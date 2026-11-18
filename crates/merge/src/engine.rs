@@ -925,7 +925,14 @@ impl Green {
     origin: crate::origin::Origin,
     checkpoint: &crate::checkpoint::Checkpoint,
   ) -> Green {
-    let mut green = Green::with_origin(origin);
+    Green::with_origin(origin).with_checkpoint(checkpoint)
+  }
+
+  /// This green, seeded from its origin and at version 0 with no increment yet, with `checkpoint` applied: what
+  /// [`Green::restore`] does after its seeding, so a recovery that seeds the origin a share at a time ([`OriginLoad`])
+  /// restores the same green as the one call does.
+  pub fn with_checkpoint(mut self, checkpoint: &crate::checkpoint::Checkpoint) -> Green {
+    let green = &mut self;
     for changed in &checkpoint.files {
       green.restore_file(changed);
     }
@@ -952,7 +959,7 @@ impl Green {
     green.folded_below = checkpoint.version;
     green.identity_version = checkpoint.version;
     green.special_history_bytes = green.special_history_recounted();
-    green
+    self
   }
 
   fn restore_file(&mut self, changed: &crate::checkpoint::Changed<String, Vec<u8>>) {

@@ -642,8 +642,24 @@ the measured wake cost before parking (the 2-competitive rule). The mount is nev
 > least half the live step quantum, its yields held to 5% of its time, and at most a heartbeat period: each record in the order recovery always took them, a green's held origin a directory's listing or
 > a file's read a unit, its chain an entry a unit, each logged write. Measured: 16 greens over a held 78-file tree
 > recovered in 2.82 s of CPU in 959 slices with the beat never older than 496 ms, where the unsliced daemon went 2.20 s
-> without a beat. The catalog's replay and a green's engine built over its origin are each one unit still. Record:
-> `docs/bugs/2026-11-07-a-shards-recovery-ran-in-one-poll-and-the-watchdog-withheld-the-beat.md`.
+> without a beat. The catalog's replay is one unit still. A green's engine built over its origin was one unit until
+> 2026-11-18 (goal g232): it hashed and copied every file of the origin, seconds over the whole kernel, so a restarted
+> owner of a kernel-sized green was ended inside its recovery at every restart; the origin is now decoded (a
+> taken-over green's recorded bytes) and seeded a share a unit, and only the checkpoint applied onto the seeded engine
+> is one unit. Records: `docs/bugs/2026-11-07-a-shards-recovery-ran-in-one-poll-and-the-watchdog-withheld-the-beat.md`,
+> `docs/bugs/2026-11-18-a-recovering-green-seeded-its-whole-origin-in-one-step.md`.
+
+> **Starts that fail in a row are backed off from their own life (2026-11-17, A-311).** Step 1's supervision counted
+> failed starts in a window of a second, so a start that a busy machine stretched past the window and that then failed
+> was never a crash loop and was restarted at once for good (a 407-shard start, every second for 27 minutes on B10's
+> Linux gate at load 70). Now the first failed start is restarted at once and the second in a row is a crash loop,
+> backed off at least the failed start's own life and doubling to the operator's failover SLO. And a start beats as it
+> goes (A-312): the starting thread writes the heartbeat after each unit of its work until the watchdog takes the beat
+> over, so a start that grows with its shards (a ring for every ordered pair) is never one thread's window of CPU
+> without a beat. A daemon that dies before it has served as long as its start took is a failed start too, and
+> `slates status` reports the anchor's verdict that a daemon has recovered (`recovered`), which tests that kill daemons
+> in a row wait for. Record:
+> `docs/bugs/2026-11-11-starts-longer-than-the-restart-window-were-restarted-at-once-forever.md`.
 
 1. The anchor process starts (or is already running), maps or creates the shared segment, and
    loads or rebuilds the machine profile.
@@ -3214,7 +3230,11 @@ directory mounts refused (NTFS reparse point); ProjFS never.
 > extension after a cached write past a hole and a shrink, inside Windows below the single receiver; it is a listed
 > failure (`fsx-seed-1-unfinished:10000`) until fixed. Since A-300 (2026-11-17) the lanes also run the workload
 > roster's version-control workloads over the drive (git, Mercurial and Subversion, through Git for Windows' shell),
-> judged against NTFS with the drive's one stated difference: no hard links.
+> judged against NTFS with the drive's one stated difference: no hard links. Their first run (CI 44260193629,
+> 2026-11-18, both architectures) found Mercurial identical but for that difference, and the drive's one limitation
+> (A-327): Windows answers no final path (`GetFinalPathNameByHandleW` with `VOLUME_NAME_DOS`, error 1005) for a file on
+> a drive that `DefineDosDeviceW` made rather than the Mount Manager, which only Administrators may ask, so git with
+> its own symbolic links on cannot change directory there. The lanes run git as Git for Windows ships it.
 
 > **Status (2026-11-02, A-198, Step 9.2: Windows handle holding).** The anchor's Windows hold channel and explicit
 > successor inheritance are built. A hold is acknowledged after duplication into the anchor, before the child publishes
@@ -4476,6 +4496,15 @@ Conformance runs through actual host mounts and Linux guests, including namespac
 base operations, concurrent SDK/kernel writes and invalidation loss. Source-level tests alone
 cannot establish the mount guarantee. A native Windows or NFS adapter must report its actual
 semantics; a Linux guest provides a separate POSIX target, not evidence for those native paths.
+
+**The group a new object takes (A-328).** POSIX lets the implementation choose (`mkdir(2)`: the parent's group or the
+creator's), and each route gives what a native file system under the kernel it serves gives, so a tool sees the same
+tree over the route as on the host. FUSE and virtio-fs serve Linux kernels: System V's rule, the creator's group unless
+the parent directory is set-group-ID, whose group a new object takes and whose bit a new directory takes too. The NFS
+export, and the routes without a kernel, give their host's own rule, as a native NFS server does: System V's on Linux,
+BSD's on macOS, the parent's group always and no inherited bit (`slates_bridge_core::GroupRule`). Measured on APFS: a
+directory made in a `2755` parent reads `755`; before A-328 the macOS export gave `2755`, and a Subversion
+repository's `db/revprops` differed there from the host's (CI run 44260193629).
 
 A mount is transparent to ordinary path-based tools within the selected namespace, but remains
 a filesystem boundary: `st_dev`, mount tables, cross-boundary links and EXDEV may expose it.
@@ -7539,6 +7568,9 @@ it builds against the contract and adds to it rather than around it.
 > text reader is gone. A green's or a work volume's status had failed as a protocol fault (the merge
 > service names their watcher `merge`), and now reads with no base
 > (`docs/bugs/2026-11-18-a-greens-status-failed-in-the-contract.md`).
+> **`CONTRACT` = 11** (9 is A-310's `Volumes` seam, 10 a volume's loss window): `DaemonReport::recovered`, appended, the
+> anchor's verdict that the daemon has served as long as its start took, so its exit is no failed start (A-311); a host
+> that ends a daemon on purpose waits for it first.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -8788,6 +8820,23 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > gathers version 0 from its hold in one call (`recover_green_inputs`); a large increment's archive is still remade from
 > its chain entry on each pass that ships it.
 
+> **Status (2026-11-18, A-313: a restarted holder rebuilds its replica from what it kept).** A warm restart keeps the
+> merge records a holder accepted (its acceptor, §4.8 "Recovery") and the inputs it held (AUD-29-59), but a holder's
+> replica of each green, the engine every later version is recomputed on, lived in memory alone. The restarted holder
+> answered every later record `merge.out_of_order`, for good, and the owner shipped it again on every pass: at `f = 1`
+> with two holders, one restart left the green one holder's answer from stalling, and a second stalled it. Now a holder
+> with a green's records and no replica rebuilds it before it answers (`merge_origin::rebuild_replica`): version 0
+> seeded from its held inputs as A-286 seeds it, or the empty engine of a green with no origin, then each version it
+> accepted recomputed from the increment it holds, an extent gathered or a version recomputed a unit, each head compared
+> with its record's identity, the records read a version at a time. The first slice runs in the exchange, so a short
+> chain is acknowledged in it; a long one goes on in a task, every record answered unacknowledged meanwhile. A version
+> its records lack, or inputs it no longer holds, installs nothing (counted); another identity refuses the green on the
+> holder for good, as a record's mismatch does. Test: `a_holder_restarted_over_its_segment_recomputes_the_greens_next_version`
+> (`crates/server/tests/fleet.rs`: holder b restarted over its segment, holder c withholding records, so version 2
+> commits only through b's rebuilt replica): with the rebuild removed, b answered version 2's record out of order 4,586
+> times and version 2 never placed within 60 s; with it, version 2 placed in 2.56 s (kiln r1017; the bug record of
+> 2026-11-18).
+
 > **Status (2026-11-06, A-235: the record plane runs when there is merge work).**
 > The merge record plane ran once per coordinator period (100 ms), putting a version's inputs at one period and its
 > record at the next, so every answer at `f > 0` waited at least one period, and usually two. One submit at a time on an
@@ -9007,7 +9056,9 @@ without `advance`; `status(green)` reports the head, the attachment's version, a
 of its pending paths green has moved under (awareness, never load-bearing).
 
 **Failure matrix.** Green owner restart: Masked (chain, deltas and `seen` replay from the log;
-in-flight submissions retry by identity). Green owner loss in a fleet: Degraded for the
+in-flight submissions retry by identity). Green holder restart: Masked (the holder keeps the merge records it accepted
+and the inputs it held, and rebuilds its replica from them a slice at a time before it recomputes the next version,
+A-313). Green owner loss in a fleet: Degraded for the
 membership horizon, then Masked after takeover on a candidate that holds the ledger. Work volume owner loss before
 `submit`: the volume's loss window (D-18) applies to the unsubmitted work. Submitter crash after
 commit: the retry returns the original result; the version stands. Merge record with a stale
@@ -10300,7 +10351,9 @@ may weaken an earlier phase's gates; ratchets only tighten.
 > runs) no Subversion commit in the roster sends more than one file's text, since the client sends a commit's texts in
 > an order drawn anew in every process and FSFS numbers a revision's items in that order; the shared environment pins
 > cargo's colour and target directory, without which CI's colour failed the cargo workload on both sides; and the live
-> guest's console is read while the VM runs, where a full pipe had stopped the guest.
+> guest's console is read while the VM runs, where a full pipe had stopped the guest. CI run 44260193629 (2026-11-18,
+> the first with A-319) showed the four identical over Linux FUSE, NFSv4.2 and the OCI container's Linux engine, and in
+> the live virtio-fs guest, with every other roster workload there.
 
 > **Editor workload correction (2026-09-17).** The host and mount must execute the same save
 > behavior even when their paths select different tool defaults. The Vim roster explicitly
@@ -14049,7 +14102,11 @@ Applied in the same change to:
 Status: built 2026-10-08. Since 2026-11-09 only an exit before the daemon served counts toward the bound (the
 supervision block's serving word, which the daemon marks once its start, recovery included, is done): a daemon killed
 while serving had recovered, and counting it backed off a test that killed a serving daemon twenty times
-(`docs/bugs/2026-11-09-a-daemon-killed-while-serving-was-counted-toward-the-crash-loop.md`).
+(`docs/bugs/2026-11-09-a-daemon-killed-while-serving-was-counted-toward-the-crash-loop.md`). Since 2026-11-17 (A-311)
+the window below is gone: a second failed start in a row is a crash loop, backed off from its own life and doubling to
+the operator's failover SLO, since a start longer than the window was never one; and a daemon that exits before it has
+served as long as its start took is a failed start too, the serving mark no longer enough
+(`docs/bugs/2026-11-11-starts-longer-than-the-restart-window-were-restarted-at-once-forever.md`).
 - What it answers: the anchor counted restarts in a window (the recovery budget) against an allowance of the budget
   over the longest measured start, and past it stopped supervising for good. On a loaded host a start stretched to
   160–490 ms (shard recovery contending for the CPU), the allowance fell to one, and `realworld_chaos.sh`'s two kills
@@ -16992,7 +17049,11 @@ Applied in the same change to: §4.16's status, A-9's "recorded durably" (now: r
   - The engine still holds the origin twice (current content and version 0's history value); loadtest-scale shares
     them after W2.
   - The overlay holds the pinned copy.
-  - Recovery walks a held origin in `init_shard` in one call.
+  - ~~Recovery walks a held origin in `init_shard` in one call.~~ Since recovery was sliced (2026-11-07) the walk is a
+    directory a unit; since 2026-11-18 (goal g232) the engine is seeded from the walked origin, or from a taken-over
+    green's recorded bytes decoded a share at a time, a share a unit too (`verbs::GreenReplay`'s `Decode` and `Load`,
+    `Green::with_checkpoint`), where it was one step of hashing and copying every file. Still one step: the checkpoint
+    applied onto the seeded engine, which costs what the green's versions changed since the origin.
 
 ### A-201 — A green's head lands through a checkout: written into the volume the green was created from, which lands under a grant like any volume (accepted and built 2026-11-04)
 
@@ -22568,7 +22629,9 @@ form, the judgment under the route's stated differences), and CI's `windows-lint
   - Git for Windows' shell copies the target for `ln -s` by default. `MSYS=winsymlinks:nativestrict` in the shared
     environment makes it a Windows symbolic link, and a failure where it cannot make one, as POSIX's `ln -s` does. So
     the `git` workload's link goes through the drive's reparse points (A-275) on one side and NTFS's on the other.
-    Every other shell ignores the variable.
+    Every other shell ignores the variable. **Amended by A-327 (2026-11-18):** the variable is set on the workload's
+    `ln -s` alone, since git reads it too and then cannot change directory on the drive; and the shared environment
+    sets `MSYS_NO_PATHCONV`, so the shell hands Subversion's `^/` URLs on as written.
 - **The drive's stated difference: no hard link.** WinFsp's driver answers `FileLinkInformation` with
   `STATUS_NOT_SUPPORTED` itself, before any file system is asked (v2.1, `src/sys/fileinfo.c` 2023-2025); its volume
   parameters' `HardLinks` bit reads "unimplemented; set to 0" (`inc/winfsp/fsctl.h` 213); and its NTFS compatibility
@@ -22644,6 +22707,114 @@ Applied in the same change to:
   two tests, each answered `EIO` at one window by the rule before.
 - **Owed.** The supervisor's runs of the live FUSE flows under load on main, and a Windows run of
   `crates/cli/tests/live_winfsp.rs`. Open (GAPS): a window can still be silent through the owner's own delay in asking.
+
+### A-311 — Starts that fail in a row are backed off from their own life, however long each takes; the backoff doubles to the failover SLO (accepted 2026-11-12, the supervisor's ruling: "the anchor budget approved, plus serve-then-crash backoff and a derived RETRY_CAP_NS"; built 2026-11-17 for goal g254, the never-served half first and the serve-then-crash half the same day)
+
+Applied in the same change to:
+- `crates/anchor/src/supervise.rs`: `RestartPolicy` is the backoff's cap alone (`RestartPolicy::derive(failover_slo_ns)`);
+  `crash_loop_backoff`, pure, with its unit tests; the failed starts in a row (`CRASH_LOOP_FAILURES`,
+  `Step::Restarted::failed_in_a_row` in place of `in_window`). The restart window, `RETRY_CAP_NS` and
+  `Supervisor::set_policy` are removed.
+- `crates/api/src/role/anchor.rs`: the policy derived once from the daemon configuration's `failover_slo_ns` and logged
+  with its derivation; a measured start no longer re-derives it; the restart line names the failed starts in a row.
+- Tests: `crates/anchor/tests/anchor.rs` (`a_crash_loop_of_starts_longer_than_the_window_is_backed_off`, red on main; the
+  crash-loop, served-restart, doubling, device-hold, torn-publication and device-refusal fixtures under the rule),
+  `crates/anchor/tests/handles_windows.rs` (the prompt fixture's one exit is now a restart), the role harness
+  `crates/server/tests/common/supervised.rs` (the role restarted at its exit is stopped at once), and
+  `crates/cli/tests/cli.rs` (the many-shard start's watch ends at the first start kill; the hold-refusal fixture's
+  policy).
+- A-119's status, §2.6's status, GAPS, `docs/wip/bench/kill_storm.sh`'s comment, and
+  `docs/bugs/2026-11-11-starts-longer-than-the-restart-window-were-restarted-at-once-forever.md`.
+
+- **What was there.** The anchor counted a daemon's failed starts (exits before it served, A-119 as amended 2026-11-09)
+  inside a window of the recovery budget, a second, against the starts the budget held at the longest start measured,
+  and backed off past that count from the window, doubling to 60 s. A start longer than the window fell in a window of
+  its own every time, so it was never a crash loop and was restarted at once for good: B10's Linux gate on adacachy2
+  (load 67-73) killed and restarted a 407-shard start every second for 27 minutes.
+- **The rule.** A failed start is restarted at once. The second in a row is a crash loop, recorded as `CrashLoop`, and
+  restarted after a backoff of at least the failed daemon's own life, spawn to exit: the loop's first backoff that life,
+  each next twice the last, doubled no further than the cap and never shorter than the failed start took. A daemon that
+  serves resets the count and the backoff. So a loop spends at most half its time starting, however long each start
+  takes, and supervision still never gives up (A-119).
+- **Why two in a row.** One failure is an event, and restarting it at once is the quickest recovery there is; a second
+  in a row is the first evidence that the next start may fail the same way. The window let "budget over start" failures
+  through at full speed each second while starts were short, and treated none as a loop once a start outlasted it.
+- **The cap, derived.** The operator's failover SLO (`FAILOVER_SLO_NS`, ten seconds until the operator gives one): the
+  outage the operator accepts for a failed owner, and the lease the daemon grants every NFSv4 client
+  (`crates/server/src/delegation.rs`). Capped there, a looping daemon starts again within one SLO of its last failure, so
+  once the loop's cause clears it serves within the bound the operator set, and its NFSv4 clients' leases have not all
+  lapsed meanwhile. The old cap was a hard Linux NFS mount's major timeout (`nfs(5)`, `timeo` 600), which no mount slates
+  makes sets. The backoff's floor, the failed start's own life, may exceed the cap, and wins: a start longer than the
+  SLO still never spends more than half the loop's time.
+- **Evidence.** Red on main 29ef4521 (the liveness agent's run, `2a5570e4d`): a child whose every start runs 400 ms and
+  fails before serving, under a policy whose window was 200 ms, was restarted at once 4 times of 4, backed off None. On
+  this change the same child is a crash loop at its second exit, backed off its own life: 548 ms after starts of 400 ms
+  (`cargo test -p slates-anchor --test anchor -- --nocapture a_crash_loop_of_starts_longer`, an 18-core M-series
+  MacBook at load 15, 2026-11-17).
+- **The serve-then-crash half (built 2026-11-17).** Applied in the same change to: `crates/anchor/src/layout.rs`
+  (`SUP_RECOVERED`, the anchor's verdict; the docs of `SUP_SERVING` and `State::CrashLoop`), `segment.rs`
+  (`Supervision::mark_recovered` and `recovered_since`, zeroed by `record_start`), `supervise.rs` (`recovered_at`, the
+  judgment at every step, `has_recovered`, `start_took_ns`), `crates/api/src/role/anchor.rs` (a daemon looked at every
+  beat until it is judged recovered, and the verdict logged once a daemon), the wire's `DaemonReport::recovered`
+  (appended; `slates status`, its JSON and MCP's `slates.status`; `slates_api::CONTRACT` raised), and the end-to-end
+  flows that kill daemons in a row, which now kill each once it is judged recovered (`crates/cli/tests/support/recovered.rs`,
+  used by `held_rendezvous.rs`, `nfs_held.rs`, `merge_kill.rs`, `winfsp.rs` and `guest_vhost.rs`).
+  - **The rule.** A daemon's start runs from its spawn to the step that first sees its serving mark, and it has
+    recovered once it has served as long again. An exit before then is a failed start, counted as an exit before the
+    mark is; after it, the daemon is restarted at once and the count starts again. The anchor publishes the verdict
+    when it first holds (`SUP_RECOVERED`), and `slates status` reports it as `recovered`. So a loop of daemons that each
+    die a moment after serving is backed off as a loop of failed starts is, and spends at most half its time starting.
+  - **Why the anchor's own steps time it.** The supervisor trusts only its own clock, which tests drive with clocks of
+    their own; the anchor looks at a daemon every beat until the verdict, so the start's end is late by at most a beat,
+    which can only delay the verdict, never grant it early.
+  - **Why the kill tests wait for it.** A test that kills daemons one after another to prove something outlives a kill
+    is not testing a crash loop. They waited only for a new daemon to answer, and under this rule without the wait
+    `held_rendezvous` failed 4 of 4 at load 21-63 (the liveness agent's run of 2026-11-11). Tests that kill once need
+    nothing: a first failed start is restarted at once.
+- **A long start** that beats per unit of work, so the 407-shard start is not killed in the first place, is A-312.
+
+### A-312 — A daemon's start beats its supervisor at every unit of its work until the watchdog takes the beat over (2026-11-17, built for goal g254: "a long start beats per unit of work")
+
+Applied in the same change to:
+- `crates/rt/src/runtime.rs`: `Runtime::start_sized` and `start_with_sized` take a progress hook, called after each
+  shard's registration, each pair ring (`connect_pairs`), each worker's spawn and each acknowledged build
+  (`await_readiness`); `Runtime::start`, `start_with` and the simulation report to no one.
+- `crates/server/src/daemon.rs`: `StartBeat`, the supervision block's heartbeat written by the starting thread from the
+  segment's attach, through the runtime's start and each shard's spawn, until the watchdog thread starts;
+  `Daemon::start_beats`; a boot line saying how often the start beat.
+- Tests: `crates/rt/tests/lifecycle.rs` (`a_start_reports_every_unit_of_its_work_as_it_goes`) and
+  `crates/server/tests/daemon.rs` (`a_daemons_start_beats_at_every_unit_of_its_work`). The end-to-end proof is
+  `crates/cli/tests/cli.rs` `a_start_whose_shards_sum_past_a_window_comes_up` (gated on `SLATES_TEST_CLI=1`), whose
+  watch fails at the anchor's first start kill since A-311.
+- §2.6's status and GAPS.
+
+- **What was there.** The anchor judges a start in its own CPU time until its first beat, and kills one whose busiest
+  thread runs a liveness window of CPU without beating (§4.14, A-228's rule for a start). Nothing in a daemon beat
+  until its watchdog thread ran, at the end of `Daemon::start_with_fleet`, and the work before it grows with the
+  shards: a driver and a registration for each, a ring for every ordered pair, N(N-1) of them, and a thread for each.
+  At 407 shards on B10's Linux gate (load 67-73) the start's busiest thread ran 1,009-1,037 ms of CPU without a beat,
+  and the anchor killed it every time; A-311 backs that loop off, but the start never came up.
+- **The rule.** A start beats as it goes. The starting thread writes the heartbeat at the segment's attach, before the
+  runtime starts, after each unit of the runtime's work, after each shard's spawn, and once more just before the
+  watchdog thread starts, which is the beat's only writer from then on. Each unit is microseconds, so a start that
+  keeps progressing keeps beating, however many shards it starts. A start stuck in a unit stops beating: the anchor
+  finds the beat lapsed with no watchdog look and judges the process by its CPU from there (A-232's rule for a silent
+  watchdog), so a stuck start is still killed, a window later than the start judgment would have killed it. A start's
+  beat is the same signal as the watchdog's: the daemon is making progress.
+- **Why not start the watchdog first.** It judges shards, and before the runtime there are none, so it would beat
+  while the starting thread spun: the case the start judgment exists to catch.
+- **Why not only make the rings cheaper.** Each shard could make its own outbound rings on its own thread, spreading
+  the quadratic work. That shortens a start but bounds no unit of it: a start is long for other reasons too (a page
+  fault cost 128 µs at load 62, `page_fault_ns` in the liveness agent's kill-loop log of 2026-11-11), and a beat at each
+  unit holds whatever the start's length.
+- **Evidence.** The runtime's hook is called once per unit, `S·(S-1) + 3·S` times for a start of S = 3 shards. A
+  daemon's start beats at least once a unit (`Daemon::start_beats`): across `cargo test -p slates-server` on a 32-core
+  Mac Studio (2026-11-18, at load 10 to 23) the boot line said 7, 13, 57 and 91 beats for starts of 1, 2, 6 and 8
+  shards, `S² + 3·S + 3` each (the hook's units, a beat a shard spawned, and one each at the attach, before the
+  runtime and before the watchdog). The attribution of the 407-shard start's long thread to the pair rings is the
+  code's arithmetic (165,242 rings), not yet measured.
+- **Owed** (GAPS): the supervisor's run of `a_start_whose_shards_sum_past_a_window_comes_up` under load, and the
+  starting thread's CPU by phase at 407 shards.
 
 ### A-290 — A guest's own attribute namespaces are its data on a guest kernel's route, and no host's route shows or sets them (2026-11-18, built for goal g268, what Shards needs from slates)
 
@@ -23618,6 +23789,103 @@ and `tag.rs` (`--dry-run`, the plan, `release_tag`).
   notarization (B.7) need Ada's Apple and Windows identities. The `draft release` job's new shape runs only on a tag.
   Before the release tag, a test tag `v0.1.0-test.3` would prove it; a refused job publishes nothing, so it fails
   safe either way.
+
+### A-313 — A restarted holder rebuilds each green's replica from the records it accepted and the inputs it holds, a slice at a time (2026-11-18, built for goal g232, one primary and two replicas)
+Applied in the same change to:
+- §4.16: the failure matrix (a green holder's restart is masked) and the status of 2026-11-18.
+- `crates/server/src/merge_origin.rs`: `ReplicaSeed` builds a replica through a version (`rebuild`, `through`, `held`,
+  `SeedStage::Chain`, `ChainStep`, `Gather::of` and `step`), `rebuild_replica` and `Rebuild`, `build`, the counts
+  `merge.replica.rebuilt`, `merge.replica.rebuilt_versions` and `merge.replica.records_short`, and the module doc.
+  `crates/server/src/merge_service.rs`: `accept_merge_record` rebuilds a missing replica before it judges a record's
+  order; the doc of `seeding`.
+- Tests: `a_restarted_holders_replica_is_rebuilt_from_the_records_and_inputs_it_kept` and
+  `a_rebuild_installs_nothing_short_of_its_records_or_off_their_identities` (`merge_origin.rs`), and
+  `a_holder_restarted_over_its_segment_recomputes_the_greens_next_version` (`crates/server/tests/fleet.rs`).
+- GAPS: the load test's ledger, after A-286's entry. The bug record:
+  `docs/bugs/2026-11-18-a-restarted-holder-refused-every-later-version-of-its-greens.md`.
+- **What was there.** A holder's replica of a green (`merge.replicas`, §4.16 "Apply on holders") lived in memory alone.
+  A warm restart kept the holder's member id, the records it accepted and the inputs it held, each for its own reason
+  (§4.8 "Recovery", AUD-29-59), and nothing rebuilt the replica. The holder answered every later record of the green
+  `merge.out_of_order` while its content answer told the owner it held the inputs, so the owner shipped the record again
+  on every pass and never had it acknowledged there.
+- **The rule.** A holder that receives a green's record with no replica of the green, and has accepted records of it,
+  rebuilds the replica before it judges the record: version 0 from its held inputs (A-286's seed) or the empty engine of
+  a green with no origin, then every version it accepted, up to the newest, recomputed from the increment it holds and
+  compared with that record's identity. The records are read a version at a time from the acceptor (`value_at`), the
+  increments gathered an extent a unit, and the build is sliced like the seed: its first slice in the exchange, the rest
+  in a task of the shard, every record of the green answered unacknowledged until it ends. It installs nothing if a
+  version's record is missing or its inputs are no longer held, and refuses the green on the holder for good on another
+  identity, as a record's own recomputation does.
+- **Why.** The failure matrix masked an owner's restart and not a holder's. Goal g232 runs one primary and two replicas
+  at `f = 1`: each version commits at the owner and one holder, so one holder's restart left the green one answer from
+  stalling, and a second restart, or the other holder's loss, stalled every submit. Red: the restarted holder refused
+  version 2's record out of order 4,586 times and it never placed within 60 s; green: placed in 2.56 s (kiln r1017).
+- **Cost.** Only at a restart, and only for a green whose record arrives: one version's recomputation per version the
+  holder accepted, as its first acceptance cost, in slices. A rebuilt replica holds what the replica held before the
+  restart; its growth per version is the open item it was (GAPS).
+
+### A-327 — The Windows lanes run git as Git for Windows ships it and hand Subversion its `^/` URLs as written; a drive the Mount Manager did not make answers no final path (2026-11-18, A-300's first run; Ada's goal of 2026-11-18)
+Applied in the same change to: §4.6 (the Windows conformance status), A-300 (its `MSYS` bullet), GAPS (A-300's entry,
+with a decision for Ada), and `crates/conformance/src/workload.rs` (`ENVIRONMENT`; the `git` workload's `ln -s`).
+- **What the first run found.** CI run 44260193629 was the first to reach the Windows lanes' workloads step, on x86_64
+  and arm64 alike. Mercurial ran identical but for the drive's stated lines. git and git's history failed on the drive
+  alone, `git init .` with `fatal: cannot mkdir .: File exists` and `git init --bare upstream.git` with `fatal: cannot
+  chdir to upstream.git: No such device`. Subversion failed on both sides with `svn: E020024: Error resolving case of
+  '^C:\Program Files\Git\trunk'`.
+- **Why git failed: the drive has no final path.** Git for Windows turns its own symbolic links on when `MSYS` names
+  `winsymlinks:nativestrict` (`compat/mingw.c` `mingw_platform_has_symlinks`), which the shared environment set for
+  `ln -s`. With them on, `mingw_chdir` opens each directory and asks `GetFinalPathNameByHandleW` for its path with
+  `VOLUME_NAME_DOS` before it changes to it, and fails the change when that fails. Windows can translate a volume's
+  device name to a drive only for a drive the Mount Manager made, or a network drive; for one `DefineDosDeviceW` made,
+  as WinFsp makes an `X:` mount, it answers `ERROR_UNRECOGNIZED_VOLUME` (1005), which git reports as `ENODEV` (WinFsp
+  issues 410 and 427: the translation never reaches WinFsp, and its maintainer knows no workaround inside it). WinFsp
+  mounts through the Mount Manager when the mount point is spelled `\\.\X:`, which only an Administrator may ask.
+- **The decision.** The workloads run git as Git for Windows ships it: the variable is set on the `git` workload's one
+  `ln -s` alone, so the link is still a Windows symbolic link through the drive's reparse points (A-275), and git keeps
+  its own links off, as its installer does unless asked. The limitation is stated, not hidden: on the drive, git with its
+  symbolic links on cannot change directory, and any program that asks a file's final path with `VOLUME_NAME_DOS` is
+  refused alike. Mounting through the Mount Manager would need an Administrator, which R10 never requires; a WinFsp
+  network file system would have a final path, a UNC one every tool would then print in place of the drive. Which, if
+  either, to offer is Ada's decision (GAPS).
+- **Why Subversion failed: the shell rewrote its argument.** Git for Windows' shell rewrites an argument that looks
+  like a POSIX path before it starts a Windows program, and it took Subversion's repository-relative URL `^/trunk` for
+  one. The shared environment now sets `MSYS_NO_PATHCONV=1`, Git for Windows' switch for handing every argument on as
+  written; every other shell ignores it, and no workload passes a POSIX path a Windows program needs rewritten (the
+  Subversion workload's own paths are already in the drive form, `pwd -W`).
+- **The failing test** is the lanes' workloads step itself, red in run 44260193629 on both architectures; nothing else
+  runs Git for Windows. Its next run is the check.
+
+### A-328 — A new object takes its group by the rule of the kernel its route serves: System V's for Linux kernels, its host's own over the NFS export, BSD's on macOS (2026-11-18, A-289's macOS run; Ada's goal of 2026-11-18)
+Applied in the same change to: §4.6 ("POSIX and transparency acceptance": the group a new object takes), GAPS (A-289's
+entry; the AUD-29-81 row), `crates/bridge-core/src/group_rule.rs` (new: `GroupRule`, its decision and
+`of_this_host`), `authority.rs` (`OpContext::group_rule`, this host's rule by default), `volume_bridge.rs`
+(`stamp_created_owner` asks the rule), and `crates/bridge-fuse/src/bridge.rs` (a creating request takes System V's).
+- **What was there.** AUD-29-81 (2026-10-01) made every transport stamp a new object by System V's rule: the creator's
+  group unless the parent is set-group-ID, whose group it takes and whose bit a new directory takes too. That is
+  Linux's (`inode_init_owner`, `fs/inode.c`), and it was written for FUSE. macOS's file systems follow BSD's: the
+  parent's group always, and no directory takes the bit (XNU's `vnode_authattr_new`; measured on APFS, macOS 26,
+  2026-11-18: in a `2755` parent `mkdir` makes `755`).
+- **What it broke.** CI run 44260193629's macOS leg ran the Subversion workload over the NFS loopback mount: its
+  repository's `db` is made set-group-ID (`svn_fs_create2` asks `svn_io_dir_make_sgid`, `fs-loader.c`), and FSFS
+  makes `db/revprops`, `db/revs` and the rest with plain `mkdir` (`fs_fs.c`). On the host they read `755`, over the
+  mount `2755`, so the trees differed at `repo/db/revprops`. The same rule gave an object the creator's group where
+  APFS gives the parent's; no workload compares groups, but `ls -l` shows it.
+- **The decision.** A route gives a new object what a native file system under the kernel it serves would. FUSE and
+  virtio-fs requests come from Linux kernels (a host's `/dev/fuse`, a virtio-fs guest, a Shards guest): System V's.
+  The NFS export gives its host's own rule, as a native NFS server does, since its host's file system would make the
+  object; so do the routes without a kernel (the typed channel): System V's on Linux and Windows, BSD's on macOS. One
+  pure decision (`GroupRule::created`) holds both rules and is unit-tested on every host; the host's choice is a
+  paired `#[cfg]` (`of_this_host`); the operation context carries the rule as it carries the creator's group, metadata
+  of the request and never authority. It is no mode switch: each route keeps one rule, the one its kernel has.
+- **Kept.** The volume root is its provisioning user's (`stamp_root_owner`), so in an ordinary tree BSD's parent group
+  is the user's own group, as the root:wheel fix of 2026-09-09 asked; only a parent of another group now gives that
+  group, as APFS does. pjdfstest accepts either group for a new object (`mkdir/00.t`, `open/00.t`).
+- **Tests.** Red first: `bsds_rule_gives_each_new_object_its_parents_group_and_no_directory_the_bit`
+  (`crates/bridge-core/tests/volume_bridge.rs`), a directory made in a set-group-ID parent reading the bit before the
+  stamp asked the rule; with it, `system_vs_rule_gives_a_set_group_id_parents_group_and_bit_and_else_the_creators_group`
+  and the decision's own two unit tests. By use over the export:
+  `an_object_made_over_the_export_takes_its_group_by_this_hosts_rule` (`crates/bridge-nfs/tests/procedures.rs`), which
+  holds macOS's CI run to BSD's rule and every other host to System V's. The FUSE creation test of AUD-29-81 stands.
 
 ### A-318 — The watchdog holds a poll's CPU to the build it runs in (2026-11-18, goal g251: every open slates bug fixed; the supervisor's order for the TSan lane)
 Applied in the same change to: §4.14 `daemon.alive` (status), GAPS (2026-11-18 entry), `crates/machine/src/build_cost.rs`

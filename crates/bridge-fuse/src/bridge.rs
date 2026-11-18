@@ -17,8 +17,8 @@ use crate::request::{ReadIn, RenameIn, Request, SetAttrIn, WriteIn, parse_name};
 
 use slates_bridge_core::posix_acl::{self, AclRefusal, Toward};
 use slates_bridge_core::{
-  AttributeNamespaces, CacheLifetime, DaxOffer, FsStat, NodeAttr, ObjectId, OpContext, OwnerView,
-  RenameFlags, SetAttr, whole_cookie_groups,
+  AttributeNamespaces, CacheLifetime, DaxOffer, FsStat, GroupRule, NodeAttr, ObjectId, OpContext,
+  OwnerView, RenameFlags, SetAttr, whole_cookie_groups,
 };
 pub use slates_bridge_core::{Bridge, DirEntry};
 use slates_vfs::error::VfsError;
@@ -127,9 +127,11 @@ pub fn dispatch(message: &[u8], bridge: &mut dyn Bridge, cx: &OpContext, out: &m
   }
   // A creating request stamps the creating process's uid and gid on what it makes (AUD-29-81): ownership
   // metadata from the kernel's request header, never authority — the attachment's enrolled subject is
-  // unchanged, and the shared seam applies the set-group-ID parent rule. A guest whose run named its owner names
-  // ids the volume keeps as another's (A-281): they are kept as the volume's, as a chown's are. Its umask goes with
-  // them for the seam to apply, which a parent's default ACL replaces (A-314).
+  // unchanged, and the shared seam applies the set-group-ID parent rule, System V's, since every kernel a FUSE
+  // request comes from is Linux's (a host's /dev/fuse, a virtio-fs guest, a Shards guest), whatever this host's own
+  // rule (A-328). A guest whose run named its owner names ids the volume keeps as another's (A-281): they are kept as
+  // the volume's, as a chown's are. Its umask goes with them for the seam to apply, which a parent's default ACL
+  // replaces (A-314).
   let creator;
   let cx = if creates(opcode) {
     let view = bridge.owner_view();
@@ -137,6 +139,7 @@ pub fn dispatch(message: &[u8], bridge: &mut dyn Bridge, cx: &OpContext, out: &m
       owner_uid: Some(view.kept_uid(request.header.uid)),
       owner_gid: Some(view.kept_gid(request.header.gid)),
       umask: creation_umask(opcode, request.body),
+      group_rule: GroupRule::SystemV,
       ..cx.clone()
     };
     &creator
