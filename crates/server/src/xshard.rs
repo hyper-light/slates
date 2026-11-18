@@ -661,6 +661,188 @@ mod tests {
     daemon.stop();
   }
 
+  /// Test support: fills this shard's task arena with tasks that park by yielding until `released` is set (no timer
+  /// slot held, as `Daemon::fill_task_arena` parks its own), stopping at the first refusal or at `cap` tasks. Returns
+  /// how many it spawned and whether the arena refused one, which is the fill's point.
+  fn fill_this_arena(
+    released: &'static std::sync::atomic::AtomicBool,
+    cap: usize,
+  ) -> (usize, bool) {
+    for spawned in 0..cap {
+      let filler = slates_rt::futures::spawn(async move {
+        while !released.load(std::sync::atomic::Ordering::Acquire) {
+          slates_rt::futures::yield_now().await;
+        }
+      });
+      if filler.and_then(slates_rt::futures::detach).is_err() {
+        return (spawned, true);
+      }
+    }
+    (cap, false)
+  }
+
+  /// Shape: how long the test thread waits for a message on a stand-in slot's channel: the daemon's own budget for a
+  /// slow shard's answer (`OBSERVE_BUDGET_NS`). A shard whose arena is full of fillers that yield polls each of them a
+  /// step, so its steps run long; a message that is lost never comes, so no shorter bound is needed to tell it apart.
+  const MESSAGE_WAIT: std::time::Duration =
+    std::time::Duration::from_nanos(crate::daemon::OBSERVE_BUDGET_NS);
+
+  /// A reply handed home waits for room even while this shard's task arena is full (goal 238; §4.3, banned items 8 and
+  /// 9). Do: on a shard, register a stand-in slot whose control channel holds one message and fill it; fill this
+  /// shard's task arena with tasks that park by yielding; and hand a reply home to the stand-in with `hand_reply_home`,
+  /// from the shard's state as its callers do. Expect: the hand-off reported no refusal, and once the filler is taken
+  /// off the channel the reply's message arrives. Until 2026-11-18 the wait for room was a task spawned on this shard,
+  /// which the full arena refused: the reply was lost, counted by its caller.
+  #[test]
+  // The test thread stands for the client's shard draining later: it must wait off-shard while the reply waits.
+  #[allow(clippy::disallowed_methods)]
+  fn a_reply_handed_home_while_this_shards_arena_is_full_waits_for_room() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static RELEASED: AtomicBool = AtomicBool::new(false);
+    RELEASED.store(false, Ordering::Release);
+    let daemon = crate::daemon::audit_daemon();
+    let (registration, receiver, filled, handed) = crate::daemon::observe_first(&daemon, |state| {
+      let cap = state.config.runtime.tasks_per_shard.saturating_mul(2);
+      let (registration, receiver) = registry::register(
+        4,
+        1,
+        registry::RegisterKick::Kick(slates_rt::driver::Kick::none()),
+      )
+      .unwrap();
+      let home = registration.shard();
+      let filler = SpawnRequest::new(Box::pin(async {}), None);
+      registry::send_control(home, Control::Spawn(Box::new(filler))).unwrap();
+      let filled = fill_this_arena(&RELEASED, cap);
+      let handed = hand_reply_home(home, || {});
+      (registration, receiver, filled, handed)
+    });
+    let (fillers, refused) = filled;
+    assert!(
+      refused,
+      "the arena refused a filler (the precondition): {fillers} spawned"
+    );
+    assert!(handed.is_ok(), "the hand-off was refused: {handed:?}");
+    assert!(receiver.recv_timeout(MESSAGE_WAIT).is_ok(), "the filler");
+    let carried = receiver.recv_timeout(MESSAGE_WAIT);
+    RELEASED.store(true, Ordering::Release);
+    assert!(
+      carried.is_ok(),
+      "the reply's message arrived once there was room, {fillers} fillers holding the arena"
+    );
+    drop(registration);
+    daemon.stop();
+  }
+
+  /// A task refused at admission answers its client through a full channel (goal 238; §4.3, §4.9). Do: on a shard,
+  /// register a stand-in slot for the client's shard whose control channel holds one message and fill it; then, from a
+  /// task of this shard, fill its task arena with tasks that park by yielding, top it up after a turn, and send this
+  /// shard's own control channel a task owing the client its answer ([`AnswerUnstarted`]). The shard refuses that task
+  /// at admission and drops it inside the admission, as it drops every refused task, where nothing can be spawned. Once
+  /// the dropped task's guard has met the full channel, take the filler off it. Expect: the owing task never ran, and the
+  /// answer's message arrives. Until 2026-11-18 the answer waited on a task spawned there, which the full arena and the
+  /// admission itself refused: lost, counted `xshard.unstarted_unanswered`, and its client waited while the daemon lived
+  /// (A-232).
+  #[test]
+  // The test thread stands for the client's shard draining later: it must wait off-shard while the answer waits.
+  #[allow(clippy::disallowed_methods)]
+  fn a_task_refused_at_admission_answers_its_client_through_a_full_channel() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static RELEASED: AtomicBool = AtomicBool::new(false);
+    static ADMITTED: AtomicBool = AtomicBool::new(false);
+    static FILLED: AtomicBool = AtomicBool::new(false);
+    static DROPPED: AtomicBool = AtomicBool::new(false);
+    /// The owing task's captures. Fields drop in their order: the guard answers (or stands down, if the task ran),
+    /// then the flag says it has, so the test takes the filler only after the answer met the full channel.
+    struct Owing {
+      guard: AnswerUnstarted,
+      _then: Dropped,
+    }
+    struct Dropped;
+    impl Drop for Dropped {
+      fn drop(&mut self) {
+        DROPPED.store(true, Ordering::Release);
+      }
+    }
+    RELEASED.store(false, Ordering::Release);
+    ADMITTED.store(false, Ordering::Release);
+    FILLED.store(false, Ordering::Release);
+    DROPPED.store(false, Ordering::Release);
+    let daemon = crate::daemon::audit_daemon();
+    let (registration, receiver) = crate::daemon::observe_first(&daemon, |state| {
+      let cap = state.config.runtime.tasks_per_shard.saturating_mul(2);
+      let at = state.shard;
+      let (registration, receiver) = registry::register(
+        4,
+        1,
+        registry::RegisterKick::Kick(slates_rt::driver::Kick::none()),
+      )
+      .unwrap();
+      let home = registration.shard();
+      let filler = SpawnRequest::new(Box::pin(async {}), None);
+      registry::send_control(home, Control::Spawn(Box::new(filler))).unwrap();
+      let maker = slates_rt::futures::spawn(async move {
+        let (_, refused) = fill_this_arena(&RELEASED, cap);
+        // A turn lets a task that ended before the fill (this observation's) give its slot back; the top-up takes it.
+        slates_rt::futures::yield_now().await;
+        let (_, topped) = fill_this_arena(&RELEASED, cap);
+        FILLED.store(refused && topped, Ordering::Release);
+        let owing = Owing {
+          guard: AnswerUnstarted::new(
+            home,
+            at,
+            0,
+            0,
+            slates_ipc::protocol::ReplyBody::Refused {
+              refusal: slates_ipc::protocol::Refusal::Overloaded { shard: at },
+            },
+          ),
+          _then: Dropped,
+        };
+        let task = SpawnRequest::new(
+          Box::pin(async move {
+            // The whole struct moves in, never its guard alone, so a drop unrun drops both fields in their order.
+            let mut owing = owing;
+            owing.guard.started();
+            ADMITTED.store(true, Ordering::Release);
+          }),
+          None,
+        );
+        registry::send_control(at, Control::Spawn(Box::new(task))).unwrap();
+        // This task keeps its own slot until released, so the arena is still full when the shard drains its channel.
+        while !RELEASED.load(Ordering::Acquire) {
+          slates_rt::futures::yield_now().await;
+        }
+      });
+      maker.and_then(slates_rt::futures::detach).unwrap();
+      (registration, receiver)
+    });
+    let began = std::time::Instant::now();
+    while !DROPPED.load(Ordering::Acquire) {
+      assert!(
+        began.elapsed() < MESSAGE_WAIT,
+        "the owing task was dropped within {MESSAGE_WAIT:?}"
+      );
+      std::thread::sleep(std::time::Duration::from_nanos(REPLY_PACE_NS));
+    }
+    assert!(receiver.recv_timeout(MESSAGE_WAIT).is_ok(), "the filler");
+    let answered = receiver.recv_timeout(MESSAGE_WAIT);
+    RELEASED.store(true, Ordering::Release);
+    assert!(
+      FILLED.load(Ordering::Acquire),
+      "the arena refused a filler, before and after the turn (the precondition)"
+    );
+    assert!(
+      !ADMITTED.load(Ordering::Acquire),
+      "the owing task was refused at admission (the precondition), not run"
+    );
+    assert!(
+      answered.is_ok(),
+      "the answer's message arrived once there was room"
+    );
+    drop(registration);
+    daemon.stop();
+  }
+
   /// §4.3 cancellation safety, the same on every shard (R8). Do: on a shard, from a task there, make a `task_within`
   /// call to that same shard whose future parks past the call's deadline and then reports that it ended. Expect the
   /// call answered `None` at its deadline and the future run to its end anyway, as a call to another shard runs. Until
