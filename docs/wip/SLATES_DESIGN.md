@@ -29098,3 +29098,17 @@ closed; the model table: nine `InstallInTurns` runs), `docs/wip/models/InstallIn
   `DurabilityPending` at the live failover estimate (2.4 to 3.4 s), the failure A-344's owner-restart test shows on main
   itself (g255's A-392); the successor's run to be told apart on main. The whole-map passes stay, as the daemon's
   unit-test oracle of the per-copy steps.
+
+### A-408 — The last wall-clock cross-shard waits wait in their target's own time (2026-11-18, built for goal g255; A-65, A-403)
+
+- **What was there.** Eight cross-shard calls still waited one liveness window of wall time (`xshard::call_within` with
+  `LIVENESS_BUDGET_NS`), each a wait on another shard of the same daemon, alive and perhaps busy: a green's re-adoption
+  (`green_adopt.rs`: the hand-off's reads and its stepped replay, 4), an NFS call routed to its volume's shard
+  (`nfs.rs` `routed`), a departed host's attachment ended on its shard (`remote_attach.rs`), and a clone's named
+  source on another shard (`verbs.rs` `clone_named_elsewhere`, 2).
+- **The rule.** Each waits by `xshard::call_in_shard_time` (A-65's rule, as A-403 for the recovery passes): it goes on
+  while the target makes CPU progress and gives up only when the target made none for a window. No cross-shard wait of
+  the daemon is judged on the wall any longer; the calls with deadlines of their own (a landing's term, the admission
+  wait, the room probe's heartbeat, the reaper's deadline, the Shards route's exchange) are their own items.
+
+Applied in the same change to: `crates/server/src/{green_adopt,nfs,remote_attach,verbs}.rs`.
