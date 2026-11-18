@@ -1388,7 +1388,16 @@
 >   - `green_fairness.rs`, 1,000 files of 16 KiB: main held its shard for one poll of 134 ms (x86_64) and 960 ms
 >     (arm64) with 0 probes answered; sliced, 259 to 1,456 probes inside, the longest 13.6 ms.
 >   - Peak RSS over the whole kernel 9.42 to 8.02 GB, `fs/` 361 to 283 MB (BENCHMARKS, "CreateGreen sliced").
->   - Still open: the engine's second lifetime copy (loadtest-scale, after W2), and recovery's walk in `init_shard`.
+>   - Still open: the engine's second lifetime copy (loadtest-scale, after W2). Recovery's walk in `init_shard` is a
+>     directory a unit since 2026-11-07, and since 2026-11-18 (g232) the engine is seeded from the origin a share a unit
+>     too: it was one step of hashing and copying every file, seconds over the whole kernel, so a restarted owner of a
+>     kernel-sized green was ended by its watchdog inside its recovery, at every restart
+>     (`a_restarted_owner_seeds_a_greens_origin_a_share_at_a_time`;
+>     `docs/bugs/2026-11-18-a-recovering-green-seeded-its-whole-origin-in-one-step.md`). The checkpoint applied onto
+>     the seeded engine is still one step, costing what the versions changed.
+>   - Open (found 2026-11-18, g232): a taken-over plain volume is restored in one call (`verbs::materialize_taken_over`:
+>     `slates_archive::restore`, then every file written), so a kernel-sized base volume's successor would hold one poll
+>     for seconds, the wall the green's own takeover meets (A-286's owed item `recover_green_inputs`).
 >
 >   The 2026-11-06 record, as it was found (reported to fixtures, A-217's re-lander): In-process daemon on the Mac (loaded arm, load 30 to 47), Linux v7.4-rc1 whole (97,229
 >   files on APFS, 1.67 GB), the sliced pin:

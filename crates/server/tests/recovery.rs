@@ -5035,6 +5035,86 @@ fn a_greens_base_snapshot_is_held_and_its_origin_recovered_from_it() {
   second.stop();
 }
 
+/// §4.8 "Recovery", §4.16 "Green owner restart: Masked", §4.3 "Bounded work everywhere" (A-217's owed item; 2026-11-18,
+/// goal g232): a restarted owner seeds a green's engine from its held origin a share at a time, a recovery unit each. The
+/// whole origin was seeded in one step, hashing and copying every file: over the Linux kernel's 1.67 GB that is seconds
+/// of one poll, so a restarted owner of a kernel-sized green was ended by its watchdog inside its own recovery, again at
+/// every restart. Do: a green over a pinned overlay's snapshot of four files of a hashing share each; restart the daemon
+/// over the same segment. Expect: the recovery counted its seeding of the origin over more than one share
+/// (`merge.recovery.origin_load_steps`), and the green reads each file's bytes at version 0.
+#[test]
+fn a_restarted_owner_seeds_a_greens_origin_a_share_at_a_time() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-originload-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  // A file a share: each is its own unit of the seeding, so the origin cannot seed in one.
+  let share = usize::try_from(config.archive_slice_bytes())
+    .unwrap()
+    .max(1);
+  let anchor = held_anchor("originload", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let target = common::target::target_dir();
+  let files: Vec<(String, Vec<u8>)> = (0..4u8)
+    .map(|file| (format!("file-{file}"), vec![file.wrapping_add(1); share]))
+    .collect();
+  for (name, bytes) in &files {
+    target.seed(name, bytes);
+  }
+  let mut client = connect(&instance);
+  let overlay = client
+    .create(&CreateSpec {
+      size: SizeClass::Bounded { limit: 1 << 30 },
+      base: Some(target.path.clone()),
+      ..scratch("origin-load-base")
+    })
+    .unwrap();
+  assert_eq!(
+    client.pin(overlay, None).unwrap(),
+    u64::try_from(files.len()).unwrap(),
+    "every base file pinned"
+  );
+  let snapshot = client.snapshot(overlay).unwrap();
+  let green = client
+    .create_green_over(
+      "origin-load-green",
+      false,
+      slates_client::GreenBase {
+        volume: overlay,
+        snapshot,
+      },
+    )
+    .unwrap();
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  let reads: Vec<bool> = files
+    .iter()
+    .map(|(name, bytes)| {
+      client
+        .read(green, name, slates_client::ReadAt::Version { version: 0 })
+        .is_ok_and(|read| read == *bytes)
+    })
+    .collect();
+  let counters = second.refusals_on_every_shard().unwrap();
+  let seeded_in = counters
+    .get("merge.recovery.origin_load_steps")
+    .copied()
+    .unwrap_or(0);
+  drop(client);
+  second.stop();
+  assert!(
+    seeded_in > 1,
+    "the recovery seeded the origin over {seeded_in} shares: {counters:?}"
+  );
+  assert!(
+    reads.iter().all(|read| *read),
+    "every file reads its bytes at version 0: {reads:?}"
+  );
+}
+
 /// A sibling of a removed base directory at recovery (found by liveness while slicing recovery, 2026-11-08): after a
 /// restart the rebuilt base plane holds no listings until each is read again on first use (A-153), and a pinned
 /// overlay's snapshot was judged against those empty listings. Do: an overlay over a directory holding `f` and `sub/g`;
