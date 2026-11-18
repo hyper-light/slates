@@ -929,6 +929,12 @@
 >   a busy unmount of a path where nothing is mounted is refused with the program's status, on each OS. By use, with a
 >   kernel mount: `a_busy_mount_is_let_go_of_the_oss_way` (`crates/api/tests/api.rs`, run with `SLATES_TEST_MOUNT=1`,
 >   filed for main's run);
+> - built 2026-11-18: the serving clause's DAX half through the library: the Shards stream end `serve_shards` hands
+>   keeps a `dax=inode` guest's `FUSE_MAP_ALIGNMENT` and `FUSE_HAS_INODE_DAX` at `INIT`, with the host's page as the
+>   alignment, and marks a file of a DAX range or more `FUSE_ATTR_DAX` and a small one not
+>   (`a_shards_stream_end_serves_the_volume_it_was_made_for`; the map's data path is the server's Shards suite's); and
+>   the contract's history held by a doc-truth test, every version a line in order up to `CONTRACT` and none past it
+>   (`the_contract_history_names_every_version_in_order`);
 > - the async form (R6), first piece built (`CONTRACT` = 31): `AsyncInstance` over a host's `Reactor`, awaiting
 >   provisioning, a snapshot, a status and a destroy; handing it back stops its completion bridge, which took the
 >   synchronous form's wakes (`docs/bugs/2026-11-18-the-async-signal-took-the-synchronous-forms-wakes.md`); owed: the
