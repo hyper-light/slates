@@ -137,6 +137,14 @@ where you must decide; a moved contract then fails your build at the place to up
 - The launcher's authority: `Issuer::from_environment()` (the anchor's handoff, as `slates grant`
   has it) or `Issuer::from_handoff(pairs)`. The SDKs and the MCP server cannot approve: they do not
   depend on this crate.
+- Moving a volume to another fleet member (A-291): `member()` is this instance's member id, and
+  `move_volume(volume, to)` asks the volume's owner to move it to the member `to` (another
+  instance's `member()`): one ask, answered `MoveProgress::Moving` until the switch and
+  `MoveProgress::Moved` from it, so ask again until `Moved`; detach first. The new member serves the
+  volume once it has adopted it (its verbs answer `Retry` until then), and the old one lets its copy
+  go once the new one has placed it. Refusals: `Busy(Attached)`, `Busy(Moving)`,
+  `Unusable(Unmovable(NotPlain | Lineage | Snapshots))`, `Invalid(MoveTarget(NotMember |
+  OutsideNeighbourhood))`, `Retry { cause: MoveUnplaced, .. }`. A lone instance has no other member.
 - Observation: `daemon_status`, `audit`, `grants`, `telemetry`.
 
 Calls are synchronous: a provisioning verb answers in microseconds, and a landing or a mount waits

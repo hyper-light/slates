@@ -22,8 +22,8 @@ use std::time::{Duration, Instant};
 use slates_api::{
   Approval, Awaiting, BaseState, ConflictClass, Denied, Drift, DriftKind, Error, Existing, Filter,
   Instance, Intent, Invalid, IssuerFault, LandOutcome, LandingConflict, LandingState, MergeOutcome,
-  Missing, PathFault, Provisioned, RebaseOutcome, SnapshotId, Unsupported, Unusable, Verification,
-  VolumeId, VolumeSpec, Work, WorkSignature,
+  Missing, MoveTarget, PathFault, Provisioned, RebaseOutcome, SnapshotId, Unsupported, Unusable,
+  Verification, VolumeId, VolumeSpec, Work, WorkSignature,
 };
 use slates_machine::{MachineError, MachineProfile, ProfileOptions};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
@@ -563,6 +563,35 @@ fn a_merge_is_accepted_or_conflicted_typed() {
 
 /// AC-5.12 / T-5.14 (A-278; §4.14): do read the daemon's status and a shard's telemetry through the library; expect the
 /// daemon's shards reported and the drain answered for the shard it has.
+/// A-291 (§4.10 "Ownership follows the writer"), the contract's half: a lone instance names itself and refuses a move
+/// typed. Do: on a lone instance, read its member id, then ask to move a volume to that id, to another id, and a
+/// volume that does not exist. Expect a member id that is not zero; both moves refused
+/// `Invalid::MoveTarget(NotMember)` (a node alone has no other member: R8's degenerate fleet), the volume still
+/// served where it was; and the missing volume refused by what it named. The move itself across members is the
+/// server's fleet test (`a_volume_moved_to_another_member_is_served_there_and_its_old_owner_forwards`).
+#[test]
+fn a_lone_instance_names_itself_and_refuses_a_move_typed() {
+  let (daemon, mut instance) = grouped("move");
+  let member = instance.member().unwrap();
+  assert_ne!(member, 0, "an instance names its member");
+  let volume = provision(&mut instance, &VolumeSpec::empty("staying", ROOM));
+  write_file(&mut instance, volume, "/f", b"stays here");
+  let not_member = Err(Error::Invalid(Invalid::MoveTarget(MoveTarget::NotMember)));
+  assert_eq!(instance.move_volume(volume, member), not_member);
+  assert_eq!(
+    instance.move_volume(volume, member.wrapping_add(1)),
+    not_member
+  );
+  assert_eq!(read_file(&mut instance, volume, "/f"), b"stays here");
+  let missing = VolumeId { bytes: [7; 16] };
+  assert_eq!(
+    instance.move_volume(missing, member.wrapping_add(1)),
+    Err(Error::NotFound(Missing::Volume(missing)))
+  );
+  drop(instance);
+  daemon.stop();
+}
+
 #[test]
 fn the_daemon_is_observed_through_the_library() {
   let (daemon, mut instance) = grouped("observe");

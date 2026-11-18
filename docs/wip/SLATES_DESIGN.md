@@ -21436,7 +21436,9 @@ exception's `from` and cohort), `crates/ipc` (`RequestBody::Move`, `ReplyBody::M
 moved-away volume, `head_for_move`, `seal_adopted_head`, `drop_snapshot`, the release's slices; `fleet.rs`: the
 stream, the drivers, `MovedForgotten` at a retired tombstone; `takeover.rs`: `adopt_at`, `drop_copy`;
 `owner_location.rs`: the exception's owner first), `crates/client` (`Client::move_volume`, `MoveState`),
-`crates/cli` (`slates move ID --to HOST`).
+`crates/cli` (`slates move ID --to HOST`), `crates/api` (`Instance::move_volume`, `Instance::member`,
+`MoveProgress`, the typed refusals `Busy::Attached`, `Busy::Moving`, `Unusable::Unmovable`, `Invalid::MoveTarget`,
+`RetryCause::MoveUnplaced`, `CONTRACT` 3; `tests/api.rs`), `docs/library.md`.
 - **Why.** Kiln moves an agent between runners only without a workspace volume (`harness/relocate.rs` refuses one),
   since nothing moved a volume: the design named the planned handoff (§4.10) and its configuration exception (§4.8
   "Authority scope"), and neither was built. A volume is mounted only on its owner (every attachment form but the
@@ -21476,6 +21478,7 @@ stream, the drivers, `MovedForgotten` at a retired tombstone; `takeover.rs`: `ad
   configuration's round trip and its lying-count and forged-flag tests (`crates/cluster/src/raft_wire.rs`);
   `the_old_owner_reports_until_the_switch_keeps_its_copy_until_adopted_and_thaws_only_without_a_switch`
   (`crates/server/src/moves.rs`). By use: `a_volume_moved_to_another_member_is_served_there_and_its_old_owner_forwards`
-  (`crates/server/tests/fleet.rs`).
+  (`crates/server/tests/fleet.rs`); the contract's `a_lone_instance_names_itself_and_refuses_a_move_typed`
+  (`crates/api/tests/api.rs`).
 - **Owed.** The automatic migration by the origin of the last N writes (AC-8.16's other half); an overlay's move; a
   move that carries snapshots other than the head; the multi-runner test with injected faults (GAPS).

@@ -67,8 +67,8 @@ pub mod volume;
 
 pub use error::{
   Absence, Busy, Denied, Elsewhere, Error, Exhausted, Existing, HostFault, Invalid, IssuerFault,
-  KindMismatch, Missing, MountFault, MountMissing, Note, PathFault, ProtocolFault, RetryCause,
-  Stale, StartFault, Unreported, Unsupported, Unusable,
+  KindMismatch, Missing, MountFault, MountMissing, MoveTarget, Note, PathFault, ProtocolFault,
+  RetryCause, Stale, StartFault, Unmovable, Unreported, Unsupported, Unusable,
 };
 pub use grant::{GrantAuthority, GrantClaim, GrantProof};
 pub use instance::{Instance, LandingRequest};
@@ -76,7 +76,8 @@ pub use issuer::{GRANT_TERM_NS, Issuer};
 pub use mount::{MountKind, MountOptions, Mounted};
 pub use outcome::{
   ActionTally, Approval, Awaiting, LandOutcome, LandingConflict, LandingReport, LandingState,
-  MergeConflict, MergeConflictClass, MergeConflicts, MergeOutcome, RebaseOutcome, Summary, Work,
+  MergeConflict, MergeConflictClass, MergeConflicts, MergeOutcome, MoveProgress, RebaseOutcome,
+  Summary, Work,
 };
 pub use policy::{PolicyReason, PolicyRefusal, PolicySubject, WriteAct, WriteMode, WritePolicy};
 pub use signed::{SignatureFault, Signer, SignerKey, Verification, WorkSignature};
@@ -92,8 +93,10 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Format: the consumer contract's version (§4.12 "Versioning", A-299), raised by one with every change to a type or a
 /// verb of the contract; a consumer asserts the one it was written against. 1: the contract as A-299 first published it
 /// (2026-11-18). 2: `Denied::Policy`, the class a write policy's refusal takes outside a landing or a merge (the
-/// same day).
-pub const CONTRACT: u32 = 2;
+/// same day). 3: a volume's move to another fleet member (A-291, the same day): `Instance::move_volume` and
+/// `Instance::member`, `MoveProgress`, and its refusals' details (`Busy::Attached`, `Busy::Moving`,
+/// `Unusable::Unmovable`, `Invalid::MoveTarget`, `RetryCause::MoveUnplaced`).
+pub const CONTRACT: u32 = 3;
 
 /// The typed client and its own types, for the verbs [`Instance::client`] lends outside the contract.
 pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, VhostUserDevice};

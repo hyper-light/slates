@@ -29,7 +29,7 @@ use crate::error::{Error, Missing, ProtocolFault, Unsupported};
 use crate::grant::{GrantAuthority, GrantClaim, GrantProof};
 use crate::outcome::{
   Approval, Awaiting, LandOutcome, LandingConflict, MergeConflict, MergeConflicts, MergeOutcome,
-  RebaseOutcome, Work, merge_class_of, report_of, summary_of,
+  MoveProgress, RebaseOutcome, Work, merge_class_of, report_of, summary_of,
 };
 use crate::signed::{Verification, WorkSignature};
 use crate::volume::{
@@ -598,6 +598,29 @@ impl Instance {
       .versions(work.green)
       .map_err(|e| self.fail(e, Some(Missing::Volume(work.green))))?;
     Ok(MergeConflicts { conflicts, head })
+  }
+
+  /// Asks `volume`'s owner to move it to the fleet member `to` (§4.10 "Ownership follows the writer", A-291), the
+  /// member named by its id ([`Instance::member`] on that member's own instance). One ask: the move goes on between
+  /// asks, so a consumer asks again until it is [`MoveProgress::Moved`], and the volume is then served by `to` once it
+  /// has adopted it (its verbs answer [`crate::RetryCause::Overloaded`] until then). The volume must be a plain one with
+  /// no attachment, clone or snapshot but its head, and `admin` on it is required. Each refusal is typed by what to do:
+  /// [`crate::Busy::Attached`] (detach first), [`crate::Busy::Moving`], [`crate::Unusable::Unmovable`],
+  /// [`crate::Invalid::MoveTarget`], [`crate::RetryCause::MoveUnplaced`]; a lone instance, which has no other member, is
+  /// refused [`crate::MoveTarget::NotMember`].
+  pub fn move_volume(&mut self, volume: VolumeId, to: u64) -> Result<MoveProgress, Error> {
+    match self.client.move_volume(volume, to) {
+      Ok(slates_client::MoveState::Moving { to }) => Ok(MoveProgress::Moving { to }),
+      Ok(slates_client::MoveState::Moved { to }) => Ok(MoveProgress::Moved { to }),
+      Err(e) => Err(self.fail(e, Some(Missing::Volume(volume)))),
+    }
+  }
+
+  /// This instance's fleet member id: what another instance's [`Instance::move_volume`] names it by, and what its
+  /// volume ids and its peers name it by (§4.8). It is the node's certificate anchor with its boot's nonce, so a
+  /// daemon restarted under the same anchor is a new member; ask it again after a restart.
+  pub fn member(&mut self) -> Result<u64, Error> {
+    Ok(self.daemon_status()?.fleet.host)
   }
 
   /// The daemon's status (§4.14 `slates.status`): its shards, health signals with their freshness, the fleet's view,
