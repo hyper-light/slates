@@ -10375,45 +10375,13 @@ const REFUSAL_PERIODS: u64 = 50;
 /// Format: the id the altered naming record is recorded under (any id: nothing looks a naming key up by it).
 const ALTERED_NAMING_ID: [u8; 16] = [0xA5; 16];
 
-/// A-322, A-92 piece 3b (§4.10 "a key or a seal that refuses drops the seal (`fleet.seal.envelope_refused`) for the next
-/// period"): a seal whose envelope is refused is started again the next period, and places once the refusal has passed.
-/// Do: three nodes at `f = 1`; on a, a volume written once and detached; on a, record the volume's naming key as a record
-/// that is well formed but wrapped under the node's root rather than the volume's lineage key, an altered record
-/// `seal_keys::namer` refuses; snapshot the volume and wait for a to count two refused envelopes; then destroy the altered
-/// record. Expect a sealing (its root held), the envelope refused twice (the seal started again after its first
-/// refusal) and the snapshot placed. Before, the refused job was kept with its walk spent and no archive: it counted
-/// one refusal, did nothing every period after, and its head never placed, whatever the keys did next.
-#[test]
-fn a_seal_whose_envelope_was_refused_is_started_again_and_places() {
-  let _serial = serialize_fleet_tests();
-  let (_serve_lease, daemons, _hosts) = formed_mesh(&["a", "b", "c"]);
-  let mut client = Client::connect(daemons[0].instance());
-  let ReplyBody::Created { id } = client.call(&scratch("refused-envelope")) else {
-    panic!("the volume was created");
-  };
-  let attachment = write_attachment(&mut client, id);
-  let written = client.call(&RequestBody::FsWrite {
-    volume: id,
-    attachment,
-    path: "/sealed".to_owned(),
-    bytes: vec![7; WALKED_FILE_BYTES],
-    mode: 0o644,
-  });
-  assert!(
-    matches!(written, ReplyBody::FsDone { .. }),
-    "the write: {written:?}"
-  );
-  let detached = client.call(&RequestBody::Detach { attachment });
-  assert!(
-    matches!(detached, ReplyBody::Detached),
-    "the attachment was let go: {detached:?}"
-  );
-  let naming = slates_db::catalog::SealKeyOwner::Naming {
-    volume: slates_db::catalog::VolumeId { bytes: id.bytes },
-  };
-  let budget = slates_server::daemon::OBSERVE_BUDGET_NS;
-  let (sealing, altered) = daemons[0]
-    .observe_control(budget, move |state| {
+/// On `daemon`'s control shard (the fleet tests' one shard), records `volume`'s naming key as a record that is well formed
+/// but wrapped under the node's root rather than the volume's lineage key: an altered record, which `seal_keys::namer`
+/// refuses. Whether the node seals (its root held), and whether the record was recorded.
+fn record_altered_naming(daemon: &Daemon, volume: slates_db::catalog::VolumeId) -> (bool, bool) {
+  let naming = slates_db::catalog::SealKeyOwner::Naming { volume };
+  daemon
+    .observe_control(slates_server::daemon::OBSERVE_BUDGET_NS, move |state| {
       let Some(root) = state.seal_root.as_ref() else {
         return (false, false);
       };
@@ -10433,22 +10401,14 @@ fn a_seal_whose_envelope_was_refused_is_started_again_and_places() {
       );
       (true, recorded.is_ok())
     })
-    .unwrap();
-  let before = refusal_count(&daemons[0], SEAL_ENVELOPE_REFUSED).unwrap();
-  let snapshot = match client.call(&RequestBody::Snapshot { volume: id }) {
-    ReplyBody::Snapshotted { id, .. } => Some(id),
-    _ => None,
-  };
-  let observed: Vec<&Daemon> = daemons.iter().collect();
-  let refused_again = poll_for_periods(&observed, PLACEMENT_DEADLINE, REFUSAL_PERIODS, || {
-    refusal_count(&daemons[0], SEAL_ENVELOPE_REFUSED)
-      .map(|count| count >= before + REFUSED_ENVELOPES)
-  });
-  let refused = refusal_count(&daemons[0], SEAL_ENVELOPE_REFUSED)
     .unwrap()
-    .saturating_sub(before);
-  let destroyed = daemons[0]
-    .observe_control(budget, move |state| {
+}
+
+/// On `daemon`'s control shard, destroys `volume`'s naming key record: whether it was destroyed.
+fn destroy_naming(daemon: &Daemon, volume: slates_db::catalog::VolumeId) -> bool {
+  let naming = slates_db::catalog::SealKeyOwner::Naming { volume };
+  daemon
+    .observe_control(slates_server::daemon::OBSERVE_BUDGET_NS, move |state| {
       let now = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
       state
         .db
@@ -10459,7 +10419,61 @@ fn a_seal_whose_envelope_was_refused_is_started_again_and_places() {
         )
         .is_ok()
     })
-    .unwrap();
+    .unwrap()
+}
+
+/// A volume named `name` on `client`'s node, `/sealed` written once and the attachment let go.
+fn written_once_and_let_go(client: &mut Client, name: &str) -> VolumeId {
+  let ReplyBody::Created { id } = client.call(&scratch(name)) else {
+    panic!("the volume was created");
+  };
+  let attachment = write_attachment(client, id);
+  let written = client.call(&RequestBody::FsWrite {
+    volume: id,
+    attachment,
+    path: "/sealed".to_owned(),
+    bytes: vec![7; WALKED_FILE_BYTES],
+    mode: 0o644,
+  });
+  assert!(
+    matches!(written, ReplyBody::FsDone { .. }),
+    "the write: {written:?}"
+  );
+  let detached = client.call(&RequestBody::Detach { attachment });
+  assert!(
+    matches!(detached, ReplyBody::Detached),
+    "the attachment was let go: {detached:?}"
+  );
+  id
+}
+
+/// A-322, A-92 piece 3b (§4.10 "a key or a seal that refuses drops the seal (`fleet.seal.envelope_refused`) for the next
+/// period"): a seal whose envelope is refused is started again the next period, and places once the refusal has passed.
+/// Do: three nodes at `f = 1`; on a, a volume written once and detached; on a, record the volume's naming key as a record
+/// that is well formed but wrapped under the node's root rather than the volume's lineage key, an altered record
+/// `seal_keys::namer` refuses; snapshot the volume and wait for a to count two refused envelopes; then destroy the altered
+/// record. Expect a sealing (its root held), the envelope refused twice (the seal started again after its first
+/// refusal) and the snapshot placed. Before, the refused job was kept with its walk spent and no archive: it counted
+/// one refusal, did nothing every period after, and its head never placed, whatever the keys did next.
+#[test]
+fn a_seal_whose_envelope_was_refused_is_started_again_and_places() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, _hosts) = formed_mesh(&["a", "b", "c"]);
+  let mut client = Client::connect(daemons[0].instance());
+  let id = written_once_and_let_go(&mut client, "refused-envelope");
+  let volume = slates_db::catalog::VolumeId { bytes: id.bytes };
+  let (sealing, altered) = record_altered_naming(&daemons[0], volume);
+  let before = refusal_count(&daemons[0], SEAL_ENVELOPE_REFUSED).unwrap();
+  let snapshot = snapshot_taken(&mut client, id);
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let refused_again = poll_for_periods(&observed, PLACEMENT_DEADLINE, REFUSAL_PERIODS, || {
+    refusal_count(&daemons[0], SEAL_ENVELOPE_REFUSED)
+      .map(|count| count >= before + REFUSED_ENVELOPES)
+  });
+  let refused = refusal_count(&daemons[0], SEAL_ENVELOPE_REFUSED)
+    .unwrap()
+    .saturating_sub(before);
+  let destroyed = destroy_naming(&daemons[0], volume);
   let placed =
     snapshot.is_some_and(|snapshot| poll_snapshot_placed(&observed, &mut client, id, snapshot));
   drop(observed);
@@ -10469,8 +10483,10 @@ fn a_seal_whose_envelope_was_refused_is_started_again_and_places() {
   eprintln!(
     "refused envelope: sealing {sealing}, altered {altered}, refused {refused}, destroyed {destroyed}, placed {placed}"
   );
-  assert!(sealing, "a seals: its root is held");
-  assert!(altered, "the altered naming record was recorded");
+  assert!(
+    sealing && altered,
+    "a seals, and the altered naming record was recorded"
+  );
   assert!(snapshot.is_some(), "the volume was snapshotted");
   assert!(
     refused_again,
@@ -10597,10 +10613,7 @@ fn a_holders_return_is_walked_in_turns_and_it_takes_every_log() {
   let held_ns = hold.answer();
   let observed: Vec<&Daemon> = daemons.iter().collect();
   let caught_up = poll_until(&observed, PLACEMENT_DEADLINE, || {
-    Ok(volumes.iter().all(|volume| {
-      let head = owned_live_line(&mut client, *volume).and_then(|(head, _, _)| head);
-      head.is_some() && held_live_head(&daemons[1], *volume) == head
-    }))
+    Ok(holds_every_head(&mut client, &daemons[1], &volumes))
   });
   let turns = refusal_count(&daemons[0], LIVE_REACHED_SLICES)
     .unwrap()
@@ -10626,6 +10639,14 @@ fn a_holders_return_is_walked_in_turns_and_it_takes_every_log() {
     "b's return was walked a volume a turn: {turns} turns for {REACHED_LIVE_VOLUMES} volumes"
   );
   assert!(caught_up, "b holds every volume's log at a's head");
+}
+
+/// Whether `holder` holds each of `volumes`' live logs at the head its owner (`client`'s node) ships.
+fn holds_every_head(client: &mut Client, holder: &Daemon, volumes: &[VolumeId]) -> bool {
+  volumes.iter().all(|volume| {
+    let head = owned_live_line(client, *volume).and_then(|(head, _, _)| head);
+    head.is_some() && held_live_head(holder, *volume) == head
+  })
 }
 
 /// One more write to `volume` through a fresh attachment, let go after: the write's reply.
@@ -12621,6 +12642,43 @@ fn sealed_and_held(daemons: &[Daemon], name: &str, path: &str) -> Result<VolumeI
   }
 }
 
+/// The anchored three-node fleet the takeover-report test runs on, formed at `f = 1`, with a volume sealed on a and held
+/// by both others ([`sealed_and_held`]): the fleet, its daemons, their member ids and the volume. A setup that does not
+/// hold stops the daemons and fails the test there.
+fn anchored_fleet_with_a_sealed_volume(
+  names: &[&str],
+  prefix: &str,
+) -> (AnchoredFleet, Vec<Daemon>, Vec<HostId>, VolumeId) {
+  let mut fleet = AnchoredFleet::new(prefix, names);
+  let daemons: Vec<Daemon> = (0..names.len()).map(|node| fleet.start(node)).collect();
+  daemons[0].bootstrap(true).unwrap();
+  settle_initial_consensus(&daemons, &fleet.seeds, &Default::default(), Quorum { f: 1 });
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, names);
+  match sealed_and_held(&daemons, prefix, "/taken") {
+    Ok(id) => (fleet, daemons, hosts, id),
+    Err(why) => {
+      for daemon in daemons {
+        daemon.stop();
+      }
+      panic!("setup: {why}");
+    }
+  }
+}
+
+/// Whether the node serving `instance` answers `status` for `volume` (polled over `daemons`), and its loss report then.
+fn served_loss(
+  daemons: &[Daemon],
+  instance: &str,
+  volume: VolumeId,
+) -> (bool, Option<(slates_ipc::protocol::LossReport, u64)>) {
+  let served = poll_status_answers(&daemons.iter().collect::<Vec<_>>(), instance, volume);
+  (served, loss_of(&mut Client::connect(instance), volume))
+}
+
 /// AC-8.3, A-325: a successor's report of the takeover that made it a volume's owner survives its warm restart. Do: three
 /// nodes at `f = 1` over anchors that outlive their daemons; on a, a volume with one file, sealed, placed and held by
 /// both others; a stops for good; once the survivor the volume ranks first serves it, read its loss report; restart that
@@ -12631,40 +12689,18 @@ fn sealed_and_held(daemons: &[Daemon], name: &str, path: &str) -> Result<VolumeI
 #[test]
 fn a_successors_takeover_report_survives_its_warm_restart() {
   let _serial = serialize_fleet_tests();
-  let names = ["taken-a", "taken-b", "taken-c"];
-  let mut fleet = AnchoredFleet::new("taken-report", &names);
-  let mut daemons: Vec<Daemon> = (0..names.len()).map(|node| fleet.start(node)).collect();
-  daemons[0].bootstrap(true).unwrap();
-  settle_initial_consensus(&daemons, &fleet.seeds, &Default::default(), Quorum { f: 1 });
-  let hosts: Vec<HostId> = daemons
-    .iter()
-    .map(|daemon| daemon.member_identity().unwrap())
-    .collect();
-  assert_fleet_forms(&daemons, &hosts, &names);
-  let sealed = sealed_and_held(&daemons, "taken-report", "/taken");
+  let (mut fleet, mut daemons, hosts, id) =
+    anchored_fleet_with_a_sealed_volume(&["taken-a", "taken-b", "taken-c"], "taken-report");
   daemons.remove(0).stop();
-  let id = match sealed {
-    Ok(id) => id,
-    Err(why) => {
-      for daemon in daemons {
-        daemon.stop();
-      }
-      panic!("setup: {why}");
-    }
-  };
   let successor =
     rendezvous_first(&[hosts[1], hosts[2]], ObjectId(id.bytes)).expect("a survivor takes over");
   let index = usize::from(successor != hosts[1]);
   let instance = daemons[index].instance().to_owned();
-  let report = |daemons: &[Daemon]| {
-    let served = poll_status_answers(&daemons.iter().collect::<Vec<_>>(), &instance, id);
-    (served, loss_of(&mut Client::connect(&instance), id))
-  };
-  let (served, before) = report(&daemons);
+  let (served, before) = served_loss(&daemons, &instance, id);
   daemons.remove(index).stop();
   daemons.insert(index, fleet.start(index + 1));
   let member_after = daemons[index].member_identity();
-  let (served_again, after) = report(&daemons);
+  let (served_again, after) = served_loss(&daemons, &instance, id);
   let read = read_at_head(&mut Client::connect(&instance), id, "/taken");
   for daemon in daemons {
     daemon.stop();
