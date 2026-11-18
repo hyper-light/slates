@@ -996,6 +996,9 @@ volume requires a matching profile), `MeasurementTimeout`.
 > announcement stood in: the probe read 0.14–0.85 µs, and the window, quantum and spin derived from it were a hundred
 > times too small. Now it reads 6.0–9.1 µs on CI's quiet runners. The daemon's idle window, which it then scaled, is
 > R9's floor on Linux and macOS since A-223's window rule (§4.7, 2026-11-11); Windows keeps the multiple (GAPS).
+> The three profiling calls are found in kernel32 at run time (A-357, 2026-11-18): Nano Server's kernel32 lacks them,
+> and the binary that imported them did not start there. Where they are missing the switch count is unknown, as when
+> the OS refuses the profiling.
 
 > **Status (2026-09-25, the wake probe measures one event and reports its mean).** The probe timed every park/unpark round trip, so it mixed an on-CPU handoff (about 0.45 µs, the waiter still running or on the waker's CPU) with a real wake (about 10 µs); thread placement holds for a run, so runs split between the two (median 416 ns or 10,041 ns on the same two container cores, a minute apart), and it stopped on the median's interval while its consumers read the p99 — often the maximum of 64 samples (667 ns to 511,042 ns). Now the waiter is confirmed asleep (Linux `/proc` state, macOS `thread_info`; Windows the waiter's announcement, reported unconfirmed), the pair is placed as production is (the control core waking a shard core where the OS pins; unpinned on macOS, with the same-CPU share recorded), the probe converges the mean — the spin-then-park rule's threshold is the expected cost of parking, and a spinning waiter on the same pinned cores never saw the tail (p99 ≤ 209 ns) while a parked one did (285–639 µs) — and five fresh-thread rounds are compared by their medians (a disagreement lists the probe degraded, `wake.rounds`). Measured on a quiet host: the median held at 8.9–10.8 µs over ten container runs and the mean at 15.1–17.6 µs on four CPUs; macOS's mean held at 2.03–2.49 µs. The spin window, the step quantum and the timer tick now read the mean, the runtime's inbound ring the p99 at its overflow target, the guest credit's kick round trip the mean; a profile of another format version is refused by name, and a daemon handed one by an older anchor measures its own. The boot mean is quick on a virtual machine (±20–30 % in 250 ms at a coefficient of variation of five to seven); since A-31 (2026-09-25) it is only the prior of each shard's and each client's online estimate, refined from the confirmed wakes they pay (§4.3 and §4.7 status), and the long-step count attributes each long poll to its task or to the host rather than reading wall time. Record: `docs/bugs/2026-09-22-wake-probe-mixes-two-events-and-reports-an-unconverged-tail.md`.
 
@@ -4375,15 +4378,20 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
   collector of descriptors in flight flushes a socket whose every copy rides a message), with the token and the
   stream's owner view as its session, updated when the guest names its owner, and released when the attachment ends or
   its guest first maps a file with DAX (whose stores then live where only the device maps them).
-  A successor hands the device a fresh stream over it in a `Resync` naming the same token; the device takes nothing
-  else (default deny), resends its outstanding request whole, and asks again for its DAX descriptors; the successor
-  answers a request the dead daemon published and never answered from that reply, never by running it again;
+  A successor hands the device a fresh stream over it in a `Resync` naming the same token, and keeps its own copy of
+  the fresh end until the device shows it holds its own, by its first bytes on the stream or by its end of the channel
+  closing, which the stream's task watches for meanwhile (A-339: the `Resync` waits in the device's channel until the
+  device reads it, and a socket whose every copy rides a message is what macOS's collector flushes); the device takes
+  nothing else (default deny), resends its outstanding request whole, and asks again for its DAX descriptors; the
+  successor answers a request the dead daemon published and never answered from that reply, never by running it
+  again;
 - the peer's close, a hostile frame, a detach, a revocation, the volume's destroy and the daemon's stop end the
   attachment one way: its references swept, its record removed, its resync channel released. A daemon's death ends
-  nothing by itself: recovery keeps a Shards attachment whose resync end the anchor held (Linux; A-316) and serves it on
-  a fresh stream, its owner view and token from the hold, its references and opens from the image, the reply the dead
-  daemon published and never wrote answering the request the device resends, and the writes it acknowledged after its
-  last publication replayed from the write log (A-63) as a mount's are; it removes any other's record, as before.
+  nothing by itself: recovery keeps a Shards attachment whose resync end the anchor held (Linux, A-316; macOS, A-339)
+  and serves it on a fresh stream, its owner view and token from the hold, its references and opens from the image,
+  the reply the dead daemon published and never wrote answering the request the device resends, and the writes it
+  acknowledged after its last publication replayed from the write log (A-63) as a mount's are; it removes any other's
+  record, as before.
 
 > **Status (2026-10-24).** Built and proven by use, in-process: `crates/server/src/shards.rs` (the serve task),
 > `crates/ipc/src/stream.rs` (the pair), `crates/bridge-fuse/src/shards_fs.rs` (the frames and their answers),
@@ -4499,6 +4507,19 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 > removed alone fails its test: among them the kept copy (the held end arrived flushed in 3 of 3 runs) and the stream
 > pair (a datagram pair's survivor waited out its read's 5 s bound). Owed on macOS: the successor's half (the write log
 > there, recovery keeping the attachment, the fresh stream handed over the held end).
+
+> **Status (2026-11-18, A-339, the successor's half on macOS).** Built and proven by use on macOS (a Mac Studio, kiln
+> run r2527). A macOS daemon keeps the resync ends the anchor hands it, recovery keeps a stream whose end was held, and
+> the successor serves it on a fresh stream, its writes logged and replayed and its barrier replies kept as on Linux.
+> With the test as the anchor and the devices, across a daemon's death: three streams are resynced while another
+> thread opens and closes Unix sockets and the devices leave their `Resync`s unread for 200 ms, each fresh end
+> arriving live; the resent exclusive CREATE is answered from the dead daemon's published reply; the write acknowledged
+> after the last publication reads back; each device that wrote is counted as having taken its fresh end; and a device
+> that goes without a byte on its fresh stream ends its attachment, its hold released
+> (`crates/server/tests/shards_resync_restart.rs`, now on every Unix). Each of seven guards removed alone fails it:
+> the stream's write log, the kept barrier reply, recovery keeping the stream, the replay, the successor's copy of the
+> fresh end (the end arrived flushed in 3 of 3 runs), the channel's watch, and the macOS daemon keeping its held
+> devices. Owed: the anchor holding a stream's DAX objects; Windows; and the siblings GAPS names.
 
 > **Status (2026-11-18, A-303, a VM's save and restore).** Built and proven by use. Over a real daemon, a guest's SAVE
 > is answered with tables and leaves the volume's newest snapshot; a fresh stream of a clone of that snapshot takes
@@ -23455,7 +23476,8 @@ form, the judgment under the route's stated differences), and CI's `windows-lint
     the `git` workload's link goes through the drive's reparse points (A-275) on one side and NTFS's on the other.
     Every other shell ignores the variable. **Amended by A-327 (2026-11-18):** the variable is set on the workload's
     `ln -s` alone, since git reads it too and then cannot change directory on the drive; and the shared environment
-    sets `MSYS_NO_PATHCONV`, so the shell hands Subversion's `^/` URLs on as written.
+    has the shell hand Subversion's `^/` URLs on as written (`MSYS2_ARG_CONV_EXCL=^/` since the same day's correction
+    in A-327; A-327's first form, `MSYS_NO_PATHCONV`, stopped every conversion, and Mercurial's launcher needs one).
 - **The drive's stated difference: no hard link.** WinFsp's driver answers `FileLinkInformation` with
   `STATUS_NOT_SUPPORTED` itself, before any file system is asked (v2.1, `src/sys/fileinfo.c` 2023-2025); its volume
   parameters' `HardLinks` bit reads "unimplemented; set to 0" (`inc/winfsp/fsctl.h` 213); and its NTFS compatibility
@@ -24832,6 +24854,23 @@ with a decision for Ada), and `crates/conformance/src/workload.rs` (`ENVIRONMENT
   Subversion workload's own paths are already in the drive form, `pwd -W`).
 - **The failing test** is the lanes' workloads step itself, red in run 44260193629 on both architectures; nothing else
   runs Git for Windows. Its next run is the check.
+- **Corrected the same day (CI run 44271637767, both architectures).** That run had Subversion identical, and every
+  `hg` exit 2 on both sides: `python.exe: can't open file 'D:\\c\\hostedtoolcache\\…\\Scripts\\hg'`. pip's `hg` is a script
+  whose `#!` line names `python.exe`; the shell starts Python with the script's path as its first argument, and that
+  path, `/c/hostedtoolcache/…/Scripts/hg` as the shell found it on the `PATH`, is one the shell must convert, which
+  `MSYS_NO_PATHCONV` stops for every argument (Git for Windows' runtime: `find_path_start_and_type` in
+  `winsup/cygwin/msys2_path_conv.cc`). Python read it on the current drive, `D:\c\…`. The shared environment now names
+  the one prefix to leave alone instead, `MSYS2_ARG_CONV_EXCL=^/` (a `;`-separated list of argument prefixes the
+  runtime passes on unconverted, `arg_heuristic_with_exclusions` in `winsup/cygwin/path.cc`, called for each argument
+  of a Windows program in `spawn.cc`), so Subversion's `^/` URLs reach `svn` as written and every other argument is
+  converted as before A-327. By the runtime's own rules each other argument the four scripts pass comes through as
+  written: a `file:///D:/…` URL is copied as a URL, `D:/…`, `svn:date` and `1:HEAD` as Windows paths, relative paths
+  and words as they are (`find_path_start_and_type`); under them Mercurial ran identical in CI run 44260193629, while
+  the Subversion script stopped at its first `^/` there (the harness runs every script under `set -e`). Test:
+  `under_the_environment_git_for_windows_sh_starts_hg_and_hands_on_a_relative_url`
+  (`crates/conformance/src/workload.rs`, run by both Windows lanes once their tools are installed): `hg version` and
+  Python's echo of `^/trunk` under the shared environment, red under `MSYS_NO_PATHCONV` (exit 2) and under no setting
+  (`^C:\Program Files\Git\trunk`).
 
 ### A-328 — A new object takes its group by the rule of the kernel its route serves: System V's for Linux kernels, its host's own over the NFS export, BSD's on macOS (2026-11-18, A-289's macOS run; Ada's goal of 2026-11-18)
 Applied in the same change to: §4.6 ("POSIX and transparency acceptance": the group a new object takes), GAPS (A-289's
@@ -24857,7 +24896,8 @@ entry; the AUD-29-81 row), `crates/bridge-core/src/group_rule.rs` (new: `GroupRu
   of the request and never authority. It is no mode switch: each route keeps one rule, the one its kernel has.
 - **Kept.** The volume root is its provisioning user's (`stamp_root_owner`), so in an ordinary tree BSD's parent group
   is the user's own group, as the root:wheel fix of 2026-09-09 asked; only a parent of another group now gives that
-  group, as APFS does. pjdfstest accepts either group for a new object (`mkdir/00.t`, `open/00.t`).
+  group, as APFS does. pjdfstest accepts either group for a new object (`mkdir/00.t`, `open/00.t`); `chown/00.t` does
+  not, for an object root makes (below).
 - **Tests.** Red first: `bsds_rule_gives_each_new_object_its_parents_group_and_no_directory_the_bit`
   (`crates/bridge-core/tests/volume_bridge.rs`), a directory made in a set-group-ID parent reading the bit before the
   stamp asked the rule; with it, `system_vs_rule_gives_a_set_group_id_parents_group_and_bit_and_else_the_creators_group`
@@ -24868,6 +24908,18 @@ entry; the AUD-29-81 row), `crates/bridge-core/src/group_rule.rs` (new: `GroupRu
   `crates/server/tests/nfs_mount.rs`) expected System V's group on every host and failed on macOS once A-328 landed
   (MKDIR's group 20, the root's, where it expected the caller's 1001; found by g251, 2026-11-18): it now states the
   rule per host, the parent's group on macOS and the caller's elsewhere, each owner still the caller.
+- **What it broke in the conformance harness (2026-11-18).** The macOS leg's pjdfstest, run as root (CI run
+  44271637767), failed 63 cases of `chown/00.t` its reviewed list does not name, cases 292 to 370 and 1055 to 1278,
+  each `expected 0,0, got 0,20`, where the run before A-328 had none. Those cases make an object as root, leave its
+  owner alone and expect it in group 0, which BSD's rule gives only in a directory of group 0: the test makes its own
+  directory in the one it starts in, and that one was the harness's, made as its own user, in group staff (20). APFS
+  would answer the same. pjdfstest is root's suite, run in the file system under test (its README: "You must be root",
+  then `cd /path/to/filesystem/under/test`), whose directory there is root's, group 0 included; so a root run now starts
+  in a directory handed to root, owner and group 0 (`hand_to_root`, `xtask/src/conformance/suites.rs`), on every host,
+  and its record's command says so. Linux's System V rule gave root's objects group 0 whatever the directory's group,
+  so nothing changes there, and no listed case is about a group. Test:
+  `what_root_makes_where_a_root_run_starts_is_in_group_0` (the same file), run by CI's macOS gates job, whose runner
+  has passwordless `sudo`; it skips loudly without it.
 
 ### A-309 — An unresolved object is recovered, not just kept: a takeover settles only on its completion record, and the members that exist now recover what a cohort past its tolerance holds (accepted 2026-11-18, kiln goal g250, A-272 (ii); built 2026-11-18)
 
@@ -25854,6 +25906,38 @@ Applied in the same change to:
   Linux (GitHub's ubuntu runner, run 44327865763): the same focused tests and A-316's restart test pass.
 - **Owed** (GAPS): the successor's half on macOS (the write log there, recovery keeping a stream whose resync end the
   anchor held, the fresh stream handed over it); the rest as A-316 says.
+- **The successor's half on macOS** (built the same day). Applied in the same change to: §4.6 (the resync bullet,
+  the teardown bullet, a status of this date), GAPS, `docs/cli.md`, `slates_bridge_fuse::shards_resync` (the device
+  closes its channel's end when it ends its share), and in `crates/server`: `write_log` and `fuse_hold` on every Unix
+  (FUSE's flush rule, `WriteLog::holds_every_write`, and a FUSE device's session stay Linux's); the state's write log,
+  replay, lost-writes flag and pending and recovered replies on every Unix (`state.rs`, `daemon.rs`'s
+  `content_slice`, `purge_write_log` and `ShardHolds`); a macOS daemon keeps the devices the anchor hands it (the
+  release of every one, `release_devices_without_fuse`, removed); `verbs.rs` replays the log, carries the replies and
+  keeps a held stream at recovery on every Unix; `shards.rs`'s replay, `keep_pending_reply`, `log_write` and
+  `adopt_held` on every Unix, a held device no record claims released there (moved from `fuse::adopt_held`, which runs
+  first), and the kept copy of the fresh end (`ShardsStream::fresh_copy`; `wait_for_work`, `watched`, `abandoned`;
+  counters `shards.resync_taken`, `shards.resync_abandoned`, `shards.resync_writes_unreported`).
+  - **What was there.** A macOS daemon released every device the anchor handed back, since it serves no FUSE, so a
+    held resync end was released at once and the device read the channel's end; and macOS had no write log, so a
+    stream's write acknowledged after the last publication was lost at a death, resynced or not.
+  - **The successor's copy of the fresh end.** A successor sends the `Resync` with the device's end of a fresh stream,
+    which then waits in the device's channel until the device reads it: dropped there, its only copy rides the
+    message, and macOS's collector flushes it (3 of 3 runs with the devices' reads held off 200 ms under socket churn).
+    So the successor keeps its copy until the device shows it holds its own: its first bytes on the stream
+    (`shards.resync_taken`), or a wake of the resync channel, which is one way, so it wakes only when the device's end
+    closes (`shards.resync_abandoned`; the copy let go, the stream sees its peer gone and the attachment ends). Linux
+    runs the same rule.
+  - **A death's lost writes are counted.** When the dead daemon's log overflowed, a resynced stream's guest is not told
+    which writes it lost (a FUSE mount's is, `LostWrites`), so the successor counts
+    `shards.resync_writes_unreported` and GAPS keeps the gap.
+  - **Evidence.** A Mac Studio, kiln run r2527: the focused tests pass (`shards_resync_restart`, `shards_resync`, the
+    write log's and the replay's unit tests, the route's), and each of seven guards removed alone fails the restart
+    test. Linux (adacachy, kernel 7.2.9, kiln run r3191; and GitHub's ubuntu runner, kernel 7.0.0-1016-aws, run
+    44329563487, with the client's stream tests too): the same focused tests pass, A-316's restart test among them
+    (its devices' reads held off under churn there too, where nothing is flushed), and the FUSE held-mount restart
+    tests of `crates/cli/tests/cli.rs` (`a_write_in_flight_at_the_daemons_kill_is_resent_and_every_acknowledged_write_survives`,
+    `a_fuse_mount_whose_daemon_was_killed_is_ended_by_the_restarted_daemon`), which the moved release of unclaimed
+    held devices runs beside.
 
 ### A-352 — A forward lane is judged in the daemon's own time under starvation: its recovery counted in periods, and a forward never refused below its path's measured floor (2026-11-18, built for goal g255; the integrator's starved runs of goal g245's tests; the supervisor's rule "run at the measured floor and report it, never refuse below the floor")
 Applied in the same change to:
@@ -26182,6 +26266,49 @@ Applied in the same change to:
 - **The rule.** A held reply waits through a silence and is refused at the total bound of the durable-wait rule, the
   failover SLO from its hold: the operator's bound on how long an object may go unserved before a takeover serves it,
   past which a write not yet held is past what the fleet promises. The refusal is the request's recorded outcome.
+
+### A-364 — A ledger is adopted position by position: modelled, and the record half of GAP-A9-7 built on it (2026-11-18, kiln goal g250; §4.8 "Promotion and takeover", §4.16 "Commit"; GAP-A9-7, BUG-12)
+
+- **The model.** `docs/wip/models/FencedLedger.tla` (text, configurations `FencedLedger.cfg`, `FencedLedger_3.cfg`,
+  `FencedLedger_register.cfg`) models a green's merge-record log as §4.8 states its takeover: each holder keeps an
+  accepted `(epoch, value)` per position and a promise; phase one reports every position, and the new owner adopts at
+  each the value accepted under the highest epoch among a majority's reports; it proposes in order, the adopted
+  positions again under its own epoch (BUG-12) and a position only once the one before committed under it, as the
+  merge plane ships a green's next version only once the last is placed. Checked: Agreement (no position commits two
+  values), Continuity (an adopted log holds every value committed at a lower epoch, whenever it commits),
+  AdoptedIsPrefix (no hole below a held position), StaleNeverCommits and ReadSafety. A switch puts the server's round
+  before the record half in its place (the highest record alone), and TLC must refute it.
+- **Results** (GAPS' model table): per-position adoption, no error at two epochs, 2,683,673 distinct states, depth 27;
+  the register's rule, Continuity violated at depth 14. The 2026-09-04 runs of `FencedRegister_2.cfg` and `Reconfig.cfg`
+  were re-run on the same toolchain and give the same counts. The three-epoch configuration is owed its result.
+- **The build owed** (GAPS, the record half): the green successor's materialization adopts, by this rule, the positions
+  between its own highest record and the adopted version from the members of the green's recovery cohorts, and
+  re-commits each under its own epoch, before it gathers the chain.
+
+Applied in the same change to: GAPS (the model table and its toolchain note; the record half's entry), and the model
+files.
+
+### A-357 — The thread-profiling calls are found in kernel32 at run time, so the Windows binary starts where kernel32 lacks them (2026-11-18, the release goals g236 and g237; a bug in A-223 found by the test tag `v0.1.0-test.3`)
+Applied in the same change to: §4.1 (A-223's status), GAPS (the binary release lane's entry), `crates/machine`
+(`switches.rs`), `unsafe-budget.toml` (`slates-machine` 81 → 85), and the bug record of 2026-11-18.
+- **The defect.** A-223's `switches.rs` imported `EnableThreadProfiling`, `ReadThreadProfilingData` and
+  `DisableThreadProfiling` from kernel32. Nano Server's kernel32 exports none of them, and Windows refuses to start a
+  binary that imports a function its DLL lacks: on the test tag `v0.1.0-test.3` (run 44326428333, main 1cd57d18b) the
+  x86_64 binary exited 0xC0000139, `STATUS_ENTRYPOINT_NOT_FOUND`, in a process-isolated `nanoserver:ltsc2025`
+  container, where main's binary of that morning (843f527ff, run 44266895044) had answered `slates version`. The two
+  binaries' import tables (`llvm-objdump -p`: 215 functions and 218) differ by exactly those three.
+- **The decision.** Find the three at a thread's first read with `GetModuleHandleW` and `GetProcAddress`, typed by the
+  documented signatures, as `slates-rt` finds `NtQuerySystemInformation` (`thread_clock.rs`), and answer `None` where
+  any is missing: the answer the module already gave when the OS refuses the profiling. The wake probe reads it as
+  an unknown sleep, and a shard learns its park's wake without the unslept filter, as on macOS. No second path is
+  added: where kernel32 has them, the same calls run with the same arguments. Rejected: running the gate in Server Core instead of Nano Server, which would keep a binary
+  that cannot start in the smallest Windows image and weaken the check that proves the C runtime is linked in.
+- **Proof (diag-g071-nano-1, run 44332283768, 2026-11-18).** Built as the release lane builds it and started in a
+  process-isolated `nanoserver:ltsc2025` on `windows-2025`: main 68148152d exited 0xC0000139, the same commit with this
+  change answered `slates 0.1.0`, and its import table holds none of the three. The module's test
+  (`a_blocked_thread_switched_and_a_running_one_did_not`) passed on Windows x86_64 and arm64, where kernel32 has them.
+- **Not covered by a push.** Only the release lane runs the Nano Server check (a tag or a dry run). A regression of
+  this kind shows on the next test tag, not on the push that makes it.
 
 ### A-351 — A takeover the retired owner cannot lease against completes, and one that gave objects up starts over once its retired owner is heard again, so a fleet settles on one configuration once its faults stop (2026-11-18, goal g225: a forming fleet reaches every candidate; §4.8 "Leases and reads", "Promotion and takeover", "Membership fed by SWIM"; the chaos nemesis, seeds 6876545201569229162 and 7236833171758868842; AUD-08, A-15, A-304)
 

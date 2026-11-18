@@ -535,13 +535,18 @@
 >   at a death for streams that are not resynced. **And on macOS (A-339, 2026-11-18), the attach's half:** the channel
 >   a stream of 28-byte messages there (a datagram pair's survivor is never told its peer has gone), its device end
 >   beside the stream's in the socket route's confirmation, and the daemon keeping its own copy of its held end, since
->   macOS flushes a socket whose every copy rides a message. **Owed:** macOS's successor's half (the write log there,
->   recovery keeping the attachment, the fresh stream handed over the held end); the anchor holding a stream's DAX
->   objects (until then a stream gives its resync up at its guest's first DAX map); Windows on Shards' handle path, and
->   a write log for a Windows stream, whose acknowledged writes a death still loses whether or not it is resynced.
->   Found beside it (Linux too): a resynced stream whose dead daemon's log overflowed is not told which writes it lost
->   (a FUSE mount is, `LostWrites`); and a stream's `FORGET`s are not logged, so a resynced stream keeps the references
->   a lost one gave back until it ends. Shards owes its device's half, after its v0.8.0 tag.
+>   macOS flushes a socket whose every copy rides a message. **And the successor's half on macOS (A-339, the same
+>   day):** the write log and its replay, the kept barrier replies, recovery keeping a stream whose end the anchor held,
+>   and the successor keeping its copy of the fresh end until the device's first bytes on it or the channel's close.
+>   **Owed:** the anchor holding a stream's DAX objects (until then a stream gives its resync up at its guest's first
+>   DAX map); Windows on Shards' handle path, and a write log for a Windows stream, whose acknowledged writes a death
+>   still loses whether or not it is resynced. Found beside it (Linux and macOS): a resynced stream whose dead daemon's
+>   log overflowed is not told which writes it lost (a FUSE mount is, `LostWrites`; counted,
+>   `shards.resync_writes_unreported`); a stream's `FORGET`s are not logged, so a resynced stream keeps the references
+>   a lost one gave back until it ends; and a stream's `close` publishes even when the log holds every write it
+>   acknowledged, where a mount's skips it (A-63's flush rule: a FUSE request that published took 105 us p50 against
+>   15 us for a read, 2026-10-06).
+>   Shards owes its device's half, after its v0.8.0 tag.
 > - Shards' side, after its v0.8.0 tag and landed by its coordinator from signed branches: its own server enforcing a
 >   guest's ACLs as slates now does (`FUSE_POSIX_ACL`, queued by its coordinator), its guest test over a
 >   slates stream on Linux and macOS (`tests/slates_fs.rs`, Windows only today), the bump of the slates revision it
@@ -653,7 +658,11 @@
 > Subversion failed on both sides: Git for Windows' shell rewrote the argument `^/trunk` as a path,
 > `^C:\Program Files\Git\trunk` (svn `E020024`). Fixed: the variable is set on the git workload's `ln -s` alone, so git
 > runs as Git for Windows ships it, its symbolic links off; and `MSYS_NO_PATHCONV=1` hands every argument on as
-> written. **Open, a limitation of the route (A-327):** on the drive, git with its symbolic links on (Git for Windows'
+> written. **Corrected the same day (CI run 44271637767, both architectures; A-327):** Subversion ran identical, and
+> every `hg` exited 2 on both sides, Python handed `/c/hostedtoolcache/…/Scripts/hg` unconverted (pip's `hg` is a `#!`
+> script naming `python.exe`, started with the script's path as its argument) and reading it on drive `D:`. The shared
+> environment now leaves only Subversion's `^/` URLs unconverted (`MSYS2_ARG_CONV_EXCL=^/`), red-tested by
+> `under_the_environment_git_for_windows_sh_starts_hg_and_hands_on_a_relative_url` on both Windows lanes. **Open, a limitation of the route (A-327):** on the drive, git with its symbolic links on (Git for Windows'
 > installer option, or `core.symlinks=true`) cannot change directory, and so cannot run there; any other program that
 > asks a file's final path with `VOLUME_NAME_DOS` is refused the same way (Python's `os.path.realpath` raised it on a
 > WinFsp drive in WinFsp issue 427). **Decision for Ada:** (a) state it, the route's limitation (recommended now: no
@@ -864,7 +873,12 @@
 > 44252296495), and Subversion with only the item order A-319 fixed. In 44260193629 the macOS leg ran git, git's history,
 > Mercurial and cargo identical, and Subversion differed at `repo/db/revprops`, `755` on the host and `2755` over the
 > mount: slates gave a directory made in a set-group-ID parent the bit, System V's rule, where APFS gives none; fixed
-> by A-328 (the NFS export gives its host's rule, BSD's on macOS), failing test first; (2) ~~the Windows WinFsp roster~~ **built 2026-11-17 (A-300, above)**: WinFsp's driver
+> by A-328 (the NFS export gives its host's rule, BSD's on macOS), failing test first. In the next run with A-328
+> (44271637767, main 7d760c4e) macOS ran all twelve workloads identical, Subversion's included; and pjdfstest there failed
+> 63 cases of `chown/00.t` unlisted (`expected 0,0, got 0,20`): an object root makes takes the group of the directory
+> the run starts in under BSD's rule, and that directory was the harness's own user's (staff). pjdfstest assumes root's
+> directory, as the file system under test's is, so a root run now starts in a directory handed to root, owner and
+> group 0 (A-328's entry); (2) ~~the Windows WinFsp roster~~ **built 2026-11-17 (A-300, above)**: WinFsp's driver
 > has no hard links (winfsp.dev's NTFS compatibility page), so Mercurial and git copy where NTFS links, now the
 > route's stated difference; git's symbolic-link probe needed reparse points, which the drive serves since A-275
 > landed (2026-11-17, below); (3) ~~a Linux FUSE leg outside a container~~
@@ -3385,6 +3399,13 @@
 >   `panic = "abort"`). Every shipped print site now writes through `slates_machine::log`, which counts a refused line
 >   and drops it. The failing-first test is `an_anchor_whose_log_reader_went_away_keeps_supervising`
 >   (`crates/cli/tests/cli.rs`). Record: `docs/bugs/2026-11-05-a-closed-log-pipe-ended-the-anchor.md`.
+> - **Closed 2026-11-18 (A-357): the Windows x86_64 binary did not start in Nano Server** (found by the test tag
+>   `v0.1.0-test.3`, run 44326428333: `slates version` exited 0xC0000139, `STATUS_ENTRYPOINT_NOT_FOUND`, so `stage`
+>   could not run and no draft was made). A-223 had imported three kernel32 functions that Nano Server's kernel32
+>   lacks (`EnableThreadProfiling`, `ReadThreadProfilingData`, `DisableThreadProfiling`). `slates-machine` now finds
+>   them at run time, and where they are missing the switch count is unknown, as when the OS refuses the profiling.
+>   Only the release lane runs the Nano Server check, so no push to main showed it. Record:
+>   `docs/bugs/2026-11-18-the-windows-binary-did-not-start-in-nano-server.md`.
 > - **Reproducible from the tag (2026-11-05, AC-9.5).** Every target is built twice on separate runners, and the
 >   release is refused unless the two copies are the same bytes. The four Linux binaries already were. The Windows
 >   ones differed in 20 bytes, the linker's timestamps and PDB GUID (run 42046848954), until `/Brepro`; with it, all six
@@ -7324,13 +7345,20 @@ Every phase retains its original acceptance gates plus the A-9 additions.
 | `models/Reconfig.tla` | Old {a1,a2,a3} → New {a2,a3,a4}, three records | no error (ReadSafety, NoLoss, TypeOK) | 20,478 distinct | 19 | 2026-09-04 |
 | `models/FencedRegister.tla` | 3 holders, 2 hosts, 2 epochs, 2 records per epoch | no error (TotalOrder, Continuity, StaleNeverCommits, ReadSafety, TypeOK) | 1,432,929 distinct | 27 | 2026-09-04 |
 | `models/FencedRegister.tla` | 3 holders, 2 hosts, 3 epochs, 2 records per epoch | not completed: stopped after 3 h 7 min with 83 GB of queued states on disk; needs symmetry reduction (TLC symmetry sets over Acceptors and Hosts) and a bounded record alphabet before it is feasible; the two-epoch result stands (one takeover plus a resumed stale owner) | — | — | 2026-09-04 |
+| `models/FencedRegister.tla` | `FencedRegister_2.cfg`, re-run (A-364): 3 holders, 2 hosts, 2 epochs, 2 records per epoch | no error, the same as 2026-09-04 (TLC 1.7.4, Temurin 21.0.13, `-deadlock`, 8 workers, Mac Studio, 1 min 16 s) | 1,432,929 distinct | 27 | 2026-11-18 |
+| `models/Reconfig.tla` | `Reconfig.cfg`, re-run (A-364) | no error, the same as 2026-09-04 (1 s) | 20,478 distinct | 19 | 2026-11-18 |
+| `models/FencedLedger.tla` | `FencedLedger.cfg` (A-364): 3 holders, 2 hosts, 2 epochs, 2 positions, 2 values, per-position adoption | no error (TypeOK, Agreement, Continuity, AdoptedIsPrefix, StaleNeverCommits, ReadSafety; 2 min 11 s) | 2,683,673 distinct | 27 | 2026-11-18 |
+| `models/FencedLedger.tla` | `FencedLedger_register.cfg` (A-364): the same under the register's rule, the highest record alone (the server's round before the record half) | Continuity violated, as it must be (non-vacuity): the adopted log lacks a committed lower position | 29,623 distinct at the violation | 14 | 2026-11-18 |
 
 The models are architecture artifacts, not CI jobs. These historical runs apply only to the
 listed models and configurations. The Rust simulations are evidence with known gaps, not a
 proof or established refinement (BUG-12/13). A-9 corrects §4.8; refinement/revalidation remains
-owed before GAP-A9-7 closes. Running a checker requires separate explicit tooling authorization;
-none ran for A-9. Any authorized rerun must bound work and keep state outside the project tree: TLC's disk-backed state queue otherwise lands in `docs/wip/models/states`, which
-is what happened on 2026-09-04 (83 GB, removed).
+owed before GAP-A9-7 closes. Model checking is allowed since 2026-11-18 (CLAUDE.md §2 item 13 removed): the
+re-runs and `FencedLedger` above ran with a user-space JDK and `tla2tools.jar` under `~/.cache` on the runner, each
+bounded, its state queue outside the project tree (`-metadir`): TLC's disk-backed state queue otherwise lands in
+`docs/wip/models/states`, which is what happened on 2026-09-04 (83 GB, removed). The command, from a copy of the models:
+`java -XX:+UseParallelGC -Xmx12g -cp tla2tools.jar tlc2.TLC -workers 8 -deadlock -cleanup -metadir <outside> -config
+<cfg> <spec>.tla` (`-deadlock` because each model's runs end: bounded epochs and records).
 
 Two modelling bugs were found and fixed before the runs passed: the first draft let an owner issue two
 different records for one sequence number (a model error, not a design error), and its Fencing
@@ -17567,7 +17595,18 @@ suite on adacachy2 and 1 of 3 of the stack's (the supervisor's gate); alone it p
   (`slates-server --lib` 266 of 266, macOS arm64, 2026-11-18).
 - **Open, the record half (GAP-A9-7):** a successor whose own records end two or more versions below the adopted one
   lacks the intermediate records themselves (phase one reports each holder's highest record only), which no fetch by
-  identity can fill; it is still given up `chain` at the bound.
+  identity can fill; it is still given up `chain` at the bound. **Modelled (A-364, g250, 2026-11-18):**
+  `docs/wip/models/FencedLedger.tla` adopts a ledger position by position, as §4.8 states it, and TLC finds no error at
+  two epochs (2,683,673 distinct states; Agreement, Continuity, AdoptedIsPrefix, StaleNeverCommits, ReadSafety), while
+  the register's rule, the highest record alone, fails Continuity (the model table below). Owed, the build (g250): the
+  successor's green materialization, finding positions between its own highest record and the adopted version unknown
+  here (`merge_service::unheld_green_inputs` answering none), asks the members of the green's recovery cohorts for the
+  positions in that range under the round's epoch (a holder promises the object, raising its fence, and reports each
+  accepted position with its epoch), adopts at each position the record accepted under the highest epoch among a
+  recovery quorum of each cohort, re-commits each under its own epoch (phase-two acceptance at a new epoch records that
+  epoch, BUG-12), and then gathers the chain; holders already keep a ledger's every position (`Acceptor::accepted`,
+  never compacted for a merge chain). The takeover's share stays open while the green is pending (A-345's
+  `takeover::materializing`), so its holders still authorize the question.
 
 ### 2026-11-07: a daemon killed inside its profile's republication refused every successor — fixed
 

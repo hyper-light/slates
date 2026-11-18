@@ -11,11 +11,17 @@
 //!   between a wait's entry and its block. Windows has no other per-thread switch count short of a system-wide
 //!   snapshot, and its per-thread times tick at about 15.6 ms. Profiling is enabled once per thread, on its first
 //!   read, and disabled when the thread ends.
+//!
+//!   The three calls are found in kernel32 at run time, never imported (A-357). Nano Server's kernel32 exports none of
+//!   them, and Windows refuses to load a binary that imports a function its DLL lacks: once A-223 imported them, the
+//!   x86_64 binary exited 0xC0000139 (`STATUS_ENTRYPOINT_NOT_FOUND`) in `nanoserver:ltsc2025` before any of its code
+//!   ran, where the binary without them had answered `slates version` that morning (release runs 44326428333 and
+//!   44266895044, 2026-11-18). Where kernel32 lacks them the count is `None`, as when the OS refuses the profiling.
 //! - **Elsewhere:** `None`. Linux's waits are judged by `getrusage(RUSAGE_THREAD)`'s voluntary switches in `slates-rt`
 //!   and the probe's by `/proc` state; macOS's probe by `thread_info`.
 
 /// The calling thread's context switches since it first asked, where the OS counts them for the thread itself
-/// (Windows); `None` elsewhere, or when the OS refuses the profiling.
+/// (Windows); `None` elsewhere, where kernel32 lacks the profiling calls, or when the OS refuses the profiling.
 #[cfg(windows)]
 pub fn switches_now() -> Option<u64> {
   windows::PROFILING.with(|profiling| profiling.as_ref().and_then(windows::Profiling::switches))
@@ -29,11 +35,19 @@ pub fn switches_now() -> Option<u64> {
 
 #[cfg(windows)]
 mod windows {
-  use windows_sys::Win32::Foundation::HANDLE;
-  use windows_sys::Win32::System::Performance::HardwareCounterProfiling::{
-    DisableThreadProfiling, EnableThreadProfiling, PERFORMANCE_DATA, ReadThreadProfilingData,
-  };
+  use windows_sys::Win32::Foundation::{FARPROC, HANDLE};
+  use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+  use windows_sys::Win32::System::Performance::HardwareCounterProfiling::PERFORMANCE_DATA;
   use windows_sys::Win32::System::Threading::GetCurrentThread;
+
+  /// `EnableThreadProfiling` [B: Microsoft Learn]: the thread, the flags, the hardware counters, and where the
+  /// profiling handle is written; it answers a Win32 error code.
+  type Enable = unsafe extern "system" fn(HANDLE, u32, u64, *mut HANDLE) -> u32;
+  /// `ReadThreadProfilingData` [B: Microsoft Learn]: the profiling handle, the flags and the record it fills; it
+  /// answers a Win32 error code.
+  type Read = unsafe extern "system" fn(HANDLE, u32, *mut PERFORMANCE_DATA) -> u32;
+  /// `DisableThreadProfiling` [B: Microsoft Learn]: the profiling handle; it answers a Win32 error code.
+  type Disable = unsafe extern "system" fn(HANDLE) -> u32;
 
   /// Format: `THREAD_PROFILING_FLAG_DISPATCH` (winnt.h): collect the thread's dispatch data, its switch count.
   const THREAD_PROFILING_FLAG_DISPATCH: u32 = 1;
@@ -44,25 +58,73 @@ mod windows {
   /// Format: `ERROR_SUCCESS`, what both calls answer when they succeed (they return a Win32 error code).
   const ERROR_SUCCESS: u32 = 0;
 
-  /// The calling thread's profiling handle, disabled when the thread ends.
-  pub(super) struct Profiling(HANDLE);
+  /// The three profiling calls as kernel32 exports them, found at run time (see the module doc).
+  struct Calls {
+    /// `EnableThreadProfiling`.
+    enable: Enable,
+    /// `ReadThreadProfilingData`.
+    read: Read,
+    /// `DisableThreadProfiling`.
+    disable: Disable,
+  }
+
+  impl Calls {
+    /// The three calls in kernel32, or `None` where it lacks any of them (Nano Server's has none of the three).
+    fn find() -> Option<Calls> {
+      let module_name: Vec<u16> = "kernel32.dll\0".encode_utf16().collect();
+      // SAFETY: `module_name` is NUL-terminated and outlives the call; kernel32 is mapped into every Windows process
+      // for the process's life, so the module handle stays valid, and each name passed to `GetProcAddress` is
+      // NUL-terminated. Each pointer found is kernel32's function of that name, whose signature its type states
+      // [B: Microsoft Learn, "EnableThreadProfiling", "ReadThreadProfilingData", "DisableThreadProfiling"]; a missing
+      // one is a null pointer, which becomes `None`.
+      unsafe {
+        let module = GetModuleHandleW(module_name.as_ptr());
+        if module.is_null() {
+          return None;
+        }
+        let enable = GetProcAddress(module, c"EnableThreadProfiling".as_ptr().cast());
+        let read = GetProcAddress(module, c"ReadThreadProfilingData".as_ptr().cast());
+        let disable = GetProcAddress(module, c"DisableThreadProfiling".as_ptr().cast());
+        Some(Calls {
+          enable: std::mem::transmute::<FARPROC, Option<Enable>>(enable)?,
+          read: std::mem::transmute::<FARPROC, Option<Read>>(read)?,
+          disable: std::mem::transmute::<FARPROC, Option<Disable>>(disable)?,
+        })
+      }
+    }
+  }
+
+  /// The calling thread's profiling handle, disabled when the thread ends, with the calls that read and disable it.
+  pub(super) struct Profiling {
+    /// The handle `EnableThreadProfiling` wrote.
+    handle: HANDLE,
+    /// `ReadThreadProfilingData`.
+    read: Read,
+    /// `DisableThreadProfiling`.
+    disable: Disable,
+  }
 
   impl Profiling {
-    /// Enables dispatch profiling on the calling thread; `None` when the OS refuses.
+    /// Enables dispatch profiling on the calling thread; `None` where kernel32 lacks the calls or the OS refuses.
     fn enable() -> Option<Profiling> {
+      let calls = Calls::find()?;
       let mut handle: HANDLE = std::ptr::null_mut();
-      // SAFETY: the calling thread's pseudo-handle, as `EnableThreadProfiling` requires (it profiles only the calling
-      // thread); no hardware counters asked; the handle is this frame's own, written by the call, and read only when
-      // the call answers success.
+      // SAFETY: `calls.enable` is kernel32's `EnableThreadProfiling`; it is passed the calling thread's pseudo-handle,
+      // as it requires (it profiles only the calling thread); no hardware counters asked; the handle is this frame's
+      // own, written by the call, and read only when the call answers success.
       let answer = unsafe {
-        EnableThreadProfiling(
+        (calls.enable)(
           GetCurrentThread(),
           THREAD_PROFILING_FLAG_DISPATCH,
           0,
           &mut handle,
         )
       };
-      (answer == ERROR_SUCCESS && !handle.is_null()).then_some(Profiling(handle))
+      (answer == ERROR_SUCCESS && !handle.is_null()).then_some(Profiling {
+        handle,
+        read: calls.read,
+        disable: calls.disable,
+      })
     }
 
     /// The thread's context switches since profiling was enabled.
@@ -72,10 +134,15 @@ mod windows {
         Version: PERFORMANCE_DATA_VERSION,
         ..PERFORMANCE_DATA::default()
       };
-      // SAFETY: this value's own live handle, read on the thread that enabled it (a thread-local); `data` is this
-      // frame's own record, its size and version stated as the call requires; read only when the call succeeds.
+      // SAFETY: `self.read` is kernel32's `ReadThreadProfilingData`; this value's own live handle, read on the thread
+      // that enabled it (a thread-local); `data` is this frame's own record, its size and version stated as the call
+      // requires; read only when the call succeeds.
       let answer = unsafe {
-        ReadThreadProfilingData(self.0, READ_THREAD_PROFILING_FLAG_DISPATCHING, &mut data)
+        (self.read)(
+          self.handle,
+          READ_THREAD_PROFILING_FLAG_DISPATCHING,
+          &mut data,
+        )
       };
       (answer == ERROR_SUCCESS).then_some(u64::from(data.ContextSwitchCount))
     }
@@ -83,9 +150,9 @@ mod windows {
 
   impl Drop for Profiling {
     fn drop(&mut self) {
-      // SAFETY: the handle is this value's own, made by `EnableThreadProfiling` on this thread and disabled only here,
-      // as the thread's locals are destroyed.
-      unsafe { DisableThreadProfiling(self.0) };
+      // SAFETY: `self.disable` is kernel32's `DisableThreadProfiling`; the handle is this value's own, made by
+      // `EnableThreadProfiling` on this thread and disabled only here, as the thread's locals are destroyed.
+      unsafe { (self.disable)(self.handle) };
     }
   }
 

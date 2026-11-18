@@ -12938,15 +12938,16 @@ pub(crate) async fn rebuild_recovered(
     nfs_states,
   } = recover_images(state);
   restore_nfs_answers(state, calls, nfs_replies);
-  // The barrier replies the dead daemon published and never delivered, for the mounts the anchor held (A-61).
-  #[cfg(target_os = "linux")]
+  // The barrier replies the dead daemon published and never delivered, for the mounts (Linux) and streams (A-316,
+  // A-339) the anchor held (A-61).
+  #[cfg(unix)]
   {
     state.recovered_replies = replies
       .into_iter()
       .map(|reply| (reply.attachment, (reply.unique, reply.reply)))
       .collect();
   }
-  #[cfg(not(target_os = "linux"))]
+  #[cfg(windows)]
   drop(replies);
   let mut rebuilt = Rebuilt::default();
   // Every block the images name is claimed before anything else allocates in the arena (A-64): the held
@@ -12967,13 +12968,17 @@ pub(crate) async fn rebuild_recovered(
   .await;
   rebuilt.blocks_swept = sweep_claims(state, claims);
   slices.unit_done().await;
-  // The FUSE writes acknowledged after the last publication, back on top of the rebuilt volumes (A-63).
+  // The writable copies the anchor held are taken back first, so every write the replay applies is written into them
+  // by the volume's write boundary (A-197).
   #[cfg(target_os = "linux")]
   {
-    // The writable copies the anchor held are taken back first, so every write the replay applies is written into them
-    // by the volume's write boundary (A-197).
     rebuilt.copies_adopted = crate::held_copy::adopt_inherited(state);
     slices.unit_done().await;
+  }
+  // The writes acknowledged after the last publication, a FUSE mount's (Linux) and a Shards stream's (Linux, macOS;
+  // A-316, A-339), back on top of the rebuilt volumes (A-63).
+  #[cfg(unix)]
+  {
     rebuilt.writes_replayed = replay_writes(state, slices).await;
   }
   // Hand out prefixes past every recovered one, so a new volume never collides with a recovered
@@ -14190,9 +14195,9 @@ fn held_nfs_replies_changed(state: &ShardState) -> bool {
 
 /// The barrier replies not yet delivered, which ride with the effects they answer (A-61).
 fn pending_replies(state: &ShardState) -> Vec<slates_vfs::recover::HeldReply> {
-  #[cfg(target_os = "linux")]
+  #[cfg(unix)]
   return state.pending_replies.values().cloned().collect();
-  #[cfg(not(target_os = "linux"))]
+  #[cfg(windows)]
   {
     let _ = state;
     Vec::new()
@@ -14274,7 +14279,7 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
   call_records_published(state);
   // Every volume captured: this image holds every logged write, so the write log empties, stamped with this
   // generation (A-63). A volume skipped keeps the log, so its writes stay replayable.
-  #[cfg(target_os = "linux")]
+  #[cfg(unix)]
   clear_write_log(
     state,
     published.skipped.is_empty(),
@@ -14540,7 +14545,7 @@ fn publish_delta_into(
   crate::content_holder::held_committed(state, held.whole, false);
   crate::live_ship::owned_committed(state, held.owned, false);
   call_records_published(state);
-  #[cfg(target_os = "linux")]
+  #[cfg(unix)]
   clear_write_log(
     state,
     published.skipped.is_empty(),
@@ -15028,13 +15033,13 @@ const TAKEOVER_KEPT_UNRELEASED: &str = "recovery.takeover_kept_unreleased";
 const REVOKED_MOUNTS_OVERDUE: &str = "fuse.revoked_overdue";
 
 /// Format: the refusal counter of a write-log span the content object refused (A-63): that write is not logged.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub(crate) const WRITE_LOG_UNWRITTEN: &str = "recovery.write_log_unwritten";
 
 /// Empties the shard's FUSE write log after a publication that captured every volume (A-63), stamped with that
 /// publication's generation: every write before it is in that image now. A volume skipped keeps the log, so its
 /// writes stay owed to the next daemon.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn clear_write_log(state: &mut ShardState, captured_every_volume: bool, generation: u64) {
   if !captured_every_volume {
     return;
@@ -15059,7 +15064,7 @@ fn clear_write_log(state: &mut ShardState, captured_every_volume: bool, generati
 /// place among the writes (GAPS, A-154's sibling): the kernel never resends one, so without it the references a dead
 /// daemon was given back after its last publication stayed counted, and an unlinked file the kernel had let go was
 /// never reclaimed.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 async fn replay_writes(
   state: &mut ShardState,
   slices: &mut crate::recovery_slices::RecoverySlices,
@@ -15094,7 +15099,7 @@ async fn replay_writes(
 }
 
 /// The slot of the volume a record names, when recovery rebuilt it.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn slot_of_volume(
   state: &ShardState,
   volume: [u8; 16],
@@ -15104,7 +15109,7 @@ fn slot_of_volume(
 
 /// Gives back one logged `FORGET`'s lookups, as its attachment's own, in the volume its record names; `None` when
 /// recovery did not rebuild that volume.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn replay_forget(
   state: &mut ShardState,
   forgotten: crate::write_log::Forgotten,
@@ -15121,7 +15126,7 @@ fn replay_forget(
 
 /// Writes one logged record into the volume it was written through, which the record names; `None` when recovery did
 /// not rebuild that volume.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn replay_one(
   state: &mut ShardState,
   record: &crate::write_log::Record,
@@ -15142,7 +15147,7 @@ fn replay_one(
 /// Empties the write log under the committed image's generation and appends `remaining` to it, so the records a
 /// replay has not yet applied survive a crash before it ends. A record the log cannot take marks it overflowed
 /// (A-63: the next daemon reports every taken-over file as having lost writes).
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn relog_remaining(state: &mut ShardState, remaining: &[crate::write_log::Logged]) {
   let generation = state.journal.generation();
   let (Some(object), Some(log)) = (state.content.as_mut(), state.write_log.as_mut()) else {
@@ -15170,12 +15175,12 @@ fn relog_remaining(state: &mut ShardState, remaining: &[crate::write_log::Logged
 }
 
 /// Format: the refusal counter of a logged write recovery could not replay (A-63).
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const WRITE_REPLAY_REFUSED: &str = "recovery.write_replay_refused";
 
 /// Format: the refusal counter of a logged `FORGET` recovery could not give back (no rebuilt volume holds its inode,
 /// or the volume refused it).
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const FORGET_REPLAY_REFUSED: &str = "recovery.forget_replay_refused";
 
 /// Format: the refusal counter of a volume whose recovered references could not be settled.
@@ -15267,8 +15272,8 @@ fn reconcile_lost(state: &mut ShardState, record: &VolumeRecord) -> (usize, usiz
         return false;
       }
       // A Shards stream whose resync end the anchor held is kept, and served again on a fresh stream its device is handed
-      // over that end (A-316); any other dies with the process, as before.
-      #[cfg(target_os = "linux")]
+      // over that end (A-316; macOS too, A-339); any other dies with the process, as before.
+      #[cfg(unix)]
       if matches!(a.form, AttachForm::ShardsFs { .. })
         && let Some(at) = state
           .inherited_fuse
@@ -15543,8 +15548,9 @@ mod tests {
   /// shard, a volume whose file "f" holds "origin", snapshotted and cloned; replay a logged write of "clone!" at offset 0
   /// of the clone's "f", through the clone, as the successor of a daemon that served it would. Expect: the clone's "f"
   /// reads "clone!" and the origin's still "origin", the inode carrying the origin's prefix (non-vacuous). Before, the
-  /// write went to the origin, the clone kept "origin" and lost its write.
-  #[cfg(target_os = "linux")]
+  /// write went to the origin, the clone kept "origin" and lost its write. Every Unix: macOS replays a Shards stream's
+  /// logged writes too (A-339).
+  #[cfg(unix)]
   #[test]
   fn a_replayed_write_to_a_clones_inherited_file_lands_in_the_clone() {
     let (origin_reads, clone_reads, inherited_prefix, origin_prefix) =
