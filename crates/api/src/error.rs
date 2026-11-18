@@ -429,8 +429,8 @@ pub enum Unsupported {
   /// A merge or a landing that carries a signature: the daemon's verifier for signed work is not in this build
   /// ([`crate::signed`]). Nothing was sent.
   SignedWork,
-  /// A write-policy verb: the daemon's side of the write modes is not in this build ([`crate::policy`]). Nothing was
-  /// sent.
+  /// A write-policy feature the daemon does not offer yet: an approval of a merge, or presenting a landing of a bypass
+  /// volume without writing it (no present-only verb yet; [`crate::Instance::plan_landing`]). Nothing was sent.
   WritePolicies,
 }
 
@@ -776,21 +776,7 @@ impl Error {
       Refusal::NotShared { principal, .. } => Error::Denied(Denied::NotShared { principal }),
       Refusal::MoveRefused { reason } => Error::of_move_refusal(reason, pause_ns),
       Refusal::PolicyForbids { act, by } => {
-        Error::Denied(Denied::Policy(crate::policy::PolicyRefusal {
-          act: match act {
-            slates_ipc::protocol::WriteAct::Merge => crate::policy::WriteAct::Merge,
-            slates_ipc::protocol::WriteAct::Land => crate::policy::WriteAct::Land,
-          },
-          by: match by {
-            slates_ipc::protocol::PolicySubject::Consumer { consumer } => {
-              crate::policy::PolicySubject::Consumer(consumer)
-            }
-            slates_ipc::protocol::PolicySubject::Volume { volume } => {
-              crate::policy::PolicySubject::Volume(volume)
-            }
-          },
-          reason: crate::policy::PolicyReason::Forbidden,
-        }))
+        Error::Denied(Denied::Policy(PolicyRefusal::forbidden(act, by)))
       }
       Refusal::ConsumerNotEnrolled => Error::Denied(Denied::NotEnrolled),
       Refusal::ConsumerRevoked => Error::Denied(Denied::Revoked),

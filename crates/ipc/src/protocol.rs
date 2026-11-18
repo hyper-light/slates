@@ -868,6 +868,35 @@ pub enum RequestBody {
     /// What the policy is set on.
     subject: PolicySubject,
   },
+  /// Presents a landing and never lands it, whatever the volume's write policy (A-285): the answer is `GrantRequired`
+  /// with the plan, its entries kept for `LandingEntries`, exactly as an asked `Land` answers, and nothing is written.
+  /// A reviewer reads the changes a bypass volume would land at once, and a forbidden volume's too, since reading them
+  /// writes nothing. Served on the volume's owner shard, as `Land` is. Appended.
+  Present {
+    /// The volume.
+    volume: VolumeId,
+    /// The snapshot, or the head.
+    snapshot: Option<SnapshotId>,
+    /// The target directory's path.
+    target: String,
+    /// The filter.
+    filter: Filter,
+  },
+  /// Submits a work whose merge an ask policy held for approval (A-285): the launcher's or the harness's approval of
+  /// exactly the increment `identity` names (the identity a `MergeApprovalRequired` reply carried), proven by the keyed
+  /// hash under the issuer secret (`slates_server::landing::merge_approval_proof`). The increment is built again and
+  /// merged only if it is still that one; one that changed since is refused `GrantMismatch`. Refused `Forbidden` on a
+  /// consumer-bound channel and `GrantIssuerUnverified` without the proof. Appended.
+  SubmitApproved {
+    /// The work volume.
+    work: VolumeId,
+    /// The evidence references (opaque to slates), possibly none.
+    evidence: Vec<[u8; 32]>,
+    /// The approved increment's identity.
+    identity: [u8; 32],
+    /// The keyed hash under the issuer secret.
+    proof: [u8; 32],
+  },
   /// Move `volume` to the fleet member `to` (§4.10 "Ownership follows the writer": "operators keep an explicit move";
   /// A-291): its owner freezes it, places its records and reports the move, and the member `to` adopts it, serves it
   /// and seals it under its own placement before the owner lets its copy go. Answered `Moving` until the configuration
@@ -1516,6 +1545,7 @@ impl RequestBody {
       | RequestBody::Edit { work: volume, .. }
       | RequestBody::Declare { work: volume, .. }
       | RequestBody::Submit { work: volume, .. }
+      | RequestBody::SubmitApproved { work: volume, .. }
       | RequestBody::Rebase { work: volume }
       | RequestBody::Clone { volume, .. }
       | RequestBody::Attach { volume, .. }
@@ -1546,6 +1576,7 @@ impl RequestBody {
       | RequestBody::FsRename { volume, .. }
       | RequestBody::FsMkdir { volume, .. }
       | RequestBody::Land { volume, .. }
+      | RequestBody::Present { volume, .. }
       | RequestBody::ImageBuild { volume, .. }
       | RequestBody::ImageMerge { image: volume, .. } => Some(*volume),
       // A volume's policy lives in its record, on its owner shard.
@@ -1602,6 +1633,7 @@ impl RequestBody {
         | RequestBody::EditSubmit { .. }
         | RequestBody::Declare { .. }
         | RequestBody::Submit { .. }
+        | RequestBody::SubmitApproved { .. }
         | RequestBody::Rebase { .. }
         | RequestBody::Clone { .. }
         | RequestBody::Resize { .. }
@@ -3818,6 +3850,17 @@ pub enum ReplyBody {
   Policy {
     /// The policy.
     policy: Option<WritePolicy>,
+  },
+  /// A merge an ask policy holds for approval (A-285): nothing was merged. `identity` names the increment exactly
+  /// (`blake3` of the work, its base, its post-state and its ops document, §4.16), so an approval
+  /// (`SubmitApproved`) binds it; `paths` counts the paths it changes. Appended.
+  MergeApprovalRequired {
+    /// The work volume.
+    work: VolumeId,
+    /// The increment's identity.
+    identity: [u8; 32],
+    /// The paths the increment changes.
+    paths: u64,
   },
   /// A volume's move is under way (`Move`, A-291): it is frozen, and the move waits for its records to be placed or for
   /// the configuration to name its new owner. Ask again. Appended.

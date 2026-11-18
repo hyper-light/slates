@@ -646,6 +646,9 @@ fn serve_merge(client: &mut Client, verb: &Verb, json: bool) -> Result<(), Clien
         match outcome {
           Submitted::Accepted(version) => slates_machine::out_line!("accepted: {version}"),
           Submitted::Conflict(windows) => print_windows(&windows),
+          Submitted::ApprovalRequired { identity, paths } => {
+            slates_machine::out_line!("approval required: {} ({paths} paths)", hex32(&identity))
+          }
         }
       }
     }
@@ -674,6 +677,12 @@ fn submit_json(outcome: &Submitted) -> serde_json::Value {
     Submitted::Conflict(windows) => {
       serde_json::json!({ "accepted": false, "conflicts": slates_mcp::windows_json(windows) })
     }
+    Submitted::ApprovalRequired { identity, paths } => serde_json::json!({
+      "accepted": false,
+      "approval_required": true,
+      "identity": hex32(identity),
+      "paths": paths,
+    }),
   }
 }
 

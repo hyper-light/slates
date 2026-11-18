@@ -440,10 +440,10 @@ pub(crate) async fn drive_outgoing(
       Step::Thaw => crate::xshard::run_on_counted(origin, shard, move |s| thaw(s, object)),
       Step::Report => {
         let Some(records) = capture(owner_acceptor, object) else {
-          let _ = state::with_state(|s| s.count(MOVE_UNCAPTURED, 1));
+          let _ = state::with_state_counted(|s| s.count(MOVE_UNCAPTURED, 1));
           continue;
         };
-        let _ = state::with_state(|s| {
+        let _ = state::with_state_counted(|s| {
           s.move_records.insert(object, records);
           s.count(MOVE_REPORTED, 1);
         });
@@ -464,7 +464,7 @@ pub(crate) async fn drive_outgoing(
         .await;
       }
       Step::Switched { owner } => {
-        let _ = state::with_state(|s| {
+        let _ = state::with_state_counted(|s| {
           if s.fleet.object_owner(object) != Some(owner) {
             crate::takeover::track_owner_on_every_shard(s, object, owner);
             crate::takeover::track_owner_on_every_shard(s, object.catalog(), owner);
@@ -475,7 +475,7 @@ pub(crate) async fn drive_outgoing(
         crate::xshard::run_on_counted(origin, shard, move |s| release(s, object, owner));
         owner_acceptor.forget_object(object);
         owner_acceptor.forget_object(object.catalog());
-        let _ = state::with_state(|s| {
+        let _ = state::with_state_counted(|s| {
           s.move_records.remove(&object);
           if s.fleet.object_owner(object) != Some(owner) {
             crate::takeover::track_owner_on_every_shard(s, object, owner);
@@ -683,7 +683,7 @@ pub(crate) async fn report_forgotten(
   })
   .unwrap_or_default();
   for object in owed {
-    let _ = state::with_state(|s| s.count(MOVE_FORGOTTEN_REPORTED, 1));
+    let _ = state::with_state_counted(|s| s.count(MOVE_FORGOTTEN_REPORTED, 1));
     crate::fleet::send_council_report(
       slates_cluster::config_group::ConfigCommand::MovedForgotten {
         object,
@@ -827,7 +827,7 @@ pub(crate) async fn drive_adoptions(
         crate::takeover::adopt_at(local, register, accepted, epoch, local, budget).await;
       in_flight.extend(dispatch);
       if placed {
-        let _ = state::with_state(|s| note_adopted(s, key, register));
+        let _ = state::with_state_counted(|s| note_adopted(s, key, register));
       }
     }
   }
@@ -877,17 +877,17 @@ async fn settle_adopted(
   match progress {
     Some(Sealing::NotServed) | None => {}
     Some(Sealing::Refused) => {
-      let _ = state::with_state(|s| s.count(MOVE_SEAL_REFUSED, 1));
+      let _ = state::with_state_counted(|s| s.count(MOVE_SEAL_REFUSED, 1));
     }
     Some(Sealing::Sealed(superseded, epoch)) => {
-      let _ = state::with_state(|s| {
+      let _ = state::with_state_counted(|s| {
         if let Some(adoption) = s.move_adoptions.get_mut(&key) {
           adoption.sealed = Some((superseded, epoch));
         }
       });
     }
     Some(Sealing::Placed) => {
-      let _ = state::with_state(|s| s.count(MOVE_ADOPTION_REPORTED, 1));
+      let _ = state::with_state_counted(|s| s.count(MOVE_ADOPTION_REPORTED, 1));
       crate::fleet::send_council_report(
         slates_cluster::config_group::ConfigCommand::MoveAdopted {
           object: key,
@@ -1088,7 +1088,7 @@ async fn ask(
   let wanted: BTreeMap<HostId, HostPrepare> = requests.into_iter().collect();
   let sessions = take_sessions("fleet.lent_to.move_ask", |host| wanted.contains_key(&host));
   if sessions.is_empty() {
-    let _ = state::with_state(|s| s.count(MOVE_QUESTIONS_UNSENT, 1));
+    let _ = state::with_state_counted(|s| s.count(MOVE_QUESTIONS_UNSENT, 1));
     return None;
   }
   let sent: Vec<HostId> = sessions.iter().map(|(host, _)| *host).collect();

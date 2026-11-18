@@ -20,10 +20,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use slates_api::{
-  Approval, Awaiting, BaseState, ConflictClass, Denied, Drift, DriftKind, Error, Existing, Filter,
-  Instance, Intent, Invalid, IssuerFault, LandOutcome, LandingConflict, LandingState, MergeOutcome,
-  Missing, MoveTarget, PathFault, Provisioned, RebaseOutcome, SnapshotId, Unsupported, Unusable,
-  Verification, VolumeId, VolumeSpec, Work, WorkSignature,
+  Approval, AuditKind, Awaiting, BaseState, ConflictClass, Denied, Drift, DriftKind, Error,
+  Existing, Filter, GrantState, Instance, Intent, Invalid, IssuerFault, LandOutcome,
+  LandingConflict, LandingStage, LandingState, MergeOutcome, Missing, MoveTarget, PathFault,
+  PolicyReason, PolicyRefusal, PolicySubject, Provisioned, RebaseOutcome, SnapshotId, Unsupported,
+  Unusable, Verification, VolumeId, VolumeSpec, Work, WorkSignature, WriteAct, WriteMode,
+  WritePolicy,
 };
 use slates_machine::{MachineError, MachineProfile, ProfileOptions};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
@@ -423,9 +425,27 @@ fn an_overlay_lands_exactly_what_was_approved_and_nothing_else() {
     b"ref: refs/heads/main\n",
     "git's own files were left out"
   );
+  // The approval and the landing are audited and listed, typed (A-299): the presentation, the grant the launcher
+  // issued, the landing finished `Done`, and the single-use grant consumed by it.
+  let audit = instance.audit(0).unwrap();
+  let kinds: Vec<AuditKind> = audit.iter().map(|record| record.kind).collect();
   assert!(
-    !instance.audit(0).unwrap().is_empty(),
-    "the grant and the landing are audited"
+    kinds.contains(&AuditKind::LandingPlanned) && kinds.contains(&AuditKind::GrantIssued),
+    "{kinds:?}"
+  );
+  assert!(
+    audit
+      .iter()
+      .any(|record| record.kind == AuditKind::LandingFinished
+        && record.outcome == Some(LandingStage::Done)),
+    "{audit:?}"
+  );
+  let grants = instance.grants().unwrap();
+  assert!(
+    grants
+      .iter()
+      .any(|grant| grant.manifest == approval.manifest && grant.state == GrantState::Consumed),
+    "{grants:?}"
   );
   daemon.stop();
 }
@@ -475,6 +495,93 @@ fn a_file_changed_on_disk_after_the_volume_changed_it_is_typed_drift_and_a_typed
     }])
   );
   assert_eq!(folder.read("d.txt").unwrap(), b"the person's\n");
+  daemon.stop();
+}
+
+/// AC-5.10 / AC-5.12 (A-299, A-285; Ada's rule of 2026-11-18): do set overlays' write policies with the launcher's
+/// authority — one bypass, one forbid — and land each, plan the bypass one, and ask for a policy that requires signed
+/// merges. Expect: an unset volume's policy reads back as none; the bypass volume read back as set and landed in the one
+/// call, `Written` and `Done`, its file on the disk; its plan refused `Unsupported(WritePolicies)` before anything is
+/// written, since no verb presents a bypass landing alone yet; the forbid volume's landing answered `Refused` by its own
+/// policy and nothing written; and the signed-merge requirement refused `Unsupported(SignedWork)` before anything is
+/// sent, since the daemon does not keep it yet.
+#[cfg(unix)]
+#[test]
+fn a_landing_follows_its_volumes_write_mode() {
+  let (daemon, mut instance) = grouped("modes");
+  let launcher = issuer_of(&daemon);
+  let bypassed = Folder::new();
+  let forbidden = Folder::new();
+  let open = provision(
+    &mut instance,
+    &VolumeSpec::overlay("open", &bypassed.path, ROOM),
+  );
+  let shut = provision(
+    &mut instance,
+    &VolumeSpec::overlay("shut", &forbidden.path, ROOM),
+  );
+  assert_eq!(
+    instance.write_policy(PolicySubject::Volume(open)).unwrap(),
+    None,
+    "nobody set one: it asks"
+  );
+  let bypass = WritePolicy {
+    merge: WriteMode::Ask,
+    land: WriteMode::Bypass,
+    require_signed_merges: false,
+  };
+  instance
+    .set_write_policy(PolicySubject::Volume(open), &bypass, &launcher)
+    .unwrap();
+  assert_eq!(
+    instance.write_policy(PolicySubject::Volume(open)).unwrap(),
+    Some(bypass)
+  );
+  write_file(&mut instance, open, "/w.txt", b"written at once\n");
+  let request = landing_into(open, &bypassed);
+  assert_eq!(
+    instance.plan_landing(&request),
+    Err(Error::Unsupported(Unsupported::WritePolicies)),
+    "a plan never writes"
+  );
+  assert_eq!(bypassed.read("w.txt"), None);
+  let LandOutcome::Written(report) = instance.land(&request, None).unwrap() else {
+    panic!("a bypass volume lands in the one call");
+  };
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert_eq!(bypassed.read("w.txt").unwrap(), b"written at once\n");
+
+  let forbid = WritePolicy {
+    merge: WriteMode::Forbid,
+    land: WriteMode::Forbid,
+    require_signed_merges: false,
+  };
+  instance
+    .set_write_policy(PolicySubject::Volume(shut), &forbid, &launcher)
+    .unwrap();
+  write_file(&mut instance, shut, "/f.txt", b"never landed\n");
+  assert_eq!(
+    instance
+      .land(&landing_into(shut, &forbidden), None)
+      .unwrap(),
+    LandOutcome::Refused(PolicyRefusal {
+      act: WriteAct::Land,
+      by: PolicySubject::Volume(shut),
+      reason: PolicyReason::Forbidden,
+    })
+  );
+  assert_eq!(forbidden.read("f.txt"), None, "nothing was written");
+  assert_eq!(
+    instance.set_write_policy(
+      PolicySubject::Volume(shut),
+      &WritePolicy {
+        require_signed_merges: true,
+        ..forbid
+      },
+      &launcher
+    ),
+    Err(Error::Unsupported(Unsupported::SignedWork))
+  );
   daemon.stop();
 }
 

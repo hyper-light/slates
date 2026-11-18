@@ -6,10 +6,10 @@
 > - **Built:** a local clone of an overlay (below, 2026-11-05's list); the configuration's moved-object exceptions
 >   (§4.8 "Authority scope"); and the planned move of a plain volume (A-291, §4.10's status): place, switch, adopt
 >   and release, the old owner keeping its copy until the new owner has sealed the volume under its own placement,
->   `slates move ID --to HOST` and `slates_api::Instance::move_volume` (contract 3), every refusal typed, a move back
+>   `slates move ID --to HOST` and `slates_api::Instance::move_volume` (contract 5), every refusal typed, a move back
 >   to the creator, a destroyed moved volume's exception dropped.
-> - **Owed, in order:** kiln's runners as members (certificates
->   under kiln's CA as the manifest's enrollment root, seeds from kiln's runner directory); kiln's relocation of an
+> - **Owed, in order:** kiln's runners as members (certificates under kiln's CA as the manifest's enrollment root,
+>   seeds from kiln's runner directory); kiln's relocation of an
 >   agent with its volume (detach, move, attach on the target); an overlay's move (its base stays on its source host,
 >   §4.10 "Overlay volumes in a fleet": refused `NotPlain` until a captured base (§4.15 `capture_base`, the design's
 >   preferred delta-plus-base form) or a remote base service exists; kiln's workspaces are overlays); the automatic
@@ -30,12 +30,14 @@
 > **Owed, in order:**
 > - the starter handed the launcher's authority on every platform (Linux: the anchor passes the segment's descriptor
 >   back to its starter);
-> - the daemon's side (A-285's owner): the modes kept and enforced per consumer and volume, bypass landing at once,
->   forbid refused `PolicyRefusal`, approvals of merges, signed work verified, and the verbs that set a policy and hand
->   out the statement a signer signs; then `Instance::set_write_policy` / `write_policy`;
+> - the daemon's side (A-285's owner): a volume's land mode is built (203ad8fa) and reaches the contract
+>   (`set_write_policy`, `write_policy`, `Refused` outcomes; piece 5, `CONTRACT` = 3); owed: a consumer's own mode,
+>   merges under a mode and their approvals, a present-only verb (until then `plan_landing` refuses a bypass volume
+>   rather than write it), the MCP and SDK land verb under the mode, signed work verified with the statement a signer
+>   signs and the trusted signers a launcher registers;
 > - typed fields on the wire for an overlay's drift, a presentation's conflicts, a landing target's refusal and a
 >   merge's versions (the work's base beside the head), replacing the crate's reading of the status text;
-> - a paged volume listing; typed audit kinds and grant states;
+> - a paged volume listing (typed audit kinds and grant states built, piece 6, `CONTRACT` = 4);
 > - a run of the Linux and Windows arms (mount, the CLI's Windows unmount): not compiled on the Mac that built piece 4.
 
 > **git, Mercurial and Subversion over the WinFsp drive (2026-11-17, Part 6 "Real workloads", §4.6; A-300; Ada's
@@ -96,8 +98,11 @@
 > landing's own plan; its cost over a granted landing of the same volume (wall time and shard time, 1, 1,000 and
 > 10,000 files) says whether the granted landing should reuse the presentation's plan. **Owed, in order** (types
 > agreed with g262, slates-api's owner):
+> - **built (2026-11-18):** `Present` (never writes, whatever the mode) and merges under the policy (forbid refused,
+>   ask `MergeApprovalRequired` then `SubmitApproved` of exactly that increment, unset merges at once); 7 of 7 in
+>   `write_policy.rs`, the presentation test red with present-only broken;
+> - the launcher secret (g262) and launcher-class proofs verifying under it, with a policy version against replay;
 > - a consumer's own policy, the stricter of consumer and volume governing (refused `Unsupported` today);
-> - merges (submit) under the policy;
 > - the MCP and SDK land verb gated by the policy (the grant kind stays refused there);
 > - signed work: a merge or landing may carry an SSH signature, checked and recorded (verified with its signer,
 >   unsigned, invalid with its reason), and a volume may require signed merges;
@@ -170,7 +175,14 @@
 > `a_survivor_holding_no_copy_of_the_works_catalog_learns_its_green_from_a_location_round` (`040da0d9a`, on main since
 > A-255 landed) was killed at its 240 s deadline in the Windows fleet lane of PR #11's first CI run (job 134508155910:
 > 123 passed, 0 failed, 1 timed out) and passed in the next (job 134523028813: 123 passed, 0 failed, 0 timed out).
-> PR #11 does not touch it. **Owed:** its rate on main's own Windows lane.
+> PR #11 does not touch it. **Owed:** its rate on main's own Windows lane. It also fails on macOS whenever d, the node
+> the test deafens to every record, is the green's successor: d adopts the green but holds none of its chain, so it can
+> never rebuild it (GAP-A9-7's record half), and d's resend is answered `NotFound`. Seen twice on 2026-11-17
+> (adas-macbook-pro, debug, with A-288's change): at load 190 on 7c6faee27 (`merge.takeover_incomplete` 4,561, before
+> the give-up existed), and at load 42 to 47 merged with main 58a37794c (given up after 100 attempts, the last waiting
+> on its chain). In both, d owned the green, and no node retired a work route (`fleet.work_route.retired` absent). Host
+> ids are drawn fresh each run, so it passes whenever another survivor is the successor (5 s at load 104, merged with
+> b7c294959). **Owed:** a deafened node that cannot be the green's successor.
 
 > **The dirty-page test's precondition, proved each attempt (2026-11-09, A-248).**
 > `a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path` failed intermittently ("the sync says so:
@@ -251,16 +263,41 @@
 > - losing the green's owner twice needs the ledger-prefix transfer (GAP-A9-7);
 > - the cross-region case is not yet tested;
 > - the 0.35 ms could be overlapped by a pipelined dispatch;
-> - **the route has no end for a work whose owner died, a store with no bound (CLAUDE.md §2 item 8).** Only a volume's
->   owner writes its tombstone, and a work never comes back to have one, so nothing retires its catalog record. The
->   adopter keeps it placed (`fleet::owed_adopted_work_catalogs`, which scans every adopted work catalog each record
->   period), its holders keep it in `holder_records`, and `pending_catalogs` drops an entry only at a materialization or
->   a tombstone, neither of which comes for a work. Every work alive when its owner dies is held so for as long as the
->   fleet runs. Found by reading on 2026-11-17, in the sibling sweep after A-255 landed; no test shows it yet. How the
->   route should end is a decision for Ada. One option: the adopter retires the record once the green's owner holds no
->   completion of the work's submits, which needs the work's id in the merge record beside the request key. The other:
->   a cap per adopter, derived from the fleet's outstanding-completion capacity, which retires the oldest record first,
->   and a resend past it is refused `NotFound`.
+> - ~~the route has no end for a work whose owner died, a store with no bound (CLAUDE.md §2 item 8)~~: **ended
+>   (2026-11-17, A-288).** Nothing retired a work's catalog record: only a volume's owner writes its tombstone, and a
+>   work never comes back, so every work alive at an owner's death was held, by its adopter and every holder, for as
+>   long as the fleet ran. Now the route is kept only while the green's owner holds a completion of the work's submits
+>   that the route can reach, one a client on another node than the work's owner made and has not acknowledged. A
+>   client of the owner's own node resends to that node, never through the route. The merge record (format 2) and
+>   chain entry (version 3) name such a submit's work, and the successor records the completion under it
+>   (`CompletionRecord::work`, `Partition::completions_routed_by`). The route's adopter asks the green's owner each
+>   period (`crate::work_route`, fleet stream 25), and a route answered "none" closes through the destroy's two
+>   tombstone stages. The owner also drops its own takeover copies when a tombstone retires, which a destroyed
+>   taken-over volume had kept too. Red first: on main 7c6faee27 the route was still held by both survivors after the
+>   acknowledgement (`retired false, counted 0`, 429 s on a loaded Mac).
+>   `a_works_route_ends_once_the_greens_owner_holds_none_of_its_completions` now also holds a work its own owner's
+>   client submitted from, retired with nothing acknowledged. That form is red on main dbf53afa2 too (`its route
+>   retired false; ... retired false, counted 0; held at the end [Ok(true), Ok(true)]`, 860 s at load 57 to 91), and
+>   green with the fix on the same Mac (macOS arm64, debug): 6.91 s at load 11 to 37 on 7c6faee27, and 8.56 s at load
+>   108 merged with main b7c294959. Both routes retired on both survivors, counted twice. Still held, A-288's open list:
+>   - a route to a green destroyed (a given-up one too, which is then neither served nor `unrecovered`), or lost to a
+>     second takeover it cannot survive (GAP-A9-7), while the route is kept: the green has no owner to answer;
+>   - ~~a route to a green its successor gave up on~~ (the give-up after the failover SLO's attempts, d3f4ddbe2):
+>     **ended the same day.** The green was never served, so its shard answered no question and the route stayed, though
+>     nothing it led to could answer. Now the green's shard answers for a green it holds `unrecovered` too, from its
+>     partition's count, which is final there; a green whose takeover is still pending is refused as before. Red first,
+>     on a lone node with a planted green given up naming its chain: the route kept, all 111 questions refused, 14.4 s
+>     at load 33 to 37. Green: refused at all 10 questions while the green was pending and kept at every read, then
+>     retired at the first question after the give-up, its tombstone recorded and retired, 5.7 s at load 48 to 52
+>     (`a_route_to_a_green_its_successor_gave_up_on_is_retired`);
+>   - a route whose completion its client never acknowledges (a client of another node that died, or one that never
+>     writes to the green again), as the completion record itself is: only an acknowledgement or a client lease ends
+>     either, and RIFL's client leases are not built;
+>   - a route kept by an adopter that restarts warm. Its holder copies come back with it, but the routes it kept
+>     (`pending_catalogs`) do not, so it neither re-places nor retires them. This is A-255's own gap, found by reading
+>     on 2026-11-17; no test shows it yet.
+>
+>   `docs/bugs/2026-11-17-a-works-route-was-never-retired.md`.
 >
 > `docs/bugs/2026-11-09-a-submit-resent-after-its-greens-takeover-was-never-answered-its-version.md`.
 
@@ -1315,7 +1352,11 @@
 > `docs/bugs/2026-11-08-a-starved-shard-was-judged-wedged.md`. Still open from it:
 > - **A kill the rule does not touch (open).** `rungs9/ab-clean-2`'s lapse came 6.4 s after its last wedged line and right
 >   after `shard 0 is spinning: 1045 ms of CPU without a step`, on a shard that had run 580 ms of CPU in the last 1.3 s.
->   A poll that long at `CPUWeight=1` is still killed; whether it is a real non-yielding task is not established.
+>   A poll that long at `CPUWeight=1` is still killed; whether it is a real non-yielding task is not established. Seen
+>   again 2026-11-17 in an in-process fleet test binary (adas-macbook-pro, macOS arm64, debug, load 23 to 56, beside
+>   another fleet test process): `shard 0 is spinning, 1077 ms of CPU without a step` ended the binary (exit 4) in the
+>   third of 13 A-255 and tombstone tests; which test it was is not known. The 11 it never ran passed one to a process
+>   at load 70 to 116, so it did not reproduce.
 > - **Siblings with the same blind spot.** `crate::observe::ShardTime` (`next_window_ns`), used by observations and the
 >   cross-shard waits (`xshard`), gave up on a window with no CPU progress, so a starved shard's observation or call
 >   ended early: **fixed 2026-11-08 (bug-sweep).** A window with no CPU progress now ends the wait only if the scheduler

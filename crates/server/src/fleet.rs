@@ -1196,6 +1196,9 @@ pub async fn run_membership(transport: FleetTransport) {
   // holder session the link tasks keep up, so it ships each head to all candidates in one commit and drives
   // each takeover over all surviving holders (the `f > 1` promotion a per-peer ship task could not reach).
   spawn_detached(run_record_plane(local), LOOP_SPAWN_REFUSED);
+  // The work route keeper (A-288): parked until a takeover adopts a work's route, then each period asks the greens'
+  // owners about the routes this node keeps, on its own task so a slow question never holds the coordinator.
+  spawn_detached(crate::work_route::run(local), LOOP_SPAWN_REFUSED);
 }
 
 /// Shared immutable dial inputs: handles of what the control shard keeps for its life (its identity, its
@@ -1565,6 +1568,22 @@ async fn serve_peer_records(
           injected_serve_delay().await;
           verbs::injected_forward_silence(&request).await;
           verbs::serve_forward(control, peer_anchor, &request).await
+        });
+        if let Some(reply) = served
+          && endpoint.reply(stream_id, &reply).is_err()
+        {
+          return;
+        }
+        continue;
+      }
+      // A work route's question (A-288) is answered on the green's shard, so it too runs on its own task.
+      crate::forward_lane::Next::Request {
+        stream_id,
+        kind,
+        request,
+      } if kind == crate::work_route::STREAM && enrolled => {
+        let served = forwards.spawn(stream_id, async move {
+          crate::work_route::serve(control, &request).await
         });
         if let Some(reply) = served
           && endpoint.reply(stream_id, &reply).is_err()
@@ -8317,7 +8336,7 @@ fn keep_recipient(
 
 /// One request to `host` over its record session, within the round's budget: the reply, or `None` when no session to
 /// it is reachable or the exchange failed (an empty reply is a refusal).
-async fn request_peer(
+pub(crate) async fn request_peer(
   host: HostId,
   stream: u64,
   request: &[u8],
@@ -8422,16 +8441,21 @@ async fn retire_shard_tombstones(
     owner_acceptor.forget_object(object);
     owner_acceptor.forget_object(object.catalog());
     // A destroyed volume this node owned under a moved-object exception: the exception goes with it (A-291).
-    let _ = state::with_state(|s| crate::moves::note_destroyed(s, object, local));
+    let _ = state::with_state_counted(|s| crate::moves::note_destroyed(s, object, local));
     // The routing forgets the volume too, as a holder's does when it accepts the retirement (`tombstone::on_held`).
     // A successor that took a destroyed volume over tracks itself its owner (`takeover::record_adoption`); kept after
     // the retirement, it answered every verb on the volume `Overloaded` as an owned volume not yet materialized, for
     // good, while the other survivor answered `NotFound` (6 of 6 runs, 2026-11-06, `crates/cli/tests/live_chaos.rs`:
-    // an unanswered destroy, then its owner's loss).
-    let _ = state::with_state(|s| {
+    // an unanswered destroy, then its owner's loss). On every shard, since the takeover tracked it on every shard.
+    // A successor's own copies go too (A-288): the takeover kept its acceptor of each register in `holder_records` and
+    // this shard's placement of an adopted catalog, and nothing drops them once every candidate has dropped its own, so
+    // a retired work's route, or a destroyed taken-over volume, would stay held here for good.
+    let _ = state::with_state_counted(|s| {
       for register in [object, object.catalog()] {
-        s.fleet.forget_object(register);
+        crate::takeover::forget_owner_on_every_shard(s, register);
         s.departed_owners.remove(&register);
+        s.holder_records.remove(&register);
+        s.placed_heads.remove(&register);
       }
     });
   }
