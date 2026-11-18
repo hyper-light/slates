@@ -813,3 +813,60 @@ slates-server: shard 2 initialized in 908 µs
 slates daemon: a heartbeat came 555 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 1 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 1 unattributed), fired 1 timers, waited 1 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 20 ms and its timer overrun 455 ms
 slates daemon: a heartbeat came 503 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 1 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 1 unattributed), fired 1 timers, waited 1 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 130 ms and its timer overrun 403 ms
 ## run 2 of 10 done, 2026-11-18T11:04:00Z
+To https://github.com/hyper-light/slates
+   89f2495..e273b46  e273b469529e2a71427fbc755c065321042062e1 -> diag-results/g258-44274158769-dll-x86
+## run 3 of 10, 2026-11-18T11:04:02Z
+# dll started first: dll=S: main=T: control=U:
+# host: windows 0x23f00206 on windows processor architecture 9 level 6 revision 52994 (x86_64), 4 logical CPUs (4 available to this process), 15 GiB, page 4096 B; largest L2 2097152 B, cache line 64 B
+# workload: 10 rounds of 1000 files of 4096 B per arm and pass, arms interleaved, first arm rotating
+# arm dll: S:/d
+# arm main: T:/d
+# arm control: U:/d
+# warm-up: one untimed round per arm (1000 files each)
+# pass quiet: spinners 0 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 33.1 µs, p99 63.2 µs, p999 147.3 µs, max 1728.0 µs over 23230 probes; 122.8 s
+fsbench	quiet	dll	create	10000	800900	1525100	3402300	35148800
+fsbench	quiet	dll	write	10000	93900	196300	479300	33900600
+fsbench	quiet	dll	fsync	10000	104000	230100	502800	33575600
+fsbench	quiet	dll	close	10000	48700	116400	408800	1351300
+fsbench	quiet	dll	stat	10000	199200	380900	2750100	14916700
+fsbench	quiet	dll	open	10000	130700	244000	496000	33496900
+fsbench	quiet	dll	read	10000	75500	169100	425900	21080700
+fsbench	quiet	dll	rename	10000	424000	730000	1318600	34792000
+fsbench	quiet	dll	unlink	10000	236900	780200	1343000	3675200
+fsbench	quiet	dll	create_security	10000	1421500	1970500	12941700	35511600
+fsbench	quiet	main	create	10000	712200	1393200	33825900	98415700
+fsbench	quiet	main	write	10000	59100	177000	487400	33217200
+fsbench	quiet	main	fsync	10000	90700	187600	442200	33486700
+fsbench	quiet	main	close	10000	47100	109700	234000	1186000
+fsbench	quiet	main	stat	10000	175800	305800	874100	111821200
+fsbench	quiet	main	open	10000	101800	236800	4989600	205018700
+fsbench	quiet	main	read	10000	7400	118200	367400	196503200
+fsbench	quiet	main	rename	10000	357900	689000	13500000	301795700
+fsbench	quiet	main	unlink	10000	209400	629200	1183500	99175700
+fsbench	quiet	main	create_security	10000	1265000	2007000	22365000	101391400
+fsbench	quiet	control	create	10000	701900	1486600	34501200	99588500
+fsbench	quiet	control	write	10000	58200	172200	504500	33144500
+fsbench	quiet	control	fsync	10000	88600	185200	304000	32391300
+fsbench	quiet	control	close	10000	45100	104800	227900	15466700
+fsbench	quiet	control	stat	10000	187900	351200	32359300	195686400
+fsbench	quiet	control	open	10000	104400	244200	1319600	53340400
+fsbench	quiet	control	read	10000	50900	132500	441500	97740500
+fsbench	quiet	control	rename	10000	348100	657900	32229400	215856300
+fsbench	quiet	control	unlink	10000	207200	676300	980800	197313900
+fsbench	quiet	control	create_security	10000	1273600	2007400	35169700	99779800
+
+**quiet** (spinners 0 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 33.1 µs, p99 63.2 µs, p999 147.3 µs, max 1728.0 µs over 23230 probes; 122.8 s). Each cell: p50 · p99 · p999 · max, µs.
+
+| op | dll | main | control |
+|---|---|---|---|
+| create | 800.9 · 1525.1 · 3402.3 · 35148.8 | 712.2 · 1393.2 · 33825.9 · 98415.7 | 701.9 · 1486.6 · 34501.2 · 99588.5 |
+| write | 93.9 · 196.3 · 479.3 · 33900.6 | 59.1 · 177.0 · 487.4 · 33217.2 | 58.2 · 172.2 · 504.5 · 33144.5 |
+| fsync | 104.0 · 230.1 · 502.8 · 33575.6 | 90.7 · 187.6 · 442.2 · 33486.7 | 88.6 · 185.2 · 304.0 · 32391.3 |
+| close | 48.7 · 116.4 · 408.8 · 1351.3 | 47.1 · 109.7 · 234.0 · 1186.0 | 45.1 · 104.8 · 227.9 · 15466.7 |
+| stat | 199.2 · 380.9 · 2750.1 · 14916.7 | 175.8 · 305.8 · 874.1 · 111821.2 | 187.9 · 351.2 · 32359.3 · 195686.4 |
+| open | 130.7 · 244.0 · 496.0 · 33496.9 | 101.8 · 236.8 · 4989.6 · 205018.7 | 104.4 · 244.2 · 1319.6 · 53340.4 |
+| read | 75.5 · 169.1 · 425.9 · 21080.7 | 7.4 · 118.2 · 367.4 · 196503.2 | 50.9 · 132.5 · 441.5 · 97740.5 |
+| rename | 424.0 · 730.0 · 1318.6 · 34792.0 | 357.9 · 689.0 · 13500.0 · 301795.7 | 348.1 · 657.9 · 32229.4 · 215856.3 |
+| unlink | 236.9 · 780.2 · 1343.0 · 3675.2 | 209.4 · 629.2 · 1183.5 · 99175.7 | 207.2 · 676.3 · 980.8 · 197313.9 |
+| create_security | 1421.5 · 1970.5 · 12941.7 · 35511.6 | 1265.0 · 2007.0 · 22365.0 · 101391.4 | 1273.6 · 2007.4 · 35169.7 · 99779.8 |
+
