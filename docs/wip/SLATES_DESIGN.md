@@ -31554,7 +31554,13 @@ handoff's length built, the Unix sibling found); and:
   `StopBounds`.
 - **Not yet (class D).** The anchor's lapse bound (`lapse_bound_ns`: `W` plus its lateness p99) and its observation
   cadence; the daemon's own supervision waits (D-c).
-- EVIDENCE_A461
+- **Evidence.** Built and run on the Mac Studio (kiln r365, 2026-11-18, load 7.5-13, debug build): `cargo test
+  --locked -p slates-api --lib -- role::anchor` 11 of 11 (one ignored, the held process's role; the cross-process
+  memory-stall test among them), `cargo test --locked -p slates-anchor --lib -- stop_tests backoff_tests` 4 of 4; the
+  anchor's and the CLI's suites build (`--no-run`; their runs are main's, and the Linux and Windows start test, which
+  macOS does not compile, is CI's). Red-checked once, with the start's beats no step and the window the bare liveness
+  window: the beating start was judged "made no progress for 1000 ms (its 1000 ms window)" while it beat, and the
+  anchor whose waits ran 2.5 s late judged by a 1 s window.
 
 Applied in the same change to: §2.5 (the graceful stop's status), §4.14 (a status block on `daemon.alive`), GAPS (the
 `LIVENESS_BUDGET_NS` entry), `crates/api/src/role/anchor.rs`, `crates/anchor/src/{supervise,lib}.rs`,
