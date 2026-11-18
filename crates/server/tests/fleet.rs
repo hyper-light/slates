@@ -19022,6 +19022,154 @@ fn a_versions_merge_record_waits_for_its_works_catalog_record() {
   );
 }
 
+/// A-290 (A-255 under A-247): a work on another shard than its green asks for its verdict only once its catalog record,
+/// its submit's route, is committed, so the version's merge record, which carries the completion, never exists before
+/// its route. The owner's own gate cannot see such a work's catalog, since the owner's partition holds no record of it.
+/// Do: three nodes at `f = 1`, two shards each; on a, a green whose version 0 is placed; both holders withhold every
+/// work's catalog record; on a, a work whose name puts it on the other shard, one edit and a submit, its answer not
+/// read; watch over four liveness budgets of the fleet's periods; then lift the fault, and send the submit again under
+/// its id if its wait outlasted the lease bound (answered `Overloaded`, unrecorded). Expect: version 1's record never
+/// placed while the work's catalog is withheld, the work's shard counting the wait (`merge.work.awaited_route`,
+/// non-vacuous), and, once lifted, the submit answered version 1, its record placed, and the green at version 1.
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn a_submit_off_its_greens_shard_waits_for_its_works_catalog_record_before_its_verdict() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh_with(
+    nodes,
+    &hosts,
+    &certs,
+    &serve,
+    1,
+    TWO_SHARDS,
+    &std::collections::BTreeMap::new(),
+    &std::collections::BTreeMap::new(),
+  );
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let fleet: Vec<&Daemon> = daemons.iter().collect();
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
+    name: "routed-green".to_owned(),
+    require_evidence: false,
+    base: None,
+  }) else {
+    panic!("create green");
+  };
+  let origin_placed = poll_until(&fleet, PLACEMENT_DEADLINE, || {
+    daemons[0].merge_record_placed(green, 0)
+  });
+  let withheld = slates_server::merge_service::MergeFault {
+    refuse_work_catalogs: true,
+    ..Default::default()
+  };
+  let faulted: Vec<_> = daemons[1..]
+    .iter()
+    .map(|holder| holder.inject_merge_fault(withheld))
+    .collect();
+  let name = (0u32..)
+    .map(|suffix| format!("routed-work-{suffix}"))
+    .find(|name| {
+      slates_server::verbs::owner_of_name(name, usize::from(TWO_SHARDS))
+        != slates_server::verbs::owner_of(green)
+    })
+    .unwrap();
+  let ReplyBody::WorkCreated { id: work, .. } =
+    client.call(&RequestBody::CreateWork { green, name })
+  else {
+    panic!("create work");
+  };
+  let edited = client.call(&RequestBody::Edit {
+    work,
+    path: "f".to_owned(),
+    at: 0,
+    delete_len: 0,
+    bytes: b"hello".to_vec(),
+  });
+  let submit = RequestBody::Submit {
+    work,
+    evidence: Vec::new(),
+  };
+  let mut submitter = common::client::connect(daemons[0].instance());
+  let word = submitter.begin(&submit).map(|id| id.word());
+  let placed_while_withheld =
+    poll_for_periods(&fleet, WORK_SEAL_WATCH, WORK_SEAL_WATCH_PERIODS, || {
+      daemons[0].merge_record_placed(green, 1)
+    });
+  let waits = daemons[0]
+    .refusals_on_every_shard()
+    .map(|counts| counts.get("merge.work.awaited_route").copied().unwrap_or(0));
+  let lifted: Vec<_> = daemons[1..]
+    .iter()
+    .map(|holder| holder.inject_merge_fault(slates_server::merge_service::MergeFault::default()))
+    .collect();
+  // A wait past the lease bound was answered `Overloaded`, unrecorded; the retry under its id meets the route again.
+  let answer = word
+    .as_ref()
+    .ok()
+    .and_then(|word| match answer_within(&mut submitter, *word) {
+      Some(Err(refusal)) if refusal.starts_with("Overloaded") => {
+        resent_answer(&mut submitter, *word, &submit)
+      }
+      other => other,
+    });
+  let placed_after = poll_until(&fleet, PLACEMENT_DEADLINE, || {
+    daemons[0].merge_record_placed(green, 1)
+  });
+  let head = client.call(&RequestBody::Versions { green });
+  drop(fleet);
+  drop(submitter);
+  drop(client);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    origin_placed,
+    "the green's version 0 was placed before the fault"
+  );
+  assert!(
+    faulted.iter().chain(&lifted).all(Result::is_ok),
+    "the holders' faults were installed and lifted: {faulted:?} {lifted:?}"
+  );
+  assert!(matches!(edited, ReplyBody::Edited), "the edit: {edited:?}");
+  assert!(word.is_ok(), "the submit was sent: {word:?}");
+  assert!(
+    !placed_while_withheld,
+    "version 1's merge record was not placed while its work's catalog record was withheld"
+  );
+  assert!(
+    waits.as_ref().is_ok_and(|waits| *waits > 0),
+    "the work's shard held the submit for its route: {waits:?}"
+  );
+  assert_eq!(
+    answer,
+    Some(Ok(ReplyBody::Submitted {
+      version: Some(1),
+      conflicts: Vec::new(),
+    })),
+    "the submit was answered its version once its route and its record committed"
+  );
+  assert!(
+    placed_after,
+    "version 1's record was placed once the work's catalog could commit"
+  );
+  assert_eq!(
+    head,
+    ReplyBody::Versions { head: 1 },
+    "the green holds the one version"
+  );
+}
+
 /// What `client` is answered under `word` within `within`, polled as [`answer_within`] polls: `None` when nothing came.
 fn answer_in(
   client: &mut slates_client::Client,

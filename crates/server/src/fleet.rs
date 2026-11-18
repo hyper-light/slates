@@ -2332,7 +2332,9 @@ pub(crate) async fn ship_owed_catalog(
 ///   completion the record carries.
 ///
 /// A volume with no record here owes no catalog: a destroyed volume's tombstone stands for both registers (AUD-29-43).
-/// Read on the green's owner shard, which holds its works too.
+/// Read on the shard that holds the volume's record: a green's on its owner shard, and a work's there too when the work
+/// shares its green's shard; a work on another shard (A-247) is read on its own shard before its verdict is asked
+/// (A-290), so the owner's gate finds no record of it here and passes.
 pub(crate) fn catalog_committed(state: &ShardState, id: DbVolumeId, local: HostId) -> bool {
   state
     .db

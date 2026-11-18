@@ -28,6 +28,14 @@
 //! about half the asks were refused at once, their retries refused in turn, and replies to resumed verbs were dropped
 //! (23 to 62 a run), so every run stalled. Batched, ten of ten runs finished with nothing refused or dropped.
 //!
+//! **A submit's route first (A-290).** A version's merge record carries its submit's completion, and A-255 ships it only
+//! once the submitting work's catalog register, which names the green, is committed: after a takeover that register is
+//! the only route a resend has to the completion. The register is the work's, held here, and the owner's partition has
+//! no record of a work on another shard, so the owner's own gate cannot see it. So the work's shard asks the owner for
+//! a verdict only once the register is committed: a submit waits here for it, the register ships at once, and the
+//! record plane's next pass after its commit runs the submit again ([`routes_placed`]). On a laptop the route is
+//! committed at once and nothing waits.
+//!
 //! **A creation holds its id and name.** A work's id is the sequence of the transaction that creates it, and a verb
 //! parked for its owner commits nothing, so creations parked in one step were all given one id, queued behind it and
 //! looped a shard. A creation's own transaction now records it pending (`Op::WorkCreationPending`), which consumes the
@@ -36,7 +44,7 @@
 //! The base a verb fetched is held for that verb alone ([`crate::work_files::FetchedBase`]): nothing of the green's is
 //! cached on a work's shard, so a base's bytes never need invalidating and the work's charge is unchanged.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use slates_db::catalog::{Principal, Role, VolumeId as DbVolumeId};
 use slates_db::op::Op;
@@ -64,6 +72,9 @@ const PENDING_STUCK: &str = "merge.work.pending_stuck";
 const PENDING_UNREADABLE: &str = "merge.work.pending_unreadable";
 /// Format: a work's increment composed on its own shard (A-247), the non-vacuity count of `composed`.
 pub(crate) const COMPOSED_ON_WORK: &str = "merge.work.composed_on_work";
+/// Format: a submit held on its work's shard until the work's catalog register, its route, was committed, before the
+/// green's owner was asked for a verdict (A-290), the non-vacuity count of [`await_route`].
+pub(crate) const AWAITED_ROUTE: &str = "merge.work.awaited_route";
 /// Format: a work's increment left to its green's owner to compose: its journal names a base it could not assemble, or
 /// does not compose (the owner then refuses it, typed).
 const COMPOSED_BY_OWNER: &str = "merge.work.composed_by_owner";
@@ -134,8 +145,9 @@ struct ParkedVerb {
 struct Queue {
   waiting: VecDeque<ParkedVerb>,
   asking: bool,
-  /// When the owner took the oldest verb's verdict to answer at its quorum commit: the instant (the lease's clock) past
-  /// which the verb stops waiting, is answered `Overloaded`, and the work is released (its retry joins the owner).
+  /// When the owner took the oldest verb's verdict to answer at its quorum commit, or the verb waits for its work's
+  /// route (A-290): the instant (the lease's clock) past which the verb stops waiting, is answered `Overloaded`, and the
+  /// work is released (its retry joins the owner, or meets the route again).
   deferred_until: Option<u64>,
 }
 
@@ -175,6 +187,9 @@ pub(crate) struct WorkHome {
   timer_armed: bool,
   /// The asks waiting to go to each owner shard (A-247).
   outboxes: BTreeMap<u16, Outbox>,
+  /// The works whose oldest verb waits for the work's route (A-290): a subset of `queues`' keys, so bounded as the
+  /// parked verbs are, and each leaves it when its queue is resolved ([`resolve`]).
+  routing: BTreeSet<DbVolumeId>,
   /// Test support (`Daemon::lose_next_owner_answer`): the next verdict or admission an ask brings back is lost.
   pub(crate) lose_next_answer: bool,
 }
@@ -208,6 +223,10 @@ enum Need {
     id: DbVolumeId,
     name: String,
   },
+  /// The work's route (A-255, A-290): its catalog register, which names its green, committed at its quorum. Met on the
+  /// work's own shard, which holds the register, before the owner is asked for a verdict, so the merge record that
+  /// carries the submit's completion never exists before its route does.
+  Route,
 }
 
 fn key(origin: u64, id: RequestId) -> (u64, u32, u32) {
@@ -296,13 +315,7 @@ fn need_of(state: &ShardState, work: DbVolumeId, body: &RequestBody) -> Option<N
       if home.verdict.is_some() {
         return None;
       }
-      let sealed = seal(state, work);
-      Some(
-        base_missing(state, &sealed).unwrap_or_else(|| Need::Verdict {
-          evidence: evidence.clone(),
-          sealed: composed(state, sealed, evidence.clone()),
-        }),
-      )
+      Some(verdict_need(state, work, seal(state, work), evidence))
     }
     RequestBody::Rebase { .. } => {
       if home.rebased.is_some() {
@@ -329,15 +342,28 @@ fn need_of(state: &ShardState, work: DbVolumeId, body: &RequestBody) -> Option<N
       if home.verdict.is_some() {
         return None;
       }
-      sealed_with_edit(state, work, (path, *at, *delete_len, insert)).map(|sealed| {
-        base_missing(state, &sealed).unwrap_or_else(|| Need::Verdict {
-          evidence: evidence.clone(),
-          sealed: composed(state, sealed, evidence.clone()),
-        })
-      })
+      sealed_with_edit(state, work, (path, *at, *delete_len, insert))
+        .map(|sealed| verdict_need(state, work, sealed, evidence))
     }
     _ => None,
   }
+}
+
+/// What a submit of `sealed` needs of the owner, once it has what it reads: its work's route first (A-290), then the
+/// base entries its composition lacks, then the verdict.
+fn verdict_need(
+  state: &ShardState,
+  work: DbVolumeId,
+  sealed: SealedWork,
+  evidence: &[[u8; 32]],
+) -> Need {
+  if !route_committed(state, work) {
+    return Need::Route;
+  }
+  base_missing(state, &sealed).unwrap_or_else(|| Need::Verdict {
+    evidence: evidence.to_vec(),
+    sealed: composed(state, sealed, evidence.to_vec()),
+  })
 }
 
 fn page_if_unheld(
@@ -608,13 +634,15 @@ fn park(
     _ => return refuse_unrecorded(state),
   };
   let asks = need.is_some() && (resuming || !state.work_home.queues.contains_key(&queue_key));
+  // A route is the work's own, met here once its queue holds the verb (A-290): nothing goes to the owner for it.
+  let routing = asks && matches!(need, Some(Need::Route));
   if asks
     && matches!(need, Some(Need::Verdict { .. }))
     && stage_pending(state, queue_key, (origin, id, client_id), principal, &body).is_err()
   {
     return refuse_unrecorded(state);
   }
-  if asks && !start_ask(state, queue_key, origin, id, principal, need) {
+  if asks && !routing && !start_ask(state, queue_key, origin, id, principal, need) {
     return refuse_unrecorded(state);
   }
   let parked = ParkedVerb {
@@ -641,6 +669,9 @@ fn park(
   queue.asking |= asks;
   home.by_request.insert(key(origin, id), queue_key);
   home.parked = home.parked.saturating_add(1);
+  if routing {
+    await_route(state, queue_key);
+  }
   state.acceptance_deferred = true;
   Gate::Answer(crate::lease_wait::parked_reply())
 }
@@ -784,6 +815,8 @@ enum Answered {
   Verdict(ReplyBody),
   Rebased(RebaseAnswer),
   Admitted(Result<Admitted, Refusal>),
+  /// The work's route is committed (A-290): nothing to hand the verb, which runs its gate again.
+  Route,
 }
 
 /// One ask waiting in a shard's outbox to its green's owner.
@@ -845,6 +878,8 @@ fn start_ask(
       Some(w) => w.green,
       None => return false,
     },
+    // The owner holds nothing of a work's route (A-290): `park` meets it on this shard.
+    Need::Route => return false,
   };
   let version = state.works.get(&queue).map_or(0, |w| w.base_version);
   let owner_partition = crate::verbs::owner_of(crate::verbs::to_wire_volume(green));
@@ -1017,6 +1052,8 @@ fn answer_on_owner(state: &mut ShardState, item: AskItem) -> Outcome {
     } => Outcome::Answered(Answered::Admitted(crate::verbs::owner_admit(
       state, &principal, green, work,
     ))),
+    // Never asked (`start_ask` refuses it); answered, it only runs the work's gate again, which checks the route there.
+    Need::Route => Outcome::Answered(Answered::Route),
   }
 }
 
@@ -1045,7 +1082,44 @@ pub(crate) fn answered_late(state: &mut ShardState, origin: u64, id: RequestId, 
   resolve(state, work, Some(Answered::Verdict(reply)));
 }
 
-/// The oldest verb of `work` waits for its quorum commit, up to the lease bound.
+/// Whether `work`'s route is committed (A-255, A-290): its catalog register, which names its green and is the only route
+/// a resend of its submit has after a takeover, is ready at its quorum. Read on this shard, which holds the work's
+/// record; at once on a laptop, which has no remote candidate.
+fn route_committed(state: &ShardState, work: DbVolumeId) -> bool {
+  crate::fleet::catalog_committed(state, work, state.fleet.host())
+}
+
+/// Holds `work`'s oldest verb, a submit, until the work's route is committed (A-290). The work's catalog register ships
+/// now rather than at the coordinator's period, and the record plane's next pass on this shard after it commits runs
+/// the verb's gate again ([`routes_placed`]). Past the lease bound the verb is answered `Overloaded`, unrecorded, so its
+/// retry runs it again: nothing went to the owner, so nothing waits to be settled.
+fn await_route(state: &mut ShardState, work: DbVolumeId) {
+  state.count(AWAITED_ROUTE, 1);
+  state.work_home.routing.insert(work);
+  state.merge.works_owing_catalog.insert(work);
+  crate::merge_service::nudge_record_plane(state);
+  defer_oldest(state, work);
+}
+
+/// Runs again the gate of each work's oldest verb that waits for its route, once the route is committed (A-290). Called
+/// at every pass of the record plane on this shard (`merge_service::next_merge_work`), which a catalog's commit nudges.
+pub(crate) fn routes_placed(state: &mut ShardState) {
+  if state.work_home.routing.is_empty() {
+    return;
+  }
+  let placed: Vec<DbVolumeId> = state
+    .work_home
+    .routing
+    .iter()
+    .copied()
+    .filter(|work| route_committed(state, *work))
+    .collect();
+  for work in placed {
+    resolve(state, work, Some(Answered::Route));
+  }
+}
+
+/// The oldest verb of `work` waits for its quorum commit, or for its route (A-290), up to the lease bound.
 fn defer_oldest(state: &mut ShardState, work: DbVolumeId) {
   let deadline =
     slates_machine::clock::monotonic_ns().saturating_add(crate::lease::lease_bound_ns());
@@ -1111,6 +1185,7 @@ fn release_expired(state: &mut ShardState) {
 
 /// An ask finished: gives the oldest verb its answer and resumes the work's queue, or, unanswered, refuses it.
 fn resolve(state: &mut ShardState, work: DbVolumeId, answer: Option<Answered>) {
+  state.work_home.routing.remove(&work);
   let Some(queue) = state.work_home.queues.get_mut(&work) else {
     return;
   };
@@ -1124,6 +1199,7 @@ fn resolve(state: &mut ShardState, work: DbVolumeId, answer: Option<Answered>) {
           Answered::Verdict(reply) => head.verdict = Some(reply),
           Answered::Rebased(rebased) => head.rebased = Some(rebased),
           Answered::Admitted(admitted) => head.admitted = Some(admitted),
+          Answered::Route => {}
         }
       }
     }

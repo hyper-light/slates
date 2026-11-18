@@ -14479,6 +14479,10 @@ the green's shard.
     records it there (deferred to the quorum as AUD-11 defers it). The verdict is the green's one serialized step. The
     answer goes back to the work's shard, which, in one transaction, restates the work (reset on an accept, its journal
     and files put back on a conflict), records the completion on its own partition, and only then replies.
+  - *A submit's route (A-290).* A submit off its green's shard asks for its verdict only once its work's catalog
+    register, which A-255 makes the route of a resend after a takeover, is committed at its quorum, read on the work's
+    shard; it waits there as a parked verb until then. The owner's gate cannot see that register, since the owner's
+    partition holds no record of a work on another shard.
   - *Rebase* rides the same path: the owner maps the increment through its deltas, moves the floor, and answers the
     changed delta and the new base. Nothing about the green changes.
   - *An edit-and-submit (A-225)* applies its edit to what it moves to the owner, not to the work, so nothing of it is
@@ -16547,7 +16551,8 @@ Applied in the same change to:
   - The green's owner answers only the completion under the request's own key and refuses anything else `NotFound`. A
     key copied into another session is refused at its origin's door (A-SEAT).
   - A version's record ships only once its submitting work's catalog is committed, so no holder holds a completion
-    without its route. The record plane ships that catalog at the work's creation, and on demand.
+    without its route. The record plane ships that catalog at the work's creation, and on demand. A work on another
+    shard than its green (A-247) meets this on its own shard before its verdict is asked (A-290).
   - The successor never runs a resend whose key its chain does not hold. A work no member owns has no work to run against,
     so the green's owner refuses it `NotFound`. It answers only from the chain it adopted whole, to the quorum's head
     (`takeover::adopt`), so a version committed at the quorum whose answer was lost is answered, never run again
@@ -20850,3 +20855,41 @@ judged by `fails_the_suite`), `crates/server/tests/virtiofs.rs` (the guest's env
   unsupported), so a local clone copies there while NTFS links, and a git repository's symbolic-link probe needs
   WinFsp reparse points, which the drive does not serve yet. A Linux FUSE leg outside a container (the native Linux
   lane reaches the daemon through the NFS adapter). The runs over each mount are the supervisor's (CLAUDE.md §8).
+
+### A-290 — A submit off its green's shard asks for its verdict only once its work's route is committed (A-255 under A-247; 2026-11-17, g231, landing W1)
+Applied in the same change to: §4.16 (Submission), A-247's rule ("A submit's route"), A-255's rule (the record plane's
+gate), `crates/server/src/work_home.rs` (`Need::Route`, `route_committed`, `await_route`, `routes_placed`,
+`AWAITED_ROUTE`), `crates/server/src/merge_service.rs` (`next_merge_work` runs `routes_placed`; the gate's comment),
+`crates/server/src/fleet.rs` (`catalog_committed`'s reading), `crates/server/src/verbs.rs` (`judge_submission` names
+its `SealedWork`'s work in the record), the test below, GAPS.
+
+- **What was wrong.** A-255 (built on main 2026-11-09, without W1) ships a version's merge record, which carries the
+  submit's completion, only once the submitting work's catalog register is committed, because after a takeover that
+  register, which names the green, is the only route a resend has to the completion. The record plane checks it on the
+  green's owner shard, "which holds its works too". A-247 (W1) places a work on the shard its name hashes to, so most
+  works are elsewhere, and the owner's partition holds no record of them: `catalog_committed` finds none and passes.
+  Merged as it stood, W1 would have let a record carrying a completion reach its holders before its route existed.
+- **The rule.** The register is the work's, held on the work's own shard. So a submit of a work whose green lives on
+  another shard (and an edit-and-submit) asks the owner for a verdict only once the work's catalog register is ready
+  at its quorum, read on the work's shard. Until then it waits there as W1's other parked verbs wait: the register
+  ships at once (the work joins `works_owing_catalog`, and the record plane is nudged), the later verbs of the work park
+  behind it, the record plane's next pass on that shard after the commit runs the submit's gate again
+  (`routes_placed`), and past the lease bound the submit is answered `Overloaded`, unrecorded, its retry meeting the
+  route again. Nothing has gone to the owner, so nothing waits to be settled. A record therefore never exists before its
+  route: the owner's gate still holds every work on its own shard, and finds no record of a work elsewhere because that
+  work's shard met the rule first.
+- **What it costs.** Nothing on a laptop, where the register is ready at once (no remote candidate). In a fleet, only a
+  submit that reaches its work's shard before the work's register has committed waits, for one placement of that
+  register (A-255 measured a submit made right after its work's creation at 1.59–1.64 ms against 1.25–1.29 ms, an idle
+  Mac Studio, 2026-11-09); the verdict then follows the register instead of running beside it.
+- **Checked once, not every pass.** The owner's gate re-reads readiness at every pass, and readiness is judged under
+  the current configuration, so it can lapse when a neighbourhood changes until the register is placed again. This
+  rule reads it once, before the verdict. A register committed at its quorum stays held there, so the route the rule
+  protects exists from then on; re-placing it under a new configuration is the record plane's period, as for every
+  register.
+- **Proven** by `a_submit_off_its_greens_shard_waits_for_its_works_catalog_record_before_its_verdict`
+  (`crates/server/tests/fleet.rs`): three nodes at `f = 1`, two shards each, both holders withholding every work's
+  catalog record, a work on the shard its green is not on. Its record is never placed while the catalog is withheld,
+  the work's shard counts the wait (`merge.work.awaited_route`), and once lifted the submit is answered version 1 and
+  the green holds one version. A-255's own test runs one shard a node, where every work shares its green's shard, so it
+  could not see this.

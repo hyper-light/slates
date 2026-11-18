@@ -1,5 +1,15 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **W1 would have let a merge record reach its holders before its route: fixed before W1 landed (2026-11-17, g231;
+> A-290, §4.16).** A-255 holds a version's merge record, which carries its submit's completion, until the submitting
+> work's catalog register is committed, checking it on the green's owner shard. W1 (A-247) puts most works on other
+> shards, whose records the owner's partition does not hold, so the check passed for them unseen; merging the two also
+> failed to compile where A-255's record named a `work_id` that W1's owner half does not have. A submit off its green's
+> shard now asks for its verdict only once its work's register is committed, waiting on the work's own shard
+> (`work_home::Need::Route`). Test: `a_submit_off_its_greens_shard_waits_for_its_works_catalog_record_before_its_verdict`
+> (three nodes at `f = 1`, two shards each, the holders withholding work catalogs). A-255's own test runs one shard a
+> node, so every work there shares its green's shard.
+
 > **A rebased work was restated into other bytes: fixed (perf, 2026-11-09, §4.16 "Rebase, the only corrective path").**
 > A rename over a file, rebased and submitted, left the destination with the moved bytes followed by its own: 20 bytes
 > where 10 were renamed in. An edit that replaced bytes came back with the work's own byte kept and an inserted one
