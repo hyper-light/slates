@@ -21,6 +21,18 @@
 > that lane from 2026-11-12 until this fix; the first run with it is the stack that lands it. Record:
 > `docs/bugs/2026-11-18-owner-turns-mkdir-asked-the-program-not-the-kernel.md`.
 
+> **A lone daemon's end left the line's writer unjoined: fixed (2026-11-18, A-232).** Main's TSan lane failed both
+> stuck-shard tests of `crates/client/tests/lone_daemon.rs` from the push that landed A-232 (run 44210937388): "the lone
+> daemon was still running 10s after its shard was held". The watchdog reached its verdict within a window and logged
+> its end every time (diag-g218-tsan-1, run 44216526894, 3 of 3 runs); the exit then ran ThreadSanitizer's finalizer,
+> which sleeps a second (`atexit_sleep_ms`) and reported the end's writer thread, finished and never joined, as a leak.
+> Symbolizing the report held the exit 26.3-26.8 s, and the process exited 66, ThreadSanitizer's code for a reported
+> warning, not 4 (diag-g218-tsan-2, run 44217144677). With `atexit_sleep_ms=0` the writer was still running at the
+> exit, so nothing was reported and both tests passed with exit 4. Uninstrumented, the tests passed 3 of 3. The end
+> (`watchdog::end_process`) now joins the writer once it says the line is written; a writer blocked past a beat is
+> still ended by the exit, as A-232 decided. Swept: no other production `process::exit` follows a spawned thread.
+> Record: `docs/bugs/2026-11-18-the-watchdogs-end-left-its-writer-unjoined.md`.
+
 > **The dirty-page test's precondition, proved each attempt (2026-11-09, A-248).**
 > `a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path` failed intermittently ("the sync says so:
 > Ok(())", B10's gate, adacachy2, load about 66) when the kernel wrote the store's page back before the replacement. On
