@@ -113,6 +113,18 @@ pub struct ImageBuilt {
   pub inodes_used: u64,
 }
 
+/// A snapshot exported as its archive (§4.11, A-441): the volume whose root holds the archive file
+/// ([`slates_ipc::protocol::ARCHIVE_FILE`]), read a page at a time with [`Client::read`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArchiveExported {
+  /// The archive volume, the caller's own.
+  pub id: VolumeId,
+  /// The archive file's length in bytes.
+  pub archive_bytes: u64,
+  /// The archive's manifest identity: the BLAKE3 Merkle root of the snapshot's tree (D-17).
+  pub manifest: [u8; 32],
+}
+
 /// The client's deadlines, every one a derivation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Deadlines {
@@ -5041,6 +5053,37 @@ impl Client {
       ReplyBody::BaseCaptured { snapshot } => Ok(snapshot),
       _ => Err(ClientError::UnexpectedReply {
         verb: "capture_base",
+      }),
+    }
+  }
+
+  /// Exports `snapshot` of `volume` as its archive (§4.11, A-441): a new volume `name`, the caller's, whose root holds
+  /// one file, [`slates_ipc::protocol::ARCHIVE_FILE`], the snapshot's content-addressed archive, read a page at a time
+  /// with [`Client::read`]. Waits for the export, which walks the snapshot in slices on its owner. `read` on the volume
+  /// is required; a snapshot whose entries still read an overlay's base is refused `Unsupported` (capture the base
+  /// first, [`Client::capture_base`]).
+  pub fn archive_export(
+    &mut self,
+    volume: VolumeId,
+    snapshot: SnapshotId,
+    name: &str,
+  ) -> Result<ArchiveExported, ClientError> {
+    match self.call(&RequestBody::ArchiveExport {
+      volume,
+      snapshot,
+      name: name.to_owned(),
+    })? {
+      ReplyBody::ArchiveExported {
+        id,
+        archive_bytes,
+        manifest,
+      } => Ok(ArchiveExported {
+        id,
+        archive_bytes,
+        manifest,
+      }),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "archive_export",
       }),
     }
   }

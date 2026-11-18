@@ -302,6 +302,9 @@ pub struct LandingReport {
   /// The batch barriers the landing took (A-130): each made a batch of written-out files durable before any of them
   /// was placed, so fewer than the files written whenever a batch held more than one.
   pub barriers: usize,
+  /// The files whose bytes were shared with an identical file their batch had already staged rather than written
+  /// (§4.15 step 6, A-445): the clone path's own count, so a landing that never clones where it could shows it.
+  pub cloned: usize,
   /// The costs measured.
   pub costs: LandingCosts,
   /// Hidden siblings of an earlier landing swept before this one ran.
@@ -545,6 +548,11 @@ struct Landing<'a, H: LandFs> {
   /// Whether the filesystem gives unnamed temporaries (`O_TMPFILE`); where it does not, a temporary is
   /// named from its creation.
   unnamed_temporaries: bool,
+  /// Whether the filesystem shares one file's bytes with another (`LandCapabilities::reflink`, A-445): where it does,
+  /// a file whose bytes its batch already staged is cloned from that temporary ([`clone_source`]).
+  reflink: bool,
+  /// The files cloned so far ([`LandingReport::cloned`]).
+  cloned: usize,
   hidden_counter: u64,
   bytes_written: u64,
   widest_window_ns: u64,
@@ -1208,6 +1216,11 @@ impl<H: LandFs> Landing<'_, H> {
     progress: &mut WriteProgress,
   ) -> EntryStep {
     let window = cx.store.content.chunk_bytes().max(1);
+    match self.begin_clone(entry, cx.vol, cx.store, progress) {
+      Ok(Some(copy)) => return self.stage_step(entry, index, copy, cx.store, progress),
+      Ok(None) => {}
+      Err(failure) => return EntryStep::Done(self.written_of(Err(failure))),
+    }
     let mut copy = match self.begin_copy(entry, cx.vol, cx.store) {
       Ok(copy) => copy,
       Err(failure) => return EntryStep::Done(self.written_of(Err(failure))),
@@ -1637,6 +1650,51 @@ impl<H: LandFs> Landing<'_, H> {
   /// (AUD-29-04). Before 2026-09-30 a replacement's temporary was created at its aside name, where a crash
   /// mid-write left bytes that matched neither the witness nor the overlay, and the resume kept them (a
   /// named-temporary filesystem: APFS).
+  /// A file's bytes shared with an identical file its batch has already staged (§4.15 step 6, A-445: "reflink instead
+  /// of writev when the target filesystem supports it and an identical file already exists in the target tree, found
+  /// through the landing's own hash index of the manifest, never by scanning the disk"): the staged temporary with the
+  /// same BLAKE3 and length ([`clone_source`]), cloned into a new temporary that is then complete, as a copy is once its
+  /// last window is written. `None` where the filesystem has no reflinks, the batch holds no such file, or the host
+  /// refused to share this pair (`EOPNOTSUPP`, nothing made): the bytes are then written as they always were.
+  fn begin_clone(
+    &mut self,
+    entry: &LandingEntry,
+    vol: &mut Volume,
+    store: &mut Store,
+    progress: &WriteProgress,
+  ) -> Result<Option<FileCopy>, WriteFailure> {
+    if !self.reflink {
+      return Ok(None);
+    }
+    let overlay = entry
+      .overlay
+      .ok_or(WriteFailure::Volume(VfsError::Invalid))?;
+    let Some(from) = clone_source(&progress.staged, &overlay) else {
+      return Ok(None);
+    };
+    let (dir_path, _) = split(&entry.path);
+    let located = self.request.source.resolve(vol, store, &entry.path)?;
+    let dir = self.open_dir_path(dir_path)?;
+    self.touched.insert(dir_path.into());
+    let created = self.hidden_name();
+    let started = Instant::now();
+    let temp = match self.host.clone_temp(dir, &created, from, overlay.size) {
+      Ok(temp) => temp,
+      Err(HostError::Unavailable(errno)) if no_clone(errno) => return Ok(None),
+      Err(e) => return Err(e.into()),
+    };
+    self.cloned = self.cloned.saturating_add(1);
+    Ok(Some(FileCopy {
+      temp,
+      dir,
+      created,
+      inode: located.inode,
+      next: overlay.size,
+      overlay,
+      started,
+    }))
+  }
+
   fn begin_copy(
     &mut self,
     entry: &LandingEntry,
@@ -2862,6 +2920,24 @@ fn batch_pages(store: &Store) -> u64 {
   u64::try_from(pages).unwrap_or(u64::MAX).max(1)
 }
 
+/// The staged temporary a file with `overlay`'s bytes may be cloned from (A-445): the first of the batch's staged files
+/// with the same BLAKE3 and length, each complete and written out. The batch is the index: bounded by its pages
+/// ([`batch_pages`]), and its temporaries are held open until it is placed, so the one found is still this landing's.
+fn clone_source(staged: &VecDeque<Staged>, overlay: &OverlayIdentity) -> Option<HostFile> {
+  staged
+    .iter()
+    .find(|staged| {
+      staged.copy.overlay.hash == overlay.hash && staged.copy.overlay.size == overlay.size
+    })
+    .map(|staged| staged.copy.temp)
+}
+
+/// Whether a clone was refused for want of sharing (`ENOTSUP` on macOS, `EOPNOTSUPP` on Linux and from the Windows
+/// writer): the bytes are then written instead.
+fn no_clone(errno: i32) -> bool {
+  errno == ERRNO_NOTSUP_MACOS || errno == ERRNO_NOTSUP_LINUX
+}
+
 fn no_exchange(errno: i32) -> bool {
   errno == ERRNO_INVAL || errno == ERRNO_NOTSUP_MACOS || errno == ERRNO_NOTSUP_LINUX
 }
@@ -3308,6 +3384,8 @@ struct Saved {
   touched: BTreeSet<Box<str>>,
   exchange: bool,
   unnamed_temporaries: bool,
+  reflink: bool,
+  cloned: usize,
   hidden_counter: u64,
   bytes_written: u64,
   widest_window_ns: u64,
@@ -3331,6 +3409,8 @@ impl Saved {
       touched: BTreeSet::new(),
       exchange: caps.exchange,
       unnamed_temporaries: caps.unnamed_temporaries,
+      reflink: caps.reflink,
+      cloned: 0,
       hidden_counter: 0,
       bytes_written: 0,
       widest_window_ns: 0,
@@ -3358,6 +3438,8 @@ impl<'a, H: LandFs> Landing<'a, H> {
       touched: saved.touched,
       exchange: saved.exchange,
       unnamed_temporaries: saved.unnamed_temporaries,
+      reflink: saved.reflink,
+      cloned: saved.cloned,
       hidden_counter: saved.hidden_counter,
       bytes_written: saved.bytes_written,
       widest_window_ns: saved.widest_window_ns,
@@ -3381,6 +3463,8 @@ impl<'a, H: LandFs> Landing<'a, H> {
       touched: self.touched,
       exchange: self.exchange,
       unnamed_temporaries: self.unnamed_temporaries,
+      reflink: self.reflink,
+      cloned: self.cloned,
       hidden_counter: self.hidden_counter,
       bytes_written: self.bytes_written,
       widest_window_ns: self.widest_window_ns,
@@ -4153,6 +4237,7 @@ fn finish_report<H: LandFs>(
     durability,
     degraded: landing.degraded,
     barriers: landing.barriers,
+    cloned: landing.cloned,
     costs,
     swept,
     target: target.dir,
@@ -4191,4 +4276,79 @@ fn same_object_after_a_move(witness: &Fingerprint, after: &Fingerprint) -> bool 
     windows: (after.windows & !MOVE_SETS) | (witness.windows & MOVE_SETS),
     ..*after
   } == *witness
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// A staged file of `size` bytes whose content hashes to `hash`, held as temporary `temp`.
+  fn staged(temp: u64, hash: u8, size: u64) -> Staged {
+    Staged {
+      index: 0,
+      copy: FileCopy {
+        temp: HostFile(temp),
+        dir: HostDir(1),
+        created: ".slates-0000000000000001-0".into(),
+        inode: slates_vfs::ids::InodeNo(temp),
+        next: size,
+        overlay: OverlayIdentity {
+          hash: [hash; 32],
+          size,
+          mode: 0o644,
+          mtime_ns: 1,
+        },
+        started: Instant::now(),
+      },
+      witness: None,
+      entry_start_ns: 0,
+    }
+  }
+
+  /// §4.15 step 6, A-445 (the landing's own index, never a scan of the disk). Do: look up a file's bytes in a staged batch
+  /// holding two files with its hash, one of another length, and one of another hash. Expect the first staged file with
+  /// both the same BLAKE3 and the same length; none for a length or a hash the batch does not hold, or an empty batch.
+  #[test]
+  fn a_file_is_cloned_only_from_a_staged_file_with_its_hash_and_its_length() {
+    let batch: VecDeque<Staged> = [
+      staged(7, 0xAA, 10),
+      staged(8, 0xBB, 4096),
+      staged(9, 0xBB, 4096),
+      staged(10, 0xBB, 99),
+    ]
+    .into();
+    let wanted = |hash: u8, size: u64| OverlayIdentity {
+      hash: [hash; 32],
+      size,
+      mode: 0o600,
+      mtime_ns: 2,
+    };
+    assert_eq!(
+      clone_source(&batch, &wanted(0xBB, 4096)),
+      Some(HostFile(8)),
+      "the first such file"
+    );
+    assert_eq!(clone_source(&batch, &wanted(0xBB, 99)), Some(HostFile(10)));
+    assert_eq!(
+      clone_source(&batch, &wanted(0xBB, 100)),
+      None,
+      "a length the batch does not hold"
+    );
+    assert_eq!(
+      clone_source(&batch, &wanted(0xCC, 4096)),
+      None,
+      "a hash the batch does not hold"
+    );
+    assert_eq!(clone_source(&VecDeque::new(), &wanted(0xAA, 10)), None);
+  }
+
+  /// A-445. Do: ask whether each refusal means "this pair cannot share" (the bytes are then written) or a failure.
+  /// Expect `ENOTSUP` (macOS 45) and `EOPNOTSUPP` (Linux's and the Windows writer's 95) to fall back, and no other.
+  #[test]
+  fn only_a_refusal_to_share_falls_back_to_writing_the_bytes() {
+    assert!(no_clone(ERRNO_NOTSUP_MACOS) && no_clone(ERRNO_NOTSUP_LINUX));
+    for errno in [ERRNO_EXIST, ERRNO_INVAL, ERRNO_NOSPC, 1, 5] {
+      assert!(!no_clone(errno), "{errno}");
+    }
+  }
 }

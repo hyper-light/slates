@@ -1847,3 +1847,42 @@ fn a_landing_ignores_windows_attribute_bits_without_error() {
     "nor how many entries it writes ({written_without})"
   );
 }
+
+/// §4.15 step 6, A-445 (a reflink in a landing). Do: land a scratch volume holding two files with the same bytes and a
+/// third with other bytes, onto a simulated filesystem with reflinks and onto one without. Expect, with them: the second
+/// identical file shared from the first's staged temporary (one clone on the host, `cloned` 1 in the report) and all
+/// three files whole on the disk; without them, no clone asked and the same disk.
+#[test]
+fn a_file_whose_bytes_its_batch_already_staged_is_cloned_where_the_target_can() {
+  let same: Vec<u8> = (0..10_000u32)
+    .map(|at| u8::try_from(at % 251).unwrap())
+    .collect();
+  for reflink in [true, false] {
+    let mut host = SimHost::new();
+    host.set_reflink_supported(reflink);
+    let target = root_target(&mut host);
+    let mut store = store();
+    let mut vol = scratch(&mut store);
+    write_file(&mut vol, &mut host, &mut store, "/a.bin", &same);
+    write_file(&mut vol, &mut host, &mut store, "/b.bin", &same);
+    write_file(&mut vol, &mut host, &mut store, "/c.bin", b"other");
+    let mut session = Session::new();
+    let report = Setup {
+      host: &mut host,
+      target: &target,
+      vol: &mut vol,
+      store: &mut store,
+      session: &mut session,
+    }
+    .land(request(1))
+    .unwrap();
+    assert_eq!(report.state, LandingState::Done, "{report:?}");
+    assert_eq!(report.written, 3, "{report:?}");
+    let expected = if reflink { (1, 1) } else { (0, 0) };
+    assert_eq!((report.cloned, host.clones()), expected, "{report:?}");
+    assert_eq!(host.bytes("/a.bin").unwrap(), same);
+    assert_eq!(host.bytes("/b.bin").unwrap(), same);
+    assert_eq!(host.bytes("/c.bin").unwrap(), b"other");
+    assert!(hidden_names(&host).is_empty(), "{:?}", hidden_names(&host));
+  }
+}

@@ -5229,6 +5229,19 @@ idle turn a request meets, E[T²]/E[T] over the turns of its own idle spins, is 
 > Test: `crates/server/tests/closed_loop.rs` (each owner decides by what it measured; the loop's parks follow the
 > decision).
 
+> **Status (2026-11-18, the Node SDK suites end on Windows).** The Node suites (`sdk.test.mjs`, `sdk_async.test.mjs`,
+> `packaged.test.mjs`) start a real anchor and end it in one shared teardown (`crates/sdk-node/tests/anchor.mjs`). On
+> Unix the anchor leads its own process group and one `SIGKILL` to the group ends it and every daemon it started. On
+> Windows a negative pid is refused (libuv opens the process by its id), and the anchor holds its daemon in a
+> kill-on-close job only it has a handle to (`crates/anchor/src/supervise.rs`), so ending the anchor's own process
+> ends the daemon with it. Until 2026-11-18 the suites had never run on Windows, and every teardown sent the group kill
+> there, swallowed its refusal and left the anchor running, whose process handle kept `node --test` waiting for over
+> 70 minutes on both Windows runners (diag run 44384411115). A teardown now fails its test if the anchor is still
+> running 20 s after its kill. CI's `sdk` job runs the Node suites and the packaged smoke test on `windows-latest`
+> and `windows-11-arm` (its Python steps need a Unix venv and are owed there). The test that freezes the daemon with
+> `SIGSTOP` and finds it with `pgrep` and `ps` skips loudly on Windows; its Windows freeze (`NtSuspendProcess`, as
+> slates' Rust suites freeze a process there) is owed (GAPS).
+
 **Worked example.** From Python: `await client.create("scratch", bounded=4 GiB)`: the extension
 writes the slot, spins for `spin_ns`, and returns the reply without ever touching the event loop
 (fast path); if the daemon were busy, the extension parks, the reply lands, the daemon writes the
@@ -8406,6 +8419,18 @@ the format floor.
 >
 > **Reconciled 2026-11-06 (VFS plan Step 15).** A restore's output is sparse again (5106abc2; AUD-29-57 closed, A-55).
 
+> **Status (2026-11-18, A-441: a snapshot exported as its archive through the library).** `ArchiveExport`
+> (`Instance::export_archive`, contract 38) renders a snapshot as its archive file, `ARCHIVE_FILE`, in a new volume of
+> the caller's, as an image build renders an ext2 file (`crate::image`): checked at once (the volume, `read`, the name,
+> the snapshot), then walked in slices by a task of the owner shard (`slates_vfs::export::SnapshotArchiver`), the
+> snapshot pinned until the file is written, the volume and the request's completion committed as one atom. A consumer
+> reads the file a page at a time (`read`) and keeps it where it keeps bytes (Mantle, kiln's object store, CP-T10.4).
+> The archive carries every file's bytes and every entry's metadata, each chunk and the whole verified by identity on
+> the way back in; its manifest identity, which the reply names, is the tree's. A snapshot whose entries still read an
+> overlay's base is refused `Unsupported` (capture the base first); a merge volume's too. Owed: the volume made from an
+> archive (the next piece, through `slates_archive::Planning` as a takeover restores); a streamed encoder, since the
+> archive is held whole while it is encoded, one unit of its size, then written into the file a chunk a unit.
+
 ### 4.12 Agent surfaces (D-19)
 
 > **Correction (2026-09-17, CLI process gate).** `run` and `exec` accept global flags before
@@ -9873,7 +9898,8 @@ stays in the overlay.
 > steps 1–6, 8, 9 and 11 as written, with grants, leases and the audit log as in-process
 > records until Phase 2; step 7's ramp as a recorded policy (entries run one at a time until
 > the runtime's pool; replaced by batches, A-130, 2026-10-10); step 10 for an empty target (a populated target waits on a hard-link
-> verb in the seam); reflinks and `syncfs` waiting on their measured costs; Windows waiting on
+> verb in the seam); reflinks (built for the batch's own duplicates by A-445, on ReFS first; `FICLONE` and
+> `clonefile` owed) and `syncfs` waiting on their measured costs; Windows waiting on
 > Phase 4. Two additions the oracle forced: a `Clear` action (a base directory the overlay
 > removed and recreated opaque: a fresh directory exchanged with the old one, the displaced
 > tree removed), and a resumed landing's recognition of its own finished work (a directory
@@ -9896,7 +9922,11 @@ stays in the overlay.
 > made handle-relative at the landing's hidden name and moved into place without replacing, its buffer set with
 > `SeCreateSymbolicLinkPrivilege` enabled for its thread alone where the process holds it; where NTFS refuses the set (a
 > standard account outside Developer Mode) the entry fails `EPERM`, typed, as every link did before. A link lands as a
-> file link: the seam carries no link's type.
+> file link: the seam carries no link's type. **Since A-445 (the same day)** step 6's reflink is built: a file whose
+> bytes its batch already staged (the same BLAKE3 and length) is cloned from that temporary where the target's volume
+> shares clusters (`LandFs::clone_temp`; on Windows ReFS and a Dev Drive, `FSCTL_DUPLICATE_EXTENTS_TO_FILE` in
+> whole-cluster regions below 4 GiB from the volume's own cluster), its count in the report (`cloned`); NTFS shares
+> nothing, so nothing changes there.
 
 > **Status (2026-09-29, A-47, AUD-29-03).** One host target has one landing lease, whichever shard owns
 > the landing volume and whichever spelling names the target. Before, each owner shard kept its own lease
@@ -24975,8 +25005,12 @@ released it (`Fed::Applied`'s `Passed`, `Green::acknowledge_replica`), and nothi
 (`Green::leave_replica`); step 1's frees by position now live in the sealed blocks. Proven by the sealed blocks' tests
 (a reader on another thread reads in place what its writer frees behind it; generated histories of seals, releases,
 joins, passes, late acknowledgements and leaves, every live block allocated and read as sealed) and the replica's
-oracle, which now holds every current file's bytes to be the owner's own memory. Its bounds (step 4) and the shards'
-use of it (step 5) are owed. The text and its measurements are perf's (2026-11-11, `agents/perf-a273`, never pushed); the
+oracle, which now holds every current file's bytes to be the owner's own memory. A replica's lifetime is bounded by
+its owner's (2026-11-18, found by Miri): the owner's holder makes every replica leave before it gives the owner up
+(`SealedBlocks::end`, refused while a reader is registered); an owner dropped with a replica still registered frees
+nothing, since the replica may still read, and is counted (`sealed::dropped_with_readers`; the bug record of
+2026-11-18, "a sealed-block writer dropped with a reader kept its blocks"). Its bounds (step 4) and the shards' use of
+it (step 5) are owed. The text and its measurements are perf's (2026-11-11, `agents/perf-a273`, never pushed); the
 content question it left open was decided by the supervisor on 2026-11-17 by A-64 and D-7 (below). W1 (A-247), whose
 works off the owner it builds on, landed on 2026-11-17 (3c0af9399).
 
@@ -30820,6 +30854,244 @@ Applied in the same change to: §4.6, the Shards form's resync and death bullets
 
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class B), `crates/server/src/{learned_wait,told,
 callback,nfs,delegation,lib}.rs`.
+
+### A-441 — A snapshot exported as its archive through the library (2026-11-18, goal g268; Mantle's CP-T10.4, "Slates snapshots on Mantle"; §4.11 "Archive", D-17; §4.12 the consumer contract, A-299)
+Applied in the same change to: `crates/ipc` (`RequestBody::ArchiveExport`, `ReplyBody::ArchiveExported`,
+`ARCHIVE_FILE`, appended and published in `tests/wire_order.txt`); `crates/server/src/image.rs` (`archive_verb`,
+`ArchiveJob`, `run_archive`), `verbs.rs` (its dispatch, its new volume's name, its durability claim as a creation's) and
+`merge_service.rs` (`StoreVerb::Archive`); `crates/client` (`Client::archive_export`, `ArchiveExported`);
+`crates/api` (`Instance::export_archive`, `ArchiveExported` and `ARCHIVE_FILE` re-exported, `CONTRACT` 38, the test
+`a_snapshot_exported_as_its_archive_carries_every_file_and_entry`); §4.11's status; GAPS (2026-11-18).
+
+- **Why.** Kiln keeps every byte it holds on Mantle (plan T10), Slates snapshots among them (CP-T10.4). The archive
+  format has existed since Phase 7 as the fleet's replication unit (`slates_vfs::export`), but no consumer could ask
+  for one: no verb exported a snapshot.
+- **The shape.** The export is a volume, as an image build is: a new volume of the caller's holding one file, the
+  archive. Every path a consumer already has then serves it: the paged `read` streams it out (a reply rides one bulk
+  chunk), the volume's size policy bounds it, its destroy lets it go, and a restart keeps it, since it is published.
+  No buffer or token of its own needs a bound, an expiry or a reaper. The archive's bytes are slates' own wire format
+  (§4.11): header, chunk records, manifest, seek table, trailer, every chunk named by the BLAKE3 of its bytes, the
+  whole hashed.
+- **Running.** As `image build` runs (§4.6, A-160): the verb checks the volume, `read` on it, the name and the snapshot
+  at once and defers its reply to a task of the owner shard. The task pins the snapshot and walks it with
+  `SnapshotArchiver` a unit at a time within the slice budget. It encodes the archive, admits the volume sized to it
+  (rounded up to whole chunks), and writes the file a chunk a unit. It then records and publishes the volume with the
+  request's completion as one atom, and lets the pin go. A refusal at any step discards the volume and the pin.
+- **Rights.** `read`: an archive copies only what a reader can read, and the snapshot's pin lasts only while the export
+  runs. An image build needs `write`, since its volume pins the snapshot for good.
+- **Refusals.** A snapshot the volume does not hold, `NotFound` (`Missing::Snapshot`). A name held, `AlreadyExists`. A
+  snapshot whose entries still read an overlay's base, `Unsupported`, with the way out (`capture_base`, then export the
+  captured snapshot). A merge volume, `Unsupported`. A shard without consensus, `ConsensusNotInitialized`. Room, by the
+  admission's own refusals.
+- **Owed.** The volume made from an archive (import), the next piece. A streamed encoder: the archive is held whole
+  while it is walked and encoded (the encoding is one unit of the archive's size), then written in slices; a shard
+  exporting a snapshot near its memory holds it twice for that moment.
+- **Evidence (Mac Studio, 2026-11-18, debug).** `a_snapshot_exported_as_its_archive_carries_every_file_and_entry`
+  passes in 0.80 s. It exports a snapshot of a small file, a 300 KiB file and an empty one in nested directories, and
+  reads back a 308,524-byte archive. That archive decodes, names the manifest the export named, and restores every
+  file's bytes, length and mode and both directories, without the write made after the snapshot. A second export
+  names the same manifest. A snapshot never taken is `NotFound` and a held name `AlreadyExists`. The wire's order test
+  holds the two appended variants, and the contract's history names 38. With the file's writing removed, it was red
+  once: an empty file where the export named 308,524 bytes.
+
+### A-444 — A live exchange to a holder waits its session's persistent-congestion duration, the session plane's own judgment of a gone path; the live budget is that duration's floor (2026-11-18, built for goal g255; R3's class B, item B-d; RFC 9002 §6.2, §7.6.1; A-200, A-292)
+- **What was there.** A live-shipped exchange (A-200) ran under a hard deadline of one liveness window (`fleet::
+  live_budget`), the reply's part of a holder's exchange too (`live_ship::exchange_budget`: the window plus the transfer),
+  past which the holder was taken for not live and its link dropped and dialed afresh. A returned record session was
+  judged dead when silent past the longer of a liveness window and its persistent-congestion duration
+  (`fleet::return_sessions`). The duration, three probe timeouts each floored at the initial one, is at least 2 s, so
+  the window there never decided; and in the live exchange the window, under that floor, gave up holders whose sessions
+  the transport still counted live, its slow-path replies too.
+- **The rule.** One judgment of a gone holder path, the session plane's own: RFC 9002 §7.6.1's persistent-congestion
+  duration, three probe timeouts (`smoothed_rtt + max(4·rttvar, kGranularity) + max_ack_delay`, §6.2.1) from the
+  session's own estimator, each floored at the initial one (§6.2.2). A holder's live exchange waits it plus its bytes'
+  transfer (`exchange_budget_for`), so a holder slower than a window is heard and a silent one ends within it. Where no
+  holder's session is at hand (the generic `live_budget`: a lineage request, a work's route, the walks and the dispatch
+  bounded by it), the duration's floor, the initial probe timeout's three, below which no path is ever judged gone. A
+  returned session is dropped when silent past its duration, floored at its own probe timeout where a window stood (no
+  change in what decides).
+- **Test.** `a_live_exchange_waits_its_holder_path_and_a_silent_one_ends_within_its_floor` (`crate::live_ship`: a path
+  measured at a window and a half a round trip gets a budget past it; a quick path's budget is its session's duration
+  and no more than a window past it).
+  Run on the Mac Studio (kiln, 2026-11-18, load 5-7, debug build, `cargo test --locked -p slates-server --lib --
+  live_ship`): 19 of 19. Red-checked once: with the reply's part back at one window, the slow holder's assertion
+  fails. The live-ship takeover and returning-session flows are filed for main's run.
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class B), `crates/server/src/{fleet,live_ship}.rs`.
+
+### A-443 — A client's claim waits while its rendezvous's owner lives; the restart bound only where a live anchor holds it (2026-11-18, goal 85 via g251; R3's class C, C-a; §4.7 "Rendezvous"; A-114, A-176, A-178, A-232)
+
+- **What was there.** A claim waited a fixed second for the daemon's answer (`rendezvous::CLAIM_WAIT_NS`), or the
+  caller's restart bound where a live anchor held the rendezvous (A-114), never less than the second. A daemon alive and
+  slow to answer (a busy machine, a long start, a control shard starved) had its clients told it was unavailable, where
+  every call since A-232 waits for a live daemon's answer however long.
+- **The rule.** A claim waits while its rendezvous's owner lives, and its owner's death ends it at once: on Linux the
+  socket, whose connection the kernel resets when the listener's owner dies; on macOS the owner's bootstrap name
+  (`crate::owner_name`, A-178), which launchd takes back the moment its holder's receive right dies, looked up as the
+  claim waits, at once and then at twice the time waited at each look, so the looks cost the logarithm of the wait and a
+  death is seen within the time already waited. Where a live anchor holds the rendezvous, the daemon may be restarting
+  under it and the anchor's life says nothing of the daemon's, so the caller's restart bound bounds the claim as before;
+  `connect` gives none, for a daemon no anchor holds. On Linux a claim cannot tell an anchor's listener from its
+  daemon's, so a restart bound given bounds it there too: the caller's own clock.
+- **Owed.** Windows: opening the owner's named Event to probe it would keep the name and refuse a successor its
+  ownership while the probe held it (A-176), so a claim there still waits the claim wait; the next step is the
+  daemon's pid in the bootstrap header with an exit watch, or an open-only probe that cannot block a successor. The
+  claim wait remains the daemon's bound on a silent client (Linux's pending handshakes, the stale slots) and the macOS
+  region fetch's wait for the owner's turn, which the Mach reply's send-once notification could end at the owner's
+  death instead. The fleet tests' `CREDIT_WAIT` in daemon time is C-a's second half.
+- **Tests.** `a_claim_on_a_daemon_that_answers_past_the_claim_wait_is_served` and
+  `a_claim_on_a_daemon_that_died_ends_by_its_owners_life_not_a_clock` (`rendezvous.rs`'s macOS unit tests): a claim
+  due through half again the claim wait and then served; a claim whose daemon end went refused for a rendezvous with no
+  live owner within the claim wait of its going. The cross-process `a_claim_is_polled_without_waiting_and_refused_once_
+  its_daemon_is_gone` (`crates/ipc/tests/rendezvous.rs`, renamed from its claim-wait form) is filed for main's run on
+  every platform.
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class C), `crates/ipc/src/rendezvous.rs`,
+`crates/ipc/tests/rendezvous.rs`.
+
+### A-446 — A held reply's durability window is the session plane's floor of a gone holder path (2026-11-18, built for goal g255; R3's class B, item B-e; A-292, A-354, A-444; RFC 9002 §7.6.1)
+- **What was there.** A transport's reply held for its volume's durability (NFS `JUKEBOX`, FUSE and virtio-fs `EIO`,
+  WinFsp's) was told "not durable" once a window passed with nothing heard on its durability path, an ask of the
+  owner's unanswered for a window, and the receiver drained (A-292's rule, `slates_bridge_core::durable_bound`), the
+  failover delay bounding the whole wait (A-354, A-375). The window was one liveness window (`DURABLE_WAIT_NS`), under
+  the floor below which the session plane never takes a holder's path for gone (A-444), so a reply could be told "not
+  durable" while its holders' sessions still counted them live.
+- **The rule.** The window is that floor (`live_ship::durable_wait_ns`, read from `fleet::live_budget`, A-444: RFC 9002
+  §7.6.1's persistent-congestion duration from the estimator, each probe timeout the initial one): a holder silent
+  shorter than it may still answer, and one silent past it, with its receiver drained, is given up as before. One number
+  names the window for the held replies and for the transports' give-up records (FUSE, virtio-fs, WinFsp).
+- **Test.** `a_held_reply_is_given_up_silent_only_past_the_holder_paths_gone_floor` (`crate::live_ship`): a reply held
+  with its holders silent and its receiver idling is given up silent past a liveness window and a half and within the
+  floor and the three looks that confirm it.
+  Run on the Mac Studio (kiln, 2026-11-18, load 3-6, debug build, `cargo test --locked -p slates-server --lib --
+  live_ship durable`): 20 of 20. Red-checked once: with the window back at one liveness window, the reply is given up
+  at 1.3 s, short of a window and a half. The live-ship flows are filed for main's run.
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class B), `crates/server/src/live_ship.rs`.
+
+### A-445 — A landing shares a file its batch already staged where the target can: step 6's reflink, ReFS first (2026-11-18, g085; A-185's owed item)
+Applied in the same change to: §4.15 (step 6's status, A-185's status), GAPS (A-185's owed list), `crates/vfs`
+(`src/host/mod.rs`: `LandFs::clone_temp`, `LandCapabilities::reflink`'s word; `src/host/sim.rs`: reflinks a test turns on,
+`clone_temp`, `clones`), `crates/land` (`src/engine.rs`: `begin_clone`, `clone_source`, `no_clone`, the report's
+`cloned`, the capability kept across slices, two unit tests; `src/block_clone.rs`, new: the regions, three unit tests;
+`src/os_windows.rs`: `shares_clusters`, `cluster_bytes`, `set_end`, `duplicate_extents`, `clone_refusal`, the
+capability and the verb, temporaries opened to be read as a clone's source; `src/os.rs`: the verb refused; `Cargo.toml`,
+two `windows-sys` features; `tests/oracle.rs` and `tests/os.rs`, a test each; `tests/os_escape.rs` and
+`tests/os_removal.rs`, the verb passed through), and `unsafe-budget.toml` (`slates-land` 29 → 33).
+- **What was there.** Step 6 named the reflink: written "instead of writev when the target filesystem supports it and
+  an identical file already exists in the target tree (found through the landing's own hash index of the manifest,
+  never by scanning the disk)". The seam carried `LandCapabilities::reflink`, but no writer offered one and no verb or
+  engine rule used it (§4.15's status: "waiting on their measured costs"). A-185's owed list named ReFS's.
+- **The rule.** The index is the batch. Its staged files are complete, written out, and held open until the batch is
+  placed (A-130), and the batch is bounded by its pages, so the index is too. A file whose BLAKE3 and length match a
+  staged file is cloned from that temporary into a new one (`LandFs::clone_temp`), which joins the batch, its barrier
+  and its placement as a copy does. Where the filesystem shares nothing, the capability says so and the engine never
+  asks. Where it refuses one pair (`EOPNOTSUPP`, nothing made), the bytes are written as they always were: one path,
+  its fast step skipped. The report counts the clones (`cloned`), so a landing that never clones where it could shows
+  it. Duplicates across batches are written; holding a placed file open past its batch to share it would bound the
+  index by the landing instead of the batch.
+- **ReFS (Microsoft Learn, "Block Cloning" and `FSCTL_DUPLICATE_EXTENTS_TO_FILE`, read 2026-11-18).** A region must
+  begin and end at a cluster boundary and be under 4 GiB. The destination may not extend past its end of file. Both
+  files must be on one volume, with the same integrity streams setting and sparseness, and a cluster takes at most
+  8,175 sharers. So the writer reads the volume's cluster (`FileFsSizeInformation`, 4 KiB or 64 KiB), sets the new
+  file's end to the length rounded up to a cluster, and clones regions of at most the largest multiple of the cluster
+  below 4 GiB (`block_clone`). Then it sets the end to the length. The volume's word on sharing is
+  `FILE_SUPPORTS_BLOCK_REFCOUNTING`, so NTFS reports no reflink. A refusal to share a pair (`ERROR_NOT_SUPPORTED`,
+  `ERROR_INVALID_FUNCTION`, `ERROR_BLOCK_TOO_MANY_REFERENCES`, `ERROR_NOT_SAME_DEVICE`, `ERROR_INVALID_PARAMETER`) is
+  `EOPNOTSUPP` with the new file removed. A temporary is opened to be read too, since a clone's source must be.
+- **Tests.** Unit, on every host: the regions (whole clusters, under 4 GiB, covering the length rounded up, none for an
+  empty file, a cluster or length the layout cannot hold refused by kind) and the engine's lookup and fallback.
+  Filed for main's runs: the oracle's `a_file_whose_bytes_its_batch_already_staged_is_cloned_where_the_target_can` (a
+  simulated filesystem with reflinks clones the duplicate, `cloned` 1, and without them clones nothing, the disk the
+  same) and, on Windows, `a_duplicate_file_is_cloned_on_a_volume_that_shares_clusters` over a ReFS or Dev Drive
+  directory (`SLATES_TEST_REFS_DIR`; skipped loudly without one). Compiled for `x86_64-pc-windows-msvc`.
+- **Owed.** Linux's `FICLONE` and macOS's `clonefile`, behind the same verb (their writers refuse it now and say no
+  reflink); duplicates across batches; and the measured cost and gain the step waits on (the filed run reads both).
+
+### A-449 — `sweep_departed`'s wait stated, and the test support's session wait derived as the product waits for a lent session (2026-11-18, built for goal g255; R3's class B, item B-f, closing class B; A-65, A-222, A-408, A-437; the supervisor's ruling of 2026-11-07)
+- **`remote_attach::sweep_departed`.** The reap loop's look at departed hosts ends their attachments on every shard,
+  each through `xshard::call_in_shard_time` with a liveness window as its budget (A-408): a wall window, then more while
+  the shard runs or waits for a CPU, as every cross-shard wait judged in its target's own time takes (A-65). The
+  departure itself is decided by the fleet's membership and its own estimators (A-363). Its derivation is now stated
+  where it is made; no change.
+- **`daemon::SESSION_WAIT_NS` → `daemon::session_wait_ns()`.** Test support (`Daemon::hold_record_session`,
+  `Daemon::ask_live_reports`) waited one liveness window for a record session out of its link. It now waits as the
+  product does for a lent session (A-437's location round): one record-plane exchange's span
+  (`fleet::record_exchange_budget_ns`, the record plane's round budget over the slowest measured path), the bound every
+  borrower of a record session runs its exchange under, as the supervisor ruled on 2026-11-07. Test support only: no
+  product behaviour changes, so no failing test; the fleet tests that hold a session (`hold_record_session`'s four
+  callers) are filed for main's run.
+- With A-437, A-439, A-442, A-444 and A-446 this closes class B of `LIVENESS_BUDGET_NS`'s R3 debt.
+  Built and run on the Mac Studio (kiln, 2026-11-18, load 3-4, debug build, `cargo test --locked -p slates-server
+  --lib -- remote_attach session departed`): 8 of 8. No red-check: no product behaviour changed.
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class B line), `crates/server/src/{daemon,
+remote_attach}.rs`.
+
+### A-447 — A Windows claim waits while its daemon lives: the daemon's process mark in the bootstrap header, its exit waited on beside the claim (2026-11-18, goal 85 via g251; R3's class C, C-a's Windows half; §4.7 "Rendezvous"; A-143, A-159, A-176, A-443)
+
+- **What was there.** A-443 made a claim on Linux and macOS wait while its rendezvous's owner lives; a Windows claim still
+  gave up at the claim wait, a second, with its daemon alive, since opening the owner's named Event to probe it would
+  keep its name and refuse a successor its ownership while the probe held it (A-176).
+- **The rule.** The daemon writes its process mark into the bootstrap header before it publishes the header: its process
+  id (the slot A-159 had emptied) and its creation time (`GetProcessTimes`, 100 ns intervals since 1601), at 24 and 32,
+  in the layout `SLB3` (a claimant of `SLB2` would read no mark, so each refuses the other as another layout). A claim
+  with no live anchor reads the mark, opens the process for `SYNCHRONIZE` and `PROCESS_QUERY_LIMITED_INFORMATION` alone,
+  the least that reads its creation time, and judges it by that time: a process given the pid after the daemon's exit
+  is never taken for the daemon, and the claim reads it exited at once. The claim then waits on its Event and the
+  process together (`WaitForMultipleObjects`, any) and ends at the daemon's exit, the slot taken back if the daemon had
+  not taken it. A process handle keeps the process object, and so its pid, but none of the objects the process named:
+  the bootstrap section's and the owner token's names die with the daemon, and a successor's takeover is never refused
+  for it. Under a live anchor the restart bound still bounds the claim (a restarted daemon is another process). A
+  header of this layout with no mark refuses the claim typed.
+- **Read first.** Microsoft's documentation of `OpenProcess` (the access rights it grants), `GetProcessTimes` (which
+  needs `PROCESS_QUERY_INFORMATION` or `PROCESS_QUERY_LIMITED_INFORMATION`), `WaitForMultipleObjects` (a process handle
+  is signaled at the process's exit) and "Process Handles and Identifiers" (a pid is not reused while a handle to its
+  process is open).
+- **Tests.** `the_daemons_mark_is_little_endian_at_its_offsets_and_none_is_read_where_none_was_written` (the golden
+  vector at both offsets, the magic `SLB3`, and hostile images: unwritten, a zero pid or time, short, every bit set).
+  The waits are Windows' (`cargo xwin check` clean); the cross-process rendezvous file's Windows run, a claim served
+  past a second and one ended at its daemon's exit, is filed for main.
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class C), `crates/ipc/src/{rendezvous,exit_watch,
+wake}.rs`, `unsafe-budget.toml` (slates-ipc 141 to 146).
+
+### A-452 — The macOS region fetch waits while its owner lives: no timeout, the kernel's send-once notification ending it at the owner's departure (2026-11-18, goal 85 via g251; R3's class C, C-a; §4.7 "Rendezvous"; GAP-A9-9, A-178, A-443)
+
+- **What was there.** A macOS claimant fetches its answered region from the instance's owner over the owner's token
+  (`mach_claim::fetch`, GAP-A9-9). The fetch waited a fixed second for its send to be queued and another for the answer
+  (the claim wait), so an owner alive and slow to answer (its thread descheduled on a busy machine) was reported gone,
+  and an owner that went away with the fetch queued was reported as keeping nothing for the claim: the kernel's notice
+  of the fetch's destroyed send-once right was read as a malformed answer.
+- **The rule.** The fetch waits while its owner lives, never by a clock, as a claim does (A-443): its send has no
+  timeout, so it waits for room in the owner's queue until it is queued or the owner's port dies (refused
+  `MACH_SEND_INVALID_DEST`); its receive has none, so it waits for the owner's answer until the kernel's send-once
+  notification (`MACH_NOTIFY_SEND_ONCE`) says the owner went away holding the fetch's reply right, or with the fetch
+  still in its queue, each refused as an owner that went away.
+- **Tests.** `a_fetch_answered_past_the_claim_wait_is_served` (the token held with nothing serving it, a region kept,
+  the fetch made, and the owner's service started half again the claim wait later: the region fetched) and
+  `a_fetch_whose_owner_went_away_is_refused_by_its_departure` (the token let go with the fetch queued: refused as an
+  owner that went away, at once). Red with the old timeouts: the first refused at the second, the second reported as
+  an owner keeping nothing.
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class C), `crates/ipc/src/{mach_claim,rendezvous}.rs`.
+
+### A-454 — The fleet tests' client waits in its daemon's own time: a connect is one claim, a full ring is waited out while its shard steps (2026-11-18, goal 85 via g251; R3's class C, C-a's second half; A-426, A-443, A-447)
+
+- **What was there.** The fleet suite's client (`crates/server/tests/fleet.rs`) retried a connect refused as unavailable,
+  and a send refused for a full request ring, for five seconds on the wall (`CREDIT_WAIT`). A daemon kept off its CPUs
+  could outlast it while alive, and the connect's retry dated from when a claim gave up at a second with its daemon
+  alive.
+- **The rule.** A connect is one claim: since A-443 and A-447 a claim waits while its daemon lives and ends at its
+  death, and every daemon of the suite opens its rendezvous before its start returns, so a refusal says no daemon holds
+  the instance's rendezvous and fails the test at once. A send that meets a full ring waits for room while the ring's
+  shard steps, since a shard drains its clients' rings at its steps (A-426's rule for room), and ends only once the
+  shard has taken no step for `FROZEN_CAP`, the suite's one wall bound for a daemon frozen or dead (`RoomWait`). No
+  product behaviour changes.
+- **Owed.** The same constant and the same two waits in `ack_release.rs`, `attach_forms.rs` and `shards.rs`.
+- **Checks.** `cargo test --locked -p slates-server --test fleet --no-run` (the suite's run is main's).
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class C), `crates/server/tests/fleet.rs`.
 
 ### A-448 — The anchor holds a Windows Shards stream's DAX sections, so a stream whose guest maps files outlives its daemon (2026-11-18, goal 90, item b, piece five; A-365's Windows half; A-175's confinement, A-180's sections, A-433's successor)
 Applied in the same change to: §4.6, the Shards form's resync bullet; A-433's owed list; GAPS, A-281's entry (its
