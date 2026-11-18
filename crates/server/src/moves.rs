@@ -31,8 +31,9 @@
 //!   move's target must be a member, and a retired id never returns), and the volume thaws.
 //! - **The switch.** The council commits the exception naming the new owner, the member it left and the cohort. Every
 //!   node routes the volume to the new owner from then on ([`crate::owner_location`], the forward); every holder of
-//!   its copies follows ([`follow_moved_objects`]) and takes the new owner's authority at its next reconcile, so a
-//!   record from the old owner is refused. The old owner keeps its frozen copy.
+//!   its copies follows as the install's walk reaches each copy ([`follow_moved_object`], whatever the copy's route
+//!   was, A-485) and takes the new owner's authority there, so a record from the old owner is refused and a takeover
+//!   of the new owner lists the copy for its successor. The old owner keeps its frozen copy.
 //! - **The new owner adopts** ([`drive_adoptions`]): phase one by name over the recorded cohort ([`MOVE_STREAM`],
 //!   answered by [`serve_move_prepare`] through `slates_db::takeover::answer_move`): the member the move left answers
 //!   from the records it captured (it may be one of the `f + 1` that placed them, and it writes no more), every other
@@ -40,7 +41,8 @@
 //!   re-committed under the new owner's placement at the round's epoch (`takeover::adopt_at`, the takeover's own
 //!   adoption) and the volume is materialized as a takeover's successor materializes it: content by identity from the
 //!   head's recorded holders, a live-shipped volume from its log. Then the new owner seals the volume under its own
-//!   placement ([`seal_adopted`]), and once that seal is placed it drops the adopted snapshot it superseded and reports
+//!   placement ([`seal_adopted`]; once, since the volume records the seal and an ask whose answer was lost is answered
+//!   the recorded seal, A-488), and once that seal is placed it drops the adopted snapshot it superseded and reports
 //!   `MoveAdopted`.
 //! - **The release.** Once the exception no longer names the member it left (adopted, or followed through the new
 //!   owner's takeover), the old owner releases its copy whole ([`release`]: `Op::VolumeReleased`, no tombstone, since
@@ -727,48 +729,46 @@ fn let_go(state: &mut ShardState, id: DbVolumeId, gone: Gone) -> bool {
 
 // ------------------------------------------------------------------------------------------------ every holder
 
-/// Brings this holder's copies of every moved object (§4.8 "Authority scope") to the configuration, on the control
-/// shard at each period before the held acceptors' authority is reconciled: a copy's routing follows its exception's
-/// owner, so the acceptors take that owner's authority at the next reconcile (`fleet::reconcile_held_authority`) and a
-/// record from the old owner is refused; and once the move is adopted (the exception names no member it left), a copy
-/// outside the owner's placement is dropped, since the owner's records reach only its own cohort from then on.
-pub(crate) fn follow_moved_objects(state: &mut ShardState) {
-  let regional = state.council.configuration().clone();
-  let local = state.fleet.host();
-  let held: Vec<ObjectId> = state
-    .holder_records
-    .keys()
-    .copied()
-    .filter(|object| regional.moved.contains_key(&object.placement_key()))
-    .collect();
-  let (mut followed, mut reclaimed): (u64, u64) = (0, 0);
-  for object in held {
-    let Some(owner) = regional.owner_of(object) else {
-      continue;
-    };
-    if !regional.members.contains(&owner) || owner == local {
-      continue;
-    }
-    let adopted = regional
-      .moved
-      .get(&object.placement_key())
-      .is_some_and(|moved| moved.from.is_none() && moved.owner == owner);
-    let outside = regional
-      .configuration_for(owner)
-      .is_some_and(|placement| !placement.place(object).candidates.contains(&local));
-    if adopted && outside {
-      crate::takeover::drop_copy(state, object);
-      reclaimed = reclaimed.saturating_add(1);
-    } else if state.fleet.object_owner(object) != Some(owner) {
-      crate::takeover::track_owner_on_every_shard(state, object, owner);
-      followed = followed.saturating_add(1);
-    }
+/// Brings this holder's copy of `object`, if the object is moved (§4.8 "Authority scope"), to `regional`, the
+/// configuration an install's walk brings the copy to, on the control shard as the walk reaches the copy and before its
+/// authority is reconciled (`fleet::install_on_copy`): the copy's routing follows its exception's owner, so the
+/// acceptor takes that owner's authority at once (`fleet::reconcile_held_copy`) and a record from the old owner is
+/// refused; and once the move is adopted (the exception names no member it left), a copy outside the owner's placement
+/// is dropped, since the owner's records reach only its own cohort from then on.
+///
+/// Every copy the walk reaches is brought, whatever its route judged before ([`crate::takeover::resolve_held_object`]),
+/// since a copy that followed no move stays under its old owner's authority, and a takeover lists a copy only along its
+/// authority's line ([`slates_db::takeover::copy_falls_to`]): when the target dies before adopting, its successor's
+/// round then learns nothing of the volume, confirms without it, and the configuration hands the volume's line to a
+/// successor that never adopted it (A-485: A-398's walk followed only a copy routed to a retired host).
+pub(crate) fn follow_moved_object(
+  state: &mut ShardState,
+  regional: &RegionalConfiguration,
+  local: HostId,
+  object: ObjectId,
+) {
+  let Some(moved) = regional.moved.get(&object.placement_key()) else {
+    return;
+  };
+  if !state.holder_records.contains_key(&object) {
+    return;
   }
-  if followed > 0 {
-    state.count(MOVE_FOLLOWED, followed);
+  let Some(owner) = regional.owner_of(object) else {
+    return;
+  };
+  if !regional.members.contains(&owner) || owner == local {
+    return;
   }
-  if reclaimed > 0 {
-    state.count(MOVE_RECLAIMED, reclaimed);
+  let adopted = moved.from.is_none() && moved.owner == owner;
+  let outside = regional
+    .configuration_for(owner)
+    .is_some_and(|placement| !placement.place(object).candidates.contains(&local));
+  if adopted && outside {
+    crate::takeover::drop_copy(state, object);
+    state.count(MOVE_RECLAIMED, 1);
+  } else if state.fleet.object_owner(object) != Some(owner) {
+    crate::takeover::track_owner_on_every_shard(state, object, owner);
+    state.count(MOVE_FOLLOWED, 1);
   }
 }
 
@@ -1036,10 +1036,11 @@ async fn settle_adopted(
   .flatten() else {
     return;
   };
-  // Waited in the owner shard's own time (A-435): the seal it takes is not taken twice for one answer, so an answer
-  // dropped at a period's end while the shard worked took a second seal the next period, superseding the first, and
-  // left the adopted snapshot it should have dropped. Only a shard that stopped, or ran a window of CPU without
-  // answering, is asked again next period.
+  // Waited in the owner shard's own time (A-435), so a shard alive and working answers within the settle. Only a shard
+  // that stopped, or ran a window of CPU without answering, is asked again next period, and that ask takes no second
+  // seal: the owner shard records the seal on the volume and answers it again (A-488). Before, an answer lost after the
+  // seal was taken left `sealed` empty here, and the next ask's seal superseded the first and left the adopted
+  // snapshot behind.
   let progress = crate::xshard::call_in_shard_time(
     origin,
     shard,
@@ -1075,9 +1076,10 @@ async fn settle_adopted(
   }
 }
 
-/// On the adopted volume's owner shard: its seal's progress. Not served yet; else, with no seal taken, a seal now (a
-/// snapshot the record plane seals and places under this node's placement); else whether that seal's head and the
-/// volume's catalog are placed at `f + 1`, dropping the adopted snapshot it superseded once they are.
+/// On the adopted volume's owner shard: its seal's progress. Not served yet; else, with no seal known to the caller, the
+/// seal (a snapshot the record plane seals and places under this node's placement), taken once: the volume records it
+/// and a later ask is answered the recorded seal (`verbs::seal_adopted_head`, A-488); else whether that seal's head and
+/// the volume's catalog are placed at `f + 1`, dropping the adopted snapshot it superseded once they are.
 pub(crate) fn seal_adopted(
   state: &mut ShardState,
   key: ObjectId,
@@ -1540,6 +1542,143 @@ mod tests {
     assert!(
       waited > std::time::Duration::from_nanos(crate::daemon::HEARTBEAT_NS),
       "the settle ended within one period ({waited:?}), before its owner shard's busy poll did"
+    );
+  }
+
+  /// What the lost-answer seal test saw on the owner shard: the snapshot the move handed over, the first ask's and the
+  /// second ask's answers, the volume's head epoch before and after both asks, the head the seal left, the settle's
+  /// answer once the seal was placed, and the snapshots the volume holds after it.
+  struct SealedTwice {
+    handed_over: u64,
+    first: Sealing,
+    again: Sealing,
+    epochs: (Option<u64>, Option<u64>),
+    seal: Option<u64>,
+    settled: Sealing,
+    held: Vec<u64>,
+  }
+
+  /// Bug 3 of goal 85 (A-488; A-435's owed item). Do: on a shard, make a volume and snapshot it (the head a move hands
+  /// over, which its new owner serves once it has adopted the move), then ask for the adoption's seal twice with no seal
+  /// recorded, as the control shard asks again when its first ask's answer was lost to an owner shard that stopped for a
+  /// window (`xshard::call_in_shard_time` forgets the call, and the shard runs it once it resumes); then place the
+  /// answered seal's head and the volume's catalog at `f + 1` and ask once more with that seal, as the next period's
+  /// settle does. Expect: the second ask answers the first seal again (the same epoch, superseding the snapshot handed
+  /// over) and the head is sealed once; once placed, the adoption settles `Placed`, the snapshot handed over is dropped
+  /// and the seal is the only snapshot the volume holds. Before, the second ask took a second seal superseding the
+  /// first, so the settle dropped the first seal and left the snapshot handed over behind for good.
+  #[test]
+  fn an_adopted_moves_seal_asked_again_after_its_answer_was_lost_is_taken_once() {
+    let saw = crate::daemon::audit_on_shard(|state| {
+      let principal = Principal::Uid {
+        host: HostId(0),
+        uid: 1234,
+      };
+      let made = crate::verbs::dispatch(
+        state,
+        1,
+        &principal,
+        slates_ipc::protocol::RequestBody::Create {
+          name: "adopted".to_owned(),
+          size: slates_ipc::protocol::SizeClass::Dynamic { max: 1 << 20 },
+          names: slates_ipc::protocol::NamePolicy::Exact,
+          require_locked: false,
+          base: None,
+        },
+      );
+      let ReplyBody::Created { id } = made else {
+        panic!("the volume was not made: {made:?}")
+      };
+      let snapshotted = crate::verbs::dispatch(
+        state,
+        1,
+        &principal,
+        slates_ipc::protocol::RequestBody::Snapshot { volume: id },
+      );
+      let ReplyBody::Snapshotted {
+        id: handed_over, ..
+      } = snapshotted
+      else {
+        panic!("the head was not snapshotted: {snapshotted:?}")
+      };
+      let key = ObjectId(id.bytes);
+      let volume = DbVolumeId { bytes: key.0 };
+      let head = |state: &ShardState| {
+        state
+          .db
+          .partition()
+          .volume(volume)
+          .map(|record| (record.head.value, record.epoch, record.catalog_version))
+      };
+      let before = head(state).map(|(_, epoch, _)| epoch);
+      let first = seal_adopted(state, key, None);
+      let again = seal_adopted(state, key, None);
+      let sealed = head(state);
+      let Sealing::Sealed(superseded, epoch) = again else {
+        panic!("the second ask answered no seal: {again:?}")
+      };
+      let quorum = state.fleet.configuration().quorum;
+      let holders: Vec<HostId> = (0..=u64::from(quorum.f)).map(HostId).collect();
+      let catalog_version = sealed.map_or(0, |(_, _, version)| version);
+      for (register, sequence) in [(key, epoch), (key.catalog(), catalog_version)] {
+        state.placed_heads.insert(
+          register,
+          crate::head::PlacedHead {
+            sequence,
+            epoch: HostEpoch(1),
+            placement: slates_db::register::Placement {
+              candidates: holders.clone(),
+              acked: holders.clone(),
+              mirror_acked: None,
+              joint: Vec::new(),
+            },
+          },
+        );
+      }
+      let settled = seal_adopted(state, key, Some((superseded, epoch)));
+      let held = state
+        .db
+        .partition()
+        .snapshots_of(volume)
+        .iter()
+        .map(|snapshot| snapshot.id.value)
+        .collect();
+      SealedTwice {
+        handed_over: handed_over.value,
+        first,
+        again,
+        epochs: (before, sealed.map(|(_, epoch, _)| epoch)),
+        seal: sealed.map(|(head, _, _)| head),
+        settled,
+        held,
+      }
+    });
+    println!(
+      "handed over {}, first {:?}, again {:?}, head epochs {:?}, seal {:?}, settled {:?}, held {:?}",
+      saw.handed_over, saw.first, saw.again, saw.epochs, saw.seal, saw.settled, saw.held
+    );
+    let Sealing::Sealed(superseded, epoch) = saw.first else {
+      panic!("the first ask took no seal: {:?}", saw.first)
+    };
+    assert_eq!(
+      superseded.value, saw.handed_over,
+      "the seal supersedes the snapshot the move handed over"
+    );
+    assert_eq!(
+      saw.again, saw.first,
+      "the ask after a lost answer took a second seal: the settle would drop the first and keep the snapshot handed over"
+    );
+    assert_eq!(
+      saw.epochs.1,
+      Some(epoch),
+      "the head was sealed more than once (epochs before and after {:?})",
+      saw.epochs
+    );
+    assert_eq!(saw.settled, Sealing::Placed, "the placed seal settled");
+    assert_eq!(
+      saw.held,
+      saw.seal.into_iter().collect::<Vec<u64>>(),
+      "a snapshot was left behind beside the seal"
     );
   }
 

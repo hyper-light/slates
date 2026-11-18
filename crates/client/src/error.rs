@@ -20,9 +20,10 @@ pub enum ClientError {
     /// The verb.
     verb: &'static str,
   },
-  /// The daemon went away and did not come back inside the reconnect budget.
+  /// The daemon went away and no anchor holds its instance's rendezvous to restart it (A-468): the reconnect found no
+  /// holder, or its anchor went too.
   DaemonGone {
-    /// The budget that passed, in nanoseconds.
+    /// How long the reconnect had been tried when it found no holder, in nanoseconds.
     after_ns: u64,
   },
   /// The session's client id is held by a live client; the daemon assigned another.
