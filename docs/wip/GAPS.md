@@ -1,12 +1,25 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **The VFS and DAX plan's last reconciliation (2026-11-18, its Step 15).** The DAX matrix (`virtiofs.md` §8) has no
+> owed cell: every cell is proven with its run or test, impossible with its source, declined with Ada's date, or none.
+> `platforms.md` had two rows the plan closed without their runs. Its Windows cells for a mount that outlives a daemon
+> restart still said "missing" after A-198. They now name `a_winfsp_drive_handle_and_view_survive_twenty_killed_daemons`
+> in `windows-lint` and `windows-arm64`: zero drives lost of twenty, diagnostics run 41484542209. The fleet's sockets and
+> the NFS listener stay missing there (foundational gap 2). Its Linux arm64 image cell now names Step 7's 7-of-7 runs
+> with Firecracker, crosvm and Cloud Hypervisor (41318050347, 41319438579). Still open, and not this plan's: the
+> inventory's built-but-unrun cells (its order of work, item 5).
+
 > **A grant is signed by a key only the human holds (2026-11-18, R10, D-22, §4.13; A-285, Ada's decision: fs-server's
 > option D, with A as the fallback, on every OS).** This closes, once built, "No grant can be issued on Linux from the
 > CLI" (A-201's entry). **Built (piece 1):** the signed statement and its SSH-signature verifier
 > (`crates/server/src/grant_signature.rs`; `ssh-ed25519` and `sk-ssh-ed25519`, the touch required, namespace
 > `slates-grant`), 10 unit tests against a real `ssh-keygen -Y sign` vector: forged, unregistered, changed manifest
-> and every other field, another namespace, expired, untouched, hostile bytes. **Owed, in order:**
-> - the presentation's nonce, a signed `Grant` on the wire, the nonce spent once (a replay refused);
+> and every other field, another namespace, expired, untouched, hostile bytes. **Built (piece 2, 2026-11-18):** each
+> presentation draws a 256-bit nonce and `land` returns it (`nonce:` / `"nonce"`); a `Grant` carries either proof
+> form (`GrantProofBody`); a signed one is decided by `landing::verify_signed_grant` against the shard's registered
+> keys, the presentation's own target and nonce, and the wall clock, and its nonce is spent by the grant it proves
+> (a replay refused `Replayed`, counted `grant_signature_replayed`). No key can be registered yet, so every signed
+> grant is refused `UnregisteredKey` until piece 3. **Owed, in order:**
 > - durable key registration: the first key only through A's terminal prompt (a standalone anchor) or kiln's person
 >   session (a kiln-managed anchor, WebAuthn; the supervisor's direction, put to Ada); later keys signed by a
 >   registered key; no agent channel adds one;

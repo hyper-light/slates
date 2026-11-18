@@ -379,6 +379,7 @@ fn landing_result(landing: Landing) -> Result<LandingResult> {
     Landing::GrantRequired {
       landing,
       manifest,
+      nonce: _,
       summary,
       conflicts,
     } => {
