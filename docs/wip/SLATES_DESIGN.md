@@ -20698,7 +20698,8 @@ Applied in the same change to:
   verbs (a directory made, files created, a file replaced, a directory renamed, a file removed), each listed in landing
   order with its bytes' hash and length and its mode, the replaced file's outsider change listed as `ModifyModify`, the
   counts and bytes the summary's; another principal's read and a replaced presentation's are `NotFound`, pages of
-  another manifest are never joined; a list of about twelve pages whose 3,986-byte entry no page holds whole comes
-  whole and in order; a landed presentation's files hash to what its list named, and its list then is `NotFound`. The
-  pager against its oracle: generated lists and page sizes join to the encodings in order with every page but the last
+  another manifest are never joined; a list whose 3,986-byte entry no page holds whole comes whole and in order, in
+  12 pages, 11 of 4,023 bytes and the last of 429, 11 of them ending inside an entry (kiln run r128, macOS arm64,
+  2026-11-17); a landed presentation's files hash to what its list named, and its list then is `NotFound`. The pager
+  against its oracle: generated lists and page sizes join to the encodings in order with every page but the last
   full; every cursor outside the list refused.
