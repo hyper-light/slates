@@ -1,5 +1,18 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **owner_turn's refused `mkdir` asked the program, not the kernel: fixed (2026-11-18, test only).**
+> `a_mutations_reply_waits_for_its_barrier_and_a_refused_barrier_answers_eio` (`crates/bridge-fuse/tests/owner_turn.rs`)
+> failed on every CI run of the ubuntu-latest gates job since main moved to Ubuntu 26.04 (from run 43146258837 on
+> 2026-11-12 to 44210937388 on 2026-11-18; diag-slabs-58 200 of 200 alone), and was ledgered as a rare race. It is
+> not a race: 26.04's `/usr/bin/mkdir` is uutils coreutils 0.10.0, which is told `EIO` by `mkdir(2)` and exits 0
+> because the refused directory exists in the volume (strace in diag-slabs-61, run 43146145846). The owner refused the
+> right request (`MkDir`) and the kernel answered `EIO`. The test now makes the directory by `mkdir(2)` and holds the
+> answer to `EIO`. Swept: no other test judges a coreutils program's refusal through a mount (the rest redirect in the
+> shell, `cat` a missing path, or run util-linux's `fallocate`). **Consequence, open:** the job runs `cargo test
+> --workspace`, which stops at the first failing binary, so no suite after `slates-bridge-fuse`'s `owner_turn` ran on
+> that lane from 2026-11-12 until this fix; the first run with it is the stack that lands it. Record:
+> `docs/bugs/2026-11-18-owner-turns-mkdir-asked-the-program-not-the-kernel.md`.
+
 > **KIND on Ubuntu 26.04 ran out of inotify instances: fixed in the lane (2026-11-09).** The KIND lane failed at
 > formation on `ubuntu-latest` once it became 26.04 (`peers_probed=0`), and passed on 24.04. The image keeps the
 > kernel's `fs.inotify.max_user_instances = 128` (24.04's set 1280), which kind's six privileged nodes share as the
