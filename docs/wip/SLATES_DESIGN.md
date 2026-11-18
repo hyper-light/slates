@@ -4378,15 +4378,20 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
   collector of descriptors in flight flushes a socket whose every copy rides a message), with the token and the
   stream's owner view as its session, updated when the guest names its owner, and released when the attachment ends or
   its guest first maps a file with DAX (whose stores then live where only the device maps them).
-  A successor hands the device a fresh stream over it in a `Resync` naming the same token; the device takes nothing
-  else (default deny), resends its outstanding request whole, and asks again for its DAX descriptors; the successor
-  answers a request the dead daemon published and never answered from that reply, never by running it again;
+  A successor hands the device a fresh stream over it in a `Resync` naming the same token, and keeps its own copy of
+  the fresh end until the device shows it holds its own, by its first bytes on the stream or by its end of the channel
+  closing, which the stream's task watches for meanwhile (A-339: the `Resync` waits in the device's channel until the
+  device reads it, and a socket whose every copy rides a message is what macOS's collector flushes); the device takes
+  nothing else (default deny), resends its outstanding request whole, and asks again for its DAX descriptors; the
+  successor answers a request the dead daemon published and never answered from that reply, never by running it
+  again;
 - the peer's close, a hostile frame, a detach, a revocation, the volume's destroy and the daemon's stop end the
   attachment one way: its references swept, its record removed, its resync channel released. A daemon's death ends
-  nothing by itself: recovery keeps a Shards attachment whose resync end the anchor held (Linux; A-316) and serves it on
-  a fresh stream, its owner view and token from the hold, its references and opens from the image, the reply the dead
-  daemon published and never wrote answering the request the device resends, and the writes it acknowledged after its
-  last publication replayed from the write log (A-63) as a mount's are; it removes any other's record, as before.
+  nothing by itself: recovery keeps a Shards attachment whose resync end the anchor held (Linux, A-316; macOS, A-339)
+  and serves it on a fresh stream, its owner view and token from the hold, its references and opens from the image,
+  the reply the dead daemon published and never wrote answering the request the device resends, and the writes it
+  acknowledged after its last publication replayed from the write log (A-63) as a mount's are; it removes any other's
+  record, as before.
 
 > **Status (2026-10-24).** Built and proven by use, in-process: `crates/server/src/shards.rs` (the serve task),
 > `crates/ipc/src/stream.rs` (the pair), `crates/bridge-fuse/src/shards_fs.rs` (the frames and their answers),
@@ -4502,6 +4507,19 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 > removed alone fails its test: among them the kept copy (the held end arrived flushed in 3 of 3 runs) and the stream
 > pair (a datagram pair's survivor waited out its read's 5 s bound). Owed on macOS: the successor's half (the write log
 > there, recovery keeping the attachment, the fresh stream handed over the held end).
+
+> **Status (2026-11-18, A-339, the successor's half on macOS).** Built and proven by use on macOS (a Mac Studio, kiln
+> run r2527). A macOS daemon keeps the resync ends the anchor hands it, recovery keeps a stream whose end was held, and
+> the successor serves it on a fresh stream, its writes logged and replayed and its barrier replies kept as on Linux.
+> With the test as the anchor and the devices, across a daemon's death: three streams are resynced while another
+> thread opens and closes Unix sockets and the devices leave their `Resync`s unread for 200 ms, each fresh end
+> arriving live; the resent exclusive CREATE is answered from the dead daemon's published reply; the write acknowledged
+> after the last publication reads back; each device that wrote is counted as having taken its fresh end; and a device
+> that goes without a byte on its fresh stream ends its attachment, its hold released
+> (`crates/server/tests/shards_resync_restart.rs`, now on every Unix). Each of seven guards removed alone fails it:
+> the stream's write log, the kept barrier reply, recovery keeping the stream, the replay, the successor's copy of the
+> fresh end (the end arrived flushed in 3 of 3 runs), the channel's watch, and the macOS daemon keeping its held
+> devices. Owed: the anchor holding a stream's DAX objects; Windows; and the siblings GAPS names.
 
 > **Status (2026-11-18, A-303, a VM's save and restore).** Built and proven by use. Over a real daemon, a guest's SAVE
 > is answered with tables and leaves the volume's newest snapshot; a fresh stream of a clone of that snapshot takes
@@ -25855,6 +25873,38 @@ Applied in the same change to:
   Linux (GitHub's ubuntu runner, run 44327865763): the same focused tests and A-316's restart test pass.
 - **Owed** (GAPS): the successor's half on macOS (the write log there, recovery keeping a stream whose resync end the
   anchor held, the fresh stream handed over it); the rest as A-316 says.
+- **The successor's half on macOS** (built the same day). Applied in the same change to: §4.6 (the resync bullet,
+  the teardown bullet, a status of this date), GAPS, `docs/cli.md`, `slates_bridge_fuse::shards_resync` (the device
+  closes its channel's end when it ends its share), and in `crates/server`: `write_log` and `fuse_hold` on every Unix
+  (FUSE's flush rule, `WriteLog::holds_every_write`, and a FUSE device's session stay Linux's); the state's write log,
+  replay, lost-writes flag and pending and recovered replies on every Unix (`state.rs`, `daemon.rs`'s
+  `content_slice`, `purge_write_log` and `ShardHolds`); a macOS daemon keeps the devices the anchor hands it (the
+  release of every one, `release_devices_without_fuse`, removed); `verbs.rs` replays the log, carries the replies and
+  keeps a held stream at recovery on every Unix; `shards.rs`'s replay, `keep_pending_reply`, `log_write` and
+  `adopt_held` on every Unix, a held device no record claims released there (moved from `fuse::adopt_held`, which runs
+  first), and the kept copy of the fresh end (`ShardsStream::fresh_copy`; `wait_for_work`, `watched`, `abandoned`;
+  counters `shards.resync_taken`, `shards.resync_abandoned`, `shards.resync_writes_unreported`).
+  - **What was there.** A macOS daemon released every device the anchor handed back, since it serves no FUSE, so a
+    held resync end was released at once and the device read the channel's end; and macOS had no write log, so a
+    stream's write acknowledged after the last publication was lost at a death, resynced or not.
+  - **The successor's copy of the fresh end.** A successor sends the `Resync` with the device's end of a fresh stream,
+    which then waits in the device's channel until the device reads it: dropped there, its only copy rides the
+    message, and macOS's collector flushes it (3 of 3 runs with the devices' reads held off 200 ms under socket churn).
+    So the successor keeps its copy until the device shows it holds its own: its first bytes on the stream
+    (`shards.resync_taken`), or a wake of the resync channel, which is one way, so it wakes only when the device's end
+    closes (`shards.resync_abandoned`; the copy let go, the stream sees its peer gone and the attachment ends). Linux
+    runs the same rule.
+  - **A death's lost writes are counted.** When the dead daemon's log overflowed, a resynced stream's guest is not told
+    which writes it lost (a FUSE mount's is, `LostWrites`), so the successor counts
+    `shards.resync_writes_unreported` and GAPS keeps the gap.
+  - **Evidence.** A Mac Studio, kiln run r2527: the focused tests pass (`shards_resync_restart`, `shards_resync`, the
+    write log's and the replay's unit tests, the route's), and each of seven guards removed alone fails the restart
+    test. Linux (adacachy, kernel 7.2.9, kiln run r3191; and GitHub's ubuntu runner, kernel 7.0.0-1016-aws, run
+    44329563487, with the client's stream tests too): the same focused tests pass, A-316's restart test among them
+    (its devices' reads held off under churn there too, where nothing is flushed), and the FUSE held-mount restart
+    tests of `crates/cli/tests/cli.rs` (`a_write_in_flight_at_the_daemons_kill_is_resent_and_every_acknowledged_write_survives`,
+    `a_fuse_mount_whose_daemon_was_killed_is_ended_by_the_restarted_daemon`), which the moved release of unclaimed
+    held devices runs beside.
 
 ### A-352 — A forward lane is judged in the daemon's own time under starvation: its recovery counted in periods, and a forward never refused below its path's measured floor (2026-11-18, built for goal g255; the integrator's starved runs of goal g245's tests; the supervisor's rule "run at the measured floor and report it, never refuse below the floor")
 Applied in the same change to:
