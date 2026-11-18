@@ -5808,6 +5808,232 @@ fn a_silent_forward_gives_up_while_its_session_carries_others() {
   );
 }
 
+/// Shape: the reads [`a_held_origin_gives_up_no_forward_whose_reply_came_while_it_was_held`] sends through b at once:
+/// eight clients, one read each, whose replies come back as many datagrams, so b's lane reads them over many turns.
+const UNREAD_READERS: usize = 8;
+/// Shape: the file each of those reads asks for: a mebibyte, so each reply is a read-ahead window of many datagrams.
+const UNREAD_FILE_BYTES: u32 = 1 << 20;
+/// Shape: the owner's delay before it answers each forwarded verb: half a liveness budget, so b's hold has taken its
+/// control shard before a answers, and a answers well inside the hold.
+const UNREAD_SERVE_DELAY_NS: u64 = LIVENESS_BUDGET_NS / 2;
+/// Shape: how long b's control shard is held: one and a half liveness budgets, so every forward's stall budget (one
+/// budget plus the path's tail, near zero on loopback) falls due inside the hold.
+const UNREAD_HOLD_NS: u64 = 3 * LIVENESS_BUDGET_NS / 2;
+
+/// The count `name` in `counters`, zero when absent.
+fn count_of(counters: &std::collections::BTreeMap<&'static str, u64>, name: &str) -> u64 {
+  counters.get(name).copied().unwrap_or(0)
+}
+
+/// A-315, §4.8 "Lookup", §4.14: an origin kept off its CPU past its forwards' stall budget gives up none of them whose
+/// owner answered meanwhile. Do: three nodes, each its own region; a mebibyte file in a volume on a, read once through b
+/// so b's route and session to a are warm; then a delays each forwarded verb half a budget, eight clients of b each
+/// read the file at once, and as soon as b has begun their forwards b's control shard is held for one and a half
+/// budgets (`Daemon::starve_control_shard`: the shard runs nothing else, as a shard kept off its CPU runs nothing), so
+/// a's answers arrive inside the hold and wait unread in b's socket while every forward's stall budget falls due.
+/// Expect every read served and b to give up no forward batch, its silences held for its receiver
+/// (`fleet.forward.silence_awaited_receiver` moved, so the hold did bring them to their budget). Before A-315 each
+/// forwarder woken by its timer at the hold's end judged its silence at once, before the lane's driver had read a's
+/// replies, and gave its batch up to a live owner (the bug record of 2026-11-18).
+#[test]
+fn a_held_origin_gives_up_no_forward_whose_reply_came_while_it_was_held() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let regions: std::collections::BTreeMap<HostId, RegionId> = hosts
+    .iter()
+    .enumerate()
+    .map(|(index, host)| (*host, RegionId(u64::try_from(index).unwrap())))
+    .collect();
+  let daemons = start_mesh_with_regions(nodes, &hosts, &certs, &serve, 1, &regions);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let read = unread_file_on_a(&daemons);
+  let run = read_through_a_held_origin(&daemons, &read);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  run.report();
+  run.assert_the_hold_left_replies_unread();
+  for (index, reply) in run.replies.iter().enumerate() {
+    assert!(
+      matches!(reply, ReplyBody::ReadPage { .. }),
+      "reader {index} was served: {reply:?}"
+    );
+  }
+  assert_eq!(
+    run.moved("fleet.forward.batch_given_up"),
+    0,
+    "b gave up no forward whose reply came while it was held: {:?}",
+    run.after
+  );
+  assert!(
+    run.moved("fleet.forward.silence_awaited_receiver") > 0,
+    "the hold brought a forward to its stall budget, and its silence waited for b to read what came: {:?}",
+    run.after
+  );
+}
+
+/// [`a_held_origin_gives_up_no_forward_whose_reply_came_while_it_was_held`]'s volume: a mebibyte file written on a,
+/// shared with b's account; the read of it each of b's clients sends.
+fn unread_file_on_a(daemons: &[Daemon]) -> RequestBody {
+  let mut raw = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id: volume } = raw.call(&RequestBody::Create {
+    name: "unread".to_owned(),
+    size: SizeClass::Bounded { limit: 16 << 20 },
+    names: NamePolicy::Exact,
+    require_locked: false,
+    base: None,
+  }) else {
+    panic!("create on a");
+  };
+  let ReplyBody::Attached { attachment, .. } = raw.call(&RequestBody::Attach {
+    volume,
+    snapshot: None,
+    intent: Intent::Write,
+    form: AttachRequest::Root,
+  }) else {
+    panic!("attach on a");
+  };
+  // Another node's account reaches this volume only through a share naming it (A-237).
+  share_with_node(&mut raw, volume, &daemons[1], ALL_RIGHTS);
+  let deadlines =
+    slates_client::Deadlines::derive(LIVENESS_BUDGET_NS, slates_db::replay::RECOVERY_BUDGET_NS)
+      .get();
+  let file: Vec<u8> = (0..UNREAD_FILE_BYTES)
+    .map(|index| (index.wrapping_mul(2_654_435_761) >> 24) as u8)
+    .collect();
+  slates_client::Client::connect(daemons[0].instance(), deadlines)
+    .unwrap()
+    .fs_write((volume, attachment), "/big", &file, 0o644)
+    .unwrap();
+  RequestBody::ReadRange {
+    volume,
+    path: "/big".to_owned(),
+    at: ReadAt::Head,
+    offset: 0,
+    max: u64::MAX,
+  }
+}
+
+/// What [`read_through_a_held_origin`] saw.
+struct UnreadRun {
+  warmed: bool,
+  delays: (Result<(), ObserveError>, Result<(), ObserveError>),
+  all_begun: bool,
+  held_after: Duration,
+  held_for: Result<u64, ObserveError>,
+  replies: Vec<ReplyBody>,
+  before: std::collections::BTreeMap<&'static str, u64>,
+  after: std::collections::BTreeMap<&'static str, u64>,
+}
+
+impl UnreadRun {
+  /// How far b's count `name` moved over the run.
+  fn moved(&self, name: &str) -> u64 {
+    count_of(&self.after, name).saturating_sub(count_of(&self.before, name))
+  }
+
+  /// Prints the run's figures.
+  fn report(&self) {
+    eprintln!(
+      "b's hold took its control shard {:?} after the reads were sent and held it {:?}; forwards begun {}, batches \
+       given up {} (silent {}, at the bound {}), silences awaiting the receiver {}, resent {}",
+      self.held_after,
+      self.held_for,
+      self.moved("fleet.forward.begun"),
+      self.moved("fleet.forward.batch_given_up"),
+      self.moved("fleet.forward.given_up_silent"),
+      self.moved("fleet.forward.given_up_at_bound"),
+      self.moved("fleet.forward.silence_awaited_receiver"),
+      self.moved("fleet.forward.retried"),
+    );
+  }
+
+  /// The run held what the test means: b read the file before, a's delay came and went, every forward was begun before
+  /// the hold, the hold took b's control shard before a answered, and it lasted past a stall budget.
+  fn assert_the_hold_left_replies_unread(&self) {
+    assert!(self.warmed, "b read a's file before the delay");
+    assert!(
+      self.delays.0.is_ok() && self.delays.1.is_ok(),
+      "a's serve delay was installed and lifted: {:?}",
+      self.delays
+    );
+    assert!(
+      self.all_begun,
+      "b began every read's forward before the hold"
+    );
+    assert!(
+      self.held_after < Duration::from_nanos(UNREAD_SERVE_DELAY_NS),
+      "b's control shard was held before a answered ({:?}): its replies were not left unread",
+      self.held_after
+    );
+    assert!(
+      self
+        .held_for
+        .as_ref()
+        .is_ok_and(|span| *span >= UNREAD_HOLD_NS),
+      "b's control shard was held past a stall budget: {:?}",
+      self.held_for
+    );
+  }
+}
+
+/// [`a_held_origin_gives_up_no_forward_whose_reply_came_while_it_was_held`]'s measured part: b reads `read` once, so
+/// its route and session to a are warm; a delays each forwarded verb half a budget; [`UNREAD_READERS`] clients of b
+/// send `read` at once; once b has begun their forwards, b's control shard is held for [`UNREAD_HOLD_NS`]; the readers'
+/// replies are collected and a's delay lifted.
+fn read_through_a_held_origin(daemons: &[Daemon], read: &RequestBody) -> UnreadRun {
+  let mut warm = Client::connect(daemons[1].instance());
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let warmed = poll_until(&observed, COUNCIL_RETIRE_DEADLINE, || {
+    Ok(matches!(warm.call(read), ReplyBody::ReadPage { .. }))
+  });
+  let delayed = daemons[0].inject_serve_delay(Some(UNREAD_SERVE_DELAY_NS));
+  let before = daemons[1].fleet_refusals().unwrap_or_default();
+  let begun_before = count_of(&before, "fleet.forward.begun");
+  let sent = Instant::now();
+  let readers: Vec<_> = (0..UNREAD_READERS)
+    .map(|_| {
+      let mut reader = Client::connect(daemons[1].instance());
+      let read = read.clone();
+      std::thread::spawn(move || reader.call(&read))
+    })
+    .collect();
+  // Held once b has begun every read's forward, so their replies are what the hold leaves unread.
+  let all_begun = poll_until(&observed, COUNCIL_RETIRE_DEADLINE, || {
+    refusal_count(&daemons[1], "fleet.forward.begun")
+      .map(|begun| begun >= begun_before + u64::try_from(UNREAD_READERS).unwrap())
+  });
+  let hold = daemons[1].starve_control_shard(UNREAD_HOLD_NS);
+  let held_after = sent.elapsed();
+  let replies: Vec<ReplyBody> = readers
+    .into_iter()
+    .map(|reader| reader.join().unwrap())
+    .collect();
+  let held_for = hold.and_then(|hold| hold.answer());
+  let lifted = daemons[0].inject_serve_delay(None);
+  let after = daemons[1].fleet_refusals().unwrap_or_default();
+  UnreadRun {
+    warmed,
+    delays: (delayed, lifted),
+    all_begun,
+    held_after,
+    held_for,
+    replies,
+    before,
+    after,
+  }
+}
+
 /// Shape: how long [`fill_task_arena`] may go without a filler admitted before it calls the shard stuck. It bounds a
 /// stall, not the fill, whose length is the arena's size.
 const FILL_STALL: Duration = Duration::from_secs(30);
@@ -16814,6 +17040,242 @@ fn expect_the_origin_made_and_seeded_a_slice_at_a_time(counters: &[Vec<(String, 
   }
 }
 
+/// §4.16 "Apply on holders" and its failure matrix (a green's restart is masked), §4.8 "Recovery" (a warm restart keeps
+/// every record it acknowledged). A holder restarted over its own segment keeps the merge records it accepted and the
+/// inputs it held (AUD-29-59), but its replica of each green, the engine every later version is recomputed on, lived in
+/// memory alone: the holder answered every later record `merge.out_of_order`, for good, and the green went on at
+/// `f + 1` only while its other holder answered. Do: on a settled three-node fleet at `f = 1` whose nodes keep their
+/// state across a restart, make a green on node a and submit one edit, so both holders recompute version 1; restart
+/// holder b over its own segment; have holder c withhold merge records, so a version can commit only through b; submit
+/// a second edit. Expect it answered `Submitted { version: Some(2) }` and placed at the quorum within the placement
+/// deadline, b's replica at version 2 rebuilt from what b holds (`merge.replica.rebuilt` moved on b), and c's withheld
+/// records counted, so b alone carried the quorum.
+#[test]
+fn a_holder_restarted_over_its_segment_recomputes_the_greens_next_version() {
+  let _serial = serialize_fleet_tests();
+  let pid = std::process::id();
+  let profiles: Vec<_> = ["holder-restart-a", "holder-restart-b", "holder-restart-c"]
+    .into_iter()
+    .map(profile)
+    .collect();
+  let anchors: Vec<_> = profiles.iter().map(anchor_of).collect();
+  let seeds: Vec<_> = anchors.iter().map(|anchor| member_id(*anchor, 0)).collect();
+  let mut identities: Vec<_> = profiles.iter().map(|_| same_identity(2)).collect();
+  let certificates: Vec<_> = identities
+    .iter()
+    .map(|pair| pair[0].certificate())
+    .collect();
+  let (_ports_lease, ports) = mesh_serve_ports(profiles.len());
+  let peers = |node| {
+    profiles
+      .iter()
+      .enumerate()
+      .filter(|(peer, _)| *peer != node)
+      .map(|(peer, _)| fleet_peer_at(anchors[peer], seeds[peer], ports[peer], &certificates[peer]))
+      .collect::<Vec<_>>()
+  };
+  let configs: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      fleet_config(
+        profile,
+        &format!("holder-restart-{node}-{pid}"),
+        anchors[node],
+        seeds[node],
+        &peers(node),
+        &Default::default(),
+      )
+    })
+    .collect();
+  // Each node's segment carries a content object, so the inputs a holder held survive its restart.
+  let anchors_held: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      common::anchor::held_anchor(
+        &format!("holder-restart-{node}-{pid}"),
+        profile,
+        &configs[node],
+      )
+    })
+    .collect();
+  let source = |node: usize| common::anchor::source_of(&anchors_held[node]);
+  let mut daemons: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      start_fleet_node(
+        profile,
+        configs[node].clone(),
+        identities[node].pop().unwrap(),
+        ports[node],
+        peers(node),
+        source(node),
+      )
+    })
+    .collect();
+  daemons[0].bootstrap(true).unwrap();
+  settle_initial_consensus(&daemons, &seeds, &Default::default(), Quorum { f: 1 });
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
+    name: "green".to_owned(),
+    require_evidence: false,
+    base: None,
+  }) else {
+    panic!("create green");
+  };
+  let first = timed_submits(&mut client, green, 1);
+  let holders_at = |daemons: &[Daemon], version: u64| -> Result<bool, ObserveError> {
+    let held: Vec<_> = daemons
+      .iter()
+      .skip(1)
+      .map(|daemon| daemon.merge_holder_state(green))
+      .collect::<Result<_, _>>()?;
+    Ok(
+      held
+        .iter()
+        .all(|state| state.version.is_some_and(|at| at >= version)),
+    )
+  };
+  let refs: Vec<&Daemon> = daemons.iter().collect();
+  let both_held = poll_until(&refs, PLACEMENT_DEADLINE, || holders_at(&daemons, 1));
+  daemons.remove(1).stop();
+  daemons.insert(
+    1,
+    start_fleet_node(
+      &profiles[1],
+      configs[1].clone(),
+      identities[1].pop().unwrap(),
+      ports[1],
+      peers(1),
+      source(1),
+    ),
+  );
+  let restarted = daemons[1].merge_holder_state(green);
+  let withheld = daemons[2].inject_merge_fault(slates_server::merge_service::MergeFault {
+    refuse_records: true,
+    ..Default::default()
+  });
+  let ReplyBody::WorkCreated { id: work, .. } = client.call(&RequestBody::CreateWork {
+    green,
+    name: "work-after-the-restart".to_owned(),
+  }) else {
+    panic!("create the second work");
+  };
+  let edited = client.call(&RequestBody::Edit {
+    work,
+    path: "after-the-restart".to_owned(),
+    at: 0,
+    delete_len: 0,
+    bytes: b"again".to_vec(),
+  });
+  let deadline_ns = u64::try_from(PLACEMENT_DEADLINE.as_nanos()).unwrap_or(u64::MAX);
+  let submitted = client.try_call(
+    &RequestBody::Submit {
+      work,
+      evidence: Vec::new(),
+    },
+    deadline_ns,
+  );
+  let refs: Vec<&Daemon> = daemons.iter().collect();
+  let placed = poll_until(&refs, PLACEMENT_DEADLINE, || {
+    daemons[0].merge_record_placed(green, 2)
+  });
+  let restarted_after = daemons[1].merge_holder_state(green);
+  let counters = merge_and_content_counters(&daemons);
+  drop(client);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "holder restart: first {first:?}; both held version 1 {both_held}; b after its restart {restarted:?}, after the \
+     second submit {restarted_after:?}; submit {submitted:?}; version 2 placed {placed}; counters {counters:?}"
+  );
+  expect_version_one_held_before_the_restart(&first, both_held, &edited, &withheld, &counters);
+  expect_version_two_through_the_rebuilt_replica(&submitted, placed, &restarted_after, &counters);
+}
+
+/// The holder-restart test's steps before its second submit, judged: the first submit accepted as version 1 and
+/// recomputed by both holders before b restarts, the second work's edit declared, and holder c withholding merge records.
+fn expect_version_one_held_before_the_restart(
+  first: &[(u64, ReplyBody, ReplyBody, Duration)],
+  both_held: bool,
+  edited: &ReplyBody,
+  withheld: &Result<(), ObserveError>,
+  counters: &[Vec<(String, u64)>],
+) {
+  assert!(
+    matches!(
+      first.first(),
+      Some((
+        _,
+        ReplyBody::Edited,
+        ReplyBody::Submitted {
+          version: Some(1),
+          ..
+        },
+        _
+      ))
+    ),
+    "the first submit is accepted as version 1: {first:?}"
+  );
+  assert!(
+    both_held,
+    "both holders recompute version 1 before b restarts: {counters:?}"
+  );
+  assert!(
+    matches!(edited, ReplyBody::Edited),
+    "the second work's edit is declared: {edited:?}"
+  );
+  assert!(
+    withheld.is_ok(),
+    "holder c withholds merge records: {withheld:?}"
+  );
+}
+
+/// The holder-restart test's second submit, judged: accepted as version 2 and placed at the quorum through the
+/// restarted holder b, whose replica was rebuilt from what it holds and recomputed version 2, while holder c withheld
+/// the record, so b alone carried the quorum.
+fn expect_version_two_through_the_rebuilt_replica(
+  submitted: &Result<ReplyBody, IpcError>,
+  placed: bool,
+  restarted_after: &Result<slates_server::merge_service::HolderMergeState, ObserveError>,
+  counters: &[Vec<(String, u64)>],
+) {
+  assert!(
+    matches!(
+      submitted,
+      Ok(ReplyBody::Submitted {
+        version: Some(2),
+        ..
+      })
+    ),
+    "the second submit is accepted as version 2 through the restarted holder: {submitted:?}; {counters:?}"
+  );
+  assert!(
+    placed,
+    "version 2 placed at the quorum through the restarted holder: {counters:?}"
+  );
+  assert_eq!(
+    restarted_after.as_ref().ok().copied(),
+    Some(slates_server::merge_service::HolderMergeState {
+      version: Some(2),
+      refused: false,
+    }),
+    "holder b recomputed version 2 on its rebuilt replica"
+  );
+  let (restarted_counters, withholding) = (&counters[1], &counters[2]);
+  assert!(
+    counted(restarted_counters, "merge.replica.rebuilt") > 0,
+    "holder b rebuilt its replica from what it holds: {restarted_counters:?}"
+  );
+  assert!(
+    counted(withholding, "merge.record_withheld") > 0,
+    "holder c withheld the second version's record, so b alone carried the quorum: {withholding:?}"
+  );
+}
+
 /// §4.10 content retention, §4.16 "Commit" (the bug record of 2026-11-07, retention decoded every merge record per put).
 /// A holder's retention rule asked, for each manifest it held, whether any position of the green's merge ledger named it,
 /// decoding every position each time: quadratic in the green's history, so a submit at `f = 1` slowed by about 40 µs a
@@ -20753,7 +21215,7 @@ fn plant_taken_over_volume(daemon: &Daemon, planted: PlantedVolume) {
         );
         s.pending_materializations.insert(
           object,
-          slates_server::state::PendingVolume::adopted(head, None),
+          slates_server::state::PendingVolume::adopted(head, None, Vec::new()),
         );
       },
     )

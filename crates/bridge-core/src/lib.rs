@@ -29,6 +29,7 @@ pub mod changed;
 pub mod dax_backing;
 pub mod delivery;
 pub mod durable_bound;
+pub mod group_rule;
 pub mod links;
 pub mod posix_acl;
 pub mod scoped;
@@ -38,6 +39,7 @@ pub use authority::{
   AttachmentId, Attachments, Barrier, CacheCoherence, ObjectId, OpContext, Rights, View,
 };
 pub use changed::{DataChange, TO_THE_END};
+pub use group_rule::GroupRule;
 pub use volume_bridge::{LostWrites, VolumeBridge, new_handle_store};
 
 use slates_vfs::error::VfsError;

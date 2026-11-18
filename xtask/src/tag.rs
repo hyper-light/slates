@@ -1,6 +1,7 @@
 //! The release tag grammar (Appendix B.2, A-210; `docs/publish.md`, "The binary release"), shared by the version
 //! guard (`version.rs`, in the `xtask` binary) and the release lane's tasks (`release.rs`, in the `release` binary).
 //! A tag is a release (`v` + the workspace version) or a test of the release lane (`v` + the version + `-test.N`).
+//! A dry run has no tag; its plan names the release tag its files would ship under (A-320).
 //! Pure, so it builds into both binaries, and the `release` binary builds on Windows, where the rest of `xtask` does
 //! not (its conformance and KIND tasks reach Unix-only calls).
 
@@ -19,10 +20,16 @@ pub(crate) enum TagKind {
   },
 }
 
+/// The tag that releases `version`: `v` + the version. A dry run of the release lane names it as the tag its staged
+/// files would ship under (A-320).
+pub(crate) fn release_tag(version: &str) -> String {
+  format!("v{version}")
+}
+
 /// What `tag` names when the workspace version is `version`: `v` + the version is a release, `v` + the version +
 /// `-test.N` a test of the lane; anything else is refused with the forms it would accept.
 pub(crate) fn tag_kind(tag: &str, version: &str) -> Result<TagKind, String> {
-  let release = format!("v{version}");
+  let release = release_tag(version);
   if tag == release {
     return Ok(TagKind::Release);
   }
