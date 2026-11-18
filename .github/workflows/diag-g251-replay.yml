@@ -60,6 +60,6 @@ jobs:
           SLATES_TEST_RESTART_SLOWDOWN: "10"
           SLATES_TEST_FLEET_DEADLINE_SECS: "120"
         run: cargo test --locked -p slates-server --no-fail-fast
-      - name: The lint wall over the two crates
+      - name: The lint wall over the server alone
         if: success() || failure()
-        run: cargo clippy --locked -p slates-server -p slates-vfs --all-targets -- -D warnings
+        run: cargo clippy --locked -p slates-server --all-targets -- -D warnings

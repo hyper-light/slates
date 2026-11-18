@@ -31,7 +31,10 @@ vacuously.
   an empty one as nothing lost.
 - `crates/server/src/fuse.rs`: `log_write` and `log_forgets` log the mount's volume.
 - `crates/server/src/verbs.rs`: `replay_one` and `replay_forget` find the record's volume by its id
-  (`slot_of_volume`); `slot_of_inode` is gone.
+  (`slot_of_volume`); `slot_of_inode` is gone; `relog_remaining` (a replay that met a full volume logs what it has
+  not applied again) keeps each record's volume.
+- Compiled on Linux alone (the write log is Linux's), so the change was proven there (diag-g251-replay on GitHub's
+  ubuntu runner): the first run found `relog_remaining`'s call, which no macOS build compiles.
 
 ## Siblings (A-166's sweep, still open, each from reading)
 
