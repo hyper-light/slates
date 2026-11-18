@@ -5246,12 +5246,15 @@ fn read_back(
   let read = poll_until(fleet, SERVE_DEADLINE, || {
     let mut all = true;
     for (path, bytes) in files {
-      let reply = client.call(&RequestBody::Read {
+      // One page holds each of these small files whole (A-267 retired the whole-file `Read`).
+      let reply = client.call(&RequestBody::ReadRange {
         volume,
         path: (*path).to_owned(),
         at: ReadAt::Head,
+        offset: 0,
+        max: u64::MAX,
       });
-      all &= matches!(&reply, ReplyBody::ReadBytes { bytes: read } if read == bytes);
+      all &= matches!(&reply, ReplyBody::ReadPage { bytes: read, .. } if read == bytes);
       last = Some(reply);
     }
     Ok(all)
