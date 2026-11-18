@@ -571,6 +571,11 @@ fn release(state: &mut ShardState, object: ObjectId, owner: HostId) {
   }
   if state.moves_out.contains_key(&id) && let_go(state, id, Gone::ToAnother) {
     state.count(MOVE_RELEASED, 1);
+    slates_machine::log_line!(
+      "slates daemon: a volume {} this node moved away is released to member {}",
+      crate::verbs::hex_of(&object.0),
+      owner.0
+    );
   }
 }
 
