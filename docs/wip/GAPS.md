@@ -1,5 +1,31 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **git's history, Mercurial and Subversion join the workload roster (2026-11-17, Part 6 "Real workloads"; A-289;
+> Ada's goal of 2026-11-18).** Until now one 15-line git script was all the version control any route ran: no clone,
+> merge, rebase, gc or repack, no mapped packs, no worktree, and no Mercurial or Subversion at all. The roster now runs
+> `git-history` (a hard-linked local clone, branch, merge, rebase, stash, a worktree, tag, push, pull, gc, a full
+> repack, verify-pack, fsck), `mercurial` (a named branch and merge, tag, bookmark, a hard-linked clone and its first
+> commit, rebase, push, a shared store, verify) and `subversion` (an FSFS repository and SQLite working copies:
+> checkout, commit, branch, switch, update back and forward, merge, tag, cleanup, verify, dump) on every leg that runs
+> the roster: macOS's NFS loopback mount, the Linux lane's NFSv3 adapter and NFSv4.2, Linux FUSE inside containers
+> (`oci-linux`) and the live virtio-fs guest. Each clone prints how many of its files have two names, so a mount that
+> cannot link or reports a wrong link count differs. All legs share one environment
+> (`slates_conformance::workload::ENVIRONMENT`), and the host determinism gate
+> (`the_version_control_workloads_run_byte_identically_twice_on_the_host`) runs each twice in two directories a second
+> apart and holds them identical: its first run (2026-11-17, macOS 26, git 2.50.1, Mercurial 7.2) found Mercurial's
+> `fncache` written in a different order by each process (a Python set; now one hash seed), and a clone's reflog and
+> `undo.desc` naming its source by absolute path (now excluded with the reason). **Closed in the same change:** a
+> workload whose script failed alike on both sides was recorded `Identical` (`compare` asked only that the exit codes
+> be equal, while Part 6 asks them 0); it is now `Failed` on every leg, red-checked first. Subversion was absent from every
+> machine this change could use, so its workload runs first in CI. Locks: every leg runs a workload's two sides under
+> one kernel, whose own locks bind SQLite's, FSFS's and Mercurial's; served locks matter only between kernels.
+> **Open:** (1) the runs over each mount, which are the supervisor's (CLAUDE.md §8): any difference they find is a gap
+> to fix failing-test-first; (2) the Windows WinFsp roster: WinFsp's driver has no hard links (winfsp.dev's NTFS
+> compatibility page), so Mercurial and git copy where NTFS links, and git's symbolic-link probe needs reparse points,
+> which the drive does not serve yet; (3) a Linux FUSE leg outside a container; (4) git's fsmonitor (a daemon that
+> refuses network mounts by default) and submodules (their configuration names the source by absolute path) are not in
+> the roster.
+
 > **The dirty-page test's precondition, proved each attempt (2026-11-09, A-248).**
 > `a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path` failed intermittently ("the sync says so:
 > Ok(())", B10's gate, adacachy2, load about 66) when the kernel wrote the store's page back before the replacement. On

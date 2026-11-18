@@ -9431,6 +9431,15 @@ may weaken an earlier phase's gates; ratchets only tighten.
 > baseline and enforced instruction regression policy are still owed; printed counts alone
 > do not meet this gate. See the dated Callgrind report and GAPS/TBD_FIXES.
 
+> **Version-control workloads (2026-11-17, A-289; Ada's goal of 2026-11-18).** The roster runs git's history and
+> maintenance (`git-history`), Mercurial (`mercurial`) and Subversion (`subversion`) beside the basic `git`
+> workload, on every leg that runs it: the macOS NFS loopback mount, the Linux lane's NFSv3 adapter and NFSv4.2, the
+> Linux FUSE mount inside containers (`oci-linux`), and the live virtio-fs guest. Every leg sets one shared
+> environment (`slates_conformance::workload::ENVIRONMENT`), and a host determinism gate runs each of the four twice in
+> two directories a second apart and holds the runs identical, so a difference over a mount is the mount's. A script
+> that exits nonzero on both sides is a failed workload, never an identical one. Owed: the Windows WinFsp roster, and
+> a Linux FUSE leg outside a container.
+
 > **Editor workload correction (2026-09-17).** The host and mount must execute the same save
 > behavior even when their paths select different tool defaults. The Vim roster explicitly
 > clears `backupskip` and compares the backup's bytes as output. Its real-save regression checks
@@ -9449,7 +9458,7 @@ field.
 | Landing oracle | Prove the one path that writes disk | an executable model of (disk, overlay, witnesses); outsider edits and crashes injected at every step; real filesystems on RAM-backed targets | Verdicts match the table; every entry old or new; every collision reported; re-runs idempotent; writes proportional to the delta | CI (Linux tmpfs), nightly (APFS, NTFS) |
 | Merge oracle | Prove the verdict, the splice and rebase | an executable model of (chain, work volumes, declared operations); proptest with shrinking; instrumented counters | Verdicts match the oracle with zero false accepts or rejects; spliced versions byte-identical; no content read on the common path; windows byte-exact | CI |
 | Conformance | Prove POSIX behaviour through each bridge, and Win32 behaviour through the WinFsp drive | pjdfstest, fsx, fsstress (CI, x86_64 and arm64 Linux); WinFsp's fsx port and winfstest (CI, x86_64 and arm64 Windows; A-209); xfstests generic, LTP (nightly) | All tests pass except the reviewed expected-failure list for that bridge, and the list only shrinks | CI / nightly |
-| Real workloads | Prove tools work | vendored git, cargo, npm, python, rg, rsync, sqlite, editors, watchers | Exit codes 0; outputs byte-identical to the host run; `git status` clean; incremental builds reuse artifacts | nightly, release |
+| Real workloads | Prove tools work | vendored git (a basic repository, and a history: a hard-linked local clone, branch, merge, rebase, stash, a worktree, tag, push, pull, gc, a full repack, verify-pack, fsck), Mercurial (a named branch and merge, tag, bookmark, a hard-linked clone and its first commit, rebase, push, a shared store, verify), Subversion (an FSFS repository and SQLite working copies: checkout, commit, branch by copy, switch, update back and forward, merge, tag, cleanup, verify, dump), cargo, npm, python, rg, rsync, sqlite, editors, watchers (A-289) | Exit codes 0; outputs byte-identical to the host run; `git status`, `hg status` and `svn status` clean; hard links counted as on the host; incremental builds reuse artifacts | nightly, release |
 | Unit and property | Prove each core structure | proptest, oracle tests (serial spec vs implementation), non-vacuity counters | Properties hold; counters prove the fast paths ran | CI |
 | Hostile input | Prove parsers never crash or over-allocate | cargo-fuzz corpora for wire, FUSE, NFS/XDR, WinFsp, archive, MCP | No panic, no UB, bounded time and memory on every input | CI smoke, nightly long |
 | Concurrency | Prove lock-free cores and schedules | loom (cores), shuttle (schedules), TSan, Miri | All explored interleavings keep invariants; no data race; no UB | CI (loom, Miri), nightly (shuttle, TSan) |
@@ -20454,3 +20463,57 @@ The steps' own records follow.
     the process judgment. On this Mac: supervised 10 of 10, unsupervised 10 of 10, frozen 5 of 5. Mutations each turned
     their own shape red on both runners: the client's `Stalled` branch, the lone self-end, and starved treated as stuck.
     The tables are in the bug record.
+
+### A-289 — The workload roster runs git's history and maintenance, Mercurial and Subversion on every leg, and a workload that fails alike on both sides fails (accepted 2026-11-17, Ada's goal of 2026-11-18: git, Mercurial and Subversion on slates volumes on every route, byte-identical to the host, covered by workload tests in CI)
+Applied in the same change to: Part 6 ("Real workloads" and its status), GAPS, `crates/conformance/src/workload.rs`
+(the three workloads, `ENVIRONMENT`, `environment_exports`, `compare`), `crates/conformance/src/record.rs`
+(`WorkloadStatus::Failed`, `fails_the_suite`, `failure_note`) and `matrix.rs` (the `FAILED` part of a summary),
+`xtask/src/conformance/workloads.rs` and `container.rs` (the shared environment; the host determinism gate; each leg
+judged by `fails_the_suite`), `crates/server/tests/virtiofs.rs` (the guest's environment), and CI's `conformance` and
+`live-guest` jobs.
+- **The decision.** "Byte-identical to the host" is judged as the roster always has been: one script run twice under
+  one environment, on the host and over the mount, compared by exit code, output with the two directories as one
+  token, and a manifest of the tree under reviewed exclusions. Three workloads join `git`:
+  - `git-history`: a bare upstream, a seed that pushes to it, and a local clone whose objects are hard links to the
+    upstream's; a branch, a merge, a rebase, a stash, a second worktree made and removed, a tag, a push and a pull;
+    then `gc`, a full `repack` and the upstream's `gc` (with its reachability bitmap), `verify-pack` and `fsck`.
+  - `mercurial`: a named branch and its merge, a tag and a bookmark; a local clone whose store files are hard links to
+    the source's, then a commit in the clone, before which Mercurial copies each store file it appends to and still
+    shares, judged by the file's link count; a rebase, a push back, a share of the store, and `verify` of all three.
+  - `subversion`: an FSFS repository with a fixed UUID; working copies whose state is SQLite; a commit, a branch by a
+    server-side copy, a switch and a commit there, an update back and forward, Subversion's merge into trunk, a tag, a
+    cleanup, a second working copy, then `svnadmin verify` and a checksum of the dump.
+- **A workload that fails alike on both sides fails.** Part 6 asks exit codes 0 before byte-identity, but `compare`
+  asked only that the host's and the mount's exit codes be equal, so a script stopped early on both sides (a tool
+  refusing an option, a missing extension) was recorded `Identical` and proved nothing about the mount. A nonzero
+  code on both sides is now `WorkloadStatus::Failed`, with the code and the host output's tail; the native,
+  container and guest legs all judge through `compare`, and both xtask legs fail their suite by one rule
+  (`fails_the_suite`). Red before the change: `a_workload_that_fails_alike_on_both_sides_is_failed_not_identical`
+  read `Identical` for two runs that each exited 129.
+- **Hard links are counted in the output.** Both clones print how many object or store files have two names, after
+  the clone and (Mercurial) after the clone's commit. A mount that cannot link, or that reports a stale or wrong link
+  count, differs there; and one that let Mercurial append into a store file it still shared would fail the source's
+  `verify`.
+- **One environment for every leg.** The host, the container and the guest set `ENVIRONMENT`: the fixed git identity
+  and date, Mercurial reading no configuration but a repository's (`HGRCPATH` empty), its plain output and committer,
+  and one Python hash seed. Measured on the host gate's first run (2026-11-17, macOS 26, git 2.50.1, Mercurial 7.2):
+  Mercurial wrote its store's file list (`fncache`, a set) in a different order in each process until the seed was
+  fixed. Commits carry fixed dates; Subversion's revision dates are set to one instant by `svnadmin setrevprop`, which
+  runs no hook, before its history is printed; the clones' origins are written back as relative paths.
+- **The exclusions, each a file the tool fills with stat data or an absolute path by design.** git's index and
+  reflogs (a clone's first reflog entry names its source by absolute path, and gc expires entries by age against the
+  clock); Mercurial's dirstate and its transaction copies, and the clone's `undo.desc` (it names the repository a push
+  answered by absolute URL); Subversion's `wc.db` and its journal (sizes, modification times and commit times), and
+  FSFS's `db/uuid` (a random instance id beside the UUID, which is printed).
+- **Locks.** Subversion's working copy and repository take POSIX record locks (SQLite's, and FSFS's `write-lock`),
+  and Mercurial's locks are symbolic links made atomically. Every leg runs both sides of a workload under one kernel,
+  where the kernel's own locks (macOS `locallocks`, the Linux adapter's `nolock`, FUSE and virtio-fs without served
+  locks) bind every process. Served locks (NFSv4.2's) are needed only between kernels.
+- **Tools.** The conformance job installs Mercurial and Subversion (Ubuntu's image has Mercurial only and macOS's
+  neither); the container and guest images (`rust:1.98.1`, built on `buildpack-deps`'s `scm` layer) carry git,
+  Mercurial and Subversion already. The live-guest job requires each new workload's `Identical` line.
+- **Owed.** The Windows WinFsp roster: WinFsp's driver has no hard links (its NTFS compatibility page lists them
+  unsupported), so a local clone copies there while NTFS links, and a git repository's symbolic-link probe needs
+  WinFsp reparse points, which the drive does not serve yet. A Linux FUSE leg outside a container (the native Linux
+  lane reaches the daemon through the NFS adapter). The runs over each mount are the supervisor's (CLAUDE.md §8).
+

@@ -2921,24 +2921,23 @@ fn the_volume_goes(client: &mut Client, volume: slates_ipc::protocol::VolumeId) 
 #[cfg(target_os = "linux")]
 const WORKLOAD_GUEST_RAM: &str = "1G";
 
-/// Shape: how long the workload guest may run — the boot, then each roster tool twice (nine on Linux, a cargo
-/// build of a one-file crate among them) under software emulation. Measured at 364 s and 317 s on Docker
-/// Desktop's Apple Silicon VM (2026-10-01), so about four times that, still failing a hung guest in bounded time.
+/// Shape: how long the workload guest may run — the boot, then each roster tool twice (twelve on Linux since A-289,
+/// a cargo build of a one-file crate among them) under software emulation. Measured at 364 s and 317 s with the
+/// nine before A-289 on Docker Desktop's Apple Silicon VM (2026-10-01), so about four times that, still failing a
+/// hung guest in bounded time; the three version-control workloads' share is owed to the next run's figure.
 #[cfg(target_os = "linux")]
 const WORKLOAD_RUN: Duration = Duration::from_secs(1500);
 
 /// Format: the guest's script, run inside the host container's root (`/` over 9p, read-only) with the slates tag
 /// at `/mnt` and a RAM `/tmp`. For each roster tool the guest holds, the workload runs on the guest's RAM and on
-/// the slates mount under one fixed environment, and each run's output and resulting tree are printed between
-/// markers: kind, permission bits, size, SHA-256 (or link target) and path per entry.
+/// the slates mount under one fixed environment — the roster's own (`slates_conformance::workload::ENVIRONMENT`,
+/// exported ahead of this script by [`place_workloads`]) and the guest's paths below — and each run's output and
+/// resulting tree are printed between markers: kind, permission bits, size, SHA-256 (or link target) and path per
+/// entry.
 #[cfg(target_os = "linux")]
 const GUEST_WORKLOADS: &str = r#"
 export PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export HOME=/tmp/home CARGO_HOME=/tmp/cargo-home RUSTUP_HOME=/usr/local/rustup
-export GIT_AUTHOR_NAME=slates GIT_AUTHOR_EMAIL=slates@example.invalid
-export GIT_COMMITTER_NAME=slates GIT_COMMITTER_EMAIL=slates@example.invalid
-export GIT_AUTHOR_DATE=2026-09-14T00:00:00Z GIT_COMMITTER_DATE=2026-09-14T00:00:00Z
-export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 TZ=UTC LC_ALL=C
 mkdir -p "$HOME" "$CARGO_HOME"
 while read -r name tool; do
   if ! command -v "$tool" >/dev/null 2>&1; then echo "=== SKIP $name $tool"; continue; fi
@@ -2984,9 +2983,10 @@ fn put(stream: &mut TcpStream, dir: &[u8], name: &str, bytes: &[u8], xid: u32) {
 /// Places the guest's script, the roster and each workload's script in the volume behind `root`.
 #[cfg(target_os = "linux")]
 fn place_workloads(stream: &mut TcpStream, root: &[u8]) {
-  // The roster's bounds, the very values every other leg runs it under.
+  // The roster's environment and bounds, the very values every other leg runs it under.
   let script = format!(
-    "export {}={} {}={}\n{GUEST_WORKLOADS}",
+    "{}export {}={} {}={}\n{GUEST_WORKLOADS}",
+    slates_conformance::workload::environment_exports(),
     slates_conformance::workload::ENV_SQLITE_BUSY_MS,
     slates_conformance::workload::SQLITE_BUSY_MS,
     slates_conformance::workload::ENV_WATCH_SECONDS,
