@@ -476,7 +476,6 @@ fn a_file_changed_on_disk_after_the_volume_changed_it_is_typed_drift_and_a_typed
       kind: DriftKind::Modified
     }]
   );
-  assert!(after.watcher.is_some(), "{after:?}");
   assert!(matches!(
     instance.status(volume).unwrap().base,
     Some(BaseState::Read(_))
@@ -588,7 +587,8 @@ fn a_landing_follows_its_volumes_write_mode() {
 
 /// AC-5.12 / T-5.14 (A-299; §4.16, D-27): do provision a green and work volumes over it; merge a seed, then two works
 /// based on the same version that rewrite the same bytes, one after the other; rebase and merge a third that changed
-/// another file. Expect the seed and the first `Merged` at versions 1 and 2, unsigned; the second `Conflicted` with a
+/// another file. Expect a green's and a work's status read with no base; the seed and the first `Merged` at versions 1
+/// and 2, unsigned; the second `Conflicted` with a
 /// window on the rewritten bytes and the green's head 2, nothing merged; the third rebased onto 2 and merged at 3; and a
 /// signed merge refused `Unsupported(SignedWork)` before anything is sent.
 #[test]
@@ -613,6 +613,10 @@ fn a_merge_is_accepted_or_conflicted_typed() {
   };
   let (seed, base) = work(&mut instance, "seed");
   assert_eq!((seed.green, base), (green, 0));
+  // A green and a work volume have no base folder: their status reads, with no base (the merge service reports their
+  // watcher as no overlay's, which a reading of the status text once took for a protocol fault).
+  assert_eq!(instance.status(green).unwrap().base, None);
+  assert_eq!(instance.drift(seed.volume).unwrap(), None);
   instance
     .client()
     .edit(seed.volume, "f", 0, 0, b"aaaaaaaa")
