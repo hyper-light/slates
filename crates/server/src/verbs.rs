@@ -5831,6 +5831,7 @@ fn create(
     access: Vec::new(),
     created_ns: state.clock.monotonic_ns(),
     catalog_version: 0,
+    taken_over: None,
   };
   publish_created_volume(
     state,
@@ -6547,6 +6548,7 @@ fn found_green(
     access: Vec::new(),
     created_ns: state.clock.monotonic_ns(),
     catalog_version: 0,
+    taken_over: None,
   };
   let now = state.clock.monotonic_ns();
   if let Err(e) = state
@@ -6875,6 +6877,7 @@ fn create_work(
     access: Vec::new(),
     created_ns: state.clock.monotonic_ns(),
     catalog_version: 0,
+    taken_over: None,
   };
   let now = state.clock.monotonic_ns();
   if let Err(e) = state
@@ -10627,7 +10630,6 @@ pub(crate) fn reconcile_unpublished_effects(state: &mut ShardState) -> usize {
     }
     state.by_id.remove(id);
     crate::live_ship::forget(state, *id);
-    state.taken_over.remove(id);
   }
   let partition = state.db.partition();
   state.greens.retain(|id, _| partition.volume(*id).is_some());
@@ -10763,7 +10765,6 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
       }
       state.by_id.remove(&id);
       crate::live_ship::forget(state, id);
-      state.taken_over.remove(&id);
       retire_local_tombstones(state);
     }
   }
@@ -10872,7 +10873,6 @@ fn record_unrecovered_destroy(
   release_name_alias(state, record.id, &record.name);
   release_origin_pin(state, origin_pin);
   crate::live_ship::forget(state, record.id);
-  state.taken_over.remove(&record.id);
   retire_local_tombstones(state);
   Ok(())
 }
@@ -11043,7 +11043,13 @@ fn loss_report(
     at_risk_ns: at_risk_ns(state, record, unchanged_since_head, placed),
     placed_sequence: placed.map(|snapshot| snapshot.epoch),
     live_shipped: record.policy.live_shipped,
-    taken_over: state.taken_over.get(&record.id).cloned(),
+    taken_over: record
+      .taken_over
+      .map(|taken| slates_ipc::protocol::VolumeTakeover {
+        epoch: taken.epoch,
+        from_live_log: taken.from_live_log,
+        head_sequence: taken.head_sequence,
+      }),
   }
 }
 
@@ -11338,6 +11344,7 @@ pub(crate) fn materialize_taken_over_green(
       access: recovery.access.clone(),
       created_ns: state.clock.monotonic_ns(),
       catalog_version: recovery.catalog_sequence,
+      taken_over: None,
     };
     let now = state.clock.monotonic_ns();
     if let Err(e) = state
@@ -11533,6 +11540,9 @@ pub(crate) struct TakenOver<'a> {
   pub catalog_sequence: u64,
   /// The head register's adopted sequence.
   pub sequence: u64,
+  /// The takeover itself, kept in the volume's record (AC-8.3, A-325): the epoch the head was placed under, `sequence`,
+  /// and whether the volume is rebuilt from its live log.
+  pub takeover: slates_db::catalog::TakeoverRecord,
 }
 
 pub(crate) fn materialize_taken_over(
@@ -11729,6 +11739,8 @@ pub(crate) fn materialize_taken_over(
     access: catalog.access.clone(),
     created_ns: now,
     catalog_version: taken.catalog_sequence,
+    // The takeover that made this node the owner, kept with the volume so its loss report survives a restart (A-325).
+    taken_over: Some(taken.takeover),
   };
   let published = publish_created_volume(
     state,
@@ -15139,6 +15151,7 @@ mod tests {
       access,
       created_ns: 0,
       catalog_version: 0,
+      taken_over: None,
     }
   }
 
@@ -16382,6 +16395,11 @@ mod tests {
       catalog,
       catalog_sequence: 0,
       sequence: 1,
+      takeover: slates_db::catalog::TakeoverRecord {
+        epoch: 1,
+        head_sequence: 1,
+        from_live_log: false,
+      },
     };
     super::materialize_taken_over(state, id, &taken, Vec::new(), Some(archive))
   }

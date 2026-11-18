@@ -13041,3 +13041,198 @@ records of about 135.5 MB), `held_back.whole` 11 to 16, `batches` 5 to 102 carry
   build over the volume in one turn is the candidate (GAPS records the live log's whole entry as a one-turn walk of a
   whole volume, and `install_built` and `install_image` rose with it). Under an anchor the daemon would be restarted,
   which is still an outage of every writer's connection.
+
+## The reply carrier at 3,000 and 10,000 clients: no reply lost after it; 57 lost and a hung run before it at 10,000 (A-296; goal 238; 2026-11-18)
+
+**What it is.** Goal 238's measurement of A-296 (every cross-shard reply waits for room, carried by a per-shard carrier,
+never dropped): the many-client rung on main just before the carrier landed (`8c9f05404`) against its landing
+(`d0e737b8d`). Both carry W1, so a green's works are served on the shards their names hash to.
+
+**Environment.** Mac Studio adas-mac-studio.local-2 (Apple M3 Ultra, 32 cores, 96 GiB, macOS 26.4), release (LTO)
+`load_bench` of each commit built there with Rust 1.98.1, 2026-11-18 10:11 to 10:34 UTC. Shared with other agents' work:
+the one-minute load average at each run's start is in the table. Linux v7.4-rc1 (6628e7d4) `kernel/`, 754 files.
+
+**Command.** `load_bench --tree <linux-v7.4-rc1>/kernel --clients N --hot-files 0.8N --per-connection 32 --rounds 3
+--reply-patience 60` (think time 0, the in-process daemon, which derived 23 shards), under `/usr/bin/time -l`. The
+`lost` rows are the daemon's counters read at the end of the run; `room` is the carrier's waits for room. Every run:
+
+| clients | build, round | load at start | wall s | verdicts/s | `xshard.reply_dropped` | room waits begun / ended (peak) | p99 ms: Edit / Accepted / Conflict / Rebase |
+|---|---|---|---|---|---|---|---|
+| 3,000 | before, 1 | 12.9 | 10 | 7,832 | 0 | (none in this build) | 91.3 / 106.7 / 114.6 / 110.8 |
+| 3,000 | after, 1 | 15.2 | 9 | 11,447 | 0 | 0 / 0 | 46.8 / 62.8 / 64.2 / 64.2 |
+| 3,000 | after, 2 | 18.0 | 6 | 13,427 | 0 | 0 / 0 | 41.8 / 49.5 / 63.3 / 53.2 |
+| 3,000 | before, 2 | 17.7 | 5 | 13,702 | 0 | | 49.8 / 61.8 / 71.8 / 59.9 |
+| 3,000 | before, 3 | 18.8 | 5 | 12,591 | 0 | | 44.0 / 48.6 / 64.9 / 51.3 |
+| 3,000 | after, 3 | 20.8 | 5 | 13,729 | 0 | 0 / 0 | 49.0 / 63.4 / 69.7 / 63.2 |
+| 10,000 | before, 1 | 15.9 | 31 | 12,213 | 0 | | 170.5 / 175.1 / 197.0 / 187.8 |
+| 10,000 | after, 1 | 25.2 | 62 | 5,440 | 0 | 6,576 / 6,576 (106) | 443.8 / 440.8 / 495.4 / 491.9 |
+| 10,000 | after, 2 | 41.0 | 32 | 11,446 | 0 | 6,358 / 6,358 (41) | 208.7 / 213.6 / 247.0 / 232.0 |
+| 10,000 | before, 2 | 37.6 | hung | | **57** (read live) | | |
+
+Every other `lost` counter read 0 in every completed run, and the oracle found nothing in any. The 10,000-client runs
+had 1,737 to 1,908 clients starved past the harness's resolutions (10,000 clients over 8,000 hot picks). The hung run
+progressed as its sibling did until about 40 s; from then to 545 s seven of its eight harness workers sat 2 to 6 agents
+short of done with their requests unanswered (one worker stopped reporting at 35 s), and the live daemon's
+`slates status`, read with `8c9f05404`'s own CLI built for it, counted `xshard.reply_dropped` 57. The harness was then
+ended (its own process, so no end-of-run rows).
+
+**What it means.**
+- **After the carrier, no reply was lost in 5 runs** at 3,000 and 10,000 clients; at 10,000 the carrier waited for room
+  6,358 and 6,576 times a run and ended every wait.
+- **Before it, the 3,000-client rung no longer drops** once W1 is in (0 in three runs), so the "about 4,200 a run" of
+  main `db9c514e` is not reproduced at this rung; at 10,000 clients one run of two lost 57 replies and hung, each lost
+  reply a client waiting for good (A-232).
+- The latencies above move with the box's load (one after-run met load 41 and took twice the wall), not with the
+  build: the carrier's cost does not show at this resolution.
+
+## A many-shard start under load, and where the starting thread's time goes at 407 shards (A-311, A-312; goal 254; 2026-11-18)
+
+**What it is.** Goal 254's owed runs: `a_start_whose_shards_sum_past_a_window_comes_up` (`crates/cli/tests/cli.rs`) under
+load on main before A-311 and A-312 (`f5b85d27b`) and after them (`7d760c4ea`), and the starting thread's CPU by phase
+at 407 shards, which the goal's notes held to be `connect_pairs` by arithmetic alone.
+
+**The test under load.** Release `cli` test binaries of each commit, each in its own target directory,
+`SLATES_TEST_CLI=1 <cli> a_start_whose_shards_sum_past_a_window_comes_up --exact --nocapture`, the arms run A B B A A B.
+The test measures one shard's share of a start and asks enough shards to sum past three liveness windows, so the shard
+count is the machine's:
+
+| where (2026-11-18 UTC) | load | shards asked | before `f5b85d27b` | after `7d760c4ea` |
+|---|---|---|---|---|
+| GitHub `ubuntu-latest`, 4 vCPU, two spinning loops a CPU (diag run 44279195223, 10:02) | 2.8-4.4 | 64-73 | 3 of 3 pass | 3 of 3 pass |
+| GitHub `ubuntu-24.04-arm`, 4 vCPU, the same (09:58) | 2.4-13.6 | 48-140 | 3 of 3 pass | 3 of 3 pass |
+| Mac Studio adas-mac-studio.local-2, 32 cores, the box's own load (10:40) | 12.1-12.6 | 30-35 | 3 of 3 pass | 3 of 3 pass |
+| GitHub `macos-latest`, 3 vCPU (10:39) | 6.3-13.1 | 756-1,959 | 0 of 3 (1,346-1,959 shards) | 1 of 3 (756 passed; 1,308 and 1,356 failed) |
+
+A shard's share of a start was 42 to 63 ms of CPU on the Linux runners, 86 to 101 ms on the Studio and 1.5 to 4.0 ms on
+`macos-latest`. Every `macos-latest` failure is the runtime's own limit, not a start kill: "start: runtime: too many
+shards: at most 1024 per process", the daemon's exit 4 and the anchor's crash loop, then "served false, the anchor's
+start kills []". The test does not cap the count it derives at the runtime's 1,024 shards a process.
+
+**The starting thread at 407 shards.** `slates daemon --quick --shards 407` of `7d760c4ea`, five starts on the Studio at
+load 17 to 47, with an uncommitted diagnostic that read the starting thread's own CPU clock (`CLOCK_THREAD_CPUTIME_ID`)
+and the wall at slates-rt's phase boundaries. Milliseconds of that thread's CPU:
+
+| phase | starts 1 / 2 / 3 / 4 / 5 |
+|---|---|
+| registrations | 1.37 / 1.83 / 1.34 / 1.65 / 1.24 |
+| `connect_pairs` (407 × 406 rings) | 43.9 / 119.2 / 73.9 / 120.9 / 29.0 |
+| spawn | 4.6 / 6.5 / 5.5 / 4.7 / 4.2 |
+| readiness | 0.06 / 0.10 / 0.06 / 0.04 / 0.05 |
+
+Wall followed CPU within 2% in each phase. The start beat 166,873 times (S² + 3S + 3) before the watchdog took the beat
+over. Each start served 2.25 to 2.75 s after launch, by when the process had run 31.5 to 55.6 s of CPU, the 407 shard
+threads' own starts.
+
+**What it means.**
+- **`connect_pairs` is the starting thread's long unit:** 80 to 94% of its start, 29 to 121 ms here, inside the 1 s
+  window by an order of magnitude on this Mac.
+- **No run here reproduced the red these changes fixed** (B10's start kills at 367 to 407 shards on a 32-thread Linux
+  box at load 70): the machines that ran asked 30 to 140 shards, or more than the runtime allows. That run is still owed
+  on a 32-thread Linux box under load.
+- **The test is unrunnable where a shard starts cheaply:** past 1,024 shards it fails on the runtime's limit, both
+  before and after the change (reported to goal 254).
+
+## The verdict cut on large files, measured in the daemon: even, because the rung never takes the path it cut (g222's perf-decide; 2026-11-18)
+
+**What it is.** The daemon A/B owed since perf-decide landed (0b14033e7; "What a verdict compares and copies" above):
+the owner's CPU a verdict and the loaded p99 at a rung whose hot files are 256 KiB to 1 MiB, main before the cut
+(`9b6b35fb3`) against its merge (`b7c294959`). Both predate W1, so every work is served on its green's owner shard.
+
+**Environment.** Mac Studio adas-mac-studio.local-2 (Apple M3 Ultra, 32 cores, 96 GiB, macOS 26.4), 2026-11-18 10:12 to
+10:15 UTC, shared (load 19.4 to 36.9). Release (LTO) `slates` and `load_bench` of each commit built there, each with the
+same temporary owner-CPU diagnostic (perf's `owner_cpu_patch.py`, never committed: the thread's CPU around each submit
+and rebase served on the green's owner shard, logged as `OWNERCPU` at each reap tick). The tree: every file of Linux
+v7.4-rc1 between 256 KiB and 1 MiB (249 files, mostly AMD register headers), three times over in `a/`, `b/` and `c/`
+(APFS clones), 747 files of 262,291 to 1,013,732 bytes, median 372,461, 346,959,825 bytes in all.
+
+**Command.** The anchored recipe (`rung.sh`: a fresh `slates anchor --quick` per run, root bootstrapped), then
+`load_bench --instance <i> --tree <large> --clients 1000 --hot-files 800 --per-connection 32 --rounds 3
+--reply-patience 60 --think-us 0`; the arms A B, B A, A B, B A, A B. Every run:
+
+| run | build | wall s | verdicts/s | accepted / conflicts | owner µs a verdict | owner µs a rebase | p99 ms: Edit / Accepted / Conflict | `TableAtCapacity` refusals: Edit / Rebase / Submit |
+|---|---|---|---|---|---|---|---|---|
+| 1 | before | 19 | 1,555 | 2,217 / 3,253 | 102.0 | 110.1 | 227.0 / 227.7 / 227.8 | 67 / 225 / 15 |
+| 1 | after | 16 | 1,699 | 1,835 / 2,525 | 103.2 | 118.8 | 152.5 / 140.4 / 141.4 | |
+| 2 | after | 19 | 2,031 | 383 / 897 | 93.1 | 149.4 | 148.7 / 72.9 / 73.4 | 828 / 139 / 1 |
+| 2 | before | 17 | 2,026 | 386 / 889 | 100.3 | 152.2 | 146.0 / 86.6 / 87.1 | 876 / 77 / 15 |
+| 3 | before | 16 | 1,930 | 386 / 897 | 87.1 | 152.6 | 143.1 / 93.4 / 93.1 | |
+| 3 | after | 16 | 1,434 | 2,058 / 2,998 | 109.5 | 113.6 | 207.0 / 199.5 / 203.9 | |
+| 4 | after | 18 | 1,349 | 2,346 / 3,675 | 104.2 | 113.7 | 193.8 / 195.1 / 194.9 | |
+| 4 | before | 17 | 1,896 | 2,276 / 3,404 | 95.3 | 94.5 | 130.6 / 122.8 / 122.7 | |
+| 5 | before | 14 | 2,334 | 413 / 894 | 84.0 | 118.0 | 127.6 / 82.0 / 82.7 | |
+| 5 | after | 13 | 1,814 | 1,528 / 2,086 | 94.6 | 104.0 | 128.4 / 126.4 / 126.2 | |
+
+Blank refusal cells were not read out for that run; every run's level ended early on capacity: 1,000 works writing
+256 KiB-to-1 MiB files filled a table of the owner's shard, edits were refused `TableAtCapacity`, and the level either
+stopped at about 385 accepted versions (wall about 0.6 s of level) or ran to about 2,000 (about 3.5 s). The oracle found
+nothing in any run; no reply was lost (the anchored daemon's counters).
+
+**What it means.**
+- **Even.** The owner spent 84.0 to 102.0 µs a verdict before the cut and 93.1 to 109.5 µs after it: no gain, at about
+  2.5 times what a verdict costs at `kernel/`'s 21 KiB files (37.1 to 39.3 µs on main, the table above).
+- **Why even: the rung never takes the cut path** (read from the engine, not measured): `Green::merge_content` sends an
+  overlapping overwrite to pass two's byte compare and only a length-changing op to the whole-file identity check
+  (`lands_on_head`) that perf-decide made follow the change; `load_bench`'s edits are slot-aligned overwrites. The
+  engine bench (`verdict_bench`, a delete and an insert) is the only measurement of the cut until a workload makes
+  length-changing edits.
+- **The large-file rung is capacity-bound before it is CPU-bound** on one owner shard: its first wall is the table its
+  works fill, not the verdict.
+
+## A full edit and merge after W1 and the reply carrier: even on one shard, slower on every runner with more (goal 222; A-247, A-296; 2026-11-18)
+
+**What it is.** Goal 222's owed A/B: the loaded p99 and p999 of a single client's full edit and merge (`edit_merge_bench`,
+an edit of 64 bytes of a 4 KiB file and its submit to the green's verdict) on main before W1 and the reply carrier
+(`8dff8fcad`) and after both (`d0e737b8d`), on Linux, macOS and Windows, interleaved. Where the A/B moved, a second run
+with four arms named the landing: `8dff8fcad`, `3c0af9399` (W1 landed), `d0e737b8d` (A-296 landed) and `7d760c4ea`
+(main at the time).
+
+**Environment.** GitHub runners from diagnostics branches never merged, 2026-11-18 09:07 to 10:52 UTC: run 44272914208
+(two arms, all five runner kinds), 44279913406 (four arms, `ubuntu-24.04-arm` and `windows-11-arm`), 44283060368 (four
+arms, `macos-latest`). Every runner has 4 vCPUs (`macos-latest` 3); the in-process daemon derived 1 shard on the x86_64
+runners, 3 on the arm64 ones and 2 on `macos-latest`. Each arm's harness built release from its own source extract.
+Loaded on Linux is the controlled load of A-224: a `systemd-run --user --scope` capped at two CPUs and 256 MB, two
+spinning threads per core of the machine (8), and a sibling writer that fsyncs 16 MiB again and again; on macOS and
+Windows, the harness's own two spinning threads a core. Quiet ran right after, nothing else on the runner.
+
+**Command.** `edit_merge_bench --loaded-only --spinners-per-core 2 --files 10 --form accept --form conflict` and
+`edit_merge_bench --quiet-only --files 10 --files 1000 --form accept --form conflict`. Each invocation is 3 runs of up to
+1,000 samples; each cell below is the invocation's median over its 3 runs, as its `goal` line prints it; the arms were
+rotated each round, three rounds, and every round is inside the ranges shown. `--files 10`, microseconds unless marked:
+
+| runner (shards) | form | `8dff8fcad` p50 / p99 | `3c0af9399` (W1) | `d0e737b8d` (+ A-296) | `7d760c4ea` (main) |
+|---|---|---|---|---|---|
+| Linux x86_64 (1) | loaded accept | 14-15 / 4.3-9.0 ms | | 15-17 / 6.2-8.5 ms | |
+| Linux x86_64 (1) | quiet accept | 13 / 21-31 | | 13-17 / 21-30 | |
+| Windows x86_64 (1) | loaded accept | 33-35 / 70-71 | | 34-35 / 66-70 | |
+| Windows x86_64 (1) | quiet accept | 28-29 / 66-71 | | 28-31 / 65 | |
+| Linux arm64 (3) | loaded accept | 4.0-8.1 ms / 21.0-21.3 ms | 12.1-19.0 ms / 38.9-45.0 ms | 16.0-19.1 ms / 39.0-41.9 ms | 14.0-18.9 ms / 37.0-41.0 ms |
+| Linux arm64 (3) | quiet accept | 18 / 36-40 | 53-54 / 76-88 | 50-52 / 77-82 | 51-52 / 78-85 |
+| Linux arm64 (3) | quiet conflict | 15 / 34-35 | 55-58 / 82-88 | 51-55 / 75-81 | 49-55 / 76-84 |
+| Windows arm64 (3) | loaded accept | 29-32 / 106-129 | 71-72 / 23.4-42.6 ms | 66-78 / 46.7-164.8 ms | 67-78 / 45.2-162.8 ms |
+| Windows arm64 (3) | quiet accept | 24-28 / 55-62 | 67-80 / 117-152 | 61-78 / 107-132 | 65-70 / 110-118 |
+| macOS arm64 (2) | loaded accept | 70-76 / 5.7-7.9 ms | 306-319 / 14.6-16.1 ms | 260-349 / 13.6-21.2 ms | 238-279 / 13.1-14.7 ms |
+| macOS arm64 (2) | quiet accept | 105-108 / 221-231 | 97-106 / 233-240 | 106-128 / 238-344 | 93-109 / 220-241 |
+| macOS arm64 (2) | quiet conflict | 103-110 / 219-265 | 246-328 / 769-918 | 248-254 / 681-728 | 247-271 / 671-806 |
+
+The p999s follow the p99s: Linux x86_64 loaded 9.0-12.0 ms on both arms, Windows x86_64 loaded 0.11-10.2 ms before and
+31.8 ms in every after round, Linux arm64 loaded 24-27 ms before and 39-48 ms with W1. Under the 256 MB cap the arm64
+runners refused the 1,000-file green at capacity (`TableAtCapacity { table: "green_chains" }`), so their loaded rows are
+10 files only; the quiet 1,000-file rows moved as the 10-file ones did. No answer was wrong in any run.
+
+**On a 32-core Mac.** adas-mac-studio.local-2 (Apple M3 Ultra, 23 shards derived), 2026-11-18 10:15 to 10:19 UTC, load
+19.4 to 26.9, `--quiet-only` only (the box is shared), A B B A A B: accept p50 117-129 µs and p99 280-334 µs before,
+465-727 µs and 721-4,836 µs after; conflict p50 93-122 and p99 253-299 µs before, 353-515 and 558-805 µs after. The same
+two builds' 1,000-client rung (`load_bench --clients 1000 --hot-files 800 --rounds 3 --think-us 0`, in-process, 10:11
+UTC) went the other way: 5,177 to 5,933 verdicts a second before and 9,044 to 12,714 after, with the accept p99
+27.9-35.4 ms before and 19.0-39.5 ms after, no reply lost.
+
+**What it means.**
+- **W1 slowed the single client wherever the daemon has more than one shard**, and the reply carrier added nothing
+  measurable: a work on a shard other than its green's owner pays the hop at every edit and submit. Quiet, a 3-shard
+  runner's accept went from 18 to about 52 µs at the median (Linux arm64) and 24-28 to 61-80 µs (Windows arm64), and
+  macOS's 2-shard conflict tripled while its accept held; loaded, the p99 doubled on Linux arm64 and macOS and went from
+  about 0.1 ms to 23-165 ms on Windows arm64. On one shard the arms are even. Main still carries it.
+- **Many clients gain from W1 what one client loses:** at 1,000 clients the same build answers 1.7 to 2.2 times the
+  verdicts a second.
+- **The goal is met on no platform under load:** loaded p99 4.3-45 ms on Linux, 5.7-21 ms on macOS, 23-165 ms on Windows
+  arm64 after W1; only Windows x86_64's single shard holds its p99 near 70 µs, with a p999 of 31.8 ms.

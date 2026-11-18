@@ -2801,8 +2801,9 @@ impl Daemon {
     Ok(())
   }
 
-  /// Test support: the quantum the record period's live slices are cut by on every shard (`live_ship::period_slice`), in
-  /// place of the shard's own step quantum; `None` gives the shard its own back. Zero ends each slice after one volume, so
+  /// Test support: the quantum the record period's live slices are cut by on every shard (`live_ship::period_slice`), and
+  /// a returned holder's walk's turns (`live_ship::reached_slice`), in place of the shard's own step quantum; `None` gives
+  /// the shard its own back. Zero ends each slice after one volume, so
   /// a test sees the slicing whatever the machine's wake cost. Delivered like [`Self::inject_live_state_withhold`]; `Ok`
   /// once installed, else the typed refusal.
   pub fn inject_live_period_quantum(&self, quantum_ns: Option<u64>) -> Result<(), ObserveError> {
@@ -4295,7 +4296,6 @@ async fn init_shard(
     demuxes: Vec::new(),
     holder_records: crate::tracked::Tracked::default(),
     live: crate::live_ship::LiveState::default(),
-    taken_over: std::collections::BTreeMap::new(),
     seal_walk_quantum_ns: None,
     host_takeovers: std::collections::BTreeMap::new(),
     config_refresh_wanted: false,
