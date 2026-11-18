@@ -932,7 +932,7 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
     }
     Ok(Turn::Ended) => return Turned::Ended,
     Ok(Turn::Dispatched(dispatched)) => {
-      log_write(s, &dispatched);
+      log_write(s, mount.volume, &dispatched);
       if dispatched.resent() {
         let count = s.refusals.entry(RESENT).or_insert(0);
         *count = count.saturating_add(1);
@@ -948,7 +948,7 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
   // What the round that just finished could not deliver. Counted rather than raised: the refusal is not
   // retryable (the next round is refused identically, and a round kept for retry is an unbounded loop), but it is
   // never silent — CLAUDE.md #9.
-  log_forgets(s, attachment, mount.serve.take_forgotten());
+  log_forgets(s, (mount.volume, attachment), mount.serve.take_forgotten());
   let refused = mount.serve.take_entry_invalidations_refused();
   s.count(ENTRY_INVALIDATION_REFUSED, refused);
   let conflicts = mount.serve.take_writeback_conflicts();
@@ -1236,13 +1236,14 @@ fn fail(s: &mut ShardState, attachment: u64) {
   ended(s, attachment);
 }
 
-/// Logs a write's bytes in the shard's write log before its reply (A-63, `crate::write_log`): the write is
+/// Logs a write's bytes in the shard's write log before its reply, under the mount's `volume`, where a replay puts them
+/// (A-63, `crate::write_log`; an inode number alone names the origin of a clone's inherited file): the write is
 /// acknowledged before the next publication, so a daemon that dies first must leave its bytes for its successor to
 /// replay. Logged before the reply, so a write applied and never answered is resent, not replayed twice over a
 /// different later write (the kernel resends it with the same bytes at the same offset). A log with no room forces a
 /// publication, which carries this write (already applied) and empties the log; only a refused publication leaves the
 /// write unlogged, marked as an overflow so the next daemon reports the loss rather than replaying around it.
-fn log_write(s: &mut ShardState, dispatched: &Dispatched) {
+fn log_write(s: &mut ShardState, volume: VolumeId, dispatched: &Dispatched) {
   if dispatched.opcode != Some(slates_bridge_fuse::Opcode::Write) || dispatched.error != 0 {
     return;
   }
@@ -1252,7 +1253,9 @@ fn log_write(s: &mut ShardState, dispatched: &Dispatched) {
     return;
   };
   let appended = match (s.write_log.as_mut(), s.content.as_mut()) {
-    (Some(log), Some(object)) => log.append(object, dispatched.nodeid(), offset, data),
+    (Some(log), Some(object)) => {
+      log.append(object, (volume.bytes, dispatched.nodeid()), offset, data)
+    }
     _ => return,
   };
   let logged = match appended {
@@ -1280,9 +1283,14 @@ const FORGET_UNLOGGED: &str = "write_log.forget_unlogged";
 /// leave its references counted in the image for good. A log with no room forces a publication, which carries the
 /// `FORGET` (already applied) and empties the log; one still refused is counted, and never marks the log overflowed,
 /// which would report every taken-over file as having lost writes.
-fn log_forgets(s: &mut ShardState, attachment: u64, forgotten: Vec<(u64, u64)>) {
+fn log_forgets(
+  s: &mut ShardState,
+  (volume, attachment): (VolumeId, u64),
+  forgotten: Vec<(u64, u64)>,
+) {
   for (inode, count) in forgotten {
     let forgotten = crate::write_log::Forgotten {
+      volume: volume.bytes,
       attachment,
       inode,
       count,

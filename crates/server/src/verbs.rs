@@ -14411,7 +14411,8 @@ fn clear_write_log(state: &mut ShardState, captured_every_volume: bool, generati
 }
 
 /// Replays the FUSE writes the previous daemon acknowledged after its last publication (A-63) into the volumes
-/// recovery rebuilt, in the order they were acknowledged: each to the volume whose prefix its inode carries. A write
+/// recovery rebuilt, in the order they were acknowledged: each to the volume it was written through, which its record
+/// names (an inode number's prefix names a clone's origin for every file the clone inherited, 2026-11-18). A write
 /// that cannot be replayed is counted and the run carries on; the file then lacks it, as the record says. A write
 /// refused `PublishNeeded` (the arena's freed blocks wait on a publication, A-64) publishes, puts every record not
 /// yet replayed back in the log under the new image's stamp — the publication cleared the log, and a crash before
@@ -14453,28 +14454,23 @@ async fn replay_writes(
   replayed
 }
 
-/// The volume slot whose prefix `inode` carries, when recovery rebuilt it.
+/// The slot of the volume a record names, when recovery rebuilt it.
 #[cfg(target_os = "linux")]
-fn slot_of_inode(
-  state: &mut ShardState,
-  inode: u64,
+fn slot_of_volume(
+  state: &ShardState,
+  volume: [u8; 16],
 ) -> Option<slates_mem::Handle<crate::state::VolumeSlot>> {
-  let prefix = u16::try_from(inode >> slates_vfs::ids::InodeNo::COUNTER_BITS).unwrap_or(u16::MAX);
-  state
-    .volumes
-    .iter()
-    .find(|(_, slot)| slot.volume.prefix() == prefix)
-    .map(|(handle, _)| handle)
+  state.by_id.get(&DbVolumeId { bytes: volume }).copied()
 }
 
-/// Gives back one logged `FORGET`'s lookups, as its attachment's own, in the volume its inode names; `None` when no
-/// rebuilt volume has it.
+/// Gives back one logged `FORGET`'s lookups, as its attachment's own, in the volume its record names; `None` when
+/// recovery did not rebuild that volume.
 #[cfg(target_os = "linux")]
 fn replay_forget(
   state: &mut ShardState,
   forgotten: crate::write_log::Forgotten,
 ) -> Option<Result<(), slates_vfs::VfsError>> {
-  let handle = slot_of_inode(state, forgotten.inode)?;
+  let handle = slot_of_volume(state, forgotten.volume)?;
   let slot = state.volumes.get_mut(handle).ok()?;
   Some(slot.volume.forget_for(
     &mut state.store,
@@ -14484,13 +14480,14 @@ fn replay_forget(
   ))
 }
 
-/// Writes one logged record into the volume whose prefix its inode carries; `None` when no rebuilt volume has it.
+/// Writes one logged record into the volume it was written through, which the record names; `None` when recovery did
+/// not rebuild that volume.
 #[cfg(target_os = "linux")]
 fn replay_one(
   state: &mut ShardState,
   record: &crate::write_log::Record,
 ) -> Option<Result<usize, slates_vfs::VfsError>> {
-  let handle = slot_of_inode(state, record.inode)?;
+  let handle = slot_of_volume(state, record.volume)?;
   let slot = state.volumes.get_mut(handle).ok()?;
   let inode = slates_vfs::ids::InodeNo(record.inode);
   let written = slot
@@ -14515,9 +14512,12 @@ fn relog_remaining(state: &mut ShardState, remaining: &[crate::write_log::Logged
   let mut kept = log.clear(object, generation).is_ok();
   for logged in remaining {
     let appended = match logged {
-      crate::write_log::Logged::Write(record) => {
-        log.append(object, record.inode, record.offset, &record.bytes)
-      }
+      crate::write_log::Logged::Write(record) => log.append(
+        object,
+        (record.volume, record.inode),
+        record.offset,
+        &record.bytes,
+      ),
       crate::write_log::Logged::Forget(forgotten) => log.append_forget(object, *forgotten),
     };
     if kept && appended.is_err() {
@@ -14882,6 +14882,107 @@ mod tests {
   /// Shape: the reduced reserve the relief test's shard runs with, so filling its arena takes a few chunks, not the
   /// machine's measured production reserve.
   const RELIEF_RESERVE: u64 = 32 << 20;
+
+  /// A-63, A-166's sibling sweep (from reading, proven here, 2026-11-18): a FUSE write a dead daemon logged to a clone's
+  /// inherited file is replayed into the clone, never its origin. A clone keeps its origin's inode numbers, the origin's
+  /// prefix in their top bits, for every file it inherits, and the replay found its volume by that prefix. Do: on a
+  /// shard, a volume whose file "f" holds "origin", snapshotted and cloned; replay a logged write of "clone!" at offset 0
+  /// of the clone's "f", through the clone, as the successor of a daemon that served it would. Expect: the clone's "f"
+  /// reads "clone!" and the origin's still "origin", the inode carrying the origin's prefix (non-vacuous). Before, the
+  /// write went to the origin, the clone kept "origin" and lost its write.
+  #[cfg(target_os = "linux")]
+  #[test]
+  fn a_replayed_write_to_a_clones_inherited_file_lands_in_the_clone() {
+    let (origin_reads, clone_reads, inherited_prefix, origin_prefix) =
+      crate::daemon::audit_on_shard(|state| {
+        let principal = Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 1234,
+        };
+        let super::ReplyBody::Created { id: origin } = super::dispatch(
+          state,
+          1,
+          &principal,
+          super::RequestBody::Create {
+            name: "replay-origin".to_owned(),
+            size: super::SizeClass::Dynamic { max: 1 << 20 },
+            names: super::NamePolicy::Exact,
+            require_locked: false,
+            base: None,
+          },
+        ) else {
+          panic!("the origin was created")
+        };
+        let origin_handle = *state.by_id.get(&super::to_db_volume(origin)).unwrap();
+        let super::ShardState { store, volumes, .. } = &mut *state;
+        let slot = volumes.get_mut(origin_handle).unwrap();
+        let root = slot.volume.root_inode(store).unwrap();
+        let file = slot.volume.create_file_no(store, root, "f", 0o644).unwrap();
+        slot.volume.write(store, file, 0, b"origin").unwrap();
+        let origin_prefix = slot.volume.prefix();
+        let super::ReplyBody::Snapshotted { id: snapshot, .. } = super::dispatch(
+          state,
+          1,
+          &principal,
+          super::RequestBody::Snapshot { volume: origin },
+        ) else {
+          panic!("the origin was snapshotted")
+        };
+        let reply = super::dispatch(
+          state,
+          1,
+          &principal,
+          super::RequestBody::Clone {
+            volume: origin,
+            snapshot,
+            name: "replay-clone".to_owned(),
+          },
+        );
+        let super::ReplyBody::Cloned { id: clone } = reply else {
+          panic!("the clone was made: {reply:?}")
+        };
+        let clone_handle = *state.by_id.get(&super::to_db_volume(clone)).unwrap();
+        let super::ShardState { store, volumes, .. } = &mut *state;
+        let clone_slot = volumes.get(clone_handle).unwrap();
+        let clone_root = clone_slot.volume.root_inode(store).unwrap();
+        let inherited = clone_slot
+          .volume
+          .lookup_no(store, clone_root, "f")
+          .unwrap()
+          .inode;
+        let record = crate::write_log::Record {
+          volume: clone.bytes,
+          inode: inherited.0,
+          offset: 0,
+          bytes: b"clone!".to_vec(),
+        };
+        assert!(
+          matches!(super::replay_one(state, &record), Some(Ok(_))),
+          "the logged write was replayed"
+        );
+        let read = |state: &mut super::ShardState, handle| {
+          let super::ShardState { store, volumes, .. } = &mut *state;
+          let slot = volumes.get(handle).unwrap();
+          let root = slot.volume.root_inode(store).unwrap();
+          let no = slot.volume.lookup_no(store, root, "f").unwrap().inode;
+          let mut bytes = [0u8; 6];
+          let read = slot.volume.read(store, no, 0, &mut bytes).unwrap();
+          bytes.get(..read).unwrap_or_default().to_vec()
+        };
+        (
+          read(state, origin_handle),
+          read(state, clone_handle),
+          inherited.prefix(),
+          origin_prefix,
+        )
+      });
+    assert_eq!(
+      inherited_prefix, origin_prefix,
+      "the clone's inherited file carries its origin's prefix"
+    );
+    assert_eq!(clone_reads, b"clone!", "the clone has its replayed write");
+    assert_eq!(origin_reads, b"origin", "the origin is untouched");
+  }
 
   /// A-64 (the relief). Do: on a shard with a reduced reserve, write a file large enough that rewriting it leaves the
   /// arena below the operation headroom; publish (the image names its blocks); rewrite it whole, so every old block's
