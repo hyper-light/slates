@@ -281,8 +281,9 @@ struct HeldFsync {
 
 /// Counter: `fsync` replies held until their live volume was durable.
 const LIVE_FSYNC_HELD: &str = "fuse.live_fsync_held";
-/// Counter: held `fsync` replies answered `EIO`: the wait passed, the volume was destroyed or its owner superseded, or
-/// the mount already held its bound of them.
+/// Counter: held `fsync` replies answered `EIO`: the wait gave up (a window with nothing heard, or its total bound;
+/// `slates_bridge_core::durable_bound`), the volume was destroyed or its owner superseded, or the mount already held its
+/// bound of them.
 const LIVE_FSYNC_REFUSED: &str = "fuse.live_fsync_refused";
 
 impl std::fmt::Debug for FuseMount {

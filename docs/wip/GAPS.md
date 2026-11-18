@@ -15285,7 +15285,7 @@ Mac, binaries built on `d61c3be2`):
   a panic injected into one honest client, the test failed in 12.85 s, where main's ran on past a 120 s bound
   (adacachy).
 
-### 2026-11-09: a healthy live `fsync` was refused at a wall-clock deadline under load — fixed (on main 2026-11-17); WinFsp's flush and a starved owner open
+### 2026-11-09: a healthy live `fsync` was refused at a wall-clock deadline under load — fixed (on main 2026-11-17); a starved owner open
 
 `a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it` answered the `fsync` made with every candidate
 running `EIO`: 1 in 6 runs on main, 2 in 9 on raft-7 (raft's report, load 36–145 on adacachy). Made to fail on demand on
@@ -15311,14 +15311,16 @@ had kept its own single deadline (`BridgeAccess::durable_bound`, `durable_heard`
   `SLATES_TEST_CLI=1`): red 3 of 3 and green 6 of 6 on adacachy2 (2026-11-09); the stopped-candidates flow still refuses
   after one window (1.0004–1.0017 s, 3 of 3). Owed: the supervisor's run of both live FUSE flows under load on main.
 
+WinFsp's held flush judges by the same rule since 2026-11-17 (`winfsp::settle_held`; it had answered
+`STATUS_UNEXPECTED_IO_ERROR` at one liveness budget from its hold, however its candidates were answering). jupiter takes
+no work, so it is unit-tested only through the shared rule; owed: a Windows run of `crates/cli/tests/live_winfsp.rs`
+(the supervisor), which still holds the suspended-candidates flush to its error.
+
 Open:
-- **WinFsp's held flush** (`winfsp.rs`, its `deadline_ns` from `live_ship::durable_wait_ns`) still answers
-  `STATUS_UNEXPECTED_IO_ERROR` at one liveness budget from its hold, however its candidates are answering. Owned by
-  g244-healthy-fsync-live, next.
 - **An owner starved past a window's end** judges that end when it next runs, possibly before it has folded the
   acknowledgements waiting on its sockets, so a window it could not observe may read as silent. raft's failing run shows
   the owner itself late (the stopped-candidates `fsync` gave up after 1.60 s against a 1.00 s bound). Owned by
-  g244-healthy-fsync-live, after WinFsp's flush.
+  g244-healthy-fsync-live, next.
 - The lanes to each holder are cut at a hard liveness budget (`fleet::live_budget`), and a cut holder waits for the record
   period or its session's return. Under load such a cut can outlast a window, which the wait's judgment cannot tell from
   silence.

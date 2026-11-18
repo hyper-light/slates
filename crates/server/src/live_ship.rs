@@ -498,9 +498,10 @@ pub(crate) fn durability_report(
   )
 }
 
-/// Derived: how long a held reply waits for durability before its transport answers that it is not (NFS `JUKEBOX`,
-/// FUSE and virtio-fs `EIO`, WinFsp `STATUS_UNEXPECTED_IO_ERROR`): [`DURABLE_WAIT_NS`]. Asked by those transports, so
-/// compiled where they are.
+/// Derived: the window a held reply's wait for durability is judged in (`slates_bridge_core::durable_bound`) before its
+/// transport answers that it is not durable (NFS `JUKEBOX`, FUSE and virtio-fs `EIO`, WinFsp
+/// `STATUS_UNEXPECTED_IO_ERROR`): [`DURABLE_WAIT_NS`]. Asked by those transports for their give-up records, so compiled
+/// where they are.
 pub(crate) const fn durable_wait_ns() -> u64 {
   DURABLE_WAIT_NS
 }

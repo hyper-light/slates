@@ -1,7 +1,7 @@
 # A healthy live `fsync` was refused at a wall-clock deadline under load
 
 - **Date:** 2026-11-09; on main 2026-11-17. **Status:** fixed (the FUSE `fsync`, an NFS stable write or `COMMIT`, a
-  Shards `FSYNC`, the virtio-fs device's `FSYNC`); WinFsp's held flush and a starved owner open (GAPS). **Design:** §4.10
+  Shards `FSYNC`, the virtio-fs device's `FSYNC`, WinFsp's held flush); a starved owner open (GAPS). **Design:** §4.10
   status "FUSE `fsync` at durability" and "The wait is judged by what it hears", A-200, AC-8.3. **Found by:** raft-7's
   run of the live fleet suite; ordered by the supervisor ahead of older items, since a spurious `EIO` on `fsync` tells an
   application its data is lost. Diagnosed and built by bug-sweep (`agents/bug-sweep-2` 50fa8c56, and the total bound
@@ -87,6 +87,8 @@ Shards refusals told the application its data might be lost. No acknowledged dat
   reply, begun by its owner and judged against the volume's heard count. A guest's `FSYNC` whose volume heard progress
   every half window and became durable after a window and a half is answered `0`
   (`a_guests_fsync_of_a_live_volume_waits_while_its_volume_keeps_progressing`).
-- **WinFsp's held flush** still gives up at one deadline: open, g244-healthy-fsync-live's next piece.
+- **WinFsp's held flush: fixed 2026-11-17.** It held a `deadline_ns` of one liveness budget from its hold; it now
+  holds a `DurableBound` and is judged by the same rule (`winfsp::settle_held`), its give-up logged with
+  `live_ship::durability_report`. Owed: a Windows run of `crates/cli/tests/live_winfsp.rs`.
 - **An owner starved past a window's end** may judge that window before it reads the acknowledgements waiting for it:
-  open, g244-healthy-fsync-live's piece after WinFsp's.
+  open, g244-healthy-fsync-live's next piece.

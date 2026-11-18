@@ -6236,8 +6236,9 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > progress while its own position is never acknowledged would start windows without end (banned item 8). The rule is
 > one pure module every transport judges by (`slates_bridge_core::durable_bound`): the FUSE `fsync`
 > (`fuse::settle_held`), the shared wait of an NFS stable write or `COMMIT` and a Shards `FSYNC`
-> (`live_ship::wait_durable`), and the virtio-fs device's `FSYNC` (`slates_bridge_virtiofs`'s device, its wait begun
-> and judged through `BridgeAccess::durable_bound` and `durable_heard`), which had kept a single deadline of its own.
+> (`live_ship::wait_durable`), the virtio-fs device's `FSYNC` (`slates_bridge_virtiofs`'s device, its wait begun and
+> judged through `BridgeAccess::durable_bound` and `durable_heard`), which had kept a single deadline of its own, and
+> WinFsp's held flush (`winfsp::settle_held`), which had too.
 > Stopped candidates acknowledge nothing and are still given up after one window; candidates that answer slowly keep
 > the wait going. A refusal logs what durability still lacked and which rule ended the wait
 > (`live_ship::durability_report`). Red first: with both candidates cycling stopped 700 ms and running 100 ms,
@@ -6245,9 +6246,8 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > 1.0013–1.0037 s, 3 of 3; after, 6 of 6 succeeded in 1.50–1.59 s (adacachy2, 2026-11-09). A guest's `FSYNC` whose
 > volume hears an acknowledgement every half window is answered `0` after a window and a half
 > (`a_guests_fsync_of_a_live_volume_waits_while_its_volume_keeps_progressing`), where the device's single deadline
-> answered `EIO` at one window. Open (GAPS): WinFsp's held flush still judges by one deadline, and an owner starved past
-> a window's end may judge it before reading the acknowledgements waiting for it
-> (`docs/bugs/2026-11-09-a-healthy-live-fsync-was-refused-at-a-wall-clock-deadline.md`).
+> answered `EIO` at one window. Open (GAPS): an owner starved past a window's end may judge it before reading the
+> acknowledgements waiting for it (`docs/bugs/2026-11-09-a-healthy-live-fsync-was-refused-at-a-wall-clock-deadline.md`).
 >
 > **Every other durability claim (2026-11-05, the sibling sweep of FUSE `fsync`).** Each place a client is told data is
 > durable on a live volume now waits for the position its barrier published, and the same failing test holds each to
