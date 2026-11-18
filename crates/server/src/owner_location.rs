@@ -100,7 +100,7 @@ impl Query {
   /// this node does not serve the object, and the first owner is this node itself only for an object it lost to a
   /// successor (A-334, A-338), which only the location round can find. Asked on the control shard, where the council's
   /// configuration is. A holder of a moved object's copy follows the exception in its routing
-  /// (`crate::moves::follow_moved_objects`), so the two agree wherever both are known.
+  /// (`crate::moves::follow_moved_object`), so the two agree wherever both are known.
   pub(crate) fn known_owner(
     self,
     state: &ShardState,
