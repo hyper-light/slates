@@ -22329,7 +22329,8 @@ dimension was read from its history), GAPS, `docs/bugs/2026-11-08-a-status-with-
   after every visit, every second, or never; replaced, removed and refused entries)
   (`a_drift_walk_a_page_at_a_time_lists_what_a_status_lists`).
 - **Every reader says which:** `slates status --drift` walks the paged read; the text counts all; MCP and the SDKs carry
-  the count. An SDK binding for the paged read is owed.
+  the count. Both SDKs read the whole drift with `drifted(volume)` (2026-11-17, goal g247): typed entries (`path`,
+  `kind`), the unverified paths and the oversized count.
 - **A list a verb's own reply carries (2026-11-17, goal g247):** reproduced by use first, each refused "reply too large
   for the bulk area" at 400 entries (`crates/server/tests/reply_bounds.rs`): an advance and a rewitness after they had
   taken effect, a presentation after it was recorded, and a granted landing's `LandingConflict`, in whose place the

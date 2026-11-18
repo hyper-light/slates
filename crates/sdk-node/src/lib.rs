@@ -108,6 +108,24 @@ fn parse_volume(hex: &str) -> Result<VolumeId> {
   Ok(VolumeId { bytes })
 }
 
+/// One drifted entry of an overlay (§4.15 "Drift"): its path and what the disk did to it (`Modified`, `Deleted`,
+/// `Replaced`, `TypeChanged`).
+#[napi(object)]
+pub struct DriftEntryJs {
+  pub path: String,
+  pub kind: String,
+}
+
+/// An overlay's whole drift (§4.4 `status`, A-267), read a page at a time: every entry the disk changed after the
+/// volume witnessed it, every one whose re-check the host refused now (`unverified`), and the entries too long for any
+/// reply (`oversized`), which no page carries.
+#[napi(object)]
+pub struct DriftedResult {
+  pub drifted: Vec<DriftEntryJs>,
+  pub unverified: Vec<String>,
+  pub oversized: u32,
+}
+
 /// A volume's status as a plain JS object (§4.4) — the fields `slates status` prints, with napi's
 /// camelCase keys (`referencedBytes`, `nfsPort`, `mirrorAgeNs`, `hostEpoch`, …). Ids cross as hex; every
 /// `u64` count is range-checked to a JS-safe integer before the object is built; the placement (§4.8,
@@ -747,6 +765,27 @@ impl Client {
     let id = parse_volume(&volume)?;
     let report = self.inner.status(id).map_err(refusal)?;
     volume_status(report)
+  }
+
+  /// Reads an overlay's whole drift (§4.4 `status`, A-267) as a [`DriftedResult`]: a status carries the first drifted
+  /// entries that fit beside its other fields and counts the rest (`driftedElided`); this reads every one, a page at a
+  /// time, each page re-checking the entries it passes against the disk.
+  #[napi]
+  pub fn drifted(&mut self, volume: String) -> Result<DriftedResult> {
+    let id = parse_volume(&volume)?;
+    let whole = self.inner.drifted(id).map_err(refusal)?;
+    Ok(DriftedResult {
+      drifted: whole
+        .drifted
+        .into_iter()
+        .map(|entry| DriftEntryJs {
+          path: entry.path,
+          kind: format!("{:?}", entry.kind),
+        })
+        .collect(),
+      unverified: whole.unverified,
+      oversized: whole.oversized,
+    })
   }
 
   // The async surface's low-level primitives (R6, D-19): begin-and-spin returns the request id word

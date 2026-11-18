@@ -329,9 +329,9 @@
 >   (`docs/bugs/2026-11-08-a-principals-grants-outgrew-one-reply-and-were-kept-for-good.md`).
 > - **A status's drift: the first that fit, a count, and a paged read (A-267, 2026-11-08).** A status with 600 drifted
 >   entries was refused; it now carries what fits beside its other fields and `drifted_elided`, `Drifted` reads them all a
->   page at a time, and `slates status --drift` walks it. Since 2026-11-17 (goal g247) a page re-checks only the
->   witnessed entries it passes, in inode order under a slice of the shard's step, where each page re-read the whole
->   status. **Owed:** an SDK binding for the paged read
+>   page at a time, `slates status --drift` walks it, and both SDKs read it whole with `drifted(volume)`. Since
+>   2026-11-17 (goal g247) a page re-checks only the witnessed entries it passes, in inode order under a slice of the
+>   shard's step, where each page re-read the whole status
 >   (`docs/bugs/2026-11-08-a-status-with-much-drift-outgrew-one-reply.md`).
 > - **A list a verb's own reply carries: fixed (A-267, 2026-11-17, goal g247).** Reproduced at 400 entries, each refused
 >   "reply too large for the bulk area": an advance and a rewitness after taking effect, a presentation after it was

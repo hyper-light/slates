@@ -137,6 +137,8 @@ test('lifecycle round trip over a live daemon', async (t) => {
     assert.ok(status.mirrorAgeNs == null, 'no mirror on a laptop');
     assert.ok('nfsPort' in status, 'the status carries the NFS port field');
     assert.deepEqual(status.drifted, []);
+    // drifted → every drifted entry, past what a status carries (A-267): a scratch volume has none.
+    assert.deepEqual(client.drifted(volume), { drifted: [], unverified: [], oversized: 0 });
 
     // list → the volume appears with its fields (a scratch volume is not an overlay).
     const entry = client.list().find((v) => v.id === volume);

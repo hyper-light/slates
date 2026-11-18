@@ -372,6 +372,28 @@ impl Client {
     status_dict(py, report)
   }
 
+  /// Reads an overlay's whole drift (§4.4 `status`, A-267) as a dict: `drifted`, a list of dicts each with its `path`
+  /// and its `kind` (`"Modified"`, `"Deleted"`, `"Replaced"`, `"TypeChanged"`); `unverified`, the paths whose re-check
+  /// the host refused now; and `oversized`, the entries too long for any reply. A status carries the first drifted
+  /// entries that fit beside its other fields and counts the rest (`drifted_elided`); this reads every one, a page at a
+  /// time, each page re-checking the entries it passes against the disk.
+  fn drifted(&mut self, py: Python<'_>, volume: &str) -> PyResult<Py<PyDict>> {
+    let id = parse_volume(volume)?;
+    let whole = self.inner.drifted(id).map_err(refusal)?;
+    let dict = PyDict::new_bound(py);
+    let mut drifted: Vec<Py<PyDict>> = Vec::with_capacity(whole.drifted.len());
+    for entry in whole.drifted {
+      let d = PyDict::new_bound(py);
+      d.set_item("path", entry.path)?;
+      d.set_item("kind", format!("{:?}", entry.kind))?;
+      drifted.push(d.into());
+    }
+    dict.set_item("drifted", drifted)?;
+    dict.set_item("unverified", whole.unverified)?;
+    dict.set_item("oversized", whole.oversized)?;
+    Ok(dict.into())
+  }
+
   /// Lists the daemon's volumes (§4.4) as a list of dicts — each with its `id` (hex), `name`, the byte
   /// accounting (`referenced_bytes`, `unique_bytes`), whether it is an `overlay` of a host directory, whether it is
   /// `live_shipped` (A-200), and `not_recovered`: `None`, or for a volume recovery could not rebuild, its cause's kind

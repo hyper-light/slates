@@ -26,6 +26,20 @@ export interface VolumeStatus {
   hostEpoch: number
 }
 
+/** One drifted entry of an overlay: its path and what the disk did to it. */
+export interface DriftEntry {
+  path: string
+  kind: 'Modified' | 'Deleted' | 'Replaced' | 'TypeChanged'
+}
+
+/** An overlay's whole drift, read a page at a time (A-267): `unverified` holds the entries whose re-check the host
+ * refused now, `oversized` counts the entries too long for any reply. */
+export interface DriftedResult {
+  drifted: DriftEntry[]
+  unverified: string[]
+  oversized: number
+}
+
 /** A volume in a listing. `notRecovered` is null, or for a volume recovery could not rebuild its cause's kind. */
 export interface VolumeEntry {
   id: string
@@ -72,6 +86,8 @@ export class Client {
   create(name: string, sizeBytes: number, dynamic?: boolean, fold?: boolean, requireLocked?: boolean, base?: string): string
   snapshot(volume: string): number
   status(volume: string): VolumeStatus
+  /** Every drifted entry of an overlay, past what a status carries (A-267). */
+  drifted(volume: string): DriftedResult
   list(): VolumeEntry[]
   resize(volume: string, sizeBytes: number, dynamic?: boolean): void
   destroy(volume: string): void
