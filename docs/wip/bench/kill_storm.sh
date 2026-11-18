@@ -19,8 +19,9 @@ mount -t nfs -o "vers=4.2,proto=tcp,port=$PORT,hard,timeo=600" "127.0.0.1:$EXPOR
 # Durable by the file's own fsync, never a global `sync`, which waits on every filesystem of the host, and one stuck
 # elsewhere hangs it forever (2026-10-08).
 head -c 8388608 /dev/urandom > /tmp/payload; dd if=/tmp/payload of=/mnt/v/payload bs=1M conv=fsync status=none
-# KILLS kills GAP seconds apart (default 8 and 0.1); enough of them out-kill the derived restart allowance (the
-# recovery budget over the longest start), which is the crash loop A-119 backs off from rather than giving up on.
+# KILLS kills GAP seconds apart (default 8 and 0.1); the second that lands before a successor serves is a crash loop
+# (A-311: failed starts in a row), which A-119 backs off from rather than giving up on. Until 2026-11-17 a loop was a
+# count of restarts in a window of the recovery budget, and A-119's recorded figures were measured under it.
 for n in $(seq 1 "${KILLS:-8}"); do
   P=$(pgrep -f "slates --instance ks daemon" | head -1); [ -n "$P" ] && kill -9 "$P"; sleep "${GAP:-0.1}"
 done
