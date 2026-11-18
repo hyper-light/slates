@@ -2498,6 +2498,24 @@ fn serve_here(
   }
 }
 
+/// The reply [`run_recorded`] gives, with its completion recorded in the verb's own transaction unless it has none yet:
+/// a `deferred` reply's completion follows the fleet commit or the live volume's durability it waits for, and a verb
+/// that never started (answered `Overloaded`) records none, so a resend under its id runs the verb.
+fn recorded_unless_deferred(
+  state: &mut ShardState,
+  (origin, id): (u64, RequestId),
+  deferred: bool,
+  reply: ReplyBody,
+) -> ReplyBody {
+  if deferred {
+    reply
+  } else if not_started(&reply) {
+    unrecorded_not_started(state, reply)
+  } else {
+    record_completion(state, origin, id, reply)
+  }
+}
+
 /// Runs a verb on this shard with its effects and its completion record in one durable step
 /// (`Db::begin` … `commit`: one log record, so a crash leaves both or neither, AC-2.3).
 fn run_recorded(
@@ -2556,13 +2574,7 @@ fn run_recorded(
   let (live_target, destroy_target) =
     replicated_waits(state, live_volume.filter(|_| !deferred), label, &reply);
   deferred |= live_target.is_some() || destroy_target.is_some();
-  let reply = if deferred {
-    reply
-  } else if not_started(&reply) {
-    unrecorded_not_started(state, reply)
-  } else {
-    record_completion(state, origin, id, reply)
-  };
+  let reply = recorded_unless_deferred(state, (origin, id), deferred, reply);
   let append = state.tracer.open_within(
     &op.context(),
     Chokepoint::LogAppend,

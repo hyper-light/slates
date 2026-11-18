@@ -355,9 +355,13 @@
 > be equal, while Part 6 asks them 0); it is now `Failed` on every leg, red-checked first. Subversion was absent from
 > every machine this change could use, so its workload runs first in CI. CI's first run of it (run 44247840584, ubuntu,
 > 2026-11-18) held the host gate red: two runs differed at `repo/db/rep-cache.db`, FSFS's representation cache, an
-> SQLite file whose page bytes are not what Subversion promises. It is now compared by its rows (printed where `sqlite3`
-> is on the `PATH`) and left out of the byte comparison with that reason, on every leg as on the host; the revisions it
-> caches (`db/revs`, `db/revprops`, `db/current`) stay byte-compared. Locks: every leg runs a workload's two sides
+> SQLite file whose page bytes are not what Subversion promises. Compared by its rows, the next run (44252249999) found
+> the rows differing in one column: `d/b.txt`'s content was item 3 of revision 2 in one run and item 4 in the next
+> (host against host on ubuntu, host against mount on macOS), so FSFS's revision files lay their items out in an order
+> two runs do not share. Both are now left out of the byte comparison with that reason, on every leg as on the host:
+> every revision's content is printed (the dump's checksum, `svnlook tree`, `svn log -v`) and verified, the cache's rows
+> print each content's hash, first revision and size where `sqlite3` is on the `PATH`, and the revisions' properties
+> (`db/revprops`) and the youngest revision (`db/current`) stay byte-compared. Locks: every leg runs a workload's two sides
 > under one kernel, whose own locks bind SQLite's, FSFS's and Mercurial's; served locks matter only between kernels.
 > **Open:** (1) the runs over each mount, which are the supervisor's (CLAUDE.md §8): any difference they find is a gap
 > to fix failing-test-first; (2) ~~the Windows WinFsp roster~~ **built 2026-11-17 (A-300, above)**: WinFsp's driver
@@ -2926,6 +2930,18 @@
 >   mutated test fails at its own assertion; the agent's own grant issued, `Ok(1)`). **Still open:** a person at a bare
 >   CLI, with no launcher, has no approval verb of their own; one would read the launcher's secret from a descriptor
 >   the person passes, never an argument or the environment.
+> - **The server in its own container lands into the volume attached to it (2026-11-18, fs-server plan step 2).** The
+>   container leg of 2026-11-05 stopped at the grant; it now lands. `fs_server.rs`'s `in_a_container` (Linux; gated
+>   `SLATES_TEST_CLI=1` and `SLATES_TEST_CONTAINER=1`, set in CI's Linux CLI step): the server node is `slates anchor` in
+>   an `ubuntu:24.04` container on a Docker network of its own, its launcher's secret on standard input through
+>   `StartSpec::anchor_command` with `docker run` as the program, its projects a bind-mounted volume; the client node runs
+>   on the host at the bridge's gateway. The launcher's role runs inside the container (the test binary re-invoked
+>   there, the secret on its standard input), since a launcher reaches its instance only where it runs. Under ask the
+>   land answers the approval request and the host reads the project unchanged until the launcher approves exactly the
+>   presented manifest (4 written, none failed); under bypass the one `slates land` writes 4 entries; the host reads every
+>   merged byte from its side of the attached volume. 3 of 3 runs on GitHub's ubuntu runner (run 44254100848, kernel 7.0,
+>   Docker 29.4); red with the launcher's approval taken away (fails at the asked project's read) and with bypass
+>   replaced by ask (the one land writes nothing).
 > - **Remote attach is owed (§4.10):** another node's `attach` is refused `NotFound`, so a client on another node
 >   pushes through a green, never through a write attachment.
 > - **A self-signed fleet certificate must be a leaf.** OpenSSL's default (`CA:TRUE`) is refused
