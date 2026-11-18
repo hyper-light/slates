@@ -427,6 +427,8 @@ pub enum Unsupported {
   /// A merge or a landing that carries a signature: the daemon's verifier for signed work is not in this build
   /// ([`crate::signed`]). Nothing was sent.
   SignedWork,
+  /// The TLS provider's secure random refused, so no launcher secret could be made ([`crate::LauncherSecret::generate`]).
+  SecureRandom,
 }
 
 /// What is wrong with the request.
@@ -1114,6 +1116,9 @@ pub enum IssuerFault {
   Attach(slates_anchor::AnchorError),
   /// The daemon has not published an issuer secret yet (an all-zero secret is no authority): it is still starting.
   NotPublished,
+  /// This authority is the launcher's secret (A-299), which proves grants, merges, policies, enrollments and
+  /// revocations; confirming a consensus recovery needs the issuer secret on the anchor's segment.
+  LauncherCannotRecover,
 }
 
 impl fmt::Display for IssuerFault {
@@ -1127,6 +1132,9 @@ impl fmt::Display for IssuerFault {
       Self::Malformed { reason } => write!(f, "the anchor's handoff is malformed: {reason}"),
       Self::Attach(error) => write!(f, "attaching the anchor: {error}"),
       Self::NotPublished => f.write_str("the daemon has published no issuer secret yet"),
+      Self::LauncherCannotRecover => f.write_str(
+        "the launcher's secret cannot confirm a consensus recovery; that needs the anchor's segment",
+      ),
     }
   }
 }
@@ -1172,6 +1180,11 @@ pub enum StartFault {
     /// The OS error number, when the OS gave one.
     errno: Option<i32>,
   },
+  /// The launcher's record could not be made ready on the anchor's standard input (A-299): the pipe refused.
+  Launcher {
+    /// The OS error number, when the OS gave one.
+    errno: Option<i32>,
+  },
 }
 
 impl fmt::Display for StartFault {
@@ -1192,6 +1205,11 @@ impl fmt::Display for StartFault {
       ),
       Self::Wait { errno } => write!(f, "waiting on the anchor: {}", errno_text(*errno)),
       Self::Stop { errno } => write!(f, "stopping the anchor: {}", errno_text(*errno)),
+      Self::Launcher { errno } => write!(
+        f,
+        "handing the anchor the launcher's secret: {}",
+        errno_text(*errno)
+      ),
     }
   }
 }
