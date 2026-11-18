@@ -1,0 +1,29 @@
+# DIAG (not for main): the Linux root pjdfstest lane over the shrunk native-linux-fuse list, for its record.
+name: diag-integrator-fuse-list
+on:
+  push:
+    branches: ['diag-integrator-fuse-list-*']
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  pjdfstest-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Suite tools (Linux)
+        run: sudo apt-get update && sudo apt-get install -y strace nfs-common fuse3
+      - name: Grant user_allow_other (Linux)
+        run: |
+          grep -qx user_allow_other /etc/fuse.conf 2>/dev/null || echo user_allow_other | sudo tee -a /etc/fuse.conf
+      - name: pjdfstest over the Linux lane, judged against the tracked list
+        run: cargo xtask conformance run --suite pjdfstest --records target/conformance-records --scratch target/conformance-scratch --keep
+      - name: Upload the records
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-records-ubuntu-latest
+          path: target/conformance-records
