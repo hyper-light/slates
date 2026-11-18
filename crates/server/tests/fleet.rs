@@ -3057,93 +3057,63 @@ fn start_mesh_unbootstrapped(
     slates_db::register::RegionId,
   >,
 ) -> Vec<Daemon> {
+  let pid = std::process::id();
+  let n = hosts.len();
   // Each node's stable anchor (the machine-identity hash its member ids derive from, task #22), so every
   // peer entry names the anchor the announced ids are validated against.
   let anchors: Vec<HostId> = nodes
     .iter()
     .map(|(profile, _, _)| anchor_of(profile))
     .collect();
-  let mesh = Mesh {
-    anchors: &anchors,
-    hosts,
-    certs,
-    serve,
-    f,
-    shards,
-    regions,
-    mirrors,
-  };
-  nodes
+  let daemons: Vec<Daemon> = nodes
     .into_iter()
     .take(started)
     .enumerate()
-    .map(|(i, node)| start_mesh_node(&mesh, i, node))
-    .collect()
-}
-
-/// One manifest naming every node of a mesh: each node's anchor, member id, certificate and serve pair, the fleet's
-/// fault tolerance and shards, and its regions and mirrors ([`start_mesh_node`]).
-struct Mesh<'a> {
-  anchors: &'a [HostId],
-  hosts: &'a [HostId],
-  certs: &'a [rustls::pki_types::CertificateDer<'static>],
-  serve: &'a [(u16, u16)],
-  f: u32,
-  shards: u16,
-  regions: &'a std::collections::BTreeMap<HostId, slates_db::register::RegionId>,
-  mirrors:
-    &'a std::collections::BTreeMap<slates_db::register::RegionId, slates_db::register::RegionId>,
-}
-
-/// Starts node `i` of `mesh`: it serves on its own pair `serve[i]` and dials every other node `j` at `serve[j]`.
-fn start_mesh_node(
-  mesh: &Mesh<'_>,
-  i: usize,
-  (profile, host, identity): (MachineProfile, HostId, Identity),
-) -> Daemon {
-  let pid = std::process::id();
-  let n = mesh.hosts.len();
-  let peers: Vec<FleetPeer> = (0..n)
-    .filter(|&j| j != i)
-    .map(|j| FleetPeer {
-      anchor: mesh.anchors[j],
-      host: mesh.hosts[j],
-      address: loopback(mesh.serve[j].0).into(),
-      record_address: loopback(mesh.serve[j].1).into(),
-      certificate: mesh.certs[j].clone(),
+    .map(|(i, (profile, host, identity))| {
+      let peers: Vec<FleetPeer> = (0..n)
+        .filter(|&j| j != i)
+        .map(|j| FleetPeer {
+          anchor: anchors[j],
+          host: hosts[j],
+          address: loopback(serve[j].0).into(),
+          record_address: loopback(serve[j].1).into(),
+          certificate: certs[j].clone(),
+        })
+        .collect();
+      let member_peers: Vec<HostId> = (0..n).filter(|&j| j != i).map(|j| hosts[j]).collect();
+      let instance = format!("fleet3-{}-{pid}", host.0);
+      let config =
+        DaemonConfig::derive(&profile, &instance, Some(shards)).with_fleet(FleetMembership {
+          quorum: Quorum { f },
+          peers: member_peers,
+          host,
+          origin_anchor: anchor_of(&profile),
+          domains: std::collections::BTreeMap::new(),
+          regions: regions.clone(),
+          durability: None,
+          region_mirrors: mirrors.clone(),
+        });
+      let transport = FleetTransport {
+        identity,
+        name: NAME.to_owned(),
+        advertise: loopback(serve[i].0).into(),
+        enrollment_roots: Vec::new(),
+        serve: held_serve_sockets(loopback(serve[i].0), loopback(serve[i].1)),
+        peers,
+        resolver: None,
+      };
+      Daemon::start_with_fleet(
+        &profile,
+        config,
+        SegmentSource::Create {
+          name: common::fixture_object("slates-seg", &format!("fleet3-{}", host.0)),
+        },
+        Some(transport),
+      )
+      .expect("the fleet daemon starts")
     })
     .collect();
-  let member_peers: Vec<HostId> = (0..n).filter(|&j| j != i).map(|j| mesh.hosts[j]).collect();
-  let instance = format!("fleet3-{}-{pid}", host.0);
-  let config =
-    DaemonConfig::derive(&profile, &instance, Some(mesh.shards)).with_fleet(FleetMembership {
-      quorum: Quorum { f: mesh.f },
-      peers: member_peers,
-      host,
-      origin_anchor: anchor_of(&profile),
-      domains: std::collections::BTreeMap::new(),
-      regions: mesh.regions.clone(),
-      durability: None,
-      region_mirrors: mesh.mirrors.clone(),
-    });
-  let transport = FleetTransport {
-    identity,
-    name: NAME.to_owned(),
-    advertise: loopback(mesh.serve[i].0).into(),
-    enrollment_roots: Vec::new(),
-    serve: held_serve_sockets(loopback(mesh.serve[i].0), loopback(mesh.serve[i].1)),
-    peers,
-    resolver: None,
-  };
-  Daemon::start_with_fleet(
-    &profile,
-    config,
-    SegmentSource::Create {
-      name: common::fixture_object("slates-seg", &format!("fleet3-{}", host.0)),
-    },
-    Some(transport),
-  )
-  .expect("the fleet daemon starts")
+  daemons
 }
 
 /// A new test deployment explicitly creates the root and one council per declared region.
@@ -7877,125 +7847,6 @@ fn a_node_whose_peers_never_answer_is_never_meshed() {
 /// Shape: the coordinator periods [`a_node_whose_peers_never_answer_is_never_meshed`] waits after start before it asks
 /// again: ten liveness budgets of one second at the 100 ms period, past the detector's condemnation of a silent peer.
 const SILENT_PEER_PERIODS: u64 = 100;
-
-/// Shape: how long the late peers of
-/// [`a_peer_started_a_probe_timeout_after_its_first_dial_is_linked_within_formations_budget`] stay unstarted once the
-/// first node's handshake call to each has begun: past one initial probe timeout (the transport's RFC 9002 PTO before
-/// any RTT sample), so the call's first flight and at least one resend wait in the late peers' held sockets, which
-/// nothing reads until they start — as in every mesh this file starts one node after another.
-const LATE_PEER_START_NS: u64 = slates_transport::rtt::INITIAL_PTO_NS;
-
-/// §4.8, §4.10a: the record plane's dial to a peer that starts after it (the formation failure of 2026-11-17 on PR #10's
-/// macOS run at 44018ec4). Do: start the first node of a three-node manifest alone; once its record link to each peer has
-/// been inside one handshake call for longer than [`LATE_PEER_START_NS`], start the other two, and bootstrap. Expect
-/// each node to hold a record session to each peer, and the initial membership to commit, within formation's own budget
-/// (`initial_consensus_periods`). In that macOS run the bootstrapper of a mesh started one node after another held no
-/// record session to one peer for the whole 96-period settle: no dial refusal counted (its first handshake call still
-/// running; one call waits up to 32 probe timeouts for a silent peer), `fleet.seal.pair_recipient_unknown` once a period,
-/// and the council never seated a second voter.
-#[test]
-fn a_peer_started_a_probe_timeout_after_its_first_dial_is_linked_within_formations_budget() {
-  let _serial = serialize_fleet_tests();
-  let names = ["a", "b", "c"];
-  let mut nodes: Vec<(MachineProfile, HostId, Identity)> =
-    names.iter().map(|name| fleet_node(name)).collect();
-  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
-  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
-  let anchors: Vec<HostId> = nodes
-    .iter()
-    .map(|(profile, _, _)| anchor_of(profile))
-    .collect();
-  let (_serve_lease, serve) = mesh_serve_ports(names.len());
-  let regions = std::collections::BTreeMap::new();
-  let mirrors = std::collections::BTreeMap::new();
-  let mesh = Mesh {
-    anchors: &anchors,
-    hosts: &hosts,
-    certs: &certs,
-    serve: &serve,
-    f: 1,
-    shards: 1,
-    regions: &regions,
-    mirrors: &mirrors,
-  };
-  let late = nodes.split_off(1);
-  let first = start_mesh_node(&mesh, 0, nodes.remove(0));
-  // The late start's non-vacuity: the first node's links to both late peers each inside one handshake call for longer
-  // than a probe timeout, its flights waiting in sockets nobody reads. Paced by wall time, not the coordinator's periods,
-  // which an unbootstrapped node does not turn.
-  let late_hosts: Vec<HostId> = hosts.iter().skip(1).copied().collect();
-  let dialing_long = || {
-    first.fleet_record_dials().is_ok_and(|dials| {
-      late_hosts.iter().all(|late| {
-        dials.iter().any(|dial| {
-          dial.peer == *late && dial.call_for_ns.is_some_and(|ran| ran > LATE_PEER_START_NS)
-        })
-      })
-    })
-  };
-  let began = Instant::now();
-  let (_pace_sender, pace) = std::sync::mpsc::channel::<()>();
-  while !dialing_long() && began.elapsed() < formation_deadline() {
-    let _ = pace.recv_timeout(Duration::from_nanos(HEARTBEAT_NS));
-  }
-  assert!(
-    dialing_long(),
-    "the first node dialed both late peers for longer than a probe timeout before they started: {:?}",
-    first.fleet_record_dials()
-  );
-  let mut daemons = vec![first];
-  daemons.extend(
-    late
-      .into_iter()
-      .enumerate()
-      .map(|(k, node)| start_mesh_node(&mesh, k + 1, node)),
-  );
-  bootstrap_mesh(&daemons, &hosts, &regions);
-  let observed: Vec<&Daemon> = daemons.iter().collect();
-  let members: Vec<HostId> = daemons
-    .iter()
-    .map(|daemon| daemon.member_identity().unwrap())
-    .collect();
-  let linked = poll_for_periods(
-    &observed,
-    formation_deadline(),
-    initial_consensus_periods(&observed, Quorum { f: 1 }),
-    || {
-      all_hold(daemons.iter().zip(&members).map(|(daemon, own)| {
-        daemon.fleet_record_links().map(|links| {
-          members
-            .iter()
-            .filter(|peer| *peer != own)
-            .all(|peer| links.iter().any(|(host, _)| host == peer))
-        })
-      }))
-    },
-  );
-  let views: Vec<String> = daemons
-    .iter()
-    .map(|daemon| {
-      format!(
-        "host={:?} record_links(host, out)={:?} record_dials={:?} pending_discovery={:?} demux={:?} refusals={:?}",
-        daemon.member_identity(),
-        daemon.fleet_record_links(),
-        daemon.fleet_record_dials(),
-        daemon.fleet_pending_discovery(),
-        daemon.fleet_demux_counters(),
-        daemon.fleet_refusals(),
-      )
-    })
-    .collect();
-  assert!(
-    linked,
-    "every node holds a record session to each peer within formation's budget: {}",
-    views.join("; ")
-  );
-  settle_initial_consensus(&daemons, &hosts, &regions, Quorum { f: 1 });
-  for daemon in daemons {
-    daemon.stop();
-  }
-}
 
 /// Polls until every daemon's **direct probe mesh** has formed — each node has a live probe session to
 /// each of its peers ([`Daemon::fleet_meshed`]) — or fails at the formation deadline naming who is still

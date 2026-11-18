@@ -1,26 +1,23 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
-> **A record link's first dial to a peer started after it never completed (2026-11-17, §4.8, §4.10a; OPEN).** The
-> landing's PR #10 macOS run at `44018ec4` (job 134436246591) failed
-> `a_campaign_waits_for_a_voters_session_that_is_out_for_a_moment`: for the whole 96-period settle (9.7 s) the council
-> kept its one voter, the bootstrapper. The bootstrapper held no record session to one peer (its `fleet_record_links`
-> named only the other; each other node named both), so it never had that peer's seal key:
-> `fleet.seal.pair_recipient_unknown` once a period, 39 at period 40 and 96 at period 97. It counted no dial failure of
-> any kind in about 20 s, so its first handshake call was still running: one call resends its first flight up to
-> `MAX_HANDSHAKE_RETRANSMITS` (32) times, one initial probe timeout (666 ms) apart, about 21 s, longer than formation's
-> whole budget, and the link can neither redial nor report until it returns. The peer's record socket served the third
-> node's dial, and the peer's own dial to the bootstrapper completed. The bootstrapper is node 0 and dials every peer at
-> once (`DirectContact::Forming`), while the test's port lease holds its peers' record ports bound and unread, so its
-> first flights wait in a peer's socket until that peer's daemon adopts it. Which step on the peer's side then left the
-> dial unanswered, nothing recorded. Main showed it in none of 28 macOS fleet runs; the landing, in 1 of 4. Now the
-> status reports each record link's dial (`fleet.dial.record.dialing`, `.longest_call_ms`, `.longest_enroll_ms`,
-> `.calls`) and each serve socket's demultiplexer (`fleet.serve.opened`, `.setup_refused`, `.peer_sessions_refused`,
-> `.peers_refused`, `.high_water`), and the fleet tests' formation-failure message carries both, with the links still
-> waiting on discovery. `a_peer_started_a_probe_timeout_after_its_first_dial_is_linked_within_formations_budget` pins
-> it: two of three nodes start only once the first node's dial to each has run past one probe timeout, and every node
-> must hold a record session to each peer within formation's period budget. The 2026-11-05 entry's unreproduced
-> "owner with no session to its only reachable candidate for 249 tries" (below) has the same shape. **Owed:** the fix,
-> chosen by the step this test's red names, every bound derived from the probe timeout and formation's budget.
+> **A record link's dial to one peer never completed while a fleet formed, and its council kept one voter (2026-11-17,
+> §4.8, §4.10a; OPEN, unreproduced).** The landing's PR #10 macOS run at `44018ec4` (job 134436246591) failed
+> `a_campaign_waits_for_a_voters_session_that_is_out_for_a_moment` inside `start_mesh`'s initial settle: for the whole
+> 96-period settle (9.7 s) the council kept its one voter, the bootstrapper. The bootstrapper held no record session
+> to the last node started (its `fleet_record_links` named only the other; each other node named both), so it never had
+> that peer's seal key: `fleet.seal.pair_recipient_unknown` once a period, 96 at period 97. No node counted a dial,
+> accept, serve, link or discovery failure, so the bootstrapper's handshake call to that peer was still running, and
+> nothing recorded where it waited. Measured rate: 1 failing macOS fleet suite in 32 (the landing's 4 runs and main's
+> 28), each suite starting 80 formations (`settle_initial_consensus`). Not reproduced by a late start: with the
+> first node's flights waiting in a peer's held, unread socket for one probe timeout to 15 s, the peer linked within a
+> second of starting, 65 runs on each Linux runner, and the fleet binary passed whole on both, 119 of 119
+> (diag-record-dial-1, -pin-1 and -pin-2). Diagnostics are in place for the next failure: the status reports each
+> record link's dial (`fleet.dial.record.dialing`, `.longest_call_ms`, `.longest_enroll_ms`, `.calls`) and each serve
+> socket's demultiplexer (`fleet.serve.opened`, `.setup_refused`, `.peer_sessions_refused`, `.peers_refused`,
+> `.high_water`), and the fleet tests' formation-failure message carries the dials, the links waiting on discovery and
+> the demultiplexer counters. The 2026-11-05 entry's unreproduced "owner with no session to its only reachable
+> candidate for 249 tries" (below) has the same shape. **Owed:** a reproduction, then the fix by the step the
+> diagnostics name.
 
 > **The dirty-page test's precondition, proved each attempt (2026-11-09, A-248).**
 > `a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path` failed intermittently ("the sync says so:
