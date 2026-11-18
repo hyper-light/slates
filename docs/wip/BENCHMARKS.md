@@ -12881,3 +12881,46 @@ records of about 135.5 MB), `held_back.whole` 11 to 16, `batches` 5 to 102 carry
   build over the volume in one turn is the candidate (GAPS records the live log's whole entry as a one-turn walk of a
   whole volume, and `install_built` and `install_image` rose with it). Under an anchor the daemon would be restarted,
   which is still an outage of every writer's connection.
+
+## The reply carrier at 3,000 and 10,000 clients: no reply lost after it; 57 lost and a hung run before it at 10,000 (A-296; goal 238; 2026-11-18)
+
+**What it is.** Goal 238's measurement of A-296 (every cross-shard reply waits for room, carried by a per-shard carrier,
+never dropped): the many-client rung on main just before the carrier landed (`8c9f05404`) against its landing
+(`d0e737b8d`). Both carry W1, so a green's works are served on the shards their names hash to.
+
+**Environment.** Mac Studio adas-mac-studio.local-2 (Apple M3 Ultra, 32 cores, 96 GiB, macOS 26.4), release (LTO)
+`load_bench` of each commit built there with Rust 1.98.1, 2026-11-18 10:11 to 10:34 UTC. Shared with other agents' work:
+the one-minute load average at each run's start is in the table. Linux v7.4-rc1 (6628e7d4) `kernel/`, 754 files.
+
+**Command.** `load_bench --tree <linux-v7.4-rc1>/kernel --clients N --hot-files 0.8N --per-connection 32 --rounds 3
+--reply-patience 60` (think time 0, the in-process daemon, which derived 23 shards), under `/usr/bin/time -l`. The
+`lost` rows are the daemon's counters read at the end of the run; `room` is the carrier's waits for room. Every run:
+
+| clients | build, round | load at start | wall s | verdicts/s | `xshard.reply_dropped` | room waits begun / ended (peak) | p99 ms: Edit / Accepted / Conflict / Rebase |
+|---|---|---|---|---|---|---|---|
+| 3,000 | before, 1 | 12.9 | 10 | 7,832 | 0 | (none in this build) | 91.3 / 106.7 / 114.6 / 110.8 |
+| 3,000 | after, 1 | 15.2 | 9 | 11,447 | 0 | 0 / 0 | 46.8 / 62.8 / 64.2 / 64.2 |
+| 3,000 | after, 2 | 18.0 | 6 | 13,427 | 0 | 0 / 0 | 41.8 / 49.5 / 63.3 / 53.2 |
+| 3,000 | before, 2 | 17.7 | 5 | 13,702 | 0 | | 49.8 / 61.8 / 71.8 / 59.9 |
+| 3,000 | before, 3 | 18.8 | 5 | 12,591 | 0 | | 44.0 / 48.6 / 64.9 / 51.3 |
+| 3,000 | after, 3 | 20.8 | 5 | 13,729 | 0 | 0 / 0 | 49.0 / 63.4 / 69.7 / 63.2 |
+| 10,000 | before, 1 | 15.9 | 31 | 12,213 | 0 | | 170.5 / 175.1 / 197.0 / 187.8 |
+| 10,000 | after, 1 | 25.2 | 62 | 5,440 | 0 | 6,576 / 6,576 (106) | 443.8 / 440.8 / 495.4 / 491.9 |
+| 10,000 | after, 2 | 41.0 | 32 | 11,446 | 0 | 6,358 / 6,358 (41) | 208.7 / 213.6 / 247.0 / 232.0 |
+| 10,000 | before, 2 | 37.6 | hung | | **57** (read live) | | |
+
+Every other `lost` counter read 0 in every completed run, and the oracle found nothing in any. The 10,000-client runs
+had 1,737 to 1,908 clients starved past the harness's resolutions (10,000 clients over 8,000 hot picks). The hung run
+progressed as its sibling did until about 40 s; from then to 545 s seven of its eight harness workers sat 2 to 6 agents
+short of done with their requests unanswered (one worker stopped reporting at 35 s), and the live daemon's
+`slates status`, read with `8c9f05404`'s own CLI built for it, counted `xshard.reply_dropped` 57. The harness was then
+ended (its own process, so no end-of-run rows).
+
+**What it means.**
+- **After the carrier, no reply was lost in 5 runs** at 3,000 and 10,000 clients; at 10,000 the carrier waited for room
+  6,358 and 6,576 times a run and ended every wait.
+- **Before it, the 3,000-client rung no longer drops** once W1 is in (0 in three runs), so the "about 4,200 a run" of
+  main `db9c514e` is not reproduced at this rung; at 10,000 clients one run of two lost 57 replies and hung, each lost
+  reply a client waiting for good (A-232).
+- The latencies above move with the box's load (one after-run met load 41 and took twice the wall), not with the
+  build: the carrier's cost does not show at this resolution.
