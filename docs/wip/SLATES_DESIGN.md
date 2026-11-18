@@ -419,7 +419,8 @@ inputs the daemon reads at boot or observes at runtime, never constants in the c
 > rate.** "1,000 clients under 1 ms" holds when every kind's p99 stays under 1 ms while one green takes 10³ or more
 > verdicts a second from 1,000 clients, the floor of the row "Increments per green volume per second" above, with no
 > oracle failure. Every kind is each request, attempt by attempt and end to end with its resends, and a whole edit and
-> merge with the client's own think pauses left out. The load test judges each level against it
+> merge with the client's own think pauses left out. A round to its accept, which holds as many edits and merges as
+> its conflicts make, is reported and not judged (A-416). The load test judges each level against it
 > (`crates/client/examples/load_bench.rs`, its `bound` row). A level with no think time is the rung's capacity in
 > verdicts a second and is never judged against the bound: its clients queue on the green's one serialized verdict,
 > so a request waits about the clients times the verdict's cost (Little's law), 21 ms at 1,000 clients on the owner's
@@ -2397,6 +2398,14 @@ Linux runner; then teardown proofs (detach, destroy, a daemon restart).
 > given back, when the publication did not capture the volume. A guest's acknowledged close survives a
 > daemon restart (`crates/server/tests/virtiofs.rs`). Group commit across a pass's chains is not built: one
 > publication per held chain, as the FUSE and NFS paths do.
+
+> **Status (2026-11-18, A-410: a guest's acknowledged write outlives its daemon through the write log).** A plain
+> `WRITE` is not held for the barrier: the bridge hands each one to the shard's write log in the anchor's content
+> object before its used element is published (`VolumeBridge::logging_writes`, given the log by `ShardBridge`), as a
+> FUSE mount and a Shards stream do (A-63, A-316), and a successor replays it. A write the log cannot keep makes the
+> bridge owe a publication (`Bridge::awaits_publication`), so the device holds that reply for the barrier and answers
+> `EIO` if it does not capture the volume (A-358's rule). Before, a write acknowledged after the last publication was
+> lost at a daemon's death (`a_guests_acknowledged_write_outlives_its_daemon_through_the_write_log`).
 
 > **Status (2026-10-01, AUD-29-83 and AUD-29-87: the guest and FUSE paths answer to the owner lease; a busy
 > guest cannot postpone revocation).** Before every pass the guest loop asks the owner whether it may serve the
@@ -5605,6 +5614,11 @@ them, and a seat change, a Raft configuration entry that moves no version itself
 its record moves, as any other change does. Before, the fetched reply named the answerer's known voters, adopted only
 with a newer view: a learner kept the voters of its join and of whichever answer first brought a version, and named a
 voter long gone (`a_learner_learns_who_votes_once_the_voter_it_joined_from_is_gone`, 3 of 24 runs at one CPU).
+The root configuration records the root group's voters the same way (A-406: `RootCommand::Seat`,
+`RootConfiguration::seat`, recorded by the root leader once no change is in flight), so a root learner asks and keeps
+contact with the root voters its configuration names, not its join's. A root learner fetches when its alive view of the
+regions differs from the configuration's, and also when a root voter it knows is no longer alive: a region whose
+representative died stays a region, so only the voters show it.
 A node the council configuration it holds does not name keeps direct contact with every member it holds alive, as a
 forming node does, until it holds one that names it (A-331). That is a fresh member whose join was answered before the
 council admitted it, or a member retired while it was away. Judged by the member rule a fresh member kept no peer at
@@ -6312,9 +6326,9 @@ creator plus these exceptions; this adds no global lookup catalog or per-write c
 > a copy made afresh takes the first member's record it meets as its owner's. Held by
 > `every_copy_catches_up_once_the_creator_takes_its_volume_back_from_the_adopter`,
 > `every_copy_catches_up_once_the_third_node_takes_the_volume_from_the_adopter` and
-> `a_superseded_owner_restarted_warm_ships_no_record_of_the_volume_it_lost` (`crates/server/tests/fleet.rs`). Owed: the
-> let-go is kept by the control shard's next publication, so a warm restart before it restores the copies; and the
-> yield itself is memory-only (`ShardState::yielded`), so a warm restart forgets it.
+> `a_superseded_owner_restarted_warm_ships_no_record_of_the_volume_it_lost` (`crates/server/tests/fleet.rs`). The
+> let-go is published at once (A-415), so a warm restart does not restore the copies. Owed: the yield itself is
+> memory-only (`ShardState::yielded`), so a warm restart forgets it.
 
 > **Status (2026-11-18, A-409: a lost volume's log stops by itself, and a refusal names the fence).** A volume its
 > node yielded at its re-admission (A-334) ships nothing more and does no period work, as a fenced one does (A-349):
@@ -8394,8 +8408,9 @@ command and every host start, mount and grant through one implementation.
   rewitness; serving as a host mount (§4.6, every platform's own mechanism; `mount::available` says
   without a daemon whether the machine can mount and what is missing, and `mount::unmount_busy` lets
   go of a mount a leftover process still holds, detached on Linux and forced on macOS and the BSDs) or as a descriptor a
-  VMM takes (the Shards
-  stream, A-161; the vhost-user socket); landing and merging under the caller's write mode, and
+  VMM takes (the Shards stream, A-161, whose guest is offered DAX per file, held through the library by
+  `a_shards_stream_end_serves_the_volume_it_was_made_for`; the vhost-user socket); landing and merging under the
+  caller's write mode, and
   approving exactly the manifest shown (the consumer contract below, A-299, which replaced A-278's
   `land_approved`); observation (daemon status, audit, grants, telemetry). `Instance::client` lends
   the whole typed client for the rest (a work volume's declared edits, the file verbs).
@@ -8523,7 +8538,10 @@ it builds against the contract and adds to it rather than around it.
   does the same for the records the log keeps. A variant appended is published in its change by
   the test's `--ignored` writer, which refuses to publish a moved tag. Anything else fails, naming
   the enum and the first tag that moved (since 2026-11-18, after `SubmitApproved` moved from 69 to
-  71; it stays at 71).
+  71; it stays at 71). The history a consumer reads is held the same way: `CONTRACT`'s doc comment
+  names what each version changed, and a doc-truth test fails a raised number without its line, a
+  line out of order or one past the number (`the_contract_history_names_every_version_in_order`,
+  `crates/api/src/lib.rs`).
 - *Laptop and fleet (R8).* One contract and one code path: the same calls, outcomes and errors on a
   laptop instance and on a fleet node; a fleet's own refusals (`Elsewhere`, `Retry` for an owner
   not confirmed) are variants a laptop never sends.
@@ -28366,7 +28384,8 @@ lists, the kept verdicts, `longest_name`, `widest_report`), `crates/vfs/src/base
   what it adopted), and a request carrying the previous version is refused `ConfigurationStale` and made again, as for
   any change. The regional configuration's encoding gains the set (layout 3).
 - **What it does not change.** The council's voters themselves and how they change (Raft §6, one joint change at a time);
-  the root group's learners, which still name the root voters of their join (GAPS, the open sibling).
+  the root group's learners, which still name the root voters of their join (GAPS, the open sibling; closed by
+  A-406).
 - **Tests.** `a_learner_names_the_voters_the_configuration_records_through_a_seat_change`
   (`crates/cluster/src/config_group.rs`) fails with the learner reading its Raft voters as before and with the leader's
   record withheld (kiln r3624, the Mac Studio, 2026-11-18);
@@ -29524,6 +29543,137 @@ Appendix B.2, GAPS and `docs/publish.md`.
   addressing another asset, an archive format, and a crate with no repository, each as its own finding.
 - **Owed.** An install against a published release (run request); publishing the crate to crates.io would let
   `cargo binstall slates-cli` drop `--git`.
+
+### A-410 — Slates' own virtio-fs device keeps each guest write in the write log before its used element: A-358's rule on the vhost-user route (2026-11-18, goal g268; g079's route table, "the vhost-user device neither saves nor logs a write before replying"; §4.6 virtio-fs, §4.8 barrier, D-18; A-63, A-316, A-358, A-379, A-402)
+Applied in the same change to:
+- `crates/bridge-core`: `VolumeBridge::logging_writes` (a transport's write log, handed each write the volume took;
+  one it did not keep makes `awaits_publication` true); `Bridge::awaits_publication`'s doc; the unit test
+  `a_bridge_hands_each_write_to_its_log_and_owes_a_publication_for_one_it_did_not_keep`
+  (`crates/bridge-core/tests/volume_bridge.rs`).
+- `crates/server/src/virtiofs.rs`: `ShardBridge::with_bridge` gives each pass's bridge the shard's write log and
+  content object; the module doc. `crates/bridge-fuse/src/bridge.rs`: `needs_barrier`'s doc.
+- The test `a_guests_acknowledged_write_outlives_its_daemon_through_the_write_log` (`crates/server/tests/virtiofs.rs`).
+- §4.6 (the virtio-fs status after AUD-29-82's); GAPS: the route table in the WinFsp write's entry (2026-11-18), with
+  the Windows streams' row brought to A-402, and Phase 8 step 4's owed line.
+
+- **What was there.** The virtio-fs device held a request's used element for the owner's barrier only when
+  `needs_barrier` named it (namespace and attribute changes, `fsync`, the `flush` a close sends) or the volume owed a
+  publication. A plain `WRITE` was answered with neither a publication nor a log record, so a write acknowledged after
+  the last publication was lost at a daemon's death. g079's sibling sweep (A-379) found it; it was safe only while the
+  VM died with its device's daemon (crosvm ends the VM at a back end's hangup), and the volume itself outlives the
+  daemon, so a write the guest was told succeeded was missing from it afterwards.
+- **The rule.** A-358's: a write a client is told succeeded survives the daemon's death before the reply. Here it is
+  kept as a FUSE mount and a Shards stream keep it: the bridge appends each write the volume took to the shard's write
+  log before the device publishes the used element, and a successor replays the log at recovery. A write the log does
+  not keep (no room, or a span the content object refused) makes the bridge owe a publication; the device then holds
+  the reply for the owner's barrier, which publishes and answers `EIO` if the publication did not capture the volume. A
+  device with no anchor's content object (no log) is a daemon nothing outlives, and owes nothing for its writes.
+- **Why not the barrier per write.** A-379 publishes every WinFsp write because Windows had no write log. The log is
+  on every platform since A-402, and a logged write costs an append into anchor-held memory, where a publication writes
+  the shard's whole recovery image; A-399 measured a stream's close publishing nothing the log held at 15.7-16.0 µs p50
+  against 17.5-20.0 µs.
+- **Evidence.** The unit test drives a bridge with a keeping log, a refusing log and none. The integration test runs
+  the in-process guest seam under a daemon whose anchor the test holds: a guest creates a file (its barrier publishes
+  it) and writes into it, the daemon is killed by a fenced stop that publishes nothing, and a successor over the same
+  segment reads the bytes back over NFS. Without the change the file comes back empty, as its create's publication left
+  it. The vhost-user front end's run on Linux is main's (`run-requests.md`, 2026-11-18).
+
+### A-416 — The many-client bound judges every request and the cycle, and reports the round; the load test's hot set is a set (2026-11-18, built for goals 231 and 257, 1,000 clients under 1 ms; amends A-297's "The judgment")
+Applied in the same change to: §1.4 (the status under the table), GAPS (the load test's entry),
+`crates/client/examples/load_bench.rs` (`Kind::judged`, `bound_row`, `hot_set`, `plan_round`, `level`'s `refused` row,
+the module's "The workload" and "The bound"), and the example's tests below.
+- **The round is reported, not judged.** A-297 judged "every kind", and the harness took that as every kind it timed,
+  the round among them. §1.4's status names the kinds as each request and a whole edit and merge, which the cycle is (a
+  round's first edit to its first verdict). A round is not one: it runs from its first edit to its accept, so it holds
+  as many edits and merges as its conflicts make, and its p99 grows with the conflict rate the hot set sets, not with
+  any request's time. On the Mac Studio at 1,000 clients and a think mean of 50 ms (1,102 verdicts a second, works on
+  their clients' shards, 2026-11-18) every request's p99 was 0.47 to 1.33 ms and the cycle's 104 ms (pauses left out),
+  while the round's was 191 ms. The bound now judges every request kind and the cycle; the round stays in the `latency`
+  row. This is g231's option (b), whose stated trigger, a measurement with the round alone over the bound, was met;
+  decided by the principle above, Ada's to veto.
+- **The hot set is a set.** The harness drew `--hot-files` indices with replacement, so a file drawn twice was twice as
+  hot as the rest of the set, and 800 draws over `kernel/`'s 700-odd eligible files made every file hot and some three
+  to five times hotter: 19 to 28 of 1,000 clients starved (ran out of resolutions) in every run, and the bound requires
+  none. The hot set is now `--hot-files` distinct files (a Fisher–Yates shuffle's first places, by the plan's own
+  draws), and at most half the files long enough to edit, so a pick from the whole tree misses it at least half the
+  time and the tree's picks stay mostly disjoint, as the workload states. A larger one is refused before the level
+  runs (`refused`, exit 1), never shrunk to fit; the 1,000-client rung's 800 hot files need a tree of 1,600 eligible
+  files or more (`fs/` of linux v7.4-rc1 holds 2,365 files). `--hot-files 0` is a level with no hot set; before, it
+  indexed an empty set.
+- **Tests** (`cargo test -p slates-client --example load_bench`): a round at 191 ms with every request and the cycle
+  under the bound meets it and names the cycle, and a cycle over it fails the level
+  (`a_round_is_reported_and_not_judged_and_a_cycle_is_judged`); a hot set names each file once and the same seed draws
+  it again (`a_hot_set_names_each_file_once`); a hot set past half the eligible files is refused and exactly half is
+  one (`a_hot_set_past_half_the_eligible_files_is_refused`); with no hot set every pick is from the whole tree and no
+  shared slot is written (`with_no_hot_set_every_pick_is_from_the_whole_tree`).
+
+### A-415 — The re-admission publishes its let-go of the host's own register copies at once (2026-11-18, g230, scale-out; §4.8 "Authority scope", "Recovery"; A-382's owed item)
+Applied in the same change to: §4.8 "Authority scope" (A-382's status), GAPS (A-382's entry), and
+`crates/server/src/readmission.rs`.
+- **What was there.** A-382's let-go removed the host's own register copies from the control shard's held map, and the
+  removals rode the shard's next publication. A warm restart before it restored the copies from the last committed
+  image and routed each to the owner it named, this host, so they refused their successors again (A-382's failure)
+  until the next re-admission, which a restarted daemon does not see.
+- **The rule.** The let-go publishes the shard at once when it let anything go (`readmission::let_go_own_registers`);
+  a refused publication is counted `fleet.readmission.registers_let_go_unpublished`, and the removals stay marked
+  changed (`crate::tracked`) for the next one.
+- **Tests.** `a_readmissions_let_go_is_in_the_journal_a_restart_reads` (`readmission`'s unit tests, on a shard with
+  recovery storage): a copy naming the host held and published, the host re-admitted; the journal a restart reads
+  (`verbs::committed_held_agrees`) agrees with the shard at once, and with every publication refused around the
+  install the let-go is counted unpublished and the next publication carries it. The re-admission flows' fleet tests
+  are filed for main (run-requests.md, A-415).
+
+### A-406 — The root group records its voters in the versioned root configuration, so a root learner names who votes from the configuration it fetches (2026-11-18, goal g225: a forming fleet reaches every candidate; §4.8 learners; A-380's root sibling)
+
+- **What was there.** A root learner (every member that is not its region's representative) takes no part in the root
+  group's Raft. It knew who votes only from its join state's voters, since a root seat change is a Raft configuration
+  entry that moves no root version, and it fetched only when its alive view of the regions differed from the root
+  configuration's. Seen on Windows (run 44298844583): after the root moved from its bootstrapper to the regions'
+  representatives, three root learners still named the bootstrapper as the only root voter. It asked that voter for
+  fetches and kept direct contact with it as a voter, and a representative that died left its region in place, so no
+  comparison it made ever moved.
+- **The rule.** `RootConfiguration::voters` records the root voters, in id order, and `seat` changes them with the
+  version. The root leader proposes `RootCommand::Seat` with the voters in force whenever no change is in flight and
+  they differ from the record (`RootGroup::record_voters`, each root leader period). A root learner's `known_voters`
+  and `known_voter` read the record of the configuration it holds, its join state's before any record. A root learner
+  fetches from the voters it knows, keeps direct contact with them, and fetches also when one of them is no longer
+  alive in its membership.
+- **Why this and not another.** The same record as A-380's, so the council and the root learn who votes one way. A
+  version announced on the probe plane, as the council's is, would be a member-plane wire change, and the root's
+  learners need it only when a root voter changes, which a dead voter shows them.
+- **What it costs.** One root version per root seat change, and the root configuration's encoding gains the set (layout
+  2). A root learner fetches each period while a root voter it knows is dead and not yet replaced, as it already did
+  while its regions differed.
+- **What it does not change.** The root voters and how they change (Raft §6); the regional council (A-380).
+- **Tests.** `a_root_learner_names_the_voters_the_configuration_records_through_a_seat_change`
+  (`crates/cluster/src/root_group.rs`),
+  `a_root_seat_records_the_voters_in_id_order_and_advances_the_version_only_when_they_change`
+  (`crates/db/src/register.rs`), the root round trip and the layout golden in `crates/cluster/src/raft_wire.rs`.
+
+Applied in the same change to: §4.8 (learners), A-380's entry, GAPS (A-380's open sibling),
+`crates/db/src/register.rs`, `crates/cluster/src/raft_wire.rs`, `crates/cluster/src/root_group.rs`,
+`crates/server/src/fleet.rs`, their tests, and the bug record
+`docs/bugs/2026-11-18-a-root-learner-named-the-root-voters-of-its-join.md`.
+
+### A-412 — A holder behind its own records catches up from them, fetching their inputs from the record's owner (2026-11-18, kiln goal g250; §4.16 "Apply on holders"; A-313, A-333, A-364, A-373)
+Applied in the same change to: GAPS (the entry at its head), the bug record of 2026-11-18 on a holder behind its own
+records, `crates/server/src/merge_service.rs` (`record_standing`, `catch_up`, `MergeShardState::catching_up`) and
+`crates/server/src/fleet.rs` (`fetch_ledger_inputs`, `merge.catch_up.*`).
+- **What was there.** A takeover commits the versions it adopted again through the register path, which carries no
+  inputs, and the record plane ships a placed version no more, so a holder whose replica had not reached them held their
+  records with nothing to apply them by. A record ahead of the replica was out of order, for good.
+- **The rule.** A record ahead of the replica's next version looks for the versions between in the holder's own ledger
+  (`merge_origin::ledger_unheld`). Held whole, with their inputs, the replica is advanced through them (A-333's
+  `advance_replica`) and the record served as the next version, recomputed before it is acknowledged. An input not
+  held is fetched by identity from the record's sender, the green's owner, which holds every version's inputs while its
+  records name them (A-244), staged as placed for its version, one fetch a green at a time in a detached task of the
+  shard, and the owner's next shipment of the record finds it held. A version between whose record the holder lacks is
+  out of order, as before.
+- **Tests.** `a_holder_behind_its_own_records_after_a_takeover_fetches_their_inputs_and_takes_the_next_version`
+  (`crates/server/tests/fleet.rs`): three nodes at `f = 1`, the holder withholding version 3 when the owner dies, the
+  successor's version 4 committed with it and recomputed there, version 3's input fetched. Kiln r355, the Mac Studio,
+  2026-11-18, debug build: green in 4.4 s; red without the catch-up, version 4 answered out of order 4,865 times in
+  405 s. The merge unit tests (`merge_origin`, `merge_service`) 27 of 27.
 
 ### A-417 — A Windows host learns before it mounts whether WinFsp's driver may make the drive (2026-11-18, g085, the Windows leg of kiln's bare-metal goal; amends A-278 piece 3's `mount::available`, follows A-369)
 Applied in the same change to: §4.12 (the contract's status, `CONTRACT` = 37), `crates/api/src/mount.rs`
