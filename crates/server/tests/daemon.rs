@@ -21,9 +21,8 @@
 use std::time::{Duration, Instant};
 
 use slates_ipc::protocol::{
-  AbsenceIs, AttachRequest, AuditKind, CauseRecord, Direction, Filter, GrantScope, Intent,
-  NamePolicy, Refusal, ReplyBody, RequestBody, SizeClass, SpanRecord, TelemetryReport, VolumeId,
-  pack, unpack,
+  AbsenceIs, AttachRequest, CauseRecord, Direction, Filter, GrantScope, Intent, NamePolicy,
+  Refusal, ReplyBody, RequestBody, SizeClass, SpanRecord, TelemetryReport, VolumeId, pack, unpack,
 };
 use slates_ipc::{ClientEnd, IpcError, connect};
 use slates_server::daemon::host_id_of;
@@ -1237,51 +1236,6 @@ fn landings_awaiting(client: &mut Client) -> u64 {
     .iter()
     .map(|shard| shard.landings_awaiting)
     .sum()
-}
-
-/// §4.15 "Audit" (AUD-29-06): a landing's trail records each step once. Do: present a landing, approve its manifest, land
-/// it under the grant and read the audit. Expect one record of the presentation's plan (no grant), one of the grant, one
-/// of the granted run's plan and one of its finish. Before 2026-11-18 the finish mirrored every record the engine's ring
-/// held for the landing's id, so the presentation's plan, which the presentation had already recorded, was recorded
-/// twice.
-#[test]
-fn a_presented_then_granted_landing_records_each_step_once() {
-  let (daemon, instance) = daemon("audit-once");
-  let secret = daemon.segment().issuer_secret().unwrap();
-  let mut client = Client::connect(&instance);
-  let target = common::target::target_dir();
-  let (id, snapshot, landing, manifest) = present_landing(&mut client, &target.path);
-  let grant = verified_approval_issues(&mut client, &secret, landing, manifest);
-  let landed = client.call(&RequestBody::Land {
-    volume: id,
-    snapshot: Some(snapshot),
-    target: target.path.clone(),
-    filter: Filter::default(),
-    grant: Some(grant),
-    signature: None,
-  });
-  assert!(matches!(landed, ReplyBody::Landed { .. }), "{landed:?}");
-  let ReplyBody::Audit { records } = client.call(&RequestBody::Audit { since: 0 }) else {
-    panic!("the audit reads back");
-  };
-  let steps: Vec<(AuditKind, Option<u64>)> = records
-    .iter()
-    .filter(|record| record.landing == Some(landing))
-    .map(|record| (record.audit_kind, record.grant))
-    .collect();
-  for step in [
-    (AuditKind::LandingPlanned, None),
-    (AuditKind::GrantIssued, Some(grant)),
-    (AuditKind::LandingPlanned, Some(grant)),
-    (AuditKind::LandingFinished, Some(grant)),
-  ] {
-    assert_eq!(
-      steps.iter().filter(|recorded| **recorded == step).count(),
-      1,
-      "{step:?} once: {steps:?}"
-    );
-  }
-  drop(daemon);
 }
 
 /// §4.15 step 3 (AUD-29-07): presented landings do not accumulate. Do: three plan → grant → land cycles on

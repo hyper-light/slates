@@ -29,7 +29,7 @@ on every copy (A-321), so no provenance was wrong. Nothing else read the ring.
 - `crates/server/src/landing.rs`: `begin_granted` notes the ring's next sequence before the run pushes a record; the
   `Planning` and `GrantedRun` carry it as `audit_from`; `finish` takes a `FinishedRun` and mirrors only the ring's
   records of the landing at or after `audit_from`.
-- `crates/server/tests/daemon.rs`: `a_presented_then_granted_landing_records_each_step_once` (red on the old mirror).
+- `crates/server/tests/presentations.rs`: `a_presented_then_granted_landing_records_each_step_once` (red on the old mirror).
 - Design §4.15 (a status blockquote); GAPS (the A-321 entry's line for it removed).
 
 ## Siblings swept

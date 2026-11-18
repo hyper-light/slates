@@ -8676,7 +8676,7 @@ would need a privilege slates never holds (R10).
 > a presented landing's plan, which its presentation records itself, was recorded twice, and a resumed landing would
 > re-record its first attempt's records. Measured on the Mac Studio: a presented-then-granted landing's trail read
 > plan, grant, plan, plan under the grant, validation, entry, finish; now each step once
-> (`a_presented_then_granted_landing_records_each_step_once` in `crates/server/tests/daemon.rs`, red on the old
+> (`a_presented_then_granted_landing_records_each_step_once` in `crates/server/tests/presentations.rs`, red on the old
 > mirror). Record: `docs/bugs/2026-11-18-a-presented-landings-plan-was-audited-twice.md`.
 
 > **Status (2026-10-01, AUD-29-62: contained base access on every platform).** The Windows base host is
