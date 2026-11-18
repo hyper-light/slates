@@ -2245,11 +2245,18 @@
 >   `a_holder_the_takeover_never_asked_lets_go_what_was_recovered_within_tolerance` (`crates/server/src/daemon.rs`);
 >   kiln r41 (Mac Studio), each red: the model with the tolerance unjudged, the server with every or no unasked copy
 >   covered.
->   **Still owed:** a copy first judged on a completion record (the last successor to confirm completes the takeover
->   in the version that records it) or past tolerance is kept, `fleet.takeover.kept_unasked`: the completion record
->   keeps no neighbourhood to judge by. Owed: the completion record keeps the retired host's settled neighbourhood (and
->   its carried retirements'), so a holder judges its object's cohorts there too; and the settle-based rule above for a
->   live owner.
+>   **Fixed (A-484, g250, 2026-11-18): a copy first judged on a completion record, and a hole in A-341's rule.** The
+>   record keeps the settled neighbourhoods its takeover recovered through and the hosts that stayed members through it
+>   (regional layout 5), so a copy first judged once the takeover completed is judged as on the retirement. And the
+>   takeover judged is the first since the copy was written, its writer's (`Acceptor::written_by`,
+>   `RegionalConfiguration::copy_stale`), not the last in its line: A-341 let a copy go at a later takeover within
+>   tolerance though the writer's had been past tolerance and its successor confirmed without learning the object,
+>   possibly the object's last copy (found by reading; bug record of 2026-11-18). Only survivors still members count,
+>   so a cohort host admitted again under its id no longer makes a cohort look within tolerance. Tests:
+>   `a_copy_whose_writers_takeover_was_past_tolerance_is_kept_through_a_later_takeover` (red before) and the A-341 test
+>   (`crates/server/src/daemon.rs`), four register tests, the lineage model. Kept still, counted: a copy whose writer
+>   this process cannot know (its acceptor rebuilt from an image after an install moved it) and an unasked copy of a
+>   moved object. **Still owed:** the settle-based rule above for a live owner.
 > - **Fixed (A-335, g250, 2026-11-18): a stale-copy reclaim dropped content a successor still fetched.** A holder
 >   outside the successor's placement let its copy go whole at the successor's confirmation or the completion record,
 >   while the confirmation certifies the record adopted and the successor fetches content from the adopted head's holders
