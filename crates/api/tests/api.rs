@@ -1,8 +1,9 @@
 //! The library and its consumer contract by use (§4.12 "Embedding", A-278; "The consumer contract", A-299): an
 //! embedding host's whole flow over a daemon in this process — attach, the consensus group, volumes provisioned from
 //! each source, snapshotted, cloned and destroyed, an overlay written, its drift read typed, a landing presented for
-//! approval and approved exactly as shown, a conflict typed per path, a merge accepted and a merge conflicted, signed
-//! work refused until the daemon verifies it, a Shards stream that serves the volume, and the daemon observed — each
+//! approval and approved exactly as shown, a conflict typed per path, a merge accepted and a merge conflicted, a signed
+//! merge judged and its record read back (a signed landing refused until the daemon verifies a landing's signature), a
+//! Shards stream that serves the volume, and the daemon observed — each
 //! outcome and each refusal asserted as its typed variant. Every test drives the crate's own verbs and judges only what
 //! a host could observe: the daemon's answers and the bytes on the disk.
 // Test harness code: an unwrap here is a failed test, which is what it should be.
@@ -23,12 +24,18 @@ use slates_api::{
   AttachTransport, AuditKind, BaseState, ConflictClass, Denied, Drift, DriftKind, Error, Exhausted,
   Existing, Filter, GrantState, Instance, Intent, Invalid, IssuerFault, KindMismatch, LandOutcome,
   LandingApproval, LandingConflict, LandingStage, LandingState, MergeApproval, MergeOutcome,
-  Missing, MountOptions, PathFault, PolicyReason, PolicyRefusal, PolicySubject, Provisioned,
-  RebaseOutcome, SimVolumes, SnapshotId, Source, Unsupported, Unusable, Verification, VolumeId,
-  VolumeSpec, Volumes, Work, WorkSignature, WriteAct, WriteMode, WritePolicy,
+  MergeRecord, Missing, MountOptions, PathFault, PolicyReason, PolicyRefusal, PolicySubject,
+  Provisioned, RebaseOutcome, SimVolumes, SnapshotId, Source, TrustedSigner, Unsupported, Unusable,
+  Verification, VolumeId, VolumeSpec, Volumes, Work, WorkSignature, WriteAct, WriteMode,
+  WritePolicy,
 };
 use slates_machine::{MachineError, MachineProfile, ProfileOptions};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
+
+/// A software SSH signer (A-321), shared with the daemon's own signed-work tests; not every helper is used here.
+#[path = "../../server/tests/common/signer.rs"]
+#[allow(dead_code)]
+mod signer;
 
 /// Shape: each probe's wall budget for the tests' machine profile (milliseconds); measured once per process.
 const PROBE_MS: u64 = 5;
@@ -599,9 +606,10 @@ fn a_landing_follows_its_volumes_write_mode() {
 }
 
 /// The forbidding half of `a_landing_follows_its_volumes_write_mode`. Do: forbid `shut`'s merges and landings with the
-/// `launcher`'s authority, write a file into it and land it over `forbidden`; then ask for a policy that also requires
-/// signed merges. Expect the landing answered `Refused` by the volume's own policy, nothing written, and the signed-merge
-/// requirement refused `Unsupported(SignedWork)`.
+/// `launcher`'s authority, write a file into it and land it over `forbidden`; then set a policy that also requires
+/// signed merges on it, and one on a consumer. Expect the landing answered `Refused` by the volume's own policy, nothing
+/// written; the volume's requirement set and read back (A-321); and the consumer's refused
+/// `Invalid::SignedMergesNotAVolume` before anything is sent, since the requirement is a volume's rule.
 #[cfg(unix)]
 fn expect_a_forbidding_volume_never_lands(
   instance: &mut Instance,
@@ -627,16 +635,20 @@ fn expect_a_forbidding_volume_never_lands(
     })
   );
   assert_eq!(forbidden.read("f.txt"), None, "nothing was written");
+  let requiring = WritePolicy {
+    require_signed_merges: true,
+    ..forbid
+  };
+  instance
+    .set_write_policy(PolicySubject::Volume(shut), &requiring, launcher)
+    .unwrap();
   assert_eq!(
-    instance.set_write_policy(
-      PolicySubject::Volume(shut),
-      &WritePolicy {
-        require_signed_merges: true,
-        ..forbid
-      },
-      launcher
-    ),
-    Err(Error::Unsupported(Unsupported::SignedWork))
+    instance.write_policy(PolicySubject::Volume(shut)).unwrap(),
+    Some(requiring)
+  );
+  assert_eq!(
+    instance.set_write_policy(PolicySubject::Consumer(1), &requiring, launcher),
+    Err(Error::Invalid(Invalid::SignedMergesNotAVolume))
   );
 }
 
@@ -644,8 +656,7 @@ fn expect_a_forbidding_volume_never_lands(
 /// based on the same version that rewrite the same bytes, one after the other; rebase and merge a third that changed
 /// another file. Expect a green's and a work's status read with no base; the seed and the first `Merged` at versions 1
 /// and 2, unsigned; the second `Conflicted` with a
-/// window on the rewritten bytes and the green's head 2, nothing merged; the third rebased onto 2 and merged at 3; and a
-/// signed merge refused `Unsupported(SignedWork)` before anything is sent.
+/// window on the rewritten bytes and the green's head 2, nothing merged; and the third rebased onto 2 and merged at 3.
 #[test]
 fn a_merge_is_accepted_or_conflicted_typed() {
   let (daemon, mut instance) = grouped("merge");
@@ -676,10 +687,6 @@ fn a_merge_is_accepted_or_conflicted_typed() {
     .client()
     .edit(seed.volume, "f", 0, 0, b"aaaaaaaa")
     .unwrap();
-  assert_eq!(
-    instance.merge(&seed, &[], Some(&a_signature())),
-    Err(Error::Unsupported(Unsupported::SignedWork))
-  );
   assert_eq!(
     instance.merge(&seed, &[], None).unwrap(),
     MergeOutcome::Merged {
@@ -739,6 +746,99 @@ fn expect_a_rebased_work_merged(instance: &mut Instance, third: &Work) {
     instance.merge(third, &[], None).unwrap(),
     MergeOutcome::Merged { version: 3, .. }
   ));
+}
+
+/// AC-5.12 (A-321; §4.16, §4.12 "The consumer contract"): do trust a key on a green and require signed merges there,
+/// with the launcher's authority; merge a work unsigned; ask for its statement, sign it with the trusted key and merge
+/// it; read the version's merge record back, and a version never committed. Expect the signers read back as set; the
+/// unsigned merge `Refused` by the green's requirement, unsigned, nothing merged; the statement naming the work, a
+/// person's text; the signed merge `Merged` at 1, verified naming the trusted key; its record verified, read back after
+/// the checkpoint the merge let fold its chain entry (the work moved to 1, so nothing below it is live); the origin's
+/// record unsigned; and the uncommitted version `NotFound` naming it.
+#[test]
+fn a_signed_merge_is_judged_and_read_back_through_the_contract() {
+  let (daemon, mut instance) = grouped("signed-merge");
+  let launcher = issuer_of(&daemon);
+  let green = provision(
+    &mut instance,
+    &VolumeSpec {
+      name: "signed-green".to_owned(),
+      source: slates_api::Source::Green {
+        base: None,
+        require_evidence: false,
+      },
+    },
+  );
+  let key = signer::TestSigner::fresh();
+  let trusted = TrustedSigner::from_wire(key.public()).unwrap();
+  instance
+    .set_signers(green, std::slice::from_ref(&trusted), &launcher)
+    .unwrap();
+  assert_eq!(instance.signers(green).unwrap(), vec![trusted.clone()]);
+  let requiring = WritePolicy {
+    merge: WriteMode::Bypass,
+    land: WriteMode::Ask,
+    require_signed_merges: true,
+  };
+  instance
+    .set_write_policy(PolicySubject::Volume(green), &requiring, &launcher)
+    .unwrap();
+  let Provisioned::Work { work, .. } = instance
+    .provision(&VolumeSpec::work("signed", green))
+    .unwrap()
+  else {
+    panic!("a work volume provisions as one");
+  };
+  instance
+    .client()
+    .edit(work.volume, "f", 0, 0, b"signed work")
+    .unwrap();
+  assert_eq!(
+    instance.merge(&work, &[], None).unwrap(),
+    MergeOutcome::Refused(PolicyRefusal {
+      act: WriteAct::Merge,
+      by: PolicySubject::Volume(green),
+      reason: PolicyReason::SignatureRequired {
+        verification: Verification::Unsigned
+      },
+    })
+  );
+  assert_eq!(instance.client().versions(green).unwrap(), 0);
+  let statement = instance.merge_statement(&work, &[]).unwrap();
+  assert_eq!(statement.work, work);
+  assert!(
+    String::from_utf8(statement.statement.clone())
+      .unwrap()
+      .starts_with("slates merge v1\n")
+  );
+  let signature = WorkSignature::from_blob(key.sign(&statement.statement));
+  let verified = Verification::Verified {
+    signer: trusted.signer(),
+  };
+  assert_eq!(
+    instance.merge(&work, &[], Some(&signature)).unwrap(),
+    MergeOutcome::Merged {
+      version: 1,
+      verification: verified
+    }
+  );
+  assert_eq!(
+    instance.merge_record(green, 1).unwrap(),
+    MergeRecord {
+      version: 1,
+      verification: verified,
+    }
+  );
+  assert_eq!(
+    instance.merge_record(green, 0).unwrap().verification,
+    Verification::Unsigned,
+    "the origin, which no merge made"
+  );
+  assert_eq!(
+    instance.merge_record(green, 9),
+    Err(Error::NotFound(Missing::Version { green, version: 9 }))
+  );
+  daemon.stop();
 }
 
 /// AC-5.12 (A-299, A-285; §4.16): do set a green's merge mode to ask with the launcher's authority, merge a work into
@@ -978,8 +1078,8 @@ fn reads_its_end(_end: &slates_api::StreamEnd) -> bool {
 /// refused `AlreadyExists` naming it; both volumes listed; the strangers refused `NotFound` naming the volume, the
 /// snapshot or the attachment; the relative folder refused `NotAbsolute`; the work at the green's first version, the
 /// others refused `NotGreen` and `NotFound`; a stream of the Shards transport whose peer reads its end once detached;
-/// the pinned snapshot's destroy refused as an invalid request (untyped yet, see the owed note) and the unpinned one's
-/// done; the clone gone from the list, and refused `NotFound` after.
+/// the pinned snapshot's destroy refused `Busy` by the volume core's `Pinned` (a holder to end first, typed since
+/// A-299) and the unpinned one's done; the clone gone from the list, and refused `NotFound` after.
 fn the_seam_conforms<V: Volumes>(seam: &mut V) {
   let origin = made(seam, &VolumeSpec::empty("seam-origin", ROOM));
   assert_eq!(
@@ -995,7 +1095,9 @@ fn the_seam_conforms<V: Volumes>(seam: &mut V) {
   assert!(
     matches!(
       seam.destroy_snapshot(origin, snapshot),
-      Err(Error::Invalid(Invalid::Request(_)))
+      Err(Error::Busy(slates_api::Busy::Volume(
+        slates_api::VolumeRefusal::Pinned
+      )))
     ),
     "a snapshot a clone pins is not destroyed"
   );

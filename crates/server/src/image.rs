@@ -585,6 +585,7 @@ impl BuildJob {
         live_holders: None,
         write: None,
         write_version: 0,
+        signers: Vec::new(),
       },
       base: BaseRecord::Image {
         volume: self.source,
