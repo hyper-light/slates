@@ -798,6 +798,19 @@
 >   most its idle window (`forward_retry.rs`, red on both Linux runners, run 42374532065:
 >   `docs/bugs/2026-11-07-a-kept-forward-waited-for-another-request.md`). The 10k rung then met the verdict's walk of
 >   every delta since a work's base on the green's owner shard, open below.
+>   - Since 2026-11-17 (A-279) the owner's drain tells the shards waiting for its room, and the loop idles with no
+>     timer. `forward_retry.rs` failed 8 of 30 at load ~35 on main because its budget from the hold's end counted the
+>     owner's drain of the 41,125 tasks it had queued ahead of the forward (64 ms to 4.33 s under 36 spinners; the
+>     resend came within 21 ms every time). It now owes the answer within the liveness budget of the owner's last
+>     progress through them, and asserts the room wake's counts
+>     (`docs/bugs/2026-11-17-a-kept-forward-polled-for-room-and-its-test-timed-the-owners-queue.md`).
+>   - Open: the scatter's parts and a result carried home still poll a full channel every `REPLY_PACE_NS`
+>     (`xshard::given_room_within`, `given_room`); `retry_forwards` stops at the first refused forward, so one full
+>     owner holds back kept forwards to owners with room.
+>   - Unmeasured: under a saturated owner, an idle client shard whose resend keeps losing the room to busy shards is
+>     told at every drain, so it wakes about once per its own wake latency, where the timer woke it once per idle
+>     window (100 wakes). The owner pays a kick per such shard per tell. Owed: kicks and CPU at the 10k fan-in rung.
+>     Behind it is a fairness question: a full channel serves whoever sends first.
 >
 > - **A run after a length change in its file merged zeros** (found 2026-11-07 proving W2, since 34548a59, the
 >   submit flow's first version). The seal read each added run at its op's base-coordinate offset rather than where

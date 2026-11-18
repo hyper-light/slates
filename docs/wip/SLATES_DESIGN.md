@@ -1485,6 +1485,27 @@ cluster.
 >   `Overloaded` past it);
 > - the fleet's tasks are added to every shard though they run on the control shard alone.
 
+> **Status (2026-11-17, A-279: a full control channel tells the senders waiting for its room).** A sender refused
+> `ControlFull` keeps its message and sends it again once the channel has room. Until now nothing said when: the serve
+> loop, while it kept a forward, woke once per idle window to try again (0.3 to 21 ms on this Mac under 36 spinners;
+> the window is the wake estimate × 100, with no cap).
+> - The sender asks to be told (`ShardContext::want_room`, `futures::want_room`): its shard's mark in the target's
+>   `room_wanted`, a `SeqCst` fence, and one more try.
+> - The target, after each drain that took a message, fences `SeqCst` and tells every shard marked
+>   (`registry::give_room`). The tell marks the target in the asker's `room_given`, fences `SeqCst` (against the fence
+>   of a drain that re-armed its flag with a plain store), and publishes the asker's control flag, which wakes its
+>   tasks waiting on that target at its next drain.
+> - Either the second try finds the room or the drain finds the mark; an exiting shard tells every asker.
+>
+> The serve loop asks for its first kept forward's owner and then idles with no timer
+> (`verbs::ask_room_for_kept_forwards`). Proven by loom models of each half (`crates/rt/src/room.rs`; the tell's fence
+> rests on C++20's fence rules, since its model passes without it too), a runtime test whose sender has no timer at
+> all (`crates/rt/tests/room.rs`), and `forward_retry.rs`, whose answer is now owed within the
+> liveness budget of the owner's last progress through the flood queued ahead of it. Its budget from the hold's end
+> had counted the drain of 41,125 queued tasks, 64 ms to 4.33 s under load (8 of 30 failed at load ~35). Record:
+> `docs/bugs/2026-11-17-a-kept-forward-polled-for-room-and-its-test-timed-the-owners-queue.md`. Owed: the scatter's
+> parts and a result carried home still poll a full channel every `REPLY_PACE_NS` (`xshard::given_room_within`).
+
 **Failure matrix.** Driver setup refused (seccomp): Masked (epoll). Task arena full: Refused
 (`TooManyTasks`, admission). A task exceeding the bounded-work rule (a poll past the step quantum on
 the CPU, or waiting inside a call past it): Degraded, counted (`long_steps`, `blocked_steps`), the
@@ -20542,3 +20563,40 @@ Applied in the same change to:
   the test that owns every node's advertised ports and forwards to their bind blocks can drop, delay, duplicate and
   reorder each datagram, and cut a running node off in either direction, with no privilege. Only KIND's netem
   injected loss before, and only on real pods (`cargo xtask kind live`, which no lane runs).
+
+### A-279 — A full control channel tells the senders waiting for its room (2026-11-17, built for goal g239, a kept forward re-sent once the channel has room)
+
+Applied in the same change to:
+- §4.3: the status of 2026-11-17 (the room wake).
+- `crates/rt/src/room.rs` (new): `ShardSet`, the protocol and its three loom models. `crates/rt/src/registry.rs`:
+  each entry's `room_wanted` and `room_given`; `give_room`; `note_exited` tells every asker.
+  `crates/rt/src/shard.rs`: `want_room`; `drain_control` wakes the tasks a tell names and, after a drain that took a
+  message, fences and tells; the counters `room_waits` and `room_wakes`. `crates/rt/src/futures.rs`: `want_room`.
+  The tests: `crates/rt/tests/room.rs` and `room_gone.rs`.
+- `crates/server/src/daemon.rs` (`serve_loop`) and `crates/server/src/verbs.rs` (`ask_room_for_kept_forwards`,
+  `refuse_unsent_forward`): the timed idle while a forward is kept is gone. `Daemon::flood_control_channel_counting`
+  and `crates/server/tests/forward_retry.rs`.
+- GAPS: the load test's "A kept forward waited for another request". The bug record:
+  `docs/bugs/2026-11-17-a-kept-forward-polled-for-room-and-its-test-timed-the-owners-queue.md`.
+- **What was there.** A shard's control channel is bounded at its admission limit, and a spawn it refuses is kept by
+  its sender (§4.3: "backpressure, never a drop"). No message, flag or kick told the sender when the channel had room
+  again. The serve loop, while it kept a forward, idled at most one idle window and then tried again (2026-11-07), so
+  it armed a timer every window and the forward reached its owner up to a window after the room. The window is the
+  shard's measured wake × 100 and has no cap of its own.
+- **The rule.** A sender refused `ControlFull` may ask the target to tell it when the channel has room. It marks its
+  shard in the target's set, fences `SeqCst`, and tries once more, and it waits only if that try is refused too. The
+  target, after every drain that took a message, fences `SeqCst` and tells each shard its set names. A tell marks the
+  target in the asker's set, fences `SeqCst`, and publishes the asker's control flag, so a parked asker is kicked as a
+  message would kick it. That fence answers the one a drain makes after re-arming its flag with a plain store, which
+  ends a publication's release sequence; a message needs none, since the channel claims its slot with a `SeqCst`
+  operation. An exiting target tells every asker, and an ask after its exit is refused `ShardGone`. The serve loop asks before it idles with a
+  forward kept and then idles with no timer. Asks and the tasks they woke are counted per shard.
+- **Why.** Goal g239: the supervisor's runs of main failed `forward_retry.rs` 8 of 30 at load ~35, named a lost wake.
+  The test's timeline on this Mac (30 runs beside 36 spinners) found the resend within 21 ms of the room in every run;
+  the answer waited for the owner's drain of the 41,125 tasks the test had queued ahead of the forward, which took up
+  to 4.33 s. So the test now owes the answer within the liveness budget of the owner's last progress through that
+  queue. The exact wake was the 2026-11-07 record's owed sibling. With it, nothing but the owner's word moves a kept
+  forward while its shard idles, which the test now proves, and the timer a window is gone.
+- **Cost.** The sender pays only on a refusal: a map insert on its own shard, two read-modify-writes and a fence. The
+  target pays one `SeqCst` fence and one load for each drain that took a message, nothing when none came, and a fence
+  for each tell.
