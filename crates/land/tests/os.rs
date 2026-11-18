@@ -498,7 +498,13 @@ fn a_symlink_in_a_landing_is_a_windows_symbolic_link() {
   mkdir(&mut vol, &mut host, &mut store, "/src");
   write_file(&mut vol, &mut host, &mut store, "/src/lib.rs", b"lib");
   mkdir(&mut vol, &mut host, &mut store, "/lib");
-  symlink(&mut vol, &mut host, &mut store, "/lib/link", "../src/lib.rs");
+  symlink(
+    &mut vol,
+    &mut host,
+    &mut store,
+    "/lib/link",
+    "../src/lib.rs",
+  );
   let mut session = Session::new();
   let mut setup = Setup {
     host: &mut host,
@@ -517,14 +523,24 @@ fn a_symlink_in_a_landing_is_a_windows_symbolic_link() {
     "{report:?}"
   );
   let lib = ws.path.join("out").join("lib");
-  let kind = std::fs::symlink_metadata(lib.join("link")).unwrap().file_type();
+  let kind = std::fs::symlink_metadata(lib.join("link"))
+    .unwrap()
+    .file_type();
   assert!(kind.is_symlink_file(), "a file symbolic link: {kind:?}");
   assert_eq!(
     std::fs::read_link(lib.join("link")).unwrap(),
     Path::new(r"..\src\lib.rs")
   );
-  assert_eq!(std::fs::read(lib.join("link")).unwrap(), b"lib", "read through the link");
-  assert_eq!(names_in(&lib), ["link"], "nothing but the link: no staged name left");
+  assert_eq!(
+    std::fs::read(lib.join("link")).unwrap(),
+    b"lib",
+    "read through the link"
+  );
+  assert_eq!(
+    names_in(&lib),
+    ["link"],
+    "nothing but the link: no staged name left"
+  );
 }
 
 /// Format: `FILE_ATTRIBUTE_READONLY` (winnt.h), as `MetadataExt::file_attributes` reads it.

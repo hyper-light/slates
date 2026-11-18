@@ -61,9 +61,9 @@ use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem as nt;
 use windows_sys::Win32::Foundation::{
   ERROR_ALREADY_EXISTS, ERROR_DISK_FULL, ERROR_FILE_EXISTS, ERROR_FILENAME_EXCED_RANGE,
-  ERROR_HANDLE_DISK_FULL, ERROR_IO_DEVICE, ERROR_PRIVILEGE_NOT_HELD, GetLastError, HANDLE, NTSTATUS,
-  OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError,
-  STATUS_DELETE_PENDING, STATUS_FILE_IS_A_DIRECTORY, STATUS_NO_SUCH_FILE, STATUS_NOT_A_DIRECTORY,
+  ERROR_HANDLE_DISK_FULL, ERROR_IO_DEVICE, ERROR_PRIVILEGE_NOT_HELD, GetLastError, HANDLE,
+  NTSTATUS, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, STATUS_DELETE_PENDING,
+  STATUS_FILE_IS_A_DIRECTORY, STATUS_NO_SUCH_FILE, STATUS_NOT_A_DIRECTORY,
   STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_INVALID, STATUS_OBJECT_NAME_NOT_FOUND,
   STATUS_OBJECT_PATH_NOT_FOUND, UNICODE_STRING,
 };
@@ -71,9 +71,9 @@ use windows_sys::Win32::Storage::FileSystem::{
   DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY,
   FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY,
   FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
-  FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
-  FileAttributeTagInfo, FileBasicInfo, FileDispositionInfoEx, FlushFileBuffers,
-  GetFileInformationByHandleEx, SYNCHRONIZE, SetFileInformationByHandle,
+  FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FileAttributeTagInfo, FileBasicInfo,
+  FileDispositionInfoEx, FlushFileBuffers, GetFileInformationByHandleEx, SYNCHRONIZE,
+  SetFileInformationByHandle,
 };
 
 use crate::engine::LandingTarget;
@@ -420,7 +420,10 @@ fn as_link_maker<T>(make: impl FnOnce() -> T) -> T {
   // SAFETY: `token` is an impersonation token this process made and keeps for its life ([`link_token`]); a null thread
   // handle names this thread; the call reads both and writes nothing of ours.
   let impersonating = unsafe {
-    windows_sys::Win32::System::Threading::SetThreadToken(std::ptr::null(), token.as_raw_handle().cast())
+    windows_sys::Win32::System::Threading::SetThreadToken(
+      std::ptr::null(),
+      token.as_raw_handle().cast(),
+    )
   };
   if impersonating == 0 {
     return make();
@@ -453,7 +456,9 @@ fn link_token() -> Option<BorrowedHandle<'static>> {
   TOKEN
     .get_or_init(|| {
       enabled_link_token()
-        .map_err(|why| slates_machine::log_line!("slates-land: links are set as the process is: {why}"))
+        .map_err(|why| {
+          slates_machine::log_line!("slates-land: links are set as the process is: {why}")
+        })
         .ok()
     })
     .as_ref()
@@ -475,7 +480,11 @@ fn enabled_link_token() -> Result<OwnedHandle, String> {
   // SAFETY: the current process's pseudo-handle and a writable handle out-parameter; the handle the call returns on
   // success is owned at once, and nothing else owns it.
   let process = unsafe {
-    (OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY, &mut process) != 0)
+    (OpenProcessToken(
+      GetCurrentProcess(),
+      TOKEN_DUPLICATE | TOKEN_QUERY,
+      &mut process,
+    ) != 0)
       .then(|| OwnedHandle::from_raw_handle(process.cast()))
   }
   .ok_or_else(|| refused("OpenProcessToken"))?;
@@ -495,8 +504,10 @@ fn enabled_link_token() -> Result<OwnedHandle, String> {
   }
   .ok_or_else(|| refused("DuplicateTokenEx"))?;
   let link = LUID {
-    LowPart: u32::try_from(windows_sys::Wdk::System::SystemServices::SE_CREATE_SYMBOLIC_LINK_PRIVILEGE)
-      .map_err(|_| "the link privilege's number".to_owned())?,
+    LowPart: u32::try_from(
+      windows_sys::Wdk::System::SystemServices::SE_CREATE_SYMBOLIC_LINK_PRIVILEGE,
+    )
+    .map_err(|_| "the link privilege's number".to_owned())?,
     HighPart: 0,
   };
   let enabled = TOKEN_PRIVILEGES {
@@ -519,7 +530,9 @@ fn enabled_link_token() -> Result<OwnedHandle, String> {
     )
   };
   // The call succeeds with `ERROR_NOT_ALL_ASSIGNED` where the token does not hold the privilege at all.
-  let code = std::io::Error::last_os_error().raw_os_error().and_then(|code| u32::try_from(code).ok());
+  let code = std::io::Error::last_os_error()
+    .raw_os_error()
+    .and_then(|code| u32::try_from(code).ok());
   if adjusted == 0 {
     return Err(refused("AdjustTokenPrivileges"));
   }

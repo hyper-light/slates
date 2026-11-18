@@ -7,7 +7,9 @@
 use crate::Ntstatus;
 
 /// The shared form (A-275, A-438): the buffer a link is shown as, the target a set buffer keeps, the tag a buffer names.
-pub use slates_vfs::host::windows_link::{IO_REPARSE_TAG_SYMLINK, Refusal, reparse_data, tag, target};
+pub use slates_vfs::host::windows_link::{
+  IO_REPARSE_TAG_SYMLINK, Refusal, reparse_data, tag, target,
+};
 
 /// Format: `STATUS_IO_REPARSE_DATA_INVALID` (`0xC000_0278`): the buffer is not a well-formed symbolic link, or names
 /// an absolute target that has no Win32 path.
