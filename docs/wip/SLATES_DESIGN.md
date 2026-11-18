@@ -7124,7 +7124,25 @@ command and every host start, mount and grant through one implementation.
 > in-process daemon (`crates/api/tests/api.rs`) and by a test binary that is itself the host
 > (`crates/api/tests/start.rs`, no libtest harness: its `main` serves the roles). Owed, in order:
 > an async form over a host's reactor (R6: a readiness wait and a timer over the client's driver);
-> a seam trait with a simulator and a conformance suite for hosts whose rules ask for one.
+> a seam trait with a simulator and a conformance suite for hosts whose rules ask for one (built 2026-11-18, A-310:
+> "The seam" below).
+
+**The seam (A-310).** A host whose rules reach every other product only through a trait that a simulator implements
+and one conformance suite holds both to (Hex's `CLAUDE.md` §9; kiln's `kiln-seams`) reaches slates through
+`slates_api::Volumes`: the contract's volume verbs (provision from every source, snapshot, destroy a snapshot, destroy,
+list, serve to a Shards VMM, mount, unmount, detach), each with the signature and the types the `Instance` verb of the
+same name has, so it is no second API. `Instance` implements it, and so does `SimVolumes`, an in-memory stand-in that
+answers each verb with the outcome or the typed error an instance answers for the same request: names unique, a clone
+pinning its snapshot, a green over a snapshot holding its volume (A-217), a work only over a green at its first version.
+It serves no file system: a stream it hands out is a real connected pair it never answers until a detach or the volume's
+destroy closes it, and a mount is a record of one. Its tables are bounded by its caller and refuse `Exhausted::Table`
+past that. One flow of the verbs, every outcome and refusal asserted as its typed value, runs over both
+(`crates/api/tests/api.rs`, `the_seam_conforms`).
+
+> **Status (2026-11-18, A-310).** Built: `crates/api/src/seam.rs`, `crates/api/src/sim.rs`, the contract at version 9,
+> and the suite over an in-process instance and over the simulator. A pinned snapshot's destroy reaches a consumer as
+> `Invalid::Request` with the volume core's `Pinned` as its note, untyped; the simulator answers the same, and a typed
+> class for it is owed to the contract.
 
 **The consumer contract (A-299).** Everything a consumer touches goes through `slates-api` (Ada,
 2026-11-18): provisioning and managing volumes, serving them, landing, merging, their conflicts,
@@ -21439,7 +21457,8 @@ Applied in the same change to:
   `crates/api/src/mount.rs` (with pure `fuse_available`/`nfs_available` tested on every host), `lib.rs`
   (`MountKind`), `docs/library.md`, §4.12's text and status, GAPS.
 - **Owed, in order.** (1) An async form over a host's reactor (R6). (2) A seam trait with a simulator and a
-  conformance suite, for hosts whose rules ask for one (Hex's §9, kiln's `kiln-seams`). A landing plan's per-path
+  conformance suite, for hosts whose rules ask for one (Hex's §9, kiln's `kiln-seams`): built 2026-11-18, A-310. A
+  landing plan's per-path
   entries, paged, were built by A-287 the same day (`Instance::landing_entries`).
 - **Checked.** `crates/api/tests/api.rs` over a daemon in the test process: no daemon is `Unavailable`; a create before
   the group is `ConsensusNotInitialized` and the group is made twice harmlessly; create, snapshot, clone and destroy;
@@ -22084,6 +22103,38 @@ Applied in the same change to:
   format, trailing bytes, a vector of `u32::MAX` entries, the bound's arithmetic), the volume's three tests, and the two
   by-use tests over a real daemon named above. Owed on Shards' side: `shards restore` taking a served share and its
   real-VM test of a save and a restore over slates, after its v0.8.0 tag.
+
+### A-310 — slates-api's seam: the volume verbs as a trait an instance and a simulator implement, held to one conformance suite (2026-11-18, built for goal g268, what Hex needs from slates)
+
+Applied in the same change to:
+- §4.12: "The seam" and its status; the embedding status's owed line, and A-278's owed list, marked built. GAPS: the
+  embedding library row. `docs/library.md`: the seam's section and the owed list.
+- `crates/api`: `seam.rs` (`Volumes`, implemented by `Instance`), `sim.rs` (`SimVolumes`), `lib.rs` (the modules, their
+  exports, the crate's notes, `CONTRACT` 9), `error.rs` (`Error::of_ipc` lent to the crate, for the simulator's pair).
+  The tests: `the_seam_conforms` run by `an_instance_answers_the_seams_conformance_suite` and
+  `the_simulator_answers_the_seams_conformance_suite`, and `the_simulator_holds_what_it_was_given_room_for`
+  (`tests/api.rs`).
+
+- **Why.** Hex, kiln's scheduler and runtime, keeps its volumes on slates (its design's README; kiln's plan T7,
+  CP-T7.8 volumes through a CSI-like interface and CP-T7.13 claims on slates), and its rules reach another product only
+  through its `-api` crate, "each trait with a simulator implementation and a conformance suite both pass" (Hex
+  `CLAUDE.md` §9). Its own simulated cluster (`hex-sim`, after kwok) runs no daemon. A-278 and A-299 left the seam owed;
+  their owner (goal g262) handed it to g268 on 2026-11-18, on the condition that it add no type to the contract.
+- **The rule.** `Volumes` carries what a scheduler does with volumes and nothing it does not: provision (overlay,
+  empty, clone, green, work), snapshot, destroy a snapshot, destroy, list, serve to a Shards VMM, mount, unmount,
+  detach, each with the `Instance` verb's own signature and types. Landings, merges and write policy stay on the
+  instance. `SimVolumes` answers what an instance answers for every case the suite runs, and documents what it does
+  not do (serve bytes, mount anything); its tables are bounded by the caller's own number.
+- **Rejected: an associated type for what serving returns.** A simulator could hand out a token instead of a stream end,
+  but then the trait's `serve_shards` would not be the contract's, and a host could not move from the simulator to an
+  instance without a type changing. The simulator makes a real connected pair (`slates_ipc::stream::pair`, a duplex
+  pipe on Windows) and keeps its end unanswered, so a host's plumbing, a VMM's spawn with the end included, runs the
+  same over both.
+- **Found.** A pinned snapshot's destroy reaches a consumer as `Invalid::Request("Pinned")`: the daemon maps the volume
+  core's `Pinned` through its catch-all (`refusal_of_vfs`) to `BadRequest`. The suite asserts the class over both, and a
+  typed class is owed to the contract (told to its owner).
+- **Evidence.** The suite over an in-process daemon and over the simulator, and the simulator's bound. Owed: Hex's own
+  use of it, when Hex takes slates (its agent was idle until 2026-11-19).
 
 ### A-306 — A resent forward keeps the place its first send had in the forward lane (2026-11-18, built for goal g245, a dead lent session; finding (b) of the bug record of 2026-11-09)
 Applied in the same change to:
