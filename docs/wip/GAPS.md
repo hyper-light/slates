@@ -2615,6 +2615,11 @@
 >   not stuck. `a_start_held_off_its_cpus_is_starved_not_stuck` (`crates/api/src/role/anchor.rs`) holds a busy process off its
 >   CPU at SCHED_IDLE: without the reading, judged "made no progress for 1001 ms", 2 of 2 on adacachy2; with it, starved
 >   at 14-23 looks and never stuck, 7 of 7 (nice 0 and 19). A process with every thread blocked still reads stuck.
+>   Since 2026-11-18 (g251) the rule is held with its condition put in place on every host
+>   (`a_start_whose_clock_stands_still_while_runnable_is_starved_not_stuck`: the clock still and the threads runnable,
+>   never stuck; blocked, stuck a window after; red with the scheduler's answer dropped), since a big idle host cannot
+>   starve a real start (jupiter, 32 cores: "did not starve", the premise failing, not the rule); the real-process test
+>   says so and skips its starved half there.
 >   Its spinning half reads each thread too since 2026-11-08 (liveness): the busiest thread's CPU, not the process's sum,
 >   which had killed every start of 23 shards on a 32-CPU Studio
 >   (`docs/bugs/2026-11-08-the-start-judgment-held-a-processs-summed-cpu-to-one-threads-window.md`).
