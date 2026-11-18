@@ -786,7 +786,11 @@ mod tests {
     owner.release(&mut chunks);
     let second = Value::whole(&mut chunks, &[9u8; 64]);
     chunks.advance();
-    assert_eq!(replica.materialize(&chunks), first, "the replica reads the bytes it named");
+    assert_eq!(
+      replica.materialize(&chunks),
+      first,
+      "the replica reads the bytes it named"
+    );
     assert_eq!(chunks.frees_held(), 1);
     assert_eq!(chunks.held_bytes(), first.len());
     chunks.acknowledge(holder, released_at);
@@ -809,7 +813,10 @@ mod tests {
     assert_eq!(chunks.held_bytes(), 0);
     let later = Value::whole(&mut chunks, &[2u8; 32]);
     later.release(&mut chunks);
-    assert_eq!((chunks.bytes(), chunks.held_bytes(), chunks.frees_held()), (0, 0, 1));
+    assert_eq!(
+      (chunks.bytes(), chunks.held_bytes(), chunks.frees_held()),
+      (0, 0, 1)
+    );
   }
 
   proptest! {
@@ -817,8 +824,8 @@ mod tests {
 
     /// A-273, the lifetime rule over generated histories. Do: generated steps of an owner storing values, releasing
     /// them (each stamped with the feed position then), sending feed messages, replicas joining, acknowledging a sent
-    /// message and leaving; each replica keeps a copy of every value the owner released at or after the position it
-    /// has passed. Expect, after every step: every such copy reads exactly its bytes, every value the owner keeps
+    /// message and leaving; each replica keeps a copy of every value the owner released after it joined and at or
+    /// after the position it has passed (a release before its join, even at the same position, it never named). Expect, after every step: every such copy reads exactly its bytes, every value the owner keeps
     /// reads its bytes, and the held bytes' running total equals their recount; at the end, with every replica gone
     /// and every value released, the arena holds nothing.
     #[test]
@@ -828,7 +835,8 @@ mod tests {
       let mut chunks = Chunks::default();
       let mut kept: Vec<(Vec<u8>, Value)> = Vec::new();
       let mut released: Vec<(u64, Vec<u8>, Value)> = Vec::new();
-      let mut replicas: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
+      // Each replica's passed position, and how many releases came before it joined.
+      let mut replicas: std::collections::BTreeMap<u64, (u64, usize)> = std::collections::BTreeMap::new();
       for (kind, pick, bytes) in steps {
         match kind {
           0 => {
@@ -843,13 +851,13 @@ mod tests {
           2 => chunks.advance(),
           3 => {
             let holder = chunks.hold();
-            replicas.insert(holder, chunks.position());
+            replicas.insert(holder, (chunks.position(), released.len()));
           }
           4 if !replicas.is_empty() && chunks.position() > 0 => {
             let holder = *replicas.keys().nth(usize::from(pick) % replicas.len()).unwrap();
             let sent = u64::from(pick) % chunks.position();
             chunks.acknowledge(holder, sent);
-            let applied = replicas.get_mut(&holder).unwrap();
+            let (applied, _) = replicas.get_mut(&holder).unwrap();
             *applied = (*applied).max(sent + 1);
           }
           5 if !replicas.is_empty() => {
@@ -859,8 +867,8 @@ mod tests {
           }
           _ => {}
         }
-        for applied in replicas.values() {
-          for (stamp, bytes, copy) in &released {
+        for (applied, joined) in replicas.values() {
+          for (stamp, bytes, copy) in released.iter().skip(*joined) {
             if stamp >= applied {
               prop_assert_eq!(&copy.materialize(&chunks), bytes);
             }
