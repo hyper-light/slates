@@ -3011,6 +3011,17 @@ impl Volume {
     Ok(inode.attrs)
   }
 
+  /// The Windows attribute bits kept beside inode `no`'s mode as snapshot `id` holds them (A-262): what a landing of
+  /// the snapshot carries (A-451), as [`Volume::windows_attributes`] gives the head's.
+  pub fn windows_attributes_in(
+    &self,
+    store: &Store,
+    id: SnapshotId,
+    no: InodeNo,
+  ) -> Result<crate::inode::WindowsAttributes, VfsError> {
+    Ok(self.inode_in(store, id, no)?.windows)
+  }
+
   /// A device node's number as a snapshot holds it (A-294); `None` for every other kind.
   pub fn device_in(
     &self,

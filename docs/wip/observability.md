@@ -43,6 +43,7 @@ the catalog says `ring.depth{client}`. Owed to the design (an integrator edit of
 | `nfs.local_p99_ns` | unknown | measured at boot (age = time since boot) | the shard's NFS service times for calls served here | owner shard (self-observed) |
 | `nfs.local_off_cpu_p99_ns` | unknown | measured at boot (age = time since boot) | the shard's NFS service times less its thread's CPU time | owner shard (self-observed) |
 | `nfs.forwarded_p99_ns` | unknown | measured at boot (age = time since boot) | the shard's NFS service times for calls forwarded to an owner | owner shard (self-observed) |
+| `shard.watch_window_ns` | degraded | measured at report (age 0) | the shard's measured scheduler overrun, by the watchdog's window rule | owner shard (self-observed) |
 <!-- health-signals:end -->
 
 ## What is built (2026-09-13, GAP-A9-12; AC-0.11/T-0.11)

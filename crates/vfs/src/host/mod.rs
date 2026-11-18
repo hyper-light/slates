@@ -220,6 +220,10 @@ pub trait LandFs: HostFs {
   ) -> Result<(), HostError>;
   /// Sets the file's mode.
   fn set_mode(&mut self, file: HostFile, mode: u32) -> Result<(), HostError>;
+  /// Gives the file the Windows attribute bits the volume keeps for it (A-262, at Windows' values: hidden, system,
+  /// archive, offline, not indexed), where the filesystem holds them (A-451: Windows); its read-only state stays its
+  /// mode's ([`LandFs::set_mode`]). Linux and macOS hold none and keep the file as it is.
+  fn set_windows(&mut self, file: HostFile, windows: u16) -> Result<(), HostError>;
   /// Sets the file's modification time in nanoseconds.
   fn set_mtime(&mut self, file: HostFile, mtime_ns: i64) -> Result<(), HostError>;
   /// Gives the temporary the name `name` under `dir`, refused `EEXIST` when the name exists, so that it holds that
@@ -246,21 +250,25 @@ pub trait LandFs: HostFs {
   fn entry_fingerprint(&mut self, dir: HostDir, name: &str) -> Result<Fingerprint, HostError>;
   /// Removes a file or symlink.
   fn unlink(&mut self, dir: HostDir, name: &str) -> Result<(), HostError>;
-  /// Creates a directory.
-  fn mkdir(&mut self, dir: HostDir, name: &str, mode: u32) -> Result<(), HostError>;
+  /// Creates a directory, with the Windows attribute bits the volume keeps for it where the filesystem holds them
+  /// (A-451; a directory's read-only among them, which Windows gives no permission).
+  fn mkdir(&mut self, dir: HostDir, name: &str, mode: u32, windows: u16) -> Result<(), HostError>;
   /// Removes an empty directory.
   fn rmdir(&mut self, dir: HostDir, name: &str) -> Result<(), HostError>;
   /// Creates the symlink `name` under `dir` to `target`, refused `EEXIST` when the name exists, so that `name` is never
   /// seen holding anything but the whole link. A writer that makes a link in one step (`symlinkat`) makes it at `name`
   /// and ignores `staged`; one that needs two (Windows: the empty object, then its reparse buffer, A-438) makes it at
   /// `staged`, a hidden name the landing owns, and moves it to `name` without replacing, so a crash between the steps
-  /// leaves only a hidden sibling the landing's sweep removes.
+  /// leaves only a hidden sibling the landing's sweep removes. `windows` is the bits the volume keeps for the link
+  /// (A-451): on Windows its directory kind (`FILE_ATTRIBUTE_DIRECTORY`, A-275) makes it a directory link, and the other
+  /// bits are its attributes; Linux and macOS links have no kind and hold no bits.
   fn symlink(
     &mut self,
     dir: HostDir,
     name: &str,
     target: &str,
     staged: &str,
+    windows: u16,
   ) -> Result<(), HostError>;
   /// Makes the directory's entries durable (`fsync` on its descriptor).
   fn sync_dir(&mut self, dir: HostDir) -> Result<(), HostError>;

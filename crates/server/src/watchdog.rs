@@ -51,15 +51,28 @@
 //! - **Windows**: the low-memory resource notification signaled; any blocked wait counts (its wait reason is not read).
 //! - **No reading** (PSI absent, a refused read, Miri): nothing excuses a still shard, as before.
 //!
-//! The window is the existing liveness budget ([`crate::daemon::LIVENESS_BUDGET_NS`]), a fixed number recorded as R3
-//! debt in GAPS. A-228 adds no number to it. A poll's CPU is held to the build the daemon runs in (A-318,
-//! [`spin_window_ns`]): the spinning window is the budget scaled by how much slower this build runs compiled code than
-//! the machine runs the same work in machine code, measured once a process ([`slates_machine::build_cost`]), never below
-//! the budget. The window of CPU is no poll's only where code runs at the speed the budget was set for: under
-//! ThreadSanitizer, whose runtime is called at every memory access and every function's entry and exit, a poll of 1,054
-//! ms and one of 1,060 ms of CPU were judged spinning and ended in-process daemons' whole test binaries on CI (runs
-//! 44238377555 and diag-b13-2, 2026-11-18). The wedged and starved judgments are on the wall and stay on the budget: a
-//! slower build stretches no wait. While every shard is alive and the control loop lives, the thread beats; once
+//! **Each shard has its own window, read at every look (A-455, [`watch_window_ns`]).** It is the liveness window `W`
+//! ([`crate::daemon::LIVENESS_BUDGET_NS`], the recovery budget by rent or buy, A-359), raised to the shard's measured
+//! scheduler overrun where that is longer, and never past a ceiling ([`WINDOW_CEILING_NS`]). The overrun is how late the
+//! shard's steps ran after the waits before them: a maximum that forgets an eighth of itself at each later wait,
+//! measured by the shard (`slates_rt::shard::ShardContext::scheduler_overrun_ns`) and mirrored in its registry pulse,
+//! where this thread reads it. A host that keeps a shard off its CPU longer than `W` leaves it no way to show progress
+//! within `W`, so there the window is what the host measured: A-359's floor, checked once at boot until now
+//! (`config::liveness_window`), is held at every look. A quiet host's overrun is a tick or less (a kevent timeout came
+//! back 1.2 ms late under launchd's timer policy, a Windows wait waits out its 15.6 ms tick), so its window is `W`. The
+//! ceiling keeps the watchdog from going blind. A shard folds its overrun in only when it waits, and a wedged shard never
+//! waits again, so a shard wedged just after a spike (a process stopped whole and continued, a host paused) would keep
+//! the spike as its window for good. The ceiling is the daemon's observation budget, past which the daemon's own
+//! question to a shard ends with a deadline as a wedge's, not a slow shard's, so the watchdog never calls alive a shard
+//! its daemon has given up asking. Each shard's window is published in the status as the health signal
+//! `shard.watch_window_ns`. A poll's CPU is held to the build the daemon runs in (A-318, [`spin_window_ns`]): the
+//! spinning window is the shard's window scaled by how much slower this build runs compiled code than the machine runs
+//! the same work in machine code, measured once a process ([`slates_machine::build_cost`]), never below the window. The
+//! window of CPU is no poll's only where code runs at the speed the budget was set for: under ThreadSanitizer, whose
+//! runtime is called at every memory access and every function's entry and exit, a poll of 1,054 ms and one of 1,060 ms
+//! of CPU were judged spinning and ended in-process daemons' whole test binaries on CI (runs 44238377555 and
+//! diag-b13-2, 2026-11-18). The wedged and starved judgments are on the wall and stay on the shard's window: a slower
+//! build stretches no wait. While every shard is alive and the control loop lives, the thread beats; once
 //! a shard is stuck it logs what it saw and withholds the beat, and the anchor, which judges the beat's age by its own
 //! measured lateness, kills the daemon. Every look is marked in the segment too, beating or not (`SUP_LOOKED`,
 //! A-232 step 5), so the anchor tells a withheld beat (the looks go on) from a watchdog that was itself kept off its CPU
@@ -99,8 +112,8 @@ pub struct Watchdog {
   handle: Option<JoinHandle<()>>,
   /// What the thread did, for whoever asks ([`Watchdog::turns`]).
   turns: &'static Turns,
-  /// The CPU a poll may run before the shard is judged spinning ([`spin_window_ns`]).
-  spin_window_ns: u64,
+  /// This build's measured cost, which holds each shard's spin window to the build ([`spin_window_ns`], A-318).
+  cost: Result<slates_machine::build_cost::BuildCost, slates_machine::build_cost::BuildCostRefused>,
   /// Where the thread reads the host's memory stall (A-336).
   memory: &'static MemoryStallSource,
 }
@@ -202,16 +215,18 @@ impl Watchdog {
   ) -> std::io::Result<Watchdog> {
     let (stop, stop_signal) = channel();
     let cost = slates_machine::build_cost::build_cost();
-    let spin_window_ns = spin_window_ns(cost);
     let memory: &'static MemoryStallSource = Box::leak(Box::default());
     slates_machine::log_line!(
-      "slates daemon: the watchdog beats every {} ms and finds a shard stuck after a {} ms window without a step, with \
-       no CPU progress and no wait for a CPU, or after {} ms of CPU without a step (the window is the liveness budget, \
-       and a poll's CPU is held to this build: {}); a shard waiting for a CPU is starved, not stuck, and the beat goes \
-       on, and so is one waiting on memory while the host reports a memory stall ({}: {:?} now); {}",
+      "slates daemon: the watchdog beats every {} ms and finds a shard stuck once it has gone its window without a \
+       step, with no CPU progress and no wait for a CPU, or has run its window of CPU, held to this build, without a \
+       step; a shard's window is the {} ms liveness window, raised to the scheduler overrun the shard measures where \
+       that is longer, at most {} ms (the observation budget), so a poll may run {} ms of CPU at least ({}); a shard \
+       waiting for a CPU is starved, not stuck, and the beat goes on, and so is one waiting on memory while the host \
+       reports a memory stall ({}: {:?} now); {}",
       HEARTBEAT_NS / NS_PER_MS,
       LIVENESS_BUDGET_NS / NS_PER_MS,
-      spin_window_ns / NS_PER_MS,
+      WINDOW_CEILING_NS / NS_PER_MS,
+      spin_window_ns(cost, LIVENESS_BUDGET_NS) / NS_PER_MS,
       describe_cost(cost),
       memory.describe(),
       memory.read(),
@@ -230,14 +245,14 @@ impl Watchdog {
           &holders,
           (&control, &stop_signal),
           supervision,
-          (turns, spin_window_ns, memory),
+          (turns, cost, memory),
         )
       })?;
     Ok(Watchdog {
       stop: Some(stop),
       handle: Some(handle),
       turns,
-      spin_window_ns,
+      cost,
       memory,
     })
   }
@@ -252,10 +267,11 @@ impl Watchdog {
     self.turns
   }
 
-  /// The CPU a poll may run without a step before its shard is judged spinning: the liveness budget held to this build
-  /// ([`spin_window_ns`], A-318).
+  /// The least CPU a poll may run without a step before its shard is judged spinning: the liveness window held to this
+  /// build ([`spin_window_ns`], A-318). A shard whose host overruns that window is held to its own window's, which is
+  /// longer ([`watch_window_ns`], A-455).
   pub fn spin_window_ns(&self) -> u64 {
-    self.spin_window_ns
+    spin_window_ns(self.cost, LIVENESS_BUDGET_NS)
   }
 
   /// Tells the thread the daemon is stopping, before the shutdown ends the control loop, so that end is not announced
@@ -283,16 +299,42 @@ impl Drop for Watchdog {
   }
 }
 
-/// The CPU a poll may run without a step before its shard is judged spinning (A-318): the liveness budget held to the
-/// build the daemon runs in, scaled by how much slower it runs compiled code than the machine runs the same work in
-/// machine code ([`slates_machine::build_cost`]), never below the budget. A cooperative task yields within the shard's
-/// step budget, so a window of CPU is no poll's in the build the budget was set for; a build that runs every poll
-/// slower (ThreadSanitizer's, an unoptimized one) runs a window of CPU in a poll that is no spin. Where the cost was not
-/// measured (Miri, which has no thread clock and judges by the wall; a refused measure, logged) the budget stands.
+/// The CPU a poll may run without a step before its shard is judged spinning (A-318): the shard's window `window_ns`
+/// ([`watch_window_ns`]) held to the build the daemon runs in, scaled by how much slower it runs compiled code than the
+/// machine runs the same work in machine code ([`slates_machine::build_cost`]), never below the window. A cooperative
+/// task yields within the shard's step budget, so a window of CPU is no poll's in the build the budget was set for; a
+/// build that runs every poll slower (ThreadSanitizer's, an unoptimized one) runs a window of CPU in a poll that is no
+/// spin. Where the cost was not measured (Miri, which has no thread clock and judges by the wall; a refused measure,
+/// logged) the window stands. One window for both judgments (A-455): a host that holds the shard's window past `W`
+/// lengthens its spin window as much, never shortens it, and the window's ceiling bounds both.
 pub fn spin_window_ns(
   cost: Result<slates_machine::build_cost::BuildCost, slates_machine::build_cost::BuildCostRefused>,
+  window_ns: u64,
 ) -> u64 {
-  cost.map_or(LIVENESS_BUDGET_NS, |cost| cost.scale(LIVENESS_BUDGET_NS))
+  cost.map_or(window_ns, |cost| cost.scale(window_ns))
+}
+
+/// Derived: the longest window a shard is judged by, whatever overrun it measured ([`watch_window_ns`], A-455): the
+/// daemon's observation budget ([`crate::daemon::OBSERVE_BUDGET_NS`]), past which the daemon's own question to a shard
+/// ends with a deadline, taken as a wedge's and not a slow shard's. Without a ceiling the watchdog could go blind: a
+/// shard folds its overrun in only when it waits, and a wedged shard never waits again, so one wedged just after a
+/// spike (a process stopped whole and continued, a host paused) would keep the spike as its window for good. Held here,
+/// the watchdog never calls alive a shard its daemon has given up asking, and a stuck shard is judged within this, a
+/// beat and the looks' own lateness of its wedge however the host ran before it.
+pub const WINDOW_CEILING_NS: u64 = crate::daemon::OBSERVE_BUDGET_NS;
+
+/// Derived: the window the watchdog judges a shard by at a look (A-455): the liveness window `W`
+/// ([`LIVENESS_BUDGET_NS`], the recovery budget by rent or buy, A-359), raised to `overrun_ns` where that is longer,
+/// never past [`WINDOW_CEILING_NS`]. `overrun_ns` is the shard's measured scheduler overrun
+/// (`slates_rt::registry::Pulse::scheduler_overrun_ns`): how late its steps ran after the waits before them, a maximum
+/// that forgets an eighth of itself at each later wait. A host that keeps the shard off its CPU that long leaves it no
+/// way to show progress sooner, so a window shorter than the overrun would judge it by a delay that is the host's
+/// (A-359's floor, held at every look rather than checked once at boot); a quiet host's overrun is a tick or less, so
+/// its shards keep `W`. Both of a shard's judgments follow it: wedged or starved after this window without a step, and
+/// spinning after this window of CPU held to the build ([`spin_window_ns`]). Pure, so the rule is tested on every host;
+/// the shard publishes its own window by the same rule as the health signal `shard.watch_window_ns`.
+pub fn watch_window_ns(overrun_ns: u64) -> u64 {
+  overrun_ns.min(WINDOW_CEILING_NS).max(LIVENESS_BUDGET_NS)
 }
 
 /// The build's measured cost in the banner's words.
@@ -563,9 +605,9 @@ impl ShardWatch {
     }
   }
 
-  /// Judges one look against the history (A-65's rule; `window_ns` is the liveness budget, `spin_window_ns` the budget of
-  /// CPU a poll may run, the liveness budget held to this build, [`spin_window_ns`]) and returns the verdict and the
-  /// history for the next look. Pure, so the rule is tested on every host with no thread under it.
+  /// Judges one look against the history (A-65's rule; `window_ns` is the shard's window, [`watch_window_ns`], and
+  /// `spin_window_ns` the CPU a poll may run, that window held to this build, [`spin_window_ns`]) and returns the verdict
+  /// and the history for the next look. Pure, so the rule is tested on every host with no thread under it.
   pub fn judge(self, look: Look, window_ns: u64, spin_window_ns: u64) -> (Verdict, ShardWatch) {
     let (spent, progress) = look.cpu.map_or((None, None), |(spent, progress)| {
       (Some(spent), Some(progress))
@@ -662,7 +704,11 @@ fn run(
   holders: &[SlotHolder],
   (control, stop): (&Receiver<()>, &Receiver<()>),
   supervision: Supervision,
-  (turns, spin_window_ns, memory): (&Turns, u64, &MemoryStallSource),
+  (turns, cost, memory): (
+    &Turns,
+    Result<slates_machine::build_cost::BuildCost, slates_machine::build_cost::BuildCostRefused>,
+    &MemoryStallSource,
+  ),
 ) {
   let mut clock = HostClock::new();
   let mut watches = vec![ShardWatch::begun_at(clock.monotonic_ns().max(1)); holders.len()];
@@ -684,14 +730,20 @@ fn run(
     let now = clock.monotonic_ns();
     let late_ns = lateness.look(now);
     let mut looks: Vec<Option<Look>> = holders.iter().map(|holder| look_at(*holder, now)).collect();
+    // Each shard's window at this look, from the overrun it measured (A-455), aligned with `holders`.
+    let windows: Vec<u64> = holders
+      .iter()
+      .map(|holder| watch_window_ns(overrun_of(*holder)))
+      .collect();
     read_runs(holders, &watches, &mut looks, memory);
     // In shard order, aligned with `reported`: `None` for a slot that now holds another registration.
     let verdicts: Vec<Option<(u16, Verdict)>> = holders
       .iter()
       .zip(looks)
       .zip(watches.iter_mut())
-      .map(|((holder, look), watch)| {
-        let (verdict, next) = watch.judge(look?, LIVENESS_BUDGET_NS, spin_window_ns);
+      .zip(&windows)
+      .map(|(((holder, look), watch), window_ns)| {
+        let (verdict, next) = watch.judge(look?, *window_ns, spin_window_ns(cost, *window_ns));
         *watch = next;
         Some((holder.shard(), verdict))
       })
@@ -703,21 +755,31 @@ fn run(
     let turn = decide(supervision, stuck, control_ended, stopping);
     if let Turn::End(cause) = turn {
       turns.looked(stuck.is_some());
-      let verdict_late_ns = stuck_at
-        .and_then(|index| watches.get(index))
-        .and_then(|watch| verdict_lateness_ns(now, watch.still_after_ns()));
-      end_process(cause, lateness.since_beat(false, late_ns), verdict_late_ns);
+      // The stuck shard's window and its verdict's lateness, which the end's line names; none for an ended control loop.
+      let judged = stuck_at.and_then(|index| {
+        let window_ns = windows.get(index).copied()?;
+        let watch = watches.get(index)?;
+        Some((
+          verdict_lateness_ns(now, watch.still_after_ns(), window_ns),
+          window_ns,
+        ))
+      });
+      end_process(cause, lateness.since_beat(false, late_ns), judged);
     }
-    for (((found, said), watch), holder) in verdicts
+    for ((((found, said), watch), holder), window_ns) in verdicts
       .iter()
       .zip(reported.iter_mut())
       .zip(&watches)
       .zip(holders)
+      .zip(&windows)
     {
       if let Some((shard, verdict)) = found {
-        report(said, (*shard, *verdict, turn), (watch, now), || {
-          memory_wait_words(*holder, watch)
-        });
+        report(
+          said,
+          (*shard, *verdict, turn),
+          (watch, now, *window_ns),
+          || memory_wait_words(*holder, watch),
+        );
       }
     }
     turns.looked(stuck.is_some());
@@ -764,11 +826,11 @@ fn first_look_lateness_ns(watch: &ShardWatch) -> Option<u64> {
   })
 }
 
-/// A stuck verdict's lateness, for its withhold line: the verdict's own ([`verdict_lateness_ns`]) and the first look's
-/// ([`first_look_lateness_ns`]), in the end line's words.
-fn stuck_lateness_words(watch: &ShardWatch, now_ns: u64) -> String {
+/// A stuck verdict's lateness, for its withhold line: the verdict's own ([`verdict_lateness_ns`], past the shard's window
+/// `window_ns`) and the first look's ([`first_look_lateness_ns`]), in the end line's words.
+fn stuck_lateness_words(watch: &ShardWatch, now_ns: u64, window_ns: u64) -> String {
   match (
-    verdict_lateness_ns(now_ns, watch.still_after_ns()),
+    verdict_lateness_ns(now_ns, watch.still_after_ns(), window_ns),
     first_look_lateness_ns(watch),
   ) {
     (Some(verdict), Some(first)) => format!(
@@ -818,17 +880,17 @@ impl Lateness {
   }
 }
 
-/// How late a stuck verdict at `now_ns` came: past a window and a beat after `still_after_ns`, the watchdog's look before
-/// the one that last saw the shard move ([`ShardWatch::still_after_ns`]). The shard last moved after that look, so a
-/// wedge ends a lone daemon within a window, a beat and this lateness of the wedge: the look's phase against the wedge
-/// and the thread's own lateness, both measured here (A-232).
+/// How late a stuck verdict at `now_ns` came: past the shard's window `window_ns` ([`watch_window_ns`]) and a beat after
+/// `still_after_ns`, the watchdog's look before the one that last saw the shard move ([`ShardWatch::still_after_ns`]).
+/// The shard last moved after that look, so a wedge ends a lone daemon within its window, a beat and this lateness of
+/// the wedge: the look's phase against the wedge and the thread's own lateness, both measured here (A-232).
 /// `None` when the shard's last movement was seen at the watchdog's first look of it, which has no look before it to
 /// measure from.
-fn verdict_lateness_ns(now_ns: u64, still_after_ns: u64) -> Option<u64> {
+fn verdict_lateness_ns(now_ns: u64, still_after_ns: u64, window_ns: u64) -> Option<u64> {
   (still_after_ns != 0).then(|| {
     now_ns
       .saturating_sub(still_after_ns)
-      .saturating_sub(LIVENESS_BUDGET_NS)
+      .saturating_sub(window_ns)
       .saturating_sub(HEARTBEAT_NS)
   })
 }
@@ -846,16 +908,19 @@ fn verdict_lateness_ns(now_ns: u64, still_after_ns: u64) -> Option<u64> {
 /// unjoined: ThreadSanitizer reported that one as a leak at the exit, after its own one-second exit sleep, and turned
 /// the exit code into its own 66 (diag-g218-tsan-2, run 44217144677: exit 66 seen 27.4 s after the hold, where the
 /// verdict came at 1.09 s).
-fn end_process(cause: Cause, late_ns: u64, verdict_late_ns: Option<u64>) -> ! {
+///
+/// `judged` is what the line names of a stuck shard: its verdict's lateness ([`verdict_lateness_ns`]) and the window it
+/// was judged by ([`watch_window_ns`], A-455); none for an ended control loop.
+fn end_process(cause: Cause, late_ns: u64, judged: Option<(Option<u64>, u64)>) -> ! {
   let line = match cause {
     Cause::Stuck { shard, verdict } => format!(
       "slates daemon: no anchor reads the beat, so the watchdog ends the daemon's process (exit {FAILED_EXIT_CODE}): \
        shard {shard} is {}; {}; the watchdog's looks ran at most {} us late since its last beat",
-      describe(verdict),
-      verdict_late_ns.map_or_else(
+      describe(verdict, judged.map(|(_, window_ns)| window_ns)),
+      judged.and_then(|(late, _)| late).map_or_else(
         || "the shard last moved at the watchdog's first look of it, so the verdict's lateness is not known".to_owned(),
         |late| format!(
-          "the verdict came {} us past a window and a beat after the watchdog's last look before the shard last moved",
+          "the verdict came {} us past its window and a beat after the watchdog's last look before the shard last moved",
           late / NS_PER_US
         )
       ),
@@ -884,21 +949,33 @@ fn end_process(cause: Cause, late_ns: u64, verdict_late_ns: Option<u64>) -> ! {
   std::process::exit(i32::from(FAILED_EXIT_CODE))
 }
 
-/// A stuck verdict in the end's words.
-fn describe(verdict: Verdict) -> String {
+/// A stuck verdict in the end's words, a wedge's against the shard's window `window_ns` ([`watch_window_ns`]), where the
+/// end knows it.
+fn describe(verdict: Verdict, window_ns: Option<u64>) -> String {
   match verdict {
     Verdict::Wedged { for_ns } => format!(
-      "wedged, unmoved for {} ms against the {} ms window",
+      "wedged, unmoved for {} ms against {}",
       for_ns / NS_PER_MS,
-      LIVENESS_BUDGET_NS / NS_PER_MS
+      window_ns.map_or_else(
+        || "its window".to_owned(),
+        |window_ns| format!("its {} ms window", window_ns / NS_PER_MS)
+      )
     ),
     Verdict::Spinning { cpu_ns, window_ns } => format!(
-      "spinning, {} ms of CPU without a step against the {} ms window",
+      "spinning, {} ms of CPU without a step against its {} ms window",
       cpu_ns / NS_PER_MS,
       window_ns / NS_PER_MS
     ),
     Verdict::Alive | Verdict::Starved { .. } => "not stuck".to_owned(),
   }
+}
+
+/// The shard's measured scheduler overrun ([`watch_window_ns`]'s input), from its registry pulse, which the shard writes
+/// at each wait it folds in (`slates_rt::shard::ShardContext::scheduler_overrun_ns`). Zero for a slot that holds no
+/// registration, which has no look either.
+fn overrun_of(holder: SlotHolder) -> u64 {
+  slates_rt::registry::with_entry(holder.shard(), |entry| entry.pulse.scheduler_overrun_ns())
+    .unwrap_or(0)
 }
 
 /// One look at the shard `holder` names, at `now_ns`; `None` once its slot holds another registration.
@@ -1003,12 +1080,13 @@ fn said_of(verdict: Verdict) -> Said {
 /// Logs what the watchdog found of a shard the first look it finds it: `said` holds what was last logged, cleared once
 /// the shard is alive. A starved shard that then blocks is logged again as wedged. `turn` is what the watchdog does this
 /// turn, which a stuck shard's line names.
-/// A stuck shard's line names the lateness its verdict rests on, from `watch` at `now_ns` ([`stuck_lateness_words`]); a
-/// shard starved for memory, its wait in the `waiting` words ([`memory_wait_words`]).
+/// A stuck shard's line names the lateness its verdict rests on, from `watch` at `now_ns` past the shard's window
+/// `window_ns` ([`stuck_lateness_words`]); a shard starved for memory, its wait in the `waiting` words
+/// ([`memory_wait_words`]). Every line names the window the shard was judged by.
 fn report(
   said: &mut Option<Said>,
   (shard, verdict, turn): (u16, Verdict, Turn),
-  (watch, now_ns): (&ShardWatch, u64),
+  (watch, now_ns, window_ns): (&ShardWatch, u64, u64),
   waiting: impl FnOnce() -> String,
 ) {
   if verdict == Verdict::Alive {
@@ -1019,9 +1097,9 @@ fn report(
   if *said != Some(kind) {
     *said = Some(kind);
     log_verdict(
-      shard,
+      (shard, window_ns),
       (verdict, turn),
-      || stuck_lateness_words(watch, now_ns),
+      || stuck_lateness_words(watch, now_ns, window_ns),
       waiting,
     );
   }
@@ -1049,10 +1127,10 @@ fn consequence(turn: Turn) -> &'static str {
   }
 }
 
-/// Logs one episode's verdict, with what the watchdog saw; a stuck one with the lateness `late` words, one starved for
-/// memory with its wait's `waiting` words.
+/// Logs one episode's verdict on `shard`, judged by its window `window_ns` ([`watch_window_ns`]), with what the watchdog
+/// saw; a stuck one with the lateness `late` words, one starved for memory with its wait's `waiting` words.
 fn log_verdict(
-  shard: u16,
+  (shard, window_ns): (u16, u64),
   (verdict, turn): (Verdict, Turn),
   late: impl FnOnce() -> String,
   waiting: impl FnOnce() -> String,
@@ -1062,34 +1140,38 @@ fn log_verdict(
       for_ns,
       of: Want::Cpu,
     } => slates_machine::log_line!(
-      "slates daemon: shard {shard} is starved: no step and no CPU progress for {} ms, past the {} ms window, while its \
+      "slates daemon: shard {shard} is starved: no step and no CPU progress for {} ms, past its {} ms window, while its \
        thread waits for a CPU; the watchdog goes on beating",
       for_ns / NS_PER_MS,
-      LIVENESS_BUDGET_NS / NS_PER_MS
+      window_ns / NS_PER_MS
     ),
     Verdict::Starved {
       for_ns,
       of: Want::Memory,
     } => slates_machine::log_line!(
-      "slates daemon: shard {shard} is starved for memory: no step and no CPU progress for {} ms, past the {} ms \
+      "slates daemon: shard {shard} is starved for memory: no step and no CPU progress for {} ms, past its {} ms \
        window, while the host reports a memory stall; {}; the watchdog goes on beating, and judges it wedged a window \
        after the stall clears",
       for_ns / NS_PER_MS,
-      LIVENESS_BUDGET_NS / NS_PER_MS,
+      window_ns / NS_PER_MS,
       waiting()
     ),
     Verdict::Wedged { for_ns } => slates_machine::log_line!(
-      "slates daemon: shard {shard} is wedged: no step, no CPU progress and no wait for a CPU for {} ms, past the {} ms \
+      "slates daemon: shard {shard} is wedged: no step, no CPU progress and no wait for a CPU for {} ms, past its {} ms \
        window; {}; {}",
       for_ns / NS_PER_MS,
-      LIVENESS_BUDGET_NS / NS_PER_MS,
+      window_ns / NS_PER_MS,
       consequence(turn),
       late()
     ),
-    Verdict::Spinning { cpu_ns, window_ns } => slates_machine::log_line!(
-      "slates daemon: shard {shard} is spinning: {} ms of CPU without a step, past the {} ms window; {}; {}",
+    // A spin is judged against its window held to the build (A-318), which the verdict names.
+    Verdict::Spinning {
+      cpu_ns,
+      window_ns: spin_window_ns,
+    } => slates_machine::log_line!(
+      "slates daemon: shard {shard} is spinning: {} ms of CPU without a step, past its {} ms window of CPU; {}; {}",
       cpu_ns / NS_PER_MS,
-      window_ns / NS_PER_MS,
+      spin_window_ns / NS_PER_MS,
       consequence(turn),
       late()
     ),
@@ -1365,7 +1447,7 @@ mod tests {
     ];
     let ceiling = crate::config::IDLE_SPIN_CEILING_NS;
     for build in builds {
-      let window = spin_window_ns(build);
+      let window = spin_window_ns(build, LIVENESS_BUDGET_NS);
       let (verdicts, most) = an_idle_spin(ceiling, window);
       assert!(
         verdicts.iter().all(|verdict| *verdict == Verdict::Alive),
@@ -1380,7 +1462,7 @@ mod tests {
         "a look saw {most} ns of CPU without a step against a {window} ns window: under it by less than a beat"
       );
     }
-    let least = spin_window_ns(Err(BuildCostRefused::NoMachineCode));
+    let least = spin_window_ns(Err(BuildCostRefused::NoMachineCode), LIVENESS_BUDGET_NS);
     let (verdicts, _) = an_idle_spin(2 * least, least);
     assert!(
       verdicts
@@ -1402,13 +1484,118 @@ mod tests {
         batch: 1,
       })
     };
-    assert_eq!(spin_window_ns(cost(200, 100)), 2 * LIVENESS_BUDGET_NS);
-    assert_eq!(spin_window_ns(cost(100, 100)), LIVENESS_BUDGET_NS);
-    assert_eq!(spin_window_ns(cost(50, 100)), LIVENESS_BUDGET_NS);
+    let budget = LIVENESS_BUDGET_NS;
+    assert_eq!(spin_window_ns(cost(200, 100), budget), 2 * budget);
+    assert_eq!(spin_window_ns(cost(100, 100), budget), budget);
+    assert_eq!(spin_window_ns(cost(50, 100), budget), budget);
     assert_eq!(
-      spin_window_ns(Err(BuildCostRefused::NoMachineCode)),
-      LIVENESS_BUDGET_NS
+      spin_window_ns(Err(BuildCostRefused::NoMachineCode), budget),
+      budget
     );
+  }
+
+  /// The first verdict that is not alive for a shard that steps at the first look and then completes no step, running
+  /// `cpu_per_look` of CPU between looks: none (a deadlock: blocked, never runnable, its clock still) or a look's worth
+  /// (a spin). Each look judges it as the watchdog's loop does (A-455): by the window the overrun it measured,
+  /// `overrun_ns`, gives ([`watch_window_ns`]), and that window held to an unmeasured build ([`spin_window_ns`]). `None`
+  /// if no verdict came within the ceiling and two looks.
+  fn first_stuck(overrun_ns: u64, cpu_per_look: u64) -> Option<Verdict> {
+    let window_ns = watch_window_ns(overrun_ns);
+    let spin_ns = spin_window_ns(
+      Err(slates_machine::build_cost::BuildCostRefused::NoMachineCode),
+      window_ns,
+    );
+    let run = if cpu_per_look == 0 {
+      blocked(None)
+    } else {
+      runnable(None)
+    };
+    let (_, mut watch) =
+      ShardWatch::default().judge(look(5, false, Some((10, 10)), TURN), window_ns, spin_ns);
+    for turn in 2..=WINDOW_CEILING_NS / TURN + 2 {
+      let cpu = 10 + (turn - 1) * cpu_per_look;
+      let (verdict, next) = watch.judge(
+        Look {
+          run,
+          ..look(5, false, Some((cpu, cpu)), turn * TURN)
+        },
+        window_ns,
+        spin_ns,
+      );
+      watch = next;
+      if verdict != Verdict::Alive {
+        return Some(verdict);
+      }
+    }
+    None
+  }
+
+  /// A-455, A-359, §4.14. Do: judge a shard stuck in one poll, wedged (blocked, never runnable, its clock still) and
+  /// spinning (a whole CPU, no step), by the window each look reads from the scheduler overrun the shard measured: a
+  /// quiet host's (none, a kevent timeout's 1.2 ms under launchd's timer policy, Windows' 15.6 ms tick), a host that
+  /// kept the shard off its CPU two and a half liveness windows, and a runaway reading (an hour, a process stopped whole
+  /// and continued; the largest word). Expect: on the quiet host, wedged a liveness window after the shard last moved
+  /// and spinning at a window of CPU, as before; on the host that overruns, each at two and a half windows, past the old
+  /// fixed one, since a shard that host keeps off its CPU so long could show no progress sooner; on the runaway one,
+  /// each at the ceiling and never later, so the watchdog is not blinded by a stale reading. Before A-455 every one was
+  /// judged at the liveness window.
+  #[test]
+  fn a_shards_window_follows_its_measured_overrun_past_the_liveness_window_and_stops_at_its_ceiling()
+   {
+    let budget = LIVENESS_BUDGET_NS;
+    let stuck_at = |window_ns: u64| {
+      (
+        Some(Verdict::Wedged { for_ns: window_ns }),
+        Some(Verdict::Spinning {
+          cpu_ns: window_ns,
+          window_ns,
+        }),
+      )
+    };
+    let judged = |overrun_ns: u64| (first_stuck(overrun_ns, 0), first_stuck(overrun_ns, TURN));
+    for quiet in [0, 1_200_000, 15_600_000] {
+      assert_eq!(
+        judged(quiet),
+        stuck_at(budget),
+        "a quiet host's overrun of {quiet} ns keeps the liveness window"
+      );
+    }
+    let overrun = 5 * budget / 2;
+    assert_eq!(
+      judged(overrun),
+      stuck_at(overrun),
+      "a host that kept the shard off its CPU for {overrun} ns gives it that window, past the liveness window"
+    );
+    for runaway in [3_600 * budget, u64::MAX] {
+      assert_eq!(
+        judged(runaway),
+        stuck_at(WINDOW_CEILING_NS),
+        "a runaway overrun of {runaway} ns is held to the ceiling"
+      );
+    }
+  }
+
+  /// A-455, §4.14. Do: on a running daemon, read a shard's part of the status and, on the same turn, the scheduler
+  /// overrun the shard measured. Expect: its health signal `shard.watch_window_ns` measured at the report (age zero), at
+  /// the window the watchdog's rule gives that overrun: the liveness window on a quiet host, past it only as far as the
+  /// overrun and never past the ceiling. A host is not made to overrun on demand here; the rule's rise is held by
+  /// `a_shards_window_follows_its_measured_overrun_past_the_liveness_window_and_stops_at_its_ceiling`.
+  #[test]
+  fn a_shards_status_names_the_window_its_watchdog_judges_it_by() {
+    let (signal, overrun_ns) = crate::daemon::audit_on_shard(|state| {
+      let signal = crate::verbs::shard_report(state)
+        .signals
+        .into_iter()
+        .find(|signal| signal.name == slates_ipc::protocol::HealthSignal::WatchWindowNs.name());
+      (signal, slates_rt::futures::scheduler_overrun_ns())
+    });
+    let signal = signal.expect("the shard's status names its window");
+    assert_eq!(
+      signal.value,
+      Some(watch_window_ns(overrun_ns)),
+      "{signal:?} at a measured overrun of {overrun_ns} ns"
+    );
+    assert_eq!(signal.freshness_ns, 0, "measured at the report: {signal:?}");
   }
 
   /// A-228, §4.14. Do: watch a shard that steps every turn, one parked every turn, and one starved (no step for
@@ -1608,7 +1795,8 @@ mod tests {
     assert!(Verdict::Alive.beats() && starved.beats() && for_memory.beats());
     assert!(!wedged.beats() && !spinning.beats());
     let mut said = None;
-    let watch = (&ShardWatch::default(), WINDOW);
+    // The history, the look's time and the shard's window (A-455).
+    let watch = (&ShardWatch::default(), WINDOW, WINDOW);
     let words = String::new;
     report(&mut said, (1, starved, Turn::Beat), watch, words);
     assert_eq!(said, Some(said_of(starved)));
@@ -1840,15 +2028,15 @@ mod tests {
       "the look before the last movement"
     );
     assert_eq!(
-      verdict_lateness_ns(13 * TURN, watch.still_after_ns()),
+      verdict_lateness_ns(13 * TURN, watch.still_after_ns(), WINDOW),
       Some(0)
     );
     assert_eq!(
-      verdict_lateness_ns(14 * TURN, watch.still_after_ns()),
+      verdict_lateness_ns(14 * TURN, watch.still_after_ns(), WINDOW),
       Some(TURN)
     );
     assert_eq!(
-      verdict_lateness_ns(14 * TURN, 0),
+      verdict_lateness_ns(14 * TURN, 0, WINDOW),
       None,
       "no look before the first"
     );
@@ -1916,7 +2104,7 @@ mod tests {
       for offset in (1..TURN).step_by(usize::try_from(TURN / 100).unwrap()) {
         let wedge = start + offset;
         let (verdict_ns, last_beat_ns, watch) = wedge_replay(wedge, &*pattern(wedge));
-        let verdict_late = verdict_lateness_ns(verdict_ns, watch.still_after_ns()).unwrap();
+        let verdict_late = verdict_lateness_ns(verdict_ns, watch.still_after_ns(), WINDOW).unwrap();
         assert!(
           verdict_ns - wedge <= WINDOW + TURN + verdict_late,
           "{name}, wedged at {wedge}: the verdict past W + B + its lateness"
@@ -1953,12 +2141,12 @@ mod tests {
     }
     assert_eq!(watch.still_after_ns(), began);
     assert_eq!(
-      verdict_lateness_ns(11 * TURN, watch.still_after_ns()),
+      verdict_lateness_ns(11 * TURN, watch.still_after_ns(), WINDOW),
       Some(0),
       "on time: within a window and a beat of the start"
     );
     assert_eq!(
-      verdict_lateness_ns(12 * TURN, watch.still_after_ns()),
+      verdict_lateness_ns(12 * TURN, watch.still_after_ns(), WINDOW),
       Some(12 * TURN - began - WINDOW - TURN),
       "a look later"
     );

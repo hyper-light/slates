@@ -40,7 +40,7 @@ pub mod store;
 pub mod transfer;
 pub mod wire;
 
-pub use archive::Archive;
+pub use archive::{Archive, Decoding};
 pub use codec::{CodecPolicy, CodecRate, Verdict};
 pub use format::{ArchiveError, Chunk, Encoding};
 pub use manifest::{Entry, Extent, ManifestError, Node, NodeMeta, Xattr};

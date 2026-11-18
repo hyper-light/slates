@@ -37,6 +37,9 @@ pub mod grant;
 pub mod manifest;
 pub mod source;
 pub mod verdict;
+// The Windows attribute word a landed object takes from the volume's bits (A-451): the Windows writer's, and pure.
+#[cfg(any(windows, test))]
+mod windows_bits;
 
 #[cfg(unix)]
 pub mod os;
