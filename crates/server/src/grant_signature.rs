@@ -1,19 +1,15 @@
-//! A grant signed by a key only the human holds (R10, D-22, §4.13 "Grants", A-285; Ada, 2026-11-18,
-//! fs-server's option D). The human's surface is no longer a secret any process of the anchor's user can read from
-//! the anchor segment: it is an SSH signature (OpenSSH `PROTOCOL.sshsig`, namespace [`NAMESPACE`]) made by a key the
-//! human registered, held where an agent with a shell cannot use it unseen. That is an ssh-agent key added with
-//! `ssh-add -c`, whose agent asks the human through askpass to confirm every use, or a FIDO key (`sk-ssh-ed25519`),
-//! which needs a physical touch for each signature; [`verify_grant_signature`] refuses an `sk` signature whose
-//! authenticator did not report the touch (the user-presence flag).
+//! SSH signatures over slates' statements, verified against a set of keys (A-285): the verifier signed work stands on
+//! (Ada, 2026-11-18: "we can (and should) support signed work"). A merge or a landing may carry a signature that slates
+//! verifies and records as provenance, and a volume may require one; it never decides whether a write is permitted,
+//! which the write mode the user gave the agent does (R10, D-22). A signature is OpenSSH's `PROTOCOL.sshsig` under a
+//! namespace, by an `ssh-ed25519` key or a FIDO `sk-ssh-ed25519` key, and [`verify_grant_signature`] refuses an `sk`
+//! signature whose authenticator did not report the touch (the user-presence flag).
 //!
-//! **What is signed.** [`GrantStatement::encode`] is the exact text the human's key signs: the landing, the manifest
-//! hash the human saw, the target, the scope and term (all that [`crate::landing::grant_proof`] bound), plus a nonce
-//! the daemon chose when it presented the landing, so a signature cannot be made before the presentation or used for
-//! a second one, and an expiry in wall-clock seconds. It is plain text, one field a line, so `ssh-keygen -Y sign`
-//! signs it as a file and a human can read what they sign; the target carries its length, so no path can forge a
-//! later line. A WebAuthn assertion (kiln's confirmation surface, a passkey or security-key touch) can be an accepted
-//! form over the same bytes: its challenge is the statement's SHA-256 ([`GrantStatement::challenge`]); verifying
-//! that form is the next piece (GAPS).
+//! **What is signed.** [`GrantStatement::encode`] is the exact text a key signs: a landing, its manifest hash, its
+//! target, the scope and term, a nonce and an expiry in wall-clock seconds, plain text one field a line, so
+//! `ssh-keygen -Y sign` signs it as a file and a person can read what they sign; the target carries its length, so no
+//! path can forge a later line. It was built for A-285's first reading (a grant's proof, since withdrawn); signed
+//! work's own statement (a merge's volume, base, head and manifest) replaces it when that piece lands (GAPS).
 //!
 //! **Why here, with aws-lc-rs.** Ed25519 and the SHA-2 digests come from AWS-LC, slates' one cryptographic library
 //! (A-66), which the server already links on every platform through rustls. The format code is pure, and its golden
@@ -21,7 +17,7 @@
 //!
 //! **Refusals.** Every failure is a [`SignatureRefusal`]: malformed bytes, another namespace, an unsupported key or
 //! hash, a key not registered, a signature that does not verify, a security key not touched, or a statement past its
-//! expiry. Replays are refused where the nonce is spent, by the daemon that issued it.
+//! expiry.
 
 use aws_lc_rs::digest;
 use aws_lc_rs::signature::{ED25519, UnparsedPublicKey};
