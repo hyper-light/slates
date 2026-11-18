@@ -237,6 +237,37 @@ pub struct Daemon {
   /// The loopback port the NFS transport (§4.6) listens on, when it is serving; `None` if the
   /// listener could not be bound. A client mounts `nfs://localhost:PORT`.
   nfs_port: Option<u16>,
+  /// How many times the start beat before the watchdog took the beat over ([`StartBeat`]).
+  start_beats: u64,
+}
+
+/// The start's beat (§2.6 boot step 2, A-312): the supervision block's heartbeat, written by the starting thread after
+/// each unit of its work, until the watchdog thread takes the beat over and becomes its one writer
+/// ([`crate::watchdog::Watchdog::start`]). The anchor judges a start in its own CPU time until its first beat, and kills
+/// one whose thread runs a liveness window of CPU without beating; a beat is the start's progress. Until 2026-11-17
+/// nothing beat until the watchdog ran, after the runtime had made a ring for every ordered pair of shards, and on B10's
+/// Linux gate at load 70 the anchor killed every start of 407 shards ("ran 1009-1037 ms of CPU on one thread without
+/// beating"). Each unit is microseconds, so a start that progresses keeps beating however many shards it starts; one
+/// stuck in a unit stops beating, and the anchor judges its process by its CPU from the lapse (A-232). Counted, so the
+/// boot log says how often a start beat.
+struct StartBeat {
+  clock: HostClock,
+  beats: u64,
+}
+
+impl StartBeat {
+  fn new() -> StartBeat {
+    StartBeat {
+      clock: HostClock::new(),
+      beats: 0,
+    }
+  }
+
+  /// Beats `supervision` now.
+  fn beat(&mut self, supervision: &slates_anchor::Supervision<'_>) {
+    supervision.beat(slates_vfs::clock::Clock::monotonic_ns(&mut self.clock));
+    self.beats = self.beats.saturating_add(1);
+  }
 }
 
 impl std::fmt::Debug for Daemon {
@@ -786,6 +817,9 @@ impl Daemon {
         segment
       }
     };
+    // The start beats from here until the watchdog takes the beat over (§2.6 boot step 2, A-312; [`StartBeat`]).
+    let mut start_beat = StartBeat::new();
+    start_beat.beat(&segment.supervision()?);
     if let Ok(json) = profile.to_json() {
       segment.publish(RegionKind::Profile, json.as_bytes())?;
     }
@@ -823,8 +857,16 @@ impl Daemon {
         code: error.raw_os_error(),
       })
     })?;
-    // The control shard first, in start order (`shards.first()`): sized for every forward its lane admits.
-    let runtime = Runtime::start_sized(&config.runtime, &[config.control_shard_capacity().get()])?;
+    // The block the start beats, held across the runtime's start (`supervision` above says who reads the beat).
+    let beat_block = segment.supervision()?;
+    start_beat.beat(&beat_block);
+    // The control shard first, in start order (`shards.first()`): sized for every forward its lane admits. The start
+    // beats after each unit of the runtime's work, its pair rings above all, N(N-1) of them (`slates_rt::runtime`).
+    let runtime = Runtime::start_sized(
+      &config.runtime,
+      &[config.control_shard_capacity().get()],
+      &mut || start_beat.beat(&beat_block),
+    )?;
     let shards: Vec<ShardId> = runtime.shard_ids().to_vec();
     // The lock ledger's entry for this daemon starts empty, before any shard recovers and reserves again.
     crate::lock_ledger::reset(shards.first().map_or(0, |shard| shard.0));
@@ -909,6 +951,7 @@ impl Daemon {
           );
         }
       })?;
+      start_beat.beat(&beat_block);
     }
     // The doorbell, on the rendezvous opened above.
     let kicks: Vec<slates_rt::driver::Kick> = shards
@@ -934,6 +977,13 @@ impl Daemon {
       .iter()
       .filter_map(|shard| registry::holder_of(shard.0))
       .collect();
+    // The start's last beat, then the watchdog's thread takes the beat over: one writer at a time.
+    start_beat.beat(&beat_block);
+    slates_machine::log_line!(
+      "slates-server: the start beat {} times over {} shards before the watchdog took the beat over",
+      start_beat.beats,
+      shards.len()
+    );
     let watchdog = crate::watchdog::Watchdog::start(
       AnchorSegment::attach(&watch_handoff, watch_len, &identity)?,
       holders,
@@ -991,6 +1041,7 @@ impl Daemon {
       config,
       shards,
       nfs_port,
+      start_beats: start_beat.beats,
     })
   }
 
@@ -998,6 +1049,12 @@ impl Daemon {
   /// `nfs://localhost:PORT` to reach this daemon's volumes (those on its accepting shard, R8).
   pub fn nfs_port(&self) -> Option<u16> {
     self.nfs_port
+  }
+
+  /// How many times this daemon's start beat before its watchdog took the beat over (§2.6 boot step 2, A-312): at least
+  /// once a unit of the start's work, so at least once for every ordered pair of its shards.
+  pub fn start_beats(&self) -> u64 {
+    self.start_beats
   }
 
   /// The configuration.
