@@ -1,9 +1,9 @@
 //! Locating a remotely homed object (§4.8 Lookup, D-14). The creator is the initial route;
 //! after takeover, only a peer that holds the object's routing record can name its owner.
 //! A read-only exchange asks the admitted home-region peers, bounded by the existing session
-//! table and liveness budget. It never executes a client verb or grants authority. One cached
-//! route per client avoids repeating discovery for ordinary use, without a global catalog.
-//! Evidence: the five-node history in tests/fleet.rs and the dated remote-lookup bug report.
+//! table and the record plane's measured round budget over the slowest path it asks (A-437). It never executes a
+//! client verb or grants authority. One cached route per client avoids repeating discovery for ordinary use, without a
+//! global catalog. Evidence: the five-node history in tests/fleet.rs and the dated remote-lookup bug report.
 
 use slates_cluster::membership::Liveness;
 use slates_cluster::{CommitBudget, broadcast};
@@ -11,7 +11,7 @@ use slates_db::register::{HostId, ObjectId, RegionId};
 use slates_transport::connection::Priority;
 use slates_wire::Wire;
 
-use crate::daemon::{HEARTBEAT_NS, LIVENESS_BUDGET_NS};
+use crate::daemon::HEARTBEAT_NS;
 use crate::fleet::{POLL_PER_PERIOD, return_sessions, take_sessions};
 use crate::state::{self, ShardState};
 
@@ -355,11 +355,23 @@ fn count(counter: &'static str) {
   state::with_state(|state| state.count(counter, 1));
 }
 
-/// Whether a round may wait one more poll for sessions still out: no once the liveness budget is spent, or
-/// when no poll can be timed (a refused sleep, off a shard — never a spin, AUD-29-39); either way counted as
-/// sessions that never returned.
-async fn wait_for_returning_sessions(began: u64, poll_ns: u64) -> bool {
-  let spent = slates_rt::futures::now_ns().saturating_sub(began) >= LIVENESS_BUDGET_NS;
+/// Derived: the budget one location round asks its peers under (A-437, R3's class B): the record plane's round budget
+/// (`fleet::consensus_budget`) over the slowest measured round-trip tail among the peers it asks (`PathRtt`, RFC
+/// 6298's estimator per path). Its base deadline is the longer of a coordinator period and that tail, so a live peer
+/// whose path is slow is heard before the round can be judged stalled; it extends while replies keep arriving and ends
+/// once none has arrived for the stall window, as every record-plane exchange does; and its whole span
+/// (`max_deadline_ns`) is the longest one record-plane exchange runs, so a session lent out when the round begins comes
+/// back within it ([`wait_for_returning_sessions`]). Before A-437 a round asked within one liveness window, hard, and
+/// waited for lent sessions the same window, whatever the paths measured.
+fn round_budget_for(slowest_tail_ns: Option<u64>) -> slates_cluster::CommitBudget {
+  crate::fleet::consensus_budget(slowest_tail_ns)
+}
+
+/// Whether a round may wait one more poll for sessions still out: no once the round's span (`span_ns`, its budget's
+/// longest, [`round_budget_for`]) has passed since it began, or when no poll can be timed (a refused sleep, off a shard —
+/// never a spin, AUD-29-39); either way counted as sessions that never returned.
+async fn wait_for_returning_sessions(began: u64, span_ns: u64, poll_ns: u64) -> bool {
+  let spent = slates_rt::futures::now_ns().saturating_sub(began) >= span_ns;
   if spent || slates_rt::futures::sleep(poll_ns).await.is_err() {
     count("fleet.owner_location.session_never_returned");
     return false;
@@ -393,9 +405,24 @@ async fn locate_round(query: Query) -> (Result<HostId, LocationError>, Option<[u
       .collect::<std::collections::BTreeSet<_>>()
   })
   .unwrap_or_default();
+  // The round's budget: the record plane's, over the slowest path among the peers it may ask.
+  let budget = round_budget_for(
+    state::with_state(|state| {
+      peers
+        .iter()
+        .filter_map(|peer| {
+          state
+            .peer_paths
+            .get(peer)
+            .and_then(slates_cluster::timing::PathRtt::tail_ns)
+        })
+        .max()
+    })
+    .flatten(),
+  );
   let request = query.to_bytes();
   count("fleet.owner_location.round");
-  // One deadline for the whole round. A peer whose record session is out when the round starts (a
+  // One span for the whole round, its budget's longest. A peer whose record session is out when the round starts (a
   // coordinator dispatch or a discovery page has it, `fleet::take_sessions`) is asked once the session
   // comes back, polled at the fleet's interval; a round that skipped it could miss the owner and refuse
   // a lookup the owner would serve (docs/bugs/2026-09-25-a-forward-refused-while-the-owners-session-was-out.md,
@@ -412,9 +439,7 @@ async fn locate_round(query: Query) -> (Result<HostId, LocationError>, Option<[u
       unasked.remove(peer);
     }
     if !taken.is_empty() {
-      let remaining =
-        LIVENESS_BUDGET_NS.saturating_sub(slates_rt::futures::now_ns().saturating_sub(began));
-      ask(&mut answers, query, &request, taken, remaining, poll_ns).await;
+      ask(&mut answers, query, &request, taken, budget).await;
     }
     let out = sessions_out(&unasked);
     if out.is_empty() {
@@ -426,7 +451,7 @@ async fn locate_round(query: Query) -> (Result<HostId, LocationError>, Option<[u
       count("fleet.owner_location.session_out");
     }
     unasked = out;
-    if !wait_for_returning_sessions(began, poll_ns).await {
+    if !wait_for_returning_sessions(began, budget.max_deadline_ns(), poll_ns).await {
       break;
     }
   }
@@ -442,15 +467,14 @@ fn count_unsessioned(unasked: &std::collections::BTreeSet<HostId>) {
   }
 }
 
-/// Asks the peers whose sessions were `taken`, within `budget_ns`, folding every reply that arrives in
-/// time and returning each session.
+/// Asks the peers whose sessions were `taken`, under the round's `budget` ([`round_budget_for`]), folding every reply
+/// that arrives in time and returning each session.
 async fn ask(
   answers: &mut Answers,
   query: Query,
   request: &[u8],
   taken: Vec<(HostId, slates_transport::endpoint::Endpoint)>,
-  budget_ns: u64,
-  poll_ns: u64,
+  budget: CommitBudget,
 ) {
   let mut unanswered: std::collections::BTreeSet<HostId> =
     taken.iter().map(|(peer, _)| *peer).collect();
@@ -458,7 +482,6 @@ async fn ask(
     .into_iter()
     .map(|(peer, endpoint)| (peer, request.to_vec(), endpoint))
     .collect();
-  let budget = CommitBudget::hard(budget_ns, poll_ns);
   let (replies, mut stragglers) = broadcast(requests, STREAM, Priority::Metadata, budget).await;
   fold_replies(answers, query, replies, &mut unanswered);
   loop {
@@ -743,5 +766,31 @@ mod tests {
     answers.fold(query, HostId(1), &reply).unwrap();
     answers.fold(query, HostId(2), &reply).unwrap();
     assert_eq!(answers.finish(), Err(LocationError::ConflictingOwners));
+  }
+
+  /// R3's class B (B-a, A-437). Do: derive the budget a location round asks its peers under, with no path measured and
+  /// with the slowest asked path's round-trip tail at two liveness windows. Expect: with none measured, a round that
+  /// extends while replies keep arriving past its base deadline; with the slow path, a base deadline past that tail, so a
+  /// live peer two windows away is heard before the round can stall; and a span past the tail, which a lent session's
+  /// return is waited for within. Before, every round asked within one liveness window, hard, whatever the paths
+  /// measured, and gave its lent sessions the same window.
+  #[test]
+  fn a_location_round_waits_for_its_slowest_asked_peers_measured_round_trip() {
+    let quiet = round_budget_for(None);
+    assert!(
+      quiet.max_deadline_ns() > quiet.deadline_ns,
+      "a round extends while replies keep arriving"
+    );
+    let slow_tail = 2 * crate::daemon::LIVENESS_BUDGET_NS;
+    let slow = round_budget_for(Some(slow_tail));
+    assert!(
+      slow.deadline_ns >= slow_tail,
+      "the slowest asked path's tail is waited for before the round can stall: {} ns",
+      slow.deadline_ns
+    );
+    assert!(
+      slow.max_deadline_ns() > slow_tail,
+      "a lent session is waited for past the slowest path's tail"
+    );
   }
 }

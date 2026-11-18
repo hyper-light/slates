@@ -7625,12 +7625,7 @@ fn the_launcher_uses_slates_apparmor_profile_only_when_asked() {
   let report: serde_json::Value = serde_json::from_slice(&check.stdout)
     .unwrap_or_else(|e| panic!("apparmor check --json: {e}: {check:?}"));
   let readiness = report["readiness"].as_str().unwrap_or_default().to_owned();
-  match std::env::var(APPARMOR_REGIME_ENV).as_deref() {
-    Ok("loaded") => assert_eq!(readiness, "profile-loaded", "{report}"),
-    Ok("absent") => assert_eq!(readiness, "profile-missing", "{report}"),
-    Ok(other) => panic!("{APPARMOR_REGIME_ENV}={other}: expected `loaded` or `absent`"),
-    Err(_) => {}
-  }
+  assert_the_ci_regime(&readiness, &report);
   let root = build_output_dir("slates-apparmor-root");
   let at = build_output_dir("slates-apparmor-at");
   shell(&format!(
@@ -7640,8 +7635,33 @@ fn the_launcher_uses_slates_apparmor_profile_only_when_asked() {
   let on = launch_reporting(&root, &at, true);
   let left = shell(&format!("ls -A {at}"));
   shell(&format!("rm -rf {root} {at}"));
+  judge_apparmor_launches(&readiness, &report, &off, &on);
+  assert_eq!(left.trim(), "", "the host sees nothing at the chosen path");
+}
+
+/// When CI names this run's AppArmor regime (`APPARMOR_REGIME_ENV`), the check's readiness must be that regime's.
+#[cfg(target_os = "linux")]
+fn assert_the_ci_regime(readiness: &str, report: &serde_json::Value) {
+  match std::env::var(APPARMOR_REGIME_ENV).as_deref() {
+    Ok("loaded") => assert_eq!(readiness, "profile-loaded", "{report}"),
+    Ok("absent") => assert_eq!(readiness, "profile-missing", "{report}"),
+    Ok(other) => panic!("{APPARMOR_REGIME_ENV}={other}: expected `loaded` or `absent`"),
+    Err(_) => {}
+  }
+}
+
+/// The launches with the option off and on, judged by the host's readiness: under a loaded profile only the option's
+/// launch runs, unconfined and holding no grant; with the profile missing both are refused, the option's naming how to
+/// load it; on a host that refuses user namespaces outright, a loud skip; elsewhere both read the volume.
+#[cfg(target_os = "linux")]
+fn judge_apparmor_launches(
+  readiness: &str,
+  report: &serde_json::Value,
+  off: &Launched,
+  on: &Launched,
+) {
   let executable = report["executable"].as_str().unwrap_or_default();
-  match readiness.as_str() {
+  match readiness {
     "profile-loaded" => {
       assert_eq!(
         on.code, 0,
@@ -7694,13 +7714,11 @@ fn the_launcher_uses_slates_apparmor_profile_only_when_asked() {
       }
     }
   }
-  assert_eq!(left.trim(), "", "the host sees nothing at the chosen path");
 }
 
-/// A-370. Do: print slates' AppArmor profile for an installed path and for this binary's own, and check this host.
-/// Expect: the profile names the path and grants `userns,` in unconfined mode; a path the profile cannot name exactly
-/// is refused (exit 1) naming why; and the check reports the binary's path as the kernel records it, succeeding exactly
-/// where `exec` can make its namespace.
+/// A-370. Do: print slates' AppArmor profile for an installed path, and for a path it cannot name. Expect: the profile
+/// names the path and grants `userns,` in unconfined mode; a path the profile cannot name exactly is refused (exit 1)
+/// naming why.
 #[test]
 fn apparmor_prints_the_profile_and_checks_the_host() {
   let printed = slates()
@@ -7729,6 +7747,13 @@ fn apparmor_prints_the_profile_and_checks_the_host() {
     .unwrap();
   assert_eq!(refused.status.code(), Some(1), "{refused:?}");
   assert!(String::from_utf8_lossy(&refused.stderr).contains("cannot name exactly"));
+}
+
+/// A-370. Do: check this host, and print this binary's own profile. Expect: the check reports the binary's path as the
+/// kernel records it, succeeding exactly where `exec` can make its namespace, and the profile names that path; off
+/// Linux the check answers `unsupported`.
+#[test]
+fn apparmor_check_reports_this_binary_and_this_host() {
   let check = slates()
     .args(["apparmor", "check", "--json"])
     .output()

@@ -5406,6 +5406,10 @@ fn sample_pressure_hold() -> Option<(u16, Vec<u16>, u64)> {
 async fn free_room_of(origin: u16, shards: &[u16]) -> Vec<u64> {
   let mut free = Vec::with_capacity(shards.len());
   for &shard in shards {
+    // A wall bound, by its reason (A-435): the reap cadence's sample, taken on the control shard's reaper task beside
+    // its lease expiries and reaps; a shard that does not answer within a heartbeat reads as no room (counted), and
+    // the hold it would have taken goes to the others or to the debt the next growth takes on, so nothing is lost,
+    // while a wait in the shard's own time would hold the cadence's other work behind one busy shard.
     let room = crate::xshard::call_within(
       origin,
       shard,

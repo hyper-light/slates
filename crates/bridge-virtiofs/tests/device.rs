@@ -3881,13 +3881,23 @@ fn a_device_parses_setxattr_in_the_form_its_guests_init_reply_kept() {
       "and its setter's flag cleared the set-group-ID bit"
     );
   }
+  a_hosts_device_keeps_the_short_form(&mut vol, &mut store, (&cx, offered, object));
+}
+
+/// The same INIT and a short-form SETXATTR of a user attribute through a device whose bridge is a host's: the host's
+/// mount is asked for no ACL, so its device keeps the short form, and the SETXATTR is served as one.
+fn a_hosts_device_keeps_the_short_form(
+  vol: &mut slates_vfs::volume::Volume,
+  store: &mut slates_vfs::volume::Store,
+  (cx, offered, object): (&OpContext, u32, ObjectId),
+) {
   let (mut device, mut driver) = device_and_driver();
-  let mut host = VolumeBridge::new(vid(), &mut vol, &mut store);
+  let mut host = VolumeBridge::new(vid(), vol, store);
   let init = exchange_once(
     &mut device,
     &mut driver,
     &mut host,
-    &cx,
+    cx,
     &message(Opcode::Init.to_wire(), 1, 0, &init_body(offered)),
   );
   assert_eq!(reply_error(&init), 0);
@@ -3899,7 +3909,7 @@ fn a_device_parses_setxattr_in_the_form_its_guests_init_reply_kept() {
     &mut device,
     &mut driver,
     &mut host,
-    &cx,
+    cx,
     &message(
       Opcode::SetXattr.to_wire(),
       2,
@@ -3908,5 +3918,5 @@ fn a_device_parses_setxattr_in_the_form_its_guests_init_reply_kept() {
     ),
   );
   assert_eq!(reply_error(&set), 0, "the short form is served as one");
-  assert_eq!(host.xattr_get(object, &cx, b"user.note").unwrap(), b"kept");
+  assert_eq!(host.xattr_get(object, cx, b"user.note").unwrap(), b"kept");
 }

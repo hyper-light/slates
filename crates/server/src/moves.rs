@@ -519,6 +519,9 @@ pub(crate) async fn drive_outgoing(
   let shards = state::with_state(|s| s.shards.clone()).unwrap_or_default();
   let mut moves: Vec<(u16, Outgoing)> = Vec::new();
   for shard in shards {
+    // A wall bound, by its reason (A-435): a pure read of the shard's moves, made each record period, so a shard that
+    // does not answer within the period has its moves decided at the next, and the period's other work (the takeovers
+    // and materializations after it) is not held behind one busy shard.
     let outgoing = crate::xshard::call_within(origin, shard, outgoing, crate::daemon::HEARTBEAT_NS)
       .await
       .unwrap_or_default();
@@ -1033,11 +1036,15 @@ async fn settle_adopted(
   .flatten() else {
     return;
   };
-  let progress = crate::xshard::call_within(
+  // Waited in the owner shard's own time (A-435): the seal it takes is not taken twice for one answer, so an answer
+  // dropped at a period's end while the shard worked took a second seal the next period, superseding the first, and
+  // left the adopted snapshot it should have dropped. Only a shard that stopped, or ran a window of CPU without
+  // answering, is asked again next period.
+  let progress = crate::xshard::call_in_shard_time(
     origin,
     shard,
     move |s| seal_adopted(s, key, sealed),
-    crate::daemon::HEARTBEAT_NS,
+    crate::daemon::LIVENESS_BUDGET_NS,
   )
   .await;
   match progress {
@@ -1426,6 +1433,115 @@ fn note_adopted(state: &mut ShardState, key: ObjectId, register: ObjectId) {
 mod tests {
   use super::*;
   use slates_db::register::Quorum;
+
+  /// Shape: the owner shard's one busy poll in the seal test, three periods of wall time, so a settle waited one period
+  /// on the wall gives up.
+  const BUSY_NS: u64 = 3 * crate::daemon::HEARTBEAT_NS;
+  /// Shape: how long the test thread waits for the settle's answer: ten busy polls.
+  const ANSWER_WAIT_NS: u64 = 10 * BUSY_NS;
+
+  /// R3's class A (A-435). Do: on a two-shard daemon, make a volume on the second shard, record its adoption on the
+  /// first, hold the second in one poll for three periods of wall time on its CPU a fifth of it (a busy or starved
+  /// shard), and settle the adoption from the first. Expect: the seal the owner shard took recorded in the adoption,
+  /// after more than a period of waiting. The settle waited a period on the wall, so the seal's answer was dropped while
+  /// the shard took it, and the next period's settle took a second seal and left the adopted snapshot behind.
+  #[test]
+  fn an_adopted_moves_seal_is_recorded_from_an_owner_shard_that_works_past_a_period() {
+    let daemon = crate::daemon::audit_daemon_of(2);
+    let (sent, answered) = std::sync::mpsc::sync_channel(1);
+    crate::daemon::observe_first(&daemon, move |state| {
+      let origin = state.shard;
+      let partitions = state.shards.len();
+      let (partition, target) = state
+        .shards
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, shard)| *shard != origin)
+        .unwrap();
+      let partition = u16::try_from(partition).unwrap();
+      let name = (0u32..)
+        .map(|n| format!("moved-{n}"))
+        .find(|name| crate::verbs::owner_of_name(name, partitions) == partition)
+        .unwrap();
+      let local = state.fleet.host();
+      let task = slates_rt::futures::spawn(async move {
+        let principal = Principal::Uid {
+          host: HostId(0),
+          uid: 1234,
+        };
+        let created = crate::xshard::call_in_shard_time(
+          origin,
+          target,
+          move |s| {
+            crate::verbs::dispatch(
+              s,
+              1,
+              &principal,
+              slates_ipc::protocol::RequestBody::Create {
+                name,
+                size: slates_ipc::protocol::SizeClass::Dynamic { max: 1 << 20 },
+                names: slates_ipc::protocol::NamePolicy::Exact,
+                require_locked: false,
+                base: None,
+              },
+            )
+          },
+          crate::daemon::LIVENESS_BUDGET_NS,
+        )
+        .await;
+        let Some(ReplyBody::Created { id }) = created else {
+          let _ = sent.send(Err(format!("the volume was not made: {created:?}")));
+          return;
+        };
+        let key = ObjectId(id.bytes);
+        let _ = state::with_state(|s| {
+          s.move_adoptions
+            .insert(key, MoveAdoption::new(0, HostEpoch(1)))
+        });
+        // The busy poll goes first on the owner shard's channel, so the settle waits behind it.
+        let busy = crate::xshard::call_on(origin, target, || {
+          crate::daemon::hold_busy(BUSY_NS);
+          Some(())
+        });
+        drop(busy);
+        let started = std::time::Instant::now();
+        let mut in_flight = Vec::new();
+        settle_adopted(
+          origin,
+          local,
+          key,
+          crate::fleet::live_budget(),
+          &mut in_flight,
+        )
+        .await;
+        let waited = started.elapsed();
+        let sealed = state::with_state(|s| {
+          s.move_adoptions
+            .get(&key)
+            .and_then(|adoption| adoption.sealed)
+        })
+        .flatten();
+        let _ = sent.send(Ok((sealed.is_some(), waited)));
+      })
+      .unwrap();
+      slates_rt::futures::detach(task).unwrap();
+    });
+    let answer = answered.recv_timeout(std::time::Duration::from_nanos(ANSWER_WAIT_NS));
+    daemon.stop();
+    let (sealed, waited) = answer
+      .expect("the settle answered")
+      .expect("the volume was made");
+    println!("a settle behind a busy poll of {BUSY_NS} ns: sealed {sealed} after {waited:?}");
+    assert!(
+      sealed,
+      "the seal an owner shard took while busy was not recorded (after {waited:?}): the next period would seal again"
+    );
+    assert!(
+      waited > std::time::Duration::from_nanos(crate::daemon::HEARTBEAT_NS),
+      "the settle ended within one period ({waited:?}), before its owner shard's busy poll did"
+    );
+  }
 
   /// Shape: the scatter width the regions of these tests are formed with (every member a neighbour of every other).
   const SCATTER: u64 = 0;

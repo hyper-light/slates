@@ -706,7 +706,7 @@
 > Record: `docs/bugs/2026-11-18-the-watchdogs-end-left-its-writer-unjoined.md`.
 
 > **Open (g222, 2026-11-17, A-273): rebases and named-version reads of a green on the shards holding its works.**
-> Designed; steps 1 and 2 of five built. The owner spends 51–53% of its wall on verdicts and rebases at the 3,000-client rung (W1),
+> Designed; steps 1, 2 and 3 of five built. The owner spends 51–53% of its wall on verdicts and rebases at the 3,000-client rung (W1),
 > rebases the larger share (about 71,000 a run against 49,000 verdicts), and W1's rebase at 1,000 clients is slower
 > than main's because it crosses to the owner. A replica holds the green's metadata (about 14.2 MB at the rung, 3.8% of
 > a shard's 373.5 MB metadata budget on the Studio) and reads the owner's content in place, never a copy (the
@@ -717,9 +717,12 @@
 > g083):** the replica and its feed (`crates/merge/src/replica.rs`): built from the owner's checkpoint at its head and
 > its feed position, fed each committed version and each fold in order, a gap or a version that would replay as
 > another refused unchanged and the replica rebuilt, counted; equal to the owner at every version over generated
-> histories with messages late, lost or in flight across a rebuild (`crates/merge/tests/replica.rs`). Its content is
-> its own until step 3. **Owed, in order:** the engine's content in sealed blocks another shard may read; the lag
-> bound that drops a replica holding too much; the code on the shards; the supervisor's A/B.
+> histories with messages late, lost or in flight across a rebuild (`crates/merge/tests/replica.rs`). **Built (step 3,
+> 2026-11-18, g083):** the green's content in sealed blocks (`slates_mem::sealed`), current files and history chunks
+> alike: a replica is made from the owner whole and reads the owner's blocks in place, holding no content of its own
+> (its current bytes are the owner's memory, by pointer, in the oracle); its replay adopts the owner's blocks in order,
+> checked byte for byte; the owner frees a released block once every replica has passed its release. **Owed, in
+> order:** the lag bound that drops a replica holding too much; the code on the shards; the supervisor's A/B.
 >
 > **A Shards guest's unprivileged run could not write a host-owned volume: built, the stream takes Shards' owner word
 > (2026-11-18, §4.6 the Shards form; A-281; goal g268).** Shards' init names the run's owner on a share's root with
@@ -3123,15 +3126,14 @@
 >     request at 0.47 to 1.33 ms, the Mac Studio, 50 ms think mean). **Owed, measurement (the supervisor's):** the
 >     rung under the set rule (`--tree <linux-v7.4-rc1>/fs`) at think means of 200, 100, 50 and 20 ms.
 >
->     **The harness's workers park instead of spinning (2026-11-18, g083, A-421).** Each worker spun for its whole
->     level, a core each taken from the daemon it measured; on the loaded Mac Studio its sweeps took 25 to 127 ms and
->     held 6.9 clients on average against 2.2 in flight. A worker now sweeps on for the daemon's published spin window
->     after its last reply or send, then arms every connection with a request in flight and parks on their completions
->     until a reply or its next deadline, waking early by the spin window and its parks' measured lateness. The
->     `harness` row counts the parks. Unit tests: a worker parked with its request in flight is woken by the reply, and
->     with nothing in flight meets its deadline. **Owed, measurement (the supervisor's):** the A/B of main's spinning
->     harness against the parking one at the same daemon (`held`, `max_sweep_ns`, every kind's `latency` and `floor`
->     p99).
+>     **The harness's workers parking between replies: measured and rejected (2026-11-18, g083, A-421).** Each worker
+>     spins for its whole level, a core each taken from the daemon it measures. A-421 had a worker park on its
+>     connections' completions between replies and sends; the supervisor's A/B (run r155, the Mac Studio, `fs/`, 1,000
+>     clients, load 6 to 27) found the longest sweep shorter in 1 pair of 6, no client held either way, and the p99 worse
+>     once the box was loaded (an edit's 26.9 ms against 8.6 ms at load 25 to 28), so the parking was taken back out the
+>     same day and its lint fixes kept (BENCHMARKS, "A load-test worker that parks between replies"). The same runs
+>     show the goals' remaining gap: every edit and submit p99 under 1 ms at the lightest load but one run, 3 to 35 ms
+>     from load 11 to 28.
 >
 >     **Owed, measurement (the supervisor's):** the 1,000-client rung on main with W1 (A-247 step one, landed
 >     2026-11-17) against main before it (02c6469e5). Each think mean runs as its own invocation with a fresh daemon,
@@ -3684,10 +3686,33 @@
 >   the claim reconciliation and re-admission (the record period's, before its materializations), and the live
 >   dispatch's wait (its lanes bounded by the live budget, its answer unread); and a work's verb held for its quorum
 >   commit or its route (A-434, goal g255: the owner lease's bound, about 0.9 s; now the failover delay, a held reply's
->   total, A-354/A-375, `work_home::park_bound_ns`). Owed in class A: ten of the 25 `xshard::call_within` and
->   `task_within` sites on the wall (`moves.rs` 2, `daemon.rs`, `verbs.rs`, `takeover.rs`, `shards_route.rs`,
->   `remote_attach.rs`, `mirror.rs`, `fleet.rs`, `anchor_hold_windows.rs`; g251's since 2026-11-18). Class B (the
->   transport's round-trip estimate) is open, but for the forward lane's stall (2026-11-18, A-315, goal g255): a batch
+>   total, A-354/A-375, `work_home::park_bound_ns`). Then an adopted move's seal, a takeover's give-up record and a
+>   revocation's wait for its fenced FUSE mounts (A-435, 2026-11-18, g251: the seal is not idempotent, so an answer
+>   dropped at a period's end took a second seal the next period and left the adopted snapshot behind; the give-up is
+>   one attempt, so a busy owner shard left its objects unrecorded for good;
+>   `an_adopted_moves_seal_is_recorded_from_an_owner_shard_that_works_past_a_period`,
+>   `a_given_up_object_is_recorded_on_an_owner_shard_that_works_past_a_period`). Kept on the wall by their reason, stated
+>   beside each: the record period's read of each shard's moves (a pure read, asked again next period) and the pressure
+>   sampler's free-room read (the reap cadence's, a shard unanswered reading as no room, which the debt covers). Then the
+>   last five (A-440, 2026-11-18, g251): the Shards route's take of an offer (macOS) and the Windows anchor's hold now
+>   wait in their owner shard's own time, since each has a side effect its caller must learn of (the take retires the
+>   offer and hands its ends over once, which a late answer dropped; the anchor's hold keeps what its caller took for
+>   unheld), the route's wall bound now held to the client's part alone
+>   (`a_claims_take_waits_for_an_owner_shard_that_works_past_its_budget`); kept on the wall by their reason, stated
+>   beside each: a dead client's reap at remote owners (its waits are remote, the forward lane's, and the reap is
+>   idempotent there, sent again by the next sweep), the mirror's record shipping (the record period's, a shipment built
+>   once and resent unchanged) and a taken-over volume's making (the period's, A-397: the making runs on and the next
+>   attempt joins it in the owner shard's own time). **Class A is closed:** every `xshard::call_within` and
+>   `task_within` left waits for a reason stated beside it (the caller's own period or cadence, a remote wait, or a
+>   peer's one-at-a-time serve), and every other cross-shard wait is judged in its target's own time. Owed, found on the
+>   way: an adopted move's seal is still taken again when its answer is lost to a stopped shard; recording the seal on
+>   the owner shard would make `moves::seal_adopted` idempotent. Class B (the
+>   transport's round-trip estimate) is open, but for the owner-location round (2026-11-18, A-437, goal g255: one
+>   liveness window, hard, for its asks and its lent sessions; now the record plane's round budget over the slowest
+>   asked path's measured tail, `owner_location::round_budget_for`), an operator's promotion forwarded to the root
+>   group's leader (A-439: one liveness window; now the stall every forward over a leader session takes, the window and
+>   the path's measured round-trip tail, `verbs::forward_stall_ns`) and the forward lane's stall (2026-11-18, A-315,
+>   goal g255): a batch
 >   quiet for its budget is given up only once a turn of its lane begun after the silence was seen has read the
 >   session's own socket empty, or found no session at all, so an origin kept off its CPU reads its owner's replies
 >   before it calls the owner silent, and the failover bound from the forward's first send caps it
@@ -11249,8 +11274,11 @@ since A-402, which also makes the log option 2 names available to the WinFsp dri
 >      through the host, copying the file up first, as the bridge did
 >      (`a_replayed_write_into_an_overlays_base_file_keeps_the_disks_bytes_around_it`, red once without the fix: byte 0
 >      differed; `docs/bugs/2026-11-18-a-replayed-write-into-an-overlays-base-file-zeroed-the-bytes-before-it.md`).
->   3. When the log is full, its forced publication counts the write as logged only if it left nothing out. A captured
->      volume's write is then reported lost, though the image holds it.
+>   3. **Fixed 2026-11-18 (A-436):** when the log was full, its forced publication counted the write as logged only if
+>      it left nothing out, so a captured volume's write marked the overflow and was reported lost though the image held
+>      it. The write is now settled by its own volume: captured, the image keeps it; left out, it is appended again into
+>      the room the retain gave back
+>      (`docs/bugs/2026-11-18-a-full-logs-forced-publication-reported-a-captured-volumes-write-as-lost.md`).
 > - **Record.** `docs/bugs/2026-11-18-a-left-out-volumes-logged-writes-were-dropped-at-the-next-restart.md`.
 
 ### 2026-10-06: restarts are a few milliseconds for every client (A-113 follow-ups, A-114)
