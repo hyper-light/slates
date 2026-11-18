@@ -60,7 +60,9 @@ error first and answered in words. The integrator found the first while fixing
 
 Each is now `Refusal::Volume { IsDirectory }` or `{ NotDirectory }`. The tests came first, one per site, in
 `crates/client/tests/client.rs`: `a_read_map_of_a_directory_is_refused_typed`,
-`a_read_of_a_directory_is_refused_typed_whole_or_paged` and `listing_a_file_is_refused_typed`.
+`a_read_of_a_directory_is_refused_typed_whole_or_paged` (since g247's landing `a_paged_read_of_a_directory_is_refused_typed`:
+the whole-file `Read` and `read_plain` are retired by A-267, the verb refused `Unsupported` in its published wire
+place) and `listing_a_file_is_refused_typed`.
 
 The sweep for every other spelling found no further volume-core error in words. It did find 11 arms in
 `crates/server/src/verbs.rs` (lines 5885, 5917, 6113, 6198, 8955, 8998, 9206, 10414, 10487, 11608 and 11632 on
