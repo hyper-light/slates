@@ -1,0 +1,39 @@
+# Diagnostics for kiln goal g260 (never main): the Linux compile and unit tests of slates-guest-probe and of the guest
+# test binaries of slates-cli, whose code is Linux-only; kiln's Linux runner froze the same run (2026-11-18). No guest
+# runs here: without SLATES_GUEST_* each guest test skips loudly.
+name: diag-g260
+on:
+  push:
+    branches: ['diag-g260-*']
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format of the touched crates
+        run: cargo fmt -p slates-guest-probe -p slates-cli --check
+      - name: Probe unit tests
+        run: cargo test --locked -p slates-guest-probe
+      - name: Probe clippy
+        run: cargo clippy --locked -p slates-guest-probe --all-targets -- -D warnings
+      - name: Probe docs
+        env:
+          RUSTDOCFLAGS: -D warnings -A rustdoc::private_intra_doc_links
+        run: cargo doc --locked -p slates-guest-probe --no-deps --document-private-items
+      - name: Probe static release build, as the live-guest lane builds it
+        run: |
+          host=$(rustc -vV | sed -n "s/^host: //p")
+          RUSTFLAGS="-C target-feature=+crt-static" cargo build --locked --release -p slates-guest-probe \
+            --bin slates-guest-probe --target "$host" --target-dir target/probe
+      - name: Guest test binaries (each guest test skips loudly without a VMM)
+        run: cargo test --locked -p slates-cli --test guest_vhost --test guest_dax --test guest_image --test vm_harness -- --nocapture
+      - name: The pmem test binary compiles
+        run: cargo test --locked -p slates-cli --test pmem --no-run
+      - name: Clippy of the guest test binaries
+        run: cargo clippy --locked -p slates-cli --test guest_vhost --test guest_dax --test guest_image --test vm_harness --test pmem -- -D warnings
