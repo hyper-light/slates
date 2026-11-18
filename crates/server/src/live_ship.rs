@@ -884,21 +884,36 @@ pub(crate) fn durable_target(
   volume: slates_db::catalog::VolumeId,
 ) -> Option<u64> {
   let live = state.live.shipping.get(&volume.bytes)?;
-  let head = live.shipper.head().map(|head| head.position);
-  if live.fenced.is_some() {
+  owed_position(
+    live.shipper.head().map(|head| head.position),
+    live.owes_whole,
+    live.fenced.is_some(),
+    answerable(state, volume.bytes),
+  )
+}
+
+/// The decision of [`durable_target`], over what it reads of the volume's shipper: its `head` position, whether it
+/// `owes_whole` a record for a publication that could not become an entry, whether this owner is `fenced`, and the
+/// position its writers may be answered at (`answerable`, `None` while the fleet does not know the volume: a takeover
+/// could not find it, so nothing written to it is durable). An owed record is waited for whether the volume's head is
+/// placed or not: before 2026-11-18 the unplaced case returned the head as it stood, so a reply waited for nothing when
+/// nothing had shipped and one position short of its write otherwise.
+fn owed_position(
+  head: Option<u64>,
+  owes_whole: bool,
+  fenced: bool,
+  answerable: Option<u64>,
+) -> Option<u64> {
+  if fenced {
     // Nothing this owner holds becomes durable again: the caller defers, and the deferral refuses.
     return Some(head.unwrap_or(0));
   }
-  if !head_placed(state, volume.bytes) {
-    // The fleet does not know the volume yet: a takeover could not find it, so nothing written to it is durable.
-    return head;
-  }
-  let target = if live.owes_whole {
+  let target = if owes_whole {
     head.map_or(Some(0), |head| head.checked_add(1))?
   } else {
     head?
   };
-  if !live.owes_whole && answerable(state, volume.bytes).is_some_and(|durable| durable >= target) {
+  if !owes_whole && answerable.is_some_and(|durable| durable >= target) {
     return None;
   }
   Some(target)
@@ -4106,6 +4121,50 @@ fn meta_of(inode: &InodeImage) -> slates_archive::NodeMeta {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// A-200, every transport's durability claim: do ask the position a reply must wait for when the publication behind it
+  /// could not become an entry (the credit full with every candidate stopped), so the volume owes a whole record, while
+  /// the fleet does not yet know the volume (its head unplaced). Expect the position that record will be appended at:
+  /// the next one after the head, or the first when nothing was shipped yet. Before, the unplaced case returned the head
+  /// as it stood, ignoring the owed record: with nothing shipped a stable NFS write, a FUSE or virtio-fs `fsync`, a
+  /// WinFsp flush or a map sync waited for nothing and answered durable; with a head it waited one position short, so
+  /// once the head was placed the reply was answered with the write it claimed held only in the record still owed.
+  #[test]
+  fn a_reply_whose_publication_owes_a_whole_record_waits_for_that_record_placed_or_not() {
+    // Unplaced, nothing is answerable (`answerable` is `None`); placed, the head the holders hold durably.
+    for (placed, answerable_at_head) in [(false, None), (true, Some(4))] {
+      assert_eq!(
+        owed_position(None, true, false, None),
+        Some(0),
+        "nothing shipped yet, placed {placed}: the owed record's position is the first"
+      );
+      assert_eq!(
+        owed_position(Some(4), true, false, answerable_at_head),
+        Some(5),
+        "head 4, placed {placed}: the owed record lands at 5"
+      );
+      assert_eq!(
+        owed_position(Some(4), false, true, answerable_at_head),
+        Some(4),
+        "fenced, placed {placed}: the head, which the deferral refuses"
+      );
+    }
+    assert_eq!(
+      owed_position(Some(4), false, false, None),
+      Some(4),
+      "nothing owed, unplaced: the head"
+    );
+    assert_eq!(
+      owed_position(Some(4), false, false, Some(4)),
+      None,
+      "durable and answerable at the head: nothing to wait for"
+    );
+    assert_eq!(
+      owed_position(None, false, false, None),
+      None,
+      "nothing published and nothing owed: nothing to wait for"
+    );
+  }
 
   /// Format: the head a test's takeover adopted: the dead owner's epoch and a position it had made durable.
   const ADOPTED: Head = Head {
