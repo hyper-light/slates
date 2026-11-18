@@ -2685,7 +2685,15 @@
 >   checks run on the dry run. Dry runs on 2026-11-05 published nothing: seven wheels and the sdist passed `twine
 >   check` (run 42048582138), and seven addons each landed in their package (run 42055543098).
 > - **Owed to Ada:** a release is published only when a maintainer pushes a real tag `v<version>` and publishes its
->   draft (`docs/publish.md`). The test draft is never to be published.
+>   draft (`docs/publish.md`, "The publish step", which lists what the publish needs from her). The test drafts are
+>   never to be published.
+> - **The dry run stages the whole release (2026-11-17, A-320).** Before, a run with no tag stopped after the builds,
+>   and only the two test tags had ever checked the checksums, the copies' comparison and the provenance. Now a
+>   read-only `stage` job runs in every run. It makes and checks `SHA256SUMS`, compares each target's two copies and
+>   writes the provenance and a publish plan. It keeps them as the run's `release-staged` artifact. Only a tag's
+>   `draft release` job signs and drafts, from exactly those files. Dry run 44261010043 (2026-11-18, commit
+>   44c7cc17): all fourteen copies passed their smoke tests, the seven pairs were byte for byte the same, and
+>   `SHA256SUMS` checked. Nothing was signed or released: no tag, no draft, no attestation. A-320 has the numbers.
 > - **Closed 2026-11-05 by 68b9cb05 (A-213): the anchor aborted when its stderr closed** (found by the smoke test,
 >   2026-11-04: `slates anchor 2>&1 >/dev/null | head -n 1` exited 134, because `eprintln!` panics on EPIPE under
 >   `panic = "abort"`). Every shipped print site now writes through `slates_machine::log`, which counts a refused line
