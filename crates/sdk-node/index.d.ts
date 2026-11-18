@@ -83,6 +83,10 @@ export class Client {
   static connect(instance: string, replyNs: number, reconnectNs: number): Client
   clientId(): number
   reconnects(): number
+  /** Spins this long (nanoseconds) for a synchronous call's reply before parking; `null` restores the wake estimate. */
+  spinFor(spinNs: number | null): void
+  /** `[parks, replies]`: the synchronous calls that parked for their reply, and the replies taken. */
+  parkRatio(): [number, number]
   create(name: string, sizeBytes: number, dynamic?: boolean, fold?: boolean, requireLocked?: boolean, base?: string): string
   snapshot(volume: string): number
   status(volume: string): VolumeStatus

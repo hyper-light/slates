@@ -1795,6 +1795,7 @@ mod tests {
       completion: None,
       signature: None,
       folded_below: 0,
+      checkpoint_floor: 0,
     }
   }
 

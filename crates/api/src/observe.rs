@@ -60,7 +60,7 @@ pub struct AuditRecord {
   /// How the landing's signature was judged (signed work, A-321), on a record of the landing as a whole — its
   /// presentation's and a granted run's [`AuditKind::LandingPlanned`], its [`AuditKind::LandingFinished`]
   /// ([`Verification::Unsigned`] when it carried none): the landing's provenance. `None` on every other record, and on
-  /// the end of a landing refused before anything named its manifest, which had no statement to judge.
+  /// one that names no manifest, which had no statement to judge.
   pub verification: Option<Verification>,
 }
 

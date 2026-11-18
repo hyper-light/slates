@@ -7281,6 +7281,7 @@ mod tests {
         completion: None,
         signature: None,
         folded_below: 0,
+        checkpoint_floor: 0,
       };
       let record = Record {
         owner,
@@ -9531,6 +9532,7 @@ mod tests {
         completion: None,
         signature: None,
         folded_below: 0,
+        checkpoint_floor: 0,
       };
       let record = Record {
         owner,
