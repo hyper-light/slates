@@ -4009,3 +4009,5 @@ slates daemon: nfs_v4_opens = 2484716: max_inodes × shards (anchors ["max_inode
 slates daemon: nfs_v4_locks = 2484716: max_inodes × shards (anchors ["max_inodes", "shards"])
 slates daemon: control_shard_capacity = ShardCapacity { tasks: 10593, timers: 10593 }: tasks_per_shard + forward_lane_bound, timers_per_shard + forward_lane_bound (the lane's bound zero with no peers) (anchors ["tasks_per_shard", "timers_per_shard", "clients_per_shard", "region.slots", "shards", "fleet.peers"])
 ## run 10 of 10 done, 2026-11-18T11:05:24Z
+To https://github.com/hyper-light/slates
+   5ec1334..63d185c  63d185c8a8b3567ec71f19227301dd26ac0861a1 -> diag-results/g258-44279316423-regress-x86
