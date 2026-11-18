@@ -13873,6 +13873,122 @@ fn a_successor_restarted_before_any_write_keeps_the_live_volume_it_took_over() {
   );
 }
 
+/// Probe helper (never for main): every daemon's live lines for `volume`, host epoch and nonzero live counters.
+fn probe_dump(daemons: &[Daemon], volume: VolumeId, tag: &str) {
+  for daemon in daemons {
+    let mut client = Client::connect(daemon.instance());
+    let ReplyBody::DaemonStatus { report } = client.call(&RequestBody::DaemonStatus) else {
+      eprintln!("probe3 {tag}: {} no status", daemon.instance());
+      continue;
+    };
+    let lines: Vec<String> = report
+      .shards
+      .iter()
+      .flat_map(|shard| shard.live.iter())
+      .filter(|live| live.volume == volume)
+      .map(|live| {
+        format!(
+          "holding {} head {:?} durable {:?} owed {} head_epoch {:?} fence {} holders {:?} recorded {:?}",
+          live.holding, live.head, live.durable, live.owed, live.head_epoch, live.fence, live.holders, live.recorded
+        )
+      })
+      .collect();
+    let counters: Vec<(String, u64)> = summed_counters(daemon)
+      .into_iter()
+      .filter(|(name, count)| *count > 0 && (name.starts_with("fleet.live") || name.starts_with("lease.")))
+      .map(|(name, count)| (name.to_owned(), count))
+      .collect();
+    eprintln!(
+      "probe3 {tag}: {} host {} host_epoch {} live {lines:?} counters {counters:?}",
+      daemon.instance(),
+      report.fleet.host,
+      report.fleet.host_epoch
+    );
+  }
+}
+
+/// Probe helper: one write through `instance` to `volume`, timed, a client deadline caught.
+fn probe_write(instance: &str, volume: VolumeId, tag: &str) {
+  let mut client = Client::connect(instance);
+  let attached = client.call(&RequestBody::Attach {
+    volume,
+    snapshot: None,
+    intent: Intent::Write,
+    form: AttachRequest::Root,
+  });
+  let ReplyBody::Attached { attachment, .. } = attached else {
+    eprintln!("probe3 {tag}: attach {attached:?}");
+    return;
+  };
+  let started = std::time::Instant::now();
+  let after = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    client.call(&RequestBody::FsWrite {
+      volume,
+      attachment,
+      path: format!("/after-{tag}"),
+      bytes: b"after".to_vec(),
+      mode: 0o644,
+    })
+  }));
+  eprintln!("probe3 {tag}: write after {:?}: {after:?}", started.elapsed());
+}
+
+/// Probe (never for main): a successor restarted warm right after its live takeover, then one write through it.
+#[test]
+fn probe3_a_successor_restarted_warm_takes_a_write() {
+  let _serial = serialize_fleet_tests();
+  let (mut fleet, mut daemons, hosts, (id, _written)) = anchored_fleet_with_a_live_volume(
+    &["probe3s-a", "probe3s-b", "probe3s-c"],
+    "probe3s",
+  );
+  let successor =
+    rendezvous_first(&[hosts[1], hosts[2]], ObjectId(id.bytes)).expect("a survivor takes over");
+  let index = usize::from(successor != hosts[1]);
+  let before = summed_counters(&daemons[index + 1]).get(LIVE_TAKEN_OVER).copied().unwrap_or(0);
+  probe_dump(&daemons, id, "before-stop");
+  daemons.remove(0).stop();
+  let instance = daemons[index].instance().to_owned();
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let taken = poll_until(&observed, SERVE_DEADLINE, || {
+    Ok(summed_counters(&daemons[index]).get(LIVE_TAKEN_OVER).copied().unwrap_or(0) > before)
+  });
+  drop(observed);
+  eprintln!("probe3 successor: taken {taken}");
+  probe_dump(&daemons, id, "after-takeover");
+  daemons.remove(index).stop();
+  daemons.insert(index, fleet.start(index + 1));
+  let served = poll_status_answers(&daemons.iter().collect::<Vec<_>>(), &instance, id);
+  eprintln!("probe3 successor: served after restart {served}");
+  probe_dump(&daemons, id, "after-restart");
+  probe_write(&instance, id, "successor-restart");
+  probe_dump(&daemons, id, "after-write");
+  for daemon in daemons {
+    daemon.stop();
+  }
+}
+
+/// Probe (never for main): a live volume's own owner restarted warm at once, then one write through it.
+#[test]
+fn probe3_a_live_owner_restarted_warm_takes_a_write() {
+  let _serial = serialize_fleet_tests();
+  let (mut fleet, mut daemons, _hosts, (id, _written)) = anchored_fleet_with_a_live_volume(
+    &["probe3o-a", "probe3o-b", "probe3o-c"],
+    "probe3o",
+  );
+  probe_dump(&daemons, id, "before-restart");
+  daemons.remove(0).stop();
+  daemons.insert(0, fleet.start(0));
+  let instance = daemons[0].instance().to_owned();
+  let served = poll_status_answers(&daemons.iter().collect::<Vec<_>>(), &instance, id);
+  eprintln!("probe3 owner: served after restart {served}");
+  probe_dump(&daemons, id, "after-restart");
+  probe_write(&instance, id, "owner-restart");
+  probe_dump(&daemons, id, "after-write");
+  for daemon in daemons {
+    daemon.stop();
+  }
+}
+
 /// AC (§4.8 "Promotion and takeover" — the successor "adopts the newest records, and serves"; §4.10
 /// clone-from-archive; R8 one code path): three daemons form an `f = 1` fleet; a file is written over NFS
 /// into a volume on A and sealed; its content places (A plus one content candidate) and its head reaches
