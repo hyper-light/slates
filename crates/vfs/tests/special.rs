@@ -8,7 +8,7 @@ use slates_vfs::VfsError;
 use slates_vfs::clock::StepClock;
 use slates_vfs::inode::{DeviceNumber, SpecialNode};
 use slates_vfs::recover::{BodyImage, VolumeImage};
-use slates_vfs::volume::Volume;
+use slates_vfs::volume::{Store, Volume};
 
 /// The names every test here makes: both IPC kinds (A-26) and device nodes (A-294): a block device, a whiteout (a
 /// character device numbered 0/0, as overlayfs writes one) and the widest number NFS can carry, past the Linux
@@ -158,21 +158,7 @@ fn ipc_names_survive_links_snapshots_clones_and_recovery() {
     None,
   )
   .unwrap();
-  for (name, node) in every_node() {
-    let (name, links) = match name {
-      "socket" => ("moved", 1),
-      name => (name, 2),
-    };
-    let inode = recovered.resolve(&fresh, name).unwrap().inode;
-    let observed = recovered.observe(&fresh, inode).unwrap();
-    assert_eq!(observed.kind, node.kind());
-    assert_eq!(observed.device, node.device(), "{name} keeps its number");
-    let attrs = observed.attrs;
-    assert_eq!(
-      (attrs.uid, attrs.gid, attrs.nlink, attrs.size),
-      (123, 456, links, 0)
-    );
-  }
+  expect_every_node_recovered_with_its_number(&recovered, &fresh);
   assert_eq!(
     recovered.to_image(&fresh, None).unwrap().to_content(),
     bytes
@@ -185,6 +171,27 @@ fn ipc_names_survive_links_snapshots_clones_and_recovery() {
     volume.device_in(&store, snapshot, disk).unwrap(),
     Some(DeviceNumber::new(8, 1))
   );
+}
+
+/// The recovered clone of `ipc_names_survive_links_snapshots_clones_and_recovery`: expect every node in `recovered`
+/// (over `store`) of its kind, with its device number, owner and link count (the moved socket's one link, every other
+/// node's two), and empty.
+fn expect_every_node_recovered_with_its_number(recovered: &Volume, store: &Store) {
+  for (name, node) in every_node() {
+    let (name, links) = match name {
+      "socket" => ("moved", 1),
+      name => (name, 2),
+    };
+    let inode = recovered.resolve(store, name).unwrap().inode;
+    let observed = recovered.observe(store, inode).unwrap();
+    assert_eq!(observed.kind, node.kind());
+    assert_eq!(observed.device, node.device(), "{name} keeps its number");
+    let attrs = observed.attrs;
+    assert_eq!(
+      (attrs.uid, attrs.gid, attrs.nlink, attrs.size),
+      (123, 456, links, 0)
+    );
+  }
 }
 
 /// AC-3.10 / A-26, A-294: regular-file operations refuse IPC names and device nodes before changing their state, so
@@ -321,7 +328,9 @@ fn recovery_refuses_a_device_body_where_none_belongs() {
     "the untouched image recovers"
   );
   let device_body = BodyImage::Device { major: 8, minor: 1 };
-  let corruptions: [(u64, &dyn Fn(&mut slates_vfs::recover::InodeImage)); 4] = [
+  // One corruption of the image: the inode it lands on, and what it does to that inode's image.
+  type Corruption<'a> = (u64, &'a dyn Fn(&mut slates_vfs::recover::InodeImage));
+  let corruptions: [Corruption<'_>; 4] = [
     (disk.0, &|inode| {
       inode.body = BodyImage::Inline {
         bytes: b"sector".to_vec(),

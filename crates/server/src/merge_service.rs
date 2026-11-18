@@ -2359,8 +2359,9 @@ pub(crate) enum MergeWork {
     record: Record,
     /// The candidates to reach this period (in order behind the version before).
     targets: Vec<HostId>,
-    /// The version's inputs, while a target does not hold them: they travel with the record.
-    inputs: Option<Archive>,
+    /// The version's inputs, while a target does not hold them: they travel with the record. Boxed: an archive is most
+    /// of the variant's bytes, and a version whose targets hold its inputs ships none.
+    inputs: Option<Box<Archive>>,
     /// The placement the record commits against: every candidate, and the cohorts joined while the owner's
     /// neighbourhood change is in flight, with nothing acknowledged.
     shape: Placement,
@@ -2497,7 +2498,7 @@ pub(crate) fn next_merge_work(
           value: pending.value.to_record_bytes(),
         },
         targets,
-        inputs,
+        inputs: inputs.map(Box::new),
         shape: Placement {
           acked: Vec::new(),
           ..pending.record.clone()
@@ -2548,7 +2549,7 @@ pub(crate) async fn run_merge_period(
           shard,
           local,
           owner_acceptor,
-          (object, version, record, inputs),
+          (object, version, record, inputs.map(|inputs| *inputs)),
           targets,
           shape,
           quorum,
