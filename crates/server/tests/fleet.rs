@@ -11623,6 +11623,77 @@ fn a_takeover_round_started_over_under_a_new_configuration_keeps_its_adoptions_w
   drop(observed);
   let instance = daemons[index].instance().to_owned();
   let after = after_the_restart(&daemons, &instance, id);
+
+/// Format: an owner's count of replies held for a live volume's durability and told to try again at their bound
+/// (`live_ship::judge_held`, A-354).
+const LIVE_HELD_GAVE_UP: &str = "fleet.live.held_gave_up";
+
+/// A live-shipped volume named `name` on `client`'s node, shared with `fleet` and attached for writing, each setup
+/// reply waited for at most the placement wait: the volume and the attachment.
+fn live_volume_attached(client: &mut Client, fleet: &[Daemon], name: &str) -> (VolumeId, u64) {
+  let ReplyBody::Created { id } = client.call(&scratch(name)) else {
+    panic!("the volume was created");
+  };
+  share_with_fleet(client, id, fleet);
+  let attachment = write_attachment(client, id);
+  let deadline_ns = u64::try_from(PLACEMENT_DEADLINE.as_nanos()).unwrap();
+  let shipped = client.try_call(
+    &RequestBody::LiveShip {
+      volume: id,
+      live_shipped: true,
+    },
+    deadline_ns,
+  );
+  assert!(
+    matches!(
+      shipped,
+      Ok(ReplyBody::LiveShippingSet { live_shipped: true })
+    ),
+    "the volume is live-shipped: {shipped:?}"
+  );
+  (id, attachment)
+}
+
+/// A-354 (§4.10 "Live shipping"; CLAUDE.md §2 items 8 and 9): a reply held for a live volume's durability waits through
+/// a silence but is answered at the latest at the failover SLO from its hold, the total bound of the rule every
+/// transport judges a held reply by (`slates_bridge_core::durable_bound`), refused `DurabilityPending` as the request's
+/// recorded outcome; the verb sent again under a new id runs again and is answered once the log is durable. Do: three
+/// nodes at `f = 1`; both survivors refuse every register record from a (`Daemon::inject_record_refusal`), so a new
+/// live volume's head and catalog never place and nothing written to it can be durable; on a, a live-shipped volume
+/// shared with the fleet; one write, its reply awaited for at most the placement wait; the same request again; then
+/// lift the refusals and send the write under a new id. Expect the write refused `DurabilityPending` after it was held
+/// the failover SLO and within a liveness budget past it, counted `fleet.live.held_gave_up`; the same request answered
+/// that same refusal (its completion, §4.9); and the write under a new id answered `FsDone`. Before, a held reply ended
+/// only durable, fenced or destroyed, so its client waited as long as its daemon lived (A-353's hang: a write through a
+/// successor whose catalog was refused for good waited 21 minutes).
+#[test]
+fn a_reply_held_for_a_durability_it_cannot_reach_is_refused_at_the_failover_slo_and_runs_again() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  for daemon in &daemons[1..] {
+    daemon.inject_record_refusal(&[hosts[0]]).unwrap();
+  }
+  let mut client = Client::connect(daemons[0].instance());
+  let (id, attachment) = live_volume_attached(&mut client, &daemons, "held-for-good");
+  let write = RequestBody::FsWrite {
+    volume: id,
+    attachment,
+    path: "/held".to_owned(),
+    bytes: b"held for a durability it cannot reach".to_vec(),
+    mode: 0o644,
+  };
+  let deadline_ns = u64::try_from(PLACEMENT_DEADLINE.as_nanos()).unwrap();
+  let first = client.try_call(&write, deadline_ns);
+  let same_id = client.try_retry(&write, deadline_ns);
+  let gave_up = summed_counters(&daemons[0])
+    .get(LIVE_HELD_GAVE_UP)
+    .copied()
+    .unwrap_or(0);
+  for daemon in &daemons[1..] {
+    daemon.inject_record_refusal(&[]).unwrap();
+  }
+  let again = client.try_call(&write, deadline_ns);
+  drop(client);
   for daemon in daemons {
     daemon.stop();
   }
@@ -11654,6 +11725,28 @@ fn a_takeover_round_started_over_under_a_new_configuration_keeps_its_adoptions_w
     after.read.iter().all(|read| *read),
     "every file reads back through the successor: {:?}",
     after.read
+
+    "held for good: the write {first:?}, the same request {same_id:?}, {gave_up} given up, the write again {again:?}"
+  );
+  let slo_ns = slates_server::config::FAILOVER_SLO_NS;
+  assert!(
+    matches!(
+      first,
+      Ok(ReplyBody::Refused {
+        refusal: Refusal::DurabilityPending { held_ns }
+      }) if (slo_ns..=slo_ns + LIVENESS_BUDGET_NS).contains(&held_ns)
+    ),
+    "the write was told to try again once held the failover SLO ({slo_ns} ns), within a liveness budget past it: \
+     {first:?}"
+  );
+  assert!(gave_up >= 1, "the owner counted the reply given up");
+  assert!(
+    matches!((&first, &same_id), (Ok(first), Ok(same)) if first == same),
+    "the same request was answered its recorded refusal: {same_id:?}"
+  );
+  assert!(
+    matches!(again, Ok(ReplyBody::FsDone { .. })),
+    "the write under a new id was answered once the log was durable: {again:?}"
   );
 }
 

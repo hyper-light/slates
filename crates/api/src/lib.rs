@@ -159,10 +159,12 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// [`LandingApproval`] carries the landing's `statement` (what a signer signs) and the `signature` it carried, which
 /// `approve_landing` presents and lands with again; a [`LandingReport`]'s `verification` is the verdict on what was
 /// written, no longer always unsigned; an [`AuditRecord`] of a landing as a whole carries its `verification` (the same
-/// day).
+/// day). 21: a reply held for durability past the failover SLO is a
+/// typed retry (`RetryCause::DurabilityPending`, the wire's appended `Refusal::DurabilityPending`): until then a write
+/// whose log or tombstone could not be held where its reply waits for it was never answered (A-354; the same day).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 20;
+pub const CONTRACT: u32 = 21;
 
 /// The typed client and its own types, for the verbs [`Instance::client`] lends outside the contract.
 pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, VhostUserDevice};

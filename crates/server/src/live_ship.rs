@@ -1029,7 +1029,31 @@ struct Awaiting {
   origin: u64,
   id: slates_wire::request::RequestId,
   reply: slates_ipc::protocol::ReplyBody,
+  /// When the reply was held, on the shard's clock: past the failover SLO from then the verb is refused
+  /// ([`judge_held`], A-354), and how long it was held is told with it.
+  held_since_ns: u64,
 }
+
+impl Awaiting {
+  /// A reply held from `now_ns`.
+  fn held((route, origin, id, reply): HeldReply, now_ns: u64) -> Awaiting {
+    Awaiting {
+      route,
+      origin,
+      id,
+      reply,
+      held_since_ns: now_ns,
+    }
+  }
+}
+
+/// What a held reply is made of ([`Awaiting::held`]): where to send it, its client's completion key and the reply.
+type HeldReply = (
+  Option<crate::merge_service::ReplyRoute>,
+  u64,
+  slates_wire::request::RequestId,
+  slates_ipc::protocol::ReplyBody,
+);
 
 /// Counter: verbs whose reply waited for durability.
 const LIVE_AWAITED: &str = "fleet.live.awaited";
@@ -1125,17 +1149,13 @@ pub(crate) fn defer(
       refusal: slates_ipc::protocol::Refusal::Overloaded { shard: state.shard },
     });
   }
+  let held = Awaiting::held((route, origin, id, reply), slates_rt::futures::now_ns());
   state
     .live
     .awaiting
     .entry((volume.bytes, target))
     .or_default()
-    .push(Awaiting {
-      route,
-      origin,
-      id,
-      reply,
-    });
+    .push(held);
   state
     .live
     .awaiting_by_request
@@ -1157,16 +1177,20 @@ pub(crate) fn join(
     .copied()
   {
     let route = state.reply_route.take();
-    if let (Some((_, waiting)), Some(route)) = (state.live.destroys.get_mut(&volume), route)
-      && let Some(first) = waiting.first()
-    {
-      let (origin, id, reply) = (first.origin, first.id, first.reply.clone());
-      waiting.push(Awaiting {
-        route: Some(route),
-        origin,
-        id,
-        reply,
-      });
+    let first = state
+      .live
+      .destroys
+      .get(&volume)
+      .and_then(|(_, waiting)| waiting.first())
+      .map(|first| (first.origin, first.id, first.reply.clone()));
+    if let (Some((first_origin, first_id, reply)), Some(route)) = (first, route) {
+      let joined = Awaiting::held(
+        (Some(route), first_origin, first_id, reply),
+        slates_rt::futures::now_ns(),
+      );
+      if let Some((_, waiting)) = state.live.destroys.get_mut(&volume) {
+        waiting.push(joined);
+      }
     }
     return true;
   }
@@ -1179,16 +1203,20 @@ pub(crate) fn join(
     return false;
   };
   let route = state.reply_route.take();
-  if let (Some(waiting), Some(route)) = (state.live.awaiting.get_mut(&key), route)
-    && let Some(first) = waiting.first()
-  {
-    let (origin, id, reply) = (first.origin, first.id, first.reply.clone());
-    waiting.push(Awaiting {
-      route: Some(route),
-      origin,
-      id,
-      reply,
-    });
+  let first = state
+    .live
+    .awaiting
+    .get(&key)
+    .and_then(|waiting| waiting.first())
+    .map(|first| (first.origin, first.id, first.reply.clone()));
+  if let (Some((first_origin, first_id, reply)), Some(route)) = (first, route) {
+    let joined = Awaiting::held(
+      (Some(route), first_origin, first_id, reply),
+      slates_rt::futures::now_ns(),
+    );
+    if let Some(waiting) = state.live.awaiting.get_mut(&key) {
+      waiting.push(joined);
+    }
   }
   true
 }
@@ -1273,18 +1301,14 @@ pub(crate) fn defer_destroy(
       refusal: slates_ipc::protocol::Refusal::Overloaded { shard: state.shard },
     });
   }
+  let held = Awaiting::held((route, origin, id, reply), slates_rt::futures::now_ns());
   let (target, waiting) = state
     .live
     .destroys
     .entry(volume.bytes)
     .or_insert_with(|| (sequence, Vec::new()));
   *target = (*target).max(sequence);
-  waiting.push(Awaiting {
-    route,
-    origin,
-    id,
-    reply,
-  });
+  waiting.push(held);
   state
     .live
     .destroys_by_request
@@ -1342,6 +1366,127 @@ fn take_awaiting(state: &mut ShardState, volume: [u8; 16]) -> Vec<Awaiting> {
     .flatten()
     .collect()
 }
+
+/// Answers each verb whose reply `volume`'s log has held past the failover SLO [`Refusal::DurabilityPending`] (A-354):
+/// the total bound of the rule every transport judges a held reply by (`slates_bridge_core::durable_bound`), the
+/// operator's bound on how long an object may go unserved before a takeover serves it, past which a write not yet held
+/// is past what the fleet promises. Through a shorter silence the reply still waits, as the 2026-11-05 sweep chose for
+/// the slates protocol (a writer waits, never a false success; a transport answers its own failure earlier). The
+/// refusal is recorded as the verb's completion, as a fence's is ([`refuse_awaiting`]), so a retry under the same id
+/// meets it (§4.9): the verb's effects stay committed on the owner, nothing claims them durable, and a consumer runs the
+/// verb again under a new id. Judged at the period's visit to the volume ([`period_volume`]). Until 2026-11-18 a held
+/// reply ended only durable, fenced or destroyed, so a log that could never be held (its holders' catalog refused for
+/// good, A-353's case) kept its writer waiting without end.
+///
+/// [`Refusal::DurabilityPending`]: slates_ipc::protocol::Refusal::DurabilityPending
+fn judge_held(state: &mut ShardState, volume: [u8; 16]) {
+  let id = slates_db::catalog::VolumeId { bytes: volume };
+  let now = slates_rt::futures::now_ns();
+  let bound_ns = state.config.failover_slo_ns;
+  let keys: Vec<([u8; 16], u64)> = state
+    .live
+    .awaiting
+    .range((volume, 0)..=(volume, u64::MAX))
+    .map(|(key, _)| *key)
+    .collect();
+  for key in keys {
+    let Some(waiting) = state.live.awaiting.remove(&key) else {
+      continue;
+    };
+    let (past, kept) = held_past(waiting, now, bound_ns);
+    if !kept.is_empty() {
+      state.live.awaiting.insert(key, kept);
+    }
+    for (entry, held_ns) in past {
+      slates_machine::log_line!(
+        "slates-server: a held reply was refused after {} ms, the failover SLO (shard {}): {}",
+        held_ns / NS_PER_MS,
+        state.shard,
+        durability_report(state, id, key.1)
+      );
+      state.count(LIVE_HELD_GAVE_UP, 1);
+      answer(state, entry, durability_pending(held_ns));
+    }
+  }
+}
+
+/// Answers each destroy this shard has held past the failover SLO for its tombstone's placement
+/// [`Refusal::DurabilityPending`] (A-354), as [`judge_held`] answers a write: the same bound, the same refusal, recorded
+/// as the destroy's completion. Judged once a record period on each shard ([`period`]); bounded by the shard's held
+/// replies ([`awaiting_bound`]).
+///
+/// [`Refusal::DurabilityPending`]: slates_ipc::protocol::Refusal::DurabilityPending
+fn judge_held_destroys(state: &mut ShardState) {
+  let now = slates_rt::futures::now_ns();
+  let bound_ns = state.config.failover_slo_ns;
+  let volumes: Vec<[u8; 16]> = state.live.destroys.keys().copied().collect();
+  for volume in volumes {
+    let Some((sequence, waiting)) = state.live.destroys.remove(&volume) else {
+      continue;
+    };
+    let (past, kept) = held_past(waiting, now, bound_ns);
+    if !kept.is_empty() {
+      state.live.destroys.insert(volume, (sequence, kept));
+    }
+    for (entry, held_ns) in past {
+      slates_machine::log_line!(
+        "slates-server: a held destroy was refused after {} ms, the failover SLO (shard {}): volume {}'s tombstone at \
+         sequence {} not placed at f + 1",
+        held_ns / NS_PER_MS,
+        state.shard,
+        crate::verbs::hex_of(&volume),
+        sequence
+      );
+      state.count(DESTROY_HELD_GAVE_UP, 1);
+      answer(state, entry, durability_pending(held_ns));
+    }
+  }
+}
+
+/// `waiting` split at `now_ns` into the entries of the requests held at least `bound_ns`, each with how long its request
+/// was held, and the rest, each in its order. A request's entries (a retry that joined its wait, [`join`]) are judged by
+/// its first hold, so all of them are answered at once with one reply, the one outcome its id records (§4.9).
+fn held_past(
+  waiting: Vec<Awaiting>,
+  now_ns: u64,
+  bound_ns: u64,
+) -> (Vec<(Awaiting, u64)>, Vec<Awaiting>) {
+  let mut first: BTreeMap<(u64, u32, u32), u64> = BTreeMap::new();
+  for entry in &waiting {
+    first
+      .entry((entry.origin, entry.id.client, entry.id.sequence))
+      .and_modify(|since| *since = (*since).min(entry.held_since_ns))
+      .or_insert(entry.held_since_ns);
+  }
+  let mut past = Vec::new();
+  let mut kept = Vec::new();
+  for entry in waiting {
+    let held_ns = first
+      .get(&(entry.origin, entry.id.client, entry.id.sequence))
+      .map_or(0, |since| now_ns.saturating_sub(*since));
+    if held_ns >= bound_ns {
+      past.push((entry, held_ns));
+    } else {
+      kept.push(entry);
+    }
+  }
+  (past, kept)
+}
+
+/// The refusal a reply held `held_ns` past the failover SLO is answered with ([`judge_held`]).
+fn durability_pending(held_ns: u64) -> slates_ipc::protocol::ReplyBody {
+  slates_ipc::protocol::ReplyBody::Refused {
+    refusal: slates_ipc::protocol::Refusal::DurabilityPending { held_ns },
+  }
+}
+
+/// Counter: a reply held for a live volume's durability, refused at the failover SLO ([`judge_held`], A-354).
+/// Format: a counter name in the daemon's status report.
+const LIVE_HELD_GAVE_UP: &str = "fleet.live.held_gave_up";
+
+/// Counter: a destroy held for its tombstone's placement, refused at the failover SLO ([`judge_held_destroys`], A-354).
+/// Format: a counter name in the daemon's status report.
+const DESTROY_HELD_GAVE_UP: &str = "fleet.destroy.held_gave_up";
 
 /// The refusal a superseded owner gives a write to the volume it lost.
 fn stale_epoch(current: HostEpoch) -> slates_ipc::protocol::ReplyBody {
@@ -3007,6 +3152,7 @@ pub(crate) async fn period(origin: u16, shard: u16) {
         move |s| {
           if counted {
             s.count(LIVE_PERIODS, 1);
+            judge_held_destroys(s);
           }
           period_slice(s, after)
         },
@@ -3074,8 +3220,10 @@ fn period_volume(s: &mut ShardState, volume: [u8; 16]) {
     live.unreachable.clear();
   }
   // A writer may wait on a condition that changes with no acknowledgement to fold (the head placed once its
-  // neighbourhood settles, a pair delivered): answered here at the latest.
+  // neighbourhood settles, a pair delivered): answered here at the latest, and refused here once it has waited the
+  // failover SLO (A-354).
   resolve(s, volume);
+  judge_held(s, volume);
   // A log whose last whole entry no successor among the candidates could open is checkpointed again once this shard has
   // delivered the pairs that would let it ([`covers_candidates`]).
   if !covers_candidates(s, volume)
