@@ -6458,7 +6458,10 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   acknowledged) and Continuity (the successor's first head is past every position durable under an earlier epoch)
 >   from outside the processes. The flows that take nothing over (candidates partitioned, stalled or slowed, and the
 >   lossy phases) read through every node mid-fault and after it, held to ReadSafety too, with the owner answering every
->   read: its lease needs one healthy candidate's confirmation of two.
+>   read: its lease needs one healthy candidate's confirmation of two. A seeded nemesis draws fourteen single faults of
+>   every kind above and one more, a link severed both ways (a partition that is not transitive), the owner struck as
+>   often as a candidate and once a run until it is taken over, the fleet recovering whole between them; every
+>   invariant is judged across whatever takeovers they cause, Continuity from the samples.
 
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
