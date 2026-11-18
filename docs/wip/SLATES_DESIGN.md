@@ -7652,6 +7652,15 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   (`crates/server/src/verbs.rs`) and `a_relinquished_volume_is_made_again_under_its_id_and_keeps_its_key`
 >   (`crates/db/tests/model.rs`).
 
+> **A live-shipped volume conforms exactly as a plain one (2026-11-18; Windows OPEN).** The conformance suites (fsx,
+> fsstress, pjdfstest) give the same verdicts over a volume live-shipped on an `f = 1` fleet as over a plain volume on the
+> same host, case by case and record by record (`cargo xtask conformance compare`). That holds on macOS NFS (8,686
+> pjdfstest cases) and on every Linux transport, including the daemon's own FUSE mount (8,798 cases a transport), and in
+> every live run the owner's log ended durable at its head with both candidates holding it. With both candidates stopped,
+> a size change waits for them and then succeeds rather than failing. CI's conformance lane runs the pair and that test
+> on every push. Evidence and commands: `docs/wip/conformance.md`, the live-shipped pair; GAPS, "A live-shipped volume
+> fails a waiting writer…".
+
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
 writer's ring to its local owner shard is the latency floor. When write-intent attachments from

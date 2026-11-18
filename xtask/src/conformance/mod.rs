@@ -13,7 +13,9 @@
 //! `--write` rewrites the document's generated block), `tally --outputs DIR [--privilege
 //! root|unprivileged]` (re-read a kept `pjdfstest-output` directory — a `--keep` scratch here, or
 //! the CI lane's uploaded artifact — and print the counts, the judgement, and the failures by
-//! shape and by file, so a run that happened elsewhere is reviewed by a command). Scratch lives
+//! shape and by file, so a run that happened elsewhere is reviewed by a command), `compare --plain
+//! DIR --live DIR [--suites S,S]` (a plain run and a live-shipped one, A-200, case by case and record
+//! by record; non-zero on any difference). Scratch lives
 //! in the build output (`--scratch`, else `<target>/conformance-scratch-<pid>`; A-50: never `/tmp`
 //! and never a RAM directory) and is removed at the end unless `--keep`.
 //!
