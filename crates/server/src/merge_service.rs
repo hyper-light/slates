@@ -2783,6 +2783,10 @@ pub(crate) async fn run_merge_period(
   }
 }
 
+/// The inputs a version's record travels with, while its targets lack them (A-286): the shipment, and the identity the
+/// record names its inputs by, so the targets' answers about them are read against it.
+type VersionInputs = (Option<ShipInputs>, Option<[u8; 32]>);
+
 /// Ships a version's record to its targets over [`MERGE_RECORD_STREAM`] through the owner's own
 /// acceptor at `f + 1` — with its inputs (the content exchange's offer and at most a shipment's bound of the chunks the
 /// targets lack, A-286) in the same message while the targets lack them, so a version commits in one exchange — and
@@ -2796,12 +2800,7 @@ async fn ship_record(
   shard: u16,
   local: HostId,
   owner_acceptor: &mut Acceptor,
-  (object, version, record, (inputs, manifest)): (
-    ObjectId,
-    u64,
-    Record,
-    (Option<ShipInputs>, Option<[u8; 32]>),
-  ),
+  (object, version, record, (inputs, manifest)): (ObjectId, u64, Record, VersionInputs),
   targets: Vec<HostId>,
   shape: Placement,
   quorum: Quorum,

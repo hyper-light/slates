@@ -28,7 +28,8 @@
 > makes one: root, except a whiteout (a character device 0/0) for any caller who may write the directory. Nothing opens
 > one as a device: a landing refuses it before its first write, and each consumer's kernel is guarded (slates' own
 > mounts `nosuid,nodev`, the Linux FUSE mount now stating both itself; a pod's device cgroup; a guest asked for
-> `nodev`). Proven by each crate's unit tests (A-294 names them). **Owed:**
+> `nosuid,nodev`, a real guest's test of both built 2026-11-18, A-94's amendment). Proven by each crate's unit tests
+> (A-294 names them). **Owed:**
 > - **every root pjdfstest list re-recorded with its record from a real run (the integrator's lanes).** The
 >   device-fixture entries (1,798 of the Linux FUSE list's 1,800; every entry of the NFSv4, OCI and virtio-fs lists;
 >   1,788 of the macOS list's 1,905) are expected to pass now, so each lane reports them listed-now-passing until the
@@ -40,8 +41,13 @@
 > - the KIND lane's first run of its device probe (`device_probe` in `xtask/src/kind_export.rs`, written with this
 >   change): a root pod makes `/dev/null`'s and `/dev/mem`'s numbers in the volume, and an unprivileged pod must open
 >   the first (the control: the pod's bind is not `nodev`) and be refused `EPERM` on the second by the device cgroup;
-> - a guest's proof over virtio-fs (g260's): the guest mount line in `docs/cli.md` asks for `nosuid,nodev` since
->   2026-11-17, with A-294's reason;
+> - the first runs of a guest's proof over virtio-fs, built 2026-11-18 (A-94's amendment, kiln goal g260):
+>   `a_guests_mount_of_slates_own_device_runs_no_set_id_file_as_its_owner_and_opens_no_device_node` in
+>   `crates/cli/tests/guest_vhost.rs`. The guest mounts the tag `nosuid,nodev`, as the guest mount line in `docs/cli.md`
+>   asks since 2026-11-17. The test expects a whiteout the host's user makes to be refused `EACCES` there and to reach
+>   the device layer (`ENXIO`) through a control mount without the flags, and a set-id copy of the probe to run as its
+>   caller there and as its owner through the control. Not yet run in a guest: CI's live-guest lane runs it in QEMU
+>   11.1, and the supervisor's run is crosvm on adacachy;
 > - Windows: a device node (and a FIFO or socket) has no WinFsp form. A directory holding one failed its whole listing
 >   (`read_all_entries` took each entry's attribute word with `?`), a sibling defect since A-26 that kept device nodes
 >   make common (an unpacked `/dev`); fixed 2026-11-17, the drive's listing leaves such an entry out (`listed`), so a
@@ -353,11 +359,34 @@
 > `undo.desc` naming its source by absolute path (now excluded with the reason). **Closed in the same change:** a
 > workload whose script failed alike on both sides was recorded `Identical` (`compare` asked only that the exit codes
 > be equal, while Part 6 asks them 0); it is now `Failed` on every leg, red-checked first. Subversion was absent from
-> every machine this change could use, so its workload runs first in CI. CI's first run of it (run 44247840584, ubuntu,
-> 2026-11-18) held the host gate red: two runs differed at `repo/db/rep-cache.db`, FSFS's representation cache, an
-> SQLite file whose page bytes are not what Subversion promises. It is now compared by its rows (printed where `sqlite3`
-> is on the `PATH`) and left out of the byte comparison with that reason, on every leg as on the host; the revisions it
-> caches (`db/revs`, `db/revprops`, `db/current`) stay byte-compared. Locks: every leg runs a workload's two sides
+> every machine this change could use, so its workload runs first in CI. **CI's first runs (2026-11-18) found three
+> gaps, each fixed failing-test-first (A-319):**
+> - The host gate was red in all three runs that reached it, by one cause: at `repo/db/rep-cache.db` (run 44247840584,
+>   ubuntu), then, once the integrator's 760fb7db printed that cache's rows, at its row for `d/b.txt`'s text, item 3
+>   against 4 (runs 44252249999 and 44252854695), as the host against the mount was on macOS and over Linux FUSE
+>   (44252296495). Subversion's client sends a commit's texts in the order of an APR hash table, seeded afresh in
+>   every process, and FSFS numbers a revision's items in the order they arrive, so the workload's one commit of two
+>   new files wrote `db/revs/0/2`, and the cache's rows, two ways: seven and five times in twelve runs
+>   (Subversion 1.14.5, kiln run r956, every other file alike). Each commit now sends one text: all twelve runs were
+>   identical in every revision file, the cache's rows and its bytes, and the gate passed 10 runs of 10 (kiln run
+>   r1031), where before the change it was red in 1 run of 6, at `db/revs/0/2` (r1024). Main's 64852828, made at the
+>   same time, had left `db/revs` out of the byte comparison instead; merged over it, the revision files are compared
+>   byte for byte again, the cache by its rows (each content's hash, first revision and size, printed where `sqlite3`
+>   is on the `PATH`, 64852828's columns), and `svnadmin verify` checks every row against its revision.
+> - `cargo` failed alike on both sides of the macOS leg (run 44247840584): every CI job sets `CARGO_TERM_COLOR=always`,
+>   whose escape sequence before `Fresh` made the script's count of fresh builds read 0. Before A-289 that was recorded
+>   `Identical`, so the reuse AC-3.2 names had never been checked in CI. The shared environment now sets cargo's colour
+>   off and its target directory to the crate's own, which kiln's runs move outside the tree
+>   (`the_workload_environment_keeps_a_parents_cargo_settings_out`, red at exit 127 before).
+> - The live guest was killed at its 1500 s bound (runs 44247840584 and 44252249999): its harness read QEMU's console
+>   only after the VM exited, and the console stopped at exactly 65,536 bytes, a Linux pipe's capacity, mid-line in the
+>   Mercurial mount run's output, once the version-control workloads made it that long. The console is now read while
+>   the VM runs (`a_child_writing_past_its_pipes_capacity_is_read_while_it_runs`, `crates/server/tests/virtiofs.rs`,
+>   killed at its 60 s bound before). The same wait-then-read shape stands in five other test helpers whose children
+>   write a few lines (`run_within` in `crates/cli/tests/cli.rs` and `winfsp.rs`, `bounded` in `cli.rs` and
+>   `crates/bridge-fuse/tests/oci_container.rs`, the destroys in `live_chaos.rs`): none has met a pipe's capacity.
+>
+> Locks: every leg runs a workload's two sides
 > under one kernel, whose own locks bind SQLite's, FSFS's and Mercurial's; served locks matter only between kernels.
 > **Open:** (1) the runs over each mount, which are the supervisor's (CLAUDE.md §8): any difference they find is a gap
 > to fix failing-test-first; (2) ~~the Windows WinFsp roster~~ **built 2026-11-17 (A-300, above)**: WinFsp's driver
@@ -713,26 +742,52 @@
 > the fixed wait (diag-live-durability-75, A-271 with B9 and the recipient fix) 45 of 48 failed, mode B (below). Owed:
 > the flow re-run on the merged main (BENCHMARKS "A live volume taken over by a node replaced at its own anchor").
 
-> **Open (g240, 2026-11-17, A-271's owed skip; read from the code, no run has reached it): an owner lost before its
-> replacement candidate accepted the owner's pair leaves the volume unserved while that replacement is its successor.**
-> A replacement enters the neighbourhood before it holds the owner shard's pair: the owner delivers one only to a
-> configured neighbour, once a record period (`fleet::deliver_pairs`), and no other node holds that pair. The
-> successor is the cohort member rendezvous ranks first, from the configuration alone
-> (`RegionalConfiguration::successor`), so the replacement can be it. If the owner dies in that window (from the
-> replacement's configuration to the owner's next record period that delivers the pair), the key the replacement
-> waits for can never come: its wait ends `takeover_no_key_exhausted` at that head for good, and the head cannot move
-> with the owner dead, so no survivor serves the volume until the replacement leaves. Nothing acknowledged is lost:
-> writes wait in that window (the cover gate above), and the holders keep their copies (A-272). The flows never reach
-> it: they kill the owner only once the fleet has recovered, and by then no successor lacked the key (48 of 48 runs,
-> every key-wait counter 0). While the replacement is not yet seated the owner's death is a second failure, past the
-> `f` the fleet has spent; but nothing orders the pair's acceptance before the seat, and a delivery that fails waits
-> for the next record period (`fleet.seal.pair_recipient_unknown`, `fleet.seal.pair_undelivered`), so how long the
-> window can outlast the seat, where the owner's death is a single failure, is not measured.
-> The sibling, read the same way: a sealed head's envelope opens only through the lineage key the head wraps for each
-> candidate's anchor under the same pair (A-92 piece 4c), so a replacement successor in that window leaves it unopened
-> (`fleet.seal.envelope_unopened`, `fleet::opened_archive`) and that volume unserved too. Owed for both: the
-> deterministic skip in ranking A-271 names (model-first, §4.8), or another way for the successor to obtain the key,
-> then a process test that kills the owner inside the window (`Daemon::inject_pair_withhold` holds it open).
+> **Fixed (g240, 2026-11-17, A-295; a live log at `f ≥ 2`, a sealed head at any `f`): an owner lost before its
+> replacement candidate accepted the owner's pair left a volume unserved while that replacement was its successor.** A
+> replacement enters the neighbourhood before it holds the owner shard's pair: the owner delivers one only to a
+> configured neighbour, once a record period (`fleet::deliver_pairs`), and no other node holds that pair. The successor
+> is the cohort member rendezvous ranks first, from the configuration alone (`RegionalConfiguration::successor`), so the
+> replacement can be it. If the owner died in that window, the key the replacement waited for could never come: its wait
+> ended `takeover_no_key_exhausted` at that head for good, and the head cannot move with the owner dead, so the volume
+> was unserved until the replacement left. Nothing acknowledged was lost: writes wait in that window (the cover gate
+> above), and the holders keep their copies (A-272). Now a successor that holds no entry of its own in the log's sealing
+> is handed the volume's lineage key by a fellow candidate (hyper-seal `docs/seal.md` §6's hand-off to a successor;
+> `LINEAGE_STREAM`): asked of the hosts that answered its phase one, once the log is fetched and at each attempt of
+> A-271's bounded wait; handed only to the member the candidate's own committed configuration names as acting for the
+> volume (`fleet::acts_for`), from the candidate's own copy of the sealing, wrapped to the recipient key the request
+> carries; kept only when the volume's naming record opens under it (`seal_keys::accept_handed_lineage`). Counted:
+> `fleet.live.takeover_key_handed` on the successor; `fleet.seal.lineage_handed` and
+> `fleet.seal.lineage_refused.{malformed,not_acting,not_held}` on the candidate; `fleet.seal.lineage_unhanded`,
+> `lineage_unchecked`, `lineage_unasked` on the successor. Held by
+> `a_replacement_that_never_received_the_owners_pair_serves_the_live_volume_it_succeeds_to` (`crates/server/tests/
+> fleet.rs`: five nodes at `f = 2`, the owner's delivery to one anchor failed, that node replaced and the fleet
+> recovered, then the owner stopped): on this Mac, 2026-11-17, at load 22 to 159, it passed 4 of 4: in the three runs
+> that printed their figures 8, 6 and 7 of the 39 volumes went to the replacement, each served 2.0 to 2.4 s after the
+> owner stopped, every one through a handed key. Red with the hand-off removed (the successor asks no one): 12 and 7 of
+> 39 went to the replacement and none was served after 434 and 455 s (`takeover_refused.no_key` 24 and 14,
+> `takeover_waits_key` 1,127 and 609, `takeover_no_key_exhausted` 48 and 70, each such volume given up). The flows never
+> reached the window: they kill the owner only once the fleet has recovered, and by then no successor lacked the key (48
+> of 48 runs, every key-wait counter 0).
+> **Open, at `f = 1` (read from the code; no run reached it):** no survivor serves the live volume in the same window,
+> whoever ranks first, so the key is not what stops it. The owner moves the volume's holders to a set naming the
+> replacement only once its whole entry covers the replacement (`live_ship::target_recordable`), and never to a set of
+> `f` members (`Shipper::begin_transition`), so the recorded holders stay the survivor and the destroyed incarnation,
+> and phase one, which counts `f + 1` of them (A-240), cannot adopt. A write durable on `f` of that set may have rested
+> on the destroyed incarnation alone, so for the volume the owner's death is a second failure, past `f`, until the
+> owner's pair reaches the replacement and the set is recorded again. Owed with A-272 (ii) (a round of the members that
+> exist now), model first (§4.8).
+> **Fixed, the sibling:** a volume served from a sealed head's envelope rather than a live log. `materialize` adopted
+> the key only from the successor's own entry in the head's sealing, so a replacement successor in the window left the
+> envelope unopened (`fleet.seal.envelope_unopened` every period). It now asks the head's other candidates the same way
+> (`fleet.seal.envelope_key_handed`); a candidate hands from the heads it holds. A head's takeover counts the members
+> that exist now, so here the window was the key's alone at `f = 1` too. Held by
+> `a_replacement_that_never_received_the_owners_pair_opens_the_sealed_head_it_succeeds_to` (three nodes at `f = 1`,
+> sixteen sealed volumes): 3 of 3: 7, 8 and 6 of the 16 went to the replacement, each served 2.1 to 2.6 s after the
+> owner stopped, every one through a handed key. Red with the hand-off removed: 8 of 16 went to it and none was served
+> after 451 s (`fleet.seal.envelope_unopened` 1,600). The volume's content must survive too: at `f = 1` it rests on the
+> owner and one other node, so the test replaces the other that holds the least of it; before it did, both red runs
+> failed earlier, every fetch finding no recorded holder (`fleet.fetch.no_holder_session`), the content on the owner and
+> the destroyed node alone.
 
 > **Fixed (live-durability, 2026-11-08): each caller judged a dead session by its own clock.** The live lane's watch
 > waited a fixed second of silence, and the forward lane its own. On the fabric the fixed second cut a live holder
@@ -8616,7 +8671,16 @@ SecP384r1MLKEM1024 between nodes is built (A-93), interoperating with OpenSSL 3.
 Condition 4, 2026-10-05: a setuid binary planted on a shared volume ran as root through a PersistentVolume mount
 without `nosuid`. Every mount slates makes or documents is now `nosuid,nodev` (A-94;
 docs/bugs/2026-10-05-setuid-through-a-shared-volume.md). The KIND lane's check runs only where the kernel has TLS
-(GitHub's Linux runner), so its first run is owed there.
+(GitHub's Linux runner), so its first run is owed there. A guest's mount of a share too (A-94 amended 2026-11-18, kiln
+goal g260): slates cannot set a guest's flags, so `docs/cli.md`'s `slates vhost-user` guest mount line asks for
+`nosuid,nodev` with A-94's reason, and the tests' guest mounts its share that way. A real guest's test is built,
+`a_guests_mount_of_slates_own_device_runs_no_set_id_file_as_its_owner_and_opens_no_device_node`
+(`crates/cli/tests/guest_vhost.rs`): it expects a set-id file and a whiteout the host's user made to run as their
+caller and be refused `EACCES` through the guest's mount, and to act through a control mount without the flags.
+**Owed:** its first runs: crosvm on adacachy (the supervisor's), and CI's live-guest lane, which runs every
+`guest_vhost.rs` test in QEMU. The gap was first found on 2026-11-09 on `agents/conformance-19` (0717586a, d701b534: a
+setuid-root copy of the probe planted by the guest's root and run as `nobody`), which never landed; A-94's amendment
+supersedes it with credit.
 
 FUSE create path, 2026-10-05 (A-96): the delta's whole reference list and the op log's full scan are gone (2,000
 creates 0.64 → 0.36–0.45 s). Owed:
@@ -16282,7 +16346,7 @@ Mac, binaries built on `d61c3be2`):
   a panic injected into one honest client, the test failed in 12.85 s, where main's ran on past a 120 s bound
   (adacachy).
 
-### 2026-11-09: a healthy live `fsync` was refused at a wall-clock deadline under load — fixed, a starved owner too (A-292; on main 2026-11-17)
+### 2026-11-09: a healthy live `fsync` was refused at a wall-clock deadline under load — fixed, a starved owner and an owner slow to ask too (A-292, A-301; on main 2026-11-17)
 
 `a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it` answered the `fsync` made with every candidate
 running `EIO`: 1 in 6 runs on main, 2 in 9 on raft-7 (raft's report, load 36–145 on adacachy). Made to fail on demand on
@@ -16332,13 +16396,26 @@ Open:
 - The lanes to each holder are cut at a hard liveness budget (`fleet::live_budget`), and a cut holder waits for the record
   period or its session's return. Under load such a cut can outlast a window, which the wait's judgment cannot tell from
   silence.
-- Hypothesis, not yet seen in a give-up record: a window can be silent through the owner's own delay in asking. A fresh
-  volume's log is shipped to a holder only once the coordinator has placed its catalog there (`pending_sends`'
-  `catalogued` gate), and its head waits for the coordinator's period behind that period's other commits, each awaited
-  in turn (`ship_shard_heads`); a coordinator kept past a window that way leaves a window with nothing asked, so nothing
-  heard, through no holder's fault. The receiver's two waits (A-292) prove the owner has read what came, not that it
-  asked. A give-up record from a run under load that shows the head or catalog unplaced with no lane in flight would
-  confirm it.
+- ~~Hypothesis: a window can be silent through the owner's own delay in asking~~ — closed by construction 2026-11-17
+  (A-301), not yet seen in a give-up record. A fresh volume's log is shipped to a holder only once the coordinator has
+  placed its catalog there (`pending_sends`' `catalogued` gate), and its head waits for the coordinator's period behind
+  that period's other commits, each awaited in turn (`ship_shard_heads`); a coordinator kept past a window that way
+  left a window with nothing asked, so nothing heard, through no holder's fault, and the receiver's two waits (A-292)
+  prove the owner has read what came, not that it asked. Now each live volume keeps when its owner first asked a holder
+  something since it last heard anything (`live_ship::LiveVolume::unanswered_since_ns`: a lane opened, a head's or
+  catalog's placement round sent), and a silent window is confirmed only once that ask is a window old. Red first by use
+  of the rule (`a_window_in_which_the_owner_asked_nothing_is_given_up_only_once_its_ask_is_a_window_old`,
+  `an_owner_that_never_asks_holds_the_verdict_only_to_the_total_bound`) and of the device
+  (`a_guests_fsync_is_not_refused_while_its_owner_has_asked_its_holders_nothing`). A give-up record now names the oldest
+  unanswered ask's age, so a run under load tells this cause from a holder's silence. Still open of it: a pair key's
+  delivery is not tracked as an ask (it is per owner shard and candidate), so a wait on it alone holds to the failover
+  SLO; and the ask is kept per volume, not per holder, so a stopped candidate's re-sent lane can stand in for an ask the
+  owner has not yet made of a live one (two faults at once, where the rule is A-292's alone). Only progress clears the
+  ask: a holder that answers without moving anything (a refusal) leaves it standing, and so does a holder whose link was
+  dropped and whose session comes back (`live_ship::holder_reached`), so after a resume the wait still counts from the
+  first ask since anything was heard. Whether either reaches a healthy `fsync` under load is for the give-up records to
+  say (they name the oldest unanswered ask's age, the lanes and the unreachable holders); clearing on them would also
+  need a test that drives the daemon's bookkeeping, which today only the live flows do.
 - The virtio-fs serve loop times only the oldest held `FSYNC`'s next look (`serve_round`, `durable_oldest`); under
   windows a younger reply's look can come first, so its verdict waits for the oldest's look, at most a window late. Never
   a refusal, only a late one; the FUSE mount and WinFsp take the soonest look over every held reply.
