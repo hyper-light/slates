@@ -1005,6 +1005,68 @@ fn a_change_to_a_file_with_another_name_is_kept_for_the_other_names() {
   }
 }
 
+/// A-190, A-360. Do: give `file` a second name, hold it open as a coherent purge's open is held, and serve the cleanup
+/// WinFsp sends when that purge's handle is the file's last while a delete is pending: WinFsp hands the delete to the last
+/// handle's cleanup, whoever made it (`FspCleanupDelete`, v2.1 `src/sys/file.c` `FspFileNodeCleanup`). Expect: the name
+/// is gone from the volume, as the deleter was told when its own close returned, and the file's other name is owed the
+/// change. Before, a purge's cleanup was answered without its delete: the name stayed, and the live hard-link test on the
+/// test-signing VM saw the other name count two links for good.
+#[test]
+fn a_delete_a_purges_last_handle_carries_is_made() {
+  let mut store = fixed_store();
+  let (mut volume, cx) = fixed_volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut volume, &mut store);
+  let root = ObjectId::new(bridge.root(&cx).unwrap(), 0);
+  let file = bridge.lookup(root, &cx, "file").unwrap();
+  let object = ObjectId::new(file.ino, file.generation);
+  bridge.link(object, root, &cx, "second").unwrap();
+  let fh = bridge.open(object, &cx, 0).unwrap();
+  let memory =
+    SparseObject::unnamed(crate::opens::bytes(2).unwrap(), slates_mem::Words::new()).unwrap();
+  let mut ledger = Ledger::create(memory, 2).unwrap();
+  let context = ledger
+    .opened(
+      Open {
+        object,
+        fh,
+        purge: true,
+      },
+      "\\file",
+    )
+    .unwrap();
+  let mut names = OpenNames::new();
+  names.opened(context, file.ino, "\\file");
+  let (reply, _answer) = sync_channel(1);
+  let served = Request {
+    op: Op::Cleanup {
+      object: context,
+      delete: Some("\\file".to_owned()),
+    },
+    reply,
+    hint: 0,
+    replayed: false,
+  }
+  .serve(&mut bridge, &cx, &mut names, &mut ledger);
+  let owed = served.sibling_change().cloned();
+  assert!(served.send());
+  assert!(
+    bridge.lookup(root, &cx, "file").is_err(),
+    "the delete the purge's last handle carried was not made"
+  );
+  let second = bridge.lookup(root, &cx, "second").unwrap();
+  assert_eq!((second.ino, second.nlink), (file.ino, 1));
+  assert_eq!(
+    owed,
+    Some(Sibling {
+      ino: file.ino,
+      through: "\\file".to_owned(),
+      bytes: CachedBytes::Kept,
+    }),
+    "the file's other name is owed the delete"
+  );
+  bridge.release(object, &cx, fh).unwrap();
+}
+
 /// A-198. Do: replay an open's delete cleanup after its first cleanup unlinked the name and an SDK created a new file
 /// there. Expect: the replacement still has its name and bytes; cleanup belongs to the old file's identity.
 #[test]
