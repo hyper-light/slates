@@ -13283,5 +13283,6 @@ held version 0's inputs (`merge.inputs_unheld` 709 each).
 - **A-313 works under the launcher:** a replica killed mid-rung rebuilt its replica from its hold, 2,810 versions in
   6,270 slices, and went on taking versions.
 - **A primary's crash over the whole kernel loses its green on that node:** the base tree volume no longer fits the
-  inode-version slab at recovery (by 6,348 bytes), so the green built over it is fenced. The seeding fix could not be
-  exercised; the run is owed again once the volume recovers. Reported to goal 232.
+  inode-version slab at recovery (by 6,348 bytes), so the green built over it is fenced. A second run (11:02 UTC) logged
+  the same two lines with the same byte counts, so it is deterministic here. The seeding fix could not be exercised;
+  the run is owed again once the volume recovers. Reported to goal 232.
