@@ -221,6 +221,8 @@ struct Agent {
   /// When this attempt's request was in its ring: the clock read once the send returned, so the request left at or
   /// before it. A reply's floor is measured from it ([`Worker::drain`]).
   handed_ns: u64,
+  /// The work's name (diag-g083: `--local-names` picks one hashing to the client's own shard).
+  name: String,
 }
 
 /// What a worker brings back.
@@ -236,6 +238,8 @@ struct Tally {
   /// Each answered attempt's floor, by the kind its latency is filed under: how long after its request was in the ring
   /// its reply was still not there, which no sweep of the harness can have added (the module's "floor").
   floors: BTreeMap<Kind, Vec<u64>>,
+  /// `--trace`: every answered attempt's request word, kind and instants (diag-g083).
+  trace: Vec<Traced>,
   submits: Vec<SubmitEvent>,
   /// The clients that gave up, by why ([`Agent::give_up`]): a refusal the harness does not ride out, a lost connection,
   /// a retry past its patience.
@@ -290,6 +294,7 @@ impl Tally {
     for (kind, mut samples) in std::mem::take(&mut tally.floors) {
       self.floors.entry(kind).or_default().append(&mut samples);
     }
+    self.trace.append(&mut tally.trace);
     self.submits.append(&mut tally.submits);
     for (why, count) in tally.refusals {
       *self.refusals.entry(why).or_default() += count;
@@ -529,7 +534,7 @@ impl Agent {
       Step::CreateWork => (
         RequestBody::CreateWork {
           green: self.green,
-          name: format!("load-{}", self.id),
+          name: self.name.clone(),
         },
         Kind::CreateWork,
       ),
@@ -1179,6 +1184,22 @@ impl Worker {
     let Some((_, sent_ns, kind)) = agent.inflight.take() else {
       return;
     };
+    if tracing() {
+      let traced_kind = match &reply {
+        ReplyBody::Submitted { version: None, .. } => Kind::SubmitConflict,
+        ReplyBody::Refused { .. } => Kind::Destroy,
+        _ => kind,
+      };
+      self.tally.trace.push(Traced {
+        word,
+        kind: traced_kind,
+        refused: matches!(&reply, ReplyBody::Refused { .. }),
+        sent: agent.attempt_sent_ns,
+        handed: agent.handed_ns,
+        taken: now,
+        floor,
+      });
+    }
     self.tally.in_flight_ns = self
       .tally
       .in_flight_ns
@@ -1865,9 +1886,27 @@ fn spread(
       .0
       .push(connect(instances[k % instances.len()]).unwrap());
   }
+  let local = std::env::args().any(|a| a == "--local-names");
+  let partitions = if local {
+    groups[0].0[0].daemon_status().map_or(1, |r| r.shards.len())
+  } else {
+    1
+  };
   for (index, rounds) in plans.into_iter().enumerate() {
     let k = index / per_connection;
+    let id = index + n * 1_000_000;
+    let name = if local {
+      let shard =
+        usize::try_from(groups[k % workers].0[k / workers].client_id()).unwrap() % partitions;
+      (0u32..)
+        .map(|s| format!("load-{id}-{s}"))
+        .find(|nm| usize::from(slates_server::verbs::owner_of_name(nm, partitions)) == shard)
+        .unwrap()
+    } else {
+      format!("load-{id}")
+    };
     groups[k % workers].1.push(Agent {
+      name,
       id: index + n * 1_000_000,
       conn: k / workers,
       green,
@@ -1997,6 +2036,10 @@ fn level(
   let mut total = Tally::default();
   for tally in tallies {
     total.absorb(tally);
+  }
+  if tracing() {
+    let mut tracer = connect(first_instance(instance)).unwrap();
+    trace_report(n, epoch, &total.trace, &mut tracer);
   }
   println!("level\t{n}\twall_ns\t{wall_ns}\tworkers\t{workers}");
   println!("{}", offered_row(n, think_mean, wall_ns, &total));
@@ -2188,6 +2231,9 @@ fn main() {
     files.len()
   );
   let mut failures = 0;
+  let pulses_before = daemon
+    .as_ref()
+    .map(|d| (d.shard_pulses(), d.shard_cpu_ns(), Instant::now()));
   for n in levels {
     failures += level(
       &instance,
@@ -2197,6 +2243,37 @@ fn main() {
       workers.min(n),
     );
   }
+  if let (Some(d), Some((before, cpu_before, at))) = (daemon.as_ref(), pulses_before) {
+    let wall = at.elapsed().as_nanos();
+    let cpu_after = d.shard_cpu_ns();
+    for after in d.shard_pulses() {
+      let b = before.iter().find(|p| p.shard == after.shard);
+      let cpu0 = cpu_before
+        .iter()
+        .find(|(s, _)| *s == after.shard)
+        .map_or(0, |c| c.1);
+      let cpu1 = cpu_after
+        .iter()
+        .find(|(s, _)| *s == after.shard)
+        .map_or(0, |c| c.1);
+      println!(
+        "pulse\tshard\t{}\tcpu_ns\t{}\tcpu_permille\t{}\tsteps\t{}\twaits\t{}\tkicks_skipped\t{}\tlongest_step_ns\t{}\toverrun_ns\t{}\twake_cost_ns\t{}\tidle_window_ns\t{}\tring_full\t{}",
+        after.shard,
+        cpu1.saturating_sub(cpu0),
+        u128::from(cpu1.saturating_sub(cpu0)) * 1000 / wall.max(1),
+        after.steps.saturating_sub(b.map_or(0, |p| p.steps)),
+        after.waits.saturating_sub(b.map_or(0, |p| p.waits)),
+        after
+          .kicks_skipped
+          .saturating_sub(b.map_or(0, |p| p.kicks_skipped)),
+        after.longest_step_ns,
+        after.scheduler_overrun_ns,
+        after.wake_cost_ns,
+        after.idle_window_ns,
+        after.ring_full_events,
+      );
+    }
+  }
   report_losses(&mut setup);
   drop(setup);
   if let Some(daemon) = daemon {
@@ -2204,6 +2281,246 @@ fn main() {
   }
   if failures > 0 {
     std::process::exit(1);
+  }
+}
+
+/// One answered attempt as `--trace` keeps it (diag-g083): its request word and the harness's instants, nanoseconds from
+/// the level's start; `kind` Destroy stands for a refusal of any kind.
+struct Traced {
+  word: u64,
+  kind: Kind,
+  refused: bool,
+  sent: u64,
+  handed: u64,
+  taken: u64,
+  floor: u64,
+}
+
+fn tracing() -> bool {
+  static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+  *ON.get_or_init(|| std::env::args().any(|a| a == "--trace"))
+}
+
+/// The legs a traced attempt's time is placed in, in the order they happen.
+const LEGS: [&str; 13] = [
+  "to_read",
+  "hop_in",
+  "ops",
+  "ask_out",
+  "ask_serve",
+  "ask_back",
+  "op_gap",
+  "hop_out",
+  "to_take",
+  "verdict",
+  "total",
+  "outbox",
+  "transit",
+];
+
+/// Joins each traced attempt with every span of its request the daemon's shards hold (drained now, every partition,
+/// through the Telemetry verb) and prints where its time went: per kind, each leg's p50/p99/p999/max over every attempt
+/// (`trace_leg`), each leg's mean over the attempts at or past their kind's p99 (`trace_tail`), and the slowest
+/// attempts' timelines (`trace_slow`).
+fn trace_report(n: usize, epoch: u64, traced: &[Traced], client: &mut Client) {
+  let shards = client
+    .daemon_status()
+    .map_or(0, |report| report.shards.len());
+  let mut names: Vec<String> = Vec::new();
+  let mut by_request: std::collections::HashMap<(u32, u32), Vec<(u16, u32, u32, u64, u64)>> =
+    std::collections::HashMap::new();
+  let mut drained = 0u64;
+  let mut shed = 0u64;
+  for partition in 0..shards {
+    let partition = u16::try_from(partition).unwrap();
+    loop {
+      let report = match client.telemetry(partition) {
+        Ok(report) => report,
+        Err(e) => {
+          println!("trace_error\t{partition}\t{e}");
+          break;
+        }
+      };
+      if names.is_empty() {
+        names = report.chokepoints.iter().map(|c| c.name.clone()).collect();
+      }
+      shed = shed.saturating_add(report.shed_before);
+      for span in report.spans {
+        drained += 1;
+        by_request
+          .entry((span.request_client, span.request_sequence))
+          .or_default()
+          .push((
+            partition,
+            span.point,
+            span.label,
+            span.start_ns,
+            span.end_ns,
+          ));
+      }
+      if report.remaining == 0 {
+        break;
+      }
+    }
+  }
+  let point = |name: &str| {
+    names
+      .iter()
+      .position(|n| n == name)
+      .map(|i| u32::try_from(i).unwrap())
+  };
+  let (ring_p, op_p, verdict_p) = (
+    point("ring.request"),
+    point("shard.op"),
+    point("merge.verdict"),
+  );
+  println!(
+    "trace\t{n}\tshards\t{shards}\tspans\t{drained}\tshed\t{shed}\tattempts\t{}",
+    traced.len()
+  );
+  let mut legs: BTreeMap<Kind, Vec<[u64; 13]>> = BTreeMap::new();
+  let mut unmatched = 0u64;
+  let mut slow: Vec<(u64, Kind, u64, [u64; 13], String)> = Vec::new();
+  for t in traced {
+    let id = slates_client::RequestId::from_word(t.word);
+    let Some(spans) = by_request.get(&(id.client, id.sequence)) else {
+      unmatched += 1;
+      continue;
+    };
+    let handed = epoch + t.handed;
+    let taken = epoch + t.taken;
+    // The request's newest ring span ending before the harness took the reply (a retry under one id has one each).
+    let Some(ring) = spans
+      .iter()
+      .filter(|s| Some(s.1) == ring_p && s.4 <= taken.saturating_add(1_000_000))
+      .max_by_key(|s| s.4)
+      .copied()
+    else {
+      unmatched += 1;
+      continue;
+    };
+    let mut inner: Vec<(u16, u32, u32, u64, u64)> = spans
+      .iter()
+      .filter(|s| Some(s.1) == op_p && s.3 >= ring.3 && s.4 <= ring.4)
+      .copied()
+      .collect();
+    inner.sort_by_key(|s| s.3);
+    let verdict: u64 = spans
+      .iter()
+      .filter(|s| Some(s.1) == verdict_p && s.3 >= ring.3 && s.4 <= ring.4)
+      .map(|s| s.4.saturating_sub(s.3))
+      .sum();
+    let mut leg = [0u64; 13];
+    leg[0] = ring.3.saturating_sub(handed);
+    let mut timeline = format!(
+      "ring@{}[{}..{}]",
+      ring.0,
+      ring.3 as i128 - handed as i128,
+      ring.4 as i128 - handed as i128
+    );
+    let mut prev: Option<(u16, u32, u64)> = None;
+    for s in &inner {
+      let ask = (2..=8).contains(&s.2);
+      let outbox = s.2 == 10;
+      let gap = match prev {
+        None => s.3.saturating_sub(ring.3),
+        Some((_, _, end)) => s.3.saturating_sub(end),
+      };
+      match prev {
+        None => leg[1] += gap,
+        Some((_, plabel, _)) => {
+          let pask = (2..=8).contains(&plabel);
+          let poutbox = plabel == 10;
+          match (pask, poutbox, ask, outbox) {
+            (false, false, true, _) => leg[3] += gap,
+            (_, true, true, _) => leg[12] += gap,
+            (true, _, false, _) => leg[5] += gap,
+            _ => leg[6] += gap,
+          }
+        }
+      }
+      if ask {
+        leg[4] += s.4.saturating_sub(s.3);
+      } else if outbox {
+        leg[11] += s.4.saturating_sub(s.3);
+      } else {
+        leg[2] += s.4.saturating_sub(s.3);
+      }
+      timeline.push_str(&format!(
+        " {}@{}:{}[{}..{}]",
+        if ask { "ask" } else { "op" },
+        s.0,
+        s.2,
+        s.3 as i128 - handed as i128,
+        s.4 as i128 - handed as i128
+      ));
+      prev = Some((s.0, s.2, s.4));
+    }
+    leg[7] = match prev {
+      Some((_, _, end)) => ring.4.saturating_sub(end),
+      None => 0,
+    };
+    leg[8] = taken.saturating_sub(ring.4);
+    leg[9] = verdict;
+    leg[10] = t.taken.saturating_sub(t.sent);
+    timeline.push_str(&format!(
+      " taken[{}] sent[{}] floor {}",
+      taken as i128 - handed as i128,
+      t.sent as i128 - t.handed as i128,
+      t.floor
+    ));
+    let kind = if t.refused { Kind::Destroy } else { t.kind };
+    legs.entry(kind).or_default().push(leg);
+    slow.push((leg[10], kind, t.word, leg, timeline));
+    if slow.len() > 4096 {
+      slow.sort_by(|a, b| b.0.cmp(&a.0));
+      slow.truncate(64);
+    }
+  }
+  println!("trace\t{n}\tunmatched\t{unmatched}");
+  for (kind, rows) in &legs {
+    for (i, name) in LEGS.iter().enumerate() {
+      let mut v: Vec<u64> = rows.iter().map(|r| r[i]).collect();
+      v.sort_unstable();
+      println!(
+        "trace_leg\t{n}\t{kind:?}\t{name}\t{}\t{}\t{}\t{}\t{}",
+        v.len(),
+        percentile(&v, 500),
+        percentile(&v, 990),
+        percentile(&v, 999),
+        v.last().copied().unwrap_or(0)
+      );
+    }
+    let mut totals: Vec<u64> = rows.iter().map(|r| r[10]).collect();
+    totals.sort_unstable();
+    let p99 = percentile(&totals, 990);
+    let tail: Vec<&[u64; 13]> = rows.iter().filter(|r| r[10] >= p99).collect();
+    let count = u64::try_from(tail.len()).unwrap().max(1);
+    let means: Vec<String> = (0..13)
+      .map(|i| (tail.iter().map(|r| r[i]).sum::<u64>() / count).to_string())
+      .collect();
+    println!(
+      "trace_tail\t{n}\t{kind:?}\tat_or_past_p99\t{p99}\tcount\t{}\t{}",
+      tail.len(),
+      LEGS
+        .iter()
+        .zip(&means)
+        .map(|(l, m)| format!("{l}={m}"))
+        .collect::<Vec<_>>()
+        .join("\t")
+    );
+  }
+  slow.sort_by(|a, b| b.0.cmp(&a.0));
+  for (total, kind, word, leg, timeline) in slow.iter().take(40) {
+    println!(
+      "trace_slow\t{n}\t{kind:?}\t{word:#x}\ttotal\t{total}\t{}\t{timeline}",
+      LEGS
+        .iter()
+        .zip(leg.iter())
+        .map(|(l, m)| format!("{l}={m}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+    );
   }
 }
 
@@ -2353,6 +2670,7 @@ mod tests {
       pause_ns: 0,
       attempt_sent_ns: 0,
       handed_ns: 0,
+      name: "load-0".to_owned(),
     }
   }
 
