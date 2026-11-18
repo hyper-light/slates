@@ -8,12 +8,12 @@
 //! the keyed hash under the anchor's issuer secret that an [`crate::Issuer`] makes. No person-only key is required;
 //! signatures are for signed work ([`crate::signed`]), which never gates permission.
 //!
-//! [`crate::Instance::approve`] is the whole step for a consumer: it presents the landing again, compares the
+//! [`crate::Instance::approve_landing`] is the whole step for a consumer: it presents the landing again, compares the
 //! manifest with the approved one, has a [`GrantAuthority`] prove the claim, grants and lands. A host whose approver
 //! answers on another client issues the grant there with [`crate::Instance::grant`] from the presentation's id and
-//! manifest ([`crate::Approval`]); the presenting client then lands under it.
+//! manifest ([`crate::LandingApproval`]); the presenting client then lands under it.
 
-use slates_ipc::protocol::GrantScope;
+use slates_ipc::protocol::{GrantScope, VolumeId};
 
 use crate::error::Error;
 
@@ -21,9 +21,9 @@ use crate::error::Error;
 /// term.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GrantClaim {
-  /// The presented landing's id ([`crate::Approval::id`]).
+  /// The presented landing's id ([`crate::LandingApproval::presentation`]).
   pub landing: u64,
-  /// The manifest hash the approver saw ([`crate::Approval::manifest`]).
+  /// The manifest hash the approver saw ([`crate::LandingApproval::manifest`]).
   pub manifest: [u8; 32],
   /// One landing of exactly this manifest, or the session's later landings of the volume into the target.
   pub scope: GrantScope,
@@ -62,4 +62,8 @@ impl std::fmt::Debug for GrantProof {
 pub trait GrantAuthority {
   /// The proof of `claim`. Refused typed when this authority cannot prove now (no handoff, no published secret).
   fn prove(&self, claim: &GrantClaim) -> Result<GrantProof, Error>;
+
+  /// The proof that approves merging the increment `identity` of `work` (A-285: a merge an ask mode held). Refused
+  /// typed as [`GrantAuthority::prove`] is.
+  fn prove_merge(&self, work: VolumeId, identity: &[u8; 32]) -> Result<GrantProof, Error>;
 }
