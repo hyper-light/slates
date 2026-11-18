@@ -10989,6 +10989,115 @@ fn a_takeover_completes_when_one_survivor_never_received_the_head() {
   );
 }
 
+/// CLAUDE.md §2 item 8 (no unbounded retry), §4.8 phase one: an object whose recovery cohort keeps a member that never
+/// promises it is given up by name once it has waited the failover SLO's worth of periods without progress, rather than
+/// waited for without end. Do: three nodes at f = 1; a volume on a, sealed and its head held by b and c; b and c each
+/// leave the other's takeover pages and questions unanswered (`Daemon::inject_takeover_silence`: a holder cut off from
+/// one successor alone, which the council never retires since every other member hears it); a stops. Expect: the
+/// volume's successor, which learns the object from its own copy, answers its status
+/// `NotRecovered { TakeoverIncomplete { waited_on: "promises" } }` within the serve deadline, having counted the wait
+/// past its bound and the give-up, while the other survivor counted its silences (non-vacuous). Before, the successor
+/// counted `fleet.takeover.unpromised` every period and answered a retryable `Overloaded` for as long as it ran.
+#[test]
+fn a_taken_over_object_a_survivor_never_promises_is_given_up_by_name() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, mut daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id } = client.call(&scratch("unpromised")) else {
+    panic!("create on the owner")
+  };
+  share_with_fleet(&mut client, id, &daemons);
+  let ReplyBody::Snapshotted { id: snapshot, .. } =
+    client.call(&RequestBody::Snapshot { volume: id })
+  else {
+    panic!("snapshot on the owner")
+  };
+  let object = ObjectId(id.bytes);
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  assert!(
+    poll_snapshot_placed(&observed, &mut client, id, snapshot),
+    "the volume's head placed"
+  );
+  // Both survivors hold the head, so the successor learns the object from its own copy whichever it is.
+  assert!(
+    poll_until(&observed, PLACEMENT_DEADLINE, || {
+      Ok(
+        daemons[1].fleet_holder_head(object)?.is_some()
+          && daemons[2].fleet_holder_head(object)?.is_some(),
+      )
+    }),
+    "both survivors hold the volume's head"
+  );
+  drop(client);
+  let silenced = [
+    daemons[1].inject_takeover_silence(&[hosts[2]]),
+    daemons[2].inject_takeover_silence(&[hosts[1]]),
+  ];
+  assert!(
+    silenced.iter().all(Result::is_ok),
+    "each survivor leaves the other's takeover questions unanswered: {silenced:?}"
+  );
+  let successor = rendezvous_first(&[hosts[1], hosts[2]], object).unwrap();
+  daemons.remove(0).stop();
+  let (at, other) = if successor == hosts[1] {
+    (0, 1)
+  } else {
+    (1, 0)
+  };
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let mut client = Client::connect(daemons[at].instance());
+  let mut last = None;
+  let given_up = poll_until(&survivors, SERVE_DEADLINE, || {
+    let reply = call_or_show_pulses(&mut client, &survivors, &RequestBody::Status { volume: id });
+    let named = matches!(
+      &reply,
+      ReplyBody::Refused {
+        refusal: Refusal::NotRecovered {
+          cause: slates_ipc::protocol::RecoveryCause::TakeoverIncomplete { waited_on },
+        },
+      } if waited_on == "promises"
+    );
+    last = Some(reply);
+    Ok(named)
+  });
+  drop(client);
+  let counted = daemons[at]
+    .fleet_refusals()
+    .map(|counters| takeover_counters(&counters));
+  let silences = daemons[other]
+    .fleet_refusals()
+    .map(|counters| counters.get("fleet.takeover.silenced_by_fault").copied());
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    matches!(silences, Ok(Some(count)) if count > 0),
+    "the other survivor left the successor's takeover questions unanswered: {silences:?}"
+  );
+  assert!(
+    given_up,
+    "the successor gives the volume up naming the promises it waited for, within {SERVE_DEADLINE:?}; its last reply \
+     {last:?}; its counters {counted:?}"
+  );
+  expect_the_wait_past_its_bound_and_the_give_up_counted(&counted.unwrap_or_default());
+}
+
+/// The successor's counts in `a_taken_over_object_a_survivor_never_promises_is_given_up_by_name`: expect `counted` (its
+/// takeover counters) to hold the wait for promises past its bound and the give-up, each at least once.
+fn expect_the_wait_past_its_bound_and_the_give_up_counted(counted: &[(&'static str, u64)]) {
+  for name in [
+    "fleet.takeover.unpromised.past_bound",
+    "fleet.takeover.given_up",
+  ] {
+    assert!(
+      counted
+        .iter()
+        .any(|(counter, count)| *counter == name && *count > 0),
+      "the successor counted {name}: {counted:?}"
+    );
+  }
+}
+
 /// A-251 (d), the process test (§4.8 "Promotion and takeover"; NoLoss): a takeover adopts a committed head that a holder
 /// left out of its pages because its routing lost the copy, the warm-restart case of
 /// `docs/bugs/2026-11-07-a-holder-restarted-warm-lost-its-copies-routing.md` (A-250 restores routing on a warm restart, so
@@ -12291,6 +12400,151 @@ fn loss_of(
   }
 }
 
+/// AC-8.3, §4.10 "Auto-seal": the loss window reported after an owner loss equals the edits after the last placed seal,
+/// measured against the owner's own report before the loss. Do: three nodes at `f = 1`; on a, a volume with one file,
+/// sealed and placed; then both other nodes refuse a's records, so the next seal (a second file) is taken but never
+/// placed; then a third file written and never sealed; then a dies. Expect a's report at no window while the volume is
+/// exactly its placed seal, naming that seal's head sequence; then a window above zero still naming the first seal (the
+/// second is not placed, so a takeover could not serve it); the successor's report naming the takeover, served from the
+/// seal (not a live log) at the sequence a named, under a later epoch; and on the successor the first file served and
+/// both later ones gone: the edits after the last placed seal, the second seal's included, are the window lost.
+#[test]
+fn a_successor_reports_the_loss_window_its_takeover_left() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, mut daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id } = client.call(&scratch("loss-window")) else {
+    panic!("the volume was created");
+  };
+  share_with_fleet(&mut client, id, &daemons);
+  let attachment = write_attachment(&mut client, id);
+  let write = |client: &mut Client, path: &str| {
+    client.call(&RequestBody::FsWrite {
+      volume: id,
+      attachment,
+      path: path.to_owned(),
+      bytes: path.as_bytes().to_vec(),
+      mode: 0o644,
+    })
+  };
+  let snapshot = |client: &mut Client| match client.call(&RequestBody::Snapshot { volume: id }) {
+    ReplyBody::Snapshotted { id, .. } => Some(id),
+    _ => None,
+  };
+  let object = ObjectId(id.bytes);
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let sealed_written = write(&mut client, "/sealed");
+  let first = snapshot(&mut client).expect("the volume was sealed");
+  let placed = poll_snapshot_placed(&observed, &mut client, id, first);
+  let survivors_hold = poll_all_hold(&[&daemons[1], &daemons[2]], object);
+  let sealed_loss = loss_of(&mut client, id);
+  // The next head reaches neither b nor c, so the second seal is taken on a but never placed.
+  let refusing = daemons[1]
+    .inject_record_refusal(&[hosts[0]])
+    .and_then(|()| daemons[2].inject_record_refusal(&[hosts[0]]));
+  let unplaced_written = write(&mut client, "/unplaced");
+  let second = snapshot(&mut client);
+  let unsealed_written = write(&mut client, "/unsealed");
+  let unsealed_loss = loss_of(&mut client, id);
+  drop(observed);
+  let owner = daemons.remove(0);
+  owner.stop();
+  let successor = rendezvous_first(&[hosts[1], hosts[2]], object).expect("a survivor takes over");
+  let successor_index = usize::from(successor != hosts[1]);
+  let successor_instance = daemons[successor_index].instance().to_owned();
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let served = poll_status_answers(&survivors, &successor_instance, id);
+  drop(survivors);
+  let mut reader = Client::connect(&successor_instance);
+  let taken_loss = loss_of(&mut reader, id);
+  let read = |reader: &mut Client, path: &str| {
+    reader.call(&RequestBody::Read {
+      volume: id,
+      path: path.to_owned(),
+      at: ReadAt::Head,
+    })
+  };
+  let sealed_read = read(&mut reader, "/sealed");
+  let unplaced_read = read(&mut reader, "/unplaced");
+  let unsealed_read = read(&mut reader, "/unsealed");
+  drop(reader);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "loss window: sealed {sealed_loss:?}, unsealed {unsealed_loss:?}, after the takeover {taken_loss:?}; \
+     reads {sealed_read:?} {unplaced_read:?} {unsealed_read:?}"
+  );
+  assert!(
+    [&sealed_written, &unplaced_written, &unsealed_written]
+      .iter()
+      .all(|written| matches!(written, ReplyBody::FsDone { .. })),
+    "every write was answered: {sealed_written:?} {unplaced_written:?} {unsealed_written:?}"
+  );
+  assert!(
+    placed && survivors_hold,
+    "the first seal placed and both survivors held its head"
+  );
+  assert!(
+    refusing.is_ok(),
+    "both survivors refuse a's records: {refusing:?}"
+  );
+  assert!(second.is_some(), "the second seal was taken on a");
+  assert!(served, "the successor serves the volume");
+  expect_the_loss_window_reported_then_taken(sealed_loss, unsealed_loss, taken_loss);
+  expect_the_sealed_file_alone_survived(&sealed_read, &unplaced_read, &unsealed_read);
+}
+
+/// The reports of `a_successor_reports_the_loss_window_its_takeover_left`. Expect the owner's report at its placed seal
+/// (`sealed`) to put nothing at risk and name that seal's head sequence; its report after the later writes
+/// (`unsealed`) to put them at risk, still naming that seal; and the successor's (`taken`) to report a takeover served
+/// from that seal, not a live log, under a later epoch.
+fn expect_the_loss_window_reported_then_taken(
+  sealed: Option<(slates_ipc::protocol::LossReport, u64)>,
+  unsealed: Option<(slates_ipc::protocol::LossReport, u64)>,
+  taken: Option<(slates_ipc::protocol::LossReport, u64)>,
+) {
+  let (sealed_loss, owner_epoch) = sealed.expect("a reported its loss window at its placed seal");
+  let at_seal = sealed_loss
+    .placed_sequence
+    .expect("a named its placed seal's head sequence");
+  assert!(
+    sealed_loss.at_risk_ns == Some(0) && !sealed_loss.live_shipped,
+    "nothing is at risk while the volume is exactly its placed seal: {sealed_loss:?}"
+  );
+  let (unsealed_loss, _) = unsealed.expect("a reported its loss window after the later writes");
+  assert!(
+    unsealed_loss.at_risk_ns.is_some_and(|ns| ns > 0)
+      && unsealed_loss.placed_sequence == Some(at_seal),
+    "the writes after the placed seal are at risk, and the unplaced seal moves nothing: {unsealed_loss:?}"
+  );
+  let taken = taken
+    .and_then(|(loss, _)| loss.taken_over)
+    .expect("the successor reports its takeover");
+  assert!(
+    !taken.from_live_log && taken.head_sequence == at_seal && taken.epoch > owner_epoch,
+    "served from the seal a named, under a later epoch: {taken:?}, a's placed seal {at_seal} under epoch {owner_epoch}"
+  );
+}
+
+/// The reads of `a_successor_reports_the_loss_window_its_takeover_left` on the successor: expect the sealed file served
+/// (`sealed`) and the two written after the placed seal (`unplaced`, `unsealed`) gone, the window lost.
+fn expect_the_sealed_file_alone_survived(
+  sealed: &ReplyBody,
+  unplaced: &ReplyBody,
+  unsealed: &ReplyBody,
+) {
+  assert!(
+    matches!(sealed, ReplyBody::ReadBytes { bytes } if bytes == b"/sealed"),
+    "the sealed file survived: {sealed:?}"
+  );
+  assert!(
+    !matches!(unplaced, ReplyBody::ReadBytes { .. })
+      && !matches!(unsealed, ReplyBody::ReadBytes { .. }),
+    "the writes after the placed seal were the window, and are gone: {unplaced:?} {unsealed:?}"
+  );
+}
+
 /// One write of `path`'s own name as its bytes through `attachment` of `volume`: the reply.
 fn write_own_name(client: &mut Client, volume: VolumeId, attachment: u64, path: &str) -> ReplyBody {
   client.call(&RequestBody::FsWrite {
@@ -12317,188 +12571,6 @@ fn read_at_head(client: &mut Client, volume: VolumeId, path: &str) -> ReplyBody 
     path: path.to_owned(),
     at: ReadAt::Head,
   })
-}
-
-/// What the loss-window test saw on the owner before it died ([`loss_window_before_the_loss`]).
-struct BeforeTheLoss {
-  /// The three writes' replies: the sealed file, the file under the unplaced seal, the unsealed file.
-  written: [ReplyBody; 3],
-  /// Whether the first seal placed, and both survivors held its head.
-  placed: bool,
-  survivors_hold: bool,
-  /// Both survivors' refusal of the owner's records, installed.
-  refusing: Result<(), ObserveError>,
-  /// The second seal, taken on the owner.
-  second: Option<SnapshotId>,
-  /// The owner's loss report (and its host epoch) at the placed seal, and after the later writes.
-  sealed: Option<(slates_ipc::protocol::LossReport, u64)>,
-  unsealed: Option<(slates_ipc::protocol::LossReport, u64)>,
-}
-
-/// The loss-window test's life of the volume on its owner `daemons[0]`: one file sealed and placed with both survivors
-/// holding its head; then both survivors refusing the owner's records, a second file sealed (never placed) and a third
-/// written and never sealed; the owner's loss report read at the placed seal and after the later writes.
-fn loss_window_before_the_loss(
-  daemons: &[Daemon],
-  hosts: &[HostId],
-  client: &mut Client,
-  id: VolumeId,
-) -> BeforeTheLoss {
-  let attachment = write_attachment(client, id);
-  let object = ObjectId(id.bytes);
-  let observed: Vec<&Daemon> = daemons.iter().collect();
-  let sealed_written = write_own_name(client, id, attachment, "/sealed");
-  let first = snapshot_taken(client, id).expect("the volume was sealed");
-  let placed = poll_snapshot_placed(&observed, client, id, first);
-  let survivors_hold = poll_all_hold(&[&daemons[1], &daemons[2]], object);
-  let sealed = loss_of(client, id);
-  // The next head reaches neither b nor c, so the second seal is taken on a but never placed.
-  let refusing = daemons[1]
-    .inject_record_refusal(&[hosts[0]])
-    .and_then(|()| daemons[2].inject_record_refusal(&[hosts[0]]));
-  let unplaced_written = write_own_name(client, id, attachment, "/unplaced");
-  let second = snapshot_taken(client, id);
-  let unsealed_written = write_own_name(client, id, attachment, "/unsealed");
-  let unsealed = loss_of(client, id);
-  BeforeTheLoss {
-    written: [sealed_written, unplaced_written, unsealed_written],
-    placed,
-    survivors_hold,
-    refusing,
-    second,
-    sealed,
-    unsealed,
-  }
-}
-
-/// What the loss-window test saw on the successor after the owner died ([`loss_window_after_the_loss`]).
-struct AfterTheLoss {
-  /// Whether the successor answered `status` for the volume.
-  served: bool,
-  /// The successor's loss report, and its host epoch.
-  taken: Option<(slates_ipc::protocol::LossReport, u64)>,
-  /// The three files read at the successor's head, in the order they were written.
-  read: [ReplyBody; 3],
-}
-
-/// The loss-window test after the owner died: the survivor `object` ranks first serves the volume, reports its loss
-/// window and reads each file back (the survivors are `daemons`, the owner's removed).
-fn loss_window_after_the_loss(daemons: &[Daemon], hosts: &[HostId], id: VolumeId) -> AfterTheLoss {
-  let object = ObjectId(id.bytes);
-  let successor = rendezvous_first(&[hosts[1], hosts[2]], object).expect("a survivor takes over");
-  let successor_index = usize::from(successor != hosts[1]);
-  let successor_instance = daemons[successor_index].instance().to_owned();
-  let survivors: Vec<&Daemon> = daemons.iter().collect();
-  let served = poll_status_answers(&survivors, &successor_instance, id);
-  let mut reader = Client::connect(&successor_instance);
-  let taken = loss_of(&mut reader, id);
-  let read = ["/sealed", "/unplaced", "/unsealed"].map(|path| read_at_head(&mut reader, id, path));
-  AfterTheLoss {
-    served,
-    taken,
-    read,
-  }
-}
-
-/// The loss-window test's owner side: every write answered, the first seal placed and held, the refusals installed,
-/// the second seal taken; nothing at risk at the placed seal and a window above zero after the later writes, both naming
-/// the placed seal's head sequence. Returns that sequence and the owner's host epoch.
-fn assert_owner_loss_reports(before: &BeforeTheLoss) -> (u64, u64) {
-  assert!(
-    before
-      .written
-      .iter()
-      .all(|written| matches!(written, ReplyBody::FsDone { .. })),
-    "every write was answered: {:?}",
-    before.written
-  );
-  assert!(
-    before.placed && before.survivors_hold,
-    "the first seal placed and both survivors held its head"
-  );
-  assert!(
-    before.refusing.is_ok(),
-    "both survivors refuse a's records: {:?}",
-    before.refusing
-  );
-  assert!(before.second.is_some(), "the second seal was taken on a");
-  let (sealed, owner_epoch) = before
-    .sealed
-    .clone()
-    .expect("a reported its loss window at its placed seal");
-  let at_seal = sealed
-    .placed_sequence
-    .expect("a named its placed seal's head sequence");
-  assert!(
-    sealed.at_risk_ns == Some(0) && !sealed.live_shipped,
-    "nothing is at risk while the volume is exactly its placed seal: {sealed:?}"
-  );
-  let (unsealed, _) = before
-    .unsealed
-    .clone()
-    .expect("a reported its loss window after the later writes");
-  assert!(
-    unsealed.at_risk_ns.is_some_and(|ns| ns > 0) && unsealed.placed_sequence == Some(at_seal),
-    "the writes after the placed seal are at risk, and the unplaced seal moves nothing: {unsealed:?}"
-  );
-  (at_seal, owner_epoch)
-}
-
-/// The loss-window test's successor side: it serves the volume, reports the takeover served from the seal the owner
-/// named (not a live log) under a later epoch, and holds the sealed file while both later writes are gone.
-fn assert_successor_loss_report(after: &AfterTheLoss, at_seal: u64, owner_epoch: u64) {
-  assert!(after.served, "the successor serves the volume");
-  let taken = after
-    .taken
-    .as_ref()
-    .and_then(|(loss, _)| loss.taken_over.clone())
-    .expect("the successor reports its takeover");
-  assert!(
-    !taken.from_live_log && taken.head_sequence == at_seal && taken.epoch > owner_epoch,
-    "served from the seal a named, under a later epoch: {taken:?}, a's placed seal {at_seal} under epoch {owner_epoch}"
-  );
-  let [sealed, unplaced, unsealed] = &after.read;
-  assert!(
-    matches!(sealed, ReplyBody::ReadBytes { bytes } if bytes == b"/sealed"),
-    "the sealed file survived: {sealed:?}"
-  );
-  assert!(
-    !matches!(unplaced, ReplyBody::ReadBytes { .. })
-      && !matches!(unsealed, ReplyBody::ReadBytes { .. }),
-    "the writes after the placed seal were the window, and are gone: {unplaced:?} {unsealed:?}"
-  );
-}
-
-/// AC-8.3, §4.10 "Auto-seal": the loss window reported after an owner loss equals the edits after the last placed seal,
-/// measured against the owner's own report before the loss. Do: three nodes at `f = 1`; on a, a volume with one file,
-/// sealed and placed; then both other nodes refuse a's records, so the next seal (a second file) is taken but never
-/// placed; then a third file written and never sealed; then a dies. Expect a's report at no window while the volume is
-/// exactly its placed seal, naming that seal's head sequence; then a window above zero still naming the first seal (the
-/// second is not placed, so a takeover could not serve it); the successor's report naming the takeover, served from the
-/// seal (not a live log) at the sequence a named, under a later epoch; and on the successor the first file served and
-/// both later ones gone: the edits after the last placed seal, the second seal's included, are the window lost.
-#[test]
-fn a_successor_reports_the_loss_window_its_takeover_left() {
-  let _serial = serialize_fleet_tests();
-  let (_serve_lease, mut daemons, hosts) = formed_mesh(&["a", "b", "c"]);
-  let mut client = Client::connect(daemons[0].instance());
-  let ReplyBody::Created { id } = client.call(&scratch("loss-window")) else {
-    panic!("the volume was created");
-  };
-  share_with_fleet(&mut client, id, &daemons);
-  let before = loss_window_before_the_loss(&daemons, &hosts, &mut client, id);
-  let owner = daemons.remove(0);
-  owner.stop();
-  let after = loss_window_after_the_loss(&daemons, &hosts, id);
-  for daemon in daemons {
-    daemon.stop();
-  }
-  eprintln!(
-    "loss window: sealed {:?}, unsealed {:?}, after the takeover {:?}; reads {:?}",
-    before.sealed, before.unsealed, after.taken, after.read
-  );
-  let (at_seal, owner_epoch) = assert_owner_loss_reports(&before);
-  assert_successor_loss_report(&after, at_seal, owner_epoch);
 }
 
 /// Three or more fleet nodes over anchor segments that outlive their daemons (each with its content object, so a
@@ -23531,11 +23603,46 @@ fn a_request_id_copied_into_another_session_reaches_no_completion_through_a_take
   );
 }
 
+/// Shape: the greens [`green_not_taken_over_by`] may create looking for one another survivor would take over: each is
+/// taken over by the avoided node at most half the time (it is one of at least two survivors in the green's cohort at
+/// `f = 1`), so 32 leave a chance of 2^-32 of finding none.
+const GREEN_TRIES: u32 = 32;
+
+/// Creates greens with a work each on `fleet[owner]` (through `client`) until one's successor, were that node to die,
+/// is not `avoided`: the member rendezvous ranks first among the surviving members of the green's cohort, the owner's
+/// candidates for it (`RegionalConfiguration::successor`'s rule, computed from the owner's placement). The green and its
+/// work.
+fn green_not_taken_over_by(
+  client: &mut Client,
+  name: &str,
+  fleet: &[Daemon],
+  (owner, avoided): (usize, HostId),
+) -> (VolumeId, VolumeId) {
+  let owner_host = fleet[owner].member_identity().unwrap();
+  for attempt in 0..GREEN_TRIES {
+    let (green, work) = green_with_work(client, &format!("{name}-{attempt}"), fleet);
+    let object = ObjectId(green.bytes);
+    let mut survivors: Vec<HostId> = fleet[owner]
+      .placement_candidates(object)
+      .unwrap()
+      .into_iter()
+      .filter(|host| *host != owner_host)
+      .collect();
+    survivors.sort_unstable_by_key(|host| host.0);
+    survivors.dedup();
+    if rendezvous_first(&survivors, object) != Some(avoided) {
+      return (green, work);
+    }
+  }
+  panic!("every one of {GREEN_TRIES} greens would be taken over by {avoided:?}")
+}
+
 /// A-255, the location round's answer end to end (§4.8 Lookup): a resend reaches the green through the work's
 /// catalog, and an origin that holds no copy of that catalog learns the work's green from the peers that do
 /// (`owner_location::locate_work_of`, `Reply::work_of`). Do: five nodes at `f = 1`; d refuses every register record
-/// from the others, so it holds no copy of the work's catalog while a owns the work; on a, a green and a
-/// work shared with the fleet; through d, an edit and the submit from a library client, answered version 1; once another
+/// from the others, so it holds no copy of the work's catalog while a owns the work; on a, a green that another survivor
+/// would take over (d holds none of its chain, so it could never rebuild it: GAP-A9-7's record half) and a work, shared
+/// with the fleet; through d, an edit and the submit from a library client, answered version 1; once another
 /// node holds version 1 and another the work's catalog (one survivor of each is what a takeover at `f = 1` needs),
 /// a dies; d's client resends under its id. Expect: the resend
 /// answered version 1; d counting its location round's naming of the green (`fleet.owner_location.work_of_named`,
@@ -23565,7 +23672,12 @@ fn a_survivor_holding_no_copy_of_the_works_catalog_learns_its_green_from_a_locat
     .collect();
   let deafened = daemons[3].inject_record_refusal(&others);
   let mut owner_client = Client::connect(daemons[0].instance());
-  let (green, work) = green_with_work(&mut owner_client, "located-work", &daemons);
+  // d holds none of the green's chain, so as the green's successor it could never rebuild it (GAP-A9-7's record half,
+  // open): host ids are drawn fresh each run, and the test failed whenever rendezvous ranked d first (1 of 3 runs alone
+  // at load 8, r906, 2026-11-18). The round under test is d's location round, so the green is one another survivor
+  // takes over.
+  let (green, work) =
+    green_not_taken_over_by(&mut owner_client, "located-work", &daemons, (0, hosts[3]));
   drop(owner_client);
   let mut client = Client::connect(daemons[3].instance());
   let (routed, last) = poll_status_served(&daemons, &mut client, work, COUNCIL_RETIRE_DEADLINE);

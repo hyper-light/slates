@@ -964,14 +964,48 @@ impl DaemonConfig {
     )
   }
 
-  /// This configuration with its control shard's capacity in the boot log, in place of any earlier line for it (the
-  /// capacity follows `runtime`'s, which [`Self::with_fleet`] raises).
+  /// Derived: the most messages one shard keeps at once for other shards whose control channels are full
+  /// (`crate::xshard::carrier`, §4.3). Each kept message is a reply or a result another shard waits for: every request
+  /// this node's clients may hold in flight owes one reply, and every acknowledgement part one result
+  /// (`2 × forward_lane_bound`); every other message a shard carries (a call's result, a connection's end) is awaited
+  /// or sent by a task, at most the daemon's task arenas. The requests in flight never reach it; past it a message is
+  /// refused to its sender, which counts the loss (`xshard.keep_refused`).
+  pub fn kept_bound(&self) -> Derived<usize> {
+    let in_flight = forward_lane_bound(
+      self.clients_per_shard,
+      self.region.slots,
+      self.runtime.shards,
+    )
+    .get();
+    let arenas = self.control_shard_capacity().get().tasks.saturating_add(
+      self
+        .runtime
+        .tasks_per_shard
+        .saturating_mul(usize::from(self.runtime.shards.saturating_sub(1))),
+    );
+    derived!(
+      in_flight.saturating_mul(2).saturating_add(arenas),
+      "2 × forward_lane_bound + control_shard_capacity.tasks + tasks_per_shard × (shards − 1)",
+      [
+        "clients_per_shard",
+        "region.slots",
+        "shards",
+        "tasks_per_shard",
+        "fleet.peers"
+      ]
+    )
+  }
+
+  /// This configuration with its control shard's capacity and its shards' kept bound in the boot log, in place of any
+  /// earlier lines for them (both follow `runtime`'s, which [`Self::with_fleet`] raises).
   fn with_control_shard_noted(mut self) -> DaemonConfig {
-    let line = note("control_shard_capacity", &self.control_shard_capacity());
-    self
-      .derivations
-      .retain(|kept| !kept.starts_with("control_shard_capacity "));
-    self.derivations.push(line);
+    let capacity = note("control_shard_capacity", &self.control_shard_capacity());
+    let kept = note("kept_bound", &self.kept_bound());
+    self.derivations.retain(|line| {
+      !line.starts_with("control_shard_capacity ") && !line.starts_with("kept_bound ")
+    });
+    self.derivations.push(capacity);
+    self.derivations.push(kept);
     self
   }
 }
