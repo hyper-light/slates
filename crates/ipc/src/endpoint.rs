@@ -1427,6 +1427,7 @@ mod departure {
   use slates_mem::Handoff;
 
   use super::{ClientEnd, DaemonEnd, Waited};
+  use crate::error::IpcError;
   use crate::region::{ClientRegion, RegionGeometry};
   use crate::rendezvous::Liveness;
   use crate::slot::Slot;
@@ -1464,8 +1465,16 @@ mod departure {
   /// object holds the start stamp a client's liveness check compares. Kept for the test; Linux's check is the control
   /// socket alone.
   #[cfg(any(target_os = "macos", windows))]
-  fn published(instance: &str) -> crate::rendezvous::Listener {
-    crate::rendezvous::Listener::open(instance, None).unwrap()
+  fn published(instance: &str) -> Result<crate::rendezvous::Listener, IpcError> {
+    crate::rendezvous::Listener::open(instance, None)
+  }
+
+  /// The OS's refusal of `call`, typed as the crate's.
+  fn refused(call: &'static str) -> impl FnOnce(std::io::Error) -> IpcError {
+    move |error| IpcError::OsRefused {
+      call,
+      code: error.raw_os_error(),
+    }
   }
 
   /// The daemon's process as these tests stand it in, ended when dropped: on Linux the daemon's end of a control
@@ -1488,7 +1497,7 @@ mod departure {
 
   /// A stand-in daemon's life and the liveness check a client end watches it by.
   #[cfg(target_os = "linux")]
-  fn daemon_life(_instance: &str) -> (DaemonLife, Liveness) {
+  fn daemon_life(_instance: &str) -> Result<(DaemonLife, Liveness), IpcError> {
     use rustix::net::{AddressFamily, SocketFlags, SocketType};
     let (daemon, client) = rustix::net::socketpair(
       AddressFamily::UNIX,
@@ -1496,36 +1505,35 @@ mod departure {
       SocketFlags::CLOEXEC,
       None,
     )
-    .unwrap();
-    (
-      DaemonLife { _socket: daemon },
-      Liveness::of_socket(client).unwrap(),
-    )
+    .map_err(|errno| refused("socketpair")(errno.into()))?;
+    Ok((DaemonLife { _socket: daemon }, Liveness::of_socket(client)?))
   }
 
   /// A stand-in daemon's life and the liveness check a client end watches it by: `instance`'s published stamp and the
   /// child's process.
   #[cfg(target_os = "macos")]
-  fn daemon_life(instance: &str) -> (DaemonLife, Liveness) {
+  fn daemon_life(instance: &str) -> Result<(DaemonLife, Liveness), IpcError> {
     let process = std::process::Command::new("/bin/sleep")
       .arg(STAND_IN_LIFE_S)
       .spawn()
-      .unwrap();
-    let liveness = Liveness::of_daemon(instance, process.id()).unwrap();
-    (DaemonLife { process }, liveness)
+      .map_err(refused("spawn the stand-in daemon"))?;
+    let pid = process.id();
+    let life = DaemonLife { process };
+    Ok((life, Liveness::of_daemon(instance, pid)?))
   }
 
   /// A stand-in daemon's life and the liveness check a client end watches it by: `instance`'s published stamp and the
   /// child's process.
   #[cfg(windows)]
-  fn daemon_life(instance: &str) -> (DaemonLife, Liveness) {
+  fn daemon_life(instance: &str) -> Result<(DaemonLife, Liveness), IpcError> {
     let process = std::process::Command::new("cmd")
       .args(["/C", "ping", "-n", STAND_IN_LIFE_S, "127.0.0.1"])
       .stdout(std::process::Stdio::null())
       .spawn()
-      .unwrap();
-    let liveness = Liveness::of_daemon(instance, process.id()).unwrap();
-    (DaemonLife { process }, liveness)
+      .map_err(refused("spawn the stand-in daemon"))?;
+    let pid = process.id();
+    let life = DaemonLife { process };
+    Ok((life, Liveness::of_daemon(instance, pid)?))
   }
 
   /// A test's rings: the region's creator (kept until the test ends), a client end over a second mapping watching
@@ -1540,42 +1548,44 @@ mod departure {
     daemon_completion: Option<std::os::fd::OwnedFd>,
   }
 
-  fn rings(test: &str, liveness: Liveness) -> Rings {
-    let region = ClientRegion::create(&unique_name(test), 7, 0, geometry()).unwrap();
-    let (handoff, len) = region.handoff().unwrap();
-    let mut client = ClientEnd::new(ClientRegion::open(&handoff, len).unwrap());
+  fn rings(test: &str, liveness: Liveness) -> Result<Rings, IpcError> {
+    let region = ClientRegion::create(&unique_name(test), 7, 0, geometry())?;
+    let (handoff, len) = region.handoff()?;
+    let mut client = ClientEnd::new(ClientRegion::open(&handoff, len)?);
     client.set_liveness(liveness);
     #[cfg(target_os = "linux")]
     let daemon_completion = {
       use rustix::event::{EventfdFlags, eventfd};
-      let completion = eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK).unwrap();
-      let daemon_copy = rustix::io::dup(&completion).unwrap();
+      let completion = eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK)
+        .map_err(|errno| refused("eventfd")(errno.into()))?;
+      let daemon_copy =
+        rustix::io::dup(&completion).map_err(|errno| refused("dup")(errno.into()))?;
       client.set_completion(completion);
       Some(daemon_copy)
     };
-    Rings {
+    Ok(Rings {
       _region: region,
       client,
       handoff,
       len,
       #[cfg(target_os = "linux")]
       daemon_completion,
-    }
+    })
   }
 
   impl Rings {
     /// A daemon end over its own mapping of the region, handed the completion eventfd's copy where one exists.
-    fn daemon_end(&mut self) -> impl FnOnce() -> DaemonEnd + Send + use<> {
+    fn daemon_end(&mut self) -> impl FnOnce() -> Result<DaemonEnd, IpcError> + Send + use<> {
       let handoff = self.handoff.clone();
       let len = self.len;
       #[cfg(target_os = "linux")]
       let completion = self.daemon_completion.take();
       move || {
         #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
-        let mut daemon = DaemonEnd::new(ClientRegion::open(&handoff, len).unwrap());
+        let mut daemon = DaemonEnd::new(ClientRegion::open(&handoff, len)?);
         #[cfg(target_os = "linux")]
         daemon.set_completion(completion);
-        daemon
+        Ok(daemon)
       }
     }
   }
@@ -1590,13 +1600,13 @@ mod departure {
     let _gate = crate::descriptor_test_gate();
     let instance = unique_name("slates-endpoint-late-reply-daemon");
     #[cfg(any(target_os = "macos", windows))]
-    let _rendezvous = published(&instance);
-    let (life, liveness) = daemon_life(&instance);
-    let mut rings = rings("slates-endpoint-late-reply", liveness);
+    let _rendezvous = published(&instance).unwrap();
+    let (life, liveness) = daemon_life(&instance).unwrap();
+    let mut rings = rings("slates-endpoint-late-reply", liveness).unwrap();
     let open_daemon = rings.daemon_end();
     rings.client.send(&Slot::inline(1, b"hi").unwrap()).unwrap();
     let replier = std::thread::spawn(move || {
-      let mut daemon = open_daemon();
+      let mut daemon = open_daemon().unwrap();
       let request = loop {
         if let Some(request) = daemon.try_take().unwrap() {
           break request;
@@ -1649,10 +1659,10 @@ mod departure {
     let _gate = crate::descriptor_test_gate();
     let instance = unique_name("slates-endpoint-departure-daemon");
     #[cfg(any(target_os = "macos", windows))]
-    let _rendezvous = published(&instance);
-    let (life, liveness) = daemon_life(&instance);
-    let mut rings = rings("slates-endpoint-departure", liveness);
-    let _daemon = rings.daemon_end()();
+    let _rendezvous = published(&instance).unwrap();
+    let (life, liveness) = daemon_life(&instance).unwrap();
+    let mut rings = rings("slates-endpoint-departure", liveness).unwrap();
+    let _daemon = rings.daemon_end()().unwrap();
     rings.client.send(&Slot::inline(1, b"hi").unwrap()).unwrap();
     let ender = std::thread::spawn(move || {
       #[allow(clippy::disallowed_methods)]
@@ -1696,7 +1706,7 @@ mod departure {
   #[test]
   fn a_daemon_restarted_inside_its_own_process_ends_the_wait() {
     use std::sync::mpsc::channel;
-    type OpenDaemon = Box<dyn FnOnce() -> DaemonEnd + Send>;
+    type OpenDaemon = Box<dyn FnOnce() -> Result<DaemonEnd, IpcError> + Send>;
     let instance = unique_name("slates-endpoint-in-process-daemon");
     let (published_tx, published_rx) = channel::<()>();
     let (daemon_tx, daemon_rx) = channel::<OpenDaemon>();
@@ -1704,14 +1714,14 @@ mod departure {
     let restarter = {
       let instance = instance.clone();
       std::thread::spawn(move || {
-        let first = published(&instance);
+        let first = published(&instance).unwrap();
         published_tx.send(()).unwrap();
         let open_daemon = daemon_rx.recv().unwrap();
         #[allow(clippy::disallowed_methods)]
         // the daemon lives a while into the wait on purpose: its restart is tested.
         std::thread::sleep(Duration::from_nanos(DEPARTS_AFTER_NS));
         drop(first);
-        let second = published(&instance);
+        let second = published(&instance).unwrap();
         let restarted = Instant::now();
         // The restarted daemon is held until the wait ends. A wait still going twice the old deadline later missed the
         // restart, and is answered on its old ring, so the test ends rather than hangs.
@@ -1719,7 +1729,7 @@ mod departure {
           .recv_timeout(Duration::from_nanos(2 * OLD_REPLY_DEADLINE_NS))
           .is_err();
         if missed {
-          let mut daemon = open_daemon();
+          let mut daemon = open_daemon().unwrap();
           if let Some(request) = daemon.try_take().unwrap() {
             daemon
               .reply(&Slot::inline(request.request, b"rescued").unwrap())
@@ -1732,7 +1742,7 @@ mod departure {
     };
     published_rx.recv().unwrap();
     let liveness = Liveness::of_daemon(&instance, std::process::id()).unwrap();
-    let mut rings = rings("slates-endpoint-in-process", liveness);
+    let mut rings = rings("slates-endpoint-in-process", liveness).unwrap();
     daemon_tx.send(Box::new(rings.daemon_end())).unwrap();
     rings.client.send(&Slot::inline(1, b"hi").unwrap()).unwrap();
     let asked = Instant::now();
