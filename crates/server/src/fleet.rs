@@ -3517,6 +3517,8 @@ fn envelope_of(state: &mut ShardState, object: ObjectId, archive: Archive) -> Op
   if state.seal_root.is_none() {
     return Some(archive);
   }
+  // Red check only: main's one-turn wrap counted as one wrap turn.
+  state.count("fleet.seal.wrap_slices", 1);
   let id = DbVolumeId { bytes: object.0 };
   let sealed = state
     .db
