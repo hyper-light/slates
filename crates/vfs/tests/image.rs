@@ -29,7 +29,7 @@ use slates_vfs::image::{
   BuildIo, ImageContent, ImageError, Merge, MergeContent, MergeReport, SnapshotFile, SnapshotTree,
   SnapshotWalk,
 };
-use slates_vfs::inode::Kind;
+use slates_vfs::inode::{DeviceNumber, Kind, SpecialNode};
 use slates_vfs::names::NameEquivalence;
 use slates_vfs::quota::Quota;
 use slates_vfs::volume::{Store, Volume, VolumeConfig};
@@ -170,11 +170,34 @@ fn volume_entries(volume: &Volume, store: &Store) -> Vec<Entry> {
         ),
         Kind::Fifo => (ImageKind::Fifo, Vec::new()),
         Kind::Socket => (ImageKind::Socket, Vec::new()),
+        // A device node is its number (A-294), in the image's encoding.
+        Kind::BlockDevice => (
+          ImageKind::BlockDevice {
+            rdev: linux_number(volume, store, row.inode),
+          },
+          Vec::new(),
+        ),
+        Kind::CharDevice => (
+          ImageKind::CharDevice {
+            rdev: linux_number(volume, store, row.inode),
+          },
+          Vec::new(),
+        ),
       };
       items.push((path, row.inode.0, node(kind, row.inode), bytes));
     }
   }
   canonical_of(items)
+}
+
+/// Device node `no`'s number in the Linux kernel's encoding, as an image carries it (A-294).
+fn linux_number(volume: &Volume, store: &Store, no: InodeNo) -> u32 {
+  volume
+    .observe(store, no)
+    .unwrap()
+    .device
+    .and_then(DeviceNumber::to_linux)
+    .unwrap()
 }
 
 /// The canonical form of `tree`, each file's bytes from `content`.
@@ -225,6 +248,10 @@ enum Make {
   Symlink(String),
   Fifo,
   Socket,
+  /// A block device node numbered by this word of the Linux kernel's encoding (A-294): every word names a number.
+  BlockDevice(u32),
+  /// A character device node, numbered the same way (A-294).
+  CharDevice(u32),
   /// A hard link to the file made `n`th, modulo the files made.
   Link(usize),
 }
@@ -266,6 +293,8 @@ fn makes() -> impl Strategy<Value = Vec<(Make, usize, String, Meta)>> {
     2 => "[a-z/.]{1,80}".prop_map(Make::Symlink),
     1 => Just(Make::Fifo),
     1 => Just(Make::Socket),
+    1 => any::<u32>().prop_map(Make::BlockDevice),
+    1 => any::<u32>().prop_map(Make::CharDevice),
     2 => any::<usize>().prop_map(Make::Link),
   ];
   prop::collection::vec((make, any::<usize>(), name(), meta()), 0..24)
@@ -317,10 +346,28 @@ fn populate(volume: &mut Volume, store: &mut Store, makes: Vec<(Make, usize, Str
       }
       Make::Symlink(target) => volume.symlink_no(store, parent, &name, &target).unwrap(),
       Make::Fifo => volume
-        .mknod_no(store, parent, &name, 0o644, Kind::Fifo)
+        .mknod_no(store, parent, &name, 0o644, SpecialNode::Fifo)
         .unwrap(),
       Make::Socket => volume
-        .mknod_no(store, parent, &name, 0o644, Kind::Socket)
+        .mknod_no(store, parent, &name, 0o644, SpecialNode::Socket)
+        .unwrap(),
+      Make::BlockDevice(rdev) => volume
+        .mknod_no(
+          store,
+          parent,
+          &name,
+          0o644,
+          SpecialNode::BlockDevice(DeviceNumber::from_linux(rdev)),
+        )
+        .unwrap(),
+      Make::CharDevice(rdev) => volume
+        .mknod_no(
+          store,
+          parent,
+          &name,
+          0o644,
+          SpecialNode::CharDevice(DeviceNumber::from_linux(rdev)),
+        )
         .unwrap(),
       Make::Link(target) => {
         if files.is_empty() {
@@ -521,6 +568,10 @@ enum Body {
   Symlink(Vec<u8>),
   Fifo,
   Socket,
+  /// A device node and its number in the Linux kernel's encoding (A-294).
+  BlockDevice(u32),
+  /// A character device node and its number (A-294).
+  CharDevice(u32),
 }
 
 /// A node of a guest history's model of the image: what it is, its attributes, and its inode number and generation.
@@ -558,7 +609,8 @@ impl Model {
         ImageKind::Symlink { target } => Body::Symlink(target.clone()),
         ImageKind::Fifo => Body::Fifo,
         ImageKind::Socket => Body::Socket,
-        kind => panic!("a volume's image holds no {kind:?}"),
+        ImageKind::BlockDevice { rdev } => Body::BlockDevice(*rdev),
+        ImageKind::CharDevice { rdev } => Body::CharDevice(*rdev),
       };
       nodes.push(ModelNode {
         body,
@@ -680,6 +732,8 @@ impl Model {
         },
         Body::Fifo => ImageKind::Fifo,
         Body::Socket => ImageKind::Socket,
+        Body::BlockDevice(rdev) => ImageKind::BlockDevice { rdev: *rdev },
+        Body::CharDevice(rdev) => ImageKind::CharDevice { rdev: *rdev },
       },
       permissions: model.permissions,
       uid: model.uid,
@@ -740,7 +794,8 @@ enum Edit {
   Attributes(usize, Meta),
   /// Deletes entry `a` (a directory with everything inside it).
   Delete(usize),
-  /// Makes a node in directory `a` named `name`: a directory, a file of `bytes`, a symlink, a FIFO.
+  /// Makes a node in directory `a` named `name`: a directory, a file of `bytes`, a symlink, a FIFO, or a block or
+  /// character device numbered by the first bytes of `bytes` (A-294).
   Create(usize, String, u8, Vec<u8>, Meta, u32),
   /// Links file `a` into directory `b` as `name`.
   Link(usize, usize, String),
@@ -758,7 +813,7 @@ fn edits() -> impl Strategy<Value = Vec<Edit>> {
     2 => (any::<usize>(), 0usize..80_000, bytes()).prop_map(|(a, b, c)| Edit::Patch(a, b, c)),
     2 => (any::<usize>(), meta()).prop_map(|(a, m)| Edit::Attributes(a, m)),
     2 => any::<usize>().prop_map(Edit::Delete),
-    3 => (any::<usize>(), name(), 0u8..4, bytes(), meta(), any::<u32>())
+    3 => (any::<usize>(), name(), 0u8..6, bytes(), meta(), any::<u32>())
       .prop_map(|(a, n, k, b, m, g)| Edit::Create(a, n, k, b, m, g)),
     1 => (any::<usize>(), any::<usize>(), name()).prop_map(|(a, b, n)| Edit::Link(a, b, n)),
     1 => (any::<usize>(), any::<usize>(), any::<usize>()).prop_map(|(a, b, c)| Edit::Swap(a, b, c)),
@@ -854,7 +909,8 @@ fn set_attributes(model: &mut Model, pick: usize, (permissions, uid, gid, times)
   node.times = times.map(timestamp);
 }
 
-/// Makes a node of `kind` (a directory, a file of `bytes`, a symlink, a FIFO) in `directory` as `name` (made free).
+/// Makes a node of `kind` (a directory, a file of `bytes`, a symlink, a FIFO, a block or character device numbered by
+/// the first four of `bytes`, A-294) in `directory` as `name` (made free).
 fn create(
   model: &mut Model,
   directory: usize,
@@ -869,7 +925,19 @@ fn create(
     0 => Body::Directory,
     1 => Body::File(bytes),
     2 => Body::Symlink(format!("t{}", bytes.len()).into_bytes()),
-    _ => Body::Fifo,
+    3 => Body::Fifo,
+    kind => {
+      // Every word of the kernel's encoding names a device number, so any four bytes do.
+      let rdev = bytes
+        .iter()
+        .take(size_of::<u32>())
+        .fold(0u32, |word, byte| (word << u8::BITS) | u32::from(*byte));
+      if kind == 4 {
+        Body::BlockDevice(rdev)
+      } else {
+        Body::CharDevice(rdev)
+      }
+    }
   };
   let node = model.add(body, meta, generation);
   model.entries.insert((directory, name), node);
@@ -1025,7 +1093,7 @@ fn scenario_base(store: &mut Store) -> Volume {
   source.link_no(store, d, "link", x).unwrap();
   source.symlink_no(store, root, "s", "d/a").unwrap();
   source
-    .mknod_no(store, root, "p", 0o644, Kind::Fifo)
+    .mknod_no(store, root, "p", 0o644, SpecialNode::Fifo)
     .unwrap();
   source
 }
@@ -1324,6 +1392,12 @@ proptest! {
 /// Merges into a clone of the scenario base an image tree with one entry naming `node` in the root, made by the
 /// guest; the merge's refusal.
 fn refusal_of(name: Vec<u8>, node: Node) -> ImageError {
+  merged_with(name, node).err().unwrap()
+}
+
+/// Merges into a clone of the scenario base an image tree with one entry naming `node` in the root, made by the
+/// guest: the clone and its store, or the merge's refusal.
+fn merged_with(name: Vec<u8>, node: Node) -> Result<(Volume, Store), ImageError> {
   let mut store = common::store();
   let mut source = scenario_base(&mut store);
   let snapshot = source.snapshot(&mut store).unwrap();
@@ -1352,13 +1426,14 @@ fn refusal_of(name: Vec<u8>, node: Node) -> ImageError {
     &mut MapContent {
       files: BTreeMap::new(),
     },
-  )
-  .unwrap_err()
+  )?;
+  Ok((clone, store))
 }
 
 /// A-160 (what a volume cannot hold, refused by kind). Do: merge images whose one new entry has a name that is not
-/// UTF-8, is a symlink whose target is not, is a character device, or carries a time past 2262 (beyond a volume's
-/// nanoseconds in an `i64`, inside the image format's 2446). Expect each refused by its own kind, the path named.
+/// UTF-8, is a symlink whose target is not, or carries a time past 2262 (beyond a volume's nanoseconds in an `i64`,
+/// inside the image format's 2446). Expect each refused by its own kind, the path named. A device node is no longer
+/// among them (A-294): `a_guests_device_node_is_kept_with_its_number`.
 #[test]
 fn what_a_volume_cannot_hold_is_refused_by_kind() {
   let fifo = |kind: ImageKind| Node {
@@ -1387,12 +1462,6 @@ fn what_a_volume_cannot_hold_is_refused_by_kind() {
       path: "/link".to_owned()
     }
   );
-  assert_eq!(
-    refusal_of(b"null".to_vec(), fifo(ImageKind::CharDevice { rdev: 259 })),
-    ImageError::NodeUnsupported {
-      path: "/null".to_owned()
-    }
-  );
   let mut late = fifo(ImageKind::Fifo);
   late.mtime = Timestamp {
     secs: i64::MAX / NANOS + 1,
@@ -1402,4 +1471,97 @@ fn what_a_volume_cannot_hold_is_refused_by_kind() {
     refusal_of(b"late".to_vec(), late),
     ImageError::Image(slates_image::ImageRefusal::TimeOutOfRange { .. })
   ));
+}
+
+/// A-294 (a device node kept as metadata). Do: merge images whose one new entry the guest made is a character device
+/// numbered 1:3 (the kernel's word 259, `/dev/null`'s number) or a block device numbered 259:1048575 (past the old
+/// 8-bit encoding, so the ext4 inode carries the new one); expect each kept in the clone as that kind with that number,
+/// its permissions and owner the image's.
+#[test]
+fn a_guests_device_node_is_kept_with_its_number() {
+  let node = |kind: ImageKind| Node {
+    kind,
+    permissions: 0o620,
+    uid: 7,
+    gid: 5,
+    atime: timestamp(0),
+    mtime: timestamp(0),
+    ctime: timestamp(0),
+  };
+  let widest = DeviceNumber::new(259, (1 << 20) - 1);
+  for (kind, expected) in [
+    (
+      ImageKind::CharDevice { rdev: 259 },
+      (Kind::CharDevice, DeviceNumber::new(1, 3)),
+    ),
+    (
+      ImageKind::BlockDevice {
+        rdev: widest.to_linux().unwrap(),
+      },
+      (Kind::BlockDevice, widest),
+    ),
+  ] {
+    let (clone, store) = merged_with(b"dev".to_vec(), node(kind)).unwrap();
+    let no = clone.resolve(&store, "/dev").unwrap().inode;
+    let observed = clone.observe(&store, no).unwrap();
+    assert_eq!(
+      (observed.kind, observed.device),
+      (expected.0, Some(expected.1))
+    );
+    assert_eq!(
+      (
+        observed.attrs.mode & PERMISSIONS,
+        observed.attrs.uid,
+        observed.attrs.gid
+      ),
+      (0o620, 7, 5)
+    );
+  }
+}
+
+/// A-294 (a number the image cannot hold). Do: build an image of a snapshot holding a character device numbered past
+/// the Linux kernel's 12-bit major, as an NFS client may make one, and, as the control, one numbered within it. Expect
+/// the first walk refused `DeviceNumberUnencodable`, naming the path and the number, never a truncated number in the
+/// image, and the second walked whole.
+#[test]
+fn a_device_number_past_the_images_encoding_is_refused_at_the_build() {
+  for (number, refused) in [
+    (DeviceNumber::new(1 << 12, 0), true),
+    (DeviceNumber::new((1 << 12) - 1, 0), false),
+  ] {
+    let mut store = common::store();
+    let mut source = volume(&mut store, 9, NameEquivalence::Exact);
+    let root = source.root_inode(&store).unwrap();
+    let dir = source.mkdir_no(&mut store, root, "dev", 0o755).unwrap();
+    source
+      .mknod_no(
+        &mut store,
+        dir,
+        "big",
+        0o600,
+        SpecialNode::CharDevice(number),
+      )
+      .unwrap();
+    let snapshot = source.snapshot(&mut store).unwrap();
+    let mut walk = SnapshotWalk::new(&source, &store, snapshot, MOST).unwrap();
+    let walked = loop {
+      match walk.step(&source, &store, SMALLEST) {
+        Ok(Some(_)) => break Ok(()),
+        Ok(None) => {}
+        Err(refusal) => break Err(refusal),
+      }
+    };
+    if refused {
+      assert_eq!(
+        walked,
+        Err(ImageError::DeviceNumberUnencodable {
+          path: "/dev/big".to_owned(),
+          major: number.major,
+          minor: number.minor,
+        })
+      );
+    } else {
+      assert_eq!(walked, Ok(()));
+    }
+  }
 }

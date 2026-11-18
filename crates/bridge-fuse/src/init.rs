@@ -6,7 +6,7 @@
 use crate::abi::{FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION, Opcode, flags};
 use crate::error::FuseError;
 use crate::wire::{Reader, Writer};
-use slates_bridge_core::{CacheCoherence, DaxOffer};
+use slates_bridge_core::{AttributeNamespaces, CacheCoherence, DaxOffer};
 
 /// The maximum write the daemon accepts in one request; public because it is the anchor of the
 /// virtio-fs device's readable-bytes cap (`slates-bridge-virtiofs`): the largest request a guest
@@ -129,9 +129,25 @@ fn wanted(coherence: CacheCoherence) -> u64 {
 }
 
 /// Negotiates from a `fuse_init_in` body (major, minor, max_readahead, flags, then flags2 and
-/// padding when the kernel set `INIT_EXT`). A body shorter than the fixed part is refused. No DAX is offered.
+/// padding when the kernel set `INIT_EXT`). A body shorter than the fixed part is refused. No DAX is offered, and the
+/// kernel is a host's, asked to check no ACL.
 pub fn negotiate(body: &[u8], coherence: CacheCoherence) -> Result<InitNegotiation, FuseError> {
-  negotiate_offering(body, coherence, DaxOffer::Withheld)
+  negotiate_offering(
+    body,
+    coherence,
+    DaxOffer::Withheld,
+    AttributeNamespaces::Host,
+  )
+}
+
+/// The ACL check a transport asks its kernel for (A-314): a guest kernel's route, whose ACLs are the guest's own,
+/// asks for `FUSE_POSIX_ACL`, so the guest's kernel judges each access by the ACL it reads, as a Linux bind mount
+/// enforces a container's `setfacl`; a host's mount reaches no ACL (A-302) and asks for none.
+fn acl_wanted(namespaces: AttributeNamespaces) -> u64 {
+  match namespaces {
+    AttributeNamespaces::Host => 0,
+    AttributeNamespaces::Guest => flags::POSIX_ACL,
+  }
 }
 
 /// The DAX flags a transport offering per-inode DAX asks for ([`DaxOffer::PerInode`]): the alignment its mappings keep
@@ -144,11 +160,13 @@ fn dax_wanted(dax: DaxOffer) -> u64 {
 }
 
 /// [`negotiate`], keeping the kernel's DAX flags where the transport offers per-inode DAX as `dax` says (the Shards
-/// route, part 3): `FUSE_HAS_INODE_DAX`, and `FUSE_MAP_ALIGNMENT` with the host's page as the alignment.
+/// route, part 3): `FUSE_HAS_INODE_DAX`, and `FUSE_MAP_ALIGNMENT` with the host's page as the alignment; and its
+/// `FUSE_POSIX_ACL` where the transport is a guest kernel's, as `namespaces` says (A-314).
 pub fn negotiate_offering(
   body: &[u8],
   coherence: CacheCoherence,
   dax: DaxOffer,
+  namespaces: AttributeNamespaces,
 ) -> Result<InitNegotiation, FuseError> {
   let opcode = Opcode::Init.to_wire();
   let mut r = Reader::new(body);
@@ -182,7 +200,7 @@ pub fn negotiate_offering(
       map_alignment: 0,
     });
   }
-  let kept = (wanted(coherence) | dax_wanted(dax)) & kernel_flags;
+  let kept = (wanted(coherence) | dax_wanted(dax) | acl_wanted(namespaces)) & kernel_flags;
   Ok(InitNegotiation {
     major: FUSE_KERNEL_VERSION,
     minor: minor.min(FUSE_KERNEL_MINOR_VERSION),

@@ -18,7 +18,9 @@
 //!    bootstrapped, a volume created, and `slates export` prints its path.
 //! 5. A PersistentVolume names the export (`nfsvers=4.2,xprtsec=mtls,nosuid,nodev`), and a pod writes a file
 //!    through kubelet's mount. A second pod, a fresh mount, must read exactly those bytes, and the kernel must
-//!    list its mount `nosuid,nodev`.
+//!    list its mount `nosuid,nodev`. A root pod makes two device nodes in the volume (A-294 keeps them as metadata),
+//!    and an unprivileged pod opens both: `/dev/null`'s number opens, which shows the pod's bind does not carry
+//!    `nodev`, and `/dev/mem`'s is refused `EPERM` by the container runtime's device cgroup, the pod's guard.
 //! 6. A pod maps a file read-only through kubelet's mount, another path (a write attachment on pod 0, through
 //!    `slates write`) replaces its bytes, and the pod's map must show the change within `MAP_WAIT` (G-mount
 //!    step 5; the DAX matrix's KIND mount-route cell, `docs/wip/virtiofs.md` §8). The other path is the daemon,
@@ -358,6 +360,7 @@ fn prove(lane: &Lane) -> Result<(), Failure> {
   eprintln!(
     "kind export: a planted setuid-root binary ran as 0 without allowPrivilegeEscalation: false and as {NON_ROOT} with it"
   );
+  device_probe(lane)?;
   eprintln!(
     "kind export: kubelet mounted the volume over RPC-with-TLS; a second mount read the bytes the first wrote"
   );
@@ -465,6 +468,69 @@ fn setuid_probe(lane: &Lane) -> Result<(String, String), Failure> {
     &serde_json::json!({ "runAsUser": uid, "runAsGroup": uid, "allowPrivilegeEscalation": false }),
   )?;
   Ok((unguarded, guarded))
+}
+
+/// Format: the device node the device probe expects a pod to open: `/dev/null`'s number, character 1:3, which runc's
+/// default device cgroup allows every container (`AllowedDevices`, `libcontainer/specconv/spec_linux.go`).
+const ALLOWED_DEVICE: &str = "dev-null";
+/// Format: the device node the device probe expects a pod refused: `/dev/mem`'s number, character 1:1, which runc's
+/// default device cgroup does not allow.
+const REFUSED_DEVICE: &str = "dev-mem";
+
+/// A-294's pod guard, by use: device nodes are kept in a volume as metadata, and in a pod, whose bind of kubelet's
+/// `nodev` mount drops the flag (A-94), the container runtime's device cgroup is what keeps one from being opened. A
+/// root pod makes [`ALLOWED_DEVICE`] and [`REFUSED_DEVICE`] in the volume, readable and writable by everyone; an
+/// unprivileged pod (`allowPrivilegeEscalation: false`) opens each. The first must open, or the pod's mount is `nodev`
+/// and the probe proves nothing about the cgroup; the second must be refused "Operation not permitted" (`EPERM`, the
+/// device cgroup), where the mode would let any process open it.
+fn device_probe(lane: &Lane) -> Result<(), Failure> {
+  let uid: u64 = NON_ROOT.parse().unwrap_or(u64::MAX);
+  let made = lane.workload_as(
+    "slates-device-maker",
+    SETUID_IMAGE,
+    &format!(
+      "mknod /data/{ALLOWED_DEVICE} c 1 3 && mknod /data/{REFUSED_DEVICE} c 1 1 && \
+       chmod 666 /data/{ALLOWED_DEVICE} /data/{REFUSED_DEVICE} && ls -l /data/{ALLOWED_DEVICE} /data/{REFUSED_DEVICE}"
+    ),
+    &serde_json::json!({ "runAsUser": 0 }),
+  )?;
+  eprintln!(
+    "kind export: a root pod made two device nodes in the volume:\n{}",
+    made.trim()
+  );
+  let opened = lane.workload_as(
+    "slates-device-opener",
+    SETUID_IMAGE,
+    &format!(
+      "for node in {ALLOWED_DEVICE} {REFUSED_DEVICE}; do \
+         if said=$(cat /data/$node 2>&1 >/dev/null); then echo \"$node opened\"; else echo \"$node refused: $said\"; fi; \
+       done"
+    ),
+    &serde_json::json!({ "runAsUser": uid, "runAsGroup": uid, "allowPrivilegeEscalation": false }),
+  )?;
+  eprintln!(
+    "kind export: an unprivileged pod opened them:\n{}",
+    opened.trim()
+  );
+  if !opened.contains(&format!("{ALLOWED_DEVICE} opened")) {
+    return Err(Failure(format!(
+      "kind export: the device probe proves nothing about the device cgroup: /dev/null's number did not open, so the \
+       pod's mount refused it first: {}",
+      opened.trim()
+    )));
+  }
+  if !opened.contains(&format!("{REFUSED_DEVICE} refused"))
+    || !opened.contains("Operation not permitted")
+  {
+    return Err(Failure(format!(
+      "kind export: a device node made in the volume was not refused EPERM by the pod's device cgroup: {}",
+      opened.trim()
+    )));
+  }
+  eprintln!(
+    "kind export: a device node kept in the volume opened only where the pod's device cgroup allows its number (A-294)"
+  );
+  Ok(())
 }
 
 /// The PersistentVolume naming the export, and its claim (bound to it by name, no storage class).

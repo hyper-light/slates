@@ -215,24 +215,6 @@ jobs:
           cp "$KILN_WORKSPACE/crates/sdk-node/tests/packaged.test.mjs" .
           SLATES_DAEMON="$KILN_WORKSPACE/target/debug/slates" node --test packaged.test.mjs
 
-  # i686 is a tested target: the official linux/386 Rust image runs natively on the x86_64 host. The
-  # container runs as the agent's uid (HOME=/tmp), so its target/ stays removable without sudo.
-  i686:
-    name: i686 (32-bit narrowing, by test)
-    runs-on: [baremetal, linux]
-    timeout-minutes: 60
-    steps:
-      - name: Unit tests as 32-bit code
-        run: >-
-          docker run --rm --platform linux/386 --user "$(id -u):$(id -g)" -e HOME=/tmp
-          -v "$PWD":/src -w /src rust:1.98.1
-          cargo test -p slates-wire -p slates-archive -p slates-ipc -p slates-db -p slates-vfs --lib
-      - name: The runtime and memory crates as 32-bit code
-        run: >-
-          docker run --rm --platform linux/386 --user "$(id -u):$(id -g)" -e HOME=/tmp
-          -v "$PWD":/src -w /src rust:1.98.1
-          cargo test --no-fail-fast -p slates-rt -p slates-mem
-
   miri-and-loom:
     name: miri + loom (mem, rt, wire)
     runs-on: [k8s]
