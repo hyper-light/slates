@@ -261,7 +261,8 @@ impl History {
           self.owner.leave_replica(old.leave().unwrap());
           self.acks.clear();
         }
-        self.replica = Some(Replica::new(self.owner.replica(replica_limit(SHARDS)).unwrap(), BUDGET).unwrap());
+        self.replica =
+          Some(Replica::new(self.owner.replica(replica_limit(SHARDS)).unwrap(), BUDGET).unwrap());
       }
     }
     self.check_at_the_replicas_head();

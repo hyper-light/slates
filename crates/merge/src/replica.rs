@@ -45,10 +45,11 @@
 //!   [`Green::replica`] is refused ([`ReplicaRefusal::Full`]), and a replica makes none
 //!   ([`ReplicaRefusal::NotAnOwner`]).
 //! - **Its own memory.** A replica's metadata ([`Green::metadata_bytes`]: its piece lists, change index, IPC history,
-//!   deltas and accepted record, which grow with the versions it holds) is held to [`replica_budget`]: no more than its
-//!   owner's retention is held to, the per-green budget, since it folds where its owner folds, and no more than its
-//!   shard has room for. Refused at its making and at a rebuild ([`Unfit::OverBudget`]) and after any message that
-//!   takes it past ([`FeedRefusal::OverBudget`]). The key indexes, one entry a path, are the owner's own bound.
+//!   deltas and accepted record, which grow with the versions it holds) is held to [`replica_budget`]: no more than the
+//!   per-green budget its owner's retention is held to, the most of a shard's table share one green's history may
+//!   hold, and no more than its shard has room for. Refused at its making and at a rebuild ([`Unfit::OverBudget`]) and
+//!   after any message that takes it past ([`FeedRefusal::OverBudget`]). The key indexes, one entry a path, are the
+//!   owner's own bound.
 //! - **The owner's keeping for it.** The owner keeps a released block for its slowest replica, and the bytes it keeps
 //!   are charged to its own per-green budget. Past [`held_limit`], the room that budget leaves beyond the owner's own
 //!   retention ([`Green::set_replica_held_limit`]), the slowest replica is evicted and refuses its next message
@@ -118,10 +119,10 @@ pub fn replica_limit(shards: usize) -> usize {
     .saturating_mul(REGISTRATIONS_PER_REPLICA)
 }
 
-/// The bytes of metadata a replica may hold ([`Replica::new`]'s `budget`, step 4): no more than its owner's retention
-/// is held to (`green_budget`, the per-green budget its owner's history is folded to: the partition's
-/// `green_chain_bytes`, its shard's table share), since a replica folds where its owner folds and is never larger than
-/// its owner may be; and no more than its own shard has room for now (`shard_room`), which its holder charges it to.
+/// The bytes of metadata a replica may hold ([`Replica::new`]'s `budget`, step 4): no more than the per-green budget its
+/// owner's retention is held to (`green_budget`: the partition's `green_chain_bytes`, its shard's table share, the most
+/// of it one green's history may hold), and no more than its own shard has room for now (`shard_room`), which its
+/// holder charges it to.
 ///
 /// Derived: min(green_budget, shard_room).
 pub fn replica_budget(green_budget: usize, shard_room: usize) -> usize {
@@ -826,7 +827,10 @@ mod tests {
     let bytes = fresh.metadata_bytes();
     let made = Replica::new(fresh, replica_budget(BUDGET, bytes - 1));
     refused_over_budget(&mut owner, made.err(), bytes - 1);
-    let made = Replica::new(owner.replica(READERS).unwrap(), replica_budget(bytes, BUDGET));
+    let made = Replica::new(
+      owner.replica(READERS).unwrap(),
+      replica_budget(bytes, BUDGET),
+    );
     let mut replica = made.unwrap();
     let message = commit(&mut owner, create(2, 1, "b", b"two"));
     let refusal = feed(&mut owner, &mut replica, &message);
@@ -857,12 +861,27 @@ mod tests {
     let own = own_retention(&owner);
     owner.set_replica_held_limit(held_limit(own + 64, own));
     let second = commit(&mut owner, increment(2, 1, "a", &[2; 64], false));
-    assert_eq!(owner.replicas_evicted(), (0, 0), "at the limit, not past it");
+    assert_eq!(
+      owner.replicas_evicted(),
+      (0, 0),
+      "at the limit, not past it"
+    );
     let third = commit(&mut owner, increment(3, 2, "a", &[3; 64], false));
-    assert_eq!(owner.replicas_evicted(), (1, 0), "past it: the lagging replica evicted");
+    assert_eq!(
+      owner.replicas_evicted(),
+      (1, 0),
+      "past it: the lagging replica evicted"
+    );
     applied(feed(&mut owner, &mut replica, &second));
-    assert_eq!(feed(&mut owner, &mut replica, &third), Err(FeedRefusal::Evicted));
-    assert_eq!(replica.green().head(), 2, "a refused message changes nothing");
+    assert_eq!(
+      feed(&mut owner, &mut replica, &third),
+      Err(FeedRefusal::Evicted)
+    );
+    assert_eq!(
+      replica.green().head(),
+      2,
+      "a refused message changes nothing"
+    );
     rebuild(&mut owner, &mut replica);
     assert_eq!(owner.content_held_bytes(), 0, "nothing kept once it left");
     let fourth = commit(&mut owner, increment(4, 3, "a", &[4; 64], false));
@@ -884,7 +903,10 @@ mod tests {
     assert_eq!(owner.replicas_evicted(), (0, 0), "nothing kept yet");
     let second = commit(&mut owner, increment(2, 1, "a", &[2; 64], false));
     assert_eq!(owner.replicas_evicted(), (1, 0));
-    assert_eq!(feed(&mut owner, &mut replica, &second), Err(FeedRefusal::Evicted));
+    assert_eq!(
+      feed(&mut owner, &mut replica, &second),
+      Err(FeedRefusal::Evicted)
+    );
     owner.leave_replica(replica.leave().unwrap());
     assert_eq!(owner.content_held_bytes(), 0);
   }

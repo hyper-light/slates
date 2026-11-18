@@ -25018,8 +25018,8 @@ one on each other shard of its node and beside it the fresh one its rebuild make
 none with one shard (R8); past it `ReplicaRefusal::Full`, and a replica makes none (`ReplicaRefusal::NotAnOwner`). A
 replica's metadata (`Green::metadata_bytes`: piece lists, change index, IPC history, deltas, accepted record and its
 chunk table, running totals all): `replica_budget` = min(the per-green budget its owner's retention is folded to, the
-partition's `green_chain_bytes`, its shard's table share; the room its own shard has for it now), since a replica folds
-where its owner folds and is never larger than its owner may be; refused at its making and at a rebuild
+partition's `green_chain_bytes`, the most of its shard's table share one green's history may hold; the room its own
+shard has for it now); refused at its making and at a rebuild
 (`Unfit::OverBudget`, the fresh green's registration given back) and after a message that takes it past
 (`FeedRefusal::OverBudget`). The bytes an owner keeps for its replicas, which are charged to its own per-green budget:
 `held_limit` = that budget less the owner's own retention (`Green::retention_charge` less `Green::content_held_bytes`;
@@ -25033,11 +25033,13 @@ blocks, and its adoption queue one message's. Proven by the sealed blocks' tests
 slowest reader evicted past the held limit, reading what it holds until it leaves; a change left unfed evicting every
 reader; every writer ended once its readers left) and the replica's (each bound driven to its refusal at its derived
 value, the replica rebuilt or given back and made again; one shard takes no replica; an owner with no room beyond its
-own retention evicts at its first release; red with the eviction disabled, RED_CHECK_RESULT). Owed (step 5): the
-holder on the shards applies the derivations to the machine's figures and logs them with the boot profile's, charges a
-replica's metadata to its shard's budget, routes a refused or evicted replica's rebases and reads to the owner, counted,
-gives back an idle one (its idle period derived from the feed's cost per version against the rebases it served), and
-makes a green's replicas leave before it gives the owner up. The text and its measurements are perf's (2026-11-11, `agents/perf-a273`, never pushed); the
+own retention evicts at its first release; with the eviction past the held limit disabled at a release, both of the
+replica's held-limit tests and the sealed blocks' slowest-reader test fail, the unfed one passing: r316 on the Mac
+Studio, 2026-11-18). Owed (step 5): the holder on the shards applies the derivations to the machine's figures and logs
+them with the boot profile's, charges a replica's metadata to its shard's budget, routes a refused or evicted replica's
+rebases and reads to the owner, counted, gives back an idle one (its idle period derived from the feed's cost per
+version against the rebases it served), and makes a green's replicas leave before it gives the owner up. The text and
+its measurements are perf's (2026-11-11, `agents/perf-a273`, never pushed); the
 content question it left open was decided by the supervisor on 2026-11-17 by A-64 and D-7 (below). W1 (A-247), whose
 works off the owner it builds on, landed on 2026-11-17 (3c0af9399).
 
