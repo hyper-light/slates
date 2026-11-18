@@ -30,12 +30,10 @@ use slates_vfs::host::HostFs;
 use slates_vfs::ids::{InodeNo, RefOwner};
 use slates_vfs::inode::{Kind, SpecialNode};
 
-/// Format: the set-group-ID mode bit (`<sys/stat.h>` `S_ISGID`): on a directory, what is created in it takes
-/// the directory's group, and a directory created in it takes the bit too.
-const S_ISGID: u32 = 0o2000;
 use slates_vfs::journal::Op;
 use slates_vfs::volume::{Observed, Store, Volume};
 
+use crate::access::S_ISGID;
 use crate::posix_acl::{Acl, MODE_PERMISSION_BITS};
 use crate::{
   Bridge, CacheLifetime, CachedBytes, DirEntry, FsStat, Invalidation, InvalidationCursor, NodeAttr,
@@ -602,10 +600,12 @@ impl<'v> VolumeBridge<'v> {
 
   /// Stamps a freshly created inode `new` with the owner a mount must show: its uid is the mounting
   /// user — the request's Unix uid, or its enrolled account without a Unix credential — and its
-  /// gid is the request's own group when its credential
-  /// named one (an NFS `AUTH_SYS` gid, carried on [`OpContext::owner_gid`]), matching what a native
-  /// NFS server stamps; otherwise it inherits the parent directory `parent`'s group, the BSD/macOS
-  /// create rule (a new object takes the creating user and the parent's group). Without this the
+  /// group is what the request's rule gives it ([`OpContext::group_rule`], A-328): under System V's
+  /// rule (a Linux kernel's request, and a Linux host's NFS export) the request's own group when its
+  /// credential names one (an NFS `AUTH_SYS` gid or a FUSE header's, on [`OpContext::owner_gid`]),
+  /// unless the parent directory `parent` is set-group-ID, whose group it takes and whose bit a new
+  /// directory takes too (AUD-29-81); under BSD's (a macOS host's NFS export, as APFS gives it) the
+  /// parent's group always and no inherited bit. Without this the
   /// object keeps the volume core's born default (uid 0, gid 0), so a file an ordinary user made
   /// listed as `root wheel` regardless of who made it (§4.13 "each request runs as the mounting user";
   /// the root:wheel mount bug fixed in docs/bugs/2026-09-09-root-wheel-mount.md). A subject that is
@@ -625,16 +625,14 @@ impl<'v> VolumeBridge<'v> {
       Some(host) => self.volume.with_host(host).stat(self.store, parent),
       None => self.volume.stat(self.store, parent),
     }?;
-    // The POSIX creation rule (AUD-29-81): a set-group-ID parent gives its group to what is made in it, and
-    // a directory made there takes the bit too; otherwise the creator's group, where the request names one,
-    // else the parent's (the BSD rule, for a credential without a group).
-    let setgid_parent = parent_attrs.mode & S_ISGID != 0;
-    let gid = match (setgid_parent, cx.owner_gid) {
-      (false, Some(gid)) => gid,
-      _ => parent_attrs.gid,
-    };
-    self.volume.chown(self.store, new, uid, gid)?;
-    if setgid_parent && self.volume.kind(self.store, new)? == Kind::Dir {
+    // The route's rule (A-328): System V's, the creator's group unless a set-group-ID parent gives its own and its bit
+    // to a directory (AUD-29-81); or BSD's, the parent's group and no bit.
+    let directory = self.volume.kind(self.store, new)? == Kind::Dir;
+    let created =
+      cx.group_rule
+        .created(parent_attrs.mode, parent_attrs.gid, cx.owner_gid, directory);
+    self.volume.chown(self.store, new, uid, created.gid)?;
+    if created.set_group_id {
       let made = self.volume.stat(self.store, new)?;
       self.volume.chmod(self.store, new, made.mode | S_ISGID)?;
     }
