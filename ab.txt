@@ -2586,3 +2586,5 @@ slates daemon: the control shard's beat task ran 589 ms after its last turn (a n
 slates daemon: the control shard's beat task ran 581 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 2 steps and 1 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 1 unattributed), fired 2 timers, waited 1 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 109 ms and its timer overrun 481 ms
 slates daemon: the control shard's beat task ran 573 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 2 steps and 1 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 0 unattributed), fired 1 timers, waited 1 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 109 ms and its timer overrun 473 ms
 ## run 10 of 10 done, 2026-11-18T12:45:44Z
+To https://github.com/hyper-light/slates
+   6813fb3..f0b66d8  f0b66d8f14b2db689cddd2810f86411fc295e46d -> diag-results/g258-44279316423-regress-arm
