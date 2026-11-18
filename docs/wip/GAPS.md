@@ -3069,6 +3069,16 @@
 >     request at 0.47 to 1.33 ms, the Mac Studio, 50 ms think mean). **Owed, measurement (the supervisor's):** the
 >     rung under the set rule (`--tree <linux-v7.4-rc1>/fs`) at think means of 200, 100, 50 and 20 ms.
 >
+>     **The harness's workers park instead of spinning (2026-11-18, g083, A-421).** Each worker spun for its whole
+>     level, a core each taken from the daemon it measured; on the loaded Mac Studio its sweeps took 25 to 127 ms and
+>     held 6.9 clients on average against 2.2 in flight. A worker now sweeps on for the daemon's published spin window
+>     after its last reply or send, then arms every connection with a request in flight and parks on their completions
+>     until a reply or its next deadline, waking early by the spin window and its parks' measured lateness. The
+>     `harness` row counts the parks. Unit tests: a worker parked with its request in flight is woken by the reply, and
+>     with nothing in flight meets its deadline. **Owed, measurement (the supervisor's):** the A/B of main's spinning
+>     harness against the parking one at the same daemon (`held`, `max_sweep_ns`, every kind's `latency` and `floor`
+>     p99).
+>
 >     **Owed, measurement (the supervisor's):** the 1,000-client rung on main with W1 (A-247 step one, landed
 >     2026-11-17) against main before it (02c6469e5). Each think mean runs as its own invocation with a fresh daemon,
 >     interleaved across builds: every kind's p50, p99, p999 and max, the `offered` row and the `bound` row. A think
