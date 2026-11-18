@@ -1,0 +1,46 @@
+[package]
+name = "slates-api"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "The library an embedding host drives slates through (§4.12 \"Embedding\", A-278): attach to an instance, create, clone, snapshot and destroy volumes, serve them as a host mount or as a descriptor a VMM takes, read their drift, plan landings and land them under a grant the host's confirmation surface issues, and observe the daemon, every failure a typed refusal."
+
+[features]
+# Forwards blake3's pure-Rust backend (no C build script) so a downstream crate can cross-lint for a Windows target from
+# a host that has no MSVC assembler. Off by default; production uses the SIMD C path. See `crates/machine`'s
+# `pure-hash`.
+pure-hash = ["slates-client/pure-hash"]
+
+[dependencies]
+# The typed client of the ring protocol (§4.7): every verb this crate offers is one of its calls.
+slates-client = { workspace = true }
+# The wire's report and refusal types this crate's API speaks (`Refusal`, `StatusReport`, `Filter`, ...).
+slates-ipc = { workspace = true }
+# The issuer authority (§4.13 "Grants"): the anchor's segment, where the daemon publishes the issuer secret.
+slates-anchor = { workspace = true }
+slates-mem = { workspace = true }
+slates-machine = { workspace = true }
+# The proofs a grant, an enrollment, a revocation and a consensus recovery carry, and the anchor's liveness budget the
+# client's deadlines derive from.
+slates-server = { workspace = true }
+# The recovery budget the client's reconnect deadline derives from.
+slates-db = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+rustix = { workspace = true }
+# The macOS mount fetches the root handle over loopback and passes it to mount(2) (§4.6 A-34).
+slates-bridge-nfs = { workspace = true }
+
+[dev-dependencies]
+slates-server = { workspace = true }
+slates-machine = { workspace = true }
+slates-db = { workspace = true }
+# The Shards stream test speaks FUSE through the end the library hands a VMM (A-161), with the codec's ABI constants.
+slates-bridge-fuse = { workspace = true }
+
+[lints]
+workspace = true

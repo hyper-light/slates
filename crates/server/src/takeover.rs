@@ -1177,8 +1177,17 @@ fn record_adoption(
     },
   );
   state.departed_owners.remove(&object);
+  // The members other than this node that reported the adopted position: a green's successor fetches any input it
+  // lacks from them (`fleet::fetch_green_inputs`), since each accepted that version holding its inputs.
+  let mut reported_adopted = Vec::new();
   if let Some(take) = state.host_takeovers.get_mut(&departed) {
-    take.learned.remove(&object);
+    if let Some(reports) = take.learned.remove(&object) {
+      reported_adopted = reports
+        .into_iter()
+        .filter(|(host, accepted)| *host != local && accepted.sequence == record.sequence)
+        .map(|(host, _)| host)
+        .collect();
+    }
     take.adopted.insert(object);
   }
   if object.is_catalog() {
@@ -1206,9 +1215,13 @@ fn record_adoption(
   } else {
     match crate::merge_service::MergeRecordValue::decode_record(&record.value) {
       // A green: its newest merge record was adopted; the owned green is rebuilt from this node's accepted chain
-      // and held inputs on the shard its id routes to (AUD-14).
+      // and held inputs on the shard its id routes to (AUD-14), fetching an input it lacks from the members that
+      // reported the adopted version.
       Ok(merge) => {
-        state.pending_green_materializations.insert(object, merge);
+        state.pending_green_materializations.insert(
+          object,
+          crate::state::PendingGreen::adopted(merge, reported_adopted),
+        );
       }
       // A merge record of another format: adopted as bytes, never materialized from, and counted.
       Err(refused) => {
