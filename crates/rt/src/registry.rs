@@ -102,6 +102,14 @@ pub struct Entry {
   /// a sender that finds one full stops spinning and counts the wake stale instead of waiting for a
   /// consumer that is gone (the livelock the registry stress test found on 2026-09-14).
   pub exited: AtomicBool,
+  /// The shards a full control channel of this shard refused that asked to be told when it next has room
+  /// ([`crate::shard::ShardContext::want_room`]): marked by each of them, taken by this shard after each drain that
+  /// took a message and at its exit, and each told ([`give_room`]; the protocol: [`crate::room`]).
+  pub room_wanted: crate::room::ShardSet,
+  /// The shards whose control channels have drained since this shard asked them for room: marked by each of them
+  /// ([`give_room`]), taken by this shard where it drains its own control channel, which wakes its tasks waiting on
+  /// each ([`crate::room`]).
+  pub room_given: crate::room::ShardSet,
 }
 
 /// A shard's forward-progress pulse, readable from any thread with no shard round-trip (§4.14; the same
@@ -389,6 +397,8 @@ pub(crate) fn register_slot(
       parking: Parking::new(),
       pulse: Pulse::default(),
       exited: AtomicBool::new(false),
+      room_wanted: crate::room::ShardSet::new(),
+      room_given: crate::room::ShardSet::new(),
     });
     entry.kick = match kick {
       RegisterKick::Kick(kick) => kick,
@@ -769,7 +779,37 @@ fn read_counted<R>(slot: &Slot, f: impl FnOnce(&Entry) -> R) -> Option<R> {
 /// Marks `shard`'s entry exited (the shard's own thread, at its loop's exit): a sender that finds its
 /// ring full stops spinning, since nothing will drain it again.
 pub fn note_exited(shard: u16) {
-  let _ = with_entry(shard, |entry| entry.exited.store(true, Ordering::Release));
+  let _ = with_entry(shard, |entry| {
+    entry.exited.store(true, Ordering::Release);
+    // A shard that exits will never drain its channel again: every shard waiting for room in it is told now, and its
+    // next send is refused `ShardGone`. The fence orders the exit before the look at who asked; an asker fences between
+    // its mark and its look at `exited` (`ShardContext::want_room`), so one of the two sees the other ([`crate::room`]).
+    fence(Ordering::SeqCst);
+    entry
+      .room_wanted
+      .take_each(|origin| give_room(origin, shard));
+  });
+}
+
+/// Tells shard `origin` that shard `target`'s control channel has room, or that `target` left its loop: `target`'s mark
+/// in `origin`'s `room_given`, a `SeqCst` fence, then `origin`'s control flag published and `origin` kicked if it is
+/// parked, a control message's own publication, so `origin` finds the mark where it drains its channel
+/// ([`crate::room`]). A free slot is told nothing: the shard that asked is gone.
+///
+/// The fence is for a publication that lands while `origin` drains a whole batch: `origin` then re-arms its flag with a
+/// plain store, which ends this publication's release sequence, so the take that reads the re-arm does not synchronize
+/// with it. `origin` fences after every drain that took a message, the re-arm's too; this fence against that one means
+/// `origin`'s next look at `room_given` finds the mark. A message needs no such fence: the channel's own claim of a slot
+/// is a `SeqCst` operation. The argument is the standard's fence rules ([B: C++20 `[atomics.order]` p4]): loom passes
+/// `a_shard_told_of_room_while_it_rearms_its_flag_learns_it` with this fence and without it (75 and 81 interleavings,
+/// 2026-11-18), so the model records the path but does not reach the miss.
+pub(crate) fn give_room(origin: u16, target: u16) {
+  let _ = with_entry(origin, |entry| {
+    entry.room_given.insert(target);
+    fence(Ordering::SeqCst);
+    entry.control_pending.publish();
+    entry.parking.kick_if_parked(|| entry.kick.kick());
+  });
 }
 
 /// The entry of a live shard, unguarded: for the shard's **own** thread (its context keeps the

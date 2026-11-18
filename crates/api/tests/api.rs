@@ -323,6 +323,34 @@ fn an_overlay_lands_exactly_what_was_approved_and_nothing_else() {
   assert!(plan.conflicts.is_empty(), "{:?}", plan.conflicts);
   assert!(plan.summary.filtered_out >= 1, "{:?}", plan.summary);
   assert_eq!(plan.manifest_text().len(), 64);
+  // A-287: the plan's entry list is what its grant writes, path by path, `/.git` left out, each file as it reads.
+  let entries = instance.landing_entries(&plan).unwrap();
+  let listed: Vec<_> = entries
+    .iter()
+    .map(|entry| {
+      (
+        entry.path.as_str(),
+        entry.action.clone(),
+        entry.content.map(|content| content.size),
+      )
+    })
+    .collect();
+  assert_eq!(
+    listed,
+    vec![
+      ("/n.txt", slates_api::PlannedAction::Create, Some(2)),
+      ("/a.txt", slates_api::PlannedAction::Replace, Some(3)),
+    ]
+  );
+  for entry in &entries {
+    let bytes = read_file(&mut instance, volume, &entry.path);
+    assert_eq!(
+      entry.content.map(|content| content.hash),
+      Some(*blake3::hash(&bytes).as_bytes()),
+      "{} is listed as it reads",
+      entry.path
+    );
+  }
 
   let issuer = issuer_of(&daemon);
   let stale = [0u8; 32];
