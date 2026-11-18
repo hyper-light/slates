@@ -3534,20 +3534,25 @@ fn reached_slice(s: &mut ShardState, holder: HostId, after: Option<[u8; 16]>) ->
 }
 
 /// `holder`'s return to one live volume: no longer unreachable there. Whether the volume had given it up and is not
-/// fenced, so it is sent what it lacks now. A holder owed an install while the image is behind the log waits for one made
-/// at the log's head: the next publication makes it, or the record period for an idle writer ([`refresh_image`]). The
+/// fenced, so it is sent what it lacks now. A holder owed an install is sent the last whole state while the retained
+/// tail reaches past it (A-428): installed there, it takes the entries after it from the tail. Only a whole state the tail
+/// no longer reaches past would leave the holder owing a second install, so only then does it wait for an image made at
+/// the log's head: the next publication makes it, or the record period for an idle writer ([`refresh_image`]). The
 /// image a holder fell behind on was a median of 1,332 and 1,395 entries old when last built, while an install's own
 /// transit added 0 or 1, so it landed past the retained tail and took a second whole install (`live_chaos`'s rolling
-/// partition, diag-live-durability-54).
+/// partition, diag-live-durability-54). Until A-428 an image was owed for any whole state behind the log's head, and
+/// after an owner's warm restart nothing shipped again: its first whole entry, sealed before its pairs were delivered
+/// again, was behind the write appended after it; the image waited behind the whole record owed to cover the
+/// candidates' keys ([`refresh_image`] makes none while one is owed); and that record waited for credit only the
+/// holders' installs could free (A-344's warm-restart test, refused `DurabilityPending` at its 20 s bound).
 fn reached_volume(s: &mut ShardState, volume: [u8; 16], holder: HostId) -> bool {
   let Some(live) = s.live.shipping.get_mut(&volume) else {
     return false;
   };
-  let stale = live
-    .whole
-    .as_ref()
-    .is_some_and(|(head, _)| Some(*head) != live.shipper.head());
-  if stale && live.shipper.pending(holder) == Next::Install {
+  let behind_the_tail = live.whole.as_ref().is_some_and(|(head, _)| {
+    Some(*head) != live.shipper.head() && !live.shipper.retains_after(head.position)
+  });
+  if behind_the_tail && live.shipper.pending(holder) == Next::Install {
     live.owes_image = true;
   }
   let was = live.unreachable.contains(&holder);
@@ -6858,6 +6863,146 @@ mod tests {
     assert!(
       log_covers(&wanted, true, None, None),
       "a log shipped in the clear needs no key"
+    );
+  }
+
+  /// Shape: the whole state a resumed owner's scene ships first: a page, so the credit it sets (its own size,
+  /// `Bounds::of_whole`) admits the short writes after it.
+  const RESUMED_WHOLE_BYTES: usize = 4096;
+
+  /// A live-shipped volume named `name` made on `state`'s shard through the verbs (`Create`, then `LiveShip`).
+  fn live_volume_here(state: &mut ShardState, name: &str) -> Option<slates_db::catalog::VolumeId> {
+    let principal = slates_db::catalog::Principal::Uid {
+      host: HostId(0),
+      uid: 1234,
+    };
+    let created = crate::verbs::dispatch(
+      state,
+      1,
+      &principal,
+      slates_ipc::protocol::RequestBody::Create {
+        name: name.to_owned(),
+        size: slates_ipc::protocol::SizeClass::Dynamic { max: 1 << 20 },
+        names: slates_ipc::protocol::NamePolicy::Exact,
+        require_locked: false,
+        base: None,
+      },
+    );
+    let slates_ipc::protocol::ReplyBody::Created { id } = created else {
+      return None;
+    };
+    let shipped = crate::verbs::dispatch(
+      state,
+      1,
+      &principal,
+      slates_ipc::protocol::RequestBody::LiveShip {
+        volume: id,
+        live_shipped: true,
+      },
+    );
+    matches!(
+      shipped,
+      slates_ipc::protocol::ReplyBody::LiveShippingSet { live_shipped: true }
+    )
+    .then_some(slates_db::catalog::VolumeId { bytes: id.bytes })
+  }
+
+  /// A-344's warm restart as the owner's log stands when its holders come back (A-428): a live volume made here, its log a
+  /// shipper resumed past position 5 that ships to two holders at `f = 1` and has heard from neither, the catalog placed
+  /// at both, its first whole entry at 6 sealed under no candidate's key (its pairs not yet delivered again) and `writes`
+  /// entries after it. With `trimmed`, the retained tail is cut to its newest entry, as an owner writing past the retain
+  /// bound leaves it. Then both holders return ([`reached_volume`]). What the owner sends them now ([`pending_sends`]):
+  /// each install's holder and the position of the whole state it carries; `None` when the scene could not be made.
+  fn installs_after_a_resumed_owners_holders_return(
+    state: &mut ShardState,
+    name: &str,
+    writes: usize,
+    trimmed: bool,
+  ) -> Option<Vec<(HostId, Option<u64>)>> {
+    let id = live_volume_here(state, name)?;
+    let local = state.fleet.configuration().owner;
+    let holders = [
+      HostId(local.0.wrapping_add(1)),
+      HostId(local.0.wrapping_add(2)),
+    ];
+    let shipper = Shipper::resumed(
+      (local, ObjectId(id.bytes), HostEpoch(1)),
+      slates_db::register::Quorum { f: 1 },
+      &holders,
+      Some(5),
+      Bounds::default(),
+    )
+    .ok()?;
+    let mut live = new_live_volume(shipper);
+    live.catalogued = holders.to_vec();
+    state.live.shipping.insert(id.bytes, live);
+    let whole = vec![b'w'; RESUMED_WHOLE_BYTES];
+    if !append_payload(state, id, (true, false), whole, Some(Vec::new())) {
+      return None;
+    }
+    for write in 0..writes {
+      let delta = format!("write {write}").into_bytes();
+      if !append_payload(state, id, (false, false), delta, None) {
+        return None;
+      }
+    }
+    if trimmed {
+      let live = state.live.shipping.get_mut(&id.bytes)?;
+      live.shipper.set_bounds(Bounds {
+        credit: RESUMED_WHOLE_BYTES.saturating_mul(2),
+        retain: 0,
+      });
+    }
+    for holder in holders {
+      reached_volume(state, id.bytes, holder);
+    }
+    Some(
+      pending_sends(state, id.bytes)
+        .into_iter()
+        .filter(|send| send.stream == slates_cluster::live::LIVE_STATE_STREAM)
+        .map(|send| {
+          let at = Install::decode(&send.bytes, usize::MAX)
+            .ok()
+            .map(|install| install.head.position);
+          (send.holder, at)
+        })
+        .collect(),
+    )
+  }
+
+  /// A-428 (§4.10 live shipping; A-344's warm restart, the regression main bisected to A-376): do make a resumed owner's
+  /// log whose first whole entry, at 6, is followed by one write at 7 that both holders still lack, let both holders
+  /// return, and ask what the owner sends them; then the same past two writes with the retained tail cut to its newest
+  /// entry. Expect each holder sent an install of the whole state at 6 in the first case, since it takes 7 from the tail
+  /// after it; and no install in the second, where the whole state at 6 is behind the tail, so the holders wait for an
+  /// image made at the log's head, as before. Before, the first case sent nothing either: the holders waited for an image
+  /// that no period made while a whole record was owed to cover the candidates' keys, and that record waited for credit
+  /// only their installs could free; after an owner's warm restart every write was refused `DurabilityPending` at the
+  /// held-reply bound (main's and g230's runs of the fleet test: `owes whole true; holders [..@None, ..@None]; lanes [];
+  /// covers candidates false`).
+  #[test]
+  fn a_returned_holder_owed_an_install_is_sent_the_last_whole_state_while_the_tail_reaches_past_it()
+  {
+    let (reaches, behind) = crate::daemon::audit_on_shard(|state| {
+      (
+        installs_after_a_resumed_owners_holders_return(state, "resumed-reaches", 1, false),
+        installs_after_a_resumed_owners_holders_return(state, "resumed-behind", 2, true),
+      )
+    });
+    let reaches = reaches.expect("the first scene was made");
+    assert_eq!(
+      reaches.len(),
+      2,
+      "each returned holder is sent an install: {reaches:?}"
+    );
+    assert!(
+      reaches.iter().all(|(_, at)| *at == Some(6)),
+      "each install carries the whole state at 6, whose following write the tail still holds: {reaches:?}"
+    );
+    assert_eq!(
+      behind,
+      Some(Vec::new()),
+      "a whole state behind the tail is not sent: the holders wait for an image at the log's head"
     );
   }
 

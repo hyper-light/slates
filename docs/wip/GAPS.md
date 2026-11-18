@@ -343,6 +343,19 @@
 > - **Owed:** a restarted owner ships its log again only at its next publication; until a write its holders keep the
 >   old chain, which holds every write acknowledged before the restart, but a publication imaged and never appended is
 >   on the owner alone until then.
+> - **Fixed 2026-11-18 (g232, A-428): after the warm restart nothing shipped once the holders came back.** Main bisected
+>   the fleet test's red to A-376, whose cheaper holder publications changed the order of the restart's steps; the
+>   cause is the live log's. The resumed log's first whole entry (6) covered no candidate's key, a write followed (7),
+>   and the returning holders, owed installs, waited for an image at the head; none is made while a whole record is
+>   owed for the keys, and that record waited for credit only their installs could free (`owes whole true; holders
+>   [..@None, ..@None]; lanes []; covers candidates false` for the whole 20 s bound). Now the last whole state is
+>   installed while the retained tail reaches past it. Red-checked by
+>   `a_returned_holder_owed_an_install_is_sent_the_last_whole_state_while_the_tail_reaches_past_it`; the fleet test
+>   is main's to run. Still open, beside it: with the tail cut past the last whole state (an owner writing past the
+>   retain bound), a whole record owed for the keys or for a refused publication and a full credit could still meet
+>   the same wait: the image waits for the record (`refresh_image`), the record for credit. Owed: an owed whole record
+>   admitted when every holder it waits on is owed an install, or an image made at the head when the record is owed
+>   only for the keys (the volume's state is then the head's).
 
 > **A live-shipped volume taken over was lost by a restart before its first write: published at its takeover
 > (2026-11-18, A-343, §4.8 "persistence before reply"; g230, A-325's live item).** A-325 published a volume taken over
