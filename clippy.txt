@@ -1,0 +1,2 @@
+# fmt at c28ddbad619674c22ae0e86bfc14b32b40270458 on windows-11-arm
+## fmt, exit 0
