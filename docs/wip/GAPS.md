@@ -3815,7 +3815,24 @@
 >   `a_fetch_whose_owner_went_away_is_refused_by_its_departure`). The fleet tests' `CREDIT_WAIT` since A-454 (2026-11-18,
 >   g251): their client's connect is one claim, which waits while its daemon lives, so a refusal fails the test at once,
 >   and a full request ring is waited out while its shard steps, `FROZEN_CAP` the one wall bound, where both waited five
->   seconds on the wall. Owed in C-a: the same constant in `ack_release.rs`, `attach_forms.rs` and `shards.rs`, the
+>   seconds on the wall. The client's reply wait since A-456 (2026-11-18, g251b; C-b's first part): a synchronous
+>   call's wait re-armed at the reply deadline (`Deadlines::reply_ns`, the liveness budget, a second) and asked the
+>   daemon's liveness there, so a call whose daemon died learned it up to that second later; it now ends at the reply or
+>   the daemon's departure, waited on together where the platform can (Linux: the completion eventfd beside the
+>   control socket, whose peer end closes with the daemon's process; Windows: the reply's Event and the daemon's
+>   process handle in one wait), and on macOS, whose reply wake (the wake word) no wait takes beside a descriptor or a
+>   process, looked at on A-443's doubling from twice the longer of the first park and the wake estimate
+>   (`a_reply_after_the_old_reply_deadline_is_taken_while_its_daemon_lives`,
+>   `a_daemons_departure_ends_the_wait_before_the_old_reply_deadline`). Owed in C-b: the reply deadline's other users,
+>   each a wait that cannot see the departure yet: the async driver's tick (the SDK loops poll only the completion
+>   descriptor; Linux's control socket, macOS's exit-watch kqueue and, on Windows, the bridge thread waiting beside the
+>   process handle could each tell the loop), the wait for a slot on a full ring (a slot that frees wakes nothing), a
+>   delivery's read (Linux: the socket's readability), the macOS route's claim steps and the CLI's MCP edge, which
+>   borrows the reply deadline for its own; then the reconnect budget (part 2) and macOS's `MOUNT_CALL_DEADLINE` (part
+>   3). macOS sees a departure within the time waited, not at once: a thread per client waiting on the exit watch could
+>   wake the park at the exit, and was not built. Found on the way: `slates-rt`'s attribution reads the same
+>   `getrusage` as the client's Linux park through its own unsafe block; folding it into `slates_machine::switches`
+>   leaves one. Owed in C-a: the same constant in `ack_release.rs`, `attach_forms.rs` and `shards.rs`, the
 >   same two waits; Windows' run of the cross-process rendezvous file is filed for main. Class B (the
 >   transport's round-trip estimate) is open, but for the owner-location round (2026-11-18, A-437, goal g255: one
 >   liveness window, hard, for its asks and its lent sessions; now the record plane's round budget over the slowest
@@ -18753,8 +18770,12 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   verify; a mode Windows cannot hold (an execute bit) makes an entry whose set changes nothing there, and the next
   landing finds the file as the disk keeps it; a check and a set are two calls on one handle, so an outsider's change to
   the same field between them is not seen; a `touch` alone and a base directory's mode change alone still land nothing;
-  a captured clone's replacement overwrites an outsider's mode change where an overlay's refuses it (T-1.14); and the
-  manifest's encoding, which grants bind, has no golden vector); and
+  a captured clone's replacement overwrote an outsider's mode change where an overlay's refuses it (T-1.14), **fixed by
+  A-466 the same day** (`docs/bugs/2026-11-18-a-captured-clones-replacement-overwrote-an-outsiders-mode.md`: its
+  metadata judged field by field beside its bytes, the outsider's mode kept under the agent's bytes, a mode both changed
+  differently a conflict, and an agent's mode set alone over bytes the disk already held; its unit tests ran on the
+  Mac Studio, the oracle reruns filed for main); and the manifest's encoding, which grants bind, has no golden vector);
+  and
   the seam's numbering: refusals the engine tells apart are POSIX numbers and the rest Win32 codes, so a Win32 code equal
   to one of the engine's numbers (`ERROR_NOT_SAME_DEVICE` 17, `ERROR_INSUFFICIENT_BUFFER` 122, among five) would read as
   that refusal; none of the writer's calls is known to answer one, and a typed refusal at the seam would close it.

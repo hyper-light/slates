@@ -57,7 +57,8 @@ use crate::manifest::{
 };
 pub use crate::source::Source;
 use crate::verdict::{
-  ConflictClass, DiskState, MetaVerdict, Verdict, content_verdict, meta_verdict, verdict,
+  ConflictClass, DiskState, MetaVerdict, Verdict, content_verdict, landed_meta, meta_verdict,
+  verdict,
 };
 
 /// Format: the prefix of every hidden sibling a landing creates inside the granted target; the
@@ -587,6 +588,21 @@ struct Landing<'a, H: LandFs> {
   /// overlay's is to its witness ([`Landing::witness_of`]), so an outsider's change between the validation and the
   /// write is a conflict, never overwritten or removed.
   observed: BTreeMap<Box<str>, Fingerprint>,
+  /// Each replacement judged by content whose validation decided its metadata (A-466), by path: what the file lands
+  /// with, each field by A-458's rule, and whether its bytes are written or only that metadata set.
+  replaced: BTreeMap<Box<str>, ReplacedMeta>,
+}
+
+/// A captured clone's replacement as its validation judged its metadata (A-466): the mode and Windows bits the file lands
+/// with (`crate::verdict::landed_meta`: the volume's where it changed a field and the disk still held the capture's, the
+/// disk's otherwise), and whether its bytes are written. They are not where the disk already held the clone's bytes:
+/// then only the metadata the file lacks is set, through its own handle ([`Landing::chmod`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReplacedMeta {
+  /// What the file lands with.
+  lands: FileMeta,
+  /// Whether its bytes are written (staged and placed) or the disk's kept.
+  bytes: bool,
 }
 
 /// What the writer needs besides the host: the volume, the grant, the observer, the audit log.
@@ -1043,6 +1059,46 @@ impl<H: LandFs> Landing<'_, H> {
     }
   }
 
+  /// A captured clone's replacement, its bytes judged (`content`), with its metadata judged beside them field by field
+  /// (A-466, [`landed_meta`]): a field the clone changed that the disk holds a third way is a conflict
+  /// (`ModifyModify`); bytes to write are staged with the metadata decided; bytes the disk already holds are kept,
+  /// and where the file lacks a field the clone set, that field alone is set (the entry applies, without its bytes).
+  /// Anything else keeps its verdict.
+  fn judge_replaced_meta(
+    &mut self,
+    entry: &LandingEntry,
+    content: Verdict,
+    disk: DiskState,
+  ) -> Verdict {
+    let (Action::Replace, Some(witness), Some(overlay), DiskState::File { fingerprint, .. }) = (
+      &entry.action,
+      entry.witnessed.as_ref(),
+      entry.overlay.as_ref(),
+      disk,
+    ) else {
+      return content;
+    };
+    if !matches!(content, Verdict::Apply | Verdict::AcceptIdentical) {
+      return content;
+    }
+    let found = FileMeta::of_fingerprint(&fingerprint);
+    let Some(lands) = landed_meta(
+      FileMeta::of_fingerprint(&witness.fingerprint),
+      found,
+      FileMeta::of_volume(overlay.mode, entry.windows),
+    ) else {
+      return Verdict::Conflict(ConflictClass::ModifyModify);
+    };
+    let bytes = content == Verdict::Apply;
+    if !bytes && lands == found {
+      return Verdict::AcceptIdentical;
+    }
+    self
+      .replaced
+      .insert(entry.path.clone(), ReplacedMeta { lands, bytes });
+    Verdict::Apply
+  }
+
   /// An entry judged by content (A-291): its verdict, and, where it is written over or removes what the capture held,
   /// the object found there now, which binds the write ([`Landing::observed`]).
   fn judge_by_content(
@@ -1057,6 +1113,8 @@ impl<H: LandFs> Landing<'_, H> {
       entry.overlay.as_ref(),
     );
     self.observed.remove(&entry.path);
+    self.replaced.remove(&entry.path);
+    let v = self.judge_replaced_meta(entry, v, disk);
     if v == Verdict::Apply && matches!(entry.action, Action::Replace | Action::Delete) {
       let found = match (&entry.action, disk) {
         (Action::Replace, DiskState::File { fingerprint, .. }) => Some(fingerprint),
@@ -1192,7 +1250,9 @@ impl<H: LandFs> Landing<'_, H> {
         Some(skipped) => skipped,
         None => {
           cx.observer.before_write(self.host, entry);
-          if matches!(entry.action, Action::Create | Action::Replace) {
+          if matches!(entry.action, Action::Create | Action::Replace)
+            && !self.sets_meta_alone(entry)
+          {
             return self.begin_file(entry, index, cx, progress);
           }
           return EntryStep::Done(self.write_entry(entry));
@@ -1324,6 +1384,7 @@ impl<H: LandFs> Landing<'_, H> {
     }
     let size = entry.overlay.map_or(0, |overlay| overlay.size);
     stages_a_file(entry, report)
+      && !self.sets_meta_alone(entry)
       && progress
         .staged_pages
         .saturating_add(file_pages(size, store))
@@ -1600,6 +1661,11 @@ impl<H: LandFs> Landing<'_, H> {
           Err(e) => return Err(e.into()),
         }
       }
+      // A captured clone's replacement whose bytes the disk already holds: its metadata alone set (A-466).
+      Action::Replace if self.sets_meta_alone(entry) => {
+        let (from, to) = replaced_meta(entry)?;
+        self.chmod(dir_path, name, from, to)?
+      }
       // A file is staged for its batch's barrier by `write_one` (A-130), never written here.
       Action::Create | Action::Replace => return Err(WriteFailure::Volume(VfsError::Invalid)),
       Action::Delete => {
@@ -1770,10 +1836,19 @@ impl<H: LandFs> Landing<'_, H> {
     progress: &mut WriteProgress,
   ) -> Result<(), WriteFailure> {
     let (dir_path, _) = split(&entry.path);
+    // An overlay's file lands with the volume's mode and bits, its verdict having found the disk at its witness; a
+    // captured clone's replacement with what its validation decided field by field (A-466).
+    let (mode, windows) = match self.replaced.get(&entry.path) {
+      Some(replaced) => (
+        (copy.overlay.mode & !FileMeta::PERMISSIONS) | replaced.lands.permissions,
+        replaced.lands.windows,
+      ),
+      None => (copy.overlay.mode, entry.windows.bits()),
+    };
     let filled = self
       .host
-      .set_mode(copy.temp, copy.overlay.mode)
-      .and_then(|()| self.host.set_windows(copy.temp, entry.windows.bits()))
+      .set_mode(copy.temp, mode)
+      .and_then(|()| self.host.set_windows(copy.temp, windows))
       .and_then(|()| self.host.set_mtime(copy.temp, copy.overlay.mtime_ns))
       .and_then(|()| self.host.write_out(copy.temp));
     if let Err(e) = filled {
@@ -2195,6 +2270,15 @@ impl<H: LandFs> Landing<'_, H> {
     let set = self.chmod_open(file, &join(dir_path, name), from, to);
     self.host.close_file(file);
     set
+  }
+
+  /// Whether `entry` is a captured clone's replacement whose bytes the disk already holds, so its validation decided to
+  /// set its metadata alone (A-466).
+  fn sets_meta_alone(&self, entry: &LandingEntry) -> bool {
+    self
+      .replaced
+      .get(&entry.path)
+      .is_some_and(|replaced| !replaced.bytes)
   }
 
   /// [`Landing::chmod`] through its open file.
@@ -2959,6 +3043,18 @@ fn grant_ended(grant: Option<&GrantRecord>, now_ns: u64) -> bool {
   grant.is_some_and(|g| g.expires_ns <= now_ns)
 }
 
+/// A replacement's metadata as a metadata entry's (A-466): what the capture held (its content witness's) and what the
+/// volume holds. A replacement with no witness or no overlay is no captured clone's, and refused as a malformed entry.
+fn replaced_meta(entry: &LandingEntry) -> Result<(FileMeta, FileMeta), WriteFailure> {
+  match (entry.witnessed.as_ref(), entry.overlay.as_ref()) {
+    (Some(witness), Some(overlay)) => Ok((
+      FileMeta::of_fingerprint(&witness.fingerprint),
+      FileMeta::of_volume(overlay.mode, entry.windows),
+    )),
+    _ => Err(WriteFailure::Volume(VfsError::Invalid)),
+  }
+}
+
 /// Whether an entry's write is a file staged for a batch's barrier (A-130): a create or a replacement it applies.
 fn stages_a_file(entry: &LandingEntry, report: &EntryReport) -> bool {
   matches!(report.verdict, Some(Verdict::Apply))
@@ -3463,6 +3559,7 @@ struct Saved {
   placed: BTreeMap<Box<str>, Fingerprint>,
   restored: BTreeMap<Box<str>, Fingerprint>,
   observed: BTreeMap<Box<str>, Fingerprint>,
+  replaced: BTreeMap<Box<str>, ReplacedMeta>,
 }
 
 impl Saved {
@@ -3488,6 +3585,7 @@ impl Saved {
       placed: BTreeMap::new(),
       restored: BTreeMap::new(),
       observed: BTreeMap::new(),
+      replaced: BTreeMap::new(),
     }
   }
 }
@@ -3517,6 +3615,7 @@ impl<'a, H: LandFs> Landing<'a, H> {
       placed: saved.placed,
       restored: saved.restored,
       observed: saved.observed,
+      replaced: saved.replaced,
     }
   }
 
@@ -3542,6 +3641,7 @@ impl<'a, H: LandFs> Landing<'a, H> {
       placed: self.placed,
       restored: self.restored,
       observed: self.observed,
+      replaced: self.replaced,
     }
   }
 }

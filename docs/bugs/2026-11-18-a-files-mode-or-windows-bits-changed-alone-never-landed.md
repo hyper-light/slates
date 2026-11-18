@@ -71,6 +71,7 @@ fault the rest of the landing.
   `chmod` of a file in a directory the landing did not otherwise change may wait for the next journal commit. A file-level `fsync` (not
   `fdatasync`, which skips a mode) off the shard is owed (GAPS).
 - A file's `touch` alone (its mtime) still lands nothing; a captured clone's replacement overwrites an outsider's mode
-  change without a conflict, where an overlay's refuses it (T-1.14); a base directory's mode change alone is in no
-  diverged set and never lands.
+  change without a conflict, where an overlay's refuses it (T-1.14; fixed by A-466 the same day,
+  `2026-11-18-a-captured-clones-replacement-overwrote-an-outsiders-mode.md`); a base directory's mode change alone is in
+  no diverged set and never lands.
 - The manifest's canonical encoding has no golden vector, though grants bind its hash.
