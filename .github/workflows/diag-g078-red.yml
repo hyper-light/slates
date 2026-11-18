@@ -1,0 +1,57 @@
+# Diagnostics only (never main): A-370's red checks (goal g078). Each guard is removed in the runner's throwaway
+# checkout and the tests that hold it must fail: the switch dropped from the launcher's arguments (the plumbing tests),
+# the step-out removed and the exec-time drop removed (the CLI flow in the loaded regime).
+name: diag-g078-red
+on:
+  push:
+    branches: ['diag-g078-red*']
+jobs:
+  red:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Red 1, the switch dropped from the launcher's arguments
+        shell: bash
+        run: |
+          f=crates/client/src/exec.rs
+          sed -i 's/^      arguments.push(APPARMOR_PROFILE_SWITCH.to_owned());/      \/\/ red check: the switch dropped/' $f
+          grep -n 'red check' $f
+          if cargo test -p slates-client --lib exec:: > a.log 2>&1; then cat a.log; echo "NOT RED: client"; exit 1; fi
+          grep -E 'panicked|test result' a.log | head -4
+          if cargo test -p slates-cli --bin slates -- exec_takes > b.log 2>&1; then cat b.log; echo "NOT RED: cli"; exit 1; fi
+          grep -E 'panicked|test result' b.log | head -4
+          git show HEAD:$f > $f
+      - name: Red 2, the step-out removed (flag off under a loaded profile must be refused)
+        shell: bash
+        run: |
+          f=crates/api/src/exec.rs
+          sed -i 's/let left_own_profile = own_profile \&\& spec.apparmor == AppArmor::Off;/let left_own_profile = false;/' $f
+          grep -n 'let left_own_profile = false;' $f
+          cargo test -p slates-cli --test cli --no-run > /dev/null 2>&1
+          exe=$(readlink -f target/debug/slates); "$exe" apparmor profile > p.txt; sudo apparmor_parser -r p.txt
+          if SLATES_TEST_APPARMOR_PROFILE=loaded cargo test -p slates-cli --test cli -- --exact \
+            the_launcher_uses_slates_apparmor_profile_only_when_asked > c.log 2>&1; then
+            cat c.log; sudo apparmor_parser -R p.txt; echo "NOT RED: step-out"; exit 1
+          fi
+          sudo apparmor_parser -R p.txt
+          grep -A4 'panicked' c.log | head -6
+          git show HEAD:$f > $f
+      - name: Red 3, the exec-time drop removed (the command must not hold the grant)
+        shell: bash
+        run: |
+          f=crates/api/src/exec.rs
+          sed -i 's/if own_profile \&\& spec.apparmor == AppArmor::Profile {/if false {/' $f
+          grep -n 'if false {' $f
+          cargo test -p slates-cli --test cli --no-run > /dev/null 2>&1
+          exe=$(readlink -f target/debug/slates); "$exe" apparmor profile > p.txt; sudo apparmor_parser -r p.txt
+          if SLATES_TEST_APPARMOR_PROFILE=loaded cargo test -p slates-cli --test cli -- --exact \
+            the_launcher_uses_slates_apparmor_profile_only_when_asked > d.log 2>&1; then
+            cat d.log; sudo apparmor_parser -R p.txt; echo "NOT RED: exec-time drop"; exit 1
+          fi
+          sudo apparmor_parser -R p.txt
+          grep -A6 'panicked' d.log | head -8
+          git show HEAD:$f > $f
