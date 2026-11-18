@@ -1977,9 +1977,16 @@ mod diag_spin {
   /// Whether the dump has run once.
   static DUMPED: AtomicU64 = AtomicU64::new(0);
 
+  #[cfg(unix)]
   fn write_stderr(text: &str) {
     // SAFETY: fd 2 and a live buffer of its length.
     let _ = unsafe { libc::write(2, text.as_ptr().cast(), text.len()) };
+  }
+
+  #[cfg(not(unix))]
+  fn write_stderr(text: &str) {
+    use std::io::Write;
+    let _ = std::io::stderr().write_all(text.as_bytes());
   }
 
   #[cfg(target_os = "linux")]

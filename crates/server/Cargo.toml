@@ -45,6 +45,8 @@ slates-bridge-fuse = { workspace = true }
 slates-bridge-nfs = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
+# DIAG (diag-g251-spin, never main): the watchdog's stuck-shard backtrace (a signal and a raw write).
+libc = { workspace = true }
 rustix = { workspace = true }
 # The virtio-fs guest device (§4.6 A-9): its loop rides the runtime's Unix descriptor readiness, and a
 # Linux guest is hosted from a Linux or macOS host, so the daemon's guest transport (`crate::virtiofs`)
