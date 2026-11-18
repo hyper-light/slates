@@ -45,7 +45,9 @@ use std::os::windows::io::{
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::task::Waker;
 
-use slates_bridge_core::{Bridge, NodeAttr, ObjectId, OpContext, RenameFlags, SetAttr};
+use slates_bridge_core::{
+  Bridge, CachedBytes, NodeAttr, ObjectId, OpContext, RenameFlags, SetAttr,
+};
 use slates_vfs::error::VfsError;
 use slates_vfs::inode::Kind;
 
@@ -457,7 +459,7 @@ impl Request {
         barrier: false,
         echo: false,
         restored_read: false,
-        shared: false,
+        sibling: None,
         flush: false,
       };
     }
@@ -469,7 +471,7 @@ impl Request {
         barrier: false,
         echo: false,
         restored_read: false,
-        shared: false,
+        sibling: None,
         flush: false,
       };
     }
@@ -499,14 +501,14 @@ impl Request {
     // retires nothing, so a replayed Cleanup's stale context stays a refusal.
     let ends_open = closed.is_some();
     let refused = admission_refusal(&self.op, names, ledger);
+    let through =
+      context_of(&self.op).and_then(|context| names.name_of(context).map(str::to_owned));
     let bound = bind(self.op, ledger);
     let barrier = bound.as_ref().is_ok_and(|op| {
       op.needs_barrier() && !matches!(op, Op::Cleanup { object, .. } if object.purge)
     });
     let echo = matches!(&bound, Ok(Op::Write { object, .. }) if object.purge);
-    let change = bound
-      .as_ref()
-      .map_or(Change::None, |op| change_of(op, bridge, cx));
+    let change = bound.as_ref().ok().and_then(|op| change_of(op, bridge, cx));
     let flush = matches!(&bound, Ok(Op::Flush { .. } | Op::FlushVolume));
     let restored_read =
       matches!(&bound, Ok(Op::Read { object, .. }) if object.fh == RESTORED_HANDLE);
@@ -528,7 +530,7 @@ impl Request {
     };
     reply = record_open_reply(reply, opened, self.hint, bridge, cx, names, ledger);
     reply = finish_context_effects(reply, closed, names, ledger);
-    let shared = change.left_other_names(&reply);
+    let sibling = change.and_then(|change| change.sibling(&reply, through));
     Served {
       reply,
       sender: self.reply,
@@ -536,61 +538,127 @@ impl Request {
       echo,
       restored_read,
       flush,
-      shared,
+      sibling,
     }
   }
+}
+
+/// A change through one name of a file that has, or had, another (A-360): what the file's other names Windows holds
+/// open must be told of. Each other name has a file node and caches of its own in WinFsp's driver, which only a
+/// notification reaches; the name the change came through saw it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Sibling {
+  /// The file.
+  pub ino: u64,
+  /// The name the change came through, as Windows' file node is named.
+  pub through: String,
+  /// The bytes it changed, `CachedBytes::Kept` for its information alone (times, a link count).
+  pub bytes: CachedBytes,
 }
 
 /// What a request does to a file that may have other names (A-360), decided before it runs.
 #[derive(Clone, Copy)]
-enum Change {
-  /// No change to a file's bytes, size, times or names.
-  None,
-  /// A change whose reply carries the file's information, its link count with it.
+struct Change {
+  ino: u64,
+  bytes: CachedBytes,
+  count: Count,
+}
+
+/// How a [`Change`] learns whether the file has another name.
+#[derive(Clone, Copy)]
+enum Count {
+  /// From its reply, which carries the file's information and its link count with it.
   Reported,
   /// A link: the file has another name once it succeeds.
   Link,
-  /// A delete of one name of a file that had this many.
+  /// The delete of one name of a file that had this many.
   Delete { names: u32 },
 }
 
 impl Change {
-  /// Whether the served request changed a file that has, or had, another name: each other name Windows holds open has
-  /// its own file node and caches, which only a notification reaches (A-360).
-  fn left_other_names(self, reply: &Reply) -> bool {
-    match (self, reply) {
-      (_, Reply::Err(_)) | (Change::None, _) => false,
-      (Change::Reported, Reply::Wrote { info, .. } | Reply::Object { info, .. }) => {
+  /// The [`Sibling`] the served request leaves owed, if it succeeded and the file has, or had, another name. With the
+  /// name it came through unknown, every name is told.
+  fn sibling(self, reply: &Reply, through: Option<String>) -> Option<Sibling> {
+    let shared = match (self.count, reply) {
+      (_, Reply::Err(_)) => false,
+      (Count::Reported, Reply::Wrote { info, .. } | Reply::Object { info, .. }) => {
         info.hard_links > 1
       }
-      (Change::Reported, _) => false,
-      (Change::Link, _) => true,
-      (Change::Delete { names }, _) => names > 1,
-    }
+      (Count::Reported, _) => false,
+      (Count::Link, _) => true,
+      (Count::Delete { names }, _) => names > 1,
+    };
+    shared.then(|| Sibling {
+      ino: self.ino,
+      through: through.unwrap_or_default(),
+      bytes: self.bytes,
+    })
   }
 }
 
-/// The [`Change`] `op` makes. A delete reads the file's link count first, since its reply carries none; a write's,
-/// a size's, an overwrite's, an allocation's and a time's reply carries the count. A purge's own echo is no change.
-fn change_of(op: &Op<Open>, bridge: &mut dyn Bridge, cx: &OpContext) -> Change {
+/// The open context a request names, when it acts through one.
+fn context_of(op: &Op<u64>) -> Option<u64> {
   match op {
-    Op::Write { object, .. } if object.purge => Change::None,
-    Op::Write { .. }
-    | Op::SetSize { .. }
-    | Op::Truncate { .. }
-    | Op::SetAllocation { .. }
-    | Op::SetTimes { .. } => Change::Reported,
-    Op::Link { .. } => Change::Link,
+    Op::Write { object, .. }
+    | Op::SetSize { object, .. }
+    | Op::Truncate { object, .. }
+    | Op::SetAllocation { object, .. }
+    | Op::SetTimes { object, .. }
+    | Op::Link { object, .. }
+    | Op::Cleanup { object, .. } => Some(*object),
+    _ => None,
+  }
+}
+
+/// The [`Change`] `op` makes: a write's bytes (from where it lands, when it appends), a size's or an overwrite's whole
+/// file, a time's or a link's information alone; their replies carry the link count. A delete reads the file's link
+/// count first, since its reply carries none. A purge's own echo is no change.
+fn change_of(op: &Op<Open>, bridge: &mut dyn Bridge, cx: &OpContext) -> Option<Change> {
+  let (object, bytes, count) = match op {
+    Op::Write { object, .. } if object.purge => return None,
+    Op::Write {
+      object,
+      offset,
+      data,
+      append,
+      ..
+    } => {
+      let bytes = if *append {
+        CachedBytes::From { at: *offset }
+      } else {
+        CachedBytes::Range {
+          at: *offset,
+          len: u64::try_from(data.len()).unwrap_or(u64::MAX),
+        }
+      };
+      (object, bytes, Count::Reported)
+    }
+    Op::SetSize { object, .. } | Op::Truncate { object, .. } | Op::SetAllocation { object, .. } => {
+      (object, CachedBytes::ALL, Count::Reported)
+    }
+    Op::SetTimes { object, .. } => (object, CachedBytes::Kept, Count::Reported),
+    Op::Link { object, .. } => (object, CachedBytes::Kept, Count::Link),
     Op::Cleanup {
       object,
       delete: Some(_),
-    } if !object.purge => bridge
-      .getattr(object.object, cx)
-      .ok()
-      .filter(|attr| attr.kind != Kind::Dir)
-      .map_or(Change::None, |attr| Change::Delete { names: attr.nlink }),
-    _ => Change::None,
-  }
+    } if !object.purge => {
+      let attr = bridge.getattr(object.object, cx).ok()?;
+      if attr.kind == Kind::Dir {
+        return None;
+      }
+      (
+        object,
+        CachedBytes::Kept,
+        Count::Delete { names: attr.nlink },
+      )
+    }
+    _ => return None,
+  };
+  Some(Change {
+    ino: object.object.inode,
+    bytes,
+    count,
+  })
 }
 
 fn confirm_reply(ledger: &mut Ledger<SparseObject>, context: u64) -> Reply {
@@ -834,8 +902,8 @@ pub struct Served {
   barrier: bool,
   echo: bool,
   restored_read: bool,
-  /// The request changed a file that has, or had, another name (A-360): see [`Served::changed_a_file_with_other_names`].
-  shared: bool,
+  /// The request changed a file that has, or had, another name (A-360): see [`Served::sibling_change`].
+  sibling: Option<Sibling>,
   /// The request was a flush (of a handle, or of the volume): its success tells the caller its data is durable.
   flush: bool,
 }
@@ -853,12 +921,11 @@ impl Served {
     self.echo
   }
 
-  /// Whether the request changed a file that has, or had, another name (A-360). The mount's own requests are its
+  /// The change this request made to a file that has, or had, another name (A-360). The mount's own requests are its
   /// kernel's doing for the name they came through, so their journal records are passed over; but each other name
-  /// Windows holds open has a file node and caches of its own, so these records stay owed, and the mount's next round
-  /// tells every name the file is open under.
-  pub fn changed_a_file_with_other_names(&self) -> bool {
-    self.shared
+  /// Windows holds open has a file node and caches of its own, so the mount's next round tells those names.
+  pub fn sibling_change(&self) -> Option<&Sibling> {
+    self.sibling.as_ref()
   }
 
   /// Whether the request succeeded and changed what survives a restart: its reply waits for the shard's publication.

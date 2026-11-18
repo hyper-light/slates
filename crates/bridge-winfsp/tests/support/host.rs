@@ -926,8 +926,8 @@ fn a_replacing_link_refused_part_way_leaves_the_taken_name_as_it_was() {
 
 /// A-360. Do: through an open of `file`, serve a write while it has one name, a link to `\second`, a write once it has
 /// two, the delete of `\second`, and a write once one name is left. Expect: the link, the write to a file with two names
-/// and the delete of one of two names each changed a file with another name, so the mount keeps their records for its
-/// next round; the writes to a file with one name do not (their records are the kernel's own doing).
+/// and the delete of one of two names each leave the file's other names owed a word (with the name it came through,
+/// `\file`, and the bytes it changed); the writes to a file with one name leave none.
 #[test]
 fn a_change_to_a_file_with_another_name_is_kept_for_the_other_names() {
   let mut store = fixed_store();
@@ -959,27 +959,38 @@ fn a_change_to_a_file_with_another_name_is_kept_for_the_other_names() {
     append: false,
     constrained: false,
   };
+  let through = |bytes| {
+    Some(Sibling {
+      ino: file.ino,
+      through: "\\file".to_owned(),
+      bytes,
+    })
+  };
   let cases = [
-    (write(), false, "a write to a file with one name"),
+    (write(), None, "a write to a file with one name"),
     (
       Op::Link {
         object: context,
         path: "\\second".to_owned(),
         replace: false,
       },
-      true,
+      through(CachedBytes::Kept),
       "a link",
     ),
-    (write(), true, "a write to a file with two names"),
+    (
+      write(),
+      through(CachedBytes::Range { at: 0, len: 1 }),
+      "a write to a file with two names",
+    ),
     (
       Op::Cleanup {
         object: context,
         delete: Some("\\second".to_owned()),
       },
-      true,
+      through(CachedBytes::Kept),
       "the delete of one of two names",
     ),
-    (write(), false, "a write once one name is left"),
+    (write(), None, "a write once one name is left"),
   ];
   for (op, expected, what) in cases {
     let (reply, _answer) = sync_channel(1);
@@ -990,7 +1001,7 @@ fn a_change_to_a_file_with_another_name_is_kept_for_the_other_names() {
       replayed: false,
     }
     .serve(&mut bridge, &cx, &mut names, &mut ledger);
-    assert_eq!(served.changed_a_file_with_other_names(), expected, "{what}");
+    assert_eq!(served.sibling_change(), expected.as_ref(), "{what}");
   }
 }
 

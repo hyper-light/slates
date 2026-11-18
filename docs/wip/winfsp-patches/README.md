@@ -43,6 +43,6 @@ half, and git's `clone --local` on the drive.
   callback, a link in `memfs`, and `winfsp-tests` cases.
 - Each name of a file has a file node of its own in the driver, and a node outlives its last handle while the cache
   manager holds the file, so the bytes and size one name's node caches are not the other's: the file system must
-  notify the other names when it changes the file, its own changes through one name included. slates' drive keeps
-  such a request's journal records for its next notification round (A-360); on the VM, before it did, a write through
-  one name read back through the other as the bytes before it.
+  notify the other names when it changes the file, its own changes through one name included. slates' drive tells a
+  file's other open names at its next notification round, never the name the change came through (A-360); on the
+  VM, before it did, a write through one name read back through the other as the bytes before it.
