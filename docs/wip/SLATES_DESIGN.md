@@ -6391,9 +6391,11 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   the test (`crates/cli/tests/support/relay.rs`) owns every node's advertised ports and forwards to its bind block
 >   (A-277). It loses, holds, duplicates and reorders datagrams per path and cuts a running node off one way or both,
 >   with no privilege: T-8.7's partitions without the iptables or pf that R10 rules out. Its flows stream writes over
->   lossy paths through a takeover, cut a running owner off, and deafen one, and also judge ReadSafety (a read through
->   the partitioned owner never answers less than its successor acknowledged) and Continuity (the successor's first
->   head is past every position durable under an earlier epoch) from outside the processes.
+>   lossy paths through a takeover, cut a running owner off, and deafen one. Every flow that takes a live volume over,
+>   these and the SIGSTOP and SIGKILL ones, now also judges ReadSafety (a read through any survivor, or through the
+>   partitioned owner while it is cut off or the moment its stopped process resumes, never answers less than was
+>   acknowledged) and Continuity (the successor's first head is past every position durable under an earlier epoch)
+>   from outside the processes.
 
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
