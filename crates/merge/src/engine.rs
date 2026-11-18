@@ -1823,6 +1823,7 @@ impl Green {
       .saturating_add(self.history_lists)
       .saturating_sub(self.history_current)
       .saturating_add(self.special_history_bytes)
+      .saturating_add(self.chunks.held_bytes())
   }
 
   /// The ops each intervening delta in `(base, head]` applied to `path`, oldest first: read at the versions `path`'s
@@ -3088,6 +3089,42 @@ impl Green {
     }
   }
 
+  /// The feed position the content this green releases now is stamped with (A-273): the position of the next
+  /// message its owner sends its replicas. Each version accepted and each fold of the history is one message, sent in
+  /// order, and the owner calls [`Green::advance_feed`] as it sends one.
+  pub fn feed_position(&self) -> u64 {
+    self.chunks.position()
+  }
+
+  /// The owner sent its replicas the feed message at [`Green::feed_position`] (a version accepted or a fold of the
+  /// history): content released from now on is stamped with the next position (A-273).
+  pub fn advance_feed(&mut self) {
+    self.chunks.advance();
+  }
+
+  /// A replica built from this green now begins reading its content in place (A-273): until it acknowledges the feed
+  /// message that released a chunk, or leaves, that chunk stays where it is, its bytes unchanged and its room unreused.
+  /// The replica's holder id.
+  pub fn hold_content(&mut self) -> u64 {
+    self.chunks.hold()
+  }
+
+  /// `holder` has applied the feed message at `position` and dropped what it released: content every holder has
+  /// passed is freed (A-273).
+  pub fn acknowledge_content(&mut self, holder: u64, position: u64) {
+    self.chunks.acknowledge(holder, position);
+  }
+
+  /// `holder` reads this green's content no more (dropped, rebuilt or ended): it holds no free from now on (A-273).
+  pub fn leave_content(&mut self, holder: u64) {
+    self.chunks.leave(holder);
+  }
+
+  /// The frees of content held for a replica since this green was made: A-273's non-vacuity counter.
+  pub fn content_frees_held(&self) -> u64 {
+    self.chunks.frees_held()
+  }
+
   /// The content and IPC histories' retained bytes **recounted** from the histories themselves — the oracle
   /// the running totals are checked against (balanced accounting): the distinct chunks the content values name and
   /// their piece lists, less the current values, and every earlier IPC node.
@@ -3111,6 +3148,7 @@ impl Green {
       .saturating_add(values().map(crate::history::Value::list_bytes).sum())
       .saturating_sub(current)
       .saturating_add(self.special_history_recounted())
+      .saturating_add(self.chunks.held_bytes_recounted())
   }
 
   /// The IPC history's earlier nodes, recounted: every node but each path's latest.
