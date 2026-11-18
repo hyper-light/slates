@@ -5751,6 +5751,23 @@ refinement and revalidation before those results can be applied to the corrected
 > A-304's like any other (a member that never promises gives the object up by name). Piece 3: a live log whose recorded
 > holders are past tolerance is taken from every surviving holder of it, recorded or in the retired owner's cohorts.
 
+> **Status (2026-11-18, A-335: a stale copy keeps the content a head may name).** A successor's confirmation says the
+> record was adopted, never that the content was fetched: the successor fetches a taken-over volume's content from the
+> holders its adopted head names, and from no one else (`fleet::fetch_into_hold`). So a holder lets a stale copy go
+> only once its retention rule (AUD-29-43) leaves no content held for the object: content its newest record names it
+> for, or content placed ahead of its records, keeps the copy whole (`takeover::let_go_stale`, counted
+> `fleet.takeover.kept_holding_content`). Before, a holder outside the successor's placement dropped content the adopted
+> head named at the confirmation, and at `f = 1` with the dead owner the head's only other holder the volume was lost to
+> one failure (`docs/bugs/2026-11-18-a-stale-copy-reclaim-dropped-content-a-successor-still-fetched.md`). Owed: the
+> release of a copy kept so (GAPS).
+
+> **Status (2026-11-18, A-340: the retirement bound's drop is typed and counted).** The bound lets a takeover go before it
+> completes only with more of them outstanding than members (A-309); the rounds it ends now give every object they had
+> learned and not adopted up by name (`NotRecovered { cause: TakeoverIncomplete { waited_on: "retirement" } }`, counted
+> `fleet.takeover.given_up.retirement_dropped`), and every holder counts the copies it keeps on an unresolved line
+> (`fleet.takeover.kept_unresolved`) or a lost one (`fleet.takeover.kept_lost`). Why it must drop, and what the operator
+> sees, are A-340's.
+
 **Neighbourhood changes.** A host's neighbourhood changes only through the group (a member
 left, a fresh member joined, a rebalancing). While a change is in flight the owner writes to a
 quorum of the old candidates and a quorum of the new ones (joint writes); the group retires the
@@ -7228,6 +7245,17 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   `crates/server/tests/fuse_mount.rs`, the supersession injected as each path brings it (`Daemon::inject_superseded`). An idle volume's mount learns of the takeover only once the
 >   owner knows it: with no write to meet a holder's fence, that waits for the re-admission's yield (A-334, owed); and
 >   the guest device, the Shards stream and the WinFsp mount still hold or serve such a volume (GAPS).
+> - **A superseded owner shipped on and starved its own takeover round (fixed 2026-11-18, A-349).** The nemesis (seed
+>   6876545201569229162, both Linux arches, 5 of 6 rounds) gave up two objects within tolerance. Its owner, isolated,
+>   superseded and admitted again, still sent each holder its fenced log's entries every record period, each refused
+>   `StaleEpoch`. The next departure's objects fell to it, and its round asked the other survivor for its page each period
+>   and found its record session out on that loan every time (`fleet.takeover.pages_unsent` 213 to 928, the diagnostic
+>   line `lent_to live_ship`), until A-304's bound gave them up: no survivor withheld a promise, the round never asked.
+>   `learn_superseded` said a superseded owner ships no more of the volume; the record period's visit did not ask. Now a
+>   fenced volume sends nothing and does no period work (`live_ship::pending_sends`, `period_volume`). Held by
+>   `a_superseded_owner_ships_nothing_more_of_the_volume_it_lost` (`crates/server/tests/fleet.rs`). Owed (GAPS): the round's
+>   adoption there meets the node's own superseded copy, which a takeover must replace (A-334's re-adoption); a lane that
+>   ends on a refusal is sent again at once.
 
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
@@ -7913,7 +7941,25 @@ it builds against the contract and adds to it rather than around it.
 > way. `HostFault` renders in words, the daemon's `TargetUnavailable` by that name. Both were lost when the CLI moved
 > onto the library (A-278); the integrator's Windows lane found them (run 44257181904,
 > `docs/bugs/2026-11-18-the-cli-on-the-library-lost-two-windows-refusals-words.md`).
-> **`CONTRACT` = 17 (A-321, signed landings):** `land` sends its signature and the daemon judges it
+> **`CONTRACT` = 17:** the daemon's database refusals are typed on the wire (`Refusal::Database { refusal:
+> DatabaseRefusal }`, appended). `refusal_of_db` is exhaustive: its catch-all sent a corrupt record, a regressed
+> NFSv4 instance, a checkpoint out of range, a malformed sealing key and a refused encoding as `BadRequest` words. The
+> contract classes each `Unusable::Database`, a fault on the daemon's side to report.
+> **`CONTRACT` = 18:** a snapshot's retention refused is typed apart from the quota. The volume core answers
+> `VfsError::RetentionExceeded` (§4.2's `RetentionBudgetExceeded`; `ENOSPC` at every mount, as before) where it
+> answered `NoSpace`. The sites are a retained version's charge or allowance, a retained byte charge, a rename's
+> retention preflight, the recovery's re-charge, and the retention half of a verb's admission. The wire appends
+> `VolumeRefusal::RetentionExceeded`, and the contract classes it `Exhausted::Volume`. kiln's review had read the
+> shard's slab as its own quota (A-342's record). Proof: `a_snapshots_retention_refused_is_not_the_quota`
+> (`crates/api/tests/api.rs`, a daemon whose slab is capped small).
+> **`CONTRACT` = 19:** a target's refusal is typed. `Refusal::Target { refusal: TargetRefusal }` is appended, and the
+> daemon sends it where it sent `TargetUnavailable` with words: a landing target that is not absolute, escapes, is
+> missing, is another's or that the host refused; a mount point that is not a directory or is another user's; a
+> mount the kernel's table does not name or past the records the daemon keeps; a mount the OS refused (its errno
+> when it gave one); a WinFsp drive the anchor's hold did not answer, or whose detach already waits. The words go to
+> the daemon's log. The contract carries the reason as `HostFault::Target(TargetRefusal)` and renders it after the
+> daemon's `TargetUnavailable`. The superseded variant is a protocol fault, since no daemon of this build sends it.
+> **`CONTRACT` = 20 (A-321, signed landings):** `land` sends its signature and the daemon judges it
 > (`Unsupported::SignedWork` gone); a `LandingApproval` carries the landing's `statement` and the
 > `signature` it carried, which `approve_landing` presents and lands with again; a `LandingReport`'s
 > `verification` is the verdict on what was written; an `AuditRecord` of a landing as a whole
@@ -8443,6 +8489,40 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > `the_spin_window_is_the_budget_held_to_the_builds_measured_cost` (`crates/server/src/watchdog.rs`),
 > `a_poll_slower_than_the_budget_within_the_builds_spin_window_keeps_the_beat` (`crates/server/tests/liveness.rs`), and
 > the build-cost tests (`crates/machine/src/build_cost.rs`).
+
+> **Status (2026-11-18, A-336): a shard waiting on memory while the host reports a memory stall is starved, not
+> wedged.** A thread waiting on a page-in, a reclaim or a refault is neither running nor runnable, as a deadlocked one
+> is, so A-228's rule judged it wedged: a lone daemon at a few hundred megabytes free ended itself (exit 4, fleet test
+> binaries at 0.2 to 1 GB free on a 15-CPU Mac, 2026-11-17), and an anchor judged a daemon paging whole by the start's
+> rule and killed it at its lapse. A-308 kept only the watchdog's own gaps out of the verdict. Now, at a look that
+> suspects a shard, the watchdog reads the host's memory stall (`slates_machine::memory_stall`), and a still shard off
+> the CPU in a wait memory shows as, while the host reported a stall since the look before, has moved, as a runnable
+> one has (`watchdog::held_for_memory`); once a window passes with no CPU it is `Starved { of: Memory }`, logged with
+> its kernel wait, and it beats. A stuck shard is still judged wedged a window after the stall clears. One rule on every
+> platform, each reading what it can:
+> - Linux: PSI's memory `some` total risen since the look before (`/proc/pressure/memory`), and the thread held in the
+>   kernel past signals (`D`); a thread asleep in a futex, a poll or a sleep (`S`) is never excused. `some`, not `full`:
+>   FULL holds on a CPU only while nothing there is productive, so a thread waiting on memory on a busy machine never
+>   shows in it (`kernel/sched/psi.c`); a delayed thread is itself `some` on its CPU, so the total rises while it waits.
+>   The thread's `wchan` names the wait in the log line.
+> - macOS: `kern.memorystatus_vm_pressure_level` above normal (XNU's dispatch level, warning or critical); XNU reports
+>   a user page fault's wait as it does a lock's, so any blocked wait counts while it is raised.
+> - Windows: the low-memory resource notification signaled; any blocked wait counts (the wait reason is not read yet).
+> - No reading (PSI absent, `psi=0`, a refused read, Miri): nothing excuses a still shard, as before.
+>
+> The anchor's start and lapse judgment run the same rule over the whole process (`slates_rt::process_run_reading`:
+> runnable when any thread is; else held in the kernel when any thread is, on Linux). A shard waiting on another
+> thread that is held in the kernel reads as that thread does (A-228's transitive wait). Regressions:
+> `a_shard_waiting_on_memory_while_the_host_stalls_is_starved_and_wedged_a_window_after_the_stall_clears`,
+> `a_shard_asleep_or_unread_is_wedged_within_the_window_however_the_host_stalls` and the rule's table
+> (`crates/server/src/watchdog.rs`); `a_shard_waiting_on_memory_keeps_the_beat_while_the_host_stalls_and_stops_it_a_window_after`
+> and, on Linux, `a_shard_asleep_while_the_host_stalls_stops_the_beat` (`crates/server/tests/liveness.rs`, the
+> host's reading put in its place through `Daemon::inject_memory_stall`, a shard held in the kernel by a vfork's wait);
+> `a_process_waiting_on_memory_is_spared_while_the_host_stalls_and_stuck_a_window_after` (`crates/api/src/role/anchor.rs`);
+> the readers' own tests (`crates/machine/src/memory_stall.rs`, `crates/rt/src/thread_clock.rs`). Not yet: an
+> observation's and a cross-shard call's wait (`observe::ShardTime`) take the same excuse next; a shard asleep on a
+> lock whose holder pages is still judged wedged on Linux (the holder is not named, GAPS); Windows' per-thread wait
+> reason is not read.
 
 > **Telemetry oracle correction (2026-09-20, AC-0.11).** A drain request itself emits spans.
 > The daemon integration oracle now derives convergence from the reply quota minus the
@@ -17068,6 +17148,10 @@ is preempted, and raising its thread's priority removes the wait (run 4205929431
 is not yet a measured gain and no priority has been changed.
 Applied in the same change to: GAPS, BENCHMARKS, `crates/bridge-winfsp/src/reply.rs`, `host.rs`, `dispatcher.rs` and `lib.rs`.
 
+**A window per kind of request (2026-11-18): measured in two forms and rejected (A-348).** One window for every kind
+stays: parking at once the kinds whose replies miss it freed arm64's loaded shards (a loaded write 42.3 µs faster at the
+p50) and cost x86_64 a wake at each p50 it moved (a loaded stat 42.5 µs slower).
+
 Applied in the same change to: GAPS (the audit entry's unmeasured-receiver item); `crates/bridge-winfsp/src/dispatcher.rs`,
 `inflight/capture.rs`, `purge_intents.rs`, `notify.rs` and `host.rs`.
 
@@ -17262,6 +17346,9 @@ Applied in the same change to:
   −2,375 µs (8 to 9 of 10), write's and unlink's p50 and write's p99 beyond the control's spread. No x86_64 loaded p99
   moves beyond the control's. The cost is a quiet stat: p50 +8.1 µs on arm64 and +4.0 µs on x86_64, the post's wake costing
   about what the round did when the shard is idle.
+- **Amended by A-348 (2026-11-18).** The mount's request channel held one request, so the request after an open waited in
+  its post until the shard had taken the confirmation; it holds two now, and the post never waits. The variant that posts
+  without the wake deadlocked over the one-request channel and, over two, measured slower: the wake stays.
 
 ### A-249 — The purge in progress is one slot the receive worker reads, never a channel it drains (accepted and built 2026-11-07, the supervisor's decision: option (a); amends A-190 and A-198)
 
@@ -24635,7 +24722,9 @@ model below; each red before its fix):
   retirement in the version that records it (before, such a holder kept its stale copy for good). A holder the round
   never asked keeps its copy (`fleet.takeover.kept_unasked`): within tolerance it is stale, past it it may be the only
   one, and nothing in the configuration tells which. Owed (GAPS): a holder an owner's neighbourhood settled away from
-  lets its copies go at that settle, on the owner's report, so these do not stay.
+  lets its copies go at that settle, on the owner's report, so these do not stay. (Wrong as stated, A-335: the settle
+  report covers records, not content, and a head may go on naming such a holder's content; a stale copy whose content
+  its holder still keeps is kept whole since A-335.)
 - **Bounded** (banned item 8): at most one record per member (`completed_bound`), the oldest let go first, but never
   the record of a survivor that left owing its share while the retirement it carried is kept, since that retirement's
   completion rests on it. A holder that lags past a let-go record keeps a stale copy: a leak bounded by what it holds,
@@ -24690,6 +24779,7 @@ and unrecovered: the configuration no longer knows whether the successor it rank
 re-ranked there could adopt a stale copy beside a live adopter it cannot see. The bound lets a retirement go only past
 one per member, a region with more takeovers outstanding than members. A neighbourhood the owner wrote to before the
 last one it moved to, while unsettled, is not recorded: past tolerance a copy there is neither learned nor let go.
+(Since A-340 the drop is typed and counted, and why the bound must drop it is stated there.)
 
 Two corrections to piece 1 made with piece 2: `stale_after_confirmation` builds the successor's placement only once
 the confirmation is found (every install resolves every held copy; built first, it laid out an owner's copysets for each
@@ -24955,7 +25045,7 @@ its own), `docs/library.md`, and:
 
 **Signed landings (2026-11-18, A-321's second part; goal g090).** Applied in the same change to: §4.15 (the audit
 record's shape, step 2 "Present", a status blockquote), §4.12 ("The consumer contract": its signed-work bullet,
-`CONTRACT` 17), A-285's status, GAPS (this entry's head entry and A-285's), `docs/library.md`, and:
+`CONTRACT` 20), A-285's status, GAPS (this entry's head entry and A-285's), `docs/library.md`, and:
 - `crates/ipc/src/protocol.rs`: `Land` and `Present` carry `signature`; `GrantRequired` carries the landing's
   `statement` and its `verification`; `LandingOutcome::verification`; `AuditEntry::verification`. Fields appended to
   existing variants and structs; no enum variant added, so no wire tag moved or was published.
@@ -24970,7 +25060,7 @@ record's shape, step 2 "Present", a status blockquote), §4.12 ("The consumer co
 - `crates/client`: `SignedLanding`, `land_with_signature`, `present_with_signature`.
 - `crates/api`: `Instance::land` sends its signature; `LandingApproval::statement` and `::signature`;
   `approve_landing` presents and lands with the approval's signature; `LandingReport::verification` from the outcome;
-  `AuditRecord::verification`; `Unsupported::SignedWork` removed; `CONTRACT` 17.
+  `AuditRecord::verification`; `Unsupported::SignedWork` removed; `CONTRACT` 20.
 - Tests: `crates/server/tests/signed_work.rs` (four landing tests, below), `crates/api/tests/api.rs`
   (`a_signed_landing_is_judged_and_read_back_through_the_contract`).
 
@@ -25278,3 +25368,208 @@ Applied in the same change to:
   mounts as a node that does not hold it: an NFS request `NFS3ERR_STALE` and no root at a mount, as the router answers a
   handle of a volume outside the node's set; a FUSE mount fenced as a revoked one is, its kernel's cache dropped, its
   requests refused `ENOTCONN`, and the mount ended. The client mounts the volume through its successor's node.
+
+### A-348 — The mount's request channel holds the receive worker's posted confirmation beside its next call; the post's wake stays, and the per-kind spin choice is measured and rejected (2026-11-18, goal g258, audit step 7 continued; amends A-274, records against A-212)
+
+Applied in the same change to:
+- §4.6 (Windows): this entry is its record.
+- `crates/bridge-winfsp/src/host.rs`: `REQUEST_BOUND` is `CALLS_WAITED_FOR + CONFIRMATIONS_POSTED`, two; the test
+  `host::channel::the_next_request_is_posted_while_a_confirmation_waits_untaken`.
+- A-274: its record names this amendment.
+- BENCHMARKS ("Step 7, continued"), GAPS (the Step 7 entry).
+- **What was there.** The mount's request channel was a `sync_channel` of one request: "the one receiver waits for its
+  current callback's answer before sending another request". A-274 made that untrue: the worker posts an open's
+  confirmation and goes on, so the confirmation can still be in the channel when the worker's next callback posts its
+  call, and that post waited for room until the shard took the confirmation. On main the confirmation's own wake brings
+  the shard, so the wait was a shard wake on the worker's path, the kind of wait A-274 took off it. A worker that posted
+  without the wake waited for good: cut (c)'s no-wake variant stalled both Windows runners in its first run, a drive's
+  first look on arm64 and the warm-up's next round on x86_64 never answered, and its live CLI suite hung (diag-g258-1,
+  run 44271751211).
+- **The rule.** The channel holds every request the one receive worker can have outstanding: the call it waits for and
+  the one confirmation it posted without waiting (A-274 refuses a second over it, `inflight::settle`). No post waits for
+  the shard to take what is in the channel. Red at one request on both Windows runners, green at two (diag-g258-4, run
+  44278926773). Measured dead even against main: no p50 or p99 cell beyond the control on x86_64, only tails both ways on
+  arm64 (the same run, ten runs a runner). It lands on A-274's rule, not for speed.
+- **The post's wake stays.** Over the two-request channel the no-wake variant measured slower beyond the control: arm64's
+  loaded write p50 +48.4 µs (0 of 10 runs faster), rename, unlink, create_security and quiet write, and x86_64's loaded
+  p99 open +636 µs (0 of 10); only arm64's loaded fsync was faster (−13.8, 10 of 10). Woken at the post, the shard serves
+  the confirmation while the worker sends, and the request after an open finds it awake.
+- **A-212's spin, one window for every kind, stays.** Cut (b) let each kind of shard request choose between spinning the
+  window and parking at once, by its own recent replies, each stamped with its shard's send instant: by the 2-competitive
+  costs (diag-g258-2) and by whether its median reply came within the window (diag-g258-7). Both lost on x86_64, about a
+  wake at each p50 that moved (the 2-competitive form's loaded close +16.7 µs, 0 of 10 faster; the median form's loaded
+  stat +42.5) and traded on arm64 (the median form's loaded write −42.3 and rename −35.2, 10 of 10 each, against loaded stat
+  +11.7 and quiet fsync +10.9). Neither lands: a spin that misses costs arm64's loaded shards a CPU they need, a park costs
+  x86_64 a wake, and a choice that takes the first without the second needs a signal of contention (open in GAPS).
+
+### A-336 — A shard waiting on memory while the host reports a memory stall is starved, not wedged, in the watchdog's verdict and the anchor's (2026-11-18, goal g251: every open slates bug fixed; the supervisor's decision by A-228's rule)
+Applied in the same change to: §4.14 `daemon.alive` (status), GAPS (the A-308 entry's open item, closed; a 2026-11-18
+entry), `docs/cli.md` (the anchor), `crates/machine/src/memory_stall.rs` (new: `StallReading`, `read`, `source`,
+`stalled_between`), `crates/rt/src/thread_clock.rs` (`RunReading::uninterruptible`, `process_run_reading` replacing
+`process_runnable`, `kernel_wait_name`), `crates/rt/src/registry.rs` (`shard_run_readings`' transitive wait,
+`shard_kernel_wait_name`), `crates/server/src/watchdog.rs` (`held_for_memory`, `Want`, `Verdict::Starved`'s `of`,
+`Look::memory`, `MemoryStallSource`, the start line and the starved-for-memory line), `crates/server/src/daemon.rs`
+(`Daemon::inject_memory_stall`), `crates/api/src/role/anchor.rs` (`judge_start_of`'s reading), `unsafe-budget.toml`
+(slates-machine 79 → 81).
+- **Why.** A-228's rule calls a shard wedged after a window with no CPU progress in which the scheduler never had it
+  runnable. A thread waiting on a page-in, a reclaim or a refault is exactly that, as a deadlocked one is. On a host
+  short of memory a lone daemon ended its own process (exit 4; fleet test binaries at 0.2 to 1 GB free on a 15-CPU Mac,
+  load 62 to 131, g231, 2026-11-17), and an anchor that found a daemon's watchdog silent judged the process by the
+  start's rule and killed it. A-308 kept the watchdog's own gaps out of the verdict and left this open. The supervisor's
+  decision of 2026-11-18, by A-228's rule (the anchor never kills a starved-but-live daemon and still kills a hung one,
+  on every OS): the memory-pressure option, with the thread's own kernel wait on Linux.
+- **The rule.** At a look that suspects a shard, a shard off the CPU in a wait memory can show as, while the host
+  reported a memory stall since the look before, has moved, as a runnable one has: its still time starts again, and a
+  window with no CPU makes it `Starved { of: Memory }`, which beats. Once the stall clears nothing excuses it, so a
+  stuck shard is judged wedged a window after the last stalled look. The host's stall is each platform's own
+  classification, so no threshold is chosen here (R3): Linux PSI's memory `some` total risen; macOS's
+  `kern.memorystatus_vm_pressure_level` above normal; Windows' low-memory resource notification signaled. The thread's
+  wait: Linux `D` (held in the kernel past signals; never `S`), any blocked wait where the platform does not tell (macOS
+  reports a user page fault's wait as it does a lock's; Windows' wait reason is not read). No reading of either, no
+  excuse. The anchor's start and lapse judgment apply it to the whole process: runnable when any thread is, else held
+  when any thread is held.
+- **`some`, not `full`.** The decision named PSI's `full` line. It would miss the case the rule is for: FULL holds on a
+  CPU only while no task there is productive (`tFULL[cpu] = time(nr_delayed_tasks[cpu] && !nr_productive_tasks[cpu])`,
+  `kernel/sched/psi.c` at 6f88f6cbb), and a busy machine, the normal case, runs something else on the CPU of a thread
+  that waits on memory. A delayed thread is itself `some` on its CPU, so the `some` total rises while it waits, by that
+  CPU's share of the machine's non-idle time; with the thread's own `D` beside it, the reading is the thread's, not a
+  neighbour's.
+- **Cost.** A look that suspects no shard reads nothing new. One that does reads the host once (a 50-byte pseudo-file
+  on Linux, one sysctl on macOS, one query on Windows) beside the scheduler readings it already took. The `wchan` is
+  read once an episode, for its log line.
+- **What it does not change.** The spinning verdict (a poll whose CPU is the kernel's reclaim on its behalf can still
+  run a window of it), the CPU-starved rule, A-308's gaps, the window, and a lone daemon's end on a stuck verdict.
+- **Owed.** The same excuse in an observation's and a cross-shard call's wait (`observe::ShardTime`, A-228's sibling);
+  a shard asleep on a lock whose holder pages, judged wedged on Linux (the holder is not named, as for a starved
+  holder); Windows' per-thread wait reason (`WrPageIn` and its kin) as the thread's own reading there; and a run of a
+  daemon in a host truly short of memory (a bounded container with swap), the measurer's.
+
+### A-335 — A stale copy is let go only once its holder keeps no content for it: a successor's confirmation says its record was adopted, not that its content was fetched (2026-11-18, kiln goal g250; a bug found while checking A-309's owed rule)
+
+A takeover's survivor confirms its share once every object its round learned is adopted: the newest record re-committed
+under its own placement (A-272). Its materialization comes after: a volume's content is fetched from the holders the
+adopted head names, and from no one else (§4.10 "fetches … by identity from a recorded holder"; `fleet::fetch_into_hold`).
+A holder of the retired owner's copy that the successor's placement leaves out read the confirmation (or the completion
+record) as its copy's adoption and dropped the copy whole, record and content (`takeover::reclaim`). At `f = 1` a seal
+places its content on the owner and one more holder; when that one was such a holder and the successor held none of the
+content, the successor could fetch from nobody once the copy was dropped, and one failure lost the volume
+(`docs/bugs/2026-11-18-a-stale-copy-reclaim-dropped-content-a-successor-still-fetched.md`).
+
+- **The record and the content are judged apart.** The record's lineage decides that a copy is stale (A-272, A-309,
+  unchanged). The content's own rule decides what it keeps (AUD-29-43): a holder keeps a manifest while its newest
+  accepted record names it for this holder, or while it is the newest placement ahead of its records. A stale copy is let
+  go only once that rule, run on the object first, leaves nothing held for it; otherwise the copy is kept whole
+  (`takeover::let_go_stale`, `fleet.takeover.kept_holding_content`, counted at each install that judges it). The
+  adopted record is the newest the round learned; when it is this holder's own, its head names this holder, so the
+  copy this holder keeps is exactly the one the successor may fetch. A green is the same: its successor fetches a
+  version's inputs from the members that reported the adopted version (`fleet::fetch_green_inputs`), and a reporter's
+  inputs are content the rule keeps.
+- **What it costs.** A copy kept for its content stays until a newer record reaches its holder and the retention rule
+  releases it. A holder outside the successor's placement receives no newer record, so it keeps the copy for good: a
+  leak bounded by what it holds, never a loss. The release is owed with the content's own certificate: a successor
+  confirms only once its adopted volumes' content is re-placed under its own placement, and an owner's settle certifies
+  its content as well as its records; a holder outside the placement then lets go (GAPS).
+- **A-309's owed rule was wrong as stated.** "A holder an owner's neighbourhood settled away from lets its copies go at
+  that settle, on the owner's report that every record it owns is placed on the new neighbourhood": the report covers
+  records (`fleet::records_placed_on_current_neighbourhood`), while content stays on the cohort it was placed on and the
+  head goes on naming its holders (§4.8 "Neighbourhood changes" status: "Content stays on its current cohort: the head
+  names its holders"). The healer leaves such a named holder outside the candidates and relies on it keeping the copy
+  (A-276's open item, `fleet.heal.named_outside_candidates`). A holder that dropped its content at the settle would
+  leave the head naming a holder without it, and the owner's failure would lose the volume. Only register copies whose
+  content no head this holder holds names may go on that rule.
+
+Held by, in `crates/server/src/daemon.rs`: `a_holder_outside_the_successors_placement_keeps_the_content_its_head_names`
+(the successor's confirmation, then the completed takeover) and
+`a_lagging_holder_keeps_the_content_its_head_names_when_the_takeover_completes` (a holder that installs only the
+completion record), each red before (the copy and its content reclaimed), over `hold_a_head_naming_this_holder` (a
+seven-member `f = 1` region; the volume's successor places it away from the holder); A-309's
+`a_holder_outside_the_successors_placement_lets_its_copy_go_when_the_takeover_completes` still lets a copy with no
+content go.
+
+Applied in the same change to: §4.8 "Promotion and takeover" (status), A-309 (its holder rule and its owed line), GAPS
+(A-272 (ii)'s entry and the content hazard), `crates/server/src/takeover.rs`, `crates/server/src/daemon.rs` (tests) and
+the bug record.
+
+### A-340 — The retirement bound's drop of a takeover that had not completed is typed and counted: the rounds it ends give what they learned up by name, and holders count what they keep (2026-11-18, kiln goal g250; A-309's residual)
+
+A-309 keeps at most one retirement per member (`RegionalConfiguration::retirement_bound`) and, past it, lets go first one
+nobody owes or carries (it can never complete) and then the oldest, with every retirement that carries it. A takeover let
+go before it completed leaves its lines unresolved: holders keep their copies (A-272) and no round recovers them. Until
+now nothing said so. The successors' rounds of it were forgotten without a word (`takeover::drive_takeovers` forgot a
+takeover it no longer owed), a volume its round had learned and not adopted answered a retryable `OwnerUnreachable` for
+good, and a holder kept the copy uncounted.
+
+**Why the bound must drop it.**
+- The configuration is replicated on every member and bounded by its members (banned item 8). A retirement stays kept
+  while a member owes its share or a kept retirement carries it, so more than `members` of them accumulate only when
+  hosts retire faster than survivors finish their rounds: a crash loop retires a fresh id at every restart, and a
+  survivor keeps its share open while an object waits for, or was given up on, a cohort member cut off from it alone
+  (A-304, which the council never retires).
+- Each alternative is worse. Keeping every outstanding retirement grows the configuration with every restart for as long
+  as one share stays open. Refusing admissions at the bound stops the region from growing back for as long as one round
+  is stuck, which A-304 shows can be indefinite. Refusing a takeover leaves a dead host unfenced. Ranking the dropped
+  takeover's objects again among the members that remain could adopt a stale copy beside a live adopter the
+  configuration no longer names (A-309's residual). So the bound still drops; A-340 changes no rule of the configuration.
+
+**What the operator sees.**
+- **On each successor whose round the drop ended:** every volume and green its round had learned and not adopted is given
+  up by name. Its shard records it unrecovered, so its status and every verb on it answer `NotRecovered { cause:
+  TakeoverIncomplete { waited_on: "retirement" } }` and `volume list` shows `not_recovered=TakeoverIncomplete`; this node
+  claims it to lookups, so a read from another node meets that answer. Counted `fleet.takeover.given_up` and
+  `fleet.takeover.given_up.retirement_dropped`, with one log line naming the retired host and the first object
+  (`takeover::rounds_the_bound_ended`, `takeover::give_up_dropped`; the recording is A-304's, shared as
+  `takeover::record_given_up`).
+- **On every holder** of a copy whose line runs through it: the copy is kept, as unresolved never reclaims, and counted
+  `fleet.takeover.kept_unresolved` at each install that judges it; a line through a retirement with no survivor counts
+  `fleet.takeover.kept_lost`.
+- **A volume no round had learned** when its retirement went (a round still paging, or no asked member holding it) is
+  served by no member: a verb on it answers `OwnerUnreachable` once the lookup's bound passes, and only its holders'
+  `kept_unresolved` shows it. Owed (GAPS): a holder answers the owner-location exchange for a copy on an unresolved line,
+  so that lookup too answers `NotRecovered` by name.
+
+Held by, in `crates/server/src/takeover.rs`: `a_round_the_retirement_bound_ended_names_what_it_had_learned` (seven members
+at `f = 1`; four takeovers outstanding with two members left; the bound ends exactly the round of the takeover it let
+go, naming its learned object, never a completed takeover's; the held copy kept, counted) and
+`a_round_the_retirement_bound_ended_gives_its_learned_volumes_up_by_name` (a volume recorded `TakeoverIncomplete
+{ waited_on: "retirement" }` and claimed; the volume and its catalog register counted).
+
+Applied in the same change to: §4.8 "Promotion and takeover" (status), A-309 (its residual), GAPS (A-272 (ii)'s entry)
+and `crates/server/src/takeover.rs`.
+
+### A-349 — A superseded owner ships nothing more of the volume it lost, so its record sessions are free for its own takeover rounds (2026-11-18, kiln goal g250; §4.10 live shipping, §4.8 "Promotion and takeover"; the chaos nemesis, seed 6876545201569229162; A-304, A-338)
+
+- **What was there.** An owner that learns its fence (a holder answered its log `StaleEpoch` at a later epoch) refuses
+  every write waiting on the volume and ships nothing more of it (`live_ship::learn_superseded`; `Next::Fenced`: "must
+  stop shipping and serving"). The paths that ship from a publication, a lane's end and a holder's return honoured
+  that; the record period did not. Its visit followed the volume's candidates and made whole records and images for it,
+  and `pending_sends` built each holder the entries or the install it lacked, every period, each refused `StaleEpoch`.
+  Each send borrows the holder's record session for its exchange (`borrow_session`, `fleet.lent_to.live_ship`), and the
+  coordinator starts the period's lanes just before it drives the takeover rounds (`run_record_period`, then
+  `adopt_and_serve`). A round's page question takes a session only if it is in its link at that instant
+  (`takeover::ask_pages`), so the old owner's rounds met it out on that loan every period. In the nemesis (diag-g250-
+  nemesis-2, CI run 44320668620, 5 of 6 rounds over both arches) the owner X1, isolated, superseded and admitted again,
+  was a survivor of the next departure (its successor X2, deafened); X2's objects fell to X1, the volume's home; X1's
+  round never sent the other survivor its page (`fleet.takeover.pages_unsent` 213 to 928) and A-304's bound gave both
+  up (NotRecovered) within tolerance. No survivor withheld a promise: the round never asked.
+- **The rule.** A fenced volume does nothing at the record period and sends nothing from any path
+  (`live_ship::pending_sends`, `period_volume`). Its writers were refused when the fence was learned, and later verbs go
+  to its successor (A-338).
+- **What it costs.** Nothing a superseded owner sent could land. Each period had sent each holder its stale entries or
+  a stale install (the whole volume: about 2,240 installs of 340 KB a run in the nemesis).
+- **Owed, found by this reading (GAPS).** The round on the old owner now adopts the objects that fall to it, and its
+  materialization meets the node's own superseded copy: `verbs::materialize_taken_over` keeps a volume the node already
+  holds, so the adopted state would never replace the stale copy, its fenced shipper or its kept fence (A-334's owed
+  re-adoption; g229 told). A lane that ends on any answer, a refusal included, sends the holder what it lacks again at
+  once (`lane_ended`): X2, retired before it knew, sent its log to the two members that refused it `not_a_member` about
+  86,000 times each in one run, its sessions out on that loop throughout. And a round's question still takes a session
+  only if it is in its link at that instant, so any borrower that takes it every period would starve it the same way.
+
+Held by `a_superseded_owner_ships_nothing_more_of_the_volume_it_lost` (`crates/server/tests/fleet.rs`: the owner cut off
+on the probe plane until its volume is taken over, healed, one write through it to meet the fence, then 20 record
+periods watched): red with the fix reverted, each holder refusing the old owner's fenced entry again every period (19
+in the 20, and 102 before the window, `not_the_acting_owner` once the old owner was admitted again), and with it each
+holder's one refusal is the write that met the fence (kiln r2346, Mac Studio).
+
+Applied in the same change to: §4.10 (the chaos flows' status), GAPS (the nemesis entry), `crates/server/src/live_ship.rs`,
+`crates/server/tests/fleet.rs` and the bug record
+`docs/bugs/2026-11-18-a-superseded-owners-shipper-starved-its-own-takeover-round.md`.
