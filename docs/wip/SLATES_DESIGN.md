@@ -31184,10 +31184,10 @@ Windows item); `docs/wip/shards/dax-protocol.md` ("Windows", after a daemon's de
   duplicated into the holder again, so the guest's maps stay right: the holder's value of the fresh stream is a known
   holder's, which a DAX ask names for the claim check (A-180). A file whose section the anchor did not hand back is
   asked for again at its next answer (`hold_asked`), never taken for held; a section no kept stream claims is released.
-- **Not in the `Resync`.** The sections are offered again at the device's asks, as on Unix, and not named in the
-  `Resync`: A-418's 40-byte wire is what Shards' device half is built to, the device asks for a section at every
-  `FUSE_SETUPMAPPING` (`dax-protocol.md`, (a)), and a section duplicated into the VMM unasked would be a handle no one
-  closes in its process.
+- **Not in the `Resync`** (main's decision, 2026-11-18). The sections are offered again at the device's asks, as on
+  Unix, and not named in the `Resync`: A-418's 40-byte wire is what Shards' device half is built to, the device asks for
+  a section at every `FUSE_SETUPMAPPING` (`dax-protocol.md`, (a)), and a section duplicated into the VMM unasked would be
+  a handle no one closes in its process.
 - **Evidence.** Red first, on main at `0576faacf` with the tests alone, on a Mac Studio (2026-11-18): `slates-anchor`'s
   lib tests did not build (13 errors: no `HoldBounds`, `WHAT_SHARDS_DAX`, `SHARDS_DAX_HANDLES`), nor `slates-server`'s
   (9 errors: no `marked`, `hold_asked`). Green on the tree as merged with main, the same day and machine:
@@ -31204,3 +31204,58 @@ Windows item); `docs/wip/shards/dax-protocol.md` ("Windows", after a daemon's de
   through the fresh stream) on CI's Windows runners, filed for main; Shards' device half (its coordinator's condition
   4c). Found beside it (GAPS): the Windows handoff names every held entry in one environment variable, whose length
   Windows bounds, and the anchor's bounds were never set against it.
+
+### A-460 — The Windows anchor hands its held entries on in an inherited section, never in one environment variable, whose 32,767 characters a table at the bounds passes (2026-11-18, goal 90; the gap A-448 found; A-198's handoff)
+Applied in the same change to: A-448's entry (main's decision on the `Resync` recorded); GAPS, A-281's entry (the
+handoff's length built, the Unix sibling found); and:
+- `crates/anchor`: `handles.rs` (`ENV_HANDLES` now names the table: `encode_handoff`, `parse_handoff`,
+  `HANDOFF_TEXT_CAP`; `table_cap`, which `parse_env` now shares; `check_owners`; the module's notes);
+  `held_windows.rs` (`Held::handoff` writes the table into a section of its own, `table_section`; `read_table`, the
+  daemon's half; the unit tests read every handoff through its section); `tests/handles_windows.rs` (every role reads
+  the table from its section; `a_table_past_an_environment_variables_limit_reaches_the_successor_whole`).
+- `crates/server`: `anchor_hold_windows.rs` (`adopt` reads the table from the section the variable names,
+  `handed_table`).
+
+- **What was there.** The anchor handed a spawned daemon its hold channel and every held entry as one environment
+  variable's value (`SLATES_ANCHOR_HANDLES`, A-198): `CHANNEL;ID:WHAT:HANDLES:RECORD...#CRC32C`. Microsoft documents
+  "The maximum size of a user-defined environment variable is 32,767 characters" (`SetEnvironmentVariableW`'s
+  `lpValue`, and "Environment Variables", which adds that the block itself has had no limit since Windows Vista; both
+  read on Microsoft Learn 2026-11-18). An entry takes up to `ENTRY_TEXT_CAP` characters: a mount's record up to 517
+  bytes, 1,034 in hexadecimal, about 1,100 in all; a DAX section's about 90. So about 30 mounts with long records passed
+  the limit, while the anchor's bounds admit `shards × 4096` mounts and `shards × dax_range_slots` sections, and past
+  it the next daemon could not read the variable whole: every held entry lost to it.
+- **The rule.** The table's text is unchanged and rides a section of its own length. At each spawn the anchor writes it
+  into a new pagefile-backed section (`slates_mem::PeerObject`, under A-175's confining descriptor), hands the spawn a
+  read-only, inheritable duplicate in the same explicit handle list as the held handles (A-183), and closes its own
+  copies once the spawn has its own. The variable names only the section's value and the table's length,
+  `TABLE_HEX:LEN_HEX`, at most 33 characters whatever the table holds. The daemon checks both against its bounds'
+  capacity before it maps or allocates anything, maps the section read alone (`slates_mem::PeerView`), reads the table
+  and closes the section; then parses the table as before (its checksum, its caps, one owner per handle), refusing
+  whole a table that names its own section again. The pointer is read only as `encode_handoff` writes it: lowercase
+  hexadecimal, no sign, no zero section, no empty table.
+- **Why a section and not another channel.** The hold channel's pipe buffers one message each way (`MESSAGE_BYTES`), so
+  a table of thousands of entries would cross it one message per supervision turn, and the anchor's loop never waits on
+  a daemon that may never read. The anchor's segment would need a region of the bounds' capacity (`table_cap`, about
+  1,100 bytes an entry: tens of megabytes at `shards × 4096` mounts) whether anything is held or not. A section costs
+  the table's own length, only at a spawn, and only until the daemon has read it. Caps derived to fit the variable were
+  rejected: they would bound the mounts and streams a daemon may hold for a reason of the transport's own (main's
+  preference, 2026-11-18).
+- **Tests.** On every host (`handles.rs`): `a_table_past_an_environment_variables_limit_rides_the_handoff_whole` (48
+  mounts with records of the whole cap and 512 DAX sections, a table past 32,767 characters, its pointer within 33, the
+  table read back whole; the cap's own length taken and one more byte refused), `hostile_handoff_pointers_are_refused`
+  (no colon, empty fields, a zero section or length, a sign, capitals, a third field, seventeen digits, past the cap),
+  `a_tables_own_section_is_never_named_again`. On Windows: `held_windows.rs`'s
+  `a_table_past_an_environment_variables_limit_is_handed_whole` (40 mounts through a real section) and every handoff
+  test reading through the section; `tests/handles_windows.rs`'s
+  `a_table_past_an_environment_variables_limit_reaches_the_successor_whole` (a real supervised restart: 40 events held
+  with records of the whole cap, the successor reading every one live from the section).
+- **Evidence.** Red first, on main at `b97d33e` with the tests alone, on a Mac Studio (2026-11-18): `slates-anchor`'s
+  lib tests did not build (15 errors: no `encode_handoff`, `parse_handoff`, `table_cap`, `check_owners`,
+  `HANDOFF_TEXT_CAP`). Green on the tree as merged with main, the same day and machine: `cargo test -p slates-anchor
+  --lib handles` 17 of 17, the three above among them; rustfmt's layout taken; and `cargo xwin check --target
+  x86_64-pc-windows-msvc` clean for `slates-anchor` and `slates-server` (lib and tests). The Windows tests and the
+  real supervised restart past the limit run only on Windows: filed for main.
+- **Found beside it** (GAPS): the Unix handoff rides environment variables too (`SLATES_ANCHOR_DEVICES`, about 109
+  characters a device with a resync session; `SLATES_ANCHOR_COPIES`, about 77 a DAX object), and Linux refuses an
+  `execve` with a single string past `MAX_ARG_STRLEN`, `PAGE_SIZE * 32` (`include/uapi/linux/binfmts.h`: 131,072 bytes
+  on 4 KiB pages, about 1,200 devices), while the bounds admit `shards × 4096`. Open; not this change's.

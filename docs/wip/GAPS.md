@@ -819,10 +819,20 @@
 >   naming it goes out, its id marked apart from every attachment's, the sections held to a bound of their own
 >   (`shards × dax_range_slots`, refused `Bound`); a successor adopts them whole, claims them for the stream and answers
 >   the device's asks after the `Resync` with the same sections. Owed on Windows: its real-process restart with DAX on
->   CI's runners (filed for main, `run-requests.md`); and the handoff's length: every held entry rides one environment
->   variable (`SLATES_ANCHOR_HANDLES`), and a user-defined variable is at most 32,767 characters by
->   `SetEnvironmentVariableW`'s documentation (from memory, to verify on a runner), which the anchor's bounds were never
->   set against, a section's entry being about 90 characters and a mount's up to about 1,100. **Built since (A-402,
+>   CI's runners (filed for main, `run-requests.md`). **The handoff's length, built since (A-460, the same day):** every
+>   held entry rode one environment variable (`SLATES_ANCHOR_HANDLES`), and "the maximum size of a user-defined
+>   environment variable is 32,767 characters" (Microsoft Learn, `SetEnvironmentVariableW`'s `lpValue` and "Environment
+>   Variables", read 2026-11-18), which a table reaches at about 30 mounts with full records (an entry up to
+>   `ENTRY_TEXT_CAP`, about 1,100 characters for a mount, about 90 for a DAX section), while the anchor's bounds admit
+>   `shards × 4096` mounts. The table now rides an inherited read-only section of its own length, and the variable names
+>   only that section and the length (at most 33 characters); its real-process restart past the limit is filed for
+>   main. **Found beside it, open (Unix):** the same table rides environment variables on Linux and macOS too
+>   (`SLATES_ANCHOR_DEVICES`, up to about 109 characters a device with a 40-byte resync session; `SLATES_ANCHOR_COPIES`,
+>   about 77 a DAX object), and Linux refuses an `execve` whose single string passes `MAX_ARG_STRLEN`, `PAGE_SIZE * 32`
+>   (`include/uapi/linux/binfmts.h`; 131,072 bytes on 4 KiB pages, so about 1,200 held devices or 1,700 copies), and
+>   macOS bounds arguments and environment together (`kern.argmax`, 1 MiB, from memory, to verify); the bounds admit
+>   `shards × 4096` devices, so a large Unix holding would leave the anchor unable to start its next daemon. **Built
+>   since (A-402,
 >   2026-11-18):** the write log on
 >   Windows, so a Windows stream's acknowledged writes outlive its daemon's death, replayed into the volume (its Windows
 >   run is main's, `run-requests.md`); before, a Windows stream's acknowledged writes since the last publication were
