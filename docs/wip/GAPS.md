@@ -3735,11 +3735,21 @@
 > (A-318); each verdict's line names the window it was judged by, and the status carries each shard's as the health
 > signal `shard.watch_window_ns`. Before, a shard the host kept off its CPU longer than `W` was judged against `W`
 > whatever the host measured, and A-359 only said so at boot. The ceiling keeps the watchdog from going blind, since a
-> wedged shard never waits again and so never forgets a spike measured just before it wedged. Still on `W` itself, each
-> owed its own change (class D): the anchor's start and lapse judgments (`role/anchor.rs`, D-b), the daemon's own
-> supervision waits (`reap_loop`, `log_late_beat`, `starved_share_ns`, `stop_parts`, `start_with_fleet`, the anchor's
-> hold windows, `held_copy`; D-c), and a laptop's failover detection term (A-405's supervision window), which should
-> follow the windows the watchdog now judges by.
+> wedged shard never waits again and so never forgets a spike measured just before it wedged. **Since A-461 (D-b's
+> start and stop half) the anchor judges a start by its silence against its own window**: from the spawn until the
+> watchdog first looks, each beat a step of the start's, so a start that beats is waited for however long it runs and
+> a wedged one is found a window after its last beat or CPU rise (before, a lapse bound and a whole window more after
+> its first beat); the window is the liveness window raised to how late the anchor's own timed waits come back, within
+> A-455's ceiling (`role/anchor.rs` `anchor_window_ns`), which a silent watchdog's process is judged by too; and a
+> graceful stop is judged in the daemon's own beating (`slates_anchor::StopBounds`, `supervise::stop_overdue`: deaf or
+> overdue once its last beat is a window past the request or its deadline; the lapse at the running lapse bound).
+> **Since A-467 D-b is closed**: the anchor's lapse bound (the window plus its lateness p99) has A-455's ceiling, so a
+> runaway reading cannot blind it, and its observation gap is the bound less its lateness p99 and a beat, at least a
+> beat (`Lateness::observation_gap_ns`), where half the bound let every gap pass the bound once the anchor ran a window
+> late, each look then taken for a sleep and a wedged daemon never found lapsed.
+> Still on `W` itself, each owed its own change (class D): the daemon's own supervision waits (`reap_loop`, `log_late_beat`,
+> `starved_share_ns`, `stop_parts`, `start_with_fleet`, the anchor's hold windows, `held_copy`; D-c), and a laptop's
+> failover detection term (A-405's supervision window), which should follow the windows the watchdog now judges by.
 >
 > - **Class A, a cross-shard wait judged in its target's own time (2026-11-06, in progress).** A verb's wait for
 >   another shard's answer gave up at the wall second while the target was alive and starved, and the work went on to
@@ -3809,7 +3819,24 @@
 >   `a_fetch_whose_owner_went_away_is_refused_by_its_departure`). The fleet tests' `CREDIT_WAIT` since A-454 (2026-11-18,
 >   g251): their client's connect is one claim, which waits while its daemon lives, so a refusal fails the test at once,
 >   and a full request ring is waited out while its shard steps, `FROZEN_CAP` the one wall bound, where both waited five
->   seconds on the wall. Owed in C-a: the same constant in `ack_release.rs`, `attach_forms.rs` and `shards.rs`, the
+>   seconds on the wall. The client's reply wait since A-456 (2026-11-18, g251b; C-b's first part): a synchronous
+>   call's wait re-armed at the reply deadline (`Deadlines::reply_ns`, the liveness budget, a second) and asked the
+>   daemon's liveness there, so a call whose daemon died learned it up to that second later; it now ends at the reply or
+>   the daemon's departure, waited on together where the platform can (Linux: the completion eventfd beside the
+>   control socket, whose peer end closes with the daemon's process; Windows: the reply's Event and the daemon's
+>   process handle in one wait), and on macOS, whose reply wake (the wake word) no wait takes beside a descriptor or a
+>   process, looked at on A-443's doubling from twice the longer of the first park and the wake estimate
+>   (`a_reply_after_the_old_reply_deadline_is_taken_while_its_daemon_lives`,
+>   `a_daemons_departure_ends_the_wait_before_the_old_reply_deadline`). Owed in C-b: the reply deadline's other users,
+>   each a wait that cannot see the departure yet: the async driver's tick (the SDK loops poll only the completion
+>   descriptor; Linux's control socket, macOS's exit-watch kqueue and, on Windows, the bridge thread waiting beside the
+>   process handle could each tell the loop), the wait for a slot on a full ring (a slot that frees wakes nothing), a
+>   delivery's read (Linux: the socket's readability), the macOS route's claim steps and the CLI's MCP edge, which
+>   borrows the reply deadline for its own; then the reconnect budget (part 2) and macOS's `MOUNT_CALL_DEADLINE` (part
+>   3). macOS sees a departure within the time waited, not at once: a thread per client waiting on the exit watch could
+>   wake the park at the exit, and was not built. Found on the way: `slates-rt`'s attribution reads the same
+>   `getrusage` as the client's Linux park through its own unsafe block; folding it into `slates_machine::switches`
+>   leaves one. Owed in C-a: the same constant in `ack_release.rs`, `attach_forms.rs` and `shards.rs`, the
 >   same two waits; Windows' run of the cross-process rendezvous file is filed for main. Class B (the
 >   transport's round-trip estimate) is open, but for the owner-location round (2026-11-18, A-437, goal g255: one
 >   liveness window, hard, for its asks and its lent sessions; now the record plane's round budget over the slowest
@@ -11356,6 +11383,31 @@ Owed:
 Shards streams on macOS have the same shape and are covered: their writes are logged since `1fa154230`; on Windows
 since A-402, which also makes the log option 2 names available to the WinFsp drive.
 
+### 2026-11-18: an overlay's base read from S3 objects (Mantle's CP-T10.5; designed and its pure core built, A-464; parts 2 and 3 owed)
+
+> - **Designed.** §4.15 "An S3 base": a directory listed lazily by a delimited `ListObjectsV2`, a file read by ranged
+>   `GetObject` bound to its object by `If-Match` (or its version id), a replaced object a new file (A-151) whose drift
+>   reaches every mapped copy (A-163), a deleted object a missing entry, every request SigV4-signed, credentials in RAM
+>   only, no external runtime, every bound derived, laptop ≡ fleet. From S3's API reference and guides, fetched
+>   2026-11-18.
+> - **Built (part 1, the pure core in `crates/base/src/s3`).** `sigv4` (held to the S3 signing page's four worked
+>   examples), `list` (a `ListObjectsV2` page, its cap checked before parsing, every hostile shape refused by kind) and
+>   `keys` (the tree and one directory's listing, every key that names no path refused by kind). Proven (Mac Studio,
+>   debug, kiln r389): `cargo test --locked -p slates-base --lib -- s3`, 14 of 14 (the four golden vectors, twenty
+>   hostile pages, a page cut anywhere and arbitrary bytes, every unnamable key); red once each (`$` unreserved, `<!`
+>   passed over, `..` a name).
+> - **Owed.**
+>   - Part 2: the network client over the shard's runtime (rt TCP, rustls over aws-lc-rs with the platform's roots,
+>     HTTP/1.1 with bounded heads and bodies, S3 error documents, the retry within `LIVENESS_BUDGET_NS`, the
+>     read-ahead from the measured bandwidth-delay product), run against a local S3-compatible store.
+>   - Part 3: the `HostFs` implementation from a RAM cache with misses parked and run again, `SimS3` as its oracle and
+>     the N=1 differential, the library's way to name an S3 base and hand its credential, the anchor's hold of the
+>     credential across a restart.
+>   - The listing page cap assumes a continuation token no longer than an encoded key (S3 states no length): measured
+>     in part 2.
+>   - The cross-target lint of `slates-base` with its new `aws-lc-rs` dependency (Windows through `cargo xwin`, the
+>     Linux targets): main's.
+
 ### 2026-11-18: a volume made from an archive through the library (Mantle's CP-T10.4 import half; built, A-453)
 
 > - **Built.** `Instance::import_archive` (contract 40): a new volume holding the tree of the archive a volume of the
@@ -18747,8 +18799,12 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   verify; a mode Windows cannot hold (an execute bit) makes an entry whose set changes nothing there, and the next
   landing finds the file as the disk keeps it; a check and a set are two calls on one handle, so an outsider's change to
   the same field between them is not seen; a `touch` alone and a base directory's mode change alone still land nothing;
-  a captured clone's replacement overwrites an outsider's mode change where an overlay's refuses it (T-1.14); and the
-  manifest's encoding, which grants bind, has no golden vector); and
+  a captured clone's replacement overwrote an outsider's mode change where an overlay's refuses it (T-1.14), **fixed by
+  A-466 the same day** (`docs/bugs/2026-11-18-a-captured-clones-replacement-overwrote-an-outsiders-mode.md`: its
+  metadata judged field by field beside its bytes, the outsider's mode kept under the agent's bytes, a mode both changed
+  differently a conflict, and an agent's mode set alone over bytes the disk already held; its unit tests ran on the
+  Mac Studio, the oracle reruns filed for main); and the manifest's encoding, which grants bind, has no golden vector);
+  and
   the seam's numbering: refusals the engine tells apart are POSIX numbers and the rest Win32 codes, so a Win32 code equal
   to one of the engine's numbers (`ERROR_NOT_SAME_DEVICE` 17, `ERROR_INSUFFICIENT_BUFFER` 122, among five) would read as
   that refusal; none of the writer's calls is known to answer one, and a typed refusal at the seam would close it.
