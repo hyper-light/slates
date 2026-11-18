@@ -1,0 +1,48 @@
+# DIAG (not for main): g229's flows on Linux x86_64 and arm64 with A-330, A-334 and A-345: the fresh-member flow three
+# times (its NoLoss failed on x86_64 at main ca216dbf8), the SIGSTOP owner flow, long-log and store-destroyed.
+name: diag-g229-chaos
+on:
+  push:
+    branches: ['diag-g229-chaos-*']
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  live-chaos-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the chaos binary (release)
+        run: cargo test --locked --release -p slates-cli --test live_chaos --no-run
+      - name: the flows, one at a time
+        env:
+          SLATES_TEST_CLI: "1"
+        run: |
+          ulimit -n 65536 || ulimit -n "$(ulimit -Hn)"
+          echo "nofile $(ulimit -n); cores $(nproc); $(free -g | sed -n 2p); load $(cat /proc/loadavg)"
+          status=0
+          for flow in a_member_that_never_held_the_log_never_stands_in_for_its_holder \
+                      a_member_that_never_held_the_log_never_stands_in_for_its_holder \
+                      a_member_that_never_held_the_log_never_stands_in_for_its_holder \
+                      an_owner_partitioned_mid_stream_is_fenced_and_loses_nothing \
+                      a_long_live_log_is_taken_over_whole \
+                      a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover; do
+            echo "=== $flow"
+            cargo test --locked --release -p slates-cli --test live_chaos -- --exact "$flow" --test-threads=1 --nocapture 2>&1 | tee -a target/live-chaos.log
+            [ "${PIPESTATUS[0]}" = 0 ] || status=1
+          done
+          exit "$status"
+      - name: Upload the chaos log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-chaos-log-${{ matrix.os }}
+          path: target/live-chaos.log
