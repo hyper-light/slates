@@ -20346,6 +20346,9 @@ The steps' own records follow.
   `FAILED_EXIT_CODE` (4, the CLI's code for a failed daemon), never a panic: a stuck shard's thread cannot be joined, so
   an orderly stop would wait on it for good. The end's line is written by a thread of its own, waited for at most one
   beat, since a shard can be wedged in a write to an undrained standard error while holding the lock every log line takes.
+  A writer that says the line is written is joined before the exit, so it is owned; one still blocked after the beat is
+  ended by the exit (2026-11-18: unjoined, a finished writer was a thread leak to ThreadSanitizer, whose exit report
+  held a lone daemon's end 26 s and made its exit code 66, `docs/bugs/2026-11-18-the-watchdogs-end-left-its-writer-unjoined.md`).
 - **Decided: only `FromEnv` is supervised; `Handoff` is not** (the plan's choice, recorded here as it asked). `Handoff`
   is an anchor in the daemon's own process: it may read the beat, but it cannot end a stuck daemon without ending
   itself, so nothing would end it, and its watchdog ends the process as a lone daemon's does. Supervision is a fact
