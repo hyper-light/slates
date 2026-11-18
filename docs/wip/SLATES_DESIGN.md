@@ -26393,7 +26393,9 @@ stream, the drivers, `MovedForgotten` at a retired tombstone; `takeover.rs`: `ad
     passes a frozen copy by (a frozen copy's heal had republished its head once its target died). The test forces the
     shape: c refuses every content put while a seals the head, and b's move questions go unanswered, so b never adopts;
     the move's own verb on the old owner's frozen copy is answered there (`Moved` once its routing follows the switch),
-    since forwarded to a target that never adopted it was never answered. Rejected: reusing
+    since forwarded to a target that never adopted it was never answered. Red-checked in one tree (the Mac Studio,
+    r3358): without the handoff the test fails as before (`fleet.fetch.no_holder_session` 100,
+    `fleet.materialize.given_up` 1), with it it passes (7.85 s and 5.87 s). Rejected: reusing
     the frozen copy in the old owner's own takeover (it serves only the case where the old owner is the successor) and
     the old owner holding its own content as a holder (its hold outlives no event that would release it when it is
     outside the new owner's placement). The cost is one more content copy before the switch, the copy the new owner's

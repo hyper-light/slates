@@ -590,7 +590,11 @@
 >   seals the head (so a and b alone hold it), and a and c leave b's move questions unanswered, so b never adopts
 >   (`inject_takeover_silence` covers a move's questions by name). Doing so found the operator's own move verb
 >   forwarded from the old owner to the target, which never answered it: the move's verb on a frozen copy is now
->   answered there, `Moved` once its routing follows the switch.
+>   answered there, `Moved` once its routing follows the switch. Red-checked in one tree on the Mac Studio (r3358,
+>   0b4ae1111): with the handoff turned off the test fails as it did (`fleet.fetch.no_holder_session` 100,
+>   `fleet.materialize.given_up` 1, every read `NotRecovered`), with it on it passes before and after (7.85 s, 5.87 s).
+>   An earlier red-check in a second worktree had passed 7 of 7 only because its build shared the green tree's target
+>   directory and ran the green binary; a red-check mutates the tree the green run built.
 > - **Owed (the handoff's bound):** the frozen phase lasts as long as the handoff's copy takes, and an unreported move
 >   is held to the failover SLO (10 s by default), so a volume whose content cannot be copied to one more host within it
 >   is refused `MoveRefusal::Unplaced` and thaws. The fix is to place the head off the owner before freezing (the volume
