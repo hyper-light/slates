@@ -210,9 +210,11 @@
 >   which only a person holds, or OpenSSH's software authenticator (`regress/misc/sk-dummy`, built from OpenSSH's source
 >   and loaded by `ssh-keygen -w`), a tool build CLAUDE.md §2 item 14 reserves for Ada; macOS's OpenSSH 10.2p1 on the
 >   Mac Studio carries only `ssh-sk-helper`'s hardware middleware (checked 2026-11-18);
-> - the integrator's runs on Linux and Windows (the merge tests are platform-free but for the agent's own channel; the
->   landing tests run where the daemon lands, on Unix, and a Windows landing writer, when it lands, must judge and
->   record a signature as `landing::landing_verdict` does, which is gated with the Unix landing path).
+> - the integrator's runs on Linux and Windows (the merge tests are platform-free but for the agent's own channel). The
+>   landing half is closed on Windows since A-185 (2026-11-18): the Windows landing judges and records a signature
+>   through the same `landing::landing_verdict`, no longer gated with a Unix landing path, and `signed_work.rs` passed
+>   12 of 12 on both Windows runners (run 44371955995), its consumer enrolled under the channel's own account; both
+>   Windows lanes run it.
 
 > **The nemesis's fleet stayed split for good after a takeover gave objects up: fixed (2026-11-18, A-351, §4.8; goal
 > g225; the chaos nemesis, seeds 6876545201569229162 on both Linux arches and 7236833171758868842 on x86_64, CI diag
@@ -520,8 +522,12 @@
 >   behind a call whose deadline is a period (g232's kernel base volume: 97,254 files, 1.99 GB, seconds of one poll).
 >   **The restore's steps exist (A-391, g251, 2026-11-18):** `slates_archive::Planning`, `Planned::restoring` and
 >   `Restoring` make a restore a piece at a time (no piece past one chunk's bytes but a merge onto a file's growing
->   piece); the server still calls the one-call `restore` until the population in steps and the plain takeover path's
->   owner-shard task follow (g251's next change).
+>   piece). **Used by both takeover paths (A-397, the same day):** one owner-shard task makes a live log's or a placed
+>   seal's volume, its archive copied out (on the control shard), restored and its tree laid each a slice a turn, the
+>   volume being made held in `ShardState::making_volumes` and discarded on any end but its making; later attempts join
+>   it. Still owed: a live volume's layout as an archive (`live_ship::archive_of`, a turn: 0.05 to 0.16 s at 300 MB), the
+>   held manifest's decode and chunk list (a turn of the control shard, metadata-sized), and the first publication's
+>   whole entry (the item above).
 >   - **Measured (2026-11-18):** g251's trace of the nemesis spin kills found a taken-over volume's first publication
 >     (`fleet::published_before_served` -> `live_ship::published`, its whole entry) at 1.06 s in one turn; the
 >     measurer's 32-writer run (128 MiB, diag-measurer-7) lost a daemon to the watchdog in 3 of 8 runs at 1,000-1,002 ms
@@ -1318,7 +1324,7 @@
 >   `a_populated_region_no_slower_than_the_untouched_one_is_unmeasured` (ef529d8a). Record:
 >   `docs/bugs/2026-11-11-the-fault-probe-reported-a-zero-fault-on-a-loaded-machine.md`.
 
-> **The Windows wake estimate (A-223, found 2026-11-05 on jupiter, fixed 2026-11-06; the idle window's rule decided 2026-11-11, extended for closed loops 2026-11-18 by A-326, on main 2026-11-18 with the merge of liveness's branch; Windows' own window closed 2026-11-18 by A-361; macOS' hold removed 2026-11-18 by A-387).**
+> **The Windows wake estimate (A-223, found 2026-11-05 on jupiter, fixed 2026-11-06; the idle window's rule decided 2026-11-11, extended for closed loops 2026-11-18 by A-326, on main 2026-11-18 with the merge of liveness's branch; Windows' own window closed 2026-11-18 by A-361; a hold kept only while a shard's idle turns poll faster than it wakes, 2026-11-18 by A-387).**
 > The boot probe let a Windows waiter's announcement stand in for its sleep, and the shards' online estimate learned
 > kicks that met a thread not yet blocked. Both measured a handoff, 0.14–0.85 µs, so the idle window (100 times it) was
 > 14–80 µs and owner shards parked between a single client's creates. Now the probe kicks only once the waiter's cycle
@@ -1375,10 +1381,14 @@
 >     M4 Max at nine shards, with the hold set to none, the median create was 41.3–43.3 against 51.4–60.0 µs at an equal
 >     p99 (92.3 and 92.0 µs at the median), the process's CPU 1.65 against 2.9 cores, and beside two spinners a logical
 >     CPU the p99 1.34 against 1.87 ms; the quiet nine-shard p999 was 128.6 against 108.6 µs at the median, the spreads
->     overlapping (BENCHMARKS, "The closed-loop hold on macOS"). Now macOS holds none (`config::closed_loop_hold`); Linux
->     and Windows keep the hold. On the 32-CPU Studio at 23 shards every unheld run beat every held one (p50 44.7–64.5
->     against 94.4–115.2 µs, p99 147.6–249.3 against 256.0–376.0 µs, 1.9–2.2 against 3.4–5.8 cores). Record:
->     `docs/bugs/2026-11-18-a-held-macos-shard-napped-instead-of-polling.md`.
+>     overlapping (BENCHMARKS, "The closed-loop hold on macOS"). On the 32-CPU Studio at 23 shards every unheld run beat
+>     every held one (p50 44.7–64.5 against 94.4–115.2 µs, p99 147.6–249.3 against 256.0–376.0 µs, 1.9–2.2 against
+>     3.4–5.8 cores). The first fix fixed the hold at none on macOS by `#[cfg]`; it is replaced by the shard's own
+>     measurement: an owner keeps a hold only while the idle turn a request meets, learned from every turn of its idle
+>     spins as E[T²]/E[T], is shorter than its wake estimate (`slates_rt::held_turn`), so a macOS shard declines, a Linux
+>     or Windows shard holds, and any shard whose polls nap or are preempted under load stops holding. **Owed:** this
+>     rule's A/B against main (run request of 2026-11-18: `provision_bench` and the closed loop on the quiet M4 Max and
+>     the 23-shard Studio). Record: `docs/bugs/2026-11-18-a-held-macos-shard-napped-instead-of-polling.md`.
 >   - **Open: a macOS single client over many shards still misses R9's 50 µs** (2026-11-18, after A-387): p99 84.6–152.5
 >     µs at nine shards on the quiet M4 Max and 147.6–249.3 µs at 23 on the shared 32-CPU Studio, unheld. Not yet
 >     measured apart: the client's own shard napping 12–15 µs a turn through R9's window (A-218 kept it for its loaded
@@ -1396,7 +1406,9 @@
 >   16,384 racing parks a run on CI's Windows runners, main learned 11–48 of those that never switched out, the fix
 >   none (`diag-liveness-client-4`, 10 runs a tree); the parked bench form's client estimate read 17–33 µs before and
 >   after. Seen on the way: `presentation.rs` failed on Windows (`Unsupported { feature: "landing" }`, no Windows
->   landing writer, A-262), on main's code too, where CI never ran it; it now builds on Unix only, as the verb does.
+>   landing writer, A-262), on main's code too, where CI never ran it; it built on Unix only, as the verb did, until the
+>   Windows writer (A-185, 2026-11-18), with which it passes on CI's windows-latest (run 44367197015) and both Windows
+>   lanes run it.
 
 > **A parked Windows shard in a job that fixes its priority class still waits out its neighbours' turns (2026-11-18,
 > A-361's open item; OPEN).** A-361 raises a shard one priority level while it is blocked in its completion port, since a
@@ -1434,9 +1446,9 @@
 > B per entry, unchanged). winfstest's 18 ATTRIBUTES cases come off its list (373 to 355). The Windows base plane reads
 > them since stage 3's base half: a fingerprint carries the disk's bits apart from a DrvFs-mapped mode (until then the
 > Windows base reported the attribute word itself as the mode, `0x20` as `0o040`). **Still owed under A-262:** a Windows
-> landing applying them (it waits on a Windows landing writer, which does not exist; Linux and macOS carry them
-> unapplied), and the merge's dimension, owed when works are mountable (no work can set the bits today, so no merge
-> drops them).
+> landing applying them (the Windows writer exists since A-185, 2026-11-18: it sets a file's `READONLY` from its mode
+> and keeps every other bit the file holds, applying none of the volume's; Linux and macOS carry them unapplied), and
+> the merge's dimension, owed when works are mountable (no work can set the bits today, so no merge drops them).
 
 > **A file removed while open over NFSv4 was reclaimed at once, and the client renamed it aside: fixed (2026-11-08,
 > §4.6 NFSv4 state; A-260).** An NFSv4 open held nothing in the volume, so a REMOVE of an open file reclaimed it (its
@@ -1666,8 +1678,10 @@
 > **CI coverage on every platform (2026-11-06, VFS plan Step 15).** `docs/wip/ci-matrix.md` lists every test target of
 > the workspace (319: lib, bin and tests) against the lanes that run it.
 > - **Now run on both Windows lanes:** `crates/server/tests/fleet.rs`, which was `cfg(unix)` as a whole. Only its
->   virtio-fs guest test stays Unix-only, and it runs one test at a time. `slates-server`'s unit tests join it with the
->   Windows landing writer (two landing tests fail there until it lands; the step is `agents/release-wincov-lib`). On CI's Windows runners (4 logical CPUs, 16 GB each; diagnostics run
+>   virtio-fs guest test stays Unix-only, and it runs one test at a time. `slates-server`'s unit tests run on both lanes
+>   too since the Windows landing writer (A-185, 2026-11-18), one test at a time: 368 passed and 3 ignored on both
+>   runners (run 44371955995). The two landing tests that kept them off, asking Windows for a landing it refused, now
+>   live in `presentations.rs`, which both lanes run with the other landing suites. On CI's Windows runners (4 logical CPUs, 16 GB each; diagnostics run
 >   42340483175, 2026-11-07), the fleet suite passed whole on both architectures: 85 passed, 3 ignored, in 418 s
 >   (x86_64) and 365 s (arm64). This was with liveness's UDP-reset fix merged in.
 > - **Open: six fleet tests fail on jupiter** (Windows x86_64, 32 logical CPUs, 128 GB, other projects running,
@@ -4182,8 +4196,12 @@
 >   20261116.315.1 (Visual Studio 18.12) beside 20261103.298.1 (18.11), the tag `v0.1.0`'s two x86_64 copies landed on
 >   different images and differed in 2,559,679 of 15,139,328 bytes, while each image built the same bytes every time
 >   (d3498b4f twice, 871a057d three times, test 4's included; run 44347535833). The artifacts task now names both images
->   in its refusal, and one copy is run again until the pair shares an image. Owed: pin the MSVC toolset and the
->   Windows SDK the Windows binaries link, so a tag's bytes do not depend on which image a runner has.
+>   in its refusal, and one copy is run again until the pair shares an image. Since A-411 (2026-11-18) the release's
+>   Windows builds pin MSVC toolset 14.44 and Windows SDK 10.0.26100.0, which both images and the arm64 one carry: the
+>   two binaries' Rich headers differed only in the default toolset's tools (linker 14.51.36260 against 14.52.37029,
+>   its runtime objects 35721 against 36815), the SDK's 204 objects alike. Owed: the first release run across two
+>   images with the pin (run request of 2026-11-18); clang-cl, which builds AWS-LC's C on arm64, still comes from
+>   the image.
 > - **Reproducible from the tag (2026-11-05, AC-9.5).** Every target is built twice on separate runners, and the
 >   release is refused unless the two copies are the same bytes. The four Linux binaries already were. The Windows
 >   ones differed in 20 bytes, the linker's timestamps and PDB GUID (run 42046848954), until `/Brepro`; with it, all six
@@ -7142,8 +7160,10 @@ Deviations and owed items from tasks 11–13:
   `clonefile` arrive with the manifest's own hash index of identical files.
 - The directory sync strategy is one `fsync` per touched directory; the `syncfs` alternative
   waits on the measured per-directory cost the report now carries (`Durability.dir_sync_ns`).
-- Windows has no OS writer yet (`FileRenameInfoEx` with `POSIX_SEMANTICS`, the sharing-mode
-  verify): the Windows bridge of Phase 4; the crate compiles there without the `os` module.
+- ~~Windows has no OS writer yet (`FileRenameInfoEx` with `POSIX_SEMANTICS`, the sharing-mode
+  verify): the Windows bridge of Phase 4; the crate compiles there without the `os` module.~~ Closed 2026-11-18 by
+  A-185: `crates/land/src/os_windows.rs`, handle-relative over NTFS (`FileRenameInformationEx` with POSIX semantics
+  through the NT call, since Win32's refused a name relative to a handle).
 - `TargetIsVolume` is not checked: there is no mount table before Phase 3.
 - The real-target tests and the OS rows of the bench run in the Linux lane; on this machine
   they skip loudly (no RAM disk authorized), so their first numbers are the lane's.
@@ -18228,6 +18248,27 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   hand-off test passes in each of 6 (no later child inherits the end, against an inheritable copy's contrast), and the
   client Shards suite 11 of 11 in each of 3, with the hostile holder test. All are red-checked. **Owed:** arm64 Windows
   runs `stream_spawn` but not the CLI test (its lane builds no `slates-cli`).
+- **Landing on Windows (A-185; built 2026-10-26 by another session, landed 2026-11-18):** `slates-land` has a Windows
+  write seam (`crates/land/src/os_windows.rs`), handle-relative over NTFS, and the server lands on Windows: no landing
+  verb answers `Unsupported` there any more. Both Windows lanes run the land suite, `slates-server`'s unit tests (one at
+  a time), the landing suites through the daemon, the client's `presentation.rs` and the MCP surface. Proven on CI's
+  windows-latest and windows-11-arm on main 53353e5e8 with the change merged (run 44371955995): the land suite whole,
+  the daemon's unit tests 368 passed and 3 ignored, `presentations.rs` 10 of 10 (the two landing tests that kept the
+  unit tests off the Windows lanes), the other landing suites through the daemon, and the client and MCP tests. Found and fixed
+  on the way: the owner check compared the target's owner with the token's user alone, which refused every directory an
+  elevated process made (`BUILTIN\Administrators` owns them; now the token's default owner too); NTFS sets `ARCHIVE`
+  on a rename and a backup clears it (the engine's move check sets it aside); NTFS tunneling gives a renamed file the
+  creation time of the name's last holder (set aside likewise); a target on the daemon's own WinFsp drive is refused
+  before any open (A-227). The 2026-10-26 finding that base modes were raw attributes was fixed meanwhile by A-262.
+  Red-checked on windows-latest (run 44367207034): the `ARCHIVE` set-aside and the default owner each; the own-drive
+  refusal passes on both runners (run 44376034930), its red-check filed for main's run.
+  **Owed:** `crates/server/tests/audit_crossing.rs` (main's, 2026-11-18) is gated to Unix only for its landing target
+  and has not run on Windows: lift its gate once a Windows run passes it; a symbolic link in a landing on Windows
+  (refused `EPERM`: no unprivileged, handle-relative way to make one);
+  a reflink (`FSCTL_DUPLICATE_EXTENTS_TO_FILE` on ReFS); A-262's landing half (the volume's other attribute bits); and
+  the seam's numbering: refusals the engine tells apart are POSIX numbers and the rest Win32 codes, so a Win32 code equal
+  to one of the engine's numbers (`ERROR_NOT_SAME_DEVICE` 17, `ERROR_INSUFFICIENT_BUFFER` 122, among five) would read as
+  that refusal; none of the writer's calls is known to answer one, and a typed refusal at the seam would close it.
 - **Windows' DAX window built (G-shards-windows step 5, A-180, 2026-10-26):** a descriptor ask on a Windows stream
   names the asking process and its stream handle there. The daemon checks the handle is this stream's own object, by
   `CompareObjectHandles` against a known holder, never by a name query, which hung past 3 s on a synchronous pipe with

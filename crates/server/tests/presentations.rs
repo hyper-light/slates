@@ -11,8 +11,7 @@
   clippy::indexing_slicing,
   clippy::unwrap_in_result
 )]
-// A real landing target on the host's disk: macOS and Linux.
-#![cfg(unix)]
+// A real landing target on the host's disk, on every platform since the Windows writer (A-185).
 
 use std::collections::BTreeMap;
 
@@ -26,7 +25,7 @@ use slates_server::daemon::OBSERVE_BUDGET_NS;
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 mod common;
-use common::client::{connect, scratch};
+use common::client::{channel_account, connect, scratch};
 use common::landing::GRANT_TERM_NS;
 use common::lease::{hold, lease_key_of, release};
 use common::target::target_dir;
@@ -428,16 +427,17 @@ fn expect_only_its_presenter_reads_the_list(
   client: &mut Client,
   (landing, manifest): (u64, [u8; 32]),
 ) -> Client {
-  // A consumer of another principal: the list is not its to read.
+  // A consumer of another principal: the list is not its to read. It is enrolled under the host account the daemon
+  // authenticated the workload's channel as, which the channel then attests to.
   let secret = daemon.segment().issuer_secret().unwrap();
-  let account = rustix::process::getuid().as_raw();
+  let mut workload = connect(instance);
+  let account = channel_account(daemon, workload.client_id());
   let (consumer, capability) = client
     .enroll(
       account,
       slates_server::landing::enroll_proof(&secret, account),
     )
     .unwrap();
-  let mut workload = connect(instance);
   workload.attest(consumer, &capability).unwrap();
   let other = workload.landing_entries(landing, manifest);
   assert!(

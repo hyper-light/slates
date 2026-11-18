@@ -7,8 +7,8 @@
 //! (docs/bugs/2026-09-29-a-landing-of-a-named-snapshot-landed-the-live-head.md).
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-// The daemon's NFS loopback transport and a real landing target: macOS and Linux.
-#![cfg(unix)]
+// The daemon's NFS loopback transport (served on Windows too, A-184) and a real landing target, on every platform since
+// the Windows writer (A-185).
 
 use std::net::TcpStream;
 

@@ -1910,6 +1910,58 @@ fn a_base_on_the_daemons_own_drive_is_refused_before_any_open() {
   assert_eq!(code, 0, "unmount: {err}");
 }
 
+/// A-227 and A-185, a landing's target on Windows (§4.6: no daemon thread opens a path on a volume the daemon serves).
+/// Do: on a one-shard daemon, mount a volume at a free drive, make a directory on it, and present a landing of a second
+/// volume into that directory. Expect: refused at once (exit 1, `OwnMount`), the directory untouched, and the daemon
+/// still answering. Until the Windows writer (A-185) every landing on Windows was refused `Unsupported`; with the
+/// writer, a target walk that did not ask whose drive it walks would open the target through the daemon's own drive and
+/// wait on the request only that daemon can answer.
+#[test]
+fn a_landing_target_on_the_daemons_own_drive_is_refused_before_any_open() {
+  if !live_mount_runs() {
+    return;
+  }
+  let instance = instance("ownland");
+  let _anchor = start_anchor_of(&instance, ONE_SHARD);
+  let created = |name: &str, size: &str| {
+    let (code, out, err) = run(&instance, &["volume", "create", name, "--bounded", size]);
+    assert_eq!(code, 0, "{err}");
+    value_of(&out, "id")
+  };
+  let mounted = created("mounted", "64MiB");
+  let landed = created("landed", "8MiB");
+  let drive = free_drive_letter();
+  let (code, _, err) = run(&instance, &["mount", &mounted, &drive]);
+  assert_eq!(code, 0, "mount: {err}");
+  wait_ready(&format!("{drive}\\"));
+  let target = format!("{drive}\\target");
+  cmd(&["mkdir", &target]);
+  let landing = ["land", &landed, &target, "--json"];
+  let Some((code, out, err)) = run_within(&instance, &landing, OWN_MOUNT_ANSWER) else {
+    panic!(
+      "the daemon did not answer a landing target on its own drive within {OWN_MOUNT_ANSWER:?}: it walked the \
+       target through its own drive and waits on itself"
+    );
+  };
+  assert_eq!(
+    code, 1,
+    "a landing target on the daemon's own drive is refused: {err} {out}"
+  );
+  assert!(
+    err.contains("OwnMount"),
+    "refused as the daemon's own mount: {err}"
+  );
+  assert_eq!(
+    std::fs::read_dir(&target).unwrap().count(),
+    0,
+    "the target is untouched"
+  );
+  let (code, _, err) = run(&instance, &["volume", "list"]);
+  assert_eq!(code, 0, "the daemon still answers: {err}");
+  let (code, _, err) = run(&instance, &["unmount", &drive]);
+  assert_eq!(code, 0, "unmount: {err}");
+}
+
 /// Runs `cmd /C` with `args`, asserting it succeeded: the Windows shell's own `mkdir`, `mklink` and `rmdir`, so the test
 /// makes its host directories and junctions without a file write of its own.
 fn cmd(args: &[&str]) {
