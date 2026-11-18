@@ -1006,7 +1006,7 @@ const ROUND_ANCHORS: RoundAnchors = RoundAnchors {
 ///   gathers no new reply for as long as a peer may go unheard before it is suspected — or for one round-trip
 ///   tail, whichever is longer — is judged stalled, not merely slow, and is left to time out at its current
 ///   deadline.
-fn consensus_budget(slowest_tail_ns: Option<u64>) -> CommitBudget {
+pub(crate) fn consensus_budget(slowest_tail_ns: Option<u64>) -> CommitBudget {
   round_budget(&ROUND_ANCHORS, slowest_tail_ns)
 }
 
