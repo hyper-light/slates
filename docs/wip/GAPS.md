@@ -32,12 +32,15 @@
 > - **Not this entry: the x86_64 runs of the same seeds** ended two daemons each by their watchdogs ("shard N is
 >   spinning, 1000 ms of CPU without a step") right after the supersession, so the dead nodes' copies read none: the
 >   live takeover's materialization in one turn, g251's item, as seed 17036665960917068132.
-> - **Open: a superseded owner's shipper that is never told its fence ships on.** In 2 of 12 runs of the third node's
->   case (CI diag 44358084443) the re-admitted adopter's own log of the volume, yielded but never fenced, built 119 and
->   1,714 installs for the creator, which refused each `not_the_acting_owner`; the adopter never learned its fence from
->   those answers, though the creator's copy was fenced above it. A-349 stops a fenced log only. Next: why that answer
->   does not fence the sender (`live_ship::not_served`, `Shipper::on_reply`), and whether a yielded log should stop
->   as a fenced one does (its waiting writers then need a refusal of their own).
+> - **Fixed (A-409, 2026-11-18): a superseded owner's shipper that was never told its fence shipped on.** In 2 of 12
+>   runs of the third node's case (CI diag 44358084443) the re-admitted adopter's own log of the volume, yielded but
+>   never fenced, built 119 and 1,714 installs for the creator, which refused each `not_the_acting_owner`. Now a yielded
+>   volume's log ships nothing and does no period work, as a fenced one (A-349), its waiting verbs answered
+>   `DurabilityPending` at the yield (`live_ship::yielded`, counted `fleet.live.yield_refused`); and a holder refusing a
+>   stale sender tells it the highest fence it knows, its record copy's as well as its live copy's
+>   (`live_ship::known_fence`), so a sender below it is fenced. Why no refusal fenced it in that run is not read from
+>   its counters (the creator's live copy showed fence 3 against the adopter's 2 at the end); the run that shows the
+>   storm gone is filed for main (run-requests.md).
 > - **Owed: the let-go and the yield survive a warm restart only once published.** The let-go rides the control shard's
 >   next publication; a warm restart before it restores the copies and routes them to this host again; and the yield
 >   is memory-only (`ShardState::yielded`), so a warm restart forgets that the node lost the volume at all (A-334).
