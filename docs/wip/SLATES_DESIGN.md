@@ -32559,8 +32559,11 @@ Unix sibling built); and:
   -- -D warnings` clean for `slates-anchor`, `slates-server` and `slates-cli` on macOS and, through `cargo xwin`, for
   `slates-anchor` and `slates-server` on Windows; `cargo xwin check` of `slates-cli`'s tests clean; `cargo xtask`'s
   structural, unsafe, version, toolchain and capabilities checks pass, and its literal check finds nothing in this
-  change's files (its five findings are in `crates/base/src/s3/list.rs`, main's `125d07953`, filed for main). The
-  x86_64 Linux check and the real-process restarts are filed for main.
+  change's files (its five findings are in `crates/base/src/s3/list.rs`, main's `125d07953`, filed for main). For
+  Linux, from the Mac: `cargo clippy` of `slates-anchor`'s lib for x86_64 and aarch64 Linux clean (its tests and
+  `slates-server` need a Linux C toolchain), and the Linux-only `held_copy_replay.rs` type-checks with its gate widened
+  in a scratch copy. The x86_64 Linux `cargo check` of both crates waited behind the one Linux runner's load and is filed
+  for main, with the real-process restarts.
 - **Found beside it, and fixed in the same landing** (main's workspace clippy and `xtask check`, r343): four findings in
   `handles.rs` (a test past the complexity bound, a constant assertion, a string sliced by index, and
   `WHAT_SHARDS_DAX`'s `Format:` line out of the literal check's four-line reach); the same kinds in this change's
