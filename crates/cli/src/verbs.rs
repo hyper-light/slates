@@ -205,28 +205,34 @@ fn mount_verb(
 
 /// `unmount` on Windows (§4.6 "Windows"): the WinFsp volume at drive `path` is the daemon's own, so the library finds
 /// its attachment among the volumes' reported mounts and detaches it; a volume whose status was refused cannot report
-/// its mounts and is named on standard error, and the drive is still released when another volume reports it.
+/// its mounts and is named on standard error, whether or not the drive is released (another volume reports it). The
+/// names went missing from a released drive's unmount when the CLI moved onto the library (A-278) and came back on
+/// 2026-11-18 (the integrator's Windows lane, run 44257181904).
 #[cfg(windows)]
 fn unmount_verb(instance: &str, path: &str) -> Result<(), Failure> {
   let mut attached = Instance::from_client(instance, connect(instance)?);
   match attached.unmount(path) {
-    Err(slates_api::Error::Mount(slates_api::MountFault::NotMounted { path, unreported }))
-      if !unreported.is_empty() =>
-    {
-      for volume in &unreported {
-        slates_machine::log_line!(
-          "slates: volume {} ({}) refused {}: its mounts are unknown",
-          volume.name,
-          slates_api::volume_id_text(volume.volume),
-          volume.refusal
-        );
-      }
+    Ok(unmounted) => {
+      name_the_unasked(&unmounted.unreported);
+      Ok(())
+    }
+    Err(slates_api::Error::Mount(slates_api::MountFault::NotMounted { path, unreported })) => {
+      name_the_unasked(&unreported);
       Err(failure_of_api(
         slates_api::Error::Mount(slates_api::MountFault::NotMounted { path, unreported }),
         instance,
       ))
     }
-    other => other.map_err(|e| failure_of_api(e, instance)),
+    Err(refused) => Err(failure_of_api(refused, instance)),
+  }
+}
+
+/// Names on standard error each volume a Windows unmount could not ask, with its status's refusal: its mounts are
+/// unknown.
+#[cfg(windows)]
+fn name_the_unasked(unreported: &[slates_api::Unreported]) {
+  for volume in unreported {
+    slates_machine::log_line!("slates: {volume}: its mounts are unknown");
   }
 }
 
@@ -1663,6 +1669,8 @@ pub(crate) fn run_shards(request: &ShardsRequest) -> Result<(), Failure> {
     attachment: shards.attachment.attachment,
     stream: shards.stream,
     at: request.handed,
+    resync: shards.resync,
+    resync_at: request.resync_at,
   };
   hand_to(client, OsStr::new(program), args, handed)
 }
@@ -1680,6 +1688,12 @@ struct Handed {
   stream: slates_client::StreamEnd,
   /// Where the command finds it.
   at: crate::args::HandOff,
+  /// The stream's resync end, when the daemon handed one (A-316).
+  #[cfg_attr(windows, allow(dead_code))]
+  resync: Option<slates_client::StreamEnd>,
+  /// Where the command finds its resync end, when it asked for one (`--resync-fd`).
+  #[cfg_attr(windows, allow(dead_code))]
+  resync_at: Option<i32>,
 }
 
 /// Replaces this process with `program`, the stream end at the descriptor number `handed` names
@@ -1700,11 +1714,31 @@ fn hand_to(
     ));
   };
   let args: Vec<OsString> = args.iter().map(OsString::from).collect();
-  let error = slates_ipc::stream::exec_with(program, &args, handed.stream, at);
+  let mut ends = vec![(handed.stream, at)];
+  if let Some(resync_at) = handed.resync_at {
+    ends.push((resync_end(handed.resync)?, resync_at));
+  }
+  let error = slates_ipc::stream::exec_with_ends(program, &args, ends);
   Err(Failure::Failed(format!(
     "shards: running {} with its end at descriptor {at}: {error}",
     program.to_string_lossy()
   )))
+}
+
+/// The resync end a command that asked for one is handed (A-316): the daemon's, or, where the daemon handed none (a
+/// platform with no resync yet, a stream served without one), a channel already ended, so the command reads its end at
+/// once and knows, as it would from the daemon's, that no resync will come.
+#[cfg(unix)]
+fn resync_end(
+  handed: Option<slates_client::StreamEnd>,
+) -> Result<slates_client::StreamEnd, Failure> {
+  if let Some(handed) = handed {
+    return Ok(handed);
+  }
+  let (ended, end) = slates_ipc::stream::message_pair()
+    .map_err(|e| Failure::Failed(format!("shards: an ended resync channel: {e}")))?;
+  drop(ended);
+  Ok(end)
 }
 
 /// Starts `program` holding the stream end as a handle named where `{handle}` stands in `args`

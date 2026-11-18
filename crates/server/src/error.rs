@@ -6,7 +6,7 @@ use std::fmt;
 use slates_anchor::AnchorError;
 use slates_db::DbError;
 use slates_ipc::IpcError;
-use slates_ipc::protocol::Refusal;
+use slates_ipc::protocol::{Refusal, VolumeRefusal};
 use slates_mem::MemError;
 use slates_rt::RtError;
 use slates_vfs::error::VfsError;
@@ -153,10 +153,56 @@ pub fn refusal_of_vfs(e: &VfsError) -> Refusal {
     VfsError::TreeTooDeep { limit } => Refusal::Unsupported {
       feature: format!("archiving a tree deeper than {limit} path components"),
     },
-    other => Refusal::BadRequest {
-      reason: format!("{other:?}"),
+    VfsError::BarrierIncomplete {
+      attachment,
+      generation,
+    } => Refusal::BarrierIncomplete {
+      attachment: *attachment,
+      generation: *generation,
     },
+    // Every other refusal of the volume core, typed by its class (A-299): until 2026-11-18 each reached a client as
+    // `BadRequest` carrying its name. No catch-all: a new volume-core refusal does not compile until it is named.
+    VfsError::Memory(_) => volume(VolumeRefusal::Memory),
+    VfsError::NotDirectory => volume(VolumeRefusal::NotDirectory),
+    VfsError::IsDirectory => volume(VolumeRefusal::IsDirectory),
+    VfsError::NotEmpty => volume(VolumeRefusal::NotEmpty),
+    VfsError::Invalid => volume(VolumeRefusal::Invalid),
+    VfsError::NoAttribute => volume(VolumeRefusal::NoAttribute),
+    VfsError::NotPermitted => volume(VolumeRefusal::NotPermitted),
+    VfsError::LinkProtected => volume(VolumeRefusal::LinkProtected),
+    VfsError::SpecialFileOperation => volume(VolumeRefusal::SpecialFileOperation),
+    VfsError::TooManyLinks => volume(VolumeRefusal::TooManyLinks),
+    VfsError::FileTooLarge => volume(VolumeRefusal::FileTooLarge),
+    VfsError::CrossVolumeMove => volume(VolumeRefusal::CrossVolumeMove),
+    VfsError::StaleHandle => volume(VolumeRefusal::StaleHandle),
+    VfsError::Pinned => volume(VolumeRefusal::Pinned),
+    VfsError::DaxMapped => volume(VolumeRefusal::DaxMapped),
+    VfsError::BaseDrift => volume(VolumeRefusal::BaseDrift),
+    VfsError::NotOverlay => volume(VolumeRefusal::NotOverlay),
+    VfsError::DigestCacheFull => volume(VolumeRefusal::DigestCacheFull),
+    VfsError::JournalIncomplete { needed, oldest } => volume(VolumeRefusal::JournalIncomplete {
+      needed: *needed,
+      oldest: *oldest,
+    }),
+    VfsError::RecoveryVersion { found, expected } => volume(VolumeRefusal::RecoveryVersion {
+      found: *found,
+      expected: *expected,
+    }),
   }
+}
+
+/// A volume-core refusal no other variant names, typed (A-299).
+fn volume(refusal: VolumeRefusal) -> Refusal {
+  Refusal::Volume { refusal }
+}
+
+/// The wire refusal for a memory refusal met outside the volume core: a reservation's at admission (bytes, version
+/// slots, the metadata ledger) or a registry's (§4.2). The volume core's own table types it, as it types
+/// `VfsError::Memory`: the budget's refusal names what is available, the lock's what it locked, and every other is the
+/// typed memory refusal. Until 2026-11-18 eleven admission arms and a full registry answered in words, `BadRequest`
+/// carrying the error's text (A-299's sibling sweep).
+pub fn refusal_of_mem(e: &MemError) -> Refusal {
+  refusal_of_vfs(&VfsError::Memory(e.clone()))
 }
 
 /// The wire refusal for a database refusal.
@@ -183,8 +229,58 @@ pub fn refusal_of_db(e: &DbError) -> Refusal {
         reason: format!("{unpublished}"),
       }
     }
+    DbError::Memory(e) => refusal_of_mem(e),
     other => Refusal::BadRequest {
       reason: format!("{other}"),
     },
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use slates_ipc::protocol::{Refusal, VolumeRefusal};
+  use slates_mem::MemError;
+
+  use super::refusal_of_mem;
+
+  /// A-299's sibling sweep (2026-11-18): do map a memory refusal of each shape admission meets (the budget's, the
+  /// lock's, a full slab or registry, an exhausted arena, an OS refusal). Expect each typed: the budget's with what is
+  /// available, the lock's with what it locked, the rest the volume core's memory refusal; none in words.
+  #[test]
+  fn every_memory_refusal_at_admission_is_typed() {
+    assert_eq!(
+      refusal_of_mem(&MemError::BudgetExceeded {
+        requested: 6,
+        available: 7
+      }),
+      Refusal::BudgetExceeded { available: 7 }
+    );
+    assert_eq!(
+      refusal_of_mem(&MemError::LockRefused {
+        requested: 8,
+        locked: 9,
+        code: None
+      }),
+      Refusal::BudgetExceeded { available: 9 }
+    );
+    for memory in [
+      MemError::SlabFull { capacity: 3 },
+      MemError::ArenaExhausted {
+        requested: 4,
+        largest_free: 5,
+      },
+      MemError::OsRefused {
+        call: "mmap",
+        code: None,
+      },
+    ] {
+      assert_eq!(
+        refusal_of_mem(&memory),
+        Refusal::Volume {
+          refusal: VolumeRefusal::Memory
+        },
+        "{memory:?}"
+      );
+    }
   }
 }

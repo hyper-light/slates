@@ -21,7 +21,7 @@
 
 use crate::error::Error;
 use crate::instance::Instance;
-use crate::mount::{MountOptions, Mounted};
+use crate::mount::{MountOptions, Mounted, Unmounted};
 use crate::volume::{Provisioned, VolumeSpec};
 use slates_client::ShardsStream;
 use slates_ipc::protocol::{Intent, SnapshotId, VolumeId, VolumeSummary};
@@ -60,8 +60,8 @@ pub trait Volumes {
     options: &MountOptions,
   ) -> Result<Mounted, Error>;
 
-  /// [`Instance::unmount`]: the mount at `path` removed.
-  fn unmount(&mut self, path: &str) -> Result<(), Error>;
+  /// [`Instance::unmount`]: the mount at `path` removed, with each volume a Windows scan could not ask.
+  fn unmount(&mut self, path: &str) -> Result<Unmounted, Error>;
 
   /// [`Instance::detach`]: an attachment (a mount's, a stream's) ended.
   fn detach(&mut self, attachment: u64) -> Result<(), Error>;
@@ -106,7 +106,7 @@ impl Volumes for Instance {
     Instance::mount(self, volume, path, options)
   }
 
-  fn unmount(&mut self, path: &str) -> Result<(), Error> {
+  fn unmount(&mut self, path: &str) -> Result<Unmounted, Error> {
     Instance::unmount(self, path)
   }
 

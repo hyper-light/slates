@@ -40,12 +40,14 @@ missing. Writes were never at risk: the copy's shipper was fenced, so a write th
   it carries a newer epoch for the same host, yields every volume the shard catalogues (`ShardState::yielded`, counted
   `fleet.readmission.yielded`). Both run-time installs use it: the control shard's (`fleet::sync_config_from_council`)
   and every other shard's fanned one (`fleet`'s `Fan::install`).
-- `crates/server/src/verbs.rs`: `owned_by_another_host` forwards a verb on a yielded volume, whoever created it and
-  whatever the catalog holds; `lease_verdict` refuses a yielded object's latest state (`LeaseVerdict::Yielded`,
-  counted `lease.refused.yielded`), so a mount or a peer's forward still naming this node never reads the copy.
-- `crates/server/src/owner_location.rs`: `Query::known_owner` never names this node, so a yielded volume's forward
-  takes the location round, where the successor claims it.
-- `crates/server/src/lease.rs`: `LeaseVerdict::Yielded`, `LEASE_YIELDED`.
+- `crates/server/src/verbs.rs`: `lost_to_a_successor`, a yielded volume or one whose live log was fenced at a later
+  epoch (A-338, which landed first with the fence alone); `owned_by_another_host` forwards a verb on either, whoever
+  created it and whatever the catalog holds; `lease_verdict` refuses either's latest state
+  (`LeaseVerdict::LostToSuccessor`, counted `lease.refused.lost_to_successor`), so a mount or a peer's forward still
+  naming this node never reads the copy.
+- `crates/server/src/owner_location.rs`: `Query::known_owner` (asking this node's routing first, A-338) never names this
+  node, so such a volume's forward takes the location round, where the successor claims it.
+- `crates/server/src/lease.rs`: `LeaseVerdict::LostToSuccessor`, `LEASE_LOST_TO_SUCCESSOR`.
 - `crates/server/tests/fleet.rs`: `an_owner_admitted_again_forwards_the_volume_its_successor_took_over_and_never_serves_its_own_copy`
   (both survivors judge a live volume's owner dead though it lives; a survivor takes the volume over and writes a second
   file; the owner refutes and is admitted again; every read of the second file through it answers the bytes or a

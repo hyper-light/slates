@@ -30,6 +30,9 @@ pub(crate) struct HeldDevice {
   pub(crate) device: OwnedFd,
   /// What its connection negotiated.
   pub(crate) session: Option<Session>,
+  /// The session's bytes as the anchor kept them: a Shards stream's resync end keeps its token and owner view there
+  /// (A-316; `crate::shards`), which the attachment's record, not these bytes, says it is.
+  pub(crate) raw_session: Option<Vec<u8>>,
 }
 
 impl HeldDevice {
@@ -54,6 +57,7 @@ pub(crate) fn split(handed: Vec<HandedDevice>, partitions: usize) -> Vec<Vec<Hel
       attachment: handed.attachment,
       device: handed.device,
       session,
+      raw_session: handed.session,
     };
     let partition = usize::from(crate::verbs::owner_of_attachment(handed.attachment));
     match split.get_mut(partition) {

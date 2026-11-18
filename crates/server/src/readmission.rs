@@ -20,7 +20,7 @@
 //! **The rule.** When a configuration a shard installs at run time carries a newer epoch for this same host, the shard
 //! marks every volume it catalogues as yielded (`ShardState::yielded`). A client's verb on a yielded volume is forwarded
 //! to its successor through the location round. Its latest state is refused here whatever the lease says
-//! ([`crate::lease::LeaseVerdict::Yielded`]), so a mount or a peer's forward that still names this node never reads the
+//! ([`crate::lease::LeaseVerdict::LostToSuccessor`]), so a mount or a peer's forward that still names this node never reads the
 //! stale copy. A host's first epoch is [`slates_db::register::FIRST_EPOCH`], and a restarted daemon is a new member at
 //! it, so a boot's install never yields. A yielded volume stays yielded: a later takeover that names this node its
 //! successor again finds the id present and keeps the stale copy (`verbs::materialize_taken_over`), so serving it
