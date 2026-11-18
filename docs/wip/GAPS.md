@@ -11249,8 +11249,11 @@ since A-402, which also makes the log option 2 names available to the WinFsp dri
 >      through the host, copying the file up first, as the bridge did
 >      (`a_replayed_write_into_an_overlays_base_file_keeps_the_disks_bytes_around_it`, red once without the fix: byte 0
 >      differed; `docs/bugs/2026-11-18-a-replayed-write-into-an-overlays-base-file-zeroed-the-bytes-before-it.md`).
->   3. When the log is full, its forced publication counts the write as logged only if it left nothing out. A captured
->      volume's write is then reported lost, though the image holds it.
+>   3. **Fixed 2026-11-18 (A-436):** when the log was full, its forced publication counted the write as logged only if
+>      it left nothing out, so a captured volume's write marked the overflow and was reported lost though the image held
+>      it. The write is now settled by its own volume: captured, the image keeps it; left out, it is appended again into
+>      the room the retain gave back
+>      (`docs/bugs/2026-11-18-a-full-logs-forced-publication-reported-a-captured-volumes-write-as-lost.md`).
 > - **Record.** `docs/bugs/2026-11-18-a-left-out-volumes-logged-writes-were-dropped-at-the-next-restart.md`.
 
 ### 2026-10-06: restarts are a few milliseconds for every client (A-113 follow-ups, A-114)

@@ -2917,6 +2917,15 @@ before the report is published, so a tool never reads attributes newer than the 
 > zeros. `verbs::replay_one` now writes an overlay's record as the bridge does: the file copied up and its windows read
 > from the disk first. Proven by `a_replayed_write_into_an_overlays_base_file_keeps_the_disks_bytes_around_it`
 > (`docs/bugs/2026-11-18-a-replayed-write-into-an-overlays-base-file-zeroed-the-bytes-before-it.md`).
+> **A full log's forced publication settles a write by its own volume (2026-11-18, A-436).** A write the log has no room
+> for forces a publication. That write counted as logged only when the publication left no volume out, so one that left
+> out another volume marked the overflow for a write its image held, and every taken-over file was reported as having
+> lost writes. The write now counts as kept when the publication captured its volume, and is appended again when the
+> publication left its volume out, since A-422's retain gave the room back; only a write nothing keeps marks the
+> overflow (`write_log::log_acknowledged_write`, which the FUSE mount and the Shards stream share). A `FORGET` is kept
+> the same way. Proven by `a_full_logs_forced_publication_keeps_a_captured_volumes_write_and_reports_no_loss` and
+> `a_full_logs_forced_publication_appends_a_left_out_volumes_write_again`
+> (`docs/bugs/2026-11-18-a-full-logs-forced-publication-reported-a-captured-volumes-write-as-lost.md`).
 > **The takeover round is built (2026-10-23, A-158).** A restored mount tells its kernel what its predecessor may not
 > have: the epoch bump and an invalidation of the root and of every restored reference and replayed inode, in slices.
 > Proven on Linux 7.2.9 through the real binary, each test red with the change's files at the previous commit:
@@ -30519,3 +30528,29 @@ Applied in the same change to:
   look, the verb released. The green owner's flows and the load rungs that park verbs are filed for main's run.
 
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class A), `crates/server/src/work_home.rs`.
+
+### A-436 — A full write log's forced publication settles the write it could not take by the write's own volume (2026-11-18, goal g268; found by reading in A-422's sibling sweep; §4.6 "Linux", §4.8; amends A-63's full-log rule)
+Applied in the same change to: `crates/server/src/write_log.rs` (`keep_record`, `log_acknowledged_write`,
+`log_forgets`), `crates/server/src/fuse.rs` and `crates/server/src/shards.rs` (each `log_write` calls
+`log_acknowledged_write`), the tests `a_full_logs_forced_publication_keeps_a_captured_volumes_write_and_reports_no_loss`
+and `a_full_logs_forced_publication_appends_a_left_out_volumes_write_again` (`crates/server/src/verbs.rs`), §4.6 (the
+takeover status, after A-429's), GAPS (A-422's entry, its third sibling) and the bug record
+`docs/bugs/2026-11-18-a-full-logs-forced-publication-reported-a-captured-volumes-write-as-lost.md`.
+
+- **What was there.** A-63: a write the log has no room for forces a publication, which carries the write and empties
+  the log; only a refused publication leaves the write unlogged, marked as an overflow. The test the transports wrote
+  for "carries" was that the publication left no volume out. A publication that left out another volume therefore
+  marked the overflow for a write its image held, and the next daemon reported every taken-over file as having lost
+  writes. A write to the left-out volume was marked too, though A-422's retain had just given back the room the
+  captured volumes' records took.
+- **The rule.** A record a full log refused is settled by its own volume after the publication it forced. Captured,
+  the image carries it, the effect already applied. Left out, the volume's records stand under the new stamp beside
+  the room the others gave back, and the record is appended again. Only a refused publication, a span the content
+  object refuses, or a log still full leaves the record unkept: a write then marks the overflow, counted, and a
+  `FORGET` is counted (`write_log.forget_unlogged`). One function holds the rule for both transports, where each had
+  its own copy.
+- **Evidence.** Two unit tests on a shard whose reserve is cut to 32 MiB, so its write log is 8 MiB. Each fills the
+  log with a plain volume's records beside an overlay that cannot be imaged, then logs a write: one to the plain
+  volume, one to the overlay. Both pass (Mac Studio, 2026-11-18, debug) beside the write log's eleven and A-422's and
+  A-430's tests, 16 of 16. Each first asserts that the forced publication left the overlay out (it kept the overlay's
+  record, counted). With the old rule put back, both failed at the overflow mark.
