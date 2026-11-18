@@ -4565,6 +4565,7 @@ async fn init_shard(
         .total_ns(),
     ),
     injected_failover_ns: None,
+    attachment_paces: std::collections::BTreeMap::new(),
     council,
     consensus_ready: false,
     consensus_generation: 0,
@@ -4655,6 +4656,9 @@ async fn init_shard(
   crate::winfsp::adopt_held();
   #[cfg(target_os = "linux")]
   crate::fuse::leave_stale();
+  // A holder could not renew while this daemon was not serving: every CLI attachment starts a fresh term now, before
+  // the serve loop answers its first request and before the reaper's first sweep (A-384).
+  let _ = state::with_state_counted(verbs::renew_termed_at_start);
   // Detached: the loop lives as long as the shard; nothing joins it (a joinable task stays in
   // the arena after it ends, which would hold the shard's shutdown).
   // A shard whose serve or reap loop the arena refuses serves nothing: a typed initialization failure

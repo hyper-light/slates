@@ -1,7 +1,7 @@
 //! The seam a host reaches slates through when its own rules reach every other product only through a trait (§4.12
 //! "The seam", A-310): [`Volumes`], the volume verbs of the consumer contract (A-299) with their own signatures and
 //! types, implemented by an [`Instance`] and by an in-memory simulator ([`crate::sim::SimVolumes`]), and held to one
-//! conformance suite both pass (`crates/api/tests/seam.rs`).
+//! conformance suite both pass (`the_seam_conforms` in `crates/api/tests/api.rs`).
 //!
 //! **Why.** Hex, kiln's scheduler and runtime (`vendor/hex`), keeps its volumes on slates (its design's README; kiln's
 //! plan T7, CP-T7.8 and CP-T7.13), and its rules allow no direct call into another product: "Other products are reached
