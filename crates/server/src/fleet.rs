@@ -5837,7 +5837,7 @@ async fn held_archive_in_turns(object: ObjectId, identity: [u8; 32]) -> Option<A
       let slice_bytes = s.config.copy_slice_bytes();
       let mut copied_bytes = 0u64;
       s.count(MATERIALIZE_ARCHIVE_SLICES, 1);
-      while let Some(chunk) = next.next() {
+      for chunk in next.by_ref() {
         let held = s
           .held_content
           .held_chunk(s.store.content.arena(), object, &identity, &chunk)?;

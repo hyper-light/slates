@@ -250,6 +250,10 @@ fn report_first_budget_refusal(
 }
 
 /// What serving a request produced.
+#[allow(
+  clippy::large_enum_variant,
+  reason = "a reply is the common answer: boxing it would allocate on every request served (R9), to shrink the rare Forwarded"
+)]
 pub enum Served {
   /// A reply for the client now.
   Reply(ReplyBody),
@@ -4569,15 +4573,15 @@ fn green_recovery_gate(
   state: &mut ShardState,
   touched: Option<DbVolumeId>,
   body: &RequestBody,
-) -> Result<Option<DbVolumeId>, ReplyBody> {
+) -> Result<Option<DbVolumeId>, Refusal> {
   let fenced = touched.filter(|volume| state.fenced_greens.contains_key(volume));
   if fenced.is_some() && !matches!(body, RequestBody::Destroy { .. }) {
     state.count(GREEN_FENCED, 1);
-    return Err(refused(Refusal::ContentUnavailable));
+    return Err(Refusal::ContentUnavailable);
   }
   if touched.is_some_and(|volume| state.merge.awaiting_adoption.contains_key(&volume)) {
     state.count(GREEN_AWAITING_ADOPTION_REFUSED, 1);
-    return Err(refused(Refusal::Overloaded { shard: state.shard }));
+    return Err(Refusal::Overloaded { shard: state.shard });
   }
   Ok(fenced)
 }
@@ -4631,7 +4635,7 @@ pub(crate) fn dispatch(
   }
   let fenced = match green_recovery_gate(state, touched, &body) {
     Ok(fenced) => fenced,
-    Err(reply) => return reply,
+    Err(refusal) => return refused(refusal),
   };
   let reply = dispatch_inner(state, client_id, principal, body);
   if let Some(volume) = fenced

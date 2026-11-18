@@ -5959,6 +5959,15 @@ pub(crate) struct Rebuilding {
   page: usize,
 }
 
+/// The lineage key a takeover fetched for a live volume (its id and wrapped bytes), with the head's naming.
+type AdoptedKey = (Option<([u8; 16], Vec<u8>)>, Option<crate::head::HeadNaming>);
+
+/// A rebuild's image so far and the runs it keeps beside it.
+type RebuildState<'a> = (
+  &'a mut Option<slates_vfs::recover::VolumeImage>,
+  &'a mut BTreeMap<(u64, u64), Vec<u8>>,
+);
+
 impl Rebuilding {
   /// Begins the rebuild of the live log `payloads` of volume `id`, owned by `owner`: the lineage key adopted when the
   /// takeover fetched one (`lineage`, with the head's `naming`), and the keys recorded here taken when the log is sealed.
@@ -5968,7 +5977,7 @@ impl Rebuilding {
     state: &mut ShardState,
     id: slates_db::catalog::VolumeId,
     owner: &slates_db::catalog::Principal,
-    (lineage, naming): (Option<([u8; 16], Vec<u8>)>, Option<crate::head::HeadNaming>),
+    (lineage, naming): AdoptedKey,
     payloads: slates_db::live::FetchedLog,
   ) -> Result<Rebuilding, &'static str> {
     if let Some(lineage) = lineage {
@@ -6044,10 +6053,7 @@ impl Rebuilding {
 /// record begins the image again, a delta applies to it, and a delta before any whole one is refused.
 fn apply_payload(
   keys: Option<&(hyper_seal::keys::WrappingKey, hyper_seal::name::Namer)>,
-  (image, runs): (
-    &mut Option<slates_vfs::recover::VolumeImage>,
-    &mut BTreeMap<(u64, u64), Vec<u8>>,
-  ),
+  (image, runs): RebuildState<'_>,
   payload: &[u8],
 ) -> Result<(), &'static str> {
   let publication = open_payload(keys, payload).ok_or(REFUSED_OPEN)?;
