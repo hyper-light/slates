@@ -39,7 +39,10 @@
 //! SIGSTOP freezes a whole process and drops nothing, so the flows that lose, delay, duplicate or reorder datagrams, or
 //! cut a running node off in one direction or both, put the fault relay of `support/relay.rs` between the daemons
 //! ([`Fleet::start_relayed`]): each node advertises a port block the relay owns and binds its own (the manifest's `bind`,
-//! A-277), with no privilege, where T-8.7 named iptables or pf, which R10 rules out. Every relayed flow prints its seed.
+//! A-277), with no privilege, where T-8.7 named iptables or pf, which R10 rules out. Every relayed flow prints its seed,
+//! and requires its relay to have carried a record-plane datagram per acknowledged write ([`judge_relayed`]): until
+//! A-330 a node announced its record plane at its bound port, every record link went around the relay after formation,
+//! and the relayed flows' faults reached only the probes.
 //!
 //! The nemesis ([`a_seeded_nemesis_of_single_faults_keeps_every_register_invariant`]) draws a schedule of single faults
 //! from its seed (every path lossy, a node slowed, one link severed, or a node stopped, cut off, deafened or muted, the
@@ -1986,6 +1989,39 @@ fn first_write_shown(successor: &str, first_head: Option<u64>, first: &[Outcome]
   }
 }
 
+/// The writes of `outcomes` that were acknowledged.
+fn acknowledged_writes(outcomes: &[Outcome]) -> usize {
+  outcomes
+    .iter()
+    .filter(|outcome| outcome.refused.is_none())
+    .count()
+}
+
+/// A relayed flow's last word on its relay (goal g229, A-330): the relay's counts, and the check that the relay carried
+/// the record plane, the flow's non-vacuity. Each write a live volume acknowledged waited for a candidate's answer on
+/// the record plane, one write at a time (a stream sends its next write only once the last is answered, so no answer
+/// sent before a write can acknowledge it), so a relay every datagram between two nodes crosses sent on at least one
+/// record-plane datagram for each of the `acknowledged` writes. Fewer means record links reached their peers around
+/// the relay, and the faults the flow set there never touched the plane its writes are made durable on: before A-330 a
+/// node announced its bound record port and every redial dialed it, and the cut-off owner's 2,143 acknowledged writes
+/// met 1,377 datagrams of every plane toward it in the whole run.
+fn judge_relayed(verdict: &mut Verdict, relay: &Relay, acknowledged: usize) {
+  let report = relay.report();
+  verdict.note(report.summary());
+  let records = report.records_forwarded();
+  verdict.check(
+    "the relay carried the record plane (a record datagram an acknowledged write, at least)",
+    if records >= u64::try_from(acknowledged).unwrap() {
+      Vec::new()
+    } else {
+      vec![format!(
+        "{records} record-plane datagrams crossed the relay for {acknowledged} acknowledged writes: record links \
+         reached their peers around it"
+      )]
+    },
+  );
+}
+
 /// The register invariants a flow ends with, printed whole; panics naming every violation.
 struct Verdict {
   flow: &'static str,
@@ -2546,7 +2582,7 @@ fn candidates_partitioned_in_turn(tag: &str, flow: &'static str, partition: Part
     &outcomes,
   );
   if let Some(relay) = &fleet.relay {
-    verdict.note(relay.report().summary());
+    judge_relayed(&mut verdict, relay, acknowledged_writes(&outcomes));
   }
   drop(fleet);
   verdict.judge();
@@ -4784,7 +4820,7 @@ fn writes_stream_through_lossy_paths_and_a_takeover_over_them_loses_nothing() {
       )],
     ),
   }
-  verdict.note(fleet.relay().report().summary());
+  judge_relayed(&mut verdict, fleet.relay(), acknowledged_writes(&outcomes));
   drop(fleet);
   verdict.judge();
 }
@@ -4878,7 +4914,7 @@ fn writes_stream_past_a_slow_candidate_without_waiting_for_it() {
     &probes,
     &outcomes,
   );
-  verdict.note(fleet.relay().report().summary());
+  judge_relayed(&mut verdict, fleet.relay(), acknowledged_writes(&outcomes));
   drop(fleet);
   verdict.judge();
 }
@@ -5019,9 +5055,10 @@ fn an_owner_partitioned(tag: &str, flow: &'static str, partition: Partition) {
       );
     },
   );
+  let acknowledged = acknowledged_writes(&outcomes) + acknowledged_writes(&run.successor_outcomes);
   judge_partition(&mut verdict, &fleet, &volume, (&outcomes, &samples), run);
   if let Some(relay) = &fleet.relay {
-    verdict.note(relay.report().summary());
+    judge_relayed(&mut verdict, relay, acknowledged);
   }
   drop(fleet);
   verdict.judge();
@@ -5720,7 +5757,7 @@ fn a_seeded_nemesis_of_single_faults_keeps_every_register_invariant() {
     (&outcomes, &samples),
     strikes,
   );
-  verdict.note(fleet.relay().report().summary());
+  judge_relayed(&mut verdict, fleet.relay(), acknowledged_writes(&outcomes));
   drop(fleet);
   verdict.judge();
 }

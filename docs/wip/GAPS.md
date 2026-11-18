@@ -2935,7 +2935,27 @@
 >     2026-11-17): forwarding and the answer's way back, a one-way cut, a node muted and deafened, loss, delay and
 >     duplication, attribution by process, and the draws. The flows' first runs are the supervisor's (CLAUDE.md §8):
 >     `SLATES_TEST_CLI=1 cargo test --release -p slates-cli --test live_chaos -- --test-threads=1` on macOS and Linux.
->     Linux's census has run nowhere yet.
+>   - **First runs (2026-11-18), 11 of 35 flows failed on macOS arm64 (main bfc34cace) and the same on Linux x86_64 and
+>     arm64 (69cd38b22).** Linux's census ran there for the first time and attributed every socket but two datagrams.
+>     - **Fixed (A-330): the relay never carried the record plane.** The three owner-partition flows failed
+>       StaleNeverCommits: their cut-off owners acknowledged 2,086, 3,528 and 2,412 writes after the cut, each durable on
+>       a candidate, over record links that went around the relay, since a node announced its record plane at its bound
+>       port and formation's redial dialed it. Every relayed flow was vacuous on that plane; each now requires a
+>       record-plane datagram per acknowledged write from its relay (`judge_relayed`). Red first:
+>       `a_candidate_behind_a_port_mapping_is_redialed_through_it_so_a_cut_there_holds_its_record_plane`
+>       (`docs/bugs/2026-11-18-a-redial-went-around-the-port-mapping-the-record-plane-was-announced-at-its-bound-port.md`).
+>     - **Open (g229): ReadSafety through a resumed owner.** In the SIGSTOP owner flow the old owner, read the moment it
+>       resumed, answered `NotFound` for the successor's acknowledged writes (2.29 s and 3.00 s into the run, 70 to 780
+>       ms after their acknowledgements), where it must refuse or answer them.
+>     - **Open (g229): the big-entry flow saw no head after its successor's first write.** Every write through the
+>       survivor it named was acknowledged and read back, yet that survivor showed no shipping line with a head. The
+>       flow takes the first survivor that serves the three files, which a survivor forwarding to the real successor
+>       does too (to be confirmed by a run that names both).
+>     - **Open (g229): a replaced member never meshed** (`a_member_that_never_held_the_log_never_stands_in_for_its_holder`,
+>       macOS): the replacement sat at configuration version 0, in contact with no peer, its four record links idle as
+>       out of contact (`fleet.link.out_of_contact` 4) through a whole fleet wait, while the owner had already recorded
+>       it as a live holder.
+>     - g230's: Continuity in five flows (a successor's positions start again at 1) and the nemesis's fence lag.
 >
 > - **Fixed: a destroy was answered before its tombstone was placed** (record
 >   `docs/bugs/2026-11-06-a-destroy-was-answered-before-its-tombstone-was-placed.md`).

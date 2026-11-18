@@ -5997,7 +5997,9 @@ peer dials it there, so both ends of every session are computed from the same fi
 disagree. A node behind a port mapping (a NAT's port forward, a container runtime's published ports,
 the chaos harness's fault relay) also names where its own two sockets bind (`bind`: an IPv4 literal
 and the base of the same block, A-277); it serves there while every peer still dials its advertised
-ports, and the mapping between them is the operator's. A manifest with fewer than `f + 1` nodes, a
+ports, and the mapping between them is the operator's. It announces the advertised ports alone, the record
+plane's too (A-330), since a peer prefers the announcement to the manifest at every later dial: announced at
+its bound port, every redial of a record link went around the mapping. A manifest with fewer than `f + 1` nodes, a
 repeated name or certificate, a base (advertised or bound) at the end of the port range, or an identity
 the TLS stack cannot use, is refused by name at boot. The two serve
 sockets are bound once, before the daemon starts (`FleetTransport::bind`, between the pure plan and the
@@ -6900,6 +6902,16 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   every kind above and one more, a link severed both ways (a partition that is not transitive), the owner struck as
 >   often as a candidate and once a run until it is taken over, the fleet recovering whole between them; every
 >   invariant is judged across whatever takeovers they cause, Continuity from the samples.
+> - **The relay never carried the record plane (fixed 2026-11-18, A-330).** The first gated runs (the integrator: macOS
+>   arm64, main bfc34cace; Linux x86_64 and arm64, 69cd38b22) failed StaleNeverCommits in the three flows that cut a
+>   running owner off: it acknowledged 2,086 (cut both ways), 3,528 (deafened) and 2,412 (muted) writes sent to it
+>   after the cut, each in under a millisecond, until it was taken over. Every one was durable on a candidate (NoLoss
+>   held on the successor), and 41 datagrams toward the owner reached the relay during the cut. A node announced its
+>   record plane at its bound port, so formation's redial of every record link went straight to the peer's own socket,
+>   and only the probes crossed the relay: every relayed flow was vacuous on the plane its writes are made durable on.
+>   The announcement now carries the advertised port, and every relayed flow requires the relay to have carried at least
+>   one record-plane datagram per acknowledged write (`judge_relayed`, its non-vacuity count;
+>   `docs/bugs/2026-11-18-a-redial-went-around-the-port-mapping-the-record-plane-was-announced-at-its-bound-port.md`).
 
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
@@ -23694,3 +23706,28 @@ with a decision for Ada), and `crates/conformance/src/workload.rs` (`ENVIRONMENT
   Subversion workload's own paths are already in the drive form, `pwd -W`).
 - **The failing test** is the lanes' workloads step itself, red in run 44260193629 on both architectures; nothing else
   runs Git for Windows. Its next run is the check.
+
+### A-330 — A node announces its record plane where it advertises it, never at its bound port (2026-11-18, goal g229, the chaos flows' first runs; completes A-277)
+Applied in the same change to: §4.8 "Deployment" (what a node announces), §4.10's chaos status, GAPS ("Chaos from
+outside the processes"), and the code below.
+- **What was there.** A-277 let a node bind elsewhere than it advertises and stated that it "still announces only" its
+  advertised address. Its discovery announcement carried the advertised IP with the port its record socket was bound
+  to (`fleet::run_membership`, `record_socket.local_addr()`), and a peer prefers an announced address to its manifest
+  at every dial (`fleet::resolve_peer_address`). Formation redials every record link once, when the peer's fresh
+  member id is learned, so from then on every record link went to the peer's bound socket directly.
+- **What it broke.** Behind the chaos harness's fault relay, only the probes crossed the relay: the owner partition
+  flows' owners lost their leases and were taken over, but went on shipping and acknowledging writes over record links
+  the relay never saw (2,086, 3,528 and 2,412 writes acknowledged after their cuts, each durable on a candidate), and
+  every relayed flow's faults missed the record plane. Behind a real port mapping, a record link's redial would dial
+  the advertised host at the inner port, which the mapping does not forward, and never come back.
+- **The rule.** A node announces each plane at the address its peers dial: the probe plane at its advertised address,
+  the record plane at the advertised block's next port (`FleetTransport::advertise_record`, set by the plan from the
+  advertised block, never the bind). Nothing a node publishes to a peer is read from a socket it bound.
+- **The failing test.** `a_candidate_behind_a_port_mapping_is_redialed_through_it_so_a_cut_there_holds_its_record_plane`
+  (`crates/server/tests/fleet.rs`): a three-node fleet whose candidates each sit behind a port mapping in the test; a
+  live write made while both mappings' record planes are cut must not be acknowledged, and must be once they heal.
+  With the bound port announced again, the owner redials around the mappings and the write is acknowledged while cut.
+- **The flows' non-vacuity.** Every relayed flow of `live_chaos.rs` now requires its relay to have carried at least
+  one record-plane datagram per acknowledged write (`judge_relayed`, over the relay's per-path record count): a stream
+  sends its next write only once the last is answered, so each acknowledgement is a distinct answer from a candidate.
+- Record: `docs/bugs/2026-11-18-a-redial-went-around-the-port-mapping-the-record-plane-was-announced-at-its-bound-port.md`.
