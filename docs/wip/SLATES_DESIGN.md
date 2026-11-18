@@ -8418,6 +8418,10 @@ it builds against the contract and adds to it rather than around it.
 > its detection, confirmation and recovery terms, each with the measurements behind it (round trips, coordinator
 > periods, takeovers and volumes timed), so a consumer tells a measured term from a prior. `slates status` prints
 > `fleet_failover: ...` and MCP's daemon status carries it under `fleet.failover`.
+> **`CONTRACT` = 30 (found by g90):** a granted landing that is refused ends its audit trail: the records of the steps
+> its attempt took, then a `LandingFinished` whose outcome is `Refused`, or `Aborted` once it wrote an entry
+> (§4.15's status of the same day); such an end that names no manifest carries no `verification`. No type changed; the
+> `audit` verb's answer did, so the number moves. Until then a refused landing's trail ended at its grant.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
