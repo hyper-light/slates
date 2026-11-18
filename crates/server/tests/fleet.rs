@@ -4953,6 +4953,217 @@ fn a_volume_moved_to_another_member_is_served_there_and_its_old_owner_forwards()
   );
 }
 
+/// The volume a moved-volume fault test moves (A-291): created on `daemons[0]` through `client`, two files written
+/// through a write attachment that is then ended, shared with every other node's account, and moved to `to` until the
+/// switch. Returns the volume, its files, and whether the move was done (with its answers in order).
+fn move_two_files(
+  daemons: &[Daemon],
+  client: &mut Client,
+  name: &str,
+  to: HostId,
+) -> (
+  VolumeId,
+  [(&'static str, &'static [u8]); 2],
+  bool,
+  Vec<String>,
+) {
+  let files: [(&'static str, &'static [u8]); 2] = [
+    ("/one", b"the first file"),
+    ("/two", b"the second, longer file"),
+  ];
+  let ReplyBody::Created { id } = client.call(&scratch(name)) else {
+    panic!("create {name} on node {}", daemons[0].instance());
+  };
+  let ReplyBody::Attached { attachment, .. } = client.call(&RequestBody::Attach {
+    volume: id,
+    snapshot: None,
+    intent: Intent::Write,
+    form: AttachRequest::Root,
+  }) else {
+    panic!("write attach of {name}");
+  };
+  for (path, bytes) in files {
+    let written = client.call(&RequestBody::FsWrite {
+      volume: id,
+      attachment,
+      path: path.to_owned(),
+      bytes: bytes.to_vec(),
+      mode: 0o644,
+    });
+    assert!(
+      matches!(written, ReplyBody::FsDone { .. }),
+      "write {path}: {written:?}"
+    );
+  }
+  assert!(matches!(
+    client.call(&RequestBody::Detach { attachment }),
+    ReplyBody::Detached
+  ));
+  for node in &daemons[1..] {
+    share_with_node(client, id, node, ALL_RIGHTS);
+  }
+  let fleet: Vec<&Daemon> = daemons.iter().collect();
+  let mut answers: Vec<String> = Vec::new();
+  let moved = poll_until(&fleet, COUNCIL_RETIRE_DEADLINE, || {
+    let reply = client.call(&RequestBody::Move {
+      volume: id,
+      to: to.0,
+    });
+    let done = matches!(reply, ReplyBody::Moved { to: moved } if moved == to.0);
+    let named = format!("{reply:?}");
+    if answers.last() != Some(&named) {
+      answers.push(named);
+    }
+    Ok(done)
+  });
+  (id, files, moved, answers)
+}
+
+/// Reads every file of `files` from `volume` through `client` until each reads back whole: whether they did, and the
+/// last answer.
+fn read_back(
+  fleet: &[&Daemon],
+  client: &mut Client,
+  volume: VolumeId,
+  files: &[(&str, &[u8])],
+) -> (bool, Option<ReplyBody>) {
+  let mut last = None;
+  let read = poll_until(fleet, SERVE_DEADLINE, || {
+    let mut all = true;
+    for (path, bytes) in files {
+      let reply = client.call(&RequestBody::Read {
+        volume,
+        path: (*path).to_owned(),
+        at: ReadAt::Head,
+      });
+      all &= matches!(&reply, ReplyBody::ReadBytes { bytes: read } if read == bytes);
+      last = Some(reply);
+    }
+    Ok(all)
+  });
+  (read, last)
+}
+
+/// A-291 (§4.10 "Ownership follows the writer"; the failure matrix's "migration in flight"): the old owner dies at the
+/// switch. Three daemons at `f = 1`. Do: on a, write two files into a volume and move it to b until the move is done;
+/// stop a at once; read both files through b's client. Expect b to adopt the volume from the rest of its cohort (c and
+/// itself; a, which captured its own records, is gone) and serve both files byte for byte.
+#[test]
+fn a_move_completes_when_its_old_owner_dies_at_the_switch() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let instances: Vec<String> = daemons
+    .iter()
+    .map(|daemon| daemon.instance().to_owned())
+    .collect();
+  let mut client_a = Client::connect(&instances[0]);
+  let (id, files, moved, answers) =
+    move_two_files(&daemons, &mut client_a, "orphaned-move", hosts[1]);
+  drop(client_a);
+  let old_owner = daemons.remove(0);
+  old_owner.stop();
+  let fleet: Vec<&Daemon> = daemons.iter().collect();
+  let mut client_b = Client::connect(&instances[1]);
+  let (served, last) = if moved {
+    read_back(&fleet, &mut client_b, id, &files)
+  } else {
+    (false, None)
+  };
+  let adopted = daemons[0]
+    .refusals_on_every_shard()
+    .map(|counts| counts.get("fleet.move.adopted").copied().unwrap_or(0));
+  let described = describe(&fleet);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    moved,
+    "the move was done (answers: {answers:?}); {described}"
+  );
+  assert!(
+    served,
+    "b serves both files with the old owner gone (last: {last:?}); {described}"
+  );
+  assert_eq!(adopted, Ok(1), "b adopted the volume");
+}
+
+/// A-291 (§4.10, the failure matrix's "migration in flight when the new host dies"): the new owner dies at the switch.
+/// Three daemons at `f = 1`. Do: on a, write two files into a volume and move it to b until the move is done; stop b at
+/// once; wait until the survivors retire it; read both files through a's client. Expect the volume served whole by b's
+/// takeover successor, whichever survivor that is: when it is a itself, its takeover's adoption supersedes the copy it
+/// froze for the move (`fleet.move.superseded`); when it is c, a releases its copy (`fleet.move.released`); either way
+/// a's frozen copy is gone and never thawed.
+#[test]
+fn a_move_whose_target_dies_at_the_switch_is_served_by_its_successor() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let instances: Vec<String> = daemons
+    .iter()
+    .map(|daemon| daemon.instance().to_owned())
+    .collect();
+  let mut client_a = Client::connect(&instances[0]);
+  let (id, files, moved, answers) =
+    move_two_files(&daemons, &mut client_a, "stranded-move", hosts[1]);
+  let target = daemons.remove(1);
+  target.stop();
+  let retired = moved && poll_survivors_retire(&daemons, hosts[1]);
+  let fleet: Vec<&Daemon> = daemons.iter().collect();
+  let (served, last) = if retired {
+    read_back(&fleet, &mut client_a, id, &files)
+  } else {
+    (false, None)
+  };
+  let let_go = poll_until(&fleet, SERVE_DEADLINE, || {
+    daemons[0].refusals_on_every_shard().map(|counts| {
+      counts.get("fleet.move.superseded").copied().unwrap_or(0)
+        + counts.get("fleet.move.released").copied().unwrap_or(0)
+        == 1
+    })
+  });
+  let described = describe(&fleet);
+  drop(client_a);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    moved,
+    "the move was done (answers: {answers:?}); {described}"
+  );
+  assert!(retired, "the survivors retired b; {described}");
+  assert!(
+    served,
+    "b's successor serves both files (last: {last:?}); {described}"
+  );
+  assert!(
+    let_go,
+    "a let its frozen copy go: superseded by its own takeover's adoption, or released to c; {described}"
+  );
+}
+
 /// AC-8.15's first half (§4.10 "Mirroring across regions"; `docs/wip/mirroring.md` M2): a snapshot placed in its home
 /// region is shipped to the owner's neighbourhood in the mirror region and held there whole by `f + 1` hosts. Two
 /// regions of three daemons at `f = 1`, each the other's mirror. Do: write a file into a volume on a (region 0),
