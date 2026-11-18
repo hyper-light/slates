@@ -96,7 +96,8 @@ const NO_PRESSURE_OR_FAILURE_SUITE: &str = concat!(
 /// The reason the virtio-fs workloads cell is not run by this harness: it ran in a live guest elsewhere.
 const VIRTIOFS_WORKLOADS_IN_THE_GUEST_TEST: &str = concat!(
   "the roster runs in a live Linux guest through QEMU's vhost-user-fs-pci, each workload compared between ",
-  "slates and the guest's RAM — all nine identical on 2026-10-01 (crates/server/tests/virtiofs.rs ",
+  "slates and the guest's RAM — all twelve identical, git's history, Mercurial and Subversion among them, in CI ",
+  "run 44260193629 (2026-11-18, the guest's run 247 s; crates/server/tests/virtiofs.rs ",
   "a_live_guest_runs_the_roster_workloads_identically_on_slates_and_on_its_ram, gated on QEMU and a guest ",
   "kernel); this harness has no VMM leg (a vhost-user device is attached in-process), so the cell is not run here"
 );

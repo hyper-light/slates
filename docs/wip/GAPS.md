@@ -275,16 +275,34 @@
 > Windows needed: the directory as the root token in each spelling its tools print (`D:\a`, `D:/a`, the shell's
 > `/d/a`, a lowercase drive, a canonical path's `\\?\D:\a`); Subversion's file URL in the drive form (`pwd -W`) and
 > `svnlook`'s carriage return dropped; and `ln -s` making a real link (`MSYS=winsymlinks:nativestrict`), so the git
-> workload's link goes through the drive's reparse points (A-275), not a copy. **The drive's stated difference:**
+> workload's link goes through the drive's reparse points (A-275), not a copy (on that `ln` alone since A-327, below). **The drive's stated difference:**
 > WinFsp's driver makes no hard link (v2.1 answers `FileLinkInformation` `STATUS_NOT_SUPPORTED` itself,
 > `src/sys/fileinfo.c`; its NTFS compatibility page lists hard links unsupported), so a local git or Mercurial clone
 > copies on the drive where NTFS links. The three lines that count a clone's files with two names are recorded with
 > both sides (`WorkloadStatus::Stated`); every other byte is compared, and a stated line that stops differing fails, so
 > the list only shrinks. **Decision for Ada:** hard-linked clones and stores on the WinFsp route need WinFsp's driver
 > to pass hard links to its file system, an upstream change to a signed kernel driver (outward-facing); recommended:
-> keep the stated difference and offer the change upstream. **Open:** the lanes' first run is the supervisor's (CI);
-> the cell's record (`native-windows-winfsp.workloads.json`, still the owed skip of 2026-11-05) is re-recorded from it;
-> the roster's other workloads (cargo, npm, python, rg, rsync, sqlite, editor, watcher) are owed a Windows form.
+> keep the stated difference and offer the change upstream. **The lanes' first run (CI 44260193629, 2026-11-18, x86_64
+> and arm64 alike; A-327):** Mercurial identical but for the three stated lines. git and git's history failed on the
+> drive alone (`fatal: cannot mkdir .: File exists`, `cannot chdir to upstream.git: No such device`): the shared
+> environment's `MSYS=winsymlinks:nativestrict` also turns Git for Windows' own symbolic links on
+> (`compat/mingw.c` `mingw_platform_has_symlinks`), and with them on git resolves every change of directory through
+> `GetFinalPathNameByHandleW(VOLUME_NAME_DOS)` (`mingw_chdir`), which Windows answers `ERROR_UNRECOGNIZED_VOLUME`
+> (1005) for a drive `DefineDosDeviceW` made; only a drive the Mount Manager made has a final path, and the Mount
+> Manager takes Administrators alone (WinFsp issues 410 and 427, its maintainer: no workaround inside WinFsp).
+> Subversion failed on both sides: Git for Windows' shell rewrote the argument `^/trunk` as a path,
+> `^C:\Program Files\Git\trunk` (svn `E020024`). Fixed: the variable is set on the git workload's `ln -s` alone, so git
+> runs as Git for Windows ships it, its symbolic links off; and `MSYS_NO_PATHCONV=1` hands every argument on as
+> written. **Open, a limitation of the route (A-327):** on the drive, git with its symbolic links on (Git for Windows'
+> installer option, or `core.symlinks=true`) cannot change directory, and so cannot run there; any other program that
+> asks a file's final path with `VOLUME_NAME_DOS` is refused the same way (Python's `os.path.realpath` raised it on a
+> WinFsp drive in WinFsp issue 427). **Decision for Ada:** (a) state it, the route's limitation (recommended now: no
+> privilege is ever required, R10); (b) mount through the Mount Manager (`\\.\X:`), which works and needs an
+> Administrator, so only as a choice the person makes when elevated; (c) mount as a WinFsp network file system, whose
+> final path is a UNC path (`\\?\UNC\…`), which every tool would then print in place of the drive. **Open:** the
+> cell's record (`native-windows-winfsp.workloads.json`, still the owed skip of 2026-11-05) is re-recorded from the
+> first run with A-327; the roster's other workloads (cargo, npm, python, rg, rsync, sqlite, editor, watcher) are owed a
+> Windows form.
 
 > **The WinFsp drive declares a folding volume case-sensitive (found 2026-11-17 reading WinFsp v2.1's source for
 > A-300; open, Windows-only, no drive test yet).** The mount sets `CaseSensitiveSearch` (and `CasePreservedNames`) for
@@ -468,7 +486,12 @@
 > Locks: every leg runs a workload's two sides
 > under one kernel, whose own locks bind SQLite's, FSFS's and Mercurial's; served locks matter only between kernels.
 > **Open:** (1) the runs over each mount, which are the supervisor's (CLAUDE.md §8): any difference they find is a gap
-> to fix failing-test-first; (2) ~~the Windows WinFsp roster~~ **built 2026-11-17 (A-300, above)**: WinFsp's driver
+> to fix failing-test-first. **Shown identical (2026-11-18, CI run 44260193629, main 30014e93, the first with A-319):**
+> Linux FUSE (the daemon's own mount) and NFSv4.2 ran all twelve roster workloads identical, the OCI container's Linux
+> engine the six its image holds (git, git's history, Mercurial, Subversion, cargo, python), and the live virtio-fs
+> guest all twelve in 247 s; the three Linux records are re-recorded from that run's artifact. macOS's NFS loopback
+> mount had run git, git's history and Mercurial identical in each of three earlier runs (44247840584, 44252249999,
+> 44252296495), and Subversion with only the item order A-319 fixed; (2) ~~the Windows WinFsp roster~~ **built 2026-11-17 (A-300, above)**: WinFsp's driver
 > has no hard links (winfsp.dev's NTFS compatibility page), so Mercurial and git copy where NTFS links, now the
 > route's stated difference; git's symbolic-link probe needed reparse points, which the drive serves since A-275
 > landed (2026-11-17, below); (3) ~~a Linux FUSE leg outside a container~~
@@ -1618,7 +1641,16 @@
 >   - `green_fairness.rs`, 1,000 files of 16 KiB: main held its shard for one poll of 134 ms (x86_64) and 960 ms
 >     (arm64) with 0 probes answered; sliced, 259 to 1,456 probes inside, the longest 13.6 ms.
 >   - Peak RSS over the whole kernel 9.42 to 8.02 GB, `fs/` 361 to 283 MB (BENCHMARKS, "CreateGreen sliced").
->   - Still open: the engine's second lifetime copy (loadtest-scale, after W2), and recovery's walk in `init_shard`.
+>   - Still open: the engine's second lifetime copy (loadtest-scale, after W2). Recovery's walk in `init_shard` is a
+>     directory a unit since 2026-11-07, and since 2026-11-18 (g232) the engine is seeded from the origin a share a unit
+>     too: it was one step of hashing and copying every file, seconds over the whole kernel, so a restarted owner of a
+>     kernel-sized green was ended by its watchdog inside its recovery, at every restart
+>     (`a_restarted_owner_seeds_a_greens_origin_a_share_at_a_time`;
+>     `docs/bugs/2026-11-18-a-recovering-green-seeded-its-whole-origin-in-one-step.md`). The checkpoint applied onto
+>     the seeded engine is still one step, costing what the versions changed.
+>   - Open (found 2026-11-18, g232): a taken-over plain volume is restored in one call (`verbs::materialize_taken_over`:
+>     `slates_archive::restore`, then every file written), so a kernel-sized base volume's successor would hold one poll
+>     for seconds, the wall the green's own takeover meets (A-286's owed item `recover_green_inputs`).
 >
 >   The 2026-11-06 record, as it was found (reported to fixtures, A-217's re-lander): In-process daemon on the Mac (loaded arm, load 30 to 47), Linux v7.4-rc1 whole (97,229
 >   files on APFS, 1.67 GB), the sliced pin:
@@ -1824,6 +1856,21 @@
 >   one more chunk, on the rule that an inputs archive names each chunk once. A fixed-size cut names a chunk again
 >   wherever the inputs repeat a chunk's bytes at a chunk boundary (two identical runs of a chunk or more), and such
 >   inputs are refused `merge.inputs_undecodable` for good. A failing test is owed before any change.
+>
+> **Fixed 2026-11-18 (g232, A-313): a restarted holder refused every later version of its greens.** A warm restart keeps
+> a holder's accepted records and held inputs, but its replica of each green lived in memory alone, so it answered every
+> later record `merge.out_of_order`, for good, while the owner shipped it again every pass. With one primary and two
+> replicas at `f = 1`, one replica's restart left every version one holder's answer from stalling, and a second stalled
+> the green. Now the holder rebuilds the replica from its records and held inputs a slice at a time before it judges the
+> record (`merge_origin::rebuild_replica`). Test: `a_holder_restarted_over_its_segment_recomputes_the_greens_next_version`
+> (`crates/server/tests/fleet.rs`): red, the restarted holder answered version 2's record out of order 4,586 times and
+> version 2 never placed within the test's 60 s; green, placed in 2.56 s with one rebuild counted (kiln r1017,
+> 2026-11-18; `docs/bugs/2026-11-18-a-restarted-holder-refused-every-later-version-of-its-greens.md`). Still open,
+> found beside it:
+> - a restarted holder's `merge.refused` (a green refused for good after a mismatch) is in memory too, so the restarted
+>   holder rebuilds such a green and refuses it again only at the version that mismatched;
+> - a rebuild over a long chain recomputes every version the holder accepted (300,000 at the 100,000-client rung's three
+>   rounds), since the holder keeps no checkpoint of its replica; the holder's growth per version is A-238's owed item.
 >
 > The topology launcher is `crates/cli/tests/load_scale.rs`. It runs one primary and two replica server nodes in
 > region 0 at `f = 1`, and client nodes in region 1, so the client nodes are never the green's holders. One harness
@@ -2639,7 +2686,15 @@
 >   checks run on the dry run. Dry runs on 2026-11-05 published nothing: seven wheels and the sdist passed `twine
 >   check` (run 42048582138), and seven addons each landed in their package (run 42055543098).
 > - **Owed to Ada:** a release is published only when a maintainer pushes a real tag `v<version>` and publishes its
->   draft (`docs/publish.md`). The test draft is never to be published.
+>   draft (`docs/publish.md`, "The publish step", which lists what the publish needs from her). The test drafts are
+>   never to be published.
+> - **The dry run stages the whole release (2026-11-17, A-320).** Before, a run with no tag stopped after the builds,
+>   and only the two test tags had ever checked the checksums, the copies' comparison and the provenance. Now a
+>   read-only `stage` job runs in every run. It makes and checks `SHA256SUMS`, compares each target's two copies and
+>   writes the provenance and a publish plan. It keeps them as the run's `release-staged` artifact. Only a tag's
+>   `draft release` job signs and drafts, from exactly those files. Dry run 44261010043 (2026-11-18, commit
+>   44c7cc17): all fourteen copies passed their smoke tests, the seven pairs were byte for byte the same, and
+>   `SHA256SUMS` checked. Nothing was signed or released: no tag, no draft, no attestation. A-320 has the numbers.
 > - **Closed 2026-11-05 by 68b9cb05 (A-213): the anchor aborted when its stderr closed** (found by the smoke test,
 >   2026-11-04: `slates anchor 2>&1 >/dev/null | head -n 1` exited 134, because `eprintln!` panics on EPIPE under
 >   `panic = "abort"`). Every shipped print site now writes through `slates_machine::log`, which counts a refused line

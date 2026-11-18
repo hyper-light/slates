@@ -3147,7 +3147,7 @@ const WORKLOAD_GUEST_RAM: &str = "1G";
 /// Shape: how long the workload guest may run — the boot, then each roster tool twice (twelve on Linux since A-289,
 /// a cargo build of a one-file crate among them) under software emulation. Measured at 364 s and 317 s with the
 /// nine before A-289 on Docker Desktop's Apple Silicon VM (2026-10-01), so about four times that, still failing a
-/// hung guest in bounded time; the three version-control workloads' share is owed to the next run's figure.
+/// hung guest in bounded time; the twelve ran in 247 s on CI's runner (CI run 44260193629, 2026-11-18).
 #[cfg(target_os = "linux")]
 const WORKLOAD_RUN: Duration = Duration::from_secs(1500);
 

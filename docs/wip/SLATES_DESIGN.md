@@ -642,8 +642,12 @@ the measured wake cost before parking (the 2-competitive rule). The mount is nev
 > least half the live step quantum, its yields held to 5% of its time, and at most a heartbeat period: each record in the order recovery always took them, a green's held origin a directory's listing or
 > a file's read a unit, its chain an entry a unit, each logged write. Measured: 16 greens over a held 78-file tree
 > recovered in 2.82 s of CPU in 959 slices with the beat never older than 496 ms, where the unsliced daemon went 2.20 s
-> without a beat. The catalog's replay and a green's engine built over its origin are each one unit still. Record:
-> `docs/bugs/2026-11-07-a-shards-recovery-ran-in-one-poll-and-the-watchdog-withheld-the-beat.md`.
+> without a beat. The catalog's replay is one unit still. A green's engine built over its origin was one unit until
+> 2026-11-18 (goal g232): it hashed and copied every file of the origin, seconds over the whole kernel, so a restarted
+> owner of a kernel-sized green was ended inside its recovery at every restart; the origin is now decoded (a
+> taken-over green's recorded bytes) and seeded a share a unit, and only the checkpoint applied onto the seeded engine
+> is one unit. Records: `docs/bugs/2026-11-07-a-shards-recovery-ran-in-one-poll-and-the-watchdog-withheld-the-beat.md`,
+> `docs/bugs/2026-11-18-a-recovering-green-seeded-its-whole-origin-in-one-step.md`.
 
 > **Starts that fail in a row are backed off from their own life (2026-11-17, A-311).** Step 1's supervision counted
 > failed starts in a window of a second, so a start that a busy machine stretched past the window and that then failed
@@ -3219,7 +3223,11 @@ directory mounts refused (NTFS reparse point); ProjFS never.
 > extension after a cached write past a hole and a shrink, inside Windows below the single receiver; it is a listed
 > failure (`fsx-seed-1-unfinished:10000`) until fixed. Since A-300 (2026-11-17) the lanes also run the workload
 > roster's version-control workloads over the drive (git, Mercurial and Subversion, through Git for Windows' shell),
-> judged against NTFS with the drive's one stated difference: no hard links.
+> judged against NTFS with the drive's one stated difference: no hard links. Their first run (CI 44260193629,
+> 2026-11-18, both architectures) found Mercurial identical but for that difference, and the drive's one limitation
+> (A-327): Windows answers no final path (`GetFinalPathNameByHandleW` with `VOLUME_NAME_DOS`, error 1005) for a file on
+> a drive that `DefineDosDeviceW` made rather than the Mount Manager, which only Administrators may ask, so git with
+> its own symbolic links on cannot change directory there. The lanes run git as Git for Windows ships it.
 
 > **Status (2026-11-02, A-198, Step 9.2: Windows handle holding).** The anchor's Windows hold channel and explicit
 > successor inheritance are built. A hold is acknowledged after duplication into the anchor, before the child publishes
@@ -8779,6 +8787,23 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > gathers version 0 from its hold in one call (`recover_green_inputs`); a large increment's archive is still remade from
 > its chain entry on each pass that ships it.
 
+> **Status (2026-11-18, A-313: a restarted holder rebuilds its replica from what it kept).** A warm restart keeps the
+> merge records a holder accepted (its acceptor, §4.8 "Recovery") and the inputs it held (AUD-29-59), but a holder's
+> replica of each green, the engine every later version is recomputed on, lived in memory alone. The restarted holder
+> answered every later record `merge.out_of_order`, for good, and the owner shipped it again on every pass: at `f = 1`
+> with two holders, one restart left the green one holder's answer from stalling, and a second stalled it. Now a holder
+> with a green's records and no replica rebuilds it before it answers (`merge_origin::rebuild_replica`): version 0
+> seeded from its held inputs as A-286 seeds it, or the empty engine of a green with no origin, then each version it
+> accepted recomputed from the increment it holds, an extent gathered or a version recomputed a unit, each head compared
+> with its record's identity, the records read a version at a time. The first slice runs in the exchange, so a short
+> chain is acknowledged in it; a long one goes on in a task, every record answered unacknowledged meanwhile. A version
+> its records lack, or inputs it no longer holds, installs nothing (counted); another identity refuses the green on the
+> holder for good, as a record's mismatch does. Test: `a_holder_restarted_over_its_segment_recomputes_the_greens_next_version`
+> (`crates/server/tests/fleet.rs`: holder b restarted over its segment, holder c withholding records, so version 2
+> commits only through b's rebuilt replica): with the rebuild removed, b answered version 2's record out of order 4,586
+> times and version 2 never placed within 60 s; with it, version 2 placed in 2.56 s (kiln r1017; the bug record of
+> 2026-11-18).
+
 > **Status (2026-11-06, A-235: the record plane runs when there is merge work).**
 > The merge record plane ran once per coordinator period (100 ms), putting a version's inputs at one period and its
 > record at the next, so every answer at `f > 0` waited at least one period, and usually two. One submit at a time on an
@@ -8998,7 +9023,9 @@ without `advance`; `status(green)` reports the head, the attachment's version, a
 of its pending paths green has moved under (awareness, never load-bearing).
 
 **Failure matrix.** Green owner restart: Masked (chain, deltas and `seen` replay from the log;
-in-flight submissions retry by identity). Green owner loss in a fleet: Degraded for the
+in-flight submissions retry by identity). Green holder restart: Masked (the holder keeps the merge records it accepted
+and the inputs it held, and rebuilds its replica from them a slice at a time before it recomputes the next version,
+A-313). Green owner loss in a fleet: Degraded for the
 membership horizon, then Masked after takeover on a candidate that holds the ledger. Work volume owner loss before
 `submit`: the volume's loss window (D-18) applies to the unsubmitted work. Submitter crash after
 commit: the retry returns the original result; the version stands. Merge record with a stale
@@ -10216,7 +10243,8 @@ ship.
    landings on real machines (dm-flakey on Linux, a pulled RAM VHD on Windows, a forced restart
    on macOS) checked against the oracle.
 5. Release engineering: the seven-target binary release (B.2, A-210; built, smoke-tested and attached to a draft
-   by `release.yml` since 2026-11-04), npm and PyPI publishing, plugin package, docs (user docs short in `docs/`,
+   by `release.yml` since 2026-11-04; its dry run stages the whole release since 2026-11-17, A-320), npm and PyPI
+   publishing, plugin package, docs (user docs short in `docs/`,
    this design and the specs in `docs/wip` promoted).
 6. The gap ledger reconciled: every open item either closed or carried with an owner.
 
@@ -10290,7 +10318,9 @@ may weaken an earlier phase's gates; ratchets only tighten.
 > runs) no Subversion commit in the roster sends more than one file's text, since the client sends a commit's texts in
 > an order drawn anew in every process and FSFS numbers a revision's items in that order; the shared environment pins
 > cargo's colour and target directory, without which CI's colour failed the cargo workload on both sides; and the live
-> guest's console is read while the VM runs, where a full pipe had stopped the guest.
+> guest's console is read while the VM runs, where a full pipe had stopped the guest. CI run 44260193629 (2026-11-18,
+> the first with A-319) showed the four identical over Linux FUSE, NFSv4.2 and the OCI container's Linux engine, and in
+> the live virtio-fs guest, with every other roster workload there.
 
 > **Editor workload correction (2026-09-17).** The host and mount must execute the same save
 > behavior even when their paths select different tool defaults. The Vim roster explicitly
@@ -10560,7 +10590,10 @@ Evidence: `research/survey-vorpal.md` §0–§9.
 > maintainer's one approved step (`docs/publish.md`, "The binary release"). The proof by use on a test tag is recorded
 > in A-210: test tag `v0.1.0-test.1`, run 41983664060, a draft with all seven binaries whose checksums and attestation
 > verify. Since 2026-11-05 every target is built twice on separate runners, and the release is refused unless the two
-> copies are the same bytes (AC-9.5; A-210 records the measurements).
+> copies are the same bytes (AC-9.5; A-210 records the measurements). Since 2026-11-17 (A-320) every run, a tag's or
+> a dry run's, stages the whole release with read-only permissions: `SHA256SUMS`, the two copies compared, the
+> provenance, the notes and a publish plan, kept as the run's `release-staged` artifact. Only a tag's run signs and
+> makes the draft, from exactly those files. `workflow_dispatch` is the dry run (proof by use in A-320).
 
 | target | runner | asset name |
 |---|---|---|
@@ -10595,12 +10628,14 @@ Recipes to copy verbatim:
   anchor and daemon start, bootstrap, a volume provisioned, a file written and read by one MCP
   client and read by a second client, the volume destroyed, the daemon gone with its anchor. It
   records the digests of the bytes it ran (A-210).
-- The release artifacts task (`cargo run -p xtask --bin release -- artifacts`) refuses a release missing a target or carrying bytes no smoke
-  test ran, and writes `SHA256SUMS` and a provenance JSON (tag, commit, run, and per target the
+- The release artifacts task (`cargo run -p xtask --bin release -- artifacts`) refuses a release missing a target, carrying bytes no smoke
+  test ran, or whose two copies differ (AC-9.5), and writes `SHA256SUMS` and a provenance JSON (tag, commit, run, and per target the
   sha256, blake3, size, rustc version, runner image and smoke timings). The signature is GitHub's
   artifact attestation, keyless through Sigstore with the job's OIDC identity, not an ed25519 key
   held as a CI secret (A-210). [C: xtask/src/main.rs:79-160, amended]
-- The lane never publishes: it creates a draft release, and a maintainer publishes it (A-210).
+- The lane never publishes: it creates a draft release, and a maintainer publishes it (A-210). A run with no tag is a
+  dry run: it stages everything a tag's run stages, labelled a dry run, and holds no permission to sign or draft
+  (A-320; `docs/publish.md`, "The publish step").
 - Weekly scheduled audit re-verifies vendored sources against pinned upstream commits and opens
   one tracking issue on drift; it never edits the tree. [C: grammar-audit.yml:1-13]
 
@@ -16981,7 +17016,11 @@ Applied in the same change to: §4.16's status, A-9's "recorded durably" (now: r
   - The engine still holds the origin twice (current content and version 0's history value); loadtest-scale shares
     them after W2.
   - The overlay holds the pinned copy.
-  - Recovery walks a held origin in `init_shard` in one call.
+  - ~~Recovery walks a held origin in `init_shard` in one call.~~ Since recovery was sliced (2026-11-07) the walk is a
+    directory a unit; since 2026-11-18 (goal g232) the engine is seeded from the walked origin, or from a taken-over
+    green's recorded bytes decoded a share at a time, a share a unit too (`verbs::GreenReplay`'s `Decode` and `Load`,
+    `Green::with_checkpoint`), where it was one step of hashing and copying every file. Still one step: the checkpoint
+    applied onto the seeded engine, which costs what the green's versions changed since the origin.
 
 ### A-201 — A green's head lands through a checkout: written into the volume the green was created from, which lands under a grant like any volume (accepted and built 2026-11-04)
 
@@ -22557,7 +22596,9 @@ form, the judgment under the route's stated differences), and CI's `windows-lint
   - Git for Windows' shell copies the target for `ln -s` by default. `MSYS=winsymlinks:nativestrict` in the shared
     environment makes it a Windows symbolic link, and a failure where it cannot make one, as POSIX's `ln -s` does. So
     the `git` workload's link goes through the drive's reparse points (A-275) on one side and NTFS's on the other.
-    Every other shell ignores the variable.
+    Every other shell ignores the variable. **Amended by A-327 (2026-11-18):** the variable is set on the workload's
+    `ln -s` alone, since git reads it too and then cannot change directory on the drive; and the shared environment
+    sets `MSYS_NO_PATHCONV`, so the shell hands Subversion's `^/` URLs on as written.
 - **The drive's stated difference: no hard link.** WinFsp's driver answers `FileLinkInformation` with
   `STATUS_NOT_SUPPORTED` itself, before any file system is asked (v2.1, `src/sys/fileinfo.c` 2023-2025); its volume
   parameters' `HardLinks` bit reads "unimplemented; set to 0" (`inc/winfsp/fsctl.h` 213); and its NTFS compatibility
@@ -23640,3 +23681,140 @@ Applied in the same change to:
   fence) and one more try. A target pays A-279's fence and load per drain that took a message. To measure (the
   supervisor's): the 3,000-client rung's `xshard.reply_dropped` (about 4,200 before, 0 expected),
   `xshard.room_waits_peak`, and each verb's p99 against main.
+
+### A-320 — The release lane's dry run stages the whole release: checksums, the two copies compared, provenance and a publish plan, with no permission to sign or publish (2026-11-17, built for goal g237, "complete the release pipeline")
+Applied in the same change to: Appendix B.2 (status and recipes), Phase 9 task 5's status, GAPS (the binary release
+lane's entry), `docs/publish.md` ("Cutting a release", "The binary release", and the new "The publish step"),
+`.github/workflows/release.yml` (the `stage` job; the `draft release` job takes its files), and `xtask/src/release.rs`
+and `tag.rs` (`--dry-run`, the plan, `release_tag`).
+- **Why.** A run with no tag (`workflow_dispatch`, or a diag branch's push) built and smoke-tested the fourteen copies
+  and stopped. The `release` job made `SHA256SUMS`, compared each target's two copies (AC-9.5) and wrote the
+  provenance, and it ran only on a tag. Only the test tags `v0.1.0-test.1` and `v0.1.0-test.2` (2026-11-05) ever ran
+  those checks; the last dry run (run 42701371173, `diag-release-9`, 2026-11-09) skipped them. A regression in them
+  would have shown first on the release tag itself.
+- **One staging for both kinds of run.** A `stage` job runs after the builds in every run, with the workflow's
+  read-only permissions. It runs the artifacts task (`--tag TAG`, or `--dry-run`) and `sha256sum --check --strict`
+  over the staged binaries, shows the plan as the job's summary, and keeps every staged file as the `release-staged`
+  artifact. On a tag, the `draft release` job, the only job holding write permissions, takes that artifact and checks
+  it against `SHA256SUMS` again. Then it signs and makes the draft. It no longer computes anything itself, so the
+  draft carries exactly the bytes that were staged and checked.
+- **Why the dry run stops where it does.** On a public repository the signature goes to Sigstore's public
+  transparency log as well as the repository's attestations. A release, even a draft, is a GitHub object under the
+  tag. Both are outward acts, and the publish reserves them for Ada. A dry run holds no permission that could do
+  either, so whatever its steps say, it cannot.
+- **A dry run cannot pass for a release.** Its title and notes say "not a release" (the notes then carry the
+  release's own text, so the dry run previews it). Its provenance has no tag and says `"dry_run": true`. Its plan
+  names the tag `v<version>` and what that tag would do, with the exact publish command. The task takes exactly one of
+  `--tag` and `--dry-run`. Tests: `a_dry_run_stages_a_releases_bytes_and_says_what_its_tag_would_do` (the dry run's
+  `SHA256SUMS` equals the release's for the same bytes), `the_artifacts_task_stages_for_a_tag_or_a_dry_run_never_both`
+  and `the_notes_name_every_shipped_asset_once`. The refusals of untested and unreproduced bytes now run on a dry run
+  too. `cargo test --locked -p xtask` passed on the Mac Studio (kiln run r1190, 2026-11-18): the release binary's 8
+  tests and xtask's 77.
+- **Proof by use (2026-11-18).** Dry run 44261010043 ran from 07:42 to 08:22 UTC, by `workflow_dispatch` on
+  `diag-g237-release-1`: commit 44c7cc17, which is main b41b11eb with this change's code. The guard, all fourteen
+  copies and `stage` passed, and `draft release` was skipped.
+  - Each copy passed every smoke step on its own runner. The steps, in ms: version, start to serving, steady
+    answers, bootstrap, provision, the MCP round trip, the second client's read, destroy, departure.
+
+    | asset | build | rebuild |
+    |---|---|---|
+    | `slates-macos-arm64` | 114, 3022, 2444, 167, 36, 180, 146, 26, 135 | 66, 1656, 1945, 47, 129, 45, 40, 109, 267 |
+    | `slates-linux-x64` | 20, 559, 385, 20, 20, 21, 20, 20, 23 | 20, 244, 386, 20, 20, 22, 20, 20, 26 |
+    | `slates-linux-arm64` | 20, 283, 386, 20, 20, 22, 20, 20, 26 | 20, 289, 386, 20, 20, 22, 20, 20, 26 |
+    | `slates-linux-x64-musl` | 20, 370, 387, 20, 20, 22, 20, 20, 26 | 20, 567, 386, 20, 20, 21, 20, 20, 23 |
+    | `slates-linux-arm64-musl` | 20, 295, 388, 20, 20, 22, 20, 20, 26 | 20, 321, 385, 20, 20, 22, 20, 20, 25 |
+    | `slates-windows-x64.exe` | 25, 1458, 426, 22, 42, 34, 22, 22, 23 | 25, 1097, 408, 22, 42, 36, 22, 22, 23 |
+    | `slates-windows-arm64.exe` | 36, 580, 418, 26, 27, 36, 27, 26, 28 | 35, 591, 416, 26, 26, 36, 26, 26, 29 |
+
+    `ldd` answered "statically linked" for the x86_64 musl binary and "not a dynamic executable" for the arm64 one.
+    `slates version` answered `slates 0.1.0` in a process-isolated Nano Server.
+  - `stage` took 63 s. It wrote the `SHA256SUMS` below, and `sha256sum --check --strict` answered OK for all seven.
+    Every rebuild's digest equals its build's. The two x86_64 Linux pairs matched across two runner image versions
+    (ubuntu26 20261111.82.6 and 20261111.196.1); each other pair ran on one image.
+
+    ```
+    fc53d4c9ed2cd59b0a78bf092df683a7d0f04f94febc1a4a331e38462fa8f0ad  slates-macos-arm64        14,625,600 B
+    5e3d51c6d4572b4175481aa0371b0815cf3cc80d795316bb096ae4222ba9815a  slates-linux-x64          20,450,024 B
+    46bba07ff638c7910ca6cc1bb623c29783eee36829f78645f9ae02b7cc4e5687  slates-linux-arm64        16,493,272 B
+    69395796e317958ec07e2db6f31294bb0f131cc176dbefb9c758a0fc3e4f05e8  slates-linux-x64-musl     20,392,400 B
+    05f4724df922383c978c83b833a400525b39ca653195eafa38c824167c4e7ad4  slates-linux-arm64-musl   16,654,408 B
+    e689e299f08a7ba9c4aa19bdead07751f5426c5d42273ab690fd67e5a58a5f93  slates-windows-x64.exe    14,851,072 B
+    e35ff7594d4cac6a394a98f3eccad54996e76babbcf6f225a1d34abd735a9ba4  slates-windows-arm64.exe  12,484,608 B
+    ```
+  - On adas-macbook-pro-2, `gh run download 44261010043 --name release-staged` gave `dist/` and `notes/`, the paths
+    the `draft release` job reads. `shasum -a 256 -c SHA256SUMS` answered OK seven times, and with one binary present
+    and `--ignore-missing` OK once (the README's command). The provenance said `"dry_run": true` and named no tag.
+    The macOS binary answered `slates 0.1.0`. Its signature is the linker's ad-hoc one with no team identifier, and
+    it carried no quarantine attribute.
+  - Nothing was published. `gh release list` still showed only the two test drafts, and no tag was made. GitHub holds
+    no attestation for a staged digest: `gh api repos/hyper-light/slates/attestations/sha256:<digest>` answered 404.
+- **Not yet, and Ada's.** The publish is goal g236: the tag `v0.1.0` and publishing its draft (`docs/publish.md`,
+  "The publish step"). The tag also starts the SDK lanes, which publish to PyPI and npm with no draft. Code signing and
+  notarization (B.7) need Ada's Apple and Windows identities. The `draft release` job's new shape runs only on a tag.
+  Before the release tag, a test tag `v0.1.0-test.3` would prove it; a refused job publishes nothing, so it fails
+  safe either way.
+
+### A-313 — A restarted holder rebuilds each green's replica from the records it accepted and the inputs it holds, a slice at a time (2026-11-18, built for goal g232, one primary and two replicas)
+Applied in the same change to:
+- §4.16: the failure matrix (a green holder's restart is masked) and the status of 2026-11-18.
+- `crates/server/src/merge_origin.rs`: `ReplicaSeed` builds a replica through a version (`rebuild`, `through`, `held`,
+  `SeedStage::Chain`, `ChainStep`, `Gather::of` and `step`), `rebuild_replica` and `Rebuild`, `build`, the counts
+  `merge.replica.rebuilt`, `merge.replica.rebuilt_versions` and `merge.replica.records_short`, and the module doc.
+  `crates/server/src/merge_service.rs`: `accept_merge_record` rebuilds a missing replica before it judges a record's
+  order; the doc of `seeding`.
+- Tests: `a_restarted_holders_replica_is_rebuilt_from_the_records_and_inputs_it_kept` and
+  `a_rebuild_installs_nothing_short_of_its_records_or_off_their_identities` (`merge_origin.rs`), and
+  `a_holder_restarted_over_its_segment_recomputes_the_greens_next_version` (`crates/server/tests/fleet.rs`).
+- GAPS: the load test's ledger, after A-286's entry. The bug record:
+  `docs/bugs/2026-11-18-a-restarted-holder-refused-every-later-version-of-its-greens.md`.
+- **What was there.** A holder's replica of a green (`merge.replicas`, §4.16 "Apply on holders") lived in memory alone.
+  A warm restart kept the holder's member id, the records it accepted and the inputs it held, each for its own reason
+  (§4.8 "Recovery", AUD-29-59), and nothing rebuilt the replica. The holder answered every later record of the green
+  `merge.out_of_order` while its content answer told the owner it held the inputs, so the owner shipped the record again
+  on every pass and never had it acknowledged there.
+- **The rule.** A holder that receives a green's record with no replica of the green, and has accepted records of it,
+  rebuilds the replica before it judges the record: version 0 from its held inputs (A-286's seed) or the empty engine of
+  a green with no origin, then every version it accepted, up to the newest, recomputed from the increment it holds and
+  compared with that record's identity. The records are read a version at a time from the acceptor (`value_at`), the
+  increments gathered an extent a unit, and the build is sliced like the seed: its first slice in the exchange, the rest
+  in a task of the shard, every record of the green answered unacknowledged until it ends. It installs nothing if a
+  version's record is missing or its inputs are no longer held, and refuses the green on the holder for good on another
+  identity, as a record's own recomputation does.
+- **Why.** The failure matrix masked an owner's restart and not a holder's. Goal g232 runs one primary and two replicas
+  at `f = 1`: each version commits at the owner and one holder, so one holder's restart left the green one answer from
+  stalling, and a second restart, or the other holder's loss, stalled every submit. Red: the restarted holder refused
+  version 2's record out of order 4,586 times and it never placed within 60 s; green: placed in 2.56 s (kiln r1017).
+- **Cost.** Only at a restart, and only for a green whose record arrives: one version's recomputation per version the
+  holder accepted, as its first acceptance cost, in slices. A rebuilt replica holds what the replica held before the
+  restart; its growth per version is the open item it was (GAPS).
+
+### A-327 — The Windows lanes run git as Git for Windows ships it and hand Subversion its `^/` URLs as written; a drive the Mount Manager did not make answers no final path (2026-11-18, A-300's first run; Ada's goal of 2026-11-18)
+Applied in the same change to: §4.6 (the Windows conformance status), A-300 (its `MSYS` bullet), GAPS (A-300's entry,
+with a decision for Ada), and `crates/conformance/src/workload.rs` (`ENVIRONMENT`; the `git` workload's `ln -s`).
+- **What the first run found.** CI run 44260193629 was the first to reach the Windows lanes' workloads step, on x86_64
+  and arm64 alike. Mercurial ran identical but for the drive's stated lines. git and git's history failed on the drive
+  alone, `git init .` with `fatal: cannot mkdir .: File exists` and `git init --bare upstream.git` with `fatal: cannot
+  chdir to upstream.git: No such device`. Subversion failed on both sides with `svn: E020024: Error resolving case of
+  '^C:\Program Files\Git\trunk'`.
+- **Why git failed: the drive has no final path.** Git for Windows turns its own symbolic links on when `MSYS` names
+  `winsymlinks:nativestrict` (`compat/mingw.c` `mingw_platform_has_symlinks`), which the shared environment set for
+  `ln -s`. With them on, `mingw_chdir` opens each directory and asks `GetFinalPathNameByHandleW` for its path with
+  `VOLUME_NAME_DOS` before it changes to it, and fails the change when that fails. Windows can translate a volume's
+  device name to a drive only for a drive the Mount Manager made, or a network drive; for one `DefineDosDeviceW` made,
+  as WinFsp makes an `X:` mount, it answers `ERROR_UNRECOGNIZED_VOLUME` (1005), which git reports as `ENODEV` (WinFsp
+  issues 410 and 427: the translation never reaches WinFsp, and its maintainer knows no workaround inside it). WinFsp
+  mounts through the Mount Manager when the mount point is spelled `\\.\X:`, which only an Administrator may ask.
+- **The decision.** The workloads run git as Git for Windows ships it: the variable is set on the `git` workload's one
+  `ln -s` alone, so the link is still a Windows symbolic link through the drive's reparse points (A-275), and git keeps
+  its own links off, as its installer does unless asked. The limitation is stated, not hidden: on the drive, git with its
+  symbolic links on cannot change directory, and any program that asks a file's final path with `VOLUME_NAME_DOS` is
+  refused alike. Mounting through the Mount Manager would need an Administrator, which R10 never requires; a WinFsp
+  network file system would have a final path, a UNC one every tool would then print in place of the drive. Which, if
+  either, to offer is Ada's decision (GAPS).
+- **Why Subversion failed: the shell rewrote its argument.** Git for Windows' shell rewrites an argument that looks
+  like a POSIX path before it starts a Windows program, and it took Subversion's repository-relative URL `^/trunk` for
+  one. The shared environment now sets `MSYS_NO_PATHCONV=1`, Git for Windows' switch for handing every argument on as
+  written; every other shell ignores it, and no workload passes a POSIX path a Windows program needs rewritten (the
+  Subversion workload's own paths are already in the drive form, `pwd -W`).
+- **The failing test** is the lanes' workloads step itself, red in run 44260193629 on both architectures; nothing else
+  runs Git for Windows. Its next run is the check.
