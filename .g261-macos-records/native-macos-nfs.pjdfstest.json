@@ -1,0 +1,40 @@
+{
+  "schema": 1,
+  "suite": "pjdfstest",
+  "transport": "native-macos-nfs",
+  "host": {
+    "os": "macOS 26.7.2 (25G332)",
+    "kernel": "Darwin 25.6.0",
+    "arch": "arm64",
+    "privilege": "root"
+  },
+  "date": "2026-11-18",
+  "command": "sudo -n sh <each of 238 tests/**/*.t of pjd/pjdfstest@85a8aea> in a directory inside the mount that root owns (owner and group 0); binary <scratch>/tools/pjdfstest-85a8aea9e685999ef0540392fd80535f873d7ff7/pjdfstest",
+  "bound": "every test file at the pinned commit (238 files), 300s per file",
+  "outcome": {
+    "kind": "ran",
+    "counts": {
+      "suite": "pjdfstest",
+      "files": 238,
+      "cases": 8686,
+      "passed": 8569,
+      "failed": 117,
+      "needs_root": 0,
+      "todo": 0,
+      "expected_failures": 117,
+      "unexpected_failures": 0,
+      "listed_now_passing": 0
+    }
+  },
+  "expected_failure_list": {
+    "path": "docs/wip/conformance/expected-failures/native-macos-nfs.pjdfstest.txt",
+    "blake3": "bd91dd12b0f50dab94b42988117d89a9b8672b1a111f793b442f72ac0188e838",
+    "entries": 117
+  },
+  "duration_ms": 374047,
+  "notes": [
+    "pjdfstest: pjd/pjdfstest@85a8aea (BSD-2-Clause), tarball sha256 2005cdd83b76204177cf136792b1f2058a7418b4fc5b203f51274a698547d754, built `cc -O2 -w -I. pjdfstest.c` over a config.h the harness probed (HAVE_: CHFLAGS FACCESSAT FCHFLAGS FCHMODAT FCHOWNAT FSTATAT LCHFLAGS LCHMOD LINKAT MKDIRAT MKFIFOAT MKNODAT OPENAT READLINKAT RENAMEAT SYMLINKAT UTIMENSAT STRUCT_STAT_ST_ATIMESPEC STRUCT_STAT_ST_BIRTHTIME STRUCT_STAT_ST_BIRTHTIMESPEC STRUCT_STAT_ST_CTIMESPEC STRUCT_STAT_ST_MTIMESPEC)",
+    "117 expected failures; 0 unlisted failures; 0 listed now passing; 0 listed absent",
+    "failures by shape (12 of 69 shapes; names folded to N, inode numbers to <inode>): 14 × unlink, expected 0, got; 7 × create 0644, expected 0, got; 4 × -u 65534 -g 65534 rename N/N N/N, expected 0, got EACCES; 4 × lstat N/N type, expected ENOENT, got dir; 3 × stat N mode,uid,gid, expected 0555,65534,65532, got 06555,65534,65532; 3 × stat N mode,uid,gid, expected 0555,65534,65533, got 06555,65534,65533; 2 × -u 65533 -g 65533 open N O_RDONLY,O_NONBLOCK, expected 0, got EACCES; 2 × -u 65533 -g 65534 open N O_RDONLY,O_NONBLOCK, expected 0, got EACCES; 2 × -u 65534 -g 65534 mkdir N/N 0755, expected 0, got EEXIST; 2 × -u 65534 -g 65534 open N O_RDONLY,O_NONBLOCK, expected 0, got EACCES; 2 × -u 65534 -g 65534 truncate N 123, expected EACCES, got 0; 2 × link N, expected 0, got"
+  ]
+}

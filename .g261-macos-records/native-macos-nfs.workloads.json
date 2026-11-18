@@ -1,0 +1,99 @@
+{
+  "schema": 1,
+  "suite": "workloads",
+  "transport": "native-macos-nfs",
+  "host": {
+    "os": "macOS 26.7.2 (25G332)",
+    "kernel": "Darwin 25.6.0",
+    "arch": "arm64",
+    "privilege": "unprivileged"
+  },
+  "date": "2026-11-18",
+  "command": "sh -c '<roster script>' in <host scratch>/<tool> and <mount>/<tool>, per tool of crates/conformance/src/workload.rs ROSTER; trees compared by manifest",
+  "bound": "12 tools run, one script each",
+  "outcome": {
+    "kind": "ran",
+    "counts": {
+      "suite": "workloads",
+      "tools": [
+        {
+          "name": "git",
+          "status": {
+            "kind": "identical"
+          }
+        },
+        {
+          "name": "git-history",
+          "status": {
+            "kind": "identical"
+          }
+        },
+        {
+          "name": "mercurial",
+          "status": {
+            "kind": "identical"
+          }
+        },
+        {
+          "name": "subversion",
+          "status": {
+            "kind": "identical"
+          }
+        },
+        {
+          "name": "cargo",
+          "status": {
+            "kind": "identical"
+          }
+        },
+        {
+          "name": "npm",
+          "status": {
+            "kind": "identical"
+          }
+        },
+        {
+          "name": "python",
+          "status": {
+            "kind": "identical"
+          }
+        },
+        {
+          "name": "rg",
+          "status": {
+            "kind": "identical"
+          }
+        },
+        {
+          "name": "rsync",
+          "status": {
+            "kind": "identical"
+          }
+        },
+        {
+          "name": "sqlite",
+          "status": {
+            "kind": "identical"
+          }
+        },
+        {
+          "name": "editor",
+          "status": {
+            "kind": "identical"
+          }
+        },
+        {
+          "name": "watcher",
+          "status": {
+            "kind": "identical"
+          }
+        }
+      ]
+    }
+  },
+  "expected_failure_list": null,
+  "duration_ms": 74423,
+  "notes": [
+    "the volume was created with --fold=true to match the host scratch's name policy; git identity and dates fixed; sqlite busy timeout 5000 ms; watcher wait 3 s"
+  ]
+}

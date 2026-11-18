@@ -528,7 +528,14 @@
 > every `hg` exited 2 on both sides, Python handed `/c/hostedtoolcache/…/Scripts/hg` unconverted (pip's `hg` is a `#!`
 > script naming `python.exe`, started with the script's path as its argument) and reading it on drive `D:`. The shared
 > environment now leaves only Subversion's `^/` URLs unconverted (`MSYS2_ARG_CONV_EXCL=^/`), red-tested by
-> `under_the_environment_git_for_windows_sh_starts_hg_and_hands_on_a_relative_url` on both Windows lanes. **Open, a limitation of the route (A-327):** on the drive, git with its symbolic links on (Git for Windows'
+> `under_the_environment_git_for_windows_sh_starts_hg_and_hands_on_a_relative_url` on both Windows lanes. In the same run
+> git and git's history failed on the drive alone, `fatal: detected dubious ownership`, git naming the owner Everyone
+> (`S-1-1-0`): the drive answered no security query (WinFsp's DLL refused each, and Windows reported its world
+> descriptor), and the one descriptor it held named the Administrators group. **Fixed by A-350:** that descriptor names
+> the account the daemon runs as, which every client of a Windows daemon is, for owner and its primary group for group,
+> and the drive answers security queries with it, as NTFS reports a file its account made
+> (`what_this_account_makes_on_the_drive_reports_it_as_owner_as_ntfs_does`); three winfstest cases that ask for exactly
+> its access list pass and are struck (382 to 379). **Open, a limitation of the route (A-327):** on the drive, git with its symbolic links on (Git for Windows'
 > installer option, or `core.symlinks=true`) cannot change directory, and so cannot run there; any other program that
 > asks a file's final path with `VOLUME_NAME_DOS` is refused the same way (Python's `os.path.realpath` raised it on a
 > WinFsp drive in WinFsp issue 427). **Decision for Ada:** (a) state it, the route's limitation (recommended now: no
