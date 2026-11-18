@@ -879,7 +879,7 @@ enum Opened {
 #[derive(Debug, Default)]
 struct Held {
   manifests: BTreeMap<[u8; 32], HeldManifest>,
-  /// Each manifest's placed sequence and identity (A-380): what lets the retention rule judge only the content placed at
+  /// Each manifest's placed sequence and identity (A-372): what lets the retention rule judge only the content placed at
   /// or past a sequence ([`ContentHold::retain_placed_from`]) and read the newest placement in one step
   /// ([`ContentHold::newest_placed`]), where both walked every manifest the object held. Changed wherever `manifests`
   /// is, and charged with it ([`manifest_entry_bytes`]).
@@ -919,7 +919,7 @@ fn object_entry_bytes() -> u64 {
     .saturating_add(btree_map_bytes::<[u8; 32], u64>())
 }
 
-/// The index cost of a new manifest for an object: its entry and its entry by placed sequence (A-380).
+/// The index cost of a new manifest for an object: its entry and its entry by placed sequence (A-372).
 fn manifest_entry_bytes() -> u64 {
   btree_entry_bytes::<[u8; 32], HeldManifest>()
     .saturating_add(btree_entry_bytes::<(u64, [u8; 32]), ()>())
@@ -1594,7 +1594,7 @@ impl ContentHold {
     self.retain_placed_from(space, object, 0, keep)
   }
 
-  /// [`retain`](Self::retain) over the manifests placed for `from` or a later sequence only, and the stage (A-380): the
+  /// [`retain`](Self::retain) over the manifests placed for `from` or a later sequence only, and the stage (A-372): the
   /// content an event can change the judgment of, when everything placed before `from` was judged already and nothing
   /// since can change it (a ledger's accepted positions are never rewritten, so its inputs named once stay named).
   /// One step to find them, where judging every manifest made each judgment cost the object's history.
@@ -1630,7 +1630,7 @@ impl ContentHold {
   }
 
   /// The newest sequence any manifest held for `object` was placed for, or `None` when nothing is held for it: one read
-  /// of its manifests by placed sequence (A-380).
+  /// of its manifests by placed sequence (A-372).
   pub fn newest_placed(&self, object: ObjectId) -> Option<u64> {
     self
       .objects
@@ -5336,7 +5336,7 @@ mod ownership_oracle {
     assert_eq!(hold.charged_bytes(), 3 * page);
   }
 
-  /// §4.10 retention, A-380: the rule judges only the content placed at or past a sequence, and the newest placement is
+  /// §4.10 retention, A-372: the rule judges only the content placed at or past a sequence, and the newest placement is
   /// one read. Do: hold six manifests of one object, placed for sequences 1 to 6; retain from sequence 4 with a rule
   /// that keeps nothing and lists what it was asked; read the newest placement; forget the rest. Expect the rule asked of
   /// the manifests placed at 4, 5 and 6 only, in sequence order, those three released and the three below kept, the

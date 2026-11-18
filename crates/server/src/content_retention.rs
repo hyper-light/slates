@@ -137,12 +137,12 @@ fn keeps(
     || (ahead(newest, placed.sequence) && placed.sequence >= newest_placed)
 }
 
-/// The status count of held manifests the retention rule judged (A-380): one a manifest each run asks about, so a test
+/// The status count of held manifests the retention rule judged (A-372): one a manifest each run asks about, so a test
 /// can hold the rule's work to the content an event can change rather than to everything held.
 /// Format: a counter name in the daemon's status report.
 pub const CONTENT_JUDGED: &str = "fleet.content.retention_judged";
 
-/// The sequence the retention rule must judge content from (A-380). A green's ledger accepts its versions in order and
+/// The sequence the retention rule must judge content from (A-372). A green's ledger accepts its versions in order and
 /// never rewrites an accepted position, so the inputs placed below its newest accepted version were judged when their
 /// own records came: named then, named for good; not named, released then. Only the content placed at or past it can
 /// change. A head, a tombstone or no record at all is judged whole: a head's register keeps one position, so its object
@@ -155,7 +155,7 @@ fn judged_from(newest: &Newest<'_>) -> u64 {
 }
 
 /// Applies the retention rule to what this holder holds for `object` now, judging what an event can have changed
-/// ([`judged_from`]); returns how many manifests went. Before A-380 every held manifest of the object was judged at
+/// ([`judged_from`]); returns how many manifests went. Before A-372 every held manifest of the object was judged at
 /// every record and put, each by its ledger position's decode: a green's every version re-decoded every version before
 /// it, a fifth of a holder's time at a thousand versions (`sample` of the late-submit test, Mac Studio, 2026-11-18).
 pub(crate) fn retain_object(state: &mut ShardState, object: ObjectId) -> usize {
@@ -264,7 +264,7 @@ mod tests {
   /// input at each version would ask about tens of manifests at the last.
   const LEDGER_VERSIONS: u64 = 64;
 
-  /// §4.10 retention, A-380: a green's holder judges, at each version it accepts, only the inputs that version can
+  /// §4.10 retention, A-372: a green's holder judges, at each version it accepts, only the inputs that version can
   /// change. Do: on a shard, for each version 1 to [`LEDGER_VERSIONS`] of a green, hold its inputs placed for it, accept
   /// the merge record naming them, and run the retention rule, reading how many manifests it judged. Expect the last run
   /// to judge one manifest (the newest version's inputs) and every version's inputs still held. Before, every run judged
