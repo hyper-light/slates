@@ -213,14 +213,17 @@ pub(crate) fn complete_once_durable(
       crate::live_ship::defer(state, (volume, target), request, route, reply)
         .map(|refusal| (refusal, route))
     }
-    (reply, None) => Some((reply, route)),
+    (reply, None) => {
+      // Answered without waiting for durability: the seat its task took, if any, is given back
+      // (`crate::live_ship::take_seat`).
+      crate::live_ship::release_seat(state, request);
+      Some((reply, route))
+    }
   }
 }
 
 /// Where the reply of in-flight `request` goes, taken, for a task that hands the request on to another deferral (a
-/// bypass presentation's granted landing, A-285) rather than completing it here. Unix's, where a landing is presented
-/// (the Windows writer is owed, `crate::landing::land_verb`).
-#[cfg(unix)]
+/// bypass presentation's granted landing, A-285) rather than completing it here.
 pub(crate) fn take_in_flight(
   state: &mut ShardState,
   request: (u64, RequestId),
@@ -745,7 +748,7 @@ async fn reserve(alias: Option<&NameAlias>) -> Result<(), Refusal> {
       confirmed: false,
     },
   };
-  crate::xshard::call_within(
+  crate::xshard::call_in_shard_time(
     alias.this,
     alias.name_shard,
     move |s| crate::verbs::alias_step(s, &reservation),
@@ -774,7 +777,7 @@ async fn settle(alias: Option<NameAlias>, reserved: Result<(), Refusal>, made: b
   } else {
     slates_db::Op::NameAliasReleased { name: alias.name }
   };
-  let settled = crate::xshard::call_within(
+  let settled = crate::xshard::call_in_shard_time(
     alias.this,
     alias.name_shard,
     move |s| crate::verbs::alias_step(s, &step),

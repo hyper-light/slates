@@ -61,7 +61,8 @@ binary per platform, no archive (Appendix B.2):
 | Windows arm64 | `aarch64-pc-windows-msvc` | `windows-11-arm` | `slates-windows-arm64.exe` |
 
 Every target is built natively on its own runner. The Windows binaries link the C runtime
-statically (`+crt-static`), so they need no Visual C++ runtime. The musl binaries are static.
+statically (`+crt-static`), so they need no Visual C++ runtime. They are built with MSVC toolset 14.44 and Windows SDK
+10.0.26100.0, pinned, not the runner image's default toolset, which moves with each image update (A-411). The musl binaries are static.
 The glibc binaries need the glibc of the runner's Ubuntu or newer.
 
 For each built binary, the release smoke task (`cargo run -p xtask --bin release -- smoke`) runs on the same runner and does what a person
@@ -76,7 +77,10 @@ installing it would do:
 7. When the anchor is stopped, the daemon leaves with it.
 
 Every target is built twice, each copy on a runner of its own, and the release is refused unless the two copies are
-the same bytes (AC-9.5). The Windows binaries are linked with `/Brepro`, so MSVC's linker takes its timestamps and
+the same bytes (AC-9.5). The Windows binaries link their MSVC toolset's C runtime, so before the toolset was pinned
+(A-411) two runner images built two binaries from one tag. A pair from two images that differs is refused with both
+images named (A-407): run one copy again (`gh run rerun <run> --job <job>`) until the pair shares an image, and
+report it, since the pinned toolset should make two images agree. The Windows binaries are linked with `/Brepro`, so MSVC's linker takes its timestamps and
 PDB GUID from the content, not the clock.
 
 The smoke test records the binary's SHA-256 and BLAKE3, its `rustc -vV`, the runner image and

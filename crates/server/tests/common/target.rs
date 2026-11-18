@@ -3,7 +3,8 @@
 //! or any system temporary directory, and never in a RAM directory. It lives in the build output
 //! (`CARGO_TARGET_TMPDIR`, under `target/`), named with the process id and a per-process counter, and is
 //! removed when dropped. The path is canonical: a landing resolves its target component by component with
-//! `O_NOFOLLOW`.
+//! `O_NOFOLLOW` (on Windows refusing every link and junction), and on Windows it is the plain drive form of the
+//! canonical path, since the tests join names onto it with `/`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -59,8 +60,27 @@ pub(crate) fn target_dir() -> TargetDir {
   #[allow(clippy::disallowed_methods)]
   std::fs::create_dir_all(&made).unwrap();
   #[allow(clippy::disallowed_methods)]
-  let path = std::fs::canonicalize(&made).unwrap();
+  let path = plain(std::fs::canonicalize(&made).unwrap());
   TargetDir {
     path: path.to_string_lossy().into_owned(),
   }
+}
+
+/// The plain drive form (`D:\...`) of a canonical path Windows answers in verbatim form (`\\?\D:\...`), in which a
+/// `/` is no separator, so a name the tests join on with `/` made a path Windows refused (`ERROR_INVALID_NAME`, 123).
+/// Both forms name the one directory; a verbatim path of another kind (a share) is left as it is.
+#[cfg(windows)]
+fn plain(path: std::path::PathBuf) -> std::path::PathBuf {
+  let drive = path
+    .to_str()
+    .and_then(|text| text.strip_prefix(r"\\?\"))
+    .filter(|rest| rest.as_bytes().get(1) == Some(&b':'))
+    .map(std::path::PathBuf::from);
+  drive.unwrap_or(path)
+}
+
+/// The path as it is: Unix answers no verbatim form.
+#[cfg(not(windows))]
+fn plain(path: std::path::PathBuf) -> std::path::PathBuf {
+  path
 }

@@ -8596,7 +8596,8 @@ and max about 100 ms, where the plain volume's p999 is 0.6 ms, on a box at load 
 cores. Measured inside the daemon at load 48 (temporary counters, removed): an entry costs 13.3 µs to build (read,
 encode, seal) and its dispatch round (owner shard to control shard, the exchange, back) 90.7 µs on average, against
 about 25 µs for the exchange alone (`replication_bench`): the cross-shard hops and the session borrow are most of it.
-Owed: the same command on a quiet machine; the round's hops measured apart; the rare 100 ms tail explained.
+Owed: the same command on a quiet machine; the round's hops measured apart (counted since 2026-11-18, `fleet.live.hop.*`:
+SLATES_DESIGN §4.10 status "The round, counted hop by hop"); the rare 100 ms tail explained.
 
 **The 100 ms tail, explained and removed (2026-11-05).** The same command, with the owner's `fleet.live.*` counters
 printed at the end. Two causes, each found by its counter and each a wait for the next record period (100 ms):
@@ -13532,9 +13533,13 @@ not the cause: window100 reads as main. The true spin would make a hold pay (p50
 invocations), but at 3.5–10 cores quiet; A-218 measured and rejected it for its tails once the host has no idle core,
 and it stays rejected.
 
-**Decision (A-387).** macOS holds no shard for a closed loop (`config::closed_loop_hold`); Linux and Windows, whose held
-shards poll without sleeping, keep A-326's hold. The one adverse number is the quiet nine-shard p999, 108.6 against
-128.6 µs at the median, with the spreads overlapping (102.8–416.2 against 112.3–445.4 µs).
+**Decision (A-387).** A hold is kept only where a held shard sees a request sooner than a parked one: its first form
+fixed the hold at none on macOS, and the rule now learns it per shard (the idle turn a request meets, E[T²]/E[T] over
+every idle turn, against the shard's wake estimate, `slates_rt::held_turn`), so a macOS shard's napping turns decline
+and Linux's and Windows' polling ones hold. The one adverse number in these rows is the quiet nine-shard p999, 108.6
+against 128.6 µs at the median, with the spreads overlapping (102.8–416.2 against 112.3–445.4 µs). The learned rule's own
+A/B against main is owed (run request of 2026-11-18); `provision_bench` now prints each shard's learned turn beside its
+wake.
 
 **At 23 shards on the 32-CPU Studio** (d1323898, Apple M3 Ultra, 32 CPUs of which 24 performance, macOS 26.4; the same
 main and holdoff binaries; 18:09–18:31 UTC; `studio23-ab.sh` beside the other scripts, log `~/.cache/g234-ab/studio23.log`
@@ -14065,6 +14070,40 @@ first turn on the shard.
   to 0.81), and at 20 ms in two of three (round 2, at load 32 to 33, by 10 to 16% the other way).
 - **The bound at 50 ms nearly held in that pair:** after A-388 every kind but the conflicted submit (1.10 ms) was under
   1 ms at 1,119 verdicts a second, at a load of 30 from other work.
+
+## A work on its client's shard, priced before it was built: an edit's p50 40% lower and its p99 about halved at 1,000 clients (A-400's pricing; goals 231 and 257; 2026-11-18)
+
+**What it is.** The price of the hop A-247 put between a client and its work, measured before A-400 moved the work: the
+same diagnostic `load_bench` (`diag-g083-v3` on main `57ff29e53`, never on main) run with each client's work named
+`load-<id>-<n>`, the first `n` whose name hashes to the client's own shard (`--local-names`), against the plain names,
+which hash anywhere. Named so, a work lives where A-400 now puts it, with nothing else changed.
+
+**Environment and command.** Mac Studio adas-mac-studio.local-2 (Apple M3 Ultra, 32 cores, macOS 26.4), release (LTO),
+the daemon in the harness's process (23 shards), `kernel/`, 1,000 clients, 800 hot picks, 20 rounds,
+`--per-connection 32`; one binary, the two forms back to back, the order alternating by round, 2026-11-18 18:38 to 18:46
+UTC, load 23 to 34. p99 in ms, Edit p50 in µs.
+
+| Z, round | form | load before → after | Edit p50 | Edit | Accepted | Conflict | ReadHead | Rebase |
+|---|---|---|---|---|---|---|---|---|
+| 50, 1 | hashed | 22.9 → 26.3 | 112 | 0.90 | 1.34 | 1.52 | 0.78 | 1.43 |
+| 50, 1 | local | 26.3 → 26.5 | 69 | 0.47 | 1.04 | 1.33 | 0.55 | 0.97 |
+| 50, 2 | local | 27.6 → 26.6 | 70 | 0.61 | 1.16 | 1.61 | 0.68 | 1.09 |
+| 50, 2 | hashed | 26.6 → 25.0 | 116 | 2.04 | 2.96 | 4.38 | 2.23 | 3.30 |
+| 50, 3 | hashed | 27.2 → 34.2 | 137 | 5.38 | 6.72 | 8.52 | 5.89 | 8.45 |
+| 50, 3 | local | 32.3 → 30.6 | 81 | 1.07 | 1.51 | 2.21 | 1.26 | 1.91 |
+| 20, 1 | hashed | 26.5 → 27.9 | 166 | 1.97 | 3.34 | 4.70 | 2.00 | 3.61 |
+| 20, 1 | local | 27.9 → 27.6 | 87 | 0.69 | 0.93 | 1.59 | 0.68 | 1.06 |
+| 20, 2 | local | 25.0 → 26.9 | 96 | 0.83 | 1.25 | 2.99 | 0.84 | 1.20 |
+| 20, 2 | hashed | 26.9 → 27.2 | 176 | 1.63 | 2.19 | 3.67 | 1.43 | 2.39 |
+| 20, 3 | hashed | 30.6 → 32.9 | 186 | 2.19 | 3.29 | 3.73 | 1.91 | 3.21 |
+| 20, 3 | local | 32.9 → 32.7 | 106 | 6.09 | 10.6 | 16.2 | 8.96 | 13.2 |
+
+The shards' CPU, summed: hashed 2,176 to 2,482 thousandths of a core at 50 ms and 5,492 to 6,108 at 20 ms; local 1,666
+to 1,978 and 4,206 to 4,737. Every run's oracle had 0 failures.
+
+**What it means.** Living on its client's shard took about 40% off an edit's median in all six pairs and about half its
+p99 in five (the sixth, 20 ms round 3, went the other way with every kind, at the same load), and 20 to 25% off the
+shards' CPU. A-400 builds it; its own A/B against main is filed with the supervisor.
 
 ## The reply carrier at 3,000 and 10,000 clients: no reply lost after it; 57 lost and a hung run before it at 10,000 (A-296; goal 238; 2026-11-18)
 

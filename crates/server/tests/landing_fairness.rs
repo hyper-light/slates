@@ -10,8 +10,8 @@
   clippy::indexing_slicing,
   clippy::unwrap_in_result
 )]
-// The daemon's NFS loopback transport and a real landing target: macOS and Linux.
-#![cfg(unix)]
+// The daemon's NFS loopback transport (served on Windows too, A-184) and a real landing target, on every platform since
+// the Windows writer (A-185).
 
 use std::net::TcpStream;
 use std::time::{Duration, Instant};

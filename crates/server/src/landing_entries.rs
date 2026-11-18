@@ -20,7 +20,6 @@
 //! file checks that what it read is what the grant would land, and a landing of the same snapshot later presents the
 //! same manifest hash, or the plan changed.
 
-#[cfg(unix)]
 use std::collections::BTreeMap;
 
 use slates_db::catalog::Principal;
@@ -36,9 +35,7 @@ use crate::state::ShardState;
 use crate::verbs::refused;
 
 /// The conflict classes a presentation's preliminary verdict pass found (§4.15 step 4 run without writing), by path:
-/// what each entry of its list names. Only the conflicting entries, so its size is the conflicts'. Unix's, where a
-/// landing is presented (the Windows writer is owed, `crate::landing::land_verb`).
-#[cfg(unix)]
+/// what each entry of its list names. Only the conflicting entries, so its size is the conflicts'.
 pub(crate) fn conflicts_of(
   preliminary: &[slates_land::engine::EntryReport],
 ) -> BTreeMap<Box<str>, LandConflict> {

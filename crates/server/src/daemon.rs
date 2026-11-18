@@ -417,6 +417,10 @@ pub struct ShardPulse {
   /// The shard's idle spin window, nanoseconds, as of its last measured wake (`ShardContext::counters`); 0 until its
   /// first. Beside `wake_cost_ns` it shows whether the window follows the estimate (A-223).
   pub idle_window_ns: u64,
+  /// What an idle turn costs a request that lands in it, nanoseconds, as the shard has learned it from its own spins,
+  /// as of its last idle spin; 0 until its first measured turn. The shard keeps a closed loop's hold only while this is
+  /// below `wake_cost_ns` (A-387, `slates_rt::held_turn::hold_pays`).
+  pub held_turn_ns: u64,
 }
 
 /// One doorbell flag per control shard, indexed by the shard's registry id: set by the daemon's doorbell
@@ -1682,6 +1686,7 @@ impl Daemon {
           scheduler_overrun_ns: entry.pulse.scheduler_overrun_ns(),
           wake_cost_ns: entry.pulse.wake_cost_ns(),
           idle_window_ns: entry.pulse.idle_window_ns(),
+          held_turn_ns: entry.pulse.held_turn_ns(),
         })
       })
       .collect()
@@ -2959,8 +2964,21 @@ impl Daemon {
     Ok(())
   }
 
+  /// Test support: the quantum an install's walk over the held register copies is cut by on every shard
+  /// (`fleet::install_slice`, A-398), in place of the shard's own step quantum; `None` gives the shard its own back.
+  /// Zero ends each turn after one copy, so a test sees the slicing whatever the machine's speed. `Ok` once installed
+  /// on every shard, else the first typed refusal.
+  pub fn inject_install_walk_quantum(&self, quantum_ns: Option<u64>) -> Result<(), ObserveError> {
+    for shard in self.shards.iter().copied() {
+      self.observe(Some(shard), move |s| {
+        s.install_walk_quantum_ns = quantum_ns;
+      })?;
+    }
+    Ok(())
+  }
+
   /// Test support: every shard waits `pause_ns` between the turns of a live takeover's rebuild it makes
-  /// (`fleet::make_live_in_turns`, g251), so a materialization outlasts the control shard's periods and its later
+  /// (`fleet::rebuild_in_turns`, g251), so a materialization outlasts the control shard's periods and its later
   /// attempts meet it running; `None` lifts it. `Ok` once installed on every shard, else the first typed refusal.
   pub fn inject_live_turn_pause(&self, pause_ns: Option<u64>) -> Result<(), ObserveError> {
     for shard in self.shards.iter().copied() {
@@ -3980,22 +3998,10 @@ fn image_range(
   }
 }
 
-/// This shard's content range for its recovery images (§4.8). Windows keeps no write log: neither a WinFsp mount nor a
-/// Shards stream there logs its writes yet (GAPS).
-#[cfg(windows)]
-fn content_slice(
-  config: &DaemonConfig,
-  partition: u16,
-  content: Option<&slates_mem::SparseObject>,
-) -> (usize, usize) {
-  image_range(config, partition, content)
-}
-
 /// This shard's content range for its recovery images (§4.8), and the write log at the slice's front with what the
 /// previous daemon left in it to replay (A-63, `crate::write_log`: a FUSE mount's writes on Linux, a Shards stream's on
-/// Linux and macOS, A-316, A-339), opened against the generation of the committed image, before anything this daemon
-/// does can publish and clear it. No log and nothing to replay without a content object.
-#[cfg(unix)]
+/// every platform, A-316, A-339, A-402), opened against the generation of the committed image, before anything this
+/// daemon does can publish and clear it. No log and nothing to replay without a content object.
 fn content_slice(
   config: &DaemonConfig,
   partition: u16,
@@ -4004,17 +4010,12 @@ fn content_slice(
   (usize, usize),
   Option<crate::write_log::WriteLog>,
   crate::write_log::Recovered,
-  Option<crate::dax_ranges::RangeTable>,
 ) {
   let images = image_range(config, partition, content.as_deref());
   let Some(object) = content.filter(|_| images.1 > images.0) else {
-    return ((0, 0), None, crate::write_log::Recovered::default(), None);
+    return ((0, 0), None, crate::write_log::Recovered::default());
   };
   let layout = config.shard_content_layout();
-  // The DAX range table (A-365), with what the previous daemon recorded in it.
-  let ranges_start = slice_start(config, partition).saturating_add(layout.dax_ranges.0);
-  let ranges_bytes = layout.dax_ranges.1.saturating_sub(layout.dax_ranges.0);
-  let dax_ranges = crate::dax_ranges::RangeTable::open(object, ranges_start, ranges_bytes);
   let log_start = slice_start(config, partition).saturating_add(layout.write_log.0);
   let log_bytes = layout.write_log.1.saturating_sub(layout.write_log.0);
   // The journal's generation — the checkpoint's advanced over its committed deltas (A-68) — since a write logged
@@ -4033,14 +4034,25 @@ fn content_slice(
     },
   );
   match crate::write_log::WriteLog::open(object, log_start, log_bytes, generation) {
-    Some((log, recovered)) => (images, Some(log), recovered, dax_ranges),
-    None => (
-      images,
-      None,
-      crate::write_log::Recovered::default(),
-      dax_ranges,
-    ),
+    Some((log, recovered)) => (images, Some(log), recovered),
+    None => (images, None, crate::write_log::Recovered::default()),
   }
+}
+
+/// The DAX range table in this shard's slice of the content object (A-365), with what the previous daemon recorded in
+/// it; none without a content object holding the shard's images (`images`, [`content_slice`]'s range).
+#[cfg(unix)]
+fn dax_range_table(
+  config: &DaemonConfig,
+  partition: u16,
+  images: (usize, usize),
+  content: Option<&mut slates_mem::SparseObject>,
+) -> Option<crate::dax_ranges::RangeTable> {
+  let object = content.filter(|_| images.1 > images.0)?;
+  let layout = config.shard_content_layout();
+  let ranges_start = slice_start(config, partition).saturating_add(layout.dax_ranges.0);
+  let ranges_bytes = layout.dax_ranges.1.saturating_sub(layout.dax_ranges.0);
+  crate::dax_ranges::RangeTable::open(object, ranges_start, ranges_bytes)
 }
 
 /// This shard's chunk arena (A-98): the pool extents its partition holds from a previous daemon, added under their
@@ -4359,16 +4371,15 @@ async fn init_shard(
   let (root, node_regions, region_mirrors) = build_root_group(config, host);
   // The anchor-owned content object that survives a restart (§4.8), if the anchor provides one.
   // Shards share the one object, partitioned by index: this shard owns the slice `[start, end)`.
-  #[cfg_attr(windows, allow(unused_mut))]
   let mut content = match AnchorSegment::open_content(env) {
     Some(result) => Some(result?),
     None => None,
   };
-  #[cfg(unix)]
-  let (content_range, write_log, recovered_writes, dax_ranges) =
+  let (content_range, write_log, recovered_writes) =
     content_slice(config, partition, content.as_mut());
-  #[cfg(windows)]
-  let content_range = content_slice(config, partition, content.as_ref());
+  // The DAX range table (A-365), with what the previous daemon recorded in it.
+  #[cfg(unix)]
+  let dax_ranges = dax_range_table(config, partition, content_range, content.as_mut());
   // The telemetry sink keeps the most recent spans up to one client ring's depth (§4.14): a shard
   // processes at most a ring of in-flight requests, so a ring's depth of recent spans covers the
   // current activity window; older spans are shed (and counted), telemetry being the shed-first class.
@@ -4412,11 +4423,8 @@ async fn init_shard(
     checkpoint_buffer: Vec::new(),
     published_keys: std::collections::BTreeSet::new(),
     published_held: crate::content_holder::PublishedHeld::default(),
-    #[cfg(unix)]
     write_log,
-    #[cfg(unix)]
     writes_lost: recovered_writes.everything_lost,
-    #[cfg(unix)]
     replay: recovered_writes.records,
     #[cfg(unix)]
     pending_replies: std::collections::BTreeMap::new(),
@@ -4460,6 +4468,7 @@ async fn init_shard(
     unrecovered: std::collections::BTreeMap::new(),
     yielded: std::collections::BTreeSet::new(),
     relinquished: Vec::new(),
+    candidate_claims: std::collections::BTreeMap::new(),
     #[cfg(target_os = "linux")]
     fuse_mounts: std::collections::BTreeMap::new(),
     #[cfg(target_os = "linux")]
@@ -4552,6 +4561,8 @@ async fn init_shard(
     holder_records: crate::tracked::Tracked::default(),
     live: crate::live_ship::LiveState::default(),
     seal_walk_quantum_ns: None,
+    install_walk: None,
+    install_walk_quantum_ns: None,
     live_turn_pause_ns: None,
     host_takeovers: std::collections::BTreeMap::new(),
     moves_out: std::collections::BTreeMap::new(),
@@ -4608,9 +4619,11 @@ async fn init_shard(
     read_ahead: crate::verbs::ReadAheadLedger::default(),
     council_timing: slates_cluster::timing::ElectionTiming::floor(),
     root_timing: slates_cluster::timing::ElectionTiming::floor(),
-    failover: slates_cluster::failover::Failover::new(),
+    // Supervised by its anchor within the liveness window (A-405): the detection a node has before any peer judges it.
+    failover: slates_cluster::failover::Failover::new().supervised(LIVENESS_BUDGET_NS),
     failover_ns: crate::fleet::failover_in_periods(
       slates_cluster::failover::Failover::new()
+        .supervised(LIVENESS_BUDGET_NS)
         .estimate()
         .total_ns(),
     ),
@@ -4644,6 +4657,7 @@ async fn init_shard(
     repairs: 0,
     pending_materializations: std::collections::BTreeMap::new(),
     making_taken_over: std::collections::BTreeMap::new(),
+    making_volumes: std::collections::BTreeMap::new(),
     pending_catalogs: std::collections::BTreeMap::new(),
     fenced_greens: std::collections::BTreeMap::new(),
     pending_green_materializations: std::collections::BTreeMap::new(),
@@ -4940,7 +4954,6 @@ async fn seal_idle_content() {
 }
 
 /// The idle shard's emptied write log, its pages given back (`crate::write_log::WriteLog::purge`).
-#[cfg(unix)]
 fn purge_write_log(s: &mut ShardState) -> (usize, bool) {
   let slice = give_back_slice(s);
   let started = slates_vfs::clock::Clock::monotonic_ns(&mut s.clock);
@@ -4950,12 +4963,6 @@ fn purge_write_log(s: &mut ShardState) -> (usize, bool) {
   };
   learn_give_back_rate(s, purged.walked, started);
   (purged.bytes, purged.more)
-}
-
-/// No write log on Windows (see `content_slice`).
-#[cfg(windows)]
-fn purge_write_log(_s: &mut ShardState) -> (usize, bool) {
-  (0, false)
 }
 
 /// The bytes one give-back step may walk (A-226): what the OS gave back in one step quantum the last time
@@ -5657,7 +5664,7 @@ async fn recover_works_across_partitions(origin: u16, shards: &[ShardId]) {
 /// `NotFound`, as a work whose log would not replay does.
 async fn rebuild_remote_works(origin: u16, shards: &[ShardId]) {
   for shard in shards.iter().copied() {
-    let Some(unbuilt) = crate::xshard::call_within(
+    let Some(unbuilt) = crate::xshard::call_in_shard_time(
       origin,
       shard.0,
       |s| std::mem::take(&mut s.work_home.unbuilt),
@@ -5669,7 +5676,7 @@ async fn rebuild_remote_works(origin: u16, shards: &[ShardId]) {
     };
     for work in unbuilt {
       let id = work.work;
-      let Some(entries) = crate::xshard::call_within(
+      let Some(entries) = crate::xshard::call_in_shard_time(
         origin,
         shard.0,
         move |s| s.db.partition().work_log(id).to_vec(),
@@ -5684,7 +5691,7 @@ async fn rebuild_remote_works(origin: u16, shards: &[ShardId]) {
         continue;
       };
       let (green, created_at) = (work.green, work.created_at);
-      let Some(replayed) = crate::xshard::call_within(
+      let Some(replayed) = crate::xshard::call_in_shard_time(
         origin,
         owner.0,
         move |s| crate::verbs::owner_replay(s, green, created_at, &entries),
@@ -5694,7 +5701,7 @@ async fn rebuild_remote_works(origin: u16, shards: &[ShardId]) {
       else {
         continue;
       };
-      let _ = crate::xshard::call_within(
+      let _ = crate::xshard::call_in_shard_time(
         origin,
         shard.0,
         move |s| crate::verbs::install_replayed_work(s, &work, replayed),
@@ -5710,7 +5717,7 @@ async fn rebuild_remote_works(origin: u16, shards: &[ShardId]) {
 /// after, its work never having been made.
 async fn drop_pending_creations(origin: u16, shards: &[ShardId]) {
   for shard in shards.iter().copied() {
-    let _ = crate::xshard::call_within(
+    let _ = crate::xshard::call_in_shard_time(
       origin,
       shard.0,
       |s| {
@@ -5740,7 +5747,7 @@ async fn drop_pending_creations(origin: u16, shards: &[ShardId]) {
 async fn reconcile_work_floors(origin: u16, shards: &[ShardId]) -> usize {
   let mut reconciled = 0usize;
   for shard in shards.iter().copied() {
-    let Some(floors) = crate::xshard::call_within(
+    let Some(floors) = crate::xshard::call_in_shard_time(
       origin,
       shard.0,
       |s| s.db.partition().work_floors().collect::<Vec<_>>(),
@@ -5756,7 +5763,7 @@ async fn reconcile_work_floors(origin: u16, shards: &[ShardId]) -> usize {
         continue;
       };
       let work = floor.work;
-      let Some((exists, holds)) = crate::xshard::call_within(
+      let Some((exists, holds)) = crate::xshard::call_in_shard_time(
         origin,
         home.0,
         move |s| {
@@ -5779,7 +5786,7 @@ async fn reconcile_work_floors(origin: u16, shards: &[ShardId]) -> usize {
       };
       if let Some(base) = change {
         let (green, work) = (floor.green, floor.work);
-        let moved = crate::xshard::call_within(
+        let moved = crate::xshard::call_in_shard_time(
           origin,
           shard.0,
           move |s| crate::verbs::owner_floor(s, green, work, base),
@@ -5802,7 +5809,7 @@ async fn reconcile_work_floors(origin: u16, shards: &[ShardId]) -> usize {
 async fn reconcile_name_aliases(origin: u16, shards: &[ShardId]) -> usize {
   let mut reconciled = 0usize;
   for shard in shards {
-    let Some(aliases) = crate::xshard::call_within(
+    let Some(aliases) = crate::xshard::call_in_shard_time(
       origin,
       shard.0,
       |s| s.db.partition().name_aliases().cloned().collect::<Vec<_>>(),
@@ -5819,7 +5826,7 @@ async fn reconcile_name_aliases(origin: u16, shards: &[ShardId]) -> usize {
       let id = alias.volume;
       let volume = match shards.get(usize::from(partition)) {
         Some(owner) => {
-          let Some(volume) = crate::xshard::call_within(
+          let Some(volume) = crate::xshard::call_in_shard_time(
             origin,
             owner.0,
             move |s| s.db.partition().volume(id).cloned(),
@@ -5843,7 +5850,7 @@ async fn reconcile_name_aliases(origin: u16, shards: &[ShardId]) -> usize {
           slates_db::Op::NameAliasReleased { name: alias.name }
         }
       };
-      let settled = crate::xshard::call_within(
+      let settled = crate::xshard::call_in_shard_time(
         origin,
         shard.0,
         move |s| crate::verbs::alias_step(s, &op).is_ok(),
@@ -7280,6 +7287,7 @@ mod tests {
         completion: None,
         signature: None,
         folded_below: 0,
+        checkpoint_floor: 0,
       };
       let record = Record {
         owner,
@@ -9530,6 +9538,7 @@ mod tests {
         completion: None,
         signature: None,
         folded_below: 0,
+        checkpoint_floor: 0,
       };
       let record = Record {
         owner,

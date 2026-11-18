@@ -75,9 +75,9 @@ jobs:
           - { target: x86_64-unknown-linux-musl, runner: ubuntu-latest, asset: slates-linux-x64-musl, musl: true }
           - { target: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm, asset: slates-linux-arm64-musl, musl: true }
           # windows-2025, not windows-latest: Nano Server ltsc2025 runs process-isolated only on a 2025 host.
-          - { target: x86_64-pc-windows-msvc, runner: windows-2025, asset: slates-windows-x64.exe, windows: true, nasm: true }
+          - { target: x86_64-pc-windows-msvc, runner: windows-2025, asset: slates-windows-x64.exe, windows: true, nasm: true, msvc_arch: x64 }
           # Native arm64 Windows (GitHub's windows-11-arm image), where aws-lc-sys builds with clang-cl.
-          - { target: aarch64-pc-windows-msvc, runner: windows-11-arm, asset: slates-windows-arm64.exe, windows: true, clang_cl: true }
+          - { target: aarch64-pc-windows-msvc, runner: windows-11-arm, asset: slates-windows-arm64.exe, windows: true, clang_cl: true, msvc_arch: arm64 }
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     env:
@@ -92,6 +92,21 @@ jobs:
         with:
           toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
           targets: ${{ matrix.target }}
+      # The MSVC toolset is pinned, so a tag's Windows bytes do not depend on the runner's image (A-411). Visual Studio's
+      # default toolset moves with every image update, and its linker and its C runtime objects, which `+crt-static`
+      # links in, went into the binary: the tag v0.1.0's two x86_64 copies, on windows-2025 20261103.298.1 and
+      # 20261116.315.1, differed in 2,559,679 bytes, and their Rich headers differed only in those tools (linker 14.51
+      # build 36260 against 14.52 build 37029; runtime objects 35721 against 36815), the Windows SDK's 204 objects alike
+      # (build 33145). Both images, and the arm64 one, carry VS 2022 17.14's toolset 14.44 beside the default
+      # (`Microsoft.VisualStudio.Component.VC.14.44.17.14.x86.x64` and `.ARM64`; actions/runner-images' readmes,
+      # 2026-11-18), and a side-by-side toolset is serviced apart from the default; the SDK is pinned to its one version.
+      - name: MSVC toolset 14.44 and Windows SDK 10.0.26100.0, pinned
+        if: ${{ matrix.windows }}
+        uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: ${{ matrix.msvc_arch }}
+          toolset: "14.44"
+          sdk: 10.0.26100.0
       # As CI's windows-arm64 lane: aws-lc-sys refuses cl.exe for aarch64-pc-windows-msvc and builds with clang-cl.
       - name: clang-cl for the C the binary links (arm64 Windows)
         if: ${{ matrix.clang_cl }}
