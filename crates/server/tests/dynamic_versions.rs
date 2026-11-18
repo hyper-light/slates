@@ -75,7 +75,8 @@ fn committed_versions(client: &mut slates_client::Client) -> u64 {
 /// disk's bytes, the second volume is admitted, and the shard's committed version slots are a handful (the two
 /// volumes' live inodes and what the snapshot retains), never the slab.
 #[test]
-fn a_dynamic_volume_holds_slots_only_for_its_inodes_so_its_snapshot_retains_and_a_second_volume_fits() {
+fn a_dynamic_volume_holds_slots_only_for_its_inodes_so_its_snapshot_retains_and_a_second_volume_fits()
+ {
   let (daemon, instance) = capped_daemon("hold");
   let target = target_dir();
   target.seed("keep.txt", b"base keep");
@@ -129,13 +130,19 @@ fn a_dynamic_volume_grows_into_unpromised_slots_only_and_a_bounded_claim_stays_s
     .unwrap();
   let grower_at = (
     grower,
-    client.attach(grower, None, Intent::Write).unwrap().attachment,
+    client
+      .attach(grower, None, Intent::Write)
+      .unwrap()
+      .attachment,
   );
   // Empty files cost no bytes, so only the inode dimension can refuse them.
   let slab = u64::try_from(SLAB_SLOTS).unwrap();
   let mut made = 0u64;
   let refusal = loop {
-    assert!(made <= slab, "the dynamic volume made more files than the slab has slots");
+    assert!(
+      made <= slab,
+      "the dynamic volume made more files than the slab has slots"
+    );
     match client.fs_write(grower_at, &format!("f{made}"), b"", 0o644) {
       Ok(_) => made += 1,
       Err(e) => break e,
@@ -145,12 +152,18 @@ fn a_dynamic_volume_grows_into_unpromised_slots_only_and_a_bounded_claim_stays_s
     matches!(refusal, ClientError::Refused(Refusal::NoSpace)),
     "a dynamic volume's growth past the unpromised slots is ENOSPC: {refusal:?}"
   );
-  assert!(made > 0, "the dynamic volume grew into the unpromised slots");
+  assert!(
+    made > 0,
+    "the dynamic volume grew into the unpromised slots"
+  );
   // The claim's own allowance: what its admission committed.
   let claimed = after_claim;
   let claim_at = (
     claim,
-    client.attach(claim, None, Intent::Write).unwrap().attachment,
+    client
+      .attach(claim, None, Intent::Write)
+      .unwrap()
+      .attachment,
   );
   // Its root is one of its live inodes; every other slot it reserved takes a file now.
   for n in 1..claimed {
