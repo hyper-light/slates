@@ -60,15 +60,27 @@
 > independent of this fix (`BaseUnavailable` at recovery; open, A-257, liveness).
 > `docs/bugs/2026-11-08-a-submit-resent-after-its-owner-restarted-was-applied-twice.md`.
 >
-> **Open and owed (A-255 reserved): after a takeover the resend is never answered its version.** It is refused
-> `OwnerUnreachable` without end, and §4.16's failure matrix promises otherwise ("Green owner loss in a fleet: Degraded
-> for the membership horizon, then Masked after takeover on a candidate that holds the ledger"), as do T-8.11 and §4.8's
-> walk-through ("its retries return their original completion records" from the new owner). Owed: the merge record
-> carries the submit's completion, and the resend reaches the green's successor. RIFL's rule, read 2026-11-08 (§3): "If
-> the object migrates, then the completion record must move with it." Nothing runs twice
-> meanwhile: `a_works_head_is_never_placed_so_a_takeover_cannot_bring_it_back_to_run_a_resend` (`fleet.rs`) holds that a
-> work never comes back on a successor, because `Snapshot` refuses a work, `LiveShip` finds no store slot for one, and
-> the seal schedule needs a head only those make, so a takeover has no work to run a resend against.
+> **Another principal's use renewed a CLI attachment's term: fixed (2026-11-09, §4.7, A-230; fixtures' sweep after
+> A-255).** Each verb that names an attachment renewed a termed one before checking that the caller was its principal,
+> so any channel that knew the id could keep another account's write attachment, and its write lease, alive past its
+> term. Now only the attachment's principal's use renews or ends it. Red-checked:
+> `a_cli_attachment_is_renewed_by_its_own_principals_use_alone` fails with the check out, the owner's late write
+> succeeding. The sweep's other identities were already checked against the session; the bug record lists where.
+> `docs/bugs/2026-11-09-another-principals-use-renewed-a-cli-attachments-term.md`.
+
+> **A submit resent after its green's takeover is answered its version: fixed (2026-11-09, §4.16, §4.8 Lookup; A-255).**
+> Before, the resend was refused `OwnerUnreachable` without end: its work, by whose id it routes, dies with its owner, and
+> the completion window with it. Now the completion rides the green's chain entries and merge records, which the
+> successor adopts. The work's catalog record names its green and is the resend's route: held, or learned from a
+> location round. A version's record ships only once its work's catalog is committed. The resend is answered
+> `Submitted { version }`, and a copied key reaches nothing (A-SEAT's door). A submit made right after its work's
+> creation costs about 0.35 ms more, for the catalog's own commit: median 1.59–1.64 ms against 1.25–1.29 ms on an idle
+> Mac Studio, and 109 ms while the catalog waited for the period. Still open:
+> - losing the green's owner twice needs the ledger-prefix transfer (GAP-A9-7);
+> - the cross-region case is not yet tested;
+> - the 0.35 ms could be overlapped by a pipelined dispatch.
+>
+> `docs/bugs/2026-11-09-a-submit-resent-after-its-greens-takeover-was-never-answered-its-version.md`.
 
 > **A version commits in one exchange, and retention no longer decodes the whole ledger per put: fixed (2026-11-07, §4.16
 > Commit, §4.10 retention; A-244).** A-235 left five hops a version (the inputs' offer

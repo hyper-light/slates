@@ -91,6 +91,11 @@ fn recovered(
     let entry = chain_entry::decode(bytes).unwrap();
     let version = green.apply_recorded(&entry.increment, &entry.applied);
     assert_eq!(
+      entry.completion,
+      completion_for(version),
+      "version {version}'s completion key, as its entry recorded it, present or absent (A-255)"
+    );
+    assert_eq!(
       identities.get(&version).copied(),
       Some(green.head_identity()),
       "version {version}'s identity, against the live green's at that version"
@@ -284,10 +289,13 @@ impl History {
         .next_id
         .is_multiple_of(3)
         .then(|| self.live.head_identity());
+      // A request made most versions (A-255): its completion key rides the entry, and recovery reads it back.
+      let completion = completion_for(*version);
       self.durable.chain.push(chain_entry::encode(
         &increment.encode(),
         &increment,
         &applied,
+        completion,
         recorded,
       ));
       self.accepted.push((increment, *version));
@@ -626,6 +634,7 @@ fn two_clients_taking_turns_keep_folding_and_stay_bounded() {
       &increment.encode(),
       &increment,
       &applied.unwrap(),
+      completion_for(version),
       None,
     ));
     accepted.push((increment, version));
@@ -657,6 +666,22 @@ fn two_clients_taking_turns_keep_folding_and_stay_bounded() {
   assert_same(&mut live, &mut twin, durable.held, &accepted, &[]);
 }
 
+/// The completion key a generated version carries in its entry: none for every fifth version (one no request made, as
+/// a green's version 0 or a merge with no submit), else [`completion_of`]; a function of the version alone, so the
+/// replay holds both markers to what was written (liveness's review of A-255).
+fn completion_for(version: u64) -> Option<chain_entry::Completion> {
+  (!version.is_multiple_of(5)).then(|| completion_of(version))
+}
+
+/// The completion key a test's version `version` was made under: distinct per version, every field used.
+fn completion_of(version: u64) -> chain_entry::Completion {
+  chain_entry::Completion {
+    origin: version.wrapping_mul(0x9e37_79b9_7f4a_7c15),
+    client: u32::try_from(version % 1_000).unwrap(),
+    sequence: u32::try_from(version % 65_521).unwrap(),
+  }
+}
+
 /// Hostile bytes are refused typed: every truncation, a flipped byte, a foreign magic and a bare increment.
 #[test]
 fn a_hostile_chain_entry_is_refused_typed() {
@@ -664,8 +689,18 @@ fn a_hostile_chain_entry_is_refused_typed() {
   let raw: Raw = (0, 0, 0, 3, 7);
   let increment = increment_of(&raw).with_id(id(1), 0);
   let (_, applied) = green.submit_resolved(&increment);
-  let bytes = chain_entry::encode(&increment.encode(), &increment, &applied.unwrap(), None);
-  assert!(chain_entry::decode(&bytes).is_ok(), "the entry decodes");
+  let bytes = chain_entry::encode(
+    &increment.encode(),
+    &increment,
+    &applied.unwrap(),
+    Some(completion_of(1)),
+    None,
+  );
+  assert_eq!(
+    chain_entry::decode(&bytes).map(|entry| entry.completion),
+    Ok(Some(completion_of(1))),
+    "the entry decodes, its completion key with it"
+  );
   for len in 0..bytes.len() {
     assert!(
       chain_entry::decode(&bytes[..len]).is_err(),
