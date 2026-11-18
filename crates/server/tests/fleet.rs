@@ -9816,6 +9816,105 @@ fn live_in_flight(client: &mut Client, volume: VolumeId) -> Option<u64> {
     })
 }
 
+/// Shape: the live volumes the period-slicing test's owner ships, each its own slice under the injected quantum.
+const SLICED_LIVE_VOLUMES: usize = 24;
+/// Format: the owner's count of record periods' live work (`live_ship::period`).
+const LIVE_PERIODS: &str = "fleet.live.periods";
+/// Format: the owner's count of the owner-shard turns that work took.
+const LIVE_PERIOD_SLICES: &str = "fleet.live.period_slices";
+
+/// The owner's live line for `volume` (its own log, not a candidate's copy): head, durable, owed.
+fn owned_live_line(
+  client: &mut Client,
+  volume: VolumeId,
+) -> Option<(Option<u64>, Option<u64>, bool)> {
+  let ReplyBody::DaemonStatus { report } = client.call(&RequestBody::DaemonStatus) else {
+    return None;
+  };
+  report
+    .shards
+    .iter()
+    .flat_map(|shard| shard.live.iter())
+    .find(|live| live.volume == volume && !live.holding)
+    .map(|live| (live.head, live.durable, live.owed))
+}
+
+/// CLAUDE.md "Bounded work everywhere", A-200's record period: a shard's live volumes are visited a slice of about a
+/// step quantum at a time (`live_ship::period_slice`), never all in one turn. Do: three nodes at `f = 1`; on a, 24
+/// live-shipped volumes, each written once and answered at durability; cut the owner's slices after one volume each
+/// (`Daemon::inject_live_period_quantum(Some(0))`) and let two record periods pass. Expect at least 24 slices for each
+/// period that passed whole (one volume each, and one that finds none left), and every volume's log durable at its head
+/// with nothing owed: the slicing starved none. Before, one turn visited every live volume the shard owned.
+#[test]
+fn a_shards_live_volumes_are_visited_by_the_period_in_slices_and_none_is_starved() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, _hosts) = formed_mesh(&["a", "b", "c"]);
+  let mut client = Client::connect(daemons[0].instance());
+  let mut volumes = Vec::new();
+  for index in 0..SLICED_LIVE_VOLUMES {
+    let ReplyBody::Created { id } = client.call(&scratch(&format!("sliced-{index}"))) else {
+      panic!("volume {index} was created");
+    };
+    let attachment = write_attachment(&mut client, id);
+    let shipped = client.call(&RequestBody::LiveShip {
+      volume: id,
+      live_shipped: true,
+    });
+    assert!(
+      matches!(shipped, ReplyBody::LiveShippingSet { live_shipped: true }),
+      "volume {index} is live-shipped: {shipped:?}"
+    );
+    let written = client.call(&RequestBody::FsWrite {
+      volume: id,
+      attachment,
+      path: "/sliced".to_owned(),
+      bytes: vec![u8::try_from(index % 251).unwrap(); 64],
+      mode: 0o644,
+    });
+    assert!(
+      matches!(written, ReplyBody::FsDone { .. }),
+      "volume {index}'s write answered at durability: {written:?}"
+    );
+    volumes.push(id);
+  }
+  let counts = |daemon: &Daemon| {
+    [LIVE_PERIODS, LIVE_PERIOD_SLICES].map(|kind| refusal_count(daemon, kind).unwrap())
+  };
+  daemons[0].inject_live_period_quantum(Some(0)).unwrap();
+  let before = counts(&daemons[0]);
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let passed = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    refusal_count(&daemons[0], LIVE_PERIODS).map(|periods| periods >= before[0] + 3)
+  });
+  let after = counts(&daemons[0]);
+  daemons[0].inject_live_period_quantum(None).unwrap();
+  let lines: Vec<_> = volumes
+    .iter()
+    .map(|volume| owned_live_line(&mut client, *volume))
+    .collect();
+  drop(observed);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!("period slicing: periods, slices before {before:?} after {after:?}; lines {lines:?}");
+  assert!(passed, "three record periods passed");
+  let (periods, slices) = (
+    after[0].saturating_sub(before[0]),
+    after[1].saturating_sub(before[1]),
+  );
+  let volumes_per_period = u64::try_from(SLICED_LIVE_VOLUMES).unwrap();
+  assert!(
+    slices >= periods.saturating_sub(1) * volumes_per_period,
+    "each whole period took a slice a volume ({periods} periods, {slices} slices)"
+  );
+  for (index, line) in lines.iter().enumerate() {
+    assert!(
+      matches!(line, Some((Some(head), Some(durable), false)) if head == durable),
+      "volume {index}'s log is durable at its head with nothing owed: {line:?}"
+    );
+  }
+}
+
 /// AC-8.9, A-200 amended 2026-11-17: a burst of barriers on one live volume ships its changes, not the volume. Do: three
 /// nodes at `f = 1`; on a, a volume of half a MiB, then live-shipped and written once (its log's first entry, the whole
 /// state, durable); hold both holders off their shards while sixteen clients each write half a page at once, so every write's

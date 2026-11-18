@@ -1,5 +1,14 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **The live record period visited every live volume of a shard in one turn: sliced (2026-11-17, A-200, CLAUDE.md
+> "Bounded work everywhere"; g230).** `live_ship::period` ran each live volume's period work (`follow_candidates`,
+> `resolve`, the whole record or image it owed, `pending_sends`) for all of the shard's volumes inside one
+> `call_within` turn, a cost that grew with the volumes the shard owns while its clients waited. It now runs in slices
+> of about the shard's step quantum (`period_slice`, counted `fleet.live.period_slices` against `fleet.live.periods`),
+> each resuming after the last volume visited. Test: `a_shards_live_volumes_are_visited_by_the_period_in_slices_and_none_is_starved`
+> (the quantum injected to one volume a slice, `Daemon::inject_live_period_quantum`). **Owed (measurement, the
+> supervisor's):** the owner shard's longest step and its clients' p99 with thousands of live volumes, before and after.
+
 > **A burst on a live volume shipped the whole volume: fixed (2026-11-17, AC-8.9, A-200 amended; g230).** The owner's
 > credit was a fixed two entries (`live_ship::CREDIT`, R3 debt, with `RETAIN = 4`), and a publication it turned away
 > left the volume owing a whole record: its next entry carried every byte of the volume to every holder. Every barrier
