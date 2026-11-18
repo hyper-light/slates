@@ -1759,6 +1759,10 @@ async fn serve_peer_records(
                 .map_or(seed, |learned| learned.host)
             })
             .unwrap_or(seed);
+            // An owner's ask that this candidate make a volume's admission before it turns live shipping on (§4.2, A-401).
+            if slates_db::live::is_admit(&request) {
+              return crate::live_ship::serve_admit(control, local, peer_host, &request).await;
+            }
             // An install puts a whole state in a copy; a report or a fetch takes nothing in.
             let installs =
               !slates_db::live::is_report(&request) && !slates_db::live::is_fetch(&request);
@@ -5837,7 +5841,7 @@ async fn held_archive_in_turns(object: ObjectId, identity: [u8; 32]) -> Option<A
       let slice_bytes = s.config.copy_slice_bytes();
       let mut copied_bytes = 0u64;
       s.count(MATERIALIZE_ARCHIVE_SLICES, 1);
-      while let Some(chunk) = next.next() {
+      for chunk in next.by_ref() {
         let held = s
           .held_content
           .held_chunk(s.store.content.arena(), object, &identity, &chunk)?;

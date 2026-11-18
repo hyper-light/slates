@@ -6,8 +6,8 @@
 //! and once the log since the last snapshot has taken the recovery budget's worth of measured
 //! replay work and is at least the last snapshot's size (A-243), publishes the partition into
 //! the alternate snapshot slot and trims the log behind it. [`recover`] is the other direction:
-//! the newest valid snapshot slot, then the records after its sequence, with the torn tail cut
-//! off and the replay timed (the recovered tail's starting work).
+//! the newest valid snapshot slot, then the records after its sequence, a record at a time
+//! (A-420), with the torn tail cut off and the replay timed (the recovered tail's starting work).
 
 use std::time::Instant;
 
@@ -39,9 +39,9 @@ pub struct SnapshotPolicy {
 pub struct Tail {
   /// Its bytes.
   pub bytes: u64,
-  /// The replay work its commits measured, nanoseconds: each record's append (encode, checksum, copy into the ring,
-  /// the mirror of a replay's read, checksum and decode) and its apply. After a recovery it starts at that recovery's
-  /// own time, the snapshot's decode included.
+  /// The replay work its commits measured, nanoseconds: each record's append (its encode, its decode as the replay
+  /// will decode it, its checksum and its copy into the ring, which cover a replay's read, checksum and decode; A-420)
+  /// and its apply. After a recovery it starts at that recovery's own time, the snapshot's decode included.
   pub replay_ns: u64,
 }
 
@@ -123,10 +123,12 @@ pub struct Db {
   snapshots_taken: u64,
   /// The running figures ([`DbStats`]).
   stats: DbStats,
-  /// The time the commits since the last snapshot spent on what a replay repeats per record: the record's append
-  /// (encode, checksum, copy into the ring), the mirror of the replay's read, checksum and decode, and its apply; never
-  /// a wait outside them. Timing the apply alone made a replay look 16 to 21 times faster than it was (raft, A-243).
-  /// After a recovery it starts at the recovery's own time, so it errs early.
+  /// The time the commits since the last snapshot spent on what a replay repeats per record: the record's append (its
+  /// encode, its decode as the replay will decode it, its checksum and its copy into the ring, which cover the replay's
+  /// read, checksum and decode) and its apply; never a wait outside them. Timing the apply alone made a replay look 16
+  /// to 21 times faster than it was (raft, A-243); timing the encode in the decode's place made a record whose decode
+  /// allocates what its encode copies replay in more than was measured (A-420). After a recovery it starts at the
+  /// recovery's own time, so it errs early.
   replay_work_ns_since_snapshot: u64,
   /// The recovery budget the tail's work is held to: [`RECOVERY_BUDGET_NS`] unless the operator set one
   /// ([`Db::set_recovery_budget`]; GAPS §5).
@@ -288,14 +290,11 @@ fn derive_partition(
     }
     None => (Partition::new(caps, now_ns), None, 0, 0),
   };
-  let replayed = log.replay(segment, from_seq)?;
-  let mut records = 0u64;
-  for (_, entry) in &replayed.ops {
-    for op in entry.ops() {
-      partition.apply(op)?;
-    }
-    records = records.saturating_add(1);
-  }
+  // A record at a time: decoded, applied and dropped before the next is read, the work each commit timed (A-420).
+  let replayed = log.replay(segment, from_seq, |entry| {
+    entry.ops().iter().try_for_each(|op| partition.apply(op))
+  })?;
+  let records = replayed.records;
   Ok(DerivedPartition {
     partition,
     snapshot,
@@ -303,6 +302,37 @@ fn derive_partition(
     from_seq,
     replayed,
     records,
+  })
+}
+
+/// Runs `step`, adding its wall time to `work_ns`.
+fn timed<T>(work_ns: &mut u64, step: impl FnOnce() -> T) -> T {
+  let started = Instant::now();
+  let done = step();
+  let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+  *work_ns = work_ns.saturating_add(elapsed);
+  done
+}
+
+/// Appends `entry` as record `seq`, adding to `work_ns` what a replay of the record repeats (A-420): its decode, and
+/// the write's checksum and copy, which stand for the replay's own checksum and its copy out of the ring (an
+/// allocation, a zeroing and a copy, which the encode's allocation and its write of every byte bound). The encode
+/// itself is timed too, since it bounds the replay's read, so the measure covers the replay's work, erring early by the
+/// encode and a preempted commit's stall. It timed the encode in the decode's place, and a record whose decode
+/// allocates what its encode copies (a thousand one-byte keys) replayed in more than the commits measured, so the
+/// trigger let a tail run past its budget. A body that does not decode is refused before anything is written, as a
+/// replay would cut it.
+fn append_record(
+  log: &LogRing,
+  segment: &mut AnchorSegment,
+  seq: u64,
+  entry: &LogEntry,
+  work_ns: &mut u64,
+) -> Result<u64, DbError> {
+  timed(work_ns, || {
+    let encoded = LogRing::encode(entry);
+    encoded.decode_as_replayed(seq)?;
+    log.write(segment, seq, &encoded)
   })
 }
 
@@ -357,33 +387,32 @@ impl Db {
     }
   }
 
-  /// Adds the time since `started` to the tail's replay work (A-243). The time decides nothing inside an apply; the
-  /// commit consults it after the append ([`maintain`](Self::maintain)).
-  fn charge_replay_work(&mut self, started: Instant) {
-    let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-    self.replay_work_ns_since_snapshot = self.replay_work_ns_since_snapshot.saturating_add(elapsed);
+  /// Adds `work_ns` to the tail's replay work (A-243). The time decides nothing inside an apply; the commit consults it
+  /// after the append ([`maintain`](Self::maintain)).
+  fn charge_replay_work(&mut self, work_ns: u64) {
+    self.replay_work_ns_since_snapshot = self.replay_work_ns_since_snapshot.saturating_add(work_ns);
   }
 
   /// Applies `op` inside a transaction, timing it as replay work: its record is appended at the commit, so the apply
   /// and the append are timed apart.
   fn apply_timed(&mut self, op: &Op) -> Result<(), DbError> {
-    let started = Instant::now();
-    let applied = self.partition.apply(op);
-    self.charge_replay_work(started);
+    let mut work_ns = 0;
+    let applied = timed(&mut work_ns, || self.partition.apply(op));
+    self.charge_replay_work(work_ns);
     applied
   }
 
-  /// Appends a transaction's record at its commit, timing it as replay work: the encode, checksum and copy a replay
-  /// mirrors with its read, checksum and decode (A-243). A refused append's time counts too, so the measure errs early.
+  /// Appends a transaction's record at its commit ([`append_record`]), charging the work a replay repeats for it. A
+  /// refused append's time counts too, so the measure errs early.
   fn append_timed(
     &mut self,
     segment: &mut AnchorSegment,
     seq: u64,
     entry: &LogEntry,
   ) -> Result<u64, DbError> {
-    let started = Instant::now();
-    let appended = self.log.append(segment, seq, entry);
-    self.charge_replay_work(started);
+    let mut work_ns = 0;
+    let appended = append_record(&self.log, segment, seq, entry, &mut work_ns);
+    self.charge_replay_work(work_ns);
     appended
   }
 
@@ -409,21 +438,20 @@ impl Db {
     let entry = LogEntry {
       ops: vec![op.clone()],
     };
-    // One clock pair over the append and the apply, adjacent here: the work a replay repeats for this record (A-243).
-    let mut started = Instant::now();
-    let bytes = match self.log.append(segment, seq, &entry) {
+    // The work a replay repeats for this record, timed step by step: the append's ([`append_record`]), then the apply.
+    let mut work_ns = 0;
+    let bytes = match append_record(&self.log, segment, seq, &entry, &mut work_ns) {
       Ok(bytes) => bytes,
       Err(DbError::LogFull { .. }) => {
         // A full ring: the snapshot releases everything before it, then the append retries; the snapshot's own time is
-        // not replay work.
+        // not replay work, and the refused append's, timed before it, counts in the tail it starts, erring early.
         self.snapshot(segment)?;
-        started = Instant::now();
-        self.log.append(segment, seq, &entry)?
+        append_record(&self.log, segment, seq, &entry, &mut work_ns)?
       }
       Err(e) => return Err(e),
     };
-    let applied = self.partition.apply(op);
-    self.charge_replay_work(started);
+    let applied = timed(&mut work_ns, || self.partition.apply(op));
+    self.charge_replay_work(work_ns);
     applied?;
     self.next_seq = seq.saturating_add(1);
     self.since_snapshot_bytes = self.since_snapshot_bytes.saturating_add(bytes);
@@ -614,5 +642,203 @@ impl Db {
   /// The log's bytes used, free and capacity.
   pub fn log_usage(&self, segment: &AnchorSegment) -> Result<(u64, u64, u64), DbError> {
     self.log.usage(segment)
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::HostId;
+  use crate::catalog::{
+    BaseRecord, NamePolicy, PolicyRecord, Principal, Role, SizeClass, SnapshotId, VolumeId,
+    VolumeRecord, VolumeState,
+  };
+  use slates_anchor::Geometry;
+  use slates_machine::facts::Identity;
+
+  /// Shape: the segment page.
+  const PAGE: u64 = 4096;
+  /// Shape: a log ring with room for the whole tail (about 5 KiB a record), so no full ring forces a snapshot.
+  const LOG_BYTES: u64 = 4 << 20;
+  /// Shape: a snapshot slot: room for the one volume the test makes.
+  const SNAPSHOT_BYTES: u64 = 1 << 20;
+  /// Shape: the keys of each record, one byte each: a record whose decode allocates every key while its encode only
+  /// copies each key's five bytes into one buffer, so a measure that times the encode in the decode's place falls
+  /// short of the replay by most of the decode.
+  const KEYS: usize = 1 << 10;
+  /// Shape: the records whose measured work is compared with their replay: a tail whose replay is milliseconds in a
+  /// debug build, far past the clocks' resolution.
+  const RECORDS: usize = 64;
+  /// Shape: the timed recoveries of a segment, the median judged and the inner quartiles' spread its noise: five, so
+  /// the quartiles are the second and the fourth and the fastest and the slowest stand outside the spread.
+  const RECOVERIES: usize = 5;
+
+  fn segment() -> AnchorSegment {
+    AnchorSegment::create(
+      &format!("slates-db-replay-unit-{}", std::process::id()),
+      &Identity {
+        cpu: "test".into(),
+        os: "test".into(),
+        arch: "test".into(),
+        cores: 4,
+        memory: 1,
+        page: PAGE,
+      },
+      Geometry {
+        partitions: 1,
+        page: PAGE,
+        profile_bytes: PAGE,
+        log_bytes: LOG_BYTES,
+        snapshot_bytes: SNAPSHOT_BYTES,
+        landing_slots: 1,
+        landing_slot_bytes: PAGE,
+      },
+    )
+    .unwrap()
+  }
+
+  fn caps() -> PartitionCaps {
+    PartitionCaps {
+      volumes: 1 << 4,
+      snapshots: 1 << 4,
+      attachments: 1 << 4,
+      segment_slots: 4,
+      timers: 1 << 4,
+      tick_ns: 1_000,
+      green_chain_bytes: 1 << 20,
+      audit_records: 1 << 4,
+    }
+  }
+
+  fn volume() -> VolumeRecord {
+    let mut bytes = [0u8; 16];
+    bytes[0] = 1;
+    VolumeRecord {
+      id: VolumeId { bytes },
+      name: "signed".to_owned(),
+      owner_shard: 0,
+      policy: PolicyRecord {
+        size: SizeClass::Bounded { limit: 1 << 30 },
+        names: NamePolicy::Exact,
+        require_locked: false,
+        role: Role::Plain,
+        live_shipped: false,
+        live_holders: None,
+        write: None,
+        write_version: 0,
+        signers: Vec::new(),
+      },
+      base: BaseRecord::Scratch,
+      head: SnapshotId { value: 0 },
+      epoch: 0,
+      referenced_bytes: 0,
+      unique_bytes: 0,
+      state: VolumeState::Live,
+      lease: None,
+      owner: Principal::Uid {
+        host: HostId(0),
+        uid: 1000,
+      },
+      access: vec![],
+      created_ns: 0,
+      catalog_version: 0,
+      taken_over: None,
+    }
+  }
+
+  /// A recovery and its cost as the calling thread's CPU time: the work the replay did, which a loaded machine does not
+  /// stretch (the cadence tests' measure, `crates/db/tests/snapshot_cadence.rs`).
+  #[cfg(unix)]
+  fn recovery_cost_ns(segment: &mut AnchorSegment) -> u64 {
+    let before = slates_rt::registry::calling_thread_cpu().unwrap();
+    let recovered = recover(segment, 0, caps(), 0).unwrap().1;
+    let after = slates_rt::registry::calling_thread_cpu().unwrap();
+    assert!(!recovered.torn, "the tail verifies");
+    after.spent_ns.saturating_sub(before.spent_ns)
+  }
+
+  /// [`recovery_cost_ns`] on Windows, by wall time: the thread's CPU time is charged a scheduler tick at a time there
+  /// (15.6 ms by default), too coarse for a span this short.
+  #[cfg(not(unix))]
+  fn recovery_cost_ns(segment: &mut AnchorSegment) -> u64 {
+    let recovered = recover(segment, 0, caps(), 0).unwrap().1;
+    assert!(!recovered.torn, "the tail verifies");
+    recovered.replay_ns
+  }
+
+  /// `RECOVERIES` recoveries of the segment as it stands: their median cost and the spread of their inner quartiles.
+  fn recoveries(segment: &mut AnchorSegment) -> (u64, u64) {
+    let mut costs: Vec<u64> = (0..RECOVERIES).map(|_| recovery_cost_ns(segment)).collect();
+    costs.sort_unstable();
+    let quartile = RECOVERIES / 4;
+    (
+      costs[RECOVERIES / 2],
+      costs[RECOVERIES - 1 - quartile] - costs[quartile],
+    )
+  }
+
+  /// A-420 (A-243's open line), §4.8. Do: set a volume's signers again and again to a thousand one-byte keys, with no
+  /// snapshot, and compare the replay work the commits measured for those records with what a recovery spends
+  /// replaying them (the median of five recoveries past a baseline recovery of the segment before them, as the calling
+  /// thread's CPU time). Expect: the measured work covers the replay's, within the recoveries' own noise, since the
+  /// snapshot trigger fires on the measure and holds a recovery to its budget only if the measure is at least the
+  /// replay. The commits timed each record's encode, checksum, copy and apply, and the replay's decode allocates every
+  /// key where the encode copies its bytes into one buffer, so the measure fell short of the replay (A-243's open
+  /// line: the commits measured 0.4x to 1.25x the replay on CI's macOS runner, 2026-11-18).
+  #[test]
+  fn a_tails_measured_replay_work_covers_its_replay_when_its_records_decode_dearer_than_they_encode()
+   {
+    let mut segment = segment();
+    let mut db = recover(&mut segment, 0, caps(), 0).unwrap().0;
+    db.set_policy(SnapshotPolicy {
+      bytes_between_snapshots: u64::MAX,
+    });
+    let record = volume();
+    let id = record.id;
+    db.mutate(&mut segment, &Op::VolumeCreated { record }, 0)
+      .unwrap();
+    let keys: Vec<Vec<u8>> = (0..KEYS)
+      .map(|n| vec![u8::try_from(n % 251).unwrap()])
+      .collect();
+    // The first set sizes the volume's key list, so every later apply reuses it at the commit and in the replay alike.
+    db.mutate(
+      &mut segment,
+      &Op::VolumeSignersSet {
+        id,
+        keys: keys.clone(),
+      },
+      0,
+    )
+    .unwrap();
+    let (baseline_ns, baseline_spread_ns) = recoveries(&mut segment);
+    let before = db.stats().tail;
+    for _ in 0..RECORDS {
+      db.mutate(
+        &mut segment,
+        &Op::VolumeSignersSet {
+          id,
+          keys: keys.clone(),
+        },
+        0,
+      )
+      .unwrap();
+    }
+    let after = db.stats().tail;
+    let measured_ns = after.replay_ns - before.replay_ns;
+    let (tail_ns, tail_spread_ns) = recoveries(&mut segment);
+    let replay_ns = tail_ns.saturating_sub(baseline_ns);
+    let noise_ns = tail_spread_ns + baseline_spread_ns;
+    println!(
+      "{RECORDS} records of {KEYS} keys, {} bytes: the commits measured {measured_ns} ns of replay work; a recovery \
+       replayed them in {replay_ns} ns past a {baseline_ns} ns baseline (noise {noise_ns} ns), {} per mille of the \
+       measure",
+      after.bytes - before.bytes,
+      replay_ns * 1_000 / measured_ns.max(1)
+    );
+    assert!(
+      replay_ns <= measured_ns + noise_ns,
+      "a tail the commits measured at {measured_ns} ns of replay work replayed in {replay_ns} ns past the baseline \
+       ({noise_ns} ns of noise): the trigger would let it run past its budget"
+    );
   }
 }

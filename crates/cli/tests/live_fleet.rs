@@ -100,17 +100,7 @@ fn run(instance: &str, args: &[&str]) -> (i32, String, String) {
 }
 
 fn run_with_stdin(instance: &str, args: &[&str], input: &[u8]) -> (i32, String) {
-  use std::io::Write;
-  let mut child = slates()
-    .arg("--instance")
-    .arg(instance)
-    .args(args)
-    .stdin(Stdio::piped())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .spawn()
-    .unwrap();
-  child.stdin.take().unwrap().write_all(input).unwrap();
+  let child = spawned_with_stdin(instance, args, input, Stdio::piped());
   let output = child.wait_with_output().unwrap();
   (
     output.status.code().unwrap_or(-1),
@@ -2547,25 +2537,13 @@ fn run_with_stdin_within(
   input: &[u8],
   within: Duration,
 ) -> Option<(i32, String)> {
-  use std::io::{Read, Write};
-  let mut child = slates()
-    .arg("--instance")
-    .arg(instance)
-    .args(args)
-    .stdin(Stdio::piped())
-    .stdout(Stdio::null())
-    .stderr(Stdio::piped())
-    .spawn()
-    .unwrap();
-  child.stdin.take().unwrap().write_all(input).unwrap();
+  let mut child = spawned_with_stdin(instance, args, input, Stdio::null());
   let deadline = Instant::now() + within;
   loop {
-    if let Some(status) = child.try_wait().unwrap() {
-      let mut err = String::new();
-      if let Some(mut stderr) = child.stderr.take() {
-        stderr.read_to_string(&mut err).unwrap();
-      }
-      return Some((status.code().unwrap_or(-1), err));
+    match child.try_wait() {
+      Ok(Some(status)) => return Some((status.code().unwrap_or(-1), stderr_of(&mut child))),
+      Ok(None) => {}
+      Err(error) => panic!("waiting on `slates {}`: {error}", args.join(" ")),
     }
     if Instant::now() >= deadline {
       let _ = child.kill();
@@ -2574,6 +2552,38 @@ fn run_with_stdin_within(
     }
     pause();
   }
+}
+
+/// `slates --instance <instance> <args>` started with `input` written to its standard input, its standard error piped
+/// and its standard output as `stdout` says.
+fn spawned_with_stdin(
+  instance: &str,
+  args: &[&str],
+  input: &[u8],
+  stdout: Stdio,
+) -> std::process::Child {
+  use std::io::Write;
+  let mut child = slates()
+    .arg("--instance")
+    .arg(instance)
+    .args(args)
+    .stdin(Stdio::piped())
+    .stdout(stdout)
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  child.stdin.take().unwrap().write_all(input).unwrap();
+  child
+}
+
+/// What an exited child wrote to its standard error.
+fn stderr_of(child: &mut std::process::Child) -> String {
+  use std::io::Read;
+  let mut err = String::new();
+  if let Some(mut stderr) = child.stderr.take() {
+    stderr.read_to_string(&mut err).unwrap();
+  }
+  err
 }
 
 // ── Every transport's durability claim on a live volume (A-200, AC-8.3): FUSE `fsync` and the NFS stable write and

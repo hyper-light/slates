@@ -59,6 +59,10 @@ pub const MAX_OPEN_HANDLES: usize = 1 << 16;
 /// a time up to [`MAX_OPEN_HANDLES`] and an idle bridge holds one small segment.
 const HANDLE_SEGMENT: usize = 256;
 
+/// A transport's write log (A-410): handed the inode, the offset and the bytes a write took, it says whether it kept
+/// them.
+pub type WriteLogger<'v> = &'v mut dyn FnMut(u64, u64, &[u8]) -> bool;
+
 /// The `Bridge` over one volume.
 pub struct VolumeBridge<'v> {
   /// The id of the volume this bridge serves. A request's [`OpContext`] names the volume its
@@ -100,7 +104,7 @@ pub struct VolumeBridge<'v> {
   /// Where a transport whose writes outlive its daemon only through the shard's write log keeps each write this bridge
   /// takes (A-410; [`VolumeBridge::logging_writes`]): handed the inode, the offset and the bytes written, it says
   /// whether it kept them. None for a transport that keeps its writes otherwise, or not at all.
-  write_log: Option<&'v mut dyn FnMut(u64, u64, &[u8]) -> bool>,
+  write_log: Option<WriteLogger<'v>>,
   /// Whether a write this bridge took was not kept by its [`VolumeBridge::logging_writes`] log, so the reply must wait
   /// for the publication that carries it ([`Bridge::awaits_publication`]; A-410).
   write_unlogged: bool,
@@ -399,10 +403,7 @@ impl<'v> VolumeBridge<'v> {
   /// device (A-63's rule, A-358's for a reply). One it did not keep makes the bridge owe a publication, which a transport
   /// reads as [`Bridge::awaits_publication`] and runs before the reply.
   #[must_use]
-  pub fn logging_writes(
-    mut self,
-    log: &'v mut dyn FnMut(u64, u64, &[u8]) -> bool,
-  ) -> VolumeBridge<'v> {
+  pub fn logging_writes(mut self, log: WriteLogger<'v>) -> VolumeBridge<'v> {
     self.write_log = Some(log);
     self
   }
