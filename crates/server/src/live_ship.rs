@@ -3388,6 +3388,7 @@ mod tests {
         access: Vec::new(),
         live_shipped: true,
         live_holders: holders.map(|holders| slates_db::catalog::LiveHolders { epoch: 1, holders }),
+        work_of: None,
       }
       .to_record_bytes()
     };
