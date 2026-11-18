@@ -626,12 +626,13 @@ fn every_piece() -> Archive {
 fn a_restore_in_steps_of_one_piece_is_the_restore_in_one_call() {
   let archive = every_piece();
   let whole = restore(&archive, ADMITTED).expect("restores in one call");
-  let (planned, plan_steps) = plan_in_steps(&archive);
+  let (planned, plan_steps) = plan_in_steps(&archive).expect("plans");
   assert_eq!(
     Ok(planned.needed()),
     slates_archive::restore_needed(&archive)
   );
-  let (stepped, restore_steps) = restore_in_steps(planned.restoring(ADMITTED).expect("admitted"));
+  let (stepped, restore_steps) =
+    restore_in_steps(planned.restoring(ADMITTED).expect("admitted")).expect("restores in steps");
   assert_eq!(stepped, whole, "the same volume either way");
   assert_eq!(
     stepped.files["outer/inner/sparse"]
@@ -645,7 +646,7 @@ fn a_restore_in_steps_of_one_piece_is_the_restore_in_one_call() {
     whole.files.len()
   );
   let needed = slates_archive::restore_needed(&archive).unwrap();
-  let (planned, _) = plan_in_steps(&archive);
+  let (planned, _) = plan_in_steps(&archive).expect("plans");
   assert!(matches!(
     planned.restoring(needed - 1),
     Err(ArchiveError::OverBudget { needed: refused, budget }) if refused == needed && budget == needed - 1
@@ -654,33 +655,33 @@ fn a_restore_in_steps_of_one_piece_is_the_restore_in_one_call() {
   missing
     .chunks
     .retain(|chunk| chunk.encoding != slates_archive::Encoding::Lz4);
-  let (planned, _) = plan_in_steps(&missing);
+  let (planned, _) = plan_in_steps(&missing).expect("plans");
   let refused = refusal_in_steps(planned.restoring(ADMITTED).unwrap());
   assert_eq!(refused, Some(ArchiveError::MissingChunk));
   assert_eq!(restore(&missing, ADMITTED), Err(ArchiveError::MissingChunk));
 }
 
-/// Plans `archive`'s restore a piece a step: the plan and the steps it took.
-fn plan_in_steps(archive: &Archive) -> (slates_archive::Planned<'_>, u64) {
+/// Plans `archive`'s restore a piece a step: the plan and the steps it took, or the refusal that ended it.
+fn plan_in_steps(archive: &Archive) -> Result<(slates_archive::Planned<'_>, u64), ArchiveError> {
   let mut planning = slates_archive::Planning::new(archive);
   let mut steps = 0u64;
   loop {
     steps += 1;
-    if let Some(planned) = planning.step(|| true).expect("plans") {
-      return (planned, steps);
+    if let Some(planned) = planning.step(|| true)? {
+      return Ok((planned, steps));
     }
   }
 }
 
-/// Restores a planned archive a piece a step: the restored volume and the steps it took.
+/// Restores a planned archive a piece a step: the restored volume and the steps it took, or the refusal that ended it.
 fn restore_in_steps(
   mut restoring: slates_archive::Restoring<'_>,
-) -> (slates_archive::Restored, u64) {
+) -> Result<(slates_archive::Restored, u64), ArchiveError> {
   let mut steps = 0u64;
   loop {
     steps += 1;
-    if let Some(restored) = restoring.step(|| true).expect("restores in steps") {
-      return (restored, steps);
+    if let Some(restored) = restoring.step(|| true)? {
+      return Ok((restored, steps));
     }
   }
 }
