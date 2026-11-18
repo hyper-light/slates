@@ -257,8 +257,11 @@ pub enum Landing {
     manifest: [u8; 32],
     /// The summary of what would be written.
     summary: LandingSummary,
-    /// Conflicts found before any write.
+    /// Conflicts found before any write, each `PATH (CLASS)`: as many as one reply holds (A-267).
     conflicts: Vec<String>,
+    /// Conflicts past what one reply holds (A-267): every entry of the presentation, its conflict among it, is read
+    /// a page at a time ([`Client::landing_entries`]).
+    conflicts_elided: u32,
   },
 }
 
@@ -298,8 +301,21 @@ pub struct Attachment {
 pub struct Advanced {
   /// The version now pinned.
   pub version: u64,
-  /// The invalidated paths, sorted.
+  /// The invalidated paths, sorted: as many as one reply holds (A-267).
   pub invalidated: Vec<String>,
+  /// Invalidated paths past what one reply holds (A-267): more changed than the reply carried, so a holder of the
+  /// view's reads treats every path as invalidated, or reads a green's with [`Client::changed_since`].
+  pub invalidated_elided: u32,
+}
+
+/// What `rewitness` did (§4.15 `rewitness`): the paths re-witnessed, as many as one reply holds, and the count of the
+/// rest (A-267), which the rewitness took too.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rewitnessed {
+  /// The paths re-witnessed, as many as one reply holds.
+  pub paths: Vec<String>,
+  /// Paths re-witnessed past what one reply holds.
+  pub paths_elided: u32,
 }
 
 /// The client.
@@ -969,9 +985,11 @@ fn extract_advanced(body: ReplyBody) -> Result<Advanced, ClientError> {
     ReplyBody::Advanced {
       version,
       invalidated,
+      invalidated_elided,
     } => Ok(Advanced {
       version,
       invalidated,
+      invalidated_elided,
     }),
     _ => Err(ClientError::UnexpectedReply { verb: "advance" }),
   }
@@ -1044,11 +1062,13 @@ fn extract_landed(body: ReplyBody) -> Result<Landing, ClientError> {
       manifest,
       summary,
       conflicts,
+      conflicts_elided,
     } => Ok(Landing::GrantRequired {
       landing,
       manifest,
       summary,
       conflicts,
+      conflicts_elided,
     }),
     _ => Err(ClientError::UnexpectedReply { verb: "land" }),
   }
@@ -4241,11 +4261,13 @@ impl Client {
         manifest,
         summary,
         conflicts,
+        conflicts_elided,
       } => Ok(Landing::GrantRequired {
         landing,
         manifest,
         summary,
         conflicts,
+        conflicts_elided,
       }),
       _ => Err(ClientError::UnexpectedReply { verb: "land" }),
     }
@@ -4637,14 +4659,21 @@ impl Client {
     }
   }
 
-  /// Re-witnesses drifted entries (all of them when `paths` is none); the paths done.
+  /// Re-witnesses drifted entries (all of them when `paths` is none); the paths done, as many as one reply holds, and
+  /// the count of the rest (A-267).
   pub fn rewitness(
     &mut self,
     volume: VolumeId,
     paths: Option<Vec<String>>,
-  ) -> Result<Vec<String>, ClientError> {
+  ) -> Result<Rewitnessed, ClientError> {
     match self.call(&RequestBody::Rewitness { volume, paths })? {
-      ReplyBody::Rewitnessed { paths } => Ok(paths),
+      ReplyBody::Rewitnessed {
+        paths,
+        paths_elided,
+      } => Ok(Rewitnessed {
+        paths,
+        paths_elided,
+      }),
       _ => Err(ClientError::UnexpectedReply { verb: "rewitness" }),
     }
   }

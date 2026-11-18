@@ -127,9 +127,14 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// seam over the contract's volume verbs, implemented by [`Instance`] and by the simulator [`SimVolumes`] (A-310) (the
 /// same day). 10: lists a page at a time (A-263 to A-267): `Page`, `Instance::{list_page, grants_page, audit_page,
 /// changed_since, changed_since_page, drift_page}`, `DriftPage`, `DriftReport::elided`, `ChangedCursor`;
-/// `Instance::drift` reads every entry (the same day).
-pub const CONTRACT: u32 = 10;
+/// `Instance::drift` reads every entry (the same day). 11: a list a verb's own reply carries counts what one reply could
+/// not hold (A-267): `Instance::rewitness` answers `Rewitnessed { paths, paths_elided }`, `Stale::Disk` carries
+/// `elided`, `LandingReport` carries `degraded_elided`, and a presentation is clean only when it carries and counts no
+/// conflict (the same day).
+pub const CONTRACT: u32 = 11;
 
+/// What a rewitness did (§4.15 `rewitness`): the paths one reply holds and the count of the rest (A-267).
+pub use slates_client::Rewitnessed;
 /// The typed client and its own types, for the verbs [`Instance::client`] lends outside the contract.
 pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, VhostUserDevice};
 /// The wire's types the contract takes and returns (§4.9; append-only, D-15).

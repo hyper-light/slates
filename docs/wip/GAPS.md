@@ -331,9 +331,15 @@
 >   entries was refused; it now carries what fits beside its other fields and `drifted_elided`, `Drifted` reads them all a
 >   page at a time, and `slates status --drift` walks it. **Owed:** an SDK binding for the paged read
 >   (`docs/bugs/2026-11-08-a-status-with-much-drift-outgrew-one-reply.md`).
-> - **Still open, the same one-reply shape**, by their code and not reproduced: the conflict and invalidation lists of
->   `Submitted`, `Rebased`, `GrantRequired` and `Advanced`. Each needs
->   a cursor the way `List`, `ChangedSince` and `ReadDir` have, or a derived bound and a typed refusal.
+> - **A list a verb's own reply carries: fixed (A-267, 2026-11-17, goal g247).** Reproduced at 400 entries, each refused
+>   "reply too large for the bulk area": an advance and a rewitness after taking effect, a presentation after it was
+>   recorded, and a granted landing's `LandingConflict`, replaced by `BadRequest`. Each now carries what one reply holds
+>   and counts the rest (`invalidated_elided`, `paths_elided`, `conflicts_elided`, `entries_elided`), every reader
+>   showing the count. Siblings fixed the same way: a finished landing's degraded cells (`degraded_elided`; one a
+>   directory where the host refuses a directory's sync) and a status's mounts, whose budget counted paths alone
+>   (`docs/bugs/2026-11-17-lists-a-verbs-own-reply-carries-outgrew-one-reply.md`).
+> - **Still open, the same one-reply shape:** the conflict windows of `Submitted` and `Rebased` (reproduced: refused at
+>   400 windows). Owed: kept with the work and paged from it, the client handing back every window.
 
 > **A version appended before its owner restarted never committed: fixed (2026-11-07, §4.16 Commit, AUD-11;
 > A-246).** A restarted owner rebuilt its greens from their chains, but not the merge records

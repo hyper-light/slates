@@ -19,8 +19,8 @@
 //! increment the approver was shown. A consumer's own mode and signed work are the daemon's next pieces (GAPS).
 
 use slates_client::{
-  Attachment, Client, ClientError, CreateSpec, Landing, Rebased, ShardsStream, Submitted,
-  VhostUserDevice,
+  Attachment, Client, ClientError, CreateSpec, Landing, Rebased, Rewitnessed, ShardsStream,
+  Submitted, VhostUserDevice,
 };
 use slates_ipc::protocol::{
   DaemonReport, Filter, GrantScope, Intent, MergeWindow, PlannedEntry, ReadAt, Refusal, ReplyBody,
@@ -329,12 +329,13 @@ impl Instance {
   }
 
   /// Takes the disk's present state of drifted entries as their new base (all of them when `paths` is `None`, §4.15
-  /// `rewitness`); the paths done. The volume's own changes to them stay its own.
+  /// `rewitness`); the paths done, as many as one reply holds, and the count of the rest (A-267), which were taken
+  /// too. The volume's own changes to them stay its own.
   pub fn rewitness(
     &mut self,
     volume: VolumeId,
     paths: Option<Vec<String>>,
-  ) -> Result<Vec<String>, Error> {
+  ) -> Result<Rewitnessed, Error> {
     self
       .client
       .rewitness(volume, paths)
@@ -538,6 +539,7 @@ impl Instance {
         manifest,
         summary,
         conflicts,
+        conflicts_elided,
       }) => {
         let approval = LandingApproval {
           request: request.clone(),
@@ -546,7 +548,8 @@ impl Instance {
           summary: summary_of(&summary)?,
           verification: Verification::Unsigned,
         };
-        if conflicts.is_empty() {
+        // A reply carries the conflicts one reply holds and counts the rest (A-267): clean only when it has neither.
+        if conflicts.is_empty() && conflicts_elided == 0 {
           Ok(Presented::Plan(approval))
         } else {
           self.conflicts_of(&approval).map(Presented::Settled)

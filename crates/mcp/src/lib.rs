@@ -543,7 +543,11 @@ impl McpServer {
     let attachment = u64_arg(args, "attachment")?;
     let version = args.get("version").and_then(Value::as_u64);
     let advanced = self.client.advance(attachment, version).map_err(refusal)?;
-    Ok(json!({ "version": advanced.version, "invalidated": advanced.invalidated }))
+    Ok(json!({
+      "version": advanced.version,
+      "invalidated": advanced.invalidated,
+      "invalidated_elided": advanced.invalidated_elided,
+    }))
   }
 
   /// Reads a file at a view (§4.12 `slates.fs.read`): a green's head, its `version`, or the version
@@ -824,11 +828,14 @@ impl McpServer {
 
   fn rewitness(&mut self, args: &Value) -> Result<Value, McpError> {
     let volume = volume_arg(args, "volume")?;
-    let paths = self
+    let rewitnessed = self
       .client
       .rewitness(volume, paths_opt(args))
       .map_err(refusal)?;
-    Ok(json!({ "rewitnessed": paths }))
+    Ok(json!({
+      "rewitnessed": rewitnessed.paths,
+      "rewitnessed_elided": rewitnessed.paths_elided,
+    }))
   }
 
   fn pin(&mut self, args: &Value) -> Result<Value, McpError> {
@@ -867,12 +874,14 @@ impl McpServer {
         manifest,
         summary,
         conflicts,
+        conflicts_elided,
       } => Ok(json!({
         "grant_required": true,
         "landing": landing,
         "manifest": hex32(&manifest),
         "summary": landing_summary_json(&summary),
         "conflicts": conflicts,
+        "conflicts_elided": conflicts_elided,
         "grant_with": format!("slates grant {landing}"),
       })),
       Landing::Landed(outcome) => Ok(json!({
@@ -1123,7 +1132,8 @@ fn tool_list() -> Vec<Value> {
     tool(
       "slates.merge.advance",
       "Re-pin a green attachment to `version` (or the head): the version pinned and the paths \
-       invalidated. An attachment's view never moves otherwise.",
+       invalidated, as many as one reply holds; `invalidated_elided` counts the rest, and then every path \
+       counts as invalidated. An attachment's view never moves otherwise.",
       json!({ "attachment": integer, "version": integer }),
       json!(["attachment"]),
     ),
@@ -1265,7 +1275,8 @@ fn tool_list() -> Vec<Value> {
     ),
     tool(
       "slates.base.rewitness",
-      "Re-witness a volume's base entries (given `paths`, or all); the paths whose base drifted.",
+      "Re-witness a volume's base entries (given `paths`, or all); the paths whose base drifted, as many as \
+       one reply holds, and `rewitnessed_elided` counting the rest, which were re-witnessed too.",
       json!({ "volume": string, "paths": { "type": "array", "items": string } }),
       json!(["volume"]),
     ),
@@ -1825,6 +1836,7 @@ pub fn outcome_json(o: &LandingOutcome) -> Value {
       "dirs": o.durability.dirs,
     },
     "degraded": o.degraded.iter().map(degradation_json).collect::<Vec<_>>(),
+    "degraded_elided": o.degraded_elided,
     "barriers": o.barriers,
   })
 }

@@ -2844,6 +2844,7 @@ fn assert_the_view_advances(
     ReplyBody::Advanced {
       version: second.value,
       invalidated: vec!["/f".to_owned()],
+      invalidated_elided: 0,
     }
   );
   let _ = advanced.send(());

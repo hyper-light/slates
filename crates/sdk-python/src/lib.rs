@@ -161,6 +161,7 @@ fn landing_dict(py: Python<'_>, landing: Landing) -> PyResult<Py<PyDict>> {
       manifest,
       summary,
       conflicts,
+      conflicts_elided,
     } => {
       dict.set_item("grant_required", true)?;
       dict.set_item("landing", landing)?;
@@ -178,6 +179,8 @@ fn landing_dict(py: Python<'_>, landing: Landing) -> PyResult<Py<PyDict>> {
       s.set_item("filtered_out", summary.filtered_out)?;
       dict.set_item("summary", s)?;
       dict.set_item("conflicts", conflicts)?;
+      // Conflicts past what one reply holds (A-267): every entry, its conflict among it, is read from the presentation.
+      dict.set_item("conflicts_elided", conflicts_elided)?;
       dict.set_item("grant_with", format!("slates grant {landing}"))?;
     }
   }

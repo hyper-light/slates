@@ -320,8 +320,10 @@ pub enum Stale {
   Grant,
   /// The disk changed under these entries after the plan was made (§4.15 step 4): present again.
   Disk {
-    /// The entries, from the target's root.
+    /// The entries, from the target's root: as many as one reply holds (A-267).
     paths: Vec<String>,
+    /// Entries past what one reply holds (A-267): presenting again lists every one.
+    elided: u32,
   },
   /// A bootstrap naming another daemon start.
   Bootstrap,
@@ -699,7 +701,13 @@ impl Error {
       Refusal::GrantMismatch => Error::Stale(Stale::Approval),
       Refusal::PolicyChanged { current } => Error::Stale(Stale::Policy { current }),
       Refusal::GrantInvalid => Error::Stale(Stale::Grant),
-      Refusal::LandingConflict { entries } => Error::Stale(Stale::Disk { paths: entries }),
+      Refusal::LandingConflict {
+        entries,
+        entries_elided,
+      } => Error::Stale(Stale::Disk {
+        paths: entries,
+        elided: entries_elided,
+      }),
       Refusal::ConsensusBootstrapStale => Error::Stale(Stale::Bootstrap),
       Refusal::ConsensusRecoveryStale => Error::Stale(Stale::Recovery),
       Refusal::LeaseHeld { epoch } => Error::Busy(Busy::WriteLease { epoch }),

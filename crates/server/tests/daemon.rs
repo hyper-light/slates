@@ -1351,7 +1351,7 @@ fn a_landing_over_an_outsiders_change_refuses_naming_only_the_conflict() {
   assert!(
     matches!(
       &landed,
-      ReplyBody::Refused { refusal: Refusal::LandingConflict { entries } } if entries == &["/b.txt".to_owned()]
+      ReplyBody::Refused { refusal: Refusal::LandingConflict { entries, .. } } if entries == &["/b.txt".to_owned()]
     ),
     "the conflict names /b.txt alone: {landed:?}"
   );
@@ -3792,6 +3792,7 @@ fn advance(client: &mut Client, attachment: u64, version: Option<u64>) -> (u64, 
   let ReplyBody::Advanced {
     version,
     invalidated,
+    ..
   } = client.call(&RequestBody::Advance {
     attachment,
     version,

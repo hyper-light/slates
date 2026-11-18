@@ -2947,11 +2947,14 @@ pub struct LandingOutcome {
   pub held: u64,
   /// The durability the landing achieved (§4.15 step 8).
   pub durability: LandingDurability,
-  /// Every Degraded cell the landing met, in the order met.
+  /// Every Degraded cell the landing met, in the order met, as many as one reply holds (A-267).
   pub degraded: Vec<LandingDegradation>,
   /// The batch barriers the landing took (§4.15 step 8, A-130): each made a batch of written-out files durable
   /// before any of them was placed, so fewer than the files written whenever a batch held more than one.
   pub barriers: u64,
+  /// Degraded cells past what one reply holds (A-267), never sent: a host that refuses every directory's sync meets
+  /// one a directory, so `degraded` carries the first that fit beside the rest of the outcome. Appended.
+  pub degraded_elided: u32,
 }
 
 /// The durability a landing achieved (§4.15 step 8).
@@ -3172,8 +3175,11 @@ pub enum Refusal {
   },
   /// The landing hit conflicts; nothing was written (§4.15 step 4).
   LandingConflict {
-    /// The conflicting entries.
+    /// The conflicting entries: as many as one reply holds beside the count (§4.3; A-267).
     entries: Vec<String>,
+    /// Conflicting entries past what one reply holds (A-267), never sent: presenting the landing again lists every
+    /// one (`GrantRequired`, then `LandingEntries`).
+    entries_elided: u32,
   },
   /// Another session holds the target's landing lease (§4.15, AC-2.9).
   LandingLeaseHeld {
@@ -3660,8 +3666,10 @@ pub enum ReplyBody {
   },
   /// Re-witnessed.
   Rewitnessed {
-    /// The paths re-witnessed.
+    /// The paths re-witnessed: as many as one reply holds beside the count (§4.3; A-267).
     paths: Vec<String>,
+    /// Paths re-witnessed past what one reply holds (A-267), never sent: the rewitness took them all.
+    paths_elided: u32,
   },
   /// Pinned.
   Pinned {
@@ -3696,8 +3704,12 @@ pub enum ReplyBody {
     manifest: [u8; 32],
     /// The summary of what would be written.
     summary: LandingSummary,
-    /// Conflicts found before any write (empty when the landing is clean).
+    /// Conflicts found before any write (empty when the landing is clean), each `PATH (CLASS)`: as many as one reply
+    /// holds beside the rest of it (§4.3; A-267).
     conflicts: Vec<String>,
+    /// Conflicts past what one reply holds (A-267), never sent here: every entry of the presentation, its conflict
+    /// among it, is read a page at a time (`LandingEntries`).
+    conflicts_elided: u32,
   },
   /// A landing finished (or partially).
   Landed {
@@ -3753,8 +3765,13 @@ pub enum ReplyBody {
   Advanced {
     /// The version the attachment now pins.
     version: u64,
-    /// The paths the move invalidated — those some version in the span changed, sorted.
+    /// The paths the move invalidated — those some version in the span changed, sorted: as many as one reply holds
+    /// beside the rest of it (§4.3; A-267).
     invalidated: Vec<String>,
+    /// Invalidated paths past what one reply holds (A-267), never sent: more changed than the reply carries, so a
+    /// holder of the view's reads treats every path as invalidated (a superset is always safe), or reads a green's
+    /// changes a page at a time (`ChangedSince`).
+    invalidated_elided: u32,
   },
   /// A file's bytes at the requested view (§4.12 `read`). Appended for append-only evolution.
   ReadBytes {

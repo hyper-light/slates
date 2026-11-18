@@ -236,6 +236,8 @@ pub struct LandingOutcomeJs {
   pub held: i64,
   pub durability: LandingDurabilityJs,
   pub degraded: Vec<LandingDegradationJs>,
+  /// Degraded cells past what one reply holds (A-267).
+  pub degraded_elided: i64,
   pub barriers: i64,
 }
 
@@ -335,6 +337,8 @@ pub struct LandingResult {
   pub manifest: Option<String>,
   pub summary: Option<LandingSummaryJs>,
   pub conflicts: Option<Vec<String>>,
+  /// Conflicts past what one reply holds (A-267): every entry, its conflict among it, is read from the presentation.
+  pub conflicts_elided: Option<i64>,
   pub grant_with: Option<String>,
 }
 
@@ -375,12 +379,14 @@ fn landing_result(landing: Landing) -> Result<LandingResult> {
           .iter()
           .map(degradation_js)
           .collect::<Result<Vec<_>>>()?,
+        degraded_elided: i64::from(o.degraded_elided),
         barriers: status_i64(o.barriers, "barriers")?,
       }),
       landing: None,
       manifest: None,
       summary: None,
       conflicts: None,
+      conflicts_elided: None,
       grant_with: None,
     }),
     Landing::GrantRequired {
@@ -388,6 +394,7 @@ fn landing_result(landing: Landing) -> Result<LandingResult> {
       manifest,
       summary,
       conflicts,
+      conflicts_elided,
     } => {
       let mut by_action = Vec::with_capacity(summary.by_action.len());
       for action in summary.by_action {
@@ -407,6 +414,7 @@ fn landing_result(landing: Landing) -> Result<LandingResult> {
           filtered_out: status_i64(summary.filtered_out, "filteredOut")?,
         }),
         conflicts: Some(conflicts),
+        conflicts_elided: Some(i64::from(conflicts_elided)),
         grant_with: Some(format!("slates grant {landing}")),
       })
     }

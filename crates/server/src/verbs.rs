@@ -9177,9 +9177,10 @@ fn bind_mount(
   }
 }
 
-/// Derived: the bytes of mount points one status report carries — a quarter of the reply's bulk chunk
+/// Derived: the bytes of mounts one status report carries — a quarter of the reply's bulk chunk
 /// (`BULK_CHUNK_BYTES` / 4), so the mounts never crowd the report's other fields out of the slot; the
-/// rest are counted (`mounts_elided`).
+/// rest are counted (`mounts_elided`). Each mount is counted at its whole encoding (its attachment, its path's length
+/// prefix and its path), not its path alone: counted by path, 400 short mounts outgrew the reply (A-267, 2026-11-17).
 const MOUNTS_REPORT_BYTES: usize = 1024;
 
 /// The volume's bound host mounts for its status (§4.4 `Bound`; GAP-A9-4): each `Consumer::Bridge`
@@ -9199,15 +9200,17 @@ fn mounts_of(
     if !matches!(record.consumer, Consumer::Bridge) {
       continue;
     }
-    if carried.saturating_add(path.len()) > MOUNTS_REPORT_BYTES {
+    let mount = slates_ipc::protocol::MountReport {
+      attachment: record.id,
+      path: path.to_owned(),
+    };
+    let bytes = encoded_len(&mount);
+    if carried.saturating_add(bytes) > MOUNTS_REPORT_BYTES {
       elided = elided.saturating_add(1);
       continue;
     }
-    carried = carried.saturating_add(path.len());
-    mounts.push(slates_ipc::protocol::MountReport {
-      attachment: record.id,
-      path: path.to_owned(),
-    });
+    carried = carried.saturating_add(bytes);
+    mounts.push(mount);
   }
   (mounts, elided)
 }
@@ -11315,6 +11318,51 @@ fn list_page_room() -> usize {
   chunk.saturating_sub(slates_ipc::protocol::framed_len(&empty))
 }
 
+/// The longest prefix of `items` a reply carries in `room` bytes beside the rest of it (§4.3: a reply is one bulk
+/// chunk; A-267), and how many it leaves out. A list that rides in a verb's own reply is carried this way — an advance's
+/// invalidated paths, a rewitness's paths, a presentation's conflicts, a refused landing's conflicts — so the reply
+/// always fits, and the count says what it could not hold. Unlike a page ([`fitting`]) no item is forced in: one path
+/// longer than the room is counted, never sent as a reply no chunk holds.
+pub(crate) fn carried<T: Wire>(items: Vec<T>, room: usize) -> (Vec<T>, u32) {
+  let total = items.len();
+  let mut used = 0usize;
+  let mut kept = Vec::new();
+  for item in items {
+    let bytes = encoded_len(&item);
+    if used.saturating_add(bytes) > room {
+      break;
+    }
+    used = used.saturating_add(bytes);
+    kept.push(item);
+  }
+  let elided = u32::try_from(total.saturating_sub(kept.len())).unwrap_or(u32::MAX);
+  (kept, elided)
+}
+
+/// The bytes a reply's carried list may take: one reply chunk less `empty`'s framing, `empty` being the reply with its
+/// list empty (§4.3). A sequence's length prefix and a count are fixed-width on the wire, so what the list adds is
+/// exactly its items' encodings.
+pub(crate) fn reply_room(empty: &ReplyBody) -> usize {
+  let chunk = usize::try_from(crate::config::bulk_chunk_bytes()).unwrap_or(usize::MAX);
+  chunk.saturating_sub(slates_ipc::protocol::framed_len(empty))
+}
+
+/// An advance's reply (§4.16 `advance`, §4.4): the version pinned and as many of the invalidated paths as one reply
+/// holds, the rest counted (A-267). The advance has taken effect, so its reply must always fit.
+pub(crate) fn advanced_reply(version: u64, invalidated: Vec<String>) -> ReplyBody {
+  let room = reply_room(&ReplyBody::Advanced {
+    version,
+    invalidated: Vec::new(),
+    invalidated_elided: 0,
+  });
+  let (invalidated, invalidated_elided) = carried(invalidated, room);
+  ReplyBody::Advanced {
+    version,
+    invalidated,
+    invalidated_elided,
+  }
+}
+
 /// The first of `items` (in the page's order) that fit `room`, and whether any are left: at least one, so a walk
 /// always progresses.
 pub(crate) fn fitting<T: Wire>(items: impl Iterator<Item = T>, room: usize) -> (Vec<T>, bool) {
@@ -11498,7 +11546,18 @@ fn rewitness(
     .with_host(host)
     .rewitness(&mut state.store, paths)
   {
-    Ok(paths) => ReplyBody::Rewitnessed { paths },
+    Ok(paths) => {
+      // The rewitness has taken effect, so its reply must always fit: the paths one reply holds, the rest counted.
+      let room = reply_room(&ReplyBody::Rewitnessed {
+        paths: Vec::new(),
+        paths_elided: 0,
+      });
+      let (paths, paths_elided) = carried(paths, room);
+      ReplyBody::Rewitnessed {
+        paths,
+        paths_elided,
+      }
+    }
     Err(e) => refused(refusal_of_vfs(&e)),
   }
 }

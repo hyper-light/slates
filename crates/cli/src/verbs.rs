@@ -571,7 +571,8 @@ fn merge_edit(
 }
 
 /// `advance ATTACHMENT [VERSION]`: the version now pinned and the invalidated paths, as text lines or
-/// a JSON `{ "version", "invalidated" }`.
+/// a JSON `{ "version", "invalidated", "invalidated_elided" }`: past what one reply holds the paths are counted
+/// (A-267), and a line says how many more changed.
 fn merge_advance(
   client: &mut Client,
   attachment: u64,
@@ -582,12 +583,22 @@ fn merge_advance(
   if json {
     slates_machine::out_line!(
       "{}",
-      serde_json::json!({ "version": advanced.version, "invalidated": advanced.invalidated })
+      serde_json::json!({
+        "version": advanced.version,
+        "invalidated": advanced.invalidated,
+        "invalidated_elided": advanced.invalidated_elided,
+      })
     );
   } else {
     slates_machine::out_line!("version: {}", advanced.version);
     for path in advanced.invalidated {
       slates_machine::out_line!("{path}");
+    }
+    if advanced.invalidated_elided > 0 {
+      slates_machine::out_line!(
+        "and {} more paths changed: every path counts as invalidated",
+        advanced.invalidated_elided
+      );
     }
   }
   Ok(())
@@ -1110,8 +1121,8 @@ fn capability_text(c: &slates_client::AttachmentCapability) -> String {
   )
 }
 
-/// `base rewitness`: the paths whose base drifted, one per text line or a JSON `{ "paths" }` (the key
-/// `changed-since` uses, so a script reads `.paths` from both).
+/// `base rewitness`: the paths whose base drifted, one per text line or a JSON `{ "paths", "paths_elided" }` (the key
+/// `changed-since` uses, so a script reads `.paths` from both): past what one reply holds they are counted (A-267).
 fn emit_rewitness(
   client: &mut Client,
   volume: VolumeId,
@@ -1120,10 +1131,16 @@ fn emit_rewitness(
 ) -> Result<(), ClientError> {
   let rewitnessed = client.rewitness(volume, paths)?;
   if json {
-    slates_machine::out_line!("{}", serde_json::json!({ "paths": rewitnessed }));
+    slates_machine::out_line!(
+      "{}",
+      serde_json::json!({ "paths": rewitnessed.paths, "paths_elided": rewitnessed.paths_elided })
+    );
   } else {
-    for path in rewitnessed {
+    for path in rewitnessed.paths {
       slates_machine::out_line!("{path}");
+    }
+    if rewitnessed.paths_elided > 0 {
+      slates_machine::out_line!("and {} more paths rewitnessed", rewitnessed.paths_elided);
     }
   }
   Ok(())
@@ -1239,12 +1256,14 @@ fn landing_json(landing: &Landing) -> serde_json::Value {
       manifest,
       summary,
       conflicts,
+      conflicts_elided,
     } => serde_json::json!({
       "grant_required": true,
       "landing": landing,
       "manifest": hex32(manifest),
       "summary": slates_mcp::landing_summary_json(summary),
       "conflicts": conflicts,
+      "conflicts_elided": conflicts_elided,
       "grant_with": format!("slates grant {landing}"),
     }),
   }
@@ -2181,6 +2200,12 @@ fn print_landing(landing: slates_client::Landing) {
       for degradation in &outcome.degraded {
         slates_machine::out_line!("degraded: {}", slates_mcp::degradation_json(degradation));
       }
+      if outcome.degraded_elided > 0 {
+        slates_machine::out_line!(
+          "and {} more degraded cells, past what one reply holds",
+          outcome.degraded_elided
+        );
+      }
       slates_machine::out_line!("barriers: {}", outcome.barriers);
     }
     slates_client::Landing::GrantRequired {
@@ -2188,6 +2213,7 @@ fn print_landing(landing: slates_client::Landing) {
       manifest,
       summary,
       conflicts,
+      conflicts_elided,
     } => {
       slates_machine::out_line!("landing: {landing}");
       slates_machine::out_line!("manifest: {}", hex32(&manifest));
@@ -2198,6 +2224,11 @@ fn print_landing(landing: slates_client::Landing) {
       slates_machine::out_line!("filtered_out: {}", summary.filtered_out);
       for path in &conflicts {
         slates_machine::out_line!("conflict: {path}");
+      }
+      if conflicts_elided > 0 {
+        slates_machine::out_line!(
+          "and {conflicts_elided} more conflicts, past what one reply holds"
+        );
       }
       slates_machine::out_line!("grant with: slates grant {landing}");
     }

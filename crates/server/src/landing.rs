@@ -936,13 +936,23 @@ fn not_landed(
     // The engine hands back every entry's report; the refusal names the conflicting ones alone (§4.15: a conflict
     // refuses the whole landing, and the person resolving it needs only the entries in conflict). Before 2026-10-06
     // every entry was named, so an entry that would only have been created read as a conflict.
-    LandingRefusal::Conflict(entries) => refused(Refusal::LandingConflict {
-      entries: entries
+    LandingRefusal::Conflict(entries) => {
+      let conflicting: Vec<String> = entries
         .iter()
         .filter(|e| matches!(e.verdict, Some(slates_land::verdict::Verdict::Conflict(_))))
         .map(|e| e.path.to_string())
-        .collect(),
-    }),
+        .collect();
+      // As many as one reply holds, the rest counted (A-267): presenting again lists every one.
+      let room = crate::verbs::reply_room(&refused(Refusal::LandingConflict {
+        entries: Vec::new(),
+        entries_elided: 0,
+      }));
+      let (entries, entries_elided) = crate::verbs::carried(conflicting, room);
+      refused(Refusal::LandingConflict {
+        entries,
+        entries_elided,
+      })
+    }
     LandingRefusal::LeaseHeld(held) => refused(Refusal::LandingLeaseHeld {
       holder: held.holder,
     }),
@@ -2242,6 +2252,7 @@ pub(crate) fn deferred_reply() -> ReplyBody {
       },
       degraded: Vec::new(),
       barriers: 0,
+      degraded_elided: 0,
     },
   }
 }
@@ -2464,11 +2475,22 @@ fn present(
   {
     return refused(crate::error::refusal_of_db(&e));
   }
+  // The presentation is recorded, so its reply must always fit (A-267): the conflicts one reply holds beside the
+  // summary, the rest counted; every entry, its conflict among it, is read a page at a time (`LandingEntries`).
+  let room = crate::verbs::reply_room(&ReplyBody::GrantRequired {
+    landing: landing_id,
+    manifest: hash,
+    summary: summary.clone(),
+    conflicts: Vec::new(),
+    conflicts_elided: 0,
+  });
+  let (conflicts, conflicts_elided) = crate::verbs::carried(conflicts, room);
   ReplyBody::GrantRequired {
     landing: landing_id,
     manifest: hash,
     summary,
     conflicts,
+    conflicts_elided,
   }
 }
 
@@ -2541,8 +2563,8 @@ fn finish(
   if let Some(refusal) = publish_landed(state, ids, report) {
     return refusal;
   }
-  ReplyBody::Landed {
-    outcome: LandingOutcome {
+  landed_reply(
+    LandingOutcome {
       landing: landing_id,
       state: landing_state_name(db_state),
       written: report.written as u64,
@@ -2552,8 +2574,31 @@ fn finish(
       bytes_written: report.bytes_written,
       held: u64::try_from(report.held).unwrap_or(u64::MAX),
       durability: durability_of(&report.durability),
-      degraded: report.degraded.iter().map(degradation_of).collect(),
+      degraded: Vec::new(),
       barriers: u64::try_from(report.barriers).unwrap_or(u64::MAX),
+      degraded_elided: 0,
+    },
+    report.degraded.iter().map(degradation_of).collect(),
+  )
+}
+
+/// A finished landing's reply (§4.15 step 9): `outcome` with as many of `degraded` as one reply holds beside it, the
+/// rest counted (A-267). The landing has run, so its reply must always fit: a host that refuses every directory's sync
+/// meets a degraded cell a directory, and a landing over hundreds of directories met more than a reply holds.
+#[cfg(unix)]
+pub(crate) fn landed_reply(
+  outcome: LandingOutcome,
+  degraded: Vec<slates_ipc::protocol::LandingDegradation>,
+) -> ReplyBody {
+  let room = crate::verbs::reply_room(&ReplyBody::Landed {
+    outcome: outcome.clone(),
+  });
+  let (degraded, degraded_elided) = crate::verbs::carried(degraded, room);
+  ReplyBody::Landed {
+    outcome: LandingOutcome {
+      degraded,
+      degraded_elided,
+      ..outcome
     },
   }
 }
@@ -3796,6 +3841,67 @@ mod tests {
         *h.finalize().as_bytes()
       }),
       "the domain tag is part of the proof"
+    );
+  }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+  use slates_ipc::protocol::{
+    HostAnswer, LandingDegradation, LandingDurability, LandingOutcome, ReplyBody, framed_len,
+  };
+
+  /// Shape: the degraded cells the test's landing met: one a directory, several replies' worth at these paths.
+  const CELLS: usize = 400;
+
+  /// A-267 (§4.15 step 9). Do: build a finished landing's reply that met 400 directory syncs the host refused (one a
+  /// directory, as a filesystem that refuses a directory's sync answers every one), each directory's path about eighty
+  /// bytes. Expect: the reply fits one reply chunk, carrying the first cells in the order met and counting the rest,
+  /// the two making 400. Before, every cell rode in the reply, and one this long was refused "reply too large for the
+  /// bulk area" after the landing had run.
+  #[test]
+  fn a_landing_that_met_more_degraded_cells_than_one_reply_holds_still_answers() {
+    let degraded: Vec<LandingDegradation> = (0..CELLS)
+      .map(|n| LandingDegradation::Unsynced {
+        dir: format!("/a-directory-whose-sync-the-host-refused-as-a-network-filesystem-may-{n:05}"),
+        answer: HostAnswer::Errno { errno: 22 },
+      })
+      .collect();
+    let outcome = LandingOutcome {
+      landing: 7,
+      state: "done".to_owned(),
+      written: 1,
+      skipped: 0,
+      conflicts: 0,
+      failed: 0,
+      bytes_written: 1,
+      held: 1,
+      durability: LandingDurability {
+        data_synced: true,
+        dirs_synced: false,
+        media: false,
+        media_requested: false,
+        dirs: 0,
+      },
+      degraded: Vec::new(),
+      barriers: 1,
+      degraded_elided: 0,
+    };
+    let reply = super::landed_reply(outcome, degraded.clone());
+    let chunk = usize::try_from(crate::config::bulk_chunk_bytes()).unwrap();
+    assert!(framed_len(&reply) <= chunk, "the reply fits one chunk");
+    let ReplyBody::Landed { outcome } = reply else {
+      panic!("a landing's reply");
+    };
+    assert!(outcome.degraded_elided > 0, "the test outgrows one reply");
+    assert_eq!(
+      outcome.degraded.len() + outcome.degraded_elided as usize,
+      CELLS
+    );
+    assert_eq!(
+      outcome.degraded,
+      degraded[..outcome.degraded.len()],
+      "the first cells, in the order met"
     );
   }
 }

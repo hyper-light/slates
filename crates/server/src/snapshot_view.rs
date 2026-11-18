@@ -220,10 +220,7 @@ pub(crate) fn advance(
   version: Option<u64>,
 ) -> slates_ipc::protocol::ReplyBody {
   match advanced(state, record, version) {
-    Ok((version, invalidated)) => slates_ipc::protocol::ReplyBody::Advanced {
-      version,
-      invalidated,
-    },
+    Ok((version, invalidated)) => crate::verbs::advanced_reply(version, invalidated),
     Err(refusal) => crate::verbs::refused(refusal),
   }
 }

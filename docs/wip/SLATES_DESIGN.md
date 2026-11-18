@@ -1678,7 +1678,8 @@ metadata provisioning path, not arbitrary host pathname resolution. A scratch vo
 - rewitness(volume, paths?) → Rewitnessed: re-witness the named drifted entries (default: all) to the
   disk as it is now, after the agent has rewritten its copies; the agent's content is untouched;
   the drift records for those entries clear. This is the explicit "a resolution is itself a
-  change" step; slates never merges.
+  change" step; slates never merges. The reply names the paths one reply holds and counts the rest, which were
+  re-witnessed too (A-267).
 - pin(volume, paths?) → Pinned: read the named subtrees (default: the whole base) into the store
   and witness them, so the view of those entries is stable regardless of later disk changes;
   cost proportional to what is pinned and reported in the reply; never implicit. Run a slice at a time on the
@@ -1713,7 +1714,8 @@ metadata provisioning path, not arbitrary host pathname resolution. A scratch vo
   (seal, compose, send the increment to the green's owner, park, resume with the verdict);
   `rebase(work_volume, to?) → Rebased{version} | Conflict{windows}` (move the work volume's base to
   a newer green version by mapping its pending operations; unchanged on conflict);
-  `advance(attachment, version)` (re-pin a green attachment; targeted invalidations);
+  `advance(attachment, version)` (re-pin a green attachment; targeted invalidations: the paths one reply holds and a
+  count of the rest, past which a holder treats every path as invalidated, A-267);
   `versions(green, from?, limit?)` and `changed_since(green, version, from?)` (reads of the chain
   and of the change index, the paths each version changed, recorded as it commits; `changed_since` names every path any
   dimension of which changed after the version, as `advance` invalidates by, each at the last version it changed at, a
@@ -22299,5 +22301,20 @@ dimension was read from its history), GAPS, `docs/bugs/2026-11-08-a-status-with-
   the paged read (`refusal_of_vfs`), where it was a text line.
 - **Every reader says which:** `slates status --drift` walks the paged read; the text counts all; MCP and the SDKs carry
   the count. An SDK binding for the paged read is owed.
+- **A list a verb's own reply carries (2026-11-17, goal g247):** reproduced by use first, each refused "reply too large
+  for the bulk area" at 400 entries (`crates/server/tests/reply_bounds.rs`): an advance and a rewitness after they had
+  taken effect, a presentation after it was recorded, and a granted landing's `LandingConflict`, in whose place the
+  daemon sent `BadRequest`. Each now carries the longest prefix one reply holds beside the rest of it and counts what
+  it left out (`crate::verbs::carried`, `reply_room`; no item forced in, so one long path is counted, never sent as a
+  reply no chunk holds): `Advanced::invalidated_elided` (a holder treats every path as invalidated, or reads a green's
+  with `ChangedSince`), `Rewitnessed::paths_elided` (the rewitness took them too), `GrantRequired::conflicts_elided`
+  (every entry and its conflict read a page at a time with `LandingEntries`, A-287) and
+  `LandingConflict::entries_elided` (presenting again lists them). Two siblings the same sweep found:
+  `LandingOutcome::degraded_elided`, since a host that refuses every directory's sync meets a degraded cell a directory
+  and a finished landing's reply outgrew a chunk after the landing ran (`landing::landed_reply`); and a status's mount
+  budget, which counted each mount's path and not its whole encoding (twelve bytes more), so 400 short mounts outgrew
+  the status reply. The client, the CLI, MCP, both SDKs and `slates-api` carry the counts (`CONTRACT` = 11:
+  `Rewitnessed`, `Stale::Disk::elided`, `LandingReport::degraded_elided`; a presentation is clean only when it carries
+  and counts no conflict).
 - **Still to come under A-267:** the conflict windows of `Submitted` and `Rebased`, kept with the work and paged from
-  it, and `GrantRequired`'s conflicts, `LandingConflict` and `Advanced`'s invalidations, each reproduced by use first.
+  it, so the client hands back every window.

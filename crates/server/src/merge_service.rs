@@ -1023,10 +1023,7 @@ pub(crate) fn advance(
   );
   // A move up may raise the reachable floor: fold and credit what that releases.
   let _ = settle_green_retention(state, pin.green);
-  ReplyBody::Advanced {
-    version: target,
-    invalidated,
-  }
+  crate::verbs::advanced_reply(target, invalidated)
 }
 
 /// `read(volume, path, at)` (§4.12 `slates.fs.read`): a file's bytes at a view. A green serves
