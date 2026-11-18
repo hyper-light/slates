@@ -82,6 +82,7 @@ fn planned(landing: u64) -> Op {
       landing: Some(landing),
       manifest: Some([7; 32]),
       outcome: None,
+      signature: None,
     },
   }
 }
