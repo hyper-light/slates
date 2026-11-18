@@ -59,7 +59,8 @@ given up on: no attempt could ever be answered within a period.
 
 ## Tests
 
-`a_live_takeover_is_rebuilt_in_turns_and_joined_while_it_runs` (`crates/server/tests/fleet.rs`): three nodes at
+`a_live_takeover_is_rebuilt_in_turns_and_joined_while_it_runs` (`crates/server/tests/fleet.rs`; renamed
+`a_live_takeover_is_fetched_and_rebuilt_in_turns_and_joined_while_it_runs` by A-386, which also counts the fetch's turns): three nodes at
 `f = 1`, one shard each; a live volume written 24 files on a; on b and c the seal quantum cut to one unit and a pause of
 half a period between a rebuild's turns; a stopped; through the successor every file reads back, the rebuild took at
 least 24 turns, one rebuild began, later attempts joined it and none began twice, and the successor's longest step

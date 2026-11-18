@@ -890,7 +890,7 @@ mod tests {
       .collect();
 
     let mut source = StreamSender::new();
-    source.write(&content);
+    source.write(content.clone());
     source.grant_credit(content.len() as u64);
     source.finish();
 
