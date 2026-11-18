@@ -30999,3 +30999,23 @@ two `windows-sys` features; `tests/oracle.rs` and `tests/os.rs`, a test each; `t
   directory (`SLATES_TEST_REFS_DIR`; skipped loudly without one). Compiled for `x86_64-pc-windows-msvc`.
 - **Owed.** Linux's `FICLONE` and macOS's `clonefile`, behind the same verb (their writers refuse it now and say no
   reflink); duplicates across batches; and the measured cost and gain the step waits on (the filed run reads both).
+
+### A-449 — `sweep_departed`'s wait stated, and the test support's session wait derived as the product waits for a lent session (2026-11-18, built for goal g255; R3's class B, item B-f, closing class B; A-65, A-222, A-408, A-437; the supervisor's ruling of 2026-11-07)
+- **`remote_attach::sweep_departed`.** The reap loop's look at departed hosts ends their attachments on every shard,
+  each through `xshard::call_in_shard_time` with a liveness window as its budget (A-408): a wall window, then more while
+  the shard runs or waits for a CPU, as every cross-shard wait judged in its target's own time takes (A-65). The
+  departure itself is decided by the fleet's membership and its own estimators (A-363). Its derivation is now stated
+  where it is made; no change.
+- **`daemon::SESSION_WAIT_NS` → `daemon::session_wait_ns()`.** Test support (`Daemon::hold_record_session`,
+  `Daemon::ask_live_reports`) waited one liveness window for a record session out of its link. It now waits as the
+  product does for a lent session (A-437's location round): one record-plane exchange's span
+  (`fleet::record_exchange_budget_ns`, the record plane's round budget over the slowest measured path), the bound every
+  borrower of a record session runs its exchange under, as the supervisor ruled on 2026-11-07. Test support only: no
+  product behaviour changes, so no failing test; the fleet tests that hold a session (`hold_record_session`'s four
+  callers) are filed for main's run.
+- With A-437, A-439, A-442, A-444 and A-446 this closes class B of `LIVENESS_BUDGET_NS`'s R3 debt.
+  Built and run on the Mac Studio (kiln, 2026-11-18, load 3-4, debug build, `cargo test --locked -p slates-server
+  --lib -- remote_attach session departed`): 8 of 8. No red-check: no product behaviour changed.
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class B line), `crates/server/src/{daemon,
+remote_attach}.rs`.
