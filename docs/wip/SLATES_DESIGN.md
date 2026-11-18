@@ -6287,7 +6287,9 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > (`seal_keys::recorded_lineage`, `recorded_namer`), a sealed log without them is refused `no_key`, and that refusal
 > waits for the key by event, bounded by `NO_KEY_WAIT_NS` (A-271 below). The store-destroyed flow on both Linux arches:
 > 48 of 48 taken over, the replacement the successor in 26, no key waited for (diag-live-durability-80; BENCHMARKS "A
-> live volume taken over by a node replaced at its own anchor").
+> live volume taken over by a node replaced at its own anchor"). Open: an owner lost after the replacement is
+> configured and before it accepts the owner's pair leaves the volume unserved while the replacement is its successor
+> (GAPS, 2026-11-17).
 >
 > **Phase one counts among the recorded holders (2026-11-06, A-240).** "Every candidate's report counts" above now
 > holds only for a candidate the shipper recorded as a holder. A member placed after the writes still reports and is
@@ -20231,12 +20233,15 @@ model-first, if the bounded wait proves not enough.
 one candidate's node destroyed mid-stream and replaced at its anchor, the fleet recovered, then the owner killed), on
 A-271 with main db9c514e and the flows' fixed wait, release, 12 runs a leg, two legs on each Linux arch: 48 of 48
 served every acknowledged write. The replacement was the successor in 26 and served 1.997 to 2.481 s after the owner's
-kill; the key-wait counters read 0 on every survivor, since the flow kills the owner only once the replacement is
-seated, by which time it has accepted its pair. The window the bounded wait covers is therefore held by the unit tests
-above, not by a flow (BENCHMARKS "A live volume taken over by a node replaced at its own anchor").
+kill; the key-wait counters read 0 on every survivor, so no successor lacked the key, the flow killing the owner only
+once the fleet has recovered (BENCHMARKS "A live volume taken over by a node replaced at its own anchor"). The window the bounded wait covers is held by the unit tests above, not by a flow, and the wait does not end
+it: only the owner's shard holds the replacement's pair (`fleet::deliver_pairs`), so with the owner dead the key never
+comes, and the volume is unserved while the replacement is its successor. So the bounded wait cannot be enough there:
+the skip in ranking owed above, or another way for the successor to obtain the key, is what ends it (GAPS "an owner
+lost before its replacement candidate accepted the owner's pair", 2026-11-17, read from the code).
 
-Applied in the same change to: §4.10's status (the cover rule), GAPS (A-271's entry and the recipient fix's), and
-BENCHMARKS.
+Applied in the same change to: §4.10's status (the cover rule), GAPS (A-271's entry, the recipient fix's, and the
+open window above), and BENCHMARKS.
 
 ### A-272 — A takeover's line is settled only on evidence; absence leaves it unresolved, and unresolved never reclaims (accepted 2026-11-09)
 

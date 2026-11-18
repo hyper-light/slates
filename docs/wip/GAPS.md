@@ -230,10 +230,23 @@
 > survivor in 22. On every survivor of every run `takeover_waits_key`, `takeover_key_arrived`,
 > `takeover_no_key_exhausted`, `takeover_refused.no_key`, `fleet.takeover.reclaimed` and `fleet.takeover.lost` read 0:
 > each replacement had accepted its redelivered pair before the owner died, so no successor waited for a key. Before
-> the fixed wait (diag-live-durability-75, A-271 with B9 and the recipient fix) 45 of 48 failed, mode B (below). Still
-> owed: a process test of the window the bound covers (an owner dying after a replacement joined and before it accepted
-> its pair), which no flow reaches, and the flow re-run on the merged main (BENCHMARKS "A live volume taken over by a
-> node replaced at its own anchor").
+> the fixed wait (diag-live-durability-75, A-271 with B9 and the recipient fix) 45 of 48 failed, mode B (below). Owed:
+> the flow re-run on the merged main (BENCHMARKS "A live volume taken over by a node replaced at its own anchor").
+
+> **Open (g240, 2026-11-17, A-271's owed skip; read from the code, no run has reached it): an owner lost before its
+> replacement candidate accepted the owner's pair leaves the volume unserved while that replacement is its successor.**
+> A replacement enters the neighbourhood before it holds the owner shard's pair: the owner delivers one only to a
+> configured neighbour, once a record period (`fleet::deliver_pairs`), and no other node holds that pair. The
+> successor is the cohort member rendezvous ranks first, from the configuration alone
+> (`RegionalConfiguration::successor`), so the replacement can be it. If the owner dies in that window (from the
+> replacement's configuration to the owner's next record period that delivers the pair), the key the replacement
+> waits for can never come: its wait ends `takeover_no_key_exhausted` at that head for good, and the head cannot move
+> with the owner dead, so no survivor serves the volume until the replacement leaves. Nothing acknowledged is lost:
+> writes wait in that window (the cover gate above), and the holders keep their copies (A-272). The flows never reach
+> it: they kill the owner only once the fleet has recovered, and by then no successor lacked the key (48 of 48 runs,
+> every key-wait counter 0).
+> Owed: the deterministic skip in ranking A-271 names (model-first, §4.8), or another way for the successor to obtain
+> the key, then a process test that kills the owner inside the window.
 
 > **Fixed (live-durability, 2026-11-08): each caller judged a dead session by its own clock.** The live lane's watch
 > waited a fixed second of silence, and the forward lane its own. On the fabric the fixed second cut a live holder
