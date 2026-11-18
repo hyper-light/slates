@@ -50,10 +50,10 @@ Nothing in this document is a placeholder. Where a fact is unknown, the document
 and names the measurement or experiment that resolves it.
 
 Reading order for a first pass: Parts 0 to 3, then §4.1 to §4.12 in order, then §4.15 (the base
-plane and landing) and §4.16 (the merge engine), which are data-path subsystems, and only then
-§4.13 (security) and §4.14 (observability), which are cross-cutting. The section numbers are
-stable identifiers cited from code, tests and the ledger, so the two cross-cutting sections keep
-their numbers.
+plane and landing), §4.16 (the merge engine) and §4.17 (the version-control servers built on it),
+which are data-path subsystems, and only then §4.13 (security) and §4.14 (observability), which are
+cross-cutting. The section numbers are stable identifiers cited from code, tests and the ledger, so
+the two cross-cutting sections keep their numbers.
 
 ### 0.2 The rules this design obeys, and how each is enforced
 
@@ -929,6 +929,13 @@ plan schedules.
 - Lost: symmetric operational transformation (no correct TP2 algorithm exists for strings; under a serializer rebasing suffices); an inferred three-way merge (diff3's pathologies; silent interleaves); last-writer-wins; locks or per-file leases as the conflict authority; a shared live mount of green (a pod's view must never move without its consent); big-bang merges at the end of a task (the streaming gate makes divergence short and conflicts cheap).
 - Measure: per-op verdict cost; mapping cost per intervening delta and the checkpoint spacing; merge-path latency end to end on a laptop and across hosts; merges per second per green; base-lag distribution; conflict rate by source (SDK edits versus whole-file tool rewrites); `StaleEpoch` refusals on merge records; rebase-retry rate; holder recomputation cost.
 - Consequence: D-16 gains the merge verdict as the conflict authority between work volumes; §4.5's journal records ranges and per-inode versions; §4.8 gains version chains, canonical deltas and merge records as ledger register entries; §4.10 gains placed-before-committed for increments and holder recomputation; §4.12 gains `slates.merge` and an SDK `edit` verb that declares true insert and delete ranges; a new Phase 6 builds the engine on one node and Phase 8 extends it to the fleet; a new crate `merge`.
+
+### D-28 Version-control servers are greens and works: a branch is a green, a push is a work whose verdict is the push's answer, objects are content indexed by the tool's id, and every tunable is learned from the deployment's own traffic
+- The decision: slates serves stock git, Mercurial and Subversion clients over their own protocols (§4.17). A repository's branches are greens that share the repository's owner and register; a push is a work whose base is the value the client says it saw and whose declared operations are the whole-file changes the client declared, plus, for git and Mercurial, the branch's head as one attribute, so §4.16's verdict answers exactly what each tool answers; stacked changes and rebases are chains of works; review requests are works held for review, and the requests built on them are works over works; every object is content deduplicated by identity and indexed per repository by the tool's id; policy and hooks decide admission before the verdict; every tunable is learned online.
+- Evidence: git's push contract (each ref compared with the old value the client saw, all or none when the client asks, pushed objects held in quarantine until admitted) [B: gitprotocol-pack, gitprotocol-capabilities, git-receive-pack]; Mercurial's heads check on `unbundle` and bundle2's check parts [B: hg wireprotocol, bundle2]; Subversion's commit rule, a node-by-node merge that fails a file changed on both sides, and its out-of-date test against the path's last-changed revision [B: svn_fs.h]; the merge engine it reuses (D-27). (`research/vcs-servers.md` §1-§3)
+- Lost: (1) running each tool's own server (`git-http-backend`, `hg serve`, `svnserve`) over a slates mount: their repositories are files with locks and append-only packs, every push would write through the mount, the tool's server would decide every push so the verdict would decide nothing, and neither the content sharing, the consistent cut of refs nor a green's replication would apply; (2) one green per repository holding the tool's on-disk layout: branches would no longer serialize independently, and the tool's packs and lock files would meet the verdict as opaque files; (3) a byte-range merge of a stock client's push: git's and Mercurial's commit ids and Subversion's working copy would no longer name what the server holds (the client-fidelity rule, §4.17.1).
+- Measure: per tool and operation, the server's wall time, CPU time and memory against the reference servers on the Linux kernel tree (§4.17.1's method); the conflict rate by source (stock pushes, agents' works, review merges); hook time; index table size and hit rate.
+- Consequence: §4.17; §4.8 gains the repository record and a register shared by a repository's greens; §4.16 gains works over works, a base given as a tree, and greens made at another green's version without a walk; review, protected branches and hooks are policy and evidence on greens.
 
 ---
 
@@ -10892,6 +10899,302 @@ versions, the deriver's inputs), §4.6 (`EROFS` on green mounts; invalidation on
 holder recomputation; submission across hosts), §4.12 (`slates.merge`, `edit`), §4.15 (the
 landing verdict shares the class vocabulary; entry-level for the disk side because the disk
 declares nothing), Part 6 (the merge oracle and the purity lint).
+
+### 4.17 Version-control servers: git, Mercurial and Subversion over greens and works (D-28)
+
+> **Status (2026-11-18, A-497).** Designed; nothing is built. The section has four parts. §4.17.1, the shared mapping,
+> is written here, and the three servers build on it without redefining its terms: §4.17.2 git (g261), §4.17.3
+> Mercurial (g291) and §4.17.4 Subversion (g292), each landing as its own amendment. The reading notes, with every
+> source's revision and the lines quoted, are `research/vcs-servers.md`.
+
+**Role.** slates serves stock git, Mercurial and Subversion clients over each tool's own protocols, as a hosting server
+does: clone, fetch, push, branches, review, protected branches, hooks and access control. The repository lives in
+slates instead of in the tool's files on a disk, and the merge engine of §4.16 is the server's write path: a branch is
+a green, a push is a work submitted to it, and the verdict is the push's answer. What this is meant to buy (each claim
+is unproven until measured by the method below):
+
+- no disk on the path (R1): a repository is held in RAM and replicated as every green is (§4.10), and it reaches a disk
+  only through a landing under a grant (§4.15);
+- one copy of every byte: file contents, the tool's objects, every branch, every fork and every checkout share content
+  by identity (§4.11);
+- a checkout is a mount: any version of any branch is a volume that an agent or a build attaches on the provisioning
+  path (R9), with nothing copied out of the repository;
+- no inferred merge anywhere (§2 ban 11, D-27): a server-side merge, a rebase or a stacked change is the verdict's
+  accept, identical or conflict with byte-exact windows, never a three-way text merge;
+- a push's answer is durable when it is given: the merge record commits at f+1 holders before the client hears "ok"
+  (§4.16 "Commit").
+
+#### 4.17.1 The shared mapping onto greens and works
+
+**Terms.** Each row is one concept in each tool, the slates object it becomes, and where the server's own section
+decides the details.
+
+| Concept | slates | git (§4.17.2) | Mercurial (§4.17.3) | Subversion (§4.17.4) |
+|---|---|---|---|---|
+| Repository | a repository record (§4.8) and its greens | a repository | a repository | a repository |
+| Branch: a name whose value a push moves | a green | each ref (`refs/heads/*`, `refs/tags/*` and every other ref) | each bookmark, and each named branch's head; a name with several heads is §4.17.3's to decide | the whole repository: one green whose version N is revision N; a branch is a directory in it |
+| Push | a work submitted to the green; the verdict is the push's answer | `receive-pack`'s update commands | `unbundle`, with its heads check | `commit`: the request and its editor drive |
+| What the client says it saw | the work's base | each command's old value | the `heads` argument, or the `check:heads`, `check:updated-heads` and `check:bookmarks` parts | the base revision of each path the drive touches |
+| Stacked changes; a rebase | a chain of works | a series of commits reviewed in order; a server-side rebase | a stack of draft changesets (§4.17.3 decides) | §4.17.4 decides |
+| A review request and the requests built on it | a work held for review; works over works | a pull request and its stack | §4.17.3 decides | §4.17.4 decides |
+| Objects | content in the volume store, deduplicated by identity, indexed by the tool's id | blobs, trees, commits and tags | changesets, manifests and file revisions | node revisions, their contents and revision properties |
+| History of a branch | the green's chain of versions | the successive values of the ref (the server's reflog) | the successive values of the bookmark or head | the revision sequence |
+
+**The repository and its greens.**
+1. A repository is a record in the metadata database (§4.8): its name, its tool, its object format (git's SHA-1 or
+   SHA-256, Mercurial's node format, Subversion's revision numbers), its policy (below), its default branch, and its
+   namespace, from each branch's name to its green.
+2. Every green of one repository carries the repository's partition in the high bits of its id, as an attachment id and
+   a landing id carry their owner's (`crates/server/src/shards.rs`, `landing.rs`). So a repository's greens share one
+   owner and one ledger register, and one register append commits several greens' versions together. git's atomic push
+   ("Either all refs are updated or none" [B: gitprotocol-capabilities `atomic`]) and a Mercurial push that adds
+   changesets and moves bookmarks are each one durable step, with no coordination call on the write path (§2 ban 10).
+   Repositories spread across the fleet; one repository's greens serialize on its owner shard. §4.16 gives each green a
+   register of its own; a register shared by a repository's greens, whose entry carries one or more of their merge
+   records, is the change this needs (a piece below).
+3. The namespace changes ride the same register: creating a branch, deleting one and moving the default are entries
+   of it, so two clients creating one name race on one append and one of them is refused.
+4. Creating a branch creates a green whose origin is a version of another green or one commit of the tool, shared by
+   identity, so creating it costs no walk of the tree. (Today `CreateGreen { base }` walks its base; this is a piece
+   below.) The new green records where it started (the green and version, or the tool's commit), which is the base a
+   review request between the two branches later uses.
+5. Deleting a branch retires its green: the name leaves the namespace, and the chain is kept for the retention the
+   policy names, so a deleted branch can be restored as a server's reflog allows.
+6. A tag is a green whose policy refuses any version after its first; the policy may allow a tag to move (git lets a
+   forced push move one).
+
+**A version.** Version N of a green is one value of the branch, and holds three things:
+- its tree: the snapshot of the files at the branch's head, so attaching version N is a checkout of it;
+- its head: the tool's name for what the branch names (git's commit id, Mercurial's changeset node, and for
+  Subversion the revision number, which is N);
+- the tool's objects that the version brought, each held as content (below).
+
+The chain is the history of the branch's values, which a server keeps as its reflog. Version N+1's head descends from
+version N's unless the policy allows a rewrite (a non-fast-forward push in git, a forced push in Mercurial); a rewrite is
+one more version, and the chain itself is never rewritten.
+
+**Objects: one copy, indexed by the tool's id.**
+1. Every object's raw bytes, the bytes the tool hashes to name it, are content in the volume store, chunked and
+   deduplicated by BLAKE3 identity (§4.11). A file's bytes in a version's tree and the tool's object for that file
+   (git's blob, Mercurial's file revision, Subversion's file contents) are the same content, so a checkout costs
+   metadata and no bytes.
+2. Wire forms are derived and never the truth: a git pack (zlib and deltas), a Mercurial bundle or changegroup and
+   Subversion's svndiff windows are computed from the raw objects for a transfer and cached by the identity of what
+   they encode. A damaged cache entry is dropped, never repaired.
+3. A repository keeps an index from the tool's id to the object's kind, length and content identity. The index belongs
+   to the repository and lives on its owner, reached by the repository's id: it is not a global catalog (§2 ban 12).
+   It is kept as immutable sorted tables that are content themselves, so a fork shares its parent's tables by identity
+   and adds only rows for its own objects. Each server's section gives its layout.
+4. The objects a push brings are held by the work, not by the green, until the verdict commits. This is the quarantine
+   git's `receive-pack` keeps: objects "are placed into a temporary "quarantine" directory ... and migrated into the
+   main object store only after the `pre-receive` hook has completed. If the push fails before then, the temporary
+   directory is removed entirely" [B: git-receive-pack]. A refused push leaves nothing behind; the work releases what it
+   held.
+5. Every object is checked on arrival: the server hashes it as the tool does, and a push holding an object whose bytes
+   do not hash to its claimed id is refused, typed, before any of it is indexed.
+
+**A push is a work.**
+1. **Its base** is the version whose head is the value the client says it saw. In git that is each command's old value:
+   the server must "validate each reference that is being updated that it hasn't changed while the request was being
+   processed (the obj-id is still the same as the old-id)" [B: gitprotocol-pack]. In Mercurial it is the heads the
+   client observed, which the server uses "to detect race conditions" [B: hg wireprotocol `unbundle`], or bundle2's
+   `check:heads`, `check:updated-heads` and `check:bookmarks` parts [B: hg bundle2]. In Subversion it is the base
+   revision of each path the editor drives, and a working copy mixes revisions, so one commit names a base per path:
+   the server checks each path against its own base (the out-of-date test, item 5) and builds the work on the version
+   current at that check, so the verdict then catches whatever lands after it. A value that no version of the green
+   ever held (git's old value naming a commit inside an earlier push, say) is answered as the tool answers a ref that
+   moved, before any work is built.
+2. **Its declared operations** are what the client declared, read at the granularity the client declared it. git and
+   Mercurial push snapshots, so a push declares which content now stands at each path: for each path whose content
+   identity differs between the base version's tree and the pushed head's tree, the work holds one `Delete` of the base
+   length and one `Insert` of the new bytes (the whole-file replacement §4.16's deriver makes of a whole-file rewrite);
+   `Create`, `Unlink`, `Mkdir` and `Rmdir` for what appears or vanishes; `SetMode` for the executable bit; `Symlink`;
+   and a special node for an entry with no file form (git's submodule link; §4.17.2). Subversion's editor declares
+   each changed file, and the work holds the same whole-file operations for it. This reads identities the client
+   computed: no bytes are compared and no edit position is guessed, so D-27's never-diff clause holds. A push that moves
+   a branch across several commits is one work: its post-state is the new head's tree, and the commits in between are
+   objects of the version it makes.
+3. **The head operation (git and Mercurial).** Each such work also sets the green's head: one `SetXattr` of the
+   reserved attribute `slates.vcs.head` on the green's root, to the new head's id. Two works that both move the branch
+   meet on that one attribute, and §4.16's verdict then answers what the tools answer: the same new value is
+   `AcceptIdentical` (that push already happened), and a different one is a `MetaMeta` conflict (another push came
+   first). A Subversion work sets no head: Subversion lands a commit made against an older revision when its paths did
+   not move, so its versions advance without a compare-and-swap on the whole repository. A work the server itself turns
+   into the tool's objects (item 4) carries no head operation either, or two such works on one version would conflict on
+   it: the server makes the commit after the verdict, records it with the version (its time and author taken from the
+   merge record, never from a holder's clock), and every holder recomputes it from the record (§4.16 "Apply on
+   holders").
+4. **The client-fidelity rule.** A stock client must end where it thinks it is. After its push is accepted, every path
+   it changed holds exactly the bytes it sent, and the branch names exactly the head it computed: git and Mercurial
+   name each commit by a hash of its content, so any change the server made would be a different commit, and
+   Subversion's client records each file it committed as being at the new revision with its own bytes. So a stock
+   client's work is decided at whole-file granularity, which the operations of item 2 give; it is never merged into
+   byte ranges it did not send. Byte-range accepts, where two edits to one file both land, are for works the server
+   itself turns into the tool's objects: an agent's work through the SDK or a mount, a server-side merge of a review
+   request, a server-side rebase. The server makes the new commit, changeset or revision, and clients fetch it.
+5. **The answers.** For each tool:
+   - git: the push's old value is the green's head, and whether each command is a fast-forward is the policy's check
+     (`receive.denyNonFastForwards` [B: git-receive-pack]), made after the admission hooks and before the verdict.
+     Accept and identical are `ok <ref>`; a conflict on the head is `ng <ref>` with the reason git gives for a ref that
+     moved ("someone pushed in the meantime" [B: gitprotocol-pack]). §4.17.2 names every answer's words.
+   - Mercurial: the heads the client saw are the green's heads; accept answers the push response's change in heads
+     [B: hg wireprotocol `unbundle`], and a conflict answers the abort its heads check calls for (§4.17.3).
+   - Subversion: a commit whose paths did not change since their base revisions is accepted and answered with
+     `commit-info` and the new revision [B: ra_svn `protocol`, `commit`]; a path changed since its base revision is a
+     conflict, answered as Subversion's out-of-date error (§4.17.4). Here the verdict is Subversion's own commit rule:
+     it merges a transaction into the newest revision node by node and fails a file "whenever source, target, and
+     ancestor are all distinct node revisions" [B: svn_fs.h `svn_fs_merge`], and it calls a path out of date when its
+     base revision "is less than the last-changed-revision of the path" [B: svn_fs.h `svn_fs_lock_many`], which is the
+     negation of §4.16's fast path (`last_changed[path] <= base`).
+6. **A base that is no version.** A review request or a merge may need a base that is a commit inside an earlier push,
+   so not the head of any version. Such a base is given as a tree, and what the green changed since it is read as the
+   whole-file differences between that tree and the head's, which is all that stock pushes ever declared. It costs
+   precision only where the green holds byte-range works, which it then reads as whole files (a conflict a finer base
+   would have avoided, never a wrong accept).
+
+**Chains of works: stacked changes and rebases.**
+- A stack, a series of changes reviewed and landed in order, is a chain of works: each work's base is the post-state of
+  the one before it. Landing the chain submits each in order; when the policy asks for all or none, the versions are
+  one register append.
+- A rebase is §4.16's `rebase`: the work's operations are mapped through what the green accepted since its base. A
+  whole-file operation on a path the green changed meanwhile is a conflict naming the path; otherwise the work moves to
+  the new base. For a stock client's commits a rebase makes new commits (new ids, the authorship kept; §4.17.2 and
+  §4.17.3 decide the tool's fields), which the client fetches.
+- Rebasing a chain rebases each work over the one before it, in order, and stops at the first conflict with its
+  windows.
+
+**Works over works: review requests and their trees.**
+- A review request (git's pull request; §4.17.3 and §4.17.4 say what one is for their tools) is a work held
+  unsubmitted, with a review record: comments anchored to the work, one of its versions, a path and a byte range;
+  approvals; and the evidence the policy requires (status checks, signatures).
+- A request built on another request is a work over a work: its base is the lower work's post-state, not a version of
+  the green. When the lower one is accepted unchanged on the fast path, the upper one's base is that version, and it
+  submits as any work does. When the lower one was mapped because other works landed first, the upper one is mapped
+  through the green's deltas except the lower work's own, which its base already holds. §4.16 bases a work on a green
+  version only, so this is new in the engine (a piece below).
+- A comment's range moves with the code: §4.16's position mapping shifts it through every delta in between, so a comment
+  stays on its line across rebases. A range that an edit replaced is marked outdated; it is never moved by a guess.
+- Merging a request is submitting it. Accept makes the new version, and the server makes the tool's merge commit or
+  rebased commits by the policy's merge method; every client fetches them. A conflict answers byte-exact windows on the
+  request, and its author rebases. There is no three-way text merge (§2 ban 11).
+
+**Policy: protected branches, access and hooks.**
+- Policy is set per repository and per green, by name pattern: who may read, who may submit, whether a rewrite (a head
+  that does not descend from the current one) or a delete is allowed, the evidence required (status checks and
+  approvals, §4.16's `require_evidence`), whether merges must be signed (§4.16, A-321), the merge method for review
+  requests, and the hooks.
+- Each tool's authentication (HTTP authorization, SSH keys, Subversion's SASL) ends in a principal of §4.13, and a
+  capability per repository and green decides reads and submits. The tools' protocols carry no authorization of their
+  own ("The protocol itself contains no authentication mechanisms" [B: gitprotocol-pack]): the transport proves who
+  the client is, and slates decides what it may do.
+- Hooks run at three points: at admission, before the verdict, where a hook may refuse with words the client prints
+  (git's `pre-receive` and `update` [B: git-receive-pack], Mercurial's `pretxnchangegroup` [B: hg config `hooks`],
+  Subversion's `pre-commit` [B: svn_repos.h]); after the commit, where hooks only observe (`post-receive`,
+  `changegroup`, `post-commit`); and on review events. A hook is a program the repository's owner configured, run over
+  a read-only attachment of the work's post-state (on Linux inside the launcher's namespace, `slates exec`, §4.6),
+  under a deadline learned from that hook's own runs. A hook never runs on the merge task's shard and never holds the
+  green: admission ends before the work reaches the merge task, so a slow hook delays only its own push.
+- The write modes still decide whether a merge may happen at all (A-285), and a signature never permits one (A-321).
+
+**Reads.** A fetch or a clone reads the greens' heads at one register position, so it sees one consistent cut of every
+branch, then the objects reachable from those heads in the tool's wire form. A version is immutable, so what a read
+computes for it (a pack, a bundle, a slice of the index) is cached by its identity and shared across clients. The change
+index (the paths each version changed, A-264) and `last_changed` answer path-limited history (`log` of a path, `blame`)
+at version granularity before any object is read.
+
+**Durability and residency.** A repository is as durable as every green: in RAM, with each merge record committed at
+f+1 of 2f+1 holders before the client is answered (§4.16), replicated by placement (§4.10), and kept across a daemon
+restart by the anchor segment (§4.4). On a laptop (f = 0) the anchor's RAM is the only copy, so a machine restart loses
+what was not landed. Importing an existing
+repository reads its directory as a base (§4.15, read-only); exporting one writes it to a disk only through a landing
+under a grant (§4.15, R10).
+
+**Every tunable is learned online.** The rule for every server in this section (Ada, 2026-11-18): a tunable is an
+estimate the server keeps learning from the deployment's own traffic. It is never a constant, and never a value measured
+once on one machine and frozen, at build or at boot. Each server's table names, for every tunable:
+- the estimator (a running quantile, a regression, the argmin of a cost model);
+- its inputs (what is measured, and where);
+- when it updates (every request, every version);
+- its bounds (what it may never exceed, each bound itself derived, such as a memory budget of §4.2 or a deadline the
+  client sent, with a typed refusal at the bound);
+- its first value, computed from the first request's own inputs (that request's size and the rate this machine was just
+  measured to do that work at), never a literal.
+
+A-363's failover estimate is the pattern: its estimators keep learning from the traffic they judge.
+
+**The interop proof.** A server is proven by stock clients only:
+- each tool's own test suite or conformance runs, pointed at slates (each server's section names which tests and how
+  they are pointed);
+- a differential run of each operation: the same stock client against the reference server and against slates, over
+  the same repository, with what the client ends up holding compared whole (its refs or heads, its objects, and the
+  tool's own consistency check run on it).
+
+**The order-of-magnitude method.** Main measures and records it in `BENCHMARKS.md` under the rule of the project's
+§5: release builds, the hardware, the dataset's commit, the date, the load discipline, and the best of N with all N
+shown.
+- Competitors: `git-http-backend` and Gitaly for git; `hg serve` for Mercurial; `svnserve` and `mod_dav_svn` for
+  Subversion.
+- Dataset: the Linux kernel tree the load tests already hold, as a git repository, and its conversions to Mercurial
+  and Subversion, each recorded with the command that made it.
+- Operations, each from a stock client: clone; fetch after one, ten and a hundred upstream commits; push of one commit
+  and of a hundred; a server-side merge; `log` and `blame` of one path.
+- Measures: wall time at the client, the server's CPU time and peak memory, and throughput with N concurrent clients.
+  The competitor and slates each serve warm (the competitor's files in the page cache), so the comparison is the
+  servers' and not the disks'.
+- The claim: "an order of magnitude faster" is made per operation, only where it was measured. An operation bound by
+  the wire or by the client's own work (a full clone's indexing on the client) is reported as such, with the server's
+  share measured separately.
+
+**Failure matrix (shared).** A client that disconnects before its push is answered: the work is never submitted, and
+what it held is released. The owner lost while a push is in flight: the submit retries by the increment's identity
+(§4.16); a client that heard nothing and pushes again is answered identical (the head operation) or with its conflict.
+A hook past its deadline: the admission refuses and names the hook; the work is not submitted. An object whose bytes do
+not hash to its id: refused, and nothing is indexed. A holder whose recomputation differs: as §4.16.
+
+**Refusals (shared).** §4.16's, plus: the client's old value names no version (`UnknownBase`, answered in the tool's
+words for a ref that moved); `PolicyRefused { rule }`; `HookRefused { hook, words }`; `ObjectIdMismatch { id }`;
+`NotPermitted`. Each server maps every refusal to its tool's words.
+
+**Worked example.** Repository `linux` (git) has branch `master` at version 812, whose head is commit C812. Alice and
+Bob have both fetched it. Alice pushes three commits, C812 to C815. The server holds the pushed objects in her work,
+checks each one's id, and reads the seven paths whose content identity differs between C812's tree and C815's: seven
+whole-file replacements, plus the head set to C815. The `pre-receive` hook passes; no path and not the head changed
+since 812, so the fast path accepts. Version 813 commits at f+1 holders, and Alice reads `ok refs/heads/master`. Bob now
+pushes C812 to C816. His base is 812, the head attribute changed at 813, and the verdict is a `MetaMeta` conflict: Bob
+reads git's answer for a ref that moved; nothing he sent is kept. He fetches, rebases on his machine, and pushes C815 to
+C817: version 814. An agent works on version 814 through the SDK and replaces bytes 1,200 to 1,480 of `init/main.c`,
+while another agent's SDK work, accepted as version 815 with the server's commit C818, changed bytes 40,100 to 40,250 of
+the same file: the first agent's byte-range work is accepted as version 816, and the server makes commit C819 for it
+(the agent as author, C818 as parent), which every client fetches. Had version 815 come from a stock push, its
+whole-file replacement of `init/main.c` would have made the agent's edit a conflict, and the agent would rebase. In
+Subversion's terms the same rule reads: Carol commits `/trunk/a.c` against revision 40 while the repository is at 42,
+where 41 and 42 changed only `/trunk/b.c`; `a.c` last changed at or before 40, so the fast path makes revision 43. Dan
+then commits `/trunk/b.c` against 40; `b.c` last changed at 42, after his base, so his commit is out of date, and he
+updates and commits again.
+
+**Laptop degenerate.** One node: the repository's register is its partition's log in the anchor segment, f = 0, the
+holder set is the owner, and every arrow above is an in-process call. The code is the fleet's (R8).
+
+**Pieces that follow (shared, in order).** Each is one piece with its own tests.
+1. The repository record and its namespace; green ids carrying the repository's partition; a green made at another
+   green's version, or at one commit's tree, without walking it.
+2. A register entry that commits several greens' versions together (the atomic push), with its recovery and its
+   recomputation on holders.
+3. The object store: raw objects as content; the per-repository index as immutable content tables plus a mutable tail;
+   forks sharing tables; every object checked against its id on arrival.
+4. Works from a client's push: the whole-file operations read from tree identities, the head operation, and the
+   client-fidelity test (an accepted push's paths hold exactly the client's bytes).
+5. Works over works: a work based on another work's post-state, mapped when the lower one lands; a base given as a tree.
+6. Review records: comments anchored and moved by position mapping; approvals as evidence.
+7. Policy and hooks: policy by name pattern; hooks over a read-only attachment of the work, at admission and after
+   commit, under learned deadlines.
+
+Each server's pieces follow these, in its own section.
+
+**Integration points.** §4.4 (roles and verbs), §4.8 (the repository record; the register its greens share), §4.10
+(placement and replication of greens), §4.11 (content identity and deduplication), §4.12 (an agent's SDK work becomes a
+commit), §4.13 (principals and capabilities), §4.15 (import from a host directory; export by landing), §4.16 (the
+engine: the verdict, rebase, position mapping, the register).
 
 ---
 
@@ -32365,3 +32668,23 @@ Applied in the same change to: GAPS (A-404's entry); `docs/bugs/2026-11-18-a-suc
 
 Applied in the same change to: §4.14 (a status block on `daemon.alive`), GAPS (A-308's entry), `docs/bugs/` (a record,
 and A-467's record's sibling line), `crates/server/src/watchdog.rs`, `crates/api/src/role/anchor.rs`.
+
+### A-497 — Version-control servers over greens and works: the shared mapping (2026-11-18, g261 for UI goal 91; new §4.17 and D-28; §4.8, §4.16)
+- **What it adds.** §4.17's frame and its shared part, §4.17.1: how a stock git, Mercurial or Subversion client's
+  repository, branches, pushes, stacked changes, review requests, objects and history become slates' repository record,
+  greens, works, chains of works, works over works, content and green chains. It defines the head operation that makes
+  §4.16's verdict answer each tool's push exactly; the client-fidelity rule (a stock push is decided at whole-file
+  granularity, and byte-range accepts are for works the server turns into the tool's objects itself); policy, hooks and
+  access; durability; the rule that every tunable is learned online; the interop proof; the order-of-magnitude method
+  main measures by; and the seven shared pieces, in order.
+- **Why this mapping.** Each tool's own push contract is a verdict §4.16 already computes. git compares each ref with
+  the old value the client saw and updates all or none when asked; Mercurial checks the heads the client saw; Subversion
+  merges a commit node by node and fails a file changed on both sides. The quotes, with their revisions and lines, are
+  in `research/vcs-servers.md` §2.
+- **The split.** Ada asked for one agent per tool (main, 2026-11-18). §4.17.2, git, is A-497's second part (g261);
+  §4.17.3, Mercurial (g291), and §4.17.4, Subversion (g292), are theirs, each building on §4.17.1 without redefining its
+  terms.
+- **Nothing is built.** No code changed; the GAPS entry tracks the pieces.
+
+Applied in the same change to: Part 0 (§0.1's reading order), Part 3 (D-28), §4.17 (new), GAPS (a §4.17 entry at the
+top), `research/vcs-servers.md` (new).
