@@ -26120,7 +26120,9 @@ Applied in the same change to:
   `STATUS_FILE_IS_A_DIRECTORY`. A replace is made under a staging name of its own (`:` makes it a name no Windows program
   can ask for) and renamed over the taken one, so a refusal at either step leaves the taken name as it was; one shard turn
   serves the whole link, so no other request sees the staging name. Every access check the DLL's rename makes for a
-  replace passes on this drive, whose objects all carry the one Everyone descriptor, so the worker makes none. A file's
+  replace passes on this drive, whose objects all carry the one Everyone descriptor, so the worker makes none. Of
+  `FileLinkInformationEx`'s flags the drive acts on ReplaceIfExists alone, as on a rename, to which WinFsp's DLL hands
+  no other: a caller asking to ignore a read-only target is still refused it. A file's
   link count reaches `FileInfo.HardLinks` (0 for a directory). A saved successful link is answered as made on recovery,
   as a saved rename is, since the volume holds the name; a cancellation would tell the caller a visible name was not
   made, and the copy it fell back to would find the name taken.
