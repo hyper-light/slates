@@ -17,6 +17,16 @@
 //! made again before the owner's next change, counted (`merge.replica.remade`); one that left for its budget is not,
 //! which bounds the remaking: each remade replica answers for a refusal or an eviction of the one before.
 //!
+//! **Idle replicas (A-473).** A replica no work on its shard has used for its idle window is given back, its charge
+//! credited, counted (`merge.replica.idle_given_back`). The window is the green's own use there: the longest gap the
+//! replica has known between two uses, its first gap measured from its holding, so a pause longer than any its works
+//! have taken ends it. Only a recorded use arms the check ([`serving`] → `note_use`): one task a shard, while it holds a
+//! used replica, sleeps to the first replica's end and gives back what has gone unused; it is never a periodic sweep.
+//! A replica never used on its shard has no use to derive a window from, so it is not judged idle: it costs its feed
+//! and its charge until its owner gives the engine up. When work returns, the first request a given-back replica would
+//! have served is asked of the owner, counted (`merge.replica.route_idle`), and asks the owner, once, to make it again;
+//! the owner's next change does, through the remake path above, counted.
+//!
 //! **The owner.** Before the first change to a green it owns ([`ensure`], called by the submit before its settle),
 //! the owner makes one replica for each other shard (`Green::replica`, refused past the limit:
 //! `ReplicaRefusal::Full`) and moves it there whole: every index cloned, the content named by the owner's sealed blocks
@@ -103,8 +113,18 @@ pub(crate) const ROUTE_REFUSED: &str = "merge.replica.route_refused";
 pub(crate) const ROUTE_EVICTED: &str = "merge.replica.route_evicted";
 /// Counter: … because this shard's replica left, or was never taken, for its budget.
 pub(crate) const ROUTE_OVER_BUDGET: &str = "merge.replica.route_over_budget";
-/// Counter: a replica its owner made again, on a shard whose replica had left after a refusal or an eviction.
+/// Counter: a replica its owner made again, on a shard whose replica had left after a refusal or an eviction, or for
+/// idleness once a work there asked for it again.
 pub(crate) const REMADE: &str = "merge.replica.remade";
+/// Counter: a replica given back because no work on its shard used it for its idle window, the longest gap it has known
+/// between two uses (A-473): its charge credited, its registration sent home.
+pub(crate) const IDLE_GIVEN_BACK: &str = "merge.replica.idle_given_back";
+/// Counter: … a base read or rebase asked of the owner because this shard's replica was given back for idleness; the
+/// first after it asks the owner to make it again.
+pub(crate) const ROUTE_IDLE: &str = "merge.replica.route_idle";
+/// Counter: a shard's idle check that could not be started (its task arena full): the replicas wait for their next use
+/// to arm it again, holding their charge meanwhile.
+pub(crate) const IDLE_CHECK_REFUSED: &str = "merge.replica.idle_check_refused";
 
 /// This shard's part in the replicas of greens (module docs): as an owner, the shards it fed and the engines it is
 /// retiring; as a replica's shard, the replicas it holds.
@@ -118,15 +138,26 @@ pub(crate) struct GreenReplicas {
   retiring: BTreeMap<(VolumeId, u64), Green>,
   /// As a replica's shard: by green, the replica held here. Bounded by the greens of the node.
   held: BTreeMap<VolumeId, Held>,
-  /// As a replica's shard: by green, why the replica it held left, for the reason a later request is asked of the owner
-  /// (A-465). Set when a replica leaves, and gone when another is held or the owner gives the engine up. Bounded as
-  /// `held` is.
-  gone: BTreeMap<VolumeId, Gone>,
+  /// As a replica's shard: by green, why the replica it held left, and whose it was, for the reason a later request is
+  /// asked of the owner (A-465) and, for idleness, to ask the owner for it again (A-473). Set when a replica leaves, and
+  /// gone when another is held or the owner gives the engine up. Bounded as `held` is.
+  gone: BTreeMap<VolumeId, Tomb>,
   /// The next install number this shard hands an engine it makes replicas of: a message names its engine by it, so a
   /// re-installed green's replicas are never taken for the old engine's.
   next_install: u64,
   /// Set when the daemon stops: no replica is made, and every one held or arriving is given back.
   closed: bool,
+  /// Whether this shard's idle check runs (A-473): armed when a held replica's use is recorded, and ended when no used
+  /// replica is held.
+  idle_armed: bool,
+}
+
+/// Why a replica that was held on this shard left it, and whose it was.
+#[derive(Clone, Copy, Debug)]
+struct Tomb {
+  gone: Gone,
+  owner: u16,
+  install: u64,
 }
 
 /// The replicas of one installed engine.
@@ -137,7 +168,7 @@ struct FedShards {
   /// The shards whose replica's registration has not come home.
   shards: BTreeSet<u16>,
   /// The shards whose replica left, and why: made again before the green's next change when it left for a refusal or
-  /// an eviction, never for its budget (A-465).
+  /// an eviction (A-465), or for idleness once a work there has asked for it again (A-473); never for its budget.
   left: BTreeMap<u16, Gone>,
 }
 
@@ -152,13 +183,22 @@ enum Gone {
   OverBudget,
   /// Its owner asked it to leave, or the daemon stopped.
   Asked,
+  /// No work on its shard used it for its idle window (A-473); `wanted` once a work there has asked for it again.
+  Idle {
+    /// Whether a work on its shard has asked for it since.
+    wanted: bool,
+  },
 }
 
 impl Gone {
   /// Whether its owner makes it again before the green's next change: after a refusal or an eviction, which a fresh
-  /// replica does not repeat; never after its budget, which it would meet again.
+  /// replica does not repeat, or after idleness once a work has asked for it again; never after its budget, which it
+  /// would meet again, nor after idleness no work has ended.
   fn remade(self) -> bool {
-    matches!(self, Gone::Refused | Gone::Evicted)
+    matches!(
+      self,
+      Gone::Refused | Gone::Evicted | Gone::Idle { wanted: true }
+    )
   }
 }
 
@@ -172,6 +212,20 @@ struct Held {
   replica: Replica,
   /// The bytes its metadata charged this shard's budget.
   charged: u64,
+  /// When a work on this shard last used it (the host's monotonic clock), or it was held, before its first use.
+  last_use_ns: u64,
+  /// The longest gap it has known between two uses, the first from its holding: its idle window (A-473). None before
+  /// its first use, which is what arms its idle check.
+  gap_tail_ns: Option<u64>,
+}
+
+impl Held {
+  /// When it has gone unused for its idle window: none before its first use.
+  fn idle_at(&self) -> Option<u64> {
+    self
+      .gap_tail_ns
+      .map(|tail| self.last_use_ns.saturating_add(tail))
+  }
 }
 
 /// What one shard sends another about a green's replicas. The engine and the feed message are boxed: each message is
@@ -207,6 +261,12 @@ enum Message {
     left: Left,
     gone: Gone,
   },
+  /// Replica's shard to the owner: a work on shard `from` asked for the replica given back there for idleness (A-473).
+  Wanted {
+    green: VolumeId,
+    install: u64,
+    from: u16,
+  },
 }
 
 impl Message {
@@ -215,7 +275,10 @@ impl Message {
   fn owed_again(&self) -> bool {
     matches!(
       self,
-      Message::Deliver { .. } | Message::Leave { .. } | Message::Left { .. }
+      Message::Deliver { .. }
+        | Message::Leave { .. }
+        | Message::Left { .. }
+        | Message::Wanted { .. }
     )
   }
 }
@@ -324,6 +387,11 @@ fn handle(state: &mut ShardState, message: Message) {
       left,
       gone,
     } => left_home(state, (green, install), from, left, gone),
+    Message::Wanted {
+      green,
+      install,
+      from,
+    } => wanted(state, (green, install), from),
   }
 }
 
@@ -544,7 +612,7 @@ fn receive(state: &mut ShardState, key: (VolumeId, u64), owner: u16, replica: Gr
     Ok(replica) => replica,
     Err(not_made) => {
       state.count(OVER_BUDGET, 1);
-      state.green_replicas.gone.insert(key.0, Gone::OverBudget);
+      bury(state, key, owner, Gone::OverBudget);
       give_home(state, key, owner, (not_made.left, Gone::OverBudget));
       return;
     }
@@ -552,7 +620,7 @@ fn receive(state: &mut ShardState, key: (VolumeId, u64), owner: u16, replica: Gr
   let bytes = metadata_charge(&replica);
   if !charge(state, bytes) {
     state.count(OVER_BUDGET, 1);
-    state.green_replicas.gone.insert(key.0, Gone::OverBudget);
+    bury(state, key, owner, Gone::OverBudget);
     give_home(state, key, owner, (replica.leave(), Gone::OverBudget));
     return;
   }
@@ -564,9 +632,23 @@ fn receive(state: &mut ShardState, key: (VolumeId, u64), owner: u16, replica: Gr
       install: key.1,
       replica,
       charged: bytes,
+      last_use_ns: slates_machine::clock::monotonic_ns(),
+      gap_tail_ns: None,
     },
   );
   state.count(HELD, 1);
+}
+
+/// Keeps why the replica of `key`'s green, `owner`'s, left this shard, for the requests asked of its owner from now on.
+fn bury(state: &mut ShardState, (green, install): (VolumeId, u64), owner: u16, gone: Gone) {
+  state.green_replicas.gone.insert(
+    green,
+    Tomb {
+      gone,
+      owner,
+      install,
+    },
+  );
 }
 
 /// The bytes a replica's metadata charges its shard.
@@ -684,7 +766,7 @@ fn give_back(state: &mut ShardState, green: VolumeId, gone: Gone) {
   };
   state.store.budget.credit_replicated(held.charged);
   if gone != Gone::Asked {
-    state.green_replicas.gone.insert(green, gone);
+    bury(state, (green, held.install), held.owner, gone);
   }
   give_home(
     state,
@@ -770,8 +852,12 @@ pub(crate) fn close(state: &mut ShardState) {
 pub(crate) fn serving(state: &mut ShardState, green: VolumeId, asked: u64) -> Option<&mut Green> {
   if let Some(route) = route_reason(&state.green_replicas, green, asked) {
     state.count(route, 1);
+    if route == ROUTE_IDLE {
+      want_again(state, green);
+    }
     return None;
   }
+  note_use(state, green);
   state
     .green_replicas
     .held
@@ -779,11 +865,122 @@ pub(crate) fn serving(state: &mut ShardState, green: VolumeId, asked: u64) -> Op
     .map(|held| held.replica.green_mut())
 }
 
+/// Records a use of the replica of `green` held here now (A-473): its gap since the last joins its gap tail, the longest
+/// it has known between two uses (the first gap from its holding), which is its idle window; and the shard's idle check
+/// is armed, if it does not run already. Only a recorded use arms it: there is no sweep.
+fn note_use(state: &mut ShardState, green: VolumeId) {
+  let now = slates_machine::clock::monotonic_ns();
+  let Some(held) = state.green_replicas.held.get_mut(&green) else {
+    return;
+  };
+  let gap = now.saturating_sub(held.last_use_ns);
+  held.gap_tail_ns = Some(held.gap_tail_ns.map_or(gap, |tail| tail.max(gap)));
+  held.last_use_ns = now;
+  if state.green_replicas.idle_armed {
+    return;
+  }
+  match slates_rt::futures::spawn(idle_check()) {
+    Ok(task) => {
+      let _ = slates_rt::futures::detach(task);
+      state.green_replicas.idle_armed = true;
+    }
+    Err(_) => state.count(IDLE_CHECK_REFUSED, 1),
+  }
+}
+
+/// The shard's idle check while it holds a used replica (A-473): sleeps to the moment the first of them has gone
+/// unused for its idle window, gives back every one that has, and goes on while any used replica is held; it ends
+/// when none is, and the next recorded use arms it again.
+async fn idle_check() {
+  loop {
+    let Some(wait) = state::with_state(next_idle_wait).flatten() else {
+      return;
+    };
+    // A refused sleep (the timer wheel full) still checks now; the next turn sleeps again.
+    let _ = slates_rt::futures::sleep(wait.max(1)).await;
+    let _ = state::with_state_counted(give_back_idle);
+  }
+}
+
+/// How long until the first held replica has gone unused for its idle window; none, with the check disarmed, when no
+/// used replica is held.
+fn next_idle_wait(state: &mut ShardState) -> Option<u64> {
+  let now = slates_machine::clock::monotonic_ns();
+  let first = state
+    .green_replicas
+    .held
+    .values()
+    .filter_map(Held::idle_at)
+    .min();
+  if first.is_none() {
+    state.green_replicas.idle_armed = false;
+  }
+  first.map(|at| at.saturating_sub(now))
+}
+
+/// Gives back every held replica that has gone unused for its idle window (A-473), counted: its charge credited, its
+/// registration sent home, and its owner makes it again once a work here asks for it.
+fn give_back_idle(state: &mut ShardState) {
+  let now = slates_machine::clock::monotonic_ns();
+  let idle: Vec<VolumeId> = state
+    .green_replicas
+    .held
+    .iter()
+    .filter(|(_, held)| held.idle_at().is_some_and(|at| at <= now))
+    .map(|(green, _)| *green)
+    .collect();
+  for green in idle {
+    state.count(IDLE_GIVEN_BACK, 1);
+    give_back(state, green, Gone::Idle { wanted: false });
+  }
+}
+
+/// A work here asked for the replica of `green` given back for idleness: its owner is told, once, so its next change
+/// makes it again (A-473).
+fn want_again(state: &mut ShardState, green: VolumeId) {
+  let Some(tomb) = state.green_replicas.gone.get_mut(&green) else {
+    return;
+  };
+  if tomb.gone != (Gone::Idle { wanted: false }) {
+    return;
+  }
+  tomb.gone = Gone::Idle { wanted: true };
+  let (owner, install, from) = (tomb.owner, tomb.install, state.shard);
+  send(
+    state,
+    owner,
+    Message::Wanted {
+      green,
+      install,
+      from,
+    },
+  );
+}
+
+/// The owner learns a work on shard `from` asked for its replica of `green`, given back there for idleness: it is made
+/// again before the green's next change (A-473).
+fn wanted(state: &mut ShardState, (green, install): (VolumeId, u64), from: u16) {
+  let Some(fed) = state
+    .green_replicas
+    .fed
+    .get_mut(&green)
+    .filter(|fed| fed.install == install)
+  else {
+    return;
+  };
+  if let Some(gone) = fed.left.get_mut(&from)
+    && matches!(gone, Gone::Idle { .. })
+  {
+    *gone = Gone::Idle { wanted: true };
+  }
+}
+
 /// Why a request for `green` at version `asked` is asked of the owner rather than served by this shard's replica (the
 /// counter it moves); none when the replica holds the version.
 fn route_reason(replicas: &GreenReplicas, green: VolumeId, asked: u64) -> Option<&'static str> {
   let Some(held) = replicas.held.get(&green) else {
-    return Some(match replicas.gone.get(&green) {
+    return Some(match replicas.gone.get(&green).map(|tomb| tomb.gone) {
+      Some(Gone::Idle { .. }) => ROUTE_IDLE,
       Some(Gone::Refused) => ROUTE_REFUSED,
       Some(Gone::Evicted) => ROUTE_EVICTED,
       Some(Gone::OverBudget) => ROUTE_OVER_BUDGET,
@@ -1318,6 +1515,51 @@ mod tests {
     assert!(over, "its budget's leave routes to the owner");
     assert_eq!(not_remade, Some(1), "never remade for its budget");
     assert_eq!(counted, [1, 1, 1, 1], "each route counted by why");
+    daemon.stop();
+  }
+
+  /// A-473. Do: on a two-shard daemon, a green with a replica on the second shard; use the replica twice there (a work's
+  /// base read at version 1, as `start_ask` asks it), then use it no more; once it is given back, ask it again, and make
+  /// a version on the owner. Expect: the replica given back once unused for its idle window, counted, its charge on its
+  /// shard credited to nothing; the next request asked of the owner as idle, counted; and the owner's next change making
+  /// it again, counted, so the shard holds it again.
+  #[test]
+  fn an_unused_replica_is_given_back_after_its_idle_window_and_made_again_when_work_returns() {
+    let daemon = crate::daemon::audit_daemon_of(2);
+    let (green, work) = crate::daemon::observe_first(&daemon, |state| {
+      let (green, work) = green_and_work(state, "idle");
+      submit_one(state, work, 1);
+      (green, work)
+    });
+    let head = crate::daemon::observe_first(&daemon, move |state| {
+      let engine = state.greens.get_mut(&green).unwrap();
+      (engine.head(), engine.head_identity())
+    });
+    assert!(eventually(&daemon, 1, move |state| held_at(state, green, head)).is_some());
+    let charged = crate::daemon::observe_at(&daemon, 1, |state| state.store.budget.replicated());
+    let used = crate::daemon::observe_at(&daemon, 1, move |state| {
+      [serving(state, green, 1).is_some(), serving(state, green, 1).is_some()]
+    });
+    assert_eq!(used, [true; 2], "the replica serves version 1, twice");
+    let given_back = eventually(&daemon, 1, move |state| {
+      let idle = state.refusals.get(IDLE_GIVEN_BACK).copied();
+      idle.filter(|_| !state.green_replicas.held.contains_key(&green))
+        .map(|idle| (idle, state.store.budget.replicated()))
+    });
+    assert_eq!(given_back, Some((1, 0)), "given back once idle, its charge {charged} credited");
+    let routed = crate::daemon::observe_at(&daemon, 1, move |state| {
+      (serving(state, green, 1).is_none(), state.refusals.get(ROUTE_IDLE).copied())
+    });
+    assert_eq!(routed, (true, Some(1)), "work returned: asked of the owner as idle");
+    let remade = crate::daemon::observe_first(&daemon, move |state| {
+      submit_one(state, work, 2);
+      state.refusals.get(REMADE).copied()
+    });
+    assert_eq!(remade, Some(1), "made again at the owner's next change");
+    let held_again = eventually(&daemon, 1, move |state| {
+      (state.refusals.get(HELD).copied() == Some(2)).then_some(())
+    });
+    assert!(held_again.is_some(), "held again");
     daemon.stop();
   }
 }
