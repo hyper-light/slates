@@ -238,6 +238,9 @@ const RESYNC_ABANDONED: &str = "shards.resync_abandoned";
 const RESYNC_WRITES_LOST: &str = "shards.resync_writes_lost";
 /// Counter: a reply made and never written, under the test-support switch `shards_withhold_replies` (A-316).
 const REPLY_WITHHELD: &str = "shards.reply_withheld";
+/// Counter: a `close`'s `FLUSH` answered with no publication of its own, since the write log held every write the shard
+/// acknowledged (A-399, A-63's flush rule): the fast path's non-vacuity count.
+const FLUSH_LOGGED: &str = "shards.flush_logged";
 /// Format: the refusal-ledger name of a resync end's release the anchor's channel refused (A-316): the anchor keeps the
 /// end until the next daemon releases it as one no record of its kind claims, so the device reads the channel's end
 /// only then.
@@ -2066,9 +2069,26 @@ fn serve_request(
   // (D-18): a change the volume's next restart must hold (`needs_barrier`), an inode number no committed publication
   // reserves (A-150), or a release of an open the committed publication counts (A-154).
   let awaits_publication = crate::verbs::awaits_publication(s, stream.volume);
+  // A `close`'s `FLUSH` owes no publication of its own while the write log holds every write the shard acknowledged
+  // (A-399, A-63's flush rule): a successor replays them all, kept stream or not, and a `FLUSH` the device resends after
+  // a death is answered again, changing nothing. Published anyway when the log overflowed, as a mount's is.
+  #[cfg(unix)]
+  let flush_logged = answered.opcode == Some(Opcode::Flush)
+    && s
+      .write_log
+      .as_ref()
+      .is_some_and(crate::write_log::WriteLog::holds_every_write);
+  #[cfg(windows)]
+  let flush_logged = false;
+  if flush_logged {
+    s.count(FLUSH_LOGGED, 1);
+  }
   // An ingest that wrote the guest's stores before this request is published before its reply too (step 3).
   let mut refused = false;
-  if needs_barrier(answered.opcode, answered.error) || awaits_publication || ingested.wrote {
+  if (needs_barrier(answered.opcode, answered.error) && !flush_logged)
+    || awaits_publication
+    || ingested.wrote
+  {
     // The reply rides the publication with its effect (A-61's rule), so a daemon that dies before writing it leaves a
     // successor that resyncs the stream the answer to the request the device resends, never a second application.
     #[cfg(unix)]

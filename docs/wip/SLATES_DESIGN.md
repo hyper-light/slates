@@ -4383,7 +4383,9 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 - a stream end may go to a VMM where a content object may not (A-135): the daemon answers nothing on it but the one
   attachment;
 - requests are answered by the shared FUSE dispatch, a durable change published before its reply as a virtio-fs
-  guest's is, and the guest is revalidated, having no path for an invalidation;
+  guest's is, and the guest is revalidated, having no path for an invalidation; a `close`'s `FLUSH` publishes nothing
+  of its own while the write log holds every write the shard acknowledged, as a FUSE mount's does (A-63's flush rule,
+  A-399), since a successor replays them all;
 - a read is answered with every byte it asks, never cut to a buffer, since a short read is the file's end to the
   guest's kernel;
 - the guest's own attribute namespaces, `trusted.` and `security.`, and its POSIX ACLs are kept in the volume as its
@@ -26379,7 +26381,8 @@ Applied in the same change to:
 - **The successor's half on macOS** (built the same day). Applied in the same change to: §4.6 (the resync bullet,
   the teardown bullet, a status of this date), GAPS, `docs/cli.md`, `slates_bridge_fuse::shards_resync` (the device
   closes its channel's end when it ends its share), and in `crates/server`: `write_log` and `fuse_hold` on every Unix
-  (FUSE's flush rule, `WriteLog::holds_every_write`, and a FUSE device's session stay Linux's); the state's write log,
+  (FUSE's flush rule, `WriteLog::holds_every_write`, and a FUSE device's session stay Linux's; amended 2026-11-18 by
+  A-399: the flush rule is a stream's too); the state's write log,
   replay, lost-writes flag and pending and recovered replies on every Unix (`state.rs`, `daemon.rs`'s
   `content_slice`, `purge_write_log` and `ShardHolds`); a macOS daemon keeps the devices the anchor hands it (the
   release of every one, `release_devices_without_fuse`, removed); `verbs.rs` replays the log, carries the replies and
@@ -28476,3 +28479,24 @@ Applied in the same change to:
   the flush after it or a handle opened since. Each guard removed alone fails it, the flush answered 0 where `EIO`
   belongs: the stream's bridge given no record of its losses (both platforms), and a resynced stream given none
   (Linux).
+
+### A-399 — A Shards stream's close publishes nothing its write log holds, as a FUSE mount's does (2026-11-18, goal g268; a sibling A-339 recorded in GAPS)
+Applied in the same change to:
+- §4.6, the Shards form's request bullet; A-339's entry, amended; GAPS: A-281's entry; BENCHMARKS (this date).
+- `crates/server`: `shards.rs` (a `FLUSH` owes no barrier of its own while the write log holds every write; the counter
+  `shards.flush_logged`), `write_log.rs` (`WriteLog::holds_every_write` and the overflow it reads, on every Unix); the
+  tests `crates/server/tests/shards_resync_restart.rs` (the writer's flush before the death) and
+  `crates/server/tests/shards.rs` (`flush_cost_after_logged_writes`, a measurement run by hand).
+
+- **What was there.** A FUSE mount's `close` sends `FLUSH`, which owed a publication; A-63 dropped it while the write
+  log holds every write acknowledged since the last publication, since a successor replays them all (105 → 79 µs p50
+  for a create, write and close, 2026-10-06). A Shards stream's `FLUSH` still published every time.
+- **The rule.** The mount's: a stream's `FLUSH` owes no barrier while the shard's log holds every write; once the log
+  overflowed it publishes, as a mount's does. Safe whether or not a successor keeps the stream: the replay puts the
+  writes in the volume either way, and a `FLUSH` the device resends after a death is answered again, changing nothing.
+  An ingest of a DAX map's stores keeps its barrier, since the ingest's writes are not logged.
+- **Evidence.** Linux (adacachy, kiln run r283): the restart test passes, its writer's flush answered with no
+  publication (`shards.flush_logged` 1) and the write read back after the death; so do the stream tests of a close, a
+  save and a restore, and the write log's unit tests. The guard removed alone fails it (the counter 0). Measured on a
+  Mac Studio (r286), three interleaved passes: a `FLUSH` after a logged page write took 17.5–20.0 µs p50 before and
+  15.7–16.0 µs after, and every one of 1,000 published nothing (BENCHMARKS, this date).

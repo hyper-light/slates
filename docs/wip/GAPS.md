@@ -697,9 +697,10 @@
 >   `shards.resync_writes_lost`); a stream's `FORGET`s were not logged, so a resynced stream kept the references
 >   a lost one gave back until it ended (**fixed by A-390, 2026-11-18**: logged as a mount's are, where the anchor holds
 >   the stream's resync end; `shards_resync_restart`'s nameless file stays let go across the death); and a stream's
->   `close` publishes even when the log holds every write it
+>   `close` published even when the log held every write it
 >   acknowledged, where a mount's skips it (A-63's flush rule: a FUSE request that published took 105 us p50 against
->   15 us for a read, 2026-10-06).
+>   15 us for a read, 2026-10-06) (**fixed by A-399, 2026-11-18**: the flush rule is a stream's too; a `FLUSH` after a
+>   logged page write measured 17.5-20.0 us p50 before and 15.7-16.0 us after on a Mac Studio, BENCHMARKS).
 >   Shards owes its device's half, after its v0.8.0 tag.
 > - Shards' side, after its v0.8.0 tag and landed by its coordinator from signed branches: its own server enforcing a
 >   guest's ACLs as slates now does (`FUSE_POSIX_ACL`, queued by its coordinator), its guest test over a

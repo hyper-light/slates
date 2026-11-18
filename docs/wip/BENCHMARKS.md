@@ -2745,6 +2745,27 @@ own filesystem and tmpfs.
   let a create reply after one append. It is a design change to §4.8's barrier, recorded in GAPS, not built.
 
 
+## A Shards stream's close no longer publishes what the write log holds (A-399; 2026-11-18)
+
+**Setup.** Apple M3 Ultra (Mac Studio, `Mac15,14`), one-minute load 19.6–22.3 from other sessions throughout. Two
+release test binaries, one built from main 89912e1e7 with the measurement added (`diag-g268-a399-before`), one with
+A-399 too (`diag-g268-a399-after`), run interleaved three times. Each run: one stream, one open file; 5 rounds of 200
+cycles, each cycle a 4 KiB write at the file's start and a `FLUSH` (the request every `close` sends), the `FLUSH`'s
+round trip timed alone. Command (from `crates/server`, each binary in turn):
+`cargo test --release -p slates-server --test shards -- --ignored --nocapture flush_cost`.
+
+| pass | before: best p50 / best p99 | after: best p50 / best p99 |
+|---|---|---|
+| 1 | 19.8 / 31.8 µs | 16.0 / 21.0 µs |
+| 2 | 20.0 / 30.1 µs | 16.0 / 20.8 µs |
+| 3 | 17.5 / 24.8 µs | 15.7 / 56.3 µs |
+
+- **Every `FLUSH` after the change published nothing** (`shards.flush_logged` 1,000 of 1,000; 0 before), and the write
+  it follows survives a death from the log alone (`shards_resync_restart`, A-399).
+- **The saving here is small, 2–4 µs at p50 (15–20%),** because each publication carried one changed chunk of one
+  file. A close after a burst of changes to many files publishes a delta as large as the burst; that is what the
+  stream no longer pays per close. p99 moves with the load, not with the change.
+
 ### 2026-10-06: the no-panic sweep costs nothing measurable on the hot paths
 
 The sweep turned every `[]` index and slice in shipped code into a `get`, among them the ART's child arrays, the
