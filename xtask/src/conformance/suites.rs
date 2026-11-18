@@ -680,6 +680,43 @@ fn pjdfstest_runner(root_available: bool, current: Runner) -> (bool, Runner) {
   (elevate, runner)
 }
 
+/// Format: root's uid and group 0 (`wheel` on BSD, `root` on Linux), as `chown` takes them.
+const ROOTS_OWNER: &str = "0:0";
+
+/// Hands pjdfstest's working directory to root, owner and group 0, for a run as root (through `sudo -n` when
+/// `elevate`, as the files run then). pjdfstest is root's suite, run in the file system under test (its README: "You
+/// must be root", then `cd /path/to/filesystem/under/test`), whose directory there is root's, its group 0 included; and
+/// its root cases expect what root makes to be in group 0 (`chown/00.t`'s `expect 0,0` of a file root made and left
+/// alone). A BSD host gives a new object its parent directory's group (macOS `mkdir(2)` and `open(2)`), and so does
+/// slates' NFS export there since A-328, so the directory the harness made as its own user, in that user's group (staff,
+/// 20, on CI's macOS runner), put everything root made in group 20, and 63 cases of `chown/00.t` failed unlisted (CI run
+/// 44271637767). Linux's System V rule gives root's objects root's group whatever the directory's, so the hand-over
+/// changes nothing there.
+fn hand_to_root(work: &Path, elevate: bool) -> Result<(), Failure> {
+  let mut command = if elevate {
+    let mut sudo = Command::new("sudo");
+    sudo.args(["-n", "chown"]);
+    sudo
+  } else {
+    Command::new("chown")
+  };
+  let output = command
+    .arg(ROOTS_OWNER)
+    .arg(work)
+    .stdin(Stdio::null())
+    .output()
+    .map_err(|e| Failure(format!("handing {} to root: {e}", work.display())))?;
+  if output.status.success() {
+    return Ok(());
+  }
+  Err(Failure(format!(
+    "handing {} to root: chown {ROOTS_OWNER} answered {}: {}",
+    work.display(),
+    output.status,
+    String::from_utf8_lossy(&output.stderr).trim()
+  )))
+}
+
 /// pjdfstest over the mount, file by file, judged against the reviewed list.
 pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   let tools = run.scratch.shared("tools")?;
@@ -699,6 +736,13 @@ pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   } else {
     None
   };
+  // A root run starts in a directory root owns (`hand_to_root`), changed through the writable mount when the suite's
+  // own is read-only, after the probe made its tree there as this user.
+  let root_run = matches!(runner, Runner::Root);
+  if root_run {
+    let writable = session.writable(&work);
+    hand_to_root(writable.as_deref().unwrap_or(work.as_path()), as_root)?;
+  }
   let files = test_files(&tree.root)?;
   // Every file's raw TAP output is kept in the scratch (`--keep`), so a failure can be reviewed by
   // its own message before it is listed as expected.
@@ -731,10 +775,15 @@ pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   let size_note = session.size_note.clone();
   drop(session);
   let command = format!(
-    "{}sh <each of {} tests/**/*.t of {}> in a directory inside the mount; binary {}",
+    "{}sh <each of {} tests/**/*.t of {}> in a directory inside the mount{}; binary {}",
     if as_root { "sudo -n " } else { "" },
     files.len(),
     fetch::PJDFSTEST_TARBALL.upstream,
+    if root_run {
+      " that root owns (owner and group 0)"
+    } else {
+      ""
+    },
     tree.binary.display()
   );
   let mut notes = vec![tree.note];
@@ -1029,6 +1078,66 @@ mod tests {
       ProbeVerdict::Missed
     );
     assert_eq!(probe_verdict("open/14.t", "0", true), ProbeVerdict::Missed);
+  }
+
+  /// pjdfstest's root cases expect what root makes to be in group 0 (`chown/00.t` cases 292 to 370 and 1055 to 1278,
+  /// `expect 0,0` of a file root made and left alone), which a BSD host gives only inside a directory in group 0: a new
+  /// object takes its parent directory's group there (macOS `mkdir(2)`), as over slates' NFS export on macOS since A-328.
+  /// The directory the harness made as its own user put root's objects in that user's group, and those 63 cases failed
+  /// unlisted on macOS (CI run 44271637767). Do: make a directory in the build output as this user, hand it to root as a
+  /// root run of the suite does, and make a directory in it as root. Expect root's directory in group 0: on a BSD host
+  /// by its parent's group, on Linux by root's own. Skips loudly without passwordless `sudo`.
+  #[cfg(unix)]
+  #[test]
+  #[allow(clippy::unwrap_used, clippy::disallowed_methods)]
+  fn what_root_makes_where_a_root_run_starts_is_in_group_0() {
+    use std::os::unix::fs::MetadataExt;
+
+    use super::*;
+
+    /// Removes, as root, what root made and the directory handed to it, however the test ends.
+    struct Removed(PathBuf, PathBuf);
+    impl Drop for Removed {
+      fn drop(&mut self) {
+        let _ = Command::new("sudo")
+          .args(["-n", "rmdir"])
+          .arg(&self.1)
+          .arg(&self.0)
+          .stdin(Stdio::null())
+          .status();
+      }
+    }
+
+    let elevate = Command::new("sudo")
+      .args(["-n", "true"])
+      .stdin(Stdio::null())
+      .status();
+    if !elevate.is_ok_and(|status| status.success()) {
+      eprintln!(
+        "SKIP: handing a directory to root needs passwordless sudo (`sudo -n true` refused)"
+      );
+      return;
+    }
+    let work =
+      crate::conformance::build_output(&format!("conformance-root-start-{}", std::process::id()))
+        .unwrap();
+    let made = work.join("made-by-root");
+    let _removed = Removed(work.clone(), made.clone());
+    hand_to_root(&work, true).unwrap();
+    let status = Command::new("sudo")
+      .args(["-n", "mkdir"])
+      .arg(&made)
+      .stdin(Stdio::null())
+      .status()
+      .unwrap();
+    assert!(status.success(), "sudo -n mkdir answered {status}");
+    let group = std::fs::metadata(&made).unwrap().gid();
+    assert_eq!(
+      group,
+      0,
+      "a directory root made where a root run starts is in group {group}, not 0 (the start's group is {})",
+      std::fs::metadata(&work).unwrap().gid()
+    );
   }
 
   /// CI run 42395077767's record of a failed fsx run held replay lines only, and its `-P` files stayed in the runner's
