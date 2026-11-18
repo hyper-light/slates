@@ -30636,6 +30636,8 @@ daemon}.rs`.
 - **Test.** `a_forward_over_a_slow_path_gets_its_round_trip_tail_on_top_of_a_window` (`crates/server/src/verbs.rs`):
   with the path to a peer measured at two liveness windows a round trip, the stall is past that tail by a window; with
   nothing measured, one window.
-  EVIDENCE_PLACEHOLDER
+  Run on the Mac Studio (kiln, 2026-11-18, load 4-7, debug build, `cargo test --locked -p slates-server --lib --
+  forward`): 14 of 14. Red-checked once: with the stall back at the window alone, the test fails at the slow path's
+  assertion. The promotion's and the forwarded verbs' fleet flows are filed for main's run.
 
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class B), `crates/server/src/verbs.rs`.
