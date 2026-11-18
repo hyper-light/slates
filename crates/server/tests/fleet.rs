@@ -10940,9 +10940,11 @@ fn a_superseded_owners_clients_reach_its_successor() {
   let successor = &daemons[if successor == hosts[1] { 1 } else { 2 }];
   let observed: Vec<&Daemon> = daemons.iter().collect();
   let served = poll_status_answers(&observed, successor.instance(), id);
+  let mut watcher = Client::connect(successor.instance());
   let shipping_at_once = poll_until(&observed, PLACEMENT_DEADLINE, || {
-    Ok(owned_live_head(&mut Client::connect(successor.instance()), id).is_some())
+    Ok(owned_live_head(&mut watcher, id).is_some())
   });
+  drop(watcher);
   let through_a = written_through(&daemons, 0, id, "/through-the-old-owner");
   let third = if successor.instance() == daemons[1].instance() {
     2
