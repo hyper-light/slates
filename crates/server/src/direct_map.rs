@@ -1318,7 +1318,8 @@ mod served {
         return refused(Refusal::MapUnavailable);
       };
       let key = (slates_ipc::route::OfferKind::Map, mapping_id);
-      if !crate::shards_route::offer(state, key, secret, descriptor) {
+      // A map's copy rides alone: only a stream's offer carries a resync end (A-339).
+      if !crate::shards_route::offer(state, key, secret, (descriptor, None)) {
         state.count(FELL_BACK, 1);
         return refused(Refusal::MapUnavailable);
       }
