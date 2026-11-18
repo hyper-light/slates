@@ -88,6 +88,7 @@ pub const PARKED_STAMP_SLOT_ONE: u32 = 2;
 /// waits, tells such a park (either stamp slot's value) from the arm by this word alone
 /// (`crate::park::parks_synchronously`). The daemon reads it as a park that stamps slot 0, as it reads every armed
 /// value but slot one's; the async path reads no stamp.
+/// Format: the next value after the two stamp slots' flags (1 and 2).
 pub const PARKED_ASYNC: u32 = 3;
 /// Format: the reply stamp's confirmed bit, the top one: set by the daemon after its wake found the
 /// client asleep in its wait (the kernel had a sleeper to wake), so the stamp times a sleeper woken — the
