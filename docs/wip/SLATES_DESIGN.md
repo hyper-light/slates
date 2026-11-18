@@ -28052,6 +28052,7 @@ path's release of the charge), `crates/server/src/merge_origin.rs` (`Gather::pla
   issued once placed, the restarted holder, the successor one version behind, the late submit) passed on the same
   server code, 6 of 6 (r3646).
 - **Still owed.** A version's recomputation, its gather included, is one call, costing what its increment's size costs.
+
 ### A-385 — A holder folds its replica of a green where its owner folded: a merge record names the owner's fold floor (2026-11-18, goal g232: one primary and two replicas editing the Linux kernel tree; §4.16 "Position mapping" and "Apply on holders"; A-238's owed item, its replica half)
 
 Applied in the same change to: §4.16 "Position mapping", A-238's "Owed", GAPS (the load test's ledger),
