@@ -804,7 +804,9 @@ fn permission_bits(mode: u32) -> u32 {
 /// `S_ISGID`, `S_IXGRP`), for `FATTR_KILL_SUIDGID` (and the set-group-id bit for
 /// `FUSE_SETXATTR_ACL_KILL_SGID`, [`kill_sgid`]).
 const S_ISUID: u32 = 0o4000;
+/// Format: `<sys/stat.h>`'s set-group-id bit.
 const S_ISGID: u32 = 0o2000;
+/// Format: `<sys/stat.h>`'s group-execute bit.
 const S_IXGRP: u32 = 0o010;
 
 /// The mode `FATTR_KILL_SUIDGID` asks for: the set-user-id bit cleared, and the set-group-id bit
