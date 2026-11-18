@@ -8,11 +8,13 @@
 //! The facts behind the rows, as of 2026-10-01: the macOS mount is the daemon's NFSv3 loopback
 //! server under `mount_nfs` (§4.6, proven live by `crates/cli/tests/cli.rs`); the daemon serves a Linux
 //! FUSE mount (`slates mount` on Linux, `crates/server/src/fuse.rs`, proven on a real kernel mount by
-//! `crates/server/tests/fuse_mount.rs`), but the Linux lane still reaches the daemon through a root
-//! `mount -t nfs` adapter — running the suites over the FUSE mount itself is owed (pjdfstest's root cases
+//! `crates/server/tests/fuse_mount.rs`): the Linux lane runs the workload roster over that mount itself, as an
+//! agent's tools reach it, with no privilege (A-293), and still reaches the daemon through a root `mount -t nfs`
+//! adapter for the other suites — running those over the FUSE mount itself is owed (pjdfstest's root cases
 //! need `allow_other`, an operator's `user_allow_other`); on Windows (A-209, 2026-11-05) the harness mounts the
 //! volume as a WinFsp drive (`slates mount ID E:`) and runs WinFsp's own two suites over it, the fsx port and
-//! winfstest, each built from its pinned source with MSVC, on both Windows lanes;
+//! winfstest, each built from its pinned source with MSVC, on both Windows lanes, and since A-300 the workload
+//! roster's version-control workloads (git, Mercurial, Subversion) through Git for Windows' shell;
 //! virtio-fs runs a live Linux guest through QEMU's vhost-user-fs, which mounts the tag and runs the workload
 //! roster identically on slates and on its RAM (`crates/server/tests/virtiofs.rs`), while the other suites have
 //! no guest leg yet; the OCI container
@@ -131,19 +133,25 @@ const OCI_OWED: &str = "the container form exists — `attach` returns a verifie
   daemon's shared FUSE mount), and on macOS it is owed: its tracer (`eslogger`) needs root, which this lane's \
   harness never takes";
 
-/// The Linux adapter: the OS NFS client mounting the unprivileged daemon's loopback export.
-const LINUX_NFS_ADAPTER: Adapter = Adapter {
+/// The Linux adapter: the OS NFS client mounting the unprivileged daemon's loopback export. The only adapter the
+/// table names; a harness that reaches a volume through it (`xtask/src/conformance/slates.rs`, `Reach`) is told so by
+/// this value.
+pub const LINUX_NFS_ADAPTER: Adapter = Adapter {
   name: "a root `mount -t nfs` by the Linux NFS client of the unprivileged daemon's NFSv3 loopback \
     export (the same serving code as macOS)",
   not_covered: "the daemon's own FUSE mount (`slates mount` on Linux, crates/server/src/fuse.rs): this lane \
-    mounts through the NFS adapter; the suites over the FUSE mount run in the Linux container lane \
-    (`oci-linux`, `slates mount --shared` with `user_allow_other`)",
+    mounts through the NFS adapter for this suite; the workload roster runs over the FUSE mount itself (A-293), \
+    and the other suites over it run in the Linux container lane (`oci-linux`, `slates mount --shared` with \
+    `user_allow_other`)",
 };
 
 /// Tools every mounted macOS suite needs.
 const MACOS_MOUNT_TOOLS: &[&str] = &["mount_nfs", "umount", "sh"];
 /// Tools every mounted Linux suite needs (root mounts through the OS client).
 const LINUX_MOUNT_TOOLS: &[&str] = &["mount", "umount", "sh", "sudo"];
+/// Tools a suite over the daemon's own Linux FUSE mount needs: `fusermount3`, the setuid helper through which an
+/// unprivileged `slates mount` reaches `/dev/fuse` and by which the harness unmounts, and the shell.
+const LINUX_FUSE_TOOLS: &[&str] = &["fusermount3", "sh"];
 
 /// The availability of a cell.
 pub fn availability(transport: Transport, suite: Suite) -> Availability {
@@ -200,6 +208,15 @@ pub fn availability(transport: Transport, suite: Suite) -> Availability {
       adapter: None,
     },
     (Transport::NativeMacosNfs, suite) => native_macos(suite),
+    // The roster over the daemon's own FUSE mount (`slates mount`), the route an agent's git, Mercurial and
+    // Subversion take on Linux: no root and no adapter, since a user's processes reach the user's own FUSE mount
+    // (A-293, Ada's goal of 2026-11-18).
+    (Transport::NativeLinuxFuse, Suite::Workloads) => Availability::Runnable {
+      on: HostOs::Linux,
+      tools: LINUX_FUSE_TOOLS,
+      root: RootNeed::None,
+      adapter: None,
+    },
     (Transport::NativeLinuxFuse, suite) => native_linux(suite, Some(LINUX_NFS_ADAPTER)),
     // The daemon's own NFSv4.2 server under the kernel client: a transport, not an adapter.
     (Transport::NativeLinuxNfs4, suite) => native_linux(suite, None),
@@ -309,10 +326,15 @@ fn native_windows(suite: Suite) -> Availability {
       root: RootNeed::None,
       adapter: None,
     },
-    Suite::Workloads => Availability::Owed(
-      "the harness mounts the drive (A-209), but the roster's tools and their byte-identity comparison are POSIX's \
-       (git over a mode-keeping tree, cargo, rsync, sqlite, a watcher) and no Windows roster is defined yet",
-    ),
+    // The roster's version-control workloads over the drive (A-300), each script run by Git for Windows' shell in an
+    // NTFS folder and on the drive and compared byte for byte, with the drive's one stated difference (it makes no
+    // hard link); the roster's other workloads are owed a Windows form (`Workload::runs_on_windows`).
+    Suite::Workloads => Availability::Runnable {
+      on,
+      tools: &[WINFSP_LIBRARY, "sh"],
+      root: RootNeed::None,
+      adapter: None,
+    },
     Suite::Hermeticity => Availability::Owed("no ETW filesystem-write tracer is wired for Windows"),
     Suite::Pressure | Suite::Failure => Availability::Owed(NO_PRESSURE_OR_FAILURE_SUITE),
   }
@@ -341,7 +363,8 @@ mod tests {
   }
 
   /// The macOS transport runs its suites on macOS with no adapter; the Linux transport runs them
-  /// through the root NFS adapter, which names what it does not cover.
+  /// through the root NFS adapter, which names what it does not cover, except the workload roster, which runs over
+  /// the daemon's own FUSE mount with neither root nor adapter (A-293).
   #[test]
   fn native_lanes_run_on_their_own_os() {
     for suite in [
@@ -358,12 +381,42 @@ mod tests {
         }
         other => panic!("{suite:?} on macOS: {other:?}"),
       }
-      match availability(Transport::NativeLinuxFuse, suite) {
-        Availability::Runnable { on, adapter, .. } => {
+      match (suite, availability(Transport::NativeLinuxFuse, suite)) {
+        (
+          Suite::Workloads,
+          Availability::Runnable {
+            on,
+            tools,
+            root,
+            adapter,
+          },
+        ) => {
+          assert_eq!(on, HostOs::Linux);
+          assert!(adapter.is_none() && root == RootNeed::None);
+          assert!(tools.contains(&"fusermount3"), "{tools:?}");
+        }
+        (_, Availability::Runnable { on, adapter, .. }) => {
           assert_eq!(on, HostOs::Linux);
           assert!(adapter.is_some_and(|a| a.not_covered.contains("FUSE")));
         }
-        other => panic!("{suite:?} on Linux: {other:?}"),
+        (_, other) => panic!("{suite:?} on Linux: {other:?}"),
+      }
+    }
+  }
+
+  /// A-293: every adapter the table names is the Linux NFS adapter, the one a harness knows how to mount; a new
+  /// adapter must teach the harness its mount before a cell names it.
+  #[test]
+  fn the_linux_nfs_adapter_is_the_only_adapter() {
+    for transport in Transport::ALL {
+      for suite in Suite::ALL {
+        if let Availability::Runnable {
+          adapter: Some(adapter),
+          ..
+        } = availability(transport, suite)
+        {
+          assert_eq!(adapter, LINUX_NFS_ADAPTER, "{transport:?} {suite:?}");
+        }
       }
     }
   }
@@ -397,10 +450,11 @@ mod tests {
     );
   }
 
-  /// A-209: the Windows transport runs fsx and winfstest on the Windows lane with no root and no adapter.
+  /// A-209: the Windows transport runs fsx and winfstest on the Windows lane with no root and no adapter; A-300: and the
+  /// workload roster, whose scripts need a POSIX shell on the `PATH` (Git for Windows').
   #[test]
-  fn windows_runs_fsx_and_winfstest() {
-    for suite in [Suite::Fsx, Suite::Winfstest] {
+  fn windows_runs_fsx_winfstest_and_the_workloads() {
+    for suite in [Suite::Fsx, Suite::Winfstest, Suite::Workloads] {
       assert!(
         matches!(
           availability(Transport::NativeWindowsWinfsp, suite),
@@ -414,6 +468,10 @@ mod tests {
         "{suite:?}"
       );
     }
+    assert!(matches!(
+      availability(Transport::NativeWindowsWinfsp, Suite::Workloads),
+      Availability::Runnable { tools, .. } if tools.contains(&"sh")
+    ));
   }
 
   /// A-209: winfstest applies to no other transport, and pjdfstest and fsstress do not apply to Windows.
