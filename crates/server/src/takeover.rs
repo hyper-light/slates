@@ -1284,9 +1284,10 @@ fn record_adoption(
     // A destroyed volume (AUD-29-43): the successor owes its tombstone from the adopted stage on, and never
     // materializes it.
     state.pending_catalogs.remove(&object);
-    state
-      .pending_tombstones
-      .insert(object, tombstone.tombstone_sequence(record.sequence));
+    state.pending_tombstones.insert(
+      object,
+      crate::state::PendingTombstone::adopted(tombstone.tombstone_sequence(record.sequence)),
+    );
   } else if let Some(head) = HeadValue::from_record_bytes(&record.value) {
     state.pending_materializations.insert(
       object,

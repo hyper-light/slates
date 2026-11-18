@@ -229,15 +229,17 @@ fn retire_unheld(works: &[ObjectId], held: &[bool]) -> usize {
 
 /// Retires `work`'s route on the adopter (module docs): no longer kept placed as a catalog (`pending_catalogs`, and the
 /// control shard's placement of the catalog), it is owed as a destroyed work's tombstone instead, which the record plane
-/// records on the work's own partition and ships in its two stages (`fleet::adopt_pending_tombstones`).
+/// records on the work's own partition and ships in its two stages (`fleet::adopt_pending_tombstones`, which bounds the
+/// attempts to record it as it bounds an adopted tombstone's).
 fn retire(state: &mut ShardState, work: ObjectId) {
   if state.pending_catalogs.remove(&work).is_none() {
     return;
   }
   state.placed_heads.remove(&work.catalog());
-  state
-    .pending_tombstones
-    .insert(work, WORK_TOMBSTONE_SEQUENCE);
+  state.pending_tombstones.insert(
+    work,
+    crate::state::PendingTombstone::adopted(WORK_TOMBSTONE_SEQUENCE),
+  );
   state.count(RETIRED, 1);
 }
 

@@ -532,9 +532,6 @@ pub struct ShardState {
   /// (`landing::grant_proof`). Every shard reads the same secret, so a grant verifies on whichever shard
   /// serves the client; it is never sent on any channel.
   pub issuer_secret: [u8; slates_anchor::layout::ISSUER_SECRET_BYTES],
-  /// The keys the human registered to sign grants with (A-285; `crate::grant_signature`). A signed `Grant` verifies
-  /// only under one of them; none are registered until the human's surface registers the first.
-  pub grant_keys: Vec<crate::grant_signature::RegisteredKey>,
   /// The node's client session secret (`crate::session_key`), read from the anchor's supervision block at shard init:
   /// what a client's session key is derived from and checked against on the shard that serves it. Never sent.
   pub session_secret: [u8; slates_anchor::layout::SESSION_SECRET_BYTES],
@@ -1003,11 +1000,13 @@ pub struct ShardState {
   /// held inputs. Each carries the attempts made, which `fleet::materialize_pending_greens` bounds. Bounded by the
   /// objects this node owns; empty on a laptop.
   pub pending_green_materializations: BTreeMap<ObjectId, PendingGreen>,
-  /// Taken-over volumes whose register this node adopted as a **tombstone** (AUD-29-43), with the tombstone's
-  /// sequence: awaiting `Op::TombstoneAdopted` on the shard the id routes to, from where the record plane
-  /// ships the tombstone's remaining stages. Never materialized. Bounded by the objects this node owns. A work whose
-  /// route this node retired joins them (A-288, `crate::work_route`).
-  pub pending_tombstones: BTreeMap<ObjectId, u64>,
+  /// Taken-over volumes whose register this node adopted as a **tombstone** (AUD-29-43), each with the tombstone's
+  /// sequence and the attempts to record it: awaiting `Op::TombstoneAdopted` on the shard the id routes to, from where
+  /// the record plane ships the tombstone's remaining stages. Never materialized. One given up on past the failover
+  /// SLO's attempts stays, marked, so the volume is still known destroyed here and its catalog never rebuilt
+  /// (`fleet::adopt_pending_tombstones`). Bounded by the objects this node owns. A work whose route this node retired
+  /// joins them (A-288, `crate::work_route`).
+  pub pending_tombstones: BTreeMap<ObjectId, PendingTombstone>,
   /// On the control shard: the work route keeper's nudge and waker (A-288, `crate::work_route`).
   pub(crate) work_routes: crate::work_route::WorkRoutes,
 }
@@ -1363,6 +1362,41 @@ impl PendingGreen {
   }
 }
 
+/// A taken-over volume's tombstone awaiting its record on the shard the volume's id routes to (§4.4 destroy, §4.10
+/// status AUD-29-43; `ShardState::pending_tombstones`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingTombstone {
+  /// The tombstone's sequence: one past every sequence the volume's registers used.
+  pub sequence: u64,
+  /// The attempts to record it so far, one a fleet period (`fleet::adopt_pending_tombstones`).
+  pub attempts: u32,
+  /// Whether it was given up on: past the failover SLO's attempts it is attempted no more, and stays only so that the
+  /// volume is still known destroyed here (`takeover::record_adoption` never rebuilds its catalog).
+  pub given_up: bool,
+}
+
+impl PendingTombstone {
+  /// A tombstone just adopted at `sequence`: no attempt made yet.
+  pub fn adopted(sequence: u64) -> PendingTombstone {
+    PendingTombstone {
+      sequence,
+      attempts: 0,
+      given_up: false,
+    }
+  }
+
+  /// Counts an attempt that did not record it against `bound` (`fleet::takeover_attempts`); whether this attempt gives
+  /// it up. One already given up counts nothing more.
+  pub fn count_attempt(&mut self, bound: u32) -> bool {
+    if self.given_up {
+      return false;
+    }
+    self.attempts = self.attempts.saturating_add(1);
+    self.given_up = self.attempts >= bound;
+    self.given_up
+  }
+}
+
 /// A taken-over volume awaiting materialization (§4.8 "Promotion and takeover", §4.10;
 /// `ShardState::pending_materializations`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1522,6 +1556,24 @@ mod tests {
         (9, false, 7),
         (10, true, 0),
       ]
+    );
+  }
+
+  /// §4.10 status AUD-29-43, CLAUDE.md §2 item 8 (no unbounded retry): a taken-over tombstone its owner shard does not
+  /// record is given up on at the bound, once, and then counts no more attempts. Do: count attempts against a bound of
+  /// 3, then twice more. Expect the third to give it up and the rest to count nothing, the attempts staying at 3.
+  #[test]
+  fn a_tombstone_is_given_up_once_at_its_bound_and_counts_nothing_after() {
+    let mut tombstone = PendingTombstone::adopted(9);
+    let given_up: Vec<bool> = (0..5).map(|_| tombstone.count_attempt(3)).collect();
+    assert_eq!(given_up, vec![false, false, true, false, false]);
+    assert_eq!(
+      tombstone,
+      PendingTombstone {
+        sequence: 9,
+        attempts: 3,
+        given_up: true,
+      }
     );
   }
 

@@ -9,28 +9,23 @@
 > with Firecracker, crosvm and Cloud Hypervisor (41318050347, 41319438579). Still open, and not this plan's: the
 > inventory's built-but-unrun cells (its order of work, item 5).
 
-> **A grant is signed by a key only the human holds (2026-11-18, R10, D-22, §4.13; A-285, Ada's decision: fs-server's
-> option D, with A as the fallback, on every OS).** This closes, once built, "No grant can be issued on Linux from the
-> CLI" (A-201's entry). **Built (piece 1):** the signed statement and its SSH-signature verifier
-> (`crates/server/src/grant_signature.rs`; `ssh-ed25519` and `sk-ssh-ed25519`, the touch required, namespace
-> `slates-grant`), 10 unit tests against a real `ssh-keygen -Y sign` vector: forged, unregistered, changed manifest
-> and every other field, another namespace, expired, untouched, hostile bytes. **Built (piece 2, 2026-11-18):** each
-> presentation draws a 256-bit nonce and `land` returns it (`nonce:` / `"nonce"`); a `Grant` carries either proof
-> form (`GrantProofBody`); a signed one is decided by `landing::verify_signed_grant` against the shard's registered
-> keys, the presentation's own target and nonce, and the wall clock, and its nonce is spent by the grant it proves
-> (a replay refused `Replayed`, counted `grant_signature_replayed`). No key can be registered yet, so every signed
-> grant is refused `UnregisteredKey` until piece 3. **Owed, in order:**
-> - durable key registration: the first key only through A's terminal prompt (a standalone anchor) or kiln's person
->   session (a kiln-managed anchor, WebAuthn; the supervisor's direction, put to Ada); later keys signed by a
->   registered key; no agent channel adds one;
-> - `slates grant` signing through `ssh-keygen -Y sign`, and A's prompt over a pty;
-> - the exported-variables issuer surface removed on macOS and Windows (GAP-A9-9's macOS segment then closes by name);
->   `enroll`, `revoke`, `run` and `recover` prove authority with the same issuer secret and need the signed proof too;
-> - the Windows confirm-per-use path (OpenSSH's agent, or FIDO through Windows Hello), recorded;
-> - the WebAuthn form verified (its challenge is the statement's SHA-256; g263 and g264 own kiln's side);
-> - a real FIDO key's signature (the unit test stands a software key in for the authenticator);
-> - the end-to-end proof on adacachy, `SLATES_TEST_GRANT=1`: registration through A over a pty, a landing granted by
->   a confirmed ssh-agent key and written, the askpass refusing, an unregistered key and a replay refused.
+> **Write permission follows the mode the user gave the agent (2026-11-18, R10, D-22, §4.13; A-285, Ada's decisions,
+> revised the same day).** Bypass merges and lands at once; ask answers a typed approval request bound to the
+> manifest, which the harness presents; a forbidding mode is refused. The launcher (kiln passes each agent's mode) or
+> the harness sets the policy, the stricter of consumer and volume governs, unset is ask, and an agent never raises
+> its own. Signed work is provenance, not permission. This closes, once built, "No grant can be issued on Linux from
+> the CLI" (A-201's entry): under bypass the daemon grants its own landing. The first reading (a human-only proof,
+> fs-server's options A–E) is withdrawn by Ada; its piece 2 (the presentation nonce and the signed `Grant`,
+> d1a46ae9) is reverted, and the SSH verifier (1c31d1c7) is kept for signed work. **Owed, in order** (types agreed
+> with g262, slates-api's owner):
+> - `WriteAct`, `WriteMode { Bypass, Ask, Forbid }`, `WritePolicy { merge, land }`, `PolicySubject`, the issuer-proven
+>   `SetPolicy` (refused on a consumer-bound channel) and `Refusal::PolicyForbids { act, by }`;
+> - a landing under the effective mode, Linux included; then merges (submit) under it;
+> - the MCP and SDK land verb gated by the policy (the grant kind stays refused there);
+> - signed work: a merge or landing may carry an SSH signature, checked and recorded (verified with its signer,
+>   unsigned, invalid with its reason), and a volume may require signed merges;
+> - the end-to-end proof on adacachy: a bypass agent's landing written at once, an ask agent's after approval, a
+>   signed merge verified and an invalid signature reported.
 
 > **git's history, Mercurial and Subversion join the workload roster (2026-11-17, Part 6 "Real workloads"; A-289;
 > Ada's goal of 2026-11-18).** Until now one 15-line git script was all the version control any route ran: no clone,
@@ -97,12 +92,14 @@
 > `a_survivor_holding_no_copy_of_the_works_catalog_learns_its_green_from_a_location_round` (`040da0d9a`, on main since
 > A-255 landed) was killed at its 240 s deadline in the Windows fleet lane of PR #11's first CI run (job 134508155910:
 > 123 passed, 0 failed, 1 timed out) and passed in the next (job 134523028813: 123 passed, 0 failed, 0 timed out).
-> PR #11 does not touch it. **Owed:** its rate on main's own Windows lane. It also failed once on macOS (2026-11-17,
-> adas-macbook-pro, debug, load 190, on 7c6faee27 with A-288's change, which the failure does not involve), another way:
-> d's resend was answered `NotFound` because the green was never materialized on its successor
-> (`merge.takeover_incomplete` counted 4,561, every work route question unanswered, none retired). That is the gap main's
-> 5e14a4098 closed, a successor one version behind never receiving the adopted version's inputs. Merged with main
-> b7c294959, it passed in 5 s at load 104.
+> PR #11 does not touch it. **Owed:** its rate on main's own Windows lane. It also fails on macOS whenever d, the node
+> the test deafens to every record, is the green's successor: d adopts the green but holds none of its chain, so it can
+> never rebuild it (GAP-A9-7's record half), and d's resend is answered `NotFound`. Seen twice on 2026-11-17
+> (adas-macbook-pro, debug, with A-288's change): at load 190 on 7c6faee27 (`merge.takeover_incomplete` 4,561, before
+> the give-up existed), and at load 42 to 47 merged with main 58a37794c (given up after 100 attempts, the last waiting
+> on its chain). In both, d owned the green, and no node retired a work route (`fleet.work_route.retired` absent). Host
+> ids are drawn fresh each run, so it passes whenever another survivor is the successor (5 s at load 104, merged with
+> b7c294959). **Owed:** a deafened node that cannot be the green's successor.
 
 > **The dirty-page test's precondition, proved each attempt (2026-11-09, A-248).**
 > `a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path` failed intermittently ("the sync says so:
@@ -2117,9 +2114,16 @@
 >     record link's ephemeral source is attributed to its node by the process holding the port (`/proc` on Linux,
 >     `netstat` and `ps` on macOS); a datagram no census attributes is dropped and counted, never forwarded, since
 >     forwarding it could carry a cut-off node's traffic across.
->   - Three flows run behind it (`Fleet::start_relayed`): writes streamed while every path holds 20 ms ± 5 ms and loses
->     1 %, then 5 %, then 1 % with 2 % duplicated, then a takeover over the lossy paths; an owner cut off both ways
->     while it runs; and an owner that still speaks to its peers but hears none.
+>   - Eight flows run behind it (`Fleet::start_relayed`), the partitions each against a running process:
+>     - writes streamed while every path holds 20 ms ± 5 ms and loses 1 %, then 5 %, then 1 % with 2 % duplicated, then
+>       a takeover over the lossy paths;
+>     - an owner cut off both ways, deafened (it speaks and hears nothing) or muted (it hears and nobody hears it), each
+>       taken over (`an_owner_partitioned`);
+>     - each candidate in turn cut off, deafened or muted for 2 s, with no write refused and no takeover: a partitioned
+>       candidate deposes no one, since its view is one voter's and a death needs `f + 1` (A-250)
+>       (`candidates_partitioned_in_turn`, the SIGSTOP flow's partition kinds);
+>     - one candidate held 200 ms ± 50 ms each way (T-8.3's slow candidate), and no write waits for it: the median write
+>       made meanwhile stays under its round trip, since one holder of two makes a write durable at `f = 1`.
 >   - Two invariants are judged from outside, in every flow that takes a live volume over (the relayed ones, the
 >     SIGSTOP owner and the SIGKILL takeovers: `judge_takeover`, `an_owner_partitioned`). ReadSafety: a latest-state
 >     read sent through any node after a write's acknowledgement answers that write or a refusal, never other bytes and
@@ -2128,12 +2132,34 @@
 >     of its successor). Continuity: the successor's first head is past every position an owner reported durable under
 >     an earlier epoch, in the samples or a last look at the owner before its loss, since its log goes on from the head
 >     it adopted (`slates_db::live::Shipper::new`).
+>   - ReadSafety is judged in the flows that take nothing over too (2026-11-17): the candidates partitioned in turn (all
+>     four kinds), the random stalls, the slow candidate and the lossy phases read the stream's newest acknowledged
+>     writes through every node mid-fault (halfway through each partition, while the stalls and the slowness last, in
+>     each lossy phase) and again once it ends (`judge_reads`). Every read must answer its write or a refusal, through
+>     the partitioned node too; the owner must answer every one with its write, since its lease needs one healthy
+>     candidate's confirmation of two (§4.8 "Leases and reads"); and at least one read must be judged through every
+>     node, the non-vacuity count (a read is judged once it was sent after its write's acknowledgement, which the
+>     stream publishes as it goes, `NewestAcknowledged`). Agreement is named for what it is, the models' TotalOrder
+>     judged over every copy that answers rather than the committed ones alone.
+>   - A seeded nemesis (2026-11-17, `a_seeded_nemesis_of_single_faults_keeps_every_register_invariant`): fourteen
+>     single faults drawn from the flow's seed (`SLATES_CHAOS_SEED` replays it), each of seven kinds as likely: every
+>     path lossy (one of the lossy profiles), one node slowed 200 ms ± 50 ms, one link severed both ways (a partition
+>     that is not transitive: its two ends each still hear the third node), or one node stopped, cut off, deafened or
+>     muted. The struck node is the owner as often as either candidate, each fault is held 200 ms to 4 s (a blip under
+>     the 900 ms horizon up to past detection and confirmation, so a takeover may finish, or still run, as it ends), and
+>     once a run the owner is partitioned until it is taken over. Reads go through every node while each fault lasts,
+>     and the fleet must recover whole before the next (members seated, no voter change in flight, neighbourhoods
+>     settled, one node shipping, every copy caught up past the owner's durable head), so no cohort loses two members,
+>     and the stream, forwarded once another node owns the volume, must make more writes durable meanwhile.
+>     It ends with Agreement, NoLoss on the last owner, every copy fenced at its epoch, ReadSafety, Convergence and a
+>     write through the last owner, and with Continuity judged from the samples (no head shipped under a fence below
+>     what an earlier fence made durable), since its takeovers are unscheduled. Its first runs are the supervisor's.
 >   - The client side of StaleNeverCommits in the owner-partition flows is now every write sent to the old owner while
 >     it was partitioned refused. Until 2026-11-17 the SIGSTOP flow refused every write sent after the resume instead,
 >     but a re-admitted old node forwards a write to the volume's owner (§4.8 "Lookup"), so an acknowledgement through
 >     it after the heal can be right; such writes are held to NoLoss on the successor with every other acknowledged one.
->   - The relay's own five tests (in-process sockets, no daemon) pass on macOS (kiln on Adas-MacBook-Pro-3, 2026-11-17,
->     run r71 and again with the takeover checks): forwarding and the answer's way back, a one-way cut, loss, delay and
+>   - The relay's own six tests (in-process sockets, no daemon) pass on macOS (kiln run r265, Adas-MacBook-Pro-2,
+>     2026-11-17): forwarding and the answer's way back, a one-way cut, a node muted and deafened, loss, delay and
 >     duplication, attribution by process, and the draws. The flows' first runs are the supervisor's (CLAUDE.md §8):
 >     `SLATES_TEST_CLI=1 cargo test --release -p slates-cli --test live_chaos -- --test-threads=1` on macOS and Linux.
 >     Linux's census has run nowhere yet.
@@ -15646,6 +15672,22 @@ suite on adacachy2 and 1 of 3 of the stack's (the supervisor's gate); alone it p
   owner's chain, 2 of 2, and the nine green takeover tests beside it 10 of 10 (macOS arm64, load 32-60). The share
   test's rerun under diag-clients-green-1's load is owed to the supervisor's lanes.
   `docs/bugs/2026-11-18-a-successor-one-version-behind-never-received-the-adopted-versions-inputs.md`.
+- **Sibling, bounded 2026-11-18: a taken-over tombstone's record.** The same period's first step,
+  `fleet::adopt_pending_tombstones` (AUD-29-43), skipped a tombstone whose partition has no shard here every period
+  without a count, and retried one its shard refused (the partition's volume capacity full, or a live volume under the
+  id) every period without end. Each pending tombstone (`state::PendingTombstone`) now counts its attempts against
+  `takeover_attempts`, each counted by its reason (`fleet.tombstone.waits.shard`, `fleet.tombstone.adopt_refused`, and
+  `fleet.tombstone.adopt_unanswered`, which `adopt_refused` counted before), and at the bound it is given up,
+  `fleet.tombstone.given_up` with a log line, and attempted no more. The adoption had already placed the tombstone at
+  the quorum, so the volume is never served again; the retirement is what is lost, which leaves the candidates holding
+  the tombstone. It stays marked, so the volume is still known destroyed and its catalog never rebuilt. Red first:
+  with the give-up cut out in a scratch copy, a tombstone whose partition has no shard here was attempted
+  100 times in 100 periods (`waits.shard` 100) and one a live volume's shard refused 99 times (`adopt_refused` 99),
+  neither given up (2 of 2, `a_taken_over_tombstone_whose_partition_has_no_shard_here_is_given_up_by_name`,
+  `a_taken_over_tombstone_its_shard_refuses_is_given_up_and_the_live_volume_stays`); with the bound each is given up
+  after 10, counted once, attempted no more, and the live volume still answers its status. Beside them the destroyed
+  volume's takeover test and seven volume and green takeover tests, 10 of 10 in 27.5 s; `slates-server --lib` 267 of
+  267 (macOS arm64, Adas-MacBook-Pro-3, load 26-38, 2026-11-18).
 - **Sibling, fixed 2026-11-18: a panic on the rebuilt green's role.** `verbs::materialize_taken_over_green` checked with
   a `debug_assert!` that the id it rebuilds names a green, the last `debug_assert!` in any crate's sources (CLAUDE.md §2
   item 6): a debug build's shard panicked on a volume of another role under the id, and a release build went on to

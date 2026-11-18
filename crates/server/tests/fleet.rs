@@ -17589,6 +17589,180 @@ fn a_taken_over_volume_whose_content_never_comes_is_refused_by_name() {
   );
 }
 
+/// Shape: a planted tombstone's object id whose partition (bytes 8 and 9, `verbs::owner_of`) no daemon here runs a
+/// shard for, so its record can never be made on this node.
+const PLANTED_TOMBSTONE_NO_SHARD: [u8; 16] = [
+  0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0xff, 0xff, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22,
+];
+
+/// Shape: the tombstone sequence a planted tombstone carries (any past a volume's creation head).
+const PLANTED_TOMBSTONE_SEQUENCE: u64 = 3;
+
+/// Plants on `daemon`'s control shard a taken-over tombstone for `object` awaiting its record, as a takeover's adoption
+/// leaves one (`takeover::record_adoption`).
+fn plant_taken_over_tombstone(daemon: &Daemon, object: ObjectId) {
+  daemon
+    .observation_on_control(
+      LIVENESS_BUDGET_NS,
+      move |s: &mut slates_server::state::ShardState| {
+        s.pending_tombstones.insert(
+          object,
+          slates_server::state::PendingTombstone::adopted(PLANTED_TOMBSTONE_SEQUENCE),
+        );
+      },
+    )
+    .unwrap()
+    .wait()
+    .unwrap();
+}
+
+/// What `daemon`'s control shard holds of the tombstone for `object`, and its `fleet.tombstone*` counters.
+fn tombstone_record(
+  daemon: &Daemon,
+  object: ObjectId,
+) -> (
+  Option<slates_server::state::PendingTombstone>,
+  std::collections::BTreeMap<String, u64>,
+) {
+  daemon
+    .observation_on_control(
+      LIVENESS_BUDGET_NS,
+      move |s: &mut slates_server::state::ShardState| {
+        let counted = s
+          .refusals
+          .iter()
+          .filter(|(name, _)| name.starts_with("fleet.tombstone"))
+          .map(|(name, count)| ((*name).to_owned(), *count))
+          .collect();
+        (s.pending_tombstones.get(&object).copied(), counted)
+      },
+    )
+    .unwrap()
+    .wait()
+    .unwrap()
+}
+
+/// Reads the tombstone for `object` on `daemon` each fleet period until it is given up, for at most `periods` periods
+/// of wall time, and then for `after` periods more; what it held at the give-up (or last) and at the end.
+fn tombstone_given_up_within(
+  daemon: &Daemon,
+  object: ObjectId,
+  periods: u64,
+  after: u64,
+) -> [(
+  Option<slates_server::state::PendingTombstone>,
+  std::collections::BTreeMap<String, u64>,
+); 2] {
+  // A channel nobody sends on paces the reads, as the lint wall wants.
+  let (_held, pace) = std::sync::mpsc::channel::<()>();
+  let started = Instant::now();
+  let mut last = tombstone_record(daemon, object);
+  while started.elapsed() < Duration::from_nanos(HEARTBEAT_NS.saturating_mul(periods))
+    && !last.0.is_some_and(|tombstone| tombstone.given_up)
+  {
+    let _ = pace.recv_timeout(Duration::from_nanos(HEARTBEAT_NS));
+    last = tombstone_record(daemon, object);
+  }
+  let _ = pace.recv_timeout(Duration::from_nanos(HEARTBEAT_NS.saturating_mul(after)));
+  [last, tombstone_record(daemon, object)]
+}
+
+/// Shape: the periods a test reads a given-up tombstone on after its give-up, to see that nothing more is attempted.
+const AFTER_GIVE_UP_PERIODS: u64 = 10;
+
+/// CLAUDE.md §2 item 8, the tombstone sibling of the bounded volume and green (AUD-29-43): a taken-over tombstone whose
+/// partition has no shard on this node is not attempted without end. Do: on a one-node fleet with a one-second failover
+/// SLO, plant a taken-over tombstone whose id names a partition no shard here serves, and read it each period. Expect,
+/// within a hundred periods, the tombstone given up after its ten attempts, each counted `fleet.tombstone.waits.shard`,
+/// and `fleet.tombstone.given_up` once; ten periods on, nothing more attempted and the tombstone still held, marked.
+/// Before, it was skipped every period with nothing counted, for as long as the daemon ran.
+#[test]
+fn a_taken_over_tombstone_whose_partition_has_no_shard_here_is_given_up_by_name() {
+  let _serial = serialize_fleet_tests();
+  let daemon = lone_fleet_node("tombstone-no-shard");
+  let object = ObjectId(PLANTED_TOMBSTONE_NO_SHARD);
+  plant_taken_over_tombstone(&daemon, object);
+  let [(at_give_up, counted), (after, counted_after)] = tombstone_given_up_within(
+    &daemon,
+    object,
+    GIVE_UP_WITHIN_PERIODS,
+    AFTER_GIVE_UP_PERIODS,
+  );
+  daemon.stop();
+  assert_eq!(
+    at_give_up,
+    Some(slates_server::state::PendingTombstone {
+      sequence: PLANTED_TOMBSTONE_SEQUENCE,
+      attempts: 10,
+      given_up: true,
+    }),
+    "given up after the failover SLO's ten attempts (counted {counted:?})"
+  );
+  assert_eq!(
+    counted.get("fleet.tombstone.waits.shard"),
+    Some(&10),
+    "{counted:?}"
+  );
+  assert_eq!(
+    counted.get("fleet.tombstone.given_up"),
+    Some(&1),
+    "{counted:?}"
+  );
+  assert_eq!(
+    (after, counted_after),
+    (at_give_up, counted),
+    "nothing more attempted after the give-up"
+  );
+}
+
+/// The same rule, a refusal: a taken-over tombstone whose owner shard refuses its record (here a live volume holds the
+/// id) is given up at the bound, and the live volume is left as it was. Do: create a volume on a one-node fleet with a
+/// one-second failover SLO, plant a taken-over tombstone under its id, and read it each period. Expect the tombstone
+/// given up after its ten attempts, each counted `fleet.tombstone.adopt_refused` (or `adopt_unanswered`, for a period
+/// whose call the loaded shard did not answer in time), and the volume still answering its status. Before, the refusal
+/// was retried every period for as long as the daemon ran.
+#[test]
+fn a_taken_over_tombstone_its_shard_refuses_is_given_up_and_the_live_volume_stays() {
+  let _serial = serialize_fleet_tests();
+  let daemon = lone_fleet_node("tombstone-refused");
+  let mut client = Client::connect(daemon.instance());
+  let ReplyBody::Created { id } = client.call(&scratch("tombstone-refused")) else {
+    panic!("create on the lone node")
+  };
+  let object = ObjectId(id.bytes);
+  plant_taken_over_tombstone(&daemon, object);
+  let [(at_give_up, counted), _] =
+    tombstone_given_up_within(&daemon, object, GIVE_UP_WITHIN_PERIODS, 0);
+  let status = client.call(&RequestBody::Status { volume: id });
+  daemon.stop();
+  assert_eq!(
+    at_give_up.map(|tombstone| (tombstone.attempts, tombstone.given_up)),
+    Some((10, true)),
+    "given up after the failover SLO's ten attempts (counted {counted:?})"
+  );
+  let refused = counted
+    .get("fleet.tombstone.adopt_refused")
+    .copied()
+    .unwrap_or(0);
+  let unanswered = counted
+    .get("fleet.tombstone.adopt_unanswered")
+    .copied()
+    .unwrap_or(0);
+  assert!(
+    refused >= 1 && refused + unanswered == 10,
+    "each attempt refused, or unanswered in its period: {counted:?}"
+  );
+  assert_eq!(
+    counted.get("fleet.tombstone.given_up"),
+    Some(&1),
+    "{counted:?}"
+  );
+  assert!(
+    matches!(status, ReplyBody::Status { .. }),
+    "the live volume still answers its status: {status:?}"
+  );
+}
+
 /// What `daemon`'s control shard counted of its taken-over greens (`merge.takeover*`), and whether the planted green is
 /// still pending there: for a failure's message.
 fn green_takeover_record(daemon: &Daemon) -> String {
