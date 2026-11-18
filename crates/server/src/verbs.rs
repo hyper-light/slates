@@ -2556,8 +2556,20 @@ fn serve_here(
   principal: Principal,
   body: RequestBody,
 ) -> Served {
+  // A mount of a volume this node lost to a successor is refused by its kind here, where the loss is known (A-334's
+  // sibling): the client's shard took the volume for this node's own, since this node created it.
+  if let Some(refusal) = crate::remote_attach::lost_attach(state, &body) {
+    return Served::Reply(record_completion(state, origin, id, refused(refusal)));
+  }
   // A volume another host of this region owns goes to it (§4.8 "Lookup"), before any completion is recorded here.
   if let Some((region, volume)) = owned_by_another_host(state, &body) {
+    // An attach of a volume this node lost is remembered with its client before it is sent, so the client's reap
+    // reaches the successor (A-222's rule, which the client's shard applies to another host's volume).
+    if crate::remote_attach::lost_record_attach(state, &body).is_some()
+      && let Err(refusal) = crate::remote_attach::remember_volume(state, client, volume)
+    {
+      return Served::Reply(record_completion(state, origin, id, refused(refusal)));
+    }
     return forward_to_owner(state, client, request, principal, region, volume, body);
   }
   if let Some(owed) = acknowledgement_owed(state, origin, id.client, &body) {
@@ -3034,13 +3046,21 @@ fn send_forward(
       }
       let id = RequestId::from_word(request);
       let mut elsewhere = None;
+      let mut remember_first = None;
       let mut carried = None;
       let reply = crate::state::with_state(|s| {
         s.last_work_ns = s.clock.monotonic_ns();
+        // A mount of a volume this node lost to a successor is refused by its kind here, where the loss is known
+        // (A-334's sibling), its completion keyed as every same-node forward's is.
+        if let Some(refusal) = crate::remote_attach::lost_attach(s, &body) {
+          let anchor = s.origin_anchor.0;
+          return Some(record_completion(s, anchor, id, refused(refusal)));
+        }
         // A volume another host of this region owns goes to it (§4.8 "Lookup"), before any completion is
         // recorded here: from the control shard, which holds the fleet's sessions.
         if let Some((region, volume)) = owned_by_another_host(s, &body) {
           let control = s.shards.first().copied();
+          remember_first = crate::remote_attach::lost_record_attach(s, &body);
           elsewhere = Some((
             region,
             volume,
@@ -3065,6 +3085,27 @@ fn send_forward(
       })
       .unwrap_or_else(|| Some(refused(Refusal::NotFound)));
       if let Some((region, volume, control, request_bytes)) = elsewhere {
+        // An attach of a volume this node lost is remembered with its client, on the client's shard where its slot is,
+        // before it is sent, so the client's reap reaches the successor (A-222's rule; A-334's sibling).
+        if let Some(lost) = remember_first
+          && let Some(refusal) =
+            remembered_or_refusal(owner, origin, (client_index, client_id), lost).await
+        {
+          // `Overloaded` says the attach was not started, so a resend under its id runs it: never its completion.
+          let reply = if matches!(refusal, Refusal::Overloaded { .. }) {
+            refused(refusal)
+          } else {
+            crate::state::with_state(|s| {
+              let anchor = s.origin_anchor.0;
+              record_completion(s, anchor, id, refused(refusal))
+            })
+            .unwrap_or_else(|| refused(Refusal::NotFound))
+          };
+          crate::xshard::send_reply_home(origin, move || {
+            crate::state::deliver(client_index, request, reply, true);
+          });
+          return;
+        }
         forward_for_local_client(
           origin,
           control,
@@ -3093,6 +3134,31 @@ fn send_forward(
     None,
   );
   crate::xshard::send_owing(owner, task)
+}
+
+/// Remembers, on the client's shard `origin`, that the client at `client` (its slot index and id) attaches `volume`, a
+/// volume this node lost to a successor, at the successor (`remote_attach::remember_volume_at`), asked from the volume's
+/// shard `owner` before the attach is sent there: `None` once remembered, else the refusal to answer the attach with
+/// (`RemoteAttachmentsFull` past the client's bound; `Overloaded`, not started, when the client's shard did not answer
+/// within a liveness budget, so the attach is never sent unremembered).
+async fn remembered_or_refusal(
+  owner: u16,
+  origin: u16,
+  client: (u32, u32),
+  volume: VolumeId,
+) -> Option<Refusal> {
+  match crate::xshard::call_within(
+    owner,
+    origin,
+    move |s| crate::remote_attach::remember_volume_at(s, client, volume),
+    crate::daemon::LIVENESS_BUDGET_NS,
+  )
+  .await
+  {
+    Some(Ok(())) => None,
+    Some(Err(refusal)) => Some(refusal),
+    None => Some(Refusal::Overloaded { shard: origin }),
+  }
 }
 
 /// Sends a local client's verb, run on its volume's owner shard here, to the volume's owner host over the fleet,

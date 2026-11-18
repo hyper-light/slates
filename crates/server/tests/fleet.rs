@@ -13127,6 +13127,12 @@ fn attachments_on(client: &mut Client, volume: VolumeId) -> Option<u32> {
   }
 }
 
+/// Shape: the fleet's periods [`a_holder_of_a_volume_its_node_yielded_is_reaped_at_the_successor`] gives a dead holder's
+/// node to end its attachment at the successor: the reaper's silence of two liveness budgets (twenty periods), then a
+/// location round and one forward (a few periods), ten times over for a loaded machine. Its red run waited out the whole
+/// period budget instead (414 s) with the attachment still held.
+const YIELDED_REAP_PERIODS: u64 = 300;
+
 /// A re-invoked holder process, killed and reaped when dropped, so a failed assertion leaves nothing behind.
 struct HolderProcess(std::process::Child);
 
@@ -13185,7 +13191,7 @@ fn a_holder_of_a_volume_its_node_yielded_is_reaped_at_the_successor() {
     Ok(attachments_on(&mut status, id).is_some_and(|count| count >= 1))
   });
   drop(holder);
-  let reaped = poll_until(&observed, REJOIN_DEADLINE, || {
+  let reaped = poll_for_periods(&observed, REJOIN_DEADLINE, YIELDED_REAP_PERIODS, || {
     Ok(attachments_on(&mut status, id) == Some(0))
   });
   let left = attachments_on(&mut status, id);
