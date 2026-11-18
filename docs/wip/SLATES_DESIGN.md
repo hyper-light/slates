@@ -28315,7 +28315,9 @@ Applied in the same change to:
   a live-shipped volume a flush still waits for the candidates, and a write does not (A-200).
 - **Siblings.**
   - NFS publishes (A-358).
-  - FUSE and Shards streams log (A-63; Unix).
-  - virtio-fs does neither. It is safe only while a VM dies with its device's daemon, and the work that lets a VM outlive
-    it must bring this rule (GAPS).
+  - FUSE mounts log (A-63).
+  - Shards streams on Linux and macOS log before the reply (A-316, A-339). A VM outlives its daemon there, and the
+    acknowledged write is read back after a kill.
+  - Windows streams and the vhost-user device do neither, and are safe only while their guest dies with the daemon. The
+    work that lets one outlive it must bring the write log or this rule. GAPS has the route table.
 - **Cost.** A publication per paging write, owed a measurement through a drive.

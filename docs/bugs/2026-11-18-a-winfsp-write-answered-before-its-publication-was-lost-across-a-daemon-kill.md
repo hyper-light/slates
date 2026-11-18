@@ -64,16 +64,19 @@ upgrade and memory pressure.
 
 ## Siblings
 
-How each transport keeps a write its daemon answered once that daemon dies:
+How each transport keeps a write its daemon answered once that daemon dies (the table is in GAPS):
 - **NFS:** published before its reply (A-358).
-- **FUSE:** logged in anchor-owned memory before its reply, and replayed by the successor (A-63).
-- **Shards streams on Unix:** logged the same way (since `1fa154230`).
+- **FUSE mounts (Linux):** logged in anchor-owned memory before the reply, and replayed by the successor (A-63).
+- **Shards streams (Linux, macOS):** logged before the reply (`shards::log_write`; A-316, A-339).
+  - A VM outlives its daemon on this route: resync, anchor-held DAX objects (A-365), and the guest's unsynced stores
+    written back before the next daemon serves.
+  - `a_stream_is_resynced_after_its_daemons_death_and_its_unanswered_create_is_answered_once` reads an acknowledged write
+    back after a kill.
 - **WinFsp:** published before its reply (this change).
-- **virtio-fs (the vhost-user device): neither**, and owed with the work that would expose it.
-  - Its writes are answered with no publication: `slates_bridge_fuse::bridge::needs_barrier`, which the device uses,
-    names no WRITE. They are not logged either.
-  - That is safe today only because the guest does not outlive the device's daemon. crosvm takes the back end's hangup
-    for a crashed device and the VM ends (GAPS, Phase 8 step 4: "a VM that outlives its device's daemon" is owed).
-    `slates vhost-user` hands the VMM the socket as a descriptor, so a front end cannot reconnect to a successor.
-  - The change that lets a VM outlive its device's daemon must bring A-358's rule, or the write log, with it. The GAPS
-    entry says so.
+- **Shards streams (Windows) and the vhost-user device: neither.**
+  - A Windows stream ends with its daemon. crosvm takes a vhost-user back end's hangup for a crashed device, and the VM
+    ends.
+  - `slates_bridge_fuse::bridge::needs_barrier`, which both use, names no WRITE.
+  - They are safe only while their guest dies with the daemon. The work that lets one outlive it ("Windows streams have
+    no write log", g268; "a VM that outlives its device's daemon", Phase 8 step 4) must bring the write log or A-358's
+    rule.
