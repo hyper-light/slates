@@ -148,7 +148,7 @@
 > (`docs/bugs/2026-11-08-a-snapshot-decoded-the-log-it-released.md`).
 
 > **A checkpoint costs the whole shard in one verb's poll (found and measured 2026-11-08, OPEN; held for raft's recovery-format
-> work, §4.3 "Bounded work everywhere", §4.8).** A mutating verb's barrier is usually a delta, whose cost is its changes. Once
+> work until it landed 2026-11-17, §4.3 "Bounded work everywhere", §4.8).** A mutating verb's barrier is usually a delta, whose cost is its changes. Once
 > the deltas since the last checkpoint reach its size, or the log has no room, that verb's publish is a checkpoint of every
 > volume (`publish_checkpoint`, `encode_image_into`): the whole head, never a delta, inside the one poll.
 > - Measured (`a_barriers_cost_against_the_shards_size`, an ignored measurement in `crates/server/src/verbs.rs`; one volume on
@@ -163,10 +163,10 @@
 >   Linear in files, 96-137 ns a file in release and 1,336-1,909 in debug. The file's bytes add 10-20 % (64 B against 16 KiB).
 >   So about 110 ms per million files per shard in release, in one poll,
 >   amortized over about 0.6 small writes per file.
-> - **Why it waits:** a sliced or incremental checkpoint needs a consistent cut while the shard keeps mutating, in the recovery
->   format raft-5's incremental held image was changing (it is built: A-270, image version 26, delta version 9), and two
->   format changes at once would collide. Owed when that lands:
->   a failing test first (a shard of N files, one small write, the poll's longest step bounded and independent of N), then a
+> - **Why it waited:** a sliced or incremental checkpoint needs a consistent cut while the shard keeps mutating, in the recovery
+>   format raft-5's incremental held image was changing, and two format changes at once would collide. That format is on
+>   main since 2026-11-17 (A-270, image version 26, delta version 9: the raft-7 merge 92e1a73a), so nothing holds this now.
+>   Owed: a failing test first (a shard of N files, one small write, the poll's longest step bounded and independent of N), then a
 >   slice or the design's delta path. Tell raft and perf before building in `crates/vfs/src/checkpoint_log.rs`.
 
 > **A clone's name is held at its name's partition (2026-11-06, A-236, bug-sweep; the supervisor's option 3).** A clone
@@ -6104,9 +6104,9 @@ line of its authority, or of the owner an install moved that authority from (sha
 objects learned, no extra write). The model measured and rejected three others: routing plus a chain path (204 lost),
 "the chain or the asker" (the asker's own objects learned), and the cohort-kept directory (one more commit per create).
 The held image carries `Acceptor::moved_from` as the acceptor's one encoding (`PersistedAcceptor`), at image version
-25 and delta version 8 (after conformance-14's A-262; raft-7 takes the numbers after), so a warm restart keeps an
-earlier move; an older image or delta is refused by its version, never read as "moved from none". (d), the process
-test, is built.
+25 and delta version 8 (after conformance-14's A-262; since A-270 landed, 2026-11-17, as a held register's piece at
+image version 26 and delta version 9), so a warm restart keeps an earlier move; an older image or delta is refused by
+its version, never read as "moved from none". (d), the process test, is built.
 
 **Open — one session per peer is lent exclusively.** A discovery page, a coordinator dispatch, a forward and
 a campaign each take the whole session out of its link, though the transport runs several exchanges on one
