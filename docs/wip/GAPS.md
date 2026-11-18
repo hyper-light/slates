@@ -25,8 +25,10 @@
 > `Error` whose class is what a consumer does, mapped from every wire refusal in one exhaustive table; `CONTRACT` = 2
 > (2 adds `Denied::Policy`, where A-285's `Refusal::PolicyForbids` maps outside a landing or a merge).
 > **Owed, in order:**
-> - the starter handed the launcher's authority on every platform (Linux: the anchor passes the segment's descriptor
->   back to its starter);
+> - the launcher's own authority, outliving its restarts (agreed with A-285's owner, 2026-11-18): a launcher secret the
+>   starter provides at every start, published by the anchor (built: the segment's field and its reader,
+>   `AnchorSegment::launcher_secret`), delivered on the anchor's standard input with `Issuer::from_launcher_secret`
+>   (owed, next), and verified by the daemon beside the issuer secret (owed, A-285's owner);
 > - the daemon's side (A-285's owner): a volume's land mode is built (203ad8fa) and reaches the contract
 >   (`set_write_policy`, `write_policy`, `Refused` outcomes; piece 5, `CONTRACT` = 3), and merges under a mode with
 >   their approvals and the present-only verb reach it too (`approve_merge`, `plan_landing` on `Present`; `CONTRACT`

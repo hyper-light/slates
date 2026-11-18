@@ -21456,6 +21456,16 @@ contract", new, with its status), GAPS (the A-299 entry and the Embedding librar
   `merge_approval_proof`; a changed increment merges nothing and is asked again); `merge` takes evidence;
   `plan_landing` presents through the daemon's `Present`, whatever the mode, and its bypass refusal and
   `Unsupported::WritePolicies` are gone.
+- **The launcher secret, piece 1 (the segment's field), the same day.** The launcher's authority must outlive the
+  launcher's own restart: handing kiln the anchor segment's descriptor (Linux keeps the segment as a memfd) would die
+  with kiln's process, after which no approval or policy could be proven without restarting the instance and losing its
+  volumes. So the launcher provides a secret of its own at every start and keeps it; the anchor publishes it into the
+  supervision block (`SUP_LAUNCHER_PRESENT` 320, `SUP_LAUNCHER_SECRET` 328, 32 bytes, beside the issuer and session
+  secrets; zero in an older anchor's segment, read as none), and the daemon verifies launcher-class proofs under it as
+  under the issuer secret (A-285's owner, agreed 2026-11-18). The issuer secret stays minted per boot: the client
+  regions' names and the boot incarnation derive from it (A-176). Built here: `AnchorSegment::publish_launcher_secret`
+  and `launcher_secret` (`crates/anchor`), with `a_published_launcher_secret_is_read_by_a_later_attachment`. Next: the
+  starter's delivery on the anchor's standard input and `Issuer::from_launcher_secret`.
 - **Checked.** `cargo test -p slates-api` (37 unit, 9 by use, 5 start, 1 doc) and `cargo test -p slates-cli` on
   macOS arm64 (kiln runner, 2026-11-18): the cases in §4.12's status. The Linux and Windows arms of the mount and the
   CLI's Windows unmount are not compiled on this host; the integrator's lanes are their first compiler.
