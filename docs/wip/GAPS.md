@@ -15690,6 +15690,67 @@ Mac, binaries built on `d61c3be2`):
   a panic injected into one honest client, the test failed in 12.85 s, where main's ran on past a 120 s bound
   (adacachy).
 
+### 2026-11-09: a healthy live `fsync` was refused at a wall-clock deadline under load — fixed, a starved owner too (A-292; on main 2026-11-17)
+
+`a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it` answered the `fsync` made with every candidate
+running `EIO`: 1 in 6 runs on main, 2 in 9 on raft-7 (raft's report, load 36–145 on adacachy). Made to fail on demand on
+adacachy2 by pinning the test and 32 spinners to four CPUs with the test's daemons reniced to 15: the healthy `fsync`
+failed in every run that reached it (3 of 10; the rest failed earlier in the fleet's start). The give-up's record
+(`fuse::settle_held`, `live_ship::durability_report`) showed what it lacked: the candidate held the bytes (`durable 1`,
+its target), and the volume's head was not yet placed when the wall clock reached the liveness budget.
+
+Fixed (`docs/bugs/2026-11-09-a-healthy-live-fsync-was-refused-at-a-wall-clock-deadline.md`; found and built by bug-sweep
+on `agents/bug-sweep-2`, landed by g244-healthy-fsync-live): a held reply gives up only after a whole window of the
+liveness budget in which nothing moved its volume's durability forward (`live_ship::LiveVolume::heard`), and at most the
+failover SLO from its hold whatever it hears (10 s by default; the supervisor's landing condition of 2026-11-11, banned
+item 8; counted as that many windows until the starved-owner fix below put it on the clock). The rule is one pure module,
+`slates_bridge_core::durable_bound`, and every Unix transport judges a held durable reply by it: the FUSE `fsync`,
+`live_ship::wait_durable` (an NFS stable write or `COMMIT`, a Shards `FSYNC`), and the virtio-fs device's `FSYNC`, which
+had kept its own single deadline (`BridgeAccess::durable_bound`, `durable_heard`). Evidence:
+- `acknowledgements_that_trickle_without_the_target_end_the_wait_at_its_bound` (`crates/bridge-core/src/durable_bound.rs`):
+  a wait that keeps hearing other writes' progress while its own position is never acknowledged ends `AtTheBound` after
+  ten windows; red with the bound removed, a thousand windows and no end.
+- `a_guests_fsync_of_a_live_volume_waits_while_its_volume_keeps_progressing` (`crates/bridge-virtiofs/tests/serve.rs`):
+  a guest's `FSYNC` whose volume hears progress every half window is answered `0` after a window and a half.
+- `a_fuse_fsync_on_a_live_volume_waits_out_candidates_that_answer_slowly` (`crates/cli/tests/live_fleet.rs`, gated on
+  `SLATES_TEST_CLI=1`): red 3 of 3 and green 6 of 6 on adacachy2 (2026-11-09); the stopped-candidates flow still refuses
+  after one window (1.0004–1.0017 s, 3 of 3, before the starved-owner fix below added its confirming looks). Owed: the
+  supervisor's run of both live FUSE flows under load on main.
+
+WinFsp's held flush judges by the same rule since 2026-11-17 (`winfsp::settle_held`; it had answered
+`STATUS_UNEXPECTED_IO_ERROR` at one liveness budget from its hold, however its candidates were answering). jupiter takes
+no work, so it is unit-tested only through the shared rule; owed: a Windows run of `crates/cli/tests/live_winfsp.rs`
+(the supervisor), which still holds the suspended-candidates flush to its error.
+
+**An owner starved past a window's end: fixed 2026-11-17.** The first look after a window's end judged it, possibly
+before the owner had folded the acknowledgements waiting on its control shard's sockets, so a window it could not
+observe read as silent (raft's failing run showed the owner itself late: the stopped-candidates `fsync` gave up after
+1.60 s against a 1.00 s bound). A silent window is now given up only once the control shard has waited in its driver
+twice since the silence was seen (read off its registry pulse, `live_ship::heard_now`), at a look after the one that saw
+it, the looks a heartbeat apart; and the total bound is the failover SLO on the clock from the hold, so a receiver that
+never waits cannot hold a wait past it. Red first by use of the rule
+(`acknowledgements_read_after_a_late_window_end_start_the_next_window`,
+`a_receiver_that_never_drains_holds_the_verdict_only_to_the_total_bound`) and of the device
+(`a_guests_fsync_is_not_refused_while_its_receiver_has_not_read_what_came`). Stopped candidates are given up 1.2 to 1.3 s
+after the hold by construction, where it was 1.0 s; owed: the supervisor's run of the live FUSE flows, which assert the
+`EIO`, not its time. A control shard that never waits (busy for the whole wait) holds a stopped-candidates verdict to
+the failover SLO.
+
+Open:
+- The lanes to each holder are cut at a hard liveness budget (`fleet::live_budget`), and a cut holder waits for the record
+  period or its session's return. Under load such a cut can outlast a window, which the wait's judgment cannot tell from
+  silence.
+- Hypothesis, not yet seen in a give-up record: a window can be silent through the owner's own delay in asking. A fresh
+  volume's log is shipped to a holder only once the coordinator has placed its catalog there (`pending_sends`'
+  `catalogued` gate), and its head waits for the coordinator's period behind that period's other commits, each awaited
+  in turn (`ship_shard_heads`); a coordinator kept past a window that way leaves a window with nothing asked, so nothing
+  heard, through no holder's fault. The receiver's two waits (A-292) prove the owner has read what came, not that it
+  asked. A give-up record from a run under load that shows the head or catalog unplaced with no lane in flight would
+  confirm it.
+- The virtio-fs serve loop times only the oldest held `FSYNC`'s next look (`serve_round`, `durable_oldest`); under
+  windows a younger reply's look can come first, so its verdict waits for the oldest's look, at most a window late. Never
+  a refusal, only a late one; the FUSE mount and WinFsp take the soonest look over every held reply.
+
 ### 2026-11-09: a taken-over green's version 3 was never placed once under whole-suite load (cause found; fixed for a successor one version behind, 2026-11-18; the record half open)
 
 `a_share_of_a_green_made_after_its_last_version_survives_a_takeover` (`crates/server/tests/fleet.rs`, 73797a42,
