@@ -1,0 +1,142 @@
+name: DIAG g258 -- main against main when cut (c) landed (29ef4521) and a control, what the receiver gained or lost since (not for main)
+
+# Audit plan step 7, continued (goal g258, 2026-11-18): diag-g258-3's first arm64 run put main's quiet stat p50 51 µs over
+# the DLL arm's, where the last comparison before cut (c) (diag-winfsp-overlap-41) put the receiver's 17.7 µs over. This
+# measures main (MAIN_HEAD: origin/main 69cd38b2 with the bench's create_security) against main as cut (c) landed
+# (OLD_HEAD: 29ef4521, B11) and a control (main's binary copied), interleaved on one VM of each runner, quiet and loaded
+# (two spinners a logical CPU), ten runs, the list rotating each run, with windows-ab.sh's stall detector. Read within
+# each run: old minus main against control minus main.
+# Derived: the ab job's bound is diag-winfsp-overlap-51's for ten runs of three arms (355 minutes), under the hosted
+# runner's 360.
+
+on:
+  push:
+    branches: ['diag-g258-[0-9]*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  MAIN_HEAD: f2a1eb258ef0e72877b458e73f2e64913f74d7dd
+  OLD_HEAD: 29ef4521d9711fd380b7fde45f63e83bac3166c7
+  WINFSP_MSI_URL: https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi
+  WINFSP_MSI_SHA256: 073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a
+
+jobs:
+  ab:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: regress-arm
+            runner: windows-11-arm
+            msvc: arm64
+          - lane: regress-x86
+            runner: windows-latest
+            msvc: x64
+    name: ${{ matrix.lane }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 355
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: The results publisher
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/publish.sh" <<'PUBLISH'
+          #!/bin/bash
+          # One commit per call on the results branch; a failed publish is reported and does not end the job.
+          export GIT_AUTHOR_NAME=diag GIT_AUTHOR_EMAIL=diag@users.noreply.github.com
+          export GIT_COMMITTER_NAME=diag GIT_COMMITTER_EMAIL=diag@users.noreply.github.com
+          cd "$GITHUB_WORKSPACE" || exit 0
+          touch ab.txt live.txt clippy.txt
+          ab=$(git hash-object -w ab.txt) || exit 0
+          live=$(git hash-object -w live.txt) || exit 0
+          lint=$(git hash-object -w clippy.txt) || exit 0
+          tree=$(printf '100644 blob %s\tab.txt\n100644 blob %s\tclippy.txt\n100644 blob %s\tlive.txt\n' "$ab" "$lint" "$live" | git mktree) || exit 0
+          parent=$(cat "$RUNNER_TEMP/results-parent" 2>/dev/null || true)
+          commit=$(git commit-tree "$tree" ${parent:+-p "$parent"} -m "results of run $GITHUB_RUN_ID") || exit 0
+          if git push origin "$commit:refs/heads/$RESULTS_BRANCH"; then
+            echo "$commit" > "$RUNNER_TEMP/results-parent"
+          else
+            echo "::warning::could not publish the results"
+          fi
+          PUBLISH
+          chmod +x "$RUNNER_TEMP/publish.sh"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM (x86_64)
+        if: matrix.msvc == 'x64'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl (arm64)
+        if: matrix.msvc == 'arm64'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Install WinFsp, pinned
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP 'winfsp.msi'
+          Invoke-WebRequest -Uri $env:WINFSP_MSI_URL -OutFile $msi
+          $found = (Get-FileHash $msi -Algorithm SHA256).Hash
+          if ($found -ne $env:WINFSP_MSI_SHA256) { throw "WinFsp's installer hashes $found, not $env:WINFSP_MSI_SHA256" }
+          $install = Start-Process msiexec -ArgumentList '/i', "`"$msi`"", '/qn', '/norestart' -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "WinFsp's installer answered $($install.ExitCode)" }
+          "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "image $env:ImageOS $env:ImageVersion; $env:NUMBER_OF_PROCESSORS CPUs; $env:PROCESSOR_ARCHITECTURE $env:PROCESSOR_IDENTIFIER; WinFsp 2.1.25156" | Out-File -FilePath image.txt -Encoding utf8
+      - name: Build every arm
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p slates-cli --example mount_bench
+          mkdir -p ab-bin/main ab-bin/control ab-bin/old
+          cp target/release/examples/mount_bench.exe ab-bin/mount_bench.exe
+          for arm in main:MAIN_HEAD old:OLD_HEAD; do
+            name=${arm%%:*} ref=${arm#*:}
+            commit=${!ref}
+            git fetch --depth=1 origin "$commit"
+            git worktree add --detach "$RUNNER_TEMP/$name" "$commit"
+            (cd "$RUNNER_TEMP/$name" && env CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target-$name" \
+              cargo build --release --locked -p slates-cli --bin slates)
+            cp "target-$name/release/slates.exe" "ab-bin/$name/slates.exe"
+          done
+          # The control: main's own binary, copied, so the arms main and control are identical code.
+          cp ab-bin/main/slates.exe ab-bin/control/slates.exe
+          sha256sum ab-bin/*/slates.exe ab-bin/mount_bench.exe | tee arms.txt
+      - name: The interleaved mount benchmark
+        shell: bash
+        env:
+          RESULTS_BRANCH: diag-results/g258-${{ github.run_id }}-${{ matrix.lane }}
+        run: |
+          {
+            echo "# lane ${{ matrix.lane }}: arms main control old; MAIN_HEAD $MAIN_HEAD; OLD_HEAD $OLD_HEAD; bench at $(git rev-parse HEAD); $(date -u +%FT%TZ)"
+            cat arms.txt
+            tr -d '\r\000' < image.txt | sed 's/^\xef\xbb\xbf//'
+            cmd //c ver | tr -d '\r' | grep -v '^$'
+            ARMS="main=ab-bin/main/slates.exe control=ab-bin/control/slates.exe old=ab-bin/old/slates.exe" \
+              BENCH=ab-bin/mount_bench.exe RUNS=10 SPINNERS_PER_CPU=2 AFTER_RUN="$RUNNER_TEMP/publish.sh" \
+              bash docs/wip/bench/fsbench/windows-ab.sh
+          } 2>&1 | tee ab.txt
+      - name: Publish whatever was measured
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$RUNNER_TEMP/publish.sh" ]; then bash "$RUNNER_TEMP/publish.sh"; fi
+        env:
+          RESULTS_BRANCH: diag-results/g258-${{ github.run_id }}-${{ matrix.lane }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ab-${{ matrix.lane }}
+          path: |
+            ab.txt
+            stall-dumps/
