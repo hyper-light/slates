@@ -1,5 +1,14 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Partly closed (g262, 2026-11-18): the protocol's wire enums are held to their published tags by a test.**
+> `crates/ipc/tests/wire_order.rs` reads each wire enum's schema, which names its variants in tag order, and compares
+> it with `tests/wire_order.txt`: 43 enums, 410 tags. A second test fails when the protocol's source derives `Wire`
+> for an enum it does not hold. An append is published in its change by the `--ignored` writer
+> (`publish_appended_variants`), which refuses while any published tag moved. `SubmitApproved` stays at 71: moving it
+> back would be a second move, and builds since 04d7ea465 speak 71. Still owed, from the entry below:
+> - the records' enums held the same way: `crates/db`'s 17 wire enums, with the same test over their schemas;
+> - the completion record framed with its reply's schema hash (the log's owner).
+
 > **Open (g267, 2026-11-18): the wire's append-only rule (D-15) is kept by review alone, and a persisted reply is read
 > outside every schema check.** A variant's wire tag is its index in its enum (`crates/wire-derive/src/lib.rs`,
 > `expand_enum`). 04d7ea465 (A-285) inserted `RequestBody::SubmitHeld` and `EditSubmitHeld` before `SubmitApproved`, so
@@ -69,6 +78,24 @@
 > - a real FIDO key's signature end to end (the touch flag is proven with a software stand-in);
 > - the integrator's runs on Linux and Windows (the suite is platform-free but for the agent's own channel, Unix).
 
+> **A superseded owner stranded its clients: it steps down (2026-11-18, A-338, §4.8, R8; g230, the chaos nemesis's
+> "fence-2 copy behind the fence-1 owner's durable head").** After a takeover the old owner kept its volume fenced and
+> answered every verb `StaleEpoch` for good, since a node forwarded only a volume it had not created; and a third node
+> took the creator for the owner, which redirected it back. So a stream whose front node was the old owner never
+> reached the successor, which shipped nothing, and the only line shipping the volume was the old owner's fenced one.
+> Now a superseded volume is routed to its current owner, and a holder asks its own routing before the creator. Test:
+> `a_superseded_owners_clients_reach_its_successor` (`crates/server/tests/fleet.rs`).
+> - **Owed (g230, next):** a mount on the old owner (NFS, FUSE) still answers `StaleEpoch` for the volume it lost.
+> - **Owed:** a node that lost its own volume and holds no routing entry for it takes itself as the creator route, its
+>   forward then served by its own fenced copy; and a node that holds no copy of an object takes a live creator for its
+>   owner however the council retired it. Neither is reached in a three-node fleet at `f = 1`, where every node holds
+>   every object and the old owner's routing names the successor.
+> - **Owed:** a successor ships a live volume only from its first publication (A-325's live item): a takeover that no
+>   write reaches leaves the superseded owner's fenced line the only one shipping.
+> - **Owed (the supervisor's):** the nemesis seeds on the fix (6876545201569229162 Linux x86_64, 10695597685579409771
+>   arm64, 12136749566337968553 macOS).
+
+
 > **A successor's live log began again at position 0: it goes on from the head its takeover adopted (2026-11-18, A-329,
 > Continuity, T-8.6; g230).** `live_ship::published` made every shipper with no start, so a successor's first entry was
 > position 0 at genesis under its higher epoch: holders took it by rank and NoLoss held, but the chaos flows' Continuity
@@ -78,11 +105,9 @@
 > `a_successors_live_log_goes_on_past_every_position_durable_before_it` (`crates/server/tests/fleet.rs`).
 > - **Owed (the supervisor's):** the five chaos flows' Continuity on the fix (they failed alike on both Linux arches,
 >   diag 44269183565).
-> - **Open, not numbering (read from that run's log, seed 6876545201569229162, and the macOS one's):** the nemesis's
->   "a fence-2 copy behind the fence-1 owner's durable head". Both holders' fences stand at 2, raised by a takeover's
->   phase one that never completed, while the owner b, still the owner at fence 1, ships epoch-1 entries neither takes
->   (its head 6,810, durable 6,808, c at 6,808 and a at 6,588): a fence an abandoned takeover raised strands its owner.
->   No successor shipped, so no position was renumbered; A-329 does not touch it.
+> - **Not numbering, and since fixed (A-338, above):** the nemesis's "a fence-2 copy behind the fence-1 owner's durable
+>   head" (seed 6876545201569229162, and the macOS one's). The takeover completed and the old owner was fenced, but its
+>   clients were stranded and the successor had not shipped, so the old owner's fenced line was the only one shipping.
 > - **Owed:** the adopted head lives in the successor shard's memory until the volume's first publication, as the
 >   volume's own image does for a live-shipped takeover (A-325's owed item): a successor restarted before then loses
 >   both.
@@ -402,7 +427,8 @@
 >   statement a signer signs and the trusted signers a launcher registers — signed merges built (A-321, `CONTRACT` =
 >   13), a signed landing owed;
 > - (built, `CONTRACT` = 15: the volume core's refusals typed, `Refusal::Volume`, no catch-all left in
->   `refusal_of_vfs`;) typed fields on the wire for a landing target's refusal (`TargetUnavailable` carries words), a merge's versions
+>   `refusal_of_vfs`; `CONTRACT` = 16: an unmount's unasked volumes answered and a host refusal rendered in words,
+>   the integrator's two Windows failures;) typed fields on the wire for a landing target's refusal (`TargetUnavailable` carries words), a merge's versions
 >   (the work's base beside the head), and the words the crate still reads from the daemon's closed tables (a landing's
 >   state, a summary's actions, the audit's kinds, a grant's state); an overlay's drift is built (`StatusReport::base`,
 >   `CONTRACT` = 8), and a presentation's conflicts are read typed from its entries;
@@ -3139,7 +3165,14 @@
 > answered `0` in under 1 ms) and a WinFsp flush (error after 1.001–1.028 s, where it succeeded in 995 µs; a volume
 > flush now publishes at all) wait too (§4.10 status "Every other durability claim"). Open (live-durability): one x86_64
 > virtio-fs run of 19 answered a stopped `FSYNC` `0` after 1.000358 s, unexplained; that run printed no log line, and
-> the 16 runs since, which print the owner's log and the hold's counters at that point, never repeated it. Open
+> the 16 runs since, which print the owner's log and the hold's counters at that point, never repeated it. Fixed (g227, 2026-11-18): the position every transport's claim waits for (`live_ship::durable_target`) ignored a
+record the volume owed while the fleet did not yet know it (its head unplaced). A publication that could not become an
+entry (the credit full with the candidates stopped) owes a whole record at the head's next position, but the unplaced
+case returned the head as it stood: with nothing shipped yet the reply waited for nothing, and with a head it waited one
+position short, so once the head was placed the claim was answered while the write it named was only in the record
+still owed. The decision is now one pure function (`owed_position`), the owed record counted placed or not; its unit
+test (`a_reply_whose_publication_owes_a_whole_record_waits_for_that_record_placed_or_not`) was red first. Whether this
+was the stopped `FSYNC` answered `0` above is not shown: that run printed no log line. Open
 > (live-fixes): a Windows fleet did not re-form after an anchor succeeded a suspended candidate under a fresh identity.
 > Measured in the daemon (release, BENCHMARKS "What live shipping adds to a stable NFS write"): a live 4 KiB `FILE_SYNC`
 > write costs 90–114 µs more than a plain one at the median, p99 217–398 µs, p999 0.44–1.27 ms, worst 0.47–1.87 ms at

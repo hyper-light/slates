@@ -15,19 +15,24 @@
   clippy::disallowed_methods
 )]
 
+#[cfg(unix)]
 use std::path::Path;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use slates_api::{
-  AttachTransport, AuditKind, BaseState, ConflictClass, Denied, Drift, DriftKind, Error, Exhausted,
-  Existing, Filter, GrantState, Instance, Intent, Invalid, IssuerFault, KindMismatch, LandOutcome,
-  LandingApproval, LandingConflict, LandingStage, LandingState, MergeApproval, MergeOutcome,
-  MergeRecord, Missing, MountOptions, PathFault, PolicyReason, PolicyRefusal, PolicySubject,
-  Provisioned, RebaseOutcome, SimVolumes, SnapshotId, Source, TrustedSigner, Unsupported, Unusable,
-  Verification, VolumeId, VolumeSpec, Volumes, Work, WorkSignature, WriteAct, WriteMode,
-  WritePolicy,
+  AttachTransport, Denied, Error, Exhausted, Existing, Instance, Intent, Invalid, IssuerFault,
+  KindMismatch, MergeApproval, MergeOutcome, MergeRecord, Missing, MountOptions, PathFault,
+  PolicyReason, PolicyRefusal, PolicySubject, Provisioned, RebaseOutcome, SimVolumes, SnapshotId,
+  Source, TrustedSigner, Unusable, Verification, VolumeId, VolumeSpec, Volumes, Work,
+  WorkSignature, WriteAct, WriteMode, WritePolicy,
+};
+// What only the Unix-gated tests (the overlay and landing tests) name.
+#[cfg(unix)]
+use slates_api::{
+  AuditKind, BaseState, ConflictClass, Drift, DriftKind, Filter, GrantState, LandOutcome,
+  LandingApproval, LandingConflict, LandingStage, LandingState, Unsupported,
 };
 use slates_machine::{MachineError, MachineProfile, ProfileOptions};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
@@ -109,10 +114,12 @@ fn grouped(tag: &str) -> (Daemon, Instance) {
 
 /// A real directory for an overlay's base and a landing's target (A-50: never `/tmp`, never a RAM directory): in the
 /// build output, named with the process id and a counter, canonical, removed on drop.
+#[cfg(unix)]
 struct Folder {
   path: String,
 }
 
+#[cfg(unix)]
 impl Folder {
   fn new() -> Folder {
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -143,6 +150,7 @@ impl Folder {
   }
 }
 
+#[cfg(unix)]
 impl Drop for Folder {
   fn drop(&mut self) {
     let _removed = std::fs::remove_dir_all(&self.path);
@@ -173,6 +181,7 @@ fn provision(instance: &mut Instance, spec: &VolumeSpec) -> VolumeId {
 }
 
 /// The landing of `volume`'s head into `folder`, `.git` left out as kiln's landings leave it.
+#[cfg(unix)]
 fn landing_into(volume: VolumeId, folder: &Folder) -> slates_api::LandingRequest {
   slates_api::LandingRequest {
     volume,
@@ -192,6 +201,7 @@ fn issuer_of(daemon: &Daemon) -> slates_api::Issuer {
 }
 
 /// A signature in `ssh-keygen -Y sign`'s armour, for the refusals that come before any verifier reads it.
+#[cfg(unix)]
 fn a_signature() -> WorkSignature {
   WorkSignature::from_armoured(
     "-----BEGIN SSH SIGNATURE-----\nU1NIU0lH\n-----END SSH SIGNATURE-----",
