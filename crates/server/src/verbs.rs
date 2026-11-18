@@ -10126,7 +10126,12 @@ pub(crate) fn materialize_taken_over(
 ) -> Result<(), Box<ReplyBody>> {
   let (head, catalog, sequence) = (taken.head, taken.catalog, taken.sequence);
   if state.by_id.contains_key(&id) {
-    return Ok(());
+    // A copy this node froze for a move it made (A-291) is superseded by what its takeover adopted: the member it moved
+    // the volume to died, this node is its successor, and that member may have taken writes since. The frozen copy goes
+    // first, so the adopted state is what serves.
+    if !crate::moves::supersede_frozen(state, id) {
+      return Ok(());
+    }
   }
   if let Some(existing) = state.db.partition().volume_by_name(&catalog.name) {
     return Err(Box::new(refused(Refusal::AlreadyExists {

@@ -44,7 +44,9 @@
 //!
 //! If the new owner dies before it adopts, its takeover follows the exception to its successor, which adopts the volume
 //! in that takeover's round from the copies the holders keep under the dead owner's authority, and the old owner then
-//! releases. If the old owner dies after the switch, the new owner's round counts the rest of the cohort. If it dies
+//! releases. When that successor is the old owner itself, its takeover's adoption supersedes the frozen copy
+//! ([`supersede_frozen`]), since the new owner may have taken writes before it died; a move once seen switched is
+//! never thawed. If the old owner dies after the switch, the new owner's round counts the rest of the cohort. If it dies
 //! before, the switch never happens and the volume is recovered by its takeover as any of its volumes is.
 //!
 //! **R8.** At one node there is no other member, so every move is refused `MoveRefusal::Target`.
@@ -83,6 +85,8 @@ const MOVE_THAWED: &str = "fleet.move.thawed";
 const MOVE_UNCAPTURED: &str = "fleet.move.uncaptured";
 /// Counter: volumes this node released to the member a move named.
 const MOVE_RELEASED: &str = "fleet.move.released";
+/// Counter: frozen copies a takeover's adoption of the same volume superseded (the target died; this node its successor).
+const MOVE_SUPERSEDED: &str = "fleet.move.superseded";
 /// Counter: releases the database refused (the volume keeps its record, retried next period).
 const MOVE_RELEASE_REFUSED: &str = "fleet.move.release_refused";
 /// Counter: held copies whose routing a move took to its new owner.
@@ -132,6 +136,10 @@ pub(crate) struct MoveOut {
   pub(crate) begun_ns: u64,
   /// Whether the move has been reported to the council.
   pub(crate) reported: bool,
+  /// Whether this node has seen the switch: the configuration naming another owner of the volume. From then on the
+  /// move is known to have committed, so the copy is let go however the exception later changes (its new owner's
+  /// takeover handing it back to this node, or its new owner's destroy dropping it), and never thawed.
+  pub(crate) switched: bool,
   /// The refusal that ended the move before any report, answered to the next ask and then dropped.
   pub(crate) refused: Option<MoveRefusal>,
 }
@@ -202,6 +210,7 @@ pub(crate) fn move_verb(
       epoch,
       begun_ns,
       reported: false,
+      switched: false,
       refused: None,
     },
   );
@@ -266,6 +275,8 @@ pub(crate) struct Outgoing {
   pub(crate) to: HostId,
   /// Whether it was reported.
   pub(crate) reported: bool,
+  /// Whether this node has seen its switch ([`MoveOut::switched`]).
+  pub(crate) switched: bool,
   /// Whether its head and catalog are placed (and a live log durable at its head), so it may be reported.
   pub(crate) ready: bool,
   /// Whether it has waited past the failover SLO unreported.
@@ -296,6 +307,7 @@ fn outgoing(state: &mut ShardState) -> Vec<Outgoing> {
         object,
         to: out.to,
         reported: out.reported,
+        switched: out.switched,
         ready,
         overdue: !out.reported && now.saturating_sub(out.begun_ns) > bound,
         cohort,
@@ -350,7 +362,8 @@ pub(crate) enum Step {
     /// The member that owns it now.
     owner: HostId,
   },
-  /// The new owner adopted it (or its takeover's successor did): release the copy.
+  /// The new owner adopted it (or its takeover's successor did, this node among them), or destroyed it: release the
+  /// copy.
   Release {
     /// The member that owns it now.
     owner: HostId,
@@ -369,6 +382,12 @@ pub(crate) fn step_for(regional: &RegionalConfiguration, local: HostId, out: &Ou
     } else {
       Step::Release { owner }
     };
+  }
+  if out.switched {
+    // The move committed, and no exception names another owner now: the target's takeover handed the volume back to
+    // this node (its successor, whose adoption serves the state the target left, writes included), or the target
+    // destroyed it. Either way the frozen copy is stale: let it go, never thaw it.
+    return Step::Release { owner: local };
   }
   if !regional.members.contains(&out.to) {
     return Step::Thaw;
@@ -464,6 +483,9 @@ pub(crate) async fn drive_outgoing(
         .await;
       }
       Step::Switched { owner } => {
+        if !out.switched {
+          crate::xshard::run_on_counted(origin, shard, move |s| note_switched(s, object));
+        }
         let _ = state::with_state_counted(|s| {
           if s.fleet.object_owner(object) != Some(owner) {
             crate::takeover::track_owner_on_every_shard(s, object, owner);
@@ -472,12 +494,22 @@ pub(crate) async fn drive_outgoing(
         });
       }
       Step::Release { owner } => {
-        crate::xshard::run_on_counted(origin, shard, move |s| release(s, object, owner));
-        owner_acceptor.forget_object(object);
-        owner_acceptor.forget_object(object.catalog());
+        // Handed back to this node by the target's takeover: the adoption's materialization lets the frozen copy go
+        // as it serves the adopted state (`supersede_frozen`), and nothing here may touch the placement it recorded.
+        let adopted_back = owner == local
+          && state::with_state_counted(|s| {
+            s.pending_materializations.contains_key(&object)
+              || s.pending_catalogs.contains_key(&object)
+          })
+          .unwrap_or(true);
+        if !adopted_back {
+          crate::xshard::run_on_counted(origin, shard, move |s| release(s, object, owner));
+          owner_acceptor.forget_object(object);
+          owner_acceptor.forget_object(object.catalog());
+        }
         let _ = state::with_state_counted(|s| {
           s.move_records.remove(&object);
-          if s.fleet.object_owner(object) != Some(owner) {
+          if owner != local && s.fleet.object_owner(object) != Some(owner) {
             crate::takeover::track_owner_on_every_shard(s, object, owner);
             crate::takeover::track_owner_on_every_shard(s, object.catalog(), owner);
           }
@@ -491,6 +523,13 @@ pub(crate) async fn drive_outgoing(
 fn note_reported(state: &mut ShardState, object: ObjectId) {
   if let Some(out) = state.moves_out.get_mut(&DbVolumeId { bytes: object.0 }) {
     out.reported = true;
+  }
+}
+
+/// Marks the move of `object` switched on its shard: the configuration was seen naming another owner.
+fn note_switched(state: &mut ShardState, object: ObjectId) {
+  if let Some(out) = state.moves_out.get_mut(&DbVolumeId { bytes: object.0 }) {
+    out.switched = true;
   }
 }
 
@@ -517,17 +556,50 @@ fn thaw(state: &mut ShardState, object: ObjectId) {
   }
 }
 
-/// Releases `object`'s volume on its shard to `owner`, who adopted it (A-291): its record leaves whole
-/// (`Op::VolumeReleased`, no tombstone), its slot is freed in the destroy's slices, its routing names the new owner so
-/// a verb forwards there, and its snapshot views, pending seals, live log shipper, name alias and move are forgotten. A
-/// release the database refuses keeps everything and is asked again next period.
+/// Releases `object`'s frozen copy on its shard to `owner`, who adopted the volume (A-291): its routing names the new
+/// owner so a verb forwards there, and the copy goes ([`let_go`]). Nothing but the routing when no copy is frozen here
+/// any more (a takeover's adoption superseded it, [`supersede_frozen`]), so a volume served here is never released.
 fn release(state: &mut ShardState, object: ObjectId, owner: HostId) {
   let id = DbVolumeId { bytes: object.0 };
-  state.fleet.track_object_owner(object, owner);
-  state.fleet.track_object_owner(object.catalog(), owner);
+  if owner != state.fleet.host() {
+    state.fleet.track_object_owner(object, owner);
+    state.fleet.track_object_owner(object.catalog(), owner);
+  }
+  if state.moves_out.contains_key(&id) && let_go(state, id, Gone::ToAnother) {
+    state.count(MOVE_RELEASED, 1);
+  }
+}
+
+/// Why a frozen copy goes ([`let_go`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Gone {
+  /// Another member owns the volume now: everything of it here goes, its name's alias on another partition too.
+  ToAnother,
+  /// This node's own takeover adopted the volume and serves it next, under the same id and name: the copy goes, but
+  /// the placements the adoption recorded here and the name's alias, which names the same id, stay.
+  Superseded,
+}
+
+/// Lets a takeover's adoption of `id` supersede the copy this node froze for a move (A-291; `verbs::materialize_taken_over`
+/// asks): `true` when such a copy was here and is gone now, so the adopted state can be served; `false` when the volume
+/// served here is no frozen copy (nothing to supersede) or the database refused the release (asked again next period).
+pub(crate) fn supersede_frozen(state: &mut ShardState, id: DbVolumeId) -> bool {
+  let superseded = state.moves_out.contains_key(&id) && let_go(state, id, Gone::Superseded);
+  if superseded {
+    state.count(MOVE_SUPERSEDED, 1);
+  }
+  superseded
+}
+
+/// Lets the frozen copy of `id` go: its record leaves whole (`Op::VolumeReleased`, no tombstone, since its registers are
+/// another owner's or the adoption's), its slot is freed in the destroy's slices, and its snapshot views, pending seals,
+/// live log shipper and move are forgotten, with its placements and name alias when it went to another member (`gone`).
+/// `false`, everything kept, when the database refuses the release.
+fn let_go(state: &mut ShardState, id: DbVolumeId, gone: Gone) -> bool {
+  let object = ObjectId(id.bytes);
   let Some(handle) = state.by_id.get(&id).copied() else {
     state.moves_out.remove(&id);
-    return;
+    return true;
   };
   let name = state
     .db
@@ -541,7 +613,7 @@ fn release(state: &mut ShardState, object: ObjectId, owner: HostId) {
     .is_err()
   {
     state.count(MOVE_RELEASE_REFUSED, 1);
-    return;
+    return false;
   }
   state.by_id.remove(&id);
   crate::snapshot_view::end_all_of(state, id);
@@ -553,13 +625,15 @@ fn release(state: &mut ShardState, object: ObjectId, owner: HostId) {
   state.moves_out.remove(&id);
   state.seals.remove(&object);
   state.mirror_seals.remove(&object);
-  state.placed_heads.remove(&object);
-  state.placed_heads.remove(&object.catalog());
   crate::live_ship::forget(state, id);
-  if let Some(name) = name {
-    crate::verbs::release_name_alias(state, id, &name);
+  if gone == Gone::ToAnother {
+    state.placed_heads.remove(&object);
+    state.placed_heads.remove(&object.catalog());
+    if let Some(name) = name {
+      crate::verbs::release_name_alias(state, id, &name);
+    }
   }
-  state.count(MOVE_RELEASED, 1);
+  true
 }
 
 // ------------------------------------------------------------------------------------------------ every holder
@@ -1263,6 +1337,7 @@ mod tests {
       object,
       to,
       reported: false,
+      switched: false,
       ready: false,
       overdue: false,
       cohort: vec![HostId(1), HostId(2), HostId(3)],
@@ -1271,10 +1346,12 @@ mod tests {
 
   /// A-291, the old owner's decision, by the configuration alone. Do: decide host 1's move of its object to host 2 as
   /// it is unplaced, placed, overdue, and then reported; commit the move and decide again; report it adopted and decide
-  /// again; then decide a second move whose target retired before any switch, and a move whose cohort the target's
-  /// neighbourhood does not cover. Expect: wait while unplaced; report once placed and again until the switch; refused
-  /// `Unplaced` when overdue unreported; switched to host 2 (keeping the copy) once committed; released once adopted;
-  /// thawed when the target left with no switch; refused `Neighbourhood` for an uncovered cohort.
+  /// again; drop the exception as its new owner's destroy does and decide again; then decide a second move whose target
+  /// retired before any switch, and a move whose cohort the target's neighbourhood does not cover. Expect: wait while
+  /// unplaced; report once placed and again until the switch; refused `Unplaced` when overdue unreported; switched to
+  /// host 2 (keeping the copy) once committed; released once adopted; released to itself (the copy let go, never
+  /// thawed) once the switched move's exception is gone; thawed when the target left with no switch; refused
+  /// `Neighbourhood` for an uncovered cohort.
   #[test]
   fn the_old_owner_reports_until_the_switch_keeps_its_copy_until_adopted_and_thaws_only_without_a_switch()
    {
@@ -1303,8 +1380,17 @@ mod tests {
       step_for(&regional, from, &out),
       Step::Switched { owner: to }
     );
+    out.switched = true;
     assert!(regional.adopt_move(object, to));
     assert_eq!(step_for(&regional, from, &out), Step::Release { owner: to });
+    let mut gone = regional.clone();
+    assert!(gone.forget_moved(object, to));
+    assert_eq!(
+      step_for(&gone, from, &out),
+      Step::Release { owner: from },
+      "a switched move whose exception is gone (destroyed by its new owner, or handed back by its takeover) lets the \
+       frozen copy go, never thaws it"
+    );
 
     let mut leaving = region();
     let other = ObjectId::new(from, 8);
