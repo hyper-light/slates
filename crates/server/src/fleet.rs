@@ -1660,6 +1660,14 @@ async fn serve_peer_records(
             crate::live_ship::serve_state(s, local, peer_host, &request)
           })
           .unwrap_or_default(),
+          slates_cluster::live::LIVE_ENTRIES_STREAM => state::with_state(|s| {
+            let peer_host = s
+              .learned_members
+              .get(&peer_anchor)
+              .map_or(seed, |learned| learned.host);
+            crate::live_ship::serve_entries(s, local, peer_host, &request)
+          })
+          .unwrap_or_default(),
           crate::mirror::MIRROR_RECORD_STREAM => state::with_state(|s| {
             let peer_host = s
               .learned_members

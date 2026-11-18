@@ -1810,15 +1810,20 @@ async fn ship_to_holder(
   });
 }
 
-/// The messages of one lane in turn ([`ship_to_holder`]): whether the holder answered every one it was sent.
+/// The messages of one lane in turn ([`ship_to_holder`]): whether the holder answered every one it was sent. The entries
+/// of one volume that follow each other go as one batch while it fits the session's congestion window
+/// ([`take_batch`]): sent one exchange an entry, a burst of `n` entries reached the holder in `n` round trips, and a
+/// holder back from a stall caught up on the retained tail a round trip an entry.
 async fn ship_lane(
   origin: u16,
   holder: HostId,
   sends: Vec<Send>,
   budget: slates_cluster::CommitBudget,
 ) -> bool {
-  for send in sends {
+  let mut queue: VecDeque<Send> = sends.into();
+  while let Some(first) = queue.pop_front() {
     let sessions = borrow_session(holder, budget.max_deadline_ns()).await;
+    let send = take_batch(first, &mut queue, &sessions);
     // Each message under its own budget: the liveness budget plus its transfer on the session it rides, so an install of
     // the whole volume is not given up the moment an entry would be (`exchange_budget`).
     let exchange = exchange_budget(send.bytes.len(), &sessions);
@@ -1845,6 +1850,68 @@ async fn ship_lane(
     }
   }
   true
+}
+
+/// Counter: batches of entries sent to a holder in one exchange ([`take_batch`]).
+const LIVE_BATCHES: &str = "fleet.live.batches";
+/// Counter: entries sent in those batches.
+const LIVE_BATCHED: &str = "fleet.live.batched";
+
+/// `first` with the entries of its volume that follow it in `queue`, taken from it as one batch
+/// (`slates_db::live::encode_batch`, [`slates_cluster::live::LIVE_ENTRIES_STREAM`]) while the batch's bytes stay within
+/// the session's congestion window; `first` alone when nothing follows it that fits, or it is not an entry. Derived: a
+/// batch is at most one window (the bytes the session may have in flight a round trip, RFC 9002 §7), so it rides the
+/// `Control` class without holding it past a round of the window, and the first entry always goes, whatever its size.
+fn take_batch(
+  first: Send,
+  queue: &mut VecDeque<Send>,
+  sessions: &[(HostId, slates_transport::endpoint::Endpoint)],
+) -> Send {
+  if first.stream != slates_cluster::live::LIVE_ENTRY_STREAM {
+    return first;
+  }
+  let window = sessions.first().map_or(0, |(_, endpoint)| {
+    usize::try_from(endpoint.congestion_window()).unwrap_or(usize::MAX)
+  });
+  let mut bytes = first.bytes.len();
+  let following = queue
+    .iter()
+    .take_while(|next| {
+      let fits = next.stream == slates_cluster::live::LIVE_ENTRY_STREAM
+        && next.object == first.object
+        && bytes.saturating_add(next.bytes.len()) <= window;
+      if fits {
+        bytes = bytes.saturating_add(next.bytes.len());
+      }
+      fits
+    })
+    .count();
+  if following == 0 {
+    return first;
+  }
+  let encoded: Vec<&[u8]> = std::iter::once(first.bytes.as_slice())
+    .chain(
+      queue
+        .iter()
+        .take(following)
+        .map(|next| next.bytes.as_slice()),
+    )
+    .collect();
+  let Some(batch) = slates_db::live::encode_batch(&encoded) else {
+    return first;
+  };
+  queue.drain(..following.min(queue.len()));
+  let carried = u64::try_from(following).map_or(u64::MAX, |following| following.saturating_add(1));
+  let _ = state::with_state(|s| {
+    s.count(LIVE_BATCHES, 1);
+    s.count(LIVE_BATCHED, carried);
+  });
+  Send {
+    object: first.object,
+    holder: first.holder,
+    stream: slates_cluster::live::LIVE_ENTRIES_STREAM,
+    bytes: batch,
+  }
 }
 
 /// The budget one message to one holder gets: the liveness budget a reply gets, plus the time its bytes take at the
@@ -2247,22 +2314,88 @@ pub(crate) fn serve_entry(
       )));
     }
   };
-  let reply = Entry::decode(request, bound).and_then(|entry| {
-    let held = held_entry(state, peer, entry.object);
-    match held.replica.check(&entry)? {
-      Admitted::Apply(head) => {
-        keep(held, &entry.payload, bound)?;
-        held.replica.commit(entry.epoch, head);
-        Ok(Some(head))
-      }
-      Admitted::Held => Ok(held.replica.head()),
-    }
-  });
+  let reply = Entry::decode(request, bound)
+    .and_then(|entry| take_entry(held_entry(state, peer, entry.object), &entry, bound));
   match &reply {
     Err(error) => count_refused(state, refused_counter(error)),
     Ok(_) => state.count(LIVE_HELD, 1),
   }
   encode_reply(&reply)
+}
+
+/// One entry taken into a candidate's copy (guard-then-apply, `Replica::check` then `commit`): applied and kept within
+/// `bound` when it extends the head, passed over when already held; the head held after it, or why not.
+fn take_entry(held: &mut Held, entry: &Entry, bound: usize) -> Result<Option<Head>, LiveError> {
+  match held.replica.check(entry)? {
+    Admitted::Apply(head) => {
+      keep(held, &entry.payload, bound)?;
+      held.replica.commit(entry.epoch, head);
+      Ok(Some(head))
+    }
+    Admitted::Held => Ok(held.replica.head()),
+  }
+}
+
+/// A candidate's answer to a batch of entries from `peer` (A-200 amended 2026-11-17, [`ship_lane`]): authorized and
+/// bounded as [`serve_entry`] does one entry, then each entry checked, kept and committed in order exactly as one entry
+/// is, until one is neither applied nor already held (a gap, a fence, the bound): answered once, with the head held
+/// after the last, or the first refusal when no entry was taken. Each entry taken counts `fleet.live.held`, as one sent
+/// alone does.
+pub(crate) fn serve_entries(
+  state: &mut ShardState,
+  local: HostId,
+  peer: HostId,
+  request: &[u8],
+) -> Vec<u8> {
+  let object = slates_db::live::object_of(request);
+  let bound = match admitted(state, local, peer, object) {
+    Ok(bound) => bound,
+    Err(why) => {
+      count_refused(state, why);
+      return encode_reply(&Err(not_served(
+        state,
+        object,
+        slates_db::live::epoch_of_batch(request),
+      )));
+    }
+  };
+  let (reply, taken) = match slates_db::live::decode_batch(request, bound) {
+    Ok(entries) => take_entries(state, peer, &entries, bound),
+    Err(refusal) => (Err(refusal), 0),
+  };
+  match &reply {
+    Err(error) => count_refused(state, refused_counter(error)),
+    Ok(_) => state.count(LIVE_HELD, taken),
+  }
+  encode_reply(&reply)
+}
+
+/// A batch's entries taken in order ([`take_entry`]) until one is not: the head held after the last taken, or the first
+/// refusal when none was; and how many were taken. A refusal that stops the batch after some were taken is counted
+/// here, since the answer is then the head reached.
+fn take_entries(
+  state: &mut ShardState,
+  peer: HostId,
+  entries: &[Entry],
+  bound: usize,
+) -> (Result<Option<Head>, LiveError>, u64) {
+  let mut reached = None;
+  let mut taken: u64 = 0;
+  for entry in entries {
+    match take_entry(held_entry(state, peer, entry.object), entry, bound) {
+      Ok(head) => {
+        taken = taken.saturating_add(1);
+        reached = Some(head);
+      }
+      Err(refusal) => {
+        if reached.is_some() {
+          count_refused(state, refused_counter(&refusal));
+        }
+        return (reached.ok_or(refusal), taken);
+      }
+    }
+  }
+  (reached.ok_or(LiveError::Malformed), taken)
 }
 
 /// A candidate's answer to an install from `peer`, as [`serve_entry`]: the install's state replaces what it held.

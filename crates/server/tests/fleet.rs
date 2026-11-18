@@ -9782,6 +9782,10 @@ const LIVE_WHOLE: &str = "fleet.live.whole";
 const LIVE_NO_CREDIT: &str = "fleet.live.refused.no_credit";
 /// Format: the owner's count of entries appended to a live log.
 const LIVE_APPENDED: &str = "fleet.live.appended";
+/// Format: the owner's count of batches it sent a holder, each the entries it lacked in one exchange.
+const LIVE_BATCHES: &str = "fleet.live.batches";
+/// Format: the owner's count of entries those batches carried.
+const LIVE_BATCHED: &str = "fleet.live.batched";
 
 /// A write attachment of `volume` through `client`.
 fn write_attachment(client: &mut Client, volume: VolumeId) -> u64 {
@@ -9820,9 +9824,11 @@ fn live_in_flight(client: &mut Client, volume: VolumeId) -> Option<u64> {
 /// nodes at `f = 1`; on a, a volume of half a MiB, then live-shipped and written once (its log's first entry, the whole
 /// state, durable); hold both holders off their shards while sixteen clients each write half a page at once, so every write's
 /// entry waits in flight together. Expect every write answered `FsDone`, no publication turned away for credit, still
-/// one whole record on the log, an entry appended for every write, and more than two entries in flight at once (seen in
-/// the owner's status). Before, the credit was a fixed two entries: the burst's third publication was turned away, and
-/// the volume's next entry was a copy of all of it.
+/// one whole record on the log, an entry appended for every write, more than two entries in flight at once (seen in the
+/// owner's status), and the entries each held holder lacked sent as batches of several an exchange once it answered
+/// (`fleet.live.batches`, `fleet.live.batched`). Before, the credit was a fixed two entries: the burst's third
+/// publication was turned away, and the volume's next entry was a copy of all of it; and a holder was sent one entry an
+/// exchange.
 #[test]
 fn a_burst_of_writes_to_a_live_volume_ships_its_changes_not_the_volume() {
   let _serial = serialize_fleet_tests();
@@ -9874,7 +9880,14 @@ fn a_burst_of_writes_to_a_live_volume_ships_its_changes_not_the_volume() {
     "the first live write is answered at durability: {first:?}"
   );
   let counts = |daemon: &Daemon| {
-    [LIVE_WHOLE, LIVE_NO_CREDIT, LIVE_APPENDED].map(|kind| refusal_count(daemon, kind).unwrap())
+    [
+      LIVE_WHOLE,
+      LIVE_NO_CREDIT,
+      LIVE_APPENDED,
+      LIVE_BATCHES,
+      LIVE_BATCHED,
+    ]
+    .map(|kind| refusal_count(daemon, kind).unwrap())
   };
   let before = counts(&daemons[0]);
   let writers: Vec<(Client, u64)> = (0..BURST_WRITERS)
@@ -9930,7 +9943,8 @@ fn a_burst_of_writes_to_a_live_volume_ships_its_changes_not_the_volume() {
     daemon.stop();
   }
   eprintln!(
-    "burst: whole, no-credit, appended before {before:?} after {after:?}; deepest in flight {deepest}; holds {held:?}"
+    "burst: whole, no-credit, appended, batches, batched before {before:?} after {after:?}; deepest in flight \
+     {deepest}; holds {held:?}"
   );
   assert!(
     replies
@@ -9953,6 +9967,14 @@ fn a_burst_of_writes_to_a_live_volume_ships_its_changes_not_the_volume() {
   assert!(
     deepest > OLD_CREDIT_ENTRIES,
     "the burst had more entries in flight at once than the old credit let be ({deepest})"
+  );
+  let (batches, batched) = (
+    after[3].saturating_sub(before[3]),
+    after[4].saturating_sub(before[4]),
+  );
+  assert!(
+    batches > 0 && batched > batches,
+    "the entries the held holders lacked went as batches, several an exchange ({batches} batches, {batched} entries)"
   );
 }
 

@@ -14,8 +14,10 @@
 > `docs/bugs/2026-11-17-a-burst-on-a-live-volume-shipped-the-whole-volume.md`.
 > - **Owed (measurement, the supervisor's):** many writers on one large live volume, before and after: whole records,
 >   bytes shipped, and the write's p50/p99/p999 (`fleet.live.whole`, `fleet.live.refused.no_credit`).
-> - **Open:** a lane ships a holder's entries one exchange at a time (`live_ship::ship_lane`), so a burst of `n` entries
->   reaches a holder in `n` round trips; one exchange carrying every entry a holder lacks is the next piece.
+> - **Fixed the same day:** a lane shipped a holder's entries one exchange at a time (`live_ship::ship_lane`), so a burst
+>   of `n` entries reached a holder in `n` round trips; the entries a holder lacks now go as one batch a congestion
+>   window (`take_batch`, `serve_entries`, request kind 25; A-200's second amendment of 2026-11-17). Owed (measurement):
+>   a stalled holder's catch-up time and a burst's last-write latency, before and after, on a WAN-shaped path.
 
 > **The dirty-page test's precondition, proved each attempt (2026-11-09, A-248).**
 > `a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path` failed intermittently ("the sync says so:

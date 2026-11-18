@@ -6382,8 +6382,10 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > whole only where that is the cheaper catch-up. Held by `a_burst_of_writes_to_a_live_volume_ships_its_changes_not_the_volume`
 > (`crates/server/tests/fleet.rs`: sixteen clients write half a page each while both holders are held off their shards; every
 > write answered, no publication turned away, no whole record; red on the fixed credit) and the byte bounds' unit tests in
-> `crates/db/tests/live.rs`. Still a lane ships a holder's entries one exchange at a time, so a burst's catch-up costs a
-> round trip an entry.
+> `crates/db/tests/live.rs`. The same day a lane began sending the entries a holder lacks as one batch a congestion window
+> (A-200's second amendment of 2026-11-17, `live_ship::take_batch`, `serve_entries`): in the same flow each held holder
+> was caught up in batches of several entries an exchange (`fleet.live.batches`, `fleet.live.batched`), where it had
+> been sent one entry an exchange.
 >
 > **Chaos from outside the processes (2026-11-06).** `crates/cli/tests/live_chaos.rs` streams writes through the Rust
 > client while it partitions or kills processes. It ends every flow with Agreement, NoLoss, StaleNeverCommits and
@@ -15279,6 +15281,25 @@ flight at once (this Mac, debug, 2026-11-17; `a_burst_of_writes_to_a_live_volume
 (the model and unit tests in bytes; three new tests), `crates/server/src/live_ship.rs` (`CREDIT`, `RETAIN` removed),
 `crates/server/tests/fleet.rs` (the burst flow, red first), `crates/cluster` (its test and bench), §4.10's live-shipping
 status, GAPS, the bug record.
+
+**Amended 2026-11-17 (g230): the entries a holder lacks go as one batch a window.** A dispatch's lane sent a holder
+each entry in its own exchange and waited for the answer before the next (`live_ship::ship_lane`), so the entries a
+burst piled up behind a lane's first reached the holder one round trip each, and a holder back from a stall caught up on
+the retained tail a round trip an entry (two hundred entries over an 80 ms path is 16 s). With the credit in bytes a
+burst's entries are all in flight at once, so the lane now sends the entries of one volume that follow each other as one
+message (`slates_db::live::encode_batch`, `decode_batch`; request kind 25, `LIVE_ENTRIES_STREAM`, the `Control` class)
+while it fits the session's congestion window (`live_ship::take_batch`, derived: one window, the bytes the session may
+have in flight a round trip, RFC 9002 §7, so a batch never holds the class past a round of it; the first entry always
+goes). The holder applies a batch's entries in order exactly as it applies one (`live_ship::serve_entries`: checked,
+kept and committed each, stopping at the first gap, fence or bound) and answers once with the head it reached, which the
+owner folds as any answer. Nothing a holder accepts changes, so the register invariants rest on the same per-entry
+rules; a batch is refused whole when its header and an entry disagree (`decode_batch`). Every node of a fleet runs one
+build: a holder that does not know kind 25 answers nothing a batch can be acknowledged by, and no fallback to single
+entries is kept (CLAUDE.md §2 item 7).
+**Applied in the same change to:** `crates/db/src/live.rs` (the batch codec), `crates/cluster/src/live.rs`
+(`LIVE_ENTRIES_STREAM`, `serve_entries`), `crates/server/src/{live_ship,fleet}.rs` (`take_batch`, `serve_entries`, the
+serve arm), the tests (`crates/db/tests/live.rs` hostile batches; `crates/cluster/tests/live.rs` a batch durable in one
+exchange and applied up to its first gap; the burst flow's batch counters), §4.10's live-shipping status, GAPS.
 
 ### A-240 — A live log's phase one counts its quorum among the holders its shipper recorded before it shipped (accepted and built 2026-11-06; the supervisor's option (C))
 

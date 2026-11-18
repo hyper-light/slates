@@ -14,6 +14,11 @@
 //! holder is off its chain or behind the tail, an [`Install`] of its whole state at its current head (Raft's
 //! InstallSnapshot, Ongaro thesis §5.3).
 //!
+//! **Batches (A-200 amended 2026-11-17).** The entries a holder lacks may travel as one message ([`encode_batch`],
+//! [`decode_batch`]): the holder applies them in order exactly as it applies each alone, and its one reply is the head it
+//! reached, which the owner reads as it reads any reply. A batch changes how many exchanges a catch-up costs, not what a
+//! holder accepts: one exchange an entry made a burst of `n` entries reach a holder in `n` round trips.
+//!
 //! **Fencing.** A holder keeps one [`Fence`] for the owner's host: an entry or install under a lower epoch is refused
 //! `StaleEpoch`, and phase one ([`Replica::prepare`]) raises it. So once a takeover has fenced `f + 1` candidates the
 //! superseded owner reaches at most `f − 1` other holders and can never make another entry durable
@@ -71,6 +76,12 @@ const ENTRY_PREFIX_BYTES: usize =
 /// state's length (u32 LE); the state follows.
 const INSTALL_PREFIX_BYTES: usize =
   2 * size_of::<u64>() + OBJECT_BYTES + HEAD_BYTES + size_of::<u32>();
+/// Format: a batch's fixed prefix: the owner (u64), the object, the epoch its entries were made under (u64), then the
+/// entry count (u32 LE); each entry follows as a u32-length-prefixed encoded [`Entry`] ([`encode_batch`]).
+const BATCH_PREFIX_BYTES: usize = 2 * size_of::<u64>() + OBJECT_BYTES + size_of::<u32>();
+/// Format: the least an entry takes in a batch: its length prefix and its fixed prefix, an empty payload. A count
+/// claiming more entries than the bytes that follow could hold is refused before anything is allocated for them.
+const BATCHED_ENTRY_MIN_BYTES: usize = size_of::<u32>() + ENTRY_PREFIX_BYTES;
 /// Format: a whole-state message's first byte: an install (owner to holder).
 const TAG_INSTALL: u8 = 1;
 /// Format: a whole-state message's first byte: a takeover's fetch (successor to holder).
@@ -274,8 +285,9 @@ impl Install {
   }
 }
 
-/// The object an encoded entry or install names, read without decoding the rest: both begin with the owner's word and
-/// then the object (the formats above). `None` for bytes too short to hold it.
+/// The object an encoded entry or batch names, read without decoding the rest: both begin with the owner's word and
+/// then the object (the formats above; an install's tag comes first, [`object_of_state`]). `None` for bytes too short
+/// to hold it.
 pub fn object_of(bytes: &[u8]) -> Option<ObjectId> {
   let mut reader = Reader { bytes };
   reader.word().ok()?;
@@ -299,6 +311,74 @@ pub fn epoch_of_install(bytes: &[u8]) -> Option<HostEpoch> {
   if reader.byte().ok()? != TAG_INSTALL {
     return None;
   }
+  reader.word().ok()?;
+  reader.object().ok()?;
+  reader.word().ok().map(HostEpoch)
+}
+
+/// Several consecutive entries of one owner's log as one message to one holder (A-200 amended 2026-11-17): the
+/// catch-up a holder lacks, sent in one exchange rather than one exchange an entry. `encoded` are entries as
+/// [`Entry::encode`] made them, in chain order, all of one owner, object and epoch (a shipper's retained entries are: it
+/// appends only under its own epoch). The holder applies them in order exactly as it applies one entry
+/// ([`Replica::check`], [`decode_batch`]) and answers once, with the head it reached. `None` when `encoded` is empty or
+/// its first entry is too short to name its owner, object and epoch.
+pub fn encode_batch(encoded: &[&[u8]]) -> Option<Vec<u8>> {
+  let first = encoded.first()?;
+  let mut reader = Reader { bytes: first };
+  let owner = reader.word().ok()?;
+  let object = reader.object().ok()?;
+  let epoch = epoch_of(first)?;
+  let bytes = encoded.iter().fold(BATCH_PREFIX_BYTES, |sum, entry| {
+    sum
+      .saturating_add(size_of::<u32>())
+      .saturating_add(entry.len())
+  });
+  let mut out = Vec::with_capacity(bytes);
+  out.extend_from_slice(&owner.to_le_bytes());
+  out.extend_from_slice(&object.0);
+  out.extend_from_slice(&epoch.0.to_le_bytes());
+  out.extend_from_slice(&u32::try_from(encoded.len()).ok()?.to_le_bytes());
+  for entry in encoded {
+    out.extend_from_slice(&u32::try_from(entry.len()).ok()?.to_le_bytes());
+    out.extend_from_slice(entry);
+  }
+  Some(out)
+}
+
+/// Parses a batch that crossed the network ([`encode_batch`]): every entry, in order. Each is refused over
+/// `payload_cap` before it is copied, as [`Entry::decode`] refuses one; a count that claims more entries than the bytes
+/// that follow could hold, an entry that names another owner, object or epoch than the batch, an empty batch, and
+/// trailing bytes are each refused [`LiveError::Malformed`].
+pub fn decode_batch(bytes: &[u8], payload_cap: usize) -> Result<Vec<Entry>, LiveError> {
+  let mut reader = Reader { bytes };
+  let owner = HostId(reader.word()?);
+  let object = reader.object()?;
+  let epoch = HostEpoch(reader.word()?);
+  let count = reader.count()?;
+  let room = reader.bytes.len() / BATCHED_ENTRY_MIN_BYTES;
+  if count == 0 || count > room {
+    return Err(LiveError::Malformed);
+  }
+  let entry_cap = ENTRY_PREFIX_BYTES.saturating_add(payload_cap);
+  let mut entries = Vec::with_capacity(count);
+  for _ in 0..count {
+    let entry = Entry::decode(&reader.prefixed(entry_cap)?, payload_cap)?;
+    if entry.owner != owner || entry.object != object || entry.epoch != epoch {
+      return Err(LiveError::Malformed);
+    }
+    entries.push(entry);
+  }
+  if reader.bytes.is_empty() {
+    Ok(entries)
+  } else {
+    Err(LiveError::Malformed)
+  }
+}
+
+/// The epoch a batch's entries were made under, read from its header alone ([`encode_batch`]), as [`epoch_of`] reads
+/// an entry's. `None` for bytes too short.
+pub fn epoch_of_batch(bytes: &[u8]) -> Option<HostEpoch> {
+  let mut reader = Reader { bytes };
   reader.word().ok()?;
   reader.object().ok()?;
   reader.word().ok().map(HostEpoch)
@@ -514,6 +594,13 @@ impl<'a> Reader<'a> {
     Ok(u64::from_le_bytes(
       bytes.try_into().map_err(|_| LiveError::Malformed)?,
     ))
+  }
+
+  /// A u32 LE count, as a `usize`.
+  fn count(&mut self) -> Result<usize, LiveError> {
+    let bytes = self.take(size_of::<u32>())?;
+    let count = u32::from_le_bytes(bytes.try_into().map_err(|_| LiveError::Malformed)?);
+    usize::try_from(count).map_err(|_| LiveError::Malformed)
   }
 
   fn identity(&mut self) -> Result<Identity, LiveError> {

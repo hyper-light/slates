@@ -2140,6 +2140,91 @@ fn hostile_bytes_are_refused_not_trusted() {
   }
 }
 
+/// Three consecutive entries of one owner's log under epoch 2, and their encodings.
+fn three_batched() -> (Vec<Entry>, Vec<Vec<u8>>) {
+  let mut previous = [9; 32];
+  let entries: Vec<Entry> = (0..3u8)
+    .map(|value| {
+      let entry = Entry {
+        owner: HostId(1),
+        object: OBJECT,
+        position: 3 + u64::from(value),
+        epoch: HostEpoch(2),
+        previous,
+        payload: vec![value; 4],
+      };
+      previous = entry.identity();
+      entry
+    })
+    .collect();
+  let encoded = entries.iter().map(Entry::encode).collect();
+  (entries, encoded)
+}
+
+/// A-200 amended 2026-11-17, hostile input on a batch: a batch round-trips to its entries, in order, and its header names
+/// its object and epoch; every truncation, a count over-claiming the bytes that follow (`u32::MAX`), a count of zero,
+/// trailing bytes, an entry's payload over the cap, and an entry of another epoch inside it are each refused; every
+/// single-bit flip decodes to other entries or is refused, never a panic.
+#[test]
+fn hostile_batches_are_refused_not_trusted() {
+  use slates_db::live::{decode_batch, encode_batch, epoch_of_batch, object_of};
+  let (entries, encoded) = three_batched();
+  let slices: Vec<&[u8]> = encoded.iter().map(Vec::as_slice).collect();
+  let bytes = encode_batch(&slices).unwrap();
+  assert_eq!(decode_batch(&bytes, CAP), Ok(entries.clone()));
+  assert_eq!(object_of(&bytes), Some(OBJECT));
+  assert_eq!(epoch_of_batch(&bytes), Some(HostEpoch(2)));
+  assert_eq!(encode_batch(&[]), None, "an empty batch is never made");
+  for length in 0..bytes.len() {
+    assert_eq!(
+      decode_batch(&bytes[..length], CAP),
+      Err(LiveError::Malformed),
+      "truncated at {length}"
+    );
+  }
+  let count_at = 8 + 16 + 8;
+  for count in [u32::MAX, 0, 4] {
+    let mut lying = bytes.clone();
+    lying[count_at..count_at + 4].copy_from_slice(&count.to_le_bytes());
+    assert_eq!(
+      decode_batch(&lying, CAP),
+      Err(LiveError::Malformed),
+      "a count of {count}"
+    );
+  }
+  let mut longer = bytes.clone();
+  longer.push(0);
+  assert_eq!(decode_batch(&longer, CAP), Err(LiveError::Malformed));
+  assert_eq!(
+    decode_batch(&bytes, 3),
+    Err(LiveError::Malformed),
+    "an entry's payload over the cap"
+  );
+  let foreign = Entry {
+    epoch: HostEpoch(3),
+    ..entries[1].clone()
+  }
+  .encode();
+  let mixed = encode_batch(&[slices[0], foreign.as_slice()]).unwrap();
+  assert_eq!(
+    decode_batch(&mixed, CAP),
+    Err(LiveError::Malformed),
+    "an entry of another epoch than the batch's"
+  );
+  let identities: Vec<_> = entries.iter().map(Entry::identity).collect();
+  for bit in 0..bytes.len() * 8 {
+    let mut flipped = bytes.clone();
+    flipped[bit / 8] ^= 1 << (bit % 8);
+    if let Ok(decoded) = decode_batch(&flipped, CAP) {
+      let decoded: Vec<_> = decoded.iter().map(Entry::identity).collect();
+      assert_ne!(
+        decoded, identities,
+        "bit {bit} changed nothing the chain would see"
+      );
+    }
+  }
+}
+
 /// Hostile input: a reply that is empty, of an unknown kind, short of its head or fence, or longer than its kind is
 /// refused.
 #[test]
