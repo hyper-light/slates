@@ -4965,6 +4965,9 @@ mod tests {
         live_shipped: true,
         live_holders: holders.map(|holders| slates_db::catalog::LiveHolders { epoch: 1, holders }),
         work_of: None,
+        write: None,
+        write_version: 0,
+        signers: Vec::new(),
       }
       .to_record_bytes()
     };

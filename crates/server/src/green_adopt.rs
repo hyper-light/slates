@@ -102,6 +102,12 @@ pub(crate) struct AdoptedGreen {
   pub(crate) access: Vec<slates_db::catalog::AccessEntry>,
   /// The adopted catalog register's sequence, which the green's record continues from.
   pub(crate) catalog_sequence: u64,
+  /// The green's write policy, from its adopted catalog register (A-285, A-321).
+  pub(crate) write: Option<slates_db::catalog::WritePolicy>,
+  /// The policy's version, from the same register.
+  pub(crate) write_version: u64,
+  /// The green's trusted signers, from the same register (A-321).
+  pub(crate) signers: Vec<Vec<u8>>,
   /// The adopted version.
   pub(crate) head: u64,
   /// The adopted record's identity: the green's head identity at `head`.

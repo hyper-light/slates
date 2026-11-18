@@ -7375,6 +7375,20 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > was caught up in batches of several entries an exchange (`fleet.live.batches`, `fleet.live.batched`), where it had
 > been sent one entry an exchange.
 >
+> **A whole state in flight is not counted against the deltas (A-371, 2026-11-18; g230).** The credit counted every entry
+> not yet durable, the whole state the owner had just appended among them, and the owner sets the credit from that very
+> entry's size: so until a whole entry was durable every delta behind it was refused `NoCredit`, each refusal owed a
+> whole state again, and the volume shipped whole once more as soon as the credit freed. The measurer's 32 writers on one
+> 128 MiB live volume saw it as two extra whole records of about 135.5 MB in every completed run (1 became 3), each an
+> O(volume) build in one turn of the owner shard. A whole state now rides one past the credit as `append_checkpoint`
+> always said, and the credit a delta is held to counts the unsettled deltas alone (`Shipper::unsettled_whole_bytes`);
+> a whole state is still admitted only while everything in flight is within the credit, so at most the credit's deltas
+> and the whole states admitted past it are in flight. Held by `deltas_behind_a_whole_state_in_flight_are_admitted_within_
+> the_credit` (`crates/db/tests/live.rs`: a whole state of 64 KiB appended as the daemon appends it, then 4 KiB deltas
+> with nothing acknowledged: every delta within the credit admitted, the next refused, no second whole state, all settled
+> by the acknowledgement), red with the whole state counted. Owed (measurement): the 32-writer run's whole records and
+> step lengths again.
+>
 > **Chaos from outside the processes (2026-11-06).** `crates/cli/tests/live_chaos.rs` streams writes through the Rust
 > client while it partitions or kills processes. It ends every flow with Agreement, NoLoss, StaleNeverCommits and
 > Convergence, checked from every node's `status`; each live line now carries its head's epoch and chain identity and
@@ -25439,8 +25453,42 @@ its own), `docs/library.md`, and:
   requirement, the work's rules travelling, the replay's record, the checkpoint's table, the green's signers, the
   consumer refusal), the restored build green. The verifier's 11 unit tests over the new `ssh-keygen` vectors, the
   chain and checkpoint codecs' tests, and the contract's `a_signed_merge_is_judged_and_read_back_through_the_contract`.
-- **Owed** (GAPS): the verdict carried by a version's merge record to holders and a takeover successor (a successor
-  records none today); a real FIDO key's signature end to end.
+- **Owed** (GAPS): a real FIDO key's signature end to end.
+
+**Signed work survives a takeover (2026-11-18, A-321's third part; goal g090).** Applied in the same change to GAPS
+(the A-321 entry's owed list, the A-285 sibling it named) and:
+- `crates/server/src/catalog.rs`: `CatalogValue::write`, `write_version` and `signers`, appended; `CatalogValue::of`
+  fills them. The ops that set them already moved `catalog_version` (A-285, A-321), so every setting ships as a newer
+  register; only the value lacked them.
+- `crates/server/src/verbs.rs`: `materialize_taken_over` (a plain volume) and `record_adopted_green` (a green, A-333)
+  make the successor's record with the catalog's policy, version and signers (each wrote `write: None`).
+- `crates/server/src/merge_service.rs`: `MergeRecordValue::signature` (a `SignatureVerdict`, the chain entry's three
+  fields in a type the wire encodes), appended, filled from the green's engine when the record is made; a holder's
+  `recompute` records it in its replica as it accepts the record. `crates/server/src/merge_origin.rs`: a replica
+  advanced or rebuilt from the ledger records each version's verdict as its record carries it. So the replica a
+  takeover adopts (A-333) answers every version as its owner judged it, and so does one a restarted successor rebuilds.
+- `crates/server/src/green_adopt.rs`, `crates/server/src/fleet.rs`: `AdoptedGreen` carries the catalog's policy, version
+  and signers (`handed_green`).
+- `crates/server/src/signed_work.rs`: `shipped` and `adopted`, the verdict between its chain-entry and record forms.
+- Tests: `crates/server/tests/fleet.rs` (`a_greens_policy_signers_and_verdicts_survive_its_owner`,
+  `a_volumes_policy_and_signers_survive_its_owner`).
+
+- **Why.** Provenance and policy are the volume's, so they outlive the owner that recorded them. A successor rebuilt a
+  taken-over green from its holders' merge records, which carried no verdict, and made every volume's record with no
+  policy and no signers, so a green taken over read its signed versions unsigned, dropped its signed-merge requirement
+  and judged signatures under no trusted key, and a volume taken over landed as an unset one does.
+- **How.** The verdict rides the version's merge record to the holders the record commits at, as its completion key
+  does (A-255); each holder records it in the replica it recomputes the version into, and the successor adopts its
+  replica as the green's engine (A-333), whose checkpoint keeps it as the owner's did. The policy, its version and the signers ride the catalog register, as the access list does (A-237).
+  Nothing is judged again: a version reads back as it was judged when it merged.
+- **Proven** (macOS arm64, Mac Studio, 2026-11-18), on three nodes at `f = 1`: a green trusting one key and requiring
+  signed merges, merged signed at 1, its owner killed once both survivors held the catalog naming the policy and the
+  key and the merge record carrying the verdict; on the successor the policy and the signers read back at version 2,
+  version 1 verified naming the key, an unsigned merge refused `SignatureRequired` naming the green, and a signed one
+  merged at 2 verified. A plain volume forbidding landings and trusting one key: on its successor both read back and a
+  landing refused `PolicyForbids`. Each guard red alone (the green's adoption dropping the catalog's policy, a plain
+  successor dropping it, the holders' replicas dropping the shipped verdict, the owner shipping none, the catalog
+  carrying none), the restored build green.
 
 **Signed landings (2026-11-18, A-321's second part; goal g090).** Applied in the same change to: §4.15 (the audit
 record's shape, step 2 "Present", a status blockquote), §4.12 ("The consumer contract": its signed-work bullet,
@@ -26927,6 +26975,21 @@ ledger), `crates/cluster/src/content.rs` (`Held::by_sequence`, charged in `manif
 - **Measured.** Kiln r3491, the Mac Studio, 2026-11-18, debug build, `a_submit_late_in_a_greens_history_is_answered_as_fast_as_an_early_one`:
   at 300 versions the late median 2.92 to 3.28 ms against the early 1.87 to 1.96 (before, 4.4 to 6.4 against 2.0 to
   2.4); at 1,000 versions 8.49 ms against 2.28 (before, 18.2 against 2.16). The rest is the content hold's image (owed).
+
+### A-371 — A whole state in flight rides one past the live credit and never counts against the deltas behind it (2026-11-18, g230, scale-out; §4.10 "Live shipping"; AC-8.9; amends A-200's credit of 2026-11-17)
+Applied in the same change to:
+- §4.10 "Live shipping": A-371's status beside the credit in bytes.
+- `crates/db/src/live.rs`: `Shipper::unsettled` records whether each entry is a whole state;
+  `Shipper::unsettled_whole_bytes`; `Shipper::append` holds the deltas in flight, a whole state's bytes left out, to
+  the credit; the docs of `Bounds::credit`, `append` and `in_flight_bytes`.
+- Tests: `deltas_behind_a_whole_state_in_flight_are_admitted_within_the_credit` (`crates/db/tests/live.rs`).
+- GAPS: the entry of 2026-11-18.
+- **What was there.** The credit counted every unsettled entry. The daemon appends a whole state past the credit and
+  then sets the credit from that state's size, so the whole state alone filled it: every delta until the whole state was
+  durable was refused, each refusal owed another whole state, and under sustained writes a large live volume shipped
+  whole again and again, each build one turn of the owner shard.
+- **The rule.** The credit holds the deltas in flight; a whole state rides one past it, admitted only while everything in
+  flight is within the credit, and is never counted against the deltas behind it.
 
 ### A-263 — A volume listing is answered a page at a time, and a new volume's name fits one page (accepted 2026-11-08)
 Applied in the same change to: §4.4 (`list`, with its status), `crates/ipc/src/protocol.rs` (`List { after }`,

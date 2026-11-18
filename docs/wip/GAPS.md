@@ -93,21 +93,16 @@
 > its signature; the contract's `land` sends it and `approve_landing` carries it (`CONTRACT` 20). Proven by four
 > landing tests in `signed_work.rs` and the contract's `a_signed_landing_is_judged_and_read_back_through_the_contract`
 > (macOS arm64, 2026-11-18), each guard red alone. **Owed, in order:**
-> - **owned by the replication goal (g230) from 2026-11-18 (g090 closed):** signed work across a takeover. (a) The
->   verdict carried by a version's merge record (`MergeRecordValue`) to its holders and a takeover successor: today a
->   successor records none, so a green taken over reads its merged versions unsigned. (b) The catalog register keeping
->   the write policy, its version and the trusted signers: a successor makes a volume's record with none
->   (`verbs::materialize_taken_over`, and `record_adopted_green` since A-333: `write: None`), since
->   `catalog::CatalogValue` carries neither, so a volume taken over merges and lands as an unset one does, its
->   signed-merge requirement dropped (A-285's sibling too). Both are built and tested, unlanded, on branch
->   `agents/g090-signed-work-takeover` (09a5747b6, merged with main 90216d741): `MergeRecordValue::signature`, recorded
->   in each holder's replica as it accepts the record (`merge_service::recompute`) and as a replica is advanced or
->   rebuilt from the ledger (`merge_origin`), so the engine a successor adopts (A-333) answers each version as its owner
->   judged it; `CatalogValue::write`, `write_version` and `signers`, carried by `AdoptedGreen` and used by
->   `record_adopted_green` and `materialize_taken_over`. Its `crates/server/tests/fleet.rs` tests on three nodes at
->   `f = 1`, `a_greens_policy_signers_and_verdicts_survive_its_owner` and
->   `a_volumes_policy_and_signers_survive_its_owner`, pass with main's A-333 adoption tests (Mac Studio, 2026-11-18),
->   and each fails with its guard removed alone (the adoption or a plain successor dropping the catalog's policy, read
+> - **built and landed 2026-11-18 (A-321's third part; g090's branch `agents/g090-signed-work-takeover`, landed by the
+>   replication goal, g230):** signed work survives a takeover. A version's merge record carries its verdict
+>   (`MergeRecordValue::signature`) to the holders it commits at, each holder's replica records it as it accepts the
+>   record (`merge_service::recompute`) and as a replica is advanced or rebuilt from the ledger (`merge_origin`), and the
+>   successor adopts the replica (A-333), so a green taken over reads its signed versions as they were judged; the catalog
+>   register carries the write policy, its version and the trusted signers (`CatalogValue::write`, `write_version`,
+>   `signers`), carried by `AdoptedGreen` and used by `record_adopted_green` and `materialize_taken_over`, so a successor
+>   enforces and reports them. Tests on three nodes at `f = 1` (`crates/server/tests/fleet.rs`):
+>   `a_greens_policy_signers_and_verdicts_survive_its_owner` and `a_volumes_policy_and_signers_survive_its_owner`, each
+>   failing with its guard removed alone (the adoption or a plain successor dropping the catalog's policy, read
 >   `(None, 0)`; a holder's replica dropping the verdict, read `Unsigned`; the owner shipping none or the catalog
 >   carrying none, never held);
 > - **found here, open (§4.15 "Audit", §4.14):** on a daemon of more than one shard `Audit` reads only the partition of
@@ -367,6 +362,15 @@
 >   now meet `DurabilityPending` where they waited; each flow's stops are a few liveness budgets, under it, but a flow
 >   that stops every candidate longer must treat the refusal as its write's outcome (not acknowledged, so never owed to
 >   a reader).
+
+> **Every delta behind a whole state in flight was refused for credit, and each refusal shipped the volume whole again:
+> fixed (2026-11-18, A-371, §4.10 "Live shipping", AC-8.9; g230).** The live credit counted the whole entry the owner had
+> just appended, and the owner sets the credit from that entry's size, so deltas behind it were refused `NoCredit` until
+> it was durable and every refusal owed a whole state: the measurer's 32 writers on a 128 MiB volume saw two extra
+> whole records of about 135.5 MB a run. The credit now holds the deltas alone; a whole state rides one past it. Test:
+> `deltas_behind_a_whole_state_in_flight_are_admitted_within_the_credit` (`crates/db/tests/live.rs`).
+> - **Owed (the measurer's):** the 32-writer, 128 MiB run again (diag-measurer-7's harness): expect `fleet.live.whole`
+>   to stay 1 and fewer one-second steps.
 
 > **A seal's envelope was wrapped in one turn, and a refused one never started again: in turns, and dropped (2026-11-18,
 > A-323 and A-322, §4.10 "Content replication"; g230).** The owner shard wrapped a seal's whole archive in the turn its
@@ -2553,6 +2557,22 @@
 >     a conflict's resolution too; a cycle starts at the first send; the row meets the bound with every kind under it at
 >     the rate, names the kind over it (a p99 of exactly 1 ms is not under), and fails below the rate, with an oracle
 >     failure, with a client given up or starved, and with nothing timed.
+>
+>     **The harness's instants are sound, and it says what it may have added (2026-11-18, g083).** The measurer's
+>     1,000-client runs on main `7d760c4ea` (BENCHMARKS, "The 1,000-client bound on main") had three oracle failures,
+>     each at a point whose harness was starved of its CPU, and one recorded a submit's round trip of 5 µs where the
+>     run's submits took 374 to 399 µs. The cause was the harness's: it stamped a send after `Client::begin` had handed
+>     the request to its ring, and a reply before `take_ready` read the ring, so a worker the host preempted in either
+>     gap recorded a send after the verdict that reflected it, or a reply before it came, and the oracle's bounds
+>     (`support/load_oracle.rs`) were unsound. Now a send is read before its handing over and again after it, and a
+>     reply after its ring was read, on the host's monotonic clock (the daemon's spans' clock). Each attempt also has a
+>     `floor` row: its reply was not there when the connection's previous drain began, so the daemon and the ring took
+>     at least that long, whatever the harness's sweep did; `max_drain_gap_ns` is now the longest window a reply's
+>     arrival could not be placed in (it counted a connection's idle time before). Tests, failing first: a worker kept
+>     off its CPU right after handing a request over, while the daemon's one shard answers, still stamps its send before
+>     the daemon's reply was written; and one kept off right after its drain's clock read still stamps the reply it
+>     takes after the daemon read the request (`a_send_is_stamped_before_the_daemon_can_have_answered_it`,
+>     `a_reply_is_stamped_after_the_ring_it_was_taken_from_was_read`).
 >
 >     **Owed, measurement (the supervisor's):** the 1,000-client rung on main with W1 (A-247 step one, landed
 >     2026-11-17) against main before it (02c6469e5). Each think mean runs as its own invocation with a fresh daemon,

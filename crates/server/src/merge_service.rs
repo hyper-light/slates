@@ -1547,6 +1547,10 @@ pub struct MergeRecordValue {
   /// completion record must move with it", Lee et al., SOSP 2015, §3). A green's successor records it, so the submit's
   /// resend after a takeover is answered its version. Appended.
   pub completion: Option<SubmitCompletion>,
+  /// How the signature of the submit that made this version was judged (A-321), as the version's chain entry records
+  /// it: a successor records it with the version, so the version's provenance outlives its owner. `None` for an
+  /// unsigned submit and for version 0, which no submit made. Appended.
+  pub signature: Option<slates_db::catalog::SignatureVerdict>,
 }
 
 /// A submit's completion key as a merge record carries it ([`MergeRecordValue::completion`]): the client's host, the
@@ -2034,6 +2038,12 @@ fn enqueue_record_with(
   // answers above: there the head identity, a hash of every byte the green holds, had been made on
   // every accept and dropped (113 of 120 profile samples of a 1,000-file green's submit, 2026-11-04).
   let identity = identity_of(state);
+  // The version's provenance (A-321), recorded in the green's engine when its entry became durable.
+  let signature = state
+    .greens
+    .get(&green)
+    .and_then(|engine| engine.signature(version))
+    .map(crate::signed_work::shipped);
   let mut value = MergeRecordValue {
     version,
     increment,
@@ -2045,6 +2055,7 @@ fn enqueue_record_with(
     require_evidence,
     owner,
     completion,
+    signature,
   };
   // Version 0 of a green over a base names its origin as its inputs: made a share at a time, and the record enqueued
   // once they are (A-286), never walked, encoded and archived in this poll.
@@ -3491,6 +3502,11 @@ fn recompute(
   if value.version == 0 && state.merge.replicas.contains_key(&object) {
     replica = state.merge.replicas.remove(&object).ok_or(OUT_OF_ORDER)?;
   }
+  // The version's provenance (A-321), as the record carries it: the replica a takeover adopts (A-333) answers it as the
+  // owner judged it.
+  if let Some(signature) = value.signature {
+    replica.record_signature(value.version, crate::signed_work::adopted(signature));
+  }
   state.merge.replicas.insert(object, replica);
   Ok(())
 }
@@ -3629,6 +3645,7 @@ mod tests {
           uid: 0,
         },
         completion: None,
+        signature: None,
       },
       inputs: Placement {
         candidates: candidates.clone(),
@@ -3727,6 +3744,7 @@ mod tests {
                 uid: 0,
               },
               completion: None,
+              signature: None,
             },
             inputs: Placement {
               candidates: candidates.clone(),
@@ -3823,6 +3841,11 @@ mod tests {
         sequence: 13,
         work: Some(DbVolumeId { bytes: [14u8; 16] }),
       }),
+      signature: Some(slates_db::catalog::SignatureVerdict {
+        kind: 1,
+        detail: 0,
+        fingerprint: [15u8; 32],
+      }),
     }
   }
 
@@ -3846,6 +3869,7 @@ mod tests {
         uid: 0,
       },
       completion: None,
+      signature: None,
     };
     assert_eq!(
       MergeRecordValue::from_record_bytes(&origin_only.to_record_bytes()),
