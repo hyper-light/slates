@@ -883,9 +883,6 @@ mod served {
       None,
     ) {
       Ok(fill) => defer(state, fill),
-      Err(Begun::Directory) => refused(Refusal::BadRequest {
-        reason: "the path is a directory".to_owned(),
-      }),
       Err(Begun::Vfs(error)) => refused(refusal_of_vfs(&error)),
       Err(Begun::Unavailable) => refused(Refusal::MapUnavailable),
       Err(Begun::FellBack) => {
@@ -955,9 +952,6 @@ mod served {
       Some((volume, attachment)),
     ) {
       Ok(fill) => defer(state, fill),
-      Err(Begun::Directory) => refused(Refusal::BadRequest {
-        reason: "the path is a directory".to_owned(),
-      }),
       Err(Begun::Vfs(error)) => refused(refusal_of_vfs(&error)),
       Err(Begun::Unavailable) => refused(Refusal::MapUnavailable),
       Err(Begun::FellBack) => {
@@ -982,9 +976,8 @@ mod served {
 
   /// Why a direct map did not begin.
   enum Begun {
-    /// The path is a directory.
-    Directory,
-    /// The path does not resolve, or its file cannot be read.
+    /// The path does not resolve, names a directory (A-299: the volume core's typed `IsDirectory`, never words), or
+    /// its file cannot be read.
     Vfs(slates_vfs::error::VfsError),
     /// A shape the direct map does not serve: an overlay, or a client served here that no descriptor can reach.
     Unavailable,
@@ -1079,7 +1072,7 @@ mod served {
         Target::Path(key) => {
           let located = slot.volume.resolve(store, key).map_err(Begun::Vfs)?;
           if matches!(located.child, Child::Dir(_)) {
-            return Err(Begun::Directory);
+            return Err(Begun::Vfs(slates_vfs::error::VfsError::IsDirectory));
           }
           located.inode
         }

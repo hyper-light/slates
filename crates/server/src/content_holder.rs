@@ -158,8 +158,8 @@ struct HeldRegister {
 }
 
 /// Format: the kind byte of a held piece's key (A-270; `slates_vfs::recover::HeldPiece`): the content hold's image, the
-/// mirror records, one held register, one live copy's head, and one live copy's entry. Key order is kind, then object,
-/// then position.
+/// mirror records, one held register, one live copy's head, one live copy's entry, and one live log this shard ships
+/// as its owner (A-344). Key order is kind, then object, then position.
 const KIND_CONTENT: u8 = 0;
 /// Format: see [`KIND_CONTENT`].
 const KIND_MIRRORED: u8 = 1;
@@ -169,6 +169,8 @@ const KIND_REGISTER: u8 = 2;
 const KIND_LIVE_HEAD: u8 = 3;
 /// Format: see [`KIND_CONTENT`].
 const KIND_LIVE_ENTRY: u8 = 4;
+/// Format: see [`KIND_CONTENT`]; its bytes are a `live_ship::OwnedLive` (A-344).
+const KIND_LIVE_OWNED: u8 = 5;
 
 /// A held piece's key: what [`slates_vfs::recover::HELD_PIECE_KEY_BYTES`] says.
 type PieceKey = [u8; slates_vfs::recover::HELD_PIECE_KEY_BYTES];
@@ -223,7 +225,22 @@ pub(crate) fn held_image(state: &ShardState) -> Vec<slates_vfs::recover::HeldPie
   for (object, held) in state.live.held.iter() {
     pieces.extend(live_pieces(*object, held, 0));
   }
+  // Every live log this shard ships as its owner: its epoch, its next position and its fence (A-344).
+  for (volume, owned) in crate::live_ship::owned_pieces(state) {
+    pieces.push(owned_piece(volume, owned));
+  }
   pieces
+}
+
+/// One live log's kept piece (A-344): what this shard's owner side keeps of `volume`'s log across a restart.
+fn owned_piece(
+  volume: [u8; 16],
+  owned: crate::live_ship::OwnedLive,
+) -> slates_vfs::recover::HeldPiece {
+  slates_vfs::recover::HeldPiece {
+    key: piece_key(KIND_LIVE_OWNED, volume, 0),
+    bytes: owned.to_bytes(),
+  }
 }
 
 /// The pieces carried whole and compared by their bytes: the content hold's image and the mirror records, each only
@@ -298,6 +315,8 @@ pub(crate) struct HeldChanges {
   pub(crate) removed: Vec<PieceKey>,
   /// The whole pieces as they now are, adopted once the delta commits.
   pub(crate) whole: BTreeMap<PieceKey, Vec<u8>>,
+  /// The kept pieces of owned live logs it changes (A-344), kept once it commits (`live_ship::owned_committed`).
+  pub(crate) owned: Vec<([u8; 16], Option<crate::live_ship::OwnedLive>)>,
 }
 
 /// What a delta carries of the held pieces since the last committed publication (A-270): a whole piece whose bytes
@@ -355,11 +374,37 @@ pub(crate) fn held_changes(state: &ShardState) -> HeldChanges {
       }
     }
   }
+  // The live logs this shard ships whose kept piece this publication changes (A-344): each captured one at the position
+  // its coming entry takes, and each marked; a log let go has its piece removed.
+  let owned = crate::live_ship::owned_changes(state);
+  for (volume, piece) in &owned {
+    match piece {
+      Some(piece) => put.push(owned_piece(*volume, *piece)),
+      None => removed.push(piece_key(KIND_LIVE_OWNED, *volume, 0)),
+    }
+  }
   HeldChanges {
     put,
     removed,
     whole,
+    owned,
   }
+}
+
+/// The kept pieces of owned live logs a checkpoint's held image carries (A-344), for `live_ship::owned_committed` once it
+/// commits. A piece that does not decode is left out: the image was made here, so it never happens.
+pub(crate) fn owned_of(
+  pieces: &[slates_vfs::recover::HeldPiece],
+) -> Vec<([u8; 16], Option<crate::live_ship::OwnedLive>)> {
+  pieces
+    .iter()
+    .filter_map(|piece| {
+      let (kind, volume, _) = split_key(&piece.key);
+      (kind == KIND_LIVE_OWNED).then_some(())?;
+      let owned = crate::live_ship::OwnedLive::from_bytes(&piece.bytes).ok()?;
+      Some((volume, Some(owned)))
+    })
+    .collect()
 }
 
 /// Adopts what a committed publication carried of the held pieces (A-270): `whole` as the published whole pieces, each
@@ -440,6 +485,8 @@ pub(crate) struct RecoveredHeld {
   registers: Vec<HeldRegister>,
   mirrored: Vec<Vec<u8>>,
   live: Vec<crate::live_ship::HeldLive>,
+  /// The live logs this shard shipped as their owner, each kept piece by volume (A-344).
+  owned: Vec<([u8; 16], crate::live_ship::OwnedLive)>,
 }
 
 /// Why a recovered image's held pieces were refused (A-270): never read as less than was held, since a holder that
@@ -487,6 +534,7 @@ pub(crate) fn split_held(
     registers: Vec::new(),
     mirrored: Vec::new(),
     live: Vec::new(),
+    owned: Vec::new(),
   };
   let mut heads: BTreeMap<[u8; 16], crate::live_ship::HeldLive> = BTreeMap::new();
   let mut entries: BTreeMap<[u8; 16], Vec<(u64, Vec<u8>)>> = BTreeMap::new();
@@ -506,6 +554,10 @@ pub(crate) fn split_held(
         .entry(object)
         .or_default()
         .push((slot, piece.bytes.clone())),
+      KIND_LIVE_OWNED => held.owned.push((
+        object,
+        crate::live_ship::OwnedLive::from_bytes(&piece.bytes)?,
+      )),
       other => return Err(HeldRefused::UnknownKind(other)),
     }
   }
@@ -539,6 +591,7 @@ pub(crate) fn restore_held_registers(
 ) -> usize {
   let count = held.registers.len();
   crate::live_ship::restore_copies(state, std::mem::take(&mut held.live));
+  crate::live_ship::restore_owned(state, std::mem::take(&mut held.owned));
   // The mirror records, each the newest of its object as it was published. One that does not decode, or that the
   // register refuses, is counted: the image held it, and this holder no longer does.
   for bytes in &held.mirrored {

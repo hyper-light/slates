@@ -23,19 +23,15 @@ use slates_client::{Attachment, ShardsStream, StreamEnd};
 use slates_ipc::protocol::{
   AttachTransport, AttachmentCapability, Conformance, DeleteWhileOpen, Established, Intent,
   KernelCache, ReadWritePolicy, Residency, SharingSemantics, SnapshotId, TargetPathConstraint,
-  VolumeId, VolumeSummary,
+  VolumeId, VolumeRefusal, VolumeSummary,
 };
 
-use crate::error::{Error, Exhausted, Existing, Invalid, KindMismatch, Missing, Note};
-use crate::mount::{MountOptions, Mounted};
+use crate::error::{Busy, Error, Exhausted, Existing, Invalid, KindMismatch, Missing, Note};
+use crate::mount::{MountOptions, Mounted, Unmounted};
 use crate::outcome::Work;
 use crate::seam::Volumes;
 use crate::volume::{Provisioned, Source, VolumeSpec};
 
-/// Format: what a refused destroy of a pinned snapshot, or of a volume a green's origin holds, carries as its note:
-/// the daemon answers both as the volume core's `Pinned` with no typed class of its own yet (A-310, owed to the
-/// contract), and the simulator answers what the daemon does.
-const PINNED: &str = "Pinned";
 /// Format: the table name an exhausted simulator's refusal carries.
 const VOLUMES_TABLE: &str = "the simulator's volumes";
 /// Format: the table name an exhausted simulator's refusal carries for its attachments.
@@ -266,9 +262,10 @@ fn table(name: &str) -> Error {
   })
 }
 
-/// The answer for a pinned snapshot's destroy, or a held volume's: the daemon's, untyped yet (see [`PINNED`]).
+/// The answer for a pinned snapshot's destroy, or a volume a green's origin holds: the daemon's, the volume core's
+/// `Pinned`, typed since A-299 as a holder the caller ends first.
 fn pinned() -> Error {
-  Error::Invalid(Invalid::Request(Note::new(PINNED)))
+  Error::Busy(Busy::Volume(VolumeRefusal::Pinned))
 }
 
 /// A connected pair: the simulator's end and the end it hands out.
@@ -431,6 +428,9 @@ impl Volumes for SimVolumes {
         token: None,
       },
       stream: handed,
+      // The simulator holds no channel a successor could resync the stream over: a consumer handles none, as it does on
+      // the platforms whose daemon hands none (A-316).
+      resync: None,
     })
   }
 
@@ -455,11 +455,12 @@ impl Volumes for SimVolumes {
     })
   }
 
-  fn unmount(&mut self, path: &str) -> Result<(), Error> {
+  fn unmount(&mut self, path: &str) -> Result<Unmounted, Error> {
     self
       .attachments
       .retain(|_, attachment| !matches!(&attachment.held, Held::Mount { path: at } if at == path));
-    Ok(())
+    // The simulator asks no volume's status for its mounts, so none goes unasked.
+    Ok(Unmounted::default())
   }
 
   fn detach(&mut self, attachment: u64) -> Result<(), Error> {

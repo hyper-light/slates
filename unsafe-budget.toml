@@ -222,8 +222,8 @@
 #   by BLAKE3.
 
 [budget]
-slates-machine = 74
-# 2026-11-18 (+2, A-336, Windows only): the host's memory stall (`memory_stall.rs`), Windows' low-memory resource
+slates-machine = 81
+# 2026-11-18 (+2, A-336, Windows only; 79 -> 81): the host's memory stall (`memory_stall.rs`), Windows' low-memory resource
 #   notification: `CreateMemoryResourceNotification` once a process and `QueryMemoryResourceNotification` at each look
 #   that suspects a shard, Win32 FFI with no safe wrapper. The watchdog and the anchor tell a shard waiting on memory
 #   from a wedged one by it; Linux reads `/proc/pressure/memory` and macOS a sysctl through the existing helper (none).
@@ -237,6 +237,10 @@ slates-machine = 74
 #   (PROC_PIDTHREADINFO)` (the thread record built field by field, not zeroed); on Windows `CreateToolhelp32Snapshot`,
 #   `Thread32First`, `Thread32Next`, `OpenThread` with the limited query right and `GetThreadTimes`. Linux reads `/proc`
 #   (none). None has a safe wrapper.
+# 2026-11-06 (+7, A-223, compiled only for Windows): the wake probe confirms its waiter asleep by its cycle count
+#   (`wake.rs`, `platform::Watch`): `GetCurrentThreadId`, `OpenThread` with query rights, `QueryThreadCycleTime` and
+#   the handle's `CloseHandle`; and a thread reads its own context switches (`switches.rs`): `EnableThreadProfiling`,
+#   `ReadThreadProfilingData` and `DisableThreadProfiling`. None has a safe wrapper.
 # 2026-11-07 (+2, compiled only for Linux): the process clock reads the whole process's CPU-time clock,
 #   `clock_getcpuclockid` and `clock_gettime`; `/proc/<pid>/schedstat`, which it read before, is the main thread's alone.
 #   Neither call has a safe wrapper in rustix.
