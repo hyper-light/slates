@@ -121,8 +121,9 @@ Op 70 WorkSubmitPending
 Op 71 WorkSubmitSettled
 Op 72 WorkFloorDropped
 Op 73 VolumeSignersSet
-Op 74 VolumeReleased
-Op 75 BaseCaptured
+Op 74 VolumeRelinquished
+Op 75 VolumeReleased
+Op 76 BaseCaptured
 PlacementState 0 Local
 PlacementState 1 Placed
 Principal 0 Uid

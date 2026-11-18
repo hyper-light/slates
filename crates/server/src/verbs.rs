@@ -4299,6 +4299,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::Volume { .. } => "volume",
     Refusal::Database { .. } => "database",
     Refusal::Target { .. } => "target",
+    Refusal::DurabilityPending { .. } => "durability_pending",
     Refusal::MoveRefused { .. } => "move_refused",
     Refusal::ImageRefused { .. } => "image_refused",
     Refusal::NotRootLeader => "not_root_leader",
@@ -10933,7 +10934,8 @@ fn teardown_started(
   true
 }
 
-/// One cooperative destroy slice per destroying volume; a finished one leaves the tables.
+/// One cooperative destroy slice per destroying volume and per stale copy relinquished to a re-adoption (A-362); a
+/// finished one leaves the tables.
 pub fn step_destroys(state: &mut ShardState) -> bool {
   let budget = state
     .config
@@ -10941,6 +10943,7 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
     .saturating_mul(DESTROY_SLICE_PERMILLE)
     / PERMILLE;
   let releasing = step_releases(state, budget.max(1));
+  let mut any = step_relinquished(state, budget);
   let destroying: Vec<(DbVolumeId, Handle<VolumeSlot>)> = state
     .by_id
     .iter()
@@ -10953,7 +10956,6 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
     })
     .map(|(id, h)| (*id, *h))
     .collect();
-  let mut any = false;
   for (id, handle) in destroying {
     // A volume whose guest devices still serve it waits for their ends (the round keeps running meanwhile).
     if !teardown_started(state, handle, id) {
@@ -11048,6 +11050,25 @@ fn step_releases(state: &mut ShardState, budget: u64) -> bool {
 /// A volume's pin on its origin's snapshot, by the origin volume and the snapshot, or none (§4.5): a clone's origin, or
 /// the snapshot an image volume was built from (A-160).
 pub(crate) type OriginPin = Option<(DbVolumeId, DbSnapshotId)>;
+/// One destroy slice of each stale copy relinquished to a re-adoption ([`relinquish_superseded`], A-362), within `budget`
+/// each; a finished one gives its credits back and leaves. Whether any has more to tear down.
+fn step_relinquished(state: &mut ShardState, budget: u64) -> bool {
+  let mut any = false;
+  for mut slot in std::mem::take(&mut state.relinquished) {
+    let done = matches!(
+      slot.volume.destroy_step(&mut state.store, budget.max(1)),
+      Ok(DestroyProgress::Done) | Err(_)
+    );
+    if done {
+      release_slot_credits(state, &slot);
+      state.count(TAKEOVER_RELINQUISHED_FREED, 1);
+    } else {
+      any = true;
+      state.relinquished.push(slot);
+    }
+  }
+  any
+}
 
 /// The origin snapshot volume `id` pins, captured before its record goes so the pin can be given back once its destroy
 /// is recorded (§4.5): a clone's origin, or the snapshot an image volume was built from (A-160).
@@ -11840,6 +11861,72 @@ pub(crate) struct TakenOver<'a> {
   pub takeover: slates_db::catalog::TakeoverRecord,
 }
 
+/// Counter: a stale copy this node relinquished to a takeover that named it again (A-362, [`relinquish_superseded`]).
+/// Format: a counter name in the daemon's status report.
+const TAKEOVER_RELINQUISHED: &str = "fleet.takeover.relinquished";
+/// Counter: a relinquished copy's slot torn down by the reaper's slices and its credits given back (A-362).
+/// Format: a counter name in the daemon's status report.
+const TAKEOVER_RELINQUISHED_FREED: &str = "fleet.takeover.relinquished_freed";
+/// Counter: a relinquish whose shard image could not be published without the stale copy (A-362): the materialization
+/// is tried again next period, and finds the volume gone, so it makes it from the adopted state.
+/// Format: a counter name in the daemon's status report.
+const TAKEOVER_RELINQUISH_UNPUBLISHED: &str = "fleet.takeover.relinquish_unpublished";
+
+/// Relinquishes this node's stale copy of volume `id` to a takeover that names this node again (A-362; §4.8 "Promotion
+/// and takeover"). The copy was lost to a successor ([`lost_to_a_successor`]: its log fenced at a later epoch, A-338, or
+/// yielded at this host's re-admission, A-334), so the state the takeover adopted, which the successor's acknowledged
+/// writes passed, replaces it. Its attachments end; its record goes with no tombstone and no key erased
+/// (`Op::VolumeRelinquished`); its guest devices, streams and snapshot views end; its slot leaves the tables for the
+/// reaper to tear down a slice at a time ([`ShardState::relinquished`], [`step_destroys`]); its shipper and the fence it
+/// kept are forgotten, and it is yielded no more; and the shard's image is published without it before the adopted state
+/// is made under its id. So a restart in between rebuilds nothing stale: the old image with no record is torn down as an
+/// orphan, and the new record with no image is answered not recovered, typed. Counted [`TAKEOVER_RELINQUISHED`]. Until
+/// 2026-11-18 the takeover found the id present and kept the stale copy, served nowhere at the new epoch (A-334's owed
+/// re-adoption; the chaos nemesis, seed 6876545201569229162, after A-349).
+fn relinquish_superseded(state: &mut ShardState, id: DbVolumeId) -> Result<(), Box<ReplyBody>> {
+  let attachments: Vec<AttachmentRecord> = state
+    .db
+    .partition()
+    .attachments_of(id)
+    .into_iter()
+    .cloned()
+    .collect();
+  for attachment in &attachments {
+    end_attachment(state, attachment, Ending::Otherwise)
+      .map_err(|e| Box::new(refused(refusal_of_db(&e))))?;
+  }
+  let origin_pin = origin_pin_of(state, id);
+  let now = state.clock.monotonic_ns();
+  state
+    .db
+    .mutate(&mut state.segment, &Op::VolumeRelinquished { id }, now)
+    .map_err(|e| Box::new(refused(refusal_of_db(&e))))?;
+  release_origin_pin(state, origin_pin);
+  #[cfg(unix)]
+  let _devices = crate::virtiofs::revoke_volume_devices(state, id);
+  let _streams = crate::shards::end_volume_streams(state, id);
+  crate::snapshot_view::end_all_of(state, id);
+  if let Some(handle) = state.by_id.remove(&id)
+    && let Ok(mut slot) = state.volumes.remove(handle)
+  {
+    if let Err(e) = slot.volume.destroy(&mut state.store) {
+      state.count(refusal_name(&refusal_of_vfs(&e)), 1);
+    }
+    state.relinquished.push(slot);
+  }
+  crate::live_ship::forget(state, id);
+  state.yielded.remove(&id);
+  state.unrecovered.remove(&id);
+  state.count(TAKEOVER_RELINQUISHED, 1);
+  match publish_shard(state) {
+    Ok(_) => Ok(()),
+    Err(e) => {
+      state.count(TAKEOVER_RELINQUISH_UNPUBLISHED, 1);
+      Err(Box::new(refused(refusal_of_vfs(&e))))
+    }
+  }
+}
+
 pub(crate) fn materialize_taken_over(
   state: &mut ShardState,
   id: DbVolumeId,
@@ -11851,9 +11938,18 @@ pub(crate) fn materialize_taken_over(
   if state.by_id.contains_key(&id) {
     // A copy this node froze for a move it made (A-291) is superseded by what its takeover adopted: the member it moved
     // the volume to died, this node is its successor, and that member may have taken writes since. The frozen copy goes
-    // first, so the adopted state is what serves.
-    if !crate::moves::supersede_frozen(state, id) {
+    // first, so the adopted state is what serves (the fleet's materialization let it go already, before the volume's
+    // keys were adopted: `fleet::let_frozen_go`). A copy this takeover made already (a retry after its publication was
+    // refused) is kept. This node's own copy lost to a successor whose takeover now names this node again is replaced by
+    // the state the takeover adopted (A-362).
+    if state.moves_out.contains_key(&id) {
+      if !crate::moves::supersede_frozen(state, id) {
+        return Ok(());
+      }
+    } else if !lost_to_a_successor(state, id) {
       return Ok(());
+    } else {
+      relinquish_superseded(state, id)?;
     }
   }
   if let Some(existing) = state.db.partition().volume_by_name(&catalog.name) {
@@ -13142,15 +13238,16 @@ pub(crate) async fn rebuild_recovered(
     nfs_states,
   } = recover_images(state);
   restore_nfs_answers(state, calls, nfs_replies);
-  // The barrier replies the dead daemon published and never delivered, for the mounts the anchor held (A-61).
-  #[cfg(target_os = "linux")]
+  // The barrier replies the dead daemon published and never delivered, for the mounts (Linux) and streams (A-316,
+  // A-339) the anchor held (A-61).
+  #[cfg(unix)]
   {
     state.recovered_replies = replies
       .into_iter()
       .map(|reply| (reply.attachment, (reply.unique, reply.reply)))
       .collect();
   }
-  #[cfg(not(target_os = "linux"))]
+  #[cfg(windows)]
   drop(replies);
   let mut rebuilt = Rebuilt::default();
   // Every block the images name is claimed before anything else allocates in the arena (A-64): the held
@@ -13171,13 +13268,17 @@ pub(crate) async fn rebuild_recovered(
   .await;
   rebuilt.blocks_swept = sweep_claims(state, claims);
   slices.unit_done().await;
-  // The FUSE writes acknowledged after the last publication, back on top of the rebuilt volumes (A-63).
+  // The writable copies the anchor held are taken back first, so every write the replay applies is written into them
+  // by the volume's write boundary (A-197).
   #[cfg(target_os = "linux")]
   {
-    // The writable copies the anchor held are taken back first, so every write the replay applies is written into them
-    // by the volume's write boundary (A-197).
     rebuilt.copies_adopted = crate::held_copy::adopt_inherited(state);
     slices.unit_done().await;
+  }
+  // The writes acknowledged after the last publication, a FUSE mount's (Linux) and a Shards stream's (Linux, macOS;
+  // A-316, A-339), back on top of the rebuilt volumes (A-63).
+  #[cfg(unix)]
+  {
     rebuilt.writes_replayed = replay_writes(state, slices).await;
   }
   // Hand out prefixes past every recovered one, so a new volume never collides with a recovered
@@ -14394,9 +14495,9 @@ fn held_nfs_replies_changed(state: &ShardState) -> bool {
 
 /// The barrier replies not yet delivered, which ride with the effects they answer (A-61).
 fn pending_replies(state: &ShardState) -> Vec<slates_vfs::recover::HeldReply> {
-  #[cfg(target_os = "linux")]
+  #[cfg(unix)]
   return state.pending_replies.values().cloned().collect();
-  #[cfg(not(target_os = "linux"))]
+  #[cfg(windows)]
   {
     let _ = state;
     Vec::new()
@@ -14478,7 +14579,7 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
   call_records_published(state);
   // Every volume captured: this image holds every logged write, so the write log empties, stamped with this
   // generation (A-63). A volume skipped keeps the log, so its writes stay replayable.
-  #[cfg(target_os = "linux")]
+  #[cfg(unix)]
   clear_write_log(
     state,
     published.skipped.is_empty(),
@@ -14744,7 +14845,7 @@ fn publish_delta_into(
   crate::content_holder::held_committed(state, held.whole, false);
   crate::live_ship::owned_committed(state, held.owned, false);
   call_records_published(state);
-  #[cfg(target_os = "linux")]
+  #[cfg(unix)]
   clear_write_log(
     state,
     published.skipped.is_empty(),
@@ -15232,13 +15333,13 @@ const TAKEOVER_KEPT_UNRELEASED: &str = "recovery.takeover_kept_unreleased";
 const REVOKED_MOUNTS_OVERDUE: &str = "fuse.revoked_overdue";
 
 /// Format: the refusal counter of a write-log span the content object refused (A-63): that write is not logged.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub(crate) const WRITE_LOG_UNWRITTEN: &str = "recovery.write_log_unwritten";
 
 /// Empties the shard's FUSE write log after a publication that captured every volume (A-63), stamped with that
 /// publication's generation: every write before it is in that image now. A volume skipped keeps the log, so its
 /// writes stay owed to the next daemon.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn clear_write_log(state: &mut ShardState, captured_every_volume: bool, generation: u64) {
   if !captured_every_volume {
     return;
@@ -15263,7 +15364,7 @@ fn clear_write_log(state: &mut ShardState, captured_every_volume: bool, generati
 /// place among the writes (GAPS, A-154's sibling): the kernel never resends one, so without it the references a dead
 /// daemon was given back after its last publication stayed counted, and an unlinked file the kernel had let go was
 /// never reclaimed.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 async fn replay_writes(
   state: &mut ShardState,
   slices: &mut crate::recovery_slices::RecoverySlices,
@@ -15298,7 +15399,7 @@ async fn replay_writes(
 }
 
 /// The slot of the volume a record names, when recovery rebuilt it.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn slot_of_volume(
   state: &ShardState,
   volume: [u8; 16],
@@ -15308,7 +15409,7 @@ fn slot_of_volume(
 
 /// Gives back one logged `FORGET`'s lookups, as its attachment's own, in the volume its record names; `None` when
 /// recovery did not rebuild that volume.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn replay_forget(
   state: &mut ShardState,
   forgotten: crate::write_log::Forgotten,
@@ -15325,7 +15426,7 @@ fn replay_forget(
 
 /// Writes one logged record into the volume it was written through, which the record names; `None` when recovery did
 /// not rebuild that volume.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn replay_one(
   state: &mut ShardState,
   record: &crate::write_log::Record,
@@ -15346,7 +15447,7 @@ fn replay_one(
 /// Empties the write log under the committed image's generation and appends `remaining` to it, so the records a
 /// replay has not yet applied survive a crash before it ends. A record the log cannot take marks it overflowed
 /// (A-63: the next daemon reports every taken-over file as having lost writes).
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn relog_remaining(state: &mut ShardState, remaining: &[crate::write_log::Logged]) {
   let generation = state.journal.generation();
   let (Some(object), Some(log)) = (state.content.as_mut(), state.write_log.as_mut()) else {
@@ -15374,12 +15475,12 @@ fn relog_remaining(state: &mut ShardState, remaining: &[crate::write_log::Logged
 }
 
 /// Format: the refusal counter of a logged write recovery could not replay (A-63).
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const WRITE_REPLAY_REFUSED: &str = "recovery.write_replay_refused";
 
 /// Format: the refusal counter of a logged `FORGET` recovery could not give back (no rebuilt volume holds its inode,
 /// or the volume refused it).
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const FORGET_REPLAY_REFUSED: &str = "recovery.forget_replay_refused";
 
 /// Format: the refusal counter of a volume whose recovered references could not be settled.
@@ -15471,8 +15572,8 @@ fn reconcile_lost(state: &mut ShardState, record: &VolumeRecord) -> (usize, usiz
         return false;
       }
       // A Shards stream whose resync end the anchor held is kept, and served again on a fresh stream its device is handed
-      // over that end (A-316); any other dies with the process, as before.
-      #[cfg(target_os = "linux")]
+      // over that end (A-316; macOS too, A-339); any other dies with the process, as before.
+      #[cfg(unix)]
       if matches!(a.form, AttachForm::ShardsFs { .. })
         && let Some(at) = state
           .inherited_fuse
@@ -15747,8 +15848,9 @@ mod tests {
   /// shard, a volume whose file "f" holds "origin", snapshotted and cloned; replay a logged write of "clone!" at offset 0
   /// of the clone's "f", through the clone, as the successor of a daemon that served it would. Expect: the clone's "f"
   /// reads "clone!" and the origin's still "origin", the inode carrying the origin's prefix (non-vacuous). Before, the
-  /// write went to the origin, the clone kept "origin" and lost its write.
-  #[cfg(target_os = "linux")]
+  /// write went to the origin, the clone kept "origin" and lost its write. Every Unix: macOS replays a Shards stream's
+  /// logged writes too (A-339).
+  #[cfg(unix)]
   #[test]
   fn a_replayed_write_to_a_clones_inherited_file_lands_in_the_clone() {
     let (origin_reads, clone_reads, inherited_prefix, origin_prefix) =
@@ -16836,6 +16938,29 @@ mod tests {
     archive: &slates_archive::Archive,
     past_tolerance: Option<slates_db::catalog::TakeoverPastTolerance>,
   ) -> Result<(), Box<super::ReplyBody>> {
+    take_over_at(
+      state,
+      id,
+      catalog,
+      archive,
+      slates_db::catalog::TakeoverRecord {
+        epoch: 1,
+        head_sequence: 1,
+        from_live_log: false,
+        past_tolerance,
+      },
+    )
+  }
+
+  /// [`take_over`] as the takeover `takeover` records it: its epoch and head sequence (the adopted head's), served from a
+  /// seal or a live log, past tolerance or within it.
+  fn take_over_at(
+    state: &mut crate::state::ShardState,
+    id: slates_db::catalog::VolumeId,
+    catalog: &crate::catalog::CatalogValue,
+    archive: &slates_archive::Archive,
+    takeover: slates_db::catalog::TakeoverRecord,
+  ) -> Result<(), Box<super::ReplyBody>> {
     let head = crate::head::HeadValue {
       manifest: None,
       content_holders: Vec::new(),
@@ -16845,15 +16970,99 @@ mod tests {
       head: &head,
       catalog,
       catalog_sequence: 0,
-      sequence: 1,
-      takeover: slates_db::catalog::TakeoverRecord {
-        epoch: 1,
-        head_sequence: 1,
-        from_live_log: false,
-        past_tolerance,
-      },
+      sequence: takeover.head_sequence,
+      takeover,
     };
     super::materialize_taken_over(state, id, &taken, Vec::new(), Some(archive))
+  }
+
+  /// The bytes of the file `f` a [`takeover_archive`] names, read from volume `id` on this shard.
+  fn read_f(state: &crate::state::ShardState, id: slates_db::catalog::VolumeId) -> Vec<u8> {
+    let slot = state.volumes.get(*state.by_id.get(&id).unwrap()).unwrap();
+    let inode = slot.volume.resolve(&state.store, "f").unwrap().inode;
+    let size = slot.volume.stat(&state.store, inode).unwrap().size;
+    let mut bytes = vec![0u8; usize::try_from(size).unwrap()];
+    let read = slot
+      .volume
+      .read(&state.store, inode, 0, &mut bytes)
+      .unwrap();
+    bytes.truncate(read);
+    bytes
+  }
+
+  /// A-362 (§4.8 "Promotion and takeover", A-334; the chaos nemesis, seed 6876545201569229162): a takeover that names a
+  /// node holding its own superseded copy of the volume serves the state it adopted, not that copy. Do: take a volume over
+  /// from an archive holding `OLD!` (this node's copy, as it held it when it owned the volume); mark it yielded, as this
+  /// host's re-admission under its id marks every volume it catalogued (A-334); then take it over again from an archive
+  /// holding `NEW!` at a later epoch and head (the state its successor's acknowledged writes left), as a takeover that
+  /// names this node again does; then let the reaper step its destroys. Expect the file to read `NEW!`, the volume no
+  /// longer lost to a successor (its verbs run here), its record naming the later takeover, the stale copy counted
+  /// relinquished, and its slot torn down and counted freed. Before, the second takeover found the id present and kept the
+  /// stale copy: the file read `OLD!`, and every verb on the volume was still sent away from its new owner.
+  #[test]
+  fn a_takeover_that_names_this_node_again_replaces_its_superseded_copy() {
+    crate::daemon::audit_on_shard(|state| {
+      let archive_of = |bytes: &[u8]| {
+        let chunk = slates_archive::Archive::raw_chunk(bytes.to_vec());
+        takeover_archive(
+          vec![slates_archive::Extent {
+            offset: 0,
+            len: 4,
+            chunk: chunk.identity,
+            chunk_offset: 0,
+          }],
+          vec![chunk],
+        )
+      };
+      let id = slates_db::catalog::VolumeId { bytes: [0x81; 16] };
+      let catalog = takeover_catalog("readopted", 1 << 20);
+      take_over(state, id, &catalog, &archive_of(b"OLD!")).unwrap();
+      assert_eq!(read_f(state, id), b"OLD!", "this node's own copy");
+      state.yielded.insert(id);
+      assert!(
+        super::lost_to_a_successor(state, id),
+        "the copy is lost to a successor"
+      );
+      let later = slates_db::catalog::TakeoverRecord {
+        epoch: 3,
+        head_sequence: 9,
+        from_live_log: false,
+        past_tolerance: None,
+      };
+      take_over_at(state, id, &catalog, &archive_of(b"NEW!"), later).unwrap();
+      let count = |state: &crate::state::ShardState, name: &str| {
+        state.refusals.get(name).copied().unwrap_or(0)
+      };
+      // Shape: destroy slices enough for a four-byte volume's teardown, many times over.
+      const STEPS: usize = 64;
+      for _ in 0..STEPS {
+        if !super::step_destroys(state) {
+          break;
+        }
+      }
+      assert_eq!(read_f(state, id), b"NEW!", "the adopted state is served");
+      assert!(
+        !super::lost_to_a_successor(state, id),
+        "its verbs run here, its new owner"
+      );
+      assert_eq!(
+        state
+          .db
+          .partition()
+          .volume(id)
+          .and_then(|record| record.taken_over),
+        Some(later),
+        "its record names the later takeover"
+      );
+      assert_eq!(
+        (
+          count(state, "fleet.takeover.relinquished"),
+          count(state, "fleet.takeover.relinquished_freed")
+        ),
+        (1, 1),
+        "the stale copy relinquished once and its slot torn down"
+      );
+    });
   }
 
   /// A-332 (A-309, AC-8.3; §4.10 "Auto-seal"): a takeover past the volume's tolerance shows in the volume's loss report.

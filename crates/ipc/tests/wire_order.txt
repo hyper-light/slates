@@ -222,7 +222,8 @@ Refusal 67 SignatureRequired
 Refusal 68 Volume
 Refusal 69 Database
 Refusal 70 Target
-Refusal 71 MoveRefused
+Refusal 71 DurabilityPending
+Refusal 72 MoveRefused
 ReplyBody 0 Created
 ReplyBody 1 Snapshotted
 ReplyBody 2 SnapshotDestroyed

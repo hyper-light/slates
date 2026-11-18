@@ -3752,6 +3752,19 @@ pub enum Refusal {
     /// Why, typed.
     refusal: TargetRefusal,
   },
+  /// The verb ran and its effects are committed on its owner, but they were not held where its reply waits for them
+  /// (a live-shipped volume's log on the owner and `f` candidates, A-200; a destroy's tombstone placed at `f + 1`,
+  /// AUD-29-43) within the failover SLO from the hold: the total bound of the rule every transport judges a held reply
+  /// by (`slates_bridge_core::durable_bound`), the operator's bound on how long an object may go unserved before a
+  /// takeover serves it, past which a write not yet held is past what the fleet promises (A-354). Through a shorter
+  /// silence the reply still waits, never a false success. The verb's effects stay committed on the owner and nothing
+  /// claims them durable; this is the request's recorded outcome (§4.9), so a retry under the same id meets it, and the
+  /// verb runs again only under a new id. Until 2026-11-18 such a reply was held for good when what it waited for could
+  /// not happen. Appended.
+  DurabilityPending {
+    /// How long the reply was held before it was told this, nanoseconds.
+    held_ns: u64,
+  },
   /// A planned move of a volume to another fleet member (`Move`, §4.10 "Ownership follows the writer", A-291) was
   /// refused, for a reason a caller can act on by its kind. Nothing moved, and the volume is served where it was.
   /// Appended.
