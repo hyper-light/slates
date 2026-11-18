@@ -3049,3 +3049,41 @@ mod tests;
 #[cfg(test)]
 #[path = "../tests/support/transact.rs"]
 mod transact_bench;
+
+#[cfg(test)]
+mod channel {
+  //! The mount's request channel against the receive worker's most outstanding requests (audit step 7, cut (c) and its
+  //! no-wake variant, goal g258).
+  #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+  use super::*;
+  use std::time::Duration;
+
+  /// Shape: a wait no post to a channel with room outlasts; a post still waiting past it is one waiting for the shard.
+  const LONG: Duration = Duration::from_secs(10);
+
+  /// A-274, goal g258. Do: post an open's confirmation, then the receive worker's next request, with the mount's task
+  /// taking neither. Expect: the second post returns at once: the worker never waits for the shard to take a
+  /// confirmation it posted without waiting for. Red with a channel of one request: the post waited until the test
+  /// drained the channel, as the worker's did for the shard to wake (and for good when the post woke nothing: the
+  /// no-wake variant stalled both runners' first run, diag-g258-1, run 44271751211).
+  #[test]
+  fn the_next_request_is_posted_while_a_confirmation_waits_untaken() {
+    let (requests, mount) = sync_channel::<Request>(REQUEST_BOUND);
+    let _confirming = post_confirm(&requests, Waker::noop(), 1).unwrap();
+    let (done, finished) = sync_channel::<bool>(1);
+    std::thread::scope(|scope| {
+      scope.spawn(|| {
+        let posted = post(&requests, Op::VolumeInfo).is_some();
+        done.send(posted).unwrap();
+      });
+      let posted = finished.recv_timeout(LONG);
+      // A post still waiting for room is released before the scope joins it, so a red run fails rather than hangs.
+      while mount.try_recv().is_ok() {}
+      assert_eq!(
+        posted,
+        Ok(true),
+        "the next request waited for the shard to take the confirmation"
+      );
+    });
+  }
+}
