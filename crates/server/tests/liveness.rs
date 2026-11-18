@@ -805,20 +805,49 @@ fn an_observation_of_a_starved_shard_is_answered() {
     wait(SAMPLE);
   }
   let spinners = settled_spinners(on_cpu.load(Ordering::Acquire), running);
+  let holder = slates_rt::registry::holder_of(other.0).unwrap();
+  eprintln!(
+    "G243 test: spinners settled at {} on cpu {}; shard {holder:?} raw {:?}",
+    slates_rt::registry::g243_unix_ms(),
+    on_cpu.load(Ordering::Acquire),
+    slates_rt::registry::diag_shard_raw_state(holder)
+  );
   let budget_ns = u64::try_from(WINDOW.as_nanos()).unwrap();
   let observation = daemon
     .observation(Some(other), budget_ns, |_: &mut ShardState| 42u32)
     .unwrap();
   let asked = Instant::now();
-  let answer = std::thread::spawn(move || observation.wait());
-  let holder = slates_rt::registry::holder_of(other.0).unwrap();
+  eprintln!("G243 test: asked at {}", slates_rt::registry::g243_unix_ms());
+  let answer = std::thread::spawn(move || {
+    let answered = observation.wait();
+    eprintln!(
+      "G243 test: the observation ended at {}: {answered:?}",
+      slates_rt::registry::g243_unix_ms()
+    );
+    answered
+  });
   let flat_enough = WINDOW * 2 + BEAT * 3;
-  let Starving { longest_flat, .. } = watch_starving(&daemon, holder, flat_enough, WINDOW * 10);
+  let Starving {
+    longest_flat,
+    largest_gap,
+    scheduler,
+  } = watch_starving(&daemon, holder, flat_enough, WINDOW * 10);
+  eprintln!(
+    "G243 test: watch ended at {}: flat {longest_flat:?}, beat gap {largest_gap:?}; scheduler runnable {} blocked {} \
+     unread {}; raw now {:?}",
+    slates_rt::registry::g243_unix_ms(),
+    scheduler.runnable,
+    scheduler.blocked,
+    scheduler.unread,
+    slates_rt::registry::diag_shard_raw_state(holder)
+  );
   running.store(false, Ordering::Relaxed);
   for spinner in spinners {
     spinner.join().unwrap();
   }
+  eprintln!("G243 test: spinners joined at {}", slates_rt::registry::g243_unix_ms());
   worker.join().unwrap();
+  eprintln!("G243 test: starving poll joined at {}", slates_rt::registry::g243_unix_ms());
   let answered = answer.join().unwrap();
   println!(
     "observation of a starved shard: its CPU clock stood still for {longest_flat:?} at most; answered {answered:?} \

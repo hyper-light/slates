@@ -725,6 +725,25 @@ pub fn shard_run_readings(holders: &[SlotHolder]) -> Vec<Option<crate::thread_cl
     .collect()
 }
 
+/// G243 diagnostics only: the shard's recorded clock handle and its thread's raw Windows `ThreadState` and
+/// `WaitReason` now (`None` off Windows).
+pub fn diag_shard_raw_state(holder: SlotHolder) -> (u64, Option<(u32, u32)>) {
+  let handle = with_entry(holder.shard, |entry| {
+    (entry.holder() == holder).then(|| entry.cpu_clock.load(Ordering::Acquire))
+  })
+  .flatten()
+  .unwrap_or(0);
+  (
+    handle,
+    crate::thread_clock::diag_raw_states(&[handle]).pop().flatten(),
+  )
+}
+
+/// G243 diagnostics only: wall milliseconds since the Unix epoch.
+pub fn g243_unix_ms() -> u128 {
+  crate::thread_clock::g243_unix_ms()
+}
+
 /// The scheduler state of the shard `holder` names at this instant ([`shard_run_readings`]).
 pub fn shard_run_state(holder: SlotHolder) -> Option<crate::thread_clock::RunState> {
   shard_run_readings(&[holder])

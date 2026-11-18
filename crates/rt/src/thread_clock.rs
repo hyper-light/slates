@@ -294,12 +294,74 @@ fn system_snapshot() -> Option<Vec<u8>> {
       return Some(buffer);
     }
     if status != LENGTH_MISMATCH {
+      eprintln!(
+        "G243 snapshot status {status:#x} at length {length} needed {needed} at {}",
+        g243_unix_ms()
+      );
       return None;
     }
+    eprintln!(
+      "G243 snapshot length mismatch at length {length} needed {needed} at {}",
+      g243_unix_ms()
+    );
     let needed = usize::try_from(needed).ok()?;
     buffer.resize(needed.checked_add(needed / ROOM_DIVISOR)?, 0);
   }
+  eprintln!("G243 snapshot gave up after {TRIES} tries at {}", g243_unix_ms());
   None
+}
+
+/// G243 diagnostics only: wall milliseconds since the Unix epoch, for lining up lines across threads and processes.
+pub fn g243_unix_ms() -> u128 {
+  std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .map_or(0, |since| since.as_millis())
+}
+
+/// G243 diagnostics only: the raw `ThreadState` and `WaitReason` of each thread `handles` name, from one snapshot.
+#[cfg(all(windows, not(miri)))]
+pub fn diag_raw_states(handles: &[u64]) -> Vec<Option<(u32, u32)>> {
+  /// Format: where a thread record holds its `WaitReason`.
+  const WAIT_REASON_AT: usize = 72;
+  let Some(snapshot) = system_snapshot() else {
+    return vec![None; handles.len()];
+  };
+  let process = std::process::id();
+  handles
+    .iter()
+    .map(|handle| {
+      if handle & TAG == 0 {
+        return None;
+      }
+      let thread = u32::try_from(handle & !TAG).ok()?;
+      let mut offset = 0usize;
+      loop {
+        let record = snapshot.get(offset..)?;
+        let next = usize::try_from(u32_at(record, 0)?).ok()?;
+        if u32_at(record, PROCESS_ID_AT)? == process {
+          let threads = usize::try_from(u32_at(record, THREAD_COUNT_AT)?).ok()?;
+          for index in 0..threads {
+            let at = PROCESS_RECORD.checked_add(index.checked_mul(THREAD_RECORD)?)?;
+            let held = record.get(at..at.checked_add(THREAD_RECORD)?)?;
+            if u32_at(held, THREAD_ID_AT)? == thread {
+              return Some((u32_at(held, THREAD_STATE_AT)?, u32_at(held, WAIT_REASON_AT)?));
+            }
+          }
+          return None;
+        }
+        if next == 0 {
+          return None;
+        }
+        offset = offset.checked_add(next)?;
+      }
+    })
+    .collect()
+}
+
+/// G243 diagnostics only: no raw state off Windows.
+#[cfg(not(all(windows, not(miri))))]
+pub fn diag_raw_states(handles: &[u64]) -> Vec<Option<(u32, u32)>> {
+  vec![None; handles.len()]
 }
 
 /// No run state read here, as no clock is.
