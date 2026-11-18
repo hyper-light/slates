@@ -214,7 +214,12 @@ fn unmount_verb(instance: &str, path: &str) -> Result<(), Failure> {
       if !unreported.is_empty() =>
     {
       for volume in &unreported {
-        slates_machine::log_line!("slates: {volume}: its mounts are unknown");
+        slates_machine::log_line!(
+          "slates: volume {} ({}) refused {}: its mounts are unknown",
+          volume.name,
+          slates_api::volume_id_text(volume.volume),
+          volume.refusal
+        );
       }
       Err(failure_of_api(
         slates_api::Error::Mount(slates_api::MountFault::NotMounted { path, unreported }),
@@ -233,18 +238,32 @@ fn unmount_verb(instance: &str, path: &str) -> Result<(), Failure> {
     .map_err(|fault| failure_of_api(slates_api::Error::Mount(fault), instance))
 }
 
-/// A library refusal as the command's failure: the daemon's refusal (exit 1), no daemon (exit 3), or the command's own
-/// (exit 4), as [`failure_of`] maps the client's.
+/// A library refusal as the command's failure: a refusal (exit 1) for every class the daemon or the machine refused
+/// with, no daemon (exit 3), or the command's own (exit 4), as [`failure_of`] maps the client's (A-299's taxonomy).
 fn failure_of_api(error: slates_api::Error, instance: &str) -> Failure {
+  use slates_api::Error as E;
   match error {
-    slates_api::Error::Refused(refusal) => failure_of(ClientError::Refused(refusal), instance),
-    slates_api::Error::Unavailable { cause, .. } | slates_api::Error::Channel(cause) => {
-      failure_of(cause, instance)
-    }
-    slates_api::Error::Mount(
+    E::Unavailable { cause, .. } => Failure::Unavailable {
+      instance: instance.to_owned(),
+      cause: cause.to_string(),
+    },
+    E::Mount(
       fault @ (slates_api::MountFault::Unsupported { .. } | slates_api::MountFault::NoCapability),
     ) => Failure::Refused(fault.to_string()),
-    other => Failure::Failed(other.to_string()),
+    refused @ (E::NotFound(_)
+    | E::AlreadyExists(_)
+    | E::Denied(_)
+    | E::Exhausted(_)
+    | E::Busy(_)
+    | E::Stale(_)
+    | E::Retry { .. }
+    | E::Unsupported(_)
+    | E::Invalid(_)
+    | E::Unusable(_)
+    | E::Elsewhere(_)) => Failure::Refused(refused.to_string()),
+    other @ (E::Host(_) | E::Mount(_) | E::Start(_) | E::Protocol(_)) => {
+      Failure::Failed(other.to_string())
+    }
   }
 }
 

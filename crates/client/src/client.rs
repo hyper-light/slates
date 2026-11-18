@@ -27,7 +27,7 @@ use slates_ipc::protocol::{
   Scope, SizeClass, SnapshotCoverage, SnapshotId, StatusReport, TelemetryReport, VolumeId,
   VolumeSummary, WorkOp, unpack,
 };
-use slates_ipc::protocol::{EntriesCursor, PlannedEntry};
+use slates_ipc::protocol::{EntriesCursor, PlannedEntry, PolicySubject, WritePolicy};
 #[cfg(unix)]
 use slates_ipc::rendezvous::ControlDelivery;
 use slates_ipc::{
@@ -3937,6 +3937,33 @@ impl Client {
     })? {
       ReplyBody::Granted { grant } => Ok(grant),
       _ => Err(ClientError::UnexpectedReply { verb: "grant" }),
+    }
+  }
+
+  /// Sets a write policy (A-285): the launcher's or the harness's act, proven by `proof`, the keyed hash under the
+  /// instance's issuer secret (`slates_server::landing::policy_proof`). Refused `Forbidden` on a consumer-bound
+  /// channel (an agent never sets its own policy) and `GrantIssuerUnverified` without the proof.
+  pub fn set_policy(
+    &mut self,
+    subject: PolicySubject,
+    policy: WritePolicy,
+    proof: [u8; 32],
+  ) -> Result<(), ClientError> {
+    match self.call(&RequestBody::SetPolicy {
+      subject,
+      policy,
+      proof,
+    })? {
+      ReplyBody::PolicySet => Ok(()),
+      _ => Err(ClientError::UnexpectedReply { verb: "set_policy" }),
+    }
+  }
+
+  /// A write policy (A-285): `None` while none is set, which is ask.
+  pub fn policy(&mut self, subject: PolicySubject) -> Result<Option<WritePolicy>, ClientError> {
+    match self.call(&RequestBody::Policy { subject })? {
+      ReplyBody::Policy { policy } => Ok(policy),
+      _ => Err(ClientError::UnexpectedReply { verb: "policy" }),
     }
   }
 
