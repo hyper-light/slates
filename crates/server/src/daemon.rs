@@ -5476,6 +5476,7 @@ async fn control_loop(
                 proven: false,
                 control,
                 revoked: false,
+                consumer_policy: None,
                 owner_route: None,
                 read_ahead: None,
                 read_ahead_pending: 0,

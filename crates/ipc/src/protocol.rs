@@ -884,6 +884,31 @@ pub enum RequestBody {
     /// The filter.
     filter: Filter,
   },
+  /// A `Submit` whose caller's own policy asks (A-285): served as a submit under an ask mode whatever the volumes'
+  /// modes, so the merge is answered `MergeApprovalRequired` (or refused, if a volume forbids it). What an agent's
+  /// channel sends in place of `Submit` when the consumer's merge mode asks; never needed from a client. Appended.
+  SubmitHeld {
+    /// The work volume.
+    work: VolumeId,
+    /// The evidence references (opaque to slates), possibly none.
+    evidence: Vec<[u8; 32]>,
+  },
+  /// An `EditSubmit` whose caller's own policy asks (A-285): the edit applies, and the submit is held as
+  /// `SubmitHeld`'s is. Appended.
+  EditSubmitHeld {
+    /// The work volume.
+    work: VolumeId,
+    /// The file.
+    path: String,
+    /// The offset.
+    at: u64,
+    /// Bytes removed at `at`.
+    delete_len: u64,
+    /// The bytes inserted at `at`.
+    insert: EditBytes,
+    /// The evidence references (opaque to slates), possibly none.
+    evidence: Vec<[u8; 32]>,
+  },
   /// Submits a work whose merge an ask policy held for approval (A-285): the launcher's or the harness's approval of
   /// exactly the increment `identity` names (the identity a `MergeApprovalRequired` reply carried), proven by the keyed
   /// hash under the issuer secret (`slates_server::landing::merge_approval_proof`). The increment is built again and
@@ -1561,6 +1586,8 @@ impl RequestBody {
       | RequestBody::StagePut { work: volume, .. }
       | RequestBody::EditStaged { work: volume, .. }
       | RequestBody::EditSubmit { work: volume, .. }
+      | RequestBody::EditSubmitHeld { work: volume, .. }
+      | RequestBody::SubmitHeld { work: volume, .. }
       | RequestBody::FsWrite { volume, .. }
       | RequestBody::FsWriteStaged { volume, .. }
       | RequestBody::FsRemove { volume, .. }
@@ -1621,6 +1648,8 @@ impl RequestBody {
         | RequestBody::Edit { .. }
         | RequestBody::EditStaged { .. }
         | RequestBody::EditSubmit { .. }
+        | RequestBody::EditSubmitHeld { .. }
+        | RequestBody::SubmitHeld { .. }
         | RequestBody::Declare { .. }
         | RequestBody::Submit { .. }
         | RequestBody::SubmitApproved { .. }

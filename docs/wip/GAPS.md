@@ -108,8 +108,13 @@
 >   replaces, so a captured proof sets nothing once the policy moved (`Refusal::PolicyChanged`);
 >   `launcher_secret.rs` 1 of 1 (red with the launcher secret ignored), `write_policy.rs` 8 of 8 (the replay test red
 >   with the version check removed);
-> - a consumer's own policy, the stricter of consumer and volume governing (refused `Unsupported` today);
-> - the MCP and SDK land verb gated by the policy (the grant kind stays refused there);
+> - **built (2026-11-18):** a consumer's own policy (its record, set on the channel and reaching every shard's bound
+>   slots before the answer, as a revocation does), held on the agent's own shard before routing: forbid refused,
+>   ask turns a landing into a presentation and a merge into a held submit (`SubmitHeld`, `EditSubmitHeld`), bypass
+>   passes to the volume's mode, so the stricter governs; `write_policy.rs` 9 of 9, the consumer test red with the
+>   gate removed;
+> - **built (2026-11-18):** the MCP and SDK land verb follows the policy (it already sent `Land`; its promises now
+>   say so); `assert_materialize_lands_under_a_bypass_policy` over MCP;
 > - signed work: a merge or landing may carry an SSH signature, checked and recorded (verified with its signer,
 >   unsigned, invalid with its reason), and a volume may require signed merges;
 > - the end-to-end proof on adacachy: a bypass agent's landing written at once, an ask agent's after approval, a

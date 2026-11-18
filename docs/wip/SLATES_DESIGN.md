@@ -21404,8 +21404,11 @@ once as every merge did before policies. Built the same day: every launcher-clas
 approval, enroll, revoke) verifies under the daemon's issuer secret or the launcher secret its starter handed the anchor
 (`landing::proven_by_launcher`), so a launcher keeps its authority across its own restarts and the daemon's; and a
 `SetPolicy` names the policy version it replaces (`PolicyRecord.write_version`, covered by the proof), so a captured
-proof sets nothing once the policy has moved (`Refusal::PolicyChanged`). Owed, in order: a consumer's own policy, the
-MCP and SDK land verb gated by the policy, then signed work. The
+proof sets nothing once the policy has moved (`Refusal::PolicyChanged`). Built the same day: a consumer's own policy,
+kept in its record and on every shard's channels bound to it, held on the agent's shard before its request is routed
+(forbid refused; ask turns a landing into `Present` and a merge into `SubmitHeld`/`EditSubmitHeld`; bypass leaves the
+volume's mode to decide), so the stricter of consumer and volume governs; and the MCP and SDK land verbs, which send
+`Land` with no grant, say what the policy does. Owed: signed work. The
 SSH-signature verifier built first (below) stays, for signed work.
 - **The rule (Ada, 2026-11-18).** Merging and landing to disk follow the permission mode the user gave the harness or
   agent that asks. Bypass (Claude Code's `bypassPermissions`, Codex's full access): slates merges and writes, no
