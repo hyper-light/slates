@@ -1635,7 +1635,8 @@ p99 service time); batch bound = latency budget / measured per-item cost; idle s
 max(F, the shard's wake estimate × the idle ratio), where the runtime's own spin-then-park has ratio 1 and no F (the
 2-competitive spin) and the daemon's has §4.7's: F, R9's provisioning floor, and no multiple on any platform (A-223,
 A-361), held open longer for a closed loop's forwards by §4.7's closed-loop hold (`ShardContext::hold_idle_window`,
-A-326; none on macOS, A-387); the
+A-326), which a shard keeps only while the idle turn a request meets, as it learns its own, is shorter than its wake
+estimate (`held_turn`, A-387); the
 step quantum (the I/O harvest cadence, the
 slices of a destroy, an archive or a pre-fault, and the long-step count) = the shard's wake estimate,
 seeded with wake_ns.mean and refined from the shard's own confirmed wakes over about 2^shift of them
@@ -5083,11 +5084,11 @@ service time, rounded to a power of two; `spin_ns` = wake_ns.mean (the client's 
 estimate pricing it (`NO_ESTIMATE_MULTIPLE`; A-223's window rule and A-361, below); idle spin ceiling = the liveness
 budget less one beat, 900 ms (`IDLE_SPIN_CEILING`), which no idle spin passes whatever its window or a hold asks, so
 none reaches the watchdog's spin window (A-361); closed-loop hold = 2F × the least k with
-((S − 1)/S)^k ≤ 1/100, S the shards and 1/100 R9's tail (`config::loop_return_hold`: 700 µs at two shards, 1.2 ms at
+((S − 1)/S)^k ≤ 1/100, S the shards and 1/100 R9's tail (`config::closed_loop_hold`: 700 µs at two shards, 1.2 ms at
 three, 6.7 ms at fifteen), held by a forward for a request that came within F of its shard's last client I/O, and never
-more cycles of 2F than its loop had run before it (`verbs::loop_hold`; A-326, below), where a held shard polls without
-sleeping (Linux, Windows); none on macOS, whose idle spin naps in its driver poll (`config::closed_loop_hold`; A-387,
-below).
+more cycles of 2F than its loop had run before it (`verbs::loop_hold`; A-326, below); kept by the owner only while the
+idle turn a request meets, E[T²]/E[T] over the turns of its own idle spins, is shorter than its wake estimate
+(`slates_rt::held_turn::hold_pays`; A-387, below).
 
 > **Status (2026-11-11, A-223's window rule: the idle window is R9's floor, not a multiple of the estimate).** The
 > window was the shard's live wake estimate × 100. The estimate counts the time a woken shard waits for a CPU, which
@@ -5138,19 +5139,24 @@ below).
 > priority class (kiln's agent job on jupiter) keeps a raised level where it was, so there a parked shard still waits
 > out its neighbours' turns; the window no longer grows with that wait (GAPS).
 
-> **Status (2026-11-18, A-387: macOS holds no shard for a closed loop).** A held macOS shard does not poll: each turn of
-> its idle spin is a zero-timeout `kevent` that sleeps 12–15 µs with an involuntary switch (A-218), so A-326's hold kept
-> every shard a loop went round napping, at a cost the park and kick it saved never repaid. On a quiet M4 Max at its
-> nine derived shards (nine runs an arm, interleaved; BENCHMARKS "The closed-loop hold on macOS") a spinning single
+> **Status (2026-11-18, A-387: an owner keeps a closed loop's hold only while its idle turns poll faster than it
+> wakes).** A-326's hold assumes a held shard polls, seeing the loop's next request as it lands. A macOS shard does
+> not: each turn of its idle spin is a zero-timeout `kevent` that sleeps 12–15 µs with an involuntary switch (A-218),
+> longer than a kicked park's 3–8 µs wake, so the hold kept every shard a loop went round napping. On a quiet M4 Max at
+> its nine derived shards (nine runs an arm, interleaved; BENCHMARKS "The closed-loop hold on macOS") a spinning single
 > client's median create was 51–60 µs held against 41–43 µs unheld at an equal p99 (medians 92.0 and 92.3 µs), the
 > process's involuntary switches 63 against 17 a create and its CPU 2.9 against 1.65 cores; beside two spinners a
 > logical CPU its p99 was 1.87 against 1.34 ms at the median. At three shards the two were even under load and the quiet
 > p99 was 80.8 against 65.6 µs. On the 32-CPU Studio at its 23 shards every unheld run beat every held one: p50
-> 44.7–64.5 against 94.4–115.2 µs, p99 147.6–249.3 against 256.0–376.0 µs, at 1.9–2.2 against 3.4–5.8 cores. So
-> `config::closed_loop_hold` is none on macOS: an owner parks between
-> a loop's returns and is kicked for the next. Linux and Windows, whose held shards poll without sleeping, keep the
-> hold. Test: `crates/server/tests/closed_loop.rs` (on macOS a loop holds no shard and its owners park between its
-> returns).
+> 44.7–64.5 against 94.4–115.2 µs, p99 147.6–249.3 against 256.0–376.0 µs, at 1.9–2.2 against 3.4–5.8 cores. The first
+> form of the fix fixed the hold at none on macOS; the decision is now the shard's own, learned online with no platform
+> named: every turn of every idle spin is timed, the turn a request meets is their length-biased mean, E[T²]/E[T]
+> (`slates_rt::held_turn`), and `hold_idle_window` keeps a hold only while that is shorter than the shard's wake
+> estimate, counting each decline (`Counters::idle_holds_declined`). A macOS shard therefore parks between a loop's
+> returns and is kicked for the next, a Linux or Windows shard holds, and any shard whose polls start to nap or be
+> preempted under load stops holding until they recover. Owed: its A/B against main (the run request of 2026-11-18).
+> Test: `crates/server/tests/closed_loop.rs` (each owner decides by what it measured; the loop's parks follow the
+> decision).
 
 **Worked example.** From Python: `await client.create("scratch", bounded=4 GiB)`: the extension
 writes the slot, spins for `spin_ns`, and returns the reply without ever touching the event loop
@@ -16569,8 +16575,9 @@ round's clock and `judge_loop_request` judges each request, an acknowledgement a
   spinning and paced forms, and the paced form's CPU (GAPS, A-223's entry).
 - **Windows' window** (A-223's open item (C)) was decided by A-361 (2026-11-18): R9's floor there too, and every hold
   under the idle spin's ceiling.
-- **macOS' hold** was removed by A-387 (2026-11-18): a held macOS shard naps in its driver poll rather than polling, so
-  macOS holds none.
+- **The hold's premise** was made the shard's own measurement by A-387 (2026-11-18): an owner keeps a hold only while the
+  idle turn a request meets, as it learns its own, is shorter than its wake estimate, which a macOS shard's napping
+  `kevent` turns are not.
 
 ### A-223's window rule — The idle window is R9's floor; no estimate prices it on Linux and macOS (accepted 2026-11-11, the supervisor's decision A)
 Applied in the same change to: §4.1 (its status and derived constants), §4.3 (derived constants), §4.7 (derived
@@ -28752,42 +28759,59 @@ item closed, install images owed), and the code below.
   first in every run of the test (twice the whole bytes); its trigger is not yet read. A transport's barrier keeps the
   position it read across a dropped build and waits for the log to pass it or its bound.
 
-### A-387 — macOS holds no shard for a closed loop: a held macOS shard naps in its driver poll (2026-11-18, goal g234; amends A-326; the macOS spinning-client regression the measurer found)
+### A-387 — An owner keeps a closed loop's hold only while its idle turns poll faster than it wakes: a held macOS shard naps in its driver poll (2026-11-18, goal g234; amends A-326; the macOS spinning-client regression the measurer found)
 Applied in the same change to: §4.3 (derived constants), §4.7 (derived constants and a status), A-326 (its last line),
-GAPS (A-223's entry), BENCHMARKS ("The closed-loop hold on macOS"), `crates/server/src/config.rs` (`loop_return_hold`,
-the loop's return at R9's percentile, cfg-free and unit-tested on every host; `closed_loop_hold`, paired per platform:
-the return on Linux and Windows, none on macOS), `crates/server/tests/closed_loop.rs` (one scenario, a verdict per
-platform), and `docs/bugs/2026-11-18-a-held-macos-shard-napped-instead-of-polling.md`.
+GAPS (A-223's entry), BENCHMARKS ("The closed-loop hold on macOS"), `crates/rt/src/held_turn.rs` (new: `HeldTurn`, the
+turn a request meets, and `hold_pays`), `crates/rt/src/shard.rs` (every idle turn learned, `hold_idle_window` deciding,
+`Counters::idle_holds_declined`, `held_turn_ns`, `held_turns`), `crates/rt/src/registry.rs` (`Pulse::held_turn_ns`),
+`crates/server` (`config::closed_loop_hold`, the loop's return on every platform; `ShardPulse::held_turn_ns`),
+`provision_bench` (each shard's turn beside its wake), `crates/server/tests/closed_loop.rs` (one verdict, by each
+owner's measurements), and `docs/bugs/2026-11-18-a-held-macos-shard-napped-instead-of-polling.md`.
 - **The defect.** A-326 holds the shards a closed loop goes round for its return, on the premise that a held shard
   polls: it sees the loop's next request as it lands. A macOS shard's idle spin does not poll. Its driver harvest, a
   `kevent` with a zero timeout, sleeps 12–15 µs with an involuntary switch (§4.3 "Loop", A-218), and only a parked shard
   is kicked, so a held macOS shard naps and switches for the whole hold. The measurer's quiet-gated A/B on the 32-CPU
   Studio found the spinning single client's p50 doubled at 23 shards once A-223's rule and A-326 landed (48.5–86.9 to
   97.6–105.8 µs) and its p99 up (200.3–251.3 to 262.1–298.1 µs), the process's CPU about twice.
-- **The A/B** (BENCHMARKS "The closed-loop hold on macOS"; a quiet M4 Max, 14 CPUs, its derived nine shards and three;
-  four arms, three rounds interleaved, nine runs a cell; noise floor, load and memory recorded per invocation). With the
-  hold set to none, at nine shards: median create 41.3–43.3 against main's 51.4–60.0 µs (lower in all 81 pairs of
-  runs), p99 even (medians 92.3 and 92.0 µs), CPU 1.65 against 2.9 cores, involuntary switches 17 against 63 a create;
-  beside two spinners a logical CPU the p99 1.34 against 1.87 ms at the median (lower in 75 of 81 pairs). At three
-  shards the quiet p99 was 65.6 against 80.8 µs and the loaded rows even. The pre-A-223 window with the hold kept read
-  as main, so the window rule is not the cause. The one adverse number: the quiet nine-shard p999, 128.6 against
-  108.6 µs at the median, the spreads overlapping (112.3–445.4 against 102.8–416.2 µs). On the 32-CPU Studio at its 23
-  shards, three rounds interleaved on a shared box (two invocations ran past their quiet bar), every unheld run beat
-  every held one: p50 44.7–64.5 against 94.4–115.2 µs, p99 147.6–249.3 against 256.0–376.0 µs, at 1.9–2.2 against 3.4–5.8
-  cores; neither meets R9's 50 µs there (GAPS).
-- **The rule.** `closed_loop_hold` is none on macOS. A hold pays only while a held shard sees the loop's request sooner
-  than a parked one woken by a kick would (3.1–6.0 µs measured here), and a shard that sleeps 12–15 µs a turn sees it
-  half a nap late on average (6–7.5 µs) besides spending the naps' switches and CPU, so no length of hold is derived
-  there; the true spin that would make one pay stays rejected (A-218: p50 8–17 µs here,
-  at 3.5–10 cores quiet, and its tails lost once the host has no idle core). Linux's epoll and Windows' completion port
-  harvest without sleeping, so they keep A-326's hold. The formula moved to `loop_return_hold`, cfg-free, and the
-  platform's rule is a paired `#[cfg]` function with one signature.
-- **Tests.** `on_macos_a_closed_loop_holds_no_shard_and_its_owners_park_between_its_returns`: the loop's forwards ask no
-  hold of its owners, which park at least once for every return of the loop later than a cycle of R9's closed loop
-  (2F), but R9's tail; the paced cycles hold nothing and the owners park, as on every platform. The client spins for
-  the loop's return on every platform, so its loop is R9's closed loop whatever the daemon holds. On the Mac Studio
-  (d1323898, debug, load 25–31) it failed 2 of 2 with macOS's hold put back to the loop's return (261 and 164 holds
-  asked; `diag-g234-a387-red`) and passed 3 of 3 as built (no hold, the owners parking 416–419 times over the loop's
-  198 returns later than 2F; `diag-g234-a387-green`), with `idle_window` and the eleven `config::tests`; on
-  ubuntu-latest the other platforms' verdict passed 3 of 3 as built (329–394 holds asked of 400 forwards; CI run
-  44367421244).
+- **The A/B of the cause** (BENCHMARKS "The closed-loop hold on macOS"; a quiet M4 Max, 14 CPUs, its derived nine
+  shards and three; four arms, three rounds interleaved, nine runs a cell; noise floor, load and memory recorded per
+  invocation). With the hold set to none, at nine shards: median create 41.3–43.3 against main's 51.4–60.0 µs (lower in
+  all 81 pairs of runs), p99 even (medians 92.3 and 92.0 µs), CPU 1.65 against 2.9 cores, involuntary switches 17
+  against 63 a create; beside two spinners a logical CPU the p99 1.34 against 1.87 ms at the median (lower in 75 of 81
+  pairs). At three shards the quiet p99 was 65.6 against 80.8 µs and the loaded rows even. The pre-A-223 window with
+  the hold kept read as main, so the window rule is not the cause. The one adverse number: the quiet nine-shard p999,
+  128.6 against 108.6 µs at the median, the spreads overlapping (112.3–445.4 against 102.8–416.2 µs). On the 32-CPU
+  Studio at its 23 shards, three rounds interleaved on a shared box (two invocations ran past their quiet bar), every
+  unheld run beat every held one: p50 44.7–64.5 against 94.4–115.2 µs, p99 147.6–249.3 against 256.0–376.0 µs, at
+  1.9–2.2 against 3.4–5.8 cores; neither meets R9's 50 µs there (GAPS).
+- **The first form, replaced the same day.** `closed_loop_hold` was none on macOS and the loop's return elsewhere, a
+  paired `#[cfg]` function (3c872fa74, on main as d8874af10). That fixes a value per platform, which CLAUDE.md §3 and
+  Ada's rule of 2026-11-18 forbid: a decision is derived from what the machine does, and a Linux or Windows box whose
+  polls nap or are preempted under load would have kept holding at a loss.
+- **The rule.** A held shard sees a request at the end of the idle turn it lands in; a parked one once a kick wakes it.
+  So a hold pays while the turn a request meets is shorter than the shard's wake estimate (A-223's, the kicked park the
+  hold would save); a turn as long as the wake declines, since a parked shard then sees the request no later and spends
+  no core waiting. Every turn of every idle spin (the window's and the holds' alike, so the estimate keeps learning
+  while the shard declines) is timed on the shard's clock. A request meets a turn in proportion to its length, so the
+  turn it meets is the length-biased mean, E[T²]/E[T]: a preemption that takes one turn in a hundred to a millisecond
+  leaves the mean turn near its usual length but makes most requests meet the long one. Both moments are a plain mean
+  over the first `2^shift` turns (the shift the wake estimate weights, from the boot probe's spread, so both sides
+  forget at one count; no prior, so an odd first turn counts as one in many), then exponentially weighted means seeded
+  with it. A turn longer than 2^32 − 1 ns counts as that long, the most whose square fits the estimator's 64-bit sample;
+  it already declines any hold. A shard with no turn measured, or tracking no wake estimate, holds as A-326 asks. The
+  forward still carries A-326's hold on every platform (`config::closed_loop_hold`); the owner decides. Measured inputs:
+  a macOS turn 12–15 µs against a 3–8 µs wake (declines), a zero-timeout `epoll_wait` or completion-port poll well
+  under a microsecond against a wake of several (holds). The true spin that would make a macOS hold pay stays rejected
+  (A-218: p50 8–17 µs here, at 3.5–10 cores quiet, and its tails lost once the host has no idle core).
+- **Tests.** `crates/rt/src/held_turn.rs`: the first turn is the estimate and equal turns keep it across the window; a
+  preempted turn is met in proportion to its length (E[T²]/E[T], exact over the plain mean, in either order); a longer
+  turn raises the estimate and a shorter lowers it after the hand-over; the decision at no evidence, a napping turn, a
+  polling turn and a turn exactly a wake long; extreme turns saturate without a panic.
+  `a_closed_loops_owners_hold_only_while_their_idle_turns_poll_faster_than_they_wake`: the loop asks its owners for
+  holds (kept or declined); an owner whose learned turn stayed at least its wake through the loop declined holds, one
+  whose turn stayed shorter kept them, one that crossed is reported; with none kept the owners park for every return
+  later than 2F (R9's tail aside), with holds kept A-326's verdict; the paced cycles ask no hold. The first form's runs
+  on the Mac Studio (debug, load 25–31): with every hold kept (main before A-387) the owners kept 261 and 164 holds and
+  parked 173 and 315 times over 198 returns later than 2F; with no hold asked, 416–419 parks over the same 198; on
+  ubuntu-latest every owner kept holds (329–394 of 400 forwards; CI run 44367421244). Owed: the A/B of this rule against
+  main (provision_bench and the closed loop on the quiet M4 Max and the 23-shard Studio; the run request of 2026-11-18).
