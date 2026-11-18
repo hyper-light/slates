@@ -34,12 +34,67 @@
 //!
 //! **Its history is the owner's.** A replica made from the owner holds every version the owner holds, so it answers a
 //! rebase over any base the owner can (`Outcome::BaseUnavailable` below the owner's own floor, as the owner does), and
-//! folds where the owner folds. Its bounds (step 4) and its use on the shards (step 5) are owed (A-273's "Owed, in
-//! order"). Laptop degenerate (R8): with one shard there is no other shard and no replica.
+//! folds where the owner folds. Laptop degenerate (R8): with one shard there is no other shard and no replica.
+//!
+//! **Bounds (step 4).** Everything a replica adds has a bound its holder derives from the machine and a typed refusal
+//! at it, and every refusal ends with the replica given back ([`Replica::leave`]) and its work going to the owner:
+//! - **Its own memory.** A replica's metadata ([`Green::metadata_bytes`]: its piece lists, change index, IPC history,
+//!   deltas and accepted record, which grow with the versions it holds) is held to the budget its holder gives it, a
+//!   share of its shard's metadata class: refused at its making ([`Unfit::OverBudget`]) and after any message that
+//!   takes it past ([`FeedRefusal::OverBudget`]). The key indexes, one entry a path, are the owner's own bound.
+//! - **The owner's keeping for it.** The owner keeps a released block for its slowest replica; past the bytes its
+//!   holder lets it keep ([`Green::set_replica_held_limit`], from its memory class's headroom), the slowest replica is
+//!   evicted and refuses its next message ([`FeedRefusal::Evicted`]), keeping its frees until it leaves.
+//! - **How many.** The owner takes as many replicas as its holder allows (one a shard that may hold its works):
+//!   past that, [`Green::replica`] is refused ([`ReplicaRefusal::Full`]).
+//! - **One message at a time.** The owner records a message's blocks until it sends it; a change made before the last
+//!   was sent evicts every replica, which could not be fed in order (`slates_mem::sealed`, "Bounds").
+//! - **Its replay.** The blocks a message sealed, queued for adoption, are that message's alone, and its reader's live
+//!   table is the owner's live blocks.
+//!
+//! An idle replica, one no work on its shard has used for its derived idle period, is its holder's to give back, on
+//! the shards (step 5).
 
 use crate::chain_entry::{Applied, Signature};
 use crate::engine::{Green, Increment};
-use slates_mem::sealed::{Changes, Left, Passed};
+use slates_mem::sealed::{Changes, Left, Passed, ReaderRefusal};
+
+/// Why an owner made no replica (A-273 step 4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplicaRefusal {
+  /// The green is itself a replica: it has no blocks of its own to give.
+  NotAnOwner,
+  /// The owner has `limit` replicas already, evicted ones that have not left among them.
+  Full {
+    /// The replicas it has.
+    readers: usize,
+    /// The most it takes.
+    limit: usize,
+  },
+}
+
+/// Why a green cannot be a replica within its budget (A-273 step 4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unfit {
+  /// It is an owner's own green, no replica.
+  NotAReplica,
+  /// Its metadata, `bytes`, is past the `budget` its holder gives it.
+  OverBudget {
+    /// Its metadata's bytes.
+    bytes: usize,
+    /// The budget.
+    budget: usize,
+  },
+}
+
+/// A green that did not become a replica, and its registration for the owner's [`Green::leave_replica`].
+#[derive(Debug)]
+pub struct NotMade {
+  /// Why.
+  pub unfit: Unfit,
+  /// What the owner takes to keep nothing for it.
+  pub left: Option<Left>,
+}
 
 /// One message of a green's feed to its replicas (A-273).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -162,6 +217,17 @@ pub enum FeedRefusal {
     /// The message's position.
     position: u64,
   },
+  /// The owner evicted this replica (step 4): it kept too much for it, or a change went unfed. Nothing changed; the
+  /// holder gives it back, and its work goes to the owner.
+  Evicted,
+  /// The replica's metadata grew past its budget with this message (step 4): it is the owner's green, but too large to
+  /// keep here; the holder gives it back, and its work goes to the owner.
+  OverBudget {
+    /// Its metadata's bytes.
+    bytes: usize,
+    /// The budget.
+    budget: usize,
+  },
 }
 
 /// What a replica did with a feed message it took.
@@ -192,31 +258,34 @@ pub struct Replica {
   refused: u64,
   /// Times its holder rebuilt it from the owner after a refusal.
   rebuilds: u64,
+  /// The bytes of metadata its holder lets it hold (step 4).
+  budget: usize,
 }
 
 impl Replica {
-  /// The replica `green` is: a green its owner made with [`Green::replica`]. `None` for an owner's own green, which is no
-  /// replica.
-  pub fn new(green: Green) -> Option<Replica> {
-    green.is_replica().then(|| Replica {
+  /// The replica `green` is, within `budget` bytes of metadata (step 4): a green its owner made with [`Green::replica`].
+  /// Refused, with its registration for the owner, when it is an owner's own green or already past its budget.
+  pub fn new(green: Green, budget: usize) -> Result<Replica, NotMade> {
+    let green = fit(green, budget)?;
+    Ok(Replica {
       next: green.feed_position(),
       green,
       applied: 0,
       passed_over: 0,
       refused: 0,
       rebuilds: 0,
+      budget,
     })
   }
 
-  /// Rebuilt after a refusal from `fresh`, a green its owner made now ([`Green::replica`]), counted; its counters carry on.
-  /// Returns the old registration for the owner's [`Green::leave_replica`]. `fresh` that is no replica changes nothing.
-  pub fn rebuild(&mut self, fresh: Green) -> Option<Left> {
-    if !fresh.is_replica() {
-      return None;
-    }
+  /// Rebuilt after a refusal from `fresh`, a green its owner made now ([`Green::replica`]), within the same budget,
+  /// counted; its counters carry on. Returns the old registration for the owner's [`Green::leave_replica`]; a `fresh`
+  /// that does not fit is refused with its own, the replica unchanged.
+  pub fn rebuild(&mut self, fresh: Green) -> Result<Option<Left>, NotMade> {
+    let fresh = fit(fresh, self.budget)?;
     self.next = fresh.feed_position();
     self.rebuilds = self.rebuilds.saturating_add(1);
-    std::mem::replace(&mut self.green, fresh).into_left()
+    Ok(std::mem::replace(&mut self.green, fresh).into_left())
   }
 
   /// The replica is done: its registration, for the owner's [`Green::leave_replica`].
@@ -247,8 +316,10 @@ impl Replica {
     let not_the_owners = FeedRefusal::NotTheOwners {
       position: message.position,
     };
-    if !self.green.begin_replay(&message.changes) {
-      return Err(self.refuse(not_the_owners));
+    match self.green.begin_replay(&message.changes) {
+      Ok(()) => {}
+      Err(ReaderRefusal::Evicted) => return Err(self.refuse(FeedRefusal::Evicted)),
+      Err(_) => return Err(self.refuse(not_the_owners)),
     }
     match &message.body {
       FeedBody::Version {
@@ -271,6 +342,13 @@ impl Replica {
     };
     self.next = self.next.saturating_add(1);
     self.applied = self.applied.saturating_add(1);
+    let bytes = self.green.metadata_bytes();
+    if bytes > self.budget {
+      return Err(self.refuse(FeedRefusal::OverBudget {
+        bytes,
+        budget: self.budget,
+      }));
+    }
     Ok(Fed::Applied { passed })
   }
 
@@ -318,6 +396,23 @@ impl Replica {
       rebuilds: self.rebuilds,
     }
   }
+}
+
+/// `green` if it is a replica within `budget` bytes of metadata, else why not, with its registration for the owner.
+fn fit(green: Green, budget: usize) -> Result<Green, NotMade> {
+  let unfit = if !green.is_replica() {
+    Unfit::NotAReplica
+  } else {
+    let bytes = green.metadata_bytes();
+    if bytes <= budget {
+      return Ok(green);
+    }
+    Unfit::OverBudget { bytes, budget }
+  };
+  Err(NotMade {
+    unfit,
+    left: green.into_left(),
+  })
 }
 
 /// A replica's feed counters ([`Replica::counts`]).
@@ -383,9 +478,14 @@ mod tests {
       .unwrap()
   }
 
+  /// Shape: the replicas a test's owner takes, more than any test keeps at once.
+  const READERS: usize = 4;
+  /// Shape: a replica's budget in the tests that do not drive it: far past any test's metadata.
+  const BUDGET: usize = 1 << 20;
+
   /// A replica of `owner` made now.
   fn replica_of(owner: &mut Green) -> Replica {
-    Replica::new(owner.replica().unwrap()).unwrap()
+    Replica::new(owner.replica(READERS).unwrap(), BUDGET).unwrap()
   }
 
   /// Applies `message` to `replica` and hands the owner what it passed; returns what the replica did.
@@ -476,7 +576,10 @@ mod tests {
       head,
       "a refused message changes nothing"
     );
-    let left = replica.rebuild(owner.replica().unwrap()).unwrap();
+    let left = replica
+      .rebuild(owner.replica(READERS).unwrap())
+      .unwrap()
+      .unwrap();
     owner.leave_replica(left);
     assert_eq!(feed(&mut owner, &mut replica, &lost), Ok(Fed::PassedOver));
     assert_eq!(feed(&mut owner, &mut replica, &after), Ok(Fed::PassedOver));
@@ -607,5 +710,140 @@ mod tests {
     assert_eq!((released, none), (0, None));
     assert_eq!(owner.feed_position(), position + 1);
     owner.leave_replica(replica.leave().unwrap());
+  }
+
+  /// A-273 step 4: a replica past its budget is refused at its making, its registration given back; one made within it
+  /// is refused once a message takes it past, though its state is the owner's, and gives itself back; made again within
+  /// a larger budget, it applies the owner's next message, and the owner keeps nothing for the one that left.
+  #[test]
+  fn a_replica_past_its_budget_is_refused_and_is_made_again_within_a_larger_one() {
+    let mut owner = Green::new();
+    commit(&mut owner, create(1, 0, "a", b"one"));
+    let fresh = owner.replica(READERS).unwrap();
+    let bytes = fresh.metadata_bytes();
+    let Err(NotMade { unfit, left }) = Replica::new(fresh, bytes - 1) else {
+      panic!("made past its budget");
+    };
+    assert_eq!(
+      unfit,
+      Unfit::OverBudget {
+        bytes,
+        budget: bytes - 1
+      }
+    );
+    owner.leave_replica(left.unwrap());
+    let mut replica = Replica::new(owner.replica(READERS).unwrap(), bytes).unwrap();
+    let message = commit(&mut owner, create(2, 1, "b", b"two"));
+    let refusal = feed(&mut owner, &mut replica, &message);
+    assert!(
+      matches!(refusal, Err(FeedRefusal::OverBudget { budget, .. }) if budget == bytes),
+      "{refusal:?}"
+    );
+    assert_eq!(
+      replica.green().head(),
+      owner.head(),
+      "the owner's state, only too large to keep"
+    );
+    owner.leave_replica(replica.leave().unwrap());
+    let mut larger = replica_of(&mut owner);
+    let next = commit(&mut owner, create(3, 2, "c", b"three"));
+    assert!(matches!(
+      feed(&mut owner, &mut larger, &next),
+      Ok(Fed::Applied { .. })
+    ));
+    owner.leave_replica(larger.leave().unwrap());
+    assert_eq!(owner.content_held_bytes(), 0);
+  }
+
+  /// A-273 step 4: an owner keeping more than its limit for a lagging replica evicts it: the replica applies the
+  /// messages sent before, refuses the next, changing nothing, and gives itself back, after which the owner keeps
+  /// nothing for it; a replica made again applies the owner's next message.
+  #[test]
+  fn a_lagging_replica_is_evicted_past_the_owners_held_limit_and_is_made_again() {
+    let mut owner = Green::new();
+    commit(&mut owner, increment(1, 0, "a", &[1; 64], true));
+    let mut replica = replica_of(&mut owner);
+    owner.set_replica_held_limit(64);
+    let second = commit(&mut owner, increment(2, 1, "a", &[2; 64], false));
+    assert_eq!(
+      owner.replicas_evicted(),
+      (0, 0),
+      "at the limit, not past it"
+    );
+    let third = commit(&mut owner, increment(3, 2, "a", &[3; 64], false));
+    assert_eq!(
+      owner.replicas_evicted(),
+      (1, 0),
+      "past it: the lagging replica evicted"
+    );
+    assert!(matches!(
+      feed(&mut owner, &mut replica, &second),
+      Ok(Fed::Applied { .. })
+    ));
+    assert_eq!(
+      feed(&mut owner, &mut replica, &third),
+      Err(FeedRefusal::Evicted)
+    );
+    assert_eq!(
+      replica.green().head(),
+      2,
+      "a refused message changes nothing"
+    );
+    owner.leave_replica(replica.leave().unwrap());
+    assert_eq!(owner.content_held_bytes(), 0, "nothing kept once it left");
+    let mut again = replica_of(&mut owner);
+    let fourth = commit(&mut owner, increment(4, 3, "a", &[4; 64], false));
+    assert!(matches!(
+      feed(&mut owner, &mut again, &fourth),
+      Ok(Fed::Applied { .. })
+    ));
+    assert_eq!(again.green_mut().head_identity(), owner.head_identity());
+    owner.leave_replica(again.leave().unwrap());
+  }
+
+  /// A-273 step 4: an owner takes no more replicas than its holder allows, and a replica makes none; once one leaves,
+  /// the owner takes another.
+  #[test]
+  fn an_owner_refuses_a_replica_past_its_limit() {
+    let mut owner = Green::new();
+    let mut first = owner.replica(1).unwrap();
+    assert_eq!(
+      owner.replica(1).err(),
+      Some(ReplicaRefusal::Full {
+        readers: 1,
+        limit: 1
+      })
+    );
+    assert_eq!(first.replica(1).err(), Some(ReplicaRefusal::NotAnOwner));
+    owner.leave_replica(first.into_left().unwrap());
+    let again = owner.replica(1).unwrap();
+    owner.leave_replica(again.into_left().unwrap());
+  }
+
+  /// A-273 step 4: a change made before the last was sent evicts every replica, which could not be fed in order: the
+  /// replica refuses the next message, and one made again applies the owner's messages.
+  #[test]
+  fn a_change_left_unfed_evicts_every_replica() {
+    let mut owner = Green::new();
+    let mut replica = replica_of(&mut owner);
+    let (outcome, _) = owner.submit_resolved(&create(1, 0, "a", b"one"));
+    assert!(
+      matches!(outcome, Outcome::Accepted { .. }),
+      "committed, never sent"
+    );
+    let message = commit(&mut owner, create(2, 1, "b", b"two"));
+    assert_eq!(owner.replicas_evicted(), (0, 1));
+    assert_eq!(
+      feed(&mut owner, &mut replica, &message),
+      Err(FeedRefusal::Evicted)
+    );
+    owner.leave_replica(replica.leave().unwrap());
+    let mut again = replica_of(&mut owner);
+    let next = commit(&mut owner, create(3, 2, "c", b"three"));
+    assert!(matches!(
+      feed(&mut owner, &mut again, &next),
+      Ok(Fed::Applied { .. })
+    ));
+    owner.leave_replica(again.leave().unwrap());
   }
 }

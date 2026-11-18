@@ -32,6 +32,12 @@ use slates_merge::replica::{Fed, FeedBody, FeedMessage, FeedRefusal, Replica};
 const PATH_INDICES: u8 = 7;
 /// Shape: the generated increments each final comparison rebases over every base both greens hold.
 const PROBES: usize = 3;
+/// Shape: the replicas the owner takes: a rebuild holds two registrations for a moment, the fresh one made before the
+/// old one is given back.
+const READERS: usize = 2;
+/// Shape: the replica's budget: unbounded, since the oracle holds the replica equal to its owner, not to a bound (the
+/// bounds' own tests are the unit tests of `crates/merge/src/replica.rs`).
+const BUDGET: usize = usize::MAX;
 
 /// One step of a generated history.
 #[derive(Clone, Debug)]
@@ -160,8 +166,14 @@ impl History {
 
   /// The replica rebuilt from the owner now, after it refused a message; its old registration given back.
   fn rebuild(&mut self) {
-    let fresh = self.owner.replica().unwrap();
-    let left = self.replica.as_mut().unwrap().rebuild(fresh).unwrap();
+    let fresh = self.owner.replica(READERS).unwrap();
+    let left = self
+      .replica
+      .as_mut()
+      .unwrap()
+      .rebuild(fresh)
+      .unwrap()
+      .unwrap();
     self.owner.leave_replica(left);
   }
 
@@ -248,7 +260,7 @@ impl History {
           self.owner.leave_replica(old.leave().unwrap());
           self.acks.clear();
         }
-        self.replica = Replica::new(self.owner.replica().unwrap());
+        self.replica = Some(Replica::new(self.owner.replica(READERS).unwrap(), BUDGET).unwrap());
       }
     }
     self.check_at_the_replicas_head();

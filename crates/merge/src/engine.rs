@@ -460,6 +460,8 @@ pub struct Green {
   xattr_history: XattrHistory,
   /// The deltas of the versions after `deltas_from`, in order: `deltas[i]` is version `deltas_from + i + 1`'s.
   deltas: Vec<BTreeMap<String, Vec<Op>>>,
+  /// The bytes the deltas hold ([`delta_bytes`]), a running total: part of [`Green::metadata_bytes`] (A-273 step 4).
+  deltas_bytes: usize,
   /// The version the green was restored at from a checkpoint ([`Green::restore`]), 0 for a green built from its origin:
   /// the deltas up to it are folded into the checkpoint, so a base below it is not mapped.
   deltas_from: u64,
@@ -526,6 +528,23 @@ pub struct Green {
   /// The deltas the verdict's position mapping consulted (`intervening`): the non-vacuity count that it reads only the
   /// deltas that changed a path, never every delta since a base. A cell, as the deltas it counts are borrowed.
   deltas_visited: std::cell::Cell<u64>,
+}
+
+/// Format: what one entry of the accepted record holds, an increment's identity and the version it committed as.
+const ACCEPTED_ENTRY_BYTES: usize = size_of::<([u8; 32], u64)>();
+/// Format: what one recorded signature verdict holds, with its version.
+const SIGNATURE_ENTRY_BYTES: usize = size_of::<(u64, crate::chain_entry::Signature)>();
+
+/// The bytes one version's delta holds: each path it names, and its ops.
+fn delta_bytes(delta: &BTreeMap<String, Vec<Op>>) -> usize {
+  delta
+    .iter()
+    .map(|(path, ops)| {
+      path
+        .len()
+        .saturating_add(ops.len().saturating_mul(size_of::<Op>()))
+    })
+    .fold(0, usize::saturating_add)
 }
 
 /// The bytes a retained conflict window costs the rejected-result cache: its path, its range and
@@ -2838,6 +2857,8 @@ impl Green {
 
   /// Applies the accepted effects, committing version `version`.
   fn commit(&mut self, effects: Vec<Effect>, version: u64) {
+    // A change recorded for the replicas and never sent to them means they cannot be fed in order (A-273 step 4).
+    self.chunks.evict_if_unfed();
     let changed: BTreeSet<String> = effects.iter().map(|e| e.path().to_owned()).collect();
     let mut delta: BTreeMap<String, Vec<Op>> = BTreeMap::new();
     let mut removed_content: Vec<String> = Vec::new();
@@ -2954,6 +2975,7 @@ impl Green {
       self.push_content(path.clone(), version, Some(value));
       delta.insert(path, ops);
     }
+    self.deltas_bytes = self.deltas_bytes.saturating_add(delta_bytes(&delta));
     self.deltas.push(delta);
     self.record_changes(version, changed);
   }
@@ -3508,10 +3530,11 @@ impl Green {
   /// A replica of this green now (A-273 step 3): every index, history and delta the owner holds, cloned, and its
   /// content named as the owner names it and read in place, never copied: it is registered with the owner's blocks,
   /// which keep every block it may read until it has passed the message that released it. It applies the owner's
-  /// feed from the owner's feed position now. `None` on a replica, which has no blocks of its own to give.
-  pub fn replica(&mut self) -> Option<Green> {
-    let chunks = self.chunks.replica()?;
-    Some(Green {
+  /// feed from the owner's feed position now. Refused past `limit` replicas (its holder's, one a shard that may hold
+  /// its works; A-273 step 4) and on a replica, which has no blocks of its own to give.
+  pub fn replica(&mut self, limit: usize) -> Result<Green, crate::replica::ReplicaRefusal> {
+    let chunks = self.chunks.replica(limit)?;
+    Ok(Green {
       identity: self.identity.clone(),
       identity_version: self.identity_version,
       identity_dirty: self.identity_dirty.clone(),
@@ -3533,6 +3556,7 @@ impl Green {
       hardlink_history: self.hardlink_history.clone(),
       xattr_history: self.xattr_history.clone(),
       deltas: self.deltas.clone(),
+      deltas_bytes: self.deltas_bytes,
       deltas_from: self.deltas_from,
       last_changed: self.last_changed.clone(),
       mode_changed: self.mode_changed.clone(),
@@ -3577,7 +3601,10 @@ impl Green {
 
   /// A replica about to replay the message that carries `changes`: the blocks it sealed become readable and are
   /// adopted, in the owner's order, by the replay's seals (`crate::store`). False, unchanged, where they are refused.
-  pub(crate) fn begin_replay(&mut self, changes: &slates_mem::sealed::Changes) -> bool {
+  pub(crate) fn begin_replay(
+    &mut self,
+    changes: &slates_mem::sealed::Changes,
+  ) -> Result<(), slates_mem::sealed::ReaderRefusal> {
     self.chunks.begin(changes)
   }
 
@@ -3598,6 +3625,36 @@ impl Green {
   /// (A-273): its memory, charged in its retained history.
   pub fn content_held_bytes(&self) -> usize {
     self.chunks.held_bytes()
+  }
+
+  /// The bytes of content this owner keeps for its replicas past which the slowest is evicted (A-273 step 4): the room
+  /// its memory class leaves for them, derived by its holder.
+  pub fn set_replica_held_limit(&mut self, bytes: usize) {
+    self.chunks.set_held_limit(bytes);
+  }
+
+  /// Replicas this owner evicted since it was made: for what it kept for them, and for changes left unfed (A-273
+  /// step 4's counters, `merge.replica.dropped_lagging` and `merge.replica.dropped_unfed`).
+  pub fn replicas_evicted(&self) -> (u64, u64) {
+    self.chunks.evictions()
+  }
+
+  /// The bytes of metadata this green holds that grow with the versions it keeps (A-273 step 4): its history's piece
+  /// lists, its change index, its IPC history, its deltas, its accepted record and signatures, and its table of chunks.
+  /// What a replica is held to its budget by: its content is its owner's. The key indexes, one entry a path, are not
+  /// counted; they are bounded by the paths the owner names, which its own budget bounds.
+  pub fn metadata_bytes(&self) -> usize {
+    [
+      self.history_lists,
+      self.changes_bytes,
+      self.special_history_bytes,
+      self.deltas_bytes,
+      self.accepted.len().saturating_mul(ACCEPTED_ENTRY_BYTES),
+      self.signatures.len().saturating_mul(SIGNATURE_ENTRY_BYTES),
+      self.chunks.table_bytes(),
+    ]
+    .into_iter()
+    .fold(0, usize::saturating_add)
   }
 
   /// Reads of content this green could not answer (A-273 step 3): never on an owner, nor on a replica whose replay is
@@ -3669,11 +3726,15 @@ impl Green {
   /// Returns the bytes released. A reachable floor at or below the current one is a no-op.
   pub fn fold_history_to_budget(&mut self, reachable_floor: u64, budget: usize) -> usize {
     let mut released = 0usize;
+    let mut first = true;
     while self.history_bytes().saturating_add(self.changes_bytes) > budget
       && self.folded_below < reachable_floor
     {
+      if std::mem::take(&mut first) {
+        self.chunks.evict_if_unfed();
+      }
       let next = self.folded_below.saturating_add(1);
-      released = released.saturating_add(self.fold_history_before(next));
+      released = released.saturating_add(self.fold_below(next));
     }
     released
   }
@@ -3687,6 +3748,16 @@ impl Green {
   /// full copy per edit past what any reader needs. Returns the content and IPC metadata bytes released. Idempotent;
   /// a floor below the current one is a no-op.
   pub fn fold_history_before(&mut self, floor: u64) -> usize {
+    if floor <= self.folded_below {
+      return 0;
+    }
+    // A change recorded for the replicas and never sent to them means they cannot be fed in order (A-273 step 4).
+    self.chunks.evict_if_unfed();
+    self.fold_below(floor)
+  }
+
+  /// [`Green::fold_history_before`]'s fold, one change however many steps of [`Green::fold_history_to_budget`] it takes.
+  fn fold_below(&mut self, floor: u64) -> usize {
     if floor <= self.folded_below {
       return 0;
     }

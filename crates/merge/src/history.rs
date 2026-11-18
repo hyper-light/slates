@@ -31,7 +31,7 @@
 //! always did.
 
 use crate::ops_doc::{Op, OpKind};
-use slates_mem::sealed::{Block, Changes, Left, Passed};
+use slates_mem::sealed::{Block, Changes, Left, Passed, ReaderRefusal};
 
 /// A run of a value's bytes: `len` bytes at `at` within chunk `chunk`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -165,10 +165,10 @@ impl Chunks {
   }
 
   /// A replica of these chunks now (A-273): registered with the owner's blocks, every chunk named as the owner names it,
-  /// read in place. `None` on a replica, which has no blocks of its own to give.
-  pub(crate) fn replica(&mut self) -> Option<Chunks> {
-    let joined = self.store.join()?;
-    Some(Chunks {
+  /// read in place. Refused past `limit` replicas, and on a replica, which has no blocks of its own to give.
+  pub(crate) fn replica(&mut self, limit: usize) -> Result<Chunks, crate::replica::ReplicaRefusal> {
+    let joined = self.store.join(limit)?;
+    Ok(Chunks {
       store: crate::store::Store::reading(joined),
       slots: self.slots.clone(),
       free: self.free.clone(),
@@ -192,8 +192,32 @@ impl Chunks {
   }
 
   /// A replica about to replay the message carrying `changes` (`crate::store::Store::begin`).
-  pub(crate) fn begin(&mut self, changes: &Changes) -> bool {
+  pub(crate) fn begin(&mut self, changes: &Changes) -> Result<(), ReaderRefusal> {
     self.store.begin(changes)
+  }
+
+  /// The bytes the owner keeps for its replicas past which the slowest is evicted (A-273 step 4).
+  pub(crate) fn set_held_limit(&mut self, bytes: usize) {
+    self.store.set_held_limit(bytes);
+  }
+
+  /// At the start of a change on the owner: every replica evicted if the last change was never sent to them.
+  pub(crate) fn evict_if_unfed(&mut self) {
+    self.store.evict_if_unfed();
+  }
+
+  /// Replicas the owner evicted: for what it kept for them, and for changes left unfed.
+  pub(crate) fn evictions(&self) -> (u64, u64) {
+    self.store.evictions()
+  }
+
+  /// The bytes a replica's own table of these chunks costs (A-273 step 4): its slots.
+  pub(crate) fn table_bytes(&self) -> usize {
+    self
+      .slots
+      .len()
+      .saturating_add(self.free.len())
+      .saturating_mul(size_of::<Option<Entry>>())
   }
 
   /// A replica done replaying it (`crate::store::Store::finish`).
@@ -779,6 +803,9 @@ mod tests {
     assert_eq!(values.last().unwrap().materialize(&chunks), bytes);
   }
 
+  /// Shape: the replicas a test's owner takes, more than any test makes.
+  const READERS: usize = 4;
+
   /// A-273 "Frees deferred until every replica has passed them", step 3. Do: an owner's value of 64 bytes; a replica's
   /// chunks are made from the owner's, so its copy of the value reads the owner's block in place; the owner releases
   /// its value and stores another of other bytes, and takes the feed message's changes; the replica replays the same
@@ -790,7 +817,7 @@ mod tests {
     let mut chunks = Chunks::default();
     let first = vec![7u8; 64];
     let owner = Value::whole(&mut chunks, &first);
-    let mut replica_chunks = chunks.replica().unwrap();
+    let mut replica_chunks = chunks.replica(READERS).unwrap();
     let replica = owner.clone();
     owner.release(&mut chunks);
     let second = Value::whole(&mut chunks, &[9u8; 64]);
@@ -802,7 +829,7 @@ mod tests {
     );
     assert_eq!(chunks.frees_held(), 1);
     assert_eq!(chunks.held_bytes(), first.len());
-    assert!(replica_chunks.begin(&changes));
+    replica_chunks.begin(&changes).unwrap();
     replica.release(&mut replica_chunks);
     let adopted = Value::whole(&mut replica_chunks, &[9u8; 64]);
     let passed = replica_chunks.finish(&changes).unwrap();
@@ -828,7 +855,7 @@ mod tests {
   fn a_replica_that_leaves_holds_no_free() {
     let mut chunks = Chunks::default();
     let owner = Value::whole(&mut chunks, &[1u8; 32]);
-    let replica = chunks.replica().unwrap();
+    let replica = chunks.replica(READERS).unwrap();
     owner.release(&mut chunks);
     assert_eq!(chunks.held_bytes(), 32);
     chunks.leave(replica.into_left().unwrap());
@@ -846,16 +873,16 @@ mod tests {
   #[test]
   fn a_replay_that_seals_other_bytes_than_its_owner_is_refused() {
     let mut chunks = Chunks::default();
-    let mut replica_chunks = chunks.replica().unwrap();
+    let mut replica_chunks = chunks.replica(READERS).unwrap();
     let owner = Value::whole(&mut chunks, &[3u8; 16]);
     let changes = chunks.take_changes().unwrap();
-    assert!(replica_chunks.begin(&changes));
+    replica_chunks.begin(&changes).unwrap();
     let other = Value::whole(&mut replica_chunks, &[4u8; 16]);
     assert!(replica_chunks.finish(&changes).is_none(), "other bytes");
-    let mut twice = chunks.replica().unwrap();
+    let mut twice = chunks.replica(READERS).unwrap();
     let again = Value::whole(&mut chunks, &[5u8; 8]);
     let changes = chunks.take_changes().unwrap();
-    assert!(twice.begin(&changes));
+    twice.begin(&changes).unwrap();
     let first = Value::whole(&mut twice, &[5u8; 8]);
     let extra = Value::whole(&mut twice, &[6u8; 8]);
     assert!(
