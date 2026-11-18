@@ -646,7 +646,8 @@ mod tests {
   /// The wait for room is a span of time on a busy shard too (2026-11-06). Do: on a shard, fill a stand-in slot's
   /// one-message channel and never drain it; keep the shard busy 20 ms at a time back to back with a task that spins and
   /// yields; and wait for room for a result carried home there. Expect: the wait gives up about one
-  /// coordinator period after it began, not much more. Before, it was a count of tries of one pause each, and each try
+  /// coordinator period after it began, not much more: past it by at most two busy polls, a pause, and the shard
+  /// thread's time off its CPU, which the host spent and the test measures. Before, it was a count of tries of one pause each, and each try
   /// lasted a pause plus the shard's busy poll.
   #[test]
   // The test thread waits for the result off the shard.
@@ -659,8 +660,10 @@ mod tests {
     static WAITED_NS: AtomicU64 = AtomicU64::new(0);
     static SENT: AtomicBool = AtomicBool::new(true);
     static LONGEST_POLL_NS: AtomicU64 = AtomicU64::new(0);
+    static OFF_CPU_NS: AtomicU64 = AtomicU64::new(0);
     DONE.store(false, Ordering::Release);
     LONGEST_POLL_NS.store(0, Ordering::Release);
+    OFF_CPU_NS.store(0, Ordering::Release);
     let daemon = crate::daemon::audit_daemon();
     let (registration, receiver) = crate::daemon::observe_first(&daemon, |_state| {
       let (registration, receiver) = registry::register(
@@ -690,14 +693,21 @@ mod tests {
       .unwrap();
       slates_rt::futures::detach(starver).unwrap();
       let waiter = slates_rt::futures::spawn(async move {
+        let cpu =
+          || slates_rt::registry::calling_thread_cpu().map_or(0, |reading| reading.spent_ns);
         let began = slates_rt::futures::now_ns();
+        let cpu_began = cpu();
         let sent = given_room(
           home,
           Control::Spawn(Box::new(SpawnRequest::new(Box::pin(async {}), None))),
         )
         .await;
-        WAITED_NS.store(
-          slates_rt::futures::now_ns().saturating_sub(began),
+        let waited = slates_rt::futures::now_ns().saturating_sub(began);
+        WAITED_NS.store(waited, Ordering::Release);
+        // The shard thread's time off its CPU across the wait: the host's scheduler held it, which no deadline can
+        // shorten, between the polls as much as inside them.
+        OFF_CPU_NS.store(
+          waited.saturating_sub(cpu().saturating_sub(cpu_began)),
           Ordering::Release,
         );
         SENT.store(sent, Ordering::Release);
@@ -717,11 +727,15 @@ mod tests {
     }
     let waited = WAITED_NS.load(Ordering::Acquire);
     let longest = LONGEST_POLL_NS.load(Ordering::Acquire);
+    let off_cpu = OFF_CPU_NS.load(Ordering::Acquire);
     // The budget, then at most the busy poll under way at the deadline and the waiter's own next turn behind another,
-    // and one pause: a deadline overshoots by that, where a count of tries overshoots by a poll for every try.
-    let bound = REPLY_ROOM_NS + 2 * longest + REPLY_PACE_NS;
+    // and one pause: a deadline overshoots by that, where a count of tries overshoots by a poll for every try. The
+    // shard's time off its CPU is the host's, measured: a full suite at load 69 to 118 with 387 MB free failed the bound
+    // without it, where alone the wait took 120.7 to 146.8 ms against bounds of 150.0 to 159.6 ms (2026-11-18).
+    let bound = REPLY_ROOM_NS + 2 * longest + REPLY_PACE_NS + off_cpu;
     println!(
-      "a result's wait for room on a busy shard: {waited} ns (longest busy poll {longest} ns, bound {bound} ns)"
+      "a result's wait for room on a busy shard: {waited} ns (longest busy poll {longest} ns, off its CPU {off_cpu} ns, \
+       bound {bound} ns)"
     );
     assert!(!SENT.load(Ordering::Acquire), "the channel never had room");
     assert!(
