@@ -1,0 +1,41 @@
+name: DIAG g244 Linux compile and unit tests (not for main)
+
+# Goal g244 (a healthy live fsync never answered EIO): the held durable reply's give-up rule (A-292, on main) and the
+# owner's unanswered ask (A-301) touch Linux-only code (crates/server/src/fuse.rs, crates/cli/tests/live_fleet.rs) that
+# kiln's Linux runners could not build (adacachy2's cargo package-cache lock jammed, 2026-11-18). Compiles every test
+# target of the touched crates and runs their unit tests on Linux x86_64, with ci.yml's test environment.
+on:
+  push:
+    branches: ['diag-g244-linux-*']
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  linux:
+    name: compile + unit tests (Linux x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Grant user_allow_other, as ci.yml does
+        run: |
+          command -v fusermount3 >/dev/null || { sudo apt-get update && sudo apt-get install -y fuse3; }
+          grep -qx user_allow_other /etc/fuse.conf 2>/dev/null || echo user_allow_other | sudo tee -a /etc/fuse.conf
+      - name: Compile every test target of the touched crates
+        run: cargo test --locked --no-run -p slates-bridge-core -p slates-bridge-virtiofs -p slates-server -p slates-cli
+      - name: Unit tests of bridge-core, bridge-virtiofs and cli
+        run: cargo test --locked --no-fail-fast -p slates-bridge-core -p slates-bridge-virtiofs -p slates-cli
+      - name: slates-server, its lib and every integration binary but fleet
+        shell: bash
+        env:
+          SLATES_FLEET_TRACE: "1"
+          SLATES_TEST_HEDGE_STARVATION_SECS: "20"
+          SLATES_TEST_RESTART_SLOWDOWN: "10"
+          SLATES_TEST_FLEET_DEADLINE_SECS: "120"
+        run: |
+          targets=$(for t in crates/server/tests/*.rs; do n=$(basename "$t" .rs); [ "$n" = fleet ] || printf -- '--test %s ' "$n"; done)
+          cargo test --locked --no-fail-fast -p slates-server --lib $targets
