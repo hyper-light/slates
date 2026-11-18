@@ -8,7 +8,6 @@
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 // The daemon's NFS loopback transport and a real landing target: macOS and Linux.
-#![cfg(unix)]
 
 use std::net::TcpStream;
 

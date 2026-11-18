@@ -543,8 +543,8 @@ jobs:
       # had never been compiled for Windows — which is where §4.6's DAX suite lives, with its paired `#[cfg]`
       # arms and its `huge_page_bytes` probe that answers `None` off Linux. Cross-linted clean against
       # `x86_64-pc-windows-gnu` before being added here. **`slates-mcp` joined on 2026-10-26** with its HTTP edge on Windows
-      # (A-183); its test runs here once landing does, since `slates.land.materialize` answers `Unsupported` on Windows
-      # until then. **`slates-cluster` joined on 2026-11-05**: it was built here only as the daemon's dependency, so its
+      # (A-183); its test runs here since landing does (A-185, 2026-11-18): until then `slates.land.materialize` answered
+      # `Unsupported` on Windows. **`slates-cluster` joined on 2026-11-05**: it was built here only as the daemon's dependency, so its
       # tests and examples, which asked `rustix::param` for the page size (configured out on Windows), never compiled for
       # Windows; they ask `slates_machine::facts::Facts::page_bytes` now (`cargo xwin clippy` red before, clean after).
       # **`slates-bridge-virtiofs` joined on 2026-11-07**: the daemon builds it, but only listed crates are
@@ -589,7 +589,7 @@ jobs:
       - name: Documentation (every reference names something Windows can see)
         env:
           RUSTDOCFLAGS: -D warnings -A rustdoc::private_intra_doc_links
-        run: cargo doc -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-anchor -p slates-cli -p slates-mcp --no-deps --document-private-items
+        run: cargo doc -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-anchor -p slates-cli -p slates-mcp -p slates-land --no-deps --document-private-items
       # Run the tests whose Win32 cfg branches only a native Windows runner can exercise: the shared
       # memory (`CreateFileMappingW`); the cross-process wake (the named auto-reset Event — §4.7's
       # `WaitOnAddress`-is-process-local case, so the park/late-reply wake in `rings` goes through the
@@ -671,6 +671,14 @@ jobs:
         if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: cargo test -p slates-base
+      # Landing on Windows (§4.15, A-185): the writer over NTFS handles, the oracle, a real kill mid-landing on NTFS
+      # (T-1.15), an outsider's junction and hard-link swaps before every seam call, real outsider saves during every
+      # kind of removal, and NTFS's own renames (a landed file keeps its ARCHIVE bit; a file a backup cleared is
+      # replaced); the symbolic-link cases are Unix's (Windows makes none without a privilege). LAND-X64-TBD
+      - name: Test landing on Windows (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: cargo test -p slates-land
       - name: Test the AFD readiness over loopback UDP (native Windows)
         if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
@@ -736,6 +744,30 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 30
         run: cargo test -p slates-server --test recovery_slicing -- --nocapture
+      # The daemon's own unit tests, which no Windows lane ran until the Windows landing writer (A-185): two of them asked
+      # for a landing, which the Windows arm refused `Unsupported { feature: "landing" }` (they have since moved to
+      # `presentations.rs`, the next step). One test at a time: each test daemon sizes itself from the whole machine, and
+      # Windows charges commit when memory is made, so at 4 threads the suite met the commit limit on jupiter and at 32 it
+      # aborted (GAPS, the client binary's oversubscription entry). LIB-X64-TBD
+      - name: Test the daemon's unit tests, one test at a time (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: cargo test -p slates-server --lib -- --test-threads=1
+      # Landings through the daemon (§4.15, A-185), Unix-only until the Windows writer: presentations (the two landing
+      # tests the unit tests once held among them), a target's one lease, a named snapshot's landing, landing fairness,
+      # the write policies (A-285), a green's checkout, signed landings (A-321) and a presentation's fairness, one test
+      # at a time as the other in-process daemon suites here. SUITES-X64-TBD
+      - name: Test landings through the daemon, one test at a time (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        run: cargo test -p slates-server --test presentations --test lease --test snapshot_landing --test landing_fairness --test write_policy --test checkout --test signed_work --test presentation_fairness -- --test-threads=1
+      # The MCP surface over a live in-process daemon (§4.12), one serial test: the handshake, the merge loop, the volume
+      # lifecycle, typed errors, and `slates.land.materialize`, which answered `Unsupported` on Windows until A-185.
+      # MCP-X64-TBD
+      - name: Test the MCP surface, landing included (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-mcp --test mcp
       # The fleet over real loopback UDP sessions with mutual TLS (crates/server/tests/fleet.rs): formation, detection,
       # replication, takeover and serving the dead owner's bytes over the successor's NFS port. It was cfg(unix) as a
       # whole until 2026-11-06; only the virtio-fs guest test stays Unix-only. It needs the Windows datagram socket's
@@ -775,6 +807,12 @@ jobs:
         if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: cargo test -p slates-client --test client --test driver -- --test-threads=1
+      # A presented landing goes with the client that presented it (AUD-29-07): the test binary re-invoked as the
+      # presenter and killed (`TerminateProcess`). Unix-only until the Windows landing writer (A-185). PRESENTATION-X64-TBD
+      - name: Test a killed client's presented landing going with it (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-client --test presentation
       # The Shards form (§4.6, A-161, A-179) by the handle route: an in-process daemon duplicates the client end of the
       # attachment's named pipe into the test, which speaks FUSE through it in Shards' framing; hostile frames, a
       # destroy and a revocation each end the attachment; a second process is refused the pipe `ERROR_PIPE_BUSY`.
@@ -1112,6 +1150,11 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 20
         run: cargo test -p slates-client --test client --test driver -- --test-threads=1
+      # A presented landing goes with the client that presented it (AUD-29-07), as on x86_64 (A-185). PRESENTATION-ARM-TBD
+      - name: Test a killed client's presented landing going with it (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-client --test presentation
       - name: Test the Shards form over the handle route (native arm64 Windows)
         if: ${{ !cancelled() }}
         timeout-minutes: 20
@@ -1127,6 +1170,28 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: cargo test -p slates-server --test liveness -- --test-threads=1
+      # Landing on arm64 Windows (§4.15, A-185), as on x86_64: the writer over NTFS handles, the oracle, the real kill
+      # mid-landing (T-1.15), the escape and removal oracles, NTFS's own renames. LAND-ARM-TBD
+      - name: Test landing on Windows (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: cargo test -p slates-land
+      # The daemon's own unit tests, one test at a time, as on x86_64 (no Windows lane ran them until the landing writer,
+      # A-185). LIB-ARM-TBD
+      - name: Test the daemon's unit tests, one test at a time (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: cargo test -p slates-server --lib -- --test-threads=1
+      # Landings through the daemon, one test at a time, as on x86_64 (A-185). SUITES-ARM-TBD
+      - name: Test landings through the daemon, one test at a time (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        run: cargo test -p slates-server --test presentations --test lease --test snapshot_landing --test landing_fairness --test write_policy --test checkout --test signed_work --test presentation_fairness -- --test-threads=1
+      # The MCP surface over a live in-process daemon, landing included, as on x86_64 (A-185). MCP-ARM-TBD
+      - name: Test the MCP surface, landing included (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-mcp --test mcp
       # The fleet over real loopback UDP sessions with mutual TLS (crates/server/tests/fleet.rs): formation, detection,
       # replication, takeover and serving the dead owner's bytes over the successor's NFS port. It was cfg(unix) as a
       # whole until 2026-11-06; only the virtio-fs guest test stays Unix-only. It needs the Windows datagram socket's

@@ -1155,9 +1155,9 @@
 > B per entry, unchanged). winfstest's 18 ATTRIBUTES cases come off its list (373 to 355). The Windows base plane reads
 > them since stage 3's base half: a fingerprint carries the disk's bits apart from a DrvFs-mapped mode (until then the
 > Windows base reported the attribute word itself as the mode, `0x20` as `0o040`). **Still owed under A-262:** a Windows
-> landing applying them (it waits on a Windows landing writer, which does not exist; Linux and macOS carry them
-> unapplied), and the merge's dimension, owed when works are mountable (no work can set the bits today, so no merge
-> drops them).
+> landing applying them (the Windows writer exists since A-185, 2026-11-18: it sets a file's `READONLY` from its mode
+> and keeps every other bit the file holds, applying none of the volume's; Linux and macOS carry them unapplied), and
+> the merge's dimension, owed when works are mountable (no work can set the bits today, so no merge drops them).
 
 > **A file removed while open over NFSv4 was reclaimed at once, and the client renamed it aside: fixed (2026-11-08,
 > §4.6 NFSv4 state; A-260).** An NFSv4 open held nothing in the volume, so a REMOVE of an open file reclaimed it (its
@@ -6573,8 +6573,10 @@ Deviations and owed items from tasks 11–13:
   `clonefile` arrive with the manifest's own hash index of identical files.
 - The directory sync strategy is one `fsync` per touched directory; the `syncfs` alternative
   waits on the measured per-directory cost the report now carries (`Durability.dir_sync_ns`).
-- Windows has no OS writer yet (`FileRenameInfoEx` with `POSIX_SEMANTICS`, the sharing-mode
-  verify): the Windows bridge of Phase 4; the crate compiles there without the `os` module.
+- ~~Windows has no OS writer yet (`FileRenameInfoEx` with `POSIX_SEMANTICS`, the sharing-mode
+  verify): the Windows bridge of Phase 4; the crate compiles there without the `os` module.~~ Closed 2026-11-18 by
+  A-185: `crates/land/src/os_windows.rs`, handle-relative over NTFS (`FileRenameInformationEx` with POSIX semantics
+  through the NT call, since Win32's refused a name relative to a handle).
 - `TargetIsVolume` is not checked: there is no mount table before Phase 3.
 - The real-target tests and the OS rows of the bench run in the Linux lane; on this machine
   they skip loudly (no RAM disk authorized), so their first numbers are the lane's.
@@ -17612,6 +17614,15 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   hand-off test passes in each of 6 (no later child inherits the end, against an inheritable copy's contrast), and the
   client Shards suite 11 of 11 in each of 3, with the hostile holder test. All are red-checked. **Owed:** arm64 Windows
   runs `stream_spawn` but not the CLI test (its lane builds no `slates-cli`).
+- **Landing on Windows built (A-185, 2026-10-26):** `slates-land` has a Windows write seam
+  (`crates/land/src/os_windows.rs`), handle-relative over NTFS, and the server lands on Windows. Proven on jupiter: the
+  land suite whole (the kill test on NTFS, the escape oracle with junction and hard-link swaps, the removal oracle with
+  real outsider saves), red-checked three ways. Found and fixed on the way: Windows base modes were raw attributes
+  (`docs/bugs/2026-10-26-windows-base-file-modes-were-raw-attributes.md`), and NTFS tunneling gives a renamed file the
+  creation time of the name's last holder (the engine's move check sets the birth time aside). **Owed:** a symbolic
+  link in a landing on Windows (refused `EPERM`: no unprivileged, handle-relative way to make one); a reflink
+  (`FSCTL_DUPLICATE_EXTENTS_TO_FILE` on ReFS); arm64 Windows. CI's x86_64 Windows lane runs the land suite whole and
+  lints it.
 - **Windows' DAX window built (G-shards-windows step 5, A-180, 2026-10-26):** a descriptor ask on a Windows stream
   names the asking process and its stream handle there. The daemon checks the handle is this stream's own object, by
   `CompareObjectHandles` against a known holder, never by a name query, which hung past 3 s on a synchronous pipe with
