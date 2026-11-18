@@ -258,6 +258,10 @@ pub(crate) struct LiveVolume {
   /// (`fleet::ship_head`, through [`asked`]). `None` while nothing asked is unanswered. A held reply's silent window is
   /// given up only once this is a window old (A-301): the owner's own delay in asking is not its holders' silence.
   unanswered_since_ns: Option<u64>,
+  /// DIAG (g076b): when the last publication's hook began, and when the last fold made the log durable further.
+  diag_published_ns: u64,
+  /// DIAG (g076b): see `diag_published_ns`.
+  diag_resolved_ns: u64,
 }
 
 /// One candidate's copy of a live log as its shard's recovery image keeps it (A-200; §4.8 "Recovery": a warm restart
@@ -782,6 +786,7 @@ fn heard_of(state: &ShardState, volume: slates_db::catalog::VolumeId) -> u64 {
 /// caller answers a stable write or `COMMIT` only then, and otherwise tells the client to try again: a barrier never
 /// claims what `f` candidates do not hold.
 pub(crate) async fn wait_durable(volume: slates_db::catalog::VolumeId, target: u64) -> bool {
+  let diag_waited = slates_rt::futures::now_ns();
   let Some(mut bound) =
     state::with_state(|s| begin_durable_bound(s, volume, slates_rt::futures::now_ns()))
   else {
@@ -842,6 +847,23 @@ pub(crate) async fn wait_durable(volume: slates_db::catalog::VolumeId, target: u
       },
       1,
     );
+    if durable {
+      let now = slates_rt::futures::now_ns();
+      let stamps = s
+        .live
+        .shipping
+        .get(&volume.bytes)
+        .map(|live| (live.diag_published_ns, live.diag_resolved_ns));
+      if let Some((published, resolved)) = stamps {
+        if resolved >= diag_waited {
+          hop_diag::record(s, hop_diag::FOLD_TO_WAKE, now.saturating_sub(resolved));
+        }
+        if published > 0 {
+          hop_diag::record(s, hop_diag::TOTAL, now.saturating_sub(published));
+        }
+      }
+      hop_diag::record(s, hop_diag::NFS_WAIT, now.saturating_sub(diag_waited));
+    }
   });
   durable
 }
@@ -1655,6 +1677,8 @@ struct Send {
   holder: HostId,
   stream: u64,
   bytes: Vec<u8>,
+  /// DIAG (g076b): when it was made, on the owner.
+  made_ns: u64,
 }
 
 /// Whether the volume with `id` is live-shipped, by its policy on this partition.
@@ -1682,6 +1706,7 @@ pub(crate) fn published(
   id: slates_db::catalog::VolumeId,
   record: Option<&[u8]>,
 ) {
+  let diag_began = slates_rt::futures::now_ns();
   if !is_live(state, id) {
     let shipped = state.live.shipping.remove(&id.bytes).is_some();
     let resumed = state.live.resumed.remove(&id.bytes).is_some();
@@ -1839,6 +1864,14 @@ pub(crate) fn published(
       }
       resolve(state, id.bytes);
       let sends = pending_sends(state, id.bytes);
+      if let Some(live) = state.live.shipping.get_mut(&id.bytes) {
+        live.diag_published_ns = diag_began;
+      }
+      hop_diag::record(
+        state,
+        hop_diag::BUILD,
+        slates_rt::futures::now_ns().saturating_sub(diag_began),
+      );
       dispatch(state, sends);
     }
     Err(_) => refuse(state, id, "fleet.live.refused.no_credit"),
@@ -1862,6 +1895,8 @@ fn new_live_volume(shipper: Shipper) -> LiveVolume {
     recording: None,
     whole_entry: None,
     image_anchors: None,
+    diag_published_ns: 0,
+    diag_resolved_ns: 0,
     heard: 0,
     unanswered_since_ns: None,
   }
@@ -2447,6 +2482,7 @@ fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
             holder: *holder,
             stream: slates_cluster::live::LIVE_ENTRY_STREAM,
             bytes: entry.encode(),
+            made_ns: now,
           });
         }
       }
@@ -2497,6 +2533,7 @@ fn install_for(live: &LiveVolume, object: ObjectId, holder: HostId) -> (Option<S
     holder,
     stream: slates_cluster::live::LIVE_STATE_STREAM,
     bytes: install.encode(),
+    made_ns: slates_rt::futures::now_ns(),
   };
   (Some(send), false)
 }
@@ -2733,6 +2770,11 @@ async fn send_from_control(origin: u16, control: u16, sends: Vec<Send>) {
     origin,
     control,
     move || async move {
+      let made = sends.iter().map(|send| send.made_ns).min().unwrap_or(0);
+      hop_diag::record_here(
+        hop_diag::TO_CONTROL,
+        slates_rt::futures::now_ns().saturating_sub(made),
+      );
       drain_stragglers();
       let mut lanes: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>> = Vec::new();
       for (holder, sends) in by_holder(sends) {
@@ -2807,7 +2849,10 @@ async fn ship_lane(
 ) -> bool {
   let mut queue: VecDeque<Send> = sends.into();
   while let Some(first) = queue.pop_front() {
+    let borrow_began = slates_rt::futures::now_ns();
     let sessions = borrow_session(holder, budget.max_deadline_ns()).await;
+    let borrowed = slates_rt::futures::now_ns();
+    hop_diag::record_here(hop_diag::BORROW, borrowed.saturating_sub(borrow_began));
     let send = take_batch(first, &mut queue, &sessions);
     // Each message under its own budget: the liveness budget plus its transfer on the session it rides, so an install of
     // the whole volume is not given up the moment an entry would be (`exchange_budget`).
@@ -2815,6 +2860,8 @@ async fn ship_lane(
     let exchanged =
       slates_cluster::live::exchange((send.stream, &send.bytes), sessions, exchange, |_, _| true)
         .await;
+    let returned = slates_rt::futures::now_ns();
+    hop_diag::record_here(hop_diag::EXCHANGE, returned.saturating_sub(borrowed));
     let (replies, stragglers) = settle_sessions(exchanged);
     let answered = !replies.is_empty();
     if !answered {
@@ -2826,7 +2873,14 @@ async fn ship_lane(
       .collect();
     if !replies.is_empty() {
       let control = state::with_state(|s| s.shard).unwrap_or(origin);
-      crate::xshard::run_on_counted(control, origin, move |s| fold_into(s, replies));
+      crate::xshard::run_on_counted(control, origin, move |s| {
+        hop_diag::record(
+          s,
+          hop_diag::TO_OWNER,
+          slates_rt::futures::now_ns().saturating_sub(returned),
+        );
+        fold_into(s, replies);
+      });
     }
     // After the answers are on their way to the owner, so durability waits for no straggler.
     finish_stragglers(origin, send.object, stragglers).await;
@@ -2896,6 +2950,7 @@ fn take_batch(
     holder: first.holder,
     stream: slates_cluster::live::LIVE_ENTRIES_STREAM,
     bytes: batch,
+    made_ns: first.made_ns,
   }
 }
 
@@ -3110,6 +3165,7 @@ fn fold_into(state: &mut ShardState, replies: Vec<(ObjectId, HostId, Vec<u8>)>) 
       note_heard(live);
     }
     if live.shipper.durable() > before {
+      live.diag_resolved_ns = slates_rt::futures::now_ns();
       state.count(LIVE_DURABLE, 1);
       resolve(state, object.0);
     }
@@ -3372,6 +3428,7 @@ fn serve_taken(
   (request, epoch): (&[u8], Option<HostEpoch>),
   decode: impl FnOnce(&[u8], usize) -> Result<Vec<Entry>, LiveError>,
 ) -> Vec<u8> {
+  let diag_began = slates_rt::futures::now_ns();
   let object = slates_db::live::object_of(request);
   let bound = match admitted(state, local, peer, object) {
     Ok(bound) => bound,
@@ -3391,7 +3448,20 @@ fn serve_taken(
     }
     Ok(_) => {
       state.count(LIVE_HELD, taken);
-      acknowledged(state, encode_reply(&reply))
+      let publishing = slates_rt::futures::now_ns();
+      let answer = acknowledged(state, encode_reply(&reply));
+      let now = slates_rt::futures::now_ns();
+      hop_diag::record(
+        state,
+        hop_diag::HOLDER_PUBLISH,
+        now.saturating_sub(publishing),
+      );
+      hop_diag::record(
+        state,
+        hop_diag::HOLDER_SERVE,
+        now.saturating_sub(diag_began),
+      );
+      answer
     }
   }
 }
@@ -5216,5 +5286,118 @@ mod tests {
         "a body of {len} bytes opens as it was sealed"
       );
     }
+  }
+}
+
+/// DIAG (g076b, 2026-11-18, never landed): the live dispatch round's hops timed apart, each span counted by bucket as a
+/// status counter (`fleet.live.span.<span>.le<bound>`, microseconds) with its count and its sum in nanoseconds, so a
+/// run's breakdown is read from `status` at its end and nothing is logged per write.
+#[allow(clippy::indexing_slicing, clippy::unwrap_used)]
+pub(crate) mod hop_diag {
+  use crate::state::ShardState;
+
+  /// The entry built on the owner: from the barrier's hook to the dispatch.
+  pub(crate) const BUILD: usize = 0;
+  /// From the dispatch on the owner to its task running on the control shard.
+  pub(crate) const TO_CONTROL: usize = 1;
+  /// The lane's borrow of its holder's session.
+  pub(crate) const BORROW: usize = 2;
+  /// The exchange, on the control shard: sent to the holder and its first answer back.
+  pub(crate) const EXCHANGE: usize = 3;
+  /// From the exchange's return on the control shard to the fold running on the owner.
+  pub(crate) const TO_OWNER: usize = 4;
+  /// From the fold that made the write durable to the held reply's wait seeing it.
+  pub(crate) const FOLD_TO_WAKE: usize = 5;
+  /// From the barrier's hook to the held reply's wait seeing it durable.
+  pub(crate) const TOTAL: usize = 6;
+  /// On a holder: an entry's serve, from its decode to its answer, its publication included.
+  pub(crate) const HOLDER_SERVE: usize = 7;
+  /// On a holder: the publication before its answer (`acknowledged`).
+  pub(crate) const HOLDER_PUBLISH: usize = 8;
+  /// The NFS stable write's wait for durability, from its barrier to its answer.
+  pub(crate) const NFS_WAIT: usize = 9;
+
+  const NAMES: [&str; 10] = [
+    "build",
+    "to_control",
+    "borrow",
+    "exchange",
+    "to_owner",
+    "fold_to_wake",
+    "total",
+    "holder_serve",
+    "holder_publish",
+    "nfs_wait",
+  ];
+  const BOUNDS_US: [u64; 30] = [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    12,
+    14,
+    16,
+    18,
+    20,
+    25,
+    30,
+    35,
+    40,
+    45,
+    50,
+    60,
+    70,
+    80,
+    100,
+    150,
+    200,
+    500,
+    1000,
+    1_000_000_000,
+  ];
+
+  fn names() -> &'static Vec<(Vec<&'static str>, &'static str, &'static str)> {
+    static NAMED: std::sync::OnceLock<Vec<(Vec<&'static str>, &'static str, &'static str)>> =
+      std::sync::OnceLock::new();
+    NAMED.get_or_init(|| {
+      NAMES
+        .iter()
+        .map(|span| {
+          let buckets = BOUNDS_US
+            .iter()
+            .map(|bound| {
+              &*Box::leak(format!("fleet.live.span.{span}.le{bound:04}").into_boxed_str())
+            })
+            .collect();
+          let count = &*Box::leak(format!("fleet.live.span.{span}.n").into_boxed_str());
+          let sum = &*Box::leak(format!("fleet.live.span.{span}.sum_ns").into_boxed_str());
+          (buckets, count, sum)
+        })
+        .collect()
+    })
+  }
+
+  /// Counts `ns` in `span`'s histogram on this shard.
+  pub(crate) fn record(state: &mut ShardState, span: usize, ns: u64) {
+    let (buckets, count, sum) = &names()[span];
+    let us_ceiling = ns.div_ceil(1_000);
+    let bucket = BOUNDS_US
+      .iter()
+      .position(|bound| us_ceiling <= *bound)
+      .unwrap_or(BOUNDS_US.len() - 1);
+    state.count(buckets[bucket], 1);
+    state.count(count, 1);
+    state.count(sum, ns.max(1));
+  }
+
+  /// Counts `ns` in `span`'s histogram on this shard's state, from outside a borrow of it.
+  pub(crate) fn record_here(span: usize, ns: u64) {
+    let _ = crate::state::with_state(|s| record(s, span, ns));
   }
 }

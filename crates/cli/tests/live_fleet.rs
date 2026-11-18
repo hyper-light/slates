@@ -1826,6 +1826,21 @@ fn measure_what_live_shipping_adds_to_a_stable_nfs_write() {
     "measure: the owner's live counters {:?}",
     live_counters(owner)
   );
+  // DIAG (g076b): every node's span counters, and the owner's live lines with their shards.
+  for (index, instance) in fleet.instances.iter().enumerate() {
+    let spans: std::collections::BTreeMap<String, u64> = live_counters(instance)
+      .into_iter()
+      .filter(|(name, _)| name.starts_with("span."))
+      .collect();
+    eprintln!(
+      "measure-diag: node {index} (owner {}) spans {spans:?}",
+      instance == owner
+    );
+  }
+  let (_, status, _) = run(owner, &["status"]);
+  for line in status.lines().filter(|line| line.contains(" live ")) {
+    eprintln!("measure-diag: owner status: {line}");
+  }
   let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
   drop((plain, live));
   drop(fleet.daemons);
