@@ -102,6 +102,12 @@ pub(crate) struct AdoptedGreen {
   pub(crate) access: Vec<slates_db::catalog::AccessEntry>,
   /// The adopted catalog register's sequence, which the green's record continues from.
   pub(crate) catalog_sequence: u64,
+  /// The green's write policy, from its adopted catalog register (A-285, A-321).
+  pub(crate) write: Option<slates_db::catalog::WritePolicy>,
+  /// The policy's version, from the same register.
+  pub(crate) write_version: u64,
+  /// The green's trusted signers, from the same register (A-321).
+  pub(crate) signers: Vec<Vec<u8>>,
   /// The adopted version.
   pub(crate) head: u64,
   /// The adopted record's identity: the green's head identity at `head`.
@@ -489,8 +495,7 @@ pub(crate) async fn readopt_at_boot(control: u16, shards: &[ShardId]) {
 async fn readopt_one(control: u16, owner: u16, id: DbVolumeId, through: u64) -> bool {
   let object = ObjectId(id.bytes);
   let attempts =
-    crate::state::with_state(|s| crate::fleet::takeover_attempts(s.config.failover_slo_ns))
-      .unwrap_or(1);
+    crate::state::with_state(|s| crate::fleet::takeover_attempts(s.failover_ns)).unwrap_or(1);
   for _ in 0..attempts {
     let Some(engine) = rebuilt_engine(object, through).await else {
       return false;
@@ -540,8 +545,7 @@ async fn rebuilt_engine(object: ObjectId, through: u64) -> Option<Green> {
 /// many times in a row as a takeover attempts a green (`fleet::takeover_attempts`); past that the green is fenced.
 async fn stepped_through(control: u16, owner: u16, id: DbVolumeId) -> bool {
   let bound =
-    crate::state::with_state(|s| crate::fleet::takeover_attempts(s.config.failover_slo_ns))
-      .unwrap_or(1);
+    crate::state::with_state(|s| crate::fleet::takeover_attempts(s.failover_ns)).unwrap_or(1);
   let mut unanswered: u32 = 0;
   while unanswered < bound {
     let step = crate::xshard::call_within(

@@ -727,12 +727,19 @@ fn retirement_learned_periods(daemons: &[&Daemon]) -> u64 {
 }
 
 /// Derived: the coordinator periods the survivors take to learn a voter's departure: a membership horizon for the
-/// detector to hold it dead, the death window, the retirement's commit, the two commits of the joint change that
-/// refills its seat, the period a learner sees its divergence in, and its fetch round.
+/// detector to hold it dead, the death window, the election the departure leaves owed when the voter led the council
+/// (its timeout's base and span, [`election_periods`], and its two rounds, the pre-vote's and the vote's), the
+/// retirement's commit, the two commits of the joint change that refills its seat, the period a learner sees its
+/// divergence in, and its fetch round. The voter these tests stop is the bootstrapper, which leads the council it created
+/// unless a priority transfer moved its leadership, and only a leader proposes the retirement: without the election the
+/// budget ran out with the retirement still owed at one CPU beside two busy loops (diag-g225-forming-fleet-reaches-2,
+/// 2026-11-18: 9 of 48 runs of the two tests waiting on it, every survivor still at the version of the stop or the
+/// leader still naming the stopped voter, 94 periods spent).
 fn departure_learned_periods(daemons: &[&Daemon]) -> u64 {
   horizon_periods()
     .saturating_add(death_window_periods(daemons))
-    .saturating_add(commit_periods().saturating_mul(4))
+    .saturating_add(election_periods(daemons))
+    .saturating_add(commit_periods().saturating_mul(6))
     .saturating_add(1)
 }
 
@@ -13094,6 +13101,204 @@ fn an_owner_admitted_again_forwards_the_volume_its_successor_took_over_and_never
   );
 }
 
+/// A-334's setup for its siblings on the client's shard: three nodes; a live volume on a, shared with every node's
+/// account and written once; a cut off the probe plane until a survivor takes the volume over, healed, and admitted again
+/// at a newer host epoch, so it has yielded the volume. The daemons, the successor's index and the volume.
+fn yielded_by_an_owner_admitted_again() -> (PortLease, Vec<Daemon>, usize, VolumeId) {
+  let (serve_lease, daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let id = shared_live_volume(&daemons);
+  let successor = falsely_taken_over(&daemons, &hosts);
+  heal_the_probe_plane(&daemons);
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let readmitted = poll_until(&observed, REJOIN_DEADLINE, || {
+    Ok(host_epoch_of(&daemons[0]).is_some_and(|epoch| epoch > slates_db::register::FIRST_EPOCH.0))
+  });
+  drop(observed);
+  assert!(readmitted, "a was admitted again at a newer host epoch");
+  (serve_lease, daemons, successor, id)
+}
+
+/// A-334's first sibling on the client's shard (goal g229), A-222's refusal by kind: a node admitted again refuses a
+/// mount of a volume it yielded to its successor as it refuses a mount of any other host's volume. Do: the A-334 setup
+/// ([`yielded_by_an_owner_admitted_again`]); through a client of a, attach the volume as an NFS host mount. Expect
+/// `AttachmentUnsupported` naming the NFS loopback transport and `OwnedByAnotherHost`: the form hands the client
+/// something of a's host, whose copy the successor's writes have passed, and only the record form crosses hosts. Before,
+/// the client's shard took the volume for a's own (a created it), so the refusal by kind never applied.
+#[test]
+fn an_owner_admitted_again_refuses_a_mount_of_the_volume_it_yielded_by_kind() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, successor, id) = yielded_by_an_owner_admitted_again();
+  let mut client = Client::connect(daemons[0].instance());
+  let mounted = client.call(&RequestBody::Attach {
+    volume: id,
+    snapshot: None,
+    intent: Intent::Write,
+    form: AttachRequest::HostMount,
+  });
+  drop(client);
+  let refused_by_kind = refusal_count(&daemons[0], "attachment_unsupported");
+  drop(daemons);
+  eprintln!(
+    "an NFS host mount of a yielded volume through its old owner (successor node {successor}): {mounted:?}; refused by \
+     kind {refused_by_kind:?}"
+  );
+  assert!(
+    matches!(
+      mounted,
+      ReplyBody::Refused {
+        refusal: Refusal::AttachmentUnsupported {
+          transport: slates_ipc::protocol::AttachTransport::NfsLoopback,
+          reason: slates_ipc::protocol::UnsupportedReason::OwnedByAnotherHost,
+        }
+      }
+    ),
+    "a mount of a volume this node yielded is refused by its kind, as another host's is: {mounted:?}"
+  );
+}
+
+/// Format: the variable that makes this test binary the holder of
+/// [`a_holder_of_a_volume_its_node_yielded_is_reaped_at_the_successor`]: the instance it attaches through and the
+/// volume's id in hex, a space between.
+const YIELDED_HOLDER_ROLE: &str = "SLATES_FLEET_TEST_YIELDED_HOLDER";
+/// Format: the tag before the holder's attachment on its standard output. A re-invoked test binary prints libtest's
+/// banner first and glues the role's first line to it, so the tag is looked for anywhere in a line.
+const YIELDED_HOLDER_TAG: &str = "yielded-holder-attached: ";
+
+/// The holder's role in [`a_holder_of_a_volume_its_node_yielded_is_reaped_at_the_successor`], in a re-invoked test
+/// binary (in a normal run it does nothing): attaches the volume its role names for writing through the instance it
+/// names, prints its attachment, and holds it until the parent kills this process, its standard input left open.
+#[test]
+fn yielded_holder_role() {
+  let Ok(role) = std::env::var(YIELDED_HOLDER_ROLE) else {
+    return;
+  };
+  // The daemon is in the parent's process: on Linux, whose rendezvous is sealed (A-187), this one installs its own seal
+  // before its first rendezvous.
+  #[cfg(target_os = "linux")]
+  slates_seal::install();
+  let (instance, volume) = role.split_once(' ').unwrap();
+  let mut client = Client::connect(instance);
+  let attachment = write_attachment(&mut client, volume_of_hex(volume));
+  println!("{YIELDED_HOLDER_TAG}{attachment}");
+  std::io::Write::flush(&mut std::io::stdout()).unwrap();
+  let mut held = String::new();
+  let _ = std::io::stdin().read_line(&mut held);
+}
+
+/// A volume id as hex, for a re-invoked role's environment.
+fn hex_of_volume(volume: VolumeId) -> String {
+  volume
+    .bytes
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect()
+}
+
+/// A volume id from [`hex_of_volume`]'s text.
+fn volume_of_hex(text: &str) -> VolumeId {
+  let mut bytes = [0u8; 16];
+  for (index, byte) in bytes.iter_mut().enumerate() {
+    *byte = u8::from_str_radix(&text[2 * index..2 * index + 2], 16).unwrap();
+  }
+  VolumeId { bytes }
+}
+
+/// The attachments `volume`'s status counts through `client`, or `None` while its daemon does not answer the volume's
+/// status. One client held for a whole poll: a client per check outruns the reaper, which reaps no in-process client on
+/// macOS (its pid lives on), and the daemon refused "too many clients" (the first run of the test below).
+fn attachments_on(client: &mut Client, volume: VolumeId) -> Option<u32> {
+  match client.call(&RequestBody::Status { volume }) {
+    ReplyBody::Status { report } => Some(report.attachments),
+    _ => None,
+  }
+}
+
+/// Shape: the fleet's periods [`a_holder_of_a_volume_its_node_yielded_is_reaped_at_the_successor`] gives a dead holder's
+/// node to end its attachment at the successor: the reaper's silence of two liveness budgets (twenty periods), then a
+/// location round and one forward (a few periods), ten times over for a loaded machine. Its red run waited out the whole
+/// period budget instead (414 s) with the attachment still held.
+const YIELDED_REAP_PERIODS: u64 = 300;
+
+/// A re-invoked holder process, killed and reaped when dropped, so a failed assertion leaves nothing behind.
+struct HolderProcess(std::process::Child);
+
+impl Drop for HolderProcess {
+  fn drop(&mut self) {
+    let _ = self.0.kill();
+    let _ = self.0.wait();
+  }
+}
+
+/// A-334's second sibling on the client's shard (goal g229), A-222's reap: a holder of a volume its node yielded, whose
+/// attach that node forwarded to the successor, is reaped at the successor when it dies, as a holder of another host's
+/// volume is. Do: the A-334 setup ([`yielded_by_an_owner_admitted_again`]); a separate process attaches the volume for
+/// writing through a client of a ([`yielded_holder_role`]), which a forwards to the successor; then kill that process.
+/// Expect the successor to count the attachment while the holder lives, and none once a's reap of the dead client has
+/// run. Before, a's client shard took the volume for its own (a created it), so it never remembered the attach for the
+/// reap, and the attachment stayed on the successor for good, its write lease ending only at its term.
+#[test]
+fn a_holder_of_a_volume_its_node_yielded_is_reaped_at_the_successor() {
+  if std::env::var_os(YIELDED_HOLDER_ROLE).is_some() {
+    return;
+  }
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, successor, id) = yielded_by_an_owner_admitted_again();
+  let mut holder = HolderProcess(
+    std::process::Command::new(std::env::current_exe().unwrap())
+      .args([
+        "--exact",
+        "yielded_holder_role",
+        "--nocapture",
+        "--test-threads=1",
+      ])
+      .env(
+        YIELDED_HOLDER_ROLE,
+        format!("{} {}", daemons[0].instance(), hex_of_volume(id)),
+      )
+      .stdin(std::process::Stdio::piped())
+      .stdout(std::process::Stdio::piped())
+      .stderr(std::process::Stdio::inherit())
+      .spawn()
+      .unwrap(),
+  );
+  let mut lines = std::io::BufRead::lines(std::io::BufReader::new(holder.0.stdout.take().unwrap()));
+  let attachment = loop {
+    let line = lines
+      .next()
+      .expect("the holder printed its attachment")
+      .unwrap();
+    if let Some(at) = line.find(YIELDED_HOLDER_TAG) {
+      break line[at + YIELDED_HOLDER_TAG.len()..].trim().to_owned();
+    }
+  };
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let mut status = Client::connect(daemons[successor].instance());
+  let held = poll_until(&observed, REJOIN_DEADLINE, || {
+    Ok(attachments_on(&mut status, id).is_some_and(|count| count >= 1))
+  });
+  drop(holder);
+  let reaped = poll_for_periods(&observed, REJOIN_DEADLINE, YIELDED_REAP_PERIODS, || {
+    Ok(attachments_on(&mut status, id) == Some(0))
+  });
+  let left = attachments_on(&mut status, id);
+  drop(status);
+  let ended_there = refusal_count(&daemons[successor], "remote_attach.ended");
+  drop(observed);
+  drop(daemons);
+  eprintln!(
+    "a holder of a yielded volume ({attachment}) through its old owner: held at the successor {held}, reaped {reaped}, \
+     left {left:?}, ended there by a reap {ended_there:?}"
+  );
+  assert!(
+    held,
+    "the successor recorded the forwarded attachment of a yielded volume"
+  );
+  assert!(
+    reaped,
+    "the dead holder's attachment ended at the successor once its node reaped it: {left:?} left"
+  );
+}
+
 /// Shape: how long [`a_takeover_completes_when_one_survivor_never_received_the_head`] holds the owner's record
 /// session to one survivor out — the placement deadline, longer than the placements and the owner's stop it
 /// has to cover; the hold ends with the owner in any case.
@@ -22073,6 +22278,296 @@ fn a_share_of_a_green_made_after_its_last_version_survives_a_takeover() {
   );
 }
 
+/// The verdict a merge signed by `key` is answered with: verified, naming the key.
+fn verified_by(key: &common::signer::TestSigner) -> slates_ipc::protocol::Verification {
+  slates_ipc::protocol::Verification::Verified {
+    signer: slates_ipc::protocol::Signer {
+      key: slates_ipc::protocol::SignerKey::Ed25519,
+      fingerprint: key.fingerprint(),
+    },
+  }
+}
+
+/// The policy a green requiring signed merges is set to in `a_greens_policy_signers_and_verdicts_survive_its_owner`:
+/// merges at once, landings forbidden, merges signed.
+fn signed_merges_required() -> slates_ipc::protocol::WritePolicy {
+  slates_ipc::protocol::WritePolicy {
+    merge: slates_ipc::protocol::WriteMode::Bypass,
+    land: slates_ipc::protocol::WriteMode::Forbid,
+    require_signed_merges: true,
+  }
+}
+
+/// The policy `a_volumes_policy_and_signers_survive_its_owner` sets: landings forbidden, merges asked.
+fn landings_forbidden() -> slates_ipc::protocol::WritePolicy {
+  slates_ipc::protocol::WritePolicy {
+    merge: slates_ipc::protocol::WriteMode::Ask,
+    land: slates_ipc::protocol::WriteMode::Forbid,
+    require_signed_merges: false,
+  }
+}
+
+/// Trusts `key` on `volume` and sets its write policy to `policy`, as the launcher does under `secret`, each setting
+/// from the version it reads (the signers move it to 1, the policy to 2).
+fn trust_and_set(
+  launcher: &mut slates_client::Client,
+  (secret, volume): (&[u8; 32], VolumeId),
+  key: &common::signer::TestSigner,
+  policy: slates_ipc::protocol::WritePolicy,
+) {
+  let keys = vec![key.public()];
+  let (_, version) = launcher.signers(volume).unwrap();
+  let proof = slates_server::landing::signers_proof(secret, volume, &keys, version);
+  launcher
+    .set_signers(volume, (&keys, version), proof)
+    .unwrap();
+  let subject = slates_ipc::protocol::PolicySubject::Volume { volume };
+  let (_, version) = launcher.policy(subject).unwrap();
+  let proof = slates_server::landing::policy_proof(secret, &subject, &policy, version);
+  launcher
+    .set_policy(subject, (policy, version), proof)
+    .unwrap();
+}
+
+/// `work` edited with `bytes` and merged signed by `key` over its statement; how the merge was answered.
+fn merge_signed(
+  client: &mut slates_client::Client,
+  work: VolumeId,
+  (path, bytes): (&str, &[u8]),
+  key: &common::signer::TestSigner,
+) -> Result<
+  (slates_client::Submitted, slates_ipc::protocol::Verification),
+  slates_client::ClientError,
+> {
+  client.edit(work, path, 0, 0, bytes)?;
+  let statement = client.merge_statement(work, &[])?.statement;
+  client.submit_with_signature(work, &[], Some(&key.sign(&statement)))
+}
+
+/// Whether `daemon` holds `object`'s catalog register naming a write policy and trusted signers.
+fn holds_policy_and_signers(daemon: &Daemon, object: ObjectId) -> bool {
+  daemon
+    .fleet_holder_head(object.catalog())
+    .ok()
+    .flatten()
+    .and_then(|(_, value)| slates_server::catalog::CatalogValue::from_record_bytes(&value))
+    .is_some_and(|catalog| catalog.write.is_some() && !catalog.signers.is_empty())
+}
+
+/// Whether `daemon` holds what a successor needs of a green's signed work: its catalog register naming a policy and
+/// trusted signers, and its newest merge record carrying a verdict.
+fn holds_signed_work(daemon: &Daemon, object: ObjectId) -> bool {
+  let merge = daemon
+    .fleet_holder_head(object)
+    .ok()
+    .flatten()
+    .and_then(|(_, value)| {
+      slates_server::merge_service::MergeRecordValue::from_record_bytes(&value)
+    });
+  holds_policy_and_signers(daemon, object) && merge.is_some_and(|record| record.signature.is_some())
+}
+
+/// What `a_greens_policy_signers_and_verdicts_survive_its_owner` reads on the successor: the green's policy and signers
+/// with their version, version 1's verdict, a new work's unsigned merge and its signed one.
+type SuccessorView = (
+  Result<(Option<slates_ipc::protocol::WritePolicy>, u64), slates_client::ClientError>,
+  Result<(Vec<Vec<u8>>, u64), slates_client::ClientError>,
+  Result<slates_ipc::protocol::Verification, slates_client::ClientError>,
+  Result<
+    (slates_client::Submitted, slates_ipc::protocol::Verification),
+    slates_client::ClientError,
+  >,
+  Result<
+    (slates_client::Submitted, slates_ipc::protocol::Verification),
+    slates_client::ClientError,
+  >,
+);
+
+/// Reads the successor's view of `green` and merges a new work there, unsigned then signed by `key`.
+fn successor_view(
+  instance: &str,
+  green: VolumeId,
+  key: &common::signer::TestSigner,
+) -> SuccessorView {
+  let mut successor = common::client::connect(instance);
+  let policy = successor.policy(slates_ipc::protocol::PolicySubject::Volume { volume: green });
+  let signers = successor.signers(green);
+  let first = successor
+    .merge_record(green, 1)
+    .map(|record| record.verification);
+  let (work, _) = successor.create_work(green, "after-the-takeover").unwrap();
+  successor
+    .edit(work, "after", 0, 0, b"merged on the successor")
+    .unwrap();
+  let unsigned = successor.submit_with_signature(work, &[], None);
+  let statement = successor
+    .merge_statement(work, &[])
+    .map(|stated| stated.statement);
+  let signed = statement
+    .and_then(|statement| successor.submit_with_signature(work, &[], Some(&key.sign(&statement))));
+  (policy, signers, first, unsigned, signed)
+}
+
+/// A-285, A-321 (§4.16 owner-loss recovery): a green's write policy, its trusted signers and its versions' signature
+/// verdicts survive its owner. Do: three nodes at f = 1; on a, a green the launcher sets to trust one key, merge at once
+/// and require signed merges, and a work over it merged at 1 signed by the key; once both survivors hold the green's
+/// catalog register naming the policy and the key and its merge record carrying the verdict, a dies. Expect on the
+/// successor, once it serves version 1: the policy and the signers read back as set, at version 2; version 1's merge
+/// record verified naming the key, as a judged it (never judged again); an unsigned merge from a new work refused
+/// `SignatureRequired` naming the green; and that work signed by the key merged at 2, verified. Before 2026-11-18 the
+/// catalog register carried neither the policy nor the signers and the merge record no verdict, so the successor read
+/// version 1 unsigned, held the green to no policy and merged the unsigned work.
+#[test]
+fn a_greens_policy_signers_and_verdicts_survive_its_owner() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, mut daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let key = common::signer::TestSigner::fresh();
+  let mut client = Client::connect(daemons[0].instance());
+  let (green, work) = green_with_work(&mut client, "signed-green", &daemons);
+  let mut launcher = common::client::connect(daemons[0].instance());
+  let secret = daemons[0].segment().issuer_secret().unwrap();
+  trust_and_set(
+    &mut launcher,
+    (&secret, green),
+    &key,
+    signed_merges_required(),
+  );
+  let merged = merge_signed(
+    &mut launcher,
+    work,
+    ("signed", b"signed on the owner"),
+    &key,
+  );
+  let object = ObjectId(green.bytes);
+  let held = poll_until(&daemons.iter().collect::<Vec<_>>(), SERVE_DEADLINE, || {
+    Ok(
+      daemons[1..]
+        .iter()
+        .all(|daemon| holds_signed_work(daemon, object)),
+    )
+  });
+  drop(launcher);
+  drop(client);
+  daemons.remove(0).stop();
+  let successor_host =
+    rendezvous_first(&[hosts[1], hosts[2]], object).expect("a survivor takes over the green");
+  let successor_index = usize::from(successor_host != hosts[1]);
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let materialized = poll_until(&survivors, PLACEMENT_DEADLINE, || {
+    daemons[successor_index].merge_record_placed(green, 1)
+  });
+  drop(survivors);
+  let view = successor_view(daemons[successor_index].instance(), green, &key);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert_eq!(
+    merged.unwrap(),
+    (slates_client::Submitted::Accepted(1), verified_by(&key))
+  );
+  assert!(
+    held && materialized,
+    "held {held}, materialized {materialized}"
+  );
+  expect_the_successors_view(view, green, &key);
+}
+
+/// A-285, A-321 (§4.8 "Promotion and takeover"): a plain volume's write policy and trusted signers survive its owner, by
+/// its catalog register. Do: three nodes at f = 1; on a, a scratch volume shared with the fleet, the launcher trusting
+/// one key on it and forbidding its landings; once both survivors hold its head and its catalog register naming both,
+/// a dies.
+/// Expect on its successor, once the volume answers there: the policy and the signers read back as set, at version 2,
+/// and a landing refused `PolicyForbids` naming the volume. Before 2026-11-18 the successor made the volume's record with
+/// no policy and no signers: it read back unset and presented the landing as an unset volume's.
+#[test]
+fn a_volumes_policy_and_signers_survive_its_owner() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, mut daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let key = common::signer::TestSigner::fresh();
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id } = client.call(&scratch("policed")) else {
+    panic!("the volume was created");
+  };
+  share_with_fleet(&mut client, id, &daemons);
+  let mut launcher = common::client::connect(daemons[0].instance());
+  let secret = daemons[0].segment().issuer_secret().unwrap();
+  trust_and_set(&mut launcher, (&secret, id), &key, landings_forbidden());
+  let object = ObjectId(id.bytes);
+  let held = poll_until(&daemons.iter().collect::<Vec<_>>(), SERVE_DEADLINE, || {
+    // A takeover adopts the volume's head and its catalog, so both survivors hold each before the owner dies.
+    Ok(daemons[1..].iter().all(|daemon| {
+      holds_policy_and_signers(daemon, object)
+        && daemon
+          .fleet_holder_head(object)
+          .is_ok_and(|head| head.is_some())
+    }))
+  });
+  drop(launcher);
+  drop(client);
+  daemons.remove(0).stop();
+  let successor_host =
+    rendezvous_first(&[hosts[1], hosts[2]], object).expect("a survivor takes over the volume");
+  let successor_instance = daemons[usize::from(successor_host != hosts[1])]
+    .instance()
+    .to_owned();
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let served = poll_status_answers(&survivors, &successor_instance, id);
+  drop(survivors);
+  let mut reader = common::client::connect(&successor_instance);
+  let policy = reader.policy(slates_ipc::protocol::PolicySubject::Volume { volume: id });
+  let signers = reader.signers(id);
+  let landed = reader.land(
+    id,
+    None,
+    "/nonexistent/policed",
+    slates_ipc::protocol::Filter::default(),
+    None,
+  );
+  drop(reader);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(held && served, "held {held}, served {served}");
+  assert_eq!(policy.unwrap(), (Some(landings_forbidden()), 2));
+  assert_eq!(signers.unwrap(), (vec![key.public()], 2));
+  assert!(
+    matches!(
+      &landed,
+      Err(slates_client::ClientError::Refused(slates_ipc::protocol::Refusal::PolicyForbids {
+        act: slates_ipc::protocol::WriteAct::Land,
+        by: slates_ipc::protocol::PolicySubject::Volume { volume },
+      })) if *volume == id
+    ),
+    "{landed:?}"
+  );
+}
+
+/// The successor's view in `a_greens_policy_signers_and_verdicts_survive_its_owner`, as its doc says.
+fn expect_the_successors_view(
+  view: SuccessorView,
+  green: VolumeId,
+  key: &common::signer::TestSigner,
+) {
+  let (policy, signers, first, unsigned, signed) = view;
+  assert_eq!(policy.unwrap(), (Some(signed_merges_required()), 2));
+  assert_eq!(signers.unwrap(), (vec![key.public()], 2));
+  assert_eq!(first.unwrap(), verified_by(key), "version 1 as a judged it");
+  assert!(
+    matches!(
+      &unsigned,
+      Err(slates_client::ClientError::Refused(slates_ipc::protocol::Refusal::SignatureRequired {
+        by: slates_ipc::protocol::PolicySubject::Volume { volume },
+        verification: slates_ipc::protocol::Verification::Unsigned,
+      })) if *volume == green
+    ),
+    "{unsigned:?}"
+  );
+  assert_eq!(
+    signed.unwrap(),
+    (slates_client::Submitted::Accepted(2), verified_by(key))
+  );
+}
+
 /// §4.16 failure matrix ("Green owner loss in a fleet: Degraded for the membership horizon, then Masked after takeover
 /// on a candidate that holds the ledger"; AUD-14; GAP-A9-7's input half; GAPS 2026-11-09): a successor one version
 /// behind the quorum takes the green over. Do: three nodes at `f = 1`; on a, a green advanced to version 2 and recomputed
@@ -25032,6 +25527,7 @@ fn planted_merge_record(anchor: HostId) -> slates_server::merge_service::MergeRe
     },
     // No request made the planted version (A-255's completion key is for a submit's resend).
     completion: None,
+    signature: None,
   }
 }
 
@@ -25058,6 +25554,9 @@ fn plant_taken_over_green(daemon: &Daemon, with_catalog: bool) {
             live_holders: None,
             // A green, not a work's volume (A-255's route is a work's catalog naming its green).
             work_of: None,
+            write: None,
+            write_version: 0,
+            signers: Vec::new(),
           };
           s.pending_catalogs.insert(object, (1, catalog));
           s.placed_heads.insert(
@@ -25505,6 +26004,9 @@ fn plant_work_route(daemon: &Daemon) {
           work_of: Some(slates_db::catalog::VolumeId {
             bytes: PLANTED_GREEN,
           }),
+          write: None,
+          write_version: 0,
+          signers: Vec::new(),
         };
         s.pending_catalogs.insert(work, (1, catalog));
         s.fleet.track_object_owner(work.catalog(), local);

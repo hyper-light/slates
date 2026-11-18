@@ -885,9 +885,19 @@ impl Daemon {
     let handed = crate::anchor_hold::adopt(config.held_device_bound());
     #[cfg(unix)]
     let mut inherited_devices = crate::fuse_hold::split(handed.devices, shards.len()).into_iter();
-    // The writable copies (A-197), each moved to the shard that holds its map: Linux alone sends the anchor one.
+    // The held copies: the Shards streams' DAX objects (A-365), each moved to the shard that owns its attachment; and
+    // the writable direct maps' copies (A-197), each to the shard that holds its map, which Linux alone sends the anchor.
+    #[cfg(unix)]
+    let (other_copies, inherited_dax) = crate::shards::dax_hold::split(handed.copies, shards.len());
+    #[cfg(unix)]
+    let mut inherited_dax = inherited_dax.into_iter();
     #[cfg(target_os = "linux")]
-    let mut inherited_copies = crate::held_copy::split(handed.copies, shards.len()).into_iter();
+    let mut inherited_copies = crate::held_copy::split(other_copies, shards.len()).into_iter();
+    #[cfg(all(unix, not(target_os = "linux")))]
+    for copy in other_copies {
+      // No other kind of copy is held here: one is let go at once, its record no shard's.
+      let _released = crate::anchor_hold::release_copy(copy.copy);
+    }
     #[cfg(windows)]
     let mut inherited_winfsp = crate::winfsp::split_held(handed.mounts, shards.len()).into_iter();
     #[cfg(windows)]
@@ -910,6 +920,7 @@ impl Daemon {
         devices: inherited_devices.next().unwrap_or_default(),
         #[cfg(target_os = "linux")]
         copies: inherited_copies.next().unwrap_or_default(),
+        dax: inherited_dax.next().unwrap_or_default(),
       };
       #[cfg(windows)]
       let windows_holds = (
@@ -3911,12 +3922,17 @@ fn content_slice(
   (usize, usize),
   Option<crate::write_log::WriteLog>,
   crate::write_log::Recovered,
+  Option<crate::dax_ranges::RangeTable>,
 ) {
   let images = image_range(config, partition, content.as_deref());
   let Some(object) = content.filter(|_| images.1 > images.0) else {
-    return ((0, 0), None, crate::write_log::Recovered::default());
+    return ((0, 0), None, crate::write_log::Recovered::default(), None);
   };
   let layout = config.shard_content_layout();
+  // The DAX range table (A-365), with what the previous daemon recorded in it.
+  let ranges_start = slice_start(config, partition).saturating_add(layout.dax_ranges.0);
+  let ranges_bytes = layout.dax_ranges.1.saturating_sub(layout.dax_ranges.0);
+  let dax_ranges = crate::dax_ranges::RangeTable::open(object, ranges_start, ranges_bytes);
   let log_start = slice_start(config, partition).saturating_add(layout.write_log.0);
   let log_bytes = layout.write_log.1.saturating_sub(layout.write_log.0);
   // The journal's generation — the checkpoint's advanced over its committed deltas (A-68) — since a write logged
@@ -3935,8 +3951,13 @@ fn content_slice(
     },
   );
   match crate::write_log::WriteLog::open(object, log_start, log_bytes, generation) {
-    Some((log, recovered)) => (images, Some(log), recovered),
-    None => (images, None, crate::write_log::Recovered::default()),
+    Some((log, recovered)) => (images, Some(log), recovered, dax_ranges),
+    None => (
+      images,
+      None,
+      crate::write_log::Recovered::default(),
+      dax_ranges,
+    ),
   }
 }
 
@@ -3975,6 +3996,8 @@ struct ShardHolds {
   /// The held writable copies.
   #[cfg(target_os = "linux")]
   copies: Vec<crate::held_copy::InheritedCopy>,
+  /// The held Shards streams' DAX objects (A-365).
+  dax: Vec<crate::shards::dax_hold::InheritedDax>,
 }
 
 /// A shard's start, run alone on its shard ([`futures::spawn_alone`]): its boot fault if the tests set one, then
@@ -4260,7 +4283,7 @@ async fn init_shard(
     None => None,
   };
   #[cfg(unix)]
-  let (content_range, write_log, recovered_writes) =
+  let (content_range, write_log, recovered_writes, dax_ranges) =
     content_slice(config, partition, content.as_mut());
   #[cfg(windows)]
   let content_range = content_slice(config, partition, content.as_ref());
@@ -4317,6 +4340,12 @@ async fn init_shard(
     pending_replies: std::collections::BTreeMap::new(),
     #[cfg(unix)]
     recovered_replies: std::collections::BTreeMap::new(),
+    #[cfg(unix)]
+    dax_ranges,
+    #[cfg(unix)]
+    inherited_dax: holds.dax,
+    #[cfg(unix)]
+    adopted_dax: std::collections::BTreeMap::new(),
     write_verifier: now.to_be_bytes(),
     nfs_v4: None,
     nfs_v4_files: None,
@@ -7151,6 +7180,7 @@ mod tests {
           uid: 0,
         },
         completion: None,
+        signature: None,
       };
       let record = Record {
         owner,
@@ -9239,6 +9269,7 @@ mod tests {
           uid: 0,
         },
         completion: None,
+        signature: None,
       };
       let record = Record {
         owner,
