@@ -475,6 +475,15 @@ pub enum Op {
     /// The volume.
     id: VolumeId,
   },
+  /// A snapshot was captured as a complete immutable base (§4.15 `capture_base`, A-291): its tree holds every name,
+  /// byte and attribute, none read from the host directory, so a clone of it is made with no base directory. Kept while
+  /// the snapshot and its volume are. Appended (2026-11-18).
+  BaseCaptured {
+    /// The volume.
+    volume: VolumeId,
+    /// The snapshot.
+    snapshot: crate::catalog::SnapshotId,
+  },
 }
 
 impl Op {
@@ -548,6 +557,7 @@ impl Op {
       Op::CompletionAwaiting { .. } => "completion_awaiting",
       Op::VolumeWritePolicySet { .. } => "volume_write_policy_set",
       Op::VolumeReleased { .. } => "volume_released",
+      Op::BaseCaptured { .. } => "base_captured",
     }
   }
 }

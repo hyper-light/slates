@@ -699,6 +699,55 @@ fn a_lone_instance_names_itself_and_refuses_a_move_typed() {
   daemon.stop();
 }
 
+/// A-291 (§4.15 `capture_base`): an overlay's base captured whole, and a clone of the capture reading it with no base
+/// directory, the form a kiln workspace takes so it can move between runners. Do: write two files into a folder,
+/// overlay it, capture its base; then change one file and add another in the folder; clone the captured snapshot and
+/// read it; capture a scratch volume. Expect the clone to read the captured bytes, never the folder's later ones, and to
+/// report no base (it reads no folder); and the scratch volume's capture refused `Unsupported`, there being no base to
+/// capture.
+#[test]
+fn a_captured_bases_clone_reads_the_capture_with_no_base_directory() {
+  let (daemon, mut instance) = grouped("capture");
+  let folder = Folder::new();
+  folder.write("a.txt", b"first");
+  folder.write("sub/b.txt", b"second");
+  let overlay = provision(
+    &mut instance,
+    &VolumeSpec::overlay("captured", &folder.path, ROOM),
+  );
+  let snapshot = instance.capture_base(overlay).unwrap();
+  folder.write("a.txt", b"changed on the disk after the capture");
+  folder.write("late.txt", b"added after the capture");
+  let clone = provision(
+    &mut instance,
+    &VolumeSpec::clone_of("workspace", overlay, snapshot),
+  );
+  assert_eq!(read_file(&mut instance, clone, "/a.txt"), b"first");
+  assert_eq!(read_file(&mut instance, clone, "/sub/b.txt"), b"second");
+  assert!(
+    matches!(
+      instance.read(clone, "/late.txt", slates_api::ReadAt::Head),
+      Err(Error::NotFound(_))
+    ),
+    "the clone holds the capture, never the folder's later entries"
+  );
+  assert_eq!(
+    instance.status(clone).unwrap().base,
+    None,
+    "the clone reads no base directory"
+  );
+  let scratch = provision(&mut instance, &VolumeSpec::empty("plain", ROOM));
+  assert!(
+    matches!(
+      instance.capture_base(scratch),
+      Err(Error::Unsupported(Unsupported::Feature(_)))
+    ),
+    "a scratch volume has no base to capture"
+  );
+  drop(instance);
+  daemon.stop();
+}
+
 #[test]
 fn the_daemon_is_observed_through_the_library() {
   let (daemon, mut instance) = grouped("observe");

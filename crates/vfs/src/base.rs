@@ -1099,7 +1099,11 @@ impl Volume {
 pub struct PinWalk {
   dirs: Vec<String>,
   files: Vec<InodeNo>,
+  /// A capture's base links, whose targets become the volume's own (none for a pin, which leaves links alone).
+  links: Vec<InodeNo>,
   pinned: usize,
+  /// Whether the walk captures the base (§4.15 `capture_base`, A-291) rather than pins it.
+  capture: bool,
 }
 
 impl PinWalk {
@@ -1111,7 +1115,20 @@ impl PinWalk {
     PinWalk {
       dirs,
       files: Vec::new(),
+      links: Vec::new(),
       pinned: 0,
+      capture: false,
+    }
+  }
+
+  /// A capture of the whole base (§4.15 `capture_base`, A-291): every directory listed, every file's bytes made the
+  /// volume's own whatever its size ([`Overlay::capture_file`]) and every link's target too, so a snapshot taken after
+  /// it holds no base-backed body: its archive covers the whole tree, and a clone of it needs no base directory. Where a
+  /// pin keeps a large file on its descriptor with its windows held, a capture reads it whole; that is its cost.
+  pub fn capture() -> PinWalk {
+    PinWalk {
+      capture: true,
+      ..PinWalk::new(None)
     }
   }
 
@@ -2605,27 +2622,7 @@ impl Overlay<'_> {
       // The small class: the bytes come in whole and the body becomes plain content.
       self.host.close_file(file);
       self.plane()?.descriptors.remove(&no);
-      let handle = self.vol.make_current_inode(store, no)?;
-      let charge = self.vol.write_charge(store, no, 0, fp.size)?;
-      store.make_room(self.vol.quota.growth_needed(self.vol.bytes.total(), charge));
-      if !self
-        .vol
-        .quota
-        .admit(self.vol.bytes.total(), charge, &mut store.budget)
-      {
-        return Err(VfsError::NoSpace);
-      }
-      // The copy lands whole or not at all (T-1.1): checked for room before the base body is replaced.
-      let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-      self.vol.write_room(store, 0, len)?;
-      let before = crate::volume::content_by_epoch(store, handle);
-      store.inodes.get_mut(handle)?.body = Body::Inline(Vec::new());
-      self
-        .vol
-        .reconcile(before, crate::volume::EpochContent::Empty);
-      if !bytes.is_empty() {
-        self.vol.apply_write_whole(store, handle, 0, &bytes)?;
-      }
+      self.own_whole(store, no, &bytes)?;
     } else {
       self.plane()?.descriptors.insert(no, file);
     }
@@ -2633,6 +2630,57 @@ impl Overlay<'_> {
     self
       .vol
       .record(&mut store.metadata, Op::Witness, path, Some(no), prev);
+    Ok(())
+  }
+
+  /// A captured file's bytes become the volume's own, whatever its size (§4.15 `capture_base`, A-291): it is copied up as
+  /// a write would copy it, and a large file the copy-up kept on its descriptor (pinned or not) is then read whole,
+  /// checked against its witness and made plain content, its descriptor closed. A source that changed under the capture
+  /// is refused `DigestUnverified` (the caller captures again once it is quiesced); a file already the volume's own is
+  /// left as it is.
+  fn capture_file(&mut self, store: &mut Store, no: InodeNo) -> Result<(), VfsError> {
+    self.copy_up(store, no, CopyUp::Content)?;
+    let (base_len, identity) = match &self.vol.inode(store, no)?.body {
+      Body::Base(base) => (base.base_len, base.witness.as_ref().map(|w| w.identity)),
+      _ => return Ok(()),
+    };
+    self.check_drift(store, no)?;
+    let file = self.descriptor(store, no)?;
+    let bytes = self.read_whole(file, base_len)?;
+    if identity != Some(*blake3::hash(&bytes).as_bytes()) {
+      return Err(VfsError::DigestUnverified);
+    }
+    self.own_whole(store, no, &bytes)?;
+    if let Some(file) = self.plane()?.descriptors.remove(&no) {
+      self.host.close_file(file);
+    }
+    Ok(())
+  }
+
+  /// Makes `bytes` the whole content of the base file `no`, its body plain content from here on: charged and admitted
+  /// before the base body is replaced, so the copy lands whole or not at all (T-1.1). The small class's copy-up and a
+  /// capture's large file both end here.
+  fn own_whole(&mut self, store: &mut Store, no: InodeNo, bytes: &[u8]) -> Result<(), VfsError> {
+    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let handle = self.vol.make_current_inode(store, no)?;
+    let charge = self.vol.write_charge(store, no, 0, len)?;
+    store.make_room(self.vol.quota.growth_needed(self.vol.bytes.total(), charge));
+    if !self
+      .vol
+      .quota
+      .admit(self.vol.bytes.total(), charge, &mut store.budget)
+    {
+      return Err(VfsError::NoSpace);
+    }
+    self.vol.write_room(store, 0, len)?;
+    let before = crate::volume::content_by_epoch(store, handle);
+    store.inodes.get_mut(handle)?.body = Body::Inline(Vec::new());
+    self
+      .vol
+      .reconcile(before, crate::volume::EpochContent::Empty);
+    if !bytes.is_empty() {
+      self.vol.apply_write_whole(store, handle, 0, bytes)?;
+    }
     Ok(())
   }
 
@@ -3856,9 +3904,19 @@ impl Overlay<'_> {
     walk: &mut PinWalk,
   ) -> Result<Option<usize>, VfsError> {
     if let Some(no) = walk.files.pop() {
+      if walk.capture {
+        self.capture_file(store, no)?;
+      } else {
+        self.copy_up(store, no, CopyUp::Content)?;
+        let size = self.vol.inode(store, no)?.attrs.size;
+        self.pin_windows(store, no, 0, size)?;
+      }
+      walk.pinned = walk.pinned.saturating_add(1);
+      return Ok(None);
+    }
+    if let Some(no) = walk.links.pop() {
+      // A captured link's target becomes the volume's own: its copy-up reads nothing from the disk.
       self.copy_up(store, no, CopyUp::Content)?;
-      let size = self.vol.inode(store, no)?.attrs.size;
-      self.pin_windows(store, no, 0, size)?;
       walk.pinned = walk.pinned.saturating_add(1);
       return Ok(None);
     }
@@ -3876,6 +3934,7 @@ impl Overlay<'_> {
           match kind {
             Kind::Dir => walk.dirs.push(child_path(&path, &name)),
             Kind::File => walk.files.push(no),
+            Kind::Symlink if walk.capture => walk.links.push(no),
             Kind::Symlink | Kind::Fifo | Kind::Socket => {}
           }
         }

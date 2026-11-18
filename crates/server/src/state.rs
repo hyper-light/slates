@@ -780,8 +780,12 @@ pub struct ShardState {
   /// configuration drops their exceptions (A-291), on the control shard only. Bounded by the exceptions naming this node.
   pub(crate) moves_forgotten: std::collections::BTreeSet<ObjectId>,
   /// Slots of volumes released to the member a move named (A-291), freed in the destroy's slices
-  /// ([`crate::verbs::step_destroys`]); their records already left. Bounded by the shard's volumes.
-  pub(crate) releasing: Vec<slates_mem::Handle<VolumeSlot>>,
+  /// ([`crate::verbs::step_destroys`]); their records already left. Each carries a clone's pin on its origin's snapshot,
+  /// given back once the slot is gone. Bounded by the shard's volumes.
+  pub(crate) releasing: Vec<(
+    slates_mem::Handle<VolumeSlot>,
+    Option<(slates_db::catalog::VolumeId, slates_db::catalog::SnapshotId)>,
+  )>,
   /// A learner has evidence its configuration is behind the region and should refresh from a voter next
   /// period (§4.8 the reactive piggyback). Set when this node **received** a record naming a newer
   /// configuration generation than its own (the holder-behind case, [`crate::fleet::accept_held_record`]),

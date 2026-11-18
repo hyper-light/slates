@@ -2067,6 +2067,100 @@ fn a_moved_volume_is_released_whole_and_leaves_no_tombstone() {
     .unwrap();
 }
 
+/// A-291 (§4.15 `capture_base`): do record a volume's snapshot, capture it as a complete base, refuse a capture of a
+/// snapshot the partition does not hold, recover the database, destroy the captured snapshot, capture a second snapshot
+/// and release the volume, and recover again. Expect the captured snapshot named so before and after the first recovery
+/// and the unheld one refused `NotFound` with nothing recorded; the capture gone with its snapshot's destroy, and with
+/// its volume's release; and the second recovery to agree.
+#[test]
+fn a_captured_base_is_kept_with_its_snapshot_and_goes_with_it() {
+  let mut segment = segment("slates-db-captured-base", LOG_BYTES);
+  let mut db = open(&mut segment);
+  let base = volume(1, "base");
+  db.mutate(
+    &mut segment,
+    &Op::VolumeCreated {
+      record: base.clone(),
+    },
+    0,
+  )
+  .unwrap();
+  let taken = |value: u64| Op::SnapshotTaken {
+    record: SnapshotRecord {
+      id: SnapshotId { value },
+      volume: base.id,
+      epoch: value,
+      identity: None,
+      placed: PlacementState::Local,
+      taken_ns: 0,
+    },
+  };
+  let (first, second) = (SnapshotId { value: 1 }, SnapshotId { value: 2 });
+  db.mutate(&mut segment, &taken(1), 0).unwrap();
+  db.mutate(
+    &mut segment,
+    &Op::BaseCaptured {
+      volume: base.id,
+      snapshot: first,
+    },
+    0,
+  )
+  .unwrap();
+  assert!(db.partition().is_captured(base.id, first));
+  assert_eq!(
+    db.mutate(
+      &mut segment,
+      &Op::BaseCaptured {
+        volume: base.id,
+        snapshot: second,
+      },
+      0,
+    ),
+    Err(DbError::NotFound),
+    "a capture names a snapshot the partition holds"
+  );
+  assert!(!db.partition().is_captured(base.id, second));
+  drop(db);
+  let mut db = open(&mut segment);
+  assert!(
+    db.partition().is_captured(base.id, first),
+    "the capture survives a recovery"
+  );
+  db.mutate(
+    &mut segment,
+    &Op::SnapshotDestroyed {
+      volume: base.id,
+      id: first,
+    },
+    0,
+  )
+  .unwrap();
+  assert!(
+    !db.partition().is_captured(base.id, first),
+    "the capture goes with its snapshot"
+  );
+  db.mutate(&mut segment, &taken(2), 0).unwrap();
+  db.mutate(
+    &mut segment,
+    &Op::BaseCaptured {
+      volume: base.id,
+      snapshot: second,
+    },
+    0,
+  )
+  .unwrap();
+  db.mutate(&mut segment, &Op::VolumeReleased { id: base.id }, 0)
+    .unwrap();
+  assert!(
+    !db.partition().is_captured(base.id, second),
+    "the capture goes with its volume"
+  );
+  drop(db);
+  let recovered = open(&mut segment);
+  assert!(!recovered.partition().is_captured(base.id, first));
+  assert!(!recovered.partition().is_captured(base.id, second));
+}
+
 // ---------------------------------------------------------------- acknowledgements that name owed ids
 
 /// One step of a client whose acknowledgements name the ids it still owes (§4.9), and of their delivery to the

@@ -4170,10 +4170,26 @@ impl Client {
     }
   }
 
+  /// Captures an overlay's whole base into a complete immutable snapshot (§4.15 `capture_base`, A-291): every file's
+  /// bytes and every link's target become the volume's own, and the snapshot is recorded captured, so a clone of it
+  /// ([`Client::clone_snapshot`]) needs no base directory and moves between fleet members as a
+  /// plain volume does. The caller asserts nothing writes the source while it runs; a source that changed under it is
+  /// refused `ConsistentBaseUnavailable`. Waits for the walk, which reads the whole base. `write` on the volume is
+  /// required.
+  pub fn capture_base(&mut self, volume: VolumeId) -> Result<SnapshotId, ClientError> {
+    match self.call(&RequestBody::CaptureBase { volume })? {
+      ReplyBody::BaseCaptured { snapshot } => Ok(snapshot),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "capture_base",
+      }),
+    }
+  }
+
   /// Asks the owner to move `volume` to the fleet member `to` (§4.10 "Ownership follows the writer", A-291; `admin` on
-  /// the volume is required, and it must be a plain volume with no attachment, clone, lineage or snapshot but its
-  /// head). One ask: the move goes on between asks, and the caller asks again until it is done ([`MoveState::Moved`]).
-  /// A volume that cannot move is refused `Refusal::MoveRefused`, its `MoveRefusal` saying why.
+  /// the volume is required, and it must be a plain volume, a clone of a captured base among them, with no attachment,
+  /// clone of its own or snapshot but its head). One ask: the move goes on between asks, and the caller asks again
+  /// until it is done ([`MoveState::Moved`]). A volume that cannot move is refused `Refusal::MoveRefused`, its
+  /// `MoveRefusal` saying why.
   pub fn move_volume(&mut self, volume: VolumeId, to: u64) -> Result<MoveState, ClientError> {
     match self.call(&RequestBody::Move { volume, to })? {
       ReplyBody::Moving { to } => Ok(MoveState::Moving { to }),

@@ -148,6 +148,16 @@ where you must decide; a moved contract then fails your build at the place to up
   go once the new one has placed it. Refusals: `Busy(Attached)`, `Busy(Moving)`,
   `Unusable(Unmovable(NotPlain | Lineage | Snapshots))`, `Invalid(MoveTarget(NotMember |
   OutsideNeighbourhood))`, `Retry { cause: MoveUnplaced, .. }`. A lone instance has no other member.
+  An overlay does not move (its folder stays on its machine); a clone of a captured base does.
+- Capturing a folder once for many workspaces that move (A-291): `capture_base(overlay)` makes
+  every byte and link of the overlay's folder the volume's own and answers a snapshot holding the
+  whole tree; `VolumeSpec::clone_of(name, overlay, snapshot)` then gives each workspace an O(1)
+  clone that reads no folder at all, so it moves like an empty volume's and outlives the folder.
+  Capture only a folder nothing writes while it runs (a commit's tree checked out for it): a file
+  that changes while it is read is refused `Error::Retry { cause: ChangedWhileRead, .. }`, and a
+  capture the folder moved under `Error::Invalid(Invalid::LiveBase)`; a volume with no folder is
+  refused `Error::Unsupported`. A large file is read whole, so the capture costs its bytes in memory
+  once more while it runs.
 - Observation: `daemon_status`, `audit` (typed `AuditRecord`s), `grants` (typed `GrantRecord`s),
   `telemetry`.
 

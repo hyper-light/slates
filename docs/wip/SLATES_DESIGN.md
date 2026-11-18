@@ -6526,8 +6526,10 @@ holder duty is balanced by neighbourhood changes; operators keep an explicit mov
 > `slates move ID --to HOST` (`RequestBody::Move`; `slates_client::Client::move_volume`) runs the planned handoff
 > as place, switch, adopt, release (`crates/server/src/moves.rs`):
 > - **Place.** The owner refuses, each by its own `MoveRefusal`, a volume that is not a plain live one, one with an
->   attachment or lease, a clone, lineage or green origin, or a snapshot other than its head, and a target that is not
->   another member of its neighbourhood (which holds the volume's sealing keys). It hands over its head (a snapshot
+>   attachment or lease, clones or a green that depends on it, or a snapshot other than its head, and a target that is
+>   not another member of its neighbourhood (which holds the volume's sealing keys). A clone that reads no base
+>   directory moves (a clone of a captured base, §4.15, or of a plain volume): its tree is archived whole, and its pin
+>   on its origin's snapshot is given back when its old owner lets it go. It hands over its head (a snapshot
 >   only if the volume changed since), freezes the volume (every other verb answers `Overloaded`, retryable), waits
 >   until the head and catalog are placed at `f + 1` of its cohort (a live log durable at its head), captures its own
 >   newest records of both registers and reports `Move` with that cohort. The target's neighbourhood must cover the
@@ -6546,9 +6548,11 @@ holder duty is balanced by neighbourhood changes; operators keep an explicit mov
 > left before any switch, or an unreported one whose records were not placed within the failover SLO
 > (`MoveRefusal::Unplaced`). `a_volume_moved_to_another_member_is_served_there_and_its_old_owner_forwards`
 > (`crates/server/tests/fleet.rs`) moves a volume between three daemons and back to its creator.
+> An overlay does not move (its base stays on its source host, "Overlay volumes in a fleet"): a workspace that must move
+> is a clone of a captured base (§4.15 `capture_base`), which `a_clone_of_a_captured_base_moves_and_gives_its_pin_back`
+> moves between three daemons.
 > Owed: the automatic migration by the origin of the last N writes (AC-8.16's other half: N is to be derived from a
-> measured migration against the measured cross-host write), an overlay's move (its base stays on its source host,
-> "Overlay volumes in a fleet"), and a move carrying snapshots other than the head.
+> measured migration against the measured cross-host write), and a move carrying snapshots other than the head.
 
 **Green volumes in a fleet (D-27).** A green volume's owner runs its merge task; an increment's
 post-state is a sealed snapshot of the work volume, placed to the work volume's candidates by
@@ -7686,6 +7690,26 @@ facility refuses `ConsistentBaseUnavailable`; repeated stats alone cannot prove 
 arbitrary multi-file scan corresponds to one instant. Ordinary `pin` can stabilize named
 entries as observed, but is not relabelled atomic whole-tree capture. Report source identity,
 coverage, dependencies, bytes read/retained and elapsed cost.
+
+> **Status (2026-11-18, A-291: `capture_base` is built for a source its caller quiesces).** `RequestBody::CaptureBase`
+> (`slates_client::Client::capture_base`, `slates_api::Instance::capture_base`) runs the pin's sliced walk with every
+> file's bytes made the volume's own whatever their size, each large file read whole and checked against its witness
+> (`DigestUnverified` when it changed under the read), and every link's target owned (`PinWalk::capture`,
+> `Overlay::capture_file` in `crates/vfs/src/base.rs`). It then takes a snapshot, judges it complete with the host (no
+> file left on the disk, every merged directory's base names frozen, nothing drifted or unverified), and records it
+> captured (`Op::BaseCaptured`, kept in the partition's snapshot with its snapshot and dropped with it); an incomplete
+> one is destroyed again and refused `ConsistentBaseUnavailable`. A clone of a captured snapshot has no base plane and
+> no host (`Volume::clone_without_base`, its record `BaseRecord::Scratch`), so it serves with the folder gone and moves
+> between fleet members as a plain volume does (§4.10's status). The quiescence is the caller's: kiln captures a
+> commit's tree checked out where nothing else writes. Evidence: `a_captured_base_holds_every_byte_and_its_clone_needs_no_base_directory`
+> (`crates/vfs/tests/base.rs`: a pin of the same tree refuses a whole archive, the capture's archives whole),
+> `a_captured_base_is_kept_with_its_snapshot_and_goes_with_it` (`crates/db/tests/model.rs`),
+> `a_captured_bases_clone_reads_the_capture_with_no_base_directory` (`crates/api/tests/api.rs`) and
+> `a_clone_of_a_captured_base_moves_and_gives_its_pin_back` (`crates/server/tests/fleet.rs`). Owed: admission does not
+> reserve the capture's cost ahead (the volume's quota charges each file as it is made the volume's own, and a refusal
+> part-way leaves what was captured as copied-up entries, which change nothing a reader sees); a large file is read
+> whole in one slice (its bytes held once more while it is checked), where its windows could be read across slices; and
+> the report of bytes read and retained and of the elapsed cost.
 
 A verified content digest xattr, if exported, names exactly the current immutable file bytes.
 It is invalidated before any mutation and absent while content is unsealed or unverified;
@@ -21605,7 +21629,15 @@ stream, the drivers, `MovedForgotten` at a retired tombstone; `takeover.rs`: `ad
   a remote base service (the source runner must stay up; asynchronous base reads in the volume core) and re-binding a
   moved overlay to the target's own copy of the folder (an equal path on another host is not evidence of an equal
   source).
-- **Owed.** `capture_base` and the move of a clone of a captured base (its lineage is refused `MoveRefusal::Lineage`
-  until then); kiln's switch from per-agent overlays to clones of a captured base; the automatic migration by the
+- **Built the same day: the capture, and the move of a clone.** `capture_base` (§4.15's status) and the move of a clone
+  that reads no base directory, its pin on its origin's snapshot given back when its old owner lets it go (§4.10's
+  status). Applied in `crates/db` (`op.rs`: `Op::BaseCaptured`; `partition.rs`: `CapturedBase`, `is_captured`, kept in
+  the snapshot), `crates/vfs` (`base.rs`: `PinWalk::capture`, `Overlay::capture_file`, `Overlay::own_whole`;
+  `volume.rs`: `Volume::clone_without_base`), `crates/ipc` (`RequestBody::CaptureBase`, `ReplyBody::BaseCaptured`),
+  `crates/server` (`verbs.rs`: `capture_base` and its snapshot judged complete and recorded, a captured snapshot's
+  clone made with no host and a scratch base record, a released clone's pin given back; `moves.rs`: a clone moves;
+  `state.rs`: `releasing` carries the pin), `crates/client` (`Client::capture_base`), `crates/api`
+  (`Instance::capture_base`, `CONTRACT` 6), `docs/library.md`. Evidence: the four tests §4.15's status names.
+- **Owed.** Kiln's switch from per-agent overlays to clones of a captured base; the automatic migration by the
   origin of the last N writes (AC-8.16's other half); a move that carries snapshots other than the head; the
   multi-runner test with injected faults (GAPS).

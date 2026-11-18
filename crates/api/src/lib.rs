@@ -99,8 +99,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// a landing or a merge a policy forbids answered as its `Refused` outcome (the same day). 4: the audit log and the
 /// grant listing typed (`AuditRecord`, `GrantRecord`; the same day). 5: a volume's move to another fleet member
 /// (A-291, the same day): `Instance::move_volume` and `Instance::member`, `MoveProgress`, and its refusals' details
-/// (`Busy::Attached`, `Busy::Moving`, `Unusable::Unmovable`, `Invalid::MoveTarget`, `RetryCause::MoveUnplaced`).
-pub const CONTRACT: u32 = 5;
+/// (`Busy::Attached`, `Busy::Moving`, `Unusable::Unmovable`, `Invalid::MoveTarget`, `RetryCause::MoveUnplaced`). 6:
+/// `Instance::capture_base`, an overlay's base captured whole so its clones move (A-291, the same day).
+pub const CONTRACT: u32 = 6;
 
 /// The typed client and its own types, for the verbs [`Instance::client`] lends outside the contract.
 pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, VhostUserDevice};

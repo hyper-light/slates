@@ -5164,6 +5164,182 @@ fn a_move_whose_target_dies_at_the_switch_is_served_by_its_successor() {
   );
 }
 
+/// A-291 (§4.15 `capture_base`, §4.10 "Ownership follows the writer"; the supervisor's decision of 2026-11-18): a kiln
+/// workspace moves as a clone of a captured base. Three daemons at `f = 1`. Do: on a, overlay a directory of two files
+/// and ask to move the overlay; capture its base; clone the captured snapshot and ask a to destroy that snapshot; write
+/// a third file into the clone and move the clone to b until the move is done; read all three files through b's client;
+/// wait until a has let its copy go, then destroy the captured snapshot on a and read all three through b again. Expect:
+/// the overlay refused `MoveRefusal::NotPlain` (its base stays on its host); the capture answered `BaseCaptured`; the
+/// snapshot refused while the clone pins it; the clone moved and served whole by b, which reads no base directory; a
+/// releasing its copy (`fleet.move.released`) and with it the clone's pin, so the captured snapshot is destroyed; and b
+/// still serving every file, its copy standing alone. Before the capture an overlay's clone read the base directories
+/// of the host that made it, so it could not move.
+#[test]
+fn a_clone_of_a_captured_base_moves_and_gives_its_pin_back() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let instances: Vec<String> = daemons
+    .iter()
+    .map(|daemon| daemon.instance().to_owned())
+    .collect();
+  let fleet: Vec<&Daemon> = daemons.iter().collect();
+  let files: [(&str, &[u8]); 3] = [
+    ("/one", b"the first captured file"),
+    ("/two", b"the second, longer captured file"),
+    ("/three", b"written into the clone"),
+  ];
+  let base = common::target::target_dir();
+  for (path, bytes) in files.iter().take(2) {
+    base.seed(path.trim_start_matches('/'), bytes);
+  }
+  let mut client_a = Client::connect(&instances[0]);
+  let ReplyBody::Created { id: overlay } = client_a.call(&RequestBody::Create {
+    name: "captured-workspace-base".to_owned(),
+    size: SizeClass::Bounded { limit: 1 << 20 },
+    names: NamePolicy::Exact,
+    require_locked: false,
+    base: Some(base.path.clone()),
+  }) else {
+    panic!("overlay on node a");
+  };
+  let overlay_move = client_a.call(&RequestBody::Move {
+    volume: overlay,
+    to: hosts[1].0,
+  });
+  let captured = client_a.call(&RequestBody::CaptureBase { volume: overlay });
+  let ReplyBody::BaseCaptured { snapshot } = captured else {
+    panic!("capture of the overlay's base: {captured:?}");
+  };
+  let ReplyBody::Cloned { id: clone } = client_a.call(&RequestBody::Clone {
+    volume: overlay,
+    snapshot,
+    name: "captured-workspace".to_owned(),
+  }) else {
+    panic!("clone of the captured snapshot");
+  };
+  let destroy_while_pinned = client_a.call(&RequestBody::DestroySnapshot {
+    volume: overlay,
+    snapshot,
+  });
+  let ReplyBody::Attached { attachment, .. } = client_a.call(&RequestBody::Attach {
+    volume: clone,
+    snapshot: None,
+    intent: Intent::Write,
+    form: AttachRequest::Root,
+  }) else {
+    panic!("write attach of the clone");
+  };
+  let wrote = client_a.call(&RequestBody::FsWrite {
+    volume: clone,
+    attachment,
+    path: files[2].0.to_owned(),
+    bytes: files[2].1.to_vec(),
+    mode: 0o644,
+  });
+  assert!(
+    matches!(wrote, ReplyBody::FsDone { .. }),
+    "write into the clone: {wrote:?}"
+  );
+  assert!(matches!(
+    client_a.call(&RequestBody::Detach { attachment }),
+    ReplyBody::Detached
+  ));
+  for node in &daemons[1..] {
+    share_with_node(&mut client_a, clone, node, ALL_RIGHTS);
+  }
+  let mut answers: Vec<String> = Vec::new();
+  let moved = poll_until(&fleet, COUNCIL_RETIRE_DEADLINE, || {
+    let reply = client_a.call(&RequestBody::Move {
+      volume: clone,
+      to: hosts[1].0,
+    });
+    let done = matches!(reply, ReplyBody::Moved { to } if to == hosts[1].0);
+    let named = format!("{reply:?}");
+    if answers.last() != Some(&named) {
+      answers.push(named);
+    }
+    Ok(done)
+  });
+  let mut client_b = Client::connect(&instances[1]);
+  let (served, last) = if moved {
+    read_back(&fleet, &mut client_b, clone, &files)
+  } else {
+    (false, None)
+  };
+  let released = served
+    && poll_until(&fleet, SERVE_DEADLINE, || {
+      daemons[0]
+        .refusals_on_every_shard()
+        .map(|counts| counts.get("fleet.move.released").copied().unwrap_or(0) == 1)
+    });
+  let mut destroyed = None;
+  let unpinned = released
+    && poll_until(&fleet, SERVE_DEADLINE, || {
+      let reply = client_a.call(&RequestBody::DestroySnapshot {
+        volume: overlay,
+        snapshot,
+      });
+      let done = matches!(reply, ReplyBody::SnapshotDestroyed);
+      destroyed = Some(reply);
+      Ok(done)
+    });
+  let (served_alone, last_alone) = if unpinned {
+    read_back(&fleet, &mut client_b, clone, &files)
+  } else {
+    (false, None)
+  };
+  let described = describe(&fleet);
+  drop(client_a);
+  drop(client_b);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    matches!(
+      &overlay_move,
+      ReplyBody::Refused {
+        refusal: Refusal::MoveRefused {
+          reason: slates_ipc::protocol::MoveRefusal::NotPlain
+        }
+      }
+    ),
+    "an overlay does not move: {overlay_move:?}"
+  );
+  assert!(
+    matches!(destroy_while_pinned, ReplyBody::Refused { .. }),
+    "the captured snapshot is held while its clone is on a: {destroy_while_pinned:?}"
+  );
+  assert!(
+    moved,
+    "the clone's move was done (answers: {answers:?}); {described}"
+  );
+  assert!(
+    served,
+    "b serves the captured files and the clone's own (last: {last:?}); {described}"
+  );
+  assert!(released, "a released its copy of the clone; {described}");
+  assert!(
+    unpinned,
+    "the captured snapshot is destroyed once a let the clone go (last: {destroyed:?}); {described}"
+  );
+  assert!(
+    served_alone,
+    "b still serves every file with the captured snapshot gone (last: {last_alone:?}); {described}"
+  );
+}
+
 /// AC-8.15's first half (§4.10 "Mirroring across regions"; `docs/wip/mirroring.md` M2): a snapshot placed in its home
 /// region is shipped to the owner's neighbourhood in the mirror region and held there whole by `f + 1` hosts. Two
 /// regions of three daemons at `f = 1`, each the other's mirror. Do: write a file into a volume on a (region 0),

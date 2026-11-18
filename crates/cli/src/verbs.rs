@@ -1136,6 +1136,17 @@ fn emit_pin(
   Ok(())
 }
 
+/// `base capture`: the snapshot holding the overlay's whole base (A-291), as text or a JSON `{ "snapshot" }`.
+fn emit_captured(client: &mut Client, volume: VolumeId, json: bool) -> Result<(), ClientError> {
+  let snapshot = client.capture_base(volume)?;
+  if json {
+    slates_machine::out_line!("{}", serde_json::json!({ "snapshot": snapshot.value }));
+  } else {
+    slates_machine::out_line!("snapshot: {}", snapshot.value);
+  }
+  Ok(())
+}
+
 /// `grants`: every grant, one per text line or a JSON array of [`grant_json`] objects (the shape a
 /// script iterates, matching `volume list`'s array of objects).
 fn emit_grants(client: &mut Client, json: bool) -> Result<(), ClientError> {
@@ -1404,6 +1415,7 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
     }
     Verb::Rewitness { volume, paths } => emit_rewitness(client, *volume, paths.clone(), json)?,
     Verb::Pin { volume, paths } => emit_pin(client, *volume, paths.clone(), json)?,
+    Verb::CaptureBase { volume } => emit_captured(client, *volume, json)?,
     Verb::Land {
       volume,
       snapshot,

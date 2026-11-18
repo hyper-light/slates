@@ -142,6 +142,20 @@ pub struct PartitionSnapshot {
   pub expired_attachments: Vec<u64>,
   /// Each green's checkpoint (W3; §4.16; 2026-11-06; appended).
   pub green_checkpoints: Vec<GreenCheckpoint>,
+  /// The snapshots captured as complete immutable bases (§4.15 `capture_base`, A-291; 2026-11-18; appended), by
+  /// (volume, snapshot) order.
+  pub captured_bases: Vec<CapturedBase>,
+}
+
+/// A snapshot captured as a complete immutable base (§4.15 `capture_base`, A-291): every name, byte and attribute of its
+/// tree is held by the volume, none read from the host directory any more, so a clone of it needs no base directory and
+/// moves between fleet members as a plain volume does.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CapturedBase {
+  /// The volume captured.
+  pub volume: VolumeId,
+  /// Its snapshot that holds the whole tree.
+  pub snapshot: SnapshotId,
 }
 
 /// One green's checkpoint, as a snapshot carries it (W3; §4.16): the version it is the green's state at, and its
@@ -225,6 +239,10 @@ pub struct Partition {
   /// Each checkpointed green's checkpoint (W3; §4.16): its version and its encoding, held in place of every increment
   /// up to that version. Counted in `green_chain_bytes` against the same cap. Removed with the green.
   green_checkpoints: BTreeMap<VolumeId, (u64, Vec<u8>)>,
+  /// The snapshots captured as complete immutable bases (§4.15 `capture_base`, A-291): a clone of one is made with no
+  /// base directory. Bounded by the snapshots (one entry a snapshot at most); an entry leaves with its snapshot or its
+  /// volume.
+  captured_bases: std::collections::BTreeSet<CapturedBase>,
   /// Each base-seeded green's origin (§4.16): its version-0 state, encoded, replayed before its
   /// chain on recovery. Counted in `green_chain_bytes` against the same cap.
   green_origins: BTreeMap<VolumeId, Vec<u8>>,
@@ -327,6 +345,7 @@ impl Partition {
       work_logs: BTreeMap::new(),
       green_origin_refs: BTreeMap::new(),
       green_checkpoints: BTreeMap::new(),
+      captured_bases: std::collections::BTreeSet::new(),
       tombstones: BTreeMap::new(),
     }
   }
@@ -520,6 +539,14 @@ impl Partition {
       .into_iter()
       .filter_map(|(_, h)| self.snapshots.get(*h).ok())
       .collect()
+  }
+
+  /// Whether `volume`'s `snapshot` was captured as a complete immutable base (§4.15 `capture_base`, A-291), so a clone
+  /// of it is made with no base directory.
+  pub fn is_captured(&self, volume: VolumeId, snapshot: SnapshotId) -> bool {
+    self
+      .captured_bases
+      .contains(&CapturedBase { volume, snapshot })
   }
 
   /// A clone's lineage edge.
@@ -967,6 +994,11 @@ impl Partition {
         }
         Ok(())
       }
+      // A captured base names a snapshot this partition holds (A-291).
+      Op::BaseCaptured { volume, snapshot } => {
+        self.snapshot(*volume, *snapshot).ok_or(DbError::NotFound)?;
+        Ok(())
+      }
       Op::TombstoneAdopted { tombstone } => {
         if self.volume(tombstone.volume).is_some()
           || self.tombstones.contains_key(&tombstone.volume)
@@ -1363,6 +1395,13 @@ impl Partition {
         }
         Ok(())
       }
+      Op::BaseCaptured { volume, snapshot } => {
+        self.captured_bases.insert(CapturedBase {
+          volume: *volume,
+          snapshot: *snapshot,
+        });
+        Ok(())
+      }
       Op::TombstoneAdopted { tombstone } => {
         self.tombstones.insert(tombstone.volume, tombstone.sequence);
         Ok(())
@@ -1398,6 +1437,10 @@ impl Partition {
           .remove(&snapshot_key(*volume, *id))
           .ok_or(DbError::NotFound)?;
         self.snapshots.remove(h)?;
+        self.captured_bases.remove(&CapturedBase {
+          volume: *volume,
+          snapshot: *id,
+        });
         Ok(())
       }
       Op::LineageAdded { edge } => {
@@ -1765,6 +1808,7 @@ impl Partition {
       }
     }
     self.lineage.remove(&id.bytes);
+    self.captured_bases.retain(|captured| captured.volume != id);
     // A destroyed green's merge chain is reclaimed with it (its increments can never be replayed for
     // a volume that no longer exists), returning its bytes to the chain budget.
     if let Some(chain) = self.green_chains.remove(&id) {
@@ -1925,6 +1969,7 @@ impl Partition {
           bytes: bytes.clone(),
         })
         .collect(),
+      captured_bases: self.captured_bases.iter().copied().collect(),
       work_logs: self
         .work_logs
         .iter()
@@ -2120,6 +2165,7 @@ impl Partition {
     p.restore_name_aliases(snapshot);
     p.restore_expired_attachments(snapshot);
     p.restore_consumers_and_tombstones(snapshot);
+    p.captured_bases = snapshot.captured_bases.iter().copied().collect();
     Ok(p)
   }
 

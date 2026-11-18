@@ -8,13 +8,16 @@
 >   and release, the old owner keeping its copy until the new owner has sealed the volume under its own placement,
 >   `slates move ID --to HOST` and `slates_api::Instance::move_volume` (contract 5), every refusal typed, a move back
 >   to the creator, a destroyed moved volume's exception dropped; held in process by three-daemon tests of the move,
->   of the old owner dying at the switch and of the target dying at it (its successor serves, the frozen copy yields).
+>   of the old owner dying at the switch and of the target dying at it (its successor serves, the frozen copy yields);
+>   and `capture_base` (§4.15's status: `Instance::capture_base`, contract 6) with the move of a clone of a captured
+>   base, the form a kiln workspace takes (decided below), held by a three-daemon test that moves such a clone, serves it
+>   on its new owner and destroys the captured snapshot once the old owner let the clone go.
 > - **Owed, in order:** kiln's runners as members (certificates under kiln's CA as the manifest's enrollment root,
->   seeds from kiln's runner directory); kiln's relocation of an
->   agent with its volume (detach, move, attach on the target); `capture_base` (§4.15) and the move of a clone of a
->   captured base, the form a kiln workspace takes (decided below; until then a clone is refused `Lineage`); the
->   automatic migration by the origin of the last N writes (AC-8.16's other half); a move carrying snapshots other
->   than the head; a multi-runner test with injected faults.
+>   seeds from kiln's runner directory); kiln's relocation of an agent with its volume (detach, move, attach on the
+>   target) and its workspaces made as clones of a captured base; the automatic migration by the origin of the last N
+>   writes (AC-8.16's other half); a move carrying snapshots other than the head; a multi-runner test with injected
+>   faults. The capture's own owed parts: admission reserving its cost ahead, a large file read across slices rather
+>   than whole in one, and the report of bytes read and retained and of the elapsed cost (§4.15's status).
 > - **Decided (the supervisor, 2026-11-18, A-291):** a kiln workspace moves as a clone of a captured base. An overlay
 >   keeps its typed refusal (`NotPlain`: its base stays on its source host, §4.10); kiln captures the repository's base
 >   once into a complete immutable snapshot (`capture_base`; a git commit's tree checked out where nothing else writes is

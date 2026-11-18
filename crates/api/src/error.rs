@@ -455,7 +455,8 @@ pub enum Invalid {
   /// The green requires evidence on every increment, and the merge carried none.
   EvidenceRequired,
   /// A green's base must be a complete immutable snapshot, and this one still serves entries from a host folder: pin the
-  /// whole base and snapshot again.
+  /// whole base and snapshot again. Or a capture's folder moved under it (`Instance::capture_base`, A-291): capture it
+  /// again once nothing writes it.
   LiveBase,
   /// No clean digest exists for the entry: read and hash its bytes instead (§4.15).
   NoCleanDigest,
@@ -543,7 +544,7 @@ pub enum Unusable {
 pub enum Unmovable {
   /// It is not a plain live volume: an overlay (its base stays on its source host), an image, a green or a work.
   NotPlain,
-  /// It is a clone, has clones, or is a green's origin, each sharing its records on its owner.
+  /// It has clones, or is a green's origin, each depending on it on its owner.
   Lineage,
   /// It has snapshots other than its head: a move carries the head, and the others would be lost. Destroy them first.
   Snapshots,

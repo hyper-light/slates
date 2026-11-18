@@ -1932,6 +1932,141 @@ fn a_clones_base_subdirectory_reads_as_the_disk_holds_it() {
   );
 }
 
+/// Walks `walk` over `vol` to its end, returning the files and links it made the volume's own.
+fn walk_to_end(
+  vol: &mut Volume,
+  host: &mut SimHost,
+  store: &mut Store,
+  walk: &mut slates_vfs::base::PinWalk,
+) -> Result<usize, VfsError> {
+  loop {
+    if let Some(done) = vol.with_host(host).pin_unit(store, walk)? {
+      return Ok(done);
+    }
+  }
+}
+
+/// A-291 (§4.15 `capture_base`): a capture makes every byte the volume's own, and a clone of its snapshot needs no base
+/// directory. Do: an overlay over a small file, a large file of three windows (past the large class) in a subdirectory
+/// and a link; walk a capture of the whole base to its end; snapshot; then rewrite the large file and add a file on the
+/// disk; clone the snapshot with no base and read, list and readlink the clone with no host at all; write through the
+/// clone. Expect the snapshot judged complete; the clone reading the snapshot's bytes, never the disk's later ones;
+/// listing exactly the captured names; the link's target; the write landing in the clone alone; and the capture's
+/// snapshot archiving whole, where a pin of the same tree, which leaves the large file on its descriptor, refuses
+/// `RecoveryIncomplete`, its bytes not all in the volume.
+#[test]
+fn a_captured_base_holds_every_byte_and_its_clone_needs_no_base_directory() {
+  let big: Vec<u8> = (0..LARGE * 3).map(|index| (index % 251) as u8).collect();
+  let mut host = SimHost::new();
+  host.replace_file("/small", b"a small file");
+  host.mkdir("/sub");
+  host.replace_file("/sub/big", &big);
+  host.symlink("/link", "sub/big");
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  let taken = walk_to_end(
+    &mut vol,
+    &mut host,
+    &mut store,
+    &mut slates_vfs::base::PinWalk::capture(),
+  )
+  .unwrap();
+  assert_eq!(taken, 3, "two files and a link");
+  let s = vol.snapshot(&mut store).unwrap();
+  assert!(
+    vol
+      .with_host(&mut host)
+      .snapshot_is_complete(&store, s)
+      .unwrap(),
+    "the capture's snapshot is the whole tree"
+  );
+  host.replace_file("/sub/big", b"rewritten on the disk");
+  host.replace_file("/late", b"added on the disk");
+  let mut clone = Volume::clone_without_base(&store, &mut vol, s, clone_config(9)).unwrap();
+  let read = |clone: &Volume, store: &Store, path: &str| {
+    let no = clone.resolve(store, path).unwrap().inode;
+    let size = clone.stat(store, no).unwrap().size;
+    let mut buf = vec![0u8; usize::try_from(size).unwrap()];
+    let n = clone.read(store, no, 0, &mut buf).unwrap();
+    buf.truncate(n);
+    buf
+  };
+  assert_eq!(read(&clone, &store, "/small"), b"a small file");
+  assert_eq!(
+    read(&clone, &store, "/sub/big"),
+    big,
+    "the large file's captured bytes"
+  );
+  let link = clone.resolve(&store, "/link").unwrap().inode;
+  assert_eq!(&*clone.readlink(&store, link).unwrap(), "sub/big");
+  let root = clone.resolve(&store, "/").unwrap();
+  let Child::Dir(root) = root.child else {
+    panic!("the root is a directory");
+  };
+  let names: BTreeSet<String> = clone
+    .readdir(&store, root)
+    .unwrap()
+    .iter()
+    .map(|row| row.name.to_owned())
+    .collect();
+  assert_eq!(
+    names,
+    ["link", "small", "sub"]
+      .into_iter()
+      .map(str::to_owned)
+      .collect(),
+    "the captured names, never the disk's later one"
+  );
+  let small = clone.resolve(&store, "/small").unwrap().inode;
+  clone.write(&mut store, small, 0, b"A").unwrap();
+  assert_eq!(read(&clone, &store, "/small"), b"A small file");
+  assert_eq!(
+    read_all(&mut vol, &mut host, &mut store, "/small").unwrap(),
+    b"a small file",
+    "the clone's write is the clone's alone"
+  );
+
+  let mut pinned_host = SimHost::new();
+  pinned_host.mkdir("/sub");
+  pinned_host.replace_file("/sub/big", &big);
+  let mut pinned = overlay(&mut pinned_host, &mut store);
+  walk_to_end(
+    &mut pinned,
+    &mut pinned_host,
+    &mut store,
+    &mut slates_vfs::base::PinWalk::new(None),
+  )
+  .unwrap();
+  let p = pinned.snapshot(&mut store).unwrap();
+  assert!(
+    matches!(
+      archive_whole(&pinned, &store, p),
+      Err(VfsError::RecoveryIncomplete)
+    ),
+    "a pin keeps the large file on its descriptor, so its snapshot cannot be archived whole"
+  );
+  assert!(
+    archive_whole(&vol, &store, s).is_ok(),
+    "the capture's snapshot archives whole, so a fleet member can serve it from its holders"
+  );
+}
+
+/// Archives snapshot `snapshot` of `volume` to completion, or its refusal.
+fn archive_whole(
+  volume: &Volume,
+  store: &Store,
+  snapshot: slates_vfs::ids::SnapshotId,
+) -> Result<slates_archive::Archive, VfsError> {
+  use slates_archive::codec::CodecPolicy;
+  use slates_vfs::export::{Progress, SnapshotArchiver};
+  let mut archiver = SnapshotArchiver::new(volume, store, snapshot, 0, 0, CodecPolicy::raw_only())?;
+  loop {
+    if let Progress::Done(archive) = archiver.advance(volume, store, u64::MAX)? {
+      return Ok(archive);
+    }
+  }
+}
+
 /// A-38: an outsider's edit beneath an overlay moves the file's change counter when a stat takes the
 /// disk's new attributes, and a stat of an unchanged file leaves it where it is, so a client caching
 /// by the counter sees the edit and keeps its cache otherwise.

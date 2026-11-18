@@ -8,13 +8,13 @@
 //! fewer than `f + 1` hosts and every failure on either side of the switch is a case the takeover already handles:
 //!
 //! - **The old owner freezes and places.** A move is asked of the volume's owner shard ([`move_verb`]). The volume
-//!   must be a plain live volume with no attachment or lease, no clone, lineage or green that depends on it, and no
-//!   snapshot but its head (a move carries the head; older snapshots stay with this owner and would be lost), and the
-//!   target must be another member of this owner's neighbourhood (it holds the volume's sealing keys), each refused by
-//!   its own `MoveRefusal`. The verb hands
-//!   over the head: the head epoch itself when nothing changed since, else a snapshot taken now. It freezes the
-//!   volume ([`MoveOut`]), so every other verb on it is told to come back, and answers `Moving`; the client asks
-//!   again until it is answered `Moved`.
+//!   must be a plain live volume (a clone of a captured base or of another plain volume among them: its tree is archived
+//!   whole and served standalone by its new owner) with no attachment or lease, no clone or green that depends on it,
+//!   and no snapshot but its head (a move carries the head; older snapshots stay with this owner and would be lost), and
+//!   the target must be another member of this owner's neighbourhood (it holds the volume's sealing keys), each refused
+//!   by its own `MoveRefusal`. The verb hands over the head: the head epoch itself when nothing changed since, else a
+//!   snapshot taken now. It freezes the volume ([`MoveOut`]), so every other verb on it is told to come back, and
+//!   answers `Moving`; the client asks again until it is answered `Moved`.
 //! - **The report.** Each period the control shard ([`drive_outgoing`]) waits until the head and the catalog are
 //!   placed at `f + 1` of this owner's cohort (a live-shipped volume's log durable at its head too), then captures its
 //!   own newest records of both registers from the owner's acceptor and reports `Move` to the council with the cohort
@@ -248,8 +248,10 @@ fn unmovable(
   if !partition.attachments_of(record.id).is_empty() || record.lease.is_some() {
     return Some(MoveRefusal::Attached);
   }
-  if partition.lineage(record.id).is_some()
-    || partition.has_clones(record.id)
+  // A clone moves (its tree, shared with its origin's snapshot here, is archived whole and served standalone by its new
+  // owner, its pin on the origin given back when it leaves: a clone of a captured base, the form a kiln workspace takes,
+  // A-291); a volume other volumes depend on does not.
+  if partition.has_clones(record.id)
     || partition
       .green_origin_refs()
       .any(|(_, held)| held.volume == record.id)
@@ -606,6 +608,9 @@ fn let_go(state: &mut ShardState, id: DbVolumeId, gone: Gone) -> bool {
     .partition()
     .volume(id)
     .map(|record| record.name.clone());
+  // A clone's pin on its origin's snapshot, read before its lineage leaves with its record, and given back once its slot
+  // is gone (`verbs::step_releases`).
+  let origin_pin = crate::verbs::origin_pin_of(state, id);
   let now = state.clock.monotonic_ns();
   if state
     .db
@@ -617,7 +622,7 @@ fn let_go(state: &mut ShardState, id: DbVolumeId, gone: Gone) -> bool {
   }
   state.by_id.remove(&id);
   crate::snapshot_view::end_all_of(state, id);
-  state.releasing.push(handle);
+  state.releasing.push((handle, origin_pin));
   // The serve round steps the release's slices (`verbs::step_destroys`); woken, it keeps running until they are done.
   if let Some(task) = state.server_task {
     slates_rt::registry::wake(task.0);

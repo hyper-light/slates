@@ -245,6 +245,21 @@ impl Instance {
       .map_err(|e| self.fail(e, Some(Missing::Volume(volume))))
   }
 
+  /// Captures an overlay's whole base into a complete immutable snapshot (§4.15 `capture_base`, A-291), its id: every
+  /// file's bytes and every link's target become the volume's own, so a clone of the snapshot
+  /// (`VolumeSpec::clone_of`) needs no base directory, survives its runner's loss and moves between fleet members
+  /// ([`Instance::move_volume`]). The host asserts nothing writes the folder while the capture runs (kiln: a commit's
+  /// tree checked out where nothing else writes); a file that changed while it was read is refused `Error::Retry`
+  /// (`RetryCause::ChangedWhileRead`) and a folder that moved under the capture [`crate::Invalid::LiveBase`], and the
+  /// capture may be asked again. It reads the whole folder, so it takes as long as that does; a volume that is not an
+  /// overlay is refused [`crate::Unsupported::Feature`].
+  pub fn capture_base(&mut self, volume: VolumeId) -> Result<SnapshotId, Error> {
+    self
+      .client
+      .capture_base(volume)
+      .map_err(|e| self.fail(e, Some(Missing::Volume(volume))))
+  }
+
   /// Destroys a snapshot, returning what only it held to the shard; refused while a clone pins it.
   pub fn destroy_snapshot(&mut self, volume: VolumeId, snapshot: SnapshotId) -> Result<(), Error> {
     self

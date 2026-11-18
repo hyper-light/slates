@@ -908,6 +908,16 @@ pub enum RequestBody {
     /// The member it moves to, by its host id.
     to: u64,
   },
+  /// Capture an overlay's whole base into a complete immutable snapshot (§4.15 `capture_base`, A-291): every file's
+  /// bytes and every link's target become the volume's own, then a snapshot is taken and recorded captured, so a clone
+  /// of it needs no base directory and moves between fleet members as a plain volume does. The caller asserts the source
+  /// is quiesced (nothing writes it while the capture runs); one that changed under it is refused
+  /// [`Refusal::ConsistentBaseUnavailable`]. Answered `BaseCaptured` once the walk ends. `write` on the volume is
+  /// required. Appended.
+  CaptureBase {
+    /// The overlay.
+    volume: VolumeId,
+  },
 }
 
 /// The bytes an [`RequestBody::EditSubmit`] inserts (A-225): carried in the request, or, for an edit larger than one
@@ -1616,7 +1626,8 @@ impl RequestBody {
       | RequestBody::LiveShip { volume, .. }
       | RequestBody::DetachOf { volume, .. }
       | RequestBody::RemoteReap { volume, .. }
-      | RequestBody::Move { volume, .. } => Some(*volume),
+      | RequestBody::Move { volume, .. }
+      | RequestBody::CaptureBase { volume } => Some(*volume),
     }
   }
 
@@ -1652,6 +1663,7 @@ impl RequestBody {
         | RequestBody::Checkout { .. }
         | RequestBody::SetPolicy { .. }
         | RequestBody::Move { .. }
+        | RequestBody::CaptureBase { .. }
     )
   }
 
@@ -3334,7 +3346,8 @@ pub enum MoveRefusal {
   NotPlain,
   /// The volume has an attachment or a lease: a writer detaches first.
   Attached,
-  /// The volume is a clone, has clones, or is a green's origin: each shares its records on its owner.
+  /// The volume has clones, or is a green's origin: each depends on it on its owner. (A clone itself moves: its tree is
+  /// archived whole and served standalone by its new owner, A-291.)
   Lineage,
   /// The volume has snapshots other than its head: a move carries the head, and the others would be lost with the old
   /// owner's copy. Destroy them first.
@@ -3872,6 +3885,12 @@ pub enum ReplyBody {
   Moved {
     /// The member it moved to.
     to: u64,
+  },
+  /// An overlay's base was captured (`CaptureBase`, A-291): `snapshot` holds its whole tree, recorded captured, so a
+  /// clone of it needs no base directory. Appended.
+  BaseCaptured {
+    /// The snapshot.
+    snapshot: SnapshotId,
   },
 }
 
