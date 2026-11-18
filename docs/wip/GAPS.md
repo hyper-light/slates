@@ -5356,6 +5356,15 @@ still fails `-D clippy::disallowed-methods` with the flag in place, and the plan
 >   - the SDKs' plumbing tests passed against the built wheel (3 of 3) and addon (1 of 1).
 >
 >   CI's `gates` job runs both regimes on every push since (`The slates exec AppArmor profile, opted into (Linux)`).
+> - **Red-checked** (diagnostics run 44353311142, `ubuntu-24.04`), each guard removed in turn:
+>   - the switch dropped from the launcher's arguments failed the shared grammar's test and the CLI's round trip;
+>   - with the step-out removed, the launcher ran without the option under the loaded profile (exit 0, where 4 is
+>     owed);
+>   - with the exec-time drop removed, the command ran labelled `/home/runner/work/slates/slates/target/debug/slates
+>     (unconfined)` and held the grant (`grant-held`).
+> - **macOS** (diagnostics run 44352021341, `macos-latest`): the focused tests pass there too (5, 4, 6 and the CLI's
+>   `apparmor_prints_the_profile_and_checks_the_host`); `slates apparmor check` answers `readiness: unsupported` (exit 1)
+>   and `exec` the refusal it always gave off Linux (exit 4).
 > - The launcher moved from `crates/cli/src/exec.rs` to `crates/api/src/exec.rs`, so an embedding host's executable
 >   serves it (`role::main`'s `exec`), and the profile can name that executable.
 >

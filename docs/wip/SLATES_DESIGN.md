@@ -27051,6 +27051,8 @@ Applied in the same change to:
   loaded, `--apparmor-profile` binds and its command reads the volume as the runner's uid, runs `unconfined` and is
   refused its own `unshare -Ur`, while without the option the launcher is refused naming it; a test demanding the
   loaded regime with none loaded fails (the red check); the SDKs' plumbing tests pass against the built wheel and addon.
+  Each guard red-checked (diagnostics run 44353311142): without the step-out the launcher ran unasked under the loaded
+  profile; without the exec-time drop the command ran under the profile's label and held the grant.
 - **Rejected:** entering a named profile by `change_profile` from unconfined, and an enforce-mode profile confining the
   whole binary (§4.6, "The launcher on a restricted host", says why).
 - **What remains.** The daemon publishing its root mount, so `SLATES_ROOT` need not be named (GAPS). The release
