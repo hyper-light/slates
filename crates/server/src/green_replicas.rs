@@ -881,12 +881,22 @@ mod tests {
 
   /// Writes `/f` through `work` with bytes of `byte` and submits it: accepted as a new version.
   fn submit_one(state: &mut ShardState, work: slates_ipc::protocol::VolumeId, byte: u8) {
+    submit_edit(state, work, (0, byte));
+  }
+
+  /// Writes eight bytes of `byte` at the start of `/f` through `work`, in place of the `replaced` bytes there, and submits
+  /// it: accepted as a new version.
+  fn submit_edit(
+    state: &mut ShardState,
+    work: slates_ipc::protocol::VolumeId,
+    (replaced, byte): (u64, u8),
+  ) {
     let owner = principal();
     let edit = RequestBody::Edit {
       work,
       path: "/f".to_owned(),
       at: 0,
-      delete_len: 0,
+      delete_len: replaced,
       bytes: vec![byte; 8],
     };
     let edited = crate::verbs::dispatch(state, 1, &owner, edit);
@@ -1119,15 +1129,18 @@ mod tests {
   }
 
   /// A-465 (A-273 step 5b), the oracle: what a work's shard asks of its green, answered by the replica there and by the
-  /// owner, compared whole. Do: on a two-shard daemon, a green on the first shard with two versions; once the second
-  /// shard's replica holds its head, ask both the same: a work's base files at version 1 (one there, one not, with their
-  /// entries), a page of one, every file's length, a clean rebase from version 1, and one that conflicts with version 2.
-  /// Expect: every answer the same, byte for byte, the rebases at the same head.
+  /// owner, compared whole. Do: on a two-shard daemon, a green on the first shard with two versions, the second
+  /// replacing the first's bytes; once the second shard's replica holds its head, ask both the same: a work's base files
+  /// at version 1 (one there, one not, with their entries), a page of one, every file's length, a clean rebase from
+  /// version 1, and one that conflicts with version 2. Expect: every answer the same, byte for byte, the rebases at the
+  /// same head.
   #[test]
   fn what_a_replica_answers_is_the_owners_answer_whole() {
     let daemon = crate::daemon::audit_daemon_of(2);
     let (green, head) = crate::daemon::observe_first(&daemon, |state| {
-      let green = green_with_versions(state, "oracle", 2);
+      let (green, work) = green_and_work(state, "oracle");
+      submit_edit(state, work, (0, 0));
+      submit_edit(state, work, (8, 1));
       let engine = state.greens.get_mut(&green).unwrap();
       (green, (engine.head(), engine.head_identity()))
     });
@@ -1216,7 +1229,7 @@ mod tests {
     };
     crate::daemon::observe_at(&daemon, 1, move |state| run_as_request(state, 2, edit));
     let edited = eventually(&daemon, 1, move |state| {
-      (state.works.get(&work)?.journal.len() == 1).then_some(())
+      (!state.works.get(&work)?.journal.is_empty()).then_some(())
     });
     assert!(edited.is_some(), "the edit ran");
     crate::daemon::observe_at(&daemon, 1, move |state| run_as_request(state, 3, rebase));
