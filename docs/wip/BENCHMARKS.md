@@ -12207,7 +12207,7 @@ and on x86_64 the round every Create's foreign security query already paid. The 
 stays: the shard woken at the post serves the confirmation while the worker sends, and the request after an open finds it
 awake.
 
-arm64 (windows-11-arm), loaded, p50: arm minus main within each run, µs (sorted); the cut's median against the control's spread.
+arm64 (windows-11-arm), loaded, p50: the bound (`bb09e307`) minus main within each run, µs (sorted); the cut's median against the control's spread.
 
 | op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
 |---|---|---|---|---|---|---|
@@ -12222,7 +12222,7 @@ arm64 (windows-11-arm), loaded, p50: arm minus main within each run, µs (sorted
 | unlink | 341.9 | -279.0 -7.1 -5.8 -3.8 -0.8 +0.3 +2.6 +5.6 +1013.5 +1298.0 | +0.3 (5/10 faster) | -287.5 -3.4 +0.0 +1.6 +2.1 +3.2 +3.2 +3.3 +4.6 +4.8 | +3.2 (2/10 faster) | within the control |
 | create_security | 239.2 | -24.6 -5.4 -3.5 -1.8 -1.8 -0.2 +2.1 +3.8 +40.1 +41.5 | -0.2 (6/10 faster) | -32.9 -5.5 -2.8 -2.6 -2.0 +2.2 +2.3 +3.6 +4.1 +4.2 | +2.2 (5/10 faster) | within the control |
 
-arm64 (windows-11-arm), quiet, p50: arm minus main within each run, µs (sorted); the cut's median against the control's spread.
+arm64 (windows-11-arm), quiet, p50: the bound (`bb09e307`) minus main within each run, µs (sorted); the cut's median against the control's spread.
 
 | op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
 |---|---|---|---|---|---|---|
@@ -12236,7 +12236,8 @@ arm64 (windows-11-arm), quiet, p50: arm minus main within each run, µs (sorted)
 | rename | 495.4 | -24.8 -14.5 -14.1 -9.4 -8.2 -8.2 -2.0 +0.7 +2.7 +4.5 | -8.2 (7/10 faster) | -13.9 -10.0 -7.6 -5.6 -4.5 -3.5 -3.2 +3.1 +6.4 +12.4 | -3.5 (7/10 faster) | within the control |
 | unlink | 305.3 | -22.2 -16.0 -5.1 -4.6 -2.2 -1.3 +0.5 +4.2 +6.2 +24.7 | -1.3 (6/10 faster) | -12.8 -5.3 -5.2 -3.1 -2.2 -1.0 +0.0 +0.7 +3.4 +18.0 | -1.0 (6/10 faster) | within the control |
 | create_security | 236.7 | -25.1 -23.8 -9.5 -6.9 -1.6 -0.2 +6.0 +7.5 +8.1 +22.4 | -0.2 (6/10 faster) | -6.5 -4.1 -1.2 +0.0 +3.9 +6.7 +9.0 +13.1 +17.3 +32.4 | +6.7 (3/10 faster) | within the control |
-x86_64 (windows-latest), loaded, p50: arm minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+x86_64 (windows-latest), loaded, p50: the bound (`bb09e307`) minus main within each run, µs (sorted); the cut's median against the control's spread.
 
 | op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
 |---|---|---|---|---|---|---|
@@ -12251,7 +12252,7 @@ x86_64 (windows-latest), loaded, p50: arm minus main within each run, µs (sorte
 | unlink | 364.8 | -55.9 -55.4 -13.5 -10.2 -0.3 +1.6 +4.0 +7.2 +9.5 +61.3 | +1.6 (5/10 faster) | -47.7 -8.7 -6.3 -1.1 -0.1 +1.2 +3.7 +9.7 +28.6 +33.1 | +1.2 (5/10 faster) | within the control |
 | create_security | 2417.2 | -113.7 -104.7 -104.5 -33.0 -32.0 -21.2 -17.0 -11.2 -8.6 +72.0 | -21.2 (9/10 faster) | -74.4 -42.7 -8.0 -7.2 -3.9 +6.3 +6.9 +12.3 +14.4 +52.5 | +6.3 (5/10 faster) | within the control |
 
-x86_64 (windows-latest), quiet, p50: arm minus main within each run, µs (sorted); the cut's median against the control's spread.
+x86_64 (windows-latest), quiet, p50: the bound (`bb09e307`) minus main within each run, µs (sorted); the cut's median against the control's spread.
 
 | op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
 |---|---|---|---|---|---|---|
@@ -12265,7 +12266,8 @@ x86_64 (windows-latest), quiet, p50: arm minus main within each run, µs (sorted
 | rename | 605.5 | -60.4 -22.2 -20.5 -9.3 -6.1 -5.8 -3.4 +2.4 +17.9 +118.1 | -5.8 (7/10 faster) | -41.6 -22.5 +2.9 +4.3 +7.5 +9.5 +12.3 +24.2 +52.5 +74.6 | +9.5 (2/10 faster) | within the control |
 | unlink | 360.0 | -55.3 -36.3 -20.1 -12.4 -6.7 -2.5 +3.7 +5.9 +14.0 +78.6 | -2.5 (6/10 faster) | -44.9 -29.7 -10.5 -4.5 -1.9 +1.6 +11.1 +18.3 +33.7 +34.6 | +1.6 (5/10 faster) | within the control |
 | create_security | 1516.2 | -201.3 -75.3 -54.5 -13.9 -6.9 +4.6 +45.9 +80.2 +89.0 +115.8 | +4.6 (5/10 faster) | -183.4 -85.3 -68.4 -12.1 -10.2 +7.2 +7.3 +10.2 +30.9 +69.8 | +7.2 (5/10 faster) | within the control |
-arm64 (windows-11-arm), loaded, p50: arm minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+arm64 (windows-11-arm), loaded, p50: the no-wake variant (`685dd645`) minus main within each run, µs (sorted); the cut's median against the control's spread.
 
 | op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
 |---|---|---|---|---|---|---|
@@ -12280,7 +12282,7 @@ arm64 (windows-11-arm), loaded, p50: arm minus main within each run, µs (sorted
 | unlink | 341.9 | -278.5 +1.2 +3.6 +3.7 +4.9 +5.2 +6.5 +11.0 +15.7 +1373.7 | +5.2 (1/10 faster) | -287.5 -3.4 +0.0 +1.6 +2.1 +3.2 +3.2 +3.3 +4.6 +4.8 | +3.2 (2/10 faster) | **slower** beyond the control |
 | create_security | 239.2 | -23.6 +0.4 +4.0 +4.4 +6.2 +9.5 +12.6 +12.7 +15.7 +1366.5 | +9.5 (1/10 faster) | -32.9 -5.5 -2.8 -2.6 -2.0 +2.2 +2.3 +3.6 +4.1 +4.2 | +2.2 (5/10 faster) | **slower** beyond the control |
 
-arm64 (windows-11-arm), quiet, p50: arm minus main within each run, µs (sorted); the cut's median against the control's spread.
+arm64 (windows-11-arm), quiet, p50: the no-wake variant (`685dd645`) minus main within each run, µs (sorted); the cut's median against the control's spread.
 
 | op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
 |---|---|---|---|---|---|---|
@@ -12294,7 +12296,8 @@ arm64 (windows-11-arm), quiet, p50: arm minus main within each run, µs (sorted)
 | rename | 495.4 | -21.6 -8.5 -6.8 -4.0 -3.3 -0.2 +0.3 +8.5 +10.2 +13.1 | -0.2 (6/10 faster) | -13.9 -10.0 -7.6 -5.6 -4.5 -3.5 -3.2 +3.1 +6.4 +12.4 | -3.5 (7/10 faster) | within the control |
 | unlink | 305.3 | -25.5 -6.3 -6.1 -5.3 -3.6 -1.1 +2.8 +4.1 +5.5 +25.7 | -1.1 (6/10 faster) | -12.8 -5.3 -5.2 -3.1 -2.2 -1.0 +0.0 +0.7 +3.4 +18.0 | -1.0 (6/10 faster) | within the control |
 | create_security | 236.7 | -16.7 +6.2 +13.7 +22.6 +24.1 +24.7 +30.4 +31.0 +44.7 +68.8 | +24.7 (1/10 faster) | -6.5 -4.1 -1.2 +0.0 +3.9 +6.7 +9.0 +13.1 +17.3 +32.4 | +6.7 (3/10 faster) | within the control |
-x86_64 (windows-latest), loaded, p50: arm minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+x86_64 (windows-latest), loaded, p50: the no-wake variant (`685dd645`) minus main within each run, µs (sorted); the cut's median against the control's spread.
 
 | op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
 |---|---|---|---|---|---|---|
@@ -12309,7 +12312,7 @@ x86_64 (windows-latest), loaded, p50: arm minus main within each run, µs (sorte
 | unlink | 364.8 | -16.0 -2.4 -1.6 +0.5 +4.5 +5.9 +6.4 +19.9 +47.5 +68.0 | +5.9 (3/10 faster) | -47.7 -8.7 -6.3 -1.1 -0.1 +1.2 +3.7 +9.7 +28.6 +33.1 | +1.2 (5/10 faster) | within the control |
 | create_security | 2417.2 | -95.8 -40.7 -40.4 -31.4 -25.4 -18.5 -17.2 +0.7 +36.3 +46.1 | -18.5 (7/10 faster) | -74.4 -42.7 -8.0 -7.2 -3.9 +6.3 +6.9 +12.3 +14.4 +52.5 | +6.3 (5/10 faster) | within the control |
 
-x86_64 (windows-latest), quiet, p50: arm minus main within each run, µs (sorted); the cut's median against the control's spread.
+x86_64 (windows-latest), quiet, p50: the no-wake variant (`685dd645`) minus main within each run, µs (sorted); the cut's median against the control's spread.
 
 | op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
 |---|---|---|---|---|---|---|
@@ -12323,6 +12326,7 @@ x86_64 (windows-latest), quiet, p50: arm minus main within each run, µs (sorted
 | rename | 605.5 | -12.3 -2.1 -2.1 +2.4 +4.1 +4.2 +17.0 +18.0 +25.2 +42.1 | +4.2 (3/10 faster) | -41.6 -22.5 +2.9 +4.3 +7.5 +9.5 +12.3 +24.2 +52.5 +74.6 | +9.5 (2/10 faster) | within the control |
 | unlink | 360.0 | -30.0 -21.5 -6.2 -5.8 -4.2 -2.1 +4.6 +18.1 +40.3 +49.5 | -2.1 (6/10 faster) | -44.9 -29.7 -10.5 -4.5 -1.9 +1.6 +11.1 +18.3 +33.7 +34.6 | +1.6 (5/10 faster) | within the control |
 | create_security | 1516.2 | -145.9 -14.0 -6.9 +11.7 +15.0 +27.5 +28.1 +30.1 +43.2 +77.6 | +27.5 (3/10 faster) | -183.4 -85.3 -68.4 -12.1 -10.2 +7.2 +7.3 +10.2 +30.9 +69.8 | +7.2 (5/10 faster) | within the control |
+
 ### Cut (b), the per-kind spin choice: the 2-competitive form and the median form, both rejected
 
 **The change.** A-212's worker spins every shard reply for its window (the median one-way wake it measured as it started)
@@ -12364,7 +12368,7 @@ Both lanes ten runs, 0 failed, no stall, no heartbeat lapse.
   its unmount answers, before the worker's last line. The Windows wait test holds the count instead
   (`a_kind_whose_replies_came_late_is_waited_for_parked_at_once`).
 
-arm64 (windows-11-arm), loaded, p50: arm minus main within each run, µs (sorted); the cut's median against the control's spread.
+arm64 (windows-11-arm), loaded, p50: the 2-competitive form (`f638d2aa`) minus main within each run, µs (sorted); the cut's median against the control's spread.
 
 | op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
 |---|---|---|---|---|---|---|
@@ -12379,7 +12383,7 @@ arm64 (windows-11-arm), loaded, p50: arm minus main within each run, µs (sorted
 | unlink | 341.4 | +10.8 +12.9 +14.1 +15.3 +15.9 +16.1 +16.6 +16.6 +20.1 +31.3 | +16.1 (0/10 faster) | -2.9 -1.0 +0.6 +1.9 +2.1 +2.1 +2.9 +3.5 +6.9 +9.5 | +2.1 (2/10 faster) | **slower** beyond the control |
 | create_security | 238.5 | -10.3 -9.2 -8.6 -6.6 -5.0 -4.7 -3.9 -2.0 +2.5 +9.0 | -4.7 (8/10 faster) | -6.2 -2.4 -1.3 -0.5 +2.3 +3.4 +4.0 +4.3 +5.7 +6.4 | +3.4 (4/10 faster) | within the control |
 
-arm64 (windows-11-arm), quiet, p50: arm minus main within each run, µs (sorted); the cut's median against the control's spread.
+arm64 (windows-11-arm), quiet, p50: the 2-competitive form (`f638d2aa`) minus main within each run, µs (sorted); the cut's median against the control's spread.
 
 | op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
 |---|---|---|---|---|---|---|
@@ -12393,7 +12397,8 @@ arm64 (windows-11-arm), quiet, p50: arm minus main within each run, µs (sorted)
 | rename | 468.0 | -5.0 -3.7 -3.4 -0.5 -0.1 +0.5 +6.5 +25.5 +39.0 +40.6 | +0.5 (5/10 faster) | -5.7 -2.9 +0.6 +4.1 +4.5 +6.7 +7.3 +8.2 +8.2 +14.1 | +6.7 (2/10 faster) | within the control |
 | unlink | 286.2 | -6.9 -6.5 -3.7 -0.6 +3.4 +3.7 +10.6 +14.9 +19.3 +22.2 | +3.7 (4/10 faster) | -1.6 -0.6 +0.5 +1.3 +3.8 +4.5 +6.4 +7.7 +8.7 +12.2 | +4.5 (2/10 faster) | within the control |
 | create_security | 228.1 | -24.5 -17.8 -16.7 -15.4 -7.7 -5.7 -2.9 -1.8 +1.3 +11.6 | -5.7 (8/10 faster) | -16.3 -11.8 -8.1 -1.9 +2.1 +6.1 +7.4 +7.9 +10.3 +14.4 | +6.1 (4/10 faster) | within the control |
-x86_64 (windows-latest), loaded, p50: arm minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+x86_64 (windows-latest), loaded, p50: the 2-competitive form (`f638d2aa`) minus main within each run, µs (sorted); the cut's median against the control's spread.
 
 | op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
 |---|---|---|---|---|---|---|
@@ -12408,7 +12413,7 @@ x86_64 (windows-latest), loaded, p50: arm minus main within each run, µs (sorte
 | unlink | 326.4 | +4.1 +4.3 +11.2 +12.5 +18.4 +27.4 +29.1 +30.9 +34.5 +48.0 | +27.4 (0/10 faster) | -19.8 -8.7 -3.3 -3.1 +2.2 +2.7 +4.7 +14.6 +16.9 +18.2 | +2.7 (4/10 faster) | **slower** beyond the control |
 | create_security | 1829.1 | +44.9 +52.4 +54.2 +54.8 +55.6 +59.2 +72.7 +78.0 +86.4 +94.5 | +59.2 (0/10 faster) | -18.6 -11.0 -0.7 +5.5 +9.8 +12.0 +21.3 +25.1 +28.0 +36.0 | +12.0 (3/10 faster) | **slower** beyond the control |
 
-x86_64 (windows-latest), quiet, p50: arm minus main within each run, µs (sorted); the cut's median against the control's spread.
+x86_64 (windows-latest), quiet, p50: the 2-competitive form (`f638d2aa`) minus main within each run, µs (sorted); the cut's median against the control's spread.
 
 | op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
 |---|---|---|---|---|---|---|
@@ -12422,7 +12427,8 @@ x86_64 (windows-latest), quiet, p50: arm minus main within each run, µs (sorted
 | rename | 354.6 | -52.0 -35.2 -17.0 +9.2 +36.6 +54.4 +55.4 +69.8 +73.9 +86.5 | +54.4 (3/10 faster) | -45.7 -40.6 -15.5 -12.3 -7.8 +28.8 +41.5 +42.4 +46.9 +46.9 | +28.8 (5/10 faster) | **slower** beyond the control |
 | unlink | 196.0 | -28.7 -18.4 -7.6 +11.5 +16.5 +28.6 +31.5 +34.4 +40.2 +43.1 | +28.6 (3/10 faster) | -18.3 -11.8 -7.6 +1.3 +1.5 +9.7 +20.1 +22.2 +22.8 +23.9 | +9.7 (3/10 faster) | **slower** beyond the control |
 | create_security | 1108.3 | -92.8 -44.7 +2.3 +17.0 +17.7 +23.9 +29.7 +39.3 +50.2 +73.4 | +23.9 (2/10 faster) | -66.9 -57.1 +15.1 +21.0 +23.7 +23.9 +31.3 +32.8 +43.5 +65.7 | +23.9 (2/10 faster) | within the control |
-arm64 (windows-11-arm), loaded, p50: arm minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+arm64 (windows-11-arm), loaded, p50: the median form (`1e9afce6`) minus main within each run, µs (sorted); the cut's median against the control's spread.
 
 | op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
 |---|---|---|---|---|---|---|
@@ -12437,7 +12443,7 @@ arm64 (windows-11-arm), loaded, p50: arm minus main within each run, µs (sorted
 | unlink | 354.4 | -8.5 -4.2 -3.1 -0.9 -0.3 -0.1 +0.1 +1.4 +3.8 +3.9 | -0.1 (6/10 faster) | -5.3 -3.1 -2.9 -0.9 +1.3 +1.9 +2.2 +3.4 +5.1 +10.1 | +1.9 (4/10 faster) | within the control |
 | create_security | 241.4 | -10.5 -10.2 -9.4 -4.2 -3.4 -3.2 -2.4 -2.2 -1.1 +0.4 | -3.2 (9/10 faster) | -8.0 -4.8 +0.9 +1.1 +2.8 +3.6 +4.8 +7.3 +8.6 +12.3 | +3.6 (2/10 faster) | within the control |
 
-arm64 (windows-11-arm), quiet, p50: arm minus main within each run, µs (sorted); the cut's median against the control's spread.
+arm64 (windows-11-arm), quiet, p50: the median form (`1e9afce6`) minus main within each run, µs (sorted); the cut's median against the control's spread.
 
 | op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
 |---|---|---|---|---|---|---|
@@ -12451,7 +12457,8 @@ arm64 (windows-11-arm), quiet, p50: arm minus main within each run, µs (sorted)
 | rename | 491.4 | -5.6 +2.8 +3.1 +6.5 +7.2 +8.4 +12.6 +18.7 +23.5 +70.1 | +8.4 (1/10 faster) | -13.1 -4.9 -1.4 -0.6 +0.0 +1.4 +2.9 +3.3 +4.9 +9.0 | +1.4 (4/10 faster) | within the control |
 | unlink | 299.7 | -6.7 -4.7 -4.6 -4.5 -3.8 -2.8 +0.7 +2.6 +4.9 +28.3 | -2.8 (6/10 faster) | -5.9 +1.2 +1.9 +2.3 +2.7 +4.3 +4.8 +6.1 +10.0 +10.7 | +4.3 (1/10 faster) | within the control |
 | create_security | 235.2 | -15.4 -11.4 -10.0 -6.4 -5.4 -1.6 +0.8 +1.1 +2.0 +5.2 | -1.6 (6/10 faster) | -7.9 -7.4 -5.8 -5.3 -0.7 -0.6 +0.5 +2.0 +4.9 +5.1 | -0.6 (6/10 faster) | within the control |
-x86_64 (windows-latest), loaded, p50: arm minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+x86_64 (windows-latest), loaded, p50: the median form (`1e9afce6`) minus main within each run, µs (sorted); the cut's median against the control's spread.
 
 | op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
 |---|---|---|---|---|---|---|
@@ -12466,7 +12473,7 @@ x86_64 (windows-latest), loaded, p50: arm minus main within each run, µs (sorte
 | unlink | 358.6 | -42.2 -0.5 +3.6 +13.3 +13.9 +26.3 +29.0 +49.3 +65.5 +70.1 | +26.3 (2/10 faster) | -53.2 -29.1 -20.4 -8.1 -0.3 +1.5 +2.0 +29.6 +45.7 +64.7 | +1.5 (5/10 faster) | within the control |
 | create_security | 2402.5 | -112.2 -42.6 -35.5 -29.5 -25.6 -20.0 -6.0 -0.5 +32.6 +34.1 | -20.0 (8/10 faster) | -62.6 -61.5 -34.8 -12.0 -10.4 -3.0 +0.4 +8.6 +56.7 +60.6 | -3.0 (6/10 faster) | within the control |
 
-x86_64 (windows-latest), quiet, p50: arm minus main within each run, µs (sorted); the cut's median against the control's spread.
+x86_64 (windows-latest), quiet, p50: the median form (`1e9afce6`) minus main within each run, µs (sorted); the cut's median against the control's spread.
 
 | op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
 |---|---|---|---|---|---|---|
@@ -12480,6 +12487,7 @@ x86_64 (windows-latest), quiet, p50: arm minus main within each run, µs (sorted
 | rename | 605.4 | -59.6 -40.6 -27.4 +15.3 +35.6 +37.6 +47.9 +79.7 +96.5 +104.6 | +37.6 (3/10 faster) | -92.4 -38.4 -31.9 -21.3 -20.0 -17.6 +3.1 +23.7 +38.4 +66.7 | -17.6 (6/10 faster) | within the control |
 | unlink | 362.3 | -54.7 -27.7 -27.5 -16.8 -2.2 +24.3 +34.7 +40.8 +43.3 +48.3 | +24.3 (5/10 faster) | -65.3 -30.0 -28.2 -18.4 -12.9 -8.3 +11.0 +28.4 +31.8 +49.7 | -8.3 (6/10 faster) | within the control |
 | create_security | 1514.4 | -59.1 -19.6 -9.7 -7.2 +8.0 +17.0 +17.2 +39.8 +41.4 +96.8 | +17.0 (4/10 faster) | -57.3 -32.3 -30.7 -28.8 -24.7 -0.6 +6.8 +8.0 +32.2 +86.4 | -0.6 (6/10 faster) | within the control |
+
 ### Main against main as cut (c) landed: nothing large lost since
 
 **The question.** `diag-g258-3`'s first arm64 run put main's quiet stat p50 51 µs over the DLL arm's, where the last
