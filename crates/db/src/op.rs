@@ -412,43 +412,6 @@ pub enum Op {
     /// The name.
     name: String,
   },
-  /// A work's base is held for it on its green's partition, wherever the work lives (A-247): made at the work's
-  /// creation, moved by its accept and rebase. Appended.
-  WorkFloorSet {
-    /// The green.
-    green: VolumeId,
-    /// The work.
-    work: VolumeId,
-    /// The version the work is based on.
-    base: u64,
-  },
-  /// A work's creation waits for its green's owner to admit it, holding its name and its id (A-247). Appended.
-  WorkCreationPending {
-    /// The creation.
-    record: crate::catalog::PendingCreationRecord,
-  },
-  /// A work's pending creation ended: made, refused, or dropped at a start (A-247). Appended.
-  WorkCreationSettled {
-    /// The name.
-    name: String,
-  },
-  /// A work's submit went to its green's owner and waits to be settled on the work (A-247). Appended.
-  WorkSubmitPending {
-    /// The submit.
-    record: crate::catalog::PendingSubmitRecord,
-  },
-  /// A work's pending submit was settled (A-247). Appended.
-  WorkSubmitSettled {
-    /// The work.
-    work: VolumeId,
-  },
-  /// A work's floor is released: it was destroyed, or found gone at recovery (A-247). Appended.
-  WorkFloorDropped {
-    /// The green.
-    green: VolumeId,
-    /// The work.
-    work: VolumeId,
-  },
   /// A CLI attachment's term was renewed by a verb naming it (A-230). Appended.
   AttachmentRenewed {
     /// The attachment.
@@ -503,6 +466,44 @@ pub enum Op {
     id: VolumeId,
     /// The policy.
     policy: crate::catalog::WritePolicy,
+  },
+  /// A work's base is held for it on its green's partition, wherever the work lives (A-247): made at the work's
+  /// creation, moved by its accept and rebase. Appended (2026-11-18), with the five after it: each variant's index is
+  /// its tag on the log, so A-247's records follow every variant main had when they landed.
+  WorkFloorSet {
+    /// The green.
+    green: VolumeId,
+    /// The work.
+    work: VolumeId,
+    /// The version the work is based on.
+    base: u64,
+  },
+  /// A work's creation waits for its green's owner to admit it, holding its name and its id (A-247). Appended.
+  WorkCreationPending {
+    /// The creation.
+    record: crate::catalog::PendingCreationRecord,
+  },
+  /// A work's pending creation ended: made, refused, or dropped at a start (A-247). Appended.
+  WorkCreationSettled {
+    /// The name.
+    name: String,
+  },
+  /// A work's submit went to its green's owner and waits to be settled on the work (A-247). Appended.
+  WorkSubmitPending {
+    /// The submit.
+    record: crate::catalog::PendingSubmitRecord,
+  },
+  /// A work's pending submit was settled (A-247). Appended.
+  WorkSubmitSettled {
+    /// The work.
+    work: VolumeId,
+  },
+  /// A work's floor is released: it was destroyed, or found gone at recovery (A-247). Appended.
+  WorkFloorDropped {
+    /// The green.
+    green: VolumeId,
+    /// The work.
+    work: VolumeId,
   },
 }
 
