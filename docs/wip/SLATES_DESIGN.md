@@ -1632,6 +1632,18 @@ metadata provisioning path, not arbitrary host pathname resolution. A scratch vo
   handles; add the claim and lineage record. Root cloning is O(1). A remote clone retains the
   base service dependency or uses an already complete immutable base. It never turns into an
   empty scratch volume merely because its source directory is remote.
+  > Status (2026-11-18, a local clone of an overlay): the daemon gives each volume a host of its own, so an
+  > overlay's clone gets one holding every directory of its origin's host under the same handle, each a duplicate
+  > descriptor of the very directory the origin reads (`slates_base::OsHost::try_clone_dirs`, `verbs::clone_base_host`):
+  > the clone's base reference is the origin's, never a pathname looked up again. Its base plane keys the root listing
+  > by the root number the clone's root directory keeps (its origin's) and takes each of the origin's listings with its
+  > entries dropped, to be read afresh from the live base (`BasePlane::for_clone`). A recovery reopens the clone's base
+  > from its record and checks its fingerprints, as it does the origin's. Before, every clone was admitted with no
+  > host, its first image could not fingerprint its base, and `volume clone` of an overlay was refused
+  > `ContentUnavailable`, pinned or not. Held by
+  > `an_overlays_snapshot_clones_and_each_clone_reads_its_base_across_a_restart` (`crates/server/tests/recovery.rs`)
+  > and `a_clones_base_subdirectory_reads_as_the_disk_holds_it` (`crates/vfs/tests/base.rs`). A clone on another host
+  > (remote attach, below) is still owed.
 - attach(volume|snapshot, consumer, transport, chosen_path?) → Attachment: authenticate the
   consumer and requested access, reserve all costs, pin the view and generation, establish
   the path or device, then publish `Bound`. Refusal rolls back owned resources. A metadata
@@ -5543,6 +5555,27 @@ placement records bind both scopes; cached configuration/attachment generations 
 ordinary writes. A region-home move also carries root-group authority. The id still routes by
 creator plus these exceptions; this adds no global lookup catalog or per-write coordination.
 
+> **Status (2026-11-18, the moved-object exceptions; the configuration's half of an explicit move).**
+> `RegionalConfiguration::moved` holds, for each moved object only, its owner and the configuration version its move
+> committed at, its ownership generation (`slates_db::register::Moved`). An object's line starts at its exception's
+> owner, else at its creator, and a retired host hands it on along the takeover's lineage
+> (`RegionalConfiguration::owner_of`). A member reports a move through the council's report stream
+> (`ConfigCommand::Move`, `MovedForgotten` once the object is destroyed); the leader proposes it only when the
+> configuration names the reporter as the owner, or names no owner because the object's line runs through a takeover
+> that is done (the configuration no longer keeps that successor, and a host that lost its authority never reports
+> again under its id), and never for a lost or unresolved line. A move that would add an exception past the bound the
+> leader derives is answered `ReportOutcome::Full` and not proposed (`fleet::moved_bound`: the members times one
+> member's volume slots, at the leader's size). A move back to the creator drops the exception. An exception follows
+> its owner's takeover at the successor's confirmation, through a takeover carried into another's too, so no line
+> starts at a retirement the configuration dropped. The encoding carries the exceptions last (the encoding itself is
+> still unversioned; GAPS). Held by four tests in `crates/db/src/register.rs` (`a_move_names_the_objects_owner_and_only_its_owner_moves_it`,
+> `a_moved_objects_exception_follows_its_owners_takeover_and_goes_with_its_destroy`,
+> `a_moved_objects_exception_follows_a_takeover_carried_into_another`,
+> `a_member_moves_an_object_whose_takeover_is_done_and_never_an_unresolved_one`), the council's
+> `a_move_report_is_proposed_by_its_owner_and_held_to_the_bound` and the encoding's round trip and lying-count tests.
+> Owed: the holders' side (a committed move installs the new owner's authority on the object's copies, fencing the
+> old owner) and the planned handoff in the daemon (§4.10 "Ownership follows the writer").
+
 **Lookup.** A volume id carries its creator host. A lookup by id routes to that host, or, when
 the configuration records a takeover of that host, to the candidate that rendezvous ranks first
 among the survivors of its neighbourhood at the takeover generation; an ownership or home move is a configuration exception naming the affected volume and its
@@ -6023,8 +6056,8 @@ failure.
 > it can reach: a submit forwarded from another node than the work's owner, not yet acknowledged. The merge record
 > (format 2) and chain entry (version 3) name such a submit's work. The successor records the completion under it, and
 > the route's adopter asks the green's owner each period and retires the route through the destroy's tombstone stages
-> once none is held. Still held: a route to a green destroyed, lost or given up while it is kept, one whose completion is
-> never acknowledged, and one its adopter kept across a warm restart (GAPS).
+> once none is held, or once the green is given up. Still held: a route to a green destroyed or lost while it is kept,
+> one whose completion is never acknowledged, and one its adopter kept across a warm restart (GAPS).
 
 > **Status (2026-11-07, A-245: an acknowledgement names the ids still owed).** A watermark is contiguous, so one held or
 > slow request kept every later completion of its client: the owner pruned none of them, and past `2 × slots` refused
@@ -16157,6 +16190,8 @@ Applied in the same change to: §4.16's status, A-9's "recorded durably" (now: r
   overlay's base names its directories by its own host's handles, so the clone of the server's overlay was refused
   `ContentUnavailable`, pinned or not, on a fleet node and on a standalone daemon alike (the volume core's own overlay
   clone, `a_clone_of_an_overlay_snapshot_reads_the_same_base`, is not reachable through the daemon). Recorded in GAPS.
+  (Since 2026-11-18 the daemon clones an overlay, §4.4 clone's status; this alternative stays rejected for the
+  reasons below.)
 - **Rejected: `land GREEN TARGET` building a hidden view.** A grant binds a presented manifest, and the presentation
   and the granted landing are two calls; a view rebuilt for each would need its manifest proven stable, and a kept one
   would be state the user never named.
@@ -16677,6 +16712,9 @@ Applied in the same change to:
 - The test `a_works_route_ends_once_the_greens_owner_holds_none_of_its_completions` (red on main 7c6faee27 and
   dbf53afa2: retired false, counted 0; green with the fix, both routes retired, counted 2), §4.16's status, GAPS, and
   `docs/bugs/2026-11-17-a-works-route-was-never-retired.md`.
+- The second piece, the same day: `work_route::held_completions` answers for a green its shard holds `unrecovered`, and
+  `work_route::nudge` is public for a test that plants a route. The test
+  `a_route_to_a_green_its_successor_gave_up_on_is_retired` (red: the route kept, all 111 questions refused).
 
 - **What was there.** A-255 made a work's catalog record, which names its green, the route a resend of its submit
   takes after the work's owner is taken over. Its adopter keeps it placed (`fleet::owed_adopted_work_catalogs`). Nothing
@@ -16695,8 +16733,10 @@ Applied in the same change to:
     partition counts what each work still has (`Partition::completions_routed_by`), and the acknowledgement that
     releases the last ends the count.
   - The route's adopter asks the green's owner every record period, for the works whose routes it keeps, whether any is
-    still held (`work_route::Question`, fleet stream 25). Only the shard that serves the green answers. A green pending
-    materialization, owned elsewhere or not found gives no answer, and the route stays.
+    still held (`work_route::Question`, fleet stream 25). Only the green's shard answers, and only once its count is
+    final: once it serves the green, or holds it `unrecovered`, since a takeover given up after the failover SLO's
+    attempts recorded no adopted completion and never will. A green pending materialization, owned elsewhere or not
+    found gives no answer, and the route stays.
   - A work answered "none" moves from the adopter's pending catalogs to its pending tombstones, at sequence 1, where the
     work's own destroy would have closed its registers. AUD-29-43's two stages then drop every holder's copy. When the
     tombstone retires, the owner drops its own copies of both registers too: a successor had kept its takeover's
@@ -16714,11 +16754,11 @@ Applied in the same change to:
     member, and its old id is retired before the new one is admitted (`fleet::LearnedOutcome::Restarted`, from
     reading). A route retired in that gap refuses a resend its surviving client is owed.
 - **Open.**
-  - A green destroyed, or lost to a second takeover it cannot survive (GAP-A9-7), while a route to it is kept leaves
-    that route held: the green has no owner to answer.
-  - A green its successor gave up on (the give-up after the failover SLO's attempts) is never served, so its shard
-    answers no question and a route to it stays, though nothing it leads to can answer: the successor never recorded
-    the adopted completions. The next piece answers such a green from its partition's count.
+  - A green destroyed (a given-up one too, which is then neither served nor `unrecovered`), or lost to a second
+    takeover it cannot survive (GAP-A9-7), while a route to it is kept leaves that route held: the green has no owner
+    to answer.
+  - ~~A green its successor gave up on keeps a route to it~~: ended the same day. Its shard answers for a green it
+    holds `unrecovered`, from its partition's count (`a_route_to_a_green_its_successor_gave_up_on_is_retired`).
   - A completion its client never acknowledges keeps its route, as it keeps the record itself. This covers a client of
     another node that died, and one that never writes to the green again. Only an acknowledgement or a client lease
     ends either, and RIFL's client leases are not built.

@@ -1,5 +1,21 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Open (g267, 2026-11-18): a volume moves between fleet nodes, and kiln's runners form the fleet.** Kiln moves an
+> agent between runners only without a volume (`harness/relocate.rs` refuses one), so the work owed is §4.10's
+> planned handoff ("Ownership follows the writer", Phase 8 task 9, AC-8.16, T-8.14), then kiln as the fleet's operator.
+> - **Built:** a local clone of an overlay (below, 2026-11-05's list) and the configuration's moved-object exceptions
+>   (§4.8 "Authority scope", its status of this date): a move is reported, bounded, committed, followed through
+>   takeovers and dropped at a destroy.
+> - **Owed, in order:** the holders' side of a committed move (the object's copies take the new owner's authority and
+>   refuse the old owner); the handoff in the daemon (drain, the head or live log durable, the report, the new owner's
+>   phase one for the one object, materialize, serve; routing follows the exception; a `slates volume move` verb); an
+>   overlay's move (its base stays on its source host, §4.10 "Overlay volumes in a fleet", so it is refused typed
+>   until a remote base service or a captured base exists); kiln's runners as members (certificates under kiln's CA,
+>   seeds from kiln's runner directory); a multi-runner test with injected faults.
+> - **Decided (Ada, 2026-11-18):** the persistent disks Hex gives microVMs stay on their own machine (Hex's D281,
+>   "volumes stay per machine", stands); only slates workspaces replicate across kiln runners, so the moves and copies
+>   this entry owes are of slates volumes alone.
+
 > **The consumer contract is published (2026-11-18, §4.12 "The consumer contract"; A-299, Ada's widening of goal
 > g262).** Everything a consumer touches goes through `slates-api`, answered with typed outcomes and closed typed errors.
 > **Built (piece 4):** write modes per act (`WriteMode` bypass / ask / forbid, `WritePolicy`, `PolicySubject`, the
@@ -261,11 +277,16 @@
 >   retired false; ... retired false, counted 0; held at the end [Ok(true), Ok(true)]`, 860 s at load 57 to 91), and
 >   green with the fix on the same Mac (macOS arm64, debug): 6.91 s at load 11 to 37 on 7c6faee27, and 8.56 s at load
 >   108 merged with main b7c294959. Both routes retired on both survivors, counted twice. Still held, A-288's open list:
->   - a route to a green destroyed, or lost to a second takeover it cannot survive (GAP-A9-7), while the route is
->     kept: the green has no owner to answer;
->   - a route to a green its successor gave up on (the give-up after the failover SLO's attempts, d3f4ddbe2): the green
->     is never served, so its shard answers no question and the route stays, though nothing it leads to can answer.
->     The next piece answers such a green from its partition's count;
+>   - a route to a green destroyed (a given-up one too, which is then neither served nor `unrecovered`), or lost to a
+>     second takeover it cannot survive (GAP-A9-7), while the route is kept: the green has no owner to answer;
+>   - ~~a route to a green its successor gave up on~~ (the give-up after the failover SLO's attempts, d3f4ddbe2):
+>     **ended the same day.** The green was never served, so its shard answered no question and the route stayed, though
+>     nothing it led to could answer. Now the green's shard answers for a green it holds `unrecovered` too, from its
+>     partition's count, which is final there; a green whose takeover is still pending is refused as before. Red first,
+>     on a lone node with a planted green given up naming its chain: the route kept, all 111 questions refused, 14.4 s
+>     at load 33 to 37. Green: refused at all 10 questions while the green was pending and kept at every read, then
+>     retired at the first question after the give-up, its tombstone recorded and retired, 5.7 s at load 48 to 52
+>     (`a_route_to_a_green_its_successor_gave_up_on_is_retired`);
 >   - a route whose completion its client never acknowledges (a client of another node that died, or one that never
 >     writes to the green again), as the completion record itself is: only an acknowledgement or a client lease ends
 >     either, and RIFL's client leases are not built;
@@ -2390,6 +2411,19 @@
 > (`docs/bugs/2026-11-05-a-held-origin-refused-every-checkout.md`). Open, found on the way:
 > - **The daemon cannot clone an overlay volume.** `admit_clone` gives every clone no host, so `volume clone` of an
 >   overlay is refused `ContentUnavailable` (pinned or not; fleet and standalone), though the volume core can.
+>   **Fixed 2026-11-18** (g267): a clone of an overlay reads its base through a host of its own that holds every
+>   directory of the origin's host under the same handle, each a duplicate descriptor of the very directory the origin
+>   reads (`OsHost::try_clone_dirs`), so no outsider's rename or newcomer at a base path can stand in for it; both clone
+>   paths take it (the origin's partition, and A-236's alias for a name held on another), and a recovery reopens the
+>   clone's base from its record and checks its fingerprints, as it does the origin's. The volume core had a second
+>   defect under it: a clone's base plane keyed its root listing by the clone's own root number, while the clone's root
+>   directory keeps its origin's, and kept none of the origin's other listings, so a base subdirectory the snapshot
+>   already held refused `NotOverlay`; the plane now keys by the snapshot root's number and takes each of the origin's
+>   listings with its entries dropped, to be read afresh. Red first:
+>   `an_overlays_snapshot_clones_and_each_clone_reads_its_base_across_a_restart` (`crates/server/tests/recovery.rs`)
+>   and `a_clones_base_subdirectory_reads_as_the_disk_holds_it` (`crates/vfs/tests/base.rs`); the duplicate's own
+>   behaviour by `a_hosts_directories_duplicate_under_the_same_handles_to_the_same_directories`
+>   (`crates/base/tests/host.rs`).
 > - **No grant can be issued on Linux from the CLI.** The anchor's issuer segment is a descriptor only its children
 >   hold (`PRINTS_ISSUER_SURFACE` in `crates/cli/tests/cli.rs`), so a Linux server's landing stops at its
 >   presentation. Needs a decision on the Linux issuer surface (§4.13).

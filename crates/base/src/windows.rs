@@ -594,6 +594,29 @@ impl OsHost {
     Ok((host, HostDir(h)))
   }
 
+  /// A host of its own for a clone of the overlay this host serves (§4.4 clone; AC-1.16): every directory this one
+  /// keeps, duplicated under the same handle (`DuplicateHandle`, through `OwnedHandle::try_clone`), so each directory
+  /// the overlay's base plane names is the very same directory object in both, whatever an outsider has since renamed
+  /// or put at its path; new handles continue past this host's. No file of this one's is kept: a clone opens its own.
+  /// Refused as the system refuses a duplicate.
+  pub fn try_clone_dirs(&self) -> Result<OsHost, HostError> {
+    let dirs = self
+      .dirs
+      .iter()
+      .map(|(&handle, owned)| {
+        owned
+          .try_clone()
+          .map(|owned| (handle, owned))
+          .map_err(|error| refusal(&error))
+      })
+      .collect::<Result<BTreeMap<_, _>, HostError>>()?;
+    Ok(Self {
+      dirs,
+      files: BTreeMap::new(),
+      next: self.next,
+    })
+  }
+
   /// The next handle id. Ids are never reused, so one is never recycled onto a handle still held; once the
   /// id space is spent the host refuses as it would past its handle limit (`ERROR_TOO_MANY_OPEN_FILES`).
   /// (At one open a nanosecond, a `u64` lasts 584 years.)

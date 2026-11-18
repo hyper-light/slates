@@ -6197,13 +6197,31 @@ fn serve_root_fetch(state: &ShardState, request: &[u8]) -> Vec<u8> {
 /// counted [`REPORT_REFUSED`]: an honest member never sends one.
 fn serve_council_report(state: &mut ShardState, peer_host: HostId, request: &[u8]) -> Vec<u8> {
   let outcome = match slates_cluster::config_group::ConfigCommand::decode(request) {
-    Some(command) => state.council.report(peer_host, command),
+    Some(command) => {
+      let bound = moved_bound(state);
+      state.council.report(peer_host, command, bound)
+    }
     None => ReportOutcome::Refused,
   };
   if outcome == ReportOutcome::Refused {
     state.count(REPORT_REFUSED, 1);
   }
   outcome.encode()
+}
+
+/// Derived: the most moved-object exceptions this node, leading the council, lets the configuration hold (banned item 8;
+/// §4.8 "Authority scope"). An exception names a live volume, and a member owns at most as many volumes as its registry
+/// has slots (`max_slots` on each of its shards, derived from its machine profile at boot), so a region holds at most
+/// that many moved volumes a member: the bound is that, counting every member at this node's size. A move past it is
+/// answered `Full` and never proposed.
+pub(crate) fn moved_bound(state: &ShardState) -> usize {
+  state
+    .council
+    .configuration()
+    .members
+    .len()
+    .saturating_mul(state.shards.len())
+    .saturating_mul(state.volumes.max_slots())
 }
 
 /// The status refusal count under which a council voter records a member's report it refused: bytes that are
@@ -6319,7 +6337,8 @@ pub(crate) async fn send_council_report(
   let Some(targets) = state::with_state(|s| {
     if s.council.is_leader() {
       s.count(REPORT_SENT, 1);
-      let _ = s.council.report(local, command);
+      let bound = moved_bound(s);
+      let _ = s.council.report(local, command, bound);
       return None;
     }
     Some(

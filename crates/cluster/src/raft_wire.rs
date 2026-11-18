@@ -12,8 +12,8 @@
 use std::mem::size_of;
 
 use slates_db::register::{
-  Adoption, DomainId, HostEpoch, HostId, Neighbourhood, OBJECT_BYTES, ObjectId, Quorum, RegionId,
-  RegionalConfiguration, Retirement, RootConfiguration, Settled,
+  Adoption, DomainId, HostEpoch, HostId, Moved, Neighbourhood, OBJECT_BYTES, ObjectId, Quorum,
+  RegionId, RegionalConfiguration, Retirement, RootConfiguration, Settled,
 };
 use slates_transport::connection::Priority;
 use slates_transport::endpoint::{Endpoint, EndpointError};
@@ -759,7 +759,38 @@ pub fn encode_regional_configuration(config: &RegionalConfiguration) -> Vec<u8> 
     put_bytes(&mut out, &adoption.catalog);
   }
   encode_hosts(&mut out, &config.dropped_unconfirmed);
+  put_u32(
+    &mut out,
+    u32::try_from(config.moved.len()).unwrap_or(u32::MAX),
+  );
+  for (object, moved) in &config.moved {
+    out.extend_from_slice(&object.0);
+    put_u64(&mut out, moved.owner.0);
+    put_u64(&mut out, moved.version);
+  }
   out
+}
+
+/// Decodes the moved-object exceptions (count, then each `(object, owner, version)`), bounding the count.
+fn decode_moved(
+  bytes: &[u8],
+) -> Result<(std::collections::BTreeMap<ObjectId, Moved>, &[u8]), RaftWireError> {
+  let (count, mut rest) = take_count(bytes)?;
+  let mut moved = std::collections::BTreeMap::new();
+  for _ in 0..count {
+    let (object, tail) = take_object(rest)?;
+    let (owner, tail) = take_u64(tail)?;
+    let (version, tail) = take_u64(tail)?;
+    moved.insert(
+      object,
+      Moved {
+        owner: HostId(owner),
+        version,
+      },
+    );
+    rest = tail;
+  }
+  Ok((moved, rest))
 }
 
 /// Decodes the adoptions map (count, then each `(object, successor, head, catalog)`), bounding the count.
@@ -876,6 +907,7 @@ pub fn decode_regional_configuration(bytes: &[u8]) -> Result<RegionalConfigurati
   let (retired, rest) = decode_retired(rest)?;
   let (adoptions, rest) = decode_adoptions(rest)?;
   let (dropped_unconfirmed, rest) = decode_hosts(rest)?;
+  let (moved, rest) = decode_moved(rest)?;
   expect_end(rest)?;
   Ok(RegionalConfiguration {
     version,
@@ -889,6 +921,7 @@ pub fn decode_regional_configuration(bytes: &[u8]) -> Result<RegionalConfigurati
     retired,
     adoptions,
     dropped_unconfirmed,
+    moved,
   })
 }
 
@@ -1773,9 +1806,50 @@ mod tests {
     let bytes = encode_regional_configuration(&config);
     assert_eq!(
       decode_regional_configuration(&bytes),
-      Ok(config),
+      Ok(config.clone()),
       "round-trip is identity with an adoption in flight"
     );
+    // A moved object's exception (§4.8 "Authority scope") survives it too.
+    assert!(config.move_object(ObjectId::new(B, 5), B, HostId(3)));
+    assert_eq!(config.moved.len(), 1);
+    let bytes = encode_regional_configuration(&config);
+    assert_eq!(
+      decode_regional_configuration(&bytes),
+      Ok(config),
+      "round-trip is identity with a moved object"
+    );
+  }
+
+  /// A configuration whose moved-object count lies — more exceptions than the bytes back — is refused before
+  /// allocating, and one cut short inside an exception is refused as truncated.
+  #[test]
+  fn a_lying_moved_object_count_is_refused() {
+    use slates_db::register::RegionalConfiguration;
+    let mut config = RegionalConfiguration::formed(
+      vec![A, B, HostId(3)],
+      Quorum { f: 1 },
+      std::collections::BTreeMap::new(),
+      3,
+      false,
+    );
+    assert!(config.move_object(ObjectId::new(A, 5), A, B));
+    let bytes = encode_regional_configuration(&config);
+    // The exceptions are last: a count, then one entry of an object id and two words.
+    let entry = OBJECT_BYTES + 2 * size_of::<u64>();
+    let count_at = bytes.len() - entry - size_of::<u32>();
+    let mut lying = bytes.clone();
+    lying[count_at..count_at + size_of::<u32>()].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert_eq!(
+      decode_regional_configuration(&lying),
+      Err(RaftWireError::LengthMismatch),
+      "a count beyond the bytes is refused"
+    );
+    for cut in 1..=entry {
+      assert!(
+        decode_regional_configuration(&bytes[..bytes.len() - cut]).is_err(),
+        "a configuration cut {cut} bytes short is refused"
+      );
+    }
   }
 
   /// A retirement whose confirmed-host count lies — more ids than the bytes back — is refused before
@@ -1794,8 +1868,9 @@ mod tests {
     let bytes = encode_regional_configuration(&config);
     // The last retirement ends with its confirmed ids (a count, none here) and its unconfirmed ids (a count,
     // none here): make the confirmed count claim every id there is.
-    // The adoptions' count (none here) follows the last retirement.
-    let confirmed_count_at = bytes.len() - 3 * size_of::<u32>();
+    // The adoptions' count, the unconfirmed drops' count and the moved objects' count (none of each here) follow the
+    // last retirement, in that order.
+    let confirmed_count_at = bytes.len() - 5 * size_of::<u32>();
     let mut lying = bytes.clone();
     lying[confirmed_count_at..confirmed_count_at + size_of::<u32>()]
       .copy_from_slice(&u32::MAX.to_le_bytes());
@@ -1804,7 +1879,7 @@ mod tests {
       Err(RaftWireError::LengthMismatch),
       "a count beyond the bytes is refused"
     );
-    for cut in 1..=3 * size_of::<u32>() {
+    for cut in 1..=5 * size_of::<u32>() {
       assert!(
         decode_regional_configuration(&bytes[..bytes.len() - cut]).is_err(),
         "a configuration cut {cut} bytes short is refused"

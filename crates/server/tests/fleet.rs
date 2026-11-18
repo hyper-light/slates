@@ -17850,6 +17850,156 @@ fn a_taken_over_green_whose_chain_is_short_is_refused_by_name() {
   );
 }
 
+/// Shape: a planted work's object id (A-288): a volume-class id (byte 10, the register-class byte, clear) whose partition
+/// (bytes 8 and 9, `verbs::owner_of`) is the node's first, as the planted green's is, so its tombstone is recorded here.
+const PLANTED_WORK: [u8; 16] = [
+  0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0, 0, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31,
+];
+
+/// Plants on `daemon`'s control shard a work's route to the planted green (A-288), as a takeover's adoption leaves one
+/// (`takeover::record_adoption`): the work's catalog register, naming the green, owned by this node, the green tracked
+/// as this node's own as its adoption tracks it, and the route keeper woken.
+fn plant_work_route(daemon: &Daemon) {
+  daemon
+    .observation_on_control(
+      LIVENESS_BUDGET_NS,
+      move |s: &mut slates_server::state::ShardState| {
+        let local = s.fleet.host();
+        let work = ObjectId(PLANTED_WORK);
+        let catalog = slates_server::catalog::CatalogValue {
+          name: "planted-work".to_owned(),
+          size: slates_db::catalog::SizeClass::Bounded { limit: 1 << 20 },
+          names: slates_db::catalog::NamePolicy::Exact,
+          owner: slates_db::catalog::Principal::Uid {
+            host: HostId(1),
+            uid: 0,
+          },
+          require_locked: false,
+          access: Vec::new(),
+          live_shipped: false,
+          live_holders: None,
+          work_of: Some(slates_db::catalog::VolumeId {
+            bytes: PLANTED_GREEN,
+          }),
+        };
+        s.pending_catalogs.insert(work, (1, catalog));
+        s.fleet.track_object_owner(work.catalog(), local);
+        s.fleet.track_object_owner(ObjectId(PLANTED_GREEN), local);
+        slates_server::work_route::nudge(s);
+      },
+    )
+    .unwrap()
+    .wait()
+    .unwrap();
+}
+
+/// What `daemon`'s control shard holds of the planted work's route (A-288): whether the green is still pending its
+/// materialization, whether the route is still kept (`pending_catalogs`), whether its tombstone is still owed
+/// (`pending_tombstones`), and the `fleet.work_route.*` counts.
+fn planted_route(daemon: &Daemon) -> (bool, bool, bool, std::collections::BTreeMap<String, u64>) {
+  daemon
+    .observation_on_control(
+      LIVENESS_BUDGET_NS,
+      |s: &mut slates_server::state::ShardState| {
+        let counted = s
+          .refusals
+          .iter()
+          .filter(|(name, _)| name.starts_with("fleet.work_route"))
+          .map(|(name, count)| ((*name).to_owned(), *count))
+          .collect();
+        (
+          s.pending_green_materializations
+            .contains_key(&ObjectId(PLANTED_GREEN)),
+          s.pending_catalogs.contains_key(&ObjectId(PLANTED_WORK)),
+          s.pending_tombstones.contains_key(&ObjectId(PLANTED_WORK)),
+          counted,
+        )
+      },
+    )
+    .unwrap()
+    .wait()
+    .unwrap()
+}
+
+/// A-288, the route to a green its successor gave up on ends (CLAUDE.md §2 item 8): a green given up after the failover
+/// SLO's attempts recorded none of its adopted completions and never will, so no resend through a work's route to it can
+/// be answered its version. Do: on a one-node fleet with a one-second failover SLO, plant a taken-over green whose chain
+/// is short (it is given up, `NotRecovered` naming `chain`), tracked as this node's own as its adoption tracks it, and a
+/// work's route to it kept here; read both each period. Expect: while the green is pending, the keeper's questions are
+/// refused (`fleet.work_route.not_served_here`) and the route is kept at every read; once the green is given up, the
+/// route is retired (`fleet.work_route.retired`) and its tombstone recorded and retired, nothing of the work left
+/// pending. Before, the green's shard answered no question about a green it did not serve, so the route was kept, and
+/// asked about every period, for as long as the node ran.
+#[test]
+fn a_route_to_a_green_its_successor_gave_up_on_is_retired() {
+  let _serial = serialize_fleet_tests();
+  let daemon = lone_fleet_node("route-given-up");
+  plant_taken_over_green(&daemon, true);
+  plant_work_route(&daemon);
+  // A channel nobody sends on paces the reads, as the lint wall wants.
+  let (_held, pace) = std::sync::mpsc::channel::<()>();
+  let deadline = Duration::from_nanos(HEARTBEAT_NS.saturating_mul(GIVE_UP_WITHIN_PERIODS));
+  let started = Instant::now();
+  let mut pending_reads = 0u64;
+  let mut refused_while_pending = 0u64;
+  let mut dropped_while_pending = 0u64;
+  let mut read = planted_route(&daemon);
+  while read.0 && started.elapsed() < deadline {
+    pending_reads = pending_reads.saturating_add(1);
+    if !read.1 {
+      dropped_while_pending = dropped_while_pending.saturating_add(1);
+    }
+    refused_while_pending = read
+      .3
+      .get("fleet.work_route.not_served_here")
+      .copied()
+      .unwrap_or(0);
+    let _ = pace.recv_timeout(Duration::from_nanos(HEARTBEAT_NS));
+    read = planted_route(&daemon);
+  }
+  let answered = status_of_planted_green(&daemon, GIVE_UP_WITHIN_PERIODS);
+  let started = Instant::now();
+  let mut last = planted_route(&daemon);
+  while (last.1 || last.2) && started.elapsed() < deadline {
+    let _ = pace.recv_timeout(Duration::from_nanos(HEARTBEAT_NS));
+    last = planted_route(&daemon);
+  }
+  let record = green_takeover_record(&daemon);
+  daemon.stop();
+  eprintln!(
+    "pending reads {pending_reads}, refused while pending {refused_while_pending}, dropped while pending \
+     {dropped_while_pending}; the green answered {answered:?}; at the end (pending, kept, tombstone owed, counted) \
+     {last:?}; {record}"
+  );
+  assert!(
+    pending_reads > 0 && refused_while_pending > 0,
+    "the keeper asked about the green while it was pending, and was refused: {pending_reads} reads, \
+     {refused_while_pending} refusals"
+  );
+  assert_eq!(
+    dropped_while_pending, 0,
+    "the route was kept at every read while the green was pending"
+  );
+  assert_eq!(
+    answered,
+    Some(Refusal::NotRecovered {
+      cause: slates_ipc::protocol::RecoveryCause::TakeoverIncomplete {
+        waited_on: "chain".to_owned()
+      }
+    }),
+    "the green was given up on, naming its chain ({record})"
+  );
+  assert!(
+    !last.1 && !last.2,
+    "the route to the given-up green was retired and its tombstone recorded: {last:?}"
+  );
+  assert_eq!(
+    last.3.get("fleet.work_route.retired").copied(),
+    Some(1),
+    "the keeper counted the retirement once: {last:?}"
+  );
+}
+
 /// A one-node fleet daemon whose transport holds an export listener and the operator's issuer (§4.6
 /// "Kubernetes publication without privilege", AUD-29-75): the daemon, its export port, and the issuer that
 /// signs clients.
