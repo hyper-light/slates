@@ -1015,21 +1015,58 @@
 > The race: `a<n>` linked to `b<n>`, `a<n>` held open so the mount's next round purges it (A-190), a write through
 > `b<n>`, then `a<n>` closed and deleted at once (`vm-delete-race.ps1`). In 4 of 4 runs, the deleter hung within 60
 > rounds: at rounds 28 and 17 before the fix, and at 60 and 1 after it. Its thread waits in `NtClose` (`IopCloseFile`) for its
-> cleanup IRP. Local kernel debugging at round 1 (`kd -kl`, 2026-11-18 18:52 UTC) showed:
-> - one file node's Main and Paging resources held shared by an owner pointer, which is a WinFsp request;
-> - one exclusive waiter, a system worker thread;
-> - the daemon's receive worker idle, waiting for the next request through FltMgr;
-> - the purge client idle on its pipe.
-> So the stuck request is not in user mode.
+> cleanup IRP. Local kernel debugging at round 1 (`kd -kl`, 2026-11-18 18:52 UTC, `hang-kd-1`; read again from the
+> dump the same day, which corrects two lines first written here) showed:
+> - **The receive worker was not idle: it was sending an answer.** Its one IRP had a buffered input and no MDL (flags
+>   `0x60830`, `Mdl 0`). In `crate::dispatcher` only `send` makes that IRP (`TRANSACT_BATCH`, the answer as input, no
+>   output); a receive's output is an MDL. The thread waited in kernel mode in `FsRtlCancellableWaitForSingleObject`,
+>   called from FltMgr (return address `fffff804'1b2821cf`, inside FLTMGR at `fffff804'1b260000`-`1b2f5000` by `lm a`
+>   in `hang-kd-4`).
+> - **The purge client was not idle on its pipe: it was opening a file.** Its only thread held a Create IRP (flags
+>   `0x884`) and waited at the same FltMgr return address. The pipe wait was the mount thread's: a pending read of the
+>   client's answer.
+> - The deleter, the receive worker, the purge client and the mount thread all began waiting at one tick (5988).
+> - One resource was held shared, alone, by a request. In WinFsp's source a request holds a single resource shared only
+>   as a Create's rename lock (WinFsp v2.1 `src/sys/create.c:246` and `669`): the purge client's open.
+> - One file node's two resources were held shared by another request, with one exclusive waiter (a system worker) and
+>   a contention count of 6. WinFsp leaves a node shared to a request only for a non-cached or paging read
+>   (`src/sys/read.c:357-444`), an information query (`src/sys/fileinfo.c:1024-1102`), a stream query (`763-790`), a
+>   security query (`src/sys/security.c:77-109`), a device control (`src/sys/devctl.c:268`) or a reparse point's
+>   read (`src/sys/fsctl.c:339`). Each of these waits for a receive.
+> - A second system worker held one resource exclusive and a second one on its own stack.
+>
+> **The mechanism the source gives (a hypothesis that fits every waiter; not proven).**
+> - WinFsp completes an answered IRP inline, on the thread that sent the answer. `FspVolumeTransact`
+>   (`src/sys/volume.c:1089-1102`) calls `FspIopDispatchComplete` for each answer, and the kind's `FSP_LEAVE_IOC`
+>   (`src/sys/driver.h:289-306`) ends in `IoCompleteRequest` (`src/sys/iop.c:321`).
+> - So the completion routines of every driver above WinFsp run on slates' receive worker. FltMgr's run there, and with
+>   them each minifilter's post-operation callback that FltMgr does not hand back to the requester's thread.
+> - slates has one receiver (A-198; `crate::dispatcher`'s `Worker`, "the only receive thread"). If a filter's completion
+>   makes a synchronous request on the same drive, the worker waits inside FltMgr for a request only it can receive,
+>   and the drive stops. Then the purge client's open, the request holding the node, the deleter's cleanup and the
+>   system worker that wants the node exclusive all wait on that worker.
+> - WinFsp's own dispatcher survives such nesting: it runs at least two receive threads (`src/dll/fs.c:26`, `384-401`;
+>   by default one per processor, 4 to 16), so another thread takes the filter's request.
+> - The filter is likely Defender's (WdFilter): the VM runs MsMpEng with real-time protection on. On CI's x86_64
+>   runner, something the bench never called asked one QuerySecurity per Cleanup (273,006 in g258's diag-52 probe;
+>   none on arm64), which is a filter's pattern.
+> - Unproven: which IRP the worker's answer completed, and which filter waited. The worker's stack ends at FltMgr's
+>   first frame, because FltMgr's symbols were not loaded.
+> - **The fix, once confirmed, is slates':** a receive must never wait for a send's completion. One way is a second
+>   receiver, WinFsp's own posture; A-198's capture-and-settle order assumes one, so this is a design amendment.
+>   Another way is to send from a thread that does not receive.
 > - **Impact when unrecovered.** The process cannot exit while the daemon lives, and on the first run the daemon did not
 >   exit when its anchor was killed. Windows' restart then hung past 15 minutes, and a reset was needed.
-> - **Not known yet:** which request holds the node (the owner pointer's `Kind` and IRP), and whether WinFsp as released
->   reaches the hang. There, a purge follows a change from outside a file's open names (A-190) rather than a hard link's.
+> - **Not known yet:** which request holds the node (the owner pointer's `Kind` and IRP), whether the hang needs a
+>   filter (the race with Defender's real-time protection off), and whether WinFsp as released reaches it. There, a purge
+>   follows a change from outside a file's open names (A-190) rather than a hard link's.
 > - **Also open:** 3 of 59 deletes were refused `ERROR_ACCESS_DENIED` in that race with the fix in place, where NTFS
 >   deletes.
-> - **Owed** (filed to main, run-requests 2026-11-18): `vm-hang-probe2.ps1` on the VM, which dumps the owner request
->   and its IRP when the race stops, and the same race on WinFsp's own driver with an outside writer in place of the
->   link.
+> - **Owed** (filed to main, run-requests 2026-11-18):
+>   - `vm-hang-probe2.ps1` on the VM, which dumps the owner request and its IRP when the race stops, now with FltMgr's
+>     symbols loaded, the receive worker's whole stack and `fltmc instances`;
+>   - the 60-round race three times with Defender's real-time protection off, against three times with it on;
+>   - the same race on WinFsp's own driver, with an outside writer in place of the link.
 
 > **The WinFsp drive declares a folding volume case-sensitive (found 2026-11-17 reading WinFsp v2.1's source for
 > A-300; open, Windows-only, no drive test yet).** The mount sets `CaseSensitiveSearch` (and `CasePreservedNames`) for
