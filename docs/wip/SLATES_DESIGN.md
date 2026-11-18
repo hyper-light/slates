@@ -4366,11 +4366,15 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
   shown the same owners. A handle the restored guest's kernel kept gives its open back at its release, as one from
   before a takeover does (A-152). Anything else is refused with its reason, and changes nothing;
 - a resync channel beside the stream (A-316; `slates_bridge_fuse::shards_resync`), for a stream to outlive its
-  daemon on Shards' coordinator's conditions (2026-11-18): a message pair made at the attach (Linux; macOS and Windows
-  hand none yet), whose first message, `Attached`, names the attachment and its resync token, 128 bits from the
-  daemon's secure random and never its mount capability. The daemon's end is held by the anchor, as a FUSE device is,
-  with the token and the stream's owner view as its session, updated when the guest names its owner, and released when
-  the attachment ends or its guest first maps a file with DAX (whose stores then live where only the device maps them).
+  daemon on Shards' coordinator's conditions (2026-11-18): a pair made at the attach, whose first message, `Attached`,
+  names the attachment and its resync token, 128 bits from the daemon's secure random and never its mount capability.
+  On Linux it is a sequenced-packet pair whose device end follows the stream's on the client's control socket; on
+  macOS (A-339) a stream of 28-byte messages, since a datagram pair's survivor is never told its peer has gone, whose
+  device end rides beside the stream's in the socket route's confirmation; Windows hands none yet. The daemon's end is
+  held by the anchor, as a FUSE device is, and the daemon keeps its own copy while the anchor holds one (A-339: XNU's
+  collector of descriptors in flight flushes a socket whose every copy rides a message), with the token and the
+  stream's owner view as its session, updated when the guest names its owner, and released when the attachment ends or
+  its guest first maps a file with DAX (whose stores then live where only the device maps them).
   A successor hands the device a fresh stream over it in a `Resync` naming the same token; the device takes nothing
   else (default deny), resends its outstanding request whole, and asks again for its DAX descriptors; the successor
   answers a request the dead daemon published and never answered from that reply, never by running it again;
@@ -4481,6 +4485,20 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 > `crates/bridge-fuse/src/shards_resync.rs`). Owed: the successor's half (re-serving a held attachment on a fresh
 > stream, `Resync`, the at-most-once replay of a stream's published reply, a stream's writes in the write log), macOS
 > (its hand-off and the write log), DAX objects held by the anchor, and Windows on Shards' handle path.
+
+> **Status (2026-11-18, A-339, the resync channel on macOS, the attach's half).** Built and proven by use on macOS (a
+> Mac Studio, kiln runs r2250 and r2278). A Shards attach there makes the channel as a stream of 28-byte messages,
+> holds the daemon's end at the anchor while keeping its own copy, and offers the device's end beside the stream's on
+> the socket route, under the confirmation kind that names two descriptors; the client takes both
+> (`slates_ipc::route::Claimed`) and refuses any other count, or two on a map's offer. With the test as the anchor, the
+> holds wait 200 ms in its channel while another thread opens and closes Unix sockets, and each held end arrives live;
+> each attach's channel brings its own token, an owner word brings the anchor the new view, and a detach releases the
+> hold so the device reads the channel's end. With no anchor the device reads `Attached` and then the end, and 48
+> claims under the same churn each bring a live resync end still holding its `Attached`
+> (`crates/server/tests/shards_resync.rs`, `shards.rs`; `crates/ipc/src/stream.rs`, `route.rs`). Each of six guards
+> removed alone fails its test: among them the kept copy (the held end arrived flushed in 3 of 3 runs) and the stream
+> pair (a datagram pair's survivor waited out its read's 5 s bound). Owed on macOS: the successor's half (the write log
+> there, recovery keeping the attachment, the fresh stream handed over the held end).
 
 > **Status (2026-11-18, A-303, a VM's save and restore).** Built and proven by use. Over a real daemon, a guest's SAVE
 > is answered with tables and leaves the volume's newest snapshot; a fresh stream of a clone of that snapshot takes
@@ -8006,6 +8024,11 @@ it builds against the contract and adds to it rather than around it.
 > when it gave one); a WinFsp drive the anchor's hold did not answer, or whose detach already waits. The words go to
 > the daemon's log. The contract carries the reason as `HostFault::Target(TargetRefusal)` and renders it after the
 > daemon's `TargetUnavailable`. The superseded variant is a protocol fault, since no daemon of this build sends it.
+> The daemon's closed word tables travel typed beside their words (2026-11-18, no contract type changed): a landing's
+> terminal stage (`LandingOutcome::stage`), a summary's actions (`LandingSummary::actions`, counted from the manifest's
+> entries), a grant's state (`GrantSummary::grant_state`), and an audit record's kind and stage (`AuditEntry::audit_kind`,
+> `stage`). The contract reads only those. The words stay for people (the CLI's and MCP's JSON), and a word the contract
+> did not know is no longer a protocol fault.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -25566,6 +25589,57 @@ Applied in the same change to:
   own wherever the shards fall: a call to the driving shard itself runs inline (§4.3's one code path for one shard and
   many), so the four sliced walks, this open among them, ran every slice in one poll on the control shard and on every
   shard of a one-shard daemon, and their tests, counting slices, could not see it.
+
+### A-339 — A Shards stream's resync channel on macOS: a stream pair, its device end beside the stream's on the socket route, and the daemon's end never left only in flight (2026-11-18, built for goal g268, what Shards needs from slates; A-316's macOS half, the attach's part)
+Applied in the same change to:
+- §4.6, the Shards form: the resync channel's bullet, and a status of this date. GAPS: A-281's entry, its restart
+  item's owed list. `docs/cli.md`: `--resync-fd` on macOS. `crates/api/src/lib.rs`: the `CONTRACT` 12 note (macOS too;
+  the type unchanged, so no new contract number).
+- `crates/ipc/src/stream.rs`: `message_pair` a stream on macOS; `recv_message` reads one whole message (on a stream,
+  until the buffer, one message long, is full). Tests: `a_message_pairs_device_end_reads_the_end_once_the_daemons_end_closes`,
+  and the message test reading each message by its length, its carried socket closed only once received.
+- `crates/ipc/src/route.rs`: `KIND_CONFIRM_WITH_RESYNC`; `send_confirmation` with the resync end; `Claimed`; `claim`
+  returning both ends and refusing any other count (`claimed_of`), and a resync end flushed in flight. Test:
+  `a_streams_confirmation_carries_its_resync_end_beside_its_end_and_a_maps_never_does`.
+- `crates/server`: `shards_route.rs` (`Offer::resync`, `Taken`; the exchange keeps both ends until the client closes);
+  `shards.rs` (the channel on every Unix; macOS's `hand_out` offers the device's end beside the stream's);
+  `shards/resync.rs` (`Resync::end`, the daemon's own copy kept while the anchor holds one, and `Resync::held`);
+  `shards/dax.rs` (the DAX give-up on every Unix); `direct_map.rs` (a map's offer rides alone). Tests:
+  `tests/shards_resync.rs` on every Unix, its holds waiting in the anchor's channel under socket churn and each held
+  end checked live; `tests/shards.rs`, the no-anchor test on every Unix and every claim of the churn test bringing a
+  live resync end that still holds its `Attached`.
+- `crates/client`: `claim_offer` returns the resync end, so `ShardsStream::resync` is handed on macOS.
+- `crates/bridge-fuse/src/shards_resync.rs`: the channel's paragraph (macOS's stream; a device closes its end of the
+  channel with its stream's).
+
+- **What was there.** A-316 made the channel on Linux alone: macOS handed no resync end, so a macOS device could never
+  be resynced. And A-316's macOS pair was a datagram pair, whose survivor macOS never tells that its peer has gone: a
+  socketpair probe on macOS 26.4 (2026-11-18) found a blocked read, a `select` and a kqueue each waiting out 5 s after
+  the peer closed, and a read after it answering `ECONNRESET` once and then blocking. A device must read the channel's
+  end when no resync will ever come.
+- **The channel on macOS** is a stream pair: each message is its fixed 28 bytes, read whole, a `Resync`'s descriptor
+  arriving with its bytes. Linux keeps its sequenced packets. On macOS a channel whose daemon end has closed (no anchor
+  held it) refuses socket options (`EINVAL`: XNU's `sosetopt` refuses a socket that can neither send nor receive); its
+  reads never wait.
+- **The hand-off.** macOS hands a stream end on its socket route (A-161), not a control socket, so the device's resync
+  end rides beside the stream's in the daemon's confirmation, under a confirmation kind of its own that names two
+  descriptors, the stream's end first. The client refuses any other count, and a map's offer carrying two. The daemon
+  keeps both ends until the client closes the route connection, as A-161 keeps the stream's.
+- **The daemon's end is never left only in flight.** XNU's collector of descriptors in flight (`unp_gc`) walks only
+  descriptors that are themselves in flight, so a socket whose every copy waits in the receive buffer of a socket
+  never sent (the anchor's end of its hold channel) is never found reachable; any Unix socket's close in the system can
+  run it; and the socket it flushes reads its own end of file for good. A-316 closed the daemon's copy right after the
+  hold, which on macOS left the hold carrying the end's only copy until the anchor's receive. With the holds waiting
+  200 ms in the anchor's channel under socket churn, the anchor's held end arrived flushed (its receive buffer zero) in
+  3 of 3 runs (r2250). The daemon now keeps its copy while the anchor holds one and closes it with the anchor's
+  (`Resync::end`). Linux runs the same rule, though its collector takes only unreachable cycles (A-161's record).
+- **Evidence.** On a Mac Studio (kiln runs r2250, r2278): the focused tests above pass; each of six guards removed
+  alone fails its test: the channel a datagram pair again (the device's read waited out its 5 s bound, and the
+  no-anchor test failed), the macOS offer without the resync end, the confirmation leaving it out, the client dropping
+  it, the daemon keeping no copy of its held end (flushed in 3 of 3 runs), and a map's claim taking two descriptors. On
+  Linux (GitHub's ubuntu runner, run 44327865763): the same focused tests and A-316's restart test pass.
+- **Owed** (GAPS): the successor's half on macOS (the write log there, recovery keeping a stream whose resync end the
+  anchor held, the fresh stream handed over it); the rest as A-316 says.
 
 ### A-334 — A host admitted again under its own id yields the volumes it catalogued (2026-11-18, goal g229, the SIGSTOP owner flow's ReadSafety finding; realizes §4.8 "Authority scope" for a re-admission)
 Applied in the same change to: §4.8 "Leases and reads" (its status), §4.10 live shipping (the chaos flows' status, A-346's
