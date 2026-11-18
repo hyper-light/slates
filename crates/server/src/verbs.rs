@@ -6470,6 +6470,16 @@ fn declare(state: &mut ShardState, principal: &Principal, work: VolumeId, op: Wo
     Ok((record, _)) => record.id,
     Err(refusal) => return refused(refusal),
   };
+  // A guest's own attribute namespaces (`trusted.`, `security.`) are its kernel's to set (A-290): a guest's kernel
+  // acts on them (a binary's capability, an overlay's opaque directory), and inside the guest only its privileged
+  // processes may set them. A declaration is a host's channel, so it sets and removes none, as no host's mount does.
+  if let WorkOp::SetXattr { name, .. } | WorkOp::RemoveXattr { name, .. } = &op
+    && slates_bridge_core::guest_only(name.as_bytes())
+  {
+    return refused(Refusal::Unsupported {
+      feature: format!("a guest's own attribute ({name}) from a host's channel"),
+    });
+  }
   let Some(w) = state.works.get(&work_id) else {
     return refused(Refusal::NotFound);
   };

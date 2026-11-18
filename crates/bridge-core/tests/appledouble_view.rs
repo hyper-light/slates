@@ -10,7 +10,7 @@
   clippy::indexing_slicing
 )]
 
-use slates_bridge_core::appledouble::{Decoded, MAX_HEADER_BYTES, decode};
+use slates_bridge_core::appledouble::{Decoded, Entry, MAX_HEADER_BYTES, decode, encode};
 use slates_bridge_core::{
   Attachments, Bridge, ObjectId, OpContext, Rights, SetAttr, View, VolumeBridge,
 };
@@ -542,4 +542,92 @@ fn any_sidecar_bytes_decode_without_panicking_and_a_real_one_still_completes() {
   let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
   fuzz_random_bytes(&mut rng);
   fuzz_flipped_vectors(&mut rng);
+}
+
+/// A canonical AppleDouble file holding `attributes`, as a macOS host would write one (`appledouble::encode`).
+fn sidecar_of(attributes: &[(&[u8], &[u8])]) -> Vec<u8> {
+  let entries: Vec<Entry> = attributes
+    .iter()
+    .map(|(name, value)| Entry {
+      name: name.to_vec(),
+      len: value.len() as u64,
+    })
+    .collect();
+  let encoding = encode(&entries);
+  assert_eq!(
+    encoding.held.len(),
+    attributes.len(),
+    "every attribute is encoded"
+  );
+  let mut file = vec![0u8; usize::try_from(encoding.len).unwrap()];
+  let rendered = encoding.render(0, &mut file, &mut |index, at, into: &mut [u8]| {
+    let at = usize::try_from(at).unwrap();
+    into.copy_from_slice(&attributes[index].1[at..at + into.len()]);
+  });
+  assert_eq!(rendered, file.len());
+  file
+}
+
+/// A-290: do give a file a guest's own attributes (`security.capability`, `trusted.overlay.origin`) and a `user.` one
+/// through the store, as a guest's route would; read its view as a macOS host does; rewrite the sidecar naming the
+/// Finder Info alone; write one naming a `trusted.` attribute; then remove the view. Expect the view to show the
+/// `user.` attribute alone; the rewrite to remove it and keep the guest's; the write naming a guest's attribute
+/// refused `NotPermitted`, the store unchanged by it and the view reading the stored attributes again; and the
+/// view's removal to leave the guest's attributes where they were.
+#[test]
+fn a_hosts_view_neither_shows_nor_sets_nor_removes_a_guests_own_attributes() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let cx = rw_cx();
+  let owner = {
+    let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+    let root = bridge.root(&cx).unwrap();
+    InodeNo(bridge.create(oid(root), &cx, "f", 0o755, 0).unwrap().0.ino)
+  };
+  let guests: [(&[u8], &[u8]); 2] = [
+    (
+      b"security.capability",
+      &[1, 0, 0, 2, 0, 32, 0, 0, 0, 0, 0, 0],
+    ),
+    (b"trusted.overlay.origin", b"origin"),
+  ];
+  for (name, value) in guests.iter().chain(&[(&b"user.tag"[..], &b"t"[..])]) {
+    vol
+      .xattr_set(&mut store, owner, name, value, XattrSet::Either)
+      .unwrap();
+  }
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  let root = bridge.root(&cx).unwrap();
+  let view = oid(bridge.appledouble_lookup(oid(root), &cx, "f").unwrap().ino);
+  assert_eq!(
+    decoded(&read_view(&mut bridge, &cx, owner)),
+    vec![(b"user.tag".to_vec(), b"t".to_vec())],
+    "the view shows the user. attribute alone"
+  );
+  let finder = [7u8; 32];
+  let rewritten = sidecar_of(&[(b"com.apple.FinderInfo", &finder)]);
+  bridge.write(view, &cx, 0, &rewritten).unwrap();
+  let named_guest = sidecar_of(&[(b"com.apple.FinderInfo", &finder), (b"trusted.x", b"host")]);
+  assert_eq!(
+    bridge.write(view, &cx, 0, &named_guest),
+    Err(VfsError::NotPermitted),
+    "a host's file naming a guest's attribute is refused"
+  );
+  assert_eq!(
+    decoded(&read_view(&mut bridge, &cx, owner)),
+    vec![(b"com.apple.FinderInfo".to_vec(), finder.to_vec())],
+    "the view reads the stored attributes, not the refused file"
+  );
+  bridge.appledouble_remove(oid(root), &cx, "f").unwrap();
+  drop(bridge);
+  let mut expected: Vec<(Vec<u8>, Vec<u8>)> = guests
+    .iter()
+    .map(|(name, value)| (name.to_vec(), value.to_vec()))
+    .collect();
+  expected.sort();
+  assert_eq!(
+    stored(&vol, &store, owner),
+    expected,
+    "the guest's attributes are where it put them, and nothing of the host's refused file"
+  );
 }

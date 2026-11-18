@@ -1812,6 +1812,17 @@ epoch copies only its table, never a value.
   never linked into a directory and has no attributes of its own.
 - Rejected: values inline in the owner. Every copy-on-write of the owner would copy every value,
   and a megabyte resource fork could be neither read at an offset nor deduplicated.
+- **Namespaces (A-290).** Every route reads and writes `user.` names. A guest kernel's route (a Shards stream, slates'
+  own virtio-fs device) also reaches the guest's own namespaces, `trusted.` and `security.`: a binary's
+  `security.capability` from `setcap`, an overlayfs upper directory's `trusted.overlay.*`. The volume keeps them as the
+  guest's data, like any attribute. No host's mount shows or sets them (a FUSE or NFS mount, the AppleDouble view of a
+  macOS NFSv3 mount), since there the host's own kernel would act on them. An acknowledged change of any attribute is
+  published before its reply on every route, as a namespace change is (D-18).
+- **A guest's POSIX ACLs (A-302).** A guest kernel's route also keeps `system.posix_acl_access` and
+  `system.posix_acl_default` as the guest's data, checked as Linux checks an ACL and their named users and groups
+  turned through the route's owner view (A-281), as a chown's ids are. They are stored, not enforced: the route does
+  not negotiate `FUSE_POSIX_ACL`, so the guest's kernel checks the mode bits it is shown, as it does over Shards' own
+  server. Every other `system.` name stays refused on every route.
 
 > **A-32 status (2026-09-26).** The volume core is implemented (`crates/vfs/src/xattr.rs`, the
 > table in `inode.rs`, recovery image version 5). It is proven by the model oracle, which now
@@ -4164,6 +4175,9 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
   guest's is, and the guest is revalidated, having no path for an invalidation;
 - a read is answered with every byte it asks, never cut to a buffer, since a short read is the file's end to the
   guest's kernel;
+- the guest's own attribute namespaces, `trusted.` and `security.`, and its POSIX ACLs are kept in the volume as its
+  data and shown to no host's mount (A-290, A-302, §4.5 "Extended attributes"); an ACL's named owners are kept through
+  the stream's owner view; an acknowledged attribute change is published before its reply;
 - Shards' owner word (`trusted.shards.owner`, its value `UID:GID`) is the stream's to take, never a file's attribute
   (A-281). Shards' init sets it on a share's root as it mounts the share, so that a run of an unprivileged user can
   write the share it was given. It is taken from the guest's root on the stream's root alone, and refused otherwise
@@ -4241,6 +4255,19 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 > reads the same files, and what the run made, as the host's; the word is kept on no file, and a second stream that
 > named no owner sees the volume's owners (`crates/server/tests/shards.rs`). Owed: Shards' own guest test over a slates
 > stream (its `tests/slates_fs.rs`), after Shards' v0.8.0 tag and its bump of the slates revision it pins.
+
+> **Status (2026-11-18, A-290, the guest's attributes).** Built and proven by use. A stream and slates' own virtio-fs
+> device keep a guest's `trusted.` and `security.` attributes as its data, read back over a second stream and after a
+> daemon restart; the daemon's NFSv4.2 port, a host's FUSE dispatch and the AppleDouble view neither list nor set them,
+> and a work's declaration of one is refused `Unsupported` (`crates/server/tests/shards.rs`, `virtiofs.rs`,
+> `daemon.rs`; `crates/bridge-fuse/tests/shards_fs.rs`; `crates/bridge-core/tests/appledouble_view.rs`). An
+> acknowledged attribute change is now published before its reply on every FUSE route.
+
+> **Status (2026-11-18, A-302, the guest's ACLs).** Built and proven by use. A stream keeps a guest's access and
+> default ACLs, checked as Linux checks one, their named owners kept through the stream's owner view and read back as
+> set over a second stream; a default ACL on a file is refused `EACCES`; a host's mount neither lists nor sets them
+> (`crates/bridge-fuse/src/posix_acl.rs` and `tests/shards_fs.rs`; `crates/server/tests/shards.rs`). They are not
+> enforced, as Shards' own server enforces none.
 
 **Writeback and snapshot barrier.** Kernel/guest cache negotiation changes when writes reach
 the owner. `snapshot`, `submit`, `advance`, clean `detach`, migration and archive must identify
@@ -12826,6 +12853,8 @@ Status: built 2026-10-06. It closes the FUSE part of A-32's owed list.
   NFSv4.2 bridge's RFC 8276 operations already do.
   - Only `user.` names are stored. `security.`, `trusted.` and `system.` belong to the host's LSM, its administrator
     and its ACLs, none of which a volume carries. Setting one is `EOPNOTSUPP` and reading one is `ENODATA`.
+    (Amended 2026-11-18 by A-290: on a guest kernel's route `trusted.` and `security.` are the guest's own, and the
+    volume keeps them; a host's mount is as above.)
   - A get or list with size 0 answers the length (`fuse_getxattr_out`); a buffer too small is `ERANGE`.
   - `XATTR_CREATE` and `XATTR_REPLACE` map to the volume's `XattrSet`.
   - The setxattr body is the short form, because `FUSE_SETXATTR_EXT` is not negotiated.
@@ -21200,3 +21229,98 @@ GAP-A9-9's macOS segment by name, its option 1); the Windows confirm-per-use pat
   expiry and an untouched security key are each refused with their own reason; hostile bytes are refused, never a
   panic (`crates/server/src/grant_signature.rs`, 10 tests). The golden test was red until the vector was re-signed over
   the exact encoding, since the first vector was signed before the target gained its length prefix.
+
+### A-290 — A guest's own attribute namespaces are its data on a guest kernel's route, and no host's route shows or sets them (2026-11-18, built for goal g268, what Shards needs from slates)
+
+Applied in the same change to:
+- §4.5 "Extended attributes": the namespaces bullet. §4.6, the Shards form: the bullet on the guest's attributes; the
+  FUSE extended-attribute status of 2026-10-06, amended. GAPS: A-281's entry, whose owed list loses this item.
+- `crates/bridge-core`: `USER_NAMESPACE`, `GUEST_NAMESPACES`, `AttributeNamespaces` (`Host`, `Guest`, `reaches`),
+  `guest_only`, `Bridge::attribute_namespaces` (a host's by default), `VolumeBridge::serving_a_guest`, `ScopedBridge`
+  passing its inner bridge's kind on; the AppleDouble view (`volume_bridge/view.rs`) shows, removes and sets none of a
+  guest's names. The tests: `a_guests_namespaces_are_reached_by_its_route_alone` (unit) and
+  `a_hosts_view_neither_shows_nor_sets_nor_removes_a_guests_own_attributes` (`tests/appledouble_view.rs`).
+- `crates/bridge-fuse`: `bridge.rs` reaches an attribute through the bridge's kind (`reached_attribute`) in GETXATTR,
+  LISTXATTR, SETXATTR and REMOVEXATTR; `needs_barrier` names SETXATTR and REMOVEXATTR. The test:
+  `a_guests_own_attributes_are_kept_for_its_route_and_no_hosts_mount_reaches_them` (`tests/shards_fs.rs`).
+- `crates/server`: the Shards stream (`shards.rs`) and slates' own virtio-fs device (`virtiofs.rs`) serve a guest;
+  `verbs.rs` refuses a declaration of a guest's name on a work `Unsupported`. The tests:
+  `a_guests_own_attributes_are_its_data_on_every_stream_and_no_hosts_mount_lists_them` and
+  `a_guests_acknowledged_attribute_survives_a_daemon_restart` (`tests/shards.rs`),
+  `a_guest_devices_own_attributes_are_kept_and_no_hosts_mount_lists_them` (`tests/virtiofs.rs`), and the work's
+  `declare_guest_attribute_part` (`tests/daemon.rs`).
+
+- **What was there.** Every FUSE route stored `user.` names alone and answered any other `EOPNOTSUPP` (§4.6's FUSE
+  status of 2026-10-06), since a host's `security.`, `trusted.` and `system.` names belong to its own security modules,
+  administrator and ACLs. A microVM's guest kernel keeps its own there: `setcap` sets `security.capability` on a
+  binary, and overlayfs keeps `trusted.overlay.*` on an upper directory a guest makes on its share (an image build
+  inside the VM). Both failed on a slates stream and succeeded on Shards' own server, which keeps them on a Linux host
+  under `user.shards.` and passes them through on macOS (Shards' `server_unix.rs` `host_xattr`, `guest_xattr`, at
+  183fe264e). Shards' coordinator ranked this second of what it needs (2026-11-18).
+- **The rule.** Each transport's bridge says which namespaces its caller reaches. A host's mount (FUSE or NFS, and the
+  AppleDouble view a macOS NFSv3 mount reads) reaches `user.` alone, as before. A guest kernel's route (a Shards stream,
+  slates' own virtio-fs device) reaches `user.`, `trusted.` and `security.`, and the volume keeps those like any
+  attribute: a snapshot, a clone, an export and a takeover carry them. A host's mount never lists them, reads them
+  `ENODATA` and is refused `EOPNOTSUPP` setting or removing one; the AppleDouble view neither shows nor removes them,
+  and refuses a sidecar naming one `NotPermitted` whole, so a host never half-writes the guest's attributes. A landing
+  writes no attribute at all (its seam has no verb for one, held by `a_landing_never_materializes_a_security_capability_xattr`),
+  and the base plane reads none from the host, so nothing of the host's own labels reaches a guest either.
+- **No host's channel sets them.** A guest's kernel acts on these names (a capability on a binary its run executes),
+  and inside the guest only its privileged processes may set them (xattr(7): `CAP_SYS_ADMIN` for `trusted.`,
+  `CAP_SETFCAP` for a capability). A declaration on a work (§4.16, the SDKs' and MCP's `set_xattr` and
+  `remove_xattr`) is a host's channel, so it is refused `Unsupported` for a guest's name, as a host's mount is; before
+  this change a guest could not see such a name, so the channel's reach mattered to no one.
+- **Why not Shards' mapping.** Shards' server must keep the guest's names on a host file, whose `trusted.` and
+  `security.` names are the host kernel's, so it renames them into `user.shards.`. A slates volume is no host file:
+  it keeps the guest's names as they are, and each route's kind decides who reaches them, so no prefix is reserved
+  and nothing is renamed.
+- **The durability fix found with it.** `needs_barrier` named every namespace and metadata change but SETXATTR and
+  REMOVEXATTR, so on a FUSE mount, a virtio-fs device and a Shards stream an acknowledged attribute change was not
+  published before its reply, and a daemon's death after the reply lost it; NFSv4.2's barrier already named its
+  attribute calls. `a_guests_acknowledged_attribute_survives_a_daemon_restart` fails without the two opcodes (a
+  `user.` attribute set, a capability set and a removal, read back after a second daemon recovers the segment) and
+  passes with them: 3 of 3 runs red without them, the second daemon listing nothing (kiln run r423, macOS arm64,
+  2026-11-18; the bug record of that date).
+- **Not here: POSIX ACLs.** Shards' coordinator ranks them third; A-302 keeps them.
+
+### A-302 — A guest's POSIX ACLs are its data on a guest kernel's route, their named owners kept through the owner view (2026-11-18, built for goal g268, what Shards needs from slates)
+
+Applied in the same change to:
+- §4.5 "Extended attributes": the ACL bullet. §4.6, the Shards form: the guest's attributes' bullet and the status of
+  this date. A-290's entry, whose "Not here" line now points here. GAPS: A-281's entry, whose owed list loses ACLs.
+- `crates/bridge-core`: `POSIX_ACL_NAMES` (`POSIX_ACL_ACCESS`, `POSIX_ACL_DEFAULT`) and `is_posix_acl`; a guest's
+  route reaches the two names (`AttributeNamespaces::reaches`) and `guest_only` counts them, so a host's mount, the
+  AppleDouble view and a work's declaration refuse them as they refuse A-290's names. The unit test
+  `a_guests_namespaces_are_reached_by_its_route_alone` asks about both names and about other `system.` names.
+- `crates/bridge-fuse`: `posix_acl.rs` (Linux's ACL value checked and its named ids turned each way, with its unit
+  tests, the hostile values among them); `bridge.rs` turns an ACL toward the volume's ids at SETXATTR and toward the
+  guest's at GETXATTR (`acl_turned`) and refuses a default ACL on anything but a directory (`default_acl_refused`).
+  The test: `a_guests_acls_are_kept_through_its_owner_view_and_no_hosts_mount_reaches_them` (`tests/shards_fs.rs`).
+- `crates/server`: `a_guests_own_attributes_are_its_data_on_every_stream_and_no_hosts_mount_lists_them`
+  (`tests/shards.rs`) sets an access ACL over a real daemon's stream as well.
+
+- **What was there.** A-290 kept a guest's `trusted.` and `security.` names and refused every `system.` name, so a
+  guest's `setfacl` failed with `EOPNOTSUPP` on a slates stream, as did `cp -a`, `tar --acls` and `rsync -A` keeping
+  one, while Shards' own server keeps them (its `host_xattr` hands every name but `trusted.` and `security.` to the
+  host's file as it is, Shards 183fe264e). Shards' coordinator ranked ACLs third of what it needs (2026-11-18).
+- **The rule.** A guest kernel's route keeps `system.posix_acl_access` on any node and `system.posix_acl_default` on a
+  directory, refusing a default ACL elsewhere `EACCES` as Linux's `set_posix_acl` does. A value is checked as Linux's
+  `posix_acl_from_xattr` and `posix_acl_valid` check one, refused whole `EOPNOTSUPP` for another version and `EINVAL`
+  for anything else malformed, so nothing half-parsed is kept. Its named users and groups are turned through the
+  route's owner view (A-281) toward the ids the volume keeps when set and toward the guest's when read, and put back
+  in id order, the order Linux's own ACLs keep and `libacl` expects. A value the volume keeps that no longer parses is
+  `EIO` to a reader: the volume's fault, never the caller's. Every route but a guest kernel's refuses both names, as it
+  refuses A-290's.
+- **Stored, not enforced.** Neither slates nor Shards' own server negotiates `FUSE_POSIX_ACL`, so the guest's kernel
+  hands an ACL through and checks the mode bits it is shown (`fs/fuse/acl.c`: a server without the flag "could get
+  and set POSIX ACLs without them being used for permission checking by the vfs"). The same guest therefore sees the
+  same behaviour whichever server serves its share. Enforcement was weighed and not taken now: the flag makes the
+  guest's kernel ask for an ACL on each inode's first permission check (one more round trip per inode on a stream that
+  carries one request at a time), and the server would have to keep the mode and the ACL's mask in step on every
+  route, a chmod through a host's mount included, and apply a default ACL at every create. Nothing Shards runs asks
+  for it; it is recorded here should a consumer need it.
+- **Evidence.** The codec's unit tests (the turn both ways with the run, a third user and the host named; the minimal
+  and empty ACLs; thirteen refused values and every bit flip of a valid one's tags), the dispatch's test over a volume
+  holding the host's and the run's files, and the real daemon's stream, whose second stream reads the ACL as set and
+  whose NFSv4.2 port lists no ACL. Owed: Shards' own guest test over a slates stream (`tests/slates_fs.rs`), after its
+  v0.8.0 tag and its bump of the slates revision it pins.

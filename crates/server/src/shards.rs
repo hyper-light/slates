@@ -34,6 +34,10 @@
 //! route sees the owners the volume keeps, so a host reads its own files as its own. The swap lives with the stream:
 //! nothing survives a restart, and the next stream's guest names its owner again as it mounts.
 //!
+//! **The guest's attributes (A-290).** A stream is a guest kernel's route: besides `user.` its guest reads and writes
+//! its own attribute namespaces, `trusted.` and `security.` (an overlayfs upper directory's `trusted.overlay.*`, a
+//! binary's `security.capability`), kept in the volume as its data. No host's mount shows or sets them.
+//!
 //! **Control asks.** Shards' device sends asks of its own:
 //! - its backend's tables for a snapshot of the VM, and their restore (D176). slates keeps no tables a VM's snapshot can
 //!   carry, so each is refused in the form Shards reads: a control answer with its reason.
@@ -1380,7 +1384,8 @@ fn serve_request(
       slot.host.as_mut().map(|host| host as &mut dyn HostFs),
     )
     .offering_dax(dax_offer)
-    .viewing_owners(stream.owners);
+    .viewing_owners(stream.owners)
+    .serving_a_guest();
     let mut scoped = None;
     let served = crate::verbs::scoped_or_whole(&mut bridge, &mut scoped, stream.scope);
     let request = stream.inbound.get(LENGTH_BYTES..total).unwrap_or(&[]);

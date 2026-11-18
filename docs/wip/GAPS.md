@@ -8,10 +8,15 @@
 > run's and the run's as the root's, and keeps the ids the guest names the other way round. Every other route sees the
 > host's ids, what the run made included. Tests by use: the word's reading and refusals and the dispatch's view
 > (`crates/bridge-fuse/tests/shards_fs.rs`), and a real daemon's stream against its NFS port
-> (`crates/server/tests/shards.rs`). **Still owed for Shards, in its coordinator's order (2026-11-18):**
-> - `trusted.*` and `security.*` (`security.capability` from `setcap`, `trusted.overlay.*` for an overlayfs upper
->   directory on a share) kept as the guest's data, never shown to a host's mount, then POSIX ACLs
->   (`system.posix_acl_*` from `setfacl`). Today every name outside `user.` is refused on every FUSE route.
+> (`crates/server/tests/shards.rs`). **Built since (A-290, 2026-11-18):** a guest's `trusted.` and `security.`
+> attributes (`security.capability` from `setcap`, `trusted.overlay.*` on an overlayfs upper directory on a share) are
+> its data on a Shards stream and slates' own virtio-fs device, never listed or set by a host's FUSE or NFS mount or the
+> AppleDouble view, and refused `Unsupported` on a work's declaration; with it, an acknowledged SETXATTR or
+> REMOVEXATTR on every FUSE route is published before its reply (it was not: a daemon's death lost it).
+> **Built since (A-302, 2026-11-18):** a guest's POSIX ACLs (`setfacl`'s `system.posix_acl_access` and a directory's
+> `system.posix_acl_default`) are its data on the same routes, checked as Linux checks one, their named users and
+> groups kept through the stream's owner view; stored and not enforced, as Shards' own server keeps them.
+> **Still owed for Shards, in its coordinator's order (2026-11-18):**
 > - A stream's tables for a VM's save and restore (Shards' D176 part 5): SAVE takes a snapshot of the volume at the
 >   cut and names it in opaque tables within Shards' `MAX_TABLES`; RESTORE takes them on a new stream before any
 >   request, against that snapshot, a clone of it, or the live volume unchanged since the cut, else `[1, why]`.

@@ -293,6 +293,70 @@ fn swapped(id: u32, a: u32, b: u32) -> u32 {
   }
 }
 
+/// Format: the attribute namespace every route reads and writes: Linux's user namespace (xattr(7)), and what RFC
+/// 8276's names are stored under.
+pub const USER_NAMESPACE: &[u8] = b"user.";
+
+/// Format: the attribute namespaces a guest's kernel keeps on its files and no host's mount reaches (xattr(7), A-290):
+/// its administrator's (`trusted.`, which its kernel lets only a process with `CAP_SYS_ADMIN` read or set) and its
+/// security modules' (`security.`: `security.capability` from `setcap`, an SELinux label, an IMA hash).
+pub const GUEST_NAMESPACES: [&[u8]; 2] = [b"trusted.", b"security."];
+
+/// Format: the two names under which a Linux kernel keeps a file's POSIX ACLs (acl(5), `include/uapi/linux/xattr.h`
+/// `XATTR_NAME_POSIX_ACL_ACCESS` and `_DEFAULT`): the access ACL, and a directory's default ACL its new entries
+/// inherit. A guest's `setfacl` sets them; they are the guest's own like [`GUEST_NAMESPACES`]' names (A-302), while
+/// every other `system.` name stays refused on every route.
+pub const POSIX_ACL_NAMES: [&[u8]; 2] = [POSIX_ACL_ACCESS, POSIX_ACL_DEFAULT];
+/// Format: a file's access ACL (`XATTR_NAME_POSIX_ACL_ACCESS`), one of [`POSIX_ACL_NAMES`].
+pub const POSIX_ACL_ACCESS: &[u8] = b"system.posix_acl_access";
+/// Format: a directory's default ACL (`XATTR_NAME_POSIX_ACL_DEFAULT`), which its new entries inherit; Linux refuses
+/// one on anything but a directory (`EACCES`). One of [`POSIX_ACL_NAMES`].
+pub const POSIX_ACL_DEFAULT: &[u8] = b"system.posix_acl_default";
+
+/// Which extended-attribute namespaces a transport's caller reaches (§4.5 "Extended attributes", §4.6; A-290, A-302).
+///
+/// Every route reads and writes `user.` names. A guest kernel's route (a Shards stream, slates' own virtio-fs device)
+/// also reaches the guest's own namespaces, [`GUEST_NAMESPACES`], and its POSIX ACLs, [`POSIX_ACL_NAMES`]: what a
+/// microVM keeps there (`security.capability` on a binary it gave a capability, `trusted.overlay.*` on an overlayfs
+/// upper directory it made on its share, an ACL its `setfacl` set) is the guest's data, kept in the volume like any
+/// attribute. A host's mount (a FUSE or NFS mount, the AppleDouble view of a macOS NFSv3 mount) neither shows nor sets
+/// them: there the host's own kernel would act on them, a capability on a binary the host runs, an overlay's whiteout
+/// on a directory the host reads, an ACL naming the guest's users.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AttributeNamespaces {
+  /// A host's mount: `user.` alone.
+  #[default]
+  Host,
+  /// A guest kernel's route: `user.`, the guest's own namespaces and its POSIX ACLs.
+  Guest,
+}
+
+impl AttributeNamespaces {
+  /// Whether a caller of this kind reaches attribute `name`: a name in a namespace it reads and writes, with
+  /// something after the namespace's prefix, or, on a guest's route, one of [`POSIX_ACL_NAMES`].
+  pub fn reaches(self, name: &[u8]) -> bool {
+    let named_in = |prefix: &[u8]| name.len() > prefix.len() && name.starts_with(prefix);
+    named_in(USER_NAMESPACE)
+      || (self == AttributeNamespaces::Guest
+        && (GUEST_NAMESPACES.iter().any(|prefix| named_in(prefix)) || is_posix_acl(name)))
+  }
+}
+
+/// Whether attribute `name` is a guest's own (A-290, A-302): in one of [`GUEST_NAMESPACES`] or one of
+/// [`POSIX_ACL_NAMES`], which no host's mount shows or sets, whatever that mount's own rule for names (the AppleDouble
+/// view's are any of macOS's).
+pub fn guest_only(name: &[u8]) -> bool {
+  GUEST_NAMESPACES
+    .iter()
+    .any(|prefix| name.starts_with(prefix))
+    || is_posix_acl(name)
+}
+
+/// Whether attribute `name` is one of [`POSIX_ACL_NAMES`] (A-302).
+pub fn is_posix_acl(name: &[u8]) -> bool {
+  POSIX_ACL_NAMES.contains(&name)
+}
+
 /// The store's parts a backed DAX session works with, lent by a bridge that has a store ([`Bridge::dax_state`]).
 pub struct DaxState<'a> {
   /// The store's DAX backings, which the volume's write boundary writes every change of a backed file through.
@@ -673,6 +737,12 @@ pub trait Bridge {
     OwnerView::IDENTITY
   }
 
+  /// Which extended-attribute namespaces this bridge's transport reaches ([`AttributeNamespaces`]): a host's mount's
+  /// by default, a guest's only on a guest kernel's route (A-290).
+  fn attribute_namespaces(&mut self) -> AttributeNamespaces {
+    AttributeNamespaces::Host
+  }
+
   /// The store's DAX backings and its in-process DAX registry, lent to a backed DAX session (`dax_backing`) that a
   /// transport drives over this bridge. `None` for a bridge with no store.
   fn dax_state(&mut self) -> Option<DaxState<'_>> {
@@ -755,7 +825,7 @@ pub trait Bridge {
 
 #[cfg(test)]
 mod tests {
-  use super::OwnerView;
+  use super::{AttributeNamespaces, OwnerView, guest_only};
 
   /// A-281. Do: swap the host's owner (501:20) with a run's (1000:1001), and read every id through the view both ways.
   /// Expect each of the two shown as the other, uid and gid apart, every other id (root's among them) as it is, the way
@@ -783,5 +853,51 @@ mod tests {
       (1000, 1000),
       "a run of the host's own owner changes nothing"
     );
+  }
+
+  /// A-290, A-302. Do: ask a host's mount and a guest's route about names in each namespace, the two ACL names, bare
+  /// prefixes, names that only begin like one, and macOS names. Expect `user.` names reached by both; `trusted.` and
+  /// `security.` names and the two ACL names by the guest's alone and marked a guest's own; a bare prefix reached by
+  /// neither; every other `system.` name and every macOS name by neither and no guest's own.
+  #[test]
+  fn a_guests_namespaces_are_reached_by_its_route_alone() {
+    let (host, guest) = (AttributeNamespaces::Host, AttributeNamespaces::Guest);
+    for name in [&b"user.x"[..], b"user.trusted.y"] {
+      assert!(host.reaches(name) && guest.reaches(name), "{name:?}");
+      assert!(!guest_only(name), "{name:?}");
+    }
+    for name in [
+      &b"trusted.overlay.opaque"[..],
+      b"security.capability",
+      b"security.selinux",
+    ] {
+      assert!(!host.reaches(name), "{name:?}");
+      assert!(guest.reaches(name), "{name:?}");
+      assert!(guest_only(name), "{name:?}");
+    }
+    for name in [&b"user."[..], b"trusted.", b"security."] {
+      assert!(
+        !host.reaches(name) && !guest.reaches(name),
+        "a bare prefix: {name:?}"
+      );
+    }
+    for name in [&b"system.posix_acl_access"[..], b"system.posix_acl_default"] {
+      assert!(!host.reaches(name), "{name:?}");
+      assert!(guest.reaches(name), "{name:?}");
+      assert!(guest_only(name), "{name:?}");
+    }
+    for name in [
+      &b"system.posix_acl_accessx"[..],
+      b"system.sockprotoname",
+      b"system.",
+      b"trustedx",
+      b"securityx",
+      b"com.apple.FinderInfo",
+      b"",
+    ] {
+      assert!(!host.reaches(name) && !guest.reaches(name), "{name:?}");
+      assert!(!guest_only(name), "{name:?}");
+    }
+    assert_eq!(AttributeNamespaces::default(), host);
   }
 }

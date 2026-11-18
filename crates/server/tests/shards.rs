@@ -3301,3 +3301,178 @@ fn the_runs_owner_named_on_the_root_owns_what_the_host_made_and_the_host_keeps_i
   drop(client);
   drop(daemon);
 }
+
+/// The names a LISTXATTR reply lists, each without its NUL.
+fn listed(reply: &[u8]) -> Vec<Vec<u8>> {
+  reply[OUT_HEADER_LEN..]
+    .split(|byte| *byte == 0)
+    .filter(|name| !name.is_empty())
+    .map(<[u8]>::to_vec)
+    .collect()
+}
+
+/// A-290 and A-302, by use on a real daemon: a Shards guest keeps its own attribute namespaces and its POSIX ACLs on its
+/// files, which no host's mount reaches. Do: over a stream, give a file `security.capability`, an access ACL and a
+/// `user.` attribute and a directory `trusted.overlay.opaque`, as `setcap`, `setfacl` and an overlayfs upper directory
+/// on the share would; read and list them over that stream and over a second stream on the volume; then list both
+/// nodes' attributes over the daemon's NFSv4.2 port, a host's mount. Expect every value back over both streams, each
+/// listing to name the guest's own and its ACL beside `user.`, and the host's listing to name the `user.` attribute
+/// alone.
+#[test]
+fn a_guests_own_attributes_are_its_data_on_every_stream_and_no_hosts_mount_lists_them() {
+  let (daemon, client, id) = provisioned("shards-guest-attributes");
+  let mut guest =
+    Guest::over(attach(&daemon, id, None, Intent::Write).expect("the attach was served"));
+  guest.init();
+  let (file, fh) = guest.create(ROOT, "bin").expect("the guest makes a file");
+  assert_eq!(guest.close(file, fh), (0, 0));
+  let dir = guest
+    .mkdir(ROOT, "upper")
+    .expect("the guest makes a directory");
+  let capability: &[u8] = &[1, 0, 0, 2, 0, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+  // An access ACL as `setfacl -m u:4242:r` leaves one: the owner rw-, user 4242 r--, the group r--, the mask r--,
+  // other r-- (version 2, then each entry's tag, permission set and id; A-302).
+  let access_acl: &[u8] = &[
+    2, 0, 0, 0, 1, 0, 6, 0, 255, 255, 255, 255, 2, 0, 4, 0, 146, 16, 0, 0, 4, 0, 4, 0, 255, 255,
+    255, 255, 16, 0, 4, 0, 255, 255, 255, 255, 32, 0, 4, 0, 255, 255, 255, 255,
+  ];
+  let attributes: [(u64, &str, &[u8]); 4] = [
+    (file, "security.capability", capability),
+    (file, "system.posix_acl_access", access_acl),
+    (file, "user.mime_type", b"application/x-executable"),
+    (dir, "trusted.overlay.opaque", b"y"),
+  ];
+  for (node, name, value) in attributes {
+    let set = guest.ask(Opcode::SetXattr, node, &setxattr(name, value));
+    assert_eq!(errno(&set), 0, "the guest sets {name}");
+  }
+  let mut second = Guest::over(attach(&daemon, id, None, Intent::Read).expect("a second attach"));
+  second.init();
+  let second_file = second.lookup(ROOT, "bin").expect("bin");
+  let second_dir = second.lookup(ROOT, "upper").expect("upper");
+  for (stream, nodes) in [
+    (&mut guest, (file, dir)),
+    (&mut second, (second_file, second_dir)),
+  ] {
+    for (node, name, value) in attributes {
+      let node = if node == file { nodes.0 } else { nodes.1 };
+      let got = stream.ask(Opcode::GetXattr, node, &getxattr(256, Some(name)));
+      assert_eq!(
+        (errno(&got), &got[OUT_HEADER_LEN..]),
+        (0, value),
+        "{name} reads back over a stream"
+      );
+    }
+    let names = listed(&stream.ask(Opcode::ListXattr, nodes.0, &getxattr(4096, None)));
+    assert_eq!(
+      names,
+      vec![
+        b"security.capability".to_vec(),
+        b"system.posix_acl_access".to_vec(),
+        b"user.mime_type".to_vec()
+      ],
+      "a stream lists the guest's own names and its ACL beside user."
+    );
+  }
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let capability_path = daemon
+    .mount_capability("shared")
+    .expect("the owner shard answers")
+    .expect("the volume is served");
+  let mut host = common::nfs4::Session::open(port, b"shards-guest-attributes");
+  assert_eq!(
+    host.xattrs(&capability_path, &["bin"]),
+    vec![(b"mime_type".to_vec(), b"application/x-executable".to_vec())],
+    "the host's NFSv4.2 mount lists the user. attribute alone"
+  );
+  assert_eq!(
+    host.xattrs(&capability_path, &["upper"]),
+    Vec::<(Vec<u8>, Vec<u8>)>::new(),
+    "and nothing of the overlay's"
+  );
+  none_counted(
+    &daemon,
+    &[
+      "shards.barrier_refused",
+      "shards.frame_refused",
+      "shards.stream_failed",
+    ],
+  );
+  drop(second);
+  drop(guest);
+  drop(client);
+  drop(daemon);
+}
+
+/// AUD-29-82 (D-18, §4.8) for an attribute, over the stream: an acknowledged SETXATTR or REMOVEXATTR survives a daemon
+/// restart, as NFSv4.2's do (`crate::nfs`'s barrier names its attribute changes). Do: under a daemon whose anchor
+/// segment the test holds, a guest creates a file, then gives it a `user.` attribute and `security.capability` and
+/// removes a third it set, every reply a success and nothing sent after; stop the daemon and start a second over the
+/// same segment. Expect the second daemon's NFSv4.2 port to list the `user.` attribute with its value, and a stream on
+/// it to read the guest's capability back and the removed name `ENODATA`.
+#[test]
+fn a_guests_acknowledged_attribute_survives_a_daemon_restart() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-shards-xattr-durable-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(1));
+  let anchor = held_anchor("shards-xattr-durable", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&scratch("xattr-durable")) else {
+    panic!("the volume was not created");
+  };
+  let mut guest = Guest::over(attach(&first, id, None, Intent::Write).unwrap());
+  guest.init();
+  let (file, fh) = guest.create(ROOT, "bin").unwrap();
+  assert_eq!(guest.close(file, fh), (0, 0));
+  let capability: &[u8] = &[1, 0, 0, 2, 0, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+  for (name, value) in [
+    ("user.gone", &b"removed after"[..]),
+    ("user.kept", b"kept"),
+    ("security.capability", capability),
+  ] {
+    let set = guest.ask(Opcode::SetXattr, file, &setxattr(name, value));
+    assert_eq!(errno(&set), 0, "the guest sets {name}");
+  }
+  let removed = guest.ask(Opcode::RemoveXattr, file, &named("user.gone"));
+  assert_eq!(errno(&removed), 0, "the guest removes user.gone");
+  drop(client);
+  first.stop();
+  assert!(guest.ended(), "the stop ended the stream");
+
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  let capability_path = second
+    .mount_capability("xattr-durable")
+    .expect("the owner shard answers")
+    .expect("the volume was recovered");
+  let port = second.nfs_port().expect("the daemon is serving NFS");
+  let mut host = common::nfs4::Session::open(port, b"shards-xattr-durable");
+  assert_eq!(
+    host.xattrs(&capability_path, &["bin"]),
+    vec![(b"kept".to_vec(), b"kept".to_vec())],
+    "the user. attribute the guest set survived the restart, and the one it removed stayed removed"
+  );
+  let mut again =
+    Guest::over(attach(&second, id, None, Intent::Read).expect("an attach after the restart"));
+  again.init();
+  let node = again.lookup(ROOT, "bin").expect("bin survived");
+  let got = again.ask(
+    Opcode::GetXattr,
+    node,
+    &getxattr(256, Some("security.capability")),
+  );
+  assert_eq!(
+    (errno(&got), &got[OUT_HEADER_LEN..]),
+    (0, capability),
+    "the guest's capability survived the restart"
+  );
+  let gone = again.ask(Opcode::GetXattr, node, &getxattr(256, Some("user.gone")));
+  assert_eq!(errno(&gone), ENODATA, "the removal survived too");
+  drop(again);
+  drop(host);
+  second.stop();
+  drop(anchor);
+}

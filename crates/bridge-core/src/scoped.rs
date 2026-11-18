@@ -461,6 +461,10 @@ impl Bridge for ScopedBridge<'_> {
     self.inner.owner_view()
   }
 
+  fn attribute_namespaces(&mut self) -> crate::AttributeNamespaces {
+    self.inner.attribute_namespaces()
+  }
+
   fn dax_state(&mut self) -> Option<crate::DaxState<'_>> {
     // The backings are the shard's store's, not this scope's. A backed session resolves every node it backs through
     // this scope first (its ask's `getattr`), so lending them widens nothing a scoped guest reaches.

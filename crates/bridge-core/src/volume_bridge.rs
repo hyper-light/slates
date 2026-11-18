@@ -92,6 +92,9 @@ pub struct VolumeBridge<'v> {
   /// How the transport shows its guest the volume's owners ([`crate::OwnerView`]): the identity unless the Shards route's
   /// serve task says otherwise ([`VolumeBridge::viewing_owners`]; A-281).
   owners: crate::OwnerView,
+  /// Which attribute namespaces the transport reaches ([`crate::AttributeNamespaces`]): a host's mount's unless a guest
+  /// kernel's route says otherwise ([`VolumeBridge::serving_a_guest`]; A-290).
+  namespaces: crate::AttributeNamespaces,
 }
 
 /// The files whose acknowledged writes a daemon's death lost, for a mount the anchor held across it (A-61;
@@ -310,6 +313,7 @@ impl<'v> VolumeBridge<'v> {
       lost: None,
       dax: crate::DaxOffer::Withheld,
       owners: crate::OwnerView::IDENTITY,
+      namespaces: crate::AttributeNamespaces::Host,
     }
   }
 
@@ -332,6 +336,7 @@ impl<'v> VolumeBridge<'v> {
       lost: None,
       dax: crate::DaxOffer::Withheld,
       owners: crate::OwnerView::IDENTITY,
+      namespaces: crate::AttributeNamespaces::Host,
     }
   }
 
@@ -360,6 +365,7 @@ impl<'v> VolumeBridge<'v> {
       lost: None,
       dax: crate::DaxOffer::Withheld,
       owners: crate::OwnerView::IDENTITY,
+      namespaces: crate::AttributeNamespaces::Host,
     }
   }
 
@@ -381,6 +387,14 @@ impl<'v> VolumeBridge<'v> {
   #[must_use]
   pub fn viewing_owners(mut self, owners: crate::OwnerView) -> VolumeBridge<'v> {
     self.owners = owners;
+    self
+  }
+
+  /// This bridge, its transport a guest kernel's (a Shards stream, slates' own virtio-fs device): it reaches the guest's
+  /// own attribute namespaces as well as `user.` (A-290).
+  #[must_use]
+  pub fn serving_a_guest(mut self) -> VolumeBridge<'v> {
+    self.namespaces = crate::AttributeNamespaces::Guest;
     self
   }
 
@@ -1414,6 +1428,10 @@ impl Bridge for VolumeBridge<'_> {
 
   fn owner_view(&mut self) -> crate::OwnerView {
     self.owners
+  }
+
+  fn attribute_namespaces(&mut self) -> crate::AttributeNamespaces {
+    self.namespaces
   }
 
   fn dax_state(&mut self) -> Option<crate::DaxState<'_>> {
