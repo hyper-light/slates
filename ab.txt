@@ -3365,3 +3365,5 @@ slates-server: shard 0 initialized in 3840 µs, 0 µs of its CPU, in 7 slices of
 slates-server: shard 1 initialized in 5436 µs, 0 µs of its CPU, in 7 slices of 6 units; the longest slice 4941 µs, the most CPU in one 0 µs, ending at unit 0 (a slice's floor 0 µs, 47 µs yielding)
 slates-winfsp: reply spin window = 4800 ns: the median one-way channel wake of 15 (the 2-competitive spin)
 ## run 10 of 10 done, 2026-11-18T13:54:01Z
+To https://github.com/hyper-light/slates
+   06a1ec8..ef96444  ef964440980e5a69071965520398bca3c658023b -> diag-results/g258-44278926773-bound-arm
