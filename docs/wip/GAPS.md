@@ -222,10 +222,12 @@
 > - **Owed:** a seal's archive walk and its wrap each advance one slice a record period (100 ms), so a large volume takes
 >   many periods to place: at a walk slice of half a 20 µs quantum at 5 GB/s, about 50 KB a period, a GiB takes hours.
 >   The turns are bounded; their pace is not derived from the loss window a seal serves.
-> - **Owed (siblings, one-turn walks of a whole volume):** a takeover's open of a sealed envelope
->   (`fleet::opened_archive`'s `envelope::open`) and a live log's whole record (`live_ship::payload` seals the volume's
->   whole image in one turn) are each one turn of the whole volume, the first on the successor, the second at every
->   whole entry and install image.
+> - **Closed (2026-11-18, A-347):** a takeover opens a sealed envelope in turns of the successor's owner shard
+>   (`fleet::open_in_turns`, `slates_cluster::envelope::Opening`); test `a_takeovers_envelope_is_opened_in_turns_and_served`.
+> - **Owed (siblings, one-turn walks of a whole volume):** a live log's whole record (`live_ship::payload` seals the
+>   volume's whole image in one turn, at every whole entry and install image); and, after A-347's open, the takeover's
+>   restore (`slates_archive::restore` in `verbs::materialize_taken_over`) lays the whole archive out in the one turn
+>   that makes the volume.
 > - **Owed (sibling, a seal left with nothing to do):** a content round's archive is carried back to the owner shard by
 >   `xshard::run_on_counted` (`fleet::put_seal_content`); a full control channel drops it, counted `xshard.run_refused`,
 >   and leaves the job with no archive as A-322's did, until a newer snapshot supersedes it.

@@ -6617,7 +6617,21 @@ reconstruction budget are derived, never fixed (D-O6).
 > `an_envelope_wrapped_in_slices_is_the_whole_wraps_to_the_byte` and `a_wrap_ends_at_its_envelope_or_its_refusal`
 > (`crates/cluster/tests/envelope.rs`). Owed (measurement): the owner shard's longest step while a GiB volume seals,
 > before and after. Owed: a seal's archive walk and its wrap each advance one slice a record period, so a large volume
-> takes many periods to place (GAPS); and a takeover's open of the envelope still runs in one turn of the successor.
+> takes many periods to place (GAPS). A takeover's open of the envelope runs in turns too since A-347 (the next status).
+>
+> **Status (2026-11-18, A-347, g230: a takeover's open of a sealed envelope in turns).** A successor opened a sealed
+> volume's envelope inside the one owner-shard turn that made the volume (`fleet::opened_archive`'s `envelope::open`): a
+> seal's open and a BLAKE3 pass a byte, about a second a GiB, the watchdog's window, on the path a takeover must finish.
+> It now opens it before that turn, in turns of the successor's owner shard (`fleet::open_in_turns`): its lineage key
+> adopted first, then the sealed manifest opened (the real archive's tree, never its content) into a
+> `slates_cluster::envelope::Opening`, then its chunks a slice a turn, one at least, until the seal turns' share of the
+> quantum has passed (`config::wrap_slice_ns`, as the wrap's); the turn that makes the volume then finds a plain archive.
+> The archive is the very one a whole open makes. Counted `fleet.seal.open_slices`; an open that is refused or cut short
+> starts again from the envelope at the materialization's next attempt. Held by
+> `a_takeovers_envelope_is_opened_in_turns_and_served` (`crates/server/tests/fleet.rs`) and by
+> `an_envelope_opened_in_slices_is_the_whole_opens_archive` and `an_open_ends_at_its_archive_or_its_refusal`
+> (`crates/cluster/tests/envelope.rs`). Owed: the restore that follows (`slates_archive::restore` in
+> `verbs::materialize_taken_over`) still lays the whole archive out in that one turn (GAPS).
 
 **Auto-seal.** Each volume seals at its derived cadence (or on explicit `snapshot`, on `detach`,
 on `archive`, and when the owner is asked to drain); publishing a server root is O(1), while
@@ -25157,3 +25171,23 @@ Applied in the same change to:
     raises on its own copy before its own report counts, as a remote candidate publishes its own before it answers.
   - A restarted owner ships its log again at its next publication; until then its holders keep the old chain, which
     holds every write acknowledged before the restart.
+
+### A-347 — A takeover opens a sealed volume's envelope in turns of the successor's owner shard (2026-11-18, g230, scale-out; §4.8 "Promotion and takeover", §4.10 "Content replication"; CLAUDE.md "Bounded work everywhere"; A-323's sibling)
+Applied in the same change to:
+- §4.10 "Content replication": the status of A-322 and A-323 (its owed open closed) and A-347's own status.
+- `crates/cluster/src/envelope.rs`: `Opening` (new, advance, chunks_left); `open` is one whole advance.
+  `crates/server/src/fleet.rs`: `open_in_turns`, `open_slice`, `recorded_keys`, `seal_quantum_ns`,
+  `materialize_refused`; `materialize` opens an envelope before the turn that makes the volume. The seal quantum's test
+  hook covers the open (`Daemon::inject_seal_walk_quantum`).
+- Tests: `a_takeovers_envelope_is_opened_in_turns_and_served` (`crates/server/tests/fleet.rs`);
+  `an_envelope_opened_in_slices_is_the_whole_opens_archive`, `an_open_ends_at_its_archive_or_its_refusal`
+  (`crates/cluster/tests/envelope.rs`).
+- GAPS: A-323's entry (its owed open closed).
+- **What was there.** A successor made a taken-over volume in one owner-shard turn: its lineage key adopted, its
+  envelope opened whole, its archive restored, its record made and published. The open is a seal's open and a BLAKE3
+  pass a byte of the volume, so a GiB volume's takeover ran about a second in one turn, the watchdog's window, on the
+  path that must finish for the volume to be served again.
+- **The rule.** A sealed envelope is opened before the volume is made, a slice a turn on the volume's owner shard, each
+  slice at least one chunk and held to the shard's clock as a seal's wrap is (`config::wrap_slice_ns`). The opened
+  archive is the very one a whole open makes; an open refused or cut short starts again from the envelope at the next
+  attempt.
