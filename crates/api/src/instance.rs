@@ -11,10 +11,12 @@
 //!
 //! **Write permission (A-299, Ada's rule of 2026-11-18).** A landing or a merge follows its caller's write mode
 //! ([`crate::WriteMode`]): bypass writes at once, ask answers [`LandOutcome::ApprovalRequired`] /
-//! [`MergeOutcome::ApprovalRequired`], forbid answers a typed refusal. The daemon side of the modes is A-285's (kiln
-//! agent g220); until it lands, every landing with something to write asks — exactly how a landing behaved before —
-//! and [`Instance::approve`] approves it with the launcher's authority (the instance's issuer, today's proof form,
-//! [`crate::grant`]), never more than the manifest the approver was shown.
+//! [`MergeOutcome::ApprovalRequired`], forbid answers its `Refused` outcome. The launcher sets a volume's mode with
+//! [`Instance::set_write_policy`] under its authority (the instance's issuer); the daemon keeps and enforces it (A-285,
+//! kiln agent g220): a bypass volume lands in the presenting request, a forbidding one is refused before any host
+//! access, an unset one asks. [`Instance::approve`] approves an ask with the launcher's authority, never more than the
+//! manifest the approver was shown. A consumer's own mode, merges under a mode and signed work are the daemon's next
+//! pieces (GAPS).
 
 use slates_client::{
   Attachment, Client, ClientError, CreateSpec, Landing, Rebased, ShardsStream, Submitted,
@@ -22,7 +24,8 @@ use slates_client::{
 };
 use slates_ipc::protocol::{
   AuditEntry, DaemonReport, Filter, GrantScope, GrantSummary, Intent, MergeWindow, PlannedEntry,
-  ReadAt, ReplyBody, RequestBody, SizeClass, SnapshotId, TelemetryReport, VolumeId, VolumeSummary,
+  ReadAt, Refusal, ReplyBody, RequestBody, SizeClass, SnapshotId, TelemetryReport, VolumeId,
+  VolumeSummary,
 };
 
 use crate::error::{Error, Missing, ProtocolFault, Unsupported};
@@ -31,6 +34,7 @@ use crate::outcome::{
   Approval, Awaiting, LandOutcome, LandingConflict, MergeConflict, MergeConflicts, MergeOutcome,
   RebaseOutcome, Work, merge_class_of, report_of, summary_of,
 };
+use crate::policy::{PolicyRefusal, PolicySubject, WriteMode, WritePolicy};
 use crate::signed::{Verification, WorkSignature};
 use crate::volume::{
   BaseState, DriftReport, Provisioned, Source, VolumeSpec, VolumeStatus, status_of,
@@ -130,9 +134,7 @@ impl Instance {
       .call(&RequestBody::Bootstrap { root: true, member })
     {
       Ok(ReplyBody::Acknowledged)
-      | Err(ClientError::Refused(slates_ipc::protocol::Refusal::ConsensusAlreadyInitialized)) => {
-        Ok(())
-      }
+      | Err(ClientError::Refused(Refusal::ConsensusAlreadyInitialized)) => Ok(()),
       Ok(_) => Err(Error::Protocol(ProtocolFault::UnexpectedReply {
         verb: "bootstrap",
       })),
@@ -388,7 +390,18 @@ impl Instance {
   /// an approval (its manifest, its summary), or the conflicts found before any write. A landing with nothing to write
   /// is finished at once and answers [`LandOutcome::Written`] with nothing written. What a reviewer asks before
   /// approving: [`Instance::approval_entries`] lists the plan path by path.
+  ///
+  /// The daemon presents and lands a bypass volume in one request, and offers no verb that presents alone yet (owed,
+  /// A-285's owner), so a landing of a volume whose own land mode is [`crate::WriteMode::Bypass`] is refused
+  /// `Unsupported(WritePolicies)` here rather than written: the volume's mode is read first, and a launcher that
+  /// raises it to bypass between the read and the presentation is the one race left until the verb lands.
   pub fn plan_landing(&mut self, request: &LandingRequest) -> Result<LandOutcome, Error> {
+    let subject = PolicySubject::Volume(request.volume);
+    if let Some(policy) = self.write_policy(subject)?
+      && policy.land == WriteMode::Bypass
+    {
+      return Err(Error::Unsupported(Unsupported::WritePolicies));
+    }
     self.land(request, None)
   }
 
@@ -446,14 +459,16 @@ impl Instance {
       )?)),
       // The grant does not cover what is planned now, or the disk moved between the grant and the landing's
       // validation: nothing was written; what holds now is presented.
+      Err(ClientError::Refused(Refusal::PolicyForbids { act, by })) => {
+        Ok(LandOutcome::Refused(PolicyRefusal::forbidden(act, by)))
+      }
       Ok(Landing::GrantRequired { .. })
-      | Err(ClientError::Refused(
-        slates_ipc::protocol::Refusal::GrantMismatch
-        | slates_ipc::protocol::Refusal::LandingConflict { .. },
-      )) => Ok(match self.present(request)? {
-        Presented::Plan(again) => LandOutcome::ApprovalRequired(again),
-        Presented::Settled(outcome) => outcome,
-      }),
+      | Err(ClientError::Refused(Refusal::GrantMismatch | Refusal::LandingConflict { .. })) => {
+        Ok(match self.present(request)? {
+          Presented::Plan(again) => LandOutcome::ApprovalRequired(again),
+          Presented::Settled(outcome) => outcome,
+        })
+      }
       Err(error) => Err(self.fail(error, Some(Missing::Presentation { id: fresh.id }))),
     }
   }
@@ -502,6 +517,9 @@ impl Instance {
           self.conflicts_of(&approval).map(Presented::Settled)
         }
       }
+      Err(ClientError::Refused(Refusal::PolicyForbids { act, by })) => Ok(Presented::Settled(
+        LandOutcome::Refused(PolicyRefusal::forbidden(act, by)),
+      )),
       Err(error) => Err(self.fail(error, Some(Missing::Volume(request.volume)))),
     }
   }
@@ -559,6 +577,9 @@ impl Instance {
       Ok(Submitted::Conflict(windows)) => self
         .merge_conflicts(work, windows)
         .map(MergeOutcome::Conflicted),
+      Err(ClientError::Refused(Refusal::PolicyForbids { act, by })) => {
+        Ok(MergeOutcome::Refused(PolicyRefusal::forbidden(act, by)))
+      }
       Err(error) => Err(self.fail(error, Some(Missing::Volume(work.volume)))),
     }
   }
@@ -600,6 +621,36 @@ impl Instance {
     Ok(MergeConflicts { conflicts, head })
   }
 
+  /// Sets `subject`'s write policy (A-299, A-285): the launcher's verb, proven by its authority (`launcher`, the
+  /// instance's issuer). The daemon refuses it on a consumer's own channel whatever the proof, so an agent never sets
+  /// or raises its own mode ([`crate::Denied::Rights`]); a proof that does not verify is [`crate::Denied::Unproven`]. A
+  /// policy that requires signed merges is refused `Unsupported(SignedWork)` before anything is sent, since the daemon
+  /// does not keep that requirement yet; a consumer's own policy is refused by the daemon as not built yet (A-285).
+  pub fn set_write_policy(
+    &mut self,
+    subject: PolicySubject,
+    policy: &WritePolicy,
+    launcher: &crate::Issuer,
+  ) -> Result<(), Error> {
+    let wire_policy = policy.wire()?;
+    let wire_subject = subject.wire();
+    let proof = launcher.policy_proof(&wire_subject, &wire_policy)?;
+    self
+      .client
+      .set_policy(wire_subject, wire_policy, proof)
+      .map_err(|e| self.fail(e, Some(missing_subject(subject))))
+  }
+
+  /// `subject`'s write policy as the daemon holds it, or `None` while nobody has set one, which asks for both acts
+  /// ([`WritePolicy::UNSET`]).
+  pub fn write_policy(&mut self, subject: PolicySubject) -> Result<Option<WritePolicy>, Error> {
+    self
+      .client
+      .policy(subject.wire())
+      .map(|policy| policy.map(WritePolicy::of_wire))
+      .map_err(|e| self.fail(e, Some(missing_subject(subject))))
+  }
+
   /// The daemon's status (§4.14 `slates.status`): its shards, health signals with their freshness, the fleet's view,
   /// the transports it serves.
   pub fn daemon_status(&mut self) -> Result<DaemonReport, Error> {
@@ -623,5 +674,13 @@ impl Instance {
       .client
       .telemetry(partition)
       .map_err(|e| self.fail(e, Some(Missing::Shard { shard: partition })))
+  }
+}
+
+/// What a policy verb names, as a missing subject.
+fn missing_subject(subject: PolicySubject) -> Missing {
+  match subject {
+    PolicySubject::Consumer(consumer) => Missing::Consumer { consumer },
+    PolicySubject::Volume(volume) => Missing::Volume(volume),
   }
 }
