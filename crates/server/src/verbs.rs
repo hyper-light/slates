@@ -3860,6 +3860,10 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
   let lease_expiring = u64::try_from(expiring).unwrap_or(u64::MAX);
   let shard_clients = u64::try_from(state.clients.iter().count()).unwrap_or(u64::MAX);
   let shard_deferred = u64::try_from(state.deferred.len()).unwrap_or(u64::MAX);
+  // The window the watchdog judges this shard by (A-455): its rule over the overrun this shard measured, which the
+  // watchdog reads from the shard's registry pulse, where the shard mirrors it at every wait it folds in.
+  let watch_window_ns =
+    crate::watchdog::watch_window_ns(slates_rt::futures::scheduler_overrun_ns());
   // A signal's value is `Some` when measured (§4.14 A-9): the six shard signals are all computable on a
   // live shard, so each is `Some` — a real zero (no volumes, no expiring leases) is a measured zero, not
   // an absent one. The `None` case is reserved for a signal that genuinely cannot be measured in a state
@@ -3877,6 +3881,7 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
       HealthSignal::NfsLocalP99Ns => nfs_quantile(state, NfsTimes::Local, P99_PPM),
       HealthSignal::NfsLocalOffCpuP99Ns => nfs_quantile(state, NfsTimes::LocalOffCpu, P99_PPM),
       HealthSignal::NfsForwardedP99Ns => nfs_quantile(state, NfsTimes::Forwarded, P99_PPM),
+      HealthSignal::WatchWindowNs => Some(watch_window_ns),
     }
   };
   // Each signal ages by the registry's stated basis (§4.14): a report-time value is age zero, a

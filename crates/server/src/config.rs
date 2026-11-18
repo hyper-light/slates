@@ -114,12 +114,13 @@ pub const NO_ESTIMATE_MULTIPLE: Derived<u64> = derived!(
 
 /// The longest one idle spin may run, nanoseconds, whatever its window, its estimate or a hold asks: the liveness budget
 /// less one beat. The watchdog judges a shard spinning once it has run its spin window of CPU with no step and no park
-/// (`crate::watchdog::spin_window_ns`, the budget held to the build and never below it, A-318), and an idle spin is
-/// neither: it follows a step that found nothing and ends in a step, a park or one idle slice of a step's quantum. A
-/// spin held under the budget by a beat can therefore never reach the verdict, on any platform and in any build: an
-/// idle shard polling for work is not a wedged one. The ceiling binds no rule in use, whose windows are R9's floor and
-/// a closed loop's hold of at most 2F × the cycles of 1,024 shards (471 ms, [`closed_loop_hold`]); it is what keeps a
-/// rule's mistake, or an estimate gone wild, from killing a live daemon, as the Windows multiple did (A-361).
+/// (`crate::watchdog::spin_window_ns`, the shard's window held to the build and never below the budget, A-318, A-455),
+/// and an idle spin is neither: it follows a step that found nothing and ends in a step, a park or one idle slice of a
+/// step's quantum. A spin held under the budget by a beat can therefore never reach the verdict, on any platform and in
+/// any build: an idle shard polling for work is not a wedged one. The ceiling binds no rule in use, whose windows are
+/// R9's floor and a closed loop's hold of at most 2F × the cycles of 1,024 shards (471 ms, [`closed_loop_hold`]); it is
+/// what keeps a rule's mistake, or an estimate gone wild, from killing a live daemon, as the Windows multiple did
+/// (A-361).
 pub const IDLE_SPIN_CEILING: Derived<u64> = derived!(
   crate::daemon::LIVENESS_BUDGET_NS.saturating_sub(crate::daemon::HEARTBEAT_NS),
   "liveness budget − one beat: under the least spin window the watchdog judges by",

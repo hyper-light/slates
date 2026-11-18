@@ -1270,12 +1270,17 @@ pub enum HealthSignal {
   NfsLocalOffCpuP99Ns,
   /// The 99th percentile of a call this shard read but forwarded to its volume's owner shard and back.
   NfsForwardedP99Ns,
+  /// The window the daemon's watchdog judges this shard by (A-455, §4.14 `daemon.alive`): the liveness window, raised to
+  /// the scheduler overrun the shard measured where that is longer, never past the observation budget. A shard with no
+  /// step for this long is stuck unless it waited for a CPU or for memory, and one that ran this long of CPU held to
+  /// the build without a step is spinning.
+  WatchWindowNs,
 }
 
 impl HealthSignal {
   /// The closed registry: every shard health signal, in the order the report emits them. A doc-truth
   /// test pins this set and its names so a rename or an addition is caught, not silently miscounted.
-  pub const ALL: [HealthSignal; 10] = [
+  pub const ALL: [HealthSignal; 11] = [
     HealthSignal::CatalogVolumes,
     HealthSignal::LogReplayNs,
     HealthSignal::LeaseExpiring,
@@ -1286,6 +1291,7 @@ impl HealthSignal {
     HealthSignal::NfsLocalP99Ns,
     HealthSignal::NfsLocalOffCpuP99Ns,
     HealthSignal::NfsForwardedP99Ns,
+    HealthSignal::WatchWindowNs,
   ];
 
   /// The dotted name this signal reports under (the stable wire vocabulary a consumer keys on).
@@ -1301,6 +1307,7 @@ impl HealthSignal {
       HealthSignal::NfsLocalP99Ns => "nfs.local_p99_ns",
       HealthSignal::NfsLocalOffCpuP99Ns => "nfs.local_off_cpu_p99_ns",
       HealthSignal::NfsForwardedP99Ns => "nfs.forwarded_p99_ns",
+      HealthSignal::WatchWindowNs => "shard.watch_window_ns",
     }
   }
 
@@ -1319,7 +1326,8 @@ impl HealthSignal {
       | HealthSignal::LeaseExpiring
       | HealthSignal::RingDepth
       | HealthSignal::ShardClients
-      | HealthSignal::ShardDeferred => AbsenceIs::Degraded,
+      | HealthSignal::ShardDeferred
+      | HealthSignal::WatchWindowNs => AbsenceIs::Degraded,
     }
   }
 
@@ -1336,7 +1344,8 @@ impl HealthSignal {
       | HealthSignal::LeaseExpiring
       | HealthSignal::RingDepth
       | HealthSignal::ShardClients
-      | HealthSignal::ShardDeferred => FreshnessBasis::AtReport,
+      | HealthSignal::ShardDeferred
+      | HealthSignal::WatchWindowNs => FreshnessBasis::AtReport,
     }
   }
 
@@ -1359,6 +1368,9 @@ impl HealthSignal {
       HealthSignal::NfsForwardedP99Ns => {
         "the shard's NFS service times for calls forwarded to an owner"
       }
+      HealthSignal::WatchWindowNs => {
+        "the shard's measured scheduler overrun, by the watchdog's window rule"
+      }
     }
   }
 
@@ -1376,7 +1388,8 @@ impl HealthSignal {
       | HealthSignal::NfsLocalP50Ns
       | HealthSignal::NfsLocalP99Ns
       | HealthSignal::NfsLocalOffCpuP99Ns
-      | HealthSignal::NfsForwardedP99Ns => Observer::OwnerShard,
+      | HealthSignal::NfsForwardedP99Ns
+      | HealthSignal::WatchWindowNs => Observer::OwnerShard,
     }
   }
 

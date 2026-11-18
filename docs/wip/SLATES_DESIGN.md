@@ -9237,7 +9237,7 @@ for replay; trace/span identity connects work across bridges, rings, shards and 
 `caused_by` connects causal events. Consumer and volume are authenticated tags, not substitutes
 for trace context. Status exposes these definitions consistently through CLI/MCP.
 
-*Health signal catalog.* Every signal is `(value, freshness_ns)` and host-observed where a host can observe it: `daemon.alive` (the anchor's view: the child is running and answered its last heartbeat), `daemon.restarts` (the anchor's count), `segment.generation` (the anchor segment's generation word), `shard.loop_lag_ns{shard}` (the driver's measured lateness), `shard.tasks{shard}` (live tasks against the arena), `ring.depth{client}` (command slots pending), `client.parked{client}`, `memory.locked_bytes` and `memory.unlocked_bytes` (per shard and rolled up), `memory.pressure` (PSI slope, macOS level, Windows notification), `catalog.volumes{shard}`, `log.bytes{partition}` and `log.replay_ns` (the last replay's duration against the recovery budget), `lease.expiring` (leases within one term of expiry), `base.watcher{volume}` (live, overflowed, unavailable), `land.active` (landings in flight), `placed.pending` (records awaiting f+1), `mirror_age{volume}`, `config.version`, and the NFS service times a shard measured since boot, `nfs.local_p50_ns`, `nfs.local_p99_ns`, `nfs.local_off_cpu_p99_ns` and `nfs.forwarded_p99_ns` (so a slow client is split into the serve, the scheduler's share of it, and the cross-shard forward).
+*Health signal catalog.* Every signal is `(value, freshness_ns)` and host-observed where a host can observe it: `daemon.alive` (the anchor's view: the child is running and answered its last heartbeat), `daemon.restarts` (the anchor's count), `segment.generation` (the anchor segment's generation word), `shard.loop_lag_ns{shard}` (the driver's measured lateness), `shard.watch_window_ns{shard}` (the window the watchdog judges the shard by: the liveness window raised to the shard's measured scheduler overrun, at most the observation budget, A-455), `shard.tasks{shard}` (live tasks against the arena), `ring.depth{client}` (command slots pending), `client.parked{client}`, `memory.locked_bytes` and `memory.unlocked_bytes` (per shard and rolled up), `memory.pressure` (PSI slope, macOS level, Windows notification), `catalog.volumes{shard}`, `log.bytes{partition}` and `log.replay_ns` (the last replay's duration against the recovery budget), `lease.expiring` (leases within one term of expiry), `base.watcher{volume}` (live, overflowed, unavailable), `land.active` (landings in flight), `placed.pending` (records awaiting f+1), `mirror_age{volume}`, `config.version`, and the NFS service times a shard measured since boot, `nfs.local_p50_ns`, `nfs.local_p99_ns`, `nfs.local_off_cpu_p99_ns` and `nfs.forwarded_p99_ns` (so a slow client is split into the serve, the scheduler's share of it, and the cross-shard forward).
 
 *Metric names.* One namespace, dotted, unit-suffixed, labels in braces; counters end in `_total`, histograms in `_ns` or `_bytes`. Per host: `slates.requests_total{kind,outcome}`, `slates.refusals_total{kind}`, `slates.provision_ns` (the AC-2.1 histogram: p50, p99, p999, max, spinning and parked), `slates.ring_wait_ns{client}`, `slates.wake_ns`, `slates.spin_to_park_ratio`. Per shard: `slates.shard.step_ns`, `slates.shard.batch`, `slates.shard.parks_total`, `slates.shard.kicks_total`, `slates.shard.arena_exhausted_total`. Per volume (readable through `status`): `referenced_bytes`, `unique_bytes`, `locked_bytes`, `unlocked_bytes`, `hashing_backlog_bytes`, `dedup_hit_ratio`, `compression_ratio`, `lease_epoch`, `attachments`, `base_cache_hit_ratio`, `drifted_entries`, `watcher_state`; per green: `head_version`, `merges_per_s`, `verdict_p99_ns`, `merge_path_p99_ns`, `conflict_rate{source}`, `rebase_retry_rate`, `base_lag_p99_ns`, `stale_epoch_refusals_total`, `holder_mismatch_total`. Per landing (in the report and the audit log): `entries{outcome}`, `bytes_written`, `dir_sync_ns`, `window_ns_max`, `barriers`. The machine profile and every derived constant are exported as `slates.derived{name}` with their inputs.
 
@@ -9414,6 +9414,23 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > observation's and a cross-shard call's wait (`observe::ShardTime`) take the same excuse next; a shard asleep on a
 > lock whose holder pages is still judged wedged on Linux (the holder is not named, GAPS); Windows' per-thread wait
 > reason is not read.
+
+> **Status (2026-11-18, A-455): each shard is judged by its own window, which follows the host.** The watchdog judges
+> a shard at each look against its window (`watchdog::watch_window_ns`): the liveness window `W` (A-359), raised to the
+> scheduler overrun the shard measured where that is longer, never past the daemon's observation budget
+> (`watchdog::WINDOW_CEILING_NS`). The overrun is how late the shard's steps ran after the waits before them, a maximum
+> that forgets an eighth at each later wait (`slates_rt`'s `scheduler_overrun_ns`, mirrored in the shard's registry
+> pulse). A host that keeps a shard off its CPU that long leaves it no way to show progress sooner, so A-359's floor,
+> checked once at boot, is now held at every look; a quiet host's shards (an overrun of a tick or less) keep `W`. The
+> spin window is the shard's window held to the build (A-318), so both judgments follow it. The ceiling keeps the
+> watchdog from going blind: a wedged shard never waits again, so a spike measured just before its wedge (a process
+> stopped whole and continued) would stay its window for good, and past the observation budget the daemon's own
+> question to the shard already ends as a wedge's. Every verdict's line names the window it was judged by, and the
+> status carries each shard's as `shard.watch_window_ns`. Regressions:
+> `a_shards_window_follows_its_measured_overrun_past_the_liveness_window_and_stops_at_its_ceiling` and
+> `a_shards_status_names_the_window_its_watchdog_judges_it_by` (`crates/server/src/watchdog.rs`). Not yet: the
+> anchor's start and lapse judgment, the daemon's other supervision waits and a laptop's failover detection term still
+> read `W` itself (GAPS).
 
 > **Telemetry oracle correction (2026-09-20, AC-0.11).** A drain request itself emits spans.
 > The daemon integration oracle now derives convergence from the reply quota minus the
@@ -31084,3 +31101,46 @@ Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class C), 
 - **Checks.** `cargo test --locked -p slates-server --test fleet --no-run` (the suite's run is main's).
 
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class C), `crates/server/tests/fleet.rs`.
+
+### A-455 — The watchdog judges each shard by its own window: the liveness window raised to the scheduler overrun the shard measured, within the observation budget, read at every look and published (2026-11-18, built for goal g255; R3's class D, item D-a; §4.14 `daemon.alive`; A-228, A-232, A-318, A-359)
+- **What was there.** The watchdog judged every shard against the liveness window `W` (A-359: the recovery budget by
+  rent or buy), a shard stuck after `W` without a step and spinning after `W` of CPU held to the build (A-318). A-359
+  measured the machine's floor once at boot (the wake probe's p99) and only said so where it passed `W`; a host that
+  keeps a shard off its CPU longer than `W` was never given a longer window.
+- **The rule.** Each shard is judged at each look by its own window, `watchdog::watch_window_ns`: `W` raised to the
+  scheduler overrun the shard measured where that is longer, and never past `watchdog::WINDOW_CEILING_NS`. The overrun
+  is `slates_rt::shard::ShardContext::scheduler_overrun_ns`: how late the shard's steps ran after the waits before them,
+  a maximum that forgets an eighth of itself at each later wait, mirrored in the shard's registry pulse, where the
+  watchdog's thread reads it. A shard the host keeps off its CPU that long has no way to show progress sooner, so a
+  window shorter than its overrun would judge it by the host's delay; a quiet host's overrun is a tick or less (a
+  kevent timeout 1.2 ms late under launchd's timer policy, Windows' 15.6 ms tick), so its shards keep `W`. Both
+  judgments follow the one window: wedged or starved after it without a step, spinning after it of CPU held to the
+  build (`watchdog::spin_window_ns`, now over the shard's window). A-232's bound holds by its terms with the shard's
+  window as `W`: a verdict within its window, a beat and its named lateness of the wedge, and every verdict's line names
+  the window it was judged by.
+- **The ceiling, and why.** A shard folds its overrun in only when it waits, and a wedged shard never waits again: a
+  shard wedged just after a spike (a process stopped whole and continued, a host paused) would keep the spike as its
+  window for good, and the watchdog would be blind to it. The ceiling is the daemon's observation budget
+  (`daemon::OBSERVE_BUDGET_NS`, ten windows), the bound past which the daemon's own question to a shard ends with a
+  deadline as a wedge's and not a slow shard's; held to it, the watchdog never calls alive a shard its own daemon has
+  given up asking, and a stuck shard is judged within the ceiling, a beat and its lateness however the host ran before.
+- **Published.** Each shard's status part carries its window as the health signal `shard.watch_window_ns` (measured at
+  the report; a missing value is degraded), computed by the same rule from the shard's own measurement, which the
+  watchdog reads through the pulse's mirror. The registry's table in `docs/wip/observability.md` and §4.14's catalog
+  name it. `Watchdog::spin_window_ns` (and `Daemon::spin_window_ns`) is now the least spin window, at `W`.
+- **Tests.** `a_shards_window_follows_its_measured_overrun_past_the_liveness_window_and_stops_at_its_ceiling` (a shard
+  wedged, and one spinning, judged by the window each look reads from its measured overrun: on a quiet host at `W`, as
+  before; under a host that kept it off its CPU two and a half windows, at two and a half; under a runaway reading, at
+  the ceiling) and `a_shards_status_names_the_window_its_watchdog_judges_it_by` (a running daemon's shard reports the
+  rule's window over the overrun it measured, at the report), both in `crates/server/src/watchdog.rs`.
+  `crates/client/tests/lone_daemon.rs` now reads the window its stuck shard's end line names, as the bound's `W`, and
+  the start line's new words for the least spin window.
+- **Not yet (class D, each its own change).** The anchor's start and lapse judgments (`crates/api/src/role/anchor.rs`,
+  D-b), the daemon's other supervision waits (D-c) and a laptop's failover detection term (A-405's supervision window)
+  still read `W` itself.
+- EVIDENCE_A455
+
+Applied in the same change to: §4.14 (the health signal catalog; a status block on `daemon.alive`), GAPS (the
+`LIVENESS_BUDGET_NS` entry), `docs/wip/observability.md` (the health-signal table), `crates/server/src/{watchdog,
+verbs,daemon,config}.rs`, `crates/ipc/src/protocol.rs` (`HealthSignal::WatchWindowNs`), `crates/api/src/role/anchor.rs`
+(`start_spin_window_ns` names the window it holds to the build), `crates/client/tests/lone_daemon.rs`.

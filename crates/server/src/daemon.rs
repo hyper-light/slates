@@ -3767,8 +3767,10 @@ impl Daemon {
       .is_some()
   }
 
-  /// The CPU one poll may run without a step before the watchdog judges its shard spinning: the liveness budget held to
-  /// this build (A-318, [`crate::watchdog::spin_window_ns`]). `None` once the daemon has stopped its watchdog.
+  /// The least CPU one poll may run without a step before the watchdog judges its shard spinning: the liveness window
+  /// held to this build (A-318, [`crate::watchdog::spin_window_ns`]); a shard whose host overruns that window is held to
+  /// its own window's, which is longer (A-455, [`crate::watchdog::watch_window_ns`]). `None` once the daemon has stopped
+  /// its watchdog.
   pub fn spin_window_ns(&self) -> Option<u64> {
     self
       .watchdog

@@ -411,7 +411,10 @@ fn judge_start_of(
 /// millisecond or two natively, a pair ring, a registration, is a few tens of milliseconds there, the beat after each
 /// unit (A-312) notwithstanding.
 fn start_spin_window_ns() -> u64 {
-  slates_server::watchdog::spin_window_ns(slates_machine::build_cost::build_cost())
+  slates_server::watchdog::spin_window_ns(
+    slates_machine::build_cost::build_cost(),
+    LIVENESS_BUDGET_NS,
+  )
 }
 
 /// The start's rule over its readings, taken in this order (g243's rule for an observation, which the watchdog's look

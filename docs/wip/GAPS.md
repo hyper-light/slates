@@ -3653,7 +3653,7 @@
 > ratified recovery budget `T` by rent or buy (a verdict waits as long as the recovery it starts costs), the heartbeat
 > `W / ELECTION_MARGIN`, the same values; the machine's wake p99 at boot is its floor, and the boot log names both and
 > says when the floor passes the window. Owed, in order: `W` held at runtime so a daemon runs at its floor where that
-> is past `W` (every use is listed by class in A-359); the failover SLO derived as the membership horizon plus the
+> is past `W` (every use is listed by class in A-359; the watchdog's since A-455, below); the failover SLO derived as the membership horizon plus the
 > council's confirmation window plus `T` (2.9 s today) once each consumer that takes it as a lease term (a landing's
 > target lease, a CLI attachment's term, the NFSv4 and delegation leases, the restart cap) has its own term; and the
 > class C claim wait below. **The failover delay is a live output since 2026-11-18 (A-363, goal g255), not A-359's boot
@@ -3682,10 +3682,22 @@
 > the request), a move's overdue bound and the telemetry freshness horizon. Owed, each in its own
 > change: each other lease takes its term from a φ-accrual
 > detector of its own holder's renewals (a CLI attachment once the CLI process sends a keepalive); `W`'s floor from the
-> pulses' running wake delay; then `FAILOVER_SLO_NS` and `with_failover_slo` go, since nothing sets `F`. The boot-time
-> sum is kept only as the A/B baseline, a build of its own, never a mode. **Since A-403 the recovery's cross-shard passes and the image's alias steps** (A-359's
-> class A list on the wall) wait in their target's own time (`xshard::call_in_shard_time`), so W's floor for them is the
-> target's measured progress, not a boot snapshot.
+> pulses' running overrun for the rest of class D; then `FAILOVER_SLO_NS` and `with_failover_slo` go, since nothing sets
+> `F`. The boot-time sum is kept only as the A/B baseline, a build of its own, never a mode. **Since A-403 the
+> recovery's cross-shard passes and the image's alias steps** (A-359's class A list on the wall) wait in their target's
+> own time (`xshard::call_in_shard_time`), so W's floor for them is the target's measured progress, not a boot snapshot.
+> **Since A-455 (2026-11-18, goal g255, D-a) the watchdog judges each shard by its own window**
+> (`watchdog::watch_window_ns`), read at every look: `W` raised to the scheduler overrun the shard measured (its
+> registry pulse's mirror of `ShardContext::scheduler_overrun_ns`) where that is longer, never past the daemon's
+> observation budget (`watchdog::WINDOW_CEILING_NS`, ten windows), its spin window that window held to the build
+> (A-318); each verdict's line names the window it was judged by, and the status carries each shard's as the health
+> signal `shard.watch_window_ns`. Before, a shard the host kept off its CPU longer than `W` was judged against `W`
+> whatever the host measured, and A-359 only said so at boot. The ceiling keeps the watchdog from going blind, since a
+> wedged shard never waits again and so never forgets a spike measured just before it wedged. Still on `W` itself, each
+> owed its own change (class D): the anchor's start and lapse judgments (`role/anchor.rs`, D-b), the daemon's own
+> supervision waits (`reap_loop`, `log_late_beat`, `starved_share_ns`, `stop_parts`, `start_with_fleet`, the anchor's
+> hold windows, `held_copy`; D-c), and a laptop's failover detection term (A-405's supervision window), which should
+> follow the windows the watchdog now judges by.
 >
 > - **Class A, a cross-shard wait judged in its target's own time (2026-11-06, in progress).** A verb's wait for
 >   another shard's answer gave up at the wall second while the target was alive and starved, and the work went on to
