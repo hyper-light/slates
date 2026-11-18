@@ -2987,7 +2987,9 @@ Apple's XDR arguments (`NFS_MATTR_FH`). The mount's source is `slates:/<name>`. 
 therefore never appears in `ps`, `mount` or `nfsstat -m`, all of which every local user can read.
 - **Unmount.** The kernel's `UMNT` names only `/<name>` and proves nothing by itself. The daemon ends
   the attachment of a host mount of that volume only once the kernel's mount table
-  (`getfsstat(MNT_NOWAIT)`) no longer lists the mount at its bound mount point.
+  (`getfsstat(MNT_NOWAIT)`) no longer lists the mount at its bound mount point. Since A-493 it watches the table
+  for as long as this shard has learned its kernel's unmounts take after their `UMNT` (`nfs::unmount_bound_ns`), not
+  a fixed second.
 - **OCI binds.** The source mount's attachment is found by that same bound mount point in the
   daemon's records.
 - **The v3 security floor.** The listener is loopback-only; every handle carries the capability and
@@ -32619,3 +32621,33 @@ and `crates/server/src/direct_map.rs` (the offers' callers), `crates/server/test
   old life, a withdrawn offer is not counted retired.
 - **Owed.** A cross-process test of a client killed before its claim (the reaper retiring it lets its offer go and its
   stream's attachment end), as `crates/client/tests/reap.rs` kills a client; main's to run.
+
+### A-493 — A `UMNT` is confirmed at the pace this shard learned of its kernel's unmounts (2026-11-19, g232; UI goal 86, R3's class C, C-c part 2; §4.6 A-34, RFC 1813 §5.2.2, §5.2.3)
+
+Applied in the same change to: §4.6's unmount paragraph, GAPS (the R3 debt's class C), `crates/server/src/nfs.rs`
+(`unmount_bound_ns`, `wait_for_unmount`, `Unmounted`, `confirm_unmount`; `UNMOUNT_CONFIRM_NS` removed),
+`crates/server/src/state.rs` (`ShardState::unmount_times`), `crates/server/src/daemon.rs` (its start),
+`crates/cli/tests/cli.rs` (the forged-`UMNT` watch's comment).
+- **What was there.** A `UMNT` started a watch of the kernel's mount table that gave up after one liveness budget,
+  fixed (`UNMOUNT_CONFIRM_NS`): a genuine unmount slower than that on a loaded host left its attachment kept as a mount
+  nobody unmounted.
+- **What the wait waits for.** A `UMNT` is a hint: it removes an entry from a server's mount list, and the list goes
+  stale whenever a client never sends one (RFC 1813 §5.2.2, §5.2.3); nfs(5) has the client reach the server's mountd
+  again only as it unmounts. The kernel sends it while it unmounts, so a genuine one's mount leaves the table within the
+  kernel's own remaining steps, as long as this host's kernel takes under its load; a forged one's never leaves. Neither
+  the client's connection (a `UMNT` reaches the MOUNT program on a call of its own, not on the mount's NFS connection:
+  XNU's `nfs3_umount_rpc`, from memory, not verified here) nor the owner shard's time (the shard is not what is waited
+  on) measures that. The name's routing to its owner shard (`nfs::routed`) is already
+  waited in that shard's own time (A-408).
+- **The rule.** Each shard learns its kernel's unmounts as the told waits learn their mounts (`LearnedWait`, A-431,
+  A-442): a confirmation that found the mount gone is a sample, the bound the samples' tail plus the liveness window a
+  live party may be late by, and one that ran out (a forged `UMNT`, or an unmount slower than the bound) is no sample but
+  doubles the next bound, never past the node's failover delay. A shard that measured nothing waits the liveness window
+  first, as before.
+- **Tests** (`nfs.rs`): `a_umnt_slower_than_the_old_fixed_bound_is_confirmed_at_the_learned_pace` (a shard that
+  measured a window-and-a-half unmount confirms one that leaves the table a window and a fifth after its `UMNT`);
+  `a_umnt_whose_mount_stays_is_given_up_at_the_learned_bound_and_backs_it_off` (unconfirmed at the first bound, the
+  next bound backed off).
+- **Owed.** A confirmation that ran out leaves its attachment kept even if the mount leaves later; a watch of the
+  kernel's unmount events (`EVFILT_FS`, `VQ_UNMOUNT`) would end it whenever the mount goes, with one watch a mount
+  bounding them.

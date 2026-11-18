@@ -3896,7 +3896,14 @@
 >   client while the client's connection lives (`an_offer_waits_for_its_live_clients_claim_past_any_fixed_life`,
 >   `an_exchange_serves_a_live_client_slower_than_any_fixed_bound`,
 >   `a_retired_clients_offers_are_let_go_and_their_ends_closed`); owed: a cross-process test of a client killed before
->   its claim. Class B (the
+>   its claim. C-c's second part since A-493 (2026-11-19, g232): a `UMNT`'s watch of the kernel's mount table gave up
+>   after a fixed second (`UNMOUNT_CONFIRM_NS`); it now waits the pace its shard learned of the kernel's unmounts (the
+>   told waits' learner: the completed confirmations' tail plus the liveness window, backed off after one that ran out,
+>   never past the failover delay), so a loaded host's genuine unmount is confirmed and a forged `UMNT` backs the bound
+>   off (`a_umnt_slower_than_the_old_fixed_bound_is_confirmed_at_the_learned_pace`,
+>   `a_umnt_whose_mount_stays_is_given_up_at_the_learned_bound_and_backs_it_off`); `nfs::routed` already waited in the
+>   name shard's own time (A-408); owed: a confirmation that ran out keeps its attachment though the mount leaves later
+>   (a watch of the kernel's unmount events would end it then). Class B (the
 >   transport's round-trip estimate) is open, but for the owner-location round (2026-11-18, A-437, goal g255: one
 >   liveness window, hard, for its asks and its lent sessions; now the record plane's round budget over the slowest
 >   asked path's measured tail, `owner_location::round_budget_for`), an operator's promotion forwarded to the root

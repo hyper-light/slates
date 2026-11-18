@@ -4612,6 +4612,7 @@ async fn init_shard(
     reply_route: None,
     told_waiters: crate::told::ToldWaiters::default(),
     told_times: crate::told::ToldTimes::default(),
+    unmount_times: crate::learned_wait::LearnedWait::default(),
     nfs_writeback: crate::nfs_writeback::WritebackStates::default(),
     told_owed: None,
     current_request: None,

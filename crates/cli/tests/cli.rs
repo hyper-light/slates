@@ -1531,9 +1531,9 @@ fn the_macos_mount_is_nosuid_and_nodev(path: &str) {
   }
 }
 
-/// Shape: how long a forged `UMNT` is watched for effect: three times the daemon's one-liveness-budget
-/// confirmation deadline (`crates/server/src/nfs.rs`, `UNMOUNT_CONFIRM_NS`), so a loaded box's delay
-/// cannot hide an ended attachment.
+/// Shape: how long a forged `UMNT` is watched for effect: three times the bound a fresh daemon's first confirmation
+/// waits (the liveness window before any unmount was measured; `crates/server/src/nfs.rs`, `unmount_bound_ns`, A-493),
+/// so a loaded box's delay cannot hide an ended attachment.
 #[cfg(target_os = "macos")]
 const FORGED_UNMOUNT_WATCH: Duration = Duration::from_secs(3);
 
