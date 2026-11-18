@@ -3695,11 +3695,20 @@
 >   `an_adopted_moves_seal_is_recorded_from_an_owner_shard_that_works_past_a_period`,
 >   `a_given_up_object_is_recorded_on_an_owner_shard_that_works_past_a_period`). Kept on the wall by their reason, stated
 >   beside each: the record period's read of each shard's moves (a pure read, asked again next period) and the pressure
->   sampler's free-room read (the reap cadence's, a shard unanswered reading as no room, which the debt covers). Owed in
->   class A: five of the 25 `xshard::call_within` and `task_within` sites on the wall (`shards_route.rs`,
->   `remote_attach.rs`, `mirror.rs`, `fleet.rs`, `anchor_hold_windows.rs`; g251's since 2026-11-18). Owed, found here:
->   an adopted move's seal is still taken again when its answer is lost to a stopped shard; recording the seal on the
->   owner shard would make `moves::seal_adopted` idempotent. Class B (the
+>   sampler's free-room read (the reap cadence's, a shard unanswered reading as no room, which the debt covers). Then the
+>   last five (A-440, 2026-11-18, g251): the Shards route's take of an offer (macOS) and the Windows anchor's hold now
+>   wait in their owner shard's own time, since each has a side effect its caller must learn of (the take retires the
+>   offer and hands its ends over once, which a late answer dropped; the anchor's hold keeps what its caller took for
+>   unheld), the route's wall bound now held to the client's part alone
+>   (`a_claims_take_waits_for_an_owner_shard_that_works_past_its_budget`); kept on the wall by their reason, stated
+>   beside each: a dead client's reap at remote owners (its waits are remote, the forward lane's, and the reap is
+>   idempotent there, sent again by the next sweep), the mirror's record shipping (the record period's, a shipment built
+>   once and resent unchanged) and a taken-over volume's making (the period's, A-397: the making runs on and the next
+>   attempt joins it in the owner shard's own time). **Class A is closed:** every `xshard::call_within` and
+>   `task_within` left waits for a reason stated beside it (the caller's own period or cadence, a remote wait, or a
+>   peer's one-at-a-time serve), and every other cross-shard wait is judged in its target's own time. Owed, found on the
+>   way: an adopted move's seal is still taken again when its answer is lost to a stopped shard; recording the seal on
+>   the owner shard would make `moves::seal_adopted` idempotent. Class B (the
 >   transport's round-trip estimate) is open, but for the owner-location round (2026-11-18, A-437, goal g255: one
 >   liveness window, hard, for its asks and its lent sessions; now the record plane's round budget over the slowest
 >   asked path's measured tail, `owner_location::round_budget_for`), an operator's promotion forwarded to the root

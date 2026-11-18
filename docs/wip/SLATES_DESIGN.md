@@ -30650,6 +30650,39 @@ daemon}.rs`.
 
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class B), `crates/server/src/verbs.rs`.
 
+### A-440 — The Shards route's take and the Windows anchor's hold wait in their owner shard's own time; the remote reap, the mirror's shipping and a taken-over volume's making are wall bounds by their reasons; class A closed (2026-11-18, goal 85 via g251; R3's class A; A-65, A-397, A-408, A-432, A-435)
+
+- **What was there.** The last five of the cross-shard calls g255 listed waited on the wall. The Shards route's claim
+  (`shards_route`, macOS, A-161) asked the offer's owner shard to check the proof and take the offer within one
+  exchange budget, under a wall bound over the whole exchange: a busy owner shard took the offer after the exchange had
+  failed, retiring it and dropping its ends with the late answer, and the client found nothing to claim again. The
+  Windows anchor's hold (`anchor_hold_windows::exchange`, A-175, A-427) ran its exchange with the anchor as a task of
+  the channel's owner shard and waited for it on the wall at the exchange's own budget, so a busy owner shard ran the
+  exchange after its caller was answered `Deadline`, and the anchor held what its caller took for unheld. A dead
+  client's reap at remote owners (`remote_attach::reap_at_owners`), the mirror's record shipping (`mirror::ship`) and
+  a taken-over volume's making (`fleet::begin_materializing`) waited the reaper's window or a period.
+- **The rule.** The take and the hold wait by `xshard::call_in_shard_time` and `task_in_shard_time` at their exchange
+  budgets: a window, then on while the owner shard works or waits for a CPU, up to that budget of its CPU, so only a
+  shard that stopped, or ran its budget without answering, fails them. The route's exchange now holds the client's
+  part alone (its hello and its proof) to its liveness budget, a silent client's bound, and the owner's take apart from
+  it. The anchor's part of a hold keeps its wall budget once the owner shard runs it: that is the anchor's time, not the
+  shard's. The other three stay on the wall, each for a stated reason beside it: the remote reap's waits are on remote
+  owners, held to the forward lane's bound (class B), and the reap is idempotent there, so the next sweep sends it again;
+  the mirror's shipping is the record period's and keeps what it builds, a shipment built once and resent unchanged; a
+  taken-over volume's making runs on as a task of its owner shard and the next attempt joins it (A-397).
+- **Class A closed.** Every `xshard::call_within` and `task_within` left in the daemon waits for a reason stated beside
+  it: the caller's own period or cadence (the record period's duties, the reaper's and the pressure sampler's), a remote
+  wait, or a peer's one-at-a-time serve. Every other cross-shard wait is judged in its target's own time.
+- **Tests.** `a_claims_take_waits_for_an_owner_shard_that_works_past_its_budget` (`shards_route.rs`): a map's
+  descriptor offered on the second shard of a two-shard daemon, that shard held in one poll of an exchange's budget and
+  a half at a fifth of its CPU (`daemon::hold_busy`, inside the offer's life of two budgets), the offer taken from the
+  first; answered with the offer past one budget, the offer gone from its shard. Red with the take on the wall: the
+  exchange failed at its budget. The Windows hold merges on a clean `cargo xwin check`; its run is filed for main's
+  Windows lanes.
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class A), `crates/server/src/{shards_route,
+anchor_hold_windows,remote_attach,mirror,fleet}.rs`.
+
 ### A-433 — A Windows Shards stream outlives its daemon: the successor adopts the held resync end, duplicates a fresh stream into the holder the session names, and answers a resent request from the reply kept for it (2026-11-18, goal 90, item b, piece four; A-316's successor half on Windows; A-418's wire, A-423's hold, A-427's attach half)
 Applied in the same change to: §4.6, the Shards form's resync and death bullets; A-427's owed list; GAPS, A-281's entry
 (its Windows item); `docs/cli.md` (`{resync}`); `unsafe-budget.toml` (`slates-ipc` 140 → 141); and:
