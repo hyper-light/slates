@@ -1972,12 +1972,29 @@ impl Acceptor {
   /// Drops every accepted position of `object` below `sequence` (AUD-29-43). For a **single-value** register
   /// — a volume's head, its catalog, a tombstone — phase one reports only the highest accepted position
   /// ([`prepare`](Acceptor::prepare)), so once `sequence` is accepted the older positions can never be adopted
-  /// and keeping them is unbounded growth, one position per seal. A **ledger** (a green's merge chain) must
-  /// not be compacted: a successor replays every version. The owner of the value class decides which it is.
+  /// and keeping them is unbounded growth, one position per seal. A **ledger** (a green's merge chain) is not compacted
+  /// this way: a successor rebuilds from its positions, and only those below a durable checkpoint of what they hold can
+  /// go ([`Acceptor::compact_ledger_between`]). The owner of the value class decides which it is.
   pub fn compact_below(&mut self, object: ObjectId, sequence: u64) {
     let changes = &mut self.changes;
     self.accepted.retain(|&(held, position), _| {
       let kept = held != object || position >= sequence;
+      if !kept && let Some(changes) = changes.as_mut() {
+        changes.note_dropped((held, position));
+      }
+      kept
+    });
+  }
+
+  /// Drops the accepted positions of a **ledger** `object` from `from` up to, not including, `below` (A-404): what a
+  /// holder whose durable checkpoint stands for the versions below `below` keeps no more, every one of them committed
+  /// at `f + 1`. Phase one ranks only the highest position, so nothing a takeover adopts is dropped; the positions kept
+  /// below `from` (a green's version 0, whose record names its origin) and from `below` on (the checkpoint's own
+  /// version, whose record its rebuild checks) stay. Noted as dropped where the acceptor tracks its changes.
+  pub fn compact_ledger_between(&mut self, object: ObjectId, from: u64, below: u64) {
+    let changes = &mut self.changes;
+    self.accepted.retain(|&(held, position), _| {
+      let kept = held != object || position < from || position >= below;
       if !kept && let Some(changes) = changes.as_mut() {
         changes.note_dropped((held, position));
       }
@@ -3765,6 +3782,12 @@ pub struct RootConfiguration {
   /// (per-region, like a per-host takeover — no global catalog, D-12). A region present here is no longer in
   /// `regions`.
   pub promotions: std::collections::BTreeMap<RegionId, RegionId>,
+  /// The root group's voters as the configuration last recorded them (§4.8 learners, A-406): the voter set its last
+  /// committed seat change left, in id order, recorded by its leader once that change has committed
+  /// ([`seat`](RootConfiguration::seat)). A root learner takes no part in the root group's Raft, so it knows who votes
+  /// from the configuration it fetches, and learns of a seat change as of any other change: by its version. Empty until
+  /// the first seat is recorded. Bounded by the regions, one representative each.
+  pub voters: Vec<HostId>,
 }
 
 impl RootConfiguration {
@@ -3779,7 +3802,35 @@ impl RootConfiguration {
       regions,
       homes: std::collections::BTreeMap::new(),
       promotions: std::collections::BTreeMap::new(),
+      voters: Vec::new(),
     }
+  }
+
+  /// Whether recording `voters` as the root group's voters would change the configuration ([`seat`]): they differ, as
+  /// a set, from the voters it records.
+  ///
+  /// [`seat`]: RootConfiguration::seat
+  pub fn seats(&self, voters: &[HostId]) -> bool {
+    in_id_order(voters) != self.voters
+  }
+
+  /// Records `voters` as the root group's voters, in id order, once the group has committed the seat change that left
+  /// them, and advances the version, so every root learner learns of the change as of any other (A-406, the root's
+  /// sibling of A-380's [`RegionalConfiguration::seat`]). A set equal to the one recorded, or a version with no
+  /// successor, changes nothing. Returns whether the configuration changed.
+  pub fn seat(&mut self, voters: &[HostId]) -> bool {
+    let voters = in_id_order(voters);
+    if voters == self.voters {
+      return false;
+    }
+    // A version with no successor refuses the change before anything moves, identically on every replica that applies
+    // it (AUD-29-26's sibling: a repeated version would name two configurations).
+    let Some(version) = self.version.checked_add(1) else {
+      return false;
+    };
+    self.voters = voters;
+    self.version = version;
+    true
   }
 
   /// Admits `region` to the root membership (a region joins the fleet). Returns whether it changed — an
@@ -4045,6 +4096,68 @@ mod tests {
     acceptor.forget_object(second);
     assert!(positions(&acceptor, second).is_empty());
     assert_eq!(acceptor.prepare(&prepare(second)).unwrap().highest, None);
+  }
+
+  /// A-404: a ledger compacted below a durable checkpoint keeps what its rebuild reads. Do: accept positions 0 to 5 of a
+  /// ledger and 1 of another object, clear the changes, and compact the ledger between 1 and 4. Expect positions 0, 4
+  /// and 5 kept, 1 to 3 dropped and noted dropped, the other object untouched, and the highest position still 5.
+  #[test]
+  fn a_ledger_compacted_between_keeps_its_first_position_and_the_checkpoints_own() {
+    let config = Configuration::solo(HostId(1));
+    let authority = Authority {
+      generation: config.version,
+      owner: config.owner,
+    };
+    let mut acceptor = Acceptor::new(config.owner, authority).tracking_changes();
+    let accept = |acceptor: &mut Acceptor, object: u64, sequence: u64| {
+      acceptor
+        .accept(&record_under(
+          &config,
+          object,
+          sequence,
+          HostEpoch(1),
+          &sequence.to_le_bytes(),
+        ))
+        .unwrap();
+    };
+    for sequence in 0..=5 {
+      accept(&mut acceptor, 7, sequence);
+    }
+    accept(&mut acceptor, 8, 1);
+    acceptor.clear_changes();
+    let (ledger, other) = (
+      ObjectId::new(config.owner, 7),
+      ObjectId::new(config.owner, 8),
+    );
+    acceptor.compact_ledger_between(ledger, 1, 4);
+    let kept: Vec<u64> = acceptor
+      .positions()
+      .filter(|(held, ..)| *held == ledger)
+      .map(|(_, sequence, ..)| sequence)
+      .collect();
+    let dropped: Vec<(ObjectId, u64)> = acceptor
+      .changes()
+      .map(|changes| changes.dropped.iter().copied().collect())
+      .unwrap_or_default();
+    assert_eq!(
+      kept,
+      vec![0, 4, 5],
+      "version 0 and the checkpoint's own position on stay"
+    );
+    assert_eq!(
+      dropped,
+      vec![(ledger, 1), (ledger, 2), (ledger, 3)],
+      "the positions between are dropped and noted"
+    );
+    assert!(
+      acceptor.value_at(other, 1).is_some(),
+      "another object's position is untouched"
+    );
+    assert_eq!(
+      acceptor.highest(ledger).map(|(sequence, _)| sequence),
+      Some(5),
+      "phase one's highest position stays"
+    );
   }
 
   /// §4.8 "persistence before reply", A-367: a holder's acceptor that tracks its changes names exactly the positions a
@@ -7498,6 +7611,36 @@ mod tests {
     assert!(
       !promotion.promoted(Quorum { f: 1 }),
       "one promise is not a quorum at f=1 — the new owner must not serve yet"
+    );
+  }
+
+  /// A-406 (§4.8 learners): the root configuration records the root group's voters, in id order, and a recorded change
+  /// advances its version as any change does. Do: in a three-region root, seat two voters given out of order, seat the
+  /// same set again in another order, then seat another set. Expect the first and the last to change the configuration,
+  /// each advancing the version by one and recording the set in id order, and the repeat to change nothing.
+  #[test]
+  fn a_root_seat_records_the_voters_in_id_order_and_advances_the_version_only_when_they_change() {
+    let mut root = RootConfiguration::formed(vec![RegionId(0), RegionId(1), RegionId(2)]);
+    let before = root.version;
+    let voters = [HostId(7), HostId(3)];
+    assert!(root.seats(&voters) && root.seat(&voters));
+    assert_eq!(
+      (root.version, root.voters.clone()),
+      (before + 1, vec![HostId(3), HostId(7)]),
+      "the voters recorded in id order, one version on"
+    );
+    let again = [HostId(3), HostId(7)];
+    assert!(
+      !root.seats(&again) && !root.seat(&again),
+      "the same set is no change"
+    );
+    assert_eq!(root.version, before + 1, "nothing moved");
+    let other = [HostId(9), HostId(3), HostId(7)];
+    assert!(root.seat(&other));
+    assert_eq!(
+      (root.version, root.voters.clone()),
+      (before + 2, vec![HostId(3), HostId(7), HostId(9)]),
+      "a new set recorded, one version on"
     );
   }
 

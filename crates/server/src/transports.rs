@@ -646,6 +646,7 @@ fn host_facts() -> (String, Option<String>) {
 /// its terminating NUL. A fact past it (the lossy conversion widens an invalid byte to three) is cut at a character
 /// boundary, so a status, which carries the facts beside a volume's name, has a widest a create can leave room for
 /// (A-267).
+/// Format: `_SYS_NAMELEN` less its NUL.
 pub(crate) const HOST_FACT_BYTES: usize = 255;
 
 /// `fact`, cut to [`HOST_FACT_BYTES`] at a character boundary.
@@ -726,6 +727,7 @@ fn every_situation() -> impl Iterator<Item = Situation> {
         nfs_listener_bound: flag(0),
         may_write: flag(1),
         fuse_available: flag(2),
+        // Format: each flag's bit in the situation word, below `SITUATION_FLAGS`.
         winfsp_installed: flag(3),
         stream_route_bound: flag(4),
       }

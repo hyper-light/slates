@@ -70,9 +70,10 @@ pub fn sid_text(bytes: &[u8]) -> Option<String> {
     .checked_add(SID_HEADER_BYTES)?;
   for word in bytes
     .get(SID_HEADER_BYTES..end)?
-    .chunks_exact(SUB_AUTHORITY_BYTES)
+    .as_chunks::<SUB_AUTHORITY_BYTES>()
+    .0
   {
-    let sub_authority = u32::from_le_bytes(word.try_into().ok()?);
+    let sub_authority = u32::from_le_bytes(*word);
     text.push_str(&format!("-{sub_authority}"));
   }
   Some(text)
@@ -152,8 +153,11 @@ mod tests {
     let mut buffer = vec![0u64; words];
     let mut bytes: Vec<u8> = vec![0; words * size_of::<u64>()];
     bytes[2 * size_of::<u64>()..][..sid.len()].copy_from_slice(&sid);
-    for (word, chunk) in buffer.iter_mut().zip(bytes.chunks_exact(size_of::<u64>())) {
-      *word = u64::from_ne_bytes(chunk.try_into().unwrap());
+    for (word, chunk) in buffer
+      .iter_mut()
+      .zip(bytes.as_chunks::<{ size_of::<u64>() }>().0)
+    {
+      *word = u64::from_ne_bytes(*chunk);
     }
     let base = u64::try_from(buffer.as_ptr().addr()).unwrap();
     buffer[0] = base + 2 * 8;

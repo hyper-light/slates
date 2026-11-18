@@ -1515,6 +1515,10 @@ pub(crate) const REPLICA_FOLDED: &str = "merge.replica.folded";
 /// record named (A-404): the non-vacuity counter of a replica checkpoint.
 /// Format: a refusal name in the daemon's status report.
 pub(crate) const REPLICA_CHECKPOINTED: &str = "merge.replica.checkpointed";
+/// Counted on a holder, by the held inputs its retention released once a new checkpoint let go of the ledger positions
+/// that named them (A-404): the non-vacuity counter of a replica that releases what its checkpoint stands for.
+/// Format: a refusal name in the daemon's status report.
+pub(crate) const REPLICA_COMPACTED_INPUTS: &str = "merge.replica.compacted_inputs";
 
 /// A holder's durable checkpoint of a green's replica (A-404): the version it is at and the checkpoint's encoding
 /// (`slates_merge::checkpoint::Checkpoint::encode`), which a rebuild applies to the origin it seeds.
@@ -1580,6 +1584,17 @@ pub(crate) fn checkpoint_replica(
   );
   state.merge.checkpoints_changed.insert(object);
   state.count(REPLICA_CHECKPOINTED, 1);
+  // What the checkpoint stands for goes (A-404): the ledger's positions after version 0 and below the checkpoint's own,
+  // every one committed at f + 1, and then the inputs their versions placed, which nothing names now. Version 0's record
+  // and origin, and the checkpoint's own record, stay: a rebuild seeds the origin and checks the checkpoint's identity.
+  if let Some(acceptor) = state.holder_records.get_mut(&object) {
+    acceptor.compact_ledger_between(object, 1, floor);
+  }
+  let released = crate::content_retention::retain_object_from(state, object, Some(1));
+  state.count(
+    REPLICA_COMPACTED_INPUTS,
+    u64::try_from(released).unwrap_or(u64::MAX),
+  );
 }
 
 /// Drops this holder's checkpoint of `object` (A-404), with the green it backs no more: the next publication removes

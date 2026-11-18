@@ -837,7 +837,7 @@ fn fingerprint_stamp(fp: &Fingerprint) -> u64 {
   hasher.update(&fp.ctime_ns.to_le_bytes());
   hasher.update(&fp.birth_ns.to_le_bytes());
   let digest = hasher.finalize();
-  let mut word = [0u8; 8];
+  let mut word = [0u8; size_of::<u64>()];
   for (to, from) in word.iter_mut().zip(digest.as_bytes()) {
     *to = *from;
   }

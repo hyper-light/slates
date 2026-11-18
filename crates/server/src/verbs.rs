@@ -11300,6 +11300,7 @@ fn bind_mount(
 /// rest are counted (`mounts_elided`). Each mount is counted at its whole encoding (its attachment, its path's length
 /// prefix and its path), not its path alone, and the mounts take no more than the room the rest of the report leaves
 /// (A-267, 2026-11-18): a long name can leave less than this.
+/// Derived: `BULK_CHUNK_BYTES` (4096) / 4.
 const MOUNTS_REPORT_BYTES: usize = 1024;
 
 /// Format: what the retired whole-file `Read` is refused as (A-267): the verb, and the paged read that replaced it.
