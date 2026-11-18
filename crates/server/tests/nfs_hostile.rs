@@ -1854,9 +1854,11 @@ fn provision_control_volume(instance: &str) -> String {
 }
 
 /// §4.13 (AUD-01), D-14 ("ids route to owners"). Do: on a two-shard daemon with a volume the control shard owns, mount
-/// the host root under that volume's capability, then hold the other shard in a poll that sleeps three liveness windows,
-/// as a wedged shard does, and list the host root meanwhile. Expect: the listing answered (accept status 0) before the
-/// hold ends, and the volume's name in it once the hold is over. A capability authorizes one attachment, which names the
+/// the host root under that volume's capability, then hold the other shard in one starved poll for three liveness windows
+/// (on the CPU a fifth of the time, alive by A-232's rule: this daemon has no anchor, so a shard wedged past a window
+/// ends its process, exit 4, as it did on CI's Windows lane in diag-b13-1), and list the host root meanwhile. Expect: the
+/// listing answered (accept status 0) before the hold ends, and the volume's name in it once the hold is over. The old
+/// gather waited on the held shard in its own CPU time, which the hold spends slowly, so it answered only after the hold. A capability authorizes one attachment, which names the
 /// partition that holds it, and only that partition can list anything under it, so the listing asks that one shard.
 /// Before, a root `READDIR` asked every shard and waited on each, so a wedged shard the capability has nothing on
 /// failed the listing `SYSTEM_ERR` after a window, and any capability holder made every shard answer as often as it
@@ -1876,16 +1878,16 @@ fn a_host_root_listing_asks_only_the_shard_its_capability_names() {
   args.extend_from_slice(&[0u8; 8]); // cookieverf
   args.extend_from_slice(&512u32.to_be_bytes()); // dircount
   args.extend_from_slice(&8192u32.to_be_bytes()); // maxcount
-  let wedged = hold_shard(&daemon, 1, WINDOW * 3, false);
+  let starved = hold_shard(&daemon, 1, WINDOW * 3, true);
   let started = Instant::now();
   let accepted = call_accept_status(&mut stream, NFS_PROGRAM, NFSPROC3_READDIRPLUS, &args, 2);
   let took = started.elapsed();
-  wedged.join().unwrap();
+  starved.join().unwrap();
   let listed = readdirplus(&mut stream, &root, 3);
   drop(daemon);
   assert!(
     accepted == 0 && took < WINDOW * 3,
-    "the host root listed under one volume's capability while another shard was wedged (status {accepted} after \
+    "the host root listed under one volume's capability while another shard was held (status {accepted} after \
      {took:?}, the hold {:?})",
     WINDOW * 3
   );
