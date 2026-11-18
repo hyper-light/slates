@@ -3462,7 +3462,8 @@ fn restoring(job: &SealJob) -> bool {
 
 /// Advances `object`'s seal one slice of `slice_bytes`; `true` once its archive is complete (this slice or
 /// an earlier one). A snapshot that cannot be archived whole (an overlay's base bytes are not in RAM) stays
-/// `Local`, counted so an operator sees why it never places (§4.4 coverage is never upgraded).
+/// `Local`, counted so an operator sees why it never places (§4.4 coverage is never upgraded). An archive whose
+/// envelope is refused drops the job, so the next period starts the seal again (A-322).
 fn advance_seal(
   state: &mut ShardState,
   track: Track,
@@ -3497,6 +3498,10 @@ fn advance_seal(
     }
   };
   let Some(archive) = envelope_of(state, object, archive) else {
+    // A refused envelope drops the seal, so the next period starts it again (A-322). Until 2026-11-18 the job was kept
+    // with its walk spent and no archive: every later period found it complete and nothing to put, so its head never
+    // placed, whatever the keys did next; a heal kept that way shut the healer out of the volume as well.
+    seal_jobs(state, track).remove(&object);
     return false;
   };
   let Some(job) = seal_jobs(state, track).get_mut(&object) else {
