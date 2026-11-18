@@ -127,6 +127,8 @@ Op 75 GreenAdopted
 Op 76 AuditOwed
 Op 77 AuditDelivered
 Op 78 AuditBatchAppended
+Op 79 VolumeReleased
+Op 80 BaseCaptured
 PlacementState 0 Local
 PlacementState 1 Placed
 Principal 0 Uid
