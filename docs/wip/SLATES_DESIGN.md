@@ -31917,3 +31917,37 @@ slices, `stage_file` staging the decided mode and bits, a replacement's metadata
   --target x86_64-pc-windows-msvc` of slates-land and slates-server with all targets were clean; `cargo fmt` laid the
   lines out. Filed for main: the land oracle (its captured-clone tests meet the content witness's new encoding and the
   replacement's metadata) and the crash oracle.
+
+### A-469 — The landing manifest's encoding, the bytes a grant binds, is pinned by a golden vector for each layout it writes (2026-11-18, g085; §4.15 steps 1 and 3; A-451, A-458, A-466)
+Applied in the same change to: §4.15 step 1 (the vectors named), GAPS (A-185's owed list), `crates/land`
+(`src/manifest_vectors.rs`, new: the fixed manifests, the vectors' test, its `--ignored` writer, a determinism test and
+a field test; `src/manifest_vectors.txt`, new: the published vectors; `src/lib.rs`).
+- **What was there.** A grant binds a manifest by the BLAKE3 of its canonical encoding, and the encoding had changed
+  three times in one day (A-451's Windows bits, A-458's metadata entry, A-466's captured metadata), each time unseen by
+  any test of its bytes: the repository's rule asks a golden vector of everything hashed in a format, and this had none.
+- **The vectors.** One for each layout the encoder writes: an overlay's (judged by witness, layout 3) and a captured
+  clone's (judged by content, layout 5); the content layout 4 of A-451's day is written by nothing now, and no decoder
+  reads any layout. Each is a fixed manifest holding every action a manifest so judged holds — an overlay's create, mkdir,
+  symlink, replace, metadata entry, rename, clear, delete and rmdir; a captured clone's the same less a rename and a
+  clear — with the Windows bits set on some entries and unset on others. Its header, each entry in landing order and its
+  identity are published one line each in `manifest_vectors.txt`, so a change shows as the lines it moves, and the test
+  names the first. Only `cargo test -p slates-land --lib -- --ignored publish_the_manifest_vectors` rewrites them, as
+  the doc-truth tests' writers do; a normal run never touches the tree. The vectors were first written by an independent
+  encoder from the encoding's reading (Python, the identities left pending, since this Mac has no BLAKE3), and every
+  header and entry line agreed with the Rust encoder byte for byte on the first run; the two identities are the
+  encoder's.
+- **Beside them.** A determinism test: each golden manifest built twice, once from its entries reversed, encodes to the
+  same bytes and identity, and the two layouts never to the same bytes. And, standing in for a decoder's hostile-input
+  tests, since nothing parses these bytes: changing any one field a landing acts on, in any entry of either layout —
+  a path, a target, an origin, the Windows bits, a witness's mode and identity, an overlay's witness's device, inode,
+  size and times, the volume's identity, size, mode and mtime, either side of a metadata entry — moves the identity.
+- **Tests.** On the Mac Studio (2026-11-18, load 8.2 to 10.5, debug): `cargo test --locked -p slates-land --lib` 33 of
+  33, the writer ignored. Red-checked once: with the encoder writing no Windows bits (the layout before A-451), 2 of 33
+  failed — the vectors at their seventh line, the first entry, and the field test at the bits of that entry. `cargo
+  fmt` laid the lines out.
+- **Owed, found by it.** No decoder exists, so a decoder's hostile-input tests have no target. A string's length prefix
+  is two bytes, so a path or target past 65,535 bytes (a path some 257 maximal names deep) encodes a length that is not
+  its length; no encoder output can be read as another's through it, since every entry's encoding holds a zero byte that
+  no path holds, but four-byte lengths (layouts 6 and 7) or a refusal at the plan would make the layout lossless. And an
+  overlay's witness's owner, birth time and Windows bits are judged (the verdict compares whole fingerprints) and not
+  bound (the encoding holds the device, inode, size, times and mode).

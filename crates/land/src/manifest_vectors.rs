@@ -290,14 +290,25 @@ fn vector_text() -> String {
     let manifest = golden_manifest(basis);
     let whole = Manifest::encode(&manifest.entries, basis);
     let layout = u16::from_le_bytes([whole[4], whole[5]]);
-    text.push_str(&format!("{layout} header {}\n", hex(&whole[..HEADER_BYTES])));
+    text.push_str(&format!(
+      "{layout} header {}\n",
+      hex(&whole[..HEADER_BYTES])
+    ));
     let mut at = HEADER_BYTES;
     for (index, entry) in manifest.entries.iter().enumerate() {
       let next = Manifest::encode(&manifest.entries[..=index], basis).len();
-      text.push_str(&format!("{layout} {} {}\n", entry.path, hex(&whole[at..next])));
+      text.push_str(&format!(
+        "{layout} {} {}\n",
+        entry.path,
+        hex(&whole[at..next])
+      ));
       at = next;
     }
-    assert_eq!(at, whole.len(), "every byte belongs to the header or an entry");
+    assert_eq!(
+      at,
+      whole.len(),
+      "every byte belongs to the header or an entry"
+    );
     text.push_str(&format!("{layout} identity {}\n", hex(&manifest.hash)));
   }
   text
