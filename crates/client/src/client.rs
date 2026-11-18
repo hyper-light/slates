@@ -2758,6 +2758,16 @@ impl Client {
     self.end.disarm_async().map_err(ClientError::Ipc)
   }
 
+  /// Ends the async completion channel ([`Self::enable_async_completion`]) for a caller going back to the synchronous
+  /// form, so its parked calls are woken by the daemon's wake rather than a bridge taking it (see
+  /// `ClientEnd::disable_async_completion`). The descriptor the async form polled is closed.
+  pub fn disable_async_completion(&mut self) -> Result<(), ClientError> {
+    self
+      .end
+      .disable_async_completion()
+      .map_err(ClientError::Ipc)
+  }
+
   /// Clears the completion fd's readiness after the loop reports it readable.
   #[cfg(unix)]
   pub fn drain_completion(&self) {

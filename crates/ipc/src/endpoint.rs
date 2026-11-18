@@ -373,6 +373,21 @@ impl ClientEnd {
     Ok(())
   }
 
+  /// Ends the async completion channel ([`Self::enable_async_completion`]) for a client going back to the synchronous
+  /// form: the arm cleared and the bridge stopped and joined, its descriptor closed. Where the bridge waits on what the
+  /// synchronous park waits on (the wake word on macOS, the named Event on Windows), the daemon's one wake per reply
+  /// went to whichever waiter the kernel picked, so a parked synchronous call beside a running bridge slept to its
+  /// whole reply deadline: 16 to 19 of 20 parked calls did, each up to 2.0 s, on the Mac Studio (2026-11-18). On Linux
+  /// the plain path holds no bridge and the eventfd stays the client's. A later [`Self::enable_async_completion`]
+  /// starts a new bridge.
+  pub fn disable_async_completion(&mut self) -> Result<(), IpcError> {
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    {
+      self.bridge = None;
+    }
+    self.disarm_async()
+  }
+
   /// Whether the daemon this end was connected to is gone (dead or restarted); true for an
   /// end that has no liveness check, so a caller reconnects rather than waits forever.
   pub fn daemon_gone(&self) -> bool {

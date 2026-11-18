@@ -1728,7 +1728,8 @@ mod asynchronous_form {
   /// answer as the synchronous verb answers it, the stranger refused `NotFound` naming the volume, every call after a
   /// dropped one answered (a dropped call is cancelled and its reply dropped when it comes; calls left in the driver
   /// would fill it and have one refused `TooManyOutstanding`), every drop made within the rounds' bound, and the
-  /// synchronous form still serving afterwards. The reactor's wakes and the slowest answered round are printed: a
+  /// synchronous form serving afterwards with its parked calls woken
+  /// ([`expect_parked_synchronous_calls_woken`]). The reactor's wakes and the slowest answered round are printed: a
   /// round's wait that timed out was ended by the driver's deadline, not by its reply's signal.
   #[test]
   fn an_async_instance_provisions_snapshots_reports_and_destroys() {
@@ -1773,12 +1774,42 @@ mod asynchronous_form {
       "a dropped call leaves the instance serving"
     );
     block_on(instance.destroy(&reactor, copy)).unwrap();
-    let mut instance = instance.into_instance();
-    assert_eq!(
-      instance.status(volume).map(|status| status.snapshots),
-      Ok(1)
-    );
+    let mut instance = instance.into_instance().unwrap();
+    expect_parked_synchronous_calls_woken(&mut instance, volume);
     daemon.stop();
+  }
+
+  /// Shape: the synchronous calls made after the instance is given back, each parking at once.
+  const PARKED_CALLS: u64 = 20;
+
+  /// The synchronous half of `an_async_instance_provisions_snapshots_reports_and_destroys`. Do: on the instance the
+  /// async form gave back, ask `volume`'s status [`PARKED_CALLS`] times, the client spinning for none of them, so each
+  /// parks for its reply. Expect each answered, every one of them parked, and each well within the client's reply
+  /// deadline. With the async form's completion bridge still running, the daemon's one wake per reply went to the bridge
+  /// or to the parked call, whichever the kernel picked, and 16 to 19 of 20 such calls slept to their 2.0 s deadline
+  /// (macOS, Mac Studio, 2026-11-18).
+  fn expect_parked_synchronous_calls_woken(instance: &mut Instance, volume: VolumeId) {
+    let deadline = Duration::from_nanos(instance.client().deadlines().reply_ns);
+    instance.client().spin_for(Some(0));
+    let (parks_before, _) = instance.client().park_ratio();
+    for call in 0..PARKED_CALLS {
+      let asked = Instant::now();
+      assert_eq!(
+        instance.status(volume).map(|status| status.snapshots),
+        Ok(1)
+      );
+      let took = asked.elapsed();
+      assert!(
+        took < deadline,
+        "call {call}: a parked synchronous call took {took:?} of its {deadline:?} deadline: its wake went elsewhere"
+      );
+    }
+    let (parks_after, _) = instance.client().park_ratio();
+    assert!(
+      parks_after.saturating_sub(parks_before) >= PARKED_CALLS,
+      "every call parked: {parks_before} parks before, {parks_after} after"
+    );
+    instance.client().spin_for(None);
   }
 
   /// The cancellation case of `an_async_instance_provisions_snapshots_reports_and_destroys`: rounds of a status call of

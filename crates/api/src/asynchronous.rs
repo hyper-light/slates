@@ -101,9 +101,15 @@ impl AsyncInstance {
     })
   }
 
-  /// The instance back, for the verbs that stay synchronous.
-  pub fn into_instance(self) -> Instance {
-    self.instance
+  /// The instance back, for the verbs that stay synchronous: its completion signal stopped and its descriptor closed
+  /// (deregister it from the host's loop first), so the synchronous form's waits are woken by the daemon. A running
+  /// signal took the daemon's wake from a parked synchronous call on macOS and Windows, which then slept to its reply
+  /// deadline. Refused as the client refuses clearing its arm, a region it can no longer read.
+  pub fn into_instance(mut self) -> Result<Instance, Error> {
+    match self.instance.client.disable_async_completion() {
+      Ok(()) => Ok(self.instance),
+      Err(error) => Err(self.instance.error(error)),
+    }
   }
 
   /// The completion signal a host's reactor waits on.
