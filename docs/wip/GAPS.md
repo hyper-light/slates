@@ -1,5 +1,14 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **The VFS and DAX plan's last reconciliation (2026-11-18, its Step 15).** The DAX matrix (`virtiofs.md` §8) has no
+> owed cell: every cell is proven with its run or test, impossible with its source, declined with Ada's date, or none.
+> `platforms.md` had two rows the plan closed without their runs. Its Windows cells for a mount that outlives a daemon
+> restart still said "missing" after A-198. They now name `a_winfsp_drive_handle_and_view_survive_twenty_killed_daemons`
+> in `windows-lint` and `windows-arm64`: zero drives lost of twenty, diagnostics run 41484542209. The fleet's sockets and
+> the NFS listener stay missing there (foundational gap 2). Its Linux arm64 image cell now names Step 7's 7-of-7 runs
+> with Firecracker, crosvm and Cloud Hypervisor (41318050347, 41319438579). Still open, and not this plan's: the
+> inventory's built-but-unrun cells (its order of work, item 5).
+
 > **A grant is signed by a key only the human holds (2026-11-18, R10, D-22, §4.13; A-285, Ada's decision: fs-server's
 > option D, with A as the fallback, on every OS).** This closes, once built, "No grant can be issued on Linux from the
 > CLI" (A-201's entry). **Built (piece 1):** the signed statement and its SSH-signature verifier
