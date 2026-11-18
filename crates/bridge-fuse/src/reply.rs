@@ -71,6 +71,9 @@ pub struct Attr {
   pub uid: u32,
   /// The owner gid.
   pub gid: u32,
+  /// A device node's number in the Linux kernel's encoding (`new_encode_dev`, which `fuse_change_attributes` decodes
+  /// with `new_decode_dev`); zero for every other kind (A-294).
+  pub rdev: u32,
   /// The preferred block size.
   pub blksize: u32,
   /// Whether the guest is told to map the file with DAX (`FUSE_ATTR_DAX` in `flags`): only where the transport offers
@@ -101,7 +104,7 @@ impl Attr {
     w.u32(self.nlink);
     w.u32(self.uid);
     w.u32(self.gid);
-    w.u32(0); // rdev
+    w.u32(self.rdev);
     w.u32(self.blksize);
     w.u32(if self.dax { ATTR_DAX } else { 0 }); // flags
   }

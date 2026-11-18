@@ -454,6 +454,18 @@ mod tests {
         node,
         mode: 0o640,
       },
+      // A device node's number rides in its node (A-294).
+      VolumeOp::Mknod {
+        path: "dev".to_owned(),
+        node: SpecialNode {
+          kind: slates_merge::special::SpecialKind::BlockDevice {
+            major: 259,
+            minor: 1 << 20,
+          },
+          ..node
+        },
+        mode: 0o600,
+      },
       VolumeOp::Unlink { path: p() },
       VolumeOp::Rename {
         from: p(),

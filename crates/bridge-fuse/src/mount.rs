@@ -66,10 +66,14 @@ const ALLOW_OTHER_REFUSAL: &str = "user_allow_other";
 const HELPER_MESSAGE_BYTES: usize = 4096;
 
 /// Format: the fixed mount options slates always sets: the kernel checks permissions itself
-/// (`default_permissions`), and the subtype makes the mount's type `fuse.slates`. The source (`fsname`) is
-/// the caller's: the daemon's names the mount's attachment (`slates:<attachment>`, AUD-29-64).
+/// (`default_permissions`); the mount honours no set-user-id bit and opens no device node (`nosuid,nodev`, A-94), so a
+/// device node kept in a volume (A-294) is refused `EACCES` at its open (`may_open_dev`, `fs/namei.c`); and the subtype
+/// makes the mount's type `fuse.slates`. `fusermount3` starts from `nosuid,nodev` too (`util/fusermount.c`
+/// `prepare_mount`), and lets an unprivileged caller ask for both (`lib/mount_util.c`, each flag "safe"); slates states
+/// them itself rather than lean on the helper's default. The source (`fsname`) is the caller's: the daemon's names the
+/// mount's attachment (`slates:<attachment>`, AUD-29-64).
 #[cfg(target_os = "linux")]
-const BASE_OPTIONS: &str = "default_permissions,subtype=slates";
+const BASE_OPTIONS: &str = "default_permissions,nosuid,nodev,subtype=slates";
 /// Format: the source a mount made without an attachment shows (the blocking [`mount`], the tests' form).
 #[cfg(target_os = "linux")]
 const PLAIN_FSNAME: &str = "slates";
