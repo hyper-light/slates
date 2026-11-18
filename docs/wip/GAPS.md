@@ -2672,6 +2672,9 @@
 >       now it marks the shard its region names and the doorbell thread kicks only the shards marked. Each shard's
 >       parks fell 59% and the shards' CPU 20 to 34% at 1,000 clients; the latencies moved with the box's load (14 to 52)
 >       more than with the change, so no latency is claimed for it (BENCHMARKS, 2026-11-18).
+>     - **Closed: an ask waiting out the batch before it (A-388, 2026-11-18).** One batch of asks was out to an owner at
+>       a time, and the wait for it was about half of an ask's way to the owner (p99 1.6 to 2.1 ms for submits and
+>       rebases at 50 ms); a shard now keeps two out.
 >     - **Open, the hops (by the trace):** an edit of a work off its client's shard crosses four thread hand-offs (the
 >       client's shard, the work's, the owner's, back), each waiting for its thread to run; and a first touch, a
 >       verdict, a rebase and a read of the green each queue on the owner's one thread.

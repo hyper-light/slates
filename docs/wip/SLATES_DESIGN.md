@@ -16525,9 +16525,10 @@ the green's shard.
     which the work keeps until its base moves; a rebase answers those of its restated journal. A submit or rebase
     fetches what its journal names that the work lacks, composes by the owner's own function over `Base::for_names`, and
     sends the increment alone. The owner only judges.
-  - *Asks are batched per owner.* A shard keeps one batch of asks out to each owner at a time, at most a client
-    region's credit, waiting for room on the owner's channel; one message an ask flooded the channels at 3,000 clients
-    and stalled every run.
+  - *Asks are batched per owner.* A shard keeps at most two batches of asks out to each owner at a time (A-388; one
+    until 2026-11-18), each at most a client region's credit, waiting for room on the owner's channel; one message an ask
+    flooded the channels at 3,000 clients and stalled every run, and one batch at a time made an ask wait for the batch
+    before it to come back before it left.
   - *A creation holds its id and its name* while the owner admits it (`Op::WorkCreationPending`, settled with the
     creation, dropped at a start). The id is the creating transaction's sequence, so a parked creation, which commits
     nothing, would share it with every other parked in the same step.
@@ -27968,3 +27969,30 @@ shard), `crates/server/src/doorbell.rs` (the thread kicks what the rings marked,
   parks fell by 59% at both loads (4.71 to 1.92 million a level at 50 ms, 2.74 to 1.13 million at 20 ms) and the shards'
   CPU by 34% and 20%. The latencies swung ten- to twentyfold with the box's load (14 to 52) within each arm, so those
   pairs cannot tell the arms' latencies apart; the 1,000-client rung's record run is the supervisor's.
+
+### A-388 — A shard keeps two batches of asks out to each owner, so an ask made while one is out leaves at once (2026-11-18, built for goals 231 and 257, 1,000 clients under 1 ms; amends A-247's "Asks are batched per owner")
+Applied in the same change to: §4.16 (A-247's rule, "Asks are batched per owner"), GAPS (the load test's entry),
+`crates/server/src/work_home.rs` (`Outbox::out`, `BATCHES_OUT`, `BATCHES_OUT_PEAK`, `start_ask`, `take_batch`, the module's
+"Asks are batched"), and the test below.
+- **What was measured.** A work's verb that needs its green's owner parks on the work's shard and its ask goes into the
+  shard's outbox for that owner; one batch was out at a time, so an ask made while a batch was out waited for that
+  batch's whole round trip (the owner's turn, the answer's way back, the shard's turn to send again) before it left. The
+  g083 trace on the Mac Studio (1,000 clients over 23 shards, a think mean of 50 ms, load 25 to 35, 2026-11-18) split an
+  ask's way to the owner at that wait: in the outbox p50 32 to 37 µs and p99 1.6 to 2.1 ms for submits and rebases,
+  against 71 to 84 µs and 2.4 to 2.7 ms from the batch's sending to the owner's start of the ask; in the slowest 1% of
+  edits, submits and rebases the outbox's mean was 3.5, 6.2 and 8.5 ms against the rest of the way's 3.6, 6.5 and 8.1.
+- **The rule.** A shard keeps at most two batches out to each owner: an ask made while fewer are out goes in a batch of
+  its own at once, and past two it waits for a batch's answer, as before. Two is double buffering, the least that
+  keeps the owner from waiting an asking shard's round trip for its next batch: one is served while the other waits at
+  the owner. A work's order is unchanged: a work has one ask out at a time (its queue's oldest verb), so two batches out
+  never carry two asks of one work. The owner's channel holds at most two messages from each asking shard, the bound
+  one batch gave it doubled.
+- **Test.** `a_shards_second_ask_leaves_while_its_first_batch_is_still_out` (`crates/server/tests/works_off_owner.rs`):
+  two works on one shard ask the green's held owner, one after the other, and the shard has two batches out at once;
+  red at one batch (its peak 1). The status counter `merge.work.batches_out_peak` is the most a shard has had out to
+  one owner at once.
+- **Measured** (BENCHMARKS, "Two batches of asks out to an owner", Mac Studio, 1,000 clients, 2026-11-18): every request
+  kind's p99 lower in five of six pairs back to back, by 40 to 50% in the pair at matched load 30 at a think mean of
+  50 ms (an accepted submit 1.55 to 0.80 ms); traced, the outbox's p999 fell eightfold to tenfold (a submit's 12.9 to
+  1.4 ms) and the whole submit's p999 by two thirds.
+
