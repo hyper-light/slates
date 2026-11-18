@@ -13996,6 +13996,55 @@ Every run's oracle had 0 failures; 11 to 44 clients a run gave up (starved past 
   to 40.6 ms), so these six pairs cannot tell the two apart; the round at the lowest load favoured A-381 at 50 ms and
   main at 20 ms.
 
+## Two batches of asks out to an owner: the ask's wait for the batch before it gone, every request kind's p99 at 50 ms 40 to 50% lower in five of six pairs (A-388; goals 231 and 257; 2026-11-18)
+
+**What it is.** The trace above, extended with a span from each ask's queueing in its shard's outbox to its batch's
+sending (`diag-g083-v2`, never on main), split an ask's way to the green's owner in two: the wait in the outbox for the
+one batch then allowed out to come back (`outbox`), and the batch's way to the owner and its turn there (`transit`). At
+1,000 clients, a think mean of 50 ms, the Mac Studio at load 25 to 35 (main `731763108` with the diagnostic,
+2026-11-18 18:05 UTC): submits' outbox p50 36 µs / p99 1.65 ms against transit 71 µs / 2.41 ms, rebases' 32 µs /
+2.13 ms against 84 µs / 2.70 ms; in the slowest 1% of edits, submits and rebases the outbox's mean was 3.5, 6.2 and
+8.5 ms against transit's 3.6, 6.5 and 8.1. A-388 keeps two batches out.
+
+**Environment and command.** As the entry above: Mac Studio, release (LTO) `load_bench` with the daemon in its process
+(23 shards), `kernel/`, 1,000 clients, 800 hot picks, 20 rounds, `--per-connection 32`, both arms with the diagnostic
+(no span sink enlarged, no `--trace`): before is main `a1d99b6e0` (`diag-g083-obbase`), after is A-388 on it
+(`diag-g083-ob`), back to back, the order alternating by round, 2026-11-18 18:21 to 18:29 UTC. p99 in ms.
+
+| Z, round | arm | load before → after | verdicts/s | Edit | Accepted | Conflict | ReadHead | Rebase | Edit floor |
+|---|---|---|---|---|---|---|---|---|---|
+| 50, 1 | before | 10.3 → 38.8 | 1,068 | 28.3 | 40.3 | 47.7 | 32.7 | 48.6 | 19.2 |
+| 50, 1 | after | 38.8 → 25.5 | 1,021 | 2.05 | 3.27 | 5.06 | 2.09 | 4.08 | 1.62 |
+| 50, 2 | after | 30.9 → 24.1 | 1,127 | 1.27 | 1.97 | 1.87 | 0.98 | 1.73 | 1.14 |
+| 50, 2 | before | 24.1 → 31.5 | 1,129 | 8.51 | 10.6 | 10.9 | 7.49 | 11.2 | 7.33 |
+| 50, 3 | before | 32.4 → 29.9 | 1,086 | 0.94 | 1.55 | 1.84 | 0.82 | 1.73 | 0.89 |
+| 50, 3 | after | 29.9 → 29.8 | 1,119 | 0.55 | 0.80 | 1.10 | 0.46 | 0.81 | 0.53 |
+| 20, 1 | before | 25.5 → 31.2 | 2,778 | 4.78 | 7.95 | 7.64 | 3.97 | 7.70 | 3.94 |
+| 20, 1 | after | 31.2 → 30.9 | 2,730 | 3.54 | 4.75 | 5.77 | 3.72 | 5.84 | 2.81 |
+| 20, 2 | after | 31.5 → 33.1 | 2,600 | 1.05 | 1.42 | 2.09 | 1.00 | 1.39 | 1.00 |
+| 20, 2 | before | 33.1 → 32.4 | 2,763 | 0.95 | 1.22 | 1.73 | 0.71 | 1.25 | 0.93 |
+| 20, 3 | before | 29.8 → 29.2 | 2,743 | 1.91 | 2.67 | 3.76 | 1.54 | 2.82 | 1.68 |
+| 20, 3 | after | 29.2 → 30.0 | 2,682 | 1.36 | 2.00 | 3.71 | 1.16 | 1.90 | 1.23 |
+
+The p50s were alike in each pair (Edit 0.11 to 0.20 ms); the shards' parks and CPU were alike (CPU 1,895 to 2,342
+thousandths of a core summed over the shards at 50 ms, 5,375 to 5,893 at 20 ms, in both arms). Every run's oracle had
+0 failures.
+
+**The mechanism, traced (18:29 to 18:31 UTC, load 25 to 29, the same binaries with `--trace` and the span sinks
+enlarged).** p50 / p99 / p999 in µs, after against before: an accepted submit's outbox 27 / 111 / 1,366 against 24 / 178
+/ 12,891, its transit 17 / 303 / 2,166 against 14 / 403 / 2,616, and the whole submit's p99 1,011 against 1,241 and its
+p999 7,658 against 23,341; a rebase's outbox 25 / 120 / 1,824 against 23 / 183 / 14,738 (the rebase's p999 11,248
+against 22,544); an edit's outbox p999 502 against 1,222 (the edit's p999 5,124 against 17,525). The wait for the batch
+before is what went: the outbox's p999 fell eightfold to tenfold; its median, about 25 µs in both, is the sender's
+first turn on the shard.
+
+**What it means.**
+- **Faster in five of six pairs.** Every request kind's p99 was lower with two batches out in every pair at 50 ms, by
+  40 to 50% in the pair whose loads matched best (round 3, load 30: an accepted submit 1.55 to 0.80 ms, a rebase 1.73
+  to 0.81), and at 20 ms in two of three (round 2, at load 32 to 33, by 10 to 16% the other way).
+- **The bound at 50 ms nearly held in that pair:** after A-388 every kind but the conflicted submit (1.10 ms) was under
+  1 ms at 1,119 verdicts a second, at a load of 30 from other work.
+
 ## The reply carrier at 3,000 and 10,000 clients: no reply lost after it; 57 lost and a hung run before it at 10,000 (A-296; goal 238; 2026-11-18)
 
 **What it is.** Goal 238's measurement of A-296 (every cross-shard reply waits for room, carried by a per-shard carrier,

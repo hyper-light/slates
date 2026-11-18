@@ -1487,7 +1487,13 @@ impl DaemonConfig {
   /// The content bytes one slice of copy-bound work (a DAX backing's fill, an image's build) may move on the calling
   /// shard now: half its live step quantum at the machine's measured memcpy rate.
   pub fn copy_slice_bytes(&self) -> u64 {
-    copy_slice_bytes(self.memcpy_bytes_per_second, self.step_quantum_ns())
+    self.copy_slice_bytes_within(self.step_quantum_ns())
+  }
+
+  /// [`DaemonConfig::copy_slice_bytes`] for a turn of `quantum_ns` (a takeover's turns, whose quantum a test may cut,
+  /// `fleet::seal_quantum_ns`): half of it at the machine's measured memcpy rate.
+  pub fn copy_slice_bytes_within(&self, quantum_ns: u64) -> u64 {
+    copy_slice_bytes(self.memcpy_bytes_per_second, quantum_ns)
   }
 
   /// Derived: the pages an idle shard pre-faults in one slice of its reserve's refill now (A-214): its step quantum

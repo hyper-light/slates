@@ -261,3 +261,237 @@ fn an_unused_grant_leaves_the_table_at_its_term() {
   drop(client);
   daemon.stop();
 }
+
+/// Shape: the volumes per shard whose landings the expiry audit test grants: a few on each of the two shards, so grants
+/// end on the control shard, whose audit record goes in the expiry's own atom, and on the other, whose records are owed
+/// to the control partition, several of them in one sweep.
+const EXPIRING_PER_SHARD: usize = 3;
+/// Shape: the grants landed with past their term in the check test: several, so at least one landing's check meets its
+/// grant before the reap's next sweep (the sweep runs once a liveness budget, a second; each landing follows its grant's
+/// term by well under a millisecond).
+const LATE_LANDINGS: usize = 4;
+
+/// Presents `volume`'s landing into `target` and approves it with a single-use grant whose term is [`SHORT_TERM_NS`]:
+/// the grant.
+fn short_grant(
+  client: &mut slates_client::Client,
+  secret: &[u8; 32],
+  volume: slates_client::VolumeId,
+  target: &str,
+) -> u64 {
+  let Ok(slates_client::Landing::GrantRequired {
+    landing, manifest, ..
+  }) = client.land(volume, None, target, Filter::default(), None)
+  else {
+    panic!("the landing was presented");
+  };
+  let scope = slates_ipc::protocol::GrantScope::Once;
+  let proof = slates_server::landing::grant_proof(secret, landing, &manifest, scope, SHORT_TERM_NS);
+  client
+    .grant(landing, manifest, scope, SHORT_TERM_NS, proof)
+    .unwrap()
+}
+
+/// Waits until none of `grants` is listed, each ended at its term, within [`EXPIRY_WAIT`].
+fn wait_until_unlisted(client: &mut slates_client::Client, grants: &[u64]) {
+  let started = std::time::Instant::now();
+  loop {
+    let listed: BTreeSet<u64> = client
+      .grants()
+      .unwrap()
+      .iter()
+      .map(|grant| grant.id)
+      .collect();
+    let left: Vec<u64> = grants
+      .iter()
+      .copied()
+      .filter(|grant| listed.contains(grant))
+      .collect();
+    if left.is_empty() {
+      return;
+    }
+    assert!(
+      started.elapsed() < EXPIRY_WAIT,
+      "grants {left:?} left the table within {EXPIRY_WAIT:?} of their term"
+    );
+    std::thread::yield_now();
+  }
+}
+
+/// The grants of `grants` whose `grant_expired` record does not follow their `grant_issued` in the audit `records`.
+fn unaudited_expiries(records: &[slates_client::AuditEntry], grants: &[u64]) -> Vec<u64> {
+  let position = |kind: &str, grant: u64| {
+    records
+      .iter()
+      .position(|record| record.kind == kind && record.grant == Some(grant))
+  };
+  grants
+    .iter()
+    .copied()
+    .filter(|grant| {
+      !matches!(
+        (position("grant_issued", *grant), position("grant_expired", *grant)),
+        (Some(issued), Some(expired)) if issued < expired
+      )
+    })
+    .collect()
+}
+
+/// The status counter `kind` on each partition.
+fn counted_by_partition(
+  client: &mut slates_client::Client,
+  kind: &str,
+) -> std::collections::BTreeMap<u16, u64> {
+  client
+    .daemon_status()
+    .unwrap()
+    .shards
+    .iter()
+    .map(|shard| {
+      let counted = shard
+        .refusals
+        .iter()
+        .filter(|refusal| refusal.kind == kind)
+        .map(|refusal| refusal.count)
+        .sum();
+      (shard.partition, counted)
+    })
+    .collect()
+}
+
+/// §4.15, AC-2.10 (A-266). Do: on a two-shard daemon present the landings of three volumes on each shard and approve
+/// each with a single-use grant whose term is one millisecond; wait until the reap has ended them all; read the audit
+/// and the shards' counters. Expect each grant's `grant_expired` record after its `grant_issued`, and expiries counted
+/// on both shards, so the record the control shard writes in the expiry's own atom and the ones the other shard owes the
+/// control partition were both read. Before 2026-11-18 an expiry wrote no audit record: an expired grant's history was
+/// its issue alone.
+#[test]
+fn every_grant_ended_at_its_term_leaves_its_expiry_in_the_audit() {
+  let (daemon, instance) = daemon("expiry-audit");
+  let mut client = connect(&instance);
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let target = target_dir();
+  let mut grants = Vec::new();
+  for partition in 0..TEST_SHARDS {
+    let names: Vec<String> = (0..)
+      .map(|n| format!("expiring-{n}"))
+      .filter(|name| {
+        slates_server::verbs::owner_of_name(name, usize::from(TEST_SHARDS)) == partition
+      })
+      .take(EXPIRING_PER_SHARD)
+      .collect();
+    for name in names {
+      let volume = client.create(&scratch(&name)).unwrap();
+      grants.push(short_grant(&mut client, &secret, volume, &target.path));
+    }
+  }
+  wait_until_unlisted(&mut client, &grants);
+  let audit = client.audit(0).unwrap();
+  let expired = counted_by_partition(&mut client, slates_server::landing::GRANTS_EXPIRED);
+  drop(client);
+  daemon.stop();
+  let unaudited = unaudited_expiries(&audit, &grants);
+  assert!(
+    unaudited.is_empty(),
+    "every grant ended at its term has its grant_expired record after its grant_issued; these do not: {unaudited:?}"
+  );
+  assert!(
+    (0..TEST_SHARDS).all(|partition| expired.get(&partition).is_some_and(|count| *count > 0)),
+    "grants ended at their term on both shards: {expired:?}"
+  );
+}
+
+/// §4.15 (A-266). Do: present four landings and approve each with a single-use grant whose term is one millisecond,
+/// and land with each once its term has passed, before the reap's next sweep can end it; then wait for the grants to
+/// leave the table and read the audit. Expect each landing refused `GrantInvalid`, every grant gone from the listing and
+/// each one's `grant_expired` record in the audit. Before 2026-11-18 the landing's check marked its grant expired in the
+/// shard's table alone, which the sweep passed over: the grant stayed listed as issued, in the shard's table until a
+/// restart, and its expiry was never recorded.
+#[test]
+fn a_grant_a_landing_found_past_its_term_still_ends_and_is_audited() {
+  let (daemon, instance) = daemon("late-landing");
+  let mut client = connect(&instance);
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let target = target_dir();
+  let mut grants = Vec::new();
+  for n in 0..LATE_LANDINGS {
+    let volume = client.create(&scratch(&format!("late-{n}"))).unwrap();
+    let grant = short_grant(&mut client, &secret, volume, &target.path);
+    let granted = std::time::Instant::now();
+    while granted.elapsed() <= std::time::Duration::from_nanos(SHORT_TERM_NS) {
+      std::hint::spin_loop();
+    }
+    let refused = client.land(volume, None, &target.path, Filter::default(), Some(grant));
+    assert!(
+      matches!(refused, Err(ClientError::Refused(Refusal::GrantInvalid))),
+      "a grant past its term is refused as a grant that is not valid: {refused:?}"
+    );
+    grants.push(grant);
+  }
+  wait_until_unlisted(&mut client, &grants);
+  let audit = client.audit(0).unwrap();
+  drop(client);
+  daemon.stop();
+  let unaudited = unaudited_expiries(&audit, &grants);
+  assert!(
+    unaudited.is_empty(),
+    "every grant a landing found past its term has its expiry audited; these do not: {unaudited:?}"
+  );
+}
+
+/// AC-2.3 (§4.8 transactions) and A-266 (the table holds live grants). Do: present a volume's landing twice; approve the
+/// first; approve the second with the shard's next publication refused before its append, so the grant's atom rolls
+/// back; then land the second presentation naming the id the refused issue took, one past the first grant's. Expect the
+/// approval refused `Unpublished`, one rollback counted, and the landing refused `GrantInvalid`: no grant stands that the
+/// refusal said was not made. Before 2026-11-18 the shard's own table kept the grant the rolled-back atom issued, bound
+/// to the presented landing, and a landing naming its id ran under it.
+#[test]
+fn a_grant_whose_issue_was_refused_covers_no_landing() {
+  let (daemon, instance) = daemon("refused-issue");
+  let mut client = connect(&instance);
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let target = target_dir();
+  let volume = client.create(&scratch("refused-issue")).unwrap();
+  let granted = common::landing::approve(&mut client, &secret, volume, None, &target.path);
+  let Ok(slates_client::Landing::GrantRequired {
+    landing, manifest, ..
+  }) = client.land(volume, None, &target.path, Filter::default(), None)
+  else {
+    panic!("the second landing was presented");
+  };
+  let scope = slates_ipc::protocol::GrantScope::Once;
+  let term = common::landing::GRANT_TERM_NS;
+  let proof = slates_server::landing::grant_proof(&secret, landing, &manifest, scope, term);
+  daemon
+    .inject_publication_fault(Some(slates_db::replay::PublicationFault::BeforeAppend))
+    .unwrap();
+  let refused = client.grant(landing, manifest, scope, term, proof);
+  daemon.inject_publication_fault(None).unwrap();
+  let rollbacks: u64 = daemon
+    .db_publication_counters()
+    .unwrap()
+    .iter()
+    .map(|counters| counters.rollbacks)
+    .sum();
+  let landed = client.land(
+    volume,
+    None,
+    &target.path,
+    Filter::default(),
+    Some(granted + 1),
+  );
+  drop(client);
+  daemon.stop();
+  assert!(
+    matches!(
+      refused,
+      Err(ClientError::Refused(Refusal::Unpublished { .. }))
+    ),
+    "the approval is refused, its atom rolled back: {refused:?}"
+  );
+  assert_eq!(rollbacks, 1, "the grant's atom was the one rolled back");
+  assert!(
+    matches!(landed, Err(ClientError::Refused(Refusal::GrantInvalid))),
+    "a landing naming the refused grant's id is refused as one with no valid grant: {landed:?}"
+  );
+}

@@ -562,14 +562,14 @@ impl Connection {
     data: &[u8],
   ) -> Result<u64, StreamRefusal> {
     let stream_id = self.streams.open_local(kind, priority)?;
-    self.install_sender(stream_id, data);
+    self.install_sender(stream_id, data.to_vec());
     Ok(stream_id)
   }
 
-  /// Replies on the peer's stream `stream_id` with the whole of `data`, in the class the stream carries.
-  /// A stream the peer has already stopped or reset takes the reply as moot (dropped, `Ok`); a stream the
-  /// peer never opened, or a second reply, is a typed refusal.
-  pub fn reply(&mut self, stream_id: u64, data: &[u8]) -> Result<(), StreamRefusal> {
+  /// Replies on the peer's stream `stream_id` with the whole of `data`, in the class the stream carries, taking it as
+  /// the stream's send buffer (never copied whole). A stream the peer has already stopped or reset takes the reply as
+  /// moot (dropped, `Ok`); a stream the peer never opened, or a second reply, is a typed refusal.
+  pub fn reply(&mut self, stream_id: u64, data: Vec<u8>) -> Result<(), StreamRefusal> {
     match self.streams.begin_reply(stream_id)? {
       ReplyAdmission::Send => {
         self.install_sender(stream_id, data);
@@ -579,7 +579,7 @@ impl Connection {
     }
   }
 
-  fn install_sender(&mut self, stream_id: u64, data: &[u8]) {
+  fn install_sender(&mut self, stream_id: u64, data: Vec<u8>) {
     let mut sender = StreamSender::new();
     sender.write(data);
     sender.grant_credit(self.initial_window);
@@ -3124,7 +3124,7 @@ mod tests {
         received_request.extend(b.read_stream(self.now, sid));
         if b.recv_stream_complete(sid) {
           b.close_recv(sid);
-          b.reply(sid, reply)
+          b.reply(sid, reply.to_vec())
             .expect("the request's stream awaits its reply");
         }
         let b_sent = self.carry(b, a);
@@ -3521,7 +3521,7 @@ mod tests {
     server.close_recv(id);
     // The server replies on the same id; the reply packet is lost on the path.
     server
-      .reply(id, &stream_content(2, 4))
+      .reply(id, stream_content(2, 4))
       .expect("the request awaits its reply");
     // Everything the server sends now is lost: the acknowledgement of the request and the reply (at this
     // small budget they leave in separate packets).

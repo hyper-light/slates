@@ -1,7 +1,7 @@
 //! An in-memory stand-in for an instance behind the [`Volumes`] seam (§4.12 "The seam", A-310): what a host's own
 //! simulated cluster drives where no daemon runs (Hex's `hex-sim`). It answers each verb with the outcome or the typed
 //! [`Error`] an [`crate::Instance`] answers for the same request, for every case the conformance suite exercises
-//! (`crates/api/tests/seam.rs`, which runs the one suite over both), and keeps nothing on disk and starts no daemon.
+//! (`the_seam_conforms` in `crates/api/tests/api.rs`, which runs the one suite over both), and keeps nothing on disk and starts no daemon.
 //!
 //! **What it models.** Volumes by name and id, each with its kind (plain, overlay, green, work) and its snapshots;
 //! a clone pins the snapshot it was made from, as the volume core's clone pin does (§4.4), so that snapshot's destroy is

@@ -9,8 +9,10 @@ pub const MAGIC: u32 = 0x4E41_4C53;
 /// owner words (A-98), 5 host-scoped principals (A-237), 6 chain entries record each version's changes (A-257), 7 they
 /// and merge records carry the submit's completion key (A-255), 8 the submitting work beside it, and a completion record
 /// a green's successor adopted carries that work too (A-288), 9 the audit ring removed, whose records the op log and the
-/// snapshots held (A-265). An older segment is refused, never misread.
-pub const LAYOUT_VERSION: u32 = 9;
+/// snapshots held (A-265), 10 the audit's crossing durable: a partition's snapshot carries the records it owes the
+/// control partition and the control partition's marks of what each delivered (A-265, 2026-11-18). An older segment is
+/// refused, never misread.
+pub const LAYOUT_VERSION: u32 = 10;
 /// Format: the layout before A-237's host-scoped principals, refused with what to do about it.
 pub const LAYOUT_BEFORE_HOST_SCOPED_PRINCIPALS: u32 = 4;
 /// Format: one content-pool extent's owner word (A-98): 0 while the extent is free, else its owning partition plus
