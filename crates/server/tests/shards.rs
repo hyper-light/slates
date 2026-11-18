@@ -2637,6 +2637,55 @@ fn ingest_cost_per_mapped_mib() {
   drop(daemon);
 }
 
+/// Measured, not a gate (A-399): what a `close`'s `FLUSH` costs a guest after writes the shard's write log holds (A-63).
+/// One file is created and kept open; each cycle writes a page at its start and sends `FLUSH`, the request every
+/// `close` sends, timing the `FLUSH`'s round trip alone; [`FLUSH_CYCLES`] cycles a round, [`FLUSH_ROUNDS`] rounds, each
+/// round's p50 and p99 printed and the best of each, with the daemon's `shards.flush_logged` count (the flushes that
+/// published nothing, A-399). Run before and after A-399 by the same command, the two binaries interleaved.
+///
+/// Run: `cargo test --release -p slates-server --test shards -- --ignored --nocapture flush_cost`.
+#[test]
+#[ignore = "a measurement, run by hand in release"]
+fn flush_cost_after_logged_writes() {
+  /// Shape: the rounds, and the cycles a round: enough of each for a p99 of its own.
+  const FLUSH_ROUNDS: usize = 5;
+  const FLUSH_CYCLES: usize = 200;
+  let (daemon, client, id) = provisioned("shards-flush-cost");
+  let mut guest = Guest::over(attach(&daemon, id, None, Intent::Write).unwrap());
+  guest.init();
+  let (node, fh) = guest.create(ROOT, "flushed").unwrap();
+  let mut flush = fh.to_le_bytes().to_vec();
+  flush.extend_from_slice(&[0u8; 16]);
+  let page = vec![0x5a; 4096];
+  let mut rounds = Vec::with_capacity(FLUSH_ROUNDS);
+  for _ in 0..FLUSH_ROUNDS {
+    let mut times = Vec::with_capacity(FLUSH_CYCLES);
+    for _ in 0..FLUSH_CYCLES {
+      assert_eq!(guest.write(node, fh, 0, &page), Ok(4096));
+      let started = Instant::now();
+      assert_eq!(errno(&guest.ask(Opcode::Flush, node, &flush)), 0);
+      times.push(started.elapsed());
+    }
+    times.sort_unstable();
+    rounds.push((times[FLUSH_CYCLES / 2], times[FLUSH_CYCLES * 99 / 100]));
+  }
+  let best_p50 = rounds.iter().map(|round| round.0).min().unwrap();
+  let best_p99 = rounds.iter().map(|round| round.1).min().unwrap();
+  let logged = daemon
+    .refusals_on_every_shard()
+    .unwrap()
+    .get("shards.flush_logged")
+    .copied()
+    .unwrap_or(0);
+  println!(
+    "flush cost after a logged page write, {FLUSH_ROUNDS} rounds of {FLUSH_CYCLES}: best p50 {best_p50:?}, best p99 \
+     {best_p99:?}; rounds (p50, p99) {rounds:?}; shards.flush_logged {logged}"
+  );
+  assert_eq!(guest.close(node, fh), (0, 0));
+  drop(client);
+  drop(daemon);
+}
+
 /// macOS: the socket route that hands a client its stream end (A-161, part 1 step 3), driven by hand on the wire so
 /// every hostile exchange can be made.
 #[cfg(target_os = "macos")]

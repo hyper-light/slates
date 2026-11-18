@@ -228,3 +228,20 @@ For recovery, provision a distinct 32-byte recovery key for each node and set
 `SLATES_RECOVERY_KEY` to its read-only secret path in both the anchor environment and the
 operator's recovery CLI. It grants no landing or consumer authority. The exact commands and
 required fencing acknowledgements are in [cli.md](cli.md#recovering-a-lost-consensus-quorum).
+
+### What a node's firewall must let through
+
+A node serves its peers on two UDP sockets at its manifest's base port, so a firewall needs only inbound rules, from
+the other nodes of the fleet:
+
+- **UDP `base`**: the probe plane (membership, its sealed datagrams).
+- **UDP `base + 1`**: the record plane (records and content).
+- **TCP `base`**, only when the fleet serves its network export (the manifest has an operator authority), from the
+  export's clients.
+
+The answers to a node's own dials come back to the socket it sent from, which a stateful firewall (`ufw`, `nftables`
+with connection tracking) passes on its own. A node addressed by name also needs UDP 53 out to the nameservers
+of its `/etc/resolv.conf`. Nothing else: the MCP and SDK channels are local to the host. With `ufw`, a fleet on
+`192.168.1.0/24` at base port 7000 needs, on every node,
+`ufw allow proto udp from 192.168.1.0/24 to any port 7000:7001`. slates holds no privilege (R10), so the rule is
+the operator's, made once per host.

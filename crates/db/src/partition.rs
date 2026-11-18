@@ -160,6 +160,15 @@ pub struct PartitionSnapshot {
   pub audit_dropped: u64,
   /// The highest grant id ever issued here (A-266; appended): the table holds live grants only.
   pub grants_issued_through: u64,
+  /// The audit records owed the control partition and not yet acknowledged, oldest first (A-265's crossing; appended).
+  pub audit_outbox: Vec<AuditRecord>,
+  /// The crossing sequence the next owed record takes (A-265; appended).
+  pub audit_outbox_next: u64,
+  /// On the control partition, what each owing partition has delivered (A-265; appended), by partition order.
+  pub audit_received: Vec<crate::catalog::AuditReceivedMark>,
+  /// The snapshots captured as complete immutable bases (§4.15 `capture_base`, A-291; 2026-11-18; appended), by
+  /// (volume, snapshot) order.
+  pub captured_bases: Vec<CapturedBase>,
 }
 
 /// A green adopted by its takeover successor from the successor's own holder ledger of it (§4.16 owner-loss recovery;
@@ -176,6 +185,17 @@ pub struct GreenAdoption {
   pub identity: [u8; 32],
   /// Version 0's inputs manifest identity as the ledger names it; `None` for a green with no origin.
   pub origin: Option<[u8; 32]>,
+}
+
+/// A snapshot captured as a complete immutable base (§4.15 `capture_base`, A-291): every name, byte and attribute of its
+/// tree is held by the volume, none read from the host directory any more, so a clone of it needs no base directory and
+/// moves between fleet members as a plain volume does.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CapturedBase {
+  /// The volume captured.
+  pub volume: VolumeId,
+  /// Its snapshot that holds the whole tree.
+  pub snapshot: SnapshotId,
 }
 
 /// One green's checkpoint, as a snapshot carries it (W3; §4.16): the version it is the green's state at, and its
@@ -258,6 +278,17 @@ pub struct Partition {
   /// The sequence the next audit record takes (A-265): a counter of the partition's own, snapshotted, so the numbers
   /// never depend on which records are retained.
   audit_next_seq: u64,
+  /// The audit records this partition owes the control partition and has not had acknowledged, oldest first, each
+  /// carrying its crossing sequence in `seq` (A-265's crossing, made durable 2026-11-18): kept from the atom that made
+  /// it until the control partition has appended it, so a crash between the two loses none. At most
+  /// `caps.audit_records`; past it the oldest leaves, counted in `audit_dropped`, as the control partition's window
+  /// would drop it.
+  audit_outbox: std::collections::VecDeque<AuditRecord>,
+  /// The crossing sequence the next owed record takes (A-265), snapshotted: the records before it were owed already.
+  audit_outbox_next: u64,
+  /// On the control partition: for each partition that owes it records, the crossing sequence of the first it has not
+  /// appended (A-265), snapshotted, so a batch sent again appends only what is new. One entry a partition.
+  audit_received: BTreeMap<u16, u64>,
   /// The highest grant id ever issued here (A-266): the table holds live grants only, so this mark, snapshotted, is
   /// what keeps an ended grant's id from being issued again after a restart.
   grants_issued_through: u64,
@@ -268,6 +299,10 @@ pub struct Partition {
   /// Each checkpointed green's checkpoint (W3; §4.16): its version and its encoding, held in place of every increment
   /// up to that version. Counted in `green_chain_bytes` against the same cap. Removed with the green.
   green_checkpoints: BTreeMap<VolumeId, (u64, Vec<u8>)>,
+  /// The snapshots captured as complete immutable bases (§4.15 `capture_base`, A-291): a clone of one is made with no
+  /// base directory. Bounded by the snapshots (one entry a snapshot at most); an entry leaves with its snapshot or its
+  /// volume.
+  captured_bases: std::collections::BTreeSet<CapturedBase>,
   /// Each base-seeded green's origin (§4.16): its version-0 state, encoded, replayed before its
   /// chain on recovery. Counted in `green_chain_bytes` against the same cap.
   green_origins: BTreeMap<VolumeId, Vec<u8>>,
@@ -389,7 +424,11 @@ impl Partition {
       green_adoptions: BTreeMap::new(),
       green_checkpoints: BTreeMap::new(),
       audit_next_seq: 0,
+      audit_outbox: std::collections::VecDeque::new(),
+      audit_outbox_next: 0,
+      audit_received: BTreeMap::new(),
       grants_issued_through: 0,
+      captured_bases: std::collections::BTreeSet::new(),
       tombstones: BTreeMap::new(),
     }
   }
@@ -655,6 +694,32 @@ impl Partition {
   }
 
   /// Applies a work's floor or pending-submit record (A-247).
+  /// Erases volume `id`'s keys with its record (A-92; seal.md §3.1, cryptographic erase): its lineage and naming keys,
+  /// whose one wrapped copy was here, so every chunk sealed under them, on any holder, opens for no one after this; and
+  /// its tenant's key when `tenant` has no other volume on this partition (a tenant key wraps only its volumes' lineage
+  /// keys). The scan is bounded by the partition's volume cap, once per destroy or release.
+  fn erase_volume_keys(&mut self, id: VolumeId, tenant: Option<u64>) {
+    self.seal_keys.remove(&SealKeyOwner::Lineage { volume: id });
+    self.seal_keys.remove(&SealKeyOwner::Naming { volume: id });
+    if let Some(account) = tenant
+      && !self
+        .volumes()
+        .iter()
+        .any(|volume| volume.owner.tenant() == account)
+    {
+      self.seal_keys.remove(&SealKeyOwner::Tenant { account });
+    }
+  }
+
+  /// A moved volume's release (A-291): as a destroy's apply, but no tombstone, since the volume's registers are the
+  /// member's it moved to; this node's copies of its keys go with its record, its new owner holding its own.
+  fn release_volume(&mut self, id: VolumeId) -> Result<(), DbError> {
+    let tenant = self.volume(id).map(|volume| volume.owner.tenant());
+    self.remove_volume(id)?;
+    self.erase_volume_keys(id, tenant);
+    Ok(())
+  }
+
   fn apply_work_floor(&mut self, op: &Op) {
     match op {
       Op::WorkFloorSet { green, work, base } => self.set_work_floor(*green, *work, *base),
@@ -749,9 +814,27 @@ impl Partition {
       .collect()
   }
 
+  /// Whether `volume`'s `snapshot` was captured as a complete immutable base (§4.15 `capture_base`, A-291), so a clone
+  /// of it is made with no base directory.
+  pub fn is_captured(&self, volume: VolumeId, snapshot: SnapshotId) -> bool {
+    self
+      .captured_bases
+      .contains(&CapturedBase { volume, snapshot })
+  }
+
   /// A clone's lineage edge.
   pub fn lineage(&self, child: VolumeId) -> Option<&LineageEdge> {
     self.lineage.get(&child.bytes)
+  }
+
+  /// Whether a volume of this partition is a clone of `origin` (its lineage edge names it): a clone shares its origin's
+  /// records here, so the origin cannot leave this node while one stands (A-291). A scan bounded by the partition's
+  /// volume cap.
+  pub fn has_clones(&self, origin: VolumeId) -> bool {
+    self
+      .lineage
+      .iter()
+      .any(|(_, edge)| edge.origin_volume == origin)
   }
 
   /// The volume a principal holds a lease on.
@@ -1154,6 +1237,67 @@ impl Partition {
     }
   }
 
+  /// The audit records this partition owes the control partition, oldest first, each carrying its crossing sequence in
+  /// `seq` (A-265): what a batch sends, from the oldest, so a batch that was lost is in the next one.
+  pub fn audit_outbox(&self) -> impl Iterator<Item = &AuditRecord> {
+    self.audit_outbox.iter()
+  }
+
+  /// On the control partition: the crossing sequence of the first record partition `origin` owes that is not appended
+  /// here (A-265); 0 for a partition that delivered none.
+  pub fn audit_received(&self, origin: u16) -> u64 {
+    self.audit_received.get(&origin).copied().unwrap_or(0)
+  }
+
+  /// The audit crossing's three records (A-265), unconditional so a replay repeats them:
+  /// - `AuditOwed`: the record enters the outbox under the next crossing sequence; past the bound the oldest leaves,
+  ///   counted, from the caps alone, as `append_audit`'s window does.
+  /// - `AuditDelivered`: the records before `through` leave the outbox; an older acknowledgement than one already
+  ///   applied removes nothing.
+  /// - `AuditBatchAppended`: the records at or past `origin`'s mark are appended, in order, and the mark moves to the
+  ///   batch's end; a record before the mark was appended by an earlier batch and is passed over. A batch whose first
+  ///   record is past the mark appends from its first: the records between were dropped from the outbox's bound, and
+  ///   counted there.
+  fn apply_audit_crossing(&mut self, op: &Op) {
+    match op {
+      Op::AuditOwed { record } => {
+        let mut record = record.clone();
+        record.seq = self.audit_outbox_next;
+        self.audit_outbox_next = self.audit_outbox_next.saturating_add(1);
+        self.audit_outbox.push_back(record);
+        while self.audit_outbox.len() > self.caps.audit_records {
+          self.audit_outbox.pop_front();
+          self.audit_dropped = self.audit_dropped.saturating_add(1);
+        }
+      }
+      Op::AuditDelivered { through } => {
+        while self
+          .audit_outbox
+          .front()
+          .is_some_and(|record| record.seq < *through)
+        {
+          self.audit_outbox.pop_front();
+        }
+      }
+      Op::AuditBatchAppended {
+        origin,
+        first,
+        records,
+      } => {
+        let from = self.audit_received(*origin);
+        for (crossing, record) in (*first..).zip(records) {
+          if crossing >= from {
+            self.append_audit(record);
+          }
+        }
+        let count = u64::try_from(records.len()).unwrap_or(u64::MAX);
+        let end = first.saturating_add(count);
+        self.audit_received.insert(*origin, from.max(end));
+      }
+      _ => {}
+    }
+  }
+
   // ------------------------------------------------------------------ the guard
 
   /// [`Partition::check`] for a name alias (A-236) and a CLI attachment's term (A-230).
@@ -1203,6 +1347,22 @@ impl Partition {
           .ok_or(DbError::Capacity {
             table: "tombstone sequence",
           })
+      }
+      // A moved volume leaves only as a whole record (A-291): no attachment of it may be left behind to name it.
+      Op::VolumeReleased { id } => {
+        self.volume(*id).ok_or(DbError::NotFound)?;
+        let attachments = self.attachments_of(*id).len();
+        if attachments > 0 {
+          return Err(DbError::Attached {
+            attachments: u32::try_from(attachments).unwrap_or(u32::MAX),
+          });
+        }
+        Ok(())
+      }
+      // A captured base names a snapshot this partition holds (A-291).
+      Op::BaseCaptured { volume, snapshot } => {
+        self.snapshot(*volume, *snapshot).ok_or(DbError::NotFound)?;
+        Ok(())
       }
       Op::TombstoneAdopted { tombstone } => {
         if self.volume(tombstone.volume).is_some()
@@ -1403,7 +1563,11 @@ impl Partition {
         Ok(())
       }
       Op::LandingStateChanged { id, .. } => self.landing(*id).map(|_| ()).ok_or(DbError::NotFound),
-      Op::AuditAppended { .. } => Ok(()),
+      // The audit is never refused (A-265): its records are the history of what happened, kept or counted as dropped.
+      Op::AuditAppended { .. }
+      | Op::AuditOwed { .. }
+      | Op::AuditDelivered { .. }
+      | Op::AuditBatchAppended { .. } => Ok(()),
       Op::GreenAdvanced { green, increment } => {
         self.volume(*green).ok_or(DbError::NotFound)?;
         // Bounded growth (§4.16; CLAUDE.md): the chain grows per accepted version, so a new increment
@@ -1616,20 +1780,15 @@ impl Partition {
         }
         // The volume's lineage key goes with it, in the same record (A-92; seal.md §3.1, cryptographic erase): its
         // one wrapped copy was here, so every chunk sealed under it, on any holder, opens for no one after this.
-        self
-          .seal_keys
-          .remove(&SealKeyOwner::Lineage { volume: *id });
-        self.seal_keys.remove(&SealKeyOwner::Naming { volume: *id });
-        // A tenant key wraps only its volumes' lineage keys, so with the tenant's last volume on this partition it is
-        // erased too, in the same record. The scan is bounded by the partition's volume cap, once per destroy.
-        if let Some(account) = tenant
-          && !self
-            .volumes()
-            .iter()
-            .any(|volume| volume.owner.tenant() == account)
-        {
-          self.seal_keys.remove(&SealKeyOwner::Tenant { account });
-        }
+        self.erase_volume_keys(*id, tenant);
+        Ok(())
+      }
+      Op::VolumeReleased { id } => self.release_volume(*id),
+      Op::BaseCaptured { volume, snapshot } => {
+        self.captured_bases.insert(CapturedBase {
+          volume: *volume,
+          snapshot: *snapshot,
+        });
         Ok(())
       }
       // Re-adopted here (A-362): the stale record goes with what `remove_volume` takes, and nothing of a destroy's.
@@ -1669,6 +1828,10 @@ impl Partition {
           .remove(&snapshot_key(*volume, *id))
           .ok_or(DbError::NotFound)?;
         self.snapshots.remove(h)?;
+        self.captured_bases.remove(&CapturedBase {
+          volume: *volume,
+          snapshot: *id,
+        });
         Ok(())
       }
       Op::LineageAdded { edge } => {
@@ -1922,6 +2085,10 @@ impl Partition {
         self.append_audit(record);
         Ok(())
       }
+      Op::AuditOwed { .. } | Op::AuditDelivered { .. } | Op::AuditBatchAppended { .. } => {
+        self.apply_audit_crossing(op);
+        Ok(())
+      }
       Op::GreenAdvanced { green, increment } => {
         self.green_chain_bytes = self.green_chain_bytes.saturating_add(increment.len());
         self
@@ -2067,6 +2234,7 @@ impl Partition {
       }
     }
     self.lineage.remove(&id.bytes);
+    self.captured_bases.retain(|captured| captured.volume != id);
     // A destroyed green's merge chain is reclaimed with it (its increments can never be replayed for
     // a volume that no longer exists), returning its bytes to the chain budget.
     if let Some(chain) = self.green_chains.remove(&id) {
@@ -2229,6 +2397,7 @@ impl Partition {
         })
         .collect(),
       green_adoptions: self.green_adoptions.values().copied().collect(),
+      captured_bases: self.captured_bases.iter().copied().collect(),
       work_logs: self
         .work_logs
         .iter()
@@ -2245,6 +2414,16 @@ impl Partition {
       audit_next_seq: self.audit_next_seq,
       audit_dropped: self.audit_dropped,
       grants_issued_through: self.grants_issued_through,
+      audit_outbox: self.audit_outbox.iter().cloned().collect(),
+      audit_outbox_next: self.audit_outbox_next,
+      audit_received: self
+        .audit_received
+        .iter()
+        .map(|(origin, through)| crate::catalog::AuditReceivedMark {
+          origin: *origin,
+          through: *through,
+        })
+        .collect(),
       nfs_instance: self.nfs_instance,
       tombstones: self.tombstones().collect(),
       green_chains: {
@@ -2443,12 +2622,20 @@ impl Partition {
     p.audit_dropped = snapshot.audit_dropped;
     p.audit_next_seq = snapshot.audit_next_seq;
     p.grants_issued_through = snapshot.grants_issued_through;
+    p.audit_outbox = snapshot.audit_outbox.iter().cloned().collect();
+    p.audit_outbox_next = snapshot.audit_outbox_next;
+    p.audit_received = snapshot
+      .audit_received
+      .iter()
+      .map(|mark| (mark.origin, mark.through))
+      .collect();
     p.restore_merge(snapshot);
     p.restore_nfs(snapshot);
     p.restore_name_aliases(snapshot);
     p.restore_work_records(snapshot);
     p.restore_expired_attachments(snapshot);
     p.restore_consumers_and_tombstones(snapshot);
+    p.captured_bases = snapshot.captured_bases.iter().copied().collect();
     Ok(p)
   }
 
