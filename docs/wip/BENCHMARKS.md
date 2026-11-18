@@ -8645,7 +8645,9 @@ runs per row, 32 of 32 closed; the replacement answered 53 to 145 ms after the k
 is the old voter being confirmed dead and the replacement staged; a leader must not drop a voter it has not confirmed
 dead. No defect. From losing a voter to its replacement seated, the fleet has spent `f = 1`: a second failure inside
 that window cannot be survived under any membership scheme, so a flow that kills the owner after replacing a node waits
-for the seat (`wait_council_seated`, `crates/cli/tests/live_chaos.rs`). diag-live-durability-66 killed the owner inside
+for the seat (`wait_recovered`, `crates/cli/tests/live_chaos.rs`; until 2026-11-09 `wait_council_seated`, which
+judged the joint flag and voter agreement alone: those hold before the change begins, so on CI it passed before the
+replacement was seated in 20 of 22 failed runs, diag-live-durability-77 and -78). diag-live-durability-66 killed the owner inside
 it in 6 of 6 x86 runs.
 
 ### The install watch, measured: a lane's install exchange ended when its holder is lost and silent (A-200; 2026-11-08 to 2026-11-09, held)
@@ -12368,3 +12370,75 @@ both arms hit at similar rates, so slicing does not stretch a takeover. The step
 floor: hyper-swim's RFC 6298 timer starts at, and never falls below, 1 s (`INITIAL_RTO_NS`, `MINIMUM_RTO_NS`) for a
 pair judged by its timer until the pool covers it, and it doubles on expiry. It is joined by an election when the dead
 owner led the council.
+
+## A candidate's acknowledgement carries the piece it changed: what persisting live copies adds to a stable write (A-270; 2026-11-08)
+
+**Hardware:** adacachy, AMD Ryzen 9 9950X3D2 (16 cores, 32 threads), 122 GiB. **Load:** load average 42–113 on 32 threads
+(other agents' builds). Each run in one `systemd-run --user` unit capped at a quarter of the cores. **Command (the
+contract):** `SLATES_TEST_CLI=1 SLATES_TEST_MEASURE=1 <live_fleet release test binary> measure_what_live_shipping
+--nocapture`, the binary built with `cargo test --release -p slates-cli --test live_fleet --no-run` at each arm's commit.
+Arms interleaved round by round (`ab3.sh`, `ab3b.sh` in the agent's scratch):
+
+- **main** at 92dcd16c: a candidate's live copies are not in its recovery image, so its acknowledgement publishes nothing.
+- **whole** at c07d1de6 (raft-5): every acknowledgement publishes the whole held image.
+- **pieces** at eeb4a6ee (agents/raft-7): every acknowledgement publishes the held pieces it changed.
+
+Microseconds, what live shipping adds to a stable 4 KiB write at the median (live p50 less plain p50), and the live p99:
+
+| arm | runs | added at the median | live p99 |
+|---|---|---|---|
+| main | 4 | 65.3, 75.5, 71.4, 73.0 | 146.5, 197.2, 162.4, 636.3 |
+| whole | 3 | 206.7 (alone, load 86), 224.8, 220.2 | 670.4, 824.8, 776.5 |
+| pieces | 6 | 76.0, 72.7, 79.1, 71.2, 69.2, 65.3 | 275.7, 247.5, 208.5, 233.3, 199.0, 151.4 |
+
+Seven arm runs printed no figures (each of the three in the second A/B's first round at load 98–145, and main in its
+second and third), and are left out. No arm's run passed the test's own bound on writes over 50 ms at this load (3 to 5
+each), so the test reports failure after printing; the figures stand.
+
+**On raft-7's tip after B11 (2026-11-11, load 11–13, adacachy, the same command and arms: main at 29ef4521, whole at
+c07d1de6, pieces at 2c93f4c9, where the register piece carries A-251's `PersistedAcceptor`).** Every round, interleaved.
+Microseconds: added at the median; live p99.
+
+| round | main | whole | pieces |
+|---|---|---|---|
+| 1 | 70.9; 284.8 | 231.2; 900.6 | 92.9; 525.4 |
+| 2 | 99.5; 471.7 | 225.3; 774.1 | 85.5; 467.8 |
+| 3 | 90.0; 443.8 | 325.4; 1,456.1 | 92.2; 387.0 |
+| 4 | 87.5; 300.0 | 241.2; 1,123.0 | 86.0; 464.8 |
+| 5 | 88.5; 498.8 | 230.7; 800.6 | 91.6; 511.6 |
+
+Medians of the rounds: main 88.5, pieces 91.6, whole 231.2. The pieces sit inside main's own spread (70.9–99.5); the
+whole image is about 140 µs above both, and its p99 is about twice theirs.
+
+**Reading.** Persisting every acknowledged live entry costs nothing at the median that main's own spread can show: pieces
+65–79 µs against main's 65–76 µs. The whole held image cost 207–225 µs, 140 µs more, and its p99 670–825 µs. The
+pieces' p99, 151–276 µs, sits about 50 µs above main's typical 146–197 µs: the publication a candidate makes before it
+answers.
+
+## The forward lane's stall budget in its own shard's time: what a deaf session's first answer costs (A-232 C+D; 2026-11-09, loadtest-scale)
+
+`6da9670d` counts a forward batch's quiet on the lane's poll clock instead of the wall
+(`docs/bugs/2026-11-09-a-starved-origin-gave-up-its-forwards-to-a-live-owner.md`). Its driving turns last a poll pace
+(10 ms) at most, where a turn before held the session up to the batch's whole stall budget, so the session is returned
+and taken back every turn. That costs the dead-session test's first answer on the replacement session about 60 ms at
+the median. The fix is kept for what it buys: a starved origin gave up 2 to 1,208 batches to a live owner on main in 6
+of 6 runs, and none with the fix in 3 of 3 (`a_starved_origin_keeps_its_forward_to_a_live_owner`).
+
+`a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one`: 256 clients burst through b, b's session to a made
+deaf, and the first answer on the replacement timed from the drop; the bound is 1.1 s. adacachy2 (32 CPUs), load 40 to
+41, debug builds, the two binaries alternated, the test without any probe:
+
+| Pair | Before (`6da9670d~1`'s lane) | The fix |
+| --- | --- | --- |
+| 1 | 118.1 ms | 173.3 ms |
+| 2 | 75.7 ms | 151.3 ms |
+| 3 | 119.9 ms | 59.5 ms |
+| 4 | 91.9 ms | 67.8 ms |
+| 5 | 39.0 ms | 205.4 ms |
+| 6 | 71.5 ms | 132.7 ms |
+| Median | 83.8 ms | 142.0 ms |
+
+The fix was slower in 4 of the 6 pairs, and every run of both passed. The fleet suite's own run of the test at
+`2577aa61` answered 439 ms after the drop. A version of the fix that credited a pace a turn whatever the shard ran took
+1.06 to 2.21 s on adacachy2 (43 to 136 ms before, alternated at load 52 to 81) and 22.4 s on the 18-CPU Mac: it read a
+busy shard as starved (the bug record's Fix).

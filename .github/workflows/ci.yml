@@ -99,13 +99,6 @@ jobs:
           # only with a failing test, so a takeover that never completes says which daemon stopped advancing (fleet
           # tests failed on 4 of 8 runs on 2026-10-06 with no evidence beyond a timeout).
           SLATES_FLEET_TRACE: "1"
-          # The hedge test (a_slow_first_round_candidate_is_hedged_after_the_measured_p95) holds a candidate
-          # down while the hedge places the second seal, and asserts the seal placed before the hold ends. The
-          # hedge fires on the measured put p95 (tens of ms); the placement-and-observation path is ~360 ms
-          # unloaded but inflates with runner load (a 180x-overloaded runner once took 3.003 s, racing the
-          # default 3 s window). Widen the window on CI so a loaded shared runner does not false-fail; a normal
-          # local run keeps the prompt 3 s default. The hedge behaviour is unchanged (crates/server/tests/fleet.rs).
-          SLATES_TEST_HEDGE_STARVATION_SECS: "20"
           # a_restarted_daemons_first_answer_is_awaited_for_the_reconnect_budget runs an in-process daemon, whose
           # stop cannot fire the client's process-exit watch, so the client detects the restart only when the
           # successor republishes its bootstrap stamp. A loaded shared runner publishes that far slower than a dev
@@ -493,8 +486,7 @@ jobs:
       # had never been compiled for Windows — which is where §4.6's DAX suite lives, with its paired `#[cfg]`
       # arms and its `huge_page_bytes` probe that answers `None` off Linux. Cross-linted clean against
       # `x86_64-pc-windows-gnu` before being added here. **`slates-mcp` joined on 2026-10-26** with its HTTP edge on Windows
-      # (A-183); its test runs here once landing does, since `slates.land.materialize` answers `Unsupported` on Windows
-      # until then. **`slates-cluster` joined on 2026-11-05**: it was built here only as the daemon's dependency, so its
+      # (A-183); its test runs here since landing does (A-185), as "Test the MCP server". **`slates-cluster` joined on 2026-11-05**: it was built here only as the daemon's dependency, so its
       # tests and examples, which asked `rustix::param` for the page size (configured out on Windows), never compiled for
       # Windows; they ask `slates_machine::facts::Facts::page_bytes` now (`cargo xwin clippy` red before, clean after).
       # **`slates-bridge-virtiofs` joined on 2026-11-07**: the daemon builds it, but only listed crates are
@@ -539,7 +531,7 @@ jobs:
       - name: Documentation (every reference names something Windows can see)
         env:
           RUSTDOCFLAGS: -D warnings -A rustdoc::private_intra_doc_links
-        run: cargo doc -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-anchor -p slates-cli -p slates-mcp --no-deps --document-private-items
+        run: cargo doc -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-anchor -p slates-cli -p slates-mcp -p slates-land --no-deps --document-private-items
       # Run the tests whose Win32 cfg branches only a native Windows runner can exercise: the shared
       # memory (`CreateFileMappingW`); the cross-process wake (the named auto-reset Event — §4.7's
       # `WaitOnAddress`-is-process-local case, so the park/late-reply wake in `rings` goes through the
@@ -621,6 +613,29 @@ jobs:
         if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: cargo test -p slates-base
+      # Landing on Windows (§4.15, A-185): the writer over NTFS handles, the oracle, a real kill mid-landing on NTFS
+      # (T-1.15), an outsider's junction and hard-link swaps before every seam call, and real outsider saves during
+      # every kind of removal; the symbolic-link cases are Unix's (Windows makes none without a privilege).
+      - name: Test landing on Windows (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: cargo test -p slates-land --release
+      # The verb that writes: landing through a daemon, then a presentation that dies with its client. One test at a
+      # time, as the client binary is: each daemon is sized from the whole machine, and Windows charges commit when
+      # memory is made.
+      - name: Test the landing verb through a daemon, one test at a time (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: cargo test -p slates-server --test lease --test snapshot_landing --test landing_fairness -- --test-threads=1
+      - name: Test a presentation abandoned with its client (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-client --test presentation -- --test-threads=1
+      # The MCP server over a real daemon: its materialize plans a landing and never writes without a grant (R10).
+      - name: Test the MCP server (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-mcp -- --test-threads=1
       - name: Test the AFD readiness over loopback UDP (native Windows)
         if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
@@ -671,6 +686,14 @@ jobs:
         if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: cargo test -p slates-server --test give_back -- --nocapture
+      # The daemon's own unit tests, which no Windows lane ran until 2026-11-06. Two landing tests failed on both runners
+      # because Windows had no landing writer; they pass through it (A-185). One test at a time: each test daemon sizes
+      # itself from the whole machine, and Windows charges commit when memory is made, so at 4 threads the suite met the
+      # commit limit and at 32 it aborted (the oversubscription GAPS records for the client binary).
+      - name: Test the daemon's unit tests, one test at a time (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-server --lib -- --test-threads=1
       # A daemon keeps its beat through a recovery longer than a liveness window (recovery slicing): the one recovery test
       # that drives no NFS loopback or rustix, so it runs here as well as with the Unix recovery oracle.
       - name: Test a daemon's beat through a long recovery (native Windows)
@@ -700,7 +723,6 @@ jobs:
         timeout-minutes: 31
         env:
           SLATES_FLEET_TRACE: "1"
-          SLATES_TEST_HEDGE_STARVATION_SECS: "20"
           SLATES_TEST_RESTART_SLOWDOWN: "10"
           SLATES_TEST_FLEET_DEADLINE_SECS: "120"
         run: cargo run --locked -p xtask --bin each_test -- --package slates-server --test fleet --per-test-secs 240
@@ -998,11 +1020,36 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 20
         run: cargo test -p slates-client --test shards -- --test-threads=1
+      # Landing on arm64 (A-185): as on x86_64, the writer over real NTFS handles, then the verb through a daemon.
+      - name: Test landing (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: cargo test -p slates-land --release
+      - name: Test the landing verb through a daemon, one test at a time (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: cargo test -p slates-server --test lease --test snapshot_landing --test landing_fairness -- --test-threads=1
+      - name: Test a presentation abandoned with its client (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-client --test presentation -- --test-threads=1
+      - name: Test the MCP server (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-mcp -- --test-threads=1
       # A-205: as on x86_64, the pages of a deleted file leave the working set.
       - name: Test a deleted file's memory going back to the OS (native arm64 Windows)
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: cargo test -p slates-server --test give_back -- --nocapture
+      # The daemon's own unit tests, which no Windows lane ran until 2026-11-06. Two landing tests failed on both runners
+      # because Windows had no landing writer; they pass through it (A-185). One test at a time: each test daemon sizes
+      # itself from the whole machine, and Windows charges commit when memory is made, so at 4 threads the suite met the
+      # commit limit and at 32 it aborted (the oversubscription GAPS records for the client binary).
+      - name: Test the daemon's unit tests, one test at a time (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-server --lib -- --test-threads=1
       # The fleet over real loopback UDP sessions with mutual TLS (crates/server/tests/fleet.rs): formation, detection,
       # replication, takeover and serving the dead owner's bytes over the successor's NFS port. It was cfg(unix) as a
       # whole until 2026-11-06; only the virtio-fs guest test stays Unix-only. It needs the Windows datagram socket's
@@ -1026,7 +1073,6 @@ jobs:
         timeout-minutes: 31
         env:
           SLATES_FLEET_TRACE: "1"
-          SLATES_TEST_HEDGE_STARVATION_SECS: "20"
           SLATES_TEST_RESTART_SLOWDOWN: "10"
           SLATES_TEST_FLEET_DEADLINE_SECS: "120"
         run: cargo run --locked -p xtask --bin each_test -- --package slates-server --test fleet --per-test-secs 240
@@ -1620,6 +1666,19 @@ jobs:
       # leg runs on its own cluster, deleted at the end, and fails rather than skips on a kernel without TLS.
       - name: The kernel's TLS record layer and NFS client (for the export leg)
         run: sudo modprobe tls && sudo modprobe nfs && sudo modprobe nfsv4
+      # kind's nodes are privileged containers whose processes all run as the host's root, so the six nodes share root's
+      # inotify instances. Ubuntu 26.04's runner image (ubuntu26 20261101.186.1) leaves fs.inotify.max_user_instances at the
+      # kernel's 128, where 24.04's image (ubuntu24 20261101.360.1) set 1280. At 128, kube-proxy exited 1 and crash-looped on
+      # 4 of 5 workers, so a pod there could not reach the cluster's DNS and the fleet never formed (`peers_probed=0`,
+      # diag-release-13 and -14). Derived: kind's documented limits for this failure (kind's Known Issues, "Pod errors due
+      # to too many open files"), raised only, never lowered; with them 6 of 6 kube-proxies ran with 0 restarts on 26.04
+      # (diag-release-14).
+      - name: Room for the nodes' inotify instances (kind's known issue; 26.04's image keeps the kernel's 128)
+        run: |
+          set -euo pipefail
+          at_least() { now=$(sysctl -n "$1"); if [ "$now" -lt "$2" ]; then sudo sysctl -w "$1=$2"; else echo "$1 = $now"; fi; }
+          at_least fs.inotify.max_user_instances 512
+          at_least fs.inotify.max_user_watches 524288
       - name: The export leg (kubelet's nfs PersistentVolume over RPC-with-TLS)
         run: cargo xtask kind export --require-kernel-tls
       # The DAX matrix's Kubernetes socket-route cell (docs/wip/virtiofs.md §8; `xtask/src/kind_direct.rs`): a process in

@@ -9,9 +9,7 @@ pub(crate) mod fuse_map;
 #[cfg(unix)]
 pub(crate) mod guest;
 // The landing plane's fixtures drive the Unix landing (the daemon lands nothing on Windows yet).
-#[cfg(unix)]
 pub(crate) mod landing;
-#[cfg(unix)]
 pub(crate) mod lease;
 pub(crate) mod nfs;
 // The NFSv4.2 client speaks TCP alone, and the daemon serves NFS on Windows too (A-184).
@@ -19,6 +17,8 @@ pub(crate) mod nfs4;
 pub(crate) mod supervised;
 pub(crate) mod target;
 // The vhost-user front end a VMM speaks, over `guest`'s driver (Linux, where vhost-user is built).
+// One shard's thread starved of its CPU while it stays runnable, beside spinners (A-228, A-232).
+pub(crate) mod starve;
 pub(crate) mod trace;
 #[cfg(target_os = "linux")]
 pub(crate) mod vhost_front_end;

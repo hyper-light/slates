@@ -2551,6 +2551,9 @@ struct ContentWork {
   /// This round's budget ([`content_budget`]): its collection stops at the owner shard's measured hedge
   /// delay, computed from the shard's put-latency window at the moment the work is handed out.
   budget: CommitBudget,
+  /// The hedge delay this round was judged against ([`hedge_delay_ns`] of the track's window), counted with a hedge
+  /// round so the delay the owner used can be compared with the p95 it measured.
+  hedge_delay_ns: u64,
 }
 
 /// The status refusal count under which the fleet loop records a snapshot it could not archive (a
@@ -2699,6 +2702,7 @@ fn start_mirror_seal(
     SealJob {
       snapshot: head,
       sequence,
+      put_sequence: sequence,
       archiver: Some(archiver),
       archive: None,
       manifest: None,
@@ -2711,6 +2715,7 @@ fn start_mirror_seal(
       rounds: 0,
       first_round_at_ns: None,
       healing: false,
+      republish: false,
       records_acked: Vec::new(),
       shipment: None,
     },
@@ -2842,7 +2847,7 @@ fn advance_seals(
         head,
         sequence,
         created_unix,
-        false,
+        None,
       )
     {
       continue;
@@ -2865,9 +2870,12 @@ fn advance_seals(
 /// the only acknowledged holder — so the ordinary content rounds re-**offer** the archive to every candidate:
 /// a holder that lost nothing answers with an empty missing set and is put zero bytes (the Merkle identity
 /// diff finds no differing subtree), a holder that lost content is put exactly what it lacks and counts as
-/// a repair, and the placement is re-recorded. One snapshot per period, in volume-id order, wrapping: a
-/// bounded slice of the walk over everything this node has placed (§4.3 bounded work). Nothing to do while
-/// a seal for the volume is already in progress, on a laptop (nothing is placed remotely), or between steps.
+/// a repair, and the placement is re-recorded. When a holder the placement names is no longer a member (or none
+/// named is remote), the heal **replaces** it instead ([`HEAL_NAMED_GONE`]): the content is put on the current cohort
+/// at the next sequence and, once recorded, the head is republished there ([`republish_head`]), since a head is never
+/// rewritten at its sequence. One snapshot per period, in volume-id order, wrapping: a bounded slice of the walk over
+/// everything this node has placed (§4.3 bounded work). Nothing to do while a seal for the volume is already in
+/// progress, on a laptop (nothing is placed remotely), or between steps.
 fn heal_one_placed_snapshot(state: &mut ShardState, local: HostId, created_unix: u64) {
   let now = state.clock.monotonic_ns();
   if state
@@ -2898,20 +2906,37 @@ fn heal_one_placed_snapshot(state: &mut ShardState, local: HostId, created_unix:
         return None;
       }
       let snapshot = state.db.partition().snapshot(*id, record.head)?;
-      matches!(snapshot.placed, PlacementState::Placed { .. }).then_some((
+      let PlacementState::Placed { region, .. } = &snapshot.placed else {
+        return None;
+      };
+      Some((
         *id,
         *handle,
         object,
         record.head,
         record.epoch,
+        region.clone(),
       ))
     });
   state.healer.last_step_ns = Some(now);
-  let Some((id, handle, object, head, sequence)) = candidate else {
+  let Some((id, handle, object, head, sequence, region)) = candidate else {
     state.healer.after = None;
     return;
   };
   state.healer.after = Some(id);
+  // A holder the shipped head names that is no longer a member can never be re-offered to, and the head names it until
+  // it is republished: the heal replaces it. So does a head naming no remote holder at all.
+  let members = &state.council.configuration().members;
+  let named_gone = region
+    .iter()
+    .any(|host| HostId(*host) != local && !members.contains(&HostId(*host)));
+  let named_remote = region.iter().any(|host| HostId(*host) != local);
+  let heal = if named_gone || !named_remote {
+    state.count(HEAL_NAMED_GONE, 1);
+    Heal::Replace
+  } else {
+    Heal::Reoffer
+  };
   start_seal(
     state,
     local,
@@ -2920,9 +2945,33 @@ fn heal_one_placed_snapshot(state: &mut ShardState, local: HostId, created_unix:
     head,
     sequence,
     created_unix,
-    true,
+    Some(heal),
   );
 }
+
+/// What a healing job does ([`heal_one_placed_snapshot`]).
+enum Heal {
+  /// Re-offer the content to the current candidates at the head's sequence: the head stays as it is.
+  Reoffer,
+  /// Place on the current cohort at the next sequence and republish the head there naming it.
+  Replace,
+}
+
+/// The status count under which the healer records a heal that ran the membership horizon without placing and
+/// recording its content (every put refused, or no candidate reachable): the job is dropped and the volume healed again
+/// on a later step, so one stuck heal never leaves the healer skipping the volume.
+/// Format: a refusal name in the daemon's status report.
+const HEAL_UNFINISHED: &str = "fleet.heal.unfinished";
+
+/// The status count under which the healer records a head republished at the next sequence to name the holders that
+/// hold its content. Format: a refusal name in the daemon's status report.
+const HEAL_REPUBLISHED: &str = "fleet.heal.republished";
+
+/// The status count under which the healer records a step that found a holder the shipped head names no longer a
+/// member (or no remote holder named at all): a re-offer cannot reach that holder, so the job places on the current
+/// cohort and republishes the head.
+/// Format: a refusal name in the daemon's status report.
+const HEAL_NAMED_GONE: &str = "fleet.heal.named_gone";
 
 /// The head snapshot of `id` that still needs sealing — its id and the head sequence — or `None` when the
 /// volume has no snapshot yet, or its head is already recorded placed (a finished seal is dropped). A seal in
@@ -2983,8 +3032,19 @@ fn start_seal(
   head: DbSnapshotId,
   sequence: u64,
   created_unix: u64,
-  healing: bool,
+  healing: Option<Heal>,
 ) -> bool {
+  // A heal that republishes the head puts its content at the next sequence, ahead of every holder's records, since a
+  // holder refuses a put at the head's own sequence that the head there does not name it for.
+  let put_sequence = if matches!(healing, Some(Heal::Replace)) {
+    let Some(next) = sequence.checked_add(1) else {
+      state.count(VOLUME_EPOCH_EXHAUSTED, 1);
+      return false;
+    };
+    next
+  } else {
+    sequence
+  };
   let Ok(slot) = state.volumes.get(handle) else {
     return false;
   };
@@ -3013,13 +3073,15 @@ fn start_seal(
     SealJob {
       snapshot: head,
       sequence,
+      put_sequence,
       archiver: Some(archiver),
       archive: None,
       manifest: None,
       content,
       rounds: 0,
       first_round_at_ns: None,
-      healing,
+      healing: healing.is_some(),
+      republish: matches!(healing, Some(Heal::Replace)),
       records_acked: Vec::new(),
       shipment: None,
     },
@@ -3143,6 +3205,14 @@ impl LatencyWindow {
   /// Whether no acknowledgement has been timed yet.
   pub fn is_empty(&self) -> bool {
     self.readings_ns.is_empty()
+  }
+
+  /// The smallest and largest reading the window holds, or none while it is empty: any percentile of it lies between.
+  pub fn range_ns(&self) -> Option<(u64, u64)> {
+    Some((
+      *self.readings_ns.iter().min()?,
+      *self.readings_ns.iter().max()?,
+    ))
   }
 
   /// The p95 of the window's readings (nearest rank, the machine crate's percentile law), or `None`
@@ -3300,9 +3370,26 @@ fn content_work(
       (hedge, content_budget_at(hedge, round))
     }
   };
-  let now = state.clock.monotonic_ns();
+  // The clock the first round's dispatch was stamped on (`put_seal_content`). Until 2026-11-08 this read the machine's
+  // boot clock against that shard-driver stamp, so the difference was the machine's uptime and every seal hedged at its
+  // next look, whatever the measured p95 said.
+  let now = futures::now_ns();
   let shard = state.shard;
   let job = seal_jobs(state, track).get_mut(&object)?;
+  // Every heal is bounded by the membership horizon from its first round, judged between rounds (its archive home), so
+  // no round in flight loses its job. A heal past it ends unfinished and is counted: the job is dropped, so a later
+  // healer step comes back to the volume rather than skipping it while a job that cannot finish stays open (a replace
+  // whose every put was refused stayed open for good, 2026-11-09).
+  let overdue = job.healing
+    && job.archive.is_some()
+    && job
+      .first_round_at_ns
+      .is_some_and(|first| now.saturating_sub(first) > crate::lease::horizon_ns());
+  if overdue {
+    seal_jobs(state, track).remove(&object);
+    state.count(HEAL_UNFINISHED, 1);
+    return None;
+  }
   if job.content.placed(quorum) {
     return None;
   }
@@ -3317,7 +3404,7 @@ fn content_work(
     shard,
     object,
     snapshot: job.snapshot,
-    sequence: job.sequence,
+    sequence: job.put_sequence,
     archive,
     candidates: job.content.candidates.clone(),
     acked: job.content.acked.clone(),
@@ -3325,7 +3412,25 @@ fn content_work(
     round: job.rounds,
     hedged,
     budget,
+    hedge_delay_ns: hedge_delay,
   })
+}
+
+/// Counter: a seal's content round sent to the remaining candidates, its first round outstanding past the measured hedge
+/// delay with no placement ([`hedge_delay_ns`], on the owner shard's clock).
+const SEAL_HEDGED: &str = "fleet.seal.hedged";
+/// Counter: the sum of the hedge delays the [`SEAL_HEDGED`] rounds were held for, nanoseconds; divided by their count,
+/// the delay the owner used, which the design makes its measured p95 put latency.
+const SEAL_HEDGE_DELAY_NS: &str = "fleet.seal.hedge_delay_ns";
+
+/// Counts a content round that hedges to `targets`, with the delay it was held for.
+fn count_hedge_round(hedged: bool, targets: &[HostId], delay_ns: u64) {
+  if hedged && !targets.is_empty() {
+    state::with_state(|s| {
+      s.count(SEAL_HEDGED, 1);
+      s.count(SEAL_HEDGE_DELAY_NS, delay_ns);
+    });
+  }
 }
 
 /// The holders one content round goes to (§4.8 mechanism 1: "content is sent to `f + 1` candidates first,
@@ -3369,6 +3474,7 @@ async fn put_seal_content(origin: u16, local: HostId, work: ContentWork) -> Opti
     .filter(|host| *host != local && !work.acked.contains(host))
     .collect();
   let targets = hedge_targets(work.hedged, remote, hedge);
+  count_hedge_round(work.hedged, &targets, work.hedge_delay_ns);
   let holders = take_sessions("fleet.lent_to.put_seal_content", |host| {
     targets.contains(&host)
   });
@@ -3506,7 +3612,7 @@ async fn put_seal_content(origin: u16, local: HostId, work: ContentWork) -> Opti
 fn record_placed_seals(state: &mut ShardState) {
   let quorum = state.fleet.configuration().quorum;
   let now = state.clock.monotonic_ns();
-  let done: Vec<(ObjectId, DbSnapshotId, [u8; 32], Vec<u64>)> = state
+  let done: Vec<PlacedSeal> = state
     .seals
     .iter()
     .filter_map(|(object, job)| {
@@ -3519,10 +3625,23 @@ fn record_placed_seals(state: &mut ShardState) {
         return None;
       }
       let region = job.content.acked.iter().map(|host| host.0).collect();
-      Some((*object, job.snapshot, identity, region))
+      Some(PlacedSeal {
+        object: *object,
+        snapshot: job.snapshot,
+        identity,
+        region,
+        republish: job.republish.then_some(job.put_sequence),
+      })
     })
     .collect();
-  for (object, snapshot, identity, region) in done {
+  for PlacedSeal {
+    object,
+    snapshot,
+    identity,
+    region,
+    republish,
+  } in done
+  {
     let volume = DbVolumeId { bytes: object.0 };
     // A mirror placement already recorded is kept: a home seal that completes again for a mirrored snapshot (the
     // healer's re-offer) wrote `mirror: None` over it until 2026-10-09, which started a second mirror job for the
@@ -3552,14 +3671,69 @@ fn record_placed_seals(state: &mut ShardState) {
         placed: PlacementState::Placed { region, mirror },
       },
     ];
-    for op in &ops {
-      if state.db.mutate(&mut state.segment, op, now).is_err() {
-        break; // The snapshot is gone (destroyed meanwhile): nothing to record; the seal is dropped.
-      }
+    let recorded = ops
+      .iter()
+      .all(|op| state.db.mutate(&mut state.segment, op, now).is_ok());
+    // The snapshot gone (destroyed meanwhile) records nothing, and the seal is dropped.
+    if recorded && let Some(epoch) = republish {
+      republish_head(state, volume, snapshot, epoch, now);
     }
     state.seals.remove(&object);
   }
 }
+
+/// A seal whose content and head have both placed, as [`record_placed_seals`] records it.
+struct PlacedSeal {
+  object: ObjectId,
+  snapshot: DbSnapshotId,
+  identity: [u8; 32],
+  region: Vec<u64>,
+  /// The heal placed on holders other than the ones the shipped head names, at this sequence: the head is republished
+  /// there.
+  republish: Option<u64>,
+}
+
+/// Republishes `volume`'s head at the next sequence, after a heal recorded its content on holders other than the ones
+/// the shipped head names (§4.10 "the healer"): the volume's epoch, which is the head's sequence, advances with the same
+/// head snapshot ([`Op::VolumeHeadAdvanced`], as a lost head's advance does), so the next period ships a head naming the
+/// set the snapshot's placement now records. Never a new value at the old position: a holder refuses that, rightly.
+/// Recorded first, then advanced, so the new head never names a holder before it holds the content. The advance is to
+/// `epoch`, the sequence the heal put the content at, so the holders that took it ahead of their records find the new
+/// head naming them. Nothing else moves: the snapshot, its manifest and the volume's publications are unchanged.
+/// Counted [`HEAL_REPUBLISHED`], or [`HEAL_REPUBLISH_REFUSED`] when the database refuses the advance.
+fn republish_head(
+  state: &mut ShardState,
+  volume: DbVolumeId,
+  snapshot: DbSnapshotId,
+  epoch: u64,
+  now: u64,
+) {
+  let Some(record) = state.db.partition().volume(volume) else {
+    return;
+  };
+  if record.head != snapshot || record.epoch.checked_add(1) != Some(epoch) {
+    return; // A newer head took the volume meanwhile: its own seal names its holders.
+  }
+  let advance = Op::VolumeHeadAdvanced {
+    id: volume,
+    head: snapshot,
+    epoch,
+  };
+  match state.db.mutate(&mut state.segment, &advance, now) {
+    Ok(_) => state.count(HEAL_REPUBLISHED, 1),
+    Err(_) => state.count(HEAL_REPUBLISH_REFUSED, 1),
+  }
+}
+
+/// The status count under which the healer records a republish the database refused: the placement records the new
+/// holders but the shipped head keeps naming the ones it named until the volume's next seal advances it, so an operator
+/// sees the count. Format: a refusal name in the daemon's status report.
+const HEAL_REPUBLISH_REFUSED: &str = "fleet.heal.republish_refused";
+
+/// The status count under which the healer records a heal that needed to republish a head whose sequence is already the
+/// largest value, so no sequence can follow it to put the content at: the head keeps naming the holders it named.
+/// Format: a refusal name in the daemon's status report.
+const VOLUME_EPOCH_EXHAUSTED: &str = "fleet.heal.epoch_exhausted";
 
 /// The status refusal count under which the fleet loop records a taken-over volume it could not
 /// materialize (an archive it could not hold, a name already taken locally, admission refused): the
@@ -8531,6 +8705,80 @@ mod tests {
       LearnedOutcome::Restarted { old: seed },
       "first contact retires the non-voting manifest placeholder"
     );
+  }
+
+  /// A seal job for [`the_hedge_waits_out_its_delay_on_the_clock_its_first_round_was_stamped_on`]: its first round
+  /// outstanding since `first_round_at_ns`, nothing acknowledged, its archive ready for a hedge.
+  fn outstanding_seal(candidates: Vec<HostId>, first_round_at_ns: u64) -> crate::head::SealJob {
+    crate::head::SealJob {
+      snapshot: DbSnapshotId::default(),
+      sequence: 1,
+      // A seal, not a heal: its content is put at its own sequence and no head is republished (A-276).
+      put_sequence: 1,
+      archiver: None,
+      archive: Some(slates_archive::Archive {
+        base_page_size: 4096,
+        chunk_min: 4096,
+        chunk_max: 4096,
+        created_unix: 0,
+        volume_id: 0,
+        snapshot_id: 0,
+        name_policy_id: 0,
+        unicode_version: 0,
+        root_meta: slates_archive::NodeMeta::default(),
+        manifest: slates_archive::Node::Directory(Vec::new()),
+        chunks: Vec::new(),
+      }),
+      manifest: None,
+      content: Placement {
+        candidates,
+        acked: Vec::new(),
+        mirror_acked: None,
+        joint: Vec::new(),
+      },
+      rounds: 0,
+      first_round_at_ns: Some(first_round_at_ns),
+      healing: false,
+      republish: false,
+      records_acked: Vec::new(),
+      shipment: None,
+    }
+  }
+
+  /// §4.8 "hedged to the remaining candidates after the measured p95 put latency". Do: on a real shard, a seal whose
+  /// first round was stamped on the shard's dispatch clock just now, with no acknowledgement; judge it with a measured
+  /// p95 of ten seconds, then of one nanosecond. Expect: inside the delay no content round is handed out, so a seal
+  /// that places within it never sends a third copy; past the delay the round is a hedge. Before 2026-11-08 the first
+  /// was judged on the machine's boot clock against the dispatch stamp, the difference was the machine's uptime, and
+  /// every seal hedged at its next look (found by making the delay thirty seconds and seeing the hedge test still pass).
+  #[test]
+  fn the_hedge_waits_out_its_delay_on_the_clock_its_first_round_was_stamped_on() {
+    let (inside, past) = crate::daemon::audit_on_shard(|state| {
+      let object = ObjectId([9; 16]);
+      let quorum = state.fleet.configuration().quorum;
+      let candidates = vec![HostId(1), HostId(2), HostId(3)];
+      let stamped = futures::now_ns();
+      for _ in 0..PUT_LATENCY_WINDOW {
+        state.put_latency.record(10_000 * MS);
+      }
+      state
+        .seals
+        .insert(object, outstanding_seal(candidates.clone(), stamped));
+      let inside = content_work(state, Track::Home, object, quorum, consensus_budget(None))
+        .map(|work| work.hedged);
+      state.put_latency = LatencyWindow::default();
+      for _ in 0..PUT_LATENCY_WINDOW {
+        state.put_latency.record(1);
+      }
+      while futures::now_ns() <= stamped.saturating_add(1) {
+        std::hint::spin_loop();
+      }
+      let past = content_work(state, Track::Home, object, quorum, consensus_budget(None))
+        .map(|work| work.hedged);
+      (inside, past)
+    });
+    assert_eq!(inside, None, "inside the measured delay no round goes out");
+    assert_eq!(past, Some(true), "past the delay the round is a hedge");
   }
 
   /// The hedge delay follows the design's law, by use: one period before any reading (the first seal of a

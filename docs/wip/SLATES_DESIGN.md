@@ -5516,6 +5516,14 @@ context. A name is not a host pathname or a bearer capability. Fleet-wide enumer
 owners, each answer linearizable at its owner and the whole labelled with the configuration
 version.
 
+> **Status (2026-11-08, the location budget).** A forward that does not know its volume's owner repeats the read-only
+> location round for one liveness budget, counted in its own polls at the fleet's poll interval (`verbs::LOCATION_POLLS`),
+> not on the wall: a starved control shard polls late rather than running out of time, so a false death is no longer
+> refused for the machine's load. One round can itself wait a liveness budget for peers that do not answer, so the
+> operator's failover SLO caps the whole. A client of a genuinely stuck owner therefore waits up to that SLO (10 s by
+> default), where it was refused after about 1 s: measured with the peers stopped, 9 polls ended by the 10 s ceiling. A
+> refusal before a takeover can finish would be a false one, and the SLO is the stated bound for that takeover.
+
 > **Status (2026-11-06, A-236: a clone's name at its name's partition).** Within a daemon a name routes by its hash to
 > one partition (`owner_of_name`), where it is looked up and where its uniqueness is decided. A clone lives beside its
 > origin, for copy-on-write, so when its name hashes elsewhere, the name's partition holds an alias pointing at the
@@ -5741,7 +5749,8 @@ window is the mirror lag at that moment, zero for every operation that awaited t
 > owner shard spent about 1,800 of 2,241 samples doing it. A partition now snapshots once the log since its last
 > snapshot has taken the recovery budget's worth of replay work and is at least that snapshot's size
 > (`replay::snapshot_due`). The work is timed on each commit's append and apply, the work a replay repeats per record,
-> and never extrapolated from one stretch of log to the next, whose records may differ in size. So snapshot work stays
+> and never extrapolated from one stretch of log to the next, whose records may differ in size. It is timed on the
+> wall: the committing thread's CPU time was measured and rejected on 2026-11-09 (A-243's amendment below). So snapshot work stays
 > within about twice the log it absorbs, whatever the partition's size, and `slates status` shows each shard's
 > snapshots, their bytes and longest duration, the log appended, the tail's bytes and measured work, the budget and
 > the floor.
@@ -6028,7 +6037,14 @@ a reader's fetch stages the same way, one chunk per exchange, and resumes from w
 each holder's offer and transfer progress independently, with no wait on the slowest offer;
 anti-entropy walks Merkle manifests between recorded holders and repairs only differing
 subtrees; the healer replays puts that never reached f+1 from the owner's `put_wal`, and puts a
-repeatedly late candidate on probation for the group to replace. Cold sealed content (a
+repeatedly late candidate on probation for the group to replace. A head is never rewritten at its
+sequence, so when a holder the head names has left the fleet the healer places the content on the
+current cohort at the **next** sequence and, once that placement is recorded, republishes the same
+head snapshot at exactly that sequence naming the new holders (A-276). The next sequence is what
+lets the put through: a holder whose newest head at a sequence does not name it refuses a put there,
+and admits one ahead of every record it holds (`content_retention::admits`). Every heal is bounded by
+the membership horizon from its first round; one that has not placed by then ends, counted, and the
+volume is healed again on a later step. Cold sealed content (a
 measured class by read rate, Phase 8) may be held as k+m fragments across k+m candidates instead
 of f+1 copies, with hedged fragment fetches on read; the class boundary, (k, m) and the
 reconstruction budget are derived, never fixed (D-O6).
@@ -6294,6 +6310,25 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > (`LiveVolume::kept`) and ships whole once that reaches the volume's size (`kept_reaches_size`): the entry that crosses
 > it still fits, since no publication is larger than the volume. After: 768 writes answered, 4 whole records, no
 > refusal for the bound.
+>
+> **A candidate's copy survives its own restart (2026-11-06).** A candidate's copies of live logs were not in its shard's
+> recovery image, and it acknowledged an entry before anything was published: after a warm restart (its anchor kept) it
+> held nothing it had acknowledged (`a_candidates_copy_survives_its_own_daemons_restart`, red first: head 4 before, none
+> after). Now each copy, with its owner, fence and head, rides the held image (`live_ship::HeldLive` in
+> `content_holder::HeldImage`), and an entry, an install or a fetch is answered only once the publication carrying it
+> commits (`live_ship::acknowledged`), as content and register holders answer; a warm restart holds it again
+> (`restore_copies`). The cost is that publication on each acknowledgement, and the held image is rebuilt whole at each
+> one, so it grows with what a candidate keeps (up to the volume's size of changes since the last whole entry). An
+> earlier form of this change also shipped a whole entry once the changes since the last were as large as it, which kept
+> that small (193–196 µs added at the median, p99 513–715 µs, at load 58–107); it is withdrawn, since the install image
+> kept beside the log (live-durability) means a whole entry on the log is shipped only at the holder's bound.
+>
+> **The held image is incremental (2026-11-08, A-270).** What a shard holds for other owners is now keyed pieces: the
+> content hold and the mirror records one piece each, one per held register, and of each live copy a head piece and one
+> piece per entry, keyed by slot. A delta carries the pieces put and the keys removed since the last publication, so an
+> acknowledgement's publication carries the entry it added. Persisting every acknowledged live entry now adds nothing
+> that main's own spread can show at the median: 65–79 µs, against main's 65–76 µs and the whole image's 207–225 µs
+> (BENCHMARKS). Still carried whole when changed: the content hold's image and the mirror records.
 >
 > **One lane a holder, only to holders of the catalog, and no session left with a cancelled request (2026-11-07).**
 > The dispatch round (`live_ship::dispatch`, `send_from_control`) now ships the way the record plane's sessions allow.
@@ -7657,6 +7692,20 @@ stays in the overlay.
 > tree removed), and a resumed landing's recognition of its own finished work (a directory
 > holding only what the manifest creates beneath it; a rename whose destination holds the
 > witnessed directory), so the re-run is idempotent for directories as it is for files.
+
+> **Status (2026-10-26, A-185: landing on Windows).** The landing writer runs on Windows: `crates/land/src/os_windows.rs`
+> has the Unix seam's surface, so the engine, the server's wiring (`crates/server/src/landing.rs`, no longer gated on
+> Unix) and the oracle run unchanged over it. Each verb is relative to a handle the base host holds: creates by
+> `NtCreateFile` with `FILE_CREATE`, the rename that never replaces by `NtSetInformationFile(FileRenameInformationEx)`
+> with POSIX semantics, removals by `FileDispositionInfoEx` with POSIX semantics, a batch's barrier as each file's
+> `FlushFileBuffers` on ⌈√n⌉ threads, a directory's sync through the directory opened again to write. NTFS has no
+> atomic exchange, so the engine moves the old entry aside, as on the other unixes. The target is walked from its
+> drive's root one component at a time, refusing a link or a junction, and must be owned by this token's user or its
+> default owner (A-185). Not built: a
+> symbolic link, which Windows makes only with a privilege slates never asks for (R10), so such an entry fails,
+> typed. Proven on jupiter (Windows 10.0.26200): the land suite whole, among it the real kill test (T-1.15) on NTFS,
+> the escape oracle with junction and hard-link swaps at every seam call, and the removal oracle with real outsider
+> saves.
 
 > **Status (2026-09-29, A-47, AUD-29-03).** One host target has one landing lease, whichever shard owns
 > the landing volume and whichever spelling names the target. Before, each owner shard kept its own lease
@@ -12145,7 +12194,10 @@ group first).
 ### A-94 — Every mount of a volume is nosuid and nodev (2026-10-05)
 Applied in the same change to: `crates/cli/src/mount.rs`, `crates/cli/examples/slates_mount.rs`,
 `crates/bridge-oci/src/binding.rs`, `xtask/src/kind_export.rs`, `docs/deploy.md`, the tests named in
-`docs/bugs/2026-10-05-setuid-through-a-shared-volume.md`, GAPS.
+`docs/bugs/2026-10-05-setuid-through-a-shared-volume.md`, GAPS; and on 2026-11-09 to `docs/cli.md` (the guest's
+virtio-fs mount, documented as `-o dax=always` alone until then, now `dax=always,nosuid,nodev`), the guest probe's own
+mount of the tag (`crates/guest-probe/src/guest.rs`, `mount_tag`), and
+`a_setuid_program_planted_on_the_volume_runs_without_privilege_in_a_guest` (`crates/cli/tests/guest_vhost.rs`).
 Status: built 2026-10-05 (condition 4).
 - What: a volume is shared between writers and readers, so no mount of it may honour a setuid or setgid bit or open a
   device node. `slates mount` asks for both flags whoever runs it (macOS `MNT_NOSUID | MNT_NODEV`; Linux FUSE was
@@ -15519,6 +15571,31 @@ Applied in the same change to:
 - **Owed.**
   - The snapshot runs whole on the committing shard's turn (an 8 MiB encode stalls it; `longest_ns` names it).
   - An incremental snapshot for partitions far past the budget.
+- **Measured and rejected 2026-11-09: the work charged in the committing thread's CPU time (the supervisor's question to
+  raft, from loadtest-scale's cadence work). The trigger stays on the wall; closed with no change.**
+  - *The argument for it.* The rule charges a commit what a replay repeats of it, its append's encode, checksum and
+    copy and its apply, "never on a wait". Preemption is a wait inside those spans that a replay never repeats, so
+    CPU time looked the faithful measure: the wall charged a preempted commit its wait, and so would bring the trigger
+    early exactly when the machine was busiest.
+  - *Measured* (adacachy, 2026-11-09, release builds, the two triggers interleaved; command:
+    `cargo test --release -p slates-db --test snapshot_cadence measure_snapshots_per_thousand_records -- --ignored
+    --exact --nocapture` on each arm). Snapshots per 200,000 small records with a 10 ms budget:
+
+    | phase (load) | wall (main) | thread CPU time |
+    |---|---|---|
+    | quiet (123–125) | 4, 4, 5 | 5, 5, 5 |
+    | 24 busy loops in the unit (125–143) | 7, 6, 7 | 10, 8, 10 |
+
+    The CPU-time trigger snapshots more often than the wall, and more so under load, the opposite of the argument. Two
+    causes. A thread CPU clock read is a system call on Linux where the wall's is a vDSO read, and part of each read
+    lands inside the span it times, so a record of about a microsecond is charged its own clock reads, more under load.
+    And a contended record burns more CPU (shared cores, cache pressure, lower clocks), which a quiet replay would not
+    repeat either. The reads also add two system calls to every commit. A calibrated subtraction of the read's cost
+    would be a second correction on a measure already worse, so it was not tried.
+  - *What failed instead.* `snapshot_cadence.rs`'s longest-tail test failed on a Mac (3 of 6 at load 69–112, and in
+    B10's Mac gate at load 62–78) because its approach predicted the next record from the last, which a preempted
+    record inflated. loadtest-scale's fix (predicting from the largest record seen) addressed it. On adacachy both
+    triggers passed that test 6 of 6 under 24 busy loops at load 32–72.
 
 ### A-274 — The receive worker posts an open's confirmation and goes on; the journal keeps the open's response, settled, until the confirmation is applied (accepted and built 2026-11-09, audit step 7 cut (c), the supervisor's order; amends A-198)
 
@@ -15688,6 +15765,67 @@ Applied in the same change to:
 - **Owed.** A page still counts a holder's empty answer as its promise even when the holder leaves out a copy it
   holds. With routing restored a restart no longer does this, but the rule belongs in phase one, for the takeover's
   owner (the bug record's siblings).
+
+### A-270 — What a shard holds for other owners is keyed pieces, and a delta carries only those that changed (accepted and built 2026-11-08, the supervisor's checkpoint_log rules for raft-5's incremental held image)
+
+Applied in the same change to:
+- §4.8 A-200's status: the note on a candidate's copy surviving its own restart.
+- GAPS: the 2026-11-08 entry; BENCHMARKS: the three-arm measurement.
+- `crates/vfs`:
+  - `recover.rs`: `HeldPiece`, `HELD_PIECE_KEY_BYTES`, `ShardImage.held` as pieces, `IMAGE_VERSION` 25 → 26, and
+    `read_header`.
+  - `checkpoint_log.rs`: `ShardDelta.held_put` and `held_removed`, folded by `apply` as the call records are, and
+    `DELTA_VERSION` 8 → 9.
+  - `error.rs`: `VfsError::RecoveryVersion { found, expected }`.
+- `crates/server`:
+  - `tracked.rs` (new): `Tracked`, a map that marks every key reached mutably since its owner last published, and
+    `slates_db::takeover::AcceptorStore` for it (A-251's by-name answer reaches held acceptors through `get_mut`).
+  - `content_holder.rs`: `held_image`, `held_changes`, `held_committed`, `split_held` and `HeldRefused`. A held
+    register's piece carries A-251's `HeldRegister { object, acceptor: PersistedAcceptor }` (`Acceptor::to_persisted`,
+    restored with `from_persisted`), its moved-from owner included, so a move rides the next delta like any change.
+  - `live_ship.rs`: `Held.first` and its slots, and `LiveState.slot_floor`.
+  - `state.rs`: `holder_records` and `live.held` tracked, and `published_held`.
+  - `verbs.rs`: the checkpoint and delta paths, `read_journal`, and `committed_held_agrees`.
+- The tests:
+  - `a_holders_publication_carries_the_record_it_acknowledges_not_everything_it_holds` (`crates/server/tests/recovery.rs`,
+    failing first).
+  - `folding_every_held_delta_over_its_checkpoint_gives_what_the_shard_holds` (`crates/server/src/daemon.rs`).
+  - `a_copy_moved_after_the_checkpoint_is_restored_from_its_delta_and_still_listed` (`crates/server/src/daemon.rs`):
+    A-251's moved case reaching the journal only in a delta. Red with the piece writing `moved_from: None`, and with
+    `Tracked::get_mut` left unmarked.
+  - From `crates/vfs/tests/checkpoint_log.rs`: the journal model with held pieces,
+    `an_image_of_another_version_is_refused_by_its_version`, `a_delta_of_another_version_is_refused_not_read_as_torn`
+    and `a_crash_at_every_byte_of_a_held_delta_recovers_the_old_pieces_or_the_new`.
+- **What was there.** Every delta carried the shard's held image whole. It was rebuilt from everything held: the
+  content hold, every register and every live copy with all its entries. Then it was compared byte for byte with the
+  last one published. So a holder's acknowledgement cost work proportional to everything it held: across 64 held
+  records a delta's held bytes grew from 2,224 to 55,216, and a live write cost 207–225 µs at the median. Its own
+  size also forced a full checkpoint every other publication.
+- **The rule.**
+  1. What a shard holds for others is keyed pieces: a kind byte, an object id and a position. vfs never reads them.
+  2. A checkpoint carries every piece. A delta carries the pieces put and the keys removed since the last committed
+     publication, never one key both, and recovery folds them in order over the checkpoint.
+  3. A piece is found changed structurally. Held registers and live copies sit in maps that mark every key reached
+     mutably, so no call site can forget to. The content hold and the mirror records are compared by their bytes.
+  4. A live copy's entries are numbered by slot. They are only pushed after the last or all cleared, and a copy made
+     again starts at or above every slot a committed publication carried, so a slot never names two entries.
+  5. Another build's image or CRC-valid delta frame is refused `RecoveryVersion` by the version it carries, before
+     anything after it is decoded. It is never read under this layout, and never taken for a torn frame, which would
+     recover the checkpoint without the acknowledged deltas after it.
+- **Measured** (adacachy, 2026-11-08, and again 2026-11-11 on the tip after B11). The failing test's late median dropped
+  from 55,216 bytes to one record's. At load 11–13, five rounds interleaved: what live shipping adds to a stable write
+  at the median, pieces 85.5–92.9 µs (median 91.6), main 70.9–99.5 µs (88.5), the whole image 225.3–325.4 µs (231.2)
+  (BENCHMARKS).
+  Interleaved at load 42–113, live shipping adds 65–79 µs to a stable write at the median with pieces, 65–76 µs on main
+  (which persists no live copy) and 207–225 µs with the whole image (BENCHMARKS).
+- **Red-checks.** The generated-history oracle fails with `get_mut` left unmarked, and with a copy made again at slot 0.
+  A crash after any byte of any write of a held delta recovers the old pieces until the journal's last write is whole.
+- **Owed.**
+  - The content hold and the mirror records are still re-encoded and compared at each publication: work proportional
+    to what they hold, though carried only when they change.
+  - `a_candidates_restored_copy_serves_its_owners_takeover` stays ignored. Since main's per-host principals, a survivor
+    refuses the taken-over volume's reads `NotShared`. It fails the same with and without this change (reported to
+    the supervisor).
 
 ### A-238 — A green's durable chain is checkpointed at its reachable floor, and a base below the checkpoint is unknown (accepted and built 2026-11-06, W3 of the load test's walls)
 
@@ -17718,6 +17856,14 @@ readied before its fill; the page size from `slates-machine`, so no `rustix`), `
   `crates/base/src/windows.rs`, with `crates/base/tests/host.rs`
   `a_files_times_are_unix_nanoseconds_and_an_in_place_edit_moves_them`, which failed on jupiter before the fix and runs
   on every host.
+- **The last check, closed with A-185 (2026-10-26).** The step asked for a write through another slates attachment
+  to show in a mapping after the compare-back's refill. Within a volume such a write reaches every map by write-through
+  before it returns (tested). Across volumes it reaches the disk only by a landing, and a landing places a new file
+  rather than writing in place, so an existing map keeps the replaced file as POSIX does; Ada chose to prove the fresh
+  map: `a_write_through_another_attachment_landed_on_the_disk_reaches_a_fresh_map` lands overlay B onto the directory
+  overlay A maps, A's old node answers `ESTALE` and keeps the old bytes, and A's name, looked up again, maps the landed
+  bytes. The refill itself is proven by an in-place edit (`a_section_of_an_untouched_base_file_is_refilled_with_an_
+  outsiders_edit`). Built for it: landing on Windows (A-185).
 - **Rejected: the pipe's name, as the goal stated it** (above: it lets an asker hold the shard). **Rejected: the
   daemon keeping a duplicate of the client end as the reference.** Any handle keeps the pipe's client open, so the
   stream would never end when its VM did.
@@ -17749,6 +17895,72 @@ readied before its fill; the page size from `slates-machine`, so no `rustix`), `
     592 to 837 µs (the descriptor's conversion), which the first ask's shard pays (GAPS).
   - macOS: the Unix DAX suites pass unchanged (`slates-server --test shards` 26 of 26, `slates-vfs --test
     shards_backing`, `slates-mem --test dax_object`, `slates-bridge-core`, `slates-bridge-fuse`).
+
+### A-185 — Landing runs on Windows: a handle-relative NTFS writer, POSIX-form modes, and NTFS tunneling in the engine's move check (accepted 2026-10-26)
+Applied in the same change to: §4.15 (a status), A-180 (its last check), GAPS, `crates/land` (`src/os_windows.rs`,
+new: the Windows seam; `src/lib.rs`; `Cargo.toml`, `windows-sys`; `src/engine.rs`, `same_object_after_a_move`;
+`tests/os.rs`, `tests/os_escape.rs` and `tests/os_removal.rs` run on Windows, their symbolic-link cases on Unix;
+`examples/land_bench.rs`, its OS rows on every platform), `crates/base` (`src/windows.rs`: `walk_dir`, `WalkRefusal`,
+the handle accessors and adoption, `entry_fingerprint`, and a POSIX-form mode; `tests/host.rs`: the junction helper's
+backslashes), `crates/server/src/landing.rs` (no Unix gate; the delegation recall drain paired), `unsafe-budget.toml`
+(`slates-land` 4 → 22), and `docs/bugs/2026-10-26-windows-base-file-modes-were-raw-attributes.md`.
+- **What was there.** `slates-land`'s write seam was Unix-only, and the server refused every landing on Windows
+  (`Unsupported { feature: "landing" }`). Ada's rule (2026-10-26): every function works on every platform.
+- **The writer.** Every verb is relative to a handle the base host holds, never a path, as on Unix:
+  - creates by `NtCreateFile` with `FILE_CREATE` and the parent's handle as `RootDirectory`, so a name, link or
+    junction already there refuses the create;
+  - the rename that never replaces by `NtSetInformationFile(FileRenameInformationEx)`, POSIX semantics and never
+    `REPLACE_IF_EXISTS`. Win32's `SetFileInformationByHandle(FileRenameInfoEx)` refused a name relative to
+    `RootDirectory` with `ERROR_INVALID_PARAMETER` (measured on jupiter, Windows 10.0.26200);
+  - removals by `FileDispositionInfoEx`, POSIX semantics, the read-only attribute ignored;
+  - a batch's barrier as each file's `FlushFileBuffers` on ⌈√n⌉ threads, off the shard (A-132). A directory's sync
+    goes through the directory opened again, an empty name relative to its own handle, with `FILE_ADD_FILE`:
+    `ReOpenFile` with `GENERIC_WRITE` was refused `ERROR_ACCESS_DENIED`.
+  NTFS has no atomic exchange of two names, so the capabilities say so and the engine moves the old entry aside
+  first. A symbolic link is refused `EPERM`: Windows makes one only through a path (`CreateSymbolicLinkW`) or with a
+  privilege, and slates writes through handles and asks for no privilege (R10).
+- **Containment.** The target is walked from its drive's root one component at a time with `FILE_OPEN_REPARSE_POINT`,
+  refusing `..`, a link, a junction or a mount point (`slates_base::walk_dir`), and must be this process's user's: its
+  owner, by security identifier, is the token's user or the token's default owner, the owner this process's own
+  creations get, which is what Unix's `st_uid == geteuid` asks. They differ on an elevated token, whose default owner
+  is `BUILTIN\Administrators` (both CI runners and an elevated shell on jupiter, 2026-11-06). Git Bash sets its token's
+  default owner to the user, so a Windows test run from it does not see this: every landing suite passed there and
+  failed `TargetNotOwned` from PowerShell. An unelevated token's default owner is its user, so it refuses what the
+  administrators own.
+- **Two Windows facts the engine met** (each measured on jupiter, then fixed):
+  - The base host's fingerprint carried the raw file attributes as the mode, so the engine read a witnessed
+    directory as a file (`Conflict(TypeChanged)` on the worked example's tree removal). Main fixed the same fault
+    as A-262 (DrvFs's mapping, `crate::windows_mode_and_bits`, the attribute bits kept apart), and merging main
+    `1c49c33f` (2026-11-09) kept A-262's mapping alone and removed this entry's own (`posix_mode`), so there is one.
+    `docs/bugs/2026-10-26-windows-base-file-modes-were-raw-attributes.md`.
+  - NTFS gives a file renamed onto a name another file left moments before that file's creation time (tunneling),
+    and the engine's fallback does exactly that, so every replacement was undone `TargetInUse`, the birth time the
+    only other difference. A moved object is now judged on the device, the file index, the size, the mtime and the
+    mode, the ctime and owner set aside as before, one check where three sites had their own
+    (`same_object_after_a_move`). The birth time is set aside on Windows alone (`BIRTH_SURVIVES_A_MOVE`): NTFS's file
+    index carries a sequence number, while ext4 reuses a freed inode number (A-151), so Unix still needs it.
+- **What a landing means for a DAX map** (A-180's last check, decided with Ada). A landing never writes a file in
+  place (R1's old-or-new): it places a new file at the name. So a guest holding the old file open keeps its bytes,
+  as POSIX does (measured: its `READ` returned them), and a node with no descriptor held answers `ESTALE` (A-151);
+  the guest looks the name up again and maps the new file, which holds the landed bytes. A refill follows a change
+  made in place on the disk only.
+- **Proven** on jupiter: `slates-land` whole (the oracle 29 of 29; `os.rs` 6 of 6, with the kill test on NTFS;
+  `os_escape.rs` with junction and hard-link swaps before every seam call; `os_removal.rs` with real outsider saves),
+  `slates-base` whole, and `crates/client/tests/shards.rs` 12 of 12 with the landing-to-fresh-map test. macOS: the
+  land suite whole. Red-checked on jupiter: a rename that may replace failed the removal oracle; a walk that follows a
+  junction failed the escape test (`None` where `EscapesTarget` was asserted); a placement made a no-op failed the
+  fresh-map test.
+- **Ported onto main and proven on both Windows runners, 2026-11-06** (`docs/bugs/2026-11-06-an-elevated-token-owned-nothing-it-made.md`):
+  `crates/land/tests/os_seam_windows.rs` calls each verb directly on a name that exists and on a real junction, since
+  with an entry's open following junctions, or a temporary's create overwriting, the landing suites still passed.
+  arm64 Windows runs what x86_64 runs. Not held by any test: a flush reaching the device, which would take a power cut.
+- **A-227 on the Windows writer, ported onto `4811191a`, 2026-11-09**
+  (`docs/bugs/2026-11-09-the-windows-writer-walked-its-own-drive-before-a-227-looked.md`): the writer's walk
+  (`slates_base::walk_dir`) opened each component of its target from the drive's root, and A-227's drive check ran only
+  afterwards, in `OsHost::open_root`. Now `walk_dir` runs the base's own check (`check_root_volume`: the drive named by
+  `QueryDosDeviceW`, never the volume) before any open, and the writer answers `TargetRefusal::OwnMount`, which the
+  server reports as `Refusal::OwnMount` for a `LandingTarget`, as on Unix. Held by
+  `a_landing_target_on_the_daemons_own_drive_is_refused_before_any_open` (`crates/cli/tests/winfsp.rs`).
 
 ### A-181 — `slates shards` on Windows starts its command holding the stream end as a named handle, and waits for it (accepted 2026-10-26)
 Applied in the same change to: §4.6 (the Shards form's Windows status), GAPS, `crates/ipc` (`win_spawn.rs`, new: the
@@ -20454,3 +20666,43 @@ The steps' own records follow.
     the process judgment. On this Mac: supervised 10 of 10, unsupervised 10 of 10, frozen 5 of 5. Mutations each turned
     their own shape red on both runners: the client's `Stalled` branch, the lone self-end, and starved treated as stuck.
     The tables are in the bug record.
+
+### A-276 — A heal that replaces a departed holder puts at the next sequence and republishes the head there; every heal ends at the membership horizon (accepted 2026-11-09, the supervisor's ruling; amends §4.10's healer)
+
+Applied in the same change to:
+- §4.10: the "Content replication" paragraph's healer sentences.
+- GAPS and `docs/bugs/2026-11-09-a-heal-left-the-head-naming-a-holder-that-had-left.md`.
+- `crates/server/src/fleet.rs` (`heal_one_placed_snapshot`, `Heal`, `start_seal`, `content_work`,
+  `record_placed_seals`, `republish_head`) and `crates/server/src/head.rs` (`SealJob::put_sequence`,
+  `SealJob::republish`).
+- The tests in `crates/server/tests/fleet.rs`: `a_heal_republishes_the_head_once_a_named_holder_has_left`,
+  `a_heal_republishes_a_live_volumes_head_once_a_named_holder_has_left` and
+  `a_heal_that_cannot_place_ends_at_its_bound_and_the_volume_is_healed_later`.
+
+- **The rule amended.** §4.10 said the healer replays puts that never reached f+1. It said nothing of a holder the head
+  names that has left the fleet. A head is never rewritten at its sequence, so the heal's re-recorded placement never
+  reached it.
+- **The rule now.**
+  - When a holder the placement names is no longer a member, or none named is remote, the heal places the content on
+    the current cohort at the head's sequence plus one.
+  - Once that placement is recorded, the same head snapshot is republished at exactly that sequence
+    (`Op::VolumeHeadAdvanced`), naming the new holders.
+  - Otherwise the heal re-offers at the head's own sequence, as before.
+  - Every heal is bounded by the membership horizon (`lease::horizon_ns`) from its first round. One that has not placed
+    by then ends, counted `fleet.heal.unfinished`, and a later step takes the volume up again.
+- **Why the next sequence.** A holder's door (`content_retention::admits`) admits a put only when its newest record at
+  that sequence names it, or when the put is ahead of every record it holds. A cohort member that holds the head and
+  is not named in it therefore refuses a put at the head's sequence. Measured: the first cut put there, the owner
+  counted `fleet.heal.named_gone` 1 and `fleet.heal.republished` 0, and the heads still named the departed holder 300
+  periods later. At the next sequence the put is ahead everywhere, retention keeps it as the newest placement ahead,
+  and the republished head at that sequence then names its holders.
+- **Why the bound.** With no bound, a heal that could not place stayed open, and the healer skips a volume with a seal
+  in progress, so one refusal left the volume unhealed for good. Measured with every put refused: without the bound,
+  `fleet.heal.unfinished` stayed 0 (36 s); with it, the heal ended counted, and once the refusal lifted the head was
+  republished.
+- **Evidence.** On the old code both republish tests fail, on a five-node `f = 1` fleet on a Mac at load 30 to 72: the
+  heads still name the departed holder and nothing is republished (453 s and 456 s). With the change all three tests
+  pass (14 s to 62 s, load 34 to 73).
+- **What it does not change.** The head's value, the snapshot, its manifest and what a client sees: the status's head,
+  snapshot and attachment counts, bytes and lease epoch, and the file's bytes are checked equal across a republish. The
+  mirror's own healer stays open (GAPS, AC-8.15).

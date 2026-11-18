@@ -5281,7 +5281,15 @@ fn a_forward_waits_for_the_owners_session_while_it_is_out() {
   share_with_node(&mut client_a, id, &daemons[1], ALL_RIGHTS);
   let mut client_b = Client::connect(daemons[1].instance());
   let (routed, last) = poll_status_served(&daemons, &mut client_b, id, COUNCIL_RETIRE_DEADLINE);
-  let held = routed.then(|| daemons[1].hold_record_session(hosts[0], SESSION_HOLD_NS));
+  // Held until the write's forward meets it, however late a loaded machine runs that forward: a hold of a fixed span
+  // ended before it arrived (b counted no forward meeting the session out).
+  let held = routed.then(|| {
+    daemons[1].hold_record_session_until_met(
+      hosts[0],
+      SESSION_HOLD_NS,
+      slates_server::daemon::OBSERVE_BUDGET_NS,
+    )
+  });
   let written = routed.then(|| client_b.call(&RequestBody::Snapshot { volume: id }));
   let retry = routed.then(|| client_b.call_retry(&RequestBody::Snapshot { volume: id }));
   let counters = daemons[1].fleet_refusals();
@@ -5322,18 +5330,23 @@ fn a_forward_waits_for_the_owners_session_while_it_is_out() {
   );
 }
 
-/// Shape: how long [`forwards_to_one_owner_never_wait_behind_each_other`] holds the owner's non-control shard: half
-/// a liveness budget, so the forward of a read there waits that long inside its own one-budget bound, and a forward
-/// that waited behind it is told from one that did not by hundreds of milliseconds.
-const OWNER_SHARD_HOLD: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS / 2);
-/// Shape: how long after the slow forward is sent the fast one goes: a tenth of the hold, so the slow one has
-/// reached the owner and is waiting on its held shard.
-const SLOW_FORWARD_LEAD: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS / 20);
+/// Shape: the longest [`forwards_to_one_owner_never_wait_behind_each_other`] holds the owner's non-control shard in one
+/// round: five liveness budgets, a ceiling the round normally never reaches, since it ends as soon as the free shard's
+/// read is answered; it only has to outlast that read's round trip through a loaded machine (half a budget did not: 300
+/// to 800 ms a round trip at nice 19 beside two spinners a CPU).
+const OWNER_SHARD_HOLD: Duration = Duration::from_nanos(5 * LIVENESS_BUDGET_NS);
+/// Shape: the rounds of [`forwards_to_one_owner_never_wait_behind_each_other`]: one read of the free shard answered
+/// during a hold disproves that it waits behind the held forward.
+const OWNER_SHARD_ROUNDS: u32 = 3;
 /// Shape: the volumes made while looking for one a given shard of two owns; a run that finds none in this many is a
 /// fault of the placement, not luck.
 const PLACEMENT_TRIES: usize = 64;
 /// Raised by the owner's held shard when its hold begins.
 static OWNER_SHARD_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Set once the free shard's read of a [`forwards_to_one_owner_never_wait_behind_each_other`] round is answered: the
+/// hold ends there rather than running out its span.
+static OWNER_SHARD_RELEASED: std::sync::atomic::AtomicBool =
+  std::sync::atomic::AtomicBool::new(false);
 
 /// A volume created through `client` that the daemon's shard at `partition` owns.
 fn volume_owned_by(client: &mut Client, partition: usize, tag: &str, fleet: &[Daemon]) -> VolumeId {
@@ -5844,6 +5857,11 @@ const DEAD_SESSION_BURST_CLIENTS: usize = 256;
 /// Whether [`a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one`]'s burst keeps sending.
 static DEAD_SESSION_BURST_ON: std::sync::atomic::AtomicBool =
   std::sync::atomic::AtomicBool::new(false);
+/// Whether the burst has sent its first round: the session goes deaf only after, so b's lane is full when it does. A
+/// fixed wait was not enough: with the Mac at load 56 to 66, the 256 clients' connects outlasted it, the session went
+/// deaf over an empty lane, and the burst finished no round (2026-11-12, 3 of 3).
+static DEAD_SESSION_BURST_SENT: std::sync::atomic::AtomicBool =
+  std::sync::atomic::AtomicBool::new(false);
 
 /// §4.8 "Lookup", found on the f = 1 primary-kill rung under load (2026-11-08): the restarted primary kept its member id,
 /// so the client node's record session to it looked valid, and borrowers kept forwarding into a session the new process
@@ -5880,6 +5898,7 @@ fn a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one() {
   let slots = usize::try_from(daemons[1].config().region.slots).unwrap();
   let through_b = daemons[1].instance().to_owned();
   DEAD_SESSION_BURST_ON.store(true, std::sync::atomic::Ordering::Release);
+  DEAD_SESSION_BURST_SENT.store(false, std::sync::atomic::Ordering::Release);
   let burst_read = read.clone();
   let burst = std::thread::spawn(move || {
     let mut clients: Vec<Client> = (0..DEAD_SESSION_BURST_CLIENTS)
@@ -5890,6 +5909,7 @@ fn a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one() {
       for client in &mut clients {
         client.send_burst(&burst_read, slots);
       }
+      DEAD_SESSION_BURST_SENT.store(true, std::sync::atomic::Ordering::Release);
       for client in &mut clients {
         client.collect_tagged(slots, ADMITTED_FORWARDS_READ);
       }
@@ -5897,7 +5917,15 @@ fn a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one() {
     }
     rounds
   });
-  // The lane busy for a budget before the session goes deaf.
+  // The burst's first round sent, however long its clients took to connect, then the lane busy for a budget before the
+  // session goes deaf.
+  let starting = Instant::now();
+  while !DEAD_SESSION_BURST_SENT.load(std::sync::atomic::Ordering::Acquire)
+    && starting.elapsed() < DEAD_SESSION_WATCH
+  {
+    std::thread::yield_now();
+  }
+  let sent = DEAD_SESSION_BURST_SENT.load(std::sync::atomic::Ordering::Acquire);
   let busy_until = Instant::now() + Duration::from_nanos(LIVENESS_BUDGET_NS);
   while Instant::now() < busy_until {
     std::thread::yield_now();
@@ -5956,6 +5984,10 @@ fn a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one() {
   assert!(routed, "b routed the volume to a: {last:?}");
   assert_eq!(held, Ok(()), "b's discovery to a was held");
   assert_eq!(marked, Ok(()), "the deafness was installed on b");
+  assert!(
+    sent,
+    "the burst sent its first round within {DEAD_SESSION_WATCH:?} of starting"
+  );
   assert!(rounds > 0, "the burst kept b's lane busy");
   let recovered = recovered.unwrap_or_else(|| {
     panic!(
@@ -5968,6 +6000,148 @@ fn a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one() {
     "the lane's first answer on the replacement came {:?} after the drop, past {:?}",
     Duration::from_nanos(recovered),
     Duration::from_nanos(DEAD_SESSION_RECOVERY_NS)
+  );
+}
+
+/// Shape: the clients reading through the starved origin at once, each a full ring of reads a round: enough that most
+/// forwards wait for the lane's driver, as in clients' runs (2 batches begun against 20 to 25 given up). One serial
+/// reader was not: with b's control shard at nice 19 beside two spinners, main served every read (2026-11-09,
+/// adacachy2: 18 to 29 reads, the longest 2.3 s, none given up).
+const STARVED_ORIGIN_CLIENTS: usize = 32;
+/// Shape: the refusals the starved-origin test keeps to print.
+const STARVED_ORIGIN_SHOWN: usize = 8;
+
+/// What [`read_in_rounds`] saw.
+struct StarvedReads {
+  served: usize,
+  unanswered: usize,
+  rounds: u32,
+  longest: Duration,
+  /// The first [`STARVED_ORIGIN_SHOWN`] refusals, with when they came.
+  refused: Vec<(Duration, String)>,
+}
+
+/// Sends `slots` reads from each client a round and collects their replies within `reply_wait`, round after round for
+/// `watch`; a round with a reply missing past its wait ends the watch, since the late reply would sit in the ring.
+fn read_in_rounds(
+  clients: &mut [Client],
+  read: &RequestBody,
+  slots: usize,
+  reply_wait: Duration,
+  watch: Duration,
+) -> StarvedReads {
+  let mut seen = StarvedReads {
+    served: 0,
+    unanswered: 0,
+    rounds: 0,
+    longest: Duration::ZERO,
+    refused: Vec::new(),
+  };
+  let watching = Instant::now();
+  while watching.elapsed() < watch && seen.unanswered == 0 {
+    let round = Instant::now();
+    for client in clients.iter_mut() {
+      client.send_burst(read, slots);
+    }
+    for client in clients.iter_mut() {
+      let replies = client.collect_tagged(slots, reply_wait.saturating_sub(round.elapsed()));
+      seen.unanswered += slots - replies.len();
+      for (_, reply) in replies {
+        if matches!(reply, ReplyBody::Status { .. }) {
+          seen.served += 1;
+        } else if seen.refused.len() < STARVED_ORIGIN_SHOWN {
+          seen
+            .refused
+            .push((watching.elapsed(), format!("{reply:?}")));
+        }
+      }
+    }
+    seen.longest = seen.longest.max(round.elapsed());
+    seen.rounds += 1;
+  }
+  seen
+}
+
+/// A-232 (class C+D), from clients' false-death runs: an origin at nice 19 beside two spinners a CPU was refused its
+/// read after 10 to 12 s, with `fleet.forward.batch_given_up` 20 to 25 against 2 batches begun, while the owner was
+/// alive. A forward's stall budget ran on the wall clock of the origin's control shard, so time the shard spent off its
+/// CPU counted as the owner's silence. Do: three nodes; a volume on a, read through b; b's control shard starved as
+/// clients' origin was (nice 19 beside two spinners at nice 0 on its CPU, `common::starve::Depth::Nice`); reads through
+/// b by [`STARVED_ORIGIN_CLIENTS`] clients, a full ring each a round, for a failover SLO and a half. Expect: b gives up
+/// no forward batch to a, which answers throughout, and reads are served. How many is b's CPU's to say, not the lane's:
+/// at nice 19 beside two spinners b's control shard has about 0.7% of its CPU, and 1,024 reads in flight outran it with
+/// the fix as before it (4 to 11 served in 11 s, the rest unanswered, b's own refusal at its failover SLO included), so
+/// those are printed, not held to a bound. Before: b gave up 2 and 713 batches (adacachy2, 2026-11-09).
+#[test]
+fn a_starved_origin_keeps_its_forward_to_a_live_owner() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let mut owner = Client::connect(daemons[0].instance());
+  let volume = volume_owned_by(&mut owner, 0, "starved-origin", &daemons);
+  let mut probe = Client::connect(daemons[1].instance());
+  let (routed, last) = poll_status_served(&daemons, &mut probe, volume, COUNCIL_RETIRE_DEADLINE);
+  let given_up = |daemon: &Daemon| {
+    summed_counters(daemon)
+      .get("fleet.forward.batch_given_up")
+      .copied()
+      .unwrap_or(0)
+  };
+  let given_up_before = given_up(&daemons[1]);
+  // Shape: a failover SLO and a half, so main's refusal (10 to 12 s in clients' runs) falls inside the watch.
+  let failover_slo_ns = daemons[1].config().failover_slo_ns;
+  let watch = Duration::from_nanos(failover_slo_ns.saturating_mul(3) / 2);
+  // Shape: each read's reply wait: the failover SLO, past which b refuses, and a liveness budget for the reply to reach
+  // the test, so what is measured is b's answer, not the client's own wall deadline (clients', A-232).
+  let reply_wait_ns = failover_slo_ns.saturating_add(LIVENESS_BUDGET_NS);
+  // Connected before the starving: a claim is answered on b's control shard, which then answers little.
+  let mut clients: Vec<Client> = (0..STARVED_ORIGIN_CLIENTS)
+    .map(|_| Client::connect(daemons[1].instance()))
+    .collect();
+  let starved = common::starve::starve_shard(
+    &daemons[1],
+    daemons[1].shards()[0],
+    common::starve::Depth::Nice,
+  );
+  let read = RequestBody::Status { volume };
+  let slots = usize::try_from(daemons[1].config().region.slots).unwrap();
+  let reply_wait = Duration::from_nanos(reply_wait_ns);
+  let StarvedReads {
+    served,
+    unanswered,
+    rounds,
+    longest,
+    refused,
+  } = read_in_rounds(&mut clients, &read, slots, reply_wait, watch);
+  drop(clients);
+  let shown = starved.shown.clone();
+  starved.stop();
+  let given_up_during = given_up(&daemons[1]).saturating_sub(given_up_before);
+  drop(owner);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "b's control shard starved ({shown}) for {watch:?}: {STARVED_ORIGIN_CLIENTS} clients, {rounds} rounds, the longest \
+     {longest:?}; {served} reads served, {unanswered} unanswered within {reply_wait:?}; refused (first \
+     {STARVED_ORIGIN_SHOWN}) {refused:?}; b gave up {given_up_during} forward batches"
+  );
+  assert!(routed, "b routed the volume to a: {last:?}");
+  assert!(served > 0, "a read through the starved b was served");
+  assert_eq!(
+    given_up_during, 0,
+    "b gave up {given_up_during} forward batches to a live a while its own shard was starved (refused {refused:?})"
   );
 }
 
@@ -6057,15 +6231,120 @@ fn a_forward_refused_at_admission_answers_its_client() {
   );
 }
 
+/// One round of [`forwards_to_one_owner_never_wait_behind_each_other`].
+#[derive(Debug)]
+struct ForwardRound {
+  /// The free shard's read was served and the held one answered.
+  served: bool,
+  /// The held read's forward had begun on the session and the free shard's read was answered while the hold stood.
+  during_hold: bool,
+  /// The free shard's read, from send to answer (printed, never judged).
+  fast_took: Duration,
+}
+
+/// How many forwards `daemon` has begun on a session (`fleet.forward.begun`), or none when it could not be read.
+fn forwards_begun(daemon: &Daemon) -> u64 {
+  daemon.fleet_refusals().map_or(0, |counters| {
+    counters.get("fleet.forward.begun").copied().unwrap_or(0)
+  })
+}
+
+/// Rounds of the read of `volumes.0` on the held shard and `volumes.1` on the free one, through `clients` of
+/// `daemons[1]`, until the free shard's read is answered during a hold or [`OWNER_SHARD_ROUNDS`] have run.
+fn forward_rounds(
+  daemons: &[Daemon],
+  (mut slow_client, mut fast_client): (Client, Client),
+  (slow, fast): (VolumeId, VolumeId),
+) -> Vec<ForwardRound> {
+  let mut rounds = Vec::new();
+  for _ in 0..OWNER_SHARD_ROUNDS {
+    let (round, returned) = forward_round(daemons, slow_client, &mut fast_client, (slow, fast));
+    slow_client = returned;
+    let answered = round.during_hold;
+    rounds.push(round);
+    if answered {
+      break;
+    }
+  }
+  rounds
+}
+
+/// One hold of `daemons[0]`'s non-control shard with the two reads inside it; hands the held read's client back.
+fn forward_round(
+  daemons: &[Daemon],
+  mut slow_client: Client,
+  fast_client: &mut Client,
+  (slow, fast): (VolumeId, VolumeId),
+) -> (ForwardRound, Client) {
+  use std::sync::atomic::Ordering::{Acquire, Release};
+  OWNER_SHARD_HELD.store(false, Release);
+  OWNER_SHARD_RELEASED.store(false, Release);
+  let hold = daemons[0]
+    .observation(
+      Some(daemons[0].shards()[1]),
+      slates_server::daemon::OBSERVE_BUDGET_NS,
+      |_: &mut slates_server::state::ShardState| {
+        OWNER_SHARD_HELD.store(true, Release);
+        let began = Instant::now();
+        // The held shard's thread runs nothing else for the hold: the read of `slow` waits there.
+        while began.elapsed() < OWNER_SHARD_HOLD && !OWNER_SHARD_RELEASED.load(Acquire) {
+          #[allow(clippy::disallowed_methods)]
+          std::thread::sleep(Duration::from_millis(1));
+        }
+        OWNER_SHARD_HELD.store(false, Release);
+      },
+    )
+    .unwrap();
+  let holder = std::thread::spawn(move || hold.wait());
+  while !OWNER_SHARD_HELD.load(Acquire) && !holder.is_finished() {
+    std::thread::yield_now();
+  }
+  let begun_before = forwards_begun(&daemons[1]);
+  let slow_read = std::thread::spawn(move || {
+    let reply = slow_client.call(&RequestBody::Status { volume: slow });
+    (reply, slow_client)
+  });
+  while forwards_begun(&daemons[1]) <= begun_before && OWNER_SHARD_HELD.load(Acquire) {
+    std::thread::yield_now();
+  }
+  let in_flight = OWNER_SHARD_HELD.load(Acquire);
+  let sent = Instant::now();
+  let fast_reply = fast_client.call(&RequestBody::Status { volume: fast });
+  let fast_took = sent.elapsed();
+  let during_hold = in_flight && OWNER_SHARD_HELD.load(Acquire);
+  OWNER_SHARD_RELEASED.store(true, Release);
+  let (slow_reply, slow_client) = slow_read.join().unwrap();
+  holder.join().unwrap().unwrap();
+  // The held read may outlast its forward's own bound when a loaded machine stretches the hold: it is then refused
+  // `OwnerUnreachable`, a retryable end and the daemon's verdict, which says nothing of the free shard's read.
+  let served = matches!(
+    slow_reply,
+    ReplyBody::Status { .. }
+      | ReplyBody::Refused {
+        refusal: Refusal::OwnerUnreachable { .. }
+      }
+  ) && matches!(fast_reply, ReplyBody::Status { .. });
+  (
+    ForwardRound {
+      served,
+      during_hold,
+      fast_took,
+    },
+    slow_client,
+  )
+}
+
 /// The network load test's fault one (GAPS, "The many-client load test over the network": a forwarded `CreateWork`
 /// p50 1.71 s at 300 clients and 4.30 s at 1,000, against 45 µs on the owner's own node). §4.8 "Lookup", §4.10. Do:
 /// three nodes, each its own region, two shards each. On a, create two volumes, `slow` owned by a's non-control
-/// shard and `fast` by its control shard. Through two clients of b read each once, so b routes both to a. Then hold
-/// a's non-control shard for half a liveness budget. Inside the hold, read `slow` through the first client of b; a
-/// tenth of the hold later, read `fast` through the second. Expect: both are served, and `fast` answers in under a
-/// quarter of the hold, since nothing it needs is held. Forwards to one owner share the origin's one session to
-/// it, and a forward that borrowed that session for its whole round trip, while the owner served one forward at a
-/// time a session, made every forward behind it wait for it.
+/// shard and `fast` by its control shard. Through two clients of b read each once, so b routes both to a. Then, for up
+/// to [`OWNER_SHARD_ROUNDS`] rounds, hold a's non-control shard for at most [`OWNER_SHARD_HOLD`], read `slow` through
+/// the first client of b, and once b counts that forward begun read `fast` through the second. Expect: both are served,
+/// and in some round `fast` is answered while the hold still stands, since nothing it needs is held. Judged by order,
+/// not by a time a loaded machine stretches (325 ms against a quarter of the hold under 36 spinners). Forwards to one
+/// owner share the origin's one session to it, and a forward that borrowed that session for its whole round trip, while
+/// the owner served one forward at a time a session, made every forward behind it wait for it: then `fast` is never
+/// answered inside a hold.
 #[test]
 fn forwards_to_one_owner_never_wait_behind_each_other() {
   let _serial = serialize_fleet_tests();
@@ -6105,62 +6384,31 @@ fn forwards_to_one_owner_never_wait_behind_each_other() {
     poll_status_served(&daemons, &mut slow_client, slow, COUNCIL_RETIRE_DEADLINE);
   let (fast_routed, fast_last) =
     poll_status_served(&daemons, &mut fast_client, fast, COUNCIL_RETIRE_DEADLINE);
-  let measured = (slow_routed && fast_routed).then(|| {
-    OWNER_SHARD_HELD.store(false, std::sync::atomic::Ordering::Release);
-    let hold = daemons[0]
-      .observation(
-        Some(daemons[0].shards()[1]),
-        slates_server::daemon::OBSERVE_BUDGET_NS,
-        |_: &mut slates_server::state::ShardState| {
-          OWNER_SHARD_HELD.store(true, std::sync::atomic::Ordering::Release);
-          // The held shard's thread runs nothing else for the hold: the read of `slow` waits there.
-          #[allow(clippy::disallowed_methods)]
-          std::thread::sleep(OWNER_SHARD_HOLD);
-        },
-      )
-      .unwrap();
-    let holder = std::thread::spawn(move || hold.wait());
-    let began = Instant::now();
-    while !OWNER_SHARD_HELD.load(std::sync::atomic::Ordering::Acquire) {
-      assert!(began.elapsed() < OWNER_SHARD_HOLD, "the hold began");
-      std::thread::yield_now();
-    }
-    let slow_read = std::thread::spawn(move || {
-      let reply = slow_client.call(&RequestBody::Status { volume: slow });
-      (reply, slow_client)
-    });
-    #[allow(clippy::disallowed_methods)]
-    std::thread::sleep(SLOW_FORWARD_LEAD);
-    let sent = Instant::now();
-    let fast_reply = fast_client.call(&RequestBody::Status { volume: fast });
-    let fast_took = sent.elapsed();
-    let (slow_reply, _) = slow_read.join().unwrap();
-    holder.join().unwrap().unwrap();
-    (fast_reply, fast_took, slow_reply)
-  });
+  let rounds = (slow_routed && fast_routed)
+    .then(|| forward_rounds(&daemons, (slow_client, fast_client), (slow, fast)));
   let counters = daemons[1].fleet_refusals();
   for daemon in daemons {
     daemon.stop();
   }
-  let (fast_reply, fast_took, slow_reply) = measured.unwrap_or_else(|| {
+  let rounds = rounds.unwrap_or_else(|| {
     panic!("b routed both reads to a before the hold (last replies: {slow_last:?}, {fast_last:?})")
   });
   eprintln!(
-    "the forward of a read on a free shard took {fast_took:?} while another forward to its owner waited out a \
-     {OWNER_SHARD_HOLD:?} hold; b's fleet counters {counters:?}"
+    "the forward of a read on a free shard took {:?} a round, while another forward to its owner waited on a \
+     {OWNER_SHARD_HOLD:?} hold: {rounds:?}; b's fleet counters {counters:?}",
+    rounds
+      .iter()
+      .map(|round| round.fast_took)
+      .collect::<Vec<_>>()
   );
   assert!(
-    matches!(slow_reply, ReplyBody::Status { .. }),
-    "the read on the held shard is served once the hold ends: {slow_reply:?}"
+    rounds.iter().all(|round| round.served),
+    "the free shard's read is served and the held one answered in every round: {rounds:?}"
   );
   assert!(
-    matches!(fast_reply, ReplyBody::Status { .. }),
-    "the read on the free shard is served: {fast_reply:?}"
-  );
-  assert!(
-    fast_took < OWNER_SHARD_HOLD / 4,
-    "the forward of a read on a free shard took {fast_took:?}, waiting behind another forward to the same owner \
-     ({OWNER_SHARD_HOLD:?} hold)"
+    rounds.iter().any(|round| round.during_hold),
+    "the read on the free shard was never answered while the hold stood, waiting behind another forward to the same \
+     owner: {rounds:?}"
   );
 }
 
@@ -9513,6 +9761,28 @@ fn seal_decorated_hello_on_owner(
   name: &str,
   decorate: impl FnOnce(&Daemon),
 ) -> Result<VolumeId, String> {
+  let (id, placed) = seal_and_place_hello(instance, daemons, name, decorate)?;
+  let survivors: Vec<&Daemon> = daemons[1..].iter().collect();
+  let all_hold = poll_all_hold(&survivors, ObjectId(id.bytes));
+  if placed && all_hold {
+    Ok(id)
+  } else {
+    Err(format!(
+      "placed={placed}, every survivor holds the head={all_hold}"
+    ))
+  }
+}
+
+/// Provisions `name` on the owner (`daemons[0]`, reached at `instance`), writes [`CONTENT`] into it over NFS, runs
+/// `decorate` on the owner, seals it with a snapshot and waits for the snapshot to place: the volume id and whether it
+/// placed, or why the volume or the snapshot was not made. Which members then hold the head is the caller's to wait
+/// for: on a fleet past `2f + 1` a head ships to its candidates, not to every member.
+fn seal_and_place_hello(
+  instance: &str,
+  daemons: &[Daemon],
+  name: &str,
+  decorate: impl FnOnce(&Daemon),
+) -> Result<(VolumeId, bool), String> {
   let mut client = Client::connect(instance);
   let ReplyBody::Created { id } = client.call(&scratch(name)) else {
     return Err("the volume was not created".to_owned());
@@ -9531,15 +9801,7 @@ fn seal_decorated_hello_on_owner(
     id,
     snapshot,
   );
-  let survivors: Vec<&Daemon> = daemons[1..].iter().collect();
-  let all_hold = poll_all_hold(&survivors, ObjectId(id.bytes));
-  if placed && all_hold {
-    Ok(id)
-  } else {
-    Err(format!(
-      "placed={placed}, every survivor holds the head={all_hold}"
-    ))
-  }
+  Ok((id, placed))
 }
 
 /// Shape: the coordinator periods [`an_owner_settles_its_neighbourhood_only_once_its_head_is_placed_on_the_new_cohort`]
@@ -10231,26 +10493,15 @@ fn a_sealed_snapshots_content_replicates_to_the_holder_and_places() {
   );
 }
 
-/// Shape: how long the first-round content candidate is starved in
-/// [`a_slow_first_round_candidate_is_hedged_after_the_measured_p95`] — three liveness budgets, the same hold
-/// the SWIM starvation test uses: far past any measured put p95 on loopback (sub-millisecond to tens of
-/// milliseconds), so a hedge that fires on the measured p95 places the seal through the third candidate long
-/// before the hold ends, while a first round that waits out the hold itself does not.
-/// Shape: how long the hedge test holds the first-round candidate's control shard down (nanoseconds) — the
-/// window the hedge must place the second seal within, which proves the hedge (not the candidate recovering)
-/// carried it. Default three liveness budgets: far past the measured put p95 (sub-ms to tens of ms) and the
-/// unloaded placement-and-observation path (measured ~360 ms here, ~18x the p95), so a normal run stays prompt.
-/// A heavily loaded or shared CI runner inflates that whole path — a 180x-overloaded runner once took 3.003 s,
-/// racing the fixed 3 s window and false-failing — so an exceptionally slow environment widens the window
-/// through `SLATES_TEST_HEDGE_STARVATION_SECS`. The hedge's behaviour (it fires on the measured p95) is
-/// unchanged; only the observation window the test allows it grows.
-static HEDGE_STARVATION_NS: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
-  std::env::var("SLATES_TEST_HEDGE_STARVATION_SECS")
-    .ok()
-    .and_then(|secs| secs.parse::<u64>().ok())
-    .map(|secs| secs.saturating_mul(1_000_000_000))
-    .unwrap_or(3 * LIVENESS_BUDGET_NS)
-});
+/// Shape: the ceiling on how long [`a_slow_first_round_candidate_is_hedged_after_the_measured_p95`] holds the first-round
+/// candidate: twenty liveness budgets. The hold ends as soon as the seal has placed through the hedge, so a run is as
+/// prompt as the hedge; the ceiling only has to outlast the hedge and its placement on a loaded machine (a fixed 3 s window
+/// raced it).
+const HEDGE_STARVATION_NS: u64 = 20 * LIVENESS_BUDGET_NS;
+/// Set once the owner's hedge round and the seal's placement have been seen: the hold of the first-round candidate ends
+/// there.
+static HEDGE_HOLD_RELEASED: std::sync::atomic::AtomicBool =
+  std::sync::atomic::AtomicBool::new(false);
 
 /// The owner's two remote content candidates, read in the exact order used by its
 /// owner shard, including committed failure domains. Return indexes into `hosts`:
@@ -10318,7 +10569,10 @@ fn a_slow_first_round_candidate_is_hedged_after_the_measured_p95() {
   // Hold the first-round candidate's control shard, then seal again: the second put cannot be answered
   // by it, so the hedge must carry the seal to the other candidate on the measured p95.
   write_hello_over_nfs(&daemons[0], "hedged");
-  let hold = daemons[first_index].starve_control_shard(*HEDGE_STARVATION_NS);
+  let (hedged_before, delay_before) = hedge_counts(&daemons[0]);
+  HEDGE_HOLD_RELEASED.store(false, std::sync::atomic::Ordering::Release);
+  let hold =
+    daemons[first_index].starve_control_shard_until(HEDGE_STARVATION_NS, &HEDGE_HOLD_RELEASED);
   let started = Instant::now();
   let ReplyBody::Snapshotted { id: second, .. } =
     client.call(&RequestBody::Snapshot { volume: id })
@@ -10328,8 +10582,14 @@ fn a_slow_first_round_candidate_is_hedged_after_the_measured_p95() {
     }
     panic!("the second snapshot was not taken");
   };
-  // The poll watches the daemons the hold leaves running. An observation of the held candidate is budgeted in its
-  // shard's own CPU time (A-65), which a starved hold spends a little at a time (A-232), so the poll's trace of it
+  // The owner's own count of the hedge round, then the placement. The hold ends at the placement, or at its ceiling on
+  // a machine too loaded to place before it; released at the hedge alone, the freed candidate could place the seal first
+  // (1 run in 10 at nice 19).
+  let hedged = poll_until(&[&daemons[0]], PLACEMENT_DEADLINE, || {
+    Ok(seals_hedged(&daemons[0]) > hedged_before)
+  });
+  // The placement poll watches the daemons the hold leaves running. An observation of the held candidate is budgeted in
+  // its shard's own CPU time (A-65), which a starved hold spends a little at a time (A-232), so the poll's trace of it
   // waited out the whole hold: placed after 20.016 s against a 20 s hold on CI's Windows lane (2026-11-17).
   let unheld: Vec<&Daemon> = all
     .iter()
@@ -10339,11 +10599,20 @@ fn a_slow_first_round_candidate_is_hedged_after_the_measured_p95() {
     .collect();
   let placed = poll_snapshot_placed(&unheld, &mut client, id, second);
   let placed_after = started.elapsed();
+  HEDGE_HOLD_RELEASED.store(true, std::sync::atomic::Ordering::Release);
+  let (hedged_after, delay_after) = hedge_counts(&daemons[0]);
+  let delay_used_ns = delay_after
+    .saturating_sub(delay_before)
+    .checked_div(hedged_after.saturating_sub(hedged_before));
+  let readings = daemons[0].fleet_put_latency_range(object).ok().flatten();
   let manifest = daemons[0].fleet_head_manifest(object);
   let outcome = HedgeOutcome {
     measured,
     placed,
     placed_after,
+    hedged,
+    delay_used_ns,
+    readings,
     hedge_holds: matches!(manifest, Ok(Some(manifest)) if daemons[hedge_index].fleet_holder_content(manifest) == Ok(true)),
     held_ns: hold.and_then(|done| done.answer()),
     after: daemons[0].fleet_put_latency(object),
@@ -10363,25 +10632,60 @@ struct HedgeOutcome {
   measured: Result<(usize, Option<u64>), ObserveError>,
   placed: bool,
   placed_after: Duration,
+  /// Whether the owner sent a hedge round for the second seal while the first-round candidate was held.
+  hedged: bool,
+  /// The hedge delay the owner held those rounds for, on average (`fleet.seal.hedge_delay_ns` over
+  /// `fleet.seal.hedged`), or none when it sent none.
+  delay_used_ns: Option<u64>,
+  /// The smallest and largest put-latency reading the owner held after the seal: its p95 lay between them.
+  readings: Option<(u64, u64)>,
   hedge_holds: bool,
   held_ns: Result<u64, ObserveError>,
   after: Result<(usize, Option<u64>), ObserveError>,
 }
 
-/// The hedge history's assertions: readings existed before the second seal, the hold held for its span,
-/// the seal placed through the hedge while the first-round candidate was still held, and the hedged put
-/// left further readings.
+/// How many hedge rounds `owner` has sent (`fleet.seal.hedged`), or none when it could not be read.
+fn seals_hedged(owner: &Daemon) -> u64 {
+  hedge_counts(owner).0
+}
+
+/// `owner`'s hedge rounds and the sum of the delays they were held for (`fleet.seal.hedged`,
+/// `fleet.seal.hedge_delay_ns`).
+fn hedge_counts(owner: &Daemon) -> (u64, u64) {
+  owner.fleet_refusals().map_or((0, 0), |counters| {
+    let of = |name: &str| counters.get(name).copied().unwrap_or(0);
+    (of("fleet.seal.hedged"), of("fleet.seal.hedge_delay_ns"))
+  })
+}
+
+/// The hedge history's assertions, on what a seal promises (§4.8 "hedged to the remaining candidates after the measured
+/// p95 put latency"): readings existed before the second seal; the owner sent a hedge round (`fleet.seal.hedged`), held
+/// for a delay among its own put-latency readings, as its measured p95 is (`fleet.seal.hedge_delay_ns` against the
+/// window's range: counts, so no load moves them; a hedge held 300 s against readings of milliseconds passed before
+/// 2026-11-09); and the seal placed, never hanging,
+/// within the placement deadline, through whichever candidates acknowledged first. When it placed while the first-round
+/// candidate was still held (released at placement, before its ceiling), the hedge carried it: the hedged candidate holds
+/// the content and the put left further readings. A run so loaded that the hold reaches its ceiling releases the
+/// candidate, and then either may carry the seal: that run is judged on the hedge and the placement alone, so the test
+/// holds at any load (17 of 20 at nice 19 when it also asked the placement to beat the ceiling).
 fn assert_hedged_through_the_measured_p95(outcome: &HedgeOutcome) {
   let HedgeOutcome {
     measured,
     placed,
     placed_after,
+    hedged,
+    delay_used_ns,
+    readings,
     hedge_holds,
     held_ns,
     after,
   } = outcome;
-  let hold_ns = *HEDGE_STARVATION_NS;
-  let held_still_starved = *placed_after < Duration::from_nanos(hold_ns);
+  let hold_ns = HEDGE_STARVATION_NS;
+  let placed_while_held = held_ns.as_ref().is_ok_and(|&held| held < hold_ns);
+  eprintln!(
+    "hedge: measured before the hold {measured:?} (readings, p95 ns); hedged {hedged} after a delay of \
+     {delay_used_ns:?} ns; second seal placed after {placed_after:?}, held {held_ns:?} ns (placed while held: {placed_while_held}); readings after {after:?}"
+  );
   assert!(
     measured
       .as_ref()
@@ -10389,26 +10693,433 @@ fn assert_hedged_through_the_measured_p95(outcome: &HedgeOutcome) {
     "the first seal left measured put-latency readings on the owner: {measured:?}"
   );
   assert!(
-    held_ns.as_ref().is_ok_and(|&held| held >= hold_ns),
-    "the first-round candidate's control shard was held for the whole span ({held_ns:?} ns)"
-  );
-  eprintln!(
-    "hedge: measured before the hold {measured:?} (readings, p95 ns); second seal placed after \
-     {placed_after:?} against a {hold_ns} ns hold; readings after {after:?}"
+    *hedged,
+    "the owner hedged the second seal once its first round went the measured p95 unplaced (held {held_ns:?} ns)"
   );
   assert!(
-    *placed && held_still_starved,
-    "the second seal placed through the hedge while the first-round candidate was still held \
-     (placed={placed} after {placed_after:?}, hold {hold_ns} ns)"
+    matches!((delay_used_ns, readings), (Some(delay), Some((low, high))) if (*low..=*high).contains(delay)),
+    "the hedge was held for the measured p95 put latency, which lies among the owner's readings: held {delay_used_ns:?} \
+     ns, readings from {readings:?} ns"
   );
+  assert!(
+    *placed,
+    "the second seal placed within the placement deadline (after {placed_after:?}, held {held_ns:?} ns)"
+  );
+  if placed_while_held {
+    assert_the_hedge_carried_it(*hedge_holds, measured, after);
+  }
+}
+
+/// Placed while the first-round candidate was held, the hedge carried the seal: the hedged candidate holds the content
+/// whole, and the hedged put left further readings than `measured` (`after`).
+fn assert_the_hedge_carried_it(
+  hedge_holds: bool,
+  measured: &Result<(usize, Option<u64>), ObserveError>,
+  after: &Result<(usize, Option<u64>), ObserveError>,
+) {
   assert!(
     hedge_holds,
-    "the hedged candidate holds the second seal's content whole — the placement came through the hedge"
+    "placed while the first-round candidate was held: the hedged candidate holds the content whole"
   );
   assert!(
     matches!((after, measured), (Ok((count, _)), Ok((before, _))) if count > before),
-    "the hedged put left further readings: {measured:?} → {after:?}"
+    "the hedged put left further readings: {measured:?} to {after:?}"
   );
+}
+
+/// Shape: the coordinator periods a heal gets to leave every head naming holders that hold the content: three of the
+/// healer's at-rest periods (one placed snapshot per hundred periods, `fleet::HEAL_PERIODS_AT_REST`), so a healer that
+/// replaces a departed holder does so several times over within it.
+const NAMED_SET_PERIODS: u64 = 300;
+
+/// A sealed volume, its manifest, the holders its shipped head names, and the index of one of them past the owner.
+type SealedNamed = (VolumeId, [u8; 32], Option<Vec<u64>>, usize);
+
+/// Whether volume `id` is live-shipped as `instance`'s listing reports it.
+fn is_live_shipped(instance: &str, id: VolumeId) -> bool {
+  match Client::connect(instance).call(&RequestBody::List) {
+    ReplyBody::Listed { volumes } => volumes
+      .iter()
+      .any(|volume| volume.id == id && volume.live_shipped),
+    _ => false,
+  }
+}
+
+/// Seals `name` on the owner (`daemons[0]`), live-shipped first when `live`, waits for the snapshot to place and for
+/// the head to be held by a member past the owner that it names as a content holder and by another member besides,
+/// one that can take the volume over once the named one leaves: the volume, its manifest, the holders the head names,
+/// and the named member's index; why not, when the setup did not complete.
+fn sealed_with_a_named_remote(
+  instance: &str,
+  daemons: &[Daemon],
+  hosts: &[HostId],
+  name: &str,
+  live: bool,
+) -> Result<SealedNamed, String> {
+  // A live volume is made live-shipped (A-200) before its seal, so its head and its live log are both in play.
+  let (id, placed) = seal_and_place_hello(instance, daemons, name, |owner| {
+    if live {
+      let mut client = Client::connect(owner.instance());
+      if let ReplyBody::Listed { volumes } = client.call(&RequestBody::List)
+        && let Some(volume) = volumes.iter().find(|volume| volume.name == name)
+      {
+        let _ = client.call(&RequestBody::LiveShip {
+          volume: volume.id,
+          live_shipped: true,
+        });
+      }
+    }
+  })?;
+  if live && !is_live_shipped(instance, id) {
+    return Err(format!("{name} was made live-shipped before its seal"));
+  }
+  let object = ObjectId(id.bytes);
+  let all: Vec<&Daemon> = daemons.iter().collect();
+  let mut named = None;
+  let mut remote = None;
+  let mut successor = None;
+  let held = placed
+    && poll_until(&all, SERVE_DEADLINE, || {
+      (named, remote) = named_remote(daemons, hosts, object);
+      successor = remote.and_then(|leaving| {
+        (1..daemons.len()).find(|index| {
+          *index != leaving
+            && daemons[*index]
+              .fleet_holder_head(object)
+              .is_ok_and(|head| head.is_some())
+        })
+      });
+      Ok(successor.is_some())
+    });
+  let manifest = daemons[0].fleet_head_manifest(object).ok().flatten();
+  match (held, manifest, remote) {
+    (true, Some(manifest), Some(remote)) => Ok((id, manifest, named, remote)),
+    _ => Err(format!(
+      "placed={placed}; the head held by a named remote and another member: manifest {manifest:?}, named {named:?}, \
+       named remote {remote:?}, other holder {successor:?}"
+    )),
+  }
+}
+
+/// What a client sees of volume `id` in its status: the head, the snapshot and attachment counts, the bytes it
+/// references and its lease epoch; `None` when the status does not answer a report.
+fn client_view(
+  client: &mut Client,
+  id: VolumeId,
+) -> Option<(SnapshotId, u32, u32, u64, Option<u64>)> {
+  match client.call(&RequestBody::Status { volume: id }) {
+    ReplyBody::Status { report } => Some((
+      report.head,
+      report.snapshots,
+      report.attachments,
+      report.referenced_bytes,
+      report.lease_epoch,
+    )),
+    _ => None,
+  }
+}
+
+/// The holders the head names as one of `daemons` (other than the owner, `daemons[0]`) holds it, and the index of the
+/// first of `daemons` past the owner that the head names.
+fn named_remote(
+  daemons: &[Daemon],
+  hosts: &[HostId],
+  object: ObjectId,
+) -> (Option<Vec<u64>>, Option<usize>) {
+  let named = (1..daemons.len()).find_map(|index| named_holders(&daemons[index], object));
+  let remote = named
+    .as_ref()
+    .and_then(|holders| (1..daemons.len()).find(|index| holders.contains(&hosts[*index].0)));
+  (named, remote)
+}
+
+/// The content holders the head `daemon` holds for `object` names, or `None` when it holds no head.
+fn named_holders(daemon: &Daemon, object: ObjectId) -> Option<Vec<u64>> {
+  daemon
+    .fleet_holder_head(object)
+    .ok()
+    .flatten()
+    .and_then(|(_, bytes)| HeadValue::from_record_bytes(&bytes))
+    .map(|head| head.content_holders)
+}
+
+/// Whether the heads in `views` (one per daemon, `None` where it holds none) are at least one, and each names, besides
+/// `owner`, only members among `daemons` that hold `manifest` whole: the holders a successor would fetch from.
+fn heads_name_holders_that_hold(
+  daemons: &[Daemon],
+  owner: HostId,
+  views: &[Option<Vec<u64>>],
+  manifest: [u8; 32],
+) -> bool {
+  let held: Vec<&Vec<u64>> = views.iter().flatten().collect();
+  !held.is_empty()
+    && held.iter().all(|holders| {
+      holders.iter().filter(|host| **host != owner.0).all(|host| {
+        daemons
+          .iter()
+          .find(|daemon| {
+            daemon
+              .member_identity()
+              .is_ok_and(|member| member.0 == *host)
+          })
+          .is_some_and(|daemon| daemon.fleet_holder_content(manifest) == Ok(true))
+      })
+    })
+}
+
+/// Waits for one of `daemons` to take `object` over (its head placed there), then reads `name`'s file back from it:
+/// whether one did, and the bytes read.
+fn successor_reads(
+  daemons: &[Daemon],
+  object: ObjectId,
+  id: VolumeId,
+  name: &str,
+) -> (bool, Option<Vec<u8>>) {
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let mut successor = None;
+  let took_over = poll_until(&survivors, SERVE_DEADLINE, || {
+    successor = daemons
+      .iter()
+      .position(|daemon| daemon.fleet_head_placed(object) == Ok(true));
+    Ok(successor.is_some())
+  });
+  let got = successor.and_then(|index| {
+    poll_status_answers(&survivors, daemons[index].instance(), id)
+      .then(|| read_hello_over_nfs(&daemons[index], name))
+  });
+  (took_over, got)
+}
+
+/// §4.10 "the healer"; §4.8 "Promotion and takeover": a holder the shipped head names that leaves the fleet is replaced
+/// by a heal, and the head is republished naming holders that hold the content, so the owner's later death is survived.
+/// Do seal a snapshot on a five-node `f = 1` fleet, stop the remote holder the head names and let the survivors retire
+/// it, let the healer run, then kill the owner. Expect every head a survivor holds to name only members that hold the
+/// content, within three healer periods of the retirement; the owner to have republished the head with nothing a client
+/// sees changed (the status's head, snapshot and attachment counts, bytes and lease epoch, and the file's bytes); and a
+/// survivor to take the volume over and read the file back byte for byte. Two failures, the second after the fleet
+/// absorbed the first, so each is within `f`. Before, a heal re-recorded the placement on the current cohort but the
+/// head kept naming the departed holder, since a head is never rewritten at its sequence (2026-11-08).
+#[test]
+fn a_heal_republishes_the_head_once_a_named_holder_has_left() {
+  heal_republishes_once_a_named_holder_has_left(false);
+}
+
+/// [`a_heal_republishes_the_head_once_a_named_holder_has_left`] for a live-shipped volume (A-200): its head is
+/// republished the same way and its live log is left as it was, so the successor still takes it over and serves it.
+#[test]
+fn a_heal_republishes_a_live_volumes_head_once_a_named_holder_has_left() {
+  heal_republishes_once_a_named_holder_has_left(true);
+}
+
+/// The body of the two republish tests: a plain volume, or a live-shipped one when `live`.
+fn heal_republishes_once_a_named_holder_has_left(live: bool) {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c", "d", "e"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let pid = std::process::id();
+  let instance_a = format!("fleet3-{}-{pid}", hosts[0].0);
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let mut daemons = start_mesh_with_f(nodes, &hosts, &certs, &serve, 1);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+
+  let name = "departed-holder";
+  let (id, manifest, named_at_seal, departing) =
+    match sealed_with_a_named_remote(&instance_a, &daemons, &hosts, name, live) {
+      Ok(sealed) => sealed,
+      Err(why) => {
+        for daemon in daemons {
+          daemon.stop();
+        }
+        panic!("setup: {why}");
+      }
+    };
+  let object = ObjectId(id.bytes);
+  // What a client sees of the volume before the heal: a republish must change none of it but the placement. The view is
+  // taken after the test's own first read, whose mount is an attachment the status counts.
+  let mut client = Client::connect(&instance_a);
+  let read_before = read_hello_over_nfs(&daemons[0], name);
+  let before = client_view(&mut client, id);
+
+  // The named holder leaves the fleet; the survivors retire it.
+  let gone = hosts[departing];
+  daemons.remove(departing).stop();
+  let retired = poll_survivors_retire(&daemons, gone);
+  // The healer replaces it, and the head is republished naming members that hold the content.
+  let all: Vec<&Daemon> = daemons.iter().collect();
+  let mut views: Vec<Option<Vec<u64>>> = Vec::new();
+  let whole = poll_for_periods(&all, PLACEMENT_DEADLINE, NAMED_SET_PERIODS, || {
+    views = daemons[1..]
+      .iter()
+      .map(|daemon| named_holders(daemon, object))
+      .collect();
+    Ok(heads_name_holders_that_hold(
+      &daemons, hosts[0], &views, manifest,
+    ))
+  });
+  let after = client_view(&mut client, id);
+  let read_after = read_hello_over_nfs(&daemons[0], name);
+  let counters = daemons[0].refusals_on_every_shard();
+  let republished = counters
+    .as_ref()
+    .map(|counters| counters.get("fleet.heal.republished").copied().unwrap_or(0))
+    .map_err(Clone::clone);
+  // The owner's healer and content counts, printed with a failure: which step the heal reached.
+  let healer: Vec<(String, u64)> = counters
+    .iter()
+    .flatten()
+    .filter(|(name, _)| {
+      name.starts_with("fleet.heal")
+        || name.starts_with("fleet.content")
+        || name.starts_with("fleet.seal")
+    })
+    .map(|(name, count)| (name.to_string(), *count))
+    .collect();
+
+  // The owner dies; a survivor takes the volume over and serves it.
+  let owner = hosts[0];
+  daemons.remove(0).stop();
+  let (took_over, got) = successor_reads(&daemons, object, id, name);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    retired,
+    "the survivors retired the departed holder {gone:?}"
+  );
+  assert!(
+    whole,
+    "every head the survivors hold names members that hold the content: heads name {views:?}; named at the seal \
+     {named_at_seal:?}; departed {gone:?}; republished {republished:?}; the owner's counts {healer:?}"
+  );
+  assert!(
+    republished.as_ref().is_ok_and(|count| *count > 0),
+    "the owner republished the head: {republished:?}"
+  );
+  assert!(
+    before.is_some() && before == after && read_before == read_after,
+    "a republish changes nothing a client sees but the placement: status (head, snapshots, attachments, referenced, \
+     lease epoch) {before:?} → {after:?}; the file read the same: {}",
+    read_before == read_after
+  );
+  assert!(
+    took_over,
+    "a survivor took over the dead owner {owner:?}'s volume"
+  );
+  assert_eq!(
+    got.as_deref(),
+    Some(CONTENT),
+    "the successor reads the file back byte for byte"
+  );
+}
+
+/// §4.10 "the healer"; banned item 8 (every retry loop bounded): a heal that replaces a departed holder and whose every
+/// put is refused ends at the membership horizon, counted, and the volume is healed on a later step once the refusal
+/// lifts. Do seal a snapshot on a five-node `f = 1` fleet, have every member but the owner refuse content puts, stop the
+/// remote holder the head names and let the survivors retire it; then lift the refusal. Expect the owner to count
+/// `fleet.heal.unfinished` while the refusal holds, and after it lifts to republish the head naming members that hold
+/// the content. Before, a replace that could not place stayed open for good and the healer skipped the volume while it
+/// did (2026-11-09: one replace refused at the door left the head naming the departed holder for 300 periods).
+#[test]
+fn a_heal_that_cannot_place_ends_at_its_bound_and_the_volume_is_healed_later() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c", "d", "e"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let pid = std::process::id();
+  let instance_a = format!("fleet3-{}-{pid}", hosts[0].0);
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let mut daemons = start_mesh_with_f(nodes, &hosts, &certs, &serve, 1);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+
+  let name = "refused-replace";
+  let (id, manifest, named_at_seal, departing) =
+    match sealed_with_a_named_remote(&instance_a, &daemons, &hosts, name, false) {
+      Ok(sealed) => sealed,
+      Err(why) => {
+        for daemon in daemons {
+          daemon.stop();
+        }
+        panic!("setup: {why}");
+      }
+    };
+  let object = ObjectId(id.bytes);
+  let refused = refuse_content_puts(&daemons[1..], true);
+
+  // The named holder leaves the fleet; the survivors retire it; every replace the owner's healer starts is refused.
+  let gone = hosts[departing];
+  daemons.remove(departing).stop();
+  let retired = poll_survivors_retire(&daemons, gone);
+  let all: Vec<&Daemon> = daemons.iter().collect();
+  let owner_count = |name: &str| {
+    daemons[0]
+      .refusals_on_every_shard()
+      .map(|counters| counters.get(name).copied().unwrap_or(0))
+  };
+  let ended = poll_for_periods(&all, PLACEMENT_DEADLINE, NAMED_SET_PERIODS, || {
+    owner_count("fleet.heal.unfinished").map(|count| count > 0)
+  });
+  let unfinished = owner_count("fleet.heal.unfinished");
+  let republished_while_refused = owner_count("fleet.heal.republished");
+
+  // The refusal lifts; a later healer step places the content and republishes the head.
+  let lifted = refuse_content_puts(&daemons[1..], false);
+  let mut views: Vec<Option<Vec<u64>>> = Vec::new();
+  let whole = poll_for_periods(&all, PLACEMENT_DEADLINE, NAMED_SET_PERIODS, || {
+    views = daemons[1..]
+      .iter()
+      .map(|daemon| named_holders(daemon, object))
+      .collect();
+    Ok(heads_name_holders_that_hold(
+      &daemons, hosts[0], &views, manifest,
+    ))
+  });
+  let republished = owner_count("fleet.heal.republished");
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    refused.is_ok() && lifted.is_ok() && retired,
+    "the refusal was installed ({refused:?}) and lifted ({lifted:?}), and the survivors retired {gone:?} ({retired})"
+  );
+  assert!(
+    ended && republished_while_refused == Ok(0),
+    "a replace whose puts were all refused ended at its bound, counted: fleet.heal.unfinished {unfinished:?}, \
+     republished meanwhile {republished_while_refused:?}"
+  );
+  assert!(
+    whole && republished.as_ref().is_ok_and(|count| *count > 0),
+    "once the refusal lifted the volume was healed: heads name {views:?}; named at the seal {named_at_seal:?}; \
+     departed {gone:?}; republished {republished:?}"
+  );
+}
+
+/// Has each of `daemons` refuse every content put while `refuse` holds (the holder-side merge fault), or serve them
+/// again: `Ok` once every one installed it, else the first typed refusal.
+fn refuse_content_puts(daemons: &[Daemon], refuse: bool) -> Result<Vec<()>, ObserveError> {
+  daemons
+    .iter()
+    .map(|daemon| {
+      daemon.inject_merge_fault(slates_server::merge_service::MergeFault {
+        refuse_content_puts: refuse,
+        ..Default::default()
+      })
+    })
+    .collect()
 }
 
 /// AC (§4.10 "anti-entropy walks Merkle manifests between recorded holders and repairs only differing
@@ -13970,7 +14681,7 @@ fn a_version_appended_before_its_owner_restarted_commits_once_it_is_back() {
 /// green's head at version 1.
 #[test]
 fn a_submit_resent_under_its_id_after_its_owner_restarted_is_answered_its_version_once() {
-  submit_resent_after_its_owner_restarted(false);
+  submit_resent_after_its_owner_restarted(RestartCase::default());
 }
 
 /// §4.16 "Commit", A-252: the resend arrives while the version still cannot commit (the holders still withhold it) on an
@@ -13978,7 +14689,34 @@ fn a_submit_resent_under_its_id_after_its_owner_restarted_is_answered_its_versio
 /// durable wait, never `Seen::New`), then the version it was accepted as once the record commits.
 #[test]
 fn a_submit_resent_while_its_version_still_waits_after_the_restart_joins_the_wait() {
-  submit_resent_after_its_owner_restarted(true);
+  submit_resent_after_its_owner_restarted(RestartCase {
+    before_lift: true,
+    ..RestartCase::default()
+  });
+}
+
+/// §4.16 "Commit", A-252, the snapshot case: the owner's partition is snapshotted after the version was appended and
+/// while its submit waits, so recovery reads the submit's durable wait from the snapshot, not from the log entry that
+/// staged it. Expect the resend answered `Submitted { version: Some(1) }` and the green at version 1, as without one.
+#[test]
+fn a_submit_resent_after_its_owners_snapshot_and_restart_is_answered_its_version_once() {
+  submit_resent_after_its_owner_restarted(RestartCase {
+    snapshot_before_restart: true,
+    ..RestartCase::default()
+  });
+}
+
+/// §4.16 "Commit", A-252, the long replay: 300 versions committed before the waiting one, so the restarted owner replays
+/// a 301-entry chain and re-enqueues the waiting version's record (A-246) while the resend arrives. Expect the resend
+/// answered `Submitted { version: Some(301) }` and the green at 301: the wait survives the replay, never `Seen::New`.
+#[test]
+fn a_submit_resent_while_its_owner_replays_a_long_chain_is_answered_its_version_once() {
+  /// Shape: committed versions before the waiting one, a replay far longer than one shard step's slice.
+  const PRIOR_VERSIONS: u64 = 300;
+  submit_resent_after_its_owner_restarted(RestartCase {
+    prior_versions: PRIOR_VERSIONS,
+    ..RestartCase::default()
+  });
 }
 
 /// Shape: how long a resend is watched for an answer it must not get while its version cannot commit: a liveness
@@ -14010,6 +14748,10 @@ fn answer_while_waiting(client: &mut slates_client::Client, word: u64) -> Option
 
 /// What [`submit_resent_after_its_owner_restarted`] saw, for [`check_resent_after_restart`].
 struct ResentAfterRestart {
+  /// The versions committed before the waiting one: it is version `prior + 1`.
+  prior: u64,
+  /// Whether the owner's partition snapshot was taken before the restart, when the case asked for one.
+  snapshotted: Option<Result<bool, ObserveError>>,
   edited: ReplyBody,
   faulted: Vec<Result<(), ObserveError>>,
   lifted: Vec<Result<(), ObserveError>>,
@@ -14049,6 +14791,14 @@ fn check_resent_after_restart(seen: ResentAfterRestart) {
     "version 1 was appended and its submit waited before the restart"
   );
   assert!(
+    seen
+      .snapshotted
+      .as_ref()
+      .is_none_or(|taken| matches!(taken, Ok(true))),
+    "the owner's partition snapshot was taken before the restart: {:?}",
+    seen.snapshotted
+  );
+  assert!(
     seen.reconnected,
     "the client reconnected under its id after the restart"
   );
@@ -14064,14 +14814,16 @@ fn check_resent_after_restart(seen: ResentAfterRestart) {
     );
     assert_eq!(
       *held,
-      ReplyBody::Versions { head: 1 },
+      ReplyBody::Versions {
+        head: seen.prior + 1
+      },
       "and nothing ran again: the green holds the one version appended before the restart"
     );
   }
   assert_eq!(
     seen.answer,
     Some(Ok(ReplyBody::Submitted {
-      version: Some(1),
+      version: Some(seen.prior + 1),
       conflicts: Vec::new(),
     })),
     "the submit resent under its id after the restart is answered the version it was accepted as: {:?}",
@@ -14079,15 +14831,33 @@ fn check_resent_after_restart(seen: ResentAfterRestart) {
   );
   assert_eq!(
     seen.head,
-    ReplyBody::Versions { head: 1 },
-    "the green holds the submit once: its head is version 1, not a second copy"
+    ReplyBody::Versions {
+      head: seen.prior + 1
+    },
+    "the green holds the submit once: its head is the version it was accepted as, not a second copy"
   );
 }
 
-/// The restart cases of A-252. `before_lift`: the client resends while the holders still withhold the version's record
-/// and is held to no answer and no second version until they lift it; else the fault is lifted first.
+/// One restart case of A-252 ([`submit_resent_after_its_owner_restarted`]).
+#[derive(Clone, Copy, Default)]
+struct RestartCase {
+  /// The client resends while the holders still withhold the version's record, and is held to no answer and no second
+  /// version until they lift it; else the fault is lifted first.
+  before_lift: bool,
+  /// The owner's partition is snapshotted after the version is appended, so recovery reads the wait from the snapshot.
+  snapshot_before_restart: bool,
+  /// Versions committed before the waiting one, each from its own work, so the restart replays a chain that long.
+  prior_versions: u64,
+}
+
+/// The restart cases of A-252, each a [`RestartCase`].
 #[allow(clippy::cognitive_complexity)]
-fn submit_resent_after_its_owner_restarted(before_lift: bool) {
+fn submit_resent_after_its_owner_restarted(case: RestartCase) {
+  let RestartCase {
+    before_lift,
+    snapshot_before_restart,
+    prior_versions,
+  } = case;
   let _serial = serialize_fleet_tests();
   let pid = std::process::id();
   let profiles: Vec<_> = ["once-restart-a", "once-restart-b", "once-restart-c"]
@@ -14162,6 +14932,7 @@ fn submit_resent_after_its_owner_restarted(before_lift: bool) {
   let ReplyBody::GreenCreated { id: green } = created else {
     panic!("create green: {created:?}");
   };
+  let prior = timed_submits(&mut client, green, prior_versions);
   let ReplyBody::WorkCreated { id: work, .. } = client.call(&RequestBody::CreateWork {
     green,
     name: "work".to_owned(),
@@ -14197,6 +14968,7 @@ fn submit_resent_after_its_owner_restarted(before_lift: bool) {
     .ok()
     .and_then(|word| answer_within(&mut resender, *word));
   let awaiting_before = daemons[0].merge_awaiting(green);
+  let snapshotted = snapshot_before_restart.then(|| daemons[0].snapshot_green_partition(green));
   drop(client);
   daemons.remove(0).stop();
   daemons.insert(
@@ -14251,7 +15023,16 @@ fn submit_resent_after_its_owner_restarted(before_lift: bool) {
   for daemon in daemons {
     daemon.stop();
   }
+  assert!(
+    prior.iter().all(|(index, _, submitted, _)| matches!(
+      submitted,
+      ReplyBody::Submitted { version: Some(version), .. } if *version == index + 1
+    )),
+    "every earlier version committed in order before the waiting one"
+  );
   check_resent_after_restart(ResentAfterRestart {
+    prior: prior_versions,
+    snapshotted,
     edited,
     faulted,
     lifted,
@@ -16290,16 +17071,99 @@ fn assert_sealed_heads_cover_every_survivor(heads: Option<(bool, Vec<Option<Head
   }
 }
 
+/// A forward read through the one node left of a formed three-node fleet, of a volume whose owner that node holds dead
+/// with no peer left to answer a location round, `failover_slo_ns` applied to that node first when given: the reply, and
+/// how many polls the location budget spent (`fleet.owner_location.retried`).
+fn read_with_no_owner_to_find(failover_slo_ns: Option<u64>) -> (ReplyBody, u64) {
+  let (_serve_lease, mut daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let mut owner_client = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id } = owner_client.call(&scratch("no-owner-to-find")) else {
+    panic!("setup: the volume was not created on A");
+  };
+  share_with_fleet(&mut owner_client, id, &daemons);
+  drop(owner_client);
+  let survivor = daemons.remove(1);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  survivor
+    .observe_peer_dead(hosts[0], FALSE_DEATH_INCARNATION)
+    .expect("the owner is held dead on the survivor");
+  if let Some(slo) = failover_slo_ns {
+    survivor
+      .observation(
+        Some(survivor.shards()[0]),
+        slates_server::daemon::OBSERVE_BUDGET_NS,
+        move |state: &mut slates_server::state::ShardState| state.config.failover_slo_ns = slo,
+      )
+      .unwrap()
+      .wait()
+      .expect("the ceiling is set on the survivor's control shard");
+  }
+  let retried = |daemon: &Daemon| {
+    daemon.fleet_refusals().map_or(0, |counters| {
+      counters
+        .get("fleet.owner_location.retried")
+        .copied()
+        .unwrap_or(0)
+    })
+  };
+  let before = retried(&survivor);
+  let reply = Client::connect(survivor.instance()).call(&RequestBody::Status { volume: id });
+  let polls = retried(&survivor).saturating_sub(before);
+  survivor.stop();
+  (reply, polls)
+}
+
+/// §4.8 "Lookup", the other side of the location budget counted in polls (`verbs::LOCATION_POLLS`): a forward whose
+/// owner cannot be found still ends. Do: read a volume through a node that holds its owner dead, with no peer left to
+/// answer a location round. Expect: the read is refused, having retried the location at least once and no more than the
+/// budget's polls (each round here waits its peers out, so the failover SLO ends it first: 9 polls at the 10 s default).
+/// So a genuinely stuck owner's client now waits up to the SLO, where it was refused after about 1 s; a refusal before a
+/// takeover can finish would be a false one. A counter, so the bound holds whatever a loaded machine does to the time
+/// each poll takes.
+#[test]
+fn a_forward_with_no_owner_to_find_is_refused_within_its_location_budget() {
+  let _serial = serialize_fleet_tests();
+  let (reply, polls) = read_with_no_owner_to_find(None);
+  assert!(
+    matches!(reply, ReplyBody::Refused { .. }),
+    "the read is refused: {reply:?}"
+  );
+  assert!(
+    (1..=slates_server::verbs::LOCATION_POLLS).contains(&polls),
+    "the location was retried within its budget's polls ({polls}): {reply:?}"
+  );
+}
+
+/// The ceiling on the same budget: one location round can wait a liveness budget for peers that do not answer, so the
+/// polls alone could run a hundred times that; the operator's failover SLO ends the wait. Do: the same read with the
+/// node's SLO at one nanosecond. Expect: refused at its first look at the ceiling, with no poll spent.
+#[test]
+fn the_failover_slo_ends_a_forwards_location_budget() {
+  let _serial = serialize_fleet_tests();
+  let (reply, polls) = read_with_no_owner_to_find(Some(1));
+  assert!(
+    matches!(reply, ReplyBody::Refused { .. }),
+    "the read is refused: {reply:?}"
+  );
+  assert_eq!(polls, 0, "the ceiling ended the budget at once: {reply:?}");
+}
+
 /// Shape: the forwarded calls the false-death recovery test times, one false death each.
 const FALSE_DEATH_TRIALS: u32 = 5;
 
 /// §4.8 "Lookup" under the detector's stated accuracy (a live member condemned within its mistake allowance, the death
 /// gossiped and refuted): how long a node holding a live owner dead keeps its clients from that owner's volume. Do: on a
 /// three-node fleet, create a volume on A and reach it from B's client; then, [`FALSE_DEATH_TRIALS`] times, inject a
-/// false death of A into B alone and poll the forwarded status from B's client until it is served. Expect: no call
-/// refused, each trial served within one liveness budget (the forward's location allowance), the times printed for
-/// the A/B of the recovery path (`docs/wip/BENCHMARKS.md`). Before 2026-10-08 every false death refused at least one
-/// call `HomedElsewhere`; the forward now retries its owner's resolution within that allowance.
+/// false death of A into B alone and poll the forwarded status from B's client until it is served. Expect: the forward's
+/// location never gave up before its budget ended, its polls spent or the failover SLO reached
+/// (`fleet.owner_location.gave_up` no more than `slo_ended` plus `polls_spent`), and at least one trial served. Judged by
+/// the daemon's counts, not a time: the client's stopwatch is printed for the A/B of the recovery path
+/// (`docs/wip/BENCHMARKS.md`). A call refused otherwise is printed, not judged: on a starved origin the forward lane gives
+/// up a batch that cannot get its session within a wall budget (`forward_lane::forward_batch`, `quiet_ns >= stall_ns`),
+/// owed to A-232 (GAPS). Before 2026-10-08 every false death refused at least one call `HomedElsewhere`; the forward now
+/// retries its owner's resolution within its budget.
 #[test]
 fn a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget() {
   let _serial = serialize_fleet_tests();
@@ -16320,9 +17184,15 @@ fn a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget()
       ReplyBody::Status { .. }
     ))
   });
+  let before = location_ends(&daemons[1]);
   let outages: Vec<_> = (0..FALSE_DEATH_TRIALS)
     .map(|trial| time_false_death(&daemons, &mut forwarded, hosts[0], id, trial))
     .collect();
+  let after = location_ends(&daemons[1]);
+  let (gave_up, ended) = (
+    after.0.saturating_sub(before.0),
+    after.1.saturating_sub(before.1),
+  );
   let counters = daemons[1].fleet_refusals();
   for daemon in daemons {
     daemon.stop();
@@ -16332,17 +17202,31 @@ fn a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget()
     reached,
     "B's client reached A's volume before the false deaths"
   );
-  for (injected, served, took, refused) in &outages {
-    assert!(*injected, "the false death landed on B");
-    assert_eq!(
-      *refused, 0,
-      "no call was refused while the false death lasted: {outages:?}; B's counters {counters:?}"
-    );
-    assert!(
-      *served && *took < Duration::from_nanos(LIVENESS_BUDGET_NS),
-      "a forward recovered from a refuted false death within its location budget: {outages:?}; B's counters {counters:?}"
-    );
-  }
+  assert!(
+    outages.iter().all(|(injected, ..)| *injected),
+    "every false death landed on B: {outages:?}"
+  );
+  assert!(
+    gave_up <= ended,
+    "the forward's location never gave up before its budget ended: {gave_up} gave up, {ended} at the budget's end; \
+     {outages:?}; B's counters {counters:?}"
+  );
+  assert!(
+    outages.iter().any(|(_, served, ..)| *served),
+    "a forward recovered from a refuted false death: {outages:?}; B's counters {counters:?}"
+  );
+}
+
+/// `daemon`'s forward location give-ups (`fleet.owner_location.gave_up`), and those at the budget's own ends
+/// (`slo_ended` plus `polls_spent`).
+fn location_ends(daemon: &Daemon) -> (u64, u64) {
+  daemon.fleet_refusals().map_or((0, 0), |counters| {
+    let of = |name: &str| counters.get(name).copied().unwrap_or(0);
+    (
+      of("fleet.owner_location.gave_up"),
+      of("fleet.owner_location.slo_ended") + of("fleet.owner_location.polls_spent"),
+    )
+  })
 }
 
 /// One false-death trial: injects a false death of `owner` into `daemons[1]` and polls `client`'s forwarded status of

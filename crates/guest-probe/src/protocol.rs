@@ -198,9 +198,21 @@ pub enum Command {
     /// How many sweeps.
     sweeps: u64,
   },
+  /// A-94 by use: the guest's root copies this probe to `path` under the mount as a setuid-root program (mode 04755,
+  /// owned by uid 0, as any root writer of a volume can make one), runs it as `nobody` with [`REPORT_EUID`], and answers
+  /// [`Reply::Ran`] with the effective uid it ran with: 0 where the mount honours the setuid bit, the caller's where the
+  /// mount is `nosuid`.
+  Escalate {
+    /// The program's path, relative to the mount.
+    path: String,
+  },
   /// Unmap, unmount, sync and power the VM off.
   Quit,
 }
+
+/// Format: the argument that makes the probe print its effective uid and exit, rather than serve as a guest's `/init`:
+/// how [`Command::Escalate`] runs it.
+pub const REPORT_EUID: &str = "--report-euid";
 
 /// One reply from the guest.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -242,6 +254,11 @@ pub enum Reply {
     digest: u64,
     /// Its path, relative to the mount.
     path: String,
+  },
+  /// The effective uid a [`Command::Escalate`] program ran with.
+  Ran {
+    /// Its effective uid.
+    euid: u32,
   },
   /// The command was refused: what was refused, and why.
   Refused(String),
@@ -332,6 +349,7 @@ impl Command {
         rounds,
       } => format!("storm {at} {len} {byte} {rounds}"),
       Command::Sweep { len, sweeps } => format!("sweep {len} {sweeps}"),
+      Command::Escalate { path } => format!("escalate {path}"),
       Command::Quit => "quit".to_owned(),
     }
   }
@@ -450,6 +468,12 @@ impl Command {
           sweeps: number(sweeps)?,
         })
       }
+      "escalate" => {
+        let [path] = exactly::<1>("escalate", arguments)?;
+        Ok(Command::Escalate {
+          path: path.to_owned(),
+        })
+      }
       "quit" => exactly::<0>("quit", arguments).map(|[]| Command::Quit),
       other => Err(ProtocolError::UnknownVerb(other.to_owned())),
     }
@@ -473,6 +497,7 @@ impl Reply {
         digest,
         path,
       } => format!("entry {} {size} {digest:016x} {path}", kind.word()),
+      Reply::Ran { euid } => format!("euid {euid}"),
       Reply::Refused(why) => format!("refused {why}"),
       Reply::Fatal(why) => format!("fatal {why}"),
     };
@@ -499,6 +524,7 @@ impl Reply {
       "timedout" => number(rest).map(|seen| Reply::TimedOut { seen }),
       "stormed" => number(rest).map(|micros| Reply::Stormed { micros }),
       "entry" => entry_of(rest),
+      "euid" => number(rest).map(|euid| Reply::Ran { euid }),
       "refused" => Ok(Reply::Refused(rest.to_owned())),
       "fatal" => Ok(Reply::Fatal(rest.to_owned())),
       other => Err(ProtocolError::UnknownVerb(other.to_owned())),
@@ -612,6 +638,9 @@ mod tests {
       Command::Sweep {
         len: 196_608,
         sweeps: u64::MAX,
+      },
+      Command::Escalate {
+        path: "suid-probe".to_owned(),
       },
       Command::Quit,
     ] {
@@ -729,6 +758,7 @@ mod tests {
       Reply::Waited { micros: 509 },
       Reply::TimedOut { seen: 104 },
       Reply::Stormed { micros: 412_345 },
+      Reply::Ran { euid: 65_534 },
       Reply::Refused("no map yet".to_owned()),
       Reply::Fatal("mount virtiofs slates: ENODEV".to_owned()),
     ] {

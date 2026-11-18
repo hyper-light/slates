@@ -454,12 +454,24 @@ is the §4.8 takeover. The in-pod mount read-back is owed with that mount decisi
 
 ## The CI lane
 
-`.github/workflows/ci.yml` `kind:` job (push cadence): `azure/setup-helm@v4` (v4.3.0) and
-`helm/kind-action@v1` (v0.33.0) install the tooling — the versions validated here; non-Rust tooling
-admitted for this lane by the charter, as the conformance lane's suites are — then `cargo test -p xtask
+`.github/workflows/ci.yml` `kind:` job (push cadence): `azure/setup-helm@v4` (v4.3.0) installs helm, and a
+pinned, retried download of the workflow installs kind (v0.33.0) and kubectl, each checked against its
+published SHA-256 — the versions validated here; non-Rust tooling admitted for this lane by the charter, as
+the conformance lane's suites are. The job raises the host's inotify limits to kind's documented values
+(below), then runs `cargo test -p xtask
 --test helm_chart` (the chart gates, also in `gates` on every PR), the export leg (`cargo xtask kind export
 --require-kernel-tls`), the direct leg (`cargo xtask kind direct`, since 2026-10-27) and `cargo xtask kind all` (the
 lane, deleting its cluster at the end). The two legs run on clusters of their own, each deleted at its end.
+
+**The host's inotify limits (2026-11-09).** kind's nodes are privileged containers whose processes run as
+the host's root, so all six share root's inotify instances. Ubuntu 26.04's runner image keeps the kernel's
+`fs.inotify.max_user_instances = 128` (24.04's set 1280); at 128 kube-proxy exited 1 and crash-looped on 4
+of 5 workers, a pod on those nodes could not reach the cluster's DNS, and the fleet never formed
+(`peers_probed=0`, `configuration_version 0`, `ConsensusRecoveryUnavailable`). With kind's documented
+limits (`max_user_instances` 512, `max_user_watches` 524288; kind's Known Issues, "Pod errors due to too
+many open files") 6 of 6 ran with 0 restarts. The job raises them, never lowers them; a Linux host running
+`cargo xtask kind all` needs the same. Record:
+`docs/bugs/2026-11-09-kind-on-ubuntu-26-04-ran-out-of-inotify-instances.md`.
 
 ## Integrator notes (§4.8)
 

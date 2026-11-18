@@ -73,6 +73,27 @@ pub const OBSERVE_BUDGET_NS: u64 = 10 * LIVENESS_BUDGET_NS;
 /// inside the observation's budget.
 pub const SESSION_WAIT_NS: u64 = LIVENESS_BUDGET_NS;
 
+/// How many forwards this control shard has counted meeting a record session out.
+fn forwards_met_out() -> u64 {
+  crate::state::with_state(|s| {
+    s.refusals
+      .get("fleet.forward.session_out")
+      .copied()
+      .unwrap_or(0)
+  })
+  .unwrap_or(0)
+}
+
+/// Waits, on the control shard's timer, for [`forwards_met_out`] to rise past `before` or for `within_ns` to pass.
+async fn await_forward_met(before: u64, within_ns: u64) {
+  let began = slates_rt::futures::now_ns();
+  while forwards_met_out() <= before
+    && slates_rt::futures::now_ns().saturating_sub(began) < within_ns
+  {
+    pace(HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD).await;
+  }
+}
+
 /// What [`Daemon::hold_record_session`] found: the session taken (and how long it waited for it), or, after
 /// [`SESSION_WAIT_NS`], why there was none — a link for the peer whose session never came back to it, or no
 /// link for the peer at all.
@@ -153,13 +174,21 @@ pub fn starved_share_ns(span_ns: u64) -> u64 {
 /// past a window runs it in that shard's observation, where a sleep would be a wedge that ends a daemon no anchor
 /// supervises (`tests/fleet.rs`, `a_silent_owner_leaves_no_forward_the_lane_admitted_unrun`).
 pub fn starve_this_thread(span_ns: u64) -> u64 {
+  starve_this_thread_until(span_ns, &AtomicBool::new(false))
+}
+
+/// [`starve_this_thread`], ended once `released` is set: within the spin of a beat's share at once, or at the end of
+/// the beat's rest, so at most one beat ([`HEARTBEAT_NS`]) after the release. A test releases the hold as soon as it
+/// has seen what the hold was for, so the span is a ceiling, not a time a loaded machine has to beat
+/// ([`Daemon::starve_control_shard_until`]). Returns the span it measured, nanoseconds.
+pub fn starve_this_thread_until(span_ns: u64, released: &AtomicBool) -> u64 {
   let share_ns = starved_share_ns(span_ns);
   let begin = slates_rt::futures::now_ns();
   let end = begin.saturating_add(span_ns);
   let mut beat_began = begin;
-  while slates_rt::futures::now_ns() < end {
+  while slates_rt::futures::now_ns() < end && !released.load(Ordering::Acquire) {
     let share_ends = beat_began.saturating_add(share_ns).min(end);
-    while slates_rt::futures::now_ns() < share_ends {
+    while slates_rt::futures::now_ns() < share_ends && !released.load(Ordering::Acquire) {
       std::hint::spin_loop();
     }
     let beat_ends = beat_began.saturating_add(HEARTBEAT_NS).min(end);
@@ -1218,6 +1247,30 @@ impl Daemon {
     peer: slates_db::HostId,
     span_ns: u64,
   ) -> Result<SessionHold, ObserveError> {
+    self.hold_session(peer, span_ns, 0)
+  }
+
+  /// [`Self::hold_record_session`], held until a forward has met the session out
+  /// (`fleet.forward.session_out` rises past its count when the hold took the session) or `meet_within_ns` has passed,
+  /// and for `span_ns` after that: a test's forward meets the hold however late a loaded machine runs it, where a hold
+  /// of a fixed span can end before the forward arrives.
+  pub fn hold_record_session_until_met(
+    &self,
+    peer: slates_db::HostId,
+    span_ns: u64,
+    meet_within_ns: u64,
+  ) -> Result<SessionHold, ObserveError> {
+    self.hold_session(peer, span_ns, meet_within_ns)
+  }
+
+  /// The hold of [`Self::hold_record_session`] and [`Self::hold_record_session_until_met`]: `meet_within_ns` zero holds
+  /// for `span_ns` alone.
+  fn hold_session(
+    &self,
+    peer: slates_db::HostId,
+    span_ns: u64,
+    meet_within_ns: u64,
+  ) -> Result<SessionHold, ObserveError> {
     let shard = self.shards.first().copied().ok_or(ObserveError::NoTarget)?;
     let runtime = self.runtime.as_ref().ok_or(ObserveError::NoRuntime)?;
     let (taken, took) = std::sync::mpsc::sync_channel::<SessionHold>(1);
@@ -1243,8 +1296,10 @@ impl Daemon {
           }
           pace(HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD).await;
         };
+        let met_before = forwards_met_out();
         let _ = taken.send(outcome);
         if !sessions.is_empty() {
+          await_forward_met(met_before, meet_within_ns).await;
           pace(span_ns).await;
           crate::fleet::return_sessions(sessions);
         }
@@ -2280,6 +2335,19 @@ impl Daemon {
   /// starvation it relied on actually held. Returns once admitted: the caller watches the rest of the
   /// fleet while the shard is held. The hold's budget is the observe budget past the span it holds for.
   pub fn starve_control_shard(&self, span_ns: u64) -> Result<Admitted<u64>, ObserveError> {
+    /// Never set: a plain hold runs out its span.
+    static NEVER_RELEASED: AtomicBool = AtomicBool::new(false);
+    self.starve_control_shard_until(span_ns, &NEVER_RELEASED)
+  }
+
+  /// [`Self::starve_control_shard`], ended early once `released` is set: a test releases the shard as soon as it has
+  /// seen what the hold was for, so its span is a ceiling, not a time a loaded machine has to beat. The answer is the
+  /// measured span, under `span_ns` when the release came first.
+  pub fn starve_control_shard_until(
+    &self,
+    span_ns: u64,
+    released: &'static AtomicBool,
+  ) -> Result<Admitted<u64>, ObserveError> {
     // The hold announces the moment it takes the shard, so this call returns only once the shard is
     // genuinely spinning on it. A question submitted after it is then ordered behind a busy shard that
     // cannot step its scheduler to admit it, so the queued-behind-a-hold path deadlines in the
@@ -2293,7 +2361,7 @@ impl Daemon {
         OBSERVE_BUDGET_NS.saturating_add(span_ns),
         move || {
           let _ = spinning.send(());
-          Ok(starve_this_thread(span_ns))
+          Ok(starve_this_thread_until(span_ns, released))
         },
       )?
       .admit()?;
@@ -2387,6 +2455,15 @@ impl Daemon {
     })
   }
 
+  /// The smallest and largest put-latency reading the owner shard of `object` holds for its content class, or `None`
+  /// before any: a hedge held for the measured p95 was held for a delay between them (test support).
+  pub fn fleet_put_latency_range(
+    &self,
+    object: slates_db::register::ObjectId,
+  ) -> Result<Option<(u64, u64)>, ObserveError> {
+    self.observe(self.shard_of_object(object), |s| s.put_latency.range_ns())
+  }
+
   /// The **measured put latency** of the content class on the shard that owns `object` (§4.8 "Derived
   /// constants": "hedge delay = measured p95 put latency per class"): how many binding content
   /// acknowledgements that owner shard has timed, and their p95 in nanoseconds — the hedge trigger the next
@@ -2431,6 +2508,14 @@ impl Daemon {
         ..record
       };
       crate::fleet::hold_checked_record(s, local, owner, &record)
+    })
+  }
+
+  /// Test support (A-270): whether the held pieces this node's committed recovery journal carries are exactly what it
+  /// holds now (`crate::verbs::committed_held_agrees`), on the shard that holds for other owners.
+  pub fn held_journal_agrees(&self) -> Result<bool, ObserveError> {
+    self.observe(self.shards.first().copied(), |s| {
+      crate::verbs::committed_held_agrees(s)
     })
   }
 
@@ -2726,6 +2811,20 @@ impl Daemon {
       Ok(()) | Err(ObserveError::State(state::StateAccess::Retention(_))) => Ok(()),
       Err(other) => Err(other),
     }
+  }
+
+  /// Test support: takes the snapshot of `green`'s owner partition now, as a log that fills does (§4.8): recovery then
+  /// reads the partition from the snapshot, not the log entries before it, so a test proves what the snapshot carries (a
+  /// submit's durable wait, A-252) across a restart. Whether the snapshot was taken; the typed refusal when it could not
+  /// be observed.
+  pub fn snapshot_green_partition(
+    &self,
+    green: slates_ipc::protocol::VolumeId,
+  ) -> Result<bool, ObserveError> {
+    let object = slates_db::register::ObjectId(green.bytes);
+    self.observe(self.shard_of_object(object), move |s| {
+      s.db.snapshot(&mut s.segment).is_ok()
+    })
   }
 
   /// Test support: runs every shard's publication now, as a transport's barrier does after a mutation (a FUSE `close`,
@@ -3899,7 +3998,7 @@ async fn init_shard(
     journal: slates_vfs::checkpoint_log::Journal::default(),
     checkpoint_buffer: Vec::new(),
     published_keys: std::collections::BTreeSet::new(),
-    published_held: Vec::new(),
+    published_held: crate::content_holder::PublishedHeld::default(),
     #[cfg(target_os = "linux")]
     write_log,
     #[cfg(target_os = "linux")]
@@ -4021,7 +4120,7 @@ async fn init_shard(
     discovery: None,
     enrolled: Vec::new(),
     demuxes: Vec::new(),
-    holder_records: std::collections::BTreeMap::new(),
+    holder_records: crate::tracked::Tracked::default(),
     live: crate::live_ship::LiveState::default(),
     host_takeovers: std::collections::BTreeMap::new(),
     config_refresh_wanted: false,
@@ -6513,6 +6612,141 @@ mod tests {
       .install_configuration(configuration, &regional.members);
   }
 
+  /// One step of the held-pieces oracle's history (A-270): a change to what the shard holds, or a publication.
+  #[derive(Clone, Copy, Debug)]
+  enum HeldStep {
+    /// An entry kept after the last of live copy `copy` (made when it holds none).
+    Push(u8),
+    /// Live copy `copy`'s entries dropped, as a whole entry does.
+    Clear(u8),
+    /// Live copy `copy` let go.
+    Drop(u8),
+    /// A register record held for object `object`.
+    Hold(u8),
+    /// Object `object`'s register dropped.
+    Forget(u8),
+    /// A delta published: what `held_changes` carries, folded over the model.
+    Delta,
+    /// A checkpoint published: everything held.
+    Checkpoint,
+  }
+
+  /// A-270, the oracle of the incremental held image: do run a generated history of live copies kept, cleared, let go
+  /// and made again, and registers held and dropped, publishing deltas and checkpoints between them. Expect after
+  /// every publication the pieces a restart would fold (each checkpoint's, each delta's put and removed applied in
+  /// order) to equal everything the shard holds (`held_image`). A change the tracked maps missed, a live slot reused
+  /// by a copy made again, or a key both put and removed fails here as a difference, before it is a record a restart
+  /// lost.
+  #[test]
+  fn folding_every_held_delta_over_its_checkpoint_gives_what_the_shard_holds() {
+    use proptest::strategy::Strategy;
+    let failures = audit_on_shard(|state| {
+      use slates_db::register::{Acceptor, Authority, HostId, ObjectId};
+      type Model =
+        std::collections::BTreeMap<[u8; slates_vfs::recover::HELD_PIECE_KEY_BYTES], Vec<u8>>;
+      let local = state.fleet.host();
+      let step = (0u8..7, 0u8..3).prop_map(|(kind, which)| match kind {
+        0 | 1 => HeldStep::Push(which),
+        2 => HeldStep::Clear(which),
+        3 => HeldStep::Drop(which),
+        4 => HeldStep::Hold(which),
+        5 => HeldStep::Forget(which),
+        _ if which == 0 => HeldStep::Checkpoint,
+        _ => HeldStep::Delta,
+      });
+      let mut runner = proptest::test_runner::TestRunner::new(slates_test_seeds::unseeded(
+        proptest::test_runner::Config {
+          cases: slates_test_seeds::cases(64),
+          ..proptest::test_runner::Config::default()
+        },
+      ));
+      // The runner's case is an `Fn`, so each case borrows the one shard's state through a cell.
+      let cell = std::cell::RefCell::new(state);
+      let outcome = runner.run(&proptest::collection::vec(step, 1..60), |steps| {
+        let mut borrowed = cell.borrow_mut();
+        let state: &mut crate::state::ShardState = &mut borrowed;
+        state.holder_records.clear();
+        state.live.held.clear();
+        state.published_held = crate::content_holder::PublishedHeld::default();
+        crate::content_holder::held_committed(state, std::collections::BTreeMap::new(), true);
+        let mut model: Model = Model::new();
+        let object = |which: u8| ObjectId([which.saturating_add(1); 16]);
+        for (at, step) in steps.iter().enumerate() {
+          match *step {
+            HeldStep::Push(which) => {
+              let first = state.live.slot_floor;
+              state
+                .live
+                .held
+                .entry(object(which))
+                .or_insert_with(|| crate::live_ship::Held::for_test(local, object(which), first))
+                .push_for_test(format!("entry {at}").into_bytes());
+            }
+            HeldStep::Clear(which) => {
+              if let Some(held) = state.live.held.get_mut(&object(which)) {
+                held.clear_for_test();
+              }
+            }
+            HeldStep::Drop(which) => {
+              state.live.held.remove(&object(which));
+            }
+            HeldStep::Hold(which) => {
+              state.holder_records.insert(
+                object(which),
+                Acceptor::new(
+                  local,
+                  Authority {
+                    generation: u64::try_from(at).unwrap(),
+                    owner: HostId(local.0 ^ 1),
+                  },
+                ),
+              );
+            }
+            HeldStep::Forget(which) => {
+              state.holder_records.remove(&object(which));
+            }
+            HeldStep::Delta => {
+              let changes = crate::content_holder::held_changes(state);
+              for piece in &changes.put {
+                proptest::prop_assert!(
+                  !changes.removed.contains(&piece.key),
+                  "step {at}: a key both put and removed"
+                );
+                model.insert(piece.key, piece.bytes.clone());
+              }
+              for key in &changes.removed {
+                model.remove(key);
+              }
+              crate::content_holder::held_committed(state, changes.whole, false);
+            }
+            HeldStep::Checkpoint => {
+              let image = crate::content_holder::held_image(state);
+              let whole = crate::content_holder::whole_of(&image);
+              model = image
+                .into_iter()
+                .map(|piece| (piece.key, piece.bytes))
+                .collect();
+              crate::content_holder::held_committed(state, whole, true);
+            }
+          }
+          if matches!(step, HeldStep::Delta | HeldStep::Checkpoint) {
+            let held: Model = crate::content_holder::held_image(state)
+              .into_iter()
+              .map(|piece| (piece.key, piece.bytes))
+              .collect();
+            proptest::prop_assert_eq!(&model, &held, "step {} ({:?}) of {:?}", at, step, steps);
+          }
+        }
+        Ok(())
+      });
+      outcome.err().map(|failure| format!("{failure}"))
+    });
+    assert_eq!(
+      failures, None,
+      "the folded held pieces equal what the shard holds"
+    );
+  }
+
   /// §4.8 "Promotion and takeover", the f + 1 rule: do make the audit node the leader-to-be of a three-voter `f = 1`
   /// council, then judge who it may retire as the voters' views change. Expect its own lone death vote for a member the
   /// others hold alive (a member it keyed slowly after a restart) to retire nothing, one other voter's fresh report to
@@ -6988,6 +7222,100 @@ mod tests {
       "listed by the owner it moved from: {page:?}"
     );
     assert_eq!(counted, 1);
+  }
+
+  /// A-270 with A-251 (b), the moved case reaching the journal only in a delta: a copy whose authority moves after the
+  /// last checkpoint is restored from that checkpoint and the delta after it, the move with it. Do: retire the owner of
+  /// a record this node holds and publish a checkpoint of the held pieces before the move; run the authority reconcile
+  /// (the move); build the delta's held pieces (`held_changes`) and fold them over the checkpoint's as recovery does;
+  /// drop the acceptors, routing and lineage and restore them from the folded pieces; answer the successor's page.
+  /// Expect: no move at the checkpoint, the register's piece carried by the delta, the restored acceptor naming the
+  /// retired owner it moved from, and the page listing the copy. A move whose mark the tracked map missed would leave
+  /// the checkpoint's piece in place, and the restored copy would name no move and go unlisted.
+  #[test]
+  fn a_copy_moved_after_the_checkpoint_is_restored_from_its_delta_and_still_listed() {
+    use slates_db::register::{HostEpoch, HostPrepare, HostPromise, ObjectId};
+    let object = ObjectId([47; 16]);
+    let (before_move, in_delta, restored_from, departed, page) = audit_on_shard(move |state| {
+      let local = state.fleet.host();
+      let (departed, successor) = retire_the_owner_of_a_held_object(state, object);
+      let before_move = state
+        .holder_records
+        .get(&object)
+        .and_then(|acceptor| acceptor.moved_from());
+      // The checkpoint, before the move.
+      let checkpoint = crate::content_holder::held_image(state);
+      crate::content_holder::held_committed(
+        state,
+        crate::content_holder::whole_of(&checkpoint),
+        true,
+      );
+      let mut journal: std::collections::BTreeMap<_, _> = checkpoint
+        .into_iter()
+        .map(|piece| (piece.key, piece.bytes))
+        .collect();
+      // The move, then the delta after it, folded as recovery folds it (`ShardImage::apply`: puts, then removals).
+      crate::fleet::reconcile_held_authority(state);
+      let changes = crate::content_holder::held_changes(state);
+      let in_delta = changes.put.len();
+      for piece in &changes.put {
+        journal.insert(piece.key, piece.bytes.clone());
+      }
+      for key in &changes.removed {
+        journal.remove(key);
+      }
+      crate::content_holder::held_committed(state, changes.whole, false);
+      let folded: Vec<slates_vfs::recover::HeldPiece> = journal
+        .into_iter()
+        .map(|(key, bytes)| slates_vfs::recover::HeldPiece { key, bytes })
+        .collect();
+      state.holder_records.clear();
+      state.fleet.forget_object(object);
+      state.departed_owners.remove(&object);
+      let held = crate::content_holder::split_held(&folded).unwrap();
+      assert_eq!(
+        crate::content_holder::restore_held_registers(state, local, held),
+        1
+      );
+      let restored_from = state
+        .holder_records
+        .get(&object)
+        .and_then(|acceptor| acceptor.moved_from());
+      state.answers_given.alive_answers.insert(
+        departed,
+        slates_machine::clock::monotonic_ns() - crate::lease::horizon_ns() - 1,
+      );
+      let prepare = HostPrepare {
+        departed,
+        owner: successor,
+        epoch: HostEpoch(2),
+        generation: state.fleet.configuration().version,
+        after: None,
+        named: Vec::new(),
+      };
+      let page = crate::takeover::serve_host_prepare(state, local, successor, &prepare.encode());
+      (before_move, in_delta, restored_from, departed, page)
+    });
+    assert_eq!(
+      before_move, None,
+      "the checkpoint was taken before the move"
+    );
+    assert!(in_delta > 0, "the delta carried the moved register's piece");
+    assert_eq!(
+      restored_from,
+      Some(departed),
+      "the checkpoint and its delta kept the owner the copy moved from"
+    );
+    let page = HostPromise::decode(&page).expect("the page answers");
+    assert_eq!(
+      page
+        .entries
+        .iter()
+        .map(|(listed, _)| *listed)
+        .collect::<Vec<_>>(),
+      vec![object],
+      "the restored copy is listed: {page:?}"
+    );
   }
 
   /// A-251 (b), the moved case across a warm restart: the held image keeps the retired owner a copy's authority moved

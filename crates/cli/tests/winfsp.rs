@@ -1816,6 +1816,62 @@ fn a_base_on_the_daemons_own_drive_is_refused_before_any_open() {
   assert_eq!(code, 0, "unmount: {err}");
 }
 
+/// A-227, a landing's target on Windows (§4.6: no daemon thread opens a path on a volume the daemon serves; A-185). Do:
+/// on a one-shard daemon, mount a volume at a free drive, make a directory on it, and present a landing of a second
+/// volume into that directory. Expect: refused at once (exit 1, `OwnMount`), the directory still empty, and the daemon
+/// still answering. Before 2026-11-07 the Windows writer's walk opened each component of the target first, through the
+/// daemon's own drive, and A-227's drive check ran only after it.
+#[test]
+fn a_landing_target_on_the_daemons_own_drive_is_refused_before_any_open() {
+  if !live_mount_runs() {
+    return;
+  }
+  let instance = instance("ownland");
+  let _anchor = start_anchor_of(&instance, ONE_SHARD);
+  let created = |name: &str| {
+    let (code, out, err) = run(&instance, &["volume", "create", name, "--bounded", "8MiB"]);
+    assert_eq!(code, 0, "{err}");
+    value_of(&out, "id")
+  };
+  let mounted = created("mounted");
+  let landed = created("landed");
+  let drive = free_drive_letter();
+  let (code, _, err) = run(&instance, &["mount", &mounted, &drive]);
+  assert_eq!(code, 0, "mount: {err}");
+  wait_ready(&format!("{drive}\\"));
+  let target = format!("{drive}\\target");
+  cmd(&["mkdir", &target]);
+  let landing = ["land", &landed, &target, "--json"];
+  let Some((code, out, err)) = run_within(&instance, &landing, OWN_MOUNT_ANSWER) else {
+    panic!(
+      "the daemon did not answer a landing target on its own drive within {OWN_MOUNT_ANSWER:?}: it walked the \
+       target through its own drive and waits on itself"
+    );
+  };
+  assert_eq!(
+    code, 1,
+    "a landing target on the daemon's own drive is refused: {err} {out}"
+  );
+  // The refusal itself, not a reason that names it: a host's `OwnMount` reported as `TargetUnavailable` says "OwnMount"
+  // in its reason too, and passed the looser check on both runners (2026-11-07).
+  assert!(
+    err.contains("LandingTarget") && !err.contains("TargetUnavailable"),
+    "refused as the daemon's own mount, a landing target: {err}"
+  );
+  let listed = Command::new("cmd")
+    .args(["/C", "dir", "/B", "/A", &target])
+    .output()
+    .unwrap();
+  assert!(
+    String::from_utf8_lossy(&listed.stdout).trim().is_empty(),
+    "the target is untouched: {listed:?}"
+  );
+  let (code, _, err) = run(&instance, &["volume", "list"]);
+  assert_eq!(code, 0, "the daemon still answers: {err}");
+  let (code, _, err) = run(&instance, &["unmount", &drive]);
+  assert_eq!(code, 0, "unmount: {err}");
+}
+
 /// Runs `cmd /C` with `args`, asserting it succeeded: the Windows shell's own `mkdir`, `mklink` and `rmdir`, so the test
 /// makes its host directories and junctions without a file write of its own.
 fn cmd(args: &[&str]) {
