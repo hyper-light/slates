@@ -93,21 +93,16 @@
 > its signature; the contract's `land` sends it and `approve_landing` carries it (`CONTRACT` 20). Proven by four
 > landing tests in `signed_work.rs` and the contract's `a_signed_landing_is_judged_and_read_back_through_the_contract`
 > (macOS arm64, 2026-11-18), each guard red alone. **Owed, in order:**
-> - **owned by the replication goal (g230) from 2026-11-18 (g090 closed):** signed work across a takeover. (a) The
->   verdict carried by a version's merge record (`MergeRecordValue`) to its holders and a takeover successor: today a
->   successor records none, so a green taken over reads its merged versions unsigned. (b) The catalog register keeping
->   the write policy, its version and the trusted signers: a successor makes a volume's record with none
->   (`verbs::materialize_taken_over`, and `record_adopted_green` since A-333: `write: None`), since
->   `catalog::CatalogValue` carries neither, so a volume taken over merges and lands as an unset one does, its
->   signed-merge requirement dropped (A-285's sibling too). Both are built and tested, unlanded, on branch
->   `agents/g090-signed-work-takeover` (09a5747b6, merged with main 90216d741): `MergeRecordValue::signature`, recorded
->   in each holder's replica as it accepts the record (`merge_service::recompute`) and as a replica is advanced or
->   rebuilt from the ledger (`merge_origin`), so the engine a successor adopts (A-333) answers each version as its owner
->   judged it; `CatalogValue::write`, `write_version` and `signers`, carried by `AdoptedGreen` and used by
->   `record_adopted_green` and `materialize_taken_over`. Its `crates/server/tests/fleet.rs` tests on three nodes at
->   `f = 1`, `a_greens_policy_signers_and_verdicts_survive_its_owner` and
->   `a_volumes_policy_and_signers_survive_its_owner`, pass with main's A-333 adoption tests (Mac Studio, 2026-11-18),
->   and each fails with its guard removed alone (the adoption or a plain successor dropping the catalog's policy, read
+> - **built and landed 2026-11-18 (A-321's third part; g090's branch `agents/g090-signed-work-takeover`, landed by the
+>   replication goal, g230):** signed work survives a takeover. A version's merge record carries its verdict
+>   (`MergeRecordValue::signature`) to the holders it commits at, each holder's replica records it as it accepts the
+>   record (`merge_service::recompute`) and as a replica is advanced or rebuilt from the ledger (`merge_origin`), and the
+>   successor adopts the replica (A-333), so a green taken over reads its signed versions as they were judged; the catalog
+>   register carries the write policy, its version and the trusted signers (`CatalogValue::write`, `write_version`,
+>   `signers`), carried by `AdoptedGreen` and used by `record_adopted_green` and `materialize_taken_over`, so a successor
+>   enforces and reports them. Tests on three nodes at `f = 1` (`crates/server/tests/fleet.rs`):
+>   `a_greens_policy_signers_and_verdicts_survive_its_owner` and `a_volumes_policy_and_signers_survive_its_owner`, each
+>   failing with its guard removed alone (the adoption or a plain successor dropping the catalog's policy, read
 >   `(None, 0)`; a holder's replica dropping the verdict, read `Unsigned`; the owner shipping none or the catalog
 >   carrying none, never held);
 > - **found here, open (§4.15 "Audit", §4.14):** on a daemon of more than one shard `Audit` reads only the partition of
@@ -648,10 +643,10 @@
 > - **Built:** a local clone of an overlay (below, 2026-11-05's list); the configuration's moved-object exceptions
 >   (§4.8 "Authority scope"); and the planned move of a plain volume (A-291, §4.10's status): place, switch, adopt
 >   and release, the old owner keeping its copy until the new owner has sealed the volume under its own placement,
->   `slates move ID --to HOST` and `slates_api::Instance::move_volume` (contract 25), every refusal typed, a move back
+>   `slates move ID --to HOST` and `slates_api::Instance::move_volume` (contract 26), every refusal typed, a move back
 >   to the creator, a destroyed moved volume's exception dropped; held in process by three-daemon tests of the move,
 >   of the old owner dying at the switch and of the target dying at it (its successor serves, the frozen copy yields);
->   and `capture_base` (§4.15's status: `Instance::capture_base`, contract 26) with the move of a clone of a captured
+>   and `capture_base` (§4.15's status: `Instance::capture_base`, contract 27) with the move of a clone of a captured
 >   base, the form a kiln workspace takes (decided below), held by a three-daemon test that moves such a clone, serves it
 >   on its new owner and destroys the captured snapshot once the old owner let the clone go.
 > - **Owed, in order:** kiln's runners as members (certificates under kiln's CA as the manifest's enrollment root,
@@ -778,7 +773,15 @@
 > both sides (`WorkloadStatus::Stated`); every other byte is compared, and a stated line that stops differing fails, so
 > the list only shrinks. **Decision for Ada:** hard-linked clones and stores on the WinFsp route need WinFsp's driver
 > to pass hard links to its file system, an upstream change to a signed kernel driver (outward-facing); recommended:
-> keep the stated difference and offer the change upstream. **The lanes' first run (CI 44260193629, 2026-11-18, x86_64
+> keep the stated difference and offer the change upstream. **2026-11-18, A-360 (goal g258):** the driver change is
+> written, two commits on WinFsp v2.1 that apply to v2.2 (`docs/wip/winfsp-patches`, never sent to WinFsp), and the
+> drive declares `HardLinks` and serves a forwarded link (its focused tests on both Windows runners). Proven end to end
+> on a test-signing Windows Server 2025 VM under KVM (adacachy) with the patched driver: the live `CreateHardLinkW`
+> test passes (one file index, two links, the other name reads a write 0.9 ms after the writer's close) and `git clone
+> --local` on the drive links all 7 object files, as NTFS does; with WinFsp's own driver the clone dies `failed to
+> create link` and the test skips loudly. The decision now comes with the patch in hand: WinFsp's contributor agreement
+> (upstream; it assigns joint copyright to WinFsp's author) or an EV code-signing certificate and a Microsoft Partner
+> Center account (a slates-signed driver). **The lanes' first run (CI 44260193629, 2026-11-18, x86_64
 > and arm64 alike; A-327):** Mercurial identical but for the three stated lines. git and git's history failed on the
 > drive alone (`fatal: cannot mkdir .: File exists`, `cannot chdir to upstream.git: No such device`): the shared
 > environment's `MSYS=winsymlinks:nativestrict` also turns Git for Windows' own symbolic links on
@@ -2538,6 +2541,22 @@
 >     a conflict's resolution too; a cycle starts at the first send; the row meets the bound with every kind under it at
 >     the rate, names the kind over it (a p99 of exactly 1 ms is not under), and fails below the rate, with an oracle
 >     failure, with a client given up or starved, and with nothing timed.
+>
+>     **The harness's instants are sound, and it says what it may have added (2026-11-18, g083).** The measurer's
+>     1,000-client runs on main `7d760c4ea` (BENCHMARKS, "The 1,000-client bound on main") had three oracle failures,
+>     each at a point whose harness was starved of its CPU, and one recorded a submit's round trip of 5 µs where the
+>     run's submits took 374 to 399 µs. The cause was the harness's: it stamped a send after `Client::begin` had handed
+>     the request to its ring, and a reply before `take_ready` read the ring, so a worker the host preempted in either
+>     gap recorded a send after the verdict that reflected it, or a reply before it came, and the oracle's bounds
+>     (`support/load_oracle.rs`) were unsound. Now a send is read before its handing over and again after it, and a
+>     reply after its ring was read, on the host's monotonic clock (the daemon's spans' clock). Each attempt also has a
+>     `floor` row: its reply was not there when the connection's previous drain began, so the daemon and the ring took
+>     at least that long, whatever the harness's sweep did; `max_drain_gap_ns` is now the longest window a reply's
+>     arrival could not be placed in (it counted a connection's idle time before). Tests, failing first: a worker kept
+>     off its CPU right after handing a request over, while the daemon's one shard answers, still stamps its send before
+>     the daemon's reply was written; and one kept off right after its drain's clock read still stamps the reply it
+>     takes after the daemon read the request (`a_send_is_stamped_before_the_daemon_can_have_answered_it`,
+>     `a_reply_is_stamped_after_the_ring_it_was_taken_from_was_read`).
 >
 >     **Owed, measurement (the supervisor's):** the 1,000-client rung on main with W1 (A-247 step one, landed
 >     2026-11-17) against main before it (02c6469e5). Each think mean runs as its own invocation with a fresh daemon,
@@ -5362,7 +5381,49 @@ failure mode to protect against. `std::` paths resolve on every platform, so lea
 typo in them an error. Red-checked rather than assumed — a planted `rustix::fs::fsync` in `slates-mem`
 still fails `-D clippy::disallowed-methods` with the flag in place, and the plant was removed byte-exact.
 
-### 8a-launcher-ci. `slates exec` writes its own userns maps, which two kernels refuse (2026-10-20, OPEN — a defect, not a runner setting)
+### 8a-launcher-ci. `slates exec` writes its own userns maps, which two kernels refuse (2026-10-20; re-diagnosed 2026-11-05: Ubuntu's AppArmor restriction; CLOSED 2026-11-18 by A-370: slates' profile, used when asked)
+
+> **Closed 2026-11-18 by A-370 (goal g078, kiln 7d8d1280): `slates exec` runs unprivileged on a restricted host, with
+> slates' AppArmor profile loaded and the option on.** Ada's decision the same day: "Ship the profile but feature flag
+> it so whether via SDK (Node/Python), API, or CLI it is user enabled." Design §4.6 "The launcher on a restricted
+> host".
+> - **The profile:** `abi <abi/4.0>,` then `profile <executable> flags=(unconfined) { userns, }`, named by the
+>   executable's real path. It is rendered by the binary for its own path (`slates apparmor profile`) and by the SDKs
+>   and slates-api for any path. `slates apparmor check` says whether the host restricts user namespaces and prints the
+>   root commands that load the profile. slates never loads it (R10) and never writes `/etc/apparmor.d` (R1).
+> - **The flag:** `slates exec --apparmor-profile`, slates-api's `ExecSpec::apparmor` (`AppArmor::Profile`), the Python
+>   SDK's `exec_command(..., apparmor_profile=True)`, the Node SDK's `execCommand(..., { apparmorProfile: true })`; off
+>   unless set.
+>   - Off: a launcher running under its loaded profile leaves it first (`changeprofile unconfined`), so the host's
+>     restriction refuses it as with no profile loaded, and the refusal names the switch; with no profile loaded, the
+>     refusal is word for word the one of 2026-11-05.
+>   - On: the namespace is made under the profile and the command is exec'd unconfined (`exec unconfined`), so it holds
+>     no user-namespace grant.
+> - **Measured** (diagnostics run 44344947954, the launcher's sequence by a probe, 2026-11-18): on `ubuntu-24.04`
+>   (AppArmor 4.0.1, Linux 7.0.0-1017-azure) and `ubuntu-latest`, now Ubuntu 26.04.1 (AppArmor 5.0.2, Linux
+>   7.0.0-1016-aws, `apparmor_restrict_unprivileged_unconfined=1`):
+>   - the profile loaded, the maps, the private tree and the bind succeed, and the command reads the volume;
+>   - the step-out restores the refusal;
+>   - with `exec unconfined` the command runs `unconfined`, and its own `unshare -Ur` is refused (inherited, it
+>     succeeded);
+>   - a copy of the binary at another path is not covered.
+> - **Through the real binary** (diagnostics run 44350784102, 2026-11-18, on `ubuntu-24.04` x86_64 and arm64 and Ubuntu
+>   26.04.1 x86_64, each restricting unprivileged user namespaces):
+>   - the focused unit tests passed (`slates-client` 5, `slates-api` 4, the CLI's grammar 6);
+>   - with no profile loaded, `the_launcher_uses_slates_apparmor_profile_only_when_asked`,
+>     `apparmor_prints_the_profile_and_checks_the_host` and `the_launcher_binds_a_volume_or_names_the_host_setting_that_forbids_it`
+>     passed, 3 of 3; without the option the refusal is word for word the one of 2026-11-05;
+>   - the same test demanding the loaded regime with none loaded failed (the red check);
+>   - with the binary's profile loaded by `apparmor_parser -r`, the three passed again. By hand, with
+>     `--apparmor-profile` the command read the volume as the runner's uid 1001, ran `unconfined`, and its own
+>     `unshare -Ur` was refused; without it the launcher was refused naming the switch (exit 4);
+>   - the SDKs' plumbing tests passed against the built wheel (3 of 3) and addon (1 of 1).
+>
+>   CI's `gates` job runs both regimes on every push since (`The slates exec AppArmor profile, opted into (Linux)`).
+> - The launcher moved from `crates/cli/src/exec.rs` to `crates/api/src/exec.rs`, so an embedding host's executable
+>   serves it (`role::main`'s `exec`), and the profile can name that executable.
+>
+> The entry as it stood on 2026-11-05:
 
 > **Re-diagnosed 2026-11-05 (bug-sweep): the refusal is fixed; the rest is a host setting after all, which slates
 > cannot lift unprivileged.** The entry below drew its conclusion from a probe that execs a shell, and an exec'd process
@@ -7188,8 +7249,9 @@ namespace. An unsatisfiable path is refused with the exact missing directory, ne
 budgeted `unsafe` (`unshare_unsafe`, sound in the single-threaded pre-exec launcher). The `--`
 splits the flags from the command; the parsing is unit-tested on every host, and the launcher
 runs against a real daemon mount in the CI Linux lane. Owed: the daemon publishing its root
-mount so `SLATES_ROOT` need not be set by hand, and the AppArmor-profile detection with the exact
-remedy message (a generic hint is given now).
+mount so `SLATES_ROOT` need not be set by hand. (The AppArmor detection with the exact remedy message landed
+2026-11-05; slates' AppArmor profile, used when the caller asks, with A-370 on 2026-11-18, when the launcher moved to
+`crates/api/src/exec.rs`: GAPS `8a-launcher-ci`.)
 
 The xtask unsafe counter was made word-boundary aware in the same change: it counted the
 substring `unsafe` inside identifiers like `unshare_unsafe`; it now counts the `unsafe` keyword

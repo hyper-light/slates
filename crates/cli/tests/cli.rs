@@ -7360,7 +7360,7 @@ fn shell(script: &str) -> String {
 }
 
 /// Format: the variable naming the daemon's root mount, where a volume appears as `<root>/<volume>`
-/// (`crates/cli/src/exec.rs`); the launcher has no default and refuses without it.
+/// (`crates/api/src/exec.rs`); the launcher has no default and refuses without it.
 #[cfg(target_os = "linux")]
 const ROOT_ENV: &str = "SLATES_ROOT";
 
@@ -7501,6 +7501,207 @@ fn the_launcher_binds_a_volume_or_names_the_host_setting_that_forbids_it() {
     );
   }
   assert_eq!(left.trim(), "", "the host sees nothing at the chosen path");
+}
+
+/// Format: the variable a CI step sets to the AppArmor regime it arranged for this binary before the launcher's
+/// AppArmor test: `absent`, no slates profile loaded for it, or `loaded`, its profile loaded by the step as root. Unset,
+/// the test takes the regime the host has; set, a host in another regime fails it, so a profile the step failed to load
+/// or to unload is never passed off as the other case.
+#[cfg(target_os = "linux")]
+const APPARMOR_REGIME_ENV: &str = "SLATES_TEST_APPARMOR_PROFILE";
+
+/// Format: the launcher's refusal on a host whose AppArmor confines unprivileged user namespaces, word for word as it
+/// read before A-370, which it still reads with the option off and no profile loaded.
+#[cfg(target_os = "linux")]
+const CONFINED_REFUSAL: &str = "this host's AppArmor confines unprivileged user namespaces \
+  (kernel.apparmor_restrict_unprivileged_userns=1), so the launcher's namespace has no capability to bind the volume; an \
+  administrator can allow it with an AppArmor profile for the slates binary that grants `userns,`, or set the sysctl \
+  to 0";
+
+/// What one run of the launcher answered: its exit code, standard output and standard error.
+#[cfg(target_os = "linux")]
+struct Launched {
+  code: i32,
+  out: String,
+  err: String,
+}
+
+/// Runs `slates exec` over `root/vol` at `at`, with the AppArmor option on or off, running a command that reports what
+/// it sees, one line each: the volume's marker through the bind, its own AppArmor label, and whether a user namespace it
+/// makes itself gets the capability to mount (`grant-held`) or not (`grant-withheld`).
+#[cfg(target_os = "linux")]
+fn launch_reporting(root: &str, at: &str, apparmor: bool) -> Launched {
+  let script = format!(
+    "cat {at}/marker; echo; cat /proc/self/attr/apparmor/current 2>/dev/null || echo none; \
+     if unshare -Urm true 2>/dev/null; then echo grant-held; else echo grant-withheld; fi"
+  );
+  let mut command = slates();
+  command.args(["exec", "--volume", "vol", "--at", at]);
+  if apparmor {
+    command.arg("--apparmor-profile");
+  }
+  let output = command
+    .args(["--", "sh", "-c", &script])
+    .env(ROOT_ENV, root)
+    .output()
+    .unwrap();
+  Launched {
+    code: output.status.code().unwrap_or(-1),
+    out: String::from_utf8_lossy(&output.stdout).into_owned(),
+    err: String::from_utf8_lossy(&output.stderr).into_owned(),
+  }
+}
+
+/// A-370 (§4.6 "The launcher"; GAPS `8a-launcher-ci`), with no daemon: a plain directory stands in for the root mount.
+/// Do: ask `slates apparmor check --json` what the launcher will meet, then run `slates exec` with and without
+/// `--apparmor-profile`, its command reporting the volume's marker, its own AppArmor label, and whether a user namespace
+/// it makes itself gets the mount capability. Expect, by the host:
+/// - where AppArmor restricts unprivileged user namespaces and slates' profile is loaded for this binary: with the
+///   option, the command reads the volume, runs `unconfined`, and its own namespace is refused the capability, so it
+///   holds nothing the host withholds; without it, a refusal (exit 4) naming the option, the launcher having left the
+///   loaded profile;
+/// - where it restricts them and no profile is loaded: without the option, the refusal word for word as before A-370;
+///   with it, a refusal naming this binary's profile file and the command that loads it;
+/// - elsewhere (no restriction): the command reads the volume either way.
+///
+/// The host sees nothing at the chosen path after any of them. CI runs it on GitHub's Ubuntu runners in both regimes
+/// (`APPARMOR_REGIME_ENV`), loading the profile as root between them.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_launcher_uses_slates_apparmor_profile_only_when_asked() {
+  let check = slates()
+    .args(["apparmor", "check", "--json"])
+    .output()
+    .unwrap();
+  let report: serde_json::Value = serde_json::from_slice(&check.stdout)
+    .unwrap_or_else(|e| panic!("apparmor check --json: {e}: {:?}", check));
+  let readiness = report["readiness"].as_str().unwrap_or_default().to_owned();
+  match std::env::var(APPARMOR_REGIME_ENV).as_deref() {
+    Ok("loaded") => assert_eq!(readiness, "profile-loaded", "{report}"),
+    Ok("absent") => assert_eq!(readiness, "profile-missing", "{report}"),
+    Ok(other) => panic!("{APPARMOR_REGIME_ENV}={other}: expected `loaded` or `absent`"),
+    Err(_) => {}
+  }
+  let root = build_output_dir("slates-apparmor-root");
+  let at = build_output_dir("slates-apparmor-at");
+  shell(&format!(
+    "mkdir -p {root}/vol && printf through-the-bind > {root}/vol/marker"
+  ));
+  let off = launch_reporting(&root, &at, false);
+  let on = launch_reporting(&root, &at, true);
+  let left = shell(&format!("ls -A {at}"));
+  shell(&format!("rm -rf {root} {at}"));
+  let executable = report["executable"].as_str().unwrap_or_default();
+  match readiness.as_str() {
+    "profile-loaded" => {
+      assert_eq!(
+        on.code, 0,
+        "the profile's launcher runs the command: {}",
+        on.err
+      );
+      assert_eq!(
+        on.out.lines().collect::<Vec<_>>(),
+        ["through-the-bind", "unconfined", "grant-withheld"],
+        "the command reads the volume, runs outside the profile, and holds no user-namespace grant"
+      );
+      assert_eq!(
+        off.code, 4,
+        "without the option the launcher leaves the profile: {}",
+        off.err
+      );
+      assert!(
+        off.err.contains("--apparmor-profile") && off.err.contains(executable),
+        "the refusal names the option and the loaded profile: {}",
+        off.err
+      );
+    }
+    "profile-missing" => {
+      assert_eq!(off.code, 4, "{}", off.err);
+      assert_eq!(
+        off.err.trim(),
+        format!("slates: {CONFINED_REFUSAL}"),
+        "without the option, the refusal as it read before A-370"
+      );
+      assert_eq!(on.code, 4, "{}", on.err);
+      let file = report["profile_file"].as_str().unwrap_or_default();
+      assert!(
+        !file.is_empty()
+          && on.err.contains(&format!("sudo apparmor_parser -r {file}"))
+          && on.err.contains(executable),
+        "with the option, the refusal names this binary's profile and how to load it: {}",
+        on.err
+      );
+    }
+    _ if off.err.contains("cannot create a user+mount namespace") => {
+      eprintln!(
+        "SKIP: this host refuses unprivileged user namespaces outright: {}",
+        off.err
+      );
+    }
+    _ => {
+      for launched in [&off, &on] {
+        assert_eq!(launched.code, 0, "{}", launched.err);
+        assert_eq!(launched.out.lines().next(), Some("through-the-bind"));
+      }
+    }
+  }
+  assert_eq!(left.trim(), "", "the host sees nothing at the chosen path");
+}
+
+/// A-370. Do: print slates' AppArmor profile for an installed path and for this binary's own, and check this host.
+/// Expect: the profile names the path and grants `userns,` in unconfined mode; a path the profile cannot name exactly
+/// is refused (exit 1) naming why; and the check reports the binary's path as the kernel records it, succeeding exactly
+/// where `exec` can make its namespace.
+#[test]
+fn apparmor_prints_the_profile_and_checks_the_host() {
+  let printed = slates()
+    .args([
+      "apparmor",
+      "profile",
+      "--executable",
+      "/usr/local/bin/slates",
+    ])
+    .output()
+    .unwrap();
+  assert!(printed.status.success(), "{printed:?}");
+  let text = String::from_utf8_lossy(&printed.stdout);
+  assert!(
+    text.contains("\nprofile /usr/local/bin/slates flags=(unconfined) {\n  userns,\n}"),
+    "{text}"
+  );
+  let refused = slates()
+    .args([
+      "apparmor",
+      "profile",
+      "--executable",
+      "/opt/my tools/slates",
+    ])
+    .output()
+    .unwrap();
+  assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+  assert!(String::from_utf8_lossy(&refused.stderr).contains("cannot name exactly"));
+  let check = slates()
+    .args(["apparmor", "check", "--json"])
+    .output()
+    .unwrap();
+  let report: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+  let readiness = report["readiness"].as_str().unwrap_or_default();
+  assert_eq!(
+    check.status.success(),
+    matches!(readiness, "unrestricted" | "profile-loaded"),
+    "{report}"
+  );
+  if cfg!(target_os = "linux") {
+    let own = std::fs::canonicalize(env!("CARGO_BIN_EXE_slates")).unwrap();
+    assert_eq!(report["executable"].as_str(), own.to_str(), "{report}");
+    let mine = slates().args(["apparmor", "profile"]).output().unwrap();
+    assert!(
+      String::from_utf8_lossy(&mine.stdout).contains(&format!("profile {} flags", own.display())),
+      "{mine:?}"
+    );
+  } else {
+    assert_eq!(readiness, "unsupported", "{report}");
+  }
 }
 
 /// AUD-29-76 (`slates mount --subtree`). Do: through the real binary against a real anchor-supervised daemon,

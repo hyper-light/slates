@@ -17,6 +17,9 @@
 //!   overlay's drift as typed entries.
 //! - *Serving* ([`mount`], [`Instance::serve_shards`], [`Instance::serve_vhost_user`]): a host mount on bare metal, or
 //!   a descriptor a VMM takes.
+//! - *The chosen-path launcher* ([`exec`], A-370): a volume shown at a path one command names, in a namespace of its
+//!   own, served by the host's own executable; where the host's AppArmor restricts unprivileged user namespaces, it uses
+//!   slates' AppArmor profile only when its user opts in ([`AppArmor`]).
 //! - *Write permission* ([`policy`]): a landing and a merge follow the mode the user gave the harness or agent asking to
 //!   write — bypass, ask, forbid ([`WriteMode`]) — set by the launcher per consumer or volume, never raised by an
 //!   agent. A landing answers [`LandOutcome`], a merge [`MergeOutcome`], a rebase [`RebaseOutcome`] ([`outcome`]).
@@ -63,6 +66,7 @@
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 pub mod error;
+pub mod exec;
 pub mod grant;
 pub mod instance;
 pub mod issuer;
@@ -83,6 +87,7 @@ pub use error::{
   KindMismatch, Missing, MountFault, MountMissing, MoveTarget, Note, PathFault, ProtocolFault,
   RetryCause, Stale, StartFault, Unmovable, Unreported, Unsupported, Unusable,
 };
+pub use exec::{AppArmor, Confinement, ExecFault, ExecSpec, Readiness};
 pub use grant::{GrantAuthority, GrantClaim, GrantProof};
 pub use instance::{Instance, LandingRequest};
 pub use issuer::{GRANT_TERM_NS, Issuer};
@@ -171,13 +176,17 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// outlasted it (kiln's 30 s at load 28, 2026-11-18; A-366). 24: the daemon's status carries the failover delay as the
 /// node estimates it now (`DaemonReport::fleet`'s `failover`, a [`FailoverReport`]): detection, confirmation and
 /// recovery, each with the measurements behind it, summed; nothing sets it, it moves with what the node measures (A-363;
-/// the same day). 25: a volume's move to another fleet member (A-291, the same day): `Instance::move_volume` and
+/// the same day). 25: the chosen-path launcher ([`exec`]): an [`ExecSpec`] whose [`AppArmor`] option, off unless the
+/// user opts in, lets the launcher make its namespace under slates' AppArmor profile where the host restricts
+/// unprivileged user namespaces; [`exec::command`] builds the command that runs it from a host's own executable, which
+/// [`role::main`] serves; [`exec::check`] answers the host's [`Readiness`]; its refusals are [`ExecFault`] (A-370; the
+/// same day). 26: a volume's move to another fleet member (A-291, the same day): `Instance::move_volume` and
 /// `Instance::member`, `MoveProgress`, and its refusals' details (`Busy::Attached`, `Busy::Moving`,
-/// `Unusable::Unmovable`, `Invalid::MoveTarget`, `RetryCause::MoveUnplaced`). 26: `Instance::capture_base`, an overlay's
+/// `Unusable::Unmovable`, `Invalid::MoveTarget`, `RetryCause::MoveUnplaced`). 27: `Instance::capture_base`, an overlay's
 /// base captured whole so its clones move (A-291, the same day).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 26;
+pub const CONTRACT: u32 = 27;
 
 /// The typed client and its own types, for the verbs [`Instance::client`] lends outside the contract.
 pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, VhostUserDevice};

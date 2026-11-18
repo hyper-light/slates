@@ -2689,6 +2689,7 @@ mod tests {
           uid: 0,
         },
         completion: None,
+        signature: None,
       };
       state.pending_green_materializations.insert(
         green,

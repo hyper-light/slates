@@ -1673,6 +1673,7 @@ mod tests {
         uid: 1000,
       },
       completion: None,
+      signature: None,
     }
   }
 

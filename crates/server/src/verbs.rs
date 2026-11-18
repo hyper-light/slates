@@ -11806,11 +11806,11 @@ fn record_adopted_green(
       },
       live_shipped: false,
       live_holders: None,
-      write: None,
-      write_version: 0,
-      // The catalog register carries neither a write policy nor trusted signers yet (GAPS, "Signed work", its open
-      // sibling): a successor's green has none, as one a successor materialized before A-333 had.
-      signers: Vec::new(),
+      // The green's write policy and trusted signers, from its adopted catalog register (A-285, A-321): a successor
+      // enforces and reports them as the departed owner did.
+      write: adopted.write,
+      write_version: adopted.write_version,
+      signers: adopted.signers.clone(),
     },
     base: BaseRecord::Scratch,
     head: DbSnapshotId::default(),
@@ -12226,9 +12226,12 @@ pub(crate) fn materialize_taken_over(
       // The holder set the dead owner's shipper recorded (A-240), kept until this node's own shipper records its own:
       // a catalog shipped meanwhile still names the holders that hold the log.
       live_holders: catalog.live_holders.clone(),
-      write: None,
-      write_version: 0,
-      signers: Vec::new(),
+      // The write policy and trusted signers the launcher set on the departed owner (A-285, A-321): a successor
+      // enforces and reports them as the owner did. Until 2026-11-18 the catalog carried neither and a volume taken
+      // over merged and landed as an unset one does, its signed-merge requirement dropped.
+      write: catalog.write,
+      write_version: catalog.write_version,
+      signers: catalog.signers.clone(),
     },
     // Placed content is always whole in RAM (an overlay's base-backed bodies are never sealed), so the
     // successor serves it with no base beneath.
@@ -17184,6 +17187,9 @@ mod tests {
       live_shipped: false,
       live_holders: None,
       work_of: None,
+      write: None,
+      write_version: 0,
+      signers: Vec::new(),
     }
   }
 
@@ -17769,6 +17775,9 @@ mod tests {
       owner: owner.clone(),
       access: Vec::new(),
       catalog_sequence: 1,
+      write: None,
+      write_version: 0,
+      signers: Vec::new(),
       head: 0,
       identity,
       origin: None,
