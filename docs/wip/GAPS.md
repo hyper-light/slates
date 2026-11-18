@@ -11273,15 +11273,36 @@ Owed:
 Shards streams on macOS have the same shape and are covered: their writes are logged since `1fa154230`; on Windows
 since A-402, which also makes the log option 2 names available to the WinFsp drive.
 
-### 2026-11-18: a snapshot exported as its archive through the library (Mantle's CP-T10.4; built, A-441); the volume from an archive owed
+### 2026-11-18: a volume made from an archive through the library (Mantle's CP-T10.4 import half; built, A-453)
+
+> - **Built.** `Instance::import_archive` (contract 40): a new volume holding the tree of the archive a volume of the
+>   caller's holds as `ARCHIVE_FILE`, run a slice a turn on that volume's owner shard: the file's length admitted
+>   before a byte is read, the file read, decoded and verified (`slates_archive::Decoding`), restored (`Planning`,
+>   `Restoring`) and laid into the volume (the takeover's `verbs::Populating`), the volume and the completion one atom.
+>   Bytes that make no volume are refused `ArchiveRefused { fault }` by kind (`ForeignMagic`, `Unsupported`,
+>   `Truncated`, `Corrupt`, `Malformed`), a tree past its room `BudgetExceeded`, with nothing made.
+> - **Proven (Mac Studio, debug, kiln r310, r318, r320).**
+>   - `a_volume_imported_from_an_exported_archive_holds_the_exported_tree`: two imports of an exported archive each
+>     hold the exported tree in every byte and every entry's metadata save inode numbers; a consumer-written archive
+>     with a symbolic link added comes back with the link; a held name `AlreadyExists`; a size too small
+>     `Exhausted::Memory`, its room given back.
+>   - `a_hostile_archive_is_refused_by_kind_with_nothing_made`: a declared chunk length of `u32::MAX` `Malformed`, a
+>     cut header `Truncated`, one bit flipped `Corrupt`, a zip's magic `ForeignMagic`, nothing made each time.
+>   - Red once each: the laying skipped, and a foreign magic classed `Corrupt`.
+> - **Owed.**
+>   - A streamed decoder: the file is held whole while it is decoded, and the decoded archive beside the restored tree
+>     until the restore ends, so an import near the shard's room holds its tree about twice for that time.
+>   - The manifest's decode and Merkle identity in pieces: one piece today, a walk of the whole tree.
+>   - The full api suite, Linux and Windows lanes: filed for main (run-requests.md, 2026-11-18).
+
+### 2026-11-18: a snapshot exported as its archive through the library (Mantle's CP-T10.4; built, A-441); the volume from an archive built (A-453)
 
 > - **Built.** `Instance::export_archive` (contract 38): a snapshot rendered as its archive file (`ARCHIVE_FILE`) in a
 >   new volume of the caller's, walked in slices on the owner shard, read back a page at a time with `read`.
 >   `a_snapshot_exported_as_its_archive_carries_every_file_and_entry` decodes and restores what it reads back: every
 >   file's bytes, length and mode, the directories, none of a write after the snapshot, the same manifest twice.
-> - **Owed.** The volume made from an archive (import), through `slates_archive::Planning` as a takeover restores
->   (`fleet::restore_in_turns`, `verbs::populate_making`), with hostile archives refused by kind: the next piece. A
->   streamed encoder: the archive is held whole while it is encoded, one unit of its size.
+> - **Owed.** A streamed encoder: the archive is held whole while it is encoded, one unit of its size. (The volume made
+>   from an archive is built: A-453, the entry above.)
 
 ### 2026-11-18: a volume a publication left out lost its logged writes at the next restart (found by reading; fixed, A-422)
 

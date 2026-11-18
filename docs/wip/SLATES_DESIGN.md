@@ -8423,6 +8423,31 @@ the format floor.
 > archive (the next piece, through `slates_archive::Planning` as a takeover restores); a streamed encoder, since the
 > archive is held whole while it is encoded, one unit of its size, then written into the file a chunk a unit.
 
+> **Status (2026-11-18, A-453: a volume made from an archive through the library).** `ArchiveImport`
+> (`Instance::import_archive`, contract 40) is the export's way back. A consumer writes the archive bytes it kept into
+> the root of a volume of its own as `ARCHIVE_FILE` (or names the volume an export made), and the daemon makes a new
+> volume holding the archive's tree. The verb checks the archive volume, `read` on it and the name at once, then a task
+> of that volume's owner shard does the rest a slice a turn, never in one long turn:
+> - the file's length is admitted before a byte is read: no longer than the archive volume's class cap (every byte a
+>   writer put there was charged to it, so only a file with holes is longer: refused `Malformed`), and no longer than
+>   the shard's room, since the file is held whole while it is decoded (refused `BudgetExceeded`);
+> - the file is read a copy slice a unit, then decoded and verified a piece a unit (`slates_archive::Decoding`: the
+>   header's fixed fields at once, the whole-archive BLAKE3 at most an archive slice of bytes a piece before anything
+>   past the header is decoded, then a chunk record a piece, then the manifest);
+> - the new volume is admitted as a create admits one, under the archive's own name policy;
+> - its tree is planned and restored (`Planning`, `Restoring`), admitted against the size the import asks and the
+>   shard's room by the rule a takeover's restore follows (`verbs::restore_budget`), and laid into the volume by the
+>   takeover's own `verbs::Populating`, every entry's mode, owner, times and attributes with it;
+> - the volume and the request's completion commit as one atom, as an export's do.
+>
+> Bytes that are no whole archive are refused `ArchiveRefused { fault }` by kind, with nothing made: `ForeignMagic`,
+> `Unsupported` (a newer major, flag or name policy), `Truncated`, `Corrupt` (the checksum or an identity fails),
+> `Malformed` (whole and matching its checksum, but breaking the format's rules). A tree past the asked size or the
+> room is refused `BudgetExceeded`, a held name `AlreadyExists`. Owners and set-id bits come back as the archive holds
+> them, as a takeover's restore brings them back; a host mount the daemon makes honours no set-id bit and opens no
+> device node (`nosuid,nodev`, A-94). Owed: a streamed decoder, since the file is held whole while it is decoded, as
+> the export's encoding is; and the manifest's decode and identity in pieces (one piece today: the whole tree's).
+
 ### 4.12 Agent surfaces (D-19)
 
 > **Correction (2026-09-17, CLI process gate).** `run` and `exec` accept global flags before
@@ -30876,3 +30901,81 @@ Applied in the same change to: `crates/ipc` (`RequestBody::ArchiveExport`, `Repl
   names the same manifest. A snapshot never taken is `NotFound` and a held name `AlreadyExists`. The wire's order test
   holds the two appended variants, and the contract's history names 38. With the file's writing removed, it was red
   once: an empty file where the export named 308,524 bytes.
+
+### A-453 — A volume made from an archive through the library (2026-11-18, goal g268; Mantle's CP-T10.4, "Slates snapshots on Mantle"; §4.11 "Archive", D-17; §4.9 hostile input; §4.12 the consumer contract, A-299; A-441, A-391)
+Applied in the same change to: `crates/archive` (`Decoding`, the decode a bounded piece at a time, `Archive::decode`
+now its pieces run to their end; the tests `an_archive_decoded_in_pieces_is_the_archive_decoded_whole` and
+`a_cut_or_flipped_archive_decoded_in_pieces_is_refused_as_whole`); `crates/vfs/src/export.rs`
+(`name_equivalence_of_id`, its test `an_archives_name_policy_names_its_volumes_back`); `crates/ipc`
+(`RequestBody::ArchiveImport`, `ReplyBody::ArchiveImported`, `Refusal::ArchiveRefused`, `ArchiveFault`, appended and
+published in `tests/wire_order.txt`); `crates/server/src/image.rs` (`import_verb`, `ImportJob`, `run_import`,
+`import_steps`), `verbs.rs` (its dispatch, its new volume's name, its durability claim as a creation's, its refusal's
+label, `restore_budget` shared with a takeover's restore) and `merge_service.rs` (`StoreVerb::ArchiveRead`);
+`crates/client` (`Client::archive_import`, `ArchiveImported`, `ArchiveFault`); `crates/api`
+(`Instance::import_archive`, `Invalid::Archive`, `ArchiveImported` and `ArchiveFault` re-exported, `CONTRACT` 40, the
+tests `a_volume_imported_from_an_exported_archive_holds_the_exported_tree` and
+`a_hostile_archive_is_refused_by_kind_with_nothing_made`); §4.11's status; GAPS (2026-11-18).
+
+- **Why.** A-441 let a consumer take a snapshot out as its archive and keep it where it keeps bytes (Mantle, kiln's
+  object store, CP-T10.4). Nothing brought one back: no verb made a volume from an archive a consumer held.
+- **The shape.** The way in mirrors the way out. The consumer writes the bytes it kept into the root of a volume of its
+  own as `ARCHIVE_FILE` (or names the volume an export made) and names that volume, a new volume's name and its size;
+  every path a consumer already has carries the bytes in (the file channel's staged write), and the archive volume's
+  own size policy bounds them. The new volume takes the archive's name policy, so names that differ only by case stay
+  apart where they were apart.
+- **Running.** A task of the archive volume's owner shard, a slice a turn under the slice budget, never in one long
+  turn (A-374's rule for a takeover's restore). The file's length is admitted first, then the file is read a copy slice
+  a unit and decoded a piece a unit (`Decoding`). The volume is admitted as a create admits one, the tree is planned and
+  restored a piece a unit (`Planning`, `Restoring`), and it is laid into the volume a piece a unit by the takeover's
+  `verbs::Populating`. The volume and the request's completion commit as one atom, and the import's leftovers (the
+  archive, the restored tree) are freed in slices after the reply. A refusal at any step discards the volume and gives
+  its room back.
+- **Hostile input (§4.9).** The length is checked against two caps before a byte is read. It must be no longer than
+  the archive volume's class cap: every byte a writer put there was charged to that volume, so only a file with holes
+  is longer, and no writer of an archive makes one. And it must be no longer than the shard's room, since the file is
+  held whole while it is decoded. The buffer is reserved fallibly and never zeroed whole. The header's fixed fields are
+  checked first (magic, major, flags, the declared chunk maximum against the format's cap). Then the whole-archive
+  BLAKE3 is checked, a slice a piece, before anything past the header is decoded. Each chunk record's declared sizes
+  are admitted before its payload is copied. The restore admits the tree's need before it allocates, against the size
+  the import asks and the shard's room, by the rule a takeover's restore follows (`verbs::restore_budget`).
+- **Refusals.** `ArchiveRefused { fault }` names the class of the reader's refusal a caller acts on alike, every
+  reader refusal classed by name in `image::refusal_of_import`:
+  - `ForeignMagic`: another format's file.
+  - `Unsupported`: a newer major, a required flag, or a name policy this daemon does not hold.
+  - `Truncated`: the stream ends before its frame, or its trailer magic is missing.
+  - `Corrupt`: the checksum, a chunk's identity or the manifest's identity fails.
+  - `Malformed`: whole and matching its checksum, but breaking the format's rules (a declared length past its cap, a
+    chunk out of canonical form, a total, extent, name or path that does not hold, a tree that does not lay).
+
+  A tree past the asked size or the room is `BudgetExceeded` (`Exhausted::Memory` in the contract), a held name
+  `AlreadyExists`, a missing archive volume or file `NotFound` (`Missing::Entry`), a merge volume `Unsupported`.
+  Nothing is made and the name stays free in every case.
+- **Rights.** `read` on the archive volume: the import only reads it. The new volume is the caller's own. Owners and
+  set-id bits come back as the archive holds them, as a takeover's restore brings them back. A host mount the daemon
+  makes honours no set-id bit and opens no device node (`nosuid,nodev`, A-94).
+- **Owed.** A streamed decoder: the file is held whole while it is decoded, and the decoded archive beside it until the
+  restore ends, so an import near the shard's room holds its tree about twice for that time (the export's encoder owes
+  the same). The manifest's decode and Merkle identity are one piece, a walk of the whole tree, as a takeover's restore
+  once was. Symlinks are not in the library test, which writes through the file channel and has no symlink verb; the
+  takeover's restore tests lay them through the same `Populating`.
+- **Evidence (Mac Studio, 2026-11-18, debug).**
+  - `a_volume_imported_from_an_exported_archive_holds_the_exported_tree` and
+    `a_hostile_archive_is_refused_by_kind_with_nothing_made` pass, the two in 1.13 s (kiln r318).
+  - The round trip exports a tree of a small file, a 300 KiB file spanning chunks, an empty file, and a private file
+    in a private directory, in nested directories. It imports that archive twice. Each import names the export's
+    manifest, and every file reads back its bytes and length through `read`. Each new volume, exported again and
+    restored, holds the exported tree: every byte, every directory, and every entry's mode, length, owner, link count
+    and all four times, the root's too, save the inode numbers. The second import's tree equals the first's.
+  - A consumer-written archive (the export with a symbolic link added) comes back whole, the link a link
+    (`0o120777`) as long as its target.
+  - A held name is `AlreadyExists`. A size of half the spanning file is `Exhausted::Memory` naming that size, and the
+    daemon's volume count and committed bytes stay as they were.
+  - The hostile archives, each written into a scratch volume and imported, are refused by kind, with no volume made,
+    no room kept and the name free: the archive re-encoded declaring a chunk length of `u32::MAX` is `Malformed`;
+    its first 20 bytes, `Truncated`; one bit flipped mid-archive, `Corrupt`; a zip's magic, `ForeignMagic`. The whole
+    archive then imports under a name a refused import used.
+  - Units (kiln r310): the archive crate's 22, among them the decode a byte of hash a step equal to the whole decode,
+    and every cut or flipped archive refused alike either way; the export's 6 (an archive's name policy names its
+    volume's back); the wire order's 2; the library's 64 (the contract's history names 40).
+  - Red once each (kiln r320): with the laying skipped, the round trip read no file (its first `read` refused); with a
+    foreign magic classed `Corrupt`, the hostile test met `Corrupt` where it asked `ForeignMagic`.

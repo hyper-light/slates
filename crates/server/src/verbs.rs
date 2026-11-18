@@ -4436,6 +4436,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::DurabilityPending { .. } => "durability_pending",
     Refusal::VerdictReplaced { .. } => "verdict_replaced",
     Refusal::MoveRefused { .. } => "move_refused",
+    Refusal::ArchiveRefused { .. } => "archive_refused",
     Refusal::ImageRefused { .. } => "image_refused",
     Refusal::NotRootLeader => "not_root_leader",
     Refusal::ConsensusNotInitialized => "consensus_not_initialized",
@@ -4487,6 +4488,7 @@ fn claims_placed_durability(body: &RequestBody) -> bool {
       | RequestBody::ImageBuild { .. }
       | RequestBody::ImageMerge { .. }
       | RequestBody::ArchiveExport { .. }
+      | RequestBody::ArchiveImport { .. }
   )
 }
 
@@ -4905,6 +4907,12 @@ fn dispatch_inner(
       snapshot,
       name,
     } => crate::image::archive_verb(state, principal, volume, snapshot, name),
+    RequestBody::ArchiveImport {
+      archive,
+      name,
+      size,
+      require_locked,
+    } => crate::image::import_verb(state, principal, archive, name, (size, require_locked)),
     RequestBody::Checkout {
       green,
       base,
@@ -13283,12 +13291,26 @@ pub(crate) fn restore_admitted(
     SizeClass::Bounded { limit } => limit,
     SizeClass::Dynamic { max } => max,
   };
-  state.store.make_room(needed.min(volume_cap));
   // The room this node's candidate claim holds for the volume is the restore's own (§4.2, g229): what the shard could
   // admit beside it no longer counts it.
   let claimed = claimed_bytes(state, id);
-  let budget = volume_cap.min(state.store.budget.admittable().saturating_add(claimed));
-  let room = volume_cap.min(state.store.admittable().saturating_add(claimed));
+  restore_budget(state, volume_cap, claimed, needed)
+}
+
+/// The budget a restore needing `needed` bytes is admitted against, and the room a refusal names, for a volume that may
+/// hold `volume_cap` bytes and holds `own` bytes of the shard's room already (its claim's, or its admission's
+/// reservation): no more than the volume may hold and no more than this shard could admit beside what it holds. A shard
+/// that claims its arena lazily makes room for the restore first (A-98). One rule for a taken-over volume's restore
+/// ([`restore_admitted`]) and an archive's import (`image::ImportJob`, A-453).
+pub(crate) fn restore_budget(
+  state: &mut ShardState,
+  volume_cap: u64,
+  own: u64,
+  needed: u64,
+) -> (u64, u64) {
+  state.store.make_room(needed.min(volume_cap));
+  let budget = volume_cap.min(state.store.budget.admittable().saturating_add(own));
+  let room = volume_cap.min(state.store.admittable().saturating_add(own));
   (budget, room)
 }
 
@@ -14202,7 +14224,8 @@ fn new_volume_name(body: &RequestBody) -> Option<&str> {
     | RequestBody::Clone { name, .. }
     | RequestBody::ImageBuild { name, .. }
     | RequestBody::ImageMerge { name, .. }
-    | RequestBody::ArchiveExport { name, .. } => Some(name),
+    | RequestBody::ArchiveExport { name, .. }
+    | RequestBody::ArchiveImport { name, .. } => Some(name),
     _ => None,
   }
 }

@@ -38,8 +38,9 @@ use std::fmt;
 use slates_client::ClientError;
 use slates_ipc::error::RouteRefusal;
 use slates_ipc::protocol::{
-  AttachTransport, DatabaseRefusal, HostPathReason, MoveRefusal, OwnMountUse, Principal,
-  RecoveryCause, Refusal, SnapshotId, TargetRefusal, UnsupportedReason, VolumeId, VolumeRefusal,
+  ArchiveFault, AttachTransport, DatabaseRefusal, HostPathReason, MoveRefusal, OwnMountUse,
+  Principal, RecoveryCause, Refusal, SnapshotId, TargetRefusal, UnsupportedReason, VolumeId,
+  VolumeRefusal,
 };
 use slates_ipc::{DeliveryFault, IpcError};
 
@@ -524,6 +525,9 @@ pub enum Invalid {
   Volume(VolumeRefusal),
   /// A move's target cannot take the volume (A-291): name another member.
   MoveTarget(MoveTarget),
+  /// The bytes an archive import read make no volume, by their kind (A-453): another format's file, a newer format, a
+  /// copy cut off or altered, or an archive a faulty writer made. Nothing was made.
+  Archive(ArchiveFault),
 }
 
 /// Why a move's target cannot take the volume ([`Invalid::MoveTarget`], A-291).
@@ -892,6 +896,7 @@ impl Error {
       Refusal::DigestNotClean => Error::Invalid(Invalid::NoCleanDigest),
       Refusal::ChosenPathUnavailable { reason } => Error::Invalid(Invalid::ChosenPath(reason)),
       Refusal::ImageRefused { reason } => Error::Invalid(Invalid::Image(Note::new(reason))),
+      Refusal::ArchiveRefused { fault } => Error::Invalid(Invalid::Archive(fault)),
       Refusal::OwnMount { path, used_as } => Error::Invalid(Invalid::OwnMount { path, used_as }),
       Refusal::Destroying => Error::Unusable(Unusable::Destroying),
       Refusal::Archived => Error::Unusable(Unusable::Archived),
