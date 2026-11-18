@@ -973,7 +973,12 @@
 >   (`a_synchronous_park_beside_a_running_bridge_is_woken_by_its_reply`, red without the pass-on: round 0 took 502 ms of
 >   its 500 ms deadline). The Node by-use test (`sdk.test.mjs`, parked calls beside the signal, with `spinFor` and
 >   `parkRatio` bound) is filed for main's run. A bridge whose thread the OS refuses is now refused typed
->   (`a_bridge_whose_thread_the_os_refuses_is_refused_typed`);
+>   (`a_bridge_whose_thread_the_os_refuses_is_refused_typed`). Closed the same day: each macOS and Windows bridge start
+>   kept two blocks for good (`Box::leak`ed stop flag and park mark), so a client turning its async completion on and
+>   off grew without end (128 blocks over 64 turns); the stop is a channel the two ends free, and the mark is the
+>   parked flag itself, the async arm having its own value (`PARKED_ASYNC`)
+>   (`a_client_turning_its_async_completion_on_and_off_keeps_no_memory`;
+>   `docs/bugs/2026-11-18-the-completion-bridge-kept-two-blocks-a-start.md`);
 > - a run of the Linux and Windows arms (mount, the CLI's Windows unmount): not compiled on the Mac that built piece 4.
 
 > **git, Mercurial and Subversion over the WinFsp drive (2026-11-17, Part 6 "Real workloads", §4.6; A-300; Ada's
