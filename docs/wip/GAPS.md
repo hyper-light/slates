@@ -1603,6 +1603,17 @@
 > scheduling slice, measured and rejected"). **Open:** the loaded Linux tail itself (p99 6 to 27 ms under two spinners
 > a core), and why a sliced shard's median request waited milliseconds in some rounds.
 >
+> **Merge: the verdict's whole-file identity check follows the change, not the file (§4.16 "The verdict"; landed
+> 2026-11-17 from agents/perf-decide 63d63b23).** A length-changing edit overlapping an intervening change rebuilt the
+> base, applied the ops to a copy and compared the copy with the head: three passes over the file a verdict. Now
+> `Value::applied_equals` compares the history's runs, and runs both values share are equal unread. Oracle:
+> `applied_equals_is_the_bytes_compared` (2,000 cases, a head stored whole among them). Engine A/B
+> (`crates/merge/examples/verdict_bench.rs`): a 1 MiB file's conflict 41 µs to 0.42–0.45 µs, a 4 KiB file's 0.68–1.12 to
+> 0.47–0.66 µs (BENCHMARKS, "What a verdict compares and copies"). At the 3,000-client rung's 21 KiB files the owner's
+> CPU a verdict is even (W1: 21.3–22.0 against 21.1–22.1 µs). **Open:** an accept still follows the file (`apply` writes
+> the new file, 37 µs at 1 MiB); the rung's engine verdict is 13 µs where the bench's is under 2.5 µs (82% of the rung's
+> verdicts are conflicts); and the large-file daemon A/B is owed to the supervisor's measurement.
+>
 > **Merge: the same edit from two works was one increment; fixed 2026-11-04 (§4.16, agents/perf).** The increment's
 > identity left out its work and its base, so a second work's byte-identical edit from the same base was answered from
 > the retry cache with the first work's version, even where the green had since changed that range: a conflict reported
