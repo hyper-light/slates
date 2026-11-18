@@ -2072,7 +2072,8 @@ fn owned_by_another_host(state: &ShardState, body: &RequestBody) -> Option<(u64,
   // A volume this node owned and lost to a takeover (its live log fenced at a later epoch) is its successor's: its verbs
   // go there, as any other node's do, whoever created it (A-338). Answered here, each was refused `StaleEpoch` for good,
   // and a client whose node this is never reached the successor (the chaos nemesis's stranded owner).
-  let superseded = crate::live_ship::superseded(state, to_db_volume(volume));
+  // Red check (guard 1 removed): a superseded volume is answered here.
+  let superseded = crate::live_ship::superseded(state, to_db_volume(volume)) && false;
   if !superseded && (creator == host || state.db.partition().volume(to_db_volume(volume)).is_some())
   {
     return None;
