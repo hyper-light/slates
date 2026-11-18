@@ -8487,6 +8487,21 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > gathers version 0 from its hold in one call (`recover_green_inputs`); a large increment's archive is still remade from
 > its chain entry on each pass that ships it.
 
+> **Status (2026-11-18, A-313: a restarted holder rebuilds its replica from what it kept).** A warm restart keeps the
+> merge records a holder accepted (its acceptor, §4.8 "Recovery") and the inputs it held (AUD-29-59), but a holder's
+> replica of each green, the engine every later version is recomputed on, lived in memory alone. The restarted holder
+> answered every later record `merge.out_of_order`, for good, and the owner shipped it again on every pass: at `f = 1`
+> with two holders, one restart left the green one holder's answer from stalling, and a second stalled it. Now a holder
+> with a green's records and no replica rebuilds it before it answers (`merge_origin::rebuild_replica`): version 0
+> seeded from its held inputs as A-286 seeds it, or the empty engine of a green with no origin, then each version it
+> accepted recomputed from the increment it holds, an extent gathered or a version recomputed a unit, each head compared
+> with its record's identity, the records read a version at a time. The first slice runs in the exchange, so a short
+> chain is acknowledged in it; a long one goes on in a task, every record answered unacknowledged meanwhile. A version
+> its records lack, or inputs it no longer holds, installs nothing (counted); another identity refuses the green on the
+> holder for good, as a record's mismatch does. Test: `a_holder_restarted_over_its_segment_recomputes_the_greens_next_version`
+> (`crates/server/tests/fleet.rs`: holder b restarted over its segment, holder c withholding records, so version 2
+> commits only through b's rebuilt replica); its red check and runs are in the bug record of 2026-11-18.
+
 > **Status (2026-11-06, A-235: the record plane runs when there is merge work).**
 > The merge record plane ran once per coordinator period (100 ms), putting a version's inputs at one period and its
 > record at the next, so every answer at `f > 0` waited at least one period, and usually two. One submit at a time on an
@@ -8697,7 +8712,9 @@ without `advance`; `status(green)` reports the head, the attachment's version, a
 of its pending paths green has moved under (awareness, never load-bearing).
 
 **Failure matrix.** Green owner restart: Masked (chain, deltas and `seen` replay from the log;
-in-flight submissions retry by identity). Green owner loss in a fleet: Degraded for the
+in-flight submissions retry by identity). Green holder restart: Masked (the holder keeps the merge records it accepted
+and the inputs it held, and rebuilds its replica from them a slice at a time before it recomputes the next version,
+A-313). Green owner loss in a fleet: Degraded for the
 membership horizon, then Masked after takeover on a candidate that holds the ledger. Work volume owner loss before
 `submit`: the volume's loss window (D-18) applies to the unsubmitted work. Submitter crash after
 commit: the retry returns the original result; the version stands. Merge record with a stale
@@ -22252,3 +22269,37 @@ Applied in the same change to:
   remove are the same logarithmic steps. A forward still queued is given up and resent at its stall budget as before:
   with its place kept that loses it nothing, but it cycles the backlog once a budget on the control shard, which is
   owed apart (GAPS).
+
+### A-313 — A restarted holder rebuilds each green's replica from the records it accepted and the inputs it holds, a slice at a time (2026-11-18, built for goal g232, one primary and two replicas)
+Applied in the same change to:
+- §4.16: the failure matrix (a green holder's restart is masked) and the status of 2026-11-18.
+- `crates/server/src/merge_origin.rs`: `ReplicaSeed` builds a replica through a version (`rebuild`, `through`, `held`,
+  `SeedStage::Chain`, `ChainStep`, `Gather::of` and `step`), `rebuild_replica` and `Rebuild`, `build`, the counts
+  `merge.replica.rebuilt`, `merge.replica.rebuilt_versions` and `merge.replica.records_short`, and the module doc.
+  `crates/server/src/merge_service.rs`: `accept_merge_record` rebuilds a missing replica before it judges a record's
+  order; the doc of `seeding`.
+- Tests: `a_restarted_holders_replica_is_rebuilt_from_the_records_and_inputs_it_kept` and
+  `a_rebuild_installs_nothing_short_of_its_records_or_off_their_identities` (`merge_origin.rs`), and
+  `a_holder_restarted_over_its_segment_recomputes_the_greens_next_version` (`crates/server/tests/fleet.rs`).
+- GAPS: the load test's ledger, after A-286's entry. The bug record:
+  `docs/bugs/2026-11-18-a-restarted-holder-refused-every-later-version-of-its-greens.md`.
+- **What was there.** A holder's replica of a green (`merge.replicas`, §4.16 "Apply on holders") lived in memory alone.
+  A warm restart kept the holder's member id, the records it accepted and the inputs it held, each for its own reason
+  (§4.8 "Recovery", AUD-29-59), and nothing rebuilt the replica. The holder answered every later record of the green
+  `merge.out_of_order` while its content answer told the owner it held the inputs, so the owner shipped the record again
+  on every pass and never had it acknowledged there.
+- **The rule.** A holder that receives a green's record with no replica of the green, and has accepted records of it,
+  rebuilds the replica before it judges the record: version 0 from its held inputs (A-286's seed) or the empty engine of
+  a green with no origin, then every version it accepted, up to the newest, recomputed from the increment it holds and
+  compared with that record's identity. The records are read a version at a time from the acceptor (`value_at`), the
+  increments gathered an extent a unit, and the build is sliced like the seed: its first slice in the exchange, the rest
+  in a task of the shard, every record of the green answered unacknowledged until it ends. It installs nothing if a
+  version's record is missing or its inputs are no longer held, and refuses the green on the holder for good on another
+  identity, as a record's own recomputation does.
+- **Why.** The failure matrix masked an owner's restart and not a holder's. Goal g232 runs one primary and two replicas
+  at `f = 1`: each version commits at the owner and one holder, so one holder's restart left the green one answer from
+  stalling, and a second restart, or the other holder's loss, stalled every submit. The red check and the runs are in
+  the bug record.
+- **Cost.** Only at a restart, and only for a green whose record arrives: one version's recomputation per version the
+  holder accepted, as its first acceptance cost, in slices. A rebuilt replica holds what the replica held before the
+  restart; its growth per version is the open item it was (GAPS).

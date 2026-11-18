@@ -1410,6 +1410,19 @@
 >   wherever the inputs repeat a chunk's bytes at a chunk boundary (two identical runs of a chunk or more), and such
 >   inputs are refused `merge.inputs_undecodable` for good. A failing test is owed before any change.
 >
+> **Fixed 2026-11-18 (g232, A-313): a restarted holder refused every later version of its greens.** A warm restart keeps
+> a holder's accepted records and held inputs, but its replica of each green lived in memory alone, so it answered every
+> later record `merge.out_of_order`, for good, while the owner shipped it again every pass. With one primary and two
+> replicas at `f = 1`, one replica's restart left every version one holder's answer from stalling, and a second stalled
+> the green. Now the holder rebuilds the replica from its records and held inputs a slice at a time before it judges the
+> record (`merge_origin::rebuild_replica`). Test: `a_holder_restarted_over_its_segment_recomputes_the_greens_next_version`
+> (`crates/server/tests/fleet.rs`), with its red check in the bug record
+> (`docs/bugs/2026-11-18-a-restarted-holder-refused-every-later-version-of-its-greens.md`). Still open, found beside it:
+> - a restarted holder's `merge.refused` (a green refused for good after a mismatch) is in memory too, so the restarted
+>   holder rebuilds such a green and refuses it again only at the version that mismatched;
+> - a rebuild over a long chain recomputes every version the holder accepted (300,000 at the 100,000-client rung's three
+>   rounds), since the holder keeps no checkpoint of its replica; the holder's growth per version is A-238's owed item.
+>
 > The topology launcher is `crates/cli/tests/load_scale.rs`. It runs one primary and two replica server nodes in
 > region 0 at `f = 1`, and client nodes in region 1, so the client nodes are never the green's holders. One harness
 > drives every client node (`--instance a,b,…`), so one oracle judges every submit. It is portable (`ps`, `pgrep`),

@@ -31,6 +31,15 @@
 //! about 1,600 extents for the kernel (some 90 KB), small enough to offer with every bounded shipment and for a holder
 //! to decode in a slice, where the host page made it 100,000 to 400,000 extents (6 to 23 MB).
 //!
+//! **A restarted holder rebuilds its replica the same way (A-313).** A warm restart keeps the merge records a holder
+//! accepted (its acceptor, §4.8 "Recovery") and the inputs it held (AUD-29-59), but not the replica, the engine every
+//! later version is recomputed on, which lived in memory alone: the holder answered every later record
+//! `merge.out_of_order`, for good, and the green went on at `f + 1` only while its other holders answered. Now a holder
+//! with records and no replica rebuilds it from them ([`rebuild_replica`]): version 0 seeded as above (or the empty
+//! engine of a green with no origin), then each version it accepted recomputed from the increment it holds, an extent
+//! gathered or a version recomputed a unit, every version's head compared with its record's identity. The records are
+//! read a version at a time (`Acceptor::value_at`), so nothing of a long chain is decoded up front.
+//!
 //! At `f = 0` none of it runs: the local append is the placement (R8).
 
 use slates_archive::Archive;
@@ -39,7 +48,7 @@ use slates_archive::manifest::{Entry, Extent, Node, NodeMeta};
 use slates_db::catalog::VolumeId as DbVolumeId;
 use slates_db::register::{HostId, ObjectId, Record};
 use slates_ipc::protocol::Refusal;
-use slates_merge::engine::{Green, OriginLoad};
+use slates_merge::engine::{Green, Increment, OriginLoad, Outcome};
 use slates_merge::origin::{DecodeCursor, EncodeCursor, Origin};
 
 use crate::merge_service::{
@@ -67,17 +76,29 @@ pub(crate) const ORIGIN_INPUTS_UNSPAWNED: &str = "merge.origin_inputs.unspawned"
 /// Counted on a holder each time it seeded a green's replica at version 0 from the inputs it holds (A-286).
 /// Format: a refusal name in the daemon's status report.
 pub(crate) const REPLICA_SEEDED: &str = "merge.replica.seeded";
-/// Counted on a holder for each slice of seeding a replica's version 0: more than one shows it was seeded in slices.
+/// Counted on a holder for each slice of building a replica (seeding version 0, A-286, or rebuilding a chain, A-313):
+/// more than one shows it was built in slices.
 /// Format: a refusal name in the daemon's status report.
 pub(crate) const REPLICA_SEED_SLICES: &str = "merge.replica.seed_slices";
-/// Counted on a holder asked to accept version 0's record while it is still seeding the replica: no acknowledgement
+/// Counted on a holder asked to accept a green's record while it is still building the replica: no acknowledgement
 /// yet; the owner ships the record again.
 /// Format: a refusal name in the daemon's status report.
 pub(crate) const REPLICA_SEEDING: &str = "merge.replica.seeding";
-/// Counted on a holder whose seeding task could not be spawned (its task arena full): the record is answered with no
-/// acknowledgement, and the owner's next shipment starts the seed again.
+/// Counted on a holder whose building task could not be spawned (its task arena full): the record is answered with no
+/// acknowledgement, and the owner's next shipment starts the build again.
 /// Format: a refusal name in the daemon's status report.
 pub(crate) const REPLICA_SEED_UNSPAWNED: &str = "merge.replica.seed_unspawned";
+/// Counted on a holder each time it rebuilt a green's replica past version 0 from the records it accepted and the
+/// inputs it holds (A-313): the non-vacuity counter of a restarted holder's rebuild, one a rebuild.
+/// Format: a refusal name in the daemon's status report.
+pub(crate) const REPLICA_REBUILT: &str = "merge.replica.rebuilt";
+/// Counted on a holder for each version after 0 a rebuild recomputed from the increment it holds (A-313).
+/// Format: a refusal name in the daemon's status report.
+pub(crate) const REPLICA_REBUILT_VERSIONS: &str = "merge.replica.rebuilt_versions";
+/// Counted on a holder whose rebuild met a version, between 0 and the newest it accepted, that its records lack: no
+/// replica is installed, and the green's later records stay unacknowledged here (A-313).
+/// Format: a refusal name in the daemon's status report.
+pub(crate) const REPLICA_RECORDS_SHORT: &str = "merge.replica.records_short";
 
 /// Derived: the most raw bytes one chunk of an inputs archive holds — the archive's largest chunk, the most any reader
 /// admits (`slates_archive::format::MAX_CHUNK_BYTES`, AUD-29-13; 1 MiB). An inputs archive is one stream that no other
@@ -575,16 +596,82 @@ pub(crate) fn seed_version_zero(
     state.count(INPUTS_UNHELD, 1);
     return Vec::new();
   }
-  let mut seed = ReplicaSeed::new(object, manifest, value.identity);
+  let ended = build(state, ReplicaSeed::new(object, manifest, value.identity));
+  if ended && state.merge.replicas.contains_key(&object) {
+    return crate::fleet::accept_held_record(state, local, peer_host, record);
+  }
+  Vec::new()
+}
+
+/// What a holder with no replica of a green made of it when one of the green's records arrived ([`rebuild_replica`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Rebuild {
+  /// The replica is installed, at this head version.
+  Installed(u64),
+  /// Not now: a task of this shard goes on building it, or the build ended without one (counted why). The record is
+  /// answered with no acknowledgement, and the owner ships it again.
+  Later,
+  /// This holder accepted no record of the green: there is nothing to rebuild from.
+  Nothing,
+}
+
+/// Rebuilds `object`'s replica on a holder that accepted the green's records but holds no replica of it (§4.16 "Apply
+/// on holders", §4.8 "Recovery", A-313): a warm restart keeps the records a holder accepted and the inputs it held
+/// (AUD-29-59), not the engine, so every later record was refused `merge.out_of_order` for good. Version 0 is seeded from
+/// its held inputs, or is the empty engine of a green with no origin; then every later version this holder accepted, up
+/// to the newest, is recomputed from the increment it holds and compared with its record's identity ([`ReplicaSeed`]).
+/// The first slice runs now, so a short chain is rebuilt in the exchange that asked; else a task of this shard goes on,
+/// owned by the green's entry in `seeding`.
+pub(crate) fn rebuild_replica(state: &mut ShardState, object: ObjectId) -> Rebuild {
+  if state.merge.seeding.contains(&object) {
+    state.count(REPLICA_SEEDING, 1);
+    return Rebuild::Later;
+  }
+  let Some(through) = newest_accepted(state, object) else {
+    return Rebuild::Nothing;
+  };
+  let Some(zero) = accepted_value(state, object, 0) else {
+    state.count(REPLICA_RECORDS_SHORT, 1);
+    return Rebuild::Later;
+  };
+  build(
+    state,
+    ReplicaSeed::rebuild(object, zero.inputs, zero.identity, through),
+  );
+  match state.merge.replicas.get(&object) {
+    Some(replica) => Rebuild::Installed(replica.head()),
+    None => Rebuild::Later,
+  }
+}
+
+/// The newest version of `object` this holder accepted (its acceptor's highest position), if it accepted any.
+fn newest_accepted(state: &ShardState, object: ObjectId) -> Option<u64> {
+  state
+    .holder_records
+    .get(&object)?
+    .highest(object)
+    .map(|(version, _)| version)
+}
+
+/// The merge record this holder accepted for `object` at `version`, if its acceptor holds that position and it is that
+/// version's: one lookup, never a walk of the green's whole ledger.
+fn accepted_value(state: &ShardState, object: ObjectId, version: u64) -> Option<MergeRecordValue> {
+  let bytes = state
+    .holder_records
+    .get(&object)?
+    .value_at(object, version)?;
+  MergeRecordValue::from_record_bytes(bytes).filter(|value| value.version == version)
+}
+
+/// Runs `seed`'s first slice now; if the seed does not end in it, a task of this shard goes on with it, owned by the
+/// green's entry in `seeding`. Whether the seed ended now.
+fn build(state: &mut ShardState, mut seed: ReplicaSeed) -> bool {
+  let object = seed.object;
   state.count(REPLICA_SEED_SLICES, 1);
   // The seed never refuses its caller: its outcome is in its stage.
   let _ = crate::image::sliced(state, |s| seed.step(s));
   if seed.ended() {
-    return if state.merge.replicas.contains_key(&object) {
-      crate::fleet::accept_held_record(state, local, peer_host, record)
-    } else {
-      Vec::new()
-    };
+    return true;
   }
   if slates_rt::futures::spawn(run_seed(seed))
     .and_then(slates_rt::futures::detach)
@@ -594,11 +681,11 @@ pub(crate) fn seed_version_zero(
   } else {
     state.count(REPLICA_SEED_UNSPAWNED, 1);
   }
-  Vec::new()
+  false
 }
 
-/// The task that goes on seeding a replica after its first slice (A-286), owned by the green's entry in `seeding`,
-/// which it removes once the seed ends or the shard's state is gone.
+/// The task that goes on building a replica after its first slice (A-286, A-313), owned by the green's entry in
+/// `seeding`, which it removes once the build ends or the shard's state is gone.
 async fn run_seed(mut seed: ReplicaSeed) {
   let object = seed.object;
   loop {
@@ -615,26 +702,37 @@ async fn run_seed(mut seed: ReplicaSeed) {
   let _ = crate::state::with_state_counted(|s| s.merge.seeding.remove(&object));
 }
 
-/// A holder's replica of a green's version 0 being seeded a share at a time from the inputs it holds (§4.16 "Apply on
-/// holders", A-286): the inputs' chunks gathered one at a time from the content hold, the origin decoded a share at a
-/// time, the engine seeded a share at a time, and its head identity compared with the record's. A seed borrows nothing
-/// between its units: each finds the held inputs again.
+/// A holder's replica of a green being built a share at a time from what the holder holds (§4.16 "Apply on holders"):
+/// version 0 seeded from its inputs — the chunks gathered one at a time from the content hold, the origin decoded a
+/// share at a time, the engine seeded a share at a time (A-286) — or the empty engine of a green with no origin; then,
+/// for a restarted holder's rebuild, every later version it accepted recomputed from the increment it holds (A-313).
+/// Each version's head identity is compared with its record's. A build borrows nothing between its units: each finds
+/// the held inputs and the accepted records again.
 pub(crate) struct ReplicaSeed {
   /// The green's object.
   object: ObjectId,
-  /// The inputs' manifest identity, as the record names it.
-  manifest: [u8; 32],
-  /// The green's head identity at version 0, as the record names it.
+  /// Version 0's inputs manifest identity, as its record names it; none for a green with no origin, whose version 0 is
+  /// the empty engine.
+  manifest: Option<[u8; 32]>,
+  /// The green's head identity at version 0, as its record names it.
   identity: [u8; 32],
-  /// Where the seeding has reached.
+  /// The newest version to build: 0 for a seed of version 0 alone (A-286), else the newest this holder accepted, each
+  /// version after 0 recomputed from its accepted record's held increment (A-313).
+  through: u64,
+  /// The newest inputs the build read, which the hold must still hold for the replica to be installed: a green
+  /// forgotten meanwhile (its tombstone, a takeover's reclaim) forgot them too. None while the build has read none.
+  held: Option<[u8; 32]>,
+  /// The version the build is at, for its log line.
+  reached: u64,
+  /// Where the build has reached.
   stage: SeedStage,
 }
 
-/// Where seeding a replica's version 0 has reached.
+/// Where building a replica has reached.
 enum SeedStage {
   /// Nothing read yet.
   Begin,
-  /// The held chunks being gathered into the origin's bytes, a chunk a unit.
+  /// Version 0's held chunks being gathered into the origin's bytes, a chunk a unit.
   Gather(Gather),
   /// The origin being decoded from the gathered bytes.
   Decode {
@@ -645,12 +743,27 @@ enum SeedStage {
   },
   /// The replica being seeded from the decoded origin. Boxed: it holds the engine being seeded.
   Load(Box<OriginLoad>),
-  /// Ended: the replica seeded, or the seed refused (counted).
+  /// Version 0 built: the later versions being recomputed on it from the increments this holder holds (A-313). Boxed:
+  /// it holds the engine.
+  Chain(Box<ChainStep>),
+  /// Ended: the replica built, or the build refused (counted).
   Ended,
 }
 
-/// The held chunks being gathered into an origin's bytes ([`SeedStage::Gather`]).
+/// A rebuild's recomputation of the version after its replica's head ([`SeedStage::Chain`]).
+struct ChainStep {
+  /// The replica so far, at the version before `version`.
+  replica: Green,
+  /// The version being recomputed.
+  version: u64,
+  /// Its record's head identity and its increment's bytes gathered so far; none until its record is read.
+  reading: Option<([u8; 32], Gather)>,
+}
+
+/// One held inputs file being gathered into its bytes, an extent a unit ([`SeedStage::Gather`], [`ChainStep`]).
 struct Gather {
+  /// The inputs' manifest identity: the held archive whose chunks are read.
+  manifest: [u8; 32],
   /// The inputs file's extents still to read, the next last.
   extents: Vec<Extent>,
   /// The bytes gathered so far.
@@ -659,23 +772,88 @@ struct Gather {
   size: u64,
 }
 
+impl Gather {
+  /// Reads `object`'s held inputs `manifest`: the inputs file's extents to gather, and room for its declared size. Each
+  /// extent holds at most one chunk's bytes, so the size is checked against what the extents can hold before anything is
+  /// reserved for it, and a reservation the allocator refuses is the build's refusal, never an abort.
+  fn of(state: &ShardState, object: ObjectId, manifest: [u8; 32]) -> Result<Gather, &'static str> {
+    let archive = state
+      .held_content
+      .held_manifest(state.store.content.arena(), object, &manifest)
+      .ok_or(INPUTS_UNHELD)?;
+    let (size, mut extents) = inputs_file(archive).ok_or(INPUTS_UNDECODABLE)?;
+    let most = u64::try_from(extents.len())
+      .unwrap_or(u64::MAX)
+      .saturating_mul(MAX_CHUNK_BYTES);
+    if size > most {
+      return Err(INPUTS_UNDECODABLE);
+    }
+    let mut bytes = Vec::new();
+    bytes
+      .try_reserve_exact(usize::try_from(size).map_err(|_| INPUTS_UNDECODABLE)?)
+      .map_err(|_| INPUTS_UNDECODABLE)?;
+    extents.reverse();
+    Ok(Gather {
+      manifest,
+      extents,
+      bytes,
+      size,
+    })
+  }
+
+  /// Gathers the next extent's bytes from the hold; once every extent is in, the inputs' bytes if they are the declared
+  /// size, with a test's corruption fault applied (`merge_service::corrupt_if_faulted`).
+  fn step(
+    &mut self,
+    state: &mut ShardState,
+    object: ObjectId,
+  ) -> Result<Option<Vec<u8>>, &'static str> {
+    let Some(extent) = self.extents.pop() else {
+      if u64::try_from(self.bytes.len()).ok() != Some(self.size) {
+        return Err(INPUTS_UNDECODABLE);
+      }
+      let mut bytes = std::mem::take(&mut self.bytes);
+      crate::merge_service::corrupt_if_faulted(state, &mut bytes);
+      return Ok(Some(bytes));
+    };
+    gather_extent(state, object, &self.manifest, &extent, &mut self.bytes)?;
+    Ok(None)
+  }
+}
+
 impl ReplicaSeed {
-  /// A seed of `object`'s replica from the inputs `manifest` names, which must reproduce the head `identity`.
+  /// A seed of `object`'s replica at version 0 from the inputs `manifest` names, which must reproduce the head
+  /// `identity` (A-286).
   fn new(object: ObjectId, manifest: [u8; 32], identity: [u8; 32]) -> ReplicaSeed {
+    ReplicaSeed::rebuild(object, Some(manifest), identity, 0)
+  }
+
+  /// A rebuild of `object`'s replica through version `through` (A-313): version 0 from the inputs `manifest` names (none
+  /// for a green with no origin), which must reproduce the head `identity`, then every later version from the records
+  /// this holder accepted.
+  fn rebuild(
+    object: ObjectId,
+    manifest: Option<[u8; 32]>,
+    identity: [u8; 32],
+    through: u64,
+  ) -> ReplicaSeed {
     ReplicaSeed {
       object,
       manifest,
       identity,
+      through,
+      held: manifest,
+      reached: 0,
       stage: SeedStage::Begin,
     }
   }
 
-  /// Whether the seed has ended.
+  /// Whether the build has ended.
   fn ended(&self) -> bool {
     matches!(self.stage, SeedStage::Ended)
   }
 
-  /// One unit, its outcome recorded when it ends the seed: `Some` once ended. Never refuses its caller.
+  /// One unit, its outcome recorded when it ends the build: `Some` once ended. Never refuses its caller.
   fn step(&mut self, state: &mut ShardState) -> Result<Option<()>, Refusal> {
     match self.unit(state) {
       Ok(None) => Ok(None),
@@ -691,87 +869,57 @@ impl ReplicaSeed {
     }
   }
 
-  /// Counts why the seed ended unseeded; a recomputation mismatch refuses the green on this holder for good, loudly
-  /// (§4.16 "mismatch fatal-and-loud"), as a later version's mismatch does.
+  /// Counts why the build ended without a replica; a recomputation mismatch refuses the green on this holder for good,
+  /// loudly (§4.16 "mismatch fatal-and-loud"), as a mismatch of a record arriving does.
   fn fail(&self, state: &mut ShardState, reason: &'static str) {
     state.count(reason, 1);
     if reason == RECOMPUTE_MISMATCH {
       state.merge.refused.insert(self.object);
       state.merge.replicas.remove(&self.object);
       slates_machine::log_line!(
-        "slates-server: merge record for green {} version 0: the seeded identity does not match the record; the green is refused on this holder",
-        hex(&self.object.0)
+        "slates-server: merge record for green {} version {}: the rebuilt identity does not match the record; the green is refused on this holder",
+        hex(&self.object.0),
+        self.reached
       );
     }
   }
 
-  /// One unit: the manifest read, a chunk gathered, a share decoded or a share seeded; `Some` once the replica is
-  /// seeded. `Err` names the counter for why it could not be.
+  /// One unit: a manifest read, a chunk gathered, a share decoded or seeded, or a later version's record read, its
+  /// increment's chunk gathered or the version recomputed; `Some` once the replica is installed. `Err` names the counter
+  /// for why it could not be.
   fn unit(&mut self, state: &mut ShardState) -> Result<Option<()>, &'static str> {
     match std::mem::replace(&mut self.stage, SeedStage::Ended) {
       SeedStage::Begin => self.begin(state),
       SeedStage::Gather(gather) => self.gather(state, gather),
       SeedStage::Decode { bytes, cursor } => self.decode(state, bytes, cursor),
       SeedStage::Load(load) => self.load(state, load),
+      SeedStage::Chain(step) => self.chain(state, step),
       SeedStage::Ended => Ok(Some(())),
     }
   }
 
-  /// Reads the held inputs' manifest: the inputs file's extents to gather, and room for its declared size. Each extent
-  /// holds at most one chunk's bytes, so the size is checked against what the extents can hold before anything is
-  /// reserved for it, and a reservation the allocator refuses is the seed's refusal, never an abort.
-  fn begin(&mut self, state: &ShardState) -> Result<Option<()>, &'static str> {
-    let manifest = state
-      .held_content
-      .held_manifest(state.store.content.arena(), self.object, &self.manifest)
-      .ok_or(INPUTS_UNHELD)?;
-    let (size, mut extents) = inputs_file(manifest).ok_or(INPUTS_UNDECODABLE)?;
-    let most = u64::try_from(extents.len())
-      .unwrap_or(u64::MAX)
-      .saturating_mul(MAX_CHUNK_BYTES);
-    if size > most {
-      return Err(INPUTS_UNDECODABLE);
-    }
-    let mut bytes = Vec::new();
-    bytes
-      .try_reserve_exact(usize::try_from(size).map_err(|_| INPUTS_UNDECODABLE)?)
-      .map_err(|_| INPUTS_UNDECODABLE)?;
-    extents.reverse();
-    self.stage = SeedStage::Gather(Gather {
-      extents,
-      bytes,
-      size,
-    });
+  /// Reads version 0's held inputs' manifest, or builds the empty engine of a green with no origin.
+  fn begin(&mut self, state: &mut ShardState) -> Result<Option<()>, &'static str> {
+    let Some(manifest) = self.manifest else {
+      return self.zero_built(state, Green::new());
+    };
+    self.stage = SeedStage::Gather(Gather::of(state, self.object, manifest)?);
     Ok(None)
   }
 
-  /// Gathers the next extent's bytes from the hold; once every extent is in and the bytes are the declared size, the
-  /// decoding begins.
+  /// Gathers the next extent of version 0's inputs; once they are whole, the decoding begins.
   fn gather(
     &mut self,
     state: &mut ShardState,
     mut gather: Gather,
   ) -> Result<Option<()>, &'static str> {
-    let Some(extent) = gather.extents.pop() else {
-      if u64::try_from(gather.bytes.len()).ok() != Some(gather.size) {
-        return Err(INPUTS_UNDECODABLE);
-      }
-      let mut bytes = gather.bytes;
-      crate::merge_service::corrupt_if_faulted(state, &mut bytes);
-      self.stage = SeedStage::Decode {
+    self.stage = match gather.step(state, self.object)? {
+      Some(bytes) => SeedStage::Decode {
         bytes,
         cursor: DecodeCursor::new(),
-      };
-      return Ok(None);
+      },
+      None => SeedStage::Gather(gather),
     };
-    gather_extent(
-      state,
-      self.object,
-      &self.manifest,
-      &extent,
-      &mut gather.bytes,
-    )?;
-    self.stage = SeedStage::Gather(gather);
     Ok(None)
   }
 
@@ -792,7 +940,7 @@ impl ReplicaSeed {
     Ok(None)
   }
 
-  /// Seeds a share of the replica; once seeded, it is installed.
+  /// Seeds a share of the replica; once seeded, version 0 is built.
   fn load(
     &mut self,
     state: &mut ShardState,
@@ -802,30 +950,102 @@ impl ReplicaSeed {
       self.stage = SeedStage::Load(load);
       return Ok(None);
     };
-    self.install(state, replica)?;
-    Ok(Some(()))
+    self.zero_built(state, replica)
   }
 
-  /// Installs the seeded `replica` once its head identity is the record's: a green this holder refused meanwhile, or
-  /// replicates already, keeps what it has. A green whose inputs are no longer held installs nothing: a tombstone or a
-  /// takeover's reclaim forgot everything held for it and dropped its replica while this seed was past reading the
-  /// hold, and a replica installed after that is a whole origin nothing removes (CLAUDE.md §2 item 8).
-  fn install(&self, state: &mut ShardState, mut replica: Green) -> Result<(), &'static str> {
-    if !state
-      .held_content
-      .holds_manifest(self.object, &self.manifest)
+  /// Version 0 is built: checked against its record, then installed, or the later versions' recomputation begins.
+  fn zero_built(
+    &mut self,
+    state: &mut ShardState,
+    mut replica: Green,
+  ) -> Result<Option<()>, &'static str> {
+    self.check(state, &mut replica, self.identity)?;
+    if self.through == 0 {
+      self.install(state, replica);
+      return Ok(Some(()));
+    }
+    self.reached = 1;
+    self.stage = SeedStage::Chain(Box::new(ChainStep {
+      replica,
+      version: 1,
+      reading: None,
+    }));
+    Ok(None)
+  }
+
+  /// One unit of recomputing the version after the replica's head (A-313): its accepted record read and its increment's
+  /// gathering begun, an extent of the increment gathered, or the increment decoded, submitted as exactly that version
+  /// and its head checked against the record's identity. The replica is installed once the newest version is.
+  fn chain(
+    &mut self,
+    state: &mut ShardState,
+    mut step: Box<ChainStep>,
+  ) -> Result<Option<()>, &'static str> {
+    let Some((identity, mut gather)) = step.reading.take() else {
+      let value = accepted_value(state, self.object, step.version).ok_or(REPLICA_RECORDS_SHORT)?;
+      let manifest = value.inputs.ok_or(INPUTS_UNDECODABLE)?;
+      step.reading = Some((value.identity, Gather::of(state, self.object, manifest)?));
+      self.stage = SeedStage::Chain(step);
+      return Ok(None);
+    };
+    let Some(bytes) = gather.step(state, self.object)? else {
+      step.reading = Some((identity, gather));
+      self.stage = SeedStage::Chain(step);
+      return Ok(None);
+    };
+    let increment = Increment::decode(&bytes).map_err(|_| INPUTS_UNDECODABLE)?;
+    match step.replica.submit(&increment) {
+      Outcome::Accepted { version } if version == step.version => {}
+      // The owner accepted it, and this holder too before its restart; anything else has diverged.
+      _ => return Err(RECOMPUTE_MISMATCH),
+    }
+    self.held = Some(gather.manifest);
+    self.check(state, &mut step.replica, identity)?;
+    state.count(REPLICA_REBUILT_VERSIONS, 1);
+    if step.version >= self.through {
+      self.install(state, step.replica);
+      return Ok(Some(()));
+    }
+    step.version = step.version.saturating_add(1);
+    self.reached = step.version;
+    self.stage = SeedStage::Chain(step);
+    Ok(None)
+  }
+
+  /// Whether `replica`'s head is `identity` on a green this holder still backs. A green whose newest inputs the build
+  /// read are no longer held was forgotten meanwhile (a tombstone or a takeover's reclaim forgot everything held for it
+  /// and dropped its replica while this build was past reading the hold): unheld, and never refused, so it is checked
+  /// before the identity; a replica installed after that is a whole origin nothing removes (CLAUDE.md §2 item 8). A
+  /// different identity is a recomputation mismatch.
+  fn check(
+    &self,
+    state: &ShardState,
+    replica: &mut Green,
+    identity: [u8; 32],
+  ) -> Result<(), &'static str> {
+    if let Some(held) = self.held
+      && !state.held_content.holds_manifest(self.object, &held)
     {
       return Err(INPUTS_UNHELD);
     }
-    if replica.head_identity() != self.identity {
+    if replica.head_identity() != identity {
       return Err(RECOMPUTE_MISMATCH);
     }
+    Ok(())
+  }
+
+  /// Installs the built `replica`: a green this holder refused meanwhile, or replicates already, keeps what it has.
+  fn install(&self, state: &mut ShardState, replica: Green) {
     if state.merge.refused.contains(&self.object) {
-      return Ok(());
+      return;
     }
     state.merge.replicas.entry(self.object).or_insert(replica);
-    state.count(REPLICA_SEEDED, 1);
-    Ok(())
+    if self.manifest.is_some() {
+      state.count(REPLICA_SEEDED, 1);
+    }
+    if self.through > 0 {
+      state.count(REPLICA_REBUILT, 1);
+    }
   }
 }
 
@@ -993,7 +1213,13 @@ mod tests {
 
   /// Holds `origin`'s inputs archive for `object` in `state`'s content hold, as a placement would: its manifest identity.
   fn hold_inputs(state: &mut ShardState, object: ObjectId, origin: &Origin) -> [u8; 32] {
-    let archive = InputsBuilder::whole(&origin.encode()).finish(0, 4096);
+    hold_encoded(state, object, &origin.encode())
+  }
+
+  /// Holds the inputs archive of `bytes` (an encoded origin or increment) for `object` in `state`'s content hold, as a
+  /// placement would: its manifest identity.
+  fn hold_encoded(state: &mut ShardState, object: ObjectId, bytes: &[u8]) -> [u8; 32] {
+    let archive = InputsBuilder::whole(bytes).finish(0, 4096);
     state
       .held_content
       .hold(
@@ -1003,6 +1229,81 @@ mod tests {
         archive,
       )
       .unwrap()
+  }
+
+  /// An increment based on version `base` that creates `path` holding `bytes`, under the identity `[id; 32]`.
+  fn creating(path: &str, bytes: &[u8], id: u8, base: u64) -> Increment {
+    use slates_merge::ops_doc::{Op, OpKind, OpsDoc};
+    let mut doc = OpsDoc::default();
+    let path = doc.paths.intern(path);
+    doc.ops.push(Op {
+      kind: OpKind::Create,
+      flags: 0,
+      path,
+      at: 0,
+      len: 0,
+      src: u64::MAX,
+    });
+    doc.ops.push(Op {
+      kind: OpKind::Insert,
+      flags: 0,
+      path,
+      at: 0,
+      len: u64::try_from(bytes.len()).unwrap(),
+      src: 0,
+    });
+    Increment {
+      id: [id; 32],
+      base,
+      doc,
+      post_state: bytes.to_vec(),
+      evidence: Vec::new(),
+    }
+  }
+
+  /// Gives `state` a holder's acceptor of `object` that accepted each of `records` (its version, its inputs manifest —
+  /// none for a scratch green's version 0 — and the head identity after it), as a holder that recomputed them did.
+  fn accept_records(
+    state: &mut ShardState,
+    object: ObjectId,
+    records: &[(u64, Option<[u8; 32]>, [u8; 32])],
+  ) {
+    let owner = HostId(2);
+    let mut acceptor = slates_db::register::Acceptor::new(
+      HostId(1),
+      slates_db::register::Authority {
+        generation: 0,
+        owner,
+      },
+    );
+    for (version, inputs, identity) in records {
+      let value = MergeRecordValue {
+        version: *version,
+        increment: [0; 32],
+        base: version.saturating_sub(1),
+        inputs: *inputs,
+        identity: *identity,
+        evidence: Vec::new(),
+        name: "green".to_owned(),
+        require_evidence: false,
+        owner: slates_db::catalog::Principal::Uid {
+          host: owner,
+          uid: 0,
+        },
+        completion: None,
+      };
+      acceptor
+        .accept(&Record {
+          owner,
+          object,
+          sequence: *version,
+          epoch: slates_db::HostEpoch(1),
+          generation: 0,
+          value: value.to_record_bytes(),
+        })
+        .unwrap();
+    }
+    state.holder_records.insert(object, acceptor);
   }
 
   /// Steps `seed` a unit at a time until it ends: the units it took.
@@ -1120,5 +1421,137 @@ mod tests {
       "a forgotten green is not refused: nothing of it is kept"
     );
     assert_eq!(counts, [0, 1], "counted unheld, never seeded");
+  }
+
+  /// §4.16 "Apply on holders", §4.8 "Recovery" (A-313): a holder restarted over its segment keeps the records it
+  /// accepted and the inputs it held, not its replica, and rebuilds the replica from them a unit at a time. Do: hold a
+  /// based green's origin (several chunks) and two increments, give the holder the records of versions 0 to 2 with the
+  /// identities a serial engine reaches, and rebuild through version 2 a unit at a time. Expect the replica at version 2
+  /// with the serial engine's identity, over more units than the inputs have chunks and versions, counted seeded once,
+  /// rebuilt once and two versions recomputed.
+  #[test]
+  fn a_restarted_holders_replica_is_rebuilt_from_the_records_and_inputs_it_kept() {
+    let origin = origin_over_chunks();
+    let chunks = InputsBuilder::whole(&origin.encode())
+      .finish(0, 4096)
+      .chunks
+      .len();
+    let first = creating("new-1", b"one", 1, 0);
+    let second = creating("new-2", b"two", 2, 1);
+    let (rebuilt, units, counts) = crate::daemon::audit_on_shard(move |state| {
+      let mut serial = Green::with_origin(origin.clone());
+      let zero = serial.head_identity();
+      let accepted_first = matches!(serial.submit(&first), Outcome::Accepted { version: 1 });
+      let one = serial.head_identity();
+      let accepted_second = matches!(serial.submit(&second), Outcome::Accepted { version: 2 });
+      let two = serial.head_identity();
+      let object = ObjectId([35; 16]);
+      let origin_inputs = hold_inputs(state, object, &origin);
+      let first_inputs = hold_encoded(state, object, &first.encode());
+      let second_inputs = hold_encoded(state, object, &second.encode());
+      accept_records(
+        state,
+        object,
+        &[
+          (0, Some(origin_inputs), zero),
+          (1, Some(first_inputs), one),
+          (2, Some(second_inputs), two),
+        ],
+      );
+      let mut seed = ReplicaSeed::rebuild(object, Some(origin_inputs), zero, 2);
+      let units = seed_to_end(state, &mut seed);
+      let rebuilt = state
+        .merge
+        .replicas
+        .get_mut(&object)
+        .map(|replica| (replica.head(), replica.head_identity()));
+      (
+        accepted_first && accepted_second && rebuilt == Some((2, two)),
+        units,
+        [
+          count_of(state, REPLICA_SEEDED),
+          count_of(state, REPLICA_REBUILT),
+          count_of(state, REPLICA_REBUILT_VERSIONS),
+        ],
+      )
+    });
+    assert!(
+      rebuilt,
+      "the rebuilt replica is at version 2 with the serial engine's identity"
+    );
+    assert!(
+      units > chunks + 2,
+      "rebuilt a unit at a time ({units} units for {chunks} chunks and two versions)"
+    );
+    assert_eq!(counts, [1, 1, 2], "seeded, rebuilt, versions recomputed");
+  }
+
+  /// §4.16 "Apply on holders", D-27 "mismatch fatal-and-loud" (A-313): a rebuild installs a replica only from the whole
+  /// run of records its holder accepted and only at their identities. Do: ask a holder with no records of a green to
+  /// rebuild it; rebuild a scratch green whose holder accepted versions 0 and 2 but not 1; rebuild one whose version 2
+  /// record names another identity than its increment reaches. Expect: nothing to rebuild from; the first installs
+  /// nothing and is not refused, counted short; the second installs nothing and refuses its green for good, counted a
+  /// mismatch.
+  #[test]
+  fn a_rebuild_installs_nothing_short_of_its_records_or_off_their_identities() {
+    let first = creating("new-1", b"one", 1, 0);
+    let second = creating("new-2", b"two", 2, 1);
+    let (nothing, short, wrong, counts) = crate::daemon::audit_on_shard(move |state| {
+      let mut serial = Green::new();
+      let zero = serial.head_identity();
+      let _ = serial.submit(&first);
+      let one = serial.head_identity();
+      let _ = serial.submit(&second);
+      let two = serial.head_identity();
+      let (absent, gap, diverged) = (ObjectId([36; 16]), ObjectId([37; 16]), ObjectId([38; 16]));
+      let nothing = rebuild_replica(state, absent);
+      let gap_second = hold_encoded(state, gap, &second.encode());
+      accept_records(state, gap, &[(0, None, zero), (2, Some(gap_second), two)]);
+      let mut seed = ReplicaSeed::rebuild(gap, None, zero, 2);
+      seed_to_end(state, &mut seed);
+      let short = (
+        state.merge.replicas.contains_key(&gap),
+        state.merge.refused.contains(&gap),
+      );
+      let diverged_first = hold_encoded(state, diverged, &first.encode());
+      let diverged_second = hold_encoded(state, diverged, &second.encode());
+      accept_records(
+        state,
+        diverged,
+        &[
+          (0, None, zero),
+          (1, Some(diverged_first), one),
+          (2, Some(diverged_second), [9; 32]),
+        ],
+      );
+      let mut seed = ReplicaSeed::rebuild(diverged, None, zero, 2);
+      seed_to_end(state, &mut seed);
+      let wrong = (
+        state.merge.replicas.contains_key(&diverged),
+        state.merge.refused.contains(&diverged),
+      );
+      let counts = [
+        count_of(state, REPLICA_RECORDS_SHORT),
+        count_of(state, RECOMPUTE_MISMATCH),
+        count_of(state, REPLICA_REBUILT),
+      ];
+      (nothing, short, wrong, counts)
+    });
+    assert_eq!(
+      nothing,
+      Rebuild::Nothing,
+      "a holder with no records has nothing to rebuild"
+    );
+    assert_eq!(
+      short,
+      (false, false),
+      "a missing version installs nothing and refuses nothing"
+    );
+    assert_eq!(
+      wrong,
+      (false, true),
+      "another identity installs nothing and refuses the green"
+    );
+    assert_eq!(counts, [1, 1, 0], "short, mismatched, never rebuilt");
   }
 }
