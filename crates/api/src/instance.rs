@@ -23,13 +23,13 @@ use slates_client::{
   VhostUserDevice,
 };
 use slates_ipc::protocol::{
-  AuditEntry, DaemonReport, Filter, GrantScope, GrantSummary, Intent, MergeWindow, PlannedEntry,
-  ReadAt, Refusal, ReplyBody, RequestBody, SizeClass, SnapshotId, TelemetryReport, VolumeId,
-  VolumeSummary,
+  DaemonReport, Filter, GrantScope, Intent, MergeWindow, PlannedEntry, ReadAt, Refusal, ReplyBody,
+  RequestBody, SizeClass, SnapshotId, TelemetryReport, VolumeId, VolumeSummary,
 };
 
 use crate::error::{Error, Missing, ProtocolFault, Unsupported};
 use crate::grant::{GrantAuthority, GrantClaim, GrantProof};
+use crate::observe::{AuditRecord, GrantRecord, audit_of, grant_of};
 use crate::outcome::{
   Approval, Awaiting, LandOutcome, LandingConflict, MergeConflict, MergeConflicts, MergeOutcome,
   RebaseOutcome, Work, merge_class_of, report_of, summary_of,
@@ -577,6 +577,17 @@ impl Instance {
       Ok(Submitted::Conflict(windows)) => self
         .merge_conflicts(work, windows)
         .map(MergeOutcome::Conflicted),
+      // An ask write policy holds the merge (A-285): a merge has no presentation, so the approval binds the
+      // increment's identity, carried as the manifest. Placeholder shape until the contract maps it (g262).
+      Ok(Submitted::ApprovalRequired { identity, .. }) => {
+        Ok(MergeOutcome::ApprovalRequired(Approval {
+          awaiting: Awaiting::Merge(*work),
+          id: 0,
+          manifest: identity,
+          summary: crate::outcome::Summary::default(),
+          verification: Verification::Unsigned,
+        }))
+      }
       Err(ClientError::Refused(Refusal::PolicyForbids { act, by })) => {
         Ok(MergeOutcome::Refused(PolicyRefusal::forbidden(act, by)))
       }
@@ -657,14 +668,27 @@ impl Instance {
     self.client.daemon_status().map_err(|e| self.error(e))
   }
 
-  /// The audit log from record `since` (§4.15, §4.14): grants, manifests and landing outcomes, in order.
-  pub fn audit(&mut self, since: u64) -> Result<Vec<AuditEntry>, Error> {
-    self.client.audit(since).map_err(|e| self.error(e))
+  /// The audit log from record `since` (§4.15, §4.14), typed: grants, presentations, validations, entries and
+  /// landings finished, in order.
+  pub fn audit(&mut self, since: u64) -> Result<Vec<AuditRecord>, Error> {
+    self
+      .client
+      .audit(since)
+      .map_err(|e| self.error(e))?
+      .into_iter()
+      .map(audit_of)
+      .collect()
   }
 
-  /// The caller's grants (§4.13): each with its scope, term and state.
-  pub fn grants(&mut self) -> Result<Vec<GrantSummary>, Error> {
-    self.client.grants().map_err(|e| self.error(e))
+  /// The caller's grants (§4.13), typed: each with its volume, target, manifest, scope and state.
+  pub fn grants(&mut self) -> Result<Vec<GrantRecord>, Error> {
+    self
+      .client
+      .grants()
+      .map_err(|e| self.error(e))?
+      .into_iter()
+      .map(grant_of)
+      .collect()
   }
 
   /// One shard's telemetry drain (§4.14): the chokepoint spans its bounded ring holds, up to one reply's quota, with

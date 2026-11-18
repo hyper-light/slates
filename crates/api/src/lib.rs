@@ -58,6 +58,7 @@ pub mod grant;
 pub mod instance;
 pub mod issuer;
 pub mod mount;
+pub mod observe;
 pub mod outcome;
 pub mod policy;
 pub mod role;
@@ -74,6 +75,7 @@ pub use grant::{GrantAuthority, GrantClaim, GrantProof};
 pub use instance::{Instance, LandingRequest};
 pub use issuer::{GRANT_TERM_NS, Issuer};
 pub use mount::{MountKind, MountOptions, Mounted};
+pub use observe::{AuditKind, AuditRecord, GrantRecord, GrantState, LandingStage};
 pub use outcome::{
   ActionTally, Approval, Awaiting, LandOutcome, LandingConflict, LandingReport, LandingState,
   MergeConflict, MergeConflictClass, MergeConflicts, MergeOutcome, RebaseOutcome, Summary, Work,
@@ -93,18 +95,19 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// verb of the contract; a consumer asserts the one it was written against. 1: the contract as A-299 first published it
 /// (2026-11-18). 2: `Denied::Policy`, the class a write policy's refusal takes outside a landing or a merge (the
 /// same day). 3: `Instance::set_write_policy` and `Instance::write_policy`, over the daemon's policy verbs (A-285), and
-/// a landing or a merge a policy forbids answered as its `Refused` outcome (the same day).
-pub const CONTRACT: u32 = 3;
+/// a landing or a merge a policy forbids answered as its `Refused` outcome (the same day). 4: the audit log and the
+/// grant listing typed (`AuditRecord`, `GrantRecord`; the same day).
+pub const CONTRACT: u32 = 4;
 
 /// The typed client and its own types, for the verbs [`Instance::client`] lends outside the contract.
 pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, VhostUserDevice};
 /// The wire's types the contract takes and returns (§4.9; append-only, D-15).
 pub use slates_ipc::protocol::{
-  AttachTransport, AuditEntry, ConflictClass, DaemonReport, Filter, GrantScope, GrantSummary,
-  GreenBase, HostAnswer, HostPathReason, Intent, JournalReport, LandingDegradation,
-  LandingDurability, MountReport, NamePolicy, OwnMountUse, PlacedState, PlannedAction,
-  PlannedContent, PlannedEntry, Principal, ReadAt, RecoveryCause, SnapshotId, TelemetryReport,
-  TransportReport, UnsupportedReason, VolumeId, VolumeSummary,
+  AttachTransport, ConflictClass, DaemonReport, Filter, GrantScope, GreenBase, HostAnswer,
+  HostPathReason, Intent, JournalReport, LandingDegradation, LandingDurability, MountReport,
+  NamePolicy, OwnMountUse, PlacedState, PlannedAction, PlannedContent, PlannedEntry, Principal,
+  ReadAt, RecoveryCause, SnapshotId, TelemetryReport, TransportReport, UnsupportedReason, VolumeId,
+  VolumeSummary,
 };
 /// The rendezvous's and the channel's own typed refusals the contract carries.
 pub use slates_ipc::{DeliveryFault, error::RouteRefusal};

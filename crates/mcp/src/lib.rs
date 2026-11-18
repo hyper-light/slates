@@ -526,6 +526,13 @@ impl McpServer {
         Submitted::Conflict(windows) => {
           json!({ "accepted": false, "conflicts": windows_json(&windows) })
         }
+        // A merge an ask write policy holds (A-285): what the launcher's approval binds.
+        Submitted::ApprovalRequired { identity, paths } => json!({
+          "accepted": false,
+          "approval_required": true,
+          "identity": hex32(&identity),
+          "paths": paths,
+        }),
       },
     )
   }

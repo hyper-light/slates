@@ -7058,7 +7058,9 @@ it builds against the contract and adds to it rather than around it.
 > (`a_landing_follows_its_volumes_write_mode`: unset reads back as none; a bypass volume lands in
 > the one call, `Done`, its file on the disk, while its plan is refused and writes nothing; a
 > forbidding one answers `Refused` by its own policy, nothing written; the signed requirement
-> refused before the daemon is asked).
+> refused before the daemon is asked). **Piece 6:** the audit log and the grant listing typed
+> (`AuditRecord` with `AuditKind` and a `LandingStage` outcome; `GrantRecord` with `GrantState`), each
+> word of the daemon's closed tables read in one place and a stranger a protocol fault; `CONTRACT` = 4.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -21298,8 +21300,14 @@ Status: a volume's write policy and landing under it are built (2026-11-18): the
 volume's record (`PolicyRecord.write`, op `VolumeWritePolicySet`), set only under the issuer and never from a
 consumer-bound channel; a landing under it, on every Unix host: forbid refuses before any host access, ask answers the
 approval request a launcher's grant approves, bypass grants the planned presentation itself (`GrantSurface::Policy`)
-and lands it in the same request (`landing::land_under_policy`). Owed, in order: a consumer's own policy (the stricter
-of consumer and volume), merges under the policy, the MCP and SDK land verb gated by it, then signed work. The
+and lands it in the same request (`landing::land_under_policy`). Built the same day: `Present`, a landing presented and
+never landed whatever the mode (a reviewer's read of a bypass volume's changes writes nothing); merges under the policy,
+the stricter of the work's and the green's merge mode, forbid refused before the seal, ask answered
+`MergeApprovalRequired` with the increment's identity and its path count and merged by `SubmitApproved` under the
+launcher's proof of exactly that identity (`landing::merge_approval_proof`), a volume with no merge mode set merging at
+once as every merge did before policies. Owed, in order: the launcher secret (g262's, steps 1-4) and launcher-class
+proofs under it with a policy version against replay (mine), a consumer's own policy, the MCP and SDK land verb gated by
+the policy, then signed work. The
 SSH-signature verifier built first (below) stays, for signed work.
 - **The rule (Ada, 2026-11-18).** Merging and landing to disk follow the permission mode the user gave the harness or
   agent that asks. Bypass (Claude Code's `bypassPermissions`, Codex's full access): slates merges and writes, no
@@ -21386,6 +21394,10 @@ contract", new, with its status), GAPS (the A-299 entry and the Embedding librar
   from the wire's, its signed-merge requirement refused before sending; `plan_landing` refusing a bypass volume until a
   present-only verb exists; `CONTRACT` 3. Applied to `crates/api/src/{policy,issuer,instance,error,lib}.rs`,
   `tests/api.rs` (`a_landing_follows_its_volumes_write_mode`), §4.12's status, GAPS, `docs/library.md`.
+- **Piece 6, the same day:** the audit log and the grant listing typed (`observe.rs`: `AuditRecord`, `AuditKind`,
+  `LandingStage`, `GrantRecord`, `GrantState`), read from the daemon's closed name tables in one place; `CONTRACT` 4.
+  Checked by unit tests over every word and a stranger, and by use: after a landing the audit holds the presentation,
+  the issued grant and the landing finished `Done`, and the single-use grant is listed `Consumed`.
 - **Checked.** `cargo test -p slates-api` (37 unit, 9 by use, 5 start, 1 doc) and `cargo test -p slates-cli` on
   macOS arm64 (kiln runner, 2026-11-18): the cases in §4.12's status. The Linux and Windows arms of the mount and the
   CLI's Windows unmount are not compiled on this host; the integrator's lanes are their first compiler.

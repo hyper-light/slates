@@ -165,12 +165,15 @@ pub struct ConflictWindow {
 }
 
 /// The outcome of a `submit` or `rebase` (§4.16): `ok` whether the increment landed cleanly, the green
-/// `version` produced (or null on conflict), and the `conflicts` windows to resolve.
+/// `version` produced (or null on conflict), and the `conflicts` windows to resolve; for a merge an ask write policy
+/// holds (A-285), the increment's `approvalIdentity` (hex) the launcher's approval binds and its `approvalPaths`.
 #[napi(object)]
 pub struct MergeOutcome {
   pub ok: bool,
   pub version: Option<i64>,
   pub conflicts: Vec<ConflictWindow>,
+  pub approval_identity: Option<String>,
+  pub approval_paths: Option<i64>,
 }
 
 /// Builds the uniform merge outcome for `submit`/`rebase`: `ok` is exactly "a version was produced";
@@ -196,6 +199,8 @@ fn merge_outcome(
     ok: version.is_some(),
     version,
     conflicts,
+    approval_identity: None,
+    approval_paths: None,
   })
 }
 
@@ -514,6 +519,13 @@ fn work_volume(id: VolumeId, base: u64) -> Result<WorkVolume> {
 fn submit_outcome(outcome: Submitted) -> Result<MergeOutcome> {
   match outcome {
     Submitted::Accepted(version) => merge_outcome(Some(version), Vec::new()),
+    Submitted::ApprovalRequired { identity, paths } => Ok(MergeOutcome {
+      ok: false,
+      version: None,
+      conflicts: Vec::new(),
+      approval_identity: Some(hex32(&identity)),
+      approval_paths: Some(status_i64(paths, "paths")?),
+    }),
     Submitted::Conflict(windows) => merge_outcome(
       None,
       windows
