@@ -4432,7 +4432,9 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
   names the attachment and its resync token, 128 bits from the daemon's secure random and never its mount capability.
   On Linux it is a sequenced-packet pair whose device end follows the stream's on the client's control socket; on
   macOS (A-339) a stream of 28-byte messages, since a datagram pair's survivor is never told its peer has gone, whose
-  device end rides beside the stream's in the socket route's confirmation; Windows hands none yet. The daemon's end is
+  device end rides beside the stream's in the socket route's confirmation; Windows hands none yet, and its wire is
+  built (A-418): a message-mode pipe whose `Resync` names the fresh end's handle in the stream's holder's process,
+  where the successor duplicated it, since no descriptor rides a message there. The daemon's end is
   held by the anchor, as a FUSE device is, and the daemon keeps its own copy while the anchor holds one (A-339: XNU's
   collector of descriptors in flight flushes a socket whose every copy rides a message), with the token, the stream's
   owner view and its kernel's SETXATTR form as its session (A-378), updated when the guest names its owner, when its
@@ -29501,3 +29503,38 @@ code below.
   checkpoint) and `a_ledger_compacted_between_keeps_its_first_position_and_the_checkpoints_own` (`register.rs`); the
   server's merge, retention, state and takeover unit tests 35 of 35 and the acceptor tests 9 of 9 (kiln, the Mac Studio,
   2026-11-18, debug).
+
+### A-418 — The Windows resync wire: a `Resync` names the fresh stream end's handle in its holder's process (2026-11-18, goal 90, item b, piece one: what Shards needs from slates; A-316's and A-339's Windows half)
+Applied in the same change to: §4.6, the Shards form's resync bullet; GAPS, A-281's entry (its Windows owed item);
+`crates/bridge-fuse/src/shards_resync.rs` (`HandedResync`, `RESYNC_HANDLE_MESSAGE_BYTES`, `ResyncRefusal::NoHandle`, the
+module's channel and message paragraphs).
+
+- **What was there.** A-316's and A-339's `Resync` carries the device's end of a fresh stream by `SCM_RIGHTS`. Windows
+  carries no descriptor with a message: a handle reaches another process only when a holder duplicates it into that
+  process's table (`DuplicateHandle` with the target's process handle), and only its value travels (A-175's route,
+  `slates_ipc::handle_route`). So a Windows `Resync` must say where the end was put.
+- **The message.** The same 28 bytes as every `Resync` (kind 2, version 1, two zero bytes, the attachment, the token),
+  then the id of the process the successor duplicated the fresh end into (`u32`) and the end's handle value there
+  (`u64`, never zero: zero names no handle, A-175's convention), little-endian, 40 bytes in all. The `Attached`
+  message is the 28 bytes on every platform. The channel on Windows is a message-mode named pipe
+  (`slates_ipc::stream::message_pair`, as the anchor's hold channel is), so each message is one read whole and the
+  lengths never run together; each form is refused at the other's length, so neither passes for the other.
+- **To whom the end goes: the stream's holder, never the confined VM.** Shards' coordinator set condition 4c
+  (2026-11-18): a VM process confined in an AppContainer takes handles only through its spawner's grants, so the new
+  stream must reach it the way `--slates-fs-handle` does. The process named is therefore the one that holds the stream
+  for the VM: the process `slates shards` names with `ShardsHolder` (A-181), else the attaching client. How the device
+  takes the end from there is its handle path, which the coordinator specifies with the device's half.
+- **Default deny (condition 4a).** The device takes a Windows resync only if it parses at its length, is version 1 and
+  kind `Resync` with zero reserved bytes, names a handle, and names the attachment and token of the channel's
+  `Attached` (`HandedResync::resyncs`, the token compared over all its bytes).
+- **Evidence.** The codec's unit tests (`crates/bridge-fuse`, `shards_resync`): the golden vector, every forgery (each
+  token byte, another attachment, an `Attached` in the Windows form, a zero handle), every wrong length to twice the
+  message, another version, a reserved byte, and every single-bit flip parsed or refused without a panic.
+- **Owed.** The attach's half on Windows: the message-mode resync pipe made at the attach, `Attached` written before
+  the hand-off, the daemon's end held by the anchor with the session (token, owner view, form, and the holder's process
+  id and start time, so a successor never duplicates into a reused id), the device's end handed beside the stream's
+  (`ShardsHanded`, the client, `slates shards`, `serve_shards`). The successor's half: the held end adopted, the
+  record kept, a fresh pipe, its client end duplicated into the holder and named in this message, the replies kept for
+  a resend and the `FORGET`s logged as on Unix. The anchor's Windows hold needs a kind for the resync end and a
+  message that replaces a held entry's record (the session moves as the guest names its owner, its `INIT` is answered,
+  a restore runs and its holder changes). And Shards' device half.
