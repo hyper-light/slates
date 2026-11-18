@@ -7908,6 +7908,10 @@ it builds against the contract and adds to it rather than around it.
 > way. `HostFault` renders in words, the daemon's `TargetUnavailable` by that name. Both were lost when the CLI moved
 > onto the library (A-278); the integrator's Windows lane found them (run 44257181904,
 > `docs/bugs/2026-11-18-the-cli-on-the-library-lost-two-windows-refusals-words.md`).
+> **`CONTRACT` = 17:** the daemon's database refusals are typed on the wire (`Refusal::Database { refusal:
+> DatabaseRefusal }`, appended). `refusal_of_db` is exhaustive: its catch-all sent a corrupt record, a regressed
+> NFSv4 instance, a checkpoint out of range, a malformed sealing key and a refused encoding as `BadRequest` words. The
+> contract classes each `Unusable::Database`, a fault on the daemon's side to report.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,

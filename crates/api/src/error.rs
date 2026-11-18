@@ -38,8 +38,8 @@ use std::fmt;
 use slates_client::ClientError;
 use slates_ipc::error::RouteRefusal;
 use slates_ipc::protocol::{
-  AttachTransport, HostPathReason, OwnMountUse, Principal, RecoveryCause, Refusal, SnapshotId,
-  UnsupportedReason, VolumeId, VolumeRefusal,
+  AttachTransport, DatabaseRefusal, HostPathReason, OwnMountUse, Principal, RecoveryCause, Refusal,
+  SnapshotId, UnsupportedReason, VolumeId, VolumeRefusal,
 };
 use slates_ipc::{DeliveryFault, IpcError};
 
@@ -534,6 +534,10 @@ pub enum Unusable {
   RecoveryUnavailable,
   /// The volume core cannot serve it from what it holds: `JournalIncomplete`, `RecoveryVersion` (A-299).
   Volume(VolumeRefusal),
+  /// The daemon's own records cannot serve it (A-299): a corrupt log record, a regressed NFSv4 instance, a checkpoint
+  /// out of range, a malformed sealing key, a refused encoding. Each is a fault on the daemon's side to report, not a
+  /// request to change.
+  Database(DatabaseRefusal),
   /// The fleet's configuration cannot hold the write to the operator's declared durability (§4.8 "Placement"); reads
   /// continue.
   DurabilityUnmet {
@@ -836,6 +840,7 @@ impl Error {
       Refusal::TargetUnavailable { reason } => Error::Host(HostFault::Target(Note::new(reason))),
       Refusal::DuplicateRequest => Error::Protocol(ProtocolFault::DuplicateRequest),
       Refusal::Volume { refusal } => Error::of_volume(refusal),
+      Refusal::Database { refusal } => Error::Unusable(Unusable::Database(refusal)),
     }
   }
 }
@@ -1576,6 +1581,17 @@ mod tests {
         && words.contains("NotRecovered")
         && words.contains("BaseMissing"),
       "{words}"
+    );
+  }
+
+  /// A-299's sibling sweep (2026-11-18): do type a database refusal of the daemon's own records. Expect it unusable,
+  /// typed by its class, never a request to change.
+  #[test]
+  fn a_database_refusal_is_typed_unusable() {
+    let corrupt = slates_ipc::protocol::DatabaseRefusal::Corrupt { seq: 3 };
+    assert_eq!(
+      Error::of_refusal(Refusal::Database { refusal: corrupt }, None, PAUSE_NS),
+      Error::Unusable(Unusable::Database(corrupt))
     );
   }
 
