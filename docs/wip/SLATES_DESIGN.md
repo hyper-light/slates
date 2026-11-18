@@ -7304,6 +7304,16 @@ No copy-up, hashing, archive or landing step opens a host special file as regula
 > fields and the mounted conformance run. BUG-11 is closed (9c97ce6b, 5127b4b3). `slates grant` issues a grant
 > (596bfb04); the Linux issuer surface stays owed (GAPS).
 
+> **Status (2026-11-18, A-287: the full entry list on demand).** Built: a presentation keeps its manifest's entries
+> (moved from the plan, never copied) and the conflict classes its preliminary pass found, for as long as A-46 keeps
+> the presentation; `LandingEntries` pages them to the presenting principal (`crates/server/src/landing_entries.rs`),
+> and `slates_client::Client::landing_entries` joins and decodes the pages. Before, a presentation answered counts and
+> conflicts only, so neither a person nor a reviewer with no mount of the volume could learn what a grant would
+> write, path by path. Proven by use (`crates/server/tests/presentations.rs`: every action kind over an overlay with
+> an outsider's conflict, another principal and a replaced presentation refused; a list past one page with an entry
+> no page holds whole; a landed presentation's bytes as listed) and by the pager's oracle (unit tests). Not served:
+> the CLI's `slates land` prints the summary alone.
+
 > **Status (2026-10-01, AUD-29-62: contained base access on every platform).** The Windows base host is
 > descriptor-relative like the Unix one: it retains a handle per opened directory and opens each entry with
 > `NtCreateFile` relative to it with `FILE_OPEN_REPARSE_POINT`, and makes the reparse check on the object it
@@ -7425,7 +7435,12 @@ entry either old or new, never torn).
 2. *Present.* Reply `GrantRequired{request_id, manifest_hash, summary}` and record
    `LandingPlanned` in the audit log. The confirmation surface shows the summary, the full entry
    list on demand, and the conflicts found by a preliminary verdict pass (step 4 run without
-   writing), because a human decides on evidence, not on a yes/no prompt. The surface may offer
+   writing), because a human decides on evidence, not on a yes/no prompt. The entry list is read
+   from the presentation itself (`LandingEntries`, A-287): the manifest's entries in its order,
+   each with what it writes (a file's BLAKE3 and length, a rename's origin, a symlink's target),
+   its mode, whether it replaces or removes what the volume witnessed, and the conflict class found
+   at it; a page at a time, as the bytes of the entries' encodings under an (entry, byte) cursor,
+   so an entry longer than one reply crosses pages; to the principal it was presented to alone. The surface may offer
    suggestions the human toggles, such as excluding what the target's ignore files name; the
    agent's own filter stays explicit; a toggled suggestion
    produces a new manifest and a new hash, so the grant always binds what will actually be
@@ -20511,3 +20526,52 @@ The steps' own records follow.
     the process judgment. On this Mac: supervised 10 of 10, unsupervised 10 of 10, frozen 5 of 5. Mutations each turned
     their own shape red on both runners: the client's `Stalled` branch, the lone self-end, and starved treated as stuck.
     The tables are in the bug record.
+
+### A-287 — A presentation keeps its manifest's entries, and `LandingEntries` reads them a page at a time to the principal it was presented to (accepted and built 2026-11-18, kiln goal g266: review with no mount of the volume)
+
+Applied in the same change to:
+- §4.15 step 2 (how the full entry list is read) and its status.
+- `crates/ipc/src/protocol.rs`: `RequestBody::LandingEntries { landing, from }` and `ReplyBody::LandingEntries { bytes,
+  next, total, manifest }` (both appended); `PlannedEntry`, `PlannedAction`, `PlannedContent`, `ConflictClass`,
+  `EntriesCursor` (new).
+- `crates/server/src/landing.rs`: `Awaiting::entries` and `Awaiting::conflicts`; `present` takes the plan by value
+  and moves the manifest's entries into the presentation. `crates/server/src/landing_entries.rs` (new): the verb, the
+  pager and its oracle. `crates/server/src/verbs.rs`: the verb served on the landing's owner shard, as a grant is.
+- `crates/client/src/client.rs`: `Client::landing_entries_page` and `Client::landing_entries`; the types re-exported.
+- `crates/server/tests/presentations.rs`: three tests by use. GAPS: the Landing (4.15) row.
+
+- **What was there.** §4.15 step 2 promised the full entry list on demand, and a presentation answered the summary's
+  counts and the conflicts alone; the manifest was dropped once its hash was taken. So a person granting a landing saw
+  how many files it wrote but not which, and a reviewer with no host mount of the volume — kiln's microVM sessions, a
+  guest's volume served over virtio-fs — had no way to learn the change it was asked to review.
+- **The rule.** A presentation keeps its manifest's entries for as long as A-46 keeps it, and `LandingEntries` reads
+  them to the principal it was presented to: to anyone else, and once the presentation has gone, the landing is
+  `NotFound`. A page is the bytes of the entries' wire encodings (`PlannedEntry`), one after another in the manifest's
+  order, from an (entry, byte) cursor to as many as one reply chunk holds; every page but the last is full, and the
+  last names no next cursor. Each create and replace names its bytes' BLAKE3 and length, as the manifest binds them,
+  so a reader of the volume's file checks that what it read is what the grant would land. A cursor that names no place
+  in the list is refused `BadRequest`.
+- **Why bytes and not whole entries.** One reply chunk holds 4,023 bytes of entries, and an entry is its path, plus a
+  rename's origin or a symlink's target, plus about 60 bytes. A path near the OS limit, with an origin or a target,
+  outgrows a page, and a page of whole entries would have to refuse that landing's list while the landing itself writes
+  it (the engine opens each component relative to its parent). Under a cursor into the encodings the entry crosses
+  pages; each page still encodes only the entries it carries, so serving the list costs work proportional to the page,
+  never to the list, and the server keeps nothing of its readers. The client decodes each entry as its last byte comes,
+  so it holds no more than one entry's part between pages.
+- **Why the presentation keeps the entries.** The list must be the manifest the grant binds, entry for entry: planning
+  again could not promise that (the disk under the preliminary verdicts moves), and planning per page would cost the
+  plan per page. The entries are moved from the plan, which had them in memory already; what is new is how long they
+  stay, and A-46 bounds that: one presentation a client seat, gone with its landing, its replacement or its client.
+- **For a reviewer.** A plain volume reads only at its head (`ReadAt`), so a reviewer snapshots the volume, presents
+  the snapshot's landing, reads the list, reads each listed file at the head and checks its BLAKE3 against the entry;
+  a mismatch means the volume changed since the snapshot, and the reviewer presents again. The landing of the same
+  snapshot later presents the same manifest hash, or the disk changed the plan, which the grant's binding refuses
+  (AC-2.8).
+- **Checked.** `crates/server/tests/presentations.rs`: over a base, every action a volume can take through the file
+  verbs (a directory made, files created, a file replaced, a directory renamed, a file removed), each listed in landing
+  order with its bytes' hash and length and its mode, the replaced file's outsider change listed as `ModifyModify`, the
+  counts and bytes the summary's; another principal's read and a replaced presentation's are `NotFound`, pages of
+  another manifest are never joined; a list of about twelve pages whose 3,986-byte entry no page holds whole comes
+  whole and in order; a landed presentation's files hash to what its list named, and its list then is `NotFound`. The
+  pager against its oracle: generated lists and page sizes join to the encodings in order with every page but the last
+  full; every cursor outside the list refused.
