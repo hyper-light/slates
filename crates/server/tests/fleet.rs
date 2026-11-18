@@ -12601,6 +12601,7 @@ fn sealed_and_held(daemons: &[Daemon], name: &str, path: &str) -> Result<VolumeI
   let ReplyBody::Created { id } = client.call(&scratch(name)) else {
     return Err("create on the owner".to_owned());
   };
+  share_with_fleet(&mut client, id, daemons);
   let attachment = write_attachment(&mut client, id);
   let written = write_own_name(&mut client, id, attachment, path);
   let detached = client.call(&RequestBody::Detach { attachment });
