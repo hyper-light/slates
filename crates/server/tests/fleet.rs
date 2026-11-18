@@ -11623,6 +11623,39 @@ fn a_takeover_round_started_over_under_a_new_configuration_keeps_its_adoptions_w
   drop(observed);
   let instance = daemons[index].instance().to_owned();
   let after = after_the_restart(&daemons, &instance, id);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "restarted round: adopted {adopted}, started over {started_over}; the write after it {:?}, its snapshot placed {}, \
+     read {:?}",
+    after.written, after.placed, after.read
+  );
+  assert!(
+    written
+      .iter()
+      .all(|reply| matches!(reply, ReplyBody::FsDone { .. })),
+    "every write on the owner was answered at durability: {written:?}"
+  );
+  assert!(
+    adopted && started_over,
+    "the successor adopted the volume's registers ({adopted}) and its round started over after ({started_over})"
+  );
+  assert!(
+    matches!(after.written, Ok(ReplyBody::FsDone { .. })),
+    "the write through the successor was answered at durability: {:?}",
+    after.written
+  );
+  assert!(
+    after.placed,
+    "the successor's snapshot placed in the region"
+  );
+  assert!(
+    after.read.iter().all(|read| *read),
+    "every file reads back through the successor: {:?}",
+    after.read
+  );
+}
 
 /// Format: an owner's count of replies held for a live volume's durability and told to try again at their bound
 /// (`live_ship::judge_held`, A-354).
@@ -11698,34 +11731,6 @@ fn a_reply_held_for_a_durability_it_cannot_reach_is_refused_at_the_failover_slo_
     daemon.stop();
   }
   eprintln!(
-    "restarted round: adopted {adopted}, started over {started_over}; the write after it {:?}, its snapshot placed {}, \
-     read {:?}",
-    after.written, after.placed, after.read
-  );
-  assert!(
-    written
-      .iter()
-      .all(|reply| matches!(reply, ReplyBody::FsDone { .. })),
-    "every write on the owner was answered at durability: {written:?}"
-  );
-  assert!(
-    adopted && started_over,
-    "the successor adopted the volume's registers ({adopted}) and its round started over after ({started_over})"
-  );
-  assert!(
-    matches!(after.written, Ok(ReplyBody::FsDone { .. })),
-    "the write through the successor was answered at durability: {:?}",
-    after.written
-  );
-  assert!(
-    after.placed,
-    "the successor's snapshot placed in the region"
-  );
-  assert!(
-    after.read.iter().all(|read| *read),
-    "every file reads back through the successor: {:?}",
-    after.read
-
     "held for good: the write {first:?}, the same request {same_id:?}, {gave_up} given up, the write again {again:?}"
   );
   let slo_ns = slates_server::config::FAILOVER_SLO_NS;
