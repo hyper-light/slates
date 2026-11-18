@@ -32312,6 +32312,30 @@ Applied in the same change to: §4.16 ("Rebase off the owner (A-273)"); A-273's 
   given back: the new test fails, nothing given back within an observation's budget.
 - **Owed.** The supervisor's A/B at 1,000 clients and more (running).
 
+### A-476 — A takeover successor names the versions its adoption stands for by its ledger and, where its checkpoint let the ledger's positions go, by the checkpoint (2026-11-18, goal 87 via g083; §4.16 owner-loss recovery; A-333, A-364, A-404, A-412)
+
+Applied in the same change to: GAPS (A-404's entry); `docs/bugs/2026-11-18-a-successors-chain-lacked-the-versions-its-checkpoint-stood-for.md`;
+`crates/server/src/merge_origin.rs` (`ledger_identities`, and the test
+`a_successors_chain_names_the_versions_its_checkpoint_stands_for`); `crates/server/src/daemon.rs`
+(`Daemon::merge_chain_identities` reads an adopted green's versions through it).
+
+- **What was there.** An adopted green's chain holds only the versions after its adoption, and the versions through it
+  are named by the successor's ledger (A-333). Since A-404 a holder lets go of its ledger's positions below the durable
+  checkpoint it keeps, which stands for them. The chain read named the adopted versions from the ledger alone, so a
+  successor whose checkpoint had let go of version 1 named its chain from version 2. It did so whenever a record it
+  recomputed named version 2 committed: 2 of 4 runs of the fleet test of a successor two versions behind, on Linux, at
+  and before A-273.
+- **The rule.** The versions through an adoption are named by the ledger's record where it holds the position, and by
+  the held checkpoint's record of what it accepted where it let go of it (`merge_origin::ledger_identities`): the two
+  durable halves of the successor's prefix since A-404. The engine (rebuilt or advanced from that checkpoint), the
+  rebuild at a restart and the durable state were right throughout; only the read missed the checkpoint.
+- **Checks.** On the Mac Studio (debug, r436, 2026-11-18): `cargo test --locked -p slates-server --lib merge_origin` 17
+  of 17, the new `a_successors_chain_names_the_versions_its_checkpoint_stands_for` among A-404's; the one-crate clippy
+  of `slates-server` clean; `cargo xtask check` structural clean and its literal check clean in this change (it counts
+  50 literals in other crates' files); rustfmt's layout taken. Red with the checkpoint's names left out (the read as it
+  was): the new test fails, naming `[(2, …), (3, …)]` for `[(1, …), (2, …), (3, …)]`, the fleet test's failure's shape.
+- **Owed.** The fleet test twenty times on Linux and on macOS (filed for main).
+
 ### A-474 — A watcher's own late looks are no span it did not watch: A-308's reset waits for a gap past the window and the watcher's measured lateness (2026-11-18, built for goal g255; §4.14 `daemon.alive`; A-228, A-232, A-308, A-455, A-467)
 - **What was there.** A-308 started every shard's still time again at a look a window or more after the watchdog's last
   one, taking the gap for the process frozen or paging whole. The watchdog looks a beat apart whatever its own lateness,
