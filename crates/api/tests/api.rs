@@ -931,6 +931,58 @@ fn a_merge_follows_its_greens_write_mode() {
   daemon.stop();
 }
 
+/// kiln's volume bound (`crates/kiln/src/workspace/slates.rs`, `volume_max`): a quarter of the machine's memory in whole
+/// GiB, at least one and at most 64.
+fn kiln_volume_max() -> u64 {
+  /// Format: kiln's `MAX_VOLUME_GIB`.
+  const MAX_VOLUME_GIB: u64 = 64;
+  ((profile().facts.memory.total / 4) >> 30).clamp(1, MAX_VOLUME_GIB) << 30
+}
+
+/// P1 (2026-11-18, kiln's review over a microVM's volume, which failed `agents.change` with "reading .gitignore: a bound
+/// is reached: Quota"). Do: what kiln does: provision an overlay over a project folder with kiln's own spec (a quarter of
+/// the machine's memory), make the agent's three edits, then review: snapshot, present that snapshot's landing without
+/// writing and list its entries, and read the project's unchanged `.gitignore` at the head as kiln's ignore rules do.
+/// Expect: the base file's bytes as the disk holds them — a read of a file nobody changed is never refused for space.
+#[cfg(unix)]
+#[test]
+fn an_unchanged_base_file_reads_at_the_head_while_a_review_holds_its_snapshot() {
+  let (daemon, mut instance) = grouped("review-read");
+  let folder = Folder::new();
+  let ignores = b"target/\n*.log\n";
+  folder.write(".gitignore", ignores);
+  folder.write("src/lib.rs", b"pub fn a() {}\n");
+  folder.write(".git/HEAD", b"ref: refs/heads/main\n");
+  let volume = provision(
+    &mut instance,
+    &VolumeSpec::overlay("kiln-review", &folder.path, kiln_volume_max()),
+  );
+  write_file(
+    &mut instance,
+    volume,
+    "/src/lib.rs",
+    b"pub fn a() { b() }\n",
+  );
+  write_file(&mut instance, volume, "/src/new.rs", b"pub fn b() {}\n");
+  write_file(&mut instance, volume, "/notes.txt", b"done\n");
+  let snapshot = instance.snapshot(volume).unwrap();
+  let request = slates_api::LandingRequest {
+    snapshot: Some(snapshot),
+    ..landing_into(volume, &folder)
+  };
+  let LandOutcome::ApprovalRequired(approval) = instance.plan_landing(&request).unwrap() else {
+    panic!("the agent's edits are presented");
+  };
+  assert_eq!(instance.approval_entries(&approval).unwrap().len(), 3);
+  assert_eq!(
+    instance.read(volume, "/.gitignore", slates_api::ReadAt::Head),
+    Ok(ignores.to_vec()),
+    "an unchanged base file reads at the head"
+  );
+  instance.destroy_snapshot(volume, snapshot).unwrap();
+  daemon.stop();
+}
+
 /// AC-5.12 / T-5.14 (A-278; §4.14): do read the daemon's status and a shard's telemetry through the library; expect the
 /// daemon's shards reported and the drain answered for the shard it has.
 #[test]
