@@ -225,6 +225,26 @@
 > must still meet the new fence, so each acceptor must be brought up to the installed version when it is next asked as
 > well as by the walk (a design change to §4.8's install, with its model).
 
+> **A takeover round started over one epoch above its own adoptions, and the successor's writes were refused for good:
+> fixed for a newer configuration (2026-11-18, A-353, §4.8 "Promotion and takeover"; g230, caught live by g229).** Each
+> survivor's confirmation is a new configuration, so a successor whose round adopted before another survivor confirmed
+> started its round over; its starting epoch counted its own adoption's copies and rose one above them, and its pages
+> fenced the adopted registers there. The successor's catalog naming its live holders was refused `StaleEpoch` every
+> period, its shipper never shipped, and a write through it waited 21 minutes (lossy live flow, Mac Studio, the status
+> reads in d1323898:~/.cache/g229-logs/hang/). Before that capture the same hang was seen once on arm64 (diag 44302631709,
+> main 1e82ebda1) and the store-destroyed flow hung once on each arch (diag 44290905601, main 30e4ee71b); neither
+> recurred in 72 capped runs at 4cbdcb5fc (diag 44318765888) nor in chaos4 (diag 44320680683, main 38de3d2a9). The
+> starting epoch now leaves out the round's adopted objects. Test:
+> `a_takeover_round_started_over_under_a_new_configuration_keeps_its_adoptions_writable`.
+> - **Owed (to model first):** a round started over above a fence a holder reported, and a round made again after the
+>   successor's warm restart (its rounds live in memory) before its confirmation committed, still re-prepare the objects
+>   it adopted above the epoch it writes them at. An acceptor's positions carry no writer, so a holder cannot tell the
+>   asker's own adoption from another's write at the same epoch; the round's epoch kept durably per retired host, or a
+>   writer with each position, would let both paths keep the epoch. The model (TLA+, `docs/wip/models/`) must show
+>   which keeps StaleNeverCommits.
+> - **Owed (A-354):** the reply a write through the successor held waited without a bound; held replies of the slates
+>   protocol are judged by no time bound (NFS and FUSE judge theirs by `durable_bound` up to the failover SLO).
+
 > **A seal's envelope was wrapped in one turn, and a refused one never started again: in turns, and dropped (2026-11-18,
 > A-323 and A-322, §4.10 "Content replication"; g230).** The owner shard wrapped a seal's whole archive in the turn its
 > walk ended (98 ms for 64 MiB, `envelope_bench` 2026-10-05; about 1.5 s a GiB, past the watchdog's one-second window,

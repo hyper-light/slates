@@ -5761,6 +5761,26 @@ refinement and revalidation before those results can be applied to the corrected
 > one failure (`docs/bugs/2026-11-18-a-stale-copy-reclaim-dropped-content-a-successor-still-fetched.md`). Owed: the
 > release of a copy kept so (GAPS).
 
+> **Status (2026-11-18, A-353: a round started over keeps its epoch over what it adopted; g230).** Each survivor's
+> confirmation of its own share is a new configuration (`RegionalConfiguration::confirm` bumps the version), so a
+> successor whose round adopted before another survivor confirmed starts its round over under that configuration. The
+> round's epoch then rose one above every epoch of the successor's own copies of the objects that fall to it, and those
+> included the objects it had just adopted, whose copies hold its own adoption at the round's epoch: so the round started
+> over one above its own writes, its pages fenced every holder's copy of the adopted registers there (and its own), and
+> every record it wrote for them at its takeover epoch was refused `StaleEpoch` for good. Caught live by g229 on a Mac
+> Studio (2026-11-18, the lossy live flow): the catalog naming the successor's live holders was refused every period,
+> so its shipper never shipped and a write through it waited 21 minutes until killed. Now a round's starting epoch
+> leaves out the objects the round adopted (`takeover::initial_epoch`): a round started over under a newer
+> configuration keeps its epoch, and a holder's re-prepare at the same epoch moves no fence. Counted
+> `fleet.takeover.restarted`. Held by
+> `a_takeover_round_started_over_under_a_new_configuration_keeps_its_adoptions_writable` (`crates/server/tests/fleet.rs`:
+> both survivors' confirmations withheld, `Daemon::inject_confirmation_withheld`; the other survivor's released once the
+> successor adopted; a write and a snapshot through the successor after its round started over). Owed (GAPS): a round
+> started over above a fence a holder reported, and a round made again after the successor's warm restart, still
+> prepare the objects it adopted above the epoch it writes them at: an acceptor's positions do not record their writer,
+> so telling the successor's own adoption from another's needs the round's epoch kept durably or a writer with each
+> position, a change to model first.
+
 **Neighbourhood changes.** A host's neighbourhood changes only through the group (a member
 left, a fresh member joined, a rebalancing). While a change is in flight the owner writes to a
 quorum of the old candidates and a quorum of the new ones (joint writes); the group retires the
@@ -25437,3 +25457,22 @@ Applied in the same change to:
   own wherever the shards fall: a call to the driving shard itself runs inline (§4.3's one code path for one shard and
   many), so the four sliced walks, this open among them, ran every slice in one poll on the control shard and on every
   shard of a one-shard daemon, and their tests, counting slices, could not see it.
+
+### A-353 — A takeover round started over under a newer configuration keeps its epoch over the objects it adopted (2026-11-18, g230, scale-out; §4.8 "Promotion and takeover"; the lossy flow's post-takeover hang)
+Applied in the same change to:
+- §4.8 "Promotion and takeover": A-353's status.
+- `crates/server/src/takeover.rs`: `initial_epoch` leaves out the objects the round adopted; `begin_round` counts a
+  round started over (`fleet.takeover.restarted`); the test hook's withheld confirmation
+  (`fleet.takeover.confirmation_withheld_by_fault`). `crates/server/src/daemon.rs`, `state.rs`:
+  `Daemon::inject_confirmation_withheld`.
+- Tests: `a_takeover_round_started_over_under_a_new_configuration_keeps_its_adoptions_writable`
+  (`crates/server/tests/fleet.rs`).
+- GAPS: the entry of 2026-11-18 (the restart epoch; its owed fence and warm-restart paths).
+- **What was there.** A round started over at `max(its epoch, the epoch a new round would start at)`, and a new round
+  starts one above every epoch of this node's copies of the objects that fall to it. After an adoption those copies
+  hold the adoption itself, at the round's epoch, so every restart of a round that had adopted anything went one above
+  its own writes, and the holders' re-prepare fenced the adopted objects above the epoch the successor writes them at.
+- **The rule.** A round's epoch must exceed the records of the objects it still has to adopt, never its own: the
+  objects a round adopted are left out of its starting epoch, so a round started over under a newer configuration
+  keeps its epoch, and a re-prepare at the same epoch is a promise its holders already made.
+

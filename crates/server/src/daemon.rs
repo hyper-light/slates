@@ -3243,6 +3243,16 @@ impl Daemon {
     })
   }
 
+  /// Test support: while `withheld` is set, this node sends no confirmation of a takeover share it has finished
+  /// (counted `fleet.takeover.confirmation_withheld_by_fault`), as a confirmation late to commit leaves its share owed
+  /// while the other survivors confirm theirs, each confirmation a new configuration (A-353). Lifting it lets the next
+  /// period confirm. Delivered like [`Self::inject_takeover_silence`]; `Ok` once installed, else the typed refusal.
+  pub fn inject_confirmation_withheld(&self, withheld: bool) -> Result<(), ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      s.injected_confirmation_withheld = withheld;
+    })
+  }
+
   /// Test support: leaves unanswered every takeover page and question by name this node, as a holder, is asked by one of
   /// `askers` (§4.8 phase one; counted `fleet.takeover.silenced_by_fault`), while it answers everything else on the same
   /// sessions: a holder cut off from one successor alone, which the council never retires since every other member hears
@@ -4348,6 +4358,7 @@ async fn init_shard(
     injected_content_ack_delay_ns: None,
     injected_forward_silence: None,
     injected_takeover_silence: std::collections::BTreeSet::new(),
+    injected_confirmation_withheld: false,
     injected_deaf_session: None,
     injected_discovery_hold: None,
     dead_session_dropped_at: std::collections::BTreeMap::new(),
