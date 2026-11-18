@@ -38,7 +38,6 @@ mod format;
 // is owed there.
 #[cfg(test)]
 mod liveness_tests;
-mod mount;
 // The handshake asks a container engine's CLI over a poll loop (`rustix`) and judges the answer with
 // `slates-bridge-oci`; both are `cfg(unix)` dependencies, so the module is too.
 #[cfg(unix)]
