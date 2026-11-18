@@ -732,28 +732,45 @@ impl<'v> VolumeBridge<'v> {
     Ok(acl.to_bytes())
   }
 
-  /// Sets `owner`'s ACL `name` to `value` as Linux keeps one (A-314; `set_posix_acl` and `posix_acl_update_mode`, and
-  /// as Linux's own attribute path does, whatever `XATTR_CREATE` or `XATTR_REPLACE` asked). An access ACL sets the
-  /// mode's three classes from its owner, mask (or owning group) and other entries, and is kept only when it says
-  /// more than a mode can, removed otherwise; a default ACL is kept as it is. The empty ACL, which a kernel reads as
-  /// none, removes either. The mode changes first, through the overlay rules, which may need room; if the attribute
-  /// then cannot be kept, the mode is put back, which needs none, the inode being current by then. A value no ACL parse
-  /// takes is refused `Invalid`: a guest's route checks one before it gets here.
+  /// Sets `owner`'s ACL `name` to `value` as Linux keeps one (A-314; `set_posix_acl`), whatever `XATTR_CREATE` or
+  /// `XATTR_REPLACE` asked, as Linux's own attribute path ignores them for an ACL: an access ACL with the mode
+  /// ([`VolumeBridge::set_access_acl`]), a default ACL as it is. A value no ACL parse takes is refused `Invalid`: a
+  /// guest's route checks one before it gets here.
   fn set_acl(&mut self, owner: InodeNo, name: &[u8], value: &[u8]) -> Result<(), VfsError> {
     let acl = Acl::parse(value).map_err(|_| VfsError::Invalid)?;
-    if name != POSIX_ACL_ACCESS {
-      return if acl.is_empty() {
-        self.remove_attribute_if_set(owner, name)
-      } else {
-        self.volume.xattr_set(
-          self.store,
-          owner,
-          name,
-          value,
-          slates_vfs::xattr::XattrSet::Either,
-        )
-      };
+    if name == POSIX_ACL_ACCESS {
+      self.set_access_acl(owner, &acl, value)
+    } else {
+      self.keep_acl(owner, name, &acl, value)
     }
+  }
+
+  /// Keeps `acl` (whose bytes are `value`) as `owner`'s ACL `name`, or none for the empty ACL, which a kernel reads as
+  /// none (`posix_acl_from_xattr` of no entries).
+  fn keep_acl(
+    &mut self,
+    owner: InodeNo,
+    name: &[u8],
+    acl: &Acl,
+    value: &[u8],
+  ) -> Result<(), VfsError> {
+    if acl.is_empty() {
+      return self.remove_attribute_if_set(owner, name);
+    }
+    self.volume.xattr_set(
+      self.store,
+      owner,
+      name,
+      value,
+      slates_vfs::xattr::XattrSet::Either,
+    )
+  }
+
+  /// Sets `owner`'s access ACL to `acl` (whose bytes are `value`) as `posix_acl_update_mode` does (A-314): the mode's
+  /// three classes from its owner, mask (or owning group) and other entries, and the ACL kept only when it says more
+  /// than a mode can, removed otherwise. The mode changes first, through the overlay rules, which may need room; if
+  /// the attribute then cannot be kept, the mode is put back, which needs none, the inode being current by then.
+  fn set_access_acl(&mut self, owner: InodeNo, acl: &Acl, value: &[u8]) -> Result<(), VfsError> {
     let before = self.attr_of(owner.0)?.mode;
     let mode = if acl.is_empty() {
       before
@@ -764,23 +781,14 @@ impl<'v> VolumeBridge<'v> {
       self.chmod_through_overlay(owner, mode)?;
     }
     let kept = if acl.exceeds_a_mode() {
-      self.volume.xattr_set(
-        self.store,
-        owner,
-        name,
-        value,
-        slates_vfs::xattr::XattrSet::Either,
-      )
+      self.keep_acl(owner, POSIX_ACL_ACCESS, acl, value)
     } else {
-      self.remove_attribute_if_set(owner, name)
+      self.remove_attribute_if_set(owner, POSIX_ACL_ACCESS)
     };
-    if let Err(refusal) = kept {
-      if mode != before {
-        self.chmod_through_overlay(owner, before)?;
-      }
-      return Err(refusal);
+    match kept {
+      Err(refusal) if mode != before => self.chmod_through_overlay(owner, before).and(Err(refusal)),
+      kept => kept,
     }
-    Ok(())
   }
 
   /// Removes attribute `name` from `owner`, and is done if it had none: an ACL set to say no more than a mode, or to
