@@ -8645,8 +8645,42 @@ runs per row, 32 of 32 closed; the replacement answered 53 to 145 ms after the k
 is the old voter being confirmed dead and the replacement staged; a leader must not drop a voter it has not confirmed
 dead. No defect. From losing a voter to its replacement seated, the fleet has spent `f = 1`: a second failure inside
 that window cannot be survived under any membership scheme, so a flow that kills the owner after replacing a node waits
-for the seat (`wait_council_seated`, `crates/cli/tests/live_chaos.rs`). diag-live-durability-66 killed the owner inside
-it in 6 of 6 x86 runs.
+for the seat (`wait_recovered`, `crates/cli/tests/live_chaos.rs`; until 2026-11-09 `wait_council_seated`, which
+judged the joint flag and voter agreement alone: those hold before the change begins, so on CI it passed before the
+replacement was seated in 20 of 22 failed runs, diag-live-durability-77 and -78). diag-live-durability-66 killed the
+owner inside it in 6 of 6 x86 runs.
+
+### A live volume taken over by a node replaced at its own anchor (A-271; 2026-11-09, diag-live-durability-75, -79, -80)
+
+**Runners:** GitHub `ubuntu-latest` (x86_64) and `ubuntu-24.04-arm`, 4 CPUs each, release. **Command (the contract),
+each run:** `SLATES_TEST_CLI=1 cargo test --release --locked -p slates-cli --test live_chaos -- --nocapture
+--test-threads=1 --exact a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover`, 12 runs a leg in
+one job, the runs one after another. **Flow:** a three-node anchored fleet streams writes to a live volume; one
+candidate's node has its store destroyed mid-stream and is started again at its anchor under a new member id; the flow
+waits for the fleet to recover, then kills the owner and waits for a survivor to serve the volume. Each run printed who
+served, how long after the owner's kill, and every survivor's takeover counters (the diag-only lines, never on main).
+
+| run | tree | passed | the replacement served | the other survivor served |
+|---|---|---|---|---|
+| diag-75 | A-271 + B9 + the recipient fix, the old wait | 3 of 48 | 1 | 2 |
+| diag-79 | main B10 + the fixed wait (no A-271) | 24 of 24 | 16 | 8 |
+| diag-80 | A-271 + main B10 + the fixed wait (1e44a57e) | 48 of 48 | 26 | 22 |
+
+Seconds from the owner's kill to the volume served, diag-80 (diag-79 in brackets):
+
+| arch | the replacement served | the other survivor served |
+|---|---|---|
+| x86 | 13 runs: min 2.003, median 2.014, max 2.386 (8: 2.001, 2.010, 2.998) | 11: 2.100, 2.255, 2.707 (4: 2.031, 2.094, 2.350) |
+| arm | 13 runs: min 1.997, median 2.009, max 2.481 (8: 2.004, 2.013, 3.005) | 11: 2.158, 2.356, 2.558 (4: 2.169, 2.257, 2.497) |
+
+**Reading.** The 45 failures of diag-75 were mode B, the flow's own wait (GAPS "the store-destroyed flow's mode B"),
+not A-271: with the wait fixed, the tree without A-271 passed 24 of 24 and the tree with it 48 of 48. In diag-80
+`takeover_waits_key`, `takeover_key_arrived`, `takeover_no_key_exhausted`, `takeover_refused.no_key`,
+`fleet.takeover.reclaimed` and `fleet.takeover.lost` read 0 on every survivor of every run, so no successor waited for
+a key: the flow kills the owner only once the replacement is seated, by which time it has accepted its pair. A-271's
+bounded wait covers the owner dying before that acceptance, which this flow does not reach. The ~2.0 s before a
+replacement serves is the owner's death being judged (fleet-transport §5); the other survivor served 0.08 to 0.35 s
+later at the median, by arch and run. Owed: the same flow on the merged main.
 
 ### The install watch, measured: a lane's install exchange ended when its holder is lost and silent (A-200; 2026-11-08 to 2026-11-09, held)
 
@@ -12368,6 +12402,50 @@ both arms hit at similar rates, so slicing does not stretch a takeover. The step
 floor: hyper-swim's RFC 6298 timer starts at, and never falls below, 1 s (`INITIAL_RTO_NS`, `MINIMUM_RTO_NS`) for a
 pair judged by its timer until the pool covers it, and it doubles on expiry. It is joined by an election when the dead
 owner led the council.
+
+## A candidate's acknowledgement carries the piece it changed: what persisting live copies adds to a stable write (A-270; 2026-11-08)
+
+**Hardware:** adacachy, AMD Ryzen 9 9950X3D2 (16 cores, 32 threads), 122 GiB. **Load:** load average 42–113 on 32 threads
+(other agents' builds). Each run in one `systemd-run --user` unit capped at a quarter of the cores. **Command (the
+contract):** `SLATES_TEST_CLI=1 SLATES_TEST_MEASURE=1 <live_fleet release test binary> measure_what_live_shipping
+--nocapture`, the binary built with `cargo test --release -p slates-cli --test live_fleet --no-run` at each arm's commit.
+Arms interleaved round by round (`ab3.sh`, `ab3b.sh` in the agent's scratch):
+
+- **main** at 92dcd16c: a candidate's live copies are not in its recovery image, so its acknowledgement publishes nothing.
+- **whole** at c07d1de6 (raft-5): every acknowledgement publishes the whole held image.
+- **pieces** at eeb4a6ee (agents/raft-7): every acknowledgement publishes the held pieces it changed.
+
+Microseconds, what live shipping adds to a stable 4 KiB write at the median (live p50 less plain p50), and the live p99:
+
+| arm | runs | added at the median | live p99 |
+|---|---|---|---|
+| main | 4 | 65.3, 75.5, 71.4, 73.0 | 146.5, 197.2, 162.4, 636.3 |
+| whole | 3 | 206.7 (alone, load 86), 224.8, 220.2 | 670.4, 824.8, 776.5 |
+| pieces | 6 | 76.0, 72.7, 79.1, 71.2, 69.2, 65.3 | 275.7, 247.5, 208.5, 233.3, 199.0, 151.4 |
+
+Seven arm runs printed no figures (each of the three in the second A/B's first round at load 98–145, and main in its
+second and third), and are left out. No arm's run passed the test's own bound on writes over 50 ms at this load (3 to 5
+each), so the test reports failure after printing; the figures stand.
+
+**On raft-7's tip after B11 (2026-11-11, load 11–13, adacachy, the same command and arms: main at 29ef4521, whole at
+c07d1de6, pieces at 2c93f4c9, where the register piece carries A-251's `PersistedAcceptor`).** Every round, interleaved.
+Microseconds: added at the median; live p99.
+
+| round | main | whole | pieces |
+|---|---|---|---|
+| 1 | 70.9; 284.8 | 231.2; 900.6 | 92.9; 525.4 |
+| 2 | 99.5; 471.7 | 225.3; 774.1 | 85.5; 467.8 |
+| 3 | 90.0; 443.8 | 325.4; 1,456.1 | 92.2; 387.0 |
+| 4 | 87.5; 300.0 | 241.2; 1,123.0 | 86.0; 464.8 |
+| 5 | 88.5; 498.8 | 230.7; 800.6 | 91.6; 511.6 |
+
+Medians of the rounds: main 88.5, pieces 91.6, whole 231.2. The pieces sit inside main's own spread (70.9–99.5); the
+whole image is about 140 µs above both, and its p99 is about twice theirs.
+
+**Reading.** Persisting every acknowledged live entry costs nothing at the median that main's own spread can show: pieces
+65–79 µs against main's 65–76 µs. The whole held image cost 207–225 µs, 140 µs more, and its p99 670–825 µs. The
+pieces' p99, 151–276 µs, sits about 50 µs above main's typical 146–197 µs: the publication a candidate makes before it
+answers.
 
 ## What a verdict compares and copies, and what the owner spends a verdict on (§4.16 "The verdict"; 2026-11-11)
 

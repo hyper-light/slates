@@ -274,13 +274,16 @@ struct HeldFsync {
   unique: u64,
   reply: Vec<u8>,
   target: u64,
-  deadline_ns: u64,
+  held_at_ns: u64,
+  /// When it gives up: a window with nothing heard on the volume's durability path (`slates_bridge_core::durable_bound`).
+  bound: slates_bridge_core::durable_bound::DurableBound,
 }
 
 /// Counter: `fsync` replies held until their live volume was durable.
 const LIVE_FSYNC_HELD: &str = "fuse.live_fsync_held";
-/// Counter: held `fsync` replies answered `EIO`: the wait passed, the volume was destroyed or its owner superseded, or
-/// the mount already held its bound of them.
+/// Counter: held `fsync` replies answered `EIO`: the wait gave up (a window with nothing heard, or its total bound;
+/// `slates_bridge_core::durable_bound`), the volume was destroyed or its owner superseded, or the mount already held its
+/// bound of them.
 const LIVE_FSYNC_REFUSED: &str = "fuse.live_fsync_refused";
 
 impl std::fmt::Debug for FuseMount {
@@ -701,9 +704,13 @@ async fn wait_for_work(
   let mut signal = std::pin::pin!(slates_rt::readiness::readable(signal));
   // The earliest held `fsync`'s give-up, armed as this wait begins: holds are only added in turns, between waits.
   let earliest = state::with_state(|s| {
-    s.fuse_mounts
-      .get(&attachment)
-      .and_then(|mount| mount.held.iter().map(|held| held.deadline_ns).min())
+    s.fuse_mounts.get(&attachment).and_then(|mount| {
+      mount
+        .held
+        .iter()
+        .map(|held| held.bound.next_look_ns())
+        .min()
+    })
   })
   .flatten();
   let mut give_up = std::pin::pin!(async move {
@@ -1083,7 +1090,8 @@ fn hold_fsync(s: &mut ShardState, mount: &mut FuseMount, dispatched: &Dispatched
     unique: dispatched.unique(),
     reply: dispatched.reply(&mount.serve).to_vec(),
     target,
-    deadline_ns: futures::now_ns().saturating_add(crate::live_ship::durable_wait_ns()),
+    held_at_ns: futures::now_ns(),
+    bound: crate::live_ship::begin_durable_bound(s, mount.volume, futures::now_ns()),
   });
   s.count(LIVE_FSYNC_HELD, 1);
   true
@@ -1099,12 +1107,28 @@ fn settle_held(s: &mut ShardState, attachment: u64, waker: Option<&std::task::Wa
   };
   let now = futures::now_ns();
   let mut kept = std::collections::VecDeque::new();
-  while let Some(held) = mount.held.pop_front() {
+  while let Some(mut held) = mount.held.pop_front() {
     let settled = crate::live_ship::durability(s, mount.volume, held.target, waker);
     let answer = match settled {
       crate::live_ship::Durability::Durable => Some(None),
       crate::live_ship::Durability::Never => Some(Some(EIO)),
-      crate::live_ship::Durability::Pending if now >= held.deadline_ns => Some(Some(EIO)),
+      crate::live_ship::Durability::Pending
+        if let Some(why) =
+          crate::live_ship::judge_durable_bound(s, mount.volume, &mut held.bound, now) =>
+      {
+        // What durability still lacked when the wait gave up: logged, since an `EIO` tells the application its data
+        // may be lost (2026-11-09).
+        slates_machine::log_line!(
+          "slates-server: a held fsync gave up after {} ms and {} windows of {} ms, {} (shard {}): {}",
+          now.saturating_sub(held.held_at_ns) / crate::live_ship::NS_PER_MS,
+          held.bound.windows(),
+          crate::live_ship::durable_wait_ns() / crate::live_ship::NS_PER_MS,
+          why.named(),
+          s.shard,
+          crate::live_ship::durability_report(s, mount.volume, held.target)
+        );
+        Some(Some(EIO))
+      }
       crate::live_ship::Durability::Pending => None,
     };
     match answer {

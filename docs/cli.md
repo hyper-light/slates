@@ -476,6 +476,9 @@ the copy at `N` goes into the command, so the attachment lasts exactly as long a
 command, and anything the command handed the end to, closes it (or on `detach`, a revocation, the volume's destroy).
 The process you started is the command — its pid, its signals, its exit code — so ending it ends the attachment; a
 command that cannot run is a failure (exit 4), its attachment ended with the end it never got.
+A guest whose init names its run's owner, as Shards' does with `trusted.shards.owner`, is shown the files the host
+made as that owner's, so an unprivileged run writes them; the volume keeps the host's own ids for what the run makes,
+so every other route shows those files as the host's.
 Linux sends the end over the client's control socket; macOS claims it on the daemon's socket route, an encrypted
 exchange keyed by a single-use secret. Windows refuses the form by kind (`AttachmentUnsupported`,
 `DescriptorRouteNotBuilt`) until a route hands a client a handle.

@@ -467,6 +467,13 @@ pub enum Op {
     /// The policy.
     policy: crate::catalog::WritePolicy,
   },
+  /// An enrolled consumer's write policy was set by its launcher (A-285). Appended (2026-11-18).
+  ConsumerWritePolicySet {
+    /// The consumer.
+    consumer: u64,
+    /// The policy.
+    policy: crate::catalog::WritePolicy,
+  },
   /// A volume moved to another fleet member left this node (§4.10 "Ownership follows the writer", A-291): its record,
   /// snapshots, lineage and this node's copies of its keys go, as a destroy's do, but no tombstone stays. Its registers
   /// belong to the member the configuration's moved-object exception names, which adopted them, so nothing here may
@@ -556,6 +563,7 @@ impl Op {
       Op::LiveHoldersCommitted { .. } => "live_holders_committed",
       Op::CompletionAwaiting { .. } => "completion_awaiting",
       Op::VolumeWritePolicySet { .. } => "volume_write_policy_set",
+      Op::ConsumerWritePolicySet { .. } => "consumer_write_policy_set",
       Op::VolumeReleased { .. } => "volume_released",
       Op::BaseCaptured { .. } => "base_captured",
     }

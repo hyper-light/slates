@@ -11,9 +11,10 @@
 //! names its path and its class, and nothing is written for it; resolution is the consumer's (§4.16 "Rebase, the only
 //! corrective path"; §4.15 `read_base`, rewrite, `rewitness`), after which it merges or lands again.
 //!
-//! **An approval binds what it shows.** [`Approval::manifest`] is the hash of exactly what an approval writes; the
-//! approve call writes only that, and answers the new presentation when the volume or the disk changed since
-//! ([`crate::Instance::approve`]).
+//! **An approval binds what it shows.** [`LandingApproval::manifest`] is the hash of exactly what an approval writes,
+//! and [`MergeApproval::identity`] the increment's identity; the approve calls write or merge only that, and answer
+//! the new request when the volume, the work or the disk changed since ([`crate::Instance::approve_landing`],
+//! [`crate::Instance::approve_merge`]).
 
 use slates_ipc::protocol::{
   ConflictClass, LandingDegradation, LandingDurability, LandingOutcome, LandingSummary,
@@ -32,7 +33,7 @@ pub enum LandOutcome {
   /// The landing ran: what reached the disk.
   Written(LandingReport),
   /// The caller's mode asks: what would be written, for the approver. Nothing was written.
-  ApprovalRequired(Approval),
+  ApprovalRequired(LandingApproval),
   /// The disk changed entries the volume changed too: each conflict, typed. Nothing was written.
   Conflicted(Vec<LandingConflict>),
   /// A policy refused the landing. Nothing was written.
@@ -50,7 +51,7 @@ pub enum MergeOutcome {
     verification: Verification,
   },
   /// The caller's mode asks: the merge awaits the approver. Nothing was merged.
-  ApprovalRequired(Approval),
+  ApprovalRequired(MergeApproval),
   /// The increment met intervening changes: each conflict window, typed. Nothing was merged; rebase, resolve and merge
   /// again.
   Conflicted(MergeConflicts),
@@ -113,22 +114,23 @@ pub struct LandingConflict {
   pub planned: Option<PlannedContent>,
 }
 
-/// A merge or a landing awaiting an approval: what the approver is shown, and what an approval binds.
+/// A landing awaiting an approval (§4.15 step 2): what the approver is shown, and what an approval binds.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Approval {
-  /// What awaits.
-  pub awaiting: Awaiting,
+pub struct LandingApproval {
+  /// The landing, as it was asked.
+  pub request: LandingRequest,
   /// The presentation's id (a presentation lives as long as the client that made it, A-46).
-  pub id: u64,
-  /// The hash an approval binds: exactly what will be written ([`Approval::manifest_text`] as people read it).
+  pub presentation: u64,
+  /// The manifest hash an approval binds: exactly what will be written ([`LandingApproval::manifest_text`] as people
+  /// read it).
   pub manifest: [u8; 32],
   /// What would be written.
   pub summary: Summary,
-  /// How the act's signature was judged.
+  /// How the landing's signature was judged.
   pub verification: Verification,
 }
 
-impl Approval {
+impl LandingApproval {
   /// The manifest hash as text: 64 hexadecimal characters, as `slates land` prints it.
   pub fn manifest_text(&self) -> String {
     self
@@ -139,13 +141,19 @@ impl Approval {
   }
 }
 
-/// What an approval would let through.
+/// A merge awaiting an approval (§4.16, A-285): the work, and the increment's identity an approval binds.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Awaiting {
-  /// A landing, as it was asked.
-  Landing(LandingRequest),
-  /// A merge of a work volume into its green.
-  Merge(Work),
+pub struct MergeApproval {
+  /// The work and its green.
+  pub work: Work,
+  /// The evidence the merge carried, carried again by its approval (§4.16).
+  pub evidence: Vec<[u8; 32]>,
+  /// The increment's identity an approval binds: exactly what will be merged.
+  pub identity: [u8; 32],
+  /// The paths the increment changes.
+  pub paths: u64,
+  /// How the merge's signature was judged.
+  pub verification: Verification,
 }
 
 /// What a landing would write (§4.15 step 2): entries per action, bytes, and what the filter left out.
