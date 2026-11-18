@@ -2967,8 +2967,9 @@
 > coordinator's measured period, with the retirement's commit round and its install; `R` the tail of the takeovers and
 > the volumes this node timed, the ratified `T` before the first. Published in the daemon's status
 > (`FleetReport::failover`, `CONTRACT` 24; `slates status` prints `fleet_failover`), each term with the measurements
-> behind it. Owed, each in its own change: the failover-shaped waits read it (a forward's bound, the location round's cap,
-> a live takeover's fetch, the takeover's attempts, the telemetry horizon); each lease takes its term from a φ-accrual
+> behind it. **Since A-375 the failover-shaped waits read it** (a forward's bound, the location round's cap, a held
+> reply's total, a takeover's attempts), fanned to every shard in whole periods. Owed, each in its own change: each lease
+> takes its term from a φ-accrual
 > detector of its own holder's renewals (a CLI attachment once the CLI process sends a keepalive); `W`'s floor from the
 > pulses' running wake delay; then `FAILOVER_SLO_NS` and `with_failover_slo` go, since nothing sets `F`. The boot-time
 > sum is kept only as the A/B baseline, a build of its own, never a mode.
