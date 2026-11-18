@@ -12971,3 +12971,49 @@ threads' own starts.
   on a 32-thread Linux box under load.
 - **The test is unrunnable where a shard starts cheaply:** past 1,024 shards it fails on the runtime's limit, both
   before and after the change (reported to goal 254).
+
+## The verdict cut on large files, measured in the daemon: even, because the rung never takes the path it cut (g222's perf-decide; 2026-11-18)
+
+**What it is.** The daemon A/B owed since perf-decide landed (0b14033e7; "What a verdict compares and copies" above):
+the owner's CPU a verdict and the loaded p99 at a rung whose hot files are 256 KiB to 1 MiB, main before the cut
+(`9b6b35fb3`) against its merge (`b7c294959`). Both predate W1, so every work is served on its green's owner shard.
+
+**Environment.** Mac Studio adas-mac-studio.local-2 (Apple M3 Ultra, 32 cores, 96 GiB, macOS 26.4), 2026-11-18 10:12 to
+10:15 UTC, shared (load 19.4 to 36.9). Release (LTO) `slates` and `load_bench` of each commit built there, each with the
+same temporary owner-CPU diagnostic (perf's `owner_cpu_patch.py`, never committed: the thread's CPU around each submit
+and rebase served on the green's owner shard, logged as `OWNERCPU` at each reap tick). The tree: every file of Linux
+v7.4-rc1 between 256 KiB and 1 MiB (249 files, mostly AMD register headers), three times over in `a/`, `b/` and `c/`
+(APFS clones), 747 files of 262,291 to 1,013,732 bytes, median 372,461, 346,959,825 bytes in all.
+
+**Command.** The anchored recipe (`rung.sh`: a fresh `slates anchor --quick` per run, root bootstrapped), then
+`load_bench --instance <i> --tree <large> --clients 1000 --hot-files 800 --per-connection 32 --rounds 3
+--reply-patience 60 --think-us 0`; the arms A B, B A, A B, B A, A B. Every run:
+
+| run | build | wall s | verdicts/s | accepted / conflicts | owner µs a verdict | owner µs a rebase | p99 ms: Edit / Accepted / Conflict | `TableAtCapacity` refusals: Edit / Rebase / Submit |
+|---|---|---|---|---|---|---|---|---|
+| 1 | before | 19 | 1,555 | 2,217 / 3,253 | 102.0 | 110.1 | 227.0 / 227.7 / 227.8 | 67 / 225 / 15 |
+| 1 | after | 16 | 1,699 | 1,835 / 2,525 | 103.2 | 118.8 | 152.5 / 140.4 / 141.4 | |
+| 2 | after | 19 | 2,031 | 383 / 897 | 93.1 | 149.4 | 148.7 / 72.9 / 73.4 | 828 / 139 / 1 |
+| 2 | before | 17 | 2,026 | 386 / 889 | 100.3 | 152.2 | 146.0 / 86.6 / 87.1 | 876 / 77 / 15 |
+| 3 | before | 16 | 1,930 | 386 / 897 | 87.1 | 152.6 | 143.1 / 93.4 / 93.1 | |
+| 3 | after | 16 | 1,434 | 2,058 / 2,998 | 109.5 | 113.6 | 207.0 / 199.5 / 203.9 | |
+| 4 | after | 18 | 1,349 | 2,346 / 3,675 | 104.2 | 113.7 | 193.8 / 195.1 / 194.9 | |
+| 4 | before | 17 | 1,896 | 2,276 / 3,404 | 95.3 | 94.5 | 130.6 / 122.8 / 122.7 | |
+| 5 | before | 14 | 2,334 | 413 / 894 | 84.0 | 118.0 | 127.6 / 82.0 / 82.7 | |
+| 5 | after | 13 | 1,814 | 1,528 / 2,086 | 94.6 | 104.0 | 128.4 / 126.4 / 126.2 | |
+
+Blank refusal cells were not read out for that run; every run's level ended early on capacity: 1,000 works writing
+256 KiB-to-1 MiB files filled a table of the owner's shard, edits were refused `TableAtCapacity`, and the level either
+stopped at about 385 accepted versions (wall about 0.6 s of level) or ran to about 2,000 (about 3.5 s). The oracle found
+nothing in any run; no reply was lost (the anchored daemon's counters).
+
+**What it means.**
+- **Even.** The owner spent 84.0 to 102.0 µs a verdict before the cut and 93.1 to 109.5 µs after it: no gain, at about
+  2.5 times what a verdict costs at `kernel/`'s 21 KiB files (37.1 to 39.3 µs on main, the table above).
+- **Why even: the rung never takes the cut path** (read from the engine, not measured): `Green::merge_content` sends an
+  overlapping overwrite to pass two's byte compare and only a length-changing op to the whole-file identity check
+  (`lands_on_head`) that perf-decide made follow the change; `load_bench`'s edits are slot-aligned overwrites. The
+  engine bench (`verdict_bench`, a delete and an insert) is the only measurement of the cut until a workload makes
+  length-changing edits.
+- **The large-file rung is capacity-bound before it is CPU-bound** on one owner shard: its first wall is the table its
+  works fill, not the verdict.
