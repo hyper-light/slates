@@ -1,0 +1,23 @@
+name: diag-fs-server-land
+on:
+  push:
+    branches: [diag-fs-server-land]
+jobs:
+  green:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_TERM_COLOR: never
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Write policy (A-285) and the two-node filesystem server landing under it
+        run: |
+          uname -a; git log -1 --format='%h %s' | cut -c1-120
+          cargo test --locked -p slates-server --test write_policy -- --nocapture
+          SLATES_TEST_CLI=1 cargo test --locked -p slates-cli --test fs_server -- --nocapture
