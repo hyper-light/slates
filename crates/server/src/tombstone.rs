@@ -84,6 +84,7 @@ pub(crate) fn on_held(state: &mut ShardState, object: ObjectId, value: Tombstone
   state.merge.replicas.remove(&object);
   state.pending_materializations.remove(&object);
   state.pending_green_materializations.remove(&object);
+  crate::green_adopt::forget_completions(state, object);
   state.pending_catalogs.remove(&object);
   if value.retired {
     for register in [object, object.catalog()] {

@@ -33,9 +33,12 @@
 //! **After a death** ([`send_resync`]): recovery keeps a Shards attachment whose resync end the anchor held, and the
 //! successor serves it on a fresh stream as the same attachment (its owner view from the hold's session, no `INIT`, no
 //! restore), then hands the device the fresh stream's end over the held channel in a `Resync` naming the same token.
-//! A request the dead daemon published with its effect and never answered is answered from that reply when the device
-//! resends it (A-61's rule, `crate::shards`'s replay). Not here yet: the successor's half on macOS (A-339 hands the
-//! device its end there, on the socket route), DAX objects held across the death, and Windows (GAPS).
+//! The successor keeps its own copy of that end until the device shows it holds its own (its first bytes on the
+//! stream, or its end of the channel closing, which the stream's serve task watches for meanwhile): the `Resync` waits
+//! in the device's channel until the device reads it, and a socket whose every copy rides a message is what macOS's
+//! collector flushes (A-339). A request the dead daemon published with its effect and never answered is answered from
+//! that reply when the device resends it (A-61's rule, `crate::shards`'s replay). Not here yet: DAX objects held across
+//! the death, and Windows (GAPS).
 
 use std::os::fd::{AsFd, OwnedFd};
 
