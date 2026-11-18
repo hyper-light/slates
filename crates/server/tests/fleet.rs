@@ -3092,6 +3092,9 @@ fn start_mesh_unbootstrapped(
   )
 }
 
+/// Each node's (probe, record) serve port pair, in node order.
+type PortPairs = [(u16, u16)];
+
 /// [`start_mesh_unbootstrapped`] with each node bound at its pair of `bound` and advertised at its pair of `advertised`
 /// (A-277): its peers dial it at the advertised pair and it announces that pair, so a node advertised where a port
 /// mapping listens is reached only through the mapping. Where the two pairs are the same, the node binds where it
@@ -3102,7 +3105,7 @@ fn start_mesh_bound_and_advertised(
   started: usize,
   hosts: &[HostId],
   certs: &[rustls::pki_types::CertificateDer<'static>],
-  (bound, advertised): (&[(u16, u16)], &[(u16, u16)]),
+  (bound, advertised): (&PortPairs, &PortPairs),
   f: u32,
   shards: u16,
   regions: &std::collections::BTreeMap<HostId, slates_db::register::RegionId>,
