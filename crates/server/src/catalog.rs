@@ -67,6 +67,11 @@ pub struct CatalogValue {
   pub live_shipped: bool,
   /// The live shipper's committed holder set (A-240): the hosts a takeover's phase one counts reports from. Appended.
   pub live_holders: Option<slates_db::catalog::LiveHolders>,
+  /// For a work, the green it is a work of (A-255): what the work's successor knows of its green once the work's owner
+  /// is gone. A work is never brought back (its head is never placed), so a request that names it is sent on to its
+  /// green's owner, which holds the submit's completion in the green's merge records. `None` for any other volume.
+  /// Appended.
+  pub work_of: Option<slates_db::catalog::VolumeId>,
 }
 
 impl CatalogValue {
@@ -81,6 +86,10 @@ impl CatalogValue {
       access: record.access.clone(),
       live_shipped: record.policy.live_shipped,
       live_holders: record.policy.live_holders.clone(),
+      work_of: match record.policy.role {
+        slates_db::catalog::Role::Work { green, .. } => Some(green),
+        slates_db::catalog::Role::Plain | slates_db::catalog::Role::Green { .. } => None,
+      },
     }
   }
 
@@ -125,6 +134,7 @@ mod tests {
       }],
       live_shipped: false,
       live_holders: None,
+      work_of: Some(slates_db::catalog::VolumeId { bytes: [9; 16] }),
     }
   }
 

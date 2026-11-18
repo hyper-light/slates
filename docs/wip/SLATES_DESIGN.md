@@ -4310,7 +4310,9 @@ root-relative path as an explicit alternative; it does not report that the reque
 
 > **Status (2026-11-06, A-230).** A CLI attachment (`slates attach`) is not the client's to take with it. It holds a
 > term, the failover SLO as the write lease's, renewed by each verb that names it. It ends at the lapse with its lease,
-> and a later use is refused `AttachmentExpired`. Only an SDK client's attachments end with the client, as below.
+> and a later use is refused `AttachmentExpired`. Only an SDK client's attachments end with the client, as below. Since
+> 2026-11-09 only the attachment's own principal's use renews it: no record is written by an identity a request merely
+> names, rather than the one its session authenticated (`use_attachment`).
 
 > **Status (2026-09-20, A-28).** Client retirement reserves the dead client's seat and id
 > until every owner shard has removed its SDK attachments. Unsent forwards are cancelled;
@@ -5686,8 +5688,12 @@ registry (D-14). A node's advertised port and the next are its two serve sockets
 first, records on the second — each shared by every peer through the session plane's connection-id
 demultiplexer (§4.10a §8; a peer's re-dial after a lost session replaces the old session), and every
 peer dials it there, so both ends of every session are computed from the same file and can never
-disagree. A manifest with fewer than `f + 1` nodes, a repeated name or certificate, a base at the end
-of the port range, or an identity the TLS stack cannot use, is refused by name at boot. The two serve
+disagree. A node behind a port mapping (a NAT's port forward, a container runtime's published ports,
+the chaos harness's fault relay) also names where its own two sockets bind (`bind`: an IPv4 literal
+and the base of the same block, A-277); it serves there while every peer still dials its advertised
+ports, and the mapping between them is the operator's. A manifest with fewer than `f + 1` nodes, a
+repeated name or certificate, a base (advertised or bound) at the end of the port range, or an identity
+the TLS stack cannot use, is refused by name at boot. The two serve
 sockets are bound once, before the daemon starts (`FleetTransport::bind`, between the pure plan and the
 daemon), so an address already in use refuses the start by plane and address, rather than leaving a
 daemon that can never be probed. A caller that already holds its ports hands the bound sockets over
@@ -5947,6 +5953,13 @@ failure.
 > version once it has placed. The wait counts toward the client's bound and leaves when its completion replaces it or the
 > client acknowledges it. After a takeover the resend is refused retryable and nothing runs twice, but its version is not
 > named, short of the failure matrix's Masked: owed as A-255 (GAPS).
+
+> **Status (2026-11-09, A-255: a submit's completion moves with its green).** After a takeover a resend under its own id
+> is answered the version it was accepted as, the failure matrix's Masked. Its completion key rides the version's chain
+> entry and merge record, and the green's successor records it. The resend reaches the successor through the work's
+> catalog record, which names the green: held, or learned from a location round. A version's record ships only once
+> that catalog is committed, and the record plane ships the catalog at the work's creation. A merge record carries
+> format version 1; another version is refused typed.
 
 > **Status (2026-11-07, A-245: an acknowledgement names the ids still owed).** A watermark is contiguous, so one held or
 > slow request kept every later completion of its client: the owner pruned none of them, and past `2 × slots` refused
@@ -14142,7 +14155,10 @@ the reaper's loop; the verbs that name an attachment), `crates/cli` (`slates att
   - The term is the operator's failover SLO, derived as the write lease's: `derived!(failover_slo_ns, …)`, 10 s by
     default. A write attachment holds the lease, so its term is the lease's.
   - Every verb that names it (`Fs*`, `detach`, `advance`, `bind`) renews it once less than half the term is left:
-    one durable record per half term of use, never one per verb.
+    one durable record per half term of use, never one per verb. Only its own principal's use renews it, or ends it
+    at the lapse. Another principal's use writes nothing and is refused by the verb's own check. Amended 2026-11-09,
+    after fixtures' sweep: a use renewed it ahead of that check, so any channel that named the id kept another
+    account's attachment alive.
   - It ends at the lapse, by the reaper's sweep or the first use after, as a detach does. The write lease goes with
     it, recorded `AttachmentExpired`.
   - A later use is refused `AttachmentExpired`, never `NotFound`. The partition keeps the expired ids, at most its
@@ -16331,6 +16347,51 @@ Applied in the same change to: §4.16 (Commit status); §4.10 content retention 
 tests; GAPS. Evidence: `docs/bugs/2026-11-07-a-versions-inputs-and-record-took-five-hops.md`,
 `docs/bugs/2026-11-07-retention-decoded-every-merge-record-per-put.md`. Wire: the merge record stream's payload is now a
 shipment. A holder of an older build fails to decode it and answers nothing, so a mixed fleet refuses safely.
+
+### A-255 — A submit's completion moves with its green, and a resend reaches the green's successor through its work's catalog (accepted and built 2026-11-09; loadtest-scale's route, fixtures' gate, the supervisor's three constraints)
+
+Applied in the same change to:
+- `crates/merge`: `chain_entry` version 2 carries `Completion { origin, client, sequence }`.
+- `crates/anchor`: `LAYOUT_VERSION` 7.
+- `crates/server`:
+  - `MergeRecordValue::completion` and its format version (`RECORD_MAGIC`, `RECORD_VERSION` 1, `RecordRefused`);
+  - `record_taken_over_completions`;
+  - `CatalogValue::work_of`, `fleet::owed_merge_catalogs` and `owed_adopted_work_catalogs`;
+  - `verbs::locate_work_green`;
+  - `owner_location::locate_work_of` and `Reply::work_of`;
+  - the record plane's gate (`PendingMergeRecord::work`, `fleet::catalog_committed`, `MergeWork::ShipWorkCatalog`,
+    `works_owing_catalog`).
+- The tests named in the bug record, GAPS, and §4.16's status.
+
+- **What was there.** A-252 made a waiting submit a durable state of the owner's partition. After a takeover the
+  resend was refused `OwnerUnreachable` without end. The completion window died with the owner, and the resend routes
+  by its work's id, which no survivor owns: a work's head is never placed.
+- **The rule.**
+  - RIFL §3: "If the object migrates, then the completion record must move with it." For a merge the object is the
+    green. The submit's completion key rides its version's chain entry and merge record, which holders replicate.
+    The successor's adopted chain answers a resend under that key with its version at once. The key lives as long as
+    the record, under W2's retention, and has no separate table.
+  - The route is the work's own replicated catalog register, which names its green. It needs no global catalog (D-14),
+    no client wire change and no id format change. A request for a work no member owns goes unchanged to the green's
+    owner. An origin holding no copy of the catalog learns the green from a location round of the catalog's holders.
+  - The green's owner answers only the completion under the request's own key and refuses anything else `NotFound`. A
+    key copied into another session is refused at its origin's door (A-SEAT).
+  - A version's record ships only once its submitting work's catalog is committed, so no holder holds a completion
+    without its route. The record plane ships that catalog at the work's creation, and on demand.
+  - The successor never runs a resend whose key its chain does not hold. A work no member owns has no work to run against,
+    so the green's owner refuses it `NotFound`. It answers only from the chain it adopted whole, to the quorum's head
+    (`takeover::adopt`), so a version committed at the quorum whose answer was lost is answered, never run again
+    (`a_submit_whose_answer_was_lost_with_its_owner_is_answered_its_version_by_the_greens_successor`).
+  - A merge record carries its own format version. Another is refused typed, never decoded by a second path (§2.7).
+- **Measured.** A submit made right after its work's creation: median 1.59–1.64 ms against 1.25–1.29 ms without the
+  work's catalog, on an idle Mac Studio, 2026-11-09. While the catalog waited for the coordinator's period it was
+  109 ms. The bug record has the arms.
+- **Open.**
+  - A second loss of the green's owner needs the ledger-prefix transfer (GAP-A9-7).
+  - The cross-region case is owed a test.
+  - The route has no end for a work whose owner died. Only a volume's owner writes its tombstone, and a work never
+    comes back, so its adopted catalog record is kept placed for as long as the fleet runs: a store with no bound,
+    which CLAUDE.md §2 bans. How it should end is reserved for Ada (GAPS, A-255's entry, 2026-11-17).
 
 ### A-254 — The owner of an instance is decided before anything is created (accepted 2026-11-08)
 Applied in the same change to: §4.7 (the rendezvous's status), GAPS, `crates/cli/src/anchor.rs` (`run`),
@@ -20497,3 +20558,30 @@ The steps' own records follow.
     the process judgment. On this Mac: supervised 10 of 10, unsupervised 10 of 10, frozen 5 of 5. Mutations each turned
     their own shape red on both runners: the client's `Stalled` branch, the lone self-end, and starved treated as stuck.
     The tables are in the bug record.
+
+### A-277 — A fleet node may bind elsewhere than it advertises (2026-11-17, built for goal g229, chaos across real processes)
+
+Applied in the same change to:
+- §4.8 "Deployment": the `bind` sentence, and a bound base past the port range refused as an advertised one is.
+- `crates/server/src/deploy.rs`: `FleetNodeEntry::bind`; `bind_address` binds the block a node names, else its
+  advertised address as before; `validate` and the plan refuse a bind block past the port range
+  (`PortBlockOverflows`, naming the bind's base). The tests: `a_node_that_binds_elsewhere_serves_there_and_is_dialed_where_it_advertises`
+  and the bind case of `a_bad_manifest_is_refused_by_name`.
+- `crates/cli/src/fleet.rs`: the manifest's optional `bind` per node, an IPv4 literal with a nonzero port; a name,
+  a missing port, port 0 or a non-string refused naming `nodes[i].bind` (`a_declared_bind_parses_and_a_bad_one_is_named`).
+- `docs/cli.md`: the manifest's `bind` field. GAPS: "Chaos from outside the processes", the relay owed.
+- **What was there.** A node bound exactly the address it advertised (an IP literal), or every interface on the
+  advertised port (a name). Whatever a peer dialed had to be the node's own socket. A node behind a port mapping
+  whose outer ports differ from its inner ones (a container runtime's published ports, a NAT's port forward) could
+  not join a fleet: it bound the outer port, which is not its to bind. And nothing could stand between two real
+  daemons on one machine, since discovery's announcement of a node's own address wins over the manifest's at every
+  dial (`fleet::resolve_peer_address`), so every peer reached the node's socket directly.
+- **The rule.** `bind` names the IPv4 literal and base port the node's two serve sockets bind; the advertised
+  address still names where every peer dials it, and the node still announces only that. The block is the same two
+  ports. With no `bind`, nothing changes. The anchor binds and hands over the plan's sockets, so it binds the block
+  too, and the daemon's check of an inherited socket compares it with the bind block.
+- **Why.** Goal g229 (Ada's chaos directive of 2026-11-04: knock replicas offline, inject latency and loss) owed loss
+  across real processes on a developer's machine, where netem needs privileges this project never takes. A relay in
+  the test that owns every node's advertised ports and forwards to their bind blocks can drop, delay, duplicate and
+  reorder each datagram, and cut a running node off in either direction, with no privilege. Only KIND's netem
+  injected loss before, and only on real pods (`cargo xtask kind live`, which no lane runs).
