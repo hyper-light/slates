@@ -24,7 +24,7 @@ use crate::dirblocks::{BlockRef, BlockStore};
 use crate::dirtree::Retired;
 use crate::error::VfsError;
 use crate::ids::{Epoch, InodeNo, RefOwner, SnapshotId};
-use crate::inode::{Attrs, BaseBody, Body, Home, Inode, Kind};
+use crate::inode::{Attrs, BaseBody, Body, Home, Inode, Kind, SpecialNode};
 use crate::journal::{Op, OpLog};
 use crate::names::{self, NameEquivalence};
 use crate::quota::{Accounting, Quota};
@@ -590,6 +590,38 @@ pub struct Observed {
   pub change: u64,
   /// The Windows attribute bits kept beside the mode (A-262).
   pub windows: crate::inode::WindowsAttributes,
+  /// A device node's number (A-294); `None` for every other kind.
+  pub device: Option<crate::inode::DeviceNumber>,
+}
+
+/// What a create of a leaf makes: a regular file, or a name with no content (A-26, A-294).
+#[derive(Clone, Copy, Debug)]
+enum Leaf {
+  /// An empty regular file.
+  File,
+  /// A FIFO or socket name, or a device node with its number.
+  Special(SpecialNode),
+}
+
+impl Leaf {
+  /// The kind of inode it makes.
+  const fn kind(self) -> Kind {
+    match self {
+      Leaf::File => Kind::File,
+      Leaf::Special(node) => node.kind(),
+    }
+  }
+
+  /// The directory entry naming the inode `no` it makes.
+  const fn child(self, no: InodeNo) -> Child {
+    match self {
+      Leaf::File => Child::File(no),
+      Leaf::Special(SpecialNode::Fifo) => Child::Fifo(no),
+      Leaf::Special(SpecialNode::Socket) => Child::Socket(no),
+      Leaf::Special(SpecialNode::BlockDevice(_)) => Child::BlockDevice(no),
+      Leaf::Special(SpecialNode::CharDevice(_)) => Child::CharDevice(no),
+    }
+  }
 }
 
 /// A `readdir` row.
@@ -1095,7 +1127,12 @@ impl Volume {
       .ok_or(VfsError::NotFound)?;
     let inode = match entry.child {
       Child::Dir(h) => store.dirs.get(h).map_err(|_| VfsError::StaleHandle)?.inode,
-      Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => no,
+      Child::File(no)
+      | Child::Symlink(no)
+      | Child::Fifo(no)
+      | Child::Socket(no)
+      | Child::BlockDevice(no)
+      | Child::CharDevice(no) => no,
       Child::Whiteout => return Err(VfsError::NotFound),
     };
     Ok(Located {
@@ -1118,6 +1155,7 @@ impl Volume {
       attrs: inode.attrs,
       change: inode.version,
       windows: inode.windows,
+      device: inode.device(),
     })
   }
 
@@ -1160,6 +1198,8 @@ impl Volume {
         Child::Symlink(no) => (Kind::Symlink, no),
         Child::Fifo(no) => (Kind::Fifo, no),
         Child::Socket(no) => (Kind::Socket, no),
+        Child::BlockDevice(no) => (Kind::BlockDevice, no),
+        Child::CharDevice(no) => (Kind::CharDevice, no),
         Child::Whiteout => continue,
       };
       rows.push(DirRow {
@@ -1196,6 +1236,8 @@ impl Volume {
         Child::Symlink(no) => (Kind::Symlink, no),
         Child::Fifo(no) => (Kind::Fifo, no),
         Child::Socket(no) => (Kind::Socket, no),
+        Child::BlockDevice(no) => (Kind::BlockDevice, no),
+        Child::CharDevice(no) => (Kind::CharDevice, no),
         Child::Whiteout => continue,
       };
       if rows.len() >= limit
@@ -1585,7 +1627,7 @@ impl Volume {
           store.content.read_extent_into(e, off, out)?;
         }
       }
-      Body::None | Body::Directory(_) | Body::Symlink(_) | Body::BaseLink(_) => {}
+      Body::None | Body::Directory(_) | Body::Symlink(_) | Body::BaseLink(_) | Body::Device(_) => {}
     }
     Ok(want)
   }
@@ -1666,23 +1708,21 @@ impl Volume {
     name: &str,
     mode: u32,
   ) -> Result<InodeNo, VfsError> {
-    self.create_leaf(store, dir, name, mode, Kind::File)
+    self.create_leaf(store, dir, name, mode, Leaf::File)
   }
 
-  /// Creates a FIFO/socket name without a stream or listener (A-26).
+  /// Creates a name with no content (A-26, A-294): a FIFO or socket name without a stream or listener, or a device
+  /// node whose number is metadata. Nothing in the volume opens the device a node names; its body is its number.
   pub fn mknod_no(
     &mut self,
     store: &mut Store,
     dir_no: InodeNo,
     name: &str,
     mode: u32,
-    kind: Kind,
+    node: SpecialNode,
   ) -> Result<InodeNo, VfsError> {
-    if !kind.is_special() {
-      return Err(VfsError::Invalid);
-    }
     let dir = self.entry_dir(store, dir_no)?;
-    self.create_leaf(store, dir, name, mode, kind)
+    self.create_leaf(store, dir, name, mode, Leaf::Special(node))
   }
 
   fn create_leaf(
@@ -1691,8 +1731,9 @@ impl Volume {
     dir: Handle<DirNode>,
     name: &str,
     mode: u32,
-    kind: Kind,
+    leaf: Leaf,
   ) -> Result<InodeNo, VfsError> {
+    let kind = leaf.kind();
     self.live()?;
     names::check(name)?;
     self.refuse_existing(store, dir, name)?;
@@ -1709,10 +1750,9 @@ impl Volume {
     let parent = store.dirs.get(dir)?.inode;
     let no = self.next_no(store)?;
     let now = self.clock.wall_ns();
-    let body = if kind.is_special() {
-      Body::None
-    } else {
-      Body::Inline(Vec::new())
+    let body = match leaf {
+      Leaf::Special(node) => node.body(),
+      Leaf::File => Body::Inline(Vec::new()),
     };
     let mut inode = Inode::new(no, self.epoch, kind, mode, body);
     inode.home = Home::new(parent, self.policy.hash(name));
@@ -1721,11 +1761,7 @@ impl Volume {
     }
     stamp_all(&mut inode.attrs, now);
     let handle = self.install(store, no, inode)?;
-    let child = match kind {
-      Kind::Fifo => Child::Fifo(no),
-      Kind::Socket => Child::Socket(no),
-      _ => Child::File(no),
-    };
+    let child = leaf.child(no);
     // Publication: the name is the one step a client sees.
     if let Err(refusal) = self.dir_insert(store, dir, name, child) {
       return Err(refusal.after_undo(self.uninstall(store, no, handle)));
@@ -1897,20 +1933,13 @@ impl Volume {
     target: InodeNo,
   ) -> Result<(), VfsError> {
     let kind = self.admit_link(store, dir, name, target)?;
+    // `admit_link` refuses a directory, so every kind it admits names a leaf entry.
+    let child = Child::of_leaf(kind, target).ok_or(VfsError::NotPermitted)?;
     let dir = self.make_current_dir(store, dir)?;
     // The target's version made current before the name is published, so the link count and the
     // multi-path flag below change it in place and cannot be refused after the entry exists.
     self.make_current_inode(store, target)?;
     let now = self.clock.wall_ns();
-    let child = if kind == Kind::Symlink {
-      Child::Symlink(target)
-    } else if kind == Kind::Fifo {
-      Child::Fifo(target)
-    } else if kind == Kind::Socket {
-      Child::Socket(target)
-    } else {
-      Child::File(target)
-    };
     self.dir_insert(store, dir, name, child)?;
     self.adjust_nlink(store, target, 1)?;
     // From now on the inode has had more than one path; the deriver walks for them.
@@ -2118,7 +2147,12 @@ impl Volume {
       Some(t)
         if matches!(
           t.child,
-          Child::File(_) | Child::Symlink(_) | Child::Fifo(_) | Child::Socket(_)
+          Child::File(_)
+            | Child::Symlink(_)
+            | Child::Fifo(_)
+            | Child::Socket(_)
+            | Child::BlockDevice(_)
+            | Child::CharDevice(_)
         ) =>
       {
         self.retention_of_drop(store, t.inode)?
@@ -2194,7 +2228,12 @@ impl Volume {
     let to_dir = self.make_current_dir(store, to_dir)?;
     let moving = match source.child {
       Child::Dir(moving) => Some(self.make_current_dir_node(store, moving)?),
-      Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => {
+      Child::File(no)
+      | Child::Symlink(no)
+      | Child::Fifo(no)
+      | Child::Socket(no)
+      | Child::BlockDevice(no)
+      | Child::CharDevice(no) => {
         self.make_current_inode(store, no)?;
         None
       }
@@ -2229,9 +2268,12 @@ impl Volume {
           self.drop_link(store, t.inode)?;
           self.adjust_nlink(store, store.dirs.get(to_dir)?.inode, -1)?;
         }
-        Child::File(_) | Child::Symlink(_) | Child::Fifo(_) | Child::Socket(_) => {
-          self.drop_link(store, t.inode)?
-        }
+        Child::File(_)
+        | Child::Symlink(_)
+        | Child::Fifo(_)
+        | Child::Socket(_)
+        | Child::BlockDevice(_)
+        | Child::CharDevice(_) => self.drop_link(store, t.inode)?,
         Child::Whiteout => {}
       }
     }
@@ -2246,7 +2288,12 @@ impl Volume {
           self.adjust_nlink(store, to_no, 1)?;
         }
       }
-      Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => {
+      Child::File(no)
+      | Child::Symlink(no)
+      | Child::Fifo(no)
+      | Child::Socket(no)
+      | Child::BlockDevice(no)
+      | Child::CharDevice(no) => {
         // The file's home follows it.
         let handle = self.make_current_inode(store, no)?;
         store.inodes.get_mut(handle)?.home = Home::new(to_no, self.policy.hash(to_name));
@@ -2510,7 +2557,9 @@ impl Volume {
       Kind::File => Ok(()),
       Kind::Dir => Err(VfsError::IsDirectory),
       Kind::Symlink => Err(VfsError::Invalid),
-      Kind::Fifo | Kind::Socket => Err(VfsError::SpecialFileOperation),
+      Kind::Fifo | Kind::Socket | Kind::BlockDevice | Kind::CharDevice => {
+        Err(VfsError::SpecialFileOperation)
+      }
     }
   }
 
@@ -2828,7 +2877,12 @@ impl Volume {
       .ok_or(VfsError::NotFound)?;
     let inode = match entry.child {
       Child::Dir(h) => store.dirs.get(h).map_err(|_| VfsError::StaleHandle)?.inode,
-      Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => no,
+      Child::File(no)
+      | Child::Symlink(no)
+      | Child::Fifo(no)
+      | Child::Socket(no)
+      | Child::BlockDevice(no)
+      | Child::CharDevice(no) => no,
       Child::Whiteout => return Err(VfsError::NotFound),
     };
     Ok(Located {
@@ -2925,7 +2979,7 @@ impl Volume {
           store.content.read_extent_into(e, off, out)?;
         }
       }
-      Body::None | Body::Directory(_) | Body::Symlink(_) | Body::BaseLink(_) => {}
+      Body::None | Body::Directory(_) | Body::Symlink(_) | Body::BaseLink(_) | Body::Device(_) => {}
     }
     Ok(want)
   }
@@ -2950,6 +3004,20 @@ impl Volume {
       return Err(VfsError::NotFound);
     }
     Ok(inode.attrs)
+  }
+
+  /// A device node's number as a snapshot holds it (A-294); `None` for every other kind.
+  pub fn device_in(
+    &self,
+    store: &Store,
+    id: SnapshotId,
+    no: InodeNo,
+  ) -> Result<Option<crate::inode::DeviceNumber>, VfsError> {
+    let inode = self.inode_in(store, id, no)?;
+    if inode.attribute_of().is_some() {
+      return Err(VfsError::NotFound);
+    }
+    Ok(inode.device())
   }
 
   /// The inode record a snapshot holds for `no`.
@@ -3096,7 +3164,14 @@ impl Volume {
       for e in node.iter(&store.blocks) {
         match e.child {
           Child::Dir(h) => stack.push((format!("{prefix}/{}", e.name), h)),
-          Child::File(n) | Child::Symlink(n) | Child::Fifo(n) | Child::Socket(n) if n == no => {
+          Child::File(n)
+          | Child::Symlink(n)
+          | Child::Fifo(n)
+          | Child::Socket(n)
+          | Child::BlockDevice(n)
+          | Child::CharDevice(n)
+            if n == no =>
+          {
             out.push(format!("{prefix}/{}", e.name))
           }
           _ => {}
@@ -3403,6 +3478,8 @@ impl Volume {
         Child::Symlink(no) => (Kind::Symlink, no),
         Child::Fifo(no) => (Kind::Fifo, no),
         Child::Socket(no) => (Kind::Socket, no),
+        Child::BlockDevice(no) => (Kind::BlockDevice, no),
+        Child::CharDevice(no) => (Kind::CharDevice, no),
         Child::Whiteout => continue,
       };
       rows.push(DirRow {
@@ -5019,9 +5096,12 @@ impl Volume {
     self.need_current_dir(store, to_no, &mut needs, &mut counted)?;
     match source.child {
       Child::Dir(_) => self.need_current_dir(store, source.inode, &mut needs, &mut counted)?,
-      Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => {
-        self.need_current_inode(store, no, &mut needs)?
-      }
+      Child::File(no)
+      | Child::Symlink(no)
+      | Child::Fifo(no)
+      | Child::Socket(no)
+      | Child::BlockDevice(no)
+      | Child::CharDevice(no) => self.need_current_inode(store, no, &mut needs)?,
       Child::Whiteout => {}
     }
     if let Some(t) = replaced {
@@ -5643,6 +5723,78 @@ impl Volume {
       // The image is what a further successor would restore until this daemon publishes (A-154).
       let committed = self.committed_opens.entry((holder, no)).or_insert(0);
       *committed = committed.saturating_add(opens);
+    }
+    Ok(())
+  }
+
+  /// What recorded attachment `attachment` holds now: its references by inode, each with how many of them are open
+  /// handles, in inode order (A-303: the tables a Shards stream hands its device at a VM's save, Shards' D176 part 5).
+  /// The same shape as the recovery image's ([`Volume::attachment_references`]), for one attachment. Empty for an
+  /// attachment holding nothing.
+  pub fn held_by(&self, attachment: u64) -> Vec<crate::recover::InodeReferences> {
+    self
+      .attachment_refs
+      .get(&RefOwner::Attachment(attachment))
+      .map(|inodes| {
+        inodes
+          .iter()
+          .map(|(no, count)| crate::recover::InodeReferences {
+            inode: no.0,
+            count: *count,
+            opens: self.attachment_open_count(attachment, *no),
+          })
+          .collect()
+      })
+      .unwrap_or_default()
+  }
+
+  /// Gives recorded attachment `attachment`, which holds nothing yet, the references and open handles `held` names
+  /// (A-303: a restored VM's stream takes what its saved stream held, on the volume saved or a clone of its cut, which
+  /// shares its numbers). The opens are restored as a takeover's are ([`Volume::restore_references`], A-152): a handle
+  /// the guest's kernel kept from the saved stream gives its open back at its release, as one issued before a takeover
+  /// does. Everything is checked before anything is given, so a refusal changes nothing: the attachment must hold
+  /// nothing, the entries must name each inode once in rising order, each with at least one reference and no more opens
+  /// than references, of an inode the volume holds, whose count can take them. A file the guest holds with no name left
+  /// is held again by these references, so it lasts until the guest lets it go.
+  pub fn adopt_held(
+    &mut self,
+    store: &Store,
+    attachment: u64,
+    held: &[crate::recover::InodeReferences],
+  ) -> Result<(), VfsError> {
+    if self
+      .attachment_refs
+      .get(&RefOwner::Attachment(attachment))
+      .is_some_and(|inodes| !inodes.is_empty())
+    {
+      return Err(VfsError::Invalid);
+    }
+    let rising = held.windows(2).all(|pair| match pair {
+      [before, after] => before.inode < after.inode,
+      _ => true,
+    });
+    if !rising {
+      return Err(VfsError::Invalid);
+    }
+    for entry in held {
+      let no = InodeNo(entry.inode);
+      if entry.count == 0 || entry.opens > entry.count {
+        return Err(VfsError::Invalid);
+      }
+      self.namespace_inode(store, no)?;
+      let global = self.references.get(&no).copied().unwrap_or(0);
+      if global.checked_add(entry.count).is_none() {
+        return Err(VfsError::TooManyLinks);
+      }
+    }
+    for entry in held {
+      self.restore_references(
+        store,
+        attachment,
+        InodeNo(entry.inode),
+        entry.count,
+        entry.opens,
+      )?;
     }
     Ok(())
   }
@@ -7272,7 +7424,7 @@ fn data_ranges(body: &Body, size: u64) -> Vec<(u64, u64)> {
       ranges.push((open.off, open.off.saturating_add(open.len)));
     }
     Body::Base(_) => ranges.push((0, size)),
-    Body::None | Body::Directory(_) | Body::Symlink(_) | Body::BaseLink(_) => {}
+    Body::None | Body::Directory(_) | Body::Symlink(_) | Body::BaseLink(_) | Body::Device(_) => {}
   }
   ranges.sort_unstable();
   let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());

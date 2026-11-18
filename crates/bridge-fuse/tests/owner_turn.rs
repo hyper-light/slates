@@ -291,10 +291,17 @@ fn a_mutations_reply_waits_for_its_barrier_and_a_refused_barrier_answers_eio() {
   allocate_through_the_mount(&mount_point);
   tmpfile_through_the_mount(&mount_point);
   refuse_tx.send(()).unwrap();
-  let (ok, err) = through_the_mount(&mount_point, "mkdir \"$1/d\"");
-  assert!(
-    !ok && err.contains("Input/output error"),
-    "the refused barrier answered EIO: {err}"
+  // The directory is made by the system call itself, not by a `mkdir` program: Ubuntu 26.04's `/usr/bin/mkdir`
+  // (uutils coreutils 0.10.0) was told EIO by `mkdir(2)` and exited 0, since the directory exists after the refused
+  // barrier (strace in diag-slabs-61, run 43146145846). The answer under test is the kernel's.
+  let made = rustix::fs::mkdir(
+    format!("{mount_point}/d").as_str(),
+    rustix::fs::Mode::from_raw_mode(0o777),
+  );
+  assert_eq!(
+    made,
+    Err(rustix::io::Errno::IO),
+    "the refused barrier answered EIO"
   );
   let (ok, err) = through_the_mount(&mount_point, "test -d \"$1/d\"");
   assert!(ok, "the directory is in the volume, unpublished: {err}");

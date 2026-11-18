@@ -25,8 +25,8 @@
 //!   daemon already uses; the pending map is thread-local, so it needs no lock.
 //!
 //! The whole browse spans shards: `mount /<name>@<capability>` (or `/@<capability>` for the host root
-//! scoped to that capability), `ls /` (a `READDIR` of the host root scatters an entry-gather to every
-//! shard and lists the volume the capability authorizes by its friendly name), `cd <name>` (a root
+//! scoped to that capability), `ls /` (a `READDIR` of the host root asks the shard that owns the
+//! capability's attachment, and lists the volume the capability authorizes by its friendly name), `cd <name>` (a root
 //! `LOOKUP` routes across shards by `owner_of_name`), read/write. Each request runs as the mounting user
 //! ([`auth_sys_identity`] reads the uid from the `AUTH_SYS` credential, §4.13; `AUTH_NONE` falls back to root)
 //! for the POSIX permission rules — but **authorization is the mount capability, never the uid**
@@ -1426,15 +1426,31 @@ impl VolumeSet for GatheredVolumeSet {
   }
 }
 
-/// Gathers every owner's entries, each waited for in its owner's own time up to the liveness budget of its CPU
-/// (`xshard::within_shard_time`, R3 class A; before, one wall second for them all, and a listing failed while a starved
-/// shard was still answering). Any failed admission, missing reply or owner given up refuses the entire listing. Calls own their registrations, so early return
-/// or cancellation also releases the gathers still in flight (AUD-04/AUD-17).
+/// Gathers the host root's entries from the one shard that can list any: the partition the capability's attachment
+/// names (its high bits, `verbs::owner_of_attachment`; D-14, ids route to owners). A shard lists only volumes it serves
+/// whose attachment record its own partition holds ([`listable`]), so no other shard has an entry to give. Without a
+/// capability, or with one naming no partition of this daemon, nothing is listed and no shard is asked (AUD-01). Before,
+/// every shard was asked, so a capability holder made every shard answer, and a wedged shard the capability had nothing
+/// on failed the listing. The owner is waited for in its own time up to the liveness budget of its CPU
+/// (`xshard::within_shard_time`, R3 class A); a failed admission, a missing reply or an owner given up refuses the
+/// listing. Calls own their registrations, so early return or cancellation also releases a gather still in flight
+/// (AUD-04/AUD-17).
 async fn gather_all_entries(
   capability: Option<MountCapability>,
 ) -> Option<Vec<(String, VolumeId)>> {
-  let (origin, shards) = state::with_state(|s| (s.shard, s.shards.clone()))?;
-  gather_entries(origin, &shards, capability).await
+  let Some((attachment, _)) = capability else {
+    return Some(Vec::new());
+  };
+  let (origin, owner) = state::with_state(|s| {
+    (
+      s.shard,
+      crate::verbs::shard_of_partition(s, crate::verbs::owner_of_attachment(attachment)),
+    )
+  })?;
+  let Some(owner) = owner else {
+    return Some(Vec::new());
+  };
+  gather_entries(origin, &[owner], capability).await
 }
 
 async fn gather_entries(
@@ -1461,15 +1477,15 @@ async fn gather_entries(
   Some(all)
 }
 
-/// Whether a call is a `READDIR`/`READDIRPLUS` of the synthetic host root (which must list every
-/// shard's volumes, not just this shard's).
+/// Whether a call is a `READDIR`/`READDIRPLUS` of the synthetic host root (which lists the volume its capability
+/// authorizes, from the shard that owns the capability's attachment, [`gather_all_entries`]).
 fn is_root_listing(program: u32, procedure: u32, args: &[u8]) -> bool {
   program == NFS_PROGRAM
     && (procedure == NFSPROC3_READDIR || procedure == NFSPROC3_READDIRPLUS)
     && request_volume(&XdrReader::new(args)) == Some(root_volume())
 }
 
-/// Serves a host-root `READDIR`/`READDIRPLUS` over the gathered entries of every shard, as `requester`
+/// Serves a host-root `READDIR`/`READDIRPLUS` over the gathered entries, as `requester`
 /// (the listing is read-only, so the group only rides for uniformity — the root creates nothing).
 fn serve_root_listing(
   requester: Requester,
@@ -1563,7 +1579,7 @@ async fn reply_for(
 }
 
 /// Serves one NFSv3, MOUNT or portmap call, routing it locally, to a volume's owner shard over the
-/// bridge queue, or (a host-root listing) across every shard, all as `requester` (the mounting user,
+/// bridge queue, or (a host-root listing) from the shard its capability names, all as `requester` (the mounting user,
 /// §4.13). The v4 front end serves each of its operations through here too, so both versions route,
 /// authorize and publish alike.
 async fn serve_v3(

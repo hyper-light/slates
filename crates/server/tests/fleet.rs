@@ -5860,25 +5860,56 @@ const DEAD_SESSION_WATCH_PERIODS: u64 =
 /// its next pace (a heartbeat; the dial and its discovery page measured at 4 to 53 ms and 0 to 7 ms under the burst),
 /// and a forward begun on the new session is answered within its own stall budget (a liveness budget).
 const DEAD_SESSION_RECOVERY_NS: u64 = LIVENESS_BUDGET_NS + slates_server::daemon::HEARTBEAT_NS;
-/// Shape: the clients that keep b's forward lane busy, so a waiting forwarder takes the session the moment another
-/// returns it and the link never finds it in its slot, as the rung's thousand clients did. Measured 2026-11-08: at 32
-/// the link's own discovery refresh found the deaf session in its slot and replaced it, and the read was served in
-/// 267 ms without the dead-session check; at 256 it was refused `OwnerUnreachable` after 18.7 s, as on the rung.
-const DEAD_SESSION_BURST_CLIENTS: usize = 256;
-/// Whether [`a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one`]'s burst keeps sending.
-static DEAD_SESSION_BURST_ON: std::sync::atomic::AtomicBool =
+/// Shape: the readers that keep b's forward lane borrowing its session to a, each with one read in flight and the next
+/// sent as the last is answered: enough that a borrower returns the session every turn, the only place it is judged
+/// with discovery held, and few enough that the recovery timed is the product's (the link's redial and a round trip).
+/// Under a 256-client burst the client node's control shard spent the recovery on the burst's resends, so the bound
+/// was missed at 1.33 s (loadtest-scale, load 41) and 1.38 s (load 28 to 47, 2026-11-18): the burst is the resend's
+/// test ([`a_read_through_a_dead_session_keeps_its_place_behind_a_burst`]), not this one's.
+const DEAD_SESSION_READERS: usize = 4;
+/// Shape: how long a reader waits for one read: the failover bound a forward is resent within, and a liveness budget
+/// for the refusal that ends it to come back, so a read through the dead session is always answered one way or the
+/// other before the reader asks again.
+const DEAD_SESSION_READ_NS: u64 = slates_server::config::FAILOVER_SLO_NS + LIVENESS_BUDGET_NS;
+/// Whether [`a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one`]'s readers keep reading.
+static DEAD_SESSION_READING: std::sync::atomic::AtomicBool =
   std::sync::atomic::AtomicBool::new(false);
+/// The reads [`a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one`]'s readers have had served.
+static DEAD_SESSION_SERVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One reader of [`a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one`]: reads `read` through `instance`
+/// while the readers are on, one read at a time, and counts each read served, refused, or not answered in its time.
+fn read_while_reading(instance: &str, read: &RequestBody) -> [u64; 3] {
+  let mut client = Client::connect(instance);
+  let mut counts = [0u64; 3];
+  while DEAD_SESSION_READING.load(std::sync::atomic::Ordering::Acquire) {
+    match client.try_call(read, DEAD_SESSION_READ_NS) {
+      Ok(ReplyBody::Status { .. }) => {
+        counts[0] += 1;
+        DEAD_SESSION_SERVED.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+      }
+      Ok(_) => counts[1] += 1,
+      Err(_) => {
+        counts[2] += 1;
+        client.drain();
+      }
+    }
+  }
+  counts
+}
 
 /// §4.8 "Lookup", found on the f = 1 primary-kill rung under load (2026-11-08): the restarted primary kept its member id,
 /// so the client node's record session to it looked valid, and borrowers kept forwarding into a session the new process
 /// had no state for; every request through the client node waited 25 to 135 s. The condition is injected here rather
 /// than hoped for from the load: b's session to a drops everything it receives (`Daemon::inject_session_deafness`, cut at
-/// the session's receive path, so the product's own judgment runs). Do: three nodes; a volume on a read through b; a
-/// burst of reads through b kept going (256 clients, so the session is never in its slot); b's session to a made deaf.
-/// Expect: b judges the session silent where a borrower returns it (`fleet::return_sessions`), drops it, and the forward
-/// lane's first answer on the replacement comes within a liveness budget of the drop. Before: no borrower judged it,
-/// the lane forwarded into it, and every forward through b gave up until its failover bound. (A read through b served
-/// within that bound behind the resends' backlog is a separate finding, tested with its fix.)
+/// the session's receive path, so the product's own judgment runs), and b's discovery to a is held, so the link never
+/// pages on the session and nothing but the return of a borrow can judge it. Do: three nodes; a volume on a, read
+/// through b by four readers that keep b's forward lane borrowing the session; b's session to a made deaf. Expect: b
+/// judges the session silent where a borrower returns it (`fleet::return_sessions`), drops it, and the forward lane's
+/// first answer on the replacement comes within a liveness budget of the drop. Before: no borrower judged it, the
+/// readers' forwards were given up and resent into it until their failover bound, and no replacement was ever answered.
+/// With the return's judgment removed it fails 5 of 5, and passes 5 of 5 with it (answered on the replacement 21 to 112
+/// ms after the drop), interleaved on a Mac beside 8 spinners at load 33 to 56 (2026-11-18).
 #[test]
 #[allow(clippy::cognitive_complexity)]
 fn a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one() {
@@ -5901,39 +5932,32 @@ fn a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one() {
   let mut probe = Client::connect(daemons[1].instance());
   let (routed, last) = poll_status_served(&daemons, &mut probe, volume, COUNCIL_RETIRE_DEADLINE);
   let read = RequestBody::Status { volume };
-  let slots = usize::try_from(daemons[1].config().region.slots).unwrap();
-  let through_b = daemons[1].instance().to_owned();
-  DEAD_SESSION_BURST_ON.store(true, std::sync::atomic::Ordering::Release);
-  let burst_read = read.clone();
-  let burst = std::thread::spawn(move || {
-    let mut clients: Vec<Client> = (0..DEAD_SESSION_BURST_CLIENTS)
-      .map(|_| Client::connect(&through_b))
-      .collect();
-    let mut rounds = 0u64;
-    while DEAD_SESSION_BURST_ON.load(std::sync::atomic::Ordering::Acquire) {
-      for client in &mut clients {
-        client.send_burst(&burst_read, slots);
-      }
-      for client in &mut clients {
-        client.collect_tagged(slots, ADMITTED_FORWARDS_READ);
-      }
-      rounds += 1;
-    }
-    rounds
-  });
-  // The lane busy for a budget before the session goes deaf.
-  let busy_until = Instant::now() + Duration::from_nanos(LIVENESS_BUDGET_NS);
-  while Instant::now() < busy_until {
-    std::thread::yield_now();
-  }
   // The link's own discovery refresh, which can take the session from its slot when a page falls due, is held, so the
-  // rescue tested is the one at the return of a borrow, which every borrower's bounded hold reaches.
+  // rescue tested is the one at the return of a borrow.
   let mut held = daemons[1].inject_discovery_hold(Some(hosts[0]));
   let holding = Instant::now();
   while held.is_err() && holding.elapsed() < DEAD_SESSION_WATCH {
     held = daemons[1].inject_discovery_hold(Some(hosts[0]));
   }
-  // Installed once the control shard answers (busy with the burst, an observation can miss its budget).
+  DEAD_SESSION_READING.store(true, std::sync::atomic::Ordering::Release);
+  DEAD_SESSION_SERVED.store(0, std::sync::atomic::Ordering::Release);
+  let readers: Vec<std::thread::JoinHandle<[u64; 3]>> = (0..DEAD_SESSION_READERS)
+    .map(|_| {
+      let through_b = daemons[1].instance().to_owned();
+      let read = read.clone();
+      std::thread::spawn(move || read_while_reading(&through_b, &read))
+    })
+    .collect();
+  // The lane forwarding before the session goes deaf: a read of every reader served on the healthy session.
+  let starting = Instant::now();
+  let readers_served = || DEAD_SESSION_SERVED.load(std::sync::atomic::Ordering::Acquire);
+  while readers_served() < u64::try_from(DEAD_SESSION_READERS).unwrap()
+    && starting.elapsed() < DEAD_SESSION_WATCH
+  {
+    std::thread::yield_now();
+  }
+  let forwarding = readers_served();
+  // Installed once the control shard answers.
   let mut marked = daemons[1].inject_session_deafness(hosts[0]);
   let marking = Instant::now();
   while marked.is_err() && marking.elapsed() < DEAD_SESSION_WATCH {
@@ -5958,8 +5982,11 @@ fn a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one() {
     },
   );
   drop(everyone);
-  DEAD_SESSION_BURST_ON.store(false, std::sync::atomic::Ordering::Release);
-  let rounds = burst.join().unwrap();
+  DEAD_SESSION_READING.store(false, std::sync::atomic::Ordering::Release);
+  let reads: Vec<[u64; 3]> = readers
+    .into_iter()
+    .map(|reader| reader.join().unwrap())
+    .collect();
   let counters: Vec<(&'static str, u64)> = summed_counters(&daemons[1])
     .into_iter()
     .filter(|(name, _)| {
@@ -5973,14 +6000,21 @@ fn a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one() {
     daemon.stop();
   }
   eprintln!(
-    "b's deaf session to a: the lane answered on its replacement {:?} after the drop; burst rounds {rounds}; b's \
-     counters {counters:?}",
+    "b's deaf session to a: the lane answered on its replacement {:?} after the drop; reads [served, refused, \
+     unanswered] per reader {reads:?}; b's counters {counters:?}",
     recovered.map(Duration::from_nanos)
   );
   assert!(routed, "b routed the volume to a: {last:?}");
   assert_eq!(held, Ok(()), "b's discovery to a was held");
+  assert!(
+    forwarding >= u64::try_from(DEAD_SESSION_READERS).unwrap(),
+    "b's lane served a read of every reader before the deafness: {forwarding} served"
+  );
   assert_eq!(marked, Ok(()), "the deafness was installed on b");
-  assert!(rounds > 0, "the burst kept b's lane busy");
+  let judged = counters
+    .iter()
+    .find(|(name, _)| *name == "fleet.link.session_judged_dead")
+    .map_or(0, |(_, count)| *count);
   let recovered = recovered.unwrap_or_else(|| {
     panic!(
       "b never answered on a replacement within the watch ({DEAD_SESSION_WATCH:?} of the daemons' periods) of the \
@@ -5988,10 +6022,184 @@ fn a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one() {
     )
   });
   assert!(
+    judged >= 1,
+    "the deaf session was dropped where a borrower returned it: fleet.link.session_judged_dead {judged}"
+  );
+  assert!(
     recovered <= DEAD_SESSION_RECOVERY_NS,
     "the lane's first answer on the replacement came {:?} after the drop, past {:?}",
     Duration::from_nanos(recovered),
     Duration::from_nanos(DEAD_SESSION_RECOVERY_NS)
+  );
+}
+
+/// Shape: the clients of [`a_read_through_a_dead_session_keeps_its_place_behind_a_burst`]'s burst through b, each with
+/// a ring of reads in flight, as the f = 1 rung's thousand clients were: enough that b's lane holds a backlog longer
+/// than a forward's stall budget takes to begin (256 clients of 32 slots queued 6,400 to 8,100 forwards behind the dead
+/// session on a Mac, 2026-11-18), so a forward resent at the back is given up again before it is begun.
+const PLACE_BURST_CLIENTS: usize = 256;
+/// Whether [`a_read_through_a_dead_session_keeps_its_place_behind_a_burst`]'s burst keeps sending.
+static PLACE_BURST_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Whether that burst has sent its first round, so the backlog stands behind the probe before the session is dropped.
+static PLACE_BURST_SENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// [`a_read_through_a_dead_session_keeps_its_place_behind_a_burst`]'s burst: reads through `instance` from
+/// [`PLACE_BURST_CLIENTS`] clients a round at a time, a ring of `slots` each, while it is on: the rounds it finished.
+fn burst_while_on(instance: &str, read: &RequestBody, slots: usize) -> u64 {
+  let mut clients: Vec<Client> = (0..PLACE_BURST_CLIENTS)
+    .map(|_| Client::connect(instance))
+    .collect();
+  let mut rounds = 0u64;
+  while PLACE_BURST_ON.load(std::sync::atomic::Ordering::Acquire) {
+    for client in &mut clients {
+      client.send_burst(read, slots);
+    }
+    PLACE_BURST_SENT.store(true, std::sync::atomic::Ordering::Release);
+    for client in &mut clients {
+      client.collect_tagged(slots, ADMITTED_FORWARDS_READ);
+    }
+    rounds += 1;
+  }
+  rounds
+}
+
+/// §4.8 "Lookup", A-306, finding (b) of the bug record of 2026-11-09 (a dead record session was lent on): a read
+/// through a client node whose session to the owner went dead was resent at the back of the lane at every stall budget,
+/// behind the resends of a burst through the same node, and refused `OwnerUnreachable` at its failover bound. Do: three
+/// nodes; a volume on a; b's discovery to a held; b's session to a made deaf; a probe read through b, the first forward
+/// after the deafness, so its own turn makes the session deaf; then 256 clients burst reads through b. Expect: b drops
+/// the session where a borrower returns it, the probe's resends keep the place its first send had
+/// (`fleet.forward.resent_in_place`), and the probe is answered on the replacement within its failover bound. Before:
+/// with the probe sent just after the burst's first round, it was refused at its bound in 1 of 10 runs on a Mac at load
+/// 37 to 46 and answered 9.2 and 9.5 s after its send in two more; with its place kept, 4.1 to 6.5 s in 10 of 10 at
+/// load 27 to 33 (2026-11-18). Sent before the burst, as here, its place is the lane's first.
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn a_read_through_a_dead_session_keeps_its_place_behind_a_burst() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let mut owner = Client::connect(daemons[0].instance());
+  let volume = volume_owned_by(&mut owner, 0, "kept-place", &daemons);
+  let mut router = Client::connect(daemons[1].instance());
+  let (routed, last) = poll_status_served(&daemons, &mut router, volume, COUNCIL_RETIRE_DEADLINE);
+  let read = RequestBody::Status { volume };
+  let slots = usize::try_from(daemons[1].config().region.slots).unwrap();
+  let mut held = daemons[1].inject_discovery_hold(Some(hosts[0]));
+  let holding = Instant::now();
+  while held.is_err() && holding.elapsed() < DEAD_SESSION_WATCH {
+    held = daemons[1].inject_discovery_hold(Some(hosts[0]));
+  }
+  let mut marked = daemons[1].inject_session_deafness(hosts[0]);
+  let marking = Instant::now();
+  while marked.is_err() && marking.elapsed() < DEAD_SESSION_WATCH {
+    marked = daemons[1].inject_session_deafness(hosts[0]);
+  }
+  // The probe: its forward takes the session first, and that turn makes it deaf.
+  let probe_read = read.clone();
+  let probe_through_b = daemons[1].instance().to_owned();
+  let asking = std::thread::spawn(move || {
+    let mut probe = Client::connect(&probe_through_b);
+    let began = Instant::now();
+    let reply = probe.try_call(
+      &probe_read,
+      slates_server::config::FAILOVER_SLO_NS + LIVENESS_BUDGET_NS,
+    );
+    (began.elapsed(), reply)
+  });
+  let everyone: Vec<&Daemon> = daemons.iter().collect();
+  let deafened = poll_for_periods(
+    &everyone,
+    DEAD_SESSION_WATCH,
+    DEAD_SESSION_WATCH_PERIODS,
+    || {
+      daemons[1]
+        .observation(
+          Some(daemons[1].shards()[0]),
+          slates_server::daemon::OBSERVE_BUDGET_NS,
+          |s: &mut slates_server::state::ShardState| s.injected_deaf_session.is_none(),
+        )?
+        .wait()
+    },
+  );
+  // The burst, every forward of it first queued after the probe's.
+  PLACE_BURST_ON.store(true, std::sync::atomic::Ordering::Release);
+  PLACE_BURST_SENT.store(false, std::sync::atomic::Ordering::Release);
+  let through_b = daemons[1].instance().to_owned();
+  let burst_read = read.clone();
+  let burst = std::thread::spawn(move || burst_while_on(&through_b, &burst_read, slots));
+  let starting = Instant::now();
+  while !PLACE_BURST_SENT.load(std::sync::atomic::Ordering::Acquire)
+    && starting.elapsed() < DEAD_SESSION_WATCH
+  {
+    std::thread::yield_now();
+  }
+  let sent = PLACE_BURST_SENT.load(std::sync::atomic::Ordering::Acquire);
+  let (took, answer) = asking.join().unwrap();
+  PLACE_BURST_ON.store(false, std::sync::atomic::Ordering::Release);
+  let rounds = burst.join().unwrap();
+  drop(everyone);
+  let counters: Vec<(&'static str, u64)> = summed_counters(&daemons[1])
+    .into_iter()
+    .filter(|(name, _)| {
+      name.contains("judged_dead")
+        || name.contains("given_up")
+        || name.contains("resent_in_place")
+        || name.contains("replaced_answered")
+    })
+    .collect();
+  drop(router);
+  drop(owner);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "the probe through b's dead session: answered after {took:?} with {answer:?}; burst rounds {rounds}; b's \
+     counters {counters:?}"
+  );
+  let count = |wanted: &str| {
+    counters
+      .iter()
+      .find(|(name, _)| *name == wanted)
+      .map_or(0, |(_, count)| *count)
+  };
+  assert!(routed, "b routed the volume to a: {last:?}");
+  assert_eq!(held, Ok(()), "b's discovery to a was held");
+  assert_eq!(marked, Ok(()), "the deafness was installed on b");
+  assert!(
+    deafened,
+    "the probe's forward took b's session to a and made it deaf"
+  );
+  assert!(
+    sent,
+    "the burst sent its first round within {DEAD_SESSION_WATCH:?} of starting"
+  );
+  assert!(
+    count("fleet.link.session_judged_dead") >= 1,
+    "b dropped the deaf session where a borrower returned it"
+  );
+  assert!(
+    count("fleet.forward.resent_in_place") >= 1,
+    "b resent forwards at the places their first sends had"
+  );
+  assert!(
+    matches!(answer, Ok(ReplyBody::Status { .. })),
+    "the probe was answered on the replacement session: {answer:?} after {took:?}"
+  );
+  assert!(
+    took <= Duration::from_nanos(slates_server::config::FAILOVER_SLO_NS),
+    "the probe was answered within its failover bound: {took:?}"
   );
 }
 
@@ -9429,6 +9637,131 @@ fn five_daemons_take_over_a_dead_owners_head_over_a_multi_holder_quorum() {
   );
 }
 
+/// Shape: the files a five-node `f = 2` live volume is written before its owner and a holder are lost together.
+const F2_LIVE_FILES: usize = 8;
+
+/// The bytes the `f = 2` live test writes into its file `file`: distinct per file, so a file served from another's
+/// write or a lost one is told apart.
+fn f2_live_body(file: usize) -> Vec<u8> {
+  format!("written {file} on the owner, answered at durability at f = 2\n").into_bytes()
+}
+
+/// The head of `volume`'s live log `daemon` holds as a candidate (its status's holding line), `None` while it shows none.
+fn held_live_head(daemon: &Daemon, volume: VolumeId) -> Option<u64> {
+  let ReplyBody::DaemonStatus { report } =
+    Client::connect(daemon.instance()).call(&RequestBody::DaemonStatus)
+  else {
+    return None;
+  };
+  report
+    .shards
+    .iter()
+    .flat_map(|shard| shard.live.iter())
+    .find(|live| live.volume == volume && live.holding)
+    .and_then(|live| live.head)
+}
+
+/// A-200 at `f = 2`, scale out (g230): five nodes, every node a candidate of every object, so a live volume's owner ships
+/// to four holders and a write is durable once the owner and two of them hold it (`W = max(n − f, f)`). Do: on a, a live
+/// volume written [`F2_LIVE_FILES`] files, each answered at durability; then stop a and the holder holding the highest
+/// head together, two losses, the most `f = 2` tolerates. Expect a survivor to take the volume over, and a client of each
+/// of the three survivors to read every acknowledged file byte for byte. Phase one counts `f + 1 = 3` reports among the
+/// four recorded holders, of which three survive, and a durable write is on two of the four, so at least one survivor
+/// holds each.
+#[test]
+fn five_nodes_at_f_2_keep_every_acknowledged_live_write_through_the_loss_of_the_owner_and_a_holder()
+{
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c", "d", "e"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let mut daemons = start_mesh_with_f(nodes, &hosts, &certs, &serve, 2);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id } = client.call(&scratch("f2-live")) else {
+    panic!("the volume was created");
+  };
+  share_with_fleet(&mut client, id, &daemons);
+  let attachment = write_attachment(&mut client, id);
+  let shipped = client.call(&RequestBody::LiveShip {
+    volume: id,
+    live_shipped: true,
+  });
+  assert!(
+    matches!(shipped, ReplyBody::LiveShippingSet { live_shipped: true }),
+    "the volume is live-shipped: {shipped:?}"
+  );
+  for file in 0..F2_LIVE_FILES {
+    let written = client.call(&RequestBody::FsWrite {
+      volume: id,
+      attachment,
+      path: format!("/f2-{file}"),
+      bytes: f2_live_body(file),
+      mode: 0o644,
+    });
+    assert!(
+      matches!(written, ReplyBody::FsDone { .. }),
+      "write {file} answered at durability: {written:?}"
+    );
+  }
+  let heads: Vec<(usize, Option<u64>)> = (1..daemons.len())
+    .map(|index| (index, held_live_head(&daemons[index], id)))
+    .collect();
+  let lost_holder = heads
+    .iter()
+    .max_by_key(|(_, head)| *head)
+    .map(|(index, _)| *index)
+    .expect("four holders");
+  let holder = daemons.remove(lost_holder);
+  let owner = daemons.remove(0);
+  owner.stop();
+  holder.stop();
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let mut served = Vec::new();
+  for survivor in &daemons {
+    let mut reader = Client::connect(survivor.instance());
+    let mut last = None;
+    let read_all = poll_until(&survivors, SERVE_DEADLINE, || {
+      for file in 0..F2_LIVE_FILES {
+        let reply = reader.call(&RequestBody::Read {
+          volume: id,
+          path: format!("/f2-{file}"),
+          at: ReadAt::Head,
+        });
+        let whole =
+          matches!(&reply, ReplyBody::ReadBytes { bytes } if *bytes == f2_live_body(file));
+        if !whole {
+          last = Some((file, reply));
+          return Ok(false);
+        }
+      }
+      Ok(true)
+    });
+    served.push((survivor.instance().to_owned(), read_all, last));
+  }
+  drop(survivors);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "f = 2 live: holder heads before the losses {heads:?}, lost holder {lost_holder}; served {served:?}"
+  );
+  for (instance, read_all, last) in served {
+    assert!(
+      read_all,
+      "a client of survivor {instance} reads every acknowledged file byte for byte (last miss {last:?})"
+    );
+  }
+}
+
 /// Shape: the bytes a fleet test writes into a volume over NFS and expects back — under the NFS
 /// client's 400-byte read, and distinctive.
 const CONTENT: &[u8] =
@@ -9537,6 +9870,28 @@ fn seal_decorated_hello_on_owner(
   name: &str,
   decorate: impl FnOnce(&Daemon),
 ) -> Result<VolumeId, String> {
+  let (id, placed) = seal_and_place_hello(instance, daemons, name, decorate)?;
+  let survivors: Vec<&Daemon> = daemons[1..].iter().collect();
+  let all_hold = poll_all_hold(&survivors, ObjectId(id.bytes));
+  if placed && all_hold {
+    Ok(id)
+  } else {
+    Err(format!(
+      "placed={placed}, every survivor holds the head={all_hold}"
+    ))
+  }
+}
+
+/// Provisions `name` on the owner (`daemons[0]`, reached at `instance`), writes [`CONTENT`] into it over NFS, runs
+/// `decorate` on the owner, seals it with a snapshot and waits for the snapshot to place: the volume id and whether it
+/// placed, or why the volume or the snapshot was not made. Which members then hold the head is the caller's to wait
+/// for: on a fleet past `2f + 1` a head ships to its candidates, not to every member.
+fn seal_and_place_hello(
+  instance: &str,
+  daemons: &[Daemon],
+  name: &str,
+  decorate: impl FnOnce(&Daemon),
+) -> Result<(VolumeId, bool), String> {
   let mut client = Client::connect(instance);
   let ReplyBody::Created { id } = client.call(&scratch(name)) else {
     return Err("the volume was not created".to_owned());
@@ -9555,15 +9910,7 @@ fn seal_decorated_hello_on_owner(
     id,
     snapshot,
   );
-  let survivors: Vec<&Daemon> = daemons[1..].iter().collect();
-  let all_hold = poll_all_hold(&survivors, ObjectId(id.bytes));
-  if placed && all_hold {
-    Ok(id)
-  } else {
-    Err(format!(
-      "placed={placed}, every survivor holds the head={all_hold}"
-    ))
-  }
+  Ok((id, placed))
 }
 
 /// Shape: the coordinator periods [`an_owner_settles_its_neighbourhood_only_once_its_head_is_placed_on_the_new_cohort`]
@@ -9779,6 +10126,355 @@ fn a_takeover_question_a_holder_never_answered_leaves_its_link_dialed_afresh() {
     lent.is_empty(),
     "the link to a holder that never answered is dropped and dialed afresh, not left lent to the takeover with no \
      session behind it (asked {rounds} times; left lent: {lent:?})"
+  );
+}
+
+/// Shape: the files written into the burst test's volume before it is live-shipped, and each file's bytes: half a MiB,
+/// so its whole state (its log's first entry) is far larger than the burst's changes. Each file is one request, so
+/// it stays under the test client's 4 KiB ring slot with its framing.
+const BURST_VOLUME_FILES: usize = 256;
+/// Shape: see [`BURST_VOLUME_FILES`].
+const BURST_VOLUME_FILE_BYTES: usize = 2 << 10;
+/// Shape: the burst test volume's size limit: room for its files, the burst and their metadata.
+const BURST_VOLUME_LIMIT: u64 = 8 << 20;
+/// Shape: the burst's writers, each a client of its own writing one page at once.
+const BURST_WRITERS: usize = 16;
+/// Shape: each burst write's bytes: half a page, one request under the test client's ring slot.
+const BURST_WRITE_BYTES: usize = 2 << 10;
+/// Shape: how long both holders are held off their only shard while the burst is sent, so every write's entry waits in
+/// flight together: a quarter of a liveness window, inside the half a held shard may take (A-232).
+const BURST_HOLD_NS: u64 = LIVENESS_BUDGET_NS / 4;
+/// Shape: the entries the daemon's credit let be in flight before 2026-11-17, a fixed two: the burst must pass it, or
+/// the test shows nothing.
+const OLD_CREDIT_ENTRIES: u64 = 2;
+/// Format: the owner's count of whole records appended to a live log (`live_ship::LIVE_WHOLE`).
+const LIVE_WHOLE: &str = "fleet.live.whole";
+/// Format: the owner's count of publications turned away for credit.
+const LIVE_NO_CREDIT: &str = "fleet.live.refused.no_credit";
+/// Format: the owner's count of entries appended to a live log.
+const LIVE_APPENDED: &str = "fleet.live.appended";
+/// Format: the owner's count of batches it sent a holder, each the entries it lacked in one exchange.
+const LIVE_BATCHES: &str = "fleet.live.batches";
+/// Format: the owner's count of entries those batches carried.
+const LIVE_BATCHED: &str = "fleet.live.batched";
+/// Format: a holder's count of live entries it took into its copy (`live_ship::LIVE_HELD`), alone or in a batch.
+const LIVE_HELD: &str = "fleet.live.held";
+
+/// A write attachment of `volume` through `client`.
+fn write_attachment(client: &mut Client, volume: VolumeId) -> u64 {
+  match client.call(&RequestBody::Attach {
+    volume,
+    snapshot: None,
+    intent: Intent::Write,
+    form: AttachRequest::Root,
+  }) {
+    ReplyBody::Attached { attachment, .. } => attachment,
+    other => panic!("attach {volume:?} for writing: {other:?}"),
+  }
+}
+
+/// `volume`'s entries in flight on its owner as the owner's status reports its live log (the head's position past the
+/// durable one), or `None` while the status shows no log for it.
+fn live_in_flight(client: &mut Client, volume: VolumeId) -> Option<u64> {
+  let ReplyBody::DaemonStatus { report } = client.call(&RequestBody::DaemonStatus) else {
+    return None;
+  };
+  report
+    .shards
+    .iter()
+    .flat_map(|shard| shard.live.iter())
+    .find(|live| live.volume == volume && !live.holding)
+    .and_then(|live| {
+      let head = live.head?;
+      Some(match live.durable {
+        Some(durable) => head.saturating_sub(durable),
+        None => head.saturating_add(1),
+      })
+    })
+}
+
+/// Shape: the live volumes the period-slicing test's owner ships, each its own slice under the injected quantum.
+const SLICED_LIVE_VOLUMES: usize = 24;
+/// Format: the owner's count of record periods' live work (`live_ship::period`).
+const LIVE_PERIODS: &str = "fleet.live.periods";
+/// Format: the owner's count of the owner-shard turns that work took.
+const LIVE_PERIOD_SLICES: &str = "fleet.live.period_slices";
+
+/// The owner's live line for `volume` (its own log, not a candidate's copy): head, durable, owed.
+fn owned_live_line(
+  client: &mut Client,
+  volume: VolumeId,
+) -> Option<(Option<u64>, Option<u64>, bool)> {
+  let ReplyBody::DaemonStatus { report } = client.call(&RequestBody::DaemonStatus) else {
+    return None;
+  };
+  report
+    .shards
+    .iter()
+    .flat_map(|shard| shard.live.iter())
+    .find(|live| live.volume == volume && !live.holding)
+    .map(|live| (live.head, live.durable, live.owed))
+}
+
+/// CLAUDE.md "Bounded work everywhere", A-200's record period: a shard's live volumes are visited a slice of about a
+/// step quantum at a time (`live_ship::period_slice`), never all in one turn. Do: three nodes at `f = 1`; on a, 24
+/// live-shipped volumes, each written once, answered at durability and detached; cut the owner's slices after one volume
+/// each (`Daemon::inject_live_period_quantum(Some(0))`) and let three record periods pass. Expect at least 24 slices for each
+/// period that passed whole (one volume each, and one that finds none left), and every volume's log durable at its head
+/// with nothing owed: the slicing starved none. Before, one turn visited every live volume the shard owned.
+#[test]
+fn a_shards_live_volumes_are_visited_by_the_period_in_slices_and_none_is_starved() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, _hosts) = formed_mesh(&["a", "b", "c"]);
+  let mut client = Client::connect(daemons[0].instance());
+  let mut volumes = Vec::new();
+  for index in 0..SLICED_LIVE_VOLUMES {
+    let ReplyBody::Created { id } = client.call(&scratch(&format!("sliced-{index}"))) else {
+      panic!("volume {index} was created");
+    };
+    let attachment = write_attachment(&mut client, id);
+    let shipped = client.call(&RequestBody::LiveShip {
+      volume: id,
+      live_shipped: true,
+    });
+    assert!(
+      matches!(shipped, ReplyBody::LiveShippingSet { live_shipped: true }),
+      "volume {index} is live-shipped: {shipped:?}"
+    );
+    let written = client.call(&RequestBody::FsWrite {
+      volume: id,
+      attachment,
+      path: "/sliced".to_owned(),
+      bytes: vec![u8::try_from(index % 251).unwrap(); 64],
+      mode: 0o644,
+    });
+    assert!(
+      matches!(written, ReplyBody::FsDone { .. }),
+      "volume {index}'s write answered at durability: {written:?}"
+    );
+    // A partition's attachments are capped at the node's derived admission limit (`PartitionCaps::attachments`), which
+    // can sit below this test's volume count (a Mac Studio refused one `TableAtCapacity`, 2026-11-17); the log ships
+    // with no attachment held.
+    let detached = client.call(&RequestBody::Detach { attachment });
+    assert!(
+      matches!(detached, ReplyBody::Detached),
+      "volume {index}'s attachment was let go: {detached:?}"
+    );
+    volumes.push(id);
+  }
+  let counts = |daemon: &Daemon| {
+    [LIVE_PERIODS, LIVE_PERIOD_SLICES].map(|kind| refusal_count(daemon, kind).unwrap())
+  };
+  daemons[0].inject_live_period_quantum(Some(0)).unwrap();
+  let before = counts(&daemons[0]);
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let passed = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    refusal_count(&daemons[0], LIVE_PERIODS).map(|periods| periods >= before[0] + 3)
+  });
+  let after = counts(&daemons[0]);
+  daemons[0].inject_live_period_quantum(None).unwrap();
+  let lines: Vec<_> = volumes
+    .iter()
+    .map(|volume| owned_live_line(&mut client, *volume))
+    .collect();
+  drop(observed);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!("period slicing: periods, slices before {before:?} after {after:?}; lines {lines:?}");
+  assert!(passed, "three record periods passed");
+  let (periods, slices) = (
+    after[0].saturating_sub(before[0]),
+    after[1].saturating_sub(before[1]),
+  );
+  let volumes_per_period = u64::try_from(SLICED_LIVE_VOLUMES).unwrap();
+  assert!(
+    slices >= periods.saturating_sub(1) * volumes_per_period,
+    "each whole period took a slice a volume ({periods} periods, {slices} slices)"
+  );
+  for (index, line) in lines.iter().enumerate() {
+    assert!(
+      matches!(line, Some((Some(head), Some(durable), false)) if head == durable),
+      "volume {index}'s log is durable at its head with nothing owed: {line:?}"
+    );
+  }
+}
+
+/// AC-8.9, A-200 amended 2026-11-17: a burst of barriers on one live volume ships its changes, not the volume. Do: three
+/// nodes at `f = 1`; on a, a volume of half a MiB, then live-shipped and written once (its log's first entry, the whole
+/// state, durable); hold both holders off their shards while sixteen clients each write half a page at once, so every write's
+/// entry waits in flight together. Expect every write answered `FsDone`, no publication turned away for credit, still
+/// one whole record on the log, an entry appended for every write, more than two entries in flight at once (seen in the
+/// owner's status), and the entries each held holder lacked sent as batches of several an exchange once it answered
+/// (`fleet.live.batches`, `fleet.live.batched`). Before, the credit was a fixed two entries: the burst's third
+/// publication was turned away, and the volume's next entry was a copy of all of it; and a holder was sent one entry an
+/// exchange.
+#[test]
+fn a_burst_of_writes_to_a_live_volume_ships_its_changes_not_the_volume() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, _hosts) = formed_mesh(&["a", "b", "c"]);
+  let owner = daemons[0].instance().to_owned();
+  let mut client = Client::connect(&owner);
+  let ReplyBody::Created { id } = client.call(&RequestBody::Create {
+    name: "burst".to_owned(),
+    size: SizeClass::Bounded {
+      limit: BURST_VOLUME_LIMIT,
+    },
+    names: NamePolicy::Exact,
+    require_locked: false,
+    base: None,
+  }) else {
+    panic!("the burst volume was created");
+  };
+  let attachment = write_attachment(&mut client, id);
+  for file in 0..BURST_VOLUME_FILES {
+    let written = client.call(&RequestBody::FsWrite {
+      volume: id,
+      attachment,
+      path: format!("/base-{file}"),
+      bytes: vec![u8::try_from(file % 251).unwrap(); BURST_VOLUME_FILE_BYTES],
+      mode: 0o644,
+    });
+    assert!(
+      matches!(written, ReplyBody::FsDone { .. }),
+      "base file {file}: {written:?}"
+    );
+  }
+  let shipped = client.call(&RequestBody::LiveShip {
+    volume: id,
+    live_shipped: true,
+  });
+  assert!(
+    matches!(shipped, ReplyBody::LiveShippingSet { live_shipped: true }),
+    "the volume is live-shipped: {shipped:?}"
+  );
+  let first = client.call(&RequestBody::FsWrite {
+    volume: id,
+    attachment,
+    path: "/first".to_owned(),
+    bytes: vec![1; BURST_WRITE_BYTES],
+    mode: 0o644,
+  });
+  assert!(
+    matches!(first, ReplyBody::FsDone { .. }),
+    "the first live write is answered at durability: {first:?}"
+  );
+  let counts = |daemon: &Daemon| {
+    [
+      LIVE_WHOLE,
+      LIVE_NO_CREDIT,
+      LIVE_APPENDED,
+      LIVE_BATCHES,
+      LIVE_BATCHED,
+    ]
+    .map(|kind| refusal_count(daemon, kind).unwrap())
+  };
+  let before = counts(&daemons[0]);
+  let taken = |daemon: &Daemon| refusal_count(daemon, LIVE_HELD).unwrap();
+  let taken_before = [taken(&daemons[1]), taken(&daemons[2])];
+  let writers: Vec<(Client, u64)> = (0..BURST_WRITERS)
+    .map(|_| {
+      let mut writer = Client::connect(&owner);
+      let attached = write_attachment(&mut writer, id);
+      (writer, attached)
+    })
+    .collect();
+  let start = std::sync::Barrier::new(BURST_WRITERS + 1);
+  let holds = [&daemons[1], &daemons[2]].map(|holder| {
+    holder
+      .starve_control_shard(BURST_HOLD_NS)
+      .expect("a holder's shard is held")
+  });
+  let (replies, deepest) = std::thread::scope(|scope| {
+    let threads: Vec<_> = writers
+      .into_iter()
+      .enumerate()
+      .map(|(index, (mut writer, attached))| {
+        let start = &start;
+        scope.spawn(move || {
+          start.wait();
+          writer.call(&RequestBody::FsWrite {
+            volume: id,
+            attachment: attached,
+            path: format!("/burst-{index}"),
+            bytes: vec![u8::try_from(index % 251).unwrap(); BURST_WRITE_BYTES],
+            mode: 0o644,
+          })
+        })
+      })
+      .collect();
+    start.wait();
+    let began = Instant::now();
+    let mut deepest = 0;
+    while threads.iter().any(|thread| !thread.is_finished()) && began.elapsed() < PLACEMENT_DEADLINE
+    {
+      if let Some(in_flight) = live_in_flight(&mut client, id) {
+        deepest = deepest.max(in_flight);
+      }
+      std::thread::yield_now();
+    }
+    let replies: Vec<ReplyBody> = threads
+      .into_iter()
+      .map(|thread| thread.join().unwrap())
+      .collect();
+    (replies, deepest)
+  });
+  let held: Vec<_> = holds.into_iter().map(|hold| hold.answer()).collect();
+  let after = counts(&daemons[0]);
+  // The holders' takes are counted as each answers, after the writes it made durable were answered: polled.
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let mut taken_after = taken_before;
+  let burst = u64::try_from(BURST_WRITERS).unwrap();
+  let all_taken = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    taken_after = [taken(&daemons[1]), taken(&daemons[2])];
+    Ok(
+      taken_after
+        .iter()
+        .zip(taken_before)
+        .all(|(after, before)| after.saturating_sub(before) >= burst),
+    )
+  });
+  drop(observed);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "burst: whole, no-credit, appended, batches, batched before {before:?} after {after:?}; deepest in flight \
+     {deepest}; holds {held:?}; holders took {taken_before:?} -> {taken_after:?}"
+  );
+  assert!(
+    replies
+      .iter()
+      .all(|reply| matches!(reply, ReplyBody::FsDone { .. })),
+    "every write of the burst is answered at durability: {replies:?}"
+  );
+  assert_eq!(
+    after[1], before[1],
+    "no publication of the burst was turned away for credit"
+  );
+  assert_eq!(
+    after[0], before[0],
+    "no whole record: the burst shipped its changes, not the volume"
+  );
+  assert!(
+    after[2].saturating_sub(before[2]) >= u64::try_from(BURST_WRITERS).unwrap(),
+    "an entry for every write of the burst"
+  );
+  assert!(
+    deepest > OLD_CREDIT_ENTRIES,
+    "the burst had more entries in flight at once than the old credit let be ({deepest})"
+  );
+  let (batches, batched) = (
+    after[3].saturating_sub(before[3]),
+    after[4].saturating_sub(before[4]),
+  );
+  assert!(
+    batches > 0 && batched > batches,
+    "the entries the held holders lacked went as batches, several an exchange ({batches} batches, {batched} entries)"
+  );
+  assert!(
+    all_taken,
+    "each holder took every entry of the burst: {taken_before:?} -> {taken_after:?}"
   );
 }
 
@@ -10435,6 +11131,401 @@ fn assert_hedged_through_the_measured_p95(outcome: &HedgeOutcome) {
   );
 }
 
+/// Shape: the coordinator periods a heal gets to leave every head naming holders that hold the content: three of the
+/// healer's at-rest periods (one placed snapshot per hundred periods, `fleet::HEAL_PERIODS_AT_REST`), so a healer that
+/// replaces a departed holder does so several times over within it.
+const NAMED_SET_PERIODS: u64 = 300;
+
+/// A sealed volume, its manifest, the holders its shipped head names, and the index of one of them past the owner.
+type SealedNamed = (VolumeId, [u8; 32], Option<Vec<u64>>, usize);
+
+/// Whether volume `id` is live-shipped as `instance`'s listing reports it.
+fn is_live_shipped(instance: &str, id: VolumeId) -> bool {
+  match Client::connect(instance).call(&RequestBody::List) {
+    ReplyBody::Listed { volumes } => volumes
+      .iter()
+      .any(|volume| volume.id == id && volume.live_shipped),
+    _ => false,
+  }
+}
+
+/// Seals `name` on the owner (`daemons[0]`), live-shipped first when `live`, waits for the snapshot to place and for
+/// the head to be held by a member past the owner that it names as a content holder and by another member besides,
+/// one that can take the volume over once the named one leaves: the volume, its manifest, the holders the head names,
+/// and the named member's index; why not, when the setup did not complete.
+fn sealed_with_a_named_remote(
+  instance: &str,
+  daemons: &[Daemon],
+  hosts: &[HostId],
+  name: &str,
+  live: bool,
+) -> Result<SealedNamed, String> {
+  // A live volume is made live-shipped (A-200) before its seal, so its head and its live log are both in play.
+  let (id, placed) = seal_and_place_hello(instance, daemons, name, |owner| {
+    if live {
+      let mut client = Client::connect(owner.instance());
+      if let ReplyBody::Listed { volumes } = client.call(&RequestBody::List)
+        && let Some(volume) = volumes.iter().find(|volume| volume.name == name)
+      {
+        let _ = client.call(&RequestBody::LiveShip {
+          volume: volume.id,
+          live_shipped: true,
+        });
+      }
+    }
+  })?;
+  if live && !is_live_shipped(instance, id) {
+    return Err(format!("{name} was made live-shipped before its seal"));
+  }
+  let object = ObjectId(id.bytes);
+  let all: Vec<&Daemon> = daemons.iter().collect();
+  let mut named = None;
+  let mut remote = None;
+  let mut successor = None;
+  let held = placed
+    && poll_until(&all, SERVE_DEADLINE, || {
+      (named, remote) = named_remote(daemons, hosts, object);
+      successor = remote.and_then(|leaving| {
+        (1..daemons.len()).find(|index| {
+          *index != leaving
+            && daemons[*index]
+              .fleet_holder_head(object)
+              .is_ok_and(|head| head.is_some())
+        })
+      });
+      Ok(successor.is_some())
+    });
+  let manifest = daemons[0].fleet_head_manifest(object).ok().flatten();
+  match (held, manifest, remote) {
+    (true, Some(manifest), Some(remote)) => Ok((id, manifest, named, remote)),
+    _ => Err(format!(
+      "placed={placed}; the head held by a named remote and another member: manifest {manifest:?}, named {named:?}, \
+       named remote {remote:?}, other holder {successor:?}"
+    )),
+  }
+}
+
+/// What a client sees of volume `id` in its status: the head, the snapshot and attachment counts, the bytes it
+/// references and its lease epoch; `None` when the status does not answer a report.
+fn client_view(
+  client: &mut Client,
+  id: VolumeId,
+) -> Option<(SnapshotId, u32, u32, u64, Option<u64>)> {
+  match client.call(&RequestBody::Status { volume: id }) {
+    ReplyBody::Status { report } => Some((
+      report.head,
+      report.snapshots,
+      report.attachments,
+      report.referenced_bytes,
+      report.lease_epoch,
+    )),
+    _ => None,
+  }
+}
+
+/// The holders the head names as one of `daemons` (other than the owner, `daemons[0]`) holds it, and the index of the
+/// first of `daemons` past the owner that the head names.
+fn named_remote(
+  daemons: &[Daemon],
+  hosts: &[HostId],
+  object: ObjectId,
+) -> (Option<Vec<u64>>, Option<usize>) {
+  let named = (1..daemons.len()).find_map(|index| named_holders(&daemons[index], object));
+  let remote = named
+    .as_ref()
+    .and_then(|holders| (1..daemons.len()).find(|index| holders.contains(&hosts[*index].0)));
+  (named, remote)
+}
+
+/// The content holders the head `daemon` holds for `object` names, or `None` when it holds no head.
+fn named_holders(daemon: &Daemon, object: ObjectId) -> Option<Vec<u64>> {
+  daemon
+    .fleet_holder_head(object)
+    .ok()
+    .flatten()
+    .and_then(|(_, bytes)| HeadValue::from_record_bytes(&bytes))
+    .map(|head| head.content_holders)
+}
+
+/// Whether the heads in `views` (one per daemon, `None` where it holds none) are at least one, and each names, besides
+/// `owner`, only members among `daemons` that hold `manifest` whole: the holders a successor would fetch from.
+fn heads_name_holders_that_hold(
+  daemons: &[Daemon],
+  owner: HostId,
+  views: &[Option<Vec<u64>>],
+  manifest: [u8; 32],
+) -> bool {
+  let held: Vec<&Vec<u64>> = views.iter().flatten().collect();
+  !held.is_empty()
+    && held.iter().all(|holders| {
+      holders.iter().filter(|host| **host != owner.0).all(|host| {
+        daemons
+          .iter()
+          .find(|daemon| {
+            daemon
+              .member_identity()
+              .is_ok_and(|member| member.0 == *host)
+          })
+          .is_some_and(|daemon| daemon.fleet_holder_content(manifest) == Ok(true))
+      })
+    })
+}
+
+/// Waits for one of `daemons` to take `object` over (its head placed there), then reads `name`'s file back from it:
+/// whether one did, and the bytes read.
+fn successor_reads(
+  daemons: &[Daemon],
+  object: ObjectId,
+  id: VolumeId,
+  name: &str,
+) -> (bool, Option<Vec<u8>>) {
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let mut successor = None;
+  let took_over = poll_until(&survivors, SERVE_DEADLINE, || {
+    successor = daemons
+      .iter()
+      .position(|daemon| daemon.fleet_head_placed(object) == Ok(true));
+    Ok(successor.is_some())
+  });
+  let got = successor.and_then(|index| {
+    poll_status_answers(&survivors, daemons[index].instance(), id)
+      .then(|| read_hello_over_nfs(&daemons[index], name))
+  });
+  (took_over, got)
+}
+
+/// §4.10 "the healer"; §4.8 "Promotion and takeover": a holder the shipped head names that leaves the fleet is replaced
+/// by a heal, and the head is republished naming holders that hold the content, so the owner's later death is survived.
+/// Do seal a snapshot on a five-node `f = 1` fleet, stop the remote holder the head names and let the survivors retire
+/// it, let the healer run, then kill the owner. Expect every head a survivor holds to name only members that hold the
+/// content, within three healer periods of the retirement; the owner to have republished the head with nothing a client
+/// sees changed (the status's head, snapshot and attachment counts, bytes and lease epoch, and the file's bytes); and a
+/// survivor to take the volume over and read the file back byte for byte. Two failures, the second after the fleet
+/// absorbed the first, so each is within `f`. Before, a heal re-recorded the placement on the current cohort but the
+/// head kept naming the departed holder, since a head is never rewritten at its sequence (2026-11-08).
+#[test]
+fn a_heal_republishes_the_head_once_a_named_holder_has_left() {
+  heal_republishes_once_a_named_holder_has_left(false);
+}
+
+/// [`a_heal_republishes_the_head_once_a_named_holder_has_left`] for a live-shipped volume (A-200): its head is
+/// republished the same way and its live log is left as it was, so the successor still takes it over and serves it.
+#[test]
+fn a_heal_republishes_a_live_volumes_head_once_a_named_holder_has_left() {
+  heal_republishes_once_a_named_holder_has_left(true);
+}
+
+/// The body of the two republish tests: a plain volume, or a live-shipped one when `live`.
+fn heal_republishes_once_a_named_holder_has_left(live: bool) {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c", "d", "e"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let pid = std::process::id();
+  let instance_a = format!("fleet3-{}-{pid}", hosts[0].0);
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let mut daemons = start_mesh_with_f(nodes, &hosts, &certs, &serve, 1);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+
+  let name = "departed-holder";
+  let (id, manifest, named_at_seal, departing) =
+    match sealed_with_a_named_remote(&instance_a, &daemons, &hosts, name, live) {
+      Ok(sealed) => sealed,
+      Err(why) => {
+        for daemon in daemons {
+          daemon.stop();
+        }
+        panic!("setup: {why}");
+      }
+    };
+  let object = ObjectId(id.bytes);
+  // What a client sees of the volume before the heal: a republish must change none of it but the placement. The view is
+  // taken after the test's own first read, whose mount is an attachment the status counts.
+  let mut client = Client::connect(&instance_a);
+  let read_before = read_hello_over_nfs(&daemons[0], name);
+  let before = client_view(&mut client, id);
+
+  // The named holder leaves the fleet; the survivors retire it.
+  let gone = hosts[departing];
+  daemons.remove(departing).stop();
+  let retired = poll_survivors_retire(&daemons, gone);
+  // The healer replaces it, and the head is republished naming members that hold the content.
+  let all: Vec<&Daemon> = daemons.iter().collect();
+  let mut views: Vec<Option<Vec<u64>>> = Vec::new();
+  let whole = poll_for_periods(&all, PLACEMENT_DEADLINE, NAMED_SET_PERIODS, || {
+    views = daemons[1..]
+      .iter()
+      .map(|daemon| named_holders(daemon, object))
+      .collect();
+    Ok(heads_name_holders_that_hold(
+      &daemons, hosts[0], &views, manifest,
+    ))
+  });
+  let after = client_view(&mut client, id);
+  let read_after = read_hello_over_nfs(&daemons[0], name);
+  let counters = daemons[0].refusals_on_every_shard();
+  let republished = counters
+    .as_ref()
+    .map(|counters| counters.get("fleet.heal.republished").copied().unwrap_or(0))
+    .map_err(Clone::clone);
+  // The owner's healer and content counts, printed with a failure: which step the heal reached.
+  let healer: Vec<(String, u64)> = counters
+    .iter()
+    .flatten()
+    .filter(|(name, _)| {
+      name.starts_with("fleet.heal")
+        || name.starts_with("fleet.content")
+        || name.starts_with("fleet.seal")
+    })
+    .map(|(name, count)| (name.to_string(), *count))
+    .collect();
+
+  // The owner dies; a survivor takes the volume over and serves it.
+  let owner = hosts[0];
+  daemons.remove(0).stop();
+  let (took_over, got) = successor_reads(&daemons, object, id, name);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    retired,
+    "the survivors retired the departed holder {gone:?}"
+  );
+  assert!(
+    whole,
+    "every head the survivors hold names members that hold the content: heads name {views:?}; named at the seal \
+     {named_at_seal:?}; departed {gone:?}; republished {republished:?}; the owner's counts {healer:?}"
+  );
+  assert!(
+    republished.as_ref().is_ok_and(|count| *count > 0),
+    "the owner republished the head: {republished:?}"
+  );
+  assert!(
+    before.is_some() && before == after && read_before == read_after,
+    "a republish changes nothing a client sees but the placement: status (head, snapshots, attachments, referenced, \
+     lease epoch) {before:?} → {after:?}; the file read the same: {}",
+    read_before == read_after
+  );
+  assert!(
+    took_over,
+    "a survivor took over the dead owner {owner:?}'s volume"
+  );
+  assert_eq!(
+    got.as_deref(),
+    Some(CONTENT),
+    "the successor reads the file back byte for byte"
+  );
+}
+
+/// §4.10 "the healer"; banned item 8 (every retry loop bounded): a heal that replaces a departed holder and whose every
+/// put is refused ends at its bound (its content round's whole span and a period), counted, and the volume is healed on
+/// a later step once the refusal lifts. Do seal a snapshot on a five-node `f = 1` fleet, have every member but the owner refuse content puts, stop the
+/// remote holder the head names and let the survivors retire it; then lift the refusal. Expect the owner to count
+/// `fleet.heal.unfinished` while the refusal holds, and after it lifts to republish the head naming members that hold
+/// the content. Before, a replace that could not place stayed open for good and the healer skipped the volume while it
+/// did (2026-11-09: one replace refused at the door left the head naming the departed holder for 300 periods).
+#[test]
+fn a_heal_that_cannot_place_ends_at_its_bound_and_the_volume_is_healed_later() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c", "d", "e"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let pid = std::process::id();
+  let instance_a = format!("fleet3-{}-{pid}", hosts[0].0);
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let mut daemons = start_mesh_with_f(nodes, &hosts, &certs, &serve, 1);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+
+  let name = "refused-replace";
+  let (id, manifest, named_at_seal, departing) =
+    match sealed_with_a_named_remote(&instance_a, &daemons, &hosts, name, false) {
+      Ok(sealed) => sealed,
+      Err(why) => {
+        for daemon in daemons {
+          daemon.stop();
+        }
+        panic!("setup: {why}");
+      }
+    };
+  let object = ObjectId(id.bytes);
+  let refused = refuse_content_puts(&daemons[1..], true);
+
+  // The named holder leaves the fleet; the survivors retire it; every replace the owner's healer starts is refused.
+  let gone = hosts[departing];
+  daemons.remove(departing).stop();
+  let retired = poll_survivors_retire(&daemons, gone);
+  let all: Vec<&Daemon> = daemons.iter().collect();
+  let owner_count = |name: &str| {
+    daemons[0]
+      .refusals_on_every_shard()
+      .map(|counters| counters.get(name).copied().unwrap_or(0))
+  };
+  let ended = poll_for_periods(&all, PLACEMENT_DEADLINE, NAMED_SET_PERIODS, || {
+    owner_count("fleet.heal.unfinished").map(|count| count > 0)
+  });
+  let unfinished = owner_count("fleet.heal.unfinished");
+  let republished_while_refused = owner_count("fleet.heal.republished");
+
+  // The refusal lifts; a later healer step places the content and republishes the head.
+  let lifted = refuse_content_puts(&daemons[1..], false);
+  let mut views: Vec<Option<Vec<u64>>> = Vec::new();
+  let whole = poll_for_periods(&all, PLACEMENT_DEADLINE, NAMED_SET_PERIODS, || {
+    views = daemons[1..]
+      .iter()
+      .map(|daemon| named_holders(daemon, object))
+      .collect();
+    Ok(heads_name_holders_that_hold(
+      &daemons, hosts[0], &views, manifest,
+    ))
+  });
+  let republished = owner_count("fleet.heal.republished");
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    refused.is_ok() && lifted.is_ok() && retired,
+    "the refusal was installed ({refused:?}) and lifted ({lifted:?}), and the survivors retired {gone:?} ({retired})"
+  );
+  assert!(
+    ended && republished_while_refused == Ok(0),
+    "a replace whose puts were all refused ended at its bound, counted: fleet.heal.unfinished {unfinished:?}, \
+     republished meanwhile {republished_while_refused:?}"
+  );
+  assert!(
+    whole && republished.as_ref().is_ok_and(|count| *count > 0),
+    "once the refusal lifted the volume was healed: heads name {views:?}; named at the seal {named_at_seal:?}; \
+     departed {gone:?}; republished {republished:?}"
+  );
+}
+
+/// Has each of `daemons` refuse every content put while `refuse` holds (the holder-side merge fault), or serve them
+/// again: `Ok` once every one installed it, else the first typed refusal.
+fn refuse_content_puts(daemons: &[Daemon], refuse: bool) -> Result<Vec<()>, ObserveError> {
+  daemons
+    .iter()
+    .map(|daemon| {
+      daemon.inject_merge_fault(slates_server::merge_service::MergeFault {
+        refuse_content_puts: refuse,
+        ..Default::default()
+      })
+    })
+    .collect()
+}
+
 /// AC (§4.10 "anti-entropy walks Merkle manifests between recorded holders and repairs only differing
 /// subtrees; the healer replays puts that never reached f+1"; §4.8 "Derived constants": "healer cadence from
 /// the measured put-failure rate"; §4.8 "Recovery": a restarted holder "holds nothing for others until
@@ -10514,6 +11605,14 @@ fn a_holder_that_lost_placed_content_is_repaired_by_the_healer() {
     )
   });
   let repairs_after = daemons[0].fleet_repairs(object);
+  // Whether the holder holds the content at the end tells a heal that never refilled it from a repair that went
+  // uncounted; the owner's heal counts say which step the heal reached.
+  let holds_after = daemons[holder_index].fleet_holder_content(manifest);
+  let healer = healer_counts(&daemons[0]);
+  eprintln!(
+    "healer: repaired {repaired}; the holder holds the content {holds_after:?}; repairs {repairs_before:?} → \
+     {repairs_after:?}; the owner's counts {healer:?}"
+  );
 
   for daemon in daemons {
     daemon.stop();
@@ -10525,7 +11624,246 @@ fn a_holder_that_lost_placed_content_is_repaired_by_the_healer() {
   assert!(
     repaired,
     "the healer re-put the lost content and the holder holds it whole again \
-     (repairs {repairs_before:?} → {repairs_after:?})"
+     (repairs {repairs_before:?} → {repairs_after:?}; the holder holds it {holds_after:?}; the owner's counts \
+     {healer:?})"
+  );
+}
+
+/// Shape: how long [`a_repair_whose_acknowledgement_outlasts_its_round_is_counted`] has the restored holder hold each
+/// content acknowledgement: five coordinator periods. A content round stops collecting at the first collection poll
+/// (a tenth of a period) past the owner's hedge delay, the p95 of its own put readings (sub-millisecond to tens of
+/// milliseconds on loopback), so the held acknowledgement arrives after its round stopped; and the holder's transfer
+/// task is bounded by the round budget's whole span, eleven periods at least (`round_budget`: a base of one period and
+/// `ELECTION_MARGIN` extensions of one), so the acknowledgement still arrives, as a straggler's.
+const ACK_HOLD_NS: u64 = 5 * HEARTBEAT_NS;
+
+/// Shape: the coordinator periods a heal test gives the healer to restore a holder: its at-rest walk (one placed
+/// snapshot per hundred periods) three times over each of the test's volumes, two at most.
+const HEAL_PERIODS: u64 = 600;
+
+/// The count `name` on every shard of `daemon`, zero when it was never counted; the typed refusal when a shard could
+/// not be observed.
+fn count_on(daemon: &Daemon, name: &str) -> Result<u64, ObserveError> {
+  daemon
+    .refusals_on_every_shard()
+    .map(|counters| counters.get(name).copied().unwrap_or(0))
+}
+
+/// The owner's healer and seal counts on every shard of `daemon`, printed with a heal test's failure: which step the
+/// heal reached.
+fn healer_counts(daemon: &Daemon) -> Vec<(String, u64)> {
+  daemon
+    .refusals_on_every_shard()
+    .iter()
+    .flatten()
+    .filter(|(name, _)| name.starts_with("fleet.heal") || name.starts_with("fleet.seal"))
+    .map(|(name, count)| (name.to_string(), *count))
+    .collect()
+}
+
+/// AC (§4.10 "the healer"; `Daemon::fleet_repairs`, the healer's non-vacuity count): a repair whose acknowledgement
+/// arrives after its round stopped collecting at the hedge delay is counted all the same. Do: on a three-node `f = 1`
+/// fleet, seal a volume until its content places; have the remote holder the head names hold each content
+/// acknowledgement for [`ACK_HOLD_NS`] (`Daemon::inject_content_ack_delay`), the condition a holder whose refill
+/// outlasts its round meets under load; drop the content there. Expect the holder to hold it whole again with the
+/// owner's repair count moved, and the refill to have outlasted the round that sent it
+/// (`fleet.heal.refill_outlasted_round`, so the case shown is the late one). Before (2026-11-17), only an
+/// acknowledgement collected inside the round that sent the bytes counted: the holder was restored, its acknowledgement
+/// was folded late, and the count never moved, as `a_holder_that_lost_placed_content_is_repaired_by_the_healer` failed
+/// under load.
+#[test]
+fn a_repair_whose_acknowledgement_outlasts_its_round_is_counted() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let all: Vec<&Daemon> = daemons.iter().collect();
+  let instance = daemons[0].instance().to_owned();
+  let id = match seal_hello_on_owner(&instance, &daemons, "late-repair") {
+    Ok(id) => id,
+    Err(why) => {
+      for daemon in daemons {
+        daemon.stop();
+      }
+      panic!("setup: {why}");
+    }
+  };
+  let object = ObjectId(id.bytes);
+  let manifest = daemons[0].fleet_head_manifest(object).ok().flatten();
+  let (named, holder) = named_remote(&daemons, &hosts, object);
+  let (Some(manifest), Some(holder)) = (manifest, holder) else {
+    for daemon in daemons {
+      daemon.stop();
+    }
+    panic!("setup: manifest {manifest:?}, the head names {named:?}");
+  };
+  let held = daemons[holder].fleet_holder_content(manifest);
+  let measured = daemons[0].fleet_put_latency(object);
+  let repairs_before = daemons[0].fleet_repairs(object);
+  let late_before = count_on(&daemons[0], "fleet.heal.repaired_late");
+  let outlasted_before = count_on(&daemons[0], "fleet.heal.refill_outlasted_round");
+
+  // The named holder holds its acknowledgements past the round and loses the content; the healer must put it back.
+  let delayed = daemons[holder].inject_content_ack_delay(Some(ACK_HOLD_NS));
+  let forgotten = daemons[holder].drop_held_content(manifest);
+  let lost = daemons[holder].fleet_holder_content(manifest) == Ok(false);
+  let repaired = poll_for_periods(&all, PLACEMENT_DEADLINE, HEAL_PERIODS, || {
+    let holds = daemons[holder].fleet_holder_content(manifest)?;
+    let repairs = daemons[0].fleet_repairs(object)?;
+    Ok(
+      holds
+        && repairs_before
+          .as_ref()
+          .is_ok_and(|&before| repairs > before),
+    )
+  });
+  let holds = daemons[holder].fleet_holder_content(manifest);
+  let repairs_after = daemons[0].fleet_repairs(object);
+  let late_after = count_on(&daemons[0], "fleet.heal.repaired_late");
+  let outlasted_after = count_on(&daemons[0], "fleet.heal.refill_outlasted_round");
+  let healer = healer_counts(&daemons[0]);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    held == Ok(true) && delayed.is_ok(),
+    "setup: the named holder held the content {held:?}; the acknowledgement hold was installed {delayed:?}"
+  );
+  assert!(
+    forgotten == Ok(true) && lost,
+    "the named holder lost the placed content (forgotten={forgotten:?}, lost={lost})"
+  );
+  assert!(
+    repaired,
+    "the healer put the content back and counted the repair: the holder holds it {holds:?}, repairs \
+     {repairs_before:?} → {repairs_after:?}, late repairs {late_before:?} → {late_after:?}; the owner's put latency \
+     (readings, p95 ns) {measured:?}; the owner's counts {healer:?}"
+  );
+  let outlasted = outlasted_before
+    .as_ref()
+    .ok()
+    .zip(outlasted_after.as_ref().ok())
+    .is_some_and(|(before, after)| after > before);
+  assert!(
+    outlasted,
+    "the refill outlasted the round that sent it, so the case shown is the one that went uncounted: \
+     {outlasted_before:?} → {outlasted_after:?}; the owner's put latency (readings, p95 ns) {measured:?}"
+  );
+}
+
+/// AC (§4.10 "the healer"; §4.8 "Promotion and takeover": a successor fetches from the holders the head names): a heal
+/// restores exactly the holders the shipped head names, so a candidate that holds no head yet never takes the content in
+/// a named holder's place. Do: on a three-node `f = 1` fleet, have the first-ranked remote candidate refuse the owner's
+/// records (it holds no head) and, until the snapshot places, its content puts, so the content and the head place on
+/// the owner and the second-ranked candidate; lift the content refusal; drop the content at the named holder. Expect
+/// the named holder to hold it whole again with the owner's repair count moved, and the candidate without the head to
+/// hold none of it. Before (2026-11-17), a heal re-offered to the cohort in rendezvous order: the candidate without the
+/// head admitted the put as ahead of its records and acknowledged first, the heal placed and re-recorded there, and the
+/// named holder stayed empty while the head named it.
+#[test]
+fn a_heal_restores_the_named_holder_and_not_a_candidate_without_the_head() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let all: Vec<&Daemon> = daemons.iter().collect();
+  let name = "named-restored";
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id } = client.call(&scratch(name)) else {
+    panic!("create");
+  };
+  share_with_fleet(&mut client, id, &daemons);
+  write_hello_over_nfs(&daemons[0], name);
+  let object = ObjectId(id.bytes);
+  let Some((lagging, named)) = remote_candidate_indexes(&daemons[0], &hosts, object) else {
+    for daemon in daemons {
+      daemon.stop();
+    }
+    panic!("a three-node f = 1 fleet gives the owner two remote candidates");
+  };
+  // The first-ranked candidate holds no record of the volume, and takes no content until the snapshot has placed.
+  let records_refused = daemons[lagging].inject_record_refusal(&[hosts[0]]);
+  let puts_refused = refuse_content_puts(std::slice::from_ref(&daemons[lagging]), true);
+  let ReplyBody::Snapshotted { id: snapshot, .. } =
+    client.call(&RequestBody::Snapshot { volume: id })
+  else {
+    for daemon in daemons {
+      daemon.stop();
+    }
+    panic!("snapshot");
+  };
+  let placed = poll_snapshot_placed(&all, &mut client, id, snapshot);
+  let named_holds_head = poll_until(&all, PLACEMENT_DEADLINE, || {
+    daemons[named]
+      .fleet_holder_head(object)
+      .map(|head| head.is_some())
+  });
+  let manifest = daemons[0].fleet_head_manifest(object).ok().flatten();
+  let head_names = named_holders(&daemons[named], object);
+  let Some(manifest) = manifest else {
+    for daemon in daemons {
+      daemon.stop();
+    }
+    panic!(
+      "setup: placed {placed}, the named holder holds the head {named_holds_head}, no manifest"
+    );
+  };
+  let held_before = (
+    daemons[named].fleet_holder_content(manifest),
+    daemons[lagging].fleet_holder_content(manifest),
+  );
+  let lagging_head = daemons[lagging].fleet_holder_head(object);
+  let repairs_before = daemons[0].fleet_repairs(object);
+
+  // The candidate without the head takes puts again; the named holder loses the content; the healer must put it back
+  // there, and only there.
+  let puts_lifted = refuse_content_puts(std::slice::from_ref(&daemons[lagging]), false);
+  let forgotten = daemons[named].drop_held_content(manifest);
+  let lost = daemons[named].fleet_holder_content(manifest) == Ok(false);
+  let restored = poll_for_periods(&all, PLACEMENT_DEADLINE, HEAL_PERIODS, || {
+    let holds = daemons[named].fleet_holder_content(manifest)?;
+    let repairs = daemons[0].fleet_repairs(object)?;
+    Ok(
+      holds
+        && repairs_before
+          .as_ref()
+          .is_ok_and(|&before| repairs > before),
+    )
+  });
+  let named_holds = daemons[named].fleet_holder_content(manifest);
+  let lagging_holds = daemons[lagging].fleet_holder_content(manifest);
+  let repairs_after = daemons[0].fleet_repairs(object);
+  let healer = healer_counts(&daemons[0]);
+  let lifted = daemons[lagging].inject_record_refusal(&[]);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    records_refused.is_ok() && puts_refused.is_ok() && puts_lifted.is_ok() && lifted.is_ok(),
+    "the faults were installed and lifted: records {records_refused:?}, puts {puts_refused:?} then {puts_lifted:?}, \
+     records lifted {lifted:?}"
+  );
+  assert!(
+    placed
+      && named_holds_head
+      && lagging_head.as_ref().is_ok_and(Option::is_none)
+      && head_names.as_ref().is_some_and(
+        |holders| holders.contains(&hosts[named].0) && !holders.contains(&hosts[lagging].0)
+      )
+      && held_before == (Ok(true), Ok(false)),
+    "setup: placed {placed}; the head names {head_names:?} and the named holder holds it {named_holds_head}; the \
+     candidate refusing records holds no head {lagging_head:?}; held before (named, lagging) {held_before:?}"
+  );
+  assert!(
+    forgotten == Ok(true) && lost,
+    "the named holder lost the placed content (forgotten={forgotten:?}, lost={lost})"
+  );
+  assert!(
+    restored,
+    "the healer put the content back on the holder the head names: it holds it {named_holds:?}, repairs \
+     {repairs_before:?} → {repairs_after:?}, the candidate without the head holds it {lagging_holds:?}; the owner's \
+     counts {healer:?}"
+  );
+  assert_eq!(
+    lagging_holds,
+    Ok(false),
+    "the candidate without the head took none of the content in the named holder's place"
   );
 }
 
@@ -11845,6 +13183,160 @@ fn a_forwarded_submit_refused_overloaded_while_it_commits_is_answered_under_its_
     committed,
     answer,
   });
+}
+
+/// A formed two-node `f = 1` fleet of two shards a node, and node A's instance (A-247: a work can be on another shard).
+fn two_shard_fleet() -> (PortLease, Daemon, Daemon, String) {
+  let (ports, [pa_probe, pa_record, pb_probe, pb_record]) = four_free_ports();
+  let a = node("a", pa_probe, pa_record);
+  let b = node("b", pb_probe, pb_record);
+  let instance_a = format!("fleet-{}-{}", a.host.0, std::process::id());
+  let peer_of_a = Peer {
+    anchor: b.origin_anchor,
+    host: b.host,
+    address: b.address,
+    record_address: b.record_address,
+    certificate: b.identity.certificate(),
+  };
+  let peer_of_b = Peer {
+    anchor: a.origin_anchor,
+    host: a.host,
+    address: a.address,
+    record_address: a.record_address,
+    certificate: a.identity.certificate(),
+  };
+  let daemon_a = start_sharded(a, peer_of_a, TWO_SHARDS);
+  let daemon_b = start_sharded(b, peer_of_b, TWO_SHARDS);
+  assert!(
+    form_and_settle(&[&daemon_a, &daemon_b]),
+    "the fleet's groups formed before the test acts"
+  );
+  (ports, daemon_a, daemon_b, instance_a)
+}
+
+/// A green on its owner's node and a work over it placed on another shard of that node, with one edit (A-247).
+fn green_and_off_shard_work(client: &mut Client) -> (VolumeId, VolumeId) {
+  let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
+    name: "off-shard-green".to_owned(),
+    require_evidence: false,
+    base: None,
+  }) else {
+    panic!("create green");
+  };
+  let name = (0u32..)
+    .map(|suffix| format!("off-shard-work-{suffix}"))
+    .find(|name| {
+      slates_server::verbs::owner_of_name(name, usize::from(TWO_SHARDS))
+        != slates_server::verbs::owner_of(green)
+    })
+    .unwrap();
+  let ReplyBody::WorkCreated { id: work, .. } =
+    client.call(&RequestBody::CreateWork { green, name })
+  else {
+    panic!("create work");
+  };
+  (green, work)
+}
+
+/// A-247, AUD-11. Do: in a two-node `f = 1` fleet whose holder withholds every merge record, submit from a client on the
+/// green's node a work on another shard of that node, and pipeline an edit behind it. Expect: the acceptance waits at
+/// the quorum on the owner, and neither verb is answered; once the holder takes the record the submit is answered the
+/// version and the edit after it, in order, and the work reads the edit over the accepted version.
+#[test]
+fn a_submit_off_its_greens_shard_is_held_to_its_quorum_and_the_works_next_verb_behind_it() {
+  let _serial = serialize_fleet_tests();
+  let (_ports, daemon_a, daemon_b, instance_a) = two_shard_fleet();
+  let mut client = Client::connect(&instance_a);
+  let (green, work) = green_and_off_shard_work(&mut client);
+  let appended = |at: u64, bytes: &[u8]| RequestBody::Edit {
+    work,
+    path: "f".to_owned(),
+    at,
+    delete_len: 0,
+    bytes: bytes.to_vec(),
+  };
+  assert!(matches!(
+    client.call(&appended(0, b"hello")),
+    ReplyBody::Edited
+  ));
+  daemon_b
+    .inject_merge_fault(slates_server::merge_service::MergeFault {
+      refuse_content_puts: false,
+      corrupt_next_inputs: false,
+      refuse_records: true,
+      refuse_work_catalogs: false,
+    })
+    .unwrap();
+  let mut pipelined = common::client::connect(&instance_a);
+  let submit = pipelined
+    .begin(&RequestBody::Submit {
+      work,
+      evidence: Vec::new(),
+    })
+    .unwrap();
+  let both = [&daemon_a, &daemon_b];
+  assert!(
+    poll_until(&both, PLACEMENT_DEADLINE, || Ok(
+      daemon_a.merge_awaiting(green)? == 1
+    )),
+    "the acceptance waits at the owner"
+  );
+  let after = pipelined.begin(&appended(5, b"!")).unwrap();
+  assert!(
+    matches!(pipelined.poll_reply(after), Ok(None)),
+    "the edit behind the deferred submit is not answered"
+  );
+  daemon_b
+    .inject_merge_fault(slates_server::merge_service::MergeFault::default())
+    .unwrap();
+  let submitted = answer_within(&mut pipelined, submit.word());
+  let edited = answer_within(&mut pipelined, after.word());
+  let answered_late = daemon_a
+    .refusals_on_every_shard()
+    .unwrap()
+    .get("merge.work.answered_late")
+    .copied()
+    .unwrap_or(0);
+  let read = client.call(&RequestBody::Read {
+    volume: work,
+    path: "f".to_owned(),
+    at: ReadAt::Head,
+  });
+  drop(pipelined);
+  drop(client);
+  daemon_a.stop();
+  daemon_b.stop();
+  assert!(
+    answered_late > 0,
+    "the quorum's commit resumed the parked submit, not a deadline and a retry"
+  );
+  assert_held_to_its_quorum(submitted, edited, &read);
+}
+
+/// What [`a_submit_off_its_greens_shard_is_held_to_its_quorum_and_the_works_next_verb_behind_it`] must have seen.
+fn assert_held_to_its_quorum(
+  submitted: Option<Result<ReplyBody, String>>,
+  edited: Option<Result<ReplyBody, String>>,
+  read: &ReplyBody,
+) {
+  assert!(
+    matches!(
+      submitted,
+      Some(Ok(ReplyBody::Submitted {
+        version: Some(1),
+        ..
+      }))
+    ),
+    "the submit answers its version: {submitted:?}"
+  );
+  assert!(
+    matches!(edited, Some(Ok(ReplyBody::Edited))),
+    "and the edit after it: {edited:?}"
+  );
+  assert!(
+    matches!(read, ReplyBody::ReadBytes { bytes } if bytes == b"hello!"),
+    "the work reads the edit over the accepted version: {read:?}"
+  );
 }
 
 /// What the forwarded resend run observed, for [`assert_resent_under_its_id`].
@@ -14372,6 +15864,353 @@ fn a_merge_version_reaches_each_holder_with_its_inputs_in_one_exchange() {
   );
 }
 
+/// Shape: the files of the base a green's origin is walked from in [`a_green_over_a_base_places_its_origin_at_f1_a_slice_at_a_time`]:
+/// enough that its origin's inputs span many of a shard's slices and more than one shipment on any machine (the
+/// shipment bound is a slice of BLAKE3 work, a few MiB at most), few enough that a debug build's sliced walk ends within
+/// the test client's reply deadline on a loaded box (1,000 of them took about 30 s at load 51, `green_fairness.rs`).
+const ORIGIN_FILES: usize = 256;
+/// Shape: the directories the base's files are spread over, so the walk walks a tree.
+const ORIGIN_DIRS: usize = 16;
+/// Shape: each base file's bytes, about a source file's (the kernel's `fs/` averages about 16 KB a file).
+const ORIGIN_FILE_BYTES: usize = 16 * 1024;
+/// Shape: the base volume's bound over its files' bytes, room for the snapshot's copy-on-write.
+const ORIGIN_BOUND_FACTOR: u64 = 4;
+/// Shape: how long version 0 of the green may take to place at `f + 1` before the test gives up: past a debug build's
+/// sliced making, shipping and seeding of the base's origin on a loaded box.
+const ORIGIN_PLACE_WAIT: Duration = Duration::from_secs(240);
+
+/// A base file's path in [`a_green_over_a_base_places_its_origin_at_f1_a_slice_at_a_time`], in the base volume.
+fn origin_file_path(file: usize) -> String {
+  format!("/d{}/f{file}.c", file % ORIGIN_DIRS)
+}
+
+/// The same file's path in the green, relative to its root as the origin's walk names it.
+fn origin_green_path(file: usize) -> String {
+  format!("d{}/f{file}.c", file % ORIGIN_DIRS)
+}
+
+/// A `slates_client` connection to `instance`, which stages a request body larger than one ring slot and reads a file
+/// in pages: the base's writes and the green's reads are each larger than a slot.
+fn origin_client(instance: &str) -> slates_client::Client {
+  let deadlines = slates_client::Deadlines::derive(
+    slates_server::daemon::LIVENESS_BUDGET_NS,
+    slates_db::replay::RECOVERY_BUDGET_NS,
+  )
+  .get();
+  slates_client::Client::connect(instance, deadlines).unwrap()
+}
+
+/// A base file's bytes: its index, then filler to [`ORIGIN_FILE_BYTES`].
+fn origin_file_bytes(file: usize) -> Vec<u8> {
+  let mut bytes = format!("origin file {file}\n").into_bytes();
+  bytes.resize(ORIGIN_FILE_BYTES, b'o');
+  bytes
+}
+
+/// A volume on `client`'s node, `instance`, holding the base's [`ORIGIN_FILES`] files over [`ORIGIN_DIRS`] directories,
+/// written under a write attachment (through `slates_client`, which stages a body larger than one ring slot) and
+/// snapshotted: the green's base.
+fn origin_base(client: &mut Client, instance: &str) -> slates_ipc::protocol::GreenBase {
+  let ReplyBody::Created { id: volume } = client.call(&RequestBody::Create {
+    name: "origin-base".to_owned(),
+    size: SizeClass::Bounded {
+      limit: (ORIGIN_FILES * ORIGIN_FILE_BYTES) as u64 * ORIGIN_BOUND_FACTOR,
+    },
+    names: NamePolicy::Exact,
+    require_locked: false,
+    base: None,
+  }) else {
+    panic!("create the base volume");
+  };
+  let ReplyBody::Attached { attachment, .. } = client.call(&RequestBody::Attach {
+    volume,
+    snapshot: None,
+    intent: Intent::Write,
+    form: AttachRequest::Root,
+  }) else {
+    panic!("attach the base volume");
+  };
+  for dir in 0..ORIGIN_DIRS {
+    let made = client.call(&RequestBody::FsMkdir {
+      volume,
+      attachment,
+      path: format!("/d{dir}"),
+      mode: 0o755,
+    });
+    assert!(
+      matches!(made, ReplyBody::FsDone { .. }),
+      "mkdir {dir}: {made:?}"
+    );
+  }
+  let mut writer = origin_client(instance);
+  for file in 0..ORIGIN_FILES {
+    writer
+      .fs_write(
+        (volume, attachment),
+        &origin_file_path(file),
+        &origin_file_bytes(file),
+        0o644,
+      )
+      .unwrap();
+  }
+  let ReplyBody::Snapshotted { id: snapshot, .. } = client.call(&RequestBody::Snapshot { volume })
+  else {
+    panic!("snapshot the base volume");
+  };
+  slates_ipc::protocol::GreenBase { volume, snapshot }
+}
+
+/// A probe of one node while a green's version 0 places: which node, when it was sent, how long its answer took.
+type OriginProbe = (usize, Instant, Duration);
+
+/// Probes every node of `instances` in turn with a status read of a volume made on it, until `stop` is dropped: every
+/// probe taken.
+fn probe_nodes_until(
+  instances: &[String],
+  stop: &std::sync::mpsc::Receiver<()>,
+) -> Vec<OriginProbe> {
+  let mut probers: Vec<(Client, VolumeId)> = instances
+    .iter()
+    .enumerate()
+    .map(|(node, instance)| {
+      let mut client = Client::connect(instance);
+      let ReplyBody::Created { id } = client.call(&scratch(&format!("origin-probe-{node}"))) else {
+        panic!("create node {node}'s probed volume");
+      };
+      (client, id)
+    })
+    .collect();
+  let mut probes = Vec::new();
+  while matches!(stop.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)) {
+    for (node, (client, volume)) in probers.iter_mut().enumerate() {
+      let at = Instant::now();
+      let reply = client.call(&RequestBody::Status { volume: *volume });
+      assert!(
+        matches!(reply, ReplyBody::Status { .. }),
+        "node {node}'s status: {reply:?}"
+      );
+      probes.push((node, at, at.elapsed()));
+    }
+  }
+  probes
+}
+
+/// The count of `name` among one node's merge and content counters.
+fn counted(counters: &[(String, u64)], name: &str) -> u64 {
+  counters
+    .iter()
+    .filter(|(counter, _)| counter == name)
+    .map(|(_, count)| count)
+    .sum()
+}
+
+/// §4.16 "Commit" and "Apply on holders", A-217, §4.3 "Bounded work everywhere" (GAPS, "The many-client load test from
+/// 10,000 to 100,000 clients": one primary and two replicas editing the whole kernel). At `f > 0` a green over a base
+/// names its origin as version 0's inputs, and those were made in one poll — the held snapshot walked, encoded and
+/// archived, at the green's creation and again on every pass of the record plane until version 0 placed — shipped
+/// whole in one message, and recomputed on each holder in one poll: a kernel-sized origin (1.67 GB) holds a shard for
+/// seconds, past the watchdog's verdict (A-232), so the primary and its replicas could not even set up. Do: on a
+/// settled three-node fleet at `f = 1`, write [`ORIGIN_FILES`] files of [`ORIGIN_FILE_BYTES`] into a volume on node a,
+/// snapshot it, and create a green over the snapshot while a prober keeps asking every node for a volume's status.
+/// Expect: version 0 places at `f + 1`; both other nodes hold a replica at version 0, not refused; version 0 reads back
+/// the base's bytes; a submit after it is accepted as version 1, which each holder recomputes on its seeded replica; the owner made version 0's inputs once,
+/// over more than one slice, and shipped them to a holder in parts; each holder seeded its replica over more than one
+/// slice; and no node kept a probe waiting for half the placement or more.
+#[test]
+fn a_green_over_a_base_places_its_origin_at_f1_a_slice_at_a_time() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<_> = names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<_> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<_> = nodes
+    .iter()
+    .map(|(_, _, identity)| identity.certificate())
+    .collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh_with_f(nodes, &hosts, &certs, &serve, 1);
+  let instances: Vec<String> = daemons
+    .iter()
+    .map(|daemon| daemon.instance().to_owned())
+    .collect();
+  let mut client = Client::connect(daemons[0].instance());
+  let base = origin_base(&mut client, daemons[0].instance());
+  let (stop, stopped) = std::sync::mpsc::channel::<()>();
+  let prober = std::thread::spawn(move || probe_nodes_until(&instances, &stopped));
+  let began = Instant::now();
+  let created = client.call(&RequestBody::CreateGreen {
+    name: "origin-green".to_owned(),
+    require_evidence: false,
+    base: Some(base),
+  });
+  let ReplyBody::GreenCreated { id: green } = created else {
+    drop(stop);
+    let _ = prober.join();
+    for daemon in daemons {
+      daemon.stop();
+    }
+    panic!("create the green over the base: {created:?}");
+  };
+  let refs: Vec<&Daemon> = daemons.iter().collect();
+  // Placed at the quorum on the owner, and held by every candidate: the second holder's seed may still be running when
+  // the first one's acknowledgement places the version.
+  let held_at = |version: u64| -> Result<bool, ObserveError> {
+    let held: Vec<_> = daemons
+      .iter()
+      .skip(1)
+      .map(|daemon| daemon.merge_holder_state(green))
+      .collect::<Result<_, _>>()?;
+    Ok(
+      held
+        .iter()
+        .all(|state| state.version.is_some_and(|at| at >= version)),
+    )
+  };
+  let placed = poll_until(&refs, ORIGIN_PLACE_WAIT, || {
+    Ok(daemons[0].merge_record_placed(green, 0)? && held_at(0)?)
+  });
+  let placing = began.elapsed();
+  drop(stop);
+  let probes = prober.join().unwrap();
+  let holders: Vec<_> = daemons
+    .iter()
+    .skip(1)
+    .map(|daemon| daemon.merge_holder_state(green))
+    .collect();
+  // Each sampled file at version 0, read in pages: whether its bytes are the base's, or why it could not be read.
+  let read_back: Vec<(usize, Result<bool, String>)> = {
+    let mut reader = origin_client(daemons[0].instance());
+    [0, ORIGIN_FILES / 2, ORIGIN_FILES - 1]
+      .into_iter()
+      .map(|file| {
+        let read = reader.read(
+          green,
+          &origin_green_path(file),
+          ReadAt::Version { version: 0 },
+        );
+        (
+          file,
+          read
+            .map(|bytes| bytes == origin_file_bytes(file))
+            .map_err(|error| format!("{error:?}")),
+        )
+      })
+      .collect()
+  };
+  let answers = if placed {
+    timed_submits(&mut client, green, 1)
+  } else {
+    Vec::new()
+  };
+  // The submit is answered once version 1 places at the quorum; the other holder follows.
+  let _caught_up = placed && poll_until(&refs, ORIGIN_PLACE_WAIT, || held_at(1));
+  let holders_after: Vec<_> = daemons
+    .iter()
+    .skip(1)
+    .map(|daemon| daemon.merge_holder_state(green))
+    .collect();
+  let counters = merge_and_content_counters(&daemons);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  let longest: Vec<Duration> = (0..names.len())
+    .map(|node| {
+      probes
+        .iter()
+        .filter(|(probed, at, took)| {
+          *probed == node && *at >= began && *at + *took <= began + placing
+        })
+        .map(|(_, _, took)| *took)
+        .max()
+        .unwrap_or_default()
+    })
+    .collect();
+  let inside = probes
+    .iter()
+    .filter(|(_, at, took)| *at >= began && *at + *took <= began + placing)
+    .count();
+  eprintln!(
+    "green over {ORIGIN_FILES} files of {ORIGIN_FILE_BYTES} bytes: version 0 placed {placed} after {placing:?}; \
+     {inside} probes inside, the longest per node {longest:?}; holders {holders:?}, after a submit {holders_after:?}; \
+     counters {counters:?}"
+  );
+  assert!(
+    placed,
+    "version 0 placed at f + 1 within {ORIGIN_PLACE_WAIT:?}: {counters:?}"
+  );
+  for (holder, state) in holders.iter().enumerate() {
+    assert_eq!(
+      state.as_ref().ok().copied(),
+      Some(slates_server::merge_service::HolderMergeState {
+        version: Some(0),
+        refused: false,
+      }),
+      "holder {} holds the green's version 0",
+      holder + 1
+    );
+  }
+  assert!(
+    read_back.iter().all(|(_, read)| *read == Ok(true)),
+    "version 0 reads every sampled file's bytes: {read_back:?}"
+  );
+  assert!(
+    matches!(
+      answers.first(),
+      Some((
+        _,
+        _,
+        ReplyBody::Submitted {
+          version: Some(1),
+          ..
+        },
+        _
+      ))
+    ),
+    "a submit after version 0 is accepted as version 1: {answers:?}"
+  );
+  for (holder, state) in holders_after.iter().enumerate() {
+    assert_eq!(
+      state.as_ref().ok().copied(),
+      Some(slates_server::merge_service::HolderMergeState {
+        version: Some(1),
+        refused: false,
+      }),
+      "holder {} recomputed version 1 on its seeded replica",
+      holder + 1
+    );
+  }
+  let owner = &counters[0];
+  assert_eq!(
+    counted(owner, "merge.origin_inputs.made"),
+    1,
+    "the owner made version 0's inputs once: {owner:?}"
+  );
+  assert!(
+    counted(owner, "merge.origin_inputs.slices") > 1,
+    "the owner made version 0's inputs over more than one slice: {owner:?}"
+  );
+  assert!(
+    counted(owner, "merge.inputs.partial") > 0,
+    "the owner shipped version 0's inputs in parts: {owner:?}"
+  );
+  for (holder, holder_counters) in counters.iter().enumerate().skip(1) {
+    assert_eq!(
+      counted(holder_counters, "merge.replica.seeded"),
+      1,
+      "holder {holder} seeded its replica of version 0 once: {holder_counters:?}"
+    );
+    assert!(
+      counted(holder_counters, "merge.replica.seed_slices") > 1,
+      "holder {holder} seeded its replica over more than one slice: {holder_counters:?}"
+    );
+  }
+  for (node, held) in longest.iter().enumerate() {
+    assert!(
+      *held * 2 < placing,
+      "node {node} kept no probe waiting for half the placement or more ({held:?} of {placing:?})"
+    );
+  }
+}
+
 /// §4.10 content retention, §4.16 "Commit" (the bug record of 2026-11-07, retention decoded every merge record per put).
 /// A holder's retention rule asked, for each manifest it held, whether any position of the green's merge ledger named it,
 /// decoding every position each time: quadratic in the green's history, so a submit at `f = 1` slowed by about 40 µs a
@@ -15436,13 +17275,10 @@ fn a_successor_one_version_behind_fetches_the_versions_inputs_and_serves_the_gre
   }
   let counted = counted.expect("the successor's counters are read");
   let count_of = |name: &str| counted.get(name).copied().unwrap_or(0);
-  assert!(both_at_two, "both holders recomputed version 2");
-  assert!(unowned, "before the death neither holder owned the green");
-  assert!(other_at_three, "the other holder recomputed version 3");
-  assert_eq!(
+  expect_the_successor_one_version_behind(
+    (both_at_two, unowned),
+    other_at_three,
     successor_at_death.map(|state| state.version),
-    Ok(Some(2)),
-    "the successor was one version behind when the owner died"
   );
   assert_eq!(
     placed,
@@ -15476,6 +17312,25 @@ fn a_successor_one_version_behind_fetches_the_versions_inputs_and_serves_the_gre
       at_head: Ok(b"hello world!".to_vec()),
     },
     "the successor serves the head version, version 1 and the head's bytes"
+  );
+}
+
+/// What `a_successor_one_version_behind_fetches_the_versions_inputs_and_serves_the_green` expects of the moment its
+/// owner died: both holders had recomputed version 2 while neither owned the green (`both_at_two`, `unowned`), the other
+/// holder had recomputed version 3 (`other_at_three`), and the successor was one version behind, at 2
+/// (`successor_at_death`).
+fn expect_the_successor_one_version_behind(
+  (both_at_two, unowned): (bool, bool),
+  other_at_three: bool,
+  successor_at_death: Result<Option<u64>, ObserveError>,
+) {
+  assert!(both_at_two, "both holders recomputed version 2");
+  assert!(unowned, "before the death neither holder owned the green");
+  assert!(other_at_three, "the other holder recomputed version 3");
+  assert_eq!(
+    successor_at_death,
+    Ok(Some(2)),
+    "the successor was one version behind when the owner died"
   );
 }
 
@@ -20230,6 +22085,154 @@ fn a_versions_merge_record_waits_for_its_works_catalog_record() {
       conflicts: Vec::new(),
     })),
     "the submit was answered its version once its record committed"
+  );
+}
+
+/// A-298 (A-255 under A-247): a work on another shard than its green asks for its verdict only once its catalog record,
+/// its submit's route, is committed, so the version's merge record, which carries the completion, never exists before
+/// its route. The owner's own gate cannot see such a work's catalog, since the owner's partition holds no record of it.
+/// Do: three nodes at `f = 1`, two shards each; on a, a green whose version 0 is placed; both holders withhold every
+/// work's catalog record; on a, a work whose name puts it on the other shard, one edit and a submit, its answer not
+/// read; watch over four liveness budgets of the fleet's periods; then lift the fault, and send the submit again under
+/// its id if its wait outlasted the lease bound (answered `Overloaded`, unrecorded). Expect: version 1's record never
+/// placed while the work's catalog is withheld, the work's shard counting the wait (`merge.work.awaited_route`,
+/// non-vacuous), and, once lifted, the submit answered version 1, its record placed, and the green at version 1.
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn a_submit_off_its_greens_shard_waits_for_its_works_catalog_record_before_its_verdict() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh_with(
+    nodes,
+    &hosts,
+    &certs,
+    &serve,
+    1,
+    TWO_SHARDS,
+    &std::collections::BTreeMap::new(),
+    &std::collections::BTreeMap::new(),
+  );
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let fleet: Vec<&Daemon> = daemons.iter().collect();
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
+    name: "routed-green".to_owned(),
+    require_evidence: false,
+    base: None,
+  }) else {
+    panic!("create green");
+  };
+  let origin_placed = poll_until(&fleet, PLACEMENT_DEADLINE, || {
+    daemons[0].merge_record_placed(green, 0)
+  });
+  let withheld = slates_server::merge_service::MergeFault {
+    refuse_work_catalogs: true,
+    ..Default::default()
+  };
+  let faulted: Vec<_> = daemons[1..]
+    .iter()
+    .map(|holder| holder.inject_merge_fault(withheld))
+    .collect();
+  let name = (0u32..)
+    .map(|suffix| format!("routed-work-{suffix}"))
+    .find(|name| {
+      slates_server::verbs::owner_of_name(name, usize::from(TWO_SHARDS))
+        != slates_server::verbs::owner_of(green)
+    })
+    .unwrap();
+  let ReplyBody::WorkCreated { id: work, .. } =
+    client.call(&RequestBody::CreateWork { green, name })
+  else {
+    panic!("create work");
+  };
+  let edited = client.call(&RequestBody::Edit {
+    work,
+    path: "f".to_owned(),
+    at: 0,
+    delete_len: 0,
+    bytes: b"hello".to_vec(),
+  });
+  let submit = RequestBody::Submit {
+    work,
+    evidence: Vec::new(),
+  };
+  let mut submitter = common::client::connect(daemons[0].instance());
+  let word = submitter.begin(&submit).map(|id| id.word());
+  let placed_while_withheld =
+    poll_for_periods(&fleet, WORK_SEAL_WATCH, WORK_SEAL_WATCH_PERIODS, || {
+      daemons[0].merge_record_placed(green, 1)
+    });
+  let waits = daemons[0]
+    .refusals_on_every_shard()
+    .map(|counts| counts.get("merge.work.awaited_route").copied().unwrap_or(0));
+  let lifted: Vec<_> = daemons[1..]
+    .iter()
+    .map(|holder| holder.inject_merge_fault(slates_server::merge_service::MergeFault::default()))
+    .collect();
+  // A wait past the lease bound was answered `Overloaded`, unrecorded; the retry under its id meets the route again.
+  let answer = word
+    .as_ref()
+    .ok()
+    .and_then(|word| match answer_within(&mut submitter, *word) {
+      Some(Err(refusal)) if refusal.starts_with("Overloaded") => {
+        resent_answer(&mut submitter, *word, &submit)
+      }
+      other => other,
+    });
+  let placed_after = poll_until(&fleet, PLACEMENT_DEADLINE, || {
+    daemons[0].merge_record_placed(green, 1)
+  });
+  let head = client.call(&RequestBody::Versions { green });
+  drop(fleet);
+  drop(submitter);
+  drop(client);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    origin_placed,
+    "the green's version 0 was placed before the fault"
+  );
+  assert!(
+    faulted.iter().chain(&lifted).all(Result::is_ok),
+    "the holders' faults were installed and lifted: {faulted:?} {lifted:?}"
+  );
+  assert!(matches!(edited, ReplyBody::Edited), "the edit: {edited:?}");
+  assert!(word.is_ok(), "the submit was sent: {word:?}");
+  assert!(
+    !placed_while_withheld,
+    "version 1's merge record was not placed while its work's catalog record was withheld"
+  );
+  assert!(
+    waits.as_ref().is_ok_and(|waits| *waits > 0),
+    "the work's shard held the submit for its route: {waits:?}"
+  );
+  assert_eq!(
+    answer,
+    Some(Ok(ReplyBody::Submitted {
+      version: Some(1),
+      conflicts: Vec::new(),
+    })),
+    "the submit was answered its version once its route and its record committed"
+  );
+  assert!(
+    placed_after,
+    "version 1's record was placed once the work's catalog could commit"
+  );
+  assert_eq!(
+    head,
+    ReplyBody::Versions { head: 1 },
+    "the green holds the one version"
   );
 }
 

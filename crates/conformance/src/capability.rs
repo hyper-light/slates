@@ -139,10 +139,12 @@ const OCI_OWED: &str = "the container form exists — `attach` returns a verifie
 pub const LINUX_NFS_ADAPTER: Adapter = Adapter {
   name: "a root `mount -t nfs` by the Linux NFS client of the unprivileged daemon's NFSv3 loopback \
     export (the same serving code as macOS)",
-  not_covered: "the daemon's own FUSE mount (`slates mount` on Linux, crates/server/src/fuse.rs): this lane \
-    mounts through the NFS adapter for this suite; the workload roster runs over the FUSE mount itself (A-293), \
-    and the other suites over it run in the Linux container lane (`oci-linux`, `slates mount --shared` with \
-    `user_allow_other`)",
+  not_covered: concat!(
+    "the daemon's own FUSE mount (`slates mount` on Linux, crates/server/src/fuse.rs): this lane ",
+    "mounts through the NFS adapter for this suite; the workload roster runs over the FUSE mount itself (A-293), ",
+    "and the other suites over it run in the Linux container lane (`oci-linux`, `slates mount --shared` with ",
+    "`user_allow_other`)",
+  ),
 };
 
 /// Tools every mounted macOS suite needs.
@@ -374,13 +376,7 @@ mod tests {
       Suite::Workloads,
       Suite::Hermeticity,
     ] {
-      match availability(Transport::NativeMacosNfs, suite) {
-        Availability::Runnable { on, adapter, .. } => {
-          assert_eq!(on, HostOs::Macos);
-          assert!(adapter.is_none());
-        }
-        other => panic!("{suite:?} on macOS: {other:?}"),
-      }
+      expect_runnable_on_macos_with_no_adapter(suite);
       match (suite, availability(Transport::NativeLinuxFuse, suite)) {
         (
           Suite::Workloads,
@@ -401,6 +397,17 @@ mod tests {
         }
         (_, other) => panic!("{suite:?} on Linux: {other:?}"),
       }
+    }
+  }
+
+  /// The macOS half of `native_lanes_run_on_their_own_os`: expect `suite` runnable on macOS with no adapter.
+  fn expect_runnable_on_macos_with_no_adapter(suite: Suite) {
+    match availability(Transport::NativeMacosNfs, suite) {
+      Availability::Runnable { on, adapter, .. } => {
+        assert_eq!(on, HostOs::Macos);
+        assert!(adapter.is_none());
+      }
+      other => panic!("{suite:?} on macOS: {other:?}"),
     }
   }
 

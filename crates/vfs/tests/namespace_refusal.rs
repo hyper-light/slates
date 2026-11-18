@@ -25,7 +25,7 @@ use slates_mem::region::Region;
 use slates_vfs::dir::{Child, DirNode};
 use slates_vfs::error::VfsError;
 use slates_vfs::ids::SnapshotId;
-use slates_vfs::inode::Kind;
+use slates_vfs::inode::{Kind, SpecialNode};
 use slates_vfs::volume::{Store, StoreConfig, Volume};
 use slates_vfs::xattr::XattrSet;
 
@@ -210,7 +210,9 @@ fn run(verb: Verb, vol: &mut Volume, store: &mut Store) -> Result<(), VfsError> 
     }
     Verb::Mknod => {
       let a = vol.resolve(store, "/a").unwrap().inode;
-      vol.mknod_no(store, a, "pipe", 0o644, Kind::Fifo).map(drop)
+      vol
+        .mknod_no(store, a, "pipe", 0o644, SpecialNode::Fifo)
+        .map(drop)
     }
     Verb::Mkdir => vol.mkdir(store, root, "newdir", 0o755).map(drop),
     Verb::Symlink => vol.symlink(store, root, "newlink", "/a/f").map(drop),
@@ -617,7 +619,7 @@ fn run_base(verb: BaseVerb, o: &mut Overlay<'_>, store: &mut Store) -> Result<()
     BaseVerb::Create => o.create_file(store, d0, "new", 0o644).map(drop),
     BaseVerb::Mknod => {
       let d1_no = o.resolve(store, "/d1")?.inode;
-      o.mknod_no(store, d1_no, "pipe", 0o644, Kind::Fifo)
+      o.mknod_no(store, d1_no, "pipe", 0o644, SpecialNode::Fifo)
         .map(drop)
     }
     BaseVerb::Mkdir => o.mkdir(store, d0, "sub", 0o755).map(drop),

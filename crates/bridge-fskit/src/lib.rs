@@ -1030,7 +1030,10 @@ fn kind_tag(kind: Kind) -> Result<u8, VfsError> {
     Kind::File => KIND_FILE,
     Kind::Dir => KIND_DIR,
     Kind::Symlink => KIND_SYMLINK,
-    Kind::Fifo | Kind::Socket => return Err(VfsError::SpecialFileOperation),
+    // A name with no content (A-26, A-294) has no FSKit item kind here: refused as unsupported, never shown as a file.
+    Kind::Fifo | Kind::Socket | Kind::BlockDevice | Kind::CharDevice => {
+      return Err(VfsError::SpecialFileOperation);
+    }
   })
 }
 

@@ -2102,7 +2102,8 @@ pub enum WorkOp {
     /// The attribute name.
     name: String,
   },
-  /// Create an IPC namespace inode with explicit metadata and no endpoint state.
+  /// Create a namespace inode with no content, with explicit metadata and no endpoint state: a FIFO or socket name
+  /// (A-26), or a device node and its number (A-294).
   Mknod {
     /// The new path.
     path: String,
@@ -2111,20 +2112,35 @@ pub enum WorkOp {
   },
 }
 
-/// A-26: a declared IPC kind. Device nodes have no wire representation here.
+/// A declared kind of name with no content: a FIFO or socket name (A-26), or a device node with its number, metadata
+/// nothing opens as a device (A-294). The device kinds are appended, so the two earlier tags are unchanged.
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IpcNodeKind {
   /// A named pipe without queued bytes.
   Fifo,
   /// A socket name without a listener or connection.
   Socket,
+  /// A block device node (A-294).
+  BlockDevice {
+    /// The major number.
+    major: u32,
+    /// The minor number.
+    minor: u32,
+  },
+  /// A character device node (A-294); a whiteout is one numbered 0/0.
+  CharDevice {
+    /// The major number.
+    major: u32,
+    /// The minor number.
+    minor: u32,
+  },
 }
 
-/// Metadata supplied by a work's declared IPC creation (§4.16, A-26). These are volume
-/// metadata, not host credentials or endpoint authority. Replay never reads a local clock.
+/// Metadata supplied by a work's declared creation of a name with no content (§4.16, A-26, A-294). These are volume
+/// metadata, not host credentials, endpoint authority or device access. Replay never reads a local clock.
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IpcNode {
-  /// The IPC kind.
+  /// The kind, with a device node's number.
   pub kind: IpcNodeKind,
   /// Permission bits.
   pub mode: u32,
@@ -2198,6 +2214,59 @@ pub struct StatusReport {
   /// daemon issued after its last publication, which no image counted, so such a file is kept, charged to the volume's
   /// quota, until that mount ends. Zero outside a takeover. Appended.
   pub takeover_kept: u32,
+  /// An overlay's base as this status read it, typed (§4.15 "Drift"; A-299): the facts `drifted` and `watcher` carry as
+  /// text for people, for a consumer to match. `None` for a volume with no base folder (a scratch volume, a clone of
+  /// one, a green, a work volume). Appended.
+  pub base: Option<BaseReport>,
+}
+
+/// An overlay's base as a status read it (§4.15 "Drift"; A-299). Append-only.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum BaseReport {
+  /// The base was read.
+  Read {
+    /// Each entry the disk changed after the volume witnessed it: landing it would conflict.
+    drifted: Vec<DriftEntry>,
+    /// Each entry whose re-check the host refused now, by path: not known to match its witness.
+    unverified: Vec<String>,
+    /// The base's watcher.
+    watcher: WatcherState,
+  },
+  /// The base could not be read now: its drift is unknown.
+  Unreadable,
+}
+
+/// One drifted entry of an overlay (§4.15 "Drift").
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct DriftEntry {
+  /// The entry, from the volume's root.
+  pub path: String,
+  /// What the disk did to it.
+  pub kind: DriftKind,
+}
+
+/// What changed on the disk beneath a witnessed entry (§4.15 "Drift"). Append-only.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DriftKind {
+  /// The same file, with other bytes or attributes.
+  Modified,
+  /// The entry is gone.
+  Deleted,
+  /// Another file sits at the path.
+  Replaced,
+  /// A file became a directory, or the reverse.
+  TypeChanged,
+}
+
+/// An overlay's watcher (§4.15): hints that make drift reports prompt, never the truth. Append-only.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WatcherState {
+  /// Delivering hints.
+  Live,
+  /// It lost events; a full re-check is done or scheduled.
+  Overflowed,
+  /// None on this host or folder: fingerprints alone.
+  Unavailable,
 }
 
 /// A volume's journal as its consuming rounds measured it (§4.5 "Journal"). The budget's formula is the mutation rate

@@ -671,6 +671,8 @@ pub struct ShardState {
   /// Verbs serving an object's latest state parked until its owner lease confirms (`crate::lease_wait`; §4.8
   /// "Leases and reads"), bounded by the shard's client credit.
   pub(crate) lease_waiters: crate::lease_wait::LeaseWaiters,
+  /// A shard's parked work verbs and the answer for the one now running (A-247; `crate::work_home`).
+  pub(crate) work_home: crate::work_home::WorkHome,
   /// The `ring.request` spans of requests this shard forwarded to another shard, or scattered, by request
   /// word (§4.14): opened at the slot read, ended when the reply comes back through `deliver` and is
   /// written, so a forwarded reply's ring span is timed from read to reply like a local one. Bounded by
@@ -843,6 +845,11 @@ pub struct ShardState {
   /// client's reply deadline while each step stays inside its own bound. `None` in production
   /// (`Daemon::inject_serve_delay`).
   pub injected_serve_delay_ns: Option<u64>,
+  /// Test support (never reachable from the wire): how long this node, as a content holder, holds each acknowledgement
+  /// of a placement before it leaves, after the hold already took the content, so the owner's round stops collecting at
+  /// its hedge delay first and folds the acknowledgement as a straggler's. A missing set or a refusal goes at once.
+  /// `None` in production (`Daemon::inject_content_ack_delay`).
+  pub injected_content_ack_delay_ns: Option<u64>,
   /// Test support (never reachable from the wire): a volume whose forwarded verbs this node leaves unanswered while
   /// set, the session carrying its other replies as before, as an owner alive but never answering one exchange is to
   /// its asker (`Daemon::inject_forward_silence`). `None` in production.
@@ -1044,6 +1051,10 @@ pub struct WorkState {
   /// The bytes this work is charged against the shard's budget: its content's and journal's footprint
   /// (`crate::work_charge`), released when it shrinks, resets or is destroyed.
   pub charged: u64,
+  /// The base entries of the paths the work fetched (A-247), each as `Green::path_base` gave it at the work's base
+  /// version, so the work composes its increment off its green's shard (`Base::for_names`). Cleared with the base;
+  /// charged with the work.
+  pub entries: std::collections::BTreeMap<String, slates_merge::increment::Base>,
 }
 
 /// A reply waiting to be written into a client's ring.
