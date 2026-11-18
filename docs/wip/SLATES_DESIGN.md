@@ -8062,6 +8062,11 @@ holder duty is balanced by neighbourhood changes; operators keep an explicit mov
 > moves between three daemons.
 > Owed: the automatic migration by the origin of the last N writes (AC-8.16's other half: N is to be derived from a
 > measured migration against the measured cross-host write), and a move carrying snapshots other than the head.
+> A consumer drives the explicit move through the library alone (A-450): kiln moves an agent between its runners with
+> its workspace volume by `Instance::move_volume` to the target's member id (its runner says the member its daemon
+> serves as at every start, `Instance::member`), following `MoveProgress` until `Moved` with no clock of its own (the
+> move ends itself: `Moved`, or `MoveUnplaced` once it thaws), every refusal reported by its kind and the agent left where
+> it was; the target mounts the moved volume once its new owner serves it (its `Retry` pauses waited out).
 
 **Green volumes in a fleet (D-27).** A green volume's owner runs its merge task; an increment's
 post-state is a sealed snapshot of the work volume, placed to the work volume's candidates by
@@ -8430,6 +8435,31 @@ the format floor.
 > overlay's base is refused `Unsupported` (capture the base first); a merge volume's too. Owed: the volume made from an
 > archive (the next piece, through `slates_archive::Planning` as a takeover restores); a streamed encoder, since the
 > archive is held whole while it is encoded, one unit of its size, then written into the file a chunk a unit.
+
+> **Status (2026-11-18, A-453: a volume made from an archive through the library).** `ArchiveImport`
+> (`Instance::import_archive`, contract 40) is the export's way back. A consumer writes the archive bytes it kept into
+> the root of a volume of its own as `ARCHIVE_FILE` (or names the volume an export made), and the daemon makes a new
+> volume holding the archive's tree. The verb checks the archive volume, `read` on it and the name at once, then a task
+> of that volume's owner shard does the rest a slice a turn, never in one long turn:
+> - the file's length is admitted before a byte is read: no longer than the archive volume's class cap (every byte a
+>   writer put there was charged to it, so only a file with holes is longer: refused `Malformed`), and no longer than
+>   the shard's room, since the file is held whole while it is decoded (refused `BudgetExceeded`);
+> - the file is read a copy slice a unit, then decoded and verified a piece a unit (`slates_archive::Decoding`: the
+>   header's fixed fields at once, the whole-archive BLAKE3 at most an archive slice of bytes a piece before anything
+>   past the header is decoded, then a chunk record a piece, then the manifest);
+> - the new volume is admitted as a create admits one, under the archive's own name policy;
+> - its tree is planned and restored (`Planning`, `Restoring`), admitted against the size the import asks and the
+>   shard's room by the rule a takeover's restore follows (`verbs::restore_budget`), and laid into the volume by the
+>   takeover's own `verbs::Populating`, every entry's mode, owner, times and attributes with it;
+> - the volume and the request's completion commit as one atom, as an export's do.
+>
+> Bytes that are no whole archive are refused `ArchiveRefused { fault }` by kind, with nothing made: `ForeignMagic`,
+> `Unsupported` (a newer major, flag or name policy), `Truncated`, `Corrupt` (the checksum or an identity fails),
+> `Malformed` (whole and matching its checksum, but breaking the format's rules). A tree past the asked size or the
+> room is refused `BudgetExceeded`, a held name `AlreadyExists`. Owners and set-id bits come back as the archive holds
+> them, as a takeover's restore brings them back; a host mount the daemon makes honours no set-id bit and opens no
+> device node (`nosuid,nodev`, A-94). Owed: a streamed decoder, since the file is held whole while it is decoded, as
+> the export's encoding is; and the manifest's decode and identity in pieces (one piece today: the whole tree's).
 
 ### 4.12 Agent surfaces (D-19)
 
@@ -9245,7 +9275,7 @@ for replay; trace/span identity connects work across bridges, rings, shards and 
 `caused_by` connects causal events. Consumer and volume are authenticated tags, not substitutes
 for trace context. Status exposes these definitions consistently through CLI/MCP.
 
-*Health signal catalog.* Every signal is `(value, freshness_ns)` and host-observed where a host can observe it: `daemon.alive` (the anchor's view: the child is running and answered its last heartbeat), `daemon.restarts` (the anchor's count), `segment.generation` (the anchor segment's generation word), `shard.loop_lag_ns{shard}` (the driver's measured lateness), `shard.tasks{shard}` (live tasks against the arena), `ring.depth{client}` (command slots pending), `client.parked{client}`, `memory.locked_bytes` and `memory.unlocked_bytes` (per shard and rolled up), `memory.pressure` (PSI slope, macOS level, Windows notification), `catalog.volumes{shard}`, `log.bytes{partition}` and `log.replay_ns` (the last replay's duration against the recovery budget), `lease.expiring` (leases within one term of expiry), `base.watcher{volume}` (live, overflowed, unavailable), `land.active` (landings in flight), `placed.pending` (records awaiting f+1), `mirror_age{volume}`, `config.version`, and the NFS service times a shard measured since boot, `nfs.local_p50_ns`, `nfs.local_p99_ns`, `nfs.local_off_cpu_p99_ns` and `nfs.forwarded_p99_ns` (so a slow client is split into the serve, the scheduler's share of it, and the cross-shard forward).
+*Health signal catalog.* Every signal is `(value, freshness_ns)` and host-observed where a host can observe it: `daemon.alive` (the anchor's view: the child is running and answered its last heartbeat), `daemon.restarts` (the anchor's count), `segment.generation` (the anchor segment's generation word), `shard.loop_lag_ns{shard}` (the driver's measured lateness), `shard.watch_window_ns{shard}` (the window the watchdog judges the shard by: the liveness window raised to the shard's measured scheduler overrun, at most the observation budget, A-455), `shard.tasks{shard}` (live tasks against the arena), `ring.depth{client}` (command slots pending), `client.parked{client}`, `memory.locked_bytes` and `memory.unlocked_bytes` (per shard and rolled up), `memory.pressure` (PSI slope, macOS level, Windows notification), `catalog.volumes{shard}`, `log.bytes{partition}` and `log.replay_ns` (the last replay's duration against the recovery budget), `lease.expiring` (leases within one term of expiry), `base.watcher{volume}` (live, overflowed, unavailable), `land.active` (landings in flight), `placed.pending` (records awaiting f+1), `mirror_age{volume}`, `config.version`, and the NFS service times a shard measured since boot, `nfs.local_p50_ns`, `nfs.local_p99_ns`, `nfs.local_off_cpu_p99_ns` and `nfs.forwarded_p99_ns` (so a slow client is split into the serve, the scheduler's share of it, and the cross-shard forward).
 
 *Metric names.* One namespace, dotted, unit-suffixed, labels in braces; counters end in `_total`, histograms in `_ns` or `_bytes`. Per host: `slates.requests_total{kind,outcome}`, `slates.refusals_total{kind}`, `slates.provision_ns` (the AC-2.1 histogram: p50, p99, p999, max, spinning and parked), `slates.ring_wait_ns{client}`, `slates.wake_ns`, `slates.spin_to_park_ratio`. Per shard: `slates.shard.step_ns`, `slates.shard.batch`, `slates.shard.parks_total`, `slates.shard.kicks_total`, `slates.shard.arena_exhausted_total`. Per volume (readable through `status`): `referenced_bytes`, `unique_bytes`, `locked_bytes`, `unlocked_bytes`, `hashing_backlog_bytes`, `dedup_hit_ratio`, `compression_ratio`, `lease_epoch`, `attachments`, `base_cache_hit_ratio`, `drifted_entries`, `watcher_state`; per green: `head_version`, `merges_per_s`, `verdict_p99_ns`, `merge_path_p99_ns`, `conflict_rate{source}`, `rebase_retry_rate`, `base_lag_p99_ns`, `stale_epoch_refusals_total`, `holder_mismatch_total`. Per landing (in the report and the audit log): `entries{outcome}`, `bytes_written`, `dir_sync_ns`, `window_ns_max`, `barriers`. The machine profile and every derived constant are exported as `slates.derived{name}` with their inputs.
 
@@ -9422,6 +9452,23 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > observation's and a cross-shard call's wait (`observe::ShardTime`) take the same excuse next; a shard asleep on a
 > lock whose holder pages is still judged wedged on Linux (the holder is not named, GAPS); Windows' per-thread wait
 > reason is not read.
+
+> **Status (2026-11-18, A-455): each shard is judged by its own window, which follows the host.** The watchdog judges
+> a shard at each look against its window (`watchdog::watch_window_ns`): the liveness window `W` (A-359), raised to the
+> scheduler overrun the shard measured where that is longer, never past the daemon's observation budget
+> (`watchdog::WINDOW_CEILING_NS`). The overrun is how late the shard's steps ran after the waits before them, a maximum
+> that forgets an eighth at each later wait (`slates_rt`'s `scheduler_overrun_ns`, mirrored in the shard's registry
+> pulse). A host that keeps a shard off its CPU that long leaves it no way to show progress sooner, so A-359's floor,
+> checked once at boot, is now held at every look; a quiet host's shards (an overrun of a tick or less) keep `W`. The
+> spin window is the shard's window held to the build (A-318), so both judgments follow it. The ceiling keeps the
+> watchdog from going blind: a wedged shard never waits again, so a spike measured just before its wedge (a process
+> stopped whole and continued) would stay its window for good, and past the observation budget the daemon's own
+> question to the shard already ends as a wedge's. Every verdict's line names the window it was judged by, and the
+> status carries each shard's as `shard.watch_window_ns`. Regressions:
+> `a_shards_window_follows_its_measured_overrun_past_the_liveness_window_and_stops_at_its_ceiling` and
+> `a_shards_status_names_the_window_its_watchdog_judges_it_by` (`crates/server/src/watchdog.rs`). Not yet: the
+> anchor's start and lapse judgment, the daemon's other supervision waits and a laptop's failover detection term still
+> read `W` itself (GAPS).
 
 > **Telemetry oracle correction (2026-09-20, AC-0.11).** A drain request itself emits spans.
 > The daemon integration oracle now derives convergence from the reply quota minus the
@@ -9916,17 +9963,21 @@ stays in the overlay.
 > from its drive's root one component at a time, refusing a link, a junction or a mount point; a target on one of this
 > daemon's own WinFsp drives is refused before any open (A-227); and it must be owned by this user. A file's mode sets
 > or clears its `READONLY` bit alone (A-262: a file's read-only state is its mode), every other attribute bit kept.
-> Not built: the volume's other Windows attribute bits, which a landing carries and does not yet apply (A-262's landing
-> half). Built on 2026-10-26 by another session and landed on 2026-11-18; the evidence is A-185's. **Since A-438 (the same
+> Built on 2026-10-26 by another session and landed on 2026-11-18; the evidence is A-185's. **Since A-438 (the same
 > day)** a symbolic link lands as the Windows one, in A-275's form (`slates_vfs::host::windows_link`, the drive's own),
 > made handle-relative at the landing's hidden name and moved into place without replacing, its buffer set with
 > `SeCreateSymbolicLinkPrivilege` enabled for its thread alone where the process holds it; where NTFS refuses the set (a
-> standard account outside Developer Mode) the entry fails `EPERM`, typed, as every link did before. A link lands as a
-> file link: the seam carries no link's type. **Since A-445 (the same day)** step 6's reflink is built: a file whose
-> bytes its batch already staged (the same BLAKE3 and length) is cloned from that temporary where the target's volume
-> shares clusters (`LandFs::clone_temp`; on Windows ReFS and a Dev Drive, `FSCTL_DUPLICATE_EXTENTS_TO_FILE` in
-> whole-cluster regions below 4 GiB from the volume's own cluster), its count in the report (`cloned`); NTFS shares
-> nothing, so nothing changes there.
+> standard account outside Developer Mode) the entry fails `EPERM`, typed, as every link did before. **Since A-445 (the
+> same day)** step 6's reflink is built: a file whose bytes its batch already staged (the same BLAKE3 and length) is
+> cloned from that temporary where the target's volume shares clusters (`LandFs::clone_temp`; on Windows ReFS and a Dev
+> Drive, `FSCTL_DUPLICATE_EXTENTS_TO_FILE` in whole-cluster regions below 4 GiB from the volume's own cluster), its
+> count in the report (`cloned`); NTFS shares nothing, so nothing changes there. **Since A-451 (the same day)** a landing
+> carries the volume's other Windows attribute bits (A-262's landing half): each manifest entry holds the bits the volume
+> keeps for what it writes, so the grant binds them, and the Windows writer gives each file, directory and link it makes
+> those bits (`LandFs::set_windows`, the `mkdir` and `symlink` verbs; `crates/land/src/windows_bits.rs`), reads the word
+> back and refuses the entry `EOPNOTSUPP` where the target's file system did not take a bit (FAT drops `OFFLINE` and
+> `NOT_CONTENT_INDEXED` without a word). A directory link (A-275's `LINK_DIRECTORY`) lands as a directory link, its
+> object made a directory. Linux and macOS hold none of the bits and apply none.
 
 > **Status (2026-09-29, A-47, AUD-29-03).** One host target has one landing lease, whichever shard owns
 > the landing volume and whichever spelling names the target. Before, each owner shard kept its own lease
@@ -19612,7 +19663,7 @@ overwrite, `SetBasicInfo`, `CanDelete` and rename in `host.rs`).
   npm, pip and cargo trees, before and after). The image's inode gains two bytes (layout version 23, the delta's 6), with
   a reviewed golden vector (`an_inode_images_encoding_is_its_golden_vector`). WinFsp's wire already carries the word.
 - **What other platforms do with them.** NFS, FUSE and FSKit expose none and set none. A Linux or macOS landing carries
-  them in the volume and applies none (not yet built on any platform; below). An overlay reports none of them for a
+  them in the volume and applies none; a Windows landing applies them since A-451 (below). An overlay reports none of them for a
   file whose disk attributes it never read: no bit, so `NORMAL`, or `READONLY` from the mode. Since stage 3's base half
   an overlay of a Windows directory reads them from its disk; an overlay of a Linux or macOS directory has none to read.
 - **Each stage's state.**
@@ -19630,10 +19681,11 @@ overwrite, `SetBasicInfo`, `CanDelete` and rename in `host.rs`).
     It also fixes what stage 1 would have exposed: the Windows base had reported the attribute word itself as the mode, so
     an ordinary file (`ARCHIVE`, `0x20`) read as `0o040`, which the drive would have reported read-only and refused to
     delete (`docs/bugs/2026-11-08-a-windows-base-files-mode-was-its-attribute-word.md`).
-  - **Stage 3's landing half, owed:** a Windows landing applying the bits (`SetFileAttributesW`). The Windows landing
-    writer exists since A-185 (2026-11-18): it sets a file's `READONLY` from its mode and keeps every other bit the file
-    holds (NTFS's `ARCHIVE` on a file it writes), and applies none of the volume's. Linux and macOS landings carry the
-    bits in the volume and apply none.
+  - **Stage 3's landing half, built 2026-11-18 (A-451):** a Windows landing gives each file, directory and link it
+    makes the bits the volume keeps for it, a file's `READONLY` still its mode's, reads the word back and refuses the
+    entry `EOPNOTSUPP` where a bit did not take; a directory link lands as a directory link. The manifest carries the
+    bits, so a grant binds them. Linux and macOS landings carry the bits in the volume and apply none. A change of an
+    untouched base file's bits alone lands nothing, as a change of its mode alone lands nothing (GAPS).
   - **Stage 2, owed when works are mountable:** the merge's metadata dimension, the bits merged as the mode is, accept,
     identical or conflict, never inferred (D-27). No work can set the bits today (below), so no merge can drop them.
 - **Invisible to the merge and the landing until then (checked 2026-11-08).** A work's increment is composed from the
@@ -19642,9 +19694,10 @@ overwrite, `SetBasicInfo`, `CanDelete` and rename in `host.rs`).
   from its volume's journal, and the volume's ops document carries none of them
   (`windows_attribute_bits_are_invisible_to_the_ops_document_until_the_merge_carries_them`, `crates/vfs/tests/derive.rs`:
   a bits-only work derives the unchanged document byte for byte, and a rewrite derives the same with or without them).
-  A landing ignores them without error (`a_landing_ignores_windows_attribute_bits_without_error`,
-  `crates/land/tests/oracle.rs`: §4.15's worked example with the bits on an edited, a created and an untouched base file
-  lands `Done` and leaves the same disk, writing as many entries as without).
+  A landing ignored them without error until A-451 carried them
+  (`a_landing_carries_windows_attribute_bits_and_writes_the_same_bytes`, `crates/land/tests/oracle.rs`: §4.15's worked
+  example with the bits on an edited, a created and an untouched base file lands `Done` and leaves the same bytes,
+  writing as many entries as without, the edited and created files holding the bits).
 - **Proven** by `windows_attributes_survive_an_image_and_a_rebuild` and the golden vector (`crates/vfs/tests/recover.rs`),
   `setattr_keeps_the_windows_attribute_bits_for_each_kind` (`crates/bridge-core/tests/volume_bridge.rs`; red with the
   bridge's setter removed: the file reported 32 where 6 was set), `windows_attribute_bits_ask_for_the_owner`, the
@@ -30791,7 +30844,7 @@ argument), and `unsafe-budget.toml` (`slates-land` 23 → 29).
   Windows-absolute one under `\??\`, a POSIX-absolute one unchanged (it resolves to nothing, as on the drive). A link
   lands as a file link, as A-275 presents a link POSIX made: the seam carries no link's type, so a directory link
   Windows made in the volume (`LINK_DIRECTORY`) lands as a file link until the volume's other attribute bits reach a
-  landing (A-185's owed list).
+  landing (A-185's owed list; since A-451 they do, and it lands as a directory link).
 - **The writer.** The empty object is made at the landing's own hidden name (`NtCreateFile` with `FILE_CREATE` and
   `FILE_OPEN_REPARSE_POINT`, relative to the parent's handle). Its buffer is set, then it is moved to its name with the
   rename that never replaces, so the name never holds half a link. Whatever refuses a step, the object is removed;
@@ -31188,10 +31241,10 @@ Windows item); `docs/wip/shards/dax-protocol.md` ("Windows", after a daemon's de
   duplicated into the holder again, so the guest's maps stay right: the holder's value of the fresh stream is a known
   holder's, which a DAX ask names for the claim check (A-180). A file whose section the anchor did not hand back is
   asked for again at its next answer (`hold_asked`), never taken for held; a section no kept stream claims is released.
-- **Not in the `Resync`.** The sections are offered again at the device's asks, as on Unix, and not named in the
-  `Resync`: A-418's 40-byte wire is what Shards' device half is built to, the device asks for a section at every
-  `FUSE_SETUPMAPPING` (`dax-protocol.md`, (a)), and a section duplicated into the VMM unasked would be a handle no one
-  closes in its process.
+- **Not in the `Resync`** (main's decision, 2026-11-18). The sections are offered again at the device's asks, as on
+  Unix, and not named in the `Resync`: A-418's 40-byte wire is what Shards' device half is built to, the device asks for
+  a section at every `FUSE_SETUPMAPPING` (`dax-protocol.md`, (a)), and a section duplicated into the VMM unasked would be
+  a handle no one closes in its process.
 - **Evidence.** Red first, on main at `0576faacf` with the tests alone, on a Mac Studio (2026-11-18): `slates-anchor`'s
   lib tests did not build (13 errors: no `HoldBounds`, `WHAT_SHARDS_DAX`, `SHARDS_DAX_HANDLES`), nor `slates-server`'s
   (9 errors: no `marked`, `hold_asked`). Green on the tree as merged with main, the same day and machine:
@@ -31208,6 +31261,275 @@ Windows item); `docs/wip/shards/dax-protocol.md` ("Windows", after a daemon's de
   through the fresh stream) on CI's Windows runners, filed for main; Shards' device half (its coordinator's condition
   4c). Found beside it (GAPS): the Windows handoff names every held entry in one environment variable, whose length
   Windows bounds, and the anchor's bounds were never set against it.
+
+### A-453 — A volume made from an archive through the library (2026-11-18, goal g268; Mantle's CP-T10.4, "Slates snapshots on Mantle"; §4.11 "Archive", D-17; §4.9 hostile input; §4.12 the consumer contract, A-299; A-441, A-391)
+Applied in the same change to: `crates/archive` (`Decoding`, the decode a bounded piece at a time, `Archive::decode`
+now its pieces run to their end; the tests `an_archive_decoded_in_pieces_is_the_archive_decoded_whole` and
+`a_cut_or_flipped_archive_decoded_in_pieces_is_refused_as_whole`); `crates/vfs/src/export.rs`
+(`name_equivalence_of_id`, its test `an_archives_name_policy_names_its_volumes_back`); `crates/ipc`
+(`RequestBody::ArchiveImport`, `ReplyBody::ArchiveImported`, `Refusal::ArchiveRefused`, `ArchiveFault`, appended and
+published in `tests/wire_order.txt`); `crates/server/src/image.rs` (`import_verb`, `ImportJob`, `run_import`,
+`import_steps`), `verbs.rs` (its dispatch, its new volume's name, its durability claim as a creation's, its refusal's
+label, `restore_budget` shared with a takeover's restore) and `merge_service.rs` (`StoreVerb::ArchiveRead`);
+`crates/client` (`Client::archive_import`, `ArchiveImported`, `ArchiveFault`); `crates/api`
+(`Instance::import_archive`, `Invalid::Archive`, `ArchiveImported` and `ArchiveFault` re-exported, `CONTRACT` 40, the
+tests `a_volume_imported_from_an_exported_archive_holds_the_exported_tree` and
+`a_hostile_archive_is_refused_by_kind_with_nothing_made`); §4.11's status; GAPS (2026-11-18).
+
+- **Why.** A-441 let a consumer take a snapshot out as its archive and keep it where it keeps bytes (Mantle, kiln's
+  object store, CP-T10.4). Nothing brought one back: no verb made a volume from an archive a consumer held.
+- **The shape.** The way in mirrors the way out. The consumer writes the bytes it kept into the root of a volume of its
+  own as `ARCHIVE_FILE` (or names the volume an export made) and names that volume, a new volume's name and its size;
+  every path a consumer already has carries the bytes in (the file channel's staged write), and the archive volume's
+  own size policy bounds them. The new volume takes the archive's name policy, so names that differ only by case stay
+  apart where they were apart.
+- **Running.** A task of the archive volume's owner shard, a slice a turn under the slice budget, never in one long
+  turn (A-374's rule for a takeover's restore). The file's length is admitted first, then the file is read a copy slice
+  a unit and decoded a piece a unit (`Decoding`). The volume is admitted as a create admits one, the tree is planned and
+  restored a piece a unit (`Planning`, `Restoring`), and it is laid into the volume a piece a unit by the takeover's
+  `verbs::Populating`. The volume and the request's completion commit as one atom, and the import's leftovers (the
+  archive, the restored tree) are freed in slices after the reply. A refusal at any step discards the volume and gives
+  its room back.
+- **Hostile input (§4.9).** The length is checked against two caps before a byte is read. It must be no longer than
+  the archive volume's class cap: every byte a writer put there was charged to that volume, so only a file with holes
+  is longer, and no writer of an archive makes one. And it must be no longer than the shard's room, since the file is
+  held whole while it is decoded. The buffer is reserved fallibly and never zeroed whole. The header's fixed fields are
+  checked first (magic, major, flags, the declared chunk maximum against the format's cap). Then the whole-archive
+  BLAKE3 is checked, a slice a piece, before anything past the header is decoded. Each chunk record's declared sizes
+  are admitted before its payload is copied. The restore admits the tree's need before it allocates, against the size
+  the import asks and the shard's room, by the rule a takeover's restore follows (`verbs::restore_budget`).
+- **Refusals.** `ArchiveRefused { fault }` names the class of the reader's refusal a caller acts on alike, every
+  reader refusal classed by name in `image::refusal_of_import`:
+  - `ForeignMagic`: another format's file.
+  - `Unsupported`: a newer major, a required flag, or a name policy this daemon does not hold.
+  - `Truncated`: the stream ends before its frame, or its trailer magic is missing.
+  - `Corrupt`: the checksum, a chunk's identity or the manifest's identity fails.
+  - `Malformed`: whole and matching its checksum, but breaking the format's rules (a declared length past its cap, a
+    chunk out of canonical form, a total, extent, name or path that does not hold, a tree that does not lay).
+
+  A tree past the asked size or the room is `BudgetExceeded` (`Exhausted::Memory` in the contract), a held name
+  `AlreadyExists`, a missing archive volume or file `NotFound` (`Missing::Entry`), a merge volume `Unsupported`.
+  Nothing is made and the name stays free in every case.
+- **Rights.** `read` on the archive volume: the import only reads it. The new volume is the caller's own. Owners and
+  set-id bits come back as the archive holds them, as a takeover's restore brings them back. A host mount the daemon
+  makes honours no set-id bit and opens no device node (`nosuid,nodev`, A-94).
+- **Owed.** A streamed decoder: the file is held whole while it is decoded, and the decoded archive beside it until the
+  restore ends, so an import near the shard's room holds its tree about twice for that time (the export's encoder owes
+  the same). The manifest's decode and Merkle identity are one piece, a walk of the whole tree, as a takeover's restore
+  once was. Symlinks are not in the library test, which writes through the file channel and has no symlink verb; the
+  takeover's restore tests lay them through the same `Populating`.
+- **Evidence (Mac Studio, 2026-11-18, debug).**
+  - `a_volume_imported_from_an_exported_archive_holds_the_exported_tree` and
+    `a_hostile_archive_is_refused_by_kind_with_nothing_made` pass, the two in 1.13 s (kiln r318).
+  - The round trip exports a tree of a small file, a 300 KiB file spanning chunks, an empty file, and a private file
+    in a private directory, in nested directories. It imports that archive twice. Each import names the export's
+    manifest, and every file reads back its bytes and length through `read`. Each new volume, exported again and
+    restored, holds the exported tree: every byte, every directory, and every entry's mode, length, owner, link count
+    and all four times, the root's too, save the inode numbers. The second import's tree equals the first's.
+  - A consumer-written archive (the export with a symbolic link added) comes back whole, the link a link
+    (`0o120777`) as long as its target.
+  - A held name is `AlreadyExists`. A size of half the spanning file is `Exhausted::Memory` naming that size, and the
+    daemon's volume count and committed bytes stay as they were.
+  - The hostile archives, each written into a scratch volume and imported, are refused by kind, with no volume made,
+    no room kept and the name free: the archive re-encoded declaring a chunk length of `u32::MAX` is `Malformed`;
+    its first 20 bytes, `Truncated`; one bit flipped mid-archive, `Corrupt`; a zip's magic, `ForeignMagic`. The whole
+    archive then imports under a name a refused import used.
+  - Units (kiln r310): the archive crate's 22, among them the decode a byte of hash a step equal to the whole decode,
+    and every cut or flipped archive refused alike either way; the export's 6 (an archive's name policy names its
+    volume's back); the wire order's 2; the library's 64 (the contract's history names 40).
+  - Red once each (kiln r320): with the laying skipped, the round trip read no file (its first `read` refused); with a
+    foreign magic classed `Corrupt`, the hostile test met `Corrupt` where it asked `ForeignMagic`.
+
+### A-451 — A Windows landing gives each file, directory and link it makes the volume's other attribute bits, read back, and a directory link lands as one (2026-11-18, g085; A-262's landing half, A-185's owed item)
+Applied in the same change to: §4.15 (A-185's status), A-262 (stage 3's landing half), A-438 (its directory link),
+GAPS (A-185's owed list), `crates/vfs` (`src/host/mod.rs`: `LandFs::set_windows`, the bits on `mkdir` and `symlink`;
+`src/host/sim.rs`: the bits kept as a Windows disk keeps them, `windows_attributes`; `src/captured.rs`: a captured
+entry's bits; `src/volume.rs`: `windows_attributes_in`), `crates/land` (`src/manifest.rs`: `LandingEntry::windows`,
+layouts 3 and 4; `src/source.rs`: `Source::windows`; `src/engine.rs`: the bits handed to the writer;
+`src/windows_bits.rs`, new: the word, the read-back, four unit tests; `src/os_windows.rs`: `give_bits`, the three verbs,
+the mode's word moved to `windows_bits`; `src/os.rs`: the verbs take the bits and apply none; `tests/common/mod.rs`:
+`set_windows_bits`; `tests/oracle.rs`, a test added and one renamed; `tests/os.rs`, a Windows test; `tests/os_escape.rs`
+and `tests/os_removal.rs`, the bits passed through).
+- **What was there.** A-262 keeps the bits in the volume: hidden, system, archive, offline and not indexed on any
+  object, a directory's read-only, and since A-275 a link's directory kind. The WinFsp drive applies them. A landing
+  carried none: A-185's writer set a file's `READONLY` from its mode and kept what the file held, and A-438 landed every
+  link as a file link, since the seam carried no bits. So an `attrib +h`, Git for Windows' hidden `.git` and a
+  directory link Windows made in the volume were each lost at the landing.
+- **The rule.** Each manifest entry carries the bits the volume keeps for what it writes (`LandingEntry::windows`; none
+  for a delete, a rename or a removal), closed into the canonical encoding (layout 3, and 4 judged by content), so a
+  grant binds the bits it lands, as it binds a mode. The writer gives them to what it makes: a file's temporary before
+  its placement (`LandFs::set_windows`, after its mode), a directory as it is made, a link before its move into place.
+  Each bit the volume keeps for the kind is the volume's, set or cleared. A file's read-only state stays its mode's
+  (A-262's one model). A settable bit the volume keeps nothing of (`TEMPORARY`) stays as the object holds it. A word
+  with no bit is written `NORMAL`, since a zero word changes nothing (`windows_bits::set_word`). A link's kind is no bit
+  `FILE_BASIC_INFO` sets, so a directory link is made a directory object (`FILE_DIRECTORY_FILE`), as
+  `SYMBOLIC_LINK_FLAG_DIRECTORY` makes one. Linux and macOS hold none of the bits, and their writer applies none.
+- **Never dropped.** Every bit the volume keeps is one a caller may set (`FILE_ATTRIBUTE_VALID_SET_FLAGS`, `0x31A7`), and
+  NTFS and ReFS hold each. A file system that holds fewer drops the rest and answers success: FAT keeps `READONLY`,
+  `HIDDEN`, `SYSTEM`, `ARCHIVE` and the directory bit, and "the rest are silently dropped on the floor"
+  (`FatSetBasicInfo`, Microsoft's FastFAT sample, `filesys/fastfat/fileinfo.c`, read 2026-11-18). So the writer reads
+  the word back after setting it, and refuses the entry `EOPNOTSUPP` where a bit did not take (`windows_bits::held`,
+  which checks a link's kind too). A refused directory or link is removed and a refused file's temporary given up, so
+  nothing of the entry is left. A bit is landed or refused, never dropped.
+- **What NTFS adds.** The rename that places a file sets `ARCHIVE` again (A-185's measurement on CI's windows-latest),
+  so a landed file holds `ARCHIVE` whatever the volume held: the truth that it changed, which a backup reads. The
+  engine already sets a move's `ARCHIVE` aside when it checks a moved file against its witness (A-185).
+- **Tests.** Unit, on every host, in `windows_bits`: all 128 combinations of the seven bits on a file, a directory and
+  a link land, read back as the volume keeps them for that kind, and are held; a file's read-only state follows its
+  mode; the word replaces what the volume keeps and keeps what it does not; and a dropped bit, an extra bit and a link
+  of the wrong kind are each found. `cargo test --locked -p slates-land --lib` passed 20 of 20 on the Mac Studio
+  (2026-11-18, load 3.3 to 5.4, debug), the engine's captured-clone landings over the simulated host among them, and
+  `cargo test --locked -p slates-vfs --lib -- captured host::sim` passed 3 of 3. Red-checked once, two ways: with
+  `set_word` ignoring the volume's bits, 4 of the 4 failed; with `held` answering yes to every word, the one test that
+  guards it failed and the 3 others passed. `cargo check` (macOS) and `cargo xwin check --target x86_64-pc-windows-msvc`
+  of both crates with all targets were clean, and `cargo fmt --check` too. Filed for main's runs: the oracle's
+  `a_landing_gives_each_object_the_bits_the_volume_keeps_and_a_directory_link_its_kind` (a directory, a file in it, a
+  directory link, a file link and a plain file, each holding its bits on the simulated disk) and
+  `a_landing_carries_windows_attribute_bits_and_writes_the_same_bytes` (renamed from
+  `a_landing_ignores_windows_attribute_bits_without_error`; the same disk and count written, now with the bits on
+  the edited and created files); the crash oracle, since `set_windows` is a write step of the simulated host; and, on
+  Windows, `the_volumes_windows_bits_land_and_a_directory_link_lands_as_one` (`crates/land/tests/os.rs`, its link part
+  skipped loudly without the link privilege or Developer Mode).
+- **Owed.** A change of an untouched base file's bits alone lands nothing. A landing judges a base file by its bytes,
+  so the verdict passes the entry its copy-up makes as `Skip`, as it passes a change of the file's mode alone, which
+  §4.15 step 1 names among what a landing carries; a captured clone's entry compares content alone likewise. A
+  directory's bits, like a Unix directory's mode, are given after it is made, so a crash between the two steps leaves it
+  without them, and a resumed landing takes it as already there. The presented entry list (`PlannedEntry`, §4.15 step
+  2) shows each entry's mode and not its bits, which the grant now binds. The backslash read-back of a landed link
+  (`..\src\lib.rs` read by the Windows base) is the base plane's own map, not this one, and stays its own piece.
+
+### A-455 — The watchdog judges each shard by its own window: the liveness window raised to the scheduler overrun the shard measured, within the observation budget, read at every look and published (2026-11-18, built for goal g255; R3's class D, item D-a; §4.14 `daemon.alive`; A-228, A-232, A-318, A-359)
+- **What was there.** The watchdog judged every shard against the liveness window `W` (A-359: the recovery budget by
+  rent or buy), a shard stuck after `W` without a step and spinning after `W` of CPU held to the build (A-318). A-359
+  measured the machine's floor once at boot (the wake probe's p99) and only said so where it passed `W`; a host that
+  keeps a shard off its CPU longer than `W` was never given a longer window.
+- **The rule.** Each shard is judged at each look by its own window, `watchdog::watch_window_ns`: `W` raised to the
+  scheduler overrun the shard measured where that is longer, and never past `watchdog::WINDOW_CEILING_NS`. The overrun
+  is `slates_rt::shard::ShardContext::scheduler_overrun_ns`: how late the shard's steps ran after the waits before them,
+  a maximum that forgets an eighth of itself at each later wait, mirrored in the shard's registry pulse, where the
+  watchdog's thread reads it. A shard the host keeps off its CPU that long has no way to show progress sooner, so a
+  window shorter than its overrun would judge it by the host's delay; a quiet host's overrun is a tick or less (a
+  kevent timeout 1.2 ms late under launchd's timer policy, Windows' 15.6 ms tick), so its shards keep `W`. Both
+  judgments follow the one window: wedged or starved after it without a step, spinning after it of CPU held to the
+  build (`watchdog::spin_window_ns`, now over the shard's window). A-232's bound holds by its terms with the shard's
+  window as `W`: a verdict within its window, a beat and its named lateness of the wedge, and every verdict's line names
+  the window it was judged by.
+- **The ceiling, and why.** A shard folds its overrun in only when it waits, and a wedged shard never waits again: a
+  shard wedged just after a spike (a process stopped whole and continued, a host paused) would keep the spike as its
+  window for good, and the watchdog would be blind to it. The ceiling is the daemon's observation budget
+  (`daemon::OBSERVE_BUDGET_NS`, ten windows), the bound past which the daemon's own question to a shard ends with a
+  deadline as a wedge's and not a slow shard's; held to it, the watchdog never calls alive a shard its own daemon has
+  given up asking, and a stuck shard is judged within the ceiling, a beat and its lateness however the host ran before.
+- **Published.** Each shard's status part carries its window as the health signal `shard.watch_window_ns` (measured at
+  the report; a missing value is degraded), computed by the same rule from the shard's own measurement, which the
+  watchdog reads through the pulse's mirror. The registry's table in `docs/wip/observability.md` and §4.14's catalog
+  name it. `Watchdog::spin_window_ns` (and `Daemon::spin_window_ns`) is now the least spin window, at `W`.
+- **Tests.** `a_shards_window_follows_its_measured_overrun_past_the_liveness_window_and_stops_at_its_ceiling` (a shard
+  wedged, and one spinning, judged by the window each look reads from its measured overrun: on a quiet host at `W`, as
+  before; under a host that kept it off its CPU two and a half windows, at two and a half; under a runaway reading, at
+  the ceiling) and `a_shards_status_names_the_window_its_watchdog_judges_it_by` (a running daemon's shard reports the
+  rule's window over the overrun it measured, at the report), both in `crates/server/src/watchdog.rs`.
+  `crates/client/tests/lone_daemon.rs` now reads the window its stuck shard's end line names, as the bound's `W`, and
+  the start line's new words for the least spin window; `crates/server/tests/liveness.rs` holds a wedged shard's stop
+  to the window read from its pulse while it is held.
+- **Not yet (class D, each its own change).** The anchor's start and lapse judgments (`crates/api/src/role/anchor.rs`,
+  D-b), the daemon's other supervision waits (D-c) and a laptop's failover detection term (A-405's supervision window)
+  still read `W` itself.
+- **Evidence.** Built and run on the Mac Studio (kiln r331 and r334, 2026-11-18, load 3.8-7.3, debug build):
+  `cargo test --locked -p slates-server --lib -- watchdog` 27 of 27; `cargo test --locked -p slates-ipc --lib --
+  health_signal` 5 of 5 (the registry's doc-truth tests; the writer ignored); `cargo test --locked -p slates-api --lib --
+  a_lapse_kills` 1 of 1; the lone-daemon and liveness suites build (`--no-run`; their runs are main's). Red-checked
+  once: with the window held at `W` whatever the overrun (the ceiling in `watch_window_ns` taken as zero), the rule's
+  test failed, a shard under a host that kept it off its CPU 2.5 s judged wedged after 1.0 s and spinning at 1.0 s of
+  CPU where its window is 2.5 s. The start line on that machine: a 1,000 ms liveness window, a 10,000 ms ceiling, and
+  3,512 ms of CPU at least, the build 3.5 times as slow as machine code.
+
+Applied in the same change to: §4.14 (the health signal catalog; a status block on `daemon.alive`), GAPS (the
+`LIVENESS_BUDGET_NS` entry), `docs/wip/observability.md` (the health-signal table), `crates/server/src/{watchdog,
+verbs,daemon,config}.rs`, `crates/ipc/src/protocol.rs` (`HealthSignal::WatchWindowNs`), `crates/api/src/role/anchor.rs`
+(`start_spin_window_ns` names the window it holds to the build), `crates/client/tests/lone_daemon.rs`,
+`crates/server/tests/liveness.rs`.
+
+### A-460 — The Windows anchor hands its held entries on in an inherited section, never in one environment variable, whose 32,767 characters a table at the bounds passes (2026-11-18, goal 90; the gap A-448 found; A-198's handoff)
+Applied in the same change to: A-448's entry (main's decision on the `Resync` recorded); GAPS, A-281's entry (the
+handoff's length built, the Unix sibling found); and:
+- `crates/anchor`: `handles.rs` (`ENV_HANDLES` now names the table: `encode_handoff`, `parse_handoff`,
+  `HANDOFF_TEXT_CAP`; `table_cap`, which `parse_env` now shares; `check_owners`; the module's notes);
+  `held_windows.rs` (`Held::handoff` writes the table into a section of its own, `table_section`; `read_table`, the
+  daemon's half; the unit tests read every handoff through its section); `tests/handles_windows.rs` (every role reads
+  the table from its section; `a_table_past_an_environment_variables_limit_reaches_the_successor_whole`).
+- `crates/server`: `anchor_hold_windows.rs` (`adopt` reads the table from the section the variable names,
+  `handed_table`).
+
+- **What was there.** The anchor handed a spawned daemon its hold channel and every held entry as one environment
+  variable's value (`SLATES_ANCHOR_HANDLES`, A-198): `CHANNEL;ID:WHAT:HANDLES:RECORD...#CRC32C`. Microsoft documents
+  "The maximum size of a user-defined environment variable is 32,767 characters" (`SetEnvironmentVariableW`'s
+  `lpValue`, and "Environment Variables", which adds that the block itself has had no limit since Windows Vista; both
+  read on Microsoft Learn 2026-11-18). An entry takes up to `ENTRY_TEXT_CAP` characters: a mount's record up to 517
+  bytes, 1,034 in hexadecimal, about 1,100 in all; a DAX section's about 90. So about 30 mounts with long records passed
+  the limit, while the anchor's bounds admit `shards × 4096` mounts and `shards × dax_range_slots` sections, and past
+  it the next daemon could not read the variable whole: every held entry lost to it.
+- **The rule.** The table's text is unchanged and rides a section of its own length. At each spawn the anchor writes it
+  into a new pagefile-backed section (`slates_mem::PeerObject`, under A-175's confining descriptor), hands the spawn a
+  read-only, inheritable duplicate in the same explicit handle list as the held handles (A-183), and closes its own
+  copies once the spawn has its own. The variable names only the section's value and the table's length,
+  `TABLE_HEX:LEN_HEX`, at most 33 characters whatever the table holds. The daemon checks both against its bounds'
+  capacity before it maps or allocates anything, maps the section read alone (`slates_mem::PeerView`), reads the table
+  and closes the section; then parses the table as before (its checksum, its caps, one owner per handle), refusing
+  whole a table that names its own section again. The pointer is read only as `encode_handoff` writes it: lowercase
+  hexadecimal, no sign, no zero section, no empty table.
+- **Why a section and not another channel.** The hold channel's pipe buffers one message each way (`MESSAGE_BYTES`), so
+  a table of thousands of entries would cross it one message per supervision turn, and the anchor's loop never waits on
+  a daemon that may never read. The anchor's segment would need a region of the bounds' capacity (`table_cap`, about
+  1,100 bytes an entry: tens of megabytes at `shards × 4096` mounts) whether anything is held or not. A section costs
+  the table's own length, only at a spawn, and only until the daemon has read it. Caps derived to fit the variable were
+  rejected: they would bound the mounts and streams a daemon may hold for a reason of the transport's own (main's
+  preference, 2026-11-18).
+- **Tests.** On every host (`handles.rs`): `a_table_past_an_environment_variables_limit_rides_the_handoff_whole` (48
+  mounts with records of the whole cap and 512 DAX sections, a table past 32,767 characters, its pointer within 33, the
+  table read back whole; the cap's own length taken and one more byte refused), `hostile_handoff_pointers_are_refused`
+  (no colon, empty fields, a zero section or length, a sign, capitals, a third field, seventeen digits, past the cap),
+  `a_tables_own_section_is_never_named_again`. On Windows: `held_windows.rs`'s
+  `a_table_past_an_environment_variables_limit_is_handed_whole` (40 mounts through a real section) and every handoff
+  test reading through the section; `tests/handles_windows.rs`'s
+  `a_table_past_an_environment_variables_limit_reaches_the_successor_whole` (a real supervised restart: 40 events held
+  with records of the whole cap, the successor reading every one live from the section).
+- **Evidence.** Red first, on main at `b97d33e` with the tests alone, on a Mac Studio (2026-11-18): `slates-anchor`'s
+  lib tests did not build (15 errors: no `encode_handoff`, `parse_handoff`, `table_cap`, `check_owners`,
+  `HANDOFF_TEXT_CAP`). Green on the tree as merged with main, the same day and machine: `cargo test -p slates-anchor
+  --lib handles` 17 of 17, the three above among them; rustfmt's layout taken; and `cargo xwin check --target
+  x86_64-pc-windows-msvc` clean for `slates-anchor` and `slates-server` (lib and tests). The Windows tests and the
+  real supervised restart past the limit run only on Windows: filed for main.
+- **Found beside it** (GAPS): the Unix handoff rides environment variables too (`SLATES_ANCHOR_DEVICES`, about 109
+  characters a device with a resync session; `SLATES_ANCHOR_COPIES`, about 77 a DAX object), and Linux refuses an
+  `execve` with a single string past `MAX_ARG_STRLEN`, `PAGE_SIZE * 32` (`include/uapi/linux/binfmts.h`: 131,072 bytes
+  on 4 KiB pages, about 1,200 devices), while the bounds admit `shards × 4096`. Open; not this change's.
+
+### A-450 — A consumer moves an agent with its volume through the library alone (2026-11-18, g267, kiln goal 95101ef3 K4; §4.10 "Ownership follows the writer", A-291)
+
+- **What was there.** A-291 built the explicit move (`slates move ID --to HOST`, `Instance::move_volume`, contract 33)
+  and the form a consumer's workspace moves in (a clone of a captured base, contract 34), but no consumer drove it:
+  kiln refused to move an agent whose workspace was a volume, saying the workspace couldn't follow it.
+- **The rule.** A consumer moves a volume between fleet members by the library alone, never by a copy through a disk:
+  it names the target by the member id the target's own daemon serves as (`Instance::member`, read again after every
+  daemon start, since a restarted daemon is a new member), asks `move_volume` and follows its `MoveProgress` until
+  `Moved`, with no deadline of its own (the move bounds itself: it answers `Moved`, or thaws and answers `MoveUnplaced`
+  within the fleet's failover bound). Every refusal is a typed `Error` the consumer reports by kind (`Busy::Attached`,
+  `Busy::Moving`, `Unusable::Unmovable(NotPlain | Lineage | Snapshots)`, `Invalid::MoveTarget(NotMember |
+  OutsideNeighbourhood)`, `RetryCause::MoveUnplaced`), leaving the volume where it was. The target attaches the moved
+  volume once its new owner serves it, waiting out the `Retry` pauses the library derives. Kiln's side (kiln main,
+  `workspace::slates_move`, `harness::relocate`, `harness::session`'s hand-over): both runners in its Slates fleet,
+  the target's node serving, the agent's harness down and its mount let go before the move, the workspace mounted again
+  on a refusal, the session handed over after `Moved`, the volume's mount re-placed under the target's own place for
+  workspaces. A workspace laid over its machine's folder is refused `NotPlain` (§4.10 "Overlay volumes in a fleet");
+  kiln's workspaces move once they are clones of a captured base (kiln's K5).
+- **Tests.** Kiln's unit tests (`k4_slates_refusals_of_a_move_are_reported_by_kind`,
+  `k4_the_source_follows_slates_answers_to_the_move`, `k4_the_plan_moves_a_workspace_only_inside_the_fleet_to_a_serving_node`,
+  `k4_a_volume_agent_moves_only_inside_kilns_slates_fleet`, `k4_a_nodes_member_id_rides_its_runners_word`,
+  `k4_a_workspace_that_moved_here_is_placed_under_this_machines_own_place`). Slates' own move is held by the
+  three-daemon tests A-291 names; no library change was needed. The live move between two Mac runners is filed for main.
+
+Applied in the same change to: §4.10's status (the consumer's paragraph), GAPS (g267).
 
 ### A-457 — The shards hold a green's replicas: made before the green's first change, fed over the cross-shard carrier, charged to their own shards, and left before their owner is given up (2026-11-18, goal 87 via g083; A-273 step 5a; §4.16 "Rebase off the owner"; D-7, D-8, D-11; A-247, A-296, A-400)
 

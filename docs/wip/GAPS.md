@@ -824,10 +824,20 @@
 >   naming it goes out, its id marked apart from every attachment's, the sections held to a bound of their own
 >   (`shards × dax_range_slots`, refused `Bound`); a successor adopts them whole, claims them for the stream and answers
 >   the device's asks after the `Resync` with the same sections. Owed on Windows: its real-process restart with DAX on
->   CI's runners (filed for main, `run-requests.md`); and the handoff's length: every held entry rides one environment
->   variable (`SLATES_ANCHOR_HANDLES`), and a user-defined variable is at most 32,767 characters by
->   `SetEnvironmentVariableW`'s documentation (from memory, to verify on a runner), which the anchor's bounds were never
->   set against, a section's entry being about 90 characters and a mount's up to about 1,100. **Built since (A-402,
+>   CI's runners (filed for main, `run-requests.md`). **The handoff's length, built since (A-460, the same day):** every
+>   held entry rode one environment variable (`SLATES_ANCHOR_HANDLES`), and "the maximum size of a user-defined
+>   environment variable is 32,767 characters" (Microsoft Learn, `SetEnvironmentVariableW`'s `lpValue` and "Environment
+>   Variables", read 2026-11-18), which a table reaches at about 30 mounts with full records (an entry up to
+>   `ENTRY_TEXT_CAP`, about 1,100 characters for a mount, about 90 for a DAX section), while the anchor's bounds admit
+>   `shards × 4096` mounts. The table now rides an inherited read-only section of its own length, and the variable names
+>   only that section and the length (at most 33 characters); its real-process restart past the limit is filed for
+>   main. **Found beside it, open (Unix):** the same table rides environment variables on Linux and macOS too
+>   (`SLATES_ANCHOR_DEVICES`, up to about 109 characters a device with a 40-byte resync session; `SLATES_ANCHOR_COPIES`,
+>   about 77 a DAX object), and Linux refuses an `execve` whose single string passes `MAX_ARG_STRLEN`, `PAGE_SIZE * 32`
+>   (`include/uapi/linux/binfmts.h`; 131,072 bytes on 4 KiB pages, so about 1,200 held devices or 1,700 copies), and
+>   macOS bounds arguments and environment together (`kern.argmax`, 1 MiB, from memory, to verify); the bounds admit
+>   `shards × 4096` devices, so a large Unix holding would leave the anchor unable to start its next daemon. **Built
+>   since (A-402,
 >   2026-11-18):** the write log on
 >   Windows, so a Windows stream's acknowledged writes outlive its daemon's death, replayed into the volume (its Windows
 >   run is main's, `run-requests.md`); before, a Windows stream's acknowledged writes since the last publication were
@@ -887,8 +897,12 @@
 >   through kiln's server and the manifest written per runner with kiln's CA as its enrollment root (K2), and the
 >   operator's choice of which runners join, with `f` and each node's address, a chosen runner's Slates started with
 >   `StartSpec.fleet` once `role::check_fleet` (contract 39) read the manifest it wrote as its start will (K3).
-> - **Owed, in order:** kiln's relocation of an agent with its volume (detach, move, attach on the
->   target) and its workspaces made as clones of a captured base; the automatic migration by the origin of the last N
+> - **Kiln moves an agent with its volume (A-450, kiln K4, 2026-11-18):** through the library alone (`move_volume` to the
+>   target's member id, followed until `Moved`, every refusal by kind, the agent left running where it was), the
+>   target's runner mounting the moved volume under its own place once its new owner serves it. Today's kiln
+>   workspaces are overlays and are refused `NotPlain`; they move once made as clones of a captured base (K5). The live
+>   move across two Mac runners is filed for main.
+> - **Owed, in order:** kiln's workspaces made as clones of a captured base (K5); the automatic migration by the origin of the last N
 >   writes (AC-8.16's other half); a move carrying snapshots other than the head; a multi-runner test with injected
 >   faults. The capture's own owed parts: admission reserving its cost ahead, a large file read across slices rather
 >   than whole in one, and the report of bytes read and retained and of the elapsed cost (§4.15's status).
@@ -3677,7 +3691,7 @@
 > ratified recovery budget `T` by rent or buy (a verdict waits as long as the recovery it starts costs), the heartbeat
 > `W / ELECTION_MARGIN`, the same values; the machine's wake p99 at boot is its floor, and the boot log names both and
 > says when the floor passes the window. Owed, in order: `W` held at runtime so a daemon runs at its floor where that
-> is past `W` (every use is listed by class in A-359); the failover SLO derived as the membership horizon plus the
+> is past `W` (every use is listed by class in A-359; the watchdog's since A-455, below); the failover SLO derived as the membership horizon plus the
 > council's confirmation window plus `T` (2.9 s today) once each consumer that takes it as a lease term (a landing's
 > target lease, a CLI attachment's term, the NFSv4 and delegation leases, the restart cap) has its own term; and the
 > class C claim wait below. **The failover delay is a live output since 2026-11-18 (A-363, goal g255), not A-359's boot
@@ -3706,10 +3720,22 @@
 > the request), a move's overdue bound and the telemetry freshness horizon. Owed, each in its own
 > change: each other lease takes its term from a φ-accrual
 > detector of its own holder's renewals (a CLI attachment once the CLI process sends a keepalive); `W`'s floor from the
-> pulses' running wake delay; then `FAILOVER_SLO_NS` and `with_failover_slo` go, since nothing sets `F`. The boot-time
-> sum is kept only as the A/B baseline, a build of its own, never a mode. **Since A-403 the recovery's cross-shard passes and the image's alias steps** (A-359's
-> class A list on the wall) wait in their target's own time (`xshard::call_in_shard_time`), so W's floor for them is the
-> target's measured progress, not a boot snapshot.
+> pulses' running overrun for the rest of class D; then `FAILOVER_SLO_NS` and `with_failover_slo` go, since nothing sets
+> `F`. The boot-time sum is kept only as the A/B baseline, a build of its own, never a mode. **Since A-403 the
+> recovery's cross-shard passes and the image's alias steps** (A-359's class A list on the wall) wait in their target's
+> own time (`xshard::call_in_shard_time`), so W's floor for them is the target's measured progress, not a boot snapshot.
+> **Since A-455 (2026-11-18, goal g255, D-a) the watchdog judges each shard by its own window**
+> (`watchdog::watch_window_ns`), read at every look: `W` raised to the scheduler overrun the shard measured (its
+> registry pulse's mirror of `ShardContext::scheduler_overrun_ns`) where that is longer, never past the daemon's
+> observation budget (`watchdog::WINDOW_CEILING_NS`, ten windows), its spin window that window held to the build
+> (A-318); each verdict's line names the window it was judged by, and the status carries each shard's as the health
+> signal `shard.watch_window_ns`. Before, a shard the host kept off its CPU longer than `W` was judged against `W`
+> whatever the host measured, and A-359 only said so at boot. The ceiling keeps the watchdog from going blind, since a
+> wedged shard never waits again and so never forgets a spike measured just before it wedged. Still on `W` itself, each
+> owed its own change (class D): the anchor's start and lapse judgments (`role/anchor.rs`, D-b), the daemon's own
+> supervision waits (`reap_loop`, `log_late_beat`, `starved_share_ns`, `stop_parts`, `start_with_fleet`, the anchor's
+> hold windows, `held_copy`; D-c), and a laptop's failover detection term (A-405's supervision window), which should
+> follow the windows the watchdog now judges by.
 >
 > - **Class A, a cross-shard wait judged in its target's own time (2026-11-06, in progress).** A verb's wait for
 >   another shard's answer gave up at the wall second while the target was alive and starved, and the work went on to
@@ -11326,15 +11352,36 @@ Owed:
 Shards streams on macOS have the same shape and are covered: their writes are logged since `1fa154230`; on Windows
 since A-402, which also makes the log option 2 names available to the WinFsp drive.
 
-### 2026-11-18: a snapshot exported as its archive through the library (Mantle's CP-T10.4; built, A-441); the volume from an archive owed
+### 2026-11-18: a volume made from an archive through the library (Mantle's CP-T10.4 import half; built, A-453)
+
+> - **Built.** `Instance::import_archive` (contract 40): a new volume holding the tree of the archive a volume of the
+>   caller's holds as `ARCHIVE_FILE`, run a slice a turn on that volume's owner shard: the file's length admitted
+>   before a byte is read, the file read, decoded and verified (`slates_archive::Decoding`), restored (`Planning`,
+>   `Restoring`) and laid into the volume (the takeover's `verbs::Populating`), the volume and the completion one atom.
+>   Bytes that make no volume are refused `ArchiveRefused { fault }` by kind (`ForeignMagic`, `Unsupported`,
+>   `Truncated`, `Corrupt`, `Malformed`), a tree past its room `BudgetExceeded`, with nothing made.
+> - **Proven (Mac Studio, debug, kiln r310, r318, r320).**
+>   - `a_volume_imported_from_an_exported_archive_holds_the_exported_tree`: two imports of an exported archive each
+>     hold the exported tree in every byte and every entry's metadata save inode numbers; a consumer-written archive
+>     with a symbolic link added comes back with the link; a held name `AlreadyExists`; a size too small
+>     `Exhausted::Memory`, its room given back.
+>   - `a_hostile_archive_is_refused_by_kind_with_nothing_made`: a declared chunk length of `u32::MAX` `Malformed`, a
+>     cut header `Truncated`, one bit flipped `Corrupt`, a zip's magic `ForeignMagic`, nothing made each time.
+>   - Red once each: the laying skipped, and a foreign magic classed `Corrupt`.
+> - **Owed.**
+>   - A streamed decoder: the file is held whole while it is decoded, and the decoded archive beside the restored tree
+>     until the restore ends, so an import near the shard's room holds its tree about twice for that time.
+>   - The manifest's decode and Merkle identity in pieces: one piece today, a walk of the whole tree.
+>   - The full api suite, Linux and Windows lanes: filed for main (run-requests.md, 2026-11-18).
+
+### 2026-11-18: a snapshot exported as its archive through the library (Mantle's CP-T10.4; built, A-441); the volume from an archive built (A-453)
 
 > - **Built.** `Instance::export_archive` (contract 38): a snapshot rendered as its archive file (`ARCHIVE_FILE`) in a
 >   new volume of the caller's, walked in slices on the owner shard, read back a page at a time with `read`.
 >   `a_snapshot_exported_as_its_archive_carries_every_file_and_entry` decodes and restores what it reads back: every
 >   file's bytes, length and mode, the directories, none of a write after the snapshot, the same manifest twice.
-> - **Owed.** The volume made from an archive (import), through `slates_archive::Planning` as a takeover restores
->   (`fleet::restore_in_turns`, `verbs::populate_making`), with hostile archives refused by kind: the next piece. A
->   streamed encoder: the archive is held whole while it is encoded, one unit of its size.
+> - **Owed.** A streamed encoder: the archive is held whole while it is encoded, one unit of its size. (The volume made
+>   from an archive is built: A-453, the entry above.)
 
 ### 2026-11-18: a volume a publication left out lost its logged writes at the next restart (found by reading; fixed, A-422)
 
@@ -18663,13 +18710,23 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   and has not run on Windows: lift its gate once a Windows run passes it; a symbolic link in a landing on Windows,
   **built by A-438 the same day** (the Windows link in A-275's form, handle-relative, staged and moved into place, the
   privilege enabled for its thread alone where the process holds it; its Windows test filed for main's lanes; still
-  owed with it: a directory link's type, which the seam does not carry, a Windows base reading a link back in A-275's
-  `/` form rather than its print name's `\`, and the Developer Mode route for an account without the privilege,
-  measured); a reflink (`FSCTL_DUPLICATE_EXTENTS_TO_FILE` on ReFS), **built by A-445 the same day** for the batch's
+  owed with it: a Windows base reading a link back in A-275's `/` form rather than its print name's `\` (the base
+  plane's own map, its own piece), and the Developer Mode route for an account without the privilege, measured; a
+  directory link's type, which the seam did not carry, **built by A-451**); a reflink
+  (`FSCTL_DUPLICATE_EXTENTS_TO_FILE` on ReFS), **built by A-445 the same day** for the batch's
   own duplicates (§4.15 step 6's rule, the batch as the hash index; ReFS and a Dev Drive in whole-cluster regions
   under 4 GiB; its Windows test over a ReFS directory and the oracle's filed for main's lanes; still owed with it:
   Linux's `FICLONE` and macOS's `clonefile`, duplicates across batches, and the measured gain); A-262's landing half
-  (the volume's other attribute bits); and
+  (the volume's other attribute bits), **built by A-451 the same day** (each manifest entry carries the bits, bound by
+  the grant; the Windows writer gives each file, directory and link it makes those bits and reads the word back,
+  refusing the entry `EOPNOTSUPP` where the target's file system did not take one, as FAT drops `OFFLINE` and
+  `NOT_CONTENT_INDEXED`; a directory link lands as one; its unit tests ran on the Mac Studio, its Windows test and two
+  oracle tests filed for main's lanes; still owed with it: a change of an untouched base file's bits alone lands
+  nothing, since a landing judges a base file by its bytes and passes the copy-up's entry `Skip`, as it passes a change
+  of its mode alone, which §4.15 step 1 names among what a landing carries, and a captured clone's entry likewise
+  compares content alone; a directory's bits, like a Unix directory's mode, are given after it is made, so a crash
+  between the two leaves it without them and a resumed landing takes it as already there; and the presented entry list
+  (`PlannedEntry`, §4.15 step 2) shows each entry's mode and not its bits, which the grant now binds); and
   the seam's numbering: refusals the engine tells apart are POSIX numbers and the rest Win32 codes, so a Win32 code equal
   to one of the engine's numbers (`ERROR_NOT_SAME_DEVICE` 17, `ERROR_INSUFFICIENT_BUFFER` 122, among five) would read as
   that refusal; none of the writer's calls is known to answer one, and a typed refusal at the seam would close it.

@@ -71,6 +71,18 @@ fn beat(daemon: &Daemon) -> u64 {
   daemon.segment().supervision().unwrap().heartbeat_ns()
 }
 
+/// The window the watchdog judges `shard` by now (A-455, `watchdog::watch_window_ns`): the liveness window, raised to the
+/// scheduler overrun the shard measured where that is longer, read from its pulse as the watchdog reads it. A shard held
+/// in one poll waits no more, so read during a hold this is the window its verdict comes after.
+fn window_of(daemon: &Daemon, shard: ShardId) -> Duration {
+  let overrun_ns = daemon
+    .shard_pulses()
+    .into_iter()
+    .find(|pulse| pulse.shard == shard.0)
+    .map_or(0, |pulse| pulse.scheduler_overrun_ns);
+  Duration::from_nanos(slates_server::watchdog::watch_window_ns(overrun_ns))
+}
+
 /// Waits until the daemon serves and has beaten twice, so a test starts from a booted, beating daemon; the returned
 /// connection is held for the test, so no client's reap runs inside it. The beat starts before the boot's client-id
 /// recovery asks every shard (`control_loop`), and a connection is accepted only after it, so a beat alone let a test's
@@ -232,6 +244,8 @@ fn a_blocked_shard_stops_the_beat_while(
   let mut last = beat(&daemon);
   let mut last_seen = base.elapsed();
   let mut stopped_at = None;
+  // The held shard's window, read while it is held (A-455): the liveness window unless its host overran that.
+  let mut window = WINDOW;
   loop {
     let answered = worker.is_finished();
     let began = began_us.load(Ordering::Acquire);
@@ -248,6 +262,7 @@ fn a_blocked_shard_stops_the_beat_while(
       && base.elapsed().saturating_sub(last_seen) >= WINDOW
     {
       stopped_at = Some(last_seen);
+      window = window_of(&daemon, other);
       break;
     }
   }
@@ -262,11 +277,12 @@ fn a_blocked_shard_stops_the_beat_while(
   });
   let after = stopped_at.saturating_sub(began);
   println!(
-    "wedged shard ({name}): the block began {began:?} in, and the beat stopped {after:?} after it"
+    "wedged shard ({name}): the block began {began:?} in, and the beat stopped {after:?} after it, judged by its \
+     {window:?} window"
   );
   assert!(
-    after <= WINDOW + BEAT * 3,
-    "the beat stopped {after:?} after the shard wedged, past a window and three beats"
+    after <= window + BEAT * 3,
+    "the beat stopped {after:?} after the shard wedged, past its {window:?} window and three beats"
   );
   daemon.stop();
 }
@@ -417,6 +433,8 @@ fn a_shard_waiting_on_memory_keeps_the_beat_while_the_host_stalls_and_stops_it_a
   let mut stopped_after = None;
   let mut last = beat(&daemon);
   let mut last_seen = cleared.elapsed();
+  // The held shard's window, read while it is held (A-455): the liveness window unless its host overran that.
+  let mut window = WINDOW;
   while cleared.elapsed() < WINDOW * 3 {
     wait(SAMPLE);
     let now = beat(&daemon);
@@ -425,6 +443,7 @@ fn a_shard_waiting_on_memory_keeps_the_beat_while_the_host_stalls_and_stops_it_a
       last_seen = cleared.elapsed();
     } else if cleared.elapsed().saturating_sub(last_seen) >= WINDOW {
       stopped_after = Some(last_seen);
+      window = window_of(&daemon, other);
       break;
     }
   }
@@ -449,8 +468,8 @@ fn a_shard_waiting_on_memory_keeps_the_beat_while_the_host_stalls_and_stops_it_a
     panic!("the beat never stopped for a whole window after the stall cleared (last advanced {last_seen:?} in)")
   });
   assert!(
-    stopped_after <= WINDOW + BEAT * 3,
-    "the beat stopped {stopped_after:?} after the stall cleared, past a window and three beats"
+    stopped_after <= window + BEAT * 3,
+    "the beat stopped {stopped_after:?} after the stall cleared, past its {window:?} window and three beats"
   );
   daemon.stop();
 }
@@ -941,8 +960,9 @@ fn a_spinning_shard_stops_the_beat_role() {
     return;
   };
   let _serving = beating(&daemon);
-  // The CPU a poll may run before the rule calls it spinning: the budget held to this build (A-318), several budgets in
-  // an unoptimized build, one in an optimized one.
+  // The least CPU a poll may run before the rule calls it spinning: the budget held to this build (A-318), several
+  // budgets in an unoptimized build, one in an optimized one. A shard whose host overran the budget before it began to
+  // spin is held to its own window's, longer (A-455), which phase two waits out within its backstop.
   let spin_window_ns = daemon.spin_window_ns().unwrap();
   let spin_window = Duration::from_nanos(spin_window_ns);
   let backstop = spin_window * LEAST_CPU_SHARE_WINDOWS;

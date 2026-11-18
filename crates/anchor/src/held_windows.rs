@@ -17,9 +17,12 @@
 //!
 //! **Handing the held handles on.** The anchor keeps each held handle non-inheritable, for the entry's life. At each
 //! spawn it makes an inheritable duplicate of every held handle and of the channel's daemon end, names them in the
-//! spawn's handle list (so the child inherits exactly those and nothing else, A-183) and in [`crate::handles::ENV_HANDLES`] at the
+//! spawn's handle list (so the child inherits exactly those and nothing else, A-183) and in the handoff table at the
 //! values the duplicates took, spawns, and closes the duplicates: the child now holds its own inherited copies at the
-//! named values (`crate::handles::parse_env`).
+//! named values (`crate::handles::parse_env`). The table rides a section of its own length, read alone, which the spawn
+//! hands on as it hands the held handles, and [`crate::handles::ENV_HANDLES`] names only that section and the table's
+//! length (A-460): a user-defined environment variable holds at most 32,767 characters, which a table reaches at a few
+//! dozen mounts ([`read_table`] is the child's half).
 //!
 //! The message formats are `crate::handles`, pure and tested on every host; this module is the Windows I/O around
 //! them, and the real daemon's end rides the runtime's pipe driver (`slates_rt::pipe`) in its own change (Step 9.3).
@@ -37,7 +40,7 @@ use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
 use crate::handles::{
   HandedEntry, HandleMessage, HandleRefusal, HoldBounds, MESSAGE_BYTES, Reason, WHAT_SHARDS_DAX,
-  decode, encode, encode_env,
+  decode, encode, encode_env, encode_handoff,
 };
 
 /// This thread's last error code, read before any other call.
@@ -599,11 +602,69 @@ impl Held {
         record: entry.record.clone(),
       });
     }
-    let env = encode_env(channel_value, &entries);
+    let table = encode_env(channel_value, &entries);
+    let section = table_section(&table)?;
+    let env = encode_handoff(handle_value(section.raw()), table.len());
+    guard.push(section);
     Ok(Handoff {
       handles: guard,
       env,
     })
+  }
+}
+
+/// Format: the name `slates_mem::PeerObject` takes for a handoff table's section, which names a memfd on Linux and
+/// nothing here: a Windows section is made without a name, so nothing opens it by one.
+const TABLE_SECTION_NAME: &str = "slates-anchor-handoff";
+
+/// An inheritable, read-only duplicate of a new section holding `table` (A-460): made under the confining descriptor a
+/// peer's copy has (`slates_mem::PeerObject`, A-175), written whole, and given up but for this duplicate, which the
+/// spawn hands on and closes after; the child's own copy keeps the section until it has read the table. Refused `Os`
+/// where the OS refuses the section, its view or the duplicate.
+fn table_section(table: &str) -> Result<ClosedOnDrop, HandleRefusal> {
+  let len = u64::try_from(table.len()).map_err(|_| HandleRefusal::Malformed {
+    reason: "a handoff table past an address",
+  })?;
+  let mut copy =
+    slates_mem::PeerObject::create(TABLE_SECTION_NAME, len, slates_mem::PeerAccess::Read)
+      .map_err(|error| mem_refused("the handoff table's section", &error))?;
+  copy
+    .store(0, table.as_bytes())
+    .map_err(|error| mem_refused("the handoff table's write", &error))?;
+  let read_only = copy
+    .read_only_handle()
+    .map_err(|error| mem_refused("the handoff table's read-only handle", &error))?;
+  duplicate_inheritable(read_only.as_raw_handle()).map_err(HandleRefusal::Ipc)
+}
+
+/// The handoff table the anchor handed this process (A-460): `len` bytes of the inherited section `section`, mapped read
+/// alone and loaded once, the section closed after; checked as the text [`crate::handles::parse_env`] reads. Refused `Os`
+/// where the section will not map or is shorter than `len`, and `Malformed` for bytes that are not text.
+pub fn read_table(section: OwnedHandle, len: usize) -> Result<String, HandleRefusal> {
+  let view_len = u64::try_from(len).map_err(|_| HandleRefusal::Malformed {
+    reason: "a handoff table past an address",
+  })?;
+  let view = slates_mem::PeerView::map(section, view_len)
+    .map_err(|error| mem_refused("the handoff table's view", &error))?;
+  let mut bytes = vec![0u8; len];
+  view
+    .load(0, &mut bytes)
+    .map_err(|error| mem_refused("the handoff table's read", &error))?;
+  String::from_utf8(bytes).map_err(|_| HandleRefusal::Malformed {
+    reason: "a handoff table that is not text",
+  })
+}
+
+/// A memory refusal as the hold's [`HandleRefusal`]: the OS's code where it gave one, as `Os`; any other, malformed.
+fn mem_refused(call: &'static str, error: &slates_mem::MemError) -> HandleRefusal {
+  match error {
+    slates_mem::MemError::OsRefused {
+      code: Some(code), ..
+    } => HandleRefusal::Os {
+      call,
+      code: u32::from_ne_bytes(code.to_ne_bytes()),
+    },
+    _ => HandleRefusal::Malformed { reason: call },
   }
 }
 
@@ -690,6 +751,24 @@ mod tests {
     }
   }
 
+  /// The handoff table's text `handoff` hands a spawn, read as the spawned daemon reads it (A-460): the section
+  /// [`crate::handles::ENV_HANDLES`] names, through a duplicate of the guard's handle, since the guard closes its own.
+  fn handed_text(handoff: &Handoff, bound: usize) -> String {
+    let (section, len) = crate::handles::parse_handoff(handoff.env(), bound).unwrap();
+    let own = owned(duplicate_from(myself(), handle_from_value(section).unwrap()).unwrap());
+    read_table(own, len).unwrap()
+  }
+
+  /// The channel's value and the entries `handoff` hands a spawn, read through its table's section ([`handed_text`]),
+  /// the section named by nothing in it.
+  fn handed(handoff: &Handoff, bound: usize) -> (u64, Vec<HandedEntry>) {
+    let (section, _) = crate::handles::parse_handoff(handoff.env(), bound).unwrap();
+    let (channel, entries) =
+      crate::handles::parse_env(&handed_text(handoff, bound), bound).unwrap();
+    crate::handles::check_owners(section, channel, &entries).unwrap();
+    (channel, entries)
+  }
+
   /// A hold of `values` as entry `id` with `record`.
   fn hold(id: u64, values: Vec<u64>, record: &[u8]) -> HandleMessage {
     HandleMessage::Hold {
@@ -737,9 +816,9 @@ mod tests {
     let held_1 = held.apply(myself(), hold(1, values, b"record"));
     assert_eq!(held_1, Some(HandleMessage::Held { id: 1 }));
     let handoff = held.handoff(&daemon).unwrap();
-    // The channel plus the one entry's three handles.
-    assert_eq!(handoff.handles().len(), 1 + 3);
-    let (_channel, entries) = crate::handles::parse_env(handoff.env(), 8).unwrap();
+    // The channel, the one entry's three handles, and the table's section (A-460).
+    assert_eq!(handoff.handles().len(), 1 + 3 + 1);
+    let (_channel, entries) = handed(&handoff, 8);
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].id, 1);
     assert_eq!(entries[0].record, b"record");
@@ -766,7 +845,7 @@ mod tests {
       Some(HandleMessage::Released { id: 2 })
     );
     let handoff = held.handoff(&daemon).unwrap();
-    let (_, entries) = crate::handles::parse_env(handoff.env(), 2).unwrap();
+    let (_, entries) = handed(&handoff, 2);
     assert_eq!(
       entries
         .iter()
@@ -850,7 +929,7 @@ mod tests {
       Some(HandleMessage::Held { id: 1 })
     );
     let handoff = held.handoff(&daemon).unwrap();
-    let (_, entries) = crate::handles::parse_env(handoff.env(), 4).unwrap();
+    let (_, entries) = handed(&handoff, 4);
     assert_eq!(entries.len(), 1);
     assert_eq!(
       (entries[0].id, entries[0].what, entries[0].values.len()),
@@ -867,7 +946,7 @@ mod tests {
       );
     }
     assert_eq!((held.len(), held.refusals()), (1, 3));
-    let (_, kept) = crate::handles::parse_env(held.handoff(&daemon).unwrap().env(), 4).unwrap();
+    let (_, kept) = handed(&held.handoff(&daemon).unwrap(), 4);
     assert_eq!(
       kept[0].record, named,
       "a refused replacement changes nothing"
@@ -932,9 +1011,7 @@ mod tests {
       Some(HandleMessage::Held { id: 14 })
     );
     assert_eq!((held.len(), held.refusals()), (3, 2));
-    let (_, entries) =
-      crate::handles::parse_env(held.handoff(&daemon).unwrap().env(), held.bounds().total())
-        .unwrap();
+    let (_, entries) = handed(&held.handoff(&daemon).unwrap(), held.bounds().total());
     let named: Vec<(u64, u8, usize, Vec<u8>)> = entries
       .into_iter()
       .map(|entry| (entry.id, entry.what, entry.values.len(), entry.record))
@@ -947,6 +1024,49 @@ mod tests {
         (14, WHAT_SHARDS_DAX, 1, 14u64.to_le_bytes().to_vec()),
       ]
     );
+  }
+
+  /// Format: a user-defined environment variable's most characters, as Microsoft documents it: "The maximum size of a
+  /// user-defined environment variable is 32,767 characters" (Microsoft Learn, `SetEnvironmentVariableW`'s `lpValue`,
+  /// and "Environment Variables", both read 2026-11-18).
+  const ENVIRONMENT_VARIABLE_CHARACTERS: usize = 32_767;
+  /// Shape: the mounts whose records fill the cap in the test below: about 1,070 characters each in the table, so 40
+  /// pass the limit above by a third.
+  const FULL_MOUNTS: usize = 40;
+
+  /// A-460. Do: hold mounts whose records fill the cap until the handoff's table passes the 32,767 characters a
+  /// user-defined environment variable holds, and build the handoff. Expect the environment's value within
+  /// `HANDOFF_TEXT_CAP`, the table read back through its section past the limit, every mount in it with its own record
+  /// and one handle, and the handoff's handles the channel's, the mounts' and the table's own.
+  #[test]
+  fn a_table_past_an_environment_variables_limit_is_handed_whole() {
+    use crate::handles::{HANDOFF_TEXT_CAP, RECORD_CAP};
+    let (_anchor, daemon) = channel().unwrap();
+    let mut held = Held::new(attachments(FULL_MOUNTS));
+    let event = one_event();
+    let value = handle_value(event.as_raw_handle());
+    let record = |id: u64| vec![u8::try_from(id).unwrap(); RECORD_CAP];
+    for id in 1..=u64::try_from(FULL_MOUNTS).unwrap() {
+      assert_eq!(
+        held.apply(myself(), hold(id, vec![value], &record(id))),
+        Some(HandleMessage::Held { id })
+      );
+    }
+    let handoff = held.handoff(&daemon).unwrap();
+    assert!(handoff.env().len() <= HANDOFF_TEXT_CAP, "{}", handoff.env());
+    let text = handed_text(&handoff, FULL_MOUNTS);
+    assert!(
+      text.len() > ENVIRONMENT_VARIABLE_CHARACTERS,
+      "a table of {} characters",
+      text.len()
+    );
+    let (_, entries) = handed(&handoff, FULL_MOUNTS);
+    assert_eq!(entries.len(), FULL_MOUNTS);
+    for (entry, id) in entries.iter().zip(1u64..) {
+      assert_eq!((entry.id, entry.values.len()), (id, 1));
+      assert_eq!(entry.record, record(id));
+    }
+    assert_eq!(handoff.handles().len(), 1 + FULL_MOUNTS + 1);
   }
 
   /// A-198. Do: ask to hold a value that is not a handle of the daemon. Expect: refused `Duplicate`, counted, nothing

@@ -297,6 +297,10 @@ impl LandFs for Interfering {
     self.tick();
     self.inner.set_mode(file, mode)
   }
+  fn set_windows(&mut self, file: HostFile, windows: u16) -> Result<(), HostError> {
+    self.tick();
+    self.inner.set_windows(file, windows)
+  }
   fn set_mtime(&mut self, file: HostFile, mtime_ns: i64) -> Result<(), HostError> {
     self.tick();
     self.inner.set_mtime(file, mtime_ns)
@@ -327,9 +331,9 @@ impl LandFs for Interfering {
     self.tick();
     self.inner.unlink(dir, name)
   }
-  fn mkdir(&mut self, dir: HostDir, name: &str, mode: u32) -> Result<(), HostError> {
+  fn mkdir(&mut self, dir: HostDir, name: &str, mode: u32, windows: u16) -> Result<(), HostError> {
     self.tick();
-    self.inner.mkdir(dir, name, mode)
+    self.inner.mkdir(dir, name, mode, windows)
   }
   fn rmdir(&mut self, dir: HostDir, name: &str) -> Result<(), HostError> {
     self.tick();
@@ -341,9 +345,10 @@ impl LandFs for Interfering {
     name: &str,
     target: &str,
     staged: &str,
+    windows: u16,
   ) -> Result<(), HostError> {
     self.tick();
-    self.inner.symlink(dir, name, target, staged)
+    self.inner.symlink(dir, name, target, staged, windows)
   }
   fn clone_temp(
     &mut self,
