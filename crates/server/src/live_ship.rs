@@ -1905,7 +1905,7 @@ fn take_batch(
   };
   queue.drain(..following.min(queue.len()));
   let carried = u64::try_from(following).map_or(u64::MAX, |following| following.saturating_add(1));
-  let _ = state::with_state(|s| {
+  let _ = state::with_state_counted(|s| {
     s.count(LIVE_BATCHES, 1);
     s.count(LIVE_BATCHED, carried);
   });
