@@ -103,7 +103,7 @@ pub const PROVISION_FLOOR_NS: u64 = PROVISION_FLOOR.get();
 #[cfg(not(windows))]
 pub const fn loaded_wake_ratio() -> Derived<u64> {
   derived!(
-    0,
+    100,
     "none: the window is F alone where a loaded wake was measured cheap",
     ["diag-liveness-35", "A-223"]
   )
