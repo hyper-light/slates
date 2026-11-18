@@ -66,6 +66,10 @@ const RETAIN: usize = 4;
 const LIVE_REFUSED: &str = "fleet.live.refused";
 /// Counter: whole records appended to a live log, each a copy of the volume's content.
 const LIVE_WHOLE: &str = "fleet.live.whole";
+/// Counter: the bytes of the whole records appended.
+const LIVE_WHOLE_BYTES: &str = "fleet.live.whole_bytes";
+/// Counter: the bytes of the changes (delta records) appended.
+const LIVE_CHANGE_BYTES: &str = "fleet.live.change_bytes";
 /// Counter: install images made from a publication's state (or a clean volume's, on the record period) for a holder
 /// behind the retained tail, beside the log rather than on it ([`refresh_image`]).
 const LIVE_IMAGE: &str = "fleet.live.install_image";
@@ -231,6 +235,92 @@ pub(crate) struct LiveVolume {
   heard: u64,
 }
 
+/// One candidate's copy of a live log as its shard's recovery image keeps it (A-200; §4.8 "Recovery": a warm restart
+/// keeps every replica the node acknowledged): its owner, its fence, the head it holds and the sealed entries since the
+/// last whole one.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HeldLive {
+  object: [u8; 16],
+  owner: u64,
+  fence: u64,
+  head: Option<HeldHead>,
+  /// The slot of the first entry (A-270).
+  first: u64,
+  /// The entries, from `first`, in slot order. A head piece carries none; recovery joins them from their own pieces.
+  entries: Vec<Vec<u8>>,
+}
+
+impl HeldLive {
+  /// The object this copy is of.
+  pub(crate) fn object(&self) -> [u8; 16] {
+    self.object
+  }
+
+  /// The slot of its first entry.
+  pub(crate) fn first(&self) -> u64 {
+    self.first
+  }
+
+  /// This copy with `entries`, from its first slot, joined to it.
+  pub(crate) fn with_entries(self, entries: Vec<Vec<u8>>) -> HeldLive {
+    HeldLive { entries, ..self }
+  }
+}
+
+/// A held copy's head, as [`HeldLive`] keeps it.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HeldHead {
+  epoch: u64,
+  position: u64,
+  identity: [u8; 32],
+}
+
+/// Holds again, after a warm restart, the copies a recovered image kept ([`held_copies`]), each with its fence.
+pub(crate) fn restore_copies(state: &mut ShardState, copies: Vec<HeldLive>) {
+  for copy in copies {
+    let object = ObjectId(copy.object);
+    let head = copy.head.map(|head| Head {
+      epoch: HostEpoch(head.epoch),
+      position: head.position,
+      identity: head.identity,
+    });
+    let bytes = copy
+      .entries
+      .iter()
+      .map(Vec::len)
+      .fold(0usize, usize::saturating_add);
+    let held = Held {
+      replica: Replica::recovered(HostId(copy.owner), object, HostEpoch(copy.fence), head),
+      entries: copy.entries.into(),
+      bytes,
+      first: copy.first,
+    };
+    // A copy made after the restart starts above every slot the recovered image carried.
+    let (_, end) = held.slots();
+    state.live.slot_floor = state.live.slot_floor.max(end);
+    state.live.held.insert(object, held);
+    state.count(LIVE_RESTORED, 1);
+  }
+}
+
+/// Counter: live copies a warm restart held again from the recovery image.
+const LIVE_RESTORED: &str = "fleet.live.restored";
+
+/// Counter: a holder's answer withheld because the publication that would keep what it acknowledged did not commit;
+/// the owner re-ships it.
+const LIVE_UNPUBLISHED: &str = "fleet.live.unpublished";
+
+/// Commits this shard's recovery image before a holder acknowledges what it now keeps (§4.8 "Recovery", as content and
+/// register holders do): `reply`, or nothing when the publication did not commit, which the owner reads as no answer
+/// and re-ships. A warm restart must hold again everything acknowledged, and its fence.
+fn acknowledged(state: &mut ShardState, reply: Vec<u8>) -> Vec<u8> {
+  if crate::verbs::publish_shard(state).is_err() {
+    state.count(LIVE_UNPUBLISHED, 1);
+    return Vec::new();
+  }
+  reply
+}
+
 /// What a candidate keeps of one live volume.
 #[derive(Debug)]
 pub(crate) struct Held {
@@ -239,6 +329,72 @@ pub(crate) struct Held {
   entries: VecDeque<Vec<u8>>,
   /// Their bytes.
   bytes: usize,
+  /// The slot of the first entry (A-270): entry `i` is slot `first + i`, its held piece's position. Entries are only
+  /// pushed after the last or all cleared ([`Held::clear_entries`], which moves it past them), so a slot never names
+  /// two entries, and a delta carries a copy's new slots and the ones it dropped.
+  first: u64,
+}
+
+impl Held {
+  /// Drops every entry: the next one pushed takes the slot after the last dropped.
+  fn clear_entries(&mut self) {
+    let dropped = u64::try_from(self.entries.len()).unwrap_or(u64::MAX);
+    self.first = self.first.saturating_add(dropped);
+    self.entries.clear();
+    self.bytes = 0;
+  }
+
+  /// The slots its entries hold: `first..end`.
+  pub(crate) fn slots(&self) -> (u64, u64) {
+    let held = u64::try_from(self.entries.len()).unwrap_or(u64::MAX);
+    (self.first, self.first.saturating_add(held))
+  }
+
+  /// The entry at `slot`, when it holds one.
+  pub(crate) fn entry_at(&self, slot: u64) -> Option<&[u8]> {
+    let index = usize::try_from(slot.checked_sub(self.first)?).ok()?;
+    self.entries.get(index).map(Vec::as_slice)
+  }
+
+  /// This copy's head piece's fields (A-270): its owner, fence, head and first slot, with no entries.
+  pub(crate) fn head_of(&self, object: ObjectId) -> HeldLive {
+    HeldLive {
+      object: object.0,
+      owner: self.replica.owner().0,
+      fence: self.replica.fence().0,
+      head: self.replica.head().map(|head| HeldHead {
+        epoch: head.epoch.0,
+        position: head.position,
+        identity: head.identity,
+      }),
+      first: self.first,
+      entries: Vec::new(),
+    }
+  }
+}
+
+#[cfg(test)]
+impl Held {
+  /// Test support (A-270's oracle): a copy of `object` for `owner` holding nothing, its first slot `first`.
+  pub(crate) fn for_test(owner: HostId, object: ObjectId, first: u64) -> Held {
+    Held {
+      replica: Replica::new(owner, object),
+      entries: VecDeque::new(),
+      bytes: 0,
+      first,
+    }
+  }
+
+  /// Test support: keeps `payload` after the last entry, as an accepted entry is kept.
+  pub(crate) fn push_for_test(&mut self, payload: Vec<u8>) {
+    self.bytes = self.bytes.saturating_add(payload.len());
+    self.entries.push_back(payload);
+  }
+
+  /// Test support: drops every entry, as a whole entry or an install does.
+  pub(crate) fn clear_for_test(&mut self) {
+    self.clear_entries();
+  }
 }
 
 /// The node's live-shipping state, on every shard: the volumes this shard owns and ships, and (on the control shard)
@@ -247,8 +403,12 @@ pub(crate) struct Held {
 pub(crate) struct LiveState {
   /// The live volumes this shard owns, by volume bytes.
   pub(crate) shipping: BTreeMap<[u8; 16], LiveVolume>,
-  /// What this node holds as a candidate, by object.
-  pub(crate) held: BTreeMap<ObjectId, Held>,
+  /// What this node holds as a candidate, by object. Tracked (`crate::tracked`), so a publication carries only the
+  /// copies reached since the last (A-270).
+  pub(crate) held: crate::tracked::Tracked<ObjectId, Held>,
+  /// The first slot a copy made now takes (A-270): at or above every slot a committed publication carried for any copy,
+  /// so a copy dropped and made again never reuses a published entry's key.
+  pub(crate) slot_floor: u64,
   /// The live volumes the publication in progress recorded, with their record (`None`: the publication was a
   /// checkpoint, so the whole image ships): shipped once it commits ([`ship_captured`]), dropped if it is refused.
   pub(crate) captured: Vec<(slates_db::catalog::VolumeId, Option<Vec<u8>>)>,
@@ -1107,6 +1267,7 @@ pub(crate) fn published(
   };
   match appended {
     Ok(entry) => {
+      let shipped = u64::try_from(payload.len()).unwrap_or(u64::MAX);
       live.owes_whole = false;
       live.kept = if whole {
         payload.len()
@@ -1129,6 +1290,9 @@ pub(crate) fn published(
       state.count(LIVE_APPENDED, 1);
       if whole {
         state.count(LIVE_WHOLE, 1);
+        state.count(LIVE_WHOLE_BYTES, shipped);
+      } else {
+        state.count(LIVE_CHANGE_BYTES, shipped);
       }
       if image_owed {
         // The volume's state now is this publication's, so its image is exactly the head just appended.
@@ -2445,10 +2609,15 @@ pub(crate) fn serve_entry(
     }
   });
   match &reply {
-    Err(error) => count_refused(state, refused_counter(error)),
-    Ok(_) => state.count(LIVE_HELD, 1),
+    Err(error) => {
+      count_refused(state, refused_counter(error));
+      encode_reply(&reply)
+    }
+    Ok(_) => {
+      state.count(LIVE_HELD, 1);
+      acknowledged(state, encode_reply(&reply))
+    }
   }
-  encode_reply(&reply)
 }
 
 /// A candidate's answer to an install from `peer`, as [`serve_entry`]: the install's state replaces what it held.
@@ -2474,8 +2643,7 @@ pub(crate) fn serve_install(
     let held = held_entry(state, peer, install.object);
     match held.replica.check_install(&install)? {
       Admitted::Apply(head) => {
-        held.entries.clear();
-        held.bytes = 0;
+        held.clear_entries();
         keep(held, &install.state, bound)?;
         held.replica.commit(install.epoch, head);
         Ok((Some(head), true))
@@ -2488,10 +2656,15 @@ pub(crate) fn serve_install(
   }
   let reply = reply.map(|(head, _)| head);
   match &reply {
-    Err(error) => count_refused(state, refused_counter(error)),
-    Ok(_) => state.count(LIVE_HELD, 1),
+    Err(error) => {
+      count_refused(state, refused_counter(error));
+      encode_reply(&reply)
+    }
+    Ok(_) => {
+      state.count(LIVE_HELD, 1);
+      acknowledged(state, encode_reply(&reply))
+    }
   }
-  encode_reply(&reply)
 }
 
 /// Why a holder will not serve a message about `object` made under `epoch`: below the fence its copy has promised it is
@@ -2522,7 +2695,7 @@ fn admitted(
   let placing = slates_cluster::content::ContentAccess::Place;
   let authority = crate::fleet::content_authority(
     regional,
-    &state.holder_records,
+    state.holder_records.as_map(),
     local,
     peer,
     placing,
@@ -2595,10 +2768,12 @@ fn refused_counter(error: &LiveError) -> &'static str {
 /// The holder's copy of `object`, kept for `owner`: the configuration names `owner` the volume's acting owner (the caller
 /// checked it, [`admitted`]), so a successor takes the copy over; the fence still refuses any stale epoch.
 fn held_entry(state: &mut ShardState, owner: HostId, object: ObjectId) -> &mut Held {
+  let first = state.live.slot_floor;
   let held = state.live.held.entry(object).or_insert_with(|| Held {
     replica: Replica::new(owner, object),
     entries: VecDeque::new(),
     bytes: 0,
+    first,
   });
   held.replica.reassign(owner);
   held
@@ -2621,7 +2796,7 @@ pub(crate) fn serve_fetch(
   let reading = slates_cluster::content::ContentAccess::Read;
   if !crate::fleet::content_authorized(
     regional,
-    &state.holder_records,
+    state.holder_records.as_map(),
     local,
     peer,
     reading,
@@ -2636,7 +2811,9 @@ pub(crate) fn serve_fetch(
       let head = held.replica.head();
       let entries: Vec<Vec<u8>> = held.entries.iter().cloned().collect();
       state.count(LIVE_FETCHED, 1);
-      slates_db::live::encode_fetched(&Ok(head), &entries)
+      // The fence this raised is a promise too: it outlives a restart before it is told.
+      let reply = slates_db::live::encode_fetched(&Ok(head), &entries);
+      acknowledged(state, reply)
     }
     Err(refusal) => slates_db::live::encode_fetched(&Err(refusal), &[]),
   }
@@ -2658,7 +2835,7 @@ pub(crate) fn serve_report(
   let reading = slates_cluster::content::ContentAccess::Read;
   if !crate::fleet::content_authorized(
     regional,
-    &state.holder_records,
+    state.holder_records.as_map(),
     local,
     peer,
     reading,
@@ -2673,7 +2850,9 @@ pub(crate) fn serve_report(
       let head = held.replica.head();
       let kept = u64::try_from(held.bytes).unwrap_or(u64::MAX);
       state.count(LIVE_REPORTED, 1);
-      slates_db::live::encode_reported(&Ok(head), kept)
+      // The fence this raised is a promise: it outlives a restart before it is told (as a fetch's, `serve_fetch`).
+      let reply = slates_db::live::encode_reported(&Ok(head), kept);
+      acknowledged(state, reply)
     }
     Err(refusal) => slates_db::live::encode_reported(&Err(refusal), 0),
   }
@@ -2696,10 +2875,12 @@ fn fenced_copy(
   object: ObjectId,
   epoch: slates_db::register::HostEpoch,
 ) -> Result<&mut Held, LiveError> {
+  let first = state.live.slot_floor;
   let held = state.live.held.entry(object).or_insert_with(|| Held {
     replica: Replica::new(successor, object),
     entries: VecDeque::new(),
     bytes: 0,
+    first,
   });
   held.replica.prepare(epoch)?;
   Ok(held)
@@ -2724,8 +2905,7 @@ pub(crate) fn serve_state(
 /// Keeps `payload` after what is held (a whole one first drops what came before it), within `bound`.
 fn keep(held: &mut Held, payload: &[u8], bound: usize) -> Result<(), LiveError> {
   if payload.first() == Some(&KIND_WHOLE) {
-    held.entries.clear();
-    held.bytes = 0;
+    held.clear_entries();
   }
   let bytes = held
     .bytes

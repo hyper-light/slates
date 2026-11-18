@@ -108,8 +108,13 @@
 >   replaces, so a captured proof sets nothing once the policy moved (`Refusal::PolicyChanged`);
 >   `launcher_secret.rs` 1 of 1 (red with the launcher secret ignored), `write_policy.rs` 8 of 8 (the replay test red
 >   with the version check removed);
-> - a consumer's own policy, the stricter of consumer and volume governing (refused `Unsupported` today);
-> - the MCP and SDK land verb gated by the policy (the grant kind stays refused there);
+> - **built (2026-11-18):** a consumer's own policy (its record, set on the channel and reaching every shard's bound
+>   slots before the answer, as a revocation does), held on the agent's own shard before routing: forbid refused,
+>   ask turns a landing into a presentation and a merge into a held submit (`SubmitHeld`, `EditSubmitHeld`), bypass
+>   passes to the volume's mode, so the stricter governs; `write_policy.rs` 9 of 9, the consumer test red with the
+>   gate removed;
+> - **built (2026-11-18):** the MCP and SDK land verb follows the policy (it already sent `Land`; its promises now
+>   say so); `assert_materialize_lands_under_a_bypass_policy` over MCP;
 > - signed work: a merge or landing may carry an SSH signature, checked and recorded (verified with its signer,
 >   unsigned, invalid with its reason), and a volume may require signed merges;
 > - the end-to-end proof on adacachy: a bypass agent's landing written at once, an ask agent's after approval, a
@@ -363,7 +368,7 @@
 > (`docs/bugs/2026-11-08-a-snapshot-decoded-the-log-it-released.md`).
 
 > **A checkpoint costs the whole shard in one verb's poll (found and measured 2026-11-08, OPEN; held for raft's recovery-format
-> work, §4.3 "Bounded work everywhere", §4.8).** A mutating verb's barrier is usually a delta, whose cost is its changes. Once
+> work until it landed 2026-11-17, §4.3 "Bounded work everywhere", §4.8).** A mutating verb's barrier is usually a delta, whose cost is its changes. Once
 > the deltas since the last checkpoint reach its size, or the log has no room, that verb's publish is a checkpoint of every
 > volume (`publish_checkpoint`, `encode_image_into`): the whole head, never a delta, inside the one poll.
 > - Measured (`a_barriers_cost_against_the_shards_size`, an ignored measurement in `crates/server/src/verbs.rs`; one volume on
@@ -378,9 +383,11 @@
 >   Linear in files, 96-137 ns a file in release and 1,336-1,909 in debug. The file's bytes add 10-20 % (64 B against 16 KiB).
 >   So about 110 ms per million files per shard in release, in one poll,
 >   amortized over about 0.6 small writes per file.
-> - **Why it waits:** a sliced or incremental checkpoint needs a consistent cut while the shard keeps mutating, in the recovery
->   format raft-5's incremental held image is changing, and two format changes at once would collide. Owed when that lands:
->   a failing test first (a shard of N files, one small write, the poll's longest step bounded and independent of N), then a
+> - **Why it waited:** a sliced or incremental checkpoint needs a consistent cut while the shard keeps mutating, in the recovery
+>   format raft-5's incremental held image was changing, and two format changes at once would collide. That format is on
+>   main since 2026-11-18 (A-270, image version 27, delta version 10, after A-275 took 26 and 9: the raft-7 merge
+>   92e1a73a), so nothing holds this now.
+>   Owed: a failing test first (a shard of N files, one small write, the poll's longest step bounded and independent of N), then a
 >   slice or the design's delta path. Tell raft and perf before building in `crates/vfs/src/checkpoint_log.rs`.
 
 > **A clone's name is held at its name's partition (2026-11-06, A-236, bug-sweep; the supervisor's option 3).** A clone
@@ -2244,6 +2251,27 @@
 > `not_a_member` and then 21 times `no_catalog` and held nothing for the whole run: a candidate that never receives the
 > volume's catalog keeps refusing, and the log rests on the other candidate alone (with it stopped, writes cannot be
 > durable; a soak run hung on exactly that). Owner: raft, next.
+>
+> **Found 2026-11-06 (raft), fixed 2026-11-07 (A-250): a restarted council leader never condemned a member that died
+> during its restart.**
+> Under anchors, with a candidate's daemon restarted warm while the owner was stopped and then killed, no takeover
+> began in 40 s: the restarted node led the council (term 2, three voters) and still listed the owner a member, but its
+> failure detector held no entry for it (the owner was already stopped when it came back, so it never heard from it and
+> never suspected it); the other survivor had dropped the owner. The reproduction is
+> `a_candidates_restored_copy_serves_its_owners_takeover` (`crates/cli/tests/live_fleet.rs`, ignored until 2026-11-09).
+> Root cause (read from the code, 2026-11-07): a node joins a member to its failure detector only once a session keyed
+> it (`member_task::join_addressable` reads `plane.keyed`), and its detector ignores gossip about members it has not
+> joined (AUD-15: no authenticated peer can name arbitrary targets). A member already down when the node restarts is
+> never keyed, so never joined, and the survivors' gossip of its death is dropped. Proposed fix, not yet built: also
+> join every member the committed configuration names whose address resolves, keyed or not. The configuration
+> authorizes them, so AUD-15's bound holds. The peers' death gossip then reaches the restarted node, while its own
+> unsendable probes stay no misses (the KIND rule in `MemberPlane::join`).
+> Closed by A-250 (caf06d71; the 2026-11-07 entry "a member down through a voter's restart was never taken over"): a
+> death is retired at `f + 1` voters, and a restarted voter watches every configured member, the join proposed above.
+> The reproduction runs again since it shares its volume with every node first (b79bae7b, 2026-11-09): `live_fleet` 31
+> of 31, three runs in a row (adacachy, 2026-11-11, 2c93f4c9). The holder's live copies rode its recovery image rebuilt
+> whole at each acknowledgement (`live_ship::acknowledged`, about 100 µs a live write, growing with what a candidate
+> keeps); since A-270 a publication carries only the pieces that changed (the 2026-11-08 entry).
 >
 > **As found, landing 13 (2026-11-05): a live takeover can wait for its quorum and never serve.** On adacachy in a
 > capped unit (`CPUQuota=1200%`, load 18–25), `a_superseded_owner_resumed_after_its_takeover_is_fenced`
@@ -6451,9 +6479,9 @@ line of its authority, or of the owner an install moved that authority from (sha
 objects learned, no extra write). The model measured and rejected three others: routing plus a chain path (204 lost),
 "the chain or the asker" (the asker's own objects learned), and the cohort-kept directory (one more commit per create).
 The held image carries `Acceptor::moved_from` as the acceptor's one encoding (`PersistedAcceptor`), at image version
-25 and delta version 8 (after conformance-14's A-262; raft-7 takes the numbers after), so a warm restart keeps an
-earlier move; an older image or delta is refused by its version, never read as "moved from none". (d), the process
-test, is built.
+25 and delta version 8 (after conformance-14's A-262; since A-270 landed, 2026-11-18, as a held register's piece at
+image version 27 and delta version 10, after A-275's 26 and 9), so a warm restart keeps an earlier move; an older
+image or delta is refused by its version, never read as "moved from none". (d), the process test, is built.
 
 **Open — one session per peer is lent exclusively.** A discovery page, a coordinator dispatch, a forward and
 a campaign each take the whole session out of its link, though the transport runs several exchanges on one
@@ -7099,6 +7127,15 @@ Open, owed in this workstream:
     skipped). Those tests are now serialized by a test-only gate: 0 of 80.
   - Closing the window for every spawner in a process needs every spawn to use `POSIX_SPAWN_CLOEXEC_DEFAULT`, or one
     owner of both pipe creation and spawning. Owed.
+  - **2026-11-18: the gate had two gaps, closed.** `mach_claim`'s stranger test spawns `sh` (GAP-A9-9) and `stream`'s two
+    `EPIPE` tests make a socket pair the same non-atomic way (A-161), and neither held the gate: g242's two failures
+    (the pipe's write `Ok(1)`, the stream's send `EAGAIN`) each came while the stranger's child ran. Every test in the
+    binary that spawns a process, and every one that asserts a descriptor's last close (an `EPIPE`, a zero read), the
+    Linux rendezvous's refused delivery among them, now holds it (`descriptor_test_gate`'s doc names them). A/B on a
+    15-core Mac at loads 47 to 53, each arm built apart and its binary run directly, interleaved: 8 of 100 runs failed
+    without the gate, 0 of 100 with it. Measured beside it: a spawn takes along only what was made inside the window,
+    for the child's whole life (a Python probe on this Mac, 444,617 socket pairs beside 138 `sleep 1` spawns: 4 held,
+    each 1.06 to 1.18 s, none short).
 
 Whole-workspace verification (2026-09-28): all 175 test binaries run directly, each under a timeout. Before
 the fixes below, 173 passed and 2 failed; both failed only outside `cargo test`, and both are fixed rather
@@ -15715,6 +15752,32 @@ because sixteen daemons share the test process, and was the second partition.
 - **What a fix has to decide.** A shard blocked in the kernel (state `D`) or runnable but starved (state `R`) is still
   working; one asleep (state `S`) using no CPU may be stuck. The current check cannot tell these apart. A refusal costs
   the start: in production the anchor restarts the daemon, with crash-loop backoff if it repeats (A-119).
+
+### 2026-11-08: a holder's acknowledgement published everything it held — fixed (A-270)
+
+raft-4's c6e178aa made a candidate publish before it acknowledges a live entry, so its copies survive its own warm
+restart. But each publication carried the shard's whole held image (the content hold, every register, every live copy
+with all its entries), rebuilt and compared byte for byte, so an acknowledgement cost what the holder held.
+- Across 64 held records a delta's held bytes grew from 2,224 to 55,216
+  (`a_holders_publication_carries_the_record_it_acknowledges_not_everything_it_holds`, red first).
+- A live write cost 207–225 µs at the median, against main's 65–76 µs.
+
+Now the held image is keyed pieces, and a delta carries only those put and removed: the same test holds the late median
+to one record's, and a live write costs 65–79 µs (BENCHMARKS, interleaved at load 42–113).
+- Held registers and live copies are tracked maps, so no change goes unmarked.
+- The format versions moved (image 27, delta 10, after A-275's 26 and 9), and another build's journal is refused
+  `RecoveryVersion`, never misread.
+- `a_candidates_restored_copy_serves_its_owners_takeover` runs again. Since main's per-host principals (A-237) a
+  survivor refused the taken-over volume's reads `NotShared`, with or without this change; the test now shares the
+  volume with every node first (b79bae7b), and `live_fleet` passed 31 of 31, three runs in a row (adacachy, 2026-11-11,
+  2c93f4c9, after giving the restart and takeover flows their own fleet names).
+
+Open:
+- The content hold and the mirror records are still compared whole at each publication.
+- `a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it` sometimes answers the fsync made with every
+  candidate running `EIO` (the "healthy" one). On main at 92dcd16c: once in 6 runs that reached it, at load 96. On
+  agents/raft-7: 2 in 9, once in the full suite at load over 100 and once alone at load 36 (adacachy, 2026-11-08).
+  Not this change's, so open: the counters of a failing run are kept in the agent's scratch (`fsync2-main-2.log`).
 
 ### 2026-11-07: a member down through a voter's restart was never taken over — fixed (A-250)
 

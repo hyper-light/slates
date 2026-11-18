@@ -256,6 +256,8 @@ mod tests {
   /// buffer is full (never a wait), and `EPIPE` after the peer has gone, with the test process still alive (no signal).
   #[test]
   fn a_full_end_refuses_at_once_and_a_gone_peer_answers_epipe() {
+    // A child another test spawns while the pair is made would hold the handed end ([`crate::descriptor_test_gate`]).
+    let _gate = crate::descriptor_test_gate();
     let (daemon, handed) = pair().unwrap();
     let chunk = [0u8; 4096];
     let mut sent = 0usize;
@@ -279,6 +281,8 @@ mod tests {
   /// discarded on macOS until the daemon's descriptor closes, and `EPIPE` on both after.
   #[test]
   fn ending_an_end_ends_both_directions_for_both_sides() {
+    // The last send waits on the daemon's end's last close ([`crate::descriptor_test_gate`]).
+    let _gate = crate::descriptor_test_gate();
     let (daemon, handed) = pair().unwrap();
     end(daemon.as_fd()).unwrap();
     let mut buf = [0u8; 8];

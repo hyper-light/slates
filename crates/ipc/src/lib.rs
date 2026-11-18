@@ -98,11 +98,21 @@ pub use rendezvous::{
 };
 pub use slot::{PAYLOAD_BYTES, Slot, SlotKind};
 
-/// Serializes the tests that hold a pipe they expect to close against the tests that spawn a child process. On Apple
-/// a pipe is made close-on-exec by an `fcntl` after `pipe` (no `pipe2`), and a child spawned by a parallel test inside
-/// that window inherits the read end for its whole life: `a_whole_record_takes_once_and_the_descriptor_is_closed`
-/// then wrote into a pipe that still had a reader, 2 of 80 runs beside `exit_watch`'s `/bin/sleep 30`, 0 of 80 without
-/// it (2026-10-06). The same window binds a harness, as `delivery`'s `pipe_close_on_exec` says.
+/// Serializes the tests that hold a descriptor they expect to close against the tests that spawn a child process. On
+/// Apple a pipe or a socket pair is made close-on-exec by an `fcntl` after `pipe` or `socketpair` (no `pipe2`, no
+/// `SOCK_CLOEXEC`), and a child spawned by a parallel test inside that window inherits the end for its whole life:
+/// `a_whole_record_takes_once_and_the_descriptor_is_closed` then wrote into a pipe that still had a reader, 2 of 80
+/// runs beside `exit_watch`'s `/bin/sleep 30`, 0 of 80 without it (2026-10-06). On Linux the ends are close-on-exec
+/// from birth, but a spawned child holds a copy of every descriptor until its `exec` closes them, and since Linux v6.11
+/// its parent may go on before that (A-183). The same window binds a harness, as `delivery`'s `pipe_close_on_exec`
+/// says.
+///
+/// So every test in this binary that spawns a process holds the gate across the spawn (`exit_watch`'s, and
+/// `mach_claim`'s stranger), and so does every test that asserts a descriptor's last close: an `EPIPE`, or a zero read
+/// (`delivery`'s descriptor tests, `stream`'s, and the Linux rendezvous's refused delivery). Until 2026-11-18 the
+/// stranger's `sh` and `stream`'s two tests went without it, and the lib's tests failed 2 of 4 runs on a loaded Mac,
+/// each time while the stranger's child ran: the pipe's write answered `Ok(1)`, the stream's send `EAGAIN`, where
+/// `EPIPE` was due.
 #[cfg(test)]
 #[allow(clippy::disallowed_types)]
 pub(crate) fn descriptor_test_gate() -> std::sync::MutexGuard<'static, ()> {
