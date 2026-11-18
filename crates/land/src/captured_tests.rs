@@ -38,6 +38,10 @@ const DIR_MODE: u32 = 0o040_755;
 const TERM_NS: u64 = 1_000_000_000_000;
 /// Shape: the large-file class boundary, one chunk window.
 const LARGE: u64 = 65_536;
+/// Shape: a file made executable (`chmod +x` of `FILE_MODE`).
+const EXECUTABLE_MODE: u32 = 0o100_755;
+/// Format: a mode's permission bits.
+const PERMISSIONS: u32 = 0o7777;
 
 fn store() -> Store {
   let mut arena = ChunkArena::new(PAGE);
@@ -364,4 +368,45 @@ fn a_target_already_holding_the_change_is_accepted_and_written_over_nothing() {
     Some(crate::engine::Outcome::Skipped(_))
   ));
   assert_eq!(host.bytes("/target/olddir/f.rs"), None);
+}
+
+/// A-458. Do: in a captured clone, `chmod` `/src/keep.rs`, a file whose bytes the agent never changed, from 0644 to
+/// 0755, and land the clone against its capture. Expect the change since the capture to hold the file, the landing
+/// `Done`, and the target's file at 0755 with its bytes and its inode kept (no byte rewritten). Before A-458 a captured
+/// clone's plan compared content alone, so it planned nothing for the file and its mode never landed.
+#[test]
+fn a_captured_clones_mode_change_alone_lands() {
+  let mut store = store();
+  let (origin, captured, mut clone) = captured_clone(&mut store);
+  let keep = clone.resolve(&store, "/src/keep.rs").unwrap().inode;
+  clone.chmod(&mut store, keep, EXECUTABLE_MODE).unwrap();
+  let (mut host, target) = disk(&[]);
+  let before = host.fingerprint("/target/src/keep.rs").unwrap();
+  let (presented, result) = land(
+    &mut host,
+    &target,
+    &mut store,
+    (&origin, captured, &mut clone),
+  );
+  assert!(
+    presented
+      .manifest
+      .entries
+      .iter()
+      .any(|e| e.path.as_ref() == "/src/keep.rs"),
+    "{:?}",
+    presented.manifest.entries
+  );
+  let report = result.unwrap();
+  assert_eq!(report.state, LandingState::Done, "{:?}", report.entries);
+  let after = host.fingerprint("/target/src/keep.rs").unwrap();
+  assert_eq!(after.mode & PERMISSIONS, EXECUTABLE_MODE & PERMISSIONS);
+  assert_eq!(
+    after.ino, before.ino,
+    "the same file: its bytes never rewritten"
+  );
+  assert_eq!(
+    host.bytes("/target/src/keep.rs").as_deref(),
+    Some(&b"kept"[..])
+  );
 }

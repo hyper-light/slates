@@ -219,6 +219,7 @@ fn action_name(action: &PlannedAction) -> &'static str {
     PlannedAction::Rmdir => "rmdir",
     PlannedAction::Symlink { .. } => "symlink",
     PlannedAction::Clear => "clear",
+    PlannedAction::Chmod { .. } => "chmod",
   }
 }
 

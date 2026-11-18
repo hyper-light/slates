@@ -706,7 +706,7 @@
 > Record: `docs/bugs/2026-11-18-the-watchdogs-end-left-its-writer-unjoined.md`.
 
 > **Open (g222, 2026-11-17, A-273): rebases and named-version reads of a green on the shards holding its works.**
-> Designed; steps 1 to 4 of five built. The owner spends 51–53% of its wall on verdicts and rebases at the 3,000-client rung (W1),
+> Designed; steps 1 to 4 and step 5a built. The owner spends 51–53% of its wall on verdicts and rebases at the 3,000-client rung (W1),
 > rebases the larger share (about 71,000 a run against 49,000 verdicts), and W1's rebase at 1,000 clients is slower
 > than main's because it crosses to the owner. A replica holds the green's metadata (about 14.2 MB at the rung, 3.8% of
 > a shard's 373.5 MB metadata budget on the Studio) and reads the owner's content in place, never a copy (the
@@ -732,10 +732,15 @@
 > (`OverBudget`, at its making, at a rebuild and after a message); the bytes an owner keeps for them against
 > `held_limit` = the per-green budget less the owner's own retention, past which its slowest replica is evicted
 > (`FeedRefusal::Evicted`, keeping its frees until it leaves); a change made while the last was unsent evicting every
-> replica (one message's blocks recorded at most). **Owed, in order:** the code on the shards (step 5: the holder
-> applies the derivations to the machine's figures and logs them, charges a replica to its shard's budget, routes a
-> refused or evicted replica's rebases and reads to the owner, counted, gives back an idle one, and makes a green's
-> replicas leave before it gives the owner up); the supervisor's A/B.
+> replica (one message's blocks recorded at most). **Built (step 5a, 2026-11-18, g083, A-457):** the shards hold a
+> green's replicas (`crates/server/src/green_replicas.rs`): the owner makes one on every other shard of the node, up to
+> the limit, before the green's first change; feeds each change over the cross-shard carrier; a replica is charged to
+> its own shard's budget within its derived budget and leaves, counted, when it refuses a message or its growth; a
+> destroyed, fenced, rolled-back or re-installed green's engine retires until every replica left, and the daemon's stop
+> closes every shard's replicas and waits for their registrations (no owner dropped with a reader); the limit and
+> budgets in the boot profile. **Owed, in order:** step 5b (a work's rebases and named-version reads served from its
+> shard's replica, a refused or evicted replica's routed to the owner, counted); an idle replica's give-back; the
+> supervisor's A/B.
 >
 > **A Shards guest's unprivileged run could not write a host-owned volume: built, the stream takes Shards' owner word
 > (2026-11-18, §4.6 the Shards form; A-281; goal g268).** Shards' init names the run's owner on a share's root with
@@ -892,8 +897,12 @@
 >   through kiln's server and the manifest written per runner with kiln's CA as its enrollment root (K2), and the
 >   operator's choice of which runners join, with `f` and each node's address, a chosen runner's Slates started with
 >   `StartSpec.fleet` once `role::check_fleet` (contract 39) read the manifest it wrote as its start will (K3).
-> - **Owed, in order:** kiln's relocation of an agent with its volume (detach, move, attach on the
->   target) and its workspaces made as clones of a captured base; the automatic migration by the origin of the last N
+> - **Kiln moves an agent with its volume (A-450, kiln K4, 2026-11-18):** through the library alone (`move_volume` to the
+>   target's member id, followed until `Moved`, every refusal by kind, the agent left running where it was), the
+>   target's runner mounting the moved volume under its own place once its new owner serves it. Today's kiln
+>   workspaces are overlays and are refused `NotPlain`; they move once made as clones of a captured base (K5). The live
+>   move across two Mac runners is filed for main.
+> - **Owed, in order:** kiln's workspaces made as clones of a captured base (K5); the automatic migration by the origin of the last N
 >   writes (AC-8.16's other half); a move carrying snapshots other than the head; a multi-runner test with injected
 >   faults. The capture's own owed parts: admission reserving its cost ahead, a large file read across slices rather
 >   than whole in one, and the report of bytes read and retained and of the elapsed cost (§4.15's status).
@@ -11372,14 +11381,22 @@ since A-402, which also makes the log option 2 names available to the WinFsp dri
 >   - The manifest's decode and Merkle identity in pieces: one piece today, a walk of the whole tree.
 >   - The full api suite, Linux and Windows lanes: filed for main (run-requests.md, 2026-11-18).
 
-### 2026-11-18: a snapshot exported as its archive through the library (Mantle's CP-T10.4; built, A-441); the volume from an archive built (A-453)
+### 2026-11-18: a snapshot exported as its archive through the library (Mantle's CP-T10.4; built, A-441); the volume from an archive built (A-453); the archive streamed (A-459)
 
 > - **Built.** `Instance::export_archive` (contract 38): a snapshot rendered as its archive file (`ARCHIVE_FILE`) in a
 >   new volume of the caller's, walked in slices on the owner shard, read back a page at a time with `read`.
 >   `a_snapshot_exported_as_its_archive_carries_every_file_and_entry` decodes and restores what it reads back: every
 >   file's bytes, length and mode, the directories, none of a write after the snapshot, the same manifest twice.
-> - **Owed.** A streamed encoder: the archive is held whole while it is encoded, one unit of its size. (The volume made
->   from an archive is built: A-453, the entry above.)
+> - **Closed (A-459, 2026-11-18): the streamed encoder.** The export walks the snapshot twice. The first walk measures
+>   each chunk and drops its bytes, and the archive is laid out and its volume admitted exactly. The second walk writes
+>   it through a stage emptied into the file at a copy slice, never past the threshold and one record of the largest
+>   chunk. The whole-buffer encoder is its oracle, byte for byte. Proven (Mac Studio, debug, kiln r349, r355):
+>   generated archives and 48 generated trees under measured codec points stream to the encoder's bytes; an archive
+>   more than twice the stage's bound streams within it, the stage emptied more often than the archive holds bounds;
+>   the export, import and hostile api tests pass through the daemon; red once each (the header outside the hash; the
+>   stage written only at the end).
+>   Owed: the manifest's encoding is held whole while it is written (metadata); an A/B of the second walk's cost.
+>   (The volume made from an archive is built: A-453, the entry above.)
 
 ### 2026-11-18: a volume a publication left out lost its logged writes at the next restart (found by reading; fixed, A-422)
 
@@ -18719,12 +18736,22 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   the grant; the Windows writer gives each file, directory and link it makes those bits and reads the word back,
   refusing the entry `EOPNOTSUPP` where the target's file system did not take one, as FAT drops `OFFLINE` and
   `NOT_CONTENT_INDEXED`; a directory link lands as one; its unit tests ran on the Mac Studio, its Windows test and two
-  oracle tests filed for main's lanes; still owed with it: a change of an untouched base file's bits alone lands
-  nothing, since a landing judges a base file by its bytes and passes the copy-up's entry `Skip`, as it passes a change
-  of its mode alone, which §4.15 step 1 names among what a landing carries, and a captured clone's entry likewise
-  compares content alone; a directory's bits, like a Unix directory's mode, are given after it is made, so a crash
-  between the two leaves it without them and a resumed landing takes it as already there; and the presented entry list
-  (`PlannedEntry`, §4.15 step 2) shows each entry's mode and not its bits, which the grant now binds); and
+  oracle tests filed for main's lanes; still owed with it: a directory's bits, like a Unix directory's mode, are given
+  after it is made, so a crash between the two leaves it without them and a resumed landing takes it as already there;
+  and the presented entry list (`PlannedEntry`, §4.15 step 2) shows each entry's mode and not its bits, which the grant
+  now binds, but for a metadata entry's); a file whose mode or Windows bits alone changed, which never landed (the
+  verdict judged a replacement by its bytes alone, a captured clone's plan compared content alone, and the plan read a
+  metadata-only copy-up's bytes from the disk, so an outsider's `chmod` of such a file refused the whole landing
+  `BaseDrift`), **fixed by A-458 the same day** (`docs/bugs/2026-11-18-a-files-mode-or-windows-bits-changed-alone-never-landed.md`:
+  a metadata entry, `Chmod`, judged field by field and set through the file's own handle, no byte rewritten; its unit
+  tests ran on the Mac Studio, the oracle and crash-oracle reruns filed for main; still owed with it: a metadata-only
+  write is made durable by its directory's sync alone, as a made directory's mode is, where a file-level `fsync` off the
+  shard is owed, from memory of ext4's and XFS's fsync paths, which commit only to the directory's own last change, to
+  verify; a mode Windows cannot hold (an execute bit) makes an entry whose set changes nothing there, and the next
+  landing finds the file as the disk keeps it; a check and a set are two calls on one handle, so an outsider's change to
+  the same field between them is not seen; a `touch` alone and a base directory's mode change alone still land nothing;
+  a captured clone's replacement overwrites an outsider's mode change where an overlay's refuses it (T-1.14); and the
+  manifest's encoding, which grants bind, has no golden vector); and
   the seam's numbering: refusals the engine tells apart are POSIX numbers and the rest Win32 codes, so a Win32 code equal
   to one of the engine's numbers (`ERROR_NOT_SAME_DEVICE` 17, `ERROR_INSUFFICIENT_BUFFER` 122, among five) would read as
   that refusal; none of the writer's calls is known to answer one, and a typed refusal at the seam would close it.

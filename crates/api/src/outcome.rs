@@ -209,6 +209,8 @@ pub struct ActionTally {
   pub symlink: u64,
   /// Directories emptied and kept.
   pub clear: u64,
+  /// Files whose mode or Windows attribute bits alone are set, their bytes kept (A-458).
+  pub chmod: u64,
 }
 
 impl ActionTally {
@@ -223,6 +225,7 @@ impl ActionTally {
       self.rmdir,
       self.symlink,
       self.clear,
+      self.chmod,
     ]
     .iter()
     .fold(0u64, |sum, count| sum.saturating_add(*count))
@@ -332,6 +335,7 @@ pub(crate) fn summary_of(summary: &LandingSummary) -> Summary {
       rmdir: typed.rmdir,
       symlink: typed.symlink,
       clear: typed.clear,
+      chmod: typed.chmod,
     },
     bytes: summary.bytes,
     filtered_out: summary.filtered_out,
@@ -387,6 +391,7 @@ mod tests {
         rmdir: 6,
         symlink: 7,
         clear: 8,
+        chmod: 9,
       },
     };
     let typed = summary_of(&summary);
@@ -400,11 +405,12 @@ mod tests {
         actions.mkdir,
         actions.rmdir,
         actions.symlink,
-        actions.clear
+        actions.clear,
+        actions.chmod
       ],
-      [1, 2, 3, 4, 5, 6, 7, 8]
+      [1, 2, 3, 4, 5, 6, 7, 8, 9]
     );
-    assert_eq!(actions.total(), 36);
+    assert_eq!(actions.total(), 45);
     assert_eq!((typed.bytes, typed.filtered_out), (7, 2));
   }
 

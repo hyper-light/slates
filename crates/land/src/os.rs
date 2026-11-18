@@ -762,6 +762,12 @@ impl LandFs for OsLand {
     ran
   }
 
+  /// The file opened to read, never through a link (`O_NOFOLLOW`; a regular file alone): `fchmod` asks ownership, not
+  /// write access (A-458). A file its owner may not read is refused `EACCES`, typed, and the entry fails.
+  fn open_to_chmod(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError> {
+    self.host.open_file(dir, name)
+  }
+
   fn set_mode(&mut self, file: HostFile, mode: u32) -> Result<(), HostError> {
     rustix::fs::fchmod(self.file(file)?, mode_bits(mode)).map_err(refusal)
   }

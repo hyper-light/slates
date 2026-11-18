@@ -52,9 +52,13 @@ use crate::grant::{
   GrantBinding, GrantId, GrantRecord, GrantRefusal, GrantScope, Grants, LandingLease,
   LandingLeaseHeld, TargetIdentity, lease_key,
 };
-use crate::manifest::{Action, Filter, Judged, LandingEntry, Manifest, OverlayIdentity, Summary};
+use crate::manifest::{
+  Action, FileMeta, Filter, Judged, LandingEntry, Manifest, OverlayIdentity, Summary,
+};
 pub use crate::source::Source;
-use crate::verdict::{ConflictClass, DiskState, Verdict, content_verdict, verdict};
+use crate::verdict::{
+  ConflictClass, DiskState, MetaVerdict, Verdict, content_verdict, meta_verdict, verdict,
+};
 
 /// Format: the prefix of every hidden sibling a landing creates inside the granted target; the
 /// landing id follows, then a per-landing counter, so a sweep recognizes its own names.
@@ -1612,6 +1616,7 @@ impl<H: LandFs> Landing<'_, H> {
       Action::Rmdir => self.remove_tree_entry(dir_path, name, entry.witnessed.as_ref())?,
       Action::Clear => return self.clear_entry(dir_path, name, entry),
       Action::Rename { from } => self.rename_dir(from, dir_path, name, entry.witnessed.as_ref())?,
+      Action::Chmod { from, to } => self.chmod(dir_path, name, *from, *to)?,
     };
     Ok(Written {
       outcome,
@@ -2165,6 +2170,62 @@ impl<H: LandFs> Landing<'_, H> {
       }
       None => Ok(Outcome::Conflict(ConflictClass::TargetInUse)),
     }
+  }
+
+  /// A file's metadata entry (A-458): the file opened through its own handle, never through a link
+  /// ([`LandFs::open_to_chmod`]), and judged again by that handle's `fstat`, field by field ([`meta_verdict`]), so what
+  /// is set lands on the object judged and a field an outsider changed since the validation is never overwritten
+  /// (`TargetInUse`). Then each field to set is set through the handle (`set_mode`, `set_windows`); no byte is
+  /// written. A check and a set are two calls on one handle: an outsider's change to the same field between them is the
+  /// one it cannot see, as POSIX and Windows offer no compare-and-set of a mode.
+  fn chmod(
+    &mut self,
+    dir_path: &str,
+    name: &str,
+    from: FileMeta,
+    to: FileMeta,
+  ) -> Result<Outcome, WriteFailure> {
+    let dir = self.open_dir_path(dir_path)?;
+    self.touched.insert(dir_path.into());
+    let file = match self.host.open_to_chmod(dir, name) {
+      Ok(file) => file,
+      Err(HostError::NotFound) => return Ok(Outcome::Conflict(ConflictClass::TargetInUse)),
+      Err(e) => return Err(e.into()),
+    };
+    let set = self.chmod_open(file, &join(dir_path, name), from, to);
+    self.host.close_file(file);
+    set
+  }
+
+  /// [`Landing::chmod`] through its open file.
+  fn chmod_open(
+    &mut self,
+    file: HostFile,
+    path: &str,
+    from: FileMeta,
+    to: FileMeta,
+  ) -> Result<Outcome, WriteFailure> {
+    let found = self.host.fstat(file)?;
+    let (permissions, windows) = match meta_verdict(from, FileMeta::of_fingerprint(&found), to) {
+      MetaVerdict::Conflict => return Ok(Outcome::Conflict(ConflictClass::TargetInUse)),
+      MetaVerdict::Held => return Ok(Outcome::AcceptedIdentical),
+      MetaVerdict::Set {
+        permissions,
+        windows,
+      } => (permissions, windows),
+    };
+    if let Some(permissions) = permissions {
+      // The file's own type bits, beside the volume's permission bits.
+      let mode = (found.mode & !FileMeta::PERMISSIONS) | permissions;
+      self.host.set_mode(file, mode)?;
+    }
+    if let Some(windows) = windows {
+      self.host.set_windows(file, windows)?;
+    }
+    // What the set left, which a landing of a snapshot rebases the head's file on ([`advance_step`]).
+    let placed = self.host.fstat(file)?;
+    self.placed.insert(path.into(), placed);
+    Ok(Outcome::Written)
   }
 
   /// A recursive removal: the directory's inode must be the witnessed one; then the directory is renamed to
@@ -2835,7 +2896,7 @@ fn owned_paths(manifest: &Manifest) -> Ours {
       .filter(|e| match e.action {
         Action::Create | Action::Mkdir | Action::Symlink { .. } | Action::Clear => made,
         Action::Delete | Action::Rmdir => !made,
-        Action::Replace | Action::Rename { .. } => false,
+        Action::Replace | Action::Rename { .. } | Action::Chmod { .. } => false,
       })
       .map(|e| e.path.to_string())
       .collect()

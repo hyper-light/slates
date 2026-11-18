@@ -54,6 +54,19 @@ impl Source {
     }
   }
 
+  /// Whether inode `no`'s bytes are its witness's, none of its own (A-458): `Volume::holds_witnessed_bytes`.
+  pub(crate) fn holds_witnessed_bytes(
+    self,
+    vol: &Volume,
+    store: &Store,
+    no: InodeNo,
+  ) -> Result<bool, VfsError> {
+    match self {
+      Source::Head => vol.holds_witnessed_bytes(store, no),
+      Source::Snapshot(id) => vol.holds_witnessed_bytes_in(store, id, no),
+    }
+  }
+
   /// Inode `no`'s Windows attribute bits (A-262), which its landing carries (A-451).
   pub(crate) fn windows(
     self,
