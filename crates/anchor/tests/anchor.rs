@@ -273,11 +273,20 @@ fn serving_child() {
     supervision.beat(n);
   }
   supervision.mark_serving(beats);
-  // It serves until its parent kills it, as a daemon serves until it is ended; one nobody kills exits after the wait a
-  // child gets.
+  // It serves until its parent kills it, as a daemon serves until it is ended; one nobody kills exits once its parent's
+  // whole watch is over, so however slowly a loaded machine starts it, it never leaves before it is judged recovered.
   #[allow(clippy::disallowed_methods)]
-  std::thread::sleep(Duration::from_millis(CHILD_WAIT_MS));
+  std::thread::sleep(served_watch());
   std::process::exit(exit);
+}
+
+/// Shape: the kills [`a_daemon_killed_after_it_served_is_restarted_every_time`] drives: six, three times the two failed
+/// starts in a row that would make a crash loop.
+const SERVED_KILLS: u32 = 6;
+
+/// How long that test watches its kills: the wait a child gets, once a kill and once more.
+fn served_watch() -> Duration {
+  Duration::from_millis(CHILD_WAIT_MS) * (SERVED_KILLS + 1)
 }
 
 /// The child whose start runs [`CHILD_START_MS`] and fails before it serves: it attaches, beats, waits out its start and
@@ -613,8 +622,7 @@ fn a_crashing_daemon_is_restarted_once_then_backed_off_and_the_segment_says_so()
 /// runners, every earlier successor having served.
 #[test]
 fn a_daemon_killed_after_it_served_is_restarted_every_time() {
-  /// Shape: the kills driven: six, three times the two failed starts in a row that would make a crash loop.
-  const KILLS: usize = 6;
+  let kills = usize::try_from(SERVED_KILLS).unwrap();
   let segment = AnchorSegment::create(
     &unique_name("slates-anchor-test-served"),
     &identity(),
@@ -635,12 +643,12 @@ fn a_daemon_killed_after_it_served_is_restarted_every_time() {
   }
   let clock = Instant::now();
   supervisor.start(now_ns(clock)).unwrap();
-  let deadline = Duration::from_millis(CHILD_WAIT_MS) * u32::try_from(KILLS + 1).unwrap();
+  let deadline = served_watch();
   let mut killed = 0usize;
   let mut counted = Vec::new();
   let mut published_afresh = Vec::new();
   let mut refused = None;
-  while counted.len() < KILLS && clock.elapsed() < deadline {
+  while counted.len() < kills && clock.elapsed() < deadline {
     match supervisor.step(now_ns(clock)).unwrap() {
       Step::Running => {
         // Each daemon is killed once, and only once its supervisor has published that it recovered.
@@ -667,12 +675,12 @@ fn a_daemon_killed_after_it_served_is_restarted_every_time() {
   supervisor.stop().ok();
   assert_eq!(
     (counted, refused),
-    (vec![0; KILLS], None),
+    (vec![0; kills], None),
     "a daemon killed after it recovered is restarted at every exit with no failed start counted"
   );
   assert_eq!(
     published_afresh,
-    vec![true; KILLS],
+    vec![true; kills],
     "each successor's recovery is judged afresh, never inherited from the daemon before it"
   );
 }
