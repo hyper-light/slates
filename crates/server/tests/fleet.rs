@@ -11091,7 +11091,9 @@ const LIVE_TAKEN_OVER: &str = "fleet.live.taken_over";
 /// A-330), until `successor` has taken the volume over from its live log (counted `fleet.live.taken_over`); then gives
 /// it its probe plane back. Whether the takeover was counted.
 fn taken_over_on_the_probe_plane(daemons: &[Daemon], hosts: &[HostId], successor: &Daemon) -> bool {
-  let before = refusal_count(successor, LIVE_TAKEN_OVER).unwrap_or(0);
+  // Summed over the successor's shards: the takeover is counted on the volume's owner shard, which is not the control
+  // shard on a daemon of more than one.
+  let before = taken_over_count(successor);
   let cut = daemons[0]
     .inject_probe_deafness(&[hosts[1], hosts[2]])
     .and_then(|()| daemons[1].inject_probe_deafness(&[hosts[0]]))
@@ -11099,7 +11101,7 @@ fn taken_over_on_the_probe_plane(daemons: &[Daemon], hosts: &[HostId], successor
   let observed: Vec<&Daemon> = daemons.iter().collect();
   let taken = cut.is_ok()
     && poll_until(&observed, RETIREMENT_DEADLINE, || {
-      refusal_count(successor, LIVE_TAKEN_OVER).map(|count| count > before)
+      Ok(taken_over_count(successor) > before)
     });
   let healed = daemons
     .iter()
@@ -14102,11 +14104,12 @@ fn a_successors_own_copy_keeps_its_raised_fence_across_its_warm_restart() {
 }
 
 /// A-344 (§4.10; §4.8 "Recovery", "Leases and reads": ReadSafety): a superseded owner restarted warm stays superseded,
-/// so a read through it is the successor's. Do: three nodes at `f = 1` over anchors, two shards each; on a, a live volume
-/// written six files; cut a off on the probe plane alone until the survivor the volume ranks first takes it over, then
-/// give it back; write a file through a until a write is answered (the first finds a's fence, A-338); restart a warm;
-/// read that file through a client of a. Expect the read to answer the file's bytes. Before, a's fence lived in its
-/// shipper's memory: restarted, a took the volume for its own again and answered the read from its own copy, which the
+/// so a read through it answers its successor's writes. Do: three nodes at `f = 1` over anchors, two shards each; on a, a
+/// live volume written six files; cut a off on the probe plane alone until the survivor the volume ranks first takes it
+/// over, then give it back; write a file through the successor; write once through a, which finds a's fence and is
+/// refused (A-338), its attachment and its client kept, so no later verb of a's publishes; restart a warm; read the
+/// successor's file through a client of a. Expect the read to answer the file's bytes. Before, a's fence lived in its
+/// shipper's memory alone: restarted, a took the volume for its own again and answered from its own copy, which the
 /// successor's writes had passed (`NotFound`).
 #[test]
 fn a_superseded_owner_restarted_warm_answers_reads_with_its_successors_writes() {
@@ -14123,16 +14126,27 @@ fn a_superseded_owner_restarted_warm_answers_reads_with_its_successors_writes() 
     rendezvous_first(&[hosts[1], hosts[2]], ObjectId(id.bytes)).expect("a survivor takes over");
   let successor = if successor == hosts[1] { 1 } else { 2 };
   let taken = taken_over_on_the_probe_plane(&daemons, &hosts, &daemons[successor]);
-  let path = "/through-the-old-owner";
-  let through_a = written_through(&daemons, 0, id, path);
+  let on_the_successor = continuity_write(daemons[successor].instance(), id, CONTINUITY_FILES);
+  let mut through_a = Client::connect(daemons[0].instance());
+  let attachment = write_attachment(&mut through_a, id);
+  let fenced = through_a.call(&RequestBody::FsWrite {
+    volume: id,
+    attachment,
+    path: "/through-the-old-owner".to_owned(),
+    bytes: b"through the old owner".to_vec(),
+    mode: 0o644,
+  });
+  // The client stays until a's daemon is gone: its leaving would reap its attachment, a verb that publishes a's shard.
   daemons.remove(0).stop();
+  drop(through_a);
   daemons.insert(0, fleet.start(0));
   let mut reader = Client::connect(daemons[0].instance());
+  let path = format!("/continuity-{CONTINUITY_FILES}");
   let mut last = None;
   let observed: Vec<&Daemon> = daemons.iter().collect();
   let read = poll_for_periods(&observed, PLACEMENT_DEADLINE, SUPERSEDED_PERIODS, || {
-    let reply = read_at_head(&mut reader, id, path);
-    let answered = matches!(&reply, ReplyBody::ReadBytes { bytes } if bytes == path.as_bytes());
+    let reply = read_at_head(&mut reader, id, &path);
+    let answered = matches!(&reply, ReplyBody::ReadBytes { bytes } if *bytes == continuity_body(CONTINUITY_FILES));
     last = Some(reply);
     Ok(answered)
   });
@@ -14142,8 +14156,8 @@ fn a_superseded_owner_restarted_warm_answers_reads_with_its_successors_writes() 
     daemon.stop();
   }
   eprintln!(
-    "a superseded owner's warm restart: taken {taken}, writes through a {through_a:?}, the read through a after its \
-     restart answered {last:?}"
+    "a superseded owner's warm restart: taken {taken}, written on the successor {on_the_successor:?}, through a \
+     {fenced:?}, the read through a after its restart answered {last:?}"
   );
   assert!(
     written
@@ -14156,14 +14170,21 @@ fn a_superseded_owner_restarted_warm_answers_reads_with_its_successors_writes() 
     "the successor took the volume over from its live log"
   );
   assert!(
-    through_a
-      .last()
-      .is_some_and(|reply| matches!(reply, ReplyBody::FsDone { .. })),
-    "a write through a reached the successor before a's restart: {through_a:?}"
+    matches!(on_the_successor, ReplyBody::FsDone { .. }),
+    "the successor took a write: {on_the_successor:?}"
+  );
+  assert!(
+    matches!(
+      fenced,
+      ReplyBody::Refused {
+        refusal: Refusal::StaleEpoch { .. }
+      }
+    ),
+    "a's write found its fence: {fenced:?}"
   );
   assert!(
     read,
-    "a read through a after its warm restart answers the successor's bytes: {last:?}"
+    "a read through a after its warm restart answers the successor's write: {last:?}"
   );
 }
 

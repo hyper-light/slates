@@ -1371,6 +1371,11 @@ fn fenced(state: &ShardState, volume: [u8; 16]) -> Option<HostEpoch> {
   }
 }
 
+/// Counter: a superseded owner's fence that its learning could not publish at once (A-344); the next publication keeps
+/// it.
+/// Format: a counter name in the daemon's status report.
+const LIVE_FENCE_UNPUBLISHED: &str = "fleet.live.fence_unpublished";
+
 /// Counter: a write refused `StaleEpoch` because its owner here was superseded.
 const LIVE_FENCED: &str = "fleet.live.fenced";
 
@@ -2860,9 +2865,17 @@ fn fold_into(state: &mut ShardState, replies: Vec<(ObjectId, HostId, Vec<u8>)>) 
     if let Next::Fenced(current) = live.shipper.on_reply(host, reply) {
       // A later epoch holds the volume: this owner was superseded, ships no more of it, and tells every write waiting
       // on it so.
+      let learned = live.fenced.is_none_or(|known| known < current);
       live.fenced = Some(current);
-      // Kept by the next publication, so a restart does not forget it (A-344).
-      state.live.owned_dirty.insert(object.0);
+      if learned {
+        // Kept before anyone is told, as a holder keeps a fence it raised: a restart must not forget that this owner was
+        // superseded, or it answers reads from the copy its successor's writes have passed (A-344). A refused
+        // publication leaves the mark for the next.
+        state.live.owned_dirty.insert(object.0);
+        if crate::verbs::publish_shard(state).is_err() {
+          state.count(LIVE_FENCE_UNPUBLISHED, 1);
+        }
+      }
       refuse_awaiting(state, object.0, current);
       wake_parked(state, object.0);
       continue;
