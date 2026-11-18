@@ -2599,7 +2599,7 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
   // is still its prior (zero samples) reads as one. Nothing sets it.
   let failover = &report.fleet.failover;
   out.push_str(&format!(
-    "fleet_failover: total_ns={} detection_ns={} (round_trips {}) confirmation_ns={} (periods {}) recovery_ns={} (takeovers {} volumes {})\n",
+    "fleet_failover: total_ns={} detection_ns={} (detector periods {}) confirmation_ns={} (coordinator periods {}) recovery_ns={} (takeovers {} volumes {})\n",
     failover.total_ns,
     failover.detection_ns,
     failover.detection_samples,

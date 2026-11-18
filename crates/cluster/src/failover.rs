@@ -8,12 +8,12 @@
 //! computed once at boot is still a constant ("2.9 s is just an arbitrary constant, not a learned or data derived method
 //! that adapts"). So each term here is the running estimate of the path it names, fed by the traffic that path carries:
 //!
-//! - **Detection `D`**, from a peer's last answer to this node's detector condemning it: hyper-swim's
-//!   `Detector::detection_bound` as the period asks. Each pair is Chen, Toueg and Aguilera's NFD-E (IEEE Transactions on
-//!   Computers 51(5), 2002) over the probe stream, with Lifeguard's local health (Dadgar, Phillips & Currey, DSN 2018): a
-//!   member condemns only once another member has answered it since, and its own wake lateness floors every margin. The
-//!   bound counts `2(2m − 1) + 1` periods (SWIM's round-robin probing, Das, Gupta & Motivala, DSN 2002, §4.3), each at
-//!   the longest this member has run, so a starved or far member's `D` grows with it.
+//! - **Detection `D`**, from a peer's last answer to this node's detector condemning it ([`detection`]): SWIM's count of
+//!   `2(2m − 1) + 1` periods (round-robin probing, Das, Gupta & Motivala, DSN 2002, §4.3), each at the running tail of
+//!   the detector's own measured period, so a starved or far member's `D` grows with its periods and falls back as they
+//!   recover. Each pair is Chen, Toueg and Aguilera's NFD-E (IEEE Transactions on Computers 51(5), 2002) over the probe
+//!   stream, with Lifeguard's local health (Dadgar, Phillips & Currey, DSN 2018): a member condemns only once another
+//!   member has answered it since, and its own wake lateness floors every margin, so both stretch the periods `D` counts.
 //!
 //!   *The false-suspicion probability is derived, never set.* Each pair's margin `α` is the one that minimizes the
 //!   expected unavailability `U = (E(D) + α + η + T_E)/MTBF + T_E·β/η` (hyper-timing's `qos`): a later deadline costs
@@ -45,8 +45,6 @@
 //! What it does not do yet (A-363, owed): the waits that bound a failover (a forward's bound, the location round's cap,
 //! a live takeover's fetch, the takeover's attempts) and the lease terms still read the operator's placeholder; each
 //! moves to this estimate, or to a φ-accrual detector of its own holder's renewals, in its own change.
-
-use std::time::Duration;
 
 use slates_transport::rtt::RttEstimator;
 
@@ -101,13 +99,27 @@ pub struct Term {
   pub samples: u64,
 }
 
-/// The detection term from the detector's answer as this period asks it: its bound on the time from a crashed peer's
-/// last answer to its condemnation, and the round trips its pooled verdict stands on. `None` while the detector has
-/// run no period (no peer, or the membership task not started), when there is nothing to detect yet.
-pub fn detection(bound: Option<Duration>, round_trips: u64) -> Option<Term> {
-  bound.map(|bound| Term {
-    ns: u64::try_from(bound.as_nanos()).unwrap_or(u64::MAX),
-    samples: round_trips,
+/// The detection term (A-363): SWIM's count of the periods from a crashed peer's last answer to its condemnation pending,
+/// `2(2m − 1) + 1` for `m` members besides this one, each at the tail of the detector's measured period. Under SWIM's
+/// round-robin probing the next probe of a peer is at most `2m − 1` periods away (Das, Gupta & Motivala, DSN 2002,
+/// §4.3); unanswered, it suspects the peer; Lifeguard's buddy probe that tells it is at most as far again, and its own
+/// period resolves the condemnation (hyper-swim's `Detector::detection_bound` counts the same). hyper-swim's bound counts
+/// each period at the longest the member ever ran, a ratchet that one slow period sets for good: on a quiet three-node
+/// loopback fleet it read 7.0 and 14.0 s before any loss where other runs read 0.9 s (2026-11-18, the Mac Studio). The
+/// running tail forgets a slow period as later ones run at their pace, so the term keeps learning. `None` with no member
+/// besides this one (nothing to detect), or before a period was timed.
+pub fn detection(members_besides: u64, periods: &RunningDuration) -> Option<Term> {
+  if members_besides == 0 {
+    return None;
+  }
+  let count = members_besides
+    .saturating_mul(2)
+    .saturating_sub(1)
+    .saturating_mul(2)
+    .saturating_add(1);
+  periods.tail_ns().map(|tail| Term {
+    ns: count.saturating_mul(tail),
+    samples: periods.samples(),
   })
 }
 
@@ -419,14 +431,16 @@ mod tests {
     assert!(measured.ns > near.ns);
   }
 
-  /// Do: refresh with a detection bound of 900 ms on 12 round trips and a timed takeover of 500 ms. Expect the failover
-  /// delay to be the three terms summed, each with its measurements, and a detector that ran no period to contribute
-  /// nothing.
+  /// Do: refresh with a detection term of 900 ms on 12 periods and a timed takeover of 500 ms. Expect the failover delay
+  /// to be the three terms summed, each with its measurements, and a detector that ran no period to contribute nothing.
   #[test]
   fn the_failover_delay_is_the_sum_of_its_terms() {
     let mut failover = Failover::new();
     failover.takeover_done(500_000_000);
-    let detected = detection(Some(Duration::from_millis(900)), 12);
+    let detected = Some(Term {
+      ns: 900_000_000,
+      samples: 12,
+    });
     let estimate = failover.refresh(detected, &ElectionTiming::floor(), HEARTBEAT);
     assert_eq!(
       estimate.detection,
@@ -440,12 +454,63 @@ mod tests {
       estimate.total_ns(),
       900_000_000 + confirmation.ns + 1_500_000_000
     );
-    let undetected = failover.refresh(detection(None, 0), &ElectionTiming::floor(), HEARTBEAT);
+    let undetected = failover.refresh(None, &ElectionTiming::floor(), HEARTBEAT);
     assert_eq!(undetected.detection, None);
     assert_eq!(
       undetected.total_ns(),
       confirmation.ns + 1_500_000_000,
       "a detector with no period adds nothing"
+    );
+  }
+
+  /// Do: count detection for two members besides this one over periods timed at 128 ms. Expect SWIM's seven periods
+  /// (`2(2m − 1) + 1`) at the period's tail, the periods counted; and nothing to detect with no member besides this one,
+  /// or before a period was timed.
+  #[test]
+  fn detection_counts_swims_periods_at_the_measured_period() {
+    let mut periods = RunningDuration::new();
+    assert_eq!(detection(2, &periods), None, "no period timed yet");
+    for _ in 0..32 {
+      periods.on_sample(128_000_000);
+    }
+    let tail = periods.tail_ns().expect("periods timed");
+    assert_eq!(
+      detection(2, &periods),
+      Some(Term {
+        ns: 7 * tail,
+        samples: 32,
+      })
+    );
+    assert_eq!(detection(0, &periods), None, "no member to detect");
+    assert_eq!(
+      detection(4, &periods).map(|term| term.ns),
+      Some(15 * tail),
+      "four members besides: fifteen periods"
+    );
+  }
+
+  /// Do: time one detector period that ran 2 s (a stall at formation), then periods of 128 ms. Expect the detection term
+  /// to stand far above its steady value after the stall, then to fall back within a few periods' worth of samples to
+  /// under twice the steady seven periods: a running estimate forgets what the detector's own bound keeps for good.
+  #[test]
+  fn detection_forgets_a_period_that_ran_long_once() {
+    let mut periods = RunningDuration::new();
+    for _ in 0..16 {
+      periods.on_sample(128_000_000);
+    }
+    periods.on_sample(2_000_000_000);
+    let stalled = detection(2, &periods).expect("periods timed").ns;
+    assert!(
+      stalled > 7 * 1_000_000_000,
+      "the stall shows at once: {stalled}"
+    );
+    for _ in 0..32 {
+      periods.on_sample(128_000_000);
+    }
+    let recovered = detection(2, &periods).expect("periods timed").ns;
+    assert!(
+      recovered < 2 * 7 * 128_000_000,
+      "the stall is forgotten as periods run at their pace: {recovered}"
     );
   }
 

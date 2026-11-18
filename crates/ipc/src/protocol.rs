@@ -1674,11 +1674,11 @@ pub struct FleetReport {
 pub struct FailoverReport {
   /// The failover delay, nanoseconds: the three terms summed.
   pub total_ns: u64,
-  /// Detection: the failure detector's bound on the time from a crashed peer's last answer to its condemnation
-  /// (SWIM with Lifeguard's local health, each pair judged by NFD-E), nanoseconds; zero where there is no peer to
-  /// detect.
+  /// Detection: SWIM's count of the failure detector's periods from a crashed peer's last answer to its condemnation,
+  /// each at the running tail of the detector's measured period (Lifeguard's local health and each pair's NFD-E margin
+  /// stretch them), nanoseconds; zero where there is no peer to detect.
   pub detection_ns: u64,
-  /// The round trips the detector's pooled verdict stands on.
+  /// The detector periods timed behind it.
   pub detection_samples: u64,
   /// Confirmation: the council's death-confirmation window at the coordinator's measured period, with the retirement's
   /// commit round and its install, nanoseconds; zero where there is no council.

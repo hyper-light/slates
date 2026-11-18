@@ -1870,8 +1870,8 @@ failover delay (one term) stays under the operator's failover SLO; tombstone hor
 landing constants are in §4.15.
 
 > **Status (2026-11-18, A-363): the failover delay is a live output, not a setting.** Each node estimates
-> `F = D + E + R` every coordinator period from what it measures (`slates_cluster::failover`): `D` its failure
-> detector's own detection bound, `E` the council's death-confirmation window at the measured period, `R` the tail of
+> `F = D + E + R` every coordinator period from what it measures (`slates_cluster::failover`): `D` SWIM's count of its
+> detector's periods at their measured running tail, `E` the council's death-confirmation window at the measured period, `R` the tail of
 > the takeovers and volumes it timed (the ratified recovery budget before the first), and publishes it in its status
 > (`FleetReport::failover`). The operator's SLO above is still the 10 s placeholder its consumers read until each moves
 > to the estimate or to a term of its own (A-363's owed list; GAPS, the `LIVENESS_BUDGET_NS` entry).
@@ -26499,9 +26499,15 @@ nemesis entry), `crates/server/src/lease.rs`, `crates/server/src/member_task.rs`
   arbitrary constant, not a learned or data derived method that adapts."
 - **The estimate** (`crates/cluster/src/failover.rs`, its module doc cites each method): `F = D + E + R`, refreshed by the
   control shard each coordinator period (`fleet::refresh_failover`), nothing setting it.
-  - `D`, detection: the member plane's detector's `detection_bound` at that moment. Each pair is NFD-E (Chen, Toueg &
-    Aguilera 2002) with Lifeguard's local health (Dadgar et al. 2018), counted over `2(2m − 1) + 1` periods at the
-    longest this member ran (SWIM §4.3). **The false-suspicion probability is derived:** each pair's margin minimizes
+  - `D`, detection: SWIM's count of `2(2m − 1) + 1` periods from a crashed peer's last answer to its condemnation
+    pending (§4.3 of Das, Gupta & Motivala 2002; hyper-swim's `Detector::detection_bound` counts the same), each at the
+    running tail of the detector's period as the member plane times it, one period's probe to the next
+    (`MemberPlane::detection`). Each pair is NFD-E (Chen, Toueg & Aguilera 2002) with Lifeguard's local health (Dadgar
+    et al. 2018), which stretch the periods `D` counts. **Not the detector's own bound:** hyper-swim counts each period
+    at the longest the member ever ran (and its latest wake lateness ever), a sound bound that only ratchets: one slow
+    period at formation set it for good, and a quiet three-node loopback fleet read 7.0 and 14.0 s before any loss where
+    other runs read 0.9 s (2026-11-18, the Mac Studio). The running tail forgets such a period as later ones run at
+    their pace (`detection_forgets_a_period_that_ran_long_once`). **The false-suspicion probability is derived:** each pair's margin minimizes
     `U = (E(D) + α + η + T_E)/MTBF + T_E·β/η` (hyper-timing `qos`) against the fleet's measured MTBF, and `β` is
     bounded from the measured lateness by Cantelli with the record-indicator share (Rényi 1962); in φ-accrual's terms
     (Hayashibara et al. 2004) the threshold is `φ = −log10 β`, with the distribution-free tail in place of the normal
@@ -26527,18 +26533,22 @@ nemesis entry), `crates/server/src/lease.rs`, `crates/server/src/member_task.rs`
 - **Evidence.** The estimator's unit tests (`crates/cluster/src/failover.rs`: the prior alone with nothing measured; the
   recovery leaving its prior at RFC 6298's first-sample tail and following the takeovers it times; the larger of the
   takeover and volume tails; the confirmation at the heartbeat before any period, stretched with the measured period,
-  and scaled with a far voter path's election base; the total the sum; no sample from a clock that reads earlier). The
+  and scaled with a far voter path's election base; detection as SWIM's period count at the measured period, and
+  forgetting a period that ran long once; the total the sum; no sample from a clock that reads earlier). The
   fleet test `a_successors_failover_estimate_learns_the_takeover_it_completed` (`crates/server/tests/fleet.rs`: three
   nodes at `f = 1`; before the loss each survivor's detection and confirmation are measured and its recovery the prior;
   after the owner's death the successor serves the volume and its estimate has timed the takeover and the volume). The
   wire's status test carries the report through fragmented pages (`crates/ipc/tests/status.rs`). Measured by that test
-  on the Mac Studio (2026-11-18, load 18-20, debug build): the survivors estimated 3.42 and 3.52 s before the loss
-  (detection 912 and 913 ms on 111 and 61 round trips, confirmation 1.51 and 1.61 s on 8 and 7 timed periods, recovery
-  the 1 s prior); the successor 4.22 s after it (detection 2.11 s, its periods stretched by the dead peer's unanswered
-  probes; confirmation 1.19 s on 28 periods; recovery 927 ms, one takeover and one volume timed, RFC 6298's first-sample
-  tail of a 309 ms recovery).
+  on the Mac Studio (2026-11-18, load 14-22, debug build, three runs): the survivors estimated 4.60-5.19 s before the
+  loss (detection 2.04-2.63 s on 82-235 detector periods, confirmation 1.56-1.57 s on 7 coordinator periods, recovery the
+  1 s prior); the successor 3.86-5.42 s after it (detection 2.07-2.12 s, confirmation 1.17-1.18 s on 27-33 periods,
+  recovery 0.62-2.14 s from one takeover and one volume timed). Each of the seven detector periods counts at its own
+  tail, `srtt + 4·rttvar`, which a loaded host's jitter widens; the periods are counted as correlated (a starved host
+  stalls them together), not as independent. Red-checked: without the takeover's fold, the volume's fold or the
+  period's refresh the test fails (the successor's takeovers or volumes untimed, or the survivors' detection and
+  confirmation zero).
 
 Applied in the same change to: §4.4 "Derived constants" (its status), §4.12 (the `CONTRACT` 23 status line, and A-354's 22 beside it), GAPS (the
-`LIVENESS_BUDGET_NS` entry), `crates/cluster/src/{failover,lib}.rs`, `crates/server/src/{fleet,takeover,state,daemon,verbs}.rs`,
+`LIVENESS_BUDGET_NS` entry), `crates/cluster/src/{failover,lib,member_plane}.rs`, `crates/server/src/{fleet,takeover,state,daemon,verbs}.rs`,
 `crates/ipc/src/protocol.rs`, `crates/ipc/tests/status.rs`, `crates/server/tests/fleet.rs`, `crates/api/src/lib.rs`,
 `crates/cli/src/verbs.rs`, `crates/mcp/src/lib.rs`.

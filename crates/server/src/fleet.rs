@@ -8939,16 +8939,16 @@ impl Fan {
 }
 
 /// Refreshes this node's failover estimate for the period (§4.8 "Derived constants", A-363): the detection term from the
-/// member plane's detector as it stands now (its bound on the time from a crashed peer's last answer to its
-/// condemnation, asked on the clock the plane is stepped with), and the confirmation from the council's election timing
+/// member plane (SWIM's count of periods from a crashed peer's last answer to its condemnation, each at the detector's
+/// measured period's running tail, `MemberPlane::detection`), and the confirmation from the council's election timing
 /// this period derived, at the coordinator's measured period. The recovery term moves as takeovers and volumes complete
 /// (`takeover::drive_host_takeover`, `fleet::materialize`). Nothing sets the estimate: it is what this node measured.
 fn refresh_failover(state: &mut ShardState) {
-  let now_ns = slates_machine::clock::monotonic_ns();
-  let detection = state.plane.plane.as_ref().and_then(|plane| {
-    let detector = plane.detector();
-    slates_cluster::failover::detection(detector.detection_bound(now_ns), detector.pool().samples)
-  });
+  let detection = state
+    .plane
+    .plane
+    .as_ref()
+    .and_then(slates_cluster::member_plane::MemberPlane::detection);
   let timing = state.council_timing;
   state.failover.refresh(detection, &timing, HEARTBEAT_NS);
 }

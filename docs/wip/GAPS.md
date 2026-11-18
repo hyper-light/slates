@@ -2798,9 +2798,10 @@
 > target lease, a CLI attachment's term, the NFSv4 and delegation leases, the restart cap) has its own term; and the
 > class C claim wait below. **The failover delay is a live output since 2026-11-18 (A-363, goal g255), not A-359's boot
 > sum** (Ada, the same day: a value computed once at boot is still a constant). The control shard keeps `F = D + E + R`
-> as running estimates, refreshed each coordinator period: `D` its detector's own detection bound (NFD-E per pair with
-> Lifeguard's local health; each pair's false-suspicion bound `β` is the one that minimizes unavailability against the
-> fleet's measured MTBF, φ-accrual's threshold `−log10 β`); `E` the council's death-confirmation window at the
+> as running estimates, refreshed each coordinator period: `D` SWIM's count of the detector's periods at their running
+> tail (NFD-E per pair with Lifeguard's local health; each pair's false-suspicion bound `β` is the one that minimizes
+> unavailability against the fleet's measured MTBF, φ-accrual's threshold `−log10 β`; the detector's own bound keeps the
+> longest period it ever ran and read 7-14 s on a quiet fleet, so it is not used); `E` the council's death-confirmation window at the
 > coordinator's measured period, with the retirement's commit round and its install; `R` the tail of the takeovers and
 > the volumes this node timed, the ratified `T` before the first. Published in the daemon's status
 > (`FleetReport::failover`, `CONTRACT` 23; `slates status` prints `fleet_failover`), each term with the measurements
