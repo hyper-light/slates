@@ -146,8 +146,9 @@ fn an_instance_starts_from_the_hosts_own_executable_serves_and_stops() {
   let report = slates.daemon_status().unwrap();
   assert_eq!(report.shards.len(), usize::from(TEST_SHARDS));
   let volume = slates
-    .create(&slates_api::scratch("started", ROOM))
-    .unwrap();
+    .provision(&slates_api::VolumeSpec::empty("started", ROOM))
+    .unwrap()
+    .volume();
   let attached = slates
     .attach_volume(volume, slates_api::Intent::Write)
     .unwrap();
@@ -157,10 +158,7 @@ fn an_instance_starts_from_the_hosts_own_executable_serves_and_stops() {
     .unwrap();
   slates.detach(attached.attachment).unwrap();
   assert_eq!(
-    slates
-      .client()
-      .read(volume, "/f", slates_ipc::protocol::ReadAt::Head)
-      .unwrap(),
+    slates.read(volume, "/f", slates_api::ReadAt::Head).unwrap(),
     b"from the host"
   );
   #[cfg(unix)]

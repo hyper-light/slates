@@ -3955,7 +3955,6 @@ async fn init_shard(
     config: config.clone(),
     segment,
     issuer_secret,
-    grant_keys: Vec::new(),
     session_secret,
     seal_root,
     seal_state: sealing,

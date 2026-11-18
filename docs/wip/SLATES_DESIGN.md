@@ -68,7 +68,7 @@ their numbers.
 | R7 | Plain English. A human implementer must be able to act on every sentence. | Terms of art are defined once in the glossary (0.4) and used consistently. Each algorithm is written as numbered steps. Each test case is written as "do X, expect Y". |
 | R8 | Both laptop and EdenFS scale, one code path. | Every subsystem carries a "laptop degenerate" section: the laptop is the derived N=1 case of one formula family, never a mode switch. A named differential test asserts that the N=1 configuration has the same observable semantics as the fleet configuration. |
 | R9 | Sub-50 µs provisioning. | The provisioning path is decomposed step by step with a cited cost per step and a per-step budget; the end-to-end histogram (p50, p99, p999, max) is a permanent CI gate. |
-| R10 | Disk is written only on a user permission grant. | A grant is a database record created only by the CLI or a confirmation surface a human operates; the MCP server and the SDKs have no verb that creates one; the landing engine refuses without a grant bound to the exact manifest it is about to write; every grant, manifest, and outcome is in the audit log (§4.15). |
+| R10 | Disk is written only on a user permission grant, and the grant follows the mode the user gave the agent (A-285). | A grant is a database record bound to the exact manifest it is about to write; the launcher's write policy decides whether the daemon issues it at once (bypass), answers an approval request that the harness presents (ask) or refuses (a forbidding mode); an agent can never raise its own policy; every grant, manifest, and outcome is in the audit log (§4.15). |
 
 **R1's access and residency contract (A-50, 2026-09-30; audit §9; decided by Ada, 2026-09-30).** slates is
 pure in memory: literal zero disk access is the baseline requirement — the entire point of the product —
@@ -860,10 +860,10 @@ plan schedules.
   distinguishes workloads within it. A channel label supplied by a caller cannot establish
   human authority. A trusted confirmation surface binds its approval to the exact manifest;
   transport checks supplement that authority check (§4.13).
-- A-285 (Ada, 2026-11-18): the human's authority is a signature by a key only the human holds (an ssh-agent key that
-  asks for confirmation on every use, or a FIDO key that needs a touch), over the exact landing and a nonce the daemon
-  issued; the anchor's own terminal is the fallback where no key is registered. No secret a process of the user can
-  read is authority any more.
+- A-285 (Ada, 2026-11-18): write permission follows the mode the user gave the agent's harness. Bypass merges and
+  lands; ask answers a typed approval request bound to the manifest, which the harness presents; a forbidding mode is
+  refused. The launcher or the harness sets the policy and an agent never raises its own. The earlier reading of a
+  human-only proof is withdrawn; signatures are signed-work provenance, not permission.
 - Evidence: `SO_PEERCRED`, `getpeereid`/`LOCAL_PEERTOKEN`, named-pipe client checks [B]; hecate's "an id is never a bearer capability" [C: survey-hecate.md §8.4]; vorpal's MCP enrollment rule [C: survey-vorpal.md §6.1].
 - Grants are created only through the CLI or a confirmation surface a human operates, for the same reason vorpal enrols servable roots by hand: a confirmation delivered through the agent's channel would be answered by the agent. A landing opens the target beneath its own directory descriptor (`openat2` with `RESOLVE_BENEATH` on Linux, `O_NOFOLLOW` chains elsewhere) so it can never write outside the granted directory [B: openat2(2)]; the target must be owned by the calling user and must not lie inside a slates mount.
 
@@ -3086,7 +3086,9 @@ directory mounts refused (NTFS reparse point); ProjFS never.
 > (`crates/cli/tests/winfsp_semantics.rs`): a move not asked to replace, a directory holding a file, `SetFileTime`, and
 > an open with `TRUNCATE_EXISTING` (WinFsp's allocation below a file's size truncates it). Open: the fsx port wedges at an
 > extension after a cached write past a hole and a shrink, inside Windows below the single receiver; it is a listed
-> failure (`fsx-seed-1-unfinished:10000`) until fixed.
+> failure (`fsx-seed-1-unfinished:10000`) until fixed. Since A-300 (2026-11-17) the lanes also run the workload
+> roster's version-control workloads over the drive (git, Mercurial and Subversion, through Git for Windows' shell),
+> judged against NTFS with the drive's one stated difference: no hard links.
 
 > **Status (2026-11-02, A-198, Step 9.2: Windows handle holding).** The anchor's Windows hold channel and explicit
 > successor inheritance are built. A hold is acknowledged after duplication into the anchor, before the child publishes
@@ -6467,11 +6469,19 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   the test (`crates/cli/tests/support/relay.rs`) owns every node's advertised ports and forwards to its bind block
 >   (A-277). It loses, holds, duplicates and reorders datagrams per path and cuts a running node off one way or both,
 >   with no privilege: T-8.7's partitions without the iptables or pf that R10 rules out. Its flows stream writes over
->   lossy paths through a takeover, cut a running owner off, and deafen one. Every flow that takes a live volume over,
+>   lossy paths through a takeover; cut a running owner off, deafen it or mute it, each taken over; cut off, deafen or
+>   mute each candidate in turn, where no write may be refused and no candidate may depose the owner (one voter's view
+>   retires no one, A-250); and hold one candidate's every datagram 200 ms ± 50 ms (T-8.3's slow candidate, AC-8.12),
+>   where no write may wait for it. Every flow that takes a live volume over,
 >   these and the SIGSTOP and SIGKILL ones, now also judges ReadSafety (a read through any survivor, or through the
 >   partitioned owner while it is cut off or the moment its stopped process resumes, never answers less than was
 >   acknowledged) and Continuity (the successor's first head is past every position durable under an earlier epoch)
->   from outside the processes.
+>   from outside the processes. The flows that take nothing over (candidates partitioned, stalled or slowed, and the
+>   lossy phases) read through every node mid-fault and after it, held to ReadSafety too, with the owner answering every
+>   read: its lease needs one healthy candidate's confirmation of two. A seeded nemesis draws fourteen single faults of
+>   every kind above and one more, a link severed both ways (a partition that is not transitive), the owner struck as
+>   often as a candidate and once a run until it is taken over, the fleet recovering whole between them; every
+>   invariant is judged across whatever takeovers they cause, Continuity from the samples.
 
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
@@ -6586,7 +6596,14 @@ mirroring have no targets and their verbs refuse `Unsupported`.
 >   holder that accepts it drops the volume's and its catalog's records. Waiting for every candidate is what
 >   keeps a later takeover from meeting a lone live head.
 > - **A takeover adopts the tombstone** and never materializes the volume. Before this a successor served a
->   destroyed volume again.
+>   destroyed volume again. The successor records the adopted tombstone on the shard the id routes to once a period,
+>   and since 2026-11-18 past the failover SLO's worth of attempts (`failover_slo_ns / HEARTBEAT_NS`, as for a
+>   taken-over volume or green) it gives that record up, counted `fleet.tombstone.given_up` with its last reason (no
+>   shard for the partition, refused, unanswered): the adoption already placed the tombstone under the successor at the
+>   quorum, so the volume is never served again, and what is lost is the retirement, which leaves the candidates
+>   holding the tombstone, the safe state. The successor keeps it marked, so the volume stays known destroyed there.
+>   Before, a tombstone whose partition had no shard was skipped every period, uncounted, and a refused one retried
+>   every period without end.
 > - **On a laptop** the tombstone retires with the destroy: there is no remote candidate to ship to.
 > - **Single-value registers** (head, catalog, tombstone) keep only their newest accepted position. A
 >   green's chain is a ledger and is kept whole.
@@ -6910,30 +6927,29 @@ command and every host start, mount and grant through one implementation.
   waits for the first answer at the anchor's heartbeat cadence while the anchor lives, and makes
   the group of an instance run alone; a host that launches the anchor under its service manager
   takes the command (`StartSpec::anchor_command`) and waits with `Instance::wait_for`. The starter
-  is given no grant authority: under Ada's decision of 2026-11-18 a grant is proved by a key only
-  the human holds (A-285), presented through the crate's proof-agnostic grant call.
+  is the launcher: under Ada's rule of 2026-11-18 (A-285 as revised, A-299) write permission
+  follows each agent's mode and the launcher's authority is the instance's issuer, which the start
+  is to hand its starter on every platform (owed; today the starter holds it where the anchor's
+  handoff reaches it).
 - *What a host holds.* An `Instance`: one held client of one running instance. A landing's
-  presentation lives as long as the client that made it (A-46), so a plan a person is shown is
-  granted and landed on the same client. An `Issuer`: the confirmation surface's authority (§4.13),
-  the anchor segment's handoff, attached for the length of one proof and never kept as a secret.
+  presentation lives as long as the client that made it (A-46), so a plan an approver is shown is
+  approved and landed on the same client. An `Issuer`: the launcher's authority (§4.13, A-299), the
+  anchor segment's handoff, attached for the length of one proof and never kept as a secret.
 - *Verbs.* Attach, the group of an instance run alone (`ensure_group`), create (an overlay over a
   host folder with a dynamic size, or scratch), snapshot, clone, destroy, list, status, drift and
   rewitness; serving as a host mount (§4.6, every platform's own mechanism; `mount::available` says
   without a daemon whether the machine can mount and what is missing, and `mount::unmount_lazy` lets
   go of a mount a leftover process still holds, Linux) or as a descriptor a VMM takes (the Shards
-  stream, A-161; the vhost-user socket); landing plans, landing under a grant, and
-  `land_approved`, which grants and lands only the manifest a person approved and otherwise returns
-  the new plan; observation (daemon status, audit, grants, telemetry). `Instance::client` lends the
-  whole typed client for the rest (the merge verbs of §4.16, the file verbs).
-- *Refusals.* One closed `Error`: the daemon's `Refusal`, `Unavailable` (no daemon at the instance),
-  the channel's own, and the crate's (`MountFault` with the OS's error number, `IssuerFault`,
-  `PathFault`, `StartFault`). None is prose alone; the enums are `#[non_exhaustive]`, so a host
-  matches them with a wildcard arm as the crate grows.
+  stream, A-161; the vhost-user socket); landing and merging under the caller's write mode, and
+  approving exactly the manifest shown (the consumer contract below, A-299, which replaced A-278's
+  `land_approved`); observation (daemon status, audit, grants, telemetry). `Instance::client` lends
+  the whole typed client for the rest (a work volume's declared edits, the file verbs).
+- *Refusals.* One closed `Error` whose variant is what a consumer does about it (the consumer
+  contract below, A-299). None is prose alone.
 - *Grant exclusion.* The SDKs and the MCP server depend on `slates-client`, not on this crate, so
   no grant verb reaches them (the structural exclusion this section asks of the registry); the
   daemon still refuses a grant kind on their channels whatever they claim.
-- *Versioning.* The workspace's one version. The report types it re-exports are the wire's, which
-  grow append-only (D-15), so a host matches their enums with a wildcard arm.
+- *Versioning.* The workspace's one version (`VERSION`), and the contract's own (`CONTRACT`, below).
 
 > **Status (2026-11-18, A-278, pieces 1 and 2).** Built: the crate with attach, the group, the
 > volume lifecycle, drift, the host mount on macOS, Linux and Windows (moved from the CLI with its
@@ -6949,6 +6965,99 @@ command and every host start, mount and grant through one implementation.
 > (`crates/api/tests/start.rs`, no libtest harness: its `main` serves the roles). Owed, in order:
 > an async form over a host's reactor (R6: a readiness wait and a timer over the client's driver);
 > a seam trait with a simulator and a conformance suite for hosts whose rules ask for one.
+
+**The consumer contract (A-299).** Everything a consumer touches goes through `slates-api` (Ada,
+2026-11-18): provisioning and managing volumes, serving them, landing, merging, their conflicts,
+permission errors, and every other interaction. Answers are typed outcomes and failures typed
+errors — closed enums a consumer matches and acts on, never strings. Kiln is the first consumer:
+it builds against the contract and adds to it rather than around it.
+- *Write permission.* Merging a work volume into its green (§4.16) and landing a volume onto a
+  host directory (§4.15) follow the permission the user gave the harness or agent asking to write,
+  a `WriteMode` per act (`WritePolicy { merge, land, require_signed_merges }`): **bypass** merges
+  and writes at once; **ask** answers a typed approval request (`ApprovalRequired`) the harness
+  presents, and writes once it is approved; **forbid** answers a typed refusal (`Refused`). The
+  launcher (kiln passes each agent's mode) or the harness sets a policy per enrolled consumer (an
+  agent's session, §4.13 "Principals") or per volume; an act follows the stricter of its caller's
+  and its volume's (`WritePolicy::meet`); a subject with no policy is asked, which is how every
+  landing behaved before. No key, signature or person-only proof decides it. An agent never raises
+  its own mode: setting a policy and approving need the launcher's authority — the instance's
+  issuer, handed to whoever starts the instance — which the daemon refuses on a consumer's channel,
+  and an agent holds only its consumer's capability. The daemon keeps and enforces the policies
+  (A-285, the owner of §4.13's grant path).
+- *Outcomes.* A landing answers `LandOutcome::{Written(report), ApprovalRequired(approval),
+  Conflicted(conflicts), Refused(policy refusal)}`; a merge `MergeOutcome::{Merged { version,
+  verification }, ApprovalRequired, Conflicted { windows, head }, Refused}`; a rebase
+  `RebaseOutcome::{Rebased { version }, Conflicted}`. An `Approval` names what awaits (a landing
+  request, or a work and its green), the presentation's id, the manifest hash it binds and a typed
+  summary of what it writes (entries per action, bytes, what the filter left out);
+  `Instance::approval_entries` lists it path by path (A-287). `Instance::approve` presents again and
+  approves only when the manifest is still the one shown, so an approval never covers more than its
+  approver saw; otherwise it answers the new presentation. `Instance::plan_landing` presents without
+  writing whatever the mode, for a reviewer.
+- *Conflicts are verdicts (D-26, D-27).* A landing conflict names its path, its class (§4.15 step 4's
+  table: both changed, changed against deleted, deleted against changed, both renamed, both created,
+  a type change, the target in use) and the bytes the volume would land there; a merge conflict its
+  file, its window in base coordinates and its class (§4.16's `MergeConflictClass`), with the
+  green's head the work must rebase onto. Nothing is inferred and nothing is written for a conflict;
+  the consumer resolves (`read_base`, a rewrite, `rewitness`; a rebase) and lands or merges again.
+- *Signed work (Ada, 2026-11-18).* A merge or a landing may carry a signature by its author's key
+  (an SSH signature, `PROTOCOL.sshsig`, the format of A-285's verifier: Ed25519 and FIDO Ed25519
+  keys), and its outcome carries how the daemon judged it: `Verified { signer }`, `Unsigned`, or
+  `Invalid { reason }`, the verifier's closed reasons. A volume's policy may require signed merges;
+  an unsigned or invalid merge into it is refused `SignatureRequired` even in bypass. Signatures
+  never gate permission: the mode does.
+- *Volumes.* One typed create, `Instance::provision(&VolumeSpec)`, for every source: an overlay
+  over a host folder, an empty volume, a clone of a snapshot, a green (empty or over a complete
+  immutable snapshot), a work volume over a green, which answers its green and its base version.
+  Snapshot, destroy, list, a typed status (`VolumeStatus`, an overlay's base `Read` or
+  `Unreadable`), an overlay's drift as typed entries (`Drift { path, kind }`, `Modified`,
+  `Deleted`, `Replaced`, `TypeChanged`, apart from the entries whose re-check the host refused),
+  `read` at a head, a version or an attachment's view, and serving: a host mount on bare metal, or
+  a descriptor a VMM takes.
+- *Errors.* `Error`'s variant is the class of thing a consumer does: `NotFound` (naming the subject
+  the call named: a volume, a snapshot, a presentation, an attachment, an entry, a shard),
+  `AlreadyExists`, `Denied`, `Exhausted`, `Busy`, `Stale`, `Retry { cause, pause_ns }` (the
+  derived first pause; `Instance::retry_pause_ns` gives each later one), `Unavailable` (no daemon:
+  start it, or report), `Unsupported`, `Invalid`, `Unusable` (destroying, not recovered, no group),
+  `Elsewhere`, `Host` (with the OS's error number), `Mount`, `Start`, and `Protocol` (a fault in
+  slates: report it). Every refusal on the wire maps to exactly one of them in one exhaustive table,
+  so a refusal added to the wire does not compile until it is given its class. Words the daemon or
+  the OS said only in prose travel as a `Note`, which is displayed and never matched.
+- *Versioning a consumer pins.* No contract enum is `#[non_exhaustive]`. `slates_api::CONTRACT` is
+  raised by one with every change to a type or a verb of the contract; a consumer pinning slates at
+  a commit asserts the version it was written against and matches exhaustively, so at its next
+  vendoring a moved contract is a failed assertion beside the compile errors of the matches it must
+  extend — never a variant falling silently through a wildcard. The wire types the contract
+  re-exports grow append-only (D-15) and count as the contract's where it returns them.
+- *Laptop and fleet (R8).* One contract and one code path: the same calls, outcomes and errors on a
+  laptop instance and on a fleet node; a fleet's own refusals (`Elsewhere`, `Retry` for an owner
+  not confirmed) are variants a laptop never sends.
+
+> **Status (2026-11-18, A-299, piece 4: the contract published).** Built in `slates-api`: the write
+> modes, the policy and its typed refusal (`policy`), signed work's types (`signed`), the outcomes,
+> approvals and typed conflicts (`outcome`), typed provisioning, status and drift (`volume`), the
+> closed taxonomy with one exhaustive table over the wire's refusals, the channel's and this
+> process's own faults (`error`), and `Instance::{provision, read, land, plan_landing,
+> approval_entries, approve, merge, rebase, retry_pause_ns}` over today's daemon, on which every
+> landing with something to write asks and the launcher approves it with the issuer; `CONTRACT` = 1,
+> then 2 the same day (`Denied::Policy`, the class a policy refusal takes outside a landing or a merge,
+> agreed with A-285's owner before its `Refusal::PolicyForbids` reaches the wire).
+> The CLI's mount, grant, enroll, revoke, run and recover map the taxonomy to its exit codes.
+> Proven by use over an in-process daemon (`crates/api/tests/api.rs`: the group missing is
+> `Unusable(NoGroup)`; provisioning from each source, `AlreadyExists` naming the holder, a destroyed
+> volume `NotFound` naming it; an overlay's landing answered `ApprovalRequired` with its typed
+> summary, a stale approval writing nothing and answering the fresh presentation, the shown one
+> `Written` and `Done`; a file changed on disk typed drift and a typed `ModifyModify` conflict with
+> the volume's bytes; a merge `Merged`, a rewrite of the same bytes `Conflicted` with its window and
+> the green's head, a clean work rebased and merged; signed work refused `Unsupported(SignedWork)`)
+> and by unit tests of the pure parts (each refusal's class, the drift text's grammar, the summary's
+> actions, the merge classes' discriminants, the policy meet). **Owed, in order:** the starter handed
+> the launcher's authority on every platform (the anchor passes the segment's descriptor back on
+> Linux); the daemon's side of the modes, merge approvals and signed work, with the verbs that set a
+> policy and hand out a statement to sign (A-285's owner, agreed through g262's inbox); typed fields
+> on the wire for drift, a presentation's conflicts, a landing's target refusal and a merge's
+> versions (the work's base beside the head), replacing what the crate reads from text or asks
+> again; a paged listing; typed audit and grant states.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -7110,12 +7219,11 @@ server, not inferred from command names.
 > every grant and a session grant was recorded spent at its first landing. Record:
 > `docs/bugs/2026-09-29-grants-were-lost-at-a-restart-and-session-grants-recorded-consumed.md`.
 
-> **Status (2026-11-18, A-285).** Ada chose the grant's proof: a signature by a key only the human holds, an SSH
-> signature under the namespace `slates-grant` (an ssh-agent key added with `ssh-add -c`, or a FIDO key) or a WebAuthn
-> assertion over the same statement; the anchor's own terminal where no key is registered. The statement, the SSH
-> verifier, the presentation's nonce and the signed `Grant` are built (`crates/server/src/grant_signature.rs`,
-> `landing::verify_signed_grant`); key registration and the CLI are owed, and the issuer secret still proves grants
-> until they land. Record: A-285, GAPS (2026-11-18).
+> **Status (2026-11-18, A-285).** Ada's rule: a grant follows the write mode the user gave the agent (bypass lands at
+> once, ask answers an approval request the harness presents, a forbidding mode refuses), set by the launcher or the
+> harness and never raised by the agent. The confirmation surface is whoever holds the launcher's authority, the
+> instance's issuer. The write policy is owed; until it lands, grants are made as before, by the issuer's keyed hash.
+> Record: A-285, GAPS (2026-11-18).
 
 *Refusals added.* `Forbidden{verb}`, `GrantChannelRefused{channel}`,
 `ConsumerNotEnrolled`, `ConsumerRevoked`, `GrantIssuerUnverified`; all are closed variants
@@ -9616,7 +9724,10 @@ may weaken an earlier phase's gates; ratchets only tighten.
 > two directories a second apart and holds the runs identical, so a difference over a mount is the mount's. A script
 > that exits nonzero on both sides is a failed workload, never an identical one. Since A-293 the Linux lane runs the
 > roster over the daemon's own FUSE mount (`slates mount`, unprivileged), the route an agent's tools take, rather than
-> through the root NFS adapter. Owed: the Windows WinFsp roster.
+> through the root NFS adapter. Since A-300 the Windows lanes run the four over the WinFsp drive through Git for
+> Windows' shell, judged against NTFS with the drive's one stated difference: it makes no hard link (WinFsp's driver
+> refuses one), so a local clone copies there where NTFS links, and the three lines that count a clone's links are
+> recorded with both sides. Owed: the roster's other workloads on Windows.
 
 > **Editor workload correction (2026-09-17).** The host and mount must execute the same save
 > behavior even when their paths select different tool defaults. The Vim roster explicitly
@@ -9636,7 +9747,7 @@ field.
 | Landing oracle | Prove the one path that writes disk | an executable model of (disk, overlay, witnesses); outsider edits and crashes injected at every step; real filesystems on RAM-backed targets | Verdicts match the table; every entry old or new; every collision reported; re-runs idempotent; writes proportional to the delta | CI (Linux tmpfs), nightly (APFS, NTFS) |
 | Merge oracle | Prove the verdict, the splice and rebase | an executable model of (chain, work volumes, declared operations); proptest with shrinking; instrumented counters | Verdicts match the oracle with zero false accepts or rejects; spliced versions byte-identical; no content read on the common path; windows byte-exact | CI |
 | Conformance | Prove POSIX behaviour through each bridge, and Win32 behaviour through the WinFsp drive | pjdfstest, fsx, fsstress (CI, x86_64 and arm64 Linux); WinFsp's fsx port and winfstest (CI, x86_64 and arm64 Windows; A-209); xfstests generic, LTP (nightly) | All tests pass except the reviewed expected-failure list for that bridge, and the list only shrinks | CI / nightly |
-| Real workloads | Prove tools work | vendored git (a basic repository, and a history: a hard-linked local clone, branch, merge, rebase, stash, a worktree, tag, push, pull, gc, a full repack, verify-pack, fsck), Mercurial (a named branch and merge, tag, bookmark, a hard-linked clone and its first commit, rebase, push, a shared store, verify), Subversion (an FSFS repository and SQLite working copies: checkout, commit, branch by copy, switch, update back and forward, merge, tag, cleanup, verify, dump), cargo, npm, python, rg, rsync, sqlite, editors, watchers (A-289) | Exit codes 0; outputs byte-identical to the host run; `git status`, `hg status` and `svn status` clean; hard links counted as on the host; incremental builds reuse artifacts | nightly, release |
+| Real workloads | Prove tools work | vendored git (a basic repository, and a history: a hard-linked local clone, branch, merge, rebase, stash, a worktree, tag, push, pull, gc, a full repack, verify-pack, fsck), Mercurial (a named branch and merge, tag, bookmark, a hard-linked clone and its first commit, rebase, push, a shared store, verify), Subversion (an FSFS repository and SQLite working copies: checkout, commit, branch by copy, switch, update back and forward, merge, tag, cleanup, verify, dump), cargo, npm, python, rg, rsync, sqlite, editors, watchers (A-289) | Exit codes 0; outputs byte-identical to the host run; `git status`, `hg status` and `svn status` clean; hard links counted as on the host (on the WinFsp drive, which makes none, a stated difference: A-300); incremental builds reuse artifacts | nightly, release |
 | Unit and property | Prove each core structure | proptest, oracle tests (serial spec vs implementation), non-vacuity counters | Properties hold; counters prove the fast paths ran | CI |
 | Hostile input | Prove parsers never crash or over-allocate | cargo-fuzz corpora for wire, FUSE, NFS/XDR, WinFsp, archive, MCP | No panic, no UB, bounded time and memory on every input | CI smoke, nightly long |
 | Concurrency | Prove lock-free cores and schedules | loom (cores), shuttle (schedules), TSan, Miri | All explored interleavings keep invariants; no data race; no UB | CI (loom, Miri), nightly (shuttle, TSan) |
@@ -20987,6 +21098,8 @@ Applied in the same change to:
   Ada's grant decision of the same day (A-285: a grant's proof is a signature by a key only the human holds, with a
   prompt on the anchor's terminal where none is registered) makes that wrong: a host process holding the issuer secret
   could grant without the person. So the starter is handed nothing, and the grant call takes the person's proof.
+  (A-285 was revised the same day: write permission follows the agent's mode, and the launcher, the issuer's holder,
+  approves.)
 - **Piece 3, the same day** (kiln's asks, g263): `mount::available() -> Result<MountKind, MountFault>`, the machine's
   mount mechanism with no daemon (macOS: `mount(2)`, always; the BSDs: `mount_nfs` on the `PATH`; Linux:
   `fusermount3` on the `PATH` and a `/dev/fuse` the user may read and write; Windows: WinFsp's library loads), each
@@ -21107,7 +21220,8 @@ judged by `fails_the_suite`), `crates/server/tests/virtiofs.rs` (the guest's env
   Mercurial and Subversion already. The live-guest job requires each new workload's `Identical` line.
 - **Owed.** The Windows WinFsp roster: WinFsp's driver has no hard links (its NTFS compatibility page lists them
   unsupported), so a local clone copies there while NTFS links, and a git repository's symbolic-link probe needs
-  WinFsp reparse points, which the drive does not serve yet. A Linux FUSE leg outside a container (the native Linux
+  WinFsp reparse points, which the drive does not serve yet. **Built by A-300 (2026-11-17)**, the drive serving
+  reparse points since A-275, and the missing hard links a stated difference of the route. A Linux FUSE leg outside a container (the native Linux
   lane reaches the daemon through the NFS adapter). The runs over each mount are the supervisor's (CLAUDE.md §8).
 
 ### A-279 — A full control channel tells the senders waiting for its room (2026-11-17, built for goal g239, a kept forward re-sent once the channel has room)
@@ -21171,45 +21285,155 @@ Applied in the same change to: Part 6's "Real workloads" status, GAPS, `docs/wip
   mount and a file's second name to two links (gated on a built CLI, run in CI's Linux conformance step). The roster's
   runs over the mount are the supervisor's (CLAUDE.md §8).
 
-### A-285 — A grant is signed by a key only the human holds; the anchor's own terminal is the fallback, on every OS (accepted 2026-11-18, Ada's decision; piece 1 built 2026-11-18)
-Applied in the same change to: D-22 (A-285 line), §4.13 "Grants" (status), GAPS (2026-11-18 entry),
-`crates/server/src/grant_signature.rs`.
-Status: piece 1 built (the statement and the SSH-signature verifier, unit-tested); piece 2 built (the presentation's
-nonce, the signed `Grant` on the wire, the nonce spent once). Owed, in order: durable key registration (the first key only
-through A or kiln's person path, later keys signed by a registered key); `slates grant` signing through `ssh-keygen -Y
-sign` and A's terminal prompt; the exported-variables issuer surface removed on macOS and Windows (which closes
-GAP-A9-9's macOS segment by name, its option 1); the Windows confirm-per-use path recorded; the WebAuthn form verified.
-- Why: before, the anchor held the grant-issuer secret. On Linux it sat in a descriptor only the anchor's children
-  inherit, so no `slates grant` could be issued and a Linux server's landing stopped at its presentation (GAPS, A-201);
-  on macOS and Windows the anchor printed `export` variables, and any process of the user that held them could grant,
-  agents included. fs-server's options (2026-11-05):
-  - A. The anchor asks on its own controlling terminal, naming the exact manifest. Small and on every OS, but R10 rests
-    on who owns that terminal: an agent that started the anchor in its own shell can answer.
-  - B. A same-user socket to the anchor checked by `SO_PEERCRED`. Any process of the user, agents included, can
-    grant; it breaks D-22. Rejected.
-  - C. A separate operator account owns issuance (the peer's uid is checked). Strong and unprivileged, but a setup per
-    machine and the human switching accounts for each grant.
-  - **D. A grant signed by a key only the human holds**: an ssh-agent key added with `ssh-add -c` (the agent asks the
-    human through askpass on every use) or a FIDO key (`sk-ssh-ed25519`, a touch per signature). An agent with a shell
-    cannot make the signature unseen.
-  - E. Standing grants in a file the human writes. It weakens R10 to a policy, and agents must not be able to write
-    the file.
+### A-285 — Write permission follows the mode the user gave the agent; signed work is provenance, never the permission gate (accepted 2026-11-18, Ada's decisions; revised the same day)
+Applied in the same change to: R10 (CLAUDE.md §1 and Part 1's rule table), D-22 (A-285 line), §4.13 "Grants" (status),
+GAPS (2026-11-18 entry), `crates/server/src/grant_signature.rs` (module docs).
+Status: a volume's write policy and landing under it are built (2026-11-18): the wire (`WriteAct`, `WriteMode`,
+`WritePolicy`, `PolicySubject`, `SetPolicy`, `Policy`, `Refusal::PolicyForbids`), the policy an appended field of the
+volume's record (`PolicyRecord.write`, op `VolumeWritePolicySet`), set only under the issuer and never from a
+consumer-bound channel; a landing under it, on every Unix host: forbid refuses before any host access, ask answers the
+approval request a launcher's grant approves, bypass grants the planned presentation itself (`GrantSurface::Policy`)
+and lands it in the same request (`landing::land_under_policy`). Owed, in order: a consumer's own policy (the stricter
+of consumer and volume), merges under the policy, the MCP and SDK land verb gated by it, then signed work. The
+SSH-signature verifier built first (below) stays, for signed work.
+- **The rule (Ada, 2026-11-18).** Merging and landing to disk follow the permission mode the user gave the harness or
+  agent that asks. Bypass (Claude Code's `bypassPermissions`, Codex's full access): slates merges and writes, no
+  prompt. Ask: slates answers a typed approval request (the change's summary and manifest) that the harness presents
+  (its own prompt, an MCP elicitation, kiln's presentation), and writes once the approval comes back bound to that
+  manifest; a changed manifest is refused. A mode that forbids writing (plan): a typed refusal. The policy is carried
+  by the session's consumer or the volume and set by the launcher (kiln passes each agent's mode when it creates the
+  workspace) or the harness; the effective mode is the stricter of the two, unset is ask, and an agent can never raise
+  its own. The launcher's authority is the instance's issuer, which an agent's consumer channel never holds.
+- **Signed work (Ada: "we can (and should) support signed work").** A merge or a landing may carry an SSH signature
+  (OpenSSH `PROTOCOL.sshsig`); slates verifies it, records it as provenance and answers a typed check (verified with
+  its signer, unsigned, or invalid with its reason), and a volume can require signed merges. It never decides whether
+  a write is permitted.
+- **Withdrawn.** The same morning A-285 read R10 as a human-only proof: fs-server's options of 2026-11-05 (A, a prompt
+  on the anchor's terminal; B, a same-user socket; C, a separate operator account; D, a signature by a key only the
+  human holds; E, standing grants in a file the human writes), of which Ada first chose D with A as the fallback. Ada
+  withdrew that reading and the options (2026-11-18): agents can approve merges and landings within the mode their user
+  gave them. What was built for it and is withdrawn: the presentation's nonce and the signed `Grant` proof (piece 2,
+  d1a46ae9, reverted); never built: key registration and the terminal prompt.
+- **Kept.** The verifier (piece 1, 1c31d1c7): an SSH signature under a namespace, `ssh-ed25519` and `sk-ssh-ed25519`
+  (the user-presence flag required), `sha512` or `sha256`, Ed25519 and SHA-2 from AWS-LC (A-66), against a set of
+  keys; every failure a typed `SignatureRefusal`. Proven by 10 unit tests over a real `ssh-keygen -Y sign` vector
+  (OpenSSH 10.0p2): every single-bit flip, an unregistered key, a changed field, another namespace, an expired
+  statement, an untouched security key and hostile bytes are refused. Signed work reuses it over its own statement.
 
-  Ada chose D, with A only where no key is registered, the same on macOS, Windows and Linux (2026-11-18).
-- The proof: an SSH signature (OpenSSH `PROTOCOL.sshsig`) under the namespace `slates-grant`, over a plain-text
-  statement, one field a line: the landing, the manifest hash, the target (prefixed by its byte length), the scope and
-  term, a nonce the daemon issues with the presentation, and an expiry in Unix seconds. It covers all that the old
-  keyed proof bound. The nonce makes a signature usable once and only after the presentation. Keys: `ssh-ed25519` and
-  `sk-ssh-ed25519@openssh.com`, whose signature must carry the authenticator's user-presence flag; hashes `sha512` or
-  `sha256`; Ed25519 and SHA-2 from AWS-LC (A-66). A second form is accepted over the same bytes: a WebAuthn assertion
-  whose challenge is the statement's SHA-256, made in kiln's person session (a passkey or a security-key touch).
-- Registration is itself a grant-class act. A standalone anchor accepts its first key only through A's terminal
-  prompt. A kiln-managed anchor has no terminal; it registers and confirms through kiln's person session, a WebAuthn
-  ceremony whose public key reaches the anchor over kiln's authenticated person path, which agents cannot use (kiln
-  already refuses an agent a manifest-bearing land). This last route is the supervisor's direction, put to Ada as a
-  recommendation (2026-11-18). Each later key must be signed by a registered key. No agent channel can add a key.
-- Proven (piece 1): a real `ssh-keygen -Y sign` signature (OpenSSH 10.0p2) verifies; every single-bit flip of it is
-  refused; an unregistered key, a changed manifest or any other changed field, another namespace, a statement past its
-  expiry and an untouched security key are each refused with their own reason; hostile bytes are refused, never a
-  panic (`crates/server/src/grant_signature.rs`, 10 tests). The golden test was red until the vector was re-signed over
-  the exact encoding, since the first vector was signed before the target gained its length prefix.
+### A-299 — The consumer contract: write modes per act, typed outcomes, typed conflicts and drift, signed work, one closed error taxonomy, a contract version a consumer pins (accepted 2026-11-18, Ada's widening of goal g262; piece 4, the contract published, built 2026-11-18)
+Applied in the same change to: §4.12 ("Embedding": what a host holds, its refusals and its versioning; "The consumer
+contract", new, with its status), GAPS (the A-299 entry and the Embedding library row), `docs/library.md`.
+- `crates/api`: `policy.rs` (new: `WriteMode`, `WriteAct`, `WritePolicy`, `PolicySubject`, `PolicyRefusal`,
+  `PolicyReason`), `signed.rs` (new: `WorkSignature`, `Verification`, `Signer`, `SignerKey`, `SignatureFault`),
+  `outcome.rs` (new: `LandOutcome`, `MergeOutcome`, `RebaseOutcome`, `Approval`, `Awaiting`, `Work`, `Summary`,
+  `ActionTally`, `LandingReport`, `LandingState`, `LandingConflict`, `MergeConflict`, `MergeConflicts`), `volume.rs`
+  (new: `VolumeSpec`, `Source`, `Provisioned`, `VolumeStatus`, `BaseState`, `DriftReport`, `Drift`, `DriftKind`,
+  `Watcher`), `error.rs` (rewritten: the classes and their details, `Note`, `MountMissing`, `Unreported`; every enum
+  closed), `instance.rs` (`provision`, `read`, `land`, `plan_landing`, `approval_entries`, `approve`, `merge`,
+  `rebase`, `retry_pause_ns`; `create`, `clone_snapshot`, `land` under a grant id, `land_approved`, `LandingPlan`,
+  `Planned` and `Approved` removed, replaced), `lib.rs` (`CONTRACT`; `overlay` and `scratch` replaced by
+  `VolumeSpec::overlay`, `VolumeSpec::empty`), `grant.rs`, `issuer.rs`, `start.rs` (the launcher's authority),
+  `mount.rs` (typed missing pieces), `Cargo.toml` (`slates-merge`), `tests/api.rs`, `tests/start.rs`.
+- `crates/cli/src/verbs.rs`: `failure_of_api` maps the taxonomy's classes to the command's exit codes; the Windows
+  unmount names each unreported volume from its typed refusal.
+
+- **Why.** Ada (2026-11-18): "merge and write to disk permissions need to reflect those granted by the user to the
+  harness/agent seeking to merge their write to disk. Part of your work is figuring out and building a correct, robust,
+  performant API with typed responses and errors that consumers can consume (Kiln is a consumer) to act upon this. This
+  also applies to handling merge conflicts, permission errors, provisioning/managing volumes, and other interactions."
+  And the rule of the same day: agents can approve merges and landings; bypass writes, ask returns a typed approval
+  request, forbid a typed refusal; no keys, no signatures, no person-only proofs; the launcher or the harness sets a
+  session's or a volume's policy, and an agent can never raise its own. And, later the same day: "we can (and should)
+  support signed work (signed merges, etc.)": a merge or a landing may carry a signature, its outcome a typed
+  verification, and a volume's policy may require signed merges; signatures never gate permission.
+- **Before.** `slates-api` answered the wire's `Refusal` (with free text in a dozen variants), the client's own
+  `ClientError`, a landing's plan with its conflicts as `"path (Class)"` strings, a summary counting actions by name,
+  an outcome's state as a word, a drift list of `"path (Kind)"` strings with an unreadable base reported as a drift
+  entry `"status refused: ..."`, a merge window's class as a byte, and enums a consumer had to match with a wildcard.
+  A consumer acting on any of it parsed text.
+- **The shape.** One class per thing a consumer does (the table in `error.rs`), with the refusal's own data typed in
+  its detail; where the daemon or the OS spoke in prose only, a `Note`, displayed and never matched. The mapping from
+  the wire is one exhaustive match, so a refusal added to the wire cannot compile until it has a class. `NotFound`
+  names the subject the call named, which the bare wire refusal does not. Outcomes are enums of what happened —
+  written, awaiting approval, conflicted, refused — and the refusal a policy makes is an outcome, not an error: in a
+  forbid mode it is the expected answer. A landing whose presentation found conflicts answers them typed, read from
+  the presentation's own entries (A-287), never parsed. An unreadable base is a state of the status, never a failure of
+  it, so a mount still reads the daemon's port.
+- **Closed, and versioned for a pinning consumer.** The A-278 crate's enums were `#[non_exhaustive]`, which forces a
+  wildcard and lets a new variant fall through it unhandled. Kiln vendors slates at a commit; a new variant should stop
+  its build where it must decide, so every contract enum is exhaustive and `CONTRACT` is raised with every change: 1 as
+  first published, 2 the same day for `Denied::Policy` (the class `Refusal::PolicyForbids` maps to outside a landing or a
+  merge, defined before A-285's owner appends that refusal, so its arm in the exhaustive table is mechanical).
+- **Write permission, split between the crate and the daemon.** The modes are enforced where agents reach slates — the
+  daemon, through the MCP server, the SDKs and the mounts as much as this crate — so the daemon keeps them (A-285's
+  owner). The crate publishes the types now so kiln's agents (g263–g266) build against them. Until the daemon's side
+  lands, every landing with something to write asks (today's behaviour, a grant per landing) and `approve` grants it
+  with the launcher's issuer, binding exactly the manifest shown; a signed act is refused `Unsupported(SignedWork)`
+  before anything is sent, and every outcome reports `Unsigned`, which is true.
+- **Rejected.** A merge's conflicts carrying the work's base from the handle a consumer holds: the daemon knows the
+  base, a handle can be stale, and the wire carries it next (owed). A paged listing faked over the one-reply list: the
+  daemon answers every volume in one reply today, and a page the daemon did not cut would hide that cost; the paged
+  verb is owed. Policy verbs that could only refuse until the daemon keeps policies: left out until they work.
+- **Checked.** `cargo test -p slates-api` (37 unit, 9 by use, 5 start, 1 doc) and `cargo test -p slates-cli` on
+  macOS arm64 (kiln runner, 2026-11-18): the cases in §4.12's status. The Linux and Windows arms of the mount and the
+  CLI's Windows unmount are not compiled on this host; the integrator's lanes are their first compiler.
+
+### A-300 — The Windows lanes run git, Mercurial and Subversion over the WinFsp drive, judged against NTFS with the drive's one stated difference: it makes no hard link (accepted 2026-11-17, Ada's goal of 2026-11-18: git, Mercurial and Subversion on every route, WinFsp among them)
+Applied in the same change to: Part 6 ("Real workloads": its row and status), §4.6 (the Windows conformance status),
+A-289 (its owed Windows roster), GAPS, `docs/wip/conformance.md`, `crates/conformance/src/workload.rs`
+(`Workload::runs_on_windows`, the Windows spellings of `normalize_output`, `StatedDifference`, `stated_differences`,
+`compare_with`, the Subversion script, `MSYS` in `ENVIRONMENT`), `crates/conformance/src/record.rs`
+(`WorkloadStatus::Stated`, `stated_note`), `matrix.rs` (a summary's stated part), `capability.rs` (the Windows
+workloads cell runnable), `xtask/src/conformance/workloads.rs` (which workloads a lane runs, the directory's plain
+form, the judgment under the route's stated differences), and CI's `windows-lint` and `windows-arm64` jobs.
+- **The decision.** The Windows lanes run the roster's version-control workloads (`git`, `git-history`, `mercurial`,
+  `subversion`) over the drive (`slates mount ID E:`): each script once in an NTFS folder of the scratch and once on
+  the drive, under the shared environment, judged by exit code, output and tree as every leg is. Git for Windows' `sh`
+  runs the scripts. The lanes install Mercurial (7.2.4, PyPI's wheel for each architecture) and Subversion (1.15.0,
+  VisualSVN's command-line zip, its SHA-256 pinned). The roster's other workloads are owed a Windows form
+  (`Workload::runs_on_windows` false): their scripts lean on tools a Windows runner lacks (rsync, rg, sqlite3, vim, a
+  watcher's inotify or FSEvents) or have not run there (cargo, npm, python).
+- **What Windows needed of the harness**, each a pure function with unit tests:
+  - Windows tools print a directory in several spellings: Python's and Mercurial's `D:\a`, git's and a Subversion file
+    URL's `D:/a`, the shell's `/d/a`, a lowercase drive letter, and a canonical path's verbatim `\\?\D:\a`. Each
+    becomes the root token (`normalize_output`), the longest first. A POSIX directory gains no Windows spelling, and
+    neither does a drive's root, whose shell spelling (`/d`) would match unrelated text. The harness starts each script
+    in the directory's plain form (`plain_path`), the one the tools print.
+  - A Subversion file URL names a Windows directory as `file:///D:/a`, so the script takes the directory from `pwd -W`
+    where the shell has it (other shells refuse the option, and `pwd` answers). Windows' `svnlook youngest` ends its
+    line with a carriage return, which the revision loop drops.
+  - Git for Windows' shell copies the target for `ln -s` by default. `MSYS=winsymlinks:nativestrict` in the shared
+    environment makes it a Windows symbolic link, and a failure where it cannot make one, as POSIX's `ln -s` does. So
+    the `git` workload's link goes through the drive's reparse points (A-275) on one side and NTFS's on the other.
+    Every other shell ignores the variable.
+- **The drive's stated difference: no hard link.** WinFsp's driver answers `FileLinkInformation` with
+  `STATUS_NOT_SUPPORTED` itself, before any file system is asked (v2.1, `src/sys/fileinfo.c` 2023-2025); its volume
+  parameters' `HardLinks` bit reads "unimplemented; set to 0" (`inc/winfsp/fsctl.h` 213); and its NTFS compatibility
+  page lists hard links as unsupported. So a local git or Mercurial clone copies on the drive where NTFS links it.
+  `git-history`'s "objects with two names after the clone" line and `mercurial`'s two "store files with two names"
+  lines count links on NTFS and none on the drive; every byte the clones hold is the same.
+  - The harness states these three lines for the WinFsp route alone (`stated_differences`), each matched by the start
+    both lines share. A pair of lines that differ and both carry one stated start is recorded with both sides
+    (`WorkloadStatus::Stated`) and does not fail the suite. Any other difference fails it, and so does a stated start
+    none of whose lines differed, so the list only shrinks, as an expected-failure list does.
+  - Rejected: printing the counts only where the file system can link (it would hide the very difference the goal
+    names); and a list kept outside the code (the lines are three and fixed, and their reason belongs beside the
+    comparison that applies it).
+  - Mercurial on the drive trusts a link count only after its `checknlink` probe makes a link, so there it copies each
+    store file before appending to it. The bytes are the same, and `verify` of all three repositories holds them.
+  - Hard-linked clones and stores on the WinFsp route need WinFsp's driver to pass hard links to its file system
+    (`FileLinkInformation` and the link queries): a change upstream to a signed kernel driver, outward-facing, so it is
+    a decision for Ada. Until then the route states the difference.
+- **Proven** on this Mac (2026-11-17; the Windows lanes' first run is the supervisor's):
+  `a_windows_directory_is_the_root_token_in_every_spelling_its_tools_print`,
+  `the_drives_link_count_is_a_stated_difference_on_its_route_alone`, `a_stated_line_excuses_nothing_else` and
+  `a_stated_difference_that_no_longer_differs_fails` (`crates/conformance/src/workload.rs`);
+  `the_workload_summary_names_a_routes_stated_differences_apart` (`matrix.rs`);
+  `windows_runs_fsx_winfstest_and_the_workloads` (`capability.rs`); `the_windows_lane_runs_the_version_control_workloads`;
+  and by use `the_drives_stated_differences_name_the_lines_the_real_clones_print` (`xtask/src/conformance/workloads.rs`).
+  That last test runs the real `git-history` and `mercurial` scripts on a host whose clones link (git: 5 of 5 objects;
+  Mercurial: 7 of 9 store files, 4 after the clone's commit). It judges each against the same run as a copying clone
+  prints it: identical but for exactly one and two stated lines; a difference on a route that states nothing; and,
+  against itself, refused because no stated line differed.
+- **Owed.** The lanes' first run, which is the supervisor's. The Windows workloads cell's record, re-recorded from that
+  run (the tracked record is still the owed skip of 2026-11-05). The other workloads' Windows forms.

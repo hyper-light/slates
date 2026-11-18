@@ -104,31 +104,49 @@ pub enum GrantScope {
   Session,
 }
 
-/// The human authority's proof a `Grant` carries (§4.13 "Grants", R10, D-22, A-285).
-#[derive(Wire, Clone, Debug, PartialEq, Eq)]
-pub enum GrantProofBody {
-  /// `BLAKE3_keyed(issuer_secret, landing ‖ manifest ‖ scope ‖ term)` under the secret the daemon minted into the
-  /// anchor segment, which the daemon recomputes. Replaced by the signed form once `slates grant` signs (A-285).
-  IssuerHash {
-    /// The keyed hash.
-    proof: [u8; 32],
-  },
-  /// An SSH signature (OpenSSH `PROTOCOL.sshsig`, namespace `slates-grant`) by a key the human registered, over the
-  /// grant statement (`slates_server::grant_signature::GrantStatement`): the landing, the manifest, the target, the
-  /// scope and term, the nonce the presentation carried, and this expiry.
-  SshSignature {
-    /// The signature blob (the armour's base64, decoded).
-    signature: Vec<u8>,
-    /// The statement's expiry, in Unix seconds.
-    expires_unix_s: u64,
-  },
+/// A kind of write a policy governs (A-285).
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteAct {
+  /// A merge (a work's submit into its green).
+  Merge,
+  /// A landing to the host's disk.
+  Land,
 }
 
-impl From<[u8; 32]> for GrantProofBody {
-  /// A bare 32-byte proof is the keyed hash under the issuer secret.
-  fn from(proof: [u8; 32]) -> GrantProofBody {
-    GrantProofBody::IssuerHash { proof }
-  }
+/// How one kind of write is permitted: the mode the user gave the harness or agent (A-285).
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteMode {
+  /// Written at once, with no approval asked (Claude Code's `bypassPermissions`, Codex's full access).
+  Bypass,
+  /// Answered with an approval request the harness presents; written once an approval binds the manifest.
+  Ask,
+  /// Refused (a mode that forbids writing, such as plan).
+  Forbid,
+}
+
+/// A write policy: the mode for merges and the mode for landings (A-285).
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WritePolicy {
+  /// How a merge is permitted.
+  pub merge: WriteMode,
+  /// How a landing is permitted.
+  pub land: WriteMode,
+}
+
+/// What a write policy is set on (A-285): an enrolled consumer (a session's agent) or a volume. The stricter of the
+/// caller's consumer and the volume governs.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicySubject {
+  /// An enrolled consumer.
+  Consumer {
+    /// The consumer id.
+    consumer: u64,
+  },
+  /// A volume.
+  Volume {
+    /// The volume.
+    volume: VolumeId,
+  },
 }
 
 /// The durability scope of `await placed` (§4.8 D-18): the owner's region, or the mirror.
@@ -349,8 +367,9 @@ pub enum RequestBody {
     /// The paths, or the whole base.
     paths: Option<Vec<String>>,
   },
-  /// A grant for a presented landing (§4.15 step 3, §4.13 "Grants"): carries the human authority's
-  /// **proof** ([`GrantProofBody`]), which the daemon verifies before it issues anything. Without a
+  /// A grant for a presented landing (§4.15 step 3, §4.13 "Grants"): carries the human surface's
+  /// **proof of issuer authority** — `BLAKE3_keyed(issuer_secret, landing ‖ manifest ‖ scope ‖ term)` —
+  /// which the daemon recomputes against the secret it minted into the anchor segment. Without a
   /// verifying proof the grant refuses `GrantIssuerUnverified` (AC-2.8: the kind arriving from an agent
   /// channel — the MCP server and the SDKs carry no proof by construction — is refused and counted);
   /// with one, the landing's grant is issued bound to that exact manifest.
@@ -363,8 +382,8 @@ pub enum RequestBody {
     scope: GrantScope,
     /// The grant's validity, nanoseconds from issue.
     term_ns: u64,
-    /// The proof of the human's authority.
-    proof: GrantProofBody,
+    /// The proof of issuer authority.
+    proof: [u8; 32],
   },
   /// Enroll a consumer under a host account (§4.13 "Principals"): the human surface, proving issuer
   /// authority as for a grant, mints a consumer id and the secret capability the workload will bind its
@@ -831,6 +850,23 @@ pub enum RequestBody {
     landing: u64,
     /// Where the page starts.
     from: EntriesCursor,
+  },
+  /// Sets a write policy (A-285): the launcher's or the harness's act, proven by the keyed hash under the issuer
+  /// secret (`slates_server::landing::policy_proof`). Refused `Forbidden` on a consumer-bound channel whatever its
+  /// proof, so an agent can never set, and so never raise, its own policy; `GrantIssuerUnverified` without the proof.
+  /// A volume's policy is served on the volume's owner shard. Appended.
+  SetPolicy {
+    /// What the policy is set on.
+    subject: PolicySubject,
+    /// The policy.
+    policy: WritePolicy,
+    /// The keyed hash under the issuer secret.
+    proof: [u8; 32],
+  },
+  /// Reads a write policy (A-285): `None` when none is set, which is ask. Appended.
+  Policy {
+    /// What the policy is set on.
+    subject: PolicySubject,
   },
 }
 
@@ -1501,6 +1537,15 @@ impl RequestBody {
       | RequestBody::Land { volume, .. }
       | RequestBody::ImageBuild { volume, .. }
       | RequestBody::ImageMerge { image: volume, .. } => Some(*volume),
+      // A volume's policy lives in its record, on its owner shard.
+      RequestBody::SetPolicy {
+        subject: PolicySubject::Volume { volume },
+        ..
+      }
+      | RequestBody::Policy {
+        subject: PolicySubject::Volume { volume },
+      } => Some(*volume),
+      RequestBody::SetPolicy { .. } | RequestBody::Policy { .. } => None,
       // A checkout writes its green's base volume, on the owner shard of both (`green --base` runs there).
       RequestBody::Checkout { base, .. } => Some(base.volume),
       // A green over a base is born on the base volume's owner shard, where the snapshot is walked.
@@ -1561,6 +1606,7 @@ impl RequestBody {
         | RequestBody::FsRename { .. }
         | RequestBody::FsMkdir { .. }
         | RequestBody::Checkout { .. }
+        | RequestBody::SetPolicy { .. }
     )
   }
 
@@ -3218,6 +3264,14 @@ pub enum Refusal {
     /// The requester, by its host's certificate anchor and its account.
     principal: Principal,
   },
+  /// The write policy forbids this act (A-285): the mode the user gave the agent forbids writing. `by` names the
+  /// subject whose policy decided. Appended.
+  PolicyForbids {
+    /// The act refused.
+    act: WriteAct,
+    /// The subject whose policy forbids it.
+    by: PolicySubject,
+  },
 }
 
 /// Why recovery could not rebuild a volume its catalog holds ([`Refusal::NotRecovered`], §4.8). Append-only.
@@ -3469,9 +3523,6 @@ pub enum ReplyBody {
     landing: u64,
     /// The manifest hash the grant must bind.
     manifest: [u8; 32],
-    /// The nonce a signed grant's statement must carry (A-285): fresh for each presentation and spent by the first
-    /// grant it proves, so a signature is made only after the presentation and proves one grant.
-    nonce: [u8; 32],
     /// The summary of what would be written.
     summary: LandingSummary,
     /// Conflicts found before any write (empty when the landing is clean).
@@ -3715,6 +3766,13 @@ pub enum ReplyBody {
     total: u64,
     /// The manifest's hash, the one its `GrantRequired` named, so a reader joining pages knows each is of one manifest.
     manifest: [u8; 32],
+  },
+  /// A write policy was set (A-285). Appended.
+  PolicySet,
+  /// A write policy (A-285): `None` when none is set, which is ask. Appended.
+  Policy {
+    /// The policy.
+    policy: Option<WritePolicy>,
   },
 }
 

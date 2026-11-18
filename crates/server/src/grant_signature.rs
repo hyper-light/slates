@@ -1,19 +1,15 @@
-//! A grant signed by a key only the human holds (R10, D-22, §4.13 "Grants", A-285; Ada, 2026-11-18,
-//! fs-server's option D). The human's surface is no longer a secret any process of the anchor's user can read from
-//! the anchor segment: it is an SSH signature (OpenSSH `PROTOCOL.sshsig`, namespace [`NAMESPACE`]) made by a key the
-//! human registered, held where an agent with a shell cannot use it unseen. That is an ssh-agent key added with
-//! `ssh-add -c`, whose agent asks the human through askpass to confirm every use, or a FIDO key (`sk-ssh-ed25519`),
-//! which needs a physical touch for each signature; [`verify_grant_signature`] refuses an `sk` signature whose
-//! authenticator did not report the touch (the user-presence flag).
+//! SSH signatures over slates' statements, verified against a set of keys (A-285): the verifier signed work stands on
+//! (Ada, 2026-11-18: "we can (and should) support signed work"). A merge or a landing may carry a signature that slates
+//! verifies and records as provenance, and a volume may require one; it never decides whether a write is permitted,
+//! which the write mode the user gave the agent does (R10, D-22). A signature is OpenSSH's `PROTOCOL.sshsig` under a
+//! namespace, by an `ssh-ed25519` key or a FIDO `sk-ssh-ed25519` key, and [`verify_grant_signature`] refuses an `sk`
+//! signature whose authenticator did not report the touch (the user-presence flag).
 //!
-//! **What is signed.** [`GrantStatement::encode`] is the exact text the human's key signs: the landing, the manifest
-//! hash the human saw, the target, the scope and term (all that [`crate::landing::grant_proof`] bound), plus a nonce
-//! the daemon chose when it presented the landing, so a signature cannot be made before the presentation or used for
-//! a second one, and an expiry in wall-clock seconds. It is plain text, one field a line, so `ssh-keygen -Y sign`
-//! signs it as a file and a human can read what they sign; the target carries its length, so no path can forge a
-//! later line. A WebAuthn assertion (kiln's confirmation surface, a passkey or security-key touch) can be an accepted
-//! form over the same bytes: its challenge is the statement's SHA-256 ([`GrantStatement::challenge`]); verifying
-//! that form is the next piece (GAPS).
+//! **What is signed.** [`GrantStatement::encode`] is the exact text a key signs: a landing, its manifest hash, its
+//! target, the scope and term, a nonce and an expiry in wall-clock seconds, plain text one field a line, so
+//! `ssh-keygen -Y sign` signs it as a file and a person can read what they sign; the target carries its length, so no
+//! path can forge a later line. It was built for A-285's first reading (a grant's proof, since withdrawn); signed
+//! work's own statement (a merge's volume, base, head and manifest) replaces it when that piece lands (GAPS).
 //!
 //! **Why here, with aws-lc-rs.** Ed25519 and the SHA-2 digests come from AWS-LC, slates' one cryptographic library
 //! (A-66), which the server already links on every platform through rustls. The format code is pure, and its golden
@@ -21,7 +17,7 @@
 //!
 //! **Refusals.** Every failure is a [`SignatureRefusal`]: malformed bytes, another namespace, an unsupported key or
 //! hash, a key not registered, a signature that does not verify, a security key not touched, or a statement past its
-//! expiry. Replays are refused where the nonce is spent, by the daemon that issued it.
+//! expiry.
 
 use aws_lc_rs::digest;
 use aws_lc_rs::signature::{ED25519, UnparsedPublicKey};
@@ -70,8 +66,6 @@ pub enum SignatureRefusal {
   NotTouched,
   /// The statement's expiry has passed.
   Expired,
-  /// The presentation's nonce was already spent by a grant: the same signature offered again.
-  Replayed,
 }
 
 impl SignatureRefusal {
@@ -86,7 +80,6 @@ impl SignatureRefusal {
       SignatureRefusal::BadSignature => "grant_signature_bad",
       SignatureRefusal::NotTouched => "grant_signature_not_touched",
       SignatureRefusal::Expired => "grant_signature_expired",
-      SignatureRefusal::Replayed => "grant_signature_replayed",
     }
   }
 }
@@ -444,65 +437,6 @@ fn ed25519_verify(
     .map_err(|_| SignatureRefusal::BadSignature)
 }
 
-/// A software Ed25519 key that signs grant statements as `ssh-keygen -Y sign -n slates-grant` does, for the tests of
-/// this module and of the grant verb (`crate::landing`).
-#[cfg(test)]
-pub(crate) struct TestSigner {
-  /// The key pair.
-  pair: aws_lc_rs::signature::Ed25519KeyPair,
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-impl TestSigner {
-  /// A fresh key.
-  pub(crate) fn new() -> TestSigner {
-    use aws_lc_rs::signature::Ed25519KeyPair;
-    let document = Ed25519KeyPair::generate_pkcs8(&aws_lc_rs::rand::SystemRandom::new()).unwrap();
-    TestSigner {
-      pair: Ed25519KeyPair::from_pkcs8(document.as_ref()).unwrap(),
-    }
-  }
-
-  /// The key as the human registers it.
-  pub(crate) fn registered(&self) -> RegisteredKey {
-    use aws_lc_rs::signature::KeyPair;
-    let mut blob = Vec::new();
-    put_string(&mut blob, KEY_ED25519.as_bytes()).unwrap();
-    put_string(&mut blob, self.pair.public_key().as_ref()).unwrap();
-    RegisteredKey(blob)
-  }
-
-  /// The SSH signature blob over `statement` under `namespace`.
-  pub(crate) fn sign_under(&self, namespace: &str, statement: &GrantStatement) -> Vec<u8> {
-    let mut signed = SSHSIG_MAGIC.to_vec();
-    put_string(&mut signed, namespace.as_bytes()).unwrap();
-    put_string(&mut signed, b"").unwrap();
-    put_string(&mut signed, b"sha512").unwrap();
-    put_string(
-      &mut signed,
-      digest::digest(&digest::SHA512, &statement.encode()).as_ref(),
-    )
-    .unwrap();
-    let mut inner = Vec::new();
-    put_string(&mut inner, KEY_ED25519.as_bytes()).unwrap();
-    put_string(&mut inner, self.pair.sign(&signed).as_ref()).unwrap();
-    let mut blob = SSHSIG_MAGIC.to_vec();
-    blob.extend_from_slice(&SSHSIG_VERSION.to_be_bytes());
-    put_string(&mut blob, &self.registered().0).unwrap();
-    put_string(&mut blob, namespace.as_bytes()).unwrap();
-    put_string(&mut blob, b"").unwrap();
-    put_string(&mut blob, b"sha512").unwrap();
-    put_string(&mut blob, &inner).unwrap();
-    blob
-  }
-
-  /// The SSH signature blob over `statement` under [`NAMESPACE`].
-  pub(crate) fn sign(&self, statement: &GrantStatement) -> Vec<u8> {
-    self.sign_under(NAMESPACE, statement)
-  }
-}
-
 #[cfg(test)]
 mod tests {
   #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
@@ -680,12 +614,21 @@ PgowBcvcisBQ+rfA7nqv3MYxc2I5mR2Qs=
   /// A signature made under another namespace (a git commit's, a file's) is refused as such, though valid.
   #[test]
   fn a_signature_under_another_namespace_is_refused() {
-    let signer = TestSigner::new();
-    let keys = vec![signer.registered()];
+    let pair = fresh_pair();
+    let mut public_blob = Vec::new();
+    put_string(&mut public_blob, KEY_ED25519.as_bytes()).unwrap();
+    put_string(&mut public_blob, pair.public_key().as_ref()).unwrap();
+    let keys = vec![RegisteredKey(public_blob.clone())];
+    let sign = |signed: &[u8]| {
+      let mut inner = Vec::new();
+      put_string(&mut inner, KEY_ED25519.as_bytes()).unwrap();
+      put_string(&mut inner, pair.sign(signed).as_ref()).unwrap();
+      inner
+    };
     let statement = golden_statement();
-    let good = signer.sign(&statement);
+    let good = sshsig(&public_blob, NAMESPACE, &statement, sign);
     assert!(verify_grant_signature(&good, &statement, &keys, BEFORE_EXPIRY).is_ok());
-    let git = signer.sign_under("git", &statement);
+    let git = sshsig(&public_blob, "git", &statement, sign);
     assert_eq!(
       verify_grant_signature(&git, &statement, &keys, BEFORE_EXPIRY),
       Err(SignatureRefusal::Namespace)
