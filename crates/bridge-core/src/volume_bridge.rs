@@ -89,6 +89,9 @@ pub struct VolumeBridge<'v> {
   /// Whether the transport serving through this bridge offers its guest per-inode DAX ([`crate::DaxOffer`]): withheld
   /// unless the Shards route's serve task says otherwise ([`VolumeBridge::offering_dax`]).
   dax: crate::DaxOffer,
+  /// How the transport shows its guest the volume's owners ([`crate::OwnerView`]): the identity unless the Shards route's
+  /// serve task says otherwise ([`VolumeBridge::viewing_owners`]; A-281).
+  owners: crate::OwnerView,
 }
 
 /// The files whose acknowledged writes a daemon's death lost, for a mount the anchor held across it (A-61;
@@ -306,6 +309,7 @@ impl<'v> VolumeBridge<'v> {
       max_read: MAX_READ,
       lost: None,
       dax: crate::DaxOffer::Withheld,
+      owners: crate::OwnerView::IDENTITY,
     }
   }
 
@@ -327,6 +331,7 @@ impl<'v> VolumeBridge<'v> {
       max_read: MAX_READ,
       lost: None,
       dax: crate::DaxOffer::Withheld,
+      owners: crate::OwnerView::IDENTITY,
     }
   }
 
@@ -354,6 +359,7 @@ impl<'v> VolumeBridge<'v> {
       max_read: MAX_READ,
       lost: None,
       dax: crate::DaxOffer::Withheld,
+      owners: crate::OwnerView::IDENTITY,
     }
   }
 
@@ -368,6 +374,13 @@ impl<'v> VolumeBridge<'v> {
   #[must_use]
   pub fn offering_dax(mut self, dax: crate::DaxOffer) -> VolumeBridge<'v> {
     self.dax = dax;
+    self
+  }
+
+  /// This bridge, its transport showing its guest the volume's owners as `owners` says (the Shards route, A-281).
+  #[must_use]
+  pub fn viewing_owners(mut self, owners: crate::OwnerView) -> VolumeBridge<'v> {
+    self.owners = owners;
     self
   }
 
@@ -1397,6 +1410,10 @@ impl Bridge for VolumeBridge<'_> {
 
   fn dax_offer(&mut self) -> crate::DaxOffer {
     self.dax
+  }
+
+  fn owner_view(&mut self) -> crate::OwnerView {
+    self.owners
   }
 
   fn dax_state(&mut self) -> Option<crate::DaxState<'_>> {

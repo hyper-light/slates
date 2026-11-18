@@ -1,5 +1,27 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A Shards guest's unprivileged run could not write a host-owned volume: built, the stream takes Shards' owner word
+> (2026-11-18, §4.6 the Shards form; A-281; goal g268).** Shards' init names the run's owner on a share's root with
+> `trusted.shards.owner` (`UID:GID`), and slates refused it `EOPNOTSUPP`, so a guest of user 1000 saw a Mac's files as
+> 501:20 and its kernel refused the run's writes. The stream now takes the word from the guest's root on its root alone
+> and refuses it otherwise as Shards' server does. From then on it shows the owner the volume keeps for its root as the
+> run's and the run's as the root's, and keeps the ids the guest names the other way round. Every other route sees the
+> host's ids, what the run made included. Tests by use: the word's reading and refusals and the dispatch's view
+> (`crates/bridge-fuse/tests/shards_fs.rs`), and a real daemon's stream against its NFS port
+> (`crates/server/tests/shards.rs`). **Still owed for Shards, in its coordinator's order (2026-11-18):**
+> - `trusted.*` and `security.*` (`security.capability` from `setcap`, `trusted.overlay.*` for an overlayfs upper
+>   directory on a share) kept as the guest's data, never shown to a host's mount, then POSIX ACLs
+>   (`system.posix_acl_*` from `setfacl`). Today every name outside `user.` is refused on every FUSE route.
+> - A stream's tables for a VM's save and restore (Shards' D176 part 5): SAVE takes a snapshot of the volume at the
+>   cut and names it in opaque tables within Shards' `MAX_TABLES`; RESTORE takes them on a new stream before any
+>   request, against that snapshot, a clone of it, or the live volume unchanged since the cut, else `[1, why]`.
+> - A stream that survives a daemon restart, answering Shards' RESEND, each non-idempotent request (CREATE with
+>   O_EXCL, MKDIR, LINK, RENAME, UNLINK) answered at most once from the dead daemon's durable record of its outcome;
+>   else the stream ends typed and counted. The owner view then has to be kept with the attachment's record.
+> - Shards' side, after its v0.8.0 tag and landed by its coordinator from signed branches: its guest test over a
+>   slates stream on Linux and macOS (`tests/slates_fs.rs`, Windows only today), the bump of the slates revision it
+>   pins (f71282e1f), and the WHP window patches 0001 to 0003 (`docs/wip/shards-patches/`).
+
 > **The dirty-page test's precondition, proved each attempt (2026-11-09, A-248).**
 > `a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path` failed intermittently ("the sync says so:
 > Ok(())", B10's gate, adacachy2, load about 66) when the kernel wrote the store's page back before the replacement. On

@@ -38,7 +38,9 @@ use slates_wire::request::RequestId;
 
 mod common;
 use common::anchor::{held_anchor, source_of};
-use common::nfs::{create, lookup, lookup_status, mkdir, mount, read, remove_status, write};
+use common::nfs::{
+  create, lookup, lookup_status, mkdir, mount, owner_and_mode, read, remove_status, write,
+};
 
 /// Shape: the reply deadline (nanoseconds): five seconds, far past any served verb.
 const DEADLINE_NS: u64 = 5_000_000_000;
@@ -88,6 +90,17 @@ const O_RDWR: u32 = 2;
 const O_RDONLY: u32 = 0;
 /// Format: the FUSE node id of the attachment's root.
 const ROOT: u64 = 1;
+/// Format: where the in-header's caller uid lies (len, opcode, unique, nodeid before it), the gid after it.
+const IN_HEADER_UID_AT: usize = 24;
+/// Format: where `fuse_attr`'s uid lies in a LOOKUP reply (`fuse_entry_out`: 40 bytes before its `fuse_attr`, whose uid
+/// is at 68) and in a GETATTR reply (`fuse_attr_out`: 16 bytes before it); its gid follows each.
+const ENTRY_ATTR_UID_AT: usize = OUT_HEADER_LEN + 40 + 68;
+const ATTR_OUT_UID_AT: usize = OUT_HEADER_LEN + 16 + 68;
+/// Format: Shards' owner word (`shards_fs::OWNER_WORD`, Shards' `SHARE_OWNER_XATTR`).
+const OWNER_WORD: &str = "trusted.shards.owner";
+/// Linux's `EPERM` and `ENODATA`.
+const EPERM: i32 = 1;
+const ENODATA: i32 = 61;
 /// Format: the FUSE protocol version a guest kernel offers (7.31, Linux 5.4's).
 const MAJOR: u32 = 7;
 const MINOR: u32 = 31;
@@ -291,8 +304,21 @@ impl Guest {
 
   /// Sends one guest request and returns its reply's bytes (empty for a request that takes none).
   fn ask(&mut self, opcode: Opcode, nodeid: u64, body: &[u8]) -> Vec<u8> {
+    self.ask_as(opcode, nodeid, (0, 0), body)
+  }
+
+  /// [`Guest::ask`] from the guest process of `uid` and `gid` (the in-header's caller; root's in every other ask).
+  fn ask_as(
+    &mut self,
+    opcode: Opcode,
+    nodeid: u64,
+    (uid, gid): (u32, u32),
+    body: &[u8],
+  ) -> Vec<u8> {
     self.unique += 1;
-    let request = message(opcode.to_wire(), self.unique, nodeid, body);
+    let mut request = message(opcode.to_wire(), self.unique, nodeid, body);
+    request[IN_HEADER_UID_AT..IN_HEADER_UID_AT + 4].copy_from_slice(&uid.to_le_bytes());
+    request[IN_HEADER_UID_AT + 4..IN_HEADER_UID_AT + 8].copy_from_slice(&gid.to_le_bytes());
     self.send_frame(0, &request);
     self.reply_frame().expect("the daemon answered").1
   }
@@ -3093,4 +3119,185 @@ fn a_guests_write_over_a_shards_stream_is_answered_once_every_fuse_mount_of_its_
   drop(point);
   drop(guest);
   daemon.stop();
+}
+
+/// The owner (uid, gid) a reply's `fuse_attr` shows at `uid_at`.
+fn shown_owner(reply: &[u8], uid_at: usize) -> (u32, u32) {
+  let word = |at: usize| u32::from_le_bytes(reply[at..at + 4].try_into().unwrap());
+  (word(uid_at), word(uid_at + 4))
+}
+
+/// A SETXATTR of `name` to `value` (`fuse_setxattr_in`: size, flags, then the name and its NUL, then the value).
+fn setxattr(name: &str, value: &[u8]) -> Vec<u8> {
+  let mut body = u32::try_from(value.len()).unwrap().to_le_bytes().to_vec();
+  body.extend_from_slice(&0u32.to_le_bytes());
+  body.extend_from_slice(&named(name));
+  body.extend_from_slice(value);
+  body
+}
+
+/// A GETXATTR (`fuse_getxattr_in`: size, padding, then the name) or, with no name, a LISTXATTR, asking for `size` bytes.
+fn getxattr(size: u32, name: Option<&str>) -> Vec<u8> {
+  let mut body = size.to_le_bytes().to_vec();
+  body.extend_from_slice(&0u32.to_le_bytes());
+  if let Some(name) = name {
+    body.extend_from_slice(&named(name));
+  }
+  body
+}
+
+/// The body of a CREATE of `name`, open for reading and writing, mode 0644 (`fuse_create_in`: flags, mode, umask, open
+/// flags; then the name).
+fn create_body(name: &str) -> Vec<u8> {
+  let mut body = Vec::new();
+  body.extend_from_slice(&O_RDWR.to_le_bytes());
+  body.extend_from_slice(&0o644u32.to_le_bytes());
+  body.extend_from_slice(&[0u8; 8]);
+  body.extend_from_slice(&named(name));
+  body
+}
+
+/// The body of a SETATTR of the owner alone (`fuse_setattr_in`, 88 bytes: `FATTR_UID | FATTR_GID`, then the uid at 76
+/// and the gid at 80).
+fn chown_body((uid, gid): (u32, u32)) -> Vec<u8> {
+  let mut body = ((1u32 << 1) | (1u32 << 2)).to_le_bytes().to_vec();
+  body.extend_from_slice(&[0u8; 4 + 8 * 6 + 4 * 5]);
+  body.extend_from_slice(&uid.to_le_bytes());
+  body.extend_from_slice(&gid.to_le_bytes());
+  body.extend_from_slice(&[0u8; 4]);
+  body
+}
+
+/// A-281, by use on a real daemon: a Shards guest's root names its run's owner with Shards' owner word, as Shards' init
+/// does when it mounts a share, and an unprivileged run then owns what the host made. Do: make a file as the host's user
+/// before any word; refuse the word from a run's user, on a node other than the root and with a value that is no
+/// `UID:GID`; name it from root on the root; read the root and the host's file over the stream; create a file as the
+/// run's user, and chown one made over NFS to the run's ids, reading both back over the daemon's NFS port; ask the stream
+/// for the word's attribute and its listing; then attach a second stream that names no owner. Expect the refusals
+/// `EPERM`, `EINVAL` and `EINVAL`, counted; the word taken and counted once; the host's owner shown to the guest as the
+/// run's; the run's file and the chowned one kept as the host's, as NFS reads them; the word kept on no file
+/// (`ENODATA`, and no listing names it); and the second stream shown every owner as the volume keeps it.
+#[test]
+fn the_runs_owner_named_on_the_root_owns_what_the_host_made_and_the_host_keeps_its_own() {
+  let (daemon, client, id) = provisioned("shards-owner");
+  let mut guest =
+    Guest::over(attach(&daemon, id, None, Intent::Write).expect("the attach was served"));
+  guest.init();
+  let kept = shown_owner(&guest.getattr_reply(ROOT), ATTR_OUT_UID_AT);
+  // A run's ids that are neither the host's uid nor its gid, so the swap shows in both.
+  let run = (kept.0.max(kept.1) + 1000, kept.0.max(kept.1) + 1001);
+  let made = guest.ask_as(Opcode::Create, ROOT, kept, &create_body("from-host.txt"));
+  assert_eq!(
+    errno(&made),
+    0,
+    "the host's user makes a file before any word"
+  );
+  let file = u64_at(&made, OUT_HEADER_LEN);
+  let (mut host, root) = host_mount(&daemon, "shared");
+  let from_host = lookup(&mut host, &root, "from-host.txt", 2);
+  let (_, uid, gid) = owner_and_mode(&mut host, &from_host, 3);
+  assert_eq!((uid, gid), kept, "the host's file is kept as the root is");
+
+  let value = format!("{}:{}", run.0, run.1).into_bytes();
+  let refused = [
+    (ROOT, run, value.clone(), EPERM),
+    (file, (0, 0), value.clone(), EINVAL),
+    (ROOT, (0, 0), b"run:run".to_vec(), EINVAL),
+  ];
+  for (node, caller, value, expected) in refused {
+    let reply = guest.ask_as(
+      Opcode::SetXattr,
+      node,
+      caller,
+      &setxattr(OWNER_WORD, &value),
+    );
+    assert_eq!(
+      errno(&reply),
+      expected,
+      "the word on {node} from {caller:?}"
+    );
+  }
+  assert_eq!(wait_for_count(&daemon, "shards.owner_refused", 3), 3);
+  let mut with_nul = value.clone();
+  with_nul.push(0);
+  let taken = guest.ask(Opcode::SetXattr, ROOT, &setxattr(OWNER_WORD, &with_nul));
+  assert_eq!(errno(&taken), 0, "the word is taken from root on the root");
+  assert_eq!(wait_for_count(&daemon, "shards.owner_named", 1), 1);
+
+  assert_eq!(
+    shown_owner(&guest.getattr_reply(ROOT), ATTR_OUT_UID_AT),
+    run,
+    "the root is the run's"
+  );
+  let looked_up = guest.lookup_reply(ROOT, "from-host.txt");
+  assert_eq!(
+    shown_owner(&looked_up, ENTRY_ATTR_UID_AT),
+    run,
+    "and so is the host's file"
+  );
+  let created = guest.ask_as(Opcode::Create, ROOT, run, &create_body("from-run.txt"));
+  assert_eq!(
+    errno(&created),
+    0,
+    "the run's user creates in the host's root"
+  );
+  assert_eq!(
+    shown_owner(&created, ENTRY_ATTR_UID_AT),
+    run,
+    "the run's file is the run's to the guest"
+  );
+  let from_run = lookup(&mut host, &root, "from-run.txt", 4);
+  let (_, uid, gid) = owner_and_mode(&mut host, &from_run, 5);
+  assert_eq!((uid, gid), kept, "and the host's over NFS");
+
+  // A file made over NFS, chowned by the guest's root to the run's ids: kept as the host's.
+  let by_nfs = create(&mut host, &root, "by-nfs.txt", 6);
+  let node = guest.lookup(ROOT, "by-nfs.txt").unwrap();
+  let changed = guest.ask(Opcode::SetAttr, node, &chown_body(run));
+  assert_eq!(errno(&changed), 0, "the chown is served");
+  assert_eq!(
+    shown_owner(&changed, ATTR_OUT_UID_AT),
+    run,
+    "and reads back as the guest asked it"
+  );
+  let (_, uid, gid) = owner_and_mode(&mut host, &by_nfs, 7);
+  assert_eq!(
+    (uid, gid),
+    kept,
+    "a chown to the run's ids is kept as the host's"
+  );
+
+  let word = guest.ask(Opcode::GetXattr, ROOT, &getxattr(256, Some(OWNER_WORD)));
+  assert_eq!(errno(&word), ENODATA, "the word is kept on no file");
+  let listed = guest.ask(Opcode::ListXattr, ROOT, &getxattr(4096, None));
+  assert_eq!(errno(&listed), 0);
+  assert!(
+    !holds(&listed[OUT_HEADER_LEN..], OWNER_WORD.as_bytes()),
+    "no listing names the word"
+  );
+
+  let mut plain = Guest::over(attach(&daemon, id, None, Intent::Read).expect("a second attach"));
+  plain.init();
+  assert_eq!(
+    shown_owner(&plain.getattr_reply(ROOT), ATTR_OUT_UID_AT),
+    kept,
+    "a stream with no word sees the root kept"
+  );
+  assert_eq!(
+    shown_owner(&plain.lookup_reply(ROOT, "from-run.txt"), ENTRY_ATTR_UID_AT),
+    kept
+  );
+  none_counted(
+    &daemon,
+    &[
+      "shards.barrier_refused",
+      "shards.frame_refused",
+      "shards.stream_failed",
+    ],
+  );
+  drop(plain);
+  drop(guest);
+  drop(host);
+  drop(client);
+  drop(daemon);
 }

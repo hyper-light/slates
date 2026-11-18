@@ -7,7 +7,8 @@
 //! its length bounded before anything is allocated for it; [`answer`] dispatches a request through the bridge the kernel
 //! mount uses ([`crate::bridge::dispatch`], the one FUSE seam) and writes the reply frame; [`descriptor_ask`] reads a DAX
 //! window's descriptor ask and [`descriptor_answer`] heads the answer that carries the descriptor; [`control_refusal`]
-//! and [`descriptor_refusal`] answer what slates refuses, in Shards' forms.
+//! and [`descriptor_refusal`] answer what slates refuses, in Shards' forms; [`owner_word`] reads Shards' owner word, the
+//! run's owner its init names on a share's root, which the stream takes itself and keeps on no file (A-281).
 //!
 //! These are functions over bytes, holding no socket and no OS type, so they stay inside the lint wall's RAM-only rule
 //! (R1) and run on every platform; the stream, its readiness and its end are the daemon's. Every failure is a typed
@@ -24,7 +25,7 @@ use std::io;
 use slates_bridge_core::{Bridge, OpContext};
 
 use crate::abi::{OUT_HEADER_LEN, Opcode};
-use crate::bridge::{EIO, dispatch, reply_error, takes_reply};
+use crate::bridge::{EINVAL, EIO, EPERM, FUSE_ROOT_ID, dispatch, reply_error, takes_reply};
 use crate::init::{MAX_WRITE, max_pages};
 use crate::reply::ReplyHeader;
 use crate::request::{InHeader, ReadIn, Request};
@@ -157,7 +158,8 @@ pub fn answer(
 }
 
 /// Overwrites the reply frame at the head of `frame` with an error reply to request `unique`: a reply refused after it
-/// was made (its change not captured by the barrier). The frame's bytes, the length word included.
+/// was made (its change not captured by the barrier); with `errno` zero, a bare success, an owner word's
+/// ([`owner_word_reply`]). The frame's bytes, the length word included.
 pub fn refuse(unique: u64, errno: i32, frame: &mut Vec<u8>) -> usize {
   let need = LENGTH_BYTES.saturating_add(OUT_HEADER_LEN);
   if frame.len() < need {
@@ -171,6 +173,112 @@ pub fn refuse(unique: u64, errno: i32, frame: &mut Vec<u8>) -> usize {
     head.copy_from_slice(&word);
   }
   LENGTH_BYTES.saturating_add(len)
+}
+
+/// Format: Shards' owner word (`shards_abi::SHARE_OWNER_XATTR`, Shards D38): the attribute Shards' init sets on a
+/// share's root as it mounts it, its value the run's owner as `UID:GID`, so that a run of an unprivileged user writes
+/// the share it was given. Shards' guest kernel lets only a process with `CAP_SYS_ADMIN` set a `trusted.` name
+/// (`fs/xattr.c` `xattr_permission`).
+pub const OWNER_WORD: &[u8] = b"trusted.shards.owner";
+
+/// What a guest's `SETXATTR` of [`OWNER_WORD`] asks (A-281), taken by the stream before any dispatch: Shards' own
+/// server takes it the same way (`server.rs` `set_default_owner`) and keeps it on no file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnerWord {
+  /// The run's owner, named by the guest's root on the share's root: what the reply to request `unique` acknowledges.
+  Named {
+    /// The request's unique id, which its reply carries.
+    unique: u64,
+    /// The run's uid.
+    uid: u32,
+    /// The run's gid.
+    gid: u32,
+  },
+  /// The word refused with `errno`, as Shards' server refuses it: `EPERM` from any caller but the guest's root, `EINVAL`
+  /// on any node but the share's root or with a value that is no `UID:GID`, `EIO` for a body too short for its value.
+  Refused {
+    /// The request's unique id.
+    unique: u64,
+    /// The errno its reply carries.
+    errno: i32,
+  },
+}
+
+impl OwnerWord {
+  /// The request it answers.
+  pub fn unique(&self) -> u64 {
+    match *self {
+      OwnerWord::Named { unique, .. } | OwnerWord::Refused { unique, .. } => unique,
+    }
+  }
+
+  /// The errno its reply carries: zero for a word taken.
+  pub fn errno(&self) -> i32 {
+    match *self {
+      OwnerWord::Named { .. } => 0,
+      OwnerWord::Refused { errno, .. } => errno,
+    }
+  }
+}
+
+/// The owner word `request` carries, if it is a `SETXATTR` of [`OWNER_WORD`]: `None` for every other request, which the
+/// dispatch answers. `fuse_setxattr_in` is the value's size and the flags, then the name and its NUL, then the value;
+/// the flags (`XATTR_CREATE`, `XATTR_REPLACE`) are ignored, as Shards' server ignores them, since the word names no
+/// attribute a file keeps. The value may end in NULs, which are dropped.
+pub fn owner_word(request: &[u8]) -> Option<OwnerWord> {
+  /// Format: `fuse_setxattr_in` — size, flags — before the name.
+  const HEAD: usize = 2 * size_of::<u32>();
+  let parsed = Request::parse(request).ok()?;
+  if parsed.opcode != Some(Opcode::SetXattr) {
+    return None;
+  }
+  let rest = parsed.body.get(HEAD..)?;
+  let end = rest.iter().position(|b| *b == 0)?;
+  if rest.get(..end)? != OWNER_WORD {
+    return None;
+  }
+  let unique = parsed.header.unique;
+  let refused = |errno| Some(OwnerWord::Refused { unique, errno });
+  if parsed.header.uid != 0 {
+    return refused(EPERM);
+  }
+  if parsed.header.nodeid != FUSE_ROOT_ID {
+    return refused(EINVAL);
+  }
+  let size = parsed
+    .body
+    .get(..size_of::<u32>())
+    .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+    .map(u32::from_le_bytes)
+    .and_then(|size| usize::try_from(size).ok());
+  let value = size.and_then(|size| {
+    let at = end.checked_add(1)?;
+    rest.get(at..at.checked_add(size)?)
+  });
+  let Some(value) = value else {
+    return refused(EIO);
+  };
+  match owner_of(value) {
+    Some((uid, gid)) => Some(OwnerWord::Named { unique, uid, gid }),
+    None => refused(EINVAL),
+  }
+}
+
+/// The `UID:GID` an owner word's value names, its trailing NULs dropped: `None` for anything else.
+fn owner_of(value: &[u8]) -> Option<(u32, u32)> {
+  let end = value
+    .iter()
+    .rposition(|b| *b != 0)
+    .map_or(0, |at| at.saturating_add(1));
+  let text = std::str::from_utf8(value.get(..end)?).ok()?;
+  let (uid, gid) = text.split_once(':')?;
+  Some((uid.parse().ok()?, gid.parse().ok()?))
+}
+
+/// Writes the reply to an owner word at the head of `frame`: its errno alone, zero for a word taken. The frame's bytes,
+/// the length word included.
+pub fn owner_word_reply(word: &OwnerWord, frame: &mut Vec<u8>) -> usize {
+  refuse(word.unique(), word.errno(), frame)
 }
 
 /// The bytes a read request asks for; `None` for a body too short to say, which the dispatch refuses.

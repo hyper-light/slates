@@ -13,9 +13,13 @@
   clippy::panic
 )]
 
-use slates_bridge_core::{Attachments, OpContext, Rights, View};
+use slates_bridge_core::{Attachments, OpContext, OwnerView, Rights, View};
 use slates_bridge_fuse::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode};
-use slates_bridge_fuse::shards_fs::{FRAME_BYTES, Frame, LENGTH_BYTES, Split, answer, split_frame};
+use slates_bridge_fuse::reply::{Attr, EntryOut};
+use slates_bridge_fuse::request::SetAttrIn;
+use slates_bridge_fuse::shards_fs::{
+  FRAME_BYTES, Frame, LENGTH_BYTES, OWNER_WORD, OwnerWord, Split, answer, owner_word, split_frame,
+};
 use slates_bridge_fuse::volume_bridge::VolumeBridge;
 use slates_db::catalog::{Principal, VolumeId};
 use slates_mem::arena::ChunkArena;
@@ -227,4 +231,308 @@ fn a_hostile_or_truncated_shards_fs_frame_is_refused_before_allocating() {
     split_frame(&[], FRAME_BYTES).unwrap(),
     Split::Partial(LENGTH_BYTES)
   );
+}
+
+/// Format: where `fuse_attr`'s uid and gid lie in it (after ino, size, blocks, the three times, their three nanosecond
+/// words, the mode and nlink: `include/uapi/linux/fuse.h`).
+const ATTR_UID_AT: usize = 68;
+const ATTR_GID_AT: usize = 72;
+/// Format: where `fuse_attr` lies in a `fuse_entry_out` (after nodeid, generation, the two valid times and their two
+/// nanosecond words) and in a `fuse_attr_out` (after its valid time, nanosecond word and padding).
+const ENTRY_ATTR_AT: usize = OUT_HEADER_LEN + EntryOut::LEN - Attr::LEN;
+const ATTR_OUT_ATTR_AT: usize = OUT_HEADER_LEN + 16;
+/// Format: a `fuse_dirent`'s fixed part (ino, off, namelen, type) after its `fuse_entry_out` in a READDIRPLUS reply, and
+/// the alignment its name is padded to (`FUSE_DIRENT_ALIGN`).
+const DIRENT_HEAD: usize = 24;
+const DIRENT_ALIGN: usize = 8;
+
+/// The owner the volume keeps for what its host made, and the run's owner a guest names: distinct, as on a Mac (the
+/// user 501 in group 20) under a run of user 1000.
+const HOST: (u32, u32) = (501, 20);
+const RUN: (u32, u32) = (1000, 1001);
+/// An owner neither the host nor the run is: the view leaves it as it is.
+const NEITHER: (u32, u32) = (4242, 4343);
+
+/// A FUSE request from the caller `uid`/`gid` (the in-header's `uid` and `gid` at 24 and 28).
+fn message_as(
+  opcode: u32,
+  unique: u64,
+  nodeid: u64,
+  (uid, gid): (u32, u32),
+  body: &[u8],
+) -> Vec<u8> {
+  let mut m = message(opcode, unique, nodeid, body);
+  m[24..28].copy_from_slice(&uid.to_le_bytes());
+  m[28..32].copy_from_slice(&gid.to_le_bytes());
+  m
+}
+
+/// The uid and gid of the `fuse_attr` at `at` in `reply`.
+fn owner_at(reply: &[u8], at: usize) -> (u32, u32) {
+  let word = |at: usize| u32::from_le_bytes(reply[at..at + 4].try_into().unwrap());
+  (word(at + ATTR_UID_AT), word(at + ATTR_GID_AT))
+}
+
+/// A SETXATTR of `name` set to `value` (`fuse_setxattr_in`: size, flags, then the name and its NUL, then the value).
+fn setxattr_body(name: &[u8], value: &[u8]) -> Vec<u8> {
+  let mut body = u32::try_from(value.len()).unwrap().to_le_bytes().to_vec();
+  body.extend_from_slice(&0u32.to_le_bytes());
+  body.extend_from_slice(name);
+  body.push(0);
+  body.extend_from_slice(value);
+  body
+}
+
+/// A-281 (Shards' owner word, as Shards' server takes it). Do: read the word as a stream does, from the guest's root on
+/// the share's root, with and without trailing NULs and either flag; from another caller; on another node; with values
+/// that are no `UID:GID`; with a value cut short of its size; and read requests that are not the word. Expect the run's
+/// owner named, `EPERM` from any caller but root, `EINVAL` on another node or for a malformed value, `EIO` for a body too
+/// short for its value, and nothing taken from any other request, which the dispatch answers.
+#[test]
+fn shards_owner_word_is_taken_from_the_guests_root_on_the_shares_root_alone() {
+  let set = Opcode::SetXattr as u32;
+  let word = |nodeid: u64, caller: (u32, u32), value: &[u8]| {
+    owner_word(&message_as(
+      set,
+      7,
+      nodeid,
+      caller,
+      &setxattr_body(OWNER_WORD, value),
+    ))
+  };
+  let named = Some(OwnerWord::Named {
+    unique: 7,
+    uid: 1000,
+    gid: 1001,
+  });
+  assert_eq!(word(1, (0, 0), b"1000:1001"), named);
+  assert_eq!(
+    word(1, (0, 0), b"1000:1001\0\0"),
+    named,
+    "trailing NULs are dropped"
+  );
+  let refused = |errno| Some(OwnerWord::Refused { unique: 7, errno });
+  assert_eq!(
+    word(1, (1000, 1001), b"1000:1001"),
+    refused(1),
+    "only the guest's root names it: EPERM"
+  );
+  assert_eq!(
+    word(5, (0, 0), b"1000:1001"),
+    refused(22),
+    "only on the share's root: EINVAL"
+  );
+  for malformed in [
+    &b"1000"[..],
+    b"1000:",
+    b":1001",
+    b"a:b",
+    b"1000:1001:1",
+    b"-1:0",
+    b"4294967296:0",
+    b"",
+  ] {
+    assert_eq!(
+      word(1, (0, 0), malformed),
+      refused(22),
+      "{:?}",
+      String::from_utf8_lossy(malformed)
+    );
+  }
+  let mut short = setxattr_body(OWNER_WORD, b"1000:1001");
+  short[0..4].copy_from_slice(&64u32.to_le_bytes());
+  assert_eq!(
+    owner_word(&message_as(set, 7, 1, (0, 0), &short)),
+    refused(5),
+    "a value cut short of its size: EIO"
+  );
+  assert_eq!(
+    owner_word(&message_as(
+      set,
+      7,
+      1,
+      (0, 0),
+      &setxattr_body(b"user.shards.owner", b"1000:1001")
+    )),
+    None,
+    "another name is the dispatch's"
+  );
+  assert_eq!(
+    owner_word(&message_as(
+      Opcode::GetXattr as u32,
+      7,
+      1,
+      (0, 0),
+      &setxattr_body(OWNER_WORD, b"")
+    )),
+    None,
+    "another opcode is the dispatch's"
+  );
+  assert_eq!(owner_word(&[0u8; 8]), None, "no header: the dispatch's");
+}
+
+/// A volume whose root and three files are kept as the host's, the run's and neither's, behind no bridge yet.
+fn owned_volume(store: &mut Store) -> Volume {
+  let mut vol = Volume::create(
+    store,
+    VolumeConfig {
+      prefix: 1,
+      names: NameEquivalence::Exact,
+      quota: Quota::Bounded { limit: 1 << 30 },
+      journal_bytes: 1 << 16,
+      clock: Box::new(HostClock::default()),
+    },
+  )
+  .unwrap();
+  let root = vol.root_inode(store).unwrap();
+  vol.chown(store, root, HOST.0, HOST.1).unwrap();
+  for (name, owner) in [
+    ("host.txt", HOST),
+    ("run.txt", RUN),
+    ("neither.txt", NEITHER),
+  ] {
+    let file = vol.create_file_no(store, root, name, 0o644).unwrap();
+    vol.chown(store, file, owner.0, owner.1).unwrap();
+  }
+  vol
+}
+
+/// The owner a READDIRPLUS reply shows for `name`.
+fn listed_owner(reply: &[u8], name: &str) -> Option<(u32, u32)> {
+  let mut at = OUT_HEADER_LEN;
+  while at + EntryOut::LEN + DIRENT_HEAD <= reply.len() {
+    let dirent = at + EntryOut::LEN;
+    let len = usize::try_from(u32::from_le_bytes(
+      reply[dirent + 16..dirent + 20].try_into().unwrap(),
+    ))
+    .unwrap();
+    let listed = &reply[dirent + DIRENT_HEAD..dirent + DIRENT_HEAD + len];
+    if listed == name.as_bytes() {
+      return Some(owner_at(reply, at + EntryOut::LEN - Attr::LEN));
+    }
+    at = dirent + (DIRENT_HEAD + len).div_ceil(DIRENT_ALIGN) * DIRENT_ALIGN;
+  }
+  None
+}
+
+/// A-281 (a stream's owner view, through the dispatch every transport shares). Do: put a volume whose root and a file
+/// are kept as the host's (501:20), one file as the run's (1000:1001) and one as neither's behind a bridge that views
+/// owners as a stream does once its guest's root named the run's owner; LOOKUP each file, GETATTR the root, READDIRPLUS
+/// the root, CREATE a file as the run's user, and chown the neither's file to the run's ids. Expect the host's files
+/// shown as the run's, the run's as the host's and the neither's as they are; the created file and the chowned one kept
+/// as the host's in the volume, which every other route reads; and the same requests through a bridge with no view
+/// showing each owner as the volume keeps it.
+#[test]
+fn a_streams_owner_view_shows_the_hosts_files_as_the_runs_and_keeps_the_runs_ids_as_the_hosts() {
+  let mut store = store();
+  let mut vol = owned_volume(&mut store);
+  let cx = test_cx();
+  let (made, chowned) = {
+    let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store)
+      .viewing_owners(OwnerView::swapping(HOST, RUN));
+    let mut ask = |unique: u64, opcode: Opcode, nodeid: u64, body: &[u8]| {
+      exchange(
+        &mut bridge,
+        &cx,
+        &message_as(opcode as u32, unique, nodeid, RUN, body),
+      )
+    };
+    for (unique, name, shown) in [
+      (1, "host.txt", RUN),
+      (2, "run.txt", HOST),
+      (3, "neither.txt", NEITHER),
+    ] {
+      let reply = ask(
+        unique,
+        Opcode::Lookup,
+        1,
+        &[name.as_bytes(), b"\0"].concat(),
+      );
+      assert_eq!(errno(&reply), 0, "LOOKUP {name}");
+      assert_eq!(
+        owner_at(&reply, ENTRY_ATTR_AT),
+        shown,
+        "{name} is shown as {shown:?}"
+      );
+    }
+    let root = ask(4, Opcode::GetAttr, 1, &[0u8; 16]);
+    assert_eq!(
+      owner_at(&root, ATTR_OUT_ATTR_AT),
+      RUN,
+      "the host's root is shown as the run's"
+    );
+    let opened = ask(5, Opcode::OpenDir, 1, &[0u8; 8]);
+    let mut read_in = vec![0u8; 40];
+    read_in[0..8].copy_from_slice(&body_u64(&opened).to_le_bytes());
+    read_in[16..20].copy_from_slice(&4096u32.to_le_bytes());
+    let listed = ask(6, Opcode::ReadDirPlus, 1, &read_in);
+    assert_eq!(
+      listed_owner(&listed, "host.txt"),
+      Some(RUN),
+      "a listing shows the host's file as the run's"
+    );
+    assert_eq!(
+      listed_owner(&listed, "run.txt"),
+      Some(HOST),
+      "and the run's as the host's"
+    );
+    // CREATE (`fuse_create_in`: flags, mode, umask, open flags; then the name) by the run's user.
+    let mut create = vec![0u8; 16];
+    create[4..8].copy_from_slice(&0o644u32.to_le_bytes());
+    create.extend_from_slice(b"made.txt\0");
+    let created = ask(7, Opcode::Create, 1, &create);
+    assert_eq!(errno(&created), 0, "CREATE");
+    assert_eq!(
+      owner_at(&created, ENTRY_ATTR_AT),
+      RUN,
+      "the run's file is shown as the run's"
+    );
+    // SETATTR (`fuse_setattr_in`, 88 bytes: the uid at 76, the gid at 80) of the neither's file to the run's ids.
+    let neither = body_u64(&ask(8, Opcode::Lookup, 1, b"neither.txt\0"));
+    let mut chown = vec![0u8; 88];
+    chown[0..4].copy_from_slice(&(SetAttrIn::FATTR_UID | SetAttrIn::FATTR_GID).to_le_bytes());
+    chown[76..80].copy_from_slice(&RUN.0.to_le_bytes());
+    chown[80..84].copy_from_slice(&RUN.1.to_le_bytes());
+    let changed = ask(9, Opcode::SetAttr, neither, &chown);
+    assert_eq!(errno(&changed), 0, "SETATTR");
+    assert_eq!(
+      owner_at(&changed, ATTR_OUT_ATTR_AT),
+      RUN,
+      "the chown reads back as the guest asked it"
+    );
+    (body_u64(&created), neither)
+  };
+  for (no, what) in [(made, "the created file"), (chowned, "the chowned file")] {
+    let kept = vol
+      .observe(&store, slates_vfs::ids::InodeNo(no))
+      .unwrap()
+      .attrs;
+    assert_eq!(
+      (kept.uid, kept.gid),
+      HOST,
+      "{what} is kept as the host's, as every other route reads it"
+    );
+  }
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  for (unique, name, kept) in [
+    (10, "host.txt", HOST),
+    (11, "run.txt", RUN),
+    (12, "made.txt", HOST),
+  ] {
+    let reply = exchange(
+      &mut bridge,
+      &cx,
+      &message(
+        Opcode::Lookup as u32,
+        unique,
+        1,
+        &[name.as_bytes(), b"\0"].concat(),
+      ),
+    );
+    assert_eq!(
+      owner_at(&reply, ENTRY_ATTR_AT),
+      kept,
+      "with no view {name} is shown as the volume keeps it"
+    );
+  }
 }

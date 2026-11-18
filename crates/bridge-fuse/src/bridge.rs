@@ -17,8 +17,8 @@ use crate::request::{ReadIn, RenameIn, Request, SetAttrIn, WriteIn, parse_name};
 
 pub use slates_bridge_core::{Bridge, DirEntry};
 use slates_bridge_core::{
-  CacheCoherence, CacheLifetime, DaxOffer, FsStat, NodeAttr, ObjectId, OpContext, RenameFlags,
-  SetAttr, whole_cookie_groups,
+  CacheCoherence, CacheLifetime, DaxOffer, FsStat, NodeAttr, ObjectId, OpContext, OwnerView,
+  RenameFlags, SetAttr, whole_cookie_groups,
 };
 use slates_vfs::error::VfsError;
 use slates_vfs::inode::Kind;
@@ -59,7 +59,7 @@ const EAGAIN: i32 = 11;
 /// Format: ENOENT, no such file or directory.
 const ENOENT: i32 = 2;
 /// Format: EPERM, operation not permitted.
-const EPERM: i32 = 1;
+pub(crate) const EPERM: i32 = 1;
 /// Format: EROFS, a read-only file system: a change asked of an attachment that may not write, or of a snapshot.
 const EROFS: i32 = 30;
 /// Format: Linux EACCES, a symlink out of the volume refused to a caller who does not own it (A-107), and a Windows
@@ -72,7 +72,7 @@ const ENOTDIR: i32 = 20;
 /// Format: EISDIR, is a directory.
 const EISDIR: i32 = 21;
 /// Format: EINVAL, invalid argument.
-const EINVAL: i32 = 22;
+pub(crate) const EINVAL: i32 = 22;
 /// Format: EFBIG, file too large.
 const EFBIG: i32 = 27;
 /// Format: ENOSPC, no space left.
@@ -122,12 +122,14 @@ pub fn dispatch(message: &[u8], bridge: &mut dyn Bridge, cx: &OpContext, out: &m
   }
   // A creating request stamps the creating process's uid and gid on what it makes (AUD-29-81): ownership
   // metadata from the kernel's request header, never authority — the attachment's enrolled subject is
-  // unchanged, and the shared seam applies the set-group-ID parent rule.
+  // unchanged, and the shared seam applies the set-group-ID parent rule. A guest whose run named its owner names
+  // ids the volume keeps as another's (A-281): they are kept as the volume's, as a chown's are.
   let creator;
   let cx = if creates(opcode) {
+    let view = bridge.owner_view();
     creator = OpContext {
-      owner_uid: Some(request.header.uid),
-      owner_gid: Some(request.header.gid),
+      owner_uid: Some(view.kept_uid(request.header.uid)),
+      owner_gid: Some(view.kept_gid(request.header.gid)),
       ..cx.clone()
     };
     &creator
@@ -719,11 +721,11 @@ fn split_ns(ns: i64) -> (u64, u32) {
   (ns / NS_PER_SEC, u32::try_from(ns % NS_PER_SEC).unwrap_or(0))
 }
 
-/// A FUSE `fuse_attr` from neutral attributes: each wire time is the neutral time of the same
-/// name. (Until the GAP-A9-3 sweep of 2026-09-14 the wire change time was taken from the
+/// A FUSE `fuse_attr` from neutral attributes, its owner as `owners` shows it to the guest (A-281): each wire time is
+/// the neutral time of the same name. (Until the GAP-A9-3 sweep of 2026-09-14 the wire change time was taken from the
 /// modification time, so a `stat` through a FUSE mount reported `ctime == mtime` — a chmod, which
 /// moves only the change time, was invisible to a tool watching it.)
-fn fuse_attr(node: &NodeAttr, dax: bool) -> Attr {
+fn fuse_attr(node: &NodeAttr, dax: bool, owners: OwnerView) -> Attr {
   Attr {
     dax,
     ino: node.ino,
@@ -734,8 +736,8 @@ fn fuse_attr(node: &NodeAttr, dax: bool) -> Attr {
     atime: split_ns(node.atime),
     mode: wire_mode(node.kind, node.mode),
     nlink: node.nlink,
-    uid: node.uid,
-    gid: node.gid,
+    uid: owners.shown_uid(node.uid),
+    gid: owners.shown_gid(node.gid),
     blksize: BLKSIZE,
   }
 }
@@ -833,8 +835,8 @@ fn dax_for(bridge: &mut dyn Bridge, node: &NodeAttr) -> bool {
   }
 }
 
-/// A FUSE `fuse_entry_out` from neutral attributes with the object's cache lifetime.
-fn entry_out(node: &NodeAttr, valid: (u64, u32), dax: bool) -> EntryOut {
+/// A FUSE `fuse_entry_out` from neutral attributes with the object's cache lifetime, its owner as `owners` shows it.
+fn entry_out(node: &NodeAttr, valid: (u64, u32), dax: bool, owners: OwnerView) -> EntryOut {
   EntryOut {
     nodeid: node.ino,
     generation: node.generation,
@@ -842,7 +844,7 @@ fn entry_out(node: &NodeAttr, valid: (u64, u32), dax: bool) -> EntryOut {
     attr_valid: valid.0,
     entry_valid_nsec: valid.1,
     attr_valid_nsec: valid.1,
-    attr: fuse_attr(node, dax),
+    attr: fuse_attr(node, dax, owners),
   }
 }
 
@@ -856,7 +858,7 @@ fn entry_reply(
   let node = result?;
   let valid = valid_for(bridge, cx, node.ino);
   let dax = dax_for(bridge, &node);
-  Ok(entry_out(&node, valid, dax))
+  Ok(entry_out(&node, valid, dax, bridge.owner_view()))
 }
 
 /// An attribute reply (`GETATTR`/`SETATTR`) with the object's cache lifetime.
@@ -871,7 +873,7 @@ fn attr_reply(
   Ok(AttrOut {
     attr_valid,
     attr_valid_nsec,
-    attr: fuse_attr(&node, dax),
+    attr: fuse_attr(&node, dax, bridge.owner_view()),
   })
 }
 
@@ -1238,7 +1240,7 @@ fn serve_readdirplus(
     let valid = valid_for(bridge, cx, entry.ino);
     let dax = dax_for(bridge, &node);
     if !dir.push_plus(
-      &entry_out(&node, valid, dax),
+      &entry_out(&node, valid, dax, bridge.owner_view()),
       entry.cookie,
       dtype(entry.kind),
       &entry.name,
@@ -1290,7 +1292,7 @@ fn serve_create(
       let valid = valid_for(bridge, cx, node.ino);
       let dax = dax_for(bridge, &node);
       let open_flags = open_flags_for(bridge, cx, ObjectId::new(node.ino, 0), false, flags);
-      let mut body = entry_out(&node, valid, dax).to_bytes();
+      let mut body = entry_out(&node, valid, dax, bridge.owner_view()).to_bytes();
       body.extend_from_slice(&OpenOut { fh, open_flags }.to_bytes());
       write_or_drop(ReplyHeader::write_ok(req.header.unique, &body, out), out)
     }
@@ -1345,7 +1347,7 @@ fn serve_tmpfile(
   let valid = valid_for(bridge, cx, node.ino);
   let dax = dax_for(bridge, &node);
   let open_flags = open_flags_for(bridge, cx, ObjectId::new(node.ino, 0), false, flags);
-  let mut body = entry_out(&node, valid, dax).to_bytes();
+  let mut body = entry_out(&node, valid, dax, bridge.owner_view()).to_bytes();
   body.extend_from_slice(&OpenOut { fh, open_flags }.to_bytes());
   write_or_drop(ReplyHeader::write_ok(unique, &body, out), out)
 }
@@ -1711,6 +1713,8 @@ fn setattr_changes(
   s: &SetAttrIn,
 ) -> Result<SetAttr, VfsError> {
   let set = |bit: u32| s.valid & bit != 0;
+  // A chown names ids as the guest sees them: kept as the volume's (A-281).
+  let owners = bridge.owner_view();
   let now = if set(SetAttrIn::FATTR_ATIME_NOW) || set(SetAttrIn::FATTR_MTIME_NOW) {
     Some(bridge.now())
   } else {
@@ -1729,8 +1733,8 @@ fn setattr_changes(
   Ok(SetAttr {
     size: set(SetAttrIn::FATTR_SIZE).then_some(s.size),
     mode,
-    uid: set(SetAttrIn::FATTR_UID).then_some(s.uid),
-    gid: set(SetAttrIn::FATTR_GID).then_some(s.gid),
+    uid: set(SetAttrIn::FATTR_UID).then_some(owners.kept_uid(s.uid)),
+    gid: set(SetAttrIn::FATTR_GID).then_some(owners.kept_gid(s.gid)),
     atime: match now {
       Some(now) if set(SetAttrIn::FATTR_ATIME_NOW) => Some(now),
       _ => set(SetAttrIn::FATTR_ATIME).then_some(s.atime),

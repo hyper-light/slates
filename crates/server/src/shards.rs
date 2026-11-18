@@ -26,6 +26,14 @@
 //! never a queue. While the owner may not serve the volume's latest state (its lease not holding, AUD-29-83), nothing is
 //! read: the guest's requests wait in the stream, asked again each heartbeat.
 //!
+//! **The run's owner (A-281).** Shards' init names the run's owner on a share's root as it mounts it, with Shards' owner
+//! word (`trusted.shards.owner`, `UID:GID`), so that a run of an unprivileged user writes the share it was given. The
+//! stream takes the word before any dispatch, from the guest's root on the stream's root alone, and keeps it on no file:
+//! from then on its guest is shown the owner the volume keeps for the root as the run's owner and the run's as the
+//! root's, uid and gid each, and the ids a guest names (a creator, a chown) are kept the other way round. Every other
+//! route sees the owners the volume keeps, so a host reads its own files as its own. The swap lives with the stream:
+//! nothing survives a restart, and the next stream's guest names its owner again as it mounts.
+//!
 //! **Control asks.** Shards' device sends asks of its own:
 //! - its backend's tables for a snapshot of the VM, and their restore (D176). slates keeps no tables a VM's snapshot can
 //!   carry, so each is refused in the form Shards reads: a control answer with its reason.
@@ -48,14 +56,14 @@ use std::os::fd::AsFd;
 use std::os::windows::io::AsHandle;
 
 use slates_bridge_core::volume_bridge::new_handle_store;
-use slates_bridge_core::{AttachmentId, Rights, View, VolumeBridge};
+use slates_bridge_core::{AttachmentId, ObjectId, OwnerView, Rights, View, VolumeBridge};
 use slates_bridge_fuse::Opcode;
 use slates_bridge_fuse::bridge::{
   EIO, KernelChange, kernel_changes, needs_barrier, reclaim_unreported,
 };
 use slates_bridge_fuse::shards_fs::{
-  ASK_DESCRIPTOR, ASK_RESTORE, ASK_SAVE, Answered, FRAME_BYTES, Frame, LENGTH_BYTES, Split, answer,
-  control_refusal, refuse, split_frame,
+  ASK_DESCRIPTOR, ASK_RESTORE, ASK_SAVE, Answered, FRAME_BYTES, Frame, LENGTH_BYTES, OwnerWord,
+  Split, answer, control_refusal, owner_word, owner_word_reply, refuse, split_frame,
 };
 use slates_db::Op;
 use slates_db::catalog::{AttachForm, AttachmentRecord, Consumer, Principal, VolumeId};
@@ -161,6 +169,12 @@ const HOLDER_ADDED: &str = "shards.holder_added";
 /// Format: the refusal-ledger name of a stream end dropped because its request's reply was not the attach that made
 /// it (a rolled-back verb answered a refusal): the end closes, so the stream ends with it.
 const HANDOFF_DROPPED: &str = "shards.handoff_dropped";
+/// Counter: an owner word taken (A-281): a guest's root named its run's owner on the stream's root, which the stream
+/// shows its guest as the owner of what the volume keeps as its root's owner's, and the reverse.
+const OWNER_NAMED: &str = "shards.owner_named";
+/// Format: the refusal-ledger name of an owner word refused (A-281): from a caller other than the guest's root
+/// (`EPERM`), on a node other than the stream's root or with no `UID:GID` (`EINVAL`), or with its root unreadable.
+const OWNER_REFUSED: &str = "shards.owner_refused";
 /// Format: the reason a refused snapshot ask carries to Shards, which reports it.
 const NO_TABLES: &str =
   "slates keeps no share tables a VM snapshot can carry; the share ends with the VM";
@@ -223,6 +237,10 @@ pub(crate) struct ShardsStream {
   /// sent once the volume's log is durable at this position, and replaced by `EIO` (to request `unique`) if it is not
   /// within the liveness budget, since a guest's `fsync` must not claim what no candidate holds.
   durable: Option<DurableOwed>,
+  /// How the guest is shown the volume's owners (A-281): the identity until its root names the run's owner with
+  /// Shards' owner word, then a swap of the root's owner then and the run's. Kept for the stream's life; a restart ends
+  /// the stream, and the next one's guest names it again as it mounts.
+  owners: OwnerView,
 }
 
 /// What an owed `FSYNC` reply waits for on a live-shipped volume (A-200): the log position its barrier published, and
@@ -401,6 +419,7 @@ pub(crate) fn attach(s: &mut ShardState, ask: ShardsAsk) -> Result<ShardsAttache
       told_mark: None,
       told: None,
       durable: None,
+      owners: OwnerView::IDENTITY,
     },
   );
   if futures::spawn(serve(attachment))
@@ -1030,6 +1049,15 @@ fn turn_with(s: &mut ShardState, stream: &mut ShardsStream) -> Turned {
         .get(LENGTH_BYTES..total)
         .unwrap_or(&[])
         .to_vec();
+      // Shards' owner word is the stream's to take, never a file's attribute (A-281).
+      if let Some(word) = owner_word(&request) {
+        let served = take_owner_word(s, stream, word);
+        consume(stream, total);
+        if !served {
+          return Turned::Ended;
+        }
+        return flush_unless_refill_owed(s, stream);
+      }
       if dax::hold_for_ingest(s, stream, &request, total) {
         stream.told_mark = crate::told::mark(s, stream.volume);
         return Turned::Served;
@@ -1226,6 +1254,66 @@ fn answer_control(stream: &mut ShardsStream, ask: u8) {
   owe(stream, &refusal);
 }
 
+/// Takes a guest's owner word (A-281): a word Shards' rules refuse is answered with its errno and changes nothing; one
+/// named by the guest's root on the stream's root makes the stream show the root's owner as it is now, uid and gid, as
+/// the run's owner the word names, and the run's as the root's, until the stream ends. The word is kept on no file:
+/// the reply is owed with nothing written to the volume, so no barrier waits on it. `false` when the attachment can no
+/// longer be served (its registry entry or its volume gone): the stream ends.
+fn take_owner_word(s: &mut ShardState, stream: &mut ShardsStream, word: OwnerWord) -> bool {
+  let answered = match word {
+    OwnerWord::Named { unique, uid, gid } => match root_owner(s, stream) {
+      Some(Ok(kept)) => {
+        stream.owners = OwnerView::swapping(kept, (uid, gid));
+        s.count(OWNER_NAMED, 1);
+        word
+      }
+      Some(Err(errno)) => OwnerWord::Refused { unique, errno },
+      None => return false,
+    },
+    OwnerWord::Refused { .. } => word,
+  };
+  if answered.errno() != 0 {
+    s.count(OWNER_REFUSED, 1);
+  }
+  stream.owed = owner_word_reply(&answered, &mut stream.outbound);
+  stream.sent = 0;
+  true
+}
+
+/// The owner (uid, gid) the volume keeps for the stream's root, its scope's directory or the volume's own: the errno
+/// its read was refused with, or `None` when the attachment can no longer be served.
+fn root_owner(s: &mut ShardState, stream: &mut ShardsStream) -> Option<Result<(u32, u32), i32>> {
+  let &handle = s.by_id.get(&stream.volume)?;
+  let cx = s.attachments.begin(stream.registry).ok()?;
+  let owner = {
+    let ShardState { store, volumes, .. } = &mut *s;
+    match volumes.get_mut(handle) {
+      Ok(slot) => {
+        let mut bridge = VolumeBridge::attached(
+          stream.volume,
+          &mut slot.volume,
+          store,
+          &mut stream.handles,
+          slot.host.as_mut().map(|host| host as &mut dyn HostFs),
+        );
+        let mut scoped = None;
+        let served = crate::verbs::scoped_or_whole(&mut bridge, &mut scoped, stream.scope);
+        let attrs = served
+          .root(&cx)
+          .and_then(|root| served.getattr(ObjectId::new(root, 0), &cx));
+        Some(
+          attrs
+            .map(|attrs| (attrs.uid, attrs.gid))
+            .map_err(slates_bridge_fuse::bridge::errno),
+        )
+      }
+      Err(_) => None,
+    }
+  };
+  s.attachments.end(stream.registry);
+  owner
+}
+
 /// Makes `bytes` the reply owed on `stream`.
 fn owe(stream: &mut ShardsStream, bytes: &[u8]) {
   if stream.outbound.len() < bytes.len() {
@@ -1291,7 +1379,8 @@ fn serve_request(
       &mut stream.handles,
       slot.host.as_mut().map(|host| host as &mut dyn HostFs),
     )
-    .offering_dax(dax_offer);
+    .offering_dax(dax_offer)
+    .viewing_owners(stream.owners);
     let mut scoped = None;
     let served = crate::verbs::scoped_or_whole(&mut bridge, &mut scoped, stream.scope);
     let request = stream.inbound.get(LENGTH_BYTES..total).unwrap_or(&[]);

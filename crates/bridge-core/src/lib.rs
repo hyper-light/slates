@@ -223,6 +223,76 @@ pub enum DaxOffer {
   },
 }
 
+/// How a guest's run sees the owners of the volume's files (§4.6, the Shards route; A-281): the identity on every
+/// transport but a Shards stream whose guest named its run's owner with Shards' owner word (`trusted.shards.owner`).
+/// There the owner the volume keeps for what its host made (the stream's root's owner when the word came) is shown to
+/// the guest as the run's owner, and the run's owner as that one, uid and gid each: a swap of two ids, so it is its own
+/// inverse. A chown the guest asks and the stat it reads back agree, two ids never collapse into one, and every other
+/// route (a host mount, NFS, the SDK, a landing) sees the owners the volume keeps.
+///
+/// Why a swap and not Shards' own rule (its server shows every file "the host made" as the run's): slates keeps a real
+/// owner on every file, the host's for a base file and the creator's for the rest, where Shards' server keeps the
+/// guest's owner in an attribute beside a host file the host user owns. A one-way rule (the host's id shown as the
+/// run's) would show the run's own files and the host's alike, and leave nothing for a chown to the host's id to store.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OwnerView {
+  /// The two owners swapped, none for the identity.
+  swap: Option<OwnerSwap>,
+}
+
+/// The two owners an [`OwnerView`] swaps: the volume's and the run's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OwnerSwap {
+  /// The owner (uid, gid) the volume keeps for what its host made.
+  kept: (u32, u32),
+  /// The owner (uid, gid) the run named.
+  run: (u32, u32),
+}
+
+impl OwnerView {
+  /// The view every transport has until a guest names its run's owner: each id shown as the volume keeps it.
+  pub const IDENTITY: OwnerView = OwnerView { swap: None };
+
+  /// The view that shows the volume's owner `kept` (uid, gid) as the run's owner `run`, and `run` as `kept`.
+  pub const fn swapping(kept: (u32, u32), run: (u32, u32)) -> OwnerView {
+    OwnerView {
+      swap: Some(OwnerSwap { kept, run }),
+    }
+  }
+
+  /// The uid the guest is shown for a file the volume keeps as `kept`'s.
+  pub fn shown_uid(&self, kept: u32) -> u32 {
+    self.swap.map_or(kept, |s| swapped(kept, s.kept.0, s.run.0))
+  }
+
+  /// The gid the guest is shown for a file the volume keeps as `kept`'s.
+  pub fn shown_gid(&self, kept: u32) -> u32 {
+    self.swap.map_or(kept, |s| swapped(kept, s.kept.1, s.run.1))
+  }
+
+  /// The uid the volume keeps for an id the guest names (a caller, a creator, a chown): the inverse of
+  /// [`OwnerView::shown_uid`], which, a swap being its own inverse, is the same exchange.
+  pub fn kept_uid(&self, shown: u32) -> u32 {
+    self.shown_uid(shown)
+  }
+
+  /// The gid the volume keeps for a gid the guest names: the inverse of [`OwnerView::shown_gid`].
+  pub fn kept_gid(&self, shown: u32) -> u32 {
+    self.shown_gid(shown)
+  }
+}
+
+/// `id` with `a` and `b` exchanged: `b` for `a`, `a` for `b`, any other unchanged.
+fn swapped(id: u32, a: u32, b: u32) -> u32 {
+  if id == a {
+    b
+  } else if id == b {
+    a
+  } else {
+    id
+  }
+}
+
 /// The store's parts a backed DAX session works with, lent by a bridge that has a store ([`Bridge::dax_state`]).
 pub struct DaxState<'a> {
   /// The store's DAX backings, which the volume's write boundary writes every change of a backed file through.
@@ -597,6 +667,12 @@ pub trait Bridge {
     DaxOffer::Withheld
   }
 
+  /// How this bridge's transport shows its guest the owners of the volume's files ([`OwnerView`]): the identity by
+  /// default, a swap only on a Shards stream whose guest named its run's owner (A-281).
+  fn owner_view(&mut self) -> OwnerView {
+    OwnerView::IDENTITY
+  }
+
   /// The store's DAX backings and its in-process DAX registry, lent to a backed DAX session (`dax_backing`) that a
   /// transport drives over this bridge. `None` for a bridge with no store.
   fn dax_state(&mut self) -> Option<DaxState<'_>> {
@@ -674,5 +750,38 @@ pub trait Bridge {
     _visit: &mut dyn FnMut(u64) -> std::ops::ControlFlow<()>,
   ) -> bool {
     true
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::OwnerView;
+
+  /// A-281. Do: swap the host's owner (501:20) with a run's (1000:1001), and read every id through the view both ways.
+  /// Expect each of the two shown as the other, uid and gid apart, every other id (root's among them) as it is, the way
+  /// back the same exchange so a chown and a stat agree, and the identity changing nothing.
+  #[test]
+  fn an_owner_view_swaps_the_hosts_owner_with_the_runs_and_leaves_every_other_id() {
+    let view = OwnerView::swapping((501, 20), (1000, 1001));
+    assert_eq!((view.shown_uid(501), view.shown_gid(20)), (1000, 1001));
+    assert_eq!((view.shown_uid(1000), view.shown_gid(1001)), (501, 20));
+    assert_eq!((view.shown_uid(0), view.shown_gid(0)), (0, 0));
+    assert_eq!(
+      (view.shown_uid(20), view.shown_gid(501)),
+      (20, 501),
+      "uid and gid swap apart"
+    );
+    for id in [0, 20, 501, 1000, 1001, 4242, u32::MAX] {
+      assert_eq!(view.kept_uid(view.shown_uid(id)), id);
+      assert_eq!(view.kept_gid(view.shown_gid(id)), id);
+      assert_eq!(OwnerView::IDENTITY.shown_uid(id), id);
+      assert_eq!(OwnerView::IDENTITY.kept_gid(id), id);
+    }
+    let same = OwnerView::swapping((1000, 1000), (1000, 1000));
+    assert_eq!(
+      (same.shown_uid(1000), same.kept_gid(1000)),
+      (1000, 1000),
+      "a run of the host's own owner changes nothing"
+    );
   }
 }

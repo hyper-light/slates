@@ -4131,8 +4131,14 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
   guest's is, and the guest is revalidated, having no path for an invalidation;
 - a read is answered with every byte it asks, never cut to a buffer, since a short read is the file's end to the
   guest's kernel;
-- control asks for its tables (a VM's save and restore) are refused in Shards' own forms, since slates keeps no tables a
-  VM's snapshot can carry;
+- Shards' owner word (`trusted.shards.owner`, its value `UID:GID`) is the stream's to take, never a file's attribute
+  (A-281). Shards' init sets it on a share's root as it mounts the share, so that a run of an unprivileged user can
+  write the share it was given. It is taken from the guest's root on the stream's root alone, and refused otherwise
+  as Shards' own server refuses it: `EPERM` from any other caller, `EINVAL` on any other node or for a value that is
+  no `UID:GID`. From then on the guest is shown the owner the volume keeps for the stream's root as the run's owner,
+  and the run's owner as the root's, uid and gid each. The ids the guest names (a creator's, a chown's) are kept the
+  other way round, so a chown and the stat after it agree and two owners never become one. Every other route sees the
+  owners the volume keeps, so the host reads what the run made as its own;
 - a DAX window's descriptor ask is answered with a descriptor of one shared-memory object per attachment and file,
   holding only that file's bytes (A-163). The store names the file by its volume's own prefix and its inode number
   together, since a clone, and a snapshot a device presents, shares its origin's numbers (A-166). The object is sized
@@ -4193,6 +4199,15 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 >
 > It passed 3 of 3 in each of runs 40503725694, 40505101140 and 40521211082. With the window off the same guest finds no DAX (run
 > 40521211082). GAPS records the pieces and what stays owed (arm64 Windows).
+
+> **Status (2026-11-18, A-281, the run's owner).** Built and proven by use. `slates_bridge_core::OwnerView` is the
+> swap, its unit test reading every id both ways. `slates_bridge_fuse::shards_fs::owner_word` reads the word as
+> Shards' server reads it, refusing a malformed or hostile one. The shared FUSE dispatch shows every attribute reply
+> through the bridge's view and keeps every creator and chown through it (`crates/bridge-fuse/tests/shards_fs.rs`).
+> On a real daemon, the stream takes the word and shows the host's files as the run's, while the daemon's NFS port
+> reads the same files, and what the run made, as the host's; the word is kept on no file, and a second stream that
+> named no owner sees the volume's owners (`crates/server/tests/shards.rs`). Owed: Shards' own guest test over a slates
+> stream (its `tests/slates_fs.rs`), after Shards' v0.8.0 tag and its bump of the slates revision it pins.
 
 **Writeback and snapshot barrier.** Kernel/guest cache negotiation changes when writes reach
 the owner. `snapshot`, `submit`, `advance`, clean `detach`, migration and archive must identify
@@ -20511,3 +20526,60 @@ The steps' own records follow.
     the process judgment. On this Mac: supervised 10 of 10, unsupervised 10 of 10, frozen 5 of 5. Mutations each turned
     their own shape red on both runners: the client's `Stalled` branch, the lone self-end, and starved treated as stuck.
     The tables are in the bug record.
+
+### A-281 — A Shards guest's run owns what its host made: the stream takes Shards' owner word and shows the volume's owner and the run's swapped (2026-11-18, built for goal g268, what Shards needs from slates)
+
+Applied in the same change to:
+- §4.6, the Shards form: the owner word's bullet and its status. GAPS: the entry of this date. `docs/cli.md`: the
+  `slates shards` paragraph.
+- `crates/bridge-core`: `OwnerView` (the swap, with its unit test), `Bridge::owner_view` (the identity by default),
+  `VolumeBridge::viewing_owners`, and `ScopedBridge` passing its inner bridge's view on.
+- `crates/bridge-fuse`: `bridge.rs` shows every `fuse_attr` (an entry, an attribute reply, a READDIRPLUS entry, a
+  CREATE's and a TMPFILE's) through the bridge's view, and keeps a creating request's caller and a SETATTR's uid and
+  gid through it. `shards_fs.rs` adds `OWNER_WORD`, `OwnerWord`, `owner_word` and `owner_word_reply`. The tests:
+  `shards_owner_word_is_taken_from_the_guests_root_on_the_shares_root_alone` and
+  `a_streams_owner_view_shows_the_hosts_files_as_the_runs_and_keeps_the_runs_ids_as_the_hosts`.
+- `crates/server`: `shards.rs` gives the stream its view (`ShardsStream::owners`), takes the word before any dispatch
+  (`take_owner_word`, `root_owner`), and counts it (`shards.owner_named`, and `shards.owner_refused` in the refusal
+  ledger). The test: `the_runs_owner_named_on_the_root_owns_what_the_host_made_and_the_host_keeps_its_own`.
+
+- **What was there.** Shards' init names the run's owner on each share's root as it mounts it, with the extended
+  attribute `trusted.shards.owner` set to `UID:GID` (Shards' `crates/init/src/setup.rs` `name_owner_as`, D38). Shards'
+  own file server takes that word and keeps it on no file, and from then on shows every file the host made as the
+  run's (`crates/vmm/src/devices/virtio/fs/server.rs` `set_default_owner`, Shards 183fe264e). slates' dispatch
+  answered any attribute outside `user.` with `EOPNOTSUPP`, so the word was refused, and a slates stream showed each
+  file's owner as the volume keeps it: the host's user, 501:20 on a Mac. A guest's kernel checks permissions itself
+  (Linux mounts virtio-fs with `default_permissions`, as Shards' server's header notes), so a run of user 1000 could
+  not write a host-owned volume. Shards'
+  coordinator ranked this first of what it needs from slates (2026-11-18): "for a served share, an unprivileged run
+  can't write a host-owned volume".
+- **The rule.** The stream takes the word before any dispatch, from the guest's root on the stream's root alone, and
+  answers it as Shards' server does: taken with nothing written, `EPERM` from any other caller, `EINVAL` on any other
+  node or for a value that is not two decimal ids. A body too short for the value it declares is `EIO`, as the
+  dispatch answers any body too short for its opcode; a guest's kernel never sends one. From then on the stream shows
+  its guest the owner the volume keeps for the stream's root, read as the word came (uid and gid), as the run's owner,
+  and the run's owner as that one. The ids the guest names are kept the other way round: a creating request's caller,
+  a chown's uid and gid, and the caller of a READLINK, whose answer A-107 bases on whether the caller owns the link.
+  A word named again recomputes the swap; a stream that never gets the word shows every owner as the volume keeps it,
+  as before.
+- **Why a swap, not Shards' own rule.** Shards' server keeps the guest's owner of a file in an attribute beside it on
+  the host and shows a file without one, which the host made, as the run's. slates keeps a real owner on every file:
+  the host's for a base file, the creator's for the rest. The one-way rule (the host's id shown as the run's) would
+  show the run's own files and the host's alike, and would leave nothing for a chown to the host's id to store. The
+  swap is the smallest change that shows the host's files as the run's and keeps one owner one owner: it is its own
+  inverse, so a chown and the stat after it agree. The volume keeps the host's ids for what the run made, so the
+  host's NFS or FUSE mount, the SDK and a landing see the host's user owning it, which is what a person whose agent
+  ran in a microVM wants of the files it made. Ids that are neither of the two (root's among them) are shown as they
+  are kept, so a file the guest's root makes is root's on every route.
+- **Why the stream keeps it, not the volume.** Shards' server keeps the word on no file, and a file holding it would
+  show a `trusted.` attribute to every other route. The swap lives with the stream; nothing of a stream survives a
+  restart today, and the next stream's guest names its owner again as its init mounts the share. Once a stream may
+  outlive a restart (owed: GAPS, Shards' RESEND), the view must be kept with the attachment's record.
+- **Where it applies.** Only in the FUSE dispatch's replies and the ids it keeps, on the bridge a Shards stream builds;
+  every other transport's bridge answers the identity (`Bridge::owner_view`'s default). slates checks no access by a
+  caller's uid but A-107's READLINK rule, so permission is the guest kernel's, against the owners it is shown.
+- **Evidence.** The three tests named above: the word read from bytes with every refusal and malformed value; the
+  dispatch over a volume holding the host's, the run's and a third owner's files; and a real daemon, whose stream
+  takes the word and whose NFS port reads the host's ids for every file the run made or chowned. Owed: Shards' own
+  guest test over a slates stream (its `tests/slates_fs.rs` on Linux and macOS), which Shards' coordinator runs after
+  its v0.8.0 tag and its bump of the slates revision it pins.
