@@ -431,4 +431,26 @@ mod tests {
       Err(RoleArgsError::HalfAFleet)
     );
   }
+
+  /// The integrator's report of 2026-11-18 (CI runs 44298844583 and 44310013691): a start asked for more shards than one
+  /// process registers. Do: parse each role with the registry's most shards, and with one more. Expect: the most parses,
+  /// one more is refused as a bad `--shards` naming the bound, so the anchor never starts a daemon the runtime refuses at
+  /// registration (it restarted it, backed off, for good: "too many shards: at most 1024 per process", 1,417 and 1,574
+  /// shards asked).
+  #[test]
+  fn a_shard_count_past_the_runtimes_registry_is_refused_before_any_start() {
+    let most = slates_rt::registry::MAX_SHARDS;
+    for role in ["anchor", "daemon"] {
+      let fits = Role::parse(&words(&format!("{role} --shards {most}")));
+      assert!(
+        matches!(&fits, Ok(Role::Anchor(options) | Role::Daemon(options)) if options.shards.map(usize::from) == Some(most)),
+        "{role}: {fits:?}"
+      );
+      let past = Role::parse(&words(&format!("{role} --shards {}", most + 1)));
+      assert!(
+        matches!(&past, Err(RoleArgsError::BadValue { flag: "--shards", reason }) if reason.contains(&most.to_string())),
+        "{role}: {past:?}"
+      );
+    }
+  }
 }
