@@ -1,0 +1,67 @@
+name: diag-g234-guard
+
+# Diagnostics only, never on main (A-361, goal g234): the focused tests of Windows' own window and the idle spin's
+# ceiling. The -red branch is main with the tests that build there (the daemon's window test on Windows, the supervised
+# idle-spin role); the -green branch is the whole change with the runtime's suite and the watchdog's and config's
+# unit tests besides.
+on:
+  push:
+    branches: ["diag-g234-guard-*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  tests:
+    name: guard (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - name: Install NASM
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Build
+        run: |
+          set +e
+          cargo test --locked -p slates-server --test idle_window --test liveness --no-run > build.log 2>&1; status=$?
+          if [ -f green.marker ]; then
+            cargo test --locked -p slates-rt --no-run >> build.log 2>&1 || status=1
+            cargo test --locked -p slates-server --lib --no-run >> build.log 2>&1 || status=1
+          fi
+          grep -E '^(error|warning: unused)' -A6 build.log | head -40; tail -3 build.log
+          exit $status
+      - name: The focused tests
+        run: |
+          set +e
+          fails=0
+          run() {
+            echo "== $* ($(date -u +%H:%M:%S))"
+            "$@" > run.log 2>&1; status=$?
+            grep -E '^test |test result|panicked|largest beat gap|idle window grew|shard [0-9]+.s idle window|SKIP|loaded wake|beside' run.log | cut -c1-400 | head -40
+            [ $status -eq 0 ] || fails=$((fails+1))
+            echo "== exit $status"
+          }
+          run cargo test --locked -p slates-server --test idle_window -- --nocapture
+          run cargo test --locked -p slates-server --test liveness an_idle_spin_never_reaches_the_watchdogs_verdict -- --nocapture --test-threads=1
+          if [ -f green.marker ]; then
+            run cargo test --locked -p slates-rt
+            run cargo test --locked -p slates-server --lib -- watchdog::tests config::tests
+          fi
+          echo "== $fails failed"
+          exit $fails
