@@ -2837,13 +2837,9 @@ impl Daemon {
         (adopted, identities)
       })?;
     if let Some(through) = adopted_through {
+      // Its ledger's, with the versions its durable checkpoint stands for (A-404, A-476).
       let mut ledger = self.observe(self.shards.first().copied(), move |s| {
-        (1..=through)
-          .filter_map(|version| {
-            crate::merge_origin::ledger_value(s, object, version)
-              .map(|value| (version, value.increment))
-          })
-          .collect::<Vec<_>>()
+        crate::merge_origin::ledger_identities(s, object, through)
       })?;
       ledger.append(&mut identities);
       identities = ledger;

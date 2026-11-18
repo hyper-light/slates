@@ -198,16 +198,6 @@ fn a_captured_clone_lands_its_change_since_the_capture_and_passes_an_outsiders()
     &mut store,
     (&origin, captured, &mut clone),
   );
-  planned_the_change_since_the_capture(&presented);
-  let report = result.unwrap();
-  assert_eq!(report.state, LandingState::Done, "{:?}", report.entries);
-  landed_the_change_and_kept_the_rest(&host);
-  assert!(!clone.is_overlay(), "the clone took a base from the target");
-}
-
-/// The judge of [`a_captured_clone_lands_its_change_since_the_capture_and_passes_an_outsiders`]'s presentation: judged
-/// by content, the change since the capture in landing order (removals deepest first), every entry to apply.
-fn planned_the_change_since_the_capture(presented: &crate::engine::Presented) {
   assert_eq!(presented.manifest.basis, Judged::Content);
   let planned: Vec<(&str, &Action)> = presented
     .manifest
@@ -234,22 +224,24 @@ fn planned_the_change_since_the_capture(presented: &crate::engine::Presented) {
     "{:?}",
     presented.preliminary
   );
+  let report = result.unwrap();
+  assert_eq!(report.state, LandingState::Done, "{:?}", report.entries);
+  assert_the_change_landed_and_the_outsiders_passed(&host);
+  assert!(!clone.is_overlay(), "the clone took a base from the target");
 }
 
-/// The judge of [`a_captured_clone_lands_its_change_since_the_capture_and_passes_an_outsiders`]'s disk: the rewritten
-/// and the made file hold the agent's bytes, the removed file and directory are gone, and the outsider's file and the
-/// untouched one are as they were.
-fn landed_the_change_and_kept_the_rest(host: &SimHost) {
-  let bytes = |path: &str| host.bytes(path);
+/// The target after the captured clone's landing: the rewritten file holds the agent's body, the made file is there, the
+/// removed file and directory are gone, and the outsider's file and the untouched one are as they were.
+fn assert_the_change_landed_and_the_outsiders_passed(host: &SimHost) {
   assert_eq!(
-    bytes("/target/src/edit.rs").as_deref(),
+    host.bytes("/target/src/edit.rs").as_deref(),
     Some(&b"the agent's body"[..])
   );
   assert_eq!(
-    bytes("/target/src/made.rs").as_deref(),
+    host.bytes("/target/src/made.rs").as_deref(),
     Some(&b"made by the agent"[..])
   );
-  assert_eq!(bytes("/target/gone.rs"), None);
+  assert_eq!(host.bytes("/target/gone.rs"), None);
   assert!(
     !host
       .paths()
@@ -259,10 +251,13 @@ fn landed_the_change_and_kept_the_rest(host: &SimHost) {
     host.paths()
   );
   assert_eq!(
-    bytes("/target/src/outsider.rs").as_deref(),
+    host.bytes("/target/src/outsider.rs").as_deref(),
     Some(&b"an outsider's edit"[..])
   );
-  assert_eq!(bytes("/target/src/keep.rs").as_deref(), Some(&b"kept"[..]));
+  assert_eq!(
+    host.bytes("/target/src/keep.rs").as_deref(),
+    Some(&b"kept"[..])
+  );
 }
 
 /// An outsider's change to a file the agent also changed refuses the whole landing, `ModifyModify`, and writes

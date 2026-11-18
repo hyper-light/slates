@@ -5038,8 +5038,9 @@ slots alternate park by park, A-199), set `parked` to that slot's value (1 or 2)
 (`SeqCst`; the park protocol, A-44), re-check the reply (to close the race), and wait on the wake word
 (futex / `os_sync_wait_on_address(SHARED)` / the Event). A call that waits while its daemon lives waits on the daemon's
 departure beside its reply (A-456): Linux polls the completion eventfd and the control socket instead of the futex,
-Windows waits on the Event and the daemon's process handle together, and macOS keeps the word, looking at the daemon's
-exit watch on a doubling schedule. Daemon: after writing a reply and advancing
+Windows waits on the Event and the daemon's process handle together, and macOS keeps the word; both look at the
+daemon's liveness (its exit watch and the instance's start stamp) on a doubling schedule, since a daemon restarted
+inside its own process changes only the stamp. Daemon: after writing a reply and advancing
 the wake word, fence and read `parked`; if set, advance the word once more, stamp the host clock into
 the `reply_stamp` slot the flag's value names (the first reply of the park only), wake (futex wake / wake by address / `SetEvent`),
 mark that stamp confirmed when the wake reports it found a sleeper (Linux and macOS; Windows' Event
@@ -5169,8 +5170,12 @@ drops.
 > descriptor or a process, so there the park looks at the daemon's exit watch on A-443's doubling: the first look once
 > the wait has lasted twice the longer of the time waited at its first park and the client's wake estimate (a look
 > costs a park's timeout and a wake), each later look at twice the time waited. The looks cost the logarithm of the
-> wait, and a departure is seen within the time waited. The departure is the process's end alone (the socket's close,
-> the exit watch), never the bootstrap object, which a live daemon need not hold to answer its ring. A Linux park on a
+> wait, and a departure is seen within the time waited. A departure is the daemon's going: on Linux its control
+> socket's close (its process's end, or a stop inside the process); on macOS and Windows its process's exit, or a new
+> start stamp in the instance's bootstrap object, which a daemon restarted inside its own process changes and nothing
+> else. So Windows' wait takes the doubling looks' timeout too, and every look asks both (fixed the same day: the first
+> form asked the process alone, and a call across a restart inside the daemon's process waited forever on macOS and
+> Windows; `docs/bugs/2026-11-18-a-reply-wait-across-a-restart-inside-the-daemons-process-never-ended.md`). A Linux park on a
 > descriptor is never confirmed by the daemon's futex wake, so the client judges its own sleep by its voluntary
 > switches (`getrusage(RUSAGE_THREAD)`, `slates_machine::switches`), as Windows' parks do, and its wake estimate still
 > learns. While a Linux completion bridge runs (Node's adopted descriptor), the park waits on the bridge's pipe, the
@@ -9548,6 +9553,16 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > `a_wedged_daemon_is_found_lapsed_though_the_anchors_own_looks_run_twice_a_window_late` and
 > `the_loop_waits_at_most_its_gap_and_finds_a_lapse_at_the_budgets_end` (`crates/api/src/role/anchor.rs`).
 
+> **Status (2026-11-18, A-474): a watcher's own late looks are no span it did not watch.** A-308 starts a shard's still
+> time again at a look that comes after a span nothing watched; that span is now a gap past the shard's window and the
+> watcher's own lateness p99, capped at A-455's ceiling (`watchdog::slept_past_ns`), where it was any gap of a window.
+> The watchdog keeps its looks' lateness (`watchdog::LatenessTail`, its last hundred, nearest-rank p99), each `Look`
+> carries it, and the anchor's start and silent-watchdog judgments pass the anchor's own (the same tail). Before, a
+> watcher whose every look ran a window late restarted a wedged shard's stillness at each look and never judged it,
+> while it beat on (`docs/bugs/2026-11-18-the-watchdog-never-judged-a-wedged-shard-once-its-own-looks-ran-a-window-late.md`).
+> A process frozen whole is still told by its gap, a whole host's sleep a gap past the ceiling. Regression:
+> `a_shard_is_judged_wedged_though_the_watchers_own_looks_run_a_window_late` (`crates/server/src/watchdog.rs`).
+
 > **Telemetry oracle correction (2026-09-20, AC-0.11).** A drain request itself emits spans.
 > The daemon integration oracle now derives convergence from the reply quota minus the
 > maximum spans a drain emits, and checks progress on each batch. A four-span reply scenario
@@ -10813,7 +10828,9 @@ shard of its node before the green's first change, feeds it each change over the
 own shard, and makes every replica leave before it gives the engine up. A work's shard answers from its replica
 (step 5b, A-465) what the work asks of its green, its base at its version and its rebase, by the owner's own functions
 over the replica's engine, with no hop; what the replica does not hold is asked of the owner, counted by why, and a
-replica that left after a refusal or an eviction is made again before the owner's next change.
+replica that left after a refusal or an eviction is made again before the owner's next change. A replica no work on its
+shard has used for its idle window, the longest gap it has known between two uses, is given back (A-473), and made again
+when work there asks for it.
 
 **Attachments and versions.** Mounts and SDK attachments of green pin a version;
 `advance(attachment, version)` re-pins and invalidates exactly the paths the manifest diff
@@ -25327,9 +25344,11 @@ own shard; and every replica leaving before its owner is given up. Step 5b built
 work's base reads (its files, a page, every file's length, at its base version) and its rebase answered by its shard's
 replica with no hop, by the owner's functions over the replica's engine (byte for byte the owner's, the oracle test);
 what the replica cannot serve asked of the owner, counted by why; a replica that left after a refusal or an eviction
-made again, counted, never one that left for its budget. Owed: an idle replica's give-back (its idle period derived from
-the feed's cost per version against the rebases it served); the supervisor's A/B at 1,000 clients and more. The text and
-its measurements are perf's (2026-11-11, `agents/perf-a273`, never pushed); the
+made again, counted, never one that left for its budget. The idle give-back built 2026-11-18 (g083, A-473, below): a
+replica no work on its shard has used for its idle window, the longest gap it has known between two uses, leaves, its
+charge credited, counted; only a recorded use arms the check; work that returns asks for it again, and the owner's next
+change remakes it. Owed: the supervisor's A/B at 1,000 clients and more (running). The text and its measurements are
+perf's (2026-11-11, `agents/perf-a273`, never pushed); the
 content question it left open was decided by the supervisor on 2026-11-17 by A-64 and D-7 (below). W1 (A-247), whose
 works off the owner it builds on, landed on 2026-11-17 (3c0af9399).
 
@@ -31994,12 +32013,11 @@ Applied in the same change to: §2.5 (the graceful stop's status), §4.14 (a sta
   back as it ends, so the async loop still learns of replies the synchronous wait drained past it). Windows: one
   `WaitForMultipleObjects` on the region's Event and the daemon's process handle (`Event::wait_or_exit` now reports
   which ended the wait). macOS: the wake word's wait (`os_sync_wait_on_address`, which no wait takes beside a
-  descriptor or a process) until the next look at the daemon's exit watch; the first look once the wait has lasted
+  descriptor or a process) until the next look at the daemon's liveness; the first look once the wait has lasted
   twice the longer of the time waited at its first park and the wake estimate (a look costs a park's timeout and a
-  wake), each later one at twice the time waited (`Looks`). The departure is the process's end alone
-  (`Liveness::departed`: the socket's close, the exit watch), not `daemon_gone`'s bootstrap stamp, since a live daemon
-  answers its ring whoever holds the instance's name. `Client::round_trip` waits with it and reconnects at `Departed`;
-  `ClientEnd::wait(deadline)` is unchanged.
+  wake), each later one at twice the time waited (`Looks`). `Client::round_trip` waits with it and reconnects at
+  `Departed`; `ClientEnd::wait(deadline)` is unchanged. (As first landed, a look asked the process's exit alone; the
+  fix below.)
 - **The wake estimate keeps learning.** The daemon's futex wake never finds a Linux park on a descriptor asleep, so its
   stamp is never confirmed; a park now carries its own rule (`Parked::waker_confirms`) and a Linux departure park, like
   every Windows park, is judged by the client's own switch count across the wait. `slates_machine::switches` gains
@@ -32028,6 +32046,27 @@ Applied in the same change to: §2.5 (the graceful stop's status), §4.14 (a sta
 Applied in the same change to: §4.7 ("Wake strategy", the A-232 status's successor), GAPS (the `LIVENESS_BUDGET_NS`
 entry's class C), `crates/ipc/src/{endpoint,rendezvous,wake,region,completion,lib}.rs`, `crates/machine/src/switches.rs`,
 `crates/client/src/client.rs`, `crates/api/src/lib.rs` (the deadlines' doc), `unsafe-budget.toml`.
+
+- **Fixed the same day: a restart inside the daemon's process went unseen on macOS and Windows.** As first landed, the
+  departure was the daemon process's end alone (`Liveness::departed`: the exit watch on macOS and Windows), and the
+  bootstrap object's start stamp was not read. A daemon stopped and started again inside one process (the client and
+  server tests' in-process daemons; an embedding that restarts its daemon) changes only the stamp, so a synchronous call
+  sent across such a restart waited forever on macOS and Windows; Linux's control socket closes at the stop. Now each
+  look asks `Liveness::daemon_gone` (the exit watch, and the stamp), as before A-456, and Windows' wait on the Event and
+  the process handle ends at the next look too (`Event::wait_or_exit` takes a timeout and answers `EventOrExit`), so a
+  process's exit still ends it at once. `Liveness::departed` is gone. Test:
+  `endpoint::departure::a_daemon_restarted_inside_its_own_process_ends_the_wait` (macOS, Windows: a daemon of the test's
+  own process restarted a quarter second into the wait; red with the exit-only look put back, where the wait missed the
+  restart and ended only at the reply the test sends on the old ring two seconds on); the real-process restart of
+  `crates/client/tests/client.rs`, `a_session_outlives_a_daemon_restart_and_its_retry_meets_the_completion_record`, hung
+  on main (a 150 s alarm ended it) and passes on the fix in 0.82 s (Mac Studio; the bug record holds the runs). The same blind spot sat in A-447's Windows claim: an
+  unanchored claim judged its daemon by its process alone, so a claim on a daemon stopped inside its own process
+  waited forever, and the rendezvous file's `a_claim_is_polled_without_waiting_and_refused_once_its_daemon_is_gone`
+  could not end on Windows. That claim now reads the start stamp it began under at each poll (the stopped daemon takes
+  it back), and its blocking wait looks again as long after as it has waited. Record:
+  `docs/bugs/2026-11-18-a-reply-wait-across-a-restart-inside-the-daemons-process-never-ended.md`. Fix applied to:
+  `crates/ipc/src/{endpoint,rendezvous,wake,region}.rs`, `crates/ipc/tests/rendezvous.rs`, §4.7 (the status and "Wake
+  strategy"), GAPS.
 
 ### A-466 — A captured clone's replacement keeps an outsider's mode change it did not make: its metadata judged field by field beside its bytes (2026-11-18, g085; A-291, A-458, D-27)
 Applied in the same change to: §4.15 step 4 (the replacement's metadata rule), A-458 (its sibling, fixed), GAPS (A-185's
@@ -32248,6 +32287,93 @@ a field test; `src/manifest_vectors.txt`, new: the published vectors; `src/lib.r
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry), `crates/server/src/daemon.rs`, and
 `docs/bugs/2026-11-18-the-anchor-never-found-a-wedged-daemon-once-its-own-waits-ran-a-window-late.md` (A-467's bug,
 recorded).
+
+### A-473 — A replica no work on its shard has used for its idle window is given back, and made again when work there asks for it; the window is the green's own use there, and only a recorded use arms the check (2026-11-18, goal 87 via g083; A-273's idle give-back; §4.16 "Rebase off the owner"; A-457, A-465)
+
+Applied in the same change to: §4.16 ("Rebase off the owner (A-273)"); A-273's status; GAPS (A-273's entry); and
+`crates/server/src/green_replicas.rs` (`Held`'s use history and `idle_at`; `note_use`, `idle_check`,
+`next_idle_wait`, `give_back_idle`; `Gone::Idle`, `Tomb`, `want_again`, `Message::Wanted`, `wanted`; the test).
+
+- **What was there.** A replica made on every other shard at its green's first change (A-457) stayed until its owner
+  gave the engine up, fed every version and charged to its shard whether or not any work there used it.
+- **The window.** A held replica keeps when a work on its shard last used it (a base read or a rebase it served,
+  A-465) and the longest gap it has known between two uses, the first measured from its holding: its gap tail, the
+  green's own use on that shard. A replica unused for longer than its gap tail is idle: its works have paused longer
+  than they ever have. No literal enters the window.
+- **The check, by event.** Recording a use arms the shard's idle check if it does not run: one task a shard, which
+  sleeps to the moment the first held replica has gone unused for its window, gives back every one that has, counted
+  (`merge.replica.idle_given_back`), its charge credited and its registration sent home, and goes on while a used
+  replica is held; it ends when none is. Nothing sweeps on a period.
+- **Work returns.** The first base read or rebase a given-back replica would have served is asked of the owner,
+  counted (`merge.replica.route_idle`), and asks the owner, once, to make it again (`Message::Wanted`); the owner's
+  next change does, through A-465's remake path, counted (`merge.replica.remade`). A replica given back for idleness
+  is not made again until a work asks for it, so an idle green costs nothing on that shard.
+- **Not judged.** A replica never used on its shard has no use to derive a window from, so it is not judged idle: it
+  costs its feed and its charge until its owner gives the engine up. Making replicas only where works ask for them
+  would end that; it is owed, the A/B's evidence first.
+- **Checks.** On the Mac Studio (debug, r417, 2026-11-18): `cargo test --locked -p slates-server --lib green_replicas`
+  7 of 7 (the new `an_unused_replica_is_given_back_after_its_idle_window_and_made_again_when_work_returns`: given back
+  once idle, its 155 bytes of charge credited, the next request asked of the owner as idle, made again at the owner's
+  next change and held again) and `cargo test --locked -p slates-merge --lib` 16 of 16; the one-crate clippy of
+  `slates-merge` clean, and of `slates-server` clean in this change's code (it fails at main's own sites in `fleet.rs`,
+  `verbs.rs`, `watchdog.rs` and `live_ship.rs`); `cargo xtask check` structural clean and the literal check clean in
+  this change (it counts 52 literals in other crates' files); rustfmt's layout taken. Red with an idle replica never
+  given back: the new test fails, nothing given back within an observation's budget.
+- **Owed.** The supervisor's A/B at 1,000 clients and more (running).
+
+### A-476 — A takeover successor names the versions its adoption stands for by its ledger and, where its checkpoint let the ledger's positions go, by the checkpoint (2026-11-18, goal 87 via g083; §4.16 owner-loss recovery; A-333, A-364, A-404, A-412)
+
+Applied in the same change to: GAPS (A-404's entry); `docs/bugs/2026-11-18-a-successors-chain-lacked-the-versions-its-checkpoint-stood-for.md`;
+`crates/server/src/merge_origin.rs` (`ledger_identities`, and the test
+`a_successors_chain_names_the_versions_its_checkpoint_stands_for`); `crates/server/src/daemon.rs`
+(`Daemon::merge_chain_identities` reads an adopted green's versions through it).
+
+- **What was there.** An adopted green's chain holds only the versions after its adoption, and the versions through it
+  are named by the successor's ledger (A-333). Since A-404 a holder lets go of its ledger's positions below the durable
+  checkpoint it keeps, which stands for them. The chain read named the adopted versions from the ledger alone, so a
+  successor whose checkpoint had let go of version 1 named its chain from version 2. It did so whenever a record it
+  recomputed named version 2 committed: 2 of 4 runs of the fleet test of a successor two versions behind, on Linux, at
+  and before A-273.
+- **The rule.** The versions through an adoption are named by the ledger's record where it holds the position, and by
+  the held checkpoint's record of what it accepted where it let go of it (`merge_origin::ledger_identities`): the two
+  durable halves of the successor's prefix since A-404. The engine (rebuilt or advanced from that checkpoint), the
+  rebuild at a restart and the durable state were right throughout; only the read missed the checkpoint.
+- **Checks.** On the Mac Studio (debug, r436, 2026-11-18): `cargo test --locked -p slates-server --lib merge_origin` 17
+  of 17, the new `a_successors_chain_names_the_versions_its_checkpoint_stands_for` among A-404's; the one-crate clippy
+  of `slates-server` clean; `cargo xtask check` structural clean and its literal check clean in this change (it counts
+  50 literals in other crates' files); rustfmt's layout taken. Red with the checkpoint's names left out (the read as it
+  was): the new test fails, naming `[(2, …), (3, …)]` for `[(1, …), (2, …), (3, …)]`, the fleet test's failure's shape.
+- **Owed.** The fleet test twenty times on Linux and on macOS (filed for main).
+
+### A-474 — A watcher's own late looks are no span it did not watch: A-308's reset waits for a gap past the window and the watcher's measured lateness (2026-11-18, built for goal g255; §4.14 `daemon.alive`; A-228, A-232, A-308, A-455, A-467)
+- **What was there.** A-308 started every shard's still time again at a look a window or more after the watchdog's last
+  one, taking the gap for the process frozen or paging whole. The watchdog looks a beat apart whatever its own lateness,
+  so a watchdog thread held off its CPU about a window at every look restarted a wedged shard's stillness at each look:
+  no verdict ever came, and since it beat at each look the anchor saw no lapse either. The anchor's start judgment and
+  its judgment of a silent watchdog's process run the same rule and had the same hole under its own late looks.
+- **The rule (`watchdog::slept_past_ns`).** A gap is a span nothing watched only past the shard's window plus the
+  watcher's own lateness p99, and never past A-455's ceiling nor under the window. A watcher's looks run late by up to
+  its p99, so a gap that lateness explains is its own late look, and across it a shard's CPU clock and its scheduler
+  state still say whether it moved: a thread leaves the run queue for a block only by running, which the clock shows.
+  It is the bound the anchor already takes a gap in its own looks for a sleep at (A-467: the liveness window plus its
+  lateness p99, capped), so both watchers attribute a gap alike. A process frozen whole, or a host asleep, still gaps
+  past it, so A-308's case stands; a runaway reading cannot stretch it past the ceiling.
+- **The lateness (`watchdog::LatenessTail`).** One bounded window of a watcher's lateness readings, its last hundred
+  with their nearest-rank p99 (A-228's form, moved from the anchor, which now keeps its waits' lateness in it too). The
+  watchdog records each look's lateness past its beat and gives every `Look` its p99 (`Look::watcher_late_ns`); the
+  anchor passes its own into its start and silent-watchdog judgments.
+- **Test.** `a_shard_is_judged_wedged_though_the_watchers_own_looks_run_a_window_late` (`crates/server/src/watchdog.rs`:
+  looks a beat and a window apart by a watcher whose p99 says so, the shard judged wedged at the first late look; and
+  gaps past the ceiling under a runaway reading, never judged across them).
+- **Evidence.** Built and run on the Mac Studio (kiln r435, 2026-11-18, load 6.3-16.7, debug build): `cargo test
+  --locked -p slates-server --lib -- watchdog` 28 of 28 and `cargo test --locked -p slates-api --lib -- role::anchor` 12
+  of 12 (one ignored, the held process's role). Red-checked once with A-308's reset at any gap of a window: the shard
+  behind looks a window late was never judged. `cargo clippy -p slates-server -p slates-api --all-targets` found nothing
+  in A-474's lines (two cognitive-complexity findings in `crates/api/tests/api.rs`, 1324 and 1630, are another
+  change's), and `cargo xtask check` none in its files.
+
+Applied in the same change to: §4.14 (a status block on `daemon.alive`), GAPS (A-308's entry), `docs/bugs/` (a record,
+and A-467's record's sibling line), `crates/server/src/watchdog.rs`, `crates/api/src/role/anchor.rs`.
 
 ### A-472 — A landed mode or bits change is synced through its file's own handle in its batch's barrier before it is reported, by the rule each platform documents (2026-11-18, g085; §4.15 step 8; A-130, A-132, A-458, A-466)
 Applied in the same change to: §4.15 step 8 (the rule and its sources), GAPS (A-185's owed list), `crates/land`

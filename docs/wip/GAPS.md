@@ -744,7 +744,12 @@
 > replica cannot serve asked of the owner, counted by why (`merge.replica.route_absent`, `_behind`, `_refused`,
 > `_evicted`, `_over_budget`); `merge.replica.served` the non-vacuity counter; a replica that left after a refusal or an
 > eviction made again before the owner's next change (`merge.replica.remade`), never one that left for its budget.
-> **Owed, in order:** an idle replica's give-back; the supervisor's A/B at 1,000 clients and more.
+> **Built (idle give-back, 2026-11-18, g083, A-473):** a replica no work on its shard has used for its idle window (the
+> longest gap it has known between two uses, the first from its holding) is given back, its charge credited
+> (`merge.replica.idle_given_back`); only a recorded use arms the shard's one idle check, never a sweep; the first
+> request after asks the owner, once, to make it again (`merge.replica.route_idle`), and its next change does
+> (`merge.replica.remade`). A replica never used on its shard is not judged idle (no use to derive a window from).
+> **Owed:** the supervisor's A/B at 1,000 clients and more (running).
 >
 > **A Shards guest's unprivileged run could not write a host-owned volume: built, the stream takes Shards' owner word
 > (2026-11-18, §4.6 the Shards form; A-281; goal g268).** Shards' init names the run's owner on a share's root with
@@ -2733,7 +2738,10 @@
 > `fleet` binary exited 4 on a wedge verdict that came 146 s past its window (g231 on a 15-CPU Mac at load 62 to 131,
 > 0.2 to 1 GB free; one poll measured 160,662 ms): the whole process had gone unscheduled, the watchdog's thread with
 > it, and the look after its gap judged every shard still for the gap. A look a window or more after the watchdog's
-> last now starts each shard's still time again (`a_gap_in_the_watchdogs_own_looks_is_not_counted_as_a_wedge`). Open
+> last now starts each shard's still time again (`a_gap_in_the_watchdogs_own_looks_is_not_counted_as_a_wedge`); since
+> A-474 only a gap past the window and the watcher's own lateness p99 (capped at A-455's ceiling) does, since one its own
+> lateness explains is no unwatched span, and a watcher whose every look ran a window late never judged a wedged shard
+> (`a_shard_is_judged_wedged_though_the_watchers_own_looks_run_a_window_late`). Open
 > then, closed 2026-11-18 by A-336 (the entry below): a shard held in the kernel past a watched window (a page-in at that
 > pressure) was still judged wedged; telling `D` and XNU's uninterruptible wait from a sleep was the owed decision.
 > Also from the same report, a test's
@@ -3318,6 +3326,15 @@
 > by the versions its owner has not yet committed. A-238's owed "the holders' replicas and records grow per version" is
 > closed by A-385 and A-404.
 >
+> **Fixed 2026-11-18 (g083, A-476): a takeover successor's chain lacked the versions its checkpoint stood for.** A
+> successor that had let go of its ledger's positions below its held checkpoint (A-404) named its adopted versions by
+> the ledger alone, so its chain began after them (`a_successor_two_versions_behind_adopts_the_versions_between_and_serves_the_green`,
+> 2 of 4 runs on Linux, at and before A-273). The versions through its adoption are now named by the ledger where it
+> holds the position and by the checkpoint's record of what it accepted where it let go of it
+> (`merge_origin::ledger_identities`; test `a_successors_chain_names_the_versions_its_checkpoint_stands_for`). Its
+> engine, its rebuild and its durable state were right throughout. Record:
+> `docs/bugs/2026-11-18-a-successors-chain-lacked-the-versions-its-checkpoint-stood-for.md`.
+>
 > **Fixed 2026-11-18 (g232, A-385): a holder's replica of a green kept every version's values.** An owner folds its
 > green's histories to its per-green budget, never past a live reader's version; a holder's replica, the engine it
 > recomputes every version on and a takeover adopts, folded nothing. Now each merge record names where the owner's engine
@@ -3832,7 +3849,17 @@
 >   process handle in one wait), and on macOS, whose reply wake (the wake word) no wait takes beside a descriptor or a
 >   process, looked at on A-443's doubling from twice the longer of the first park and the wake estimate
 >   (`a_reply_after_the_old_reply_deadline_is_taken_while_its_daemon_lives`,
->   `a_daemons_departure_ends_the_wait_before_the_old_reply_deadline`). Owed in C-b: the reply deadline's other users,
+>   `a_daemons_departure_ends_the_wait_before_the_old_reply_deadline`). Fixed the same day: those looks asked the
+>   process's exit alone, so on macOS and Windows a call across a daemon restarted inside its own process (the in-process
+>   test daemons, an embedding) waited forever; every look asks the start stamp too, and Windows' wait takes the looks'
+>   timeout (`a_daemon_restarted_inside_its_own_process_ends_the_wait`;
+>   `docs/bugs/2026-11-18-a-reply-wait-across-a-restart-inside-the-daemons-process-never-ended.md`); A-447's Windows
+>   claim had the same blind spot and now reads the start stamp it began under. `CLAIM_WAIT_NS` (a second, W restated
+>   in slates-ipc, which sits below the crates that define it) still has users, each a fixed second R3 forbids and owed
+>   here: the Linux daemon's wait for a client's opening; the macOS and Windows daemon's reclaim of a claim slot a party
+>   left (twice it); a Windows claim's wait under a live anchor (at least it; A-468 replaces it with the anchor's
+>   life); one more of it for a claim the daemon took to answer; and the async connect's pacing (a tenth of it,
+>   `Connecting::next_poll_ns`). Owed in C-b: the reply deadline's other users,
 >   each a wait that cannot see the departure yet: the async driver's tick (the SDK loops poll only the completion
 >   descriptor; Linux's control socket, macOS's exit-watch kqueue and, on Windows, the bridge thread waiting beside the
 >   process handle could each tell the loop), the wait for a slot on a full ring (a slot that frees wakes nothing), a
