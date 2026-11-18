@@ -27,10 +27,11 @@ use slates_db::catalog::{
 #[cfg(unix)]
 use slates_ipc::protocol::{
   ActionCount, HostAnswer, LandingDegradation, LandingDurability, LandingOutcome, LandingSummary,
+  WriteAct,
 };
 use slates_ipc::protocol::{
   AuditEntry, GrantScope, GrantSummary, PolicySubject, Refusal, ReplyBody, SnapshotId, VolumeId,
-  WriteAct, WriteMode, WritePolicy,
+  WriteMode, WritePolicy,
 };
 use slates_land::engine::Audit;
 #[cfg(unix)]
@@ -2669,6 +2670,9 @@ pub fn grant_proof(
 /// a manifest other than the one presented (the plan changed under the approval), and `NotFound` for a
 /// landing not awaiting a grant (consumed, or never presented — a replay of a spent approval). The
 /// comparison of the proof is constant-time over its whole width so a wrong proof leaks nothing by timing.
+/// Refuses `Forbidden` — counted `grant_by_consumer` — on a channel bound to a consumer (an agent's session), before
+/// anything else and whatever its proof (A-285): an agent never approves its own landing, as it never approves its own
+/// merge (`submit_approved`) or sets a policy (`set_policy_verb`); the approval is the launcher's or its harness's.
 pub fn grant_verb(
   state: &mut ShardState,
   principal: &Principal,
@@ -2678,6 +2682,11 @@ pub fn grant_verb(
   term_ns: u64,
   proof: [u8; 32],
 ) -> ReplyBody {
+  // A-285: an agent never approves its own landing, even holding a genuine proof.
+  if matches!(principal, Principal::Consumer { .. }) {
+    state.count("grant_by_consumer", 1);
+    return crate::verbs::forbidden("grant");
+  }
   let Some(awaiting) = state.landing.awaiting.get(&landing_id).cloned() else {
     return crate::verbs::refused(Refusal::NotFound);
   };

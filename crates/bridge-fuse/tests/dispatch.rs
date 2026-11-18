@@ -78,6 +78,7 @@ impl Mock {
       btime: self.ctime,
       windows: 0,
       change: 0,
+      device: None,
     }
   }
 }
@@ -123,6 +124,7 @@ impl Bridge for Mock {
         btime: 0,
         windows: 0,
         change: 0,
+        device: None,
       }),
       2 => Ok(self.file_attr()),
       _ => Err(VfsError::NotFound),
@@ -306,6 +308,7 @@ impl Bridge for Mock {
         btime: 0,
         windows: 0,
         change: 0,
+        device: None,
       },
       8,
     ))
@@ -331,7 +334,7 @@ impl Bridge for Mock {
     _cx: &OpContext,
     _name: &str,
     _mode: u32,
-    _kind: Kind,
+    _node: slates_vfs::inode::SpecialNode,
   ) -> Result<NodeAttr, VfsError> {
     Err(VfsError::SpecialFileOperation)
   }

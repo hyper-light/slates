@@ -228,7 +228,7 @@ impl<'a> Reader<'a> {
   /// A big-endian `uint32`.
   fn u32(&mut self) -> Result<u32, SignatureRefusal> {
     let bytes: [u8; 4] = self
-      .take(4)?
+      .take(std::mem::size_of::<u32>())?
       .try_into()
       .map_err(|_| SignatureRefusal::Malformed)?;
     Ok(u32::from_be_bytes(bytes))
@@ -275,31 +275,37 @@ fn put_string(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), SignatureRefusal> {
   Ok(())
 }
 
+/// Format: the base64 alphabet (RFC 4648 §4, Table 1), each character standing for its index's six bits.
+const BASE64_ALPHABET: &[u8; 64] =
+  b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+/// Format: the characters of one base64 group (RFC 4648 §4: 24 bits as four characters of six bits each).
+const BASE64_GROUP_SYMBOLS: usize = 4;
+/// Format: the bytes one base64 group decodes to (24 bits).
+const BASE64_GROUP_BYTES: usize = 3;
+/// Format: the bits one base64 character stands for.
+const BASE64_SYMBOL_BITS: u32 = 6;
+
 /// Decodes standard base64 (RFC 4648 §4) with padding, ignoring whitespace (the armour wraps lines).
 ///
 /// # Errors
 /// [`SignatureRefusal::Malformed`] for any other character, a bad length or misplaced padding.
 pub fn base64_decode(text: &str) -> Result<Vec<u8>, SignatureRefusal> {
-  /// The six bits a character stands for.
+  /// The six bits a character stands for: its index in `BASE64_ALPHABET`.
   fn sextet(character: u8) -> Option<u32> {
-    match character {
-      b'A'..=b'Z' => Some(u32::from(character.wrapping_sub(b'A'))),
-      b'a'..=b'z' => Some(u32::from(character.wrapping_sub(b'a')).wrapping_add(26)),
-      b'0'..=b'9' => Some(u32::from(character.wrapping_sub(b'0')).wrapping_add(52)),
-      b'+' => Some(62),
-      b'/' => Some(63),
-      _ => None,
-    }
+    BASE64_ALPHABET
+      .iter()
+      .position(|symbol| *symbol == character)
+      .and_then(|index| u32::try_from(index).ok())
   }
   let symbols: Vec<u8> = text
     .bytes()
     .filter(|byte| !byte.is_ascii_whitespace())
     .collect();
-  if !symbols.len().is_multiple_of(4) {
+  if !symbols.len().is_multiple_of(BASE64_GROUP_SYMBOLS) {
     return Err(SignatureRefusal::Malformed);
   }
-  let (groups, _) = symbols.as_chunks::<4>();
-  let mut out = Vec::with_capacity(groups.len().saturating_mul(3));
+  let (groups, _) = symbols.as_chunks::<BASE64_GROUP_SYMBOLS>();
+  let mut out = Vec::with_capacity(groups.len().saturating_mul(BASE64_GROUP_BYTES));
   let last = groups.len().saturating_sub(1);
   for (index, group) in groups.iter().enumerate() {
     let padding = group.iter().rev().take_while(|byte| **byte == b'=').count();
@@ -308,19 +314,19 @@ pub fn base64_decode(text: &str) -> Result<Vec<u8>, SignatureRefusal> {
     }
     let mut word = 0u32;
     for (position, symbol) in group.iter().enumerate() {
-      let value = if position.saturating_add(padding) >= 4 {
+      let value = if position.saturating_add(padding) >= BASE64_GROUP_SYMBOLS {
         0
       } else {
         sextet(*symbol).ok_or(SignatureRefusal::Malformed)?
       };
-      word = word.wrapping_shl(6) | value;
+      word = word.wrapping_shl(BASE64_SYMBOL_BITS) | value;
     }
     out.extend(
       word
         .to_be_bytes()
         .iter()
         .skip(1)
-        .take(3usize.saturating_sub(padding)),
+        .take(BASE64_GROUP_BYTES.saturating_sub(padding)),
     );
   }
   Ok(out)
