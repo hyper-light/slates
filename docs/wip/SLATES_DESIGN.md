@@ -6326,9 +6326,9 @@ creator plus these exceptions; this adds no global lookup catalog or per-write c
 > a copy made afresh takes the first member's record it meets as its owner's. Held by
 > `every_copy_catches_up_once_the_creator_takes_its_volume_back_from_the_adopter`,
 > `every_copy_catches_up_once_the_third_node_takes_the_volume_from_the_adopter` and
-> `a_superseded_owner_restarted_warm_ships_no_record_of_the_volume_it_lost` (`crates/server/tests/fleet.rs`). Owed: the
-> let-go is kept by the control shard's next publication, so a warm restart before it restores the copies; and the
-> yield itself is memory-only (`ShardState::yielded`), so a warm restart forgets it.
+> `a_superseded_owner_restarted_warm_ships_no_record_of_the_volume_it_lost` (`crates/server/tests/fleet.rs`). The
+> let-go is published at once (A-415), so a warm restart does not restore the copies. Owed: the yield itself is
+> memory-only (`ShardState::yielded`), so a warm restart forgets it.
 
 > **Status (2026-11-18, A-409: a lost volume's log stops by itself, and a refusal names the fence).** A volume its
 > node yielded at its re-admission (A-334) ships nothing more and does no period work, as a fenced one does (A-349):
@@ -29602,6 +29602,22 @@ the module's "The workload" and "The bound"), and the example's tests below.
   it again (`a_hot_set_names_each_file_once`); a hot set past half the eligible files is refused and exactly half is
   one (`a_hot_set_past_half_the_eligible_files_is_refused`); with no hot set every pick is from the whole tree and no
   shared slot is written (`with_no_hot_set_every_pick_is_from_the_whole_tree`).
+
+### A-415 — The re-admission publishes its let-go of the host's own register copies at once (2026-11-18, g230, scale-out; §4.8 "Authority scope", "Recovery"; A-382's owed item)
+Applied in the same change to: §4.8 "Authority scope" (A-382's status), GAPS (A-382's entry), and
+`crates/server/src/readmission.rs`.
+- **What was there.** A-382's let-go removed the host's own register copies from the control shard's held map, and the
+  removals rode the shard's next publication. A warm restart before it restored the copies from the last committed
+  image and routed each to the owner it named, this host, so they refused their successors again (A-382's failure)
+  until the next re-admission, which a restarted daemon does not see.
+- **The rule.** The let-go publishes the shard at once when it let anything go (`readmission::let_go_own_registers`);
+  a refused publication is counted `fleet.readmission.registers_let_go_unpublished`, and the removals stay marked
+  changed (`crate::tracked`) for the next one.
+- **Tests.** `a_readmissions_let_go_is_in_the_journal_a_restart_reads` (`readmission`'s unit tests, on a shard with
+  recovery storage): a copy naming the host held and published, the host re-admitted; the journal a restart reads
+  (`verbs::committed_held_agrees`) agrees with the shard at once, and with every publication refused around the
+  install the let-go is counted unpublished and the next publication carries it. The re-admission flows' fleet tests
+  are filed for main (run-requests.md, A-415).
 
 ### A-406 — The root group records its voters in the versioned root configuration, so a root learner names who votes from the configuration it fetches (2026-11-18, goal g225: a forming fleet reaches every candidate; §4.8 learners; A-380's root sibling)
 
