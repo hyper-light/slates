@@ -30,6 +30,8 @@
 //!   Signatures never gate permission.
 //! - *Errors* ([`error`]): one closed taxonomy whose variant is what a consumer does about it.
 //! - *The seam* ([`seam`], [`sim`]): the volume verbs as a trait, for hosts that need a simulator (A-310).
+//! - *The async form* ([`asynchronous`]): verbs a host awaits on its own loop through its [`Reactor`], never a thread
+//!   blocked on a round trip (R6).
 //!
 //! **Starting an instance with no slates binary** ([`start`], [`role`]). A host starts its instance from its own
 //! executable: [`Instance::start`] runs `HOST_EXE PREFIX... --instance NAME anchor`, and the host's `main` hands the
@@ -65,6 +67,7 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
+pub mod asynchronous;
 pub mod error;
 pub mod exec;
 pub mod grant;
@@ -83,6 +86,7 @@ pub mod sim;
 pub mod start;
 pub mod volume;
 
+pub use asynchronous::{AsyncInstance, Completion, Reactor, Waiting, Woke};
 pub use error::{
   Absence, Busy, Denied, Elsewhere, Error, Exhausted, Existing, HostFault, Invalid, IssuerFault,
   KindMismatch, Missing, MountFault, MountMissing, MoveTarget, Note, PathFault, ProtocolFault,
@@ -197,13 +201,18 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// its audit trail: the records of the steps its attempt took, then an [`AuditKind::LandingFinished`] whose `outcome` is
 /// [`LandingStage::Refused`], or [`LandingStage::Aborted`] once it wrote an entry; such an end that names no manifest
 /// (refused before any plan, under a grant that names none) carries no `verification`. Until then a refused landing's
-/// trail ended at its grant (found by g90; the same day). 31: a volume's move to another fleet member (A-291, the same
-/// day): `Instance::move_volume` and `Instance::member`, `MoveProgress`, and its refusals' details (`Busy::Attached`,
-/// `Busy::Moving`, `Unusable::Unmovable`, `Invalid::MoveTarget`, `RetryCause::MoveUnplaced`). 32:
-/// `Instance::capture_base`, an overlay's base captured whole so its clones move (A-291, the same day).
+/// trail ended at its grant (found by g90; the same day). 31: the async form ([`AsyncInstance`] over a host's
+/// [`Reactor`]: provisioning from every source, a snapshot, a status and a destroy, awaited on the host's own loop
+/// through the client's driver; [`AsyncInstance::into_instance`] stops the completion signal, so the synchronous form's
+/// waits are woken; R6) (A-299; the same day).
+/// 32: `AuditKind::GrantExpired`, the record a grant's end at its term leaves in the audit (A-266) (the same day).
+/// 33: a volume's move to another fleet member (A-291, the same day): `Instance::move_volume` and `Instance::member`,
+/// `MoveProgress`, and its refusals' details (`Busy::Attached`, `Busy::Moving`, `Unusable::Unmovable`,
+/// `Invalid::MoveTarget`, `RetryCause::MoveUnplaced`). 34: `Instance::capture_base`, an overlay's base captured whole so
+/// its clones move (A-291, the same day).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 32;
+pub const CONTRACT: u32 = 34;
 
 /// What a rewitness did (§4.15 `rewitness`): the paths one reply holds and the count of the rest (A-267).
 pub use slates_client::Rewitnessed;

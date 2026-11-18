@@ -16,6 +16,7 @@ AuditKind 3 LandingValidated
 AuditKind 4 EntryWritten
 AuditKind 5 EntryRefused
 AuditKind 6 LandingFinished
+AuditKind 7 GrantExpired
 BaseRecord 0 Scratch
 BaseRecord 1 Path
 BaseRecord 2 Image
@@ -123,8 +124,11 @@ Op 72 WorkFloorDropped
 Op 73 VolumeSignersSet
 Op 74 VolumeRelinquished
 Op 75 GreenAdopted
-Op 76 VolumeReleased
-Op 77 BaseCaptured
+Op 76 AuditOwed
+Op 77 AuditDelivered
+Op 78 AuditBatchAppended
+Op 79 VolumeReleased
+Op 80 BaseCaptured
 PlacementState 0 Local
 PlacementState 1 Placed
 Principal 0 Uid

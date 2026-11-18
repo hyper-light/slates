@@ -205,3 +205,184 @@ fn a_read_from_any_sequence_is_the_window_past_it() {
   let (recovered, _) = recover(&mut seg, 0, bounded, NOW_NS).unwrap();
   check(&recovered);
 }
+
+/// An audit record a shard other than the control shard owes (A-265's crossing): the same record, owed.
+fn owed(landing: u64) -> Op {
+  let Op::AuditAppended { record } = planned(landing) else {
+    panic!("planned is an append");
+  };
+  Op::AuditOwed { record }
+}
+
+/// The landings of the records `records` carries, in order: what a test reads a record's identity by.
+fn landings<'a>(records: impl Iterator<Item = &'a AuditRecord>) -> Vec<u64> {
+  records.filter_map(|record| record.landing).collect()
+}
+
+/// The crossing sequences of a partition's outbox, oldest first.
+fn outbox(db: &slates_db::Db) -> Vec<u64> {
+  db.partition()
+    .audit_outbox()
+    .map(|record| record.seq)
+    .collect()
+}
+
+/// Shape: the records a crossing test owes.
+const OWED: u64 = 5;
+
+/// AC-2.10, §4.15 (A-265's crossing). Do: on a partition that is not the control partition, owe five audit records,
+/// acknowledge the first three, recover from the log, then snapshot and recover again; then acknowledge an older mark.
+/// Expect: the records are numbered 0 to 4 by their crossing sequence; the acknowledgement leaves 3 and 4 owed; each
+/// recovery keeps exactly those two; an older acknowledgement removes nothing. Before 2026-11-18 an owed record lived in
+/// the shard's memory alone between its atom's commit and its batch, so a crash there lost it.
+#[test]
+fn an_owed_record_waits_in_the_outbox_until_its_delivery_is_recorded() {
+  let mut seg = segment("slates-db-audit-owed");
+  let (mut db, _) = recover(&mut seg, 0, caps(), NOW_NS).unwrap();
+  db.set_policy(SnapshotPolicy {
+    bytes_between_snapshots: u64::MAX,
+  });
+  for landing in 0..OWED {
+    db.mutate(&mut seg, &owed(landing), NOW_NS).unwrap();
+  }
+  assert_eq!(
+    outbox(&db),
+    (0..OWED).collect::<Vec<_>>(),
+    "owed in crossing order"
+  );
+  assert!(
+    db.partition().audit().next().is_none(),
+    "nothing is appended where it is owed"
+  );
+  db.mutate(&mut seg, &Op::AuditDelivered { through: 3 }, NOW_NS)
+    .unwrap();
+  assert_eq!(outbox(&db), vec![3, 4], "the delivered records leave");
+  drop(db);
+  let (mut db, _) = recover(&mut seg, 0, caps(), NOW_NS).unwrap();
+  assert_eq!(outbox(&db), vec![3, 4], "a replay keeps what is still owed");
+  db.snapshot(&mut seg).unwrap();
+  drop(db);
+  let (mut db, _) = recover(&mut seg, 0, caps(), NOW_NS).unwrap();
+  assert_eq!(outbox(&db), vec![3, 4], "and so does a snapshot");
+  assert_eq!(
+    landings(db.partition().audit_outbox()),
+    vec![3, 4],
+    "each the record it was"
+  );
+  db.mutate(&mut seg, &Op::AuditDelivered { through: 1 }, NOW_NS)
+    .unwrap();
+  assert_eq!(
+    outbox(&db),
+    vec![3, 4],
+    "an older acknowledgement removes nothing"
+  );
+  db.mutate(&mut seg, &owed(OWED), NOW_NS).unwrap();
+  assert_eq!(
+    outbox(&db),
+    vec![3, 4, 5],
+    "the next owed record takes the next crossing sequence"
+  );
+}
+
+/// A batch of `count` records owed by `origin`, the first at crossing sequence `first`, each record's landing its
+/// crossing sequence.
+fn batch(origin: u16, first: u64, count: u64) -> Op {
+  let records = (first..first + count)
+    .map(|crossing| {
+      let Op::AuditAppended { record } = planned(crossing) else {
+        panic!("planned is an append");
+      };
+      record
+    })
+    .collect();
+  Op::AuditBatchAppended {
+    origin,
+    first,
+    records,
+  }
+}
+
+/// AC-2.10, §4.15 (A-265's crossing). Do: on the control partition, append partition 1's batch of records 0 to 4; the
+/// same batch again; a batch of 3 to 6, which overlaps it; a batch of 10 alone, past a gap; and partition 2's batch of
+/// 0 to 1. Then recover from the log, and from a snapshot. Expect: partition 1's records 0 to 6 and 10 each appended
+/// once, in order, then partition 2's two; partition 1's mark 11 and partition 2's 2; and each recovery the same. A
+/// batch is sent again after a crash or a lost acknowledgement, so the control partition appends nothing twice.
+#[test]
+fn a_batch_sent_again_appends_only_what_is_new() {
+  let mut seg = segment("slates-db-audit-batch");
+  let (mut db, _) = recover(&mut seg, 0, caps(), NOW_NS).unwrap();
+  db.set_policy(SnapshotPolicy {
+    bytes_between_snapshots: u64::MAX,
+  });
+  for op in [
+    batch(1, 0, 5),
+    batch(1, 0, 5),
+    batch(1, 3, 4),
+    batch(1, 10, 1),
+    batch(2, 0, 2),
+  ] {
+    db.mutate(&mut seg, &op, NOW_NS).unwrap();
+  }
+  let expected = vec![0, 1, 2, 3, 4, 5, 6, 10, 0, 1];
+  let check = |db: &slates_db::Db, when: &str| {
+    assert_eq!(
+      landings(db.partition().audit()),
+      expected,
+      "{when}: each record once, in order"
+    );
+    assert_eq!(
+      seqs(db),
+      (0..10).collect::<Vec<_>>(),
+      "{when}: numbered as appended"
+    );
+    assert_eq!(
+      db.partition().audit_received(1),
+      11,
+      "{when}: partition 1's mark"
+    );
+    assert_eq!(
+      db.partition().audit_received(2),
+      2,
+      "{when}: partition 2's mark"
+    );
+    assert_eq!(
+      db.partition().audit_received(3),
+      0,
+      "{when}: a partition that sent none"
+    );
+  };
+  check(&db, "live");
+  drop(db);
+  let (mut db, _) = recover(&mut seg, 0, caps(), NOW_NS).unwrap();
+  check(&db, "replayed");
+  db.snapshot(&mut seg).unwrap();
+  drop(db);
+  let (db, _) = recover(&mut seg, 0, caps(), NOW_NS).unwrap();
+  check(&db, "from a snapshot");
+}
+
+/// AC-2.10's bound (A-265's crossing). Do: with the audit bounded at 16 records, owe 40 on a partition that is not the
+/// control partition, then recover. Expect: the 16 newest owed (crossing sequences 24 to 39), the 24 oldest dropped and
+/// counted, the same after the recovery: the outbox grows no further than the control partition's window would keep.
+#[test]
+fn the_outbox_keeps_the_newest_owed_records_and_counts_what_it_dropped() {
+  let bounded = PartitionCaps {
+    audit_records: WINDOW,
+    ..caps()
+  };
+  let mut seg = segment("slates-db-audit-outbox-bound");
+  let (mut db, _) = recover(&mut seg, 0, bounded, NOW_NS).unwrap();
+  for landing in 0..RECORDS {
+    db.mutate(&mut seg, &owed(landing), NOW_NS).unwrap();
+  }
+  let newest: Vec<u64> = (RECORDS - WINDOW as u64..RECORDS).collect();
+  assert_eq!(outbox(&db), newest, "the newest 16, oldest first");
+  assert_eq!(db.partition().audit_dropped(), RECORDS - WINDOW as u64);
+  drop(db);
+  let (recovered, _) = recover(&mut seg, 0, bounded, NOW_NS).unwrap();
+  assert_eq!(outbox(&recovered), newest, "a replay keeps the same outbox");
+  assert_eq!(
+    recovered.partition().audit_dropped(),
+    RECORDS - WINDOW as u64
+  );
+}

@@ -3478,6 +3478,8 @@ pub enum AuditKind {
   EntryRefused,
   /// A landing finished.
   LandingFinished,
+  /// A grant reached its term unused and ended (A-266), recorded under the principal it was made for. Appended.
+  GrantExpired,
 }
 
 /// The closed refusal taxonomy on the wire (§4.4, §4.13). (`Eq` is not derived because the durability

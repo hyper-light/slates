@@ -12457,7 +12457,7 @@ fn live_volume_written(
   (id, written)
 }
 
-/// Shape: the files [`a_live_takeover_is_rebuilt_in_turns_and_joined_while_it_runs`] writes into a's live volume: its
+/// Shape: the files [`a_live_takeover_is_fetched_and_rebuilt_in_turns_and_joined_while_it_runs`] writes into a's live volume: its
 /// log holds a payload a publication, and a burst's writes may share one, so the log's length is read, not assumed.
 const LIVE_TURN_FILES: usize = 24;
 /// Format: the successor's count of the owner-shard turns its live rebuilds took (`fleet::make_live_in_turns`).
@@ -12470,20 +12470,27 @@ const LIVE_REBUILDS_BEGUN: &str = "fleet.live.rebuilds_begun";
 const MATERIALIZE_WAITS_MAKING: &str = "fleet.materialize.waits.making";
 /// Format: the successor's count of live materializations begun while one of the same volume ran.
 const MAKING_ALREADY: &str = "fleet.materialize.making_already";
+/// Format: a node's count of the turns a takeover fetch's answer took to lay out there, a candidate's for the successor
+/// or the successor's of its own copy (`live_ship::FetchAnswer`).
+const LIVE_FETCH_SLICES: &str = "fleet.live.fetch_slices";
 
 /// g251 (the nemesis's watchdog kills of a successor; CLAUDE.md "Bounded work everywhere"), §4.10 live shipping, §4.8
-/// "Promotion and takeover": a live volume taken over is rebuilt from its log in turns of the successor's owner shard,
-/// and the successor's later attempts join the materialization running there rather than fetching and rebuilding the log
-/// again. Do: three nodes at `f = 1`, one shard a node; on a, a live-shipped volume written 24 files; on b and c, the seal
-/// quantum cut to one unit (a payload a turn) and a pause of half a period between a rebuild's turns, so the
-/// materialization outlasts the control shard's periods; stop a; once the survivor the volume ranks first serves it, read
-/// every file back through it. Expect every file read back; the rebuild in a turn a payload, more than one; one rebuild begun, the later
-/// attempts joining it (`fleet.materialize.waits.making`, non-vacuous) and none begun twice; and the successor's longest
-/// step under the watchdog's window. Before, the whole log was rebuilt inside the one owner-shard turn that made the
-/// volume (0.68 to 1.08 s for the nemesis's 152 to 306 MB, past the spin window with the restore and the publication
-/// after it), and each period's attempt that the turn outlasted fetched and rebuilt the whole log again.
+/// "Promotion and takeover": a live volume taken over is fetched and rebuilt from its log in turns, and the successor's
+/// later attempts join the materialization running on its owner shard rather than fetching and rebuilding the log
+/// again. Do: three nodes at `f = 1`, one shard a node; on a, a live-shipped volume written 24 files; on b and c, the
+/// seal quantum cut to one unit (a payload a turn, an entry a turn of a fetch's answer) and a pause of half a period
+/// between a rebuild's turns, so the materialization outlasts the control shard's periods; stop a; once the survivor
+/// the volume ranks first serves it, read every file back through it. Expect every file read back; the fetch's answer
+/// laid out in a turn an entry, whichever survivor laid it out (the other candidate for the successor, or the successor
+/// of its own copy); the rebuild in a turn a payload, more than one; one rebuild begun, the later attempts joining it
+/// (`fleet.materialize.waits.making`, non-vacuous) and none begun twice; both survivors' longest step under the
+/// watchdog's window; and the successor's failover estimate to have timed the volume it served (A-363). Before, the
+/// whole log was rebuilt inside the one owner-shard turn that made the volume (0.68 to 1.08 s for the nemesis's 152 to
+/// 306 MB, past the spin window with the restore and the publication after it), and each period's attempt that the turn
+/// outlasted fetched and rebuilt the whole log again; and the fetch's answer cloned and copied the whole log in one turn
+/// of the answering node's control shard (a 406 MB log beside a 557 ms poll, seed 18189587465523915115).
 #[test]
-fn a_live_takeover_is_rebuilt_in_turns_and_joined_while_it_runs() {
+fn a_live_takeover_is_fetched_and_rebuilt_in_turns_and_joined_while_it_runs() {
   let _serial = serialize_fleet_tests();
   let (_serve_lease, mut daemons, hosts) = formed_mesh(&["a", "b", "c"]);
   let mut client = Client::connect(daemons[0].instance());
@@ -12537,14 +12544,26 @@ fn a_live_takeover_is_rebuilt_in_turns_and_joined_while_it_runs() {
     counted(MATERIALIZE_WAITS_MAKING),
     counted(MAKING_ALREADY),
   );
-  let longest_step_ns = control_longest_poll_ns(&daemons[index]);
+  // Laid out by the other candidate for the successor, or by the successor of its own copy: counted wherever it ran.
+  let fetch_slices: u64 = daemons
+    .iter()
+    .map(|daemon| {
+      summed_counters(daemon)
+        .get(LIVE_FETCH_SLICES)
+        .copied()
+        .unwrap_or(0)
+    })
+    .sum();
+  let longest_steps_ns: Vec<u64> = daemons.iter().map(control_longest_poll_ns).collect();
+  let failover = failover_through(&mut Client::connect(&instance));
   for daemon in daemons {
     daemon.stop();
   }
   eprintln!(
-    "a live takeover in turns: served {served}, read {read:?}, {slices} rebuild turns for {payloads} payloads of \
-     {LIVE_TURN_FILES} files, {begun} rebuilds begun, {joined} attempts joined one running, {twice} begun twice, the \
-     successor's longest step {longest_step_ns} ns"
+    "a live takeover in turns: served {served}, read {read:?}, {fetch_slices} fetch turns and {slices} rebuild turns \
+     for {payloads} payloads of {LIVE_TURN_FILES} files, {begun} rebuilds begun, {joined} attempts joined one running, \
+     {twice} begun twice, the survivors' longest steps {longest_steps_ns:?} ns, the successor's failover estimate \
+     {failover:?}"
   );
   assert!(
     matches!(shipped, ReplyBody::LiveShippingSet { live_shipped: true }),
@@ -12566,6 +12585,10 @@ fn a_live_takeover_is_rebuilt_in_turns_and_joined_while_it_runs() {
     "non-vacuity: the log held more than one payload to rebuild ({payloads})"
   );
   assert!(
+    fetch_slices >= payloads,
+    "the fetch's answer was laid out an entry a turn: {fetch_slices} turns for {payloads} payloads"
+  );
+  assert!(
     slices >= payloads,
     "the log was rebuilt a payload a turn: {slices} turns for {payloads} payloads"
   );
@@ -12579,8 +12602,14 @@ fn a_live_takeover_is_rebuilt_in_turns_and_joined_while_it_runs() {
     "no materialization of the volume was begun while one ran"
   );
   assert!(
-    longest_step_ns < LIVENESS_BUDGET_NS,
-    "the successor's longest step {longest_step_ns} ns stayed under the watchdog's window {LIVENESS_BUDGET_NS} ns"
+    longest_steps_ns
+      .iter()
+      .all(|longest| *longest < LIVENESS_BUDGET_NS),
+    "the survivors' longest steps {longest_steps_ns:?} ns stayed under the watchdog's window {LIVENESS_BUDGET_NS} ns"
+  );
+  assert!(
+    failover.is_some_and(|report| report.volumes_timed >= 1),
+    "the successor's failover estimate timed the live volume it served: {failover:?}"
   );
 }
 

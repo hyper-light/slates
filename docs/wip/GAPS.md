@@ -456,10 +456,20 @@
 >   whole materialization in one owner-shard turn (0.73 to 2.84 s at 152 to 306 MB of sealed log on a Mac Studio), and
 >   each period's attempt, its 100 ms deadline outlasted, fetched and rebuilt the whole log again. The log is now rebuilt
 >   a payload a slice by a task of the owner shard, the archive, the restore and the making each a turn, and a later
->   attempt joins the task running (`a_live_takeover_is_rebuilt_in_turns_and_joined_while_it_runs`; the bug record of
->   2026-11-18, "a live takeover made its volume in one turn"). Still owed: the archive's layout and the restore in quantum
->   slices (each one turn, about 0.1 s at 300 MB), the first publication's whole entry (the item above), and a sealed
->   volume's restore.
+>   attempt joins the task running (`a_live_takeover_is_fetched_and_rebuilt_in_turns_and_joined_while_it_runs`; the bug
+>   record of 2026-11-18, "a live takeover made its volume in one turn"). **Its fetch closed the same day (A-386, g251):**
+>   the candidate's answer (every entry cloned, then copied into one growing answer) and the successor's decode (every
+>   payload copied out) were each one turn of a control shard, 406 MB of log beside a 557 ms poll in a nemesis run
+>   (seed 18189587465523915115); the answer is now laid out a copy slice a turn on a task of the serve loop and handed to
+>   the transport uncopied, and the successor reads the payloads in place as it applies them (the bug record of
+>   2026-11-18, "a takeover fetch copied the whole log in one turn"). Still owed: the archive's layout and the restore in
+>   quantum slices (each one turn, about 0.1 s at 300 MB), the first publication's whole entry (the item above), a
+>   sealed volume's restore, and the plain (unlogged) takeover's restore and population, still one owner-shard turn
+>   behind a call whose deadline is a period (g232's kernel base volume: 97,254 files, 1.99 GB, seconds of one poll).
+>   **The restore's steps exist (A-391, g251, 2026-11-18):** `slates_archive::Planning`, `Planned::restoring` and
+>   `Restoring` make a restore a piece at a time (no piece past one chunk's bytes but a merge onto a file's growing
+>   piece); the server still calls the one-call `restore` until the population in steps and the plain takeover path's
+>   owner-shard task follow (g251's next change).
 >   - **Measured (2026-11-18):** g251's trace of the nemesis spin kills found a taken-over volume's first publication
 >     (`fleet::published_before_served` -> `live_ship::published`, its whole entry) at 1.06 s in one turn; the
 >     measurer's 32-writer run (128 MiB, diag-measurer-7) lost a daemon to the watchdog in 3 of 8 runs at 1,000-1,002 ms
@@ -678,13 +688,16 @@
 >   DAX range table records each range answered, and a successor takes the objects back, ingests the guest's unsynced
 >   stores before it serves anything and answers the device with the same objects; a stream keeps its resync through
 >   its guest's maps. **Owed:** Windows on Shards' handle path, and a write log for a Windows stream, whose acknowledged
->   writes a death still loses whether or not it is resynced. Found with A-365 (Linux): A-197's writable copies are
->   taken back awake before the write log's replay, so a logged write a client's store followed can be written over
->   that store at a takeover (DAX objects are kept dormant through the replay for that reason); its tests write
->   through no other path before the client's store. Found beside it (Linux and macOS): a resynced stream whose dead daemon's
+>   writes a death still loses whether or not it is resynced. Found with A-365 (Linux), **fixed by A-389 (2026-11-18)**:
+>   A-197's writable copies were taken back awake before the write log's replay, so a logged write a client's store
+>   followed was written over that store, in the client's own map, at a takeover; they are kept dormant through the
+>   replay and woken after it, as A-365's DAX objects are (`crates/server/tests/held_copy_replay.rs`, Linux). Found
+>   beside it (Linux and macOS): a resynced stream whose dead daemon's
 >   log overflowed is not told which writes it lost (a FUSE mount is, `LostWrites`; counted,
->   `shards.resync_writes_unreported`); a stream's `FORGET`s are not logged, so a resynced stream keeps the references
->   a lost one gave back until it ends; and a stream's `close` publishes even when the log holds every write it
+>   `shards.resync_writes_unreported`); a stream's `FORGET`s were not logged, so a resynced stream kept the references
+>   a lost one gave back until it ended (**fixed by A-390, 2026-11-18**: logged as a mount's are, where the anchor holds
+>   the stream's resync end; `shards_resync_restart`'s nameless file stays let go across the death); and a stream's
+>   `close` publishes even when the log holds every write it
 >   acknowledged, where a mount's skips it (A-63's flush rule: a FUSE request that published took 105 us p50 against
 >   15 us for a read, 2026-10-06).
 >   Shards owes its device's half, after its v0.8.0 tag.
@@ -719,10 +732,10 @@
 > - **Built:** a local clone of an overlay (below, 2026-11-05's list); the configuration's moved-object exceptions
 >   (§4.8 "Authority scope"); and the planned move of a plain volume (A-291, §4.10's status): place, switch, adopt
 >   and release, the old owner keeping its copy until the new owner has sealed the volume under its own placement,
->   `slates move ID --to HOST` and `slates_api::Instance::move_volume` (contract 31), every refusal typed, a move back
+>   `slates move ID --to HOST` and `slates_api::Instance::move_volume` (contract 33), every refusal typed, a move back
 >   to the creator, a destroyed moved volume's exception dropped; held in process by three-daemon tests of the move,
 >   of the old owner dying at the switch and of the target dying at it (its successor serves, the frozen copy yields);
->   and `capture_base` (§4.15's status: `Instance::capture_base`, contract 32) with the move of a clone of a captured
+>   and `capture_base` (§4.15's status: `Instance::capture_base`, contract 34) with the move of a clone of a captured
 >   base, the form a kiln workspace takes (decided below), held by a three-daemon test that moves such a clone, serves it
 >   on its new owner and destroys the captured snapshot once the old owner let the clone go.
 > - **Owed, in order:** kiln's runners as members (certificates under kiln's CA as the manifest's enrollment root,
@@ -835,6 +848,12 @@
 >   an overlay's drift is built (`StatusReport::base`, `CONTRACT` = 8), and a presentation's conflicts are read typed
 >   from its entries;
 > - owed: a typed field on the wire for a merge's versions (the work's base beside the head);
+> - the async form (R6), first piece built (`CONTRACT` = 31): `AsyncInstance` over a host's `Reactor`, awaiting
+>   provisioning, a snapshot, a status and a destroy; handing it back stops its completion bridge, which took the
+>   synchronous form's wakes (`docs/bugs/2026-11-18-the-async-signal-took-the-synchronous-forms-wakes.md`); owed: the
+>   paged verbs, landings, merges, policies and observation, awaited the same way; and the Node SDK's `Client`, whose
+>   synchronous verbs park beside the bridge its `completionFd()` starts (the same stolen wake, on macOS and Windows;
+>   reported, not changed);
 > - a run of the Linux and Windows arms (mount, the CLI's Windows unmount): not compiled on the Mac that built piece 4.
 
 > **git, Mercurial and Subversion over the WinFsp drive (2026-11-17, Part 6 "Real workloads", §4.6; A-300; Ada's
@@ -1348,15 +1367,36 @@
 >   found every record numbered 0, the audit unbounded in memory and snapshots, and each shard keeping its own, a client
 >   reading its own shard's alone. Now numbered in `apply`, a derived window kept (`table_bytes / size_of::<AuditRecord>()`,
 >   the oldest dropped and counted; the operator horizon waits for a measured landing rate), the unwritten audit ring
->   removed, every record held by the control shard's partition, and the read paged. **Open:** a record made on another
->   shard reaches the control partition after its own atom commits, so a crash between the two loses that batch
+>   removed, every record held by the control shard's partition, and the read paged
 >   (`docs/bugs/2026-11-08-the-audit-numbered-nothing-and-kept-everything.md`).
+>   - **A record owed across shards survives a crash: fixed (2026-11-18, goal g247; AC-2.10).** A record made on
+>     another shard reached the control partition after its own atom committed, so a crash between the two lost that
+>     batch. It is now owed in its atom (the partition's outbox), sent from the oldest owed until the control shard's
+>     acknowledgement is recorded, sent again by the reap tick when it was not, and appended once however often it is
+>     sent (a per-partition mark the batch's own record moves). Anchor layout version 10. Tests:
+>     `crates/db/tests/audit.rs`, `crates/server/tests/audit_crossing.rs`
+>     (`docs/bugs/2026-11-18-an-audit-record-owed-across-shards-was-lost-to-a-crash.md`).
 > - **`grants`: paged, and the table holds live grants (A-266, 2026-11-08).** Refused between 25 and 50 grants; paging
 >   it found every grant kept for the daemon's life and none ended at its term. Now paged in grant-id order, a grant
 >   leaves the table at its terminal step (its history is the audit), the reap ends grants past their term, and a
->   target past what a grant's summary holds on one page (3,995 bytes) is refused before presenting. **Open:** an expiry
->   writes no audit record, so an expired grant's history is its `grant_issued` alone
+>   target past what a grant's summary holds on one page (3,995 bytes) is refused before presenting
 >   (`docs/bugs/2026-11-08-a-principals-grants-outgrew-one-reply-and-were-kept-for-good.md`).
+>   - **An expiry is audited, and a grant a landing found past its term ends too: fixed (2026-11-18, goal g247).** An
+>     expiry wrote no audit record, so an expired grant's history was its `grant_issued` alone; each is now recorded
+>     with a `grant_expired` record in one atom (`record_expiry`), sent to the control partition from another shard as
+>     the sweep's one batch. And a landing's check marked a grant past its term expired in its shard's table alone,
+>     which the sweep, taking issued grants, passed over: the grant was never recorded ended, stayed listed as issued
+>     and stayed in the table until a restart. The check now only reads. Tests:
+>     `every_grant_ended_at_its_term_leaves_its_expiry_in_the_audit` and
+>     `a_grant_a_landing_found_past_its_term_still_ends_and_is_audited` (`crates/server/tests/grants_pages.rs`),
+>     `a_grant_a_landing_found_past_its_term_is_still_due_for_the_sweep` (`crates/land/src/grant.rs`)
+>     (`docs/bugs/2026-11-18-a-grant-a-landing-found-past-its-term-was-never-ended.md`).
+>   - **A grant whose issue was refused covers nothing: fixed (sibling, 2026-11-18, goal g247).** `issue_grant` issues
+>     in the shard's table before the durable `GrantIssued`, and nothing took the grant back when that record or its
+>     atom's commit was refused: the approval was answered `Unpublished`, and a landing naming the id the refused issue
+>     took ran under it. A refused record now ends the grant there, and a rolled-back atom's grants leave the shard's
+>     table (`reconcile_unpublished_effects`, `Grants::retain`). Test: `a_grant_whose_issue_was_refused_covers_no_landing`
+>     (`crates/server/tests/grants_pages.rs`).
 > - **A status's drift: the first that fit, a count, and a paged read (A-267, 2026-11-08).** A status with 600 drifted
 >   entries was refused; it now carries what fits beside its other fields and `drifted_elided`, `Drifted` reads them all a
 >   page at a time, `slates status --drift` walks it, and both SDKs read it whole with `drifted(volume)`. Since
@@ -2796,6 +2836,9 @@
 >       now it marks the shard its region names and the doorbell thread kicks only the shards marked. Each shard's
 >       parks fell 59% and the shards' CPU 20 to 34% at 1,000 clients; the latencies moved with the box's load (14 to 52)
 >       more than with the change, so no latency is claimed for it (BENCHMARKS, 2026-11-18).
+>     - **Closed: an ask waiting out the batch before it (A-388, 2026-11-18).** One batch of asks was out to an owner at
+>       a time, and the wait for it was about half of an ask's way to the owner (p99 1.6 to 2.1 ms for submits and
+>       rebases at 50 ms); a shard now keeps two out.
 >     - **Open, the hops (by the trace):** an edit of a work off its client's shard crosses four thread hand-offs (the
 >       client's shard, the work's, the owner's, back), each waiting for its thread to run; and a first touch, a
 >       verdict, a rebase and a read of the green each queue on the owner's one thread.

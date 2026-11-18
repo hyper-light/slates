@@ -11333,8 +11333,15 @@ fn destroy(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> R
 /// so its destroy completes within the destroy slice budget the cooperative path uses; the loop is
 /// bounded by that volume's own extent. Returns how many volumes were released.
 pub(crate) fn reconcile_unpublished_effects(state: &mut ShardState) -> usize {
-  // The audit records the refused atom owed the control partition went with it (A-265).
-  state.landing.audit_owed.clear();
+  // The audit records the refused atom owed the control partition went with it: they are partition state (the outbox,
+  // A-265), rolled back with the rest.
+  // A grant the refused atom issued went with it (A-266): the shard's own table keeps what the durable one holds, so no
+  // landing runs under a grant whose issue was refused.
+  let partition = state.db.partition();
+  state
+    .landing
+    .grants
+    .retain(|id| partition.grant(id.0).is_some());
   let orphans: Vec<(DbVolumeId, Handle<VolumeSlot>)> = state
     .by_id
     .iter()
@@ -14583,9 +14590,10 @@ pub(crate) async fn rebuild_recovered(
   .await;
   rebuilt.blocks_swept = sweep_claims(state, claims);
   slices.unit_done().await;
-  // The objects the anchor held are taken back first, so every write the replay applies is written into them by the
-  // volume's write boundary: the writable direct maps' copies (A-197, Linux) and the Shards streams' DAX objects
-  // (A-365), in one ascending order of their backings' handles.
+  // The objects the anchor held are taken back first, at the handles their backings had and dormant through the
+  // replay, since each already holds every write the dead daemon made, in order with the stores made through it: the
+  // writable direct maps' copies (A-197, Linux) and the Shards streams' DAX objects (A-365), in one ascending order of
+  // their backings' handles (A-389).
   #[cfg(unix)]
   {
     rebuilt.copies_adopted = crate::shards::dax_hold::adopt_inherited(state);
@@ -14597,6 +14605,11 @@ pub(crate) async fn rebuild_recovered(
   {
     rebuilt.writes_replayed = replay_writes(state, slices).await;
   }
+  // The writable copies wake once the replay is done (A-389): every change reaches them again from here on, and what
+  // the replay wrote beneath one that it differs from is its client's later store, which the client's next sync writes
+  // back. The streams' DAX objects wake when their streams take them.
+  #[cfg(target_os = "linux")]
+  let _woken = crate::held_copy::wake_adopted(state);
   // Hand out prefixes past every recovered one, so a new volume never collides with a recovered
   // volume's inode numbers (the prefixes came from the images, not from `next_prefix`).
   state.next_prefix = max_prefix;
