@@ -8477,6 +8477,13 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > `a_poll_slower_than_the_budget_within_the_builds_spin_window_keeps_the_beat` (`crates/server/tests/liveness.rs`), and
 > the build-cost tests (`crates/machine/src/build_cost.rs`).
 
+> **Status (2026-11-18, A-356): the anchor's start judgment and a wait judged in a shard's own CPU are held to the build
+> too.** The anchor measures the build in its own process, the executable its daemon runs, and judges a start's busiest
+> thread against the spin window; an observation's or a cross-shard call's budget is the budget held to the build in
+> CPU, its windows at most the budget on the wall (`observe::held_to_this_build`). Regressions:
+> `a_starts_thread_is_judged_spinning_only_past_the_window_held_to_its_build`,
+> `a_shard_in_a_slower_build_is_given_its_budget_held_to_the_build`.
+
 > **Status (2026-11-18, A-336): a shard waiting on memory while the host reports a memory stall is starved, not
 > wedged.** A thread waiting on a page-in, a reclaim or a refault is neither running nor runnable, as a deadlocked one
 > is, so A-228's rule judged it wedged: a lone daemon at a few hundred megabytes free ended itself (exit 4, fleet test
@@ -24805,7 +24812,8 @@ Applied in the same change to: §4.14 `daemon.alive` (status), GAPS (2026-11-18 
   refused, and the budget stands. Measured once a process: the binary does not change while it runs.
 - **What it does not change.** The wedged and starved judgments (wall time, the budget), the anchor's lapse judgment,
   the beat, and a release build's window (its chain runs at machine code's speed, so the budget stands). Under Miri, which
-  runs no machine code and has no thread clock, the watchdog judges by the wall as before.
+  runs no machine code and has no thread clock, the watchdog judges by the wall as before. (A-356 holds the anchor's
+  judgment of a start's thread and the CPU budget of a wait judged in a shard's own time to the build too.)
 
 ### A-330 — A node announces its record plane where it advertises it, never at its bound port (2026-11-18, goal g229, the chaos flows' first runs; completes A-277)
 Applied in the same change to: §4.8 "Deployment" (what a node announces), §4.10's chaos status, GAPS ("Chaos from
@@ -25486,3 +25494,23 @@ holder's one refusal is the write that met the fence (kiln r2346, Mac Studio).
 Applied in the same change to: §4.10 (the chaos flows' status), GAPS (the nemesis entry), `crates/server/src/live_ship.rs`,
 `crates/server/tests/fleet.rs` and the bug record
 `docs/bugs/2026-11-18-a-superseded-owners-shipper-starved-its-own-takeover-round.md`.
+
+### A-356 — The anchor's judgment of a start's thread and a wait judged in a shard's own CPU are held to the build, as A-318 holds a poll (2026-11-18, goal g251: every open slates bug fixed; A-318's siblings)
+Applied in the same change to: §4.14 (A-318's note), GAPS (A-318's entry: its siblings closed),
+`crates/api/src/role/anchor.rs` (`start_spin_window_ns`, `judge_start_by`'s window, the anchor's start line),
+`crates/server/src/observe.rs` (`held_to_this_build`, `OwnTime::cpu_budget_ns`, `unspent_at`).
+- **Why.** A-318 held the daemon's watchdog to the build: a poll's CPU is judged against the liveness budget scaled by
+  how much slower the build runs compiled code than the machine runs the same work in machine code. Two judgments in
+  CPU time were left at the bare budget. The anchor kills a start whose busiest thread runs a window of CPU without a
+  beat (A-228, A-312), and a start's unit of work (a registration, a pair ring) runs its build's slowdown's worth of
+  CPU as a poll does. A wait judged in a shard's own time (an observation, a cross-shard call, A-65) ends once a busy
+  shard has run its budget of CPU without answering, and a shard busy with the same work runs that much more CPU in a
+  slower build. ThreadSanitizer's builds run 17.9 to 35.3 times machine code on CI's runners.
+- **The rule.** The anchor measures the build in its own process (`slates_machine::build_cost`, once, before any start
+  is judged) and judges a start's thread against the spin window (`watchdog::spin_window_ns`): the anchor runs the
+  executable it starts its daemon from (the roles' prefix, A-278), so its build is its daemon's. A wait judged in a
+  shard's own time gives the shard the budget held to the build in CPU; each of its windows stays at most the budget on
+  the wall, so a shard that stops is judged within a budget of stopping, as before.
+- **What it does not change.** A release build (its chain runs at machine code's speed), the wedged and starved
+  judgments on the wall, the anchor's lapse bound and the beat.
+

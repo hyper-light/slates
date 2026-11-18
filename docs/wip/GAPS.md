@@ -1915,11 +1915,16 @@
 > CI's runners (spin windows of 18 to 35 s), and the lane passed with no spinning verdict, six runs of six
 > (diag-g251-tsan); an unoptimized build 3.5 times (a Mac Studio), a release build 1.0. Regressions: `a_poll_is_judged_spinning_only_past_the_window_held_to_its_build`
 > (red with the budget put back as the spin window), `a_poll_slower_than_the_budget_within_the_builds_spin_window_keeps_the_beat`
-> (`crates/server/tests/liveness.rs`). **Siblings, open:** the anchor's start judgment holds a starting daemon's busiest
-> thread to a window of CPU too (`crates/api/src/role/anchor.rs`, `process_clock`), and an observation's budget is counted
-> in the observed shard's CPU (`crate::observe::ShardTime`); neither is held to the build yet, and neither has been seen
-> to fail under ThreadSanitizer. The release-build spinning kills of the A-228 entry ("A kill the rule does not touch")
-> are untouched: a release build's window is the budget.
+> (`crates/server/tests/liveness.rs`). **Its siblings, closed 2026-11-18 (A-356, g251):** the anchor's start judgment
+> held a starting daemon's busiest thread to the bare budget of CPU (`crates/api/src/role/anchor.rs`), and an
+> observation's or a cross-shard wait's budget is counted in the observed shard's CPU (`crate::observe::ShardTime`);
+> neither was held to the build, and neither had been seen to fail under ThreadSanitizer. Now the anchor measures the
+> build in its own process, which runs the executable its daemon runs, and judges a start's thread against the spin
+> window; a wait gives its shard the budget held to the build in CPU, its windows still at most the budget on the wall,
+> so a shard that stops is judged as soon as before. Red with the bare budget put back, each at its own assertion
+> (`a_starts_thread_is_judged_spinning_only_past_the_window_held_to_its_build`,
+> `a_shard_in_a_slower_build_is_given_its_budget_held_to_the_build`). The release-build spinning kills of the A-228 entry
+> ("A kill the rule does not touch") are untouched: a release build's window is the budget.
 
 > **A Windows UDP socket died on an earlier send's ICMP error (found 2026-11-06, fixed 2026-11-06).** With Windows'
 > default `SIO_UDP_CONNRESET`, a port-unreachable for a datagram sent earlier failed the socket's next `recvfrom` with
