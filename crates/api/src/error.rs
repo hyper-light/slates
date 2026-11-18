@@ -1,9 +1,10 @@
 //! The library's closed refusal taxonomy (§4.4's refusals as the daemon sends them, the channel's own, and this crate's:
-//! a mount the OS refused, an issuer authority this process does not hold, a path the wire cannot carry). Every
-//! failure of every verb is one of these variants; none is a panic and none is prose alone (CLAUDE.md §3 "Errors, not
-//! panics"). A host decides on the variant: [`Error::Refused`] is the daemon's typed answer (retry, re-plan, or show
-//! it), [`Error::Unavailable`] means no daemon answers at the instance (start one, or report it), and the rest name
-//! what failed in this process.
+//! a mount the OS refused, an issuer authority this process does not hold, a path the wire cannot carry, an instance
+//! that did not start). Every failure of every verb is one of these variants; none is a panic and none is prose alone
+//! (CLAUDE.md §3 "Errors, not panics"). A host decides on the variant: [`Error::Refused`] is the daemon's typed answer
+//! (retry, re-plan, or show it), [`Error::Unavailable`] means no daemon answers at the instance (start one, or report
+//! it), and the rest name what failed in this process. The enums grow as the crate does (`#[non_exhaustive]`), so a
+//! host matches them with a wildcard arm.
 
 use std::fmt;
 
@@ -13,6 +14,7 @@ use slates_ipc::protocol::Refusal;
 /// A typed failure of one of this crate's verbs. (`Eq` is not derived: a daemon [`Refusal`] may carry measured
 /// probabilities.)
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum Error {
   /// The daemon refused the verb (§4.4's taxonomy, each refusal counted by the daemon).
   Refused(Refusal),
@@ -38,6 +40,8 @@ pub enum Error {
     /// What is wrong with it.
     fault: PathFault,
   },
+  /// An instance could not be started, or its anchor stopped ([`crate::start`]).
+  Start(StartFault),
 }
 
 impl Error {
@@ -83,6 +87,7 @@ impl fmt::Display for Error {
       Self::Mount(fault) => write!(f, "{fault}"),
       Self::Issuer(fault) => write!(f, "{fault}"),
       Self::Path { path, fault } => write!(f, "{path}: {fault}"),
+      Self::Start(fault) => write!(f, "{fault}"),
     }
   }
 }
@@ -91,6 +96,7 @@ impl std::error::Error for Error {}
 
 /// What is wrong with a path a verb takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PathFault {
   /// It is relative: the daemon would resolve it against its own working directory, not the caller's.
   NotAbsolute,
@@ -112,6 +118,7 @@ impl fmt::Display for PathFault {
 /// Why a host mount could not be made or removed (§4.6). An OS refusal carries its error number, never a message
 /// alone, so a host decides on it.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum MountFault {
   /// The mount point could not be resolved to the real path the kernel records (it does not exist, or is not
   /// reachable); the error number.
@@ -231,6 +238,7 @@ impl fmt::Display for MountFault {
 /// Why this process cannot issue a grant (§4.13 "Grants"): the authority is the anchor's segment, which only the
 /// anchor's own tree and, on macOS and Windows, a process given its name hold.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum IssuerFault {
   /// No anchor handoff is in this process's environment (or in the pairs given): the process was not started from
   /// the anchor's session, and the MCP server and the SDKs never are.
@@ -266,5 +274,63 @@ fn errno_text(errno: Option<i32>) -> String {
   match errno {
     Some(errno) => std::io::Error::from_raw_os_error(errno).to_string(),
     None => "the OS gave no error number".to_owned(),
+  }
+}
+
+/// Why an instance did not start, or its anchor could not be stopped ([`crate::start`]). An OS refusal carries its error
+/// number, never a message alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StartFault {
+  /// The instance already answers: another anchor runs it. Attach to it ([`crate::Instance::attach`]) instead.
+  AlreadyRunning {
+    /// The instance.
+    instance: String,
+  },
+  /// The anchor's program could not be started (missing, or not executable).
+  Spawn {
+    /// The program.
+    program: String,
+    /// The OS error number, when the OS gave one.
+    errno: Option<i32>,
+  },
+  /// The anchor ended before the instance answered. Its log lines on standard error say why: a second anchor of a
+  /// live instance is refused, as is a profile the machine could not measure, or a host whose `main` did not hand its
+  /// prefix's arguments to [`crate::role::main`].
+  AnchorExited {
+    /// Its exit code (`None` when a signal ended it).
+    code: Option<i32>,
+  },
+  /// Asking whether the anchor still runs, or waiting for it to exit, failed.
+  Wait {
+    /// The OS error number, when the OS gave one.
+    errno: Option<i32>,
+  },
+  /// The anchor could not be asked to stop.
+  Stop {
+    /// The OS error number, when the OS gave one.
+    errno: Option<i32>,
+  },
+}
+
+impl fmt::Display for StartFault {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::AlreadyRunning { instance } => {
+        write!(f, "the instance {instance} already runs; attach to it")
+      }
+      Self::Spawn { program, errno } => {
+        write!(f, "starting the anchor {program}: {}", errno_text(*errno))
+      }
+      Self::AnchorExited { code: Some(code) } => write!(
+        f,
+        "the anchor exited (code {code}) before the instance answered; its log lines say why"
+      ),
+      Self::AnchorExited { code: None } => f.write_str(
+        "the anchor was ended by a signal before the instance answered; its log lines say why",
+      ),
+      Self::Wait { errno } => write!(f, "waiting on the anchor: {}", errno_text(*errno)),
+      Self::Stop { errno } => write!(f, "stopping the anchor: {}", errno_text(*errno)),
+    }
   }
 }

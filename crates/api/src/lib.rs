@@ -12,6 +12,11 @@
 //! one `--exclude` a landing). Those pieces live here now and the CLI calls them, so there is one mount and one issuer,
 //! not a copy per front end (CLAUDE.md §2 item 7).
 //!
+//! **Starting an instance with no slates binary** ([`start`], [`role`]). A host starts its instance from its own
+//! executable: [`Instance::start`] runs `HOST_EXE PREFIX... --instance NAME anchor`, and the host's `main` hands the
+//! arguments after its `PREFIX` to [`role::main`], which serves the anchor and daemon roles the `slates` binary serves
+//! (they live here, and the binary calls them too). The anchor starts its daemon from the same executable and prefix.
+//!
 //! **What a host holds.**
 //! - An [`Instance`]: a client of one running instance (the rendezvous, §4.7), and every verb this crate offers. Its
 //!   calls are the client's synchronous round trips, which spin and then park on the daemon's wake word (§4.7 "Wake
@@ -29,9 +34,8 @@
 //! field or a variant is added, never changed or removed, so a host reads them and matches their enums with a
 //! wildcard arm.
 //!
-//! **What is owed** (GAPS, the A-278 row): starting an instance from a host's own executable, with the issuer handed
-//! to its starter; an async form over a host's reactor (R6); a seam trait with a simulator and a conformance suite
-//! for hosts whose rules ask for one (Hex's §9, kiln's `kiln-seams`).
+//! **What is owed** (GAPS, the A-278 row): an async form over a host's reactor (R6); a seam trait with a simulator and
+//! a conformance suite for hosts whose rules ask for one (Hex's §9, kiln's `kiln-seams`).
 
 // The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds are exempt.
 // The panic rule: a print macro panics on a refused write, and a library prints nothing: every outcome is returned.
@@ -43,12 +47,19 @@ pub mod grant;
 pub mod instance;
 pub mod issuer;
 pub mod mount;
+pub mod role;
+pub mod start;
 
-pub use error::{Error, IssuerFault, MountFault, PathFault};
+pub use error::{Error, IssuerFault, MountFault, PathFault, StartFault};
 pub use grant::{GrantAuthority, GrantClaim, GrantProof};
 pub use instance::{Approved, Instance, LandingPlan, LandingRequest, Planned};
 pub use issuer::{GRANT_TERM_NS, Issuer};
 pub use mount::{MountOptions, Mounted};
+pub use start::{Anchor, StartSpec, Started};
+
+/// The crate's version: the workspace's one hand-edited version (§4.12 "One version"), which a host reports beside its
+/// own.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The typed client and its own types, for the verbs [`Instance::client`] lends.
 pub use slates_client::{
@@ -56,9 +67,10 @@ pub use slates_client::{
 };
 /// The wire's types this crate's verbs take and return (§4.9; append-only, D-15).
 pub use slates_ipc::protocol::{
-  AuditEntry, ConflictClass, DaemonReport, Filter, GrantScope, GrantSummary, Intent,
-  LandingOutcome, LandingSummary, NamePolicy, PlannedAction, PlannedContent, PlannedEntry, Refusal,
-  SizeClass, SnapshotId, StatusReport, TelemetryReport, VolumeId, VolumeSummary,
+  ActionCount, AuditEntry, ConflictClass, DaemonReport, Filter, GrantScope, GrantSummary, Intent,
+  LandingDegradation, LandingDurability, LandingOutcome, LandingSummary, NamePolicy, PlannedAction,
+  PlannedContent, PlannedEntry, Refusal, SizeClass, SnapshotId, StatusReport, TelemetryReport,
+  VolumeId, VolumeSummary,
 };
 
 /// The client's deadlines as the product derives them (§4.7 "Failure matrix"; `Deadlines::derive`): a reply is waited
