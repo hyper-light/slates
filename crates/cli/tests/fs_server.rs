@@ -47,11 +47,38 @@ fn slates() -> Command {
   Command::new(env!("CARGO_BIN_EXE_slates"))
 }
 
+/// Format: an instance served inside a container, as the container lane names it to [`run`]: this prefix, then
+/// `CONTAINER/INSTANCE`. Every verb of this file reaches it through `docker exec` as the test's own user, so one flow
+/// drives a server node on the host or in its own container unchanged.
+const IN_CONTAINER: &str = "docker-exec:";
+
+/// The command that runs `slates` for `instance`, and the instance's own name: the binary on the host, or `docker exec`
+/// into the container an [`IN_CONTAINER`] name names.
+fn slates_for(instance: &str) -> (Command, String) {
+  match instance
+    .strip_prefix(IN_CONTAINER)
+    .and_then(|rest| rest.split_once('/'))
+  {
+    Some((container, name)) => {
+      let user = format!(
+        "{}:{}",
+        rustix::process::getuid().as_raw(),
+        rustix::process::getgid().as_raw()
+      );
+      let mut command = Command::new("docker");
+      command.args(["exec", "-i", "--user", &user, container, "slates"]);
+      (command, name.to_owned())
+    }
+    None => (slates(), instance.to_owned()),
+  }
+}
+
 /// Runs a verb at `instance`; (exit code, stdout, stderr).
 fn run(instance: &str, args: &[&str]) -> (i32, String, String) {
-  let output = slates()
+  let (mut command, name) = slates_for(instance);
+  let output = command
     .arg("--instance")
-    .arg(instance)
+    .arg(name)
     .args(args)
     .output()
     .unwrap();
@@ -165,15 +192,24 @@ fn mint_identity(dir: &str, node: &str) {
 }
 
 /// The manifest: every node on loopback at its held base, at `f = 0`.
-#[allow(clippy::disallowed_methods)]
 fn write_manifest(dir: &str, nodes: &[&str], bases: &[u16]) -> String {
-  let nodes: Vec<serde_json::Value> = nodes
+  let addressed: Vec<(&str, String)> = nodes
     .iter()
     .zip(bases)
-    .map(|(node, base)| {
+    .map(|(node, base)| (*node, format!("127.0.0.1:{base}")))
+    .collect();
+  write_manifest_at(dir, &addressed)
+}
+
+/// The manifest with each node at the address given (`IP:PORT`, the probe port; records on the next), at `f = 0`.
+#[allow(clippy::disallowed_methods)]
+fn write_manifest_at(dir: &str, nodes: &[(&str, String)]) -> String {
+  let nodes: Vec<serde_json::Value> = nodes
+    .iter()
+    .map(|(node, address)| {
       serde_json::json!({
         "node": node,
-        "address": format!("127.0.0.1:{base}"),
+        "address": address,
         "certificate": format!("{node}.crt.der"),
         "key": format!("{node}.key.der"),
       })
@@ -192,13 +228,18 @@ struct HeldBlock {
 }
 
 fn free_port_block(from: u16) -> HeldBlock {
+  free_port_block_on(std::net::Ipv4Addr::LOCALHOST, from)
+}
+
+/// [`free_port_block`] on the host address `ip` (the container lane's bridge, where its containers reach the host).
+fn free_port_block_on(ip: std::net::Ipv4Addr, from: u16) -> HeldBlock {
   let mut base = from;
   for _ in 0..PORT_ATTEMPTS {
     let sockets: Option<Vec<std::net::UdpSocket>> = (0..PORTS_PER_NODE)
       .map(|k| {
         base
           .checked_add(k)
-          .and_then(|port| std::net::UdpSocket::bind(("127.0.0.1", port)).ok())
+          .and_then(|port| std::net::UdpSocket::bind((ip, port)).ok())
       })
       .collect();
     if let Some(sockets) = sockets {
@@ -206,7 +247,7 @@ fn free_port_block(from: u16) -> HeldBlock {
     }
     base = base.checked_add(PORTS_PER_NODE).unwrap_or(PORT_FLOOR);
   }
-  panic!("no block of free loopback UDP ports found from {from}");
+  panic!("no block of free UDP ports found on {ip} from {from}");
 }
 
 /// A duplicate of `socket` a spawned child inherits.
@@ -344,12 +385,17 @@ fn two_node_fleet(tag: &str) -> (Scratch, [String; 2], Vec<Daemon>) {
 /// The server's overlay of `project`, pinned and snapshotted, and a green over the snapshot: (volume, snapshot,
 /// green).
 fn server_green(server: &str, project: &str) -> (String, String, String) {
+  server_green_named(server, project, "project")
+}
+
+/// [`server_green`] with the overlay named `name` and the green `NAME-green`, for a server holding several projects.
+fn server_green_named(server: &str, project: &str, name: &str) -> (String, String, String) {
   let volume = id_of(&ok(
     server,
     &[
       "volume",
       "create",
-      "project",
+      name,
       "--dynamic",
       "64MiB",
       "--base",
@@ -361,11 +407,12 @@ fn server_green(server: &str, project: &str) -> (String, String, String) {
   let snapshot: serde_json::Value =
     serde_json::from_str(&ok(server, &["volume", "snapshot", &volume, "--json"])).unwrap();
   let snapshot = snapshot["snapshot"].to_string();
+  let green_name = format!("{name}-green");
   let green = id_of(&ok(
     server,
     &[
       "green",
-      "project-green",
+      &green_name,
       "--base",
       &volume,
       "--snapshot",
@@ -517,8 +564,18 @@ fn the_server_checks_out(server: &str, green: &str, (volume, snapshot): (&str, &
 /// `slates land VOLUME PROJECT` on the server under a policy that asks: the presentation, 1 create and 3 replaces with
 /// no conflict, and the project still as it was seeded. Its JSON reply.
 fn the_landing_asks(server: &str, volume: &str, project: &str) -> serde_json::Value {
+  the_landing_asks_at(server, volume, (project, project))
+}
+
+/// [`the_landing_asks`] for a project the server names `target` and this host reads at `on_host`: they differ when the
+/// server runs in a container and the project is a volume attached to it.
+fn the_landing_asks_at(
+  server: &str,
+  volume: &str,
+  (target, on_host): (&str, &str),
+) -> serde_json::Value {
   let presented: serde_json::Value =
-    serde_json::from_str(&ok(server, &["land", volume, project, "--json"])).unwrap();
+    serde_json::from_str(&ok(server, &["land", volume, target, "--json"])).unwrap();
   assert_eq!(presented["grant_required"], true, "{presented}");
   assert_eq!(presented["conflicts"], serde_json::json!([]));
   assert_eq!(
@@ -526,7 +583,7 @@ fn the_landing_asks(server: &str, volume: &str, project: &str) -> serde_json::Va
     serde_json::json!([{"action": "create", "count": 1}, {"action": "replace", "count": 3}])
   );
   assert_eq!(
-    project_files(project),
+    project_files(on_host),
     seeded_files(),
     "nothing lands before an approval"
   );
@@ -1350,3 +1407,509 @@ fn detector_lines(instance: &str) -> String {
 /// Derived: how long the retired test holds a live host's attachment before the kill: two and a half liveness budgets
 /// (1 s each, `LIVENESS_BUDGET_NS`), so the owner's departure look (one a budget) runs at least twice meanwhile.
 const LIVE_HOLD: Duration = Duration::from_millis(2_500);
+
+/// The server in its own container (fs-server plan step 2; R8, A-285, A-299): the server node is `slates anchor` in a
+/// Linux container on a Docker network of its own, started with its launcher's secret on standard input, its projects a
+/// volume attached to the container; the client node runs on the host and reaches it over the network's bridge. The
+/// client pushes into the server's greens, the server checks the heads out, and each merge lands into the attached
+/// volume under the launcher's write policy: one project under ask (the approval request first, then the launcher's
+/// approval of exactly that manifest), the other under bypass (written in the one `slates land`). The host then reads
+/// every merged byte from its side of the attached volume. The launcher is this test binary, re-invoked inside the
+/// server's container as a role, since a launcher reaches its instance only where the instance runs. Linux only:
+/// Docker Desktop's containers are not reachable by address from the host. Gated (`SLATES_TEST_CLI=1` and
+/// `SLATES_TEST_CONTAINER=1`, a reachable Docker), skipping loudly.
+#[cfg(target_os = "linux")]
+mod in_a_container {
+  use super::*;
+  use std::io::{Read, Write};
+
+  /// Format: the image the server node runs in: the release GitHub's `ubuntu-latest` runs, so the binaries built
+  /// beside it (this test binary and `slates`) run in it unchanged, with no library of their own.
+  const SERVER_IMAGE: &str = "ubuntu:24.04";
+  /// Format: the environment variable that turns the re-invoked test binary into the launcher's role, with its value
+  /// the role (`ask`, `bypass`, `approve`). The other `ROLE_*` variables give its instance, volume and target.
+  const ROLE: &str = "SLATES_FS_CONTAINER_ROLE";
+  /// Format: the role's instance (its name inside the container).
+  const ROLE_INSTANCE: &str = "SLATES_FS_CONTAINER_ROLE_INSTANCE";
+  /// Format: the role's volume (32 hexadecimal characters).
+  const ROLE_VOLUME: &str = "SLATES_FS_CONTAINER_ROLE_VOLUME";
+  /// Format: the role's landing target, as the server names it.
+  const ROLE_TARGET: &str = "SLATES_FS_CONTAINER_ROLE_TARGET";
+  /// Format: the tag of the one line the role reports on, found anywhere in a line (libtest's own `test NAME ... `
+  /// comes first on the same line).
+  const ROLE_TAG: &str = "FS-CONTAINER-ROLE:";
+  /// Shape: the projects' directory as the server names it inside its container.
+  const PROJECTS_IN_CONTAINER: &str = "/projects";
+  /// Shape: the server node's probe port inside its container (records on the next); its network namespace is its
+  /// own, so no other process can hold it.
+  const SERVER_PORT: u16 = 7_000;
+  /// Shape: the last octet of the server container's address on its network.
+  const SERVER_HOST_OCTET: u8 = 10;
+  /// Shape: the network's /24 is `172.31.N.0`, N searched from a pid-derived start, so concurrent runs pick apart and a
+  /// network another run holds is skipped.
+  const NETWORK_OCTETS: u8 = 200;
+  /// Shape: how long one `docker` command may take on a loaded runner before it is called hung (an image pull included).
+  const DOCKER_WAIT: Duration = Duration::from_secs(300);
+
+  /// Whether this run may use the container lane; the loud skip otherwise.
+  fn gate() -> bool {
+    if std::env::var_os("SLATES_TEST_CLI").is_none()
+      || std::env::var_os("SLATES_TEST_CONTAINER").is_none()
+    {
+      eprintln!(
+        "skipping the container lane: set SLATES_TEST_CLI=1 and SLATES_TEST_CONTAINER=1 to run it (a real container)"
+      );
+      return false;
+    }
+    match Command::new("docker")
+      .args(["info", "--format", "{{.ServerVersion}}"])
+      .output()
+    {
+      Ok(output) if output.status.success() => true,
+      Ok(output) => {
+        eprintln!(
+          "skipping the container lane: docker info failed: {}",
+          String::from_utf8_lossy(&output.stderr).trim()
+        );
+        false
+      }
+      Err(error) => {
+        eprintln!("skipping the container lane: no docker: {error}");
+        false
+      }
+    }
+  }
+
+  /// Runs `docker ARGS` to its end, bounded by [`DOCKER_WAIT`]; (exit code, stdout, stderr).
+  fn docker(args: &[&str]) -> (i32, String, String) {
+    let mut child = Command::new("docker")
+      .args(args)
+      .stdout(Stdio::piped())
+      .stderr(Stdio::piped())
+      .spawn()
+      .unwrap();
+    let deadline = Instant::now() + DOCKER_WAIT;
+    while child.try_wait().unwrap().is_none() {
+      assert!(Instant::now() < deadline, "docker {args:?} hung");
+      pause();
+    }
+    let output = child.wait_with_output().unwrap();
+    (
+      output.status.code().unwrap_or(-1),
+      String::from_utf8_lossy(&output.stdout).into_owned(),
+      String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+  }
+
+  /// A Docker network of the test's own, removed when dropped (after the containers on it, which are dropped first).
+  struct Network {
+    name: String,
+    /// The network's first three octets.
+    prefix: [u8; 3],
+  }
+
+  impl Network {
+    /// The host's address on the network's bridge: its gateway.
+    fn gateway(&self) -> std::net::Ipv4Addr {
+      let [a, b, c] = self.prefix;
+      std::net::Ipv4Addr::new(a, b, c, 1)
+    }
+
+    /// The server container's address.
+    fn server(&self) -> std::net::Ipv4Addr {
+      let [a, b, c] = self.prefix;
+      std::net::Ipv4Addr::new(a, b, c, SERVER_HOST_OCTET)
+    }
+  }
+
+  impl Drop for Network {
+    fn drop(&mut self) {
+      let _ = Command::new("docker")
+        .args(["network", "rm", &self.name])
+        .output();
+    }
+  }
+
+  /// A network of the test's own on a free /24.
+  fn network(tag: &str) -> Network {
+    let name = format!("slates-fs-{tag}-{}", std::process::id());
+    let start = u8::try_from(std::process::id() % u32::from(NETWORK_OCTETS)).unwrap();
+    for step in 0..NETWORK_OCTETS {
+      let third = start.wrapping_add(step) % NETWORK_OCTETS;
+      let prefix = [172, 31, third];
+      let subnet = format!("172.31.{third}.0/24");
+      let gateway = format!("172.31.{third}.1");
+      let (code, _, _) = docker(&[
+        "network",
+        "create",
+        "--subnet",
+        &subnet,
+        "--gateway",
+        &gateway,
+        &name,
+      ]);
+      if code == 0 {
+        return Network { name, prefix };
+      }
+    }
+    panic!("no free /24 for the container lane's network");
+  }
+
+  /// The server node's container, stopped and removed when dropped.
+  struct ServerContainer {
+    name: String,
+    /// The `docker run` the anchor runs under (attached, for its standard input).
+    child: Child,
+  }
+
+  impl Drop for ServerContainer {
+    fn drop(&mut self) {
+      let _ = Command::new("docker")
+        .args(["rm", "-f", &self.name])
+        .output();
+      let _ = self.child.kill();
+      let _ = self.child.wait();
+    }
+  }
+
+  /// The test's user as Docker takes it (`UID:GID`), so the server writes the attached volume as the host's own user.
+  fn user() -> String {
+    format!(
+      "{}:{}",
+      rustix::process::getuid().as_raw(),
+      rustix::process::getgid().as_raw()
+    )
+  }
+
+  /// Docker's `--mount` form of a bind (never `-v`, which makes a missing source on the host).
+  fn bind(source: &str, destination: &str, read_only: bool) -> String {
+    let mut bind = format!("type=bind,source={source},destination={destination}");
+    if read_only {
+      bind.push_str(",readonly");
+    }
+    bind
+  }
+
+  /// Starts the server node as `slates anchor --fleet /fleet/fleet.json --node server` in its container, on `network`
+  /// at its server address, with `launcher`'s secret on the anchor's standard input: the command `slates-api` builds
+  /// for a host (`StartSpec::anchor_command`), here with `docker run` as the program, so the secret's record and the
+  /// marker variable reach the anchor inside.
+  fn start_server(
+    (name, instance): (&str, &str),
+    network: &Network,
+    (fleet_dir, projects): (&str, &str),
+    launcher: &slates_api::LauncherSecret,
+  ) -> ServerContainer {
+    let test_binary = std::env::current_exe().unwrap();
+    let test_binary = test_binary.to_string_lossy().into_owned();
+    let address = network.server().to_string();
+    let marker = format!(
+      "{}={}",
+      slates_api::launcher::ENV_LAUNCHER,
+      slates_api::launcher::LAUNCHER_ON_STDIN
+    );
+    let prefix = [
+      "run",
+      "-i",
+      "--rm",
+      "--name",
+      name,
+      "--network",
+      &network.name,
+      "--ip",
+      &address,
+      "--user",
+      &user(),
+      "--mount",
+      &bind(env!("CARGO_BIN_EXE_slates"), "/usr/local/bin/slates", true),
+      "--mount",
+      &bind(&test_binary, "/usr/local/bin/fs-server-role", true),
+      "--mount",
+      &bind(fleet_dir, "/fleet", true),
+      "--mount",
+      &bind(projects, PROJECTS_IN_CONTAINER, false),
+      "-e",
+      &marker,
+      SERVER_IMAGE,
+      "slates",
+    ];
+    let mut spec =
+      slates_api::StartSpec::new(instance, std::path::PathBuf::from("docker"), &prefix);
+    spec.quick = true;
+    spec.shards = Some(SHARDS.parse().unwrap());
+    spec.fleet = Some(slates_api::role::FleetSelection {
+      manifest: "/fleet/fleet.json".to_owned(),
+      node: "server".to_owned(),
+    });
+    let child = spec
+      .with_launcher(launcher.clone())
+      .anchor_command()
+      .unwrap()
+      .stdout(Stdio::null())
+      .stderr(Stdio::inherit())
+      .spawn()
+      .unwrap();
+    ServerContainer {
+      name: name.to_owned(),
+      child,
+    }
+  }
+
+  /// Runs the launcher's role `role` in the server's container: this test binary re-invoked there, its instance,
+  /// volume and target in its environment and the launcher's secret on its standard input (never an argument or the
+  /// environment). The role's tagged line.
+  fn launcher_role(
+    container: &str,
+    role: &str,
+    (instance, volume, target): (&str, &str, &str),
+    launcher: &slates_api::LauncherSecret,
+  ) -> String {
+    let variables = [
+      format!("{ROLE}={role}"),
+      format!("{ROLE_INSTANCE}={instance}"),
+      format!("{ROLE_VOLUME}={volume}"),
+      format!("{ROLE_TARGET}={target}"),
+    ];
+    let mut command = Command::new("docker");
+    command.args(["exec", "-i", "--user", &user()]);
+    for variable in &variables {
+      command.args(["-e", variable]);
+    }
+    command.args([
+      container,
+      "/usr/local/bin/fs-server-role",
+      "--exact",
+      "in_a_container::launcher_role_in_the_servers_container",
+      "--nocapture",
+      "--test-threads",
+      "1",
+    ]);
+    let mut child = command
+      .stdin(Stdio::piped())
+      .stdout(Stdio::piped())
+      .stderr(Stdio::piped())
+      .spawn()
+      .unwrap();
+    let secret: String = launcher
+      .bytes()
+      .iter()
+      .map(|byte| format!("{byte:02x}"))
+      .collect();
+    child
+      .stdin
+      .take()
+      .unwrap()
+      .write_all(secret.as_bytes())
+      .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let out = String::from_utf8_lossy(&output.stdout).into_owned();
+    let err = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+      output.status.success(),
+      "the launcher's {role} role failed: {out}{err}"
+    );
+    out
+      .lines()
+      .find_map(|line| {
+        line
+          .split_once(ROLE_TAG)
+          .map(|(_, said)| said.trim().to_owned())
+      })
+      .unwrap_or_else(|| panic!("the launcher's {role} role reported nothing: {out}{err}"))
+  }
+
+  /// Not a test of its own: the launcher's role inside the server's container, run when [`ROLE`] names it (the
+  /// container lane re-invokes this binary there); otherwise it returns at once.
+  #[test]
+  fn launcher_role_in_the_servers_container() {
+    let Ok(role) = std::env::var(ROLE) else {
+      return;
+    };
+    let instance = std::env::var(ROLE_INSTANCE).unwrap();
+    let volume = std::env::var(ROLE_VOLUME).unwrap();
+    let target = std::env::var(ROLE_TARGET).unwrap();
+    let mut hex = String::new();
+    std::io::stdin().read_to_string(&mut hex).unwrap();
+    let mut bytes = [0u8; slates_api::launcher::LAUNCHER_SECRET_BYTES];
+    for (byte, pair) in bytes.iter_mut().zip(hex.trim().as_bytes().chunks(2)) {
+      *byte = u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap();
+    }
+    let secret = slates_api::LauncherSecret::from_bytes(bytes).unwrap();
+    let launcher = slates_api::Issuer::from_launcher_secret(&secret);
+    match role.as_str() {
+      "ask" => {
+        launcher_sets_land_mode(&instance, &launcher, &volume, slates_api::WriteMode::Ask);
+        println!("{ROLE_TAG} ask set");
+      }
+      "bypass" => {
+        launcher_sets_land_mode(&instance, &launcher, &volume, slates_api::WriteMode::Bypass);
+        println!("{ROLE_TAG} bypass set");
+      }
+      "approve" => {
+        let mut approver = slates_api::Instance::attach(&instance).unwrap();
+        let request = slates_api::LandingRequest {
+          volume: volume_id(&volume),
+          snapshot: None,
+          target,
+          filter: slates_api::Filter::default(),
+        };
+        let approval = match approver.plan_landing(&request).unwrap() {
+          slates_api::LandOutcome::ApprovalRequired(approval) => approval,
+          other => panic!("an ask landing is an approval request: {other:?}"),
+        };
+        match approver.approve_landing(&approval, &launcher).unwrap() {
+          slates_api::LandOutcome::Written(report) => {
+            println!(
+              "{ROLE_TAG} written={} failed={}",
+              report.written, report.failed
+            );
+          }
+          other => panic!("the approved landing is written: {other:?}"),
+        }
+      }
+      other => panic!("no launcher role {other:?}"),
+    }
+  }
+
+  /// The two nodes up: the server in its container on its own network, the client on the host at the network's
+  /// gateway, from one manifest; the root group bootstrapped at the server.
+  struct Lane {
+    /// The client node's process; dropped first.
+    _client: Daemon,
+    /// The server node's container; dropped before the network it is on.
+    server: ServerContainer,
+    /// The network; dropped after the container.
+    _network: Network,
+    /// The scratch directory: the manifest, the identities and the projects; dropped last.
+    scratch: Scratch,
+    /// The server's instance as this file's verbs name it ([`IN_CONTAINER`]).
+    server_at: String,
+    /// The server's instance inside its container.
+    server_instance: String,
+    /// The client's instance.
+    client: String,
+    /// The server launcher's secret.
+    launcher: slates_api::LauncherSecret,
+  }
+
+  fn lane(tag: &str) -> Lane {
+    let scratch = scratch(&format!("fs-server-container-{tag}"));
+    let fleet_dir = format!("{}/fleet", scratch.path);
+    let projects = format!("{}/projects", scratch.path);
+    make_dirs(&[&fleet_dir, &projects]);
+    let (code, _, err) = docker(&["pull", "--quiet", SERVER_IMAGE]);
+    assert_eq!(code, 0, "docker pull {SERVER_IMAGE}: {err}");
+    for node in NODES {
+      mint_identity(&fleet_dir, node);
+    }
+    let network = network(tag);
+    let offset = std::process::id() % u32::from(PORT_SPAN);
+    let from = u16::try_from(u32::from(PORT_FLOOR) + offset).unwrap();
+    let held = free_port_block_on(network.gateway(), from);
+    let manifest = write_manifest_at(
+      &fleet_dir,
+      &[
+        ("server", format!("{}:{SERVER_PORT}", network.server())),
+        ("client", format!("{}:{}", network.gateway(), held.base)),
+      ],
+    );
+    let pid = std::process::id();
+    let server_instance = format!("cli-fs-container-{tag}-server-{pid}");
+    let container = format!("slates-fs-{tag}-server-{pid}");
+    let launcher = slates_api::LauncherSecret::generate().unwrap();
+    let server = start_server(
+      (&container, &server_instance),
+      &network,
+      (&fleet_dir, &projects),
+      &launcher,
+    );
+    let client = format!("cli-fs-container-{tag}-client-{pid}");
+    let client_daemon = start(&client, &manifest, ("client", &held), None);
+    let server_at = format!("{IN_CONTAINER}{container}/{server_instance}");
+    eventually(&server_at, &["volume", "list"]);
+    eventually(&client, &["volume", "list"]);
+    eventually(&server_at, &["bootstrap", "root"]);
+    Lane {
+      _client: client_daemon,
+      server,
+      _network: network,
+      scratch,
+      server_at,
+      server_instance,
+      client,
+      launcher,
+    }
+  }
+
+  /// Makes each of `dirs` in the scratch directory.
+  #[allow(clippy::disallowed_methods)]
+  fn make_dirs(dirs: &[&str]) {
+    for dir in dirs {
+      std::fs::create_dir_all(dir).unwrap();
+    }
+  }
+
+  /// A project in the attached volume, seeded, with its overlay and green on the server and the client's two pushes
+  /// merged and checked out: (the project as the host reads it, as the server names it, the overlay volume).
+  fn pushed_and_checked_out(lane: &Lane, name: &str) -> (String, String, String) {
+    let on_host = format!("{}/projects/{name}", lane.scratch.path);
+    let in_container = format!("{PROJECTS_IN_CONTAINER}/{name}");
+    seed_project(&on_host);
+    let (volume, snapshot, green) = server_green_named(&lane.server_at, &in_container, name);
+    share_with_client(&lane.server_at, &green, &lane.client);
+    the_client_pushes(&lane.client, &green);
+    the_server_checks_out(&lane.server_at, &green, (&volume, &snapshot));
+    (on_host, in_container, volume)
+  }
+
+  /// Fs-server plan step 2 (R8, A-285, A-299, §4.15). Do: the server node in its own container and the client node on
+  /// the host, as [`in_a_container`] states; two projects in the attached volume. Project `asked`: the client pushes two
+  /// increments over four files and a late overlapping one, the server checks the head out, the launcher sets ask,
+  /// `slates land` on the server, then the launcher approves exactly the presented manifest. Project `bypassed`: the
+  /// same pushes and checkout, the launcher sets bypass, `slates land` once. Expect: the late push refused with its
+  /// window `src/one.txt [0..3]` each time; the asked land answers the approval request (1 create, 3 replaces) and the
+  /// host reads the project unchanged, then the approval writes 4 entries, none failed; the bypassed land writes 4
+  /// entries in the one call; and the host reads exactly the merged files in both projects of the attached volume.
+  #[test]
+  fn a_server_in_its_own_container_lands_the_client_nodes_merge_into_its_attached_volume() {
+    if !gate() {
+      return;
+    }
+    let lane = lane("land");
+    let (asked_on_host, asked, asked_volume) = pushed_and_checked_out(&lane, "asked");
+    let set = launcher_role(
+      &lane.server.name,
+      "ask",
+      (&lane.server_instance, &asked_volume, &asked),
+      &lane.launcher,
+    );
+    assert_eq!(set, "ask set");
+    the_landing_asks_at(&lane.server_at, &asked_volume, (&asked, &asked_on_host));
+    let approved = launcher_role(
+      &lane.server.name,
+      "approve",
+      (&lane.server_instance, &asked_volume, &asked),
+      &lane.launcher,
+    );
+    assert_eq!(approved, "written=4 failed=0");
+    assert_eq!(project_files(&asked_on_host), merged_files());
+    let (bypassed_on_host, bypassed, bypassed_volume) = pushed_and_checked_out(&lane, "bypassed");
+    let set = launcher_role(
+      &lane.server.name,
+      "bypass",
+      (&lane.server_instance, &bypassed_volume, &bypassed),
+      &lane.launcher,
+    );
+    assert_eq!(set, "bypass set");
+    let landed: serde_json::Value = serde_json::from_str(&ok(
+      &lane.server_at,
+      &["land", &bypassed_volume, &bypassed, "--json"],
+    ))
+    .unwrap();
+    assert_eq!(landed["grant_required"], false, "{landed}");
+    assert_eq!(landed["outcome"]["written"], 4, "{landed}");
+    assert_eq!(landed["outcome"]["failed"], 0, "{landed}");
+    assert_eq!(project_files(&bypassed_on_host), merged_files());
+    drop(lane);
+  }
+}

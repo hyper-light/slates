@@ -221,16 +221,17 @@ hg -R ../shared status --all
 /// seeds each hash table from the clock and its addresses (`apr_hash_make`, `tables/apr_hash.c` of 1.7), so the order
 /// is drawn anew in every process; FSFS numbers a revision's items in the order they arrive. One commit of two new
 /// files therefore wrote its revision file, and the representation cache's row for each text, in either of two orders:
-/// CI's host gate saw the cache's item number 3 in one run and 4 in the other (runs 44252249999 and 44252854695,
-/// 2026-11-18), and on Subversion 1.14.5 (kiln run r956) twelve runs of the script with that commit wrote
-/// `db/revs/0/2` two ways, seven and five times, every other file alike, while twelve runs with its two files
-/// committed apart were identical in every revision file, the cache's rows and its bytes, the output and the dump.
-/// The representation cache (`db/rep-cache.db`) is compared by what Subversion keeps in it, its rows, printed where
-/// `sqlite3` is on the `PATH`, rather than by SQLite's bytes for them; its bytes had differed between two runs (CI run
-/// 44247840584, ubuntu) only because its rows had. Everywhere, `svnadmin verify` checks each row against the
-/// revision it names (`verify_rep_cache`, `subversion/libsvn_fs_fs/verify.c` of 1.14). The revisions it caches
-/// (`db/revs`, `db/revprops`, `db/current`) are compared byte for byte, and `svnadmin verify` and the dump's checksum
-/// print the repository whole.
+/// the cache's item number for `d/b.txt`'s text was 3 in one run and 4 in the next (host and host on ubuntu, host and
+/// mount on macOS and over Linux FUSE: CI runs 44252249999, 44252296495 and 44252854695, 2026-11-18), and on Subversion
+/// 1.14.5 (kiln run r956) twelve runs of the script with that commit wrote `db/revs/0/2` two ways, seven and five
+/// times, every other file alike, while twelve runs with its two files committed apart were identical in every
+/// revision file, the cache's rows and its bytes, the output and the dump. So the revision files (`db/revs`), their
+/// properties (`db/revprops`) and the youngest revision (`db/current`) are compared byte for byte. The representation
+/// cache (`db/rep-cache.db`) is compared by what Subversion keeps in it, its rows, rather than by SQLite's bytes for
+/// them: each content's hash, the revision that first stored it and its size print where `sqlite3` is on the `PATH`
+/// (its bytes had differed between two runs, CI run 44247840584, only because its rows had), and `svnadmin verify`
+/// checks each row against the revision it names (`verify_rep_cache`, `subversion/libsvn_fs_fs/verify.c` of 1.14).
+/// The dump's checksum, `svnlook tree`, `svn log -v` and `svnadmin verify` print every revision's content.
 const SUBVERSION: &str = r#"
 top=$(pwd -W 2>/dev/null || pwd)
 case $top in
@@ -295,7 +296,7 @@ svn list -R '^/'
 cd ..
 svnadmin verify repo
 if command -v sqlite3 >/dev/null 2>&1; then
-  sqlite3 repo/db/rep-cache.db 'SELECT hash, revision, offset, size, expanded_size FROM rep_cache ORDER BY hash'
+  sqlite3 repo/db/rep-cache.db 'SELECT hash, revision, expanded_size FROM rep_cache ORDER BY hash'
 fi
 svnlook tree repo
 # Format: revision 7, the merge, as the repository records it.
@@ -472,8 +473,8 @@ if grep -q 'new\.txt' events.txt; then echo "observed new.txt created"; else ech
 /// - cargo's plain output and its own target directory (`CARGO_TARGET_DIR=target`, which cargo takes relative to the
 ///   directory it runs in, so the crate's own), whatever a parent sets: every CI job sets `CARGO_TERM_COLOR=always`,
 ///   whose escape sequence before `Fresh` made the cargo workload's count of fresh builds read 0, failing it on both
-///   sides (CI run 44247840584, macOS, 2026-11-18), and kiln's runs set a target directory outside the tree, where the
-///   workload's `./target/debug/mini` would not be;
+///   sides of every leg (CI runs 44247840584 and 44252249999, 2026-11-18), and kiln's runs set a target directory
+///   outside the tree, where the workload's `./target/debug/mini` would not be;
 /// - under Git for Windows' shell (A-300), `ln -s` making a Windows symbolic link and failing where it cannot
 ///   (`winsymlinks:nativestrict`), as POSIX's does; by default that shell copies the target instead, which would hide
 ///   whether the drive makes links (A-275). Every other shell ignores the variable.
@@ -645,9 +646,9 @@ pub const ROSTER: &[Workload] = &[
       ),
       (
         "repo/db/rep-cache.db",
-        "FSFS's representation cache is an SQLite file, judged by what Subversion keeps in it, its rows, which are \
-         printed where sqlite3 is on the PATH and each checked against the revision it names by `svnadmin verify`, \
-         rather than by SQLite's bytes for them; the revisions it caches are compared byte for byte",
+        "FSFS's representation cache is an SQLite file, judged by what Subversion keeps in it, its rows: each \
+         content's hash, first revision and size are printed where sqlite3 is on the PATH, and `svnadmin verify` \
+         checks every row against the revision it names; the revisions it caches are compared byte for byte",
       ),
     ],
     runs_on_windows: true,

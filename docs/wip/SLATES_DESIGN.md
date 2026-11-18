@@ -2145,7 +2145,8 @@ NFS after a taken name (`EEXIST`) and an unwritable directory (`EACCES`), the or
 device: every mount slates makes is `nosuid,nodev` (macOS `MNT_NODEV`; the Linux FUSE mount's own options; the OCI
 binding), so its kernel refuses the open `EACCES` (`may_open_dev`); an export's PersistentVolume is `nodev` too, and in a
 pod, whose bind drops it (A-94), the container runtime's device cgroup refuses the open; a guest's mount of a virtio-fs
-share is the guest's, so slates asks it for `nodev`, and a guest that declines opens only its own devices. WinFsp and
+share is the guest's, so slates asks it for `nosuid,nodev` (`docs/cli.md`'s guest mount line; a real guest's test of
+both, A-94's amendment of 2026-11-18), and a guest that declines opens only its own devices. WinFsp and
 FSKit have no device kind and refuse the node unsupported, as a FIFO; the WinFsp drive's listing leaves out each FIFO,
 socket and device node rather than fail the directory (`listed`).
 
@@ -6592,9 +6593,11 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > (`seal_keys::recorded_lineage`, `recorded_namer`), a sealed log without them is refused `no_key`, and that refusal
 > waits for the key by event, bounded by `NO_KEY_WAIT_NS` (A-271 below). The store-destroyed flow on both Linux arches:
 > 48 of 48 taken over, the replacement the successor in 26, no key waited for (diag-live-durability-80; BENCHMARKS "A
-> live volume taken over by a node replaced at its own anchor"). Open: an owner lost after the replacement is
-> configured and before it accepts the owner's pair leaves the volume unserved while the replacement is its successor
-> (GAPS, 2026-11-17).
+> live volume taken over by a node replaced at its own anchor"). An owner lost after the replacement is configured and
+> before it accepts the owner's pair left the volume unserved while the replacement was its successor: at `f ≥ 2` a
+> fellow candidate now hands the replacement the key, wrapped to its recipient (A-295 below); at `f = 1` no survivor can
+> adopt the log in that window, since its recorded holders lack the replacement until it is covered, a second failure
+> for the volume (GAPS, 2026-11-17).
 >
 > **Phase one counts among the recorded holders (2026-11-06, A-240).** "Every candidate's report counts" above now
 > holds only for a candidate the shipper recorded as a holder. A member placed after the writes still reports and is
@@ -8677,7 +8680,8 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > red with the base check and the writes removed), by `crates/cli/tests/fs_server.rs` (two fleet nodes through the real
 > binary: presented and unwritten under an unset policy; since 2026-11-18 landed on the server's disk under the write
 > policy its launcher set, A-285: bypass in the one `slates land`, ask once the launcher approves exactly the presented
-> manifest, on macOS arm64 and Linux x86_64 and arm64), and across two machines on 2026-11-05: a client on Linux pushed
+> manifest, on macOS arm64 and Linux x86_64 and arm64; and with the server node in its own Linux container, landing into
+> the volume attached to it, in CI's Linux CLI step), and across two machines on 2026-11-05: a client on Linux pushed
 > to a green on a macOS server, whose human granted the landing at its anchor, and the merged files landed on the
 > server's disk (GAPS). The stop at the presentation on a Linux server (no grant from its CLI, A-201) is gone for the
 > launcher's path: the policy the launcher set, never a person's proof, decides the write (A-285).
@@ -12688,6 +12692,12 @@ under the lineage key (`HeadNaming`, no per-neighbour cost), adopted with the li
 destroy. Per-tenant naming was set aside: tenant keys are per node and partition, so tenant-wide names could never
 cross a takeover. The takeover test seals with the real naming key; its first run with it failed because the naming
 key was made after the head shipped, which is why the seal's start makes both.
+Amended (2026-11-17, A-295): a successor that holds no entry of its own in a live log's or a sealed head's sealing (a
+node replaced at its anchor whose pair from the owner never arrived before the owner died) is handed the lineage key by
+a fellow candidate, which unwraps its own entry and wraps the key to the successor's recipient key (seal.md §6's
+hand-off to a successor), and only for the member its committed configuration names as acting for the volume; the
+successor keeps it only when the volume's naming record opens under it. "A successor takes a volume only by a key
+wrapped to it" holds: the key reaches a candidate of the volume and no other node, wrapped to that candidate.
 Built (2026-10-05): piece 3b, the envelope archive (`slates_cluster::envelope`), on hyper-raft `f9a2c8e`. When a seal's
 archive is complete, the owner shard wraps it (`fleet::envelope_of`). Each chunk is sealed under a data key derived from
 the volume's lineage key and the BLAKE3 of exactly the record sealed (hyper-seal `FileSealer::content_keyed`, seal.md
@@ -12835,8 +12845,15 @@ group first).
 ### A-94 — Every mount of a volume is nosuid and nodev (2026-10-05)
 Applied in the same change to: `crates/cli/src/mount.rs`, `crates/cli/examples/slates_mount.rs`,
 `crates/bridge-oci/src/binding.rs`, `xtask/src/kind_export.rs`, `docs/deploy.md`, the tests named in
-`docs/bugs/2026-10-05-setuid-through-a-shared-volume.md`, GAPS.
-Status: built 2026-10-05 (condition 4).
+`docs/bugs/2026-10-05-setuid-through-a-shared-volume.md`, GAPS. For a guest's mount (amended 2026-11-18, below):
+`docs/cli.md` (the `slates vhost-user` guest mount line asks for `nosuid,nodev` and gives this entry's reason; written
+2026-11-17 with A-294), `crates/guest-probe` (the guest's own mount `nosuid,nodev`, `HARDENED`; the control mount
+`bare`; `exec` and `open` from either mount; the `identity` and `failed` replies; a run of the probe that is not the
+first process says its ids), `crates/cli/tests/guest_vhost.rs`
+(`a_guests_mount_of_slates_own_device_runs_no_set_id_file_as_its_owner_and_opens_no_device_node`),
+`crates/cli/tests/vm/mod.rs` (the initramfs's `/bare`), §4.6, A-294 (its owed guest proof), GAPS.
+Status: built 2026-10-05 (condition 4). A guest's mount: the line 2026-11-17, a real guest's test 2026-11-18 (kiln
+goal g260); the test's first runs are owed (crosvm on adacachy; CI's live-guest lane runs it in QEMU 11.1).
 - What: a volume is shared between writers and readers, so no mount of it may honour a setuid or setgid bit or open a
   device node. `slates mount` asks for both flags whoever runs it (macOS `MNT_NOSUID | MNT_NODEV`; Linux FUSE was
   already `nosuid,nodev` as root, measured). The OCI binding entry states them. The PersistentVolume the operator
@@ -12850,6 +12867,30 @@ Status: built 2026-10-05 (condition 4).
   flags close the escalation without changing ownership.
 - Rejected: stripping setuid and setgid bits in the daemon. It would break a root filesystem built inside a volume
   (`sudo` installed by `dpkg` must stay setuid there) and still leave the mount honouring bits that arrive another way.
+- **Amended 2026-11-18 (kiln goal g260): a guest's mount of a share is `nosuid,nodev` too, and a real guest is held to
+  it.** A guest's kernel mounts the share, and the device never sees a mount's flags, so slates cannot set them: it asks
+  for them. `docs/cli.md`'s guest mount line for `slates vhost-user` is `mount -t virtiofs slates /mnt -o
+  dax=always,nosuid,nodev`, with this entry's reason (2026-11-17, with A-294, which made `nodev` the guard by keeping
+  device nodes as metadata), and slates' own guest, the tests' probe, mounts what it is shared, a tag or a volume's
+  image, the same way.
+  - The test that holds a real guest to it, built 2026-11-18 and not yet run in a guest:
+    `a_guests_mount_of_slates_own_device_runs_no_set_id_file_as_its_owner_and_opens_no_device_node`
+    (`crates/cli/tests/guest_vhost.rs`, in crosvm and in QEMU 11.1). Through the session's `slates mount` the host's
+    user makes a set-user-id and set-group-id copy of the probe, and a whiteout: a character device 0/0, the one device
+    node an ordinary user may make. In the guest, the copy run as `nobody` from the guest's mount must say `nobody`'s
+    ids, and the whiteout's open must be refused `EACCES` (`may_open_dev`). The control is the same tag mounted again
+    without the flags: a mount's flags are its own, not its file system's. There the copy must take its owner's ids,
+    and the open must reach the device layer (`ENXIO`, no driver for 0/0). So the test shows that the bits and the node
+    reach the guest, and that the flags alone withhold them. On CI's QEMU lane the test runs as root, so there the
+    control's copy runs as uid 0: this entry's escalation itself.
+  - Owed: the test's first runs. The supervisor's is crosvm on adacachy; CI's live-guest lane runs every test of
+    `guest_vhost.rs` in QEMU 11.1 from the first push.
+  - Credit: the gap was first found on 2026-11-09 by the agent of `agents/conformance-19` (0717586a, d701b534). Its
+    guest's root planted a setuid-root copy of the probe and ran it as `nobody`, expected red under the then-documented
+    `-o dax=always` alone, and the fix put `nosuid,nodev` on the probe's mount and the documented one. It never landed:
+    the B12 stack that held it failed its gate on other branches. This amendment supersedes it and keeps its idea, a
+    copy of the probe run as `nobody` that says its effective ids; it adds the host-side writer, `nodev`, and the
+    control mount, which shows in every run, on every box, that the bits reached the guest.
 
 ### A-95 — A v4 READDIR page is encoded at the directory's owner (2026-10-05)
 Applied in the same change to: `crates/bridge-nfs/src/v4/listing.rs` (new: `PageRequest`, `encode_page`,
@@ -21458,18 +21499,20 @@ Held by `a_pair_accepted_by_a_predecessor_at_the_same_anchor_does_not_cover_its_
 `a_missing_key_is_waited_for_and_the_log_fetched_once_it_comes`, `a_holders_log_begins_at_the_newest_whole_entry_it_holds`
 (`crates/server/src/live_ship.rs`) and `a_reader_without_the_key_records_none_and_adopts_the_right_one`
 (`crates/server/tests/seal.rs`). Owed: a deterministic skip in ranking computed from the durable whole entry's cover,
-model-first, if the bounded wait proves not enough.
+model-first, if the bounded wait proves not enough; at `f ≥ 2` A-295 hands the successor the key instead.
 
 **The flow (2026-11-09, diag-live-durability-80).** The store-destroyed takeover (`crates/cli/tests/live_chaos.rs`:
 one candidate's node destroyed mid-stream and replaced at its anchor, the fleet recovered, then the owner killed), on
 A-271 with main db9c514e and the flows' fixed wait, release, 12 runs a leg, two legs on each Linux arch: 48 of 48
 served every acknowledged write. The replacement was the successor in 26 and served 1.997 to 2.481 s after the owner's
 kill; the key-wait counters read 0 on every survivor, so no successor lacked the key, the flow killing the owner only
-once the fleet has recovered (BENCHMARKS "A live volume taken over by a node replaced at its own anchor"). The window the bounded wait covers is held by the unit tests above, not by a flow, and the wait does not end
-it: only the owner's shard holds the replacement's pair (`fleet::deliver_pairs`), so with the owner dead the key never
-comes, and the volume is unserved while the replacement is its successor. So the bounded wait cannot be enough there:
-the skip in ranking owed above, or another way for the successor to obtain the key, is what ends it (GAPS "an owner
-lost before its replacement candidate accepted the owner's pair", 2026-11-17, read from the code).
+once the fleet has recovered (BENCHMARKS "A live volume taken over by a node replaced at its own anchor"). The
+window the bounded wait covers is held by the unit tests above, not by a flow, and the wait does not end it: only the
+owner's shard holds the replacement's pair (`fleet::deliver_pairs`), so with the owner dead the key never comes, and
+the volume is unserved while the replacement is its successor. So the bounded wait cannot be enough there: the skip in
+ranking owed above, or another way for the successor to obtain the key, is what ends it (GAPS "an owner lost before
+its replacement candidate accepted the owner's pair", 2026-11-17). A-295 is that other way, at `f ≥ 2`; at `f = 1` the
+window leaves the log's recorded holders short of `f + 1` survivors, so no successor adopts it whatever key it holds.
 
 Applied in the same change to: §4.10's status (the cover rule), GAPS (A-271's entry, the recipient fix's, and the
 open window above), and BENCHMARKS.
@@ -22888,8 +22931,12 @@ and `crates/bridge-winfsp` (refused unsupported, as a FIFO), `crates/land` (refu
   FUSE, an ordinary user: `/dev/null`'s number refused `EACCES` on the `nodev` mount) and
   `a_device_node_is_made_with_its_number_and_never_opened` (Linux's NFSv4.1 and 4.2 clients, as root, `nodev`).
 - **Owed.** The KIND lane's first run of its device probe (`device_probe`, `xtask/src/kind_export.rs`: `/dev/null`'s
-  number opens in an unprivileged pod, `/dev/mem`'s is refused `EPERM` by the device cgroup); a guest's proof (g260's; the guest mount
-  line asks for `nosuid,nodev` since 2026-11-17); a Windows representation (WSL keeps a device node as a reparse point tagged `IO_REPARSE_TAG_LX_CHR` or
+  number opens in an unprivileged pod, `/dev/mem`'s is refused `EPERM` by the device cgroup); the first runs of a
+  guest's proof, built 2026-11-18 (A-94's amendment:
+  `a_guests_mount_of_slates_own_device_runs_no_set_id_file_as_its_owner_and_opens_no_device_node`, which expects a
+  whiteout made by the host's user to be refused `EACCES` on the guest's `nodev` mount and to reach the device layer,
+  `ENXIO`, through a control mount without the flag; the guest mount line asks for `nosuid,nodev` since 2026-11-17); a
+  Windows representation (WSL keeps a device node as a reparse point tagged `IO_REPARSE_TAG_LX_CHR` or
   `_LX_BLK`; the drive's listing leaves such entries out since 2026-11-17, where one had failed the whole directory);
   each pjdfstest list and its record re-recorded from a real run, since the device-fixture entries are expected to pass
   and a list edited without its run fails the record's doc-truth test.
@@ -23062,6 +23109,70 @@ their reset checked first), the test below, GAPS.
   agent's session that asks holds its merge of its own off-shard work; the owner was asked for the verdicts. A-285's
   own tests run one shard, where every work shares its green's partition.
 
+### A-295 — A successor that holds no entry of its own in a volume's sealing is handed the lineage key by a fellow candidate, wrapped to its recipient (accepted and built 2026-11-17, goal g240; A-271's window, for a live log at `f ≥ 2` and a sealed head at any `f`)
+
+A-271 left a window (GAPS, 2026-11-17). A node replaced at its own anchor enters the volume's neighbourhood before it
+holds the owner shard's pair, and only the owner's shard delivers that pair, once a record period
+(`fleet::deliver_pairs`). The successor is ranked from the configuration alone (`RegionalConfiguration::successor`), so
+the replacement can be it. If the owner dies before a period delivers the pair, the key the replacement waits for can
+never come: its wait ends `takeover_no_key_exhausted`, and the head cannot move with the owner dead, so the volume was
+unserved until the replacement left. Nothing acknowledged was lost (the cover gate holds writes, the holders keep their
+copies); the volume was not served.
+
+The remedy is the hand-off hyper-seal names for this (hyper-raft `docs/seal.md` §6, "a hand-off to a successor": a
+successor that must open a volume takes its key wrapped to its certificate's identity). §4.8's ranking is unchanged,
+so no model is re-run.
+- **Who asks.** A successor that cannot open its own entry in the log's whole-entry sealing asks the hosts that
+  answered its phase one, in turn, on `LINEAGE_STREAM` over the record session: the object, the lineage key's id, and
+  its own recipient public key. The stream is kind 27: no registry holds the kinds, and a kind another stream takes is
+  served as that one (at 25, the work routes' since A-288, every ask came back empty and no handler counted it). It asks once the log is fetched, so the first attempt can serve, and again at each
+  attempt of A-271's bounded wait (`live_ship::handed_lineage`). A successor that must open a sealed head's envelope
+  with no entry of its own in the head's sealing asks the head's other candidates the same way, at each attempt to
+  materialize it (`fleet::materialize`).
+- **Who hands, and to whom.** A fellow candidate hands the key only to the member its own committed configuration
+  names as acting for the volume (`fleet::acts_for`): the owner its held record names while that owner is a member, or,
+  the owner retired, the member the configuration's line of retired owners takes the object to
+  (`RegionalConfiguration::lineage`). That member is a candidate of the volume, which the owner's pair would have
+  reached, so the key reaches no node outside the volume's candidates.
+- **From what.** Only its own copy of the volume's sealing, never bytes from the request: the whole entry its held live
+  log begins with, then the heads it holds naming that key. Its own entry is unwrapped under the pair the owner
+  delivered to it and wrapped to the recipient key the request carries (`seal_keys::hand_lineage`; hybrid ML-KEM-1024
+  with P-384, about 1.7 KB, once a takeover). The key is carried in the request, not kept from a pair delivery: a
+  candidate delivers pairs only to its own neighbourhood, which in a fleet wider than one need not hold the asker. The
+  session authenticates the asker, and a recipient key it does not hold the other half of opens nothing for it.
+- **Kept only when it checks.** The successor opens the hand-off with its recipient and keeps the key only when the
+  volume's naming record, which the owner wrapped under the lineage key (`HeadNaming`), opens under it (key wrap's
+  integrity check, `seal_keys::accept_handed_lineage`). A sealing with no naming record cannot check a key and is
+  refused `Unchecked`. The key then takes the path the successor's own entry would have: wrapped under the root to the
+  volume's owner shard and adopted (`adopt_lineage`).
+- **Counted.** On the successor `fleet.live.takeover_key_handed` and `fleet.seal.envelope_key_handed`,
+  `fleet.seal.lineage_unhanded`, `lineage_unchecked` and `lineage_unasked`; on the candidate asked
+  `fleet.seal.lineage_handed` and `fleet.seal.lineage_refused.{malformed,not_acting,not_held}`.
+- **At `f = 1` the window stays a second failure.** The owner moves a live volume's holders to a set naming the
+  replacement only once its whole entry covers the replacement (`live_ship::target_recordable`), and never to a set of
+  `f` members (`Shipper::begin_transition`). So in the window the recorded holders are the survivor and the destroyed
+  incarnation, and phase one, which counts `f + 1` recorded holders (A-240), adopts nothing at `f = 1`, whoever ranks
+  first. A write durable on `f` of that set may have rested on the destroyed incarnation alone. Read from the code and
+  stated in the test's doc; owed with A-272 (ii), model first. A sealed head's takeover counts the members that exist
+  now, so for a volume served from its envelope the window is the key's alone at `f = 1` too, and the hand-off ends it.
+
+Held by:
+- `a_replacement_that_never_received_the_owners_pair_serves_the_live_volume_it_succeeds_to` (`crates/server/tests/
+  fleet.rs`): five nodes at `f = 2`; the owner's delivery to one anchor failed (`Daemon::inject_pair_withhold_to`);
+  that node replaced at its anchor and the fleet recovered; then the owner stopped. On this Mac (2026-11-17, load 22 to
+  159) it passed 4 of 4, the replacement serving 6 to 8 of the 39 volumes 2.0 to 2.4 s after the owner stopped, each
+  through a handed key; red with the hand-off removed, none of 12 and of 7 was served after 434 and 455 s.
+- `a_replacement_that_never_received_the_owners_pair_opens_the_sealed_head_it_succeeds_to` (the same file): three
+  nodes at `f = 1`, sixteen volumes sealed by snapshots and placed, the same window: 3 of 3, 6 to 8 of 16 served 2.1 to
+  2.6 s after the owner stopped; red, none of 8 after 451 s (`envelope_unopened` 1,600).
+- `a_lineage_key_is_handed_from_a_candidates_own_entry_and_kept_only_when_it_checks` (`crates/server/tests/seal.rs`).
+- `a_lineage_request_of_any_other_shape_is_refused` and `only_the_volumes_acting_owner_is_handed_its_key` (`fleet`'s
+  unit tests).
+
+Applied in the same change to: §4.10's status (A-271's window), A-92 piece 4c (the hand-off), A-271's record, GAPS
+(the window's entry: a live log fixed at `f ≥ 2` and `f = 1` open, a sealed head fixed), and the bug record
+`docs/bugs/2026-11-17-a-replacement-successor-waited-for-a-key-only-the-dead-owner-could-deliver.md`.
+
 ### A-319 — The version-control workloads after CI's first runs: one text per Subversion commit, cargo's colour and target pinned, and the live guest's console read while it runs (2026-11-18, A-289's runs over each mount; Ada's goal of 2026-11-18)
 Applied in the same change to: Part 6 (the status of the version-control workloads), A-289 (its owed list), GAPS (A-289's
 entry), `crates/conformance/src/workload.rs` (the Subversion script and its exclusion's reason, `ENVIRONMENT`),
@@ -23070,9 +23181,14 @@ entry), `crates/conformance/src/workload.rs` (the Subversion script and its excl
 - **What CI's first runs found.** Run 44247840584 (main 9f71a69f5) was the first to run A-289's workloads on any route:
   over macOS's NFS loopback mount git, git's history and Mercurial were identical; Subversion differed at
   `repo/db/rep-cache.db`; the cargo workload failed alike on both sides; the Ubuntu job's host gate stopped at the same
-  Subversion file, so its mounts never ran; and the live virtio-fs guest was killed at its 1500 s bound. Runs 44252249999
-  and 44252854695, with the cache's rows printed (the integrator's 760fb7db), found the gate red at its row for one text:
-  item 3 in one run, 4 in the other.
+  Subversion file, so its mounts never ran; and the live virtio-fs guest was killed at its 1500 s bound. Runs
+  44252249999, 44252296495 and 44252854695, with the cache's rows printed (the integrator's 760fb7db), found the gate,
+  and the host against the mount on macOS and over Linux FUSE, differing at its row for one text: item 3 in one run, 4
+  in the other.
+  Main's 64852828 then left `db/revs` out of the byte comparison and the item number out of the printed rows, and set
+  cargo's colour; this change, made at the same time and merged over it, brings the revision files back into the byte
+  comparison, keeps its rows' columns (each content's hash, first revision and size) and its colour, and adds cargo's
+  target directory.
 - **One text per Subversion commit.** Subversion's client sends a commit's texts after its tree, in the order of a hash
   table (`svn_client__do_commit`'s `file_mods`, `subversion/libsvn_client/commit_util.c`, branch 1.14.x), and APR seeds
   every hash table from the clock and its own addresses (`apr_hash_make`, `tables/apr_hash.c`, branch 1.7.x), so the
@@ -23083,7 +23199,8 @@ entry), `crates/conformance/src/workload.rs` (the Subversion script and its excl
   twelve runs were identical in every revision file, in the cache's rows and in its bytes. The cache's bytes had
   differed only because its rows had; it stays compared by its rows, which are what Subversion keeps in it (printed where
   `sqlite3` is on the `PATH`), and `svnadmin verify` checks each row against the revision it names (`verify_rep_cache`,
-  `subversion/libsvn_fs_fs/verify.c`). The revision files stay compared byte for byte. Failing test first: the host gate
+  `subversion/libsvn_fs_fs/verify.c`). The revision files are compared byte for byte, as Ada's goal asks of every route
+  and as they now can be. Failing test first: the host gate
   (`the_version_control_workloads_run_byte_identically_twice_on_the_host`), red in all three CI runs that reached it and
   in 1 run of 6 on Linux in a container with Subversion (kiln run r1024); after, 10 of 10 (r1031).
 - **Cargo's colour and target directory.** Every CI job sets `CARGO_TERM_COLOR=always`, which put an escape sequence
