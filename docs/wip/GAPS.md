@@ -2554,7 +2554,11 @@
 > its newest accepted version were judged when their records came; now the rule judges those placed at or past it
 > (`ContentHold::retain_placed_from`, over the hold's manifests indexed by placed sequence, charged with them), and the
 > newest placement is one read. Test: `a_greens_retention_judges_only_the_inputs_its_newest_version_can_change`
-> (`content_retention.rs`): the last of 64 versions judges one manifest, every input still held.
+> (`content_retention.rs`): the last of 64 versions judges one manifest, every input still held (red with the rule
+> judging a ledger whole). Kiln r3491, the Mac Studio, debug: the late-submit test's late median at 300 versions 2.92 to
+> 3.28 ms against early 1.87 to 1.96 (it was 4.4 to 6.4 against 2.0 to 2.4), and at 1,000 versions 8.49 against 2.28
+> (18.2 against 2.16). What remains is the content hold's image, one piece re-encoded and re-put at each publication,
+> about a tenth of a holder's time at 1,000 versions, which also brings the checkpoints a delta's size triggers.
 >
 > **Fixed 2026-11-18 (g232, A-367): every version re-published every version its holders kept.** A held register was
 > one piece holding every position its acceptor kept (A-270), and a green's register on its holders is a ledger, never

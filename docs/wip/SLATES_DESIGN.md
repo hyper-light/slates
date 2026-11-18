@@ -26723,5 +26723,9 @@ ledger), `crates/cluster/src/content.rs` (`Held::by_sequence`, charged in `manif
   sequence; a head, a tombstone or an object with no record is judged whole, as before (a head's register keeps one
   position, a tombstone releases everything once). The index is charged with the manifests it indexes.
 - **Tests.** `a_greens_retention_judges_only_the_inputs_its_newest_version_can_change` (`content_retention.rs`: 64
-  versions, the last judges one manifest); `a_retention_from_a_sequence_judges_only_the_content_placed_at_or_past_it`
-  (`slates-cluster`); the hold's model test keeps every charge balanced with the index charged.
+  versions, the last judges one manifest; red with a ledger judged whole);
+  `a_retention_from_a_sequence_judges_only_the_content_placed_at_or_past_it` (`slates-cluster`); the hold's model test
+  keeps every charge balanced with the index charged.
+- **Measured.** Kiln r3491, the Mac Studio, 2026-11-18, debug build, `a_submit_late_in_a_greens_history_is_answered_as_fast_as_an_early_one`:
+  at 300 versions the late median 2.92 to 3.28 ms against the early 1.87 to 1.96 (before, 4.4 to 6.4 against 2.0 to
+  2.4); at 1,000 versions 8.49 ms against 2.28 (before, 18.2 against 2.16). The rest is the content hold's image (owed).
