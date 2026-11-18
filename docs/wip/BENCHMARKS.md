@@ -12368,3 +12368,97 @@ both arms hit at similar rates, so slicing does not stretch a takeover. The step
 floor: hyper-swim's RFC 6298 timer starts at, and never falls below, 1 s (`INITIAL_RTO_NS`, `MINIMUM_RTO_NS`) for a
 pair judged by its timer until the pool covers it, and it doubles on expiry. It is joined by an election when the dead
 owner led the council.
+
+## A candidate's acknowledgement carries the piece it changed: what persisting live copies adds to a stable write (A-270; 2026-11-08)
+
+**Hardware:** adacachy, AMD Ryzen 9 9950X3D2 (16 cores, 32 threads), 122 GiB. **Load:** load average 42–113 on 32 threads
+(other agents' builds). Each run in one `systemd-run --user` unit capped at a quarter of the cores. **Command (the
+contract):** `SLATES_TEST_CLI=1 SLATES_TEST_MEASURE=1 <live_fleet release test binary> measure_what_live_shipping
+--nocapture`, the binary built with `cargo test --release -p slates-cli --test live_fleet --no-run` at each arm's commit.
+Arms interleaved round by round (`ab3.sh`, `ab3b.sh` in the agent's scratch):
+
+- **main** at 92dcd16c: a candidate's live copies are not in its recovery image, so its acknowledgement publishes nothing.
+- **whole** at c07d1de6 (raft-5): every acknowledgement publishes the whole held image.
+- **pieces** at eeb4a6ee (agents/raft-7): every acknowledgement publishes the held pieces it changed.
+
+Microseconds, what live shipping adds to a stable 4 KiB write at the median (live p50 less plain p50), and the live p99:
+
+| arm | runs | added at the median | live p99 |
+|---|---|---|---|
+| main | 4 | 65.3, 75.5, 71.4, 73.0 | 146.5, 197.2, 162.4, 636.3 |
+| whole | 3 | 206.7 (alone, load 86), 224.8, 220.2 | 670.4, 824.8, 776.5 |
+| pieces | 6 | 76.0, 72.7, 79.1, 71.2, 69.2, 65.3 | 275.7, 247.5, 208.5, 233.3, 199.0, 151.4 |
+
+Seven arm runs printed no figures (each of the three in the second A/B's first round at load 98–145, and main in its
+second and third), and are left out. No arm's run passed the test's own bound on writes over 50 ms at this load (3 to 5
+each), so the test reports failure after printing; the figures stand.
+
+**On raft-7's tip after B11 (2026-11-11, load 11–13, adacachy, the same command and arms: main at 29ef4521, whole at
+c07d1de6, pieces at 2c93f4c9, where the register piece carries A-251's `PersistedAcceptor`).** Every round, interleaved.
+Microseconds: added at the median; live p99.
+
+| round | main | whole | pieces |
+|---|---|---|---|
+| 1 | 70.9; 284.8 | 231.2; 900.6 | 92.9; 525.4 |
+| 2 | 99.5; 471.7 | 225.3; 774.1 | 85.5; 467.8 |
+| 3 | 90.0; 443.8 | 325.4; 1,456.1 | 92.2; 387.0 |
+| 4 | 87.5; 300.0 | 241.2; 1,123.0 | 86.0; 464.8 |
+| 5 | 88.5; 498.8 | 230.7; 800.6 | 91.6; 511.6 |
+
+Medians of the rounds: main 88.5, pieces 91.6, whole 231.2. The pieces sit inside main's own spread (70.9–99.5); the
+whole image is about 140 µs above both, and its p99 is about twice theirs.
+
+**Reading.** Persisting every acknowledged live entry costs nothing at the median that main's own spread can show: pieces
+65–79 µs against main's 65–76 µs. The whole held image cost 207–225 µs, 140 µs more, and its p99 670–825 µs. The
+pieces' p99, 151–276 µs, sits about 50 µs above main's typical 146–197 µs: the publication a candidate makes before it
+answers.
+
+## What a verdict compares and copies, and what the owner spends a verdict on (§4.16 "The verdict"; 2026-11-11)
+
+**The question (the supervisor's, 2026-11-11):** `Green::decide` is about half the green owner's CPU, and `memcmp` and
+`memmove` lead its self time. Is that work proportional to the change, the file, or the green?
+
+**The engine alone: `crates/merge/examples/verdict_bench.rs`.** One slot replacement (a delete and an insert of 16
+bytes, as an SDK edit composes) submitted to a green of one measured file among 754, 7,540 or 75,400 small ones, in
+three cases: overlapping an intervening replacement with other bytes (conflict), with the same bytes (converges), and a
+disjoint edit at the head (accepted). Fastest of 7 rounds of 2,000 submits, each outcome checked. `cargo run --release -p
+slates-merge --example verdict_bench`, adas-mac-studio.local-2, load 2.3 to 3.3, main db9c514e against perf-decide
+63d63b23 (the whole-file identity check compared run by run in the content history), alternated, 3 rounds a side, the
+range over the rounds. Nanoseconds a submit:
+
+| paths | file | conflict, main → cut | converge, main → cut | accept (both) |
+|---|---|---|---|---|
+| 754 | 4 KiB | 684–1,121 → 466–660 | 723–830 → 462–493 | 1,156–1,187 |
+| 754 | 21 KiB | 1,467–1,504 → 420–447 | 1,805–1,854 → 447–458 | 2,001–2,050 |
+| 754 | 1 MiB | 40,819–41,508 → 417–447 | 50,252–51,283 → 444–457 | 37,198–37,824 |
+| 75,400 | 21 KiB | 1,660–1,693 → 557–590 | 2,041–2,078 → 584–618 | 2,470–2,582 |
+| 75,400 | 1 MiB | 41,445–42,102 → 571–601 | 50,810–51,812 → 584–625 | 39,102–39,666 |
+
+- The verdict's cost does not follow the green: a hundred times the paths adds about 0.15 µs (the maps' searches).
+- It followed the edited file twice over: the whole-file identity check of a length-changing edit that overlaps an
+  intervening change (rebuild the base, apply the ops to a copy, compare the copy with the head), and every accept
+  (`apply` writes the new file; the history checks its splice against it byte for byte). The first now follows the
+  change (a 1 MiB file: 41–51 µs to 0.42–0.63 µs); the accept still follows the file.
+
+**The daemon: not moved.** The owner's thread CPU per verdict and per rebase (`tools/owner_cpu_patch.py`, not
+committed), the anchor recipe, interleaved, 5 rounds a side, oracle 0 in all 40 runs:
+
+| | main db9c514e | + the cut | W1 c349a42a | + the cut |
+|---|---|---|---|---|
+| 3,000 clients, µs a verdict | 48.9–51.0 | 49.2–51.1 | 21.3–22.0 | 21.1–22.1 |
+| 3,000 clients, µs a rebase | 27.2–27.8 | 27.3–28.2 | 12.1–12.5 | 12.0–12.5 |
+| 1,000 clients, µs a verdict | 37.1–39.3 | 37.0–38.7 | 23.0–23.6 | 22.1–23.0 |
+
+At the rung's files (21 KiB on average, the slots in their first 512 bytes) the identity check costs a few µs of a verdict,
+so the cut is even there. It landed on 2026-11-17 (g222) on the engine's A/B above, which is not even: faster at every
+file size measured, 4 KiB to 1 MiB, and by two orders of magnitude at 1 MiB. **Owed (the supervisor's measurement):** the
+daemon's owner CPU a verdict and the loaded edit-and-merge p99/p999 at a rung whose hot files are large (256 KiB to 1 MiB),
+main before and after this merge, interleaved.
+
+**Where W1's owner spends a verdict (a second diagnostic, `tools/engine_split_patch.py`, the engine call timed apart by
+the thread's CPU clock).** 3,000 clients, 3 runs, oracle 0: a verdict 21.4–21.7 µs, of it the engine (`submit_resolved`)
+13.0–13.1 and the rest (composing the admission, the chain's admission, retention, the span, the durable records)
+8.3–8.7; a rebase 12.3–12.4 µs, the engine (`Green::rebase`) 9.5–9.6 and the rest 2.7–2.8. Verdicts and rebases are
+51–53% of the owner's wall (`merge-util`), the engine 68% of that. A rung verdict costs the engine 13 µs where the bench's
+one-path verdict costs under 2.5 µs, and 82% of the rung's verdicts are conflicts: what in a rung increment costs the
+engine the difference is the next measurement (a line-table build, `sample`'s call sites resolved by `atos`).

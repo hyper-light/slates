@@ -683,12 +683,17 @@ fn completion_for(version: u64) -> Option<chain_entry::Completion> {
   (!version.is_multiple_of(5)).then(|| completion_of(version))
 }
 
-/// The completion key a test's version `version` was made under: distinct per version, every field used.
+/// The completion key a test's version `version` was made under: distinct per version, every field used, the submitting
+/// work named for every other version (a client on another node than the work's owner) and absent for the rest (one on
+/// the owner's own node, A-288).
 fn completion_of(version: u64) -> chain_entry::Completion {
   chain_entry::Completion {
     origin: version.wrapping_mul(0x9e37_79b9_7f4a_7c15),
     client: u32::try_from(version % 1_000).unwrap(),
     sequence: u32::try_from(version % 65_521).unwrap(),
+    work: version
+      .is_multiple_of(2)
+      .then(|| [u8::try_from(version % 251).unwrap(); 16]),
   }
 }
 
@@ -699,17 +704,18 @@ fn a_hostile_chain_entry_is_refused_typed() {
   let raw: Raw = (0, 0, 0, 3, 7);
   let increment = increment_of(&raw).with_id(id(1), 0);
   let (_, applied) = green.submit_resolved(&increment);
+  // A completion naming its submitting work (A-288), so every byte of the work's marker and id is truncated and flipped.
   let bytes = chain_entry::encode(
     &increment.encode(),
     &increment,
     &applied.unwrap(),
-    Some(completion_of(1)),
+    Some(completion_of(2)),
     None,
   );
   assert_eq!(
     chain_entry::decode(&bytes).map(|entry| entry.completion),
-    Ok(Some(completion_of(1))),
-    "the entry decodes, its completion key with it"
+    Ok(Some(completion_of(2))),
+    "the entry decodes, its completion key and submitting work with it"
   );
   for len in 0..bytes.len() {
     assert!(
@@ -729,5 +735,13 @@ fn a_hostile_chain_entry_is_refused_typed() {
     chain_entry::decode(&increment.encode()),
     Err(DocDecodeError::BadMagic),
     "a bare increment from an earlier layout"
+  );
+  // An entry of the version before A-288 carried no submitting work: refused whole, never read with a work it lacks.
+  let mut earlier = bytes.clone();
+  earlier[4..8].copy_from_slice(&2u32.to_le_bytes());
+  assert_eq!(
+    chain_entry::decode(&earlier),
+    Err(DocDecodeError::BadVersion),
+    "an entry of version 2, before the submitting work rode it"
   );
 }

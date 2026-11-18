@@ -7,8 +7,9 @@
 pub const MAGIC: u32 = 0x4E41_4C53;
 /// Format: the layout version, changed for header, region, timestamp or record semantics: 3 a host-wide origin, 4 pool
 /// owner words (A-98), 5 host-scoped principals (A-237), 6 chain entries record each version's changes (A-257), 7 they
-/// and merge records carry the submit's completion key (A-255). An older segment is refused, never misread.
-pub const LAYOUT_VERSION: u32 = 7;
+/// and merge records carry the submit's completion key (A-255), 8 the submitting work beside it, and a completion record
+/// a green's successor adopted carries that work too (A-288). An older segment is refused, never misread.
+pub const LAYOUT_VERSION: u32 = 8;
 /// Format: the layout before A-237's host-scoped principals, refused with what to do about it.
 pub const LAYOUT_BEFORE_HOST_SCOPED_PRINCIPALS: u32 = 4;
 /// Format: one content-pool extent's owner word (A-98): 0 while the extent is free, else its owning partition plus
@@ -151,6 +152,20 @@ pub const SUP_SESSION_SECRET: usize = 264;
 /// Format: the client session secret's width, a 256-bit random value, the width of the BLAKE3 key that derives each
 /// client's session key from it (BLAKE3 §2.3).
 pub const SESSION_SECRET_BYTES: usize = 32;
+/// The **launcher secret** published word (A-299): `1` once the anchor has published the secret after it, `0` before (an
+/// anchor whose starter provided none, or an older anchor). The launcher — the host that starts the instance and passes
+/// each agent its write mode (kiln) — provides the secret on the anchor's standard input at every start and keeps it
+/// itself, so its authority (approving what an ask mode holds, setting a write policy, enrolling) outlives a daemon
+/// restart and its own. The daemon verifies a launcher-class proof under it as under the issuer secret; unlike the
+/// issuer secret it is never minted, and nothing derives a per-boot name from it.
+/// Format: the byte offset inside the supervision block, the first cache line past the session secret (264 + 32 = 296,
+/// so 320).
+pub const SUP_LAUNCHER_PRESENT: usize = 320;
+/// Format: the launcher secret's offset, the word after its published word.
+pub const SUP_LAUNCHER_SECRET: usize = 328;
+/// Format: the launcher secret's width, a 256-bit random value: the BLAKE3 key the launcher-class proofs are keyed by,
+/// the width of the issuer secret's (`ISSUER_SECRET_BYTES`), so the same proof formulas take either.
+pub const LAUNCHER_SECRET_BYTES: usize = 32;
 
 /// Format: a published payload's words (the profile, a snapshot slot, a landing slot): the
 /// generation (odd while a writer is inside) then the length, then the bytes.

@@ -272,6 +272,33 @@ pub struct PolicyRecord {
   /// catalog register before the shipper's first entry, so a takeover counts phase one's reports from exactly the hosts
   /// a durable entry is held by. `None` until a shipper commits one. Appended.
   pub live_holders: Option<LiveHolders>,
+  /// The volume's write policy (A-285): how a merge and a landing of it are permitted, set by the launcher or the
+  /// harness through the issuer, never by an agent. `None` until one is set: merges at once, lands under approval.
+  /// Appended.
+  pub write: Option<WritePolicy>,
+  /// How many times the write policy was set (A-285): a setter names the version it read, so a captured proof sets
+  /// nothing once the policy has moved. Appended.
+  pub write_version: u64,
+}
+
+/// How one kind of write is permitted (A-285): the mode the user gave the harness or agent.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteMode {
+  /// Written at once, with no approval asked.
+  Bypass,
+  /// Answered with an approval request the harness presents; written once the approval binds the manifest.
+  Ask,
+  /// Refused.
+  Forbid,
+}
+
+/// A volume's write policy (A-285): the mode for its merges and the mode for its landings.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WritePolicy {
+  /// How a merge into the volume is permitted.
+  pub merge: WriteMode,
+  /// How a landing of the volume is permitted.
+  pub land: WriteMode,
 }
 
 /// A live shipper's holder set and the epoch it ships under (A-240): the `2f` candidates it ships to, as their host
@@ -680,6 +707,12 @@ pub struct CompletionRecord {
   pub sequence: u32,
   /// The reply bytes.
   pub result: Vec<u8>,
+  /// For a completion a green's successor adopted from the green's merge records (A-255) whose resend can reach it only
+  /// through its work's route, the work whose submit it completes (A-288): the work's catalog record, that route, is kept
+  /// while the green's owner retains one such completion (`Partition::completions_routed_by`). `None` for every completion
+  /// a verb ran here, and for one of a client on the work's own owner node, whose resend that node's records answer.
+  /// Appended.
+  pub work: Option<VolumeId>,
 }
 
 /// The surface a grant came from (§4.15).
@@ -692,6 +725,8 @@ pub enum GrantSurface {
     /// The harness.
     harness: String,
   },
+  /// The volume's write policy (A-285): the daemon issued the grant itself under a bypass policy. Appended.
+  Policy,
 }
 
 /// A grant's scope.
