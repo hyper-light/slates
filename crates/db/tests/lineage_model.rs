@@ -586,6 +586,96 @@ impl World {
   }
 }
 
+impl World {
+  /// Every (retired host, survivor) pair whose share is still owed.
+  fn owed(&self) -> Vec<(HostId, HostId)> {
+    self
+      .regional
+      .retired
+      .iter()
+      .flat_map(|(departed, retirement)| {
+        retirement
+          .survivors
+          .iter()
+          .map(move |survivor| (*departed, *survivor))
+      })
+      .filter(|(departed, survivor)| self.regional.owes_confirmation(*departed, *survivor))
+      .collect()
+  }
+
+  /// The objects whose owner is a member, so it can write them.
+  fn writable(&self) -> Vec<ObjectId> {
+    self
+      .objects
+      .iter()
+      .filter(|(_, state)| self.regional.members.contains(&state.owner))
+      .map(|(object, _)| *object)
+      .collect()
+  }
+
+  /// One drawn event: an admission, a takeover (never the last member), a write, a settle report, a round of an owed
+  /// share, or a member starting or ending to lag.
+  fn event(&mut self, draw: &mut Draw) {
+    let alive: Vec<HostId> = self.regional.members.clone();
+    match draw.within(0, 9) {
+      0 | 1 => self.admit(),
+      2 if alive.len() > 1 => {
+        if let Some(host) = draw.pick(&alive) {
+          self.kill(host);
+        }
+      }
+      3 | 4 => {
+        if let Some(object) = draw.pick(&self.writable()) {
+          self.write(draw, object);
+        }
+      }
+      5 => {
+        if let Some(owner) = draw.pick(&alive) {
+          self.settle(owner);
+        }
+      }
+      6 | 7 => {
+        if let Some((departed, successor)) = draw.pick(&self.owed()) {
+          self.round(draw, departed, successor);
+        }
+      }
+      8 => {
+        if let Some(host) = draw.pick(&alive) {
+          self.toggle_lagging(host);
+        }
+      }
+      _ => {}
+    }
+  }
+
+  /// `host` starts lagging, or catches up.
+  fn toggle_lagging(&mut self, host: HostId) {
+    if !self.lagging.remove(&host) {
+      self.lagging.insert(host);
+    }
+  }
+
+  /// Quiescence: every member installs, and every share still owed is run, until none is owed or the bound on passes
+  /// is spent; whether the bounds held throughout.
+  fn quiesce(&mut self, draw: &mut Draw) -> bool {
+    let mut bounded = true;
+    self.lagging.clear();
+    self.install(true);
+    for _ in 0..self.regional.retirement_bound() + 4 {
+      let owed = self.owed();
+      if owed.is_empty() {
+        break;
+      }
+      for (departed, successor) in owed {
+        self.round(draw, departed, successor);
+        self.install(true);
+        bounded &= self.bounded();
+      }
+    }
+    bounded
+  }
+}
+
 /// Runs the history `seed` draws: its events, a check of the bounds after each, and every owing share run at the end.
 fn run(seed: u64) -> (Counts, Vec<Violation>, bool) {
   let mut draw = Draw::new(seed);
@@ -601,84 +691,11 @@ fn run(seed: u64) -> (Counts, Vec<Violation>, bool) {
   let mut world = World::formed(&mut draw, members, f, scatter);
   let mut bounded = true;
   for _ in 0..draw.within(8, MAX_EVENTS) {
-    let alive: Vec<HostId> = world.regional.members.clone();
-    match draw.within(0, 9) {
-      0 | 1 => world.admit(),
-      2 if alive.len() > 1 => {
-        if let Some(host) = draw.pick(&alive) {
-          world.kill(host);
-        }
-      }
-      3 | 4 => {
-        let owned: Vec<ObjectId> = world
-          .objects
-          .iter()
-          .filter(|(_, state)| world.regional.members.contains(&state.owner))
-          .map(|(object, _)| *object)
-          .collect();
-        if let Some(object) = draw.pick(&owned) {
-          world.write(&mut draw, object);
-        }
-      }
-      5 => {
-        if let Some(owner) = draw.pick(&alive) {
-          world.settle(owner);
-        }
-      }
-      6 | 7 => {
-        let owed: Vec<(HostId, HostId)> = world
-          .regional
-          .retired
-          .iter()
-          .flat_map(|(departed, retirement)| {
-            retirement
-              .survivors
-              .iter()
-              .map(move |survivor| (*departed, *survivor))
-          })
-          .filter(|(departed, survivor)| world.regional.owes_confirmation(*departed, *survivor))
-          .collect();
-        if let Some((departed, successor)) = draw.pick(&owed) {
-          world.round(&mut draw, departed, successor);
-        }
-      }
-      8 => {
-        if let Some(host) = draw.pick(&alive) {
-          if !world.lagging.remove(&host) {
-            world.lagging.insert(host);
-          }
-        }
-      }
-      _ => {}
-    }
+    world.event(&mut draw);
     world.install(false);
     bounded &= world.bounded();
   }
-  // Quiescence: every member installs, and every share still owed is run, until none is owed or none moves.
-  world.lagging.clear();
-  world.install(true);
-  for _ in 0..world.regional.retirement_bound() + 4 {
-    let owed: Vec<(HostId, HostId)> = world
-      .regional
-      .retired
-      .iter()
-      .flat_map(|(departed, retirement)| {
-        retirement
-          .survivors
-          .iter()
-          .map(move |survivor| (*departed, *survivor))
-      })
-      .filter(|(departed, survivor)| world.regional.owes_confirmation(*departed, *survivor))
-      .collect();
-    if owed.is_empty() {
-      break;
-    }
-    for (departed, successor) in owed {
-      world.round(&mut draw, departed, successor);
-      world.install(true);
-      bounded &= world.bounded();
-    }
-  }
+  bounded &= world.quiesce(&mut draw);
   (world.counts, world.violations, bounded)
 }
 

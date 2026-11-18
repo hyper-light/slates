@@ -930,17 +930,7 @@ fn past_tolerance_case(seed: u64, past: bool) -> PastTolerance {
     .filter(|host| !gone.contains(host))
     .collect();
   members.remove(&DEPARTED);
-  let mut current = Vec::new();
-  if draw.chance(2, 3) {
-    let mut cohort = vec![DEPARTED];
-    let candidates: Vec<HostId> = members.iter().copied().collect();
-    for host in candidates {
-      if cohort.len() < usize::try_from(2 * f + 1).unwrap() && draw.chance(1, 2) {
-        cohort.push(host);
-      }
-    }
-    current.push(cohort);
-  }
+  let current = current_cohort(&mut draw, f, &members);
   let cohorts = vec![settled];
   let surviving: BTreeSet<HostId> = cohorts
     .iter()
@@ -949,17 +939,8 @@ fn past_tolerance_case(seed: u64, past: bool) -> PastTolerance {
     .copied()
     .filter(|host| members.contains(host))
     .collect();
-  let mut held: BTreeMap<HostId, u64> = BTreeMap::new();
-  for host in &surviving {
-    if draw.chance(2, 3) {
-      held.insert(*host, draw.within(1, 4));
-    }
-  }
-  let mut order: Vec<HostId> = surviving.into_iter().collect();
-  for index in (1..order.len()).rev() {
-    let other = usize::try_from(draw.within(0, u64::try_from(index).unwrap())).unwrap();
-    order.swap(index, other);
-  }
+  let held = held_records(&mut draw, &surviving);
+  let order = shuffled(&mut draw, surviving.into_iter().collect());
   PastTolerance {
     quorum,
     members,
@@ -968,6 +949,40 @@ fn past_tolerance_case(seed: u64, past: bool) -> PastTolerance {
     held,
     order,
   }
+}
+
+/// Two times in three, a current cohort of the retired host and up to `2f` of `members`, each drawn by a coin.
+fn current_cohort(draw: &mut Draw, f: u64, members: &BTreeSet<HostId>) -> Vec<Vec<HostId>> {
+  if !draw.chance(2, 3) {
+    return Vec::new();
+  }
+  let mut cohort = vec![DEPARTED];
+  for host in members {
+    if cohort.len() < usize::try_from(2 * f + 1).unwrap() && draw.chance(1, 2) {
+      cohort.push(*host);
+    }
+  }
+  vec![cohort]
+}
+
+/// A record of sequence 1 to 4 on two in three of `surviving`.
+fn held_records(draw: &mut Draw, surviving: &BTreeSet<HostId>) -> BTreeMap<HostId, u64> {
+  let mut held = BTreeMap::new();
+  for host in surviving {
+    if draw.chance(2, 3) {
+      held.insert(*host, draw.within(1, 4));
+    }
+  }
+  held
+}
+
+/// `hosts` in an order `draw` shuffles them into (Fisher-Yates).
+fn shuffled(draw: &mut Draw, mut hosts: Vec<HostId>) -> Vec<HostId> {
+  for index in (1..hosts.len()).rev() {
+    let other = usize::try_from(draw.within(0, u64::try_from(index).unwrap())).unwrap();
+    hosts.swap(index, other);
+  }
+  hosts
 }
 
 /// The verdict after each surviving member has answered in `case.order`, a report of its record or by name holding

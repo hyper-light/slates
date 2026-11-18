@@ -25,7 +25,10 @@
 //!   member, so no holder accepts its records, and the successor is the only member the configuration names for it.
 //! - **Adoption.** An object is adopted once `f + 1` members of each of its recovery cohorts have promised, so
 //!   the adoption meets every record any of them committed; the newest reported record is re-committed under
-//!   the successor's own placement at the round's epoch, and the successor then serves it.
+//!   the successor's own placement at the round's epoch, and the successor then serves it. Past tolerance, when a
+//!   cohort has fewer members left than that quorum, it is adopted once every surviving member of its cohorts, settled
+//!   and current, has promised, with the newest record any of them holds (A-309): the members that exist now recover
+//!   it, where before it was lost and recovered by no one.
 //! - **Confirmation.** A successor confirms its share once every member it asked has answered in full and every
 //!   object it learned is adopted (A-272); the council records it ([`crate::fleet`]'s report stream), and a
 //!   retirement becomes a completion record once every survivor has confirmed or carried its share into a takeover

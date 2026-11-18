@@ -23140,7 +23140,8 @@ model below; each red before its fix):
 - **Bounded** (banned item 8): at most one record per member (`completed_bound`), the oldest let go first, but never
   the record of a survivor that left owing its share while the retirement it carried is kept, since that retirement's
   completion rests on it. A holder that lags past a let-go record keeps a stale copy: a leak bounded by what it holds,
-  never a loss.
+  never a loss. An id admitted again loses its old record (`admit`): it says nothing of the member it names now, and
+  kept it would let a later, uncompleted takeover of the id read as completed.
 - **A move on an unresolved line is allowed** (`RegionalConfiguration::moves`). Records are bounded, so the line of
   every volume whose creator's takeover completed long ago reads unresolved once its record goes; refusing it, as
   A-272 did, would leave such a volume unmovable for good. The configuration names no owner there and holds no claim

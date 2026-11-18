@@ -2546,6 +2546,9 @@ impl RegionalConfiguration {
     if let Some(domain) = domain {
       self.domains.insert(member, domain);
     }
+    // A record of an earlier takeover of this id says nothing of the member it names now (A-309): kept, a later
+    // takeover of it that never completed would read as completed, settling lines nobody adopted.
+    self.completed.remove(&member);
     self.version = version;
     self.fix_neighbourhoods(scatter);
     // An admitted member owns nothing yet, so its first neighbourhood is settled at once. The members whose
@@ -5337,6 +5340,10 @@ mod tests {
     assert!(
       regional.admit(departed, None, scatter),
       "admitted once its takeover is done"
+    );
+    assert!(
+      !regional.completed.contains_key(&departed),
+      "the record of the id's earlier takeover goes with its admission: it says nothing of the member it names now"
     );
   }
 
