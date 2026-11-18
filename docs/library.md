@@ -300,7 +300,5 @@ that hold each one and where they run. What it found owed, with the rest:
 1. A typed field on the wire for a merge's versions (the work's base beside the head).
 2. The async form for the remaining verbs: the paged reads, landings, merges, policies and
    observation.
-3. A test through the library of the Shards stream on Windows (changes, drift, landing plans,
-   grant-bound landing, the paged audit and the async form are tested there since 2026-11-18).
-4. A test of `serve_vhost_user` through the library (Linux).
-5. The example above compiled by a test, so it cannot drift from the API.
+3. A test of `serve_vhost_user` through the library (Linux).
+4. The example above compiled by a test, so it cannot drift from the API.
