@@ -176,6 +176,22 @@ pub(crate) fn resolve(state: &mut ShardState) {
   state.lease_waiters.waiting = still;
 }
 
+/// A verb resumed after waiting: what it needs to run under its own completion key and to answer where it waits.
+pub(crate) struct ResumedVerb {
+  /// Where to reply; `None` for a verb forwarded from another node, whose exchange polls the completion record.
+  pub(crate) route: Option<ReplyRoute>,
+  /// The completion key's origin.
+  pub(crate) origin: u64,
+  /// The request id.
+  pub(crate) id: RequestId,
+  /// The client it was asked by.
+  pub(crate) client_id: u32,
+  /// The principal it was asked as.
+  pub(crate) principal: Principal,
+  /// The verb.
+  pub(crate) body: RequestBody,
+}
+
 /// Runs one resolved waiter: the verb under its completion key when its lease `confirmed`, else the refusal; the
 /// reply recorded as its completion in one durable step and delivered where the request waits.
 fn run(state: &mut ShardState, waiter: LeaseWaiter, confirmed: bool) {
@@ -188,6 +204,63 @@ fn run(state: &mut ShardState, waiter: LeaseWaiter, confirmed: bool) {
     body,
     ..
   } = waiter;
+  let verb = ResumedVerb {
+    route,
+    origin,
+    id,
+    client_id,
+    principal,
+    body,
+  };
+  let refusal = (!confirmed).then(|| {
+    state.count(EXPIRED, 1);
+    crate::verbs::refused(Refusal::LeaseUnconfirmed {
+      version: state.fleet.configuration().version,
+    })
+  });
+  run_resumed(state, verb, refusal, confirmed.then_some(SERVED));
+}
+
+/// Writes `reply`, unrecorded, where `route` says the request waits.
+pub(crate) fn send_reply(state: &mut ShardState, route: ReplyRoute, reply: ReplyBody) {
+  reply_home(state, route, reply);
+}
+
+/// Carries a resumed verb's reply to the client's shard by a task of this shard that waits for room on that shard's
+/// channel (`crate::xshard::send_reply_home`), as a forwarded verb's reply goes. Handed over once with no wait, a burst
+/// of resumed verbs (a green's works answered together, A-247) met full channels and lost their replies, so their
+/// clients waited out their whole reply deadline: 5 a shard on every shard at 3,000 clients.
+fn reply_home(state: &mut ShardState, route: ReplyRoute, reply: ReplyBody) {
+  let carried = slates_rt::futures::spawn(async move {
+    crate::xshard::send_reply_home(route.shard, move || {
+      crate::state::deliver(route.client_index, route.request, reply, true);
+    })
+    .await;
+  });
+  match carried {
+    Ok(task) => {
+      let _ = slates_rt::futures::detach(task);
+    }
+    Err(_) => state.count(UNDELIVERED, 1),
+  }
+}
+
+/// Runs a parked verb under its completion key, or answers its `refusal`: the reply recorded as its completion in one
+/// durable step with its effects and delivered where the request waits; `served`, when given, counted once it is.
+pub(crate) fn run_resumed(
+  state: &mut ShardState,
+  verb: ResumedVerb,
+  refusal: Option<ReplyBody>,
+  served: Option<&'static str>,
+) {
+  let ResumedVerb {
+    route,
+    origin,
+    id,
+    client_id,
+    principal,
+    body,
+  } = verb;
   state.db.begin();
   state.current_request = Some((origin, id));
   state.reply_route = route;
@@ -195,13 +268,9 @@ fn run(state: &mut ShardState, waiter: LeaseWaiter, confirmed: bool) {
   let mark = body
     .volume()
     .and_then(|volume| crate::told::mark(state, crate::verbs::to_db_volume(volume)));
-  let reply = if confirmed {
-    crate::verbs::dispatch(state, client_id, &principal, body)
-  } else {
-    state.count(EXPIRED, 1);
-    crate::verbs::refused(Refusal::LeaseUnconfirmed {
-      version: state.fleet.configuration().version,
-    })
+  let reply = match refusal {
+    Some(refusal) => refusal,
+    None => crate::verbs::dispatch(state, client_id, &principal, body),
   };
   state.current_request = None;
   let route = state.reply_route.take().or(route);
@@ -219,8 +288,8 @@ fn run(state: &mut ShardState, waiter: LeaseWaiter, confirmed: bool) {
     state.count(UNRECORDED, 1);
     return;
   }
-  if confirmed {
-    state.count(SERVED, 1);
+  if let Some(served) = served {
+    state.count(served, 1);
   }
   let Some(route) = route else {
     // A verb forwarded from another node: its exchange polls the completion record.
@@ -235,13 +304,7 @@ fn run(state: &mut ShardState, waiter: LeaseWaiter, confirmed: bool) {
     },
     None => (route, recorded),
   };
-  if crate::xshard::hand_reply_home(route.shard, move || {
-    crate::state::deliver(route.client_index, route.request, recorded, true);
-  })
-  .is_err()
-  {
-    state.count(UNDELIVERED, 1);
-  }
+  reply_home(state, route, recorded);
 }
 
 /// Arms this shard's deadline timer if it is not running: one task that sleeps until the earliest deadline,

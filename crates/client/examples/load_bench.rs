@@ -39,12 +39,26 @@
 //! not yet taken), thinking, pausing after a refusal for now, or held: due to send and not yet sent, by the harness's
 //! sweep or by its connection's ring or in-flight bound. Each is summed where it happens (a held client's wait at its
 //! send, from the instant it was due), and the `offered` row gives each as the time-averaged number of clients, with
-//! the replies and verdicts a second. A latency is stamped at the send, so time a client is held is in no latency row:
-//! a level with clients held measures less than its clients wait, and says so here.
+//! the replies and verdicts a second. A latency is stamped at a send, so the time a client is held before a send is in
+//! no `latency` row, and before an operation's first send in no `operation` row either: a level with clients held
+//! measures less than its clients wait, and says so here.
 //!
-//! Rows: `offered\t<n>\t…` (above), `latency\t<n>\t<kind>\t<count>\t<p50>\t<p99>\t<p999>\t<max>` in nanoseconds, then
-//! `oracle\t<n>\t…` lines; a nonzero `oracle_failures` exits 1. Last, the daemon's own counts of what it lost and of its
-//! waits for room, read from its report at the end of the run: `lost\t<counter>\t<count>` and `room\t<counter>\t<count>`.
+//! **The bound (the `bound` row; Ada's decision of 2026-11-18, A-297).** "1,000 clients under 1 ms" is stated at up to
+//! 10³ verdicts a second, the floor of §1.4's fleet-session row ("Increments per green volume per second: thousands").
+//! A level meets it when every kind's p99, each attempt's (`latency`) and each operation's (`operation`), is under 1 ms
+//! while the level's verdicts a second are at least 10³, with no oracle failure and no client given up or starved. The
+//! row names the worst row and kind with its p99, and the held clients beside them, whose wait no latency row holds. A
+//! cycle and a round leave out their client's own think pauses, which are the client's time, not the service's: left
+//! in, a cycle at the pace that offers 10³ verdicts a second from 1,000 clients holds five pauses of about 200 ms, and
+//! no paced level could meet the bound. At a think mean of 0 they are the cycle's and the round's wall.
+//!
+//! Rows: `offered\t<n>\t…` (above); `latency\t<n>\t<kind>\t<count>\t<p50>\t<p99>\t<p999>\t<max>` in nanoseconds, each
+//! attempt timed alone; then `operation\t…` in the same columns, each logical operation from its first attempt to its
+//! answer, refusals for now and resends included; then `oracle\t<n>\t…` lines; a nonzero `oracle_failures` exits 1;
+//! then `bound\t<n>\t…` (above). Last, from the daemon's own report: `lost\t<counter>\t<count>` for each of its
+//! counters of a lost reply, result, release or ask; `room\t<counter>\t<count>` for its waits for room (begun and
+//! ended, summed over the shards, and the most one shard held at once, goal 238); and `counter\t<counter>\t<count>` for
+//! where a work's submissions were composed.
 // Bench harness code: an unwrap here is a failed run.
 #![allow(
   clippy::unwrap_used,
@@ -96,6 +110,15 @@ const PERCENTILES: &[u64] = &[500, 990, 999];
 const PERMILLE: u64 = 1000;
 /// Shape: the seed of the deterministic plan (splitmix64), so a run is reproducible.
 const SEED: u64 = 0x5eed_1a7e_57c0_ffee;
+/// The bound a level is judged against: every kind's p99 under 1 ms (RQ-4's end-to-end bound; the goal "1,000 clients
+/// under 1 ms", stated by Ada on 2026-11-18 at the offered load below; A-297).
+const BOUND_P99_NS: u64 = 1_000_000;
+/// The offered load the bound is stated at: at least 10³ verdicts a second, the floor of §1.4's fleet-session row
+/// ("Increments per green volume per second: tens (a few agents) | thousands (a fleet session)", hecate MERGE.md §7),
+/// Ada's decision of 2026-11-18. Below it a level measures a lighter load than the bound names, so it cannot meet it.
+const BOUND_VERDICTS_PER_S: u128 = 1_000;
+/// Format: the percentile the bound judges, in parts per thousand: the p99.
+const BOUND_PERMILLE: u64 = 990;
 
 /// The kinds of operation timed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -107,6 +130,13 @@ enum Kind {
   ReadHead,
   Rebase,
   Destroy,
+  /// A round's edit and merge as its client sees it, its own think pauses left out: from sending its first edit to its
+  /// submit's first verdict, an accept or a conflict, every request between included (the goal's own measure: a whole
+  /// edit and merge). A refusal's pause and a held send stay in: the service or the harness kept the client waiting.
+  Cycle,
+  /// A round from its first edit to its accept, conflicts and their resolution included, its own think pauses left
+  /// out as the cycle's are.
+  Round,
 }
 
 /// What a client is doing.
@@ -155,6 +185,15 @@ struct Agent {
   /// submit waiting on the fleet commit is answered `Overloaded` while its acceptance commits), and only the same id
   /// meets its completion record; the client keeps its acknowledgement below the id until the resend.
   retry: Option<(u64, u64, Kind)>,
+  /// When the round's first edit was first sent: the start of its [`Kind::Cycle`] (cleared at its first verdict) and of
+  /// its [`Kind::Round`] (cleared at its accept).
+  cycle_since: Option<u64>,
+  round_since: Option<u64>,
+  /// The think pauses the client drew while its cycle and its round were open, left out of each ([`Agent::thought`]).
+  cycle_thought_ns: u64,
+  round_thought_ns: u64,
+  /// When the current step's first attempt was sent, kept across a refusal for now and its resend.
+  op_since: Option<u64>,
   /// The pause before this client sends again after a refusal for now (`LeaseUnconfirmed`, `AcknowledgementOwed`, a
   /// refusal retryable under its id), doubling while they repeat (`Client::retry_pause_ns`), zero once a reply moves
   /// it on. Resent at once, 1,000 clients refused `LeaseUnconfirmed` after a primary's kill sent 20,000 a second.
@@ -170,7 +209,13 @@ struct Tally {
   /// Replies taken: a worker's sign of motion, for its stall dump.
   answered: u64,
   latencies: BTreeMap<Kind, Vec<u64>>,
+  /// Each logical operation's latency from its first attempt to its answer: a request refused for now
+  /// (`AcknowledgementOwed`, `LeaseUnconfirmed`) and sent again as new, or retried under its id, is one operation whose
+  /// wait includes the refusals, the pauses and the resends. `latencies` times each attempt alone.
+  operations: BTreeMap<Kind, Vec<u64>>,
   submits: Vec<SubmitEvent>,
+  /// The clients that gave up, by why ([`Agent::give_up`]): a refusal the harness does not ride out, a lost connection,
+  /// a retry past its patience.
   refusals: BTreeMap<String, u64>,
   starved: u64,
   rebase_conflicts: u64,
@@ -200,13 +245,42 @@ struct Tally {
 }
 
 impl Tally {
-  /// Adds `other`'s replies taken and its sums of the clients' time into this tally's.
-  fn add_load(&mut self, other: &Tally) {
-    self.answered = self.answered.saturating_add(other.answered);
-    self.in_flight_ns = self.in_flight_ns.saturating_add(other.in_flight_ns);
-    self.thinking_ns = self.thinking_ns.saturating_add(other.thinking_ns);
-    self.paused_ns = self.paused_ns.saturating_add(other.paused_ns);
-    self.held_ns = self.held_ns.saturating_add(other.held_ns);
+  /// Records one logical operation of `kind`, from its first send to its final answer, resends included.
+  fn operation_took(&mut self, kind: Kind, ns: u64) {
+    self.operations.entry(kind).or_default().push(ns);
+  }
+
+  /// Adds a worker's tally into this one.
+  fn absorb(&mut self, mut tally: Tally) {
+    for (kind, mut samples) in std::mem::take(&mut tally.latencies) {
+      self.latencies.entry(kind).or_default().append(&mut samples);
+    }
+    for (kind, mut samples) in std::mem::take(&mut tally.operations) {
+      self
+        .operations
+        .entry(kind)
+        .or_default()
+        .append(&mut samples);
+    }
+    self.submits.append(&mut tally.submits);
+    for (why, count) in tally.refusals {
+      *self.refusals.entry(why).or_default() += count;
+    }
+    self.starved += tally.starved;
+    self.rebase_conflicts += tally.rebase_conflicts;
+    self.max_sweep_ns = self.max_sweep_ns.max(tally.max_sweep_ns);
+    self.reconnects += tally.reconnects;
+    self.resent += tally.resent;
+    self.max_outage_ns = self.max_outage_ns.max(tally.max_outage_ns);
+    self.backpressure += tally.backpressure;
+    self.retried += tally.retried;
+    self.unconfirmed += tally.unconfirmed;
+    self.max_drain_gap_ns = self.max_drain_gap_ns.max(tally.max_drain_gap_ns);
+    self.answered = self.answered.saturating_add(tally.answered);
+    self.in_flight_ns = self.in_flight_ns.saturating_add(tally.in_flight_ns);
+    self.thinking_ns = self.thinking_ns.saturating_add(tally.thinking_ns);
+    self.paused_ns = self.paused_ns.saturating_add(tally.paused_ns);
+    self.held_ns = self.held_ns.saturating_add(tally.held_ns);
   }
 }
 
@@ -500,10 +574,14 @@ impl Agent {
     self.inflight = None;
   }
 
+  /// Moves the client on with `reply`, the answer to its attempt sent at `sent_ns` and taken at `replied_ns`.
+  /// `first_ns` is when the operation's first attempt was sent: a round's cycle starts there, so a refusal for now of
+  /// its first edit, and the pause after it, are in the cycle.
   fn advance(
     &mut self,
     reply: ReplyBody,
     (sent_ns, replied_ns, kind): (u64, u64, Kind),
+    first_ns: u64,
     tally: &mut Tally,
   ) {
     let elapsed = replied_ns.saturating_sub(sent_ns);
@@ -516,6 +594,10 @@ impl Agent {
         record(tally, kind, elapsed);
       }
       (Step::Edit(n), ReplyBody::Edited) => {
+        if n == 0 && self.round_since.is_none() {
+          self.cycle_since = Some(first_ns);
+          self.round_since = Some(first_ns);
+        }
         self.step = if n + 1 < self.slots().len() {
           Step::Edit(n + 1)
         } else {
@@ -599,6 +681,17 @@ impl Agent {
     self.give_up(tally, &short);
   }
 
+  /// Counts a think pause the client drew after a reply, so a cycle and a round open now leave it out: the pause is the
+  /// client's own time, not the service's.
+  fn thought(&mut self, pause_ns: u64) {
+    if self.cycle_since.is_some() {
+      self.cycle_thought_ns = self.cycle_thought_ns.saturating_add(pause_ns);
+    }
+    if self.round_since.is_some() {
+      self.round_thought_ns = self.round_thought_ns.saturating_add(pause_ns);
+    }
+  }
+
   fn submitted(
     &mut self,
     version: Option<u64>,
@@ -607,6 +700,24 @@ impl Agent {
     tally: &mut Tally,
   ) {
     let elapsed = at.1.saturating_sub(at.0);
+    if let Some(start) = self.cycle_since.take() {
+      let thought = std::mem::take(&mut self.cycle_thought_ns);
+      record(
+        tally,
+        Kind::Cycle,
+        at.1.saturating_sub(start).saturating_sub(thought),
+      );
+    }
+    if version.is_some()
+      && let Some(start) = self.round_since.take()
+    {
+      let thought = std::mem::take(&mut self.round_thought_ns);
+      record(
+        tally,
+        Kind::Round,
+        at.1.saturating_sub(start).saturating_sub(thought),
+      );
+    }
     let outcome = match version {
       Some(v) => Outcome::Accepted(v),
       None => Outcome::Conflict(
@@ -897,9 +1008,10 @@ impl Worker {
     }
     match conn.client.begin(&body) {
       Ok(id) => {
-        let sent_ns = ns_since(self.epoch);
-        agent.inflight = Some((id.word(), sent_ns, kind));
-        agent.attempt_sent_ns = sent_ns;
+        let now = ns_since(self.epoch);
+        agent.op_since.get_or_insert(now);
+        agent.inflight = Some((id.word(), now, kind));
+        agent.attempt_sent_ns = now;
         conn.inflight.insert(id.word(), a);
         true
       }
@@ -973,70 +1085,96 @@ impl Worker {
       };
       answered = true;
       self.tally.answered += 1;
-      let agent = &mut self.agents[a];
-      let Some((_, sent_ns, kind)) = agent.inflight.take() else {
-        continue;
-      };
-      self.tally.in_flight_ns = self
-        .tally
-        .in_flight_ns
-        .saturating_add(now.saturating_sub(agent.attempt_sent_ns));
-      if let ReplyBody::Refused { refusal } = &reply
-        && retryable_under_its_id(refusal)
-      {
-        // Bounded: past the client's reconnect budget times the patience, the outcome is left unknown for the oracle.
-        let waited = now.saturating_sub(sent_ns);
-        let budget = conn_reconnect_ns(&self.conns, agent.conn).saturating_mul(reply_patience());
-        if waited > budget {
-          // Given up: the client need no longer keep its acknowledgement below the id.
-          self.conns[agent.conn].client.release_retryable(word);
-          agent.inflight = Some((word, sent_ns, kind));
-          agent.give_up(
-            &mut self.tally,
-            &format!("{kind:?}: still refused retryable after {waited} ns"),
-          );
-          continue;
-        }
-        agent.retry = Some((word, sent_ns, kind));
-        agent.pause_ns = refusal_pause(
-          &self.conns[agent.conn].client,
-          agent.pause_ns,
-          &mut self.tally,
-        );
-        self
-          .ready
-          .push(std::cmp::Reverse((now.saturating_add(agent.pause_ns), a)));
-        continue;
-      }
-      let for_now = matches!(
-        &reply,
-        ReplyBody::Refused {
-          refusal: Refusal::LeaseUnconfirmed { .. } | Refusal::AcknowledgementOwed { .. }
-        }
-      );
-      agent.advance(reply, (sent_ns, now, kind), &mut self.tally);
-      if agent.step != Step::Done {
-        let wait = if for_now {
-          agent.pause_ns = refusal_pause(
-            &self.conns[agent.conn].client,
-            agent.pause_ns,
-            &mut self.tally,
-          );
-          agent.pause_ns
-        } else {
-          agent.pause_ns = 0;
-          self.think.draw(&mut self.tally)
-        };
-        self
-          .ready
-          .push(std::cmp::Reverse((now.saturating_add(wait), a)));
-      }
+      self.take_answer(a, word, reply, now);
     }
     // The daemon keeps every reply's completion record until the client acknowledges it, and refuses a client that
     // owes too many (`AcknowledgementOwed`): an async caller acknowledges as it goes, unawaited, never past a request
     // it still awaits.
     if answered && let Err(e) = self.conns[c].client.begin_ack_if_due() {
       self.fail_connection(c, &format!("acknowledge: {e}"));
+    }
+  }
+
+  /// Moves client `a` on with `reply`, the answer to its request `word`, arrived at `now`: a retryable refusal is
+  /// resent under its id (or given up past the patience); any other answer advances the client and, once it is final,
+  /// records the logical operation from its first send.
+  fn take_answer(&mut self, a: usize, word: u64, reply: ReplyBody, now: u64) {
+    let agent = &mut self.agents[a];
+    let Some((_, sent_ns, kind)) = agent.inflight.take() else {
+      return;
+    };
+    self.tally.in_flight_ns = self
+      .tally
+      .in_flight_ns
+      .saturating_add(now.saturating_sub(agent.attempt_sent_ns));
+    if let ReplyBody::Refused { refusal } = &reply
+      && retryable_under_its_id(refusal)
+    {
+      // Bounded: past the client's reconnect budget times the patience, the outcome is left unknown for the oracle.
+      let waited = now.saturating_sub(sent_ns);
+      let budget = conn_reconnect_ns(&self.conns, agent.conn).saturating_mul(reply_patience());
+      if waited > budget {
+        // Given up: the client need no longer keep its acknowledgement below the id.
+        self.conns[agent.conn].client.release_retryable(word);
+        agent.inflight = Some((word, sent_ns, kind));
+        agent.give_up(
+          &mut self.tally,
+          &format!("{kind:?}: still refused retryable after {waited} ns"),
+        );
+        return;
+      }
+      agent.retry = Some((word, sent_ns, kind));
+      agent.pause_ns = refusal_pause(
+        &self.conns[agent.conn].client,
+        agent.pause_ns,
+        &mut self.tally,
+      );
+      self
+        .ready
+        .push(std::cmp::Reverse((now.saturating_add(agent.pause_ns), a)));
+      return;
+    }
+    let for_now = matches!(
+      &reply,
+      ReplyBody::Refused {
+        refusal: Refusal::LeaseUnconfirmed { .. } | Refusal::AcknowledgementOwed { .. }
+      }
+    );
+    let refused = matches!(&reply, ReplyBody::Refused { .. });
+    // A submit's operation is filed under its outcome, as its attempt's latency is (`Agent::submitted`).
+    let outcome = match &reply {
+      ReplyBody::Submitted { version: None, .. } => Kind::SubmitConflict,
+      _ => kind,
+    };
+    let first = if for_now { None } else { agent.op_since.take() };
+    agent.advance(
+      reply,
+      (sent_ns, now, kind),
+      first.unwrap_or(sent_ns),
+      &mut self.tally,
+    );
+    if !refused && let Some(first) = first {
+      self
+        .tally
+        .operation_took(outcome, now.saturating_sub(first));
+    }
+    if agent.step != Step::Done {
+      let wait = if for_now {
+        agent.pause_ns = refusal_pause(
+          &self.conns[agent.conn].client,
+          agent.pause_ns,
+          &mut self.tally,
+        );
+        agent.pause_ns
+      } else {
+        agent.pause_ns = 0;
+        let pause = self.think.draw(&mut self.tally);
+        agent.thought(pause);
+        pause
+      };
+      self
+        .ready
+        .push(std::cmp::Reverse((now.saturating_add(wait), a)));
     }
   }
 
@@ -1357,6 +1495,19 @@ fn report(n: usize, tally: &mut Tally) {
       samples.last().copied().unwrap_or(0)
     );
   }
+  for (kind, samples) in &mut tally.operations {
+    samples.sort_unstable();
+    let cuts: Vec<String> = PERCENTILES
+      .iter()
+      .map(|p| percentile(samples, *p).to_string())
+      .collect();
+    println!(
+      "operation\t{n}\t{kind:?}\t{}\t{}\t{}",
+      samples.len(),
+      cuts.join("\t"),
+      samples.last().copied().unwrap_or(0)
+    );
+  }
   for (why, count) in &tally.refusals {
     println!("refusal\t{n}\t{count}\t{why}");
   }
@@ -1402,12 +1553,6 @@ fn per_second(count: u64, wall_ns: u64) -> u128 {
 /// loop that sum is the throughput times each operation's cycle, request and pause together (Little's law), so `held`
 /// is the share of the clients the harness or a connection's bound kept back: their wait is in no latency row.
 fn offered_row(n: usize, think_mean_ns: u64, wall_ns: u64, tally: &Tally) -> String {
-  let count = |kind: Kind| {
-    tally.latencies.get(&kind).map_or(0, |samples| {
-      u64::try_from(samples.len()).unwrap_or(u64::MAX)
-    })
-  };
-  let verdicts = count(Kind::SubmitAccepted).saturating_add(count(Kind::SubmitConflict));
   let alive = tally
     .in_flight_ns
     .saturating_add(tally.thinking_ns)
@@ -1416,13 +1561,64 @@ fn offered_row(n: usize, think_mean_ns: u64, wall_ns: u64, tally: &Tally) -> Str
   format!(
     "offered\t{n}\tthink_mean_ns\t{think_mean_ns}\treplies_per_s\t{}\tverdicts_per_s\t{}\trebases_per_s\t{}\talive\t{}\tin_flight\t{}\tthinking\t{}\tpaused\t{}\theld\t{}",
     per_second(tally.answered, wall_ns),
-    per_second(verdicts, wall_ns),
-    per_second(count(Kind::Rebase), wall_ns),
+    per_second(verdicts(tally), wall_ns),
+    per_second(attempts(tally, Kind::Rebase), wall_ns),
     tenths(alive, wall_ns),
     tenths(tally.in_flight_ns, wall_ns),
     tenths(tally.thinking_ns, wall_ns),
     tenths(tally.paused_ns, wall_ns),
     tenths(tally.held_ns, wall_ns),
+  )
+}
+
+/// The attempts of `kind` the level timed.
+fn attempts(tally: &Tally, kind: Kind) -> u64 {
+  tally.latencies.get(&kind).map_or(0, |samples| {
+    u64::try_from(samples.len()).unwrap_or(u64::MAX)
+  })
+}
+
+/// The verdicts the level took: its submits answered, accepted or in conflict.
+fn verdicts(tally: &Tally) -> u64 {
+  attempts(tally, Kind::SubmitAccepted).saturating_add(attempts(tally, Kind::SubmitConflict))
+}
+
+/// The level judged against the bound (the module's "The bound"; Ada's decision of 2026-11-18): the bound and the
+/// verdicts a second it is stated at; the level's own verdicts a second; the worst p99 of every kind, each attempt's
+/// (`latency`) and each operation's (`operation`), with its row and kind; the clients held, time-averaged as in the
+/// `offered` row, whose wait no latency row holds; the clients given up or starved; the oracle's failures; and
+/// `met\tyes` when the level met the bound, else `met\tno`. A level that timed nothing meets nothing.
+fn bound_row(n: usize, wall_ns: u64, tally: &Tally, oracle_failures: u64) -> String {
+  let verdicts_per_s = per_second(verdicts(tally), wall_ns);
+  let worst = [
+    ("latency", &tally.latencies),
+    ("operation", &tally.operations),
+  ]
+  .into_iter()
+  .flat_map(|(row, kinds)| {
+    kinds.iter().map(move |(kind, samples)| {
+      let mut sorted = samples.clone();
+      sorted.sort_unstable();
+      (percentile(&sorted, BOUND_PERMILLE), row, *kind)
+    })
+  })
+  .max();
+  let gave_up = tally
+    .refusals
+    .values()
+    .fold(tally.starved, |sum, count| sum.saturating_add(*count));
+  let met = worst.is_some_and(|(p99, _, _)| p99 < BOUND_P99_NS)
+    && verdicts_per_s >= BOUND_VERDICTS_PER_S
+    && gave_up == 0
+    && oracle_failures == 0;
+  let (worst_p99, worst_row, worst_kind) = worst
+    .map_or((0, "none", "none".to_owned()), |(p99, row, kind)| {
+      (p99, row, format!("{kind:?}"))
+    });
+  format!(
+    "bound\t{n}\tp99_bound_ns\t{BOUND_P99_NS}\tverdicts_floor_per_s\t{BOUND_VERDICTS_PER_S}\tverdicts_per_s\t{verdicts_per_s}\tworst\t{worst_row}\t{worst_kind}\tworst_p99_ns\t{worst_p99}\theld\t{}\tgave_up\t{gave_up}\toracle_failures\t{oracle_failures}\tmet\t{}",
+    tenths(tally.held_ns, wall_ns),
+    if met { "yes" } else { "no" },
   )
 }
 
@@ -1611,6 +1807,11 @@ fn spread(
       resolutions: 0,
       inflight: None,
       retry: None,
+      cycle_since: None,
+      round_since: None,
+      cycle_thought_ns: 0,
+      round_thought_ns: 0,
+      op_since: None,
       pause_ns: 0,
       attempt_sent_ns: 0,
     });
@@ -1713,45 +1914,13 @@ fn level(
       .map(|handle| handle.join().unwrap())
       .collect()
   });
-  let wall = epoch.elapsed();
+  let wall_ns = u64::try_from(epoch.elapsed().as_nanos()).unwrap_or(u64::MAX);
   let mut total = Tally::default();
-  for mut tally in tallies {
-    total.add_load(&tally);
-    for (kind, mut samples) in std::mem::take(&mut tally.latencies) {
-      total
-        .latencies
-        .entry(kind)
-        .or_default()
-        .append(&mut samples);
-    }
-    total.submits.append(&mut tally.submits);
-    for (why, count) in tally.refusals {
-      *total.refusals.entry(why).or_default() += count;
-    }
-    total.starved += tally.starved;
-    total.rebase_conflicts += tally.rebase_conflicts;
-    total.max_sweep_ns = total.max_sweep_ns.max(tally.max_sweep_ns);
-    total.reconnects += tally.reconnects;
-    total.resent += tally.resent;
-    total.max_outage_ns = total.max_outage_ns.max(tally.max_outage_ns);
-    total.backpressure += tally.backpressure;
-    total.retried += tally.retried;
-    total.unconfirmed += tally.unconfirmed;
-    total.max_drain_gap_ns = total.max_drain_gap_ns.max(tally.max_drain_gap_ns);
+  for tally in tallies {
+    total.absorb(tally);
   }
-  println!(
-    "level\t{n}\twall_ns\t{}\tworkers\t{workers}",
-    wall.as_nanos()
-  );
-  println!(
-    "{}",
-    offered_row(
-      n,
-      think_mean,
-      u64::try_from(wall.as_nanos()).unwrap_or(u64::MAX),
-      &total
-    )
-  );
+  println!("level\t{n}\twall_ns\t{wall_ns}\tworkers\t{workers}");
+  println!("{}", offered_row(n, think_mean, wall_ns, &total));
   report(n, &mut total);
   // Version numbers in the events are absolute; rebase them to this level's first version for the oracle.
   for event in &mut total.submits {
@@ -1791,9 +1960,12 @@ fn level(
   let judged = oracle(n, &total.submits, base, |path| {
     read_patiently(&mut reader, green, path, ReadAt::Head)
   });
-  u64::try_from(unexplained.len()).unwrap_or(u64::MAX)
-    + judged
-    + own_files_oracle(n, &mut reader, green, &total.submits)
+  let failures = u64::try_from(unexplained.len())
+    .unwrap_or(u64::MAX)
+    .saturating_add(judged)
+    .saturating_add(own_files_oracle(n, &mut reader, green, &total.submits));
+  println!("{}", bound_row(n, wall_ns, &total, failures));
+  failures
 }
 
 /// Format: the hexadecimal digits of a volume id, as the CLI prints it.
@@ -1820,11 +1992,11 @@ fn arg(name: &str) -> Option<String> {
   args.find(|a| a == name).and_then(|_| args.next())
 }
 
-/// Format: the daemon's counters of a reply, a result or a release it lost, printed at the end of a run as
-/// `lost\t<counter>\t<count>`, every shard summed, a zero printed too. Since A-232 a client waits for a lost reply while
-/// its daemon lives, so a run's latencies alone cannot show one (goal 238: about 4,200 `xshard.reply_dropped` a run of
-/// the 3,000-client rung on main before the carrier).
-const LOSS_COUNTERS: [&str; 11] = [
+/// Format: the daemon's counters of a reply, a result, a release or an ask that was lost or refused for want of room, read
+/// at the end of a run: `lost\t<counter>\t<count>`, all shards summed, a zero printed too. Since A-232 a client waits
+/// for a lost reply while its daemon lives, so a run's latencies alone do not show one (goal 238: about 4,200
+/// `xshard.reply_dropped` a run of the 3,000-client rung on main before the carrier).
+const LOSS_COUNTERS: [&str; 15] = [
   "xshard.reply_dropped",
   "xshard.keep_refused",
   "xshard.unstarted_unanswered",
@@ -1836,20 +2008,17 @@ const LOSS_COUNTERS: [&str; 11] = [
   "fleet.live.undelivered",
   "merge.acceptance_undelivered",
   "winfsp.reply_undelivered",
+  "merge.work.ask_unanswered",
+  "merge.work.park_full",
+  "merge.work.pending_stuck",
+  "merge.work.floor_not_sent",
 ];
 
-/// Prints [`LOSS_COUNTERS`] and the daemon's waits for room (`room\t<counter>\t<count>`: begun and ended summed over
-/// the shards, and the most any one shard held at once) from its own report, through a connection made now, as the
-/// oracle reads. A report the daemon could not give is printed, not fatal: the run's rows stand without it.
-fn report_losses(instance: &str) {
-  let report = match connect(first_instance(instance)).and_then(|mut reader| reader.daemon_status())
-  {
-    Ok(report) => report,
-    Err(error) => {
-      println!("lost\tunavailable\t{error:?}");
-      return;
-    }
-  };
+/// Prints [`LOSS_COUNTERS`], the daemon's waits for room (`room\t<counter>\t<count>`: begun and ended summed over the
+/// shards, and the most any one shard held at once) and where a work's submissions were composed
+/// (`counter\t<counter>\t<count>`), from the daemon's own report.
+fn report_losses(client: &mut Client) {
+  let report = client.daemon_status().unwrap();
   let per_shard = |name: &'static str| {
     report.shards.iter().map(move |shard| {
       shard
@@ -1868,6 +2037,12 @@ fn report_losses(instance: &str) {
   }
   let peak = per_shard("xshard.room_waits_peak").max().unwrap_or(0);
   println!("room\txshard.room_waits_peak\t{peak}");
+  for name in [
+    "merge.work.composed_on_work",
+    "merge.work.composed_by_owner",
+  ] {
+    println!("counter\t{name}\t{}", per_shard(name).sum::<u64>());
+  }
 }
 
 fn main() {
@@ -1943,7 +2118,7 @@ fn main() {
       workers.min(n),
     );
   }
-  report_losses(&instance);
+  report_losses(&mut setup);
   drop(setup);
   if let Some(daemon) = daemon {
     daemon.stop();
@@ -2064,5 +2239,271 @@ mod tests {
     let row = offered_row(1, 0, 0, &tally);
     assert!(row.contains("\treplies_per_s\t0\t"), "{row:?}");
     assert!(row.ends_with("\theld\t0.0"), "{row:?}");
+  }
+
+  /// Shape: a second, the wall of the bound row's tests.
+  const SECOND_NS: u64 = 1_000_000_000;
+
+  /// A client whose work exists, at its first round's first edit; the round edits two slots of one file.
+  fn agent_at_its_first_edit() -> Agent {
+    let slot = |at: u64| Slot {
+      path: "/f".to_owned(),
+      at,
+      bytes: vec![b'x'; usize::try_from(SLOT_BYTES).unwrap()],
+    };
+    Agent {
+      own_len: 0,
+      resolving: (0, Vec::new()),
+      id: 0,
+      conn: 0,
+      green: VolumeId { bytes: [1; 16] },
+      work: Some(VolumeId { bytes: [2; 16] }),
+      base: 0,
+      rounds: vec![vec![slot(0), slot(SLOT_STRIDE)]],
+      round: 0,
+      step: Step::Edit(0),
+      windows: Vec::new(),
+      resolutions: 0,
+      inflight: None,
+      retry: None,
+      cycle_since: None,
+      round_since: None,
+      cycle_thought_ns: 0,
+      round_thought_ns: 0,
+      op_since: None,
+      pause_ns: 0,
+      attempt_sent_ns: 0,
+    }
+  }
+
+  /// Runs `replies` through `agent` in turn as a worker does: each sent `pause_ns` after the last was taken and
+  /// answered `latency_ns` after it was sent, the pause drawn after each reply counted as the client's thinking.
+  /// Returns when the last was taken.
+  fn exchange(
+    agent: &mut Agent,
+    tally: &mut Tally,
+    mut now: u64,
+    (latency_ns, pause_ns): (u64, u64),
+    replies: Vec<(ReplyBody, Kind)>,
+  ) -> u64 {
+    for (reply, kind) in replies {
+      let sent = now;
+      now = sent + latency_ns;
+      agent.advance(reply, (sent, now, kind), sent, tally);
+      agent.thought(pause_ns);
+      now += pause_ns;
+    }
+    now - pause_ns
+  }
+
+  /// A submit's reply: accepted as `version`, or in conflict over `conflicts`.
+  fn verdict(version: Option<u64>, conflicts: Vec<MergeWindow>) -> (ReplyBody, Kind) {
+    (
+      ReplyBody::Submitted { version, conflicts },
+      Kind::SubmitAccepted,
+    )
+  }
+
+  fn only(tally: &Tally, kind: Kind) -> Vec<u64> {
+    tally.latencies.get(&kind).cloned().unwrap_or_default()
+  }
+
+  /// AC-9.1 (the bound's own measure, a whole edit and merge): a client edits two slots, appends and submits, thinking
+  /// 50 ms after each reply, each request answered in 100 µs; its cycle and its round are its four requests, 400 µs,
+  /// not the 150 ms it thought between them, and the pause after its accept is in neither.
+  #[test]
+  fn a_cycle_and_a_round_leave_out_their_clients_think_pauses() {
+    const LATENCY_NS: u64 = 100_000;
+    const PAUSE_NS: u64 = 50_000_000;
+    let mut agent = agent_at_its_first_edit();
+    let mut tally = Tally::default();
+    exchange(
+      &mut agent,
+      &mut tally,
+      SECOND_NS,
+      (LATENCY_NS, PAUSE_NS),
+      vec![
+        (ReplyBody::Edited, Kind::Edit),
+        (ReplyBody::Edited, Kind::Edit),
+        (ReplyBody::Edited, Kind::Edit),
+        verdict(Some(1), Vec::new()),
+      ],
+    );
+    assert_eq!(only(&tally, Kind::Cycle), vec![4 * LATENCY_NS]);
+    assert_eq!(only(&tally, Kind::Round), vec![4 * LATENCY_NS]);
+    assert_eq!(agent.step, Step::Destroy, "one round, then the work goes");
+  }
+
+  /// AC-9.1: a round that meets a conflict and resolves it is every request of it, the resolution's too, and none of
+  /// the pauses: the cycle ends at the first verdict (four requests), the round at the accept (eleven).
+  #[test]
+  fn a_round_through_a_conflict_counts_its_resolution_and_none_of_its_pauses() {
+    const LATENCY_NS: u64 = 100_000;
+    const PAUSE_NS: u64 = 30_000_000;
+    let mut agent = agent_at_its_first_edit();
+    let mut tally = Tally::default();
+    let window = MergeWindow {
+      path: "/f".to_owned(),
+      at: 0,
+      len: SLOT_BYTES,
+      class: 0,
+    };
+    let now = exchange(
+      &mut agent,
+      &mut tally,
+      SECOND_NS,
+      (LATENCY_NS, PAUSE_NS),
+      vec![
+        (ReplyBody::Edited, Kind::Edit),
+        (ReplyBody::Edited, Kind::Edit),
+        (ReplyBody::Edited, Kind::Edit),
+        verdict(None, vec![window]),
+      ],
+    );
+    assert_eq!(only(&tally, Kind::Cycle), vec![4 * LATENCY_NS]);
+    assert!(only(&tally, Kind::Round).is_empty(), "the round is open");
+    let window_bytes = vec![b'g'; usize::try_from(SLOT_BYTES).unwrap()];
+    exchange(
+      &mut agent,
+      &mut tally,
+      now + PAUSE_NS,
+      (LATENCY_NS, PAUSE_NS),
+      vec![
+        (ReplyBody::Versions { head: 1 }, Kind::ReadHead),
+        (
+          ReplyBody::ReadPage {
+            bytes: window_bytes,
+            total: SLOT_BYTES,
+            stamp: 0,
+          },
+          Kind::ReadHead,
+        ),
+        (ReplyBody::Edited, Kind::Edit),
+        (
+          ReplyBody::Rebased {
+            version: Some(1),
+            conflicts: Vec::new(),
+          },
+          Kind::Rebase,
+        ),
+        (ReplyBody::Edited, Kind::Edit),
+        (ReplyBody::Edited, Kind::Edit),
+        verdict(Some(2), Vec::new()),
+      ],
+    );
+    assert_eq!(only(&tally, Kind::Cycle), vec![4 * LATENCY_NS], "one cycle");
+    assert_eq!(only(&tally, Kind::Round), vec![11 * LATENCY_NS]);
+  }
+
+  /// AC-9.1: the cycle starts at its first edit's first send, so a refusal for now of that edit and the client's
+  /// pause after it are in the cycle: the edit first sent at 1 s is refused and answered on its resend at 1.003 s.
+  #[test]
+  fn a_cycle_starts_at_its_first_edits_first_send() {
+    let mut agent = agent_at_its_first_edit();
+    let mut tally = Tally::default();
+    let first = SECOND_NS;
+    let resent = first + 2_000_000;
+    agent.advance(
+      ReplyBody::Edited,
+      (resent, resent + 1_000_000, Kind::Edit),
+      first,
+      &mut tally,
+    );
+    exchange(
+      &mut agent,
+      &mut tally,
+      resent + 1_000_000,
+      (0, 0),
+      vec![
+        (ReplyBody::Edited, Kind::Edit),
+        (ReplyBody::Edited, Kind::Edit),
+        verdict(Some(1), Vec::new()),
+      ],
+    );
+    assert_eq!(only(&tally, Kind::Cycle), vec![3_000_000]);
+  }
+
+  /// A tally of `verdicts` accepted submits each answered in `submit_ns`, and as many edits in `edit_ns`, each one
+  /// operation.
+  fn tally_of(verdicts: usize, submit_ns: u64, edit_ns: u64) -> Tally {
+    let mut tally = Tally::default();
+    for _ in 0..verdicts {
+      record(&mut tally, Kind::SubmitAccepted, submit_ns);
+      record(&mut tally, Kind::Edit, edit_ns);
+      tally.operation_took(Kind::SubmitAccepted, submit_ns);
+      tally.operation_took(Kind::Edit, edit_ns);
+    }
+    tally
+  }
+
+  /// AC-9.1 (the bound, Ada's decision of 2026-11-18): 1,000 verdicts in a second, every kind's p99 under 1 ms, no
+  /// failure and nobody given up meets it, naming its worst kind; a level at the bound's own rate is enough.
+  #[test]
+  fn a_level_with_every_kind_under_the_bound_at_its_rate_meets_it() {
+    let tally = tally_of(1_000, 400_000, 90_000);
+    let row = bound_row(1_000, SECOND_NS, &tally, 0);
+    for field in [
+      "bound\t1000\tp99_bound_ns\t1000000\tverdicts_floor_per_s\t1000\t",
+      "\tverdicts_per_s\t1000\t",
+      "\tworst\toperation\tSubmitAccepted\tworst_p99_ns\t400000\t",
+      "\tgave_up\t0\toracle_failures\t0\t",
+    ] {
+      assert!(row.contains(field), "{row:?} lacks {field:?}");
+    }
+    assert!(row.ends_with("\tmet\tyes"), "{row:?}");
+  }
+
+  /// AC-9.1: one kind's p99 over the bound fails the level and is named, whatever the others: two of 100 rebases at
+  /// 1.5 ms put the rebases' p99 there; a p99 of exactly 1 ms is not under it.
+  #[test]
+  fn one_kind_over_the_bound_fails_the_level_and_is_named() {
+    let mut tally = tally_of(1_000, 400_000, 90_000);
+    for at in 0..100 {
+      tally.operation_took(Kind::Rebase, if at < 2 { 1_500_000 } else { 200_000 });
+    }
+    let row = bound_row(1_000, SECOND_NS, &tally, 0);
+    assert!(
+      row.contains("\tworst\toperation\tRebase\tworst_p99_ns\t1500000\t"),
+      "{row:?}"
+    );
+    assert!(row.ends_with("\tmet\tno"), "{row:?}");
+    let at_the_bound = tally_of(1_000, BOUND_P99_NS, 90_000);
+    let row = bound_row(1_000, SECOND_NS, &at_the_bound, 0);
+    assert!(row.ends_with("\tmet\tno"), "{row:?}");
+  }
+
+  /// AC-9.1: a level below the bound's rate, with an oracle failure, with a client given up or starved, or with nothing
+  /// timed does not meet it, however fast its replies.
+  #[test]
+  fn a_level_below_the_rate_or_failed_or_incomplete_does_not_meet_the_bound() {
+    let fast = || tally_of(1_000, 10_000, 10_000);
+    let below = bound_row(1_000, 2 * SECOND_NS, &fast(), 0);
+    assert!(below.contains("\tverdicts_per_s\t500\t"), "{below:?}");
+    assert!(below.ends_with("\tmet\tno"), "{below:?}");
+    let failed = bound_row(1_000, SECOND_NS, &fast(), 1);
+    assert!(
+      failed.ends_with("\toracle_failures\t1\tmet\tno"),
+      "{failed:?}"
+    );
+    let mut gave_up = fast();
+    gave_up.refusals.insert("Submit: NotFound".to_owned(), 1);
+    let row = bound_row(1_000, SECOND_NS, &gave_up, 0);
+    assert!(
+      row.contains("\tgave_up\t1\t") && row.ends_with("\tmet\tno"),
+      "{row:?}"
+    );
+    let mut starved = fast();
+    starved.starved = 1;
+    let row = bound_row(1_000, SECOND_NS, &starved, 0);
+    assert!(
+      row.contains("\tgave_up\t1\t") && row.ends_with("\tmet\tno"),
+      "{row:?}"
+    );
+    let empty = bound_row(1_000, SECOND_NS, &Tally::default(), 0);
+    assert!(
+      empty.contains("\tworst\tnone\tnone\tworst_p99_ns\t0\t"),
+      "{empty:?}"
+    );
+    assert!(empty.ends_with("\tmet\tno"), "{empty:?}");
   }
 }
