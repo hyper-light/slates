@@ -2454,11 +2454,16 @@
 >   before the scheduler looked, and was judged wedged: the same test ended `Deadline { stage: Admission }` 3.019 s after
 >   it asked, its answer already sent (1 of 32 runs of the failing tree on windows-latest, diag-g243-2, where a look at the
 >   scheduler is a 3 ms snapshot). It now reads the clock again after the scheduler answers (`OwnTime::next_window_ns`);
->   record `docs/bugs/2026-11-18-an-observation-read-the-clock-before-the-scheduler.md`. **Open, reported:** the
->   watchdog's look (`look_at`, then `read_runs`) and the anchor's start judgment (`judge_start_of`) read in the same
->   order; their whole-window rule leaves the gap one look wide, at the end of a window the shard sat still through; and
->   no `ci.yml` lane runs the liveness suite on Windows (`docs/wip/ci-matrix.md`), which is why only a diagnostics run saw
->   this. The anchor's start judgment
+>   record `docs/bugs/2026-11-18-an-observation-read-the-clock-before-the-scheduler.md`. **Its two siblings, reported then,
+>   closed 2026-11-18 (g251):** the watchdog's look (`look_at`, then `read_runs`) and the anchor's start judgment
+>   (`judge_start_of`) read in the same order, so a shard or a start blocked in a call for most of a window, whose call
+>   returned between the first read and the scheduler's answer, was judged stuck as it parked. Each now reads again after
+>   the answer (`watchdog::after_the_answer`; `anchor::judge_start_by`, when the answer is a block): a step, a park or a
+>   clock risen at the second read is movement. Red with the second read ignored, each at its own assertion
+>   (`a_shard_that_moves_between_the_look_and_the_schedulers_answer_has_moved`: `Wedged` where `Alive` was due;
+>   `a_start_that_runs_between_its_clock_and_the_schedulers_answer_has_moved`: likewise). Still open: no `ci.yml` lane
+>   runs the liveness suite on Windows (`docs/wip/ci-matrix.md`), which is why only a diagnostics run saw the first.
+>   The anchor's start judgment
 >   (`crates/api/src/role/anchor.rs`, `process_clock`) judged a whole process by CPU time with no scheduler reading, so a
 >   start starved for a whole window was killed ("the starting daemon made no progress for 1014 ms; killing it", in
 >   `held_rendezvous` on CI's Windows runner): **fixed 2026-11-08 (bug-sweep).** It now asks whether any of the start's

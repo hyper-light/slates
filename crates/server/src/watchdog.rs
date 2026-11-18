@@ -918,9 +918,39 @@ fn look_at(holder: SlotHolder, now_ns: u64) -> Option<Look> {
   })
 }
 
+/// A suspected shard's look once the scheduler has answered for it (`run`), with its pulse and clock read again after
+/// that answer (`again`; g243's rule for an observation, `crate::observe`'s `OwnTime`, which this look shares): a shard
+/// that stepped, parked or ran between the first read and the answer has moved, whatever the answer says, and the look
+/// takes the second read. With none of that, the first read stands beside the answer, and the answer stands for the
+/// window: a thread leaves the run queue for a block only by running, which its clock would show. With only the first
+/// read, a shard blocked in a call for most of a window whose call returned just then ran, stepped and parked before the
+/// scheduler looked, and was judged wedged (still for the window, never runnable) while it was parked; a lone daemon
+/// ends its process on that verdict (A-232). No second read (its slot reused) leaves the first.
+fn after_the_answer(first: Look, run: Option<RunReading>, again: Option<Look>) -> Look {
+  let answered = Look { run, ..first };
+  let Some(again) = again else {
+    return answered;
+  };
+  let ran = match (first.cpu, again.cpu) {
+    (Some((_, before)), Some((_, after))) => after > before,
+    _ => false,
+  };
+  if again.steps != first.steps || again.parked || ran {
+    Look {
+      steps: again.steps,
+      parked: again.parked,
+      cpu: again.cpu,
+      ..answered
+    }
+  } else {
+    answered
+  }
+}
+
 /// Asks the scheduler about the shards under suspicion, all at once (at most one Windows snapshot a beat), and reads the
 /// host's memory stall once for the look (A-336), into every shard's look: a look that suspects no shard reads neither,
-/// so a daemon whose shards step or park costs nothing more than before.
+/// so a daemon whose shards step or park costs nothing more than before. Each suspected shard's pulse and clock are read
+/// again after the scheduler's answer ([`after_the_answer`]).
 fn read_runs(
   holders: &[SlotHolder],
   watches: &[ShardWatch],
@@ -950,9 +980,9 @@ fn read_runs(
     .filter_map(|index| holders.get(index).map(|holder| (index, *holder)))
     .unzip();
   let readings = slates_rt::registry::shard_run_readings(&asked);
-  for (index, reading) in at.into_iter().zip(readings) {
+  for ((index, holder), reading) in at.into_iter().zip(asked).zip(readings) {
     if let Some(Some(look)) = looks.get_mut(index) {
-      look.run = reading;
+      *look = after_the_answer(*look, reading, look_at(holder, look.now_ns));
     }
   }
 }
@@ -1160,6 +1190,77 @@ mod tests {
       verdicts.push(verdict);
     }
     verdicts
+  }
+
+  /// g243's sibling (`docs/bugs/2026-11-18-an-observation-read-the-clock-before-the-scheduler.md`), §4.14. Do: watch a
+  /// shard blocked in a call, still and never runnable, for most of a window; at the look that would end the window,
+  /// script its reads in the order the watchdog takes them: the pulse and the clock still, the scheduler finding it blocked,
+  /// and the pulse and the clock read again after that answer showing it ran, stepped and parked (its call returned
+  /// between the first read and the scheduler's look). Expect: alive, and the next look's history starts from that step.
+  /// The old order took only the first read: the shard still for the whole window and not runnable, it was judged wedged
+  /// while it was parked, having just stepped, and a lone daemon ended its process on that verdict (A-232).
+  #[test]
+  fn a_shard_that_moves_between_the_look_and_the_schedulers_answer_has_moved() {
+    let (_, mut watch) =
+      ShardWatch::default().judge(look(5, false, Some((10, 10)), TURN), WINDOW, WINDOW);
+    for turn in 2..=10_u64 {
+      let still = Look {
+        run: blocked(None),
+        ..look(5, false, Some((10, 10)), turn * TURN)
+      };
+      let (verdict, next) = watch.judge(still, WINDOW, WINDOW);
+      assert_eq!(
+        verdict,
+        Verdict::Alive,
+        "turn {turn}: still for less than a window"
+      );
+      watch = next;
+    }
+    let at = 11 * TURN;
+    let first = look(5, false, Some((10, 10)), at);
+    let again = Some(look(6, true, Some((12, 12)), at));
+    let folded = after_the_answer(first, blocked(None), again);
+    let (verdict, next) = watch.judge(folded, WINDOW, WINDOW);
+    assert_eq!(
+      verdict,
+      Verdict::Alive,
+      "it stepped and parked between the first read and the scheduler's answer: {folded:?}"
+    );
+    // With nothing moved at the second read, the first read stands with the answer: the window it sat still in is its.
+    let (_, mut still_watch) =
+      ShardWatch::default().judge(look(5, false, Some((10, 10)), TURN), WINDOW, WINDOW);
+    for turn in 2..=10_u64 {
+      let (_, next) = still_watch.judge(
+        Look {
+          run: blocked(None),
+          ..look(5, false, Some((10, 10)), turn * TURN)
+        },
+        WINDOW,
+        WINDOW,
+      );
+      still_watch = next;
+    }
+    let unmoved = after_the_answer(first, blocked(None), Some(first));
+    assert!(
+      matches!(
+        still_watch.judge(unmoved, WINDOW, WINDOW).0,
+        Verdict::Wedged { .. }
+      ),
+      "unmoved at both reads and blocked: wedged a window after its last movement"
+    );
+    let (verdict, _) = next.judge(
+      Look {
+        run: blocked(None),
+        ..look(6, false, Some((12, 12)), at + TURN)
+      },
+      WINDOW,
+      WINDOW,
+    );
+    assert_eq!(
+      verdict,
+      Verdict::Alive,
+      "its history starts again from the step"
+    );
   }
 
   /// A-318, §4.14. Do: watch a shard on a whole CPU inside one poll, judged with a spin window three budgets long (a build
