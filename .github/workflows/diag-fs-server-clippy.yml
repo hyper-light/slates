@@ -1,0 +1,24 @@
+name: diag-fs-server-clippy
+on:
+  push:
+    branches: [diag-fs-server-clippy]
+jobs:
+  clippy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy on the two crates the change touches, every lint capped to a warning so the whole graph is checked
+        run: |
+          rustup component add clippy || true
+          set +e
+          RUSTFLAGS="--cap-lints=warn" cargo clippy --locked -p slates-cli -p slates-server --all-targets > clippy.log 2>&1; rc=$?
+          echo "clippy exit=$rc"
+          echo "findings by file:"; grep -E "^ +--> " clippy.log | sed -E 's/:[0-9]+:[0-9]+$//' | sort | uniq -c | sort -rn | head -30
+          echo "--- in the files this change touches:"
+          grep -nE -B6 -A14 "^ +--> (crates/cli/tests/fs_server.rs|crates/server/tests/write_policy.rs|crates/server/src/landing.rs:26[6-9][0-9])" clippy.log | head -200
+          ! grep -qE "^ +--> (crates/cli/tests/fs_server.rs|crates/server/tests/write_policy.rs|crates/server/src/landing.rs:26[6-9][0-9])" clippy.log
