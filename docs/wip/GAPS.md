@@ -19,6 +19,12 @@
 > candidate for 249 tries" (below) has the same shape. **Owed:** a reproduction, then the fix by the step the
 > diagnostics name.
 
+> **A works catalog test timed out once on Windows (2026-11-17, A-255; main's flake, observed once).**
+> `a_survivor_holding_no_copy_of_the_works_catalog_learns_its_green_from_a_location_round` (`040da0d9a`, on main since
+> A-255 landed) was killed at its 240 s deadline in the Windows fleet lane of PR #11's first CI run (job 134508155910:
+> 123 passed, 0 failed, 1 timed out) and passed in the next (job 134523028813: 123 passed, 0 failed, 0 timed out).
+> PR #11 does not touch it. **Owed:** its rate on main's own Windows lane.
+
 > **The dirty-page test's precondition, proved each attempt (2026-11-09, A-248).**
 > `a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path` failed intermittently ("the sync says so:
 > Ok(())", B10's gate, adacachy2, load about 66) when the kernel wrote the store's page back before the replacement. On
