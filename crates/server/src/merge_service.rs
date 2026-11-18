@@ -1572,9 +1572,9 @@ pub(crate) const RECORD_AWAITS_WORK_CATALOG: &str = "merge.record.awaits_work_ca
 /// Format: a merge record's magic, "GMRC" little-endian, after the register's class byte: an unversioned record an
 /// earlier layout wrote begins with its version number, whose low word is the magic only at version 1,129,467,207.
 const RECORD_MAGIC: u32 = u32::from_le_bytes(*b"GMRC");
-/// Format: a merge record's format version (A-255: 1 is the first versioned format, with the submit's completion key);
-/// a decoder refuses any other.
-const RECORD_VERSION: u32 = 1;
+/// Format: a merge record's format version (A-255: 1 is the first versioned format, with the submit's completion key; 2
+/// carries the submitting work beside the key, A-288); a decoder refuses any other.
+const RECORD_VERSION: u32 = 2;
 /// Format: a merge record's magic and its version are each a little-endian `u32`.
 const RECORD_WORD_BYTES: usize = size_of::<u32>();
 /// Format: the magic and version before a merge record's value.
@@ -1619,7 +1619,9 @@ pub struct MergeRecordValue {
 }
 
 /// A submit's completion key as a merge record carries it ([`MergeRecordValue::completion`]): the client's host, the
-/// client and the request's sequence, the key a partition's completion window holds it under.
+/// client and the request's sequence, the key a partition's completion window holds it under; and, for a client on
+/// another node than the work's owner, the work the submit was made from, which a green's successor records the
+/// completion under (A-288), so the work's route is kept only while a completion that route can reach is held.
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SubmitCompletion {
   /// The client's host (`HostId.0`): this node for a local client, the authenticated origin for a forwarded one.
@@ -1628,15 +1630,22 @@ pub struct SubmitCompletion {
   pub client: u32,
   /// The request's sequence within the client.
   pub sequence: u32,
+  /// The work the submit was made from, for a submit forwarded from another node: not part of the key, the route a
+  /// resend under it takes after a takeover (A-255, A-288). `None` for a client of the work's owner's own node: its
+  /// resend is served by that node, from the records it made, and never takes the route; if the node is gone, so is it.
+  pub work: Option<DbVolumeId>,
 }
 
 impl SubmitCompletion {
-  /// The key of the request now running on `state`, if a request is running (`ShardState::current_request`).
-  pub(crate) fn of_current(state: &ShardState) -> Option<SubmitCompletion> {
+  /// The key of the request now running on `state`, a submit of `work`, if a request is running
+  /// (`ShardState::current_request`); the work is named only for a request another node forwarded here.
+  pub(crate) fn of_current(state: &ShardState, work: DbVolumeId) -> Option<SubmitCompletion> {
+    let local = state.origin_anchor.0;
     state.current_request.map(|(origin, id)| SubmitCompletion {
       origin,
       client: id.client,
       sequence: id.sequence,
+      work: (origin != local).then_some(work),
     })
   }
 
@@ -1646,6 +1655,7 @@ impl SubmitCompletion {
       origin: self.origin,
       client: self.client,
       sequence: self.sequence,
+      work: self.work.map(|work| work.bytes),
     }
   }
 
@@ -1655,6 +1665,7 @@ impl SubmitCompletion {
       origin: key.origin,
       client: key.client,
       sequence: key.sequence,
+      work: key.work.map(|bytes| DbVolumeId { bytes }),
     }
   }
 }
@@ -3188,18 +3199,8 @@ pub(crate) fn recover_green_inputs(
   adopted: &MergeRecordValue,
   (catalog_sequence, catalog): (u64, &crate::catalog::CatalogValue),
 ) -> Option<GreenRecovery> {
-  let mut values: BTreeMap<u64, MergeRecordValue> = state
-    .holder_records
-    .get(&object)?
-    .persisted()
-    .1
-    .into_iter()
-    .filter(|(held, _, _, _)| *held == object)
-    .filter_map(|(_, sequence, _, bytes)| {
-      MergeRecordValue::from_record_bytes(&bytes).map(|value| (sequence, value))
-    })
-    .collect();
-  values.insert(adopted.version, adopted.clone());
+  state.holder_records.get(&object)?;
+  let values = green_ledger_values(state, object, adopted);
   // The prefix must be complete: every version from 0 to the adopted head, each with its inputs held.
   let mut origin = None;
   let mut chain = Vec::with_capacity(usize::try_from(adopted.version).unwrap_or(0));
@@ -3232,6 +3233,58 @@ pub(crate) fn recover_green_inputs(
     head: adopted.version,
     identity: adopted.identity,
   })
+}
+
+/// The merge record values this node knows of `object`'s ledger up to the `adopted` record (§4.16 owner-loss
+/// recovery): its holder acceptor's accepted positions, one per version it recomputed and accepted, with the adopted
+/// record at its own version. What [`recover_green_inputs`] rebuilds from and [`unheld_green_inputs`] reads.
+fn green_ledger_values(
+  state: &ShardState,
+  object: ObjectId,
+  adopted: &MergeRecordValue,
+) -> BTreeMap<u64, MergeRecordValue> {
+  let mut values: BTreeMap<u64, MergeRecordValue> = state
+    .holder_records
+    .get(&object)
+    .map(|acceptor| {
+      acceptor
+        .persisted()
+        .1
+        .into_iter()
+        .filter(|(held, _, _, _)| *held == object)
+        .filter_map(|(_, sequence, _, bytes)| {
+          MergeRecordValue::from_record_bytes(&bytes).map(|value| (sequence, value))
+        })
+        .collect()
+    })
+    .unwrap_or_default();
+  values.insert(adopted.version, adopted.clone());
+  values
+}
+
+/// The inputs a taken-over green's ledger names that this node does not hold (§4.16 owner-loss recovery, "Masked after
+/// takeover on a candidate that holds the ledger"; GAP-A9-7's input half): each version, from 0 to the `adopted` one,
+/// whose record this node knows ([`green_ledger_values`]) and whose inputs manifest it does not hold, with that
+/// manifest's identity, lowest version first. A successor one version behind the quorum knows the adopted record (it
+/// re-committed it) but never received its inputs; the survivors that accepted the version hold them, since a holder
+/// accepts a merge record only once it holds its inputs, so a fetch by identity from them fills the gap. `None` when a
+/// record itself is unknown here: no fetch by identity can fill that (the ledger-prefix transfer of records, owed).
+pub(crate) fn unheld_green_inputs(
+  state: &ShardState,
+  object: ObjectId,
+  adopted: &MergeRecordValue,
+) -> Option<Vec<(u64, [u8; 32])>> {
+  let values = green_ledger_values(state, object, adopted);
+  let mut unheld = Vec::new();
+  for version in 0..=adopted.version {
+    let value = values.get(&version)?;
+    if let Some(manifest) = value.inputs
+      && !state.held_content.holds_manifest(object, &manifest)
+    {
+      unheld.push((version, manifest));
+    }
+  }
+  Some(unheld)
 }
 
 /// A holder's view of `object`'s replica, for a test.
@@ -3533,7 +3586,12 @@ mod tests {
         host: slates_db::HostId(0),
         uid: 1000,
       },
-      completion: None,
+      completion: Some(SubmitCompletion {
+        origin: 11,
+        client: 12,
+        sequence: 13,
+        work: Some(DbVolumeId { bytes: [14u8; 16] }),
+      }),
     }
   }
 
@@ -3593,6 +3651,18 @@ mod tests {
       MergeRecordValue::decode_record(&other_version),
       Err(RecordRefused::Version {
         found: RECORD_VERSION.saturating_add(1),
+        expected: RECORD_VERSION,
+      })
+    );
+    // A-288: a record of format 1, whose completion carried no submitting work, is refused typed, never read without it.
+    let mut before_the_work = value().to_record_bytes();
+    if let Some(version) = before_the_work.get_mut(5..9) {
+      version.copy_from_slice(&1u32.to_le_bytes());
+    }
+    assert_eq!(
+      MergeRecordValue::decode_record(&before_the_work),
+      Err(RecordRefused::Version {
+        found: 1,
         expected: RECORD_VERSION,
       })
     );

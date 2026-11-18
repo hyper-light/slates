@@ -8,6 +8,9 @@
 //! - `slates daemon` is the daemon: it attaches the segment from its environment (or, run
 //!   alone, measures and creates one), reads the published profile, derives its
 //!   configuration and serves; it leaves when its anchor does.
+//!
+//!   Both roles are the library's (`slates_api::role`, A-278), which an embedding host serves from
+//!   its own executable too; this binary serves them with no prefix.
 //! - Every other verb is a client: the rendezvous, one request, one reply, printed in a
 //!   stable plain form (one `key: value` per line, or one record per line), with the refusal
 //!   taxonomy mapped to exit codes.
@@ -25,26 +28,16 @@
 
 use std::process::ExitCode;
 
-mod anchor;
 mod args;
-mod daemon;
-mod dumps;
 #[cfg(target_os = "linux")]
 mod exec;
-mod fleet;
 mod format;
-// A-232 step 5: the liveness bound against this crate's own anchor (the test binary re-invoked as the anchor and
-// daemon). Unix only: the Windows anchor hands its daemon an explicit handle list, so the roles' shared standard input
-// is owed there.
-#[cfg(test)]
-mod liveness_tests;
-mod mount;
 // The handshake asks a container engine's CLI over a poll loop (`rustix`) and judges the answer with
 // `slates-bridge-oci`; both are `cfg(unix)` dependencies, so the module is too.
 #[cfg(unix)]
 mod oci_runtime;
-mod parent;
-mod recovery_key;
+// The self-pipe `slates pmem` reads its signals from, Linux's alone.
+#[cfg(target_os = "linux")]
 mod signal;
 mod verbs;
 
@@ -62,11 +55,11 @@ const EXIT_FAILED: u8 = slates_server::watchdog::FAILED_EXIT_CODE;
 
 fn main() -> ExitCode {
   let arguments: Vec<String> = std::env::args().skip(1).collect();
-  // The daemon's WinFsp purge client, a role only a daemon starts (no daemon thread opens its own volume, §4.6).
+  // The daemon's WinFsp purge client, a role only a daemon starts (no daemon thread opens its own volume, §4.6), served
+  // by the library's role entry as a host's executable serves it.
   #[cfg(windows)]
   if arguments.first().map(String::as_str) == Some(slates_bridge_winfsp::purge_client::ROLE_ARG) {
-    let code = slates_bridge_winfsp::purge_client::serve_from_env();
-    return ExitCode::from(u8::try_from(code).unwrap_or(u8::MAX));
+    return slates_api::role::main(&[], &arguments);
   }
   let command = match args::parse(&arguments) {
     Ok(command) => command,
@@ -90,8 +83,12 @@ fn main() -> ExitCode {
     _ => false,
   };
   let outcome = match command {
-    Command::Anchor(options) => anchor::run(&options),
-    Command::Daemon(options) => daemon::run(&options),
+    Command::Anchor(options) => {
+      slates_api::role::serve(&[], &slates_api::role::Role::Anchor(options)).map_err(Failure::from)
+    }
+    Command::Daemon(options) => {
+      slates_api::role::serve(&[], &slates_api::role::Role::Daemon(options)).map_err(Failure::from)
+    }
     Command::Profile(options) => verbs::profile(&options),
     Command::Version => {
       slates_machine::out_line!("slates {}", env!("CARGO_PKG_VERSION"));
@@ -207,6 +204,16 @@ fn run_oci_runtime(_runtime: &str) -> Result<(), Failure> {
      it is not available here"
       .to_owned(),
   ))
+}
+
+/// A role's failure as the command's: the same sentence, and the same exit code (1 refused, 4 failed).
+impl From<slates_api::role::Failure> for Failure {
+  fn from(failure: slates_api::role::Failure) -> Failure {
+    match failure {
+      slates_api::role::Failure::Refused(text) => Failure::Refused(text),
+      slates_api::role::Failure::Failed(text) => Failure::Failed(text),
+    }
+  }
 }
 
 /// How a command ends other than well; each maps to one exit code.

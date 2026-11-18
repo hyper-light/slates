@@ -50,7 +50,7 @@ fn pause() {
   std::thread::sleep(POLL);
 }
 
-/// Format: the start of the line a daemon prints once it serves (`crates/cli/src/daemon.rs`); the instance follows.
+/// Format: the start of the line a daemon prints once it serves (`crates/api/src/role/daemon.rs`); the instance follows.
 const SERVING_LINE: &str = "slates daemon: instance ";
 
 /// The anchor, killed and reaped on drop, so a failed assertion leaves no daemon behind; each of its daemons' serving
