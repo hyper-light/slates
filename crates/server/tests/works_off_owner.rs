@@ -1269,32 +1269,11 @@ fn a_merge_off_its_greens_shard_follows_both_volumes_write_policy() {
     ),
     "an agent's own approval: {by_agent:?}"
   );
-  let forged = client.submit_approved(
-    work,
-    &[],
-    identity,
-    merge_approval_proof(&secret, work, &other),
-  );
-  assert!(
-    matches!(
-      forged,
-      Err(ClientError::Refused(Refusal::GrantIssuerUnverified))
-    ),
-    "a proof of another increment: {forged:?}"
-  );
-  assert_eq!(
-    client.versions(green).unwrap(),
-    1,
-    "nothing merged before the approval"
-  );
-  assert_eq!(
-    client.submit_approved(
-      work,
-      &[],
-      identity,
-      merge_approval_proof(&secret, work, &identity)
-    ),
-    Ok(Submitted::Accepted(2))
+  expect_a_forged_proof_refused_and_the_launchers_accepted(
+    &mut client,
+    &secret,
+    (green, work),
+    (identity, other),
   );
 
   expect_the_greens_ask_to_hold_an_edit_and_submit(&mut client, &secret);
@@ -1338,6 +1317,44 @@ fn expect_the_greens_forbid_refused(client: &mut Client, secret: &[u8; 32]) {
     "the green's forbid: {refused:?}"
   );
   assert_eq!(client.versions(green).unwrap(), 1, "nothing merged");
+}
+
+/// The approvals of `a_merge_off_its_greens_shard_follows_both_volumes_write_policy`'s asked work. Do: approve the
+/// increment `identity` of `work` (over `green`) with a proof made for `other`, then with the launcher's proof of it.
+/// Expect the forged proof refused `GrantIssuerUnverified` with nothing merged, and the launcher's accepted as version 2.
+fn expect_a_forged_proof_refused_and_the_launchers_accepted(
+  client: &mut Client,
+  secret: &[u8; 32],
+  (green, work): (VolumeId, VolumeId),
+  (identity, other): ([u8; 32], [u8; 32]),
+) {
+  let forged = client.submit_approved(
+    work,
+    &[],
+    identity,
+    merge_approval_proof(secret, work, &other),
+  );
+  assert!(
+    matches!(
+      forged,
+      Err(ClientError::Refused(Refusal::GrantIssuerUnverified))
+    ),
+    "a proof of another increment: {forged:?}"
+  );
+  assert_eq!(
+    client.versions(green).unwrap(),
+    1,
+    "nothing merged before the approval"
+  );
+  assert_eq!(
+    client.submit_approved(
+      work,
+      &[],
+      identity,
+      merge_approval_proof(secret, work, &identity)
+    ),
+    Ok(Submitted::Accepted(2))
+  );
 }
 
 /// The green's ask in `a_merge_off_its_greens_shard_follows_both_volumes_write_policy`. Do: set a green's merges to ask
