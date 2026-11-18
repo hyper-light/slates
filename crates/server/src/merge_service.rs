@@ -1536,7 +1536,9 @@ pub(crate) fn status_merge_volume(
 //
 // Holder side. A merge record arrives on its own stream (`MERGE_RECORD_STREAM`), dispatched by
 // kind. The holder finds the version's inputs in its content hold (else refuses
-// `merge.inputs_unheld` — the record waits), replays them into its replica of the green (an
+// `merge.inputs_unheld` — the record waits), gathers them extent by extent with what it holds of
+// them charged to its shard's budget (else refuses `merge.inputs_over_budget` — the record waits;
+// A-383), replays them into its replica of the green (an
 // engine of its own, at the version before), and compares the replica's head identity with the
 // record's: a mismatch is refused, counted (`merge.recompute_mismatch`), printed loudly, and the
 // green is never served from this holder again (fatal for the green here; the owner and the other
@@ -1605,6 +1607,14 @@ pub(crate) const OUT_OF_ORDER: &str = "merge.out_of_order";
 /// Counted on a holder whose held inputs did not decode as an increment or origin (a corrupt hold).
 /// Format: a refusal name in the daemon's status report.
 pub(crate) const INPUTS_UNDECODABLE: &str = "merge.inputs_undecodable";
+/// Counted on a holder whose shard's budget could not take what recomputing a version from its held inputs holds
+/// ([`RECOMPUTE_COPIES`] of their declared size, A-383): the record waits, as for inputs not yet held, and its owner
+/// ships it again, so the holder recomputes it once its shard has room.
+/// Format: a refusal name in the daemon's status report.
+pub(crate) const INPUTS_OVER_BUDGET: &str = "merge.inputs_over_budget";
+/// Derived: the copies of a version's inputs a holder's recomputation holds at once (A-383): the bytes gathered from its
+/// hold, and the increment decoded from them, whose post-state is a copy of at most as many (`Increment::decode`).
+const RECOMPUTE_COPIES: u64 = 2;
 
 /// Format: the one entry of an inputs archive's manifest — a file holding the version's inputs.
 pub(crate) const INPUTS_ENTRY_NAME: &str = "inputs";
@@ -3483,15 +3493,24 @@ pub(crate) fn accept_merge_record(
   }
   let inputs = match value.inputs {
     None => None,
-    Some(manifest) => match held_inputs(state, object, &manifest) {
-      Some(bytes) => Some(bytes),
-      None => {
-        state.count(INPUTS_UNHELD, 1);
+    Some(manifest) => match held_inputs(state, object, manifest) {
+      Ok(held) => Some(held),
+      Err(reason) => {
+        state.count(reason, 1);
         return Vec::new();
       }
     },
   };
-  match recompute(state, object, &value, inputs.as_deref()) {
+  let recomputed = recompute(
+    state,
+    object,
+    &value,
+    inputs.as_ref().map(|held| held.bytes.as_slice()),
+  );
+  if let Some(held) = inputs {
+    state.store.budget.release(held.charge);
+  }
+  match recomputed {
     Ok(()) => crate::fleet::accept_held_record(state, local, peer_host, record),
     Err(reason) => {
       state.count(reason, 1);
@@ -3510,29 +3529,41 @@ pub(crate) fn accept_merge_record(
   }
 }
 
-/// The inputs bytes a manifest names, from this holder's content hold — the one file, restored within
-/// the bytes the hold admitted (its chunks' raw bytes and one chunk's decode space: a well-formed inputs
-/// archive names each chunk once, so its file is never longer, and a hostile one naming a chunk many
-/// times is refused before allocating, AUD-29-13) — with a test's corruption fault applied once if set
-/// (the last byte of the post-state, so the increment still decodes but recomputes to different bytes).
-fn held_inputs(state: &mut ShardState, object: ObjectId, manifest: &[u8; 32]) -> Option<Vec<u8>> {
-  let archive = state
-    .held_content
-    .archive_of(state.store.content.arena(), object, manifest)?;
-  let held = archive
-    .chunks
-    .iter()
-    .fold(0u64, |total, chunk| total.saturating_add(chunk.raw_len));
-  let largest = archive
-    .chunks
-    .iter()
-    .map(|chunk| chunk.raw_len)
-    .max()
-    .unwrap_or(0);
-  let mut restored = slates_archive::restore(&archive, held.saturating_add(largest)).ok()?;
-  let mut bytes = restored.files.remove(INPUTS_ENTRY_NAME)?.dense()?;
-  corrupt_if_faulted(state, &mut bytes);
-  Some(bytes)
+/// A version's inputs gathered from this holder's hold, and the charge they hold against the shard's budget until the
+/// recomputation that reads them is done (A-383).
+struct HeldInputs {
+  /// The inputs' bytes.
+  bytes: Vec<u8>,
+  /// What recomputing from them holds, charged to the shard's budget: the caller releases it once it recomputed.
+  charge: slates_mem::budget::Reservation,
+}
+
+/// The inputs bytes a manifest names, from this holder's content hold (A-383): the one file gathered extent by extent
+/// (`crate::merge_origin::PlannedInputs`), as the replica's rebuild and seed gather it, with a test's corruption fault
+/// applied once if set (the last byte of the post-state, so the increment still decodes but recomputes to different
+/// bytes). Before a byte is reserved, what the recomputation holds ([`RECOMPUTE_COPIES`] of the declared size) is charged
+/// to the shard's budget, so a manifest naming one chunk at many extents makes a holder hold no more than its shard
+/// admits: past that the record waits, refused [`INPUTS_OVER_BUDGET`]. Until A-383 the file was restored from the
+/// archive within its distinct chunks' bytes and one chunk more, on the rule that an inputs archive names each chunk
+/// once; but inputs are cut at fixed offsets, so inputs repeating a chunk's bytes at the cut name a chunk more than once,
+/// and every holder refused them at every shipment, for good.
+fn held_inputs(
+  state: &mut ShardState,
+  object: ObjectId,
+  manifest: [u8; 32],
+) -> Result<HeldInputs, &'static str> {
+  let planned = crate::merge_origin::PlannedInputs::of(state, object, manifest)?;
+  let charge = state
+    .store
+    .grow(planned.size().saturating_mul(RECOMPUTE_COPIES))
+    .map_err(|_| INPUTS_OVER_BUDGET)?;
+  match planned.gather(state, object) {
+    Ok(bytes) => Ok(HeldInputs { bytes, charge }),
+    Err(reason) => {
+      state.store.budget.release(charge);
+      Err(reason)
+    }
+  }
 }
 
 /// A test's corruption fault, applied once to the next inputs a holder recomputes from, if it is set (never from the
@@ -4110,6 +4141,106 @@ mod tests {
       !by_tree,
       "a record naming the tree's identity finds nothing"
     );
+  }
+
+  /// Holds `archive` for `object` in the shard's own content hold, as a holder that acknowledged its put holds it: the
+  /// manifest identity held.
+  fn hold_for(state: &mut ShardState, object: ObjectId, archive: Archive) -> [u8; 32] {
+    state
+      .held_content
+      .hold(
+        &mut crate::content_holder::hold_space(&mut state.store),
+        object,
+        slates_cluster::content::Placed::default(),
+        archive,
+      )
+      .expect("the inputs archive is whole and verifies")
+  }
+
+  /// A-383, §4.16 "Apply on holders": inputs are cut into chunks at fixed offsets, so inputs that repeat a chunk's bytes
+  /// at the cut name one chunk at more than one extent, and a holder that restored them within the archive's distinct
+  /// chunks and one chunk more refused them at every shipment, for good. Do: hold the inputs archive of bytes holding a
+  /// run of one byte three chunks long, and read the inputs as a holder recomputing a version does. Expect the very
+  /// bytes; the archive naming a chunk at more than one extent (the case meant); twice their size charged to the shard's
+  /// budget while they are held, and all of it given back once the charge is released.
+  #[test]
+  fn a_holder_reads_inputs_that_repeat_a_chunk_and_charges_them_while_it_holds_them() {
+    let chunk = crate::merge_origin::inputs_chunk_bytes();
+    let mut bytes = b"before the run".to_vec();
+    bytes.extend(std::iter::repeat_n(b'r', chunk * 3));
+    bytes.extend_from_slice(b"after the run");
+    let archive = MergeShardState::inputs_archive(&bytes, 0, 4096);
+    let named_twice = archive.chunks.len() > archive.referenced_chunks().len();
+    let object = ObjectId::new(slates_db::HostId(1), 1);
+    let (read, charged, left) = crate::daemon::audit_on_shard(move |state| {
+      let manifest = hold_for(state, object, archive);
+      let before = state.store.budget.committed();
+      let held = held_inputs(state, object, manifest);
+      let charged = state.store.budget.committed() - before;
+      let read = held.map(|held| {
+        state.store.budget.release(held.charge);
+        held.bytes
+      });
+      (read, charged, state.store.budget.committed() - before)
+    });
+    assert!(named_twice, "the inputs archive names one chunk twice");
+    assert_eq!(read, Ok(bytes.clone()), "the holder reads the very inputs");
+    assert_eq!(
+      charged,
+      u64::try_from(bytes.len()).unwrap() * RECOMPUTE_COPIES,
+      "what the recomputation holds is charged while it holds it"
+    );
+    assert_eq!(left, 0, "the charge is given back whole");
+  }
+
+  /// Shape: the reduced reserve the over-budget test's shard runs with, so a manifest naming one chunk past what the
+  /// shard admits names a few dozen extents, not the machine's measured production reserve.
+  const OVER_BUDGET_RESERVE: u64 = 32 << 20;
+
+  /// A-383, CLAUDE.md §4 hostile input (AUD-29-13): a manifest naming one chunk at more extents than the shard can hold
+  /// the inputs of is refused before a byte of them is reserved, as the cap of distinct chunks refused it before. Do: on
+  /// a shard with a reduced reserve, hold an inputs archive of one chunk named at enough extents that twice their bytes
+  /// pass what the shard could admit, and read the inputs as a holder recomputing a version does. Expect the read
+  /// refused `merge.inputs_over_budget`, with the shard's budget as it was.
+  #[test]
+  fn inputs_naming_a_chunk_past_what_the_shard_admits_are_refused_before_any_is_gathered() {
+    let object = ObjectId::new(slates_db::HostId(1), 1);
+    let (refused, before, after) = crate::daemon::audit_on_shard_configured(
+      move |state| {
+        let chunk = crate::merge_origin::inputs_chunk_bytes();
+        let mut archive = MergeShardState::inputs_archive(&vec![b'r'; chunk], 0, 4096);
+        let len = u64::try_from(chunk).unwrap();
+        let named = state.store.admittable() / (len * RECOMPUTE_COPIES) + 1;
+        let slates_archive::Node::Directory(entries) = &mut archive.manifest else {
+          panic!("an inputs archive is one directory");
+        };
+        let entry = entries
+          .first_mut()
+          .expect("an inputs archive has its one file");
+        let slates_archive::Node::File(extents) = &mut entry.node else {
+          panic!("the inputs entry is a file");
+        };
+        let one = *extents.first().expect("one chunk, one extent");
+        *extents = (0..named)
+          .map(|at| slates_archive::Extent {
+            offset: at * len,
+            ..one
+          })
+          .collect();
+        entry.meta.size = named * len;
+        let manifest = hold_for(state, object, archive);
+        let before = state.store.budget.committed();
+        let refused = held_inputs(state, object, manifest).err();
+        (refused, before, state.store.budget.committed())
+      },
+      |config| config.reserve_per_shard = OVER_BUDGET_RESERVE,
+    );
+    assert_eq!(
+      refused,
+      Some(INPUTS_OVER_BUDGET),
+      "the inputs are refused at the shard's budget"
+    );
+    assert_eq!(before, after, "nothing is left charged");
   }
 
   /// A version's inputs archive over two whole inputs chunks and half of a third (A-286).

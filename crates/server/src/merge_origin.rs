@@ -889,10 +889,22 @@ struct Gather {
 }
 
 impl Gather {
-  /// Reads `object`'s held inputs `manifest`: the inputs file's extents to gather, and room for its declared size. Each
-  /// extent holds at most one chunk's bytes, so the size is checked against what the extents can hold before anything is
-  /// reserved for it, and a reservation the allocator refuses is the build's refusal, never an abort.
+  /// Reads `object`'s held inputs `manifest`: the inputs file's extents to gather, and room for its declared size
+  /// ([`Gather::planned`], then [`Gather::reserve`]).
   fn of(state: &ShardState, object: ObjectId, manifest: [u8; 32]) -> Result<Gather, &'static str> {
+    let mut gather = Self::planned(state, object, manifest)?;
+    gather.reserve()?;
+    Ok(gather)
+  }
+
+  /// Reads `object`'s held inputs `manifest`: the inputs file's extents to gather and its declared size, with nothing
+  /// reserved for the bytes yet, so a caller may charge the size first ([`PlannedInputs`]). Each extent holds at most
+  /// one chunk's bytes, so the size is checked against what the extents can hold.
+  fn planned(
+    state: &ShardState,
+    object: ObjectId,
+    manifest: [u8; 32],
+  ) -> Result<Gather, &'static str> {
     let archive = state
       .held_content
       .held_manifest(state.store.content.arena(), object, &manifest)
@@ -904,17 +916,22 @@ impl Gather {
     if size > most {
       return Err(INPUTS_UNDECODABLE);
     }
-    let mut bytes = Vec::new();
-    bytes
-      .try_reserve_exact(usize::try_from(size).map_err(|_| INPUTS_UNDECODABLE)?)
-      .map_err(|_| INPUTS_UNDECODABLE)?;
     extents.reverse();
     Ok(Gather {
       manifest,
       extents,
-      bytes,
+      bytes: Vec::new(),
       size,
     })
+  }
+
+  /// Reserves room for the declared size: a reservation the allocator refuses is the build's refusal, never an abort.
+  fn reserve(&mut self) -> Result<(), &'static str> {
+    let size = usize::try_from(self.size).map_err(|_| INPUTS_UNDECODABLE)?;
+    self
+      .bytes
+      .try_reserve_exact(size)
+      .map_err(|_| INPUTS_UNDECODABLE)
   }
 
   /// Gathers the next extent's bytes from the hold; once every extent is in, the inputs' bytes if they are the declared
@@ -934,6 +951,45 @@ impl Gather {
     };
     gather_extent(state, object, &self.manifest, &extent, &mut self.bytes)?;
     Ok(None)
+  }
+}
+
+/// A held inputs file planned and not yet gathered (A-383): what a holder recomputing one version as its record arrives
+/// (`crate::merge_service`'s record path) reads the declared size from, to charge it to its shard's budget before a byte
+/// is reserved, and then gathers whole, an extent at a time, as the rebuild and the seed gather. Gathered by extent,
+/// inputs that repeat a chunk's bytes at the cut read as the file they are.
+pub(crate) struct PlannedInputs(Gather);
+
+impl PlannedInputs {
+  /// Plans `object`'s held inputs `manifest`: refused `INPUTS_UNHELD` when this node does not hold it, and
+  /// `INPUTS_UNDECODABLE` when it is not one inputs file or declares more than its extents can hold.
+  pub(crate) fn of(
+    state: &ShardState,
+    object: ObjectId,
+    manifest: [u8; 32],
+  ) -> Result<PlannedInputs, &'static str> {
+    Gather::planned(state, object, manifest).map(PlannedInputs)
+  }
+
+  /// The inputs' declared size, no more than their extents can hold.
+  pub(crate) fn size(&self) -> u64 {
+    self.0.size
+  }
+
+  /// Gathers the inputs whole in one call, as the holder recomputes the version in one: room reserved for the declared
+  /// size, then an extent a step, as many steps as there are extents and one more that returns the bytes.
+  pub(crate) fn gather(
+    self,
+    state: &mut ShardState,
+    object: ObjectId,
+  ) -> Result<Vec<u8>, &'static str> {
+    let mut gather = self.0;
+    gather.reserve()?;
+    loop {
+      if let Some(bytes) = gather.step(state, object)? {
+        return Ok(bytes);
+      }
+    }
   }
 }
 
