@@ -24919,17 +24919,28 @@ Applied in the same change to: GAPS (A-273's entry). Nothing else yet: the tests
 Status: step 1 built 2026-11-17 (the owner's frees held for its replicas, below). Step 2 built 2026-11-18 (g083): the
 replica and its feed, in `crates/merge/src/replica.rs`. The owner makes a message for each version it commits
 (`Green::feed_version`) and for each fold that moves its floor (`fold_and_feed`, `fold_to_budget_and_feed`), at its feed
-position, which it then moves past. A replica is built from the owner's checkpoint at its head over the green's origin,
-joined at the owner's feed position then (`Green::replica_seed`, `Replica::build`), so a base below that version is
-the owner's to answer. It applies the message at its next position through `Green::apply_recorded` or
+position, which it then moves past. A replica was built from the owner's checkpoint at its head over the green's origin,
+joined at the owner's feed position then, so a base below that version was the owner's to answer (step 3 replaced
+this: a replica is now made from the owner whole). It applies the message at its next position through `Green::apply_recorded` or
 `fold_history_before`, passes over one below it, and refuses one above it (`FeedRefusal::Gap`), or a version that
 would replay as another (`FeedRefusal::Diverged`), before anything changes; its holder then rebuilds it, counted
 (`Replica::rebuild`, `Replica::counts`). Proven by `crates/merge/tests/replica.rs`: over generated histories with a
 message delivered late, lost, or in flight across a rebuild, the replica is the owner's green at its head after every
 step (its identity and every name's bytes), and at the end equals the owner whole (every version both hold, the paths
-changed since each, every rebase over each base, and a base below its floor refused). Its content is still its own;
-the sealed blocks read in place (step 3), its bounds (step 4) and the shards' use of it (step 5) are owed. The text and
-its measurements are perf's (2026-11-11, `agents/perf-a273`, never pushed); the
+changed since each, every rebase over each base, and a base below its floor refused). Step 3 built 2026-11-18 (g083):
+the green's content in sealed blocks (`slates_mem::sealed`, `crates/merge/src/store.rs`), its current files and its
+history chunks alike. The owner seals each run of bytes once and releases what it names no more; a replica is made from
+the owner whole (`Green::replica`: every index, history and delta cloned, the content named by the owner's blocks), so
+it holds no byte of content of its own and serves every base the owner does, and reads each block in place through its
+own live table, which only the owner's messages fill. A replay's seals adopt the blocks the owner sealed in the same
+message, in its order, each checked to hold exactly the bytes the replay made, else the message is refused
+(`FeedRefusal::NotTheOwners`). The owner frees a released block once every replica has passed the message that
+released it (`Fed::Applied`'s `Passed`, `Green::acknowledge_replica`), and nothing for a replica that left
+(`Green::leave_replica`); step 1's frees by position now live in the sealed blocks. Proven by the sealed blocks' tests
+(a reader on another thread reads in place what its writer frees behind it; generated histories of seals, releases,
+joins, passes, late acknowledgements and leaves, every live block allocated and read as sealed) and the replica's
+oracle, which now holds every current file's bytes to be the owner's own memory. Its bounds (step 4) and the shards'
+use of it (step 5) are owed. The text and its measurements are perf's (2026-11-11, `agents/perf-a273`, never pushed); the
 content question it left open was decided by the supervisor on 2026-11-17 by A-64 and D-7 (below). W1 (A-247), whose
 works off the owner it builds on, landed on 2026-11-17 (3c0af9399).
 

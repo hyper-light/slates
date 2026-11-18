@@ -18,8 +18,9 @@
 //! through the intervening deltas to head coordinates for the verdict and the splice; the
 //! splice ([`mod@splice`]) applies a path's accepted ops to its base extent list by reference
 //! surgery (no byte copied); the chain and the fleet commit are the engine's other pieces, built
-//! on these. A replica of the green on a shard that holds its works ([`replica`], A-273) is the engine built from the
-//! owner's checkpoint and kept equal to it by the owner's feed of versions and folds.
+//! on these. A replica of the green on a shard that holds its works ([`replica`], A-273) is the engine made from the
+//! owner's and kept equal to it by the owner's feed of versions and folds, its content the owner's sealed blocks
+//! (`slates_mem::sealed`) read in place.
 //!
 //! The fast path: when every path the increment touches was last changed at or before the
 //! increment's base version, the verdict is `Accept` with no range work — what a fresh basis

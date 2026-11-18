@@ -98,7 +98,6 @@ struct Ran {
 /// One history in progress: the owner, its replica if one has joined, the messages in flight to it, and what the owner
 /// committed.
 struct History {
-  origin_rows: Vec<Raw>,
   owner: Green,
   replica: Option<Replica>,
   inflight: VecDeque<FeedMessage>,
@@ -116,7 +115,6 @@ impl History {
     let mut owner = Green::with_origin(origin_of(origin_rows));
     let identities = BTreeMap::from([(0, owner.head_identity())]);
     History {
-      origin_rows: origin_rows.to_vec(),
       owner,
       replica: None,
       inflight: VecDeque::new(),
