@@ -13045,7 +13045,7 @@ rotated each round, three rounds, and every round is inside the ranges shown. `-
 | Linux x86_64 (1) | quiet accept | 13 / 21-31 | | 13-17 / 21-30 | |
 | Windows x86_64 (1) | loaded accept | 33-35 / 70-71 | | 34-35 / 66-70 | |
 | Windows x86_64 (1) | quiet accept | 28-29 / 66-71 | | 28-31 / 65 | |
-| Linux arm64 (3) | loaded accept | 4.0-8.1 ms / 21.0-21.3 ms | 12.1-19.0 ms / 38.9-45.0 ms | 16.1-19.1 ms / 39.0-41.9 ms | 14.0-18.9 ms / 37.0-41.0 ms |
+| Linux arm64 (3) | loaded accept | 4.0-8.1 ms / 21.0-21.3 ms | 12.1-19.0 ms / 38.9-45.0 ms | 16.0-19.1 ms / 39.0-41.9 ms | 14.0-18.9 ms / 37.0-41.0 ms |
 | Linux arm64 (3) | quiet accept | 18 / 36-40 | 53-54 / 76-88 | 50-52 / 77-82 | 51-52 / 78-85 |
 | Linux arm64 (3) | quiet conflict | 15 / 34-35 | 55-58 / 82-88 | 51-55 / 75-81 | 49-55 / 76-84 |
 | Windows arm64 (3) | loaded accept | 29-32 / 106-129 | 71-72 / 23.4-42.6 ms | 66-78 / 46.7-164.8 ms | 67-78 / 45.2-162.8 ms |
@@ -13055,7 +13055,7 @@ rotated each round, three rounds, and every round is inside the ranges shown. `-
 | macOS arm64 (2) | quiet conflict | 103-110 / 219-265 | 246-328 / 769-918 | 248-254 / 681-728 | 247-271 / 671-806 |
 
 The p999s follow the p99s: Linux x86_64 loaded 9.0-12.0 ms on both arms, Windows x86_64 loaded 0.11-10.2 ms before and
-31.8 ms in every after round, Linux arm64 loaded 24-27 ms before and 44-48 ms with W1. Under the 256 MB cap the arm64
+31.8 ms in every after round, Linux arm64 loaded 24-27 ms before and 39-48 ms with W1. Under the 256 MB cap the arm64
 runners refused the 1,000-file green at capacity (`TableAtCapacity { table: "green_chains" }`), so their loaded rows are
 10 files only; the quiet 1,000-file rows moved as the 10-file ones did. No answer was wrong in any run.
 
@@ -13069,9 +13069,9 @@ UTC) went the other way: 5,177 to 5,933 verdicts a second before and 9,044 to 12
 **What it means.**
 - **W1 slowed the single client wherever the daemon has more than one shard**, and the reply carrier added nothing
   measurable: a work on a shard other than its green's owner pays the hop at every edit and submit. Quiet, a 3-shard
-  runner's accept went from 18 to about 52 µs at the median (Linux arm64) and 24-28 to 61-80 µs (Windows arm64); loaded,
-  the Linux arm64 p99 doubled and the Windows arm64 p99 went from about 0.1 ms to 23-165 ms. On one shard the arms are
-  even. Main still carries it.
+  runner's accept went from 18 to about 52 µs at the median (Linux arm64) and 24-28 to 61-80 µs (Windows arm64), and
+  macOS's 2-shard conflict tripled while its accept held; loaded, the p99 doubled on Linux arm64 and macOS and went from
+  about 0.1 ms to 23-165 ms on Windows arm64. On one shard the arms are even. Main still carries it.
 - **Many clients gain from W1 what one client loses:** at 1,000 clients the same build answers 1.7 to 2.2 times the
   verdicts a second.
 - **The goal is met on no platform under load:** loaded p99 4.3-45 ms on Linux, 5.7-21 ms on macOS, 23-165 ms on Windows
