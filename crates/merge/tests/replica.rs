@@ -292,6 +292,12 @@ impl History {
       green.head_identity_from_scratch(),
       "the replica's identity is its state's"
     );
+    assert!(
+      green.folded_below() >= owner.folded_below(),
+      "the replica keeps no history its owner dropped: its floor {} against the owner's {}",
+      green.folded_below(),
+      owner.folded_below()
+    );
     let floor = green.folded_below().max(owner.folded_below());
     for version in floor..=owner.head() {
       for name in &names {
