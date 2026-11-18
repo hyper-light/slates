@@ -13236,3 +13236,44 @@ UTC) went the other way: 5,177 to 5,933 verdicts a second before and 9,044 to 12
   verdicts a second.
 - **The goal is met on no platform under load:** loaded p99 4.3-45 ms on Linux, 5.7-21 ms on macOS, 23-165 ms on Windows
   arm64 after W1; only Windows x86_64's single shard holds its p99 near 70 µs, with a p999 of 31.8 ms.
+
+## The f = 1 launcher with a server node killed: a replica rebuilds, a primary over the whole kernel loses its green (A-313, goal 232's seeding fix; 2026-11-18)
+
+**What it is.** Goal 232's two owed chaos flows on the f = 1 topology (`crates/cli/tests/load_scale.rs`: a primary and two
+replica nodes in region 0, a client node in region 1, every verb a forward): a replica's daemon killed partway through
+the rung (`SLATES_LOADTEST_KILL_NODE=1`, A-313's rebuild of a restarted holder's replica), and the primary's
+(`SLATES_LOADTEST_KILL_NODE=0` over the whole kernel, the recovering green's origin seeded a share at a time). Each
+node is a `slates anchor --quick --fleet`, so a killed daemon is restarted by its anchor at once.
+
+**Environment.** Mac Studio adas-mac-studio.local-2 (Apple M3 Ultra, 32 cores, 96 GiB, macOS 26.4), 2026-11-18 10:47 to
+10:56 UTC, load 9.6 to 23.7. Release `load_scale` test binary of main `7d760c4ea` with the measurer's uncommitted
+addition (each server node's `slates status` merge and recovery counters printed at the rung's end), and that commit's
+release `load_bench`. Linux v7.4-rc1 (6628e7d4).
+
+**Command.** `SLATES_LOADTEST_TREE=<tree> SLATES_LOADTEST_BENCH=<load_bench> SLATES_LOADTEST_CLIENTS=1000
+SLATES_LOADTEST_ARGS="--hot-files 800 --per-connection 32 --rounds 20 --reply-patience 60 --think-us 50000"
+SLATES_LOADTEST_KILL_NODE=<n> SLATES_LOADTEST_KILL_MS=<ms> <load_scale>
+many_clients_through_client_nodes_against_one_primary_and_two_replicas --exact --nocapture`, one client node.
+
+**A replica killed (node 1, 30 s into the rung, `kernel/`, 754 files).** Passed: the harness exited 0 with no oracle
+failure after 384.8 s, 19,461 versions accepted and 45,593 conflicts (169 verdicts a second through the client node).
+The restarted replica counted `merge.replica.rebuilt` 1, `merge.replica.rebuilt_versions` 2,810 (the versions it had
+accepted before the kill), `merge.replica.seed_slices` 6,270 and `merge.replica.seeded` 1, then carried 16,685
+versions' inputs to its partner's 19,355; neither replica counted `merge.out_of_order`. Through the forward: Edit p50 238
+ms and p99 906 ms; an accepted submit p50 1.94 s and p99 6.57 s.
+
+**The primary killed (node 0, 60 s into the rung, the whole kernel, 97,254 files, 1.99 GB).** Failed. The harness's walk
+of the green through the client node took 52.5 s; the primary was killed at 60 s and restarted, and its recovery logged:
+`partition 0: volume tree not rebuilt: ResourcesUnavailable { reason: "recovered inode allowance exceeds the version
+slab: budget exceeded: 648393 bytes requested, 642045 available" }`, then `green tree-green fenced, its recovered history
+is not what was acknowledged: OriginUnavailable`. Its shard 0 initialized in 620.5 ms of wall (602.7 ms of CPU, 8 slices,
+the longest 454.5 ms), no watchdog end. The harness's next read was refused `ContentUnavailable` and it stopped; no
+`merge.recovery.origin_load_steps` was counted, since the green was fenced before any seeding. The replicas had not yet
+held version 0's inputs (`merge.inputs_unheld` 709 each).
+
+**What it means.**
+- **A-313 works under the launcher:** a replica killed mid-rung rebuilt its replica from its hold, 2,810 versions in
+  6,270 slices, and went on taking versions.
+- **A primary's crash over the whole kernel loses its green on that node:** the base tree volume no longer fits the
+  inode-version slab at recovery (by 6,348 bytes), so the green built over it is fenced. The seeding fix could not be
+  exercised; the run is owed again once the volume recovers. Reported to goal 232.
