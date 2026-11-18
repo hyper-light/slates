@@ -10756,16 +10756,21 @@ pub(crate) async fn rebuild_recovered(
 
 /// The held replicas' content and registers from the image (AUD-29-59; §4.8 persistence before reply), what
 /// [`rebuild_recovered`] takes back before the volumes.
-fn restore_held_image(state: &mut ShardState, held: &[u8], rebuilt: &mut Rebuilt) {
+fn restore_held_image(
+  state: &mut ShardState,
+  held: &[slates_vfs::recover::HeldPiece],
+  rebuilt: &mut Rebuilt,
+) {
   // The held replicas' blocks too (A-64), then every claim is committed: the recovered image names them all, so none
   // is reused before this daemon's first publication commits.
-  // The held image carries the content hold and the held registers (§4.8 persistence before reply): split, the
-  // content claimed and rebuilt below, the registers rebuilt with their fences once the hold is.
+  // The held image's pieces carry the content hold, the held registers and the live copies (§4.8 persistence before
+  // reply; A-270): split, the content claimed and rebuilt below, the registers rebuilt with their fences once the hold
+  // is.
   let held = match crate::content_holder::split_held(held) {
     Ok(held) => Some(held),
     Err(e) => {
       slates_machine::log_line!(
-        "slates-server: partition {}: held image refused: {e:?}",
+        "slates-server: partition {}: held image refused: {e}",
         state.partition
       );
       rebuilt.replicas_refused = true;
@@ -11544,18 +11549,18 @@ fn content_range(start: usize, slice_len: usize, offset: usize, len: usize) -> O
     .flatten()
 }
 
-/// The shard's recovery images from its slice of the anchor content object (§4.8), by volume id, and the
-/// held replicas' image the same shard image carries (AUD-29-59). A torn or malformed image logs and yields
-/// nothing for that shard (each volume then refuses as unrecoverable rather than presenting empty),
-/// matching §4.8's "never an empty success".
-fn recover_images(state: &mut ShardState) -> RecoveredImages {
+/// The shard's journal as a restart reads it from its slice of the anchor content object (§4.8, A-68): the committed
+/// checkpoint with every valid delta after it applied, and the journal positioned after them; `None` without a content
+/// object or a slice in it.
+fn read_journal(
+  state: &ShardState,
+) -> Option<Result<(Option<ShardImage>, slates_vfs::checkpoint_log::Journal), slates_vfs::VfsError>>
+{
   let (start, end) = state.content_range;
   let (delta_start, delta_end) = state.delta_range;
-  let Some(object) = &state.content else {
-    return RecoveredImages::default();
-  };
+  let object = state.content.as_ref()?;
   if end <= start || end > object.len() {
-    return RecoveredImages::default();
+    return None;
   }
   let checkpoints = ContentView {
     object,
@@ -11572,11 +11577,39 @@ fn recover_images(state: &mut ShardState) -> RecoveredImages {
       0
     },
   };
-  match slates_vfs::checkpoint_log::Journal::recover(&checkpoints, &log) {
+  Some(slates_vfs::checkpoint_log::Journal::recover(
+    &checkpoints,
+    &log,
+  ))
+}
+
+/// Test support (A-270's oracle): whether the held pieces a restart would read from this shard's committed journal are
+/// exactly the ones it holds now ([`crate::content_holder::held_image`]), each delta's pieces folded over its
+/// checkpoint. Read after a publication commits, a missed change mark is a difference here before it is a lost record.
+pub(crate) fn committed_held_agrees(state: &ShardState) -> bool {
+  let committed = match read_journal(state) {
+    Some(Ok((Some(shard), _))) => shard.held,
+    Some(Ok((None, _))) | None => Vec::new(),
+    Some(Err(_)) => return false,
+  };
+  let mut held = crate::content_holder::held_image(state);
+  held.sort_by_key(|piece| piece.key);
+  committed == held
+}
+
+/// The shard's recovery images from its slice of the anchor content object (§4.8), by volume id, and the
+/// held replicas' image the same shard image carries (AUD-29-59). A torn or malformed image logs and yields
+/// nothing for that shard (each volume then refuses as unrecoverable rather than presenting empty),
+/// matching §4.8's "never an empty success".
+fn recover_images(state: &mut ShardState) -> RecoveredImages {
+  let Some(recovered) = read_journal(state) else {
+    return RecoveredImages::default();
+  };
+  match recovered {
     Ok((Some(shard), journal)) => {
       state.journal = journal;
       state.published_keys = shard.volumes.iter().map(|keyed| keyed.key).collect();
-      state.published_held.clone_from(&shard.held);
+      state.published_held = crate::content_holder::published_from(&shard.held);
       RecoveredImages {
         volumes: shard
           .volumes
@@ -11606,7 +11639,7 @@ fn recover_images(state: &mut ShardState) -> RecoveredImages {
 #[derive(Default)]
 struct RecoveredImages {
   volumes: std::collections::BTreeMap<[u8; 16], VolumeImage>,
-  held: Vec<u8>,
+  held: Vec<slates_vfs::recover::HeldPiece>,
   replies: Vec<slates_vfs::recover::HeldReply>,
   calls: Vec<slates_vfs::recover::HeldCall>,
   nfs_replies: Vec<slates_vfs::recover::HeldNfsReply>,
@@ -11842,7 +11875,8 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
   }
   // The replicas this shard holds for other owners ride the same image (AUD-29-59): a holder acknowledges a
   // content put only once a publish carrying it commits.
-  let held = crate::content_holder::held_image(state);
+  let mut held = crate::content_holder::held_image(state);
+  let whole = crate::content_holder::whole_of(&held);
   let mut replies = pending_replies(state);
   let mut calls = call_records_checkpoint(state);
   let mut nfs_replies = held_nfs_replies(state);
@@ -11857,7 +11891,7 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
       state,
       &handles,
       &skipped,
-      &held,
+      &mut held,
       (&mut replies, &mut calls, &mut nfs_replies, &mut nfs_states),
     ) {
       Ok(Streamed::Uncaptured(id, e)) => skipped.push((id, e)),
@@ -11891,7 +11925,7 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
     }
   }
   state.published_keys = published.volumes.iter().map(|id| id.bytes).collect();
-  state.published_held = held;
+  crate::content_holder::held_committed(state, whole, true);
   call_records_published(state);
   // Every volume captured: this image holds every logged write, so the write log empties, stamped with this
   // generation (A-63). A volume skipped keeps the log, so its writes stay replayable.
@@ -11923,7 +11957,7 @@ fn stream_checkpoint(
   state: &mut ShardState,
   handles: &[Handle<VolumeSlot>],
   skipped: &[(DbVolumeId, slates_vfs::VfsError)],
-  held: &[u8],
+  held: &mut Vec<slates_vfs::recover::HeldPiece>,
   (replies, calls, nfs_replies, nfs_states): (
     &mut Vec<slates_vfs::recover::HeldReply>,
     &mut Vec<slates_vfs::recover::HeldCall>,
@@ -12115,8 +12149,7 @@ fn publish_delta_into(
     .filter(|key| !present.contains(*key))
     .copied()
     .collect();
-  let held = crate::content_holder::held_image(state);
-  let held_changed = held != state.published_held;
+  let mut held = crate::content_holder::held_changes(state);
   let (mut calls, mut calls_removed) = call_records_delta(state);
   let mut nfs_replies = held_nfs_replies_changed(state).then(|| held_nfs_replies(state));
   // The held connections' byte states (A-231), whole in every delta: a READ changes them without a publication of its
@@ -12127,7 +12160,7 @@ fn publish_delta_into(
     count_at,
     count,
     &mut removed,
-    held_changed.then_some(&held[..]),
+    (&mut held.put, &mut held.removed),
     Some(&pending_replies(state)),
     (&mut calls, &mut calls_removed),
     (nfs_replies.as_deref_mut(), Some(&mut nfs_states[..])),
@@ -12151,9 +12184,15 @@ fn publish_delta_into(
     }
   }
   state.published_keys = present;
-  if held_changed {
-    state.published_held = held;
+  let carried = held
+    .put
+    .iter()
+    .map(|piece| piece.bytes.len())
+    .fold(0usize, usize::saturating_add);
+  if carried > 0 {
+    state.count(DELTA_HELD_BYTES, u64::try_from(carried).unwrap_or(u64::MAX));
   }
+  crate::content_holder::held_committed(state, held.whole, false);
   call_records_published(state);
   #[cfg(target_os = "linux")]
   clear_write_log(
@@ -12163,6 +12202,10 @@ fn publish_delta_into(
   );
   Ok(published)
 }
+
+/// Format: the status counter of the held-image bytes the shard's committed deltas carried (§4.8 persistence before
+/// reply): what a holder's acknowledgement costs its publication, so a test can hold it to the change made.
+pub(crate) const DELTA_HELD_BYTES: &str = "publish.delta_held_bytes";
 
 /// Format: the status counter of publications run to release blocks whose frees waited on one (A-64).
 pub(crate) const DEFERRED_RELIEVED: &str = "arena.deferred_relieved";
