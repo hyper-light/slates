@@ -409,8 +409,7 @@ fn a_crash_loop_of_starts_longer_than_the_window_is_backed_off() {
 /// failed start too; restarted at once each time, it would spend nearly all its time restarting. Do: supervise a child
 /// that starts for [`SLOW_START_NS`], serves a tenth of that and exits, every time. Expect the first exit restarted at
 /// once and the crash loop reported at the second, backed off at least as long as a start. Before, any exit after the
-/// serving mark was restarted at once: red on main 29ef4521 (restarted at once 4 times of 4, backed off None), and still
-/// red once a failed start in a row was backed off (A-311's first half) until a served exit counted.
+/// serving mark was restarted at once: red on main 29ef4521 (restarted at once 4 times of 4, backed off None).
 #[test]
 fn a_daemon_that_dies_soon_after_it_serves_is_backed_off() {
   // The start of the slow loop's test: the two run in parallel and share the process's environment, which carries it.
