@@ -9,8 +9,7 @@
   clippy::indexing_slicing,
   clippy::unwrap_in_result
 )]
-// A real landing target on the host's disk: macOS and Linux.
-#![cfg(unix)]
+// A real landing target on the host's disk, on every platform since the Windows writer (A-185).
 
 use slates_client::{
   Client, ClientError, Filter, Landing, PolicySubject, Refusal, VolumeId, WriteAct, WriteMode,
@@ -23,7 +22,7 @@ use slates_server::landing::{
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 mod common;
-use common::client::{connect, scratch};
+use common::client::{channel_account, connect, scratch};
 use common::landing::GRANT_TERM_NS;
 use common::target::{TargetDir, target_dir};
 
@@ -202,11 +201,11 @@ fn an_agent_cannot_raise_its_own_policy() {
   let target = target_dir();
   let mut launcher = connect(&instance);
   let volume = volume_with(&mut launcher, "guarded", b"agent's work");
-  let account = rustix::process::getuid().as_raw();
+  let mut agent = connect(&instance);
+  let account = channel_account(&daemon, agent.client_id());
   let (consumer, capability) = launcher
     .enroll(account, enroll_proof(&secret, account))
     .unwrap();
-  let mut agent = connect(&instance);
   agent.attest(consumer, &capability).unwrap();
   let subject = PolicySubject::Volume { volume };
   let bypass = landing(WriteMode::Bypass);
@@ -334,11 +333,11 @@ fn an_agent_cannot_approve_its_own_merge() {
   else {
     panic!("an asked merge answers an approval request");
   };
-  let account = rustix::process::getuid().as_raw();
+  let mut agent = connect(&instance);
+  let account = channel_account(&daemon, agent.client_id());
   let (consumer, capability) = launcher
     .enroll(account, enroll_proof(&secret, account))
     .unwrap();
-  let mut agent = connect(&instance);
   agent.attest(consumer, &capability).unwrap();
   let approved = agent.submit_approved(
     work,
@@ -369,11 +368,11 @@ fn an_agent_cannot_approve_its_own_landing() {
   let secret = daemon.segment().issuer_secret().unwrap();
   let target = target_dir();
   let mut launcher = connect(&instance);
-  let account = rustix::process::getuid().as_raw();
+  let mut agent = connect(&instance);
+  let account = channel_account(&daemon, agent.client_id());
   let (consumer, capability) = launcher
     .enroll(account, enroll_proof(&secret, account))
     .unwrap();
-  let mut agent = connect(&instance);
   agent.attest(consumer, &capability).unwrap();
   let volume = volume_with(&mut agent, "self-approved", b"agent's work");
   set(&mut launcher, &secret, volume, landing(WriteMode::Ask));
@@ -417,14 +416,14 @@ fn an_agent_cannot_enroll_or_revoke_a_consumer() {
   let (daemon, instance) = daemon("enroll-revoke");
   let secret = daemon.segment().issuer_secret().unwrap();
   let mut launcher = connect(&instance);
-  let account = rustix::process::getuid().as_raw();
+  let mut agent = connect(&instance);
+  let account = channel_account(&daemon, agent.client_id());
   let (consumer, capability) = launcher
     .enroll(account, enroll_proof(&secret, account))
     .unwrap();
   let (neighbour, neighbour_capability) = launcher
     .enroll(account, enroll_proof(&secret, account))
     .unwrap();
-  let mut agent = connect(&instance);
   agent.attest(consumer, &capability).unwrap();
   let mut neighbouring_agent = connect(&instance);
   neighbouring_agent
@@ -537,11 +536,11 @@ fn a_consumers_own_policy_holds_its_agent_to_the_stricter_mode() {
   let secret = daemon.segment().issuer_secret().unwrap();
   let target = target_dir();
   let mut launcher = connect(&instance);
-  let account = rustix::process::getuid().as_raw();
+  let mut agent = connect(&instance);
+  let account = channel_account(&daemon, agent.client_id());
   let (consumer, capability) = launcher
     .enroll(account, enroll_proof(&secret, account))
     .unwrap();
-  let mut agent = connect(&instance);
   agent.attest(consumer, &capability).unwrap();
   // The agent's own volume and work, as an agent works; the launcher sets the policies.
   let volume = volume_with(&mut agent, "session-held", b"agent's work");

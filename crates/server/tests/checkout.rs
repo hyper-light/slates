@@ -3,8 +3,7 @@
 //! disk. Each test drives a real daemon over a real directory in the build output and reads the disk back.
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-// A real landing target: macOS and Linux.
-#![cfg(unix)]
+// A real landing target, on every platform since the Windows writer (A-185).
 
 use slates_client::{Client, ClientError, Landing, Submitted, VolumeId};
 use slates_ipc::protocol::{CheckoutReport, Filter, GreenBase, Intent, Refusal};

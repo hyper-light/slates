@@ -20,7 +20,7 @@
 
 use std::collections::BTreeMap;
 use std::os::windows::fs::{FileExt, OpenOptionsExt};
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 
 use slates_vfs::host::{
@@ -40,7 +40,7 @@ use windows_sys::Win32::Storage::FileSystem::{
   FILE_GENERIC_READ, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
   FILE_SHARE_WRITE, FILE_TRAVERSE, FileAttributeTagInfo, FileFullDirectoryInfo,
   FileFullDirectoryRestartInfo, GetFileInformationByHandleEx, MAXIMUM_REPARSE_DATA_BUFFER_SIZE,
-  SYNCHRONIZE,
+  READ_CONTROL, SYNCHRONIZE,
 };
 use windows_sys::Win32::System::IO::{DeviceIoControl, IO_STATUS_BLOCK};
 
@@ -447,14 +447,13 @@ fn check_root_volume(path: &Path) -> Result<(), HostError> {
 /// the path a name surrogate along the way redirects to, with the rest appended; `None` when the walk reaches the last
 /// component without one. A path on no drive letter (a share, a device) names no volume this daemon mounts.
 fn next_redirect(path: &Path) -> Result<Option<std::path::PathBuf>, HostError> {
-  use std::path::{Component, Prefix};
+  use std::path::Component;
   let mut components = path.components();
   let Some(Component::Prefix(prefix)) = components.next() else {
     return Ok(None);
   };
-  let drive = match prefix.kind() {
-    Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => format!("{}:", char::from(letter)),
-    _ => return Ok(None),
+  let Some(drive) = drive_of(prefix) else {
+    return Ok(None);
   };
   if drive_is_own(&drive)? {
     return Err(crate::own_mounts::refusal());
@@ -495,6 +494,15 @@ fn next_redirect(path: &Path) -> Result<Option<std::path::PathBuf>, HostError> {
     parent = child;
   }
   Ok(None)
+}
+
+/// The drive (`X:`) a path's prefix names; `None` for a share or a device, which names no volume this daemon mounts.
+fn drive_of(prefix: std::path::PrefixComponent<'_>) -> Option<String> {
+  use std::path::Prefix;
+  match prefix.kind() {
+    Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => Some(format!("{}:", char::from(letter))),
+    _ => None,
+  }
 }
 
 /// Whether `drive` (`X:`) names one of this daemon's own WinFsp volumes: its DOS device target, by the object manager.
@@ -636,6 +644,114 @@ impl OsHost {
   pub fn open_handles(&self) -> usize {
     self.dirs.len().saturating_add(self.files.len())
   }
+
+  /// The handle behind a directory handle id, for the landing crate's write verbs (the Unix host's `dir_fd`).
+  pub fn dir_handle(&self, dir: HostDir) -> Result<BorrowedHandle<'_>, HostError> {
+    self.dir(dir).map(AsHandle::as_handle)
+  }
+
+  /// The file behind a file handle id, for the landing crate's write verbs (the Unix host's `file_fd`): written through
+  /// as it is (`seek_write`), its handle borrowed for the rest, never duplicated per call.
+  pub fn file_of(&self, file: HostFile) -> Result<&std::fs::File, HostError> {
+    self.files.get(&file.0).ok_or(HostError::StaleHandle)
+  }
+
+  /// The fingerprint of the entry `name` under `dir` itself — a link's own, never its target's (opened with
+  /// `FILE_OPEN_REPARSE_POINT`): the landing's check of an entry it moved aside (AUD-29-04). A read, like
+  /// [`HostFs::list`]'s own per-entry open.
+  pub fn entry_fingerprint(&self, dir: HostDir, name: &str) -> Result<Fingerprint, HostError> {
+    let entry = open_relative(
+      self.dir(dir)?,
+      name,
+      ENTRY_ACCESS,
+      nt::FILE_OPEN_REPARSE_POINT | nt::FILE_SYNCHRONOUS_IO_NONALERT,
+    )?;
+    fingerprint_of_handle(entry.as_raw_handle())
+  }
+
+  /// Takes ownership of a directory handle the caller opened (with containment); refused once the handle ids
+  /// are spent ([`OsHost::allocate`]).
+  pub fn adopt_dir(&mut self, handle: OwnedHandle) -> Result<HostDir, HostError> {
+    let h = self.allocate()?;
+    self.dirs.insert(h, handle);
+    Ok(HostDir(h))
+  }
+
+  /// Takes ownership of a file handle the caller opened (a temporary); refused once the handle ids are spent.
+  pub fn adopt_file(&mut self, handle: OwnedHandle) -> Result<HostFile, HostError> {
+    let h = self.allocate()?;
+    self.files.insert(h, std::fs::File::from(handle));
+    Ok(HostFile(h))
+  }
+}
+
+/// Why [`walk_dir`] refused a path.
+#[derive(Debug)]
+pub enum WalkRefusal {
+  /// The path is not absolute (a drive or a share and a root).
+  NotAbsolute,
+  /// A component is `..`, a link, a junction or a mount point: the path would leave the directory it names.
+  Escapes,
+  /// The path is on one of this daemon's own WinFsp volumes (§4.6, A-227): refused before any open, since a request
+  /// the daemon sends to its own volume is answered only by itself.
+  OwnMount,
+  /// The host refused a component.
+  Host(HostError),
+}
+
+/// Opens the absolute directory `path` one component at a time from its root, each with `FILE_OPEN_REPARSE_POINT`
+/// relative to the handle before it, refusing `..` and any component that redirects the namespace (a symbolic link,
+/// a junction, a mount point): the landing target's containment (§4.15 step 4), the Windows form of the Unix walk with
+/// `O_DIRECTORY|O_NOFOLLOW`. Each handle has the directory access the host retains, and `READ_CONTROL` (the owner's
+/// check). A path on one of this daemon's own drives is refused before the first open (A-227): the walk refuses every
+/// name surrogate, so the drive the path names is the only volume it can reach, where the Unix walk checks each
+/// component's mount. A read: nothing is created or written.
+pub fn walk_dir(path: &Path) -> Result<OwnedHandle, WalkRefusal> {
+  use std::path::Component;
+  let mut components = path.components();
+  let (Some(Component::Prefix(prefix)), Some(Component::RootDir)) =
+    (components.next(), components.next())
+  else {
+    return Err(WalkRefusal::NotAbsolute);
+  };
+  if let Some(drive) = drive_of(prefix)
+    && drive_is_own(&drive).map_err(WalkRefusal::Host)?
+  {
+    return Err(WalkRefusal::OwnMount);
+  }
+  let mut root = std::path::PathBuf::from(prefix.as_os_str());
+  root.push(std::path::MAIN_SEPARATOR_STR);
+  // structural: allow — a read-only open of the volume's root directory; nothing is written (R1).
+  let mut current = std::fs::OpenOptions::new()
+    .access_mode(DIRECTORY_ACCESS | READ_CONTROL)
+    .share_mode(SHARE_ALL)
+    .custom_flags(BACKUP_SEMANTICS | OPEN_REPARSE_POINT)
+    .open(&root)
+    .map(OwnedHandle::from)
+    .map_err(|e| WalkRefusal::Host(refusal(&e)))?;
+  for component in components {
+    let name = match component {
+      Component::Normal(name) => name.to_str().ok_or(WalkRefusal::Escapes)?,
+      Component::CurDir => continue,
+      _ => return Err(WalkRefusal::Escapes),
+    };
+    let next = open_relative(
+      &current,
+      name,
+      DIRECTORY_ACCESS | READ_CONTROL,
+      nt::FILE_OPEN_REPARSE_POINT | nt::FILE_SYNCHRONOUS_IO_NONALERT,
+    )
+    .map_err(WalkRefusal::Host)?;
+    let info = attribute_tag(&next).map_err(WalkRefusal::Host)?;
+    if redirects(&info) {
+      return Err(WalkRefusal::Escapes);
+    }
+    if info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+      return Err(WalkRefusal::Host(HostError::NotDirectory));
+    }
+    current = next;
+  }
+  Ok(current)
 }
 
 /// The entry `units` of `parent` as a listing shows it: fingerprinted and kinded through its own contained

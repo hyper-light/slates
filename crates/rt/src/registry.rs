@@ -149,6 +149,9 @@ pub struct Pulse {
   /// The shard's idle spin window (`ShardContext::counters`' `idle_window_ns`), mirrored beside the wake estimate
   /// it may be priced on, so a reader on another thread can tell whether the window follows the estimate (A-223).
   idle_window_ns: AtomicU64,
+  /// What an idle turn costs a request that lands in it, as the shard has learned it (`ShardContext::counters`'
+  /// `held_turn_ns`), mirrored at the end of each idle spin beside the wake estimate it is weighed against (A-387).
+  held_turn_ns: AtomicU64,
 }
 
 impl Pulse {
@@ -184,6 +187,17 @@ impl Pulse {
   /// [`Pulse::record_idle_window`]).
   pub fn idle_window_ns(&self) -> u64 {
     self.idle_window_ns.load(Ordering::Relaxed)
+  }
+
+  /// The owning shard mirrors what an idle turn costs a request, as it has learned it, at the end of an idle spin.
+  pub fn record_held_turn(&self, held_turn_ns: u64) {
+    self.held_turn_ns.store(held_turn_ns, Ordering::Relaxed);
+  }
+
+  /// What an idle turn costs a request that lands in it, nanoseconds, as of the shard's last idle spin; 0 until its
+  /// first measured turn (see [`Pulse::record_held_turn`]).
+  pub fn held_turn_ns(&self) -> u64 {
+    self.held_turn_ns.load(Ordering::Relaxed)
   }
 
   /// The owning shard's application loop marks one period of forward progress.

@@ -3,9 +3,9 @@
 //! it under the trusted signers only the launcher sets — a merge's under its work's and its green's, a landing's under
 //! its volume's — records the verdict as the act's provenance (a merge's with the version, a landing's on its audit
 //! records) and answers it; a volume may require signed merges. A signature never permits anything: the write modes
-//! decide (A-285). Driven through real daemons and the wire, a landing into a real directory on the host's disk (Unix,
-//! where the daemon lands); the signing keys are software Ed25519 keys signing as `ssh-keygen -Y sign -n slates-work`
-//! signs (`common::signer`).
+//! decide (A-285). Driven through real daemons and the wire, a landing into a real directory on the host's disk (on
+//! every platform since the Windows writer, A-185); the signing keys are software Ed25519 keys signing as
+//! `ssh-keygen -Y sign -n slates-work` signs (`common::signer`).
 #![allow(
   clippy::unwrap_used,
   clippy::expect_used,
@@ -25,20 +25,14 @@ use slates_ipc::HeldRendezvous;
 use slates_server::landing::{merge_approval_proof, policy_proof, signers_proof};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
-use common::client::connect;
+use common::client::{channel_account, connect};
 use common::signer::TestSigner;
-// What only the landing tests name: a landing writes a real target on the host's disk, on Unix.
-#[cfg(unix)]
+// What only the landing tests name: a landing writes a real target on the host's disk.
 use common::client::scratch;
-#[cfg(unix)]
 use common::landing::GRANT_TERM_NS;
-#[cfg(unix)]
 use common::target::{TargetDir, target_dir};
-#[cfg(unix)]
 use slates_client::{Filter, GrantScope, Intent, Landing, SignedLanding};
-#[cfg(unix)]
 use slates_ipc::protocol::AuditKind;
-#[cfg(unix)]
 use slates_server::landing::{enroll_proof, grant_proof};
 
 /// Shape: one shard, so a green and its works share it; `a_signed_merge_off_its_greens_shard_is_judged_there` runs
@@ -49,7 +43,6 @@ const SPREAD_SHARDS: u16 = 4;
 /// Format: the launcher secret the restart tests' starter hands its anchor.
 const LAUNCHER: [u8; 32] = [9; 32];
 /// Format: the permission bits of the file a landing test writes.
-#[cfg(unix)]
 const MODE: u32 = 0o644;
 
 /// A daemon of `shards` shards over a fresh segment, its local consensus group made.
@@ -458,23 +451,22 @@ fn the_launcher_sets_a_volumes_trusted_signers_once_each() {
 
 /// A-321, R10: an agent never sets its own volume's trusted signers, as it never sets its policy. Do: from a channel
 /// bound to an enrolled consumer, set a green's signers with a genuine proof (the launcher's secret leaked to the
-/// agent). Expect `Forbidden`, and nothing set. Unix: the consumer is enrolled under the channel's uid (`consumers.rs`
-/// covers enrollment on every platform).
-#[cfg(unix)]
+/// agent). Expect `Forbidden`, and nothing set. The consumer is enrolled under the host account the daemon authenticated
+/// the agent's channel as (`common::client::channel_account`).
 #[test]
 fn an_agent_cannot_set_trusted_signers() {
   let (daemon, instance) = daemon("agent-signers", TEST_SHARDS);
   let secret = daemon.segment().issuer_secret().unwrap();
   let mut launcher = connect(&instance);
   let green = launcher.create_green("agent-green", false).unwrap();
-  let account = rustix::process::getuid().as_raw();
+  let mut agent = connect(&instance);
+  let account = channel_account(&daemon, agent.client_id());
   let (consumer, capability) = launcher
     .enroll(
       account,
       slates_server::landing::enroll_proof(&secret, account),
     )
     .unwrap();
-  let mut agent = connect(&instance);
   agent.attest(consumer, &capability).unwrap();
   let keys = vec![TestSigner::fresh().public()];
   let refused = agent.set_signers(green, (&keys, 0), signers_proof(&secret, green, &keys, 0));
@@ -694,7 +686,6 @@ fn a_forbidden_merge_has_no_statement() {
 }
 
 /// A volume holding `f` = `bytes`: what a landing test lands.
-#[cfg(unix)]
 fn volume_with(client: &mut Client, name: &str, bytes: &[u8]) -> VolumeId {
   let volume = client.create(&scratch(name)).unwrap();
   write_f(client, volume, bytes);
@@ -702,7 +693,6 @@ fn volume_with(client: &mut Client, name: &str, bytes: &[u8]) -> VolumeId {
 }
 
 /// Writes `f` = `bytes` into `volume`, through an attachment of its own.
-#[cfg(unix)]
 fn write_f(client: &mut Client, volume: VolumeId, bytes: &[u8]) {
   let attachment = client
     .attach(volume, None, Intent::Write)
@@ -714,7 +704,6 @@ fn write_f(client: &mut Client, volume: VolumeId, bytes: &[u8]) {
 }
 
 /// The policy that lands as `land` says and merges as asked.
-#[cfg(unix)]
 fn landing(land: WriteMode) -> WritePolicy {
   WritePolicy {
     merge: WriteMode::Ask,
@@ -724,14 +713,12 @@ fn landing(land: WriteMode) -> WritePolicy {
 }
 
 /// What `target` holds at `f`, if anything.
-#[cfg(unix)]
 fn on_disk(target: &TargetDir) -> Option<Vec<u8>> {
   #[allow(clippy::disallowed_methods)] // reading the landed target back, read-only
   std::fs::read(format!("{}/f", target.path)).ok()
 }
 
 /// `volume`'s landing into `target` presented and never landed, whatever its mode, carrying `signature`.
-#[cfg(unix)]
 fn presented(
   client: &mut Client,
   volume: VolumeId,
@@ -744,7 +731,6 @@ fn presented(
 }
 
 /// `volume`'s landing into `target` under its mode, with `grant` if one was issued, carrying `signature`.
-#[cfg(unix)]
 fn land_signed(
   client: &mut Client,
   (volume, target): (VolumeId, &TargetDir),
@@ -761,7 +747,6 @@ fn land_signed(
 }
 
 /// A presentation's id, manifest and statement, from its answer.
-#[cfg(unix)]
 fn shown(answer: &SignedLanding) -> (u64, [u8; 32], Vec<u8>) {
   let Landing::GrantRequired {
     landing, manifest, ..
@@ -776,7 +761,6 @@ fn shown(answer: &SignedLanding) -> (u64, [u8; 32], Vec<u8>) {
 }
 
 /// A landing's verdict, from an answer that says it landed.
-#[cfg(unix)]
 fn landed_verdict(answer: &SignedLanding) -> Verification {
   let Landing::Landed(outcome) = &answer.landing else {
     panic!("a landing written: {answer:?}");
@@ -789,7 +773,6 @@ fn landed_verdict(answer: &SignedLanding) -> Verification {
 }
 
 /// Lowercase hex, as the statement names a volume and a manifest.
-#[cfg(unix)]
 fn hex(bytes: &[u8]) -> String {
   bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -803,7 +786,6 @@ fn hex(bytes: &[u8]) -> String {
 /// unsigned presentation's one record unsigned, every record of the signed landing as a whole (its presentation, the
 /// granted run's plan, its finish) verified, and no other record judging anything. Non-vacuity: the verifier counted
 /// the verified judgments, one at the presentation and one at the finish.
-#[cfg(unix)]
 #[test]
 fn a_signed_landing_is_judged_recorded_and_read_back() {
   let (daemon, instance) = daemon("landed", TEST_SHARDS);
@@ -852,7 +834,6 @@ fn a_signed_landing_is_judged_recorded_and_read_back() {
 /// The unsigned presentation of `a_signed_landing_is_judged_recorded_and_read_back`. Expect it unsigned, and its
 /// statement exactly the landing's — its first line, the volume, the target as the request named it with its length,
 /// the manifest shown, one field a line. Returns its id, manifest and statement.
-#[cfg(unix)]
 fn expect_the_statement_a_person_reads(
   unsigned: &SignedLanding,
   volume: VolumeId,
@@ -876,7 +857,6 @@ fn expect_the_statement_a_person_reads(
 /// The audit of `a_signed_landing_is_judged_recorded_and_read_back`. Expect the unsigned presentation `first` judged on
 /// its one record, unsigned; every record of the signed landing `second` that judges verified naming `key`, a planned
 /// and a finished one among them; and no record judging anything but a landing's planned and finished ones.
-#[cfg(unix)]
 fn expect_the_landings_audited(client: &mut Client, (first, second): (u64, u64), key: &TestSigner) {
   let records = client.audit(0).unwrap();
   let judged = |landing: u64| {
@@ -916,7 +896,6 @@ fn expect_the_landings_audited(client: &mut Client, (first, second): (u64, u64),
 
 /// A bypass volume `name` holding `f` = `bytes` and trusting `trusted`, a fresh target, and the statement a presentation
 /// of the landing states: one landing of `a_landings_signature_decides_nothing_its_mode_decides`.
-#[cfg(unix)]
 fn bypassed(
   client: &mut Client,
   secret: &[u8; 32],
@@ -939,7 +918,6 @@ fn bypassed(
 /// at once and answered invalid — `UnregisteredKey`, `Namespace`, `BadSignature` — each counted once at the bypass
 /// presentation and once at the finish; and the forbidden one refused `PolicyForbids` though its signature verifies,
 /// never judged, nothing written.
-#[cfg(unix)]
 #[test]
 fn a_landings_signature_decides_nothing_its_mode_decides() {
   let (daemon, instance) = daemon("undecided", TEST_SHARDS);
@@ -979,7 +957,6 @@ fn a_landings_signature_decides_nothing_its_mode_decides() {
 /// One invalid landing of `a_landings_signature_decides_nothing_its_mode_decides`. Do: land a bypass volume `name`
 /// trusting `trusted`, signed by `sign` over the statement its presentation stated. Expect it written at once and
 /// answered invalid for `fault`: the verdict is provenance and refuses nothing.
-#[cfg(unix)]
 fn expect_landed_invalid(
   client: &mut Client,
   (secret, trusted): (&[u8; 32], &TestSigner),
@@ -999,7 +976,6 @@ fn expect_landed_invalid(
 /// The stale landing of `a_landings_signature_decides_nothing_its_mode_decides`. Do: sign the statement of a bypass
 /// volume's landing with the trusted key, change `f`, and land with that signature. Expect it written with `f` as it
 /// is now, and answered `BadSignature`: the statement it signed named a manifest the volume moved past.
-#[cfg(unix)]
 fn expect_a_stale_signature_landed_bad(
   client: &mut Client,
   secret: &[u8; 32],
@@ -1025,7 +1001,6 @@ fn expect_a_stale_signature_landed_bad(
 /// The forbidden landing of `a_landings_signature_decides_nothing_its_mode_decides`. Do: sign a bypass volume's landing
 /// statement with the trusted key, forbid the volume's landings, and land with the signature. Expect `PolicyForbids`
 /// naming the landing and the volume, and nothing written: a forbidden landing is refused signed or not.
-#[cfg(unix)]
 fn expect_a_verified_signature_forbidden(
   client: &mut Client,
   secret: &[u8; 32],
@@ -1054,11 +1029,16 @@ fn expect_a_verified_signature_forbidden(
 }
 
 /// An agent's channel bound to a consumer whose own policy asks for its landings (and forbids its merges), enrolled and
-/// set by `launcher` under `secret`, as `write_policy.rs` binds one. Unix: the consumer is enrolled under the channel's
-/// uid.
-#[cfg(unix)]
-fn asking_agent(launcher: &mut Client, secret: &[u8; 32], instance: &str) -> Client {
-  let account = rustix::process::getuid().as_raw();
+/// set by `launcher` under `secret`, as `write_policy.rs` binds one. The consumer is enrolled under the host account
+/// `daemon` authenticated the agent's channel as.
+fn asking_agent(
+  daemon: &Daemon,
+  launcher: &mut Client,
+  secret: &[u8; 32],
+  instance: &str,
+) -> Client {
+  let mut agent = connect(instance);
+  let account = channel_account(daemon, agent.client_id());
   let (consumer, capability) = launcher
     .enroll(account, enroll_proof(secret, account))
     .unwrap();
@@ -1075,7 +1055,6 @@ fn asking_agent(launcher: &mut Client, secret: &[u8; 32], instance: &str) -> Cli
       policy_proof(secret, &subject, &asked, 0),
     )
     .unwrap();
-  let mut agent = connect(instance);
   agent.attest(consumer, &capability).unwrap();
   agent
 }
@@ -1084,14 +1063,13 @@ fn asking_agent(launcher: &mut Client, secret: &[u8; 32], instance: &str) -> Cli
 /// landing keeps its signature through that turn. Do: as an agent whose consumer asks, make a volume the launcher sets
 /// to bypass and trusting one key; present its landing for the statement and land it signed by that key. Expect the
 /// landing presented, nothing written (the consumer's ask governs the volume's bypass), and verified naming the key.
-#[cfg(unix)]
 #[test]
 fn an_agents_asked_landing_keeps_its_signature() {
   let (daemon, instance) = daemon("agent-landing", TEST_SHARDS);
   let secret = daemon.segment().issuer_secret().unwrap();
   let target = target_dir();
   let mut launcher = connect(&instance);
-  let mut agent = asking_agent(&mut launcher, &secret, &instance);
+  let mut agent = asking_agent(&daemon, &mut launcher, &secret, &instance);
   let volume = volume_with(&mut agent, "agent-landing", b"the agent's signed work");
   let key = TestSigner::fresh();
   trust(&mut launcher, &secret, volume, &[&key]);
@@ -1121,7 +1099,6 @@ fn an_agents_asked_landing_keeps_its_signature() {
 /// Expect each finished landing's records as they were judged — verified naming the key, and unsigned — read back from
 /// the recovered log, and the restarted daemon's verifier never asked (its counters at zero): provenance is how the
 /// landing was judged when it landed, never judged again.
-#[cfg(unix)]
 #[test]
 fn a_landings_verdict_survives_a_daemon_restart() {
   let (config, segment, rendezvous) = anchored("landing-restart");
@@ -1163,7 +1140,6 @@ fn a_landings_verdict_survives_a_daemon_restart() {
 /// One landing of `a_landings_verdict_survives_a_daemon_restart`: a bypass volume `name` trusting `trusted`, landed at
 /// once, signed by `signer` over its statement or unsigned. Its landing id, its verdict, and its target, kept for the
 /// restart that rebuilds the volume over it.
-#[cfg(unix)]
 fn land_at_once(
   client: &mut Client,
   (name, signer): (&str, Option<&TestSigner>),
