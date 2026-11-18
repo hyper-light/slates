@@ -5614,6 +5614,11 @@ them, and a seat change, a Raft configuration entry that moves no version itself
 its record moves, as any other change does. Before, the fetched reply named the answerer's known voters, adopted only
 with a newer view: a learner kept the voters of its join and of whichever answer first brought a version, and named a
 voter long gone (`a_learner_learns_who_votes_once_the_voter_it_joined_from_is_gone`, 3 of 24 runs at one CPU).
+The root configuration records the root group's voters the same way (A-406: `RootCommand::Seat`,
+`RootConfiguration::seat`, recorded by the root leader once no change is in flight), so a root learner asks and keeps
+contact with the root voters its configuration names, not its join's. A root learner fetches when its alive view of the
+regions differs from the configuration's, and also when a root voter it knows is no longer alive: a region whose
+representative died stays a region, so only the voters show it.
 A node the council configuration it holds does not name keeps direct contact with every member it holds alive, as a
 forming node does, until it holds one that names it (A-331). That is a fresh member whose join was answered before the
 council admitted it, or a member retired while it was away. Judged by the member rule a fresh member kept no peer at
@@ -6321,9 +6326,9 @@ creator plus these exceptions; this adds no global lookup catalog or per-write c
 > a copy made afresh takes the first member's record it meets as its owner's. Held by
 > `every_copy_catches_up_once_the_creator_takes_its_volume_back_from_the_adopter`,
 > `every_copy_catches_up_once_the_third_node_takes_the_volume_from_the_adopter` and
-> `a_superseded_owner_restarted_warm_ships_no_record_of_the_volume_it_lost` (`crates/server/tests/fleet.rs`). Owed: the
-> let-go is kept by the control shard's next publication, so a warm restart before it restores the copies; and the
-> yield itself is memory-only (`ShardState::yielded`), so a warm restart forgets it.
+> `a_superseded_owner_restarted_warm_ships_no_record_of_the_volume_it_lost` (`crates/server/tests/fleet.rs`). The
+> let-go is published at once (A-415), so a warm restart does not restore the copies. Owed: the yield itself is
+> memory-only (`ShardState::yielded`), so a warm restart forgets it.
 
 > **Status (2026-11-18, A-409: a lost volume's log stops by itself, and a refusal names the fence).** A volume its
 > node yielded at its re-admission (A-334) ships nothing more and does no period work, as a fenced one does (A-349):
@@ -28375,7 +28380,8 @@ lists, the kept verdicts, `longest_name`, `widest_report`), `crates/vfs/src/base
   what it adopted), and a request carrying the previous version is refused `ConfigurationStale` and made again, as for
   any change. The regional configuration's encoding gains the set (layout 3).
 - **What it does not change.** The council's voters themselves and how they change (Raft §6, one joint change at a time);
-  the root group's learners, which still name the root voters of their join (GAPS, the open sibling).
+  the root group's learners, which still name the root voters of their join (GAPS, the open sibling; closed by
+  A-406).
 - **Tests.** `a_learner_names_the_voters_the_configuration_records_through_a_seat_change`
   (`crates/cluster/src/config_group.rs`) fails with the learner reading its Raft voters as before and with the leader's
   record withheld (kiln r3624, the Mac Studio, 2026-11-18);
@@ -29596,3 +29602,51 @@ the module's "The workload" and "The bound"), and the example's tests below.
   it again (`a_hot_set_names_each_file_once`); a hot set past half the eligible files is refused and exactly half is
   one (`a_hot_set_past_half_the_eligible_files_is_refused`); with no hot set every pick is from the whole tree and no
   shared slot is written (`with_no_hot_set_every_pick_is_from_the_whole_tree`).
+
+### A-415 — The re-admission publishes its let-go of the host's own register copies at once (2026-11-18, g230, scale-out; §4.8 "Authority scope", "Recovery"; A-382's owed item)
+Applied in the same change to: §4.8 "Authority scope" (A-382's status), GAPS (A-382's entry), and
+`crates/server/src/readmission.rs`.
+- **What was there.** A-382's let-go removed the host's own register copies from the control shard's held map, and the
+  removals rode the shard's next publication. A warm restart before it restored the copies from the last committed
+  image and routed each to the owner it named, this host, so they refused their successors again (A-382's failure)
+  until the next re-admission, which a restarted daemon does not see.
+- **The rule.** The let-go publishes the shard at once when it let anything go (`readmission::let_go_own_registers`);
+  a refused publication is counted `fleet.readmission.registers_let_go_unpublished`, and the removals stay marked
+  changed (`crate::tracked`) for the next one.
+- **Tests.** `a_readmissions_let_go_is_in_the_journal_a_restart_reads` (`readmission`'s unit tests, on a shard with
+  recovery storage): a copy naming the host held and published, the host re-admitted; the journal a restart reads
+  (`verbs::committed_held_agrees`) agrees with the shard at once, and with every publication refused around the
+  install the let-go is counted unpublished and the next publication carries it. The re-admission flows' fleet tests
+  are filed for main (run-requests.md, A-415).
+
+### A-406 — The root group records its voters in the versioned root configuration, so a root learner names who votes from the configuration it fetches (2026-11-18, goal g225: a forming fleet reaches every candidate; §4.8 learners; A-380's root sibling)
+
+- **What was there.** A root learner (every member that is not its region's representative) takes no part in the root
+  group's Raft. It knew who votes only from its join state's voters, since a root seat change is a Raft configuration
+  entry that moves no root version, and it fetched only when its alive view of the regions differed from the root
+  configuration's. Seen on Windows (run 44298844583): after the root moved from its bootstrapper to the regions'
+  representatives, three root learners still named the bootstrapper as the only root voter. It asked that voter for
+  fetches and kept direct contact with it as a voter, and a representative that died left its region in place, so no
+  comparison it made ever moved.
+- **The rule.** `RootConfiguration::voters` records the root voters, in id order, and `seat` changes them with the
+  version. The root leader proposes `RootCommand::Seat` with the voters in force whenever no change is in flight and
+  they differ from the record (`RootGroup::record_voters`, each root leader period). A root learner's `known_voters`
+  and `known_voter` read the record of the configuration it holds, its join state's before any record. A root learner
+  fetches from the voters it knows, keeps direct contact with them, and fetches also when one of them is no longer
+  alive in its membership.
+- **Why this and not another.** The same record as A-380's, so the council and the root learn who votes one way. A
+  version announced on the probe plane, as the council's is, would be a member-plane wire change, and the root's
+  learners need it only when a root voter changes, which a dead voter shows them.
+- **What it costs.** One root version per root seat change, and the root configuration's encoding gains the set (layout
+  2). A root learner fetches each period while a root voter it knows is dead and not yet replaced, as it already did
+  while its regions differed.
+- **What it does not change.** The root voters and how they change (Raft §6); the regional council (A-380).
+- **Tests.** `a_root_learner_names_the_voters_the_configuration_records_through_a_seat_change`
+  (`crates/cluster/src/root_group.rs`),
+  `a_root_seat_records_the_voters_in_id_order_and_advances_the_version_only_when_they_change`
+  (`crates/db/src/register.rs`), the root round trip and the layout golden in `crates/cluster/src/raft_wire.rs`.
+
+Applied in the same change to: §4.8 (learners), A-380's entry, GAPS (A-380's open sibling),
+`crates/db/src/register.rs`, `crates/cluster/src/raft_wire.rs`, `crates/cluster/src/root_group.rs`,
+`crates/server/src/fleet.rs`, their tests, and the bug record
+`docs/bugs/2026-11-18-a-root-learner-named-the-root-voters-of-its-join.md`.
