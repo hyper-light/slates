@@ -57,7 +57,7 @@ pub enum IoAuthority {
   Delegation,
 }
 
-use slates_vfs::inode::Kind;
+use slates_vfs::inode::{DeviceNumber, Kind, SpecialNode};
 
 /// Format: the superuser's uid (POSIX: "appropriate privileges" is uid 0 on every Unix here).
 pub const ROOT_UID: u32 = 0;
@@ -338,6 +338,19 @@ pub fn with_setid_side_effects(caller: &Caller, node: &NodeAttr, changes: SetAtt
   changes
 }
 
+/// Whether only the superuser may make `node` (A-294): every device node but a whiteout, a character device numbered
+/// 0/0. Linux's `vfs_mknod` asks `CAP_MKNOD` of every device node but a whiteout (`fs/namei.c`: `is_whiteout` skips the
+/// check, Linux 5.8 on), and `nfsd` makes one only for a root caller, since it drops `CAP_MKNOD` with the rest of
+/// `CAP_NFSD_SET` from any other uid (`fs/nfsd/auth.c` `nfsd_setuser`, `include/linux/capability.h`). A FIFO or socket
+/// name needs only the directory's write permission.
+pub fn needs_superuser(node: SpecialNode) -> bool {
+  match node {
+    SpecialNode::Fifo | SpecialNode::Socket => false,
+    SpecialNode::CharDevice(number) => number != DeviceNumber::default(),
+    SpecialNode::BlockDevice(_) => true,
+  }
+}
+
 /// The mode a non-superuser's write leaves a file with: its set-user-id and set-group-id bits
 /// cleared (POSIX `write(2)`), or `None` when nothing needs clearing (no bits set, or the superuser).
 pub fn mode_after_write(caller: &Caller, node: &NodeAttr) -> Option<u32> {
@@ -367,6 +380,7 @@ mod tests {
       btime: 0,
       windows: 0,
       change: 0,
+      device: None,
     }
   }
 

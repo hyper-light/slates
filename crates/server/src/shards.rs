@@ -1088,6 +1088,18 @@ fn turn_with(s: &mut ShardState, stream: &mut ShardsStream) -> Turned {
       return Turned::Ended;
     }
   };
+  answer_frame(s, stream, control, total)
+}
+
+/// Answers the frame of `total` bytes at the head of `stream`: a control ask (`control`: a SAVE or a RESTORE, A-303; a
+/// descriptor ask; any other refused) or, with none, a guest's request. Then the frame is consumed, and unless serving
+/// it ended the stream, its reply goes out as far as the stream takes it.
+fn answer_frame(
+  s: &mut ShardState,
+  stream: &mut ShardsStream,
+  control: Option<u8>,
+  total: usize,
+) -> Turned {
   // Only a fresh stream's first frame may be a RESTORE (A-303); every frame after reads within the request's bound.
   let first = std::mem::replace(&mut stream.restorable, false);
   let served = match control {
