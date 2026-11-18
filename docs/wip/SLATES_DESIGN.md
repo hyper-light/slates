@@ -6858,8 +6858,8 @@ mount and grant through one implementation.
 > starting an instance from the host's own executable, with the issuer handed to its starter, so a
 > host runs no `slates` binary (the anchor and daemon roles move into the crate); an async form over
 > a host's reactor (R6: a readiness wait and a timer over the client's driver); a seam trait with a
-> simulator and a conformance suite for hosts whose rules ask for one; a landing plan's per-path
-> entries, paged, for a person to review.
+> simulator and a conformance suite for hosts whose rules ask for one. A landing plan's per-path
+> entries, paged, are built (A-287, 2026-11-18): `Instance::landing_entries(&plan)`.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -20663,7 +20663,9 @@ Applied in the same change to:
   and moves the manifest's entries into the presentation. `crates/server/src/landing_entries.rs` (new): the verb, the
   pager and its oracle. `crates/server/src/verbs.rs`: the verb served on the landing's owner shard, as a grant is.
 - `crates/client/src/client.rs`: `Client::landing_entries_page` and `Client::landing_entries`; the types re-exported.
-- `crates/server/tests/presentations.rs`: three tests by use. GAPS: the Landing (4.15) row.
+- `crates/api`: `Instance::landing_entries(&LandingPlan)` and the types re-exported (A-278's owed item 4), checked in
+  `tests/api.rs`'s landing test; §4.12 "Embedding" status; `docs/library.md`.
+- `crates/server/tests/presentations.rs`: three tests by use. GAPS: the Landing (4.15) and Embedding library rows.
 
 - **What was there.** §4.15 step 2 promised the full entry list on demand, and a presentation answered the summary's
   counts and the conflicts alone; the manifest was dropped once its hash was taken. So a person granting a landing saw

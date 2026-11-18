@@ -56,9 +56,9 @@ pub use slates_client::{
 };
 /// The wire's types this crate's verbs take and return (§4.9; append-only, D-15).
 pub use slates_ipc::protocol::{
-  AuditEntry, DaemonReport, Filter, GrantScope, GrantSummary, Intent, LandingOutcome,
-  LandingSummary, NamePolicy, Refusal, SizeClass, SnapshotId, StatusReport, TelemetryReport,
-  VolumeId, VolumeSummary,
+  AuditEntry, ConflictClass, DaemonReport, Filter, GrantScope, GrantSummary, Intent,
+  LandingOutcome, LandingSummary, NamePolicy, PlannedAction, PlannedContent, PlannedEntry, Refusal,
+  SizeClass, SnapshotId, StatusReport, TelemetryReport, VolumeId, VolumeSummary,
 };
 
 /// The client's deadlines as the product derives them (§4.7 "Failure matrix"; `Deadlines::derive`): a reply is waited
