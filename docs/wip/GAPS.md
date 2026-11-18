@@ -1,5 +1,14 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **The VFS and DAX plan's last reconciliation (2026-11-18, its Step 15).** The DAX matrix (`virtiofs.md` §8) has no
+> owed cell: every cell is proven with its run or test, impossible with its source, declined with Ada's date, or none.
+> `platforms.md` had two rows the plan closed without their runs. Its Windows cells for a mount that outlives a daemon
+> restart still said "missing" after A-198. They now name `a_winfsp_drive_handle_and_view_survive_twenty_killed_daemons`
+> in `windows-lint` and `windows-arm64`: zero drives lost of twenty, diagnostics run 41484542209. The fleet's sockets and
+> the NFS listener stay missing there (foundational gap 2). Its Linux arm64 image cell now names Step 7's 7-of-7 runs
+> with Firecracker, crosvm and Cloud Hypervisor (41318050347, 41319438579). Still open, and not this plan's: the
+> inventory's built-but-unrun cells (its order of work, item 5).
+
 > **The dirty-page test's precondition, proved each attempt (2026-11-09, A-248).**
 > `a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path` failed intermittently ("the sync says so:
 > Ok(())", B10's gate, adacachy2, load about 66) when the kernel wrote the store's page back before the replacement. On
