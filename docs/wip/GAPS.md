@@ -2722,6 +2722,16 @@
 > - a rebuild over a long chain recomputes every version the holder accepted (300,000 at the 100,000-client rung's three
 >   rounds), since the holder keeps no checkpoint of its replica; the holder's growth per version is A-238's owed item.
 >
+> **Fixed 2026-11-18 (g232, A-385): a holder's replica of a green kept every version's values.** An owner folds its
+> green's histories to its per-green budget, never past a live reader's version; a holder's replica, the engine it
+> recomputes every version on and a takeover adopts, folded nothing. Now each merge record names where the owner's engine
+> had folded (record format 3) and the holder folds its replica there once it holds the version, as a rebuild does at
+> each version. Test: `a_holders_replica_keeps_no_more_history_than_its_owner` (`crates/server/tests/fleet.rs`): 130
+> versions of 4,043 bytes under a 256 KiB chain cap, both replicas folded below 66 holding 260,288 bytes of history, the
+> owner's to the byte; with the fold a no-op they held 524,643 bytes, folded below 0 (kiln r133, Mac Studio). Still
+> open, A-238's owed: a holder's ledger records and held inputs grow per version until a durable checkpoint of the
+> replica on the holder lets them go below the floor.
+>
 > **Fixed 2026-11-18 (g232): the late-submit test judged a green's history by factors no measurement gave.**
 > `a_submit_late_in_a_greens_history_is_answered_as_fast_as_an_early_one` (`crates/server/tests/fleet.rs`) held the median
 > of the last 50 of 300 submits to four times the first 50's plus 2 ms (R3), from windows minutes apart, so a load that
