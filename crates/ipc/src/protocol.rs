@@ -1083,6 +1083,16 @@ pub enum RequestBody {
     /// The position to read from: the windows the verdict's reply carried, then each page's `next`.
     from: u32,
   },
+  /// Renews a CLI attachment's term from whatever holds it (A-230, A-384): what `slates attach --hold` and the client
+  /// library's and the SDKs' attachment objects send while they live, so an attachment its holder keeps never lapses
+  /// for want of another verb naming it. Does nothing else. Served on the attachment's owner shard and answered
+  /// `Renewed` with the term now in force and when to renew again; refused as any use of the attachment is
+  /// (`AttachmentExpired` once its term lapsed), and `BadRequest` for an attachment with no term (a mount's renews
+  /// through its own activity). Appended.
+  Renew {
+    /// The attachment.
+    attachment: u64,
+  },
 }
 
 /// The bytes an [`RequestBody::EditSubmit`] inserts (A-225): carried in the request, or, for an edit larger than one
@@ -1829,7 +1839,8 @@ impl RequestBody {
       | RequestBody::LandingEntries { .. }
       | RequestBody::Enroll { .. }
       | RequestBody::Attest { .. }
-      | RequestBody::Revoke { .. } => None,
+      | RequestBody::Revoke { .. }
+      | RequestBody::Renew { .. } => None,
       // Retired (A-267): refused where it arrives, so routed nowhere.
       RequestBody::Read { .. } => None,
       RequestBody::Share { volume, .. }
@@ -4619,6 +4630,17 @@ pub enum ReplyBody {
     windows: Vec<MergeWindow>,
     /// The position the next page reads from, or `None` when this page ends the verdict.
     next: Option<u32>,
+  },
+  /// A CLI attachment's term was renewed (A-384): the term now in force from this renewal, and how soon its holder renews
+  /// again. Appended.
+  Renewed {
+    /// The term, nanoseconds: the attachment lapses this long after its last use.
+    term_ns: u64,
+    /// How soon the holder renews again, nanoseconds: a third of the shorter of the term and the daemon's liveness
+    /// window, so two renewals lost or late are survived, and a cadence that does not follow the term it shapes (one a
+    /// third of the term fed its own gaps back into the term, which grew to the failover delay: 1.0 s to 4.0 s in ten
+    /// renewals on the Mac Studio, 2026-11-18).
+    renew_every_ns: u64,
   },
 }
 
