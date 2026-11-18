@@ -294,8 +294,16 @@ fn a_merge_follows_its_volumes_write_policy() {
     client.submit_approved(asked, &[], identity, proof),
     Ok(slates_client::Submitted::Accepted(1))
   ));
-  let (_, forbidden) = work_with_an_edit(&mut client, "forbidden");
-  set(&mut client, &secret, forbidden, merging(WriteMode::Forbid));
+  expect_a_forbidden_merge_refused(&mut client, &secret);
+  drop(client);
+  daemon.stop();
+}
+
+/// The forbidden merge of `a_merge_follows_its_volumes_write_policy`. Do: submit a work whose policy, set with
+/// `secret`'s authority, forbids merges. Expect it refused `PolicyForbids`, naming the merge and the work volume.
+fn expect_a_forbidden_merge_refused(client: &mut Client, secret: &[u8; 32]) {
+  let (_, forbidden) = work_with_an_edit(client, "forbidden");
+  set(client, secret, forbidden, merging(WriteMode::Forbid));
   let refused = client.submit(forbidden);
   assert!(
     matches!(
@@ -307,8 +315,6 @@ fn a_merge_follows_its_volumes_write_policy() {
     ),
     "{refused:?}"
   );
-  drop(client);
-  daemon.stop();
 }
 
 /// A-285: an agent never approves its own merge. Do: from a channel bound to an enrolled consumer, approve an asked

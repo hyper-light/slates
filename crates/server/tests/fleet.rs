@@ -15006,13 +15006,10 @@ fn a_successor_one_version_behind_fetches_the_versions_inputs_and_serves_the_gre
   }
   let counted = counted.expect("the successor's counters are read");
   let count_of = |name: &str| counted.get(name).copied().unwrap_or(0);
-  assert!(both_at_two, "both holders recomputed version 2");
-  assert!(unowned, "before the death neither holder owned the green");
-  assert!(other_at_three, "the other holder recomputed version 3");
-  assert_eq!(
+  expect_the_successor_one_version_behind(
+    (both_at_two, unowned),
+    other_at_three,
     successor_at_death.map(|state| state.version),
-    Ok(Some(2)),
-    "the successor was one version behind when the owner died"
   );
   assert_eq!(
     placed,
@@ -15046,6 +15043,25 @@ fn a_successor_one_version_behind_fetches_the_versions_inputs_and_serves_the_gre
       at_head: Ok(b"hello world!".to_vec()),
     },
     "the successor serves the head version, version 1 and the head's bytes"
+  );
+}
+
+/// What `a_successor_one_version_behind_fetches_the_versions_inputs_and_serves_the_green` expects of the moment its
+/// owner died: both holders had recomputed version 2 while neither owned the green (`both_at_two`, `unowned`), the other
+/// holder had recomputed version 3 (`other_at_three`), and the successor was one version behind, at 2
+/// (`successor_at_death`).
+fn expect_the_successor_one_version_behind(
+  (both_at_two, unowned): (bool, bool),
+  other_at_three: bool,
+  successor_at_death: Result<Option<u64>, ObserveError>,
+) {
+  assert!(both_at_two, "both holders recomputed version 2");
+  assert!(unowned, "before the death neither holder owned the green");
+  assert!(other_at_three, "the other holder recomputed version 3");
+  assert_eq!(
+    successor_at_death,
+    Ok(Some(2)),
+    "the successor was one version behind when the owner died"
   );
 }
 
