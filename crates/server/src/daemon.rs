@@ -4428,6 +4428,7 @@ async fn init_shard(
     published_keys: std::collections::BTreeSet::new(),
     published_held: crate::content_holder::PublishedHeld::default(),
     write_log,
+    #[cfg(unix)]
     writes_lost: recovered_writes.everything_lost,
     replay: recovered_writes.records,
     #[cfg(unix)]
