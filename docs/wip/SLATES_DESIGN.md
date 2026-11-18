@@ -10029,7 +10029,16 @@ entry either old or new, never torn).
    writer's dirty data on the filesystem: beside one busy writer a `syncfs` took up to 3.7 s, A-130;
    macOS one `F_FULLFSYNC` after the barriers when the grant asked for media durability, otherwise the
    barriers only; Windows `FlushFileBuffers` on the directory handles). The directory syncs and the media
-   barrier still run on the shard: A-132's measured residual, the next piece (GAPS).
+   barrier still run on the shard: A-132's measured residual, the next piece (GAPS). A metadata entry (a mode or bits
+   change alone, A-458, A-466) is durable before it is reported, through its file's own handle in the same batch: its
+   fields are set in place, the handle stays open in the batch, and the barrier syncs the file whole — Linux `fsync`,
+   which "also flushes the metadata information associated with the file" where `fdatasync` "does not flush modified
+   metadata unless that metadata is needed in order to allow a subsequent data retrieval" (fsync(2)); macOS `fsync`,
+   which moves "all modified data and attributes" (Apple's fsync(2)); Windows `FlushFileBuffers`, which "writes all the
+   buffered information for a specified file" through a handle that may write (its documentation). No source says a
+   directory's sync covers another inode's mode: fsync(2) names the file it flushes; ext4's documentation says a
+   power loss loses "as much as the latest 5 seconds of metadata changes" (`commit=`); XFS's says its transactions
+   are asynchronous until a log force (A-472).
    The outcome record states which durability the landing achieved, and the reply carries it with
    every Degraded cell met (A-45): a directory it could not open or sync (`Unsynced`), a media barrier
    asked for that failed (`MediaUnsynced`, as against `BarriersOnly` when not asked for), an entry of
@@ -32239,3 +32248,49 @@ a field test; `src/manifest_vectors.txt`, new: the published vectors; `src/lib.r
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry), `crates/server/src/daemon.rs`, and
 `docs/bugs/2026-11-18-the-anchor-never-found-a-wedged-daemon-once-its-own-waits-ran-a-window-late.md` (A-467's bug,
 recorded).
+
+### A-472 — A landed mode or bits change is synced through its file's own handle in its batch's barrier before it is reported, by the rule each platform documents (2026-11-18, g085; §4.15 step 8; A-130, A-132, A-458, A-466)
+Applied in the same change to: §4.15 step 8 (the rule and its sources), GAPS (A-185's owed list), `crates/land`
+(`src/engine.rs`: `StagedMeta` and `MetaSet`, `stage_meta`, `set_meta`, `report_meta`, the batch's files
+(`batch_files`) and room (`batch_pages_of`, `stages_meta`), a batch that ends unsynced recording its metadata entries;
+`src/os.rs`: the barrier's `Durability`, a metadata entry's file synced whole; `src/os_windows.rs`: `CHMOD_ACCESS` asks
+`FILE_WRITE_DATA`; `src/chmod_tests.rs` and `src/captured_tests.rs`, the tests; and, from main's clippy and literal scan
+of the same files, `src/test_store.rs`, new, the suites' one store fixture, the golden vectors' inputs as named
+constants, a named type, and two tests split under the complexity bound), `crates/vfs` (`src/host/mod.rs`: the
+barrier's and `open_to_chmod`'s documentation; `src/host/sim.rs`: a mode or bits set in place unsynced until a barrier
+names its file, `holds_unsynced_metadata`).
+- **What was there.** A-458's metadata entry set a file's mode or bits in place and reported the entry at once; the
+  only sync after it was its directory's, at the landing's end.
+- **The sources (read 2026-11-18).**
+  - fsync(2) (Linux man-pages, man7.org): fsync "also flushes the metadata information associated with the file", and
+    "does not necessarily ensure that the entry in the directory containing the file has also reached disk"; fdatasync
+    "does not flush modified metadata unless that metadata is needed in order to allow a subsequent data retrieval",
+    its examples the times and, needed, the size. A mode is not needed to read the bytes.
+  - ext4 (docs.kernel.org, `filesystems/ext4/journal` and `admin-guide/ext4`): the journal carries metadata, a
+    transaction commits within `commit=` seconds, "if you lose your power, you will lose as much as the latest 5 seconds
+    of metadata changes". Neither page says a directory's fsync commits another inode's changes.
+  - XFS (`filesystems/xfs/xfs-delayed-logging-design`): "all high level transactions are asynchronous by default",
+    durable at a log force, forces "to a specific LSN" and every checkpoint before it; nothing names a directory's
+    fsync as forcing another inode's later change.
+  - Apple's fsync(2): "causes all modified data and attributes of fildes to be moved to a permanent storage device",
+    the drive's own cache aside, which `F_FULLFSYNC` (fcntl(2)) asks it to flush.
+  - FlushFileBuffers (learn.microsoft.com): "writes all the buffered information for a specified file to the device",
+    its handle "must have the GENERIC_WRITE access right"; flushing every file of a volume asks administrative
+    privileges, which slates never holds (R10).
+  - So no platform documents a directory's sync covering a child's mode: on each, the file's own sync is the rule, and
+    nothing was left as it was.
+- **The rule.** A metadata entry is staged in A-130's batch beside the files: its fields set in place through its own
+  handle, judged again there (A-458), the handle held open and counted one page against the batch's room, the barrier
+  syncing it off the shard (A-132) — Linux `fsync`, since a temporary's `fdatasync` would not do, macOS `fsync`, Windows
+  `FlushFileBuffers` — and the entry reported and advanced only after. A set is atomic, so the file holds the old value
+  or the new one whatever happens before then; what waits is the report. A batch that ends without its barrier records
+  its metadata entries as it records its files, skipped or failed, which never advances them, so the volume keeps them
+  and the next landing judges the file again. A file the landing may not open to set its metadata fails its entry alone:
+  on Windows that is a read-only file, whose handle may not write (owed, GAPS).
+- **Tests.** Failing first on the Mac Studio (2026-11-18, kiln r433, load 5.3 to 11.1, debug), the simulated host's
+  sync model in place and the engine as it was: 3 of 35 `slates-land` lib tests failed — the new
+  `a_metadata_entry_is_synced_by_its_batchs_barrier_before_it_is_reported` (no barrier taken) and the two captured
+  clones' metadata tests (the mode left unsynced). With the fix (load 7.8 to 10.3): `cargo test --locked -p slates-land
+  --lib` 35 of 35, the writer ignored; `slates-vfs --lib -- host::sim captured` 3 of 3. Red-checked once: with the
+  barrier given the batch's temporaries alone, the same 3 failed. `cargo fmt` laid the lines out. Filed for main: the
+  crash oracle, whose metadata entries now take a barrier.

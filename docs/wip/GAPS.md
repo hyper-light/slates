@@ -18820,6 +18820,14 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   path holds, but which a lossless layout (four-byte lengths, layouts 6 and 7) or a refusal at the plan would close; and
   an overlay's witness's owner, birth time and Windows bits are judged, its verdict comparing whole fingerprints, and not
   bound, the encoding holding the device, inode, size, times and mode alone); and
+  a landed mode or bits change's durability, **built by A-472 the same day** (a metadata entry synced through its file's
+  own handle in its batch's barrier before it is reported: Linux `fsync`, macOS `fsync`, Windows `FlushFileBuffers`, each
+  as its documentation states; no source says a directory's sync covers another inode's metadata; its unit tests ran on
+  the Mac Studio, the crash oracle's rerun filed for main; still owed with it: on Windows a file read-only when its
+  metadata entry opens it fails that entry alone, since `FlushFileBuffers` needs a handle that may write and NTFS refuses
+  one to a read-only file, where a clear of the bit before the flush's open, or a measured rule, would land it; and a made
+  directory's mode, given after `mkdirat` and synced with the directory's parent alone, has the same question, unasked
+  until now); and
   the seam's numbering: refusals the engine tells apart are POSIX numbers and the rest Win32 codes, so a Win32 code equal
   to one of the engine's numbers (`ERROR_NOT_SAME_DEVICE` 17, `ERROR_INSUFFICIENT_BUFFER` 122, among five) would read as
   that refusal; none of the writer's calls is known to answer one, and a typed refusal at the seam would close it.

@@ -110,7 +110,8 @@ const MOVE_ACCESS: u32 = DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
 /// (`FILE_BASIC_INFO` asks `FILE_WRITE_ATTRIBUTES`), and `FILE_WRITE_DATA`, which its batch's barrier needs to flush it
 /// (A-472: `FlushFileBuffers` "writes all the buffered information for a specified file", through a handle that "must
 /// have the GENERIC_WRITE access right"); none of its data is written.
-const CHMOD_ACCESS: u32 = FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | FILE_WRITE_DATA | SYNCHRONIZE;
+const CHMOD_ACCESS: u32 =
+  FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | FILE_WRITE_DATA | SYNCHRONIZE;
 /// Format: a directory this writer makes: listed, traversed and its attributes read, as the host retains one.
 const MADE_DIR_ACCESS: u32 =
   FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;

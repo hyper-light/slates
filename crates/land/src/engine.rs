@@ -1426,7 +1426,12 @@ impl<H: LandFs> Landing<'_, H> {
 
   /// The pages `entry` would take in a batch: a staged file's ([`file_pages`]), one for a metadata entry, whose file
   /// the batch holds open (A-472), and none for an entry the batch does not hold.
-  fn batch_pages_of(&self, entry: &LandingEntry, report: &EntryReport, store: &Store) -> Option<u64> {
+  fn batch_pages_of(
+    &self,
+    entry: &LandingEntry,
+    report: &EntryReport,
+    store: &Store,
+  ) -> Option<u64> {
     if self.stages_meta(entry, report) {
       return Some(file_pages(0, store));
     }
@@ -2338,9 +2343,7 @@ impl<H: LandFs> Landing<'_, H> {
     let set = metadata_of(entry).and_then(|(from, to)| self.set_meta(dir_path, name, from, to));
     match set {
       Ok(MetaSet::Staged(file)) => {
-        progress.staged_pages = progress
-          .staged_pages
-          .saturating_add(file_pages(0, store));
+        progress.staged_pages = progress.staged_pages.saturating_add(file_pages(0, store));
         progress.metas.push_back(StagedMeta {
           index,
           file,

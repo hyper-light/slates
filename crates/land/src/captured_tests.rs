@@ -262,10 +262,7 @@ fn landed_the_change_and_kept_the_rest(host: &SimHost) {
     bytes("/target/src/outsider.rs").as_deref(),
     Some(&b"an outsider's edit"[..])
   );
-  assert_eq!(
-    bytes("/target/src/keep.rs").as_deref(),
-    Some(&b"kept"[..])
-  );
+  assert_eq!(bytes("/target/src/keep.rs").as_deref(), Some(&b"kept"[..]));
 }
 
 /// An outsider's change to a file the agent also changed refuses the whole landing, `ModifyModify`, and writes

@@ -233,12 +233,42 @@ mod tests {
   fn the_word_replaces_what_the_volume_keeps_and_keeps_what_it_does_not() {
     let stale = HIDDEN | SYSTEM | OFFLINE | NOT_CONTENT_INDEXED | ARCHIVE;
     let rows: [(u32, u16, Made, u32, &str); 6] = [
-      (stale | TEMPORARY, 0, Made::File, TEMPORARY, "the untracked bit kept"),
-      (stale, WindowsAttributes::HIDDEN, Made::File, HIDDEN, "the volume's bit replaces the stale ones"),
+      (
+        stale | TEMPORARY,
+        0,
+        Made::File,
+        TEMPORARY,
+        "the untracked bit kept",
+      ),
+      (
+        stale,
+        WindowsAttributes::HIDDEN,
+        Made::File,
+        HIDDEN,
+        "the volume's bit replaces the stale ones",
+      ),
       (stale, 0, Made::File, NORMAL, "no bit: NORMAL alone"),
-      (DIRECTORY | stale, WindowsAttributes::READONLY, Made::Dir, READONLY, "a directory's read-only is a bit"),
-      (READONLY, 0, Made::File, READONLY, "a file's read-only is its mode's, kept"),
-      (REPARSE_POINT | DIRECTORY, WindowsAttributes::LINK_DIRECTORY, Made::Link, NORMAL, "a link's kind is never a bit set"),
+      (
+        DIRECTORY | stale,
+        WindowsAttributes::READONLY,
+        Made::Dir,
+        READONLY,
+        "a directory's read-only is a bit",
+      ),
+      (
+        READONLY,
+        0,
+        Made::File,
+        READONLY,
+        "a file's read-only is its mode's, kept",
+      ),
+      (
+        REPARSE_POINT | DIRECTORY,
+        WindowsAttributes::LINK_DIRECTORY,
+        Made::Link,
+        NORMAL,
+        "a link's kind is never a bit set",
+      ),
     ];
     for (current, volume, made, word, why) in rows {
       assert_eq!(set_word(current, volume, made), word, "{why}");
