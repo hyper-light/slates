@@ -565,7 +565,10 @@ fn a_duplicate_file_is_cloned_on_a_volume_that_shares_clusters() {
   seed_dir(&ws.path.join("out"));
   let (mut host, target) = OsLand::open_target(&ws.path.join("out")).unwrap();
   if !host.capabilities(target.dir).unwrap().reflink {
-    eprintln!("skipped: the volume under {} shares no clusters between files", ws.path.display());
+    eprintln!(
+      "skipped: the volume under {} shares no clusters between files",
+      ws.path.display()
+    );
     return;
   }
   let same: Vec<u8> = (0..3 * 65_536 + 17u32)
@@ -596,9 +599,17 @@ fn a_duplicate_file_is_cloned_on_a_volume_that_shares_clusters() {
   assert_eq!(report.cloned, 1, "{report:?}");
   let out = ws.path.join("out");
   assert_eq!(read(&out.join("a.bin")).unwrap(), same);
-  assert_eq!(read(&out.join("b.bin")).unwrap(), same, "the clone, whole at its exact length");
+  assert_eq!(
+    read(&out.join("b.bin")).unwrap(),
+    same,
+    "the clone, whole at its exact length"
+  );
   assert_eq!(read(&out.join("c.bin")).unwrap(), b"other");
-  assert_eq!(names_in(&out), ["a.bin", "b.bin", "c.bin"], "no hidden name left");
+  assert_eq!(
+    names_in(&out),
+    ["a.bin", "b.bin", "c.bin"],
+    "no hidden name left"
+  );
 }
 
 /// Format: `FILE_ATTRIBUTE_READONLY` (winnt.h), as `MetadataExt::file_attributes` reads it.

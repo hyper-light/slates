@@ -2926,7 +2926,9 @@ fn batch_pages(store: &Store) -> u64 {
 fn clone_source(staged: &VecDeque<Staged>, overlay: &OverlayIdentity) -> Option<HostFile> {
   staged
     .iter()
-    .find(|staged| staged.copy.overlay.hash == overlay.hash && staged.copy.overlay.size == overlay.size)
+    .find(|staged| {
+      staged.copy.overlay.hash == overlay.hash && staged.copy.overlay.size == overlay.size
+    })
     .map(|staged| staged.copy.temp)
 }
 
@@ -4308,18 +4310,35 @@ mod tests {
   /// both the same BLAKE3 and the same length; none for a length or a hash the batch does not hold, or an empty batch.
   #[test]
   fn a_file_is_cloned_only_from_a_staged_file_with_its_hash_and_its_length() {
-    let batch: VecDeque<Staged> =
-      [staged(7, 0xAA, 10), staged(8, 0xBB, 4096), staged(9, 0xBB, 4096), staged(10, 0xBB, 99)].into();
+    let batch: VecDeque<Staged> = [
+      staged(7, 0xAA, 10),
+      staged(8, 0xBB, 4096),
+      staged(9, 0xBB, 4096),
+      staged(10, 0xBB, 99),
+    ]
+    .into();
     let wanted = |hash: u8, size: u64| OverlayIdentity {
       hash: [hash; 32],
       size,
       mode: 0o600,
       mtime_ns: 2,
     };
-    assert_eq!(clone_source(&batch, &wanted(0xBB, 4096)), Some(HostFile(8)), "the first such file");
+    assert_eq!(
+      clone_source(&batch, &wanted(0xBB, 4096)),
+      Some(HostFile(8)),
+      "the first such file"
+    );
     assert_eq!(clone_source(&batch, &wanted(0xBB, 99)), Some(HostFile(10)));
-    assert_eq!(clone_source(&batch, &wanted(0xBB, 100)), None, "a length the batch does not hold");
-    assert_eq!(clone_source(&batch, &wanted(0xCC, 4096)), None, "a hash the batch does not hold");
+    assert_eq!(
+      clone_source(&batch, &wanted(0xBB, 100)),
+      None,
+      "a length the batch does not hold"
+    );
+    assert_eq!(
+      clone_source(&batch, &wanted(0xCC, 4096)),
+      None,
+      "a hash the batch does not hold"
+    );
     assert_eq!(clone_source(&VecDeque::new(), &wanted(0xAA, 10)), None);
   }
 

@@ -77,8 +77,8 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Storage::FileSystem::{
   DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY,
   FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY,
-  FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
-  FILE_READ_DATA, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FileAttributeTagInfo, FileBasicInfo,
+  FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+  FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FileAttributeTagInfo, FileBasicInfo,
   FileDispositionInfoEx, FlushFileBuffers, GetFileInformationByHandleEx, SYNCHRONIZE,
   SetFileInformationByHandle,
 };
@@ -383,7 +383,8 @@ fn dispose(entry: BorrowedHandle<'_>) -> Result<(), HostError> {
 
 /// Format: `FILE_SUPPORTS_BLOCK_REFCOUNTING` (winnt.h): the volume shares logical clusters between files on it (ReFS's
 /// block cloning, Microsoft Learn, `GetVolumeInformationByHandleW`).
-const BLOCK_REFCOUNTING: u32 = windows_sys::Win32::System::SystemServices::FILE_SUPPORTS_BLOCK_REFCOUNTING;
+const BLOCK_REFCOUNTING: u32 =
+  windows_sys::Win32::System::SystemServices::FILE_SUPPORTS_BLOCK_REFCOUNTING;
 
 /// Whether the volume the directory `dir` is on shares clusters between files (`FILE_SUPPORTS_BLOCK_REFCOUNTING`): a
 /// landing's reflinks there (A-445).
@@ -414,7 +415,8 @@ fn shares_clusters(dir: BorrowedHandle<'_>) -> Result<bool, HostError> {
 fn cluster_bytes(on: BorrowedHandle<'_>) -> Result<u64, HostError> {
   let mut size = windows_sys::Wdk::System::SystemServices::FILE_FS_SIZE_INFORMATION::default();
   let mut status_block = windows_sys::Win32::System::IO::IO_STATUS_BLOCK::default();
-  let length = u32::try_from(size_of_val(&size)).map_err(|_| code_refusal(ERROR_FILENAME_EXCED_RANGE))?;
+  let length =
+    u32::try_from(size_of_val(&size)).map_err(|_| code_refusal(ERROR_FILENAME_EXCED_RANGE))?;
   // SAFETY: `on` is open for the call; `size` is a writable record of the class asked, of the length passed, and
   // `status_block` a writable status record.
   let status = unsafe {
@@ -464,7 +466,9 @@ fn duplicate_extents(
   offset: u64,
   length: u64,
 ) -> Result<(), HostError> {
-  use windows_sys::Win32::System::Ioctl::{DUPLICATE_EXTENTS_DATA, FSCTL_DUPLICATE_EXTENTS_TO_FILE};
+  use windows_sys::Win32::System::Ioctl::{
+    DUPLICATE_EXTENTS_DATA, FSCTL_DUPLICATE_EXTENTS_TO_FILE,
+  };
   let at = |value: u64| i64::try_from(value).map_err(|_| HostError::Unavailable(ERRNO_NOTSUP));
   let region = DUPLICATE_EXTENTS_DATA {
     FileHandle: source.as_raw_handle().cast(),
@@ -1141,9 +1145,9 @@ impl LandFs for OsLand {
     )?;
     let shared = set_end(made.as_handle(), end)
       .and_then(|()| {
-        regions
-          .iter()
-          .try_for_each(|&(offset, length)| duplicate_extents(source, made.as_handle(), offset, length))
+        regions.iter().try_for_each(|&(offset, length)| {
+          duplicate_extents(source, made.as_handle(), offset, length)
+        })
       })
       .and_then(|()| set_end(made.as_handle(), len));
     if let Err(refused) = shared {
