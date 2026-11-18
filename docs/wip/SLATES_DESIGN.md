@@ -3086,7 +3086,9 @@ directory mounts refused (NTFS reparse point); ProjFS never.
 > (`crates/cli/tests/winfsp_semantics.rs`): a move not asked to replace, a directory holding a file, `SetFileTime`, and
 > an open with `TRUNCATE_EXISTING` (WinFsp's allocation below a file's size truncates it). Open: the fsx port wedges at an
 > extension after a cached write past a hole and a shrink, inside Windows below the single receiver; it is a listed
-> failure (`fsx-seed-1-unfinished:10000`) until fixed.
+> failure (`fsx-seed-1-unfinished:10000`) until fixed. Since A-300 (2026-11-17) the lanes also run the workload
+> roster's version-control workloads over the drive (git, Mercurial and Subversion, through Git for Windows' shell),
+> judged against NTFS with the drive's one stated difference: no hard links.
 
 > **Status (2026-11-02, A-198, Step 9.2: Windows handle holding).** The anchor's Windows hold channel and explicit
 > successor inheritance are built. A hold is acknowledged after duplication into the anchor, before the child publishes
@@ -9700,7 +9702,10 @@ may weaken an earlier phase's gates; ratchets only tighten.
 > two directories a second apart and holds the runs identical, so a difference over a mount is the mount's. A script
 > that exits nonzero on both sides is a failed workload, never an identical one. Since A-293 the Linux lane runs the
 > roster over the daemon's own FUSE mount (`slates mount`, unprivileged), the route an agent's tools take, rather than
-> through the root NFS adapter. Owed: the Windows WinFsp roster.
+> through the root NFS adapter. Since A-300 the Windows lanes run the four over the WinFsp drive through Git for
+> Windows' shell, judged against NTFS with the drive's one stated difference: it makes no hard link (WinFsp's driver
+> refuses one), so a local clone copies there where NTFS links, and the three lines that count a clone's links are
+> recorded with both sides. Owed: the roster's other workloads on Windows.
 
 > **Editor workload correction (2026-09-17).** The host and mount must execute the same save
 > behavior even when their paths select different tool defaults. The Vim roster explicitly
@@ -9720,7 +9725,7 @@ field.
 | Landing oracle | Prove the one path that writes disk | an executable model of (disk, overlay, witnesses); outsider edits and crashes injected at every step; real filesystems on RAM-backed targets | Verdicts match the table; every entry old or new; every collision reported; re-runs idempotent; writes proportional to the delta | CI (Linux tmpfs), nightly (APFS, NTFS) |
 | Merge oracle | Prove the verdict, the splice and rebase | an executable model of (chain, work volumes, declared operations); proptest with shrinking; instrumented counters | Verdicts match the oracle with zero false accepts or rejects; spliced versions byte-identical; no content read on the common path; windows byte-exact | CI |
 | Conformance | Prove POSIX behaviour through each bridge, and Win32 behaviour through the WinFsp drive | pjdfstest, fsx, fsstress (CI, x86_64 and arm64 Linux); WinFsp's fsx port and winfstest (CI, x86_64 and arm64 Windows; A-209); xfstests generic, LTP (nightly) | All tests pass except the reviewed expected-failure list for that bridge, and the list only shrinks | CI / nightly |
-| Real workloads | Prove tools work | vendored git (a basic repository, and a history: a hard-linked local clone, branch, merge, rebase, stash, a worktree, tag, push, pull, gc, a full repack, verify-pack, fsck), Mercurial (a named branch and merge, tag, bookmark, a hard-linked clone and its first commit, rebase, push, a shared store, verify), Subversion (an FSFS repository and SQLite working copies: checkout, commit, branch by copy, switch, update back and forward, merge, tag, cleanup, verify, dump), cargo, npm, python, rg, rsync, sqlite, editors, watchers (A-289) | Exit codes 0; outputs byte-identical to the host run; `git status`, `hg status` and `svn status` clean; hard links counted as on the host; incremental builds reuse artifacts | nightly, release |
+| Real workloads | Prove tools work | vendored git (a basic repository, and a history: a hard-linked local clone, branch, merge, rebase, stash, a worktree, tag, push, pull, gc, a full repack, verify-pack, fsck), Mercurial (a named branch and merge, tag, bookmark, a hard-linked clone and its first commit, rebase, push, a shared store, verify), Subversion (an FSFS repository and SQLite working copies: checkout, commit, branch by copy, switch, update back and forward, merge, tag, cleanup, verify, dump), cargo, npm, python, rg, rsync, sqlite, editors, watchers (A-289) | Exit codes 0; outputs byte-identical to the host run; `git status`, `hg status` and `svn status` clean; hard links counted as on the host (on the WinFsp drive, which makes none, a stated difference: A-300); incremental builds reuse artifacts | nightly, release |
 | Unit and property | Prove each core structure | proptest, oracle tests (serial spec vs implementation), non-vacuity counters | Properties hold; counters prove the fast paths ran | CI |
 | Hostile input | Prove parsers never crash or over-allocate | cargo-fuzz corpora for wire, FUSE, NFS/XDR, WinFsp, archive, MCP | No panic, no UB, bounded time and memory on every input | CI smoke, nightly long |
 | Concurrency | Prove lock-free cores and schedules | loom (cores), shuttle (schedules), TSan, Miri | All explored interleavings keep invariants; no data race; no UB | CI (loom, Miri), nightly (shuttle, TSan) |
@@ -21128,7 +21133,8 @@ judged by `fails_the_suite`), `crates/server/tests/virtiofs.rs` (the guest's env
   Mercurial and Subversion already. The live-guest job requires each new workload's `Identical` line.
 - **Owed.** The Windows WinFsp roster: WinFsp's driver has no hard links (its NTFS compatibility page lists them
   unsupported), so a local clone copies there while NTFS links, and a git repository's symbolic-link probe needs
-  WinFsp reparse points, which the drive does not serve yet. A Linux FUSE leg outside a container (the native Linux
+  WinFsp reparse points, which the drive does not serve yet. **Built by A-300 (2026-11-17)**, the drive serving
+  reparse points since A-275, and the missing hard links a stated difference of the route. A Linux FUSE leg outside a container (the native Linux
   lane reaches the daemon through the NFS adapter). The runs over each mount are the supervisor's (CLAUDE.md §8).
 
 ### A-279 — A full control channel tells the senders waiting for its room (2026-11-17, built for goal g239, a kept forward re-sent once the channel has room)
@@ -21278,3 +21284,63 @@ contract", new, with its status), GAPS (the A-299 entry and the Embedding librar
 - **Checked.** `cargo test -p slates-api` (37 unit, 9 by use, 5 start, 1 doc) and `cargo test -p slates-cli` on
   macOS arm64 (kiln runner, 2026-11-18): the cases in §4.12's status. The Linux and Windows arms of the mount and the
   CLI's Windows unmount are not compiled on this host; the integrator's lanes are their first compiler.
+
+### A-300 — The Windows lanes run git, Mercurial and Subversion over the WinFsp drive, judged against NTFS with the drive's one stated difference: it makes no hard link (accepted 2026-11-17, Ada's goal of 2026-11-18: git, Mercurial and Subversion on every route, WinFsp among them)
+Applied in the same change to: Part 6 ("Real workloads": its row and status), §4.6 (the Windows conformance status),
+A-289 (its owed Windows roster), GAPS, `docs/wip/conformance.md`, `crates/conformance/src/workload.rs`
+(`Workload::runs_on_windows`, the Windows spellings of `normalize_output`, `StatedDifference`, `stated_differences`,
+`compare_with`, the Subversion script, `MSYS` in `ENVIRONMENT`), `crates/conformance/src/record.rs`
+(`WorkloadStatus::Stated`, `stated_note`), `matrix.rs` (a summary's stated part), `capability.rs` (the Windows
+workloads cell runnable), `xtask/src/conformance/workloads.rs` (which workloads a lane runs, the directory's plain
+form, the judgment under the route's stated differences), and CI's `windows-lint` and `windows-arm64` jobs.
+- **The decision.** The Windows lanes run the roster's version-control workloads (`git`, `git-history`, `mercurial`,
+  `subversion`) over the drive (`slates mount ID E:`): each script once in an NTFS folder of the scratch and once on
+  the drive, under the shared environment, judged by exit code, output and tree as every leg is. Git for Windows' `sh`
+  runs the scripts. The lanes install Mercurial (7.2.4, PyPI's wheel for each architecture) and Subversion (1.15.0,
+  VisualSVN's command-line zip, its SHA-256 pinned). The roster's other workloads are owed a Windows form
+  (`Workload::runs_on_windows` false): their scripts lean on tools a Windows runner lacks (rsync, rg, sqlite3, vim, a
+  watcher's inotify or FSEvents) or have not run there (cargo, npm, python).
+- **What Windows needed of the harness**, each a pure function with unit tests:
+  - Windows tools print a directory in several spellings: Python's and Mercurial's `D:\a`, git's and a Subversion file
+    URL's `D:/a`, the shell's `/d/a`, a lowercase drive letter, and a canonical path's verbatim `\\?\D:\a`. Each
+    becomes the root token (`normalize_output`), the longest first. A POSIX directory gains no Windows spelling, and
+    neither does a drive's root, whose shell spelling (`/d`) would match unrelated text. The harness starts each script
+    in the directory's plain form (`plain_path`), the one the tools print.
+  - A Subversion file URL names a Windows directory as `file:///D:/a`, so the script takes the directory from `pwd -W`
+    where the shell has it (other shells refuse the option, and `pwd` answers). Windows' `svnlook youngest` ends its
+    line with a carriage return, which the revision loop drops.
+  - Git for Windows' shell copies the target for `ln -s` by default. `MSYS=winsymlinks:nativestrict` in the shared
+    environment makes it a Windows symbolic link, and a failure where it cannot make one, as POSIX's `ln -s` does. So
+    the `git` workload's link goes through the drive's reparse points (A-275) on one side and NTFS's on the other.
+    Every other shell ignores the variable.
+- **The drive's stated difference: no hard link.** WinFsp's driver answers `FileLinkInformation` with
+  `STATUS_NOT_SUPPORTED` itself, before any file system is asked (v2.1, `src/sys/fileinfo.c` 2023-2025); its volume
+  parameters' `HardLinks` bit reads "unimplemented; set to 0" (`inc/winfsp/fsctl.h` 213); and its NTFS compatibility
+  page lists hard links as unsupported. So a local git or Mercurial clone copies on the drive where NTFS links it.
+  `git-history`'s "objects with two names after the clone" line and `mercurial`'s two "store files with two names"
+  lines count links on NTFS and none on the drive; every byte the clones hold is the same.
+  - The harness states these three lines for the WinFsp route alone (`stated_differences`), each matched by the start
+    both lines share. A pair of lines that differ and both carry one stated start is recorded with both sides
+    (`WorkloadStatus::Stated`) and does not fail the suite. Any other difference fails it, and so does a stated start
+    none of whose lines differed, so the list only shrinks, as an expected-failure list does.
+  - Rejected: printing the counts only where the file system can link (it would hide the very difference the goal
+    names); and a list kept outside the code (the lines are three and fixed, and their reason belongs beside the
+    comparison that applies it).
+  - Mercurial on the drive trusts a link count only after its `checknlink` probe makes a link, so there it copies each
+    store file before appending to it. The bytes are the same, and `verify` of all three repositories holds them.
+  - Hard-linked clones and stores on the WinFsp route need WinFsp's driver to pass hard links to its file system
+    (`FileLinkInformation` and the link queries): a change upstream to a signed kernel driver, outward-facing, so it is
+    a decision for Ada. Until then the route states the difference.
+- **Proven** on this Mac (2026-11-17; the Windows lanes' first run is the supervisor's):
+  `a_windows_directory_is_the_root_token_in_every_spelling_its_tools_print`,
+  `the_drives_link_count_is_a_stated_difference_on_its_route_alone`, `a_stated_line_excuses_nothing_else` and
+  `a_stated_difference_that_no_longer_differs_fails` (`crates/conformance/src/workload.rs`);
+  `the_workload_summary_names_a_routes_stated_differences_apart` (`matrix.rs`);
+  `windows_runs_fsx_winfstest_and_the_workloads` (`capability.rs`); `the_windows_lane_runs_the_version_control_workloads`;
+  and by use `the_drives_stated_differences_name_the_lines_the_real_clones_print` (`xtask/src/conformance/workloads.rs`).
+  That last test runs the real `git-history` and `mercurial` scripts on a host whose clones link (git: 5 of 5 objects;
+  Mercurial: 7 of 9 store files, 4 after the clone's commit). It judges each against the same run as a copying clone
+  prints it: identical but for exactly one and two stated lines; a difference on a route that states nothing; and,
+  against itself, refused because no stated line differed.
+- **Owed.** The lanes' first run, which is the supervisor's. The Windows workloads cell's record, re-recorded from that
+  run (the tracked record is still the owed skip of 2026-11-05). The other workloads' Windows forms.
