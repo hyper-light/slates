@@ -4466,6 +4466,11 @@ impl Rebuilding {
     Ok(())
   }
 
+  /// The payloads not yet applied.
+  pub(crate) fn left(&self) -> usize {
+    self.payloads.len()
+  }
+
   /// The rebuilt volume laid out as the archive `materialize_taken_over` restores; refused
   /// [`REFUSED_NOT_WHOLE_FIRST`] when no whole record began the log.
   pub(crate) fn archive(self) -> Result<slates_archive::Archive, &'static str> {

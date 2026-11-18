@@ -5912,9 +5912,15 @@ async fn make_live_in_turns(
     let slice_ns = state::with_state(|s| crate::config::wrap_slice_ns(seal_quantum_ns(s)))
       .ok_or(MATERIALIZE_UNANSWERED)?;
     let began = futures::now_ns();
+    let before = rebuilding.left();
     let advanced = rebuilding.advance(|| futures::now_ns().saturating_sub(began) >= slice_ns);
+    let applied = before.saturating_sub(rebuilding.left());
     let done = state::with_state(|s| {
       s.count(LIVE_REBUILD_SLICES, 1);
+      s.count(
+        LIVE_REBUILD_PAYLOADS,
+        u64::try_from(applied).unwrap_or(u64::MAX),
+      );
       turned(s, object);
       advanced.map_err(|why| crate::live_ship::rebuild_refused(s, why))
     })
@@ -5988,6 +5994,10 @@ async fn make_live_in_turns(
 /// Counter: one owner-shard turn's slice of a live volume's rebuild from its log ([`make_live_in_turns`], g251).
 /// Format: a counter name in the daemon's status report.
 const LIVE_REBUILD_SLICES: &str = "fleet.live.rebuild_slices";
+/// Counter: the payloads a live volume's rebuild applied, in all its turns (g251): with [`LIVE_REBUILD_SLICES`], how
+/// many a turn took.
+/// Format: a counter name in the daemon's status report.
+const LIVE_REBUILD_PAYLOADS: &str = "fleet.live.rebuild_payloads";
 /// Counter: a live volume's rebuild from its log begun on its owner shard (g251): once a takeover, however many attempts
 /// its control shard makes while it runs.
 /// Format: a counter name in the daemon's status report.

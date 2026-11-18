@@ -11602,12 +11602,13 @@ fn live_volume_written(
   (id, written)
 }
 
-/// Shape: the files [`a_live_takeover_is_rebuilt_in_turns_and_joined_while_it_runs`] writes into a's live volume: each
-/// write's publication is a payload of the log, so the successor's rebuild takes at least this many turns once its
-/// quantum is cut to one unit (a payload a turn).
+/// Shape: the files [`a_live_takeover_is_rebuilt_in_turns_and_joined_while_it_runs`] writes into a's live volume: its
+/// log holds a payload a publication, and a burst's writes may share one, so the log's length is read, not assumed.
 const LIVE_TURN_FILES: usize = 24;
 /// Format: the successor's count of the owner-shard turns its live rebuilds took (`fleet::make_live_in_turns`).
 const LIVE_REBUILD_SLICES: &str = "fleet.live.rebuild_slices";
+/// Format: the successor's count of the payloads its live rebuilds applied, in all their turns.
+const LIVE_REBUILD_PAYLOADS: &str = "fleet.live.rebuild_payloads";
 /// Format: the successor's count of the live rebuilds it began, once a takeover however many attempts join it.
 const LIVE_REBUILDS_BEGUN: &str = "fleet.live.rebuilds_begun";
 /// Format: the successor's count of its attempts that found a live materialization running and joined it.
@@ -11621,7 +11622,7 @@ const MAKING_ALREADY: &str = "fleet.materialize.making_already";
 /// again. Do: three nodes at `f = 1`, one shard a node; on a, a live-shipped volume written 24 files; on b and c, the seal
 /// quantum cut to one unit (a payload a turn) and a pause of half a period between a rebuild's turns, so the
 /// materialization outlasts the control shard's periods; stop a; once the survivor the volume ranks first serves it, read
-/// every file back through it. Expect every file read back; the rebuild in at least 24 turns; one rebuild begun, the later
+/// every file back through it. Expect every file read back; the rebuild in a turn a payload, more than one; one rebuild begun, the later
 /// attempts joining it (`fleet.materialize.waits.making`, non-vacuous) and none begun twice; and the successor's longest
 /// step under the watchdog's window. Before, the whole log was rebuilt inside the one owner-shard turn that made the
 /// volume (0.68 to 1.08 s for the nemesis's 152 to 306 MB, past the spin window with the restore and the publication
@@ -11674,8 +11675,9 @@ fn a_live_takeover_is_rebuilt_in_turns_and_joined_while_it_runs() {
   drop(reader);
   let counters = summed_counters(&daemons[index]);
   let counted = |name: &str| counters.get(name).copied().unwrap_or(0);
-  let (slices, begun, joined, twice) = (
+  let (slices, payloads, begun, joined, twice) = (
     counted(LIVE_REBUILD_SLICES),
+    counted(LIVE_REBUILD_PAYLOADS),
     counted(LIVE_REBUILDS_BEGUN),
     counted(MATERIALIZE_WAITS_MAKING),
     counted(MAKING_ALREADY),
@@ -11685,9 +11687,9 @@ fn a_live_takeover_is_rebuilt_in_turns_and_joined_while_it_runs() {
     daemon.stop();
   }
   eprintln!(
-    "a live takeover in turns: served {served}, read {read:?}, {slices} rebuild turns for {LIVE_TURN_FILES} files, \
-     {begun} rebuilds begun, {joined} attempts joined one running, {twice} begun twice, the successor's longest step \
-     {longest_step_ns} ns"
+    "a live takeover in turns: served {served}, read {read:?}, {slices} rebuild turns for {payloads} payloads of \
+     {LIVE_TURN_FILES} files, {begun} rebuilds begun, {joined} attempts joined one running, {twice} begun twice, the \
+     successor's longest step {longest_step_ns} ns"
   );
   assert!(
     matches!(shipped, ReplyBody::LiveShippingSet { live_shipped: true }),
@@ -11705,8 +11707,12 @@ fn a_live_takeover_is_rebuilt_in_turns_and_joined_while_it_runs() {
     "every file reads back through the successor: {read:?}"
   );
   assert!(
-    slices >= u64::try_from(LIVE_TURN_FILES).unwrap(),
-    "the log was rebuilt a payload a turn: {slices} turns for {LIVE_TURN_FILES} files"
+    payloads > 1,
+    "non-vacuity: the log held more than one payload to rebuild ({payloads})"
+  );
+  assert!(
+    slices >= payloads,
+    "the log was rebuilt a payload a turn: {slices} turns for {payloads} payloads"
   );
   assert_eq!(begun, 1, "the log was rebuilt once");
   assert!(
