@@ -23,12 +23,16 @@ pub(crate) fn name(index: u8) -> &'static str {
   NAMES[usize::from(index) % NAMES.len()]
 }
 
+/// A name with no content picked by `seed`: a FIFO, a socket, or a block or character device numbered by the seed
+/// (A-294), so every oracle over generated greens meets device nodes and their numbers too.
 pub(crate) fn node(seed: u8) -> SpecialNode {
+  let (major, minor) = (u32::from(seed), u32::from(seed).wrapping_mul(257));
   SpecialNode {
-    kind: if seed.is_multiple_of(2) {
-      SpecialKind::Fifo
-    } else {
-      SpecialKind::Socket
+    kind: match seed % 4 {
+      0 => SpecialKind::Fifo,
+      1 => SpecialKind::Socket,
+      2 => SpecialKind::BlockDevice { major, minor },
+      _ => SpecialKind::CharDevice { major, minor },
     },
     uid: u32::from(seed),
     gid: u32::from(seed),

@@ -190,9 +190,7 @@ impl Checkpoint {
     checkpoint.modes = take_table(&mut reader, take_str, Reader::u32)?;
     checkpoint.symlinks = take_table(&mut reader, take_str, take_str)?;
     checkpoint.hardlinks = take_table(&mut reader, take_str, take_str)?;
-    checkpoint.specials = take_table(&mut reader, take_str, |r| {
-      SpecialNode::decode(r.bytes(crate::special::ENCODED_BYTES)?)
-    })?;
+    checkpoint.specials = take_table(&mut reader, take_str, SpecialNode::read)?;
     checkpoint.xattrs = take_table(
       &mut reader,
       |r| Ok((take_str(r)?, take_str(r)?)),

@@ -6932,6 +6932,9 @@ fn declare(state: &mut ShardState, principal: &Principal, work: VolumeId, op: Wo
           kind: match node.kind {
             IpcNodeKind::Fifo => SpecialKind::Fifo,
             IpcNodeKind::Socket => SpecialKind::Socket,
+            // A declared device node is metadata (A-294): the merge keeps its number and nothing opens it.
+            IpcNodeKind::BlockDevice { major, minor } => SpecialKind::BlockDevice { major, minor },
+            IpcNodeKind::CharDevice { major, minor } => SpecialKind::CharDevice { major, minor },
           },
           uid: node.uid,
           gid: node.gid,
@@ -10708,17 +10711,24 @@ fn populate_restored(
       continue;
     }
     let no = match kind_of_mode(meta.mode) {
-      Some(kind @ (Kind::Fifo | Kind::Socket)) => {
+      // A name with no content: a FIFO or socket name (A-26), or a device node with the number its metadata carries
+      // (A-294).
+      Some(kind @ (Kind::Fifo | Kind::Socket | Kind::BlockDevice | Kind::CharDevice)) => {
         if file.len != 0 {
           return Err(slates_vfs::error::VfsError::RecoveryIncomplete);
         }
+        let node = slates_vfs::inode::SpecialNode::of(
+          kind,
+          slates_vfs::inode::DeviceNumber::new(meta.device_major, meta.device_minor),
+        )
+        .ok_or(slates_vfs::VfsError::RecoveryIncomplete)?;
         let parent_no = store.dirs.get(parent)?.inode;
         volume.mknod_no(
           store,
           parent_no,
           &name,
           permissions_of_mode(meta.mode),
-          kind,
+          node,
         )?
       }
       Some(Kind::Symlink) => {
@@ -10807,7 +10817,8 @@ fn validate_restored_nodes(
       .get(path)
       .ok_or(VfsError::RecoveryIncomplete)?;
     match kind_of_mode(meta.mode) {
-      Some(Kind::Fifo | Kind::Socket) if meta.size == 0 && file.len == 0 => {}
+      Some(Kind::Fifo | Kind::Socket | Kind::BlockDevice | Kind::CharDevice)
+        if meta.size == 0 && file.len == 0 => {}
       Some(Kind::File | Kind::Symlink) if meta.size == file.len => {}
       _ => return Err(VfsError::RecoveryIncomplete),
     }
