@@ -1,0 +1,55 @@
+# DIAG (not for main): g229's A-334 + A-345 (main 68148152d) -- three live_chaos flows, 5 runs each, release, capped,
+# on Linux x86_64 and arm64: the partitioned owner (ReadSafety), the member that never held the log (NoLoss), the long
+# live log's count.
+name: diag-supervisor-g229
+on:
+  push:
+    branches: ['diag-supervisor-g229-*']
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  chaos-flows:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (release)
+        run: cargo test --locked --release -p slates-cli --test live_chaos --no-run
+      - name: Three flows, 5 runs each, capped
+        env:
+          SLATES_TEST_CLI: "1"
+          SLATES_FLEET_TRACE: "1"
+        run: |
+          ulimit -n 65536 || ulimit -n "$(ulimit -Hn)"
+          mkdir -p target/chaos
+          bin=$(cargo test --locked --release -p slates-cli --test live_chaos --no-run --message-format=json 2>/dev/null \
+            | jq -r 'select(.executable != null and .target.name == "live_chaos") | .executable' | tail -1)
+          slowest_pass_s=425
+          cap_s=$((slowest_pass_s * 4))
+          failed=0
+          for prefix in an_owner_partitioned_mid_stream a_member_that_never_held_the_log a_long_live_log; do
+            flow=$("$bin" --list --format terse 2>/dev/null | sed -n 's/: test$//p' | grep "^${prefix}" | head -1)
+            [ -n "$flow" ] || { echo "no flow for ${prefix}"; failed=$((failed + 1)); continue; }
+            for run in 1 2 3 4 5; do
+              began=$(date +%s)
+              if timeout "${cap_s}" "$bin" --exact "${flow}" --test-threads=1 --nocapture > "target/chaos/${flow}-${run}.log" 2>&1; then r=ok; else r=FAILED; failed=$((failed + 1)); fi
+              echo "${flow} run ${run}: ${r} ($(( $(date +%s) - began )) s, load $(cut -d' ' -f1 /proc/loadavg))"
+              [ "$r" = ok ] || grep -E "panicked|violat|assert" -A3 "target/chaos/${flow}-${run}.log" | head -12
+            done
+          done
+          echo "runs failed: ${failed}"
+          [ "${failed}" -eq 0 ]
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g229-chaos-${{ matrix.os }}
+          path: target/chaos/
