@@ -2519,7 +2519,7 @@ pub(crate) fn read_window_bytes(state: &ShardState) -> u64 {
 /// `slots + slots / 2 + slots / 2`. Past it a new request is refused `AcknowledgementOwed`, never run or recorded,
 /// so a client that never acknowledges cannot grow a shard's records, and every snapshot that encodes them, without
 /// bound (RIFL, Lee et al., SOSP 2015, bounds its completion records the same way, by the client's acknowledgements).
-fn completion_bound(state: &ShardState) -> u64 {
+pub(crate) fn completion_bound(state: &ShardState) -> u64 {
   u64::from(state.config.region.slots).saturating_mul(2)
 }
 
@@ -4396,6 +4396,28 @@ fn gates(
   }
 }
 
+/// The gate a green's recovery puts on a verb that touches it: `Err` with the answer when the verb is not run, else `Ok`
+/// with the fenced green an admin's `Destroy` of it releases. A fenced green (AUD-29-18) is never served: its recovered
+/// history is not what was acknowledged. The one verb it takes is an admin's `Destroy` — the reviewed release; its
+/// durable log is the evidence until then. A green a restarted successor holds by adoption is not served until the boot
+/// has rebuilt its engine from this node's ledger (A-333): the request was not started and may be retried.
+fn green_recovery_gate(
+  state: &mut ShardState,
+  touched: Option<DbVolumeId>,
+  body: &RequestBody,
+) -> Result<Option<DbVolumeId>, ReplyBody> {
+  let fenced = touched.filter(|volume| state.fenced_greens.contains_key(volume));
+  if fenced.is_some() && !matches!(body, RequestBody::Destroy { .. }) {
+    state.count(GREEN_FENCED, 1);
+    return Err(refused(Refusal::ContentUnavailable));
+  }
+  if touched.is_some_and(|volume| state.merge.awaiting_adoption.contains_key(&volume)) {
+    state.count(GREEN_AWAITING_ADOPTION_REFUSED, 1);
+    return Err(refused(Refusal::Overloaded { shard: state.shard }));
+  }
+  Ok(fenced)
+}
+
 pub(crate) fn dispatch(
   state: &mut ShardState,
   client_id: u32,
@@ -4443,14 +4465,10 @@ pub(crate) fn dispatch(
       coincident_failures: shortfall.coincident_failures,
     });
   }
-  // A fenced green (AUD-29-18) is never served: its recovered history is not what was acknowledged. The one
-  // verb it takes is an admin's `Destroy` — the reviewed release; its durable log is the evidence until then.
-  let fenced = touched.filter(|volume| state.fenced_greens.contains_key(volume));
-  let destroying = matches!(body, RequestBody::Destroy { .. });
-  if fenced.is_some() && !destroying {
-    state.count(GREEN_FENCED, 1);
-    return refused(Refusal::ContentUnavailable);
-  }
+  let fenced = match green_recovery_gate(state, touched, &body) {
+    Ok(fenced) => fenced,
+    Err(reply) => return reply,
+  };
   let reply = dispatch_inner(state, client_id, principal, body);
   if let Some(volume) = fenced
     && matches!(reply, ReplyBody::Destroyed)
@@ -11406,189 +11424,167 @@ fn await_placed(
 /// no content yet (§4.4 create); each snapshot's placement then writes the next sequence.
 pub(crate) const CREATION_HEAD_SEQUENCE: u64 = 0;
 
-/// Materializes a taken-over volume on this node (§4.8 "Promotion and takeover": the new owner "adopts
-/// the newest records, and serves"; §4.10 clone-from-archive): from the adopted head's catalog essentials
-/// and the archive of the content it names, creates the volume **under its original id and name**, restores
-/// every directory, file (bytes, mode, times) and symlink from the archive, and seals the tree as the
-/// volume's head snapshot at the adopted `sequence` — with the manifest identity the head names and the
-/// content holders (`region`) the head recorded, so `status` and `await placed(region)` answer for it as
-/// they did on the dead owner. Idempotent: a volume already present under the id is served as it is. The
-/// admission (byte reservation, inode allowance) is the same a `create` makes, so a successor short of
-/// capacity refuses `BudgetExceeded` rather than over-committing; a mount name already taken locally is
-/// `AlreadyExists` (names are per host, §4.4); a malformed archive is a `BadRequest` naming the reader's
-/// refusal. Any refusal leaves nothing behind (the credits go back, the partial volume is discarded).
-/// Materializes a taken-over **green** on the shard its id routes to (§4.16 owner-loss recovery;
-/// AUD-14): records its catalog entry under the adopted record's name, evidence policy and owner, with the
-/// access list of its adopted catalog register at that register's sequence (guard-then-apply,
-/// refused typed when the name is taken or the chain budget cannot hold it),
-/// re-records its origin and every increment of the recovered chain durably — so a restart of this
-/// node rebuilds the same green — replays them into a fresh engine (`rebuild_green`: the same
-/// derivation a restart runs, with the rejected-cache budget and retention settled), and verifies the
-/// rebuilt head identity against the adopted record's: a mismatch is fatal-and-loud for the green
-/// here (the catalog record stays but the engine is not installed, counted). On success the adopted
-/// head is placed (its records committed at the quorum under the departed owner, the adoption under
-/// this node's epoch), so `await placed`, `versions`, reads at any version and new submits serve.
-/// Idempotent: a green this shard already holds is left alone.
-pub(crate) fn materialize_taken_over_green(
+/// Adopts a taken-over **green** on the shard its id routes to (§4.16 owner-loss recovery; AUD-14; A-333): records the
+/// green by its adoption — its catalog record under the adopted record's name, evidence policy and owner, with the
+/// access list of its adopted catalog register at that register's sequence, and the adopted version, its identity and
+/// version 0's inputs manifest (`Op::GreenAdopted`), one operation checked as a creation is — and installs the engine the
+/// control shard handed it, this node's replica at the adopted version, whose versions up to it are this node's holder
+/// ledger. Nothing is recorded or replayed beyond that: the origin's bytes and the adopted versions' increments stay in
+/// the ledger (`crate::green_adopt`). Then the completions the ledger's records carried are recorded (A-255) and the
+/// adopted head is placed (its records committed at the quorum under the departed owner, the adoption under this node's
+/// epoch), so `await placed`, `versions`, reads at any version and new submits serve. Idempotent: a green this shard
+/// already serves is left alone, and one recorded by the same adoption is installed. A name taken here, or a volume of
+/// another role or another adoption under the id, is refused typed and recorded nothing; the adoption is handed back so
+/// its engine waits on the control shard for the next attempt.
+pub(crate) fn adopt_taken_over_green(
   state: &mut ShardState,
   id: DbVolumeId,
-  recovery: crate::merge_service::GreenRecovery,
-) -> Result<(), Box<ReplyBody>> {
-  use crate::merge_service::MergeRole;
+  adopted: crate::green_adopt::AdoptedGreen,
+) -> Result<(), Box<crate::green_adopt::AdoptedGreen>> {
   if state.greens.contains_key(&id) {
     return Ok(());
   }
-  if state.db.partition().volume(id).is_none() {
-    if let Some(existing) = state.db.partition().volume_by_name(&recovery.name) {
-      return Err(Box::new(refused(Refusal::AlreadyExists {
-        existing: to_wire_volume(existing.id),
-      })));
-    }
-    let record = VolumeRecord {
-      id,
-      name: recovery.name.clone(),
-      owner_shard: state.partition,
-      policy: PolicyRecord {
-        size: db_size(SizeClass::Dynamic { max: 0 }),
-        names: DbNamePolicy::Exact,
-        require_locked: false,
-        role: Role::Green {
-          require_evidence: recovery.require_evidence,
-          head_version: recovery.head,
-        },
-        live_shipped: false,
-        live_holders: None,
-        write: None,
-        write_version: 0,
-        signers: Vec::new(),
-      },
-      base: BaseRecord::Scratch,
-      head: DbSnapshotId::default(),
-      epoch: 0,
-      referenced_bytes: 0,
-      unique_bytes: 0,
-      state: VolumeState::Live,
-      lease: None,
-      owner: recovery.owner.clone(),
-      access: recovery.access.clone(),
-      created_ns: state.clock.monotonic_ns(),
-      catalog_version: recovery.catalog_sequence,
-      taken_over: None,
-    };
-    let now = state.clock.monotonic_ns();
-    if let Err(e) = state
-      .db
-      .mutate(&mut state.segment, &Op::VolumeCreated { record }, now)
-    {
-      return Err(Box::new(refused(refusal_of_db(&e))));
-    }
-  }
-  // The id must name a green here. A volume of another role already recorded under it is not this green, and replaying
-  // the green's chain onto its record would serve one object as another: refused typed (a `debug_assert!` before
-  // 2026-11-18, which panicked a debug build's shard and let a release build go on). The takeover counts the refusal and
-  // gives the green up at its bound, naming `refused` (`fleet::materialize_pending_greens`).
-  if !matches!(
-    crate::merge_service::merge_role(state, id),
-    Some(MergeRole::Green { .. })
-  ) {
-    return Err(Box::new(refused(Refusal::AlreadyExists {
-      existing: to_wire_volume(id),
-    })));
-  }
-  // The chain, durably, in order — each entry guarded before it is applied.
-  let now = state.clock.monotonic_ns();
-  // What this node holds durably already: its checkpoint's version and the increments after it (W3).
-  let already = usize::try_from(state.db.partition().green_head(id)).unwrap_or(usize::MAX);
-  if already == 0
-    && state.db.partition().green_origin(id).is_none()
-    && let Some(origin) = &recovery.origin
-  {
-    let op = Op::GreenOriginated {
-      green: id,
-      origin: origin.clone(),
-    };
-    if let Err(e) = state.db.mutate(&mut state.segment, &op, now) {
-      return Err(Box::new(refused(refusal_of_db(&e))));
-    }
-  }
-  // A holder's records carry the increments a successor judges afresh (§4.16 "Apply on holders"); what each resolves to
-  // here is what this node's chain records of it (A-257).
-  let mut engine = match replay_green(state, id) {
-    Ok((engine, _)) => engine,
-    Err(fence) => {
-      return Err(Box::new(refused(Refusal::BadRequest {
-        reason: format!("taken-over green does not replay locally: {fence:?}"),
-      })));
-    }
-  };
-  for (increment_bytes, completion) in recovery
-    .chain
-    .iter()
-    .zip(&recovery.completions)
-    .skip(already)
-  {
-    let judged = slates_merge::engine::Increment::decode(increment_bytes)
-      .ok()
-      .map(|increment| {
-        let verdict = engine.submit_resolved(&increment);
-        (increment, verdict)
-      });
-    let Some((increment, (slates_merge::engine::Outcome::Accepted { .. }, Some(applied)))) = judged
-    else {
-      return Err(Box::new(refused(Refusal::BadRequest {
-        reason: "taken-over green's chain does not replay onto its adopted head".to_owned(),
-      })));
-    };
-    let op = Op::GreenAdvanced {
-      green: id,
-      increment: slates_merge::chain_entry::encode(
-        increment_bytes,
-        &increment,
-        &applied,
-        completion.map(crate::merge_service::SubmitCompletion::to_entry),
-        None,
-        // The signature's verdict does not ride the merge record yet (A-321, GAPS): a successor records none.
-        None,
-      ),
-    };
-    if let Err(e) = state.db.mutate(&mut state.segment, &op, now) {
-      return Err(Box::new(refused(refusal_of_db(&e))));
-    }
+  if let Err(refusal) = record_adopted_green(state, id, &adopted) {
+    state.count(GREEN_TAKEOVER_ADOPTION_REFUSED, 1);
+    slates_machine::log_line!(
+      "slates-server: partition {}: taken-over green {} not adopted: {refusal:?}",
+      state.partition,
+      adopted.name
+    );
+    return Err(Box::new(adopted));
   }
   let Some(record) = state.db.partition().volume(id).cloned() else {
-    return Err(Box::new(refused(Refusal::NotFound)));
+    return Err(Box::new(adopted));
   };
-  rebuild_green(state, &record);
-  let rebuilt = state
-    .greens
-    .get_mut(&id)
-    .map(|engine| (engine.head(), engine.head_identity()));
-  if rebuilt != Some((recovery.head, recovery.identity)) {
-    // The chain this node held does not reproduce the adopted head: refuse the green here, loudly,
-    // rather than serve versions the quorum did not commit.
-    state.greens.remove(&id);
-    crate::merge_service::release_green_retention(state, id);
-    state.count(GREEN_TAKEOVER_MISMATCH, 1);
-    slates_machine::log_line!(
-      "slates-server: partition {}: taken-over green {} rebuilt to {:?}, the adopted record names version {} with another identity; refused",
-      state.partition,
-      record.name,
-      rebuilt.map(|(head, _)| head),
-      recovery.head
+  let crate::green_adopt::AdoptedGreen {
+    mut engine,
+    completions,
+    head,
+    ..
+  } = adopted;
+  engine.set_rejected_budget(crate::merge_service::rejected_cache_budget(state));
+  state.greens.insert(id, engine);
+  // The adopted replica holds every history in full; it is folded oldest-first to the budget and its retention charged,
+  // as a recovered green's is (`install_green`). A retention the budget cannot hold fences the green.
+  if let Err(short) = crate::merge_service::settle_green_retention(state, id) {
+    fence_green(
+      state,
+      &record,
+      crate::merge_service::GreenFence::Retention { short },
     );
-    return Err(Box::new(refused(Refusal::BadRequest {
-      reason: "taken-over green does not reproduce its adopted head".to_owned(),
-    })));
+    return Ok(());
   }
-  record_taken_over_completions(state, &recovery.completions);
+  record_taken_over_completions(state, &completions);
   let object = ObjectId(id.bytes);
-  let placed = state.merge.placed.entry(object).or_insert(recovery.head);
-  *placed = (*placed).max(recovery.head);
+  let placed = state.merge.placed.entry(object).or_insert(head);
+  *placed = (*placed).max(head);
   // A round that gave the green up waiting for its cohorts' promises, then adopted it under a later configuration, left
   // its record here (`takeover::give_up_unpromised`); the green is served now.
   state.unrecovered.remove(&id);
+  state.count(GREEN_TAKEOVER_ADOPTED, 1);
   Ok(())
 }
+
+/// Records green `id` by its adoption (A-333), or finds it recorded by this same adoption: `Err` with the refusal when
+/// the id or the name is another volume's here, or the partition refuses the record.
+fn record_adopted_green(
+  state: &mut ShardState,
+  id: DbVolumeId,
+  adopted: &crate::green_adopt::AdoptedGreen,
+) -> Result<(), Refusal> {
+  if let Some(existing) = state.db.partition().volume(id) {
+    // Recorded already: by this adoption (an attempt whose answer did not come within its period), or it is not this
+    // green, and the adoption would serve one object as another.
+    let this_adoption = matches!(existing.policy.role, Role::Green { .. })
+      && state
+        .db
+        .partition()
+        .green_adoption(id)
+        .is_some_and(|recorded| {
+          recorded.version == adopted.head && recorded.identity == adopted.identity
+        });
+    return if this_adoption {
+      Ok(())
+    } else {
+      Err(Refusal::AlreadyExists {
+        existing: to_wire_volume(id),
+      })
+    };
+  }
+  let record = VolumeRecord {
+    id,
+    name: adopted.name.clone(),
+    owner_shard: state.partition,
+    policy: PolicyRecord {
+      size: db_size(SizeClass::Dynamic { max: 0 }),
+      names: DbNamePolicy::Exact,
+      require_locked: false,
+      role: Role::Green {
+        require_evidence: adopted.require_evidence,
+        head_version: adopted.head,
+      },
+      live_shipped: false,
+      live_holders: None,
+      write: None,
+      write_version: 0,
+      // The catalog register carries neither a write policy nor trusted signers yet (GAPS, "Signed work", its open
+      // sibling): a successor's green has none, as one a successor materialized before A-333 had.
+      signers: Vec::new(),
+    },
+    base: BaseRecord::Scratch,
+    head: DbSnapshotId::default(),
+    epoch: 0,
+    referenced_bytes: 0,
+    unique_bytes: 0,
+    state: VolumeState::Live,
+    lease: None,
+    owner: adopted.owner.clone(),
+    access: adopted.access.clone(),
+    created_ns: state.clock.monotonic_ns(),
+    catalog_version: adopted.catalog_sequence,
+    // The takeover that made this node the green's owner (AC-8.3, A-325): its promotion epoch, which the holders fenced
+    // the green at, is what this node writes the green's records at after a restart forgets `placed_heads`
+    // (`fleet::promotion_epoch`). Before A-333 a successor recorded none, so a restarted one wrote them at its own
+    // host's epoch, every one refused, and the green's next version never committed.
+    taken_over: Some(slates_db::catalog::TakeoverRecord {
+      epoch: adopted.epoch,
+      head_sequence: adopted.head,
+      from_live_log: false,
+      // A green's takeover past its tolerance is not carried here yet: the round keeps the shortfall of a volume's head
+      // register only (A-332; `takeover::record_adoption`), GAPS "The many-client load test", A-333's open items.
+      past_tolerance: None,
+    }),
+  };
+  let op = Op::GreenAdopted {
+    record,
+    version: adopted.head,
+    identity: adopted.identity,
+    origin: adopted.origin,
+  };
+  let now = state.clock.monotonic_ns();
+  state
+    .db
+    .mutate(&mut state.segment, &op, now)
+    .map(|_| ())
+    .map_err(|e| match refusal_of_db(&e) {
+      Refusal::AlreadyExists { .. } => match state.db.partition().volume_by_name(&adopted.name) {
+        Some(existing) => Refusal::AlreadyExists {
+          existing: to_wire_volume(existing.id),
+        },
+        None => Refusal::AlreadyExists {
+          existing: to_wire_volume(id),
+        },
+      },
+      refusal => refusal,
+    })
+}
+
+/// The status count of taken-over greens adopted from this node's holder ledger (A-333): the non-vacuity counter of the
+/// adoption.
+const GREEN_TAKEOVER_ADOPTED: &str = "merge.takeover.adopted";
+/// The status count of adoptions the owner shard refused (a name taken here, another volume under the id, the partition
+/// refusing the record); the control shard keeps the engine and attempts again.
+const GREEN_TAKEOVER_ADOPTION_REFUSED: &str = "merge.takeover.adoption_refused";
 
 /// The status count of a taken-over submit's completion recorded on its green's successor (A-255).
 const TAKEN_OVER_COMPLETION_RECORDED: &str = "merge.takeover.completion_recorded";
@@ -11611,21 +11607,17 @@ const TAKEN_OVER_COMPLETION_UNRECORDED: &str = "merge.takeover.completion_unreco
 /// typed and runs nothing (the work is gone with its owner). Counted.
 fn record_taken_over_completions(
   state: &mut ShardState,
-  completions: &[Option<crate::merge_service::SubmitCompletion>],
+  completions: &[(u64, crate::merge_service::SubmitCompletion)],
 ) {
   let bound = usize::try_from(completion_bound(state)).unwrap_or(usize::MAX);
   // Each client's submits: a request's sequence, the version it was answered and the work it came from.
   let mut by_client: std::collections::BTreeMap<(u64, u32), Vec<_>> =
     std::collections::BTreeMap::new();
-  for (index, key) in completions.iter().enumerate() {
-    let Some(key) = key else {
-      continue;
-    };
-    let version = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
+  for (version, key) in completions {
     by_client
       .entry((key.origin, key.client))
       .or_default()
-      .push((key.sequence, version, key.work));
+      .push((key.sequence, *version, key.work));
   }
   for ((origin, client), mut submits) in by_client {
     submits.sort_unstable();
@@ -11653,10 +11645,6 @@ fn record_taken_over_completions(
     }
   }
 }
-
-/// A taken-over green whose recovered chain did not reproduce the adopted head's identity: refused on
-/// this node, fatal-and-loud (§4.16 D-27).
-const GREEN_TAKEOVER_MISMATCH: &str = "merge.takeover_mismatch";
 
 /// What a takeover adopted for one volume: its head (the content), its catalog (what the volume is served
 /// as) and each register's adopted sequence.
@@ -11740,6 +11728,17 @@ fn relinquish_superseded(state: &mut ShardState, id: DbVolumeId) -> Result<(), B
   }
 }
 
+/// Materializes a taken-over volume on this node (§4.8 "Promotion and takeover": the new owner "adopts
+/// the newest records, and serves"; §4.10 clone-from-archive): from the adopted head's catalog essentials
+/// and the archive of the content it names, creates the volume **under its original id and name**, restores
+/// every directory, file (bytes, mode, times) and symlink from the archive, and seals the tree as the
+/// volume's head snapshot at the adopted `sequence` — with the manifest identity the head names and the
+/// content holders (`region`) the head recorded, so `status` and `await placed(region)` answer for it as
+/// they did on the dead owner. Idempotent: a volume already present under the id is served as it is. The
+/// admission (byte reservation, inode allowance) is the same a `create` makes, so a successor short of
+/// capacity refuses `BudgetExceeded` rather than over-committing; a mount name already taken locally is
+/// `AlreadyExists` (names are per host, §4.4); a malformed archive is a `BadRequest` naming the reader's
+/// refusal. Any refusal leaves nothing behind (the credits go back, the partial volume is discarded).
 pub(crate) fn materialize_taken_over(
   state: &mut ShardState,
   id: DbVolumeId,
@@ -13111,6 +13110,11 @@ async fn rebuild_record(
   max_prefix: &mut u16,
 ) -> bool {
   match record.policy.role {
+    // A green its takeover adopted from this node's holder ledger (A-333) is rebuilt from that ledger at boot, which
+    // no replay of this partition can do: it waits for it.
+    Role::Green { .. } if await_adoption(state, record) => {
+      rebuilt.merge_volumes = rebuilt.merge_volumes.saturating_add(1);
+    }
     Role::Green { .. } => {
       // A restarted owner owes its holders every merge record its chain holds that they may not: the pending records
       // lived in memory, so a version appended before the restart and not yet committed at `f + 1` was never shipped
@@ -13339,7 +13343,9 @@ fn reconcile_clone_pins(state: &mut ShardState) -> usize {
 /// Rebuilds a recovered green volume (§4.16, §4.8): a fresh merge engine with its persisted chain
 /// replayed in order, so its content, versions, last-changed index and dedup set return exactly as
 /// before the restart. A corrupt chain entry stops the replay there — the green recovers to its last
-/// good version, logged, rather than presenting a wrong later state.
+/// good version, logged, rather than presenting a wrong later state. The tests' form of
+/// [`rebuild_green_sliced`], in one call: a recovery runs the sliced one, and since A-333 a takeover replays nothing.
+#[cfg(test)]
 fn rebuild_green(
   state: &mut ShardState,
   record: &VolumeRecord,
@@ -13348,8 +13354,10 @@ fn rebuild_green(
   install_green(state, record, replayed)
 }
 
-/// [`rebuild_green`] in a recovery's slices (§2.6 boot step 2): the same replay, a directory of the held origin or a
-/// chain entry a unit.
+/// Rebuilds a recovered green volume in a recovery's slices (§2.6 boot step 2; §4.16, §4.8): a fresh merge engine with
+/// its persisted origin and chain replayed in order, a directory of the held origin or a chain entry a unit, so its
+/// content, versions, last-changed index and dedup set return exactly as before the restart; or the green fenced with
+/// why its replay was refused (AUD-29-18).
 async fn rebuild_green_sliced(
   state: &mut ShardState,
   record: &VolumeRecord,
@@ -13404,7 +13412,9 @@ fn install_green(
 /// acknowledged version, so each must decode and be accepted at exactly its own version — version `n` for
 /// the `n`-th entry after the checkpoint (W3) or over the origin's version 0 — or the replay is refused with the fence
 /// naming why (AUD-29-18). Until 2026-09-30 a corrupt origin installed an empty green, a corrupt entry stopped the
-/// replay and installed the shorter one, and a submit's outcome was not checked at all.
+/// replay and installed the shorter one, and a submit's outcome was not checked at all. [`rebuild_green`]'s replay,
+/// in one call, for the tests; a recovery runs [`replay_green_sliced`].
+#[cfg(test)]
 fn replay_green(
   state: &ShardState,
   id: DbVolumeId,
@@ -13414,8 +13424,8 @@ fn replay_green(
   replay.finish(state)
 }
 
-/// [`replay_green`] in a recovery's slices: the slice may end after any unit. With it, the shares its origin was seeded
-/// in.
+/// Replays green `id`'s durable origin and chain into a fresh engine in a recovery's slices ([`GreenReplay`]): the slice
+/// may end after any unit. With it, the shares its origin was seeded in.
 async fn replay_green_sliced(
   state: &ShardState,
   id: DbVolumeId,
@@ -13442,13 +13452,14 @@ type ReplayedGreen = (
   Vec<crate::merge_service::ReplayedVersion>,
 );
 
-/// A green's replay a unit at a time ([`replay_green`]): its held origin walked a directory a step (A-217), or its recorded
-/// origin bytes decoded a share a step; then its engine seeded from the origin a share a step and restored at its
-/// checkpoint (W3); then its chain an entry a step. Holds no borrow of the state between steps. Until 2026-11-18 the engine
+/// A green's replay a unit at a time (§4.16; every chain entry must decode and be accepted at exactly its own version,
+/// or the replay is refused with the fence naming why, AUD-29-18): its held origin walked a directory a step (A-217), or
+/// its recorded origin bytes decoded a share a step; then its engine seeded from the origin a share a step and restored
+/// at its checkpoint (W3); then its chain an entry a step. Holds no borrow of the state between steps. Until 2026-11-18 the engine
 /// was built from the whole origin in one step (`Green::with_origin`, or `Green::restore` over it), which hashes and
 /// copies every file: seconds of one poll over the Linux kernel's 1.67 GB, past the watchdog's verdict on a shard that
 /// runs a window of CPU in one step, so a restarted owner of a kernel-sized green was ended again inside its recovery.
-struct GreenReplay {
+pub(crate) struct GreenReplay {
   /// The green replayed.
   id: DbVolumeId,
   /// Where the replay is.
@@ -13580,8 +13591,14 @@ impl GreenReplay {
             .iter()
             .filter(|version| version.base < held)
             .count();
+          // The floor is a checkpoint's, or with none the version the green's takeover adopted it at (A-333).
+          let floor = if state.db.partition().green_checkpoint(self.id).is_some() {
+            "checkpoint"
+          } else {
+            "adoption"
+          };
           slates_machine::log_line!(
-            "slates-server: partition {}: green {} restored at checkpoint {held}, applied {} chain entries above it, {below} of them based below it",
+            "slates-server: partition {}: green {} restored at its {floor} at version {held}, applied {} chain entries above it, {below} of them based below it",
             state.partition,
             hex_of(&self.id.bytes),
             replayed.len()
@@ -13662,7 +13679,9 @@ fn chain_phase(
   // The engine seeded from the origin (the empty engine for a green with no origin), restored at its checkpoint if it
   // has one, as `Green::restore` does in one call.
   let seeded = seeded.unwrap_or_default();
-  let (mut green, held, head_check) = match state.db.partition().green_checkpoint(id) {
+  let partition = state.db.partition();
+  let adopted = partition.green_adoption(id).is_some();
+  let (mut green, held, head_check) = match partition.green_checkpoint(id) {
     Some((held, bytes)) => {
       let checkpoint = slates_merge::checkpoint::Checkpoint::decode(bytes)
         .ok()
@@ -13674,7 +13693,9 @@ fn chain_phase(
         checkpoint.head_check,
       )
     }
-    None => (seeded, 0, None),
+    // With no checkpoint the chain begins after the green's floor: 0, or the version its takeover adopted it at, whose
+    // engine the boot rebuilt from this node's ledger (A-333).
+    None => (seeded, partition.green_floor(id), None),
   };
   // The identity the head had when the checkpoint was taken (A-257): compared once the replay reaches that version.
   if head_check
@@ -13683,9 +13704,9 @@ fn chain_phase(
     return Err(GreenFence::IdentityDiverged { version: held });
   }
   // Version 0's merge record, as its owner enqueued it, when no checkpoint stands for it; `replay_chain_entry` keeps
-  // the rest.
+  // the rest. An adopted green's version 0 is its departed owner's, placed before its takeover (A-333).
   let mut replayed = Vec::new();
-  if held == 0 {
+  if held == 0 && !adopted {
     replayed.push(crate::merge_service::ReplayedVersion {
       version: 0,
       increment: [0u8; 32],
@@ -13741,6 +13762,155 @@ fn fence_green(
 /// report, alongside the verbs' refusal kinds.
 const GREEN_FENCED: &str = "merge.green_fenced";
 
+/// The status count of verbs on a green a restarted successor holds by adoption, answered `Overloaded` while the boot
+/// rebuilds its engine from this node's ledger (A-333).
+const GREEN_AWAITING_ADOPTION_REFUSED: &str = "merge.awaiting_adoption_refused";
+/// The status count of greens a recovery found held by adoption, left for the boot to rebuild from this node's ledger
+/// (A-333).
+const GREEN_AWAITING_ADOPTION: &str = "merge.recovery.awaiting_adoption";
+
+/// Leaves recovered green `record` for the boot to re-adopt, when its takeover adopted it from this node's holder ledger
+/// (A-333): its partition records the versions up to the adoption by reference, so no replay of the partition rebuilds
+/// it. Its engine is rebuilt from the ledger through the adopted version, or through version 0 alone when a checkpoint
+/// past the adoption stands (the checkpoint is applied onto the origin), then handed here
+/// (`crate::green_adopt::readopt_at_boot`). Whether the green waits so.
+fn await_adoption(state: &mut ShardState, record: &VolumeRecord) -> bool {
+  let partition = state.db.partition();
+  let Some(adoption) = partition.green_adoption(record.id).copied() else {
+    return false;
+  };
+  let awaiting = if partition.green_checkpoint(record.id).is_some() {
+    crate::green_adopt::AwaitingAdoption {
+      through: 0,
+      identity: None,
+      replay: None,
+    }
+  } else {
+    crate::green_adopt::AwaitingAdoption {
+      through: adoption.version,
+      identity: Some(adoption.identity),
+      replay: None,
+    }
+  };
+  state.merge.awaiting_adoption.insert(record.id, awaiting);
+  state.count(GREEN_AWAITING_ADOPTION, 1);
+  true
+}
+
+/// Takes the engine the boot rebuilt from this node's ledger for green `id`, awaiting its re-adoption here (A-333), and
+/// begins the replay of this partition's own chain onto it: its checkpoint applied when one stands, then each chain
+/// entry after the green's floor, a slice a call ([`step_readoption`]). False, and the engine dropped, when the engine
+/// is not at the version and identity the adoption names, or the checkpoint does not decode: the boot fences the green.
+/// A green no longer awaiting (destroyed meanwhile) takes nothing, and answers true.
+pub(crate) fn begin_readoption(
+  state: &mut ShardState,
+  id: DbVolumeId,
+  mut engine: slates_merge::engine::Green,
+) -> bool {
+  let Some(awaiting) = state.merge.awaiting_adoption.get(&id) else {
+    return true;
+  };
+  let (through, identity) = (awaiting.through, awaiting.identity);
+  if engine.head() != through || identity.is_some_and(|identity| engine.head_identity() != identity)
+  {
+    return false;
+  }
+  let Ok(phase) = chain_phase(state, id, Some(engine)) else {
+    return false;
+  };
+  if let Some(awaiting) = state.merge.awaiting_adoption.get_mut(&id) {
+    awaiting.replay = Some(Box::new(GreenReplay {
+      id,
+      phase,
+      load_steps: 0,
+    }));
+  }
+  true
+}
+
+/// What one call of a green's re-adoption replay did ([`step_readoption`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadoptionStep {
+  /// A slice of the chain was applied; more remains.
+  More,
+  /// The chain is applied: the green is installed and served, each version after its floor owed to its holders again.
+  Installed,
+  /// The replay was refused (an entry that does not decode or does not reach its recorded identity), or none began:
+  /// the green is fenced.
+  Fenced,
+}
+
+/// Applies a slice of green `id`'s own chain onto the engine its re-adoption was handed ([`begin_readoption`], A-333);
+/// once all of it is applied, installs the green as a recovery does (`install_green`: the rejected-cache budget, the
+/// retention settled) and owes its holders every version after the green's floor again (A-246). A green no longer
+/// awaiting (destroyed meanwhile) is `Installed`: there is nothing left to do for it.
+pub(crate) fn step_readoption(state: &mut ShardState, id: DbVolumeId) -> ReadoptionStep {
+  let Some(awaiting) = state.merge.awaiting_adoption.get_mut(&id) else {
+    return ReadoptionStep::Installed;
+  };
+  let Some(mut replay) = awaiting.replay.take() else {
+    fence_awaiting_adoption(state, id);
+    return ReadoptionStep::Fenced;
+  };
+  let budget = state.config.copy_slice_ns().max(1);
+  let began = state.clock.monotonic_ns();
+  loop {
+    match replay.step(state) {
+      Ok(true) => break,
+      Ok(false) if state.clock.monotonic_ns().saturating_sub(began) < budget => {}
+      Ok(false) => {
+        if let Some(awaiting) = state.merge.awaiting_adoption.get_mut(&id) {
+          awaiting.replay = Some(replay);
+        }
+        return ReadoptionStep::More;
+      }
+      Err(fence) => {
+        state.merge.awaiting_adoption.remove(&id);
+        if let Some(record) = state.db.partition().volume(id).cloned() {
+          fence_green(state, &record, fence);
+        }
+        return ReadoptionStep::Fenced;
+      }
+    }
+  }
+  state.merge.awaiting_adoption.remove(&id);
+  let Some(record) = state.db.partition().volume(id).cloned() else {
+    return ReadoptionStep::Installed;
+  };
+  let replayed = replay.finish(state);
+  for version in install_green(state, &record, replayed) {
+    crate::merge_service::enqueue_recovered_record(state, id, version);
+  }
+  // The adopted version was placed at the quorum before the restart (the takeover re-committed it); only the versions
+  // after it are owed to the holders again.
+  if let Some(adoption) = state.db.partition().green_adoption(id).copied()
+    && state.greens.contains_key(&id)
+  {
+    let placed = state
+      .merge
+      .placed
+      .entry(ObjectId(id.bytes))
+      .or_insert(adoption.version);
+    *placed = (*placed).max(adoption.version);
+  }
+  ReadoptionStep::Installed
+}
+
+/// Fences green `id`, awaiting its re-adoption here, whose boot could not re-adopt it from this node's ledger (A-333):
+/// every verb on it refused typed from here, its records left as the evidence (AUD-29-18).
+pub(crate) fn fence_awaiting_adoption(state: &mut ShardState, id: DbVolumeId) {
+  if state.merge.awaiting_adoption.remove(&id).is_none() {
+    return;
+  }
+  if let Some(record) = state.db.partition().volume(id).cloned() {
+    fence_green(
+      state,
+      &record,
+      crate::merge_service::GreenFence::LedgerUnavailable,
+    );
+  }
+}
+
 /// Rebuilds a recovered work volume from its log (§4.16, A-207; D-18): its base, what it holds of its own and its
 /// journal, replayed over its rebuilt green, so every change it acknowledged before the restart is there after it.
 /// Skipped when its green is gone (the work has nothing to be over). Charged for what it keeps, like any work; a log
@@ -13748,8 +13918,11 @@ const GREEN_FENCED: &str = "merge.green_fenced";
 /// (`WORK_REBUILD_REFUSED`), never presented reset as if its edits were kept.
 fn rebuild_work(state: &mut ShardState, record: &VolumeRecord, green: DbVolumeId) {
   // A green on another partition has not recovered yet, and its engine is not this shard's: the work is replayed
-  // through its owner once every partition has recovered, before any client is admitted (A-247).
-  if owner_of(to_wire_volume(green)) != state.partition {
+  // through its owner once every partition has recovered, before any client is admitted (A-247). So is a work over a
+  // green this shard holds by adoption, whose engine the boot rebuilds from the ledger first (A-333).
+  if owner_of(to_wire_volume(green)) != state.partition
+    || state.merge.awaiting_adoption.contains_key(&green)
+  {
     let created_at = match record.policy.role {
       Role::Work { base_version, .. } => base_version,
       _ => 0,
@@ -17191,15 +17364,34 @@ mod tests {
     *state.by_id.get(&super::to_db_volume(id)).unwrap()
   }
 
-  /// §4.16 owner-loss recovery, CLAUDE.md §2 item 6 (no panics in non-test code, ever): a taken-over green whose id
-  /// names a volume of another role on its owner shard is refused typed, and nothing is rebuilt over it. Do: create a
-  /// plain volume, then materialize a taken-over green under its id and another name. Expect `AlreadyExists` naming
-  /// the id, no green engine, and the plain volume still plain and served. Before (2026-11-18), a `debug_assert!` on the
-  /// volume's role panicked the shard in a debug build, and a release build went on to replay the green's chain against
-  /// the plain volume's record.
+  /// The adoption a test hands an owner shard (A-333): a green with no origin, at version 0, named `name`.
+  fn adoption(name: &str, owner: &Principal) -> crate::green_adopt::AdoptedGreen {
+    let mut engine = slates_merge::engine::Green::new();
+    let identity = engine.head_identity();
+    crate::green_adopt::AdoptedGreen {
+      name: name.to_owned(),
+      require_evidence: false,
+      owner: owner.clone(),
+      access: Vec::new(),
+      catalog_sequence: 1,
+      head: 0,
+      identity,
+      origin: None,
+      epoch: 0,
+      engine,
+      completions: Vec::new(),
+    }
+  }
+
+  /// §4.16 owner-loss recovery, CLAUDE.md §2 item 6 (no panics in non-test code, ever), A-333: a taken-over green whose
+  /// id names a volume of another role on its owner shard is refused, and nothing is adopted over it. Do: create a plain
+  /// volume, then adopt a taken-over green under its id and another name. Expect the adoption handed back with its
+  /// engine, counted refused, no green engine, and the plain volume still plain and served. Before (2026-11-18), a
+  /// `debug_assert!` on the volume's role panicked the shard in a debug build, and a release build went on to replay the
+  /// green's chain against the plain volume's record.
   #[test]
   fn a_taken_over_green_whose_id_names_a_plain_volume_is_refused_typed() {
-    let (wire, answer, engine, role, served) = crate::daemon::audit_on_shard(|state| {
+    let (handed_back, refused, engine, role, served) = crate::daemon::audit_on_shard(|state| {
       let owner = Principal::Uid {
         host: slates_db::HostId(0),
         uid: 1234,
@@ -17220,37 +17412,173 @@ mod tests {
         panic!("{reply:?}")
       };
       let id = super::to_db_volume(wire);
-      let recovery = crate::merge_service::GreenRecovery {
-        name: "green".to_owned(),
-        require_evidence: false,
-        owner,
-        access: Vec::new(),
-        catalog_sequence: 1,
-        origin: None,
-        chain: Vec::new(),
-        completions: Vec::new(),
-        head: 0,
-        identity: [0; 32],
-      };
-      let answer = super::materialize_taken_over_green(state, id, recovery).map_err(|reply| *reply);
+      let answer = super::adopt_taken_over_green(state, id, adoption("green", &owner));
       (
-        wire,
-        answer,
+        answer.err().map(|back| back.engine.head()),
+        state
+          .refusals
+          .get(super::GREEN_TAKEOVER_ADOPTION_REFUSED)
+          .copied(),
         state.greens.contains_key(&id),
         crate::merge_service::merge_role(state, id).is_none(),
         state.by_id.contains_key(&id),
       )
     });
     assert_eq!(
-      answer,
-      Err(ReplyBody::Refused {
-        refusal: Refusal::AlreadyExists { existing: wire }
-      }),
-      "a green is never materialized over a plain volume"
+      handed_back,
+      Some(0),
+      "the adoption is handed back with its engine"
     );
+    assert_eq!(refused, Some(1), "counted refused once");
     assert!(!engine, "no green engine over the plain volume");
     assert!(role, "the volume under the id is still plain");
     assert!(served, "the plain volume is still served");
+  }
+
+  /// §4.16 owner-loss recovery, A-333: a taken-over green is recorded on its owner shard by its adoption and served by
+  /// the engine handed to it. Do: adopt a green at version 0 under a free id and ask its versions; adopt it again; drop its
+  /// engine (an install that did not happen) and adopt it again; drop it again and adopt under the same id an adoption
+  /// naming another identity; adopt another green under the same name. Expect the first adoption served (its versions at
+  /// head 0), recorded with its adoption and no origin bytes, counted adopted once; the second a no-op; the same adoption
+  /// installed again over its own record, counted; the other adoption and the other green refused and handed back.
+  #[test]
+  fn a_taken_over_green_is_recorded_by_its_adoption_and_served() {
+    let (versions, recorded, origin_bytes, answers, adopted) =
+      crate::daemon::audit_on_shard(|state| {
+        let owner = Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 1234,
+        };
+        let id = super::DbVolumeId { bytes: [0x42; 16] };
+        let first = super::adopt_taken_over_green(state, id, adoption("adopted", &owner)).is_ok();
+        let versions = super::dispatch(
+          state,
+          1,
+          &owner,
+          super::RequestBody::Versions {
+            green: super::to_wire_volume(id),
+          },
+        );
+        let recorded = state.db.partition().green_adoption(id).copied();
+        let origin_bytes = state.db.partition().green_origin(id).is_some();
+        let again = super::adopt_taken_over_green(state, id, adoption("adopted", &owner)).is_ok();
+        state.greens.remove(&id);
+        let reinstalled = super::adopt_taken_over_green(state, id, adoption("adopted", &owner))
+          .is_ok()
+          && state.greens.contains_key(&id);
+        state.greens.remove(&id);
+        let mut another = adoption("adopted", &owner);
+        another.identity = [9; 32];
+        let another = super::adopt_taken_over_green(state, id, another).is_err();
+        let other = super::DbVolumeId { bytes: [0x43; 16] };
+        let other =
+          super::adopt_taken_over_green(state, other, adoption("adopted", &owner)).is_err();
+        let adopted = state.refusals.get(super::GREEN_TAKEOVER_ADOPTED).copied();
+        (
+          versions,
+          recorded,
+          origin_bytes,
+          [first, again, reinstalled, another, other],
+          adopted,
+        )
+      });
+    assert!(
+      matches!(versions, ReplyBody::Versions { head: 0 }),
+      "{versions:?}"
+    );
+    assert_eq!(
+      recorded.map(|adoption| (adoption.version, adoption.origin)),
+      Some((0, None)),
+      "recorded by its adoption"
+    );
+    assert!(!origin_bytes, "no origin bytes recorded");
+    assert_eq!(
+      answers, [true; 5],
+      "installed; a no-op again; installed over its own record; another adoption and another green refused"
+    );
+    assert_eq!(adopted, Some(2), "counted adopted at each install");
+  }
+
+  /// §4.16 owner-loss recovery and its failure matrix (a green owner's restart is masked), A-333: a restarted successor's
+  /// green, held by adoption, waits for the engine its ledger rebuilds and serves once it has it. Do: adopt a green at
+  /// version 0 and another whose adoption names another identity; leave both as a restart leaves them (recorded, no engine,
+  /// nothing placed) and await their re-adoption; ask the first's versions; hand the second an engine at version 0, and the
+  /// first one, and step the first's replay; ask its versions again. Expect the first ask answered `Overloaded`, counted;
+  /// the engine off the second's identity not taken; the first's replay installed in one step, its versions at head 0 and
+  /// version 0 placed again.
+  #[test]
+  fn a_green_awaiting_its_readoption_answers_overloaded_then_serves_the_engine_handed_to_it() {
+    let (waiting, taken, step, versions, placed, counted) =
+      crate::daemon::audit_on_shard(|state| {
+        let owner = Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 1234,
+        };
+        let (id, off) = (
+          super::DbVolumeId { bytes: [0x44; 16] },
+          super::DbVolumeId { bytes: [0x45; 16] },
+        );
+        let mut other = adoption("off", &owner);
+        other.identity = [9; 32];
+        let adopted = super::adopt_taken_over_green(state, id, adoption("readopted", &owner))
+          .is_ok()
+          && super::adopt_taken_over_green(state, off, other).is_ok();
+        // What a restart leaves of each: its record and adoption, no engine and nothing placed.
+        for green in [id, off] {
+          state.greens.remove(&green);
+          state.merge.placed.remove(&ObjectId(green.bytes));
+          let record = state.db.partition().volume(green).cloned();
+          assert!(
+            adopted && record.is_some_and(|record| super::await_adoption(state, &record)),
+            "an adopted green waits for its ledger"
+          );
+        }
+        let wire = super::to_wire_volume(id);
+        let waiting = super::dispatch(
+          state,
+          1,
+          &owner,
+          super::RequestBody::Versions { green: wire },
+        );
+        let taken = [
+          super::begin_readoption(state, off, slates_merge::engine::Green::new()),
+          super::begin_readoption(state, id, slates_merge::engine::Green::new()),
+        ];
+        let step = super::step_readoption(state, id);
+        let versions = super::dispatch(
+          state,
+          1,
+          &owner,
+          super::RequestBody::Versions { green: wire },
+        );
+        let placed = crate::merge_service::placed_version(state, ObjectId(id.bytes));
+        let counted = state
+          .refusals
+          .get(super::GREEN_AWAITING_ADOPTION_REFUSED)
+          .copied();
+        (waiting, taken, step, versions, placed, counted)
+      });
+    assert!(
+      matches!(
+        waiting,
+        ReplyBody::Refused {
+          refusal: Refusal::Overloaded { .. }
+        }
+      ),
+      "a verb on a green awaiting its re-adoption is not started: {waiting:?}"
+    );
+    assert_eq!(
+      taken,
+      [false, true],
+      "an engine off the adoption's identity is not taken; the right one is"
+    );
+    assert_eq!(step, super::ReadoptionStep::Installed);
+    assert!(
+      matches!(versions, ReplyBody::Versions { head: 0 }),
+      "{versions:?}"
+    );
+    assert_eq!(placed, Some(0), "the adopted version is placed again");
+    assert_eq!(counted, Some(1), "the refused verb counted");
   }
 
   /// What a client observes of the node at `path`: its kind and permission bits, owner, link count, four
