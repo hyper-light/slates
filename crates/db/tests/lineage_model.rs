@@ -17,14 +17,15 @@
 //! was adopted (A-272). A holder resolves its copies at each install as `takeover::resolve_held_objects` does:
 //! a line that names a successor moves the copy's routing to it; a line that ends at a completed takeover lets the copy
 //! go when the holder took part in that takeover ([`RegionalConfiguration::settled_for`]); and a successor's
-//! confirmation lets it go when the holder, asked in that round, is outside the successor's placement
-//! (`stale_after_confirmation`). A holder sometimes misses installs and installs the newest configuration later, as a
-//! lagging node does.
+//! confirmation lets it go when the holder is outside the successor's placement (`stale_after_confirmation`) and was
+//! asked in that round, or, never asked, judges from the kept retirement that the object was recovered within tolerance
+//! ([`RegionalConfiguration::within_tolerance`], A-341). A holder sometimes misses installs and installs the newest
+//! configuration later, as a lagging node does.
 //!
 //! **The oracle** is the property A-272 and A-309 exist for: a holder lets a copy go only if its object was adopted
-//! after that copy was written (an adoption made a newer record, so the copy is stale). And every structure stays
-//! bounded: the retirements by one per member, the completion records by one per member or the ones kept retirements
-//! still need.
+//! after that copy was written (an adoption made a newer record, so the copy is stale), or the copy's record was never
+//! placed (never acknowledged as durable). And every structure stays bounded: the retirements by one per member, the
+//! completion records by one per member or the ones kept retirements still need.
 //!
 //! **What it found while A-309 was built**, each a history that broke the oracle until the rule after it:
 //! - A takeover with no survivor, or one carried into such a takeover, read settled (the minimal history below).
@@ -37,6 +38,13 @@
 //! - A holder a neighbourhood the owner had left still reached held a copy no asked member held; the successor confirmed
 //!   without learning it, and the holder read the confirmation as an adoption. Fixed by letting a copy go only for a
 //!   holder the round asked.
+//! - A-341's first rule let an unasked holder's copy go at every confirmation, held to a placement that had certified a
+//!   record at least as new elsewhere (seed 44): a region formed on host 1 alone (its settled cohort host 1 itself)
+//!   admitted 102, wrote an object jointly to {1} and {1, 102}, placed, then moved its neighbourhood to later joiners
+//!   without settling and died. The round asked the joiners and learned nothing of the object, its successor confirmed,
+//!   and 102 let go the last copy of a record placed at `f + 1`, after one failure at `f = 1`; the "certification" was
+//!   the dead owner's own cohort. Fixed by letting an unasked copy go only where the object's settled cohorts were
+//!   within tolerance, so the round learned a record at least as new.
 //!
 //! - `a_takeover_with_no_survivor_lets_no_holder_reclaim_an_object_nobody_adopted`: the minimal history by hand.
 //! - `holders_let_go_only_of_copies_an_adoption_made_stale` (proptest): the oracle and the bounds on every history.
@@ -116,6 +124,9 @@ struct HeldCopy {
   moved_from: Option<HostId>,
   /// The retired host whose takeover this copy is in, as the lease gate records it (`departed_owners`).
   departed: Option<HostId>,
+  /// Whether the write that made this copy placed its record (`f + 1` of each cohort it went to): a record never placed
+  /// was never acknowledged as durable, so the oracle does not hold its copies.
+  committed: bool,
 }
 
 /// One object's ground truth.
@@ -140,8 +151,12 @@ struct Counts {
   reclaimed_confirmed: u64,
   /// Copies kept because their line read unresolved or lost.
   kept_unknown: u64,
-  /// Copies kept because their line ended at a completed takeover that never asked their holder.
+  /// Copies kept because a takeover that never asked their holder was confirmed or completed where nothing shows the
+  /// object recovered within tolerance (past it, or judged by a completion record alone).
   kept_unasked: u64,
+  /// Copies let go by a holder the takeover never asked, judged from the kept retirement with the object's settled
+  /// cohorts within tolerance (A-341).
+  reclaimed_unasked: u64,
   /// Adoptions made by rounds.
   adopted: u64,
   /// Of those, adoptions past tolerance: a cohort short of its recovery quorum, every surviving holder heard (A-309).
@@ -157,6 +172,7 @@ impl Counts {
     self.reclaimed_confirmed += other.reclaimed_confirmed;
     self.kept_unknown += other.kept_unknown;
     self.kept_unasked += other.kept_unasked;
+    self.reclaimed_unasked += other.reclaimed_unasked;
     self.adopted += other.adopted;
     self.recovered_past_tolerance += other.recovered_past_tolerance;
     self.completed += other.completed;
@@ -169,6 +185,7 @@ impl Counts {
       ("reclaimed_confirmed", self.reclaimed_confirmed),
       ("kept_unknown", self.kept_unknown),
       ("kept_unasked", self.kept_unasked),
+      ("reclaimed_unasked", self.reclaimed_unasked),
       ("adopted", self.adopted),
       ("recovered_past_tolerance", self.recovered_past_tolerance),
       ("completed", self.completed),
@@ -187,7 +204,12 @@ type Violation = (HostId, ObjectId, u64, u64);
 enum Confirmed {
   /// The successor confirmed and the holder was asked in its round, outside its placement: the copy is stale.
   Stale,
-  /// The successor confirmed and the holder is outside its placement, but the round never asked the holder: kept.
+  /// The successor confirmed and the holder is outside its placement, and the round never asked the holder, but the kept
+  /// retirement shows the object's settled cohorts within tolerance, so the round learned a record at least as new
+  /// (A-341): the copy is stale.
+  Covered,
+  /// The successor confirmed and the holder is outside its placement, but the round never asked the holder and nothing
+  /// shows the object recovered within tolerance: kept.
   Unasked,
   /// Nothing to judge: no confirmation, or the holder is within the successor's placement.
   Not,
@@ -270,6 +292,7 @@ impl World {
         acked.push(*host);
       }
     }
+    let committed = placement.placed_with(&acked, configuration.quorum);
     let state = self.objects.get_mut(&object).unwrap();
     let sequence = state.next_sequence;
     state.next_sequence += 1;
@@ -282,6 +305,7 @@ impl World {
           owner,
           moved_from: None,
           departed: None,
+          committed,
         },
       );
     }
@@ -460,6 +484,7 @@ impl World {
         acked.push(host);
       }
     }
+    let committed = placement.placed_with(&acked, configuration.quorum);
     let state = self.objects.get_mut(&object).unwrap();
     for host in acked {
       state.copies.insert(
@@ -470,6 +495,7 @@ impl World {
           owner: successor,
           moved_from: None,
           departed: None,
+          committed,
         },
       );
     }
@@ -505,6 +531,10 @@ impl World {
         match self.stale_after_confirmation(holder, object, &copy) {
           Confirmed::Stale => {
             self.counts.reclaimed_confirmed += 1;
+            self.reclaim(holder, object);
+          }
+          Confirmed::Covered => {
+            self.counts.reclaimed_unasked += 1;
             self.reclaim(holder, object);
           }
           Confirmed::Unasked => self.counts.kept_unasked += 1,
@@ -547,8 +577,9 @@ impl World {
   }
 
   /// Whether the holder's copy, routed to the live member `copy.owner` after a takeover, is stale: that member's share
-  /// of the copy's takeover is confirmed (in the kept retirement or its completion record), the holder was asked in that
-  /// round (a survivor of it), and the holder is outside that member's placement of the object.
+  /// of the copy's takeover is confirmed (in the kept retirement or its completion record), the holder is outside that
+  /// member's placement of the object, and the holder was asked in that round (a survivor of it) or the kept retirement
+  /// shows the object's settled cohorts within tolerance (A-341).
   fn stale_after_confirmation(
     &self,
     holder: HostId,
@@ -579,15 +610,18 @@ impl World {
     };
     match (confirmed && outside, asked) {
       (true, true) => Confirmed::Stale,
+      (true, false) if self.regional.within_tolerance(departed, object) => Confirmed::Covered,
       (true, false) => Confirmed::Unasked,
       (false, _) => Confirmed::Not,
     }
   }
 
-  /// `holder` lets its copy of `object` go; the oracle records it unless an adoption came after the copy was written.
+  /// `holder` lets its copy of `object` go; the oracle records it unless an adoption came after the copy was written, or
+  /// its record was never placed.
   fn reclaim(&mut self, holder: HostId, object: ObjectId) {
     let state = self.objects.get_mut(&object).unwrap();
     if let Some(copy) = state.copies.remove(&holder)
+      && copy.committed
       && state.adoptions <= copy.adoptions
     {
       self
@@ -778,8 +812,9 @@ proptest! {
 
 /// Non-vacuity: over a fixed set of seeds the histories reach every verdict the oracle judges, so a silently dead path
 /// can never pass as a held property. Do: run the seeds and add up what they did. Expect copies let go by a settled line
-/// and by a confirmed successor, copies kept on an unresolved or lost line and on a completed takeover that never asked
-/// their holder, adoptions (some past tolerance, A-309) and completed takeovers, each at least once, and no violation.
+/// and by a confirmed successor, copies kept on an unresolved or lost line and where a takeover that never asked their
+/// holder shows nothing within tolerance, copies let go by such a holder where it does (A-341), adoptions (some past
+/// tolerance, A-309) and completed takeovers, each at least once, and no violation.
 #[test]
 fn the_generated_histories_reach_every_verdict() {
   let mut total = Counts::default();

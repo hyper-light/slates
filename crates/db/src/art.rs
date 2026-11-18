@@ -613,6 +613,75 @@ impl<V> Art<V> {
     }
   }
 
+  /// The first `limit` keys strictly past `after` (from the first key when `None`), with their values, in key order: a
+  /// bounded ordered read that visits only the nodes on the path to `after` and those of the keys it returns, never the
+  /// whole tree. A page of the volume listing reads by it (A-267), where collecting every key ([`Art::iter`]) cost the
+  /// table each page.
+  pub fn after(&self, after: Option<&[u8]>, limit: usize) -> Vec<(Vec<u8>, &V)> {
+    let mut out = Vec::with_capacity(limit.min(self.len));
+    if let Some(root) = self.root {
+      self.collect_after(root, Vec::new(), after, limit, &mut out);
+    }
+    out
+  }
+
+  /// [`Art::after`]'s walk of the subtree at `ix`, whose keys start with `so_far`: `bound` is `after` while the walk is
+  /// on its path, and `None` once every key of the subtree is past it. Stops at `limit` keys.
+  fn collect_after<'a>(
+    &'a self,
+    ix: NodeIx,
+    mut so_far: Vec<u8>,
+    bound: Option<&[u8]>,
+    limit: usize,
+    out: &mut Vec<(Vec<u8>, &'a V)>,
+  ) {
+    if out.len() >= limit {
+      return;
+    }
+    let Some(node) = self.node(ix) else {
+      return;
+    };
+    so_far.extend_from_slice(&node.prefix);
+    let bound = match bound {
+      Some(after) => {
+        let shared = so_far.len().min(after.len());
+        let here = so_far.get(..shared).unwrap_or_default();
+        let there = after.get(..shared).unwrap_or_default();
+        match here.cmp(there) {
+          // Every key of the subtree sorts before `after`.
+          std::cmp::Ordering::Less => return,
+          // Every key of the subtree sorts after it, or extends it.
+          std::cmp::Ordering::Greater => None,
+          std::cmp::Ordering::Equal if so_far.len() > after.len() => None,
+          // On its path: `so_far` is a prefix of `after`, so this node's own key is not past it.
+          std::cmp::Ordering::Equal => Some(after),
+        }
+      }
+      None => None,
+    };
+    if bound.is_none()
+      && let Some(value) = &node.value
+    {
+      out.push((so_far.clone(), value));
+    }
+    // The byte of `after` that follows `so_far`, while the walk is on its path: children below it are before it, the
+    // child at it stays on the path, and those above it are past it. None once `so_far` is `after` itself.
+    let next = bound.and_then(|after| after.get(so_far.len()).copied());
+    for (byte, child) in node.children.pairs() {
+      if out.len() >= limit {
+        return;
+      }
+      let child_bound = match (bound, next) {
+        (Some(_), Some(next)) if byte < next => continue,
+        (Some(after), Some(next)) if byte == next => Some(after),
+        _ => None,
+      };
+      let mut key = so_far.clone();
+      key.push(byte);
+      self.collect_after(child, key, child_bound, limit, out);
+    }
+  }
+
   /// Every value whose key starts with `prefix`, in key order.
   pub fn scan_prefix(&self, prefix: &[u8]) -> Vec<(Vec<u8>, &V)> {
     self.iter().filter(|(k, _)| k.starts_with(prefix)).collect()
@@ -677,6 +746,45 @@ mod tests {
         let listed: Vec<(Vec<u8>, u32)> = art.iter().map(|(k, v)| (k, *v)).collect();
         let expected: Vec<(Vec<u8>, u32)> = model.iter().map(|(k, v)| (k.clone(), *v)).collect();
         prop_assert_eq!(listed, expected);
+      }
+    }
+
+    /// A-267: the bounded ordered read equals an ordered map's range on every generated tree, from no bound, from
+    /// every key it holds, from keys it does not hold (prefixes of its keys and keys past them), and at every limit
+    /// from none to more than it holds.
+    #[test]
+    fn a_read_past_any_key_equals_an_ordered_maps_range(
+      keys in proptest::collection::vec(key(), 0..120),
+      probes in proptest::collection::vec(key(), 0..12),
+      limit in 0usize..20,
+    ) {
+      let mut art: Art<u32> = Art::new();
+      let mut model: BTreeMap<Vec<u8>, u32> = BTreeMap::new();
+      for (n, k) in keys.iter().enumerate() {
+        let v = u32::try_from(n).unwrap();
+        art.insert(k, v);
+        model.insert(k.clone(), v);
+      }
+      let bounds: Vec<Option<Vec<u8>>> = std::iter::once(None)
+        .chain(model.keys().cloned().map(Some))
+        .chain(probes.into_iter().map(Some))
+        .collect();
+      for bound in bounds {
+        let read: Vec<(Vec<u8>, u32)> = art
+          .after(bound.as_deref(), limit)
+          .into_iter()
+          .map(|(k, v)| (k, *v))
+          .collect();
+        let from = match &bound {
+          Some(after) => std::ops::Bound::Excluded(after.clone()),
+          None => std::ops::Bound::Unbounded,
+        };
+        let expected: Vec<(Vec<u8>, u32)> = model
+          .range((from, std::ops::Bound::Unbounded))
+          .take(limit)
+          .map(|(k, v)| (k.clone(), *v))
+          .collect();
+        prop_assert_eq!(read, expected, "after {:?} limit {}", bound, limit);
       }
     }
   }

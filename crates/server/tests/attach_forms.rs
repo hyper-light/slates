@@ -993,6 +993,7 @@ fn advance(
     ReplyBody::Advanced {
       version,
       invalidated,
+      ..
     } => Ok((version, invalidated)),
     ReplyBody::Refused { refusal, .. } => Err(refusal),
     other => panic!("advance answered {other:?}"),
