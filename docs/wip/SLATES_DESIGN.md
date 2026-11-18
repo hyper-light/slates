@@ -7890,7 +7890,12 @@ it builds against the contract and adds to it rather than around it.
   launcher sets (`Instance::set_signers`). The verdict is recorded with the version and read back
   (`Instance::merge_record`). A volume's policy may require signed merges; an unsigned or invalid
   merge into it is refused `SignatureRequired` even in bypass, when it would merge. Signatures never
-  gate permission: the mode does. Merges are signed work now; a landing's signature is owed (A-321).
+  gate permission: the mode does. A landing's statement comes with every presentation
+  (`LandingApproval::statement`, from `Instance::plan_landing` or an asked `land`), its verdict is
+  judged against what it presents and again against what it writes, answered in the approval and
+  in `LandingReport::verification`, and recorded on its audit records (`AuditRecord::verification`,
+  `Instance::audit`); an approval carries the landing's signature on to `approve_landing`
+  (`LandingApproval::signature`). Merges and landings are signed work (A-321).
 - *Volumes.* One typed create, `Instance::provision(&VolumeSpec)`, for every source: an overlay
   over a host folder, an empty volume, a clone of a snapshot, a green (empty or over a complete
   immutable snapshot), a work volume over a green, which answers its green and its base version.
@@ -8045,7 +8050,15 @@ it builds against the contract and adds to it rather than around it.
 > entries), a grant's state (`GrantSummary::grant_state`), and an audit record's kind and stage (`AuditEntry::audit_kind`,
 > `stage`). The contract reads only those. The words stay for people (the CLI's and MCP's JSON), and a word the contract
 > did not know is no longer a protocol fault.
-> **`CONTRACT` = 20 (A-332):** a takeover past the volume's tolerance shows in its loss report.
+> **`CONTRACT` = 20 (A-321, signed landings):** `land` sends its signature and the daemon judges it
+> (`Unsupported::SignedWork` gone); a `LandingApproval` carries the landing's `statement` and the
+> `signature` it carried, which `approve_landing` presents and lands with again; a `LandingReport`'s
+> `verification` is the verdict on what was written; an `AuditRecord` of a landing as a whole
+> (planned, finished) carries its `verification`. Proven by use
+> (`a_signed_landing_is_judged_and_read_back_through_the_contract`: a plan states the landing
+> unsigned, the statement signed by the trusted key is asked again verified with nothing written,
+> its approval lands it verified, and its planned and finished records read back verified).
+> **`CONTRACT` = 21 (A-332):** a takeover past the volume's tolerance shows in its loss report.
 > `VolumeTakeover::past_tolerance`, appended, is a `PastTolerance` naming the `Shortfall` (the hosts recovery needed,
 > and how many remained members) of its head register's cohort and of its live log's recorded holders, each `None`
 > when that part was recovered within tolerance; the takeover record keeps it with the volume, so it survives the
@@ -8651,6 +8664,18 @@ would need a privilege slates never holds (R10).
 > no page holds whole; a landed presentation's bytes as listed) and by the pager's oracle (unit tests). Not served:
 > the CLI's `slates land` prints the summary alone.
 
+> **Status (2026-11-18, A-321: signed landings).** Built: `Land` and `Present` may carry an SSH signature over the
+> landing's statement (`slates landing v1`, the volume, the target as the request names it with its length, the
+> manifest hash; `crates/server/src/signed_work.rs`), which every presentation states in its `GrantRequired`. The
+> volume's owner judges it under the volume's trusted signers against the manifest it presents, and again against the
+> one a granted landing writes (`landing::landing_verdict`), records the verdict on the landing's `LandingPlanned` and
+> `LandingFinished` audit records (`AuditRecord::signature`, kept by recovery as the log is) and answers it with the
+> presentation and in the `LandingOutcome`; `Audit` reads it back. An asking consumer's landing keeps its signature
+> through the turn into a presentation. Nothing requires a signed landing, and a signature permits nothing: a forbidden
+> landing is refused signed or not, an asked one waits for its approval, a bypass one lands with an invalid signature
+> recorded invalid. Proven by `crates/server/tests/signed_work.rs` (four landing tests, macOS arm64, Mac Studio,
+> 2026-11-18) and the contract's `a_signed_landing_is_judged_and_read_back_through_the_contract`, each guard red alone.
+
 > **Status (2026-10-01, AUD-29-62: contained base access on every platform).** The Windows base host is
 > descriptor-relative like the Unix one: it retains a handle per opened directory and opens each entry with
 > `NtCreateFile` relative to it with `FILE_OPEN_REPARSE_POINT`, and makes the reparse check on the object it
@@ -8741,7 +8766,8 @@ enum ConflictClass { ModifyModify, ModifyDelete, DeleteModify, RenameRename, Cre
 struct LandingLease { target: CanonicalTarget /* device and inode */, holder: AttemptId /* one landing attempt (A-47) */,
                       generation: u64 /* the take's log sequence on the control partition */, expires: Monotonic }
 struct AuditRecord { seq: u64, at: Monotonic, kind: AuditKind /* GrantIssued | GrantRevoked | LandingPlanned | LandingValidated | EntryWritten | EntryRefused | LandingFinished */,
-                     grant: Option<GrantId>, landing: Option<RequestId>, manifest: Option<Blake3>, outcome: Option<LandingState> }
+                     grant: Option<GrantId>, landing: Option<RequestId>, manifest: Option<Blake3>, outcome: Option<LandingState>,
+                     signature: Option<SignatureVerdict> /* A-321: how a landing's signature was judged, on its LandingPlanned and LandingFinished records */ }
 ```
 Ownership facts: a landing request belongs to the owner shard of the snapshot's volume and runs
 as one of its tasks; the manifest lives in that shard's arena; grants, landing leases and the
@@ -8770,7 +8796,9 @@ entry either old or new, never torn).
    and removals, symlinks and mode changes; hash the canonical encoding of the manifest. Cost
    proportional to diverged entries.
 2. *Present.* Reply `GrantRequired{request_id, manifest_hash, summary}` and record
-   `LandingPlanned` in the audit log. The confirmation surface shows the summary, the full entry
+   `LandingPlanned` in the audit log. The reply also states the landing's statement, which a signer signs to make the
+   landing signed work, and how the request's signature was judged against this manifest, which the record keeps
+   (A-321; a signature is provenance and decides nothing here). The confirmation surface shows the summary, the full entry
    list on demand, and the conflicts found by a preliminary verdict pass (step 4 run without
    writing), because a human decides on evidence, not on a yes/no prompt. The entry list is read
    from the presentation itself (`LandingEntries`, A-287): the manifest's entries in its order,
@@ -23127,8 +23155,9 @@ setting and a merge's approval already were, so an agent never approves its own 
 `Enroll` and `Revoke` refuse `Forbidden` on a consumer-bound channel before the proof (`enroll_by_consumer`,
 `revoke_by_consumer`), so no launcher-class verb answers an agent's own channel (GAPS); `SetSigners` refuses it
 alike (A-321). Signed merges built 2026-11-17 (A-321): the statement, the verdict recorded with the version, the
-trusted signers and a volume's requirement; owed, a landing's signature (A-321's next piece). The SSH-signature
-verifier built first (below) is signed work's, its grant statement removed.
+trusted signers and a volume's requirement; signed landings built 2026-11-18 (A-321's second part): the statement each
+presentation states, the verdict judged against what is presented and what is written, recorded on the landing's audit
+records. The SSH-signature verifier built first (below) is signed work's, its grant statement removed.
 - **The rule (Ada, 2026-11-18).** Merging and landing to disk follow the permission mode the user gave the harness or
   agent that asks. Bypass (Claude Code's `bypassPermissions`, Codex's full access): slates merges and writes, no
   prompt. Ask: slates answers a typed approval request (the change's summary and manifest) that the harness presents
@@ -23140,7 +23169,7 @@ verifier built first (below) is signed work's, its grant statement removed.
 - **Signed work (Ada: "we can (and should) support signed work").** A merge or a landing may carry an SSH signature
   (OpenSSH `PROTOCOL.sshsig`); slates verifies it, records it as provenance and answers a typed check (verified with
   its signer, unsigned, or invalid with its reason), and a volume can require signed merges. It never decides whether
-  a write is permitted. Built for merges by A-321 (its statement, its trusted signers, its record).
+  a write is permitted. Built for merges and landings by A-321 (their statements, the trusted signers, their records).
 - **Withdrawn.** The same morning A-285 read R10 as a human-only proof: fs-server's options of 2026-11-05 (A, a prompt
   on the anchor's terminal; B, a same-user socket; C, a separate operator account; D, a signature by a key only the
   human holds; E, standing grants in a file the human writes), of which Ada first chose D with A as the fallback. Ada
@@ -25108,10 +25137,68 @@ its own), `docs/library.md`, and:
   requirement, the work's rules travelling, the replay's record, the checkpoint's table, the green's signers, the
   consumer refusal), the restored build green. The verifier's 11 unit tests over the new `ssh-keygen` vectors, the
   chain and checkpoint codecs' tests, and the contract's `a_signed_merge_is_judged_and_read_back_through_the_contract`.
-- **Owed** (GAPS): a landing's signature (the statement is defined; the verdict on `Land` and `Present`, recorded with
-  the landing's record and read back in the audit, and the contract's `land` with a signature); the verdict carried by
-  a version's merge record to holders and a takeover successor (a successor records none today); a real FIDO key's
-  signature end to end.
+- **Owed** (GAPS): the verdict carried by a version's merge record to holders and a takeover successor (a successor
+  records none today); a real FIDO key's signature end to end.
+
+**Signed landings (2026-11-18, A-321's second part; goal g090).** Applied in the same change to: §4.15 (the audit
+record's shape, step 2 "Present", a status blockquote), §4.12 ("The consumer contract": its signed-work bullet,
+`CONTRACT` 20), A-285's status, GAPS (this entry's head entry and A-285's), `docs/library.md`, and:
+- `crates/ipc/src/protocol.rs`: `Land` and `Present` carry `signature`; `GrantRequired` carries the landing's
+  `statement` and its `verification`; `LandingOutcome::verification`; `AuditEntry::verification`. Fields appended to
+  existing variants and structs; no enum variant added, so no wire tag moved or was published.
+- `crates/db`: `catalog::AuditRecord::signature` (`SignatureVerdict`: the verdict's kind, detail and fingerprint, as
+  the chain entry codes them), appended; the model test's records carry one on every other record, so recovery is
+  held to keep it.
+- `crates/server`: `landing.rs` (`landing_verdict`; `present` judges against the manifest presented and records the
+  verdict on its `LandingPlanned`; `finish` judges against the manifest written and records it on the run's
+  `LandingPlanned` and `LandingFinished`; a bypass presentation's granted run and every refusal path carry the
+  signature; `audit_verb` reads it back), `signed_work.rs` (`to_record`, `of_record`), `verbs.rs` (the consumer
+  gate's presentation keeps the signature).
+- `crates/client`: `SignedLanding`, `land_with_signature`, `present_with_signature`.
+- `crates/api`: `Instance::land` sends its signature; `LandingApproval::statement` and `::signature`;
+  `approve_landing` presents and lands with the approval's signature; `LandingReport::verification` from the outcome;
+  `AuditRecord::verification`; `Unsupported::SignedWork` removed; `CONTRACT` 20.
+- Tests: `crates/server/tests/signed_work.rs` (four landing tests, below), `crates/api/tests/api.rs`
+  (`a_signed_landing_is_judged_and_read_back_through_the_contract`).
+
+- **The statement and how a signer gets it.** As defined with the merge's: `slates landing v1`, the volume, the target
+  as the request names it with its length in bytes first, the manifest hash (§4.15 step 2), which binds every entry
+  written. Every presentation states it in its `GrantRequired`, whatever the mode: a present-only `Present`
+  (`Instance::plan_landing`), or a landing an ask mode holds.
+- **Judged twice, recorded where it was judged.** On the volume's owner, under the volume's trusted signers: against
+  the manifest a presentation shows, so the approval request carries the verdict an approver weighs and its
+  `LandingPlanned` record keeps it; and against the manifest a granted landing writes, so the outcome and the run's
+  `LandingPlanned` and `LandingFinished` records say how what reached the disk was signed. The two agree for a
+  single-use grant, which binds the presented manifest; a session grant's later landing writes a manifest no
+  presentation showed, so only the second judgment can name it. The counters count judgments: a signed bypass landing
+  moves its verdict's counter twice.
+- **Recorded as provenance.** On the audit records, the landing's durable trail (§4.15 "Ownership facts"), read back
+  by `Audit`; recovery replays them as it replays every record. A record no landing judges (a grant's, a validation's,
+  an entry's) carries none and reads `None`; a landing's that carried no signature reads `Unsigned`.
+- **Never a permission.** Nothing requires a signed landing. A forbidding mode refuses a landing before its signature is
+  read; an asking one presents it, signed or not, and lands it only under an approval; a bypass one lands it with an
+  invalid signature recorded invalid. An asking consumer's channel turns its landing into a presentation that keeps the
+  signature (`consumer_gate`). The contract's `approve_landing` carries the approval's signature to the re-presentation
+  and the landing, so an approved landing is recorded with its verdict; an approver may set a signature made over the
+  approval's statement.
+- **Rejected.** A verdict on the planned record alone: a session grant's later landing writes a manifest no
+  presentation judged. The landing record (`LandingRecord`) as the verdict's home: no verb reads a landing record back to
+  a consumer, and the audit is where a landing's trail is read. Changing the client's `Landing::GrantRequired` to carry
+  the statement: the CLI, the MCP server and both SDKs bind its fields one by one, so `SignedLanding` carries the signed
+  parts beside it.
+- **Proven** by `crates/server/tests/signed_work.rs` (macOS arm64, Mac Studio, 2026-11-18): a landing presented
+  unsigned with the exact statement, signed with the trusted key and asked again verified with nothing written, landed
+  under its grant verified, every planned and finished record of it read back verified and the unsigned
+  presentation's unsigned (`a_signed_landing_is_judged_recorded_and_read_back`); bypass landings signed by a stranger,
+  under git's namespace and over a statement the volume moved past, each written and answered `UnregisteredKey`,
+  `Namespace`, `BadSignature`, and a verified signature on a forbidding volume refused with nothing written
+  (`a_landings_signature_decides_nothing_its_mode_decides`); an asking agent's signed landing presented verified
+  (`an_agents_asked_landing_keeps_its_signature`); both verdicts read back after a restart, judged by no one again
+  (`a_landings_verdict_survives_a_daemon_restart`); and the contract's
+  `a_signed_landing_is_judged_and_read_back_through_the_contract`. Each red with its guard removed alone (the
+  presentation's judgment, the finish's, the run's planned record, the presentation's record, the mirrored records, the
+  volume's signers, the consumer gate's signature, the bypass run's signature, the contract's approval carrying it and
+  `approve_landing` sending it), the restored build green.
 
 ### A-331 — A node the council configuration it holds does not name keeps direct contact with every member it holds alive, until it holds one that names it (2026-11-18, goal g225: a forming fleet reaches every candidate at start)
 Applied in the same change to: §4.8 "Consensus lifetime" (the learner paragraph), GAPS (the entry for this stall),
@@ -25808,7 +25895,7 @@ Applied in the same change to: §4.10's chaos status, GAPS ("Chaos from outside 
   acknowledged write or not.
 - **The rule.** The takeover records how it went past tolerance with the volume (`TakeoverRecord::past_tolerance`, a
   `TakeoverPastTolerance` of two `RecoveryShortfall`s, appended), and the loss report carries it
-  (`VolumeTakeover::past_tolerance`, a `PastTolerance` of two `Shortfall`s, appended; `CONTRACT` 20):
+  (`VolumeTakeover::past_tolerance`, a `PastTolerance` of two `Shortfall`s, appended; `CONTRACT` 21):
   - `registers`: the head register's first cohort short of its recovery quorum when the round adopted the newest record
     every surviving member of the volume's cohorts held (`Readiness::ReadyPastTolerance`'s `needed` and `members`,
     kept by the round per object and handed to the volume's pending materialization at its adoption);
@@ -25826,6 +25913,6 @@ recorded past tolerance and one within, each volume's status read as its owner),
 (`a_successor_reports_the_loss_window_its_takeover_left`: within tolerance, `None`), and the store-destroyed chaos flow,
 which holds each part of the report to the successor's own past-tolerance counts (the supervisor's run).
 
-Applied in the same change to: §4.12 (the `CONTRACT` 20 status line), GAPS (A-272 (ii)'s entry),
+Applied in the same change to: §4.12 (the `CONTRACT` 21 status line), GAPS (A-272 (ii)'s entry),
 `crates/db/src/catalog.rs`, `crates/ipc/src/protocol.rs`, `crates/server/src/{takeover,state,live_ship,fleet,verbs}.rs`,
 `crates/cli/src/verbs.rs`, `crates/mcp/src/lib.rs`, `crates/api/src/lib.rs`, and the tests named above.

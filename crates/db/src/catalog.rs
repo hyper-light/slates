@@ -947,6 +947,22 @@ pub struct AuditRecord {
   pub manifest: Option<[u8; 32]>,
   /// The terminal state, for `LandingFinished`.
   pub outcome: Option<LandingState>,
+  /// How the landing's signature was judged (signed work, A-321), on a `LandingPlanned` and a `LandingFinished`
+  /// record: the landing's provenance. `None` on every other record, and on a landing that carried no signature.
+  /// Appended.
+  pub signature: Option<SignatureVerdict>,
+}
+
+/// How an act's signature was judged (signed work, A-321), as a record keeps it: the server's verdict
+/// (`slates_server::signed_work`), opaque here, so a record read back reports it as it was judged.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SignatureVerdict {
+  /// The verdict's kind (verified or invalid), as the server numbers it.
+  pub kind: u8,
+  /// The verdict's detail (the signer's key type, or why it did not verify), as the server numbers it.
+  pub detail: u8,
+  /// The signer's key fingerprint (zero for a signature that did not verify).
+  pub fingerprint: [u8; 32],
 }
 
 /// An NFSv4 open held at its file's owner partition (§4.6 A-37): what `slates_bridge_nfs::v4::files`
