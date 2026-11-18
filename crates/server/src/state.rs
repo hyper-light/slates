@@ -652,8 +652,9 @@ pub struct ShardState {
   pub loop_run: u64,
   /// The end of this shard's last round of its clients' loop I/O (their requests read, the replies to them written),
   /// one clock read a round: what judges whether a request continues a closed loop (`verbs::loop_hold`; A-326). Unlike
-  /// `last_work_ns`, the shard's own background work (a destroy's slices, a lease's expiry, a kept forward's retry) and
-  /// a client's acknowledgement never move it, or a paced client's pause would look like a loop's. 0 before the first.
+  /// `last_work_ns`, the shard's own background work (a destroy's slices, a lease's expiry, a kept forward's retry)
+  /// never moves it, nor a client's acknowledgement after a pause, or a paced client's pause would look like a loop's.
+  /// 0 before the first.
   pub last_client_io_ns: u64,
   /// Whether the round now running read a request of a client's loop or wrote a reply to one (`verbs::serve_round`
   /// stamps `last_client_io_ns` at its end when it did; A-326).

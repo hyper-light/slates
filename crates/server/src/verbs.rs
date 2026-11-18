@@ -2303,12 +2303,7 @@ pub fn serve(
       }
     }
   };
-  // A request of the caller's own continues or ends this shard's closed loop (A-326); the client's acknowledgement,
-  // which it sends itself before a request every half ring of replies, is the protocol's and neither.
-  if !matches!(body, RequestBody::Acknowledge { .. }) {
-    state.forward_hold_ns = loop_hold(state, now);
-    state.loop_io = true;
-  }
+  judge_loop_request(state, &body, now);
   // A channel bound to a consumer the human has since revoked refuses every effect (§4.13), before any
   // lookup or mutation, whatever the verb — one local read (the revocation was fanned to this slot).
   if state.clients.get(client).is_ok_and(|slot| slot.revoked) {
@@ -2843,6 +2838,25 @@ fn record_completion_routed(
 
 /// Forwards a volume-bound request to its owner shard: a task there runs the verb on the
 /// owner's state and hands the reply back to this shard's queue (sharing by move both ways).
+/// Judges a request decoded at `now` against this shard's closed loop (§4.7; A-326). A request of the caller's own
+/// continues or ends the loop ([`loop_hold`]), its forward's hold set and its round's loop I/O marked. A client's
+/// acknowledgement, which it sends itself before a request every half ring of replies (§4.9), is the protocol's: it keeps
+/// a loop's clock running when it comes within F of the loop's last I/O and ends a loop it comes after a longer pause,
+/// but never lengthens a run or holds a shard. Skipped altogether, a debug build's acknowledgement ended the loop it
+/// sat in, the next create read more than F after the loop's last I/O (64 to 75 of a loop's 400 forwards unheld,
+/// against 20 to 31); counted as a request, it made a paced client's destroy the third request of a loop, which held
+/// its owner (closed_loop.rs, three runs each, the Mac Studio, 2026-11-18).
+fn judge_loop_request(state: &mut ShardState, body: &RequestBody, now: u64) {
+  if !matches!(body, RequestBody::Acknowledge { .. }) {
+    state.forward_hold_ns = loop_hold(state, now);
+    state.loop_io = true;
+  } else if now.saturating_sub(state.last_client_io_ns) <= crate::config::PROVISION_FLOOR_NS {
+    state.loop_io = true;
+  } else {
+    state.loop_run = 0;
+  }
+}
+
 /// Judges a ring request read at `now` (§4.7; A-326) and returns the idle window a forward made for it holds its owner
 /// open for. The request continues this shard's closed loop when it came within F of the end of the shard's last round
 /// of its clients' loop I/O (their requests read, the replies to them written, never an acknowledgement;
@@ -2857,9 +2871,7 @@ fn record_completion_routed(
 /// judged against the shard's last work, a local destroy's slices made 1 to 3 of 24 paced cycles look like a loop's
 /// (`crates/server/tests/closed_loop.rs`, 2026-11-18). Stamped at a round's start instead of its client I/O's end, a
 /// debug build's round counted toward every think time and left 69 to 83 of a loop's 400 forwards unheld, against 22.
-/// An acknowledgement, which a client sends itself before a request every half ring of replies, counts for neither:
-/// counted, it made a paced client's create and destroy the second and third requests of a loop, and the destroy held
-/// its owner (one hold in each of three runs' 24 paced cycles).
+/// A client's acknowledgement is judged apart ([`judge_loop_request`]).
 pub(crate) fn loop_hold(state: &mut ShardState, now: u64) -> u64 {
   if now.saturating_sub(state.last_client_io_ns) > crate::config::PROVISION_FLOOR_NS {
     state.loop_run = 0;
