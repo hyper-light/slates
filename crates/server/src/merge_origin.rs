@@ -1139,6 +1139,14 @@ impl ReplicaSeed {
     }
     self.held = Some(gather.manifest);
     self.check(state, &mut step.replica, identity)?;
+    // The version's provenance (A-321), as its record carries it: an adopted replica answers it as its owner judged it.
+    if let Some(signature) =
+      ledger_value(state, self.object, step.version).and_then(|value| value.signature)
+    {
+      step
+        .replica
+        .record_signature(step.version, crate::signed_work::adopted(signature));
+    }
     state.count(REPLICA_REBUILT_VERSIONS, 1);
     if step.version >= self.through {
       self.install(state, step.replica);
@@ -1458,6 +1466,7 @@ mod tests {
           uid: 0,
         },
         completion: None,
+        signature: None,
       };
       acceptor
         .accept(&Record {

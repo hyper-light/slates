@@ -138,3 +138,30 @@ export class AsyncClient {
   removeXattr(work: string, path: string, name: string): Promise<void>
   land(volume: string, target: string, snapshot?: number, include?: string[], exclude?: string[], grant?: number): Promise<LandingResult>
 }
+
+/** What `execCommand` takes beside the request (A-370). */
+export interface ExecOptions {
+  /**
+   * The launcher's AppArmor option, off unless `true`: on a host whose AppArmor restricts unprivileged user namespaces
+   * (Ubuntu 24.04 and later), the launcher makes its namespace under slates' AppArmor profile for `program`, which an
+   * administrator loads as root (`apparmorProfile`); off, it never uses that profile.
+   */
+  apparmorProfile?: boolean
+  /** The executable that serves the launcher: `slates` (found on the `PATH`) unless named. */
+  program?: string
+}
+
+/**
+ * The command that runs slates' chosen-path launcher (`slates exec`, §4.6; A-370): `volume` shown at the existing
+ * directory `at` for `command`, in a namespace of its own (Linux), as an argument list for
+ * `child_process.spawn(argv[0], argv.slice(1))`. The launcher finds the volume under `SLATES_ROOT` in the environment it
+ * is given. Throws for an empty command.
+ */
+export function execCommand(volume: string, at: string, command: string[], options?: ExecOptions): string[]
+
+/**
+ * slates' AppArmor profile for `executable`, the absolute real path of the binary that runs the launcher (A-370): the
+ * text an administrator saves under `/etc/apparmor.d` and loads with `apparmor_parser -r`, as root. Throws for a path
+ * the profile cannot name exactly.
+ */
+export function apparmorProfile(executable: string): string

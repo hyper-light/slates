@@ -22290,6 +22290,296 @@ fn a_share_of_a_green_made_after_its_last_version_survives_a_takeover() {
   );
 }
 
+/// The verdict a merge signed by `key` is answered with: verified, naming the key.
+fn verified_by(key: &common::signer::TestSigner) -> slates_ipc::protocol::Verification {
+  slates_ipc::protocol::Verification::Verified {
+    signer: slates_ipc::protocol::Signer {
+      key: slates_ipc::protocol::SignerKey::Ed25519,
+      fingerprint: key.fingerprint(),
+    },
+  }
+}
+
+/// The policy a green requiring signed merges is set to in `a_greens_policy_signers_and_verdicts_survive_its_owner`:
+/// merges at once, landings forbidden, merges signed.
+fn signed_merges_required() -> slates_ipc::protocol::WritePolicy {
+  slates_ipc::protocol::WritePolicy {
+    merge: slates_ipc::protocol::WriteMode::Bypass,
+    land: slates_ipc::protocol::WriteMode::Forbid,
+    require_signed_merges: true,
+  }
+}
+
+/// The policy `a_volumes_policy_and_signers_survive_its_owner` sets: landings forbidden, merges asked.
+fn landings_forbidden() -> slates_ipc::protocol::WritePolicy {
+  slates_ipc::protocol::WritePolicy {
+    merge: slates_ipc::protocol::WriteMode::Ask,
+    land: slates_ipc::protocol::WriteMode::Forbid,
+    require_signed_merges: false,
+  }
+}
+
+/// Trusts `key` on `volume` and sets its write policy to `policy`, as the launcher does under `secret`, each setting
+/// from the version it reads (the signers move it to 1, the policy to 2).
+fn trust_and_set(
+  launcher: &mut slates_client::Client,
+  (secret, volume): (&[u8; 32], VolumeId),
+  key: &common::signer::TestSigner,
+  policy: slates_ipc::protocol::WritePolicy,
+) {
+  let keys = vec![key.public()];
+  let (_, version) = launcher.signers(volume).unwrap();
+  let proof = slates_server::landing::signers_proof(secret, volume, &keys, version);
+  launcher
+    .set_signers(volume, (&keys, version), proof)
+    .unwrap();
+  let subject = slates_ipc::protocol::PolicySubject::Volume { volume };
+  let (_, version) = launcher.policy(subject).unwrap();
+  let proof = slates_server::landing::policy_proof(secret, &subject, &policy, version);
+  launcher
+    .set_policy(subject, (policy, version), proof)
+    .unwrap();
+}
+
+/// `work` edited with `bytes` and merged signed by `key` over its statement; how the merge was answered.
+fn merge_signed(
+  client: &mut slates_client::Client,
+  work: VolumeId,
+  (path, bytes): (&str, &[u8]),
+  key: &common::signer::TestSigner,
+) -> Result<
+  (slates_client::Submitted, slates_ipc::protocol::Verification),
+  slates_client::ClientError,
+> {
+  client.edit(work, path, 0, 0, bytes)?;
+  let statement = client.merge_statement(work, &[])?.statement;
+  client.submit_with_signature(work, &[], Some(&key.sign(&statement)))
+}
+
+/// Whether `daemon` holds `object`'s catalog register naming a write policy and trusted signers.
+fn holds_policy_and_signers(daemon: &Daemon, object: ObjectId) -> bool {
+  daemon
+    .fleet_holder_head(object.catalog())
+    .ok()
+    .flatten()
+    .and_then(|(_, value)| slates_server::catalog::CatalogValue::from_record_bytes(&value))
+    .is_some_and(|catalog| catalog.write.is_some() && !catalog.signers.is_empty())
+}
+
+/// Whether `daemon` holds what a successor needs of a green's signed work: its catalog register naming a policy and
+/// trusted signers, and its newest merge record carrying a verdict.
+fn holds_signed_work(daemon: &Daemon, object: ObjectId) -> bool {
+  let merge = daemon
+    .fleet_holder_head(object)
+    .ok()
+    .flatten()
+    .and_then(|(_, value)| {
+      slates_server::merge_service::MergeRecordValue::from_record_bytes(&value)
+    });
+  holds_policy_and_signers(daemon, object) && merge.is_some_and(|record| record.signature.is_some())
+}
+
+/// What `a_greens_policy_signers_and_verdicts_survive_its_owner` reads on the successor: the green's policy and signers
+/// with their version, version 1's verdict, a new work's unsigned merge and its signed one.
+type SuccessorView = (
+  Result<(Option<slates_ipc::protocol::WritePolicy>, u64), slates_client::ClientError>,
+  Result<(Vec<Vec<u8>>, u64), slates_client::ClientError>,
+  Result<slates_ipc::protocol::Verification, slates_client::ClientError>,
+  Result<
+    (slates_client::Submitted, slates_ipc::protocol::Verification),
+    slates_client::ClientError,
+  >,
+  Result<
+    (slates_client::Submitted, slates_ipc::protocol::Verification),
+    slates_client::ClientError,
+  >,
+);
+
+/// Reads the successor's view of `green` and merges a new work there, unsigned then signed by `key`.
+fn successor_view(
+  instance: &str,
+  green: VolumeId,
+  key: &common::signer::TestSigner,
+) -> SuccessorView {
+  let mut successor = common::client::connect(instance);
+  let policy = successor.policy(slates_ipc::protocol::PolicySubject::Volume { volume: green });
+  let signers = successor.signers(green);
+  let first = successor
+    .merge_record(green, 1)
+    .map(|record| record.verification);
+  let (work, _) = successor.create_work(green, "after-the-takeover").unwrap();
+  successor
+    .edit(work, "after", 0, 0, b"merged on the successor")
+    .unwrap();
+  let unsigned = successor.submit_with_signature(work, &[], None);
+  let statement = successor
+    .merge_statement(work, &[])
+    .map(|stated| stated.statement);
+  let signed = statement
+    .and_then(|statement| successor.submit_with_signature(work, &[], Some(&key.sign(&statement))));
+  (policy, signers, first, unsigned, signed)
+}
+
+/// A-285, A-321 (§4.16 owner-loss recovery): a green's write policy, its trusted signers and its versions' signature
+/// verdicts survive its owner. Do: three nodes at f = 1; on a, a green the launcher sets to trust one key, merge at once
+/// and require signed merges, and a work over it merged at 1 signed by the key; once both survivors hold the green's
+/// catalog register naming the policy and the key and its merge record carrying the verdict, a dies. Expect on the
+/// successor, once it serves version 1: the policy and the signers read back as set, at version 2; version 1's merge
+/// record verified naming the key, as a judged it (never judged again); an unsigned merge from a new work refused
+/// `SignatureRequired` naming the green; and that work signed by the key merged at 2, verified. Before 2026-11-18 the
+/// catalog register carried neither the policy nor the signers and the merge record no verdict, so the successor read
+/// version 1 unsigned, held the green to no policy and merged the unsigned work.
+#[test]
+fn a_greens_policy_signers_and_verdicts_survive_its_owner() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, mut daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let key = common::signer::TestSigner::fresh();
+  let mut client = Client::connect(daemons[0].instance());
+  let (green, work) = green_with_work(&mut client, "signed-green", &daemons);
+  let mut launcher = common::client::connect(daemons[0].instance());
+  let secret = daemons[0].segment().issuer_secret().unwrap();
+  trust_and_set(
+    &mut launcher,
+    (&secret, green),
+    &key,
+    signed_merges_required(),
+  );
+  let merged = merge_signed(
+    &mut launcher,
+    work,
+    ("signed", b"signed on the owner"),
+    &key,
+  );
+  let object = ObjectId(green.bytes);
+  let held = poll_until(&daemons.iter().collect::<Vec<_>>(), SERVE_DEADLINE, || {
+    Ok(
+      daemons[1..]
+        .iter()
+        .all(|daemon| holds_signed_work(daemon, object)),
+    )
+  });
+  drop(launcher);
+  drop(client);
+  daemons.remove(0).stop();
+  let successor_host =
+    rendezvous_first(&[hosts[1], hosts[2]], object).expect("a survivor takes over the green");
+  let successor_index = usize::from(successor_host != hosts[1]);
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let materialized = poll_until(&survivors, PLACEMENT_DEADLINE, || {
+    daemons[successor_index].merge_record_placed(green, 1)
+  });
+  drop(survivors);
+  let view = successor_view(daemons[successor_index].instance(), green, &key);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert_eq!(
+    merged.unwrap(),
+    (slates_client::Submitted::Accepted(1), verified_by(&key))
+  );
+  assert!(
+    held && materialized,
+    "held {held}, materialized {materialized}"
+  );
+  expect_the_successors_view(view, green, &key);
+}
+
+/// A-285, A-321 (§4.8 "Promotion and takeover"): a plain volume's write policy and trusted signers survive its owner, by
+/// its catalog register. Do: three nodes at f = 1; on a, a scratch volume shared with the fleet, the launcher trusting
+/// one key on it and forbidding its landings; once both survivors hold its head and its catalog register naming both,
+/// a dies.
+/// Expect on its successor, once the volume answers there: the policy and the signers read back as set, at version 2,
+/// and a landing refused `PolicyForbids` naming the volume. Before 2026-11-18 the successor made the volume's record with
+/// no policy and no signers: it read back unset and presented the landing as an unset volume's.
+#[test]
+fn a_volumes_policy_and_signers_survive_its_owner() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, mut daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let key = common::signer::TestSigner::fresh();
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id } = client.call(&scratch("policed")) else {
+    panic!("the volume was created");
+  };
+  share_with_fleet(&mut client, id, &daemons);
+  let mut launcher = common::client::connect(daemons[0].instance());
+  let secret = daemons[0].segment().issuer_secret().unwrap();
+  trust_and_set(&mut launcher, (&secret, id), &key, landings_forbidden());
+  let object = ObjectId(id.bytes);
+  let held = poll_until(&daemons.iter().collect::<Vec<_>>(), SERVE_DEADLINE, || {
+    // A takeover adopts the volume's head and its catalog, so both survivors hold each before the owner dies.
+    Ok(daemons[1..].iter().all(|daemon| {
+      holds_policy_and_signers(daemon, object)
+        && daemon
+          .fleet_holder_head(object)
+          .is_ok_and(|head| head.is_some())
+    }))
+  });
+  drop(launcher);
+  drop(client);
+  daemons.remove(0).stop();
+  let successor_host =
+    rendezvous_first(&[hosts[1], hosts[2]], object).expect("a survivor takes over the volume");
+  let successor_instance = daemons[usize::from(successor_host != hosts[1])]
+    .instance()
+    .to_owned();
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let served = poll_status_answers(&survivors, &successor_instance, id);
+  drop(survivors);
+  let mut reader = common::client::connect(&successor_instance);
+  let policy = reader.policy(slates_ipc::protocol::PolicySubject::Volume { volume: id });
+  let signers = reader.signers(id);
+  let landed = reader.land(
+    id,
+    None,
+    "/nonexistent/policed",
+    slates_ipc::protocol::Filter::default(),
+    None,
+  );
+  drop(reader);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(held && served, "held {held}, served {served}");
+  assert_eq!(policy.unwrap(), (Some(landings_forbidden()), 2));
+  assert_eq!(signers.unwrap(), (vec![key.public()], 2));
+  assert!(
+    matches!(
+      &landed,
+      Err(slates_client::ClientError::Refused(slates_ipc::protocol::Refusal::PolicyForbids {
+        act: slates_ipc::protocol::WriteAct::Land,
+        by: slates_ipc::protocol::PolicySubject::Volume { volume },
+      })) if *volume == id
+    ),
+    "{landed:?}"
+  );
+}
+
+/// The successor's view in `a_greens_policy_signers_and_verdicts_survive_its_owner`, as its doc says.
+fn expect_the_successors_view(
+  view: SuccessorView,
+  green: VolumeId,
+  key: &common::signer::TestSigner,
+) {
+  let (policy, signers, first, unsigned, signed) = view;
+  assert_eq!(policy.unwrap(), (Some(signed_merges_required()), 2));
+  assert_eq!(signers.unwrap(), (vec![key.public()], 2));
+  assert_eq!(first.unwrap(), verified_by(key), "version 1 as a judged it");
+  assert!(
+    matches!(
+      &unsigned,
+      Err(slates_client::ClientError::Refused(slates_ipc::protocol::Refusal::SignatureRequired {
+        by: slates_ipc::protocol::PolicySubject::Volume { volume },
+        verification: slates_ipc::protocol::Verification::Unsigned,
+      })) if *volume == green
+    ),
+    "{unsigned:?}"
+  );
+  assert_eq!(
+    signed.unwrap(),
+    (slates_client::Submitted::Accepted(2), verified_by(key))
+  );
+}
+
 /// §4.16 failure matrix ("Green owner loss in a fleet: Degraded for the membership horizon, then Masked after takeover
 /// on a candidate that holds the ledger"; AUD-14; GAP-A9-7's input half; GAPS 2026-11-09): a successor one version
 /// behind the quorum takes the green over. Do: three nodes at `f = 1`; on a, a green advanced to version 2 and recomputed
@@ -25253,6 +25543,7 @@ fn planted_merge_record(anchor: HostId) -> slates_server::merge_service::MergeRe
     },
     // No request made the planted version (A-255's completion key is for a submit's resend).
     completion: None,
+    signature: None,
   }
 }
 
@@ -25279,6 +25570,9 @@ fn plant_taken_over_green(daemon: &Daemon, with_catalog: bool) {
             live_holders: None,
             // A green, not a work's volume (A-255's route is a work's catalog naming its green).
             work_of: None,
+            write: None,
+            write_version: 0,
+            signers: Vec::new(),
           };
           s.pending_catalogs.insert(object, (1, catalog));
           s.placed_heads.insert(
@@ -25726,6 +26020,9 @@ fn plant_work_route(daemon: &Daemon) {
           work_of: Some(slates_db::catalog::VolumeId {
             bytes: PLANTED_GREEN,
           }),
+          write: None,
+          write_version: 0,
+          signers: Vec::new(),
         };
         s.pending_catalogs.insert(work, (1, catalog));
         s.fleet.track_object_owner(work.catalog(), local);

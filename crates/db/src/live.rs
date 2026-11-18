@@ -883,9 +883,10 @@ pub fn adopt_past_tolerance(reports: &[(HostId, Option<Head>)], wait: &[HostId])
 /// ([`Entry::wire_bytes`]; AC-8.9).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Bounds {
-  /// The entries appended and not yet durable, at most, counting the one being appended
-  /// ([`Shipper::append`]); a whole state may go one entry past it ([`Shipper::append_checkpoint`]). One entry is
-  /// admitted whatever its size while nothing is in flight, so zero still lets the log go one entry at a time.
+  /// The deltas appended and not yet durable, at most, counting the one being appended ([`Shipper::append`]); a whole
+  /// state may go one entry past it ([`Shipper::append_checkpoint`]) and is not counted against the deltas behind it
+  /// (A-371). One delta is admitted whatever its size while no delta is in flight, so zero still lets the log go one
+  /// entry at a time.
   pub credit: usize,
   /// The entries retained for laggards, at most; past it the oldest is dropped and a holder that lacks it is installed.
   /// The newest entry is never dropped for size alone, and an entry every holder holds is not kept at all.
@@ -931,12 +932,16 @@ pub struct Shipper {
   holders: Vec<HostId>,
   /// The bytes it holds in flight and retains for laggards ([`Shipper::set_bounds`]).
   bounds: Bounds,
-  /// The entries appended here and not yet durable, oldest first: each one's position and wire bytes. Kept apart from
-  /// `retained`, which a checkpoint past the credit can trim below them, so the credit counts exactly what is in flight.
-  /// Bounded by the credit: at most its bytes plus one whole state ([`Shipper::append_checkpoint`]).
-  unsettled: VecDeque<(u64, usize)>,
+  /// The entries appended here and not yet durable, oldest first: each one's position and wire bytes, and whether it is
+  /// a whole state ([`Shipper::append_checkpoint`]). Kept apart from `retained`, which a checkpoint past the credit can
+  /// trim below them, so the credit counts exactly what is in flight. Bounded: the deltas within the credit, and the
+  /// whole states admitted one past it.
+  unsettled: VecDeque<(u64, usize, bool)>,
   /// The sum of `unsettled`'s bytes.
   unsettled_bytes: usize,
+  /// The sum of the bytes of `unsettled`'s whole states: a whole state rides one past the credit, so the credit a delta
+  /// is held to counts the rest alone (A-371).
+  unsettled_whole_bytes: usize,
   /// The head the owner started from (a takeover's adopted head), which it holds and every holder may report.
   start: Option<Head>,
   /// The position its first entry takes when it has no `start`: 0 for a new log, and for an owner restarted over its
@@ -988,6 +993,7 @@ impl Shipper {
       bounds,
       unsettled: VecDeque::new(),
       unsettled_bytes: 0,
+      unsettled_whole_bytes: 0,
       start,
       first: 0,
       head: start,
@@ -1209,7 +1215,8 @@ impl Shipper {
     .max()
   }
 
-  /// The wire bytes of the entries appended here that are not yet durable: what [`Bounds::credit`] holds.
+  /// The wire bytes of the entries appended here that are not yet durable, whole states included: [`Bounds::credit`]
+  /// holds the deltas among them, and a whole state is admitted only while all of them are within it.
   pub fn in_flight_bytes(&self) -> usize {
     self.unsettled_bytes
   }
@@ -1220,17 +1227,24 @@ impl Shipper {
   }
 
   /// Appends the next publication to the chain: the entry to send to every holder. Refused [`LiveError::NoCredit`]
-  /// when entries are in flight and their bytes with this one's would pass [`Bounds::credit`]; the writer waits for
-  /// acknowledgements (AC-8.9). With nothing in flight it is admitted whatever its size, so the log always moves.
+  /// when deltas are in flight and their bytes with this one's would pass [`Bounds::credit`]; the writer waits for
+  /// acknowledgements (AC-8.9). A whole state in flight is not counted: it rides one past the credit
+  /// ([`Shipper::append_checkpoint`], A-371). With no delta in flight it is admitted whatever its size, so the log always
+  /// moves.
   pub fn append(&mut self, payload: Vec<u8>) -> Result<Entry, LiveError> {
     let bytes = ENTRY_PREFIX_BYTES.saturating_add(payload.len());
-    if !self.unsettled.is_empty() && self.unsettled_bytes.saturating_add(bytes) > self.bounds.credit
-    {
+    // The deltas in flight, a whole state's bytes left out: a whole state rides one past the credit (A-371). Counted
+    // with it, the whole entry the daemon has just appended filled the credit it sets from that entry's size, and every
+    // delta after it was refused until the whole state was durable.
+    let deltas = self
+      .unsettled_bytes
+      .saturating_sub(self.unsettled_whole_bytes);
+    if deltas > 0 && deltas.saturating_add(bytes) > self.bounds.credit {
       return Err(LiveError::NoCredit {
         durable: self.durable,
       });
     }
-    self.append_unchecked(payload)
+    self.append_unchecked(payload, false)
   }
 
   /// Whether a whole state would be admitted now ([`Shipper::append_checkpoint`]): what is in flight is within the
@@ -1250,10 +1264,11 @@ impl Shipper {
         durable: self.durable,
       });
     }
-    self.append_unchecked(payload)
+    self.append_unchecked(payload, true)
   }
 
-  fn append_unchecked(&mut self, payload: Vec<u8>) -> Result<Entry, LiveError> {
+  /// Appends `payload` at the next position, kept unsettled as a whole state when `whole`.
+  fn append_unchecked(&mut self, payload: Vec<u8>, whole: bool) -> Result<Entry, LiveError> {
     let (position, previous) = match self.head {
       Some(head) => (
         head.position.checked_add(1).ok_or(LiveError::Malformed)?,
@@ -1271,8 +1286,11 @@ impl Shipper {
     };
     self.head = Some(entry.head());
     let bytes = entry.wire_bytes();
-    self.unsettled.push_back((position, bytes));
+    self.unsettled.push_back((position, bytes, whole));
     self.unsettled_bytes = self.unsettled_bytes.saturating_add(bytes);
+    if whole {
+      self.unsettled_whole_bytes = self.unsettled_whole_bytes.saturating_add(bytes);
+    }
     self.retained.push_back(entry.clone());
     self.trim();
     self.refresh_durable();
@@ -1285,12 +1303,15 @@ impl Shipper {
     let Some(floor) = self.settled_through() else {
       return;
     };
-    while let Some((position, bytes)) = self.unsettled.front().copied() {
+    while let Some((position, bytes, whole)) = self.unsettled.front().copied() {
       if position > floor {
         break;
       }
       self.unsettled.pop_front();
       self.unsettled_bytes = self.unsettled_bytes.saturating_sub(bytes);
+      if whole {
+        self.unsettled_whole_bytes = self.unsettled_whole_bytes.saturating_sub(bytes);
+      }
     }
   }
 
