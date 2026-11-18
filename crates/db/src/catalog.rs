@@ -931,6 +931,16 @@ pub enum AuditKind {
   GrantExpired,
 }
 
+/// What the control partition has appended of one partition's owed audit records (A-265's crossing): every record that
+/// partition owed before crossing sequence `through` is in the audit, so a batch sent again appends only what is new.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuditReceivedMark {
+  /// The partition that owed the records.
+  pub origin: u16,
+  /// The crossing sequence of the first record from `origin` not yet appended.
+  pub through: u64,
+}
+
 /// One audit record; content-free except the manifest hash.
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 pub struct AuditRecord {

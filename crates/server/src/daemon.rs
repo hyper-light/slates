@@ -2882,6 +2882,30 @@ impl Daemon {
     Ok(())
   }
 
+  /// Test support: while `withhold` is set, no shard sends the control partition what it owes the audit (A-265's
+  /// crossing; `LandingState::crossing_withheld`): an owed record stays between its atom's commit and its batch, where a
+  /// daemon that died used to lose it. A daemon started over the same anchor sends it from its recovered outbox.
+  /// Delivered like [`Self::withhold_shards_replies`]; `Ok` once installed, else the typed refusal.
+  pub fn withhold_audit_crossing(&self, withhold: bool) -> Result<(), ObserveError> {
+    for shard in self.shards.iter().copied() {
+      self.observe(Some(shard), move |s| s.landing.crossing_withheld = withhold)?;
+    }
+    Ok(())
+  }
+
+  /// Test support: while `withhold` is set, no shard records the control partition's acknowledgement of its appended
+  /// audit records (A-265; `LandingState::acknowledgement_withheld`), as if each were lost: the outbox keeps them, and
+  /// the reap tick sends them again, which the control partition must append nothing twice of. Delivered like
+  /// [`Self::withhold_audit_crossing`]; `Ok` once installed, else the typed refusal.
+  pub fn withhold_audit_acknowledgement(&self, withhold: bool) -> Result<(), ObserveError> {
+    for shard in self.shards.iter().copied() {
+      self.observe(Some(shard), move |s| {
+        s.landing.acknowledgement_withheld = withhold;
+      })?;
+    }
+    Ok(())
+  }
+
   /// Test support: the quantum the record period's live slices are cut by on every shard (`live_ship::period_slice`), and
   /// a returned holder's walk's turns (`live_ship::reached_slice`), in place of the shard's own step quantum; `None` gives
   /// the shard its own back. Zero ends each slice after one volume, so
@@ -4707,6 +4731,9 @@ async fn reap_loop() {
       let _ = verbs::step_destroys(s);
       // A grant past its term leaves the tables (A-266); its history is the audit log.
       crate::landing::end_expired_grants(s);
+      // What this shard owes the audit and was not acknowledged a tick ago is sent again (A-265): a batch lost to a
+      // crash, a restart or an unanswered wait reaches the control partition, which appends nothing twice.
+      crate::landing::resend_stuck_audit(s);
     });
     // Another host's attachments end once the fleet no longer counts that host a member (A-222; control shard).
     crate::remote_attach::sweep_departed().await;

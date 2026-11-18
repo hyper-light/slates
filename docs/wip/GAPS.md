@@ -1225,9 +1225,15 @@
 >   found every record numbered 0, the audit unbounded in memory and snapshots, and each shard keeping its own, a client
 >   reading its own shard's alone. Now numbered in `apply`, a derived window kept (`table_bytes / size_of::<AuditRecord>()`,
 >   the oldest dropped and counted; the operator horizon waits for a measured landing rate), the unwritten audit ring
->   removed, every record held by the control shard's partition, and the read paged. **Open:** a record made on another
->   shard reaches the control partition after its own atom commits, so a crash between the two loses that batch
+>   removed, every record held by the control shard's partition, and the read paged
 >   (`docs/bugs/2026-11-08-the-audit-numbered-nothing-and-kept-everything.md`).
+>   - **A record owed across shards survives a crash: fixed (2026-11-18, goal g247; AC-2.10).** A record made on
+>     another shard reached the control partition after its own atom committed, so a crash between the two lost that
+>     batch. It is now owed in its atom (the partition's outbox), sent from the oldest owed until the control shard's
+>     acknowledgement is recorded, sent again by the reap tick when it was not, and appended once however often it is
+>     sent (a per-partition mark the batch's own record moves). Anchor layout version 10. Tests:
+>     `crates/db/tests/audit.rs`, `crates/server/tests/audit_crossing.rs`
+>     (`docs/bugs/2026-11-18-an-audit-record-owed-across-shards-was-lost-to-a-crash.md`).
 > - **`grants`: paged, and the table holds live grants (A-266, 2026-11-08).** Refused between 25 and 50 grants; paging
 >   it found every grant kept for the daemon's life and none ended at its term. Now paged in grant-id order, a grant
 >   leaves the table at its terminal step (its history is the audit), the reap ends grants past their term, and a
