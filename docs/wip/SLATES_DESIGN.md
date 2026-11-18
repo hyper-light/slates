@@ -30411,3 +30411,22 @@ no new contract number); `unsafe-budget.toml` (`slates-ipc` 139 → 140); and:
 
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class A, AUD-29-84's line), `crates/server/src/
 {told,state,daemon,virtiofs,verbs}.rs`.
+
+### A-434 — A work's verb held for its quorum commit, or for its work's route, waits the failover delay, a held reply's total (2026-11-18, built for goal g255; R3's class B; AUD-11, A-247, A-298, A-354, A-363, A-375)
+- **What was there.** A work's verb whose verdict its green's owner takes to answer at its quorum commit (AUD-11), or
+  that waits for its work's route to commit (A-298), was held up to the owner lease's bound (`lease::lease_bound_ns`,
+  the membership horizon less its clock tolerance, about 0.9 s), then answered `Overloaded`, unrecorded, for its retry
+  to run it again. That bound is the one a verb waits for its own owner lease to confirm (`lease_wait`); a commit at
+  the quorum is not a lease's confirmation: when a holder is lost it waits for the fleet to fail over, which the
+  failover delay bounds (A-363), so a verb given up at the lease's bound came back to wait again, once a lease bound
+  for as long as the failover took.
+- **The rule.** Such a verb is held at most the node's failover delay (`work_home::park_bound_ns`, the fanned
+  `ShardState::failover_ns`), a held reply's total (A-354, A-375, the durable spans `live_ship` reads): the most any
+  reply waits for a commit to be durable, one number for both. A batch of asks to the owner keeps the lease's bound as
+  its first window, judged in the owner's own time past it (A-426).
+- **Test.** `a_verb_held_for_its_quorum_commit_waits_the_failover_delay` (`crates/server/src/work_home.rs`): on a shard
+  whose failover delay is held at three lease bounds, a verb deferred for its quorum commit is still held a lease bound
+  after its deferral and released at the failover delay.
+  EVIDENCE_PLACEHOLDER
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class A), `crates/server/src/work_home.rs`.

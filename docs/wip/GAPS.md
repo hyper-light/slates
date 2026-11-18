@@ -3673,9 +3673,10 @@
 >   every step, and the owner's answer by `within_shard_time`: `xshard::given_room_in_shard_time`,
 >   `call_in_shard_time_given_room`, `a_part_waits_for_room_while_its_target_steps`); AC-3.3's told wait (A-431: half a
 >   window on the wall; now learned, the tail of the told waits the shard measured plus a liveness window, backed off
->   after an overdue wait up to the failover delay, `told::bound_ns`). Owed in class A: the park bound of a verb waiting
->   on a green's owner (`work_home`, the lease bound on the wall), and the 25 `xshard::call_within`/`task_within` sites
->   on the wall (g251's since 2026-11-18). Class B (the
+>   after an overdue wait up to the failover delay, `told::bound_ns`); and a work's verb held for its quorum commit or its
+>   route (A-434: the owner lease's bound, about 0.9 s; now the failover delay, a held reply's total, A-354/A-375,
+>   `work_home::park_bound_ns`). Owed in class A: the 25 `xshard::call_within`/`task_within` sites on the wall (g251's
+>   since 2026-11-18). Class B (the
 >   transport's round-trip estimate) is open, but for the forward lane's stall (2026-11-18, A-315, goal g255): a batch
 >   quiet for its budget is given up only once a turn of its lane begun after the silence was seen has read the
 >   session's own socket empty, or found no session at all, so an origin kept off its CPU reads its owner's replies
