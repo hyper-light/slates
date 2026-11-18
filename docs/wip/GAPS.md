@@ -3840,7 +3840,17 @@
 >   process handle in one wait), and on macOS, whose reply wake (the wake word) no wait takes beside a descriptor or a
 >   process, looked at on A-443's doubling from twice the longer of the first park and the wake estimate
 >   (`a_reply_after_the_old_reply_deadline_is_taken_while_its_daemon_lives`,
->   `a_daemons_departure_ends_the_wait_before_the_old_reply_deadline`). Owed in C-b: the reply deadline's other users,
+>   `a_daemons_departure_ends_the_wait_before_the_old_reply_deadline`). Fixed the same day: those looks asked the
+>   process's exit alone, so on macOS and Windows a call across a daemon restarted inside its own process (the in-process
+>   test daemons, an embedding) waited forever; every look asks the start stamp too, and Windows' wait takes the looks'
+>   timeout (`a_daemon_restarted_inside_its_own_process_ends_the_wait`;
+>   `docs/bugs/2026-11-18-a-reply-wait-across-a-restart-inside-the-daemons-process-never-ended.md`); A-447's Windows
+>   claim had the same blind spot and now reads the start stamp it began under. `CLAIM_WAIT_NS` (a second, W restated
+>   in slates-ipc, which sits below the crates that define it) still has users, each a fixed second R3 forbids and owed
+>   here: the Linux daemon's wait for a client's opening; the macOS and Windows daemon's reclaim of a claim slot a party
+>   left (twice it); a Windows claim's wait under a live anchor (at least it; A-468 replaces it with the anchor's
+>   life); one more of it for a claim the daemon took to answer; and the async connect's pacing (a tenth of it,
+>   `Connecting::next_poll_ns`). Owed in C-b: the reply deadline's other users,
 >   each a wait that cannot see the departure yet: the async driver's tick (the SDK loops poll only the completion
 >   descriptor; Linux's control socket, macOS's exit-watch kqueue and, on Windows, the bridge thread waiting beside the
 >   process handle could each tell the loop), the wait for a slot on a full ring (a slot that frees wakes nothing), a

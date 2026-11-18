@@ -5038,8 +5038,9 @@ slots alternate park by park, A-199), set `parked` to that slot's value (1 or 2)
 (`SeqCst`; the park protocol, A-44), re-check the reply (to close the race), and wait on the wake word
 (futex / `os_sync_wait_on_address(SHARED)` / the Event). A call that waits while its daemon lives waits on the daemon's
 departure beside its reply (A-456): Linux polls the completion eventfd and the control socket instead of the futex,
-Windows waits on the Event and the daemon's process handle together, and macOS keeps the word, looking at the daemon's
-exit watch on a doubling schedule. Daemon: after writing a reply and advancing
+Windows waits on the Event and the daemon's process handle together, and macOS keeps the word; both look at the
+daemon's liveness (its exit watch and the instance's start stamp) on a doubling schedule, since a daemon restarted
+inside its own process changes only the stamp. Daemon: after writing a reply and advancing
 the wake word, fence and read `parked`; if set, advance the word once more, stamp the host clock into
 the `reply_stamp` slot the flag's value names (the first reply of the park only), wake (futex wake / wake by address / `SetEvent`),
 mark that stamp confirmed when the wake reports it found a sleeper (Linux and macOS; Windows' Event
@@ -5169,8 +5170,12 @@ drops.
 > descriptor or a process, so there the park looks at the daemon's exit watch on A-443's doubling: the first look once
 > the wait has lasted twice the longer of the time waited at its first park and the client's wake estimate (a look
 > costs a park's timeout and a wake), each later look at twice the time waited. The looks cost the logarithm of the
-> wait, and a departure is seen within the time waited. The departure is the process's end alone (the socket's close,
-> the exit watch), never the bootstrap object, which a live daemon need not hold to answer its ring. A Linux park on a
+> wait, and a departure is seen within the time waited. A departure is the daemon's going: on Linux its control
+> socket's close (its process's end, or a stop inside the process); on macOS and Windows its process's exit, or a new
+> start stamp in the instance's bootstrap object, which a daemon restarted inside its own process changes and nothing
+> else. So Windows' wait takes the doubling looks' timeout too, and every look asks both (fixed the same day: the first
+> form asked the process alone, and a call across a restart inside the daemon's process waited forever on macOS and
+> Windows; `docs/bugs/2026-11-18-a-reply-wait-across-a-restart-inside-the-daemons-process-never-ended.md`). A Linux park on a
 > descriptor is never confirmed by the daemon's futex wake, so the client judges its own sleep by its voluntary
 > switches (`getrusage(RUSAGE_THREAD)`, `slates_machine::switches`), as Windows' parks do, and its wake estimate still
 > learns. While a Linux completion bridge runs (Node's adopted descriptor), the park waits on the bridge's pipe, the
@@ -31999,12 +32004,11 @@ Applied in the same change to: §2.5 (the graceful stop's status), §4.14 (a sta
   back as it ends, so the async loop still learns of replies the synchronous wait drained past it). Windows: one
   `WaitForMultipleObjects` on the region's Event and the daemon's process handle (`Event::wait_or_exit` now reports
   which ended the wait). macOS: the wake word's wait (`os_sync_wait_on_address`, which no wait takes beside a
-  descriptor or a process) until the next look at the daemon's exit watch; the first look once the wait has lasted
+  descriptor or a process) until the next look at the daemon's liveness; the first look once the wait has lasted
   twice the longer of the time waited at its first park and the wake estimate (a look costs a park's timeout and a
-  wake), each later one at twice the time waited (`Looks`). The departure is the process's end alone
-  (`Liveness::departed`: the socket's close, the exit watch), not `daemon_gone`'s bootstrap stamp, since a live daemon
-  answers its ring whoever holds the instance's name. `Client::round_trip` waits with it and reconnects at `Departed`;
-  `ClientEnd::wait(deadline)` is unchanged.
+  wake), each later one at twice the time waited (`Looks`). `Client::round_trip` waits with it and reconnects at
+  `Departed`; `ClientEnd::wait(deadline)` is unchanged. (As first landed, a look asked the process's exit alone; the
+  fix below.)
 - **The wake estimate keeps learning.** The daemon's futex wake never finds a Linux park on a descriptor asleep, so its
   stamp is never confirmed; a park now carries its own rule (`Parked::waker_confirms`) and a Linux departure park, like
   every Windows park, is judged by the client's own switch count across the wait. `slates_machine::switches` gains
@@ -32033,6 +32037,27 @@ Applied in the same change to: §2.5 (the graceful stop's status), §4.14 (a sta
 Applied in the same change to: §4.7 ("Wake strategy", the A-232 status's successor), GAPS (the `LIVENESS_BUDGET_NS`
 entry's class C), `crates/ipc/src/{endpoint,rendezvous,wake,region,completion,lib}.rs`, `crates/machine/src/switches.rs`,
 `crates/client/src/client.rs`, `crates/api/src/lib.rs` (the deadlines' doc), `unsafe-budget.toml`.
+
+- **Fixed the same day: a restart inside the daemon's process went unseen on macOS and Windows.** As first landed, the
+  departure was the daemon process's end alone (`Liveness::departed`: the exit watch on macOS and Windows), and the
+  bootstrap object's start stamp was not read. A daemon stopped and started again inside one process (the client and
+  server tests' in-process daemons; an embedding that restarts its daemon) changes only the stamp, so a synchronous call
+  sent across such a restart waited forever on macOS and Windows; Linux's control socket closes at the stop. Now each
+  look asks `Liveness::daemon_gone` (the exit watch, and the stamp), as before A-456, and Windows' wait on the Event and
+  the process handle ends at the next look too (`Event::wait_or_exit` takes a timeout and answers `EventOrExit`), so a
+  process's exit still ends it at once. `Liveness::departed` is gone. Test:
+  `endpoint::departure::a_daemon_restarted_inside_its_own_process_ends_the_wait` (macOS, Windows: a daemon of the test's
+  own process restarted a quarter second into the wait; red with the exit-only look put back, where the wait missed the
+  restart and ended only at the reply the test sends on the old ring two seconds on); the real-process restart of
+  `crates/client/tests/client.rs`, `a_session_outlives_a_daemon_restart_and_its_retry_meets_the_completion_record`, hung
+  on main (a 150 s alarm ended it) and passes on the fix in 0.82 s (Mac Studio; the bug record holds the runs). The same blind spot sat in A-447's Windows claim: an
+  unanchored claim judged its daemon by its process alone, so a claim on a daemon stopped inside its own process
+  waited forever, and the rendezvous file's `a_claim_is_polled_without_waiting_and_refused_once_its_daemon_is_gone`
+  could not end on Windows. That claim now reads the start stamp it began under at each poll (the stopped daemon takes
+  it back), and its blocking wait looks again as long after as it has waited. Record:
+  `docs/bugs/2026-11-18-a-reply-wait-across-a-restart-inside-the-daemons-process-never-ended.md`. Fix applied to:
+  `crates/ipc/src/{endpoint,rendezvous,wake,region}.rs`, `crates/ipc/tests/rendezvous.rs`, §4.7 (the status and "Wake
+  strategy"), GAPS.
 
 ### A-466 — A captured clone's replacement keeps an outsider's mode change it did not make: its metadata judged field by field beside its bytes (2026-11-18, g085; A-291, A-458, D-27)
 Applied in the same change to: §4.15 step 4 (the replacement's metadata rule), A-458 (its sibling, fixed), GAPS (A-185's

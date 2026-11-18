@@ -279,48 +279,22 @@ fn poll_bound() -> Duration {
   Duration::from_nanos(CLAIM_WAIT_NS / 10)
 }
 
-/// AUD-29-19 (§4.7 "Rendezvous", R6), A-443: a connect never holds its caller, and a claim ends with its daemon. Do:
-/// open a daemon end that does not accept, begin a claim on it with no restart bound and poll it through a claim wait,
-/// timing every poll; let the daemon end go and poll the claim until it ends; then open a daemon end again, begin a
-/// second claim and let it accept while the claim is polled. Expect: every poll returns at once (within
+/// AUD-29-19 (§4.7 "Rendezvous", R6), A-443, A-447: a connect never holds its caller, and a claim ends with its daemon.
+/// Do: open a daemon end that does not accept, begin a claim on it with no restart bound and poll it through a claim
+/// wait, timing every poll; let the daemon end go and poll the claim until it ends; then open a daemon end again, begin
+/// a second claim and let it accept while the claim is polled. Expect: every poll returns at once (within
 /// [`poll_bound`]) and the claim is polled more than once (non-vacuous: its answer was outstanding); the unanswered
-/// claim refused `DaemonUnavailable` once its daemon end has gone, still due before it on Linux and macOS (it waits
-/// while its daemon lives; Windows still refuses at the claim wait, A-443's owed item); the second claim connected once
-/// the daemon answered it. Before AUD-29-19 the connect waited for the answer inside one call; before A-443 the claim
-/// was refused at the claim wait with its daemon alive.
+/// claim still due before the daemon end goes, on every platform (it waits while its daemon lives), and refused
+/// `DaemonUnavailable` once it has gone (on Windows by the start stamp the stopped daemon end takes back, its process
+/// being this one); the second claim connected once the daemon answered it. Before AUD-29-19 the connect waited for the
+/// answer inside one call; before A-443 the claim was refused at the claim wait with its daemon alive.
 #[test]
 fn a_claim_is_polled_without_waiting_and_refused_once_its_daemon_is_gone() {
   toy_seal::install();
   let instance = format!("test-claim-{}", std::process::id());
   let listener = Listener::open(&instance, None).unwrap();
   let mut claim = begin_connect_as(&instance, 0, 0).unwrap();
-  let started = Instant::now();
-  let mut polls = 0u64;
-  let mut longest = Longest::default();
-  // Through a claim wait, polled at once each time: due all the while on Linux and macOS, where a claim waits while its
-  // daemon lives.
-  while started.elapsed() < Duration::from_nanos(CLAIM_WAIT_NS) {
-    let at = Instant::now();
-    let switches = slates_machine::bench::involuntary_switches();
-    let polled = claim.poll();
-    longest.note(
-      at.elapsed(),
-      slates_machine::bench::involuntary_switches_since(switches),
-    );
-    polls += 1;
-    match polled {
-      Ok(None) => std::hint::spin_loop(),
-      Ok(Some(_)) => panic!("no daemon answered the claim"),
-      Err(refusal) => {
-        assert!(
-          cfg!(windows),
-          "refused with its daemon alive, {:?} after its start: {refusal:?}",
-          started.elapsed()
-        );
-        break;
-      }
-    }
-  }
+  let (mut polls, longest) = poll_through_a_claim_wait(&mut claim);
   drop(listener);
   let (refusal, more, gone_longest) = poll_until_refused(claim);
   polls += more;
@@ -360,6 +334,33 @@ fn a_claim_is_polled_without_waiting_and_refused_once_its_daemon_is_gone() {
       ),
     }
   }
+}
+
+/// Polls `claim` through a claim wait, at once each time, timing every poll: the polls made and the longest. The claim
+/// is due all the while, since a claim waits while its daemon lives (A-443, A-447); any end fails the test.
+fn poll_through_a_claim_wait(claim: &mut slates_ipc::Claim) -> (u64, Longest) {
+  let started = Instant::now();
+  let mut polls = 0u64;
+  let mut longest = Longest::default();
+  while started.elapsed() < Duration::from_nanos(CLAIM_WAIT_NS) {
+    let at = Instant::now();
+    let switches = slates_machine::bench::involuntary_switches();
+    let polled = claim.poll();
+    longest.note(
+      at.elapsed(),
+      slates_machine::bench::involuntary_switches_since(switches),
+    );
+    polls += 1;
+    match polled {
+      Ok(None) => std::hint::spin_loop(),
+      Ok(Some(_)) => panic!("no daemon answered the claim"),
+      Err(refusal) => panic!(
+        "refused with its daemon alive, {:?} after its start: {refusal:?}",
+        started.elapsed()
+      ),
+    }
+  }
+  (polls, longest)
 }
 
 /// Polls `claim` until it ends, which must be a refusal: the refusal, the polls made, the longest poll.
