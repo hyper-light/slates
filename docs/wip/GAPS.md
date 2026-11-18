@@ -1233,24 +1233,20 @@
 >   owner's client waits up to the SLO where it was refused after about 1 s); and the seal's hedge compared two clocks
 >   (`docs/bugs/2026-11-08-a-seals-hedge-compared-two-clocks.md`). C+D (A-232): the client's part is done, since a call
 >   waits while its daemon lives (2026-11-14, `docs/bugs/2026-11-13-a-live-starved-daemons-call-was-failed-stalled.md`);
->   the forward lane's stall budget is done (below); the window itself, `W`, is still a fixed budget (R3 debt). Found on
+>   the forward lane's stall budget is open (below); the window itself, `W`, is still a fixed budget (R3 debt). Found on
 >   the way: a Windows channel (a `Sid`) can never attest a consumer (`verify_attestation` takes a uid only), and two
 >   server unit tests of landing fail on Windows, where CI does not run them. Record: `docs/bugs/2026-11-06-a-cross-shard-wait-lost-a-starved-shards-answer.md`.
->   **C+D, done for the forward lane's stall budget (2026-11-09, loadtest-scale, on the supervisor's ruling):** a
->   forward batch's quiet was the wall clock on the origin's control shard, so a starved origin gave up its forwards to
->   a live owner (clients' false-death runs: 20 to 25 given up against 2 begun, refused after 10 to 12 s). It is now
->   counted on the lane's poll clock, credited by the driver's turns, each up to the larger of a pace and the CPU its
->   shard ran, so a starved shard is told from an idle or a busy one; the wall still bounds it at the failover SLO
->   (`forward_lane::Quiet`). `a_starved_origin_keeps_its_forward_to_a_live_owner`, b's control
->   shard at nice 19 beside two spinners: main gave up 2 to 1,208 batches in 6 of 6 runs, the fix none
->   (`docs/bugs/2026-11-09-a-starved-origin-gave-up-its-forwards-to-a-live-owner.md`). The two C+D items this
->   paragraph left open are closed in the same stack (B13): the client's own reply deadline by A-232, and the location
->   budget's wall by clients' polls (`verbs::LOCATION_POLLS`, above).
->   Its cost, about 60 ms at the median on a deaf session's first answer (142 against 84 ms), is in BENCHMARKS beside the
->   A/B. **Unexplained, kept open:** one run of the dead-session test missed its 1.1 s bound at 1.33 s (adacachy2, load
->   41, `2577aa61` with an uncommitted diagnostic: a probe client's 20 s Status read through b, issued just after the
->   deafness, its test thread blocked in it). The other 4 runs with that probe answered in 118 to 198 ms, and 6 runs
->   without it in 60 to 205 ms. Not reproduced; a recurrence in a gate run is the data point to chase.
+>   **C+D, the forward lane's stall budget: open (2026-11-18).** A forward batch's quiet is the wall clock on the
+>   origin's control shard, so a starved origin gives up its forwards to a live owner (clients' false-death runs: 20 to
+>   25 given up against 2 begun, refused after 10 to 12 s). loadtest-scale's fix (`agents/loadtest-scale-spin`,
+>   6da9670d: the lane's poll clock, credited a turn up to the larger of a pace and its shard's CPU) passed every Linux
+>   and macOS run but was taken out of the B13 stack before main: on windows-latest
+>   `a_starved_origin_keeps_its_forward_to_a_live_owner` failed 5 of 5 and the older
+>   `an_unanswered_forward_is_sent_again_within_the_takeover_bound` failed every logged run with it, and 5 of 5 passed
+>   without it (diag-b13-bisect-a run 44230887960, -b run 44230858190; both Windows lanes in diag-b13-1). Unmeasured
+>   reading: a 10 ms pace's wait lasts a timer tick, about 15.6 ms, on Windows, and a thread's CPU time moves in ticks,
+>   so an idle shard's lane clock runs slow. The other C+D items are closed in B13: the client's own reply deadline by
+>   A-232, and the location budget's wall by clients' polls (`verbs::LOCATION_POLLS`, above).
 
 > **A-190's purge client leaves the daemon's process (2026-11-06, fixed); the sweep for the rest (open).** No daemon
 > thread opens a path on a volume the daemon serves (§4.6). The coherent purge's opens, writes and reads now run in a
