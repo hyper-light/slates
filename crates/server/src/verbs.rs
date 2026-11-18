@@ -11783,16 +11783,20 @@ pub(crate) fn materialize_taken_over(
       // A refusal names what the shard could admit now, the pool's free extents included: the arena claims nothing
       // for a restore the pool cannot cover (A-98), so the budget alone names only what the shard already holds.
       let room = volume_cap.min(state.store.admittable());
-      Some(
-        slates_archive::restore(archive, restore_budget).map_err(|e| match e {
-          slates_archive::ArchiveError::OverBudget { .. } => {
-            refused(Refusal::BudgetExceeded { available: room })
-          }
-          other => refused(Refusal::BadRequest {
-            reason: format!("taken-over content archive: {other}"),
-          }),
-        })?,
-      )
+      let diag_r0 = std::time::Instant::now();
+      let diag_restored = slates_archive::restore(archive, restore_budget);
+      eprintln!(
+        "DIAG materialize_taken_over: restore {:?}",
+        diag_r0.elapsed()
+      );
+      Some(diag_restored.map_err(|e| match e {
+        slates_archive::ArchiveError::OverBudget { .. } => {
+          refused(Refusal::BudgetExceeded { available: room })
+        }
+        other => refused(Refusal::BadRequest {
+          reason: format!("taken-over content archive: {other}"),
+        }),
+      })?)
     }
     None => None,
   };
@@ -11894,9 +11898,15 @@ pub(crate) fn materialize_taken_over(
       refusal_of_vfs(&e),
     )));
   }
-  if let Some(restored) = &restored
-    && let Err(e) = populate_restored(&mut state.store, &mut volume, restored)
-  {
+  let diag_p0 = std::time::Instant::now();
+  let diag_populated = restored
+    .as_ref()
+    .map(|restored| populate_restored(&mut state.store, &mut volume, restored));
+  eprintln!(
+    "DIAG materialize_taken_over: populate {:?}",
+    diag_p0.elapsed()
+  );
+  if let Some(Err(e)) = diag_populated {
     let discarded = volume.discard_partial(&mut state.store);
     count_kept(state, VOLUME_DISCARD_REFUSED, discarded);
     return Err(Box::new(give_back(
@@ -14037,7 +14047,10 @@ pub fn publish_shard(state: &mut ShardState) -> Result<Published, slates_vfs::Vf
   // The blocks this publication may name, recorded before any is imaged: until it commits or is abandoned, a free
   // of one is deferred, so the committed image never names a reused block (A-64). Settled here on every outcome.
   state.store.content.arena_mut().capture();
+  let diag_t0 = std::time::Instant::now();
+  let diag_checkpoint = state.journal.wants_checkpoint();
   let outcome = publish_captured(state);
+  let diag_t1 = diag_t0.elapsed();
   match outcome {
     Ok(_) => {
       // Every volume the publication recorded has its ceiling raised (`Volume::mark_published`, A-150); a volume still
@@ -14045,6 +14058,13 @@ pub fn publish_shard(state: &mut ShardState) -> Result<Published, slates_vfs::Vf
       state.store.counters_low = false;
       state.store.content.arena_mut().commit_capture();
       crate::live_ship::ship_captured(state);
+      let diag_t2 = diag_t0.elapsed();
+      if diag_t2 > std::time::Duration::from_millis(50) {
+        eprintln!(
+          "DIAG publish_shard: captured (checkpoint wanted {diag_checkpoint}) {diag_t1:?}, ship_captured {:?}",
+          diag_t2.saturating_sub(diag_t1)
+        );
+      }
       // The committed image names no block of a wholly free extent, and no deferred free holds one: it goes back to
       // the pool for any shard to claim (A-98).
       state.store.release_idle();
