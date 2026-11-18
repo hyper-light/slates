@@ -19,6 +19,20 @@
 > the cell's record (`native-windows-winfsp.workloads.json`, still the owed skip of 2026-11-05) is re-recorded from it;
 > the roster's other workloads (cargo, npm, python, rg, rsync, sqlite, editor, watcher) are owed a Windows form.
 
+> **The WinFsp drive declares a folding volume case-sensitive (found 2026-11-17 reading WinFsp v2.1's source for
+> A-300; open, Windows-only, no drive test yet).** The mount sets `CaseSensitiveSearch` (and `CasePreservedNames`) for
+> every volume (`crates/bridge-winfsp/src/host.rs`, the mount's `params.flags`), while a volume made with `--fold`
+> (`NamePolicy::Fold`) folds names in its own look-ups. WinFsp's driver keys its open files by name and compares
+> case-sensitively when that bit is set (`src/sys/device.c` 676 and 750, `src/sys/create.c` 316-318). So a file opened
+> as `A.TXT` and as `a.txt` on a folding volume gets two of the driver's file nodes: two share-access records (an
+> exclusive open does not exclude the other spelling, where NTFS answers a sharing violation) and two caches over one
+> file. T-4.6 ("case-insensitive lookup on a case-fold volume; expect one entry and `EEXIST` on a folded duplicate")
+> has no test through the drive. The fix: declare `CaseSensitiveSearch` for an exact volume only, and answer each open
+> of a folding volume with its normalized name (each component as stored), which WinFsp otherwise upper-cases
+> (`create.c` 1036-1043), failing test first (an exclusive open under one spelling, then the other: NTFS's
+> `ERROR_SHARING_VIOLATION`). The roster's workloads open no file under two spellings, so the Windows workloads cell,
+> which runs on a folding volume to match NTFS (A-300), does not meet it.
+
 > **The VFS and DAX plan's last reconciliation (2026-11-18, its Step 15).** The DAX matrix (`virtiofs.md` §8) has no
 > owed cell: every cell is proven with its run or test, impossible with its source, declined with Ada's date, or none.
 > `platforms.md` had two rows the plan closed without their runs. Its Windows cells for a mount that outlives a daemon
