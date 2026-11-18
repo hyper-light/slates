@@ -88,11 +88,21 @@ fn daemon(tag: &str) -> (Daemon, Instance) {
 
 /// [`daemon`] on `shards` shards.
 fn daemon_on(tag: &str, shards: u16) -> (Daemon, Instance) {
+  daemon_with(tag, shards, |_| {})
+}
+
+/// [`daemon_on`] with its derived configuration adjusted first (a capped slab, say).
+fn daemon_with(
+  tag: &str,
+  shards: u16,
+  adjust: impl FnOnce(&mut DaemonConfig),
+) -> (Daemon, Instance) {
   static NEXT: AtomicU64 = AtomicU64::new(0);
   let profile = profile();
   let serial = NEXT.fetch_add(1, Ordering::Relaxed);
   let instance = format!("api-{tag}-{}-{serial}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance, Some(shards));
+  let mut config = DaemonConfig::derive(&profile, &instance, Some(shards));
+  adjust(&mut config);
   let daemon = Daemon::start(
     &profile,
     config,
@@ -1067,6 +1077,68 @@ fn kilns_workspaces_are_provisioned_side_by_side() {
   for volume in made.into_iter().flatten() {
     instance.destroy(volume).unwrap();
   }
+  daemon.stop();
+}
+
+/// Shape: a capped daemon's version slab: room for a handful of files, so a test can spend every unpromised slot.
+#[cfg(unix)]
+const CAPPED_SLAB: usize = 64;
+/// Shape: the capped daemon's arena, sized with its slab so a slot is about 1 MiB of quota (A-109).
+#[cfg(unix)]
+const CAPPED_RESERVE: u64 = 64 << 20;
+
+/// The retention sibling of P1 (2026-11-18; A-342's record): a snapshot's retention refused reached kiln as
+/// `Exhausted(Quota)` when the bound was the shard's version slab, never the volume's quota. Do: on a daemon whose
+/// slab is capped small, grow an overlay (dynamic, twice the arena at most) with empty files until the daemon refuses
+/// the growth, snapshot it, and change a file the snapshot holds. Expect: the growth refused `NoSpace`, the volume's
+/// own bound, and the change refused `Volume { RetentionExceeded }` on the wire, typed apart from it (the contract
+/// classes it `Exhausted::Volume`, `error.rs`'s unit test), the file as it was.
+#[cfg(unix)]
+#[test]
+fn a_snapshots_retention_refused_is_not_the_quota() {
+  let (daemon, mut instance) = daemon_with("retention", TEST_SHARDS, |config| {
+    config.store.max_inodes = CAPPED_SLAB;
+    config.reserve_per_shard = CAPPED_RESERVE;
+  });
+  instance.ensure_group().unwrap();
+  let folder = Folder::new();
+  let volume = provision(
+    &mut instance,
+    &VolumeSpec::overlay("retention", &folder.path, 2 * CAPPED_RESERVE),
+  );
+  let attached = instance.attach_volume(volume, Intent::Write).unwrap();
+  let at = (volume, attached.attachment);
+  let grown = (0..=CAPPED_SLAB).find_map(|serial| {
+    instance
+      .client()
+      .fs_write(at, &format!("/f{serial}"), b"", MODE)
+      .err()
+  });
+  assert!(
+    matches!(
+      grown,
+      Some(slates_client::ClientError::Refused(
+        slates_ipc::protocol::Refusal::NoSpace
+      ))
+    ),
+    "the dynamic volume's growth past the slab is its own bound: {grown:?}"
+  );
+  let snapshot = instance.snapshot(volume).unwrap();
+  let changed = instance.client().fs_write(at, "/f0", b"changed", MODE);
+  assert!(
+    matches!(
+      changed,
+      Err(slates_client::ClientError::Refused(
+        slates_ipc::protocol::Refusal::Volume {
+          refusal: slates_api::VolumeRefusal::RetentionExceeded
+        }
+      ))
+    ),
+    "a snapshot's retention refused is typed apart from the quota: {changed:?}"
+  );
+  assert_eq!(read_file(&mut instance, volume, "/f0"), b"");
+  instance.detach(attached.attachment).unwrap();
+  instance.destroy_snapshot(volume, snapshot).unwrap();
   daemon.stop();
 }
 

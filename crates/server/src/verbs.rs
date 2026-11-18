@@ -4271,6 +4271,8 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::PolicyChanged { .. } => "policy_changed",
     Refusal::SignatureRequired { .. } => "signature_required",
     Refusal::Volume { .. } => "volume",
+    Refusal::Database { .. } => "database",
+    Refusal::Target { .. } => "target",
     Refusal::ImageRefused { .. } => "image_refused",
     Refusal::NotRootLeader => "not_root_leader",
     Refusal::ConsensusNotInitialized => "consensus_not_initialized",
