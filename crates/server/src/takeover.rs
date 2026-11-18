@@ -478,49 +478,60 @@ pub(crate) fn resolve_held_objects(state: &mut ShardState, local: HostId) {
   let regional = state.council.configuration().clone();
   let held: Vec<ObjectId> = state.holder_records.keys().copied().collect();
   for object in held {
-    let Some(owner) = state.fleet.object_owner(object) else {
-      continue;
-    };
-    if regional.members.contains(&owner) && !regional.retired.contains_key(&owner) {
-      match stale_after_confirmation(state, &regional, object, owner, local) {
-        Confirmation::Stale => let_go_stale(state, object),
-        Confirmation::Covered => {
-          state.count(TAKEOVER_UNASKED_COVERED, 1);
-          let_go_stale(state, object);
-        }
-        Confirmation::Unasked => state.count(TAKEOVER_KEPT_UNASKED, 1),
-        Confirmation::None => {}
+    resolve_held_object(state, local, &regional, object);
+  }
+}
+
+/// [`resolve_held_objects`] for one held copy, `object`'s, under `regional`: the walk of an install takes the copies a
+/// slice a turn (`fleet::install_on_copy`, A-389), and this whole pass is its oracle in the daemon's unit tests.
+pub(crate) fn resolve_held_object(
+  state: &mut ShardState,
+  local: HostId,
+  regional: &RegionalConfiguration,
+  object: ObjectId,
+) {
+  let Some(owner) = state.fleet.object_owner(object) else {
+    return;
+  };
+  if regional.members.contains(&owner) && !regional.retired.contains_key(&owner) {
+    match stale_after_confirmation(state, regional, object, owner, local) {
+      Confirmation::Stale => let_go_stale(state, object),
+      Confirmation::Covered => {
+        state.count(TAKEOVER_UNASKED_COVERED, 1);
+        let_go_stale(state, object);
       }
-      continue;
+      Confirmation::Unasked => state.count(TAKEOVER_KEPT_UNASKED, 1),
+      Confirmation::None => {}
     }
-    match regional.lineage(owner, object) {
-      Lineage::Successor {
-        departed,
-        successor,
-      } => {
-        track_owner_on_every_shard(state, object, successor);
-        let since_version = regional
-          .retired
-          .get(&departed)
-          .map_or(regional.version, |retirement| retirement.version);
-        state.departed_owners.insert(
-          object,
-          crate::lease::DepartedOwner {
-            owner: departed,
-            since_version,
-          },
-        );
-      }
-      // Lost or unresolved: nothing shows the object adopted anywhere, so this holder keeps its copy (A-272), counted so
-      // it shows what it keeps that no takeover will recover (A-340).
-      Lineage::Lost => state.count(TAKEOVER_KEPT_LOST, 1),
-      Lineage::Unresolved => state.count(TAKEOVER_KEPT_UNRESOLVED, 1),
-      Lineage::Settled { takeover } => {
-        if regional.settled_for(takeover, local) {
-          let_go_stale(state, object);
-        } else {
-          state.count(TAKEOVER_KEPT_UNASKED, 1);
-        }
+    return;
+  }
+  match regional.lineage(owner, object) {
+    Lineage::Successor {
+      departed,
+      successor,
+    } => {
+      track_owner_on_every_shard(state, object, successor);
+      let since_version = regional
+        .retired
+        .get(&departed)
+        .map_or(regional.version, |retirement| retirement.version);
+      state.departed_owners.insert(
+        object,
+        crate::lease::DepartedOwner {
+          owner: departed,
+          since_version,
+        },
+      );
+    }
+    // Lost or unresolved: nothing shows the object adopted anywhere, so this holder keeps its copy (A-272), counted so
+    // it shows what it keeps that no takeover will recover (A-340).
+    Lineage::Lost => state.count(TAKEOVER_KEPT_LOST, 1),
+    Lineage::Unresolved => state.count(TAKEOVER_KEPT_UNRESOLVED, 1),
+    Lineage::Settled { takeover } => {
+      if regional.settled_for(takeover, local) {
+        let_go_stale(state, object);
+      } else {
+        state.count(TAKEOVER_KEPT_UNASKED, 1);
       }
     }
   }

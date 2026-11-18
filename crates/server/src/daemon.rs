@@ -2935,6 +2935,19 @@ impl Daemon {
     Ok(())
   }
 
+  /// Test support: the quantum an install's walk over the held register copies is cut by on every shard
+  /// (`fleet::install_slice`, A-389), in place of the shard's own step quantum; `None` gives the shard its own back.
+  /// Zero ends each turn after one copy, so a test sees the slicing whatever the machine's speed. `Ok` once installed
+  /// on every shard, else the first typed refusal.
+  pub fn inject_install_walk_quantum(&self, quantum_ns: Option<u64>) -> Result<(), ObserveError> {
+    for shard in self.shards.iter().copied() {
+      self.observe(Some(shard), move |s| {
+        s.install_walk_quantum_ns = quantum_ns;
+      })?;
+    }
+    Ok(())
+  }
+
   /// Test support: every shard waits `pause_ns` between the turns of a live takeover's rebuild it makes
   /// (`fleet::make_live_in_turns`, g251), so a materialization outlasts the control shard's periods and its later
   /// attempts meet it running; `None` lifts it. `Ok` once installed on every shard, else the first typed refusal.
@@ -4507,6 +4520,8 @@ async fn init_shard(
     holder_records: crate::tracked::Tracked::default(),
     live: crate::live_ship::LiveState::default(),
     seal_walk_quantum_ns: None,
+    install_walk: None,
+    install_walk_quantum_ns: None,
     live_turn_pause_ns: None,
     host_takeovers: std::collections::BTreeMap::new(),
     config_refresh_wanted: false,
