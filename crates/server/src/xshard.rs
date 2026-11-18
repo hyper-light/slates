@@ -1307,24 +1307,7 @@ mod tests {
       (bound_waits, bound_waits),
       "every kept reply is a wait for room, all held at once"
     );
-    let mut ran = 0_usize;
-    while NEXT.load(Ordering::Acquire) < bound {
-      match take(&receiver, &registration) {
-        Ok(Control::Spawn(mut request)) => {
-          let mut context = Context::from_waker(Waker::noop());
-          assert!(
-            request.future.as_mut().poll(&mut context).is_ready(),
-            "a message's task runs to its end at once"
-          );
-        }
-        Ok(_) => panic!("only tasks were sent"),
-        Err(error) => panic!(
-          "{} of {bound} replies arrived, then none within {MESSAGE_WAIT:?}: {error:?}",
-          NEXT.load(Ordering::Acquire)
-        ),
-      }
-      ran += 1;
-    }
+    let ran = run_until_every_reply_arrived(&receiver, &registration, (&NEXT, bound));
     let after = crate::daemon::observe_first(&daemon, |_| room_waits());
     assert_eq!(
       ran,
@@ -1348,6 +1331,36 @@ mod tests {
     );
     drop(registration);
     daemon.stop();
+  }
+
+  /// The drain of `the_carrier_keeps_its_bound_in_order_and_refuses_one_past_it`: take every message off the stand-in's
+  /// channel and run it, as the client's shard would, until `next` counts all `bound` replies. Expect each a task that
+  /// runs to its end at once, and a message within the wait each time. Returns the messages run.
+  fn run_until_every_reply_arrived(
+    receiver: &std::sync::mpsc::Receiver<Control>,
+    registration: &registry::Registration,
+    (next, bound): (&std::sync::atomic::AtomicUsize, usize),
+  ) -> usize {
+    use std::sync::atomic::Ordering;
+    let mut ran = 0_usize;
+    while next.load(Ordering::Acquire) < bound {
+      match take(receiver, registration) {
+        Ok(Control::Spawn(mut request)) => {
+          let mut context = Context::from_waker(Waker::noop());
+          assert!(
+            request.future.as_mut().poll(&mut context).is_ready(),
+            "a message's task runs to its end at once"
+          );
+        }
+        Ok(_) => panic!("only tasks were sent"),
+        Err(error) => panic!(
+          "{} of {bound} replies arrived, then none within {MESSAGE_WAIT:?}: {error:?}",
+          next.load(Ordering::Acquire)
+        ),
+      }
+      ran += 1;
+    }
+    ran
   }
 
   /// §4.3 cancellation safety, the same on every shard (R8). Do: on a shard, from a task there, make a `task_within`
