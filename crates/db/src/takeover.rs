@@ -3,8 +3,12 @@
 //! (`crates/db/tests/takeover_model.rs`).
 //!
 //! An object is adopted once every one of its recovery cohorts has its recovery quorum of members that promised it
-//! ([`Quorum::recovery`]: `cohort − f`, so the promises meet every set of `f + 1` a record committed on). It is lost
-//! when a cohort has fewer members left than that quorum: more of the cohort failed than the region tolerates.
+//! ([`Quorum::recovery`]: `cohort − f`, so the promises meet every set of `f + 1` a record committed on). When a cohort
+//! has fewer members left than that quorum, more of it failed than the region tolerates, and no quorum can meet every
+//! committed record. Until A-309 such an object was lost: never adopted, its share never confirmed, its copies kept and
+//! recovered by no one. Now the members that exist now recover it: it is adopted once every surviving member of its
+//! cohorts, settled and current (the neighbourhood a change in flight reached), has promised it, with the newest record
+//! any of them holds ([`Readiness::ReadyPastTolerance`]). Within tolerance the counting is unchanged.
 //!
 //! What counts as a member's promise is the question A-251 is about ([`CountingRule`]). A member that listed the object
 //! has promised it and reported its highest record. Until A-251 (b), a member whose paged answer was complete also
@@ -53,12 +57,16 @@ pub struct Heard<'a> {
 pub enum Readiness {
   /// Every cohort has its recovery quorum of promises: adopt the newest record reported.
   Ready,
-  /// A cohort has not promised enough yet.
+  /// A cohort has not promised enough yet: within tolerance its recovery quorum, past it every surviving member of the
+  /// object's cohorts.
   Waiting,
-  /// A cohort has fewer members left than its recovery quorum: the object cannot be recovered. Carries what was
-  /// judged, so a caller can say why without recomputing it.
-  Lost {
-    /// The short cohort's index in the cohorts [`readiness`] was given.
+  /// A cohort has fewer members left than its recovery quorum (more of it failed than the region tolerates), and every
+  /// surviving member of the object's cohorts, settled and current, has promised it (A-309): adopt the newest record
+  /// reported, the newest any surviving holder of it has. No quorum can meet every committed record past tolerance; this
+  /// is the most the members that exist now hold. Carries what was judged, so a caller can say why without recomputing
+  /// it.
+  ReadyPastTolerance {
+    /// The first short cohort's index in the cohorts [`readiness`] was given.
     cohort: usize,
     /// Its recovery quorum.
     needed: usize,
@@ -84,15 +92,20 @@ impl Heard<'_> {
 
 /// Where an object recovered through `cohorts` stands, its members being the hosts `is_member` admits, under `quorum`
 /// and `rule`, given what was `heard` of it. A cohort's hosts that are no longer members (the retired host among them)
-/// count toward its size, not its promises.
+/// count toward its size, not its promises. `current` are the cohorts the object was placed on in its recovery owners'
+/// current neighbourhoods while a change was in flight ([`RegionalConfiguration::current_cohorts`]): counted only past
+/// tolerance, where every surviving member of every cohort, settled and current, must have promised, since a record
+/// newer than any quorum shows may sit on any of them (A-309).
 pub fn readiness(
   cohorts: &[Vec<HostId>],
+  current: &[Vec<HostId>],
   is_member: impl Fn(HostId) -> bool,
   quorum: Quorum,
   heard: &Heard<'_>,
   rule: CountingRule,
 ) -> Readiness {
   let mut ready = true;
+  let mut short = None;
   for (index, cohort) in cohorts.iter().enumerate() {
     let needed = quorum.recovery(cohort.len());
     let members: Vec<HostId> = cohort
@@ -101,11 +114,8 @@ pub fn readiness(
       .filter(|host| is_member(*host))
       .collect();
     if members.len() < needed {
-      return Readiness::Lost {
-        cohort: index,
-        needed,
-        members: members.len(),
-      };
+      short = short.or(Some((index, needed, members.len())));
+      continue;
     }
     let promised = members
       .iter()
@@ -113,8 +123,26 @@ pub fn readiness(
       .count();
     ready &= promised >= needed;
   }
-  if ready {
-    Readiness::Ready
+  let Some((cohort, needed, members)) = short else {
+    return if ready {
+      Readiness::Ready
+    } else {
+      Readiness::Waiting
+    };
+  };
+  let every_survivor = cohorts
+    .iter()
+    .chain(current)
+    .flatten()
+    .copied()
+    .filter(|host| is_member(*host))
+    .all(|host| heard.promised(host, rule));
+  if every_survivor {
+    Readiness::ReadyPastTolerance {
+      cohort,
+      needed,
+      members,
+    }
   } else {
     Readiness::Waiting
   }
@@ -328,6 +356,7 @@ mod tests {
     assert_eq!(
       readiness(
         &cohorts,
+        &[],
         is_member,
         quorum,
         &heard,
@@ -338,6 +367,7 @@ mod tests {
     assert_eq!(
       readiness(
         &cohorts,
+        &[],
         is_member,
         quorum,
         &heard,
@@ -352,6 +382,7 @@ mod tests {
     assert_eq!(
       readiness(
         &cohorts,
+        &[],
         is_member,
         quorum,
         &named,
@@ -361,38 +392,79 @@ mod tests {
     );
   }
 
-  /// A cohort with fewer members left than its recovery quorum is lost under either rule, and every cohort must have
-  /// its quorum. Do: two cohorts at f = 1, the second left with a single member of three; then two whole cohorts, only
-  /// one of which has promised. Expect: lost, naming the second cohort, its quorum of two and its one member; then
-  /// waiting.
+  /// A-309: a cohort with fewer members left than its recovery quorum waits for every surviving member of the object's
+  /// cohorts, settled and current, under either rule, and every cohort within tolerance must have its quorum. Do: two
+  /// settled cohorts at f = 1, the second left with a single member of three, and a current cohort with a member of its
+  /// own; hear the first cohort's two members, then the short cohort's survivor by name, then the current cohort's
+  /// member. Expect waiting until the last of them, then ready past tolerance naming the short cohort, its quorum of two
+  /// and its one member; and two whole cohorts, only one of which has promised, waiting whatever the current cohort
+  /// says. Before A-309 the short cohort read lost at once and the object was never adopted.
   #[test]
-  fn every_cohort_needs_its_quorum_and_a_short_one_is_lost() {
-    let (departed, gone, a, b, c) = (HostId(9), HostId(8), HostId(1), HostId(2), HostId(3));
+  fn a_short_cohort_waits_for_every_surviving_holder_and_a_whole_one_for_its_quorum() {
+    let (departed, gone, a, b, c, d) = (
+      HostId(9),
+      HostId(8),
+      HostId(1),
+      HostId(2),
+      HostId(3),
+      HostId(4),
+    );
     let quorum = Quorum { f: 1 };
-    let reports = BTreeMap::from([(a, record(1)), (b, record(1))]);
     let empty = BTreeSet::new();
-    let heard = Heard {
-      reports: &reports,
-      complete: &empty,
-      named_nothing: &empty,
-      local: None,
-    };
     let is_member = |host: HostId| host != departed && host != gone;
     let short = vec![vec![departed, a, b], vec![departed, gone, c]];
+    let current = vec![vec![departed, a, d]];
+    let first = BTreeMap::from([(a, record(1)), (b, record(1))]);
+    let named_c = BTreeSet::from([c]);
+    let all = BTreeMap::from([(a, record(1)), (b, record(1)), (d, record(2))]);
     for rule in [CountingRule::CompleteAnswer, CountingRule::NamedAnswer] {
+      let heard = Heard {
+        reports: &first,
+        complete: &empty,
+        named_nothing: &empty,
+        local: None,
+      };
       assert_eq!(
-        readiness(&short, is_member, quorum, &heard, rule),
-        Readiness::Lost {
+        readiness(&short, &current, is_member, quorum, &heard, rule),
+        Readiness::Waiting,
+        "the short cohort's survivor and the current cohort's member are not heard yet"
+      );
+      // The survivor answers: by name under A-251's rule, by its complete pages under today's.
+      let named = Heard {
+        complete: &named_c,
+        named_nothing: &named_c,
+        ..heard
+      };
+      assert_eq!(
+        readiness(&short, &current, is_member, quorum, &named, rule),
+        Readiness::Waiting,
+        "the current cohort's member is not heard yet"
+      );
+      let everyone = Heard {
+        reports: &all,
+        complete: &named_c,
+        named_nothing: &named_c,
+        ..heard
+      };
+      assert_eq!(
+        readiness(&short, &current, is_member, quorum, &everyone, rule),
+        Readiness::ReadyPastTolerance {
           cohort: 1,
           needed: 2,
           members: 1
         }
       );
     }
+    let heard = Heard {
+      reports: &first,
+      complete: &empty,
+      named_nothing: &empty,
+      local: None,
+    };
     let whole = vec![vec![departed, a, b], vec![departed, b, c]];
     for rule in [CountingRule::CompleteAnswer, CountingRule::NamedAnswer] {
       assert_eq!(
-        readiness(&whole, is_member, quorum, &heard, rule),
+        readiness(&whole, &current, is_member, quorum, &heard, rule),
         Readiness::Waiting
       );
     }
@@ -797,6 +869,7 @@ mod tests {
     assert_eq!(
       readiness(
         &cohorts,
+        &[],
         is_member,
         quorum,
         &open,
@@ -807,6 +880,7 @@ mod tests {
     assert_eq!(
       readiness(
         &cohorts,
+        &[],
         is_member,
         quorum,
         &shut,
@@ -817,6 +891,7 @@ mod tests {
     assert_eq!(
       readiness(
         &cohorts,
+        &[],
         is_member,
         quorum,
         &open,
@@ -833,6 +908,7 @@ mod tests {
     assert_eq!(
       readiness(
         &cohorts,
+        &[],
         is_member,
         quorum,
         &answered,

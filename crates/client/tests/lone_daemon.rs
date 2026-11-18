@@ -541,6 +541,22 @@ fn end_line(stderr: &Receiver<(u64, String)>) -> Option<(Duration, Duration, u64
   found
 }
 
+/// Format: the words of the watchdog's start line right after the spin window's milliseconds (A-318).
+const SPIN_WINDOW_WORDS: &str = " ms of CPU without a step (the window is the liveness budget";
+
+/// The CPU a poll may run without a step before the child's watchdog calls its shard spinning: the budget held to the
+/// child's build (A-318), read from the watchdog's start line, which comes before the role says it is ready.
+fn spin_window_of(stderr: &Receiver<(u64, String)>) -> Duration {
+  let line = await_tag(stderr, SPIN_WINDOW_WORDS, START_WAIT);
+  let ms: u64 = line
+    .split(SPIN_WINDOW_WORDS)
+    .next()
+    .and_then(|before| before.rsplit(' ').next())
+    .and_then(|number| number.parse().ok())
+    .unwrap_or_else(|| panic!("the watchdog's start line names its spin window: {line}"));
+  Duration::from_millis(ms)
+}
+
 /// The milliseconds of CPU a spinning verdict names in the end line.
 fn spun_for(line: &str) -> Duration {
   let ms: u64 = line
@@ -560,14 +576,18 @@ fn spun_for(line: &str) -> Duration {
 /// verdict's time from above, and the test asserts that bound: the end line read by `t0 + W + B + L`. Then `end`, the
 /// time from that line to the client's liveness answering gone, is measured, and the client's gone time is reported
 /// against `t0 + W + B + L + end` and against the plan's `t0 + W + B + L` without it. A spin is judged in the shard's
-/// own CPU time, which a busy machine hands out slower than the wall runs, so its verdict must name at least a window
-/// of CPU and at most a window and one look's (`B + L`). The call then ends at its next deadline after the exit, past
+/// own CPU time, which a busy machine hands out slower than the wall runs, so its verdict must name at least the spin
+/// window of CPU (the budget held to this build, A-318) and at most that and one look's (`B + L`). The call then ends at its next deadline after the exit, past
 /// the reconnect budget: within `exit + reply + reconnect` and one of the reconnect's paced attempts (`reconnect / 10`,
 /// the driver's pacing).
 fn a_lone_daemons_stuck_shard_ends_it(name: &str, hold: Hold) {
   let instance = format!("lone-{name}-{}", std::process::id());
   let mut daemon = start_lone_daemon(&instance, hold);
   await_tag(&daemon.stdout, READY_TAG, START_WAIT);
+  let spin_window = spin_window_of(&daemon.stderr);
+  // A spin's verdict needs the spin window of the shard's CPU, longer than the budget in a build slower than machine
+  // code (A-318), so the test's bound is past it by its own ten windows.
+  let give_up = GIVE_UP + spin_window;
   let mut client = connect(&instance);
   let stdin = daemon.stdin.as_mut().unwrap();
   writeln!(stdin, "{}", client.client_id()).unwrap();
@@ -586,11 +606,11 @@ fn a_lone_daemons_stuck_shard_ends_it(name: &str, hold: Hold) {
     &mut driver,
     ticket,
     &mut daemon,
-    (held_at, GIVE_UP),
+    (held_at, give_up),
   );
   let (status, exited_after) = ended.exit.unwrap_or_else(|| {
     panic!(
-      "{name}: the lone daemon was still running {GIVE_UP:?} after its shard was held; the call: {:?} (None: still \
+      "{name}: the lone daemon was still running {give_up:?} after its shard was held; the call: {:?} (None: still \
        pending); the daemon said on standard error, last {SAID_LINES} lines:\n{}",
       ended.call,
       said_so_far(&daemon.stderr)
@@ -640,9 +660,10 @@ fn a_lone_daemons_stuck_shard_ends_it(name: &str, hold: Hold) {
       let look = BEAT + looks_late;
       let spun = spun_for(&line);
       assert!(
-        spun >= WINDOW && spun <= WINDOW + look,
-        "{name}: the verdict named {spun:?} of CPU, outside a window to a window and a look ({:?})",
-        WINDOW + look
+        spun >= spin_window && spun <= spin_window + look,
+        "{name}: the verdict named {spun:?} of CPU, outside the spin window ({spin_window:?}, the budget held to this \
+         build) to the spin window and a look ({:?})",
+        spin_window + look
       );
     }
   }
@@ -668,9 +689,10 @@ fn a_lone_daemons_wedged_shard_ends_its_process_and_the_call_ends_daemon_gone() 
   a_lone_daemons_stuck_shard_ends_it("wedged", Hold::Wedged);
 }
 
-/// A-232, §4.14. Do: as the wedged case, with the shard on the CPU for good in one poll (a task that never yields).
-/// Expect: the process exits with the failed exit code on a spinning verdict that names a window of CPU to a window and
-/// one look's, and the call ends `DaemonGone`.
+/// A-232, A-318, §4.14. Do: as the wedged case, with the shard on the CPU for good in one poll (a task that never
+/// yields). Expect: the process exits with the failed exit code on a spinning verdict that names the spin window of CPU
+/// (the budget held to this build, from the watchdog's start line) to the spin window and one look's, and the call ends
+/// `DaemonGone`.
 #[test]
 fn a_lone_daemons_spinning_shard_ends_its_process_and_the_call_ends_daemon_gone() {
   a_lone_daemons_stuck_shard_ends_it("spinning", Hold::Spinning);
