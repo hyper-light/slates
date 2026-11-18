@@ -11636,6 +11636,14 @@ new process. In simulation the session ended one round trip after its first pack
   60 of 60, diag-live-fixes-56). A voter promoted after the last configuration commit stays unknown to a learner until
   the next one.
 - **Open sibling:** `drive_root_learner_fetch` filters on the root's voters the same way, and has no test yet.
+- **The departure wait's budget omitted the election, fixed 2026-11-18 (g225).** The three tests that stop the bootstrap
+  voter wait `departure_learned_periods`, which counted the detector's horizon, the death window and the commits but
+  not the election the stop leaves owed: the bootstrapper leads the council it created, and only a leader proposes the
+  retirement. At one CPU beside two busy loops (diag-g225-forming-fleet-reaches-2) 9 of 48 runs of the two tests waiting
+  on it spent their budget (94 periods) with every survivor still at the version of the stop, or the leader still naming
+  the stopped voter. The budget now adds the election's timeout (base and span, measured as the daemons derive it) and
+  its two rounds. Still open beside it: a learner's known voters move only with a newer configuration, and a seat change
+  moves none (the A-337 entry above).
 
 ### 2026-11-09: the formation check falls behind each new event counter (open)
 

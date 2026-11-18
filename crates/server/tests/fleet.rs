@@ -727,12 +727,19 @@ fn retirement_learned_periods(daemons: &[&Daemon]) -> u64 {
 }
 
 /// Derived: the coordinator periods the survivors take to learn a voter's departure: a membership horizon for the
-/// detector to hold it dead, the death window, the retirement's commit, the two commits of the joint change that
-/// refills its seat, the period a learner sees its divergence in, and its fetch round.
+/// detector to hold it dead, the death window, the election the departure leaves owed when the voter led the council
+/// (its timeout's base and span, [`election_periods`], and its two rounds, the pre-vote's and the vote's), the
+/// retirement's commit, the two commits of the joint change that refills its seat, the period a learner sees its
+/// divergence in, and its fetch round. The voter these tests stop is the bootstrapper, which leads the council it created
+/// unless a priority transfer moved its leadership, and only a leader proposes the retirement: without the election the
+/// budget ran out with the retirement still owed at one CPU beside two busy loops (diag-g225-forming-fleet-reaches-2,
+/// 2026-11-18: 9 of 48 runs of the two tests waiting on it, every survivor still at the version of the stop or the
+/// leader still naming the stopped voter, 94 periods spent).
 fn departure_learned_periods(daemons: &[&Daemon]) -> u64 {
   horizon_periods()
     .saturating_add(death_window_periods(daemons))
-    .saturating_add(commit_periods().saturating_mul(4))
+    .saturating_add(election_periods(daemons))
+    .saturating_add(commit_periods().saturating_mul(6))
     .saturating_add(1)
 }
 
