@@ -2968,8 +2968,10 @@
 > the volumes this node timed, the ratified `T` before the first. Published in the daemon's status
 > (`FleetReport::failover`, `CONTRACT` 24; `slates status` prints `fleet_failover`), each term with the measurements
 > behind it. **Since A-375 the failover-shaped waits read it** (a forward's bound, the location round's cap, a held
-> reply's total, a takeover's attempts), fanned to every shard in whole periods. Owed, each in its own change: each lease
-> takes its term from a φ-accrual
+> reply's total, a takeover's attempts), fanned to every shard in whole periods. **Since A-384 a CLI attachment's term is
+> its holder's** (`min(F, the gaps' tail + W)`, renewed by every verb and by a holder's `Renew`, fresh after a restart);
+> `slates attach --hold` and the library's and SDKs' attachment objects as holders are owed next. Owed, each in its own
+> change: each other lease takes its term from a φ-accrual
 > detector of its own holder's renewals (a CLI attachment once the CLI process sends a keepalive); `W`'s floor from the
 > pulses' running wake delay; then `FAILOVER_SLO_NS` and `with_failover_slo` go, since nothing sets `F`. The boot-time
 > sum is kept only as the A/B baseline, a build of its own, never a mode.

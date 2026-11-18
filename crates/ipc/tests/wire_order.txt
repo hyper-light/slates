@@ -281,6 +281,7 @@ ReplyBody 62 MergeApprovalRequired
 ReplyBody 63 SubmittedSigned
 ReplyBody 64 SignersSet
 ReplyBody 65 MergeRecord
+ReplyBody 66 Renewed
 RequestBody 0 Create
 RequestBody 1 Snapshot
 RequestBody 2 DestroySnapshot
@@ -356,6 +357,7 @@ RequestBody 71 SubmitApproved
 RequestBody 72 SubmitSigned
 RequestBody 73 SetSigners
 RequestBody 74 MergeRecord
+RequestBody 75 Renew
 Residency 0 DaemonRam
 Residency 1 DaemonRamAndKernelCache
 Residency 2 DaemonRamKernelCacheAndRuntimeVm

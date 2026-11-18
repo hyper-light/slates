@@ -2459,7 +2459,8 @@ pub fn serve(
     }
     RequestBody::Detach { attachment }
     | RequestBody::Advance { attachment, .. }
-    | RequestBody::BindMount { attachment, .. } => Some(owner_of_attachment(*attachment)),
+    | RequestBody::BindMount { attachment, .. }
+    | RequestBody::Renew { attachment } => Some(owner_of_attachment(*attachment)),
     // A grant is served where its landing was presented: the volume's owner shard, which the landing id
     // names — not the client's shard, where nothing is awaiting. So is a presentation's entry list.
     RequestBody::Grant { landing, .. } | RequestBody::LandingEntries { landing, .. } => {
@@ -4832,6 +4833,7 @@ fn dispatch_inner(
       form,
     } => attach(state, client_id, principal, volume, snapshot, intent, form),
     RequestBody::Detach { attachment } => detach(state, principal, attachment),
+    RequestBody::Renew { attachment } => renew(state, principal, attachment),
     RequestBody::DetachOf { volume, attachment } => {
       detach_of(state, principal, Some(volume), attachment)
     }
@@ -9494,6 +9496,7 @@ fn attach(
     ),
   };
   let attachment = next_attachment_id(state);
+  let termed = matches!(consumer, Consumer::Termed { .. });
   let token = match capability_token(borrows_mount) {
     Ok(token) => token,
     Err(refusal) => return refused(refusal),
@@ -9520,6 +9523,12 @@ fn attach(
   }
   if let Err(refusal) = commit_attachment(state, &record, &form, attachment_record, now) {
     return refused(refusal);
+  }
+  if termed {
+    // Its making is its holder's first use: the gaps its term follows are measured from here (A-384).
+    state
+      .attachment_paces
+      .insert(attachment, crate::state::AttachmentPace::begun(now));
   }
   capability.read_write = read_write_of(intent);
   ReplyBody::Attached {
@@ -10088,23 +10097,122 @@ pub(crate) fn consumer_of(
   }
 }
 
-/// A CLI attachment's term (A-230, §4.7): the operator's failover SLO, as the write lease's (`take_write_lease`). The
-/// attachment holds the volume's write lease for an attach-for-write, so its term is the lease's: a renewal by each verb
-/// naming it keeps both for a user at work, and an abandoned one lets the lease go within one term, past which the
-/// failover SLO would be broken for any other writer anyway.
-pub(crate) fn attachment_term(state: &ShardState) -> u64 {
-  derived!(
-    state.config.failover_slo_ns,
-    "the operator's failover SLO, the write lease's term (a renewal is a verb's own round trip, microseconds)",
-    ["failover_slo_ns"]
-  )
-  .get()
+/// A CLI attachment's term (A-230, A-384, §4.7): the longest it may go unused before it lapses with the write lease it
+/// holds, its holder's own. At most this node's failover delay (`ShardState::failover_ns`, A-363): an abandoned attachment
+/// holds the volume's write lease no longer than a failover would leave the volume unserved, past which any other
+/// writer's failover delay would be broken anyway (A-230's bound). Within it, its holder's pace: the tail of the gaps
+/// between its uses (RFC 6298's estimator, `smoothed + 4·deviation`, as the failover estimate's terms) plus a liveness
+/// window, the lateness by which a live party may fall behind before it is judged (A-228) — an accrual term per holder
+/// (Hayashibara et al. 2004, judged at the estimator's tail). So a holder that renews at a steady pace (`slates attach
+/// --hold`, the library's and the SDKs' attachment objects, which renew at the cadence the `Renewed` reply names,
+/// [`renewal_cadence`]) is judged by its own pace, and one with no pace measured yet (just made, or recovered by a restart, or used by verbs
+/// alone a term apart) has the failover delay.
+pub(crate) fn attachment_term(state: &ShardState, attachment: u64) -> u64 {
+  let ceiling = state.failover_ns.max(1);
+  state
+    .attachment_paces
+    .get(&attachment)
+    .and_then(|pace| pace.gaps.tail_ns())
+    .map_or(ceiling, |tail| {
+      tail
+        .saturating_add(crate::daemon::LIVENESS_BUDGET_NS)
+        .min(ceiling)
+    })
 }
 
-/// When a CLI attachment made or renewed now lapses (A-230): one [`attachment_term`] from the shard's clock.
+/// When a CLI attachment made now lapses (A-230, A-384): one term from the shard's clock, its holder's pace not yet
+/// measured, so the failover delay ([`attachment_term`]).
 pub(crate) fn termed_expiry(state: &mut ShardState) -> u64 {
-  let term = attachment_term(state);
+  let term = state.failover_ns.max(1);
   state.clock.monotonic_ns().saturating_add(term)
+}
+
+/// The `Renew` verb (A-384): a holder's renewal of its CLI attachment's term, and nothing else. Renewed by
+/// [`use_attachment`] as any verb naming it is, and answered the term now in force and the cadence the holder renews at
+/// ([`renewal_cadence`]). Refused as any use is (`AttachmentExpired` past its term, `NotFound` for no such attachment);
+/// another principal's is `Forbidden`, its use having renewed nothing; and an attachment with no term (a mount's,
+/// which renews through its own activity) is a bad request.
+fn renew(state: &mut ShardState, principal: &Principal, attachment: u64) -> ReplyBody {
+  if let Err(refusal) = use_attachment(state, principal, attachment) {
+    return refused(refusal);
+  }
+  let Some(record) = state.db.partition().attachment(attachment).cloned() else {
+    return refused(Refusal::NotFound);
+  };
+  if &record.principal != principal {
+    return forbidden("renew");
+  }
+  let Consumer::Termed {
+    expires_ns: current,
+  } = record.consumer
+  else {
+    return refused(Refusal::BadRequest {
+      reason:
+        "only a CLI attachment has a term to renew; a mount's renews through its own activity"
+          .to_owned(),
+    });
+  };
+  // A renewal asked for is made: its holder's next is a third of the term away, so the expiry is a whole term from now,
+  // whatever an ordinary use's half-term rule left it at (`use_attachment`).
+  let term = attachment_term(state, attachment);
+  let now = state.clock.monotonic_ns();
+  let expires_ns = now.saturating_add(term);
+  if current < expires_ns {
+    let renewal = Op::AttachmentRenewed {
+      id: attachment,
+      expires_ns,
+    };
+    if let Err(e) = state.db.mutate(&mut state.segment, &renewal, now) {
+      return refused(refusal_of_db(&e));
+    }
+  }
+  ReplyBody::Renewed {
+    term_ns: term,
+    renew_every_ns: renewal_cadence(term),
+  }
+}
+
+/// Derived: how soon a holder renews its attachment again after a renewal that named `term_ns` (A-384): a third of the
+/// shorter of the term and the liveness window `W`, so two renewals lost or late are survived within the term. Not a
+/// third of the term alone: the holder's gaps shape its term (its tail plus `W`), so a cadence that followed the term fed
+/// back into it, and the term grew to the failover delay (1.0 s to 4.0 s in ten renewals on the Mac Studio, 2026-11-18).
+/// With the cadence a third of `W`, the gaps are steady and the term settles near `4W / 3`.
+pub(crate) fn renewal_cadence(term_ns: u64) -> u64 {
+  /// Format: the renewals a holder makes within the term it must renew inside: the one due, and two that may be lost or
+  /// late.
+  const RENEWALS_PER_TERM: u64 = 3;
+  term_ns
+    .min(crate::daemon::LIVENESS_BUDGET_NS)
+    .checked_div(RENEWALS_PER_TERM)
+    .unwrap_or(0)
+    .max(1)
+}
+
+/// Gives every CLI attachment of this partition a fresh term from now, at the shard's start (A-384): a holder could not
+/// renew while this daemon was not serving, and its own downtime is never counted against a holder (Lifeguard's rule,
+/// Dadgar et al. 2018: a member does not condemn others for its own unavailability). Each pace starts again with the
+/// failover delay. The attachments renewed; one whose renewal could not be recorded keeps its old expiry.
+pub(crate) fn renew_termed_at_start(state: &mut ShardState) -> usize {
+  let now = state.clock.monotonic_ns();
+  let expires_ns = now.saturating_add(state.failover_ns.max(1));
+  let termed: Vec<u64> = state
+    .db
+    .partition()
+    .attachments()
+    .filter(|record| matches!(record.consumer, Consumer::Termed { .. }))
+    .map(|record| record.id)
+    .collect();
+  let mut renewed = 0usize;
+  for id in termed {
+    let renewal = Op::AttachmentRenewed { id, expires_ns };
+    if state.db.mutate(&mut state.segment, &renewal, now).is_ok() {
+      state
+        .attachment_paces
+        .insert(id, crate::state::AttachmentPace::begun(now));
+      renewed = renewed.saturating_add(1);
+    }
+  }
+  renewed
 }
 
 /// The rights an attachment records (§4.13 "Access lists"; AUD-01): the principal's rights on the volume
@@ -10447,7 +10555,13 @@ pub(crate) fn use_attachment(
     end_attachment(state, &record, Ending::Expired).map_err(|e| refusal_of_db(&e))?;
     return Err(expired);
   }
-  let term = attachment_term(state);
+  // The use is a sample of its holder's pace, which its term follows (A-384).
+  state
+    .attachment_paces
+    .entry(attachment)
+    .and_modify(|pace| pace.used(now))
+    .or_insert_with(|| crate::state::AttachmentPace::begun(now));
+  let term = attachment_term(state, attachment);
   if expires_ns.saturating_sub(now) < term / 2 {
     let renewal = Op::AttachmentRenewed {
       id: attachment,
@@ -10500,6 +10614,8 @@ pub(crate) fn end_attachment(
     Ending::Detached | Ending::Otherwise => Op::AttachmentRemoved { id: record.id },
   };
   state.db.mutate(&mut state.segment, &removal, now)?;
+  // Its pace goes with it (A-384).
+  state.attachment_paces.remove(&record.id);
   crate::merge_service::forget_attachment(state, record.id);
   // A mount that survived a takeover holds its volume's kept files until it ends, however it ends (U10).
   if let Some(&handle) = state.by_id.get(&record.volume)

@@ -1876,9 +1876,10 @@ landing constants are in §4.15.
 > detector's periods at their measured running tail, `E` the council's death-confirmation window at the measured period, `R` the tail of
 > the takeovers and volumes it timed (the ratified recovery budget before the first), and publishes it in its status
 > (`FleetReport::failover`). **Since A-375 the waits that bound a failover read it** (a forward's bound, the location
-> round's cap, a held reply's total, a takeover's attempts), fanned to every shard in whole coordinator periods; the
-> lease terms still read the operator's 10 s placeholder above until each takes a term of its own (A-363's owed list;
-> GAPS, the `LIVENESS_BUDGET_NS` entry).
+> round's cap, a held reply's total, a takeover's attempts), fanned to every shard in whole coordinator periods; **since
+> A-384 a CLI attachment's term is its holder's**, at most the failover delay; the other lease terms still read the
+> operator's 10 s placeholder above until each takes a term of its own (A-363's owed list; GAPS, the
+> `LIVENESS_BUDGET_NS` entry).
 
 **Worked example.** An agent clones snapshot S of a 2 million-file volume: the reply arrives in one
 ring round trip; the clone's `referenced_bytes` equals S's referenced bytes (charged in full),
@@ -27413,3 +27414,49 @@ record before its inputs) and `crates/server/src/takeover.rs` (`commit_adopted`)
   answers the next version out of order until it fetches those inputs and advances; the green goes on at `f + 1` while
   its other holders answer. The successor's own replacement is not driven end to end by a test: that wants two
   takeovers with divergent uncommitted values; its rewind is the register path's, which the tests drive.
+
+### A-384 — A CLI attachment's term is its holder's: renewed by every verb that uses it and by its holder's `Renew`, fresh after a restart, at most the failover delay and within it the tail of the holder's renewal gaps and a liveness window (2026-11-18, built for goal g255; the coordinator's ruling of the same day on who renews an attachment; A-230, A-363, A-375)
+
+- **What was there.** A-230's term was the operator's 10 s placeholder, renewed only by a verb naming the attachment (one
+  durable record per half term), so nothing could keep an idle attachment alive and every attachment had the same term.
+- **The rule** (the coordinator's ruling, 2026-11-18): a lease is renewed by whatever holds it. Every verb that uses an
+  attachment renews it, as before; an idle one expires after a term derived from the live estimators, an accrual term
+  per holder; `slates attach --hold` keeps one alive from a foreground process that renews it, and the client library's
+  and the SDKs' attachment objects renew while they live (both owed, the next changes); a mount renews through its own
+  activity (its attachment has no term).
+- **The term** (`verbs::attachment_term`): `min(F, the tail of the holder's renewal gaps + W)`. `F` is the node's
+  failover delay (A-363, `ShardState::failover_ns`): A-230's bound, since an abandoned attachment holds the volume's write
+  lease no longer than a failover would leave the volume unserved. The gaps' tail is RFC 6298's `smoothed + 4·deviation`
+  over the gaps between the attachment's uses on its owner shard (`state::AttachmentPace`, the estimator the failover
+  estimate's terms use), and `W` the lateness a live party may show before it is judged (A-228). An attachment with no gap
+  measured yet (just made, recovered by a restart, or used a term apart) has `F`. A holder renews at the cadence its
+  `Renewed` reply names, a third of the shorter of the term and `W` (`verbs::renewal_cadence`), so where `F` is longer
+  the term settles near four thirds of a liveness window, and where it is shorter (a laptop's, the recovery prior alone,
+  A-363), at `F`. Not a third of the term: the first build renewed so, the holder's gaps followed the term they shape,
+  and the term grew to the failover delay, 1.0 s to 4.0 s in ten renewals (the held-attachment test, the Mac Studio).
+- **The verb.** `RequestBody::Renew { attachment }` answered `ReplyBody::Renewed { term_ns, renew_every_ns }` (both appended and published:
+  `RequestBody` 75, `ReplyBody` 66), served on the attachment's owner shard: a renewal asked for is made durable, a whole
+  term from now; refused as any use is (`AttachmentExpired` past its term), and `BadRequest` for an attachment with no
+  term. `Client::renew`.
+- **Lifeguard's rule** (Dadgar et al. 2018: a member does not condemn others for its own unavailability): at a shard's
+  start, before its serve loop answers anything, every CLI attachment of its partition gets a fresh term, `F` from then,
+  and its pace starts again (`verbs::renew_termed_at_start`), so a restart longer than a term never ends an attachment
+  its holder could not renew meanwhile.
+- **What changes.** On a laptop a CLI attachment that nothing renews lasts about a second idle (`F` is the recovery prior
+  there), and in a quiet fleet about 4-5 s, where it was 10 s; a user who keeps one between commands holds it with
+  `--hold` or a library object. A held attachment that stops renewing ends at its own pace, about one and a half liveness
+  windows at most, where it waited out the 10 s.
+- **Not changed, owed.** The volume's write lease (D-16, `take_write_lease`) still takes the placeholder (writes do not
+  check it; its term gates another writer's take), with the landing target lease and the NFSv4 and delegation leases.
+- **Evidence.** `crates/server/tests/attachment_term.rs` on the Mac Studio (2026-11-18, load 10-48, debug build), 4 of 4,
+  twice: A-230's two tests, their failover delay held at 3 s by injection; `a_held_attachment_lives_while_its_holder_
+  renews_and_lapses_at_its_own_pace` (renewed by `Renew` alone for 8 s, twice its 4 s ceiling, the named terms rising
+  to about 2.0 s and settling at 1.43-1.47 s, then refused `AttachmentExpired` two terms after its last use, before
+  the ceiling); `a_restart_gives_a_cli_attachment_a_fresh_term` (the test as the anchor, two terms with no daemon, then
+  renewed and written at once). Red-checked: a term that ignores the pace fails the held test's late write; no renewal
+  at the start fails the restart test; a `Renew` that renews nothing fails the held test's renewals. The wire-order test
+  holds both appended tags.
+
+Applied in the same change to: §4.4 "Derived constants" (its status), GAPS (the `LIVENESS_BUDGET_NS` entry),
+`crates/ipc/src/protocol.rs`, `crates/ipc/tests/wire_order.txt`, `crates/client/src/client.rs`,
+`crates/server/src/{verbs,state,daemon}.rs`, `crates/server/tests/attachment_term.rs`.
