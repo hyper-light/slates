@@ -67,7 +67,7 @@ impl HeldTurn {
   /// The turns the plain mean covers before the weighted means take over: `2^shift`.
   /// Derived: one shifted left `shift` places is `2^shift` (saturating at `u64::MAX`), the wake estimate's own window.
   fn window(&self) -> u64 {
-    1u64.checked_shl(self.shift).unwrap_or(u64::MAX)
+    1_u64.checked_shl(self.shift).unwrap_or(u64::MAX)
   }
 
   /// Folds one idle turn's measured length in, nanoseconds (at most [`LONGEST_TURN_NS`]).
