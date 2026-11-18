@@ -82,10 +82,10 @@ the fleet ran: a store with no bound (CLAUDE.md §2 item 8).
 
 - A route to a green destroyed, or lost to a second takeover it cannot survive (GAP-A9-7), while the route is kept: no
   owner answers.
-- A route to a green its successor gave up on (main's give-up after the failover SLO's attempts, d3f4ddbe2): the green
-  is never served, so its shard answers no question, and the route stays. Its successor never recorded the adopted
-  completions, so nothing the route leads to can answer. The next piece answers such a green from its partition's
-  count.
+- ~~A route to a green its successor gave up on~~ (main's give-up after the failover SLO's attempts, d3f4ddbe2): ended
+  the same day by A-288's second piece. The green's shard answers for a green it holds `unrecovered`, from its
+  partition's count, since its successor never recorded the adopted completions and never will. A given-up green that
+  is then destroyed is neither served nor `unrecovered`, and joins the item above.
 - A route whose completion its client never acknowledges keeps it, as the completion record itself is kept. This is
   RIFL's client lease, not built.
 - A route its adopter kept across a warm restart (the last sibling below).

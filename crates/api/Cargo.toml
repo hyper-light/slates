@@ -43,6 +43,10 @@ serde_json = { workspace = true }
 # The merge engine's conflict classes, which a merge window names by discriminant on the wire (§4.16, D-27): the
 # contract reads them against the engine's own enum (A-299). The server links it already.
 slates-merge = { workspace = true }
+# The launcher secret (A-299): its record's CRC32C (`slates-wire`), and a fresh secret from the TLS provider's secure
+# random (`slates-transport`, A-66), as the daemon mints its own. The server links both already.
+slates-wire = { workspace = true }
+slates-transport = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

@@ -312,9 +312,32 @@ impl BridgeAccess for ShardBridge {
     crate::live_ship::DurableWait::new(self.volume, target)
   }
 
-  /// Every transport's bound on a durability claim (`crate::live_ship::durable_wait_ns`: the liveness budget).
-  fn durable_bound_ns(&mut self) -> u64 {
-    crate::live_ship::durable_wait_ns()
+  /// Every transport's rule for a durability claim (`crate::live_ship::begin_durable_bound`): windows of the liveness
+  /// budget, a silent one given up once the control shard has read what came, at most the failover SLO from the hold.
+  fn durable_bound(&mut self, now_ns: u64) -> slates_bridge_core::durable_bound::DurableBound {
+    let volume = self.volume;
+    state::with_state(|s| crate::live_ship::begin_durable_bound(s, volume, now_ns)).unwrap_or_else(
+      || {
+        // The shard's state out of reach (its shutdown): one window, with nothing to hear, ending at its total bound.
+        let window_ns = crate::live_ship::durable_wait_ns();
+        slates_bridge_core::durable_bound::DurableBound::begin(
+          slates_bridge_core::durable_bound::Heard::default(),
+          now_ns,
+          slates_bridge_core::durable_bound::Spans {
+            window_ns,
+            total_ns: window_ns,
+            look_ns: window_ns,
+          },
+        )
+      },
+    )
+  }
+
+  /// What a held reply's wait is judged against now (`crate::live_ship::heard_now`): the volume's acknowledgements and
+  /// the control shard's idles.
+  fn durable_heard(&mut self) -> slates_bridge_core::durable_bound::Heard {
+    let volume = self.volume;
+    state::with_state(|s| crate::live_ship::heard_now(s, volume)).unwrap_or_default()
   }
 
   /// On the device's ledger (`virtiofs.live_fsync_waited`, `virtiofs.live_fsync_refused`).

@@ -753,6 +753,14 @@ impl Volume {
       .snapshots
       .get_mut(snapshot_handle(snapshot))
       .map_err(|_| VfsError::StaleHandle)?;
+    // The clone's root directory is its snapshot's, which keeps the origin's root number: the number a base plane keys
+    // the root's listing by, and the one the clone's image records as its root. Read before the snapshot is pinned, so
+    // a refusal pins nothing.
+    let root_no = store
+      .dirs
+      .get(snap.root)
+      .map_err(|_| VfsError::StaleHandle)?
+      .inode;
     snap.clone_refs = snap.clone_refs.saturating_add(1);
     let (root, inode_root, epoch, referenced) = (
       snap.root,
@@ -779,10 +787,7 @@ impl Volume {
       last_snapshot: None,
       origin_epoch: Some(epoch),
       quota: config.quota,
-      base: origin
-        .base
-        .as_ref()
-        .map(|b| b.for_clone(InodeNo::compose(config.prefix, 1), epoch)),
+      base: origin.base.as_ref().map(|b| b.for_clone(root_no, epoch)),
       bytes: ByEpoch::inherited(epoch, referenced),
       journal: OpLog::new(config.journal_bytes),
       change: ChangeWaiters::default(),

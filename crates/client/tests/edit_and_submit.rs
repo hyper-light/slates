@@ -181,6 +181,9 @@ fn refusal_of(error: ClientError) -> Answer {
 fn submitted(result: Result<Submitted, ClientError>) -> Answer {
   match result {
     Ok(Submitted::Accepted(version)) => Answer::Accepted(version),
+    Ok(Submitted::ApprovalRequired { .. }) => {
+      panic!("no write policy is set here, so no merge awaits approval")
+    }
     Ok(Submitted::Conflict(windows)) => Answer::Conflict(
       windows
         .into_iter()

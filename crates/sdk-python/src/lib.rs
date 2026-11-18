@@ -14,9 +14,9 @@
 //! to the thread that connected it (its rings are single-consumer), so Python must use it from that
 //! thread — PyO3 enforces this rather than allowing an unsound cross-thread move.
 //!
-//! Grants are deliberately absent (R10): the SDK has no verb that creates a landing grant, exactly as
-//! the design requires — a grant is made only by a human at the CLI or a confirmation surface, never by
-//! an agent answering its own question.
+//! Grants are deliberately absent (R10): the SDK has no verb that creates or approves a landing grant. A landing
+//! follows the write mode the user gave the agent (A-285): bypass lands at once, ask comes back grant-required for the
+//! launcher to approve, a forbidding mode is refused; the launcher, never the agent, sets the mode and approves.
 
 // The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds
 // are exempt. Once a crate is clean this holds it there; out-of-bounds indexing and slicing are denied
@@ -248,6 +248,15 @@ fn work_dict(py: Python<'_>, id: VolumeId, base: u64) -> PyResult<Py<PyDict>> {
 fn submitted_to_py(py: Python<'_>, outcome: Submitted) -> PyResult<PyObject> {
   let dict = match outcome {
     Submitted::Accepted(version) => merge_outcome_dict(py, Some(version), Vec::new())?,
+    // A merge an ask write policy holds (A-285): the increment's identity the launcher's approval binds, and its paths.
+    Submitted::ApprovalRequired { identity, paths } => {
+      let dict = merge_outcome_dict(py, None, Vec::new())?;
+      dict
+        .bind(py)
+        .set_item("approval_identity", hex32(&identity))?;
+      dict.bind(py).set_item("approval_paths", paths)?;
+      dict
+    }
     Submitted::Conflict(windows) => merge_outcome_dict(
       py,
       None,
