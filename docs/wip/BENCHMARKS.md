@@ -12675,6 +12675,144 @@ quiet p50, and a write, a rename and an unlink 31 to 87 µs more loaded. The lev
   account for 42.
 - Crash safety's price (the journal, the ledger, A-198's barriers) stays, as the supervisor decided on 2026-11-07 (R4).
 
+### Main after A-348 against the DLL and against 69cd38b2, and where Step 7, continued closes (2026-11-18)
+
+**The A/B.** Diag `diag-g258-9` (run 44325673298), four arms interleaved on one VM of each runner, quiet and loaded (two
+spinners a logical CPU), ten runs a lane planned: main (`093fef96`: A-348 landed, and A-223 and A-326 since 69cd38b2), a
+control (main's binary copied), the DLL arm (`71cf09ac`, built from its own tree as above) and before (`69cd38b2`, the
+main every A/B in this section measured), with 69cd38b2's `mount_bench` (nine operations). Read as diag-g258-6 above.
+- windows-11-arm, 14:56–16:20 UTC: 5 runs done, 0 failed, no daemon lapsed in any arm. Run 6 was lost with the runner
+  itself ("The hosted runner lost communication with the server", the job ended 17:21 UTC), so its numbers are none.
+- windows-latest (AMD Family 25 Model 1, image win25-vs2026 20261116.315.1; diag-g258-6's was Family 26 Model 2, so the
+  two lanes' microseconds do not compare), 15:02–17:25 UTC: 2 runs done (5 and 7), 5 failed (1–4 and 6); run 8 was
+  cancelled when the goal closed. Each failed run lost a drive when its daemon was killed under the loaded pass ("the
+  daemon's heartbeat lapsed (1121–1154 ms old, past 1077–1082 ms …); killing it"). Kills over the seven runs: main 5,
+  control 4, the DLL arm 1, before 0 (before's daemon exited 143 and was restarted once in runs 1 and 3–7; its older
+  anchor prints no lapse line). Main's and the control's are A-223's: its window, priced on a hundred times the wake
+  estimate, let a one-shard daemon spin for seconds after a WinFsp request until its watchdog withheld the beat; A-361
+  (goal g234, landed `519969ed9`) holds every idle spin under the watchdog's window. This lane measured main before A-361
+  under load, so its two runs are recorded and not read as a verdict.
+
+**Verdict.**
+- **windows-11-arm: 10 cells of 36 beyond the DLL's spread, as in diag-g258-6 (10 of 36).** At the p50, within each
+  run: quiet create +19.6 µs, stat +44.9, read +5.6, rename +76.3, unlink +41.1; loaded write +85.3, stat +2.7, rename
+  +43.4, unlink +21.3; and the loaded rename p99. The control's differences sit within 8 µs of main's at each p50 there.
+- **Main against 69cd38b2 on windows-11-arm** (before − main within each run, against the control's spread): within it in
+  32 of 36 p50 and p99 cells; 69cd38b2 slower at the loaded open p50 (+139.4 µs) and p99 (+5,544), faster at the quiet
+  create p99 (−113.5) and close p99 (−622.7). What main took since (A-223, A-326, A-348) neither closed nor widened the
+  arm64 gap at the p50.
+- **windows-latest: 13 cells of 36 beyond the DLL's slowest run, no verdict.** Each p50 among them is beyond it by under
+  50 µs (quiet close 5.4, read 1.6, unlink 8.1; loaded write 0.8, fsync 8.2, open 7.2, rename 49.8), but two runs make
+  each arm's spread two values wide, and main lapsed in the five runs that failed.
+
+**Where Step 7, continued closes** (the supervisor, 2026-11-18, for Ada: "close it at its stated condition"). The cuts
+were made and measured on both Windows runners, quiet and loaded, and every run's numbers are in this section: A-348 (the
+request channel's bound) landed; cut (c)'s no-wake variant and cut (b)'s two per-kind spin choices are measured and
+rejected; the bench's `create_security` op landed. What remains against the DLL is arm64's p50 gap above, unchanged
+since diag-g258-6, and its levers are the list just above (a spin choice that reads contention, shard threads above
+normal priority, a fresh per-phase profile), none started under this goal. Owed to whoever takes the next cut: the
+x86_64 lane again with A-361 in main.
+
+#### arm64 (windows-11-arm), run 44325673298: 5 runs done, 0 failed
+
+arm64 (windows-11-arm), run 44325673298, quiet: main's and the DLL arm's p50 and p99 (median run, the DLL's slowest run), and main − dll within each run, µs.
+
+| op | rank | main median | dll slowest | verdict | main − dll, each run (sorted) | median | control − dll median |
+|---|---|---|---|---|---|---|---|
+| create | p50 | 228.2 | 220.6 | **worse** by 7.6 | +16.3 +19.4 +19.6 +20.2 +26.4 | +19.6 | +21.9 |
+| create | p99 | 548.6 | 1049.6 | within | -16.9 +45.0 +76.0 +86.0 +154.3 | +76.0 | +72.9 |
+| write | p50 | 99.9 | 108.8 | within | -2.0 -0.3 +0.8 +2.8 +6.7 | +0.8 | +2.2 |
+| write | p99 | 278.4 | 1460.1 | within | +12.5 +16.4 +33.4 +79.6 +329.2 | +33.4 | +46.9 |
+| fsync | p50 | 114.8 | 118.9 | within | -0.8 -0.4 +0.6 +6.7 +7.0 | +0.6 | +2.0 |
+| fsync | p99 | 204.9 | 1317.2 | within | -731.6 +8.5 +9.7 +14.2 +37.6 | +9.7 | +17.1 |
+| close | p50 | 3931.4 | 4325.3 | within | -3000.5 -633.2 -137.9 +76.6 +483.6 | -137.9 | +207.0 |
+| close | p99 | 7132.6 | 16884.7 | within | -7670.8 -1258.1 -867.2 -522.1 -217.5 | -867.2 | -372.1 |
+| stat | p50 | 168.6 | 125.1 | **worse** by 43.5 | +28.9 +43.1 +44.9 +46.3 +65.7 | +44.9 | +50.2 |
+| stat | p99 | 247.5 | 303.8 | within | +36.8 +37.1 +37.9 +43.1 +182.0 | +37.9 | +114.1 |
+| open | p50 | 2110.4 | 4002.0 | within | -1726.0 -70.3 +4.3 +50.2 +2666.5 | +4.3 | +381.5 |
+| open | p99 | 6196.7 | 7153.3 | within | -216.0 -98.2 -6.9 +245.5 +2217.1 | -6.9 | +92.2 |
+| read | p50 | 49.2 | 47.5 | **worse** by 1.7 | -2.1 +2.2 +5.6 +5.7 +7.9 | +5.6 | +4.7 |
+| read | p99 | 78.6 | 82.1 | within | -2.5 +0.3 +2.0 +11.5 +12.2 | +2.0 | +4.8 |
+| rename | p50 | 480.2 | 450.0 | **worse** by 30.2 | +63.4 +74.6 +76.3 +78.6 +87.2 | +76.3 | +84.0 |
+| rename | p99 | 925.8 | 2916.5 | within | -333.7 -80.8 +16.0 +115.6 +1199.3 | +16.0 | +705.5 |
+| unlink | p50 | 297.0 | 271.0 | **worse** by 26.0 | +35.8 +38.5 +41.1 +41.4 +52.3 | +41.1 | +39.4 |
+| unlink | p99 | 585.3 | 591.2 | within | -7.0 +25.1 +139.7 +158.2 +980.9 | +139.7 | +156.4 |
+
+arm64 (windows-11-arm), run 44325673298, loaded: main's and the DLL arm's p50 and p99 (median run, the DLL's slowest run), and main − dll within each run, µs.
+
+| op | rank | main median | dll slowest | verdict | main − dll, each run (sorted) | median | control − dll median |
+|---|---|---|---|---|---|---|---|
+| create | p50 | 220.8 | 244.2 | within | -10.1 -4.0 -0.8 +1.8 +14.9 | -0.8 | -0.2 |
+| create | p99 | 1361.6 | 1770.3 | within | -889.4 -217.4 +571.4 +658.6 +2639.4 | +571.4 | +86.7 |
+| write | p50 | 186.9 | 105.5 | **worse** by 81.4 | +76.7 +83.3 +85.3 +85.6 +86.1 | +85.3 | +83.1 |
+| write | p99 | 590.0 | 638.9 | within | -119.4 +50.0 +146.4 +1186.7 +2359.5 | +146.4 | +1385.9 |
+| fsync | p50 | 115.2 | 135.7 | within | -17.7 -15.9 -15.1 -7.6 -4.6 | -15.1 | -11.2 |
+| fsync | p99 | 415.2 | 13004.2 | within | -12542.9 -3359.7 -2372.0 -1207.9 -277.0 | -2372.0 | -2401.5 |
+| close | p50 | 4571.5 | 5293.4 | within | -549.0 -484.0 -462.8 -423.9 +193.7 | -462.8 | -393.6 |
+| close | p99 | 41087.4 | 50972.1 | within | -9884.7 -8801.1 -6841.0 -3310.6 -1203.2 | -6841.0 | -7087.1 |
+| stat | p50 | 152.5 | 152.4 | **worse** by 0.1 | +0.1 +2.1 +2.7 +4.0 +6.9 | +2.7 | +3.2 |
+| stat | p99 | 769.2 | 37763.8 | within | -37060.3 -33527.5 -32417.1 -30189.9 -25042.9 | -32417.1 | -32918.4 |
+| open | p50 | 3964.8 | 4425.2 | within | -380.7 -278.4 -275.1 -162.0 -71.2 | -275.1 | -256.5 |
+| open | p99 | 40151.0 | 49127.7 | within | -8976.7 -6605.6 -5982.0 -3614.5 -2155.8 | -5982.0 | -4637.0 |
+| read | p50 | 47.3 | 51.5 | within | -4.4 -1.5 -1.2 -0.1 +0.0 | -1.2 | -1.2 |
+| read | p99 | 87.7 | 90.3 | within | -8.4 -4.2 -0.9 -0.5 +2.4 | -0.9 | -3.5 |
+| rename | p50 | 510.3 | 476.4 | **worse** by 33.9 | +33.1 +37.8 +43.4 +44.0 +55.4 | +43.4 | +46.4 |
+| rename | p99 | 36336.1 | 34345.6 | **worse** by 1990.5 | +2679.5 +3377.7 +3760.8 +4167.9 +7536.0 | +3760.8 | +3526.9 |
+| unlink | p50 | 347.8 | 332.4 | **worse** by 15.4 | +14.5 +19.7 +21.3 +25.6 +30.2 | +21.3 | +25.3 |
+| unlink | p99 | 28273.7 | 41467.2 | within | -12844.4 -12234.7 -11627.4 -11404.6 -10234.8 | -11627.4 | -12049.2 |
+
+cells worse than the DLL's spread: 10 of 36
+
+#### x86_64 (windows-latest), run 44325673298: 2 runs done, 5 failed
+
+x86_64 (windows-latest), run 44325673298, quiet: main's and the DLL arm's p50 and p99 (median run, the DLL's slowest run), and main − dll within each run, µs.
+
+| op | rank | main median | dll slowest | verdict | main − dll, each run (sorted) | median | control − dll median |
+|---|---|---|---|---|---|---|---|
+| create | p50 | 910.6 | 983.6 | within | -91.5 +9.5 | +9.5 | -3.9 |
+| create | p99 | 1647.2 | 1929.3 | within | -342.9 +10.3 | +10.3 | -17.9 |
+| write | p50 | 81.7 | 109.1 | within | -27.4 +5.3 | +5.3 | +5.2 |
+| write | p99 | 214.9 | 222.2 | within | -39.1 +32.0 | +32.0 | +30.6 |
+| fsync | p50 | 126.4 | 166.4 | within | -40.0 -3.1 | -3.1 | -2.2 |
+| fsync | p99 | 254.0 | 338.6 | within | -100.1 +22.4 | +22.4 | +17.2 |
+| close | p50 | 67.1 | 61.7 | **worse** by 5.4 | +5.2 +6.9 | +6.9 | +6.9 |
+| close | p99 | 140.5 | 147.9 | within | -13.2 +14.9 | +14.9 | +9.4 |
+| stat | p50 | 261.9 | 333.7 | within | -71.8 +9.8 | +9.8 | +9.4 |
+| stat | p99 | 391.6 | 520.6 | within | -129.0 +27.7 | +27.7 | +27.3 |
+| open | p50 | 168.1 | 189.3 | within | -21.2 +18.5 | +18.5 | +18.1 |
+| open | p99 | 289.1 | 303.1 | within | -14.0 -1.9 | -1.9 | +2.9 |
+| read | p50 | 14.0 | 12.4 | **worse** by 1.6 | +1.5 +1.9 | +1.9 | +1.9 |
+| read | p99 | 32.2 | 20.3 | **worse** by 11.9 | +6.0 +11.9 | +11.9 | +13.9 |
+| rename | p50 | 595.1 | 689.1 | within | -94.0 +50.9 | +50.9 | +53.1 |
+| rename | p99 | 1102.6 | 1396.3 | within | -293.7 +162.4 | +162.4 | +302.2 |
+| unlink | p50 | 378.3 | 370.2 | **worse** by 8.1 | +8.1 +57.1 | +57.1 | +58.2 |
+| unlink | p99 | 869.9 | 867.2 | **worse** by 2.7 | +2.7 +48.4 | +48.4 | +72.0 |
+
+x86_64 (windows-latest), run 44325673298, loaded: main's and the DLL arm's p50 and p99 (median run, the DLL's slowest run), and main − dll within each run, µs.
+
+| op | rank | main median | dll slowest | verdict | main − dll, each run (sorted) | median | control − dll median |
+|---|---|---|---|---|---|---|---|
+| create | p50 | 1609.0 | 1681.7 | within | -72.7 -22.0 | -22.0 | -14.7 |
+| create | p99 | 98278.9 | 234223.1 | within | -137034.3 -135944.2 | -135944.2 | -132828.6 |
+| write | p50 | 124.7 | 123.9 | **worse** by 0.8 | +0.8 +1.7 | +1.7 | +1.6 |
+| write | p99 | 398.5 | 22153.6 | within | -21755.5 -11.5 | -11.5 | -7.9 |
+| fsync | p50 | 200.2 | 192.0 | **worse** by 8.2 | +7.5 +9.4 | +9.4 | +8.9 |
+| fsync | p99 | 467.8 | 435.9 | **worse** by 31.9 | -9.5 +109.1 | +109.1 | +703.4 |
+| close | p50 | 81.1 | 97.1 | within | -16.4 -16.0 | -16.0 | -16.0 |
+| close | p99 | 213.7 | 170.9 | **worse** by 42.8 | +28.1 +42.8 | +42.8 | +43.6 |
+| stat | p50 | 356.3 | 361.8 | within | -6.3 -5.5 | -5.5 | -7.2 |
+| stat | p99 | 30476.5 | 114279.2 | within | -85470.2 -81569.4 | -81569.4 | -86485.8 |
+| open | p50 | 248.4 | 241.2 | **worse** by 7.2 | +7.2 +7.8 | +7.8 | +6.9 |
+| open | p99 | 1595.8 | 548.7 | **worse** by 1047.1 | +1047.1 +1078.8 | +1078.8 | +785.4 |
+| read | p50 | 107.6 | 125.5 | within | -20.0 -17.9 | -17.9 | -20.4 |
+| read | p99 | 243.6 | 226.8 | **worse** by 16.8 | +16.8 +28.6 | +28.6 | +859.1 |
+| rename | p50 | 880.1 | 830.3 | **worse** by 49.8 | +49.8 +50.6 | +50.6 | +49.7 |
+| rename | p99 | 62878.4 | 63484.4 | within | -1453.3 +4003.5 | +4003.5 | +6820.6 |
+| unlink | p50 | 477.3 | 494.1 | within | -17.7 -13.3 | -13.3 | -12.7 |
+| unlink | p99 | 33280.9 | 132952.3 | within | -100125.9 -93657.2 | -93657.2 | -93074.7 |
+
+cells worse than the DLL's spread: 13 of 36
+
 ## CreateGreen sliced: its shard and peak RSS over `fs/` and the whole kernel (2026-11-07)
 
 `agents/reland-a207-3` (`CreateGreen { base }` walked, hashed and seeded in slices with its reply deferred; the
