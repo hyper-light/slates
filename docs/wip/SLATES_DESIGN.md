@@ -2766,7 +2766,8 @@ renamed-away name this way, which is counted (`fuse.epoch_unsupported`).
 validation rules; finite stale-data TTLs do not silently become exact live-source semantics. The
 launcher (`slates exec`) implements the chosen-path form with `CLONE_NEWUSER|CLONE_NEWNS`,
 recursive-private root, and a bind mount; on AppArmor-restricted hosts it reports the exact
-setting needed. Base files: a read-only `open` of an untouched base file is answered from
+setting needed, and, where its caller opts in, makes its namespace under slates' AppArmor profile for its
+executable, which an administrator loads (A-370, "The launcher on a restricted host" below). Base files: a read-only `open` of an untouched base file is answered from
 the daemon's descriptor on the backing file; `read` copies from the page cache into arena pages
 once and replies by reference, with splice where the kernel allows it; `mmap` of an untouched
 base file is served through the same pages. FUSE passthrough is not used: it requires
@@ -4641,12 +4642,64 @@ FSKit unmounts the volume; the daemon's state is intact; the anchor re-mounts (D
 Unprivileged user namespaces disabled: Refused for the launcher form with the exact remedy. That includes
 a host whose AppArmor confines them (Ubuntu 24.04's `kernel.apparmor_restrict_unprivileged_userns=1`): `unshare`
 succeeds there, but the namespace gets no capability, so the launcher names that sysctl, or an AppArmor profile
-granting `userns,` to the binary, as the operator's remedy (2026-11-05; GAPS `8a-launcher-ci`).
+granting `userns,` to the binary, as the operator's remedy (2026-11-05; GAPS `8a-launcher-ci`). Since A-370 slates
+ships that profile and the launcher uses it only when its caller asks: asked and loaded, the namespace is made under
+it and the command runs outside it; not asked, the launcher leaves a loaded profile first and the refusal is the one
+above; asked and not loaded, the refusal names the profile's file and the command that loads it (below).
 `allow_other` requested but not permitted: Refused with the `/etc/fuse.conf` line. FSKit module
 not enabled: Refused with the exact System Settings path. Any separately selected limited
 NFS form reports its weaker semantics and cannot satisfy a full-POSIX request. Base
 file unreadable (permissions changed, base unmounted): Refused (`EIO` at the mount, `BaseUnavailable`
 in `status`) for that entry only.
+
+**The launcher on a restricted host (A-370).** Ubuntu 24.04 and 26.04 confine every unprivileged user namespace through
+AppArmor (`kernel.apparmor_restrict_unprivileged_userns=1`): `unshare` succeeds, then the process moves into the
+`unprivileged_userns` profile, which denies the namespace every capability, so the launcher can neither write its maps
+nor bind, whoever writes the maps (GAPS `8a-launcher-ci`). An AppArmor profile attached to the launcher's executable
+that grants `userns,` lifts this for that executable alone. Loading it needs root, so slates never loads it (R10) and
+never writes `/etc/apparmor.d` (R1). Ada's decision, 2026-11-18: "Ship the profile but feature flag it so whether via
+SDK (Node/Python), API, or CLI it is user enabled."
+- *The profile* (`slates_client::exec::profile`) is `abi <abi/4.0>,` then `profile <executable> flags=(unconfined) {
+  userns, }`:
+  - It is named by the executable's real path, AppArmor's own convention. So it attaches to that path alone, two
+    executables on one host never share a name, and the launcher knows its own profile by its label.
+  - `flags=(unconfined)` mediates nothing else, the form Ubuntu's own `userns,` profiles take (`/etc/apparmor.d/chrome`
+    on the runners).
+  - A path the profile cannot name exactly is refused: one holding a character outside ASCII letters, digits and
+    `/ . _ - +` (AppArmor reads several as patterns, quotes, variables or separators), or an empty, `.` or `..`
+    component.
+  - It ships inside every release binary and SDK package, rendered for the executable's own path
+    (`slates apparmor profile`, `apparmor_profile(path)`, `apparmorProfile(path)`), not as a file naming one path: the
+    profile must name wherever the binary was put. `slates apparmor check` prints the root commands that save it as
+    `/etc/apparmor.d/<the path, each / a .>` and load it with `apparmor_parser -r`.
+- *The flag* is `AppArmor`, off unless the user opts in: `slates exec --apparmor-profile`, slates-api's
+  `ExecSpec::apparmor`, the SDKs' `apparmor_profile=True` and `{ apparmorProfile: true }`.
+  - **Off:** a launcher whose thread runs under its own profile writes `changeprofile unconfined` to
+    `/proc/thread-self/attr/apparmor/current` first. Its namespace then meets the host's restriction exactly as with no
+    profile, and the refusal names the switch.
+  - **On:** the namespace is made under the profile, then the launcher writes `exec unconfined` to
+    `/proc/thread-self/attr/apparmor/exec`. So the command runs unconfined, and a namespace the command makes itself is
+    restricted as any process's is. A refused write is a typed refusal, never a command run holding the grant.
+- *Who is restricted.* The restriction exempts a process holding `CAP_SYS_ADMIN` in its user namespace (root), whose
+  namespaces get their capabilities whatever the setting, so the launcher judges a refusal, and `slates apparmor check`
+  its readiness, by the restriction applying to it (`Confinement::restricted_here`), not by the setting alone.
+- *Who holds the grant.* A loaded profile labels every process of its executable. slates' own code uses the grant in
+  the launcher alone, there only when asked, and never in the command it runs. But any user who may run the executable
+  may use the grant through it (a preload or a debugger runs their code under its label), and on Ubuntu 24.04 any
+  unconfined process may enter a loaded profile by `change_profile` without running it at all, as it may enter the
+  user-namespace profiles Ubuntu itself loads (measured below). So loading the profile is an administrator's decision
+  that every user of the host may create user namespaces, as on a host without the restriction; the profile's header
+  and `docs/cli.md` say so.
+- *Rejected:*
+  - Entering a named profile with `change_profile` from unconfined (the `aa-exec` route). Ubuntu treats it as a bypass
+    of the restriction and closes it where `kernel.apparmor_restrict_unprivileged_unconfined=1`, Ubuntu 26.04's
+    default. Measured, diagnostics run 44349241634: on 26.04 the kernel logs "change_profile unprivileged unconfined
+    converted to stacking", the label is `slates-probe//&unconfined`, and the namespace is refused; on 24.04 (the
+    setting 0) any unconfined process enters the profile and maps itself root. Path attachment needs no such
+    permission.
+  - A profile in enforce mode, allowing the binary what it needs and moving its children into a capability-free
+    profile, as Ubuntu's `bwrap` profile does. It would confine the daemon and every verb too, and any mediation class it
+    missed would break them; the exec-time `exec unconfined` gives the command the same outcome without it.
 
 **Derived constants.** NFS fallback `actimeo` for writable volumes = k × measured GETATTR RTT
 (k from the multi-process coherence test); FUSE `max_background` and congestion threshold = shard
@@ -7367,6 +7420,20 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > was caught up in batches of several entries an exchange (`fleet.live.batches`, `fleet.live.batched`), where it had
 > been sent one entry an exchange.
 >
+> **A whole state in flight is not counted against the deltas (A-371, 2026-11-18; g230).** The credit counted every entry
+> not yet durable, the whole state the owner had just appended among them, and the owner sets the credit from that very
+> entry's size: so until a whole entry was durable every delta behind it was refused `NoCredit`, each refusal owed a
+> whole state again, and the volume shipped whole once more as soon as the credit freed. The measurer's 32 writers on one
+> 128 MiB live volume saw it as two extra whole records of about 135.5 MB in every completed run (1 became 3), each an
+> O(volume) build in one turn of the owner shard. A whole state now rides one past the credit as `append_checkpoint`
+> always said, and the credit a delta is held to counts the unsettled deltas alone (`Shipper::unsettled_whole_bytes`);
+> a whole state is still admitted only while everything in flight is within the credit, so at most the credit's deltas
+> and the whole states admitted past it are in flight. Held by `deltas_behind_a_whole_state_in_flight_are_admitted_within_
+> the_credit` (`crates/db/tests/live.rs`: a whole state of 64 KiB appended as the daemon appends it, then 4 KiB deltas
+> with nothing acknowledged: every delta within the credit admitted, the next refused, no second whole state, all settled
+> by the acknowledgement), red with the whole state counted. Owed (measurement): the 32-writer run's whole records and
+> step lengths again.
+>
 > **Chaos from outside the processes (2026-11-06).** `crates/cli/tests/live_chaos.rs` streams writes through the Rust
 > client while it partitions or kills processes. It ends every flow with Agreement, NoLoss, StaleNeverCommits and
 > Convergence, checked from every node's `status`; each live line now carries its head's epoch and chain identity and
@@ -8305,7 +8372,8 @@ and `scripts/`; published raw by `slates skills install` into `.agents/skills/` 
 guidance.
 
 **CLI.** `slates daemon`, `slates status [--drift <volume>]`, `slates volume ...` (including
-`create --base <dir>`), `slates attach ...`, `slates exec` (Linux launcher), `slates archive ...`,
+`create --base <dir>`), `slates attach ...`, `slates exec` (Linux launcher; `--apparmor-profile`, A-370),
+`slates apparmor profile|check` (the launcher's AppArmor profile and the host's readiness, A-370), `slates archive ...`,
 `slates base rewitness|pin|read <volume> [paths]`, `slates land <snapshot> --to <dir> [--filter ...]`
 (plans and prints the landing manifest summary, then waits for a grant), `slates grant
 <request-id> [--session]` and `slates grant --watch` (the terminal confirmation surface: prints
@@ -10334,7 +10402,8 @@ fd handoff through the anchor, `slates exec`, the conformance and workload harne
 3. The `Bridge` trait implementation in the core; inode `(no, gen)`; invalidation on every
    mutation visible through another attachment; `fsync` semantics; `statfs`.
 4. `slates exec`: user+mount namespace, recursive-private root, bind mount, exec; AppArmor
-   detection and the exact remedy message.
+   detection and the exact remedy message; slates' AppArmor profile for a restricted host, used only when the caller
+   asks (A-370).
 5. Conformance: pjdfstest, fsx, fsstress in CI; xfstests generic and LTP nightly; the reviewed
    expected-failure list.
 6. Workloads: git, cargo, npm, python/pytest, rg, rsync, sqlite, editor patterns, inotify.
@@ -11609,7 +11678,7 @@ requested form. The virtio-fs backend, device residency and mapping matrix are P
 | macOS arm64 | 16 KiB pages; no superpages; `os_sync_wait_on_address` needs 14.4 (minimum version); thread affinity is a hint; QoS steers P/E |
 | macOS FSKit | 15.4+ for the framework; URL resources 26+ (15.x needs a block resource); one-time user enablement; sandboxed extension (app-group IPC only); Swift entry point; Operations (15.4–26) and Handler (27+) protocol generations; app-bundle packaging and signing |
 | macOS NFS fallback | no xattrs by default; no "forget"; weak close-to-open; `.nfs` temp files on delete-while-open; documented Degraded cells |
-| Linux kernel floors | 5.10 baseline through epoll; io_uring requires synchronous cancellation (6.0), with single-issuer deferred work on 6.1; FUSE io_uring 6.14; MADV_POPULATE 5.14; futex_waitv 5.16; user namespaces may be restricted by AppArmor (Ubuntu 23.10+) |
+| Linux kernel floors | 5.10 baseline through epoll; io_uring requires synchronous cancellation (6.0), with single-issuer deferred work on 6.1; FUSE io_uring 6.14; MADV_POPULATE 5.14; futex_waitv 5.16; user namespaces may be restricted by AppArmor (Ubuntu 23.10+; lifted for the launcher by slates' profile when asked, A-370, which needs the per-module `/proc/thread-self/attr/apparmor` of 5.8) |
 | Windows | `WaitOnAddress` process-local (named Events across processes); asyncio needs sockets; AF_UNIX creates NTFS reparse points (not used); directory mounts are reparse points (refused); large pages need `SeLockMemoryPrivilege` |
 | Stable Rust 1.98 | no nightly features; `RawWakerVTable` encodings; `std::thread::scope`; `OnceLock` |
 | Containers | io_uring may be blocked by seccomp: epoll fallback is first-class; `mlock` may be limited: probed and reported |
@@ -23635,6 +23704,9 @@ form, the judgment under the route's stated differences), and CI's `windows-lint
   against itself, refused because no stated line differed.
 - **Owed.** The lanes' first run, which is the supervisor's. The Windows workloads cell's record, re-recorded from that
   run (the tracked record is still the owed skip of 2026-11-05). The other workloads' Windows forms.
+- **Amended by A-360 (2026-11-18).** The stated difference is WinFsp's driver's as released: a driver carrying
+  `docs/wip/winfsp-patches` forwards a hard link, and the drive makes it. Where a lane's driver makes links, the stated
+  lines stop differing and the harness fails them, so the list shrinks in that change.
 
 ### A-292 — A held durable reply gives up when its holders are silent, not at a deadline (2026-11-17, built for goal g244; found 2026-11-09 by bug-sweep)
 
@@ -25424,8 +25496,42 @@ its own), `docs/library.md`, and:
   requirement, the work's rules travelling, the replay's record, the checkpoint's table, the green's signers, the
   consumer refusal), the restored build green. The verifier's 11 unit tests over the new `ssh-keygen` vectors, the
   chain and checkpoint codecs' tests, and the contract's `a_signed_merge_is_judged_and_read_back_through_the_contract`.
-- **Owed** (GAPS): the verdict carried by a version's merge record to holders and a takeover successor (a successor
-  records none today); a real FIDO key's signature end to end.
+- **Owed** (GAPS): a real FIDO key's signature end to end.
+
+**Signed work survives a takeover (2026-11-18, A-321's third part; goal g090).** Applied in the same change to GAPS
+(the A-321 entry's owed list, the A-285 sibling it named) and:
+- `crates/server/src/catalog.rs`: `CatalogValue::write`, `write_version` and `signers`, appended; `CatalogValue::of`
+  fills them. The ops that set them already moved `catalog_version` (A-285, A-321), so every setting ships as a newer
+  register; only the value lacked them.
+- `crates/server/src/verbs.rs`: `materialize_taken_over` (a plain volume) and `record_adopted_green` (a green, A-333)
+  make the successor's record with the catalog's policy, version and signers (each wrote `write: None`).
+- `crates/server/src/merge_service.rs`: `MergeRecordValue::signature` (a `SignatureVerdict`, the chain entry's three
+  fields in a type the wire encodes), appended, filled from the green's engine when the record is made; a holder's
+  `recompute` records it in its replica as it accepts the record. `crates/server/src/merge_origin.rs`: a replica
+  advanced or rebuilt from the ledger records each version's verdict as its record carries it. So the replica a
+  takeover adopts (A-333) answers every version as its owner judged it, and so does one a restarted successor rebuilds.
+- `crates/server/src/green_adopt.rs`, `crates/server/src/fleet.rs`: `AdoptedGreen` carries the catalog's policy, version
+  and signers (`handed_green`).
+- `crates/server/src/signed_work.rs`: `shipped` and `adopted`, the verdict between its chain-entry and record forms.
+- Tests: `crates/server/tests/fleet.rs` (`a_greens_policy_signers_and_verdicts_survive_its_owner`,
+  `a_volumes_policy_and_signers_survive_its_owner`).
+
+- **Why.** Provenance and policy are the volume's, so they outlive the owner that recorded them. A successor rebuilt a
+  taken-over green from its holders' merge records, which carried no verdict, and made every volume's record with no
+  policy and no signers, so a green taken over read its signed versions unsigned, dropped its signed-merge requirement
+  and judged signatures under no trusted key, and a volume taken over landed as an unset one does.
+- **How.** The verdict rides the version's merge record to the holders the record commits at, as its completion key
+  does (A-255); each holder records it in the replica it recomputes the version into, and the successor adopts its
+  replica as the green's engine (A-333), whose checkpoint keeps it as the owner's did. The policy, its version and the signers ride the catalog register, as the access list does (A-237).
+  Nothing is judged again: a version reads back as it was judged when it merged.
+- **Proven** (macOS arm64, Mac Studio, 2026-11-18), on three nodes at `f = 1`: a green trusting one key and requiring
+  signed merges, merged signed at 1, its owner killed once both survivors held the catalog naming the policy and the
+  key and the merge record carrying the verdict; on the successor the policy and the signers read back at version 2,
+  version 1 verified naming the key, an unsigned merge refused `SignatureRequired` naming the green, and a signed one
+  merged at 2 verified. A plain volume forbidding landings and trusting one key: on its successor both read back and a
+  landing refused `PolicyForbids`. Each guard red alone (the green's adoption dropping the catalog's policy, a plain
+  successor dropping it, the holders' replicas dropping the shipped verdict, the owner shipping none, the catalog
+  carrying none), the restored build green.
 
 **Signed landings (2026-11-18, A-321's second part; goal g090).** Applied in the same change to: §4.15 (the audit
 record's shape, step 2 "Present", a status blockquote), §4.12 ("The consumer contract": its signed-work bullet,
@@ -26912,6 +27018,165 @@ ledger), `crates/cluster/src/content.rs` (`Held::by_sequence`, charged in `manif
 - **Measured.** Kiln r3491, the Mac Studio, 2026-11-18, debug build, `a_submit_late_in_a_greens_history_is_answered_as_fast_as_an_early_one`:
   at 300 versions the late median 2.92 to 3.28 ms against the early 1.87 to 1.96 (before, 4.4 to 6.4 against 2.0 to
   2.4); at 1,000 versions 8.49 ms against 2.28 (before, 18.2 against 2.16). The rest is the content hold's image (owed).
+
+### A-371 — A whole state in flight rides one past the live credit and never counts against the deltas behind it (2026-11-18, g230, scale-out; §4.10 "Live shipping"; AC-8.9; amends A-200's credit of 2026-11-17)
+Applied in the same change to:
+- §4.10 "Live shipping": A-371's status beside the credit in bytes.
+- `crates/db/src/live.rs`: `Shipper::unsettled` records whether each entry is a whole state;
+  `Shipper::unsettled_whole_bytes`; `Shipper::append` holds the deltas in flight, a whole state's bytes left out, to
+  the credit; the docs of `Bounds::credit`, `append` and `in_flight_bytes`.
+- Tests: `deltas_behind_a_whole_state_in_flight_are_admitted_within_the_credit` (`crates/db/tests/live.rs`).
+- GAPS: the entry of 2026-11-18.
+- **What was there.** The credit counted every unsettled entry. The daemon appends a whole state past the credit and
+  then sets the credit from that state's size, so the whole state alone filled it: every delta until the whole state was
+  durable was refused, each refusal owed another whole state, and under sustained writes a large live volume shipped
+  whole again and again, each build one turn of the owner shard.
+- **The rule.** The credit holds the deltas in flight; a whole state rides one past it, admitted only while everything in
+  flight is within the credit, and is never counted against the deltas behind it.
+
+### A-370 — The launcher makes its namespace under slates' AppArmor profile where its caller asks, on a host that restricts unprivileged user namespaces (2026-11-18, goal g078 / kiln 7d8d1280; §4.6 "The launcher", "Failure matrix"; Ada's decision of 2026-11-18; GAPS `8a-launcher-ci`)
+
+- **What was wrong.** On Ubuntu 24.04 and 26.04 AppArmor confines every unprivileged user namespace
+  (`kernel.apparmor_restrict_unprivileged_userns=1`), so `slates exec` could not run unprivileged there: since
+  2026-11-05 it refused naming the setting and the two ways an administrator lifts it. Ada, 2026-11-18: "Ship the
+  profile but feature flag it so whether via SDK (Node/Python), API, or CLI it is user enabled."
+- **The rule.**
+  - slates renders an AppArmor profile for the launcher's executable that grants `userns,` and nothing else
+    (`flags=(unconfined)`), named by the executable's real path. An administrator loads it, as root: slates never does
+    (R10) and never writes `/etc/apparmor.d` (R1).
+  - The launcher uses it only when its caller sets the AppArmor option, off unless set, in every surface.
+  - Off, a launcher under its own profile leaves it before the namespace (`changeprofile unconfined`), so the host's
+    restriction applies as with no profile.
+  - On, the namespace is made under the profile and the command is exec'd unconfined (`exec unconfined`), so slates'
+    code uses the grant in the launcher alone.
+  - The refusals are typed (`ExecFault`); without the option and with no profile loaded, the refusal reads word for word
+    as before.
+- **Evidence.** Diagnostics run 44344947954 (2026-11-18, the launcher's sequence by a probe on `ubuntu-24.04`, AppArmor
+  4.0.1, and Ubuntu 26.04.1, AppArmor 5.0.2): the profile lets the sequence bind; the step-out restores the refusal;
+  the exec-time change leaves the command `unconfined` with its own `unshare -Ur` refused; a copy at another path is not
+  covered. Through the real binary, diagnostics run 44350784102 (`ubuntu-24.04` x86_64 and arm64, Ubuntu 26.04.1
+  x86_64): with no profile loaded the refusals, without the option word for word as before; with the binary's profile
+  loaded, `--apparmor-profile` binds and its command reads the volume as the runner's uid, runs `unconfined` and is
+  refused its own `unshare -Ur`, while without the option the launcher is refused naming it; a test demanding the
+  loaded regime with none loaded fails (the red check); the SDKs' plumbing tests pass against the built wheel and addon.
+- **Rejected:** entering a named profile by `change_profile` from unconfined, and an enforce-mode profile confining the
+  whole binary (§4.6, "The launcher on a restricted host", says why).
+- **What remains.** The daemon publishing its root mount, so `SLATES_ROOT` need not be named (GAPS). The release
+  carries the profile inside its binaries and the SDK packages, rendered for the executable's own path, not as a file
+  of its own naming one path.
+- **Applied in the same change to**
+  - `crates/client/src/exec.rs` (new: `ExecSpec` and its arguments, `AppArmor`, `profile`, `profile_file`,
+    `load_command`, `unload_command`, `label_name`), `crates/client/src/lib.rs`;
+  - `crates/api/src/exec.rs` (the launcher, moved from `crates/cli/src/exec.rs`: `run`, `confinement`, `check`,
+    `Readiness`, `ExecFault`, `judge_map_refusal`, `command`), `crates/api/src/role/mod.rs` (`role::main` serves `exec`),
+    `crates/api/src/lib.rs` (CONTRACT 25, after A-363's 24);
+  - `crates/cli/src/{args,main,apparmor}.rs` (`exec --apparmor-profile`, `apparmor profile [--executable PATH]`,
+    `apparmor check [--json]`), `crates/cli/src/exec.rs` removed;
+  - `crates/sdk-python/src/lib.rs` (`exec_command`, `apparmor_profile`), `crates/sdk-node/src/lib.rs`, `index.d.ts`,
+    `index.mjs` (`execCommand`, `apparmorProfile`);
+  - `unsafe-budget.toml` (the launcher's one block moved: slates-api 4 → 5, slates-cli 3 → 2);
+  - `.github/workflows/ci.yml` (the gates job's AppArmor step: both regimes on the runner);
+  - §4.6 (the launcher, the failure matrix, "The launcher on a restricted host"), §4.12 "CLI", Phase 3 task 4, Appendix
+    C, GAPS (`8a-launcher-ci` closed; the launcher row), `docs/cli.md`, `docs/library.md`, both SDK READMEs;
+  - tests: `crates/client/src/exec.rs`, `crates/api/src/exec.rs` and `crates/cli/src/args.rs` (the flag's plumbing and
+    judgement), `crates/cli/tests/cli.rs` (`the_launcher_uses_slates_apparmor_profile_only_when_asked`,
+    `apparmor_prints_the_profile_and_checks_the_host`), `crates/sdk-python/tests/test_exec.py`,
+    `crates/sdk-node/tests/sdk.test.mjs`.
+
+### A-360 — WinFsp hard links: a driver patch forwards `FileLinkInformation` to a volume that declares `HardLinks`, and the drive serves it (2026-11-18, goal g258, Ada via the supervisor: "research and figure out a way to make it work"; amends A-300)
+
+Applied in the same change to:
+- §4.6 (Windows): this entry is its record.
+- `docs/wip/winfsp-patches/` (`0001`, `0002`, `README.md`): the driver patch, kept here as Shards' patches are and
+  never sent to WinFsp.
+- `crates/bridge-winfsp`: `ffi.rs` (`VOLUME_FLAG_HARD_LINKS`, bit 7), `host.rs` (`Op::Link`, `op_link`, `staging_name`,
+  `link`, the volume's flag, a file's link count in `FileInfo`), `dispatcher.rs` (the receive worker serves a link before
+  WinFsp's DLL), `inflight.rs` (`Link`, `Request::link`, `Request::successful_link`), `inflight/settle.rs` (a saved
+  successful link is answered as made on recovery). Tests: `inflight::tests::a_forwarded_link_names_its_open_its_new_name_and_whether_it_may_replace`,
+  `only_a_saved_successful_link_is_answered_as_saved`, `a_hostile_link_request_names_nothing`; in the host's tests
+  (`tests/support/host.rs`) `a_forwarded_link_gives_the_open_file_a_second_name`,
+  `a_link_to_a_taken_name_replaces_it_only_when_asked`, `a_link_never_replaces_a_directory_or_a_read_only_file`,
+  `a_link_onto_a_name_of_the_file_itself_changes_nothing`, `a_directory_takes_no_second_name`,
+  `a_replacing_link_refused_part_way_leaves_the_taken_name_as_it_was`,
+  `a_change_to_a_file_with_another_name_is_kept_for_the_other_names`.
+- `crates/bridge-winfsp/src/notify.rs`: `OpenNames::name_of`, `NotifyRound::add_siblings`, `spanning`; tests
+  `a_change_through_one_name_tells_only_the_files_other_names`,
+  `two_changes_owed_one_word_span_every_byte_either_changed`.
+- `crates/server/src/winfsp.rs`: the owed words (`siblings`, `owe_siblings`), told and purged by the next round.
+- `crates/cli/tests/winfsp_semantics.rs`: `a_hard_link_made_through_the_drive_names_the_same_file`, the live
+  `CreateHardLinkW` test, which skips loudly where the driver refuses the link itself.
+- `unsafe-budget.toml`: `slates-bridge-winfsp` 155 to 158, the link's three sites.
+- A-300: its stated difference holds on WinFsp as released.
+- GAPS ("WinFsp hard links").
+- **What was there.** WinFsp's driver completes `FileLinkInformation` itself, `STATUS_NOT_SUPPORTED` with the comment "no
+  hard link support", before any file system is asked; `FileLinkInformationEx` falls to `STATUS_INVALID_PARAMETER`;
+  `NumberOfLinks` is hardcoded to 1; the `HardLinks` volume flag reads "unimplemented; set to 0"; and the advertisement of
+  `FILE_SUPPORTS_HARD_LINKS` is commented out (`src/sys/fileinfo.c` and `volinfo.c` at v2.1, at v2.2B5 of 2026-10-13
+  and at v2.2, the 2026 release, `ada6de15`). WinFsp's NTFS-compatibility page lists hard links as unsupported, and its
+  author declined them in 2016 for the driver changes they need. So no WinFsp file system makes a hard link, and git's and
+  Mercurial's local clones copy on the drive (A-300).
+- **The routes weighed.** WinFsp's API: none, the refusal is in the driver. A newer WinFsp: none, through v2.2. Dokany's
+  driver forwards a set-information class it does not know to user mode, but serving Windows through it would put a
+  second mount framework beside WinFsp (CLAUDE.md §2 item 7). A patch to WinFsp's driver is the one route.
+- **The patch** (two commits on WinFsp v2.1; they apply to v2.2 by three-way merge). For a volume that declares
+  `HardLinks`, the driver forwards `FileLinkInformation` and `FileLinkInformationEx` as a SetInformation request in the
+  rename request's layout: the new name in `Info.Rename.NewFileName`, ReplaceIfExists in bit 0 of `Info.RenameEx.Flags`,
+  and the requestor's token when a name may be replaced. It refuses a directory (`STATUS_FILE_IS_A_DIRECTORY`, MS-FSA
+  2.1.5.15.7), a deleted file and a stream, and a name that may be replaced while it has an open handle, as a rename's
+  target. On success it invalidates the file's cached information, takes a replaced name's file node out of its name
+  table as a rename does, invalidates the new name's directory listing and tells that directory's watchers; the
+  completion runs on the file system's answering thread, so it acquires no other file node (one receive worker serves
+  this drive, and a request on that node could be waiting for it). `NumberOfLinks` is the file system's count where the
+  volume declares hard links, 1 for a directory as on NTFS; such a volume advertises `FILE_SUPPORTS_HARD_LINKS`. A volume
+  that does not declare `HardLinks` is answered as before.
+- **The drive's half.** The drive declares `HardLinks`, which WinFsp as released ignores. The receive worker reads a
+  forwarded link from the request's bytes and serves it before WinFsp's DLL, whose set-information operation has no case
+  for the class; the shard makes the name by Windows' rules: a taken name refused `STATUS_OBJECT_NAME_COLLISION` unless
+  the caller asked to replace it, a name of the file itself left as it is, a replaced name never a directory's or a
+  read-only file's (`STATUS_ACCESS_DENIED`, as a rename's replace, A-209 and A-262), a directory refused
+  `STATUS_FILE_IS_A_DIRECTORY`. A replace is made under a staging name of its own (`:` makes it a name no Windows program
+  can ask for) and renamed over the taken one, so a refusal at either step leaves the taken name as it was; one shard turn
+  serves the whole link, so no other request sees the staging name. The drive's objects all carry one descriptor
+  (A-350), so a caller that opened the file holds the same access over the new name's directory and the name it
+  replaces, and the worker makes none of the access checks the DLL's rename makes for a replace. Of
+  `FileLinkInformationEx`'s flags the drive acts on ReplaceIfExists alone, as on a rename, to which WinFsp's DLL hands
+  no other: a caller asking to ignore a read-only target is still refused it. A file's
+  link count reaches `FileInfo.HardLinks` (0 for a directory). A saved successful link is answered as made on recovery,
+  as a saved rename is, since the volume holds the name; a cancellation would tell the caller a visible name was not
+  made, and the copy it fell back to would find the name taken.
+- **Two names, two caches.** WinFsp's driver keeps a file node per name, and a node outlives its last handle while the
+  cache manager holds the file, with its data and information cached (this drive's `FileInfoTimeout` is infinite, A-177).
+  So a change through one name left another name's node stale: on the test-signing VM a write through `b.txt` read back
+  through `a.txt` as the bytes before it, size and all, while the volume held the new bytes under both. A request the
+  mount serves is its kernel's own doing for the name it came through, so the mount passes over its journal records
+  (`served_own_request`). A request that changes a file with another name (a write, a size, an overwrite, an allocation
+  or a time whose reply counts more than one link; a link; the delete of one of several names) also leaves a word owed
+  (`Served::sibling_change`): the file, the name it came through and the bytes it changed. The mount's next round tells
+  every other name the file is open under (`NotifyRound::add_siblings`) and purges their bytes (A-190's purge), never
+  the name it came through, whose cache saw the change. The owed words are bounded by the handles Windows holds; past
+  that the round tells every open name. The round follows the reply, at the mount's next turn: a reader through another
+  name sees the change once the notification is applied (on the VM, 0.9 ms after the writer's close in the live test
+  and 7 ms in the two-names check), not with the reply.
+  Telling the names before the reply would make the receive worker wait on a notification whose purge may need that
+  worker (a dirty page of another name is written back through it), which WinFsp's rule against notifying from the
+  answering thread forbids. The first form kept the request's own journal records owed instead; that told and purged the
+  name it came through too, and a purge opens the file through the drive with write access, so on the VM a reader of
+  that name sharing only reads was refused (`ERROR_SHARING_VIOLATION`) while the purge lasted. A reader of another
+  name still can be, while that name's purge lasts, as after any change A-190 purges for (once in the VM's check,
+  against none in 51 reads of the writer's own name).
+- **Proven.** The request decoding, the replay rule, the shard's rules and the owed words by the tests above, green on
+  both Windows runners (diagnostics run 44350120133 at `28ad74fcd`; the notification and decoding tests also on the
+  Mac Studio, kiln r3516). End to end on a Windows Server 2025 evaluation under KVM on adacachy, test signing on,
+  WinFsp 2.1.25156's driver replaced by the patched build (`docs/wip/winfsp-patches/README.md` has the build and
+  every line): the live test passes with the drive's half and fails `ERROR_NOT_SUPPORTED` with main's, which declares
+  no `HardLinks`; `git clone --local` of a repository on the drive exits 0 with its 7 object files linked, as on
+  NTFS. With WinFsp's own driver back, the test refuses as before (skipping loudly as CI runs it) and the clone dies,
+  `failed to create link`.
+- **What remains, and whose.** The patch reaches users only in a WinFsp release: upstream, which needs WinFsp's
+  contributor agreement signed (adding a name to `Contributors.asciidoc` assigns joint copyright to WinFsp's author), or
+  a slates-signed driver (an EV code-signing certificate and a Microsoft Partner Center account for attestation
+  signing). Both are Ada's. Until then the drive on WinFsp as released makes no hard link and A-300's stated difference
+  stands.
 
 ### A-376 — A holder publishes what changed of its content hold: the hold's image is a piece per stored chunk, per held manifest and per stage, and a delta carries those the hold changed since the last committed publication (2026-11-18, goal g232: one primary and two replicas editing the Linux kernel tree; image version 30)
 Applied in the same change to: §4.8 (A-270's status: "The content hold is its pieces"), GAPS (the load test's

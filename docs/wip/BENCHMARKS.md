@@ -13567,6 +13567,11 @@ went up to 2.71 s between two drains of a ring.
   trip of 5 µs (sent 100,336,833 ns, replied 100,341,833 ns) where the run's submits took 374 to 399 µs at the median:
   its send was stamped long after the request went out, so the oracle's bound came from the late stamp. The failures
   read as the harness's, and stamping before `begin` is the test of it (reported to goal 231).
+- **The harness was fixed the same day (goal 257's agent g083).** A send is now stamped before its request is handed to
+  the ring and a reply after its ring was read, so the oracle's bounds are sound by construction; the reply's own
+  stamp had the second fault (read before the ring), which a preempted drain turns into a reply recorded before it
+  came. Each attempt also prints a `floor`, a lower bound on what the daemon and the ring took, so a later run tells a
+  tail the harness may have added from one it cannot have. No run of the fixed harness is recorded yet.
 
 ## Many writers on one large live volume: the byte credit keeps the owner up in 5 of 8 runs, and two whole records still ship (AC-8.9; A-200; goal 230; 2026-11-18)
 
