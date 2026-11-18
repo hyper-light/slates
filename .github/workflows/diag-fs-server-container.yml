@@ -1,0 +1,24 @@
+name: diag-fs-server-container
+on:
+  push:
+    branches: [diag-fs-server-container]
+jobs:
+  green:
+    strategy:
+      fail-fast: false
+      matrix:
+        run: [1]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Container lane, run ${{ matrix.run }} of 3
+        run: |
+          uname -a; docker version --format '{{.Server.Version}}'; git log -1 --format='%h %s' | cut -c1-120
+          SLATES_TEST_CLI=1 SLATES_TEST_CONTAINER=1 cargo test --locked -p slates-cli --test fs_server -- --nocapture --test-threads 2 2>&1 | tee lane.log
+          grep -q "instance cli-fs-container-land-server-[0-9]* up; daemon pid" lane.log && echo "THE SERVER RAN IN ITS CONTAINER"
+          grep -qE "^test result: ok\. [0-9]+ passed; 0 failed" lane.log
