@@ -29814,7 +29814,7 @@ module's channel and message paragraphs).
   record kept, a fresh pipe, its client end duplicated into the holder and named in this message, the replies kept for
   a resend and the `FORGET`s logged as on Unix. The anchor's Windows hold needs a kind for the resync end and a
   message that replaces a held entry's record (the session moves as the guest names its owner, its `INIT` is answered,
-  a restore runs and its holder changes). And Shards' device half.
+  a restore runs and its holder changes): built by A-423. And Shards' device half.
 
 ### A-420 — A commit times the decode a replay of its record does, and recovery replays a record at a time (2026-11-18, goal 83, g251; A-243's open line)
 
@@ -29850,3 +29850,37 @@ Applied in the same change to:
   (`replay.rs`'s unit tests): 64 records of 1,024 one-byte keys, their replay in a recovery past a baseline held to
   what the commits measured. The cadence and cost tests (`snapshot_cadence.rs`, `snapshot_cost.rs`, the model) are
   filed for main.
+
+### A-423 — The Windows anchor holds a Shards stream's resync end, and a daemon replaces a held entry's record as the stream's session moves (2026-11-18, goal 90, item b, piece two; A-418's owed anchor formats)
+Applied in the same change to: A-418's owed list; GAPS, A-281's entry (its Windows item);
+`crates/anchor/src/handles.rs` (`WHAT_SHARDS_RESYNC`, `SHARDS_RESYNC_HANDLES`, `admits`, `HandleMessage::Record`, its
+encoding and its decoding, the module's notes); `crates/anchor/src/held_windows.rs` (`Held::apply` takes a record's
+replacement; `Held::hold` admits each kind at its handle counts); `crates/anchor/src/supervise_windows.rs` (the drain
+bound's derivation).
+
+- **What was there.** The Windows hold (A-198) held one kind of entry, a WinFsp mount's handles, and kept each entry's
+  record as its hold set it: any other kind was refused `Malformed`, and nothing could change a record once held. A
+  Shards stream's resync end needs both: its hold is one handle, the daemon's end of the stream's message-mode resync
+  pipe, and its record is the stream's session, which moves while the stream lives (the guest names its owner, its
+  kernel's `INIT` is answered, a restore takes a saved guest's tables, a holder is named for the stream), as the Unix
+  hold's session does (`crate::held`'s `Session` message, A-281, A-378).
+- **The kinds.** `admits(what, count)`: a WinFsp mount one to `MAX_HANDLES` handles, as A-198 left it (its daemon names
+  two since A-369; the room stays for a daemon built apart across an upgrade); a Shards stream's resync end
+  (`WHAT_SHARDS_RESYNC`, 2) exactly one; any other kind nothing. A record is opaque to the anchor, within `RECORD_CAP`.
+- **The record's replacement.** `Record { id, record }` (kind 6), laid out as a hold whose kind, count and handle slots
+  are zero, which decoding requires, so the message has one encoding and names no handle; nothing is duplicated for
+  it. Answered `Held { id }` once the anchor keeps the new record, the entry's handles as they were held, and refused
+  `Malformed` and counted, with nothing changed, for an entry the anchor does not hold or a record past the cap. Its
+  answer is a hold's: a daemon runs one exchange at a time, sends a record's replacement only for an entry the anchor
+  answered held, and gives the stream's resync up rather than send another after one whose answer did not come, so
+  no answer can be taken for another of the same entry. An anchor built before this refuses the kind and the message,
+  so a newer daemon's stream is served without a resync there (Shards' option (a)), as when the anchor refuses a hold.
+- **Evidence.** The formats' unit tests, on every host (`crates/anchor`, `handles`): the record's golden vector, a
+  resync hold and two records round-tripping, a record naming a kind, a count or a handle and one past the cap refused
+  with every changed bit, a long record refused at encoding, and `admits` for every count of every kind. Red first: on
+  main the tests did not build (no `Record`, `WHAT_SHARDS_RESYNC` or `admits`). The hold's own test
+  (`held_windows.rs`, Windows): a resync end held alone and a two-handle one refused, its record replaced and handed to
+  the next process under its kind, and a replacement for an entry not held or past the cap refused and counted, with
+  nothing changed; compiled clean for Windows (`cargo xwin check`), its run filed for main.
+- **Owed.** The daemon's half: its hold of a resync end and its record's replacements over `crate::anchor_hold`'s
+  exchange, and a successor adopting a handed resync entry (A-418's attach and successor halves).
