@@ -3594,6 +3594,30 @@ pub enum Refusal {
     /// Why, typed.
     refusal: TargetRefusal,
   },
+  /// The verb ran and its effects are committed on its owner, but they were not held where its reply waits for them
+  /// (a live-shipped volume's log on the owner and `f` candidates, A-200; a destroy's tombstone placed at `f + 1`,
+  /// AUD-29-43) within the owner's bound for a held reply: the rule every transport judges one by
+  /// (`slates_bridge_core::durable_bound`, which NFS answers `NFS3ERR_JUKEBOX`), a window with nothing heard while an
+  /// ask stood a window unanswered, or the failover SLO from the hold (A-354). Nothing claims them durable. Retry under
+  /// the same request id: the retry joins the wait and is answered once they are held, or told this again at its own
+  /// bound. Until 2026-11-18 such a reply was held for good when what it waited for could not happen. Appended.
+  DurabilityPending {
+    /// How long the reply was held before it was given up, nanoseconds.
+    held_ns: u64,
+    /// Why the wait was given up.
+    gave_up: HeldGaveUp,
+  },
+}
+
+/// Why a reply held for durability was given up ([`Refusal::DurabilityPending`], A-354): the two ends of
+/// `slates_bridge_core::durable_bound`'s rule. Append-only.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeldGaveUp {
+  /// A whole window passed with nothing heard on the durability path, while an ask of the owner's had stood unanswered
+  /// for a window and the owner had read what its holders sent.
+  Silent,
+  /// The total bound was reached, whatever was heard: the owner's failover SLO from the hold.
+  AtTheBound,
 }
 
 /// Why a target cannot be used ([`Refusal::Target`], A-299): each the class of a landing target's, a mount point's or a

@@ -38,8 +38,8 @@ use std::fmt;
 use slates_client::ClientError;
 use slates_ipc::error::RouteRefusal;
 use slates_ipc::protocol::{
-  AttachTransport, DatabaseRefusal, HostPathReason, OwnMountUse, Principal, RecoveryCause, Refusal,
-  SnapshotId, TargetRefusal, UnsupportedReason, VolumeId, VolumeRefusal,
+  AttachTransport, DatabaseRefusal, HeldGaveUp, HostPathReason, OwnMountUse, Principal,
+  RecoveryCause, Refusal, SnapshotId, TargetRefusal, UnsupportedReason, VolumeId, VolumeRefusal,
 };
 use slates_ipc::{DeliveryFault, IpcError};
 
@@ -396,6 +396,15 @@ pub enum RetryCause {
   },
   /// A stream's holder record has not reached its shard yet (A-181).
   HolderPending,
+  /// The verb ran on its owner, but what its reply waits for (a live volume's log on `f` candidates, a destroy's
+  /// tombstone placed at `f + 1`) was not held within the owner's bound for a held reply (A-354); retried under the
+  /// same request id, it joins the wait.
+  DurabilityPending {
+    /// How long the reply was held, nanoseconds.
+    held_ns: u64,
+    /// Why the wait was given up.
+    gave_up: HeldGaveUp,
+  },
   /// The command ring is full: nothing was sent.
   RingFull,
   /// The daemon left this channel, or a reconnected one is still being bound: nothing was sent.
@@ -801,6 +810,9 @@ impl Error {
       Refusal::ContentUnavailable => retry(RetryCause::ContentUnavailable, pause_ns),
       Refusal::DigestUnverified => retry(RetryCause::ChangedWhileRead { path: None }, pause_ns),
       Refusal::HolderPending => retry(RetryCause::HolderPending, pause_ns),
+      Refusal::DurabilityPending { held_ns, gave_up } => {
+        retry(RetryCause::DurabilityPending { held_ns, gave_up }, pause_ns)
+      }
       Refusal::Unsupported { feature } => {
         Error::Unsupported(Unsupported::Feature(Note::new(feature)))
       }
@@ -1653,6 +1665,29 @@ mod tests {
       rights.contains("Forbidden") && rights.contains("status"),
       "{rights}"
     );
+  }
+
+  /// A-354 (2026-11-18): do type the daemon's refusal of a reply held past its bound for durability. Expect a retry
+  /// carrying how long it was held and why it was given up, after the pause.
+  #[test]
+  fn a_reply_held_past_its_durable_bound_is_a_retry() {
+    for gave_up in [HeldGaveUp::Silent, HeldGaveUp::AtTheBound] {
+      let typed = Error::of_refusal(
+        Refusal::DurabilityPending {
+          held_ns: 7,
+          gave_up,
+        },
+        None,
+        PAUSE_NS,
+      );
+      assert!(
+        matches!(
+          &typed,
+          Error::Retry { cause: RetryCause::DurabilityPending { held_ns: 7, gave_up: given }, .. } if *given == gave_up
+        ),
+        "{typed:?}"
+      );
+    }
   }
 
   /// A-299 (2026-11-18): do type the daemon's typed target refusal and the variant it superseded. Expect the first a
