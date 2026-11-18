@@ -15,19 +15,24 @@
   clippy::disallowed_methods
 )]
 
+#[cfg(unix)]
 use std::path::Path;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use slates_api::{
-  AttachTransport, AuditKind, BaseState, ConflictClass, Denied, Drift, DriftKind, Error, Exhausted,
-  Existing, Filter, Instance, Intent, Invalid, IssuerFault, KindMismatch, LandOutcome,
-  LandingApproval, LandingConflict, LandingStage, LandingState, MergeApproval, MergeOutcome,
-  MergeRecord, Missing, MountOptions, PathFault, PolicyReason, PolicyRefusal, PolicySubject,
-  Provisioned, RebaseOutcome, SimVolumes, SnapshotId, Source, TrustedSigner, Unsupported, Unusable,
-  Verification, VolumeId, VolumeSpec, Volumes, Work, WorkSignature, WriteAct, WriteMode,
-  WritePolicy,
+  AttachTransport, Denied, Error, Exhausted, Existing, Instance, Intent, Invalid, IssuerFault,
+  KindMismatch, MergeApproval, MergeOutcome, MergeRecord, Missing, MountOptions, PathFault,
+  PolicyReason, PolicyRefusal, PolicySubject, Provisioned, RebaseOutcome, SimVolumes, SnapshotId,
+  Source, TrustedSigner, Unusable, Verification, VolumeId, VolumeSpec, Volumes, Work,
+  WorkSignature, WriteAct, WriteMode, WritePolicy,
+};
+// What only the Unix-gated tests (the overlay and landing tests) name.
+#[cfg(unix)]
+use slates_api::{
+  AuditKind, BaseState, ConflictClass, Drift, DriftKind, Filter, LandOutcome, LandingApproval,
+  LandingConflict, LandingStage, LandingState, Unsupported,
 };
 use slates_machine::{MachineError, MachineProfile, ProfileOptions};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
@@ -109,10 +114,12 @@ fn grouped(tag: &str) -> (Daemon, Instance) {
 
 /// A real directory for an overlay's base and a landing's target (A-50: never `/tmp`, never a RAM directory): in the
 /// build output, named with the process id and a counter, canonical, removed on drop.
+#[cfg(unix)]
 struct Folder {
   path: String,
 }
 
+#[cfg(unix)]
 impl Folder {
   fn new() -> Folder {
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -143,6 +150,7 @@ impl Folder {
   }
 }
 
+#[cfg(unix)]
 impl Drop for Folder {
   fn drop(&mut self) {
     let _removed = std::fs::remove_dir_all(&self.path);
@@ -173,6 +181,7 @@ fn provision(instance: &mut Instance, spec: &VolumeSpec) -> VolumeId {
 }
 
 /// The landing of `volume`'s head into `folder`, `.git` left out as kiln's landings leave it.
+#[cfg(unix)]
 fn landing_into(volume: VolumeId, folder: &Folder) -> slates_api::LandingRequest {
   slates_api::LandingRequest {
     volume,
@@ -192,6 +201,7 @@ fn issuer_of(daemon: &Daemon) -> slates_api::Issuer {
 }
 
 /// A signature in `ssh-keygen -Y sign`'s armour, for the refusals that come before any verifier reads it.
+#[cfg(unix)]
 fn a_signature() -> WorkSignature {
   WorkSignature::from_armoured(
     "-----BEGIN SSH SIGNATURE-----\nU1NIU0lH\n-----END SSH SIGNATURE-----",
@@ -937,10 +947,13 @@ fn a_merge_follows_its_greens_write_mode() {
 const LISTED: usize = 200;
 /// Shape: the files the drift test changes on disk under its overlay: more drifted entries at these path lengths than a
 /// status reply carries beside its other fields, and more than one paged read holds.
+#[cfg(unix)]
 const DRIFTED: usize = 100;
 /// Shape: the paths the changed-since test's work changes in its green: more than one reply's worth at these lengths.
+#[cfg(unix)]
 const CHANGED: usize = 150;
 /// Shape: the landings the audit test presents, each one audit record: more than one reply's worth of records.
+#[cfg(unix)]
 const PRESENTED: usize = 120;
 
 /// Walks `read` a page at a time from the start: every page's items, and the cursors the pages were asked from (the
@@ -1083,6 +1096,7 @@ fn a_greens_changes_are_read_a_page_at_a_time_and_whole() {
 /// `drift` names all 100 `Modified`, in path order, and elides none; and the paged read, walked from the start, names
 /// each once.
 /// Before A-267 a status with 600 drifted entries was refused, and the library read only what a status carried.
+#[cfg(unix)]
 #[test]
 fn an_overlays_drift_past_one_reply_is_read_whole() {
   let (daemon, mut instance) = grouped("drift-pages");

@@ -7768,7 +7768,7 @@ it builds against the contract and adds to it rather than around it.
 > on the wire for drift, a presentation's conflicts, a landing's target refusal and a merge's
 > versions (the work's base beside the head), replacing what the crate reads from text or asks
 > again (typed audit and grant states are built, piece 6). **Lists a page at a time (A-263 to A-267, goal g247,
-> `CONTRACT` = 16):** every
+> `CONTRACT` = 17):** every
 > list the daemon answers a reply at a time is read through the contract a page at a time — `Page { items, next }`
 > from `Instance::{list_page, grants_page, audit_page, changed_since_page}`, an overlay's `DriftPage` from
 > `drift_page` — or whole (`list`, `grants`, `audit`, `changed_since`, `drift`); a status's `DriftReport` counts what
@@ -7841,6 +7841,12 @@ it builds against the contract and adds to it rather than around it.
 > reached a client as `BadRequest` carrying its name, a pinned snapshot's destroy among them (A-310's
 > seam found it). The contract puts each in the class a consumer acts on (`Busy::Volume` for `Pinned`
 > and `DaxMapped`, `Stale`, `Denied`, `Exhausted`, `Unusable` or `Invalid` `::Volume` for the rest).
+> **`CONTRACT` = 16:** `Instance::unmount` answers `Unmounted { unreported }`, as does the `Volumes` seam's (the
+> simulator's is always empty). A Windows unmount that releases a drive another volume reported now names each volume
+> it could not ask; until then only a drive no volume reported named them. The CLI names them on standard error either
+> way. `HostFault` renders in words, the daemon's `TargetUnavailable` by that name. Both were lost when the CLI moved
+> onto the library (A-278); the integrator's Windows lane found them (run 44257181904,
+> `docs/bugs/2026-11-18-the-cli-on-the-library-lost-two-windows-refusals-words.md`).
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -23025,6 +23031,20 @@ contract", new, with its status), GAPS (the A-299 entry and the Embedding librar
   unreadable journal or image unusable, the operations an entry does not take invalid. Applied to
   `crates/ipc/src/protocol.rs`, `crates/server/src/{error,verbs}.rs`, `crates/server/tests/{recovery,fuse_mount}.rs`,
   `crates/api/src/{error,sim,lib}.rs`, `tests/api.rs` (the seam's suite asserts the typed `Pinned`).
+- **`CONTRACT` 16, the same day: what an unmount removed, and host refusals in words.** The integrator's Windows lane
+  (run 44257181904) failed two WinFsp tests the CLI passed before it mounted through the library (A-278):
+  - `a_refused_mount_time_hold_leaves_nothing_mounted` read `Target("...")`, since `Error`'s rendering printed
+    `HostFault` by its `Debug`;
+  - `unmount_releases_every_healthy_drive_beside_a_volume_recovery_could_not_rebuild` exited 0 naming nothing, since
+    `Instance::unmount` answered `()` and dropped the volumes its scan could not ask once another volume reported the
+    drive.
+
+  `HostFault` and `Unreported` now render in words (`TargetUnavailable` named). `Instance::unmount` answers
+  `Unmounted { unreported }`, empty on macOS and Linux, whose unmount asks no volume. The CLI's Windows unmount names
+  the unasked on standard error whether the drive was released or not. Applied to
+  `crates/api/src/{error,mount,seam,sim,lib}.rs` and `crates/cli/src/verbs.rs`. The rendering tests are unit tests (`a_host_refusal_is_named_by_its_kind_in_words`,
+  red first; `an_unreported_volume_is_named_with_its_refusals_kind`). The two live tests run on CI's Windows runner
+  only (jupiter has no WinFsp).
 - **Checked.** `cargo test -p slates-api` (37 unit, 9 by use, 5 start, 1 doc) and `cargo test -p slates-cli` on
   macOS arm64 (kiln runner, 2026-11-18): the cases in §4.12's status. The Linux and Windows arms of the mount and the
   CLI's Windows unmount are not compiled on this host; the integrator's lanes are their first compiler.
@@ -25102,8 +25122,8 @@ Applied in the same change to: §4.12 (the SDKs' `status`), `crates/ipc/src/prot
 dimension was read from its history), GAPS, `docs/bugs/2026-11-08-a-status-with-much-drift-outgrew-one-reply.md`; and
 since 2026-11-17 to `crates/server/src/{verbs,landing,merge_service,state,snapshot_view,transports}.rs` (the carried
 lists, the kept verdicts, `longest_name`, `widest_report`), `crates/vfs/src/base.rs` (`drift_page`,
-`read_base_range`), `crates/db/src/{partition,art}.rs` (the seeks), `crates/client`, `crates/api` (`CONTRACT` 16 to
-19), `docs/bugs/2026-11-17-lists-a-verbs-own-reply-carries-outgrew-one-reply.md` and
+`read_base_range`), `crates/db/src/{partition,art}.rs` (the seeks), `crates/client`, `crates/api` (`CONTRACT` 17 to
+20), `docs/bugs/2026-11-17-lists-a-verbs-own-reply-carries-outgrew-one-reply.md` and
 `docs/bugs/2026-11-18-a-volume-under-the-longest-name-could-not-be-statused.md`.
 - **Status stays one reply:** it carries the first drifted entries that fit beside its other fields and counts the rest.
 - **A paged read:** `Drifted` from a position, an entry too long for any page passed over and counted. Since the drift
@@ -25123,7 +25143,7 @@ lists, the kept verdicts, `longest_name`, `widest_report`), `crates/vfs/src/base
   page together. Held to `status` over the simulated host by an oracle (pages of 1, 3 and 64 inodes, the slice spent
   after every visit, every second, or never; replaced, removed and refused entries)
   (`a_drift_walk_a_page_at_a_time_lists_what_a_status_lists`). `slates-api`'s `drift_page` reads past an inode and
-  `drift` answers its lists in path order (`CONTRACT` = 19).
+  `drift` answers its lists in path order (`CONTRACT` = 20).
 - **Every reader says which:** `slates status --drift` walks the paged read; the text counts all; MCP and the SDKs carry
   the count. Both SDKs read the whole drift with `drifted(volume)` (2026-11-17, goal g247): typed entries (`path`,
   `kind`), the unverified paths and the oversized count.
@@ -25141,7 +25161,7 @@ lists, the kept verdicts, `longest_name`, `widest_report`), `crates/vfs/src/base
   budget, which counted each mount's path and not its whole encoding (twelve bytes more). The mounts were never a
   refusal: a partition holds a bounded number of attachments (`PartitionCaps::attachments`), and the 400-mount test met
   that bound before any status (corrected 2026-11-18). The client, the CLI, MCP, both SDKs and `slates-api` carry the
-  counts (`CONTRACT` = 17:
+  counts (`CONTRACT` = 18:
   `Rewitnessed`, `Stale::Disk::elided`, `LandingReport::degraded_elided`; a presentation is clean only when it carries
   and counts no conflict).
 - **A merge verdict's windows (2026-11-17, goal g247):** `Submitted` and `Rebased` carried every conflict window and
@@ -25159,7 +25179,7 @@ lists, the kept verdicts, `longest_name`, `widest_report`), `crates/vfs/src/base
   id (2026-11-18). The client walks them,
   synchronously and as a chain under the call's word (`VerdictChain`), so `Submitted::Conflict` and
   `Rebased::Conflict` hold every window and no consumer changed; `slates-api` maps `VerdictReplaced` to
-  `Stale::Verdict` (`CONTRACT` = 18).
+  `Stale::Verdict` (`CONTRACT` = 19).
 - **A name every reply holds (2026-11-18, goal g247):** A-263 bounded a new volume's name by the listing alone (4,012
   bytes). A status names the volume beside its transports, journal, loss window and mounts, so a volume under such a
   name was listed and its status refused "reply too large for the bulk area" (reproduced by use,

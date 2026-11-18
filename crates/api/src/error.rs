@@ -578,7 +578,8 @@ pub enum HostFault {
   },
   /// An overlay's base could not be read now: its drift is unknown (§4.15 "Drift").
   BaseUnreadable,
-  /// A landing's target cannot be opened, or escapes containment (§4.15 step 4); the daemon's words.
+  /// The daemon's `TargetUnavailable`, in its words: a landing's target cannot be opened or escapes containment
+  /// (§4.15 step 4), or a mount's drive could not be made (a WinFsp mount whose hold the anchor did not answer).
   Target(Note),
   /// An OS call of the channel failed.
   Os {
@@ -911,10 +912,39 @@ impl fmt::Display for Error {
       ),
       Self::Unusable(unusable) => write!(f, "unusable now: {unusable:?}"),
       Self::Elsewhere(elsewhere) => write!(f, "ask elsewhere: {elsewhere:?}"),
-      Self::Host(fault) => write!(f, "the host refused: {fault:?}"),
+      Self::Host(fault) => write!(f, "the host refused: {fault}"),
       Self::Mount(fault) => write!(f, "{fault}"),
       Self::Start(fault) => write!(f, "{fault}"),
       Self::Protocol(fault) => write!(f, "a fault in slates (report it): {fault:?}"),
+    }
+  }
+}
+
+impl fmt::Display for HostFault {
+  /// Each fault by its kind and the daemon's or the OS's own words, never their `Debug`: the `Target` fault is named
+  /// by the daemon's refusal, `TargetUnavailable`, which a person and a script both look for (A-299; until 2026-11-18
+  /// the CLI printed `Target("...")`).
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::Base { path, errno } => write!(
+        f,
+        "the overlay's base folder {path} is unavailable: {}",
+        errno_text(Some(*errno))
+      ),
+      Self::BaseUnreadable => {
+        f.write_str("the overlay's base could not be read now, so its drift is unknown")
+      }
+      Self::Target(note) => write!(f, "TargetUnavailable: {note}"),
+      Self::Os { call, errno } => write!(f, "{call} failed: {}", errno_text(*errno)),
+      Self::Memory(note) => write!(f, "the channel's shared memory refused: {note}"),
+      Self::Route(refusal) => write!(
+        f,
+        "the daemon's socket route refused the hand-off: {refusal}"
+      ),
+      Self::HandOff(note) => write!(
+        f,
+        "a direct map's hand-off failed and its copy is held until this client ends: {note}"
+      ),
     }
   }
 }
@@ -1046,7 +1076,8 @@ pub enum MountFault {
   },
 }
 
-/// A volume that could not report its mounts ([`MountFault::NotMounted`]).
+/// A volume that could not report its mounts: named in [`MountFault::NotMounted`] when no other volume reported the
+/// drive, and in [`crate::Unmounted::unreported`] when another did and the drive was released (Windows).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Unreported {
   /// The volume.
@@ -1055,6 +1086,20 @@ pub struct Unreported {
   pub name: String,
   /// Why its status was refused.
   pub refusal: Box<Error>,
+}
+
+impl fmt::Display for Unreported {
+  /// The volume by its name and id, and its status's refusal by its kind (`NotRecovered` for one recovery could not
+  /// rebuild), so a person sees which volume's mounts are unknown and why.
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(
+      f,
+      "volume {} ({}) refused: {}",
+      self.name,
+      crate::volume_id_text(self.volume),
+      self.refusal
+    )
+  }
 }
 
 /// What this machine lacks to mount the form asked (§4.6). Each says what to install or change.
@@ -1155,17 +1200,7 @@ impl fmt::Display for MountFault {
         write!(f, "no slates volume is mounted at {path}")
       }
       Self::NotMounted { path, unreported } => {
-        let named: Vec<String> = unreported
-          .iter()
-          .map(|volume| {
-            format!(
-              "volume {} ({}) refused: {}",
-              volume.name,
-              crate::volume_id_text(volume.volume),
-              volume.refusal
-            )
-          })
-          .collect();
+        let named: Vec<String> = unreported.iter().map(Unreported::to_string).collect();
         write!(
           f,
           "no slates volume that reported its mounts is mounted at {path}; {} did not report: {}",
@@ -1297,7 +1332,8 @@ mod tests {
   use slates_ipc::protocol::{Refusal, VolumeId};
 
   use super::{
-    Busy, Error, Exhausted, Existing, Missing, ProtocolFault, RetryCause, Stale, Unusable,
+    Busy, Error, Exhausted, Existing, HostFault, Missing, Note, ProtocolFault, RetryCause, Stale,
+    Unreported, Unusable,
   };
 
   /// Shape: the pause a test's retryable refusal carries.
@@ -1454,5 +1490,67 @@ mod tests {
     ));
     let gone = Error::of_client("i", ClientError::DaemonGone { after_ns: 5 }, None, PAUSE_NS);
     assert!(gone.is_unavailable() && gone.is_retryable(), "{gone:?}");
+  }
+
+  /// A-299 (the integrator's Windows lane, 2026-11-18, run 44257181904: `a_refused_mount_time_hold_leaves_nothing_mounted`
+  /// read `Target("...")`). Do: render the daemon's `TargetUnavailable` for a WinFsp mount whose hold the anchor did
+  /// not answer, and a host refusal of every other kind. Expect: the first named `TargetUnavailable` with the
+  /// daemon's words; none rendered as its `Debug`.
+  #[test]
+  fn a_host_refusal_is_named_by_its_kind_in_words() {
+    let hold = Error::Host(HostFault::Target(Note::new(
+      "the WinFsp mount at E: was refused: the anchor's hold: the anchor did not answer",
+    )))
+    .to_string();
+    assert!(
+      hold.contains("TargetUnavailable") && hold.contains("the anchor's hold"),
+      "{hold}"
+    );
+    for fault in [
+      HostFault::Base {
+        path: "/gone".to_owned(),
+        errno: 2,
+      },
+      HostFault::BaseUnreadable,
+      HostFault::Target(Note::new("words")),
+      HostFault::Os {
+        call: "mmap",
+        errno: None,
+      },
+      HostFault::Memory(Note::new("words")),
+      HostFault::HandOff(Note::new("words")),
+    ] {
+      let words = Error::Host(fault.clone()).to_string();
+      assert!(!words.contains(&format!("{fault:?}")), "{words}");
+    }
+  }
+
+  /// A-299 (the integrator's Windows lane, 2026-11-18, run 44257181904:
+  /// `unmount_releases_every_healthy_drive_beside_a_volume_recovery_could_not_rebuild`). Do: render a volume whose
+  /// status the daemon refused because recovery could not rebuild it. Expect: the volume by its name and its refusal's
+  /// kind, `NotRecovered`, with the missing base.
+  #[test]
+  fn an_unreported_volume_is_named_with_its_refusals_kind() {
+    let refusal = Error::of_refusal(
+      Refusal::NotRecovered {
+        cause: slates_ipc::protocol::RecoveryCause::BaseMissing {
+          path: "C:\\base".to_owned(),
+        },
+      },
+      None,
+      PAUSE_NS,
+    );
+    let words = Unreported {
+      volume: VolumeId { bytes: [7; 16] },
+      name: "unrebuilt".to_owned(),
+      refusal: Box::new(refusal),
+    }
+    .to_string();
+    assert!(
+      words.contains("volume unrebuilt")
+        && words.contains("NotRecovered")
+        && words.contains("BaseMissing"),
+      "{words}"
+    );
   }
 }

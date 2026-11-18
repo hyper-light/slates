@@ -153,7 +153,8 @@ nothing answers until detached) and mounts nothing (a mount is a record). The co
   (typed, an overlay's base read or unreadable), `drift` (typed entries: `Modified`, `Deleted`,
   `Replaced`, `TypeChanged`), `rewitness`, `read`.
 - Serving: `mount(volume, path, &MountOptions)` and `unmount(path)` (macOS: the loopback NFS mount;
-  Linux: FUSE; Windows: a WinFsp drive), `serve_shards(volume, intent, subtree)` (a stream end to
+  Linux: FUSE; Windows: a WinFsp drive; it answers `Unmounted`, whose `unreported` names each volume a
+  Windows unmount could not ask for its mounts), `serve_shards(volume, intent, subtree)` (a stream end to
   hand `shards run --slates-fs-fd N`), `serve_vhost_user(..)` (Linux), `detach(attachment)`.
   `slates_api::mount::available()` says, with no daemon, whether this machine can mount a volume
   and through what (`MountKind`), or what is missing (`MountMissing`). `slates_api::mount::unmount_lazy(path)`

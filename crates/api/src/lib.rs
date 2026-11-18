@@ -87,7 +87,7 @@ pub use grant::{GrantAuthority, GrantClaim, GrantProof};
 pub use instance::{Instance, LandingRequest};
 pub use issuer::{GRANT_TERM_NS, Issuer};
 pub use launcher::{LauncherFault, LauncherSecret};
-pub use mount::{MountKind, MountOptions, Mounted};
+pub use mount::{MountKind, MountOptions, Mounted, Unmounted};
 pub use observe::{AuditKind, AuditRecord, GrantRecord, GrantState, LandingStage};
 pub use outcome::{
   ActionTally, LandOutcome, LandingApproval, LandingConflict, LandingReport, LandingState,
@@ -145,19 +145,21 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// --scope`), the launcher's standard input kept (A-299; the same day). 15: the volume core's refusals typed
 /// (`VolumeRefusal`, each in the class a consumer acts on as `Busy`, `Stale`, `Denied`, `Exhausted`, `Unusable` or
 /// `Invalid` `::Volume`): until then each reached a consumer as an invalid request carrying a word, a pinned snapshot's
-/// destroy among them (A-299; the same day). 16: lists a page at a time (A-263 to A-267): `Page`,
-/// `Instance::{list_page, grants_page, audit_page, changed_since, changed_since_page, drift_page}`, `DriftPage`,
-/// `DriftReport::elided`, `ChangedCursor`; `Instance::drift` reads every entry (the same day). 17: a list a verb's own
-/// reply carries counts what one reply could not hold (A-267): `Instance::rewitness` answers `Rewitnessed { paths,
-/// paths_elided }`, `Stale::Disk` carries `elided`, `LandingReport` carries `degraded_elided`, and a presentation is
-/// clean only when it carries and counts no conflict (the same day). 18: `Stale::Verdict`, a merge's or a rebase's
-/// conflict windows read after the work's verdict was replaced; `merge` and `rebase` answer every window of a verdict
-/// however many, a signed merge's too (A-267) (the same day). 19: `drift_page` reads past an inode (`after:
-/// Option<u64>`), in inode order, re-checking the entries it passes; `drift` answers its lists in path order (A-267)
-/// (the same day).
+/// destroy among them (A-299; the same day). 16: `Instance::unmount` and the seam's `unmount` answer what was removed ([`Unmounted`]): on
+/// Windows each volume the scan could not ask is named there when another volume reported the drive (it was named only
+/// when none did), and a host refusal renders in words, the daemon's `TargetUnavailable` by that name (A-299; the same
+/// day). 17: lists a page at a time (A-263 to A-267): `Page`, `Instance::{list_page, grants_page, audit_page,
+/// changed_since, changed_since_page, drift_page}`, `DriftPage`, `DriftReport::elided`, `ChangedCursor`;
+/// `Instance::drift` reads every entry (the same day). 18: a list a verb's own reply carries counts what one reply could
+/// not hold (A-267): `Instance::rewitness` answers `Rewitnessed { paths, paths_elided }`, `Stale::Disk` carries
+/// `elided`, `LandingReport` carries `degraded_elided`, and a presentation is clean only when it carries and counts no
+/// conflict (the same day). 19: `Stale::Verdict`, a merge's or a rebase's conflict windows read after the work's verdict
+/// was replaced; `merge` and `rebase` answer every window of a verdict however many, a signed merge's too (A-267) (the
+/// same day). 20: `drift_page` reads past an inode (`after: Option<u64>`), in inode order, re-checking the entries it
+/// passes; `drift` answers its lists in path order (A-267) (the same day).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 19;
+pub const CONTRACT: u32 = 20;
 
 /// What a rewitness did (§4.15 `rewitness`): the paths one reply holds and the count of the rest (A-267).
 pub use slates_client::Rewitnessed;
