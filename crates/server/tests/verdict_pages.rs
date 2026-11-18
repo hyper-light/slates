@@ -62,15 +62,20 @@ fn file(n: usize) -> String {
 /// A green whose seed merged [`MANY`] files, and two works over it that each rewrote the first four bytes of every
 /// file, the first merged: the second conflicts in every file. The green and the second work.
 fn conflicting(client: &mut Client) -> (VolumeId, VolumeId) {
-  conflicting_named(client, |_| "second".to_owned())
+  conflicting_named(
+    client,
+    |client| client.create_green("green", false).unwrap(),
+    |_| "second".to_owned(),
+  )
 }
 
 /// [`conflicting`], the second work named by `second` from the green.
 fn conflicting_named(
   client: &mut Client,
+  make_green: impl FnOnce(&mut Client) -> VolumeId,
   second: impl Fn(VolumeId) -> String,
 ) -> (VolumeId, VolumeId) {
-  let green = client.create_green("green", false).unwrap();
+  let green = make_green(client);
   let (seed, _) = client.create_work(green, "seed").unwrap();
   for n in 0..MANY {
     client
@@ -244,7 +249,20 @@ fn a_replaced_verdict_is_refused_typed() {
   daemon.stop();
 }
 
-/// A name of `prefix` that hashes to a partition other than `green`'s, so a work of that name is off its green's shard.
+/// A green made by a client of another shard than `client`'s on an eight-shard daemon (A-400: a work lives on the shard
+/// of the client that makes it, a green on its maker's), so `client`'s works are off its shard.
+fn green_off(client: &Client, instance: &str) -> VolumeId {
+  let here = client.client_id() % u32::from(MANY_SHARDS);
+  loop {
+    let mut maker = connect(instance);
+    if maker.client_id() % u32::from(MANY_SHARDS) != here {
+      return maker.create_green("green", false).unwrap();
+    }
+  }
+}
+
+/// A name of `prefix` that hashes to a partition other than `green`'s: a work of that name made on another shard holds
+/// it there by an alias (A-400).
 fn off_owner_name(green: VolumeId, prefix: &str) -> String {
   (0u32..)
     .map(|suffix| format!("{prefix}-{suffix}"))
@@ -262,7 +280,7 @@ fn asked_of_the_owner(daemon: &Daemon) -> u64 {
 }
 
 /// A-267 under A-247 (§4.16: a green's works are served where they live; only the verdict is the green's). Do: on eight
-/// shards, conflict a work whose name is off its green's shard in 400 files, submit it through the wire and read the
+/// shards, conflict a work off its green's shard (its client's, A-400) in 400 files, submit it through the wire and read the
 /// rest of its verdict a page at a time, then rebase it through the client. Expect: the work's shard asked the green's
 /// owner; the reply carries some windows and counts the rest under a verdict id; the pages, read from the work's shard,
 /// hold the rest; the two name every file once; and the rebase answers every window. Merged as text, the branch kept a
@@ -272,7 +290,11 @@ fn asked_of_the_owner(daemon: &Daemon) -> u64 {
 fn a_verdict_judged_on_the_greens_shard_is_kept_with_its_work_on_another() {
   let (daemon, instance) = daemon_of("off-owner", MANY_SHARDS);
   let mut client = connect(&instance);
-  let (_, work) = conflicting_named(&mut client, |green| off_owner_name(green, "second"));
+  let (_, work) = conflicting_named(
+    &mut client,
+    |client| green_off(client, &instance),
+    |green| off_owner_name(green, "second"),
+  );
   let asked_before = asked_of_the_owner(&daemon);
   let submitted = client.call(&RequestBody::Submit {
     work,

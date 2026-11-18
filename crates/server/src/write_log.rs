@@ -1,5 +1,5 @@
 //! The FUSE writes acknowledged since the shard's last publication, kept whole in anchor-owned RAM (A-63; A-61;
-//! §4.6 "Linux"; §4.8; D-18).
+//! §4.6 "Linux"; §4.8; D-18): a FUSE mount's (Linux) and a Shards stream's (every platform: A-316, A-339, A-402).
 //!
 //! A plain `write` through a FUSE mount is answered before the shard's recovery image is published: the image is
 //! the shard's whole state, re-imaged at each barrier, far too costly per write. Before A-61 a daemon's death ended

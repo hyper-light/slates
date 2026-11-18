@@ -2498,9 +2498,11 @@ pub fn serve(
     ));
   }
   let owner = match &body {
-    RequestBody::Create { name, .. } | RequestBody::CreateWork { name, .. } => {
-      Some(owner_of_name(name, state.shards.len()))
-    }
+    RequestBody::Create { name, .. } => Some(owner_of_name(name, state.shards.len())),
+    // A work lives on the shard that serves its creation, its client's own (A-400): its edits and its submits are read
+    // and answered there with no hop, and its name is held at the partition it hashes to, by an alias when that is
+    // another (A-236).
+    RequestBody::CreateWork { .. } => Some(state.partition),
     RequestBody::Detach { attachment }
     | RequestBody::Advance { attachment, .. }
     | RequestBody::BindMount { attachment, .. }
@@ -7492,9 +7494,91 @@ pub(crate) fn encoded_len<T: Wire>(value: &T) -> usize {
   encoded.len()
 }
 
-/// Creates a work volume over a green (§4.16): an agent's private place to declare operations,
-/// based on the green's current head. The green must be owned by this shard (it holds the engine).
+/// Creates a work volume over a green (§4.16) on this shard, the one that serves its creation (A-400): an agent's
+/// private place to declare operations, based on the green's current head. A name that hashes to another partition is
+/// held there by an alias of the work's id, reserved before the creation (`crate::work_home`) and confirmed once it
+/// commits, or released if it did not ([`settle_work_alias`]).
 fn create_work(
+  state: &mut ShardState,
+  principal: &Principal,
+  green: VolumeId,
+  name: &str,
+) -> ReplyBody {
+  let reserved = (owner_of_name(name, state.shards.len()) != state.partition)
+    .then(|| this_requests_pending_creation(state, name))
+    .flatten();
+  let reply = create_work_here(state, principal, green, name);
+  if let Some(id) = reserved {
+    settle_work_alias(state, id, name);
+  }
+  reply
+}
+
+/// The work id this request's own pending creation of `name` holds on this partition (A-247), if any.
+fn this_requests_pending_creation(state: &ShardState, name: &str) -> Option<DbVolumeId> {
+  let (origin, id) = state.current_request?;
+  state
+    .db
+    .partition()
+    .pending_creation(name)
+    .filter(|pending| {
+      (pending.origin, pending.client, pending.sequence) == (origin, id.client, id.sequence)
+    })
+    .map(|pending| pending.work)
+}
+
+/// Settles the alias `name`'s partition holds for `work`, a work this shard was making (A-400, A-236's last step): once
+/// this step's transaction is committed, confirmed there if the work stands here under its name, else released. A task of
+/// this shard decides from what committed, and the message to the name's shard is taken only while the alias still names
+/// `work`; one lost (counted) is the next start's reconcile's to settle.
+fn settle_work_alias(state: &mut ShardState, work: DbVolumeId, name: &str) {
+  let name_partition = owner_of_name(name, state.shards.len());
+  let (Some(here), Some(name_shard)) = (
+    shard_of_partition(state, state.partition),
+    shard_of_partition(state, name_partition),
+  ) else {
+    state.count(ALIAS_STEP_UNTAKEN, 1);
+    return;
+  };
+  let name = name.to_owned();
+  let settling = slates_rt::futures::spawn(async move {
+    // A refused borrow (counted by `with_state_counted`) decides nothing: the alias stays reserved, never released for
+    // a work that may stand, and the next start's reconcile settles it (A-236).
+    let Some(made) = crate::state::with_state_counted(|s| {
+      s.db
+        .partition()
+        .volume(work)
+        .is_some_and(|record| record.name == name)
+    }) else {
+      return;
+    };
+    crate::xshard::run_on_counted(here, name_shard, move |s| {
+      if !s
+        .db
+        .partition()
+        .name_alias(&name)
+        .is_some_and(|alias| alias.volume == work)
+      {
+        return;
+      }
+      let step = if made {
+        Op::NameAliasConfirmed { name }
+      } else {
+        Op::NameAliasReleased { name }
+      };
+      if alias_step(s, &step).is_err() {
+        s.count(ALIAS_STEP_UNTAKEN, 1);
+      }
+    });
+  })
+  .and_then(slates_rt::futures::detach);
+  if settling.is_err() {
+    state.count(ALIAS_STEP_UNTAKEN, 1);
+  }
+}
+
+/// [`create_work`]'s creation itself, on this shard.
+fn create_work_here(
   state: &mut ShardState,
   principal: &Principal,
   green: VolumeId,
@@ -7530,14 +7614,22 @@ fn create_work(
       };
       // The work is the green at its head: it holds nothing of its own until it changes a file, and reads every
       // other file from the green there (`crate::work_files`), so an edit to a base file splices what the file holds.
-      (green_id, engine.head(), None)
+      // A name held for it at another partition holds the id its pending creation was given (A-400).
+      (
+        green_id,
+        engine.head(),
+        this_requests_pending_creation(state, name),
+      )
     }
   };
   // An admitted work holds its own name while it waits (A-247): that is its own hold, released here.
   if let Some(existing) = name_held(state, name)
     && Some(to_db_volume(existing)) != minted
   {
-    if let Some(id) = minted {
+    // Only an owner on another shard recorded a floor for the work at its admission; a green here records it below.
+    if let Some(id) = minted
+      && owner_of(green) != state.partition
+    {
       crate::work_home::tell_floor(state, green_id, id, None);
     }
     return refused(Refusal::AlreadyExists { existing });
@@ -7583,17 +7675,20 @@ fn create_work(
     taken_over: None,
   };
   let now = state.clock.monotonic_ns();
+  // A green elsewhere recorded the work's floor when it admitted the work; a green here records it below. The id may be
+  // minted here as well (a name held by an alias elsewhere, A-400), so where the floor is recorded follows the green.
+  let admitted_elsewhere = owner_of(green) != state.partition;
   if let Err(e) = state
     .db
     .mutate(&mut state.segment, &Op::VolumeCreated { record }, now)
   {
-    if minted.is_some() {
+    if admitted_elsewhere {
       crate::work_home::tell_floor(state, green_id, id, None);
     }
     return refused(refusal_of_db(&e));
   }
-  // The green keeps this base while the work holds it (A-247); a green elsewhere recorded it when it admitted the work.
-  if minted.is_none()
+  // The green keeps this base while the work holds it (A-247).
+  if !admitted_elsewhere
     && let Err(e) = state.db.mutate(
       &mut state.segment,
       &Op::WorkFloorSet {
@@ -14866,12 +14961,9 @@ pub(crate) async fn rebuild_recovered(
     rebuilt.copies_adopted = crate::shards::dax_hold::adopt_inherited(state);
     slices.unit_done().await;
   }
-  // The writes acknowledged after the last publication, a FUSE mount's (Linux) and a Shards stream's (Linux, macOS;
-  // A-316, A-339), back on top of the rebuilt volumes (A-63).
-  #[cfg(unix)]
-  {
-    rebuilt.writes_replayed = replay_writes(state, slices).await;
-  }
+  // The writes acknowledged after the last publication, a FUSE mount's (Linux) and a Shards stream's (every platform;
+  // A-316, A-339, A-402), back on top of the rebuilt volumes (A-63).
+  rebuilt.writes_replayed = replay_writes(state, slices).await;
   // The writable copies wake once the replay is done (A-389): every change reaches them again from here on, and what
   // the replay wrote beneath one that it differs from is its client's later store, which the client's next sync writes
   // back. The streams' DAX objects wake when their streams take them.
@@ -16352,7 +16444,6 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
   call_records_published(state);
   // Every volume captured: this image holds every logged write, so the write log empties, stamped with this
   // generation (A-63). A volume skipped keeps the log, so its writes stay replayable.
-  #[cfg(unix)]
   clear_write_log(
     state,
     published.skipped.is_empty(),
@@ -16618,7 +16709,6 @@ fn publish_delta_into(
   crate::content_holder::held_committed(state, held.whole, false);
   crate::live_ship::owned_committed(state, held.owned, false);
   call_records_published(state);
-  #[cfg(unix)]
   clear_write_log(
     state,
     published.skipped.is_empty(),
@@ -17110,13 +17200,11 @@ const TAKEOVER_KEPT_UNRELEASED: &str = "recovery.takeover_kept_unreleased";
 const REVOKED_MOUNTS_OVERDUE: &str = "fuse.revoked_overdue";
 
 /// Format: the refusal counter of a write-log span the content object refused (A-63): that write is not logged.
-#[cfg(unix)]
 pub(crate) const WRITE_LOG_UNWRITTEN: &str = "recovery.write_log_unwritten";
 
 /// Empties the shard's FUSE write log after a publication that captured every volume (A-63), stamped with that
 /// publication's generation: every write before it is in that image now. A volume skipped keeps the log, so its
 /// writes stay owed to the next daemon.
-#[cfg(unix)]
 fn clear_write_log(state: &mut ShardState, captured_every_volume: bool, generation: u64) {
   if !captured_every_volume {
     return;
@@ -17141,7 +17229,6 @@ fn clear_write_log(state: &mut ShardState, captured_every_volume: bool, generati
 /// place among the writes (GAPS, A-154's sibling): the kernel never resends one, so without it the references a dead
 /// daemon was given back after its last publication stayed counted, and an unlinked file the kernel had let go was
 /// never reclaimed.
-#[cfg(unix)]
 async fn replay_writes(
   state: &mut ShardState,
   slices: &mut crate::recovery_slices::RecoverySlices,
@@ -17176,7 +17263,6 @@ async fn replay_writes(
 }
 
 /// The slot of the volume a record names, when recovery rebuilt it.
-#[cfg(unix)]
 fn slot_of_volume(
   state: &ShardState,
   volume: [u8; 16],
@@ -17186,7 +17272,6 @@ fn slot_of_volume(
 
 /// Gives back one logged `FORGET`'s lookups, as its attachment's own, in the volume its record names; `None` when
 /// recovery did not rebuild that volume.
-#[cfg(unix)]
 fn replay_forget(
   state: &mut ShardState,
   forgotten: crate::write_log::Forgotten,
@@ -17203,7 +17288,6 @@ fn replay_forget(
 
 /// Writes one logged record into the volume it was written through, which the record names; `None` when recovery did
 /// not rebuild that volume.
-#[cfg(unix)]
 fn replay_one(
   state: &mut ShardState,
   record: &crate::write_log::Record,
@@ -17224,7 +17308,6 @@ fn replay_one(
 /// Empties the write log under the committed image's generation and appends `remaining` to it, so the records a
 /// replay has not yet applied survive a crash before it ends. A record the log cannot take marks it overflowed
 /// (A-63: the next daemon reports every taken-over file as having lost writes).
-#[cfg(unix)]
 fn relog_remaining(state: &mut ShardState, remaining: &[crate::write_log::Logged]) {
   let generation = state.journal.generation();
   let (Some(object), Some(log)) = (state.content.as_mut(), state.write_log.as_mut()) else {
@@ -17252,12 +17335,10 @@ fn relog_remaining(state: &mut ShardState, remaining: &[crate::write_log::Logged
 }
 
 /// Format: the refusal counter of a logged write recovery could not replay (A-63).
-#[cfg(unix)]
 const WRITE_REPLAY_REFUSED: &str = "recovery.write_replay_refused";
 
 /// Format: the refusal counter of a logged `FORGET` recovery could not give back (no rebuilt volume holds its inode,
 /// or the volume refused it).
-#[cfg(unix)]
 const FORGET_REPLAY_REFUSED: &str = "recovery.forget_replay_refused";
 
 /// Format: the refusal counter of a volume whose recovered references could not be settled.
@@ -17693,9 +17774,8 @@ mod tests {
   /// shard, a volume whose file "f" holds "origin", snapshotted and cloned; replay a logged write of "clone!" at offset 0
   /// of the clone's "f", through the clone, as the successor of a daemon that served it would. Expect: the clone's "f"
   /// reads "clone!" and the origin's still "origin", the inode carrying the origin's prefix (non-vacuous). Before, the
-  /// write went to the origin, the clone kept "origin" and lost its write. Every Unix: macOS replays a Shards stream's
-  /// logged writes too (A-339).
-  #[cfg(unix)]
+  /// write went to the origin, the clone kept "origin" and lost its write. Every platform: a Shards stream's logged
+  /// writes are replayed on macOS (A-339) and Windows (A-402) too.
   #[test]
   fn a_replayed_write_to_a_clones_inherited_file_lands_in_the_clone() {
     let (origin_reads, clone_reads, inherited_prefix, origin_prefix) =

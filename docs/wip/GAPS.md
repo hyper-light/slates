@@ -416,11 +416,17 @@
 > the step quantum (`reached_slice`, counted `fleet.live.reached_slices`). Test:
 > `a_holders_return_is_walked_in_turns_and_it_takes_every_log` (`crates/server/tests/fleet.rs`). **Owed (measurement, the
 > supervisor's):** the owner shard's longest step when a holder of thousands of live volumes returns, before and after.
-> **Still owed (the seal walk's other sibling):** a new configuration's install on the control shard
-> (`fleet::sync_config_from_council`) raises every held record's fence and moves every held object of a retired owner
-> in one turn. Slicing it is not a cut of a loop alone: a record a stale owner sends to a held object not yet reached
-> must still meet the new fence, so each acceptor must be brought up to the installed version when it is next asked as
-> well as by the walk (a design change to §4.8's install, with its model).
+> **Closed (the seal walk's other sibling, 2026-11-18, A-398):** a new configuration's install on the control shard
+> (`fleet::sync_config_from_council`) raised every held record's fence and moved every held object of a retired owner
+> in one turn. It now installs the version in that turn and walks the copies a step quantum a turn
+> (`fleet::InstallWalk`; `a_holders_copies_take_an_install_in_turns_and_every_copy_follows`). The worry written here,
+> that a record a stale owner sends to a copy not yet reached must still meet the new fence, was put to the model first
+> (`docs/wip/models/InstallInTurns.tla`, the model table): a copy not yet reached refuses a record of the new
+> generation by its own generation check, the node refuses one of any other generation at the door, and phase one's
+> page fences and re-authorizes each copy it lists itself; any one or two of those three may go and no stale record
+> commits, and only with all three gone does one. So no reconcile on access is needed for safety; the walk alone
+> decides when a copy follows. **Owed (measurement, the supervisor's):** the control shard's longest step at an install
+> with 10^4 and 10^5 held copies, before and after.
 
 > **A takeover round started over one epoch above its own adoptions, and the successor's writes were refused for good:
 > fixed for a newer configuration (2026-11-18, A-353, §4.8 "Promotion and takeover"; g230, caught live by g229).** Each
@@ -736,8 +742,10 @@
 >   **And its DAX maps (A-365, the same day):** the anchor holds each DAX object a stream hands its device, the shard's
 >   DAX range table records each range answered, and a successor takes the objects back, ingests the guest's unsynced
 >   stores before it serves anything and answers the device with the same objects; a stream keeps its resync through
->   its guest's maps. **Owed:** Windows on Shards' handle path, and a write log for a Windows stream, whose acknowledged
->   writes a death still loses whether or not it is resynced. Found with A-365 (Linux), **fixed by A-389 (2026-11-18)**:
+>   its guest's maps. **Owed:** Windows on Shards' handle path. **Built since (A-402, 2026-11-18):** the write log on
+>   Windows, so a Windows stream's acknowledged writes outlive its daemon's death, replayed into the volume (its Windows
+>   run is main's, `run-requests.md`); before, a Windows stream's acknowledged writes since the last publication were
+>   lost at its daemon's death. Found with A-365 (Linux), **fixed by A-389 (2026-11-18)**:
 >   A-197's writable copies were taken back awake before the write log's replay, so a logged write a client's store
 >   followed was written over that store, in the client's own map, at a takeover; they are kept dormant through the
 >   replay and woken after it, as A-365's DAX objects are (`crates/server/tests/held_copy_replay.rs`, Linux). Found
@@ -2930,9 +2938,12 @@
 >     - **Closed: an ask waiting out the batch before it (A-388, 2026-11-18).** One batch of asks was out to an owner at
 >       a time, and the wait for it was about half of an ask's way to the owner (p99 1.6 to 2.1 ms for submits and
 >       rebases at 50 ms); a shard now keeps two out.
->     - **Open, the hops (by the trace):** an edit of a work off its client's shard crosses four thread hand-offs (the
->       client's shard, the work's, the owner's, back), each waiting for its thread to run; and a first touch, a
->       verdict, a rebase and a read of the green each queue on the owner's one thread.
+>     - **Closed: a work's hop from its client's shard (A-400, 2026-11-18).** A work lived on the shard its name hashes
+>       to, so every verb of it crossed from its client's shard and back; it now lives on its client's shard, its name
+>       held by an alias where the name hashes. Priced first by naming works onto their clients' shards: an edit's p99
+>       about halved and its p50 40% lower at 1,000 clients.
+>     - **Open, the owner's one thread:** a first touch of a base file, a verdict, a rebase and a read of the green each
+>       still cross to the green's owner and queue there (A-273's replicas would take the reads and rebases off it).
 >
 >     **Owed, measurement (the supervisor's):** the 1,000-client rung on main with W1 (A-247 step one, landed
 >     2026-11-17) against main before it (02c6469e5). Each think mean runs as its own invocation with a fresh daemon,
@@ -3427,8 +3438,8 @@
 > reply's total, a takeover's attempts), fanned to every shard in whole periods. **Since A-384 a CLI attachment's term is
 > its holder's** (`min(F, the gaps' tail + W)`, renewed by every verb and by a holder's `Renew`, fresh after a restart),
 > held by `slates attach --hold` and the library's `slates_client::Hold` (the SDKs make no CLI-form attachment: theirs
-> end with their client); owed: a laptop's failover delay counting its anchor's supervision window as its detection, and
-> the volume's write lease (D-16) taking its holder's term. Owed, each in its own
+> end with their client); since A-405 a laptop's failover delay counts its anchor's supervision window as its detection
+> (two seconds there); owed: the volume's write lease (D-16) taking its holder's term. Owed, each in its own
 > change: each other lease takes its term from a φ-accrual
 > detector of its own holder's renewals (a CLI attachment once the CLI process sends a keepalive); `W`'s floor from the
 > pulses' running wake delay; then `FAILOVER_SLO_NS` and `with_failover_slo` go, since nothing sets `F`. The boot-time
@@ -4145,6 +4156,13 @@
 >   it stopped (1 of 11 `windows-2025` runners sampled; it failed the tag `v0.1.0`'s first Windows x86_64 build). It
 >   refused main before the fix with 0xC0000139 and adds 21 s to the lane (run 44354728411). Record:
 >   `docs/bugs/2026-11-18-the-windows-binary-did-not-start-in-nano-server.md`.
+> - **Open (2026-11-18, A-407): AC-9.5 holds on one runner image.** The Windows binaries link MSVC's static C
+>   runtime, so the Visual Studio of the runner's image is in their bytes. During GitHub's rollout of `windows-2025`
+>   20261116.315.1 (Visual Studio 18.12) beside 20261103.298.1 (18.11), the tag `v0.1.0`'s two x86_64 copies landed on
+>   different images and differed in 2,559,679 of 15,139,328 bytes, while each image built the same bytes every time
+>   (d3498b4f twice, 871a057d three times, test 4's included; run 44347535833). The artifacts task now names both images
+>   in its refusal, and one copy is run again until the pair shares an image. Owed: pin the MSVC toolset and the
+>   Windows SDK the Windows binaries link, so a tag's bytes do not depend on which image a runner has.
 > - **Reproducible from the tag (2026-11-05, AC-9.5).** Every target is built twice on separate runners, and the
 >   release is refused unless the two copies are the same bytes. The four Linux binaries already were. The Windows
 >   ones differed in 20 bytes, the linker's timestamps and PDB GUID (run 42046848954), until `/Brepro`; with it, all six
@@ -8208,6 +8226,11 @@ Every phase retains its original acceptance gates plus the A-9 additions.
 | `models/FencedLedger.tla` | `FencedLedger.cfg` (A-364): 3 holders, 2 hosts, 2 epochs, 2 positions, 2 values, per-position adoption | no error (TypeOK, Agreement, Continuity, AdoptedIsPrefix, StaleNeverCommits, ReadSafety; 2 min 11 s) | 2,683,673 distinct | 27 | 2026-11-18 |
 | `models/FencedLedger.tla` | `FencedLedger_register.cfg` (A-364): the same under the register's rule, the highest record alone (the server's round before the record half) | Continuity violated, as it must be (non-vacuity): the adopted log lacks a committed lower position | 29,623 distinct at the violation | 14 | 2026-11-18 |
 | `models/FencedLedger.tla` | `FencedLedger_3.cfg` (A-364): 3 epochs (two takeovers), holders symmetric | not completed: stopped after 34 min with 13,438,768 states on the queue, to give the runner's memory back (TLC at 9.6 GB beside other builds); no invariant violated in the 40,469,260 distinct states explored, every one at depth 26 or less. A complete run wants a bound on the stale owners' proposals or a larger machine | 40,469,260 distinct (partial) | 26 (partial) | 2026-11-18 |
+| `models/InstallInTurns.tla` | `InstallInTurns_eager.cfg` (A-398): 3 holders (symmetric), 3 versions (two takeovers), 1 record an owner, every copy moved at its node's install | no error (TypeOK, TotalOrder, Continuity, StaleNeverCommits, ReadSafety; 16 s) | 117,782 distinct | 32 | 2026-11-18 |
+| `models/InstallInTurns.tla` | `InstallInTurns_lazy.cfg` (A-398): the same, each copy reconciled at any later step (the walk in turns) | no error (34 s) | 192,633 distinct | 38 | 2026-11-18 |
+| `models/InstallInTurns.tla` | `_lazy_copy_gen.cfg`, `_lazy_fence.cfg`, `_lazy_promote_auth.cfg`: one protection removed (a copy's own generation check; every fence raise but an accepted record's; phase one's demand that the copy name the successor) | no error, each (1 min 2 s; 39 s; 2 min 6 s) | 323,141; 192,633; 858,558 distinct | 38 | 2026-11-18 |
+| `models/InstallInTurns.tla` | `_lazy_copy_gen_fence.cfg`, `_lazy_fence_promote_auth.cfg`, `_lazy_copy_gen_promote_auth.cfg`: two removed | no error, each (38 s; 1 min 14 s; 3 min 30 s) | 323,141; 858,558; 1,436,869 distinct | 38 | 2026-11-18 |
+| `models/InstallInTurns.tla` | `InstallInTurns_lazy_all.cfg`: all three removed | StaleNeverCommits violated, as it must be (non-vacuity): a stale owner's record commits on copies that answered phase one under its authority, unfenced | at the violation | 12 | 2026-11-18 |
 
 The models are architecture artifacts, not CI jobs. These historical runs apply only to the
 listed models and configurations. The Rust simulations are evidence with known gaps, not a
@@ -10873,13 +10896,50 @@ whose verifier disagrees written again — with a kill per round and a final kil
 kill sent the macOS client through its reconnect path, the path whose memory corruption panicked the kernel. That
 client is the leading suspect, not proven: the kernel run under A-113 (no reconnects) would show it, and waits for Ada.
 
-### 2026-11-18: a WinFsp write answered before its publication may be lost across a daemon kill (A-358's sibling; open, unproven)
+### 2026-11-18: a WinFsp write answered before its publication was lost across a daemon kill (A-358's sibling; fixed, A-379)
+
+> **2026-11-18 (g079): proven and fixed (A-379).**
+> - **The test.** `a_write_answered_before_its_daemons_kill_is_kept_or_its_flush_refused` (`crates/cli/tests/winfsp.rs`)
+>   runs on CI's two Windows runners through diagnostics branches. Each of five rounds:
+>   - creates a new file through a writable drive, opened unbuffered;
+>   - writes its first page;
+>   - kills the daemon before any flush or close;
+>   - waits for the successor on the same drive, then flushes and reads the page back uncached.
+> - **Results.**
+>   - On main (run 44360312582) all 5 rounds lost their write on each runner: every flush succeeded, and every new file
+>     then read back empty, 0 of its 4,096 bytes.
+>   - With the fix (run 44360313388) every write was kept: 5 of 5 on each runner.
+> - **Why the first draft passed.** It overwrote one page of an existing file and kept 5 of 5 on main (run 44354915582).
+>   An overwrite inside a published length lands in place in the file's open extent in anchor-owned memory (§4.8). A new
+>   file's bytes run past every published length.
+> - **The fix.** `Op::needs_barrier` names `Op::Write`: every WinFsp write is published before its reply, apart from a
+>   purge's own write, which changes nothing. A write's reply claims no durability past the daemon, so on a live-shipped
+>   volume only a flush waits for the candidates (A-200).
+> - **Regressions.** With the fix the WinFsp bridge's library tests (107), the WinFsp CLI suite (19, A-198's twenty kills
+>   with no drive lost) and the WinFsp semantics suite (16) pass on both runners (runs 44356053019 and 44360313388).
+> - **Each route, and what keeps a write its daemon answered once that daemon dies** (2026-11-18, the sibling sweep;
+>   A-358's rule is that one of the two must hold before the reply):
+>
+> | route | kept by | proven by |
+> |---|---|---|
+> | NFS (the macOS mount, the network export) | the barrier, before every write's reply (A-358) | `an_acknowledged_write_survives_its_daemons_kill_with_no_rewrite` |
+> | FUSE mounts (Linux) | the write log in anchor memory, replayed by the successor (A-63) | `a_closed_files_writes_survive_a_kill_from_the_write_log_alone` |
+> | Shards streams (Linux, macOS), where a VM outlives its daemon (A-316, A-339, A-365) | the write log, before the reply (`shards::log_write`) | `a_stream_is_resynced_after_its_daemons_death_and_its_unanswered_create_is_answered_once` |
+> | WinFsp drives (Windows) | the barrier, before every write's reply (A-379) | `a_write_answered_before_its_daemons_kill_is_kept_or_its_flush_refused` |
+> | Shards streams (Windows) | nothing; the stream ends with its daemon, so no successor serves it | owed with "Windows streams have no write log" (g268) |
+> | vhost-user (crosvm, QEMU; Linux) | nothing; the VM ends with its device's daemon | owed with "a VM that outlives its device's daemon" (Phase 8 step 4) |
+>
+> - **Owed.** The cost of A-379: a publication per paging write, measured through a WinFsp drive before and after. For
+>   the last two routes: the work that lets a guest outlive its daemon must bring the write log or A-358's rule first.
+> - **Record.** `docs/bugs/2026-11-18-a-winfsp-write-answered-before-its-publication-was-lost-across-a-daemon-kill.md`.
+
 
 A-358 found that an NFS write answered before any publication is lost when the daemon dies, if the client never sends
 it again (Apple's never does). WinFsp has the same shape:
 - a plain write is answered before any publication; only a namespace or size change, a flush, and the close of a handle
   that wrote publish first (`crates/server/src/winfsp.rs`);
-- Windows has no write log (`write_log` is `#[cfg(unix)]`);
+- Windows had no write log (`write_log` was `#[cfg(unix)]`; it is on every platform since A-402, 2026-11-18, and a
+  Shards stream's writes are logged there; a WinFsp write is not logged yet);
 - a WinFsp drive outlives a killed daemon (A-198).
 
 So a kill between a paging write's reply and the next flush or close would lose that write, and the successor's flush
@@ -10890,7 +10950,8 @@ Owed:
    shape on a WinFsp drive: write, kill, flush, close, read back.
 2. If it is red, the fix: A-358's rule (publish every write before its reply), or the write log on Windows, A/B'd.
 
-Shards streams on macOS have the same shape and are covered: their writes are logged since `1fa154230`.
+Shards streams on macOS have the same shape and are covered: their writes are logged since `1fa154230`; on Windows
+since A-402, which also makes the log option 2 names available to the WinFsp drive.
 
 ### 2026-10-06: restarts are a few milliseconds for every client (A-113 follow-ups, A-114)
 
@@ -17955,6 +18016,10 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     as in step 3; `guest_dax.rs` 3 of 3 beside them. **Found:** the A-170 bug below, in 2 rounds of 3 before the fix.
   - **Owed, a later goal:** a VM that outlives its device's daemon. The anchor would have to hold the device's socket
     end and its state (vrings, memory table, back-end channel, windows) across the restart, as A-61 holds a FUSE device.
+    This vhost-user route answers a guest's write before any publication and does not log it. That is safe only because
+    the VM dies with the daemon here. Work that lets a VM outlive its device's daemon on this route must publish each
+    write before its reply (A-358) or log it. The Shards stream route already lets a VM outlive its daemon, and it logs:
+    see the route table in GAPS 2026-11-18, "a WinFsp write answered before its publication was lost".
 - **Fixed 2026-10-25 (A-170), found by step 4: a clone's copy-up sealed its origin's open extent behind the origin's
   image, so a crash lost the shard.** `docs/bugs/2026-10-25-a-clones-copy-up-sealed-its-origins-open-extent-behind-its-image.md`.
   - **Symptom:** the daemon-kill test failed 2 rounds of 3, then 3 of 4, always the fastest rounds. The successor logged

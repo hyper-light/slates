@@ -1942,26 +1942,44 @@ const RECORD_REFUSED_BY_FAULT: &str = "fleet.record.refused_by_fault";
 /// authorized owner — the object's new owner can then commit through this hold and its prepare authorizes.
 /// Every survivor computes the same routing winner, so this needs no coordination. Idempotent: an install
 /// of the same owner under an equal-or-higher generation is accepted, a lower one refused (ignored), so the
-/// authority only advances.
+/// authority only advances. An install walks the copies a slice a turn instead ([`install_on_copy`], A-398); this whole
+/// pass is the walk's oracle in the daemon's unit tests.
+#[cfg(test)]
 pub(crate) fn reconcile_held_authority(state: &mut ShardState) {
   let generation = state.fleet.configuration().version;
-  // A move away from a retired owner is recorded with the copy (A-251): once the authority names the successor, only
-  // that record says the copy was the retired owner's, which a takeover round's listing needs.
-  let retired: std::collections::BTreeSet<HostId> = state
+  let retired = retired_hosts(state);
+  let held: Vec<ObjectId> = state.holder_records.keys().copied().collect();
+  for object in held {
+    reconcile_held_copy(state, object, generation, &retired);
+  }
+}
+
+/// The hosts the council's configuration keeps a retirement of.
+#[cfg(test)]
+fn retired_hosts(state: &ShardState) -> std::collections::BTreeSet<HostId> {
+  state
     .council
     .configuration()
     .retired
     .keys()
     .copied()
-    .collect();
-  let held: Vec<ObjectId> = state.holder_records.keys().copied().collect();
-  for object in held {
-    if let Some(owner) = state.fleet.object_owner(object)
-      && let Some(acceptor) = state.holder_records.get_mut(&object)
-    {
-      let from_retired = retired.contains(&acceptor.owner());
-      let _ = acceptor.move_authority(Authority { generation, owner }, from_retired);
-    }
+    .collect()
+}
+
+/// [`reconcile_held_authority`] for one held copy, `object`'s: its authority moved to the owner this node's routing
+/// names, at `generation`. A move away from a retired owner is recorded with the copy (A-251): once the authority names
+/// the successor, only that record says the copy was the retired owner's, which a takeover round's listing needs.
+fn reconcile_held_copy(
+  state: &mut ShardState,
+  object: ObjectId,
+  generation: u64,
+  retired: &std::collections::BTreeSet<HostId>,
+) {
+  if let Some(owner) = state.fleet.object_owner(object)
+    && let Some(acceptor) = state.holder_records.get_mut(&object)
+  {
+    let from_retired = retired.contains(&acceptor.owner());
+    let _ = acceptor.move_authority(Authority { generation, owner }, from_retired);
   }
 }
 
@@ -9362,13 +9380,9 @@ fn sync_config_from_council(local: HostId) {
     if s.council.configuration().version == s.fleet.configuration().version {
       return;
     }
-    let (configuration, members, epochs) = {
+    let (configuration, members) = {
       let regional = s.council.configuration();
-      (
-        regional.configuration_for(local),
-        regional.members.clone(),
-        regional.epochs.clone(),
-      )
+      (regional.configuration_for(local), regional.members.clone())
     };
     let Some(configuration) = configuration else {
       return;
@@ -9390,26 +9404,181 @@ fn sync_config_from_council(local: HostId) {
       .installed(configuration.version, slates_machine::clock::monotonic_ns());
     // At this host's own epoch advanced (retired while away, admitted again under its id), its catalogued volumes are
     // yielded to their successors (A-334, `crate::readmission`).
+    let version = configuration.version;
     crate::readmission::install_placement(s, configuration, &members);
-    // Raise the fence for every held object to its owner's committed fencing epoch (§4.8 "every holder
-    // raises its fence for that host to the new epoch"). A failed owner's epoch was bumped by the council's
-    // takeover, so this fences a resumed stale owner `StaleEpoch` across all its objects **at once** — done
-    // before the objects move to their successors below, so the fence is read against the *departed* owner.
-    // Monotonic (a live owner's unchanged epoch is a no-op), additive on top of the configuration-generation
-    // fence. (The FencedRegister per-host model this realizes, A-9, still owes its TLA+ revalidation before the
-    // modeled StaleNeverCommits result formally applies; design §4.8.)
-    for acceptor in s.holder_records.values_mut() {
-      if let Some(epoch) = epochs.get(&acceptor.owner()) {
-        acceptor.raise_fence(*epoch);
-      }
-    }
-    // Every held object whose owner a kept retirement names moves to the successor the configuration's
-    // lineage ranks — at every holder, the successor included, each keeping the retired host whose round lists
-    // the object and whose lease its promise is gated on — and a stale copy is reclaimed (§4.8; the takeover
-    // module).
-    crate::takeover::resolve_held_objects(s, local);
-    reconcile_held_authority(s);
+    // The install reaches the held register copies by a walk a slice a turn (A-398, [`InstallWalk`]): each copy's
+    // fence raised to its owner's committed epoch, its object moved to the successor a kept retirement's lineage ranks
+    // or let go as stale, and its authority moved to the owner its route names ([`install_on_copy`]). Until the walk
+    // reaches a copy, the copy refuses a record of this version (its own generation is older), and a takeover round's
+    // page installs its asker on the copies it lists itself; so the walk changes when a copy follows, never what it may
+    // accept (`docs/wip/models/InstallInTurns.tla`). A newer install begins the walk again from the first copy.
+    s.install_walk = Some(InstallWalk {
+      version,
+      after: None,
+      walking: false,
+    });
+    s.count(INSTALL_WALKS, 1);
   });
+}
+
+/// The install of the committed configuration on this holder's register copies, a slice a turn (A-398; §4.8
+/// "Configuration, by consensus"; CLAUDE.md "Bounded work everywhere"). An install once moved every held copy in the
+/// turn that installed the version: each fence raised, each object a kept retirement names moved to its successor and
+/// each authority reconciled, one turn of the control shard over every copy this node holds. Now the version is
+/// installed in that turn (the node's placement, so a record of another generation is refused at the door,
+/// `check_held_record`) and the copies follow by this walk, in key order, a step quantum of the control shard a turn
+/// ([`install_slice`]), each turn a turn of its own ([`crate::xshard::Turns`]). Model-checked first
+/// (`docs/wip/models/InstallInTurns.tla`, three holders, two takeovers): a copy reconciled any time after its node
+/// installed the version keeps TotalOrder, Continuity, StaleNeverCommits and ReadSafety; so does one that, besides,
+/// skips its own generation check, or whose fences are not raised, or that answers phase one under its old authority;
+/// only with all three gone does a stale owner's record commit.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct InstallWalk {
+  /// The configuration version the walk brings the copies to: a newer install begins a walk of its own.
+  version: u64,
+  /// The last copy the walk reached, in key order; `None` before the first.
+  after: Option<ObjectId>,
+  /// Whether a task walks it now ([`walk_install`]); the coordinator's period starts one when none does, so a task the
+  /// shard refused, or one whose turn missed its deadline, is begun again where the walk stands.
+  walking: bool,
+}
+
+/// Counter: an install whose walk over the held register copies began ([`InstallWalk`], A-398).
+const INSTALL_WALKS: &str = "fleet.config.install_walks";
+/// Counter: one turn of an install's walk ([`install_slice`]).
+const INSTALL_SLICES: &str = "fleet.config.install_slices";
+/// Counter: an install's walk that reached every held copy.
+const INSTALL_WALKED: &str = "fleet.config.installs_walked";
+/// Counter: a walk task the control shard could not spawn; the next period begins it again.
+const INSTALL_UNWALKED: &str = "fleet.config.install_unwalked";
+
+/// Begins a task walking the install owed on this (the control) shard when none walks it ([`InstallWalk`]): at the
+/// period after the install, and again at a later period if the task could not be spawned or its turn was not answered.
+fn drive_install_walk(local: HostId) {
+  let Some((control, version)) = state::with_state(|s| {
+    let walk = s.install_walk.as_mut()?;
+    if walk.walking {
+      return None;
+    }
+    walk.walking = true;
+    Some((s.shard, walk.version))
+  })
+  .flatten() else {
+    return;
+  };
+  let spawned = futures::spawn(walk_install(control, local, version)).and_then(futures::detach);
+  if spawned.is_err() {
+    let _ = state::with_state_counted(|s| {
+      s.count(INSTALL_UNWALKED, 1);
+      if let Some(walk) = s.install_walk.as_mut()
+        && walk.version == version
+      {
+        walk.walking = false;
+      }
+    });
+  }
+}
+
+/// Walks the install of `version` over this shard's held register copies a turn at a time ([`install_slice`]), each
+/// turn awaited within a heartbeat and a turn of the shard of its own. Ends once every copy took the version, a newer
+/// install began its own walk, or a turn was not answered within its deadline (the period begins the walk again where
+/// it stands).
+async fn walk_install(control: u16, local: HostId, version: u64) {
+  let mut turns = crate::xshard::Turns::new(control, control);
+  loop {
+    match turns
+      .call(move |s| install_slice(s, local, version), HEARTBEAT_NS)
+      .await
+    {
+      Some(true) => {}
+      Some(false) => return,
+      None => break,
+    }
+  }
+  let _ = state::with_state_counted(|s| {
+    if let Some(walk) = s.install_walk.as_mut()
+      && walk.version == version
+    {
+      walk.walking = false;
+    }
+  });
+}
+
+/// One turn of an install's walk: the held copies after the walk's last, in key order, each brought to the installed
+/// version ([`install_on_copy`]), until the shard's step quantum is spent (or the one a test injected); the first copy
+/// is always reached, so every turn moves the walk on. Whether another turn is owed: not once every copy took the
+/// version, nor for a walk a newer install replaced, nor while the council has committed a version past it (the next
+/// period installs that one and begins its walk afresh, so the copies are never brought to a configuration the node's
+/// placement has not installed).
+fn install_slice(s: &mut ShardState, local: HostId, version: u64) -> bool {
+  let Some(walk) = s.install_walk else {
+    return false;
+  };
+  if walk.version != version
+    || s.fleet.configuration().version != version
+    || s.council.configuration().version != version
+  {
+    return false;
+  }
+  s.count(INSTALL_SLICES, 1);
+  let quantum = s
+    .install_walk_quantum_ns
+    .or_else(futures::step_budget_ns)
+    .unwrap_or(s.config.runtime.step_budget_ns);
+  let regional = s.council.configuration().clone();
+  let retired: std::collections::BTreeSet<HostId> = regional.retired.keys().copied().collect();
+  let began = futures::now_ns();
+  let mut after = walk.after;
+  loop {
+    let next = match after {
+      Some(last) => s
+        .holder_records
+        .as_map()
+        .range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded))
+        .next()
+        .map(|(object, _)| *object),
+      None => s.holder_records.keys().next().copied(),
+    };
+    let Some(object) = next else {
+      s.install_walk = None;
+      s.count(INSTALL_WALKED, 1);
+      return false;
+    };
+    install_on_copy(s, local, (&regional, &retired), version, object);
+    after = Some(object);
+    if futures::now_ns().saturating_sub(began) >= quantum {
+      break;
+    }
+  }
+  if let Some(walk) = s.install_walk.as_mut() {
+    walk.after = after;
+  }
+  true
+}
+
+/// The installed configuration on one held copy, `object`'s, as the install once did it to every copy at once, in its
+/// order: the copy's fence raised to its owner's committed epoch (§4.8 "every holder raises its fence for that host to
+/// the new epoch"; read against the owner the copy names before it moves, so a departed owner's bumped epoch fences
+/// its resumed stale self `StaleEpoch`), then the object moved to the successor its lineage ranks or let go as stale
+/// (`takeover::resolve_held_object`), then its authority moved to the owner its route names at `generation`
+/// ([`reconcile_held_copy`]).
+fn install_on_copy(
+  s: &mut ShardState,
+  local: HostId,
+  (regional, retired): (
+    &slates_db::register::RegionalConfiguration,
+    &std::collections::BTreeSet<HostId>,
+  ),
+  generation: u64,
+  object: ObjectId,
+) {
+  if let Some(acceptor) = s.holder_records.get_mut(&object)
+    && let Some(epoch) = regional.epochs.get(&acceptor.owner())
+  {
+    acceptor.raise_fence(*epoch);
+  }
+  crate::takeover::resolve_held_object(s, local, regional, object);
+  reconcile_held_copy(s, object, generation, retired);
 }
 
 /// Fans the control shard's current committed configurations — the council's placement `Configuration` and the
@@ -9805,6 +9974,9 @@ async fn follow_configuration(
   // owner's objects that rendezvous first to this node over the new neighbourhood are owed a phase-one
   // recovery, driven below).
   sync_config_from_council(local);
+  // The install reaches the held register copies by a walk in turns (A-398): begun here once the version is installed,
+  // and begun again where it stands if its task could not run.
+  drive_install_walk(local);
   // Fan the committed placement and root configurations out to every other shard, every period, so a client
   // reads the same placement and cross-region home wherever it lands (§4.8 "Lookup", D-7). Re-fanned every
   // period so a dispatch a full control channel refused self-heals; the receiving install/adopt are
