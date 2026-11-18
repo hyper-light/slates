@@ -874,10 +874,16 @@ enum Opened {
   Missing(Vec<[u8; 32]>),
 }
 
-/// One object's held content: its manifests and how many of them reference each chunk.
+/// One object's held content: its manifests, the same manifests by the sequence each was placed for, and how many of
+/// them reference each chunk.
 #[derive(Debug, Default)]
 struct Held {
   manifests: BTreeMap<[u8; 32], HeldManifest>,
+  /// Each manifest's placed sequence and identity (A-372): what lets the retention rule judge only the content placed at
+  /// or past a sequence ([`ContentHold::retain_placed_from`]) and read the newest placement in one step
+  /// ([`ContentHold::newest_placed`]), where both walked every manifest the object held. Changed wherever `manifests`
+  /// is, and charged with it ([`manifest_entry_bytes`]).
+  by_sequence: BTreeSet<(u64, [u8; 32])>,
   chunks: BTreeMap<[u8; 32], u64>,
 }
 
@@ -905,16 +911,18 @@ fn chunk_entry_bytes() -> u64 {
   btree_entry_bytes::<[u8; 32], StoredChunk>()
 }
 
-/// The index cost of a new object: its entry and the roots of its two maps.
+/// The index cost of a new object: its entry and the roots of its three maps.
 fn object_entry_bytes() -> u64 {
   btree_entry_bytes::<ObjectId, Held>()
     .saturating_add(btree_map_bytes::<[u8; 32], HeldManifest>())
+    .saturating_add(btree_map_bytes::<(u64, [u8; 32]), ()>())
     .saturating_add(btree_map_bytes::<[u8; 32], u64>())
 }
 
-/// The index cost of a new manifest for an object.
+/// The index cost of a new manifest for an object: its entry and its entry by placed sequence (A-372).
 fn manifest_entry_bytes() -> u64 {
   btree_entry_bytes::<[u8; 32], HeldManifest>()
+    .saturating_add(btree_entry_bytes::<(u64, [u8; 32]), ()>())
 }
 
 /// The index cost of an object's reference to a chunk.
@@ -1178,11 +1186,11 @@ impl ContentHold {
     manifest: &Archive,
   ) -> Result<(Opened, bool), ContentRefusal> {
     let identity = manifest.manifest_identity();
-    if let Some(record) = self
-      .objects
-      .get_mut(&object)
-      .and_then(|held| held.manifests.get_mut(&identity))
+    if let Some(held) = self.objects.get_mut(&object)
+      && let Some(record) = held.manifests.get_mut(&identity)
     {
+      held.by_sequence.remove(&(record.placed.sequence, identity));
+      held.by_sequence.insert((placed.sequence, identity));
       record.placed = placed;
       return Ok((Opened::Held, false));
     }
@@ -1445,7 +1453,7 @@ impl ContentHold {
       }
       *references = references.saturating_add(1);
     }
-    held.manifests.insert(
+    let replaced = held.manifests.insert(
       identity,
       HeldManifest {
         extent: stage.extent,
@@ -1453,6 +1461,12 @@ impl ContentHold {
         placed: stage.placed,
       },
     );
+    if let Some(replaced) = replaced {
+      held
+        .by_sequence
+        .remove(&(replaced.placed.sequence, identity));
+    }
+    held.by_sequence.insert((stage.placed.sequence, identity));
     for chunk_identity in &stage.staged {
       if let Some(chunk) = self.chunks.get_mut(chunk_identity) {
         chunk.staged = chunk.staged.saturating_sub(1);
@@ -1575,6 +1589,20 @@ impl ContentHold {
     &mut self,
     space: &mut HoldSpace<'_>,
     object: ObjectId,
+    keep: impl FnMut(&[u8; 32], Placed) -> bool,
+  ) -> usize {
+    self.retain_placed_from(space, object, 0, keep)
+  }
+
+  /// [`retain`](Self::retain) over the manifests placed for `from` or a later sequence only, and the stage (A-372): the
+  /// content an event can change the judgment of, when everything placed before `from` was judged already and nothing
+  /// since can change it (a ledger's accepted positions are never rewritten, so its inputs named once stay named).
+  /// One step to find them, where judging every manifest made each judgment cost the object's history.
+  pub fn retain_placed_from(
+    &mut self,
+    space: &mut HoldSpace<'_>,
+    object: ObjectId,
+    from: u64,
     mut keep: impl FnMut(&[u8; 32], Placed) -> bool,
   ) -> usize {
     let stage_released = self
@@ -1587,10 +1615,10 @@ impl ContentHold {
       .get(&object)
       .map(|held| {
         held
-          .manifests
-          .iter()
-          .filter(|(identity, record)| !keep(identity, record.placed))
-          .map(|(identity, _)| *identity)
+          .by_sequence
+          .range((from, [0; 32])..)
+          .filter(|&&(sequence, identity)| !keep(&identity, Placed { sequence }))
+          .map(|&(_, identity)| identity)
           .collect()
       })
       .unwrap_or_default();
@@ -1601,15 +1629,15 @@ impl ContentHold {
       .saturating_add(usize::from(stage_released))
   }
 
-  /// The newest sequence any manifest held for `object` was placed for, or `None` when nothing is held for it.
+  /// The newest sequence any manifest held for `object` was placed for, or `None` when nothing is held for it: one read
+  /// of its manifests by placed sequence (A-372).
   pub fn newest_placed(&self, object: ObjectId) -> Option<u64> {
     self
       .objects
       .get(&object)?
-      .manifests
-      .values()
-      .map(|record| record.placed.sequence)
-      .max()
+      .by_sequence
+      .last()
+      .map(|&(sequence, _)| sequence)
   }
 
   /// Forgets a manifest held for `object` in `space`: its block is freed and its charge given back, and each
@@ -1632,6 +1660,9 @@ impl ContentHold {
     let Some(record) = held.manifests.remove(identity) else {
       return false;
     };
+    held
+      .by_sequence
+      .remove(&(record.placed.sequence, *identity));
     let referenced: BTreeSet<[u8; 32]> = Self::manifest_of(space.arena, &record)
       .map(|archive| archive.referenced_chunks().into_iter().collect())
       .unwrap_or_default();
@@ -5303,6 +5334,46 @@ mod ownership_oracle {
       .unwrap();
     assert_eq!(room.budget.replicated(), 3 * page);
     assert_eq!(hold.charged_bytes(), 3 * page);
+  }
+
+  /// §4.10 retention, A-372: the rule judges only the content placed at or past a sequence, and the newest placement is
+  /// one read. Do: hold six manifests of one object, placed for sequences 1 to 6; retain from sequence 4 with a rule
+  /// that keeps nothing and lists what it was asked; read the newest placement; forget the rest. Expect the rule asked of
+  /// the manifests placed at 4, 5 and 6 only, in sequence order, those three released and the three below kept, the
+  /// newest placement 3 after it, and the hold charging nothing once everything is forgotten.
+  #[test]
+  fn a_retention_from_a_sequence_judges_only_the_content_placed_at_or_past_it() {
+    let a = object(0);
+    let mut hold = ContentHold::new();
+    let mut room = TestSpace::new();
+    for at in 1..=6usize {
+      let content = BTreeSet::from([at]);
+      hold
+        .hold(
+          &mut room.space(),
+          a,
+          Placed {
+            sequence: u64::try_from(at).unwrap(),
+          },
+          archive(&content, &content),
+        )
+        .unwrap();
+    }
+    let mut asked = Vec::new();
+    let released = hold.retain_placed_from(&mut room.space(), a, 4, |_, placed| {
+      asked.push(placed.sequence);
+      false
+    });
+    let (kept, newest) = (hold.manifest_count(), hold.newest_placed(a));
+    hold.forget_all(&mut room.space());
+    assert_eq!(asked, vec![4, 5, 6], "only the content placed at or past 4");
+    assert_eq!((released, kept), (3, 3));
+    assert_eq!(newest, Some(3));
+    assert_eq!(
+      (room.budget.replicated(), room.metadata.committed()),
+      (0, 0),
+      "every byte and every index entry given back"
+    );
   }
 
   /// Hostile input (§4.9) on the hold image (AUD-29-59, A-64): do: image a hold of two overlapping manifests,

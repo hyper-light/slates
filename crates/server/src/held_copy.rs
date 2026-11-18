@@ -10,7 +10,8 @@
 //!   attachment), sent before the copy is handed to its client ([`hold`]), so no client holds a copy the anchor was not
 //!   given, and released when the copy is let go ([`release`]). A refused hold is counted and the map works on, ending
 //!   with its daemon as before A-197.
-//! - **The successor takes each back while recovery rebuilds the shard** ([`adopt_inherited`]): its writer attachment
+//! - **The successor takes each back while recovery rebuilds the shard** ([`adopt_or_release`], in one ascending slot
+//!   order with the Shards streams' held DAX objects, `crate::shards::adopt_inherited`, A-365): its writer attachment
 //!   is kept ([`keeps`]), as a FUSE mount whose device the anchor held is (A-61); the copy is adopted at the exact slot
 //!   and generation its backing had, so the map id its client holds names it again; and its map is held under its client
 //!   once more. Adoption runs before the write log's replay (A-63), so every write the replay applies is written into
@@ -141,29 +142,28 @@ pub(crate) fn keeps(inherited: &[InheritedCopy], attachment: u64) -> bool {
     .any(|copy| copy.record.attachment == attachment)
 }
 
-/// Takes back every copy the anchor handed this shard (A-197), while recovery rebuilds it and before the write log's
-/// replay: each copy adopted at the slot and generation its backing had (in ascending slot order, as the backings'
-/// registry takes them), whole, its map held under its client with its writer, its claim owed by the reconnect budget.
-/// One that cannot be taken back is let go and counted. How many were taken back.
-pub(crate) fn adopt_inherited(state: &mut ShardState) -> usize {
-  let mut inherited = std::mem::take(&mut state.inherited_copies);
-  inherited.sort_by_key(|copy| Encoded::from_word(copy.copy).slot());
-  let deadline = state
+/// When a copy taken back now is owed its holder's claim: the reconnect budget from now.
+pub(crate) fn claim_deadline(state: &mut ShardState) -> u64 {
+  state
     .clock
     .monotonic_ns()
-    .saturating_add(reconnect_budget_ns());
-  let mut adopted: usize = 0;
-  for copy in inherited {
-    let id = copy.copy;
-    if adopt_one(state, copy, deadline) {
-      adopted = adopted.saturating_add(1);
-      state.count(ADOPTED, 1);
-    } else {
-      release(id);
-      state.count(ADOPT_REFUSED, 1);
-    }
+    .saturating_add(reconnect_budget_ns())
+}
+
+/// Takes back one copy the anchor handed this shard (A-197), while recovery rebuilds it and before the write log's
+/// replay: adopted at the slot and generation its backing had, whole, its map held under its client with its writer, its
+/// claim owed by `deadline`; or let go, counted. The caller runs every held copy of either kind in ascending slot order,
+/// as the backings' registry takes them (`crate::shards::adopt_inherited`). Whether it was taken back.
+pub(crate) fn adopt_or_release(state: &mut ShardState, copy: InheritedCopy, deadline: u64) -> bool {
+  let id = copy.copy;
+  let taken = adopt_one(state, copy, deadline);
+  if taken {
+    state.count(ADOPTED, 1);
+  } else {
+    release(id);
+    state.count(ADOPT_REFUSED, 1);
   }
-  adopted
+  taken
 }
 
 /// Takes back one copy ([`adopt_inherited`]): whether it was.

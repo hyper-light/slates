@@ -130,6 +130,16 @@ fn report() -> ReplyBody {
           asked: 4,
           last_asked_ago_ns: Some(199),
         },
+        failover: slates_ipc::protocol::FailoverReport {
+          total_ns: 211,
+          detection_ns: 223,
+          detection_samples: 227,
+          confirmation_ns: 229,
+          confirmation_samples: 233,
+          recovery_ns: 239,
+          takeovers_timed: 241,
+          volumes_timed: 251,
+        },
       },
     }),
   }

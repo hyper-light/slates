@@ -93,12 +93,18 @@
 > its signature; the contract's `land` sends it and `approve_landing` carries it (`CONTRACT` 20). Proven by four
 > landing tests in `signed_work.rs` and the contract's `a_signed_landing_is_judged_and_read_back_through_the_contract`
 > (macOS arm64, 2026-11-18), each guard red alone. **Owed, in order:**
-> - the verdict carried by a version's merge record (`MergeRecordValue`) to holders and a takeover successor, which
->   records none today, so a green taken over reads its merged versions unsigned;
-> - **a sibling found here, open (A-285's too):** a takeover successor makes a volume's record with no write policy and
->   no trusted signers (`verbs::materialize_taken_over`, and `record_adopted_green` since A-333: `write: None`), since the
->   catalog register (`catalog::CatalogValue`) carries neither, so a volume taken over merges and lands as an unset
->   one does, its signed-merge requirement dropped; the catalog register should carry both;
+> - **built and landed 2026-11-18 (A-321's third part; g090's branch `agents/g090-signed-work-takeover`, landed by the
+>   replication goal, g230):** signed work survives a takeover. A version's merge record carries its verdict
+>   (`MergeRecordValue::signature`) to the holders it commits at, each holder's replica records it as it accepts the
+>   record (`merge_service::recompute`) and as a replica is advanced or rebuilt from the ledger (`merge_origin`), and the
+>   successor adopts the replica (A-333), so a green taken over reads its signed versions as they were judged; the catalog
+>   register carries the write policy, its version and the trusted signers (`CatalogValue::write`, `write_version`,
+>   `signers`), carried by `AdoptedGreen` and used by `record_adopted_green` and `materialize_taken_over`, so a successor
+>   enforces and reports them. Tests on three nodes at `f = 1` (`crates/server/tests/fleet.rs`):
+>   `a_greens_policy_signers_and_verdicts_survive_its_owner` and `a_volumes_policy_and_signers_survive_its_owner`, each
+>   failing with its guard removed alone (the adoption or a plain successor dropping the catalog's policy, read
+>   `(None, 0)`; a holder's replica dropping the verdict, read `Unsigned`; the owner shipping none or the catalog
+>   carrying none, never held);
 > - **found here, open (§4.15 "Audit", §4.14):** on a daemon of more than one shard `Audit` reads only the partition of
 >   the shard that serves it (`RequestBody::Audit` routes to the client's own shard, `landing::audit_verb`), while a
 >   landing's records are written on its volume's owner shard, so a consumer misses every landing whose volume another
@@ -107,7 +113,10 @@
 >   of the landing at all; on one shard every step. §4.15 says the audit log is written through the control shard. The
 >   fix needs a read over every partition with a cursor per partition (each keeps its own sequence), or the records
 >   written where the design says;
-> - a real FIDO key's signature end to end (the touch flag is proven with a software stand-in);
+> - a real FIDO key's signature end to end (the touch flag is proven with a software stand-in): it needs a physical key,
+>   which only a person holds, or OpenSSH's software authenticator (`regress/misc/sk-dummy`, built from OpenSSH's source
+>   and loaded by `ssh-keygen -w`), a tool build CLAUDE.md §2 item 14 reserves for Ada; macOS's OpenSSH 10.2p1 on the
+>   Mac Studio carries only `ssh-sk-helper`'s hardware middleware (checked 2026-11-18);
 > - the integrator's runs on Linux and Windows (the merge tests are platform-free but for the agent's own channel; the
 >   landing tests run where the daemon lands, on Unix, and a Windows landing writer, when it lands, must judge and
 >   record a signature as `landing::landing_verdict` does, which is gated with the Unix landing path).
@@ -354,6 +363,15 @@
 >   that stops every candidate longer must treat the refusal as its write's outcome (not acknowledged, so never owed to
 >   a reader).
 
+> **Every delta behind a whole state in flight was refused for credit, and each refusal shipped the volume whole again:
+> fixed (2026-11-18, A-371, §4.10 "Live shipping", AC-8.9; g230).** The live credit counted the whole entry the owner had
+> just appended, and the owner sets the credit from that entry's size, so deltas behind it were refused `NoCredit` until
+> it was durable and every refusal owed a whole state: the measurer's 32 writers on a 128 MiB volume saw two extra
+> whole records of about 135.5 MB a run. The credit now holds the deltas alone; a whole state rides one past it. Test:
+> `deltas_behind_a_whole_state_in_flight_are_admitted_within_the_credit` (`crates/db/tests/live.rs`).
+> - **Owed (the measurer's):** the 32-writer, 128 MiB run again (diag-measurer-7's harness): expect `fleet.live.whole`
+>   to stay 1 and fewer one-second steps.
+
 > **A seal's envelope was wrapped in one turn, and a refused one never started again: in turns, and dropped (2026-11-18,
 > A-323 and A-322, §4.10 "Content replication"; g230).** The owner shard wrapped a seal's whole archive in the turn its
 > walk ended (98 ms for 64 MiB, `envelope_bench` 2026-10-05; about 1.5 s a GiB, past the watchdog's one-second window,
@@ -581,9 +599,14 @@
 >   macOS flushes a socket whose every copy rides a message. **And the successor's half on macOS (A-339, the same
 >   day):** the write log and its replay, the kept barrier replies, recovery keeping a stream whose end the anchor held,
 >   and the successor keeping its copy of the fresh end until the device's first bytes on it or the channel's close.
->   **Owed:** the anchor holding a stream's DAX objects (until then a stream gives its resync up at its guest's first
->   DAX map); Windows on Shards' handle path, and a write log for a Windows stream, whose acknowledged writes a death
->   still loses whether or not it is resynced. Found beside it (Linux and macOS): a resynced stream whose dead daemon's
+>   **And its DAX maps (A-365, the same day):** the anchor holds each DAX object a stream hands its device, the shard's
+>   DAX range table records each range answered, and a successor takes the objects back, ingests the guest's unsynced
+>   stores before it serves anything and answers the device with the same objects; a stream keeps its resync through
+>   its guest's maps. **Owed:** Windows on Shards' handle path, and a write log for a Windows stream, whose acknowledged
+>   writes a death still loses whether or not it is resynced. Found with A-365 (Linux): A-197's writable copies are
+>   taken back awake before the write log's replay, so a logged write a client's store followed can be written over
+>   that store at a takeover (DAX objects are kept dormant through the replay for that reason); its tests write
+>   through no other path before the client's store. Found beside it (Linux and macOS): a resynced stream whose dead daemon's
 >   log overflowed is not told which writes it lost (a FUSE mount is, `LostWrites`; counted,
 >   `shards.resync_writes_unreported`); a stream's `FORGET`s are not logged, so a resynced stream keeps the references
 >   a lost one gave back until it ends; and a stream's `close` publishes even when the log holds every write it
@@ -2561,6 +2584,21 @@
 > - a rebuild over a long chain recomputes every version the holder accepted (300,000 at the 100,000-client rung's three
 >   rounds), since the holder keeps no checkpoint of its replica; the holder's growth per version is A-238's owed item.
 >
+> **Fixed 2026-11-18 (g232, A-372): every version re-judged every version's inputs its holders kept.** A holder runs the
+> retention rule after every record it accepts and every put it holds, and the rule judged every manifest held for the
+> object, each by decoding the ledger position at its placed sequence (`content_retention::retain_object`), so a green's
+> every version decoded every version's record before it: on the Mac Studio, a debug build, `sample` of the late-submit
+> test at 1,000 versions found a fifth of each holder's time in that rule (1,364 to 1,413 samples of about 6,570), the
+> late median at 18.2 ms against the early 2.16. A ledger never rewrites an accepted position, so its inputs placed below
+> its newest accepted version were judged when their records came; now the rule judges those placed at or past it
+> (`ContentHold::retain_placed_from`, over the hold's manifests indexed by placed sequence, charged with them), and the
+> newest placement is one read. Test: `a_greens_retention_judges_only_the_inputs_its_newest_version_can_change`
+> (`content_retention.rs`): the last of 64 versions judges one manifest, every input still held (red with the rule
+> judging a ledger whole). Kiln r3491, the Mac Studio, debug: the late-submit test's late median at 300 versions 2.92 to
+> 3.28 ms against early 1.87 to 1.96 (it was 4.4 to 6.4 against 2.0 to 2.4), and at 1,000 versions 8.49 against 2.28
+> (18.2 against 2.16). What remains is the content hold's image, one piece re-encoded and re-put at each publication,
+> about a tenth of a holder's time at 1,000 versions, which also brings the checkpoints a delta's size triggers.
+>
 > **Fixed 2026-11-18 (g232, A-367): every version re-published every version its holders kept.** A held register was
 > one piece holding every position its acceptor kept (A-270), and a green's register on its holders is a ledger, never
 > compacted; a holder publishes before it acknowledges each version, so each version's publication re-encoded and
@@ -2881,7 +2919,20 @@
 > is past `W` (every use is listed by class in A-359); the failover SLO derived as the membership horizon plus the
 > council's confirmation window plus `T` (2.9 s today) once each consumer that takes it as a lease term (a landing's
 > target lease, a CLI attachment's term, the NFSv4 and delegation leases, the restart cap) has its own term; and the
-> class C claim wait below.
+> class C claim wait below. **The failover delay is a live output since 2026-11-18 (A-363, goal g255), not A-359's boot
+> sum** (Ada, the same day: a value computed once at boot is still a constant). The control shard keeps `F = D + E + R`
+> as running estimates, refreshed each coordinator period: `D` SWIM's count of the detector's periods at their running
+> tail (NFD-E per pair with Lifeguard's local health; each pair's false-suspicion bound `β` is the one that minimizes
+> unavailability against the fleet's measured MTBF, φ-accrual's threshold `−log10 β`; the detector's own bound keeps the
+> longest period it ever ran and read 7-14 s on a quiet fleet, so it is not used); `E` the council's death-confirmation window at the
+> coordinator's measured period, with the retirement's commit round and its install; `R` the tail of the takeovers and
+> the volumes this node timed, the ratified `T` before the first. Published in the daemon's status
+> (`FleetReport::failover`, `CONTRACT` 24; `slates status` prints `fleet_failover`), each term with the measurements
+> behind it. Owed, each in its own change: the failover-shaped waits read it (a forward's bound, the location round's cap,
+> a live takeover's fetch, the takeover's attempts, the telemetry horizon); each lease takes its term from a φ-accrual
+> detector of its own holder's renewals (a CLI attachment once the CLI process sends a keepalive); `W`'s floor from the
+> pulses' running wake delay; then `FAILOVER_SLO_NS` and `with_failover_slo` go, since nothing sets `F`. The boot-time
+> sum is kept only as the A/B baseline, a build of its own, never a mode.
 >
 > - **Class A, a cross-shard wait judged in its target's own time (2026-11-06, in progress).** A verb's wait for
 >   another shard's answer gave up at the wall second while the target was alive and starved, and the work went on to
@@ -3817,11 +3868,14 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 >       `an_owner_admitted_again_forwards_the_volume_its_successor_took_over_and_never_serves_its_own_copy`
 >       (`docs/bugs/2026-11-18-an-owner-admitted-again-served-the-copy-its-successor-had-passed.md`). A later takeover
 >       naming the host a yielded volume's successor again relinquishes the stale copy and lifts the yield (A-362,
->       g250). **Owed:** releasing a yielded copy's memory (GAP-A9-7); and the creator rule's two siblings on the
->       client's shard,
->       `remote_attach::elsewhere` (a mount attach of a yielded volume attaches the copy, whose live tree is now fenced)
->       and the remote-attach reap (a record-form attach of one is forwarded but not remembered, so it ends at its lease
->       term).
+>       g250). The creator rule's two siblings on the client's shard are fixed (g229, 2026-11-18): a mount of a
+>       yielded volume is refused by its kind on the volume's shard (`remote_attach::lost_attach`; it had attached the
+>       copy), and a record-form attach of one is remembered with its client before it is sent, so the client's reap ends
+>       it at the successor (`remote_attach::remember_volume_at`; it had stayed there for good). Red first:
+>       `an_owner_admitted_again_refuses_a_mount_of_the_volume_it_yielded_by_kind` and
+>       `a_holder_of_a_volume_its_node_yielded_is_reaped_at_the_successor`
+>       (`docs/bugs/2026-11-18-a-node-admitted-again-took-the-volumes-it-yielded-for-its-own-on-the-clients-shard.md`).
+>       **Owed:** releasing a yielded copy's memory (GAP-A9-7).
 >     - **Fixed in the flow (g229): the big-entry flow judged a forwarder as its successor.** It took the first
 >       survivor that served the three files, which a survivor forwarding to the real successor does too, and a
 >       forwarder shows no shipping head after a write through it: every write through it was acknowledged and read
@@ -7503,6 +7557,7 @@ Every phase retains its original acceptance gates plus the A-9 additions.
 | `models/Reconfig.tla` | `Reconfig.cfg`, re-run (A-364) | no error, the same as 2026-09-04 (1 s) | 20,478 distinct | 19 | 2026-11-18 |
 | `models/FencedLedger.tla` | `FencedLedger.cfg` (A-364): 3 holders, 2 hosts, 2 epochs, 2 positions, 2 values, per-position adoption | no error (TypeOK, Agreement, Continuity, AdoptedIsPrefix, StaleNeverCommits, ReadSafety; 2 min 11 s) | 2,683,673 distinct | 27 | 2026-11-18 |
 | `models/FencedLedger.tla` | `FencedLedger_register.cfg` (A-364): the same under the register's rule, the highest record alone (the server's round before the record half) | Continuity violated, as it must be (non-vacuity): the adopted log lacks a committed lower position | 29,623 distinct at the violation | 14 | 2026-11-18 |
+| `models/FencedLedger.tla` | `FencedLedger_3.cfg` (A-364): 3 epochs (two takeovers), holders symmetric | not completed: stopped after 34 min with 13,438,768 states on the queue, to give the runner's memory back (TLC at 9.6 GB beside other builds); no invariant violated in the 40,469,260 distinct states explored, every one at depth 26 or less. A complete run wants a bound on the stale owners' proposals or a larger machine | 40,469,260 distinct (partial) | 26 (partial) | 2026-11-18 |
 
 The models are architecture artifacts, not CI jobs. These historical runs apply only to the
 listed models and configurations. The Rust simulations are evidence with known gaps, not a
@@ -11651,6 +11706,14 @@ new process. In simulation the session ended one round trip after its first pack
   60 of 60, diag-live-fixes-56). A voter promoted after the last configuration commit stays unknown to a learner until
   the next one.
 - **Open sibling:** `drive_root_learner_fetch` filters on the root's voters the same way, and has no test yet.
+- **The departure wait's budget omitted the election, fixed 2026-11-18 (g225).** The three tests that stop the bootstrap
+  voter wait `departure_learned_periods`, which counted the detector's horizon, the death window and the commits but
+  not the election the stop leaves owed: the bootstrapper leads the council it created, and only a leader proposes the
+  retirement. At one CPU beside two busy loops (diag-g225-forming-fleet-reaches-2) 9 of 48 runs of the two tests waiting
+  on it spent their budget (94 periods) with every survivor still at the version of the stop, or the leader still naming
+  the stopped voter. The budget now adds the election's timeout (base and span, measured as the daemons derive it) and
+  its two rounds. Still open beside it: a learner's known voters move only with a newer configuration, and a seat change
+  moves none (the A-337 entry above).
 
 ### 2026-11-09: the formation check falls behind each new event counter (open)
 
@@ -17804,20 +17867,31 @@ suite on adacachy2 and 1 of 3 of the stack's (the supervisor's gate); alone it p
   the shard panicked ("assertion failed: matches!(crate::merge_service::merge_role(state, id), Some(MergeRole::Green {
   .. }))") and the test failed; with the refusal it answers `AlreadyExists` and the plain volume stays plain and served
   (`slates-server --lib` 266 of 266, macOS arm64, 2026-11-18).
-- **Open, the record half (GAP-A9-7):** a successor whose own records end two or more versions below the adopted one
-  lacks the intermediate records themselves (phase one reports each holder's highest record only), which no fetch by
-  identity can fill; it is still given up `chain` at the bound. **Modelled (A-364, g250, 2026-11-18):**
+- **Fixed, the record half (GAP-A9-7; A-364, g250, 2026-11-18):** a successor whose own records ended two or more
+  versions below the adopted one lacked the intermediate records themselves (phase one reports each holder's highest
+  record only), which no fetch by identity can fill, and gave the green up `chain` at the bound. Modelled first:
   `docs/wip/models/FencedLedger.tla` adopts a ledger position by position, as §4.8 states it, and TLC finds no error at
-  two epochs (2,683,673 distinct states; Agreement, Continuity, AdoptedIsPrefix, StaleNeverCommits, ReadSafety), while
-  the register's rule, the highest record alone, fails Continuity (the model table below). Owed, the build (g250): the
-  successor's green materialization, finding positions between its own highest record and the adopted version unknown
-  here (`merge_service::unheld_green_inputs` answering none), asks the members of the green's recovery cohorts for the
-  positions in that range under the round's epoch (a holder promises the object, raising its fence, and reports each
-  accepted position with its epoch), adopts at each position the record accepted under the highest epoch among a
-  recovery quorum of each cohort, re-commits each under its own epoch (phase-two acceptance at a new epoch records that
-  epoch, BUG-12), and then gathers the chain; holders already keep a ledger's every position (`Acceptor::accepted`,
-  never compacted for a merge chain). The takeover's share stays open while the green is pending (A-345's
-  `takeover::materializing`), so its holders still authorize the question.
+  two epochs (2,683,673 distinct states; Agreement, Continuity, AdoptedIsPrefix, StaleNeverCommits, ReadSafety) while
+  the register's rule, the highest record alone, fails Continuity (the model table below). Built on it: the successor's
+  green materialization, finding versions below the adopted one whose records it does not know
+  (`green_adopt::Engine::RecordsShort`, A-333), asks every member of the green's recovery cohorts for the positions in that
+  range under its round's epoch (`slates_db::register::LedgerPrepare` on stream 28; a holder answers through the checks
+  a by-name question runs, promising the object first: `slates_db::takeover::answer_ledger`), adopts at each position,
+  in order, the record accepted under the highest epoch once a recovery quorum of each cohort promised it
+  (`slates_db::takeover::ledger_positions`), commits each again under its own epoch (`takeover::commit_adopted`, shared
+  with the newest record's adoption), and then fetches the versions' inputs and gathers the chain. Holders already kept
+  a ledger's every position (`Acceptor::accepted`, never compacted for a merge chain), and the takeover's share stays
+  open while the green is pending (A-345's `takeover::materializing`), so its holders still authorize the question.
+  Test: `a_successor_two_versions_behind_adopts_the_versions_between_and_serves_the_green`
+  (`crates/server/tests/fleet.rs`; red with the catch-up skipped: waited on its chain 100 periods, given up), with the
+  db's `a_ledger_is_adopted_position_by_position_in_order`, the codec's round trip and hostile input, and
+  `an_acceptor_reports_a_ledgers_positions_in_a_range`.
+- **Open (A-364): a held position never yields to a higher epoch.** `Acceptor::check` refuses a record whose value
+  differs from the one a holder already accepted at that position (`ConflictingPosition`), where the model's acceptor
+  overwrites a lower-epoch value (Paxos per position). A position whose divergent value was never committed (two
+  takeovers, the first adopting without it) cannot then be re-committed on the holders that keep the stale one; with
+  the successor among them its own commit is refused and the range waits for its bound. Not reached at `f = 1` with one
+  takeover; owed: accept a higher epoch's different value at an uncommitted position, held to the model.
 
 ### 2026-11-07: a daemon killed inside its profile's republication refused every successor — fixed
 
