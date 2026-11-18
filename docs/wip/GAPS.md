@@ -3069,6 +3069,12 @@
 >   rename +74.8, unlink +31.2. Cut (c)'s no-wake variant and cut (b), the per-kind spin choice, were measured and
 >   rejected; the request channel's bound was fixed (A-348). Main lost no more than about 9 µs of this since cut (c)
 >   (diag-g258-5).
+> - **2026-11-18, goal g258 closed at its stated condition (BENCHMARKS, "Main after A-348 against the DLL and against
+>   69cd38b2"):** diag-g258-9 (run 44325673298), main `093fef96` against the DLL arm, a control and 69cd38b2. arm64, 5
+>   runs: 10 cells of 36 beyond the DLL's spread, the same p50 gap (quiet stat +44.9 µs, rename +76.3, unlink +41.1;
+>   loaded write +85.3), and main within the control's spread of 69cd38b2 in 32 of 36 cells. x86_64: 2 runs done and 5
+>   failed, main's daemon killed under load (A-223's idle spin, fixed since by A-361), so no verdict there; the x86_64
+>   lane is owed again with A-361 in main. No cut is open under g258; the levers below are the next goal's.
 > - **Open, the levers left** (each in BENCHMARKS' record): a spin choice that reads contention (the per-kind median form
 >   took 42.3 µs off arm64's loaded write p50 and lost a wake on x86_64); a fresh per-phase profile of arm64's quiet stat,
 >   rename and unlink (the last attributed 18 µs of a stat to crash safety); and, **a decision for Ada**, the shard threads
@@ -3143,6 +3149,11 @@
 >   - `windows-11-arm`: the fleet did not form for fsx. It formed for winfstest, whose 628 cases matched plain exactly
 >     (0 differing), but shipping failed: candidate b held no live log, the owner counted `no_session` 7,663,
 >     `unanswered` 5,596 and `refused` 138, and only candidate c held entries (4,741).
+> - **macOS conforms (2026-11-18, main `40efd7456`; Linux OPEN, owner g226).** On Adas-MacBook-Pro-3 (macOS 26.6, NFS
+>   loopback, load averages 7 to 14), fsx (10,000 operations), fsstress (4 × 500) and unprivileged pjdfstest (8,686 cases)
+>   ran plain and live-shipped. `compare` found 0 differences, and every live run shipped. The writer's `ETIMEDOUT` went
+>   with A-229's hard mount; the log stuck at `head=2 durable=none` and the takeover off the mounted node did not recur.
+>   Commands and counts: `docs/wip/conformance.md` (the live-shipped pair). Linux and Windows remain as recorded above.
 
 > **The many-client load test over the network (loadtest; 2026-11-05).** The harness
 > (`crates/client/examples/load_bench.rs`, `--green` to drive a green on another node) and its launcher
@@ -18017,12 +18028,37 @@ suite on adacachy2 and 1 of 3 of the stack's (the supervisor's gate); alone it p
   (`crates/server/tests/fleet.rs`; red with the catch-up skipped: waited on its chain 100 periods, given up), with the
   db's `a_ledger_is_adopted_position_by_position_in_order`, the codec's round trip and hostile input, and
   `an_acceptor_reports_a_ledgers_positions_in_a_range`.
-- **Open (A-364): a held position never yields to a higher epoch.** `Acceptor::check` refuses a record whose value
-  differs from the one a holder already accepted at that position (`ConflictingPosition`), where the model's acceptor
-  overwrites a lower-epoch value (Paxos per position). A position whose divergent value was never committed (two
-  takeovers, the first adopting without it) cannot then be re-committed on the holders that keep the stale one; with
-  the successor among them its own commit is refused and the range waits for its bound. Not reached at `f = 1` with one
-  takeover; owed: accept a higher epoch's different value at an uncommitted position, held to the model.
+- **Fixed (A-373, g250, 2026-11-18): a held position yields to a higher epoch.** `Acceptor::check` refused a record
+  whose value differed from the one a holder had accepted at that position (`ConflictingPosition`), whatever its epoch,
+  where the model's acceptor (`FencedLedger.tla`'s `Accept`) takes any proposal at or above its promise. Decided by the
+  model's proof obligations: a refusal is always safe (a refused phase-two message is a lost one), and the model's
+  Agreement and Continuity rest on each epoch's owner adopting, per position, the highest-epoch value a majority
+  reports before it proposes, so a higher epoch's different value replaces only one that never committed; slates keeps
+  each obligation (a record is accepted only from the object's authority owner, a successor writes only after its
+  round adopted, a superseded owner is fenced below the round's epoch). The refusal cost liveness: a holder keeping a
+  dying owner's uncommitted value refused the successor's value there forever and, its replica built on the refused
+  value, refused the green for good at the next version's recomputation; a successor keeping one could never commit
+  the value its round adopted (`fleet.takeover.adopt_unplaced.local`). The code took the model's rule; the model is
+  unchanged, so nothing was re-run. A second value under the epoch a position holds is still refused (one ballot, one
+  value a position). A green's replica follows the register: one built over a replaced value is rebuilt through the
+  version before (`merge_origin::rewind_replica`; on the register path in `fleet::hold_checked_record`, and in a
+  successor's own adoption, `takeover::commit_adopted`), and a record the record plane ships in place of a held value is
+  held before its inputs, which the door admits only once a held record names them, then recomputed as the replica's
+  next version before it is acknowledged (`merge_service::hold_replacing_record`). A build that read a version its
+  ledger replaced meanwhile installs nothing (`merge.replica.superseded`). Counted `fleet.record.replaced`,
+  `merge.replica.rewound`. Tests: the db's
+  `a_held_position_yields_to_a_higher_epochs_value_and_refuses_a_second_in_one_epoch`; `merge_origin`'s `a_holder_follows_a_higher_epochs_value_at_a_version_it_applied` (shipments through
+  `fleet::serve_merge_shipment`), `a_replica_rewinds_below_a_value_its_ledger_replaced_and_advances_to_the_new_one` and
+  `a_build_that_read_a_replaced_version_installs_nothing`. Kiln r3555 (Mac Studio, debug, load 15 to 17): register 76 of
+  76, the server's focused lib tests 45 of 45, the fleet's green takeover and shipment tests 5 of 5; red r3573, each of
+  the four pieces removed in a scratch copy fails its test (A-373 lists what each showed).
+- **Owed (A-373, A-364): a holder's replica behind its own ledger.** A value a successor's adoption commits again
+  reaches the holders through the register path, which carries no inputs: a holder that kept another value at that
+  position, or none, now holds the adopted record, and its replica stays at the version before (A-373 rewinds it there;
+  A-364's re-commit of the positions between left it there already). The record plane never ships a placed version
+  again, so the next version is answered `merge.out_of_order` on that holder until it rebuilds, which also wants those
+  inputs. The green goes on at `f + 1` while its other holders answer. Owed: a holder that holds records past its
+  replica fetches their inputs by identity, as a successor does (`fleet::fetch_green_inputs`), and advances.
 
 ### 2026-11-07: a daemon killed inside its profile's republication refused every successor — fixed
 
