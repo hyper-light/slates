@@ -9,18 +9,16 @@
 //!
 //! **Drift (§4.15 "Drift").** An overlay reports each entry the disk changed after the volume witnessed it, typed by
 //! what happened ([`DriftKind`]), and each entry whose re-check the host refused now (not known to match, so never
-//! reported as if it did). The daemon's status reply carries these as text today (`StatusReport::drifted`, `watcher`);
-//! this module reads them in one place ([`base_of`]), by the grammar the daemon writes them in, until the reply carries
-//! them typed (GAPS, A-299's owed list), when the reading is replaced.
+//! reported as if it did). The status reply carries them typed (`StatusReport::base`, A-299); its `drifted` and
+//! `watcher` text is for people, and this crate never reads it.
 
 use std::path::PathBuf;
 
 use slates_ipc::protocol::{
-  GreenBase, JournalReport, MountReport, NamePolicy, PlacedState, SnapshotId, StatusReport,
-  TransportReport, VolumeId,
+  self as wire, GreenBase, JournalReport, MountReport, NamePolicy, PlacedState, SnapshotId,
+  StatusReport, TransportReport, VolumeId,
 };
 
-use crate::error::{Error, ProtocolFault};
 use crate::outcome::Work;
 
 /// A volume to make: its name, and what it starts from.
@@ -188,14 +186,14 @@ pub enum BaseState {
 }
 
 /// An overlay's base as a status read it (§4.15 "Drift").
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DriftReport {
   /// Each entry the disk changed after the volume witnessed it: landing it would conflict.
   pub drifted: Vec<Drift>,
   /// Each entry whose re-check the host refused now: not known to match its witness.
   pub unverified: Vec<String>,
-  /// The watcher's state, when the base has one.
-  pub watcher: Option<Watcher>,
+  /// The base's watcher.
+  pub watcher: Watcher,
 }
 
 /// One drifted entry.
@@ -220,19 +218,6 @@ pub enum DriftKind {
   TypeChanged,
 }
 
-impl DriftKind {
-  /// The kind by the name the daemon writes.
-  fn of_name(name: &str) -> Option<DriftKind> {
-    match name {
-      "Modified" => Some(Self::Modified),
-      "Deleted" => Some(Self::Deleted),
-      "Replaced" => Some(Self::Replaced),
-      "TypeChanged" => Some(Self::TypeChanged),
-      _ => None,
-    }
-  }
-}
-
 /// An overlay's watcher (§4.15): hints that make drift reports prompt, never the truth.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Watcher {
@@ -244,17 +229,9 @@ pub enum Watcher {
   Unavailable,
 }
 
-/// The watcher state a status reply names for a volume with no base.
-const NO_BASE: &str = "scratch";
-/// The watcher state a status reply names when the base could not be read; its one drift entry then says why.
-const BASE_REFUSED: &str = "unavailable";
-/// What the daemon writes after an entry's path when the host refused its re-check.
-const UNVERIFIED: &str = " (unverified: ";
-
 /// A volume's status reply, typed.
-pub(crate) fn status_of(report: StatusReport) -> Result<VolumeStatus, Error> {
-  let base = base_of(&report.drifted, &report.watcher)?;
-  Ok(VolumeStatus {
+pub(crate) fn status_of(report: StatusReport) -> VolumeStatus {
+  VolumeStatus {
     id: report.id,
     name: report.name,
     referenced_bytes: report.referenced_bytes,
@@ -270,132 +247,86 @@ pub(crate) fn status_of(report: StatusReport) -> Result<VolumeStatus, Error> {
     mounts_elided: report.mounts_elided,
     journal: report.journal,
     takeover_kept: report.takeover_kept,
-    base,
-  })
-}
-
-/// An overlay's base from the status reply's text (`crates/server/src/verbs.rs`, the status verb): `watcher` names
-/// [`NO_BASE`] for a volume with no base, [`BASE_REFUSED`] when the base could not be read, and otherwise the watcher's
-/// state; each drift entry is `PATH (KIND)` for an entry the disk changed, or `PATH (unverified: REFUSAL)` for one
-/// whose re-check the host refused. The kind is read from the entry's end, so a path holding parentheses of its own is
-/// read whole. Refused as a protocol fault for a form the daemon does not write.
-pub(crate) fn base_of(drifted: &[String], watcher: &str) -> Result<Option<BaseState>, Error> {
-  let watcher = match watcher {
-    NO_BASE => return Ok(None),
-    BASE_REFUSED => return Ok(Some(BaseState::Unreadable)),
-    "Live" => Watcher::Live,
-    "Overflowed" => Watcher::Overflowed,
-    "Unavailable" => Watcher::Unavailable,
-    _ => return Err(unknown("watcher state")),
-  };
-  let mut report = DriftReport {
-    watcher: Some(watcher),
-    ..DriftReport::default()
-  };
-  for entry in drifted {
-    match drift_line(entry)? {
-      Line::Drifted(drift) => report.drifted.push(drift),
-      Line::Unverified(path) => report.unverified.push(path),
-    }
+    base: report.base.map(base_state_of),
   }
-  Ok(Some(BaseState::Read(report)))
 }
 
-/// One drift entry, read.
-enum Line {
-  /// The disk changed it.
-  Drifted(Drift),
-  /// The host refused its re-check.
-  Unverified(String),
-}
-
-/// One drift entry from its text (see [`base_of`]).
-fn drift_line(entry: &str) -> Result<Line, Error> {
-  let inner = entry
-    .strip_suffix(')')
-    .ok_or_else(|| unknown("drift entry"))?;
-  if let Some((path, kind)) = inner.rsplit_once(" (")
-    && let Some(kind) = DriftKind::of_name(kind)
-  {
-    return Ok(Line::Drifted(Drift {
-      path: path.to_owned(),
-      kind,
-    }));
+/// An overlay's base as the reply carries it, typed (A-299).
+fn base_state_of(base: wire::BaseReport) -> BaseState {
+  match base {
+    wire::BaseReport::Read {
+      drifted,
+      unverified,
+      watcher,
+    } => BaseState::Read(DriftReport {
+      drifted: drifted
+        .into_iter()
+        .map(|entry| Drift {
+          path: entry.path,
+          kind: match entry.kind {
+            wire::DriftKind::Modified => DriftKind::Modified,
+            wire::DriftKind::Deleted => DriftKind::Deleted,
+            wire::DriftKind::Replaced => DriftKind::Replaced,
+            wire::DriftKind::TypeChanged => DriftKind::TypeChanged,
+          },
+        })
+        .collect(),
+      unverified,
+      watcher: match watcher {
+        wire::WatcherState::Live => Watcher::Live,
+        wire::WatcherState::Overflowed => Watcher::Overflowed,
+        wire::WatcherState::Unavailable => Watcher::Unavailable,
+      },
+    }),
+    wire::BaseReport::Unreadable => BaseState::Unreadable,
   }
-  inner
-    .rfind(UNVERIFIED)
-    .and_then(|at| inner.get(..at))
-    .map(|path| Line::Unverified(path.to_owned()))
-    .ok_or_else(|| unknown("drift entry"))
-}
-
-/// A form the daemon does not write.
-fn unknown(field: &'static str) -> Error {
-  Error::Protocol(ProtocolFault::UnknownName { field })
 }
 
 #[cfg(test)]
 mod tests {
-  use super::{BaseState, Drift, DriftKind, DriftReport, Watcher, base_of};
-  use crate::error::{Error, ProtocolFault};
+  use slates_ipc::protocol::{self as wire, DriftEntry};
 
-  /// A-299, §4.15 "Drift": do read the drift list a status reply carries, with each kind, a path holding parentheses
-  /// of its own (one that ends like an unverified entry, one like a kind), and an unverified entry whose refusal
-  /// carries parentheses; expect each typed by what happened at its whole path, the unverified one apart, and the
-  /// watcher's state.
+  use super::{BaseState, Drift, DriftKind, DriftReport, Watcher, base_state_of};
+
+  /// A-299, §4.15 "Drift": do type a base the status read, with an entry of each kind and one whose re-check the host
+  /// refused, and one it could not read; expect each entry typed at its path, the refused one apart, the watcher, and
+  /// an unreadable base kept as one rather than failing the status.
   #[test]
-  fn each_drift_entry_is_typed_at_its_whole_path() {
-    let entries = [
-      "/a.txt (Modified)",
-      "/gone (Deleted)",
-      "/b (Replaced)",
-      "/d (TypeChanged)",
-      "/x (unverified: y (Modified)",
-      "/odd (Deleted) (Modified)",
-      "/u (unverified: ENOMEM (the arena is full))",
-    ]
-    .map(str::to_owned);
-    let Some(BaseState::Read(report)) = base_of(&entries, "Overflowed").unwrap() else {
-      panic!("a read base reports its drift");
-    };
-    let drift = |path: &str, kind| Drift {
-      path: path.to_owned(),
-      kind,
-    };
+  fn a_base_report_is_typed_entry_by_entry() {
+    let kinds = [
+      (wire::DriftKind::Modified, DriftKind::Modified),
+      (wire::DriftKind::Deleted, DriftKind::Deleted),
+      (wire::DriftKind::Replaced, DriftKind::Replaced),
+      (wire::DriftKind::TypeChanged, DriftKind::TypeChanged),
+    ];
+    let read = base_state_of(wire::BaseReport::Read {
+      drifted: kinds
+        .iter()
+        .map(|(kind, _)| DriftEntry {
+          path: format!("/{kind:?} (Modified)"),
+          kind: *kind,
+        })
+        .collect(),
+      unverified: vec!["/u".to_owned()],
+      watcher: wire::WatcherState::Overflowed,
+    });
     assert_eq!(
-      report,
-      DriftReport {
-        drifted: vec![
-          drift("/a.txt", DriftKind::Modified),
-          drift("/gone", DriftKind::Deleted),
-          drift("/b", DriftKind::Replaced),
-          drift("/d", DriftKind::TypeChanged),
-          drift("/x (unverified: y", DriftKind::Modified),
-          drift("/odd (Deleted)", DriftKind::Modified),
-        ],
+      read,
+      BaseState::Read(DriftReport {
+        drifted: kinds
+          .iter()
+          .map(|(wire_kind, kind)| Drift {
+            path: format!("/{wire_kind:?} (Modified)"),
+            kind: *kind,
+          })
+          .collect(),
         unverified: vec!["/u".to_owned()],
-        watcher: Some(Watcher::Overflowed),
-      }
+        watcher: Watcher::Overflowed,
+      })
     );
-  }
-
-  /// A-299: do read a volume with no base, one whose base could not be read, a watcher state and an entry the daemon
-  /// does not write; expect no base, an unreadable one (the rest of the status stands), and two protocol faults —
-  /// never a guess.
-  #[test]
-  fn a_missing_or_unreadable_base_and_a_stranger_are_typed() {
-    assert_eq!(base_of(&[], "scratch"), Ok(None));
     assert_eq!(
-      base_of(&["status refused: Io".to_owned()], "unavailable"),
-      Ok(Some(BaseState::Unreadable))
+      base_state_of(wire::BaseReport::Unreadable),
+      BaseState::Unreadable
     );
-    assert!(matches!(
-      base_of(&[], "Sleeping"),
-      Err(Error::Protocol(ProtocolFault::UnknownName { .. }))
-    ));
-    assert!(matches!(
-      base_of(&["/a (Renamed)".to_owned()], "Live"),
-      Err(Error::Protocol(ProtocolFault::UnknownName { .. }))
-    ));
   }
 }

@@ -68,8 +68,10 @@
 >   their approvals and the present-only verb reach it too (`approve_merge`, `plan_landing` on `Present`; `CONTRACT`
 >   = 6); owed: a consumer's own mode, the MCP and SDK land verb under the mode, signed work verified with the
 >   statement a signer signs and the trusted signers a launcher registers;
-> - typed fields on the wire for an overlay's drift, a presentation's conflicts, a landing target's refusal and a
->   merge's versions (the work's base beside the head), replacing the crate's reading of the status text;
+> - typed fields on the wire for a landing target's refusal (`TargetUnavailable` carries words), a merge's versions
+>   (the work's base beside the head), and the words the crate still reads from the daemon's closed tables (a landing's
+>   state, a summary's actions, the audit's kinds, a grant's state); an overlay's drift is built (`StatusReport::base`,
+>   `CONTRACT` = 8), and a presentation's conflicts are read typed from its entries;
 > - a paged volume listing (typed audit kinds and grant states built, piece 6, `CONTRACT` = 4);
 > - a run of the Linux and Windows arms (mount, the CLI's Windows unmount): not compiled on the Mac that built piece 4.
 

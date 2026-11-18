@@ -7126,7 +7126,7 @@ destroy closes it, and a mount is a record of one. Its tables are bounded by its
 past that. One flow of the verbs, every outcome and refusal asserted as its typed value, runs over both
 (`crates/api/tests/api.rs`, `the_seam_conforms`).
 
-> **Status (2026-11-18, A-310).** Built: `crates/api/src/seam.rs`, `crates/api/src/sim.rs`, the contract at version 8,
+> **Status (2026-11-18, A-310).** Built: `crates/api/src/seam.rs`, `crates/api/src/sim.rs`, the contract at version 9,
 > and the suite over an in-process instance and over the simulator. A pinned snapshot's destroy reaches a consumer as
 > `Invalid::Request` with the volume core's `Pinned` as its note, untyped; the simulator answers the same, and a typed
 > class for it is owed to the contract.
@@ -7264,6 +7264,11 @@ it builds against the contract and adds to it rather than around it.
 > secret, a stranger's refused `Unproven`, the daemon killed and restarted by its anchor, and the
 > launcher's next setting verified by the new daemon); an anchor handed garbage or a short record
 > refuses to start.
+> **`CONTRACT` = 8:** an overlay's drift travels typed on the wire (`StatusReport::base`, appended:
+> `BaseReport`, `DriftEntry`, `DriftKind`, `WatcherState`), and the crate reads only that field; its
+> text reader is gone. A green's or a work volume's status had failed as a protocol fault (the merge
+> service names their watcher `merge`), and now reads with no base
+> (`docs/bugs/2026-11-18-a-greens-status-failed-in-the-contract.md`).
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -21819,6 +21824,13 @@ contract", new, with its status), GAPS (the A-299 entry and the Embedding librar
   a short record each refused at the anchor's start). The daemon's verification landed the same hour (A-285's owner,
   0366b68a), and `the_launchers_secret_proves_its_policy_across_a_daemon_restart` proves the whole path by use: the
   daemon killed and restarted by its anchor verifies the launcher's next setting.
+- **Typed drift on the wire, the same day; `CONTRACT` 8.** `StatusReport` gains `base: Option<BaseReport>`, appended
+  (D-15), filled by the status verb from the base plane's own status and `None` from the merge service; the crate reads
+  it and nothing else, and its text reader goes (replaced, not layered). Found by the test first: a green's status
+  failed `Protocol(UnknownName { field: "watcher state" })`, since the merge service names a green's watcher `merge`
+  (`docs/bugs/2026-11-18-a-greens-status-failed-in-the-contract.md`). `DriftReport::watcher` is a `Watcher`. Applied to
+  `crates/ipc/src/protocol.rs`, `crates/server/src/{verbs,merge_service}.rs`, `crates/api/src/{volume,instance,lib}.rs`,
+  `tests/api.rs`.
 - **Checked.** `cargo test -p slates-api` (37 unit, 9 by use, 5 start, 1 doc) and `cargo test -p slates-cli` on
   macOS arm64 (kiln runner, 2026-11-18): the cases in §4.12's status. The Linux and Windows arms of the mount and the
   CLI's Windows unmount are not compiled on this host; the integrator's lanes are their first compiler.
@@ -22085,7 +22097,7 @@ Applied in the same change to:
 - §4.12: "The seam" and its status; the embedding status's owed line, and A-278's owed list, marked built. GAPS: the
   embedding library row. `docs/library.md`: the seam's section and the owed list.
 - `crates/api`: `seam.rs` (`Volumes`, implemented by `Instance`), `sim.rs` (`SimVolumes`), `lib.rs` (the modules, their
-  exports, the crate's notes, `CONTRACT` 8), `error.rs` (`Error::of_ipc` lent to the crate, for the simulator's pair).
+  exports, the crate's notes, `CONTRACT` 9), `error.rs` (`Error::of_ipc` lent to the crate, for the simulator's pair).
   The tests: `the_seam_conforms` run by `an_instance_answers_the_seams_conformance_suite` and
   `the_simulator_answers_the_seams_conformance_suite`, and `the_simulator_holds_what_it_was_given_room_for`
   (`tests/api.rs`).
