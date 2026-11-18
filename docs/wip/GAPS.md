@@ -78,7 +78,17 @@
 > Mac Studio, and 109 ms while the catalog waited for the period. Still open:
 > - losing the green's owner twice needs the ledger-prefix transfer (GAP-A9-7);
 > - the cross-region case is not yet tested;
-> - the 0.35 ms could be overlapped by a pipelined dispatch.
+> - the 0.35 ms could be overlapped by a pipelined dispatch;
+> - **the route has no end for a work whose owner died, a store with no bound (CLAUDE.md §2 item 8).** Only a volume's
+>   owner writes its tombstone, and a work never comes back to have one, so nothing retires its catalog record. The
+>   adopter keeps it placed (`fleet::owed_adopted_work_catalogs`, which scans every adopted work catalog each record
+>   period), its holders keep it in `holder_records`, and `pending_catalogs` drops an entry only at a materialization or
+>   a tombstone, neither of which comes for a work. Every work alive when its owner dies is held so for as long as the
+>   fleet runs. Found by reading on 2026-11-17, in the sibling sweep after A-255 landed; no test shows it yet. How the
+>   route should end is a decision for Ada. One option: the adopter retires the record once the green's owner holds no
+>   completion of the work's submits, which needs the work's id in the merge record beside the request key. The other:
+>   a cap per adopter, derived from the fleet's outstanding-completion capacity, which retires the oldest record first,
+>   and a resend past it is refused `NotFound`.
 >
 > `docs/bugs/2026-11-09-a-submit-resent-after-its-greens-takeover-was-never-answered-its-version.md`.
 
