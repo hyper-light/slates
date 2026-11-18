@@ -52,11 +52,11 @@ minutes on a machine already at load 70, and its clients' hard mounts waited the
 
 ## Siblings
 
-- The serve-then-crash loop: a daemon that serves, then dies before it has served as long as its start took, is still
-  restarted at once every time (`a_daemon_that_dies_soon_after_it_serves_is_backed_off`, ignored, GAPS). Its rule is
-  approved; the end-to-end tests that kill a serving daemon again soon after it serves must first pace their kills on a
-  published recovered verdict.
-- The cause of the 407-shard kills themselves: the start's main thread makes no beat until the watchdog runs, and its
-  work grows with the shards (GAPS, "a long start beats per unit of work").
+- The serve-then-crash loop: a daemon that serves, then dies before it has served as long as its start took, was still
+  restarted at once every time (`a_daemon_that_dies_soon_after_it_serves_is_backed_off`). Closed the same day by
+  A-311's second half: such an exit is a failed start, the anchor publishes its verdict that a daemon has recovered
+  (`recovered` in `slates status`), and the end-to-end tests that kill daemons in a row wait for it.
+- The cause of the 407-shard kills themselves: the start's main thread made no beat until the watchdog ran, and its
+  work grows with the shards. Closed the same day by A-312: a start beats at every unit of its work.
 - `docs/wip/bench/kill_storm.sh` recorded A-119's numbers under the window's rule ("ten restarts, then a crash loop"); a
   storm now meets a crash loop at the second kill that lands before the daemon serves.

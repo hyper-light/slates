@@ -811,12 +811,12 @@
 > (A-311). Red on main 29ef4521 (a 400 ms start against a 200 ms window: restarted at once 4 times of 4, backed off
 > None); passes on this change, a crash loop at the second exit backed off 548 ms, its own life (an 18-core MacBook at
 > load 15; `a_crash_loop_of_starts_longer_than_the_window_is_backed_off`, the bug record of 2026-11-11). The test now ends its watch at the anchor's first start kill instead of reading on. Open:
-> - **The serve-then-crash loop.** A daemon that serves, then dies before it has served as long as its start took, is
->   still restarted at once every time (`a_daemon_that_dies_soon_after_it_serves_is_backed_off`, ignored until then).
->   The rule is approved (the supervisor, 2026-11-12), but six end-to-end files kill a serving daemon again soon after
->   it serves (`held_rendezvous.rs`, `nfs_held.rs`, `merge_kill.rs`, `live_fleet.rs`, `winfsp.rs`, `guest_vhost.rs`), and
->   `held_rendezvous` failed 4 of 4 under the rule at load 21-63 (the liveness agent's run of 2026-11-11). They are to
->   pace their kills on a recovered verdict the anchor publishes.
+> - ~~**The serve-then-crash loop.**~~ **Closed 2026-11-17 (A-311's second half):** a daemon that dies before it has
+>   served as long as its start took is a failed start, and the anchor publishes its verdict that a daemon has recovered
+>   (`recovered` in `slates status`). The end-to-end flows that kill daemons in a row (`held_rendezvous.rs`,
+>   `nfs_held.rs`, `merge_kill.rs`, `winfsp.rs`, `guest_vhost.rs`) kill each once it is judged recovered; without the
+>   wait, `held_rendezvous` failed 4 of 4 under the rule at load 21-63 (the liveness agent's run of 2026-11-11). Owed:
+>   the supervisor's runs of those flows on main (gated on `SLATES_TEST_CLI=1`; WinFsp's on CI's Windows runners).
 > - ~~**A long start beats per unit of work.**~~ **Built 2026-11-17 (A-312):** the starting thread beats after each unit
 >   of its work (each shard's registration, spawn and acknowledged build, each pair ring) until the watchdog takes the
 >   beat over, so the backoff is no longer all that stands between a long start and the anchor. Owed: the supervisor's

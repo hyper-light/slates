@@ -534,6 +534,22 @@ fn start_stuck(verdict: Verdict) -> Option<String> {
   }
 }
 
+/// Says once a daemon that it has recovered (A-311): it has served as long as its start took, so its exit from here on
+/// is no failed start and is restarted at once. `said` is the daemon whose verdict was said last.
+fn say_recovered(supervisor: &Supervisor, recovered: bool, said: &mut Option<u32>) {
+  let pid = supervisor.child_pid();
+  if !recovered || pid.is_none() || *said == pid {
+    return;
+  }
+  *said = pid;
+  slates_machine::log_line!(
+    "slates anchor: daemon pid {} recovered: it has served as long as its start took ({} ms), so its exit is no failed \
+     start",
+    pid.map_or_else(|| "unknown".to_owned(), |pid| pid.to_string()),
+    supervisor.start_took_ns().unwrap_or(0) / NS_PER_MS
+  );
+}
+
 /// The observation loop.
 fn observe(
   supervisor: &mut Supervisor,
@@ -569,6 +585,8 @@ fn observe(
   );
   let mut kill_sent = false;
   let mut quiet = Quiet::default();
+  // The daemon whose recovery the log has said (A-311), so each daemon's is said once.
+  let mut said_recovered = None;
   loop {
     if signal::stop_requested() {
       stop_gracefully(supervisor, clock)?;
@@ -594,9 +612,14 @@ fn observe(
           )
         };
         quiet.reset_while(alive);
-        // A starting daemon is looked at every beat, since its start is judged by its CPU until its first beat; a
-        // running one only when its heartbeat could next be found lapsed (`lapse_wait`).
-        let pause = if starting_since.is_some() {
+        // A starting daemon is looked at every beat, since its start is judged by its CPU until its first beat, and so
+        // is one not yet judged recovered (A-311), so that verdict comes within a beat of being due; a recovered one only
+        // when its heartbeat could next be found lapsed (`lapse_wait`).
+        let recovered = supervisor
+          .has_recovered()
+          .map_err(|e| failed("supervision", e))?;
+        say_recovered(supervisor, recovered, &mut said_recovered);
+        let pause = if starting_since.is_some() || !recovered {
           observation_pause()
         } else {
           Duration::from_nanos(lapse_wait(watch, heartbeat_ns, now, bound))

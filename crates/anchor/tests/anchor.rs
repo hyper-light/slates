@@ -256,8 +256,9 @@ fn supervised_child() {
 }
 
 /// The child [`a_daemon_killed_after_it_served_is_restarted_every_time`] supervises: as [`supervised_child`], and it marks
-/// that it serves before it exits. Its own test name, not an environment variable, makes it serve, so the tests that
-/// run beside it in this process spawn children that do not. Ignored, and run by its parent with `--ignored --exact`.
+/// that it serves and serves on until it is killed. Its own test name, not an environment variable, makes it serve, so
+/// the tests that run beside it in this process spawn children that do not. Ignored, and run by its parent with
+/// `--ignored --exact`.
 #[test]
 #[ignore = "the serving child; run by a_daemon_killed_after_it_served_... with --ignored"]
 fn serving_child() {
@@ -272,6 +273,10 @@ fn serving_child() {
     supervision.beat(n);
   }
   supervision.mark_serving(beats);
+  // It serves until its parent kills it, as a daemon serves until it is ended; one nobody kills exits after the wait a
+  // child gets.
+  #[allow(clippy::disallowed_methods)]
+  std::thread::sleep(Duration::from_millis(CHILD_WAIT_MS));
   std::process::exit(exit);
 }
 
@@ -391,13 +396,13 @@ fn a_crash_loop_of_starts_longer_than_the_window_is_backed_off() {
   );
 }
 
-/// §2.6 step 1 (A-119): a daemon that serves, but dies before it has served as long as its start took, is a crash loop
-/// too; restarted at once each time, it would spend nearly all its time restarting. Do: supervise a child that starts
-/// for 400 ms, serves a tenth of that and exits, every time. Expect the crash loop reported by the third exit, backed off at least
-/// as long as a start. On main a served exit was restarted at once, always.
+/// §2.6 step 1 (A-119, A-311): a daemon that serves, but dies before it has served as long as its start took, is a
+/// failed start too; restarted at once each time, it would spend nearly all its time restarting. Do: supervise a child
+/// that starts for [`SLOW_START_NS`], serves a tenth of that and exits, every time. Expect the first exit restarted at
+/// once and the crash loop reported at the second, backed off at least as long as a start. Before, any exit after the
+/// serving mark was restarted at once: red on main 29ef4521 (restarted at once 4 times of 4, backed off None), and still
+/// red once a failed start in a row was backed off (A-311's first half) until a served exit counted.
 #[test]
-#[ignore = "owed (A-311, GAPS): a serve-then-crash loop is backed off once the kill tests pace on a published recovered \
-            verdict; until then a served exit is restarted at once"]
 fn a_daemon_that_dies_soon_after_it_serves_is_backed_off() {
   // The start of the slow loop's test: the two run in parallel and share the process's environment, which carries it.
   let start = Duration::from_nanos(SLOW_START_NS);
@@ -408,9 +413,12 @@ fn a_daemon_that_dies_soon_after_it_serves_is_backed_off() {
     4,
   );
   let start_ns = u64::try_from(start.as_nanos()).unwrap();
+  eprintln!(
+    "starts of {start:?} that serve a tenth of that: backed off {backoff:?} ns after {exits} exits"
+  );
   assert!(
-    backoff.is_some_and(|backoff| backoff >= start_ns) && exits <= 3,
-    "a daemon that dies soon after it serves is backed off at least its start's length by the third exit: backed off \
+    backoff.is_some_and(|backoff| backoff >= start_ns) && exits == 2,
+    "a daemon that dies soon after it serves is backed off at least its start's length at the second exit: backed off \
      {backoff:?} ns after {exits} exits"
   );
 }
@@ -595,16 +603,18 @@ fn a_crashing_daemon_is_restarted_once_then_backed_off_and_the_segment_says_so()
   assert_crash_loop_recorded(&supervisor);
 }
 
-/// §2.6 step 1 (A-119, A-311): a daemon that finished its start and served before it exited was recovering, so its exit
-/// is no failed start. Do: supervise a child that beats, marks that it serves, and exits, and drive it through three
-/// times the failed starts in a row that make a crash loop. Expect each one restarted at once with no failed start
-/// counted, never a crash loop, never a back-off. On main 80be552a every exit counted, so a daemon killed while serving
-/// was judged a crash loop at the fourth kill: `a_winfsp_drive_handle_and_view_survive_twenty_killed_daemons` was backed
-/// off 16 s at kill 20 on both Windows runners, every earlier successor having served.
+/// §2.6 step 1 (A-119, A-311): a daemon that served as long as its start took recovered, so its exit is no failed start,
+/// however often that happens. Do: supervise a child that beats, marks that it serves and serves on, and kill each one
+/// once its supervisor has published that it recovered (`layout::SUP_RECOVERED`), three times the failed starts in a row
+/// that make a crash loop. Expect each restarted at once with no failed start counted, never a crash loop, and each
+/// successor's verdict unpublished until it too has served as long as its start took. On main 80be552a every exit
+/// counted, so a daemon killed while serving was judged a crash loop at the fourth kill:
+/// `a_winfsp_drive_handle_and_view_survive_twenty_killed_daemons` was backed off 16 s at kill 20 on both Windows
+/// runners, every earlier successor having served.
 #[test]
 fn a_daemon_killed_after_it_served_is_restarted_every_time() {
-  /// Shape: the exits driven: six, three times the two failed starts in a row that would make a crash loop.
-  const EXITS: u32 = 6;
+  /// Shape: the kills driven: six, three times the two failed starts in a row that would make a crash loop.
+  const KILLS: usize = 6;
   let segment = AnchorSegment::create(
     &unique_name("slates-anchor-test-served"),
     &identity(),
@@ -625,22 +635,28 @@ fn a_daemon_killed_after_it_served_is_restarted_every_time() {
   }
   let clock = Instant::now();
   supervisor.start(now_ns(clock)).unwrap();
-  let deadline = Duration::from_millis(CHILD_WAIT_MS);
+  let deadline = Duration::from_millis(CHILD_WAIT_MS) * u32::try_from(KILLS + 1).unwrap();
+  let mut killed = 0usize;
   let mut counted = Vec::new();
+  let mut published_afresh = Vec::new();
   let mut refused = None;
-  while counted.len() < usize::try_from(EXITS).unwrap() && clock.elapsed() < deadline * EXITS {
+  while counted.len() < KILLS && clock.elapsed() < deadline {
     match supervisor.step(now_ns(clock)).unwrap() {
       Step::Running => {
+        // Each daemon is killed once, and only once its supervisor has published that it recovered.
+        if killed == counted.len() && supervisor.has_recovered().unwrap() {
+          supervisor.kill().unwrap();
+          killed += 1;
+        }
         // The test harness paces the poll; shipped code parks on its driver (D-9).
         #[allow(clippy::disallowed_methods)]
         std::thread::sleep(Duration::from_micros(POLL_US));
       }
       Step::Restarted {
-        exit_code,
-        failed_in_a_row,
+        failed_in_a_row, ..
       } => {
-        assert_eq!(exit_code, Some(EXIT));
         counted.push(failed_in_a_row);
+        published_afresh.push(!supervisor.has_recovered().unwrap());
       }
       other => {
         refused = Some(format!("{other:?}"));
@@ -651,8 +667,13 @@ fn a_daemon_killed_after_it_served_is_restarted_every_time() {
   supervisor.stop().ok();
   assert_eq!(
     (counted, refused),
-    (vec![0; usize::try_from(EXITS).unwrap()], None),
-    "a daemon that served is restarted at every exit with no failed start counted"
+    (vec![0; KILLS], None),
+    "a daemon killed after it recovered is restarted at every exit with no failed start counted"
+  );
+  assert_eq!(
+    published_afresh,
+    vec![true; KILLS],
+    "each successor's recovery is judged afresh, never inherited from the daemon before it"
   );
 }
 
