@@ -268,6 +268,14 @@ pub fn file_attributes(kind: Kind) -> Result<u32, VfsError> {
   })
 }
 
+/// Whether the drive lists an entry of `kind` (A-26, A-294): Windows has no FIFO, socket or device node, so the drive
+/// leaves each out of its directory's listing, as it refuses to open one ([`file_attributes`]), and the rest of the
+/// directory lists. Before, one such entry failed the whole listing `STATUS_NOT_SUPPORTED`, so a `dir` of an unpacked
+/// root filesystem's `/dev` listed nothing at all.
+pub fn listed(kind: Kind) -> bool {
+  !kind.is_special()
+}
+
 /// The `NTSTATUS` WinFsp returns for a volume refusal (§4.6). The common, well-defined codes map
 /// precisely; the rare and slates-specific refusals (`TooManyLinks`, `FileTooLarge`, `Destroying`,
 /// `BaseUnavailable`, `BaseDrift`, `NotOverlay`, `RecoveryIncomplete`, `Archived`, `PolicyMismatch`,
@@ -419,6 +427,26 @@ mod tests {
     assert!(refuses_replacement(&node(Kind::File, 0o444, 0)));
     assert!(!refuses_replacement(&node(Kind::File, 0o644, 0)));
     assert!(!refuses_replacement(&node(Kind::Dir, 0o555, 0x1)));
+  }
+
+  /// AC-3.10 / A-294: do ask whether the drive lists an entry of each kind. Expect a directory, a file and a symlink
+  /// listed, each with its attribute word, and a FIFO, a socket and both device kinds left out, each of which the
+  /// drive refuses to open: a directory holding one still lists the rest.
+  #[test]
+  fn a_listing_leaves_out_the_kinds_windows_has_none_of() {
+    for kind in [Kind::Dir, Kind::File, Kind::Symlink] {
+      assert!(listed(kind), "{kind:?} is listed");
+      assert!(file_attributes(kind).is_ok());
+    }
+    for kind in [
+      Kind::Fifo,
+      Kind::Socket,
+      Kind::BlockDevice,
+      Kind::CharDevice,
+    ] {
+      assert!(!listed(kind), "{kind:?} is left out");
+      assert!(file_attributes(kind).is_err());
+    }
   }
 
   /// AC-3.10 / A-26, A-294: a FIFO, socket or device node is refused as unsupported, never projected as a disk file.

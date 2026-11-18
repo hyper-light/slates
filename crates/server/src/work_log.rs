@@ -373,7 +373,11 @@ pub(crate) fn replay(
         delete_len,
         bytes,
       } => {
-        let base = Base { green, version };
+        let base = Base {
+          green,
+          fetched: None,
+          version,
+        };
         let old = files.get(base, &path)?.map(std::borrow::Cow::into_owned);
         let inserted = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         let ops = edit_ops(&path, old.as_deref(), (at, delete_len, inserted));
@@ -387,7 +391,11 @@ pub(crate) fn replay(
       WorkLogEntry::Declared { op } => {
         apply_declare(
           (&mut files, &mut journal),
-          Base { green, version },
+          Base {
+            green,
+            fetched: None,
+            version,
+          },
           op.op()?,
         )?;
       }

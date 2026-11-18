@@ -1918,26 +1918,7 @@ fn a_device_mknod_makes_a_node_for_root_and_refuses_any_other_caller_eperm() {
   let mut store = store();
   let mut vol = volume(&mut store);
   let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
-  let widest = (259, (1 << 20) - 1);
-  {
-    let mut export = export_to(&mut bridge, 0);
-    let root = root_handle(&mut export);
-    for (ftype3, name) in [(3, "block"), (4, "char")] {
-      let (status, made) = mknod_reply(&mut export, &root, name, ftype3, widest);
-      assert_eq!(status, Nfsstat3::Ok.wire(), "root makes a {name} device");
-      for attrs in [made.unwrap(), attributes_of(&mut export, &root, name)] {
-        assert_eq!(
-          (
-            attrs.kind as u32,
-            attrs.rdev.specdata1,
-            attrs.rdev.specdata2
-          ),
-          (ftype3, widest.0, widest.1),
-          "a {name} device reports its type and number"
-        );
-      }
-    }
-  }
+  expect_root_makes_each_device_at_the_widest_number(&mut bridge);
   let cx = write_cx();
   let root_ino = bridge.root(&cx).unwrap();
   chmod(&mut bridge, &cx, root_ino, 0o777);
@@ -1972,6 +1953,30 @@ fn a_device_mknod_makes_a_node_for_root_and_refuses_any_other_caller_eperm() {
     ),
     (4, 0, 0, 1000)
   );
+}
+
+/// Root's half of `a_device_mknod_makes_a_node_for_root_and_refuses_any_other_caller_eperm`. Do: as root, MKNOD a block
+/// and a character device numbered 259:1048575 (past the old 8-bit encoding) through `bridge`. Expect each made, and
+/// its MKNOD reply and a GETATTR to report its type (`NF3BLK`, `NF3CHR`) and its number in `rdev`.
+fn expect_root_makes_each_device_at_the_widest_number(bridge: &mut VolumeBridge<'_>) {
+  let widest = (259, (1 << 20) - 1);
+  let mut export = export_to(bridge, 0);
+  let root = root_handle(&mut export);
+  for (ftype3, name) in [(3, "block"), (4, "char")] {
+    let (status, made) = mknod_reply(&mut export, &root, name, ftype3, widest);
+    assert_eq!(status, Nfsstat3::Ok.wire(), "root makes a {name} device");
+    for attrs in [made.unwrap(), attributes_of(&mut export, &root, name)] {
+      assert_eq!(
+        (
+          attrs.kind as u32,
+          attrs.rdev.specdata1,
+          attrs.rdev.specdata2
+        ),
+        (ftype3, widest.0, widest.1),
+        "a {name} device reports its type and number"
+      );
+    }
+  }
 }
 
 /// A-268, kept by A-294. Do: make a FIFO, then MKNOD a character device of the same name; then, as a user who may not

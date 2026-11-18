@@ -36,7 +36,6 @@ pub mod init;
 #[cfg(unix)]
 pub mod mount;
 pub mod notify;
-pub mod posix_acl;
 pub mod reply;
 pub mod request;
 pub mod session;

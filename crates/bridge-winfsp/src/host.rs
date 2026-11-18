@@ -64,7 +64,7 @@ use crate::held::{
 use crate::notify::OpenNames;
 use crate::opens::{Ledger, Open, RESTORED_HANDLE};
 use crate::purge::{Purge, PurgeOutcome};
-use crate::{STATUS_SUCCESS, file_attributes, filetime_from_unix_ns, ntstatus};
+use crate::{STATUS_SUCCESS, file_attributes, filetime_from_unix_ns, listed, ntstatus};
 use slates_mem::SparseObject;
 
 /// A typed WinFsp host failure (no panics; every refusal is a value).
@@ -1378,7 +1378,12 @@ fn read_all_entries(
   let rows = bridge.readdir(object, cx, fh, 0, usize::MAX)?;
   let mut out = Vec::with_capacity(rows.len());
   for entry in rows {
+    // A FIFO, socket or device node has no Windows form: it is left out, never a reason to fail the listing (A-294).
+    if !listed(entry.kind) {
+      continue;
+    }
     let info = match bridge.getattr(ObjectId::new(entry.ino, 0), cx) {
+      Ok(attr) if !listed(attr.kind) => continue,
       Ok(attr) => file_info(&attr)?,
       Err(_) => FileInfo {
         file_attributes: file_attributes(entry.kind)?,

@@ -307,6 +307,22 @@ impl Registration {
   pub fn shard(&self) -> u16 {
     self.shard
   }
+
+  /// Tells every shard that asked this slot for room ([`crate::shard::ShardContext::want_room`]) that its control
+  /// channel has room now, as a shard's drain that took a message tells them ([`crate::room`]): for a holder that takes
+  /// messages off the slot's control channel itself (a test's stand-in for a shard), called after each take. The fence
+  /// orders the take before the look at who asked, as the drain's does, so either an asker's second try finds the room
+  /// or this finds its mark.
+  pub fn tell_room(&self) {
+    let _ = with_entry(self.shard, |entry| {
+      fence(Ordering::SeqCst);
+      if entry.room_wanted.maybe_any() {
+        entry
+          .room_wanted
+          .take_each(|origin| give_room(origin, self.shard));
+      }
+    });
+  }
 }
 
 impl Drop for Registration {

@@ -79,9 +79,12 @@ pub mod lease;
 mod lease_wait;
 mod live_ship;
 mod member_task;
+// Version 0 of a green over a base, made, shipped and seeded a slice at a time at `f > 0` (§4.16, A-286).
+mod merge_origin;
 pub mod merge_service;
 mod mirror;
 mod remote_attach;
+mod work_home;
 #[cfg(target_os = "linux")]
 mod write_log;
 // The Windows WinFsp transport (§4.6 "Windows"): a volume at a drive letter, served on its owner shard.

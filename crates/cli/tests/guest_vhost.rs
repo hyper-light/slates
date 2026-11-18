@@ -19,6 +19,10 @@
 //!   out any modified portions of the last page of an object which are beyond its end");
 //! - the session's origin untouched by any of it, and the origin's own later write never in the guest's map (A-166).
 //!
+//! And what its own mount must withhold (A-94, A-294): the guest mounts the tag `nosuid,nodev`, as `docs/cli.md`'s
+//! guest mount line asks, so a set-id file another writer made runs as its caller and a device node another writer
+//! made is never opened; the same tag mounted again without the flags, the control, shows that both reached the guest.
+//!
 //! Gated: Linux, with the guest's kernel and the probe named in the environment as for `tests/guest_dax.rs`, and crosvm
 //! (`SLATES_GUEST_CROSVM`, with KVM) or QEMU (`SLATES_GUEST_QEMU`, with KVM where the host has it and its own emulation
 //! where not), or it skips loudly. Every test runs once in each VMM named. The guest's initramfs is written into a slates volume through its mount, so the test writes nothing to disk
@@ -43,7 +47,7 @@ use std::time::{Duration, Instant};
 use slates_bridge_virtiofs::backed;
 use slates_bridge_virtiofs::serve::TOLD_ABANDONED;
 use slates_client::{Client, Intent, VolumeId};
-use slates_guest_probe::protocol::{Command as Ask, Reply};
+use slates_guest_probe::protocol::{Command as Ask, Mount, Reply};
 use vm::{
   Anchor, Guest, MountPoint, QUIT_WAIT, REPLY_WAIT, START_WAIT, created_volume, daemon_of,
   initramfs, kill_daemon, kill_the_daemon, pause, run, start_anchor, start_anchor_with, write_at,
@@ -1930,5 +1934,177 @@ fn daemons_killed_mid_write(gate: &Gate) {
     status.success(),
     "the last VM powered off cleanly: {status}\n{}",
     last.transcript()
+  );
+}
+
+// A-94 and A-294 through a real guest: the guest's own mount of a share honours no set-id bit and opens no device node,
+// as `docs/cli.md`'s guest mount line asks, whoever made either in the volume; a control mount without the flags shows
+// that both reached the guest.
+
+/// Format: the set-id file the host's user makes in the session: a copy of the probe's binary, which run from a mount
+/// says its ids ([`Reply::Identity`]).
+const SET_ID: &str = "set-id";
+/// Format: the set-id file's mode: set-user-id, set-group-id and `rwxr-xr-x`, so any guest user may run it.
+const SET_ID_MODE: u32 = 0o6755;
+/// Format: the bits of a file's mode `stat` reports beside its type: the set-id and sticky bits and the permissions.
+const MODE_BITS: u32 = 0o7777;
+/// Format: the device node the host's user makes in the session: a whiteout, the one device node an ordinary user may
+/// make (Linux's `vfs_mknod` asks `CAP_MKNOD` of every other; A-294 keeps the rule).
+const WHITEOUT: &str = "whiteout";
+/// Format: a whiteout's device number, major and minor: 0/0 (overlayfs's `WHITEOUT_DEV`).
+const WHITEOUT_NUMBER: (u32, u32) = (0, 0);
+/// Format: the whiteout's mode as asked, before the host's umask: anyone's to read and write.
+const WHITEOUT_MODE: u32 = 0o666;
+/// Format: the guest user the set-id file is run as: `nobody`, 65534 on Linux, who owns nothing in the volume.
+const NOBODY: u32 = 65_534;
+
+/// Writes a copy of the probe's binary into the session through its mount, as the host's user, and makes it set-user-id
+/// and set-group-id ([`SET_ID_MODE`]): the copy's owner and group as the host's mount shows them, which is how the guest
+/// sees them too (every route shows a volume's ids as the volume keeps them, but a Shards stream whose guest names its
+/// run's owner).
+#[allow(clippy::disallowed_methods)] // reads the built probe and sets a mode through a slates mount: RAM, not disk
+fn plant_set_id_copy(rig: &Rig, gate: &Gate) -> (u32, u32) {
+  use std::os::unix::fs::{MetadataExt, PermissionsExt};
+  let probe = std::fs::read(&gate.probe).unwrap_or_else(|e| panic!("read {}: {e}", gate.probe));
+  let path = rig.session_side.file(SET_ID);
+  write_whole(&path, &probe);
+  std::fs::set_permissions(&path, std::fs::Permissions::from_mode(SET_ID_MODE))
+    .unwrap_or_else(|e| panic!("chmod {path}: {e}"));
+  let made = std::fs::metadata(&path).unwrap_or_else(|e| panic!("stat {path}: {e}"));
+  assert_eq!(
+    made.mode() & MODE_BITS,
+    SET_ID_MODE,
+    "the session keeps the set-id bits its owner gave {path}"
+  );
+  (made.uid(), made.gid())
+}
+
+/// Makes a whiteout in the session through its mount, as the host's user: a character device numbered 0/0.
+fn plant_whiteout(rig: &Rig) {
+  use rustix::fs::{CWD, FileType, Mode, major, makedev, minor, mknodat};
+  let path = rig.session_side.file(WHITEOUT);
+  let (major_number, minor_number) = WHITEOUT_NUMBER;
+  mknodat(
+    CWD,
+    path.as_str(),
+    FileType::CharacterDevice,
+    Mode::from_raw_mode(WHITEOUT_MODE),
+    makedev(major_number, minor_number),
+  )
+  .unwrap_or_else(|e| panic!("mknod {path} as a whiteout: {e}"));
+  let made = rustix::fs::stat(path.as_str()).unwrap_or_else(|e| panic!("stat {path}: {e}"));
+  assert_eq!(
+    (
+      FileType::from_raw_mode(made.st_mode),
+      (major(made.st_rdev), minor(made.st_rdev))
+    ),
+    (FileType::CharacterDevice, WHITEOUT_NUMBER),
+    "the session keeps {path} as a character device numbered 0/0"
+  );
+}
+
+/// A-94 and A-294 through a real guest of slates' own device. Do: as the host's user, through the session's
+/// `slates mount`, write a copy of the probe's binary and make it set-user-id and set-group-id, and make a whiteout
+/// beside it, a character device numbered 0/0 (the one device node an ordinary user may make); boot a guest that mounts
+/// the tag `dax=always,nosuid,nodev`, as `docs/cli.md`'s guest mount line asks, and mount the tag again without either
+/// flag, the control. In the guest, run the copy as `nobody` from each mount, and open the whiteout for reading, as
+/// root, through each.
+///
+/// Expect: from the guest's mount the copy runs with `nobody`'s ids, never its owner's (the kernel's `bprm_fill_uid`
+/// honours no set-id bit on a `nosuid` mount), and the open is refused `EACCES` before any device is reached
+/// (`may_open_dev`). From the control the copy runs with its owner's effective ids, and the open reaches the device
+/// layer, which has no driver for 0/0 (`ENXIO`): the bits and the node reached the guest, and the flags alone withheld
+/// them.
+#[test]
+fn a_guests_mount_of_slates_own_device_runs_no_set_id_file_as_its_owner_and_opens_no_device_node() {
+  for gate in Gate::each_from_env() {
+    withholds_set_id_and_devices(&gate);
+  }
+}
+
+/// [`a_guests_mount_of_slates_own_device_runs_no_set_id_file_as_its_owner_and_opens_no_device_node`] in the VMM `gate`
+/// names.
+fn withholds_set_id_and_devices(gate: &Gate) {
+  let (rig, _) = Rig::new(gate, "vhost-nosuid");
+  let (owner, group) = plant_set_id_copy(&rig, gate);
+  assert_ne!(
+    owner, NOBODY,
+    "the host's user is not nobody, or the control could not tell the owner's ids from the caller's"
+  );
+  plant_whiteout(&rig);
+  let mut guest = rig.boot(gate);
+  guest.done(&Ask::Bare);
+  for (mount, (euid, egid), what) in [
+    (
+      Mount::Hardened,
+      (NOBODY, NOBODY),
+      "run from the guest's nosuid mount, the set-id copy keeps its caller's ids",
+    ),
+    (
+      Mount::Bare,
+      (owner, group),
+      "the control: run from the mount without nosuid, the set-id copy takes its owner's ids",
+    ),
+  ] {
+    let reply = guest.ask(
+      &Ask::Exec {
+        mount,
+        path: SET_ID.to_owned(),
+        uid: NOBODY,
+        gid: NOBODY,
+      },
+      REPLY_WAIT,
+    );
+    assert_eq!(
+      reply,
+      Reply::Identity {
+        uid: NOBODY,
+        euid,
+        gid: NOBODY,
+        egid
+      },
+      "{what}\n{}",
+      guest.transcript()
+    );
+  }
+  for (mount, errno, what) in [
+    (
+      Mount::Hardened,
+      rustix::io::Errno::ACCESS,
+      "the guest's nodev mount refuses the open before any device",
+    ),
+    (
+      Mount::Bare,
+      rustix::io::Errno::NXIO,
+      "the control: without nodev the open reaches the device layer, which has no driver for 0/0",
+    ),
+  ] {
+    let reply = guest.ask(
+      &Ask::Open {
+        mount,
+        path: WHITEOUT.to_owned(),
+      },
+      REPLY_WAIT,
+    );
+    assert_eq!(
+      reply,
+      Reply::Failed {
+        errno: errno.raw_os_error()
+      },
+      "{what}\n{}",
+      guest.transcript()
+    );
+  }
+  eprintln!(
+    "A-94 in {}: the set-id copy (owner {owner}, group {group}) ran as nobody from the guest's nosuid,nodev mount and \
+     as its owner from the control; the whiteout's open was refused EACCES through the guest's mount and reached the \
+     device layer (ENXIO) through the control",
+    gate.vmm.name()
+  );
+  let status = guest.quit();
+  assert!(
+    status.success(),
+    "the VM powered off cleanly: {status}\n{}",
+    guest.transcript()
   );
 }
