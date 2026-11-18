@@ -12,7 +12,7 @@
 > (`xtask/src/conformance/suites.rs`, which the CI conformance lane runs with `SLATES_TEST_FSX=1`: the pinned fsx with
 > its file overwritten in place).
 
-> **Live-shipped volumes do not yet conform as plain ones do (2026-11-06, A-200; OPEN, owner raft).** `--live-ship`
+> **Live-shipped volumes do not yet conform as plain ones do (2026-11-06, A-200; macOS conforms since 2026-11-18; Linux OPEN, owner g226).** `--live-ship`
 > runs a suite over a volume live-shipped on an `f = 1` fleet: three anchors from one manifest, the volume created and
 > mounted on node a, `slates live-ship ID`. A run fails unless the owner's log is durable at its head and both
 > candidates hold it, and its record carries the `fleet.live` counters. `compare` holds a live run to a plain one on the
@@ -29,6 +29,16 @@
 >   plain; the live fsstress hung over three hours until cancelled. `windows-latest`: the live fleet never formed
 >   (WSAECONNRESET on a handshake). `windows-11-arm`: the fleet formed for winfstest, whose 628 cases matched plain, but
 >   one candidate held nothing; it did not form for fsx.
+> - **macOS conforms now (2026-11-18, main `40efd7456`; Linux still OPEN).** On Adas-MacBook-Pro-3 (macOS 26.6 25G72,
+>   arm64, NFS loopback, load averages 7 to 14), each suite plain then live on one machine, then `compare`:
+>   - fsx: 10,000 operations passed both ways.
+>   - fsstress: 4 × 500, 2,000 logged, passed both ways (8 s plain, 36 s live).
+>   - pjdfstest: unprivileged, `LIMITED` both ways with identical counts (238 files, 8,686 cases: 2,915 passed, 1,738
+>     failed, 4,033 needs-root). `compare`: 8,686 cases each, 0 differing, so the live run conforms exactly as the plain one.
+>   The live runs shipped: the harness fails one whose owner's log is not durable at its head with both candidates
+>   holding it. None of the 2026-11-06 faults came back. Commands:
+>   `cargo xtask conformance run --suite S [--live-ship] --transport native-macos-nfs --records D/R --scratch D/S --keep`,
+>   then `cargo xtask conformance compare --plain P --live L`.
 > GAPS ("A live-shipped volume fails a waiting writer…") holds the evidence; the lists are unchanged, since a live
 > volume must conform as a plain one does and no list may grow for it.
 

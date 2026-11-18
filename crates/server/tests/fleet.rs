@@ -11584,6 +11584,133 @@ fn live_volume_written(
   (id, written)
 }
 
+/// Shape: the files [`a_live_takeover_is_rebuilt_in_turns_and_joined_while_it_runs`] writes into a's live volume: its
+/// log holds a payload a publication, and a burst's writes may share one, so the log's length is read, not assumed.
+const LIVE_TURN_FILES: usize = 24;
+/// Format: the successor's count of the owner-shard turns its live rebuilds took (`fleet::make_live_in_turns`).
+const LIVE_REBUILD_SLICES: &str = "fleet.live.rebuild_slices";
+/// Format: the successor's count of the payloads its live rebuilds applied, in all their turns.
+const LIVE_REBUILD_PAYLOADS: &str = "fleet.live.rebuild_payloads";
+/// Format: the successor's count of the live rebuilds it began, once a takeover however many attempts join it.
+const LIVE_REBUILDS_BEGUN: &str = "fleet.live.rebuilds_begun";
+/// Format: the successor's count of its attempts that found a live materialization running and joined it.
+const MATERIALIZE_WAITS_MAKING: &str = "fleet.materialize.waits.making";
+/// Format: the successor's count of live materializations begun while one of the same volume ran.
+const MAKING_ALREADY: &str = "fleet.materialize.making_already";
+
+/// g251 (the nemesis's watchdog kills of a successor; CLAUDE.md "Bounded work everywhere"), §4.10 live shipping, §4.8
+/// "Promotion and takeover": a live volume taken over is rebuilt from its log in turns of the successor's owner shard,
+/// and the successor's later attempts join the materialization running there rather than fetching and rebuilding the log
+/// again. Do: three nodes at `f = 1`, one shard a node; on a, a live-shipped volume written 24 files; on b and c, the seal
+/// quantum cut to one unit (a payload a turn) and a pause of half a period between a rebuild's turns, so the
+/// materialization outlasts the control shard's periods; stop a; once the survivor the volume ranks first serves it, read
+/// every file back through it. Expect every file read back; the rebuild in a turn a payload, more than one; one rebuild begun, the later
+/// attempts joining it (`fleet.materialize.waits.making`, non-vacuous) and none begun twice; and the successor's longest
+/// step under the watchdog's window. Before, the whole log was rebuilt inside the one owner-shard turn that made the
+/// volume (0.68 to 1.08 s for the nemesis's 152 to 306 MB, past the spin window with the restore and the publication
+/// after it), and each period's attempt that the turn outlasted fetched and rebuilt the whole log again.
+#[test]
+fn a_live_takeover_is_rebuilt_in_turns_and_joined_while_it_runs() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, mut daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id } = client.call(&scratch("turns")) else {
+    panic!("the volume was created");
+  };
+  share_with_fleet(&mut client, id, &daemons);
+  let attachment = write_attachment(&mut client, id);
+  let shipped = client.call(&RequestBody::LiveShip {
+    volume: id,
+    live_shipped: true,
+  });
+  let written: Vec<ReplyBody> = (0..LIVE_TURN_FILES)
+    .map(|file| {
+      client.call(&RequestBody::FsWrite {
+        volume: id,
+        attachment,
+        path: format!("/turns-{file}"),
+        bytes: continuity_body(file),
+        mode: 0o644,
+      })
+    })
+    .collect();
+  drop(client);
+  for daemon in &daemons[1..] {
+    daemon.inject_seal_walk_quantum(Some(0)).unwrap();
+    daemon
+      .inject_live_turn_pause(Some(HEARTBEAT_NS / 2))
+      .unwrap();
+  }
+  let successor =
+    rendezvous_first(&[hosts[1], hosts[2]], ObjectId(id.bytes)).expect("a survivor takes over");
+  let index = usize::from(successor != hosts[1]);
+  daemons.remove(0).stop();
+  let instance = daemons[index].instance().to_owned();
+  let served = poll_status_answers(&daemons.iter().collect::<Vec<_>>(), &instance, id);
+  let mut reader = Client::connect(&instance);
+  let read: Vec<bool> = (0..LIVE_TURN_FILES)
+    .map(|file| {
+      let reply = read_at_head(&mut reader, id, &format!("/turns-{file}"));
+      matches!(reply, ReplyBody::ReadPage { bytes, .. } if bytes == continuity_body(file))
+    })
+    .collect();
+  drop(reader);
+  let counters = summed_counters(&daemons[index]);
+  let counted = |name: &str| counters.get(name).copied().unwrap_or(0);
+  let (slices, payloads, begun, joined, twice) = (
+    counted(LIVE_REBUILD_SLICES),
+    counted(LIVE_REBUILD_PAYLOADS),
+    counted(LIVE_REBUILDS_BEGUN),
+    counted(MATERIALIZE_WAITS_MAKING),
+    counted(MAKING_ALREADY),
+  );
+  let longest_step_ns = control_longest_poll_ns(&daemons[index]);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "a live takeover in turns: served {served}, read {read:?}, {slices} rebuild turns for {payloads} payloads of \
+     {LIVE_TURN_FILES} files, {begun} rebuilds begun, {joined} attempts joined one running, {twice} begun twice, the \
+     successor's longest step {longest_step_ns} ns"
+  );
+  assert!(
+    matches!(shipped, ReplyBody::LiveShippingSet { live_shipped: true }),
+    "the volume is live-shipped: {shipped:?}"
+  );
+  assert!(
+    written
+      .iter()
+      .all(|reply| matches!(reply, ReplyBody::FsDone { .. })),
+    "every write was answered: {written:?}"
+  );
+  assert!(served, "the successor serves the volume");
+  assert!(
+    read.iter().all(|read| *read),
+    "every file reads back through the successor: {read:?}"
+  );
+  assert!(
+    payloads > 1,
+    "non-vacuity: the log held more than one payload to rebuild ({payloads})"
+  );
+  assert!(
+    slices >= payloads,
+    "the log was rebuilt a payload a turn: {slices} turns for {payloads} payloads"
+  );
+  assert_eq!(begun, 1, "the log was rebuilt once");
+  assert!(
+    joined >= 1,
+    "non-vacuity: the materialization outlasted an attempt, which joined it ({joined} joined)"
+  );
+  assert_eq!(
+    twice, 0,
+    "no materialization of the volume was begun while one ran"
+  );
+  assert!(
+    longest_step_ns < LIVENESS_BUDGET_NS,
+    "the successor's longest step {longest_step_ns} ns stayed under the watchdog's window {LIVENESS_BUDGET_NS} ns"
+  );
+}
+
 /// What the Continuity test saw through the successor: whether it served the volume, its first write's reply, its log's
 /// head (epoch, position) after that write, and whether each file written on the owner read back.
 struct ThroughTheSuccessor {
@@ -21359,23 +21486,120 @@ fn a_successor_adopts_a_greens_ledger_past_its_merge_budget_and_keeps_it_across_
   );
 }
 
-/// §4.10 content retention, §4.16 "Commit" (the bug record of 2026-11-07, retention decoded every merge record per put).
-/// A holder's retention rule asked, for each manifest it held, whether any position of the green's merge ledger named it,
-/// decoding every position each time: quadratic in the green's history, so a submit at `f = 1` slowed by about 40 µs a
-/// version (247 µs over the first 50 submits, 20 ms by the 500th). Do: on a settled three-node fleet at `f = 1`, submit
-/// 300 works over one green one after another. Expect every submit accepted, and the median of the last 50 answers no
-/// more than four times the first 50's plus 2 ms: a submit late in a green's history costs what an early one does.
+/// Shape: the submits that give the old green of the late-submit test its history before it is measured: enough for a
+/// per-version cost to show (12 ms by the 300th before the 2026-11-07 retention fix, 4.4 to 7.1 ms before A-367).
+const HISTORY_SUBMITS: u64 = 300;
+/// Shape: the measured pairs of the late-submit test, one submit on the old green and one on the fresh green each: the
+/// sample the signed-rank test is taken over (its normal approximation holds from about 20 pairs, Wilcoxon 1945).
+const MEASURED_PAIRS: u64 = 50;
+/// The one-sided standard normal quantile of the late-submit test's false-alarm rate, a spurious failure in a million
+/// runs: Φ⁻¹(1 − 10⁻⁶) = 4.7534 (the standard normal's tabled quantile; NIST/SEMATECH e-Handbook of Statistical Methods,
+/// §1.3.6.7.1). The test runs on every lane of every push, so a rarer rate than a run a day would see is the requirement.
+const SPURIOUS_FAILURE_QUANTILE: f64 = 4.7534;
+
+/// The Wilcoxon signed-rank statistic of `pairs` (Wilcoxon 1945): the differences `old − fresh`, zeros dropped, ranked
+/// by size (tied sizes their mean rank), and the ranks of the positive ones summed (`W+`), with the count ranked.
+fn signed_rank(pairs: &[(Duration, Duration)]) -> (f64, usize) {
+  let mut differences: Vec<(f64, bool)> = pairs
+    .iter()
+    .filter(|(old, fresh)| old != fresh)
+    .map(|(old, fresh)| {
+      let (old, fresh) = (old.as_secs_f64(), fresh.as_secs_f64());
+      ((old - fresh).abs(), old > fresh)
+    })
+    .collect();
+  differences.sort_by(|left, right| left.0.total_cmp(&right.0));
+  let mut positive = 0.0;
+  let mut at = 0;
+  while at < differences.len() {
+    let tied = differences[at..]
+      .iter()
+      .take_while(|(size, _)| *size == differences[at].0)
+      .count();
+    // Ranks are 1-based: the tied run from `at` holds ranks at + 1 to at + tied, whose mean is this.
+    let mean_rank = (2 * at + tied + 1) as f64 / 2.0;
+    positive += mean_rank
+      * differences[at..at + tied]
+        .iter()
+        .filter(|(_, older_slower)| *older_slower)
+        .count() as f64;
+    at += tied;
+  }
+  (positive, differences.len())
+}
+
+/// The largest `W+` of [`signed_rank`] over `ranked` pairs that no per-version cost explains at the false-alarm rate of
+/// [`SPURIOUS_FAILURE_QUANTILE`]: with no difference between the greens, `W+` is about normal with mean n(n + 1)/4 and
+/// variance n(n + 1)(2n + 1)/24 (Wilcoxon 1945; the normal approximation of the signed-rank statistic).
+fn signed_rank_bound(ranked: usize) -> f64 {
+  let n = ranked as f64;
+  n * (n + 1.0) / 4.0 + SPURIOUS_FAILURE_QUANTILE * (n * (n + 1.0) * (2.0 * n + 1.0) / 24.0).sqrt()
+}
+
+/// The late-submit test's statistic (Wilcoxon 1945), held to its definition. Do: rank pairs whose old member is slower by
+/// 1 to 5 ms, pairs whose old member is faster by those, the differences +1, −2 and +3 ms, and two pairs equal in size
+/// and sign with one equal pair. Expect W+ 15 of 5 (every rank), 0 of 5, 4 of 3 (ranks 1 and 3), and 3 of 2 (the tied
+/// ranks 1 and 2 each 1.5, the equal pair dropped); and the bound at 50 ranked pairs n(n + 1)/4 + z·√(n(n + 1)(2n + 1)/24).
+#[test]
+fn the_signed_rank_statistic_ranks_differences_by_size() {
+  let ms = Duration::from_millis;
+  let base = ms(10);
+  let slower: Vec<_> = (1..=5).map(|n| (base + ms(n), base)).collect();
+  let faster: Vec<_> = (1..=5).map(|n| (base, base + ms(n))).collect();
+  let mixed = [
+    (base + ms(1), base),
+    (base, base + ms(2)),
+    (base + ms(3), base),
+  ];
+  let tied = [(base + ms(2), base), (base + ms(2), base), (base, base)];
+  assert_eq!(signed_rank(&slower), (15.0, 5));
+  assert_eq!(signed_rank(&faster), (0.0, 5));
+  assert_eq!(signed_rank(&mixed), (4.0, 3));
+  assert_eq!(signed_rank(&tied), (3.0, 2));
+  let expected =
+    50.0 * 51.0 / 4.0 + SPURIOUS_FAILURE_QUANTILE * (50.0 * 51.0 * 101.0 / 24.0f64).sqrt();
+  assert!((signed_rank_bound(50) - expected).abs() < f64::EPSILON * expected);
+}
+
+/// One work over `green` named `name`, one edit of `path`, and its submit timed: the edit's reply, the submit's and the
+/// submit's wait.
+fn timed_submit(
+  client: &mut Client,
+  green: VolumeId,
+  (name, path): (String, String),
+) -> (ReplyBody, ReplyBody, Duration) {
+  let ReplyBody::WorkCreated { id: work, .. } =
+    client.call(&RequestBody::CreateWork { green, name })
+  else {
+    panic!("create a work over {green:?}");
+  };
+  let edited = client.call(&RequestBody::Edit {
+    work,
+    path,
+    at: 0,
+    delete_len: 0,
+    bytes: b"hello".to_vec(),
+  });
+  let started = Instant::now();
+  let submitted = client.call(&RequestBody::Submit {
+    work,
+    evidence: Vec::new(),
+  });
+  (edited, submitted, started.elapsed())
+}
+
+/// §4.10 content retention, §4.16 "Commit" (the bug record of 2026-11-07, retention decoded every merge record per put;
+/// A-367, A-372 and A-376, a holder re-published and re-judged its whole ledger and hold at each version). A submit's cost
+/// must not grow with its green's history. Do: on a settled three-node fleet at `f = 1`, give one green
+/// [`HISTORY_SUBMITS`] versions, make a fresh green, then submit [`MEASURED_PAIRS`] pairs, one work on each green, the
+/// order in the pair alternating, so the two greens are measured side by side under the same load. Expect every submit
+/// accepted as its green's next version, and the Wilcoxon signed-rank statistic of the pairs' differences, old minus
+/// fresh, no greater than its bound at a false-alarm rate of a run in a million ([`signed_rank_bound`]): a submit late in
+/// a green's history is answered as fast as an early one. (Before 2026-11-18 it held the median of the last 50 of 300
+/// submits to four times the first 50's plus 2 ms, factors no measurement gave, and a load that changed between the two
+/// windows read as a cost of history.)
 #[test]
 fn a_submit_late_in_a_greens_history_is_answered_as_fast_as_an_early_one() {
-  /// Shape: submits made, one after another; enough history for a per-version cost to show (12 ms by the 300th).
-  const SUBMITS: u64 = 300;
-  /// Shape: the submits each end's median is taken over.
-  const WINDOW: usize = 50;
-  /// Shape: how much slower the late window may be than the early one before a per-version cost is declared, and the
-  /// absolute slack for a loaded machine's scheduling.
-  const SLOWER_AT_MOST: u32 = 4;
-  /// Shape: see [`SLOWER_AT_MOST`].
-  const SLACK: Duration = Duration::from_millis(2);
   let _serial = serialize_fleet_tests();
   let names = ["a", "b", "c"];
   let nodes: Vec<_> = names.iter().map(|name| fleet_node(name)).collect();
@@ -21387,50 +21611,96 @@ fn a_submit_late_in_a_greens_history_is_answered_as_fast_as_an_early_one() {
   let (_serve_lease, serve) = mesh_serve_ports(names.len());
   let daemons = start_mesh_with_f(nodes, &hosts, &certs, &serve, 1);
   let mut client = Client::connect(daemons[0].instance());
-  let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
-    name: "green".to_owned(),
+  let create = |client: &mut Client, name: &str| match client.call(&RequestBody::CreateGreen {
+    name: name.to_owned(),
     require_evidence: false,
     base: None,
-  }) else {
+  }) {
+    ReplyBody::GreenCreated { id } => Some(id),
+    _ => None,
+  };
+  let Some(old) = create(&mut client, "green") else {
     for daemon in daemons {
       daemon.stop();
     }
-    panic!("create green");
+    panic!("create the old green");
   };
-  let answers = timed_submits(&mut client, green, SUBMITS);
+  let history: Vec<_> = (0..HISTORY_SUBMITS)
+    .map(|index| {
+      let (_, submitted, _) = timed_submit(
+        &mut client,
+        old,
+        (format!("work-{index}"), format!("file-{index}")),
+      );
+      submitted
+    })
+    .collect();
+  let Some(fresh) = create(&mut client, "fresh") else {
+    for daemon in daemons {
+      daemon.stop();
+    }
+    panic!("create the fresh green");
+  };
+  let mut pairs = Vec::new();
+  let mut answers = Vec::new();
+  for index in 0..MEASURED_PAIRS {
+    let mut on = |green: VolumeId, prefix: &str| {
+      timed_submit(
+        &mut client,
+        green,
+        (
+          format!("{prefix}-work-{index}"),
+          format!("{prefix}-file-{index}"),
+        ),
+      )
+    };
+    // The order alternates, so neither green is always the one measured just after the other.
+    let (older, newer) = if index % 2 == 0 {
+      let older = on(old, "old");
+      (older, on(fresh, "fresh"))
+    } else {
+      let newer = on(fresh, "fresh");
+      (on(old, "old"), newer)
+    };
+    pairs.push((older.2, newer.2));
+    answers.push((index, older.1, newer.1));
+  }
   for daemon in daemons {
     daemon.stop();
   }
-  for (index, _, submitted, _) in &answers {
-    assert_eq!(
-      *submitted,
-      ReplyBody::Submitted {
-        version: Some(index + 1),
-        conflicts: Vec::new(),
-        conflicts_elided: 0,
-        verdict: 0,
-      },
-      "submit {index} is accepted as the next version"
+  for (index, submitted) in history.iter().enumerate() {
+    let version = u64::try_from(index).unwrap() + 1;
+    assert!(
+      matches!(submitted, ReplyBody::Submitted { version: Some(at), .. } if *at == version),
+      "history submit {index} is accepted as version {version}: {submitted:?}"
     );
   }
-  let median_of = |window: &[(u64, ReplyBody, ReplyBody, Duration)]| {
-    let mut waits: Vec<Duration> = window.iter().map(|(_, _, _, waited)| *waited).collect();
+  for (index, older, newer) in &answers {
+    assert!(
+      matches!(older, ReplyBody::Submitted { version: Some(at), .. } if *at == HISTORY_SUBMITS + index + 1),
+      "the old green's measured submit {index} is accepted as its next version: {older:?}"
+    );
+    assert!(
+      matches!(newer, ReplyBody::Submitted { version: Some(at), .. } if *at == index + 1),
+      "the fresh green's measured submit {index} is accepted as its next version: {newer:?}"
+    );
+  }
+  let median = |pick: fn(&(Duration, Duration)) -> Duration| {
+    let mut waits: Vec<Duration> = pairs.iter().map(pick).collect();
     waits.sort();
     waits.get(waits.len() / 2).copied().unwrap_or(Duration::MAX)
   };
-  let early = median_of(answers.get(..WINDOW).unwrap_or_default());
-  let late = median_of(
-    answers
-      .get(answers.len().saturating_sub(WINDOW)..)
-      .unwrap_or_default(),
-  );
+  let (old_median, fresh_median) = (median(|pair| pair.0), median(|pair| pair.1));
+  let (positive, ranked) = signed_rank(&pairs);
+  let bound = signed_rank_bound(ranked);
   eprintln!(
-    "submit answers at f = 1 over {SUBMITS} versions: early median {early:?}, late median {late:?}"
+    "submit answers at f = 1, {MEASURED_PAIRS} pairs: the green {HISTORY_SUBMITS} versions in, median {old_median:?}; \
+     the fresh green, median {fresh_median:?}; signed-rank W+ {positive} of {ranked} ranked, bound {bound:.1}"
   );
   assert!(
-    late <= early * SLOWER_AT_MOST + SLACK,
-    "a submit late in the green's history is answered as fast as an early one: early median {early:?}, late median \
-     {late:?} over {WINDOW} submits each"
+    positive <= bound,
+    "a submit late in the green's history is answered as fast as an early one: W+ {positive} over {ranked} pairs \
+     passes {bound:.1} (medians {old_median:?} against {fresh_median:?})"
   );
 }
 
