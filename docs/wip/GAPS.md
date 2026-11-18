@@ -1199,6 +1199,20 @@
 >   itself, `W`, is still a fixed budget (R3 debt). Found on
 >   the way: a Windows channel (a `Sid`) can never attest a consumer (`verify_attestation` takes a uid only), and two
 >   server unit tests of landing fail on Windows, where CI does not run them. Record: `docs/bugs/2026-11-06-a-cross-shard-wait-lost-a-starved-shards-answer.md`.
+>   **C+D, done for the forward lane's stall budget (2026-11-09, loadtest-scale, on the supervisor's ruling):** a
+>   forward batch's quiet was the wall clock on the origin's control shard, so a starved origin gave up its forwards to
+>   a live owner (clients' false-death runs: 20 to 25 given up against 2 begun, refused after 10 to 12 s). It is now
+>   counted on the lane's poll clock, credited by the driver's turns, each up to the larger of a pace and the CPU its
+>   shard ran, so a starved shard is told from an idle or a busy one; the wall still bounds it at the failover SLO
+>   (`forward_lane::Quiet`). `a_starved_origin_keeps_its_forward_to_a_live_owner`, b's control
+>   shard at nice 19 beside two spinners: main gave up 2 to 1,208 batches in 6 of 6 runs, the fix none
+>   (`docs/bugs/2026-11-09-a-starved-origin-gave-up-its-forwards-to-a-live-owner.md`). Still open in C+D: the client's
+>   own reply deadline (clients) and the location budget's wall (`verbs::locate_within_budget`).
+>   Its cost, about 60 ms at the median on a deaf session's first answer (142 against 84 ms), is in BENCHMARKS beside the
+>   A/B. **Unexplained, kept open:** one run of the dead-session test missed its 1.1 s bound at 1.33 s (adacachy2, load
+>   41, `2577aa61` with an uncommitted diagnostic: a probe client's 20 s Status read through b, issued just after the
+>   deafness, its test thread blocked in it). The other 4 runs with that probe answered in 118 to 198 ms, and 6 runs
+>   without it in 60 to 205 ms. Not reproduced; a recurrence in a gate run is the data point to chase.
 
 > **A-190's purge client leaves the daemon's process (2026-11-06, fixed); the sweep for the rest (open).** No daemon
 > thread opens a path on a volume the daemon serves (§4.6). The coherent purge's opens, writes and reads now run in a
