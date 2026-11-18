@@ -258,11 +258,16 @@
 >   retired false; ... retired false, counted 0; held at the end [Ok(true), Ok(true)]`, 860 s at load 57 to 91), and
 >   green with the fix on the same Mac (macOS arm64, debug): 6.91 s at load 11 to 37 on 7c6faee27, and 8.56 s at load
 >   108 merged with main b7c294959. Both routes retired on both survivors, counted twice. Still held, A-288's open list:
->   - a route to a green destroyed, or lost to a second takeover it cannot survive (GAP-A9-7), while the route is
->     kept: the green has no owner to answer;
->   - a route to a green its successor gave up on (the give-up after the failover SLO's attempts, d3f4ddbe2): the green
->     is never served, so its shard answers no question and the route stays, though nothing it leads to can answer.
->     The next piece answers such a green from its partition's count;
+>   - a route to a green destroyed (a given-up one too, which is then neither served nor `unrecovered`), or lost to a
+>     second takeover it cannot survive (GAP-A9-7), while the route is kept: the green has no owner to answer;
+>   - ~~a route to a green its successor gave up on~~ (the give-up after the failover SLO's attempts, d3f4ddbe2):
+>     **ended the same day.** The green was never served, so its shard answered no question and the route stayed, though
+>     nothing it led to could answer. Now the green's shard answers for a green it holds `unrecovered` too, from its
+>     partition's count, which is final there; a green whose takeover is still pending is refused as before. Red first,
+>     on a lone node with a planted green given up naming its chain: the route kept, all 111 questions refused, 14.4 s
+>     at load 33 to 37. Green: refused at all 10 questions while the green was pending and kept at every read, then
+>     retired at the first question after the give-up, its tombstone recorded and retired, 5.7 s at load 48 to 52
+>     (`a_route_to_a_green_its_successor_gave_up_on_is_retired`);
 >   - a route whose completion its client never acknowledges (a client of another node that died, or one that never
 >     writes to the green again), as the completion record itself is: only an acknowledgement or a client lease ends
 >     either, and RIFL's client leases are not built;

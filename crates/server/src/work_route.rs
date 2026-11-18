@@ -22,10 +22,12 @@
 //! catalogs to its pending tombstones, so the two stages AUD-29-43 ships for a destroyed volume (`crate::tombstone`) drop
 //! every holder's copy of the work's registers, and the adopter's own copies go when the tombstone retires.
 //!
-//! **What is never answered "none".** Only the shard that serves the green answers, and only once it serves it: the
-//! takeover recorded every adopted completion in the same turn the green began to be served
-//! (`verbs::materialize_taken_over_green`). A green pending materialization, owned elsewhere or not found gives no
-//! answer, and the route stays to be asked again the next period; so does a question refused or unanswered.
+//! **What is never answered "none".** Only the green's shard answers, and only once its count is final: once it serves
+//! the green, since the takeover recorded every adopted completion in the same turn the green began to be served
+//! (`verbs::materialize_taken_over_green`), or once the green is `unrecovered`: a takeover given up after the failover
+//! SLO's attempts (`fleet::give_up_taken_over`) recorded none and never will, and a recovery that could not rebuild the
+//! green left its partition's records as they were. A green pending materialization, owned elsewhere or not found gives
+//! no answer, and the route stays to be asked again the next period; so does a question refused or unanswered.
 //!
 //! **Bounds.** A question names at most [`WORKS_PER_QUESTION`] works, so its encoding and the answering shard's work are
 //! bounded; a node keeps at most the work catalogs it adopted, each asked once a period. An owner that leaves a question
@@ -34,13 +36,12 @@
 //! record plane's coordinator, and an idle node takes no wakeup for it.
 //!
 //! **Not yet.** A green destroyed, or lost to a second takeover it cannot survive (GAP-A9-7), while a route to it is
-//! kept leaves that route held: the green has no owner, so no answer comes. So does a green its successor gave up on: it
-//! is never served, so its shard answers nothing, though it recorded no completion the route could reach. A completion
-//! its client never acknowledges (a client of another node that died, or one that never writes to the green again)
-//! keeps its route as it keeps the record itself: only an acknowledgement or a client lease ends either, and RIFL's
-//! client leases are not built. And an adopter that restarts warm gets its holder copies back but not the routes it
-//! kept (`pending_catalogs` starts empty), so it neither re-places nor retires them: A-255's own gap, found by reading
-//! (GAPS, A-288's entry).
+//! kept leaves that route held: the green has no owner, so no answer comes; so does a given-up green that is then
+//! destroyed, which leaves it neither served nor `unrecovered`. A completion its client never acknowledges (a client
+//! of another node that died, or one that never writes to the green again) keeps its route as it keeps the record
+//! itself: only an acknowledgement or a client lease ends either, and RIFL's client leases are not built. And an
+//! adopter that restarts warm gets its holder copies back but not the routes it kept (`pending_catalogs` starts
+//! empty), so it neither re-places nor retires them: A-255's own gap, found by reading (GAPS, A-288's entry).
 
 use std::collections::BTreeMap;
 
@@ -119,7 +120,8 @@ pub(crate) struct WorkRoutes {
 }
 
 /// Wakes the keeper: a takeover adopted a work's catalog record, a route this node now keeps (`takeover::record_adoption`).
-pub(crate) fn nudge(state: &mut ShardState) {
+/// Called on the control shard, where the keeper runs; a test that plants a route there calls it as the adoption does.
+pub fn nudge(state: &mut ShardState) {
   state.work_routes.nudged = true;
   if let Some(waker) = state.work_routes.waker.take() {
     waker.wake();
@@ -343,14 +345,17 @@ async fn answer_on_green_shard(control: u16, question: Question) -> Option<Vec<b
 }
 
 /// On the green's shard: for each work of `question`, whether this partition retains a completion of its submits that
-/// only its route reaches, or `None` (counted) when this shard does not serve the green as its owner, since then what it
-/// retains says nothing of what the green's owner holds (module docs).
+/// only its route reaches, or `None` (counted) when this shard does not answer for the green as its owner, since then
+/// what it retains says nothing of what the green's owner holds (module docs). It answers for a green it serves, and for
+/// one its takeover gave up on or its recovery could not rebuild (`unrecovered`): neither records an adopted completion
+/// from then on, so the partition's count is final. A green whose takeover is still pending is neither, and is refused.
 fn held_completions(state: &mut ShardState, question: &Question) -> Option<Vec<bool>> {
   let green = DbVolumeId {
     bytes: question.green,
   };
   let owner = state.fleet.object_owner(ObjectId(question.green));
-  if !state.greens.contains_key(&green) || owner.is_some_and(|owner| owner != state.fleet.host()) {
+  let answers = state.greens.contains_key(&green) || state.unrecovered.contains_key(&green);
+  if !answers || owner.is_some_and(|owner| owner != state.fleet.host()) {
     state.count(NOT_SERVED_HERE, 1);
     return None;
   }
