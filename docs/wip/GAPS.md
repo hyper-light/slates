@@ -17805,8 +17805,9 @@ suite on adacachy2 and 1 of 3 of the stack's (the supervisor's gate); alone it p
   a ledger's every position (`Acceptor::accepted`, never compacted for a merge chain), and the takeover's share stays
   open while the green is pending (A-345's `takeover::materializing`), so its holders still authorize the question.
   Test: `a_successor_two_versions_behind_adopts_the_versions_between_and_serves_the_green`
-  (`crates/server/tests/fleet.rs`), with the db's `a_ledger_is_adopted_position_by_position_in_order`, the codec's
-  round trip and hostile input, and `an_acceptor_reports_a_ledgers_positions_in_a_range`.
+  (`crates/server/tests/fleet.rs`; red with the catch-up skipped: waited on its chain 100 periods, given up), with the
+  db's `a_ledger_is_adopted_position_by_position_in_order`, the codec's round trip and hostile input, and
+  `an_acceptor_reports_a_ledgers_positions_in_a_range`.
 - **Open (A-364): a held position never yields to a higher epoch.** `Acceptor::check` refuses a record whose value
   differs from the one a holder already accepted at that position (`ConflictingPosition`), where the model's acceptor
   overwrites a lower-epoch value (Paxos per position). A position whose divergent value was never committed (two

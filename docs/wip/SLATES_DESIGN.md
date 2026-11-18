@@ -26719,8 +26719,10 @@ test's ledger), `crates/db/src/register.rs` (`PositionChanges`, `Acceptor::track
 
 Held by `a_successor_two_versions_behind_adopts_the_versions_between_and_serves_the_green` (`crates/server/tests/fleet.rs`:
 the successor withholds versions 3 and 4, the owner dies; it adopts version 3's record, fetches both versions' inputs and
-serves version 4), `a_ledger_is_adopted_position_by_position_in_order` (`crates/db/src/takeover.rs`), the codec's round
-trip and hostile input and `an_acceptor_reports_a_ledgers_positions_in_a_range` (`crates/db/src/register.rs`).
+serves version 4, in about 4 s on the Mac Studio; with the catch-up skipped it waited on its chain 100 periods and gave
+the green up, red before and after main's A-333 rebuilt the adoption), `a_ledger_is_adopted_position_by_position_in_order`
+(`crates/db/src/takeover.rs`), the codec's round trip and hostile input and
+`an_acceptor_reports_a_ledgers_positions_in_a_range` (`crates/db/src/register.rs`).
 
 Applied in the same change to: GAPS (the model table and its toolchain note; the record half's entry; the open
 `ConflictingPosition` item), the model files, `crates/db/src/{register,takeover}.rs`,
