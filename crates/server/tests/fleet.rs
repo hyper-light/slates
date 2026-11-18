@@ -10763,6 +10763,122 @@ fn a_seal_whose_envelope_was_refused_is_started_again_and_places() {
   );
 }
 
+/// Shape: the distinct files of the taken-over sealed volume, each its own chunk, so its envelope's open opens that many.
+const OPENED_CHUNKS: usize = 24;
+/// Format: the successor's count of the owner-shard turns its envelope opens took (`fleet::open_slice`).
+const ENVELOPE_OPEN_SLICES: &str = "fleet.seal.open_slices";
+
+/// The bytes of opened file `index`: distinct for each file, so each is its own chunk.
+fn opened_body(index: usize) -> Vec<u8> {
+  vec![u8::try_from(index).unwrap(); WALKED_FILE_BYTES]
+}
+
+/// A volume of [`OPENED_CHUNKS`] distinct files on `daemons[0]`, shared with the fleet, sealed, its snapshot placed and
+/// its head held by both other nodes: the volume, or what did not hold.
+fn sealed_many_and_held(daemons: &[Daemon], name: &str) -> Result<VolumeId, String> {
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id } = client.call(&scratch(name)) else {
+    return Err("create on the owner".to_owned());
+  };
+  share_with_fleet(&mut client, id, daemons);
+  let attachment = write_attachment(&mut client, id);
+  let written = (0..OPENED_CHUNKS).all(|index| {
+    matches!(
+      client.call(&RequestBody::FsWrite {
+        volume: id,
+        attachment,
+        path: format!("/opened-{index}"),
+        bytes: opened_body(index),
+        mode: 0o644,
+      }),
+      ReplyBody::FsDone { .. }
+    )
+  });
+  let detached = client.call(&RequestBody::Detach { attachment });
+  let snapshot = snapshot_taken(&mut client, id).ok_or("snapshot on the owner")?;
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let placed = poll_snapshot_placed(&observed, &mut client, id, snapshot);
+  let held = poll_all_hold(&[&daemons[1], &daemons[2]], ObjectId(id.bytes));
+  if written && matches!(detached, ReplyBody::Detached) && placed && held {
+    Ok(id)
+  } else {
+    Err(format!(
+      "written {written}, detached {detached:?}, placed {placed}, held by both others {held}"
+    ))
+  }
+}
+
+/// A-347 (§4.8 "Promotion and takeover", §4.10, CLAUDE.md "Bounded work everywhere"): a takeover opens a sealed volume's
+/// envelope in turns of the successor's owner shard, a chunk at least a turn, never the whole archive in one turn. Do:
+/// three nodes at `f = 1`; on a, one volume of 24 files of distinct bytes (24 distinct chunks), shared with the fleet,
+/// sealed and held by both other nodes; cut the survivors' seal turns to one unit
+/// (`Daemon::inject_seal_walk_quantum(Some(0))`); stop a for good; once the survivor the volume ranks first serves it,
+/// read every file through it and read its shard's longest step. Expect the volume served, every file read back, at
+/// least 24 turns of the open on the successor (a chunk a turn) and its longest step under the watchdog's window
+/// (`LIVENESS_BUDGET_NS`). Before, the open ran inside the turn that made the volume: one turn whatever the volume, about
+/// a second a GiB.
+#[test]
+fn a_takeovers_envelope_is_opened_in_turns_and_served() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, mut daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let id = match sealed_many_and_held(&daemons, "opened") {
+    Ok(id) => id,
+    Err(why) => {
+      for daemon in daemons {
+        daemon.stop();
+      }
+      panic!("setup: {why}");
+    }
+  };
+  for daemon in &daemons[1..] {
+    daemon.inject_seal_walk_quantum(Some(0)).unwrap();
+  }
+  let successor =
+    rendezvous_first(&[hosts[1], hosts[2]], ObjectId(id.bytes)).expect("a survivor takes over");
+  let index = usize::from(successor != hosts[1]);
+  let before = summed_counters(&daemons[index + 1])
+    .get(ENVELOPE_OPEN_SLICES)
+    .copied()
+    .unwrap_or(0);
+  daemons.remove(0).stop();
+  let instance = daemons[index].instance().to_owned();
+  let served = poll_status_answers(&daemons.iter().collect::<Vec<_>>(), &instance, id);
+  let mut reader = Client::connect(&instance);
+  let read: Vec<bool> = (0..OPENED_CHUNKS)
+    .map(|file| {
+      let reply = read_at_head(&mut reader, id, &format!("/opened-{file}"));
+      matches!(reply, ReplyBody::ReadBytes { bytes } if bytes == opened_body(file))
+    })
+    .collect();
+  drop(reader);
+  let turns = summed_counters(&daemons[index])
+    .get(ENVELOPE_OPEN_SLICES)
+    .copied()
+    .unwrap_or(0)
+    .saturating_sub(before);
+  let longest_step_ns = control_longest_poll_ns(&daemons[index]);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "open in turns: served {served}, {turns} open turns for {OPENED_CHUNKS} chunks, read {read:?}, the successor's \
+     longest step {longest_step_ns} ns"
+  );
+  assert!(served, "the successor serves the volume");
+  assert!(
+    read.iter().all(|read| *read),
+    "every file reads back through the successor: {read:?}"
+  );
+  assert!(
+    turns >= u64::try_from(OPENED_CHUNKS).unwrap(),
+    "the envelope was opened a chunk a turn: {turns} turns for {OPENED_CHUNKS} chunks"
+  );
+  assert!(
+    longest_step_ns < LIVENESS_BUDGET_NS,
+    "the successor's longest step {longest_step_ns} ns stayed under the watchdog's window {LIVENESS_BUDGET_NS} ns"
+  );
+}
+
 /// Shape: the distinct files of the wrapped volume, each its own chunk, so its envelope seals that many chunks.
 const WRAPPED_CHUNKS: usize = 24;
 /// Format: the owner's count of the owner-shard turns its envelope wraps took (`fleet::wrap_slice`).
