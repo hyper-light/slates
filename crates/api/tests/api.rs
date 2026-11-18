@@ -32,8 +32,9 @@ use slates_api::{
 use slates_machine::{MachineError, MachineProfile, ProfileOptions};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
-/// A software SSH signer (A-321), shared with the daemon's own signed-work tests.
+/// A software SSH signer (A-321), shared with the daemon's own signed-work tests; not every helper is used here.
 #[path = "../../server/tests/common/signer.rs"]
+#[allow(dead_code)]
 mod signer;
 
 /// Shape: each probe's wall budget for the tests' machine profile (milliseconds); measured once per process.
