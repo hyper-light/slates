@@ -205,5 +205,6 @@ impl Hold {
   }
 }
 
-/// Derived: one hold and one release per entry admitted by the attachment-derived bound.
+/// Derived: one hold and one release per entry admitted by the attachment-derived bound. A record's replacement
+/// (A-423) waits for its answer as a hold does, a daemon's exchanges one at a time, so it adds no message waiting at once.
 const MESSAGES_PER_ENTRY: usize = 2;

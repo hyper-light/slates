@@ -54,7 +54,7 @@ pub(crate) fn drain(s: &mut ShardState) {
   }
   let requested = s.store.recall_gate.take_requested();
   let now = futures::now_ns();
-  let lease = s.config.failover_slo_ns;
+  let lease = crate::nfs::v4_lease_ns(s);
   let Some(files) = s.nfs_v4_files.as_mut() else {
     return;
   };

@@ -1711,7 +1711,7 @@ async fn serve_local_held(
       (
         s.store.recall_gate.refusals(),
         s.store.recall_gate.generation(),
-        s.config.failover_slo_ns,
+        v4_lease_ns(s),
       )
     });
     let (Some(seen), Some((refusals, generation, lease))) = (seen, gate) else {
@@ -2362,11 +2362,19 @@ impl compound::Backend for RoutedBackend {
 /// which authorizes nothing.
 const NO_CAPABILITY: MountCapability = (0, [0u8; 16]);
 
-/// The NFSv4 limits this shard's listener runs under (§4.6 A-35, `config::nfs_v4_caps`): the lease the
-/// operator's failover SLO (a client silent through a whole failover may be evicted when the table is
-/// full); requests and replies up to the v3 transfer ceiling plus one compound header, and a kept reply
-/// up to one compound header (a larger reply is an idempotent READ or READDIR, whose retry is resent as
-/// new).
+/// The NFSv4 lease (RFC 8881 §8.3; A-425): what the listener grants every client and advertises as `FATTR4_LEASE_TIME`,
+/// the wait a recalled delegation is owed before it is revoked and after which a recalled file may be delegated again
+/// (§10.4.5, §10.4), the wait an NFSv3 write the recall gate refused gives the delegation's return, and the wait a
+/// landing gives it (`landing::recall_before_finish`). Every one of them reads this, so they are one number by
+/// construction: `config::NfsV4Caps::lease_ns`, derived from the idle Linux client's renewal floor and a liveness window.
+pub(crate) fn v4_lease_ns(s: &ShardState) -> u64 {
+  s.config.nfs_v4.lease_ns
+}
+
+/// The NFSv4 limits this shard's listener runs under (§4.6 A-35, `config::nfs_v4_caps`): the lease
+/// ([`v4_lease_ns`]: a client silent past it may be evicted when the table is full); requests and replies up to the
+/// v3 transfer ceiling plus one compound header, and a kept reply up to one compound header (a larger reply is an
+/// idempotent READ or READDIR, whose retry is resent as new).
 pub(crate) fn v4_limits(s: &ShardState) -> Limits {
   let caps = s.config.nfs_v4;
   let size = slates_bridge_nfs::procedures::MAX_TRANSFER + compound::COMPOUND_HEADER_BYTES;
@@ -2381,7 +2389,7 @@ pub(crate) fn v4_limits(s: &ShardState) -> Limits {
       max_operations: size / compound::MIN_OPERATION_BYTES,
       max_requests: caps.slots,
     },
-    lease_ns: s.config.failover_slo_ns,
+    lease_ns: v4_lease_ns(s),
   }
 }
 
@@ -3811,5 +3819,51 @@ mod tests {
       .unwrap();
     runtime.run_until_idle();
     assert_eq!(received.try_recv().unwrap(), None);
+  }
+
+  /// RFC 8881 §8.3, A-425. Do: on a daemon whose operator set the failover SLO to one liveness window, take the limits
+  /// its NFSv4 listener runs under and a client table of one under them; register a client, then have a second client
+  /// ask the full table for room just before the first's next renewal were it an idle Linux client (its renewal floor
+  /// after its last renewal, delivered within a liveness window), and again once the first has been silent a whole
+  /// lease. Expect: the first ask refused `NFS4ERR_DELAY` with the idle client kept, and the second granted in its
+  /// place. Before, the lease was the operator's failover SLO, so with a short one every idle Linux client lapsed
+  /// between two of its renewals, and a full table dropped a live client's state.
+  #[test]
+  fn an_idle_linux_client_keeps_its_nfs_v4_lease_whatever_the_failover_slo() {
+    use slates_bridge_nfs::v4::session::{ExchangeId, Sessions};
+    use slates_bridge_nfs::v4::types::VERIFIER_SIZE;
+    let limits = crate::daemon::audit_on_shard_configured(
+      |s| v4_limits(s),
+      |config| config.failover_slo_ns = crate::daemon::LIVENESS_BUDGET_NS,
+    );
+    let mut table = Sessions::new(
+      1,
+      Limits {
+        max_clients: 1,
+        ..limits
+      },
+    );
+    let ask = |owner: &[u8]| ExchangeId {
+      verifier: [1; VERIFIER_SIZE],
+      owner: owner.to_vec(),
+      principal: 0,
+    };
+    // The table's clock starts anywhere; the client's last renewal is its registration.
+    let born = 0;
+    let idle = table.exchange_id(&ask(b"idle"), born).unwrap();
+    let before_its_renewal =
+      born + crate::config::NFS_V4_CLIENT_RENEWAL_FLOOR_NS + crate::daemon::LIVENESS_BUDGET_NS - 1;
+    assert_eq!(
+      table.exchange_id(&ask(b"second"), before_its_renewal),
+      Err(Nfsstat4::Delay),
+      "the full table kept the idle client: its lease outlasts the gap between its renewals"
+    );
+    assert!(table.holds_client(idle.clientid));
+    let past_its_lease = born + limits.lease_ns + 1;
+    assert!(
+      table.exchange_id(&ask(b"second"), past_its_lease).is_ok(),
+      "a client silent a whole lease makes room"
+    );
+    assert!(!table.holds_client(idle.clientid));
   }
 }
