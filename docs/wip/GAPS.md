@@ -15465,7 +15465,7 @@ Mac, binaries built on `d61c3be2`):
   a panic injected into one honest client, the test failed in 12.85 s, where main's ran on past a 120 s bound
   (adacachy).
 
-### 2026-11-09: a healthy live `fsync` was refused at a wall-clock deadline under load — fixed, a starved owner too (A-292; on main 2026-11-17)
+### 2026-11-09: a healthy live `fsync` was refused at a wall-clock deadline under load — fixed, a starved owner and an owner slow to ask too (A-292, A-301; on main 2026-11-17)
 
 `a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it` answered the `fsync` made with every candidate
 running `EIO`: 1 in 6 runs on main, 2 in 9 on raft-7 (raft's report, load 36–145 on adacachy). Made to fail on demand on
@@ -15515,13 +15515,21 @@ Open:
 - The lanes to each holder are cut at a hard liveness budget (`fleet::live_budget`), and a cut holder waits for the record
   period or its session's return. Under load such a cut can outlast a window, which the wait's judgment cannot tell from
   silence.
-- Hypothesis, not yet seen in a give-up record: a window can be silent through the owner's own delay in asking. A fresh
-  volume's log is shipped to a holder only once the coordinator has placed its catalog there (`pending_sends`'
-  `catalogued` gate), and its head waits for the coordinator's period behind that period's other commits, each awaited
-  in turn (`ship_shard_heads`); a coordinator kept past a window that way leaves a window with nothing asked, so nothing
-  heard, through no holder's fault. The receiver's two waits (A-292) prove the owner has read what came, not that it
-  asked. A give-up record from a run under load that shows the head or catalog unplaced with no lane in flight would
-  confirm it.
+- ~~Hypothesis: a window can be silent through the owner's own delay in asking~~ — closed by construction 2026-11-17
+  (A-301), not yet seen in a give-up record. A fresh volume's log is shipped to a holder only once the coordinator has
+  placed its catalog there (`pending_sends`' `catalogued` gate), and its head waits for the coordinator's period behind
+  that period's other commits, each awaited in turn (`ship_shard_heads`); a coordinator kept past a window that way
+  left a window with nothing asked, so nothing heard, through no holder's fault, and the receiver's two waits (A-292)
+  prove the owner has read what came, not that it asked. Now each live volume keeps when its owner first asked a holder
+  something since it last heard anything (`live_ship::LiveVolume::unanswered_since_ns`: a lane opened, a head's or
+  catalog's placement round sent), and a silent window is confirmed only once that ask is a window old. Red first by use
+  of the rule (`a_window_in_which_the_owner_asked_nothing_is_given_up_only_once_its_ask_is_a_window_old`,
+  `an_owner_that_never_asks_holds_the_verdict_only_to_the_total_bound`) and of the device
+  (`a_guests_fsync_is_not_refused_while_its_owner_has_asked_its_holders_nothing`). A give-up record now names the oldest
+  unanswered ask's age, so a run under load tells this cause from a holder's silence. Still open of it: a pair key's
+  delivery is not tracked as an ask (it is per owner shard and candidate), so a wait on it alone holds to the failover
+  SLO; and the ask is kept per volume, not per holder, so a stopped candidate's re-sent lane can stand in for an ask the
+  owner has not yet made of a live one (two faults at once, where the rule is A-292's alone).
 - The virtio-fs serve loop times only the oldest held `FSYNC`'s next look (`serve_round`, `durable_oldest`); under
   windows a younger reply's look can come first, so its verdict waits for the oldest's look, at most a window late. Never
   a refusal, only a late one; the FUSE mount and WinFsp take the soonest look over every held reply.
