@@ -463,19 +463,25 @@
 >   writes (AC-8.16's other half); a move carrying snapshots other than the head; a multi-runner test with injected
 >   faults. The capture's own owed parts: admission reserving its cost ahead, a large file read across slices rather
 >   than whole in one, and the report of bytes read and retained and of the elapsed cost (§4.15's status).
-> - **Open, blocks this entry's landing (found 2026-11-18 by `a_move_whose_target_dies_at_the_switch_is_served_by_its_successor`,
->   red 3 of 3 after main ef7f0915a was merged, green before on c73211b0f):** the target dies at the switch and the old
->   owner a is its takeover's successor. a's control shard saw the switched move's exception gone (the takeover hands
->   the object back to its creator) and released its frozen copy (`fleet.move.released` 1, `fleet.move.superseded` 0)
->   before the takeover registered the object pending (the `adopted_back` guard in `moves::drive_outgoing` reads
->   `pending_materializations`, which races the round); the materialization then held no content and fetched only
->   from the head's recorded holder, the dead target (`fleet.fetch.no_holder_session` 100), until it was given up
->   (`fleet.materialize.given_up` 1): every verb answers `NotRecovered { TakeoverIncomplete { waited_on: "content" } }`.
->   Owed, in this order: a switched move whose exception is gone while its target left the membership is a hand-back,
->   so the old owner waits (never releases) for its takeover; that takeover reuses the frozen copy when the adopted
->   head names the frozen head's manifest (a thaw, no fetch) and supersedes it only for a newer head; and the old
->   owner's frozen content is served by identity (or the move places f + 1 copies besides the old owner's), so a
->   successor other than the old owner recovers when the target was the only other holder.
+> - **Fixed (2026-11-18): a move whose target dies at the switch is served by its successor.**
+>   `a_move_whose_target_dies_at_the_switch_is_served_by_its_successor` was red 3 of 3 on the Mac Studio after main
+>   ef7f0915a was merged, and again on a07bc2587 (the merge of main 3915879e3). Its log put the cause elsewhere than
+>   first written here: the old owner a was the dead target's successor (`fleet.takeover.adopted` 2), and its
+>   materialization gave the volume up waiting on content (`fleet.fetch.no_holder_session` 100,
+>   `fleet.materialize.given_up` 1) before it released its frozen copy (the give-up logged first, then the release),
+>   so the release race named here before was not the cause. A seal leaves a head held by its owner and `f` others,
+>   the owner counting its own live copy; at `f = 1` the moved head named a and b alone, and after the switch a's
+>   frozen copy answers no fetch, so b's death left no copy any successor could fetch (a successor c would have failed
+>   the same way while a let its copy go at c's confirmation). Now a move reports only a head held by `f + 1` members
+>   other than the old owner, placing it again on the cohort without the owner at the next sequence and republishing
+>   it there when short (A-291's handoff, `Heal::Handoff`, counted `fleet.move.handoff_begun`, which the test now
+>   requires); the healer passes a frozen copy by (it had republished the frozen copy's head after b died,
+>   `fleet.heal.named_gone` 1, `fleet.heal.republished` 1); and a takeover lets a frozen copy go before it adopts the
+>   volume's keys, which the release erases.
+> - **Owed (the handoff's bound):** the frozen phase lasts as long as the handoff's copy takes, and an unreported move
+>   is held to the failover SLO (10 s by default), so a volume whose content cannot be copied to one more host within it
+>   is refused `MoveRefusal::Unplaced` and thaws. The fix is to place the head off the owner before freezing (the volume
+>   still writable, its later changes then a small incremental seal); not measured yet.
 > - **Owed before kiln's workspaces switch (found 2026-11-18 reading `crates/land/src/verdict.rs`, not yet by a
 >   test):** a clone of a captured base lands as a scratch volume does. Its record names no base and its files hold no
 >   witness (a capture makes each body the volume's own, and the witness lived in the base body), so every entry of

@@ -5282,10 +5282,13 @@ fn a_move_completes_when_its_old_owner_dies_at_the_switch() {
 
 /// A-291 (§4.10, the failure matrix's "migration in flight when the new host dies"): the new owner dies at the switch.
 /// Three daemons at `f = 1`. Do: on a, write two files into a volume and move it to b until the move is done; stop b at
-/// once; wait until the survivors retire it; read both files through a's client. Expect the volume served whole by b's
-/// takeover successor, whichever survivor that is: when it is a itself, its takeover's adoption supersedes the copy it
-/// froze for the move (`fleet.move.superseded`); when it is c, a releases its copy (`fleet.move.released`); either way
-/// a's frozen copy is gone and never thawed.
+/// once; wait until the survivors retire it; read both files through a's client. Expect the move to have handed over a
+/// head held by two hosts besides a (`fleet.move.handoff_begun`: a's seal leaves its head held by a and one other, and
+/// a frozen copy serves no fetch); and the volume served whole by b's takeover successor, whichever survivor that is:
+/// when it is a itself, its takeover's adoption supersedes the copy it froze for the move (`fleet.move.superseded`);
+/// when it is c, a releases its copy (`fleet.move.released`); either way a's frozen copy is gone and never thawed.
+/// Before the handoff (red 3 of 3 on the Mac Studio, 2026-11-18) a was the successor, the head named a and b alone, and
+/// a's takeover fetched only from b, dead, until it gave the volume up (`fleet.materialize.given_up` 1).
 #[test]
 fn a_move_whose_target_dies_at_the_switch_is_served_by_its_successor() {
   let _serial = serialize_fleet_tests();
@@ -5329,6 +5332,9 @@ fn a_move_whose_target_dies_at_the_switch_is_served_by_its_successor() {
         == 1
     })
   });
+  let handed_off = daemons[0]
+    .refusals_on_every_shard()
+    .map(|counts| counts.get("fleet.move.handoff_begun").copied().unwrap_or(0));
   let described = describe(&fleet);
   drop(client_a);
   for daemon in daemons {
@@ -5337,6 +5343,10 @@ fn a_move_whose_target_dies_at_the_switch_is_served_by_its_successor() {
   assert!(
     moved,
     "the move was done (answers: {answers:?}); {described}"
+  );
+  assert!(
+    matches!(handed_off, Ok(begun) if begun >= 1),
+    "a handed the head over held by two hosts besides itself: {handed_off:?}; {described}"
   );
   assert!(retired, "the survivors retired b; {described}");
   assert!(

@@ -3152,9 +3152,13 @@ fn heal_one_placed_snapshot(state: &mut ShardState, local: HostId, created_unix:
     .find_map(|(id, handle)| {
       let object = ObjectId(id.bytes);
       let record = state.db.partition().volume(*id)?;
+      // A copy frozen for a move (A-291) is the move's to place: before the switch its handoff places it
+      // ([`start_move_handoff`]), and after it the volume is another member's, whose records a heal from here would
+      // contend with (a frozen copy's heal republished its head once its target died, 2026-11-18).
       if record.epoch == 0
         || record.state == VolumeState::Destroying
         || state.seals.contains_key(&object)
+        || crate::moves::frozen(state, slates_ipc::protocol::VolumeId { bytes: id.bytes })
       {
         return None;
       }
@@ -3201,6 +3205,12 @@ enum Heal {
   Restore(Vec<HostId>),
   /// Place on the current cohort at the next sequence and republish the head there naming that set.
   Replace,
+  /// Place on the current cohort without this owner at the next sequence and republish the head there naming that set
+  /// ([`start_move_handoff`], A-291): a volume moving to another member is handed over with its head held by `f + 1`
+  /// hosts other than the member it leaves. This owner's own copy is its content only while it owns the volume: once
+  /// the configuration names the new owner, every successor fetches by identity from the holders the head names, and
+  /// this node's frozen copy serves no fetch, so the owner is neither a candidate nor counted.
+  Handoff,
 }
 
 /// The heal for an owned snapshot whose recorded placement names `region` (§4.10 "the healer"), as [`heal_decision`]
@@ -3415,9 +3425,11 @@ fn start_seal(
   created_unix: u64,
   healing: Option<Heal>,
 ) -> bool {
-  // A replace puts its content at the next sequence, ahead of every holder's records, since a holder refuses a put
-  // at the head's own sequence that the head there does not name it for (`content_retention::admits`).
-  let put_sequence = if matches!(healing, Some(Heal::Replace)) {
+  // A replace (and a move's handoff) puts its content at the next sequence, ahead of every holder's records, since a
+  // holder refuses a put at the head's own sequence that the head there does not name it for
+  // (`content_retention::admits`).
+  let republish = matches!(healing, Some(Heal::Replace | Heal::Handoff));
+  let put_sequence = if republish {
     let Some(next) = sequence.checked_add(1) else {
       state.count(HEAL_EPOCH_EXHAUSTED, 1);
       return false;
@@ -3446,6 +3458,11 @@ fn start_seal(
   // names and a successor fetches from, and a head is never rewritten at its sequence.
   let mut content = match &healing {
     Some(Heal::Restore(holders)) => Placement::of(holders),
+    Some(Heal::Handoff) => {
+      let mut cohort = state.fleet.configuration().place_content(object);
+      cohort.candidates.retain(|host| *host != local);
+      cohort
+    }
     Some(Heal::Replace) | None => state.fleet.configuration().place_content(object),
   };
   content.acked = if content.candidates.contains(&local) {
@@ -3467,13 +3484,48 @@ fn start_seal(
       rounds: 0,
       first_round_at_ns: None,
       healing: healing.is_some(),
-      republish: matches!(healing, Some(Heal::Replace)),
+      republish,
       refilled: Vec::new(),
       records_acked: Vec::new(),
       shipment: None,
     },
   );
   true
+}
+
+/// Begins the handoff of a moving volume's head on its owner shard (A-291; [`Heal::Handoff`]): the head's content put at
+/// the next sequence on this owner's cohort without this node, and the head republished there naming the hosts that took
+/// it, so the head a move hands over is held by `f + 1` hosts other than the member it leaves (`crate::moves`). `false`,
+/// nothing begun, while a seal job for the volume is under way (a handoff begun earlier among them) or when its head
+/// cannot be walked ([`start_seal`] counts that).
+pub(crate) fn start_move_handoff(state: &mut ShardState, id: DbVolumeId) -> bool {
+  let object = ObjectId(id.bytes);
+  if state.seals.contains_key(&object) {
+    return false;
+  }
+  let Some(&handle) = state.by_id.get(&id) else {
+    return false;
+  };
+  let Some((head, sequence)) = state
+    .db
+    .partition()
+    .volume(id)
+    .map(|record| (record.head, record.epoch))
+  else {
+    return false;
+  };
+  let local = state.fleet.host();
+  let created_unix = u64::try_from(state.clock.wall_ns()).unwrap_or(0) / NANOS_PER_SECOND;
+  start_seal(
+    state,
+    local,
+    object,
+    handle,
+    head,
+    sequence,
+    created_unix,
+    Some(Heal::Handoff),
+  )
 }
 
 /// Whether `job`'s content is where the job must leave it: a restoring heal once every holder it restores holds it,
@@ -3941,12 +3993,9 @@ fn hedge_targets(hedged: bool, remote: Vec<HostId>, first_round: usize) -> Vec<H
 /// dispatch to settle.
 async fn put_seal_content(origin: u16, local: HostId, work: ContentWork) -> Option<Dispatch> {
   let budget = work.budget;
-  // The first round reaches `f + 1` copies: at home the owner is one of them, so `f` remote candidates; in the
-  // mirror region the owner holds none, so `f + 1`.
-  let owner_copies = match work.track {
-    Track::Home => 0,
-    Track::Mirror => 1,
-  };
+  // The first round reaches `f + 1` copies: where the owner is a candidate (a home seal) it is one of them, so `f`
+  // remote candidates; where it is not (the mirror region, a move's handoff, A-291) it holds none, so `f + 1`.
+  let owner_copies = usize::from(!work.candidates.contains(&local));
   let hedge = usize::try_from(work.quorum.f)
     .unwrap_or(0)
     .saturating_add(owner_copies);
@@ -5307,6 +5356,13 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
           from_live_log: live.is_some(),
         },
       };
+      // A copy this node froze for a move it made (A-291) goes before the volume's keys are adopted: its release erases
+      // the volume's keys with its record (a destroy's cryptographic erase), so a release after the adoption erased the
+      // adopted keys too, and the volume's next seal made keys of its own.
+      if s.moves_out.contains_key(&id) && !crate::moves::supersede_frozen(s, id) {
+        s.count(FROZEN_UNSUPERSEDED, 1);
+        return Err(FROZEN_UNSUPERSEDED);
+      }
       // The volume's lineage key, so this node opens what the dead owner sealed and seals under the same key (A-92
       // pieces 3b and 4c). A head that carried no entry for this node (it acknowledged before its pair arrived) leaves
       // a plain archive's volume to a new key, and an envelope unopened.
@@ -5391,6 +5447,10 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
   // The control shard's state out of reach (its shutdown): nothing more is attempted.
   outcome.unwrap_or(Ok(()))
 }
+
+/// Counter: materializations of a taken-over volume whose frozen copy (a move this node made, A-291) the database would
+/// not let go this period: the volume stays pending and is attempted again next period.
+const FROZEN_UNSUPERSEDED: &str = "fleet.materialize.frozen_unsuperseded";
 
 /// What a taken-over volume's materialization waited on when an attempt could not finish ([`materialize_pending`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

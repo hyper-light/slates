@@ -7257,9 +7257,15 @@ holder duty is balanced by neighbourhood changes; operators keep an explicit mov
 >   directory moves (a clone of a captured base, §4.15, or of a plain volume): its tree is archived whole, and its pin
 >   on its origin's snapshot is given back when its old owner lets it go. It hands over its head (a snapshot
 >   only if the volume changed since), freezes the volume (every other verb answers `Overloaded`, retryable), waits
->   until the head and catalog are placed at `f + 1` of its cohort (a live log durable at its head), captures its own
->   newest records of both registers and reports `Move` with that cohort. The target's neighbourhood must cover the
->   cohort, so the target's takeover could recover the volume.
+>   until the head and catalog are placed at `f + 1` of its cohort (a live log durable at its head) and the head's
+>   content is held by `f + 1` members other than itself, captures its own newest records of both registers and
+>   reports `Move` with that cohort. The target's neighbourhood must cover the cohort, so the target's takeover could
+>   recover the volume. An owner's own copy counts toward its content's placement only while it owns the volume (a
+>   seal leaves the head held by the owner and `f` others): from the switch on, a successor of the new owner fetches
+>   by identity from the hosts the head names, and a frozen copy serves no fetch. So a head short of `f + 1` others is
+>   placed again first, at the next sequence on the cohort without the owner, and republished there naming the hosts
+>   that took it (the handoff, `Heal::Handoff`, the healer's replace with the owner left out; `fleet.move.handoff_begun`).
+>   The healer passes a frozen copy by.
 > - **Switch.** The committed exception names the new owner; every node routes the volume there (a lookup asks the
 >   exception's owner first), every holder takes the new owner's authority, and the old owner's records are refused.
 > - **Adopt.** The new owner runs phase one by name over the recorded cohort (`MOVE_STREAM`, 28): the old owner
@@ -7271,9 +7277,13 @@ holder duty is balanced by neighbourhood changes; operators keep an explicit mov
 >   volume is held by `f + 1` throughout.
 >
 > A move's verb answers `Moving` until the switch and `Moved` from it; the old owner thaws only a move whose target
-> left before any switch, or an unreported one whose records were not placed within the failover SLO
+> left before any switch, or an unreported one whose records or handoff were not placed within the failover SLO
 > (`MoveRefusal::Unplaced`). `a_volume_moved_to_another_member_is_served_there_and_its_old_owner_forwards`
-> (`crates/server/tests/fleet.rs`) moves a volume between three daemons and back to its creator.
+> (`crates/server/tests/fleet.rs`) moves a volume between three daemons and back to its creator;
+> `a_move_completes_when_its_old_owner_dies_at_the_switch` and
+> `a_move_whose_target_dies_at_the_switch_is_served_by_its_successor` stop either side at the switch. The second was red
+> 3 of 3 before the handoff (2026-11-18, the Mac Studio): the old owner was the target's successor, the head named it
+> and the target alone, and its takeover fetched only from the dead target until it gave the volume up.
 > An overlay does not move (its base stays on its source host, "Overlay volumes in a fleet"): a workspace that must move
 > is a clone of a captured base (§4.15 `capture_base`), which `a_clone_of_a_captured_base_moves_and_gives_its_pin_back`
 > moves between three daemons.
@@ -25306,7 +25316,26 @@ stream, the drivers, `MovedForgotten` at a retired tombstone; `takeover.rs`: `ad
     takeover's successor (the creator, so the takeover drops the exception), the old owner's frozen copy would shadow
     what the takeover adopted, writes the target took included: `materialize_taken_over` returned early on the held id.
     The adoption now supersedes the frozen copy (`moves::supersede_frozen`), and a switched move whose exception is gone
-    lets its copy go.
+    lets its copy go. The supersede comes before the takeover adopts the volume's keys (`fleet::materialize`): a
+    release erases a volume's keys with its record, so a release after the adoption erased the keys it had just
+    adopted.
+  - *A head held off the old owner (the handoff).* A seal leaves a head held by its owner and `f` others: the owner
+    counts its own live copy. From the switch on that copy is no owner's: a successor fetches by identity only from the
+    hosts the head names, and a frozen copy answers no fetch. So at `f = 1` a move handed over a head held by the old
+    owner and one other host, often the target, and a target that died at the switch left the content in the frozen
+    copy alone: `a_move_whose_target_dies_at_the_switch_is_served_by_its_successor` was red 3 of 3 (the Mac Studio,
+    2026-11-18; the old owner was the successor and its takeover fetched only from the dead target until it gave the
+    volume up, `fleet.fetch.no_holder_session` 100, `fleet.materialize.given_up` 1), and a successor other than the
+    old owner would have failed the same way while the old owner let its copy go at that successor's confirmation.
+    The move now reports only a head held by `f + 1` members other than the old owner: a head short of them is placed
+    again at the next sequence on the cohort without the old owner and republished there (`Heal::Handoff`, the
+    healer's replace with the owner neither a candidate nor counted; `fleet.move.handoff_begun`), and the healer
+    passes a frozen copy by (a frozen copy's heal had republished its head once its target died). Rejected: reusing
+    the frozen copy in the old owner's own takeover (it serves only the case where the old owner is the successor) and
+    the old owner holding its own content as a holder (its hold outlives no event that would release it when it is
+    outside the new owner's placement). The cost is one more content copy before the switch, the copy the new owner's
+    own seal makes after it in a fleet whose cohorts coincide, and a frozen phase as long as that copy takes: a volume
+    whose handoff outlasts the failover SLO is refused `Unplaced` and thaws (GAPS).
   - *A typed refusal.* Every refusal is `Refusal::MoveRefused { reason }`, a closed `MoveRefusal` a consumer matches
     (Ada, 2026-11-18: responses and errors are closed, typed enums, never strings).
 - **Evidence.** Unit: `a_moves_adoption_is_reported_by_its_new_owner_and_lets_the_member_it_left_go`,
@@ -25315,8 +25344,8 @@ stream, the drivers, `MovedForgotten` at a retired tombstone; `takeover.rs`: `ad
   `a_moved_volume_is_released_whole_and_leaves_no_tombstone` (`crates/db/tests/model.rs`, with recovery);
   `a_move_report_is_proposed_by_its_owner_and_held_to_the_bound` (`crates/cluster/src/config_group.rs`); the
   configuration's round trip and its lying-count and forged-flag tests (`crates/cluster/src/raft_wire.rs`);
-  `the_old_owner_reports_until_the_switch_keeps_its_copy_until_adopted_and_thaws_only_without_a_switch`
-  (`crates/server/src/moves.rs`). By use: `a_volume_moved_to_another_member_is_served_there_and_its_old_owner_forwards`,
+  `the_old_owner_reports_until_the_switch_keeps_its_copy_until_adopted_and_thaws_only_without_a_switch` and
+  `a_move_hands_over_a_head_held_by_f_plus_one_members_besides_its_owner` (`crates/server/src/moves.rs`). By use: `a_volume_moved_to_another_member_is_served_there_and_its_old_owner_forwards`,
   `a_move_completes_when_its_old_owner_dies_at_the_switch` and
   `a_move_whose_target_dies_at_the_switch_is_served_by_its_successor` (`crates/server/tests/fleet.rs`); the contract's `a_lone_instance_names_itself_and_refuses_a_move_typed`
   (`crates/api/tests/api.rs`).

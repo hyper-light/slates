@@ -3689,8 +3689,8 @@ pub enum MoveRefusal {
   /// The target is outside the owner's neighbourhood (it holds no key to the volume's sealed content), or its own
   /// neighbourhood does not cover the cohort the volume's records sit in (its takeover could not recover the volume).
   Neighbourhood,
-  /// The volume's records were not placed within the fleet's failover SLO, so the move was not reported; the volume
-  /// thawed. Ask again.
+  /// The volume's records, or its head's content on hosts other than its owner (the move's handoff), were not placed
+  /// within the fleet's failover SLO, so the move was not reported; the volume thawed. Ask again.
   Unplaced,
   /// The volume is already moving to another member.
   Pending,

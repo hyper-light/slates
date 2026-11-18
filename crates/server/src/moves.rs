@@ -3,9 +3,10 @@
 //! advances that object's ownership generation and names the new owner, the new owner runs phase one, and the old
 //! owner's later writes are refused"; "operators keep an explicit move"; A-291).
 //!
-//! The handoff is place, switch, adopt, release. The switch is one committed configuration change, and the old owner
-//! keeps its copy until the new owner has placed the volume under its own placement, so the volume is never held by
-//! fewer than `f + 1` hosts and every failure on either side of the switch is a case the takeover already handles:
+//! The handoff is place, switch, adopt, release. The switch is one committed configuration change. Before it the head
+//! the move hands over is held by `f + 1` hosts other than the old owner, and the old owner keeps its copy until the new
+//! owner has placed the volume under its own placement, so the volume is never held by fewer than `f + 1` hosts a
+//! successor can fetch it from, and every failure on either side of the switch is a case the takeover already handles:
 //!
 //! - **The old owner freezes and places.** A move is asked of the volume's owner shard ([`move_verb`]). The volume
 //!   must be a plain live volume (a clone of a captured base or of another plain volume among them: its tree is archived
@@ -16,7 +17,11 @@
 //!   snapshot taken now. It freezes the volume ([`MoveOut`]), so every other verb on it is told to come back, and
 //!   answers `Moving`; the client asks again until it is answered `Moved`.
 //! - **The report.** Each period the control shard ([`drive_outgoing`]) waits until the head and the catalog are
-//!   placed at `f + 1` of this owner's cohort (a live-shipped volume's log durable at its head too), then captures its
+//!   placed at `f + 1` of this owner's cohort (a live-shipped volume's log durable at its head too) and the head's
+//!   content is held by `f + 1` members other than this owner ([`ready_to_hand_over`]): an owner's own copy counts
+//!   toward its content's placement only while it owns the volume, and after the switch a frozen copy serves no fetch,
+//!   so a head short of them is first placed again on the cohort without this owner, at the next sequence, and
+//!   republished there (the handoff, `crate::fleet::start_move_handoff`). Then the shard captures its
 //!   own newest records of both registers from the owner's acceptor and reports `Move` to the council with the cohort
 //!   the records sit in, each period until the configuration shows the switch. The target's neighbourhood must cover
 //!   that cohort, so that the target's takeover, should it die before adopting, recovers the volume from it
@@ -43,22 +48,26 @@
 //!   holder outside the new owner's placement drops its stale copy.
 //!
 //! If the new owner dies before it adopts, its takeover follows the exception to its successor, which adopts the volume
-//! in that takeover's round from the copies the holders keep under the dead owner's authority, and the old owner then
-//! releases. When that successor is the old owner itself, its takeover's adoption supersedes the frozen copy
-//! ([`supersede_frozen`]), since the new owner may have taken writes before it died; a move once seen switched is
-//! never thawed. If the old owner dies after the switch, the new owner's round counts the rest of the cohort. If it dies
-//! before, the switch never happens and the volume is recovered by its takeover as any of its volumes is.
+//! in that takeover's round from the copies the holders keep under the dead owner's authority, its content fetched by
+//! identity from the hosts the handed-over head names, and the old owner then releases. When that successor is the old
+//! owner itself, its takeover's adoption supersedes the frozen copy ([`supersede_frozen`]), since the new owner may have
+//! taken writes before it died; a move once seen switched is never thawed. The healer passes a frozen copy by: it is
+//! the move's to place before the switch and another member's volume after it. If the old owner dies after the switch,
+//! the new owner's round counts the rest of the cohort. If it dies before, the switch never happens and the volume is
+//! recovered by its takeover as any of its volumes is.
 //!
 //! **R8.** At one node there is no other member, so every move is refused `MoveRefusal::Target`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use slates_cluster::{CommitBudget, broadcast};
-use slates_db::catalog::{BaseRecord, Principal, Role, VolumeId as DbVolumeId, VolumeState};
+use slates_db::catalog::{
+  BaseRecord, PlacementState, Principal, Role, VolumeId as DbVolumeId, VolumeState,
+};
 use slates_db::op::Op;
 use slates_db::register::{
-  Accepted, Acceptor, HostEpoch, HostId, HostPrepare, HostPromise, ObjectId, RegionalConfiguration,
-  RegisterError, encode_refusal,
+  Accepted, Acceptor, HostEpoch, HostId, HostPrepare, HostPromise, ObjectId, Quorum,
+  RegionalConfiguration, RegisterError, encode_refusal,
 };
 use slates_db::takeover::{CountingRule, Heard, Readiness, answer_move, readiness};
 use slates_ipc::protocol::{MoveRefusal, Refusal, ReplyBody, VolumeId};
@@ -77,6 +86,9 @@ pub(crate) const MOVE_STREAM: u64 = 28;
 
 /// Counter: moves a shard began (the volume frozen with its head handed over).
 const MOVE_BEGUN: &str = "fleet.move.begun";
+/// Counter: handoffs a move began: its head placed again on `f + 1` hosts other than this owner and republished
+/// ([`ready_to_hand_over`]).
+const MOVE_HANDOFF_BEGUN: &str = "fleet.move.handoff_begun";
 /// Counter: move reports this node sent to the council.
 const MOVE_REPORTED: &str = "fleet.move.reported";
 /// Counter: unreported moves refused and thawed (the neighbourhood rule, or records not placed in time).
@@ -135,7 +147,8 @@ const MOVE_FORGOTTEN_REPORTED: &str = "fleet.move.forgotten_reported";
 pub(crate) struct MoveOut {
   /// The member the volume moves to.
   pub(crate) to: HostId,
-  /// The volume's head epoch the move hands over: the head that must be placed before the report.
+  /// The volume's head epoch the move hands over: the head that must be placed before the report, advanced to the next
+  /// sequence when the move's handoff republishes the head ([`ready_to_hand_over`]).
   pub(crate) epoch: u64,
   /// The shard clock when the move began, for the bound on an unreported move (`MoveRefusal::Unplaced`).
   pub(crate) begun_ns: u64,
@@ -307,7 +320,7 @@ fn outgoing(state: &mut ShardState) -> Vec<Outgoing> {
     .into_iter()
     .map(|(id, out)| {
       let object = ObjectId(id.bytes);
-      let ready = out.reported || ready_to_report(state, id, out.epoch, quorum);
+      let ready = out.reported || ready_to_hand_over(state, id, quorum);
       let mut cohort = state.fleet.configuration().place_content(object).candidates;
       cohort.sort_unstable_by_key(|host| host.0);
       Outgoing {
@@ -321,6 +334,62 @@ fn outgoing(state: &mut ShardState) -> Vec<Outgoing> {
       }
     })
     .collect()
+}
+
+/// Whether the move of `id` may be reported (A-291): the head it hands over is the volume's head, placed with its
+/// catalog ([`ready_to_report`]) and held by `f + 1` members other than this node ([`held_off_owner`]). This node's own
+/// copy is the volume's content only while it owns the volume: from the switch on, a successor of the new owner fetches
+/// by identity from the holders the head names, and a frozen copy serves no fetch. So a head short of them is placed
+/// again first ([`crate::fleet::start_move_handoff`], counted [`MOVE_HANDOFF_BEGUN`]), at the next sequence on this
+/// owner's cohort without it, and republished there naming the hosts that took it; the move's epoch follows the head.
+/// Before 2026-11-18 a move handed over a head held by `f` hosts besides this node, the owner counting itself, so at
+/// `f = 1` a target that died at the switch left the content in the frozen copy alone, and its takeover's successor
+/// waited on it until it gave the volume up (`a_move_whose_target_dies_at_the_switch_is_served_by_its_successor`).
+fn ready_to_hand_over(state: &mut ShardState, id: DbVolumeId, quorum: Quorum) -> bool {
+  // The head is the volume's: a frozen volume takes no write and no snapshot, and the healer passes it by, so only its
+  // handoff advances it.
+  let Some(epoch) = state.db.partition().volume(id).map(|record| record.epoch) else {
+    return false;
+  };
+  if let Some(out) = state.moves_out.get_mut(&id) {
+    out.epoch = epoch;
+  }
+  if !ready_to_report(state, id, epoch, quorum) {
+    return false;
+  }
+  if held_off_owner(state, id, quorum) {
+    return true;
+  }
+  if crate::fleet::start_move_handoff(state, id) {
+    state.count(MOVE_HANDOFF_BEGUN, 1);
+  }
+  false
+}
+
+/// Whether volume `id`'s head snapshot is recorded placed on `f + 1` members other than this node ([`off_owner`]).
+fn held_off_owner(state: &ShardState, id: DbVolumeId, quorum: Quorum) -> bool {
+  let partition = state.db.partition();
+  let Some(head) = partition.volume(id).map(|record| record.head) else {
+    return false;
+  };
+  let Some(PlacementState::Placed { region, .. }) = partition
+    .snapshot(id, head)
+    .map(|snapshot| &snapshot.placed)
+  else {
+    return false;
+  };
+  off_owner(region, state.fleet.host(), state.fleet.members(), quorum)
+}
+
+/// Whether a placement naming `region` holds content on `f + 1` of `members` other than `local`, the owner a move leaves
+/// (A-291; pure).
+pub(crate) fn off_owner(region: &[u64], local: HostId, members: &[HostId], quorum: Quorum) -> bool {
+  let held = region
+    .iter()
+    .map(|host| HostId(*host))
+    .filter(|host| *host != local && members.contains(host))
+    .count();
+  quorum.committed(held)
 }
 
 /// Whether the volume `id`'s records hold everything it took before its move: its head at `epoch` and its catalog at
@@ -1362,6 +1431,31 @@ mod tests {
       SCATTER,
       false,
     )
+  }
+
+  /// A-291, what a move hands over: a head held by `f + 1` members other than the owner it leaves. Do: judge placements
+  /// at `f = 1` from owner host 1 of a region of hosts 1 to 3: the owner and one other (the shape a seal leaves, the
+  /// owner counting itself); two others; all three; two others, one no longer a member; and at `f = 0` the owner alone,
+  /// then one other. Expect held only by two members besides the owner at `f = 1` and by one at `f = 0`: the owner's own
+  /// copy never counts, since from the switch on a successor fetches only from what the head's holders hold.
+  #[test]
+  fn a_move_hands_over_a_head_held_by_f_plus_one_members_besides_its_owner() {
+    let members: Vec<HostId> = (1..=3).map(HostId).collect();
+    let owner = HostId(1);
+    let one = Quorum { f: 1 };
+    assert!(
+      !off_owner(&[1, 2], owner, &members, one),
+      "a seal's own placement, the owner counted, is one short"
+    );
+    assert!(off_owner(&[2, 3], owner, &members, one));
+    assert!(off_owner(&[1, 2, 3], owner, &members, one));
+    assert!(
+      !off_owner(&[2, 4], owner, &members, one),
+      "a holder that left the region holds nothing a successor can fetch"
+    );
+    let none = Quorum { f: 0 };
+    assert!(!off_owner(&[1], owner, &members, none));
+    assert!(off_owner(&[2], owner, &members, none));
   }
 
   fn begun(object: ObjectId, to: HostId) -> Outgoing {
