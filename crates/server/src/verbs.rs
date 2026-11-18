@@ -10787,13 +10787,15 @@ fn teardown_started(
   true
 }
 
-/// One cooperative destroy slice per destroying volume; a finished one leaves the tables.
+/// One cooperative destroy slice per destroying volume and per stale copy relinquished to a re-adoption (A-362); a
+/// finished one leaves the tables.
 pub fn step_destroys(state: &mut ShardState) -> bool {
   let budget = state
     .config
     .step_quantum_ns()
     .saturating_mul(DESTROY_SLICE_PERMILLE)
     / PERMILLE;
+  let mut any = step_relinquished(state, budget);
   let destroying: Vec<(DbVolumeId, Handle<VolumeSlot>)> = state
     .by_id
     .iter()
@@ -10806,7 +10808,6 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
     })
     .map(|(id, h)| (*id, *h))
     .collect();
-  let mut any = false;
   for (id, handle) in destroying {
     // A volume whose guest devices still serve it waits for their ends (the round keeps running meanwhile).
     if !teardown_started(state, handle, id) {
@@ -10856,6 +10857,26 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
       state.by_id.remove(&id);
       crate::live_ship::forget(state, id);
       retire_local_tombstones(state);
+    }
+  }
+  any
+}
+
+/// One destroy slice of each stale copy relinquished to a re-adoption ([`relinquish_superseded`], A-362), within `budget`
+/// each; a finished one gives its credits back and leaves. Whether any has more to tear down.
+fn step_relinquished(state: &mut ShardState, budget: u64) -> bool {
+  let mut any = false;
+  for mut slot in std::mem::take(&mut state.relinquished) {
+    let done = matches!(
+      slot.volume.destroy_step(&mut state.store, budget.max(1)),
+      Ok(DestroyProgress::Done) | Err(_)
+    );
+    if done {
+      release_slot_credits(state, &slot);
+      state.count(TAKEOVER_RELINQUISHED_FREED, 1);
+    } else {
+      any = true;
+      state.relinquished.push(slot);
     }
   }
   any
@@ -11141,7 +11162,22 @@ fn loss_report(
         epoch: taken.epoch,
         from_live_log: taken.from_live_log,
         head_sequence: taken.head_sequence,
+        past_tolerance: taken.past_tolerance.map(wire_past_tolerance),
       }),
+  }
+}
+
+/// A takeover's record of going past the volume's tolerance (A-309, A-332), as the loss report carries it.
+fn wire_past_tolerance(
+  past: slates_db::catalog::TakeoverPastTolerance,
+) -> slates_ipc::protocol::PastTolerance {
+  let shortfall = |short: slates_db::catalog::RecoveryShortfall| slates_ipc::protocol::Shortfall {
+    needed: short.needed,
+    remaining: short.remaining,
+  };
+  slates_ipc::protocol::PastTolerance {
+    registers: past.registers.map(shortfall),
+    live_log: past.live_log.map(shortfall),
   }
 }
 
@@ -11637,6 +11673,72 @@ pub(crate) struct TakenOver<'a> {
   pub takeover: slates_db::catalog::TakeoverRecord,
 }
 
+/// Counter: a stale copy this node relinquished to a takeover that named it again (A-362, [`relinquish_superseded`]).
+/// Format: a counter name in the daemon's status report.
+const TAKEOVER_RELINQUISHED: &str = "fleet.takeover.relinquished";
+/// Counter: a relinquished copy's slot torn down by the reaper's slices and its credits given back (A-362).
+/// Format: a counter name in the daemon's status report.
+const TAKEOVER_RELINQUISHED_FREED: &str = "fleet.takeover.relinquished_freed";
+/// Counter: a relinquish whose shard image could not be published without the stale copy (A-362): the materialization
+/// is tried again next period, and finds the volume gone, so it makes it from the adopted state.
+/// Format: a counter name in the daemon's status report.
+const TAKEOVER_RELINQUISH_UNPUBLISHED: &str = "fleet.takeover.relinquish_unpublished";
+
+/// Relinquishes this node's stale copy of volume `id` to a takeover that names this node again (A-362; §4.8 "Promotion
+/// and takeover"). The copy was lost to a successor ([`lost_to_a_successor`]: its log fenced at a later epoch, A-338, or
+/// yielded at this host's re-admission, A-334), so the state the takeover adopted, which the successor's acknowledged
+/// writes passed, replaces it. Its attachments end; its record goes with no tombstone and no key erased
+/// (`Op::VolumeRelinquished`); its guest devices, streams and snapshot views end; its slot leaves the tables for the
+/// reaper to tear down a slice at a time ([`ShardState::relinquished`], [`step_destroys`]); its shipper and the fence it
+/// kept are forgotten, and it is yielded no more; and the shard's image is published without it before the adopted state
+/// is made under its id. So a restart in between rebuilds nothing stale: the old image with no record is torn down as an
+/// orphan, and the new record with no image is answered not recovered, typed. Counted [`TAKEOVER_RELINQUISHED`]. Until
+/// 2026-11-18 the takeover found the id present and kept the stale copy, served nowhere at the new epoch (A-334's owed
+/// re-adoption; the chaos nemesis, seed 6876545201569229162, after A-349).
+fn relinquish_superseded(state: &mut ShardState, id: DbVolumeId) -> Result<(), Box<ReplyBody>> {
+  let attachments: Vec<AttachmentRecord> = state
+    .db
+    .partition()
+    .attachments_of(id)
+    .into_iter()
+    .cloned()
+    .collect();
+  for attachment in &attachments {
+    end_attachment(state, attachment, Ending::Otherwise)
+      .map_err(|e| Box::new(refused(refusal_of_db(&e))))?;
+  }
+  let origin_pin = origin_pin_of(state, id);
+  let now = state.clock.monotonic_ns();
+  state
+    .db
+    .mutate(&mut state.segment, &Op::VolumeRelinquished { id }, now)
+    .map_err(|e| Box::new(refused(refusal_of_db(&e))))?;
+  release_origin_pin(state, origin_pin);
+  #[cfg(unix)]
+  let _devices = crate::virtiofs::revoke_volume_devices(state, id);
+  let _streams = crate::shards::end_volume_streams(state, id);
+  crate::snapshot_view::end_all_of(state, id);
+  if let Some(handle) = state.by_id.remove(&id)
+    && let Ok(mut slot) = state.volumes.remove(handle)
+  {
+    if let Err(e) = slot.volume.destroy(&mut state.store) {
+      state.count(refusal_name(&refusal_of_vfs(&e)), 1);
+    }
+    state.relinquished.push(slot);
+  }
+  crate::live_ship::forget(state, id);
+  state.yielded.remove(&id);
+  state.unrecovered.remove(&id);
+  state.count(TAKEOVER_RELINQUISHED, 1);
+  match publish_shard(state) {
+    Ok(_) => Ok(()),
+    Err(e) => {
+      state.count(TAKEOVER_RELINQUISH_UNPUBLISHED, 1);
+      Err(Box::new(refused(refusal_of_vfs(&e))))
+    }
+  }
+}
+
 pub(crate) fn materialize_taken_over(
   state: &mut ShardState,
   id: DbVolumeId,
@@ -11646,7 +11748,12 @@ pub(crate) fn materialize_taken_over(
 ) -> Result<(), Box<ReplyBody>> {
   let (head, catalog, sequence) = (taken.head, taken.catalog, taken.sequence);
   if state.by_id.contains_key(&id) {
-    return Ok(());
+    // A copy this takeover made already (a retry after its publication was refused) is kept. This node's own copy lost
+    // to a successor whose takeover now names this node again is replaced by the state the takeover adopted (A-362).
+    if !lost_to_a_successor(state, id) {
+      return Ok(());
+    }
+    relinquish_superseded(state, id)?;
   }
   if let Some(existing) = state.db.partition().volume_by_name(&catalog.name) {
     return Err(Box::new(refused(Refusal::AlreadyExists {
@@ -16513,6 +16620,40 @@ mod tests {
     catalog: &crate::catalog::CatalogValue,
     archive: &slates_archive::Archive,
   ) -> Result<(), Box<super::ReplyBody>> {
+    take_over_past(state, id, catalog, archive, None)
+  }
+
+  /// [`take_over`] recording `past_tolerance` as the takeover's (A-332): `None` within tolerance.
+  fn take_over_past(
+    state: &mut crate::state::ShardState,
+    id: slates_db::catalog::VolumeId,
+    catalog: &crate::catalog::CatalogValue,
+    archive: &slates_archive::Archive,
+    past_tolerance: Option<slates_db::catalog::TakeoverPastTolerance>,
+  ) -> Result<(), Box<super::ReplyBody>> {
+    take_over_at(
+      state,
+      id,
+      catalog,
+      archive,
+      slates_db::catalog::TakeoverRecord {
+        epoch: 1,
+        head_sequence: 1,
+        from_live_log: false,
+        past_tolerance,
+      },
+    )
+  }
+
+  /// [`take_over`] as the takeover `takeover` records it: its epoch and head sequence (the adopted head's), served from a
+  /// seal or a live log, past tolerance or within it.
+  fn take_over_at(
+    state: &mut crate::state::ShardState,
+    id: slates_db::catalog::VolumeId,
+    catalog: &crate::catalog::CatalogValue,
+    archive: &slates_archive::Archive,
+    takeover: slates_db::catalog::TakeoverRecord,
+  ) -> Result<(), Box<super::ReplyBody>> {
     let head = crate::head::HeadValue {
       manifest: None,
       content_holders: Vec::new(),
@@ -16522,14 +16663,173 @@ mod tests {
       head: &head,
       catalog,
       catalog_sequence: 0,
-      sequence: 1,
-      takeover: slates_db::catalog::TakeoverRecord {
-        epoch: 1,
-        head_sequence: 1,
-        from_live_log: false,
-      },
+      sequence: takeover.head_sequence,
+      takeover,
     };
     super::materialize_taken_over(state, id, &taken, Vec::new(), Some(archive))
+  }
+
+  /// The bytes of the file `f` a [`takeover_archive`] names, read from volume `id` on this shard.
+  fn read_f(state: &crate::state::ShardState, id: slates_db::catalog::VolumeId) -> Vec<u8> {
+    let slot = state.volumes.get(*state.by_id.get(&id).unwrap()).unwrap();
+    let inode = slot.volume.resolve(&state.store, "f").unwrap().inode;
+    let size = slot.volume.stat(&state.store, inode).unwrap().size;
+    let mut bytes = vec![0u8; usize::try_from(size).unwrap()];
+    let read = slot
+      .volume
+      .read(&state.store, inode, 0, &mut bytes)
+      .unwrap();
+    bytes.truncate(read);
+    bytes
+  }
+
+  /// A-362 (§4.8 "Promotion and takeover", A-334; the chaos nemesis, seed 6876545201569229162): a takeover that names a
+  /// node holding its own superseded copy of the volume serves the state it adopted, not that copy. Do: take a volume over
+  /// from an archive holding `OLD!` (this node's copy, as it held it when it owned the volume); mark it yielded, as this
+  /// host's re-admission under its id marks every volume it catalogued (A-334); then take it over again from an archive
+  /// holding `NEW!` at a later epoch and head (the state its successor's acknowledged writes left), as a takeover that
+  /// names this node again does; then let the reaper step its destroys. Expect the file to read `NEW!`, the volume no
+  /// longer lost to a successor (its verbs run here), its record naming the later takeover, the stale copy counted
+  /// relinquished, and its slot torn down and counted freed. Before, the second takeover found the id present and kept the
+  /// stale copy: the file read `OLD!`, and every verb on the volume was still sent away from its new owner.
+  #[test]
+  fn a_takeover_that_names_this_node_again_replaces_its_superseded_copy() {
+    crate::daemon::audit_on_shard(|state| {
+      let archive_of = |bytes: &[u8]| {
+        let chunk = slates_archive::Archive::raw_chunk(bytes.to_vec());
+        takeover_archive(
+          vec![slates_archive::Extent {
+            offset: 0,
+            len: 4,
+            chunk: chunk.identity,
+            chunk_offset: 0,
+          }],
+          vec![chunk],
+        )
+      };
+      let id = slates_db::catalog::VolumeId { bytes: [0x81; 16] };
+      let catalog = takeover_catalog("readopted", 1 << 20);
+      take_over(state, id, &catalog, &archive_of(b"OLD!")).unwrap();
+      assert_eq!(read_f(state, id), b"OLD!", "this node's own copy");
+      state.yielded.insert(id);
+      assert!(
+        super::lost_to_a_successor(state, id),
+        "the copy is lost to a successor"
+      );
+      let later = slates_db::catalog::TakeoverRecord {
+        epoch: 3,
+        head_sequence: 9,
+        from_live_log: false,
+        past_tolerance: None,
+      };
+      take_over_at(state, id, &catalog, &archive_of(b"NEW!"), later).unwrap();
+      let count = |state: &crate::state::ShardState, name: &str| {
+        state.refusals.get(name).copied().unwrap_or(0)
+      };
+      // Shape: destroy slices enough for a four-byte volume's teardown, many times over.
+      const STEPS: usize = 64;
+      for _ in 0..STEPS {
+        if !super::step_destroys(state) {
+          break;
+        }
+      }
+      assert_eq!(read_f(state, id), b"NEW!", "the adopted state is served");
+      assert!(
+        !super::lost_to_a_successor(state, id),
+        "its verbs run here, its new owner"
+      );
+      assert_eq!(
+        state
+          .db
+          .partition()
+          .volume(id)
+          .and_then(|record| record.taken_over),
+        Some(later),
+        "its record names the later takeover"
+      );
+      assert_eq!(
+        (
+          count(state, "fleet.takeover.relinquished"),
+          count(state, "fleet.takeover.relinquished_freed")
+        ),
+        (1, 1),
+        "the stale copy relinquished once and its slot torn down"
+      );
+    });
+  }
+
+  /// A-332 (A-309, AC-8.3; §4.10 "Auto-seal"): a takeover past the volume's tolerance shows in the volume's loss report.
+  /// Do: take over one volume recorded past tolerance (its head register adopted from one member of a cohort whose
+  /// recovery quorum is two, its live log within tolerance) and another within tolerance, then ask each one's status as
+  /// its owner. Expect the first's loss report to name the takeover and that shortfall, registers short and the live log
+  /// not, and the second's to name its takeover with no shortfall. Before, the report could not tell a takeover that
+  /// lost acknowledged writes to the lost hosts from one that kept every one.
+  #[test]
+  fn a_takeover_past_its_tolerance_shows_in_the_volumes_loss_report() {
+    crate::daemon::audit_on_shard(|state| {
+      let data = slates_archive::Archive::raw_chunk(b"DATA".to_vec());
+      let archive = takeover_archive(
+        vec![slates_archive::Extent {
+          offset: 0,
+          len: 4,
+          chunk: data.identity,
+          chunk_offset: 0,
+        }],
+        vec![data.clone()],
+      );
+      // Shape: the store-destroyed takeover's cohort at `f = 1`, a recovery quorum of two with one member left.
+      let short = slates_db::catalog::RecoveryShortfall {
+        needed: 2,
+        remaining: 1,
+      };
+      let past = slates_db::catalog::VolumeId { bytes: [0x71; 16] };
+      take_over_past(
+        state,
+        past,
+        &takeover_catalog("past-tolerance", 1 << 20),
+        &archive,
+        Some(slates_db::catalog::TakeoverPastTolerance {
+          registers: Some(short),
+          live_log: None,
+        }),
+      )
+      .unwrap();
+      let within = slates_db::catalog::VolumeId { bytes: [0x72; 16] };
+      take_over(
+        state,
+        within,
+        &takeover_catalog("within-tolerance", 1 << 20),
+        &archive,
+      )
+      .unwrap();
+      let owner = Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 501,
+      };
+      let taken = |state: &mut crate::state::ShardState, id: slates_db::catalog::VolumeId| {
+        match super::status(state, &owner, VolumeId { bytes: id.bytes }) {
+          ReplyBody::Status { report } => report.loss.taken_over,
+          other => panic!("the volume's status was answered: {other:?}"),
+        }
+      };
+      let past_taken = taken(state, past).expect("the takeover past tolerance is reported");
+      assert_eq!(
+        past_taken.past_tolerance,
+        Some(slates_ipc::protocol::PastTolerance {
+          registers: Some(slates_ipc::protocol::Shortfall {
+            needed: 2,
+            remaining: 1
+          }),
+          live_log: None,
+        }),
+        "its registers recovered from one member of a cohort that needed two: {past_taken:?}"
+      );
+      let within_taken = taken(state, within).expect("the takeover within tolerance is reported");
+      assert_eq!(
+        within_taken.past_tolerance, None,
+        "a takeover within tolerance names no shortfall: {within_taken:?}"
+      );
+    });
   }
 
   /// AUD-29-17: do: take over a volume whose catalog carries a consumer's grant, and one whose catalog

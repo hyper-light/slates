@@ -103,16 +103,23 @@
 > up. No survivor withheld a promise; the round never asked. Fixed: a fenced volume sends nothing and does no period work
 > (`live_ship::pending_sends`, `period_volume`). Test: `a_superseded_owner_ships_nothing_more_of_the_volume_it_lost`
 > (`crates/server/tests/fleet.rs`). Bug record: `docs/bugs/2026-11-18-a-superseded-owners-shipper-starved-its-own-takeover-round.md`.
-> - **Owed (g250, next): re-adoption.** X1's round now adopts X2's objects, and its materialization meets X1's own
->   superseded copy: `verbs::materialize_taken_over` keeps a volume the node already holds, so the adopted state (X2's
->   acknowledged writes) never replaces the stale copy, its fenced shipper or its kept fence. A takeover that names a node
->   holding a superseded (fenced, or with A-334 yielded) copy must replace it. Until then the seed fails there.
+> - **Fixed (A-362, g250, 2026-11-18): re-adoption.** X1's round adopts X2's objects, and its materialization met X1's
+>   own superseded copy: `verbs::materialize_taken_over` kept a volume the node already held, so the adopted state (X2's
+>   acknowledged writes) never replaced the stale copy, its fenced shipper or its kept fence. Now a takeover that names a
+>   node holding a copy it lost to a successor (`verbs::lost_to_a_successor`: fenced, A-338, or yielded, A-334)
+>   relinquishes that copy (`verbs::relinquish_superseded`: its attachments ended, its record gone with no tombstone and
+>   no key erased, `Op::VolumeRelinquished`; its slot torn down by the reaper in slices; its shipper, fence and yield
+>   forgotten; the image published without it) and makes the volume from the state it adopted. Tests:
+>   `a_takeover_that_names_this_node_again_replaces_its_superseded_copy` (`crates/server/src/verbs.rs`) and
+>   `a_relinquished_volume_is_made_again_under_its_id_and_keeps_its_key` (`crates/db/tests/model.rs`, with the step in
+>   the db model's histories). Still owed: a guest device or Shards stream serving the stale copy is ended, not waited
+>   for, since the adopted state takes the id at once.
 > - **Owed: a lane that ends on a refusal is sent again at once** (`live_ship::lane_ended` follows any answer;
 >   `fold_into` follows only progress, for this reason since 2026-11-05). X2, retired before it knew, sent its log to the
 >   two members, which refused it `not_a_member` 85,877 and 86,502 times in one run, its sessions out on that loop.
 > - **Owed: a round's question takes a session only if it is in its link at that instant** (`takeover::ask_pages`, and the
 >   takeover's fetch), so any borrower that takes it every period starves the round the same way.
-> - **Owed (the supervisor's):** the seed on main once re-adoption lands.
+> - **Owed (the supervisor's):** the seed on main (6876545201569229162, both Linux arches), now that re-adoption is in.
 
 > **A superseded owner's mounts served its copy: NFS answers `NFS3ERR_STALE`, a FUSE mount ends (2026-11-18, A-346,
 > §4.8 "Leases and reads", AUD-29-84; g230).** A-338 sent the old owner's verbs to its successor, but its mounts were
@@ -1379,6 +1386,13 @@
 >   surviving recorded holder and every surviving member of the retired owner's cohorts for the volume, and adopts the
 >   greatest head (`fleet.live.taken_over_past_tolerance`). Owed: the supervisor's store-destroyed flow
 >   (`crates/cli/tests/live_chaos.rs`) on merged main, both Linux arches, for the end-to-end evidence.
+> - **Fixed (A-332, g250, 2026-11-18): a takeover past tolerance shows in the volume's status.** Its loss report's
+>   `taken_over.past_tolerance` names the shortfall of the head register's cohort and of the live log's recorded holders
+>   (the hosts recovery needed, how many remained), kept in the volume's takeover record (`CONTRACT` 21); `slates status`
+>   prints `taken_over_past_tolerance`. Test: `a_takeover_past_its_tolerance_shows_in_the_volumes_loss_report`
+>   (`crates/server/src/verbs.rs`); the AC-8.3 fleet test holds it `None` within tolerance, and the store-destroyed flow
+>   holds the report to the successor's own counts (the supervisor's run). Still Ada's (Decisions): whether a volume
+>   recovered past tolerance also refuses writes until an operator acknowledges it.
 > - **Open (A-309): a holder the round never asked keeps its copy** (`fleet.takeover.kept_unasked`). A neighbourhood an
 >   owner settled away from keeps the owner's copies; before A-309 they went when the owner's takeover settled, safe
 >   only within tolerance. Owed: such a holder lets them go at the settle, on the owner's report that every record it
@@ -1955,11 +1969,16 @@
 > CI's runners (spin windows of 18 to 35 s), and the lane passed with no spinning verdict, six runs of six
 > (diag-g251-tsan); an unoptimized build 3.5 times (a Mac Studio), a release build 1.0. Regressions: `a_poll_is_judged_spinning_only_past_the_window_held_to_its_build`
 > (red with the budget put back as the spin window), `a_poll_slower_than_the_budget_within_the_builds_spin_window_keeps_the_beat`
-> (`crates/server/tests/liveness.rs`). **Siblings, open:** the anchor's start judgment holds a starting daemon's busiest
-> thread to a window of CPU too (`crates/api/src/role/anchor.rs`, `process_clock`), and an observation's budget is counted
-> in the observed shard's CPU (`crate::observe::ShardTime`); neither is held to the build yet, and neither has been seen
-> to fail under ThreadSanitizer. The release-build spinning kills of the A-228 entry ("A kill the rule does not touch")
-> are untouched: a release build's window is the budget.
+> (`crates/server/tests/liveness.rs`). **Its siblings, closed 2026-11-18 (A-356, g251):** the anchor's start judgment
+> held a starting daemon's busiest thread to the bare budget of CPU (`crates/api/src/role/anchor.rs`), and an
+> observation's or a cross-shard wait's budget is counted in the observed shard's CPU (`crate::observe::ShardTime`);
+> neither was held to the build, and neither had been seen to fail under ThreadSanitizer. Now the anchor measures the
+> build in its own process, which runs the executable its daemon runs, and judges a start's thread against the spin
+> window; a wait gives its shard the budget held to the build in CPU, its windows still at most the budget on the wall,
+> so a shard that stops is judged as soon as before. Red with the bare budget put back, each at its own assertion
+> (`a_starts_thread_is_judged_spinning_only_past_the_window_held_to_its_build`,
+> `a_shard_in_a_slower_build_is_given_its_budget_held_to_the_build`). The release-build spinning kills of the A-228 entry
+> ("A kill the rule does not touch") are untouched: a release build's window is the budget.
 
 > **A Windows UDP socket died on an earlier send's ICMP error (found 2026-11-06, fixed 2026-11-06).** With Windows'
 > default `SIO_UDP_CONNRESET`, a port-unreachable for a datagram sent earlier failed the socket's next `recvfrom` with
@@ -2559,7 +2578,13 @@
 >   again 2026-11-17 in an in-process fleet test binary (adas-macbook-pro, macOS arm64, debug, load 23 to 56, beside
 >   another fleet test process): `shard 0 is spinning, 1077 ms of CPU without a step` ended the binary (exit 4) in the
 >   third of 13 A-255 and tombstone tests; which test it was is not known. The 11 it never ran passed one to a process
->   at load 70 to 116, so it did not reproduce.
+>   at load 70 to 116, so it did not reproduce. **One cause found and fixed 2026-11-18 (g251):** a work's catalog with
+>   no session to ship over held a one-shard node's control shard inside its record plane's poll, the merge plane
+>   nudging itself after every ship (windows-11-arm, 3 of 3 runs of the council-forms submit test; the shard's pulse
+>   dumped at the verdict named `run_record_plane`'s task, diag-g251-spin-3). The arm nudges now only when the ship's
+>   placement was recorded (`docs/bugs/2026-11-18-a-work-catalog-with-no-session-spun-the-record-plane.md`;
+>   `a_work_catalog_with_no_session_to_ship_over_waits_for_the_period`: red 233,090 ships with no session in 25
+>   periods, green within the bound). The 2026-11-17 sighting has its shape; the 2026-11-08 one is not established.
 > - **Siblings with the same blind spot.** `crate::observe::ShardTime` (`next_window_ns`), used by observations and the
 >   cross-shard waits (`xshard`), gave up on a window with no CPU progress, so a starved shard's observation or call
 >   ended early: **fixed 2026-11-08 (bug-sweep).** A window with no CPU progress now ends the wait only if the scheduler
@@ -2649,7 +2674,14 @@
 > **`LIVENESS_BUDGET_NS` is still a fixed second (R3 debt, 2026-11-06; follow-on, not A-228).** It is A-228's window and
 > the reply-deadline unit of about 60 files (the client's and the server's deadlines, observations, the scatter's room
 > wait). A-228 judges the window in each shard's own CPU time, which keeps a starved daemon alive, but the window's length
-> is still the `Shape:` constant "a second", not measured.
+> is still the `Shape:` constant "a second", not measured. **Derived since 2026-11-18 (A-359, goal g255):** `W` is the
+> ratified recovery budget `T` by rent or buy (a verdict waits as long as the recovery it starts costs), the heartbeat
+> `W / ELECTION_MARGIN`, the same values; the machine's wake p99 at boot is its floor, and the boot log names both and
+> says when the floor passes the window. Owed, in order: `W` held at runtime so a daemon runs at its floor where that
+> is past `W` (every use is listed by class in A-359); the failover SLO derived as the membership horizon plus the
+> council's confirmation window plus `T` (2.9 s today) once each consumer that takes it as a lease term (a landing's
+> target lease, a CLI attachment's term, the NFSv4 and delegation leases, the restart cap) has its own term; and the
+> class C claim wait below.
 >
 > - **Class A, a cross-shard wait judged in its target's own time (2026-11-06, in progress).** A verb's wait for
 >   another shard's answer gave up at the wall second while the target was alive and starved, and the work went on to

@@ -3471,6 +3471,10 @@ fn a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover() {
         "StaleNeverCommits (fences)",
         fenced_at_or_above(&survivors, &volume, epoch),
       );
+      verdict.check(
+        "the loss report names a takeover past tolerance exactly when it went past (A-332)",
+        past_tolerance_reported(successor, &volume),
+      );
       judge_takeover(
         &mut verdict,
         &fleet,
@@ -3500,6 +3504,51 @@ fn a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover() {
   }
   drop(fleet);
   verdict.judge();
+}
+
+/// A-332: where `successor`'s loss report for `volume` and its counts disagree on whether its takeover went past
+/// tolerance: its registers (`fleet.takeover.recovered_past_tolerance`) and its live log
+/// (`fleet.live.taken_over_past_tolerance`), each part named in the report exactly when the successor counted it. Each
+/// disagreement in words; empty when they agree. The flow's fleet serves this one volume, so a count is its own.
+fn past_tolerance_reported(successor: &str, volume: &str) -> Vec<String> {
+  let counted = [
+    counter(successor, "fleet.takeover.recovered_past_tolerance") > 0,
+    counter(successor, "fleet.live.taken_over_past_tolerance") > 0,
+  ];
+  let report = Client::connect(successor, deadlines())
+    .map_err(|e| format!("{e:?}"))
+    .and_then(|mut client| {
+      client
+        .status(volume_id_of(volume))
+        .map_err(|e| format!("{e:?}"))
+    });
+  let taken = match report {
+    Ok(report) => report.loss.taken_over,
+    Err(why) => return vec![format!("{successor} answered no status of {volume}: {why}")],
+  };
+  let Some(taken) = taken else {
+    return vec![format!(
+      "{successor}'s loss report names no takeover of {volume}"
+    )];
+  };
+  let named = [
+    taken
+      .past_tolerance
+      .is_some_and(|past| past.registers.is_some()),
+    taken
+      .past_tolerance
+      .is_some_and(|past| past.live_log.is_some()),
+  ];
+  ["registers", "live log"]
+    .iter()
+    .zip(counted.iter().zip(named))
+    .filter(|(_, (counted, named))| **counted != *named)
+    .map(|(part, (counted, named))| {
+      format!(
+        "{successor}: its {part} past tolerance counted {counted}, reported {named} ({taken:?})"
+      )
+    })
+    .collect()
 }
 
 /// The control for every chaos flow's latency: do stream writes to a live volume on a fleet nothing disturbs, for
