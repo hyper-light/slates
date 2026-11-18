@@ -2052,6 +2052,19 @@
 > (`docs/bugs/2026-11-05-a-held-origin-refused-every-checkout.md`). Open, found on the way:
 > - **The daemon cannot clone an overlay volume.** `admit_clone` gives every clone no host, so `volume clone` of an
 >   overlay is refused `ContentUnavailable` (pinned or not; fleet and standalone), though the volume core can.
+>   **Fixed 2026-11-18** (g267): a clone of an overlay reads its base through a host of its own that holds every
+>   directory of the origin's host under the same handle, each a duplicate descriptor of the very directory the origin
+>   reads (`OsHost::try_clone_dirs`), so no outsider's rename or newcomer at a base path can stand in for it; both clone
+>   paths take it (the origin's partition, and A-236's alias for a name held on another), and a recovery reopens the
+>   clone's base from its record and checks its fingerprints, as it does the origin's. The volume core had a second
+>   defect under it: a clone's base plane keyed its root listing by the clone's own root number, while the clone's root
+>   directory keeps its origin's, and kept none of the origin's other listings, so a base subdirectory the snapshot
+>   already held refused `NotOverlay`; the plane now keys by the snapshot root's number and takes each of the origin's
+>   listings with its entries dropped, to be read afresh. Red first:
+>   `an_overlays_snapshot_clones_and_each_clone_reads_its_base_across_a_restart` (`crates/server/tests/recovery.rs`)
+>   and `a_clones_base_subdirectory_reads_as_the_disk_holds_it` (`crates/vfs/tests/base.rs`); the duplicate's own
+>   behaviour by `a_hosts_directories_duplicate_under_the_same_handles_to_the_same_directories`
+>   (`crates/base/tests/host.rs`).
 > - **No grant can be issued on Linux from the CLI.** The anchor's issuer segment is a descriptor only its children
 >   hold (`PRINTS_ISSUER_SURFACE` in `crates/cli/tests/cli.rs`), so a Linux server's landing stops at its
 >   presentation. Needs a decision on the Linux issuer surface (§4.13).

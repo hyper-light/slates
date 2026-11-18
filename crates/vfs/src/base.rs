@@ -562,10 +562,16 @@ impl BasePlane {
     self.unavailable.len()
   }
 
-  /// A clone's plane: the same root and facts, its own listings, and the witnesses of the snapshot it
-  /// was made from — frozen at `epoch` — never the origin's head's (A-48). Before 2026-09-30 a clone of an
-  /// older snapshot took the head's, so after a rewitness its old-based bytes were judged against the
-  /// newer witness.
+  /// A clone's plane: the same root and facts, the origin's base directories under the same handles with nothing of
+  /// their cached listings, and the witnesses of the snapshot it was made from — frozen at `epoch` — never the origin's
+  /// head's (A-48). Before 2026-09-30 a clone of an older snapshot took the head's, so after a rewitness its old-based
+  /// bytes were judged against the newer witness.
+  ///
+  /// The handles name directories in the origin's host, so a clone reads its base through that host or one holding the
+  /// same handles to the same directories (the daemon's: `slates_base::OsHost::try_clone_dirs`). Each directory is
+  /// listed afresh on first use (the base is live), and one a recovery reopened keeps that mark (A-151). Before
+  /// 2026-11-18 a clone kept only its root's listing, so every base subdirectory its snapshot already held refused it
+  /// `NotOverlay` (`a_clones_base_subdirectory_reads_as_the_disk_holds_it`). Bounded by the origin's listings.
   pub(crate) fn for_clone(&self, root_no: InodeNo, epoch: Epoch) -> Self {
     let mut plane = Self::new(
       BaseConfig {
@@ -575,6 +581,25 @@ impl BasePlane {
       },
       root_no,
     );
+    plane.listings = self
+      .listings
+      .iter()
+      .map(|(&no, listing)| {
+        (
+          no,
+          Listing {
+            dir: listing.dir,
+            source: listing.source.clone(),
+            fingerprint: None,
+            entries: None,
+            read_at_ns: 0,
+            watch: WatchState::Unavailable,
+            restored: listing.restored,
+          },
+        )
+      })
+      .collect();
+    plane.unavailable = self.unavailable.clone();
     plane.witnesses = self.witnesses.view_at(epoch);
     plane.witness_homes = self.witness_homes.view_at(epoch);
     plane.whiteouts = self.whiteouts.view_at(epoch);

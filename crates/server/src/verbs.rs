@@ -5454,29 +5454,60 @@ pub(crate) fn reserve_metadata(
   }
 }
 
+/// Why the base directory at `path` could not be opened, as a create (and a clone of an overlay) is refused for it.
+fn base_open_refusal(path: &str, error: slates_vfs::host::HostError) -> Refusal {
+  match error {
+    // A-227: a base on one of this daemon's own mounts, refused before anything opened it.
+    slates_vfs::host::HostError::OwnMount(_) => Refusal::OwnMount {
+      path: path.to_owned(),
+      used_as: slates_ipc::protocol::OwnMountUse::Base,
+    },
+    slates_vfs::host::HostError::Unavailable(code) => Refusal::BaseUnavailable {
+      path: path.to_owned(),
+      errno: code,
+    },
+    _ => Refusal::BaseUnavailable {
+      path: path.to_owned(),
+      errno: 0,
+    },
+  }
+}
+
+/// The host a clone of `record`'s overlay (in slot `origin`) reads its base through (§4.4 clone, AC-1.16): a duplicate of
+/// every directory handle the origin's host keeps, under the same handles (`OsHost::try_clone_dirs`), so each base
+/// directory the clone's plane names is the very directory the origin's names, whatever an outsider has since put at
+/// its path. `None` for a volume with no base directory (scratch, image). Before 2026-11-18 every clone was given no
+/// host, so an overlay's clone could not image its base and the clone verb was refused `ContentUnavailable` (GAPS
+/// 2026-11-05, "The daemon cannot clone an overlay volume").
+fn clone_base_host(
+  state: &ShardState,
+  origin: Handle<VolumeSlot>,
+  record: &VolumeRecord,
+) -> Result<Option<OsHost>, Refusal> {
+  let BaseRecord::Path { path } = &record.base else {
+    return Ok(None);
+  };
+  let slot = state.volumes.get(origin).map_err(|_| Refusal::NotFound)?;
+  let Some(host) = slot.host.as_ref() else {
+    return Err(Refusal::BaseUnavailable {
+      path: path.clone(),
+      errno: 0,
+    });
+  };
+  host
+    .try_clone_dirs()
+    .map(Some)
+    .map_err(|error| base_open_refusal(path, error))
+}
+
 /// Opens a base directory (read-only, `O_NOFOLLOW`) and creates the overlay over it.
 fn open_base(
   state: &mut ShardState,
   path: &str,
   config: VolumeConfig,
 ) -> Result<(Volume, Option<OsHost>), Box<ReplyBody>> {
-  let (mut host, root) = OsHost::open_root(std::path::Path::new(path)).map_err(|e| {
-    Box::new(refused(match e {
-      // A-227: a base on one of this daemon's own mounts, refused before anything opened it.
-      slates_vfs::host::HostError::OwnMount(_) => Refusal::OwnMount {
-        path: path.to_owned(),
-        used_as: slates_ipc::protocol::OwnMountUse::Base,
-      },
-      slates_vfs::host::HostError::Unavailable(code) => Refusal::BaseUnavailable {
-        path: path.to_owned(),
-        errno: code,
-      },
-      _ => Refusal::BaseUnavailable {
-        path: path.to_owned(),
-        errno: 0,
-      },
-    }))
-  })?;
+  let (mut host, root) = OsHost::open_root(std::path::Path::new(path))
+    .map_err(|e| Box::new(refused(base_open_refusal(path, e))))?;
   let facts = host.facts(root).map_err(|_| {
     Box::new(refused(Refusal::BaseUnavailable {
       path: path.to_owned(),
@@ -7350,6 +7381,20 @@ pub(crate) fn admit_clone(
       )));
     }
   };
+  // An overlay's clone reads the same base directories through a host of its own, made before the clone pins the
+  // snapshot so a refusal here has nothing to unpin.
+  let host = match clone_base_host(state, handle, record) {
+    Ok(host) => host,
+    Err(refusal) => {
+      return Err(Box::new(give_back(
+        state,
+        reservation,
+        version_credit,
+        metadata_credit,
+        refusal,
+      )));
+    }
+  };
   let cloned = match state.volumes.get_mut(handle) {
     Ok(slot) => Volume::clone_of(
       &state.store,
@@ -7386,7 +7431,7 @@ pub(crate) fn admit_clone(
   count_kept(state, VOLUME_ALLOWANCE_REFUSED, allowed);
   Ok(Admitted {
     volume: volume_core,
-    host: None,
+    host,
     credits: Credits {
       reservation,
       version: version_credit,
@@ -7480,15 +7525,16 @@ pub(crate) fn publish_clone_as(
   }
   let Admitted {
     volume: mut volume_core,
+    host,
     credits,
-    ..
   } = admitted;
   crate::content_cipher::key_volume(&mut state.store, &mut volume_core, id.bytes);
   let slot = VolumeSlot {
     id,
     name: name.to_owned(),
     volume: volume_core,
-    host: None,
+    // An overlay's clone keeps the host its admission duplicated from its origin's (AC-1.16).
+    host,
     reservation: credits.reservation,
     version_credit: credits.version,
     metadata_credit: credits.metadata,

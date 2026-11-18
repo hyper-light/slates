@@ -1601,6 +1601,18 @@ metadata provisioning path, not arbitrary host pathname resolution. A scratch vo
   handles; add the claim and lineage record. Root cloning is O(1). A remote clone retains the
   base service dependency or uses an already complete immutable base. It never turns into an
   empty scratch volume merely because its source directory is remote.
+  > Status (2026-11-18, a local clone of an overlay): the daemon gives each volume a host of its own, so an
+  > overlay's clone gets one holding every directory of its origin's host under the same handle, each a duplicate
+  > descriptor of the very directory the origin reads (`slates_base::OsHost::try_clone_dirs`, `verbs::clone_base_host`):
+  > the clone's base reference is the origin's, never a pathname looked up again. Its base plane keys the root listing
+  > by the root number the clone's root directory keeps (its origin's) and takes each of the origin's listings with its
+  > entries dropped, to be read afresh from the live base (`BasePlane::for_clone`). A recovery reopens the clone's base
+  > from its record and checks its fingerprints, as it does the origin's. Before, every clone was admitted with no
+  > host, its first image could not fingerprint its base, and `volume clone` of an overlay was refused
+  > `ContentUnavailable`, pinned or not. Held by
+  > `an_overlays_snapshot_clones_and_each_clone_reads_its_base_across_a_restart` (`crates/server/tests/recovery.rs`)
+  > and `a_clones_base_subdirectory_reads_as_the_disk_holds_it` (`crates/vfs/tests/base.rs`). A clone on another host
+  > (remote attach, below) is still owed.
 - attach(volume|snapshot, consumer, transport, chosen_path?) → Attachment: authenticate the
   consumer and requested access, reserve all costs, pin the view and generation, establish
   the path or device, then publish `Bound`. Refusal rolls back owned resources. A metadata
@@ -15840,6 +15852,8 @@ Applied in the same change to: §4.16's status, A-9's "recorded durably" (now: r
   overlay's base names its directories by its own host's handles, so the clone of the server's overlay was refused
   `ContentUnavailable`, pinned or not, on a fleet node and on a standalone daemon alike (the volume core's own overlay
   clone, `a_clone_of_an_overlay_snapshot_reads_the_same_base`, is not reachable through the daemon). Recorded in GAPS.
+  (Since 2026-11-18 the daemon clones an overlay, §4.4 clone's status; this alternative stays rejected for the
+  reasons below.)
 - **Rejected: `land GREEN TARGET` building a hidden view.** A grant binds a presented manifest, and the presentation
   and the granted landing are two calls; a view rebuilt for each would need its manifest proven stable, and a kept one
   would be state the user never named.
