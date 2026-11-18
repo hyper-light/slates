@@ -159,6 +159,17 @@ fn judged_from(newest: &Newest<'_>) -> u64 {
 /// every record and put, each by its ledger position's decode: a green's every version re-decoded every version before
 /// it, a fifth of a holder's time at a thousand versions (`sample` of the late-submit test, Mac Studio, 2026-11-18).
 pub(crate) fn retain_object(state: &mut ShardState, object: ObjectId) -> usize {
+  retain_object_from(state, object, None)
+}
+
+/// [`retain_object`], judging the content placed from `from` on where it is given (A-404): a holder that compacted its
+/// green's ledger below a durable checkpoint releases the inputs of the versions it dropped, which the rule judged
+/// named when their records came and never judges again on its own.
+pub(crate) fn retain_object_from(
+  state: &mut ShardState,
+  object: ObjectId,
+  from: Option<u64>,
+) -> usize {
   let local = state.fleet.host();
   let newest = newest(state.holder_records.as_map(), object);
   let newest_placed = state.held_content.newest_placed(object).unwrap_or(0);
@@ -167,7 +178,7 @@ pub(crate) fn retain_object(state: &mut ShardState, object: ObjectId) -> usize {
   let released = state.held_content.retain_placed_from(
     space,
     object,
-    judged_from(&newest),
+    from.unwrap_or_else(|| judged_from(&newest)),
     |manifest, placed| {
       judged = judged.saturating_add(1);
       keeps(&newest, object, local, (manifest, placed), newest_placed)
@@ -304,6 +315,7 @@ mod tests {
           completion: None,
           signature: None,
           folded_below: 0,
+          checkpoint_floor: 0,
         };
         state
           .holder_records

@@ -12,8 +12,7 @@
   clippy::indexing_slicing,
   clippy::unwrap_in_result
 )]
-// A real landing target on the host's disk: macOS and Linux.
-#![cfg(unix)]
+// A real landing target on the host's disk, on every platform since the Windows writer (A-185).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};

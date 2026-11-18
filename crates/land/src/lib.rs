@@ -35,3 +35,7 @@ pub mod verdict;
 
 #[cfg(unix)]
 pub mod os;
+// Windows' write seam, the same surface over NTFS handles (plan G-shards-windows step 5).
+#[cfg(windows)]
+#[path = "os_windows.rs"]
+pub mod os;

@@ -97,7 +97,7 @@ pub use grant::{GrantAuthority, GrantClaim, GrantProof};
 pub use instance::{Instance, LandingRequest};
 pub use issuer::{GRANT_TERM_NS, Issuer};
 pub use launcher::{LauncherFault, LauncherSecret};
-pub use mount::{MountKind, MountOptions, Mounted, Unmounted};
+pub use mount::{LetGo, MountKind, MountOptions, Mounted, Unmounted};
 pub use observe::{AuditKind, AuditRecord, GrantRecord, GrantState, LandingStage};
 pub use outcome::{
   ActionTally, LandOutcome, LandingApproval, LandingConflict, LandingReport, LandingState,
@@ -209,10 +209,16 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 33: a volume's move to another fleet member (A-291, the same day): `Instance::move_volume` and `Instance::member`,
 /// `MoveProgress`, and its refusals' details (`Busy::Attached`, `Busy::Moving`, `Unusable::Unmovable`,
 /// `Invalid::MoveTarget`, `RetryCause::MoveUnplaced`). 34: `Instance::capture_base`, an overlay's base captured whole so
-/// its clones move (A-291, the same day).
+/// its clones move (A-291, the same day). 35: only a granted landing ends its audit trail when refused: one whose grant
+/// the daemon held as it began, so every such [`AuditKind::LandingFinished`] names its manifest and its verdict. A
+/// landing under a grant the daemon does not hold is presented once planned, and refused before its plan it is a
+/// refused request with no trail; under 30 it wrote an end naming no manifest (the same day). 36: a busy mount is let go
+/// of on every Unix host: [`mount::unmount_busy`] answers how ([`LetGo::Detached`] on Linux, [`LetGo::Forced`] on macOS
+/// and the BSDs), where Linux's `unmount_lazy` was refused elsewhere; `MountMissing::LazyUnmount` is gone (found by
+/// g076a; the same day).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 34;
+pub const CONTRACT: u32 = 36;
 
 /// What a rewitness did (§4.15 `rewitness`): the paths one reply holds and the count of the rest (A-267).
 pub use slates_client::Rewitnessed;

@@ -1948,6 +1948,58 @@ mod asynchronous_form {
   }
 }
 
+/// Shape: the environment variable that opts into a test making a kernel mount, which main runs; a unit run skips it
+/// loudly.
+#[cfg(unix)]
+const MOUNT_TESTS: &str = "SLATES_TEST_MOUNT";
+
+/// Whether `path` is a mount point: its device differs from its parent's.
+#[cfg(unix)]
+fn is_mount_point(path: &str) -> bool {
+  use std::os::unix::fs::MetadataExt;
+  let parent = Path::new(path).parent().unwrap();
+  std::fs::metadata(path).unwrap().dev() != std::fs::metadata(parent).unwrap().dev()
+}
+
+/// §4.6, A-278 (g076a's report): a busy mount is let go of on every Unix host, the OS's way. Do: mount a volume through
+/// the library, open a file on the mount and hold it, unmount the path plainly, then let go of it busy. Expect the plain
+/// unmount refused while the file is held, the busy one answered `Detached` on Linux and `Forced` on macOS and the BSDs,
+/// and the path no longer a mount point. Before 2026-11-18 macOS refused the busy unmount `Unsupported`, and a host had
+/// no library route off a held, `hard` loopback mount. Skips loudly unless SLATES_TEST_MOUNT is set: it makes a kernel
+/// mount.
+#[cfg(unix)]
+#[test]
+fn a_busy_mount_is_let_go_of_the_oss_way() {
+  if std::env::var_os(MOUNT_TESTS).is_none() {
+    eprintln!("SKIP: {MOUNT_TESTS} is not set: this test makes a kernel mount");
+    return;
+  }
+  let (daemon, mut instance) = grouped("busy-mount");
+  let volume = provision(&mut instance, &VolumeSpec::empty("busy-mount", ROOM));
+  write_file(&mut instance, volume, "/held.txt", b"held\n");
+  let point = Folder::new();
+  let mounted = instance
+    .mount(volume, &point.path, &MountOptions::default())
+    .unwrap();
+  let held = std::fs::File::open(Path::new(&mounted.path).join("held.txt")).unwrap();
+  assert!(
+    matches!(
+      slates_api::mount::unmount(&mounted.path),
+      Err(slates_api::MountFault::Unmount { .. })
+    ),
+    "a mount a process holds is busy"
+  );
+  let expected = if cfg!(target_os = "linux") {
+    slates_api::LetGo::Detached
+  } else {
+    slates_api::LetGo::Forced
+  };
+  assert_eq!(slates_api::mount::unmount_busy(&mounted.path), Ok(expected));
+  assert!(!is_mount_point(&mounted.path), "the mount is gone");
+  drop(held);
+  daemon.stop();
+}
+
 /// A volume id no instance issued (A-310's conformance cases).
 const NOWHERE: VolumeId = VolumeId { bytes: [0xAB; 16] };
 /// Shape: the simulator's bound in the conformance suite: room for every volume and attachment the suite makes.

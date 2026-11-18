@@ -71,6 +71,7 @@ pub(crate) const TAKEOVER_STREAM: u64 = 16;
 
 /// The record-session stream a successor asks a ledger's positions over (A-364; [`LedgerPrepare`],
 /// [`serve_ledger_prepare`]): a green's merge-record log adopted position by position.
+/// Format: a record-session stream id, the next free one when A-364 took it; ids are never reused or renumbered.
 pub(crate) const TAKEOVER_LEDGER_STREAM: u64 = 28;
 
 /// Counter: positions of a ledger a successor adopted and committed again under its own epoch (A-364,
@@ -667,6 +668,8 @@ pub(crate) fn drop_copy(state: &mut ShardState, object: ObjectId) {
   state.fleet.forget_object(object);
   state.departed_owners.remove(&object);
   state.merge.replicas.remove(&object);
+  // Its durable checkpoint goes with it (A-404).
+  crate::merge_service::forget_checkpoint(state, object);
 }
 
 /// Answers one page of a successor's takeover round on [`TAKEOVER_STREAM`] (§4.8): after checking the asker is
@@ -2738,6 +2741,7 @@ mod tests {
         completion: None,
         signature: None,
         folded_below: 0,
+        checkpoint_floor: 0,
       };
       state.pending_green_materializations.insert(
         green,

@@ -459,7 +459,7 @@ impl CompletionsWalk {
 /// every verb on it refused typed, its records left as the evidence (AUD-29-18).
 pub(crate) async fn readopt_at_boot(control: u16, shards: &[ShardId]) {
   for shard in shards.iter().copied() {
-    let awaiting = crate::xshard::call_within(
+    let awaiting = crate::xshard::call_in_shard_time(
       control,
       shard.0,
       |s| {
@@ -476,7 +476,7 @@ pub(crate) async fn readopt_at_boot(control: u16, shards: &[ShardId]) {
     for (id, through) in awaiting {
       let readopted = readopt_one(control, shard.0, id, through).await;
       if !readopted {
-        let _ = crate::xshard::call_within(
+        let _ = crate::xshard::call_in_shard_time(
           control,
           shard.0,
           move |s| crate::verbs::fence_awaiting_adoption(s, id),
@@ -500,7 +500,7 @@ async fn readopt_one(control: u16, owner: u16, id: DbVolumeId, through: u64) -> 
     let Some(engine) = rebuilt_engine(object, through).await else {
       return false;
     };
-    let began = crate::xshard::call_within(
+    let began = crate::xshard::call_in_shard_time(
       control,
       owner,
       move |s| crate::verbs::begin_readoption(s, id, engine),
@@ -548,7 +548,7 @@ async fn stepped_through(control: u16, owner: u16, id: DbVolumeId) -> bool {
     crate::state::with_state(|s| crate::fleet::takeover_attempts(s.failover_ns)).unwrap_or(1);
   let mut unanswered: u32 = 0;
   while unanswered < bound {
-    let step = crate::xshard::call_within(
+    let step = crate::xshard::call_in_shard_time(
       control,
       owner,
       move |s| crate::verbs::step_readoption(s, id),

@@ -81,6 +81,12 @@ pub struct MergeShardState {
   /// holder recomputes every version into before accepting the record that names it. Empty on a
   /// laptop (no records arrive).
   pub replicas: BTreeMap<ObjectId, Green>,
+  /// This holder's durable checkpoint of each green it backs (A-404): its replica's state at the newest committed
+  /// version a record named, kept as a held piece (`content_holder`), so a rebuild after a restart starts there.
+  /// Bounded by the greens it backs, one each, dropped with the green.
+  pub(crate) checkpoints: BTreeMap<ObjectId, HeldCheckpoint>,
+  /// The greens whose held checkpoint changed since the last committed publication (A-404): what the next delta carries.
+  pub(crate) checkpoints_changed: BTreeSet<ObjectId>,
   /// The greens this holder refused for good after a recomputation mismatch (fatal-and-loud).
   pub refused: BTreeSet<ObjectId>,
   /// Faults a test injects on this holder; never set from the wire.
@@ -1505,6 +1511,99 @@ const RECOMPUTE_COPIES: u64 = 2;
 /// the non-vacuity counter of a replica that keeps no more history than its owner.
 /// Format: a refusal name in the daemon's status report.
 pub(crate) const REPLICA_FOLDED: &str = "merge.replica.folded";
+/// Counted on a holder each time it kept a new durable checkpoint of a green's replica at the committed floor its owner's
+/// record named (A-404): the non-vacuity counter of a replica checkpoint.
+/// Format: a refusal name in the daemon's status report.
+pub(crate) const REPLICA_CHECKPOINTED: &str = "merge.replica.checkpointed";
+/// Counted on a holder, by the held inputs its retention released once a new checkpoint let go of the ledger positions
+/// that named them (A-404): the non-vacuity counter of a replica that releases what its checkpoint stands for.
+/// Format: a refusal name in the daemon's status report.
+pub(crate) const REPLICA_COMPACTED_INPUTS: &str = "merge.replica.compacted_inputs";
+
+/// A holder's durable checkpoint of a green's replica (A-404): the version it is at and the checkpoint's encoding
+/// (`slates_merge::checkpoint::Checkpoint::encode`), which a rebuild applies to the origin it seeds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HeldCheckpoint {
+  /// The version the checkpoint holds the green at.
+  pub(crate) at: u64,
+  /// The checkpoint, encoded.
+  pub(crate) bytes: Vec<u8>,
+}
+
+/// Format: a held checkpoint's piece is its version, a little-endian `u64`, then the encoded checkpoint.
+const CHECKPOINT_AT_BYTES: usize = size_of::<u64>();
+
+impl HeldCheckpoint {
+  /// The piece a held image carries (A-404): the version, then the checkpoint.
+  pub(crate) fn to_piece(&self) -> Vec<u8> {
+    let mut piece = Vec::with_capacity(CHECKPOINT_AT_BYTES.saturating_add(self.bytes.len()));
+    piece.extend_from_slice(&self.at.to_le_bytes());
+    piece.extend_from_slice(&self.bytes);
+    piece
+  }
+
+  /// A held checkpoint from its piece; `None` for a piece shorter than its version or whose checkpoint does not decode.
+  pub(crate) fn from_piece(piece: &[u8]) -> Option<HeldCheckpoint> {
+    let (at, bytes) = piece.split_first_chunk::<CHECKPOINT_AT_BYTES>()?;
+    slates_merge::checkpoint::Checkpoint::decode(bytes).ok()?;
+    Some(HeldCheckpoint {
+      at: u64::from_le_bytes(*at),
+      bytes: bytes.to_vec(),
+    })
+  }
+}
+
+/// Keeps a durable checkpoint of `replica`, this holder's replica of `object`, at `floor`, the newest committed version
+/// its owner's record named (A-404), when that is past the checkpoint it keeps: taken before the replica folds, since a
+/// checkpoint reads the history at its version, and skipped while the replica has folded past it (a later record names
+/// a newer floor). Counted `merge.replica.checkpointed`.
+pub(crate) fn checkpoint_replica(
+  state: &mut ShardState,
+  object: ObjectId,
+  replica: &Green,
+  floor: u64,
+) {
+  if floor == 0
+    || state
+      .merge
+      .checkpoints
+      .get(&object)
+      .is_some_and(|held| held.at >= floor)
+  {
+    return;
+  }
+  let Some(checkpoint) = replica.checkpoint(floor) else {
+    return;
+  };
+  state.merge.checkpoints.insert(
+    object,
+    HeldCheckpoint {
+      at: floor,
+      bytes: checkpoint.encode(),
+    },
+  );
+  state.merge.checkpoints_changed.insert(object);
+  state.count(REPLICA_CHECKPOINTED, 1);
+  // What the checkpoint stands for goes (A-404): the ledger's positions after version 0 and below the checkpoint's own,
+  // every one committed at f + 1, and then the inputs their versions placed, which nothing names now. Version 0's record
+  // and origin, and the checkpoint's own record, stay: a rebuild seeds the origin and checks the checkpoint's identity.
+  if let Some(acceptor) = state.holder_records.get_mut(&object) {
+    acceptor.compact_ledger_between(object, 1, floor);
+  }
+  let released = crate::content_retention::retain_object_from(state, object, Some(1));
+  state.count(
+    REPLICA_COMPACTED_INPUTS,
+    u64::try_from(released).unwrap_or(u64::MAX),
+  );
+}
+
+/// Drops this holder's checkpoint of `object` (A-404), with the green it backs no more: the next publication removes
+/// its piece.
+pub(crate) fn forget_checkpoint(state: &mut ShardState, object: ObjectId) {
+  if state.merge.checkpoints.remove(&object).is_some() {
+    state.merge.checkpoints_changed.insert(object);
+  }
+}
 
 /// Format: the one entry of an inputs archive's manifest — a file holding the version's inputs.
 pub(crate) const INPUTS_ENTRY_NAME: &str = "inputs";
@@ -1519,9 +1618,9 @@ pub(crate) const RECORD_AWAITS_WORK_CATALOG: &str = "merge.record.awaits_work_ca
 /// earlier layout wrote begins with its version number, whose low word is the magic only at version 1,129,467,207.
 const RECORD_MAGIC: u32 = u32::from_le_bytes(*b"GMRC");
 /// Format: a merge record's format version (A-255: 1 is the first versioned format, with the submit's completion key; 2
-/// carries the submitting work beside the key, A-288; 3 carries the owner's fold floor, A-385); a decoder refuses any
-/// other.
-const RECORD_VERSION: u32 = 3;
+/// carries the submitting work beside the key, A-288; 3 carries the owner's fold floor, A-385; 4 its committed floor,
+/// A-404); a decoder refuses any other.
+const RECORD_VERSION: u32 = 4;
 /// Format: a merge record's magic and its version are each a little-endian `u32`.
 const RECORD_WORD_BYTES: usize = size_of::<u32>();
 /// Format: the magic and version before a merge record's value.
@@ -1572,6 +1671,11 @@ pub struct MergeRecordValue {
   /// increment is based below it. A holder folds its replica there once it holds this version, so a replica keeps no more
   /// of the green's history than its owner does. 0 for version 0. Appended.
   pub folded_below: u64,
+  /// The newest version the owner knew committed when it made this record (A-404): at most the green's checkpoint
+  /// floor (`checkpoint_floor`: the reachable floor, below every version still waiting for placement) and below this
+  /// version, so every version up to it is placed at `f + 1` and no live reader names one. A holder keeps a durable
+  /// checkpoint of its replica there (`checkpoint_replica`). 0 for version 0. Appended.
+  pub checkpoint_floor: u64,
 }
 
 /// A submit's completion key as a merge record carries it ([`MergeRecordValue::completion`]): the client's host, the
@@ -2068,6 +2172,8 @@ fn enqueue_record_with(
   // Where the engine has folded the green's histories (A-385): its holders fold their replicas there once they hold
   // this version, so no replica keeps more of the green's history than its owner.
   let folded_below = state.greens.get(&green).map_or(0, Green::folded_below);
+  // The newest version known committed (A-404): never this one, which waits for its placement.
+  let committed = checkpoint_floor(state, green).min(version.saturating_sub(1));
   let mut value = MergeRecordValue {
     version,
     increment,
@@ -2081,6 +2187,7 @@ fn enqueue_record_with(
     completion,
     signature,
     folded_below,
+    checkpoint_floor: committed,
   };
   // Version 0 of a green over a base names its origin as its inputs: made a share at a time, and the record enqueued
   // once they are (A-286), never walked, encoded and archived in this poll.
@@ -3594,6 +3701,8 @@ fn recompute(
   if let Some(signature) = value.signature {
     replica.record_signature(value.version, crate::signed_work::adopted(signature));
   }
+  // A durable checkpoint at the committed floor the record names (A-404), taken before the fold, which may pass it.
+  checkpoint_replica(state, object, &replica, value.checkpoint_floor);
   // Folded where the owner had folded when it made this record (A-385): nothing at or past the floor is lost, and no
   // later increment is based below it.
   fold_replica(state, &mut replica, value.folded_below);
@@ -3751,6 +3860,7 @@ mod tests {
         completion: None,
         signature: None,
         folded_below: 0,
+        checkpoint_floor: 0,
       },
       inputs: Placement {
         candidates: candidates.clone(),
@@ -3851,6 +3961,7 @@ mod tests {
               completion: None,
               signature: None,
               folded_below: 0,
+              checkpoint_floor: 0,
             },
             inputs: Placement {
               candidates: candidates.clone(),
@@ -3953,6 +4064,7 @@ mod tests {
         fingerprint: [15u8; 32],
       }),
       folded_below: 2,
+      checkpoint_floor: 1,
     }
   }
 
@@ -3978,6 +4090,7 @@ mod tests {
       completion: None,
       signature: None,
       folded_below: 0,
+      checkpoint_floor: 0,
     };
     assert_eq!(
       MergeRecordValue::from_record_bytes(&origin_only.to_record_bytes()),

@@ -11,8 +11,7 @@
   clippy::indexing_slicing,
   clippy::unwrap_in_result
 )]
-// A real landing target on the host's disk: macOS and Linux.
-#![cfg(unix)]
+// A real landing target on the host's disk, on every platform since the Windows writer (A-185).
 
 use std::collections::BTreeMap;
 
@@ -20,11 +19,13 @@ use slates_client::{
   Client, ClientError, ConflictClass, CreateSpec, EntriesCursor, Filter, Landing, LandingSummary,
   PlannedAction, PlannedContent, PlannedEntry, Refusal, SnapshotId, VolumeId,
 };
+use slates_db::catalog::LandingState as DbLandingState;
 use slates_ipc::protocol::{AuditKind, GrantScope, Intent, LandingStage};
+use slates_server::daemon::OBSERVE_BUDGET_NS;
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 mod common;
-use common::client::{connect, scratch};
+use common::client::{channel_account, connect, scratch};
 use common::landing::GRANT_TERM_NS;
 use common::lease::{hold, lease_key_of, release};
 use common::target::target_dir;
@@ -426,16 +427,17 @@ fn expect_only_its_presenter_reads_the_list(
   client: &mut Client,
   (landing, manifest): (u64, [u8; 32]),
 ) -> Client {
-  // A consumer of another principal: the list is not its to read.
+  // A consumer of another principal: the list is not its to read. It is enrolled under the host account the daemon
+  // authenticated the workload's channel as, which the channel then attests to.
   let secret = daemon.segment().issuer_secret().unwrap();
-  let account = rustix::process::getuid().as_raw();
+  let mut workload = connect(instance);
+  let account = channel_account(daemon, workload.client_id());
   let (consumer, capability) = client
     .enroll(
       account,
       slates_server::landing::enroll_proof(&secret, account),
     )
     .unwrap();
-  let mut workload = connect(instance);
   workload.attest(consumer, &capability).unwrap();
   let other = workload.landing_entries(landing, manifest);
   assert!(
@@ -699,6 +701,26 @@ type Step = (
   Option<[u8; 32]>,
 );
 
+/// `landing`'s durable record as the daemon's control shard (this suite's one shard) holds it: its state, the entries it
+/// wrote and those in conflict; `None` when it has none.
+fn record_of(daemon: &Daemon, landing: u64) -> Option<(DbLandingState, u32, u32)> {
+  daemon
+    .observe_control(OBSERVE_BUDGET_NS, move |s| {
+      s.db
+        .partition()
+        .landing(landing)
+        .map(|record| (record.state, record.written, record.conflicts))
+    })
+    .expect("the control shard answers")
+}
+
+/// The highest landing id the control shard's partition holds a record of.
+fn highest_recorded(daemon: &Daemon) -> Option<u64> {
+  daemon
+    .observe_control(OBSERVE_BUDGET_NS, |s| s.db.partition().highest_landing())
+    .expect("the control shard answers")
+}
+
 /// Every record of `landing` the audit holds, in its order.
 fn trail_of(client: &mut Client, landing: u64) -> Vec<Step> {
   client
@@ -820,6 +842,11 @@ fn a_granted_landing_a_conflict_refuses_records_its_steps_and_its_refusal() {
       ),
     ]
   );
+  assert_eq!(
+    record_of(&daemon, landing),
+    Some((DbLandingState::Refused, 0, 1)),
+    "the landing's record ends where its trail does"
+  );
   drop(client);
   daemon.stop();
 }
@@ -872,6 +899,11 @@ fn a_granted_landing_its_grant_does_not_cover_records_its_plan_and_its_refusal()
     "the run planned the volume as it is now: {trail:?}"
   );
   assert_eq!(trail[3].3, planned_under_the_grant, "{trail:?}");
+  assert_eq!(
+    record_of(&daemon, landing),
+    Some((DbLandingState::Refused, 0, 0)),
+    "the landing's record ends where its trail does"
+  );
   drop(client);
   daemon.stop();
 }
@@ -933,6 +965,11 @@ fn a_granted_landing_refused_its_targets_lease_records_its_refusal() {
       ),
     ]
   );
+  assert_eq!(
+    record_of(&daemon, landing),
+    Some((DbLandingState::Refused, 0, 0)),
+    "the landing's record ends where its trail does"
+  );
   drop(client);
   daemon.stop();
 }
@@ -940,19 +977,20 @@ fn a_granted_landing_refused_its_targets_lease_records_its_refusal() {
 /// Shape: grant ids no approval issued: the daemon numbers its grants from one, one an approval.
 const UNISSUED_GRANTS: [u64; 2] = [u64::MAX, u64::MAX - 1];
 
-/// §4.15 "Audit", A-321: the end of a granted landing refused before anything named its manifest records no verdict,
-/// since it had no statement to judge a signature against, and each such landing's end names an id of its own. Do: write
-/// a scratch volume's file, hold an empty target's lease for another attempt, and land the volume into it twice, each
+/// §4.15 "Audit", step 3: a landing under a grant the shard does not hold is not a granted landing, so refused before
+/// its plan it is a refused request, as an ungranted landing is: once planned the engine would present it. Do: write a
+/// scratch volume's file, hold an empty target's lease for another attempt, and land the volume into it twice, each
 /// time under a grant no approval issued and carrying a signature; read the audit. Expect each landing refused
-/// `LandingLeaseHeld`, and one `landing_finished` under each grant: `refused`, naming neither a manifest nor a verdict,
-/// the two under different landing ids. Read as a verdict, the end would claim the signed landing `Unsigned`; and a
-/// refused landing that spent no fresh id would leave the next one's trail under its own.
+/// `LandingLeaseHeld`, no audit record naming either grant, and no landing record made. On the morning of 2026-11-18
+/// each such refusal spent a fresh id and wrote a `landing_finished` naming no manifest, with no landing record behind
+/// it.
 #[test]
-fn a_granted_landing_refused_before_any_manifest_records_no_verdict() {
-  let (daemon, instance) = daemon("refused-unnamed", None);
+fn a_landing_under_a_grant_the_shard_does_not_hold_refused_before_its_plan_leaves_no_trail() {
+  let (daemon, instance) = daemon("refused-unheld", None);
   let target = target_dir();
   let mut client = connect(&instance);
-  let volume = volume_holding(&mut client, "refused-unnamed", "u.txt", b"unnamed");
+  let volume = volume_holding(&mut client, "refused-unheld", "u.txt", b"unheld");
+  let highest = highest_recorded(&daemon);
   let key = lease_key_of(&target.path);
   hold(&daemon, &key, OTHER_HOLDER, HOLD_TERM_NS).unwrap();
   for grant in UNISSUED_GRANTS {
@@ -975,27 +1013,13 @@ fn a_granted_landing_refused_before_any_manifest_records_no_verdict() {
   }
   release(&daemon, &key, OTHER_HOLDER);
   let audit = client.audit(0).unwrap();
-  let mut landings = Vec::new();
-  for grant in UNISSUED_GRANTS {
-    let ends: Vec<_> = audit
-      .iter()
-      .filter(|record| record.grant == Some(grant))
-      .collect();
-    assert_eq!(ends.len(), 1, "one end under grant {grant}: {audit:?}");
-    let end = ends[0];
-    assert_eq!(
-      (end.audit_kind, end.stage, end.manifest, end.verification),
-      (
-        AuditKind::LandingFinished,
-        Some(LandingStage::Refused),
-        None,
-        None
-      ),
-      "{end:?}"
-    );
-    landings.push(end.landing);
-  }
-  assert_ne!(landings[0], landings[1], "{audit:?}");
+  assert!(
+    audit.iter().all(|record| record
+      .grant
+      .is_none_or(|grant| !UNISSUED_GRANTS.contains(&grant))),
+    "{audit:?}"
+  );
+  assert_eq!(highest_recorded(&daemon), highest, "no landing recorded");
   drop(client);
   daemon.stop();
 }

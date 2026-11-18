@@ -24,7 +24,8 @@
 //!
 //! Modules: [`error`], [`control`], [`waker`], [`registry`], [`parking`] (the kick-if-parked
 //! protocol and its loom model), [`room`] (a sender told when a full control channel has room, and its loom model),
-//! [`task`], [`queue`], [`timer`], [`driver`], [`sim`], [`shard`],
+//! [`task`], [`queue`], [`timer`], [`driver`], [`sim`], [`shard`], [`held_turn`] (what a held shard's idle turn costs a
+//! request, learned online, and whether a hold pays),
 //! [`runtime`], [`futures`], `attribution` (who held a long poll: the task or the host), the async
 //! sockets ([`udp`] everywhere and `tcp` on Unix — the NFS mount server's, over one shared readiness
 //! future), and the OS drivers.
@@ -41,6 +42,7 @@ pub mod control;
 pub mod driver;
 pub mod error;
 pub mod futures;
+pub mod held_turn;
 mod interest;
 mod netsys;
 pub mod parking;

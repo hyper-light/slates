@@ -775,7 +775,7 @@ async fn routed(this: u16, program: u32, procedure: u32, args: &[u8]) -> Option<
     state::with_state(|s| served_partition(s, &name))?
   } else {
     let name_shard = name_shard?;
-    crate::xshard::call_within(
+    crate::xshard::call_in_shard_time(
       this,
       name_shard,
       move |s| served_partition(s, &name),

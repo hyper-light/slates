@@ -417,6 +417,10 @@ pub struct ShardPulse {
   /// The shard's idle spin window, nanoseconds, as of its last measured wake (`ShardContext::counters`); 0 until its
   /// first. Beside `wake_cost_ns` it shows whether the window follows the estimate (A-223).
   pub idle_window_ns: u64,
+  /// What an idle turn costs a request that lands in it, nanoseconds, as the shard has learned it from its own spins,
+  /// as of its last idle spin; 0 until its first measured turn. The shard keeps a closed loop's hold only while this is
+  /// below `wake_cost_ns` (A-387, `slates_rt::held_turn::hold_pays`).
+  pub held_turn_ns: u64,
 }
 
 /// One doorbell flag per control shard, indexed by the shard's registry id: set by the daemon's doorbell
@@ -1682,6 +1686,7 @@ impl Daemon {
           scheduler_overrun_ns: entry.pulse.scheduler_overrun_ns(),
           wake_cost_ns: entry.pulse.wake_cost_ns(),
           idle_window_ns: entry.pulse.idle_window_ns(),
+          held_turn_ns: entry.pulse.held_turn_ns(),
         })
       })
       .collect()
@@ -2973,7 +2978,7 @@ impl Daemon {
   }
 
   /// Test support: every shard waits `pause_ns` between the turns of a live takeover's rebuild it makes
-  /// (`fleet::make_live_in_turns`, g251), so a materialization outlasts the control shard's periods and its later
+  /// (`fleet::rebuild_in_turns`, g251), so a materialization outlasts the control shard's periods and its later
   /// attempts meet it running; `None` lifts it. `Ok` once installed on every shard, else the first typed refusal.
   pub fn inject_live_turn_pause(&self, pause_ns: Option<u64>) -> Result<(), ObserveError> {
     for shard in self.shards.iter().copied() {
@@ -4652,6 +4657,7 @@ async fn init_shard(
     repairs: 0,
     pending_materializations: std::collections::BTreeMap::new(),
     making_taken_over: std::collections::BTreeMap::new(),
+    making_volumes: std::collections::BTreeMap::new(),
     pending_catalogs: std::collections::BTreeMap::new(),
     fenced_greens: std::collections::BTreeMap::new(),
     pending_green_materializations: std::collections::BTreeMap::new(),
@@ -7281,6 +7287,7 @@ mod tests {
         completion: None,
         signature: None,
         folded_below: 0,
+        checkpoint_floor: 0,
       };
       let record = Record {
         owner,
@@ -9531,6 +9538,7 @@ mod tests {
         completion: None,
         signature: None,
         folded_below: 0,
+        checkpoint_floor: 0,
       };
       let record = Record {
         owner,
