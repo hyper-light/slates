@@ -724,6 +724,8 @@ fn durable_spans(state: &ShardState) -> Spans {
     window_ns: DURABLE_WAIT_NS,
     total_ns: state.failover_ns,
     look_ns: DURABLE_LOOK_NS,
+    // This node's own failover window after its start is not counted against the fleet's promise (A-392).
+    counts_from_ns: state.serving_since_ns.saturating_add(state.failover_ns),
   }
 }
 
@@ -1405,7 +1407,8 @@ fn judge_held(state: &mut ShardState, volume: [u8; 16]) {
   let now = slates_rt::futures::now_ns();
   // The rule's own total ([`durable_spans`]): the failover delay, so a held verb is bounded as the transports' held
   // replies are and follows the failover estimate wherever it is published, never a number of its own.
-  let bound_ns = durable_spans(state).total_ns;
+  let spans = durable_spans(state);
+  let bound_ns = spans.total_ns;
   let keys: Vec<([u8; 16], u64)> = state
     .live
     .awaiting
@@ -1416,7 +1419,7 @@ fn judge_held(state: &mut ShardState, volume: [u8; 16]) {
     let Some(waiting) = state.live.awaiting.remove(&key) else {
       continue;
     };
-    let (past, kept) = held_past(waiting, now, bound_ns);
+    let (past, kept) = held_past(waiting, now, (bound_ns, spans.counts_from_ns));
     if !kept.is_empty() {
       state.live.awaiting.insert(key, kept);
     }
@@ -1442,13 +1445,14 @@ fn judge_held(state: &mut ShardState, volume: [u8; 16]) {
 fn judge_held_destroys(state: &mut ShardState) {
   let now = slates_rt::futures::now_ns();
   // The rule's own total, as [`judge_held`] reads it.
-  let bound_ns = durable_spans(state).total_ns;
+  let spans = durable_spans(state);
+  let bound_ns = spans.total_ns;
   let volumes: Vec<[u8; 16]> = state.live.destroys.keys().copied().collect();
   for volume in volumes {
     let Some((sequence, waiting)) = state.live.destroys.remove(&volume) else {
       continue;
     };
-    let (past, kept) = held_past(waiting, now, bound_ns);
+    let (past, kept) = held_past(waiting, now, (bound_ns, spans.counts_from_ns));
     if !kept.is_empty() {
       state.live.destroys.insert(volume, (sequence, kept));
     }
@@ -1467,13 +1471,15 @@ fn judge_held_destroys(state: &mut ShardState) {
   }
 }
 
-/// `waiting` split at `now_ns` into the entries of the requests held at least `bound_ns`, each with how long its request
-/// was held, and the rest, each in its order. A request's entries (a retry that joined its wait, [`join`]) are judged by
-/// its first hold, so all of them are answered at once with one reply, the one outcome its id records (§4.9).
+/// `waiting` split at `now_ns` into the entries of the requests held at least `bound_ns`, counted from the later of their
+/// first hold and `counts_from_ns` (the end of this node's own failover window after its start, A-392), each with how
+/// long its request was held, and the rest, each in its order. A request's entries (a retry that joined its wait,
+/// [`join`]) are judged by its first hold, so all of them are answered at once with one reply, the one outcome its id
+/// records (§4.9).
 fn held_past(
   waiting: Vec<Awaiting>,
   now_ns: u64,
-  bound_ns: u64,
+  (bound_ns, counts_from_ns): (u64, u64),
 ) -> (Vec<(Awaiting, u64)>, Vec<Awaiting>) {
   let mut first: BTreeMap<(u64, u32, u32), u64> = BTreeMap::new();
   for entry in &waiting {
@@ -1485,10 +1491,12 @@ fn held_past(
   let mut past = Vec::new();
   let mut kept = Vec::new();
   for entry in waiting {
-    let held_ns = first
+    let since = first
       .get(&(entry.origin, entry.id.client, entry.id.sequence))
-      .map_or(0, |since| now_ns.saturating_sub(*since));
-    if held_ns >= bound_ns {
+      .copied()
+      .unwrap_or(now_ns);
+    let held_ns = now_ns.saturating_sub(since);
+    if now_ns.saturating_sub(since.max(counts_from_ns)) >= bound_ns {
       past.push((entry, held_ns));
     } else {
       kept.push(entry);

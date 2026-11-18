@@ -465,6 +465,7 @@ impl BridgeAccess for OwnedVolume {
         window_ns: TOLD_BOUND_NS,
         total_ns: TOLD_BOUND_NS * DURABLE_WINDOWS,
         look_ns: TOLD_BOUND_NS / DURABLE_LOOKS_PER_WINDOW,
+        counts_from_ns: 0,
       },
     )
   }

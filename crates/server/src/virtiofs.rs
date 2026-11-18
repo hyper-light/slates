@@ -328,6 +328,7 @@ impl BridgeAccess for ShardBridge {
             window_ns,
             total_ns: window_ns,
             look_ns: window_ns,
+            counts_from_ns: 0,
           },
         )
       },

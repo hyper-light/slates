@@ -38,8 +38,11 @@
 //! **The total bound.** Progress that trickles in, other writes' acknowledgements moving the count while this reply's
 //! own position is never acknowledged, would start window after window without end, and a receiver that never idles
 //! would hold the verdict for ever (banned item 8; the supervisor's landing condition, 2026-11-11). So a wait ends at its
-//! total bound whatever it hears: the failover SLO from the hold, the operator's bound on how long an object may go
-//! unserved before a takeover serves it (§4.8). A write the fleet has not made durable within it is past what the fleet
+//! total bound whatever it hears: the failover delay from the hold (A-375: the node's live estimate of how long an object
+//! may go unserved before a takeover serves it, §4.8), or, on an owner still in its own failover window after its start,
+//! from that window's end ([`Spans::counts_from_ns`], A-392): a restarted owner's re-formation is its own recovery, which
+//! Lifeguard's rule never counts against others, and before A-392 a write a warm restart made durable in about 4 s was
+//! refused at the restarted owner's 3.4 s estimate (A-344's test, g230's finding). A write the fleet has not made durable within it is past what the fleet
 //! promises to keep. The bound is kept on the clock rather than as a count of windows, since a window whose silence
 //! awaited its receiver lasts longer than a window.
 
@@ -104,6 +107,13 @@ pub struct Spans {
   pub total_ns: u64,
   /// How far apart the looks are that confirm a silence: a span within which a receiver that runs idles at least once.
   pub look_ns: u64,
+  /// The moment before which the total bound does not run, on the clock the wait is judged by: the end of the owner's own
+  /// failover window after its start, its start plus its failover delay (A-392). A restarted owner is its volumes'
+  /// failover, and what it holds meanwhile waits on its own re-formation (its links dialed afresh, its shippers' first
+  /// whole state shipped), not on the fleet, so that time is not counted against the fleet's promise (Lifeguard's rule,
+  /// Dadgar et al. 2018: a member does not condemn others for its own unavailability). Silent windows are judged
+  /// throughout. Zero where nothing restarted.
+  pub counts_from_ns: u64,
 }
 
 /// One held reply's wait for durability, in windows ([`DurableBound::judge`]).
@@ -128,7 +138,9 @@ impl DurableBound {
   /// than a window is taken as one window.
   #[must_use]
   pub fn begin(heard: Heard, now_ns: u64, spans: Spans) -> DurableBound {
-    let gives_up_by_ns = now_ns.saturating_add(spans.total_ns.max(spans.window_ns));
+    let gives_up_by_ns = now_ns
+      .max(spans.counts_from_ns)
+      .saturating_add(spans.total_ns.max(spans.window_ns));
     DurableBound {
       heard: heard.acknowledged,
       ends_ns: now_ns.saturating_add(spans.window_ns).min(gives_up_by_ns),
@@ -228,6 +240,7 @@ mod tests {
       window_ns: WINDOW_NS,
       total_ns: SLO_NS,
       look_ns: LOOK_NS,
+      counts_from_ns: 0,
     }
   }
 
@@ -431,5 +444,40 @@ mod tests {
       }
     }
     assert_eq!(ended, Some((GaveUp::AtTheBound, HELD_AT_NS + SLO_NS)));
+  }
+
+  /// A-392, Lifeguard's rule: a reply held while its owner is still in its own failover window after its start (a warm
+  /// restart re-forming) is not counted against the total bound until that window ends. Do: hold a reply at `HELD_AT_NS`
+  /// with the total running only from a moment past the hold; hear progress at every look. Expect no verdict at the hold
+  /// plus the total (where a bound counted from the hold gave up), and the total bound reached at that moment plus the
+  /// total, whatever was heard.
+  #[test]
+  fn a_hold_inside_its_owners_own_failover_window_is_counted_from_the_windows_end() {
+    let counts_from = HELD_AT_NS + 3 * WINDOW_NS;
+    let restarted = Spans {
+      counts_from_ns: counts_from,
+      ..spans()
+    };
+    let mut bound = DurableBound::begin(heard(0, 0), HELD_AT_NS, restarted);
+    let mut acknowledged = 0;
+    let mut at = HELD_AT_NS;
+    while at < HELD_AT_NS + SLO_NS {
+      at += WINDOW_NS;
+      acknowledged += 1;
+      assert_eq!(
+        bound.judge(heard(acknowledged, 0), at),
+        None,
+        "heard at {at}"
+      );
+    }
+    assert_eq!(
+      bound.judge(heard(acknowledged + 1, 0), counts_from + SLO_NS - 1),
+      None,
+      "still inside the bound counted from the window's end"
+    );
+    assert_eq!(
+      bound.judge(heard(acknowledged + 2, 0), counts_from + SLO_NS),
+      Some(GaveUp::AtTheBound)
+    );
   }
 }

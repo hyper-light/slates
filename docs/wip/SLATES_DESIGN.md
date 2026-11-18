@@ -28233,3 +28233,27 @@ Applied in the same change to: §4.16 "Position mapping", A-238's "Owed", GAPS (
 - **Still owed.** A holder's ledger records and held inputs still grow per version: releasing them below the floor needs
   a durable checkpoint of the replica on the holder (a rebuild recomputes from version 0, and a takeover adopts the
   records for its completions).
+
+### A-392 — A held reply's total bound does not run during its owner's own failover window after its start: a warm restart's re-formation is the owner's recovery, never the fleet's failure (2026-11-18, built for goal g255; g230's finding, A-344's test red on main under A-375)
+
+- **What broke.** A-375 made a held reply's total bound (A-354, every transport's `DurableBound` and `live_ship::judge_held`)
+  the node's live failover delay instead of the 10 s placeholder. A write held on an owner just restarted warm becomes
+  durable only once the owner has re-formed (its links dialed afresh, its resumed shippers' first whole state shipped and
+  acknowledged): about 4 s (A-344 measured 4.4 and 4.1 s). The restarted owner's estimate is mostly priors, about 3.4 s,
+  so the write was refused `DurabilityPending` at 3.41 and 3.34 s and the successor later lacked it (g230, the Mac Studio,
+  main 3d2aebbc7, 2 of 2; red in a Linux run too).
+- **The rule.** A restarted owner is its volumes' failover: for one failover delay after it starts serving, what it
+  holds waits on its own re-formation, not on the fleet. So a held reply's total runs from the later of its hold and the
+  end of that window, `serving_since + F` on the clock holds are stamped on (`Spans::counts_from_ns`,
+  `ShardState::serving_since_ns`, recorded as the shard begins serving). Lifeguard's rule (Dadgar et al. 2018), as A-384
+  applies it to attachment terms: a member never condemns others for its own unavailability. A wait is still bounded
+  (at most twice the failover delay after the start, A-354's "never held for good"), and silent windows are judged
+  throughout, so a dead holder set is still refused at once. Nothing changes for a node that did not just start.
+- **Why not a longer estimate.** A just-started node's estimate stands on priors and few periods, and nothing it could
+  measure before the write would reveal its own re-formation's cost; the bound's question is the fleet's promise, which
+  begins once the owner is past its own failover.
+EVIDENCE_A392
+
+Applied in the same change to: `crates/bridge-core/src/durable_bound.rs` (`Spans::counts_from_ns`, `DurableBound::begin`,
+its module doc and a unit test), `crates/server/src/{live_ship,state,daemon,virtiofs}.rs`,
+`crates/bridge-virtiofs/tests/serve.rs`.

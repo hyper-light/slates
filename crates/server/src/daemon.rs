@@ -4457,6 +4457,7 @@ async fn init_shard(
     shards: config_shards.to_vec(),
     recovered,
     booted_ns: now,
+    serving_since_ns: 0,
     status_scatters: std::collections::BTreeMap::new(),
     last_work_ns: now,
     pending_forwards: std::collections::VecDeque::new(),
@@ -4658,7 +4659,11 @@ async fn init_shard(
   crate::fuse::leave_stale();
   // A holder could not renew while this daemon was not serving: every CLI attachment starts a fresh term now, before
   // the serve loop answers its first request and before the reaper's first sweep (A-384).
-  let _ = state::with_state_counted(verbs::renew_termed_at_start);
+  let _ = state::with_state_counted(|s| {
+    // The moment this shard serves from, on the clock its held replies are stamped on (A-392).
+    s.serving_since_ns = futures::now_ns();
+    verbs::renew_termed_at_start(s)
+  });
   // Detached: the loop lives as long as the shard; nothing joins it (a joinable task stays in
   // the arena after it ends, which would hold the shard's shutdown).
   // A shard whose serve or reap loop the arena refuses serves nothing: a typed initialization failure

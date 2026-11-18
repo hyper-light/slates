@@ -662,6 +662,9 @@ pub struct ShardState {
   pub recovered: slates_db::replay::Recovered,
   /// When this shard's state was installed (the freshness of what recovery measured).
   pub booted_ns: u64,
+  /// When this shard began serving, on the runtime's clock (`slates_rt::futures::now_ns`), the clock its held replies are
+  /// stamped on: a held reply's total bound runs only from the end of this node's own failover window after it (A-392).
+  pub serving_since_ns: u64,
   /// Daemon status requests in flight: by request word, the client slot, the shards still
   /// to answer, and the parts so far.
   pub status_scatters: BTreeMap<u64, (u32, usize, Vec<slates_ipc::protocol::ShardReport>)>,
