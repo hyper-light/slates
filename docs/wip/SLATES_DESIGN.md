@@ -11516,7 +11516,9 @@ Recipes to copy verbatim:
 - A `guard` job asserts the git tag equals the workspace version, or names a test of the lane
   (`v<version>-test.N`, accepted by the release lane alone; A-210). [C: release.yml:40-45]
 - Windows binaries link the C runtime statically (`+crt-static`), and the x86_64 one must start in a
-  process-isolated Nano Server container, which has no Visual C++ runtime (A-210).
+  process-isolated Nano Server container, which has no Visual C++ runtime (A-210). Every push starts CI's debug build
+  there too, the runtime's DLLs beside it, so an import Nano Server lacks fails the push that adds it (A-357); one
+  action (`.github/actions/nano-server-start`) serves both, and starts Docker's engine when a runner left it stopped.
 - The release smoke task (`cargo run -p xtask --bin release -- smoke`) runs each built binary on its own runner before it may ship: version,
   anchor and daemon start, bootstrap, a volume provisioned, a file written and read by one MCP
   client and read by a second client, the volume destroyed, the daemon gone with its anchor. It
@@ -26553,8 +26555,18 @@ Applied in the same change to: §4.1 (A-223's status), GAPS (the binary release 
   process-isolated `nanoserver:ltsc2025` on `windows-2025`: main 68148152d exited 0xC0000139, the same commit with this
   change answered `slates 0.1.0`, and its import table holds none of the three. The module's test
   (`a_blocked_thread_switched_and_a_running_one_did_not`) passed on Windows x86_64 and arm64, where kernel32 has them.
-- **Not covered by a push.** Only the release lane runs the Nano Server check (a tag or a dry run). A regression of
-  this kind shows on the next test tag, not on the push that makes it.
+- **Every push checks it (the CI half, 2026-11-18).** Until then only the release lane ran the Nano Server check (a
+  tag or a dry run), so this regression showed on the next test tag, not on the push that made it. Now CI's Windows
+  lane starts the debug binary its CLI tests built in the same container, with the Visual C++ runtime's DLLs beside it
+  (that build's C runtime is a DLL), so every other import must resolve from Nano Server's own. One composite action
+  (`.github/actions/nano-server-start`) serves both callers. It also starts Docker's engine first: its service, set to
+  start automatically, was stopped when the job began on 1 of 11 `windows-2025` runners sampled (diag runs
+  44352989836 and 44353300409), and the tag `v0.1.0`'s run read the missing engine as the binary's exit 1 (run
+  44347535833). A Docker failure is now named as the runner's. By use (diag-g071-ci-1, run 44354728411), each job
+  with Docker's service stopped first: CI's shape answered `slates 0.1.0` from this change and refused main 68148152d
+  with 0xC0000139, and the release's shape answered from test 4's static binary. The step adds 21 s to the lane (31 s
+  for the release's shape). Applied to `.github/workflows/ci.yml` (the Windows lane), `.github/workflows/release.yml`
+  (its Nano Server step), the new action, Appendix B.2, GAPS and the bug record.
 
 ### A-333 — A green's takeover successor adopts its holder ledger and the replica it built from it, instead of recording the green again; a restarted successor re-adopts it at boot (2026-11-18, built for goal g232, one primary and two replicas)
 Applied in the same change to:
