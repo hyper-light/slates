@@ -11100,7 +11100,7 @@ fn an_owner_admitted_again_forwards_the_volume_its_successor_took_over_and_never
     "a read through the owner admitted again reached the successor's write: {answers:?}"
   );
   assert!(
-    yielded.is_ok_and(|count| count > 0),
+    matches!(yielded, Ok(count) if count > 0),
     "the owner admitted again yielded its volume: {yielded:?}"
   );
 }
