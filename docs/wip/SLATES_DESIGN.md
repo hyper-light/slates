@@ -995,7 +995,8 @@ volume requires a matching profile), `MeasurementTimeout`.
 > a Windows park that never switched out by the same count, as Linux does by its voluntary switches. Before this, the
 > announcement stood in: the probe read 0.14–0.85 µs, and the window, quantum and spin derived from it were a hundred
 > times too small. Now it reads 6.0–9.1 µs on CI's quiet runners. The daemon's idle window, which it then scaled, is
-> R9's floor on Linux and macOS since A-223's window rule (§4.7, 2026-11-11); Windows keeps the multiple (GAPS).
+> R9's floor on every platform: on Linux and macOS since A-223's window rule (§4.7, 2026-11-11), on Windows since
+> A-361 (2026-11-18), whose loaded wake had kept a hundred times the estimate there.
 
 > **Status (2026-09-25, the wake probe measures one event and reports its mean).** The probe timed every park/unpark round trip, so it mixed an on-CPU handoff (about 0.45 µs, the waiter still running or on the waker's CPU) with a real wake (about 10 µs); thread placement holds for a run, so runs split between the two (median 416 ns or 10,041 ns on the same two container cores, a minute apart), and it stopped on the median's interval while its consumers read the p99 — often the maximum of 64 samples (667 ns to 511,042 ns). Now the waiter is confirmed asleep (Linux `/proc` state, macOS `thread_info`; Windows the waiter's announcement, reported unconfirmed), the pair is placed as production is (the control core waking a shard core where the OS pins; unpinned on macOS, with the same-CPU share recorded), the probe converges the mean — the spin-then-park rule's threshold is the expected cost of parking, and a spinning waiter on the same pinned cores never saw the tail (p99 ≤ 209 ns) while a parked one did (285–639 µs) — and five fresh-thread rounds are compared by their medians (a disagreement lists the probe degraded, `wake.rounds`). Measured on a quiet host: the median held at 8.9–10.8 µs over ten container runs and the mean at 15.1–17.6 µs on four CPUs; macOS's mean held at 2.03–2.49 µs. The spin window, the step quantum and the timer tick now read the mean, the runtime's inbound ring the p99 at its overflow target, the guest credit's kick round trip the mean; a profile of another format version is refused by name, and a daemon handed one by an older anchor measures its own. The boot mean is quick on a virtual machine (±20–30 % in 250 ms at a coefficient of variation of five to seven); since A-31 (2026-09-25) it is only the prior of each shard's and each client's online estimate, refined from the confirmed wakes they pay (§4.3 and §4.7 status), and the long-step count attributes each long poll to its task or to the host rather than reading wall time. Record: `docs/bugs/2026-09-22-wake-probe-mixes-two-events-and-reports-an-unconverged-tail.md`.
 
@@ -1407,8 +1408,9 @@ only ever issued `PollAdd` and `Nop` through a ring — epoll's job — and the 
 that bought showed a 13% p50 win confined to the parked wake path against a loss of up to 23% at the
 8-client p99 in the spinning path, which is the one R9's sub-50 µs gate measures. It is removed, not
 kept behind a flag: the rule is replace, do not layer. macOS: kqueue with `EVFILT_USER` kicks and non-blocking socket I/O for the NFS
-server. Windows: IOCP with `PostQueuedCompletionStatus` kicks; WinFsp requests arrive on WinFsp's
-threads and are routed to the owning shard by handle. Simulation: a driver that replaces time,
+server. Windows: IOCP with `PostQueuedCompletionStatus` kicks, a blocked wait raised one priority level for as long as it
+blocks (A-361: a completion port's waiter gets none of the wake boost an event's waiter gets, so a kicked shard waited
+out its neighbours' turns); WinFsp requests arrive on WinFsp's threads and are routed to the owning shard by handle. Simulation: a driver that replaces time,
 randomness, sockets, rings, and the bridge with seeded in-process simulations for the whole
 cluster.
 
@@ -4908,10 +4910,11 @@ drops.
 
 **Derived constants.** Ring depth = Little's law on measured per-client request rate × p99
 service time, rounded to a power of two; `spin_ns` = wake_ns.mean (the client's prior); `spin_shift`
-= ⌈log₂ (1.96 · wake_ns.sd / (0.05 · wake_ns.mean))²⌉; idle window = max(F, the shard's wake estimate ×
-the platform's multiple), where F = R9's provisioning floor, 50 µs (`PROVISION_FLOOR`, the requirement itself, which
-the bench gates on too) and the multiple, `loaded_wake_ratio()` (paired `#[cfg]` functions with one signature), is 0
-on Linux and macOS and 100 on Windows (A-223's window rule, below); closed-loop hold = 2F × the least k with
+= ⌈log₂ (1.96 · wake_ns.sd / (0.05 · wake_ns.mean))²⌉; idle window = F, R9's provisioning floor, 50 µs
+(`PROVISION_FLOOR`, the requirement itself, which the bench gates on too), on every platform, no multiple of the wake
+estimate pricing it (`NO_ESTIMATE_MULTIPLE`; A-223's window rule and A-361, below); idle spin ceiling = the liveness
+budget less one beat, 900 ms (`IDLE_SPIN_CEILING`), which no idle spin passes whatever its window or a hold asks, so
+none reaches the watchdog's spin window (A-361); closed-loop hold = 2F × the least k with
 ((S − 1)/S)^k ≤ 1/100, S the shards and 1/100 R9's tail (`config::closed_loop_hold`: 700 µs at two shards, 1.2 ms at
 three, 6.7 ms at fifteen), held by a forward for a request that came within F of its shard's last client I/O, and never
 more cycles of 2F than its loop had run before it (`verbs::loop_hold`; A-326, below).
@@ -4925,8 +4928,8 @@ more cycles of 2F than its loop had run before it (`verbs::loop_hold`; A-326, be
 > spinning cannot lengthen it. The boot probe's smallest confirmed wake was weighed as the other input and dropped: on
 > a quiet boot it is the smallest of many confirmed wakes (5.4–6.6 µs on Linux), but a daemon booted beside spinners
 > read 6.8–346 µs, past F in 5 of 9 boots on each Linux runner, and the daemon cannot tell a loaded boot from a slow
-> machine. Windows keeps the multiple of 100: a Windows shard parked under load waits 50–100 ms to run again, and at
-> F alone every loaded request paid it (GAPS, open). Both live readers, the shard's idle spin and the serve loop,
+> machine. Windows kept the multiple of 100 until A-361 (below): a Windows shard parked under load waited 14–42 ms
+> to run again, and at F alone every loaded request paid it. Both live readers, the shard's idle spin and the serve loop,
 > read the one window (`ShardContext::idle_window_ns`); the step quantum still reads the estimate's mean. Measured: BENCHMARKS, "The idle window's rule"; test:
 > `crates/server/tests/idle_window.rs`.
 
@@ -4945,6 +4948,25 @@ more cycles of 2F than its loop had run before it (`verbs::loop_hold`; A-326, be
 > behind when it ends is at most what the loop itself took, and a paced client's create (after its pause) and its
 > destroy (the first request of a run) hold nothing. No estimate is an input, so (i) still holds. Test:
 > `crates/server/tests/closed_loop.rs` (a loop over three shards finds them polling; a paced client holds none).
+
+> **Status (2026-11-18, A-361: Windows' own window, and every idle spin under the watchdog's).** Windows wakes a thread
+> blocked on an event, a semaphore or an address a priority level up, and a thread dequeued from an I/O completion port
+> at its own level, which is how a parked shard waited. Beside two spinners a logical CPU at the shard's level, on CI's
+> windows-latest and windows-11-arm (`diag-g234-wake-1`), a completion-port waiter woke 29 ms and 14 ms after its kick
+> at the median, 95–112 ms and 32–48 ms at the p99, waiting out the spinners' turns of 31.6 ms, while an event's or
+> WaitOnAddress's waiter woke in 15 µs and 6–7 µs; with its boost disabled the event's waiter waited the same 29 and
+> 14 ms. Now a blocked wait raises a shard at the normal level one level for as long as it blocks and puts it back
+> before it runs anything (§4.3 "Drivers"). The hundred times the estimate Windows kept had priced the window on those
+> waits: windows of seconds, which after a WinFsp request spun past the watchdog's window, and the anchor killed a live
+> daemon in 3 of 3 runs on windows-latest (g258, 2026-11-18). So the window is R9's floor on Windows too, and every
+> idle spin, window or hold, ends by the idle spin's ceiling, a beat under the liveness budget, the least spin window
+> the watchdog judges by (asserted at compile time beside the constants). Measured at two shards (`diag-g234-winbench-1`,
+> three rounds, every N in BENCHMARKS "Windows' own window"): a 1 ms-paced client's CPU fell from 94 and 199 thousandths
+> of a core quiet and 756 and 787 loaded to 7 and 25 quiet and 20 loaded; the loaded single-client p99 from 157 µs with
+> 4 of 9 runs at 56–83 ms (x86_64) and 108 µs with one at 31.9 ms (arm64) to 130 and 148 µs, none past 192 µs; the
+> quiet p99 stayed within main's spread (24 against 26 µs, 31 against 32 µs). Open: a process whose job fixes its
+> priority class (kiln's agent job on jupiter) keeps a raised level where it was, so there a parked shard still waits
+> out its neighbours' turns; the window no longer grows with that wait (GAPS).
 
 **Worked example.** From Python: `await client.create("scratch", bounded=4 GiB)`: the extension
 writes the slot, spins for `spin_ns`, and returns the reply without ever touching the event loop
@@ -15984,7 +16006,8 @@ round's clock and `judge_loop_request` judges each request, an acknowledgement a
 - **Owed (the supervisor's measurement):** `provision_bench` at the derived and at three shards on every CI runner and
   a many-core Linux machine, quiet and loaded, every N: single-client p99 against main's, parks per 1,000 in the
   spinning and paced forms, and the paced form's CPU (GAPS, A-223's entry).
-- **Not decided here: Windows' window** (A-223's open item (C)). The hold applies on Windows too, beside the multiple.
+- **Windows' window** (A-223's open item (C)) was decided by A-361 (2026-11-18): R9's floor there too, and every hold
+  under the idle spin's ceiling.
 
 ### A-223's window rule — The idle window is R9's floor; no estimate prices it on Linux and macOS (accepted 2026-11-11, the supervisor's decision A)
 Applied in the same change to: §4.1 (its status and derived constants), §4.3 (derived constants), §4.7 (derived
@@ -16023,7 +16046,8 @@ rule's table in `config.rs`.
   thousandths of a core quiet and 293–365 loaded (main 859–1,051), its loaded p99 0.34–5.60 ms. The plan's bar of 150
   quiet is not met on Linux or on Windows (131–341, the ×100 it keeps); what a shorter window costs in p99 is the
   plan's step 6. The paced-client test failed 6 of 6 on Linux before the rule and passed 6 of 6 after.
-- **Not decided here: Windows' window.** A Windows shard parked beside two spinners a CPU waits 50–100 ms to run again,
+- **Not decided here: Windows' window** (decided 2026-11-18 by A-361: R9's floor there too, once a blocked wait sits a
+  level up). A Windows shard parked beside two spinners a CPU waits 50–100 ms to run again,
   so F alone made that every loaded request's latency (97–100 ms on windows-latest, 48–56 ms on windows-11-arm,
   against 125–127 µs at the multiple). GAPS holds it open, and §5 lists the 100 as a residual literal.
 
@@ -26150,3 +26174,56 @@ Applied in the same change to:
   failover SLO from its hold: the operator's bound on how long an object may go unserved before a takeover serves it,
   past which a write not yet held is past what the fleet promises. The refusal is the request's recorded outcome.
 
+
+### A-361 — Windows' own window: a blocked completion-port wait raised a level, R9's floor on every platform, and every idle spin under the watchdog's window (2026-11-18, goal g234; A-223's open item (C); the regression of g258's now-x86 lane; the supervisor's guard "an idle shard polling for work is not a wedged shard")
+Applied in the same change to: §4.1 (its status), §4.3 ("Drivers"), §4.7 (derived constants, A-223's status, a status),
+A-223's window rule and A-326 (their Windows items), GAPS (A-223's entry, §5's residual literal, a new open entry),
+BENCHMARKS ("Windows' own window"), `crates/rt` (`iocp.rs`: `RaisedForWait`, `move_level`; `runtime.rs`:
+`WakeTracking::idle_ceiling_ns`, `NO_IDLE_CEILING_NS`; `shard.rs`: the window and the hold held to the ceiling),
+`crates/server` (`config.rs`: `NO_ESTIMATE_MULTIPLE` and `IDLE_SPIN_CEILING` replace `loaded_wake_ratio` and
+`idle_window_ns`, a compile-time assertion beside them), `unsafe-budget.toml` (slates-rt 101 → 102), the tests
+`crates/rt/tests/wake_estimate.rs` (`loaded_wake`), `crates/rt/tests/idle_spin.rs`, `crates/server/src/watchdog.rs`,
+`crates/server/tests/idle_window.rs` (now on Windows too), and the bug record
+`docs/bugs/2026-11-18-a-windows-shards-idle-spin-outran-its-watchdog.md`.
+- **Why a parked Windows shard waited 14–42 ms under load.** Windows raises a thread a priority level when a wait on an
+  event, a semaphore or an address ends, and none when a thread is dequeued from an I/O completion port, which is how a
+  shard parks. Measured on CI's runners beside two spinners a logical CPU at the shard's level (`diag-g234-wake-1`,
+  200 wakes an arm, two rounds; the job runs BelowNormal, base 6, and its turn is 31.6–32.2 ms on both): the waiter's
+  priority after a completion-port wake stayed 6, after an event's or WaitOnAddress's 7. Median wake: completion port
+  29 ms (windows-latest) and 14 ms (windows-11-arm), the runtime's own shard 25–30 and 14 ms, an event 15–17 µs and
+  6–7 µs, an event with its boost disabled 29 and 14 ms, a completion port raised a level for its wait 15–17 µs and
+  6–7 µs. Quiet, every arm woke in 6–15 µs. So the wait was not the clock: it was the kicked shard queued at its own
+  level behind spinners until one's turn ended.
+- **The raise.** A wait that may block raises a thread at the normal level to the next for as long as it blocks and
+  puts it back before it runs anything; a thread set to another level (a test that starves a shard at IDLE) is left
+  alone, and a zero-timeout harvest pays nothing. A raise and its restore cost 0.77–0.88 µs quiet and 1.3–5.5 µs loaded,
+  against a parked wake of 6–15 µs. Proven by `a_parked_shard_wakes_beside_spinners_as_soon_as_a_parked_thread_does`:
+  red on both Windows runners in 6 of 6 rounds (the shard's median 21.5–42 ms against a parked thread's 11–23 µs),
+  green in 6 of 6 with the raise (33–59 µs against 10–23 µs).
+- **One window rule.** The hundred times the estimate that Windows kept (the supervisor's decision of 2026-11-11, for
+  that wait) priced its window on it: seconds. After a WinFsp request a one-shard daemon on windows-latest spun that long
+  with no step, its watchdog judged it spinning ("1015 ms of CPU without a step") and withheld the beat, and the anchor
+  killed it in 3 of 3 runs (g258's now-x86 lane, run 44325673298; its arm from before A-223, whose estimate learned
+  handoffs, never). The window is now R9's floor on every platform. Measured at two shards (`diag-g234-winbench-1`,
+  three rounds, nine runs a cell): the paced client's CPU 94 → 7 and 199 → 25 thousandths of a core quiet, 756 → 20 and
+  787 → 20 loaded; the loaded single-client p99 157 µs with 4 of 9 runs at 56–83 ms → 130 µs, none past 151 µs
+  (x86_64), 108 µs with one at 31.9 ms → 148 µs, none past 192 µs (arm64); the quiet p99 24 against 26 µs and 31
+  against 32 µs. The raise alone with the multiple held the loaded p99 at 54 and 90 µs and kept the paced cost (732 and
+  777).
+- **The guard.** No idle spin runs past `IDLE_SPIN_CEILING`, the liveness budget less a beat, whatever its window, an
+  estimate or a closed loop's hold asks: the watchdog judges a shard spinning at its spin window of CPU without a step,
+  never below the budget (A-318), and an idle spin follows an empty step and ends in a step, a park or one idle slice,
+  so a spin under the budget by a beat cannot reach the verdict on any platform or in any build. A compile-time
+  assertion holds the ceiling under the budget by a beat; the watchdog's own judge sees a ceiling's spin alive at
+  every look in builds as fast as the machine and ten times slower, and a spin of two windows judged spinning; and a
+  runtime pricing its window on an estimate a hundred quiet stretches long, at the largest multiple, spins no longer
+  than its ceiling after an activity or a hold. A daemon-level test was tried and dropped: a supervised daemon whose
+  shards priced their window on such an estimate kept its beat with the ceiling removed too (largest gap 246 ms against
+  a debug spin window of 3.5 s, the budget held to the build's slowdown, on a Mac Studio), so as built it could not
+  fail. The ceiling binds no rule in use (the longest is a closed loop's hold over 1,024 shards, 471 ms).
+- **Open.** A process in a job that fixes its priority class (kiln's agents on jupiter: `JOB_OBJECT_LIMIT_PRIORITY_CLASS`,
+  BelowNormal) keeps a thread's level where it was: `SetThreadPriority` answers success and the level stays. There a
+  parked shard still waits out its neighbours' turns under load (jupiter: 30.75 ms against 12.5 µs), though its window
+  stays R9's floor. The loaded-wake test skips loudly there. Owed: a shard with no I/O outstanding parks where Windows
+  boosts the wake (an address of its parking word), which needs the parking protocol to name the object its kickers
+  signal, and the loom model with it.
