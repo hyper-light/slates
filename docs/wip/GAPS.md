@@ -6,13 +6,16 @@
 > policy's typed refusal); signed work's types (`WorkSignature`, `Verification::{Verified, Unsigned, Invalid}`, a
 > volume's `require_signed_merges`); `LandOutcome`, `MergeOutcome`, `RebaseOutcome`, `Approval` with a typed summary;
 > typed landing and merge conflicts; typed provisioning (`VolumeSpec` over each source), status and drift; one closed
-> `Error` whose class is what a consumer does, mapped from every wire refusal in one exhaustive table; `CONTRACT` = 1.
+> `Error` whose class is what a consumer does, mapped from every wire refusal in one exhaustive table; `CONTRACT` = 2
+> (2 adds `Denied::Policy`, where A-285's `Refusal::PolicyForbids` maps outside a landing or a merge).
 > **Owed, in order:**
 > - the starter handed the launcher's authority on every platform (Linux: the anchor passes the segment's descriptor
 >   back to its starter);
-> - the daemon's side (A-285's owner): the modes kept and enforced per consumer and volume, bypass landing at once,
->   forbid refused `PolicyRefusal`, approvals of merges, signed work verified, and the verbs that set a policy and hand
->   out the statement a signer signs; then `Instance::set_write_policy` / `write_policy`;
+> - the daemon's side (A-285's owner): a volume's land mode is built (203ad8fa) and reaches the contract
+>   (`set_write_policy`, `write_policy`, `Refused` outcomes; piece 5, `CONTRACT` = 3); owed: a consumer's own mode,
+>   merges under a mode and their approvals, a present-only verb (until then `plan_landing` refuses a bypass volume
+>   rather than write it), the MCP and SDK land verb under the mode, signed work verified with the statement a signer
+>   signs and the trusted signers a launcher registers;
 > - typed fields on the wire for an overlay's drift, a presentation's conflicts, a landing target's refusal and a
 >   merge's versions (the work's base beside the head), replacing the crate's reading of the status text;
 > - a paged volume listing; typed audit kinds and grant states;

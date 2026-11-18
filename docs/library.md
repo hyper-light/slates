@@ -67,11 +67,14 @@ green) follow the permission the user gave the harness or agent asking to write:
 | `Forbid` | `LandOutcome::Refused(policy_refusal)` | `MergeOutcome::Refused(policy_refusal)` |
 
 Conflicts are their own outcome in both (`Conflicted`), typed per path. The launcher sets a
-`WritePolicy` per agent (an enrolled consumer) or per volume, and an act follows the stricter of the
-two; an agent can never raise its own. The daemon's side of the modes is being built (A-285): until
-it lands, every landing with something to write answers `ApprovalRequired`, and the launcher
-approves it with `Instance::approve(&approval, &issuer)`, which writes exactly the manifest shown or
-answers the new presentation when the volume or the disk changed since.
+`WritePolicy` per volume with `Instance::set_write_policy(PolicySubject::Volume(v), &policy, &issuer)`
+and reads it with `write_policy` (`None` while unset, which asks); an act follows the stricter of
+the volume's and, once the daemon keeps them, the agent's own; an agent can never raise its own (the
+daemon refuses the verb on an agent's channel). The launcher approves an ask with
+`Instance::approve(&approval, &issuer)`, which writes exactly the manifest shown or answers the new
+presentation when the volume or the disk changed since. Owed on the daemon's side: an agent's own
+mode, merges under a mode, and a verb that presents a bypass volume's landing without writing it —
+until then `plan_landing` refuses a bypass volume rather than write it.
 
 ### Signed work
 

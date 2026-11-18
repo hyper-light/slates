@@ -7030,7 +7030,9 @@ it builds against the contract and adds to it rather than around it.
 > closed taxonomy with one exhaustive table over the wire's refusals, the channel's and this
 > process's own faults (`error`), and `Instance::{provision, read, land, plan_landing,
 > approval_entries, approve, merge, rebase, retry_pause_ns}` over today's daemon, on which every
-> landing with something to write asks and the launcher approves it with the issuer; `CONTRACT` = 1.
+> landing with something to write asks and the launcher approves it with the issuer; `CONTRACT` = 1,
+> then 2 the same day (`Denied::Policy`, the class a policy refusal takes outside a landing or a merge,
+> agreed with A-285's owner before its `Refusal::PolicyForbids` reaches the wire).
 > The CLI's mount, grant, enroll, revoke, run and recover map the taxonomy to its exit codes.
 > Proven by use over an in-process daemon (`crates/api/tests/api.rs`: the group missing is
 > `Unusable(NoGroup)`; provisioning from each source, `AlreadyExists` naming the holder, a destroyed
@@ -7047,6 +7049,20 @@ it builds against the contract and adds to it rather than around it.
 > on the wire for drift, a presentation's conflicts, a landing's target refusal and a merge's
 > versions (the work's base beside the head), replacing what the crate reads from text or asks
 > again; a paged listing; typed audit and grant states.
+
+> **Status (2026-11-18, A-299, piece 5: the write modes reach the contract).** Over A-285's policy
+> wire (203ad8fa): `Instance::set_write_policy(subject, &policy, &launcher)`, proven by the
+> launcher's issuer, and `Instance::write_policy(subject)` (`None` while unset, which asks); a
+> landing or a merge a policy forbids answers its `Refused` outcome (`PolicyRefusal { act, by,
+> reason }`), any other call `Denied::Policy`; a policy that requires signed merges is refused
+> `Unsupported(SignedWork)` before anything is sent, since the daemon keeps no such requirement yet;
+> `CONTRACT` = 3. `plan_landing` reads the volume's mode first and refuses a bypass volume
+> `Unsupported(WritePolicies)` rather than write it: the daemon presents and lands a bypass volume
+> in one request, and a present-only verb is owed (asked of A-285's owner). Proven by use
+> (`a_landing_follows_its_volumes_write_mode`: unset reads back as none; a bypass volume lands in
+> the one call, `Done`, its file on the disk, while its plan is refused and writes nothing; a
+> forbidding one answers `Refused` by its own policy, nothing written; the signed requirement
+> refused before the daemon is asked).
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -21286,7 +21302,9 @@ contract", new, with its status), GAPS (the A-299 entry and the Embedding librar
   it, so a mount still reads the daemon's port.
 - **Closed, and versioned for a pinning consumer.** The A-278 crate's enums were `#[non_exhaustive]`, which forces a
   wildcard and lets a new variant fall through it unhandled. Kiln vendors slates at a commit; a new variant should stop
-  its build where it must decide, so every contract enum is exhaustive and `CONTRACT` (1) is raised with every change.
+  its build where it must decide, so every contract enum is exhaustive and `CONTRACT` is raised with every change: 1 as
+  first published, 2 the same day for `Denied::Policy` (the class `Refusal::PolicyForbids` maps to outside a landing or a
+  merge, defined before A-285's owner appends that refusal, so its arm in the exhaustive table is mechanical).
 - **Write permission, split between the crate and the daemon.** The modes are enforced where agents reach slates — the
   daemon, through the MCP server, the SDKs and the mounts as much as this crate — so the daemon keeps them (A-285's
   owner). The crate publishes the types now so kiln's agents (g263–g266) build against them. Until the daemon's side
@@ -21297,6 +21315,13 @@ contract", new, with its status), GAPS (the A-299 entry and the Embedding librar
   base, a handle can be stale, and the wire carries it next (owed). A paged listing faked over the one-reply list: the
   daemon answers every volume in one reply today, and a page the daemon did not cut would hide that cost; the paged
   verb is owed. Policy verbs that could only refuse until the daemon keeps policies: left out until they work.
+- **Piece 5, the same day** (over A-285's policy wire, 203ad8fa): `Instance::set_write_policy` (the launcher's
+  `Issuer` proves `slates_server::landing::policy_proof` over the subject and policy) and `Instance::write_policy`;
+  `PolicyForbids` answered as a landing's or a merge's `Refused` outcome and as `Denied::Policy` elsewhere (A-285's
+  owner added the variant's arm the same hour, and the two definitions were one); the API's policy converted to and
+  from the wire's, its signed-merge requirement refused before sending; `plan_landing` refusing a bypass volume until a
+  present-only verb exists; `CONTRACT` 3. Applied to `crates/api/src/{policy,issuer,instance,error,lib}.rs`,
+  `tests/api.rs` (`a_landing_follows_its_volumes_write_mode`), §4.12's status, GAPS, `docs/library.md`.
 - **Checked.** `cargo test -p slates-api` (37 unit, 9 by use, 5 start, 1 doc) and `cargo test -p slates-cli` on
   macOS arm64 (kiln runner, 2026-11-18): the cases in §4.12's status. The Linux and Windows arms of the mount and the
   CLI's Windows unmount are not compiled on this host; the integrator's lanes are their first compiler.

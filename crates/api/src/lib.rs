@@ -91,8 +91,10 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Format: the consumer contract's version (§4.12 "Versioning", A-299), raised by one with every change to a type or a
 /// verb of the contract; a consumer asserts the one it was written against. 1: the contract as A-299 first published it
-/// (2026-11-18).
-pub const CONTRACT: u32 = 1;
+/// (2026-11-18). 2: `Denied::Policy`, the class a write policy's refusal takes outside a landing or a merge (the
+/// same day). 3: `Instance::set_write_policy` and `Instance::write_policy`, over the daemon's policy verbs (A-285), and
+/// a landing or a merge a policy forbids answered as its `Refused` outcome (the same day).
+pub const CONTRACT: u32 = 3;
 
 /// The typed client and its own types, for the verbs [`Instance::client`] lends outside the contract.
 pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, VhostUserDevice};

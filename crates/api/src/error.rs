@@ -43,6 +43,8 @@ use slates_ipc::protocol::{
 };
 use slates_ipc::{DeliveryFault, IpcError};
 
+use crate::policy::PolicyRefusal;
+
 /// Words for a person, carried beside a typed variant: what the daemon or the OS said in prose. A consumer decides on
 /// the variant; a note is only shown, so its one accessor is [`fmt::Display`].
 #[derive(Clone, PartialEq, Eq)]
@@ -204,8 +206,10 @@ pub enum Denied {
   },
   /// The consumer capability a harness delivers on an inherited descriptor could not be taken (§4.13).
   CapabilityNotDelivered(DeliveryFault),
-  /// A write policy refused the act (A-285): nothing was written.
-  Policy(crate::policy::PolicyRefusal),
+  /// A write policy refused the act (A-299): the daemon's refusal where a call other than a landing or a merge meets
+  /// it. A landing and a merge answer it as their own outcome ([`crate::LandOutcome::Refused`],
+  /// [`crate::MergeOutcome::Refused`]), since in a forbidding mode it is the expected answer.
+  Policy(PolicyRefusal),
 }
 
 /// Which bound is reached.
@@ -418,8 +422,8 @@ pub enum Unsupported {
   /// A merge or a landing that carries a signature: the daemon's verifier for signed work is not in this build
   /// ([`crate::signed`]). Nothing was sent.
   SignedWork,
-  /// A write-policy verb: the daemon's side of the write modes is not in this build ([`crate::policy`]). Nothing was
-  /// sent.
+  /// A write-policy feature the daemon does not offer yet: an approval of a merge, or presenting a landing of a bypass
+  /// volume without writing it (no present-only verb yet; [`crate::Instance::plan_landing`]). Nothing was sent.
   WritePolicies,
 }
 
@@ -722,21 +726,7 @@ impl Error {
       }),
       Refusal::NotShared { principal, .. } => Error::Denied(Denied::NotShared { principal }),
       Refusal::PolicyForbids { act, by } => {
-        Error::Denied(Denied::Policy(crate::policy::PolicyRefusal {
-          act: match act {
-            slates_ipc::protocol::WriteAct::Merge => crate::policy::WriteAct::Merge,
-            slates_ipc::protocol::WriteAct::Land => crate::policy::WriteAct::Land,
-          },
-          by: match by {
-            slates_ipc::protocol::PolicySubject::Consumer { consumer } => {
-              crate::policy::PolicySubject::Consumer(consumer)
-            }
-            slates_ipc::protocol::PolicySubject::Volume { volume } => {
-              crate::policy::PolicySubject::Volume(volume)
-            }
-          },
-          reason: crate::policy::PolicyReason::Forbidden,
-        }))
+        Error::Denied(Denied::Policy(PolicyRefusal::forbidden(act, by)))
       }
       Refusal::ConsumerNotEnrolled => Error::Denied(Denied::NotEnrolled),
       Refusal::ConsumerRevoked => Error::Denied(Denied::Revoked),
