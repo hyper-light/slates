@@ -156,7 +156,8 @@ pub trait HostFs {
 pub struct LandCapabilities {
   /// An atomic exchange of two names exists (`RENAME_EXCHANGE`, `RENAME_SWAP`).
   pub exchange: bool,
-  /// Reflinks exist (`FICLONE`, `clonefile`).
+  /// Reflinks exist (`FICLONE`, `clonefile`, ReFS block cloning: A-445): [`LandFs::clone_temp`] shares an
+  /// earlier temporary's bytes instead of copying them.
   pub reflink: bool,
   /// Unnamed temporaries exist (`O_TMPFILE`); otherwise a hidden sibling name is used.
   pub unnamed_temporaries: bool,
@@ -183,6 +184,20 @@ pub trait LandFs: HostFs {
   /// A new, empty, writable file under `dir`: unnamed where the filesystem allows, else at the
   /// hidden sibling `name`; it becomes visible only through [`LandFs::place`].
   fn create_temp(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError>;
+  /// A new temporary at the hidden sibling `name` under `dir` (named, as `create_temp` names one where the filesystem
+  /// has no unnamed ones) holding the first `len` bytes of `from`, an earlier temporary of the same landing whose bytes
+  /// are all written, shared with it rather than copied (§4.15 step 6, A-445): ReFS block cloning on Windows (Linux
+  /// `FICLONE` and macOS `clonefile` are owed). Asked only where [`LandCapabilities::reflink`] says the filesystem has
+  /// it; refused `EOPNOTSUPP` (`ENOTSUP` on macOS) where this pair cannot be shared (another volume, the volume's
+  /// limit on a cluster's sharers, a file attribute the two do not share), with nothing left behind, so the engine
+  /// writes the bytes as it would have.
+  fn clone_temp(
+    &mut self,
+    dir: HostDir,
+    name: &str,
+    from: HostFile,
+    len: u64,
+  ) -> Result<HostFile, HostError>;
   /// Writes at an offset (the whole buffer, or a refusal).
   fn write_at(&mut self, file: HostFile, off: u64, bytes: &[u8]) -> Result<(), HostError>;
   /// The file is final — its bytes, mode and mtime written (§4.15 step 8, A-130) — and joins its batch: its writeback

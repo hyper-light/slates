@@ -25,6 +25,13 @@
 //!   write bit makes the file read-only (`FILE_ATTRIBUTE_READONLY`), as A-262 reads a file's read-only state as its
 //!   mode, and every other bit the file holds is kept. The modification time is set through `FILE_BASIC_INFO` in the
 //!   FILETIME domain.
+//! - **Reflinks (A-445):** where the target's volume shares clusters between files (ReFS, a Dev Drive:
+//!   `FILE_SUPPORTS_BLOCK_REFCOUNTING`), a file whose bytes its batch already staged is cloned from that temporary by
+//!   `FSCTL_DUPLICATE_EXTENTS_TO_FILE`, in regions of whole clusters below 4 GiB laid out from the volume's own cluster
+//!   (`crate::block_clone`), the new file's end first set to the length rounded up to a cluster and set back after.
+//!   NTFS shares nothing, so its capability says so and the engine never asks. A pair the volume refuses to share (the
+//!   cluster's 8,175 sharers, the two files' integrity streams, another volume) is refused `EOPNOTSUPP` with nothing
+//!   left, and the engine writes its bytes.
 //! - **Symbolic links (A-438):** a volume link is landed as the Windows symbolic link the WinFsp drive shows for it
 //!   (A-275's form, `slates_vfs::host::windows_link`): a relative target with `\` and `SYMLINK_FLAG_RELATIVE`, a
 //!   Windows-absolute one under `\??\`. Handle-relative, as every verb here: the empty object made at the landing's
@@ -70,8 +77,8 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Storage::FileSystem::{
   DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY,
   FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY,
-  FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
-  FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FileAttributeTagInfo, FileBasicInfo,
+  FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+  FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FileAttributeTagInfo, FileBasicInfo,
   FileDispositionInfoEx, FlushFileBuffers, GetFileInformationByHandleEx, SYNCHRONIZE,
   SetFileInformationByHandle,
 };
@@ -88,8 +95,10 @@ const ERRNO_NOTSUP: i32 = 95;
 const ERRNO_PERM: i32 = 1;
 /// Format: every share mode, so a handle the writer holds never blocks a user's read, write, rename or delete.
 const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
-/// Format: a temporary's access: written, its attributes and times set, moved and flushed (`DELETE` to rename it).
-const TEMP_ACCESS: u32 = FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES | DELETE | SYNCHRONIZE;
+/// Format: a temporary's access: written, its attributes and times set, moved and flushed (`DELETE` to rename it), and
+/// read as the source of a clone (`FILE_READ_DATA`, which `FSCTL_DUPLICATE_EXTENTS_TO_FILE` asks of its source, A-445).
+const TEMP_ACCESS: u32 =
+  FILE_GENERIC_WRITE | FILE_READ_DATA | FILE_READ_ATTRIBUTES | DELETE | SYNCHRONIZE;
 /// Format: an entry opened to be moved or removed: nothing of its data, its attributes, and `DELETE`.
 const MOVE_ACCESS: u32 = DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
 /// Format: a directory this writer makes: listed, traversed and its attributes read, as the host retains one.
@@ -370,6 +379,149 @@ fn dispose(entry: BorrowedHandle<'_>) -> Result<(), HostError> {
     return Err(last_refusal());
   }
   Ok(())
+}
+
+/// Format: `FILE_SUPPORTS_BLOCK_REFCOUNTING` (winnt.h): the volume shares logical clusters between files on it (ReFS's
+/// block cloning, Microsoft Learn, `GetVolumeInformationByHandleW`).
+const BLOCK_REFCOUNTING: u32 =
+  windows_sys::Win32::System::SystemServices::FILE_SUPPORTS_BLOCK_REFCOUNTING;
+
+/// Whether the volume the directory `dir` is on shares clusters between files (`FILE_SUPPORTS_BLOCK_REFCOUNTING`): a
+/// landing's reflinks there (A-445).
+fn shares_clusters(dir: BorrowedHandle<'_>) -> Result<bool, HostError> {
+  let mut flags = 0u32;
+  // SAFETY: `dir` is open for the call; only the file system's flags are asked for (a writable local), every buffer
+  // left null with its length zero.
+  let read = unsafe {
+    windows_sys::Win32::Storage::FileSystem::GetVolumeInformationByHandleW(
+      dir.as_raw_handle().cast(),
+      std::ptr::null_mut(),
+      0,
+      std::ptr::null_mut(),
+      std::ptr::null_mut(),
+      &mut flags,
+      std::ptr::null_mut(),
+      0,
+    )
+  };
+  if read == 0 {
+    return Err(last_refusal());
+  }
+  Ok(flags & BLOCK_REFCOUNTING != 0)
+}
+
+/// The volume's cluster in bytes (its allocation unit: sectors per unit times bytes per sector, `FileFsSizeInformation`),
+/// asked of an open handle on it: what every clone region aligns to (A-445).
+fn cluster_bytes(on: BorrowedHandle<'_>) -> Result<u64, HostError> {
+  let mut size = windows_sys::Wdk::System::SystemServices::FILE_FS_SIZE_INFORMATION::default();
+  let mut status_block = windows_sys::Win32::System::IO::IO_STATUS_BLOCK::default();
+  let length =
+    u32::try_from(size_of_val(&size)).map_err(|_| code_refusal(ERROR_FILENAME_EXCED_RANGE))?;
+  // SAFETY: `on` is open for the call; `size` is a writable record of the class asked, of the length passed, and
+  // `status_block` a writable status record.
+  let status = unsafe {
+    nt::NtQueryVolumeInformationFile(
+      on.as_raw_handle().cast(),
+      &mut status_block,
+      (&raw mut size).cast(),
+      length,
+      nt::FileFsSizeInformation,
+    )
+  };
+  if status < 0 {
+    return Err(status_refusal(status));
+  }
+  u64::from(size.SectorsPerAllocationUnit)
+    .checked_mul(u64::from(size.BytesPerSector))
+    .ok_or(HostError::Unavailable(ERRNO_NOTSUP))
+}
+
+/// Sets the end of the file `file` to `end` bytes (`FileEndOfFileInfo`): grown with zeros, or cut.
+fn set_end(file: BorrowedHandle<'_>, end: u64) -> Result<(), HostError> {
+  let info = windows_sys::Win32::Storage::FileSystem::FILE_END_OF_FILE_INFO {
+    EndOfFile: i64::try_from(end).map_err(|_| HostError::Unavailable(ERRNO_NOSPC))?,
+  };
+  let size = u32::try_from(size_of_val(&info)).unwrap_or(0);
+  // SAFETY: `file` is open with `FILE_WRITE_DATA`; `info` is a filled record of the class named, of the size passed.
+  let set = unsafe {
+    SetFileInformationByHandle(
+      file.as_raw_handle().cast(),
+      windows_sys::Win32::Storage::FileSystem::FileEndOfFileInfo,
+      (&raw const info).cast(),
+      size,
+    )
+  };
+  if set == 0 {
+    return Err(last_refusal());
+  }
+  Ok(())
+}
+
+/// Clones `length` bytes at `offset` of `source` to the same offset of `target` (`FSCTL_DUPLICATE_EXTENTS_TO_FILE`, a
+/// region of whole clusters below 4 GiB, `crate::block_clone`): refused `EOPNOTSUPP` where the volume will not share
+/// this pair ([`clone_refusal`]).
+fn duplicate_extents(
+  source: BorrowedHandle<'_>,
+  target: BorrowedHandle<'_>,
+  offset: u64,
+  length: u64,
+) -> Result<(), HostError> {
+  use windows_sys::Win32::System::Ioctl::{
+    DUPLICATE_EXTENTS_DATA, FSCTL_DUPLICATE_EXTENTS_TO_FILE,
+  };
+  let at = |value: u64| i64::try_from(value).map_err(|_| HostError::Unavailable(ERRNO_NOTSUP));
+  let region = DUPLICATE_EXTENTS_DATA {
+    FileHandle: source.as_raw_handle().cast(),
+    SourceFileOffset: at(offset)?,
+    TargetFileOffset: at(offset)?,
+    ByteCount: at(length)?,
+  };
+  let size = u32::try_from(size_of_val(&region)).unwrap_or(0);
+  let mut returned = 0u32;
+  // SAFETY: `target` is open with `FILE_WRITE_DATA` and synchronous (`FILE_SYNCHRONOUS_IO_NONALERT`), so no overlapped
+  // record is passed; `region` names `source`, open with `FILE_READ_DATA` for the call, and is readable for `size`
+  // bytes; nothing is written back but `returned`, a writable local.
+  let cloned = unsafe {
+    windows_sys::Win32::System::IO::DeviceIoControl(
+      target.as_raw_handle().cast(),
+      FSCTL_DUPLICATE_EXTENTS_TO_FILE,
+      (&raw const region).cast(),
+      size,
+      std::ptr::null_mut(),
+      0,
+      &mut returned,
+      std::ptr::null_mut(),
+    )
+  };
+  if cloned != 0 {
+    return Ok(());
+  }
+  let code = std::io::Error::last_os_error()
+    .raw_os_error()
+    .and_then(|code| u32::try_from(code).ok())
+    .unwrap_or(0);
+  Err(clone_refusal(code))
+}
+
+/// A clone's refusal as the seam reports it (A-445): the volume's refusals to share this pair, each with nothing
+/// written, are `EOPNOTSUPP`, after which the engine writes the bytes: no sharing at all (`ERROR_NOT_SUPPORTED`,
+/// `ERROR_INVALID_FUNCTION`), a cluster already shared by its limit of regions (`ERROR_BLOCK_TOO_MANY_REFERENCES`),
+/// another volume (`ERROR_NOT_SAME_DEVICE`), and a pair whose integrity streams or sparseness differ
+/// (`ERROR_INVALID_PARAMETER`, which ReFS answers for every precondition Microsoft lists). Every other code is the
+/// clone's failure in Windows' own number, as a write's.
+fn clone_refusal(code: u32) -> HostError {
+  use windows_sys::Win32::Foundation::{
+    ERROR_BLOCK_TOO_MANY_REFERENCES, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER,
+    ERROR_NOT_SAME_DEVICE, ERROR_NOT_SUPPORTED,
+  };
+  match code {
+    ERROR_NOT_SUPPORTED
+    | ERROR_INVALID_FUNCTION
+    | ERROR_BLOCK_TOO_MANY_REFERENCES
+    | ERROR_NOT_SAME_DEVICE
+    | ERROR_INVALID_PARAMETER => HostError::Unavailable(ERRNO_NOTSUP),
+    other => code_refusal(other),
+  }
 }
 
 /// Sets `buffer` (an `IO_REPARSE_TAG_SYMLINK` `REPARSE_DATA_BUFFER`) as the reparse point of the empty object `object`,
@@ -955,13 +1107,66 @@ impl HostFs for OsLand {
 }
 
 impl LandFs for OsLand {
+  /// NTFS has no exchange and no unnamed temporary; reflinks where the target's volume shares clusters between files
+  /// (`shares_clusters`: ReFS, a Dev Drive).
   fn capabilities(&mut self, dir: HostDir) -> Result<LandCapabilities, HostError> {
-    self.dir(dir)?;
+    let reflink = shares_clusters(self.dir(dir)?)?;
     Ok(LandCapabilities {
       exchange: false,
-      reflink: false,
+      reflink,
       unnamed_temporaries: false,
     })
+  }
+
+  /// A new temporary at `name` holding the first `len` bytes of the temporary `from`, shared by ReFS's block cloning
+  /// (the module's "Reflinks"): its end set to the length rounded up to a whole cluster of the volume
+  /// (`crate::block_clone`), each region cloned, the end set to `len`. A refusal to share this pair answers
+  /// `EOPNOTSUPP` (`clone_refusal`) and whatever refused, the new file is removed: nothing is left behind.
+  fn clone_temp(
+    &mut self,
+    dir: HostDir,
+    name: &str,
+    from: HostFile,
+    len: u64,
+  ) -> Result<HostFile, HostError> {
+    let parent = self.dir(dir)?;
+    let cluster = cluster_bytes(parent)?;
+    let unshareable = |_| HostError::Unavailable(ERRNO_NOTSUP);
+    let end = crate::block_clone::clone_end(len, cluster).map_err(unshareable)?;
+    let regions = crate::block_clone::clone_regions(len, cluster).map_err(unshareable)?;
+    let source = self.file(from)?;
+    let made = nt_create(
+      parent,
+      name,
+      TEMP_ACCESS,
+      nt::FILE_CREATE,
+      nt::FILE_NON_DIRECTORY_FILE,
+      FILE_ATTRIBUTE_NORMAL,
+    )?;
+    let shared = set_end(made.as_handle(), end)
+      .and_then(|()| {
+        regions.iter().try_for_each(|&(offset, length)| {
+          duplicate_extents(source, made.as_handle(), offset, length)
+        })
+      })
+      .and_then(|()| set_end(made.as_handle(), len));
+    if let Err(refused) = shared {
+      if let Err(left) = dispose(made.as_handle()) {
+        slates_machine::log_line!(
+          "slates-land: a refused clone's temporary {name} stays for the sweep: {left:?}"
+        );
+      }
+      return Err(refused);
+    }
+    let file = self.host.adopt_file(made)?;
+    self.temps.insert(
+      file.0,
+      Temp {
+        dir,
+        name: name.into(),
+      },
+    );
+    Ok(file)
   }
 
   fn create_temp(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError> {
