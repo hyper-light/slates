@@ -131,6 +131,63 @@ fn run_cycle(client: &mut Client, spec: &CreateSpec) {
   client.destroy(volume).unwrap();
 }
 
+/// What one run of the loop measured from the client: its returns to an owner later than the hold, its longest return,
+/// and its mean cycle.
+#[derive(Debug)]
+struct LoopRun {
+  late_returns: u64,
+  longest_return: Duration,
+  cycle: Duration,
+}
+
+/// Runs the loop's `cycles`, cycle `n` on owner `n % owners` with its `n / owners`th spec, and measures each owner's
+/// returns: the time from its last cycle's end to its next one's start.
+fn run_loop(
+  client: &mut Client,
+  specs: &[Vec<CreateSpec>],
+  cycles: std::ops::Range<usize>,
+  hold: Duration,
+) -> LoopRun {
+  let mut last_visit: Vec<Option<Instant>> = vec![None; specs.len()];
+  let mut run = LoopRun {
+    late_returns: 0,
+    longest_return: Duration::ZERO,
+    cycle: Duration::ZERO,
+  };
+  let (count, started) = (cycles.len(), Instant::now());
+  for n in cycles {
+    let owner = n % specs.len();
+    if let Some(gap) = last_visit[owner].map(|last| last.elapsed()) {
+      run.longest_return = run.longest_return.max(gap);
+      run.late_returns += u64::from(gap > hold);
+    }
+    run_cycle(client, &specs[owner][n / specs.len()]);
+    last_visit[owner] = Some(Instant::now());
+  }
+  run.cycle = started.elapsed() / u32::try_from(count.max(1)).unwrap();
+  run
+}
+
+/// Runs [`PACED_CYCLES`] cycles [`PACE`] apart, round every shard: on the client's own shard (`own`) every `shards`th
+/// cycle, and on the owners in turn (`looped`, from cycle `from` on) between.
+fn run_paced(
+  client: &mut Client,
+  (own, looped): (&[CreateSpec], &[Vec<CreateSpec>]),
+  from: usize,
+  shards: usize,
+) {
+  let mut next = from;
+  for n in 0..PACED_CYCLES {
+    wait(PACE);
+    if n % shards == 0 {
+      run_cycle(client, &own[n / shards]);
+    } else {
+      run_cycle(client, &looped[next % looped.len()][next / looped.len()]);
+      next += 1;
+    }
+  }
+}
+
 /// Waits `span` on the test thread, however early a park returns.
 fn wait(span: Duration) {
   let started = Instant::now();
@@ -185,54 +242,26 @@ fn a_closed_loops_creates_find_the_shards_it_goes_round_polling_and_a_paced_clie
     .into_iter()
     .map(spec)
     .collect();
-  let looped = |cycle: usize| &looped_specs[cycle % owners.len()][cycle / owners.len()];
-  for n in 0..warm {
-    run_cycle(&mut client, looped(n));
-  }
+  run_loop(&mut client, &looped_specs, 0..warm, hold);
   let before = parks_and_holds(&daemon);
-  let mut last_visit: Vec<Option<Instant>> = vec![None; owners.len()];
-  let (mut late_returns, mut longest_return) = (0, Duration::ZERO);
-  let looping = Instant::now();
-  for n in warm..warm + LOOP_CYCLES {
-    let owner = n % owners.len();
-    if let Some(last) = last_visit[owner] {
-      let gap = last.elapsed();
-      longest_return = longest_return.max(gap);
-      if gap > hold {
-        late_returns += 1;
-      }
-    }
-    run_cycle(&mut client, looped(n));
-    last_visit[owner] = Some(Instant::now());
-  }
-  let cycle_time = looping.elapsed() / u32::try_from(LOOP_CYCLES).unwrap();
+  let looped = run_loop(&mut client, &looped_specs, warm..warm + LOOP_CYCLES, hold);
   let after_loop = parks_and_holds(&daemon);
   wait(hold.saturating_mul(2));
   let rested = parks_and_holds(&daemon);
-  // The paced cycles go round every shard: on an owner through a forward, on the client's own shard served there.
-  let mut next_owner_cycle = warm + LOOP_CYCLES;
-  for n in 0..PACED_CYCLES {
-    wait(PACE);
-    if n % shards == 0 {
-      run_cycle(&mut client, &own_specs[n / shards]);
-    } else {
-      run_cycle(&mut client, looped(next_owner_cycle));
-      next_owner_cycle += 1;
-    }
-  }
+  run_paced(
+    &mut client,
+    (&own_specs, &looped_specs),
+    warm + LOOP_CYCLES,
+    shards,
+  );
   let paced = parks_and_holds(&daemon);
   drop(client);
   daemon.stop();
   println!(
-    "closed loop: {TEST_SHARDS} shards, a cycle {cycle_time:?}, hold {hold:?}, returns at most {longest_return:?} \
-     apart and {late_returns} later than the hold; parks and holds before {before:?}, after the loop {after_loop:?}, \
-     rested {rested:?}, paced {paced:?}"
+    "closed loop: {TEST_SHARDS} shards, {looped:?}, hold {hold:?}; parks and holds before {before:?}, after the loop \
+     {after_loop:?}, rested {rested:?}, paced {paced:?}"
   );
-  judge_loop(
-    gained(&before, &after_loop, &owners),
-    (late_returns, longest_return),
-    hold,
-  );
+  judge_loop(gained(&before, &after_loop, &owners), &looped, hold);
   let (paced_parks, paced_holds) = gained(&rested, &paced, &owners);
   let all: Vec<usize> = (0..usize::from(TEST_SHARDS)).collect();
   assert_eq!(
@@ -253,11 +282,8 @@ fn a_closed_loops_creates_find_the_shards_it_goes_round_polling_and_a_paced_clie
 /// in the longest return the loop measured; and one park an owner for the counters' own question, which reaches a
 /// parked shard. Fewer than half the forwards held means the build ran slower than R9's closed loop at least as often
 /// as within it, so the run says so and judges nothing.
-fn judge_loop(
-  (parks, holds): (u64, u64),
-  (late_returns, longest_return): (u64, Duration),
-  hold: Duration,
-) {
+fn judge_loop((parks, holds): (u64, u64), looped: &LoopRun, hold: Duration) {
+  let (late_returns, longest_return) = (looped.late_returns, looped.longest_return);
   let returns = u64::try_from(LOOP_CYCLES).unwrap();
   let forwards = returns * 2;
   if holds * 2 < forwards {
