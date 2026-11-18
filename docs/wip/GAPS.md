@@ -4093,9 +4093,10 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 >       configuration naming both nodes and answered a forwarded read within a bound derived from its own estimates
 >       before the cut (the handshake's initial probe timeout, RFC 9002 §6.2.2; four of the session's probe timeouts;
 >       the detector's verdict for the pair, expected arrival plus margin; two coordinator periods; a membership
->       horizon). Forwarded read answered 0.56 to 1.53 s after the heal against bounds of 1.82 to 3.37 s: 10 of 10 on
->       Adas-Mac-Studio (macOS arm64, load 9 to 18) and 12 of 12 on GitHub's ubuntu x86_64 and arm64 runners (diag
->       runs 44342202455 and 44342920360), with 53 to 11,611 datagrams dropped each way at the relay.
+>       horizon). Forwarded read answered 0.25 to 1.53 s after the heal against bounds of 1.82 to 3.37 s: 13 of 13 on
+>       Adas-Mac-Studio (macOS arm64, load 9 to 18) and 18 of 18 on GitHub's ubuntu x86_64 and arm64 runners (diag
+>       runs 44342202455, 44342920360 and, merged with main, 44344637800), with 53 to 11,611 datagrams dropped each
+>       way at the relay.
 >     What remains for g066d is the path itself: the client reached adacachy over the Mac's Wi-Fi. Seen in 2 of those
 >     runs and passed to g255 (forward-lane budgets): right after the heal a forward lane's floor read 175 s, past the
 >     10 s SLO, from a probe timeout of 24.9 s, about 64 times the session's live one, as if still backed off by the
