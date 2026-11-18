@@ -1,0 +1,373 @@
+//! The I/O completion port driver (Windows): `PostQueuedCompletionStatus` for kicks and no-ops,
+//! `GetQueuedCompletionStatusEx` with a timeout for the wait [B: Microsoft Learn].
+//!
+//! **A blocked wait sits one level above normal (A-361).** Windows raises a thread's priority a level when an event, a
+//! semaphore or an address it waits on wakes it, and none when it is dequeued from an I/O completion port, which is how a
+//! parked shard waits. Measured on CI's Windows runners (2026-11-18, diag-g234-wake-1, two spinning threads a logical CPU
+//! at the job's own BelowNormal level): a thread woken from a completion port stayed at its base priority and ran 29 ms
+//! (windows-latest) and 14 ms (windows-11-arm) after its kick at the median, 95–112 ms and 32–48 ms at the p99, as the
+//! runtime's own parked shard did, waiting out the spinners' turns of 31.6 ms; a waiter on an event or on
+//! WaitOnAddress ran one level up and took 15 µs and 6–7 µs; an event waiter with its boost disabled waited the 29 and
+//! 14 ms again; and a completion-port waiter raised one level for its wait alone took 15–17 µs and 6–7 µs. So a wait
+//! that may block raises a thread at the normal level to the next for as long as it blocks, and puts it back before it
+//! runs anything ([`RaisedForWait`]): the shard is woken as Windows wakes an event's waiter and runs, as before, at its
+//! own level. A thread at another level (a test that starves a shard at IDLE) is left as it is, and a zero-timeout
+//! harvest, which never blocks, pays nothing. A raise and its restore cost 0.77–0.88 µs a pair quiet and 1.3–5.5 µs
+//! loaded, against a parked wake of 6–15 µs. No privilege is asked: a thread may set its own level within its process's
+//! class (R10).
+
+use std::time::Instant;
+
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT};
+use windows_sys::Win32::Networking::WinSock::SOCKET;
+use windows_sys::Win32::System::IO::{
+  CreateIoCompletionPort, GetQueuedCompletionStatusEx, OVERLAPPED_ENTRY, PostQueuedCompletionStatus,
+};
+use windows_sys::Win32::System::Threading::{
+  GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+  THREAD_PRIORITY_NORMAL,
+};
+
+use crate::afd::{Afd, Block, READABLE_EVENTS, WRITABLE_EVENTS, base_socket};
+use crate::driver::{Completion, Driver, DriverKind, Kick, KickPort, nanos_since};
+use crate::error::RtError;
+use crate::pipe::{PIPE_KEY, Pipes};
+use crate::pipe_state::{PipeRead, PipeWrite};
+
+/// Format: the completion key that marks a kick.
+const KICK_KEY: usize = usize::MAX;
+/// Format: the completion key that marks a no-op; its user word rides in the overlapped pointer.
+const NOP_KEY: usize = usize::MAX - 1;
+/// Format: the completion key the AFD readiness device is associated under. Its completions carry a
+/// poll block in the overlapped pointer (its head is the block), not a user word in the key.
+const AFD_KEY: usize = usize::MAX - 2;
+
+/// Shape: entries drained per wait (see the kqueue driver for the reasoning).
+const EVENTS_PER_WAIT: usize = 64;
+
+/// A completion port the registry slot owns (§4.3, D-8), closed when the slot retires its
+/// registration — after the shard's thread has ended and every foreign kick borrowing it has returned —
+/// so a late kick can never post to a handle value the process has since reused. Kept as its exposed
+/// address so it is `Send` without an unsafe impl.
+#[derive(Debug)]
+pub struct Port {
+  handle: usize,
+}
+
+impl Port {
+  /// The port's raw handle value.
+  pub(crate) fn raw(&self) -> usize {
+    self.handle
+  }
+}
+
+impl Drop for Port {
+  fn drop(&mut self) {
+    let handle: HANDLE = std::ptr::with_exposed_provenance_mut(self.handle);
+    // SAFETY: the port was created by `prepare` and is owned by this value alone; closed once here.
+    unsafe { CloseHandle(handle) };
+  }
+}
+
+/// The driver. It borrows its port from the registry slot (see [`Port`]) and never closes it.
+pub struct IocpDriver {
+  port: HANDLE,
+  /// The registry's kick over this driver's port.
+  kick: KickPort,
+  epoch: Instant,
+  entries: Vec<OVERLAPPED_ENTRY>,
+  /// The AFD readiness device, opened and associated with `port` on the first socket registration
+  /// (a shard that only kicks and times out never opens it). Socket readiness is polled through it.
+  afd: Option<Afd>,
+  /// The pipe ends this driver serves (A-179): their completions come back under `PIPE_KEY`, and their readiness is a
+  /// finished operation rather than an AFD poll.
+  pipes: Pipes,
+}
+
+impl std::fmt::Debug for IocpDriver {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("IocpDriver")
+      .field("port", &self.port)
+      .field("entries", &self.entries.len())
+      .finish()
+  }
+}
+
+/// Creates the port with one concurrent thread (the shard), for the registry slot to own.
+pub fn prepare() -> Result<Port, RtError> {
+  // SAFETY: creating a fresh port; the result is checked.
+  let port = unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 1) };
+  if port.is_null() {
+    return Err(RtError::os("CreateIoCompletionPort"));
+  }
+  Ok(Port {
+    handle: port.expose_provenance(),
+  })
+}
+
+impl IocpDriver {
+  /// Builds the driver over the port the registry slot owns, on the shard's thread. Refused when the
+  /// registration no longer holds a port (it was retired).
+  pub fn from_prepared(kick: KickPort) -> Result<IocpDriver, RtError> {
+    let port = kick.raw().ok_or(RtError::DriverRefused {
+      call: "IOCP driver over a retired registration",
+      code: None,
+    })?;
+    // SAFETY: an all-zero OVERLAPPED_ENTRY is a valid, empty record.
+    let entries = (0..EVENTS_PER_WAIT)
+      .map(|_| unsafe { std::mem::zeroed() })
+      .collect();
+    Ok(IocpDriver {
+      port: std::ptr::with_exposed_provenance_mut(port),
+      kick,
+      epoch: Instant::now(),
+      entries,
+      afd: None,
+      pipes: Pipes::default(),
+    })
+  }
+
+  /// The AFD readiness device, opened and associated with this port on first use (§4.6). Lazily,
+  /// because a driver that never awaits a socket needs no AFD handle.
+  fn afd(&mut self) -> Result<&Afd, RtError> {
+    if let Some(ref afd) = self.afd {
+      return Ok(afd);
+    }
+    let afd = Afd::open()?;
+    // Associate the AFD device with this port so its polls complete here under `AFD_KEY`.
+    // SAFETY: both handles are live and ours; `CreateIoCompletionPort` with an existing `port`
+    // associates `afd.handle()` with it and returns the port (null on failure).
+    let associated = unsafe { CreateIoCompletionPort(afd.handle(), self.port, AFD_KEY, 0) };
+    if associated.is_null() {
+      return Err(RtError::os("CreateIoCompletionPort(AFD)"));
+    }
+    // `insert` stores the device and hands back a reference to it — no `expect` on a re-read.
+    Ok(self.afd.insert(afd))
+  }
+
+  /// Arms a one-shot AFD poll for `events` on the socket `raw` names, waking `user_data` when it
+  /// fires. A Windows `SOCKET` fits in a positive `i32` in practice (kernel handle-table values), so
+  /// the readiness seam carries it as the same `i32` a Unix fd uses; it is reconstructed here as the
+  /// low 32 bits, unsigned. The leaked poll block is owned by the kernel until `wait` reclaims it.
+  fn arm(&mut self, raw: i32, events: u32, user_data: u64) -> Result<(), RtError> {
+    // The inverse of `netsys::Socket::raw_id`: reinterpret the `i32` as its 32 bits, then widen to the
+    // pointer-width `SOCKET` — bit-for-bit the handle the seam narrowed. No sign-losing `as` cast.
+    let socket = u32::from_ne_bytes(raw.to_ne_bytes()) as SOCKET;
+    let base = base_socket(socket)?;
+    let afd = self.afd()?;
+    // SAFETY: `afd()` associated the device with this port before returning it, so the poll's
+    // completion is delivered here and `wait` reclaims the block exactly once.
+    let _block = unsafe { afd.poll(base, events, user_data)? };
+    Ok(())
+  }
+}
+
+impl IocpDriver {
+  /// One `GetQueuedCompletionStatusEx` for at most `remaining_ns` (none: without bound), rounded up to whole
+  /// milliseconds: how many entries it filled, or `None` when it timed out.
+  fn dequeue(&mut self, remaining_ns: Option<u64>) -> Result<Option<usize>, RtError> {
+    /// Format: nanoseconds per millisecond.
+    const NANOS_PER_MILLI: u64 = 1_000_000;
+    /// Format: INFINITE.
+    const INFINITE: u32 = u32::MAX;
+    let timeout_ms = remaining_ns.map_or(INFINITE, |ns| {
+      u32::try_from(ns.div_ceil(NANOS_PER_MILLI)).unwrap_or(INFINITE - 1)
+    });
+    let mut count: u32 = 0;
+    let capacity = u32::try_from(self.entries.len()).unwrap_or(u32::MAX);
+    // SAFETY: the entry buffer holds `capacity` records and `count` is writable.
+    let ok = unsafe {
+      GetQueuedCompletionStatusEx(
+        self.port,
+        self.entries.as_mut_ptr(),
+        capacity,
+        &raw mut count,
+        timeout_ms,
+        0,
+      )
+    };
+    if ok == 0 {
+      let code = std::io::Error::last_os_error().raw_os_error();
+      return if code == Some(i32::try_from(WAIT_TIMEOUT).unwrap_or(0)) {
+        Ok(None)
+      } else {
+        Err(RtError::DriverRefused {
+          call: "GetQueuedCompletionStatusEx",
+          code,
+        })
+      };
+    }
+    Ok(Some(usize::try_from(count).unwrap_or(0)))
+  }
+}
+
+/// Moves the calling thread from priority level `from` to `to` when it stands at `from`: whether it moved.
+fn move_level(from: i32, to: i32) -> bool {
+  // SAFETY: the calling thread's pseudo-handle, valid for both calls; a thread reads and sets its own level within its
+  // process's priority class without any privilege.
+  unsafe {
+    GetThreadPriority(GetCurrentThread()) == from && SetThreadPriority(GetCurrentThread(), to) != 0
+  }
+}
+
+/// The calling thread raised one level above normal for a wait that may block, and put back as this drops (A-361, the
+/// module doc). Holds nothing when the wait cannot block or the thread was not at the normal level.
+struct RaisedForWait(bool);
+
+impl RaisedForWait {
+  /// Raises the calling thread for a wait of `timeout_ns` (`None`: without bound) when that wait may block.
+  fn raise(timeout_ns: Option<u64>) -> RaisedForWait {
+    RaisedForWait(
+      timeout_ns != Some(0) && move_level(THREAD_PRIORITY_NORMAL, THREAD_PRIORITY_ABOVE_NORMAL),
+    )
+  }
+}
+
+impl Drop for RaisedForWait {
+  fn drop(&mut self) {
+    if self.0 {
+      // A level something else set during the wait is left as it is.
+      let _ = move_level(THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_NORMAL);
+    }
+  }
+}
+
+/// Posts a kick packet to `port`, a live port the caller has pinned ([`KickPort::with`]); safe from
+/// any thread. A failed post means the port is being torn down with its shard, the documented outcome
+/// of a kick to an exiting shard (`Kick::kick`).
+pub fn post_kick(port: usize) {
+  let handle: HANDLE = std::ptr::with_exposed_provenance_mut(port);
+  // SAFETY: the caller pinned the registration that owns this port, so the handle is open.
+  unsafe { PostQueuedCompletionStatus(handle, 0, KICK_KEY, std::ptr::null_mut()) };
+}
+
+impl Driver for IocpDriver {
+  fn kind(&self) -> DriverKind {
+    DriverKind::Iocp
+  }
+
+  fn kick_handle(&self) -> Kick {
+    Kick::Iocp(self.kick)
+  }
+
+  fn now_ns(&self) -> u64 {
+    nanos_since(self.epoch)
+  }
+
+  fn wait(&mut self, timeout_ns: Option<u64>, out: &mut Vec<Completion>) -> Result<(), RtError> {
+    // Windows expires a timed wait on its timer's tick, which can fall before the deadline as the shard's clock (QPC)
+    // reads it. Measured on jupiter 2026-10-26: a park for a 5 ms timer woke 2.32 ms and 0.18 ms early, 2 waits in 60
+    // (`docs/bugs/2026-10-26-a-windows-park-woke-before-its-deadline.md`). A wait that times out before its deadline
+    // waits out the rest, so a park never returns early, as the seam promises. Each further wait asks for at least a
+    // millisecond, so the rest shrinks every time; a kick or a completion still ends the wait at once.
+    let deadline = timeout_ns.map(|ns| self.now_ns().saturating_add(ns));
+    // One level up while the wait may block, back to normal before anything runs (A-361, the module doc); every return
+    // below drops it.
+    let raised = RaisedForWait::raise(timeout_ns);
+    let count = loop {
+      let remaining = deadline.map(|due| due.saturating_sub(self.now_ns()));
+      match self.dequeue(remaining)? {
+        Some(count) => break count,
+        None if deadline.is_some_and(|due| self.now_ns() < due) => {}
+        None => return Ok(()),
+      }
+    };
+    drop(raised);
+    for entry in self.entries.iter().take(count) {
+      match entry.lpCompletionKey {
+        KICK_KEY => {}
+        NOP_KEY => out.push(Completion {
+          user_data: u64::try_from(entry.lpOverlapped.addr()).unwrap_or(0),
+          result: 0,
+        }),
+        AFD_KEY => {
+          // A socket readiness poll fired: the overlapped pointer is the leaked poll block (its head
+          // is the `OVERLAPPED`), so reclaim it and wake the word it carried. The fired events are not
+          // needed — the readiness future just retries its non-blocking syscall (a spurious wake, e.g.
+          // for a since-dropped task, harmlessly wakes nothing).
+          if !entry.lpOverlapped.is_null() {
+            let block = entry.lpOverlapped.cast::<Block>();
+            // SAFETY: `block` is a `Block` leaked by `Afd::poll` (its `OVERLAPPED` head is what was
+            // armed) and delivered here exactly once by the port; `reclaim` takes ownership back.
+            let user_data = unsafe { Block::reclaim(block) };
+            out.push(Completion {
+              user_data,
+              result: 0,
+            });
+          }
+        }
+        PIPE_KEY => {
+          // A pipe operation finished: reclaim its block, and wake the waiter its side registered, if its end is still
+          // served (a completion for a released end frees its block and wakes no one).
+          // SAFETY: completions under `PIPE_KEY` carry a block `pipe::start` leaked, delivered once by the port.
+          if let Some(word) = unsafe { self.pipes.complete(entry.lpOverlapped) } {
+            out.push(Completion {
+              user_data: word,
+              result: 0,
+            });
+          }
+        }
+        key => out.push(Completion {
+          user_data: u64::try_from(key).unwrap_or(0),
+          result: i32::try_from(entry.dwNumberOfBytesTransferred).unwrap_or(i32::MAX),
+        }),
+      }
+    }
+    Ok(())
+  }
+
+  fn has_pending(&self) -> bool {
+    false
+  }
+
+  fn submit_nop(&mut self, user_data: u64) -> Result<(), RtError> {
+    let overlapped = std::ptr::without_provenance_mut(usize::try_from(user_data).unwrap_or(0));
+    // SAFETY: the overlapped pointer is a tag the wait reads back as an address, never dereferenced.
+    if unsafe { PostQueuedCompletionStatus(self.port, 0, NOP_KEY, overlapped) } == 0 {
+      return Err(RtError::os("PostQueuedCompletionStatus"));
+    }
+    Ok(())
+  }
+
+  fn register_readable(&mut self, raw: i32, user_data: u64) -> Result<(), RtError> {
+    // A pipe end's readability is a finished read (A-179): told at once when one is held, else by its completion.
+    if self.pipes.holds(raw) {
+      if self.pipes.want(raw, false, user_data)? {
+        self.submit_nop(user_data)?;
+      }
+      return Ok(());
+    }
+    // One-shot AFD poll for the read edges (data, an incoming connection, EOF, an error): it completes
+    // on this port when any fires, and `wait` wakes `user_data`. The readiness-native drivers (kqueue,
+    // epoll) do this with `EVFILT_READ`/`EPOLLIN`; AFD is the Windows equivalent.
+    self.arm(raw, READABLE_EVENTS, user_data)
+  }
+
+  fn register_writable(&mut self, raw: i32, user_data: u64) -> Result<(), RtError> {
+    // A pipe end's writability is its write in the kernel finishing (A-179), or at once when none is.
+    if self.pipes.holds(raw) {
+      if self.pipes.want(raw, true, user_data)? {
+        self.submit_nop(user_data)?;
+      }
+      return Ok(());
+    }
+    // One-shot AFD poll for the write edges (send-buffer space, a connect result, an error).
+    self.arm(raw, WRITABLE_EVENTS, user_data)
+  }
+
+  fn adopt_pipe(&mut self, raw: i32, handle: usize, sizes: (usize, usize)) -> Result<(), RtError> {
+    self.pipes.adopt(self.port, (raw, handle), sizes)
+  }
+
+  fn release_pipe(&mut self, raw: i32) {
+    self.pipes.release(raw);
+  }
+
+  fn pipe_read(&mut self, raw: i32, out: &mut [u8]) -> Result<PipeRead, RtError> {
+    self.pipes.read(raw, out)
+  }
+
+  fn pipe_write(&mut self, raw: i32, bytes: &[u8]) -> Result<PipeWrite, RtError> {
+    self.pipes.write(raw, bytes)
+  }
+}

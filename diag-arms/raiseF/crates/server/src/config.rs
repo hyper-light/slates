@@ -1,0 +1,2172 @@
+//! The daemon's configuration: every number a derivation from the machine profile (D-11),
+//! logged with its inputs at start.
+
+use slates_anchor::Geometry;
+use slates_db::partition::PartitionCaps;
+use slates_transport::demux::SESSION_SLOTS_PER_PEER;
+use std::collections::BTreeMap;
+
+use slates_db::register::{Configuration, DomainId, HostId, Quorum, RegionId, scatter_width};
+use slates_ipc::RegionGeometry;
+use slates_machine::{Derived, MachineProfile, derived};
+use slates_mem::budget::region_bytes;
+use slates_rt::RuntimeConfig;
+use slates_rt::runtime::admission_limit;
+
+/// Shape: the small-directory cut-over measured in Phase 1 (A-7: two entries inline).
+const DIR_CUTOVER: usize = 2;
+/// Shape: the latency budget the batch bound is calibrated against, the provisioning target
+/// of R9 (50 µs).
+const LATENCY_BUDGET_NS: u64 = 50_000;
+/// Shape: the request rate the first admission limit assumes before a client is measured:
+/// one client saturating the ring floor (Phase 2 baseline, IPC: 278 ns per round trip, so
+/// under four million per second); re-derived from measured rates at the first status.
+const ASSUMED_REQUESTS_PER_SECOND: u64 = 4_000_000;
+/// Shape: the service-time p99 the first admission limit assumes: the database mutation
+/// baseline plus the ring (Phase 2 baseline: 206 + 278 ns) with an order of magnitude of
+/// headroom for the volume core's create.
+const ASSUMED_SERVICE_P99_NS: u64 = 5_000;
+/// Shape: the memory classes the shard reserve is split into (§4.2: metadata slabs, rings,
+/// chunk regions).
+const MEMORY_CLASSES: u64 = 3;
+/// Shape: the share of a shard's metadata reserve the volume tables may take (the rest is the
+/// store's own slabs); ratified in GAPS §5.
+const TABLE_SHARE_PERMILLE: u64 = 250;
+/// Shape: the share of a shard's reserve the client regions may take (their pages are
+/// populated only as bodies need them, so the share bounds the worst case); ratified in GAPS
+/// §5 with the table share.
+const CLIENT_SHARE_PERMILLE: u64 = 250;
+/// Format: a key slot's bytes in hyper-seal's locked region (an AES-256 key, seal.md §8).
+const SEAL_KEY_BYTES: usize = 32;
+/// Shape: the share of the control shard's reserve all fleet sessions' receive windows may hold at once
+/// (§4.10a; research note §5): each window auto-tunes toward its path's BDP within this bound, as the
+/// table and client shares bound theirs (GAPS §5); pages are touched only as data arrives.
+const FLEET_RECEIVE_SHARE_PERMILLE: u64 = 250;
+/// Format: parts per thousand.
+const PERMILLE: u64 = 1000;
+/// Shape: the archive walk's slice as a share of the shard's step budget, parts per thousand: half,
+/// so a seal in progress never takes the whole step from the clients (the share a cooperative destroy
+/// takes, `verbs::DESTROY_SLICE_PERMILLE`).
+const ARCHIVE_SLICE_PERMILLE: u64 = 500;
+/// Shape: a slice of copy-bound work (a DAX backing's fill, ingest and refill, A-163; an image's build and merge, A-160) as a share of
+/// the shard's step budget, parts per thousand — the same half the archive walk and a granted landing take, and for
+/// the same reason: work in progress never takes the whole step from the clients.
+const COPY_SLICE_PERMILLE: u64 = 500;
+/// Shape: the share of the process's descriptor and mapping limits the same-kernel direct map's copies may hold, parts
+/// per thousand (§4.6, A-171): half, so the copies never take the whole of either from the rings, sockets and objects
+/// the daemon's other paths open, which it does not budget path by path yet; the same half a copy slice takes of a
+/// step, for the same reason.
+const DIRECT_MAP_LIMIT_SHARE_PERMILLE: u64 = 500;
+/// Format: the descriptors one direct-map copy holds in the daemon: its memfd, kept for the zeroing's `SEEK_DATA`
+/// (`slates_mem::PeerObject`).
+const DESCRIPTORS_PER_COPY: u64 = 1;
+/// Format: the mappings one direct-map copy holds in the daemon: its view, placed inside a reservation one grain longer
+/// (`slates_mem::shared`), which the placement splits into at most three: the slack before, the view, the slack after.
+const MAPPINGS_PER_COPY: u64 = 3;
+/// Format: nanoseconds per second, to turn a bytes-per-second throughput into bytes per step.
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
+/// Shape: tasks a client may need across shards at once: its request forwarded to the owner
+/// and the reply carried back (a synchronous client has one request in flight; an
+/// asynchronous one is bounded by its ring's credit, which the ring's slots cap).
+const TASKS_PER_CLIENT: usize = 2;
+/// Shape: the shard's own perpetual tasks: the server loop, the reap loop, the control loop
+/// and the heartbeat, plus a spare for a shutdown message.
+const LOOP_TASKS_PER_SHARD: usize = 5;
+/// Shape: the fleet's perpetual tasks per peer on the control shard: the probe loop and the record
+/// link (`fleet::probe_peer`, `fleet::establish_record_link`).
+const FLEET_LOOPS_PER_PEER: usize = 2;
+/// Shape: the fleet's planes, each with its own socket, demultiplexer and accept loop: probes and
+/// records (§4.8).
+const FLEET_PLANES: usize = 2;
+/// Shape: the fleet's perpetual tasks per shard beyond the per-peer ones: one demultiplexer receive
+/// loop and one accept loop per plane (`fleet::run_demux`, `fleet::accept_probes`,
+/// `fleet::accept_records`), plus the one coordinator (`fleet::run_record_plane`, which also drives
+/// the configuration council and the root group in its period).
+const FLEET_LOOPS_PER_SHARD: usize = FLEET_PLANES * 2 + 1;
+/// F, R9's provisioning floor (AC-2.1, T-2.6): a create's single-client p99 is held to fifty microseconds. The idle
+/// window is at least this long, so a closed-loop client that meets R9 (its next request within F of its last reply)
+/// finds its own shard still polling (A-223), and the other shards its loop goes round are held for its return
+/// ([`closed_loop_hold`], A-326). It is the requirement itself, not a measurement, so no load moves it; the
+/// boot probe's smallest wake, the other input weighed, was measured at up to 259-346 µs on a loaded boot
+/// (BENCHMARKS, the idle window's rule). `provision_bench` gates on the same constant.
+pub const PROVISION_FLOOR: Derived<u64> = derived!(
+  50_000,
+  "R9: a create's single-client p99 at most 50 µs",
+  ["R9", "AC-2.1"]
+);
+/// F in nanoseconds ([`PROVISION_FLOOR`]), for arithmetic and the bench's gate.
+pub const PROVISION_FLOOR_NS: u64 = PROVISION_FLOOR.get();
+/// The idle window's multiple of the shard's wake estimate on Linux and macOS: none. Two shards beside two spinners a
+/// logical CPU parked between a 1 ms-paced client's requests at R9's floor alone, and their loaded single-client p99
+/// halved against main's (8.0 to 4.0 ms on ubuntu-latest, 9.8 to 4.0 ms on ubuntu-24.04-arm, macOS even), so no
+/// estimate, which load lengthens, prices the window there (A-223).
+#[cfg(not(windows))]
+pub const fn loaded_wake_ratio() -> Derived<u64> {
+  derived!(
+    0,
+    "none: the window is F alone where a loaded wake was measured cheap",
+    ["diag-liveness-35", "A-223"]
+  )
+}
+/// The idle window's multiple of the shard's wake estimate on Windows: the hundred it had before A-223, kept by the
+/// supervisor's decision (2026-11-11) until Windows' own window is measured. A Windows shard parked beside two spinners
+/// a logical CPU waits 50-100 ms to run again, so at R9's floor alone every loaded request paid it (single-client p99
+/// 97-100 ms on windows-latest, 48-56 ms on windows-11-arm) where this multiple held 125-127 µs medians. Ratified as a
+/// residual literal in GAPS §5.
+#[cfg(windows)]
+pub const fn loaded_wake_ratio() -> Derived<u64> {
+  derived!(
+    0,
+    "the pre-A-223 multiple, kept on Windows: R9's floor alone cost a loaded p99 of 48-100 ms",
+    ["diag-liveness-35", "GAPS §5"]
+  )
+}
+
+/// Format: R9 holds a create's p99 (AC-2.1), so one request in this many may fall in the tail: the share of a closed
+/// loop's requests a held window may leave to find their shard parked ([`loop_revisit_cycles`]).
+pub const PROVISION_TAIL: u64 = 100;
+/// Format: the floors one cycle of a closed loop takes at most: its request, within F at R9's percentile, and its think
+/// time, within F by the loop's definition (its next request within F of its last reply; A-223's window rule).
+const CLOSED_LOOP_CYCLE_FLOORS: u64 = 2;
+/// The longest cycle of a closed loop that meets R9, nanoseconds: [`CLOSED_LOOP_CYCLE_FLOORS`] × F (A-326).
+pub const CLOSED_LOOP_CYCLE_NS: u64 = PROVISION_FLOOR_NS.saturating_mul(CLOSED_LOOP_CYCLE_FLOORS);
+/// Format: one whole, in the fixed point the revisit walk keeps its probability in ([`loop_revisit_cycles`]): 64
+/// fractional bits, so a step's product with the shard count (at most 16 bits) fits 128 bits.
+const REVISIT_ONE: u128 = 1 << 64;
+
+/// How many cycles a closed loop over `shards` shards may go without returning to one of them, at R9's percentile: the
+/// least `k` with `((S − 1) / S)^k ≤ 1 / PROVISION_TAIL` (A-326). A create goes to the partition its name hashes to
+/// and every later verb to its volume's owner (`verbs::owner_of_name`, `verbs::owner_of`), so a request of the loop
+/// lands on a given shard with probability `1/S`, the cycles until it does are geometric, and more than `k` of them
+/// pass with probability `((S − 1) / S)^k`. One shard is revisited every cycle. Integer arithmetic: the probability is
+/// kept in fixed point and rounded up at each step, so `k` is never short of the bound; the walk ends within
+/// `S × PROVISION_TAIL` steps, since `((S − 1) / S)^(S × 100) < e^−100`.
+pub fn loop_revisit_cycles(shards: u16) -> u64 {
+  let shards = u128::from(shards.max(1));
+  let stay = shards.saturating_sub(1);
+  let tail = REVISIT_ONE
+    .checked_div(u128::from(PROVISION_TAIL))
+    .unwrap_or(0);
+  let most = u64::try_from(shards)
+    .unwrap_or(u64::MAX)
+    .saturating_mul(PROVISION_TAIL);
+  let mut missed = REVISIT_ONE;
+  for cycles in 1..=most {
+    missed = missed.saturating_mul(stay).div_ceil(shards);
+    if missed <= tail {
+      return cycles;
+    }
+  }
+  most
+}
+
+/// The idle window a forward holds its shards open for when it is made for a client in R9's closed loop (§4.7; A-326):
+/// `CLOSED_LOOP_CYCLE_FLOORS × F × loop_revisit_cycles(S)`. A loop that meets R9 sends its next request within F of
+/// its last reply, which F covers on the client's own shard (A-223's window rule), but over `S` shards its next request
+/// for a given shard comes only after the loop has gone round the others, as many cycles of at most `2F` as
+/// [`loop_revisit_cycles`] allows at R9's percentile. Measured (step 6 of the A-223 plan, 2026-11-12): at R9's floor
+/// alone a quiet single client's p99 on ubuntu-24.04-arm's three shards was 116.4 µs against main's 27.1, its shards
+/// parking 144 to 331 times per 1,000 creates; at `F × S`, 36.8 µs and 3 to 7 parks; at `2F × S`, 29.5 µs. Its inputs
+/// are R9's floor and percentile and the shard count, so no load moves it. A forward holds no longer than its loop had
+/// run, and a paced client, whose next request comes later than F, starts no loop (`verbs::loop_hold`).
+pub fn closed_loop_hold(shards: u16) -> Derived<u64> {
+  derived!(
+    CLOSED_LOOP_CYCLE_NS.saturating_mul(loop_revisit_cycles(shards)),
+    "2 × provision_floor_ns × the least k with ((shards − 1) / shards)^k ≤ 1 / PROVISION_TAIL",
+    ["provision_floor_ns", "shards", "PROVISION_TAIL (R9's p99)"]
+  )
+}
+
+/// The idle window for a shard whose wake estimate is `wake_ns`: `max(F, wake × loaded_wake_ratio())` (§4.3, §4.7;
+/// A-223). R9's floor keeps a closed-loop client's own shard awake (the others its loop goes round are held by
+/// [`closed_loop_hold`], A-326); the platform's multiple covers a loaded wake where parking costs more than spinning
+/// saves. Where the multiple is zero (Linux, macOS) no estimate moves the window, so a
+/// shard's own spinning, which lengthens the wakes it measures, cannot lengthen it.
+pub const fn idle_window_ns(wake_ns: u64) -> u64 {
+  let covered = wake_ns.saturating_mul(loaded_wake_ratio().get());
+  if covered > PROVISION_FLOOR_NS {
+    covered
+  } else {
+    PROVISION_FLOOR_NS
+  }
+}
+/// The divisor between a shard's metadata class and one slab dimension's units. The class is split
+/// among the inode dimension (a version slot and a table slot per inode), the directory dimension
+/// (a node and a block per directory) and the volume records (journals and objects) — three parts
+/// — and each slab dimension keeps half of its part for growth headroom, so the slabs' maximum
+/// footprints sum to about a third of the class and the records' ledger holds the rest (§4.2 "the
+/// prepared arena layout"; `Store::set_metadata_class`).
+/// Shape: three parts, each slab part halved for headroom.
+const STORE_TABLE_DIVISOR: u64 = 6;
+/// Shape: the largest inline lifecycle request: a name and a base path, both under the OS
+/// path limit (Linux `PATH_MAX` 4096); one page each direction per slot.
+const BULK_CHUNK_BYTES: u64 = 4096;
+
+/// The bytes one request or reply may carry: one bulk chunk of the client's region (a paged verb sizes its page by
+/// it, `ReadRange`, `StagePut`).
+pub(crate) const fn bulk_chunk_bytes() -> u64 {
+  BULK_CHUNK_BYTES
+}
+/// Shape: the landing slots the segment holds: landings in flight per daemon, one per shard
+/// plus one for the control shard's presentation.
+const LANDING_SLOTS_PER_SHARD: u32 = 1;
+/// Shape: the audit ring: a page per shard; the audit rate is measured from the first landings
+/// (§4.15's derived table) and the ring re-sized at the next start.
+const AUDIT_PAGES_PER_SHARD: u64 = 1;
+
+/// The store's caps per shard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoreCaps {
+  /// Inode versions the shard may hold.
+  pub max_inodes: usize,
+  /// Directory nodes.
+  pub max_dirs: usize,
+  /// Chunks.
+  pub max_chunks: usize,
+  /// Directory blocks.
+  pub max_dir_blocks: usize,
+  /// The small-directory cut-over.
+  pub dir_cutover: usize,
+  /// Derived: the shard's metadata class in bytes (§4.2), the second of the three memory classes:
+  /// the slabs above grow into it up to their bounds, and the remainder is the ledger every
+  /// volume's records are reserved from (`Store::set_metadata_class`).
+  pub metadata_class_bytes: u64,
+}
+
+/// The fleet membership this node is configured to join (§4.8, boot step 6): the fault-tolerance
+/// quorum and the peer hosts its neighbourhood is drawn from. `None` on the `DaemonConfig` is the
+/// laptop — `f = 0`, solo, one member (itself), the same code path a fleet runs (R8), the cluster plane
+/// degenerate. Placement, the configuration group and the owner's acceptor are built over this at boot
+/// (`init_shard`). The *transport* the live probe/gossip loop dials each peer over (its address and the
+/// operator-provisioned certificate, §4.8 "certificates provisioned by the operator") arrives with that
+/// loop; this is the membership the placement authority is built over, which a single-host daemon leaves
+/// `None`.
+#[derive(Clone, Debug)]
+pub struct FleetMembership {
+  /// The fault tolerance: a write commits at `f + 1` acknowledgements of `2f + 1` candidate holders
+  /// (§4.8). `f = 0` is the solo degenerate (one candidate, the owner) — the same as no fleet at all.
+  pub quorum: Quorum,
+  /// The peer hosts this node's neighbourhood is drawn from, believed alive at boot; SWIM refines the
+  /// live set from here. This host is always a member and is never listed among its own peers.
+  pub peers: Vec<HostId>,
+  /// This node's manifest routing placeholder, `member_id(origin_anchor, 0)`. The daemon
+  /// replaces it with its fresh per-start member id; the placeholder grants no voting rights.
+  pub host: HostId,
+  /// This node's **stable cert-anchor** — `deploy::host_id_of_certificate` of its own certificate (a laptop
+  /// uses its machine-identity hash). Unchanged across restarts, unlike the ephemeral member id. The daemon
+  /// derives its runtime member id `member_id(origin_anchor, generation)` from it, and keys a client's
+  /// completion record on it so a retry meets its record after a restart (§4.8; task #22 two-id model).
+  pub origin_anchor: HostId,
+  /// Each fleet member's failure domain (from the manifest), so placement forms copysets across distinct
+  /// domains (D-14). A host absent from the map is its own domain (unique-per-host) — the default when the
+  /// deployment declares none. Installed into the configuration group at boot (`init_shard`).
+  pub domains: BTreeMap<HostId, DomainId>,
+  /// Each fleet member's **region** (§4.8, D-14 — "a root group across regions holds region membership"), so
+  /// the root group agrees on which regions exist and the regional council scopes its membership to the hosts
+  /// of one region. A host absent from the map is in the **sole region** `RegionId(0)` — the default when
+  /// the deployment declares none, which collapses to a single-region fleet whose root group is the degenerate
+  /// self-leading group (R8). This node's own region is `regions[host]` (or the sole region if absent).
+  pub regions: BTreeMap<HostId, RegionId>,
+  /// Each region's designated **mirror** region (§4.8 "region loss promotes the mirror through the root
+  /// group"): where a region's data is asynchronously copied, and the region an operator promotes it to on
+  /// loss. A region absent from the map has no mirror. Read by the root group's reconcile (a lost region with
+  /// a mirror is left for a deliberate operator promotion, not auto-retired) and by the operator promotion
+  /// (`Daemon::promote_region` looks up the lost region's mirror here). Fleet-wide, from the manifest.
+  pub region_mirrors: BTreeMap<RegionId, RegionId>,
+  /// The operator's durability policy, if declared (§4.8 "the copyset count check at every configuration
+  /// change"): the accepted coincident-loss probability under a stated simultaneous failure count. `None` —
+  /// the default — leaves the check disabled (an accepted loss probability is a policy, not a machine
+  /// measurement, so it is never derived — it is the operator's). When set, every configuration change is
+  /// checked against it and a breach is **surfaced** (a counted health signal), never silently over-scattered:
+  /// a breach is a recovery-vs-durability conflict for the operator to resolve (more copies, more bandwidth,
+  /// tighter failure domains).
+  pub durability: Option<DurabilityBound>,
+}
+
+/// An operator durability policy (§4.8, D-14; research §3.1): the accepted coincident-loss probability
+/// `accepted_loss` under a coincident failure of `coincident_failures` hosts. It bounds the copyset count a
+/// configuration may reach — a wider scatter spreads objects over more copysets, raising the chance some
+/// copyset lies entirely within a coincident failure. The operator states both (the accepted risk and the
+/// failure scale it is accepted under); neither is derived, because an accepted loss probability is a policy,
+/// not a machine measurement.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DurabilityBound {
+  /// The largest coincident-loss probability the operator accepts (`0.0` accepts none; `1.0` accepts any —
+  /// the disabled bound).
+  pub accepted_loss: f64,
+  /// The number of hosts assumed to fail at once when evaluating the loss (the failure scale the policy is
+  /// stated under — e.g. a power-domain outage of some fraction of the region).
+  pub coincident_failures: u64,
+}
+
+impl DurabilityBound {
+  /// Whether `configuration` **breaches** this bound — its coincident-loss probability under the policy's
+  /// failure count exceeds the accepted loss. A breach is surfaced at the configuration change, never
+  /// silently accepted (§4.8): the resolution is the operator's (raise `f`, the re-replication bandwidth, or
+  /// the failure-domain granularity), not a quiet over-scatter.
+  pub fn breached_by(&self, configuration: &Configuration) -> bool {
+    self.shortfall(configuration).is_some()
+  }
+
+  /// The **measured shortfall** of `configuration` against this bound — the design's `within_loss_bound(ε, F)`
+  /// check (§4.8 "Placement"), answered with its numbers: `None` when the configuration's coincident-loss
+  /// probability under the policy's failure count is within the accepted ε, otherwise the probability the
+  /// configuration actually carries beside the ε it was held to and the failure count it was measured under.
+  /// This is the durability policy "that gates a refusal": the daemon measures it once at every configuration
+  /// change (a cold path — `Configuration::coincident_loss` is a few floating-point products) and keeps the
+  /// result on the shard, where the verbs read it per write as a field, never recomputing it.
+  pub fn shortfall(&self, configuration: &Configuration) -> Option<DurabilityShortfall> {
+    let coincident_loss = configuration.coincident_loss(self.coincident_failures);
+    if coincident_loss <= self.accepted_loss {
+      return None;
+    }
+    Some(DurabilityShortfall {
+      coincident_loss,
+      accepted_loss: self.accepted_loss,
+      coincident_failures: self.coincident_failures,
+    })
+  }
+}
+
+/// A committed configuration's durability **shortfall** against the operator's policy (§4.8 "Placement"):
+/// the coincident-loss probability it carries under the policy's failure count, above the accepted ε. The
+/// fact a write is refused with ([`Refusal::DurabilityUnmet`](slates_ipc::protocol::Refusal)) — measured at
+/// the configuration change, read per write.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DurabilityShortfall {
+  /// The configuration's measured coincident-loss probability under `coincident_failures` failures.
+  pub coincident_loss: f64,
+  /// The loss probability the policy accepts (its ε).
+  pub accepted_loss: f64,
+  /// The number of hosts the policy assumes fail at once.
+  pub coincident_failures: u64,
+}
+
+/// The daemon's configuration.
+#[derive(Clone, Debug)]
+pub struct DaemonConfig {
+  /// Operator-provisioned, node-specific quorum-recovery capability. When absent, the
+  /// anchor's human issuer capability is required. Neither is available to consumers.
+  pub recovery_key: Option<crate::RecoveryKey>,
+  /// The runtime's configuration.
+  pub runtime: RuntimeConfig,
+  /// The segment's geometry.
+  pub geometry: Geometry,
+  /// The partition caps.
+  pub caps: PartitionCaps,
+  /// The client region's geometry.
+  pub region: RegionGeometry,
+  /// Derived: the bytes this process may lock in RAM (the profile's lock capacity when its confirming lock succeeded,
+  /// else none): what strict (`--locked`) volumes' entitlements are reserved against (§4.2 D-12, `lock_ledger`).
+  pub lock_capacity_bytes: u64,
+  /// Derived: clients per shard, the admission limit (AC-2.6): what the client share of the
+  /// reserve holds in regions.
+  pub clients_per_shard: usize,
+  /// Derived: the direct maps' copies one shard may hold at once, handed or being filled (§4.6, A-171):
+  /// [`direct_maps_per_shard`] over the process's descriptor and mapping limits. A client's share is this, and the
+  /// shard's fill budget, over the clients the shard serves, those holding its copies, and the one asking (A-188).
+  pub direct_maps_per_shard: usize,
+  /// Derived: the landings one owner shard holds awaiting a grant (§4.15 step 3; AUD-29-07) — the daemon's
+  /// client seats, `clients_per_shard × shards`: a presentation lives on its volume's owner shard whichever
+  /// shard its client sits on, and each seat may have one pending there. A presentation past it is refused
+  /// `LandingsAwaitingFull` before an id or a record is made.
+  pub landings_awaiting_per_shard: usize,
+  /// Derived: the shard's reserve in bytes.
+  pub reserve_per_shard: u64,
+  /// Derived: the large-class boundary of overlay copy-ups (one arena region).
+  pub large_class_bytes: u64,
+  /// Derived: the store's caps per shard (inodes, directories, chunks, directory blocks).
+  pub store: StoreCaps,
+  /// Whether huge pages help here (measured).
+  pub huge_pages: bool,
+  /// The cache line in bytes.
+  pub cache_line: usize,
+  /// The base page in bytes.
+  pub page: usize,
+  /// The smallest released content block whose pages go back to the OS rather than being zeroed in place
+  /// (`slates_machine::profile::DerivedConstants::discard_from_bytes`).
+  pub discard_from_bytes: usize,
+  /// The rendezvous instance name.
+  pub instance: String,
+  /// The operator's failover SLO, the lease term's ceiling (§4.4 "Derived constants", D-16).
+  pub failover_slo_ns: u64,
+  /// Derived: the idle window a forward holds its shards open for when it is made for a client in R9's closed loop
+  /// ([`closed_loop_hold`], §4.7; A-326).
+  pub closed_loop_hold_ns: u64,
+  /// The operator's stated per-node **re-replication bandwidth** in bytes/second, the anchor `B` of the
+  /// scatter-width derivation (§4.8 "Placement", D-14): how fast this node restores a lost host's copies.
+  /// `0` — the default — leaves the scatter width at the candidate floor (one copyset); a deployment states
+  /// its link so recovery sizes a wider neighbourhood, until the network-empirical measurement (§4.10a,
+  /// deferred: bandwidth "needs a real network to measure") supplies it. See [`DaemonConfig::derived_scatter`].
+  pub rereplication_bytes_per_second: u64,
+  /// Measured: the machine's BLAKE3 throughput, bytes per second, which sizes an archive-walk slice against
+  /// the shard's live step quantum ([`DaemonConfig::archive_slice_bytes`]).
+  pub blake3_bytes_per_second: u64,
+  /// Measured: the machine's memcpy throughput at the largest copy size the boot profile measured, bytes per
+  /// second. A §4.6 L2 shift is a block copy, so this is what sizes its slice against the shard's live step
+  /// quantum ([`DaemonConfig::copy_slice_bytes`]) — the hash rate would be the wrong question for it.
+  pub memcpy_bytes_per_second: u64,
+  /// Measured: the boot profile's base-page fault cost in nanoseconds, at least one: what an idle shard's pre-fault of
+  /// its reserve (A-214) slices by, as §4.2's pre-fault batch is `idle window / fault_ns`
+  /// ([`DaemonConfig::prefault_slice_pages`]).
+  pub page_fault_ns: u64,
+  /// Derived: the compress-or-not cost model each sealed chunk is stored under (§4.11, D-17): the boot
+  /// profile's measured codec points (LZ4 and each zstd level's compress and decompress throughput and
+  /// ratio over the probe corpus) as the policy's candidates; a byte's neutral worth = its measured
+  /// memcpy cost; `E[reads] = 1` (a seal's archive is the replication copy, read about once per
+  /// re-attach or takeover: §4.11 "about one per re-attach for archived"); `value_of_byte` and
+  /// `value_of_cpu` at neutral. At neutral the model stores a chunk read once **raw** — moving a byte is
+  /// far cheaper than compressing it, the design's "hot volumes stay raw unless pressure raises
+  /// `value_of_byte`" — so what compresses is decided by the two value signals, both owed as
+  /// derivations, not literals: the archive class's `value_of_byte` (a placed byte occupies `f + 1`
+  /// holders' RAM for the snapshot's retention, so its worth is that retention over one memcpy time,
+  /// per copy — "archived volumes compress once") and the live memory-pressure and load signals. Raw-only
+  /// when the profile measured no codec.
+  pub codec: slates_archive::CodecPolicy,
+  /// Derived: the spans one `Telemetry` reply carries (§4.14; `crate::telemetry::spans_per_reply`): what
+  /// one bulk chunk of a client's region holds past the report's fixed part, measured from the wire
+  /// encoding at boot.
+  pub telemetry_spans_per_reply: usize,
+  /// The fleet this node joins (§4.8, boot step 6), or `None` for the laptop (`f = 0`, solo — the
+  /// degenerate of the same code path, R8). A single-host daemon leaves this `None` and every placement
+  /// is local; a fleet node names its quorum and peers, and the placement authority, configuration group
+  /// and owner acceptor are built over them at boot.
+  pub fleet: Option<FleetMembership>,
+  /// Derived: available fleet task slots divided by the tasks one peer requires; never below the seeds.
+  pub fleet_peer_capacity: usize,
+  /// Derived: `SESSION_SLOTS_PER_PEER × fleet_peer_capacity` accepted endpoints per plane.
+  /// The transport owns the multiplier: one pending handshake plus a live/replaced authenticated
+  /// pair. Admission and task/timer budgeting use the same peer capacity and shape. Zero on a laptop.
+  pub fleet_sessions_per_plane: usize,
+  /// Derived: the most bytes one fleet session's receive window may grow to — the fleet's receive share
+  /// of the reserve over every fleet session (the accepted and the dialed, on both planes), never below
+  /// the initial window. Zero on a laptop.
+  pub fleet_session_receive_bytes: u64,
+  /// Derived: the most bytes of other owners' content a shard may hold as its clients' read-ahead windows at once
+  /// (§4.8 "Lookup"; `crate::verbs::ReadAhead`): one fleet session's receive bytes per peer, counted inside the
+  /// fleet's receive share as one more session per peer, so the windows and the session buffers together stay
+  /// within the share. Zero on a laptop, which forwards nothing.
+  pub read_ahead_bytes: u64,
+  /// Derived: the keys hyper-seal's locked region holds at once (A-92; seal.md §8): one base page of 32-byte key
+  /// slots per shard, the bounded cache of unwrapped keys each shard keeps (a key past it is evicted and unwrapped
+  /// again on its next use), and the root among them. Locked once at boot, a few pages, well inside the default
+  /// locked-memory limit.
+  pub seal_key_slots: usize,
+  /// A fault injected into one shard's start, for the boot tests; `None` in every deployment (a test sets it with
+  /// [`DaemonConfig::with_boot_fault`]).
+  pub boot_fault: Option<BootFault>,
+  /// Derived: a guest device attachment's credits (§4.6 A-9, §4.9): the request credit is the shard's
+  /// admission limit (`requests_in_flight_per_shard`), the byte credit the §4.9 window over the measured
+  /// memcpy bandwidth and the mean wake as the kick round trip, with one request's worst case as the frame.
+  /// Unix only, as the guest transport is.
+  #[cfg(unix)]
+  pub guest_credits: slates_bridge_virtiofs::credit::AttachmentCredits,
+  /// Derived: the NFSv4 listener's table bounds (§4.6 A-35).
+  pub nfs_v4: NfsV4Caps,
+  /// Derived (A-150): the inode numbers each publication reserves ahead of a volume's counter, so a reply may hand one
+  /// out with no barrier of its own while a successor still starts past it ([`inode_reserve`]).
+  pub inode_reserve: u64,
+  /// Every derivation, for the boot log.
+  pub derivations: Vec<String>,
+}
+
+/// Shape: the operator's failover SLO (Gray & Cheriton: seconds): ten seconds until the
+/// operator gives `slates anchor` a value.
+pub const FAILOVER_SLO_NS: u64 = 10_000_000_000;
+
+/// The liveness window on this machine ([`liveness_window`]): the derived window and the floor the machine measured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LivenessWindow {
+  /// The derived window `W` (`crate::daemon::LIVENESS_BUDGET_NS`).
+  pub window_ns: u64,
+  /// The machine's floor, measured at boot: the wake probe's p99, how long a parked thread waits to run again once
+  /// woken (`slates_machine::wake::WakeLatency::p99_ns`).
+  pub floor_ns: u64,
+  /// The window this machine needs: the longer of the two.
+  pub needed_ns: u64,
+  /// Whether the floor passes the window: a live shard can then be kept off its CPU longer than a window, so on this
+  /// machine the daemon cannot meet its window, and its boot log says so.
+  pub floor_past_window: bool,
+}
+
+/// Derived: the liveness window this daemon runs on and the floor its machine measured at boot (A-359): `W` is the
+/// recovery budget `T` (`crate::daemon::LIVENESS_BUDGET_NS`, rent or buy); its floor is `floor_ns`, the wake probe's
+/// p99. Where the floor passes the window the daemon cannot meet its window on this machine: the window it needs is
+/// the floor, and the boot log names both (`DaemonConfig::derivations`). A-228 already judges a shard starved, not
+/// stuck, while it is kept off its CPU, so the window's verdicts stay safe there; what the floor bounds is how soon.
+pub fn liveness_window(floor_ns: u64) -> Derived<LivenessWindow> {
+  let window_ns = crate::daemon::LIVENESS_BUDGET_NS;
+  derived!(
+    LivenessWindow {
+      window_ns,
+      floor_ns,
+      needed_ns: window_ns.max(floor_ns),
+      floor_past_window: floor_ns > window_ns,
+    },
+    "W = T, the recovery budget (rent or buy: a verdict waits as long as the recovery it starts costs); floor = the \
+     wake probe's p99; past W the daemon cannot meet its window on this machine and needs the floor",
+    ["RECOVERY_BUDGET_NS", "wake.p99_ns"]
+  )
+}
+
+/// Where each part of a shard's slice of the content object lies, relative to the slice's start, as
+/// `(start, end)` or `(start, len)` ranges ([`DaemonConfig::shard_content_layout`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShardContentLayout {
+  /// The slice's length, a mapping-granule multiple.
+  pub stride: usize,
+  /// The FUSE write log, `(start, end)` (A-63).
+  pub write_log: (usize, usize),
+  /// The two image slots, `(start, end)` (§4.8): the checkpoints.
+  pub images: (usize, usize),
+  /// The delta log, `(start, end)` (A-68): what each barrier appends over the committed checkpoint.
+  pub delta_log: (usize, usize),
+  /// The arena range, `(start, len)`, its start on the mapping granule (A-64).
+  pub arena: (usize, usize),
+}
+
+/// Format: the smallest base page of any supported target (x86-64's 4 KiB; aarch64 hosts run 4, 16 or 64 KiB): the
+/// block every host's file cache and every transport (NFS, FUSE, virtio-fs, WinFsp) moves file bytes in.
+const SMALLEST_TARGET_PAGE: usize = 4096;
+
+/// Derived: the unit content is allocated in (the chunk arena's granule and the store's charge unit): the host page,
+/// but no larger than [`SMALLEST_TARGET_PAGE`]. A 4 KiB file — or the 4 KiB AppleDouble sidecar macOS writes beside
+/// every file on NFSv3 — took a whole 16 KiB block on macOS arm64 and would take 64 KiB on a 64 KiB-page Linux
+/// kernel: 4,000 small files dirtied 196 MB of arena on macOS (2026-10-04), four times their size. Large files are
+/// unaffected: a chunk stays sixteen host pages (`slates_vfs::content::chunk_bytes`), so a large file is cut into as
+/// many chunks as before. Cutting chunks at sixteen granules instead was measured and rejected: 256 MiB written
+/// through the mount took 1.45-1.95 s against 0.55-0.77 s (four times the chunks; 2026-10-04, BENCHMARKS.md).
+pub fn content_granule(page: usize) -> usize {
+  page.clamp(1, SMALLEST_TARGET_PAGE)
+}
+
+impl DaemonConfig {
+  /// The unit this daemon allocates content in ([`content_granule`] of its page).
+  pub fn content_granule(&self) -> usize {
+    content_granule(self.page)
+  }
+
+  /// Derived (A-98): the unit a shard's arena range is cut into pool parts on. It is one chunk window
+  /// (`slates_vfs::content::chunk_bytes`) rounded up to the mapping granule and the page, as a power of two, so every
+  /// part holds whole chunks and maps on its own.
+  pub fn pool_unit(&self) -> usize {
+    slates_mem::mapping_granule()
+      .unwrap_or(self.page)
+      .max(self.page)
+      .max(slates_vfs::content::chunk_bytes(self.page).get())
+      .checked_next_power_of_two()
+      .unwrap_or(usize::MAX)
+  }
+
+  /// Derived: each shard's FUSE write log in the anchor's content object (A-63): a quarter of the shard's reserve.
+  /// A log that fills forces a publication, which empties it, so its size trades publications against resident log
+  /// pages, never durability; a quarter of the reserve lets a write stream of that much ride between barriers
+  /// without re-imaging the shard. Lazily backed, so only the pages a stream reaches cost RAM.
+  pub fn write_log_bytes(&self) -> usize {
+    /// Shape: the share of the reserve the log takes (see the method).
+    const RESERVE_SHARE: usize = 4;
+    usize::try_from(self.reserve_per_shard).unwrap_or(usize::MAX) / RESERVE_SHARE
+  }
+
+  /// Derived: where each part of one shard's slice of the anchor's content object lies, relative to the slice's
+  /// start. In order: the FUSE write log (A-63); the two reserve-sized image slots, the committed recovery image
+  /// and the one being written (§4.8); and the shard's arena range, its chunk arena's one region (A-64), the
+  /// reserve's length, starting on the mapping granule so it can be mapped on its own. The slice's length is a
+  /// granule multiple too, so every shard's arena starts on one. The slots are sized as before the arena moved
+  /// in: an image now carries metadata, not content, and only the pages it reaches are backed.
+  pub fn shard_content_layout(&self) -> ShardContentLayout {
+    /// Format: the double buffer's slots: the committed image and the one being written.
+    const PUBLISH_SLOTS: usize = 2;
+    let granule = slates_mem::mapping_granule()
+      .unwrap_or(self.page)
+      .max(self.page)
+      .max(1);
+    let reserve = usize::try_from(self.reserve_per_shard)
+      .unwrap_or(usize::MAX)
+      .max(self.page);
+    let log = self.write_log_bytes();
+    let images_end = reserve.saturating_mul(PUBLISH_SLOTS).saturating_add(log);
+    // Derived (A-68): the delta log holds one reserve, a checkpoint slot's size: the journal checkpoints once the
+    // deltas since the last checkpoint reach that checkpoint's size, which a slot bounds, so a log of one slot's
+    // size is never what forces a checkpoint early. Lazily backed: only the pages a delta reaches cost RAM.
+    let delta_end = images_end.saturating_add(reserve);
+    let arena_start = delta_end
+      .checked_next_multiple_of(granule)
+      .unwrap_or(usize::MAX);
+    let stride = arena_start
+      .saturating_add(reserve)
+      .checked_next_multiple_of(granule)
+      .unwrap_or(usize::MAX);
+    ShardContentLayout {
+      stride,
+      write_log: (0, log),
+      images: (log, images_end),
+      delta_log: (images_end, delta_end),
+      arena: (arena_start, reserve),
+    }
+  }
+
+  /// Derived: the anchor content object's whole size: every shard's slice ([`DaemonConfig::shard_content_layout`])
+  /// times the partitions. One definition, the anchor's and a standalone daemon's (they disagreed: the anchor
+  /// sized one slot per shard until 2026-10-03).
+  pub fn content_bytes(&self) -> usize {
+    self
+      .shard_content_layout()
+      .stride
+      .saturating_mul(usize::from(self.geometry.partitions.max(1)))
+  }
+
+  /// Derived: the FUSE devices (A-61) or Windows mount holds (A-198) an anchor may keep across a restart: one per live
+  /// attachment the daemon's shards can hold, `shards × slates_bridge_core::authority::MAX_ATTACHMENTS`, since a
+  /// mount is an attachment on its volume's owner shard.
+  pub fn held_device_bound(&self) -> usize {
+    usize::from(self.runtime.shards).saturating_mul(slates_bridge_core::authority::MAX_ATTACHMENTS)
+  }
+
+  /// Derived: the NFS loopback connections an anchor may hold for this daemon across a restart (A-113): one per live
+  /// attachment the daemon's shards can hold, as [`DaemonConfig::held_device_bound`] — a kernel mount is an attachment,
+  /// and the macOS and Linux kernel clients open one connection per mount. A connection past it is closed by the daemon
+  /// and counted (`nfs.connection_hold_refused`), never served unheld: a client that opens more than one per mount
+  /// (Linux `nconnect`) meets the bound only that much sooner.
+  pub fn held_connection_bound(&self) -> usize {
+    usize::from(self.runtime.shards).saturating_mul(slates_bridge_core::authority::MAX_ATTACHMENTS)
+  }
+
+  /// Derived: the writable direct maps' copies an anchor may hold for this daemon across a restart (A-197): every copy
+  /// its shards may hold at once, `shards × direct_maps_per_shard`, of which the writable ones are some.
+  pub fn held_copy_bound(&self) -> usize {
+    usize::from(self.runtime.shards).saturating_mul(self.direct_maps_per_shard)
+  }
+
+  /// The configuration from a profile, for `instance`. An explicit shard count is selected
+  /// before dividing the host's capacity (§4.2); otherwise the profile chooses the cores.
+  /// Explicit counts are unpinned, as several daemons may share those cores in a test or VM.
+  pub fn derive(profile: &MachineProfile, instance: &str, shards: Option<u16>) -> DaemonConfig {
+    let mut derivations = Vec::new();
+    derivations.push(note(
+      "liveness_budget_ns",
+      &liveness_window(profile.wake.p99_ns),
+    ));
+    let d = profile.derived();
+    let admission = admission_limit(ASSUMED_REQUESTS_PER_SECOND, ASSUMED_SERVICE_P99_NS);
+    derivations.push(note("requests_in_flight_per_shard", &admission));
+    let mut runtime =
+      RuntimeConfig::from_profile(profile, admission.get(), admission.get(), LATENCY_BUDGET_NS);
+    if let Some(shards) = shards {
+      runtime.shards = shards.max(1);
+      runtime.pin = false;
+      runtime.cores.clear();
+    }
+    let shards = u64::from(runtime.shards.max(1));
+    // §4.2 D-12 "honest degradation": the default provisioning reserve is the shard's share of the
+    // machine's total RAM, not the OS lock LIMIT. A volume's arena is locked only when a client asks
+    // (`require_locked`, verbs.rs); by default it is a normal, usable — if unlocked — mapping (crate
+    // mem's lock sequence keeps an unlocked region "usable, unlocked, and counted"). Deriving the
+    // reserve from the mlock limit refused every volume where the OS grants little lockable RAM — the
+    // design's own failure case, "a locked-down CI container refuses mlock; lock capacity 0" (§4.2 boot
+    // order); a `require_locked` volume still respects the lock capacity best-effort. The basis is
+    // **total** memory, not free/available: the reserve is a boot-time admission *ceiling* (the arena
+    // is a lazy anonymous mapping — it costs no physical RAM until a volume stores bytes, so a virtual
+    // ceiling over total is honest), and total is stable, whereas free memory is a fluctuating snapshot
+    // that would make the ceiling — and whether the daemon can provision at all — depend on whatever
+    // else the machine is doing at boot (racy under a busy host or a parallel test suite). Total is
+    // clamped to the tightest OS/job/cgroup bound on the process when one is set (§4.2 "effective
+    // capacity"): a container's `memory.max` or a finite `RLIMIT_AS` is a hard limit the OS enforces
+    // by killing or refusing, so admitting past it would be a promise the host cannot keep; like
+    // total, a configured bound is stable across the boot.
+    let effective: Derived<u64> = derived!(
+      slates_machine::facts::effective_capacity(
+        profile.facts.memory.total,
+        profile.facts.memory.limit
+      ),
+      "min(memory.total, the OS/job/cgroup bound when one is set)",
+      ["memory.total", "memory.limit"]
+    );
+    derivations.push(note("effective_capacity_bytes", &effective));
+    let reserve = region_bytes(effective.get(), shards, MEMORY_CLASSES);
+    derivations.push(note("reserve_per_shard", &reserve));
+    let lock_capacity: Derived<u64> = derived!(
+      if profile.lock.confirmed {
+        profile.lock.bytes
+      } else {
+        0
+      },
+      "the OS's lock limit when a confirming lock succeeded, else 0",
+      ["mem.lock_capacity", "mem.lock_confirmed"]
+    );
+    derivations.push(note("lock_capacity_bytes", &lock_capacity));
+    let page = profile.facts.page.base;
+    let tables: Derived<u64> = derived!(
+      reserve.get().saturating_mul(TABLE_SHARE_PERMILLE) / PERMILLE,
+      "reserve_per_shard × TABLE_SHARE_PERMILLE / 1000",
+      ["mem.lock_capacity", "GAPS §5 table share"]
+    );
+    derivations.push(note("table_bytes", &tables));
+    let volume_record_bytes =
+      u64::try_from(size_of::<slates_db::catalog::VolumeRecord>()).unwrap_or(1);
+    let volumes: Derived<usize> = derived!(
+      usize::try_from(
+        tables
+          .get()
+          .checked_div(volume_record_bytes.max(1))
+          .unwrap_or(0)
+      )
+      .unwrap_or(usize::MAX)
+      .max(1),
+      "table_bytes / size_of::<VolumeRecord>()",
+      ["table_bytes"]
+    );
+    derivations.push(note("volumes_per_shard", &volumes));
+    // §4.7 "Derived constants": a client ring holds what one client may have in flight — Little's law
+    // on the request rate × p99 service time (`requests_in_flight_per_shard`, the admission value that
+    // sizes one client's in-flight work) — rounded up to a power of two. Until 2026-09-22 it was the
+    // runtime's inbound ring depth, `wake.p99 / syscall.median` from one boot probe: a contended boot
+    // measured a tail up to milliseconds, the ring and the bulk area that scales with it took the whole
+    // client share, and a KIND pod seated one client while a sibling pod of the same image seated 1285
+    // (docs/bugs/2026-09-22-client-ring-sized-by-the-wake-tail-not-littles-law.md).
+    let slots: Derived<u32> = derived!(
+      u32::try_from(admission.get())
+        .unwrap_or(u32::MAX)
+        .max(1)
+        .next_power_of_two(),
+      "requests one client may hold in flight (Little's law: request rate × p99 service time), rounded up to a power of two",
+      ["rt.request_rate", "rt.service_p99_ns"]
+    );
+    derivations.push(note("slots_per_ring", &slots));
+    let spin: Derived<u32> = derived!(
+      u32::try_from(d.spin_before_park_ns.get()).unwrap_or(u32::MAX),
+      "the expected (mean) cost of parking, the 2-competitive spin threshold",
+      ["wake.mean_ns"]
+    );
+    derivations.push(note("spin_ns", &spin));
+    // The log holds only what the next snapshot absorbs: the cadence snapshots every `recovery budget ×
+    // measured replay rate` bytes, and a full ring snapshots and trims before the append retries
+    // (`Db::mutate`, `LogFull`). A ring larger than the tables it records buys nothing, and because the
+    // ring wraps, its whole capacity becomes resident RAM over a long run. Until 2026-09-26 it was
+    // `recovery_budget_us × one page per µs` (a 16 GB/s replay guess): 16.4 GB per partition on a 128 GB
+    // Mac, 4 GB in a 1 GiB KIND pod, past the memory the daemon is sized by
+    // (docs/bugs/2026-09-26-the-op-log-ring-was-sized-past-memory.md).
+    let log_bytes: Derived<u64> = derived!(
+      tables.get().max(page),
+      "table_bytes: the ring holds what the next snapshot absorbs, inside the shard's reserve",
+      ["table_bytes", "page"]
+    );
+    derivations.push(note("log_bytes_per_partition", &log_bytes));
+    let snapshot_bytes: Derived<u64> = derived!(
+      tables.get().saturating_mul(2),
+      "twice the table bytes (the whole partition encoded, with growth headroom)",
+      ["table_bytes"]
+    );
+    derivations.push(note("snapshot_bytes_per_partition", &snapshot_bytes));
+    // The boot value, for the record: a shard sizes each slice by its live quantum, which follows its
+    // online wake estimate (`DaemonConfig::archive_slice_bytes`).
+    let archive_slice_bytes: Derived<u64> = derived!(
+      archive_slice_bytes(profile.hash.blake3_bytes_per_second, runtime.step_budget_ns),
+      "blake3_bytes_per_second × step_quantum_ns / 1e9 × ARCHIVE_SLICE_PERMILLE / 1000",
+      ["hash.blake3_bytes_per_second", "rt.step_budget_ns"]
+    );
+    derivations.push(note("archive_slice_bytes", &archive_slice_bytes));
+    // A §4.6 L2 shift copies a content block, so its slice is sized by the measured copy rate rather than the
+    // hash rate; the largest measured copy size is the one a whole-block copy behaves like.
+    let memcpy_bytes_per_second: Derived<u64> = derived!(
+      profile
+        .memcpy
+        .iter()
+        .max_by_key(|point| point.bytes)
+        .map_or(1, |point| point.bytes_per_second)
+        .max(1),
+      "memcpy bytes per second at the largest measured copy size (at least one)",
+      ["memcpy"]
+    );
+    derivations.push(note("memcpy_bytes_per_second", &memcpy_bytes_per_second));
+    let copy_slice_bytes: Derived<u64> = derived!(
+      copy_slice_bytes(memcpy_bytes_per_second.get(), runtime.step_budget_ns),
+      "memcpy_bytes_per_second × step_quantum_ns / 1e9 × COPY_SLICE_PERMILLE / 1000",
+      ["memcpy", "rt.step_budget_ns"]
+    );
+    derivations.push(note("copy_slice_bytes", &copy_slice_bytes));
+    let page_fault_ns: Derived<u64> = derived!(
+      profile.faults.base_ns.max(1),
+      "the profile's measured base-page fault cost (at least one)",
+      ["faults.base_ns"]
+    );
+    derivations.push(note("page_fault_ns", &page_fault_ns));
+    // The reserve an idle shard keeps pre-faulted (A-214): its bound is known at boot, its burst only at run time.
+    derivations.push(format!(
+      "prefault_reserve_bytes = min(the shard's last write burst, reserve_per_shard = {}, the arena's free bytes): the \
+       free content pages an idle shard keeps pre-faulted; the burst is measured at each idle tick (anchors \
+       [\"reserve_per_shard\", \"content.allocated_bytes\"])",
+      reserve.get()
+    ));
+    let codec = codec_policy(profile);
+    derivations.push(format!(
+      "codec = lz4 {}, zstd levels {:?}, byte worth {} scaled ns: the profile's measured codec points, a \
+       byte worth its memcpy cost at neutral value_of_byte and value_of_cpu, E[reads] = 1 (anchors \
+       [\"codecs\", \"memcpy.bytes_per_second\"])",
+      codec.lz4.is_some(),
+      codec.zstd.iter().map(|rate| rate.level).collect::<Vec<_>>(),
+      codec.byte_ns_scaled
+    ));
+    // A reply rides one bulk chunk (one page each direction per slot), so a telemetry drain carries
+    // what a chunk holds past the report's fixed part (§4.14 bounded export).
+    let seal_key_slots: Derived<usize> = derived!(
+      usize::try_from(page)
+        .unwrap_or(0)
+        .checked_div(SEAL_KEY_BYTES)
+        .unwrap_or(0)
+        .saturating_mul(usize::try_from(shards).unwrap_or(1))
+        .max(1),
+      "page.base / 32 × shards (one page of key slots per shard)",
+      ["page.base", "shards"]
+    );
+    derivations.push(note("seal_key_slots", &seal_key_slots));
+    let telemetry_spans_per_reply =
+      crate::telemetry::spans_per_reply(usize::try_from(BULK_CHUNK_BYTES).unwrap_or(usize::MAX));
+    derivations.push(note(
+      "telemetry_spans_per_reply",
+      &telemetry_spans_per_reply,
+    ));
+    let geometry = Geometry {
+      partitions: runtime.shards.max(1),
+      page,
+      profile_bytes: u64::try_from(profile.to_json().map(|j| j.len()).unwrap_or(0))
+        .unwrap_or(0)
+        .saturating_mul(2)
+        .max(page),
+      log_bytes: log_bytes.get(),
+      snapshot_bytes: snapshot_bytes.get(),
+      audit_bytes: AUDIT_PAGES_PER_SHARD
+        .saturating_mul(page)
+        .saturating_mul(shards),
+      landing_slots: LANDING_SLOTS_PER_SHARD
+        .saturating_mul(runtime.shards.max(1).into())
+        .saturating_add(1),
+      landing_slot_bytes: page,
+    };
+    let caps = PartitionCaps {
+      volumes: volumes.get(),
+      snapshots: volumes.get(),
+      attachments: admission.get(),
+      segment_slots: usize::try_from(page.checked_div(volume_record_bytes.max(1)).unwrap_or(0))
+        .unwrap_or(1)
+        .max(1),
+      timers: volumes.get(),
+      tick_ns: runtime.timer_tick_ns,
+      // The green merge chains share the partition's metadata byte budget (§4.16): the same table
+      // bytes the records draw from, so a green's persisted chain is bounded by measured memory, not
+      // a magic count. Checkpointing to fold old chain entries (the design's optimization) is owed.
+      green_chain_bytes: usize::try_from(tables.get()).unwrap_or(usize::MAX),
+    };
+    // The store's tables (§4.2 metadata dimension): each slab's bound is the metadata class — the
+    // shard's second memory class, one reserve — over the true slot cost of the dimension's unit
+    // (an inode is a version slot and a table slot; a directory a node and a block), so the slabs'
+    // maximum footprints are inside the class by construction and the remainder is the ledger the
+    // volumes' records are reserved from. Chunk records go one per page of the arena. The
+    // directory-block bound is the directory bound: every directory past the cut-over holds at
+    // least one block, and a large directory's extra blocks come out of the same unit count.
+    let inode_unit = u64::try_from(slates_vfs::volume::inode_unit_bytes()).unwrap_or(1);
+    let dir_unit = u64::try_from(slates_vfs::volume::directory_unit_bytes()).unwrap_or(1);
+    let max_inodes: Derived<usize> = derived!(
+      usize::try_from(
+        reserve
+          .get()
+          .checked_div(inode_unit.max(1))
+          .and_then(|slots| slots.checked_div(STORE_TABLE_DIVISOR))
+          .unwrap_or(0),
+      )
+      .unwrap_or(usize::MAX)
+      .max(1),
+      "metadata_class / (Slot<Inode> + Slot<TrieNode>) / STORE_TABLE_DIVISOR",
+      ["reserve_per_shard", "vfs.inode_unit_bytes"]
+    );
+    derivations.push(note("max_inodes", &max_inodes));
+    let max_dirs: Derived<usize> = derived!(
+      usize::try_from(
+        reserve
+          .get()
+          .checked_div(dir_unit.max(1))
+          .and_then(|slots| slots.checked_div(STORE_TABLE_DIVISOR))
+          .unwrap_or(0),
+      )
+      .unwrap_or(usize::MAX)
+      .max(1),
+      "metadata_class / (Slot<DirNode> + a smallest-class directory block's page share) / STORE_TABLE_DIVISOR",
+      ["reserve_per_shard", "vfs.directory_unit_bytes"]
+    );
+    derivations.push(note("max_dirs", &max_dirs));
+    let granule = u64::try_from(content_granule(usize::try_from(page).unwrap_or(1))).unwrap_or(1);
+    let max_chunks: Derived<usize> = derived!(
+      usize::try_from(reserve.get().checked_div(granule.max(1)).unwrap_or(0))
+        .unwrap_or(usize::MAX)
+        .max(1),
+      "reserve_per_shard / content_granule (one chunk per granule at least)",
+      ["reserve_per_shard", "page"]
+    );
+    derivations.push(note("max_chunks", &max_chunks));
+    let metadata_class: Derived<u64> = derived!(
+      reserve.get(),
+      "the shard's metadata class: one of the MEMORY_CLASSES shares of its RAM",
+      ["reserve_per_shard", "MEMORY_CLASSES"]
+    );
+    derivations.push(note("metadata_class_bytes", &metadata_class));
+    // The clean-file digest cache's bound (§4.15), derived by the store from the inode table it sizes;
+    // computed here too so the boot log carries every derived value with its inputs (R3).
+    derivations.push(note(
+      "digest_cache_entries",
+      &slates_vfs::base::digest_capacity(max_inodes.get()),
+    ));
+    let store = StoreCaps {
+      max_inodes: max_inodes.get(),
+      max_dirs: max_dirs.get(),
+      max_chunks: max_chunks.get(),
+      max_dir_blocks: max_dirs.get(),
+      dir_cutover: DIR_CUTOVER,
+      metadata_class_bytes: metadata_class.get(),
+    };
+    let spin_shift: Derived<u32> = derived!(
+      profile.wake.estimate_shift(),
+      "⌈log₂ (1.96 × wake.sd_ns / (wake.mean_ns × 0.05))²⌉: the wakes a client's estimate weighs to hold the \
+       probe's ±5 % at 95 %",
+      ["wake.sd_ns", "wake.mean_ns"]
+    );
+    derivations.push(note("spin_shift", &spin_shift));
+    let region = RegionGeometry {
+      slots: slots.get(),
+      spin_ns: spin.get(),
+      spin_shift: spin_shift.get(),
+      bulk_bytes: u64::from(slots.get())
+        .saturating_mul(2)
+        .saturating_mul(BULK_CHUNK_BYTES),
+      page,
+    };
+    let region_bytes = u64::try_from(region.total_bytes())
+      .unwrap_or(u64::MAX)
+      .max(1);
+    let clients: Derived<usize> = derived!(
+      usize::try_from(
+        reserve
+          .get()
+          .saturating_mul(CLIENT_SHARE_PERMILLE)
+          .checked_div(PERMILLE)
+          .and_then(|share| share.checked_div(region_bytes))
+          .unwrap_or(0)
+      )
+      .unwrap_or(usize::MAX)
+      .max(1),
+      "reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / region_bytes",
+      ["reserve_per_shard", "region_bytes"]
+    );
+    derivations.push(note("clients_per_shard", &clients));
+    // The same-kernel direct map's copies a shard may hold (§4.6, A-171): what the process's descriptor and mapping
+    // limits leave room for, over the shards.
+    let direct_maps: Derived<usize> = derived!(
+      direct_maps_per_shard(
+        slates_machine::facts::descriptor_limit(),
+        slates_machine::facts::mapping_limit(),
+        shards,
+        max_chunks.get()
+      ),
+      "min(RLIMIT_NOFILE × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / DESCRIPTORS_PER_COPY, vm.max_map_count × \
+       DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / MAPPINGS_PER_COPY) / shards, at most max_chunks",
+      ["RLIMIT_NOFILE", "vm.max_map_count", "shards", "max_chunks"]
+    );
+    derivations.push(note("direct_maps_per_shard", &direct_maps));
+    // A landing presentation lives on its volume's owner shard whichever shard its client sits on: the
+    // daemon's seats bound the presentations one shard holds (AUD-29-07).
+    let landings_awaiting: Derived<usize> = derived!(
+      clients
+        .get()
+        .saturating_mul(usize::try_from(shards).unwrap_or(usize::MAX)),
+      "clients_per_shard × shards",
+      ["clients_per_shard", "shards"]
+    );
+    derivations.push(note("landings_awaiting_per_shard", &landings_awaiting));
+    // The task arena and the control channel hold the cross-shard traffic of the clients:
+    // one task per forwarded request at its owner and one for its reply at the origin, and
+    // the shard's own loops; the admission value above sizes only what one client may hold
+    // in flight.
+    let tasks: Derived<usize> = derived!(
+      clients
+        .get()
+        .saturating_mul(TASKS_PER_CLIENT)
+        .saturating_add(LOOP_TASKS_PER_SHARD),
+      "clients_per_shard × TASKS_PER_CLIENT + LOOP_TASKS_PER_SHARD",
+      ["clients_per_shard"]
+    );
+    derivations.push(note("tasks_per_shard", &tasks));
+    runtime.tasks_per_shard = tasks.get();
+    runtime.timers_per_shard = tasks.get();
+    // The shard polls for the idle window after its last work before parking (§4.7 "Shards
+    // poll rings while any client has activity within the measured idle window"), so a
+    // request from an active client, or a forward from another shard, never pays a wake.
+    derivations.push(note("provision_floor_ns", &PROVISION_FLOOR));
+    derivations.push(note("loaded_wake_ratio", &loaded_wake_ratio()));
+    let idle_window: Derived<u64> = derived!(
+      idle_window_ns(d.spin_before_park_ns.get()),
+      "max(provision_floor_ns, wake estimate × loaded_wake_ratio), the estimate seeded with spin_before_park_ns",
+      ["provision_floor_ns", "loaded_wake_ratio", "wake.mean_ns"]
+    );
+    derivations.push(note("idle_window_ns", &idle_window));
+    runtime.spin_ns = idle_window.get();
+    // A shard's spin follows its online wake estimate by the same rule (§4.3): the platform's multiple, at least
+    // R9's floor. `spin_ns` is the boot value, kept by a runtime that tracks no estimate.
+    if let Some(tracking) = runtime.wake_tracking.as_mut() {
+      tracking.idle_ratio = loaded_wake_ratio().get();
+      tracking.idle_floor_ns = PROVISION_FLOOR_NS;
+    }
+    // A client in R9's closed loop finds the shards it goes round still polling: a forward made for it holds them for
+    // the loop's revisit at R9's percentile (§4.7; A-326).
+    let loop_hold = closed_loop_hold(runtime.shards);
+    derivations.push(note("closed_loop_hold_ns", &loop_hold));
+    #[cfg(unix)]
+    let guest_credits = guest_credits(profile, admission.get(), &mut derivations);
+    let inode_reserve = inode_reserve(&mut derivations);
+    let nfs_v4 = nfs_v4_caps(
+      reserve.get(),
+      (runtime.shards.max(1), region.slots),
+      store.max_inodes,
+      &mut derivations,
+    );
+    DaemonConfig {
+      runtime,
+      geometry,
+      caps,
+      region,
+      lock_capacity_bytes: lock_capacity.get(),
+      clients_per_shard: clients.get(),
+      direct_maps_per_shard: direct_maps.get(),
+      landings_awaiting_per_shard: landings_awaiting.get(),
+      reserve_per_shard: reserve.get(),
+      large_class_bytes: d.arena_region_bytes.get(),
+      store,
+      huge_pages: slates_mem::region::huge_pages_beneficial(profile).get(),
+      cache_line: usize::try_from(profile.facts.cache_line)
+        .unwrap_or(1)
+        .max(1),
+      page: usize::try_from(page).unwrap_or(1).max(1),
+      discard_from_bytes: usize::try_from(d.discard_from_bytes.get()).unwrap_or(usize::MAX),
+      instance: instance.to_owned(),
+      failover_slo_ns: FAILOVER_SLO_NS,
+      closed_loop_hold_ns: loop_hold.get(),
+      // Unstated by default: the scatter width stays at the candidate floor until a deployment states its
+      // re-replication bandwidth (or the deferred network-empirical measurement supplies it).
+      rereplication_bytes_per_second: 0,
+      blake3_bytes_per_second: profile.hash.blake3_bytes_per_second,
+      memcpy_bytes_per_second: memcpy_bytes_per_second.get(),
+      page_fault_ns: page_fault_ns.get(),
+      codec,
+      telemetry_spans_per_reply: telemetry_spans_per_reply.get(),
+      // The laptop default: no fleet, `f = 0`, solo. An operator deploying a fleet sets this (with
+      // `with_fleet`); the derivation from the machine profile is the same either way (R8).
+      fleet: None,
+      recovery_key: None,
+      fleet_peer_capacity: 0,
+      fleet_sessions_per_plane: 0,
+      fleet_session_receive_bytes: 0,
+      read_ahead_bytes: 0,
+      seal_key_slots: seal_key_slots.get(),
+      boot_fault: None,
+      #[cfg(unix)]
+      guest_credits,
+      nfs_v4,
+      inode_reserve,
+      derivations,
+    }
+    .with_control_shard_noted()
+  }
+
+  /// Derived: the control shard's task and timer capacities. The control shard runs every forward of every shard's
+  /// clients to another node (each a task there for its whole round), and its forward lane admits
+  /// [`forward_lane_bound`] of them, so its arena, its control channel (bounded by the same capacity) and its timers
+  /// hold that many beyond every shard's own share (`runtime.tasks_per_shard`, `runtime.timers_per_shard`). A lane
+  /// that admits work its shard's arena cannot run is the defect (the supervisor's order of 2026-11-07: the control
+  /// shard sized like the rest refused 117 spawns in fixtures' 1,000-client replica-kill rung, and its channel 10,198
+  /// to 10,298 forwards in `a_silent_owner_leaves_no_forward_the_lane_admitted_unrun`).
+  pub fn control_shard_capacity(&self) -> Derived<slates_rt::ShardCapacity> {
+    // The lane holds forwards to other nodes, so with no peers it admits none (R8: the formula's value, no mode): a
+    // laptop's control shard is sized like its other shards. Until 2026-11-08 a laptop's got the lane's bound too, a
+    // channel of 1,371,635 tasks on a Mac for forwards that cannot exist.
+    let peers = self.fleet.as_ref().map_or(0, |fleet| fleet.peers.len());
+    let lane = if peers == 0 {
+      0
+    } else {
+      forward_lane_bound(
+        self.clients_per_shard,
+        self.region.slots,
+        self.runtime.shards,
+      )
+      .get()
+    };
+    derived!(
+      slates_rt::ShardCapacity {
+        tasks: self.runtime.tasks_per_shard.saturating_add(lane),
+        timers: self.runtime.timers_per_shard.saturating_add(lane),
+      },
+      "tasks_per_shard + forward_lane_bound, timers_per_shard + forward_lane_bound (the lane's bound zero with no peers)",
+      [
+        "tasks_per_shard",
+        "timers_per_shard",
+        "clients_per_shard",
+        "region.slots",
+        "shards",
+        "fleet.peers"
+      ]
+    )
+  }
+
+  /// Derived: the most messages one shard keeps at once for other shards whose control channels are full
+  /// (`crate::xshard::carrier`, §4.3). Each kept message is a reply or a result another shard waits for: every request
+  /// this node's clients may hold in flight owes one reply, and every acknowledgement part one result
+  /// (`2 × forward_lane_bound`); every other message a shard carries (a call's result, a connection's end) is awaited
+  /// or sent by a task, at most the daemon's task arenas. The requests in flight never reach it; past it a message is
+  /// refused to its sender, which counts the loss (`xshard.keep_refused`).
+  pub fn kept_bound(&self) -> Derived<usize> {
+    let in_flight = forward_lane_bound(
+      self.clients_per_shard,
+      self.region.slots,
+      self.runtime.shards,
+    )
+    .get();
+    let arenas = self.control_shard_capacity().get().tasks.saturating_add(
+      self
+        .runtime
+        .tasks_per_shard
+        .saturating_mul(usize::from(self.runtime.shards.saturating_sub(1))),
+    );
+    derived!(
+      in_flight.saturating_mul(2).saturating_add(arenas),
+      "2 × forward_lane_bound + control_shard_capacity.tasks + tasks_per_shard × (shards − 1)",
+      [
+        "clients_per_shard",
+        "region.slots",
+        "shards",
+        "tasks_per_shard",
+        "fleet.peers"
+      ]
+    )
+  }
+
+  /// This configuration with its control shard's capacity and its shards' kept bound in the boot log, in place of any
+  /// earlier lines for them (both follow `runtime`'s, which [`Self::with_fleet`] raises).
+  fn with_control_shard_noted(mut self) -> DaemonConfig {
+    let capacity = note("control_shard_capacity", &self.control_shard_capacity());
+    let kept = note("kept_bound", &self.kept_bound());
+    self.derivations.retain(|line| {
+      !line.starts_with("control_shard_capacity ") && !line.starts_with("kept_bound ")
+    });
+    self.derivations.push(capacity);
+    self.derivations.push(kept);
+    self
+  }
+}
+
+/// Derived: the forwards one forward lane may hold, queued and open together: every request this node's clients may
+/// hold in flight, `clients_per_shard × slots` on each of `shards` (`crate::forward_lane`). The control shard's
+/// capacity is sized from the same value ([`DaemonConfig::control_shard_capacity`]).
+pub(crate) fn forward_lane_bound(
+  clients_per_shard: usize,
+  slots: u32,
+  shards: u16,
+) -> Derived<usize> {
+  derived!(
+    clients_per_shard
+      .saturating_mul(usize::try_from(slots).unwrap_or(usize::MAX))
+      .saturating_mul(usize::from(shards.max(1)))
+      .max(1),
+    "clients_per_shard × slots × shards",
+    ["clients_per_shard", "region.slots", "shards"]
+  )
+}
+
+/// A fault injected into one shard's start (the boot tests): which partition, how it misbehaves, and for how long.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BootFault {
+  /// The partition whose start misbehaves.
+  pub partition: u16,
+  /// How it misbehaves.
+  pub kind: BootFaultKind,
+  /// For how long, nanoseconds.
+  pub for_ns: u64,
+}
+
+/// How a shard's start misbehaves under a [`BootFault`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BootFaultKind {
+  /// The start runs on the CPU for the whole time, as a long recovery does.
+  Busy,
+  /// The start sleeps for the whole time, using no CPU, as a stuck shard does.
+  Stuck,
+}
+
+/// The NFSv4 listener's table bounds (§4.6 A-35): what its sessions, clients and opens may hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NfsV4Caps {
+  /// Derived: the requests one session keeps in flight (its slot count).
+  pub slots: u32,
+  /// Derived: the clients (mounting hosts) the listener holds state for.
+  pub clients: usize,
+  /// Derived: the opens the listener records at once.
+  pub opens: usize,
+  /// Derived: the byte-range lock ranges (and lock states holding none) the listener records at once.
+  pub locks: usize,
+  /// Derived: the bytes of call records a shard holds at once (A-127): what answers a compound retried after a
+  /// restart, bounded beside the slot caches it is the durable twin of.
+  pub record_bytes: usize,
+}
+
+/// Shape: the holders the NFSv4 client share of a shard's reserve is split between (A-127): the slot caches (a kept
+/// reply per slot) and the call records (what a kept reply becomes across a restart, published with its effects).
+/// Each takes an equal part, so neither crowds out the other.
+const NFS_V4_CLIENT_SHARE_HOLDERS: u64 = 2;
+
+/// Shape: the sessions one NFSv4 client holds at once: the live one and its successor, which a client
+/// creates before destroying the old when it replaces a session (RFC 8881 §2.10.13); a client that
+/// trunks more connections binds them to one session (§2.10.3.1).
+pub const NFS_V4_SESSIONS_PER_CLIENT: usize = 2;
+
+/// The NFSv4 listener's table bounds from the listener shard's reserve, the shard count and the
+/// store's inode bound:
+/// - **slots** = the shard count: a session's requests are served by the volumes' owner shards, so more
+///   in flight than there are shards to serve them only queues;
+/// - **clients** = the slot caches' part of the client share of the listener shard's reserve over one client's slot
+///   caches (every session's slots, each keeping a reply of up to one compound header, the cached-reply ceiling);
+/// - **record bytes** = the call records' part of the same share (A-127): the records a shard keeps for the compounds
+///   whose calls it served;
+/// - **opens** = the store's inode bound × the shard count: an open names a file, and every shard's
+///   store holds at most that many;
+/// - **locks** = the same bound: a lock range names a byte range of an open file, and one lock-owner's
+///   locks on a file merge into as few ranges as their gaps allow, so a range per file is the common
+///   case and each costs what an open costs.
+fn nfs_v4_caps(
+  reserve_per_shard: u64,
+  (shards, in_flight): (u16, u32),
+  max_inodes: usize,
+  derivations: &mut Vec<String>,
+) -> NfsV4Caps {
+  // A session's slots are the requests its client keeps in flight, the bound a ring client gets (`slots_per_ring`,
+  // Little's law). Until 2026-10-04 it was the shard count: four slots held a parallel Go build's requests in the
+  // Linux client, queued 1.05 ms per reopen against 0.44 ms on the wire (A-75).
+  let slots: Derived<u32> = derived!(
+    in_flight.max(1),
+    "slots_per_ring: the requests one client may hold in flight (Little's law)",
+    ["slots_per_ring"]
+  );
+  derivations.push(note("nfs_v4_slots", &slots));
+  let client_bytes = u64::from(slots.get())
+    .saturating_mul(u64::try_from(NFS_V4_SESSIONS_PER_CLIENT).unwrap_or(u64::MAX))
+    .saturating_mul(u64::from(
+      slates_bridge_nfs::v4::compound::COMPOUND_HEADER_BYTES,
+    ))
+    .max(1);
+  let part = reserve_per_shard
+    .saturating_mul(CLIENT_SHARE_PERMILLE)
+    .checked_div(PERMILLE)
+    .and_then(|share| share.checked_div(NFS_V4_CLIENT_SHARE_HOLDERS))
+    .unwrap_or(0);
+  let clients: Derived<usize> = derived!(
+    usize::try_from(part.checked_div(client_bytes).unwrap_or(0))
+      .unwrap_or(usize::MAX)
+      .max(1),
+    "reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS / (nfs_v4_slots × NFS_V4_SESSIONS_PER_CLIENT × COMPOUND_HEADER_BYTES)",
+    ["reserve_per_shard", "shards"]
+  );
+  derivations.push(note("nfs_v4_clients", &clients));
+  let record_bytes: Derived<usize> = derived!(
+    usize::try_from(part).unwrap_or(usize::MAX),
+    "reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS",
+    ["reserve_per_shard"]
+  );
+  derivations.push(note("nfs_v4_record_bytes", &record_bytes));
+  let opens: Derived<usize> = derived!(
+    max_inodes.saturating_mul(usize::from(shards.max(1))),
+    "max_inodes × shards",
+    ["max_inodes", "shards"]
+  );
+  derivations.push(note("nfs_v4_opens", &opens));
+  let locks: Derived<usize> = derived!(
+    max_inodes.saturating_mul(usize::from(shards.max(1))),
+    "max_inodes × shards",
+    ["max_inodes", "shards"]
+  );
+  derivations.push(note("nfs_v4_locks", &locks));
+  NfsV4Caps {
+    slots: slots.get(),
+    clients: clients.get(),
+    opens: opens.get(),
+    locks: locks.get(),
+    record_bytes: record_bytes.get(),
+  }
+}
+
+/// A guest device attachment's credits from the profile (§4.6 A-9, §4.9): the request credit is the
+/// shard's admission limit; the byte credit is the credit window over the measured memcpy bandwidth (the
+/// largest measured copy size, the streaming rate a request copy runs at) and the mean wake (the expected
+/// round trip of a kick through the driver), with one request's worst case — the device's readable cap
+/// plus its writable cap — as the frame, under the provisioning latency budget.
+#[cfg(unix)]
+fn guest_credits(
+  profile: &MachineProfile,
+  requests_in_flight_per_shard: usize,
+  derivations: &mut Vec<String>,
+) -> slates_bridge_virtiofs::credit::AttachmentCredits {
+  use slates_bridge_virtiofs::credit::AttachmentCredits;
+  use slates_bridge_virtiofs::device::{readable_cap, writable_cap};
+  let bandwidth_bytes_per_ns: Derived<u64> = derived!(
+    profile
+      .memcpy
+      .iter()
+      .max_by_key(|point| point.bytes)
+      .map_or(1, |point| point.bytes_per_second / NANOS_PER_SECOND)
+      .max(1),
+    "memcpy bytes per second at the largest measured copy size / 1e9 (at least one byte per nanosecond)",
+    ["memcpy"]
+  );
+  derivations.push(note(
+    "guest_bandwidth_bytes_per_ns",
+    &bandwidth_bytes_per_ns,
+  ));
+  let frame = readable_cap().get().saturating_add(writable_cap().get());
+  // The kick round trip of the byte window (bandwidth × round trip, a bandwidth-delay product) is the
+  // expected wake: a throughput window is sized to the mean round trip, and the p99 inflated it ten- to
+  // fifteenfold on a virtual machine (docs/bugs/2026-09-22-wake-probe-mixes-two-events-and-reports-an-
+  // unconverged-tail.md).
+  let credits = AttachmentCredits::derive(
+    requests_in_flight_per_shard,
+    bandwidth_bytes_per_ns.get(),
+    profile.wake.mean_ns.max(1),
+    frame,
+    LATENCY_BUDGET_NS,
+  );
+  derivations.push(note("guest_requests_credit", &credits.requests));
+  derivations.push(note("guest_bytes_credit", &credits.bytes));
+  credits
+}
+
+/// The bytes one archive-walk slice may hash within `quantum_ns`: half the quantum at `blake3_bytes_per_second`,
+/// so a seal (§4.10) is archived in bounded slices (§4.3) that never take the whole step from the clients.
+fn archive_slice_bytes(blake3_bytes_per_second: u64, quantum_ns: u64) -> u64 {
+  (blake3_bytes_per_second.saturating_mul(quantum_ns) / NANOS_PER_SECOND)
+    .saturating_mul(ARCHIVE_SLICE_PERMILLE)
+    / PERMILLE
+}
+
+/// Derived: how long one turn may spend wrapping a seal's envelope (A-323) within a turn of `quantum_ns`: the archive
+/// walk's share of a step, `quantum_ns × ARCHIVE_SLICE_PERMILLE / 1000`. The wrap seals a chunk at least whatever it is,
+/// and has no measured rate of its own in the boot profile (it costs a seal and three BLAKE3 passes a byte, where the
+/// walk's slice is sized by one), so it is held to the shard's clock rather than to a byte count.
+pub fn wrap_slice_ns(quantum_ns: u64) -> u64 {
+  quantum_ns.saturating_mul(ARCHIVE_SLICE_PERMILLE) / PERMILLE
+}
+
+/// The direct maps' copies one shard may hold at once, handed or being filled (§4.6, A-171): the direct maps' share of
+/// the process's descriptor limit and of its mapping limit, each over what one copy holds, the smaller of the two, over
+/// the shards. The backings' slab capacity (`max_chunks` a shard) bounds it where no OS limit binds lower. Zero where
+/// the limits leave no room for one copy a shard: the shard then serves no direct map, and its clients read by copy.
+pub fn direct_maps_per_shard(
+  descriptors: Option<u64>,
+  mappings: Option<u64>,
+  shards: u64,
+  max_chunks: usize,
+) -> usize {
+  let share = |limit: u64, per_copy: u64| {
+    limit
+      .saturating_mul(DIRECT_MAP_LIMIT_SHARE_PERMILLE)
+      .checked_div(PERMILLE)
+      .and_then(|shared| shared.checked_div(per_copy))
+      .and_then(|process| process.checked_div(shards.max(1)))
+  };
+  let by_slab = u64::try_from(max_chunks).unwrap_or(u64::MAX);
+  let per_shard = [
+    descriptors.and_then(|limit| share(limit, DESCRIPTORS_PER_COPY)),
+    mappings.and_then(|limit| share(limit, MAPPINGS_PER_COPY)),
+  ]
+  .into_iter()
+  .flatten()
+  .fold(by_slab, u64::min);
+  usize::try_from(per_shard).unwrap_or(usize::MAX)
+}
+
+/// The content bytes one slice of copy-bound work may move within `quantum_ns`: half the quantum at the machine's
+/// measured memcpy rate. A shard with many mapped windows shifts them (§4.6 L2), and an image is built or merged
+/// (A-160), in bounded slices (§4.3), the shard serving between them.
+fn copy_slice_bytes(memcpy_bytes_per_second: u64, quantum_ns: u64) -> u64 {
+  (memcpy_bytes_per_second.saturating_mul(quantum_ns) / NANOS_PER_SECOND)
+    .saturating_mul(COPY_SLICE_PERMILLE)
+    / PERMILLE
+}
+
+impl DaemonConfig {
+  /// The calling shard's step quantum now (§4.3): its online wake estimate while its runtime tracks one
+  /// (`slates_rt::futures::step_budget_ns`); the configured step budget off a shard thread. What a
+  /// cooperative slice is sized by, so slices follow the quantum the shard actually keeps.
+  pub fn step_quantum_ns(&self) -> u64 {
+    slates_rt::futures::step_budget_ns().unwrap_or(self.runtime.step_budget_ns)
+  }
+
+  /// The bytes one archive-walk slice may hash on the calling shard now: half its live step quantum at the
+  /// machine's measured BLAKE3 throughput.
+  pub fn archive_slice_bytes(&self) -> u64 {
+    archive_slice_bytes(self.blake3_bytes_per_second, self.step_quantum_ns())
+  }
+
+  /// The content bytes one slice of copy-bound work (a DAX backing's fill, an image's build) may move on the calling
+  /// shard now: half its live step quantum at the machine's measured memcpy rate.
+  pub fn copy_slice_bytes(&self) -> u64 {
+    copy_slice_bytes(self.memcpy_bytes_per_second, self.step_quantum_ns())
+  }
+
+  /// Derived: the pages an idle shard pre-faults in one slice of its reserve's refill now (A-214): its step quantum
+  /// over the measured base-page fault cost, `step_quantum_ns / page_fault_ns`, at least one (§4.2's pre-fault batch,
+  /// "idle window / fault_ns").
+  pub fn prefault_slice_pages(&self) -> usize {
+    usize::try_from(
+      self
+        .step_quantum_ns()
+        .checked_div(self.page_fault_ns.max(1))
+        .unwrap_or(0),
+    )
+    .unwrap_or(usize::MAX)
+    .max(1)
+  }
+
+  /// Derived: the bytes the calling shard can copy in one whole step quantum now, at the measured memcpy rate
+  /// (`memcpy_bytes_per_second × step_quantum_ns / 1e9`), at least one. A lower bound on what a quantum's work must
+  /// copy past: work that copies more bytes than this cannot finish within the quantum. An NFS connection's turn stops
+  /// taking records there (`crate::nfs`, `read_head`; A-204).
+  pub fn quantum_copy_bytes(&self) -> u64 {
+    self
+      .memcpy_bytes_per_second
+      .saturating_mul(self.step_quantum_ns())
+      .checked_div(NANOS_PER_SECOND)
+      .unwrap_or(0)
+      .max(1)
+  }
+
+  /// [`DaemonConfig::copy_slice_bytes`] in whole host pages, at least one: the slice a DAX backing's fill, ingest or
+  /// refill copies on the calling shard now (A-163), since a backing is stored and compared a page at a time.
+  pub fn copy_slice_page_bytes(&self) -> u64 {
+    let page = u64::try_from(self.page.max(1)).unwrap_or(u64::MAX);
+    self
+      .copy_slice_bytes()
+      .checked_div(page)
+      .and_then(|pages| pages.checked_mul(page))
+      .unwrap_or(page)
+      .max(page)
+  }
+
+  /// The time one slice of such work may take on the calling shard now: half its live step quantum. Work whose units
+  /// are not bytes copied — an image's walk, layout, writing and merge (A-160), where an entry costs tens of times its
+  /// bytes — is bounded by it against the clock, one unit at a time.
+  pub fn copy_slice_ns(&self) -> u64 {
+    self.step_quantum_ns().saturating_mul(COPY_SLICE_PERMILLE) / PERMILLE
+  }
+
+  /// This configuration with `fault` injected into a shard's start (the boot tests).
+  pub fn with_boot_fault(mut self, fault: BootFault) -> DaemonConfig {
+    self.boot_fault = Some(fault);
+    self
+  }
+
+  /// The same configuration with the operator's failover SLO (the lease term's ceiling).
+  pub fn with_failover_slo(mut self, failover_slo_ns: u64) -> DaemonConfig {
+    self.failover_slo_ns = failover_slo_ns.max(1);
+    self
+  }
+
+  /// The same configuration with the operator's stated re-replication bandwidth (bytes/second), the `B`
+  /// anchor of the scatter-width derivation. `0` leaves the scatter width at the candidate floor.
+  pub fn with_rereplication_bandwidth(mut self, bytes_per_second: u64) -> DaemonConfig {
+    self.rereplication_bytes_per_second = bytes_per_second;
+    self
+  }
+
+  /// The scatter width the neighbourhood is bounded to (§4.8 "Placement", D-14), derived from this node's
+  /// replicated data budget `D` (its RAM content reserve across shards), its operator-stated re-replication
+  /// bandwidth `B` and the recovery budget `T` (`slates_db::replay::RECOVERY_BUDGET_NS`):
+  /// `scatter_width(D, B, T, f)` — the smallest S that restores the copies within T, never below the
+  /// candidate floor `2f + 1`. With `B` unstated (`0`) this is exactly the floor (one copyset), so the
+  /// bounded neighbourhood is unchanged from the default; a stated bandwidth sizes a wider neighbourhood for
+  /// recovery parallelism, which the fixed-copyset construction then keeps loss-free.
+  pub fn derived_scatter(&self, quorum: Quorum) -> u64 {
+    let data_bytes = self
+      .reserve_per_shard
+      .saturating_mul(u64::from(self.runtime.shards.max(1)));
+    scatter_width(
+      data_bytes,
+      self.rereplication_bytes_per_second,
+      slates_db::replay::RECOVERY_BUDGET_NS,
+      u64::from(quorum.f),
+    )
+  }
+
+  /// The same configuration joined to a fleet (§4.8, boot step 6): the placement authority, configuration
+  /// group and owner acceptor are built over `membership` (its quorum and peers) at boot, rather than the
+  /// solo degenerate. An operator sets this to deploy a fleet node; a laptop leaves it unset.
+  pub fn with_fleet(mut self, membership: FleetMembership) -> DaemonConfig {
+    // The fleet's own tasks are a second population on the control shard beside the clients' (§4.3
+    // "every structure has a derived bound"): per unit of peer capacity, the probe loop and the record
+    // link; per plane, one accept-side serve task for every slot of the demultiplexer's **shared** session
+    // pool (`SESSION_SLOTS_PER_PEER` per unit of capacity — one pending handshake and the authenticated
+    // live/replacement pair; a slot is held from its allotment until its serve task drops the session,
+    // so no more serve tasks can exist than slots); plus the receive and accept loops of both planes and
+    // the coordinator. Admission uses this capacity and the same transport-owned multiplier, so a burst
+    // of re-dials under load fills the fleet's share and never the
+    // clients' (2026-09-14: at ~3× oversubscription the shard's whole arena filled with accept-side
+    // handshakes each held for its bounded retransmit budget, `adm_refused` 4,554 —
+    // `docs/wip/fleet-under-load.md`). The invariant, per plane: accepted endpoints ≤ S = 3 × C; the
+    // fleet's reserve = 2C + 2S + 5.
+    let per_peer = FLEET_LOOPS_PER_PEER + SESSION_SLOTS_PER_PEER * FLEET_PLANES;
+    let peers = membership
+      .peers
+      .len()
+      .max(self.runtime.tasks_per_shard / per_peer);
+    self.fleet_peer_capacity = peers;
+    let sessions_per_plane: Derived<usize> = derived!(
+      peers.saturating_mul(SESSION_SLOTS_PER_PEER),
+      "SESSION_SLOTS_PER_PEER × fleet_peer_capacity",
+      ["fleet.peers"]
+    );
+    self
+      .derivations
+      .push(note("fleet_sessions_per_plane", &sessions_per_plane));
+    self.fleet_sessions_per_plane = sessions_per_plane.get();
+    // Every fleet session on the control shard: the accepted ones (the pool per plane) and the ones this
+    // node dials (one per peer per plane); and one session's worth per peer for the read-ahead windows a shard
+    // keeps of what those sessions carried (`read_ahead_bytes`).
+    let fleet_sessions = sessions_per_plane
+      .get()
+      .saturating_add(peers)
+      .saturating_mul(FLEET_PLANES)
+      .saturating_add(peers)
+      .max(1);
+    let receive: Derived<u64> = derived!(
+      (self
+        .reserve_per_shard
+        .saturating_mul(FLEET_RECEIVE_SHARE_PERMILLE)
+        .checked_div(PERMILLE)
+        .and_then(|share| share.checked_div(u64::try_from(fleet_sessions).unwrap_or(u64::MAX)))
+        .unwrap_or(0))
+      .max(slates_transport::connection::initial_receive_window(
+        crate::fleet::FLEET_FRAME_CAP
+      )),
+      "reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window",
+      ["reserve_per_shard", "fleet.peers"]
+    );
+    self
+      .derivations
+      .push(note("fleet_session_receive_bytes", &receive));
+    self.fleet_session_receive_bytes = receive.get();
+    let read_ahead: Derived<u64> = derived!(
+      receive
+        .get()
+        .saturating_mul(u64::try_from(peers).unwrap_or(u64::MAX)),
+      "fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share)",
+      ["fleet_session_receive_bytes", "fleet.peers"]
+    );
+    self.derivations.push(note("read_ahead_bytes", &read_ahead));
+    self.read_ahead_bytes = read_ahead.get();
+    let fleet_tasks: Derived<usize> = derived!(
+      peers
+        .saturating_mul(FLEET_LOOPS_PER_PEER)
+        .saturating_add(sessions_per_plane.get().saturating_mul(FLEET_PLANES))
+        .saturating_add(FLEET_LOOPS_PER_SHARD),
+      "peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD",
+      ["fleet.peers", "fleet_sessions_per_plane"]
+    );
+    self
+      .derivations
+      .push(note("fleet_tasks_per_shard", &fleet_tasks));
+    self.runtime.tasks_per_shard = self
+      .runtime
+      .tasks_per_shard
+      .saturating_add(fleet_tasks.get());
+    self.runtime.timers_per_shard = self
+      .runtime
+      .timers_per_shard
+      .saturating_add(fleet_tasks.get());
+    self.fleet = Some(membership);
+    self.with_control_shard_noted()
+  }
+}
+
+/// The cost model's policy from the profile's measured codec points (§4.11, D-17): the `lz4` point
+/// (the probe codec) and every `zstd` level point become the candidates, each with its measured
+/// compress and decompress cost and ratio; the value constants are neutral and `E[reads]` is one (see
+/// [`DaemonConfig::codec`]). A profile that measured no codec (the probe off, or the codecs not
+/// compiled in) yields the raw-only policy — the same decision path with no candidates (R8).
+fn codec_policy(profile: &MachineProfile) -> slates_archive::CodecPolicy {
+  let mut policy = slates_archive::CodecPolicy::raw_only();
+  // The neutral worth of a byte: the measured memcpy bandwidth at the largest probed size (the
+  // streaming rate a chunk moves at), so a codec pays when the bytes it saves would cost more to move
+  // than to compress and decompress.
+  let memcpy = profile
+    .memcpy
+    .iter()
+    .max_by_key(|point| point.bytes)
+    .map_or(0, |point| point.bytes_per_second);
+  policy.byte_ns_scaled = slates_archive::CodecPolicy::byte_worth_from_memcpy(memcpy);
+  for point in &profile.codecs {
+    let rate = slates_archive::CodecRate::from_throughput(
+      point.level,
+      point.compress_bytes_per_second,
+      point.decompress_bytes_per_second,
+      point.ratio_permille,
+    );
+    match point.codec.as_str() {
+      "lz4" => policy.lz4 = Some(rate),
+      "zstd" => policy.zstd.push(rate),
+      _ => {}
+    }
+  }
+  policy
+}
+
+/// Format: the smallest `fuse_dirent` a directory listing carries (Linux `include/uapi/linux/fuse.h`): `ino`, `off`,
+/// `namelen` and `type`, 24 bytes, then a name of at least one byte, the record padded to `FUSE_DIRENT_ALIGN`, 8. That is
+/// 32 bytes, each record naming an inode.
+#[cfg(unix)]
+const SMALLEST_FUSE_DIRENT: u64 = 32;
+/// Format: the smallest NFSv3 `entry3` a `READDIR` reply carries (RFC 1813 §3.3.16): the file id (8), the name's length
+/// (4) and one padded word of name (4), the cookie (8), and the next entry's flag (4). That is 28 bytes, each entry
+/// naming an inode.
+const SMALLEST_NFS_ENTRY: u64 = 28;
+
+/// Derived (A-150): the inode numbers each publication reserves ahead of a volume's counter. A reply may hand out a
+/// number below the reserved ceiling with no barrier of its own; past it, the reply waits for a publication (D-18), so a
+/// successor never issues a number a client still holds. The reserve is the most numbers one unit of work can issue,
+/// times [`slates_vfs::volume::RESERVE_TOP_UP_SHARE`], so the top-up the owner runs at that share leaves a whole unit's
+/// numbers reserved before the unit runs. The most is a directory listing filling the largest reply a transport serves
+/// with its smallest entries, each naming an inode: the NFS message cap over the smallest `entry3`, or a guest's reply
+/// cap over the smallest `fuse_dirent` where a guest keeps its numbers across a restart ([`guest_listing_entries`]),
+/// whichever is more. A successor skips at most this many numbers per takeover, against a counter space of 2^47 per
+/// volume. Until 2026-10-26 Windows reserved none, having no transport whose client keeps a number across a restart;
+/// its network export is one (A-184), as an NFS client keeps its file handles.
+fn inode_reserve(derivations: &mut Vec<String>) -> u64 {
+  let nfs = u64::try_from(slates_bridge_nfs::rpc::MAX_MESSAGE)
+    .unwrap_or(u64::MAX)
+    .checked_div(SMALLEST_NFS_ENTRY)
+    .unwrap_or(0);
+  let guest = guest_listing_entries();
+  derivations.push(note("guest_listing_entries", &guest));
+  let reserve: Derived<u64> = derived!(
+    guest
+      .get()
+      .max(nfs)
+      .saturating_mul(slates_vfs::volume::RESERVE_TOP_UP_SHARE),
+    "max(guest_listing_entries, NFS max message / smallest entry3) × RESERVE_TOP_UP_SHARE",
+    ["guest_listing_entries", "nfs.max_message"]
+  );
+  derivations.push(note("inode_reserve", &reserve));
+  reserve.get()
+}
+
+/// Derived: the most entries a guest's directory listing can carry, its reply cap over the smallest `fuse_dirent`. A
+/// guest's device outlives a daemon restart under the anchor (A-61, A-168), so the numbers it was given must never be
+/// issued again.
+#[cfg(unix)]
+fn guest_listing_entries() -> Derived<u64> {
+  derived!(
+    slates_bridge_virtiofs::device::writable_cap()
+      .get()
+      .checked_div(SMALLEST_FUSE_DIRENT)
+      .unwrap_or(0),
+    "guest writable cap / smallest fuse_dirent",
+    ["guest.writable_cap"]
+  )
+}
+
+/// Derived: none kept across a restart. A Windows guest's stream ends with its daemon, since no anchor holds it there
+/// (`docs/wip/platforms.md`, gap 2), so the numbers its session was given die with it. Holding the stream adds the
+/// guest's term here, as on Unix.
+#[cfg(windows)]
+fn guest_listing_entries() -> Derived<u64> {
+  derived!(
+    0,
+    "none: a Windows guest's stream ends with its daemon, so no number it holds outlives a restart",
+    []
+  )
+}
+
+fn note<T: std::fmt::Debug>(name: &str, d: &Derived<T>) -> String {
+  format!(
+    "{name} = {:?}: {} (anchors {:?})",
+    d.value, d.formula, d.anchors
+  )
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// A-359: do derive the liveness window over a quiet machine's floor (a wake p99 of 400 µs) and over one kept so busy
+  /// at boot that a woken thread waits longer than a window. Expect the quiet one within its window and needing no
+  /// more; the busy one reported past it, needing its floor.
+  #[test]
+  fn a_machine_whose_scheduling_delay_passes_the_window_is_reported_needing_its_floor() {
+    let quiet = liveness_window(400_000).get();
+    assert!(!quiet.floor_past_window, "{quiet:?}");
+    assert_eq!(quiet.needed_ns, quiet.window_ns);
+    let busy_floor = crate::daemon::LIVENESS_BUDGET_NS + crate::daemon::HEARTBEAT_NS;
+    let busy = liveness_window(busy_floor).get();
+    assert!(busy.floor_past_window, "{busy:?}");
+    assert_eq!(busy.needed_ns, busy_floor);
+    assert_eq!(
+      busy.window_ns, quiet.window_ns,
+      "the derived window is the machine's, not the load's"
+    );
+  }
+
+  /// A-326, §4.7. Do: derive the closed-loop hold for every shard count from one to [`MOST_SHARDS_TESTED`]. Expect: the
+  /// hold is whole cycles of 2F (R9's floor for a request and for the think time before the next); its cycles cover a
+  /// loop's return to one shard at R9's percentile, more of them passing without a return with probability
+  /// `((S − 1) / S)^k` of at most one in a hundred, while one cycle fewer would leave more than that; one shard, which
+  /// the loop returns to every cycle, holds one cycle; the hold never shrinks as shards are added; and at three shards it
+  /// is at least `2F × S`, the shortest window step 6 measured within main's spread there (29.5 µs, diag-liveness-44).
+  #[test]
+  fn a_closed_loops_hold_covers_its_return_to_a_shard_at_r9s_percentile() {
+    /// Shape: the shard counts derived, past the 23 of the widest machine measured (fedora-2, 32 CPUs).
+    const MOST_SHARDS_TESTED: u16 = 128;
+    /// Shape: the three shards of ubuntu-24.04-arm, where R9's floor alone failed (step 6, diag-liveness-42).
+    const STEP_SIX_SHARDS: u16 = 3;
+    let tail = 1.0 / f64::from(u32::try_from(PROVISION_TAIL).unwrap());
+    let mut last = 0;
+    for shards in 1..=MOST_SHARDS_TESTED {
+      let hold = closed_loop_hold(shards).get();
+      assert_eq!(hold % CLOSED_LOOP_CYCLE_NS, 0, "{shards} shards: {hold} ns");
+      let cycles = i32::try_from(hold / CLOSED_LOOP_CYCLE_NS).unwrap();
+      let stay = f64::from(shards - 1) / f64::from(shards);
+      assert!(
+        stay.powi(cycles) <= tail,
+        "{shards} shards: {cycles} cycles leave {} of returns uncovered",
+        stay.powi(cycles)
+      );
+      assert!(
+        cycles == 1 || stay.powi(cycles - 1) > tail,
+        "{shards} shards: {cycles} cycles, one more than R9's percentile needs"
+      );
+      assert!(hold >= last, "{shards} shards: {hold} ns after {last} ns");
+      last = hold;
+    }
+    assert_eq!(closed_loop_hold(1).get(), CLOSED_LOOP_CYCLE_NS);
+    assert!(
+      closed_loop_hold(STEP_SIX_SHARDS).get() >= CLOSED_LOOP_CYCLE_NS * u64::from(STEP_SIX_SHARDS)
+    );
+  }
+
+  /// A-223, §4.3, §4.7. Do: run a table of wake estimates through the idle window's rule: zero, one under F, the
+  /// unqueued 6 µs Linux's probe reads quiet, the 346 µs a loaded boot's probe read (above F), a queued 2 ms, and a
+  /// saturated estimate. Expect: every window at least F, never zero, and no overflow. On Linux and macOS every window
+  /// is F, so no estimate, however load inflated it, moves the window; on Windows the window is F or the estimate's
+  /// multiple, whichever is longer, so it is also at least the estimate.
+  #[test]
+  fn the_idle_window_is_the_floor_or_the_platforms_cover_of_a_loaded_wake() {
+    /// Shape: a wake under F.
+    const UNDER_FLOOR_NS: u64 = 100;
+    /// Measured: the boot probe's smallest wake on a quiet ubuntu-latest (5.9-6.2 µs, diag-liveness-35).
+    const QUIET_BOOT_NS: u64 = 6_000;
+    /// Measured: the boot probe's smallest wake on a loaded ubuntu-24.04-arm (diag-liveness-35).
+    const LOADED_BOOT_NS: u64 = 346_000;
+    /// Shape: a wake queued behind spinners, milliseconds.
+    const QUEUED_NS: u64 = 2_000_000;
+    for wake in [
+      0,
+      UNDER_FLOOR_NS,
+      QUIET_BOOT_NS,
+      LOADED_BOOT_NS,
+      QUEUED_NS,
+      u64::MAX,
+    ] {
+      let window = idle_window_ns(wake);
+      assert!(window >= PROVISION_FLOOR_NS, "{wake} ns gave {window} ns");
+      if cfg!(windows) {
+        assert!(window >= wake, "{wake} ns gave {window} ns");
+        assert_eq!(
+          window,
+          PROVISION_FLOOR_NS.max(wake.saturating_mul(loaded_wake_ratio().get())),
+          "{wake} ns"
+        );
+      } else {
+        assert_eq!(window, PROVISION_FLOOR_NS, "{wake} ns");
+      }
+    }
+  }
+
+  /// AC-A-171 (G-direct step 2): the direct maps' copies a shard may hold follow the process's limits. Do: derive it for
+  /// a host with Linux's default limits (1,024 descriptors soft, 65,530 mappings) over one and four shards; for one whose
+  /// mappings bind lower; for one with no OS limit; and for limits too small for a copy a shard. Expect half the
+  /// descriptors, one each (512), over the shards; a third of half the mappings when that is lower; the slab's capacity
+  /// with no limit and as a ceiling; and zero where nothing fits.
+  #[test]
+  fn the_direct_maps_a_shard_may_hold_follow_the_process_limits() {
+    let slab = 1_000_000;
+    assert_eq!(
+      direct_maps_per_shard(Some(1024), Some(65_530), 1, slab),
+      512
+    );
+    assert_eq!(
+      direct_maps_per_shard(Some(1024), Some(65_530), 4, slab),
+      128
+    );
+    assert_eq!(
+      direct_maps_per_shard(Some(524_288), Some(65_530), 1, slab),
+      65_530 / 2 / 3,
+      "the mappings bind lower"
+    );
+    assert_eq!(
+      direct_maps_per_shard(None, None, 2, slab),
+      slab,
+      "the slab alone"
+    );
+    assert_eq!(
+      direct_maps_per_shard(Some(524_288), None, 1, 100),
+      100,
+      "the slab as a ceiling"
+    );
+    assert_eq!(
+      direct_maps_per_shard(Some(3), None, 2, slab),
+      0,
+      "no room for a copy a shard"
+    );
+  }
+
+  /// AC (§4.8 "Placement", D-14): the derived scatter width is the recovery floor — the candidate floor
+  /// `2f + 1` when the re-replication bandwidth is unstated, wider when a stated bandwidth is too slow to
+  /// restore the data budget within the recovery budget, and back at the floor when it is ample.
+  #[test]
+  fn the_derived_scatter_is_the_recovery_floor_above_the_candidate_floor() {
+    let profile = crate::daemon::test_profile();
+    let quorum = Quorum { f: 1 }; // candidate floor 2f + 1 = 3
+    let config = DaemonConfig::derive(&profile, "scatter-test", Some(1));
+
+    assert_eq!(
+      config.derived_scatter(quorum),
+      3,
+      "an unstated bandwidth leaves the scatter at the candidate floor"
+    );
+    let slow = config.clone().with_rereplication_bandwidth(1);
+    assert!(
+      slow.derived_scatter(quorum) > 3,
+      "a bandwidth too slow to restore the data budget within the recovery budget widens the scatter"
+    );
+    let ample = config.with_rereplication_bandwidth(u64::MAX);
+    assert_eq!(
+      ample.derived_scatter(quorum),
+      3,
+      "a bandwidth that restores the data budget within the budget leaves the scatter at the floor"
+    );
+  }
+
+  /// AC (§4.8 "the copyset count check at every configuration change", D-14): an operator durability bound is
+  /// breached when a configuration's coincident-loss probability exceeds the accepted loss — a policy that
+  /// accepts **no** loss is breached by any redundant configuration (its loss is positive), while a policy
+  /// that accepts **any** loss is never breached. The check reads the existing `within_loss_bound`.
+  #[test]
+  fn a_durability_bound_surfaces_a_breach() {
+    use slates_db::register::RegionalConfiguration;
+    let owner = HostId(1);
+    let regional = RegionalConfiguration::formed(
+      vec![owner, HostId(2), HostId(3)],
+      Quorum { f: 1 },
+      BTreeMap::new(),
+      3,
+      false,
+    );
+    let configuration = regional
+      .configuration_for(owner)
+      .expect("the owner has a placement view");
+
+    // Accept no loss: any redundant (f = 1) configuration has a positive coincident-loss probability, so a
+    // coincident failure of the two copies breaches the zero-loss policy.
+    let strict = DurabilityBound {
+      accepted_loss: 0.0,
+      coincident_failures: 2,
+    };
+    assert!(
+      strict.breached_by(&configuration),
+      "a zero-loss policy is breached by any redundant configuration"
+    );
+
+    // Accept any loss: never breached.
+    let lax = DurabilityBound {
+      accepted_loss: 1.0,
+      coincident_failures: 2,
+    };
+    assert!(
+      !lax.breached_by(&configuration),
+      "a policy that accepts any loss is never breached"
+    );
+  }
+
+  /// AC (§4.8 "Placement" — the `within_loss_bound(ε, F)` check answered with its numbers): a breach reports
+  /// its **measured shortfall** — the configuration's coincident-loss probability under the policy's failure
+  /// count, beside the ε it was held to and that count — so a refusal can carry the fact, not a flag. A
+  /// policy stated under a failure count no copyset can fall wholly inside (one host, at `f = 1`) has no
+  /// shortfall even at zero accepted loss; and a single-copy laptop configuration is never short (R8).
+  #[test]
+  fn a_breach_reports_its_measured_shortfall() {
+    use slates_db::register::RegionalConfiguration;
+    let owner = HostId(1);
+    let configuration = RegionalConfiguration::formed(
+      vec![owner, HostId(2), HostId(3)],
+      Quorum { f: 1 },
+      BTreeMap::new(),
+      3,
+      false,
+    )
+    .configuration_for(owner)
+    .expect("the owner has a placement view");
+
+    let strict = DurabilityBound {
+      accepted_loss: 0.0,
+      coincident_failures: 2,
+    };
+    let shortfall = strict
+      .shortfall(&configuration)
+      .expect("two coincident failures can lose an f = 1 copyset");
+    assert_eq!(
+      shortfall.coincident_loss,
+      configuration.coincident_loss(2),
+      "the shortfall carries the configuration's own measured loss"
+    );
+    assert!(
+      shortfall.coincident_loss > shortfall.accepted_loss,
+      "a shortfall is a loss above the accepted ε"
+    );
+    assert_eq!(shortfall.accepted_loss, 0.0);
+    assert_eq!(shortfall.coincident_failures, 2);
+
+    let one_failure = DurabilityBound {
+      accepted_loss: 0.0,
+      coincident_failures: 1,
+    };
+    assert_eq!(
+      one_failure.shortfall(&configuration),
+      None,
+      "one failing host cannot hold both copies of an f = 1 copyset: no shortfall even at zero accepted loss"
+    );
+
+    let laptop =
+      RegionalConfiguration::formed(vec![owner], Quorum { f: 0 }, BTreeMap::new(), 1, false)
+        .configuration_for(owner)
+        .expect("the solo owner has a placement view");
+    assert_eq!(
+      strict.shortfall(&laptop),
+      Some(DurabilityShortfall {
+        coincident_loss: 1.0,
+        accepted_loss: 0.0,
+        coincident_failures: 2,
+      }),
+      "losing the only admitted host loses the only copy; the laptop obeys the fleet's loss rule"
+    );
+  }
+
+  /// AC-0.10 (§4.2 metadata dimension): the derived slab bounds lay the metadata class out so that
+  /// every slab at its bound fits inside the class with room left for volume records — a store built
+  /// on the derived caps accepts its class and offers a positive records ledger. Non-vacuous: with
+  /// the directory-block bound tied to the directory count over the node's size alone, the blocks
+  /// alone were several times the class and the class was refused.
+  #[test]
+  fn the_derived_slab_bounds_lay_the_metadata_class_out_with_room_for_records() {
+    use slates_mem::arena::ChunkArena;
+    use slates_mem::region::Region;
+    use slates_vfs::volume::{Store, StoreConfig};
+    let profile = crate::daemon::test_profile();
+    let config = DaemonConfig::derive(&profile, "metadata-layout", Some(1));
+    let page = config.page;
+    let mut arena = ChunkArena::new(config.content_granule());
+    arena
+      .add_region(Region::map(page, page, false).expect("one page maps"))
+      .expect("one region");
+    let mut store = Store::new(
+      &StoreConfig {
+        page,
+        cache_line: config.cache_line,
+        max_dirs: config.store.max_dirs,
+        max_inodes: config.store.max_inodes,
+        max_chunks: config.store.max_chunks,
+        max_dir_blocks: config.store.max_dir_blocks,
+        dir_cutover: config.store.dir_cutover,
+      },
+      arena,
+      0,
+    );
+    let slabs = store.slab_footprint_bytes();
+    let class = config.store.metadata_class_bytes;
+    let records = store
+      .set_metadata_class(class)
+      .expect("the derived layout fits its class");
+    assert_eq!(
+      slabs + records,
+      class,
+      "the class is the slabs plus the records"
+    );
+    assert!(
+      records >= class / 2,
+      "at least half the class is left for records ({records} of {class}; slabs {slabs})"
+    );
+  }
+
+  /// §4.3 "every structure has a derived bound" for the fleet's own tasks: a fleet configuration
+  /// carries, per peer, the probe loop, the record link and one serve task per session the
+  /// demultiplexer may hold on each plane, plus the plane loops — derived from the peer count and
+  /// added to the shard's task budget, so a burst of peer re-dials fills the fleet's share and never
+  /// a client's. Do: derive with and without a five-peer fleet. Expect: the fleet form's task and
+  /// timer budgets exceed the solo form's by exactly the derived share, and the boot log names it
+  /// with its input. Non-vacuous: before the share existed the two budgets were equal, so the accept
+  /// loops admitted serve tasks against the clients' budget alone (`adm_refused` 4,554 at ~3×
+  /// oversubscription, `docs/wip/fleet-under-load.md`).
+  #[test]
+  fn a_fleet_configuration_derives_its_own_task_share_from_the_peer_count() {
+    let profile = crate::daemon::test_profile();
+    let solo = DaemonConfig::derive(&profile, "fleet-share-solo", None);
+    let peers: Vec<HostId> = (1..=5).map(HostId).collect();
+    let fleet =
+      DaemonConfig::derive(&profile, "fleet-share-fleet", None).with_fleet(FleetMembership {
+        quorum: Quorum { f: 2 },
+        peers: peers.clone(),
+        host: HostId(0),
+        origin_anchor: HostId(0),
+        domains: BTreeMap::new(),
+        regions: BTreeMap::new(),
+        durability: None,
+        region_mirrors: BTreeMap::new(),
+      });
+    assert_eq!(
+      fleet.fleet_sessions_per_plane,
+      fleet.fleet_peer_capacity * SESSION_SLOTS_PER_PEER,
+      "the shared session pool is one reservation per unit of peer capacity, per plane"
+    );
+    let share = fleet.fleet_peer_capacity * FLEET_LOOPS_PER_PEER
+      + fleet.fleet_sessions_per_plane * FLEET_PLANES
+      + FLEET_LOOPS_PER_SHARD;
+    assert_eq!(
+      fleet.runtime.tasks_per_shard,
+      solo.runtime.tasks_per_shard + share,
+      "the fleet's task share is derived from the peer count and added to the shard's budget"
+    );
+    assert_eq!(
+      fleet.runtime.timers_per_shard,
+      solo.runtime.timers_per_shard + share,
+      "every fleet task may hold a timer"
+    );
+    assert!(
+      fleet
+        .derivations
+        .iter()
+        .any(|line| line.starts_with("fleet_tasks_per_shard")),
+      "the boot log names the share with its input: {:?}",
+      fleet.derivations
+    );
+  }
+
+  /// §4.3: with no peers a node's forward lane admits nothing, so a laptop's control shard is sized like its other
+  /// shards; a fleet node's holds the lane's bound beside its own share. Until 2026-11-08 a laptop's held the lane's
+  /// bound too, and `a_forward_kept_for_a_full_channel_is_sent_once_the_channel_has_room` flooded 1,371,635 tasks onto
+  /// a Mac's control shard, past the second its answer may take.
+  #[test]
+  fn a_laptops_control_shard_holds_no_forward_lane() {
+    let profile = crate::daemon::test_profile();
+    let solo = DaemonConfig::derive(&profile, "control-solo", None);
+    let capacity = solo.control_shard_capacity().get();
+    assert_eq!(
+      (capacity.tasks, capacity.timers),
+      (solo.runtime.tasks_per_shard, solo.runtime.timers_per_shard),
+      "a node with no peers has no forwards to other nodes to hold"
+    );
+    let fleet = DaemonConfig::derive(&profile, "control-fleet", None).with_fleet(FleetMembership {
+      quorum: Quorum { f: 1 },
+      peers: vec![HostId(1), HostId(2)],
+      host: HostId(0),
+      origin_anchor: HostId(0),
+      domains: BTreeMap::new(),
+      regions: BTreeMap::new(),
+      durability: None,
+      region_mirrors: BTreeMap::new(),
+    });
+    let lane = forward_lane_bound(
+      fleet.clients_per_shard,
+      fleet.region.slots,
+      fleet.runtime.shards,
+    )
+    .get();
+    assert_eq!(
+      fleet.control_shard_capacity().get().tasks,
+      fleet.runtime.tasks_per_shard + lane,
+      "a fleet node's control shard holds every forward its lane admits"
+    );
+  }
+
+  /// AC-0.10 (§4.2 "effective capacity ... constrained by OS/job/cgroup limits"): a bound set on
+  /// the process below its physical memory caps every shard's reserve, so the classes summed over
+  /// the shards never exceed what the host will let the process use; without a bound, or with one
+  /// above total, the reserve is the share of total 1f40689 chose. Non-vacuous: derived from total
+  /// alone, a quarter-of-total bound leaves the reserve four times what the bound allows.
+  /// D-12, §4.8 (docs/bugs/2026-09-26-the-op-log-ring-was-sized-past-memory.md): the anchor segment is a
+  /// sparse object, so a payload region (a snapshot or consensus slot) holds RAM only for what is
+  /// published in it, but a ring (a partition's log, the audit) wraps through its whole capacity over a
+  /// long run, and every byte of it becomes resident. Do: derive the configuration on this machine for one
+  /// to four shards, unbounded and under a 1 GiB container bound. Expect: the rings together fit in the
+  /// effective capacity. Before, one partition's log alone was 16.4 GB here and 4 GB under 1 GiB.
+  #[test]
+  fn the_rings_that_wrap_fit_in_the_memory_the_daemon_may_use() {
+    /// Shape: a small container's memory bound, the KIND lane's pod limit.
+    const POD_LIMIT: u64 = 1 << 30;
+    let mut profile = crate::daemon::test_profile();
+    for limit in [None, Some(POD_LIMIT)] {
+      profile.facts.memory.limit = limit;
+      let effective = slates_machine::facts::effective_capacity(profile.facts.memory.total, limit);
+      for shards in 1..=4 {
+        let geometry = DaemonConfig::derive(&profile, "rings-fit", Some(shards)).geometry;
+        let rings: u64 = geometry
+          .regions()
+          .iter()
+          .filter(|region| {
+            matches!(
+              region.kind,
+              slates_anchor::RegionKind::Log(_) | slates_anchor::RegionKind::Audit
+            )
+          })
+          .map(|region| region.len)
+          .sum();
+        assert!(
+          rings <= effective,
+          "{shards} shards, limit {limit:?}: {rings} bytes of rings over {effective} bytes"
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn a_memory_bound_below_total_caps_the_reserve() {
+    let mut profile = crate::daemon::test_profile();
+    let total = profile.facts.memory.total;
+    profile.facts.memory.limit = None;
+    let unbounded = DaemonConfig::derive(&profile, "bound-none", None);
+    let shards = u64::from(unbounded.runtime.shards.max(1));
+    assert_eq!(
+      unbounded.reserve_per_shard,
+      total / shards / MEMORY_CLASSES,
+      "no bound: the reserve is the share of total"
+    );
+    profile.facts.memory.limit = Some(total / 4);
+    let bounded = DaemonConfig::derive(&profile, "bound-quarter", None);
+    assert_eq!(
+      bounded.reserve_per_shard,
+      total / 4 / shards / MEMORY_CLASSES,
+      "a quarter-of-total bound: the reserve is the share of the bound"
+    );
+    assert!(
+      bounded.reserve_per_shard * shards * MEMORY_CLASSES <= total / 4,
+      "the classes over every shard fit the bound ({} × {shards} × {MEMORY_CLASSES} ≤ {})",
+      bounded.reserve_per_shard,
+      total / 4
+    );
+    profile.facts.memory.limit = Some(total.saturating_mul(2));
+    let above = DaemonConfig::derive(&profile, "bound-above", None);
+    assert_eq!(
+      above.reserve_per_shard,
+      total / shards / MEMORY_CLASSES,
+      "a bound above total does not raise the reserve"
+    );
+  }
+}

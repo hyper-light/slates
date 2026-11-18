@@ -1,0 +1,78 @@
+name: diag-g234-winbench
+
+# Diagnostics only, never on main (A-361, goal g234): provision_bench on CI's Windows runners, three arms built from this
+# commit with the arm's files laid over (diag-arms/<arm>/): main (the x100 multiple, no raise), raise (x100 and a blocked
+# wait raised a level), raiseF (the raise and R9's floor alone). Two shards; quiet and two spinning shell loops per
+# logical CPU; three rounds, arms interleaved; the single-client spinning form and the paced form.
+on:
+  push:
+    branches: ["diag-g234-winbench-*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  arms:
+    name: window A/B (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - name: Install NASM
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Build the arms
+        run: |
+          set +e
+          mkdir -p ../arms
+          for arm in main raise raiseF; do
+            git worktree add "../src-$arm" HEAD > /dev/null 2>&1
+            cp -r "diag-arms/$arm/." "../src-$arm/"
+            ( cd "../src-$arm" && git status --short | head -5 )
+            ( cd "../src-$arm" && CARGO_TARGET_DIR="../target-$arm" cargo build --release --locked -p slates-client --example provision_bench ) > "../build-$arm.log" 2>&1 || { echo "== build $arm failed"; grep -E '^error' -A8 "../build-$arm.log" | head -40; exit 1; }
+            cp "../target-$arm/release/examples/provision_bench.exe" "../arms/bench-$arm.exe"
+            md5sum "../arms/bench-$arm.exe"
+          done
+      - name: The arms, quiet and loaded, three rounds, interleaved
+        run: |
+          set +e +o pipefail
+          R=results.txt
+          cpus=$NUMBER_OF_PROCESSORS
+          echo "runner ${{ matrix.os }}, $cpus CPUs, $(date -u)" | tee -a $R
+          export PROVISION_BENCH_SHARDS=2 PROVISION_BENCH_FORMS=spinning_1,parked_1
+          for cond in quiet loaded; do
+            for round in 1 2 3; do
+              for arm in main raise raiseF; do
+                pids=""
+                if [ $cond = loaded ]; then
+                  for i in $(seq 1 $((cpus * 2))); do ( while :; do :; done ) & pids="$pids $!"; done
+                fi
+                echo "== $cond round=$round arm=$arm at $(date -u +%H:%M:%S)" | tee -a $R
+                timeout 1200 "../arms/bench-$arm.exe" > ../run.log 2>&1; status=$?
+                for p in $pids; do kill "$p" 2>/dev/null; done
+                wait 2>/dev/null
+                grep -E 'provisioning histogram|_cpu_|spinning_1 parks|parked_1 parks|^  provision\.(spinning_1|parked_1)_(p50|p99|p999):|ac-2.1|panicked' ../run.log | cut -c1-600 | tee -a $R
+                echo "== exit $status" | tee -a $R
+              done
+            done
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: winbench-${{ matrix.os }}
+          path: results.txt
