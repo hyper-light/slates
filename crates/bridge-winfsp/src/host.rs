@@ -1441,23 +1441,20 @@ fn post(requests: &SyncSender<Request>, op: Op<u64>) -> Option<Receiver<Reply>> 
 /// A posted confirmation's answer, still to be taken ([`confirmed_open`]).
 pub(crate) struct Confirming(Receiver<Reply>);
 
-/// Posts the confirmation that the driver accepted the open `context` names and wakes the mount's task, without waiting
-/// for it: the shard applies it while the receive worker acknowledges and receives, and the FIFO channel puts it ahead of
-/// the worker's next request (audit step 7, cut (c)). The answer is taken by [`confirmed_open`] before the journal
-/// overwrites the open's settled response. A request answered without the shard can come next and would otherwise find
-/// it unapplied: the host registers no GetSecurity callback (`ffi.rs`, `get_security: None`), so WinFsp's own
-/// QuerySecurity answers STATUS_INVALID_DEVICE_REQUEST without calling the host (WinFsp v2.1 `src/dll/fsop.c:1444-1445`),
-/// and QueryEa and QueryStreamInformation likewise (`fsop.c:1208`, `1478`).
+/// Posts the confirmation that the driver accepted the open `context` names, and neither wakes the mount's task nor
+/// waits (audit step 7, cut (c) without its wake): the FIFO channel puts it ahead of the receive worker's next request,
+/// whose own wake carries both to the shard. The answer is taken by [`confirmed_open`] before the journal overwrites the
+/// open's settled response. A request answered without the shard can come next and finds it unapplied: the host
+/// registers no GetSecurity callback (`ffi.rs`, `get_security: None`), so WinFsp's own QuerySecurity answers
+/// STATUS_INVALID_DEVICE_REQUEST without calling the host (WinFsp v2.1 `src/dll/fsop.c:1444-1445`), and QueryEa and
+/// QueryStreamInformation likewise (`fsop.c:1208`, `1478`); [`confirmed_open`] then wakes the mount's task and waits.
 pub(crate) fn post_confirm(
   requests: &SyncSender<Request>,
-  wake: &Waker,
   context: u64,
 ) -> Result<Confirming, WinFspError> {
-  let confirming = post(requests, Op::Confirm { context })
+  post(requests, Op::Confirm { context })
     .map(Confirming)
-    .ok_or(WinFspError::MountThread)?;
-  wake.wake_by_ref();
-  Ok(confirming)
+    .ok_or(WinFspError::MountThread)
 }
 
 /// Takes a posted confirmation's answer, waking the mount's task first when it has not been applied yet.

@@ -450,11 +450,7 @@ impl inflight::settle::Edges for Dll<'_> {
     if self.confirming.is_some() {
       return Err(WinFspError::Capture(Refusal::Unsettled));
     }
-    self.confirming = Some(crate::host::post_confirm(
-      self.confirmations,
-      self.wake,
-      context,
-    )?);
+    self.confirming = Some(crate::host::post_confirm(self.confirmations, context)?);
     Ok(())
   }
 
