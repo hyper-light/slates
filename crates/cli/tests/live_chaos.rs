@@ -2303,6 +2303,7 @@ fn diagnosis(instances: &[String], volume: &str) -> String {
             || line.starts_with("fleet_host")
             || line.starts_with("fleet_peers_")
             || line.contains("lent_to")
+            || line.contains("lease")
         })
         .collect();
       format!(
@@ -2465,9 +2466,7 @@ fn wait_serving<'a>(
           .read(id, &format!("/{}", chaos_path(*last)), ReadAt::Head)
           .is_ok_and(|bytes| bytes == chaos_body(*last))
       });
-      if serves
-        && (counter(survivor, "fleet.live.taken_over") > 0 || serving_epoch(survivor, volume) > 0)
-      {
+      if serves && took_over(survivor, volume) {
         return Some((survivor, began.elapsed()));
       }
     }
@@ -2778,15 +2777,22 @@ fn writes_stream_through_random_candidate_stalls() {
 fn wait_taken_over<'a>(survivors: &[&'a str], volume: &str) -> Option<(&'a str, Duration)> {
   let began = Instant::now();
   while began.elapsed() < FLEET_WAIT {
-    // The successor counts its rebuild from the live log; it ships only from its next publication on.
-    if let Some(successor) = survivors.iter().find(|survivor| {
-      counter(survivor, "fleet.live.taken_over") > 0 || serving_epoch(survivor, volume) > 0
-    }) {
+    if let Some(successor) = survivors
+      .iter()
+      .find(|survivor| took_over(survivor, volume))
+    {
       return Some((successor, began.elapsed()));
     }
     pause();
   }
   None
+}
+
+/// Whether `survivor` took `volume` over: it counted its rebuild from the live log, or it ships the volume (it ships only
+/// from its next publication on). Serving the volume's files is no sign of it, since every survivor forwards a read to
+/// the successor (§4.8 "Lookup").
+fn took_over(survivor: &str, volume: &str) -> bool {
+  counter(survivor, "fleet.live.taken_over") > 0 || serving_epoch(survivor, volume) > 0
 }
 
 /// A-200, StaleNeverCommits, NoLoss, ReadSafety and Continuity with the owner's process stopped mid-stream (SIGSTOP, the
@@ -3918,22 +3924,32 @@ fn a_live_entry_past_one_chunk_is_taken_over_whole() {
   let last_look = live_states(&owner, &volume).unwrap_or_default();
   fleet.kill_node(owner_index);
   let began = Instant::now();
+  // The successor is the survivor that took the volume over and serves the three files: every survivor serves them once
+  // it forwards to the successor, so the first to serve them may be a forwarder, which ships nothing and so shows no head
+  // after a write through it (the integrator's run on bfc34cace judged a forwarder so).
   let served = loop {
     let whole = refs.iter().find(|survivor| {
-      Client::connect(survivor, deadlines()).is_ok_and(|mut reader| {
-        files.iter().all(|(name, bytes)| {
-          reader
-            .read(id, &format!("/{name}"), ReadAt::Head)
-            .is_ok_and(|read| read == *bytes)
+      took_over(survivor, &volume)
+        && Client::connect(survivor, deadlines()).is_ok_and(|mut reader| {
+          files.iter().all(|(name, bytes)| {
+            reader
+              .read(id, &format!("/{name}"), ReadAt::Head)
+              .is_ok_and(|read| read == *bytes)
+          })
         })
-      })
     });
     if whole.is_some() || began.elapsed() > FLEET_WAIT {
       break whole.map(|survivor| ((*survivor).to_owned(), began.elapsed()));
     }
     pause();
   };
-  verdict.note(format!("served whole after the owner's loss: {served:?}"));
+  verdict.note(format!(
+    "served whole after the owner's loss by the survivor that took it over: {served:?}; every survivor's live lines: {:?}",
+    refs
+      .iter()
+      .map(|survivor| (*survivor, live_states(survivor, &volume)))
+      .collect::<Vec<_>>()
+  ));
   verdict.check(
     "NoLoss (successor)",
     if served.is_some() {
@@ -5100,6 +5116,7 @@ fn partition_owner_mid_stream(
   }
   if partition.running() {
     let (probes, healed) = read_through(fleet, owner_index, (volume, &last), began, true);
+    note_missing(verdict, &fleet.instances[owner_index], volume, &probes);
     run.probes.extend(probes);
     // A heal the reads needed (the owner held them past their bound) ended the partition there.
     run.healed_at = healed.unwrap_or_else(|| {
@@ -5109,12 +5126,29 @@ fn partition_owner_mid_stream(
   } else {
     partition.end(fleet, owner_index);
     run.healed_at = began.elapsed();
-    run
-      .probes
-      .extend(read_through(fleet, owner_index, (volume, &last), began, false).0);
+    let (probes, _) = read_through(fleet, owner_index, (volume, &last), began, false);
+    note_missing(verdict, &fleet.instances[owner_index], volume, &probes);
+    run.probes.extend(probes);
   }
   sleep(AFTER_HEAL);
   run
+}
+
+/// When a read through `reader` answered missing, what `reader` held then: its volume list and its status's fleet,
+/// lease and live lines ([`diagnosis`]), so a ReadSafety failure names the state that answered it (goal g229: the old
+/// owner read the moment it resumed answered `NotFound` for its successor's acknowledged writes).
+fn note_missing(verdict: &mut Verdict, reader: &str, volume: &str, probes: &[ReadProbe]) {
+  if !probes
+    .iter()
+    .any(|probe| matches!(probe.answer, ReadAnswer::Missing))
+  {
+    return;
+  }
+  let (code, listed, _) = run(reader, &["volume", "list"]);
+  verdict.note(format!(
+    "{reader} answered a read missing; its volumes (exit {code}):\n{listed}\n{}",
+    diagnosis(&[reader.to_owned()], volume)
+  ));
 }
 
 /// Writes through the successor `taken_by` that took `volume` over: its first write ([`first_write_through`]), then a
