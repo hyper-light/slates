@@ -40,6 +40,28 @@
 > (`shards.rs`, `tell_holder`). To measure (the supervisor's): the 3,000-client rung's `xshard.reply_dropped` (about
 > 4,200 on main before, 0 expected), `xshard.room_waits_peak`, and each verb's p99 against main.
 
+> **A lone daemon's end left the line's writer unjoined: fixed (2026-11-18, A-232).** Main's TSan lane failed both
+> stuck-shard tests of `crates/client/tests/lone_daemon.rs` from the push that landed A-232 (run 44210937388): "the lone
+> daemon was still running 10s after its shard was held". The watchdog reached its verdict within a window and logged
+> its end every time (diag-g218-tsan-1, run 44216526894, 3 of 3 runs); the exit then ran ThreadSanitizer's finalizer,
+> which sleeps a second (`atexit_sleep_ms`) and reported the end's writer thread, finished and never joined, as a leak.
+> Symbolizing the report held the exit 26.3-26.8 s, and the process exited 66, ThreadSanitizer's code for a reported
+> warning, not 4 (diag-g218-tsan-2, run 44217144677). With `atexit_sleep_ms=0` the writer was still running at the
+> exit, so nothing was reported and both tests passed with exit 4. Uninstrumented, the tests passed 3 of 3. The end
+> (`watchdog::end_process`) now joins the writer once it says the line is written; a writer blocked past a beat is
+> still ended by the exit, as A-232 decided. Swept: no other production `process::exit` follows a spawned thread.
+> Record: `docs/bugs/2026-11-18-the-watchdogs-end-left-its-writer-unjoined.md`.
+
+> **Open (g222, 2026-11-17, A-273): rebases and named-version reads of a green on the shards holding its works.**
+> Designed, not built. The owner spends 51–53% of its wall on verdicts and rebases at the 3,000-client rung (W1),
+> rebases the larger share (about 71,000 a run against 49,000 verdicts), and W1's rebase at 1,000 clients is slower
+> than main's because it crosses to the owner. A replica holds the green's metadata (about 14.2 MB at the rung, 3.8% of
+> a shard's 373.5 MB metadata budget on the Studio) and reads the owner's content in place, never a copy (the
+> supervisor, 2026-11-17, by A-64 and D-7). Owed, in order: W1 on main; the engine's content in sealed blocks that
+> never move; the owner's frees held until every replica has acknowledged a version past them; the tests first (the
+> replica equals the owner at every version, the lifetime red with the acknowledgement ignored); the code; the
+> supervisor's A/B.
+>
 > **A Shards guest's unprivileged run could not write a host-owned volume: built, the stream takes Shards' owner word
 > (2026-11-18, §4.6 the Shards form; A-281; goal g268).** Shards' init names the run's owner on a share's root with
 > `trusted.shards.owner` (`UID:GID`), and slates refused it `EOPNOTSUPP`, so a guest of user 1000 saw a Mac's files as
@@ -1152,6 +1174,32 @@
 >   discovery refresh catches a session sitting unborrowed in its slot, and a peer's stateless reset (A-261) ends one
 >   sooner where it is heard
 >   (`docs/bugs/2026-11-09-a-dead-record-session-was-lent-on-for-want-of-anyone-judging-it.md`).
+>   - **Its test made deterministic (2026-11-18, goal g245).** The test's 256-client burst made its recovery bound
+>     (1.1 s) depend on load: missed at 1.33 s (loadtest-scale, adacachy2, load 41), 1.339 s (the supervisor's r423,
+>     load ~52) and 1.384 s (a diagnostic run on a Mac, load 28 to 47). That run's timeline: the link redialed 89 ms
+>     after the drop, its handshake took 665 ms (its cause not measured apart), the lane's first turn on the replacement
+>     came at 853 ms with 8,031 forwards queued, a sent its first reply at 896 ms, and b's lane took it at 1,384 ms
+>     while the burst's resends cycled through b's control shard (61,824 batches given up that run, 20,349 to 47,925
+>     in the 12 others read); the judgment and the redial were not the cost. The test now keeps b's lane borrowing the
+>     session with four readers, a read each in flight, discovery held: green 5 of 5 (dropped 2,002 to 2,644 ms into the
+>     silence against its 1,998 ms window, answered on the replacement 21 to 112 ms later) and red 5 of 5 with the
+>     return's judgment removed, on a Mac at load 33 to 56 beside 8 spinners. The burst went to A-306's test, below.
+>   - **Finding (b), fixed (2026-11-18, A-306): a resend keeps its place in the lane.** A read through b during the dead
+>     session missed its failover bound behind the burst's resends: each resend took fresh tickets at the back of the
+>     lane and was given up again before it was begun. With the probe read sent just after the burst's first round,
+>     main refused it `OwnerUnreachable` at 10.5 s in 1 of 10 runs and answered it after 9.2 and 9.5 s in two more
+>     (2.3 to 10.5 s; load 37 to 46). A forward's place is now its first send's ticket and its resends are queued there
+>     (`forward_lane::Place`, `fleet.forward.resent_in_place`): 4.1 to 6.5 s, 10 of 10 (load 27 to 33).
+>     `a_read_through_a_dead_session_keeps_its_place_behind_a_burst` sends the probe before the burst, so its place is
+>     the lane's first: answered in 2.19 to 2.50 s, 5 of 5; with the place ignored it was refused at its bound in 2 of
+>     5 (load 33 to 56). The order itself is held by `a_resend_is_begun_ahead_of_every_forward_first_queued_after_it`
+>     and a model test, both red with the place ignored
+>     (`docs/bugs/2026-11-18-a-resent-forward-lost-its-place-in-the-lane.md`).
+>   - **Open (2026-11-18, goal g245): a forward still queued is given up at its stall budget while its lane moves.**
+>     Nothing of it was sent, and with its place kept its resend loses nothing, but each one costs its forwarder a give-up
+>     and a resend on the control shard: behind the burst above, 17,000 to 52,000 batches given up a run, the most in
+>     the runs that starved. Owed: a queued forward's quiet counts its lane's progress (a forward begun or a reply taken),
+>     so it is given up only when the lane does not move for a stall budget, the failover bound still capping it.
 >
 > - **A forward lane turned without end while its forwards waited on the stream credit** (found 2026-11-08 on the f = 1
 >   primary-kill rung). After the primary restarted, a turn ended at once whenever any forward was queued, and with
@@ -9916,6 +9964,54 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
   relay-retirement test. Both are intermittent, are owed root causes, and are not tolerated.
 - Nothing in this day's changes touches session formation or the contact rule: A-127 and A-128 are NFS state and its
   records, and the pressure hold is admission.
+
+### 2026-11-17: the healer missed late repairs, could place where the head names no holder, and left a departed holder named (A-276; fixed)
+
+- **Found.** `a_holder_that_lost_placed_content_is_repaired_by_the_healer` failed once under a whole-suite gate at load
+  54 (head 92dcd16c, `repairs Ok(0) → Ok(0)`, `~/.cache/slates-scratch/fanout/l37-gates.log`). live-fixes' account of
+  2026-11-08 (two losses, the first-ranked candidate offered first) was retracted on 2026-11-09: on three nodes every
+  member holds the head, so the door (`content_retention::admits`) refuses that candidate's put. Goal g248 found the
+  cause and three siblings, and took over live-fixes' unlanded replace (A-276, 6ec41144a).
+- **Causes**, each red on the old code with its test (the Studio, 2026-11-17; the table is in the bug record), and the
+  first reproduced there naturally under contention: 64 bursting spinners on the efficiency cores, 23 runs ok, then the
+  original failure (`repairs Ok(0) → Ok(0)`, the holder holding the content), its DIAG lines showing the refill's
+  acknowledgement arriving 128 ms after the round's dispatch, as a straggler:
+  - **A late repair was never counted.** A content round stops collecting about one hedge delay after a holder's
+    transfer starts (`DispatchWait::judge` sees the owner's own hold as the round's only progress, so the round is
+    judged stalled once its deadline passes), and the refill's acknowledgement then arrives as a straggler's.
+    `fold_late_content` folded it into the placement but counted no repair, the job recorded and dropped, and every
+    later heal found the holder whole. Under load the refill outlasts the round more often.
+  - **A restore could place where the head names no holder.** A cohort member holding no head for the object admits a
+    put at the head's sequence as ahead of its records; the heal placed there, re-recorded that set at the head's
+    sequence, and the named holder stayed empty while the head named it.
+  - **A departed holder stayed named** (live-fixes, 2026-11-09): a head is never rewritten at its sequence, and a
+    replacement put there is refused by the cohort members holding the head; a heal had no bound.
+  - **The first round's dispatch was stamped on another clock** (on main since the p95 hedge trigger; found by this
+    change's first green run): `first_round_at_ns` came from the dispatching shard's runtime-driver clock, which counts
+    from that shard's start, and the owner judged it by its host clock since boot. The hedge round was never held for
+    the measured p95, and with the heal's bound every heal unfinished after its first round ended at the next period.
+- **Fixed (A-276).** A heal restores exactly the named holders, all at once, and records nothing; a repair counts when
+  its acknowledgement is folded, in its round or late (`fleet.heal.repaired_late`,
+  `fleet.heal.refill_outlasted_round`); a named holder that left, or a placement naming fewer than `f + 1`, is replaced
+  on the current cohort at the next sequence, its placement and the republished head one transaction
+  (`record_replacement`), and at `f = 0` nothing is healed (`heal_decision`); every heal ends once its content round's
+  whole span and a period have passed since its first round (`heal_bound_ns`, `fleet.heal.unfinished`), the first
+  round's dispatch stamped on the owner's clock; a round's and a straggler's acknowledgements fold only into the job put
+  at their sequence. Test support `Daemon::inject_content_ack_delay` makes the late acknowledgement deterministic. Bug record:
+  `docs/bugs/2026-11-17-a-heal-miscounted-repairs-and-left-heads-naming-holders-without-the-content.md`.
+- **Open, reported and not changed:**
+  - A named holder that is still a member but outside the object's current candidates (a neighbourhood change moved
+    the cohort) refuses a placement from the owner (`content_authority`), so it can be neither re-offered to nor
+    verified: the heal leaves it named and counts `fleet.heal.named_outside_candidates`. If it loses its copy, the head
+    names a holder without the content. Recommended: replace it as a departed holder is (one republish per volume per
+    such change), so every holder a head names is one the owner can restore.
+  - A departure is healed at the healer's cadence, one placed snapshot per hundred periods at rest, so a node owning
+    many volumes leaves the last of them naming the departed holder for a long walk; a second failure inside that walk
+    loses them at `f = 1`. Recommended: on a retirement, heal first the volumes whose placement names the retired host.
+  - The mirror has no healer (AC-8.15): a mirror holder that loses its copy is never re-shipped to, and the mirror head
+    keeps naming it (live-fixes, 2026-11-08, from reading; its GAPS note never landed).
+  - A takeover's re-commit and a neighbourhood change re-place content under a new holder set; each is owed a test of
+    this shape (live-fixes, 2026-11-09).
 
 ### 2026-11-08: a restarted node's peers kept their sessions to its old process (A-261, stateless reset)
 

@@ -5486,7 +5486,7 @@ fn wait_caught_up(fleet: &Fleet, owner: usize, volume: &str) {
     .map_or((0, 0), |state| (state.fence, state.durable.unwrap_or(0)));
   let mut window = FrozenWindow::new();
   loop {
-    let behind: Vec<(String, Option<(u64, Option<u64>)>)> = fleet
+    let behind: Vec<_> = fleet
       .others(owner)
       .into_iter()
       .map(|index| {
