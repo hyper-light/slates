@@ -33,9 +33,11 @@ use common::{
   LARGE, Session, Setup, config, mkdir, read_through, rename, request, rm_r, scratch, store,
   unlink, write_file,
 };
-// The pieces only the Unix tests use (a symlink, a directory's recorded mode).
+// A link in the volume, which the Unix tests and the Windows link test land (A-438).
+use common::symlink;
+// The piece only the Unix tests use (a directory's recorded mode).
 #[cfg(unix)]
-use common::{mkdir_with_mode, symlink};
+use common::mkdir_with_mode;
 
 /// Format: the environment variable that turns this binary into the kill test's child.
 const CHILD_DIR: &str = "SLATES_LAND_CHILD_DIR";
@@ -136,7 +138,8 @@ fn edit_example(vol: &mut Volume, host: &mut OsLand, store: &mut Store) {
   unlink(vol, host, store, "/src/gone.rs");
   mkdir(vol, host, store, "/out");
   write_file(vol, host, store, "/out/inner", b"inner");
-  // Windows makes no symbolic link without a privilege slates never asks for (R10; `os_windows.rs`).
+  // Windows lands a link only where its account may make one (A-438): its own test,
+  // `a_symlink_in_a_landing_is_a_windows_symbolic_link`, which skips loudly where it may not.
   #[cfg(unix)]
   symlink(vol, host, store, "/link", "src/lib.rs");
   rename(vol, host, store, "/moved", "/moved2");
@@ -457,6 +460,71 @@ fn a_file_a_landing_placed_is_replaced_by_the_next_landing() {
     "{second:?}"
   );
   assert_eq!(read(&ws.path.join("out/f")).unwrap(), b"second landing");
+}
+
+/// Format: `ERROR_PRIVILEGE_NOT_HELD` (winerror.h): the probe link refused for want of the privilege and of Developer
+/// Mode.
+#[cfg(windows)]
+const PRIVILEGE_NOT_HELD: i32 = 1314;
+
+/// A-438 (a volume link in A-275's form, landed). Do: land a scratch volume holding `/src/lib.rs` and the relative link
+/// `/lib/link` to `../src/lib.rs` into an empty real directory, where this account may make symbolic links (skipped
+/// loudly where it may not: the probe `CreateSymbolicLinkW` refused `ERROR_PRIVILEGE_NOT_HELD`, no privilege and no
+/// Developer Mode). Expect the landing `Done` with every entry written; the link a Windows file symbolic link whose
+/// target reads `..\src\lib.rs` (the volume's `/` as `\`); the file's bytes read through it; and no hidden name left
+/// where the link was staged. Before A-438 the link's entry failed `EPERM` on every machine.
+#[cfg(windows)]
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn a_symlink_in_a_landing_is_a_windows_symbolic_link() {
+  use std::os::windows::fs::FileTypeExt;
+  let ram = build_output();
+  let ws = Workspace::new(&ram, "link");
+  seed_dir(&ws.path.join("out"));
+  let probe = ws.path.join("probe");
+  match std::os::windows::fs::symlink_file("out", &probe) {
+    Ok(()) => std::fs::remove_file(&probe).unwrap(),
+    Err(refused) if refused.raw_os_error() == Some(PRIVILEGE_NOT_HELD) => {
+      eprintln!(
+        "skipped: this account may not make a symbolic link (no SeCreateSymbolicLinkPrivilege, no Developer Mode)"
+      );
+      return;
+    }
+    Err(refused) => panic!("the probe link: {refused}"),
+  }
+  let (mut host, target) = OsLand::open_target(&ws.path.join("out")).unwrap();
+  let mut store = store();
+  let mut vol = scratch(&mut store);
+  mkdir(&mut vol, &mut host, &mut store, "/src");
+  write_file(&mut vol, &mut host, &mut store, "/src/lib.rs", b"lib");
+  mkdir(&mut vol, &mut host, &mut store, "/lib");
+  symlink(&mut vol, &mut host, &mut store, "/lib/link", "../src/lib.rs");
+  let mut session = Session::new();
+  let mut setup = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  };
+  let report = setup.land(request(1)).unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert!(
+    report
+      .entries
+      .iter()
+      .all(|entry| entry.outcome == Some(Outcome::Written)),
+    "{report:?}"
+  );
+  let lib = ws.path.join("out").join("lib");
+  let kind = std::fs::symlink_metadata(lib.join("link")).unwrap().file_type();
+  assert!(kind.is_symlink_file(), "a file symbolic link: {kind:?}");
+  assert_eq!(
+    std::fs::read_link(lib.join("link")).unwrap(),
+    Path::new(r"..\src\lib.rs")
+  );
+  assert_eq!(std::fs::read(lib.join("link")).unwrap(), b"lib", "read through the link");
+  assert_eq!(names_in(&lib), ["link"], "nothing but the link: no staged name left");
 }
 
 /// Format: `FILE_ATTRIBUTE_READONLY` (winnt.h), as `MetadataExt::file_attributes` reads it.

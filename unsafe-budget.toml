@@ -385,7 +385,14 @@ slates-vfs = 0
 #   (`GetLastError`, `RtlNtStatusToDosError`, 2); and the target's owner check (`GetSecurityInfo`, the process token
 #   opened and owned, a token record read and its SID taken for the user and for the default owner, the SIDs compared,
 #   the descriptor freed: 7).
-slates-land = 23
+# 2026-11-18 (+6, A-438, a symbolic link in a Windows landing, `os_windows.rs` only; 23 -> 29): NTFS sets a link's
+#   reparse buffer only through `FSCTL_SET_REPARSE_POINT` on a handle (`DeviceIoControl`, 1), for a caller with
+#   `SeCreateSymbolicLinkPrivilege` enabled, which an administrator's token holds disabled; `CreateSymbolicLinkW` enables
+#   it around its own call but takes a path, which the handle-relative writer never resolves. So the set runs on its
+#   thread under a copy of the process token with the privilege enabled: the token opened and owned (1), duplicated for
+#   impersonation and owned (1), the privilege enabled in the copy (`AdjustTokenPrivileges`, 1), the thread's token set
+#   (`SetThreadToken`, 1) and reverted (`RevertToSelf`, 1). None has a safe wrapper.
+slates-land = 29
 # 2026-11-02, A-198: retire the six supervisor job/assignment sites in favor of IPC's existing creation-time job
 # attribute. The hold transport has ten Win32 ownership/I/O sites: last-error read, event create/adopt, read/write,
 # event wait, cancellation and join on timeout or failed wait, and adoption of a duplicated handle. No unsafe sharing.

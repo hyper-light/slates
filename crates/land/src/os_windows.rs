@@ -25,10 +25,19 @@
 //!   write bit makes the file read-only (`FILE_ATTRIBUTE_READONLY`), as A-262 reads a file's read-only state as its
 //!   mode, and every other bit the file holds is kept. The modification time is set through `FILE_BASIC_INFO` in the
 //!   FILETIME domain.
-//! - **Symbolic links:** refused (`ERROR_PRIVILEGE_NOT_HELD`'s errno, `EPERM`). Windows makes one only through
-//!   `CreateSymbolicLinkW`, which takes a path, or a reparse point the caller sets, which needs a privilege without
-//!   developer mode; slates writes through handles only and requires no privilege (R10), so a landing holding a
-//!   symbolic link fails that entry, typed.
+//! - **Symbolic links (A-438):** a volume link is landed as the Windows symbolic link the WinFsp drive shows for it
+//!   (A-275's form, `slates_vfs::host::windows_link`): a relative target with `\` and `SYMLINK_FLAG_RELATIVE`, a
+//!   Windows-absolute one under `\??\`. Handle-relative, as every verb here: the empty object made at the landing's
+//!   own hidden name (`staged`) with `FILE_OPEN_REPARSE_POINT`, its `IO_REPARSE_TAG_SYMLINK` buffer set
+//!   (`FSCTL_SET_REPARSE_POINT`), then moved to its name without replacing, so the name never holds half a link and a
+//!   crash between the steps leaves a hidden sibling the landing's sweep removes. NTFS sets a link's buffer only for a
+//!   caller with `SeCreateSymbolicLinkPrivilege` enabled, unless Developer Mode lets it; an administrator's token holds
+//!   it disabled, and `CreateSymbolicLinkW` enables it around its own call, so the set runs on this thread under a copy
+//!   of the process's token with it enabled (`as_link_maker`), for that call alone. No privilege is asked for that the
+//!   process does not hold (R10): where NTFS refuses the set (a standard account outside Developer Mode) the entry fails
+//!   `EPERM`, typed, as every link did before A-438. A link is a file link: the seam carries no link's type, so a
+//!   directory link Windows made in the volume (A-275's `LINK_DIRECTORY`) lands as a file link until the volume's other
+//!   attribute bits reach a landing (GAPS, A-185's owed list).
 //!
 //! Refusals the engine tells apart are reported in its errno numbers (it was written over POSIX): a name that exists
 //! as `EEXIST` (17), no room as `ENOSPC` (28), the missing exchange as `EOPNOTSUPP` (95).
@@ -51,8 +60,9 @@ use slates_vfs::inode::Fingerprint;
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem as nt;
 use windows_sys::Win32::Foundation::{
-  ERROR_ALREADY_EXISTS, ERROR_DISK_FULL, ERROR_FILE_EXISTS, ERROR_HANDLE_DISK_FULL,
-  ERROR_IO_DEVICE, GetLastError, HANDLE, NTSTATUS, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError,
+  ERROR_ALREADY_EXISTS, ERROR_DISK_FULL, ERROR_FILE_EXISTS, ERROR_FILENAME_EXCED_RANGE,
+  ERROR_HANDLE_DISK_FULL, ERROR_IO_DEVICE, ERROR_PRIVILEGE_NOT_HELD, GetLastError, HANDLE, NTSTATUS,
+  OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError,
   STATUS_DELETE_PENDING, STATUS_FILE_IS_A_DIRECTORY, STATUS_NO_SUCH_FILE, STATUS_NOT_A_DIRECTORY,
   STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_INVALID, STATUS_OBJECT_NAME_NOT_FOUND,
   STATUS_OBJECT_PATH_NOT_FOUND, UNICODE_STRING,
@@ -61,6 +71,7 @@ use windows_sys::Win32::Storage::FileSystem::{
   DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY,
   FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY,
   FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
+  FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
   FileAttributeTagInfo, FileBasicInfo, FileDispositionInfoEx, FlushFileBuffers,
   GetFileInformationByHandleEx, SYNCHRONIZE, SetFileInformationByHandle,
 };
@@ -101,6 +112,14 @@ const SETTABLE_ATTRIBUTES: u32 = 0x0000_31A7;
 const FILETIME_UNIX_EPOCH_TICKS: i64 = 116_444_736_000_000_000;
 /// Format: nanoseconds in a FILETIME interval.
 const HUNDRED_NS: i64 = 100;
+/// Format: a symbolic link's object as this writer makes it (A-438): its reparse buffer set (`FSCTL_SET_REPARSE_POINT`
+/// asks `FILE_WRITE_DATA` or `FILE_WRITE_ATTRIBUTES`, MS-FSA 2.1.5.10.36), moved to its name and, refused, removed
+/// (`DELETE`), its attributes read and waited on synchronously.
+const LINK_ACCESS: u32 =
+  FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | FILE_READ_ATTRIBUTES | DELETE | SYNCHRONIZE;
+/// Format: `FSCTL_SET_REPARSE_POINT` (winioctl.h): `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 41, METHOD_BUFFERED,
+/// FILE_SPECIAL_ACCESS)`, which sets the object's reparse buffer.
+const FSCTL_SET_REPARSE_POINT: u32 = 0x0009_00A4;
 /// Format: the access a directory's flush is made through: adding entries (`FILE_ADD_FILE`, the directory's
 /// `FILE_WRITE_DATA`) and waiting synchronously; `FlushFileBuffers` needs a handle that may write.
 const DIR_FLUSH_ACCESS: u32 = windows_sys::Win32::Storage::FileSystem::FILE_ADD_FILE | SYNCHRONIZE;
@@ -351,6 +370,163 @@ fn dispose(entry: BorrowedHandle<'_>) -> Result<(), HostError> {
     return Err(last_refusal());
   }
   Ok(())
+}
+
+/// Sets `buffer` (an `IO_REPARSE_TAG_SYMLINK` `REPARSE_DATA_BUFFER`) as the reparse point of the empty object `object`,
+/// opened as itself (`FILE_OPEN_REPARSE_POINT`) with [`LINK_ACCESS`]: refused `EPERM` where NTFS refuses the caller the
+/// link privilege (`ERROR_PRIVILEGE_NOT_HELD`), as every link was refused before A-438, otherwise in Windows' own code.
+fn set_reparse(object: BorrowedHandle<'_>, buffer: &[u8]) -> Result<(), HostError> {
+  let length = u32::try_from(buffer.len()).map_err(|_| code_refusal(ERROR_FILENAME_EXCED_RANGE))?;
+  let mut returned = 0u32;
+  // SAFETY: `object` is open for the call, synchronous (`FILE_SYNCHRONOUS_IO_NONALERT`), so no overlapped record is
+  // passed; `buffer` is readable for `length` bytes; nothing is written back (no output buffer), and `returned` is a
+  // writable local.
+  let set = unsafe {
+    windows_sys::Win32::System::IO::DeviceIoControl(
+      object.as_raw_handle().cast(),
+      FSCTL_SET_REPARSE_POINT,
+      buffer.as_ptr().cast(),
+      length,
+      std::ptr::null_mut(),
+      0,
+      &mut returned,
+      std::ptr::null_mut(),
+    )
+  };
+  if set != 0 {
+    return Ok(());
+  }
+  let code = std::io::Error::last_os_error()
+    .raw_os_error()
+    .and_then(|code| u32::try_from(code).ok())
+    .unwrap_or(0);
+  Err(if code == ERROR_PRIVILEGE_NOT_HELD {
+    HostError::Unavailable(ERRNO_PERM)
+  } else {
+    code_refusal(code)
+  })
+}
+
+/// Runs `make` (a link's buffer set) on this thread under a copy of the process's token with
+/// `SeCreateSymbolicLinkPrivilege` enabled, where the process holds the privilege ([`link_token`]), and reverts the
+/// thread to the process's own token after: NTFS checks the privilege enabled at the set, an administrator's token holds
+/// it disabled, and `CreateSymbolicLinkW` enables it around its own call the same way. Only this thread, only for
+/// `make`: the shard's other work and every other thread run as they did. Where the process does not hold it, or the
+/// thread cannot take the copy, `make` runs as the process is and NTFS decides (Developer Mode).
+fn as_link_maker<T>(make: impl FnOnce() -> T) -> T {
+  let Some(token) = link_token() else {
+    return make();
+  };
+  // SAFETY: `token` is an impersonation token this process made and keeps for its life ([`link_token`]); a null thread
+  // handle names this thread; the call reads both and writes nothing of ours.
+  let impersonating = unsafe {
+    windows_sys::Win32::System::Threading::SetThreadToken(std::ptr::null(), token.as_raw_handle().cast())
+  };
+  if impersonating == 0 {
+    return make();
+  }
+  let _back = Reverted;
+  make()
+}
+
+/// The thread's own token again when dropped ([`as_link_maker`]), whatever `make` returned.
+struct Reverted;
+
+impl Drop for Reverted {
+  fn drop(&mut self) {
+    // SAFETY: no arguments; it ends this thread's impersonation, which `as_link_maker` began on this thread.
+    let reverted = unsafe { windows_sys::Win32::Security::RevertToSelf() };
+    if reverted == 0 {
+      slates_machine::log_line!(
+        "slates-land: a thread could not revert from the link-making token: {}",
+        std::io::Error::last_os_error()
+      );
+    }
+  }
+}
+
+/// The impersonation token a link's set runs under ([`as_link_maker`]): a copy of this process's token with
+/// `SeCreateSymbolicLinkPrivilege` enabled, made once for the process; `None` where the process does not hold the
+/// privilege (a standard account) or a step refused, logged once.
+fn link_token() -> Option<BorrowedHandle<'static>> {
+  static TOKEN: std::sync::OnceLock<Option<OwnedHandle>> = std::sync::OnceLock::new();
+  TOKEN
+    .get_or_init(|| {
+      enabled_link_token()
+        .map_err(|why| slates_machine::log_line!("slates-land: links are set as the process is: {why}"))
+        .ok()
+    })
+    .as_ref()
+    .map(AsHandle::as_handle)
+}
+
+/// A copy of this process's token, for impersonation, with `SeCreateSymbolicLinkPrivilege` enabled in it; refused, in
+/// words, where the process does not hold the privilege or a call refused.
+fn enabled_link_token() -> Result<OwnedHandle, String> {
+  use windows_sys::Win32::Foundation::{ERROR_NOT_ALL_ASSIGNED, LUID};
+  use windows_sys::Win32::Security::{
+    AdjustTokenPrivileges, DuplicateTokenEx, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED,
+    SecurityImpersonation, TOKEN_ADJUST_PRIVILEGES, TOKEN_DUPLICATE, TOKEN_IMPERSONATE,
+    TOKEN_PRIVILEGES, TOKEN_QUERY, TokenImpersonation,
+  };
+  use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+  let refused = |call: &str| format!("{call}: {}", std::io::Error::last_os_error());
+  let mut process: HANDLE = std::ptr::null_mut();
+  // SAFETY: the current process's pseudo-handle and a writable handle out-parameter; the handle the call returns on
+  // success is owned at once, and nothing else owns it.
+  let process = unsafe {
+    (OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY, &mut process) != 0)
+      .then(|| OwnedHandle::from_raw_handle(process.cast()))
+  }
+  .ok_or_else(|| refused("OpenProcessToken"))?;
+  let mut copy: HANDLE = std::ptr::null_mut();
+  // SAFETY: `process` is open with `TOKEN_DUPLICATE`; no security attributes; `copy` is a writable out-parameter, and the
+  // handle the call returns on success is owned at once, and nothing else owns it.
+  let copy = unsafe {
+    (DuplicateTokenEx(
+      process.as_raw_handle().cast(),
+      TOKEN_ADJUST_PRIVILEGES | TOKEN_IMPERSONATE | TOKEN_QUERY,
+      std::ptr::null(),
+      SecurityImpersonation,
+      TokenImpersonation,
+      &mut copy,
+    ) != 0)
+      .then(|| OwnedHandle::from_raw_handle(copy.cast()))
+  }
+  .ok_or_else(|| refused("DuplicateTokenEx"))?;
+  let link = LUID {
+    LowPart: u32::try_from(windows_sys::Wdk::System::SystemServices::SE_CREATE_SYMBOLIC_LINK_PRIVILEGE)
+      .map_err(|_| "the link privilege's number".to_owned())?,
+    HighPart: 0,
+  };
+  let enabled = TOKEN_PRIVILEGES {
+    PrivilegeCount: 1,
+    Privileges: [LUID_AND_ATTRIBUTES {
+      Luid: link,
+      Attributes: SE_PRIVILEGE_ENABLED,
+    }],
+  };
+  // SAFETY: `copy` is open with `TOKEN_ADJUST_PRIVILEGES`; `enabled` is a filled one-entry record; no previous state is
+  // asked for.
+  let adjusted = unsafe {
+    AdjustTokenPrivileges(
+      copy.as_raw_handle().cast(),
+      0,
+      &enabled,
+      0,
+      std::ptr::null_mut(),
+      std::ptr::null_mut(),
+    )
+  };
+  // The call succeeds with `ERROR_NOT_ALL_ASSIGNED` where the token does not hold the privilege at all.
+  let code = std::io::Error::last_os_error().raw_os_error().and_then(|code| u32::try_from(code).ok());
+  if adjusted == 0 {
+    return Err(refused("AdjustTokenPrivileges"));
+  }
+  if code == Some(ERROR_NOT_ALL_ASSIGNED) {
+    return Err("this process does not hold SeCreateSymbolicLinkPrivilege".to_owned());
+  }
+  Ok(copy)
 }
 
 /// Writes `info` as the file's basic information: a zero member is left as it is.
@@ -941,9 +1117,47 @@ impl LandFs for OsLand {
     dispose(entry.as_handle())
   }
 
-  fn symlink(&mut self, dir: HostDir, _name: &str, _target: &str) -> Result<(), HostError> {
-    self.dir(dir)?;
-    Err(HostError::Unavailable(ERRNO_PERM))
+  /// The volume's link to `target` as a Windows symbolic link in A-275's form (the module's "Symbolic links"): made at
+  /// `staged`, its buffer set with the link privilege where the process holds it (`as_link_maker`), then moved to
+  /// `name` without replacing; whatever refuses a step, the staged object is removed, and a crash between them leaves
+  /// it at the landing's hidden name for its sweep.
+  fn symlink(
+    &mut self,
+    dir: HostDir,
+    name: &str,
+    target: &str,
+    staged: &str,
+  ) -> Result<(), HostError> {
+    let buffer = slates_vfs::host::windows_link::reparse_data(target)
+      .map_err(|_| code_refusal(ERROR_FILENAME_EXCED_RANGE))?;
+    entry_units(name)?;
+    let parent = self.dir(dir)?;
+    let object = nt_create(
+      parent,
+      staged,
+      LINK_ACCESS,
+      nt::FILE_CREATE,
+      nt::FILE_NON_DIRECTORY_FILE | nt::FILE_OPEN_REPARSE_POINT,
+      FILE_ATTRIBUTE_NORMAL,
+    )?;
+    let placed = as_link_maker(|| set_reparse(object.as_handle(), &buffer)).and_then(|()| {
+      if staged == name {
+        Ok(())
+      } else {
+        rename_handle(object.as_handle(), parent, name)
+      }
+    });
+    if let Err(refused) = placed {
+      // The step's own refusal is what the landing reports; a removal refused too leaves the object at the hidden name,
+      // where this landing's sweep removes it (`engine::sweep_parent`).
+      if let Err(left) = dispose(object.as_handle()) {
+        slates_machine::log_line!(
+          "slates-land: a refused link's staged object {staged} stays for the sweep: {left:?}"
+        );
+      }
+      return Err(refused);
+    }
+    Ok(())
   }
 
   fn sync_dir(&mut self, dir: HostDir) -> Result<(), HostError> {
