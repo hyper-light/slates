@@ -9779,7 +9779,12 @@ entry either old or new, never torn).
    `AcceptIdentical` where it holds the volume's, `Conflict(ModifyModify)` where it holds a third; a field the volume
    left as the base had stays as the disk holds it, as bytes the disk changed and the volume did not do. A missing file
    is `ModifyDelete` and anything but a file `TypeChanged`. The fields are set through the file's own handle, which is
-   judged again by its own `fstat` just before.
+   judged again by its own `fstat` just before. A captured clone's replacement judges its metadata the same way beside
+   its bytes' content verdict (A-466): the file lands with the clone's value in each field the clone changed and the
+   disk still holds as the capture did, and with the disk's in every other, so an outsider's mode change is kept under
+   the agent's bytes; a field held a third way is `ModifyModify`; and bytes the disk already holds are kept while the
+   fields the file lacks are set alone. An overlay's replacement needs its witnessed file whole instead (step 6), so an
+   outsider's metadata change there refuses the landing.
 
    Any `Conflict` refuses the landing with `Conflict{entries}` and records `LandingValidated`
    with the verdicts; nothing is written. Resolution is the agent's or the human's (`read_base`,
@@ -31732,5 +31737,5 @@ new, four tests; `src/captured_tests.rs`, one; `tests/oracle.rs`, A-451's bits t
   (an execute bit) makes an entry whose set changes nothing there; the next landing finds the file as the disk keeps it.
   A check and a set are two calls on one handle, and an outsider's change to the same field between them is not seen.
   Siblings found, not fixed: a `touch` alone and a base directory's mode change alone still land nothing; a captured
-  clone's replacement overwrites an outsider's mode change where an overlay's refuses it (T-1.14); and the manifest's
-  canonical encoding, which grants bind, has no golden vector.
+  clone's replacement overwrites an outsider's mode change where an overlay's refuses it (T-1.14; fixed by A-466 the same
+  day); and the manifest's canonical encoding, which grants bind, has no golden vector.

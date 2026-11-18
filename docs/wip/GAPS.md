@@ -18743,8 +18743,12 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   verify; a mode Windows cannot hold (an execute bit) makes an entry whose set changes nothing there, and the next
   landing finds the file as the disk keeps it; a check and a set are two calls on one handle, so an outsider's change to
   the same field between them is not seen; a `touch` alone and a base directory's mode change alone still land nothing;
-  a captured clone's replacement overwrites an outsider's mode change where an overlay's refuses it (T-1.14); and the
-  manifest's encoding, which grants bind, has no golden vector); and
+  a captured clone's replacement overwrote an outsider's mode change where an overlay's refuses it (T-1.14), **fixed by
+  A-466 the same day** (`docs/bugs/2026-11-18-a-captured-clones-replacement-overwrote-an-outsiders-mode.md`: its
+  metadata judged field by field beside its bytes, the outsider's mode kept under the agent's bytes, a mode both changed
+  differently a conflict, and an agent's mode set alone over bytes the disk already held; its unit tests ran on the
+  Mac Studio, the oracle reruns filed for main); and the manifest's encoding, which grants bind, has no golden vector);
+  and
   the seam's numbering: refusals the engine tells apart are POSIX numbers and the rest Win32 codes, so a Win32 code equal
   to one of the engine's numbers (`ERROR_NOT_SAME_DEVICE` 17, `ERROR_INSUFFICIENT_BUFFER` 122, among five) would read as
   that refusal; none of the writer's calls is known to answer one, and a typed refusal at the seam would close it.

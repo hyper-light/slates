@@ -35,13 +35,14 @@ const MAGIC: &[u8; 4] = b"SLMF";
 const VERSION: u16 = 3;
 /// Format: the encoding version of a manifest judged by content ([`Judged::Content`], A-291): the layout of
 /// [`VERSION`] with each witness tagged [`WITNESS_CONTENT`], so no grant of one binds a manifest of the other. 4 since
-/// A-451, with the bits, as [`VERSION`].
-const VERSION_CONTENT: u16 = 4;
+/// A-451, with the bits, as [`VERSION`]; 5 since A-466, each witness with the mode and Windows bits the capture held
+/// (`FileMeta`), which a replacement's metadata is judged against: a grant binds what it judges by.
+const VERSION_CONTENT: u16 = 5;
 /// Format: a witness tag: none.
 const WITNESS_NONE: u8 = 0;
 /// Format: a witness tag: a fingerprint and an identity ([`Judged::Witness`]).
 const WITNESS_FINGERPRINT: u8 = 1;
-/// Format: a witness tag: an identity alone ([`Judged::Content`]).
+/// Format: a witness tag: an identity and the metadata the capture held ([`Judged::Content`]; the metadata since A-466).
 const WITNESS_CONTENT: u8 = 2;
 /// Format: the action tags of the encoding, in the order the design lists the actions.
 const TAG_CREATE: u8 = 0;
@@ -300,6 +301,7 @@ impl Manifest {
         (Some(w), Judged::Content) => {
           out.push(WITNESS_CONTENT);
           out.extend_from_slice(&w.identity);
+          put_meta(&mut out, &FileMeta::of_fingerprint(&w.fingerprint));
         }
         (None, _) => out.push(WITNESS_NONE),
       }
@@ -636,6 +638,20 @@ fn content_witness(identity: [u8; 32]) -> Witness {
   }
 }
 
+/// [`content_witness`] of a file the capture held as `meta` (A-466): the mode and Windows bits it held sit in the
+/// witness's fingerprint, the one place a content witness carries more than its identity, so a replacement's metadata is
+/// judged against them field by field (`crate::verdict::landed_meta`).
+fn content_witness_of(identity: [u8; 32], meta: FileMeta) -> Witness {
+  Witness {
+    fingerprint: Fingerprint {
+      mode: meta.permissions,
+      windows: meta.windows,
+      ..Fingerprint::default()
+    },
+    ..content_witness(identity)
+  }
+}
+
 /// The BLAKE3 of file `no`'s bytes in `tree`, read whole as the overlay's plan reads a file.
 fn tree_identity(
   store: &Store,
@@ -718,7 +734,7 @@ fn capture_entries(
       };
       Ok(vec![entry(
         action,
-        Some(content_witness(captured)),
+        Some(content_witness_of(captured, from)),
         overlay,
         *windows,
       )])
