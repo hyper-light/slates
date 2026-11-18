@@ -309,3 +309,159 @@ fn a_green_seeded_in_shares_is_the_green_seeded_whole() {
     }
   }
 }
+
+/// Writes `origin` (canonical) through an [`slates_merge::origin::EncodeCursor`] in shares of `share` bytes: the bytes
+/// and the steps it took.
+fn encoded_in_shares(origin: &Origin, share: usize) -> (Vec<u8>, usize) {
+  let mut cursor = slates_merge::origin::EncodeCursor::new(origin).expect("canonical");
+  let mut out = Vec::new();
+  let mut steps = 0usize;
+  loop {
+    steps += 1;
+    if cursor.step(origin, share, &mut |bytes| out.extend_from_slice(bytes)) {
+      return (out, steps);
+    }
+  }
+}
+
+/// Reads `bytes` through a [`slates_merge::origin::DecodeCursor`] in shares of `share` bytes: what it answered and
+/// the steps it took.
+fn decoded_in_shares(bytes: &[u8], share: usize) -> (Result<Origin, DocDecodeError>, usize) {
+  let mut cursor = slates_merge::origin::DecodeCursor::new();
+  let mut steps = 0usize;
+  loop {
+    steps += 1;
+    match cursor.step(bytes, share) {
+      Ok(Some(origin)) => return (Ok(origin), steps),
+      Ok(None) => {}
+      Err(refusal) => return (Err(refusal), steps),
+    }
+  }
+}
+
+/// §4.16 "Commit", §4.3 (a green's version-0 inputs written in shares). Do: write the fixed origin's canonical bytes a
+/// few bytes at a time and whole. Expect: the bytes [`Origin::encode`] writes, every time, in more than one step for
+/// the small shares (non-vacuity); a cursor refuses an origin that is not canonical.
+#[test]
+fn an_origins_encoding_written_in_shares_is_its_encoding() {
+  let mut canonical = fixed_origin();
+  canonical.canonicalize();
+  let whole = canonical.encode();
+  for share in [1, 3, 17, 64, usize::MAX] {
+    let (bytes, steps) = encoded_in_shares(&canonical, share);
+    assert_eq!(bytes, whole, "shares of {share} bytes ({steps} steps)");
+    if share < whole.len() {
+      assert!(steps > 1, "shares of {share} bytes took {steps} steps");
+    }
+  }
+  assert!(slates_merge::origin::EncodeCursor::new(&fixed_origin()).is_none());
+}
+
+/// §4.16 "Apply on holders", §4.3 (a holder's replica of version 0 decoded in shares). Do: read the fixed origin's
+/// bytes a few bytes at a time and whole. Expect: the canonical origin every time, in more than one step for the small
+/// shares (non-vacuity).
+#[test]
+fn an_origin_decoded_in_shares_is_the_origin_decoded_whole() {
+  let mut canonical = fixed_origin();
+  canonical.canonicalize();
+  let bytes = canonical.encode();
+  for share in [1, 3, 17, 64, usize::MAX] {
+    let (decoded, steps) = decoded_in_shares(&bytes, share);
+    assert_eq!(
+      decoded.as_ref(),
+      Ok(&canonical),
+      "shares of {share} bytes ({steps} steps)"
+    );
+    if share < bytes.len() {
+      assert!(steps > 1, "shares of {share} bytes took {steps} steps");
+    }
+  }
+}
+
+/// Hostile input, in shares: every truncation, every single-bit flip, a trailing byte and a wild count, each read a
+/// byte at a time, seven at a time and whole. Expect: every share answers exactly what [`Origin::decode`] answers, the
+/// same origin or the same typed refusal (a resumed read never accepts what the whole refuses, nor the reverse).
+#[test]
+fn a_malformed_origin_is_refused_alike_in_every_share() {
+  let mut canonical = fixed_origin();
+  canonical.canonicalize();
+  let bytes = canonical.encode();
+  let mut hostile: Vec<Vec<u8>> = (0..bytes.len()).map(|cut| bytes[..cut].to_vec()).collect();
+  for at in 0..bytes.len() {
+    for bit in 0..8 {
+      let mut flipped = bytes.clone();
+      flipped[at] ^= 1 << bit;
+      hostile.push(flipped);
+    }
+  }
+  let mut padded = bytes.clone();
+  padded.push(0);
+  hostile.push(padded);
+  let mut wild = bytes.clone();
+  wild[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+  hostile.push(wild);
+  let mut refused = 0usize;
+  for input in &hostile {
+    let whole = Origin::decode(input);
+    refused += usize::from(whole.is_err());
+    for share in [1, 7, usize::MAX] {
+      assert_eq!(
+        decoded_in_shares(input, share).0,
+        whole,
+        "shares of {share} bytes over {} hostile bytes",
+        input.len()
+      );
+    }
+  }
+  assert!(
+    refused > bytes.len(),
+    "the hostile inputs were refused ({refused})"
+  );
+}
+
+/// A generated origin's tables, each entry's key from a small alphabet so keys repeat and sort non-trivially.
+fn origin_strategy() -> impl proptest::strategy::Strategy<Value = Origin> {
+  use proptest::prelude::*;
+  let key = || proptest::string::string_regex("[a-c]{1,3}(/[a-c]{1,2})?").unwrap();
+  let bytes = || proptest::collection::vec(any::<u8>(), 0..40);
+  (
+    proptest::collection::vec((key(), bytes()), 0..12),
+    proptest::collection::vec(key(), 0..6),
+    proptest::collection::vec((key(), any::<u32>()), 0..6),
+    proptest::collection::vec((key(), key()), 0..4),
+    proptest::collection::vec((key(), key()), 0..4),
+    proptest::collection::vec((key(), key(), bytes()), 0..4),
+  )
+    .prop_map(|(files, dirs, modes, symlinks, hardlinks, xattrs)| {
+      let mut origin = Origin {
+        files,
+        dirs,
+        modes,
+        symlinks,
+        hardlinks,
+        specials: Vec::new(),
+        xattrs,
+      };
+      origin.canonicalize();
+      origin
+    })
+}
+
+proptest::proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
+  /// §4.16, §4.3 (property). Do: write a generated canonical origin in generated shares, and read the bytes back in
+  /// other generated shares. Expect: the shares write exactly [`Origin::encode`]'s bytes, and read back exactly the
+  /// origin.
+  #[test]
+  fn every_origin_written_and_read_in_shares_round_trips(
+    origin in origin_strategy(),
+    write_share in 1usize..64,
+    read_share in 1usize..64,
+  ) {
+    let whole = origin.encode();
+    let (bytes, _) = encoded_in_shares(&origin, write_share);
+    proptest::prop_assert_eq!(&bytes, &whole);
+    let (decoded, _) = decoded_in_shares(&bytes, read_share);
+    proptest::prop_assert_eq!(decoded, Ok(origin));
+  }
+}

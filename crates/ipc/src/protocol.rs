@@ -3134,6 +3134,17 @@ pub enum RecoveryCause {
     /// Which, and the refusal.
     reason: String,
   },
+  /// A green this node took over from a departed owner (§4.16 owner-loss recovery) could not be materialized within the
+  /// takeover's bound: the failover SLO's worth of the fleet's periods, each one attempt. Every verb on it answers this
+  /// rather than waiting without end. Appended.
+  TakeoverIncomplete {
+    /// What the last attempt waited on: `catalog` (its catalog register or that register's placement never adopted),
+    /// `chain` (a version's record not known here: the adopted version beyond this node's accepted records), `inputs`
+    /// (an input its ledger names not held here, and not served whole by the survivors that reported the adopted
+    /// version), `placement` (no placement of the adopted record, or no shard for its partition), or `refused` (the
+    /// owner shard refused the rebuilt green).
+    waited_on: String,
+  },
 }
 
 impl RecoveryCause {
@@ -3150,6 +3161,7 @@ impl RecoveryCause {
       RecoveryCause::OriginNotRecovered => "OriginNotRecovered",
       RecoveryCause::ImageRefused { .. } => "ImageRefused",
       RecoveryCause::ResourcesUnavailable { .. } => "ResourcesUnavailable",
+      RecoveryCause::TakeoverIncomplete { .. } => "TakeoverIncomplete",
     }
   }
 }
