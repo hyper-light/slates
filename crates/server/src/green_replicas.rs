@@ -1538,19 +1538,34 @@ mod tests {
     assert!(eventually(&daemon, 1, move |state| held_at(state, green, head)).is_some());
     let charged = crate::daemon::observe_at(&daemon, 1, |state| state.store.budget.replicated());
     let used = crate::daemon::observe_at(&daemon, 1, move |state| {
-      [serving(state, green, 1).is_some(), serving(state, green, 1).is_some()]
+      [
+        serving(state, green, 1).is_some(),
+        serving(state, green, 1).is_some(),
+      ]
     });
     assert_eq!(used, [true; 2], "the replica serves version 1, twice");
     let given_back = eventually(&daemon, 1, move |state| {
       let idle = state.refusals.get(IDLE_GIVEN_BACK).copied();
-      idle.filter(|_| !state.green_replicas.held.contains_key(&green))
+      idle
+        .filter(|_| !state.green_replicas.held.contains_key(&green))
         .map(|idle| (idle, state.store.budget.replicated()))
     });
-    assert_eq!(given_back, Some((1, 0)), "given back once idle, its charge {charged} credited");
+    assert_eq!(
+      given_back,
+      Some((1, 0)),
+      "given back once idle, its charge {charged} credited"
+    );
     let routed = crate::daemon::observe_at(&daemon, 1, move |state| {
-      (serving(state, green, 1).is_none(), state.refusals.get(ROUTE_IDLE).copied())
+      (
+        serving(state, green, 1).is_none(),
+        state.refusals.get(ROUTE_IDLE).copied(),
+      )
     });
-    assert_eq!(routed, (true, Some(1)), "work returned: asked of the owner as idle");
+    assert_eq!(
+      routed,
+      (true, Some(1)),
+      "work returned: asked of the owner as idle"
+    );
     let remade = crate::daemon::observe_first(&daemon, move |state| {
       submit_one(state, work, 2);
       state.refusals.get(REMADE).copied()
