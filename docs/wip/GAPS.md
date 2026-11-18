@@ -2507,7 +2507,9 @@
 >     50 ms and 2.2 to 4.6 ms at 20 ms. Every shard parked and woke about 7,500 times a second: the doorbell's herd
 >     (A-381, closed below). The owner ran at 33% and 51% of a core; every other shard at 13 to 28%.
 >     - **Closed: the doorbell's herd (A-381, 2026-11-18).** On macOS and Windows each client's ring kicked every shard;
->       now it marks the shard its region names and the doorbell thread kicks only the shards marked.
+>       now it marks the shard its region names and the doorbell thread kicks only the shards marked. Each shard's
+>       parks fell 59% and the shards' CPU 20 to 34% at 1,000 clients; the latencies moved with the box's load (14 to 52)
+>       more than with the change, so no latency is claimed for it (BENCHMARKS, 2026-11-18).
 >     - **Open, the hops (by the trace):** an edit of a work off its client's shard crosses four thread hand-offs (the
 >       client's shard, the work's, the owner's, back), each waiting for its thread to run; and a first touch, a
 >       verdict, a rebase and a read of the green each queue on the owner's one thread.

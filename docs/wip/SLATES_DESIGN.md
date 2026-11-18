@@ -27266,6 +27266,9 @@ shard), `crates/server/src/doorbell.rs` (the thread kicks what the rings marked,
   a shard neither it nor the control shard fewer than half as often; red with the thread kicking every shard (at 100
   cycles on the Mac Studio such a shard woke 114 times against the client's shard's 100 with every shard kicked, and 14
   times with A-381).
-- **Measured (owed, the supervisor's):** the 1,000-client rung on the Mac Studio, main before against this, interleaved:
-  every shard's parks a second, its CPU, and each kind's latency and floor.
+- **Measured** (BENCHMARKS, "Where a 1,000-client request's time goes, and a client's ring that wakes only its shard";
+  Mac Studio, 1,000 clients, 23 shards, six pairs back to back at think means of 50 and 20 ms, 2026-11-18): each shard's
+  parks fell by 59% at both loads (4.71 to 1.92 million a level at 50 ms, 2.74 to 1.13 million at 20 ms) and the shards'
+  CPU by 34% and 20%. The latencies swung ten- to twentyfold with the box's load (14 to 52) within each arm, so those
+  pairs cannot tell the arms' latencies apart; the 1,000-client rung's record run is the supervisor's.
 

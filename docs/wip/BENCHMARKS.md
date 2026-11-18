@@ -13623,6 +13623,78 @@ records of about 135.5 MB), `held_back.whole` 11 to 16, `batches` 5 to 102 carry
   whole volume, and `install_built` and `install_image` rose with it). Under an anchor the daemon would be restarted,
   which is still an outage of every writer's connection.
 
+## Where a 1,000-client request's time goes, and a client's ring that wakes only its shard: parks down 59%, daemon CPU down 20-34%, latency moving with the box (A-381; goals 231 and 257; 2026-11-18)
+
+**What it is.** Goal 257's agent (g083) profiled the 1,000-client rung's loaded tail, the harness against the product,
+then cut the first thing the profile named. The profile is a diagnostic build never on main (branch `diag-g083-trace`):
+each shard's span sink sized to hold a whole run (`SLATES_DIAG_SPAN_CAPACITY`), the owner's answer to each ask and each
+resumed verb spanned under its request's id, and `load_bench --trace` joining every attempt it timed with every span of
+its request. The harness on main since `f6d37937b` stamps a send before it reaches the ring and a reply after its ring
+was read, and prints each attempt's `floor` (the daemon and the ring's share, whatever the harness's sweep did).
+
+**Environment.** Mac Studio adas-mac-studio.local-2 (Apple M3 Ultra, 32 cores, macOS 26.4), release (LTO) `load_bench`
+with the daemon in its process (23 shards derived), Linux v7.4-rc1 `kernel/`. Shared: other agents' builds and tests
+ran throughout, and the one-minute load at the runs' starts went from 14 to 52.
+
+**Command.** `[SLATES_DIAG_SPAN_CAPACITY=1500000] load_bench --tree <linux-v7.4-rc1>/kernel --clients 1000 --hot-files
+800 --per-connection 32 --rounds 20 --reply-patience 60 --think-us Z [--trace]`, the scripts `diag_run.sh` and `ab.sh` of
+`~/.cache/slates-scratch/g083/scripts/` (the measuring agent's), every bench.log kept whole on the Studio in
+`~/.cache/g083-runs/`.
+
+**The profile (2026-11-18 17:05 UTC, load 14 to 17, the diagnostic on main `f6d37937b`).** Each leg of an attempt's
+time, p50 / p99 / p999 in µs: the request in the client's ring until its shard read it (`to_read`), the hop to the
+work's shard (`hop_in`), the verb's own steps (`ops`), an ask's wait to reach the green's owner, its batch and queue
+(`ask_out`), the owner's answer (`ask_serve`), the answer back (`ask_back`), the reply home (`hop_out`), and the
+harness taking the reply (`to_take`).
+
+| Z, verdicts/s | kind | to_read | hop_in | ops | ask_out | ask_serve | ask_back | hop_out | to_take | total |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 50 ms, 1,121 | Edit | 35 / 634 / 4,666 | 17 / 267 / 2,417 | 12 / 54 / 102 | 0 / 397 / 3,532 | 0 / 13 / 42 | 0 / 127 / 1,034 | 33 / 238 / 2,023 | 1 / 25 / 2,744 | 141 / 2,218 / 20,449 |
+| 50 ms, 1,121 | Accepted | 35 / 513 / 4,326 | 16 / 271 / 2,000 | 50 / 138 / 227 | 34 / 786 / 5,837 | 51 / 135 / 224 | 16 / 214 / 2,253 | 11 / 187 / 1,465 | 1 / 23 / 2,246 | 240 / 2,684 / 16,994 |
+| 50 ms, 1,121 | ReadHead | 34 / 589 / 4,483 | 19 / 599 / 6,217 | 4 / 26 / 61 | | | | 39 / 261 / 2,410 | 1 / 25 / 1,479 | 114 / 1,863 / 14,024 |
+| 20 ms, 2,682 | Edit | 28 / 421 / 6,027 | 23 / 351 / 3,440 | 13 / 68 / 120 | 0 / 1,028 / 13,563 | 0 / 15 / 47 | 0 / 188 / 1,118 | 39 / 358 / 2,586 | 1 / 51 / 37,916 | 178 / 3,308 / 46,533 |
+| 20 ms, 2,682 | Accepted | 29 / 389 / 3,934 | 21 / 312 / 2,148 | 53 / 167 / 261 | 74 / 1,935 / 31,262 | 49 / 150 / 250 | 24 / 271 / 1,766 | 18 / 320 / 1,677 | 1 / 48 / 45,177 | 329 / 5,021 / 46,865 |
+
+The floor's p99 was 1.6 to 2.7 ms at 50 ms (every kind) against a latency p99 of 1.9 to 3.7 ms, and 2.2 to 4.6 ms at
+20 ms. Every shard parked and woke 344,631 to 379,811 times in the 49.3 s level (about 7,500 a second), alike on shards
+serving one connection and two; the owner ran 33% of a core at 50 ms and 51% at 20 ms, every other shard 13 to 28%.
+
+**The A/B of A-381 (17:40 to 17:49 UTC).** Before is main `79aee2a17` with the diagnostic (`diag-g083-base`), after is
+A-381's branch on it (`diag-g083-a381`); no span sink enlarged and no `--trace`. Back to back, the order alternating by
+round. `waits` is every shard's parks summed over the level (49 to 55 s at 50 ms, 23 to 30 s at 20 ms), `CPU` the
+shards' CPU summed, in thousandths of a core; latencies in ms.
+
+| Z, round | arm | load before → after | verdicts/s | waits | CPU | Edit p50 / p99 | Edit floor p99 | Accepted p99 |
+|---|---|---|---|---|---|---|---|---|
+| 50, 1 | before | 14.5 → 31.0 | 1,058 | 5,240,411 | 4,936 | 0.51 / 29.2 | 26.8 | 36.8 |
+| 50, 1 | after | 31.0 → 28.4 | 1,031 | 1,777,236 | 3,445 | 0.40 / 23.4 | 15.3 | 30.2 |
+| 50, 2 | after | 40.0 → 43.7 | 1,038 | 1,816,524 | 2,945 | 0.48 / 22.0 | 11.7 | 29.2 |
+| 50, 2 | before | 43.7 → 51.9 | 1,101 | 4,281,536 | 3,891 | 0.67 / 15.1 | 9.4 | 22.2 |
+| 50, 3 | before | 47.0 → 46.3 | 1,080 | 4,602,849 | 4,024 | 0.49 / 15.1 | 7.8 | 32.4 |
+| 50, 3 | after | 46.3 → 31.7 | 1,095 | 2,157,207 | 2,097 | 0.11 / 1.48 | 1.31 | 2.04 |
+| 20, 1 | before | 28.4 → 37.7 | 2,165 | 2,325,470 | 6,224 | 2.26 / 40.6 | 35.2 | 45.3 |
+| 20, 1 | after | 37.7 → 40.0 | 2,208 | 1,151,770 | 5,004 | 1.00 / 31.3 | 28.7 | 35.6 |
+| 20, 2 | after | 51.9 → 49.6 | 2,166 | 1,049,246 | 5,203 | 1.75 / 33.0 | 28.3 | 38.7 |
+| 20, 2 | before | 49.6 → 47.0 | 2,471 | 2,885,394 | 6,510 | 0.82 / 23.0 | 20.5 | 26.7 |
+| 20, 3 | before | 31.7 → 28.8 | 2,703 | 3,021,147 | 6,979 | 0.19 / 1.32 | 1.23 | 2.24 |
+| 20, 3 | after | 28.8 → 31.2 | 2,627 | 1,190,604 | 5,498 | 0.23 / 2.57 | 2.36 | 3.33 |
+
+Every run's oracle had 0 failures; 11 to 44 clients a run gave up (starved past 64 resolutions a round, the shape's).
+
+**What it means.**
+- **The p99 is the product's, the p999 partly the harness's.** At the p99 the harness took 25 to 51 µs to take a reply,
+  and the floor was 85% of the latency or more; past the p99 a worker kept off its CPU for up to 96 to 126 ms (the
+  `max_sweep_ns` of every run) shows in `to_take` (a p999 of 2.7 to 45 ms).
+- **The product's time is waiting, not work.** A verb's own steps took 12 to 50 µs at the median and the owner's answer
+  13 to 135 µs at the p99; the rest of a slow request was its turn at four or five thread hand-offs: the client's shard
+  reading the ring, the hop to the work's shard, the ask's way to the owner, its way back, and the reply home, each with
+  a p99 of 127 to 786 µs at 50 ms and up to 1.9 ms at 20 ms. The ask to the owner grows fastest with load.
+- **A-381 cut what it was for and moved no latency this box can show.** Each shard's parks fell by 59% at both loads
+  (4.71 to 1.92 million a level at 50 ms, 2.74 to 1.13 million at 20 ms, means of three) and the shards' CPU by 34% at
+  50 ms and 20% at 20 ms. The latencies swung by ten to twenty times with the box's load within each arm (Edit p99 1.3
+  to 40.6 ms), so these six pairs cannot tell the two apart; the round at the lowest load favoured A-381 at 50 ms and
+  main at 20 ms.
+
 ## The reply carrier at 3,000 and 10,000 clients: no reply lost after it; 57 lost and a hung run before it at 10,000 (A-296; goal 238; 2026-11-18)
 
 **What it is.** Goal 238's measurement of A-296 (every cross-shard reply waits for room, carried by a per-shard carrier,
