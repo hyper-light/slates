@@ -601,6 +601,7 @@ impl BuildJob {
       access: Vec::new(),
       created_ns: state.clock.monotonic_ns(),
       catalog_version: 0,
+      taken_over: None,
     };
     let Admitted {
       volume,

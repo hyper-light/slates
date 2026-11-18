@@ -2711,7 +2711,7 @@ step, spin, park and send), and the probe's own overhead reversed the result: al
   one miss per round trip). Its window is the 2-competitive spin-then-park threshold (spin for the expected cost of
   parking; Karlin, Manasse, McGeoch and Owicki 1991), and that threshold took the startup profile's `wake.mean`
   (1.7 µs on macOS), well below the wakes actually paid under load.
-- **Measured in the daemon's configuration** (macOS, load 14–40). The spin window was ×100 (`IDLE_WINDOW_RATIO`)
+- **Measured in the daemon's configuration** (macOS, load 14–40). The spin window was ×100 (the daemon's idle ratio then)
   with the online estimate on, alternating, three rounds: always-kick 4,875–5,917 ns, the candidate 12,167–12,791 ns.
   Still rejected.
 - **The window is not the cause.** The shards' counters show 1–2 real driver waits per 2,000 round trips: nearly
@@ -12524,7 +12524,7 @@ waited out a reply deadline: the longest operation of any kind in main's three 3
 
 ## One paced client keeps its shards spinning on main: the window rule's baseline (A-223; R9; CI; 2026-11-09)
 
-**What it is.** A client that sends one request every millisecond keeps its owner shard spinning through the pause under today's idle window: the shard's live wake estimate × `IDLE_WINDOW_RATIO` (100) grows longer than the pause, so the shard never parks. On Linux this costs 1.5 to 2 cores at two shards on main. The cost is main's own, found while measuring A-223, which raises it on Windows only. It is the baseline the window rule's A/B is measured against.
+**What it is.** A client that sends one request every millisecond keeps its owner shard spinning through the pause under today's idle window: the shard's live wake estimate × the daemon's idle ratio (100) grows longer than the pause, so the shard never parks. On Linux this costs 1.5 to 2 cores at two shards on main. The cost is main's own, found while measuring A-223, which raises it on Windows only. It is the baseline the window rule's A/B is measured against.
 
 **Rows.** `provision_bench`'s `provision.paced_1_1000us_cpu_<N>_shards`: the process's CPU over each run of the parked form, one client paced every 1 ms, 500 creates a run, in thousandths of one core, the client's own CPU included. `provision.rest_cpu_<N>_shards`: the same daemon over 3 s with no client, after its boot window has passed. `provision.spinning_1_p99`: the single-client p99.
 
@@ -12565,6 +12565,166 @@ waited out a reply deadline: the longest operation of any kind in main's three 3
 - **Windows paid little only by accident.** Main's Windows estimate timed an on-CPU handoff, 0.14 to 0.85 µs, so its window was 14 to 85 µs and the shards parked between paced requests (31 to 104 thousandths). A-223 measures the real 7 to 9 µs wake, and the same rule now spins on Windows too (191 to 493).
 - **macOS stays low.** Main's macOS spin naps about 15 µs at each harvest (A-218), so the paced client costs 77 to 480 thousandths on every arm.
 - **The window rule (A-223's plan, steps 3 to 6, landing in step 7) is measured against this table.** It aims to cut the paced rows while keeping the single-client p99 within R9, on Linux as well as Windows.
+
+## The idle window's rule, measured: main, x100, and three rules against it (A-223; R9; CI; 2026-11-09)
+
+**What was asked.** A-223 measures a real Windows wake, which made the idle window (the shard's wake estimate × the daemon's idle ratio, 100) span a 1 ms pause and feed on its own spinning's queueing. The same rule already spun through a 1 ms pause on main on Linux (the window rule's baseline, above). The supervisor asked for a rule priced on something load cannot grow, judged by (a) the paced client's CPU, (b) quiet single-client p99, (c) loaded single-client p99 and (d) parks in the paced form above 0.
+
+**Measured and rejected: the floor of confirmed wakes** (605ec524, 2389b0d9, diag-liveness-33). The window priced on the smallest confirmed wake over the last one to two windows of 2^shift wakes. Under two spinners a logical CPU at 2 shards the floor itself queued: largest shard floor 33.8 ms on windows-latest, 17.3 ms on windows-11-arm, 0.90 ms on ubuntu-latest and 0.33 ms on ubuntu-24.04-arm, against at most 15 µs quiet.
+
+**Measured and rejected: option 1, the floor less the thread's run-queue time (Linux only).** The floor sample was each wake less the thread's `run_delay` across the wait (`/proc/thread-self/schedstat`). On fedora-2 (32 CPUs, 64 spinners, load 68) at 2 shards every shard floor read 0-1.75 µs, nearly all 0. Owner parks rose to 1,639-2,318 per 1,000 single-client creates, the loaded single-client p99 was 2.5-3.1 ms, and paced CPU was 238-243 thousandths of a core. A Linux wake's kick-to-running time is run-queue time, so subtracting it removes the wake itself. Windows reports no such time.
+
+**The comparison** (diag-liveness-35). Command: `provision_bench` with `PROVISION_BENCH_SHARDS=2`, built from main 1c49c33f and from the branch at 843cc514 with a diagnostic selector (`SLATES_DIAG_WINDOW_RULE`, f4f48b1b), on every CI runner. Arms: main; x100 (the window on the live mean × 100, A-223 alone); option 2, W = max(F, the boot probe's smallest confirmed wake), where F = 50 µs is R9's provisioning floor (AC-2.1, T-2.6); option 3, the live floor × 100 capped at 4F (the 4 is a bare factor, not derived). Quiet is the runner alone. Loaded is two spinning shell loops per logical CPU, with the daemon booting beside them. Three rounds, the arms alternating, 24 runs per runner.
+
+### windows-latest
+
+| arm | paced CPU quiet (N=9) | paced CPU loaded (N=9) | quiet p99 µs (N=9) | loaded p99 µs (N=9) | paced parks/1000, quiet (per shard, N=6) | paced parks/1000, loaded (N=6) |
+|---|---|---|---|---|---|---|
+| main | med 45: 29, 33, 39, 42, 45, 45, 46, 53, 69 | med 749: 706, 740, 742, 743, 749, 751, 752, 755, 759 | med 79.7: 46.8, 49.1, 50.0, 51.9, 79.7, 80.7, 86.7, 88.7, 216.6 | med 129.1: 51.0, 87.3, 94.1, 97.1, 129.1, 65.1ms, 73.2ms, 86.8ms, 89.4ms | 1169, 1440, 1588, 1628, 1830, 1896 | 28, 36, 38, 51, 58, 62 |
+| x100 (mean) | med 232: 177, 180, 203, 223, 232, 241, 242, 250, 254 | med 775: 766, 769, 773, 774, 775, 776, 777, 779, 782 | med 35.9: 31.4, 33.2, 33.7, 35.6, 35.9, 36.1, 37.7, 39.3, 39.9 | med 127.1: 81.9, 86.8, 105.8, 106.4, 127.1, 133.3, 140.4, 43.5ms, 74.7ms | 1039, 1149, 1153, 1312, 1396, 1419 | 2, 2, 4, 4, 8, 10 |
+| option 2 | med 45: 20, 31, 39, 40, 45, 48, 49, 50, 67 | med None: - | med 41.2: 39.5, 40.3, 40.5, 40.6, 41.2, 42.6, 42.6, 43.0, 43.3 | med 98.8ms: 96.9ms, 97.2ms, 98.2ms, 98.8ms, 98.8ms, 98.8ms, 99.4ms, 100.2ms, 100.5ms | 1351, 1380, 1526, 1796, 1798, 1830 | - |
+| option 3 | med 64: 37, 50, 61, 63, 64, 67, 69, 69, 69 | med 12: 10, 12, 15 | med 38.0: 31.3, 33.4, 34.9, 35.6, 38.0, 38.4, 38.6, 38.9, 39.0 | med 97.1ms: 92.8ms, 93.1ms, 94.8ms, 96.5ms, 97.1ms, 97.6ms, 100.8ms, 137.1ms, 163.9ms | 1160, 1161, 1200, 1427, 1430, 1485 | 1890, 2314 |
+
+Boot probe floor (idle window at boot / 100), option 2 arm: quiet 3.1, 6.4, 6.4 µs; loaded 10.1, 10.1, 10.1 µs
+All rules-binary boots: quiet floor 3.1, 6.4, 6.4, 6.4, 6.4, 6.4, 6.5, 6.5, 6.5 µs (N=9); loaded floor 10.0, 10.0, 10.1, 10.1, 10.1, 10.1, 10.1, 10.1, 10.1 µs (N=9)
+Problems: ['== exit 124', '== exit 124', '== exit 124', '== exit 124', '== exit 124']
+
+### windows-11-arm
+
+| arm | paced CPU quiet (N=9) | paced CPU loaded (N=9) | quiet p99 µs (N=9) | loaded p99 µs (N=9) | paced parks/1000, quiet (per shard, N=6) | paced parks/1000, loaded (N=6) |
+|---|---|---|---|---|---|---|
+| main | med 37: 29, 29, 31, 35, 37, 38, 41, 44, 50 | med 702: 162, 176, 181, 666, 702, 707, 725, 733, 737 | med 30.2: 27.9, 27.9, 29.5, 29.9, 30.2, 30.3, 34.8, 36.7, 40.7 | med 36.0ms: 44.8, 83.6, 129.0, 10.8ms, 36.0ms, 41.3ms, 48.3ms, 49.2ms, 51.9ms | 1172, 1266, 1412, 1570, 1612, 1882 | 4, 6, 8, 10, 1301, 1473 |
+| x100 (mean) | med 274: 225, 256, 260, 274, 274, 280, 284, 290, 435 | med 736: 693, 716, 718, 730, 736, 740, 741, 741, 756 | med 31.2: 25.7, 29.2, 29.5, 30.5, 31.2, 32.2, 33.7, 35.5, 76.1 | med 125.2: 72.6, 85.7, 91.5, 93.8, 125.2, 126.0, 131.2, 25.8ms, 36.9ms | 1163, 1170, 1180, 1386, 1387, 1393 | 0, 0, 0, 0, 0, 0 |
+| option 2 | med 39: 33, 33, 35, 35, 39, 44, 48, 54, 56 | med 11: 8, 10, 10, 11, 11, 12, 12, 12, 13 | med 42.6: 25.0, 29.9, 31.6, 31.7, 42.6, 42.9, 43.6, 93.8, 161.7 | med 48.2ms: 47.8ms, 48.0ms, 48.1ms, 48.1ms, 48.2ms, 48.2ms, 52.2ms, 54.7ms, 56.2ms | 1782, 1800, 1810, 1973, 1976, 2010 | 1863, 1864, 1864, 2221, 2226, 2231 |
+| option 3 | med 54: 40, 46, 50, 50, 54, 54, 58, 62, 68 | med 17: 12, 12, 13, 17, 17, 17, 18, 18, 22 | med 30.0: 27.5, 27.5, 27.9, 29.4, 30.0, 30.5, 33.5, 34.4, 36.2 | med 48.3ms: 47.9ms, 48.0ms, 48.0ms, 48.1ms, 48.3ms, 48.4ms, 48.6ms, 50.8ms, 66.8ms | 1186, 1190, 1251, 1398, 1408, 1421 | 1849, 1849, 1858, 2206, 2212, 2213 |
+
+Boot probe floor (idle window at boot / 100), option 2 arm: quiet 5.8, 6.4, 7.1 µs; loaded 4.9, 5.1, 5.1 µs
+All rules-binary boots: quiet floor 5.4, 5.6, 5.7, 5.8, 5.8, 5.8, 6.0, 6.4, 7.1 µs (N=9); loaded floor 4.7, 4.9, 4.9, 5.0, 5.1, 5.1, 5.1, 5.2, 5.2 µs (N=9)
+
+### ubuntu-latest
+
+| arm | paced CPU quiet (N=9) | paced CPU loaded (N=9) | quiet p99 µs (N=9) | loaded p99 µs (N=9) | paced parks/1000, quiet (per shard, N=6) | paced parks/1000, loaded (N=6) |
+|---|---|---|---|---|---|---|
+| main | med 1502: 1451, 1462, 1467, 1481, 1502, 1512, 1552, 1908, 1980 | med 980: 905, 938, 945, 978, 980, 1011, 1029, 1043, 1051 | med 19.3: 17.8, 18.1, 18.7, 19.0, 19.3, 19.3, 19.3, 19.6, 19.6 | med 8.0ms: 7.0ms, 7.1ms, 8.0ms, 8.0ms, 8.0ms, 8.1ms, 9.1ms, 9.9ms, 10.0ms | 0, 0, 182, 709, 717, 784 | 0, 0, 0, 0, 0, 0 |
+| x100 (mean) | med 1619: 1467, 1468, 1475, 1482, 1619, 1884, 2023, 2024, 2025 | med 943: 858, 900, 933, 934, 943, 956, 958, 1020, 1029 | med 18.3: 16.4, 17.2, 17.5, 18.1, 18.3, 18.4, 19.2, 20.0, 20.4 | med 8.5ms: 6.9ms, 7.0ms, 7.4ms, 8.2ms, 8.5ms, 9.9ms, 9.9ms, 9.9ms, 9.9ms | 0, 0, 0, 177, 673, 802 | 0, 0, 0, 0, 0, 0 |
+| option 2 | med 162: 155, 157, 160, 161, 162, 162, 163, 168, 170 | med 343: 299, 302, 315, 331, 343, 379, 421, 430, 434 | med 19.0: 17.1, 17.5, 17.6, 18.8, 19.0, 19.2, 19.4, 19.6, 20.1 | med 4.0ms: 2.9ms, 3.2ms, 3.9ms, 4.0ms, 4.0ms, 4.0ms, 4.0ms, 4.0ms, 4.0ms | 754, 765, 888, 891, 911, 1013 | 1537, 1553, 1644, 2120, 2175, 2200 |
+| option 3 | med 361: 356, 358, 359, 361, 361, 361, 366, 369, 369 | med 447: 420, 420, 426, 439, 447, 451, 452, 452, 469 | med 19.5: 17.2, 18.4, 18.7, 19.1, 19.5, 19.7, 19.9, 24.0, 36.0 | med 4.0ms: 3.6ms, 3.7ms, 3.7ms, 4.0ms, 4.0ms, 4.0ms, 4.0ms, 5.0ms, 5.0ms | 740, 788, 878, 882, 936, 988 | 1652, 1740, 1812, 2145, 2194, 2420 |
+
+Boot probe floor (idle window at boot / 100), option 2 arm: quiet 5.9, 6.2, 6.2 µs; loaded 21.7, 50.1, 258.8 µs
+All rules-binary boots: quiet floor 5.9, 5.9, 5.9, 6.0, 6.0, 6.0, 6.2, 6.2, 6.2 µs (N=9); loaded floor 6.8, 21.7, 42.8, 48.8, 50.1, 67.3, 73.0, 74.5, 258.8 µs (N=9)
+
+### ubuntu-24.04-arm
+
+| arm | paced CPU quiet (N=9) | paced CPU loaded (N=9) | quiet p99 µs (N=9) | loaded p99 µs (N=9) | paced parks/1000, quiet (per shard, N=6) | paced parks/1000, loaded (N=6) |
+|---|---|---|---|---|---|---|
+| main | med 2017: 1626, 1637, 1732, 2001, 2017, 2021, 2022, 2022, 2023 | med 950: 859, 864, 918, 928, 950, 952, 966, 972, 1002 | med 23.3: 23.1, 23.1, 23.1, 23.1, 23.3, 23.7, 23.7, 23.9, 24.0 | med 9.8ms: 7.9ms, 9.0ms, 9.1ms, 9.8ms, 9.8ms, 9.9ms, 10.0ms, 10.0ms, 10.0ms | 0, 0, 0, 16, 172, 362 | 0, 0, 0, 0, 0, 0 |
+| x100 (mean) | med 1610: 1584, 1590, 1608, 1609, 1610, 1707, 2005, 2020, 2022 | med 965: 813, 907, 940, 941, 965, 989, 1028, 1042, 1058 | med 23.4: 22.9, 23.3, 23.3, 23.3, 23.4, 23.9, 24.4, 25.1, 26.0 | med 8.0ms: 6.9ms, 6.9ms, 7.0ms, 7.7ms, 8.0ms, 8.9ms, 9.9ms, 9.9ms, 12.1ms | 0, 0, 12, 315, 341, 398 | 0, 0, 0, 0, 0, 0 |
+| option 2 | med 198: 193, 194, 194, 195, 198, 198, 202, 203, 224 | med 318: 289, 289, 295, 306, 318, 360, 440, 516, 524 | med 24.1: 23.1, 23.5, 23.9, 23.9, 24.1, 24.3, 24.9, 24.9, 25.2 | med 4.0ms: 2.9ms, 3.0ms, 3.1ms, 3.1ms, 4.0ms, 4.0ms, 6.2ms, 6.4ms, 6.7ms | 808, 908, 909, 947, 1018, 1044 | 1606, 1836, 1843, 1848, 2344, 2535 |
+| option 3 | med 396: 383, 391, 394, 395, 396, 398, 399, 405, 408 | med 406: 362, 388, 394, 401, 406, 410, 414, 446, 452 | med 24.0: 22.9, 23.4, 23.6, 23.9, 24.0, 24.1, 24.3, 25.2, 26.0 | med 3.7ms: 3.6ms, 3.7ms, 3.7ms, 3.7ms, 3.7ms, 4.0ms, 4.6ms, 5.0ms, 5.8ms | 844, 844, 863, 952, 984, 988 | 1560, 1652, 1822, 1994, 2030, 2250 |
+
+Boot probe floor (idle window at boot / 100), option 2 arm: quiet 6.3, 6.5, 6.6 µs; loaded 12.0, 19.3, 346.0 µs
+All rules-binary boots: quiet floor 5.4, 6.3, 6.4, 6.4, 6.4, 6.4, 6.5, 6.6, 6.6 µs (N=9); loaded floor 8.2, 12.0, 19.3, 43.9, 45.3, 70.6, 87.4, 323.8, 346.0 µs (N=9)
+
+### macos-latest
+
+| arm | paced CPU quiet (N=9) | paced CPU loaded (N=9) | quiet p99 µs (N=9) | loaded p99 µs (N=9) | paced parks/1000, quiet (per shard, N=6) | paced parks/1000, loaded (N=6) |
+|---|---|---|---|---|---|---|
+| main | med 304: 105, 121, 129, 275, 304, 310, 317, 332, 333 | med 172: 64, 68, 72, 148, 172, 176, 353, 397, 510 | med 350.8: 273.7, 281.4, 287.6, 292.9, 350.8, 355.4, 584.4, 608.3, 690.3 | med 3.9ms: 3.2ms, 3.3ms, 3.7ms, 3.9ms, 3.9ms, 3.9ms, 4.0ms, 4.1ms, 4.1ms | 459, 587, 589, 665, 1158, 1230 | 0, 30, 639, 860, 1093, 1212 |
+| x100 (mean) | med 328: 153, 210, 293, 309, 328, 337, 337, 348, 384 | med 132: 82, 90, 108, 131, 132, 133, 501, 503, 536 | med 298.5: 242.7, 262.0, 269.8, 273.5, 298.5, 299.1, 312.3, 350.8, 589.8 | med 3.8ms: 3.4ms, 3.4ms, 3.7ms, 3.7ms, 3.8ms, 3.9ms, 3.9ms, 3.9ms, 4.1ms | 490, 628, 707, 712, 722, 769 | 0, 90, 804, 884, 1000, 1147 |
+| option 2 | med 95: 85, 88, 90, 92, 95, 96, 98, 106, 112 | med 84: 60, 71, 73, 74, 84, 88, 94, 98, 99 | med 273.7: 242.2, 245.4, 246.7, 266.9, 273.7, 274.0, 284.8, 299.5, 527.8 | med 3.7ms: 3.0ms, 3.5ms, 3.5ms, 3.6ms, 3.7ms, 3.8ms, 3.8ms, 3.8ms, 3.9ms | 1390, 1400, 1498, 1640, 1658, 1756 | 1301, 1318, 1338, 1690, 1736, 1775 |
+| option 3 | med 97: 75, 83, 92, 95, 97, 104, 104, 109, 123 | med 81: 36, 48, 68, 75, 81, 82, 85, 95, 96 | med 282.1: 260.3, 268.1, 273.2, 282.0, 282.1, 302.5, 517.9, 569.5, 709.0 | med 3.8ms: 2.2ms, 2.6ms, 3.5ms, 3.6ms, 3.8ms, 3.8ms, 3.9ms, 4.0ms, 4.0ms | 1343, 1404, 1453, 1552, 1583, 1656 | 1146, 1251, 1426, 1456, 1646, 1670 |
+
+Boot probe floor (idle window at boot / 100), option 2 arm: quiet 0.9, 1.0, 1.0 µs; loaded 0.7, 0.8, 0.8 µs
+All rules-binary boots: quiet floor 0.9, 0.9, 1.0, 1.0, 1.0, 1.3, 1.3, 2.3, 2.8 µs (N=9); loaded floor 0.7, 0.7, 0.8, 0.8, 0.8, 1.0, 1.0, 1.2, 1.2 µs (N=9)
+
+**What it shows.**
+- **Linux and macOS: option 2 meets (a)-(d).** Paced CPU quiet fell from main's 1,451-2,023 to 155-224 thousandths of a core on Linux. Quiet p99 stays within main's spread. Loaded p99 halved (8.0 → 4.0 ms on x86_64, 9.8 → 4.0 ms on arm64). The owner parks under the paced form while loaded (1,537-2,535 per 1,000), where main's never does.
+- **Option 3 is measured and rejected.** It is no better than option 2 on any criterion, and its paced CPU on Linux is about twice option 2's (356-408 against 155-224 quiet).
+- **The loaded boot inflates option 2's input.** A Linux daemon booted beside two spinners a CPU read the probe's smallest wake at 6.8-259 µs (x86_64) and 8.2-346 µs (arm64), past F in 5 of 9 boots on each runner, against 5.4-6.6 µs quiet. So the boot minimum cannot be trusted under load, and option 2 becomes W = F alone. Windows' loaded boots read 4.7-10.1 µs and macOS's 0.7-2.8 µs.
+- **Windows: option 2 fails (c).** A shard parked under two spinners a CPU pays a wake of 50-100 ms on every request. On windows-latest the loaded single-client p99 was 97-100 ms in all nine runs, against x100's median 127 µs and main's 129 µs. Every loaded option 2 run, and two of three loaded option 3 runs, ran past the bench's 1,500 s limit before the paced form. On windows-11-arm the loaded p99 was 47.8-56.2 ms, against x100's median 125 µs. Windows' paced CPU was already low on main (29-69 quiet), and option 2 keeps it there (20-67 quiet), so a short window buys little on Windows and costs its loaded tail. This repeats A-218's Windows finding.
+- **The rule for Windows is the supervisor's decision** (A-223 plan, 2026-11-09). The choices are W = F on Linux and macOS with x100 kept on Windows, W = F everywhere, or a Windows window measured first.
+- **Decided (the supervisor, 2026-11-11): the first choice, with Windows' own window as the follow-up.** The idle window is `max(F, wake estimate × loaded_wake_ratio())`, F = R9's 50 µs (`config::PROVISION_FLOOR`) and the multiple 0 on Linux and macOS, 100 on Windows (`config::idle_window_ns`; SLATES_DESIGN, A-223's window rule). Option 2's boot-floor term is measured and rejected, by the loaded boots above. Option 3 is measured and rejected, by its paced CPU.
+
+## The idle window's rule as built: F on Linux and macOS, ×100 kept on Windows (A-223 step 4; R9; CI; 2026-11-12)
+
+**What it is.** The rule above as built (`config::idle_window_ns`, `max(F, wake estimate × loaded_wake_ratio())`, F = 50 µs), measured on its own tree: the plan's bar for step 4 was a 1 ms-paced client at two shards, quiet, costing at most 150 thousandths of a core on Linux and Windows.
+
+**Command** (diag-liveness-37, the branch at 8adeaf04 plus the rule): `provision_bench` built `--release`, `PROVISION_BENCH_SHARDS=2`, three rounds quiet then three with two spinning shell loops per logical CPU, each round three runs; the same job ran fmt, `cargo xtask check`, clippy, the machine and rt suites, the rule's table test, `wake_estimate`, `forward_retry` and the paced-client test (`crates/server/tests/idle_window.rs`, three times, Linux and macOS). Every CI runner has 4 CPUs.
+
+| runner | paced CPU quiet (N=9) | paced CPU loaded (N=9) | quiet single-client p99 µs (N=9) | loaded single-client p99 (N=9) |
+|---|---|---|---|---|
+| ubuntu-latest | 197, 219, 188, 198, 196, 206, 196, 208, 214 | 325, 310, 317, 353, 336, 330, 325, 336, 330 | 28.7, 28.8, 27.9, 29.2, 28.6, 27.8, 31.5, 29.9, 28.6 | 4.00, 4.00, 3.08, 4.00, 2.91, 0.36, 4.06, 3.37, 4.00 ms |
+| ubuntu-24.04-arm | 198, 217, 192, 204, 210, 193, 197, 201, 214 | 306, 361, 337, 314, 302, 293, 337, 365, 303 | 24.9, 23.5, 22.3, 23.6, 24.4, 25.8, 24.9, 25.8, 24.1 | 5.60, 3.11, 3.81, 4.00, 3.12, 0.34, 4.00, 3.01, 3.22 ms |
+| windows-latest | 208, 341, 291, 178, 251, 221, 227, 334, 307 | 785, 779, 777, 772, 774, 774, 775, 776, 774 | 82.2, 82.2, 53.8, 84.2, 78.5, 59.2, 84.2, 86.7, 59.2 | 56.8 ms, 127 µs, 128 µs, 79.0 ms, 124 µs, 148 µs, 85.1 ms, 111 µs, 145 µs |
+| windows-11-arm | 156, 148, 166, 137, 146, 131, 283, 257, 287 | 743, 734, 740, 728, 744, 752, 744, 743, 731 | 1,313.0, 76.8, 155.8, 38.8, 30.3, 28.7, 35.4, 30.2, 32.4 | 30.6 ms, 90 µs, 26.3 ms, 26.1 ms, 140 µs, 37.1 ms, 92 µs, 128 µs, 128 µs |
+| macos-latest (3 CPUs) | 121, 89, 93, 78, 88, 90, 101, 97, 102 | 119, 90, 60, 75, 83, 68, 85, 80, 74 | 287.0, 450.4, 289.7, 278.1, 248.6, 258.9, 382.5, 292.5, 220.8 | 3.77, 3.95, 3.80, 3.70, 3.77, 3.63, 3.55, 3.48, 1.90 ms |
+
+The paced-client test failed 6 of 6 on Linux before the rule (diag-liveness-36: each shard's window 27.4–84.4 ms against 0.69–1.53 ms at boot, its estimate 274–844 µs against a 6.9–15.3 µs prior) and passed 6 of 6 with it. Every gate and suite above passed on all four runners.
+
+**What it shows.**
+- **The 150-thousandths bar is not met, on Linux or on Windows.** Linux reads 188–219 quiet, as step 3's option 2 read 155–224: on a quiet boot that rule's window was F too, so this is the same window measured again. Two shards spinning F after each request (with the forward to the other shard), plus the client's own spin, cost about 0.2 core at a 1 ms pace; the bar's own bound, 2 shards × (W + B) / 1 ms, is 0.11 core before the client. What a shorter window gives up in p99 is step 6's sweep.
+- **Linux's loaded cost fell by two thirds.** Loaded paced CPU 293–365 against main's 859–1,051 (step 3), and the loaded single-client p99 0.34–5.60 ms against main's 7.0–10.0 ms.
+- **macOS meets the bar**: 60–121 thousandths of a core quiet or loaded. Its quiet p99 (221–450 µs) is main's (274–690 µs in step 3): macOS's idle spin naps about 15 µs a harvest (A-218), which neither rule changes.
+- **The paced-client test's non-vacuity bound is the estimate passing its boot prior, not a multiple of it.** At ten times the prior one macOS run of three missed (5.9 times, diag-liveness-37); at four, three of ten missed (1.06–1.8 times, diag-liveness-38), every window held at F. With the window at F the shards stop spinning and stop queueing each other's wakes, so the estimate rises far less than under ×100 (23–200 times). A window priced on the estimate passes its boot value as soon as the estimate passes the prior, so that is the bound that tells the rules apart.
+- **Windows is ×100, unchanged.** Its window is the estimate's multiple wherever that passes F (a 7–18 µs estimate gives 0.7–1.8 ms), so it computes what step 3's ×100 arm did, and its paced CPU sits in that arm's spread (177–435 quiet, 693–782 loaded). windows-latest's quiet p99, 53.8–86.7 µs against the ×100 arm's 31.4–39.9 µs, comes from identical window arithmetic; it is recorded as the runner's, and step 6 measures the arms interleaved on one runner.
+
+## The idle window's rule at three and more shards: R9's floor alone fails a closed loop; a fixed S-scaled window fails a paced client (A-223 step 6, A-326; R9; CI and adacachy2; 2026-11-12)
+
+**What it is.** The plan's step 6 ran the rule as built (`adb383f26`) against main (`29ef4521`) at each runner's
+derived shard count as well as two, and then two shard-scaled windows, on CI and on adacachy2. It found what A-326
+fixes. Recorded by goal g234 (2026-11-18) from liveness's notes, which keep every table whole
+(`~/.cache/slates-agents-scratch/a223/step6-*.md` on the supervisor's Mac).
+
+**Command.** `provision_bench` built `--release` for each arm, `PROVISION_BENCH_SHARDS` unset (derived) or 2; three
+rounds, arms interleaved, quiet and then with two spinning shell loops per logical CPU, each round three runs a job
+(diag-liveness-42, -43, -44: ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-latest, 4 CPUs, 3 on
+macOS). The shard-scaled arms are the rule's tree with a diagnostics-only `SLATES_DIAG_WINDOW_PER_SHARD=k` setting the
+floor to `k × F × shards` (15add74a, never on main). adacachy2: `abc-adacachy2.sh` (kiln r11, 32 CPUs, Linux,
+2026-11-12 19:47–19:57 UTC, the machine shared, load 3.8 to 16 in the quiet rounds), at its 15 derived shards.
+
+ubuntu-24.04-arm at its 3 derived shards, quiet (diag-liveness-42; µs):
+
+| arm | single-client p99 (N=9) | paced CPU, thousandths of a core (N=9) |
+|---|---|---|
+| main | 25.1, 26.5, 27.0, 27.0, 27.1, 27.1, 27.2, 27.5, 29.0 | 1776, 1788, 1853, 1950, 1977, 2108, 2203, 2414, 2556 |
+| ×100 (A-223 alone) | 26.9, 27.2, 27.5, 27.6, 28.0, 28.3, 29.0, 30.6, 32.4 | 1765, 1766, 1778, 1804, 1947, 2148, 2154, 2420, 2620 |
+| the rule (F) | 41.0, 43.6, 44.4, 113.9, 116.4, 118.3, 119.1, 119.3, 121.9 | 202, 204, 212, 217, 221, 228, 238, 239, 246 |
+
+The same runner, quiet, the shard-scaled windows (diag-liveness-43 and -44; spinning-form parks per 1,000 creates summed
+over the shards: 144–331 at F, 3–7 at `F × S`):
+
+| arm | single-client p99 (N=9) | paced CPU (N=9) |
+|---|---|---|
+| main (-43) | 25.6, 25.8, 26.6, 26.8, 27.5, 28.7, 28.8, 31.5, 32.4 | 1713, 1734, 1762, 1765, 1848, 1869, 1872, 1944, 1998 |
+| F (-43) | 44.8, 47.2, 113.3, 113.9, 114.7, 116.1, 121.8, 122.2, 140.1 | 203, 218, 221, 222, 223, 225, 235, 239, 249 |
+| F × S (-44) | 30.0, 33.7, 36.2, 36.4, 36.8, 37.1, 40.5, 212.6, 214.7 | 353, 357, 359, 364, 365, 369, 377, 380, 384 |
+| 2F × S (-44) | 26.7, 27.4, 29.0, 29.0, 29.5, 29.6, 31.0, 34.9, 363.7 | 567, 567, 571, 581, 584, 589, 597, 599, 604 |
+| 4F × S (-44) | 25.0, 25.4, 25.6, 26.2, 28.2, 30.6, 30.9, 31.9, 33.6 | 999, 1008, 1013, 1016, 1017, 1023, 1030, 1032, 1035 |
+
+adacachy2 at 15 derived shards, quiet (N=9 each; paced CPU in thousandths of a core):
+
+| arm | single-client p99 µs | paced CPU |
+|---|---|---|
+| main | 26.5, 34.4, 35.8, 47.2, 102.0, 113.2, 123.2, 126.9, 311.4 | 298, 352, 357, 640, 664, 728, 788, 794, 910 |
+| F | 83.4, 89.6, 105.1, 105.5, 106.7, 107.1, 108.4, 110.4, 116.8 | 171, 180, 194, 199, 222, 224, 226, 232, 237 |
+| F × S | 21.2, 22.0, 24.2, 24.6, 24.6, 26.1, 38.0, 41.0, 89.1 | 1349, 1350, 1354, 1356, 1386, 1389, 1399, 1400, 1407 |
+| 2F × S | 21.5, 23.9, 24.6, 25.0, 25.3, 27.8, 30.3, 34.3, 57.0 | 2265, 2266, 2272, 2288, 2289, 2291, 2313, 2320, 2325 |
+
+**What it shows.**
+- **R9's floor alone fails a closed loop over three or more shards.** At three shards the rule's p99 split into runs of
+  41–44 and 114–122 µs against main's 25–32. A create goes to the partition its name hashes to, so an owner hears from
+  the loop only after it has gone round the others, past F, and parks; main's window (the estimate × 100) kept every
+  owner polling. At two shards the bench's sequential names alternate the two partitions, so every owner returns within
+  F there and the failure did not show; arbitrary names would have shown it.
+- **A fixed shard-scaled window fixes the loop and spends it on a paced client too.** `2F × S` held main's spread at
+  three shards (29.5 µs), but a 1 ms-paced client then cost 584 thousandths of a core there and 2,289 at fifteen shards,
+  against main's 664 and F's 222. No fixed window met every criterion; the shard that reads a request is the one place
+  that can tell a closed loop from a paced client.
+- **Main fails R9 at fifteen shards already** (p99 median 102 µs); `F × S` brought it to 24.6 µs there.
+- **A-326** (§4.7) holds only a closed loop's shards, for its return at R9's percentile, never longer than the loop had
+  run (1.2 ms at three shards, 6.7 ms at fifteen, `2F × k`). Owed, the supervisor's runs on main: these tables again on
+  the built rule, with the spinning form's parks per 1,000 at three shards and the paced form's CPU, against main's
+  rows above (GAPS, A-223's entry).
 
 ## A-228 step 5: two weight-1 rungs on main, invalid, frozen (2026-11-09, fixtures)
 
@@ -12881,3 +13041,239 @@ records of about 135.5 MB), `held_back.whole` 11 to 16, `batches` 5 to 102 carry
   build over the volume in one turn is the candidate (GAPS records the live log's whole entry as a one-turn walk of a
   whole volume, and `install_built` and `install_image` rose with it). Under an anchor the daemon would be restarted,
   which is still an outage of every writer's connection.
+
+## The reply carrier at 3,000 and 10,000 clients: no reply lost after it; 57 lost and a hung run before it at 10,000 (A-296; goal 238; 2026-11-18)
+
+**What it is.** Goal 238's measurement of A-296 (every cross-shard reply waits for room, carried by a per-shard carrier,
+never dropped): the many-client rung on main just before the carrier landed (`8c9f05404`) against its landing
+(`d0e737b8d`). Both carry W1, so a green's works are served on the shards their names hash to.
+
+**Environment.** Mac Studio adas-mac-studio.local-2 (Apple M3 Ultra, 32 cores, 96 GiB, macOS 26.4), release (LTO)
+`load_bench` of each commit built there with Rust 1.98.1, 2026-11-18 10:11 to 10:34 UTC. Shared with other agents' work:
+the one-minute load average at each run's start is in the table. Linux v7.4-rc1 (6628e7d4) `kernel/`, 754 files.
+
+**Command.** `load_bench --tree <linux-v7.4-rc1>/kernel --clients N --hot-files 0.8N --per-connection 32 --rounds 3
+--reply-patience 60` (think time 0, the in-process daemon, which derived 23 shards), under `/usr/bin/time -l`. The
+`lost` rows are the daemon's counters read at the end of the run; `room` is the carrier's waits for room. Every run:
+
+| clients | build, round | load at start | wall s | verdicts/s | `xshard.reply_dropped` | room waits begun / ended (peak) | p99 ms: Edit / Accepted / Conflict / Rebase |
+|---|---|---|---|---|---|---|---|
+| 3,000 | before, 1 | 12.9 | 10 | 7,832 | 0 | (none in this build) | 91.3 / 106.7 / 114.6 / 110.8 |
+| 3,000 | after, 1 | 15.2 | 9 | 11,447 | 0 | 0 / 0 | 46.8 / 62.8 / 64.2 / 64.2 |
+| 3,000 | after, 2 | 18.0 | 6 | 13,427 | 0 | 0 / 0 | 41.8 / 49.5 / 63.3 / 53.2 |
+| 3,000 | before, 2 | 17.7 | 5 | 13,702 | 0 | | 49.8 / 61.8 / 71.8 / 59.9 |
+| 3,000 | before, 3 | 18.8 | 5 | 12,591 | 0 | | 44.0 / 48.6 / 64.9 / 51.3 |
+| 3,000 | after, 3 | 20.8 | 5 | 13,729 | 0 | 0 / 0 | 49.0 / 63.4 / 69.7 / 63.2 |
+| 10,000 | before, 1 | 15.9 | 31 | 12,213 | 0 | | 170.5 / 175.1 / 197.0 / 187.8 |
+| 10,000 | after, 1 | 25.2 | 62 | 5,440 | 0 | 6,576 / 6,576 (106) | 443.8 / 440.8 / 495.4 / 491.9 |
+| 10,000 | after, 2 | 41.0 | 32 | 11,446 | 0 | 6,358 / 6,358 (41) | 208.7 / 213.6 / 247.0 / 232.0 |
+| 10,000 | before, 2 | 37.6 | hung | | **57** (read live) | | |
+
+Every other `lost` counter read 0 in every completed run, and the oracle found nothing in any. The 10,000-client runs
+had 1,737 to 1,908 clients starved past the harness's resolutions (10,000 clients over 8,000 hot picks). The hung run
+progressed as its sibling did until about 40 s; from then to 545 s seven of its eight harness workers sat 2 to 6 agents
+short of done with their requests unanswered (one worker stopped reporting at 35 s), and the live daemon's
+`slates status`, read with `8c9f05404`'s own CLI built for it, counted `xshard.reply_dropped` 57. The harness was then
+ended (its own process, so no end-of-run rows).
+
+**What it means.**
+- **After the carrier, no reply was lost in 5 runs** at 3,000 and 10,000 clients; at 10,000 the carrier waited for room
+  6,358 and 6,576 times a run and ended every wait.
+- **Before it, the 3,000-client rung no longer drops** once W1 is in (0 in three runs), so the "about 4,200 a run" of
+  main `db9c514e` is not reproduced at this rung; at 10,000 clients one run of two lost 57 replies and hung, each lost
+  reply a client waiting for good (A-232).
+- The latencies above move with the box's load (one after-run met load 41 and took twice the wall), not with the
+  build: the carrier's cost does not show at this resolution.
+
+## A many-shard start under load, and where the starting thread's time goes at 407 shards (A-311, A-312; goal 254; 2026-11-18)
+
+**What it is.** Goal 254's owed runs: `a_start_whose_shards_sum_past_a_window_comes_up` (`crates/cli/tests/cli.rs`) under
+load on main before A-311 and A-312 (`f5b85d27b`) and after them (`7d760c4ea`), and the starting thread's CPU by phase
+at 407 shards, which the goal's notes held to be `connect_pairs` by arithmetic alone.
+
+**The test under load.** Release `cli` test binaries of each commit, each in its own target directory,
+`SLATES_TEST_CLI=1 <cli> a_start_whose_shards_sum_past_a_window_comes_up --exact --nocapture`, the arms run A B B A A B.
+The test measures one shard's share of a start and asks enough shards to sum past three liveness windows, so the shard
+count is the machine's:
+
+| where (2026-11-18 UTC) | load | shards asked | before `f5b85d27b` | after `7d760c4ea` |
+|---|---|---|---|---|
+| GitHub `ubuntu-latest`, 4 vCPU, two spinning loops a CPU (diag run 44279195223, 10:02) | 2.8-4.4 | 64-73 | 3 of 3 pass | 3 of 3 pass |
+| GitHub `ubuntu-24.04-arm`, 4 vCPU, the same (09:58) | 2.4-13.6 | 48-140 | 3 of 3 pass | 3 of 3 pass |
+| Mac Studio adas-mac-studio.local-2, 32 cores, the box's own load (10:40) | 12.1-12.6 | 30-35 | 3 of 3 pass | 3 of 3 pass |
+| GitHub `macos-latest`, 3 vCPU (10:39) | 6.3-13.1 | 756-1,959 | 0 of 3 (1,346-1,959 shards) | 1 of 3 (756 passed; 1,308 and 1,356 failed) |
+
+A shard's share of a start was 42 to 63 ms of CPU on the Linux runners, 86 to 101 ms on the Studio and 1.5 to 4.0 ms on
+`macos-latest`. Every `macos-latest` failure is the runtime's own limit, not a start kill: "start: runtime: too many
+shards: at most 1024 per process", the daemon's exit 4 and the anchor's crash loop, then "served false, the anchor's
+start kills []". The test does not cap the count it derives at the runtime's 1,024 shards a process.
+
+**The starting thread at 407 shards.** `slates daemon --quick --shards 407` of `7d760c4ea`, five starts on the Studio at
+load 17 to 47, with an uncommitted diagnostic that read the starting thread's own CPU clock (`CLOCK_THREAD_CPUTIME_ID`)
+and the wall at slates-rt's phase boundaries. Milliseconds of that thread's CPU:
+
+| phase | starts 1 / 2 / 3 / 4 / 5 |
+|---|---|
+| registrations | 1.37 / 1.83 / 1.34 / 1.65 / 1.24 |
+| `connect_pairs` (407 × 406 rings) | 43.9 / 119.2 / 73.9 / 120.9 / 29.0 |
+| spawn | 4.6 / 6.5 / 5.5 / 4.7 / 4.2 |
+| readiness | 0.06 / 0.10 / 0.06 / 0.04 / 0.05 |
+
+Wall followed CPU within 2% in each phase. The start beat 166,873 times (S² + 3S + 3) before the watchdog took the beat
+over. Each start served 2.25 to 2.75 s after launch, by when the process had run 31.5 to 55.6 s of CPU, the 407 shard
+threads' own starts.
+
+**What it means.**
+- **`connect_pairs` is the starting thread's long unit:** 80 to 94% of its start, 29 to 121 ms here, inside the 1 s
+  window by an order of magnitude on this Mac.
+- **No run here reproduced the red these changes fixed** (B10's start kills at 367 to 407 shards on a 32-thread Linux
+  box at load 70): the machines that ran asked 30 to 140 shards, or more than the runtime allows. That run is still owed
+  on a 32-thread Linux box under load.
+- **The test is unrunnable where a shard starts cheaply:** past 1,024 shards it fails on the runtime's limit, both
+  before and after the change (reported to goal 254).
+
+## The verdict cut on large files, measured in the daemon: even, because the rung never takes the path it cut (g222's perf-decide; 2026-11-18)
+
+**What it is.** The daemon A/B owed since perf-decide landed (0b14033e7; "What a verdict compares and copies" above):
+the owner's CPU a verdict and the loaded p99 at a rung whose hot files are 256 KiB to 1 MiB, main before the cut
+(`9b6b35fb3`) against its merge (`b7c294959`). Both predate W1, so every work is served on its green's owner shard.
+
+**Environment.** Mac Studio adas-mac-studio.local-2 (Apple M3 Ultra, 32 cores, 96 GiB, macOS 26.4), 2026-11-18 10:12 to
+10:15 UTC, shared (load 19.4 to 36.9). Release (LTO) `slates` and `load_bench` of each commit built there, each with the
+same temporary owner-CPU diagnostic (perf's `owner_cpu_patch.py`, never committed: the thread's CPU around each submit
+and rebase served on the green's owner shard, logged as `OWNERCPU` at each reap tick). The tree: every file of Linux
+v7.4-rc1 between 256 KiB and 1 MiB (249 files, mostly AMD register headers), three times over in `a/`, `b/` and `c/`
+(APFS clones), 747 files of 262,291 to 1,013,732 bytes, median 372,461, 346,959,825 bytes in all.
+
+**Command.** The anchored recipe (`rung.sh`: a fresh `slates anchor --quick` per run, root bootstrapped), then
+`load_bench --instance <i> --tree <large> --clients 1000 --hot-files 800 --per-connection 32 --rounds 3
+--reply-patience 60 --think-us 0`; the arms A B, B A, A B, B A, A B. Every run:
+
+| run | build | wall s | verdicts/s | accepted / conflicts | owner µs a verdict | owner µs a rebase | p99 ms: Edit / Accepted / Conflict | `TableAtCapacity` refusals: Edit / Rebase / Submit |
+|---|---|---|---|---|---|---|---|---|
+| 1 | before | 19 | 1,555 | 2,217 / 3,253 | 102.0 | 110.1 | 227.0 / 227.7 / 227.8 | 67 / 225 / 15 |
+| 1 | after | 16 | 1,699 | 1,835 / 2,525 | 103.2 | 118.8 | 152.5 / 140.4 / 141.4 | |
+| 2 | after | 19 | 2,031 | 383 / 897 | 93.1 | 149.4 | 148.7 / 72.9 / 73.4 | 828 / 139 / 1 |
+| 2 | before | 17 | 2,026 | 386 / 889 | 100.3 | 152.2 | 146.0 / 86.6 / 87.1 | 876 / 77 / 15 |
+| 3 | before | 16 | 1,930 | 386 / 897 | 87.1 | 152.6 | 143.1 / 93.4 / 93.1 | |
+| 3 | after | 16 | 1,434 | 2,058 / 2,998 | 109.5 | 113.6 | 207.0 / 199.5 / 203.9 | |
+| 4 | after | 18 | 1,349 | 2,346 / 3,675 | 104.2 | 113.7 | 193.8 / 195.1 / 194.9 | |
+| 4 | before | 17 | 1,896 | 2,276 / 3,404 | 95.3 | 94.5 | 130.6 / 122.8 / 122.7 | |
+| 5 | before | 14 | 2,334 | 413 / 894 | 84.0 | 118.0 | 127.6 / 82.0 / 82.7 | |
+| 5 | after | 13 | 1,814 | 1,528 / 2,086 | 94.6 | 104.0 | 128.4 / 126.4 / 126.2 | |
+
+Blank refusal cells were not read out for that run; every run's level ended early on capacity: 1,000 works writing
+256 KiB-to-1 MiB files filled a table of the owner's shard, edits were refused `TableAtCapacity`, and the level either
+stopped at about 385 accepted versions (wall about 0.6 s of level) or ran to about 2,000 (about 3.5 s). The oracle found
+nothing in any run; no reply was lost (the anchored daemon's counters).
+
+**What it means.**
+- **Even.** The owner spent 84.0 to 102.0 µs a verdict before the cut and 93.1 to 109.5 µs after it: no gain, at about
+  2.5 times what a verdict costs at `kernel/`'s 21 KiB files (37.1 to 39.3 µs on main, the table above).
+- **Why even: the rung never takes the cut path** (read from the engine, not measured): `Green::merge_content` sends an
+  overlapping overwrite to pass two's byte compare and only a length-changing op to the whole-file identity check
+  (`lands_on_head`) that perf-decide made follow the change; `load_bench`'s edits are slot-aligned overwrites. The
+  engine bench (`verdict_bench`, a delete and an insert) is the only measurement of the cut until a workload makes
+  length-changing edits.
+- **The large-file rung is capacity-bound before it is CPU-bound** on one owner shard: its first wall is the table its
+  works fill, not the verdict.
+
+## A full edit and merge after W1 and the reply carrier: even on one shard, slower on every runner with more (goal 222; A-247, A-296; 2026-11-18)
+
+**What it is.** Goal 222's owed A/B: the loaded p99 and p999 of a single client's full edit and merge (`edit_merge_bench`,
+an edit of 64 bytes of a 4 KiB file and its submit to the green's verdict) on main before W1 and the reply carrier
+(`8dff8fcad`) and after both (`d0e737b8d`), on Linux, macOS and Windows, interleaved. Where the A/B moved, a second run
+with four arms named the landing: `8dff8fcad`, `3c0af9399` (W1 landed), `d0e737b8d` (A-296 landed) and `7d760c4ea`
+(main at the time).
+
+**Environment.** GitHub runners from diagnostics branches never merged, 2026-11-18 09:07 to 10:52 UTC: run 44272914208
+(two arms, all five runner kinds), 44279913406 (four arms, `ubuntu-24.04-arm` and `windows-11-arm`), 44283060368 (four
+arms, `macos-latest`). Every runner has 4 vCPUs (`macos-latest` 3); the in-process daemon derived 1 shard on the x86_64
+runners, 3 on the arm64 ones and 2 on `macos-latest`. Each arm's harness built release from its own source extract.
+Loaded on Linux is the controlled load of A-224: a `systemd-run --user --scope` capped at two CPUs and 256 MB, two
+spinning threads per core of the machine (8), and a sibling writer that fsyncs 16 MiB again and again; on macOS and
+Windows, the harness's own two spinning threads a core. Quiet ran right after, nothing else on the runner.
+
+**Command.** `edit_merge_bench --loaded-only --spinners-per-core 2 --files 10 --form accept --form conflict` and
+`edit_merge_bench --quiet-only --files 10 --files 1000 --form accept --form conflict`. Each invocation is 3 runs of up to
+1,000 samples; each cell below is the invocation's median over its 3 runs, as its `goal` line prints it; the arms were
+rotated each round, three rounds, and every round is inside the ranges shown. `--files 10`, microseconds unless marked:
+
+| runner (shards) | form | `8dff8fcad` p50 / p99 | `3c0af9399` (W1) | `d0e737b8d` (+ A-296) | `7d760c4ea` (main) |
+|---|---|---|---|---|---|
+| Linux x86_64 (1) | loaded accept | 14-15 / 4.3-9.0 ms | | 15-17 / 6.2-8.5 ms | |
+| Linux x86_64 (1) | quiet accept | 13 / 21-31 | | 13-17 / 21-30 | |
+| Windows x86_64 (1) | loaded accept | 33-35 / 70-71 | | 34-35 / 66-70 | |
+| Windows x86_64 (1) | quiet accept | 28-29 / 66-71 | | 28-31 / 65 | |
+| Linux arm64 (3) | loaded accept | 4.0-8.1 ms / 21.0-21.3 ms | 12.1-19.0 ms / 38.9-45.0 ms | 16.0-19.1 ms / 39.0-41.9 ms | 14.0-18.9 ms / 37.0-41.0 ms |
+| Linux arm64 (3) | quiet accept | 18 / 36-40 | 53-54 / 76-88 | 50-52 / 77-82 | 51-52 / 78-85 |
+| Linux arm64 (3) | quiet conflict | 15 / 34-35 | 55-58 / 82-88 | 51-55 / 75-81 | 49-55 / 76-84 |
+| Windows arm64 (3) | loaded accept | 29-32 / 106-129 | 71-72 / 23.4-42.6 ms | 66-78 / 46.7-164.8 ms | 67-78 / 45.2-162.8 ms |
+| Windows arm64 (3) | quiet accept | 24-28 / 55-62 | 67-80 / 117-152 | 61-78 / 107-132 | 65-70 / 110-118 |
+| macOS arm64 (2) | loaded accept | 70-76 / 5.7-7.9 ms | 306-319 / 14.6-16.1 ms | 260-349 / 13.6-21.2 ms | 238-279 / 13.1-14.7 ms |
+| macOS arm64 (2) | quiet accept | 105-108 / 221-231 | 97-106 / 233-240 | 106-128 / 238-344 | 93-109 / 220-241 |
+| macOS arm64 (2) | quiet conflict | 103-110 / 219-265 | 246-328 / 769-918 | 248-254 / 681-728 | 247-271 / 671-806 |
+
+The p999s follow the p99s: Linux x86_64 loaded 9.0-12.0 ms on both arms, Windows x86_64 loaded 0.11-10.2 ms before and
+31.8 ms in every after round, Linux arm64 loaded 24-27 ms before and 39-48 ms with W1. Under the 256 MB cap the arm64
+runners refused the 1,000-file green at capacity (`TableAtCapacity { table: "green_chains" }`), so their loaded rows are
+10 files only; the quiet 1,000-file rows moved as the 10-file ones did. No answer was wrong in any run.
+
+**On a 32-core Mac.** adas-mac-studio.local-2 (Apple M3 Ultra, 23 shards derived), 2026-11-18 10:15 to 10:19 UTC, load
+19.4 to 26.9, `--quiet-only` only (the box is shared), A B B A A B: accept p50 117-129 µs and p99 280-334 µs before,
+465-727 µs and 721-4,836 µs after; conflict p50 93-122 and p99 253-299 µs before, 353-515 and 558-805 µs after. The same
+two builds' 1,000-client rung (`load_bench --clients 1000 --hot-files 800 --rounds 3 --think-us 0`, in-process, 10:11
+UTC) went the other way: 5,177 to 5,933 verdicts a second before and 9,044 to 12,714 after, with the accept p99
+27.9-35.4 ms before and 19.0-39.5 ms after, no reply lost.
+
+**What it means.**
+- **W1 slowed the single client wherever the daemon has more than one shard**, and the reply carrier added nothing
+  measurable: a work on a shard other than its green's owner pays the hop at every edit and submit. Quiet, a 3-shard
+  runner's accept went from 18 to about 52 µs at the median (Linux arm64) and 24-28 to 61-80 µs (Windows arm64), and
+  macOS's 2-shard conflict tripled while its accept held; loaded, the p99 doubled on Linux arm64 and macOS and went from
+  about 0.1 ms to 23-165 ms on Windows arm64. On one shard the arms are even. Main still carries it.
+- **Many clients gain from W1 what one client loses:** at 1,000 clients the same build answers 1.7 to 2.2 times the
+  verdicts a second.
+- **The goal is met on no platform under load:** loaded p99 4.3-45 ms on Linux, 5.7-21 ms on macOS, 23-165 ms on Windows
+  arm64 after W1; only Windows x86_64's single shard holds its p99 near 70 µs, with a p999 of 31.8 ms.
+
+## The f = 1 launcher with a server node killed: a replica rebuilds, a primary over the whole kernel loses its green (A-313, goal 232's seeding fix; 2026-11-18)
+
+**What it is.** Goal 232's two owed chaos flows on the f = 1 topology (`crates/cli/tests/load_scale.rs`: a primary and two
+replica nodes in region 0, a client node in region 1, every verb a forward): a replica's daemon killed partway through
+the rung (`SLATES_LOADTEST_KILL_NODE=1`, A-313's rebuild of a restarted holder's replica), and the primary's
+(`SLATES_LOADTEST_KILL_NODE=0` over the whole kernel, the recovering green's origin seeded a share at a time). Each
+node is a `slates anchor --quick --fleet`, so a killed daemon is restarted by its anchor at once.
+
+**Environment.** Mac Studio adas-mac-studio.local-2 (Apple M3 Ultra, 32 cores, 96 GiB, macOS 26.4), 2026-11-18 10:47 to
+10:56 UTC, load 9.6 to 23.7. Release `load_scale` test binary of main `7d760c4ea` with the measurer's uncommitted
+addition (each server node's `slates status` merge and recovery counters printed at the rung's end), and that commit's
+release `load_bench`. Linux v7.4-rc1 (6628e7d4).
+
+**Command.** `SLATES_LOADTEST_TREE=<tree> SLATES_LOADTEST_BENCH=<load_bench> SLATES_LOADTEST_CLIENTS=1000
+SLATES_LOADTEST_ARGS="--hot-files 800 --per-connection 32 --rounds 20 --reply-patience 60 --think-us 50000"
+SLATES_LOADTEST_KILL_NODE=<n> SLATES_LOADTEST_KILL_MS=<ms> <load_scale>
+many_clients_through_client_nodes_against_one_primary_and_two_replicas --exact --nocapture`, one client node.
+
+**A replica killed (node 1, 30 s into the rung, `kernel/`, 754 files).** Passed: the harness exited 0 with no oracle
+failure after 384.8 s, 19,461 versions accepted and 45,593 conflicts (169 verdicts a second through the client node).
+The restarted replica counted `merge.replica.rebuilt` 1, `merge.replica.rebuilt_versions` 2,810 (the versions it had
+accepted before the kill), `merge.replica.seed_slices` 6,270 and `merge.replica.seeded` 1, then carried 16,685
+versions' inputs to its partner's 19,355; neither replica counted `merge.out_of_order`. Through the forward: Edit p50 238
+ms and p99 906 ms; an accepted submit p50 1.94 s and p99 6.57 s.
+
+**The primary killed (node 0, 60 s into the rung, the whole kernel, 97,254 files, 1.99 GB).** Failed. The harness's walk
+of the green through the client node took 52.5 s; the primary was killed at 60 s and restarted, and its recovery logged:
+`partition 0: volume tree not rebuilt: ResourcesUnavailable { reason: "recovered inode allowance exceeds the version
+slab: budget exceeded: 648393 bytes requested, 642045 available" }`, then `green tree-green fenced, its recovered history
+is not what was acknowledged: OriginUnavailable`. Its shard 0 initialized in 620.5 ms of wall (602.7 ms of CPU, 8 slices,
+the longest 454.5 ms), no watchdog end. The harness's next read was refused `ContentUnavailable` and it stopped; no
+`merge.recovery.origin_load_steps` was counted, since the green was fenced before any seeding. The replicas had not yet
+held version 0's inputs (`merge.inputs_unheld` 709 each).
+
+**What it means.**
+- **A-313 works under the launcher:** a replica killed mid-rung rebuilt its replica from its hold, 2,810 versions in
+  6,270 slices, and went on taking versions.
+- **A primary's crash over the whole kernel loses its green on that node:** the base tree volume no longer fits the
+  inode-version slab at recovery (by 6,348 bytes), so the green built over it is fenced. The seeding fix could not be
+  exercised; the run is owed again once the volume recovers. Reported to goal 232.

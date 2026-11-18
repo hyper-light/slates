@@ -149,7 +149,11 @@ pub struct SealJob {
   pub put_sequence: u64,
   /// The walk in progress, until the archive is complete.
   pub archiver: Option<SnapshotArchiver>,
-  /// The complete archive, kept until its content places (then dropped — the volume holds the bytes).
+  /// The envelope being made from the complete archive on a node that seals, a slice a turn of the seal walk (A-323),
+  /// until it is complete; the plain archive lives in it meanwhile.
+  pub wrapping: Option<slates_cluster::envelope::Wrapping>,
+  /// The complete archive (an envelope on a node that seals), kept until its content places (then dropped — the volume
+  /// holds the bytes).
   pub archive: Option<Archive>,
   /// The manifest identity, once the archive is complete.
   pub manifest: Option<[u8; 32]>,
