@@ -5670,6 +5670,19 @@ version.
 > read now takes 1.8 to 2.4 ms (`crate::forward_lane`; `forwards_to_one_owner_never_wait_behind_each_other`;
 > `docs/bugs/2026-11-06-forwards-to-one-owner-went-one-at-a-time.md`).
 
+> **Status (2026-11-18, A-306: a resend keeps its place in the lane).** A forward given up at its stall budget, or cut
+> off by its session's replacement, is sent again by its caller under its own ids (`verbs::resolve_and_forward`). Each
+> send took fresh tickets at the back of the peer's lane, so behind a backlog the lane begins more slowly than a stall
+> budget a resend was given up again before it was begun, while forwards first queued after it went ahead: a read
+> through a client node whose session to its owner died was refused `OwnerUnreachable` at its failover bound in 1 of 10
+> runs behind a 256-client burst, and answered after 9.2 and 9.5 s in two more (load 37 to 46). A forward's place is
+> now its first send's ticket, and its resends are queued there (`forward_lane::Place`): the lane begins forwards in
+> the order of their first send. The same read was answered in 4.1 to 6.5 s, 10 of 10 (load 27 to 33).
+> `a_resend_is_begun_ahead_of_every_forward_first_queued_after_it` and its model test hold the order, and
+> `a_read_through_a_dead_session_keeps_its_place_behind_a_burst` the read
+> (`docs/bugs/2026-11-18-a-resent-forward-lost-its-place-in-the-lane.md`). Owed: a forward still queued is given up at
+> its stall budget while its lane moves, so the backlog is cycled once a budget on the control shard (GAPS).
+
 > **Status (2026-10-07, same-region lookups).** A lookup by id now reaches its creator from any node of the
 > creator's own region, not only from another region. Before, the server forwarded only a volume homed in another
 > region, and a client of another node in the owner's region was answered `NotFound` (found on two Docker
@@ -7111,7 +7124,25 @@ command and every host start, mount and grant through one implementation.
 > in-process daemon (`crates/api/tests/api.rs`) and by a test binary that is itself the host
 > (`crates/api/tests/start.rs`, no libtest harness: its `main` serves the roles). Owed, in order:
 > an async form over a host's reactor (R6: a readiness wait and a timer over the client's driver);
-> a seam trait with a simulator and a conformance suite for hosts whose rules ask for one.
+> a seam trait with a simulator and a conformance suite for hosts whose rules ask for one (built 2026-11-18, A-310:
+> "The seam" below).
+
+**The seam (A-310).** A host whose rules reach every other product only through a trait that a simulator implements
+and one conformance suite holds both to (Hex's `CLAUDE.md` §9; kiln's `kiln-seams`) reaches slates through
+`slates_api::Volumes`: the contract's volume verbs (provision from every source, snapshot, destroy a snapshot, destroy,
+list, serve to a Shards VMM, mount, unmount, detach), each with the signature and the types the `Instance` verb of the
+same name has, so it is no second API. `Instance` implements it, and so does `SimVolumes`, an in-memory stand-in that
+answers each verb with the outcome or the typed error an instance answers for the same request: names unique, a clone
+pinning its snapshot, a green over a snapshot holding its volume (A-217), a work only over a green at its first version.
+It serves no file system: a stream it hands out is a real connected pair it never answers until a detach or the volume's
+destroy closes it, and a mount is a record of one. Its tables are bounded by its caller and refuse `Exhausted::Table`
+past that. One flow of the verbs, every outcome and refusal asserted as its typed value, runs over both
+(`crates/api/tests/api.rs`, `the_seam_conforms`).
+
+> **Status (2026-11-18, A-310).** Built: `crates/api/src/seam.rs`, `crates/api/src/sim.rs`, the contract at version 9,
+> and the suite over an in-process instance and over the simulator. A pinned snapshot's destroy reaches a consumer as
+> `Invalid::Request` with the volume core's `Pinned` as its note, untyped; the simulator answers the same, and a typed
+> class for it is owed to the contract.
 
 **The consumer contract (A-299).** Everything a consumer touches goes through `slates-api` (Ada,
 2026-11-18): provisioning and managing volumes, serving them, landing, merging, their conflicts,
@@ -7251,7 +7282,7 @@ it builds against the contract and adds to it rather than around it.
 > text reader is gone. A green's or a work volume's status had failed as a protocol fault (the merge
 > service names their watcher `merge`), and now reads with no base
 > (`docs/bugs/2026-11-18-a-greens-status-failed-in-the-contract.md`).
-> **`CONTRACT` = 9:** `StartSpec::anchor_command_under(wrapper)`, the anchor's command under a
+> **`CONTRACT` = 10** (9 is A-310's seam, landed beside it): `StartSpec::anchor_command_under(wrapper)`, the anchor's command under a
 > wrapper that execs it (`systemd-run --user --scope -- ...`, kiln's Linux start), the launcher's
 > record kept on its standard input; proven under `/usr/bin/env`, an exec wrapper, by a policy set
 > under the launcher's secret.
@@ -21430,7 +21461,8 @@ Applied in the same change to:
   `crates/api/src/mount.rs` (with pure `fuse_available`/`nfs_available` tested on every host), `lib.rs`
   (`MountKind`), `docs/library.md`, §4.12's text and status, GAPS.
 - **Owed, in order.** (1) An async form over a host's reactor (R6). (2) A seam trait with a simulator and a
-  conformance suite, for hosts whose rules ask for one (Hex's §9, kiln's `kiln-seams`). A landing plan's per-path
+  conformance suite, for hosts whose rules ask for one (Hex's §9, kiln's `kiln-seams`): built 2026-11-18, A-310. A
+  landing plan's per-path
   entries, paged, were built by A-287 the same day (`Instance::landing_entries`).
 - **Checked.** `crates/api/tests/api.rs` over a daemon in the test process: no daemon is `Unavailable`; a create before
   the group is `ConsensusNotInitialized` and the group is made twice harmlessly; create, snapshot, clone and destroy;
@@ -21816,7 +21848,7 @@ contract", new, with its status), GAPS (the A-299 entry and the Embedding librar
   (`docs/bugs/2026-11-18-a-greens-status-failed-in-the-contract.md`). `DriftReport::watcher` is a `Watcher`. Applied to
   `crates/ipc/src/protocol.rs`, `crates/server/src/{verbs,merge_service}.rs`, `crates/api/src/{volume,instance,lib}.rs`,
   `tests/api.rs`.
-- **`CONTRACT` 9, the same day (g263's ask):** `StartSpec::anchor_command_under(wrapper)`, since a host cannot take
+- **`CONTRACT` 10, the same day (g263's ask; 9 is A-310's seam):** `StartSpec::anchor_command_under(wrapper)`, since a host cannot take
   a `Command`'s standard input out to hand its wrapper's: the wrapper's words, then the anchor's program, prefix and
   role, with the launcher's record on standard input, the marker and the process group. Proven by
   `an_anchor_started_under_an_exec_wrapper_keeps_the_launchers_secret` (`/usr/bin/env` execs the anchor; a policy set
@@ -22080,3 +22112,168 @@ Applied in the same change to:
   format, trailing bytes, a vector of `u32::MAX` entries, the bound's arithmetic), the volume's three tests, and the two
   by-use tests over a real daemon named above. Owed on Shards' side: `shards restore` taking a served share and its
   real-VM test of a save and a restore over slates, after its v0.8.0 tag.
+
+### A-310 — slates-api's seam: the volume verbs as a trait an instance and a simulator implement, held to one conformance suite (2026-11-18, built for goal g268, what Hex needs from slates)
+
+Applied in the same change to:
+- §4.12: "The seam" and its status; the embedding status's owed line, and A-278's owed list, marked built. GAPS: the
+  embedding library row. `docs/library.md`: the seam's section and the owed list.
+- `crates/api`: `seam.rs` (`Volumes`, implemented by `Instance`), `sim.rs` (`SimVolumes`), `lib.rs` (the modules, their
+  exports, the crate's notes, `CONTRACT` 9), `error.rs` (`Error::of_ipc` lent to the crate, for the simulator's pair).
+  The tests: `the_seam_conforms` run by `an_instance_answers_the_seams_conformance_suite` and
+  `the_simulator_answers_the_seams_conformance_suite`, and `the_simulator_holds_what_it_was_given_room_for`
+  (`tests/api.rs`).
+
+- **Why.** Hex, kiln's scheduler and runtime, keeps its volumes on slates (its design's README; kiln's plan T7,
+  CP-T7.8 volumes through a CSI-like interface and CP-T7.13 claims on slates), and its rules reach another product only
+  through its `-api` crate, "each trait with a simulator implementation and a conformance suite both pass" (Hex
+  `CLAUDE.md` §9). Its own simulated cluster (`hex-sim`, after kwok) runs no daemon. A-278 and A-299 left the seam owed;
+  their owner (goal g262) handed it to g268 on 2026-11-18, on the condition that it add no type to the contract.
+- **The rule.** `Volumes` carries what a scheduler does with volumes and nothing it does not: provision (overlay,
+  empty, clone, green, work), snapshot, destroy a snapshot, destroy, list, serve to a Shards VMM, mount, unmount,
+  detach, each with the `Instance` verb's own signature and types. Landings, merges and write policy stay on the
+  instance. `SimVolumes` answers what an instance answers for every case the suite runs, and documents what it does
+  not do (serve bytes, mount anything); its tables are bounded by the caller's own number.
+- **Rejected: an associated type for what serving returns.** A simulator could hand out a token instead of a stream end,
+  but then the trait's `serve_shards` would not be the contract's, and a host could not move from the simulator to an
+  instance without a type changing. The simulator makes a real connected pair (`slates_ipc::stream::pair`, a duplex
+  pipe on Windows) and keeps its end unanswered, so a host's plumbing, a VMM's spawn with the end included, runs the
+  same over both.
+- **Found.** A pinned snapshot's destroy reaches a consumer as `Invalid::Request("Pinned")`: the daemon maps the volume
+  core's `Pinned` through its catch-all (`refusal_of_vfs`) to `BadRequest`. The suite asserts the class over both, and a
+  typed class is owed to the contract (told to its owner).
+- **Evidence.** The suite over an in-process daemon and over the simulator, and the simulator's bound. Owed: Hex's own
+  use of it, when Hex takes slates (its agent was idle until 2026-11-19).
+
+### A-306 — A resent forward keeps the place its first send had in the forward lane (2026-11-18, built for goal g245, a dead lent session; finding (b) of the bug record of 2026-11-09)
+Applied in the same change to:
+- §4.8 "Lookup": the status of 2026-11-18.
+- `crates/server/src/forward_lane.rs`: `Place`; each ticket's place, and the lane's queue ordered by place, then
+  ticket; `ForwardLanes::queue` and `leave` (the queue's discipline apart from the shard's state) and
+  `begin_queued_with` (apart from the session); the count `fleet.forward.resent_in_place`; the module doc.
+  `crates/server/src/fleet.rs` (`forward_batch_over_leader_session` takes the place) and `crates/server/src/verbs.rs`
+  (`resolve_and_forward` keeps one place across its resends; `forward_once` passes it).
+- Tests: `a_resend_is_begun_ahead_of_every_forward_first_queued_after_it` and the model test
+  `a_lanes_forwards_are_begun_in_the_order_they_were_first_queued` (`forward_lane.rs`), and
+  `a_read_through_a_dead_session_keeps_its_place_behind_a_burst` (`crates/server/tests/fleet.rs`).
+- GAPS: the load test's "dead record session" entry. The bug record:
+  `docs/bugs/2026-11-18-a-resent-forward-lost-its-place-in-the-lane.md`.
+- **What was there.** A forwarder gives its batch up once none of its forwards has progressed for its stall budget,
+  queued or begun, and its caller sends the same requests again under their own ids while the owner is not confirmed
+  dead and the failover bound allows. Every send was a new batch with fresh tickets, and a lane begins its queue in
+  ticket order, so every resend went to the back.
+- **The rule.** A forward's place is the ticket its first send was given; a resend is queued at it, each request of a
+  batch at its own first ticket. A lane begins its queued forwards in the order of their places: the order of first
+  sends, whatever has been given up and sent again since. Its wait is bounded by the forwards first sent before it.
+- **Why.** Goal g245, finding (b): behind a 256-client burst a read through a client node whose session to its owner
+  died was refused at its failover bound in 1 of 10 runs and answered after 9.2 and 9.5 s in two more (2.3 to 10.5 s
+  in all), its every resend given up again behind forwards first sent after it. With its place kept: 4.1 to 6.5 s in
+  10 of 10.
+- **Cost.** None new: a queued forward's key in the same ordered set is a pair, and a resend's insert and a leave's
+  remove are the same logarithmic steps. A forward still queued is given up and resent at its stall budget as before:
+  with its place kept that loses it nothing, but it cycles the backlog once a budget on the control shard, which is
+  owed apart (GAPS).
+
+### A-273 — A shard that holds a green's works keeps a replica of the green, fed the owner's accepted versions in order; a rebase and a read at a named version are served there, over the owner's content in place (2026-11-17; the text first, the code after W1 lands)
+Applied in the same change to: GAPS (A-273's entry). Nothing else yet: the tests come first, then the code.
+
+Status: designed. The text and its measurements are perf's (2026-11-11, `agents/perf-a273`, never pushed); the content
+question it left open was decided by the supervisor on 2026-11-17 by A-64 and D-7 (below). Code waits on W1 (A-247),
+whose works off the owner it builds on; W1 lands from `agents/g231-000-clients-loadtest-w1`.
+
+- **Why (measured).** W1 (A-247) moves a work's edits and composition to the work's shard; the verdict and the rebase
+  still run on the green's owner.
+  - At the 3,000-client load rung (`kernel/` of linux 7.4-rc1, 754 files, 16 MB) the owner spends 51–53% of its wall
+    on them (W1, the anchor recipe, 2026-11-11). A verdict is 21.4–21.7 µs of the owner's CPU and a rebase 12.3–12.4.
+  - Rebases are the larger share of the owner's merge work: 71,000–72,000 rebases a run against 49,000 verdicts.
+  - At 1,000 clients and equal offered load, W1's rebase p99 is worse than main's (rounds' medians 30.7 against 21.2 ms):
+    it crosses to the owner and waits in the ask batch, where on main it ran beside its work.
+  - A rebase changes nothing on the green. Running it on the work's shard takes it off the owner entirely.
+- **The shape.** Each shard that holds a work of a green keeps a replica of the green: the engine's own metadata, built
+  from the owner's at a version and kept current by the owner's accepted versions applied in order through the engine's
+  own replay (`Green::apply_recorded`, the chain entry's `Applied` over its increment). One code path: a replica at
+  version v is the owner's green at v by construction, the property replay already holds for recovery.
+  - *The feed.* After a version is committed (A-252: after its quorum), the owner sends its chain entry to each shard
+    holding a replica, over the existing bounded control channel, in version order. A replica that sees a gap (a
+    version it lacks before the one it is sent) is rebuilt from the owner, counted.
+  - *Served from the replica.* A rebase of a work on that shard, at the replica's head (never below the work's base;
+    the work's next submit is judged by the owner against its own head, as every stale base is). A read of the green
+    at a named version the replica holds (the 60% of A-247's reads). Everything else is unchanged: the verdict, the
+    `Head` read, the merge record, every refusal.
+  - *Behind.* A replica whose head is below a work's base (the owner accepted a version the feed has not delivered)
+    forwards that rebase to the owner, as today, counted. A read at a version the replica does not hold, above its
+    head or below its floor, is forwarded the same way.
+  - *Laptop degenerate (R8).* With one shard there is no other shard and no replica: the owner serves, as now.
+- **Content: once, in place (the supervisor's decision, 2026-11-17).** A-64 keeps content once in the anchor's RAM, and
+  D-7 lets any core read an immutable chunk. So a replica holds no bytes of its own: it names the owner's chunks, and
+  reads them where they are. It never copies them and never fetches them through the fleet for a shard of the same node.
+  Two things the code does not have today follow, and both are part of this amendment:
+  - *Chunks that never move or change.* The engine's content is its owner's heap today (`Green::content`, a map of
+    `Vec<u8>`; the history's `Chunks`, a slot vector of `Vec<u8>` reused when freed), so a reference to it from another
+    thread is not sound. The owner's current values and history chunks move into blocks of a region the owner allocates
+    and seals: a sealed block is never written, moved or reused while any shard can name it (D-6's rule for volume
+    chunks, A-64's for the image). A replica's piece names a block by handle and range, as an image's chunk reference
+    does.
+  - *Frees deferred until every replica has passed them.* A-64's deferral holds a block only until the owner's next
+    publication commits, and knows nothing of readers on other shards; alone it would let a replica read a block freed
+    and reused under it. So the owner frees a chunk whose last reference version v dropped only when every replica has
+    acknowledged a version at or past v. A replica acknowledges on the feed's own channel, after its turn has applied
+    the version and dropped every reference the version removed; the acknowledgement is per version (batched to the
+    latest), never per chunk, so the cost is one message a version a replica and no atomic on any per-item path (D-7's
+    quiescent-state rule, made by message). A replica dropped, rebuilt or ended acknowledges by leaving: its shard's
+    acknowledgement is removed, so a dead replica never holds a free.
+  - *Bounds.* The deferred bytes are charged to the owner's memory class, and they are bounded by the slowest
+    replica's lag. A replica more than the derived lag behind (owed: its derivation, from the class's headroom against
+    the bytes a version frees) is dropped, counted (`merge.replica.dropped_lagging`), and its rebases and reads go to
+    the owner. So no replica can hold the owner's memory past its class.
+  - *When this would be wrong.* If a measured fact makes it unsound (a lifetime the acknowledgement cannot hold) or
+    slower than a copy (cross-shard reads of the owner's blocks costing more than the copy saves), the numbers and the
+    alternative go to the supervisor before code is built another way.
+- **What a replica costs, measured** (perf, 2026-11-11). A diagnostic build (never committed) logged the owner's green,
+  by kind, at the 3,000-client rung's end: head 9,000, two runs alike to a few hundred bytes. Payload bytes, maps' node
+  overhead not counted, so a lower bound:
+
+  | part | bytes | a replica holds it |
+  |---|---|---|
+  | current file bytes | 16,438,721 | no: the owner's blocks, read in place |
+  | history chunks (the current values again, and earlier runs) | 18,859,529 | no: the owner's blocks, read in place |
+  | content history index (45,690 entries, their piece lists) | 8,991,756 | yes |
+  | deltas (9,000 versions, 44,997 ops) | 4,642,109 | yes |
+  | path, last-changed and kind indexes, kind histories | 613,120 | yes |
+  | idempotency and rejected-result caches | 4,183,041 | no: the owner's |
+
+  - Metadata is about 14.2 MB a replica at this rung (about 1.6 KB a version kept, until the retention floor folds it),
+    about 313 MB at 22 shards. Copying content as well would have been about 49.5 MB a replica, and about 1.3 GB for a
+    whole kernel tree, most of a 1.49 GB memory class in every replica: content in place avoids both.
+  - Against the budgets, from the measurement's own daemon log (adas-mac-studio.local-2, `effective_capacity_bytes`
+    103,079,215,104, 23 shards): a shard's metadata class, `table_bytes`, is 373,475,417 bytes (it already bounds the
+    green's chain), and a memory class, `reserve_per_shard`, is 1,493,901,668. A replica's metadata is 3.8% of one
+    shard's `table_bytes` (under 8% if the maps' node overhead doubled it), and each shard holds only its own replica.
+- **Bounds and outcomes.** A replica's metadata is charged to its shard's metadata budget. At the bound the replica is
+  dropped and its rebases and reads go to the owner, counted (`merge.replica.dropped`), never refused to the client.
+  A replica no work on its shard has used for the derived idle period (owed: its derivation, from the feed's cost per
+  version against the rebases it served) is dropped the same way. The feed rides the control channel's existing bound;
+  a full channel delays a version, never drops it (the reply rule since 2026-11-09), and a replica behind forwards.
+- **Tests first.**
+  - The replica equals the owner at every version over generated histories (files, links, modes, renames, removals),
+    the green's identity compared at each version.
+  - A lagging replica's rebase is answered exactly as the owner would answer it at the replica's head, and a rebase whose
+    base is above the replica's head is forwarded and answered by the owner.
+  - A read at a version the replica lacks is forwarded, and its answer equals the owner's.
+  - Lifetime: a replica holding a piece of a chunk whose last reference the owner has dropped reads the chunk's bytes
+    unchanged until it acknowledges, and the owner's free happens at that acknowledgement and not before; a replica
+    dropped mid-read releases its hold. Red with the acknowledgement ignored (the owner frees at once).
+  - Non-vacuity: counters of rebases and reads served off the owner and of those forwarded, and of frees deferred for
+    a replica (`merge.replica.frees_deferred`).
+  - Then the A/B the supervisor runs: the anchor recipe, every round, with the owner's utilization before and after.
+- **Tried and rejected.**
+  - *Copying content into each replica* (perf's option 1) or *for the paths a shard's works touch* (option 2): content
+    twice, against A-64, and about 1.3 GB a replica for a whole kernel tree. Rejected 2026-11-17 by the supervisor.
+  - *An epoch-published immutable root of the green's metadata* (the owner's maps shared read-only with every shard):
+    it needs a persistent map the engine does not use. Rejected 2026-11-11 for a replica fed by message. Its other
+    cost, reclaiming what readers may still hold, is paid here for content alone, by acknowledgement.
+  - *Shard-count-fixed replicas* (a replica on a literal number of shards): a tuning literal (R3), and a work's shard is
+    where its rebases are. Rejected for "every shard holding a work of the green".
+  - *Answering the owner's asks in slices of the step budget* (2026-11-09): the step budget, about 4.5 µs, is below one
+    ask's cost, so every slice was one ask and every answer a message; SubmitAccepted p99 75.3–493.0 ms against W1's
+    53.8–77.2 (BENCHMARKS). It moved no work off the owner.

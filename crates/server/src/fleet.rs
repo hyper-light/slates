@@ -8736,16 +8736,21 @@ pub(crate) async fn forward_over_leader_session(
   request: Vec<u8>,
   deadline_ns: u64,
 ) -> Option<Vec<u8>> {
-  forward_batch_over_leader_session(peer, &[request], deadline_ns)
-    .await
-    .map(|batch| {
-      batch
-        .replies
-        .into_iter()
-        .next()
-        .flatten()
-        .unwrap_or_default()
-    })
+  forward_batch_over_leader_session(
+    peer,
+    &[request],
+    deadline_ns,
+    &mut crate::forward_lane::Place::default(),
+  )
+  .await
+  .map(|batch| {
+    batch
+      .replies
+      .into_iter()
+      .next()
+      .flatten()
+      .unwrap_or_default()
+  })
 }
 
 /// [`forward_over_leader_session`] for several requests at once — a read-ahead batch of windows
@@ -8753,13 +8758,15 @@ pub(crate) async fn forward_over_leader_session(
 /// `stall_ns` bounds the wait for the session and, once it is borrowed, any stretch with no progress: a batch that
 /// keeps delivering is never cut off for its size. Returns the replies in order (`None` for one not answered) with
 /// how they streamed ([`slates_cluster::BatchReplies`]), or `None` when the session never came back within the
-/// budget.
+/// budget. The batch is queued at `place` in the peer's lane: a resend passes the place its first issue recorded there
+/// ([`crate::forward_lane::Place`]).
 pub(crate) async fn forward_batch_over_leader_session(
   peer: HostId,
   requests: &[Vec<u8>],
   stall_ns: u64,
+  place: &mut crate::forward_lane::Place,
 ) -> Option<slates_cluster::BatchReplies> {
-  crate::forward_lane::forward_batch(peer, requests, stall_ns).await
+  crate::forward_lane::forward_batch(peer, requests, stall_ns, place).await
 }
 
 #[cfg(test)]

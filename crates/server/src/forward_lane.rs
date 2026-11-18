@@ -42,6 +42,13 @@
 //! **What a session change does.** An exchange is tied to the session it was begun on (its connection id). If the
 //! link replaced the session meanwhile, the forward is answered as unanswered, as a forward cut off by its session's
 //! loss always was, and the caller's refusal and retry path takes it from there.
+//!
+//! **A resend's place (A-306).** The lane begins its queued forwards in the order of their first send ([`Place`]): the
+//! caller's resend of a forward given up or cut off is queued where its first send was, ahead of every forward first
+//! queued after it. A resend queued at the back, as each was until 2026-11-18, was given up again before it was begun
+//! behind a backlog longer than a stall budget, while later forwards went ahead: a read through a client node whose
+//! session to its owner died was refused at its failover bound in 1 of 10 runs behind a 256-client burst (2.3 to
+//! 10.5 s), and answered in 4.1 to 6.5 s, 10 of 10, with its place kept (the bug record of 2026-11-18).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::task::{Poll, Waker};
@@ -77,6 +84,9 @@ const TAKEN_FOR_ANOTHER: &str = "fleet.forward.taken_for_another";
 const BATCH_DONE: &str = "fleet.forward.batch_done";
 /// The status count of a forwarder that gave up its batch at its stall budget, or because its session failed.
 const BATCH_GIVEN_UP: &str = "fleet.forward.batch_given_up";
+/// The status count of a batch resent at the place its first issue had in the lane ([`Place`]): the non-vacuity count
+/// of the kept place, so a test that holds a resend's order shows the resends it held were made.
+const RESENT_IN_PLACE: &str = "fleet.forward.resent_in_place";
 
 /// Where one forward is.
 enum Stage {
@@ -99,14 +109,33 @@ struct Ticket {
   stage: Stage,
   /// When it last made progress: queued, begun, or bytes of its own reply read while it was open.
   progress_ns: u64,
+  /// Its place in the lane's queue ([`Place`]): its own ticket when first issued, the first issue's when resent.
+  place: u64,
+}
+
+/// A forward's place in its lane (A-306): the ticket its first issue was given. A resend of the same requests under
+/// their own ids (`verbs::resolve_and_forward`, after a forward went unanswered or was never begun within its stall
+/// budget) is queued at that place, so it is begun ahead of every forward first queued after it, as if it had waited
+/// there all along. Queued at the back with fresh tickets, as every resend was before, a forward lost its place at each
+/// budget: behind a backlog longer than a budget it was given up before it was begun, again and again, while forwards
+/// first queued after it went ahead, until its failover bound refused it (a read through a client node whose session to
+/// the owner went dead met `OwnerUnreachable` after 10 s behind the resends of a 256-client burst, about 45,000 to
+/// 57,000 batches given up; the bug record of 2026-11-09). Kept by the caller across its resends; `Place::default()`
+/// for a first issue.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Place {
+  /// The first ticket of the first issue; `None` until the first issue is queued.
+  first: Option<u64>,
 }
 
 /// One peer's forwards.
 #[derive(Default)]
 struct Lane {
-  /// Forwards waiting to be begun, in the order they were queued (ticket ids rise as they are issued). A set, so a
-  /// forwarder leaving takes its own out at log cost: a scan of the queue on each leave was quadratic in a burst.
-  queued: BTreeSet<u64>,
+  /// Forwards waiting to be begun, by their place and then their ticket ([`Place`]): a first issue's place is its own
+  /// ticket, and ticket ids rise as they are issued, so forwards are begun in the order they were first queued and a
+  /// resend keeps the place its first issue had. A set, so a forwarder leaving takes its own out at log cost: a scan of
+  /// the queue on each leave was quadratic in a burst.
+  queued: BTreeSet<(u64, u64)>,
   tickets: BTreeMap<u64, Ticket>,
   /// The open forwards by their exchange on the session they were begun on ([`Lane::open_on`]): a turn takes only
   /// the replies that completed and marks only the exchanges that read bytes, as the session reports them
@@ -157,31 +186,56 @@ fn lane_bound(state: &state::ShardState) -> usize {
   .get()
 }
 
-/// Queues `requests` on `peer`'s lane under a new forwarder: its id and its tickets, in order, or `None` when the
-/// lane is at its bound (counted) or the state is out of reach.
-fn enqueue(peer: HostId, requests: &[Vec<u8>]) -> Option<(u64, Vec<u64>)> {
+/// Queues `requests` on `peer`'s lane under a new forwarder at `place` ([`ForwardLanes::queue`]): its id and its
+/// tickets, in order, or `None` when the lane is at its bound (counted) or the state is out of reach. A resend at a
+/// kept place is counted ([`RESENT_IN_PLACE`]).
+fn enqueue(peer: HostId, requests: &[Vec<u8>], place: &mut Place) -> Option<(u64, Vec<u64>)> {
   state::with_state(|s| {
     let bound = lane_bound(s);
-    let held = s
+    let resend = place.first.is_some();
+    let queued = s
       .forward_lanes
-      .lanes
-      .get(&peer)
-      .map_or(0, |lane| lane.tickets.len());
-    if held.saturating_add(requests.len()) > bound {
+      .queue(peer, requests, place, bound, futures::now_ns());
+    if queued.is_none() {
       s.count(LANE_FULL, 1);
+    } else if resend {
+      s.count(RESENT_IN_PLACE, 1);
+    }
+    queued
+  })
+  .flatten()
+}
+
+impl ForwardLanes {
+  /// Queues `requests` on `peer`'s lane under a new forwarder at `place`, at `now`: its id and its tickets, in order,
+  /// or `None` when the lane would hold more than `bound`. A first issue takes its own tickets as its place and records
+  /// it in `place`; a resend (`place` already recorded) is queued at the first issue's place, each request at the
+  /// ticket its first issue had (they were issued together, so in a run). The waiting driver is woken.
+  fn queue(
+    &mut self,
+    peer: HostId,
+    requests: &[Vec<u8>],
+    place: &mut Place,
+    bound: usize,
+    now: u64,
+  ) -> Option<(u64, Vec<u64>)> {
+    let held = self.lanes.get(&peer).map_or(0, |lane| lane.tickets.len());
+    if held.saturating_add(requests.len()) > bound {
       return None;
     }
-    let now = futures::now_ns();
-    let lanes = &mut s.forward_lanes;
-    lanes.next_forwarder = lanes.next_forwarder.saturating_add(1);
-    let forwarder = lanes.next_forwarder;
+    self.next_forwarder = self.next_forwarder.saturating_add(1);
+    let forwarder = self.next_forwarder;
     let mut tickets = Vec::with_capacity(requests.len());
     for _ in requests {
-      lanes.next_ticket = lanes.next_ticket.saturating_add(1);
-      tickets.push(lanes.next_ticket);
+      self.next_ticket = self.next_ticket.saturating_add(1);
+      tickets.push(self.next_ticket);
     }
-    let lane = lanes.lanes.entry(peer).or_default();
-    for (ticket, request) in tickets.iter().zip(requests) {
+    let first = place.first;
+    let lane = self.lanes.entry(peer).or_default();
+    for (offset, (ticket, request)) in tickets.iter().zip(requests).enumerate() {
+      let at = first.map_or(*ticket, |first| {
+        first.saturating_add(u64::try_from(offset).unwrap_or(u64::MAX))
+      });
       lane.tickets.insert(
         *ticket,
         Ticket {
@@ -189,17 +243,49 @@ fn enqueue(peer: HostId, requests: &[Vec<u8>]) -> Option<(u64, Vec<u64>)> {
           request: request.clone(),
           stage: Stage::Queued,
           progress_ns: now,
+          place: at,
         },
       );
-      lane.queued.insert(*ticket);
+      lane.queued.insert((at, *ticket));
     }
     lane.fresh_queued = true;
     if let Some(driver) = lane.driver.take() {
       driver.wake();
     }
+    if first.is_none() {
+      place.first = tickets.first().copied();
+    }
     Some((forwarder, tickets))
-  })
-  .flatten()
+  }
+
+  /// Removes `forwarder`'s tickets from `peer`'s lane: an open one's exchange is abandoned on the next turn, and if it
+  /// was driving, the lane is left undriven and the next waiter woken to drive it. A lane left with nothing is dropped.
+  fn leave(&mut self, peer: HostId, forwarder: u64, tickets: &[u64], was_driving: bool) {
+    let Some(lane) = self.lanes.get_mut(&peer) else {
+      return;
+    };
+    for ticket in tickets {
+      let Some(entry) = lane.tickets.remove(ticket) else {
+        continue;
+      };
+      lane.queued.remove(&(entry.place, *ticket));
+      if let Stage::Open { exchange, session } = entry.stage {
+        lane.open.remove(&exchange);
+        lane.abandon.push((exchange, session));
+      }
+    }
+    lane.waiters.remove(&forwarder);
+    if was_driving {
+      lane.driving = false;
+      lane.driver = None;
+      if let Some(next) = lane.waiters.values().next() {
+        next.wake_by_ref();
+      }
+    }
+    if lane.tickets.is_empty() && lane.abandon.is_empty() && !lane.driving {
+      self.lanes.remove(&peer);
+    }
+  }
 }
 
 /// What a forwarder sees of its tickets now.
@@ -239,36 +325,9 @@ fn look(peer: HostId, tickets: &[u64]) -> Option<Look> {
   .flatten()
 }
 
-/// Removes `forwarder`'s tickets from `peer`'s lane: an open one's exchange is abandoned on the next turn, and if it
-/// was driving, the lane is left undriven and the next waiter woken to drive it.
+/// Removes `forwarder`'s tickets from `peer`'s lane ([`ForwardLanes::leave`]).
 fn leave(peer: HostId, forwarder: u64, tickets: &[u64], was_driving: bool) {
-  let _ = state::with_state(|s| {
-    let Some(lane) = s.forward_lanes.lanes.get_mut(&peer) else {
-      return;
-    };
-    for ticket in tickets {
-      lane.queued.remove(ticket);
-      if let Some(Ticket {
-        stage: Stage::Open { exchange, session },
-        ..
-      }) = lane.tickets.remove(ticket)
-      {
-        lane.open.remove(&exchange);
-        lane.abandon.push((exchange, session));
-      }
-    }
-    lane.waiters.remove(&forwarder);
-    if was_driving {
-      lane.driving = false;
-      lane.driver = None;
-      if let Some(next) = lane.waiters.values().next() {
-        next.wake_by_ref();
-      }
-    }
-    if lane.tickets.is_empty() && lane.abandon.is_empty() && !lane.driving {
-      s.forward_lanes.lanes.remove(&peer);
-    }
-  });
+  let _ = state::with_state(|s| s.forward_lanes.leave(peer, forwarder, tickets, was_driving));
 }
 
 /// A forwarder's hold on its tickets: dropped however the forwarder ends (its replies taken, its budget spent, its
@@ -289,14 +348,16 @@ impl Drop for Held {
 /// Forwards `requests` to `peer` over its record session, sharing the session with every other forward to it: the
 /// replies in order (`None` for one not answered), or `None` when the lane was full or the session never came within
 /// `stall_ns` (nothing was begun). `streamed_bytes` and `streamed_ns` are this batch's own: its replies' bytes after
-/// the first, and the time from the first reply to the last (the session's bytes are no longer one batch's). Called
-/// from the control shard, where the record sessions live.
+/// the first, and the time from the first reply to the last (the session's bytes are no longer one batch's). The batch
+/// is queued at `place` ([`Place`]): a caller resending the same requests passes the place it kept from their first
+/// issue, which this records. Called from the control shard, where the record sessions live.
 pub(crate) async fn forward_batch(
   peer: HostId,
   requests: &[Vec<u8>],
   stall_ns: u64,
+  place: &mut Place,
 ) -> Option<BatchReplies> {
-  let (forwarder, tickets) = enqueue(peer, requests)?;
+  let (forwarder, tickets) = enqueue(peer, requests, place)?;
   let mut held = Held {
     peer,
     forwarder,
@@ -668,28 +729,37 @@ fn apply_injected_deafness(peer: HostId, endpoint: &mut Endpoint) {
   }
 }
 
-/// Begins queued forwards on session `on`, in order, while its stream credit admits them (a refusal past the credit,
-/// `Backlogged`, leaves the rest queued for a stream to free; any other refusal answers that forward unanswered).
-/// How many were begun.
+/// Begins queued forwards on session `on`, in their places' order ([`Place`]), while its stream credit admits them (a
+/// refusal past the credit, `Backlogged`, leaves the rest queued for a stream to free; any other refusal answers that
+/// forward unanswered). How many were begun.
 fn begin_queued(
   lane: &mut Lane,
   endpoint: &mut Endpoint,
   on: ConnectionId,
   answered: &mut Answered,
 ) -> u64 {
-  let now = futures::now_ns();
+  begin_queued_with(lane, on, futures::now_ns(), answered, |request| {
+    endpoint.begin(crate::fleet::FORWARD_STREAM, Priority::Metadata, request)
+  })
+}
+
+/// [`begin_queued`] with the session's begin as `begin`, at `now`: the queue's discipline apart from the session.
+fn begin_queued_with(
+  lane: &mut Lane,
+  on: ConnectionId,
+  now: u64,
+  answered: &mut Answered,
+  mut begin: impl FnMut(&[u8]) -> Result<u64, EndpointError>,
+) -> u64 {
   let mut begun = 0u64;
   lane.fresh_queued = false;
-  while let Some(ticket) = lane.queued.first().copied() {
+  while let Some(queued) = lane.queued.first().copied() {
+    let (_, ticket) = queued;
     let Some(entry) = lane.tickets.get_mut(&ticket) else {
-      lane.queued.remove(&ticket);
+      lane.queued.remove(&queued);
       continue;
     };
-    match endpoint.begin(
-      crate::fleet::FORWARD_STREAM,
-      Priority::Metadata,
-      &entry.request,
-    ) {
+    match begin(&entry.request) {
       Ok(exchange) => {
         entry.stage = Stage::Open {
           exchange,
@@ -707,7 +777,7 @@ fn begin_queued(
         answered.forwarders.push(entry.forwarder);
       }
     }
-    lane.queued.remove(&ticket);
+    lane.queued.remove(&queued);
   }
   begun
 }
@@ -880,4 +950,226 @@ pub(crate) async fn next_request_or_forwarded(
     let _ = futures::join(task).await;
   }
   next
+}
+
+#[cfg(test)]
+mod tests {
+  use std::collections::{BTreeMap, BTreeSet};
+
+  use proptest::prelude::*;
+  use slates_db::HostId;
+  use slates_transport::endpoint::{CONNECTION_ID_BYTES, ConnectionId, EndpointError};
+  use slates_transport::streams::StreamRefusal;
+
+  use super::{Answered, ForwardLanes, Place, begin_queued_with};
+
+  /// Shape: the owner every test's lane forwards to.
+  const PEER: HostId = HostId(1);
+  /// Shape: the session every test settles against (its id only names it).
+  const SESSION: ConnectionId = [7; CONNECTION_ID_BYTES];
+  /// Shape: a lane bound no test reaches, so the bound never decides an order.
+  const BOUND: usize = 1 << 16;
+
+  /// Begins up to `credit` of the lane's queued forwards on one session, as a settle does when the session's stream
+  /// credit admits that many and refuses the next `Backlogged`, numbering the exchanges on from `exchanges`: the
+  /// requests begun, in the order they went out.
+  fn begin(lanes: &mut ForwardLanes, credit: usize, exchanges: &mut u64) -> Vec<Vec<u8>> {
+    let mut sent: Vec<Vec<u8>> = Vec::new();
+    let Some(lane) = lanes.lanes.get_mut(&PEER) else {
+      return sent;
+    };
+    let mut answered = Answered::default();
+    begin_queued_with(lane, SESSION, 0, &mut answered, |request| {
+      if sent.len() >= credit {
+        return Err(EndpointError::Stream(StreamRefusal::Backlogged {
+          waiting: 0,
+          limit: 0,
+        }));
+      }
+      sent.push(request.to_vec());
+      *exchanges += 1;
+      Ok(*exchanges)
+    });
+    sent
+  }
+
+  /// A-306: do queue a forward P on a lane, then three forwards first queued after it; give P up, as its forwarder does
+  /// at its stall budget, and resend it at the place it kept; then begin the lane's forwards one at a time, as a
+  /// session's stream credit admits them. Expect P begun first, then the three in the order they were queued. Before, a
+  /// resend took fresh tickets at the back of the lane, and P went out after every forward first queued after it: a
+  /// read through a client node whose session to its owner died was refused `OwnerUnreachable` at its failover bound,
+  /// given up again and again behind a burst's backlog (the bug record of 2026-11-09, finding (b)).
+  #[test]
+  fn a_resend_is_begun_ahead_of_every_forward_first_queued_after_it() {
+    let mut lanes = ForwardLanes::default();
+    let mut kept = Place::default();
+    let (p, p_tickets) = lanes
+      .queue(PEER, &[b"p".to_vec()], &mut kept, BOUND, 0)
+      .unwrap();
+    for name in [b"q1", b"q2", b"q3"] {
+      lanes
+        .queue(PEER, &[name.to_vec()], &mut Place::default(), BOUND, 0)
+        .unwrap();
+    }
+    lanes.leave(PEER, p, &p_tickets, false);
+    lanes
+      .queue(PEER, &[b"p".to_vec()], &mut kept, BOUND, 0)
+      .unwrap();
+    let mut exchanges = 0;
+    let order: Vec<Vec<u8>> = (0..4)
+      .flat_map(|_| begin(&mut lanes, 1, &mut exchanges))
+      .collect();
+    assert_eq!(
+      order,
+      [
+        b"p".to_vec(),
+        b"q1".to_vec(),
+        b"q2".to_vec(),
+        b"q3".to_vec()
+      ],
+      "the resent P goes out at the place its first issue had"
+    );
+  }
+
+  /// One step of a lane's history in `a_lanes_forwards_are_begun_in_the_order_they_were_first_queued`.
+  #[derive(Clone, Debug)]
+  enum Step {
+    /// A new forwarder queues a batch of this many requests, its first issue.
+    Issue(usize),
+    /// The forwarder at this index among those queued now gives up its batch (its tickets leave, begun or not).
+    GiveUp(usize),
+    /// The forwarder at this index among those given up resends its batch at the place it kept.
+    Resend(usize),
+    /// A settle begins up to this many queued forwards.
+    Begin(usize),
+  }
+
+  fn step() -> impl Strategy<Value = Step> {
+    prop_oneof![
+      (1usize..4).prop_map(Step::Issue),
+      (0usize..16).prop_map(Step::GiveUp),
+      (0usize..16).prop_map(Step::Resend),
+      (0usize..5).prop_map(Step::Begin),
+    ]
+  }
+
+  /// One logical forwarder of the model: its batch's requests and the place the lane keeps for it.
+  struct Batch {
+    requests: Vec<Vec<u8>>,
+    place: Place,
+    /// The lane's forwarder id and tickets while it is queued.
+    held: Option<(u64, Vec<u64>)>,
+  }
+
+  /// A lane driven beside the model of its rule (A-306): a lane begins its queued forwards in the order of their first
+  /// issue, a batch's requests in their order, however often each was given up and resent.
+  #[derive(Default)]
+  struct Run {
+    lanes: ForwardLanes,
+    batches: Vec<Batch>,
+    /// The model: each request queued now, by (first-issue order, offset in its batch).
+    model: BTreeSet<(usize, usize)>,
+    /// The batch and offset each request's bytes name, to read a begun request back into the model's terms.
+    named: BTreeMap<Vec<u8>, (usize, usize)>,
+    /// The exchanges numbered so far on the session.
+    exchanges: u64,
+  }
+
+  impl Run {
+    fn step(&mut self, step: &Step) {
+      match *step {
+        Step::Issue(count) => self.issue(count),
+        Step::GiveUp(pick) => self.give_up(pick),
+        Step::Resend(pick) => self.resend(pick),
+        Step::Begin(credit) => self.begin(credit),
+      }
+    }
+
+    fn issue(&mut self, count: usize) {
+      let index = self.batches.len();
+      let requests: Vec<Vec<u8>> = (0..count)
+        .map(|offset| format!("{index}.{offset}").into_bytes())
+        .collect();
+      for (offset, request) in requests.iter().enumerate() {
+        self.named.insert(request.clone(), (index, offset));
+        self.model.insert((index, offset));
+      }
+      let mut place = Place::default();
+      let held = self.lanes.queue(PEER, &requests, &mut place, BOUND, 0);
+      assert!(held.is_some(), "a lane under its bound queues a batch");
+      self.batches.push(Batch {
+        requests,
+        place,
+        held,
+      });
+    }
+
+    /// The batch `pick` names among those in the lane (`queued`) or among those given up (not `queued`).
+    fn pick(&self, queued: bool, pick: usize) -> Option<usize> {
+      let matching: Vec<usize> = (0..self.batches.len())
+        .filter(|index| self.batches[*index].held.is_some() == queued)
+        .collect();
+      (!matching.is_empty()).then(|| matching[pick % matching.len()])
+    }
+
+    fn give_up(&mut self, pick: usize) {
+      let Some(index) = self.pick(true, pick) else {
+        return;
+      };
+      if let Some((forwarder, tickets)) = self.batches[index].held.take() {
+        self.lanes.leave(PEER, forwarder, &tickets, false);
+      }
+      self.model.retain(|(batch, _)| *batch != index);
+    }
+
+    fn resend(&mut self, pick: usize) {
+      let Some(index) = self.pick(false, pick) else {
+        return;
+      };
+      let batch = &mut self.batches[index];
+      batch.held = self
+        .lanes
+        .queue(PEER, &batch.requests, &mut batch.place, BOUND, 0);
+      assert!(
+        batch.held.is_some(),
+        "a lane under its bound queues a resend"
+      );
+      for offset in 0..batch.requests.len() {
+        self.model.insert((index, offset));
+      }
+    }
+
+    fn begin(&mut self, credit: usize) {
+      let begun: Vec<(usize, usize)> = begin(&mut self.lanes, credit, &mut self.exchanges)
+        .iter()
+        .map(|request| self.named[request])
+        .collect();
+      let expected: Vec<(usize, usize)> = self.model.iter().take(credit).copied().collect();
+      assert_eq!(
+        begun, expected,
+        "a settle begins the queued forwards first issued earliest"
+      );
+      for request in &begun {
+        self.model.remove(request);
+      }
+    }
+  }
+
+  proptest! {
+    #![proptest_config(slates_test_seeds::unseeded(ProptestConfig::default()))]
+
+    /// A-306, against a model: do run generated histories on one lane (batches first issued, given up whether queued or
+    /// begun, resent at their kept places, and settles that begin as many as a stream credit admits). Expect every
+    /// settle to begin exactly the queued forwards the model names: those first issued earliest, a batch's in its
+    /// order.
+    #[test]
+    fn a_lanes_forwards_are_begun_in_the_order_they_were_first_queued(
+      steps in proptest::collection::vec(step(), 0..64),
+    ) {
+      let mut run = Run::default();
+      for step in &steps {
+        run.step(step);
+      }
+    }
+  }
 }
