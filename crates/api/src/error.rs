@@ -857,7 +857,8 @@ impl Error {
       VolumeRefusal::TooManyLinks
       | VolumeRefusal::FileTooLarge
       | VolumeRefusal::DigestCacheFull
-      | VolumeRefusal::Memory => Error::Exhausted(Exhausted::Volume(refusal)),
+      | VolumeRefusal::Memory
+      | VolumeRefusal::RetentionExceeded => Error::Exhausted(Exhausted::Volume(refusal)),
       VolumeRefusal::JournalIncomplete { .. } | VolumeRefusal::RecoveryVersion { .. } => {
         Error::Unusable(Unusable::Volume(refusal))
       }
@@ -1465,6 +1466,7 @@ mod tests {
       V::FileTooLarge,
       V::DigestCacheFull,
       V::Memory,
+      V::RetentionExceeded,
     ] {
       assert_eq!(
         volume_refused(bound),

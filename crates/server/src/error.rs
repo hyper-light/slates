@@ -120,6 +120,8 @@ pub fn refusal_of_vfs(e: &VfsError) -> Refusal {
       existing: slates_ipc::protocol::VolumeId::default(),
     },
     VfsError::NoSpace => Refusal::NoSpace,
+    // A snapshot's retention, typed apart from the quota (§4.2 `RetentionBudgetExceeded`; until 2026-11-18 `NoSpace`).
+    VfsError::RetentionExceeded => volume(VolumeRefusal::RetentionExceeded),
     VfsError::RecoveryIncomplete | VfsError::Integrity => Refusal::ContentUnavailable,
     // The wire's taxonomy names one kind for a name the volume will not take, whatever the reason.
     VfsError::InvalidName | VfsError::NameTooLong => Refusal::InvalidName,

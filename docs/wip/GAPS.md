@@ -489,7 +489,8 @@
 >   removed), a whole and a paged read's (`merge_service.rs`), a listing's of a file (`listing.rs`). Their tests are in
 >   `crates/client/tests/client.rs`. The 11 admission arms that sent a memory error other than `BudgetExceeded`, and the
 >   two that answered a full registry, in words now go through `refusal_of_mem` (`crates/server/src/error.rs`), as a
->   database's memory refusal does. `refusal_of_db`'s last catch-all, which sent `Corrupt`, `NfsInstanceRegressed`,
+>   database's memory refusal does. a snapshot's retention refused is typed apart from the quota (`VolumeRefusal::RetentionExceeded`, `CONTRACT` = 18,
+>   where it was `NoSpace`, read as the quota); `refusal_of_db`'s last catch-all, which sent `Corrupt`, `NfsInstanceRegressed`,
 >   `CheckpointOutOfRange`, `SealKeyMalformed` and `Wire` as words, is gone: each is `Refusal::Database {
 >   DatabaseRefusal }`, appended, which the contract classes `Unusable::Database` (`CONTRACT` = 17);) typed fields on the wire for a landing target's refusal (`TargetUnavailable` carries words), a merge's versions
 >   (the work's base beside the head), and the words the crate still reads from the daemon's closed tables (a landing's
@@ -1814,12 +1815,41 @@
 > `fleet` binary exited 4 on a wedge verdict that came 146 s past its window (g231 on a 15-CPU Mac at load 62 to 131,
 > 0.2 to 1 GB free; one poll measured 160,662 ms): the whole process had gone unscheduled, the watchdog's thread with
 > it, and the look after its gap judged every shard still for the gap. A look a window or more after the watchdog's
-> last now starts each shard's still time again (`a_gap_in_the_watchdogs_own_looks_is_not_counted_as_a_wedge`). Open: a
-> shard held in the kernel past a watched window (a page-in at that pressure) is still judged wedged; telling `D` and
-> XNU's uninterruptible wait from a sleep is the 2026-10-22 entry's owed decision. Also from the same report, a test's
+> last now starts each shard's still time again (`a_gap_in_the_watchdogs_own_looks_is_not_counted_as_a_wedge`). Open
+> then, closed 2026-11-18 by A-336 (the entry below): a shard held in the kernel past a watched window (a page-in at that
+> pressure) was still judged wedged; telling `D` and XNU's uninterruptible wait from a sleep was the owed decision.
+> Also from the same report, a test's
 > bound, not the product: `a_lone_daemons_spinning_shard_ends_its_process_and_the_call_ends_daemon_gone` gave up its
 > loop at ten windows of wall while its call was inside its own bound after an exit that came 8.49 s after the hold;
 > the loop now runs to the call's bound after the exit.
+
+> **A shard waiting on memory was judged wedged (found 2026-11-17, decided and fixed 2026-11-18, A-336).** A thread
+> waiting on a page-in, a reclaim or a refault is neither running nor runnable, so A-228's rule called it wedged: a lone
+> daemon at a few hundred megabytes free ended itself (exit 4; fleet test binaries at 0.2 to 1 GB free on a 15-CPU Mac,
+> g231), and an anchor that found a daemon's watchdog silent judged the paging process stuck and killed it. Decided by
+> the supervisor by A-228's rule: at a look that suspects a shard the watchdog reads the host's memory stall (Linux PSI
+> memory `some` risen, macOS `kern.memorystatus_vm_pressure_level` above normal, Windows' low-memory notification), and
+> a still shard off the CPU in a wait memory shows as (Linux `D`; any blocked wait where the platform does not tell)
+> while the host stalled is `Starved { of: Memory }`, which beats; it is judged wedged a window after the stall clears.
+> The anchor's start and lapse judgment apply it to the whole process. `some`, not the decision's `full`: FULL never
+> holds on a busy machine's CPU that runs anything else (`kernel/sched/psi.c`), which is the case the rule is for.
+> Regressions: the watchdog's replays and table (`crates/server/src/watchdog.rs`), the watchdog's loop with the host's
+> reading put in its place and a shard held in the kernel by a vfork's wait (`crates/server/tests/liveness.rs`), the
+> anchor's judgment of a held child process (`crates/api/src/role/anchor.rs`), and the readers' tests. Open:
+> - **The waits judged in a shard's own time (A-228's sibling).** An observation and a cross-shard call
+>   (`observe::ShardTime`) still give up on a shard that waits on memory through a window: an observation ends
+>   `Deadline`, a cross-shard verb is refused. Next piece (g251).
+> - **A shard asleep on a lock whose holder pages (Linux).** Its own state is `S`, so it is judged wedged however the
+>   host stalls; the holder is not named, as for a starved holder ("the lock a starved test thread held is not named").
+>   macOS and Windows excuse any blocked wait while the host stalls, so they do not judge it.
+> - **Windows' per-thread wait reason.** The snapshot the watchdog already takes holds each thread's `WaitReason`
+>   (`WrPageIn`, `WrFreePage`, `WrVirtualMemory` and their kin), which would be the thread's own reading there, as `D` is
+>   on Linux. Not read; needs a Windows run.
+> - **A spinning verdict for the kernel's reclaim.** A poll whose CPU is direct reclaim on its behalf runs CPU without a
+>   step and can be judged spinning; not seen.
+> - **Evidence under real pressure.** The rule is proven by the readings put in place and by a thread held in the
+>   kernel; a daemon in a host truly short of memory (a bounded container with swap, a few hundred MB) is the
+>   measurer's run.
 
 > **ThreadSanitizer's slow polls ended in-process daemons' test binaries (found 2026-11-17, fixed 2026-11-18, A-318).**
 > Main's TSan lane had been red on every push since A-232: in run 44238377555 the `client` test binary died with
