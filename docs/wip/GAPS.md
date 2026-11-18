@@ -25,6 +25,13 @@
 >   a sibling defect since A-26 that kept device nodes make common (an unpacked `/dev`); WSL's form, a reparse point
 >   tagged `IO_REPARSE_TAG_LX_CHR` or `_LX_BLK`, is the candidate.
 
+> **A snapshot's attribute-only change was lost in recovery: fixed (2026-11-17, §4.8).** The image's cross-snapshot
+> dedup matched a version to an earlier snapshot's by its body alone, while the rebuild shares the earlier snapshot's
+> whole record, so a version changed only by a `chmod`, `chown` or `touch` between two snapshots recovered with the
+> earlier one's metadata (snapshot `b` read 0o644 for its 0o600, `a_version_that_differs_only_in_its_attributes_keeps_them_through_recovery`).
+> Every FIFO, socket and device-node version shares one body, so for them any two versions matched. The match now
+> needs the whole inode image equal. Record: `docs/bugs/2026-11-17-a-snapshots-attribute-only-change-was-lost-in-recovery.md`.
+
 > **A grant is signed by a key only the human holds (2026-11-18, R10, D-22, §4.13; A-285, Ada's decision: fs-server's
 > option D, with A as the fallback, on every OS).** This closes, once built, "No grant can be issued on Linux from the
 > CLI" (A-201's entry). **Built (piece 1):** the signed statement and its SSH-signature verifier

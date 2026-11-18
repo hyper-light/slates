@@ -1580,7 +1580,7 @@ impl Volume {
     store: &Store,
     snap_inode_root: Handle<TrieNode>,
     id: SnapshotId,
-    canonical: &mut BTreeMap<(u64, u32), Vec<(SnapshotRef, BodyImage)>>,
+    canonical: &mut BTreeMap<(u64, u32), Vec<(SnapshotRef, InodeImage)>>,
   ) -> Result<(Vec<InodeImage>, Vec<SharedInode>), VfsError> {
     let mut handles = Vec::new();
     trie::walk(&store.tries, snap_inode_root, &mut handles);
@@ -1620,12 +1620,15 @@ impl Volume {
         });
         continue;
       }
-      // A version that diverged from the head: dedup it against earlier snapshots by content. The
-      // crc buckets the lookup; the body decides the match.
+      // A version that diverged from the head: dedup it against earlier snapshots. The body's crc buckets the
+      // lookup; the whole image decides the match, since the rebuild shares the earlier snapshot's whole record
+      // (attributes, owner, times, change counter and attribute table with the bytes). Matched by its body alone, a
+      // version changed only by a `chmod` between two snapshots recovered with the earlier snapshot's mode
+      // (`docs/bugs/2026-11-17-a-snapshots-attribute-only-change-was-lost-in-recovery.md`).
       let image = self.image_of_inode(store, inode)?;
       let crc = body_crc(&image.body);
       let bucket = canonical.entry((no.0, crc)).or_default();
-      if let Some((src, _)) = bucket.iter().find(|(_, body)| *body == image.body) {
+      if let Some((src, _)) = bucket.iter().find(|(_, held)| *held == image) {
         shared.push(SharedInode {
           number: no.0,
           source: SharedSource::Snapshot { at: *src },
@@ -1633,7 +1636,7 @@ impl Volume {
         continue;
       }
       // This snapshot is the canonical holder of this version; record it for later snapshots.
-      bucket.push((snap_ref(id), image.body.clone()));
+      bucket.push((snap_ref(id), image.clone()));
       inodes.push(image);
     }
     shared.sort_by_key(|s| s.number);
@@ -1641,14 +1644,14 @@ impl Volume {
   }
 
   fn capture_snapshots(&self, store: &Store) -> Result<Vec<SnapshotImage>, VfsError> {
-    // Cross-snapshot content dedup: a file or symlink version captured in full by one snapshot is
-    // referenced, not re-captured, by a later snapshot that holds the byte-identical version. The
-    // map is (number, body crc) → the snapshots that captured that version in full, with the body
-    // kept to verify against a crc collision (a wrong match would corrupt content, so bytes decide,
-    // not the checksum). `self.snapshots.iter()` yields ascending slot order, which is ascending id
+    // Cross-snapshot dedup: a file, symlink or special-name version captured in full by one snapshot is
+    // referenced, not re-captured, by a later snapshot that holds the same version. The map is (number, body crc)
+    // → the snapshots that captured a version in full, with its whole image kept to decide the match (a wrong match
+    // would recover the later snapshot with the earlier one's record, so the image decides, never the checksum and
+    // never the bytes alone: a version changed only in its attributes is its own). `self.snapshots.iter()` yields ascending slot order, which is ascending id
     // order, and `from_image` rebuilds in the same order, so a reference always points to an
     // already-captured, earlier-rebuilt canonical.
-    let mut canonical: BTreeMap<(u64, u32), Vec<(SnapshotRef, BodyImage)>> = BTreeMap::new();
+    let mut canonical: BTreeMap<(u64, u32), Vec<(SnapshotRef, InodeImage)>> = BTreeMap::new();
     let mut out = Vec::with_capacity(self.snapshots.iter().count());
     for (handle, snap) in self.snapshots.iter() {
       let id = SnapshotId {
@@ -2886,10 +2889,10 @@ fn dead_key(dead: &Dead) -> (Discriminant<Dead>, u64, u32) {
   (std::mem::discriminant(dead), index, generation)
 }
 
-/// A crc of a body's bytes, used only to bucket the cross-snapshot content dedup lookup (§4.2). The
-/// match is then decided by exact byte equality, so a crc collision costs one comparison, never a
-/// wrong dedup (which would corrupt content). Directories do not reach here (only files and symlinks
-/// are deduped); the arm exists to keep the match exhaustive.
+/// A crc of a body's bytes, used only to bucket the cross-snapshot dedup lookup (§4.2). The match is then decided by
+/// the whole inode image's equality, so a crc collision costs one comparison, never a wrong dedup (which would recover a
+/// snapshot with another version's content or attributes). Directories do not reach here (only files, symlinks and the
+/// names with no content are deduplicated); the arm exists to keep the match exhaustive.
 fn body_crc(body: &BodyImage) -> u32 {
   match body {
     // A chunked body's references and offsets are its identity (the same blocks at another offset are a

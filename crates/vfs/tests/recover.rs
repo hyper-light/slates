@@ -1332,6 +1332,70 @@ fn a_version_shared_across_snapshots_is_captured_once_and_recovers_shared() {
   recovered.destroy_snapshot(&mut fresh, snap_b).unwrap();
 }
 
+/// §4.8, the cross-snapshot dedup, and A-294: a version is shared with an earlier snapshot's only when it is that
+/// version, never because its bytes match. Do: make a file, a FIFO and a device node; snapshot; change only each one's
+/// mode; snapshot again; change each mode once more in the head, so both snapshots hold versions that diverged from the
+/// head with the bytes (or the empty body, or the device number) of the first; recover. Expect each snapshot's own
+/// modes and the head's, and the rebuilt volume to image as the original did.
+#[test]
+fn a_version_that_differs_only_in_its_attributes_keeps_them_through_recovery() {
+  use slates_vfs::inode::{DeviceNumber, SpecialNode};
+  let mut src = store();
+  let mut vol = volume(&mut src, 1 << 30);
+  let root = vol.root_inode(&src).unwrap();
+  let file = vol.create_file_no(&mut src, root, "f", 0o644).unwrap();
+  vol.write(&mut src, file, 0, b"stable-value").unwrap();
+  let pipe = vol
+    .mknod_no(&mut src, root, "p", 0o644, SpecialNode::Fifo)
+    .unwrap();
+  let disk = vol
+    .mknod_no(
+      &mut src,
+      root,
+      "d",
+      0o644,
+      SpecialNode::BlockDevice(DeviceNumber::new(8, 1)),
+    )
+    .unwrap();
+  let nodes = [file, pipe, disk];
+  let snap_a = vol.snapshot(&mut src).unwrap();
+  for no in nodes {
+    vol.chmod(&mut src, no, 0o600).unwrap();
+  }
+  let snap_b = vol.snapshot(&mut src).unwrap();
+  for no in nodes {
+    vol.chmod(&mut src, no, 0o640).unwrap();
+  }
+  let image = vol.to_image(&src, None).unwrap();
+  let mut fresh = common::surviving(&src);
+  let claims = common::claims(&mut fresh, &[&image]);
+  let recovered = Volume::from_image(
+    &mut fresh,
+    &image,
+    &claims,
+    Box::new(StepClock::new(0, 1)),
+    1 << 16,
+    None,
+  )
+  .unwrap();
+  for no in nodes {
+    assert_eq!(
+      (
+        recovered.stat_in(&fresh, snap_a, no).unwrap().mode,
+        recovered.stat_in(&fresh, snap_b, no).unwrap().mode,
+        recovered.stat(&fresh, no).unwrap().mode
+      ),
+      (0o644, 0o600, 0o640),
+      "inode {no:?}: each snapshot's mode and the head's survive recovery"
+    );
+  }
+  assert_eq!(
+    recovered.to_image(&fresh, None).unwrap(),
+    image,
+    "the rebuilt volume images as the original"
+  );
+}
+
 /// AC (§4.8): a version shared across a chain of snapshots recovers as one inode and survives being
 /// dropped newest-first with an intervening allocation that reuses freed slots — the adversarial case
 /// for the global newest-referencer-first deadlist reconstruction. If the shared inode were on more
