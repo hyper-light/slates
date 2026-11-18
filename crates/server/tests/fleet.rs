@@ -18963,6 +18963,125 @@ fn a_submit_to_a_green_on_a_non_control_shard_is_answered_once_its_record_commit
   );
 }
 
+/// Shape: the coordinator periods [`a_work_catalog_with_no_session_to_ship_over_waits_for_the_period`] holds the
+/// creating node's record sessions out: several, so a plane that retries the catalog once a period is seen to, and the
+/// counter's bound below is a few periods' worth, not one.
+const CATALOG_HELD_PERIODS: u64 = 5;
+
+/// §4.16 "Commit", A-255's work catalog (g251; windows-11-arm, where `a_submit_made_while_the_council_forms_...` ended
+/// its binary exit 4 in 3 of 3 runs, "shard 0 is spinning", the stuck shard inside `run_record_plane`'s poll,
+/// diag-g251-spin-3). Do: on a formed three-node fleet at `f = 1`, one shard a node, hold the creating node's record
+/// sessions to both peers out of their links for [`CATALOG_HELD_PERIODS`] periods, create a green and a work there, so
+/// the work's catalog finds no session to ship over, and count the catalog ships that found none. Expect: the record
+/// plane retries the catalog at most once a coordinator period meanwhile (the ships with no session grow by at most the
+/// periods that passed, plus the work's own nudge), and once the sessions return a submit of the work is answered as
+/// version 1. Before, the arm that ships a work's catalog nudged the record plane whatever the ship did, so a ship that
+/// found no session ran the next merge pass at once, in the same poll, and the next: the control shard never yielded,
+/// the hold's own task never ran to give the sessions back, and the watchdog ended the process.
+#[test]
+fn a_work_catalog_with_no_session_to_ship_over_waits_for_the_period() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
+    name: "green".to_owned(),
+    require_evidence: false,
+    base: None,
+  }) else {
+    for daemon in daemons {
+      daemon.stop();
+    }
+    panic!("create green");
+  };
+  let held_ns = HEARTBEAT_NS * CATALOG_HELD_PERIODS;
+  let holds: Vec<_> = hosts
+    .iter()
+    .skip(1)
+    .map(|peer| daemons[0].hold_record_session(*peer, held_ns))
+    .collect();
+  let no_session = |daemon: &Daemon| {
+    daemon
+      .fleet_refusals()
+      .ok()
+      .and_then(|refusals| refusals.get("fleet.ship.catalog.no_session").copied())
+      .unwrap_or(0)
+  };
+  let before = no_session(&daemons[0]);
+  let held_from = Instant::now();
+  let created = client.call(&RequestBody::CreateWork {
+    green,
+    name: "work".to_owned(),
+  });
+  // Read once the hold has run out: a plane that waits for its period retried a few times; one that never yields is
+  // read after its watchdog, or not at all.
+  let (_hold, pause) = std::sync::mpsc::channel::<()>();
+  let _ = pause.recv_timeout(Duration::from_nanos(held_ns));
+  let during = no_session(&daemons[0]).saturating_sub(before);
+  let periods =
+    u64::try_from(held_from.elapsed().as_nanos() / u128::from(HEARTBEAT_NS)).unwrap_or(u64::MAX);
+  let submitted = match created {
+    ReplyBody::WorkCreated { id: work, .. } => {
+      let _ = client.call(&RequestBody::Edit {
+        work,
+        path: "f".to_owned(),
+        at: 0,
+        delete_len: 0,
+        bytes: b"hello".to_vec(),
+      });
+      client
+        .try_call(
+          &RequestBody::Submit {
+            work,
+            evidence: Vec::new(),
+          },
+          u64::try_from(formation_deadline().as_nanos()).unwrap_or(u64::MAX),
+        )
+        .ok()
+    }
+    _ => None,
+  };
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    holds
+      .iter()
+      .all(|held| matches!(held, Ok(SessionHold::Took { .. }))),
+    "both peers' record sessions were held out: {holds:?}"
+  );
+  assert!(
+    matches!(created, ReplyBody::WorkCreated { .. }),
+    "the work was created: {created:?}"
+  );
+  assert!(
+    during > 0,
+    "the work's catalog was shipped with no session to ship over while the sessions were held (non-vacuity)"
+  );
+  // A period ships each catalog its node owes at most twice with no session: once among the period's heads
+  // (`run_record_period`) and once in a merge pass a nudge from elsewhere ran (`pace_running_merges`). Two catalogs
+  // can be owed here, the green's (made just before the hold, and perhaps not yet placed) and the work's, over the
+  // periods that passed and the one under way; the work's own nudge runs one pass more.
+  let owed_catalogs = 2;
+  let ships_a_period = 2;
+  let most = periods
+    .saturating_add(1)
+    .saturating_mul(owed_catalogs * ships_a_period)
+    .saturating_add(1);
+  assert!(
+    during <= most,
+    "the catalog was shipped {during} times with no session in {periods} periods (at most {most}): the record plane \
+     ran its passes back to back instead of waiting for its period"
+  );
+  assert_eq!(
+    submitted,
+    Some(ReplyBody::Submitted {
+      version: Some(1),
+      conflicts: Vec::new(),
+    }),
+    "once the sessions returned the catalog committed and the submit was answered"
+  );
+}
+
 /// §4.16 "Commit" (AUD-11) under a forming configuration (the bug record of 2026-11-06: in a deployed three-server
 /// fleet no submit was ever answered). The bootstrap gives the bootstrapping node a one-voter council and installs its
 /// one-candidate placement at once, so a green made and submitted to there before the council grows enqueued its merge

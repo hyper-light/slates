@@ -2572,7 +2572,13 @@
 >   again 2026-11-17 in an in-process fleet test binary (adas-macbook-pro, macOS arm64, debug, load 23 to 56, beside
 >   another fleet test process): `shard 0 is spinning, 1077 ms of CPU without a step` ended the binary (exit 4) in the
 >   third of 13 A-255 and tombstone tests; which test it was is not known. The 11 it never ran passed one to a process
->   at load 70 to 116, so it did not reproduce.
+>   at load 70 to 116, so it did not reproduce. **One cause found and fixed 2026-11-18 (g251):** a work's catalog with
+>   no session to ship over held a one-shard node's control shard inside its record plane's poll, the merge plane
+>   nudging itself after every ship (windows-11-arm, 3 of 3 runs of the council-forms submit test; the shard's pulse
+>   dumped at the verdict named `run_record_plane`'s task, diag-g251-spin-3). The arm nudges now only when the ship's
+>   placement was recorded (`docs/bugs/2026-11-18-a-work-catalog-with-no-session-spun-the-record-plane.md`;
+>   `a_work_catalog_with_no_session_to_ship_over_waits_for_the_period`: red 233,090 ships with no session in 25
+>   periods, green within the bound). The 2026-11-17 sighting has its shape; the 2026-11-08 one is not established.
 > - **Siblings with the same blind spot.** `crate::observe::ShardTime` (`next_window_ns`), used by observations and the
 >   cross-shard waits (`xshard`), gave up on a window with no CPU progress, so a starved shard's observation or call
 >   ended early: **fixed 2026-11-08 (bug-sweep).** A window with no CPU progress now ends the wait only if the scheduler
@@ -2662,7 +2668,14 @@
 > **`LIVENESS_BUDGET_NS` is still a fixed second (R3 debt, 2026-11-06; follow-on, not A-228).** It is A-228's window and
 > the reply-deadline unit of about 60 files (the client's and the server's deadlines, observations, the scatter's room
 > wait). A-228 judges the window in each shard's own CPU time, which keeps a starved daemon alive, but the window's length
-> is still the `Shape:` constant "a second", not measured.
+> is still the `Shape:` constant "a second", not measured. **Derived since 2026-11-18 (A-359, goal g255):** `W` is the
+> ratified recovery budget `T` by rent or buy (a verdict waits as long as the recovery it starts costs), the heartbeat
+> `W / ELECTION_MARGIN`, the same values; the machine's wake p99 at boot is its floor, and the boot log names both and
+> says when the floor passes the window. Owed, in order: `W` held at runtime so a daemon runs at its floor where that
+> is past `W` (every use is listed by class in A-359); the failover SLO derived as the membership horizon plus the
+> council's confirmation window plus `T` (2.9 s today) once each consumer that takes it as a lease term (a landing's
+> target lease, a CLI attachment's term, the NFSv4 and delegation leases, the restart cap) has its own term; and the
+> class C claim wait below.
 >
 > - **Class A, a cross-shard wait judged in its target's own time (2026-11-06, in progress).** A verb's wait for
 >   another shard's answer gave up at the wall second while the target was alive and starved, and the work went on to
