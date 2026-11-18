@@ -4345,8 +4345,21 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
   attachment then holds what the saved one did, a file the guest held with no name left included, and its guest is
   shown the same owners. A handle the restored guest's kernel kept gives its open back at its release, as one from
   before a takeover does (A-152). Anything else is refused with its reason, and changes nothing;
+- a resync channel beside the stream (A-316; `slates_bridge_fuse::shards_resync`), for a stream to outlive its
+  daemon on Shards' coordinator's conditions (2026-11-18): a message pair made at the attach (Linux; macOS and Windows
+  hand none yet), whose first message, `Attached`, names the attachment and its resync token, 128 bits from the
+  daemon's secure random and never its mount capability. The daemon's end is held by the anchor, as a FUSE device is,
+  with the token and the stream's owner view as its session, updated when the guest names its owner, and released when
+  the attachment ends or its guest first maps a file with DAX (whose stores then live where only the device maps them).
+  A successor hands the device a fresh stream over it in a `Resync` naming the same token; the device takes nothing
+  else (default deny), resends its outstanding request whole, and asks again for its DAX descriptors; the successor
+  answers a request the dead daemon published and never answered from that reply, never by running it again;
 - the peer's close, a hostile frame, a detach, a revocation, the volume's destroy and the daemon's stop end the
-  attachment one way: its references swept, its record removed. Nothing survives a restart.
+  attachment one way: its references swept, its record removed, its resync channel released. A daemon's death ends
+  nothing by itself: recovery keeps a Shards attachment whose resync end the anchor held (Linux; A-316) and serves it on
+  a fresh stream, its owner view and token from the hold, its references and opens from the image, the reply the dead
+  daemon published and never wrote answering the request the device resends, and the writes it acknowledged after its
+  last publication replayed from the write log (A-63) as a mount's are; it removes any other's record, as before.
 
 > **Status (2026-10-24).** Built and proven by use, in-process: `crates/server/src/shards.rs` (the serve task),
 > `crates/ipc/src/stream.rs` (the pair), `crates/bridge-fuse/src/shards_fs.rs` (the frames and their answers),
@@ -4427,6 +4440,27 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 > same (`crates/bridge-fuse/tests/shards_fs.rs`; the rules' unit tests in `crates/bridge-core/src/posix_acl.rs`). Owed:
 > a real guest's run (a Shards guest over a stream, a VM over slates' own virtio-fs device), and Shards' own server
 > enforcing them too (Shards' side, after its v0.8.0 tag).
+
+> **Status (2026-11-18, A-316, the successor's half).** Built and proven by use on Linux, with a test that plays the
+> anchor and the device across a daemon's death (`crates/server/tests/shards_resync_restart.rs`): each of two streams'
+> devices is handed a fresh stream in a `Resync` naming its token; an exclusive CREATE whose reply the dead daemon
+> published and never wrote is answered with that reply when resent, not run again (`EEXIST`), counted
+> `shards.replayed`; a write acknowledged after the last publication reads back (a stream's writes are now logged as a
+> mount's are, A-63, which also keeps them for the volume when the stream is not resynced); and the file exists once.
+> Owed: macOS (the channel's hand-off and the write log), the anchor holding a stream's DAX objects, Windows on Shards'
+> handle path, and Shards' device half.
+
+> **Status (2026-11-18, A-316, the resync channel, the attach's half).** Built and proven by use on Linux. A Shards
+> attach makes the channel, writes `Attached` first, holds the daemon's end at the anchor with the token and the owner
+> view before the record commits, and hands the device's end right after the stream's on the client's control socket
+> (`ControlDelivery::Resync`); the client returns it (`ShardsStream::resync`), `slates shards --resync-fd M` places it,
+> and `slates_api`'s `serve_shards` hands it (`CONTRACT` 12). With the test as the anchor, each attach's channel brings
+> its own token, the anchor is given the very end the device reads, an owner word brings the anchor the new view, and a
+> detach releases the hold so the device reads the channel's end; with no anchor the device reads `Attached` and then
+> the end (`crates/server/tests/shards_resync.rs`, `shards.rs`; the wire's codec and its hostile inputs in
+> `crates/bridge-fuse/src/shards_resync.rs`). Owed: the successor's half (re-serving a held attachment on a fresh
+> stream, `Resync`, the at-most-once replay of a stream's published reply, a stream's writes in the write log), macOS
+> (its hand-off and the write log), DAX objects held by the anchor, and Windows on Shards' handle path.
 
 > **Status (2026-11-18, A-303, a VM's save and restore).** Built and proven by use. Over a real daemon, a guest's SAVE
 > is answered with tables and leaves the volume's newest snapshot; a fresh stream of a clone of that snapshot takes
@@ -5833,6 +5867,16 @@ context. A name is not a host pathname or a bearer capability. Fleet-wide enumer
 owners, each answer linearizable at its owner and the whole labelled with the configuration
 version.
 
+> **Status (2026-11-18, A-317: the location budget is the membership horizon, ended by a look begun after it).** A
+> forward that does not know its volume's owner repeats the read-only location round (the direct route first, and
+> again after the round) every poll interval for the membership horizon (`lease::horizon_ns`, the window in which a
+> detector condemns a member, so a false death is refuted within it), on the wall from its first look, and gives up
+> only once a look begun after the horizon has found no owner: a round waiting on silent peers no longer spends the
+> whole budget, and a refutation the shard read while a round waited is seen before it gives up (clients' runs, nice 19
+> beside two spinners a CPU: 1 or 2 calls refused in every false death under one liveness budget of wall time). The
+> operator's failover SLO caps the whole on the wall. Counted: `fleet.owner_location.gave_up`, and the budget's two
+> ends, `budget_spent` and `slo_ended`.
+
 > **Status (2026-11-06, A-236: a clone's name at its name's partition).** Within a daemon a name routes by its hash to
 > one partition (`owner_of_name`), where it is looked up and where its uniqueness is decided. A clone lives beside its
 > origin, for copy-on-write, so when its name hashes elsewhere, the name's partition holds an alias pointing at the
@@ -5867,8 +5911,31 @@ version.
 > the order of their first send. The same read was answered in 4.1 to 6.5 s, 10 of 10 (load 27 to 33).
 > `a_resend_is_begun_ahead_of_every_forward_first_queued_after_it` and its model test hold the order, and
 > `a_read_through_a_dead_session_keeps_its_place_behind_a_burst` the read
-> (`docs/bugs/2026-11-18-a-resent-forward-lost-its-place-in-the-lane.md`). Owed: a forward still queued is given up at
-> its stall budget while its lane moves, so the backlog is cycled once a budget on the control shard (GAPS).
+> (`docs/bugs/2026-11-18-a-resent-forward-lost-its-place-in-the-lane.md`). Owed then, built by A-315 (below): a forward
+> still queued was given up at its stall budget while its lane moved, so the backlog was cycled once a budget on the
+> control shard.
+
+> **Status (2026-11-18, A-315: a lane's silence is judged in its shard's own time).** A forwarder gave its batch up at
+> the first look past its stall budget. An origin whose control shard was kept off its CPU past a budget woke with its
+> owner's replies unread in its socket, and its waiting forwarders, woken by their timers ahead of the lane's driver,
+> gave those batches up to a live owner. Now a batch quiet for its budget is given up only once a turn of its lane,
+> begun after the silence was first seen, has read the session's own socket empty: the record link's sessions read
+> their own sockets (`Endpoint::client`), so that turn has read everything that reached the socket before. A turn that
+> finds the peer with no session at all counts as one that read it empty, since a dropped session's replies never
+> reach the lane (a survivor's forward to a stopped owner was otherwise held to its failover bound). The shard's
+> waits in its driver (A-292's receiver rule) do not prove it here: the shard waits while another borrower (the link's
+> discovery page) holds the session, and a shard kept busy by other forwards' replies rarely waits at all. A forward
+> still queued, of
+> which nothing was sent, counts its lane's progress as its own (a forward begun, a reply taken, bytes of a reply
+> read), so a backlog that moves is no longer given up and resent once a budget (A-306's owed item). An open forward
+> still counts only its own reply's bytes (the 298 forwards of 2026-11-07). Both are bounded by the failover bound from
+> the forward's first send, which `resolve_and_forward` passes to every send: the lane's progress holds a queued
+> forward only until then, and past it a silence is given up without waiting for the receiver. The judge
+> (`forward_lane::Stall`) is pure and reads no CPU clock and keeps no poll pace, so it holds alike on every platform;
+> loadtest-scale's lane poll clock (`6da9670d`, reverted from the B13 stack) assumed an idle shard's timer fires on
+> time, which Windows' 15.6 ms tick breaks. Tests: the rule's unit and model tests, a queued forward behind a moving
+> lane, and `a_held_origin_gives_up_no_forward_whose_reply_came_while_it_was_held` (`crates/server/tests/fleet.rs`;
+> `docs/bugs/2026-11-18-a-forward-lanes-silence-was-judged-before-its-shard-read-what-came.md`).
 
 > **Status (2026-10-07, same-region lookups).** A lookup by id now reaches its creator from any node of the
 > creator's own region, not only from another region. Before, the server forwarded only a volume homed in another
@@ -6042,7 +6109,9 @@ peer dials it there, so both ends of every session are computed from the same fi
 disagree. A node behind a port mapping (a NAT's port forward, a container runtime's published ports,
 the chaos harness's fault relay) also names where its own two sockets bind (`bind`: an IPv4 literal
 and the base of the same block, A-277); it serves there while every peer still dials its advertised
-ports, and the mapping between them is the operator's. A manifest with fewer than `f + 1` nodes, a
+ports, and the mapping between them is the operator's. It announces the advertised ports alone, the record
+plane's too (A-330), since a peer prefers the announcement to the manifest at every later dial: announced at
+its bound port, every redial of a record link went around the mapping. A manifest with fewer than `f + 1` nodes, a
 repeated name or certificate, a base (advertised or bound) at the end of the port range, or an identity
 the TLS stack cannot use, is refused by name at boot. The two serve
 sockets are bound once, before the daemon starts (`FleetTransport::bind`, between the pure plan and the
@@ -6945,6 +7014,16 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   every kind above and one more, a link severed both ways (a partition that is not transitive), the owner struck as
 >   often as a candidate and once a run until it is taken over, the fleet recovering whole between them; every
 >   invariant is judged across whatever takeovers they cause, Continuity from the samples.
+> - **The relay never carried the record plane (fixed 2026-11-18, A-330).** The first gated runs (the integrator: macOS
+>   arm64, main bfc34cace; Linux x86_64 and arm64, 69cd38b22) failed StaleNeverCommits in the three flows that cut a
+>   running owner off: it acknowledged 2,086 (cut both ways), 3,528 (deafened) and 2,412 (muted) writes sent to it
+>   after the cut, each in under a millisecond, until it was taken over. Every one was durable on a candidate (NoLoss
+>   held on the successor), and 41 datagrams toward the owner reached the relay during the cut. A node announced its
+>   record plane at its bound port, so formation's redial of every record link went straight to the peer's own socket,
+>   and only the probes crossed the relay: every relayed flow was vacuous on the plane its writes are made durable on.
+>   The announcement now carries the advertised port, and every relayed flow requires the relay to have carried at least
+>   one record-plane datagram per acknowledged write (`judge_relayed`, its non-vacuity count;
+>   `docs/bugs/2026-11-18-a-redial-went-around-the-port-mapping-the-record-plane-was-announced-at-its-bound-port.md`).
 
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
@@ -7588,6 +7667,8 @@ it builds against the contract and adds to it rather than around it.
 > **`CONTRACT` = 11** (9 is A-310's `Volumes` seam, 10 a volume's loss window): `DaemonReport::recovered`, appended, the
 > anchor's verdict that the daemon has served as long as its start took, so its exit is no failed start (A-311); a host
 > that ends a daemon on purpose waits for it first.
+> **`CONTRACT` = 12 (A-316):** `ShardsStream::resync`, the device's end of a Shards stream's resync channel, which
+> `serve_shards` hands beside the stream's where the daemon makes one (Linux); none elsewhere and from the simulator.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -23058,6 +23139,148 @@ Applied in the same change to:
   with its place kept that loses it nothing, but it cycles the backlog once a budget on the control shard, which is
   owed apart (GAPS).
 
+### A-315 — A forward lane's silence is judged once its shard has read what came, and a queued forward counts its lane's progress until its failover bound (2026-11-18, built for goal g255; A-306's owed item; supersedes loadtest-scale's lane poll clock, `6da9670d`, never on main)
+Applied in the same change to:
+- §4.8 "Lookup": the status of 2026-11-18 (A-315), and A-306's status, whose owed item this builds.
+- `crates/server/src/forward_lane.rs`: `Stall` (pure, with `Heard`, `Verdict`, `GaveUp` and `Noted`), the lane's
+  `progress_ns` (a forward begun, a reply taken, bytes of a reply read), `turns_begun` and `drained_turn` (`begin_turn`,
+  `mark_drained`: the latest turn that read the session's own socket empty, `left_empty`; `note_sessionless_turn`: a
+  driving turn that found the peer with no session at all), `look_in` and `answer_with`
+  (the view and the reply's bookkeeping apart from the shard and the session), `failover_bound_from`; the counts
+  `fleet.forward.given_up_silent`, `fleet.forward.given_up_at_bound`, `fleet.forward.silence_awaited_receiver`,
+  `fleet.forward.held_by_lane` and `fleet.forward.sessionless_turn`; the module doc. `crates/server/src/fleet.rs`
+  (`forward_batch_over_leader_session` takes the bound; `forward_over_leader_session` passes one from its own send) and
+  `crates/server/src/verbs.rs` (`resolve_and_forward` passes its failover bound, from the first send, to every send
+  through `forward_once`).
+  `crates/transport/src/endpoint.rs`: `Endpoint::datagrams_received`, the datagrams an established session took, by
+  which a lane's turn knows it read the socket empty (stream bytes would not tell: a datagram of acknowledgements alone
+  consumes none), and `Endpoint::reads_its_own_socket`, since only a session that reads its own socket proves the
+  socket empty by an empty read.
+- Tests: in `forward_lane.rs`, `a_silence_is_given_up_only_once_a_turn_begun_after_it_reads_the_socket_empty`,
+  `progress_while_a_silence_awaits_its_receiver_starts_the_quiet_again`,
+  `a_queued_forward_counts_its_lanes_progress_until_its_failover_bound`,
+  `a_silence_past_its_bound_is_given_up_without_its_receiver`,
+  `a_batch_whose_own_forwards_progress_is_never_given_up_at_its_bound`,
+  `a_queued_forward_behind_a_moving_lane_is_kept_past_its_own_budget` and the model test
+  `a_stall_judges_every_history_as_the_rule_reads_it`; in `crates/server/tests/fleet.rs`,
+  `a_held_origin_gives_up_no_forward_whose_reply_came_while_it_was_held`, and
+  `a_takeover_adopts_the_newest_head_a_holder_left_out_of_its_pages`, which failed without the sessionless turn.
+- GAPS: the load test's "dead record session" entry (A-306's open item, closed) and the R3 debt of
+  `LIVENESS_BUDGET_NS` (class B, the forward lane). The bug record:
+  `docs/bugs/2026-11-18-a-forward-lanes-silence-was-judged-before-its-shard-read-what-came.md`.
+- **What was there.** A forwarder looked at its batch whenever it woke, and gave it up once none of its forwards had
+  progressed for its stall budget on the wall clock: a liveness budget plus the path's measured round-trip tail. Two
+  things counted against a live owner. An origin whose control shard was kept off its CPU past a budget woke with the
+  owner's replies unread in its socket, and the waiting forwarders, woken by their timers, ran ahead of the lane's
+  driver, which reads one datagram a turn, and gave those batches up. And a forward still queued behind the session's
+  stream credit, of which nothing had been sent, was given up at its budget while its lane moved, and resent: behind a
+  256-client burst, 17,000 to 52,000 batches a run cycled through the control shard that way (A-306).
+- **The rule.** A batch is quiet from the latest of its start, its own forwards' progress and, while one of them is
+  still queued, its lane's progress, the last counted only up to the failover bound from the forward's first send. A
+  batch quiet for its stall budget before the bound is given up only once a driving turn of its lane, begun after the
+  silence was first seen, has read the session's own socket empty (`forward_lane::left_empty`: its drive took no
+  datagram, or one more receive that does not wait took none, counted by `Endpoint::datagrams_received`;
+  `Lane::drained_turn`) or has found the peer with no session at all (`forward_lane::note_sessionless_turn`), looking
+  again every poll interval (`HEARTBEAT_NS / POLL_PER_PERIOD`); progress meanwhile ends
+  the confirmation, and a later silence is confirmed afresh. Past the bound a quiet batch is given up at once. A batch
+  whose own forwards progress is never given up: a long read stalls only when no byte of it comes for a budget, never
+  at a deadline.
+- **Why.** The record link's sessions read their own sockets (`Endpoint::client`), so a turn that reads its socket
+  empty has read every datagram that reached it before, its settles putting the replies into the lane; begun after the
+  silence was first seen, it has read everything that came before the silence was judged. Turns are ordered by the
+  lane's own count (`Lane::turns_begun`), exact on the one shard thread, where clock readings within one step need not
+  be. A lane whose peer has no session at all has nothing left to read: a dropped session is never put back
+  (`fleet::return_sessions` drops a late return), so none of its replies reaches the lane, and a forward begun on it is
+  answered unanswered by the next session's settle; one lent to another borrower is not such a lane, since that
+  borrower reads the socket and the lane settles it on the session's return. Without the sessionless turn a survivor's
+  forward to a stopped owner, whose session its link dropped before the forward's silence was seen, was held to its
+  failover bound (`fleet.forward.no_session` and `fleet.forward.given_up_at_bound` 1 each, 3 of 3 runs). Two proofs
+  were tried first, and the CI runs refused both. The control shard's two waits in its driver since the
+  silence (A-292's receiver rule) gave all 7 waiting batches up in 2 of 18 runs of the held-origin test, each run's lane
+  having found its session lent to the link (`fleet.lent_to.link` 1): the shard waits while the link's discovery page
+  holds the session, the lane's replies unsettled. And a turn begun after those waits that took nothing kept a forward
+  its owner never answered open in 2 of 3 runs of `a_silent_forward_gives_up_while_its_session_carries_others` on
+  ubuntu-latest (a session busy with other replies is never found so), while the waits themselves, made the
+  precondition of an empty read, held one past its test's window in 1 of 6 on the merged tree, its shard kept busy by
+  3,035 other replies. The lane's state lives on its shard, so the verdict needs no further look, as A-292's
+  hand-off to a volume's shard does. A queued forward has sent nothing, so its lane moving is the only progress it can
+  make; an open one keeps to its own reply's bytes, since bytes of other forwards' replies kept forwards an owner never
+  answered open for good (the 298 forwards of 2026-11-07). The failover bound is the operator's bound on how long an
+  owner may go unserved, the bound the caller's resends already keep, so nothing here waits past it for a receiver that
+  never waits (always busy) or a lane that never begins a forward.
+- **Why not loadtest-scale's poll clock.** `6da9670d` counted the quiet on a clock each lane's driving turns credited:
+  a turn's wall time up to the larger of a 10 ms poll pace and the CPU its shard ran. It assumed an idle shard's timer
+  fires on time. Windows' completion-port wait keeps the system's 15.6 ms tick (`crates/rt/src/iocp.rs` asks no finer
+  timer), and Windows charges a thread's CPU time a tick at a time, so by the code an idle origin's clock ran at about
+  two thirds of the wall there. The test that wants a forward resent at its budget saw none resent, 5 of 5 on
+  `windows-latest` (`an_unanswered_forward_is_sent_again_within_the_takeover_bound`, run 44230887960), and it was
+  reverted from the B13 stack (`b458723c9`). The receiver's waits are counted the same way on every platform.
+- **Evidence.** `a_held_origin_gives_up_no_forward_whose_reply_came_while_it_was_held` (eight reads through b, a's
+  answers delayed half a budget, b's control shard held 1.5 budgets once the forwards were begun), on GitHub's
+  ubuntu-latest, macos-latest and windows-latest runners (2026-11-18): main's lane failed 9 of 9, each run giving up
+  and resending 7 of the 8 batches (run 44253485264); A-315 as landed passed 16 of 16 on ubuntu-latest and
+  windows-latest on the merged tree, none given up, 6 or 7 silences held for the receiver a run (run 44260700333), with
+  the lane's other promises kept (the silent forward given up while others flow, 12 of 12; a forward resent at its
+  budget, 6 of 6; the dead-session tests, 6 of 6 each). Each of six mutations of the rule turns a unit test red (run
+  44260700876). The server suite found the sessionless case before landing:
+  `a_takeover_adopts_the_newest_head_a_holder_left_out_of_its_pages` failed 8 of 8 on ubuntu-latest without the
+  sessionless turn, its serve poll lasting 10.01 s, the bound (run 44269560693), where main passed it 8 of 8 (run
+  44269560657); with it, 8 of 8, and 4 of 4 on windows-latest where it had failed 3 of 3 (runs 44271632046 and
+  44271632037), the lane's other tests unchanged, and sixteen runs a side served its volumes in 2.11 to 3.13 s, main
+  in 2.15 to 3.37 s (runs 44272364924 and 44272413371). With A-317 over it, the held-origin test passed 3 of 3 on each
+  of the three runners, macos-latest among them, and the takeover test 6 of 6 on each (run 44273659893). The bug
+  record has the forms that did not land.
+- **Cost.** A look reads the lane's two turn counts. A silence awaiting its receiver looks again every poll interval
+  while it lasts, and a turn that read a datagram makes one more receive that does not wait. The lane's progress is one
+  stored instant per begin, reply and byte-bearing turn.
+- **Owed.** The supervisor's runs of the fleet suite under load and on Windows, and the load test's count of batches
+  given up behind a burst (A-306's 17,000 to 52,000 a run), which this should bring near none.
+
+### A-317 — A forward's owner location is given the membership horizon, ended by a look begun after it, within the failover SLO (2026-11-18, built for goal g255; clients' class B, `3c072f490`, with the supervisor's derivation)
+Applied in the same change to:
+- §4.8 "Lookup": the status of 2026-11-18 (A-317).
+- `crates/server/src/verbs.rs`: `locate_within_budget` (the give-up counted on the caller's side of the loop) and
+  `locate_within_horizon`, and the counts `fleet.owner_location.gave_up`, `.budget_spent` and `.slo_ended`.
+- Tests (`crates/server/tests/fleet.rs`): `a_forward_with_no_owner_to_find_keeps_looking_for_its_location_budget` and
+  `the_failover_slo_ends_a_forwards_location_budget` (new), and
+  `a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget`, judged by the location's own counts
+  (clients' rewrite).
+- GAPS: the R3 debt of `LIVENESS_BUDGET_NS` (class B, the location budget).
+- **What was there.** A forward with no known owner gave its location one liveness budget of wall time, a fixed
+  second: the direct route, then a round, again every poll interval until the second ran out. A control shard kept off
+  its CPU ran out of it while the gossip that refutes a false death waited to be read, and its client was refused for
+  the machine's load (clients' runs at nice 19 beside two spinners a CPU, 1 or 2 calls in every false death); and with
+  silent peers the first round's own wait spent the whole second, so the location never looked again.
+- **The rule.** The location looks (the direct route, a round, and the direct route again) every poll interval. It
+  gives up once a look begun after the membership horizon, on the wall from its first look, has found no owner, or once
+  the operator's failover SLO has passed.
+- **Why.** An owner is unfindable while live for the time a false death takes to be gossiped and refuted, which the
+  detector's own horizon bounds (the supervisor's derivation of 2026-11-07: the location budget is the membership
+  horizon), not for a liveness budget. Ending only with a look begun after it means a round that outlasted the horizon
+  is followed by one more look, and the direct route asked after each round sees what the shard read while the round
+  waited on its peers.
+- **The forms that did not land.** Clients' polls (a liveness budget's worth at the poll interval, capped by the
+  failover SLO): a round that waits a liveness budget on a silent peer makes each poll a second, so a forward's
+  location runs to the SLO, ten times main's second. And the horizon followed by two waits of the control shard in its
+  driver (A-292's receiver rule): a busy shard rarely waits, so it too runs to the SLO (A-315 found the same on the
+  forward lane). Built first on main as of `9addf53ef`, each rewrite, this one included, made the five-node takeover test
+  `a_survivor_holding_no_copy_of_the_works_catalog_learns_its_green_from_a_location_round` fail there (2 of 6, 4 of 15
+  and 8 of 24 GitHub runs, against 0 of 9 on that base's own budget). On main as of `bfc34cace` this form passes it 16
+  of 16 on ubuntu-latest and windows-latest, as main does (`diag-g255-a255-green-1`, `-red-1`); what changed between
+  the two bases to make the difference was not traced.
+- **Evidence.** On GitHub's ubuntu-latest, macos-latest and windows-latest runners (2026-11-18):
+  `a_forward_with_no_owner_to_find_keeps_looking_for_its_location_budget` failed 3 of 3 on each over main's budget,
+  the location never looking again (`diag-g255-loc-red-1`, `-red-3`), and passed 3 of 3 on each with this form, as did
+  `the_failover_slo_ends_a_forwards_location_budget`, the false-death test and the location round's session-out test
+  (`-green-4`, run 44260988795); the five-node takeover test, 16 of 16 over main as of `bfc34cace` (above). Over
+  A-315 and main as of `1e8f4a49e` (`diag-g255-land2-1`, run 44273659893), on each of the three runners the four
+  location tests 3 of 3 each, the five-node takeover test and the left-out-head takeover test 6 of 6 each, and the
+  held-origin test 3 of 3; and fmt, clippy and the whole `slates-server` suite pass on ubuntu-latest, `fleet` 157 of
+  157.
+- **Cost.** None at the location's steady state: one more look at the direct route a round. A location that cannot find
+  its owner ends one look past the horizon: about a poll interval when its rounds are answered, and one round's wait
+  when they wait on a silent peer.
+
 ### A-273 — A shard that holds a green's works keeps a replica of the green, fed the owner's accepted versions in order; a rebase and a read at a named version are served there, over the owner's content in place (2026-11-17; the text first, the code after W1 lands)
 Applied in the same change to: GAPS (A-273's entry). Nothing else yet: the tests come first, then the code.
 
@@ -24083,3 +24306,109 @@ Applied in the same change to: §4.14 `daemon.alive` (status), GAPS (2026-11-18 
 - **What it does not change.** The wedged and starved judgments (wall time, the budget), the anchor's lapse judgment,
   the beat, and a release build's window (its chain runs at machine code's speed, so the budget stands). Under Miri, which
   runs no machine code and has no thread clock, the watchdog judges by the wall as before.
+
+### A-330 — A node announces its record plane where it advertises it, never at its bound port (2026-11-18, goal g229, the chaos flows' first runs; completes A-277)
+Applied in the same change to: §4.8 "Deployment" (what a node announces), §4.10's chaos status, GAPS ("Chaos from
+outside the processes"), and the code below.
+- **What was there.** A-277 let a node bind elsewhere than it advertises and stated that it "still announces only" its
+  advertised address. Its discovery announcement carried the advertised IP with the port its record socket was bound
+  to (`fleet::run_membership`, `record_socket.local_addr()`), and a peer prefers an announced address to its manifest
+  at every dial (`fleet::resolve_peer_address`). Formation redials every record link once, when the peer's fresh
+  member id is learned, so from then on every record link went to the peer's bound socket directly.
+- **What it broke.** Behind the chaos harness's fault relay, only the probes crossed the relay: the owner partition
+  flows' owners lost their leases and were taken over, but went on shipping and acknowledging writes over record links
+  the relay never saw (2,086, 3,528 and 2,412 writes acknowledged after their cuts, each durable on a candidate), and
+  every relayed flow's faults missed the record plane. Behind a real port mapping, a record link's redial would dial
+  the advertised host at the inner port, which the mapping does not forward, and never come back.
+- **The rule.** A node announces each plane at the address its peers dial: the probe plane at its advertised address,
+  the record plane at the advertised block's next port (`FleetTransport::advertise_record`, set by the plan from the
+  advertised block, never the bind). Nothing a node publishes to a peer is read from a socket it bound.
+- **The failing test.** `a_candidate_behind_a_port_mapping_is_redialed_through_it_so_a_cut_there_holds_its_record_plane`
+  (`crates/server/tests/fleet.rs`): a three-node fleet whose candidates each sit behind a port mapping in the test; a
+  live write made while both mappings' record planes are cut must not be acknowledged, and must be once they heal.
+  With the bound port announced again, the owner redials around the mappings and the write is acknowledged while cut.
+- **The flows' non-vacuity.** Every relayed flow of `live_chaos.rs` now requires its relay to have carried at least
+  one record-plane datagram per acknowledged write (`judge_relayed`, over the relay's per-path record count): a stream
+  sends its next write only once the last is answered, so each acknowledgement is a distinct answer from a candidate.
+- Record: `docs/bugs/2026-11-18-a-redial-went-around-the-port-mapping-the-record-plane-was-announced-at-its-bound-port.md`.
+
+### A-316 — A Shards stream outlives its daemon: a resync channel made at the attach, its token held with the daemon's end by the anchor, and a successor that serves the attachment on a fresh stream and hands the device its end (2026-11-18, built for goal g268, what Shards needs from slates; Linux)
+
+Applied in the same change to:
+- §4.6, the Shards form: the resync channel's bullet, the teardown bullet (the channel released; nothing survives a
+  restart yet), and the status of this date. §4.12: `CONTRACT` 12 (10 and 11 went to the loss window and `DaemonReport::recovered` the same day). `docs/cli.md`: `slates shards --resync-fd`. GAPS:
+  A-281's entry, whose owed restart item now names what is built and what is owed.
+- `crates/bridge-fuse`: `shards_resync.rs` (the wire: `ResyncMessage`, its 28 bytes, `parse`, and `resyncs`, the
+  device's default-deny check), with its golden vector, forgery and hostile-input tests.
+- `crates/ipc`: `stream::message_pair` (sequenced packets on Linux, datagrams on macOS), `stream::recv_message` (a
+  message and the descriptors it carried), `stream::exec_with_ends` (several ends, each at its number, every source
+  copied above every number first; `exec_with` is it for one); the control socket's `ControlDelivery::Resync`, sent by
+  `Control::send_resync` right after a stream whose delivery says `resync_follows`. The tests:
+  `a_message_pair_keeps_each_message_whole_and_carries_a_descriptor`,
+  `ends_handed_below_three_or_two_at_one_number_are_refused_before_exec`,
+  `a_streams_resync_end_follows_its_end_on_the_control_socket`.
+- `crates/server`: `shards/resync.rs` (`establish`, `tell_owners`, `give_up`, the hold's session bytes and their unit
+  test); `shards.rs` makes the channel before the record commits, tells the anchor the owner view the guest names,
+  gives the channel up at the attachment's end and at its guest's first DAX map (`dax::answer`), counts
+  `shards.resync_unmade`, `shards.resync_unheld` and `shards.resync_given_up`, and hands the device's end with the
+  stream's. The tests: `a_stream_whose_resync_end_no_anchor_holds_tells_its_device_no_resync_will_come`
+  (`tests/shards.rs`) and `a_streams_resync_end_is_held_by_the_anchor_with_its_token_and_owners_and_released_at_its_end`
+  (`tests/shards_resync.rs`, a binary of its own, the test playing the anchor).
+- `crates/client`: `ShardsStream::resync`, taken after the stream's delivery when it says one follows.
+- `crates/cli`: `slates shards ... --resync-fd M` (Unix; refused on Windows), handing an ended channel where the daemon
+  made none. `crates/api`: `ShardsStream::resync` reaches consumers through `serve_shards`; the simulator hands none.
+- The successor's half (`crates/server`): `fuse_hold::HeldDevice::raw_session`; `verbs::reconcile_lost` keeps a Shards
+  record whose resync end was held (`ShardState::adopt_shards`); `shards::adopt_held` and `adopt_one` (run after
+  recovery, beside `fuse::adopt_held`), `ShardsStream::new` (one constructor for the attach and the adoption),
+  `ShardsStream::replay` with `replayed`, `keep_pending_reply`, `sent_whole`, `log_write` and `written`; the counters
+  `shards.resynced`, `shards.resync_refused`, `shards.replayed`; `resync::send_resync`; and the test support
+  `Daemon::withhold_shards_replies` (`shards.reply_withheld`). The test: `crates/server/tests/shards_resync_restart.rs`,
+  a binary of its own in which the test plays the anchor and the devices across a daemon's death.
+
+- **What was there.** A Shards stream ended with its daemon: the device read the stream's end and the share ended,
+  and recovery removed the guest's record (counted in `attachments_dropped`). Shards' coordinator accepted a resync
+  channel on conditions (2026-11-18): (4a) the new stream proves it is the same attachment by a token from the original
+  attach, checked by the device before it resends anything, default deny; (4b) the device resends its outstanding
+  request whole and asks again for each DAX mapping's descriptor, and slates answers a non-idempotent request at most
+  once from A-61's record; (4c) Windows waits on Shards' handle path. A held byte stream was rejected for the
+  framing: a reply a daemon died part-way through cannot be told from payload by a device that reads with
+  `read_exact`, so a successor gives the device a fresh stream instead.
+- **The wire** (`slates_bridge_fuse::shards_resync`, sent to Shards' coordinator 2026-11-18 for its device): one way,
+  each message one packet of 28 bytes (kind, version 1, two zero bytes, the attachment, the token). `Attached` first, at
+  the attach, carrying no descriptor; `Resync` from a successor, carrying exactly one, the device's end of a fresh
+  stream. The device takes a resync only for its attachment and token, the token compared over all its bytes.
+- **The token.** 128 bits from the daemon's secure random, per attachment; a token not minted (no secure random) means
+  no channel, never a weak one. Not the attachment's mount capability, which the NFS edge accepts: a VMM given that could
+  mount the volume over NFS. Kept beside the daemon's held end and never on disk, so holding the device's end of the
+  channel alone proves nothing to a device that checks the token.
+- **The anchor needs nothing new.** The daemon's end is an ordinary held descriptor (`slates_anchor::held`'s hold,
+  session and release, keyed by attachment); its session is the token and the owner view, 32 bytes, the anchor's cap.
+  The next daemon tells it from a FUSE device by the form of the attachment's record. Until the successor's half is
+  built it releases every such end as one no record of its kind claims (`crate::fuse::adopt_held`; macOS releases every
+  held descriptor), so the device reads the channel's end once recovery has run: Shards' option (a), as before.
+- **DAX.** A guest's stores through a DAX map live in an object only the device maps once its daemon is gone, so a
+  successor answering the device's new descriptor asks with fresh objects would lose them. Until the anchor holds a
+  stream's DAX objects (as it holds a writable direct map's copy, A-197), a stream gives its resync up at its guest's
+  first map, counted, and the device reads the channel's end: it knows that share ends at a daemon's death.
+- **Evidence.** The codec's golden vector, forgeries and hostile inputs; the control socket's delivery order; the
+  message pair's whole messages and descriptor; with the test as the anchor, two attaches' channels (distinct tokens,
+  each `Attached` first), the holds and sessions the anchor receives, the owner word's session, the held end being the
+  device's own channel, and the release at a detach followed by the device reading the end; with no anchor, `Attached`
+  then the end. Unit runs: see the commit.
+- **The successor's half** (built the same day, Linux; `shards::adopt_held`, `shards::adopt_one`,
+  `shards/resync.rs` `send_resync`). Recovery keeps a Shards record whose resync end the anchor handed back
+  (`verbs::reconcile_lost`, beside the FUSE rule), and the successor serves it on a fresh stream as the same
+  attachment: the registry re-admits the record's rights under the record as owner, so the references and opens the
+  image carried are its own (A-152 gives back an open at the release of a handle the dead daemon issued); its
+  directory from the record; its owner view and token from the hold's session; no `INIT` and no restore. It then sends
+  the device a `Resync` over the held end with the fresh stream's end riding it; a refusal anywhere ends the attachment
+  and releases the hold (`shards.resync_refused`). A stream a successor may resync keeps each barrier reply in the
+  shard's pending replies before the publication, as a mount does (`keep_pending_reply`), released once the reply is
+  written whole or refused; the successor answers a first request whose unique is that reply's from it
+  (`shards.replayed`), and drops it at any other first request. And a stream's successful `WRITE` is logged before its
+  reply (`log_write`, as `fuse`'s), so a write acknowledged after the last publication survives the death, whether or
+  not the stream is resynced: before, such a write was lost with the daemon (a sibling of A-63's finding, found here).
+  The parse test also found `--resync-fd` missing from the CLI's table of value flags.
+- **Owed** (GAPS): macOS (the channel's hand-off on the socket route, and the write log, which a resync there needs so
+  no write acknowledged after the last barrier is lost); the anchor holding a stream's DAX objects; Windows on Shards'
+  handle path; and Shards' device half (ROOT, after its v0.8.0 tag).
