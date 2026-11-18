@@ -119,7 +119,8 @@ impl Query {
           .filter(|owner| *owner != local && eligible(state, *owner, RegionId(self.region)))
       })
       .or_else(|| {
-        (creator != local && eligible(state, creator, RegionId(self.region))).then_some(creator)
+        // Red check (guard 2 removed): this node may be its own creator route.
+        eligible(state, creator, RegionId(self.region)).then_some(creator)
       })
   }
 }
