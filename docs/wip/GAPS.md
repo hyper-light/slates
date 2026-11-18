@@ -975,7 +975,12 @@
 >   (`a_synchronous_park_beside_a_running_bridge_is_woken_by_its_reply`, red without the pass-on: round 0 took 502 ms of
 >   its 500 ms deadline). The Node by-use test (`sdk.test.mjs`, parked calls beside the signal, with `spinFor` and
 >   `parkRatio` bound) is filed for main's run. A bridge whose thread the OS refuses is now refused typed
->   (`a_bridge_whose_thread_the_os_refuses_is_refused_typed`);
+>   (`a_bridge_whose_thread_the_os_refuses_is_refused_typed`). Closed the same day: each macOS and Windows bridge start
+>   kept two blocks for good (`Box::leak`ed stop flag and park mark), so a client turning its async completion on and
+>   off grew without end (128 blocks over 64 turns); the stop is a channel the two ends free, and the mark is the
+>   parked flag itself, the async arm having its own value (`PARKED_ASYNC`)
+>   (`a_client_turning_its_async_completion_on_and_off_keeps_no_memory`;
+>   `docs/bugs/2026-11-18-the-completion-bridge-kept-two-blocks-a-start.md`);
 > - a run of the Linux and Windows arms (mount, the CLI's Windows unmount): not compiled on the Mac that built piece 4.
 
 > **git, Mercurial and Subversion over the WinFsp drive (2026-11-17, Part 6 "Real workloads", §4.6; A-300; Ada's
@@ -3568,7 +3573,13 @@
 > its holder's** (`min(F, the gaps' tail + W)`, renewed by every verb and by a holder's `Renew`, fresh after a restart),
 > held by `slates attach --hold` and the library's `slates_client::Hold` (the SDKs make no CLI-form attachment: theirs
 > end with their client); since A-405 a laptop's failover delay counts its anchor's supervision window as its detection
-> (two seconds there); owed: the volume's write lease (D-16) taking its holder's term. Owed, each in its own
+> (two seconds there); **since A-414 the volume's write lease (D-16), a landing's target lease and a staging buffer
+> take the failover delay as their term**, and a write lease stays its holder's while any of its write attachments
+> lives (renewed at each lapse; another principal refused `LeaseHeld` meanwhile), where before it ran out at its term
+> under a live writer. Still on the placeholder, each owed a term of its own: the NFSv4 and delegation leases (with the
+> wait a landing gives a recalled delegation, which must stay equal to the lease the server advertises), the anchor's
+> restart cap, the FUSE helpers' bounds, the status capture's deadline (it should count from the capture, not the
+> request), a move's overdue bound and the telemetry freshness horizon. Owed, each in its own
 > change: each other lease takes its term from a φ-accrual
 > detector of its own holder's renewals (a CLI attachment once the CLI process sends a keepalive); `W`'s floor from the
 > pulses' running wake delay; then `FAILOVER_SLO_NS` and `with_failover_slo` go, since nothing sets `F`. The boot-time
@@ -4675,8 +4686,19 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 >       cannot, nothing taken), its copy is charged against that claim, and a successor's restore takes the claim over.
 >       Red first, `a_candidates_claim_keeps_the_room_its_successor_makes_the_volume_in`: on main the successor's shard,
 >       filled after it held the log, left the volume given up; with the change it is served from its claim
->       (`docs/bugs/2026-11-18-a-successor-with-no-room-gave-up-a-live-volume-a-survivor-held-whole.md`). **Owed:**
->       `live-ship` refusing typed when a candidate cannot admit (next under A-401).
+>       (`docs/bugs/2026-11-18-a-successor-with-no-room-gave-up-a-live-volume-a-survivor-held-whole.md`). Then `live-ship`
+>       itself asks every candidate to admit before it records the flag, and refuses `BudgetExceeded` when one cannot
+>       (A-401's second part; `a_live_ship_a_candidate_cannot_admit_is_refused_and_ships_once_it_can`). The other 15 flows'
+>       single 782 MiB claim (76 % of the runner's 1 GiB shard) is no longer admitted again at a takeover: the successor
+>       takes its candidate claim over. The same room is now met at live-ship, typed when it is not (SLATES_DESIGN A-401,
+>       "The live chaos flows, in numbers"). The runner's case, six bounded claims on one fleet, is its own flow now:
+>       `a_bounded_claim_is_served_by_its_successor_or_refused_before_it_ships` (run request filed 2026-11-18). **Owed:** a
+>       candidate that joins the placement later and cannot admit refuses its first entry `NoRoom`, but the configuration
+>       may still name it a successor. And the control shard's view of its claims can name one its partition released (a
+>       claim admitted for a message the copy then refused is released at the next reconciliation, since only copies
+>       holding entries keep theirs), so the copy's next entry is served as claimed with no claim behind it; found
+>       reviewing the second part, failing test owed (SLATES_DESIGN A-401, its owed item). `live-ship`'s asks are
+>       answered by the partition itself, so they are not misled.
 >     - g230's: Continuity in five flows (A-329: a successor's positions no longer start again at 1) and the nemesis's
 >       fence lag.
 >
@@ -8290,7 +8312,7 @@ or executable regression was performed by this docs change.
 
 | Id | Gap and source finding | Design contract | Closure gate / owning phase |
 |---|---|---|---|
-| GAP-A9-1 | Per-host admission is all-cost on one code path (2026-09-13): content charged at its buddy block, snapshot retention charged from unpromised capacity by the retaining operation (refused typed before mutation, balanced through destroy and recovery), metadata laid out against the class and every volume's records reserved from a per-shard ledger; effective capacity clamped to the OS/job/cgroup bound; mapped and usable reported; an admitted claim protected through resize and recovery; proven by the charge oracle (150 histories) and AC-2.11's neighbour test. **Pressure signal DONE 2026-09-21** (a hold on each shard's byte budget, sampled from `memory_available_now` at the liveness cadence and fanned as the host shortfall's per-shard share; shrinks admittable only, never a committed claim, so a raised hold refuses a new create `BudgetExceeded` while an admitted volume's within-entitlement writes land — `crates/server/tests/nfs_mount.rs`, the pure budget unit; admission.md §5.5). Owed: the Windows job-object bound, guest and open-reference bytes (docs/wip/admission.md); `live-ship` refusing typed when a candidate cannot admit, and a placed seal's successor admitting only at its restore (2026-11-18, A-401: a live log's candidate now reserves the claim as it takes the first entry, its copy is charged against it, and the restore takes it over). (Was: locked flag without locked store, mapped-vs-usable capacity, dynamic allocations competing with bounded claims (BUG-1–3); uncharged metadata/transient/retained bytes could defeat the cap.) | §4.2: atomic all-cost per-host admission; disjoint shard credits; protect outstanding entitlement through resize, pressure and recovery. | AC-0.10/T-0.10; AC-2.11/T-2.13; Phases 0/2. |
+| GAP-A9-1 | Per-host admission is all-cost on one code path (2026-09-13): content charged at its buddy block, snapshot retention charged from unpromised capacity by the retaining operation (refused typed before mutation, balanced through destroy and recovery), metadata laid out against the class and every volume's records reserved from a per-shard ledger; effective capacity clamped to the OS/job/cgroup bound; mapped and usable reported; an admitted claim protected through resize and recovery; proven by the charge oracle (150 histories) and AC-2.11's neighbour test. **Pressure signal DONE 2026-09-21** (a hold on each shard's byte budget, sampled from `memory_available_now` at the liveness cadence and fanned as the host shortfall's per-shard share; shrinks admittable only, never a committed claim, so a raised hold refuses a new create `BudgetExceeded` while an admitted volume's within-entitlement writes land — `crates/server/tests/nfs_mount.rs`, the pure budget unit; admission.md §5.5). Owed: the Windows job-object bound, guest and open-reference bytes (docs/wip/admission.md); a placed seal's successor admitting only at its restore, and a candidate that joins a live volume's placement later without room to admit, and the control shard's view of its claims naming one its partition released (2026-11-18, A-401: a live log's candidate reserves the claim as it takes the first entry or at the owner's ask, its copy is charged against it, the restore takes it over, and `live-ship` refuses typed when a candidate cannot admit). (Was: locked flag without locked store, mapped-vs-usable capacity, dynamic allocations competing with bounded claims (BUG-1–3); uncharged metadata/transient/retained bytes could defeat the cap.) | §4.2: atomic all-cost per-host admission; disjoint shard credits; protect outstanding entitlement through resize, pressure and recovery. | AC-0.10/T-0.10; AC-2.11/T-2.13; Phases 0/2. |
 | GAP-A9-2 | Live bases and immutable complete snapshots conflated; remote delta-only clone drops untouched state; base capture not implemented. | §4.4/§4.15/§4.10: retained BaseRef and explicit coverage; stable-source requirement for complete atomic capture. | AC-1.16/T-1.20; AC-8.21/T-8.19; Phases 1/8. |
 | GAP-A9-3 | **Swept 2026-09-14 (`991c84e`..`b4eeb2d`)**: base lookup loads the listing on demand and every metadata mutation copies up through the base plane; the FUSE flags are checked against the kernel header by 18 independent vectors (which found and fixed `flags2` never negotiated); READDIRPLUS/FSYNC/LINK dispatch, every setattr field and rename flag honoured or refused `EINVAL`, statfs truthful to the shard budget, invalidations delivered from the journal and watcher hints with a bounded lifetime for live base entries. Still open: the mounted conformance run over native FUSE in the Linux lane (native Linux still mounts through the root NFS adapter, `MountMethod::LinuxRoot`). Closed since (reconciled 2026-11-06, Step 15): the FUSE loop's first compile and a real-kernel serve (dadbdc17, 153ca633), and the owner fields of base entries (13309ce5). (Was: base lookup depends on listing, FUSE flag mismatch, undispatched advertised operations, ignored metadata/rename flags, false statfs (BUG-5–10); coherence delivery and metadata copy-up need sweep.) | §4.5–§4.6: complete shared operations, independent ABI checks, truthful capacity, real invalidations and mounted conformance. | AC-1.17/T-1.21 (by use on one host: closed); AC-3.10/T-3.13 (edge and vectors: closed; mounted: Linux lane); Phases 1/3. |
 | GAP-A9-4 | **Closed 2026-09-21** (the 2026-09-14 pieces stand: bounded generation-checked handles, the deadline-bounded helper handshake that reaps or cancels on every exit, generations with in-flight pins and a barrier refusing typed `BarrierIncomplete`). Now: the daemon holds **one attachment registry per shard** every transport rides — a mount's request is admitted under the registry attachment its capability maps to (admitted on first use, revoked and drained when the catalog attachment ends), the NFS export serves through the shared registry (`Export::over`), and a guest device is admitted into it (`admit` takes the owner's registry; the device keeps its id, its service passes and terminal step take the registry through `BridgeAccess`); `snapshot` runs the barrier over the volume before freezing the root and its reply **says what it covers** (`SnapshotCoverage { boundary: Complete | ServerVisible, attachments_closed }` — server-visible over an NFS mount, whose client buffers acknowledged writes until its `COMMIT`); the FUSE writeback flush has no work left (writeback cache refused at `FUSE_INIT`, 2026-09-19); and a host mount **binds its mount point** (`BindMount` → `AttachForm::ChosenPath`, §4.4 `Binding → Bound`; `slates mount` binds after `mount_nfs`; `status` lists bound mounts under a budget). Proven by use over the real NFS socket (`crates/server/tests/nfs_mount.rs`: coverage complete/0 → server-visible/1 → complete/0 with the mount's life; a bound mount listed, another principal and an SDK attachment refused, the detach unlisting it), the device suites over the shared registry, and the live kernel-mount CLI flow (`status ID` names the mount point while mounted, none after `umount`). **Reopened and fixed 2026-10-23:** a FUSE mount that ended in its serve turn (an unmount, a failed device) was dropped there, so `ended` never revoked or drained its registry attachment. That leaked one slot of the shard's 4096 per unmount, until every attach on the shard was refused. Now `turn` always puts the mount back and `ended` tears it down. Proven by `a_fuse_mounts_unmount_frees_its_registry_attachment` (status `registry_attachments` back to its count before the mount), red then green on the box (`docs/bugs/2026-10-23-a-fuse-mount-that-ends-in-its-turn-keeps-its-registry-attachment.md`). (Was: attachment record is not a mounted path; dirty client caches lack a seal barrier; handles grow and helper error exits can orphan children (BUG-4/14).) | §4.4/§4.6: authenticated binding, ready path/device, barriers, generations, bounded drain/revoke/reuse. | AC-3.11/T-3.14 (seam: closed; kernel-buffered writes: Linux lane); AC-3.12/T-3.15 (closed on this host); Phase 3. |
@@ -16053,7 +16075,8 @@ beside it (no unprivileged process sees a frame number), and L2's shift (no map 
 - A fill that fails part-way unmarks its range but leaves the bytes it stored. A later fill copies only the volume's data
   runs and pages that are not zero, so where the file has since become a hole or zeros, those stale bytes would stay in
   the backing. No test reaches a fill failing part-way. Placement does not widen it: a range is placed only once its
-  fill finishes.
+  fill finishes. **Fixed 2026-11-18 (A-419):** the range is left uncleared and counted, and cleared before its next
+  fill; three unit tests reach a fill failing part-way (the 2026-10-25 G-vhost entry says which).
 
 ### 2026-11-01: the Linux arm64 KVM cells, with no Docker on the Mac (Step 7 of the VFS and DAX plan) — closed
 
@@ -18287,9 +18310,19 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   file's size, so a guest whose size was stale (another path cut the file) mapped a range write-through never reached,
   and read zeros there after a later extension. `covered` now covers every range an ask touches;
   `a_range_asked_past_the_files_end_takes_a_later_write_into_it` failed before and passes after.
-- **Open, observed while reading (owed a test with an injected refusal):** a fill refused part-way unmarks its range
-  but leaves the pages it stored in the object, and a later fill of the range skips what the volume then holds as holes
-  or zeros, so those pages could reach a guest's map.
+- **Fixed 2026-11-18 (A-419, goal 83 B7, g079): a fill refused part-way unmarked its range but left the pages it
+  stored in the object, and a later fill of the range skipped what the volume then held as holes or zeros, so those
+  pages reached a guest's map.** A fill refused or given up part-way now leaves its range uncleared: no write reaches
+  it, it stays counted against the fill budget, and its next fill clears it before storing anything
+  (`docs/bugs/2026-11-18-a-dax-fill-refused-part-way-left-its-bytes-for-a-later-fill-to-show.md`). Tests, with an
+  injected refusal (`crates/bridge-core/src/dax_backing.rs`): `a_fill_refused_part_way_leaves_nothing_a_later_fill_shows`,
+  `a_fill_abandoned_part_way_leaves_nothing_a_later_fill_shows` and
+  `a_part_way_fill_stays_counted_until_its_range_is_filled_again`; red without the fix 3 of 3 (the first slice still
+  read `A` after the file was zeroed; one range counted where two held bytes), green with it, on the Mac Studio.
+  - **Open, the siblings it found (each from reading, each owed a failing test):** a successor's adopted DAX object
+    (A-365) may hold a fill's bytes in a range its range table does not name (a range the dead daemon was filling, or
+    one that failed there), which the successor's next fill skips as before A-419; and on Windows a range is committed
+    before its charge is asked, so a `Budget` refusal leaves a committed range uncounted that Windows never gives back.
 - **Open, reported by A-166's sibling sweep (each from reading; each to be proven by a test before a change):**
   - **Fixed 2026-11-18 (g251):** write-log replay (`verbs::replay_one`) routed a logged FUSE write by its inode number's
     prefix, which for a clone's inherited file is its origin's: a replayed write landed in the origin and the clone lost

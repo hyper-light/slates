@@ -12997,7 +12997,7 @@ const FILL_ATTEMPTS: usize = 3;
 /// Fills `daemon`'s shard (one shard a node in these meshes) with one bounded volume of everything it admits now: a
 /// create past any shard's room is refused `BudgetExceeded` naming what the shard could admit, and a create of that size
 /// takes it. The volume made, or the last reply.
-fn fill_shard(daemon: &Daemon, name: &str) -> Result<VolumeId, ReplyBody> {
+fn fill_shard(daemon: &Daemon, name: &str) -> Result<VolumeId, Box<ReplyBody>> {
   let mut client = Client::connect(daemon.instance());
   let mut limit = u64::MAX / 2;
   let mut last = None;
@@ -13020,9 +13020,9 @@ fn fill_shard(daemon: &Daemon, name: &str) -> Result<VolumeId, ReplyBody> {
       }
     }
   }
-  Err(last.unwrap_or(ReplyBody::Refused {
+  Err(Box::new(last.unwrap_or(ReplyBody::Refused {
     refusal: Refusal::BudgetExceeded { available: limit },
-  }))
+  })))
 }
 
 /// §4.2 ("a remote holder makes the same admission against its own machine before acknowledging placement"; g229, the
@@ -13099,6 +13099,64 @@ fn a_candidates_claim_keeps_the_room_its_successor_makes_the_volume_in() {
   assert!(
     taken > taken_before && given_up == given_up_before,
     "made from its claim ({taken_before} -> {taken}), never given up ({given_up_before} -> {given_up})"
+  );
+}
+
+/// §4.2 (A-401's second part): `live-ship` turns a volume's live shipping on only once every candidate has made the
+/// claim's admission, and refuses `BudgetExceeded` when one cannot. Do: three nodes at `f = 1`, the pressure hold held at
+/// nothing; fill one candidate's shard with everything it admits; on a, create a bounded volume and ask to live-ship it;
+/// then destroy the fill and ask again. Expect the first refused `BudgetExceeded` with the volume not live-shipped, and
+/// the second answered live-shipped. Before, the flag was recorded at once whatever the candidates could hold.
+#[test]
+fn a_live_ship_a_candidate_cannot_admit_is_refused_and_ships_once_it_can() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, _hosts) = formed_mesh(&["a", "b", "c"]);
+  for daemon in &daemons {
+    daemon.inject_available_memory(u64::MAX / 2).unwrap();
+  }
+  let fill = fill_shard(&daemons[1], "fill");
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id } = client.call(&scratch("asked")) else {
+    panic!("the volume was created");
+  };
+  share_with_fleet(&mut client, id, &daemons);
+  let refused = client.call(&RequestBody::LiveShip {
+    volume: id,
+    live_shipped: true,
+  });
+  let shipped_while_full = is_live_shipped(daemons[0].instance(), id);
+  let destroyed = match &fill {
+    Ok(volume) => {
+      Client::connect(daemons[1].instance()).call(&RequestBody::Destroy { volume: *volume })
+    }
+    Err(reply) => reply.clone(),
+  };
+  let shipped = client.call(&RequestBody::LiveShip {
+    volume: id,
+    live_shipped: true,
+  });
+  let shipped_after = is_live_shipped(daemons[0].instance(), id);
+  drop(client);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "asked: fill {fill:?}; first {refused:?} (live {shipped_while_full}); fill destroyed {destroyed:?}; second \
+     {shipped:?} (live {shipped_after})"
+  );
+  assert!(fill.is_ok(), "a candidate's shard was filled: {fill:?}");
+  assert!(
+    matches!(
+      refused,
+      ReplyBody::Refused {
+        refusal: Refusal::BudgetExceeded { .. }
+      }
+    ) && !shipped_while_full,
+    "refused BudgetExceeded and nothing shipped: {refused:?}, live {shipped_while_full}"
+  );
+  assert!(
+    matches!(shipped, ReplyBody::LiveShippingSet { live_shipped: true }) && shipped_after,
+    "live-shipped once the candidate had room: {shipped:?}, live {shipped_after}"
   );
 }
 
@@ -13682,6 +13740,9 @@ fn takeover_outcomes(daemons: &[Daemon]) -> Vec<(u64, u64)> {
     .collect()
 }
 
+/// Each node's counted (live takeovers, given-up objects), before a deaf spell and after it ([`takeover_outcomes`]).
+type OutcomePairs = (Vec<(u64, u64)>, Vec<(u64, u64)>);
+
 /// What one deaf spell of [`deaf_until_its_takeover_resolves`] did: whether the node was made deaf and healed, whether
 /// the others retired it and its takeover resolved meanwhile, each node's live takeovers and given-up objects before
 /// and after, and every node's configuration at the retirement and at the heal.
@@ -13690,7 +13751,7 @@ struct DeafSpell {
   retired: bool,
   resolved: bool,
   healed: bool,
-  outcomes: (Vec<(u64, u64)>, Vec<(u64, u64)>),
+  outcomes: OutcomePairs,
   at_retirement: Vec<String>,
   at_heal: Vec<String>,
 }
@@ -15285,7 +15346,7 @@ fn hex_of_volume(volume: VolumeId) -> String {
 fn volume_of_hex(text: &str) -> VolumeId {
   let mut bytes = [0u8; 16];
   for (index, byte) in bytes.iter_mut().enumerate() {
-    *byte = u8::from_str_radix(&text[2 * index..2 * index + 2], 16).unwrap();
+    *byte = u8::from_str_radix(text.get(2 * index..2 * index + 2).unwrap(), 16).unwrap();
   }
   VolumeId { bytes }
 }
@@ -15355,7 +15416,11 @@ fn a_holder_of_a_volume_its_node_yielded_is_reaped_at_the_successor() {
       .expect("the holder printed its attachment")
       .unwrap();
     if let Some(at) = line.find(YIELDED_HOLDER_TAG) {
-      break line[at + YIELDED_HOLDER_TAG.len()..].trim().to_owned();
+      break line
+        .get(at + YIELDED_HOLDER_TAG.len()..)
+        .unwrap()
+        .trim()
+        .to_owned();
     }
   };
   let observed: Vec<&Daemon> = daemons.iter().collect();
@@ -18154,7 +18219,7 @@ fn an_idle_volumes_nfs_mount_on_an_owner_admitted_again_answers_stale() {
   let (_serve_lease, daemons, hosts) = formed_mesh(&["a", "b", "c"]);
   let name = "yielded-nfs";
   let mut client = Client::connect(daemons[0].instance());
-  let id = live_volume_named(&mut client, &daemons, name);
+  live_volume_named(&mut client, &daemons, name);
   drop(client);
   let port = daemons[0].nfs_port().expect("the daemon serves NFS");
   let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the NFS port");
@@ -23570,7 +23635,10 @@ fn submit_version_on(node: &Daemon, green: VolumeId, version: u64) -> ReplyBody 
 
 /// A work over `green` made on `node`, with one edit of a file `kept` declared and not submitted: the work, or the
 /// refusal of the step that failed.
-fn work_with_an_unsubmitted_edit(node: &Daemon, green: VolumeId) -> Result<VolumeId, ReplyBody> {
+fn work_with_an_unsubmitted_edit(
+  node: &Daemon,
+  green: VolumeId,
+) -> Result<VolumeId, Box<ReplyBody>> {
   let mut client = Client::connect(node.instance());
   let created = client
     .try_call(
@@ -23582,7 +23650,7 @@ fn work_with_an_unsubmitted_edit(node: &Daemon, green: VolumeId) -> Result<Volum
     )
     .unwrap_or_else(|e| refused_placeholder(&e));
   let ReplyBody::WorkCreated { id: work, .. } = created else {
-    return Err(created);
+    return Err(Box::new(created));
   };
   let edited = client.call(&RequestBody::Edit {
     work,
@@ -23593,7 +23661,7 @@ fn work_with_an_unsubmitted_edit(node: &Daemon, green: VolumeId) -> Result<Volum
   });
   match edited {
     ReplyBody::Edited => Ok(work),
-    other => Err(other),
+    other => Err(Box::new(other)),
   }
 }
 

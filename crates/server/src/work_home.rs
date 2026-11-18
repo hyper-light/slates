@@ -1083,6 +1083,10 @@ fn start_ask(
 }
 
 /// What the owner answered for one ask of a batch.
+#[allow(
+  clippy::large_enum_variant,
+  reason = "an answer is the common outcome: boxing it would allocate per ask, to shrink the rare Deferred"
+)]
 enum Outcome {
   Answered(Answered),
   /// The owner took the verdict and answers when it commits.

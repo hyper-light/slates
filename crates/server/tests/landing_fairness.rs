@@ -413,7 +413,8 @@ fn term_for_gap(gap_ns: u64) -> u64 {
     .max(SHORT_TERM_NS)
 }
 
-/// A daemon whose landing lease term (its failover bound) is `term_ns`, bootstrapped, and a client to it.
+/// A daemon whose landing lease term (its failover delay, A-414: injected, since nothing sets the estimate) is
+/// `term_ns`, bootstrapped, and a client to it.
 fn daemon_with_term(term_ns: Option<u64>) -> (Daemon, Client) {
   let profile = common::machine_profile();
   let instance = format!(
@@ -422,10 +423,6 @@ fn daemon_with_term(term_ns: Option<u64>) -> (Daemon, Client) {
     term_ns.unwrap_or(0)
   );
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
-  let config = match term_ns {
-    Some(term_ns) => config.with_failover_slo(term_ns),
-    None => config,
-  };
   let daemon = Daemon::start(
     &profile,
     config,
@@ -437,6 +434,11 @@ fn daemon_with_term(term_ns: Option<u64>) -> (Daemon, Client) {
   daemon
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
+  if let Some(term_ns) = term_ns {
+    daemon
+      .inject_failover(Some(term_ns))
+      .expect("the failover delay is held");
+  }
   let client = connect(&instance);
   (daemon, client)
 }

@@ -813,6 +813,9 @@ impl From<slates_wire::WireError> for HeldRefused {
   }
 }
 
+/// A content hold's pieces by kind (A-376): its chunks', its manifests' and its stages' bytes.
+type PiecesByKind = (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>);
+
 /// Splits a recovered image's held pieces (A-270), each live copy joined from its head and its entries in slot order.
 /// No pieces hold nothing; pieces that do not decode, or that leave a copy's entries short, are refused.
 pub(crate) fn split_held(
@@ -831,7 +834,7 @@ pub(crate) fn split_held(
   let mut positions: BTreeMap<[u8; 16], Vec<slates_db::register::PersistedPosition>> =
     BTreeMap::new();
   // The content hold's chunk, manifest and stage pieces (A-376), put back into its image once all are read.
-  let mut content: (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>) = Default::default();
+  let mut content: PiecesByKind = Default::default();
   for piece in pieces {
     let (kind, object, slot) = split_key(&piece.key);
     match kind {
