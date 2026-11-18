@@ -1296,13 +1296,19 @@ mod asynchronous_form {
   }
 
   /// A-299, R6: do drive the async form over a daemon: provision an empty volume, snapshot it, read its status,
-  /// provision a clone of the snapshot, ask the status of a volume no one made, drop a status call while its wait has
-  /// not answered, ask again, destroy both volumes, and give the instance back to the synchronous form. Expect each
-  /// answer as the synchronous verb answers it, the stranger refused `NotFound` naming the volume, the dropped call
-  /// cancelled without harm (the next call answered), and the synchronous form still serving afterwards.
+  /// provision a clone of the snapshot, ask the status of a volume no one made, then drop more status calls than the
+  /// client admits outstanding twice over, each while its wait has not answered, ask again, destroy the clone, and give
+  /// the instance back to the synchronous form. Expect each answer as the synchronous verb answers it, the stranger
+  /// refused `NotFound` naming the volume, every dropped call cancelled (the next call answered, where calls left
+  /// in the driver would have it refused `TooManyOutstanding`), and the synchronous form still serving afterwards.
   #[test]
   fn an_async_instance_provisions_snapshots_reports_and_destroys() {
-    let (daemon, instance) = grouped("async");
+    let (daemon, mut instance) = grouped("async");
+    let abandoned = instance
+      .client()
+      .outstanding_limit()
+      .saturating_mul(2)
+      .saturating_add(1);
     let mut instance = AsyncInstance::new(instance).unwrap();
     let volume = block_on(instance.provision(&Blocking, &VolumeSpec::empty("async", ROOM)))
       .unwrap()
@@ -1320,7 +1326,8 @@ mod asynchronous_form {
       block_on(instance.status(&Blocking, NOWHERE)),
       Err(Error::NotFound(Missing::Volume(NOWHERE)))
     );
-    {
+    eprintln!("dropping {abandoned} calls while they wait");
+    for _ in 0..abandoned {
       let waiting = instance.status(&Never, volume);
       let mut waiting = pin!(waiting);
       let mut context = Context::from_waker(Waker::noop());
