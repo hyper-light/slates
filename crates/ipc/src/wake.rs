@@ -184,7 +184,7 @@ pub use win_event::Event;
 #[cfg(windows)]
 mod win_event {
   use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
   };
   use windows_sys::Win32::System::Threading::{
     CreateEventW, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
@@ -269,23 +269,28 @@ mod win_event {
       Ok(())
     }
 
-    /// Waits until the Event is signaled or the process `process` exits (`None`: forever), the first of either; both
-    /// are kernel objects one wait takes (`WaitForMultipleObjects`, any of them): a claim waits for its answer beside
-    /// its daemon's exit (A-447).
+    /// Waits until the Event is signaled or the process `process` exits, the first of either, with no timeout; both are
+    /// kernel objects one wait takes (`WaitForMultipleObjects`, any of them): a claim waits for its answer beside its
+    /// daemon's exit (A-447), and a reply beside its daemon's (A-456). `Ok(true)` when the Event was signaled (the wait
+    /// took its signal, as an auto-reset Event's wait does); `Ok(false)` when the process had exited and the Event was
+    /// not signaled. With both, the Event is answered first: the wait reports the lowest-numbered object signaled
+    /// [B: Microsoft Learn, "WaitForMultipleObjects"], and the Event is first in the array.
     pub fn wait_or_exit(
       &self,
       process: std::os::windows::io::BorrowedHandle<'_>,
-    ) -> Result<(), IpcError> {
+    ) -> Result<bool, IpcError> {
       use std::os::windows::io::AsRawHandle;
       let objects: [HANDLE; 2] = [self.handle(), process.as_raw_handle()];
       let count = u32::try_from(objects.len()).unwrap_or(u32::MAX);
       // SAFETY: both handles are live for the call (the Event this struct owns, the process handle the caller borrows),
       // the array outlives the call and `count` is its length.
       let rc = unsafe { WaitForMultipleObjects(count, objects.as_ptr(), 0, INFINITE) };
-      if rc == WAIT_FAILED {
-        return Err(os("WaitForMultipleObjects"));
+      // `WAIT_OBJECT_0` plus the index of the object that ended the wait; `WAIT_FAILED` and anything else is a refusal.
+      match rc.checked_sub(WAIT_OBJECT_0) {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(os("WaitForMultipleObjects")),
       }
-      Ok(())
     }
 
     /// Waits up to `timeout_ns` (`None`: forever). `Ok(true)` when signaled, `Ok(false)` at the timeout.
