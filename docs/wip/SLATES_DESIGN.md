@@ -29670,3 +29670,34 @@ records, `crates/server/src/merge_service.rs` (`record_standing`, `catch_up`, `M
   successor's version 4 committed with it and recomputed there, version 3's input fetched. Kiln r355, the Mac Studio,
   2026-11-18, debug build: green in 4.4 s; red without the catch-up, version 4 answered out of order 4,865 times in
   405 s. The merge unit tests (`merge_origin`, `merge_service`) 27 of 27.
+
+### A-421 — The load test's workers park between replies and sends, as the clients they stand for do (2026-11-18, built for goals 231 and 257, 1,000 clients under 1 ms; the harness's half of A-297's measurement)
+Applied in the same change to: GAPS (the load test's entry), `crates/client/examples/load_bench.rs` (`drive`,
+`Worker::sweep`, `park_until`, `arm_in_flight`, `count_park`, `park_margin_ns`, `next_due`, `park` paired for Unix and
+Windows, `park_timeout_ns`, `Parked`, `Connection::completion`, the `harness` row's park columns, the module's "Workers
+wait"), and the example's tests below.
+- **What was measured.** Every worker spun for its whole level, so the harness took a core a worker from the daemon it
+  measured: eight on the Mac Studio's 32. On that box under load its sweeps took 25 to 127 ms and held 6.9 clients on
+  average, due to send and not yet sent, against 2.2 in flight, at 1,000 clients (g083's trace, 2026-11-18).
+- **The rule.** A worker whose sweep took no reply and sent nothing sweeps on for the daemon's published spin window
+  (the measured mean cost of a wake), as an async client spins before it parks. Then it arms the completion of every
+  connection with a request in flight, drains those once more, which closes the race with a reply that landed before
+  its arm, and parks on every connection's completion until a reply makes one readable or its next deadline comes:
+  the earliest due send, overdue check or progress report. It wakes early by the spin window and by the mean lateness
+  of its timed-out parks, and spins the rest of the way, so a due client is sent on time. Every arm is cleared after
+  the park, so a reply taken while the worker sweeps costs the daemon no wake. A worker does not park while a
+  connection reconnects or resends: those keep their own pacing. A reply that comes while its worker is parked costs
+  the daemon a wake and the worker its wakeup, inside that reply's latency, as it does for an agent's async client.
+- **Per platform.** Linux polls the rendezvous's eventfd and macOS each connection's completion bridge pipe, both with
+  `poll(2)` (on macOS under a launchd job's timer policy it comes back about 2 ms late where `nanosleep` and `select`
+  come back about 76 ms late, 2026-10-26). Windows polls each completion bridge's socket with `WSAPoll`, which waits on
+  at least one socket, so every connection's completion is in the set. A connection whose completion is not armed is
+  never made readable.
+- **Counted.** The `harness` row now ends with the parks, those a reply ended, the worker-nanoseconds parked and the
+  mean lateness of the parks that met their deadline.
+- **Tests** (`cargo test -p slates-client --example load_bench`): `a_parked_worker_is_woken_by_its_reply` (the daemon's
+  one shard held until the worker has armed its connection and found its ring empty; the reply ends the park long
+  before its 5 s deadline and is there to be taken; then, with nothing in flight, a park meets its 20 ms deadline less
+  its margin and its lateness is kept) and `a_park_wakes_its_margin_before_its_deadline`. The stamp tests now stand in
+  for the host's preemption with a yielding wait rather than a blocking sleep (D-9). The A/B is main's: main's harness,
+  spinning, against this one at the same daemon, `held`, `max_sweep_ns` and every kind's `latency` and `floor` p99.
