@@ -11,9 +11,12 @@ use rustix::net::{Ipv4Addr, SocketAddrV4};
 use rustls::pki_types::PrivateKeyDer;
 use slates_cluster::CommitBudget;
 use slates_cluster::live::{
-  LIVE_ENTRY_STREAM, LIVE_STATE_STREAM, fold_late, serve_entry, serve_install, ship,
+  LIVE_ENTRIES_STREAM, LIVE_ENTRY_STREAM, LIVE_STATE_STREAM, fold_late, serve_entries, serve_entry,
+  serve_install, ship,
 };
-use slates_db::live::{Next, Replica, Shipper};
+use slates_db::live::{
+  Bounds, Entry, LiveError, Next, Replica, Shipper, decode_reply, encode_batch,
+};
 use slates_db::register::{HostEpoch, HostId, ObjectId, Quorum};
 use slates_rt::runtime::RuntimeConfig;
 use slates_rt::sim::SimRuntime;
@@ -101,6 +104,11 @@ async fn holder(
       .serve_once(|kind, request| {
         if kind == LIVE_ENTRY_STREAM {
           serve_entry(&mut replica, &request, CAP, |entry| {
+            state.extend_from_slice(&entry.payload);
+            true
+          })
+        } else if kind == LIVE_ENTRIES_STREAM {
+          serve_entries(&mut replica, &request, CAP, |entry| {
             state.extend_from_slice(&entry.payload);
             true
           })
@@ -247,13 +255,27 @@ async fn ship_one(
   (durable, sessions)
 }
 
-fn shipper(credit: u64, retain: usize) -> Shipper {
+/// A shipper from the owner to both holders whose bounds hold `credit` entries in flight and `retain` retained, each
+/// entry of `payload` bytes counted at its wire size as the shipper counts it (`Entry::wire_bytes`).
+fn shipper((credit, retain): (usize, usize), payload: usize) -> Shipper {
+  let entry = Entry {
+    owner: OWNER,
+    object: OBJECT,
+    position: 0,
+    epoch: HostEpoch(1),
+    previous: [0; 32],
+    payload: vec![0; payload],
+  }
+  .wire_bytes();
   Shipper::new(
     (OWNER, OBJECT, HostEpoch(1)),
     Quorum { f: 1 },
     &[OWNER, HOLDERS[0], HOLDERS[1]],
     None,
-    (credit, retain),
+    Bounds {
+      credit: credit * entry,
+      retain: retain * entry,
+    },
   )
 }
 
@@ -267,7 +289,7 @@ fn a_holder_that_joins_late_is_installed_and_then_follows() {
     false,
     Box::new(move |sessions, commands| {
       Box::pin(async move {
-        let mut shipper = shipper(4, 2);
+        let mut shipper = shipper((4, 2), size_of::<u64>());
         let mut late = Vec::new();
         let mut written = Vec::new();
         let (mut sessions, mut aside): (Vec<_>, Vec<_>) = sessions
@@ -396,7 +418,7 @@ fn a_lane_that_ends_with_a_holder_unanswered_gets_every_session_back() {
     true,
     Box::new(move |sessions, commands| {
       Box::pin(async move {
-        let mut shipper = shipper(2, 2);
+        let mut shipper = shipper((2, 2), b"one".len());
         let entry = shipper.append(b"one".to_vec()).unwrap();
         let bytes = entry.encode();
         let (back_tx, back_rx) = channel();
@@ -448,5 +470,143 @@ fn a_lane_that_ends_with_a_holder_unanswered_gets_every_session_back() {
     hosts,
     HOLDERS.to_vec(),
     "every session the lane took came back"
+  );
+}
+
+/// Shape: the entries one batch carries in the batch tests.
+const BATCHED: u64 = 5;
+
+/// A-200 amended 2026-11-17, a batch: do append [`BATCHED`] writes with nothing shipped (a burst while the holders were
+/// away), then ship them all to both holders as one batch, in one exchange. Expect every write durable at that one
+/// exchange's end, and both holders at the owner's head holding exactly the owner's state: one exchange did what one
+/// exchange an entry took [`BATCHED`] round trips to do. Over real endpoints on the simulated fabric.
+#[test]
+fn a_batch_makes_every_entry_it_carries_durable_in_one_exchange() {
+  let (report_tx, report_rx) = channel();
+  let states = run(
+    false,
+    Box::new(move |sessions, _commands| {
+      Box::pin(async move {
+        let mut shipper = shipper(
+          (
+            usize::try_from(BATCHED).unwrap(),
+            usize::try_from(BATCHED).unwrap(),
+          ),
+          size_of::<u64>(),
+        );
+        let mut written = Vec::new();
+        let entries: Vec<Entry> = (0..BATCHED)
+          .map(|value| {
+            let payload = value.to_le_bytes().to_vec();
+            written.extend_from_slice(&payload);
+            shipper.append(payload).unwrap()
+          })
+          .collect();
+        let encoded: Vec<Vec<u8>> = entries.iter().map(Entry::encode).collect();
+        let slices: Vec<&[u8]> = encoded.iter().map(Vec::as_slice).collect();
+        let batch = encode_batch(&slices).unwrap();
+        let last = entries.last().unwrap().position;
+        let shipped = ship(
+          &mut shipper,
+          (LIVE_ENTRIES_STREAM, &batch),
+          None,
+          sessions,
+          CommitBudget::hard(DEADLINE_NS, POLL_NS),
+        )
+        .await;
+        let durable = shipper.durable();
+        let mut late = vec![shipped.stragglers];
+        let sessions = gather(&mut shipper, shipped.reusable, &mut late, 2).await;
+        let _ = report_tx.send((durable, last, shipper.head(), written));
+        for (_, mut endpoint) in sessions {
+          let _ = endpoint
+            .request(
+              STOP_KIND,
+              slates_transport::connection::Priority::Control,
+              &[],
+            )
+            .await;
+        }
+      })
+    }),
+  );
+  let (durable, last, head, written) = report_rx.try_recv().unwrap();
+  assert_eq!(
+    durable,
+    Some(last),
+    "every write of the batch was durable at its one exchange"
+  );
+  assert_eq!(states.len(), 2, "both holders reported");
+  for (host, (held, state)) in states {
+    assert_eq!(held, head, "holder {host:?} ends at the owner's head");
+    assert_eq!(
+      state, written,
+      "holder {host:?} holds every write, in order"
+    );
+  }
+}
+
+/// The entries of `entries` as one batch's bytes.
+fn batch_of(entries: &[Entry]) -> Vec<u8> {
+  let encoded: Vec<Vec<u8>> = entries.iter().map(Entry::encode).collect();
+  let slices: Vec<&[u8]> = encoded.iter().map(Vec::as_slice).collect();
+  encode_batch(&slices).unwrap()
+}
+
+/// A-200 amended 2026-11-17: a batch is applied exactly as its entries are one at a time. Do, on a holder holding
+/// positions 0 and 1: send a batch of positions 3 and 4 (a gap at 2); then one of positions 1 to 4 (1 already held);
+/// then one under an epoch below the holder's fence. Expect the gap applied nothing and answered the head held (1), the
+/// second applied 2 to 4 past the held 1 and answered 4, and the stale one refused `StaleEpoch` with nothing applied.
+#[test]
+fn a_batch_is_applied_in_order_up_to_its_first_gap() {
+  let mut shipper = shipper((8, 8), 1);
+  let entries: Vec<Entry> = (0..5u8)
+    .map(|value| shipper.append(vec![value]).unwrap())
+    .collect();
+  let mut replica = Replica::new(OWNER, OBJECT);
+  replica.accept(&entries[0]).unwrap();
+  let held = replica.accept(&entries[1]).unwrap();
+  let mut applied: Vec<u64> = Vec::new();
+  let gap = serve_entries(&mut replica, &batch_of(&entries[3..]), CAP, |entry| {
+    applied.push(entry.position);
+    true
+  });
+  assert_eq!(
+    (decode_reply(&gap), applied.as_slice()),
+    (Ok(held), [].as_slice()),
+    "a batch past a gap applies nothing and answers the head held"
+  );
+  let caught_up = serve_entries(&mut replica, &batch_of(&entries[1..]), CAP, |entry| {
+    applied.push(entry.position);
+    true
+  });
+  assert_eq!(
+    (decode_reply(&caught_up), applied.as_slice()),
+    (Ok(Some(entries[4].head())), [2, 3, 4].as_slice()),
+    "the held entry is passed over and the rest applied in order"
+  );
+  replica.prepare(HostEpoch(2)).unwrap();
+  let stale = Shipper::new(
+    (OWNER, OBJECT, HostEpoch(1)),
+    Quorum { f: 1 },
+    &[OWNER, HOLDERS[0], HOLDERS[1]],
+    Some(entries[4].head()),
+    Bounds::of_whole(CAP),
+  )
+  .append(vec![9])
+  .unwrap();
+  let refused = serve_entries(&mut replica, &batch_of(&[stale]), CAP, |entry| {
+    applied.push(entry.position);
+    true
+  });
+  assert_eq!(
+    (decode_reply(&refused), applied.as_slice()),
+    (
+      Err(LiveError::StaleEpoch {
+        current: HostEpoch(2)
+      }),
+      [2, 3, 4].as_slice()
+    ),
+    "a batch under a fenced epoch is refused whole"
   );
 }

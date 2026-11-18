@@ -108,11 +108,13 @@ pub use volume::{
 /// own.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Format: the consumer contract's version (§4.12 "Versioning", A-299), raised by one with every change to a type or a
-/// verb of the contract; a consumer asserts the one it was written against. 1: the contract as A-299 first published it
-/// (2026-11-18). 2: `Denied::Policy`, the class a write policy's refusal takes outside a landing or a merge (the
-/// same day). 3: `Instance::set_write_policy` and `Instance::write_policy`, over the daemon's policy verbs (A-285), and
-/// a landing or a merge a policy forbids answered as its `Refused` outcome (the same day). 4: the audit log and the
+/// The consumer contract's version (§4.12 "Versioning", A-299), raised by one with every change to a type or a verb
+/// of the contract; a consumer asserts the one it was written against.
+///
+/// 1: the contract as A-299 first published it (2026-11-18). 2: `Denied::Policy`, the class a write policy's refusal
+/// takes outside a landing or a merge (the same day). 3: `Instance::set_write_policy` and `Instance::write_policy`,
+/// over the daemon's policy verbs (A-285), and a landing or a merge a policy forbids answered as its `Refused` outcome
+/// (the same day). 4: the audit log and the
 /// grant listing typed (`AuditRecord`, `GrantRecord`; the same day). 5: `WritePolicy::UNSET` merges at once and asks
 /// for landings, as the daemon applies an unset policy (the same day). 6: a merge an ask mode holds is a
 /// `MergeApproval` (the increment's identity and paths) approved by `approve_merge`, and a landing's approval a
@@ -125,16 +127,20 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// reply's typed field, never its text: `DriftReport::watcher` a `Watcher`, and a green's or a work volume's status
 /// read with no base (it failed as a protocol fault before) (the same day). 9: the [`Volumes`]
 /// seam over the contract's volume verbs, implemented by [`Instance`] and by the simulator [`SimVolumes`] (A-310) (the
-/// same day). 10: lists a page at a time (A-263 to A-267): `Page`, `Instance::{list_page, grants_page, audit_page,
-/// changed_since, changed_since_page, drift_page}`, `DriftPage`, `DriftReport::elided`, `ChangedCursor`;
-/// `Instance::drift` reads every entry (the same day). 11: a list a verb's own reply carries counts what one reply could
+/// same day). 10: a volume's loss window, `VolumeStatus::loss` (`LossReport`, `VolumeTakeover`; AC-8.3): what an owner
+/// loss would lose now, the newest seal placed on another host, and on a successor the takeover that made it the owner
+/// (the same day). 11: lists a page at a time (A-263 to A-267): `Page`, `Instance::{list_page, grants_page,
+/// audit_page, changed_since, changed_since_page, drift_page}`, `DriftPage`, `DriftReport::elided`, `ChangedCursor`;
+/// `Instance::drift` reads every entry (the same day). 12: a list a verb's own reply carries counts what one reply could
 /// not hold (A-267): `Instance::rewitness` answers `Rewitnessed { paths, paths_elided }`, `Stale::Disk` carries
 /// `elided`, `LandingReport` carries `degraded_elided`, and a presentation is clean only when it carries and counts no
-/// conflict (the same day). 12: `Stale::Verdict`, a merge's or a rebase's conflict windows read after the work's verdict
-/// was replaced; `merge` and `rebase` answer every window of a verdict however many (A-267) (the same day). 13:
+/// conflict (the same day). 13: `Stale::Verdict`, a merge's or a rebase's conflict windows read after the work's verdict
+/// was replaced; `merge` and `rebase` answer every window of a verdict however many (A-267) (the same day). 14:
 /// `drift_page` reads past an inode (`after: Option<u64>`), in inode order, re-checking the entries it passes; `drift`
 /// answers its lists in path order (A-267) (the same day).
-pub const CONTRACT: u32 = 13;
+///
+/// Format: one whole number, the last of the versions above.
+pub const CONTRACT: u32 = 14;
 
 /// What a rewitness did (§4.15 `rewitness`): the paths one reply holds and the count of the rest (A-267).
 pub use slates_client::Rewitnessed;
@@ -144,9 +150,9 @@ pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, 
 pub use slates_ipc::protocol::{
   AttachTransport, ChangedCursor, ConflictClass, DaemonReport, Filter, GrantScope, GreenBase,
   HostAnswer, HostPathReason, Intent, JournalReport, LandingDegradation, LandingDurability,
-  MountReport, NamePolicy, OwnMountUse, PlacedState, PlannedAction, PlannedContent, PlannedEntry,
-  Principal, ReadAt, RecoveryCause, SnapshotId, TelemetryReport, TransportReport,
-  UnsupportedReason, VolumeId, VolumeSummary,
+  LossReport, MountReport, NamePolicy, OwnMountUse, PlacedState, PlannedAction, PlannedContent,
+  PlannedEntry, Principal, ReadAt, RecoveryCause, SnapshotId, TelemetryReport, TransportReport,
+  UnsupportedReason, VolumeId, VolumeSummary, VolumeTakeover,
 };
 /// The rendezvous's and the channel's own typed refusals the contract carries.
 pub use slates_ipc::{DeliveryFault, error::RouteRefusal};

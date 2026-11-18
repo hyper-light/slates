@@ -445,22 +445,21 @@ async fn answer_after(
     if let Some(owed) = owed {
       let _ = crate::told::wait(owed).await;
     }
-    deliver_to(route, reply, here).await;
+    deliver_to(route, reply, here);
   }
 }
 
 /// Delivers a deferred reply where its request waits: on this shard's ring when its client is served here, else as a
 /// task on the client's shard (A-188), as an image build's reply goes, waiting for room as every reply carried home
 /// does (`crate::xshard::send_back`).
-async fn deliver_to(route: ReplyRoute, reply: ReplyBody, here: u16) {
+fn deliver_to(route: ReplyRoute, reply: ReplyBody, here: u16) {
   if route.shard == here {
     crate::state::deliver(route.client_index, route.request, reply, true);
     return;
   }
   crate::xshard::send_reply_home(route.shard, move || {
     crate::state::deliver(route.client_index, route.request, reply, true);
-  })
-  .await;
+  });
 }
 
 /// Writes back every writable map the dead client `client_id` holds on this shard (§4.6, A-186, A-188), before its reap
@@ -1637,7 +1636,7 @@ mod served {
     });
     // Delivered after the state's borrow ends, since delivery takes it again.
     if let Some((reply, Some(route), here)) = answered {
-      super::deliver_to(route, reply, here).await;
+      super::deliver_to(route, reply, here);
     }
   }
 }

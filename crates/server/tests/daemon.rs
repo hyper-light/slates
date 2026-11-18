@@ -3412,7 +3412,7 @@ fn declare_guest_attribute_part(client: &mut Client, green: slates_ipc::protocol
   ] {
     let name = match &op {
       WorkOp::SetXattr { name, .. } | WorkOp::RemoveXattr { name, .. } => name.clone(),
-      _ => unreachable!("only attribute declarations are made here"),
+      _ => panic!("only attribute declarations are made here"),
     };
     match client.call(&RequestBody::Declare { work, op }) {
       ReplyBody::Refused {

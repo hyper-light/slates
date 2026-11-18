@@ -203,6 +203,11 @@ pub mod flags {
   /// `fuse_mknod_in`), for the filesystem to apply (Linux `fs/fuse/dir.c`). Corrected 2026-10-01
   /// (AUD-29-80): this said the opposite, and the handlers discarded the umask.
   pub const DONT_MASK: u64 = 1 << 6;
+  /// Format: FUSE_POSIX_ACL — the kernel checks every access against the access ACL it reads from the server with
+  /// `GETXATTR`, and turns `default_permissions` on with it (Linux `fs/fuse/inode.c` `process_init_reply`,
+  /// `fs/fuse/acl.c`). Asked for on a guest kernel's route alone, whose ACLs are the guest's (A-314); a host's mount
+  /// reaches no ACL (A-302), so its kernel must never ask for one.
+  pub const POSIX_ACL: u64 = 1 << 20;
   /// Format: FUSE_HAS_EXPIRE_ONLY — the kernel honours `FUSE_EXPIRE_ONLY` on an entry
   /// invalidation (revalidate the name on its next use rather than drop it now; 6.2+). In the
   /// second flags word (`flags2`), hence the bit above 31.

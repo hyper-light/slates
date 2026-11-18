@@ -2372,31 +2372,137 @@ fn run_qemu_with(
     ])
     .stdout(std::process::Stdio::piped())
     .stderr(std::process::Stdio::piped());
-  let mut child = spawn_vm_command(command, socket);
-  let started = Instant::now();
-  let mut timed_out = false;
-  while child.try_wait().unwrap().is_none() {
+  let child = spawn_vm_command(command, socket);
+  let (console, timed_out) = wait_reading(child, bound, &mut || {
     sample(&guest_memory_mappings());
-    if started.elapsed() > bound {
-      let _ = child.kill();
-      timed_out = true;
-      break;
-    }
-    // The test thread polls its child QEMU process; no runtime wheel serves this thread (D-9 allows a test).
-    #[allow(clippy::disallowed_methods)]
-    std::thread::sleep(Duration::from_millis(50));
-  }
-  let output = child.wait_with_output().unwrap();
-  let console = format!(
-    "{}{}",
-    String::from_utf8_lossy(&output.stdout),
-    String::from_utf8_lossy(&output.stderr)
-  );
+  });
   if timed_out {
     format!("(the guest did not power off within {bound:?})\n{console}")
   } else {
     console
   }
+}
+
+/// Shape: how often a live guest's wait looks at its VM (and samples the guest's mappings).
+const VM_POLL: Duration = Duration::from_millis(50);
+
+/// Shape: the bytes of each of a VM's output streams a live guest's wait keeps. The workload guest's console had
+/// reached 64 KiB five runs into the roster's 24 (CI run 44247840584), so a whole roster's is a few hundred KiB; 64 MiB
+/// is over a hundred times that and small beside the test container's memory. Past it the stream is still read, and
+/// what it carries dropped with a note, so the VM never waits on its console and the test never grows without bound.
+const CONSOLE_KEPT: u64 = 64 << 20;
+
+/// Reads a child's output stream to its end on a thread of its own: up to [`CONSOLE_KEPT`] bytes kept, the rest read
+/// and counted, so the child never blocks writing to it.
+fn read_on_a_thread<R: std::io::Read + Send + 'static>(
+  mut stream: R,
+) -> std::thread::JoinHandle<(Vec<u8>, u64)> {
+  std::thread::spawn(move || {
+    use std::io::Read;
+    let mut kept = Vec::new();
+    // A read error ends the stream as its end does: the child is gone or the pipe broken, and what was read is kept.
+    let _ = (&mut stream).take(CONSOLE_KEPT).read_to_end(&mut kept);
+    let dropped = std::io::copy(&mut stream, &mut std::io::sink()).unwrap_or(0);
+    (kept, dropped)
+  })
+}
+
+/// A stream read by [`read_on_a_thread`], as text, with a note of what was read past [`CONSOLE_KEPT`] and dropped.
+fn text_of(reader: Option<std::thread::JoinHandle<(Vec<u8>, u64)>>) -> String {
+  let Some(reader) = reader else {
+    return String::new();
+  };
+  let (kept, dropped) = reader.join().unwrap();
+  let text = String::from_utf8_lossy(&kept);
+  if dropped == 0 {
+    return text.into_owned();
+  }
+  format!(
+    "{text}\n(the stream went on {dropped} bytes past the {CONSOLE_KEPT} kept; they were read and dropped)\n"
+  )
+}
+
+/// Waits for `child` to exit, killing it once `bound` has passed, and calls `between` at each look; then its standard
+/// output followed by its standard error, and whether it was killed. A thread for each stream reads it while the child
+/// runs: a pipe holds only what fits its capacity until it is read (64 KiB on Linux), and a child writing past that
+/// waits in its write. Read only after the exit, the workload guest's console stopped at exactly 65,536 bytes, mid-line,
+/// and the guest, waiting on its console, was killed at its 1500 s bound (CI run 44247840584, 2026-11-18).
+fn wait_reading(
+  mut child: std::process::Child,
+  bound: Duration,
+  between: &mut dyn FnMut(),
+) -> (String, bool) {
+  let stdout = child.stdout.take().map(read_on_a_thread);
+  let stderr = child.stderr.take().map(read_on_a_thread);
+  let started = Instant::now();
+  let mut timed_out = false;
+  while child.try_wait().unwrap().is_none() {
+    between();
+    if started.elapsed() > bound {
+      let _ = child.kill();
+      timed_out = true;
+      break;
+    }
+    // The test thread polls its child process; no runtime wheel serves this thread (D-9 allows a test).
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(VM_POLL);
+  }
+  child.wait().unwrap();
+  let console = format!("{}{}", text_of(stdout), text_of(stderr));
+  (console, timed_out)
+}
+
+/// Shape: the bytes the pipe test's child writes to each of its standard output and error: 1 MiB, sixteen times a
+/// Linux pipe's default capacity (64 KiB) and past any other host's default, so a wait that does not read its child
+/// while it runs leaves the child blocked in a write.
+const PIPE_PROOF_BYTES: usize = 1 << 20;
+
+/// Shape: how long the pipe test's child may take: writing 2 MiB into pipes that are read takes milliseconds, so a
+/// minute is a bound only a child blocked on an unread pipe meets.
+const PIPE_PROOF_BOUND: Duration = Duration::from_secs(60);
+
+/// Harness (the live guests' wait, A-289's virtio-fs leg; CI run 44247840584, 2026-11-18, where the workload guest's
+/// console stopped at exactly 65,536 bytes, mid-line, and the guest was killed at its 1500 s bound). Do: run a child
+/// that writes [`PIPE_PROOF_BYTES`] to its standard output, then as many to its standard error, then exits, under
+/// [`wait_reading`] with [`PIPE_PROOF_BOUND`]. Expect: the child exits by itself, never killed at the bound, and both
+/// writes are read whole, the output's before the error's.
+#[test]
+fn a_child_writing_past_its_pipes_capacity_is_read_while_it_runs() {
+  let script = format!("yes | head -c {PIPE_PROOF_BYTES}; yes n | head -c {PIPE_PROOF_BYTES} >&2");
+  let child = std::process::Command::new("sh")
+    .args(["-c", &script])
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
+  let started = Instant::now();
+  let (console, timed_out) = wait_reading(child, PIPE_PROOF_BOUND, &mut || {});
+  assert!(
+    !timed_out,
+    "the child was killed at the {PIPE_PROOF_BOUND:?} bound after {:?}: it blocked writing to a pipe nobody read; \
+     {} bytes were read",
+    started.elapsed(),
+    console.len()
+  );
+  let (output, error) = console.split_at(console.len().min(PIPE_PROOF_BYTES));
+  assert_eq!(
+    output.len(),
+    PIPE_PROOF_BYTES,
+    "the standard output was not read whole"
+  );
+  assert!(
+    output.bytes().all(|byte| byte == b'y' || byte == b'\n'),
+    "the standard output is not the child's"
+  );
+  assert_eq!(
+    error.len(),
+    PIPE_PROOF_BYTES,
+    "the standard error was not read whole"
+  );
+  assert!(
+    error.bytes().all(|byte| byte == b'n' || byte == b'\n'),
+    "the standard error is not the child's"
+  );
 }
 
 /// Starts the VM with its socket inherited at its existing number, the number in QEMU's `fd=` argument.

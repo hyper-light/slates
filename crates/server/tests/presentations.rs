@@ -316,6 +316,40 @@ fn a_presentations_entry_list_names_each_entry_its_grant_would_write() {
   };
   assert_eq!(conflicts, vec!["/edit.txt (ModifyModify)".to_owned()]);
   let entries = client.landing_entries(landing, manifest).unwrap();
+  expect_the_six_entries_in_landing_order(&entries);
+  assert_eq!(
+    counted(&entries),
+    stated(&summary),
+    "the list and the summary a person reads agree"
+  );
+  let workload =
+    expect_only_its_presenter_reads_the_list(&daemon, &instance, &mut client, (landing, manifest));
+  let Ok(Landing::GrantRequired {
+    landing: again,
+    manifest: again_manifest,
+    ..
+  }) = present(&mut client, volume, Some(snapshot), &target.path)
+  else {
+    panic!("the snapshot's landing was not presented again");
+  };
+  assert_eq!(again_manifest, manifest, "the snapshot plans what it froze");
+  let replaced = client.landing_entries(landing, manifest);
+  assert!(
+    matches!(replaced, Err(ClientError::Refused(Refusal::NotFound))),
+    "the replaced presentation's list went with it: {replaced:?}"
+  );
+  assert_eq!(client.landing_entries(again, manifest).unwrap(), entries);
+  drop(workload);
+  drop(client);
+  daemon.stop();
+}
+
+/// The list of `a_presentations_entry_list_names_each_entry_its_grant_would_write`. Expect `entries` to be the
+/// manifest's six in landing order (directories made, files created, replaced, the directory renamed, the file removed),
+/// each create and replace naming its bytes' BLAKE3 and length, the replacement, the removal and the rename what the
+/// volume witnessed, the conflict at `edit.txt` alone; a file and a directory landing with their modes and a removal
+/// with none.
+fn expect_the_six_entries_in_landing_order(entries: &[PlannedEntry]) {
   let seen: Vec<_> = entries
     .iter()
     .map(|entry| {
@@ -379,11 +413,18 @@ fn a_presentations_entry_list_names_each_entry_its_grant_would_write() {
   );
   assert_eq!(permissions("/made"), Some(0o755), "so does a directory");
   assert_eq!(permissions("/gone.txt"), None, "a removal lands none");
-  assert_eq!(
-    counted(&entries),
-    stated(&summary),
-    "the list and the summary a person reads agree"
-  );
+}
+
+/// The readers of `a_presentations_entry_list_names_each_entry_its_grant_would_write`. Do: through `client`, the
+/// presenter, enroll a consumer with `daemon`'s issuer secret and read the list of `landing` under `manifest` as that
+/// consumer; then read it through `client` against another manifest. Expect the consumer's read `NotFound` and the
+/// other manifest's `UnexpectedReply`. Returns the consumer's client, held as long as the test runs.
+fn expect_only_its_presenter_reads_the_list(
+  daemon: &Daemon,
+  instance: &str,
+  client: &mut Client,
+  (landing, manifest): (u64, [u8; 32]),
+) -> Client {
   // A consumer of another principal: the list is not its to read.
   let secret = daemon.segment().issuer_secret().unwrap();
   let account = rustix::process::getuid().as_raw();
@@ -393,7 +434,7 @@ fn a_presentations_entry_list_names_each_entry_its_grant_would_write() {
       slates_server::landing::enroll_proof(&secret, account),
     )
     .unwrap();
-  let mut workload = connect(&instance);
+  let mut workload = connect(instance);
   workload.attest(consumer, &capability).unwrap();
   let other = workload.landing_entries(landing, manifest);
   assert!(
@@ -405,24 +446,7 @@ fn a_presentations_entry_list_names_each_entry_its_grant_would_write() {
     matches!(mismatched, Err(ClientError::UnexpectedReply { .. })),
     "pages of another manifest are never joined: {mismatched:?}"
   );
-  let Ok(Landing::GrantRequired {
-    landing: again,
-    manifest: again_manifest,
-    ..
-  }) = present(&mut client, volume, Some(snapshot), &target.path)
-  else {
-    panic!("the snapshot's landing was not presented again");
-  };
-  assert_eq!(again_manifest, manifest, "the snapshot plans what it froze");
-  let replaced = client.landing_entries(landing, manifest);
-  assert!(
-    matches!(replaced, Err(ClientError::Refused(Refusal::NotFound))),
-    "the replaced presentation's list went with it: {replaced:?}"
-  );
-  assert_eq!(client.landing_entries(again, manifest).unwrap(), entries);
-  drop(workload);
-  drop(client);
-  daemon.stop();
+  workload
 }
 
 /// Shape: the directories the long list's deep file lies under, and the bytes of each one's name, so that the file's

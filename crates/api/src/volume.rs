@@ -15,8 +15,8 @@
 use std::path::PathBuf;
 
 use slates_ipc::protocol::{
-  self as wire, GreenBase, JournalReport, MountReport, NamePolicy, PlacedState, SnapshotId,
-  StatusReport, TransportReport, VolumeId,
+  self as wire, GreenBase, JournalReport, LossReport, MountReport, NamePolicy, PlacedState,
+  SnapshotId, StatusReport, TransportReport, VolumeId,
 };
 
 use crate::outcome::Work;
@@ -174,6 +174,9 @@ pub struct VolumeStatus {
   pub takeover_kept: u32,
   /// An overlay's base as the status read it; none for a volume with no base.
   pub base: Option<BaseState>,
+  /// What an owner loss would lose of the volume now, and what the takeover that made this node its owner lost
+  /// (§4.10 "Auto-seal", AC-8.3).
+  pub loss: LossReport,
 }
 
 /// An overlay's base as a status found it.
@@ -268,6 +271,7 @@ pub(crate) fn status_of(report: StatusReport) -> VolumeStatus {
     base: report
       .base
       .map(|base| base_state_of(base, report.drifted_elided)),
+    loss: report.loss,
   }
 }
 

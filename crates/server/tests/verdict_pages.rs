@@ -2,7 +2,8 @@
 //! reply carries the windows one reply holds and counts the rest, the work keeps the verdict, and `Conflicts` reads
 //! every window a page at a time, so the client hands its caller every window. Before A-267 a verdict was one list in
 //! one reply, and past what a reply chunk holds the daemon answered `BadRequest { reason: "reply too large for the bulk
-//! area" }` in its place: a work in conflict could learn nothing of what to resolve.
+//! area" }` in its place: a work in conflict could learn nothing of what to resolve. A work whose name is off its
+//! green's shard is judged on the green's owner and keeps its verdict on its own shard (A-247), where its reads go.
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(
   clippy::unwrap_used,
@@ -16,6 +17,7 @@ use std::collections::BTreeMap;
 
 use slates_client::{Client, ClientError, Rebased, Refusal, Submitted, VolumeId};
 use slates_ipc::protocol::{MergeWindow, ReplyBody, RequestBody};
+use slates_server::verbs::{owner_of, owner_of_name};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 mod common;
@@ -23,13 +25,21 @@ use common::client::connect;
 
 /// Shape: one shard, the owner of the green and its works.
 const TEST_SHARDS: u16 = 1;
+/// Shape: enough shards that a work's name can hash off its green's (A-247).
+const MANY_SHARDS: u16 = 8;
 /// Shape: the files each work rewrites, one conflict window each: several replies' worth at these names.
 const MANY: usize = 400;
+/// Format: the counter a work's shard moves for each verb it asked its green's owner to serve (A-247).
+const ASKED_THE_OWNER: &str = "merge.work.asked_owner";
 
 fn daemon(tag: &str) -> (Daemon, String) {
+  daemon_of(tag, TEST_SHARDS)
+}
+
+fn daemon_of(tag: &str, shards: u16) -> (Daemon, String) {
   let profile = common::machine_profile();
   let instance = format!("srv-verdict-pages-{tag}-{}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let config = DaemonConfig::derive(&profile, &instance, Some(shards));
   let daemon = Daemon::start(
     &profile,
     config,
@@ -52,6 +62,14 @@ fn file(n: usize) -> String {
 /// A green whose seed merged [`MANY`] files, and two works over it that each rewrote the first four bytes of every
 /// file, the first merged: the second conflicts in every file. The green and the second work.
 fn conflicting(client: &mut Client) -> (VolumeId, VolumeId) {
+  conflicting_named(client, |_| "second".to_owned())
+}
+
+/// [`conflicting`], the second work named by `second` from the green.
+fn conflicting_named(
+  client: &mut Client,
+  second: impl Fn(VolumeId) -> String,
+) -> (VolumeId, VolumeId) {
   let green = client.create_green("green", false).unwrap();
   let (seed, _) = client.create_work(green, "seed").unwrap();
   for n in 0..MANY {
@@ -61,7 +79,7 @@ fn conflicting(client: &mut Client) -> (VolumeId, VolumeId) {
   }
   assert!(matches!(client.submit(seed), Ok(Submitted::Accepted(_))));
   let (first, _) = client.create_work(green, "first").unwrap();
-  let (second, _) = client.create_work(green, "second").unwrap();
+  let (second, _) = client.create_work(green, &second(green)).unwrap();
   for n in 0..MANY {
     client.edit(first, &file(n), 0, 4, b"bbbb").unwrap();
     client.edit(second, &file(n), 0, 4, b"cccc").unwrap();
@@ -222,6 +240,67 @@ fn a_replaced_verdict_is_refused_typed() {
   );
   let (rest, _) = walk(&mut client, work, second, carried);
   assert_eq!(rest.len() + carried, MANY, "the second verdict reads whole");
+  drop(client);
+  daemon.stop();
+}
+
+/// A name of `prefix` that hashes to a partition other than `green`'s, so a work of that name is off its green's shard.
+fn off_owner_name(green: VolumeId, prefix: &str) -> String {
+  (0u32..)
+    .map(|suffix| format!("{prefix}-{suffix}"))
+    .find(|name| owner_of_name(name, usize::from(MANY_SHARDS)) != owner_of(green))
+    .unwrap()
+}
+
+fn asked_of_the_owner(daemon: &Daemon) -> u64 {
+  daemon
+    .refusals_on_every_shard()
+    .unwrap()
+    .get(ASKED_THE_OWNER)
+    .copied()
+    .unwrap_or(0)
+}
+
+/// A-267 under A-247 (§4.16: a green's works are served where they live; only the verdict is the green's). Do: on eight
+/// shards, conflict a work whose name is off its green's shard in 400 files, submit it through the wire and read the
+/// rest of its verdict a page at a time, then rebase it through the client. Expect: the work's shard asked the green's
+/// owner; the reply carries some windows and counts the rest under a verdict id; the pages, read from the work's shard,
+/// hold the rest; the two name every file once; and the rebase answers every window. Merged as text, the branch kept a
+/// verdict where it was judged, on the owner, which holds no work on another shard: the reply named verdict 0, and the
+/// rest could not be read.
+#[test]
+fn a_verdict_judged_on_the_greens_shard_is_kept_with_its_work_on_another() {
+  let (daemon, instance) = daemon_of("off-owner", MANY_SHARDS);
+  let mut client = connect(&instance);
+  let (_, work) = conflicting_named(&mut client, |green| off_owner_name(green, "second"));
+  let asked_before = asked_of_the_owner(&daemon);
+  let submitted = client.call(&RequestBody::Submit {
+    work,
+    evidence: Vec::new(),
+  });
+  assert!(
+    asked_of_the_owner(&daemon) > asked_before,
+    "the verdict was asked of the green's owner"
+  );
+  let Ok(ReplyBody::Submitted {
+    version: None,
+    conflicts,
+    conflicts_elided,
+    verdict,
+  }) = submitted
+  else {
+    panic!("the submit's conflict is answered: {submitted:?}");
+  };
+  assert!(conflicts_elided > 0, "the test outgrows one reply");
+  assert_ne!(verdict, 0, "the work's shard kept the verdict");
+  let (rest, _) = walk(&mut client, work, verdict, conflicts.len());
+  assert_eq!(rest.len(), conflicts_elided as usize);
+  let every: Vec<MergeWindow> = conflicts.into_iter().chain(rest).collect();
+  assert_every_file_once(&every);
+  let Ok(Rebased::Conflict(windows)) = client.rebase(work) else {
+    panic!("the rebase conflicts");
+  };
+  assert_every_file_once(&windows);
   drop(client);
   daemon.stop();
 }
