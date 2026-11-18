@@ -16187,6 +16187,115 @@ fn a_superseded_owner_restarted_warm_answers_reads_with_its_successors_writes() 
   );
 }
 
+/// Format: a holder's count of register records it refused because their owner is not the one its copy's authority
+/// names (`fleet.record.refused.unauthorized`): a stale owner's record.
+const RECORD_REFUSED_UNAUTHORIZED: &str = "fleet.record.refused.unauthorized";
+
+/// A-382 (§4.8 "Authority scope", "Promotion and takeover"): a node ships no register record of a volume it lost to a
+/// successor. Do: three nodes at `f = 1` over anchors, two shards each; on a, a live volume written six files; cut a
+/// off on the probe plane alone until the survivor the volume ranks first takes it over, then give it back; write a
+/// file through the successor; write once through a, which finds a's fence (A-338) and keeps it (A-344); restart a
+/// warm, so it has forgotten which of its records its holders acknowledged; wait for one configuration of all three;
+/// then let a run [`FENCED_QUIET_PERIODS`] record periods. Expect neither other node to refuse more than [`FENCED_QUIET_SLACK`] of
+/// a's records as a stale owner's (`fleet.record.refused.unauthorized`) in those periods. Before, a shipped the lost
+/// volume's catalog to every candidate again each period, and each refused it; and a holder whose copy is made afresh
+/// (a re-admitted one lets its own go, A-382) takes the first member's record it meets as its owner's.
+#[test]
+fn a_superseded_owner_restarted_warm_ships_no_record_of_the_volume_it_lost() {
+  let _serial = serialize_fleet_tests();
+  let (mut fleet, mut daemons, hosts, (id, written)) = anchored_fleet_with_a_live_volume(
+    &[
+      "superseded-records-a",
+      "superseded-records-b",
+      "superseded-records-c",
+    ],
+    "superseded-records",
+  );
+  let successor =
+    rendezvous_first(&[hosts[1], hosts[2]], ObjectId(id.bytes)).expect("a survivor takes over");
+  let successor = if successor == hosts[1] { 1 } else { 2 };
+  let taken = taken_over_on_the_probe_plane(&daemons, &hosts, &daemons[successor]);
+  let on_the_successor = continuity_write(daemons[successor].instance(), id, CONTINUITY_FILES);
+  let mut through_a = Client::connect(daemons[0].instance());
+  let attachment = write_attachment(&mut through_a, id);
+  let fenced = through_a.call(&RequestBody::FsWrite {
+    volume: id,
+    attachment,
+    path: "/through-the-old-owner".to_owned(),
+    bytes: b"through the old owner".to_vec(),
+    mode: 0o644,
+  });
+  // The client stays until a's daemon is gone, as in the read test above: its leaving would reap its attachment.
+  daemons.remove(0).stop();
+  drop(through_a);
+  daemons.insert(0, fleet.start(0));
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let settled = poll_for_periods(
+    &observed,
+    RETIREMENT_DEADLINE,
+    readmission_periods(&observed),
+    || settled_on_one_configuration(&daemons, &hosts),
+  );
+  let refused = |daemon: &Daemon| {
+    summed_counters(daemon)
+      .get(RECORD_REFUSED_UNAUTHORIZED)
+      .copied()
+      .unwrap_or(0)
+  };
+  let before = [refused(&daemons[1]), refused(&daemons[2])];
+  // Never met: the wait ends once a has run the window's periods.
+  let _ = poll_for_periods(
+    &[&daemons[0]],
+    PLACEMENT_DEADLINE,
+    FENCED_QUIET_PERIODS,
+    || Ok(false),
+  );
+  let after = [refused(&daemons[1]), refused(&daemons[2])];
+  drop(observed);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "a superseded owner's records after its warm restart: taken {taken}, written on the successor \
+     {on_the_successor:?}, through a {fenced:?}, settled {settled}; the others' refusals of a stale owner's records \
+     {before:?} -> {after:?} over {FENCED_QUIET_PERIODS} periods"
+  );
+  assert!(
+    written
+      .iter()
+      .all(|reply| matches!(reply, ReplyBody::FsDone { .. })),
+    "every write on a was answered: {written:?}"
+  );
+  assert!(
+    taken,
+    "the successor took the volume over from its live log"
+  );
+  assert!(
+    matches!(on_the_successor, ReplyBody::FsDone { .. }),
+    "the successor took a write: {on_the_successor:?}"
+  );
+  assert!(
+    matches!(
+      fenced,
+      ReplyBody::Refused {
+        refusal: Refusal::StaleEpoch { .. }
+      }
+    ),
+    "a's write found its fence: {fenced:?}"
+  );
+  assert!(
+    settled,
+    "the fleet settled on one configuration after a's restart"
+  );
+  for (holder, (before, after)) in ["b", "c"].iter().zip(before.into_iter().zip(after)) {
+    assert!(
+      after.saturating_sub(before) <= FENCED_QUIET_SLACK,
+      "{holder} refused {} of a's records as a stale owner's in {FENCED_QUIET_PERIODS} periods",
+      after.saturating_sub(before)
+    );
+  }
+}
+
 /// A live-shipped volume named `name` through `client`, shared with `fleet`, with nothing written: the volume.
 fn live_volume_named(client: &mut Client, fleet: &[Daemon], name: &str) -> VolumeId {
   let ReplyBody::Created { id } = client.call(&scratch(name)) else {
