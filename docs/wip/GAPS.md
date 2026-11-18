@@ -955,8 +955,8 @@
 >   (`moves::follow_moved_object`); held by `a_held_copy_follows_its_move_at_the_install_walk_and_falls_to_the_dead_
 >   targets_successor` (the server's unit tests, red without the fix). Bug record:
 >   `docs/bugs/2026-11-18-a-held-copy-of-a-moved-volume-stopped-following-its-move-at-the-install-walk.md`. **Owed
->   (main's):** the fleet test itself on macOS and Linux, and the volume-moved test (goal 85 bug 2), whose move back
->   depends on holders taking the new owner's authority the same way.
+>   (main's):** the fleet test itself on macOS and Linux, and the volume-moved test (goal 85 bug 2), whose move back may
+>   lean on the same following (not shown: holders a new owner's own move round reaches take its authority there).
 > - **Owed (the handoff's bound):** the frozen phase lasts as long as the handoff's copy takes, and an unreported move
 >   is held to the failover SLO (10 s by default), so a volume whose content cannot be copied to one more host within it
 >   is refused `MoveRefusal::Unplaced` and thaws. The fix is to place the head off the owner before freezing (the volume

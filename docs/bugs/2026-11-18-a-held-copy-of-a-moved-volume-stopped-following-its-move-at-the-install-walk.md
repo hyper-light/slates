@@ -48,8 +48,9 @@ install step, stays routed to its old owner, and the target's takeover lists not
 ## Impact
 
 Any fleet volume moved with `slates move` or `Instance::move_volume` whose target died before adopting it was lost:
-the old owner released its copy and no survivor served it. The move back to the creator (goal 85 bug 2) leans on the
-same following: a holder that keeps the old owner's authority refuses the new owner's records.
+the old owner released its copy and no survivor served it. Whether the move back to the creator (goal 85 bug 2) leans
+on the same following is not shown: a holder the new owner's own move round reaches takes its authority in that round,
+whatever the walk did.
 
 The pass inside each per-copy step also went over every held copy each time it ran, a pass per copy reached, against
 the walk's bound on a turn's work.
