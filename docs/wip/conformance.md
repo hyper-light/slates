@@ -12,35 +12,49 @@
 > (`xtask/src/conformance/suites.rs`, which the CI conformance lane runs with `SLATES_TEST_FSX=1`: the pinned fsx with
 > its file overwritten in place).
 
-> **Live-shipped volumes do not yet conform as plain ones do (2026-11-06, A-200; macOS conforms since 2026-11-18; Linux OPEN, owner g226).** `--live-ship`
-> runs a suite over a volume live-shipped on an `f = 1` fleet: three anchors from one manifest, the volume created and
-> mounted on node a, `slates live-ship ID`. A run fails unless the owner's log is durable at its head and both
+> **Live-shipped volumes conform as plain ones do, and CI holds them to it (2026-11-18, A-200; Windows OPEN).**
+> `--live-ship` runs a suite over a volume live-shipped on an `f = 1` fleet: three anchors from one manifest, the volume
+> created and mounted on node a, `slates live-ship ID`. A run fails unless the owner's log is durable at its head and both
 > candidates hold it, and its record carries the `fleet.live` counters. `compare` holds a live run to a plain one on the
-> same host, case by case, since this Mac's unprivileged pjdfstest cannot pass the root-reviewed list. Pair on this Mac
-> (macOS 26.4.1, NFS loopback, load averages 14 to 36):
-> - Plain: fsx 10,000 operations passed (21.1 s), fsstress 4 × 500 passed, pjdfstest 238 files, 8,686 cases.
-> - Live-shipped: fsx failed after the owner missed its heartbeat and a takeover moved the volume off the mounted node;
->   fsstress logged 319 of 2,000; pjdfstest's calls answered `ETIMEDOUT`, the owner's log at `head=2 durable=none` from
->   the start. `compare`: 8,647 differences.
-> - The deterministic red, `a_live_shipped_volume_makes_a_writer_wait_for_stopped_candidates_rather_than_fail`
->   (`xtask/src/conformance/live_fleet.rs`): with both candidates stopped, a size change failed `ETIMEDOUT` after 57.1 s
->   through the soft mount (§4.6), where A-200 says the writer waits.
-> - Linux and Windows (diagnostics run 42150662467). `ubuntu-latest`: the live fsx passed on all three transports, as
->   plain; the live fsstress hung over three hours until cancelled. `windows-latest`: the live fleet never formed
->   (WSAECONNRESET on a handshake). `windows-11-arm`: the fleet formed for winfstest, whose 628 cases matched plain, but
->   one candidate held nothing; it did not form for fsx.
-> - **macOS conforms now (2026-11-18, main `40efd7456`; Linux still OPEN).** On Adas-MacBook-Pro-3 (macOS 26.6 25G72,
->   arm64, NFS loopback, load averages 7 to 14), each suite plain then live on one machine, then `compare`:
->   - fsx: 10,000 operations passed both ways.
->   - fsstress: 4 × 500, 2,000 logged, passed both ways (8 s plain, 36 s live).
->   - pjdfstest: unprivileged, `LIMITED` both ways with identical counts (238 files, 8,686 cases: 2,915 passed, 1,738
->     failed, 4,033 needs-root). `compare`: 8,686 cases each, 0 differing, so the live run conforms exactly as the plain one.
->   The live runs shipped: the harness fails one whose owner's log is not durable at its head with both candidates
->   holding it. None of the 2026-11-06 faults came back. Commands:
->   `cargo xtask conformance run --suite S [--live-ship] --transport native-macos-nfs --records D/R --scratch D/S --keep`,
->   then `cargo xtask conformance compare --plain P --live L`.
-> GAPS ("A live-shipped volume fails a waiting writer…") holds the evidence; the lists are unchanged, since a live
-> volume must conform as a plain one does and no list may grow for it.
+> same host, case by case and record by record. It holds where no reviewed list does: a Mac's unprivileged pjdfstest
+> cannot pass the root-reviewed list, but it fails the same cases both ways.
+> - **macOS NFS loopback.** Pair 1 was on a MacBook Pro (main `40efd7456`, macOS 26.6, load 7 to 14). Pair 2 was on a
+>   Mac Studio (main `7993026`, macOS 26.4 25E246, load 10 to 26). Both were unprivileged, with each suite run plain and
+>   then live on one machine:
+>   - fsx: 10,000 operations passed both ways (8.5 s plain, 164.5 s live on the Studio).
+>   - fsstress: 4 × 500, 2,000 logged, passed both ways (12.0 s, 50.1 s).
+>   - pjdfstest: `LIMITED` both ways with identical counts (238 files, 8,686 cases: 2,915 passed, 1,738 failed, 4,033
+>     needs-root).
+>   - `compare`: 0 differing, each time.
+> - **Linux, every transport.** Diagnostics run 44362281881 (main `9e684f48e`, Ubuntu 24.04.5, `ubuntu-24.04-arm` and
+>   `ubuntu-latest`) covered `native-linux-fuse` through its NFS adapter, `native-linux-nfs4`, and `oci-linux` over the
+>   daemon's own FUSE mount:
+>   - fsx and fsstress passed both ways.
+>   - pjdfstest ran as root, 238 files and 8,798 cases a transport, with the same verdicts both ways.
+>   - `compare`: 0 differing over 3 outputs and 9 records on each runner.
+> - **Every live run shipped**: the owner's log was durable at its head with both candidates holding it.
+> - **The writer waits.** With both candidates stopped, a size change waited for them and then succeeded: 149.3 s on the
+>   Studio (A-229's hard mount) and 124.0 s and 124.3 s on Linux (the kernel's client retries `NFS3ERR_JUKEBOX`). The test is
+>   `a_live_shipped_volume_makes_a_writer_wait_for_stopped_candidates_rather_than_fail`
+>   (`xtask/src/conformance/live_fleet.rs`). It was red on 2026-11-05 through the soft mount: `ETIMEDOUT` after 57.1 s.
+> - **In CI.** The conformance lane runs the pair on `ubuntu-latest` and `macos-latest` (diagnostics run 44371380372). It
+>   runs the plain `all` (records and scratch in `target/conformance/plain`), then fsx, fsstress and pjdfstest
+>   live-shipped (`target/conformance/live`), then `compare --suites fsx,fsstress,pjdfstest`, then the stopped-candidates
+>   test. Each live verdict, the comparison and the test gate the lane. The live arm is uploaded as
+>   `conformance-live-<os>`.
+> - **None of the 2026-11-06 faults recurred.** Those were an fsx `ETIMEDOUT` through the soft mount, a log stuck at
+>   `head=2 durable=none` (`compare` then named 8,647 differences), an owner killed by its watchdog and taken over off
+>   the mounted node, and a live fsstress over the Linux NFS adapter that ran three hours until cancelled.
+> - **A live run costs more than a plain one.** On the Studio fsx shipped 407 whole states past the live credit (owner
+>   `refused.no_credit` 411). This is not a difference: it is AC-8.9's credit and live-write latency's (GAPS).
+> - **Windows** stays as diagnostics run 42150662467 left it on 2026-11-06: on `windows-latest` the live fleet did not
+>   form (`WSAECONNRESET` on a handshake). On `windows-11-arm`, winfstest's 628 cases matched plain, but one candidate
+>   held nothing.
+>
+> Commands: `cargo xtask conformance run --suite S [--live-ship] --records D/records --scratch D/scratch --keep`, then
+> `cargo xtask conformance compare --plain P --live L [--suites S,S]`. GAPS ("A live-shipped volume fails a waiting
+> writer…") holds the evidence. The lists are unchanged, since a live volume must conform as a plain one does and no list
+> may grow for it.
 
 > **Windows conformance, and the suites on arm64 Linux (2026-11-05, A-209).** The Windows transport's cells run: WinFsp's
 > winfstest (a Rust transcription of its Python 2.7 scripts over upstream's C driver, held to them by a golden of 733
@@ -546,6 +560,8 @@ cargo xtask conformance run --suite winfstest     # Windows: WinFsp's winfstest 
 cargo xtask conformance run --suite fsx --live-ship --records L/records --scratch L/scratch --keep
                                                   # the suite over a live-shipped volume on an f = 1 fleet (A-200)
 cargo xtask conformance compare --plain P --live L  # two runs case by case; non-zero on any difference
+cargo xtask conformance compare --plain P --live L --suites fsx,fsstress,pjdfstest
+                                                  # only those suites, each of which both runs must hold (CI's pair)
 cargo xtask conformance all                       # plan, then every runnable suite, continuing past failures
 cargo xtask conformance matrix --write            # regenerate §2 from the tracked records
 cargo test -p slates-conformance --test matrix    # the doc-truth tests

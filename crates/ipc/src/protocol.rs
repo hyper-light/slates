@@ -1093,6 +1093,27 @@ pub enum RequestBody {
     /// The attachment.
     attachment: u64,
   },
+  /// Move `volume` to the fleet member `to` (§4.10 "Ownership follows the writer": "operators keep an explicit move";
+  /// A-291): its owner freezes it, places its records and reports the move, and the member `to` adopts it, serves it
+  /// and seals it under its own placement before the owner lets its copy go. Answered `Moving` until the configuration
+  /// names `to`, then `Moved`; the caller asks again until `Moved`. A volume that cannot move is refused
+  /// [`Refusal::MoveRefused`]. `admin` on the volume is required. Appended.
+  Move {
+    /// The volume.
+    volume: VolumeId,
+    /// The member it moves to, by its host id.
+    to: u64,
+  },
+  /// Capture an overlay's whole base into a complete immutable snapshot (§4.15 `capture_base`, A-291): every file's
+  /// bytes and every link's target become the volume's own, then a snapshot is taken and recorded captured, so a clone
+  /// of it needs no base directory and moves between fleet members as a plain volume does. The caller asserts the source
+  /// is quiesced (nothing writes it while the capture runs); one that changed under it is refused
+  /// [`Refusal::ConsistentBaseUnavailable`]. Answered `BaseCaptured` once the walk ends. `write` on the volume is
+  /// required. Appended.
+  CaptureBase {
+    /// The overlay.
+    volume: VolumeId,
+  },
 }
 
 /// The bytes an [`RequestBody::EditSubmit`] inserts (A-225): carried in the request, or, for an edit larger than one
@@ -1846,7 +1867,9 @@ impl RequestBody {
       RequestBody::Share { volume, .. }
       | RequestBody::LiveShip { volume, .. }
       | RequestBody::DetachOf { volume, .. }
-      | RequestBody::RemoteReap { volume, .. } => Some(*volume),
+      | RequestBody::RemoteReap { volume, .. }
+      | RequestBody::Move { volume, .. }
+      | RequestBody::CaptureBase { volume } => Some(*volume),
     }
   }
 
@@ -1885,6 +1908,8 @@ impl RequestBody {
         | RequestBody::Checkout { .. }
         | RequestBody::SetPolicy { .. }
         | RequestBody::SetSigners { .. }
+        | RequestBody::Move { .. }
+        | RequestBody::CaptureBase { .. }
     )
   }
 
@@ -3453,6 +3478,8 @@ pub enum AuditKind {
   EntryRefused,
   /// A landing finished.
   LandingFinished,
+  /// A grant reached its term unused and ended (A-266), recorded under the principal it was made for. Appended.
+  GrantExpired,
 }
 
 /// The closed refusal taxonomy on the wire (§4.4, §4.13). (`Eq` is not derived because the durability
@@ -3862,6 +3889,13 @@ pub enum Refusal {
     /// The work volume.
     work: VolumeId,
   },
+  /// A planned move of a volume to another fleet member (`Move`, §4.10 "Ownership follows the writer", A-291) was
+  /// refused, for a reason a caller can act on by its kind. Nothing moved, and the volume is served where it was.
+  /// Appended.
+  MoveRefused {
+    /// Why.
+    reason: MoveRefusal,
+  },
 }
 
 /// Why a target cannot be used ([`Refusal::Target`], A-299): each the class of a landing target's, a mount point's or a
@@ -4017,6 +4051,32 @@ pub enum VolumeRefusal {
   /// retained version or bytes, or the volume is at its retention allowance. Not the volume's quota: destroying a
   /// snapshot frees it. Appended (2026-11-18; until then it reached a client as `NoSpace`).
   RetentionExceeded,
+}
+
+/// Why a planned move was refused ([`Refusal::MoveRefused`], A-291): each names what the caller can change. Append-only.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveRefusal {
+  /// The volume is not a plain live volume: an overlay (its base stays on its source host, §4.10 "Overlay volumes in a
+  /// fleet"), an image, a green or a work, or one being destroyed.
+  NotPlain,
+  /// The volume has an attachment or a lease: a writer detaches first.
+  Attached,
+  /// The volume has clones, or is a green's origin: each depends on it on its owner. (A clone itself moves: its tree is
+  /// archived whole and served standalone by its new owner, A-291.)
+  Lineage,
+  /// The volume has snapshots other than its head: a move carries the head, and the others would be lost with the old
+  /// owner's copy. Destroy them first.
+  Snapshots,
+  /// The target is not another member of the volume's region.
+  Target,
+  /// The target is outside the owner's neighbourhood (it holds no key to the volume's sealed content), or its own
+  /// neighbourhood does not cover the cohort the volume's records sit in (its takeover could not recover the volume).
+  Neighbourhood,
+  /// The volume's records, or its head's content on hosts other than its owner (the move's handoff), were not placed
+  /// within the fleet's failover SLO, so the move was not reported; the volume thawed. Ask again.
+  Unplaced,
+  /// The volume is already moving to another member.
+  Pending,
 }
 
 /// Why recovery could not rebuild a volume its catalog holds ([`Refusal::NotRecovered`], §4.8). Append-only.
@@ -4641,6 +4701,23 @@ pub enum ReplyBody {
     /// third of the term fed its own gaps back into the term, which grew to the failover delay: 1.0 s to 4.0 s in ten
     /// renewals on the Mac Studio, 2026-11-18).
     renew_every_ns: u64,
+  },
+  /// A volume's move is under way (`Move`, A-291): it is frozen, and the move waits for its records to be placed or for
+  /// the configuration to name its new owner. Ask again. Appended.
+  Moving {
+    /// The member it moves to.
+    to: u64,
+  },
+  /// The configuration names a volume's new owner (`Move`, A-291): verbs on it go there now. Appended.
+  Moved {
+    /// The member it moved to.
+    to: u64,
+  },
+  /// An overlay's base was captured (`CaptureBase`, A-291): `snapshot` holds its whole tree, recorded captured, so a
+  /// clone of it needs no base directory. Appended.
+  BaseCaptured {
+    /// The snapshot.
+    snapshot: SnapshotId,
   },
 }
 

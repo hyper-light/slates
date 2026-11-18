@@ -2907,6 +2907,30 @@ impl Daemon {
     Ok(())
   }
 
+  /// Test support: while `withhold` is set, no shard sends the control partition what it owes the audit (A-265's
+  /// crossing; `LandingState::crossing_withheld`): an owed record stays between its atom's commit and its batch, where a
+  /// daemon that died used to lose it. A daemon started over the same anchor sends it from its recovered outbox.
+  /// Delivered like [`Self::withhold_shards_replies`]; `Ok` once installed, else the typed refusal.
+  pub fn withhold_audit_crossing(&self, withhold: bool) -> Result<(), ObserveError> {
+    for shard in self.shards.iter().copied() {
+      self.observe(Some(shard), move |s| s.landing.crossing_withheld = withhold)?;
+    }
+    Ok(())
+  }
+
+  /// Test support: while `withhold` is set, no shard records the control partition's acknowledgement of its appended
+  /// audit records (A-265; `LandingState::acknowledgement_withheld`), as if each were lost: the outbox keeps them, and
+  /// the reap tick sends them again, which the control partition must append nothing twice of. Delivered like
+  /// [`Self::withhold_audit_crossing`]; `Ok` once installed, else the typed refusal.
+  pub fn withhold_audit_acknowledgement(&self, withhold: bool) -> Result<(), ObserveError> {
+    for shard in self.shards.iter().copied() {
+      self.observe(Some(shard), move |s| {
+        s.landing.acknowledgement_withheld = withhold;
+      })?;
+    }
+    Ok(())
+  }
+
   /// Test support: the quantum the record period's live slices are cut by on every shard (`live_ship::period_slice`), and
   /// a returned holder's walk's turns (`live_ship::reached_slice`), in place of the shard's own step quantum; `None` gives
   /// the shard its own back. Zero ends each slice after one volume, so
@@ -3235,6 +3259,26 @@ impl Daemon {
     Ok(pooled.map(|pool| pool.saturating_add(held).saturating_add(debt)))
   }
 
+  /// Test support (A-393): every shard's write log is marked overflowed, as a log is when it could not take an
+  /// acknowledged write and the publication that would have emptied it was refused (A-63): the next daemon then reports
+  /// every file a taken-over attachment had open as having lost writes. A test of what a successor tells its guest sets
+  /// the very predicate the log keeps, rather than starving a publication. Whether every shard holding a log marked
+  /// it, or the first shard's typed refusal.
+  #[cfg(unix)]
+  pub fn inject_write_log_overflow(&self) -> Result<bool, ObserveError> {
+    let mut marked = true;
+    for shard in self.shards.iter().copied() {
+      let this = self.observe(Some(shard), |s| {
+        match (s.write_log.as_mut(), s.content.as_mut()) {
+          (Some(log), Some(object)) => log.overflow(object).is_ok(),
+          _ => true,
+        }
+      })?;
+      marked = marked && this;
+    }
+    Ok(marked)
+  }
+
   /// Test support: every shard refuses (or takes again) the NFSv4 purges sent to it, as an owner that cannot make a
   /// drop durable answers `NFS4ERR_DELAY` (2026-10-10). A test leaves a dropped client's purge owed with it, then proves
   /// the purge outlives a restart.
@@ -3393,7 +3437,8 @@ impl Daemon {
   }
 
   /// Test support: leaves unanswered every takeover page and question by name this node, as a holder, is asked by one of
-  /// `askers` (§4.8 phase one; counted `fleet.takeover.silenced_by_fault`), while it answers everything else on the same
+  /// `askers` (§4.8 phase one; counted `fleet.takeover.silenced_by_fault`), and every planned move's question by name
+  /// (A-291; counted `fleet.move.silenced_by_fault`), while it answers everything else on the same
   /// sessions: a holder cut off from one successor alone, which the council never retires since every other member hears
   /// it. Replaces any earlier set; an empty `askers` restores full service. Delivered like
   /// [`Self::inject_serve_delay`]; `Ok` once installed, else the typed refusal.
@@ -4509,6 +4554,11 @@ async fn init_shard(
     seal_walk_quantum_ns: None,
     live_turn_pause_ns: None,
     host_takeovers: std::collections::BTreeMap::new(),
+    moves_out: std::collections::BTreeMap::new(),
+    move_adoptions: std::collections::BTreeMap::new(),
+    move_records: std::collections::BTreeMap::new(),
+    moves_forgotten: std::collections::BTreeSet::new(),
+    releasing: Vec::new(),
     config_refresh_wanted: false,
     council_learner_pace: crate::fleet::LearnerPace::default(),
     learner_fetch: crate::fleet::LearnerFetchLog::default(),
@@ -4736,6 +4786,9 @@ async fn reap_loop() {
       let _ = verbs::step_destroys(s);
       // A grant past its term leaves the tables (A-266); its history is the audit log.
       crate::landing::end_expired_grants(s);
+      // What this shard owes the audit and was not acknowledged a tick ago is sent again (A-265): a batch lost to a
+      // crash, a restart or an unanswered wait reaches the control partition, which appends nothing twice.
+      crate::landing::resend_stuck_audit(s);
     });
     // Another host's attachments end once the fleet no longer counts that host a member (A-222; control shard).
     crate::remote_attach::sweep_departed().await;
