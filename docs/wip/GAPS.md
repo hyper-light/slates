@@ -1,5 +1,15 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Open (g222, 2026-11-17, A-273): rebases and named-version reads of a green on the shards holding its works.**
+> Designed, not built. The owner spends 51–53% of its wall on verdicts and rebases at the 3,000-client rung (W1),
+> rebases the larger share (about 71,000 a run against 49,000 verdicts), and W1's rebase at 1,000 clients is slower
+> than main's because it crosses to the owner. A replica holds the green's metadata (about 14.2 MB at the rung, 3.8% of
+> a shard's 373.5 MB metadata budget on the Studio) and reads the owner's content in place, never a copy (the
+> supervisor, 2026-11-17, by A-64 and D-7). Owed, in order: W1 on main; the engine's content in sealed blocks that
+> never move; the owner's frees held until every replica has acknowledged a version past them; the tests first (the
+> replica equals the owner at every version, the lifetime red with the acknowledgement ignored); the code; the
+> supervisor's A/B.
+>
 > **A Shards guest's unprivileged run could not write a host-owned volume: built, the stream takes Shards' owner word
 > (2026-11-18, §4.6 the Shards form; A-281; goal g268).** Shards' init names the run's owner on a share's root with
 > `trusted.shards.owner` (`UID:GID`), and slates refused it `EOPNOTSUPP`, so a guest of user 1000 saw a Mac's files as
@@ -29,8 +39,26 @@
 >   else the stream ends typed and counted. The owner view then has to be kept with the attachment's record.
 > - Shards' side, after its v0.8.0 tag and landed by its coordinator from signed branches: its guest test over a
 >   slates stream on Linux and macOS (`tests/slates_fs.rs`, Windows only today), the bump of the slates revision it
->   pins (f71282e1f), the WHP window patches 0001 to 0003 (`docs/wip/shards-patches/`), and `shards restore` handing a
+>   pins (f71282e1f; handed to it as the signed branch `agents/g268-slates-rev-bump`, 808cdc1e4, pinning ac30fc77a
+>   and Rust 1.98.1), the WHP window patches 0001 to 0003 (the signed branch `agents/g268-whp-window-edge-cases`,
+>   2026-11-18, their record renumbered PM M620), and `shards restore` handing a
 >   restored VM a served share (`--slates-fs-fd`, `--slates-fs-handle`) with a real-VM test of a save and a restore.
+> - Until the restart's resync is agreed, a daemon's death ends the stream: the device reads the end, and recovery
+>   removes the guest's record, counted in its report's `attachments_dropped` (Shards' option (a)).
+
+> **What Hex and Mantle need from slates (2026-11-18, goal g268).**
+> - **Hex** reaches other products only through a trait with a simulator and one conformance suite (its `CLAUDE.md`
+>   §9). **Built (A-310):** `slates_api::Volumes`, implemented by `Instance` and by `SimVolumes`, held to one suite
+>   (`crates/api/tests/api.rs`). **Owed:** a typed class for a pinned snapshot's destroy, answered `Invalid::Request`
+>   today (the contract's, goal g262); Hex's own use of the seam when it takes slates (kiln's plan T7, CP-T7.8 and
+>   CP-T7.13). **Decided (Ada, 2026-11-18):** Hex's microVM disks stay per machine (its D281); slates workspaces alone
+>   replicate across runners (g267's entry).
+> - **Mantle**'s agent, asked on 2026-11-18 whether it waits on slates, has not answered; its kiln track (plan T10)
+>   puts kiln's bytes on Mantle through kiln's `Blobs`, and two of its steps reach slates, neither started: CP-T10.4 keeps slates snapshots on Mantle, which needs a snapshot's
+>   archive taken out through `slates-api` and a volume made from one (the archive exists inside the daemon, for the
+>   fleet's copies and a takeover, with no verb for a host); CP-T10.5 lays a slates overlay over Mantle's objects until
+>   Mantle's file system ships, which needs a base read from an object store rather than a host folder (§4.15 knows
+>   only a host folder). Both wait on T10.1 to T10.3.
 
 > **Open (g267, 2026-11-18): a volume moves between fleet nodes, and kiln's runners form the fleet.** Kiln moves an
 > agent between runners only without a volume (`harness/relocate.rs` refuses one), so the work owed is §4.10's
@@ -1094,6 +1122,32 @@
 >   discovery refresh catches a session sitting unborrowed in its slot, and a peer's stateless reset (A-261) ends one
 >   sooner where it is heard
 >   (`docs/bugs/2026-11-09-a-dead-record-session-was-lent-on-for-want-of-anyone-judging-it.md`).
+>   - **Its test made deterministic (2026-11-18, goal g245).** The test's 256-client burst made its recovery bound
+>     (1.1 s) depend on load: missed at 1.33 s (loadtest-scale, adacachy2, load 41), 1.339 s (the supervisor's r423,
+>     load ~52) and 1.384 s (a diagnostic run on a Mac, load 28 to 47). That run's timeline: the link redialed 89 ms
+>     after the drop, its handshake took 665 ms (its cause not measured apart), the lane's first turn on the replacement
+>     came at 853 ms with 8,031 forwards queued, a sent its first reply at 896 ms, and b's lane took it at 1,384 ms
+>     while the burst's resends cycled through b's control shard (61,824 batches given up that run, 20,349 to 47,925
+>     in the 12 others read); the judgment and the redial were not the cost. The test now keeps b's lane borrowing the
+>     session with four readers, a read each in flight, discovery held: green 5 of 5 (dropped 2,002 to 2,644 ms into the
+>     silence against its 1,998 ms window, answered on the replacement 21 to 112 ms later) and red 5 of 5 with the
+>     return's judgment removed, on a Mac at load 33 to 56 beside 8 spinners. The burst went to A-306's test, below.
+>   - **Finding (b), fixed (2026-11-18, A-306): a resend keeps its place in the lane.** A read through b during the dead
+>     session missed its failover bound behind the burst's resends: each resend took fresh tickets at the back of the
+>     lane and was given up again before it was begun. With the probe read sent just after the burst's first round,
+>     main refused it `OwnerUnreachable` at 10.5 s in 1 of 10 runs and answered it after 9.2 and 9.5 s in two more
+>     (2.3 to 10.5 s; load 37 to 46). A forward's place is now its first send's ticket and its resends are queued there
+>     (`forward_lane::Place`, `fleet.forward.resent_in_place`): 4.1 to 6.5 s, 10 of 10 (load 27 to 33).
+>     `a_read_through_a_dead_session_keeps_its_place_behind_a_burst` sends the probe before the burst, so its place is
+>     the lane's first: answered in 2.19 to 2.50 s, 5 of 5; with the place ignored it was refused at its bound in 2 of
+>     5 (load 33 to 56). The order itself is held by `a_resend_is_begun_ahead_of_every_forward_first_queued_after_it`
+>     and a model test, both red with the place ignored
+>     (`docs/bugs/2026-11-18-a-resent-forward-lost-its-place-in-the-lane.md`).
+>   - **Open (2026-11-18, goal g245): a forward still queued is given up at its stall budget while its lane moves.**
+>     Nothing of it was sent, and with its place kept its resend loses nothing, but each one costs its forwarder a give-up
+>     and a resend on the control shard: behind the burst above, 17,000 to 52,000 batches given up a run, the most in
+>     the runs that starved. Owed: a queued forward's quiet counts its lane's progress (a forward begun or a reply taken),
+>     so it is given up only when the lane does not move for a stall budget, the failover bound still capping it.
 >
 > - **A forward lane turned without end while its forwards waited on the stream credit** (found 2026-11-08 on the f = 1
 >   primary-kill rung). After the primary restarted, a turn ended at once whenever any forward was queued, and with

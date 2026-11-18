@@ -55,4 +55,16 @@ ids, never a second run, and each judgment is counted.
 ## Not fixed here
 
 A read through the client node during the dead session still misses its 10 s failover bound behind the resends' backlog
-(about 45,000 to 57,000 batches given up). It is its own finding (b), measured before it is fixed.
+(about 45,000 to 57,000 batches given up). It is its own finding (b), measured before it is fixed. Fixed 2026-11-18
+(A-306): a resend keeps the place its first send had in the lane
+(`2026-11-18-a-resent-forward-lost-its-place-in-the-lane.md`).
+
+## Since (2026-11-18)
+
+The test above missed its 1.1 s recovery bound under load, at 1.33 s (load 41), 1.339 s (load ~52) and 1.384 s (load
+28 to 47). In the last, a sent its first reply on the replacement 896 ms after the drop and b's lane took it at 1,384
+ms, 488 ms later, while the burst's resends were cycling through b's control shard (62,000 batches given up that run);
+the replacement's handshake took 665 ms, its cause not measured apart. The judgment came 104 ms past its window (2,102
+ms against 1,998) and the redial began 89 ms after the drop: they were not the cost. The test now keeps the lane
+borrowing the session with four readers and no burst, discovery still held: green 5 of 5 and red 5 of 5 with the
+return's judgment removed, at load 33 to 56 beside 8 spinners (GAPS).

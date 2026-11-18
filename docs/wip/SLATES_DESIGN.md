@@ -5670,6 +5670,19 @@ version.
 > read now takes 1.8 to 2.4 ms (`crate::forward_lane`; `forwards_to_one_owner_never_wait_behind_each_other`;
 > `docs/bugs/2026-11-06-forwards-to-one-owner-went-one-at-a-time.md`).
 
+> **Status (2026-11-18, A-306: a resend keeps its place in the lane).** A forward given up at its stall budget, or cut
+> off by its session's replacement, is sent again by its caller under its own ids (`verbs::resolve_and_forward`). Each
+> send took fresh tickets at the back of the peer's lane, so behind a backlog the lane begins more slowly than a stall
+> budget a resend was given up again before it was begun, while forwards first queued after it went ahead: a read
+> through a client node whose session to its owner died was refused `OwnerUnreachable` at its failover bound in 1 of 10
+> runs behind a 256-client burst, and answered after 9.2 and 9.5 s in two more (load 37 to 46). A forward's place is
+> now its first send's ticket, and its resends are queued there (`forward_lane::Place`): the lane begins forwards in
+> the order of their first send. The same read was answered in 4.1 to 6.5 s, 10 of 10 (load 27 to 33).
+> `a_resend_is_begun_ahead_of_every_forward_first_queued_after_it` and its model test hold the order, and
+> `a_read_through_a_dead_session_keeps_its_place_behind_a_burst` the read
+> (`docs/bugs/2026-11-18-a-resent-forward-lost-its-place-in-the-lane.md`). Owed: a forward still queued is given up at
+> its stall budget while its lane moves, so the backlog is cycled once a budget on the control shard (GAPS).
+
 > **Status (2026-10-07, same-region lookups).** A lookup by id now reaches its creator from any node of the
 > creator's own region, not only from another region. Before, the server forwarded only a volume homed in another
 > region, and a client of another node in the owner's region was answered `NotFound` (found on two Docker
@@ -22142,6 +22155,139 @@ Applied in the same change to:
   typed class is owed to the contract (told to its owner).
 - **Evidence.** The suite over an in-process daemon and over the simulator, and the simulator's bound. Owed: Hex's own
   use of it, when Hex takes slates (its agent was idle until 2026-11-19).
+
+### A-306 — A resent forward keeps the place its first send had in the forward lane (2026-11-18, built for goal g245, a dead lent session; finding (b) of the bug record of 2026-11-09)
+Applied in the same change to:
+- §4.8 "Lookup": the status of 2026-11-18.
+- `crates/server/src/forward_lane.rs`: `Place`; each ticket's place, and the lane's queue ordered by place, then
+  ticket; `ForwardLanes::queue` and `leave` (the queue's discipline apart from the shard's state) and
+  `begin_queued_with` (apart from the session); the count `fleet.forward.resent_in_place`; the module doc.
+  `crates/server/src/fleet.rs` (`forward_batch_over_leader_session` takes the place) and `crates/server/src/verbs.rs`
+  (`resolve_and_forward` keeps one place across its resends; `forward_once` passes it).
+- Tests: `a_resend_is_begun_ahead_of_every_forward_first_queued_after_it` and the model test
+  `a_lanes_forwards_are_begun_in_the_order_they_were_first_queued` (`forward_lane.rs`), and
+  `a_read_through_a_dead_session_keeps_its_place_behind_a_burst` (`crates/server/tests/fleet.rs`).
+- GAPS: the load test's "dead record session" entry. The bug record:
+  `docs/bugs/2026-11-18-a-resent-forward-lost-its-place-in-the-lane.md`.
+- **What was there.** A forwarder gives its batch up once none of its forwards has progressed for its stall budget,
+  queued or begun, and its caller sends the same requests again under their own ids while the owner is not confirmed
+  dead and the failover bound allows. Every send was a new batch with fresh tickets, and a lane begins its queue in
+  ticket order, so every resend went to the back.
+- **The rule.** A forward's place is the ticket its first send was given; a resend is queued at it, each request of a
+  batch at its own first ticket. A lane begins its queued forwards in the order of their places: the order of first
+  sends, whatever has been given up and sent again since. Its wait is bounded by the forwards first sent before it.
+- **Why.** Goal g245, finding (b): behind a 256-client burst a read through a client node whose session to its owner
+  died was refused at its failover bound in 1 of 10 runs and answered after 9.2 and 9.5 s in two more (2.3 to 10.5 s
+  in all), its every resend given up again behind forwards first sent after it. With its place kept: 4.1 to 6.5 s in
+  10 of 10.
+- **Cost.** None new: a queued forward's key in the same ordered set is a pair, and a resend's insert and a leave's
+  remove are the same logarithmic steps. A forward still queued is given up and resent at its stall budget as before:
+  with its place kept that loses it nothing, but it cycles the backlog once a budget on the control shard, which is
+  owed apart (GAPS).
+
+### A-273 — A shard that holds a green's works keeps a replica of the green, fed the owner's accepted versions in order; a rebase and a read at a named version are served there, over the owner's content in place (2026-11-17; the text first, the code after W1 lands)
+Applied in the same change to: GAPS (A-273's entry). Nothing else yet: the tests come first, then the code.
+
+Status: designed. The text and its measurements are perf's (2026-11-11, `agents/perf-a273`, never pushed); the content
+question it left open was decided by the supervisor on 2026-11-17 by A-64 and D-7 (below). Code waits on W1 (A-247),
+whose works off the owner it builds on; W1 lands from `agents/g231-000-clients-loadtest-w1`.
+
+- **Why (measured).** W1 (A-247) moves a work's edits and composition to the work's shard; the verdict and the rebase
+  still run on the green's owner.
+  - At the 3,000-client load rung (`kernel/` of linux 7.4-rc1, 754 files, 16 MB) the owner spends 51–53% of its wall
+    on them (W1, the anchor recipe, 2026-11-11). A verdict is 21.4–21.7 µs of the owner's CPU and a rebase 12.3–12.4.
+  - Rebases are the larger share of the owner's merge work: 71,000–72,000 rebases a run against 49,000 verdicts.
+  - At 1,000 clients and equal offered load, W1's rebase p99 is worse than main's (rounds' medians 30.7 against 21.2 ms):
+    it crosses to the owner and waits in the ask batch, where on main it ran beside its work.
+  - A rebase changes nothing on the green. Running it on the work's shard takes it off the owner entirely.
+- **The shape.** Each shard that holds a work of a green keeps a replica of the green: the engine's own metadata, built
+  from the owner's at a version and kept current by the owner's accepted versions applied in order through the engine's
+  own replay (`Green::apply_recorded`, the chain entry's `Applied` over its increment). One code path: a replica at
+  version v is the owner's green at v by construction, the property replay already holds for recovery.
+  - *The feed.* After a version is committed (A-252: after its quorum), the owner sends its chain entry to each shard
+    holding a replica, over the existing bounded control channel, in version order. A replica that sees a gap (a
+    version it lacks before the one it is sent) is rebuilt from the owner, counted.
+  - *Served from the replica.* A rebase of a work on that shard, at the replica's head (never below the work's base;
+    the work's next submit is judged by the owner against its own head, as every stale base is). A read of the green
+    at a named version the replica holds (the 60% of A-247's reads). Everything else is unchanged: the verdict, the
+    `Head` read, the merge record, every refusal.
+  - *Behind.* A replica whose head is below a work's base (the owner accepted a version the feed has not delivered)
+    forwards that rebase to the owner, as today, counted. A read at a version the replica does not hold, above its
+    head or below its floor, is forwarded the same way.
+  - *Laptop degenerate (R8).* With one shard there is no other shard and no replica: the owner serves, as now.
+- **Content: once, in place (the supervisor's decision, 2026-11-17).** A-64 keeps content once in the anchor's RAM, and
+  D-7 lets any core read an immutable chunk. So a replica holds no bytes of its own: it names the owner's chunks, and
+  reads them where they are. It never copies them and never fetches them through the fleet for a shard of the same node.
+  Two things the code does not have today follow, and both are part of this amendment:
+  - *Chunks that never move or change.* The engine's content is its owner's heap today (`Green::content`, a map of
+    `Vec<u8>`; the history's `Chunks`, a slot vector of `Vec<u8>` reused when freed), so a reference to it from another
+    thread is not sound. The owner's current values and history chunks move into blocks of a region the owner allocates
+    and seals: a sealed block is never written, moved or reused while any shard can name it (D-6's rule for volume
+    chunks, A-64's for the image). A replica's piece names a block by handle and range, as an image's chunk reference
+    does.
+  - *Frees deferred until every replica has passed them.* A-64's deferral holds a block only until the owner's next
+    publication commits, and knows nothing of readers on other shards; alone it would let a replica read a block freed
+    and reused under it. So the owner frees a chunk whose last reference version v dropped only when every replica has
+    acknowledged a version at or past v. A replica acknowledges on the feed's own channel, after its turn has applied
+    the version and dropped every reference the version removed; the acknowledgement is per version (batched to the
+    latest), never per chunk, so the cost is one message a version a replica and no atomic on any per-item path (D-7's
+    quiescent-state rule, made by message). A replica dropped, rebuilt or ended acknowledges by leaving: its shard's
+    acknowledgement is removed, so a dead replica never holds a free.
+  - *Bounds.* The deferred bytes are charged to the owner's memory class, and they are bounded by the slowest
+    replica's lag. A replica more than the derived lag behind (owed: its derivation, from the class's headroom against
+    the bytes a version frees) is dropped, counted (`merge.replica.dropped_lagging`), and its rebases and reads go to
+    the owner. So no replica can hold the owner's memory past its class.
+  - *When this would be wrong.* If a measured fact makes it unsound (a lifetime the acknowledgement cannot hold) or
+    slower than a copy (cross-shard reads of the owner's blocks costing more than the copy saves), the numbers and the
+    alternative go to the supervisor before code is built another way.
+- **What a replica costs, measured** (perf, 2026-11-11). A diagnostic build (never committed) logged the owner's green,
+  by kind, at the 3,000-client rung's end: head 9,000, two runs alike to a few hundred bytes. Payload bytes, maps' node
+  overhead not counted, so a lower bound:
+
+  | part | bytes | a replica holds it |
+  |---|---|---|
+  | current file bytes | 16,438,721 | no: the owner's blocks, read in place |
+  | history chunks (the current values again, and earlier runs) | 18,859,529 | no: the owner's blocks, read in place |
+  | content history index (45,690 entries, their piece lists) | 8,991,756 | yes |
+  | deltas (9,000 versions, 44,997 ops) | 4,642,109 | yes |
+  | path, last-changed and kind indexes, kind histories | 613,120 | yes |
+  | idempotency and rejected-result caches | 4,183,041 | no: the owner's |
+
+  - Metadata is about 14.2 MB a replica at this rung (about 1.6 KB a version kept, until the retention floor folds it),
+    about 313 MB at 22 shards. Copying content as well would have been about 49.5 MB a replica, and about 1.3 GB for a
+    whole kernel tree, most of a 1.49 GB memory class in every replica: content in place avoids both.
+  - Against the budgets, from the measurement's own daemon log (adas-mac-studio.local-2, `effective_capacity_bytes`
+    103,079,215,104, 23 shards): a shard's metadata class, `table_bytes`, is 373,475,417 bytes (it already bounds the
+    green's chain), and a memory class, `reserve_per_shard`, is 1,493,901,668. A replica's metadata is 3.8% of one
+    shard's `table_bytes` (under 8% if the maps' node overhead doubled it), and each shard holds only its own replica.
+- **Bounds and outcomes.** A replica's metadata is charged to its shard's metadata budget. At the bound the replica is
+  dropped and its rebases and reads go to the owner, counted (`merge.replica.dropped`), never refused to the client.
+  A replica no work on its shard has used for the derived idle period (owed: its derivation, from the feed's cost per
+  version against the rebases it served) is dropped the same way. The feed rides the control channel's existing bound;
+  a full channel delays a version, never drops it (the reply rule since 2026-11-09), and a replica behind forwards.
+- **Tests first.**
+  - The replica equals the owner at every version over generated histories (files, links, modes, renames, removals),
+    the green's identity compared at each version.
+  - A lagging replica's rebase is answered exactly as the owner would answer it at the replica's head, and a rebase whose
+    base is above the replica's head is forwarded and answered by the owner.
+  - A read at a version the replica lacks is forwarded, and its answer equals the owner's.
+  - Lifetime: a replica holding a piece of a chunk whose last reference the owner has dropped reads the chunk's bytes
+    unchanged until it acknowledges, and the owner's free happens at that acknowledgement and not before; a replica
+    dropped mid-read releases its hold. Red with the acknowledgement ignored (the owner frees at once).
+  - Non-vacuity: counters of rebases and reads served off the owner and of those forwarded, and of frees deferred for
+    a replica (`merge.replica.frees_deferred`).
+  - Then the A/B the supervisor runs: the anchor recipe, every round, with the owner's utilization before and after.
+- **Tried and rejected.**
+  - *Copying content into each replica* (perf's option 1) or *for the paths a shard's works touch* (option 2): content
+    twice, against A-64, and about 1.3 GB a replica for a whole kernel tree. Rejected 2026-11-17 by the supervisor.
+  - *An epoch-published immutable root of the green's metadata* (the owner's maps shared read-only with every shard):
+    it needs a persistent map the engine does not use. Rejected 2026-11-11 for a replica fed by message. Its other
+    cost, reclaiming what readers may still hold, is paid here for content alone, by acknowledgement.
+  - *Shard-count-fixed replicas* (a replica on a literal number of shards): a tuning literal (R3), and a work's shard is
+    where its rebases are. Rejected for "every shard holding a work of the green".
+  - *Answering the owner's asks in slices of the step budget* (2026-11-09): the step budget, about 4.5 µs, is below one
+    ask's cost, so every slice was one ask and every answer a message; SubmitAccepted p99 75.3–493.0 ms against W1's
+    53.8–77.2 (BENCHMARKS). It moved no work off the owner.
 
 ### A-276 — A heal restores the holders a head names and counts each repair however late its acknowledgement; a holder that left is replaced at the next sequence, recorded with the republished head as one record; every heal ends once its first round's replies have had their whole span (2026-11-17, built for goal g248; the replace is live-fixes' 2026-11-09 work; amends §4.10's healer)
 
