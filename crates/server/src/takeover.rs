@@ -2653,6 +2653,7 @@ mod tests {
         },
         completion: None,
         signature: None,
+        folded_below: 0,
       };
       state.pending_green_materializations.insert(
         green,

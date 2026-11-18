@@ -1426,7 +1426,8 @@ pub(crate) fn status_merge_volume(
 // record's: a mismatch is refused, counted (`merge.recompute_mismatch`), printed loudly, and the
 // green is never served from this holder again (fatal for the green here; the owner and the other
 // holders carry on, Degraded — §4.16 failure matrix); a match accepts the record into the holder's
-// acceptor exactly as a head record is. An out-of-order record (a version past the replica's next)
+// acceptor exactly as a head record is, its replica folded where the record says the owner's engine had folded
+// (A-385). An out-of-order record (a version past the replica's next)
 // is refused and counted; the owner re-ships it once its predecessor is acknowledged.
 
 use std::collections::BTreeSet;
@@ -1490,6 +1491,10 @@ pub(crate) const OUT_OF_ORDER: &str = "merge.out_of_order";
 /// Counted on a holder whose held inputs did not decode as an increment or origin (a corrupt hold).
 /// Format: a refusal name in the daemon's status report.
 pub(crate) const INPUTS_UNDECODABLE: &str = "merge.inputs_undecodable";
+/// Counted on a holder, by the versions its replica of a green folded at the floor its owner's record named (A-385):
+/// the non-vacuity counter of a replica that keeps no more history than its owner.
+/// Format: a refusal name in the daemon's status report.
+pub(crate) const REPLICA_FOLDED: &str = "merge.replica.folded";
 
 /// Format: the one entry of an inputs archive's manifest — a file holding the version's inputs.
 pub(crate) const INPUTS_ENTRY_NAME: &str = "inputs";
@@ -1504,8 +1509,9 @@ pub(crate) const RECORD_AWAITS_WORK_CATALOG: &str = "merge.record.awaits_work_ca
 /// earlier layout wrote begins with its version number, whose low word is the magic only at version 1,129,467,207.
 const RECORD_MAGIC: u32 = u32::from_le_bytes(*b"GMRC");
 /// Format: a merge record's format version (A-255: 1 is the first versioned format, with the submit's completion key; 2
-/// carries the submitting work beside the key, A-288); a decoder refuses any other.
-const RECORD_VERSION: u32 = 2;
+/// carries the submitting work beside the key, A-288; 3 carries the owner's fold floor, A-385); a decoder refuses any
+/// other.
+const RECORD_VERSION: u32 = 3;
 /// Format: a merge record's magic and its version are each a little-endian `u32`.
 const RECORD_WORD_BYTES: usize = size_of::<u32>();
 /// Format: the magic and version before a merge record's value.
@@ -1551,6 +1557,11 @@ pub struct MergeRecordValue {
   /// it: a successor records it with the version, so the version's provenance outlives its owner. `None` for an
   /// unsigned submit and for version 0, which no submit made. Appended.
   pub signature: Option<slates_db::catalog::SignatureVerdict>,
+  /// The version below which the owner's engine had folded the green's histories when it made this record (§4.16 "delta
+  /// retention before folding", A-385): never past the oldest version a live reader of the green names, so no later
+  /// increment is based below it. A holder folds its replica there once it holds this version, so a replica keeps no more
+  /// of the green's history than its owner does. 0 for version 0. Appended.
+  pub folded_below: u64,
 }
 
 /// A submit's completion key as a merge record carries it ([`MergeRecordValue::completion`]): the client's host, the
@@ -2044,6 +2055,9 @@ fn enqueue_record_with(
     .get(&green)
     .and_then(|engine| engine.signature(version))
     .map(crate::signed_work::shipped);
+  // Where the engine has folded the green's histories (A-385): its holders fold their replicas there once they hold
+  // this version, so no replica keeps more of the green's history than its owner.
+  let folded_below = state.greens.get(&green).map_or(0, Green::folded_below);
   let mut value = MergeRecordValue {
     version,
     increment,
@@ -2056,6 +2070,7 @@ fn enqueue_record_with(
     owner,
     completion,
     signature,
+    folded_below,
   };
   // Version 0 of a green over a base names its origin as its inputs: made a share at a time, and the record enqueued
   // once they are (A-286), never walked, encoded and archived in this poll.
@@ -3548,8 +3563,25 @@ fn recompute(
   if let Some(signature) = value.signature {
     replica.record_signature(value.version, crate::signed_work::adopted(signature));
   }
+  // Folded where the owner had folded when it made this record (A-385): nothing at or past the floor is lost, and no
+  // later increment is based below it.
+  fold_replica(state, &mut replica, value.folded_below);
   state.merge.replicas.insert(object, replica);
   Ok(())
+}
+
+/// Folds a holder's `replica` of a green below `floor`, the version below which its owner's engine had folded the
+/// green's histories when it made the record this holder now holds (§4.16 "delta retention before folding", A-385): the
+/// replica then keeps no more of the green's history than its owner does. A floor at or below the replica's own fold
+/// is no change. The versions it folds are counted (`merge.replica.folded`), the non-vacuity counter of a holder that
+/// follows its owner's fold.
+pub(crate) fn fold_replica(state: &mut ShardState, replica: &mut Green, floor: u64) {
+  let before = replica.folded_below();
+  if floor <= before {
+    return;
+  }
+  replica.fold_history_before(floor);
+  state.count(REPLICA_FOLDED, floor.saturating_sub(before));
 }
 
 /// A holder's view of `object`'s replica, for a test.
@@ -3687,6 +3719,7 @@ mod tests {
         },
         completion: None,
         signature: None,
+        folded_below: 0,
       },
       inputs: Placement {
         candidates: candidates.clone(),
@@ -3786,6 +3819,7 @@ mod tests {
               },
               completion: None,
               signature: None,
+              folded_below: 0,
             },
             inputs: Placement {
               candidates: candidates.clone(),
@@ -3887,6 +3921,7 @@ mod tests {
         detail: 0,
         fingerprint: [15u8; 32],
       }),
+      folded_below: 2,
     }
   }
 
@@ -3911,6 +3946,7 @@ mod tests {
       },
       completion: None,
       signature: None,
+      folded_below: 0,
     };
     assert_eq!(
       MergeRecordValue::from_record_bytes(&origin_only.to_record_bytes()),
