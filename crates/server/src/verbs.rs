@@ -13023,7 +13023,7 @@ fn chain_phase(
   use crate::merge_service::GreenFence;
   // The engine seeded from the origin (the empty engine for a green with no origin), restored at its checkpoint if it
   // has one, as `Green::restore` does in one call.
-  let seeded = seeded.unwrap_or_else(slates_merge::engine::Green::new);
+  let seeded = seeded.unwrap_or_default();
   let (mut green, held, head_check) = match state.db.partition().green_checkpoint(id) {
     Some((held, bytes)) => {
       let checkpoint = slates_merge::checkpoint::Checkpoint::decode(bytes)

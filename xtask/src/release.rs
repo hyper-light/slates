@@ -1029,7 +1029,7 @@ fn checked_build(entry: &Gathered) -> Result<Checked, Failure> {
 }
 
 /// Format: the platforms table in the draft's notes, one row per shipped asset; a test holds it to
-/// [`ASSETS`](crate::targets::ASSETS).
+/// [`ASSETS`].
 const PLATFORMS: &str = "| Platform | File |\n|---|---|\n| macOS arm64 | `slates-macos-arm64` |\n| Linux x86_64 \
    (glibc) | `slates-linux-x64` |\n| Linux arm64 (glibc) | `slates-linux-arm64` |\n| Linux x86_64 (static, musl) | \
    `slates-linux-x64-musl` |\n| Linux arm64 (static, musl) | `slates-linux-arm64-musl` |\n| Windows x86_64 | \
