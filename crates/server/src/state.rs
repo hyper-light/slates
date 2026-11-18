@@ -510,6 +510,14 @@ pub struct ShardState {
   /// after its record went, since the volume made from the adopted state took its id. Bounded by the partition's volume
   /// cap: a relinquished copy was a volume this shard held, and each leaves once its teardown is done.
   pub(crate) relinquished: Vec<VolumeSlot>,
+  /// The claims this shard holds for live volumes routed to it that this node holds the log of as a candidate (§4.2 "a
+  /// remote holder makes the same admission against its own machine before acknowledging placement"; g229): by volume,
+  /// the credits a successor's restore takes over (`verbs::CandidateClaim`, `verbs::make_restored`). Bounded by the live
+  /// copies this node holds of volumes routed to this partition, each admitted only once its catalog is held
+  /// (`live_ship::admit_claim`): a claim whose copy went is released at the control shard's next reconciliation
+  /// (`live_ship::reconcile_claims`).
+  pub(crate) candidate_claims:
+    std::collections::BTreeMap<slates_db::catalog::VolumeId, crate::verbs::CandidateClaim>,
   /// The Linux FUSE mounts this shard serves, by attachment (§4.6 "Linux"; AUD-29-64; `crate::fuse`). Bounded
   /// by the partition's attachment cap: one entry per live FUSE attachment at most.
   #[cfg(target_os = "linux")]

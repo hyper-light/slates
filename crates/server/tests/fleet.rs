@@ -12886,6 +12886,122 @@ fn a_successors_live_log_goes_on_past_every_position_durable_before_it() {
   );
 }
 
+/// Format: a successor's count of taken-over volumes made from the claim it reserved as a candidate (§4.2, g229).
+const CLAIM_TAKEN_OVER: &str = "fleet.live.claim_taken_over";
+/// Format: a node's count of taken-over volumes given up after their attempts (`fleet::give_up_taken_over`).
+const MATERIALIZE_GIVEN_UP: &str = "fleet.materialize.given_up";
+/// Shape: the creates a fill tries, each at the size the last one's refusal named: the bytes, then what the inode
+/// allowance or the metadata left, then one more for a ledger another admission moved meanwhile.
+const FILL_ATTEMPTS: usize = 3;
+
+/// Fills `daemon`'s shard (one shard a node in these meshes) with one bounded volume of everything it admits now: a
+/// create past any shard's room is refused `BudgetExceeded` naming what the shard could admit, and a create of that size
+/// takes it. The volume made, or the last reply.
+fn fill_shard(daemon: &Daemon, name: &str) -> Result<VolumeId, ReplyBody> {
+  let mut client = Client::connect(daemon.instance());
+  let mut limit = u64::MAX / 2;
+  let mut last = None;
+  for _ in 0..FILL_ATTEMPTS {
+    let reply = client.call(&RequestBody::Create {
+      name: name.to_owned(),
+      size: SizeClass::Bounded { limit },
+      names: NamePolicy::Exact,
+      require_locked: false,
+      base: None,
+    });
+    match reply {
+      ReplyBody::Created { id } => return Ok(id),
+      ReplyBody::Refused {
+        refusal: Refusal::BudgetExceeded { available },
+      } if available > 0 && available < limit => limit = available,
+      other => {
+        last = Some(other);
+        break;
+      }
+    }
+  }
+  Err(last.unwrap_or(ReplyBody::Refused {
+    refusal: Refusal::BudgetExceeded { available: limit },
+  }))
+}
+
+/// §4.2 ("a remote holder makes the same admission against its own machine before acknowledging placement"; g229, the
+/// macOS kill-at-ack failure, CI diag-supervisor-live-2): a candidate reserves a live volume's claim as it takes the
+/// log's first entry, so its successor makes the volume in that room however full its shard grew since. Do: three
+/// nodes at `f = 1`, the pressure hold held at nothing; on a, a bounded live-shipped volume written six files, each
+/// answered at durability; once the survivor the volume ranks first holds its log, fill that survivor's shard with a
+/// bounded volume of everything it then admits; stop a. Expect the successor to serve the volume and every file within
+/// the serve wait, made from its claim (`fleet.live.claim_taken_over` moved) and never given up. Before, the fill took the
+/// room a successor's restore needs, the restore was refused `BudgetExceeded` a period at a time, and after the failover
+/// SLO's attempts the volume was given up (`NotRecovered`) while the other survivor held every acknowledged write.
+#[test]
+fn a_candidates_claim_keeps_the_room_its_successor_makes_the_volume_in() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, mut daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  // No pressure hold: a takeover's restore may run into the hold's room (`fleet::past_the_pressure_hold`), which would
+  // let a successor without its claim make the volume all the same.
+  for daemon in &daemons {
+    daemon.inject_available_memory(u64::MAX / 2).unwrap();
+  }
+  let mut client = Client::connect(daemons[0].instance());
+  let (id, written) = live_volume_written(&mut client, &daemons, "claimed");
+  drop(client);
+  let object = ObjectId(id.bytes);
+  let successor = rendezvous_first(&[hosts[1], hosts[2]], object).expect("a survivor takes over");
+  let index = if successor == hosts[1] { 1 } else { 2 };
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let holds_log = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    daemons[index]
+      .fleet_live_held(object)
+      .map(|held| held.is_some())
+  });
+  drop(observed);
+  let filled = fill_shard(&daemons[index], "fill");
+  let taken_before = refusal_count(&daemons[index], CLAIM_TAKEN_OVER).unwrap();
+  let given_up_before = refusal_count(&daemons[index], MATERIALIZE_GIVEN_UP).unwrap();
+  daemons.remove(0).stop();
+  let index = index - 1;
+  let instance = daemons[index].instance().to_owned();
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let served = poll_status_answers(&observed, &instance, id);
+  let mut reader = Client::connect(&instance);
+  let read: Vec<bool> = (0..CONTINUITY_FILES)
+    .map(|file| {
+      let reply = read_at_head(&mut reader, id, &format!("/continuity-{file}"));
+      matches!(reply, ReplyBody::ReadPage { bytes, .. } if bytes == continuity_body(file))
+    })
+    .collect();
+  drop(reader);
+  let taken = refusal_count(&daemons[index], CLAIM_TAKEN_OVER).unwrap();
+  let given_up = refusal_count(&daemons[index], MATERIALIZE_GIVEN_UP).unwrap();
+  drop(observed);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "claimed: the successor held the log {holds_log}, its shard filled {filled:?}; served {served}, read {read:?}; \
+     claims taken over {taken_before} -> {taken}, given up {given_up_before} -> {given_up}"
+  );
+  assert!(
+    written
+      .iter()
+      .all(|reply| matches!(reply, ReplyBody::FsDone { .. })),
+    "every write was answered at durability: {written:?}"
+  );
+  assert!(
+    holds_log && filled.is_ok(),
+    "the successor held the log ({holds_log}) and its shard was filled: {filled:?}"
+  );
+  assert!(
+    served && read.iter().all(|read| *read),
+    "the successor serves the volume ({served}) and every file reads back through it: {read:?}"
+  );
+  assert!(
+    taken > taken_before && given_up == given_up_before,
+    "made from its claim ({taken_before} -> {taken}), never given up ({given_up_before} -> {given_up})"
+  );
+}
+
 /// Format: a node's count of objects its takeover rounds adopted (`takeover::record_adoption`).
 const TAKEOVER_ADOPTED: &str = "fleet.takeover.adopted";
 /// Format: a node's count of takeover rounds started over (`takeover::begin_round`, A-353).
@@ -25612,6 +25728,149 @@ fn a_live_shipped_verb_refused_at_the_held_reply_bound_changed_nothing_so_its_re
     overloaded(&resent),
     "the resend met the bound again and ran nothing twice: {resent:?}"
   );
+}
+
+/// Format: what the mapper of [`a_live_shipped_maps_sync_refused_at_the_held_reply_bound_wrote_nothing`] stores, as long
+/// as the file the filler writes, so the whole store lies within the file and a write-back would write all of it.
+const MAP_STORE: &[u8] = b"STORED!";
+
+/// A-200, the held replies' bound for an asynchronous outcome (GAPS, "A live-shipped verb refused at the held replies'
+/// bound ran again on its resend": the siblings). A mapped file's sync on a live-shipped volume meets the owner shard's
+/// bound on held replies before its write-back runs, so a sync refused `Overloaded` wrote nothing, as every verb refused
+/// so changed nothing. Before, the sync met the bound in `live_ship::defer`, after its write-back had written the map's
+/// stores into the file: the client was told `Overloaded` of stores the file held. Do: three nodes at `f = 1`, two
+/// shards of one client seat each, so the owner shard holds at most one client's ring of replies; a live-shipped volume
+/// holding `/file`; a library client maps it for writing; both candidates stopped; another client holds a ring of
+/// writes of the file; the mapper stores [`MAP_STORE`] in its map and syncs. Expect: the sync refused `Overloaded`, the
+/// bound counted, and the file still as the held writes left it, without the store.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_live_shipped_maps_sync_refused_at_the_held_reply_bound_wrote_nothing() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let mut daemons = start_mesh_tuned(nodes, &hosts, &certs, &serve, 2, |config| {
+    config.clients_per_shard = 1;
+  });
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  for daemon in &daemons {
+    daemon
+      .inject_failover(Some(HELD_PAST_THE_TEST_NS))
+      .expect("the failover delay is held past the test");
+  }
+  let mut filler = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id } = filler.call(&scratch("map-over-bound")) else {
+    panic!("create");
+  };
+  share_with_fleet(&mut filler, id, &daemons);
+  let ReplyBody::Attached { attachment, .. } = filler.call(&RequestBody::Attach {
+    volume: id,
+    snapshot: None,
+    intent: Intent::Write,
+    form: AttachRequest::Root,
+  }) else {
+    panic!("attach");
+  };
+  let shipped = filler.call(&RequestBody::LiveShip {
+    volume: id,
+    live_shipped: true,
+  });
+  let write = RequestBody::FsWrite {
+    volume: id,
+    attachment,
+    path: "/file".to_owned(),
+    bytes: b"written".to_vec(),
+    mode: 0o644,
+  };
+  let first_write = filler.call(&write);
+  let deadlines =
+    slates_client::Deadlines::derive(LIVENESS_BUDGET_NS, slates_db::replay::RECOVERY_BUDGET_NS)
+      .get();
+  let mut mapper = slates_client::Client::connect(daemons[0].instance(), deadlines).unwrap();
+  let map_attachment = mapper.attach(id, None, Intent::Write).unwrap().attachment;
+  let mapped = mapper
+    .map_write(
+      (id, map_attachment),
+      "/file",
+      slates_client::page_bytes().unwrap(),
+    )
+    .unwrap();
+  // Both candidates gone: nothing written from here becomes durable, so every write's reply is held.
+  for candidate in daemons.split_off(1) {
+    candidate.stop();
+  }
+  let held_before = library_shard_count(&mut mapper, "fleet.live.awaited");
+  let ring = filler.end.region().cmd().slots();
+  filler.send_burst(&write, ring);
+  let ring_held = poll_until(&[&daemons[0]], PLACEMENT_DEADLINE, || {
+    Ok(
+      library_shard_count(&mut mapper, "fleet.live.awaited")
+        >= held_before + u64::try_from(ring).unwrap(),
+    )
+  });
+  // Stored once the held writes have written the file (and, through it, the map's copy), so only the sync can carry
+  // the store into the file.
+  let stored = mapped.write_at(0, MAP_STORE).unwrap();
+  let synced = mapper.map_sync(&mapped);
+  let over_bound = library_shard_count(&mut mapper, "fleet.live.over_bound");
+  let file = mapper.read(id, "/file", slates_client::ReadAt::Head);
+  drop(mapped);
+  drop((filler, mapper));
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "live-ship {shipped:?}; first write {first_write:?}; {ring} writes held {ring_held}; stored {stored}; sync \
+     {synced:?}; over_bound {over_bound}; file {file:?}"
+  );
+  assert!(
+    matches!(shipped, ReplyBody::LiveShippingSet { live_shipped: true }),
+    "the volume is live-shipped: {shipped:?}"
+  );
+  assert!(
+    matches!(first_write, ReplyBody::FsDone { .. }),
+    "the write before the stop was durable and answered: {first_write:?}"
+  );
+  assert!(ring_held, "a ring of writes was held for durability");
+  assert_eq!(stored, MAP_STORE.len(), "the map took the store");
+  assert!(
+    matches!(
+      synced,
+      Err(slates_client::ClientError::Refused(
+        Refusal::Overloaded { .. }
+      ))
+    ),
+    "the sync met the bound: {synced:?}"
+  );
+  assert!(over_bound >= 1, "the bound refused the sync (non-vacuous)");
+  assert_eq!(
+    file.unwrap(),
+    b"written",
+    "a sync refused at the bound wrote nothing into the file"
+  );
+}
+
+/// A shard counter of the daemon `client` reaches, summed over its shards, asked through the client library.
+fn library_shard_count(client: &mut slates_client::Client, kind: &str) -> u64 {
+  let Ok(ReplyBody::DaemonStatus { report }) = client.call(&RequestBody::DaemonStatus) else {
+    panic!("the daemon reported its status");
+  };
+  report
+    .shards
+    .iter()
+    .flat_map(|shard| shard.refusals.iter())
+    .filter(|count| count.kind == kind)
+    .map(|count| count.count)
+    .sum()
 }
 
 /// Shape: how long a resend is sent again while refused retryable: five liveness budgets, past a takeover's settling.

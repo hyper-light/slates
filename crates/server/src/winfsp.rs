@@ -14,11 +14,11 @@
 //! request over a bounded channel and wake it (§4.3 "Drivers": "WinFsp requests arrive on WinFsp's threads and are
 //! routed to the owning shard by handle"); each turn serves one request whole with a transient `VolumeBridge` over the
 //! shard's slot, admitted under the mount's registry attachment so a barrier over the volume sees it in flight. A request
-//! that changed what survives a restart (a namespace or size change, a flush, the close of a handle that wrote)
-//! publishes the shard's recovery image before its reply (§4.8, D-18), as the FUSE and NFS transports' do; a refused
-//! publication answers `STATUS_UNEXPECTED_IO_ERROR`. The task yields between requests so a busy mount never holds its
-//! shard. While the owner may not serve the volume's latest state (the live-tree fence, AUD-29-83) no request is
-//! taken: WinFsp's dispatcher waits, asked again each heartbeat.
+//! that changed what survives a restart (a namespace or size change, a write (A-379), a flush, the close of a handle
+//! that wrote) publishes the shard's recovery image before its reply (§4.8, D-18), as the FUSE and NFS transports' do;
+//! a refused publication answers `STATUS_UNEXPECTED_IO_ERROR`. The task yields between requests so a busy mount never
+//! holds its shard. While the owner may not serve the volume's latest state (the live-tree fence, AUD-29-83) no request
+//! is taken: WinFsp's dispatcher waits, asked again each heartbeat.
 //!
 //! **Coherence (§4.6 "Cache posture").** Windows keeps what it fetched for as long as the mount does not say otherwise
 //! (`FileInfoTimeout` infinite), so the mount tells it of every change made through any other path — the SDK, another

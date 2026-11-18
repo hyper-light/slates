@@ -1259,19 +1259,19 @@ shards, replay, delayed replies or cancellation. A remote holder makes the same 
 against its own machine before acknowledging placement. A promise on host A reserves nothing
 on host B. Configuration and holder records expose the actual reservation and generation.
 
-> **Status (2026-11-18, g229: a candidate's admission is owed).** A candidate makes no admission
-> before it holds a live log (§4.10). It keeps the log's entries on its heap (`live_ship::keep`, at
-> most twice the volume's quota, outside the shard budget) and reserves nothing. A successor reserves a
-> bounded claim only at its restore (`verbs::make_restored`), and the successor is the
-> configuration's rendezvous pick among the retirement's survivors
-> (`RegionalConfiguration::successor`), never chosen by room. So a successor whose shard cannot admit
-> the claim refuses its own restore `BudgetExceeded` each period, and after the failover SLO's
-> attempts gives the volume up (`NotRecovered { TakeoverIncomplete }`, final), while another survivor
-> holds every acknowledged write. CI's 7 GB macOS runner showed it, a 782 MiB claim being 76 % of a
-> shard there (GAPS, the chaos entry, 2026-11-18). Owed: every candidate of the volume's recovery
-> cohort reserves the claim when it takes the log's first entry; the successor's restore takes that
-> reservation over; a placement a candidate cannot admit is refused typed at `live-ship`; and the
-> held log is charged.
+> **Status (2026-11-18, A-401, g229: a live log's candidate makes the admission).** A candidate reserves the claim a
+> successor's restore takes when it takes a live log's first entry (`live_ship::admit_claim`): the bytes, the inode
+> allowance, the records and a strict volume's locked entitlement, on the shard the volume's id routes to
+> (`verbs::admit_candidate_claim`). A candidate that cannot admit them answers `NoRoom` and takes nothing. The held log is
+> charged against the claim, and past it on the control shard, as content held for another owner (`live_ship::Room`).
+> A successor's restore takes the claim over (`verbs::take_claim_or_admit`), so whatever this node has admitted since
+> cannot take the volume's room. Before, a candidate reserved nothing. The successor is the configuration's rendezvous
+> pick among the survivors (`RegionalConfiguration::successor`), never chosen by room, so one whose shard had filled
+> refused its restore `BudgetExceeded` each period and gave the volume up while another survivor held every
+> acknowledged write (CI's 7 GB macOS runner, where a 782 MiB claim was 76 % of a shard;
+> `docs/bugs/2026-11-18-a-successor-with-no-room-gave-up-a-live-volume-a-survivor-held-whole.md`). Owed: `live-ship`
+> answers before any candidate has admitted, where the rule refuses the placement typed (next, under A-401); and a
+> placed seal's successor still admits at its restore alone.
 
 **Resource dimensions.** A byte quota cannot bound arbitrarily many empty files, names,
 xattrs, open handles or snapshots. Admission therefore publishes a resource vector: content
@@ -7215,8 +7215,14 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > record, so the resend ran the verb again over them: a directory's resend was refused `AlreadyExists`, an append landed
 > twice (g232's finding). Held by
 > `a_live_shipped_verb_refused_at_the_held_reply_bound_changed_nothing_so_its_resend_runs_once`
-> (`crates/server/tests/fleet.rs`). An asynchronous outcome (a mapped file's sync, an image build) still meets the bound
-> in `defer`, after its commit (GAPS, OPEN).
+> (`crates/server/tests/fleet.rs`). An asynchronous outcome that may wait so (a mapped file's write-back, a checkout)
+> takes a seat among the held replies as its task begins (`live_ship::take_seat`), refused `Overloaded` at the bound
+> before it writes anything; its wait fills the seat (`defer`, which no longer refuses for room), or it gives the seat
+> back when it completes without one (`release_seat`). A map's release lets its copy go whatever its write-back
+> answers, so it is seated when there is room and never refused for room (`seat_if_room`). An outcome that began with no
+> seat (that release, or one whose volume turned live-shipped while it ran) is held past the bound, counted
+> (`fleet.live.held_past_bound`), rather than refused after its commit. Held by `a_live_shipped_maps_sync_refused_at_the_held_reply_bound_wrote_nothing`: before, the sync was
+> refused `Overloaded` with its stores already in the file.
 >
 > **Slice three (2026-11-05): takeover from the live log.** The whole-state kind (23) carries a successor's fetch beside
 > installs, by tag (`slates_db::live::Fetch`). A takeover that adopts a live-shipped volume's head runs phase one for
@@ -7499,6 +7505,14 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > earlier form of this change also shipped a whole entry once the changes since the last were as large as it, which kept
 > that small (193–196 µs added at the median, p99 513–715 µs, at load 58–107); it is withdrawn, since the install image
 > kept beside the log (live-durability) means a whole entry on the log is shipped only at the holder's bound.
+>
+> **A candidate's copy is charged, against the claim it reserved (2026-11-18, A-401, §4.2).** A copy's entries were heap
+> outside every ledger. Now the candidate reserves the volume's claim as it takes the first entry
+> (`live_ship::admit_claim`, refused `NoRoom` when it cannot), and the copy is charged against that claim. Only its bytes
+> past the claim are charged on the control shard (`live_ship::Room`, `ShardBudget::charge_replicated`), refused
+> `NoRoom` when that shard has no room, with the copy left as it was. A dynamic volume's claim holds no bytes, so its
+> copy is charged there whole. A destroy's let-go credits the copy and releases its claim at the control shard's next
+> reconciliation (`live_ship::reconcile_claims`), which also admits a warm restart's copies' claims again.
 >
 > **The held image is incremental (2026-11-08, A-270; on main 2026-11-18 at image version 27, delta version 10).** What
 > a shard holds for other owners is now keyed pieces: the
@@ -20548,7 +20562,7 @@ Applied in the same change to: §4.7 (the rendezvous's status), A-114 (adoption 
 ### A-177 — The daemon serves a WinFsp volume at a drive letter and tells Windows of every other path's change (accepted 2026-10-26)
 Applied in the same change to: §4.6 ("Windows (own thin WinFsp binding)" and its status; the DAX matrix's A-164 status), the DAX matrix (`docs/wip/virtiofs.md` §8, the Windows x86_64 mount-route cell), GAPS, README (the Windows capability row), `crates/bridge-winfsp` (`host.rs` rewritten: requests to the owner shard, `MountThread`; `ffi.rs`: the exports found at run time; `notify.rs`, new; `build.rs` and `tests/mount.rs` removed), `crates/bridge-core` (`delivery.rs`: `Coherence` and `Delivered` moved from `slates-bridge-fuse`), `crates/server` (`winfsp.rs`, new; `transports.rs`: WinFsp offered where its library loads; `verbs.rs`: the WinFsp form's establishment, deferral, end and recovery; `daemon.rs`: `EndWinFspMounts`), `crates/ipc` (`AttachRequest::WinFspMount`, `UnsupportedReason::WinFspNotInstalled`, appended), `crates/db` (`AttachForm::WinFspMount`, appended; `daemon_mount_point`), `crates/client` (`attach_winfsp`), `crates/cli` (`mount`/`unmount` on Windows; `tests/winfsp.rs`, new), `.github/workflows/ci.yml` (both x86_64 Windows lanes), `unsafe-budget.toml` (`slates-bridge-winfsp` 86 → 104), `xtask/src/capabilities.rs`, and two bug records.
 - **What was there.** The WinFsp host served only a volume it built and owned itself (its live test's scratch volume), `slates mount` refused on Windows, and the daemon reported the transport `BridgeNotWired` (research f17). Nothing else could change a file under a Windows mount, so there was nothing to tell Windows.
-- **Built: the owner shard serves the mount.** `attach` with the WinFsp form defers its reply to the mount's task on the volume's owner shard. An owned mount thread creates the file system, defines the drive and starts WinFsp's two dispatcher threads, off the shard. Each callback sends its request over a bounded channel to the task and wakes it (§4.3: "WinFsp requests arrive on WinFsp's threads and are routed to the owning shard"). The task serves one request a turn through the shared operation layer, under a registry attachment, behind the live-tree fence. A namespace or size change, a flush, or the close of a handle that changed its file publishes before its reply. The attachment is recorded with the reply once the drive is mounted. A drive letter has nothing beneath it, so every end of the attachment removes the drive.
+- **Built: the owner shard serves the mount.** `attach` with the WinFsp form defers its reply to the mount's task on the volume's owner shard. An owned mount thread creates the file system, defines the drive and starts WinFsp's two dispatcher threads, off the shard. Each callback sends its request over a bounded channel to the task and wakes it (§4.3: "WinFsp requests arrive on WinFsp's threads and are routed to the owning shard"). The task serves one request a turn through the shared operation layer, under a registry attachment, behind the live-tree fence. A namespace or size change, a write (A-379), a flush, or the close of a handle that changed its file publishes before its reply. The attachment is recorded with the reply once the drive is mounted. A drive letter has nothing beneath it, so every end of the attachment removes the drive.
 - **Built: Windows is told.** `FileInfoTimeout` is infinite (§4.6, as designed), and the volume's free space has a zero timeout: no notification names it. Before each request, and whenever the volume's generation moves, the task runs the FUSE mount's coherence rounds (now `slates_bridge_core::delivery`). It hands Windows one `FspFileSystemNotify` round naming what Windows holds open: Windows caches only what hangs off an open file node (WinFsp `src/sys/file.c`). A round a rename's lock defers (`STATUS_CANT_WAIT` at a zero-timeout begin) or WinFsp refuses puts the cursor back. WinFsp processes a round in a work item of its own (`FspVolumeNotify`, `src/sys/volume.c`), so the shard never waits on a kernel lock.
 - **Decided: the library is found at run time, not linked.** Linked, a daemon could not start on a Windows host without WinFsp. Loaded as WinFsp's own `FspLoad` loads it, the daemon starts everywhere, and the form is refused `WinFspNotInstalled` where the library is absent (run on jupiter, which has no WinFsp, 2026-10-25).
 - **Two defects found on the runner by a request log, both fixed** (run 40251802164). A paging write (`ConstrainedIo`) was applied whole, so a 62-byte file grew to its 4096-byte page; it is now clipped to the file's size, as WinFsp's `memfs` clips it (`docs/bugs/2026-10-26-a-paging-write-through-winfsp-grew-a-file-to-its-page.md`). And since the host was first written, every open of a file was handed the first open's context, so a second open freed that context twice (`docs/bugs/2026-10-26-a-winfsp-file-opened-twice-freed-its-first-context-twice.md`); the mount now takes per-handle contexts (`UmFileContextIsUserContext2`). A file's last close now writes its pages back before its publication (`FlushAndPurgeOnCleanup`): before, a Windows program's write reached the shard only at the cache manager's lazy write-back.
@@ -26777,9 +26791,10 @@ Applied in the same change to:
     `set_consumer_policy_everywhere`, `consumer_policy_on_channel`, `revoke_everywhere`, `attest_on_channel`,
     `clone_named_elsewhere`; `nfs.rs` `serve_remote`, `gather_entries`, `call_owner`; `direct_map.rs` `hand_off`;
     `delegation.rs` `send_recalls`; `remote_attach.rs` `serve_unforwardable`; `work_route.rs` `answer_on_green_shard`.
-    `~` on the wall still: the recovery's cross-shard passes (`daemon.rs` `rebuild_remote_works`,
-    `drop_pending_creations`, `reconcile_work_floors`, `reconcile_name_aliases`, `retained_client_ids`) and the image's
-    alias steps (`image.rs` `reserve`, `settle`), each `xshard::call_within` one window.
+    Since A-403 the recovery's cross-shard passes (`daemon.rs` `rebuild_remote_works`, `drop_pending_creations`,
+    `reconcile_work_floors`, `reconcile_name_aliases`; `retained_client_ids` judged its target's progress already) and the
+    image's alias steps (`image.rs` `reserve`, `settle`) wait in their target's own time too (`xshard::call_in_shard_time`),
+    where each was `xshard::call_within` one window on the wall.
   - Class B, a wait on another host: the forward lane (`verbs::forward_once`'s stall budget base, judged in the lane's
     own time, A-315; `forward_lane.rs` `REPLACEMENT_ANSWER_PERIODS`, `path_floor_ns`, `FailoverBound::from_now`'s
     fallback, A-352); `fleet.rs` `return_sessions` (the transport's silence floor) and `live_budget` (A-200's
@@ -28906,6 +28921,109 @@ Applied in the same change to: §4.2's status, GAPS (the load test's ledger),
   directory and snapshot unit tests 17 of 17, and the server's recovery tests 58 of 58 passed on the same tree; kiln
   r340: the vfs image, retained-bytes, retention, clone, content-in-place and chunk-ownership tests passed (45), and
   with the vfs change reverted the new vfs test held 5 inodes where the live volume held 3.
+
+### A-403 — The recovery's cross-shard passes and the image's alias steps wait in their target's own time: the liveness window's floor for them is the target's measured progress, never a boot snapshot (2026-11-18, built for goal g255; item 1's "W's floor from the running wake estimate"; A-65, A-228, A-359)
+
+- **What was there.** A-359's class A list kept seven call families on the wall: the daemon's recovery passes over the
+  other shards (`rebuild_remote_works` 4 calls, `drop_pending_creations`, `reconcile_work_floors` 3,
+  `reconcile_name_aliases` 3) and the image's alias steps (`image.rs` `reserve`, `settle`), each `xshard::call_within` one
+  liveness window of wall time. They run while every shard is busy with its own recovery, so a target alive and working
+  on its CPU could outlast one wall window and its pass was skipped: the very case A-228 rules a target starved, not
+  stuck. A-359 measured the machine's floor once at boot (the wake probe's p99), which Ada's rule of 2026-11-18 rules out:
+  a value computed once at boot is still a constant.
+- **The rule.** Each waits by `xshard::call_in_shard_time` (A-65's rule, `xshard::within_shard_time`), as the class A
+  verbs have since 2026-11-06: a wait goes on while its target makes progress on its CPU, and gives up only when the target
+  made none for a window or ran its budget, judged in the target's own CPU time. The floor of each wait is then the
+  target's own measured progress, live, never a number. The room probe (`free_room_of`, a heartbeat's bound on a
+  question it can ask again next pass) is not a liveness wait and stays.
+- **Owed.** The boot log's floor line (`config::liveness_window(wake.p99_ns)`) is kept as the A/B record; the running
+  overrun each shard mirrors in its pulse (`Pulse::scheduler_overrun_ns`) is the live floor a published window would
+  follow. A failing test of a recovery pass beside a target kept busy past a window is filed for main (the recovery and
+  cross-shard suites).
+
+Applied in the same change to: the design's A-359 class A list, GAPS (the `LIVENESS_BUDGET_NS` entry),
+`crates/server/src/{daemon,image}.rs`.
+
+### A-401 — A live log's candidate reserves the claim a successor's restore takes as it takes the log's first entry, and the restore takes that claim over (2026-11-18, goal g229: chaos across real processes; the macOS kill-at-ack failure)
+Applied in the same change to:
+- §4.2: "Atomic admission", its status. §4.10: the candidate's copy, its status of this date.
+- GAPS: the chaos entry, and GAP-A9-1's owed list.
+- `crates/db`: `live.rs`, `LiveError::NoRoom` and its reply kind.
+- `crates/server`:
+  - `verbs.rs`: `CandidateClaim`, `restore_credits`, `admit_candidate_claim`, `reconcile_candidate_claims`,
+    `take_claim_or_admit` and `return_to_claim`; `make_restored`; `restore_taken_over`.
+  - `live_ship.rs`: `Room`, `admit_claim`, `reconcile_claims`; `keep`, now guard-then-apply.
+  - `fleet.rs`: the record plane's admission, and the reconciliation in `adopt_and_serve`.
+  - `state.rs`, `daemon.rs`.
+- The bug record `docs/bugs/2026-11-18-a-successor-with-no-room-gave-up-a-live-volume-a-survivor-held-whole.md`.
+
+- **What was there.**
+  - A candidate took a live log into a copy on its heap and reserved nothing.
+  - A successor made the volume's admission only at its restore. The successor is the configuration's rendezvous pick,
+    chosen by no measure of room.
+  - On CI's 7 GB macOS runner, the kill-at-ack flow's successor already held a 782 MiB claim it had taken over on each
+    of its two 1 GiB shards. Its restore was refused `BudgetExceeded` once a period for the failover SLO's 100 periods,
+    and the volume was given up (`NotRecovered`, final) while the other survivor held the whole log.
+- **The rule (§4.2's own).** A holder makes the owner's admission against its own machine before it acknowledges
+  placement.
+  - **When.** Before a candidate takes a message that would put entries in a copy holding no claim (an entry, a batch, an
+    install), it reserves on the shard the volume's id routes to exactly what a successor's restore takes: a bounded
+    claim's bytes and inode allowance, the volume's records, and a strict volume's locked entitlement. A dynamic volume's
+    claim holds no bytes.
+  - **Refused.** When the shard cannot admit them, the candidate answers `NoRoom { available }` and takes nothing; the
+    owner counts no acknowledgement.
+  - **The charge.** The copy is charged against the claim. Its bytes past the claim are charged on the control shard as
+    content held for another owner, and refused `NoRoom` past that shard's unpromised room. The log and the volume made
+    from it coexist only for the takeover's own work.
+  - **The takeover.** A successor's restore takes the claim over. A failed making returns the credits to the claim, so
+    the next attempt finds the room.
+  - **Reconciliation.** A claim is released once no copy holding entries names it. The control shard reconciles a
+    partition's claims after a let-go or an unanswered admission, and after a warm restart, whose copies have their claims
+    admitted again.
+- **What it costs.** A bounded volume's room is now reserved on every candidate, not only its owner: the design's own
+  accounting of a promise. On the 7 GB runner a node holds about one 782 MiB claim a shard, owned or held as a candidate.
+  The live chaos flows each keep one such volume. The kill-at-ack flow keeps six, so it makes them dynamic.
+- **Evidence.**
+  - `a_candidates_claim_keeps_the_room_its_successor_makes_the_volume_in` (`crates/server/tests/fleet.rs`). Do: fill the
+    successor's shard with everything it admits after it holds the log, then stop the owner. On main (94fffd000, Mac
+    Studio, kiln r263) the volume was given up, never served. With the change it is served, its six files read back,
+    and the claim is taken over.
+  - The unit tests of the charge and of the refusal, and the reply's wire test.
+  - Unchanged: the live takeover tests and the held image's fold oracle.
+- **Owed, next under this number.** `live-ship` refuses typed when a candidate cannot admit, so no placement is
+  acknowledged before every candidate holds its claim.
+
+### A-379 — A WinFsp write is published before its reply: A-358's rule on Windows, where no write log keeps an answered write and a drive outlives its daemon (2026-11-18, goal g079, fsync'd files never come back empty after daemon kills, the sibling sweep; §4.6 "Windows", §4.8 barrier, D-18; A-198, A-200, A-358)
+
+Applied in the same change to:
+- `crates/bridge-winfsp/src/host.rs`: `Op::needs_barrier` names `Op::Write`; a purge's own write is barrier-free, as a
+  purge's close was.
+- `crates/server/src/winfsp.rs` (the module doc); §4.6 "Windows" (the built-mount paragraph).
+- `crates/cli/tests/winfsp.rs`: `a_write_answered_before_its_daemons_kill_is_kept_or_its_flush_refused`.
+- GAPS (the 2026-11-18 entry, and the virtio-fs owed line of Phase 8 step 4);
+  `docs/bugs/2026-11-18-a-winfsp-write-answered-before-its-publication-was-lost-across-a-daemon-kill.md`.
+
+- **What was there.** A WinFsp write was answered before any publication. Its handle's flush or close carried the
+  barrier, "as a FUSE close's `flush` does".
+- **Why it changed.** FUSE can wait for the close because its write log keeps every answered write in anchor-owned
+  memory for a successor (A-63). Windows has no write log, and since A-198 a WinFsp drive outlives a killed daemon. So a
+  write answered before a publication died with its daemon, and the successor's flush then answered success over the
+  loss.
+  - On CI's two Windows runners, each of five rounds wrote a new file's first page, killed the daemon, then flushed. On
+    main every write was lost on both runners: 5 of 5 each, every file read back empty behind a successful flush. With
+    the change every write was kept.
+  - An overwrite inside a published length is not exposed: it lands in place in the file's open extent (§4.8). The test's
+    first draft kept 5 of 5 on main that way.
+- **The rule.** A-358's: every write is published before its reply. The reply claims no durability past the daemon: on
+  a live-shipped volume a flush still waits for the candidates, and a write does not (A-200).
+- **Siblings.**
+  - NFS publishes (A-358).
+  - FUSE mounts log (A-63).
+  - Shards streams on Linux and macOS log before the reply (A-316, A-339). A VM outlives its daemon there, and the
+    acknowledged write is read back after a kill.
+  - Windows streams and the vhost-user device do neither, and are safe only while their guest dies with the daemon. The
+    work that lets one outlive it must bring the write log or this rule. GAPS has the route table.
+- **Cost.** A publication per paging write, owed a measurement through a drive.
 
 ### A-398 — A holder takes an installed configuration a copy a turn: the install walks the held register copies in turns, model-checked first (2026-11-18, g230, scale-out; §4.8 "Promotion and takeover", "Configuration, by consensus"; CLAUDE.md "Bounded work everywhere"; A-324's sibling)
 Applied in the same change to: §4.8 "Promotion and takeover" (its status), GAPS (A-324's entry: the install's item
