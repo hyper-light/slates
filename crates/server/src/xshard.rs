@@ -1115,6 +1115,123 @@ mod tests {
     daemon.stop();
   }
 
+  /// The carrier keeps at most its bound, sends what it keeps in order, and refuses one past the bound to its sender,
+  /// counted (§4.3; CLAUDE.md §2 item 8; goal 238). Do: start a one-shard daemon with one client a shard, so its
+  /// derived bound (`DaemonConfig::kept_bound`) is about one task arena; on its shard, register a stand-in slot whose
+  /// control channel holds half the bound and fill it; hand `bound` numbered replies home to the stand-in, from the
+  /// shard's state as `hand_reply_home`'s callers do, then one more. Expect: each of the `bound` hand-offs was taken,
+  /// and the one past them was refused to its sender and never ran; the shard's report counts one
+  /// `xshard.keep_refused`, and its waits for room `bound` begun, all held at once. Then take every message off the
+  /// channel, running each: the fillers arrive, then the `bound` replies in the order they were handed home, and
+  /// nothing else; every wait has ended. The channel holds half of what is kept, so every drain meets it full
+  /// part-way. Kept past its bound, the last hand-off is taken; a send refused part-way and put back behind the rest
+  /// rather than in front, the numbers arrive out of order.
+  #[test]
+  // The test thread stands for the client's shard draining later: it must wait off-shard while the replies wait.
+  #[allow(clippy::disallowed_methods)]
+  fn the_carrier_keeps_its_bound_in_order_and_refuses_one_past_it() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    static OUT_OF_ORDER: AtomicUsize = AtomicUsize::new(0);
+    static PAST_RAN: AtomicBool = AtomicBool::new(false);
+    NEXT.store(0, Ordering::Release);
+    OUT_OF_ORDER.store(0, Ordering::Release);
+    PAST_RAN.store(false, Ordering::Release);
+    let daemon = crate::daemon::audit_daemon_configured(|config| config.clients_per_shard = 1);
+    let (registration, receiver, bound, room, taken, past) =
+      crate::daemon::observe_first(&daemon, |state| {
+        let bound = state.config.kept_bound().get();
+        let room = (bound / 2).max(1);
+        let (registration, receiver) = registry::register(
+          4,
+          room,
+          registry::RegisterKick::Kick(slates_rt::driver::Kick::none()),
+        )
+        .unwrap();
+        let home = registration.shard();
+        for _ in 0..room {
+          let filler = SpawnRequest::new(Box::pin(async {}), None);
+          registry::send_control(home, Control::Spawn(Box::new(filler))).unwrap();
+        }
+        let taken = (0..bound)
+          .filter(|&number| {
+            hand_reply_home(home, move || {
+              if NEXT.fetch_add(1, Ordering::AcqRel) != number {
+                OUT_OF_ORDER.fetch_add(1, Ordering::AcqRel);
+              }
+            })
+            .is_ok()
+          })
+          .count();
+        let past = hand_reply_home(home, || PAST_RAN.store(true, Ordering::Release));
+        (registration, receiver, bound, room, taken, past)
+      });
+    println!("the carrier's bound: {bound} replies, the stand-in channel {room}");
+    assert_eq!(taken, bound, "every hand-off up to the bound was taken");
+    assert!(
+      past.is_err(),
+      "the hand-off past the bound was refused to its sender: {past:?}"
+    );
+    let (refused, held) = crate::daemon::observe_first(&daemon, |state| {
+      let report = crate::verbs::shard_report(state);
+      let refused: u64 = report
+        .refusals
+        .iter()
+        .filter(|counted| counted.kind == KEEP_REFUSED)
+        .map(|counted| counted.count)
+        .sum();
+      (refused, room_waits())
+    });
+    assert_eq!(refused, 1, "the shard's report counts the one refused keep");
+    let bound_waits = u64::try_from(bound).unwrap();
+    assert_eq!(
+      (held.started, held.peak),
+      (bound_waits, bound_waits),
+      "every kept reply is a wait for room, all held at once"
+    );
+    let mut ran = 0_usize;
+    while NEXT.load(Ordering::Acquire) < bound {
+      match receiver.recv_timeout(MESSAGE_WAIT) {
+        Ok(Control::Spawn(mut request)) => {
+          let mut context = Context::from_waker(Waker::noop());
+          assert!(
+            request.future.as_mut().poll(&mut context).is_ready(),
+            "a message's task runs to its end at once"
+          );
+        }
+        Ok(_) => panic!("only tasks were sent"),
+        Err(error) => panic!(
+          "{} of {bound} replies arrived, then none within {MESSAGE_WAIT:?}: {error:?}",
+          NEXT.load(Ordering::Acquire)
+        ),
+      }
+      ran += 1;
+    }
+    let after = crate::daemon::observe_first(&daemon, |_| room_waits());
+    assert_eq!(
+      ran,
+      room + bound,
+      "the fillers, then the replies, and nothing else"
+    );
+    assert!(receiver.try_recv().is_err(), "no message was sent twice");
+    assert_eq!(
+      OUT_OF_ORDER.load(Ordering::Acquire),
+      0,
+      "the replies arrived in the order they were handed home"
+    );
+    assert!(
+      !PAST_RAN.load(Ordering::Acquire),
+      "the refused reply never ran"
+    );
+    assert_eq!(
+      (after.ended, after.now),
+      (after.started, 0),
+      "every wait for room ended once its reply was sent"
+    );
+    drop(registration);
+    daemon.stop();
+  }
+
   /// §4.3 cancellation safety, the same on every shard (R8). Do: on a shard, from a task there, make a `task_within`
   /// call to that same shard whose future parks past the call's deadline and then reports that it ended. Expect the
   /// call answered `None` at its deadline and the future run to its end anyway, as a call to another shard runs. Until

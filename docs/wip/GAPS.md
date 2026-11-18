@@ -26,7 +26,9 @@
 > `a_forwarded_answer_waits_for_room_on_its_clients_shard_rather_than_being_dropped` (`crates/server/tests/reply_room.rs`)
 > failed with `send_back`'s wait bounded to a period again (perf, 2026-11-12). What bounds it (item 8): every kept message answers a request in flight or is awaited by a task, so a shard
 > keeps at most `DaemonConfig::kept_bound` (`2 × clients_per_shard × slots × shards` plus the task arenas, in the boot
-> log); past it a message is refused to its sender and counted (`xshard.keep_refused`). Counted per shard thread, not in
+> log); past it a message is refused to its sender and counted (`xshard.keep_refused`), which
+> `the_carrier_keeps_its_bound_in_order_and_refuses_one_past_it` holds on a daemon's derived bound, with the order of
+> what was kept. Counted per shard thread, not in
 > the shard's state, which a caller that keeps a reply may be borrowing: `xshard.room_waits_started`, `_ended`, `_peak`.
 > Swept: every `send_back`, `send_reply_home` and `hand_reply_home` caller, `run_on_waiting` (A-192's connection ends,
 > now carried the same way), and every direct `send_control` of a reply in `crates/server/src`. Siblings reported, not

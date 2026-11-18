@@ -1516,9 +1516,10 @@ cluster.
 > Tests: `a_forwarded_answer_waits_for_room_on_its_clients_shard_rather_than_being_dropped`
 > (`crates/server/tests/reply_room.rs`), and in `crates/server/src/xshard.rs`
 > `a_reply_handed_home_to_a_full_channel_waits_for_room`,
-> `a_reply_handed_home_while_this_shards_arena_is_full_waits_for_room` and
-> `a_task_refused_at_admission_answers_its_client_through_a_full_channel` (the last two fail on the task-per-reply
-> form).
+> `a_reply_handed_home_while_this_shards_arena_is_full_waits_for_room`,
+> `a_task_refused_at_admission_answers_its_client_through_a_full_channel` (these two fail on the task-per-reply
+> form) and `the_carrier_keeps_its_bound_in_order_and_refuses_one_past_it` (a daemon's derived bound reached, one
+> message past it refused to its sender and counted, and what was kept sent in the order it was kept).
 
 **Failure matrix.** Driver setup refused (seccomp): Masked (epoll). Task arena full: Refused
 (`TooManyTasks`, admission). A task exceeding the bounded-work rule (a poll past the step quantum on

@@ -42,8 +42,9 @@ const FULL: &str = "lease.wait.full";
 /// The status refusal count of a resolved verb whose completion could not be made durable (the client's retry
 /// runs it again).
 const UNRECORDED: &str = "lease.wait.unrecorded";
-/// The status refusal count of a resolved reply the client's shard refused to admit (its retry meets the
-/// completion record).
+/// The status refusal count of a resolved reply that could not be carried to its client's shard
+/// (`xshard::hand_reply_home`): that shard gone, as its daemon stops, or this shard's carrier at its bound. Its resend
+/// meets the completion record. (Until goal 238, 2026-11-18, a full channel there lost it too.)
 const UNDELIVERED: &str = "lease.wait.undelivered";
 /// The status refusal count of a deadline timer the shard's arena refused (waiters are still resolved at the next
 /// lease fan).

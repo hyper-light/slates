@@ -5821,7 +5821,8 @@ mod limits {
 
 #[cfg(test)]
 pub(crate) use tests::{
-  audit_daemon, audit_on_shard, audit_on_shard_configured, observe_first, test_profile,
+  audit_daemon, audit_daemon_configured, audit_on_shard, audit_on_shard_configured, observe_first,
+  test_profile,
 };
 
 #[cfg(test)]
@@ -6001,6 +6002,14 @@ mod tests {
   /// A running one-shard audit daemon, bootstrapped, for a test whose work outlives one observation (a task it spawns
   /// that must still run after the observation returns); the test stops it.
   pub(crate) fn audit_daemon() -> super::Daemon {
+    audit_daemon_configured(|_| {})
+  }
+
+  /// [`audit_daemon`] with its derived configuration changed by `configure` before it starts, as
+  /// [`audit_on_shard_configured`] changes an audit's: a test that must reach a derived bound shrinks what derives it.
+  pub(crate) fn audit_daemon_configured(
+    configure: impl FnOnce(&mut crate::DaemonConfig),
+  ) -> super::Daemon {
     let profile = test_profile();
     static NEXT_KEPT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let instance = format!(
@@ -6008,7 +6017,8 @@ mod tests {
       std::process::id(),
       NEXT_KEPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
-    let config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    configure(&mut config);
     audit_daemon_with(&profile, config, instance)
   }
 
