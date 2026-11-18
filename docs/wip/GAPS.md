@@ -497,10 +497,12 @@
 >     `NoSpace`;
 >   - `CONTRACT` = 19: a target's refusal is `Refusal::Target { TargetRefusal }`, where `TargetUnavailable` carried
 >     words (a landing target's, a mount point's, a mount's);
-> - owed: typed fields on the wire for a merge's versions (the work's base beside the head), and for the words the crate
->   still reads from the daemon's closed tables (a landing's state, a summary's actions, the audit's kinds, a grant's
->   state); an overlay's drift is built (`StatusReport::base`, `CONTRACT` = 8), and a presentation's conflicts are read
->   typed from its entries;
+> - built 2026-11-18: the words the crate read from the daemon's closed tables travel typed too, appended beside them
+>   (`LandingOutcome::stage`, `LandingSummary::actions`, `GrantSummary::grant_state`, `AuditEntry::audit_kind` and
+>   `stage`), so the contract reads no word of a landing's state, a summary's actions, an audit's kind or a grant's state;
+>   an overlay's drift is built (`StatusReport::base`, `CONTRACT` = 8), and a presentation's conflicts are read typed
+>   from its entries;
+> - owed: a typed field on the wire for a merge's versions (the work's base beside the head);
 > - a paged volume listing (typed audit kinds and grant states built, piece 6, `CONTRACT` = 4);
 > - a run of the Linux and Windows arms (mount, the CLI's Windows unmount): not compiled on the Mac that built piece 4.
 
