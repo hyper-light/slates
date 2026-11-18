@@ -9890,7 +9890,8 @@ stays in the overlay.
 > steps 1–6, 8, 9 and 11 as written, with grants, leases and the audit log as in-process
 > records until Phase 2; step 7's ramp as a recorded policy (entries run one at a time until
 > the runtime's pool; replaced by batches, A-130, 2026-10-10); step 10 for an empty target (a populated target waits on a hard-link
-> verb in the seam); reflinks and `syncfs` waiting on their measured costs; Windows waiting on
+> verb in the seam); reflinks (built for the batch's own duplicates by A-445, on ReFS first; `FICLONE` and
+> `clonefile` owed) and `syncfs` waiting on their measured costs; Windows waiting on
 > Phase 4. Two additions the oracle forced: a `Clear` action (a base directory the overlay
 > removed and recreated opaque: a fresh directory exchanged with the old one, the displaced
 > tree removed), and a resumed landing's recognition of its own finished work (a directory
@@ -9913,7 +9914,11 @@ stays in the overlay.
 > made handle-relative at the landing's hidden name and moved into place without replacing, its buffer set with
 > `SeCreateSymbolicLinkPrivilege` enabled for its thread alone where the process holds it; where NTFS refuses the set (a
 > standard account outside Developer Mode) the entry fails `EPERM`, typed, as every link did before. A link lands as a
-> file link: the seam carries no link's type.
+> file link: the seam carries no link's type. **Since A-445 (the same day)** step 6's reflink is built: a file whose
+> bytes its batch already staged (the same BLAKE3 and length) is cloned from that temporary where the target's volume
+> shares clusters (`LandFs::clone_temp`; on Windows ReFS and a Dev Drive, `FSCTL_DUPLICATE_EXTENTS_TO_FILE` in
+> whole-cluster regions below 4 GiB from the volume's own cluster), its count in the report (`cloned`); NTFS shares
+> nothing, so nothing changes there.
 
 > **Status (2026-09-29, A-47, AUD-29-03).** One host target has one landing lease, whichever shard owns
 > the landing volume and whichever spelling names the target. Before, each owner shard kept its own lease
@@ -30931,6 +30936,85 @@ Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class B), 
 
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class C), `crates/ipc/src/rendezvous.rs`,
 `crates/ipc/tests/rendezvous.rs`.
+
+### A-446 — A held reply's durability window is the session plane's floor of a gone holder path (2026-11-18, built for goal g255; R3's class B, item B-e; A-292, A-354, A-444; RFC 9002 §7.6.1)
+- **What was there.** A transport's reply held for its volume's durability (NFS `JUKEBOX`, FUSE and virtio-fs `EIO`,
+  WinFsp's) was told "not durable" once a window passed with nothing heard on its durability path, an ask of the
+  owner's unanswered for a window, and the receiver drained (A-292's rule, `slates_bridge_core::durable_bound`), the
+  failover delay bounding the whole wait (A-354, A-375). The window was one liveness window (`DURABLE_WAIT_NS`), under
+  the floor below which the session plane never takes a holder's path for gone (A-444), so a reply could be told "not
+  durable" while its holders' sessions still counted them live.
+- **The rule.** The window is that floor (`live_ship::durable_wait_ns`, read from `fleet::live_budget`, A-444: RFC 9002
+  §7.6.1's persistent-congestion duration from the estimator, each probe timeout the initial one): a holder silent
+  shorter than it may still answer, and one silent past it, with its receiver drained, is given up as before. One number
+  names the window for the held replies and for the transports' give-up records (FUSE, virtio-fs, WinFsp).
+- **Test.** `a_held_reply_is_given_up_silent_only_past_the_holder_paths_gone_floor` (`crate::live_ship`): a reply held
+  with its holders silent and its receiver idling is given up silent past a liveness window and a half and within the
+  floor and the three looks that confirm it.
+  Run on the Mac Studio (kiln, 2026-11-18, load 3-6, debug build, `cargo test --locked -p slates-server --lib --
+  live_ship durable`): 20 of 20. Red-checked once: with the window back at one liveness window, the reply is given up
+  at 1.3 s, short of a window and a half. The live-ship flows are filed for main's run.
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class B), `crates/server/src/live_ship.rs`.
+
+### A-445 — A landing shares a file its batch already staged where the target can: step 6's reflink, ReFS first (2026-11-18, g085; A-185's owed item)
+Applied in the same change to: §4.15 (step 6's status, A-185's status), GAPS (A-185's owed list), `crates/vfs`
+(`src/host/mod.rs`: `LandFs::clone_temp`, `LandCapabilities::reflink`'s word; `src/host/sim.rs`: reflinks a test turns on,
+`clone_temp`, `clones`), `crates/land` (`src/engine.rs`: `begin_clone`, `clone_source`, `no_clone`, the report's
+`cloned`, the capability kept across slices, two unit tests; `src/block_clone.rs`, new: the regions, three unit tests;
+`src/os_windows.rs`: `shares_clusters`, `cluster_bytes`, `set_end`, `duplicate_extents`, `clone_refusal`, the
+capability and the verb, temporaries opened to be read as a clone's source; `src/os.rs`: the verb refused; `Cargo.toml`,
+two `windows-sys` features; `tests/oracle.rs` and `tests/os.rs`, a test each; `tests/os_escape.rs` and
+`tests/os_removal.rs`, the verb passed through), and `unsafe-budget.toml` (`slates-land` 29 → 33).
+- **What was there.** Step 6 named the reflink: written "instead of writev when the target filesystem supports it and
+  an identical file already exists in the target tree (found through the landing's own hash index of the manifest,
+  never by scanning the disk)". The seam carried `LandCapabilities::reflink`, but no writer offered one and no verb or
+  engine rule used it (§4.15's status: "waiting on their measured costs"). A-185's owed list named ReFS's.
+- **The rule.** The index is the batch. Its staged files are complete, written out, and held open until the batch is
+  placed (A-130), and the batch is bounded by its pages, so the index is too. A file whose BLAKE3 and length match a
+  staged file is cloned from that temporary into a new one (`LandFs::clone_temp`), which joins the batch, its barrier
+  and its placement as a copy does. Where the filesystem shares nothing, the capability says so and the engine never
+  asks. Where it refuses one pair (`EOPNOTSUPP`, nothing made), the bytes are written as they always were: one path,
+  its fast step skipped. The report counts the clones (`cloned`), so a landing that never clones where it could shows
+  it. Duplicates across batches are written; holding a placed file open past its batch to share it would bound the
+  index by the landing instead of the batch.
+- **ReFS (Microsoft Learn, "Block Cloning" and `FSCTL_DUPLICATE_EXTENTS_TO_FILE`, read 2026-11-18).** A region must
+  begin and end at a cluster boundary and be under 4 GiB. The destination may not extend past its end of file. Both
+  files must be on one volume, with the same integrity streams setting and sparseness, and a cluster takes at most
+  8,175 sharers. So the writer reads the volume's cluster (`FileFsSizeInformation`, 4 KiB or 64 KiB), sets the new
+  file's end to the length rounded up to a cluster, and clones regions of at most the largest multiple of the cluster
+  below 4 GiB (`block_clone`). Then it sets the end to the length. The volume's word on sharing is
+  `FILE_SUPPORTS_BLOCK_REFCOUNTING`, so NTFS reports no reflink. A refusal to share a pair (`ERROR_NOT_SUPPORTED`,
+  `ERROR_INVALID_FUNCTION`, `ERROR_BLOCK_TOO_MANY_REFERENCES`, `ERROR_NOT_SAME_DEVICE`, `ERROR_INVALID_PARAMETER`) is
+  `EOPNOTSUPP` with the new file removed. A temporary is opened to be read too, since a clone's source must be.
+- **Tests.** Unit, on every host: the regions (whole clusters, under 4 GiB, covering the length rounded up, none for an
+  empty file, a cluster or length the layout cannot hold refused by kind) and the engine's lookup and fallback.
+  Filed for main's runs: the oracle's `a_file_whose_bytes_its_batch_already_staged_is_cloned_where_the_target_can` (a
+  simulated filesystem with reflinks clones the duplicate, `cloned` 1, and without them clones nothing, the disk the
+  same) and, on Windows, `a_duplicate_file_is_cloned_on_a_volume_that_shares_clusters` over a ReFS or Dev Drive
+  directory (`SLATES_TEST_REFS_DIR`; skipped loudly without one). Compiled for `x86_64-pc-windows-msvc`.
+- **Owed.** Linux's `FICLONE` and macOS's `clonefile`, behind the same verb (their writers refuse it now and say no
+  reflink); duplicates across batches; and the measured cost and gain the step waits on (the filed run reads both).
+
+### A-449 — `sweep_departed`'s wait stated, and the test support's session wait derived as the product waits for a lent session (2026-11-18, built for goal g255; R3's class B, item B-f, closing class B; A-65, A-222, A-408, A-437; the supervisor's ruling of 2026-11-07)
+- **`remote_attach::sweep_departed`.** The reap loop's look at departed hosts ends their attachments on every shard,
+  each through `xshard::call_in_shard_time` with a liveness window as its budget (A-408): a wall window, then more while
+  the shard runs or waits for a CPU, as every cross-shard wait judged in its target's own time takes (A-65). The
+  departure itself is decided by the fleet's membership and its own estimators (A-363). Its derivation is now stated
+  where it is made; no change.
+- **`daemon::SESSION_WAIT_NS` → `daemon::session_wait_ns()`.** Test support (`Daemon::hold_record_session`,
+  `Daemon::ask_live_reports`) waited one liveness window for a record session out of its link. It now waits as the
+  product does for a lent session (A-437's location round): one record-plane exchange's span
+  (`fleet::record_exchange_budget_ns`, the record plane's round budget over the slowest measured path), the bound every
+  borrower of a record session runs its exchange under, as the supervisor ruled on 2026-11-07. Test support only: no
+  product behaviour changes, so no failing test; the fleet tests that hold a session (`hold_record_session`'s four
+  callers) are filed for main's run.
+- With A-437, A-439, A-442, A-444 and A-446 this closes class B of `LIVENESS_BUDGET_NS`'s R3 debt.
+  Built and run on the Mac Studio (kiln, 2026-11-18, load 3-4, debug build, `cargo test --locked -p slates-server
+  --lib -- remote_attach session departed`): 8 of 8. No red-check: no product behaviour changed.
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class B line), `crates/server/src/{daemon,
+remote_attach}.rs`.
 
 ### A-447 — A Windows claim waits while its daemon lives: the daemon's process mark in the bootstrap header, its exit waited on beside the claim (2026-11-18, goal 85 via g251; R3's class C, C-a's Windows half; §4.7 "Rendezvous"; A-143, A-159, A-176, A-443)
 
