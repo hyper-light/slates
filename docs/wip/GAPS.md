@@ -16234,8 +16234,12 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   but leaves the pages it stored in the object, and a later fill of the range skips what the volume then holds as holes
   or zeros, so those pages could reach a guest's map.
 - **Open, reported by A-166's sibling sweep (each from reading; each to be proven by a test before a change):**
-  - write-log replay (`verbs::replay_one`) routes a logged FUSE write by its inode number's prefix, which for a clone's
-    inherited file is its origin's: a replayed write would land in the origin;
+  - **Fixed 2026-11-18 (g251):** write-log replay (`verbs::replay_one`) routed a logged FUSE write by its inode number's
+    prefix, which for a clone's inherited file is its origin's: a replayed write landed in the origin and the clone lost
+    it (proven by `a_replayed_write_to_a_clones_inherited_file_lands_in_the_clone`, red with the prefix routing put
+    back). Every write-log record now names the volume it was written through and is replayed there, the `FORGET`s too;
+    the log's header carries a layout word, and a log of the layout before that holds records is reported as lost writes,
+    never misread (`docs/bugs/2026-11-18-a-replayed-write-to-a-clones-inherited-file-landed-in-its-origin.md`);
   - the in-process DAX gate's recall (`has_writable_of_prefix`, `writable_of_prefix`, `recalling(no.prefix())`) counts
     a clone's writable windows on inherited files under the origin, so the clone's snapshot could freeze under one
     (harness-only exposure: `writable_dax`, DAX unadvertised);
