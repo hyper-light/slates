@@ -6,7 +6,7 @@ use std::fmt;
 use slates_anchor::AnchorError;
 use slates_db::DbError;
 use slates_ipc::IpcError;
-use slates_ipc::protocol::{Refusal, VolumeRefusal};
+use slates_ipc::protocol::{DatabaseRefusal, Refusal, VolumeRefusal};
 use slates_mem::MemError;
 use slates_rt::RtError;
 use slates_vfs::error::VfsError;
@@ -120,6 +120,8 @@ pub fn refusal_of_vfs(e: &VfsError) -> Refusal {
       existing: slates_ipc::protocol::VolumeId::default(),
     },
     VfsError::NoSpace => Refusal::NoSpace,
+    // A snapshot's retention, typed apart from the quota (§4.2 `RetentionBudgetExceeded`; until 2026-11-18 `NoSpace`).
+    VfsError::RetentionExceeded => volume(VolumeRefusal::RetentionExceeded),
     VfsError::RecoveryIncomplete | VfsError::Integrity => Refusal::ContentUnavailable,
     // The wire's taxonomy names one kind for a name the volume will not take, whatever the reason.
     VfsError::InvalidName | VfsError::NameTooLong => Refusal::InvalidName,
@@ -230,10 +232,31 @@ pub fn refusal_of_db(e: &DbError) -> Refusal {
       }
     }
     DbError::Memory(e) => refusal_of_mem(e),
-    other => Refusal::BadRequest {
-      reason: format!("{other}"),
-    },
+    // Every other database refusal, typed by its class (A-299): until 2026-11-18 each reached a client as `BadRequest`
+    // carrying its words. No catch-all: a new database refusal does not compile until it is named.
+    DbError::Corrupt { seq, .. } => database(DatabaseRefusal::Corrupt { seq: *seq }),
+    DbError::NfsInstanceRegressed { current } => {
+      database(DatabaseRefusal::NfsInstanceRegressed { current: *current })
+    }
+    DbError::CheckpointOutOfRange {
+      version,
+      held,
+      head,
+    } => database(DatabaseRefusal::CheckpointOutOfRange {
+      version: *version,
+      held: *held,
+      head: *head,
+    }),
+    DbError::SealKeyMalformed { len } => database(DatabaseRefusal::SealKeyMalformed {
+      len: u64::try_from(*len).unwrap_or(u64::MAX),
+    }),
+    DbError::Wire(_) => database(DatabaseRefusal::Encoding),
   }
+}
+
+/// A database refusal no other variant names, typed (A-299).
+fn database(refusal: DatabaseRefusal) -> Refusal {
+  Refusal::Database { refusal }
 }
 
 #[cfg(test)]
@@ -241,7 +264,9 @@ mod tests {
   use slates_ipc::protocol::{Refusal, VolumeRefusal};
   use slates_mem::MemError;
 
-  use super::refusal_of_mem;
+  use super::{refusal_of_db, refusal_of_mem};
+  use slates_db::DbError;
+  use slates_ipc::protocol::DatabaseRefusal;
 
   /// A-299's sibling sweep (2026-11-18): do map a memory refusal of each shape admission meets (the budget's, the
   /// lock's, a full slab or registry, an exhausted arena, an OS refusal). Expect each typed: the budget's with what is
@@ -280,6 +305,53 @@ mod tests {
           refusal: VolumeRefusal::Memory
         },
         "{memory:?}"
+      );
+    }
+  }
+
+  /// A-299's sibling sweep (2026-11-18): do map each database refusal `refusal_of_db` answered in words before (a
+  /// corrupt record, a regressed NFSv4 instance, a checkpoint out of range, a malformed sealing key, a refused
+  /// encoding). Expect each typed as `Refusal::Database` with its fields, none `BadRequest`.
+  #[test]
+  fn every_database_refusal_is_typed() {
+    let cases = [
+      (
+        DbError::Corrupt {
+          seq: 3,
+          reason: "checksum",
+        },
+        DatabaseRefusal::Corrupt { seq: 3 },
+      ),
+      (
+        DbError::NfsInstanceRegressed { current: 4 },
+        DatabaseRefusal::NfsInstanceRegressed { current: 4 },
+      ),
+      (
+        DbError::CheckpointOutOfRange {
+          version: 5,
+          held: 6,
+          head: 7,
+        },
+        DatabaseRefusal::CheckpointOutOfRange {
+          version: 5,
+          held: 6,
+          head: 7,
+        },
+      ),
+      (
+        DbError::SealKeyMalformed { len: 8 },
+        DatabaseRefusal::SealKeyMalformed { len: 8 },
+      ),
+      (
+        DbError::Wire(slates_wire::error::WireError::Truncated { needed: 9 }),
+        DatabaseRefusal::Encoding,
+      ),
+    ];
+    for (error, typed) in cases {
+      assert_eq!(
+        refusal_of_db(&error),
+        Refusal::Database { refusal: typed },
+        "{error:?}"
       );
     }
   }

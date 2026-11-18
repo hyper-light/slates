@@ -781,7 +781,7 @@ fn retained_versions_counts_the_snapshot_pinned_inode_versions() {
 }
 
 /// AC (§4.2 retention charge): a diverging write that would pin an inode version past the retention
-/// allowance is refused with `NoSpace` before the copy-up — so one volume's snapshots cannot consume
+/// allowance is refused `RetentionExceeded` (once `NoSpace`) before the copy-up — so one volume's snapshots cannot consume
 /// the shared version slab past their bound — and the refused write changes nothing. Below the
 /// allowance a diverging write succeeds; destroying the snapshot releases the pinned versions. The
 /// allowance is unbounded by default, so only a volume an owner has bounded is affected.
@@ -803,7 +803,10 @@ fn the_retention_allowance_refuses_a_diverging_write_past_the_bound() {
 
   // Diverging `b` would pin a second — refused, and nothing changes.
   assert!(
-    matches!(vol.write(&mut src, b, 0, b"b2"), Err(VfsError::NoSpace)),
+    matches!(
+      vol.write(&mut src, b, 0, b"b2"),
+      Err(VfsError::RetentionExceeded)
+    ),
     "a diverging write past the retention allowance is refused"
   );
   assert_eq!(

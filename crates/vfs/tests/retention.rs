@@ -139,8 +139,9 @@ fn destroying_a_volume_returns_its_retention_charge() {
 }
 
 /// T-A9: a retention is refused when it would dip into promised space — the reserved logical
-/// allowances and the copy-up headroom (§4.2). Non-vacuous: the refused write leaves the charge at
-/// exactly the retentions that the unpromised capacity could back.
+/// allowances and the copy-up headroom (§4.2) — as `RetentionExceeded`, never as the quota's `NoSpace`
+/// (2026-11-18: a consumer read the quota's refusal as its own bound, A-342). Non-vacuous: the refused
+/// write leaves the charge at exactly the retentions that the unpromised capacity could back.
 #[test]
 fn a_retention_refuses_when_it_would_use_promised_space() {
   let mut store = store(64);
@@ -178,7 +179,7 @@ fn a_retention_refuses_when_it_would_use_promised_space() {
   assert!(
     matches!(
       vol.write(&mut store, files[2], 0, b"y"),
-      Err(VfsError::NoSpace)
+      Err(VfsError::RetentionExceeded)
     ),
     "a retention cannot use promised space"
   );

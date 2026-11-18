@@ -39,6 +39,11 @@ Conformance 3 VerifiedSourceExport
 Conformance 4 SimulatedGuestDriver
 Conformance 5 LiveGuestWorkloads
 Conformance 6 SimulatedShardsDevice
+DatabaseRefusal 0 Corrupt
+DatabaseRefusal 1 NfsInstanceRegressed
+DatabaseRefusal 2 CheckpointOutOfRange
+DatabaseRefusal 3 SealKeyMalformed
+DatabaseRefusal 4 Encoding
 DeleteWhileOpen 0 NoKernelClient
 DeleteWhileOpen 1 Unlinked
 DeleteWhileOpen 2 SillyRenamed
@@ -186,6 +191,7 @@ Refusal 65 PolicyForbids
 Refusal 66 PolicyChanged
 Refusal 67 SignatureRequired
 Refusal 68 Volume
+Refusal 69 Database
 ReplyBody 0 Created
 ReplyBody 1 Snapshotted
 ReplyBody 2 SnapshotDestroyed
@@ -390,6 +396,7 @@ VolumeRefusal 16 DigestCacheFull
 VolumeRefusal 17 Memory
 VolumeRefusal 18 JournalIncomplete
 VolumeRefusal 19 RecoveryVersion
+VolumeRefusal 20 RetentionExceeded
 WatcherState 0 Live
 WatcherState 1 Overflowed
 WatcherState 2 Unavailable
