@@ -50,6 +50,11 @@ pub struct ClientSlot {
   /// revocation is fanned to every shard's slots when it commits — so the per-verb gate is one read,
   /// never a cross-shard call on a write path (banned item 10).
   pub revoked: bool,
+  /// The write policy of the consumer this channel attested as (A-285): read with the consumer's record at the
+  /// attestation, and replaced on every shard's bound slots when its launcher sets it, as a revocation is marked. The
+  /// channel's merges and landings are held to it before they are routed (`verbs::consumer_gate`). `None` for an
+  /// account's channel, and for a consumer with no policy set.
+  pub consumer_policy: Option<slates_db::catalog::WritePolicy>,
   /// The last successful remote route, released with this client. One slot, no global catalog.
   pub(crate) owner_route: Option<crate::owner_location::CachedRoute>,
   /// The read-ahead window of this client's latest forwarded read (`crate::verbs::ReadAhead`): the pages after the

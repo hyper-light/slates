@@ -646,7 +646,7 @@ impl Error {
   }
 
   /// A channel failure, typed.
-  fn of_ipc(instance: &str, error: IpcError, pause_ns: u64) -> Error {
+  pub(crate) fn of_ipc(instance: &str, error: IpcError, pause_ns: u64) -> Error {
     match error {
       error @ IpcError::DaemonUnavailable { .. } => Error::Unavailable {
         instance: instance.to_owned(),
