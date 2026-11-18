@@ -242,6 +242,16 @@ fn a_captured_clone_lands_its_change_since_the_capture_and_passes_an_outsiders()
     &mut store,
     (&origin, captured, &mut clone),
   );
+  planned_as_the_change_since_the_capture(&presented);
+  let report = result.unwrap();
+  assert_eq!(report.state, LandingState::Done, "{:?}", report.entries);
+  wrote_the_change_and_passed_the_outsider(&host);
+  assert!(!clone.is_overlay(), "the clone took a base from the target");
+}
+
+/// The presentation of [`a_captured_clone_lands_its_change_since_the_capture_and_passes_an_outsiders`]: judged by
+/// content, the change since the capture in landing order (removals deepest first), every entry to apply.
+fn planned_as_the_change_since_the_capture(presented: &crate::engine::Presented) {
   assert_eq!(presented.manifest.basis, Judged::Content);
   let planned: Vec<(&str, &Action)> = presented
     .manifest
@@ -268,8 +278,11 @@ fn a_captured_clone_lands_its_change_since_the_capture_and_passes_an_outsiders()
     "{:?}",
     presented.preliminary
   );
-  let report = result.unwrap();
-  assert_eq!(report.state, LandingState::Done, "{:?}", report.entries);
+}
+
+/// The target [`a_captured_clone_lands_its_change_since_the_capture_and_passes_an_outsiders`] leaves: the rewritten and
+/// the made file written, the removed file and directory gone, the outsider's file and the untouched one as they were.
+fn wrote_the_change_and_passed_the_outsider(host: &SimHost) {
   assert_eq!(
     host.bytes("/target/src/edit.rs").as_deref(),
     Some(&b"the agent's body"[..])
@@ -295,7 +308,6 @@ fn a_captured_clone_lands_its_change_since_the_capture_and_passes_an_outsiders()
     host.bytes("/target/src/keep.rs").as_deref(),
     Some(&b"kept"[..])
   );
-  assert!(!clone.is_overlay(), "the clone took a base from the target");
 }
 
 /// An outsider's change to a file the agent also changed refuses the whole landing, `ModifyModify`, and writes
