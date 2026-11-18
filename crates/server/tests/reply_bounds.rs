@@ -13,8 +13,7 @@
   clippy::unwrap_in_result,
   clippy::disallowed_methods
 )]
-// An overlay over a real host directory, and a landing onto one: macOS and Linux.
-#![cfg(unix)]
+// An overlay over a real host directory, and a landing onto one, on every platform since the Windows writer (A-185).
 
 use std::time::{Duration, Instant};
 

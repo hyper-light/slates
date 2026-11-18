@@ -1749,6 +1749,44 @@ fn fenced(state: &ShardState, volume: [u8; 16]) -> Option<HostEpoch> {
   }
 }
 
+/// Whether this owner lost `volume` to a successor: its log fenced at a later epoch ([`fenced`]), or yielded when its
+/// node was admitted again under its id (`ShardState::yielded`, A-334). Such a log ships nothing and does no period
+/// work (A-349, A-409).
+fn lost(state: &ShardState, volume: [u8; 16]) -> bool {
+  fenced(state, volume).is_some()
+    || state
+      .yielded
+      .contains(&slates_db::catalog::VolumeId { bytes: volume })
+}
+
+/// This node yielded `id` at its re-admission (A-334, `readmission::yield_catalogued`): its log ships nothing more
+/// ([`lost`]), and every verb waiting on its durability is answered `DurabilityPending` now, held as long as it was, as
+/// the failover SLO's bound answers one (A-354): the write it waits for was made on a copy its successor's writes have
+/// passed, so it never becomes durable, and the same request run again goes to the successor. Its transports' parked
+/// replies are woken to meet the yield at their gates. Before, its writers waited out the bound, and its log went on
+/// shipping to holders that refused it as not the volume's acting owner, which never fenced it: an install of the whole
+/// volume to the creator 1,714 times in one run (A-409).
+pub(crate) fn yielded(state: &mut ShardState, id: slates_db::catalog::VolumeId) {
+  let now = slates_rt::futures::now_ns();
+  let destroys = state
+    .live
+    .destroys
+    .remove(&id.bytes)
+    .map(|(_, waiting)| waiting)
+    .unwrap_or_default();
+  for entry in take_awaiting(state, id.bytes).into_iter().chain(destroys) {
+    let held_ns = now.saturating_sub(entry.held_since_ns);
+    state.count(LIVE_YIELD_REFUSED, 1);
+    answer(state, entry, durability_pending(held_ns));
+  }
+  wake_parked(state, id.bytes);
+}
+
+/// Counter: a verb waiting on a live volume's durability, answered `DurabilityPending` when its node yielded the volume
+/// at its re-admission ([`yielded`], A-409).
+/// Format: a counter name in the daemon's status report.
+const LIVE_YIELD_REFUSED: &str = "fleet.live.yield_refused";
+
 /// A later epoch holds `volume` (a holder answered with its fence): this owner was superseded on it. It ships no more of
 /// it and tells every write waiting on it so; a fence learned now is kept before anyone is told, as a holder keeps a
 /// fence it raised, so a restart does not forget it (A-344; a refused publication leaves the mark for the next); and
@@ -3177,8 +3215,9 @@ fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
   // sessions out on that loan at the start of every period, where its own takeover round of another departure met
   // them, never asked the other survivor and gave up two objects within tolerance (the chaos nemesis, seed
   // 6876545201569229162: `fleet.live.install_built` about 2,240 after its fence, `fleet.takeover.pages_unsent` 213 to
-  // 928).
-  if fenced(state, volume).is_some() {
+  // 928). Nor one its node yielded at its re-admission (A-409): its node knows it lost the volume before any holder
+  // tells it, and such an owner, never fenced, sent the creator an install of its whole volume 1,714 times in one run.
+  if lost(state, volume) {
     return Vec::new();
   }
   if !holders_placed(state, volume) {
@@ -4174,6 +4213,12 @@ fn period_volume(s: &mut ShardState, volume: [u8; 16]) {
   if fenced(s, volume).is_some() {
     return;
   }
+  // Nor a log its node yielded at its re-admission (A-409): its writers were refused at the yield ([`yielded`]); one
+  // made after it is judged against its bound all the same, and nothing else is done.
+  if lost(s, volume) {
+    judge_held(s, volume);
+    return;
+  }
   let id = slates_db::catalog::VolumeId { bytes: volume };
   follow_candidates(s, volume);
   // The period is what retries a holder whose last lane went unanswered ([`LiveVolume::unreachable`]).
@@ -4485,14 +4530,37 @@ pub(crate) fn serve_install(
   }
 }
 
-/// Why a holder will not serve a message about `object` made under `epoch`: below the fence its copy has promised it is
-/// `StaleEpoch`, which tells a superseded owner to stop (`Shipper::on_reply` answers `Fenced`) and refuse what waits on
-/// it; otherwise `Unauthorized`. Refused as a stranger, a resumed old owner could not tell its loss from a passing
-/// refusal and held its write unanswered for the fence flow's whole 40 s wait (2026-11-05, `live_fleet`).
+/// Why a holder will not serve a message about `object` made under `epoch`: below the highest fence it holds the
+/// object at, its live copy's or its record copy's ([`known_fence`]), it is `StaleEpoch`, which tells a superseded
+/// owner to stop (`Shipper::on_reply` answers `Fenced`) and refuse what waits on it; otherwise `Unauthorized`. Refused
+/// as a stranger, a resumed old owner could not tell its loss from a passing refusal and held its write unanswered for
+/// the fence flow's whole 40 s wait (2026-11-05, `live_fleet`). The record copy's fence counts since A-409: in one run
+/// a re-admitted old owner's log, never fenced, sent the volume's creator an install 1,714 times, each refused
+/// `not_the_acting_owner`; why no refusal fenced it is not read from that run's counters, and the fence a holder knows
+/// from either copy is the most it can tell (the yield now stops such a log by itself, [`yielded`]).
 fn not_served(state: &ShardState, object: Option<ObjectId>, epoch: Option<HostEpoch>) -> LiveError {
-  let fence = object
-    .and_then(|object| state.live.held.get(&object))
+  refusal_for(object.and_then(|object| known_fence(state, object)), epoch)
+}
+
+/// The highest fence this holder holds `object` at: its live copy's (a successor's phase one raised it) and its record
+/// copy's (the takeover's page, an accepted record or an install raised it), each in the one epoch order the owners
+/// ship under (a successor ships at the epoch its takeover placed the head at, `live_ship::planned`).
+fn known_fence(state: &ShardState, object: ObjectId) -> Option<HostEpoch> {
+  let live = state
+    .live
+    .held
+    .get(&object)
     .map(|held| held.replica.fence());
+  let record = state
+    .holder_records
+    .get(&object)
+    .map(slates_db::register::Acceptor::fence);
+  live.max(record)
+}
+
+/// [`not_served`]'s decision: `StaleEpoch` at `fence` for a message under an `epoch` below it, `Unauthorized` otherwise
+/// (no fence known, no epoch read, or an epoch at or past the fence).
+fn refusal_for(fence: Option<HostEpoch>, epoch: Option<HostEpoch>) -> LiveError {
   match (fence, epoch) {
     (Some(current), Some(epoch)) if epoch < current => LiveError::StaleEpoch { current },
     _ => LiveError::Unauthorized,
@@ -6219,6 +6287,33 @@ fn meta_of(inode: &InodeImage) -> slates_archive::NodeMeta {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// A-409 (§4.8 "Promotion and takeover"; the install storm): do refuse a message under each epoch against each fence
+  /// a holder may know. Expect `StaleEpoch` at the fence for an epoch below it, which fences the sender
+  /// (`Shipper::on_reply`), and `Unauthorized` for an epoch at or past it, or when no fence or no epoch is known.
+  #[test]
+  fn a_refused_sender_below_the_fence_a_holder_knows_is_told_that_fence() {
+    let fence = Some(HostEpoch(3));
+    assert_eq!(
+      refusal_for(fence, Some(HostEpoch(2))),
+      LiveError::StaleEpoch {
+        current: HostEpoch(3)
+      },
+      "an old owner below the fence learns it"
+    );
+    for epoch in [Some(HostEpoch(3)), Some(HostEpoch(4)), None] {
+      assert_eq!(
+        refusal_for(fence, epoch),
+        LiveError::Unauthorized,
+        "epoch {epoch:?} at or past the fence, or unread: not a stale owner"
+      );
+    }
+    assert_eq!(
+      refusal_for(None, Some(HostEpoch(2))),
+      LiveError::Unauthorized,
+      "no fence known: nothing to tell"
+    );
+  }
 
   /// A-200, every transport's durability claim: do ask the position a reply must wait for when the publication behind it
   /// could not become an entry (the credit full with every candidate stopped), so the volume owes a whole record, while
