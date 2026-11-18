@@ -249,7 +249,7 @@ fn stated(summary: &LandingSummary) -> (BTreeMap<String, u64>, u64) {
 fn content(bytes: &[u8]) -> Option<PlannedContent> {
   Some(PlannedContent {
     hash: *blake3::hash(bytes).as_bytes(),
-    size: bytes.len() as u64,
+    size: u64::try_from(bytes.len()).unwrap(),
   })
 }
 
