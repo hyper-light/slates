@@ -1,0 +1,60 @@
+# DIAG (not for main): g230's A-382 (the holder-side yield): the retaken-volume convergence tests green, and red with
+# each half removed, on Linux x86_64 and arm64.
+name: diag-g230-yield
+on:
+  push:
+    branches: ['diag-g230-yield-*']
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  focused:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the fleet test binary
+        run: cargo test --locked -p slates-server --test fleet --no-run
+      - name: Green
+        env:
+          G230_TESTS: every_copy_catches_up_once_the_creator_takes_its_volume_back_from_the_adopter every_copy_catches_up_once_the_third_node_takes_the_volume_from_the_adopter
+        run: |
+          set +e
+          for t in ${G230_TESTS}; do
+            for n in 1 2; do
+              timeout 1500 cargo test --locked -p slates-server --test fleet -- --exact "$t" --nocapture > "out-green-$t-$n.log" 2>&1; code=$?
+              echo "== green $t run $n exit $code"
+              grep -E "^retaken from its adopter|panicked at|test result" -A 1 "out-green-$t-$n.log" | cut -c1-600
+            done
+          done
+      - name: Red A, the own register copies kept at the re-admission
+        run: |
+          set +e
+          perl -0pi -e 's/    yield_catalogued\(state\);\n    let_go_own_registers\(state, local\);/    yield_catalogued(state);\n    let _ = local;/' crates/server/src/readmission.rs
+          grep -c "let _ = local;" crates/server/src/readmission.rs | sed 's/^/mutation applied: /'
+          t=every_copy_catches_up_once_the_creator_takes_its_volume_back_from_the_adopter
+          timeout 1500 cargo test --locked -p slates-server --test fleet -- --exact "$t" --nocapture > "out-redA-$t.log" 2>&1; echo "== red A $t exit $?"
+          grep -E "^retaken from its adopter|panicked at|test result" -A 1 "out-redA-$t.log" | cut -c1-600
+          git show HEAD:crates/server/src/readmission.rs > crates/server/src/readmission.rs
+      - name: Red B, a lost volume's records shipped
+        run: |
+          set +e
+          perl -0pi -e 's/    if crate::verbs::lost_to_a_successor\(state, slot.id\) \{\n      continue;\n    \}\n//' crates/server/src/fleet.rs
+          grep -c "lost_to_a_successor(state, slot.id)" crates/server/src/fleet.rs | sed 's/^/remaining (0 = mutation applied): /'
+          t=every_copy_catches_up_once_the_third_node_takes_the_volume_from_the_adopter
+          for n in 1 2 3; do
+            timeout 1500 cargo test --locked -p slates-server --test fleet -- --exact "$t" --nocapture > "out-redB-$t-$n.log" 2>&1; echo "== red B $t run $n exit $?"
+            grep -E "^retaken from its adopter|panicked at|test result" -A 1 "out-redB-$t-$n.log" | cut -c1-600
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: yield-logs-${{ matrix.os }}
+          path: out-*.log
