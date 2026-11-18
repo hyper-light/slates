@@ -108,12 +108,7 @@ impl Query {
     cached
       .filter(|route| self.reuses(state, *route).is_none())
       .map(|route| route.owner)
-      .or_else(|| {
-        state
-          .fleet
-          .object_owner(object)
-          .filter(|owner| *owner != local && eligible(state, *owner, RegionId(self.region)))
-      })
+      // Red check (guard 2b removed): the routing is not asked before the creator.
       .or_else(|| {
         eligible(state, object.creator(), RegionId(self.region)).then_some(object.creator())
       })
