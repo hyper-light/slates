@@ -38,3 +38,23 @@ synchronous one would see the same stalls on macOS and Windows (reported, not ch
   `an_async_instance_provisions_snapshots_reports_and_destroys`. It makes 20 synchronous calls that each park, each
   required under the reply deadline, with the client's park count as the non-vacuity counter. It fails with the
   bridge left running.
+
+## At the source, the same day (second change)
+
+`into_instance` stopping the bridge fixed one route; any client that keeps its bridge and parks synchronously had the
+same stall. The Node SDK's `Client` is one: its `completionFd()` starts the bridge, and its synchronous verbs park on
+the same client. The fix is now at the source (`crates/ipc/src/completion.rs`, `crates/ipc/src/endpoint.rs`):
+- A synchronous park raises a mark (`CompletionBridge::sync_parked`, a `SyncPark` guard in `ClientEnd::wait`) before
+  it raises the parked flag.
+- A bridge woken while the mark stands wakes once more: `wake_one` on macOS, `wake_signal` on Windows. The parked call
+  is then the only waiter left.
+- `a_synchronous_park_beside_a_running_bridge_is_woken_by_its_reply` sends 20 calls that each park while the bridge
+  runs. All are answered within half their 500 ms deadline. Without the pass-on, round 0 took 502 ms (Mac Studio).
+- The Node SDK binds `spinFor` and `parkRatio`. Its by-use test, a synchronous call beside the async completion signal,
+  runs in `crates/sdk-node/tests/sdk.test.mjs` and is filed for main's run.
+
+Found on the way: `CompletionBridge::start` dropped a refused thread spawn (`.spawn(..).ok()`, three sites), a
+swallowed error (CLAUDE.md §2 item 9). The bridge then started with no thread, and every async wait ran to its
+deadline. The start is now refused typed (`IpcError::OsRefused`, "spawn the completion bridge's thread"), through a
+`Spawn` seam the test refuses with `EAGAIN` (`a_bridge_whose_thread_the_os_refuses_is_refused_typed`, red with the
+refusal bypassed).
