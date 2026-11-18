@@ -9502,7 +9502,8 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
   let accounting = slot.volume.accounting();
   let journal = journal_report(&slot.volume);
   let takeover_kept = u32::try_from(slot.volume.takeover_kept()).unwrap_or(u32::MAX);
-  let (drifted, watcher) = match slot.host.as_mut() {
+  // An overlay's base, as text for people (`drifted`, `watcher`) and typed for consumers (`base`, A-299).
+  let (drifted, watcher, base) = match slot.host.as_mut() {
     Some(host) => match slot.volume.with_host(host).status(&mut state.store) {
       Ok(s) => (
         s.drift
@@ -9515,13 +9516,15 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
           )
           .collect(),
         format!("{:?}", s.watcher),
+        Some(base_report(&s)),
       ),
       Err(e) => (
         vec![format!("status refused: {e:?}")],
         "unavailable".to_owned(),
+        Some(slates_ipc::protocol::BaseReport::Unreadable),
       ),
     },
-    None => (Vec::new(), "scratch".to_owned()),
+    None => (Vec::new(), "scratch".to_owned(), None),
   };
   let attachments = state.db.partition().attachments_of(record.id).len();
   ReplyBody::Status {
@@ -9548,7 +9551,38 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
       mounts_elided,
       journal,
       takeover_kept,
+      base,
     }),
+  }
+}
+
+/// An overlay's base as a status read it, typed for the wire (§4.15 "Drift"; A-299).
+fn base_report(status: &slates_vfs::base::BaseStatus) -> slates_ipc::protocol::BaseReport {
+  use slates_ipc::protocol::{DriftEntry, DriftKind, WatcherState};
+  slates_ipc::protocol::BaseReport::Read {
+    drifted: status
+      .drift
+      .iter()
+      .map(|(path, kind)| DriftEntry {
+        path: path.clone(),
+        kind: match kind {
+          slates_vfs::base::DriftKind::Modified => DriftKind::Modified,
+          slates_vfs::base::DriftKind::Deleted => DriftKind::Deleted,
+          slates_vfs::base::DriftKind::Replaced => DriftKind::Replaced,
+          slates_vfs::base::DriftKind::TypeChanged => DriftKind::TypeChanged,
+        },
+      })
+      .collect(),
+    unverified: status
+      .unverified
+      .iter()
+      .map(|(path, _)| path.clone())
+      .collect(),
+    watcher: match status.watcher {
+      slates_vfs::host::WatchState::Live => WatcherState::Live,
+      slates_vfs::host::WatchState::Overflowed => WatcherState::Overflowed,
+      slates_vfs::host::WatchState::Unavailable => WatcherState::Unavailable,
+    },
   }
 }
 

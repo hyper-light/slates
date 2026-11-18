@@ -7154,6 +7154,11 @@ it builds against the contract and adds to it rather than around it.
 > secret, a stranger's refused `Unproven`, the daemon killed and restarted by its anchor, and the
 > launcher's next setting verified by the new daemon); an anchor handed garbage or a short record
 > refuses to start.
+> **`CONTRACT` = 8:** an overlay's drift travels typed on the wire (`StatusReport::base`, appended:
+> `BaseReport`, `DriftEntry`, `DriftKind`, `WatcherState`), and the crate reads only that field; its
+> text reader is gone. A green's or a work volume's status had failed as a protocol fault (the merge
+> service names their watcher `merge`), and now reads with no base
+> (`docs/bugs/2026-11-18-a-greens-status-failed-in-the-contract.md`).
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -21529,6 +21534,13 @@ contract", new, with its status), GAPS (the A-299 entry and the Embedding librar
   a short record each refused at the anchor's start). The daemon's verification landed the same hour (A-285's owner,
   0366b68a), and `the_launchers_secret_proves_its_policy_across_a_daemon_restart` proves the whole path by use: the
   daemon killed and restarted by its anchor verifies the launcher's next setting.
+- **Typed drift on the wire, the same day; `CONTRACT` 8.** `StatusReport` gains `base: Option<BaseReport>`, appended
+  (D-15), filled by the status verb from the base plane's own status and `None` from the merge service; the crate reads
+  it and nothing else, and its text reader goes (replaced, not layered). Found by the test first: a green's status
+  failed `Protocol(UnknownName { field: "watcher state" })`, since the merge service names a green's watcher `merge`
+  (`docs/bugs/2026-11-18-a-greens-status-failed-in-the-contract.md`). `DriftReport::watcher` is a `Watcher`. Applied to
+  `crates/ipc/src/protocol.rs`, `crates/server/src/{verbs,merge_service}.rs`, `crates/api/src/{volume,instance,lib}.rs`,
+  `tests/api.rs`.
 - **Checked.** `cargo test -p slates-api` (37 unit, 9 by use, 5 start, 1 doc) and `cargo test -p slates-cli` on
   macOS arm64 (kiln runner, 2026-11-18): the cases in §4.12's status. The Linux and Windows arms of the mount and the
   CLI's Windows unmount are not compiled on this host; the integrator's lanes are their first compiler.
