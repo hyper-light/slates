@@ -29,8 +29,10 @@ const PTO_RTTVAR_MULTIPLIER: u64 = 4;
 /// Format: RFC 9002 §6.2.1 — before any RTT sample, the PTO is twice the initial RTT. A protocol
 /// constant (the "2 ×" of `2 * kInitialRtt`).
 const INITIAL_PTO_MULTIPLIER: u64 = 2;
-/// Derived: the probe timeout before any RTT sample, [`INITIAL_PTO_MULTIPLIER`] × `kInitialRtt` (666 ms).
-pub(crate) const INITIAL_PTO_NS: u64 = INITIAL_PTO_MULTIPLIER * INITIAL_RTT_NS;
+/// Derived: the probe timeout before any RTT sample, [`INITIAL_PTO_MULTIPLIER`] × `kInitialRtt` (666 ms): the ceiling a
+/// handshake's retransmits back off to, so also the slowest a fresh dial resends its flight (the fleet tests' recovery
+/// bounds read it here).
+pub const INITIAL_PTO_NS: u64 = INITIAL_PTO_MULTIPLIER * INITIAL_RTT_NS;
 /// Format: RFC 9002 §6.1.2 `kTimeThreshold` = 9/8, the numerator. A protocol constant.
 const TIME_THRESHOLD_NUMERATOR: u64 = 9;
 /// Format: RFC 9002 §6.1.2 `kTimeThreshold` = 9/8, the denominator. A protocol constant.

@@ -328,13 +328,14 @@ fn briefly_serving_child() {
 }
 
 /// Supervises `child` (a role of this binary) with its start set to `start`, until a crash loop is reported or `exits`
-/// exits have passed: the back-off the crash loop scheduled, if one came, and the exits up to it.
+/// exits have passed: the back-off the crash loop scheduled, if one came, the exits up to it, and whether any of its
+/// daemons had reached its serving mark by then ([`Supervisor::ever_served`]).
 fn exits_until_backed_off(
   name: &str,
   child: &str,
   start: Duration,
   exits: u32,
-) -> (Option<u64>, u32) {
+) -> (Option<u64>, u32, bool) {
   let segment = AnchorSegment::create(&unique_name(name), &identity(), geometry()).unwrap();
   let args = vec![
     "--ignored".to_owned(),
@@ -364,15 +365,17 @@ fn exits_until_backed_off(
         seen += 1;
       }
       Step::CrashLoop { retry_in_ns, .. } => {
+        let served = supervisor.ever_served();
         supervisor.stop().ok();
-        return (Some(retry_in_ns), seen + 1);
+        return (Some(retry_in_ns), seen + 1, served);
       }
       other => panic!("supervision ended: {other:?}"),
     }
   }
+  let served = supervisor.ever_served();
   // The child restarted last is stopped before the segment goes, so it never starts against a segment that is gone.
   supervisor.stop().ok();
-  (None, seen)
+  (None, seen, served)
 }
 
 /// Shape: how long each slow child's start runs: 400 ms, twice the 200 ms the red run on main shortened the restart
@@ -386,23 +389,27 @@ const SLOW_START_NS: u64 = 400_000_000;
 /// anchor counted failed starts in a window of the recovery budget, so a start longer than the window fell in a window of
 /// its own every time and was restarted at once, for good: red on main 29ef4521 with the window shortened to half the
 /// start (restarted at once 4 times of 4, backed off None), and B10's Linux gate restarted a 407-shard start every
-/// second for 27 minutes.
+/// second for 27 minutes. A-366: none of those daemons reached its serving mark, so the supervisor says none ever
+/// served (what lets a starter's anchor stop rather than loop on an instance no client ever held).
 #[test]
 fn a_crash_loop_of_starts_longer_than_the_window_is_backed_off() {
   let start = Duration::from_nanos(SLOW_START_NS);
-  let (backoff, exits) = exits_until_backed_off(
+  let (backoff, exits, served) = exits_until_backed_off(
     "slates-anchor-test-slow-loop",
     "slow_failing_child",
     start,
     4,
   );
   let start_ns = u64::try_from(start.as_nanos()).unwrap();
-  eprintln!("starts of {start:?} failing in a row: backed off {backoff:?} ns after {exits} exits");
+  eprintln!(
+    "starts of {start:?} failing in a row: backed off {backoff:?} ns after {exits} exits, served {served}"
+  );
   assert!(
     backoff.is_some_and(|backoff| backoff >= start_ns) && exits == 2,
     "the second start failed in a row is backed off at least its own length: backed off {backoff:?} ns after {exits} \
      exits"
   );
+  assert!(!served, "no daemon of the loop reached its serving mark");
 }
 
 /// §2.6 step 1 (A-119, A-311): a daemon that serves, but dies before it has served as long as its start took, is a
@@ -414,7 +421,7 @@ fn a_crash_loop_of_starts_longer_than_the_window_is_backed_off() {
 fn a_daemon_that_dies_soon_after_it_serves_is_backed_off() {
   // The start of the slow loop's test: the two run in parallel and share the process's environment, which carries it.
   let start = Duration::from_nanos(SLOW_START_NS);
-  let (backoff, exits) = exits_until_backed_off(
+  let (backoff, exits, served) = exits_until_backed_off(
     "slates-anchor-test-brief-serve",
     "briefly_serving_child",
     start,
@@ -422,13 +429,16 @@ fn a_daemon_that_dies_soon_after_it_serves_is_backed_off() {
   );
   let start_ns = u64::try_from(start.as_nanos()).unwrap();
   eprintln!(
-    "starts of {start:?} that serve a tenth of that: backed off {backoff:?} ns after {exits} exits"
+    "starts of {start:?} that serve a tenth of that: backed off {backoff:?} ns after {exits} exits, served {served}"
   );
   assert!(
     backoff.is_some_and(|backoff| backoff >= start_ns) && exits == 2,
     "a daemon that dies soon after it serves is backed off at least its start's length at the second exit: backed off \
      {backoff:?} ns after {exits} exits"
   );
+  // A-366: these daemons marked serving, so a client may have attached: the supervisor says so, and nothing may give
+  // the instance up (A-119).
+  assert!(served, "a daemon of the loop reached its serving mark");
 }
 
 /// The NFS-listener-inheritance child (§4.6): it verifies it inherited the anchor's held listener

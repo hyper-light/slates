@@ -31,7 +31,9 @@ use crate::procedures::{MAX_TRANSFER, extension, extension_status, io_want, seek
 use crate::xdr::{XdrReader, XdrWriter};
 
 /// Format: `stable_how4` `UNSTABLE4`: a COPY's writes are unstable, made stable by the client's
-/// COMMIT, as a client's own WRITEs would be (RFC 7862 §15.2.3 `wr_committed`).
+/// COMMIT, as a client's own WRITEs would be (RFC 7862 §15.2.3 `wr_committed`). Like those, each
+/// piece is published before it is answered (A-358), so it survives the daemon's death; what the
+/// COMMIT adds is a live-shipped volume's candidates (A-200).
 const UNSTABLE4: u32 = 0;
 /// Format: the bytes one READ_PLUS content entry costs beyond its data: the content type, the offset,
 /// and a length or an opaque's length word (RFC 7862 `read_plus_content`).

@@ -808,6 +808,12 @@ pub struct ShardState {
   /// them is kept until they refute the death (`fleet::direct_contact`'s `Returned`). Only the control shard updates it;
   /// bounded by the fleet's peer capacity.
   pub returned_members: BTreeMap<slates_db::HostId, u64>,
+  /// The record sessions each peer dialed to this node that this node serves now, by the peer's stable anchor
+  /// (`fleet::serve_peer_records`, each counted by its `fleet::DialedIn` while it runs): a peer dials and keeps a session
+  /// only while it keeps direct contact with this node, which the pair's canonical dialer honours
+  /// (`fleet::direct_contact`'s `Dialed`, A-337). Only the control shard updates it; bounded by the roster, an anchor
+  /// with no session left removed.
+  pub dialed_in: BTreeMap<slates_db::HostId, u32>,
   /// Reverse index of the current authenticated identities, bounded by learned_members.
   /// Relayed alive gossip may refute a failure, but cannot revive a superseded RAM identity.
   pub authenticated_members: std::collections::BTreeSet<slates_db::HostId>,
@@ -1047,6 +1053,11 @@ pub struct ShardState {
   pub council_timing: slates_cluster::timing::ElectionTiming,
   /// The root group's election timing, derived as the council's is over the root voters' paths.
   pub root_timing: slates_cluster::timing::ElectionTiming,
+  /// The failover delay as this node estimates it (§4.8 "Derived constants", A-363): the coordinator's measured period,
+  /// the takeovers and volumes it timed, and the detection and confirmation terms the last period derived from the
+  /// detector and the council's timing. Live on the control shard, which runs the coordinator; a laptop's, and every
+  /// other shard's, is the recovery prior alone.
+  pub failover: slates_cluster::failover::Failover,
   /// What this node holds as a **content candidate** for other owners' snapshots (§4.10 "Content
   /// replication"): the distinct chunks by identity and each manifest held whole, verified before
   /// anything is stored — served on the record session's content stream by the fleet loop. It is what
@@ -1559,11 +1570,14 @@ pub struct PendingVolume {
   /// which the volume's loss report names once it is served (`slates_db::catalog::TakeoverPastTolerance::registers`).
   /// `None` within tolerance and for a volume no round adopted.
   pub registers_short: Option<slates_db::catalog::RecoveryShortfall>,
+  /// When it was adopted, on the shard's clock (zero off a shard): its recovery is timed from here to its service, into
+  /// the failover estimate (A-363).
+  pub adopted_ns: u64,
 }
 
 impl PendingVolume {
   /// A volume just adopted with its head `head` by `departed`'s takeover round, the retired owner having placed it on
-  /// `cohort_hosts`: no attempt made yet.
+  /// `cohort_hosts`: no attempt made yet, adopted now.
   pub fn adopted(
     head: crate::head::HeadValue,
     departed: Option<slates_db::register::HostId>,
@@ -1577,6 +1591,7 @@ impl PendingVolume {
       round_seen: None,
       cohort_hosts,
       registers_short: None,
+      adopted_ns: slates_rt::futures::now_ns(),
     }
   }
 

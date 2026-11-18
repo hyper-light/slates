@@ -350,11 +350,12 @@ pub fn confirmations_needed(live_others: usize, cohort: usize, quorum: Quorum) -
 /// successor's promotion of a departed peer's objects at this holder.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AnswersGiven {
-  /// When this node last answered `peer`'s direct probe (this host's monotonic clock): the acknowledgement
-  /// confirms this node alive to `peer`, feeding `peer`'s lease, so until the horizon has passed since it,
-  /// a lease `peer` built partly on this answer may still hold. Bounded by the members; pruned each period.
+  /// When this node last answered `peer`'s direct probe with an answer that can confirm `peer`'s lease (this host's
+  /// monotonic clock): the acknowledgement confirms this node alive to `peer`, feeding `peer`'s lease, so until the
+  /// horizon has passed since it, a lease `peer` built partly on this answer may still hold. Bounded by the members and
+  /// the former members answered within the horizon ([`AnswersGiven::retain_members`]).
   pub alive_answers: BTreeMap<HostId, u64>,
-  /// The newest configuration version each peer announced on its probes.
+  /// The newest configuration version each peer announced on its probes. Bounded as `alive_answers` is.
   pub announced_versions: BTreeMap<HostId, u64>,
 }
 
@@ -365,18 +366,42 @@ impl AnswersGiven {
     *last = (*last).max(now_ns);
   }
 
+  /// This node answered `peer`'s direct probe at `now_ns`, naming `standing`: the version its configuration fixed
+  /// `peer`'s settled neighbourhood at, or `None` when `peer` is no member of it. Only an answer that names a standing
+  /// can confirm `peer`'s lease ([`OwnerLease::answered`] confirms a standing it recognizes and never confirms none: a
+  /// standing of `None` supersedes the lease instead), so only such an answer is recorded as feeding it
+  /// ([`AnswersGiven::answered_alive`]). An answer to a host this node's configuration retired names none, so it holds
+  /// no promotion of the host's objects back (A-351): before, a retired owner deaf to every answer, whose own probes
+  /// still reached the fleet, was answered each period, and every holder deferred its promise for as long as it
+  /// probed, until the takeover gave its objects up (the chaos nemesis's split fleet).
+  pub fn answered(&mut self, peer: HostId, now_ns: u64, standing: Option<u64>) {
+    if standing.is_some() {
+      self.answered_alive(peer, now_ns);
+    }
+  }
+
   /// `peer`'s probe announced `version` as the newest configuration it knows of.
   pub fn announced(&mut self, peer: HostId, version: u64) {
     let known = self.announced_versions.entry(peer).or_insert(version);
     *known = (*known).max(version);
   }
 
-  /// Drops the entries of peers that are no longer members, keeping both maps bounded by the membership.
-  pub fn retain_members(&mut self, members: &[HostId]) {
-    self.alive_answers.retain(|peer, _| members.contains(peer));
+  /// Drops, at `now_ns`, the entries of peers that are no longer members and whose last lease-confirming answer is past
+  /// the horizon, keeping both maps bounded by the members and the former members answered within it. A former
+  /// member's answer is kept until then because a promotion of its objects waits on it ([`promotion_open`]): dropped at
+  /// the retirement, as it was before A-351, the gate opened the period the retirement was installed, while a lease the
+  /// departed built on this node's last answer to it could still hold. Only a member is answered with a standing
+  /// ([`AnswersGiven::answered`]), so no entry of a host that never was one is kept past the period.
+  ///
+  /// [`promotion_open`]: AnswersGiven::promotion_open
+  pub fn retain_members(&mut self, members: &[HostId], now_ns: u64) {
+    self
+      .alive_answers
+      .retain(|peer, last| members.contains(peer) || now_ns.saturating_sub(*last) <= horizon_ns());
+    let answered = &self.alive_answers;
     self
       .announced_versions
-      .retain(|peer, _| members.contains(peer));
+      .retain(|peer, _| members.contains(peer) || answered.contains_key(peer));
   }
 
   /// Whether this holder may answer a promotion of an object whose owner `departed` under configuration
@@ -835,7 +860,56 @@ mod tests {
       Some(&3),
       "announcements only advance"
     );
-    given.retain_members(&[LOCAL]);
+    given.retain_members(&[LOCAL], now + horizon_ns() + 1);
     assert!(given.alive_answers.is_empty() && given.announced_versions.is_empty());
+  }
+
+  /// A-351 (§4.8 "Leases and reads", AUD-08; the chaos nemesis's deafened owner, seed 6876545201569229162). Do: answer a
+  /// retired owner's probe naming no standing (it is no member of this node's configuration), then a member's naming
+  /// one. Expect: the answer naming no standing leaves the promotion of the retired owner's objects open, since it can
+  /// never confirm a lease ([`OwnerLease::answered`] never confirms a `None` standing); the one naming a standing closes
+  /// it for the horizon. Before, every answer closed it, and a retired owner deaf to the fleet, still probing it, kept
+  /// every holder from promising its objects until the takeover gave them up.
+  #[test]
+  fn an_answer_that_names_no_standing_never_holds_a_promotion_back() {
+    let mut given = AnswersGiven::default();
+    let now = 10 * horizon_ns();
+    given.answered(X, now, None);
+    given.announced(X, 2);
+    assert!(
+      given.promotion_open(X, 3, now),
+      "an answer that names no standing confirms no lease: open"
+    );
+    given.answered(Y, now, Some(4));
+    assert!(
+      !given.promotion_open(Y, 3, now),
+      "an answer that names a standing may feed the lease: closed for the horizon"
+    );
+  }
+
+  /// A-351 (AUD-08): a former member's last lease-confirming answer holds a promotion of its objects back until its
+  /// horizon passes, however the period's prune runs. Do: answer `X` with a standing, prune to the members without it
+  /// within the horizon, then past it. Expect: within the horizon the answer is kept and the promotion stays closed; past
+  /// it the answer and the announcement are dropped, and the promotion opens. Before, the prune dropped the answer the
+  /// period `X` left the membership, and a holder promised while a lease built on that answer could still hold.
+  #[test]
+  fn a_former_members_last_answer_holds_its_promotion_until_its_horizon() {
+    let mut given = AnswersGiven::default();
+    let now = 10 * horizon_ns();
+    given.answered(X, now, Some(4));
+    given.announced(X, 2);
+    let within = now + horizon_ns() / 2;
+    given.retain_members(&[LOCAL, Y], within);
+    assert!(
+      given.alive_answers.contains_key(&X) && !given.promotion_open(X, 3, within),
+      "within the horizon the former member's answer is kept and its promotion closed"
+    );
+    let past = now + horizon_ns() + 1;
+    given.retain_members(&[LOCAL, Y], past);
+    assert!(
+      given.alive_answers.is_empty() && given.announced_versions.is_empty(),
+      "past the horizon the former member's entries are dropped"
+    );
+    assert!(given.promotion_open(X, 3, past), "and its promotion opens");
   }
 }

@@ -2585,6 +2585,49 @@ impl Daemon {
     })
   }
 
+  /// Test support (A-367): every position this node holds of `object` as a holder, as its sequence and the epoch it was
+  /// accepted at, in sequence order.
+  pub fn fleet_held_positions(
+    &self,
+    object: slates_db::register::ObjectId,
+  ) -> Result<Vec<(u64, u64)>, ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      s.holder_records
+        .get(&object)
+        .map(|acceptor| {
+          acceptor
+            .positions()
+            .filter(|(held, ..)| *held == object)
+            .map(|(_, sequence, epoch, _)| (sequence, epoch.0))
+            .collect()
+        })
+        .unwrap_or_default()
+    })
+  }
+
+  /// Test support: the record this node holds of `object` at ledger position `sequence`, with the epoch its fence has
+  /// seen; `None` when it holds none there. A test reads what a takeover adopted at a position whatever the successor
+  /// wrote after it.
+  pub fn fleet_held_record_at(
+    &self,
+    object: slates_db::register::ObjectId,
+    sequence: u64,
+  ) -> Result<Option<HeldRecordView>, ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      let acceptor = s.holder_records.get(&object)?;
+      let (promised, accepted) = acceptor.persisted();
+      accepted
+        .into_iter()
+        .find(|(held, at, _, _)| *held == object && *at == sequence)
+        .map(|(_, sequence, epoch, value)| HeldRecordView {
+          sequence,
+          epoch: epoch.0,
+          value,
+          fence: promised.0,
+        })
+    })
+  }
+
   /// The newest record this node holds of `object` as a holder, with the epoch its fence has seen: what a takeover's
   /// phase one would read from it.
   pub fn fleet_held_record(
@@ -2699,41 +2742,58 @@ impl Daemon {
   ) -> Result<Vec<(u64, [u8; 32])>, ObserveError> {
     let object = slates_db::register::ObjectId(green.bytes);
     let volume = slates_db::catalog::VolumeId { bytes: green.bytes };
-    self.observe(self.shard_of_object(object), move |s| {
-      // The versions up to the green's checkpoint (W3) are named by the identities it keeps with them; the chain
-      // holds the versions after it.
-      let partition = s.db.partition();
-      let (held, mut identities) =
-        partition
+    let (adopted_through, mut identities) =
+      self.observe(self.shard_of_object(object), move |s| {
+        // The versions up to the green's checkpoint (W3) are named by the identities it keeps with them; the chain
+        // holds the versions after the green's floor: its checkpoint, else its adoption (A-333), else 0.
+        let partition = s.db.partition();
+        let held = partition.green_floor(volume);
+        let mut identities: Vec<(u64, [u8; 32])> = partition
           .green_checkpoint(volume)
-          .map_or((0, Vec::new()), |(held, bytes)| {
-            let accepted = slates_merge::checkpoint::Checkpoint::decode(bytes)
+          .map(|(_, bytes)| {
+            slates_merge::checkpoint::Checkpoint::decode(bytes)
               .map(|checkpoint| checkpoint.accepted)
-              .unwrap_or_default();
-            (
-              held,
-              accepted
-                .into_iter()
-                .map(|(id, version)| (version, id))
-                .collect(),
-            )
-          });
-      identities.sort_unstable();
-      identities.extend(partition.green_chain(volume).iter().enumerate().filter_map(
-        |(index, bytes)| {
-          slates_merge::chain_entry::decode(bytes).ok().map(|entry| {
-            (
-              u64::try_from(index)
-                .unwrap_or(u64::MAX)
-                .saturating_add(held)
-                .saturating_add(1),
-              entry.increment.id,
-            )
+              .unwrap_or_default()
+              .into_iter()
+              .map(|(id, version)| (version, id))
+              .collect()
           })
-        },
-      ));
-      identities
-    })
+          .unwrap_or_default();
+        identities.sort_unstable();
+        identities.extend(partition.green_chain(volume).iter().enumerate().filter_map(
+          |(index, bytes)| {
+            slates_merge::chain_entry::decode(bytes).ok().map(|entry| {
+              (
+                u64::try_from(index)
+                  .unwrap_or(u64::MAX)
+                  .saturating_add(held)
+                  .saturating_add(1),
+                entry.increment.id,
+              )
+            })
+          },
+        ));
+        // A green its takeover adopted from this node's holder ledger, with no checkpoint past the adoption, names the
+        // versions up to it by the ledger's records, which the control shard holds.
+        let adopted = partition
+          .green_adoption(volume)
+          .filter(|_| partition.green_checkpoint(volume).is_none())
+          .map(|adoption| adoption.version);
+        (adopted, identities)
+      })?;
+    if let Some(through) = adopted_through {
+      let mut ledger = self.observe(self.shards.first().copied(), move |s| {
+        (1..=through)
+          .filter_map(|version| {
+            crate::merge_origin::ledger_value(s, object, version)
+              .map(|value| (version, value.increment))
+          })
+          .collect::<Vec<_>>()
+      })?;
+      ledger.append(&mut identities);
+      identities = ledger;
+    }
+    Ok(identities)
   }
 
   /// The bytes the snapshot of `green`'s partition encodes to now (§4.8): what every snapshot taken when its log
@@ -4380,6 +4440,7 @@ async fn init_shard(
     death_reports: std::collections::BTreeMap::new(),
     death_watch_started_ns: None,
     returned_members: std::collections::BTreeMap::new(),
+    dialed_in: std::collections::BTreeMap::new(),
     authenticated_members: std::collections::BTreeSet::new(),
     council_death_watch: std::collections::BTreeMap::new(),
     discovery: None,
@@ -4438,6 +4499,7 @@ async fn init_shard(
     read_ahead: crate::verbs::ReadAheadLedger::default(),
     council_timing: slates_cluster::timing::ElectionTiming::floor(),
     root_timing: slates_cluster::timing::ElectionTiming::floor(),
+    failover: slates_cluster::failover::Failover::new(),
     council,
     consensus_ready: false,
     consensus_generation: 0,
@@ -5798,6 +5860,9 @@ async fn control_loop(
   }
   // Every shard has recovered and no client is admitted yet, so no clone is between its steps: the names' aliases are
   // reconciled with the clones they name (A-236).
+  // Every green a partition holds by its takeover's adoption is rebuilt from this node's ledger first (A-333), so no
+  // client meets one half built and every work over one is replayed after it.
+  crate::green_adopt::readopt_at_boot(control, &shards).await;
   // Likewise no work is between its steps: a work whose green lives on another partition is replayed through that
   // green's owner, and only then is every floor compared with the work it holds for (A-247).
   recover_works_across_partitions(control, &shards).await;
@@ -6777,6 +6842,98 @@ mod tests {
     );
   }
 
+  /// A-337 (§4.8 direct contact and the plane's keying; the formation flake of
+  /// `a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone`, g251's diag run 44262759484, ubuntu,
+  /// 2026-11-18): the pair's canonical dialer keeps contact with a peer that holds a record session it dialed to it, and
+  /// only the canonical dialer does. Do: make this node a non-voting member of seven at `f = 1`, scatter three, all held
+  /// alive, and take a member its role rule drops (no neighbour, no holder, no voter); learn that member under an anchor
+  /// above this node's and then below, each with no session it dialed here and with one. Expect `Dialed`, kept, only
+  /// with the session and this node the lower anchor (the pair's canonical dialer); `OutsideNeighbourhood`, dropped,
+  /// otherwise, so two nodes never keep each other by their sessions alone. Before, the learner in the flake, the pair's
+  /// lower anchor and told stale voters, dropped a voter that kept it, and the pair's plane was never keyed.
+  #[test]
+  fn the_pairs_canonical_dialer_keeps_a_peer_that_dialed_it_and_only_it() {
+    use slates_cluster::config_group::RegionalCouncil;
+    use slates_cluster::membership::{Liveness, MemberState};
+    use slates_cluster::root_group::RootGroup;
+    use slates_db::register::{HostId, Quorum, RegionId};
+    let (dropped, readings) = audit_on_shard(|state| {
+      let local = state.fleet.host();
+      let others: Vec<HostId> = (1..=6u64).map(|n| HostId(local.0 ^ (n << 16))).collect();
+      let voter = others[0];
+      let mut all = vec![local];
+      all.extend_from_slice(&others);
+      state.council = RegionalCouncil::new(
+        voter,
+        all,
+        vec![voter],
+        Quorum { f: 1 },
+        std::collections::BTreeMap::new(),
+        3,
+        false,
+      );
+      state.root = RootGroup::new(voter, vec![RegionId(0)], vec![voter]);
+      install_council(state);
+      let alive = MemberState {
+        liveness: Liveness::Alive,
+        incarnation: 0,
+      };
+      for peer in &others {
+        slates_cluster::fleet::apply_peer_state(&mut state.fleet, *peer, Some(alive));
+      }
+      let Some(peer) = others
+        .iter()
+        .copied()
+        .find(|peer| crate::fleet::direct_contact_reason(state, *peer) == "OutsideNeighbourhood")
+      else {
+        return (None, Vec::new());
+      };
+      let origin = state.origin_anchor;
+      let mut readings = Vec::new();
+      for anchor in [
+        HostId(origin.0.saturating_add(1)),
+        HostId(origin.0.saturating_sub(1)),
+      ] {
+        state.learned_members.clear();
+        state.learned_members.insert(
+          anchor,
+          crate::state::LearnedMember {
+            boot_nonce: 1,
+            host: peer,
+            previous: None,
+          },
+        );
+        for sessions in [0u32, 1] {
+          state.dialed_in.clear();
+          if sessions > 0 {
+            state.dialed_in.insert(anchor, sessions);
+          }
+          readings.push((
+            anchor > origin,
+            sessions,
+            crate::fleet::direct_contact_reason(state, peer),
+            crate::fleet::keeps_direct_contact_with(state, peer),
+          ));
+        }
+      }
+      (Some(peer), readings)
+    });
+    assert!(
+      dropped.is_some(),
+      "a member of seven at scatter three falls outside this node's role rule"
+    );
+    let expected: Vec<(bool, u32, String, bool)> = vec![
+      (true, 0, "OutsideNeighbourhood".to_owned(), false),
+      (true, 1, "Dialed".to_owned(), true),
+      (false, 0, "OutsideNeighbourhood".to_owned(), false),
+      (false, 1, "OutsideNeighbourhood".to_owned(), false),
+    ];
+    assert_eq!(
+      readings, expected,
+      "(the peer's anchor above this node's, sessions it dialed here, the reason, kept)"
+    );
+  }
+
   /// §4.8 Lookup, AC-8.14: a node whose placement has not yet installed its council's newest configuration
   /// still claims an object it owns — ownership moves only when the owner is retired, and the claim is judged
   /// against the council's own membership, so the lag cannot make a claim false. Do: commit a change on this
@@ -7043,22 +7200,69 @@ mod tests {
     Clear(u8),
     /// Live copy `copy` let go.
     Drop(u8),
-    /// A register record held for object `object`.
+    /// A register put in place for object `object`: a fresh acceptor that keeps no changes, holding one position.
     Hold(u8),
     /// Object `object`'s register dropped.
     Forget(u8),
+    /// The next position of object `object`'s register accepted, its acceptor made, keeping its changes, when none is
+    /// held (A-367: the ledger a holder of a green keeps).
+    Accept(u8),
+    /// Object `object`'s newest position accepted again at a newer epoch, as a takeover re-commits it (A-367).
+    Again(u8),
+    /// Object `object`'s register compacted below its newest position, as a single-value register is (A-367).
+    Compact(u8),
+    /// A fresh acceptor that keeps its changes put in place of object `object`'s, holding one position (A-367): its
+    /// changes do not account for the published positions it replaced.
+    Renew(u8),
     /// A delta published: what `held_changes` carries, folded over the model.
     Delta,
     /// A checkpoint published: everything held.
     Checkpoint,
   }
 
-  /// A-270, the oracle of the incremental held image: do run a generated history of live copies kept, cleared, let go
-  /// and made again, and registers held and dropped, publishing deltas and checkpoints between them. Expect after
-  /// every publication the pieces a restart would fold (each checkpoint's, each delta's put and removed applied in
-  /// order) to equal everything the shard holds (`held_image`). A change the tracked maps missed, a live slot reused
-  /// by a copy made again, or a key both put and removed fails here as a difference, before it is a record a restart
-  /// lost.
+  /// Accepts into `acceptor` a record of `object` from the owner its authority names, under its generation: at
+  /// `again`, its value unchanged at an epoch one past its fence (a takeover's re-commit); else at the position after its
+  /// highest, at its fence's epoch, valued by `at`. Whether it was accepted.
+  fn held_accept(
+    acceptor: &mut slates_db::register::Acceptor,
+    object: slates_db::register::ObjectId,
+    at: usize,
+    again: Option<u64>,
+  ) -> bool {
+    use slates_db::register::{HostEpoch, Record};
+    let (promised, _) = acceptor.persisted();
+    let (sequence, epoch, value) = match again {
+      Some(sequence) => {
+        let Some(value) = acceptor.value_at(object, sequence).map(<[u8]>::to_vec) else {
+          return false;
+        };
+        (sequence, HostEpoch(promised.0.saturating_add(1)), value)
+      }
+      None => {
+        let next = acceptor
+          .highest(object)
+          .map_or(1, |(sequence, _)| sequence.saturating_add(1));
+        (next, promised, format!("value {at}").into_bytes())
+      }
+    };
+    acceptor
+      .accept(&Record {
+        owner: acceptor.owner(),
+        object,
+        sequence,
+        epoch,
+        generation: acceptor.generation(),
+        value,
+      })
+      .is_ok()
+  }
+
+  /// A-270, A-367, the oracle of the incremental held image: do run a generated history of live copies kept, cleared,
+  /// let go and made again, and registers held, dropped, grown a position at a time, accepted again at a newer epoch,
+  /// compacted and replaced, publishing deltas and checkpoints between them. Expect after every publication the pieces a
+  /// restart would fold (each checkpoint's, each delta's put and removed applied in order) to equal everything the shard
+  /// holds (`held_image`). A change the tracked maps or an acceptor's changes missed, a live slot reused by a copy made
+  /// again, or a key both put and removed fails here as a difference, before it is a record a restart lost.
   #[test]
   fn folding_every_held_delta_over_its_checkpoint_gives_what_the_shard_holds() {
     use proptest::strategy::Strategy;
@@ -7067,12 +7271,16 @@ mod tests {
       type Model =
         std::collections::BTreeMap<[u8; slates_vfs::recover::HELD_PIECE_KEY_BYTES], Vec<u8>>;
       let local = state.fleet.host();
-      let step = (0u8..7, 0u8..3).prop_map(|(kind, which)| match kind {
+      let step = (0u8..12, 0u8..3).prop_map(|(kind, which)| match kind {
         0 | 1 => HeldStep::Push(which),
         2 => HeldStep::Clear(which),
         3 => HeldStep::Drop(which),
         4 => HeldStep::Hold(which),
         5 => HeldStep::Forget(which),
+        6 | 7 => HeldStep::Accept(which),
+        8 => HeldStep::Again(which),
+        9 => HeldStep::Compact(which),
+        10 => HeldStep::Renew(which),
         _ if which == 0 => HeldStep::Checkpoint,
         _ => HeldStep::Delta,
       });
@@ -7113,19 +7321,60 @@ mod tests {
               state.live.held.remove(&object(which));
             }
             HeldStep::Hold(which) => {
-              state.holder_records.insert(
-                object(which),
-                Acceptor::new(
-                  local,
-                  Authority {
-                    generation: u64::try_from(at).unwrap(),
-                    owner: HostId(local.0 ^ 1),
-                  },
-                ),
+              let mut fresh = Acceptor::new(
+                local,
+                Authority {
+                  generation: u64::try_from(at).unwrap(),
+                  owner: HostId(local.0 ^ 1),
+                },
               );
+              held_accept(&mut fresh, object(which), at, None);
+              state.holder_records.insert(object(which), fresh);
             }
             HeldStep::Forget(which) => {
               state.holder_records.remove(&object(which));
+            }
+            HeldStep::Accept(which) => {
+              let acceptor = state
+                .holder_records
+                .entry(object(which))
+                .or_insert_with(|| {
+                  Acceptor::new(
+                    local,
+                    Authority {
+                      generation: 0,
+                      owner: HostId(local.0 ^ 1),
+                    },
+                  )
+                  .tracking_changes()
+                });
+              held_accept(acceptor, object(which), at, None);
+            }
+            HeldStep::Again(which) => {
+              if let Some(acceptor) = state.holder_records.get_mut(&object(which))
+                && let Some((sequence, _)) = acceptor.highest(object(which))
+              {
+                held_accept(acceptor, object(which), at, Some(sequence));
+              }
+            }
+            HeldStep::Compact(which) => {
+              if let Some(acceptor) = state.holder_records.get_mut(&object(which))
+                && let Some((sequence, _)) = acceptor.highest(object(which))
+              {
+                acceptor.compact_below(object(which), sequence);
+              }
+            }
+            HeldStep::Renew(which) => {
+              let mut fresh = Acceptor::new(
+                local,
+                Authority {
+                  generation: u64::try_from(at).unwrap(),
+                  owner: HostId(local.0 ^ 1),
+                },
+              )
+              .tracking_changes();
+              held_accept(&mut fresh, object(which), at, None);
+              state.holder_records.insert(object(which), fresh);
             }
             HeldStep::Delta => {
               let changes = crate::content_holder::held_changes(state);
@@ -7278,11 +7527,28 @@ mod tests {
     object: slates_db::register::ObjectId,
     sequence: u64,
   ) -> (slates_db::HostId, slates_db::HostId) {
-    use slates_cluster::config_group::{Reconfiguration, RegionalCouncil};
-    use slates_db::register::{Acceptor, Authority, FIRST_EPOCH, HostId, Quorum, Record};
     let local = state.fleet.host();
-    let departed = HostId(local.0 ^ 1);
-    let third = HostId(local.0 ^ 2);
+    retire_a_named_owner_of_a_held_record(
+      state,
+      object,
+      sequence,
+      (
+        slates_db::HostId(local.0 ^ 1),
+        slates_db::HostId(local.0 ^ 2),
+      ),
+    )
+  }
+
+  /// [`retire_the_owner_of_a_held_record`] with the other two members named: `departed`, the owner retired, and `third`.
+  fn retire_a_named_owner_of_a_held_record(
+    state: &mut crate::state::ShardState,
+    object: slates_db::register::ObjectId,
+    sequence: u64,
+    (departed, third): (slates_db::HostId, slates_db::HostId),
+  ) -> (slates_db::HostId, slates_db::HostId) {
+    use slates_cluster::config_group::{Reconfiguration, RegionalCouncil};
+    use slates_db::register::{Acceptor, Authority, FIRST_EPOCH, Quorum, Record};
+    let local = state.fleet.host();
     state.council = RegionalCouncil::new(
       local,
       vec![local, departed, third],
@@ -7403,6 +7669,62 @@ mod tests {
     assert!(
       HostPromise::decode(&lapsed).is_ok(),
       "once its answers can no longer feed the owner's lease, the holder promises"
+    );
+  }
+
+  /// A-351 (§4.8 "Leases and reads", AUD-08; the chaos nemesis's deafened owner, seed 6876545201569229162): a holder that
+  /// keeps answering a retired owner's probes still promises the owner's objects once its last answer under the owner's
+  /// membership is past the horizon. Do: learn a peer on contact; make it the owner of a record this node holds, this
+  /// node's last answer to it while it was a member past the horizon; retire it; answer its probe, announcing an older
+  /// configuration, as the probes of an owner deaf to every answer keep coming; then answer the successor's takeover
+  /// page. Expect: the probe answered with no standing, and the page promising the record. Before, every answer to the
+  /// retired owner closed the gate again, so a holder deferred every page for as long as the owner probed, and the
+  /// takeover gave the owner's objects up.
+  #[test]
+  fn a_holder_answering_a_retired_owners_probes_still_promises_its_objects() {
+    use slates_db::register::{HostEpoch, HostPrepare, HostPromise, ObjectId};
+    let (answered, page) = audit_on_shard(|state| {
+      let local = state.fleet.host();
+      let anchor = slates_db::HostId(local.0 ^ 0x40);
+      let owner = crate::deploy::member_id(anchor, 1);
+      crate::fleet::learn_member(state, anchor, 1, owner);
+      let object = ObjectId([31; 16]);
+      let (departed, successor) = retire_a_named_owner_of_a_held_record(
+        state,
+        object,
+        0,
+        (owner, slates_db::HostId(local.0 ^ 2)),
+      );
+      let now = slates_machine::clock::monotonic_ns();
+      state
+        .answers_given
+        .alive_answers
+        .insert(departed, now - crate::lease::horizon_ns() - 1);
+      let older = state.council.configuration().version.saturating_sub(1);
+      let answered = crate::member_task::answer_probe(state, departed, 1, older);
+      let prepare = HostPrepare {
+        departed,
+        owner: successor,
+        epoch: HostEpoch(2),
+        generation: state.fleet.configuration().version,
+        after: None,
+        named: Vec::new(),
+      }
+      .encode();
+      let page = crate::takeover::serve_host_prepare(state, local, successor, &prepare);
+      (answered, page)
+    });
+    assert_eq!(
+      answered.map(|(_, standing)| standing),
+      Some(None),
+      "the retired owner is answered, with no standing"
+    );
+    let promise = HostPromise::decode(&page);
+    assert!(
+      promise
+        .as_ref()
+        .is_ok_and(|promise| promise.entries.len() == 1),
+      "the holder promises the retired owner's record: {promise:?}"
     );
   }
 
