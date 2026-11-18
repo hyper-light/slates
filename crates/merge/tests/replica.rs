@@ -269,6 +269,16 @@ impl History {
   /// Everything in flight delivered, the replica equals the owner whole (module docs). Returns what the history did.
   fn finish(mut self, probes: &[Raw]) -> Ran {
     self.deliver(self.inflight.len());
+    // A lost last message is followed by none the replica could refuse as a gap, so it stays behind, as a lagging
+    // replica does: the owner's next message would be refused and the replica rebuilt. The history ends before one is
+    // sent, so that rebuild is made here.
+    if self
+      .replica
+      .as_ref()
+      .is_some_and(|replica| replica.position() < self.owner.feed_position())
+    {
+      self.rebuild();
+    }
     let names = self.names();
     let Some(mut replica) = self.replica.take() else {
       return self.ran;

@@ -24889,8 +24889,20 @@ Applied in the same change to:
 ### A-273 — A shard that holds a green's works keeps a replica of the green, fed the owner's accepted versions in order; a rebase and a read at a named version are served there, over the owner's content in place (2026-11-17; the text first, the code after W1 lands)
 Applied in the same change to: GAPS (A-273's entry). Nothing else yet: the tests come first, then the code.
 
-Status: step 1 built 2026-11-17 (the owner's frees held for its replicas, below); the replica itself, the feed and
-the sealed blocks owed. The text and its measurements are perf's (2026-11-11, `agents/perf-a273`, never pushed); the
+Status: step 1 built 2026-11-17 (the owner's frees held for its replicas, below). Step 2 built 2026-11-18 (g083): the
+replica and its feed, in `crates/merge/src/replica.rs`. The owner makes a message for each version it commits
+(`Green::feed_version`) and for each fold that moves its floor (`fold_and_feed`, `fold_to_budget_and_feed`), at its feed
+position, which it then moves past. A replica is built from the owner's checkpoint at its head over the green's origin,
+joined at the owner's feed position then (`Green::replica_seed`, `Replica::build`), so a base below that version is
+the owner's to answer. It applies the message at its next position through `Green::apply_recorded` or
+`fold_history_before`, passes over one below it, and refuses one above it (`FeedRefusal::Gap`), or a version that
+would replay as another (`FeedRefusal::Diverged`), before anything changes; its holder then rebuilds it, counted
+(`Replica::rebuild`, `Replica::counts`). Proven by `crates/merge/tests/replica.rs`: over generated histories with a
+message delivered late, lost, or in flight across a rebuild, the replica is the owner's green at its head after every
+step (its identity and every name's bytes), and at the end equals the owner whole (every version both hold, the paths
+changed since each, every rebase over each base, and a base below its floor refused). Its content is still its own;
+the sealed blocks read in place (step 3), its bounds (step 4) and the shards' use of it (step 5) are owed. The text and
+its measurements are perf's (2026-11-11, `agents/perf-a273`, never pushed); the
 content question it left open was decided by the supervisor on 2026-11-17 by A-64 and D-7 (below). W1 (A-247), whose
 works off the owner it builds on, landed on 2026-11-17 (3c0af9399).
 
