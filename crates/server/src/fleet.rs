@@ -5298,10 +5298,7 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
         crate::live_ship::adopt_head(s, id, fetched.head);
         s.placed_heads.insert(object, placed);
         s.placed_heads.insert(object.catalog(), catalog_placed);
-        // Published at once, so the successor ships its log from the takeover on, under its epoch and from the adopted
-        // head (A-338), and a restart finds its image (A-325's rule): until its first write, nothing showed it shipping
-        // the volume but the superseded owner's fenced log.
-        published_before_served(s)?;
+        // Red check (guard 4 removed): the live takeover does not publish at once.
         return Ok(());
       }
       // Open a content archive (a sealed one needs the lineage key); a contentless volume has none to open.
