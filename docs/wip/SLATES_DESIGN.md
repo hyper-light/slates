@@ -4977,7 +4977,11 @@ nothing where the OS refuses the count, A-223), and, for SDK event loops, signal
 the completion fd (eventfd / pipe / socket) so `add_reader`/`uv_poll` fires. Where no descriptor can be
 shared (macOS, Windows), a client-local bridge thread makes its pipe or socket readable after every
 return from its wait while the client is armed and a reply waits in its ring: a level, never an edge
-(A-44). The client folds a
+(A-44). The bridge waits where a parked synchronous call of the same client waits, and the daemon wakes one
+waiter: a synchronous park raises a mark before its flag, and a bridge woken while the mark stands wakes once
+more, so the parked call is never left to its deadline (2026-11-18: before, 16 to 19 of 20 parked calls beside
+a running bridge slept to it). A bridge whose thread the OS refuses is refused typed, never started without
+it. The client folds a
 confirmed stamp inside its wait into its estimate (stamp to return). Shards poll rings while any
 client has activity within the
 measured idle window, then park in the driver; a parked shard is woken by the driver kick the

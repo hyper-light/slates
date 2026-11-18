@@ -916,9 +916,13 @@
 > - the async form (R6), first piece built (`CONTRACT` = 31): `AsyncInstance` over a host's `Reactor`, awaiting
 >   provisioning, a snapshot, a status and a destroy; handing it back stops its completion bridge, which took the
 >   synchronous form's wakes (`docs/bugs/2026-11-18-the-async-signal-took-the-synchronous-forms-wakes.md`); owed: the
->   paged verbs, landings, merges, policies and observation, awaited the same way; and the Node SDK's `Client`, whose
->   synchronous verbs park beside the bridge its `completionFd()` starts (the same stolen wake, on macOS and Windows;
->   reported, not changed);
+>   paged verbs, landings, merges, policies and observation, awaited the same way. The Node SDK's `Client`, whose
+>   synchronous verbs park beside the bridge its `completionFd()` starts, had the same stolen wake on macOS and Windows:
+>   closed the same day at the source, since a bridge now passes on a wake it took while a synchronous park waits
+>   (`a_synchronous_park_beside_a_running_bridge_is_woken_by_its_reply`, red without the pass-on: round 0 took 502 ms of
+>   its 500 ms deadline). The Node by-use test (`sdk.test.mjs`, parked calls beside the signal, with `spinFor` and
+>   `parkRatio` bound) is filed for main's run. A bridge whose thread the OS refuses is now refused typed
+>   (`a_bridge_whose_thread_the_os_refuses_is_refused_typed`);
 > - a run of the Linux and Windows arms (mount, the CLI's Windows unmount): not compiled on the Mac that built piece 4.
 
 > **git, Mercurial and Subversion over the WinFsp drive (2026-11-17, Part 6 "Real workloads", §4.6; A-300; Ada's
