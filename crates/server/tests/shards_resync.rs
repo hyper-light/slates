@@ -2,9 +2,10 @@
 //! The test makes the anchor's hold channel and hands the daemon its end as the anchor does, through
 //! `SLATES_ANCHOR_DEVICES`, which a daemon adopts once per process into a process-wide cell (`crate::anchor_hold`):
 //! hence a binary of its own with one test, so no other test's daemon adopts the channel. The client attaches through
-//! the daemon's real Linux control socket, so both ends reach it the way they reach `slates shards`.
+//! the daemon's real route, so both ends reach it the way they reach `slates shards`: Linux's control socket, and on
+//! macOS the socket route, where the resync end rides beside the stream's (A-339).
 
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 #![allow(
   clippy::unwrap_used,
   clippy::expect_used,
@@ -15,6 +16,7 @@
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, IntoRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use slates_anchor::held::{self, Incoming};
@@ -30,6 +32,10 @@ mod common;
 
 /// Shape: how long the test waits for the daemon, its client, a message to the anchor or a frame's answer.
 const WAIT: Duration = Duration::from_secs(20);
+/// Shape: how long the attaches' holds wait in the anchor's channel while another thread opens and closes sockets:
+/// thousands of runs of XNU's collector of descriptors in flight, which flushed an end whose every copy rode a message
+/// in 17 to 40 of 48 claims taken in well under a millisecond each (A-161's record).
+const HOLDS_IN_FLIGHT: Duration = Duration::from_millis(200);
 /// Format: a FUSE request's in-header (`struct fuse_in_header`) and `FUSE_SETXATTR`'s opcode.
 const IN_HEADER_LEN: usize = 40;
 const SETXATTR: u32 = 21;
@@ -80,7 +86,7 @@ fn next_held(anchor: &OwnedFd) -> Incoming {
 fn next_resync(end: &OwnedFd) -> (ResyncMessage, usize) {
   rustix::net::sockopt::set_socket_timeout(end, rustix::net::sockopt::Timeout::Recv, Some(WAIT))
     .unwrap();
-  let mut bytes = [0u8; 2 * RESYNC_MESSAGE_BYTES];
+  let mut bytes = [0u8; RESYNC_MESSAGE_BYTES];
   let (read, descriptors) = slates_ipc::stream::recv_message(end.as_fd(), &mut bytes).unwrap();
   (
     ResyncMessage::parse(&bytes[..read]).unwrap(),
@@ -120,12 +126,32 @@ fn reply_errno(stream: &mut UnixStream) -> i32 {
   -i32::from_le_bytes(reply[OUT_LEN_BYTES..OUT_LEN_BYTES + 4].try_into().unwrap())
 }
 
+/// Sets its flag when dropped: the churn's stop, on every exit of the attaches, a failed assertion included.
+struct StopOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for StopOnDrop<'_> {
+  fn drop(&mut self) {
+    self.0.store(true, Ordering::Relaxed);
+  }
+}
+
+/// Opens and closes Unix socket pairs until `stop`: each close may run XNU's collector of descriptors in flight.
+fn churn(stop: &AtomicBool) {
+  while !stop.load(Ordering::Relaxed) {
+    drop(UnixStream::pair().unwrap());
+  }
+}
+
 /// One Shards attach as the anchor sees it: the device's resync end of `shards` reads `Attached` naming its attachment
-/// and a token, with no descriptor; the anchor is given the daemon's end by a hold for that attachment, then a session
-/// of the same token and the identity view. Returns the token and the anchor's held end.
+/// and a token, with no descriptor; the anchor is given the daemon's end by a hold for that attachment, live (a flush in
+/// flight zeroes its receive buffer, A-339), then a session of the same token and the identity view. Returns the token
+/// and the anchor's held end.
 fn held_with_its_token(anchor: &OwnedFd, shards: &ShardsStream) -> ([u8; TOKEN_BYTES], OwnedFd) {
   let attachment = shards.attachment.attachment;
-  let resync = shards.resync.as_ref().expect("Linux hands a resync end");
+  let resync = shards
+    .resync
+    .as_ref()
+    .expect("the daemon hands a resync end (Linux, macOS)");
   let (attached, carried) = next_resync(resync);
   assert_eq!(
     (attached.kind, attached.attachment, carried),
@@ -141,6 +167,11 @@ fn held_with_its_token(anchor: &OwnedFd, shards: &ShardsStream) -> ([u8; TOKEN_B
     panic!("the daemon's end was not held first");
   };
   assert_eq!(held, attachment, "the hold names its attachment");
+  assert_ne!(
+    rustix::net::sockopt::socket_recv_buffer_size(&device).unwrap(),
+    0,
+    "the daemon's end arrives live: the daemon kept a copy while it rode its hold, so no collector took it for garbage"
+  );
   let Incoming::Session {
     attachment: told,
     session,
@@ -206,7 +237,8 @@ fn owner_word_updates_the_session(
 /// anchor to be given each daemon end by a hold for its attachment, then a session of that token and the identity
 /// view; the owner word to bring a session naming the swap (the root's owner shown as 1000:1001); the anchor's held end
 /// to be the very channel the device reads; and the detach to release the hold, after which the device reads the
-/// channel's end.
+/// channel's end. The holds wait in the anchor's channel while another thread opens and closes sockets, and each held
+/// end arrives live (A-339: on macOS a daemon that closed its copy at once left the hold carrying the end's only one).
 #[test]
 fn a_streams_resync_end_is_held_by_the_anchor_with_its_token_and_owners_and_released_at_its_end() {
   let (anchor, daemon_end) = held::channel().unwrap();
@@ -239,8 +271,18 @@ fn a_streams_resync_end_is_held_by_the_anchor_with_its_token_and_owners_and_rele
       base: None,
     })
     .unwrap();
-  let first = client.attach_shards(volume, Intent::Write, None).unwrap();
-  let second = client.attach_shards(volume, Intent::Write, None).unwrap();
+  // The holds wait in the anchor's channel while sockets churn (A-339), as a busy machine's would.
+  let stop = AtomicBool::new(false);
+  let (first, second) = std::thread::scope(|scope| {
+    scope.spawn(|| churn(&stop));
+    let _stop = StopOnDrop(&stop);
+    let first = client.attach_shards(volume, Intent::Write, None).unwrap();
+    let second = client.attach_shards(volume, Intent::Write, None).unwrap();
+    // The test thread holds the anchor's receive off while the churn runs; no runtime serves it (D-9 allows a test).
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(HOLDS_IN_FLIGHT);
+    (first, second)
+  });
   let (first_token, held_end) = held_with_its_token(&anchor, &first);
   let (second_token, _) = held_with_its_token(&anchor, &second);
   assert_ne!(
@@ -258,12 +300,13 @@ fn a_streams_resync_end_is_held_by_the_anchor_with_its_token_and_owners_and_rele
   );
 
   let first_resync = first.resync.unwrap();
-  slates_ipc::stream::send(held_end.as_fd(), b"from the anchor's copy").unwrap();
-  let mut through = [0u8; 64];
+  let from_the_anchor = b"from the anchor's copy";
+  slates_ipc::stream::send(held_end.as_fd(), from_the_anchor).unwrap();
+  let mut through = [0u8; 22];
   let (read, _) = slates_ipc::stream::recv_message(first_resync.as_fd(), &mut through).unwrap();
   assert_eq!(
     &through[..read],
-    b"from the anchor's copy",
+    from_the_anchor,
     "the anchor holds the very channel the device reads"
   );
 

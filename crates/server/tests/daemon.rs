@@ -1083,6 +1083,7 @@ fn grant_scenario() {
       target: elsewhere.path.clone(),
       filter: Filter::default(),
       grant: Some(grant),
+      signature: None,
     }),
     ReplyBody::Refused {
       refusal: Refusal::GrantMismatch
@@ -1101,6 +1102,7 @@ fn grant_scenario() {
     target: target.path.clone(),
     filter: Filter::default(),
     grant: Some(grant),
+    signature: None,
   });
   let ReplyBody::Landed { outcome } = landed else {
     panic!("the granted landing lands: {landed:?}")
@@ -1176,6 +1178,7 @@ fn present_landing(
     target: target.to_owned(),
     filter: Filter::default(),
     grant: None,
+    signature: None,
   });
   let ReplyBody::GrantRequired {
     landing, manifest, ..
@@ -1212,6 +1215,7 @@ fn present_named(
     target: target.to_owned(),
     filter: Filter::default(),
     grant: None,
+    signature: None,
   });
   let ReplyBody::GrantRequired {
     landing, manifest, ..
@@ -1256,6 +1260,7 @@ fn a_granted_landing_consumes_its_presentation() {
       target: target.path.clone(),
       filter: Filter::default(),
       grant: Some(grant),
+      signature: None,
     });
     assert!(matches!(landed, ReplyBody::Landed { .. }), "{landed:?}");
     assert_eq!(
@@ -1326,6 +1331,7 @@ fn a_landing_over_an_outsiders_change_refuses_naming_only_the_conflict() {
     target: target.path.clone(),
     filter: Filter::default(),
     grant: None,
+    signature: None,
   });
   let ReplyBody::GrantRequired {
     landing,
@@ -1350,6 +1356,7 @@ fn a_landing_over_an_outsiders_change_refuses_naming_only_the_conflict() {
     target: target.path.clone(),
     filter: Filter::default(),
     grant: Some(grant),
+    signature: None,
   });
   #[allow(clippy::disallowed_methods)] // reading the target back, read-only
   let on_disk = std::fs::read(format!("{}/b.txt", target.path)).unwrap();
@@ -1438,6 +1445,7 @@ fn landing_refusal_scenario() {
       target: "/nonexistent/slates/land/target".to_owned(),
       filter: slates_ipc::protocol::Filter::default(),
       grant: None,
+      signature: None,
     }),
     ReplyBody::Refused {
       refusal: Refusal::Target {
@@ -3947,6 +3955,7 @@ fn role_store_verbs_part(
     target: "/nonexistent".to_owned(),
     filter: Filter::default(),
     grant: None,
+    signature: None,
   };
   let Refusal::Unsupported { feature } = refusal_of(client, &land) else {
     panic!("land of a green");
