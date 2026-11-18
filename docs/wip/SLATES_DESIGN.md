@@ -8677,7 +8677,8 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > red with the base check and the writes removed), by `crates/cli/tests/fs_server.rs` (two fleet nodes through the real
 > binary: presented and unwritten under an unset policy; since 2026-11-18 landed on the server's disk under the write
 > policy its launcher set, A-285: bypass in the one `slates land`, ask once the launcher approves exactly the presented
-> manifest, on macOS arm64 and Linux x86_64 and arm64), and across two machines on 2026-11-05: a client on Linux pushed
+> manifest, on macOS arm64 and Linux x86_64 and arm64; and with the server node in its own Linux container, landing into
+> the volume attached to it, in CI's Linux CLI step), and across two machines on 2026-11-05: a client on Linux pushed
 > to a green on a macOS server, whose human granted the landing at its anchor, and the merged files landed on the
 > server's disk (GAPS). The stop at the presentation on a Linux server (no grant from its CLI, A-201) is gone for the
 > launcher's path: the policy the launcher set, never a person's proof, decides the write (A-285).

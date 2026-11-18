@@ -2900,6 +2900,18 @@
 >   mutated test fails at its own assertion; the agent's own grant issued, `Ok(1)`). **Still open:** a person at a bare
 >   CLI, with no launcher, has no approval verb of their own; one would read the launcher's secret from a descriptor
 >   the person passes, never an argument or the environment.
+> - **The server in its own container lands into the volume attached to it (2026-11-18, fs-server plan step 2).** The
+>   container leg of 2026-11-05 stopped at the grant; it now lands. `fs_server.rs`'s `in_a_container` (Linux; gated
+>   `SLATES_TEST_CLI=1` and `SLATES_TEST_CONTAINER=1`, set in CI's Linux CLI step): the server node is `slates anchor` in
+>   an `ubuntu:24.04` container on a Docker network of its own, its launcher's secret on standard input through
+>   `StartSpec::anchor_command` with `docker run` as the program, its projects a bind-mounted volume; the client node runs
+>   on the host at the bridge's gateway. The launcher's role runs inside the container (the test binary re-invoked
+>   there, the secret on its standard input), since a launcher reaches its instance only where it runs. Under ask the
+>   land answers the approval request and the host reads the project unchanged until the launcher approves exactly the
+>   presented manifest (4 written, none failed); under bypass the one `slates land` writes 4 entries; the host reads every
+>   merged byte from its side of the attached volume. 3 of 3 runs on GitHub's ubuntu runner (run 44254100848, kernel 7.0,
+>   Docker 29.4); red with the launcher's approval taken away (fails at the asked project's read) and with bypass
+>   replaced by ask (the one land writes nothing).
 > - **Remote attach is owed (§4.10):** another node's `attach` is refused `NotFound`, so a client on another node
 >   pushes through a green, never through a write attachment.
 > - **A self-signed fleet certificate must be a leaf.** OpenSSL's default (`CA:TRUE`) is refused
