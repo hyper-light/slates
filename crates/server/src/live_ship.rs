@@ -32,7 +32,8 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use slates_db::live::{
-  Admitted, Entry, Head, Install, LiveError, Next, Replica, Shipper, decode_reply, encode_reply,
+  Admitted, Bounds, Entry, Head, Install, LiveError, Next, Replica, Shipper, decode_reply,
+  encode_reply,
 };
 use slates_db::register::{HostEpoch, HostId, ObjectId};
 use slates_vfs::delta::VolumeRecord;
@@ -52,13 +53,6 @@ const BODY_SEALED: u8 = 1;
 /// Format: the second byte: the body is in the clear, where this node cannot seal at all (no sealing root), as a
 /// seal's archive is placed then (`fleet::envelope_of`).
 const BODY_CLEAR: u8 = 0;
-/// Derived: the entries a volume's shipper holds that are not yet durable, at most. Shape: one publication in flight
-/// and one behind it, the pipelining of a writer that does not wait (A-200's barrier slice derives it from the measured
-/// apply rate and round trip; until then a writer that outruns two is shipped a whole record next).
-const CREDIT: u64 = 2;
-/// Shape: the entries the owner retains for a holder that lags, beyond which it is installed: as many as the credit
-/// lets be in flight, twice over.
-const RETAIN: usize = 4;
 
 /// Counter: a live volume's publication that could not be shipped as an entry, because its content could not be read,
 /// sealed or appended; its next publication ships the whole volume.
@@ -892,7 +886,9 @@ pub(crate) fn published(
         quorum,
         &holders,
         None,
-        (CREDIT, RETAIN),
+        // Nothing is known of the volume's whole state before its first whole record, which is this log's first entry
+        // (`owes_whole`): admitted with nothing in flight, it sets the bounds (`Bounds::of_whole`, below).
+        Bounds::default(),
       ),
       owes_whole: true,
       owes_image: false,
@@ -947,9 +943,12 @@ pub(crate) fn published(
       if whole {
         let head = entry.head();
         live.shipper.mark_checkpoint(head);
-        // Derived: the retained tail's byte bound is this whole record's size, the install a laggard would be sent
-        // instead: shipping it the entries it lacks never costs more than installing it (`Shipper::retain_up_to`).
-        live.shipper.retain_up_to(payload.len());
+        // Derived (AC-8.9, A-200 amended 2026-11-17): the credit and the retained tail are both this whole record's
+        // size, the install a laggard would be sent instead: the deltas outstanding never cost more than the whole
+        // record a turned-away one leads to, and shipping a laggard the entries it lacks never costs more than
+        // installing it (`Bounds::of_whole`). The fixed credit of two entries had made a third publication inside one
+        // round trip ship the whole volume.
+        live.shipper.set_bounds(Bounds::of_whole(payload.len()));
         live.whole = Some((head, payload));
         live.owes_image = false;
         live.whole_anchors = anchors;
@@ -997,7 +996,7 @@ fn kept_reaches_size(state: &ShardState, id: slates_db::catalog::VolumeId) -> bo
 /// holder behind is installed. Until 2026-11-07 such a holder set `owes_whole`, so the next write's record carried the
 /// whole volume to every holder and every write behind it waited for the up-to-date candidate to take it: 20–45 MB a
 /// time, 100–600 ms each, and writes of 1.2–1.9 s (CI, `diag-live-durability-14`). The retained tail's byte bound
-/// follows the image (`Shipper::retain_up_to`), so a laggard is sent the entries it lacks while they cost less than
+/// follows the image (`Shipper::set_bounds`), so a laggard is sent the entries it lacks while they cost less than
 /// installing the volume as it is now, not as it was at its last whole record. A volume whose image cannot be made
 /// stays owing it, and the next publication or period tries again.
 fn refresh_image(state: &mut ShardState, id: slates_db::catalog::VolumeId) {
@@ -1024,7 +1023,7 @@ fn refresh_image(state: &mut ShardState, id: slates_db::catalog::VolumeId) {
     return;
   };
   live.shipper.mark_checkpoint(head);
-  live.shipper.retain_up_to(image.len());
+  live.shipper.set_bounds(Bounds::of_whole(image.len()));
   live.whole = Some((head, image));
   // The entry's anchors stay what A-240 judges the log by (`whole_anchors`); the image's are judged beside them.
   // An image sealed under no keys (a volume shipped in the clear) has none to judge.
@@ -2098,7 +2097,7 @@ fn owes_whole_within_credit(state: &ShardState, volume: [u8; 16]) -> bool {
     .live
     .shipping
     .get(&volume)
-    .is_some_and(|live| live.owes_whole && live.shipper.in_flight() <= CREDIT)
+    .is_some_and(|live| live.owes_whole && live.shipper.admits_checkpoint())
 }
 
 /// The record period's turn on `shard` (run from the control shard): re-ships what each holder of each live volume

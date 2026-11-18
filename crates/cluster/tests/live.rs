@@ -13,7 +13,7 @@ use slates_cluster::CommitBudget;
 use slates_cluster::live::{
   LIVE_ENTRY_STREAM, LIVE_STATE_STREAM, fold_late, serve_entry, serve_install, ship,
 };
-use slates_db::live::{Next, Replica, Shipper};
+use slates_db::live::{Bounds, Entry, Next, Replica, Shipper};
 use slates_db::register::{HostEpoch, HostId, ObjectId, Quorum};
 use slates_rt::runtime::RuntimeConfig;
 use slates_rt::sim::SimRuntime;
@@ -247,13 +247,27 @@ async fn ship_one(
   (durable, sessions)
 }
 
-fn shipper(credit: u64, retain: usize) -> Shipper {
+/// A shipper from the owner to both holders whose bounds hold `credit` entries in flight and `retain` retained, each
+/// entry of `payload` bytes counted at its wire size as the shipper counts it (`Entry::wire_bytes`).
+fn shipper((credit, retain): (usize, usize), payload: usize) -> Shipper {
+  let entry = Entry {
+    owner: OWNER,
+    object: OBJECT,
+    position: 0,
+    epoch: HostEpoch(1),
+    previous: [0; 32],
+    payload: vec![0; payload],
+  }
+  .wire_bytes();
   Shipper::new(
     (OWNER, OBJECT, HostEpoch(1)),
     Quorum { f: 1 },
     &[OWNER, HOLDERS[0], HOLDERS[1]],
     None,
-    (credit, retain),
+    Bounds {
+      credit: credit * entry,
+      retain: retain * entry,
+    },
   )
 }
 
@@ -267,7 +281,7 @@ fn a_holder_that_joins_late_is_installed_and_then_follows() {
     false,
     Box::new(move |sessions, commands| {
       Box::pin(async move {
-        let mut shipper = shipper(4, 2);
+        let mut shipper = shipper((4, 2), size_of::<u64>());
         let mut late = Vec::new();
         let mut written = Vec::new();
         let (mut sessions, mut aside): (Vec<_>, Vec<_>) = sessions
@@ -396,7 +410,7 @@ fn a_lane_that_ends_with_a_holder_unanswered_gets_every_session_back() {
     true,
     Box::new(move |sessions, commands| {
       Box::pin(async move {
-        let mut shipper = shipper(2, 2);
+        let mut shipper = shipper((2, 2), b"one".len());
         let entry = shipper.append(b"one".to_vec()).unwrap();
         let bytes = entry.encode();
         let (back_tx, back_rx) = channel();

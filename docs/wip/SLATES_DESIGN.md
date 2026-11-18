@@ -6362,6 +6362,16 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > for the middle third of 180 sequential stable writes: one whole record, at least one install, and the candidate caught
 > up).
 >
+> **The credit in bytes (2026-11-17, A-200 amended that day, AC-8.9).** The owner's credit was a fixed two entries, and
+> a publication past it shipped the whole volume next. Now the entries not yet durable and the retained tail are each
+> held to the wire bytes of the whole state an install would send (`slates_db::live::Bounds::of_whole`, set at each whole
+> record and install image), so a burst of barriers on one volume ships its deltas at once and the volume is shipped
+> whole only where that is the cheaper catch-up. Held by `a_burst_of_writes_to_a_live_volume_ships_its_changes_not_the_volume`
+> (`crates/server/tests/fleet.rs`: sixteen clients write half a page each while both holders are held off their shards; every
+> write answered, no publication turned away, no whole record; red on the fixed credit) and the byte bounds' unit tests in
+> `crates/db/tests/live.rs`. Still a lane ships a holder's entries one exchange at a time, so a burst's catch-up costs a
+> round trip an entry.
+>
 > **Chaos from outside the processes (2026-11-06).** `crates/cli/tests/live_chaos.rs` streams writes through the Rust
 > client while it partitions or kills processes. It ends every flow with Agreement, NoLoss, StaleNeverCommits and
 > Convergence, checked from every node's `status`; each live line now carries its head's epoch and chain identity and
@@ -15220,6 +15230,39 @@ the successor's counted set and the record's model cases are raft-chaos's, on to
 mutations broken). Bug record `docs/bugs/2026-11-07-a-live-shipper-made-before-its-candidates-were-known-shipped-to-nobody.md`.
 **Applied in the same change to:** `crates/db/src/live.rs`, `crates/server/src/live_ship.rs`, §4.10's live-shipping
 status, GAPS.
+
+**Amended 2026-11-17 (g230, AC-8.9): the credit is bytes, and its bound is the whole state an install would send.**
+"Backpressure" above asked for a credit derived by Little's law from the measured apply rate and round trip. The daemon
+shipped a fixed credit of two entries instead (`CREDIT = 2`, with `RETAIN = 4`, R3 debt), and what happened past it was
+worse than a wait: a publication the credit turned away left the volume owing a whole record, so the volume's next
+entry carried every byte the volume holds to every holder, and the writer that published it waited for that copy. Every
+barrier publishes (an `fsync`, a `COMMIT`, each recorded verb), so many writers on one volume put several publications
+inside one round trip, and the third of them shipped the volume: with sixteen clients writing half a page each to a
+half-MiB volume while its holders were held a quarter of a liveness window, 13 of the 16 publications were turned away
+and the log took two more whole records, each a copy of the volume to both holders (`fleet.live.whole` 1 → 3; 4 entries
+appended, at most 3 in flight); with the change, none was turned away, no whole record, 16 entries appended and 16 in
+flight at once (this Mac, debug, 2026-11-17; `a_burst_of_writes_to_a_live_volume_ships_its_changes_not_the_volume`,
+`crates/server/tests/fleet.rs`; bug record `docs/bugs/2026-11-17-a-burst-on-a-live-volume-shipped-the-whole-volume.md`).
+- **The unit is bytes.** Little's law says how many entries are in flight (the publication rate times the time to
+  acknowledge), and that number is the workload's, not a constant: a count bounds memory by nothing, since an entry may
+  be a whole record. The shipper now holds the wire bytes of the entries not yet durable within `Bounds::credit` and the
+  retained tail within `Bounds::retain` (`slates_db::live::Bounds`, `Entry::wire_bytes`).
+- **The bound is derived from the data** (`Bounds::of_whole`): both are the size of the whole state an install would
+  send, measured at each whole record and each install image (`live_ship::published`, `refresh_image`). A delta is then
+  turned away only when the deltas outstanding would already cost more than the whole record a turned-away one leads to,
+  and the owner's memory for them stays within one whole state. The retained tail's byte bound was already this
+  quantity (2026-11-06); the credit joins it, and the two counts are gone.
+- **The log never stops at a bound.** One entry is admitted whatever its size while nothing is in flight, a whole state
+  goes one entry past the credit (`Shipper::append_checkpoint`, at most the credit and one whole state in flight), and
+  the newest entry is never dropped from the tail for size.
+- **What was not built.** Rate and round trip are not measured for the credit: past the whole state's bytes no rate
+  would change the decision, since the whole record is then the cheaper catch-up, and under it every publication is
+  admitted at once. Queueing turned-away deltas behind a count was measured and rejected on 2026-11-06 (BENCHMARKS);
+  this admits them, ships them at once, and stops only where shipping the volume costs less.
+**Applied in the same change to:** `crates/db/src/live.rs` (`Bounds`, the byte credit and tail), `crates/db/tests/live.rs`
+(the model and unit tests in bytes; three new tests), `crates/server/src/live_ship.rs` (`CREDIT`, `RETAIN` removed),
+`crates/server/tests/fleet.rs` (the burst flow, red first), `crates/cluster` (its test and bench), §4.10's live-shipping
+status, GAPS, the bug record.
 
 ### A-240 — A live log's phase one counts its quorum among the holders its shipper recorded before it shipped (accepted and built 2026-11-06; the supervisor's option (C))
 

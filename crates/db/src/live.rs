@@ -35,9 +35,16 @@
 //! [`Shipper::activate`] switches once it does. Replacing the holders outright let a takeover count a set that held none
 //! of the durable entries (NoLoss broken in `tests/live.rs`, 2026-11-07).
 //!
-//! **Bounds.** The owner holds at most `credit` entries not yet durable ([`LiveError::NoCredit`] past it: the writer
-//! waits, AC-8.9) and retains at most `retain` entries for laggards; a holder behind the retained tail is installed.
-//! Both are the caller's to derive (A-200: Little's law over the measured apply rate and holder round trip).
+//! **Bounds (AC-8.9, A-200 amended 2026-11-17).** Both bounds are bytes of entries, each entry counted at its wire size
+//! ([`Entry::wire_bytes`]): the entries appended and not yet durable are held within [`Bounds::credit`]
+//! ([`LiveError::NoCredit`] past it: the writer waits for acknowledgements, or for the whole state its turned-away
+//! change is then shipped in), and the entries retained for laggards within [`Bounds::retain`]; a holder behind the
+//! retained tail is installed. One entry is always admitted while nothing is in flight, and the newest entry is never
+//! dropped for size, so a bound never stops the log. The caller derives both from the data ([`Bounds::of_whole`]: the whole state
+//! an install would send), so the deltas outstanding never cost more than the install or whole record that replaces
+//! them. A count was the wrong unit: the entries in flight are the publication rate times the time to acknowledge
+//! (Little's law), and a burst of barriers on one volume puts several publications inside one round trip, so the
+//! daemon's fixed credit of two turned the third into a copy of the whole volume.
 //!
 //! Guard-then-apply, as `crate::partition`: [`Replica::check`] refuses before the caller applies a payload, and
 //! [`Replica::commit`] is unconditional, so a payload the caller could not apply leaves the replica unchanged.
@@ -97,8 +104,8 @@ pub enum LiveError {
   ForeignObject,
   /// Bytes that are not a well-formed message, or a payload over the caller's cap.
   Malformed,
-  /// The owner already holds `credit` entries that are not durable; `durable` is the durable position (`None`:
-  /// nothing yet). The writer waits for acknowledgements (AC-8.9).
+  /// The entries the owner holds that are not durable would pass its credit's bytes with this one ([`Bounds::credit`]);
+  /// `durable` is the durable position (`None`: nothing yet). The writer waits for acknowledgements (AC-8.9).
   NoCredit {
     /// The durable position.
     durable: Option<u64>,
@@ -189,6 +196,12 @@ impl Entry {
       previous,
       payload,
     })
+  }
+
+  /// The bytes the entry takes on the wire, its fixed prefix and its payload: what the owner's bounds count it at
+  /// ([`Bounds`]).
+  pub fn wire_bytes(&self) -> usize {
+    ENTRY_PREFIX_BYTES.saturating_add(self.payload.len())
   }
 
   /// The entry's identity: the BLAKE3 of its canonical bytes, binding its place in the chain and its payload.
@@ -710,6 +723,34 @@ pub fn adopt(
     .max_by_key(|(_, head)| head.rank())
 }
 
+/// What the owner keeps of its log beyond its own state, in bytes of entries at their wire size
+/// ([`Entry::wire_bytes`]; AC-8.9).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Bounds {
+  /// The entries appended and not yet durable, at most, counting the one being appended
+  /// ([`Shipper::append`]); a whole state may go one entry past it ([`Shipper::append_checkpoint`]). One entry is
+  /// admitted whatever its size while nothing is in flight, so zero still lets the log go one entry at a time.
+  pub credit: usize,
+  /// The entries retained for laggards, at most; past it the oldest is dropped and a holder that lacks it is installed.
+  /// The newest entry is never dropped for size alone, and an entry every holder holds is not kept at all.
+  pub retain: usize,
+}
+
+impl Bounds {
+  /// Derived (A-200 amended 2026-11-17): both bounds are `whole_bytes`, the size of the whole state an install would
+  /// send (the caller's measurement: its last whole record or install image). A delta is then turned away only when the
+  /// deltas outstanding would already cost more than shipping the volume whole, which is what a turned-away delta
+  /// leads to; the owner's memory for them stays within one whole state; and a laggard is sent the entries it lacks
+  /// only while they cost no more than installing it. The bounds follow the volume as it grows, at each whole record
+  /// and install image the caller makes.
+  pub fn of_whole(whole_bytes: usize) -> Bounds {
+    Bounds {
+      credit: whole_bytes,
+      retain: whole_bytes,
+    }
+  }
+}
+
 /// What the owner sends a holder next ([`Shipper::on_reply`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Next {
@@ -732,10 +773,14 @@ pub struct Shipper {
   epoch: HostEpoch,
   quorum: Quorum,
   holders: Vec<HostId>,
-  credit: u64,
-  retain: usize,
-  /// The payload bytes kept for laggards beyond `retain` entries ([`Shipper::retain_up_to`]); zero keeps `retain` alone.
-  retain_bytes: usize,
+  /// The bytes it holds in flight and retains for laggards ([`Shipper::set_bounds`]).
+  bounds: Bounds,
+  /// The entries appended here and not yet durable, oldest first: each one's position and wire bytes. Kept apart from
+  /// `retained`, which a checkpoint past the credit can trim below them, so the credit counts exactly what is in flight.
+  /// Bounded by the credit: at most its bytes plus one whole state ([`Shipper::append_checkpoint`]).
+  unsettled: VecDeque<(u64, usize)>,
+  /// The sum of `unsettled`'s bytes.
+  unsettled_bytes: usize,
   /// The head the owner started from (a takeover's adopted head), which it holds and every holder may report.
   start: Option<Head>,
   /// The owner's head: its last entry, or `start` before its first.
@@ -761,14 +806,15 @@ pub struct Shipper {
 impl Shipper {
   /// The owner's side for `object` under `epoch`, shipping to `holders` (the candidates other than the owner: `2f` of
   /// them usually, `2f + 1` when the placement moved off the owner, fewer while a fleet forms), starting from
-  /// `start` (`None` for a new volume; a takeover's adopted head otherwise). `credit` bounds the entries appended here
-  /// that are not yet durable and `retain` the entries kept for laggards; each is at least one.
+  /// `start` (`None` for a new volume; a takeover's adopted head otherwise). `bounds` holds the entries appended here
+  /// that are not yet durable and the entries kept for laggards ([`Bounds`]); [`Shipper::set_bounds`] moves them as the
+  /// caller measures the whole state.
   pub fn new(
     (owner, object, epoch): (HostId, ObjectId, HostEpoch),
     quorum: Quorum,
     holders: &[HostId],
     start: Option<Head>,
-    (credit, retain): (u64, usize),
+    bounds: Bounds,
   ) -> Shipper {
     let mut shipper = Shipper {
       owner,
@@ -780,9 +826,9 @@ impl Shipper {
         .copied()
         .filter(|holder| *holder != owner)
         .collect(),
-      credit: credit.max(1),
-      retain: retain.max(1),
-      retain_bytes: 0,
+      bounds,
+      unsettled: VecDeque::new(),
+      unsettled_bytes: 0,
       start,
       head: start,
       retained: VecDeque::new(),
@@ -792,7 +838,7 @@ impl Shipper {
       owed_install: std::collections::BTreeSet::new(),
       transition: None,
     };
-    shipper.durable = shipper.recompute_durable();
+    shipper.refresh_durable();
     shipper
   }
 
@@ -873,7 +919,7 @@ impl Shipper {
       true
     };
     self.forget_unnamed();
-    self.durable = self.recompute_durable();
+    self.refresh_durable();
     changed
   }
 
@@ -907,7 +953,7 @@ impl Shipper {
     self.holders = named;
     self.transition = None;
     self.forget_unnamed();
-    self.durable = self.recompute_durable();
+    self.refresh_durable();
     true
   }
 
@@ -945,22 +991,40 @@ impl Shipper {
     let Some(head) = self.head else {
       return 0;
     };
-    let floor = match (self.durable, self.start) {
-      (Some(durable), Some(start)) => Some(durable.max(start.position)),
-      (Some(durable), None) => Some(durable),
-      (None, Some(start)) => Some(start.position),
-      (None, None) => None,
-    };
-    match floor {
+    match self.settled_through() {
       Some(floor) => head.position.saturating_sub(floor),
       None => head.position.saturating_add(1),
     }
   }
 
+  /// The last position nothing appended here waits on: the durable position, or the head it started from when that is
+  /// higher (`None`: neither yet).
+  fn settled_through(&self) -> Option<u64> {
+    match (self.durable, self.start) {
+      (Some(durable), Some(start)) => Some(durable.max(start.position)),
+      (Some(durable), None) => Some(durable),
+      (None, Some(start)) => Some(start.position),
+      (None, None) => None,
+    }
+  }
+
+  /// The wire bytes of the entries appended here that are not yet durable: what [`Bounds::credit`] holds.
+  pub fn in_flight_bytes(&self) -> usize {
+    self.unsettled_bytes
+  }
+
+  /// The bounds it holds its log to.
+  pub fn bounds(&self) -> Bounds {
+    self.bounds
+  }
+
   /// Appends the next publication to the chain: the entry to send to every holder. Refused [`LiveError::NoCredit`]
-  /// while `credit` entries are not yet durable; the writer waits for acknowledgements (AC-8.9).
+  /// when entries are in flight and their bytes with this one's would pass [`Bounds::credit`]; the writer waits for
+  /// acknowledgements (AC-8.9). With nothing in flight it is admitted whatever its size, so the log always moves.
   pub fn append(&mut self, payload: Vec<u8>) -> Result<Entry, LiveError> {
-    if self.in_flight() >= self.credit {
+    let bytes = ENTRY_PREFIX_BYTES.saturating_add(payload.len());
+    if !self.unsettled.is_empty() && self.unsettled_bytes.saturating_add(bytes) > self.bounds.credit
+    {
       return Err(LiveError::NoCredit {
         durable: self.durable,
       });
@@ -968,12 +1032,19 @@ impl Shipper {
     self.append_unchecked(payload)
   }
 
+  /// Whether a whole state would be admitted now ([`Shipper::append_checkpoint`]): what is in flight is within the
+  /// credit.
+  pub fn admits_checkpoint(&self) -> bool {
+    self.unsettled_bytes <= self.bounds.credit
+  }
+
   /// Appends a whole state (a checkpoint, which [`Shipper::mark_checkpoint`] then names), allowed one entry past the
   /// credit: a checkpoint is how holders that fell behind the retained tail are caught up, and when every holder has,
   /// nothing becomes durable to free the credit, so a checkpoint that waited for it would never come (both candidates
-  /// stalled through 30 writes waited 19 minutes, 2026-11-05, `live_fleet`). Still bounded: refused past `credit + 1`.
+  /// stalled through 30 writes waited 19 minutes, 2026-11-05, `live_fleet`). Still bounded: refused once what is in
+  /// flight already passes the credit, so at most the credit and one whole state are ever in flight.
   pub fn append_checkpoint(&mut self, payload: Vec<u8>) -> Result<Entry, LiveError> {
-    if self.in_flight() > self.credit {
+    if !self.admits_checkpoint() {
       return Err(LiveError::NoCredit {
         durable: self.durable,
       });
@@ -998,10 +1069,28 @@ impl Shipper {
       payload,
     };
     self.head = Some(entry.head());
+    let bytes = entry.wire_bytes();
+    self.unsettled.push_back((position, bytes));
+    self.unsettled_bytes = self.unsettled_bytes.saturating_add(bytes);
     self.retained.push_back(entry.clone());
     self.trim();
-    self.durable = self.recompute_durable();
+    self.refresh_durable();
     Ok(entry)
+  }
+
+  /// Recomputes the durable position and settles the entries it now covers, giving their bytes back to the credit.
+  fn refresh_durable(&mut self) {
+    self.durable = self.recompute_durable();
+    let Some(floor) = self.settled_through() else {
+      return;
+    };
+    while let Some((position, bytes)) = self.unsettled.front().copied() {
+      if position > floor {
+        break;
+      }
+      self.unsettled.pop_front();
+      self.unsettled_bytes = self.unsettled_bytes.saturating_sub(bytes);
+    }
   }
 
   /// An install of `state`, which must be the owner's state at [`Shipper::head`]; `None` before anything was shipped.
@@ -1052,7 +1141,7 @@ impl Shipper {
     if newer {
       self.held.insert(holder, head);
       self.trim();
-      self.durable = self.recompute_durable();
+      self.refresh_durable();
     }
     if head == own {
       Next::Nothing
@@ -1155,8 +1244,8 @@ impl Shipper {
     }
   }
 
-  /// Drops retained entries every host it ships to holds, then the oldest past `retain` (a laggard behind them is
-  /// installed).
+  /// Drops retained entries every host it ships to holds, then the oldest while the tail's bytes pass
+  /// [`Bounds::retain`] (a laggard behind them is installed), never the newest for size alone.
   fn trim(&mut self) {
     let everyone = self
       .targets()
@@ -1166,25 +1255,26 @@ impl Shipper {
     let mut bytes = self
       .retained
       .iter()
-      .fold(0usize, |sum, entry| sum.saturating_add(entry.payload.len()));
+      .fold(0usize, |sum, entry| sum.saturating_add(entry.wire_bytes()));
     while let Some(oldest) = self.retained.front() {
       let held_by_all = everyone.is_some_and(|position| oldest.position <= position);
-      let over = self.retained.len() > self.retain && bytes > self.retain_bytes;
+      let over = self.retained.len() > 1 && bytes > self.bounds.retain;
       if !(held_by_all || over) {
         break;
       }
-      bytes = bytes.saturating_sub(oldest.payload.len());
+      bytes = bytes.saturating_sub(oldest.wire_bytes());
       self.retained.pop_front();
     }
   }
 
-  /// Keeps entries for laggards up to `bytes` of payload as well as the `retain` entries: whichever keeps more.
-  /// Derived (by the caller): `bytes` is the size of the whole state an install would send, the owner's last whole
-  /// record; then a laggard is sent the entries it lacks for as long as they cost no more than an install. Kept to a count alone, an owner writing faster than an install's
-  /// round trip left a holder it had just installed behind the tail again, and installed it again without end
-  /// (2026-11-06, `crates/cli/tests/live_chaos.rs`: 803 installs, 571 MB, in one run).
-  pub fn retain_up_to(&mut self, bytes: usize) {
-    self.retain_bytes = bytes;
+  /// Moves its bounds (the caller's derivation, [`Bounds::of_whole`] in the daemon: the size of the whole state an
+  /// install would send, measured at each whole record and install image), and trims the retained tail to them. Kept to
+  /// a count of entries, an owner writing faster than an install's round trip left a holder it had just installed
+  /// behind the tail again, and installed it again without end (2026-11-06, `crates/cli/tests/live_chaos.rs`: 803
+  /// installs, 571 MB, in one run); and a credit of two entries turned a third publication inside one round trip into
+  /// a copy of the whole volume (2026-11-17).
+  pub fn set_bounds(&mut self, bounds: Bounds) {
+    self.bounds = bounds;
     self.trim();
   }
 
