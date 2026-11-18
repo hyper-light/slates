@@ -12,6 +12,9 @@
 //!   the published profile, derives its configuration and serves; it leaves when its anchor does.
 //! - **The WinFsp purge client** (Windows) is a child the daemon starts from the same executable and prefix, since no
 //!   daemon thread opens a volume it serves (§4.6).
+//! - **The chosen-path launcher** (`exec`, §4.6 "The launcher", A-370) runs one command with a volume at a path it
+//!   names, in a namespace of its own; it is served here so slates' AppArmor profile can attach to the host's own
+//!   executable ([`crate::exec`]).
 //!
 //! A host serves the roles from its `main`: when its arguments begin with the prefix it chose, it hands the rest to
 //! [`main`], which never returns to the host's own code paths. [`crate::StartSpec`] builds the anchor's command with the
@@ -337,8 +340,9 @@ pub fn serve(prefix: &[String], role: &Role) -> Result<(), Failure> {
 }
 
 /// The role entry of a host's own executable: `args` are what followed the host's `prefix` in its arguments (the
-/// WinFsp purge client's word, on Windows, or a role [`Role::parse`] reads); the role runs, and its exit code comes
-/// back for the host's `main` to return. A usage error prints [`ROLE_USAGE`]; a failure prints one line naming the
+/// WinFsp purge client's word, on Windows; the chosen-path launcher's, beginning `exec`, which
+/// [`crate::exec::command`] builds; or a role [`Role::parse`] reads); the role runs, and its exit code comes back for
+/// the host's `main` to return. The launcher never returns on success: it becomes its command. A usage error prints [`ROLE_USAGE`]; a failure prints one line naming the
 /// role.
 ///
 /// ```no_run
@@ -356,6 +360,10 @@ pub fn main(prefix: &[String], args: &[String]) -> ExitCode {
   if args.first().map(String::as_str) == Some(slates_bridge_winfsp::purge_client::ROLE_ARG) {
     let code = slates_bridge_winfsp::purge_client::serve_from_env();
     return ExitCode::from(u8::try_from(code).unwrap_or(u8::MAX));
+  }
+  // The chosen-path launcher (A-370), served by the host's own executable so slates' AppArmor profile can attach to it.
+  if args.first().map(String::as_str) == Some(slates_client::exec::EXEC_WORD) {
+    return crate::exec::serve(args);
   }
   let role = match Role::parse(args) {
     Ok(role) => role,

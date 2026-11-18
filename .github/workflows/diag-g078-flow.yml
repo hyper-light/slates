@@ -1,0 +1,76 @@
+# Diagnostics only (never main): A-370's launcher under Ubuntu's AppArmor userns restriction (goal g078), on the
+# runners whose default policy restricts unprivileged user namespaces: the focused unit tests, then the CLI flow with
+# no slates profile loaded (the refusals), a red check (the `loaded` regime demanded with none loaded must fail), then
+# this build's profile loaded as root (the launcher makes its namespace only when asked), then unloaded.
+name: diag-g078-flow
+on:
+  push:
+    branches: ['diag-g078-flow*']
+jobs:
+  flow:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm, ubuntu-latest]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Facts
+        run: |
+          uname -a; head -2 /etc/os-release
+          cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns /proc/sys/kernel/apparmor_restrict_unprivileged_unconfined || true
+      - name: Format (the touched crates)
+        run: cargo fmt -p slates-client -p slates-api -p slates-cli --check
+      - name: Unit tests (focused)
+        run: |
+          cargo test -p slates-client --lib exec:: 2>&1 | tail -15
+          cargo test -p slates-api --lib exec:: 2>&1 | tail -15
+          cargo test -p slates-cli --bin slates -- exec apparmor harness 2>&1 | tail -15
+      - name: Build the CLI suite
+        run: cargo test -p slates-cli --test cli --no-run
+      - name: No profile loaded (the refusals)
+        shell: bash
+        run: |
+          set -o pipefail
+          exe=$(readlink -f target/debug/slates); echo "exe=$exe"
+          "$exe" apparmor check || true
+          SLATES_TEST_APPARMOR_PROFILE=absent cargo test -p slates-cli --test cli -- --test-threads=1 --nocapture --exact \
+            the_launcher_uses_slates_apparmor_profile_only_when_asked apparmor_prints_the_profile_and_checks_the_host \
+            the_launcher_binds_a_volume_or_names_the_host_setting_that_forbids_it 2>&1 | tee absent.log
+          grep -q "test result: ok. 3 passed" absent.log
+      - name: Red check (the loaded regime demanded, none loaded, must fail)
+        shell: bash
+        run: |
+          if SLATES_TEST_APPARMOR_PROFILE=loaded cargo test -p slates-cli --test cli -- --test-threads=1 --exact \
+            the_launcher_uses_slates_apparmor_profile_only_when_asked > red.log 2>&1; then
+            cat red.log; echo "RED CHECK FAILED: the loaded regime passed with no profile loaded"; exit 1
+          fi
+          grep -A6 'panicked' red.log | head -12; echo "red as expected"
+      - name: The profile loaded (exec only when asked)
+        shell: bash
+        run: |
+          set -o pipefail
+          exe=$(readlink -f target/debug/slates)
+          "$exe" apparmor profile | tee profile.txt
+          sudo apparmor_parser -r profile.txt
+          "$exe" apparmor check
+          status=0
+          SLATES_TEST_APPARMOR_PROFILE=loaded cargo test -p slates-cli --test cli -- --test-threads=1 --nocapture --exact \
+            the_launcher_uses_slates_apparmor_profile_only_when_asked apparmor_prints_the_profile_and_checks_the_host \
+            the_launcher_binds_a_volume_or_names_the_host_setting_that_forbids_it 2>&1 | tee loaded.log || status=$?
+          d=$(mktemp -d -p "$PWD"); mkdir -p "$d/root/vol" "$d/at"; printf by-hand > "$d/root/vol/marker"
+          echo "--- by hand, with the option:"
+          SLATES_ROOT="$d/root" "$exe" exec --apparmor-profile --volume vol --at "$d/at" -- sh -c \
+            "cat $d/at/marker; echo; id -u; cat /proc/self/attr/apparmor/current; unshare -Ur true && echo nested-ok || echo nested-refused" || status=$?
+          echo "--- by hand, without it:"
+          SLATES_ROOT="$d/root" "$exe" exec --volume vol --at "$d/at" -- true; echo "exit $?"
+          rm -rf "$d"
+          sudo apparmor_parser -R profile.txt
+          sudo dmesg | grep 'apparmor=' | tail -8 || true
+          grep -q "test result: ok. 3 passed" loaded.log
+          exit "$status"

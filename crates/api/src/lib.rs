@@ -17,6 +17,9 @@
 //!   overlay's drift as typed entries.
 //! - *Serving* ([`mount`], [`Instance::serve_shards`], [`Instance::serve_vhost_user`]): a host mount on bare metal, or
 //!   a descriptor a VMM takes.
+//! - *The chosen-path launcher* ([`exec`], A-370): a volume shown at a path one command names, in a namespace of its
+//!   own, served by the host's own executable; where the host's AppArmor restricts unprivileged user namespaces, it uses
+//!   slates' AppArmor profile only when its user opts in ([`AppArmor`]).
 //! - *Write permission* ([`policy`]): a landing and a merge follow the mode the user gave the harness or agent asking to
 //!   write — bypass, ask, forbid ([`WriteMode`]) — set by the launcher per consumer or volume, never raised by an
 //!   agent. A landing answers [`LandOutcome`], a merge [`MergeOutcome`], a rebase [`RebaseOutcome`] ([`outcome`]).
@@ -63,6 +66,7 @@
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 pub mod error;
+pub mod exec;
 pub mod grant;
 pub mod instance;
 pub mod issuer;
@@ -83,6 +87,7 @@ pub use error::{
   KindMismatch, Missing, MountFault, MountMissing, Note, PathFault, ProtocolFault, RetryCause,
   Stale, StartFault, Unreported, Unsupported, Unusable,
 };
+pub use exec::{AppArmor, Confinement, ExecFault, ExecSpec, Readiness};
 pub use grant::{GrantAuthority, GrantClaim, GrantProof};
 pub use instance::{Instance, LandingRequest};
 pub use issuer::{GRANT_TERM_NS, Issuer};
@@ -168,10 +173,14 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// start a host waits on needs no wall-clock deadline of its own: [`StartSpec::until_served`] asks the anchor to stop when its daemons crash-loop before any of them has served, and
 /// [`Instance::wait_for`] with that anchor's child then ends [`StartFault::NeverServed`]; until then an anchor looped on
 /// such an instance for good (A-119), so a host bounded its wait by a second it picked, and a slow start under load
-/// outlasted it (kiln's 30 s at load 28, 2026-11-18; A-366).
+/// outlasted it (kiln's 30 s at load 28, 2026-11-18; A-366). 24: the chosen-path launcher ([`exec`]): an [`ExecSpec`]
+/// whose [`AppArmor`] option, off unless the user opts in, lets the launcher make its namespace under slates' AppArmor
+/// profile where the host restricts unprivileged user namespaces; [`exec::command`] builds the command that runs it from a
+/// host's own executable, which [`role::main`] serves; [`exec::check`] answers the host's [`Readiness`]; its refusals
+/// are [`ExecFault`] (A-370; the same day).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 23;
+pub const CONTRACT: u32 = 24;
 
 /// The typed client and its own types, for the verbs [`Instance::client`] lends outside the contract.
 pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, VhostUserDevice};
