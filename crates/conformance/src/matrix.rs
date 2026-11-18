@@ -207,11 +207,15 @@ fn disabled(operations: &[String]) -> String {
 fn workloads(tools: &[crate::record::WorkloadResult]) -> String {
   let mut identical = Vec::new();
   let mut differing = Vec::new();
+  let mut failed = Vec::new();
   let mut skipped = Vec::new();
   for tool in tools {
     match &tool.status {
       WorkloadStatus::Identical => identical.push(tool.name.as_str()),
       WorkloadStatus::Differs { .. } => differing.push(tool.name.as_str()),
+      WorkloadStatus::Failed { exit_code, .. } => {
+        failed.push(format!("{} (exit {exit_code})", tool.name))
+      }
       WorkloadStatus::Skipped { tool: absent } => {
         skipped.push(format!("{} ({absent} absent)", tool.name))
       }
@@ -220,6 +224,9 @@ fn workloads(tools: &[crate::record::WorkloadResult]) -> String {
   let mut parts = vec![format!("identical: {}", list(&identical))];
   if !differing.is_empty() {
     parts.push(format!("DIFFERS: {}", differing.join(", ")));
+  }
+  if !failed.is_empty() {
+    parts.push(format!("FAILED: {}", failed.join(", ")));
   }
   if !skipped.is_empty() {
     parts.push(format!("skipped: {}", skipped.join(", ")));
@@ -355,7 +362,7 @@ mod tests {
     assert!(rewrite(&format!("{BEGIN}unterminated"), "x").is_err());
   }
 
-  /// The workload summary names the identical, differing and skipped tools.
+  /// The workload summary names the identical, differing, failed and skipped tools, a failed one with its exit code.
   #[test]
   fn the_workload_summary_names_every_tool() {
     use crate::record::WorkloadResult;
@@ -371,6 +378,13 @@ mod tests {
         },
       },
       WorkloadResult {
+        name: "mercurial".to_owned(),
+        status: WorkloadStatus::Failed {
+          exit_code: 255,
+          detail: "abort".to_owned(),
+        },
+      },
+      WorkloadResult {
         name: "watcher".to_owned(),
         status: WorkloadStatus::Skipped {
           tool: "fswatch".to_owned(),
@@ -379,7 +393,7 @@ mod tests {
     ];
     assert_eq!(
       summary(&Counts::Workloads { tools }),
-      "identical: git; DIFFERS: npm; skipped: watcher (fswatch absent)"
+      "identical: git; DIFFERS: npm; FAILED: mercurial (exit 255); skipped: watcher (fswatch absent)"
     );
   }
 }

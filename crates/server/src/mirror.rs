@@ -912,7 +912,9 @@ fn seed_assigned(state: &mut ShardState, local: HostId) -> Vec<ObjectId> {
     state
       .pending_catalogs
       .insert(object, (catalog.sequence, catalog_value));
-    state.pending_materializations.insert(object, value);
+    state
+      .pending_materializations
+      .insert(object, crate::state::PendingVolume::adopted(value, None));
     state.mirror_seeded.insert(object);
     state.count(PROMOTION_SEEDED, 1);
   }

@@ -3199,18 +3199,8 @@ pub(crate) fn recover_green_inputs(
   adopted: &MergeRecordValue,
   (catalog_sequence, catalog): (u64, &crate::catalog::CatalogValue),
 ) -> Option<GreenRecovery> {
-  let mut values: BTreeMap<u64, MergeRecordValue> = state
-    .holder_records
-    .get(&object)?
-    .persisted()
-    .1
-    .into_iter()
-    .filter(|(held, _, _, _)| *held == object)
-    .filter_map(|(_, sequence, _, bytes)| {
-      MergeRecordValue::from_record_bytes(&bytes).map(|value| (sequence, value))
-    })
-    .collect();
-  values.insert(adopted.version, adopted.clone());
+  state.holder_records.get(&object)?;
+  let values = green_ledger_values(state, object, adopted);
   // The prefix must be complete: every version from 0 to the adopted head, each with its inputs held.
   let mut origin = None;
   let mut chain = Vec::with_capacity(usize::try_from(adopted.version).unwrap_or(0));
@@ -3243,6 +3233,58 @@ pub(crate) fn recover_green_inputs(
     head: adopted.version,
     identity: adopted.identity,
   })
+}
+
+/// The merge record values this node knows of `object`'s ledger up to the `adopted` record (§4.16 owner-loss
+/// recovery): its holder acceptor's accepted positions, one per version it recomputed and accepted, with the adopted
+/// record at its own version. What [`recover_green_inputs`] rebuilds from and [`unheld_green_inputs`] reads.
+fn green_ledger_values(
+  state: &ShardState,
+  object: ObjectId,
+  adopted: &MergeRecordValue,
+) -> BTreeMap<u64, MergeRecordValue> {
+  let mut values: BTreeMap<u64, MergeRecordValue> = state
+    .holder_records
+    .get(&object)
+    .map(|acceptor| {
+      acceptor
+        .persisted()
+        .1
+        .into_iter()
+        .filter(|(held, _, _, _)| *held == object)
+        .filter_map(|(_, sequence, _, bytes)| {
+          MergeRecordValue::from_record_bytes(&bytes).map(|value| (sequence, value))
+        })
+        .collect()
+    })
+    .unwrap_or_default();
+  values.insert(adopted.version, adopted.clone());
+  values
+}
+
+/// The inputs a taken-over green's ledger names that this node does not hold (§4.16 owner-loss recovery, "Masked after
+/// takeover on a candidate that holds the ledger"; GAP-A9-7's input half): each version, from 0 to the `adopted` one,
+/// whose record this node knows ([`green_ledger_values`]) and whose inputs manifest it does not hold, with that
+/// manifest's identity, lowest version first. A successor one version behind the quorum knows the adopted record (it
+/// re-committed it) but never received its inputs; the survivors that accepted the version hold them, since a holder
+/// accepts a merge record only once it holds its inputs, so a fetch by identity from them fills the gap. `None` when a
+/// record itself is unknown here: no fetch by identity can fill that (the ledger-prefix transfer of records, owed).
+pub(crate) fn unheld_green_inputs(
+  state: &ShardState,
+  object: ObjectId,
+  adopted: &MergeRecordValue,
+) -> Option<Vec<(u64, [u8; 32])>> {
+  let values = green_ledger_values(state, object, adopted);
+  let mut unheld = Vec::new();
+  for version in 0..=adopted.version {
+    let value = values.get(&version)?;
+    if let Some(manifest) = value.inputs
+      && !state.held_content.holds_manifest(object, &manifest)
+    {
+      unheld.push((version, manifest));
+    }
+  }
+  Some(unheld)
 }
 
 /// A holder's view of `object`'s replica, for a test.

@@ -142,11 +142,15 @@ pub struct HostTakeover {
   /// Per learned object, the members that answered for it by name holding nothing of it (A-251 (b)): their promise of
   /// that object alone. A member's complete pages promise nothing of an object they did not list.
   named_nothing: BTreeMap<ObjectId, BTreeSet<HostId>>,
+  /// The page answers that advanced a member's page (its next page starts later, or its answer completed), counted
+  /// since the round began and never cleared by a restart: the round's progress, which a taken-over object waiting on a
+  /// register this round may still bring reads ([`rounds_still_paging`]).
+  page_advances: u64,
 }
 
 /// One asked member's progress through its answer: the object its next page starts after, and whether its
 /// answer is complete.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 struct Page {
   after: Option<ObjectId>,
   complete: bool,
@@ -164,11 +168,12 @@ impl HostTakeover {
       lost: BTreeSet::new(),
       fenced: None,
       named_nothing: BTreeMap::new(),
+      page_advances: 0,
     }
   }
 
   /// Starts the round over at `generation` and `epoch`: every promise was for the old round, so every page is
-  /// asked again. What was adopted stays adopted.
+  /// asked again. What was adopted stays adopted, and the page advances stay counted.
   fn restart(&mut self, generation: u64, epoch: HostEpoch) {
     self.generation = generation;
     self.epoch = epoch;
@@ -179,10 +184,59 @@ impl HostTakeover {
     self.named_nothing.clear();
   }
 
+  /// Records `host`'s answer to a page as its progress `page`, counting it in [`HostTakeover::page_advances`] when it
+  /// moved the member on: a later next page, or its answer complete. A member that answers the same page again (a copy
+  /// it could not promise keeps the page open where it was) has not advanced the round.
+  fn advance_page(&mut self, host: HostId, page: Page) {
+    if self.pages.insert(host, page) != Some(page) {
+      self.page_advances = self.page_advances.saturating_add(1);
+    }
+  }
+
   /// The objects learned and not yet adopted.
   pub fn outstanding(&self) -> usize {
     self.learned.len()
   }
+}
+
+/// The retired hosts whose takeover round on this node is still paging (§4.8 phase one), each with its page advances
+/// so far ([`HostTakeover::page_advances`]): its configuration moved on or a fence sends it higher, so it starts over,
+/// or a member it asks has not answered every page. While a round pages, an object it adopted may still be joined by
+/// another register of the same object from a later page. A catalog register's class byte sorts it after every object
+/// of its creator's partition (`ObjectId::catalog`), and a round reads one page a member a period ([`page_budget`],
+/// about 55 objects), so a large host's catalog registers come many periods after their heads. The takeover bound
+/// (`fleet::materialize_pending`, `fleet::materialize_pending_greens`) takes an advance of the round that brings such a
+/// register as progress of every object waiting on it, and counts the wait only while the round stands still.
+pub(crate) fn rounds_still_paging(state: &ShardState) -> BTreeMap<HostId, u64> {
+  let regional = state.council.configuration();
+  let local = state.fleet.host();
+  state
+    .host_takeovers
+    .iter()
+    .filter(|(departed, take)| {
+      take.generation != regional.version
+        || take.fenced.is_some()
+        || pages_outstanding(
+          &take.pages,
+          regional
+            .recovery_hosts(**departed)
+            .into_iter()
+            .filter(|host| *host != local && regional.members.contains(host)),
+        )
+    })
+    .map(|(departed, take)| (*departed, take.page_advances))
+    .collect()
+}
+
+/// Whether a member among `asked` has not answered every page: `pages` holds each asked member's progress, and a member
+/// never asked yet has none.
+fn pages_outstanding(
+  pages: &BTreeMap<HostId, Page>,
+  asked: impl IntoIterator<Item = HostId>,
+) -> bool {
+  asked
+    .into_iter()
+    .any(|host| !pages.get(&host).is_some_and(|page| page.complete))
 }
 
 /// Records `owner` as `object`'s owner in this shard's routing and in every other shard's (§4.8 "Lookup"). A takeover
@@ -891,7 +945,7 @@ pub(crate) fn fold_answers(
         }
       }
     } else {
-      take.pages.insert(host, page);
+      take.advance_page(host, page);
     }
   }
 }
@@ -1195,8 +1249,17 @@ fn record_adoption(
     },
   );
   state.departed_owners.remove(&object);
+  // The members other than this node that reported the adopted position: a green's successor fetches any input it
+  // lacks from them (`fleet::fetch_green_inputs`), since each accepted that version holding its inputs.
+  let mut reported_adopted = Vec::new();
   if let Some(take) = state.host_takeovers.get_mut(&departed) {
-    take.learned.remove(&object);
+    if let Some(reports) = take.learned.remove(&object) {
+      reported_adopted = reports
+        .into_iter()
+        .filter(|(host, accepted)| *host != local && accepted.sequence == record.sequence)
+        .map(|(host, _)| host)
+        .collect();
+    }
     take.adopted.insert(object);
   }
   if object.is_catalog() {
@@ -1225,13 +1288,20 @@ fn record_adoption(
       .pending_tombstones
       .insert(object, tombstone.tombstone_sequence(record.sequence));
   } else if let Some(head) = HeadValue::from_record_bytes(&record.value) {
-    state.pending_materializations.insert(object, head);
+    state.pending_materializations.insert(
+      object,
+      crate::state::PendingVolume::adopted(head, Some(departed)),
+    );
   } else {
     match crate::merge_service::MergeRecordValue::decode_record(&record.value) {
       // A green: its newest merge record was adopted; the owned green is rebuilt from this node's accepted chain
-      // and held inputs on the shard its id routes to (AUD-14).
+      // and held inputs on the shard its id routes to (AUD-14), fetching an input it lacks from the members that
+      // reported the adopted version.
       Ok(merge) => {
-        state.pending_green_materializations.insert(object, merge);
+        state.pending_green_materializations.insert(
+          object,
+          crate::state::PendingGreen::adopted(merge, Some(departed), reported_adopted),
+        );
       }
       // A merge record of another format: adopted as bytes, never materialized from, and counted.
       Err(refused) => {
@@ -1284,6 +1354,81 @@ fn share_done(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// The takeover bound's paging gate (`rounds_still_paging`): a round still pages while any member it asks has not
+  /// answered every page, a member never asked counting as not answered. Do: judge two asked members with one page
+  /// complete and the other part-way, never asked, and complete. Expect paging until both are complete, and none once
+  /// no member is asked.
+  #[test]
+  fn a_round_pages_until_every_asked_member_has_answered_every_page() {
+    let (first, second) = (HostId(2), HostId(3));
+    let complete = Page {
+      after: None,
+      complete: true,
+    };
+    let part_way = Page {
+      after: Some(ObjectId::new(HostId(1), 7)),
+      complete: false,
+    };
+    let asked = [first, second];
+    let pages = BTreeMap::from([(first, complete), (second, part_way)]);
+    assert!(
+      pages_outstanding(&pages, asked),
+      "one member part-way: paging"
+    );
+    let pages = BTreeMap::from([(first, complete)]);
+    assert!(
+      pages_outstanding(&pages, asked),
+      "one member never asked: paging"
+    );
+    let pages = BTreeMap::from([(first, complete), (second, complete)]);
+    assert!(
+      !pages_outstanding(&pages, asked),
+      "every member complete: done paging"
+    );
+    assert!(
+      !pages_outstanding(&BTreeMap::new(), []),
+      "no member asked: nothing to page"
+    );
+  }
+
+  /// The takeover bound's progress of a paging round (`HostTakeover::page_advances`): a page answer advances the round
+  /// only when it moves its member on, and a restart keeps the count. Do: fold a member's first page, the same page
+  /// again (a copy it could not promise keeps the page open where it was), its next page, its completion, the
+  /// completion again; restart the round; fold the first page again. Expect the count to move at the first page, the
+  /// next, the completion and the first page after the restart, and nowhere else, so a member that answers without
+  /// moving on reads as a round standing still and the bound counts the waits on it.
+  #[test]
+  fn a_round_advances_only_when_a_member_moves_on_and_a_restart_keeps_the_count() {
+    let member = HostId(2);
+    let mut take = HostTakeover::new(5, HostEpoch(3));
+    let page = |after: u64, complete: bool| Page {
+      after: (!complete).then_some(ObjectId::new(HostId(1), after)),
+      complete,
+    };
+    let mut seen = Vec::new();
+    for answer in [
+      page(55, false),
+      page(55, false),
+      page(110, false),
+      page(0, true),
+      page(0, true),
+    ] {
+      take.advance_page(member, answer);
+      seen.push(take.page_advances);
+    }
+    assert_eq!(seen, vec![1, 1, 2, 3, 3]);
+    take.restart(6, HostEpoch(4));
+    assert_eq!(
+      take.page_advances, 3,
+      "a restart keeps the round's progress counted"
+    );
+    take.advance_page(member, page(55, false));
+    assert_eq!(
+      take.page_advances, 4,
+      "the first page asked again after the restart moves the member on"
+    );
+  }
 
   /// A-272: a round that declared an object lost does not confirm its share. Do ask whether a share is done with every
   /// page complete and nothing left learned, with and without a lost object. Expect done only with none lost. Before, a
