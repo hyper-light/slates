@@ -727,12 +727,19 @@ fn retirement_learned_periods(daemons: &[&Daemon]) -> u64 {
 }
 
 /// Derived: the coordinator periods the survivors take to learn a voter's departure: a membership horizon for the
-/// detector to hold it dead, the death window, the retirement's commit, the two commits of the joint change that
-/// refills its seat, the period a learner sees its divergence in, and its fetch round.
+/// detector to hold it dead, the death window, the election the departure leaves owed when the voter led the council
+/// (its timeout's base and span, [`election_periods`], and its two rounds, the pre-vote's and the vote's), the
+/// retirement's commit, the two commits of the joint change that refills its seat, the period a learner sees its
+/// divergence in, and its fetch round. The voter these tests stop is the bootstrapper, which leads the council it created
+/// unless a priority transfer moved its leadership, and only a leader proposes the retirement: without the election the
+/// budget ran out with the retirement still owed at one CPU beside two busy loops (diag-g225-forming-fleet-reaches-2,
+/// 2026-11-18: 9 of 48 runs of the two tests waiting on it, every survivor still at the version of the stop or the
+/// leader still naming the stopped voter, 94 periods spent).
 fn departure_learned_periods(daemons: &[&Daemon]) -> u64 {
   horizon_periods()
     .saturating_add(death_window_periods(daemons))
-    .saturating_add(commit_periods().saturating_mul(4))
+    .saturating_add(election_periods(daemons))
+    .saturating_add(commit_periods().saturating_mul(6))
     .saturating_add(1)
 }
 
@@ -10452,6 +10459,97 @@ fn three_daemons_take_over_a_dead_owners_head() {
   );
 }
 
+/// The failover delay as a successor estimates it (§4.8 "Derived constants", A-363): an output that learns from the
+/// takeover it completes, never a setting. Do: three nodes at `f = 1`; on a, a volume shared with the fleet, its head
+/// held by both others; read each survivor's failover estimate; then a dies, and the successor serves the volume. Expect
+/// each survivor's estimate before the loss to carry detection from its detector and confirmation from the coordinator
+/// periods it timed, the recovery at its prior (the ratified recovery budget, nothing timed) and the total their sum; and
+/// the successor's, once its share is done, to have timed the takeover and the volume, the total still the sum of its
+/// terms.
+#[test]
+fn a_successors_failover_estimate_learns_the_takeover_it_completed() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, mut daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id } = client.call(&scratch("failover-learned")) else {
+    panic!("the volume was created");
+  };
+  share_with_fleet(&mut client, id, &daemons);
+  drop(client);
+  let object = ObjectId(id.bytes);
+  let survivors_hold = poll_all_hold(&[&daemons[1], &daemons[2]], object);
+  let before: Vec<Option<slates_ipc::protocol::FailoverReport>> = daemons
+    .iter()
+    .skip(1)
+    .map(|daemon| failover_through(&mut Client::connect(daemon.instance())))
+    .collect();
+  let owner = daemons.remove(0);
+  owner.stop();
+  let successor = rendezvous_first(&[hosts[1], hosts[2]], object).expect("a survivor takes over");
+  let successor_index = usize::from(successor != hosts[1]);
+  let successor_instance = daemons[successor_index].instance().to_owned();
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let served = poll_status_answers(&survivors, &successor_instance, id);
+  // One client for the whole wait: a client a poll would cost its shard a seat each time.
+  let mut status = Client::connect(&successor_instance);
+  let mut after = None;
+  let timed = poll_until(&survivors, SERVE_DEADLINE, || {
+    after = failover_through(&mut status);
+    Ok(after.is_some_and(|report| report.takeovers_timed > 0 && report.volumes_timed > 0))
+  });
+  drop(status);
+  drop(survivors);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!("failover estimates: before the loss {before:?}; the successor's after it {after:?}");
+  assert!(
+    survivors_hold,
+    "both survivors held the head before the loss"
+  );
+  for report in &before {
+    let report = report.expect("each survivor reported its failover estimate");
+    assert!(
+      report.detection_ns > 0 && report.confirmation_ns > 0 && report.confirmation_samples > 0,
+      "detection from the detector and confirmation from timed periods, measured: {report:?}"
+    );
+    assert_eq!(
+      (
+        report.takeovers_timed,
+        report.volumes_timed,
+        report.recovery_ns
+      ),
+      (0, 0, slates_db::replay::RECOVERY_BUDGET_NS),
+      "nothing recovered yet: the recovery is its prior"
+    );
+    assert_eq!(
+      report.total_ns,
+      report.detection_ns + report.confirmation_ns + report.recovery_ns,
+      "the failover delay is its terms' sum"
+    );
+  }
+  assert!(served, "the successor serves the volume");
+  assert!(
+    timed,
+    "the successor timed its takeover and the volume into its estimate: {after:?}"
+  );
+  let after = after.expect("the successor reported its failover estimate");
+  assert_eq!(
+    after.total_ns,
+    after.detection_ns + after.confirmation_ns + after.recovery_ns,
+    "the failover delay is its terms' sum: {after:?}"
+  );
+}
+
+/// The failover estimate the daemon `client` is connected to reports in its status (A-363), or `None` when it did not
+/// answer one.
+fn failover_through(client: &mut Client) -> Option<slates_ipc::protocol::FailoverReport> {
+  match client.call(&RequestBody::DaemonStatus) {
+    ReplyBody::DaemonStatus { report } => Some(report.fleet.failover),
+    _ => None,
+  }
+}
+
 /// Prints each survivor's refusal counters after a takeover that did not complete (`completed` false): which step
 /// stalled.
 fn print_takeover_counters(survivors: &[Daemon], successor_index: usize, completed: bool) {
@@ -13882,6 +13980,204 @@ fn an_owner_admitted_again_forwards_the_volume_its_successor_took_over_and_never
   assert!(
     matches!(yielded, Ok(count) if count > 0),
     "the owner admitted again yielded its volume: {yielded:?}"
+  );
+}
+
+/// A-334's setup for its siblings on the client's shard: three nodes; a live volume on a, shared with every node's
+/// account and written once; a cut off the probe plane until a survivor takes the volume over, healed, and admitted again
+/// at a newer host epoch, so it has yielded the volume. The daemons, the successor's index and the volume.
+fn yielded_by_an_owner_admitted_again() -> (PortLease, Vec<Daemon>, usize, VolumeId) {
+  let (serve_lease, daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let id = shared_live_volume(&daemons);
+  let successor = falsely_taken_over(&daemons, &hosts);
+  heal_the_probe_plane(&daemons);
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let readmitted = poll_until(&observed, REJOIN_DEADLINE, || {
+    Ok(host_epoch_of(&daemons[0]).is_some_and(|epoch| epoch > slates_db::register::FIRST_EPOCH.0))
+  });
+  drop(observed);
+  assert!(readmitted, "a was admitted again at a newer host epoch");
+  (serve_lease, daemons, successor, id)
+}
+
+/// A-334's first sibling on the client's shard (goal g229), A-222's refusal by kind: a node admitted again refuses a
+/// mount of a volume it yielded to its successor as it refuses a mount of any other host's volume. Do: the A-334 setup
+/// ([`yielded_by_an_owner_admitted_again`]); through a client of a, attach the volume as an NFS host mount. Expect
+/// `AttachmentUnsupported` naming the NFS loopback transport and `OwnedByAnotherHost`: the form hands the client
+/// something of a's host, whose copy the successor's writes have passed, and only the record form crosses hosts. Before,
+/// the client's shard took the volume for a's own (a created it), so the refusal by kind never applied.
+#[test]
+fn an_owner_admitted_again_refuses_a_mount_of_the_volume_it_yielded_by_kind() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, successor, id) = yielded_by_an_owner_admitted_again();
+  let mut client = Client::connect(daemons[0].instance());
+  let mounted = client.call(&RequestBody::Attach {
+    volume: id,
+    snapshot: None,
+    intent: Intent::Write,
+    form: AttachRequest::HostMount,
+  });
+  drop(client);
+  let refused_by_kind = refusal_count(&daemons[0], "attachment_unsupported");
+  drop(daemons);
+  eprintln!(
+    "an NFS host mount of a yielded volume through its old owner (successor node {successor}): {mounted:?}; refused by \
+     kind {refused_by_kind:?}"
+  );
+  assert!(
+    matches!(
+      mounted,
+      ReplyBody::Refused {
+        refusal: Refusal::AttachmentUnsupported {
+          transport: slates_ipc::protocol::AttachTransport::NfsLoopback,
+          reason: slates_ipc::protocol::UnsupportedReason::OwnedByAnotherHost,
+        }
+      }
+    ),
+    "a mount of a volume this node yielded is refused by its kind, as another host's is: {mounted:?}"
+  );
+}
+
+/// Format: the variable that makes this test binary the holder of
+/// [`a_holder_of_a_volume_its_node_yielded_is_reaped_at_the_successor`]: the instance it attaches through and the
+/// volume's id in hex, a space between.
+const YIELDED_HOLDER_ROLE: &str = "SLATES_FLEET_TEST_YIELDED_HOLDER";
+/// Format: the tag before the holder's attachment on its standard output. A re-invoked test binary prints libtest's
+/// banner first and glues the role's first line to it, so the tag is looked for anywhere in a line.
+const YIELDED_HOLDER_TAG: &str = "yielded-holder-attached: ";
+
+/// The holder's role in [`a_holder_of_a_volume_its_node_yielded_is_reaped_at_the_successor`], in a re-invoked test
+/// binary (in a normal run it does nothing): attaches the volume its role names for writing through the instance it
+/// names, prints its attachment, and holds it until the parent kills this process, its standard input left open.
+#[test]
+fn yielded_holder_role() {
+  let Ok(role) = std::env::var(YIELDED_HOLDER_ROLE) else {
+    return;
+  };
+  // The daemon is in the parent's process: on Linux, whose rendezvous is sealed (A-187), this one installs its own seal
+  // before its first rendezvous.
+  #[cfg(target_os = "linux")]
+  slates_seal::install();
+  let (instance, volume) = role.split_once(' ').unwrap();
+  let mut client = Client::connect(instance);
+  let attachment = write_attachment(&mut client, volume_of_hex(volume));
+  println!("{YIELDED_HOLDER_TAG}{attachment}");
+  std::io::Write::flush(&mut std::io::stdout()).unwrap();
+  let mut held = String::new();
+  let _ = std::io::stdin().read_line(&mut held);
+}
+
+/// A volume id as hex, for a re-invoked role's environment.
+fn hex_of_volume(volume: VolumeId) -> String {
+  volume
+    .bytes
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect()
+}
+
+/// A volume id from [`hex_of_volume`]'s text.
+fn volume_of_hex(text: &str) -> VolumeId {
+  let mut bytes = [0u8; 16];
+  for (index, byte) in bytes.iter_mut().enumerate() {
+    *byte = u8::from_str_radix(&text[2 * index..2 * index + 2], 16).unwrap();
+  }
+  VolumeId { bytes }
+}
+
+/// The attachments `volume`'s status counts through `client`, or `None` while its daemon does not answer the volume's
+/// status. One client held for a whole poll: a client per check outruns the reaper, which reaps no in-process client on
+/// macOS (its pid lives on), and the daemon refused "too many clients" (the first run of the test below).
+fn attachments_on(client: &mut Client, volume: VolumeId) -> Option<u32> {
+  match client.call(&RequestBody::Status { volume }) {
+    ReplyBody::Status { report } => Some(report.attachments),
+    _ => None,
+  }
+}
+
+/// Shape: the fleet's periods [`a_holder_of_a_volume_its_node_yielded_is_reaped_at_the_successor`] gives a dead holder's
+/// node to end its attachment at the successor: the reaper's silence of two liveness budgets (twenty periods), then a
+/// location round and one forward (a few periods), ten times over for a loaded machine. Its red run waited out the whole
+/// period budget instead (414 s) with the attachment still held.
+const YIELDED_REAP_PERIODS: u64 = 300;
+
+/// A re-invoked holder process, killed and reaped when dropped, so a failed assertion leaves nothing behind.
+struct HolderProcess(std::process::Child);
+
+impl Drop for HolderProcess {
+  fn drop(&mut self) {
+    let _ = self.0.kill();
+    let _ = self.0.wait();
+  }
+}
+
+/// A-334's second sibling on the client's shard (goal g229), A-222's reap: a holder of a volume its node yielded, whose
+/// attach that node forwarded to the successor, is reaped at the successor when it dies, as a holder of another host's
+/// volume is. Do: the A-334 setup ([`yielded_by_an_owner_admitted_again`]); a separate process attaches the volume for
+/// writing through a client of a ([`yielded_holder_role`]), which a forwards to the successor; then kill that process.
+/// Expect the successor to count the attachment while the holder lives, and none once a's reap of the dead client has
+/// run. Before, a's client shard took the volume for its own (a created it), so it never remembered the attach for the
+/// reap, and the attachment stayed on the successor for good, its write lease ending only at its term.
+#[test]
+fn a_holder_of_a_volume_its_node_yielded_is_reaped_at_the_successor() {
+  if std::env::var_os(YIELDED_HOLDER_ROLE).is_some() {
+    return;
+  }
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, successor, id) = yielded_by_an_owner_admitted_again();
+  let mut holder = HolderProcess(
+    std::process::Command::new(std::env::current_exe().unwrap())
+      .args([
+        "--exact",
+        "yielded_holder_role",
+        "--nocapture",
+        "--test-threads=1",
+      ])
+      .env(
+        YIELDED_HOLDER_ROLE,
+        format!("{} {}", daemons[0].instance(), hex_of_volume(id)),
+      )
+      .stdin(std::process::Stdio::piped())
+      .stdout(std::process::Stdio::piped())
+      .stderr(std::process::Stdio::inherit())
+      .spawn()
+      .unwrap(),
+  );
+  let mut lines = std::io::BufRead::lines(std::io::BufReader::new(holder.0.stdout.take().unwrap()));
+  let attachment = loop {
+    let line = lines
+      .next()
+      .expect("the holder printed its attachment")
+      .unwrap();
+    if let Some(at) = line.find(YIELDED_HOLDER_TAG) {
+      break line[at + YIELDED_HOLDER_TAG.len()..].trim().to_owned();
+    }
+  };
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let mut status = Client::connect(daemons[successor].instance());
+  let held = poll_until(&observed, REJOIN_DEADLINE, || {
+    Ok(attachments_on(&mut status, id).is_some_and(|count| count >= 1))
+  });
+  drop(holder);
+  let reaped = poll_for_periods(&observed, REJOIN_DEADLINE, YIELDED_REAP_PERIODS, || {
+    Ok(attachments_on(&mut status, id) == Some(0))
+  });
+  let left = attachments_on(&mut status, id);
+  drop(status);
+  let ended_there = refusal_count(&daemons[successor], "remote_attach.ended");
+  drop(observed);
+  drop(daemons);
+  eprintln!(
+    "a holder of a yielded volume ({attachment}) through its old owner: held at the successor {held}, reaped {reaped}, \
+     left {left:?}, ended there by a reap {ended_there:?}"
+  );
+  assert!(
+    held,
+    "the successor recorded the forwarded attachment of a yielded volume"
+  );
+  assert!(
+    reaped,
+    "the dead holder's attachment ended at the successor once its node reaped it: {left:?} left"
   );
 }
 

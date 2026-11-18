@@ -1531,6 +1531,9 @@ pub struct ShardReport {
   pub peers_unmeshed: u32,
   /// This node's council configuration fetches as a learner (control shard only; empty elsewhere). Appended.
   pub learner: LearnerReport,
+  /// This node's failover estimate (A-363): live on the control shard, which runs the coordinator; elsewhere the
+  /// recovery prior alone. Appended.
+  pub failover: FailoverReport,
 }
 
 /// A learner's configuration fetches (§4.8, D-14): the council version it holds now, the version it held after its last
@@ -1678,6 +1681,38 @@ pub struct FleetReport {
   pub peers_unmeshed: u32,
   /// This node's council configuration fetches as a learner, from its control shard. Appended.
   pub learner: LearnerReport,
+  /// The failover delay as this node estimates it now, from its control shard (A-363): what an owner's loss costs its
+  /// objects' service, learned from the detector, the council and the recoveries this node timed. Nothing sets it.
+  /// Appended.
+  pub failover: FailoverReport,
+}
+
+/// The failover delay as a node estimates it now (§4.8 "Derived constants", A-363): from an owner's loss to its objects
+/// served again, detection plus confirmation plus recovery, each term the running estimate of the path it names, with
+/// the measurements behind it, so a reader tells a measured term from a prior. Nothing sets it; it moves with what the
+/// node measures. A laptop reports the recovery alone: no peer to detect and no council to confirm (R8).
+#[derive(Wire, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FailoverReport {
+  /// The failover delay, nanoseconds: the three terms summed.
+  pub total_ns: u64,
+  /// Detection: SWIM's count of the failure detector's periods from a crashed peer's last answer to its condemnation,
+  /// each at the running tail of the detector's measured period (Lifeguard's local health and each pair's NFD-E margin
+  /// stretch them), nanoseconds; zero where there is no peer to detect.
+  pub detection_ns: u64,
+  /// The detector periods timed behind it.
+  pub detection_samples: u64,
+  /// Confirmation: the council's death-confirmation window at the coordinator's measured period, with the retirement's
+  /// commit round and its install, nanoseconds; zero where there is no council.
+  pub confirmation_ns: u64,
+  /// The coordinator periods timed behind it.
+  pub confirmation_samples: u64,
+  /// Recovery: the larger tail of the takeovers and the volumes this node timed, nanoseconds; before any, the ratified
+  /// recovery budget, a prior.
+  pub recovery_ns: u64,
+  /// The takeovers this node timed, round begun to share confirmed.
+  pub takeovers_timed: u64,
+  /// The taken-over volumes this node timed, adopted to served.
+  pub volumes_timed: u64,
 }
 
 impl RequestBody {

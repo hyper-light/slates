@@ -2631,6 +2631,20 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
       |ns| (ns / NANOS_PER_MILLISECOND).to_string()
     )
   ));
+  // The failover delay as the daemon estimates it now (A-363): each term and the measurements behind it, so a term that
+  // is still its prior (zero samples) reads as one. Nothing sets it.
+  let failover = &report.fleet.failover;
+  out.push_str(&format!(
+    "fleet_failover: total_ns={} detection_ns={} (detector periods {}) confirmation_ns={} (coordinator periods {}) recovery_ns={} (takeovers {} volumes {})\n",
+    failover.total_ns,
+    failover.detection_ns,
+    failover.detection_samples,
+    failover.confirmation_ns,
+    failover.confirmation_samples,
+    failover.recovery_ns,
+    failover.takeovers_timed,
+    failover.volumes_timed
+  ));
   for session in &report.fleet.sessions {
     out.push_str(&format!(
       "fleet_session {}: lent={} cwnd={} srtt_ns={} pto_ns={} spurious_losses={} persistent_collapses={} consumed={} mtu={}\n",
