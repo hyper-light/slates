@@ -91,6 +91,12 @@ pub enum WinFspError {
   SecurityDescriptor,
   /// The mount thread could not be started, or ended without reporting.
   MountThread,
+  /// WinFsp's driver may make the mount's drive through the Mount Manager only where the machine allows it (A-369): an
+  /// Administrator sets `MountUseMountmgrFromFSD` to 1 under WinFsp's key, once, as WinFsp itself is installed once.
+  MountManagerNotAllowed,
+  /// The mount's drive letter names another volume: the Mount Manager gave it to another, or a definition local to
+  /// this session hides the machine's (A-369).
+  DriveLetterTaken,
   /// The held volume, drive or access record was malformed or did not match the catalog.
   Record(crate::held::Refusal),
   /// A checked open-ledger allocation, read or write was refused.
@@ -127,6 +133,12 @@ impl std::fmt::Display for WinFspError {
       Self::Api { call, status } => write!(f, "{call} answered NTSTATUS {status:#010x}"),
       Self::SecurityDescriptor => write!(f, "the mount's security descriptor could not be built"),
       Self::MountThread => write!(f, "the mount thread could not run"),
+      Self::MountManagerNotAllowed => write!(
+        f,
+        "this machine does not let WinFsp's driver make a Mount Manager drive: an Administrator sets it once with \
+         `reg add HKLM\\SOFTWARE\\WOW6432Node\\WinFsp /v MountUseMountmgrFromFSD /t REG_DWORD /d 1 /f`"
+      ),
+      Self::DriveLetterTaken => write!(f, "the drive letter names another volume"),
       Self::Record(reason) => write!(f, "the held mount record was refused: {reason:?}"),
       Self::Ledger(reason) => write!(f, "{reason}"),
       Self::Intent(reason) => write!(f, "{reason}"),
@@ -2686,7 +2698,7 @@ impl Mounted {
     read_only: bool,
     requests: SyncSender<Request>,
     wake: Waker,
-    inherited: Option<(Record, OwnedHandle, OwnedHandle)>,
+    inherited: Option<(Record, OwnedHandle)>,
     purge_intents: crate::purge_intents::Sender,
     private_opens: &crate::purge_intents::Intents,
   ) -> Result<Mounted, WinFspError> {
@@ -2707,7 +2719,7 @@ impl Mounted {
     let api = ffi::api().map_err(|_| WinFspError::NotInstalled)?;
     checked_dll(api)?;
     let purge_marker = crate::purge_token::Marker::fresh()?;
-    let security_descriptor = drive_security_descriptor()?;
+    let security_descriptor = drive_security_descriptor(purge_marker)?;
     let handler = Box::into_raw(Box::new(Handler {
       requests,
       wake,
@@ -2790,7 +2802,7 @@ impl Mounted {
     unsafe {
       (*file_system).user_context = handler.cast::<c_void>();
     }
-    if let Some((record, volume, link)) = inherited {
+    if let Some((record, volume)) = inherited {
       if record.drive_text().map_err(WinFspError::Record)? != mount_point
         || record.read_only != read_only
       {
@@ -2805,7 +2817,7 @@ impl Mounted {
         (*file_system).volume_name = record.volume;
         drop(OwnedHandle::from_raw_handle(old));
       }
-      mounted.drive = Some(Drive::inherited(&record, link));
+      mounted.drive = Some(Drive::inherited());
       mounted.record = record;
     }
     // SAFETY: the DLL object now owns the final control handle (including substitution on adoption), and remains
@@ -2813,7 +2825,9 @@ impl Mounted {
     let control = unsafe { (*file_system).volume_handle };
     crate::dispatcher::announce_ready(control, private_opens)?;
     if mounted.drive.is_none() {
-      mounted.drive = Some(Drive::create(&mounted.record)?);
+      // SAFETY: the DLL object owns this live control handle for the whole of `mounted`; the borrow ends with the call.
+      let volume = unsafe { BorrowedHandle::borrow_raw(control) };
+      mounted.drive = Some(Drive::create(volume, &mounted.record)?);
     }
     Ok(mounted)
   }
@@ -2827,14 +2841,8 @@ impl Mounted {
         call: "duplicate volume control handle",
         code: error.raw_os_error(),
       })?;
-    let link = self
-      .drive
-      .as_ref()
-      .ok_or(WinFspError::MountThread)?
-      .duplicate()?;
     Ok(Offer {
       volume,
-      link,
       record: self.record.clone(),
     })
   }
@@ -2984,14 +2992,12 @@ impl Ready {
   pub fn handle_values(&self) -> Result<Vec<u64>, WinFspError> {
     let volume = u64::try_from(self.offer.volume.as_raw_handle().addr())
       .map_err(|_| WinFspError::MountThread)?;
-    let link = u64::try_from(self.offer.link.as_raw_handle().addr())
-      .map_err(|_| WinFspError::MountThread)?;
     let ledger = self
       .ledger
       .memory()
       .handle_value()
       .map_err(|error| WinFspError::Ledger(crate::opens::Refusal::Memory(error)))?;
-    Ok(vec![volume, link, ledger])
+    Ok(vec![volume, ledger])
   }
 }
 
@@ -3148,7 +3154,6 @@ fn run_mount(
     let (mut ledger, inherited) = match inherited {
       Some(Inherited {
         volume,
-        link,
         ledger,
         record,
       }) => {
@@ -3156,7 +3161,7 @@ fn run_mount(
           .map_err(|error| WinFspError::Ledger(crate::opens::Refusal::Memory(error)))?;
         (
           Ledger::recover(memory, open_bound).map_err(WinFspError::Ledger)?,
-          Some((record, volume, link)),
+          Some((record, volume)),
         )
       }
       None => {
@@ -3289,10 +3294,11 @@ fn run_mount(
 }
 
 /// The drive's one security descriptor, as self-relative bytes: the account this daemon runs as, which every client of
-/// a Windows daemon is (its rendezvous admits that user's SID alone), as owner, the account's primary group as group,
-/// and the access list that lets the shard decide (`crate::account`, A-350). NTFS gives a file the account makes the
-/// same owner and group, unelevated. Refused `SecurityDescriptor` when the token or its SIDs cannot be read.
-fn drive_security_descriptor() -> Result<Vec<u8>, WinFspError> {
+/// a Windows daemon is (its rendezvous admits that user's SID alone), as owner, the account's primary group as group
+/// (A-350), and an access list for that account, SYSTEM, the Administrators and the mount's purge `marker` alone
+/// (`crate::account::drive_sddl`, A-368). NTFS gives a file the account makes the same owner and group, unelevated.
+/// Refused `SecurityDescriptor` when the token, its SIDs or the marker's cannot be read.
+fn drive_security_descriptor(marker: crate::purge_token::Marker) -> Result<Vec<u8>, WinFspError> {
   let mut token = std::ptr::null_mut();
   // SAFETY: this process's pseudo-handle, which needs no closing, and an out-pointer to a local; the token is owned
   // below.
@@ -3308,7 +3314,8 @@ fn drive_security_descriptor() -> Result<Vec<u8>, WinFspError> {
       .and_then(|buffer| crate::account::token_sid_text(&buffer))
       .ok_or(WinFspError::SecurityDescriptor)
   };
-  let sddl = crate::account::drive_sddl(&sid(TokenUser)?, &sid(TokenPrimaryGroup)?);
+  let marker = marker.sid_text().ok_or(WinFspError::SecurityDescriptor)?;
+  let sddl = crate::account::drive_sddl(&sid(TokenUser)?, &sid(TokenPrimaryGroup)?, &marker);
   security_descriptor_of(&sddl)
 }
 

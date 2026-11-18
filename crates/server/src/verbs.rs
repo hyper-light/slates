@@ -11846,12 +11846,40 @@ pub(crate) fn materialize_taken_over(
   region: Vec<u64>,
   archive: Option<&slates_archive::Archive>,
 ) -> Result<(), Box<ReplyBody>> {
-  let (head, catalog, sequence) = (taken.head, taken.catalog, taken.sequence);
+  if made_already(state, id, taken.catalog)? {
+    return Ok(());
+  }
+  let restored = restore_taken_over(state, taken.catalog, archive)?;
+  make_restored(state, id, taken, region, restored.as_ref())
+}
+
+/// [`materialize_taken_over`] from a restore made in an earlier turn of this shard ([`restore_taken_over`]): a live
+/// takeover's materialization in turns (g251, `fleet::make_live_in_turns`), whose restore and whose making are turns
+/// of their own.
+pub(crate) fn materialize_taken_over_restored(
+  state: &mut ShardState,
+  id: DbVolumeId,
+  taken: &TakenOver<'_>,
+  region: Vec<u64>,
+  restored: Option<&slates_archive::Restored>,
+) -> Result<(), Box<ReplyBody>> {
+  if made_already(state, id, taken.catalog)? {
+    return Ok(());
+  }
+  make_restored(state, id, taken, region, restored)
+}
+
+/// Whether the taken-over volume `id` is made here already, refused when its name is taken here by another: a copy this
+/// takeover made already (a retry after its publication was refused) is kept; this node's own copy lost to a successor
+/// whose takeover now names this node again is relinquished, to be replaced by the state the takeover adopted (A-362).
+pub(crate) fn made_already(
+  state: &mut ShardState,
+  id: DbVolumeId,
+  catalog: &crate::catalog::CatalogValue,
+) -> Result<bool, Box<ReplyBody>> {
   if state.by_id.contains_key(&id) {
-    // A copy this takeover made already (a retry after its publication was refused) is kept. This node's own copy lost
-    // to a successor whose takeover now names this node again is replaced by the state the takeover adopted (A-362).
     if !lost_to_a_successor(state, id) {
-      return Ok(());
+      return Ok(true);
     }
     relinquish_superseded(state, id)?;
   }
@@ -11860,42 +11888,70 @@ pub(crate) fn materialize_taken_over(
       existing: to_wire_volume(existing.id),
     })));
   }
-  let size = match catalog.size {
+  Ok(false)
+}
+
+/// The size class a taken-over volume's catalog names.
+fn taken_over_size(catalog: &crate::catalog::CatalogValue) -> SizeClass {
+  match catalog.size {
     DbSizeClass::Bounded { limit } => SizeClass::Bounded { limit },
     DbSizeClass::Dynamic { max } => SizeClass::Dynamic { max },
-  };
-  // The restore is admitted before it allocates (AUD-29-13): no more than the volume may hold — its bound
-  // or its dynamic maximum — and no more than this shard could admit, since every restored byte is written
-  // into the volume next. An archive needing more is refused typed before a byte is reconstructed.
-  let volume_cap = match size {
+  }
+}
+
+/// A taken-over volume's archive restored for its making ([`make_restored`]), admitted before it allocates (AUD-29-13):
+/// no more than the volume may hold — its bound or its dynamic maximum — and no more than this shard could admit, since
+/// every restored byte is written into the volume next. An archive needing more is refused typed before a byte is
+/// reconstructed; a malformed one is a `BadRequest` naming the reader's refusal. A contentless volume (a scratch volume
+/// never sealed, taken over) has no archive: it restores nothing and serves its empty tree from its adopted head and
+/// catalog registers.
+pub(crate) fn restore_taken_over(
+  state: &mut ShardState,
+  catalog: &crate::catalog::CatalogValue,
+  archive: Option<&slates_archive::Archive>,
+) -> Result<Option<slates_archive::Restored>, Box<ReplyBody>> {
+  let volume_cap = match taken_over_size(catalog) {
     SizeClass::Bounded { limit } => limit,
     SizeClass::Dynamic { max } => max,
   };
-  // A shard that claims its arena lazily makes room for what the restore needs first (A-98); an archive that does not
-  // plan is refused by the restore below, as before. A contentless volume (a scratch volume never sealed, taken
-  // over) has no archive: it restores nothing and serves its empty tree from its adopted head and catalog registers.
-  let restored = match archive {
-    Some(archive) => {
-      if let Ok(needed) = slates_archive::restore_needed(archive) {
-        state.store.make_room(needed.min(volume_cap));
-      }
-      let restore_budget = volume_cap.min(state.store.budget.admittable());
-      // A refusal names what the shard could admit now, the pool's free extents included: the arena claims nothing
-      // for a restore the pool cannot cover (A-98), so the budget alone names only what the shard already holds.
-      let room = volume_cap.min(state.store.admittable());
-      Some(
-        slates_archive::restore(archive, restore_budget).map_err(|e| match e {
-          slates_archive::ArchiveError::OverBudget { .. } => {
-            refused(Refusal::BudgetExceeded { available: room })
-          }
-          other => refused(Refusal::BadRequest {
-            reason: format!("taken-over content archive: {other}"),
-          }),
-        })?,
-      )
-    }
-    None => None,
+  let Some(archive) = archive else {
+    return Ok(None);
   };
+  // A shard that claims its arena lazily makes room for what the restore needs first (A-98); an archive that does not
+  // plan is refused by the restore below, as before.
+  if let Ok(needed) = slates_archive::restore_needed(archive) {
+    state.store.make_room(needed.min(volume_cap));
+  }
+  let restore_budget = volume_cap.min(state.store.budget.admittable());
+  // A refusal names what the shard could admit now, the pool's free extents included: the arena claims nothing
+  // for a restore the pool cannot cover (A-98), so the budget alone names only what the shard already holds.
+  let room = volume_cap.min(state.store.admittable());
+  slates_archive::restore(archive, restore_budget)
+    .map(Some)
+    .map_err(|e| {
+      Box::new(match e {
+        slates_archive::ArchiveError::OverBudget { .. } => {
+          refused(Refusal::BudgetExceeded { available: room })
+        }
+        other => refused(Refusal::BadRequest {
+          reason: format!("taken-over content archive: {other}"),
+        }),
+      })
+    })
+}
+
+/// A taken-over volume made from its restored tree ([`restore_taken_over`]): the admission (byte reservation, inode
+/// allowance) a `create` makes, the volume created under its original id and name and populated, and the tree sealed as
+/// its head snapshot at the adopted sequence ([`materialize_taken_over`]'s doc).
+fn make_restored(
+  state: &mut ShardState,
+  id: DbVolumeId,
+  taken: &TakenOver<'_>,
+  region: Vec<u64>,
+  restored: Option<&slates_archive::Restored>,
+) -> Result<(), Box<ReplyBody>> {
+  let (head, catalog, sequence) = (taken.head, taken.catalog, taken.sequence);
+  let size = taken_over_size(catalog);
   let reservation = match size {
     SizeClass::Bounded { limit } => match state.store.reserve(limit) {
       Ok(r) => Some(r),
@@ -11994,7 +12050,7 @@ pub(crate) fn materialize_taken_over(
       refusal_of_vfs(&e),
     )));
   }
-  if let Some(restored) = &restored
+  if let Some(restored) = restored
     && let Err(e) = populate_restored(&mut state.store, &mut volume, restored)
   {
     let discarded = volume.discard_partial(&mut state.store);
