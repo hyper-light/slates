@@ -217,6 +217,15 @@ pub(crate) fn complete_once_durable(
   }
 }
 
+/// Where the reply of in-flight `request` goes, taken, for a task that hands the request on to another deferral (a
+/// bypass presentation's granted landing, A-285) rather than completing it here.
+pub(crate) fn take_in_flight(
+  state: &mut ShardState,
+  request: (u64, RequestId),
+) -> Option<ReplyRoute> {
+  take_route(state, request)
+}
+
 /// Where the reply of in-flight `request` goes, taken: it is answered once, from here.
 fn take_route(state: &mut ShardState, (origin, id): (u64, RequestId)) -> Option<ReplyRoute> {
   state
@@ -572,6 +581,8 @@ impl BuildJob {
         role: Role::Plain,
         live_shipped: false,
         live_holders: None,
+        write: None,
+        write_version: 0,
       },
       base: BaseRecord::Image {
         volume: self.source,

@@ -7,12 +7,12 @@
 //! namespace operations, submit, rebase, read the chain), the volume lifecycle (create, list, stat,
 //! snapshot, clone, resize, destroy), attach and
 //! detach, the base operations (read_base, digest, rewitness, pin), `slates.status`, and `slates.land`
-//! (materialize, which returns `GrantRequired`). Owed toward the full §4.12: `slates.fs` (the mount
+//! (materialize, which lands as the volume's write policy allows, A-285). Owed toward the full §4.12: `slates.fs` (the mount
 //! path), Streamable HTTP, resources and prompts.
 //!
-//! **No grant, ever (R10).** No tool here creates a landing grant; the grant is a human-only act on
-//! the CLI or a confirmation surface. The server has no grant verb to refuse — it simply does not
-//! offer one, and any `slates.land` tool added later returns `GrantRequired`, never a grant.
+//! **No grant, ever (R10).** No tool here creates or approves a landing grant: the write mode the user gave the
+//! agent decides (A-285) — bypass lands at once, ask returns `GrantRequired` for the launcher to approve, a forbidding
+//! mode is refused — and the launcher, never the agent, sets that mode and approves.
 //!
 //! The wire is JSON-RPC 2.0. A request with an `id` gets a reply; a notification (no `id`) gets none.
 //! A tool call returns `structuredContent` (the machine-readable result) alongside a text `content`
@@ -123,7 +123,7 @@ const META_SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
 const CACHE_TTL_MS: u64 = 0;
 /// The guidance `server/discover` gives a model about this server (MCP 2026-07-28 `DiscoverResult.instructions`):
 /// what the tools do together, not what each does.
-const INSTRUCTIONS: &str = "slates gives each agent its own copy-on-write volume, kept in RAM: create or clone a volume, attach it (a mount path, or read and write through slates.fs), work in it, and bring work together through the merge loop (slates.merge.*). Nothing reaches the host's disk until a human grants a landing; slates.land.materialize only plans one and answers GrantRequired. Volume ids are opaque hex: pass back exactly what a tool returned. A refusal is typed in structuredContent.error; call slates.help for the workflow.";
+const INSTRUCTIONS: &str = "slates gives each agent its own copy-on-write volume, kept in RAM: create or clone a volume, attach it (a mount path, or read and write through slates.fs), work in it, and bring work together through the merge loop (slates.merge.*). What reaches the host's disk follows the write mode your user gave you: under bypass slates.land.materialize writes at once; under ask it answers GrantRequired and writes nothing until your harness approves; a mode that forbids writing is refused. Volume ids are opaque hex: pass back exactly what a tool returned. A refusal is typed in structuredContent.error; call slates.help for the workflow.";
 
 /// JSON-RPC error codes (the standard set plus two in the implementation-defined server range for a
 /// typed refusal from the daemon and an unreachable daemon). These are the JSON-RPC 2.0 wire values,
@@ -526,6 +526,13 @@ impl McpServer {
         Submitted::Conflict(windows) => {
           json!({ "accepted": false, "conflicts": windows_json(&windows) })
         }
+        // A merge an ask write policy holds (A-285): what the launcher's approval binds.
+        Submitted::ApprovalRequired { identity, paths } => json!({
+          "accepted": false,
+          "approval_required": true,
+          "identity": hex32(&identity),
+          "paths": paths,
+        }),
       },
     )
   }
@@ -835,10 +842,10 @@ impl McpServer {
     Ok(daemon_json(&report, &telemetry))
   }
 
-  /// Plans a landing onto a host directory (§4.15). MCP never passes a grant (R10), so the reply is
-  /// `GrantRequired` — the manifest and summary a human reviews, and the `slates grant` command that
-  /// authorizes it — or `Landed` when there is nothing diverged to write. The grant itself is a
-  /// human-only act on the CLI; this tool cannot make one.
+  /// Lands onto a host directory (§4.15) as the volume's write policy allows (A-285). MCP never passes a grant (R10):
+  /// under bypass the daemon grants and lands at once (`Landed`); under ask the reply is `GrantRequired`, the
+  /// manifest and summary the launcher approves; a forbidding mode is refused `PolicyForbids`. The approval is the
+  /// launcher's act; this tool cannot make one.
   fn land_materialize(&mut self, args: &Value) -> Result<Value, McpError> {
     let volume = volume_arg(args, "volume")?;
     let target = string_arg(args, "target")?;
@@ -858,7 +865,6 @@ impl McpServer {
       Landing::GrantRequired {
         landing,
         manifest,
-        nonce: _,
         summary,
         conflicts,
       } => Ok(json!({
@@ -1271,8 +1277,9 @@ fn tool_list() -> Vec<Value> {
     ),
     tool(
       "slates.land.materialize",
-      "Plan a landing of a volume's diverged entries onto a host directory. Returns the manifest and \
-       the `slates grant` command a human runs to authorize it — this tool never grants (R10).",
+      "Land a volume's diverged entries onto a host directory, as the write mode your user gave you allows \
+       (A-285): under bypass it writes at once; under ask it returns the manifest for your harness to approve and \
+       writes nothing; a forbidding mode is refused. This tool never approves (R10).",
       json!({
         "volume": string,
         "target": string,
