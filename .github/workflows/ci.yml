@@ -762,13 +762,14 @@ jobs:
         run: cargo test -p slates-server --lib -- --test-threads=1
       # Landings through the daemon (§4.15, A-185), Unix-only until the Windows writer: presentations (the two landing
       # tests the unit tests once held among them), a target's one lease, a named snapshot's landing, landing fairness,
-      # the write policies (A-285), a green's checkout, signed landings (A-321) and a presentation's fairness, one test
-      # at a time as the other in-process daemon suites here. 46 tests passed in 73 s with their build on windows-latest,
-      # `landing_fairness` the longest at 17.4 s (diag-g085-4, run 44371955995, 2026-11-18).
+      # the write policies (A-285), a green's checkout, signed landings (A-321), a presentation's fairness, a principal's
+      # grants in pages and the replies' bounds, one test at a time as the other in-process daemon suites here.
+      # presentations.rs's 10 tests passed in 2.35 s and the other nine suites' 46 in 73 s with their build on
+      # windows-latest, `landing_fairness` the longest at 17.4 s (diag-g085-4, run 44371955995, 2026-11-18).
       - name: Test landings through the daemon, one test at a time (native Windows)
         if: ${{ !cancelled() }}
         timeout-minutes: 30
-        run: cargo test -p slates-server --test presentations --test lease --test snapshot_landing --test landing_fairness --test write_policy --test checkout --test signed_work --test presentation_fairness -- --test-threads=1
+        run: cargo test -p slates-server --test presentations --test lease --test snapshot_landing --test landing_fairness --test write_policy --test checkout --test signed_work --test presentation_fairness --test grants_pages --test reply_bounds -- --test-threads=1
       # The MCP surface over a live in-process daemon (§4.12), one serial test: the handshake, the merge loop, the volume
       # lifecycle, typed errors, and `slates.land.materialize`, which answered `Unsupported` on Windows until A-185.
       # One test, 2.13 s on windows-latest (diag-g085-4, run 44371955995).
@@ -1193,12 +1194,13 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 20
         run: cargo test -p slates-server --lib -- --test-threads=1
-      # Landings through the daemon, one test at a time, as on x86_64 (A-185): 46 tests passed in 113 s with their build,
-      # `landing_fairness` the longest at 23.0 s (diag-g085-4, run 44371955995).
+      # Landings through the daemon, one test at a time, as on x86_64 (A-185): presentations.rs's 10 tests passed
+      # in 2.69 s and the other nine suites' 46 in 113 s with their build, `landing_fairness` the longest at 23.0 s
+      # (diag-g085-4, run 44371955995).
       - name: Test landings through the daemon, one test at a time (native arm64 Windows)
         if: ${{ !cancelled() }}
         timeout-minutes: 30
-        run: cargo test -p slates-server --test presentations --test lease --test snapshot_landing --test landing_fairness --test write_policy --test checkout --test signed_work --test presentation_fairness -- --test-threads=1
+        run: cargo test -p slates-server --test presentations --test lease --test snapshot_landing --test landing_fairness --test write_policy --test checkout --test signed_work --test presentation_fairness --test grants_pages --test reply_bounds -- --test-threads=1
       # The MCP surface over a live in-process daemon, landing included, as on x86_64 (A-185); 2.08 s (diag-g085-4, run
       # 44371955995).
       - name: Test the MCP surface, landing included (native arm64 Windows)

@@ -40,11 +40,13 @@ landing tests failed on Windows until it landed, since `landing.rs`'s Windows ar
 
 Since 2026-11-18 (A-185, the Windows landing writer) both Windows lanes also run `slates-land` whole, `slates-server`'s
 unit tests one test at a time (368 passed, 3 ignored, in 9.68 s on windows-latest and 16.64 s on windows-11-arm), the
-landing suites through the daemon one test at a time (`presentations`, `checkout`, `landing_fairness`, `lease`,
-`presentation_fairness`, `signed_work`, `snapshot_landing` and `write_policy`), the client's `presentation` and the MCP
-surface (`slates-mcp`'s `mcp`), all passing on both runners (diagnostics run 44371955995, on main 53353e5e8 with the
-change merged). The table's rows for those targets read `all` on Windows; `presentations`, `presentation_fairness`,
-`signed_work` and `write_policy` postdate the table and have no rows.
+landing suites through the daemon one test at a time (`presentations`, `checkout`, `grants_pages`, `landing_fairness`,
+`lease`, `presentation_fairness`, `reply_bounds`, `signed_work`, `snapshot_landing` and `write_policy`: 56 tests), the
+client's `presentation` and the MCP surface (`slates-mcp`'s `mcp`), all passing on both runners (diagnostics run
+44371955995, on main 53353e5e8 with the change merged; `grants_pages` has grown by portable tests since). The table's
+rows for those targets read `all` on Windows; `presentations`, `grants_pages`, `presentation_fairness`, `reply_bounds`,
+`signed_work` and `write_policy` postdate the table and have no rows. `audit_crossing` (main's, 2026-11-18) is gated
+to Unix only for its landing target and has not run on Windows yet, so it keeps its gate until it has.
 
 Since 2026-11-18 both Windows lanes also run `crates/server/tests/liveness.rs` (the daemon's liveness beat, A-228), one test
 at a time: 12 tests pass, the 6 child roles ignored, in 51-52 s on windows-latest and 57-58 s on windows-11-arm, three runs

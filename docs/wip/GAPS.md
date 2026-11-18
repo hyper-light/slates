@@ -18202,7 +18202,9 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   before any open (A-227). The 2026-10-26 finding that base modes were raw attributes was fixed meanwhile by A-262.
   Red-checked on windows-latest (run 44367207034): the `ARCHIVE` set-aside and the default owner each; the own-drive
   refusal passes on both runners (run 44376034930), its red-check filed for main's run.
-  **Owed:** a symbolic link in a landing on Windows (refused `EPERM`: no unprivileged, handle-relative way to make one);
+  **Owed:** `crates/server/tests/audit_crossing.rs` (main's, 2026-11-18) is gated to Unix only for its landing target
+  and has not run on Windows: lift its gate once a Windows run passes it; a symbolic link in a landing on Windows
+  (refused `EPERM`: no unprivileged, handle-relative way to make one);
   a reflink (`FSCTL_DUPLICATE_EXTENTS_TO_FILE` on ReFS); A-262's landing half (the volume's other attribute bits); and
   the seam's numbering: refusals the engine tells apart are POSIX numbers and the rest Win32 codes, so a Win32 code equal
   to one of the engine's numbers (`ERROR_NOT_SAME_DEVICE` 17, `ERROR_INSUFFICIENT_BUFFER` 122, among five) would read as

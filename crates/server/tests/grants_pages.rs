@@ -9,8 +9,7 @@
   clippy::indexing_slicing,
   clippy::unwrap_in_result
 )]
-// A landing presented into a real target directory: macOS and Linux.
-#![cfg(unix)]
+// A landing presented into a real target directory, on every platform since the Windows writer (A-185).
 
 use std::collections::BTreeSet;
 
