@@ -7386,6 +7386,17 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   `a_superseded_owner_ships_nothing_more_of_the_volume_it_lost` (`crates/server/tests/fleet.rs`). Owed (GAPS): the round's
 >   adoption there meets the node's own superseded copy, which a takeover must replace (A-334's re-adoption); a lane that
 >   ends on a refusal is sent again at once.
+> - **A takeover that named a node again kept its superseded copy (fixed 2026-11-18, A-362).** With A-349 the old owner's
+>   round adopts the objects that fall to it, the volume's home among them, and its materialization found the id present
+>   and returned: the node kept its stale copy, missing the successor's acknowledged writes, its fenced shipper (so it
+>   never shipped at the new epoch) and its yield (so every verb went away from it, its new owner). Now a copy the node
+>   lost to a successor (`verbs::lost_to_a_successor`) is relinquished to the takeover that names it again
+>   (`verbs::relinquish_superseded`): its attachments end, its record goes with no tombstone and no key erased
+>   (`Op::VolumeRelinquished`), its slot leaves the tables for the reaper's destroy slices, its shipper, fence and yield
+>   are forgotten, and the shard's image is published without it before the adopted state is made under its id, so a
+>   restart in between rebuilds nothing stale. Held by `a_takeover_that_names_this_node_again_replaces_its_superseded_copy`
+>   (`crates/server/src/verbs.rs`) and `a_relinquished_volume_is_made_again_under_its_id_and_keeps_its_key`
+>   (`crates/db/tests/model.rs`).
 
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
@@ -8630,6 +8641,13 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > `the_spin_window_is_the_budget_held_to_the_builds_measured_cost` (`crates/server/src/watchdog.rs`),
 > `a_poll_slower_than_the_budget_within_the_builds_spin_window_keeps_the_beat` (`crates/server/tests/liveness.rs`), and
 > the build-cost tests (`crates/machine/src/build_cost.rs`).
+
+> **Status (2026-11-18, A-356): the anchor's start judgment and a wait judged in a shard's own CPU are held to the build
+> too.** The anchor measures the build in its own process, the executable its daemon runs, and judges a start's busiest
+> thread against the spin window; an observation's or a cross-shard call's budget is the budget held to the build in
+> CPU, its windows at most the budget on the wall (`observe::held_to_this_build`). Regressions:
+> `a_starts_thread_is_judged_spinning_only_past_the_window_held_to_its_build`,
+> `a_shard_in_a_slower_build_is_given_its_budget_held_to_the_build`.
 
 > **Status (2026-11-18, A-336): a shard waiting on memory while the host reports a memory stall is starved, not
 > wedged.** A thread waiting on a page-in, a reclaim or a refault is neither running nor runnable, as a deadlocked one
@@ -24975,7 +24993,8 @@ Applied in the same change to: §4.14 `daemon.alive` (status), GAPS (2026-11-18 
   refused, and the budget stands. Measured once a process: the binary does not change while it runs.
 - **What it does not change.** The wedged and starved judgments (wall time, the budget), the anchor's lapse judgment,
   the beat, and a release build's window (its chain runs at machine code's speed, so the budget stands). Under Miri, which
-  runs no machine code and has no thread clock, the watchdog judges by the wall as before.
+  runs no machine code and has no thread clock, the watchdog judges by the wall as before. (A-356 holds the anchor's
+  judgment of a start's thread and the CPU budget of a wait judged in a shard's own time to the build too.)
 
 ### A-330 — A node announces its record plane where it advertises it, never at its bound port (2026-11-18, goal g229, the chaos flows' first runs; completes A-277)
 Applied in the same change to: §4.8 "Deployment" (what a node announces), §4.10's chaos status, GAPS ("Chaos from
@@ -26027,6 +26046,62 @@ Applied in the same change to:
     `anchor_hold_windows.rs` `HOLD_BUDGET_NS`, `RELEASE_ATTEMPT_NS`; `held_copy.rs` `reconnect_budget_ns`.
 - **Evidence.** The values are unchanged (1 s and 100 ms), so nothing a test asserts moves; the derivation's check is
   the unit test above. The sweep is `git grep -n LIVENESS_BUDGET_NS -- 'crates/*/src'` at `0019cd510`, each site read.
+
+### A-362 — A takeover that names a node again relinquishes the node's superseded copy and makes the volume from the state it adopted (2026-11-18, kiln goal g250; §4.8 "Promotion and takeover", "persistence before reply"; A-334, A-338, A-343, A-349)
+
+- **What was there.** `verbs::materialize_taken_over` returned at once for a volume the node already held, so a retry
+  after a refused publication kept the copy it had made (A-343). A node can also hold a copy it lost: its log fenced at a
+  later epoch (A-338) or yielded at its re-admission (A-334). When the volume's successor departs in turn and its objects
+  fall to that node again (the volume's home ranks it first), the takeover adopted the newest registers and then kept
+  the stale copy, which lacks every write the successor acknowledged, under a fence that stops its shipper and a yield
+  that sends every verb away. A-334 recorded this as owed; the chaos nemesis (seed 6876545201569229162) meets it once
+  A-349 lets the round adopt.
+- **The rule.** A copy lost to a successor is relinquished to the takeover that names its node again, then the volume is
+  made from the adopted state as for any successor (`verbs::relinquish_superseded`):
+  - its attachments end (their clients were being sent to the successor);
+  - its record goes by `Op::VolumeRelinquished` (appended): `remove_volume`'s work and none of a destroy's, so no
+    tombstone holds the id (the volume lives on here) and no key is erased (the adopted lineage is the volume's own);
+  - its guest devices, streams and snapshot views end, and its slot leaves the tables for the reaper's destroy slices
+    (`ShardState::relinquished`, bounded by the partition's volumes), its credits given back when done;
+  - its shipper and the fence it kept are forgotten, its yield and any unrecovered mark lifted;
+  - the shard's image is published without it before the adopted state is made, so a restart between the two finds the
+    old image with no record (torn down as an orphan) or the new record with no image (answered not recovered, typed),
+    never the stale copy under the new record. A refused publication leaves the materialization pending; its next
+    attempt finds the id gone and makes the volume.
+  A copy the same takeover made is kept, as before (it is not lost to a successor).
+- **Counters.** `fleet.takeover.relinquished`, `fleet.takeover.relinquished_freed`,
+  `fleet.takeover.relinquish_unpublished`.
+- **Owed (GAPS).** A guest device or a Shards stream still serving the stale copy is ended, not waited for as a destroy
+  waits, since the adopted state takes the id at once.
+
+Held by `a_takeover_that_names_this_node_again_replaces_its_superseded_copy` (`crates/server/src/verbs.rs`: a copy
+holding `OLD!` yielded, then a takeover at a later epoch from `NEW!`; red with the relinquish removed, the file read
+`OLD!` and the volume still lost to a successor) and `a_relinquished_volume_is_made_again_under_its_id_and_keeps_its_key`
+(`crates/db/tests/model.rs`: no tombstone, the key kept, recovery agreeing; a destroyed volume's id refused), with the
+relinquish a step of the db model's histories.
+
+Applied in the same change to: §4.10 (the chaos flows' status), A-334's owed line (`crates/server/src/readmission.rs`),
+GAPS (the nemesis entry), `crates/db/src/{op,partition}.rs`, `crates/db/tests/{model.rs,wire_order.txt}`,
+`crates/server/src/{verbs,state,daemon}.rs`.
+
+### A-356 — The anchor's judgment of a start's thread and a wait judged in a shard's own CPU are held to the build, as A-318 holds a poll (2026-11-18, goal g251: every open slates bug fixed; A-318's siblings)
+Applied in the same change to: §4.14 (A-318's note), GAPS (A-318's entry: its siblings closed),
+`crates/api/src/role/anchor.rs` (`start_spin_window_ns`, `judge_start_by`'s window, the anchor's start line),
+`crates/server/src/observe.rs` (`held_to_this_build`, `OwnTime::cpu_budget_ns`, `unspent_at`).
+- **Why.** A-318 held the daemon's watchdog to the build: a poll's CPU is judged against the liveness budget scaled by
+  how much slower the build runs compiled code than the machine runs the same work in machine code. Two judgments in
+  CPU time were left at the bare budget. The anchor kills a start whose busiest thread runs a window of CPU without a
+  beat (A-228, A-312), and a start's unit of work (a registration, a pair ring) runs its build's slowdown's worth of
+  CPU as a poll does. A wait judged in a shard's own time (an observation, a cross-shard call, A-65) ends once a busy
+  shard has run its budget of CPU without answering, and a shard busy with the same work runs that much more CPU in a
+  slower build. ThreadSanitizer's builds run 17.9 to 35.3 times machine code on CI's runners.
+- **The rule.** The anchor measures the build in its own process (`slates_machine::build_cost`, once, before any start
+  is judged) and judges a start's thread against the spin window (`watchdog::spin_window_ns`): the anchor runs the
+  executable it starts its daemon from (the roles' prefix, A-278), so its build is its daemon's. A wait judged in a
+  shard's own time gives the shard the budget held to the build in CPU; each of its windows stays at most the budget on
+  the wall, so a shard that stops is judged within a budget of stopping, as before.
+- **What it does not change.** A release build (its chain runs at machine code's speed), the wedged and starved
+  judgments on the wall, the anchor's lapse bound and the beat.
 
 ### A-353 — A takeover round started over under a newer configuration keeps its epoch over the objects it adopted (2026-11-18, g230, scale-out; §4.8 "Promotion and takeover"; the lossy flow's post-takeover hang)
 Applied in the same change to:
