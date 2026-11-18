@@ -1575,7 +1575,7 @@ impl<H: LandFs> Landing<'_, H> {
         let dir = self.open_dir_path(dir_path)?;
         let mode = entry.overlay.map_or(STAGE_MODE, |o| o.mode);
         self.touched.insert(dir_path.into());
-        match self.host.mkdir(dir, name, mode) {
+        match self.host.mkdir(dir, name, mode, entry.windows.bits()) {
           Ok(()) => Outcome::Written,
           Err(HostError::Unavailable(ERRNO_EXIST)) => self.existing_directory(dir, name)?,
           Err(e) => return Err(e.into()),
@@ -1587,7 +1587,7 @@ impl<H: LandFs> Landing<'_, H> {
         // Where a writer that makes a link in two steps stages it (Windows, A-438): this landing's own hidden name,
         // which its sweep removes after a crash between the steps.
         let staged = self.hidden_name();
-        match self.host.symlink(dir, name, target, &staged) {
+        match self.host.symlink(dir, name, target, &staged, entry.windows.bits()) {
           Ok(()) => Outcome::Written,
           Err(HostError::Unavailable(ERRNO_EXIST)) => Outcome::Conflict(ConflictClass::TargetInUse),
           Err(e) => return Err(e.into()),
@@ -1765,6 +1765,7 @@ impl<H: LandFs> Landing<'_, H> {
     let filled = self
       .host
       .set_mode(copy.temp, copy.overlay.mode)
+      .and_then(|()| self.host.set_windows(copy.temp, entry.windows.bits()))
       .and_then(|()| self.host.set_mtime(copy.temp, copy.overlay.mtime_ns))
       .and_then(|()| self.host.write_out(copy.temp));
     if let Err(e) = filled {
@@ -2214,7 +2215,7 @@ impl<H: LandFs> Landing<'_, H> {
     let mode = entry.overlay.map_or(STAGE_MODE, |o| o.mode);
     match self.verify_dir(dir, name, entry.witnessed.as_ref())? {
       None => {
-        let outcome = match self.host.mkdir(dir, name, mode) {
+        let outcome = match self.host.mkdir(dir, name, mode, entry.windows.bits()) {
           Ok(()) => Outcome::Written,
           Err(HostError::Unavailable(ERRNO_EXIST)) => Outcome::Conflict(ConflictClass::TargetInUse),
           Err(e) => return Err(e.into()),
@@ -2237,7 +2238,7 @@ impl<H: LandFs> Landing<'_, H> {
     // The fresh directory takes the entry's aside name: the exchange leaves the displaced directory under
     // it, and a sweep after a crash checks it before removing it (AUD-29-04).
     let fresh = self.aside_name(&path);
-    self.host.mkdir(dir, &fresh, mode)?;
+    self.host.mkdir(dir, &fresh, mode, entry.windows.bits())?;
     // The fresh directory's identity, taken while only this landing's hidden name holds it.
     let made = self.host.entry_fingerprint(dir, &fresh)?;
     if !self.exchange_names(dir, &fresh, name)? {

@@ -17,7 +17,7 @@ use slates_vfs::dir::Child;
 use slates_vfs::error::VfsError;
 use slates_vfs::host::HostFs;
 use slates_vfs::ids::InodeNo;
-use slates_vfs::inode::{Fingerprint, Kind, Witness};
+use slates_vfs::inode::{Fingerprint, Kind, WindowsAttributes, Witness};
 use slates_vfs::names::NameEquivalence;
 use slates_vfs::volume::{Store, Volume};
 
@@ -30,11 +30,13 @@ fn under(path: &str, prefix: &str) -> bool {
 
 /// Format: the manifest encoding's magic and version.
 const MAGIC: &[u8; 4] = b"SLMF";
-/// Format: the encoding version; bumped with any change to the layout.
-const VERSION: u16 = 1;
+/// Format: the encoding version; bumped with any change to the layout. 3 since A-451, each entry closed by the volume's
+/// Windows attribute bits (1 had none, and 2 is [`VERSION_CONTENT`]'s old number): a grant binds the bits it lands.
+const VERSION: u16 = 3;
 /// Format: the encoding version of a manifest judged by content ([`Judged::Content`], A-291): the layout of
-/// [`VERSION`] with each witness tagged [`WITNESS_CONTENT`], so no grant of one binds a manifest of the other.
-const VERSION_CONTENT: u16 = 2;
+/// [`VERSION`] with each witness tagged [`WITNESS_CONTENT`], so no grant of one binds a manifest of the other. 4 since
+/// A-451, with the bits, as [`VERSION`].
+const VERSION_CONTENT: u16 = 4;
 /// Format: a witness tag: none.
 const WITNESS_NONE: u8 = 0;
 /// Format: a witness tag: a fingerprint and an identity ([`Judged::Witness`]).
@@ -141,6 +143,10 @@ pub struct LandingEntry {
   pub overlay: Option<OverlayIdentity>,
   /// How its verdict judges the disk.
   pub judged: Judged,
+  /// The Windows attribute bits the volume keeps for what it writes (A-262, at Windows' own values): hidden, system,
+  /// archive, offline, not indexed, a directory's read-only, and a link's directory kind. A Windows landing applies them
+  /// (A-451); Linux and macOS hold none. None for an entry that writes nothing (a delete, a rename, a removal).
+  pub windows: WindowsAttributes,
 }
 
 impl LandingEntry {
@@ -257,6 +263,7 @@ impl Manifest {
         }
         None => out.push(0),
       }
+      out.extend_from_slice(&e.windows.bits().to_le_bytes());
     }
     out
   }
@@ -587,7 +594,7 @@ fn tree_identity(
 fn captured_identity(store: &Store, base: FrozenTree, held: &Held) -> Result<[u8; 32], VfsError> {
   match held {
     Held::File { no, size, .. } => tree_identity(store, base, *no, *size),
-    Held::Symlink { target } => Ok(*blake3::hash(target.as_bytes()).as_bytes()),
+    Held::Symlink { target, .. } => Ok(*blake3::hash(target.as_bytes()).as_bytes()),
     Held::Absent | Held::Dir { .. } | Held::Special => Ok([0; 32]),
   }
 }
@@ -605,14 +612,17 @@ fn capture_entries(
 ) -> Result<Vec<LandingEntry>, VfsError> {
   let was = slates_vfs::captured::held_at(store, base, policy, path)?;
   let now = slates_vfs::captured::held_at(store, source, policy, path)?;
-  let entry =
-    |action: Action, witnessed: Option<Witness>, overlay: Option<OverlayIdentity>| LandingEntry {
-      path: path.into(),
-      action,
-      witnessed,
-      overlay,
-      judged: Judged::Content,
-    };
+  let entry = |action: Action,
+               witnessed: Option<Witness>,
+               overlay: Option<OverlayIdentity>,
+               windows: WindowsAttributes| LandingEntry {
+    path: path.into(),
+    action,
+    witnessed,
+    overlay,
+    judged: Judged::Content,
+    windows,
+  };
   match (&was, &now) {
     (Held::Absent, Held::Absent) | (Held::Dir { .. }, Held::Dir { .. }) => Ok(Vec::new()),
     (
@@ -622,6 +632,7 @@ fn capture_entries(
         size,
         mode,
         mtime_ns,
+        windows,
       },
     ) => {
       let captured = captured_identity(store, base, &was)?;
@@ -638,10 +649,14 @@ fn capture_entries(
             mode: *mode,
             mtime_ns: *mtime_ns,
           }),
+          *windows,
         )]
       })
     }
-    (Held::Symlink { target: before }, Held::Symlink { target }) => Ok(if before == target {
+    (
+      Held::Symlink { target: before, .. },
+      Held::Symlink { target, windows },
+    ) => Ok(if before == target {
       Vec::new()
     } else {
       vec![entry(
@@ -650,15 +665,16 @@ fn capture_entries(
         },
         None,
         None,
+        *windows,
       )]
     }),
     _ => {
       let mut out = Vec::new();
       if let Some((action, witness)) = removal_of(store, base, &was)? {
-        out.push(entry(action, Some(witness), None));
+        out.push(entry(action, Some(witness), None, WindowsAttributes::default()));
       }
-      if let Some((action, overlay)) = made_entry(store, source, &now)? {
-        out.push(entry(action, None, overlay));
+      if let Some((action, overlay, windows)) = made_entry(store, source, &now)? {
+        out.push(entry(action, None, overlay, windows));
       }
       Ok(out)
     }
@@ -682,12 +698,12 @@ fn removal_of(
   })
 }
 
-/// What making `held` writes: its action and, for a file or directory, its identity.
+/// What making `held` writes: its action, for a file or directory its identity, and its Windows bits (A-451).
 fn made_entry(
   store: &Store,
   source: FrozenTree,
   held: &Held,
-) -> Result<Option<(Action, Option<OverlayIdentity>)>, VfsError> {
+) -> Result<Option<(Action, Option<OverlayIdentity>, WindowsAttributes)>, VfsError> {
   Ok(match held {
     Held::Absent => None,
     Held::File {
@@ -695,6 +711,7 @@ fn made_entry(
       size,
       mode,
       mtime_ns,
+      windows,
     } => Some((
       Action::Create,
       Some(OverlayIdentity {
@@ -703,8 +720,13 @@ fn made_entry(
         mode: *mode,
         mtime_ns: *mtime_ns,
       }),
+      *windows,
     )),
-    Held::Dir { mode, mtime_ns } => Some((
+    Held::Dir {
+      mode,
+      mtime_ns,
+      windows,
+    } => Some((
       Action::Mkdir,
       Some(OverlayIdentity {
         hash: [0; 32],
@@ -712,12 +734,14 @@ fn made_entry(
         mode: *mode,
         mtime_ns: *mtime_ns,
       }),
+      *windows,
     )),
-    Held::Symlink { target } => Some((
+    Held::Symlink { target, windows } => Some((
       Action::Symlink {
         target: target.clone(),
       },
       None,
+      *windows,
     )),
     Held::Special => return Err(VfsError::SpecialFileOperation),
   })
@@ -761,6 +785,7 @@ fn entry_for(
         witnessed,
         overlay: None,
         judged: Judged::Witness,
+        windows: WindowsAttributes::default(),
       }))
     }
     Divergence::Redirect => {
@@ -779,6 +804,7 @@ fn entry_for(
         witnessed,
         overlay: None,
         judged: Judged::Witness,
+        windows: WindowsAttributes::default(),
       }))
     }
     Divergence::Created | Divergence::Witnessed => {
@@ -811,6 +837,7 @@ fn entry_for(
               mtime_ns: attrs.mtime,
             }),
             judged: Judged::Witness,
+            windows: source.windows(vol, store, located.inode)?,
           }))
         }
         Child::Symlink(no) => Ok(Some(LandingEntry {
@@ -821,6 +848,7 @@ fn entry_for(
           witnessed: None,
           overlay: None,
           judged: Judged::Witness,
+          windows: source.windows(vol, store, no)?,
         })),
         Child::Fifo(_) | Child::Socket(_) | Child::BlockDevice(_) | Child::CharDevice(_) => {
           Err(VfsError::SpecialFileOperation)
@@ -847,6 +875,7 @@ fn entry_for(
               mtime_ns: attrs.mtime,
             }),
             judged: Judged::Witness,
+            windows: source.windows(vol, store, no)?,
           }))
         }
         Child::Whiteout => Ok(None),

@@ -18626,13 +18626,23 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   and has not run on Windows: lift its gate once a Windows run passes it; a symbolic link in a landing on Windows,
   **built by A-438 the same day** (the Windows link in A-275's form, handle-relative, staged and moved into place, the
   privilege enabled for its thread alone where the process holds it; its Windows test filed for main's lanes; still
-  owed with it: a directory link's type, which the seam does not carry, a Windows base reading a link back in A-275's
-  `/` form rather than its print name's `\`, and the Developer Mode route for an account without the privilege,
-  measured); a reflink (`FSCTL_DUPLICATE_EXTENTS_TO_FILE` on ReFS), **built by A-445 the same day** for the batch's
+  owed with it: a Windows base reading a link back in A-275's `/` form rather than its print name's `\` (the base
+  plane's own map, its own piece), and the Developer Mode route for an account without the privilege, measured; a
+  directory link's type, which the seam did not carry, **built by A-451**); a reflink
+  (`FSCTL_DUPLICATE_EXTENTS_TO_FILE` on ReFS), **built by A-445 the same day** for the batch's
   own duplicates (§4.15 step 6's rule, the batch as the hash index; ReFS and a Dev Drive in whole-cluster regions
   under 4 GiB; its Windows test over a ReFS directory and the oracle's filed for main's lanes; still owed with it:
   Linux's `FICLONE` and macOS's `clonefile`, duplicates across batches, and the measured gain); A-262's landing half
-  (the volume's other attribute bits); and
+  (the volume's other attribute bits), **built by A-451 the same day** (each manifest entry carries the bits, bound by
+  the grant; the Windows writer gives each file, directory and link it makes those bits and reads the word back,
+  refusing the entry `EOPNOTSUPP` where the target's file system did not take one, as FAT drops `OFFLINE` and
+  `NOT_CONTENT_INDEXED`; a directory link lands as one; its unit tests ran on the Mac Studio, its Windows test and two
+  oracle tests filed for main's lanes; still owed with it: a change of an untouched base file's bits alone lands
+  nothing, since a landing judges a base file by its bytes and passes the copy-up's entry `Skip`, as it passes a change
+  of its mode alone, which §4.15 step 1 names among what a landing carries, and a captured clone's entry likewise
+  compares content alone; a directory's bits, like a Unix directory's mode, are given after it is made, so a crash
+  between the two leaves it without them and a resumed landing takes it as already there; and the presented entry list
+  (`PlannedEntry`, §4.15 step 2) shows each entry's mode and not its bits, which the grant now binds); and
   the seam's numbering: refusals the engine tells apart are POSIX numbers and the rest Win32 codes, so a Win32 code equal
   to one of the engine's numbers (`ERROR_NOT_SAME_DEVICE` 17, `ERROR_INSUFFICIENT_BUFFER` 122, among five) would read as
   that refusal; none of the writer's calls is known to answer one, and a typed refusal at the seam would close it.

@@ -9908,17 +9908,21 @@ stays in the overlay.
 > from its drive's root one component at a time, refusing a link, a junction or a mount point; a target on one of this
 > daemon's own WinFsp drives is refused before any open (A-227); and it must be owned by this user. A file's mode sets
 > or clears its `READONLY` bit alone (A-262: a file's read-only state is its mode), every other attribute bit kept.
-> Not built: the volume's other Windows attribute bits, which a landing carries and does not yet apply (A-262's landing
-> half). Built on 2026-10-26 by another session and landed on 2026-11-18; the evidence is A-185's. **Since A-438 (the same
+> Built on 2026-10-26 by another session and landed on 2026-11-18; the evidence is A-185's. **Since A-438 (the same
 > day)** a symbolic link lands as the Windows one, in A-275's form (`slates_vfs::host::windows_link`, the drive's own),
 > made handle-relative at the landing's hidden name and moved into place without replacing, its buffer set with
 > `SeCreateSymbolicLinkPrivilege` enabled for its thread alone where the process holds it; where NTFS refuses the set (a
-> standard account outside Developer Mode) the entry fails `EPERM`, typed, as every link did before. A link lands as a
-> file link: the seam carries no link's type. **Since A-445 (the same day)** step 6's reflink is built: a file whose
-> bytes its batch already staged (the same BLAKE3 and length) is cloned from that temporary where the target's volume
-> shares clusters (`LandFs::clone_temp`; on Windows ReFS and a Dev Drive, `FSCTL_DUPLICATE_EXTENTS_TO_FILE` in
-> whole-cluster regions below 4 GiB from the volume's own cluster), its count in the report (`cloned`); NTFS shares
-> nothing, so nothing changes there.
+> standard account outside Developer Mode) the entry fails `EPERM`, typed, as every link did before. **Since A-445 (the
+> same day)** step 6's reflink is built: a file whose bytes its batch already staged (the same BLAKE3 and length) is
+> cloned from that temporary where the target's volume shares clusters (`LandFs::clone_temp`; on Windows ReFS and a Dev
+> Drive, `FSCTL_DUPLICATE_EXTENTS_TO_FILE` in whole-cluster regions below 4 GiB from the volume's own cluster), its
+> count in the report (`cloned`); NTFS shares nothing, so nothing changes there. **Since A-451 (the same day)** a landing
+> carries the volume's other Windows attribute bits (A-262's landing half): each manifest entry holds the bits the volume
+> keeps for what it writes, so the grant binds them, and the Windows writer gives each file, directory and link it makes
+> those bits (`LandFs::set_windows`, the `mkdir` and `symlink` verbs; `crates/land/src/windows_bits.rs`), reads the word
+> back and refuses the entry `EOPNOTSUPP` where the target's file system did not take a bit (FAT drops `OFFLINE` and
+> `NOT_CONTENT_INDEXED` without a word). A directory link (A-275's `LINK_DIRECTORY`) lands as a directory link, its
+> object made a directory. Linux and macOS hold none of the bits and apply none.
 
 > **Status (2026-09-29, A-47, AUD-29-03).** One host target has one landing lease, whichever shard owns
 > the landing volume and whichever spelling names the target. Before, each owner shard kept its own lease
@@ -19592,7 +19596,7 @@ overwrite, `SetBasicInfo`, `CanDelete` and rename in `host.rs`).
   npm, pip and cargo trees, before and after). The image's inode gains two bytes (layout version 23, the delta's 6), with
   a reviewed golden vector (`an_inode_images_encoding_is_its_golden_vector`). WinFsp's wire already carries the word.
 - **What other platforms do with them.** NFS, FUSE and FSKit expose none and set none. A Linux or macOS landing carries
-  them in the volume and applies none (not yet built on any platform; below). An overlay reports none of them for a
+  them in the volume and applies none; a Windows landing applies them since A-451 (below). An overlay reports none of them for a
   file whose disk attributes it never read: no bit, so `NORMAL`, or `READONLY` from the mode. Since stage 3's base half
   an overlay of a Windows directory reads them from its disk; an overlay of a Linux or macOS directory has none to read.
 - **Each stage's state.**
@@ -19610,10 +19614,11 @@ overwrite, `SetBasicInfo`, `CanDelete` and rename in `host.rs`).
     It also fixes what stage 1 would have exposed: the Windows base had reported the attribute word itself as the mode, so
     an ordinary file (`ARCHIVE`, `0x20`) read as `0o040`, which the drive would have reported read-only and refused to
     delete (`docs/bugs/2026-11-08-a-windows-base-files-mode-was-its-attribute-word.md`).
-  - **Stage 3's landing half, owed:** a Windows landing applying the bits (`SetFileAttributesW`). The Windows landing
-    writer exists since A-185 (2026-11-18): it sets a file's `READONLY` from its mode and keeps every other bit the file
-    holds (NTFS's `ARCHIVE` on a file it writes), and applies none of the volume's. Linux and macOS landings carry the
-    bits in the volume and apply none.
+  - **Stage 3's landing half, built 2026-11-18 (A-451):** a Windows landing gives each file, directory and link it
+    makes the bits the volume keeps for it, a file's `READONLY` still its mode's, reads the word back and refuses the
+    entry `EOPNOTSUPP` where a bit did not take; a directory link lands as a directory link. The manifest carries the
+    bits, so a grant binds them. Linux and macOS landings carry the bits in the volume and apply none. A change of an
+    untouched base file's bits alone lands nothing, as a change of its mode alone lands nothing (GAPS).
   - **Stage 2, owed when works are mountable:** the merge's metadata dimension, the bits merged as the mode is, accept,
     identical or conflict, never inferred (D-27). No work can set the bits today (below), so no merge can drop them.
 - **Invisible to the merge and the landing until then (checked 2026-11-08).** A work's increment is composed from the
@@ -19622,9 +19627,10 @@ overwrite, `SetBasicInfo`, `CanDelete` and rename in `host.rs`).
   from its volume's journal, and the volume's ops document carries none of them
   (`windows_attribute_bits_are_invisible_to_the_ops_document_until_the_merge_carries_them`, `crates/vfs/tests/derive.rs`:
   a bits-only work derives the unchanged document byte for byte, and a rewrite derives the same with or without them).
-  A landing ignores them without error (`a_landing_ignores_windows_attribute_bits_without_error`,
-  `crates/land/tests/oracle.rs`: §4.15's worked example with the bits on an edited, a created and an untouched base file
-  lands `Done` and leaves the same disk, writing as many entries as without).
+  A landing ignored them without error until A-451 carried them
+  (`a_landing_carries_windows_attribute_bits_and_writes_the_same_bytes`, `crates/land/tests/oracle.rs`: §4.15's worked
+  example with the bits on an edited, a created and an untouched base file lands `Done` and leaves the same bytes,
+  writing as many entries as without, the edited and created files holding the bits).
 - **Proven** by `windows_attributes_survive_an_image_and_a_rebuild` and the golden vector (`crates/vfs/tests/recover.rs`),
   `setattr_keeps_the_windows_attribute_bits_for_each_kind` (`crates/bridge-core/tests/volume_bridge.rs`; red with the
   bridge's setter removed: the file reported 32 where 6 was set), `windows_attribute_bits_ask_for_the_owner`, the
@@ -30738,7 +30744,7 @@ argument), and `unsafe-budget.toml` (`slates-land` 23 → 29).
   Windows-absolute one under `\??\`, a POSIX-absolute one unchanged (it resolves to nothing, as on the drive). A link
   lands as a file link, as A-275 presents a link POSIX made: the seam carries no link's type, so a directory link
   Windows made in the volume (`LINK_DIRECTORY`) lands as a file link until the volume's other attribute bits reach a
-  landing (A-185's owed list).
+  landing (A-185's owed list; since A-451 they do, and it lands as a directory link).
 - **The writer.** The empty object is made at the landing's own hidden name (`NtCreateFile` with `FILE_CREATE` and
   `FILE_OPEN_REPARSE_POINT`, relative to the parent's handle). Its buffer is set, then it is moved to its name with the
   rename that never replaces, so the name never holds half a link. Whatever refuses a step, the object is removed;

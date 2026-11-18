@@ -695,6 +695,113 @@ fn a_landed_file_keeps_its_archive_bit_and_takes_read_only_from_its_mode() {
   );
 }
 
+/// Format: `FILE_ATTRIBUTE_HIDDEN` (winnt.h).
+#[cfg(windows)]
+const HIDDEN: u32 = 0x2;
+/// Format: `FILE_ATTRIBUTE_SYSTEM` (winnt.h).
+#[cfg(windows)]
+const SYSTEM: u32 = 0x4;
+
+/// A-451 (the volume's Windows bits land, and a directory link as a directory link). Do: land into an empty real
+/// directory on NTFS a scratch volume holding a directory the drive made read-only and hidden, a file in it the drive
+/// made system and hidden, and the relative link `/to_d` to `d` that Windows made as a directory link (the link skipped
+/// loudly where this account may not make one: no privilege and no Developer Mode). Expect the landing `Done` with
+/// every entry written; the directory holding `READONLY | HIDDEN`; the file `SYSTEM | HIDDEN` and `ARCHIVE` (the rename
+/// that places it sets that bit) and not `READONLY` (its mode can write); the link a Windows directory symbolic link
+/// whose target reads `d`, the file listed through it; and no hidden name left. Before A-451 the bits stayed in the
+/// volume and a directory link landed as a file link.
+#[cfg(windows)]
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn the_volumes_windows_bits_land_and_a_directory_link_lands_as_one() {
+  use std::os::windows::fs::FileTypeExt;
+  use slates_vfs::inode::{Kind, WindowsAttributes};
+  let ram = build_output();
+  let ws = Workspace::new(&ram, "windows-bits");
+  seed_dir(&ws.path.join("out"));
+  let probe = ws.path.join("probe");
+  let links = match std::os::windows::fs::symlink_dir("out", &probe) {
+    Ok(()) => {
+      std::fs::remove_dir(&probe).unwrap();
+      true
+    }
+    Err(refused) if refused.raw_os_error() == Some(PRIVILEGE_NOT_HELD) => {
+      eprintln!(
+        "skipped, the link part: this account may not make a symbolic link (no SeCreateSymbolicLinkPrivilege, no Developer Mode)"
+      );
+      false
+    }
+    Err(refused) => panic!("the probe link: {refused}"),
+  };
+  let (mut host, target) = OsLand::open_target(&ws.path.join("out")).unwrap();
+  let mut store = store();
+  let mut vol = scratch(&mut store);
+  mkdir(&mut vol, &mut host, &mut store, "/d");
+  write_file(&mut vol, &mut host, &mut store, "/d/f.rs", b"in a hidden directory");
+  let mut marks = vec![
+    ("/d", READONLY | HIDDEN, Kind::Dir),
+    ("/d/f.rs", SYSTEM | HIDDEN, Kind::File),
+  ];
+  if links {
+    symlink(&mut vol, &mut host, &mut store, "/to_d", "d");
+    marks.push((
+      "/to_d",
+      u32::from(WindowsAttributes::LINK_DIRECTORY),
+      Kind::Symlink,
+    ));
+  }
+  for (path, bits, kind) in marks {
+    common::set_windows_bits(&mut vol, &mut host, &mut store, path, bits, kind);
+  }
+  let mut session = Session::new();
+  let mut setup = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  };
+  let report = setup.land(request(1)).unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert!(
+    report
+      .entries
+      .iter()
+      .all(|entry| entry.outcome == Some(Outcome::Written)),
+    "{report:?}"
+  );
+  let out = ws.path.join("out");
+  let directory = attributes_of(&out.join("d"));
+  assert_eq!(
+    directory & (READONLY | HIDDEN | SYSTEM),
+    READONLY | HIDDEN,
+    "the directory's attributes: {directory:#x}"
+  );
+  let file = attributes_of(&out.join("d").join("f.rs"));
+  assert_eq!(
+    file & (READONLY | HIDDEN | SYSTEM | ARCHIVE),
+    SYSTEM | HIDDEN | ARCHIVE,
+    "the file's attributes: {file:#x}"
+  );
+  if links {
+    let kind = std::fs::symlink_metadata(out.join("to_d"))
+      .unwrap()
+      .file_type();
+    assert!(kind.is_symlink_dir(), "a directory symbolic link: {kind:?}");
+    assert_eq!(std::fs::read_link(out.join("to_d")).unwrap(), Path::new("d"));
+    assert_eq!(
+      names_in(&out.join("to_d")),
+      ["f.rs"],
+      "the directory listed through the link"
+    );
+  }
+  let mut landed = vec!["d"];
+  if links {
+    landed.push("to_d");
+  }
+  assert_eq!(names_in(&out), landed, "no hidden name left");
+}
+
 /// A-185. Do: on NTFS, seed a file and clear its `ARCHIVE` bit as a backup does; over the directory, write new bytes to
 /// the file in an overlay and land it. Expect: the landing replaces the file (`Done`, its entry `Written`, the disk
 /// holding the new bytes). NTFS has no exchange, so the engine moves the old file aside and checks it there against its
