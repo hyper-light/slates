@@ -1945,8 +1945,12 @@ epoch copies only its table, never a value.
     the default's entries as its access ACL when they say more than its mode, and a new directory takes the default
     too. A symlink takes neither. Without a default ACL, a FUSE creator's umask is applied, and an NFS client applied
     its own.
-  - **Not kept:** Linux clears set-group-ID when a caller outside the file's group sets its ACL. The FUSE wire carries
-    that judgement only under `FUSE_SETXATTR_EXT`, which slates does not negotiate (GAPS).
+  - **An access ACL set from outside the file's group clears its set-group-ID bit** (A-378), as Linux does
+    (`posix_acl_update_mode`). The guest's kernel says so: the route asks for `FUSE_SETXATTR_EXT`, the form of
+    SETXATTR whose request carries the setter's flags, and the kernel sets `FUSE_SETXATTR_ACL_KILL_SGID` there for a
+    setter outside the group without `CAP_FSETID`. The server clears the bit once the ACL is set; a default ACL's set
+    leaves it, as on Linux. The form is the connection's, settled by its `INIT`, so a Shards stream keeps it through
+    its resync and its restore, which send none.
 
   Every other `system.` name stays refused on every route.
 
@@ -4345,8 +4349,9 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 - the guest's own attribute namespaces, `trusted.` and `security.`, and its POSIX ACLs are kept in the volume as its
   data and shown to no host's mount (A-290, A-302, §4.5 "Extended attributes"); an ACL's named owners are kept through
   the stream's owner view; the guest's kernel is asked to enforce its ACLs, which the shared seam keeps in step with
-  the mode and gives at every create under a default ACL (A-314); an acknowledged attribute change is published before
-  its reply;
+  the mode and gives at every create under a default ACL (A-314), and to send SETXATTR in its extended form, which says
+  when an access ACL's setter is outside the file's group so the file's set-group-ID bit goes (A-378); an acknowledged
+  attribute change is published before its reply;
 - Shards' owner word (`trusted.shards.owner`, its value `UID:GID`) is the stream's to take, never a file's attribute
   (A-281). Shards' init sets it on a share's root as it mounts the share, so that a run of an unprivileged user can
   write the share it was given. It is taken from the guest's root on the stream's root alone, and refused otherwise
@@ -4369,11 +4374,11 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 - a VM's save and restore (Shards' D176 part 5; A-303): a SAVE, which the device sends while it is paused and so
   between requests, waits for the guest's stores through its maps to reach the volume, then takes a snapshot of the
   volume for the attachment's own principal, publishes it, and is answered with the stream's tables, opaque to Shards
-  and checked by a CRC-32C: the volume and the snapshot, the directory presented, the owner view, and each inode the
-  guest holds with its references and opens. A RESTORE is taken only as a fresh stream's first frame, onto the volume
-  saved while unchanged since the cut or a clone of the cut's snapshot, presenting the same directory; the stream's
-  attachment then holds what the saved one did, a file the guest held with no name left included, and its guest is
-  shown the same owners. A handle the restored guest's kernel kept gives its open back at its release, as one from
+  and checked by a CRC-32C: the volume and the snapshot, the directory presented, the owner view, the form of SETXATTR
+  the guest's kernel sends (A-378), and each inode the guest holds with its references and opens. A RESTORE is taken
+  only as a fresh stream's first frame, onto the volume saved while unchanged since the cut or a clone of the cut's
+  snapshot, presenting the same directory; the stream's attachment then holds what the saved one did, a file the guest
+  held with no name left included, its guest is shown the same owners and its requests are read in the same form. A handle the restored guest's kernel kept gives its open back at its release, as one from
   before a takeover does (A-152). Anything else is refused with its reason, and changes nothing;
 - a resync channel beside the stream (A-316; `slates_bridge_fuse::shards_resync`), for a stream to outlive its
   daemon on Shards' coordinator's conditions (2026-11-18): a pair made at the attach, whose first message, `Attached`,
@@ -4382,8 +4387,9 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
   macOS (A-339) a stream of 28-byte messages, since a datagram pair's survivor is never told its peer has gone, whose
   device end rides beside the stream's in the socket route's confirmation; Windows hands none yet. The daemon's end is
   held by the anchor, as a FUSE device is, and the daemon keeps its own copy while the anchor holds one (A-339: XNU's
-  collector of descriptors in flight flushes a socket whose every copy rides a message), with the token and the
-  stream's owner view as its session, updated when the guest names its owner, and released when the attachment ends.
+  collector of descriptors in flight flushes a socket whose every copy rides a message), with the token, the stream's
+  owner view and its kernel's SETXATTR form as its session (A-378), updated when the guest names its owner, when its
+  kernel's `INIT` is answered and when a RESTORE takes a saved guest's tables, and released when the attachment ends.
   A stream whose guest maps files with DAX keeps its resync (A-365): the anchor holds each file's DAX object before its
   first descriptor goes to the device, and the shard's DAX range table in anchor RAM records each range answered and
   whether it was asked writable, a slot a range, its slots derived from the fill budget; a refusal of either gives the
@@ -4403,10 +4409,10 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 - the peer's close, a hostile frame, a detach, a revocation, the volume's destroy and the daemon's stop end the
   attachment one way: its references swept, its record removed, its resync channel released. A daemon's death ends
   nothing by itself: recovery keeps a Shards attachment whose resync end the anchor held (Linux, A-316; macOS, A-339)
-  and serves it on a fresh stream, its owner view and token from the hold, its references and opens from the image,
-  the reply the dead daemon published and never wrote answering the request the device resends, and the writes it
-  acknowledged after its last publication replayed from the write log (A-63) as a mount's are; it removes any other's
-  record, as before.
+  and serves it on a fresh stream, its owner view, its SETXATTR form and token from the hold, its references and opens
+  from the image, the reply the dead daemon published and never wrote answering the request the device resends, and
+  the writes it acknowledged after its last publication replayed from the write log (A-63) as a mount's are; it removes
+  any other's record, as before.
 
 > **Status (2026-10-24).** Built and proven by use, in-process: `crates/server/src/shards.rs` (the serve task),
 > `crates/ipc/src/stream.rs` (the pair), `crates/bridge-fuse/src/shards_fs.rs` (the frames and their answers),
@@ -4487,6 +4493,16 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 > same (`crates/bridge-fuse/tests/shards_fs.rs`; the rules' unit tests in `crates/bridge-core/src/posix_acl.rs`). Owed:
 > a real guest's run (a Shards guest over a stream, a VM over slates' own virtio-fs device), and Shards' own server
 > enforcing them too (Shards' side, after its v0.8.0 tag).
+
+> **Status (2026-11-18, A-378, the set-group-ID bit an ACL's set clears).** Built and proven by use. A guest's INIT is
+> answered with `FUSE_SETXATTR_EXT` beside `FUSE_POSIX_ACL`, a host's with neither; an access ACL set in the extended
+> form with `FUSE_SETXATTR_ACL_KILL_SGID` on a 02660 file leaves it 0660, one without the flag leaves it 02660, and a
+> default ACL's set leaves a set-group-ID directory's bit (`crates/bridge-fuse/tests/shards_fs.rs`); the virtio-fs
+> device reads the form from the INIT reply it sends and serves an extended SETXATTR in the same pass
+> (`crates/bridge-virtiofs/tests/device.rs`); a stream reads it from its INIT, and a restored stream, and a stream
+> resynced after its daemon's death, go on reading it with no INIT (`crates/server/tests/shards.rs`,
+> `shards_resync.rs`, `shards_resync_restart.rs`). Owed: a real guest's run, a non-member's `setfacl` on a
+> set-group-ID file over a Shards stream and over slates' own virtio-fs device.
 
 > **Status (2026-11-18, A-316, the successor's half).** Built and proven by use on Linux, with a test that plays the
 > anchor and the device across a daemon's death (`crates/server/tests/shards_resync_restart.rs`): each of two streams'
@@ -14417,7 +14433,8 @@ Status: built 2026-10-06. It closes the FUSE part of A-32's owed list.
     volume keeps them; a host's mount is as above.)
   - A get or list with size 0 answers the length (`fuse_getxattr_out`); a buffer too small is `ERANGE`.
   - `XATTR_CREATE` and `XATTR_REPLACE` map to the volume's `XattrSet`.
-  - The setxattr body is the short form, because `FUSE_SETXATTR_EXT` is not negotiated.
+  - The setxattr body is the short form, because `FUSE_SETXATTR_EXT` is not negotiated. (Amended 2026-11-18 by A-378:
+    a guest kernel's route negotiates it, and its body is then the extended form; a host's mount keeps the short form.)
 - Why: until now every attribute operation was answered `ENOSYS`, so the kernel told every caller "not supported".
   `setfattr -n user.x` failed in an adversarial container run, and tools that tag files (download origins, build
   caches, `rsync -X`) lost their attributes on a slates mount.
@@ -24478,6 +24495,8 @@ Applied in the same change to:
   `FUSE_SETXATTR_EXT`, which widens SETXATTR's request per connection; no request decoder here takes a negotiated
   form yet, and a stream restored or resynced without INIT would have to carry it. So the bit stays, as on any FUSE
   server without that flag (`fs/fuse/acl.c`: such servers "don't expect setgid bits to be stripped"). Owed in GAPS.
+  (Amended 2026-11-18 by A-378: kept. A guest's route negotiates the extended form, every transport reads it from the
+  `INIT` reply it sent, and a Shards stream carries it through its resync and its restore.)
 - **Evidence.** Failing first: kiln run r783 (macOS arm64, runner f3f618f2, 2026-11-18) of the three tests on the
   tree before the change: the INIT kept no `FUSE_POSIX_ACL`; the file made under the default ACL was 0644 (the umask
   applied) where Linux makes 0660; the file `setfacl` granted was still 0600 where Linux makes 0660. The other six
@@ -25288,6 +25307,7 @@ Applied in the same change to:
   channel alone proves nothing to a device that checks the token.
 - **The anchor needs nothing new.** The daemon's end is an ordinary held descriptor (`slates_anchor::held`'s hold,
   session and release, keyed by attachment); its session is the token and the owner view, 32 bytes, the anchor's cap.
+  (Amended 2026-11-18 by A-378: and the connection's SETXATTR form, 40 bytes; the anchor's cap is 64.)
   The next daemon tells it from a FUSE device by the form of the attachment's record. Until the successor's half is
   built it releases every such end as one no record of its kind claims (`crate::fuse::adopt_held`; macOS releases every
   held descriptor), so the device reads the channel's end once recovery has run: Shards' option (a), as before.
@@ -26875,3 +26895,70 @@ Applied in the same change to:
   existing stream DAX tests; each of eight guards removed alone fails the restart test (the dormancy, the hold, the
   range's record, its writable mark, the adoption's ingest, the wake, the session's adoption, and the resync kept at a
   DAX map). Linux: GitHub's ubuntu runner (run 44347232055).
+
+### A-378 — An access ACL a guest sets from outside a file's group clears its set-group-ID bit: a guest's route negotiates the extended SETXATTR, every transport reads the form from the INIT reply it sent, and a Shards stream keeps it through its resync and its restore (2026-11-18, built for goal g268, what Shards needs from slates; A-314's item not kept)
+Applied in the same change to:
+- §4.5 "Extended attributes" (the guest's POSIX ACLs), §4.6 the Shards form (the attribute, SAVE and RESTORE, resync
+  and death bullets) and a status of this date; the A-106, A-314 and A-316 entries, amended; GAPS: A-281's entry;
+  `docs/cli.md` (the `shards` form's attributes).
+- `crates/bridge-fuse`: `abi.rs` (`flags::SETXATTR_EXT`, `SETXATTR_IN_BYTES`, `COMPAT_SETXATTR_IN_BYTES`,
+  `SETXATTR_ACL_KILL_SGID`); `init.rs` (a guest's route asks for `FUSE_SETXATTR_EXT`; `kept_flags`, the flags an INIT
+  reply kept as its kernel reads them; `InitNegotiation::setxattr_ext`; the unit test
+  `an_init_reply_keeps_the_extended_setxattr_on_a_guests_route_alone_and_reads_back_whole`); `bridge.rs`
+  (`serve_setxattr` reads the form its bridge was told; `kill_sgid`); the test
+  `a_guests_acl_set_from_outside_the_files_group_clears_its_set_group_id_bit` in `tests/shards_fs.rs`.
+- `crates/bridge-core`: `Bridge::setxattr_ext` and `Bridge::set_setxattr_ext`, kept by `VolumeBridge` and passed
+  through by `ScopedBridge`.
+- `crates/bridge-virtiofs/src/device.rs`: the form read from each INIT reply the device sends, forgotten at a reset,
+  and told to the bridge before every chain; the test `a_device_parses_setxattr_in_the_form_its_guests_init_reply_kept`
+  in `tests/device.rs`.
+- `crates/server`: `shards.rs` (the stream's form, read from its INIT reply (`kept_at_init`), told to its bridge before
+  every request, saved in its tables and taken back at a RESTORE and from a held session; `tell_session`, which a
+  RESTORE now calls too); `shards/resync.rs` (`Kept`: the session keeps the form beside the owner view;
+  `tell_session`; `from_session` refuses a form it does not know); `shards/tables.rs` (format 2,
+  `StreamTables::setxattr_ext`); the tests `a_guests_extended_setxattr_is_parsed_from_its_init_and_after_its_restore`
+  (`tests/shards.rs`), the INIT's and the RESTORE's sessions (`tests/shards_resync.rs`), and the extended form served
+  after a daemon's death (`tests/shards_resync_restart.rs`).
+- `crates/anchor/src/held.rs`: `SESSION_CAP`, 64 bytes (was 32).
+
+- **What was there.** A-314 asked a guest's kernel to enforce its ACLs (`FUSE_POSIX_ACL`) and not for
+  `FUSE_SETXATTR_EXT`, so the kernel sent SETXATTR's short form, which has no room to say that an ACL's setter is
+  outside the file's group. Linux's own filesystems clear a file's set-group-ID bit at such a set
+  (`posix_acl_update_mode`, the rule `chmod` keeps through `setattr_should_drop_sgid`), so that whoever sets an ACL
+  without being in the file's group keeps no bit that runs a program as that group. A FUSE kernel leaves the clearing
+  to its server and says when (`fs/fuse/acl.c` `fuse_set_acl`: `FUSE_SETXATTR_ACL_KILL_SGID` where the connection has
+  POSIX ACLs and the setter is neither in the group nor holds `CAP_FSETID`). slates' guests kept the bit.
+- **The form is the connection's.** A kernel sends the extended `fuse_setxattr_in` (16 bytes before the name, where
+  the short form has 8) once an INIT reply kept `FUSE_SETXATTR_EXT` (`fs/fuse/inode.c` `process_init_reply`, at any
+  minor; `fs/fuse/xattr.c` `fuse_setxattr`), so a server must read every SETXATTR by the form its connection settled.
+  Each transport reads it from the INIT reply the shared dispatch wrote, the connection's truth (the virtio-fs device's
+  own negotiation is a host's, which asks for no ACL), and tells its bridge: the device before every chain, since a
+  guest can read the INIT's reply and send a SETXATTR that the same pass serves; a Shards stream before every request.
+  A host's mount asks for neither flag and keeps the short form. A SETXATTR too short for the extended head is `EIO`.
+- **The clearing.** Once `system.posix_acl_access` is set with the flag, the file's set-group-ID bit is cleared by a
+  chmod of its mode less the bit, in the same request. After the set, so a refused set changes nothing, as Linux keeps
+  neither the mode it computed nor the ACL on a refusal; and the set made the inode current, so the chmod needs no
+  room. A default ACL's set leaves the bit, flag or not, since Linux clears it for an access ACL alone.
+- **What a stream carries.** A resynced stream's device sends no INIT (A-316), nor does a restored guest's kernel
+  (A-303), so the form rides with what each keeps: the anchor's held session, a word beside the token and the owner
+  view (40 bytes, past the anchor's 32-byte cap, which is now 64; an anchor and its daemons are one build), and the
+  SAVE tables, format 2. A session naming a form this daemon does not know is refused, never read as the short form.
+  Rejected: reading tables of format 1 as the short form. It would be right for them, since their daemon never offered
+  the extended form, but it keeps a second decoder for VMs saved before an upgrade; they are refused with their reason,
+  as A-303 refuses any other format.
+- **Found beside it.** A RESTORE set its stream's owner view and never told the anchor, so the held session kept the
+  fresh stream's identity view, and a daemon's death after a restore served the guest the volume's owners unswapped
+  (A-281). A RESTORE now tells the anchor the restored guest's session; the resync test asserts it.
+- **Evidence.** On a Mac Studio, the focused tests pass (kiln run r3591): the INIT's unit test, the stream's
+  attribute and ACL tests and the dispatch's attribute tests, the device's, the anchor's channel, the session's and the
+  tables' unit tests, `shards_resync`, `shards_resync_restart`, and the stream's save, restore, attribute, ACL and owner
+  tests. Each of fourteen guards removed alone fails the tests named for it (r3599 and r3623): the guest's INIT asking
+  for the form; the dispatch's extended parse; the setter's flag; the access ACL alone; the device telling its bridge,
+  before every chain rather than once a pass, from the reply's kept flag; the stream reading its INIT's form, telling
+  its bridge, saving it, taking it at a restore and telling the anchor then; the session keeping it; and a successor
+  taking it. The device's test first served each chain in a pass of its own, since a volume holding an inode past its
+  committed ceiling holds every reply for the barrier (A-150), so the guard "once a pass" passed it (r3599); it now
+  serves the INIT and the SETXATTR in one pass and asserts so. Linux: GitHub's ubuntu runner passes the same tests and
+  the virtio-fs device's attribute test (run 44357398816, the device's test in its first form).
+- **Cost.** None on a host's mount. A guest's SETXATTR reads eight more bytes; an access ACL set with the flag adds a
+  GETATTR and, where the bit is set, a chmod to its request. Each INIT reply is read again for its flags, a few words.

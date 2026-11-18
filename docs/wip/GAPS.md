@@ -556,8 +556,24 @@
 > of Linux's permission check over the dispatch's answers (`crates/bridge-fuse/tests/shards_fs.rs`). Not kept: Linux's
 > clearing of set-group-ID when a caller outside the file's group sets an ACL, which the FUSE wire carries only under
 > `FUSE_SETXATTR_EXT`, not negotiated (a per-connection request form a restored or resynced stream would have to
-> carry). Owed: a real guest's run of it (a Shards guest over a stream; a VM over slates' own virtio-fs device) and the
-> GETXATTR round trips it adds to a non-owner's access, measured by the integrator.
+> carry). (Kept since A-378, below.) Owed: a real guest's run of it (a Shards guest over a stream; a VM over slates' own
+> virtio-fs device) and the GETXATTR round trips it adds to a non-owner's access, measured by the integrator.
+> **Built since (A-378, 2026-11-18):** an access ACL set from outside a file's group clears the file's set-group-ID
+> bit, as Linux does. A guest route's INIT asks for `FUSE_SETXATTR_EXT` beside `FUSE_POSIX_ACL`; each transport reads
+> the form from the INIT reply the shared dispatch wrote and tells its bridge (the virtio-fs device before every chain,
+> since one pass can serve an INIT and a request after it; a Shards stream before every request); the dispatch then
+> reads the extended `fuse_setxattr_in`, and for `system.posix_acl_access` with `FUSE_SETXATTR_ACL_KILL_SGID` clears
+> the bit once the ACL is set (a default ACL's set leaves it, as on Linux). A Shards stream keeps the form in its
+> anchor-held session (40 bytes; the anchor's cap is 64) and in its SAVE tables (format 2), so a resynced or a restored
+> stream, which sees no INIT, reads its guest's requests as before. Found and fixed with it: a RESTORE never told the
+> anchor the restored guest's session, so a daemon's death after a restore served the guest with the fresh stream's
+> identity owners, the saved swap (A-281) lost. Tables saved before A-378 (format 1) are refused at a RESTORE with
+> their reason, as any other format is. Proven by use (a Mac Studio, kiln runs r3591, r3599 and r3623; Linux, GitHub
+> run 44357398816): a 02660 file whose access ACL a guest sets with the flag is 0660, one set without it stays 02660, and
+> a directory's default ACL leaves its bit; the virtio-fs device serves an extended SETXATTR in the pass that served its
+> INIT; a stream reads the form after a restore and after its daemon's death; each of fourteen guards removed alone
+> fails its test. Owed: a real guest's run (a non-member's `setfacl` on a set-group-ID file, over a Shards stream and
+> over slates' own virtio-fs device).
 > **Built since (A-303, 2026-11-18):** a stream's tables for a VM's save and restore (Shards' D176 part 5): a SAVE
 > waits for the guest's stores through its maps, takes and publishes a snapshot at the cut and answers tables naming
 > it with the guest's references, opens, scope and owner view; a RESTORE, a fresh stream's first frame, takes them onto
