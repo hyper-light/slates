@@ -118,10 +118,9 @@ struct JoinState {
 struct Fetched {
   group: [u8; 32],
   join: Option<JoinState>,
+  /// The answerer's configuration, which records the council's voters (A-380): how a learner, whose own Raft state never
+  /// moves after its join, learns who votes now.
   configuration: Vec<u8>,
-  /// The council's voters as the answering member knows them (empty for the root group): how a learner, whose own Raft
-  /// state never moves after its join, learns who votes now.
-  voters: Vec<u64>,
 }
 
 pub(crate) fn serve_fetch(state: &ShardState, root: bool, bytes: &[u8]) -> Option<Vec<u8>> {
@@ -167,22 +166,11 @@ pub(crate) fn serve_fetch(state: &ShardState, root: bool, bytes: &[u8]) -> Optio
   } else {
     encode_regional_configuration(state.council.configuration())
   };
-  let voters = if root {
-    Vec::new()
-  } else {
-    state
-      .council
-      .known_voters()
-      .into_iter()
-      .map(|voter| voter.0)
-      .collect()
-  };
   Some(
     Fetched {
       group,
       join,
       configuration,
-      voters,
     }
     .to_bytes(),
   )
@@ -316,14 +304,8 @@ pub(crate) fn adopt_fetch(
       state.recovery.council = None;
     }
     if !state.council.is_voter(state.fleet.host()) {
-      let newer = state.council.adopt(configuration);
-      // The voters travel with the view they came with: only a newer view moves them, or a first answer, so a late reply
-      // cannot put an older voter set back.
-      if newer || state.council.known_voters() == state.council.voters() {
-        state
-          .council
-          .learn_voters(reply.voters.into_iter().map(HostId).collect());
-      }
+      // The voters travel inside the configuration (A-380), so a view adopted only forward moves them only forward.
+      state.council.adopt(configuration);
     }
   }
   FetchOutcome::Adopted
