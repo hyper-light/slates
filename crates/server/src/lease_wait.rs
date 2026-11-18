@@ -251,12 +251,12 @@ pub(crate) fn run_resumed(
   refusal: Option<ReplyBody>,
   served: Option<&'static str>,
 ) {
-  let start = state.clock.monotonic_ns();
+  let start = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
   let span = state
     .tracer
     .open_unlinked(verb.id, slates_wire::observe::Chokepoint::ShardOp, start);
   run_resumed_diag(state, verb, refusal, served);
-  let end = state.clock.monotonic_ns();
+  let end = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
   crate::telemetry::emit(state, span.end(9, end));
 }
 
