@@ -197,6 +197,11 @@ pub(crate) fn supervise(options: &ProcessOptions, daemon_args: &[String]) -> Res
   // Before the segment holds a byte: no core dump may carry it (AUD-29-41).
   super::dumps::exclude_from_dumps()?;
   signal::install().map_err(Failure::Failed)?;
+  // The launcher's secret (A-299): what the starter handed on standard input, read first, so a starter that meant to
+  // hand one and failed is refused by its fault before anything is measured, held or created — never left running an
+  // instance it can never approve for.
+  let launcher = crate::launcher::from_standard_input()
+    .map_err(|fault| Failure::Refused(format!("the launcher's secret: {fault}")))?;
   let profile: MachineProfile = measure(options.quick)?;
   let config = DaemonConfig::derive(&profile, &options.instance, options.shards);
   // The owner first (A-254, the rule of A-176 and A-178): a second anchor of a live instance is refused here, having
@@ -224,6 +229,12 @@ pub(crate) fn supervise(options: &ProcessOptions, daemon_args: &[String]) -> Res
   segment
     .publish(RegionKind::Profile, json.as_bytes())
     .map_err(|e| failed("publish", e))?;
+  // The launcher's secret (A-299), published before any daemon reads the segment.
+  if let Some(secret) = &launcher {
+    segment
+      .publish_launcher_secret(secret.bytes())
+      .map_err(|e| failed("launcher secret", e))?;
+  }
   // Until a start is measured, the budget holds one start: a daemon that fails once
   // before it ever beat is restarted once.
   let policy = RestartPolicy::derive(RECOVERY_BUDGET_NS, RECOVERY_BUDGET_NS);

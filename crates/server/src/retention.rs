@@ -6,8 +6,8 @@
 use slates_anchor::{AnchorError, AnchorSegment, RegionKind};
 use slates_cluster::raft::SavedRaft;
 use slates_cluster::raft_wire::{
-  decode_regional_configuration, decode_root_configuration, encode_regional_configuration,
-  encode_root_configuration,
+  RaftWireError, decode_regional_configuration, decode_root_configuration,
+  encode_regional_configuration, encode_root_configuration,
 };
 use slates_db::register::{HostId, RegionId};
 use slates_wire::Wire;
@@ -53,6 +53,20 @@ pub(crate) struct Retained {
 
 fn invalid(reason: &'static str) -> AnchorError {
   AnchorError::Layout { reason }
+}
+
+/// The refusal for a retained configuration that would not decode: `foreign` when its bytes are another build's layout
+/// (`RaftWireError::ForeignLayout`, `LayoutVersion`), `corrupt` otherwise. Both refuse recovery, since a vote must never
+/// be forgotten, but a restart across a change of the configuration's layout says so by name, where before it was
+/// refused only by the accident of a length and called invalid (GAPS, live-durability 2026-11-09).
+fn configuration_refused(
+  error: RaftWireError,
+  (foreign, corrupt): (&'static str, &'static str),
+) -> AnchorError {
+  match error {
+    RaftWireError::ForeignLayout { .. } | RaftWireError::LayoutVersion { .. } => invalid(foreign),
+    _ => invalid(corrupt),
+  }
 }
 
 impl Retained {
@@ -104,10 +118,24 @@ impl Retained {
       if crate::consensus::genesis(false, &group.origin) != group.genesis {
         return Err(invalid("retained council genesis differs"));
       }
-      let base = decode_regional_configuration(&group.base)
-        .map_err(|_| invalid("invalid retained council base"))?;
-      let view = decode_regional_configuration(&group.view)
-        .map_err(|_| invalid("invalid retained council view"))?;
+      let base = decode_regional_configuration(&group.base).map_err(|error| {
+        configuration_refused(
+          error,
+          (
+            "retained council base is another build's layout",
+            "invalid retained council base",
+          ),
+        )
+      })?;
+      let view = decode_regional_configuration(&group.view).map_err(|error| {
+        configuration_refused(
+          error,
+          (
+            "retained council view is another build's layout",
+            "invalid retained council view",
+          ),
+        )
+      })?;
       state
         .council
         .restore_from(group.raft, base)
@@ -122,10 +150,24 @@ impl Retained {
       if crate::consensus::genesis(true, &group.origin) != group.genesis {
         return Err(invalid("retained root genesis differs"));
       }
-      let base = decode_root_configuration(&group.base)
-        .map_err(|_| invalid("invalid retained root base"))?;
-      let view = decode_root_configuration(&group.view)
-        .map_err(|_| invalid("invalid retained root view"))?;
+      let base = decode_root_configuration(&group.base).map_err(|error| {
+        configuration_refused(
+          error,
+          (
+            "retained root base is another build's layout",
+            "invalid retained root base",
+          ),
+        )
+      })?;
+      let view = decode_root_configuration(&group.view).map_err(|error| {
+        configuration_refused(
+          error,
+          (
+            "retained root view is another build's layout",
+            "invalid retained root view",
+          ),
+        )
+      })?;
       state
         .root
         .restore_from(group.raft, base)
@@ -524,6 +566,33 @@ mod tests {
       ));
       // Repair only the test's injected corruption so the fixture can shut down normally.
       flip(&mut state.segment);
+    });
+  }
+
+  /// GAPS (live-durability, 2026-11-09): a retained council whose configuration is another build's layout refuses
+  /// recovery by name. Do retain a vote, then restore the publication with its council base rewritten as the earlier,
+  /// unversioned layout wrote it (its bytes after the magic and layout version). Expect recovery refused, as a corrupt
+  /// one is (a vote is never forgotten), with the reason naming the layout; and the same record with its base whole
+  /// restored. Before, such a base was refused only by the accident of a length, as "invalid".
+  #[test]
+  fn a_retained_council_of_another_layout_refuses_recovery_by_name() {
+    crate::daemon::audit_on_shard(|state| {
+      retain_first_vote(state);
+      let whole = load(&state.segment).unwrap().unwrap();
+      let mut earlier = load(&state.segment).unwrap().unwrap();
+      let council = earlier.council.as_mut().unwrap();
+      council.base = council.base.split_off(2 * size_of::<u32>());
+      let refused = earlier.restore(state);
+      assert!(
+        matches!(
+          refused,
+          Err(AnchorError::Layout {
+            reason: "retained council base is another build's layout"
+          })
+        ),
+        "an unversioned base is refused by name: {refused:?}"
+      );
+      assert!(whole.restore(state).is_ok(), "the record whole restores");
     });
   }
 

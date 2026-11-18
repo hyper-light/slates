@@ -64,7 +64,12 @@ impl Volume {
               return Ok(false);
             }
           }
-          Child::Symlink(_) | Child::Fifo(_) | Child::Socket(_) | Child::Whiteout => {}
+          Child::Symlink(_)
+          | Child::Fifo(_)
+          | Child::Socket(_)
+          | Child::BlockDevice(_)
+          | Child::CharDevice(_)
+          | Child::Whiteout => {}
         }
       }
       if node.base == BaseDirState::Merged {

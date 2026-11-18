@@ -79,9 +79,12 @@ pub mod lease;
 mod lease_wait;
 mod live_ship;
 mod member_task;
+// Version 0 of a green over a base, made, shipped and seeded a slice at a time at `f > 0` (§4.16, A-286).
+mod merge_origin;
 pub mod merge_service;
 mod mirror;
 mod remote_attach;
+mod work_home;
 #[cfg(target_os = "linux")]
 mod write_log;
 // The Windows WinFsp transport (§4.6 "Windows"): a volume at a drive letter, served on its owner shard.
@@ -135,6 +138,7 @@ pub mod telemetry;
 // A writer outside FUSE answered once every FUSE mount of its volume was told (AC-3.3).
 mod told;
 pub mod tombstone;
+mod tracked;
 // The transport capability report of §4.6 A-9 (what `attach` and `status` say each transport can do
 // on this host); pure over one platform seam, so it compiles and tests everywhere.
 pub mod transports;

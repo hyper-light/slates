@@ -77,16 +77,21 @@ const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// body carries the disk file it was made from, and every fingerprint the file's birth time, so a successor never takes
 /// the file now at a name for the one an old handle opened. 21 (A-152, 2026-10-22) each attachment's references carry how
 /// many of them are open handles, so a successor gives back the open of a handle the dead daemon issued at its release.
-/// 23 (A-262, 2026-11-08) every inode carries the Windows attribute bits kept beside its mode. 24 (A-262, 2026-11-08)
+/// 22 (A-231, 2026-11-05) the held connections' byte states. 23 (A-262, 2026-11-08) every inode carries the Windows attribute bits kept beside its mode. 24 (A-262, 2026-11-08)
 /// every fingerprint carries the Windows attribute bits its disk holds, so a recovered witness compares them too.
 /// 25 (A-251, 2026-11-09) each held register carries the acceptor's whole persisted state, the retired owner an install
 /// last moved its authority from too (`slates_db::register::PersistedAcceptor`), so a warm restart keeps the move.
 /// 26 (A-275, built 2026-11-09, landed 2026-11-17 in landing order) a symlink's Windows bits may hold
 /// `FILE_ATTRIBUTE_DIRECTORY` (a Windows directory link): the bytes are laid out as 25's, but a reader of an earlier
 /// version would drop the bit without a word and show a directory link as a file link, so it refuses this version.
+/// 27 (A-270, built 2026-11-09 as 26, landed 2026-11-18 after A-275, so it takes the next) what the shard holds for
+/// other owners is keyed pieces ([`HeldPiece`]) instead of one opaque image, so a delta carries only the pieces that
+/// changed.
+/// 28 (A-294, built 2026-11-17 as 26, landed after A-270, so it takes the next) block and character device nodes, each
+/// kind with its number as its body.
 /// Format: the image layout version, bumped with any change to the types below, to what they may hold, or to the held
 /// replicas' image they carry.
-pub const IMAGE_VERSION: u16 = 26;
+pub const IMAGE_VERSION: u16 = 28;
 
 /// A recorded attachment's references in an image (A-61): its durable id and its share by inode.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
@@ -152,6 +157,11 @@ pub enum KindImage {
   Fifo,
   /// A socket name, without a listener or connection.
   Socket,
+  /// A block device node; its number is its body ([`BodyImage::Device`], A-294). Appended, so every earlier kind's
+  /// tag is unchanged.
+  BlockDevice,
+  /// A character device node; its number is its body (A-294).
+  CharDevice,
 }
 
 /// POSIX attributes in an image (§4.5 `Attrs`); every field is fixed-width, so the encoding is
@@ -251,6 +261,13 @@ pub enum BodyImage {
   BaseLink {
     /// The target path.
     target: String,
+  },
+  /// A device node's number ([`Body::Device`], A-294), its major and minor as made; appended, as `BaseLink` was.
+  Device {
+    /// The major number.
+    major: u32,
+    /// The minor number.
+    minor: u32,
   },
 }
 
@@ -520,10 +537,10 @@ pub struct ShardImage {
   pub version: u16,
   /// The volumes, in key order.
   pub volumes: Vec<KeyedImage>,
-  /// The content this shard holds for other owners as their candidate holder (AUD-29-59): the hold's own
-  /// canonical image, opaque here (the cluster plane encodes and decodes it), empty when nothing is held.
-  /// A holder acknowledges a content put only once an image carrying it is committed.
-  pub held: Vec<u8>,
+  /// What this shard holds for other owners as their candidate holder (AUD-29-59, A-270): keyed pieces in key order,
+  /// opaque here (the server cuts and joins them), none when nothing is held. A holder acknowledges what it holds only
+  /// once an image or a delta carrying it is committed.
+  pub held: Vec<HeldPiece>,
   /// The replies a barrier published with its effect and had not yet delivered (A-61): at most one per FUSE
   /// mount, opaque here (the transport encodes them).
   pub replies: Vec<HeldReply>,
@@ -614,6 +631,21 @@ pub struct HeldReply {
   pub reply: Vec<u8>,
 }
 
+/// Format: the bytes of a held piece's key (A-270): the server's kind byte, an object id (16 bytes), and a position (a
+/// big-endian word, so key order within an object is position order). Opaque here beyond its width.
+pub const HELD_PIECE_KEY_BYTES: usize = 1 + 16 + size_of::<u64>();
+
+/// One piece of what a shard holds for other owners (A-270): a key and its bytes, both opaque here. An image carries
+/// every piece; a delta carries the pieces put and the keys removed since the last publication, so what a holder's
+/// acknowledgement costs its publication is the piece it changed, not everything it holds.
+#[derive(Clone, Debug, PartialEq, Eq, Wire)]
+pub struct HeldPiece {
+  /// The piece's key.
+  pub key: [u8; HELD_PIECE_KEY_BYTES],
+  /// The piece's bytes.
+  pub bytes: Vec<u8>,
+}
+
 /// Format: the bytes of a held call record's key: an NFSv4.1 session id (16 bytes) and its slot (a big-endian word).
 pub const HELD_CALL_KEY_BYTES: usize = 16 + size_of::<u32>();
 
@@ -625,6 +657,14 @@ pub struct HeldCall {
   pub key: [u8; HELD_CALL_KEY_BYTES],
   /// The record's bytes.
   pub record: Vec<u8>,
+}
+
+/// Format: a recovery image's or a journal frame's leading magic and version, as `Wire` writes a `u32` then a `u16`
+/// (little endian): read alone, so a refusal by version decodes nothing after it. `None` when fewer bytes arrived.
+pub(crate) fn read_header(bytes: &[u8]) -> Option<(u32, u16)> {
+  let (magic, rest) = bytes.split_first_chunk::<{ size_of::<u32>() }>()?;
+  let (version, _) = rest.split_first_chunk::<{ size_of::<u16>() }>()?;
+  Some((u32::from_le_bytes(*magic), u16::from_le_bytes(*version)))
 }
 
 impl ShardImage {
@@ -644,7 +684,7 @@ impl ShardImage {
   /// .with_nfs_replies(nfs).with_nfs_states(states)`'s `encode` writes them after the volumes.
   pub fn encode_finish(
     out: &mut Vec<u8>,
-    held: &[u8],
+    held: &mut Vec<HeldPiece>,
     (replies, calls, nfs_replies, nfs_states): (
       &mut Vec<HeldReply>,
       &mut Vec<HeldCall>,
@@ -652,8 +692,8 @@ impl ShardImage {
       &mut Vec<HeldNfsStates>,
     ),
   ) {
-    slates_wire::codec::encode_len(held.len(), out);
-    out.extend_from_slice(held);
+    held.sort_by_key(|piece| piece.key);
+    held.encode(out);
     replies.sort_by_key(|reply| reply.attachment);
     replies.encode(out);
     calls.sort_by_key(|call| call.key);
@@ -679,8 +719,9 @@ impl ShardImage {
     }
   }
 
-  /// This image carrying `held`, the shard's held replicas' canonical image (AUD-29-59).
-  pub fn with_held(self, held: Vec<u8>) -> ShardImage {
+  /// This image carrying `held`, the pieces of what the shard holds for other owners (AUD-29-59, A-270), in key order.
+  pub fn with_held(self, mut held: Vec<HeldPiece>) -> ShardImage {
+    held.sort_by_key(|piece| piece.key);
     ShardImage { held, ..self }
   }
 
@@ -711,9 +752,20 @@ impl ShardImage {
     ShardImage { nfs_states, ..self }
   }
 
-  /// Decodes a shard image from content-object bytes, refusing a foreign magic, an unknown version
-  /// or any malformed field with [`VfsError::RecoveryIncomplete`].
+  /// Decodes a shard image from content-object bytes, refusing a foreign magic or any malformed field with
+  /// [`VfsError::RecoveryIncomplete`], and another build's version, read before any field after it, with
+  /// [`VfsError::RecoveryVersion`]: a layout this build does not know is never decoded as this one.
   pub fn from_content(bytes: &[u8]) -> Result<ShardImage, VfsError> {
+    match read_header(bytes) {
+      Some((magic, version)) if magic == SHARD_MAGIC && version != IMAGE_VERSION => {
+        return Err(VfsError::RecoveryVersion {
+          found: version,
+          expected: IMAGE_VERSION,
+        });
+      }
+      Some((magic, _)) if magic == SHARD_MAGIC => {}
+      _ => return Err(VfsError::RecoveryIncomplete),
+    }
     let shard = ShardImage::from_bytes(bytes).map_err(|_| VfsError::RecoveryIncomplete)?;
     if shard.magic != SHARD_MAGIC || shard.version != IMAGE_VERSION {
       return Err(VfsError::RecoveryIncomplete);
@@ -1346,6 +1398,8 @@ const fn kind_image(kind: Kind) -> KindImage {
     Kind::Symlink => KindImage::Symlink,
     Kind::Fifo => KindImage::Fifo,
     Kind::Socket => KindImage::Socket,
+    Kind::BlockDevice => KindImage::BlockDevice,
+    Kind::CharDevice => KindImage::CharDevice,
   }
 }
 
@@ -1568,7 +1622,7 @@ impl Volume {
     store: &Store,
     snap_inode_root: Handle<TrieNode>,
     id: SnapshotId,
-    canonical: &mut BTreeMap<(u64, u32), Vec<(SnapshotRef, BodyImage)>>,
+    canonical: &mut BTreeMap<(u64, u32), Vec<(SnapshotRef, InodeImage)>>,
   ) -> Result<(Vec<InodeImage>, Vec<SharedInode>), VfsError> {
     let mut handles = Vec::new();
     trie::walk(&store.tries, snap_inode_root, &mut handles);
@@ -1579,7 +1633,12 @@ impl Volume {
       let no = inode.no;
       if !matches!(
         inode.kind,
-        Kind::File | Kind::Symlink | Kind::Fifo | Kind::Socket
+        Kind::File
+          | Kind::Symlink
+          | Kind::Fifo
+          | Kind::Socket
+          | Kind::BlockDevice
+          | Kind::CharDevice
       ) {
         // Directories are always carried in full; their entries are small and their structure is
         // this snapshot's own.
@@ -1603,12 +1662,15 @@ impl Volume {
         });
         continue;
       }
-      // A version that diverged from the head: dedup it against earlier snapshots by content. The
-      // crc buckets the lookup; the body decides the match.
+      // A version that diverged from the head: dedup it against earlier snapshots. The body's crc buckets the
+      // lookup; the whole image decides the match, since the rebuild shares the earlier snapshot's whole record
+      // (attributes, owner, times, change counter and attribute table with the bytes). Matched by its body alone, a
+      // version changed only by a `chmod` between two snapshots recovered with the earlier snapshot's mode
+      // (`docs/bugs/2026-11-17-a-snapshots-attribute-only-change-was-lost-in-recovery.md`).
       let image = self.image_of_inode(store, inode)?;
       let crc = body_crc(&image.body);
       let bucket = canonical.entry((no.0, crc)).or_default();
-      if let Some((src, _)) = bucket.iter().find(|(_, body)| *body == image.body) {
+      if let Some((src, _)) = bucket.iter().find(|(_, held)| *held == image) {
         shared.push(SharedInode {
           number: no.0,
           source: SharedSource::Snapshot { at: *src },
@@ -1616,7 +1678,7 @@ impl Volume {
         continue;
       }
       // This snapshot is the canonical holder of this version; record it for later snapshots.
-      bucket.push((snap_ref(id), image.body.clone()));
+      bucket.push((snap_ref(id), image.clone()));
       inodes.push(image);
     }
     shared.sort_by_key(|s| s.number);
@@ -1624,14 +1686,14 @@ impl Volume {
   }
 
   fn capture_snapshots(&self, store: &Store) -> Result<Vec<SnapshotImage>, VfsError> {
-    // Cross-snapshot content dedup: a file or symlink version captured in full by one snapshot is
-    // referenced, not re-captured, by a later snapshot that holds the byte-identical version. The
-    // map is (number, body crc) → the snapshots that captured that version in full, with the body
-    // kept to verify against a crc collision (a wrong match would corrupt content, so bytes decide,
-    // not the checksum). `self.snapshots.iter()` yields ascending slot order, which is ascending id
+    // Cross-snapshot dedup: a file, symlink or special-name version captured in full by one snapshot is
+    // referenced, not re-captured, by a later snapshot that holds the same version. The map is (number, body crc)
+    // → the snapshots that captured a version in full, with its whole image kept to decide the match (a wrong match
+    // would recover the later snapshot with the earlier one's record, so the image decides, never the checksum and
+    // never the bytes alone: a version changed only in its attributes is its own). `self.snapshots.iter()` yields ascending slot order, which is ascending id
     // order, and `from_image` rebuilds in the same order, so a reference always points to an
     // already-captured, earlier-rebuilt canonical.
-    let mut canonical: BTreeMap<(u64, u32), Vec<(SnapshotRef, BodyImage)>> = BTreeMap::new();
+    let mut canonical: BTreeMap<(u64, u32), Vec<(SnapshotRef, InodeImage)>> = BTreeMap::new();
     let mut out = Vec::with_capacity(self.snapshots.iter().count());
     for (handle, snap) in self.snapshots.iter() {
       let id = SnapshotId {
@@ -1776,6 +1838,13 @@ impl Volume {
         },
         Kind::File => file_body_image(store, &inode.body)?,
         Kind::Fifo | Kind::Socket => BodyImage::Empty,
+        Kind::BlockDevice | Kind::CharDevice => match inode.body {
+          Body::Device(number) => BodyImage::Device {
+            major: number.major,
+            minor: number.minor,
+          },
+          _ => return Err(VfsError::RecoveryIncomplete),
+        },
       }
     })
   }
@@ -1901,7 +1970,12 @@ impl Volume {
     let mut entries = Vec::with_capacity(dir.len());
     for entry in dir.iter(&store.blocks) {
       let child = match entry.child {
-        Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => Some(no),
+        Child::File(no)
+        | Child::Symlink(no)
+        | Child::Fifo(no)
+        | Child::Socket(no)
+        | Child::BlockDevice(no)
+        | Child::CharDevice(no) => Some(no),
         Child::Dir(handle) => Some(
           store
             .dirs
@@ -2052,7 +2126,7 @@ fn file_body_image(store: &Store, body: &Body) -> Result<BodyImage, VfsError> {
         born: open.born.0,
       }),
     }),
-    Body::Directory(_) | Body::Symlink(_) | Body::BaseLink(_) | Body::Base(_) => {
+    Body::Directory(_) | Body::Symlink(_) | Body::BaseLink(_) | Body::Base(_) | Body::Device(_) => {
       Err(VfsError::RecoveryIncomplete)
     }
   }
@@ -2062,7 +2136,12 @@ fn file_body_image(store: &Store, body: &Body) -> Result<BodyImage, VfsError> {
 /// a whiteout names none.
 pub(crate) fn child_number(store: &Store, child: &Child) -> Result<Option<u64>, VfsError> {
   Ok(match child {
-    Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => Some(no.0),
+    Child::File(no)
+    | Child::Symlink(no)
+    | Child::Fifo(no)
+    | Child::Socket(no)
+    | Child::BlockDevice(no)
+    | Child::CharDevice(no) => Some(no.0),
     Child::Dir(handle) => Some(
       store
         .dirs
@@ -2099,6 +2178,8 @@ const fn kind_from_image(kind: KindImage) -> Kind {
     KindImage::Symlink => Kind::Symlink,
     KindImage::Fifo => Kind::Fifo,
     KindImage::Socket => Kind::Socket,
+    KindImage::BlockDevice => Kind::BlockDevice,
+    KindImage::CharDevice => Kind::CharDevice,
   }
 }
 
@@ -2850,10 +2931,10 @@ fn dead_key(dead: &Dead) -> (Discriminant<Dead>, u64, u32) {
   (std::mem::discriminant(dead), index, generation)
 }
 
-/// A crc of a body's bytes, used only to bucket the cross-snapshot content dedup lookup (§4.2). The
-/// match is then decided by exact byte equality, so a crc collision costs one comparison, never a
-/// wrong dedup (which would corrupt content). Directories do not reach here (only files and symlinks
-/// are deduped); the arm exists to keep the match exhaustive.
+/// A crc of a body's bytes, used only to bucket the cross-snapshot dedup lookup (§4.2). The match is then decided by
+/// the whole inode image's equality, so a crc collision costs one comparison, never a wrong dedup (which would recover a
+/// snapshot with another version's content or attributes). Directories do not reach here (only files, symlinks and the
+/// names with no content are deduplicated); the arm exists to keep the match exhaustive.
 fn body_crc(body: &BodyImage) -> u32 {
   match body {
     // A chunked body's references and offsets are its identity (the same blocks at another offset are a
@@ -2862,7 +2943,7 @@ fn body_crc(body: &BodyImage) -> u32 {
     BodyImage::Symlink { target } | BodyImage::BaseLink { target } => crc32c(target.as_bytes()),
     BodyImage::Empty => crc32c(&[]),
     BodyImage::Directory { .. } => 0,
-    BodyImage::Base { .. } => crc32c(&body.to_bytes()),
+    BodyImage::Base { .. } | BodyImage::Device { .. } => crc32c(&body.to_bytes()),
   }
 }
 
@@ -2886,6 +2967,13 @@ fn body_for(
       }
       Ok(Body::None)
     }
+    // A device node's body is its number and nothing else (A-294): an image giving one content or a size is corrupt.
+    KindImage::BlockDevice | KindImage::CharDevice => match image_inode.body {
+      BodyImage::Device { major, minor } if image_inode.attrs.size == 0 => {
+        Ok(Body::Device(crate::inode::DeviceNumber::new(major, minor)))
+      }
+      _ => Err(VfsError::RecoveryIncomplete),
+    },
     KindImage::Symlink => match &image_inode.body {
       BodyImage::Symlink { target } => Ok(Body::Symlink(target.as_str().into())),
       BodyImage::BaseLink { target } => Ok(Body::BaseLink(target.as_str().into())),
@@ -2939,9 +3027,10 @@ fn file_body_from_image(claims: &Claims, body: &BodyImage, size: u64) -> Result<
       lost: *lost,
       file: crate::inode::FileTag::from_word(*file),
     })),
-    BodyImage::Directory { .. } | BodyImage::Symlink { .. } | BodyImage::BaseLink { .. } => {
-      Err(VfsError::RecoveryIncomplete)
-    }
+    BodyImage::Directory { .. }
+    | BodyImage::Symlink { .. }
+    | BodyImage::BaseLink { .. }
+    | BodyImage::Device { .. } => Err(VfsError::RecoveryIncomplete),
   }
 }
 
@@ -3360,6 +3449,8 @@ fn child_for(
     KindImage::Symlink => Ok(Child::Symlink(child_no)),
     KindImage::Fifo => Ok(Child::Fifo(child_no)),
     KindImage::Socket => Ok(Child::Socket(child_no)),
+    KindImage::BlockDevice => Ok(Child::BlockDevice(child_no)),
+    KindImage::CharDevice => Ok(Child::CharDevice(child_no)),
     KindImage::Dir => {
       let handle = *dirs.get(&child).ok_or(VfsError::RecoveryIncomplete)?;
       let node = store.dirs.get_mut(handle)?;

@@ -467,6 +467,51 @@ pub enum Op {
     /// The policy.
     policy: crate::catalog::WritePolicy,
   },
+  /// An enrolled consumer's write policy was set by its launcher (A-285). Appended (2026-11-18).
+  ConsumerWritePolicySet {
+    /// The consumer.
+    consumer: u64,
+    /// The policy.
+    policy: crate::catalog::WritePolicy,
+  },
+  /// A work's base is held for it on its green's partition, wherever the work lives (A-247): made at the work's
+  /// creation, moved by its accept and rebase. Appended (2026-11-18), with the five after it: each variant's index is
+  /// its tag on the log, so A-247's records follow every variant main had when they landed.
+  WorkFloorSet {
+    /// The green.
+    green: VolumeId,
+    /// The work.
+    work: VolumeId,
+    /// The version the work is based on.
+    base: u64,
+  },
+  /// A work's creation waits for its green's owner to admit it, holding its name and its id (A-247). Appended.
+  WorkCreationPending {
+    /// The creation.
+    record: crate::catalog::PendingCreationRecord,
+  },
+  /// A work's pending creation ended: made, refused, or dropped at a start (A-247). Appended.
+  WorkCreationSettled {
+    /// The name.
+    name: String,
+  },
+  /// A work's submit went to its green's owner and waits to be settled on the work (A-247). Appended.
+  WorkSubmitPending {
+    /// The submit.
+    record: crate::catalog::PendingSubmitRecord,
+  },
+  /// A work's pending submit was settled (A-247). Appended.
+  WorkSubmitSettled {
+    /// The work.
+    work: VolumeId,
+  },
+  /// A work's floor is released: it was destroyed, or found gone at recovery (A-247). Appended.
+  WorkFloorDropped {
+    /// The green.
+    green: VolumeId,
+    /// The work.
+    work: VolumeId,
+  },
 }
 
 impl Op {
@@ -533,12 +578,19 @@ impl Op {
       Op::NameAliasReserved { .. } => "name_alias_reserved",
       Op::NameAliasConfirmed { .. } => "name_alias_confirmed",
       Op::NameAliasReleased { .. } => "name_alias_released",
+      Op::WorkFloorSet { .. } => "work_floor_set",
+      Op::WorkFloorDropped { .. } => "work_floor_dropped",
+      Op::WorkCreationPending { .. } => "work_creation_pending",
+      Op::WorkCreationSettled { .. } => "work_creation_settled",
+      Op::WorkSubmitPending { .. } => "work_submit_pending",
+      Op::WorkSubmitSettled { .. } => "work_submit_settled",
       Op::AttachmentRenewed { .. } => "attachment_renewed",
       Op::AttachmentExpired { .. } => "attachment_expired",
       Op::LiveShippingChanged { .. } => "live_shipping_changed",
       Op::LiveHoldersCommitted { .. } => "live_holders_committed",
       Op::CompletionAwaiting { .. } => "completion_awaiting",
       Op::VolumeWritePolicySet { .. } => "volume_write_policy_set",
+      Op::ConsumerWritePolicySet { .. } => "consumer_write_policy_set",
     }
   }
 }

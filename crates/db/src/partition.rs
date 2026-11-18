@@ -142,6 +142,12 @@ pub struct PartitionSnapshot {
   pub expired_attachments: Vec<u64>,
   /// Each green's checkpoint (W3; §4.16; 2026-11-06; appended).
   pub green_checkpoints: Vec<GreenCheckpoint>,
+  /// Each live work's hold on a version of a green of this partition (A-247; appended).
+  pub work_floors: Vec<crate::catalog::WorkFloorRecord>,
+  /// Each work's submit awaiting its settle (A-247; appended).
+  pub pending_submits: Vec<crate::catalog::PendingSubmitRecord>,
+  /// Each work's creation awaiting its admission (A-247; appended).
+  pub pending_creations: Vec<crate::catalog::PendingCreationRecord>,
 }
 
 /// One green's checkpoint, as a snapshot carries it (W3; §4.16): the version it is the green's state at, and its
@@ -257,6 +263,15 @@ pub struct Partition {
   /// The names this partition holds for volumes other partitions hold (A-236): at most one a name, and at most
   /// `caps.volumes` of them, since each stands for a volume another partition holds under the same cap.
   name_aliases: BTreeMap<String, NameAliasRecord>,
+  /// Each live work's base, by green and work (A-247), on the green's partition.
+  work_floors: BTreeMap<(VolumeId, VolumeId), u64>,
+  /// Each work's submit awaiting its settle, at most one a work (A-247).
+  pending_submits: BTreeMap<VolumeId, crate::catalog::PendingSubmitRecord>,
+  /// Each work's creation awaiting its admission, by name (A-247).
+  pending_creations: BTreeMap<String, crate::catalog::PendingCreationRecord>,
+  /// How many works hold each version of each green, so a green's reachable floor is one look-up per verdict rather
+  /// than a walk of its works (A-247: a green with 10,000 works is judged once per accept).
+  work_floor_counts: BTreeMap<(VolumeId, u64), u64>,
   /// The CLI attachments whose term lapsed, oldest first (A-230), so a later use is refused as expired rather than as
   /// unknown. At most `caps.attachments` of them: the oldest leaves when a lapse would pass it.
   expired_attachments: std::collections::VecDeque<u64>,
@@ -316,6 +331,10 @@ impl Partition {
       nfs_calls: BTreeMap::new(),
       nfs_purges: BTreeSet::new(),
       name_aliases: BTreeMap::new(),
+      work_floors: BTreeMap::new(),
+      pending_submits: BTreeMap::new(),
+      pending_creations: BTreeMap::new(),
+      work_floor_counts: BTreeMap::new(),
       expired_attachments: std::collections::VecDeque::new(),
       nfs_instance: 0,
       landing_leases: Art::new(),
@@ -474,6 +493,142 @@ impl Partition {
   /// Whether attachment `id` was a CLI attachment whose term lapsed (A-230), among the most recent the partition keeps.
   pub fn attachment_expired(&self, id: u64) -> bool {
     self.expired_attachments.contains(&id)
+  }
+
+  /// The oldest version any live work of `green` is based on (A-247), or `None` when it has none.
+  pub fn oldest_work_floor(&self, green: VolumeId) -> Option<u64> {
+    self
+      .work_floor_counts
+      .range((green, 0)..=(green, u64::MAX))
+      .next()
+      .map(|((_, base), _)| *base)
+  }
+
+  /// The work creation pending under `name`, when there is one (A-247).
+  pub fn pending_creation(&self, name: &str) -> Option<&crate::catalog::PendingCreationRecord> {
+    self.pending_creations.get(name)
+  }
+
+  /// Every work creation pending on this partition (A-247).
+  pub fn pending_creations(&self) -> impl Iterator<Item = &crate::catalog::PendingCreationRecord> {
+    self.pending_creations.values()
+  }
+
+  /// The work's submit awaiting its settle, when it has one (A-247).
+  pub fn pending_submit(&self, work: VolumeId) -> Option<&crate::catalog::PendingSubmitRecord> {
+    self.pending_submits.get(&work)
+  }
+
+  /// Every work's hold on a green of this partition (A-247), for the orphan check at recovery.
+  pub fn work_floors(&self) -> impl Iterator<Item = crate::catalog::WorkFloorRecord> + '_ {
+    self
+      .work_floors
+      .iter()
+      .map(|((green, work), base)| crate::catalog::WorkFloorRecord {
+        green: *green,
+        work: *work,
+        base: *base,
+      })
+  }
+
+  /// The work's floor on its green, when it holds one (A-247).
+  pub fn work_floor(&self, green: VolumeId, work: VolumeId) -> Option<u64> {
+    self.work_floors.get(&(green, work)).copied()
+  }
+
+  /// Records `work`'s hold of version `base` of `green`, in place of any it had (A-247), keeping the counts over them.
+  fn set_work_floor(&mut self, green: VolumeId, work: VolumeId, base: u64) {
+    if let Some(previous) = self.work_floors.insert((green, work), base) {
+      self.release_floor_count(green, previous);
+    }
+    let held = self.work_floor_counts.entry((green, base)).or_insert(0);
+    *held = held.saturating_add(1);
+  }
+
+  /// The guard of a work's records on a partition (A-247). A floor is one per live work, so it is bounded as the volumes
+  /// are; a drop of none is a no-op (a destroy's message may meet the recovery's orphan check). A pending submit is one a
+  /// work: a second while one waits is refused, so the first is never lost.
+  fn check_work_record(&self, op: &Op) -> Result<(), DbError> {
+    match op {
+      Op::WorkFloorSet { green, work, .. } => {
+        if self.work_floors.contains_key(&(*green, *work))
+          || self.work_floors.len() < self.caps.volumes
+        {
+          Ok(())
+        } else {
+          Err(DbError::Capacity {
+            table: "work floors",
+          })
+        }
+      }
+      // A name is held once on its partition: by a volume, an alias, or one pending creation.
+      Op::WorkCreationPending { record } => {
+        let held = self
+          .volume_by_name(&record.name)
+          .map(|volume| volume.id)
+          .or_else(|| self.name_alias(&record.name).map(|alias| alias.volume))
+          .or_else(|| {
+            self
+              .pending_creations
+              .get(&record.name)
+              .filter(|pending| *pending != record)
+              .map(|pending| pending.work)
+          });
+        match held {
+          Some(existing) => Err(DbError::AlreadyExists {
+            existing: existing.bytes,
+          }),
+          None if self.pending_creations.len() >= self.caps.volumes => Err(DbError::Capacity {
+            table: "pending work creations",
+          }),
+          None => Ok(()),
+        }
+      }
+      Op::WorkSubmitPending { record } => match self.pending_submits.get(&record.work) {
+        Some(pending) if pending != record => Err(DbError::AlreadyExists {
+          existing: record.work.bytes,
+        }),
+        _ => Ok(()),
+      },
+      _ => Ok(()),
+    }
+  }
+
+  /// Applies a work's floor or pending-submit record (A-247).
+  fn apply_work_floor(&mut self, op: &Op) {
+    match op {
+      Op::WorkFloorSet { green, work, base } => self.set_work_floor(*green, *work, *base),
+      Op::WorkFloorDropped { green, work } => {
+        if let Some(base) = self.work_floors.remove(&(*green, *work)) {
+          self.release_floor_count(*green, base);
+        }
+      }
+      Op::WorkSubmitPending { record } => {
+        self.pending_submits.insert(record.work, record.clone());
+      }
+      Op::WorkSubmitSettled { work } => {
+        self.pending_submits.remove(work);
+      }
+      Op::WorkCreationPending { record } => {
+        self
+          .pending_creations
+          .insert(record.name.clone(), record.clone());
+      }
+      Op::WorkCreationSettled { name } => {
+        self.pending_creations.remove(name);
+      }
+      _ => {}
+    }
+  }
+
+  /// Releases one work's hold of `base`.
+  fn release_floor_count(&mut self, green: VolumeId, base: u64) {
+    if let Some(held) = self.work_floor_counts.get_mut(&(green, base)) {
+      *held = held.saturating_sub(1);
+      if *held == 0 {
+        self.work_floor_counts.remove(&(green, base));
+      }
+    }
   }
 
   /// The alias this partition holds for `name`, if any (A-236): a name another partition's volume holds.
@@ -1060,6 +1215,12 @@ impl Partition {
       | Op::NfsCallsCleared { .. }
       | Op::NfsPurgeOwed { .. }
       | Op::NfsPurgeSettled { .. } => Ok(()),
+      Op::WorkFloorSet { .. }
+      | Op::WorkFloorDropped { .. }
+      | Op::WorkSubmitPending { .. }
+      | Op::WorkSubmitSettled { .. }
+      | Op::WorkCreationPending { .. }
+      | Op::WorkCreationSettled { .. } => self.check_work_record(op),
       Op::NameAliasReserved { .. }
       | Op::NameAliasConfirmed { .. }
       | Op::NameAliasReleased { .. }
@@ -1118,7 +1279,7 @@ impl Partition {
         }
         Ok(())
       }
-      Op::ConsumerRevoked { consumer } => self
+      Op::ConsumerRevoked { consumer } | Op::ConsumerWritePolicySet { consumer, .. } => self
         .consumers
         .get(consumer)
         .map(|_| ())
@@ -1414,6 +1575,15 @@ impl Partition {
         self.expired_attachments.push_back(*id);
         Ok(())
       }
+      Op::WorkFloorSet { .. }
+      | Op::WorkFloorDropped { .. }
+      | Op::WorkSubmitPending { .. }
+      | Op::WorkSubmitSettled { .. }
+      | Op::WorkCreationPending { .. }
+      | Op::WorkCreationSettled { .. } => {
+        self.apply_work_floor(op);
+        Ok(())
+      }
       Op::NameAliasReserved { record } => {
         self
           .name_aliases
@@ -1564,6 +1734,12 @@ impl Partition {
           .get_mut(consumer)
           .ok_or(DbError::NotFound)?
           .revoked = true;
+        Ok(())
+      }
+      Op::ConsumerWritePolicySet { consumer, policy } => {
+        let record = self.consumers.get_mut(consumer).ok_or(DbError::NotFound)?;
+        record.write = Some(*policy);
+        record.write_version = record.write_version.saturating_add(1);
         Ok(())
       }
       Op::LandingLeaseTaken { record } => {
@@ -1895,6 +2071,9 @@ impl Partition {
         })
         .collect(),
       name_aliases: self.name_aliases.values().cloned().collect(),
+      work_floors: self.work_floors().collect(),
+      pending_submits: self.pending_submits.values().cloned().collect(),
+      pending_creations: self.pending_creations.values().cloned().collect(),
       expired_attachments: self.expired_attachments.iter().copied().collect(),
       nfs_instance: self.nfs_instance,
       tombstones: self.tombstones().collect(),
@@ -1932,6 +2111,21 @@ impl Partition {
   /// Restores the expired CLI attachments a snapshot carries (A-230).
   fn restore_expired_attachments(&mut self, snapshot: &PartitionSnapshot) {
     self.expired_attachments = snapshot.expired_attachments.iter().copied().collect();
+  }
+
+  /// Restores the works' records a snapshot carries (A-247): their floors, pending submits and pending creations.
+  fn restore_work_records(&mut self, snapshot: &PartitionSnapshot) {
+    for pending in &snapshot.pending_creations {
+      self
+        .pending_creations
+        .insert(pending.name.clone(), pending.clone());
+    }
+    for pending in &snapshot.pending_submits {
+      self.pending_submits.insert(pending.work, pending.clone());
+    }
+    for floor in &snapshot.work_floors {
+      self.set_work_floor(floor.green, floor.work, floor.base);
+    }
   }
 
   /// Restores the name aliases a snapshot carries (A-236).
@@ -2079,6 +2273,7 @@ impl Partition {
     p.restore_merge(snapshot);
     p.restore_nfs(snapshot);
     p.restore_name_aliases(snapshot);
+    p.restore_work_records(snapshot);
     p.restore_expired_attachments(snapshot);
     p.restore_consumers_and_tombstones(snapshot);
     Ok(p)

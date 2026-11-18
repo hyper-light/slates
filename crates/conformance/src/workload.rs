@@ -150,6 +150,7 @@ git status --porcelain=v2 --branch
 /// fixed date, as the git workloads' do, and the clone's `hgrc` is written back with the source's relative path,
 /// since `hg clone` records a local source by its absolute path.
 const MERCURIAL: &str = r#"
+# Format: every commit's one fixed date, as the git workloads fix theirs.
 d='2026-09-14 00:00:00 +0000'
 hg init src
 cd src
@@ -213,7 +214,15 @@ hg -R ../shared status --all
 /// workload's absolute path, which the comparison replaces by the root token. Under Git for Windows' shell (A-300) the
 /// directory is taken in its drive form (`pwd -W`, `D:/a`; other shells refuse the option and the plain `pwd` answers),
 /// since a file URL names a Windows directory as `file:///D:/a`, and `svnlook youngest` ends its line with Windows'
-/// carriage return there, which the revision loop's count must not carry.
+/// carriage return there, which the revision loop's count must not carry. A revision's files are compared by what
+/// Subversion promises of them, never by their layout: FSFS numbers a revision's items in the order its commit wrote
+/// them, and the client sends a commit's file contents in an order two runs do not share (the rep-cache's item index
+/// of `d/b.txt`'s content in revision 2 was 3 in one run and 4 in the next, host and host on ubuntu, host and mount on
+/// macOS: CI run 44252249999, 2026-11-18). So `db/revs` and the representation cache (`db/rep-cache.db`, an SQLite file,
+/// whose pages two runs did not share either: run 44247840584) are left out of the byte comparison; the dump's checksum,
+/// `svnlook tree`, `svn log -v` and `svnadmin verify` print every revision's content, and the cache's rows print, where
+/// `sqlite3` is on the `PATH`, each content's hash, the revision that first stored it and its size. The revisions'
+/// properties (`db/revprops`) and the youngest revision (`db/current`) stay byte-compared.
 const SUBVERSION: &str = r#"
 top=$(pwd -W 2>/dev/null || pwd)
 case $top in
@@ -221,6 +230,7 @@ case $top in
   *) url="file:///$top/repo" ;;
 esac
 svn() { command svn --config-dir "$top/svn-config" --non-interactive --no-auth-cache "$@"; }
+# Format: every revision's one fixed date, and the repository's fixed UUID.
 printf '2026-09-14T00:00:00.000000Z' > date
 svnadmin create repo
 svnadmin setuuid repo 00000000-0000-4000-8000-00000000c0de
@@ -266,13 +276,18 @@ svn info --show-item last-changed-revision
 svn info --show-item url
 svn info --show-item repos-uuid
 svn log -v -r 1:HEAD '^/'
+# Format: revision 5 is the change on trunk, 6 the branch's merge into it.
 svn diff -c 5 '^/'
 svn propget svn:mergeinfo .
 svn cat -r 2 a.txt
 svn list -R '^/'
 cd ..
 svnadmin verify repo
+if command -v sqlite3 >/dev/null 2>&1; then
+  sqlite3 repo/db/rep-cache.db 'SELECT hash, revision, expanded_size FROM rep_cache ORDER BY hash'
+fi
 svnlook tree repo
+# Format: revision 6, the merge, as the repository records it.
 svnlook changed -r 6 repo
 svnadmin dump -q repo | cksum
 "#;
@@ -445,7 +460,10 @@ if grep -q 'new\.txt' events.txt; then echo "observed new.txt created"; else ech
 ///   in the cache, would be the one line that differs between runs);
 /// - under Git for Windows' shell (A-300), `ln -s` making a Windows symbolic link and failing where it cannot
 ///   (`winsymlinks:nativestrict`), as POSIX's does; by default that shell copies the target instead, which would hide
-///   whether the drive makes links (A-275). Every other shell ignores the variable.
+///   whether the drive makes links (A-275). Every other shell ignores the variable;
+/// - cargo's output uncolored: CI sets `CARGO_TERM_COLOR=always` for its own logs, under which the cargo workload's
+///   second build printed its `Fresh` line inside colour codes, so its count read 0 and the script failed alike on both
+///   sides of every leg (CI run 44252249999, macOS, 2026-11-18).
 pub const ENVIRONMENT: &[(&str, &str)] = &[
   ("GIT_AUTHOR_NAME", "slates"),
   ("GIT_AUTHOR_EMAIL", "slates@example.invalid"),
@@ -467,6 +485,7 @@ pub const ENVIRONMENT: &[(&str, &str)] = &[
   ("npm_config_audit", "false"),
   ("npm_config_logs_max", "0"),
   ("MSYS", "winsymlinks:nativestrict"),
+  ("CARGO_TERM_COLOR", "never"),
 ];
 
 /// [`ENVIRONMENT`] as POSIX shell `export` lines ([`export_line`]), for a leg that sets it inside a script (the live
@@ -609,6 +628,17 @@ pub const ROSTER: &[Workload] = &[
         "repo/db/uuid",
         "FSFS keeps a random instance id beside the repository's UUID, drawn anew by `svnadmin setuuid` by design; \
          the UUID itself is printed (`svn info --show-item repos-uuid`)",
+      ),
+      (
+        "repo/db/rep-cache.db",
+        "FSFS's representation cache is an SQLite file, whose pages SQLite lays out as it goes, and its rows name \
+         each content's place by the item number its revision gave it; each content's hash, first revision and size \
+         are printed where sqlite3 is on the PATH",
+      ),
+      (
+        "repo/db/revs/",
+        "FSFS numbers a revision's items in the order its commit wrote them, which two runs of the same commits do \
+         not share; every revision's content is printed (the dump's checksum, svnlook tree, svn log -v) and verified",
       ),
     ],
     runs_on_windows: true,
@@ -854,10 +884,12 @@ pub struct StatedDifference {
 }
 
 /// Why the WinFsp drive's link counts are not NTFS's (A-300).
-const NO_HARD_LINK_ON_THE_DRIVE: &str = "the WinFsp drive makes no hard link: WinFsp's driver answers \
-  FileLinkInformation STATUS_NOT_SUPPORTED before any file system is asked (v2.1, src/sys/fileinfo.c) and its NTFS \
-  compatibility page lists hard links unsupported, so a local clone copies on the drive where NTFS links; the bytes \
-  are the same (A-300)";
+const NO_HARD_LINK_ON_THE_DRIVE: &str = concat!(
+  "the WinFsp drive makes no hard link: WinFsp's driver answers ",
+  "FileLinkInformation STATUS_NOT_SUPPORTED before any file system is asked (v2.1, src/sys/fileinfo.c) and its NTFS ",
+  "compatibility page lists hard links unsupported, so a local clone copies on the drive where NTFS links; the bytes ",
+  "are the same (A-300)",
+);
 
 /// The WinFsp drive's stated differences: how many files of a local clone have two names (A-300). git and Mercurial
 /// link a local clone's files where the file system can and copy them where it cannot, so these lines count links on
