@@ -1269,9 +1269,6 @@ fn read_plain_range(
         stamp,
       }
     }
-    Err(slates_vfs::error::VfsError::IsDirectory) => refused(Refusal::BadRequest {
-      reason: "the path is a directory".to_owned(),
-    }),
     Err(e) => refused(refusal_of_vfs(&e)),
   }
 }
@@ -1344,9 +1341,6 @@ fn read_plain(state: &mut ShardState, volume: VolumeId, path: &str) -> ReplyBody
   };
   match read {
     Ok(bytes) => ReplyBody::ReadBytes { bytes },
-    Err(slates_vfs::error::VfsError::IsDirectory) => refused(Refusal::BadRequest {
-      reason: "the path is a directory".to_owned(),
-    }),
     Err(e) => refused(refusal_of_vfs(&e)),
   }
 }

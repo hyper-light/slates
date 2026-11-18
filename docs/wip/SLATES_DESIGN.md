@@ -1284,7 +1284,12 @@ never hidden as a successful smaller reservation. Admission prevents Slates from
 its verified host budget; it cannot constrain unrelated privileged allocators on the machine.
 
 **Dynamic volumes and base cache.** Growth increments derive from measured allocation rate
-and arena preparation time, bounded by the declared maximum and unpromised capacity. Cached
+and arena preparation time, bounded by the declared maximum and unpromised capacity. The same
+holds in every dimension, not bytes alone (A-342): a dynamic volume's inode allowance, derived
+from its maximum, is a ceiling it reserves nothing of. It holds a version slot for each live
+inode it makes, taken from the unpromised slots as the inode is issued, never given back while
+it lives, and returned whole at teardown; past the unpromised slots its next inode is refused
+`ENOSPC`, as its next byte is. Only a bounded claim reserves its whole inode allowance. Cached
 base bytes are evictable only while they can still be re-read from their identified source.
 Witnessed, copied-up and explicitly pinned bytes are retained obligations. Watcher hints speed
 invalidation but cannot prove a cache entry clean; revalidation and the racy-clean rules in
@@ -6917,6 +6922,11 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   receive loop at its first probe of a peer still starting (3 of 4 starts never formed). The fix that landed is
 >   liveness's (00c4add1, first pushed as d8a8d859: every Windows datagram socket, an adopted one too, made with
 >   `SIO_UDP_CONNRESET` and `SIO_UDP_NETRESET` off); the WinFsp flow needs it to form its fleet.
+> - *A publication that owed a whole record before the fleet knew the volume* (2026-11-18, g227): every claim above waits
+>   for the position `live_ship::durable_target` names, and while the volume's head was unplaced it named the head as
+>   it stood, ignoring a whole record owed for a publication that could not become an entry (the credit full with the
+>   candidates stopped). With nothing shipped yet a claim waited for nothing; with a head it waited one position short of
+>   the record holding its write. The owed record now counts placed or not (`owed_position`, unit-tested red first).
 > - *Landings* need no wait: a landing claims what it wrote to disk, which holds it; a takeover that loses the volume's
 >   undurable tail serves the disk's bytes through the base, and a later landing that would revert the disk is refused
 >   by the witness check.
@@ -7151,6 +7161,23 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   `a_successors_live_log_goes_on_past_every_position_durable_before_it` (`crates/server/tests/fleet.rs`). Owed: the
 >   adopted head lives in the successor shard's memory until the volume's first publication, as the volume's own image
 >   does (GAPS, A-325's live-shipped item).
+> - **A superseded owner stranded its clients (fixed 2026-11-18, A-338).** The nemesis (seeds 6876545201569229162,
+>   10695597685579409771 and 12136749566337968553) failed with "a fence-2 copy behind the fence-1 owner's durable head".
+>   Reproduced in-process (the owner cut off on the probe plane alone, its record plane whole, as the relay left it
+>   before A-330): the takeover completes, the holders' fences go to the successor's epoch, and the old owner learns it
+>   from a holder's `StaleEpoch` and keeps the volume fenced, as designed on 2026-11-05. But the old owner is the
+>   volume's creator, and a node forwarded only a volume it neither created nor recorded, so every verb through the
+>   old owner's node was answered there `StaleEpoch` for good; and a third node routed to the creator, which, readmitted
+>   under its id with its objects gone to their successors, redirected each forward `HomedElsewhere`, which routed to it
+>   again. So a stream whose front node was the old owner never reached the successor, the successor never shipped, and
+>   the only line shipping the volume was the old owner's fenced one. Now a superseded owner steps down: a volume whose
+>   log is fenced at a later epoch is routed to its current owner as any non-owner's is (`verbs::owned_by_another_host`),
+>   and a node asks its own routing for an object it holds before taking the creator for its owner
+>   (`owner_location`'s `known_owner`). The old owner's own first write after its loss may be the one that finds the
+>   fence, and is refused `StaleEpoch`; the next reaches the successor. Held by
+>   `a_superseded_owners_clients_reach_its_successor` (`crates/server/tests/fleet.rs`). Owed (GAPS): a mount on the old
+>   owner (NFS, FUSE) still answers `StaleEpoch`; a node with no routing entry for its own lost object takes itself as
+>   the creator route; and a successor ships a live volume only from its first write.
 
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
@@ -7722,7 +7749,13 @@ it builds against the contract and adds to it rather than around it.
   a commit asserts the version it was written against and matches exhaustively, so at its next
   vendoring a moved contract is a failed assertion beside the compile errors of the matches it must
   extend — never a variant falling silently through a wildcard. The wire types the contract
-  re-exports grow append-only (D-15) and count as the contract's where it returns them.
+  re-exports grow append-only (D-15) and count as the contract's where it returns them. A
+  test, not review, holds the rule. `crates/ipc/tests/wire_order.rs` compares every wire enum of
+  the protocol with its published tags (`tests/wire_order.txt`); `crates/db/tests/wire_order.rs`
+  does the same for the records the log keeps. A variant appended is published in its change by
+  the test's `--ignored` writer, which refuses to publish a moved tag. Anything else fails, naming
+  the enum and the first tag that moved (since 2026-11-18, after `SubmitApproved` moved from 69 to
+  71; it stays at 71).
 - *Laptop and fleet (R8).* One contract and one code path: the same calls, outcomes and errors on a
   laptop instance and on a fleet node; a fleet's own refusals (`Elsewhere`, `Retry` for an owner
   not confirmed) are variants a laptop never sends.
@@ -24972,3 +25005,65 @@ Applied in the same change to:
 - **The rule.** The live takeover records, on the owner shard where it materializes the volume, the head phase one
   adopted. The volume's shipper, made at its first publication, starts from that head and takes it once. A volume
   made on its own node starts from nothing, as before.
+
+### A-338 — A superseded owner steps down: its verbs on the volume it lost go to the successor, and a holder routes by its own routing before the creator (2026-11-18, g230, scale-out; §4.8 "Promotion and takeover", R8; the chaos nemesis's stranded owner)
+Applied in the same change to:
+- §4.10 live shipping: the chaos flows' status (a superseded owner stranded its clients).
+- `crates/server/src/verbs.rs`: `owned_by_another_host` routes a superseded volume. `crates/server/src/live_ship.rs`:
+  `superseded`. `crates/server/src/owner_location.rs`: `known_owner` asks this node's routing before the creator.
+- Tests: `a_superseded_owners_clients_reach_its_successor` (`crates/server/tests/fleet.rs`), red on main's code and red
+  with either guard removed.
+- GAPS: the entry of 2026-11-18.
+- **What was there.** A superseded owner kept its volume fenced and refused every write `StaleEpoch` (2026-11-05,
+  `a_superseded_owner_resumed_after_its_takeover_is_fenced`), and a node forwarded a verb only for a volume it had not
+  created and held no record of, so the old owner, its creator, answered every verb itself, for good. A third node took
+  the creator for the owner while its process lived; the creator, readmitted under its id with its objects gone to
+  their successors, redirected each forward `HomedElsewhere`, and the next forward went to it again.
+- **The rule.** A node that does not own a volume routes its verbs to the volume's owner, whoever created it (R8): a
+  node whose log of the volume was fenced at a later epoch does not own it, and a node that holds a copy of an object
+  asks its own routing (the records it accepted, the retirements it installed) before taking the creator for its
+  owner. The superseded owner's own first write after its loss may still be the one that finds the fence, and is
+  refused `StaleEpoch`; the next goes to the successor.
+
+### A-342 — A dynamic volume holds a version slot for each inode it makes, never its maximum's whole allowance; only a bounded claim reserves its allowance (2026-11-18, kiln goal g266: the HVF microVM review; decided by the supervisor under §4.2's rule, Ada may veto)
+Applied in the same change to: §4.2 "Dynamic volumes and base cache", GAPS (the AUD-29-25–30 row's open question, and
+the version-slab entries), `crates/mem/src/budget.rs` (`VersionBudget::grow`), `crates/vfs/src/volume.rs`
+(`Volume::holds_versions`, `version_hold`, `hold_versions`, `adopt_version_hold`; `next_no`, `admit_needs`),
+`crates/server/src/verbs.rs` (`admit`, the clone, the takeover, `rebuild_volume`, the resize, `release_slot_credits`,
+`release_version_hold` and every discard of an admitted volume), the tests (`crates/server/tests/dynamic_versions.rs`,
+the capped-slab scenarios of `crates/server/tests/daemon.rs`), and the bug record
+`docs/bugs/2026-11-18-a-dynamic-volume-reserved-the-whole-version-slab.md`.
+
+Status: built 2026-11-18.
+- **Why.** `admit` reserved every volume's whole inode allowance at creation, bounded or dynamic. A dynamic volume's
+  allowance is derived from its maximum (A-109) and capped at the slab, so a large maximum promised a near-empty
+  volume every version slot: kiln's agent volumes (a quarter of the machine's memory) did, one holding 54 bytes
+  committing 7,456,539 of its shard's 7,456,540 slots. A snapshot of it could then retain nothing. kiln's review of a
+  microVM's volume snapshots it and reads each listed file at the head, and the first read of an untouched base file
+  materializes its entry into a directory the snapshot pins, which retains one version: refused `NoSpace` (3 of 3
+  HVF runs). A second volume on the shard was refused too, so a two-shard kiln instance held two agent volumes. The
+  question was open since 2026-10-01 (GAPS, AUD-29-25–30).
+- **The rule.** §4.2 decides it: a bounded claim backs its whole quota; dynamic growth consumes only unpromised
+  capacity. Version slots are capacity as bytes are, and a dynamic volume reserves no bytes up front, so it reserves no
+  slots up front either.
+  - A dynamic volume reserves nothing at admission.
+  - It holds a slot for each live inode, taken from the unpromised slots (the slab less every bounded claim's
+    reservation, every hold and retention, and the copy-up headroom) as the inode is issued: `next_no`, admitted with
+    a verb's retention in `admit_needs`, both from the same capacity.
+  - Its hold never shrinks while it lives: an unlinked inode's slot backs its next one, as its byte growth does.
+  - Its owner returns the hold whole at teardown or discard.
+  - A clone takes slots for the inodes it inherits before it pins the snapshot; a taken-over or recovered volume for
+    the inodes it was rebuilt with.
+  - Its allowance stays the ceiling `next_no` refuses at.
+- **What a dynamic volume no longer gets.** A guaranteed inode count up to its maximum. Past the unpromised slots its
+  next inode is refused `ENOSPC`, as its next byte is past the unpromised bytes. That is its stated contract (§4.2,
+  T-1.5). A volume that needs a guaranteed count is a bounded claim.
+- **Test.** `crates/server/tests/dynamic_versions.rs`, red on main (f6c515447, run r1634, macOS arm64):
+  - After a snapshot, the first read of an untouched base file was refused `NoSpace`.
+  - A dynamic volume beside a bounded claim was refused `BudgetExceeded { available: 48 }`, wanting its maximum's 63
+    slots.
+
+  Green after: the read answers the disk's bytes; the volumes commit a handful of slots; a dynamic volume grows into
+  the unpromised slots and is then refused `NoSpace` while the claim makes every file its allowance holds; a destroyed
+  volume's hold comes back whole. The daemon suite's capped-slab scenarios now fill the slab with a bounded claim and a
+  dynamic volume grown into the rest.
