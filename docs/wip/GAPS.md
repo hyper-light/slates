@@ -3748,9 +3748,12 @@
 >   anchor opens that process for `SYNCHRONIZE` and a limited query alone, judges it by its creation time (a reused pid is
 >   never taken for the daemon), and waits on the claim's Event and the process at once, ending at the daemon's exit; a
 >   process handle keeps no object the process named, so neither the bootstrap name nor the owner's token outlives the
->   daemon and no successor's takeover is refused (A-176). Owed in C-a: the fleet tests' `CREDIT_WAIT` in daemon time,
->   and the macOS region fetch's own wait for the owner's turn (the Mach reply's send-once notification would end it at
->   the owner's death); Windows' run of the cross-process rendezvous file is filed for main. Class B (the
+>   daemon and no successor's takeover is refused (A-176). The macOS region fetch since A-452 (2026-11-18, g251): it
+>   waited a fixed second to send and again to receive, so an owner alive and slow to answer was reported gone and one
+>   that went away was reported keeping nothing; now neither has a timeout, a dead owner's port refuses the send and the
+>   kernel's send-once notification ends the receive (`a_fetch_answered_past_the_claim_wait_is_served`,
+>   `a_fetch_whose_owner_went_away_is_refused_by_its_departure`). Owed in C-a: the fleet tests' `CREDIT_WAIT` in daemon
+>   time; Windows' run of the cross-process rendezvous file is filed for main. Class B (the
 >   transport's round-trip estimate) is open, but for the owner-location round (2026-11-18, A-437, goal g255: one
 >   liveness window, hard, for its asks and its lent sessions; now the record plane's round budget over the slowest
 >   asked path's measured tail, `owner_location::round_budget_for`), an operator's promotion forwarded to the root

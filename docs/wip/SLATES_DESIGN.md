@@ -31047,3 +31047,23 @@ remote_attach}.rs`.
 
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class C), `crates/ipc/src/{rendezvous,exit_watch,
 wake}.rs`, `unsafe-budget.toml` (slates-ipc 141 to 146).
+
+### A-452 — The macOS region fetch waits while its owner lives: no timeout, the kernel's send-once notification ending it at the owner's departure (2026-11-18, goal 85 via g251; R3's class C, C-a; §4.7 "Rendezvous"; GAP-A9-9, A-178, A-443)
+
+- **What was there.** A macOS claimant fetches its answered region from the instance's owner over the owner's token
+  (`mach_claim::fetch`, GAP-A9-9). The fetch waited a fixed second for its send to be queued and another for the answer
+  (the claim wait), so an owner alive and slow to answer (its thread descheduled on a busy machine) was reported gone,
+  and an owner that went away with the fetch queued was reported as keeping nothing for the claim: the kernel's notice
+  of the fetch's destroyed send-once right was read as a malformed answer.
+- **The rule.** The fetch waits while its owner lives, never by a clock, as a claim does (A-443): its send has no
+  timeout, so it waits for room in the owner's queue until it is queued or the owner's port dies (refused
+  `MACH_SEND_INVALID_DEST`); its receive has none, so it waits for the owner's answer until the kernel's send-once
+  notification (`MACH_NOTIFY_SEND_ONCE`) says the owner went away holding the fetch's reply right, or with the fetch
+  still in its queue, each refused as an owner that went away.
+- **Tests.** `a_fetch_answered_past_the_claim_wait_is_served` (the token held with nothing serving it, a region kept,
+  the fetch made, and the owner's service started half again the claim wait later: the region fetched) and
+  `a_fetch_whose_owner_went_away_is_refused_by_its_departure` (the token let go with the fetch queued: refused as an
+  owner that went away, at once). Red with the old timeouts: the first refused at the second, the second reported as
+  an owner keeping nothing.
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class C), `crates/ipc/src/{mach_claim,rendezvous}.rs`.
