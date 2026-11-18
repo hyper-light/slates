@@ -116,7 +116,11 @@
 >   written where the design says. A-265 writes them where the design says: every record is held by the control
 >   shard's partition (a record made on another shard owed to it as one batch), `Audit` is served there a page at a
 >   time, one sequence numbers the daemon's audit, and `a_client_on_any_shard_reads_every_shards_audit`
->   (`crates/server/tests/audit_pages.rs`) reads every record from clients on both of two shards;
+>   (`crates/server/tests/audit_pages.rs`) reads every record from clients on both of two shards. Through the contract,
+>   on the shards kiln starts: `a_signed_landings_audit_reads_back_on_every_shard_kiln_starts` (`crates/api/tests/api.rs`)
+>   reads a signed landing's planned and finished records, verified, from four instances on both shards; on main
+>   79aee2a17, before A-265, the landing instance's whole audit read `[]` (Mac Studio, kiln r3614), and it passes with
+>   A-265 (r3621);
 > - a real FIDO key's signature end to end (the touch flag is proven with a software stand-in): it needs a physical key,
 >   which only a person holds, or OpenSSH's software authenticator (`regress/misc/sk-dummy`, built from OpenSSH's source
 >   and loaded by `ssh-keygen -w`), a tool build CLAUDE.md §2 item 14 reserves for Ada; macOS's OpenSSH 10.2p1 on the
