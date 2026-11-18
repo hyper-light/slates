@@ -1,0 +1,32 @@
+# DIAG (not for main): g254's owed run under load (A-311, A-312): the many-shard start test 5 times beside two spinners a
+# CPU at nice 19, on Linux x86_64, Linux arm64 and macOS arm64.
+name: diag-integrator-start
+on:
+  push:
+    branches: ['diag-integrator-start-*']
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  start-under-load:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the test
+        run: cargo test --locked -p slates-cli --test cli --no-run
+      - name: The many-shard start under spinners
+        run: bash .github/diag-integrator-start.sh
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: start-results-${{ matrix.os }}
+          path: target/start-*
