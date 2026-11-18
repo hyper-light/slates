@@ -1,0 +1,43 @@
+# Diagnostics only, never merged (g251): A-318 on CI's ThreadSanitizer lane. The lane as ci.yml runs it, twice in
+# parallel, so a spinning verdict that comes one run in two shows; the watchdog's start lines name the measured
+# slowdown and the spin window.
+name: diag-g251-tsan
+
+on:
+  push:
+    branches: [diag-g251-tsan]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  tsan:
+    name: TSan with the build-held spin window (g251, run ${{ matrix.run }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        run: [1, 2]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - name: TSan (the race canary must be reported; then the suites, any report fails)
+        shell: bash
+        env:
+          SLATES_TEST_RESTART_SLOWDOWN: "25"
+        run: |
+          set -o pipefail
+          cargo xtask tsan 2>&1 | tee tsan.log
+      - name: What the watchdogs measured and judged
+        if: success() || failure()
+        shell: bash
+        run: |
+          grep -oE 'or after [0-9]+ ms of CPU without a step|runs compiled code [0-9.]+ times as slowly[^;)]*' tsan.log | sort | uniq -c | sort -rn | head -20
+          grep -E 'is spinning|is wedged|ends the daemon.s process \(exit' tsan.log | cut -c1-300 | head -20
+          grep -E '^test result: FAILED|process didn.t exit|panicked at' tsan.log | cut -c1-300 | head -20
