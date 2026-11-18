@@ -1255,6 +1255,20 @@ shards, replay, delayed replies or cancellation. A remote holder makes the same 
 against its own machine before acknowledging placement. A promise on host A reserves nothing
 on host B. Configuration and holder records expose the actual reservation and generation.
 
+> **Status (2026-11-18, g229: a candidate's admission is owed).** A candidate makes no admission
+> before it holds a live log (§4.10). It keeps the log's entries on its heap (`live_ship::keep`, at
+> most twice the volume's quota, outside the shard budget) and reserves nothing. A successor reserves a
+> bounded claim only at its restore (`verbs::make_restored`), and the successor is the
+> configuration's rendezvous pick among the retirement's survivors
+> (`RegionalConfiguration::successor`), never chosen by room. So a successor whose shard cannot admit
+> the claim refuses its own restore `BudgetExceeded` each period, and after the failover SLO's
+> attempts gives the volume up (`NotRecovered { TakeoverIncomplete }`, final), while another survivor
+> holds every acknowledged write. CI's 7 GB macOS runner showed it, a 782 MiB claim being 76 % of a
+> shard there (GAPS, the chaos entry, 2026-11-18). Owed: every candidate of the volume's recovery
+> cohort reserves the claim when it takes the log's first entry; the successor's restore takes that
+> reservation over; a placement a candidate cannot admit is refused typed at `live-ship`; and the
+> held log is charged.
+
 **Resource dimensions.** A byte quota cannot bound arbitrarily many empty files, names,
 xattrs, open handles or snapshots. Admission therefore publishes a resource vector: content
 bytes plus inode/namespace, xattr, handle, in-flight and retention allowances, each derived
@@ -1892,9 +1906,10 @@ landing constants are in §4.15.
 > detector's periods at their measured running tail, `E` the council's death-confirmation window at the measured period, `R` the tail of
 > the takeovers and volumes it timed (the ratified recovery budget before the first), and publishes it in its status
 > (`FleetReport::failover`). **Since A-375 the waits that bound a failover read it** (a forward's bound, the location
-> round's cap, a held reply's total, a takeover's attempts), fanned to every shard in whole coordinator periods; the
-> lease terms still read the operator's 10 s placeholder above until each takes a term of its own (A-363's owed list;
-> GAPS, the `LIVENESS_BUDGET_NS` entry).
+> round's cap, a held reply's total, a takeover's attempts), fanned to every shard in whole coordinator periods; **since
+> A-384 a CLI attachment's term is its holder's**, at most the failover delay; the other lease terms still read the
+> operator's 10 s placeholder above until each takes a term of its own (A-363's owed list; GAPS, the
+> `LIVENESS_BUDGET_NS` entry).
 
 **Worked example.** An agent clones snapshot S of a 2 million-file volume: the reply arrives in one
 ring round trip; the clone's `referenced_bytes` equals S's referenced bytes (charged in full),
@@ -1965,8 +1980,12 @@ epoch copies only its table, never a value.
     the default's entries as its access ACL when they say more than its mode, and a new directory takes the default
     too. A symlink takes neither. Without a default ACL, a FUSE creator's umask is applied, and an NFS client applied
     its own.
-  - **Not kept:** Linux clears set-group-ID when a caller outside the file's group sets its ACL. The FUSE wire carries
-    that judgement only under `FUSE_SETXATTR_EXT`, which slates does not negotiate (GAPS).
+  - **An access ACL set from outside the file's group clears its set-group-ID bit** (A-378), as Linux does
+    (`posix_acl_update_mode`). The guest's kernel says so: the route asks for `FUSE_SETXATTR_EXT`, the form of
+    SETXATTR whose request carries the setter's flags, and the kernel sets `FUSE_SETXATTR_ACL_KILL_SGID` there for a
+    setter outside the group without `CAP_FSETID`. The server clears the bit once the ACL is set; a default ACL's set
+    leaves it, as on Linux. The form is the connection's, settled by its `INIT`, so a Shards stream keeps it through
+    its resync and its restore, which send none.
 
   Every other `system.` name stays refused on every route.
 
@@ -4367,8 +4386,9 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 - the guest's own attribute namespaces, `trusted.` and `security.`, and its POSIX ACLs are kept in the volume as its
   data and shown to no host's mount (A-290, A-302, §4.5 "Extended attributes"); an ACL's named owners are kept through
   the stream's owner view; the guest's kernel is asked to enforce its ACLs, which the shared seam keeps in step with
-  the mode and gives at every create under a default ACL (A-314); an acknowledged attribute change is published before
-  its reply;
+  the mode and gives at every create under a default ACL (A-314), and to send SETXATTR in its extended form, which says
+  when an access ACL's setter is outside the file's group so the file's set-group-ID bit goes (A-378); an acknowledged
+  attribute change is published before its reply;
 - Shards' owner word (`trusted.shards.owner`, its value `UID:GID`) is the stream's to take, never a file's attribute
   (A-281). Shards' init sets it on a share's root as it mounts the share, so that a run of an unprivileged user can
   write the share it was given. It is taken from the guest's root on the stream's root alone, and refused otherwise
@@ -4391,11 +4411,11 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 - a VM's save and restore (Shards' D176 part 5; A-303): a SAVE, which the device sends while it is paused and so
   between requests, waits for the guest's stores through its maps to reach the volume, then takes a snapshot of the
   volume for the attachment's own principal, publishes it, and is answered with the stream's tables, opaque to Shards
-  and checked by a CRC-32C: the volume and the snapshot, the directory presented, the owner view, and each inode the
-  guest holds with its references and opens. A RESTORE is taken only as a fresh stream's first frame, onto the volume
-  saved while unchanged since the cut or a clone of the cut's snapshot, presenting the same directory; the stream's
-  attachment then holds what the saved one did, a file the guest held with no name left included, and its guest is
-  shown the same owners. A handle the restored guest's kernel kept gives its open back at its release, as one from
+  and checked by a CRC-32C: the volume and the snapshot, the directory presented, the owner view, the form of SETXATTR
+  the guest's kernel sends (A-378), and each inode the guest holds with its references and opens. A RESTORE is taken
+  only as a fresh stream's first frame, onto the volume saved while unchanged since the cut or a clone of the cut's
+  snapshot, presenting the same directory; the stream's attachment then holds what the saved one did, a file the guest
+  held with no name left included, its guest is shown the same owners and its requests are read in the same form. A handle the restored guest's kernel kept gives its open back at its release, as one from
   before a takeover does (A-152). Anything else is refused with its reason, and changes nothing;
 - a resync channel beside the stream (A-316; `slates_bridge_fuse::shards_resync`), for a stream to outlive its
   daemon on Shards' coordinator's conditions (2026-11-18): a pair made at the attach, whose first message, `Attached`,
@@ -4404,8 +4424,9 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
   macOS (A-339) a stream of 28-byte messages, since a datagram pair's survivor is never told its peer has gone, whose
   device end rides beside the stream's in the socket route's confirmation; Windows hands none yet. The daemon's end is
   held by the anchor, as a FUSE device is, and the daemon keeps its own copy while the anchor holds one (A-339: XNU's
-  collector of descriptors in flight flushes a socket whose every copy rides a message), with the token and the
-  stream's owner view as its session, updated when the guest names its owner, and released when the attachment ends.
+  collector of descriptors in flight flushes a socket whose every copy rides a message), with the token, the stream's
+  owner view and its kernel's SETXATTR form as its session (A-378), updated when the guest names its owner, when its
+  kernel's `INIT` is answered and when a RESTORE takes a saved guest's tables, and released when the attachment ends.
   A stream whose guest maps files with DAX keeps its resync (A-365): the anchor holds each file's DAX object before its
   first descriptor goes to the device, and the shard's DAX range table in anchor RAM records each range answered and
   whether it was asked writable, a slot a range, its slots derived from the fill budget; a refusal of either gives the
@@ -4425,10 +4446,10 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 - the peer's close, a hostile frame, a detach, a revocation, the volume's destroy and the daemon's stop end the
   attachment one way: its references swept, its record removed, its resync channel released. A daemon's death ends
   nothing by itself: recovery keeps a Shards attachment whose resync end the anchor held (Linux, A-316; macOS, A-339)
-  and serves it on a fresh stream, its owner view and token from the hold, its references and opens from the image,
-  the reply the dead daemon published and never wrote answering the request the device resends, and the writes it
-  acknowledged after its last publication replayed from the write log (A-63) as a mount's are; it removes any other's
-  record, as before.
+  and serves it on a fresh stream, its owner view, its SETXATTR form and token from the hold, its references and opens
+  from the image, the reply the dead daemon published and never wrote answering the request the device resends, and
+  the writes it acknowledged after its last publication replayed from the write log (A-63) as a mount's are; it removes
+  any other's record, as before.
 
 > **Status (2026-10-24).** Built and proven by use, in-process: `crates/server/src/shards.rs` (the serve task),
 > `crates/ipc/src/stream.rs` (the pair), `crates/bridge-fuse/src/shards_fs.rs` (the frames and their answers),
@@ -4509,6 +4530,16 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 > same (`crates/bridge-fuse/tests/shards_fs.rs`; the rules' unit tests in `crates/bridge-core/src/posix_acl.rs`). Owed:
 > a real guest's run (a Shards guest over a stream, a VM over slates' own virtio-fs device), and Shards' own server
 > enforcing them too (Shards' side, after its v0.8.0 tag).
+
+> **Status (2026-11-18, A-378, the set-group-ID bit an ACL's set clears).** Built and proven by use. A guest's INIT is
+> answered with `FUSE_SETXATTR_EXT` beside `FUSE_POSIX_ACL`, a host's with neither; an access ACL set in the extended
+> form with `FUSE_SETXATTR_ACL_KILL_SGID` on a 02660 file leaves it 0660, one without the flag leaves it 02660, and a
+> default ACL's set leaves a set-group-ID directory's bit (`crates/bridge-fuse/tests/shards_fs.rs`); the virtio-fs
+> device reads the form from the INIT reply it sends and serves an extended SETXATTR in the same pass
+> (`crates/bridge-virtiofs/tests/device.rs`); a stream reads it from its INIT, and a restored stream, and a stream
+> resynced after its daemon's death, go on reading it with no INIT (`crates/server/tests/shards.rs`,
+> `shards_resync.rs`, `shards_resync_restart.rs`). Owed: a real guest's run, a non-member's `setfacl` on a
+> set-group-ID file over a Shards stream and over slates' own virtio-fs device.
 
 > **Status (2026-11-18, A-316, the successor's half).** Built and proven by use on Linux, with a test that plays the
 > anchor and the device across a daemon's death (`crates/server/tests/shards_resync_restart.rs`): each of two streams'
@@ -4829,6 +4860,19 @@ Ownership: the daemon creates the region (memfd / shm_open object / pagefile sec
 and hands it to one client; the client writes only `cmd` slots and the `parked` flag; the daemon
 writes only `cpl` slots and the wake word; large payloads (archive streams, big reads through the
 SDK) travel through a per-client bulk region referenced by offset from a slot.
+
+> **Status (2026-11-18, A-381): a client's ring wakes only its own shard.** On macOS and Windows a client of a shard
+> that has announced itself idle rings the bootstrap object's daemon-wide doorbell, and the daemon's doorbell thread
+> kicks shards. It kicked every shard at every ring: at 1,000 clients over 23 shards on a Mac Studio each shard parked
+> and woke about 7,500 times a second, alike on shards serving one connection and two, and the control shard ran a
+> claim round for every request. A ring now marks the shard its region names (a bit a shard id in the bootstrap
+> object, with a summary bit a word, so the thread reads only the words a ring touched) and a claim marks the claim
+> (the header's word beside the doorbell), and the thread kicks the shards marked: the control shard only for a
+> claim. The bootstrap object's magic is `SLB2`, so a client or an object of the layout before is refused as another
+> layout, never served with its rings unheard. Linux clients write their shard's own kick descriptor, as before.
+> Tests: `a_ring_marks_only_the_shard_it_names_and_a_claim_marks_the_claim` (`slates-ipc`) and
+> `a_clients_ring_wakes_only_the_shard_that_serves_it` (`crates/server/tests/doorbell.rs`), red with the thread
+> kicking every shard.
 
 > **Status (2026-09-19, Linux rendezvous):** the control shard drains the listener and
 > awaits its next one-shot driver readiness. Connections already queued or arriving during
@@ -5516,8 +5560,13 @@ A regional learner fetches from every member of its region it holds a session to
 list is its join state's and a fetched view does not update it, so a learner that joined from the bootstrapper had no one
 to ask once that voter left (2026-11-08). Any member can answer, since what it serves is a configuration it applied, and
 adoption only moves forward.
-A learner's reports to the council go to the same members, and the leader proposes them. The fetched reply also names the
-voters, which the learner keeps and its contact rule reads, so it stays in direct contact with the council it reports to.
+A learner's reports to the council go to the same members, and the leader proposes them. The configuration records the
+council's voters (A-380): once no change is in flight, the leader records the voters in force (`ConfigCommand::Seat`,
+`RegionalConfiguration::seat`), so a learner names who votes from the configuration it fetches, its contact rule reads
+them, and a seat change, a Raft configuration entry that moves no version itself, reaches every learner by the version
+its record moves, as any other change does. Before, the fetched reply named the answerer's known voters, adopted only
+with a newer view: a learner kept the voters of its join and of whichever answer first brought a version, and named a
+voter long gone (`a_learner_learns_who_votes_once_the_voter_it_joined_from_is_gone`, 3 of 24 runs at one CPU).
 A node the council configuration it holds does not name keeps direct contact with every member it holds alive, as a
 forming node does, until it holds one that names it (A-331). That is a fresh member whose join was answered before the
 council admitted it, or a member retired while it was away. Judged by the member rule a fresh member kept no peer at
@@ -5528,9 +5577,9 @@ main's first gated runs, 2026-11-18). A retired member kept only its old neighbo
 A pair's canonical dialer, its lower anchor, also keeps contact with a peer that holds a record session it dialed to it
 (A-337): a peer dials and keeps one only while its own rule keeps this node, and the pair's plane is keyed only from the
 lower anchor's side, so that side follows the peer's demand whatever its own view says. Each role rule is kept from both
-sides only while both hold the same view, and a learner's voters can be stale (a seat change moves no configuration
-version, so no learner fetches on it, and a learner answered by another learner takes that one's voters): a learner, the
-pair's lower anchor, dropped a voter that kept it, and the pair was never keyed (fleet test
+sides only while both hold the same view, and a learner's voters could be stale (until A-380 a seat change moved no
+configuration version, so no learner fetched on it, and a learner answered by another learner took that one's voters): a
+learner, the pair's lower anchor, dropped a voter that kept it, and the pair was never keyed (fleet test
 `a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone`, g251's diag run 44262759484, 2026-11-18).
 Only the lower anchor follows a session, so no two nodes keep each other by their sessions alone.
 Bootstrap installs the current durability-policy result on every shard. Its loss calculation
@@ -8176,7 +8225,10 @@ past that. One flow of the verbs, every outcome and refusal asserted as its type
 > **Status (2026-11-18, A-310).** Built: `crates/api/src/seam.rs`, `crates/api/src/sim.rs`, the contract at version 9,
 > and the suite over an in-process instance and over the simulator. A pinned snapshot's destroy reaches a consumer as
 > `Invalid::Request` with the volume core's `Pinned` as its note, untyped; the simulator answers the same, and a typed
-> class for it is owed to the contract.
+> class for it is owed to the contract. (Amended 2026-11-18: typed since `CONTRACT` 15, `Busy::Volume(Pinned)`, which
+> the simulator answers and the suite asserts. At `CONTRACT` 30 the suite passes over an in-process instance and over
+> the simulator, on a Mac Studio, kiln run r160. The seam's signatures are unchanged since 16, and the error classes
+> added since reach it as they reach the instance.)
 
 **The consumer contract (A-299).** Everything a consumer touches goes through `slates-api` (Ada,
 2026-11-18): provisioning and managing volumes, serving them, landing, merging, their conflicts,
@@ -8415,6 +8467,10 @@ it builds against the contract and adds to it rather than around it.
 > its detection, confirmation and recovery terms, each with the measurements behind it (round trips, coordinator
 > periods, takeovers and volumes timed), so a consumer tells a measured term from a prior. `slates status` prints
 > `fleet_failover: ...` and MCP's daemon status carries it under `fleet.failover`.
+> **`CONTRACT` = 30 (found by g90):** a granted landing that is refused ends its audit trail: the records of the steps
+> its attempt took, then a `LandingFinished` whose outcome is `Refused`, or `Aborted` once it wrote an entry
+> (§4.15's status of the same day); such an end that names no manifest carries no `verification`. No type changed; the
+> `audit` verb's answer did, so the number moves. Until then a refused landing's trail ended at its grant.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -9044,6 +9100,16 @@ would need a privilege slates never holds (R10).
 > plan, grant, plan, plan under the grant, validation, entry, finish; now each step once
 > (`a_presented_then_granted_landing_records_each_step_once` in `crates/server/tests/presentations.rs`, red on the old
 > mirror). Record: `docs/bugs/2026-11-18-a-presented-landings-plan-was-audited-twice.md`.
+
+> **Status (2026-11-18, a refused granted landing leaves its trail).** A granted landing refused at any step from the
+> moment its id is decided (its target's lease, its volume, its plan or grant, its validation, its run) records, in its
+> completion's atom, the engine ring's records of its attempt and then its end (`landing::record_refused`). The end is
+> a `LandingFinished` whose outcome is `Refused`, or `Aborted` once the attempt wrote an entry. It names the manifest
+> the attempt planned (its grant's when it planned none) and its signature's verdict against that manifest. A plan no
+> grant covers ends in a presentation instead, which records itself. Before, a refused landing's trail ended at its
+> grant. An end that names no manifest (refused before any plan, under a grant that names none) records no verdict, and
+> `Audit` reads none on it. Proven by four refusals in `crates/server/tests/presentations.rs`, three of them red before
+> (macOS arm64, Mac Studio, 2026-11-18). Record: `docs/bugs/2026-11-18-a-refused-granted-landing-left-no-trail.md`.
 
 > **Status (2026-10-01, AUD-29-62: contained base access on every platform).** The Windows base host is
 > descriptor-relative like the Unix one: it retains a handle per opened directory and opens each entry with
@@ -14597,7 +14663,8 @@ Status: built 2026-10-06. It closes the FUSE part of A-32's owed list.
     volume keeps them; a host's mount is as above.)
   - A get or list with size 0 answers the length (`fuse_getxattr_out`); a buffer too small is `ERANGE`.
   - `XATTR_CREATE` and `XATTR_REPLACE` map to the volume's `XattrSet`.
-  - The setxattr body is the short form, because `FUSE_SETXATTR_EXT` is not negotiated.
+  - The setxattr body is the short form, because `FUSE_SETXATTR_EXT` is not negotiated. (Amended 2026-11-18 by A-378:
+    a guest kernel's route negotiates it, and its body is then the extended form; a host's mount keeps the short form.)
 - Why: until now every attribute operation was answered `ENOSYS`, so the kernel told every caller "not supported".
   `setfattr -n user.x` failed in an adversarial container run, and tools that tag files (download origins, build
   caches, `rsync -X`) lost their attributes on a slates mount.
@@ -24670,6 +24737,8 @@ Applied in the same change to:
   `FUSE_SETXATTR_EXT`, which widens SETXATTR's request per connection; no request decoder here takes a negotiated
   form yet, and a stream restored or resynced without INIT would have to carry it. So the bit stays, as on any FUSE
   server without that flag (`fs/fuse/acl.c`: such servers "don't expect setgid bits to be stripped"). Owed in GAPS.
+  (Amended 2026-11-18 by A-378: kept. A guest's route negotiates the extended form, every transport reads it from the
+  `INIT` reply it sent, and a Shards stream carries it through its resync and its restore.)
 - **Evidence.** Failing first: kiln run r783 (macOS arm64, runner f3f618f2, 2026-11-18) of the three tests on the
   tree before the change: the INIT kept no `FUSE_POSIX_ACL`; the file made under the default ACL was 0644 (the umask
   applied) where Linux makes 0660; the file `setfacl` granted was still 0600 where Linux makes 0660. The other six
@@ -25292,7 +25361,9 @@ model below; each red before its fix):
   one, and nothing in the configuration tells which. Owed (GAPS): a holder an owner's neighbourhood settled away from
   lets its copies go at that settle, on the owner's report, so these do not stay. (Wrong as stated, A-335: the settle
   report covers records, not content, and a head may go on naming such a holder's content; a stale copy whose content
-  its holder still keeps is kept whole since A-335.)
+  its holder still keeps is kept whole since A-335.) Since A-341 the kept retirement does tell, at a successor's
+  confirmation: an unasked copy goes as a stale one where the object's settled cohorts are within tolerance
+  (`RegionalConfiguration::within_tolerance`), and is kept past tolerance or when judged on a completion record.
 - **Bounded** (banned item 8): at most one record per member (`completed_bound`), the oldest let go first, but never
   the record of a survivor that left owing its share while the retirement it carried is kept, since that retirement's
   completion rests on it. A holder that lags past a let-go record keeps a stale copy: a leak bounded by what it holds,
@@ -25481,6 +25552,7 @@ Applied in the same change to:
   channel alone proves nothing to a device that checks the token.
 - **The anchor needs nothing new.** The daemon's end is an ordinary held descriptor (`slates_anchor::held`'s hold,
   session and release, keyed by attachment); its session is the token and the owner view, 32 bytes, the anchor's cap.
+  (Amended 2026-11-18 by A-378: and the connection's SETXATTR form, 40 bytes; the anchor's cap is 64.)
   The next daemon tells it from a FUSE device by the form of the attachment's record. Until the successor's half is
   built it releases every such end as one no record of its kind claims (`crate::fuse::adopt_held`; macOS releases every
   held descriptor), so the device reads the channel's end once recovery has run: Shards' option (a), as before.
@@ -27797,6 +27869,227 @@ lists, the kept verdicts, `longest_name`, `widest_report`), `crates/vfs/src/base
   refused `Unsupported`, naming `ReadRange`, and kept with `ReplyBody::ReadBytes` in its published place, since
   removing either moved every tag after it, which main's wire-order test (853943af0) refuses (D-15: a completion
   record keeps its reply unframed). Retired, not kept beside: no second read path serves.
+
+### A-380 — The council records its voters in the versioned regional configuration, so a learner names who votes from the configuration it fetches (2026-11-18, goal g225: a forming fleet reaches every candidate; §4.8 learners; the open item A-337 recorded)
+
+- **What was there.** A learner takes no part in the council's Raft. It knew who votes from its join state's voters and
+  from the voters a fetch reply named (the answerer's known voters), adopted only with a newer configuration view. A
+  seat change is a Raft configuration entry with no command, so it moved no configuration version: no learner fetched
+  on it, and a fetch at the same version adopted nothing. So a learner kept the voters of its join, or the stale voters
+  of another learner that answered first, and named a voter long gone: `a_learner_learns_who_votes_once_the_voter_it_joined_from_is_gone`
+  failed 3 of 24 runs at one CPU beside two busy loops (diag-g225-forming-fleet-reaches-2), each a learner naming only
+  the stopped bootstrapper. The contact rule read those voters too; A-337 kept the pair keyed in spite of them.
+- **The rule.** `RegionalConfiguration::voters` records the council's voters, in id order, and `seat` changes them with
+  the version, as any change does. The leader proposes `ConfigCommand::Seat` with the voters in force whenever no change
+  is in flight (it is caught up and out of any joint configuration) and they differ from the record
+  (`RegionalCouncil::record_voters`, each leader period). A learner's `known_voters` reads the record of the
+  configuration it holds, its join state's voters before any record. The fetch reply no longer carries voters, and a
+  learner keeps none of its own: the configuration carries them, and adoption moves only forward.
+- **Why this and not another.** A version is how a learner learns any change (the announcements on probes, a refusal of
+  `ConfigurationStale`, a divergence of its view); giving the voters their own version, or a learner a periodic fetch,
+  would be a second way to learn a configuration. Taking the voters from a voter's answer at the same version would let
+  two answers in flight put an older set back.
+- **What it costs.** One configuration version per seat change: a takeover round under way starts over at it (keeping
+  what it adopted), and a request carrying the previous version is refused `ConfigurationStale` and made again, as for
+  any change. The regional configuration's encoding gains the set (layout 3).
+- **What it does not change.** The council's voters themselves and how they change (Raft §6, one joint change at a time);
+  the root group's learners, which still name the root voters of their join (GAPS, the open sibling).
+- **Tests.** `a_learner_names_the_voters_the_configuration_records_through_a_seat_change`
+  (`crates/cluster/src/config_group.rs`) fails with the learner reading its Raft voters as before and with the leader's
+  record withheld (kiln r3624, the Mac Studio, 2026-11-18);
+  `a_seat_records_the_voters_in_id_order_and_advances_the_version_only_when_they_change` (`crates/db/src/register.rs`);
+  the configuration round trip and the layout golden in `crates/cluster/src/raft_wire.rs`. The fleet's learner tests
+  passed on the same machine; their rate at one CPU beside two busy loops is the diag lane's.
+
+Applied in the same change to: §4.8 (learners; A-337's paragraph), GAPS (the A-337 entry's open item),
+`crates/db/src/register.rs`, `crates/cluster/src/raft_wire.rs`, `crates/cluster/src/config_group.rs`,
+`crates/server/src/consensus.rs`, `crates/server/src/fleet.rs`, `crates/server/src/daemon.rs`, their tests, and the bug
+record `docs/bugs/2026-11-18-a-learner-named-the-voters-of-its-join-and-never-a-seat-change.md`.
+
+### A-378 — An access ACL a guest sets from outside a file's group clears its set-group-ID bit: a guest's route negotiates the extended SETXATTR, every transport reads the form from the INIT reply it sent, and a Shards stream keeps it through its resync and its restore (2026-11-18, built for goal g268, what Shards needs from slates; A-314's item not kept)
+Applied in the same change to:
+- §4.5 "Extended attributes" (the guest's POSIX ACLs), §4.6 the Shards form (the attribute, SAVE and RESTORE, resync
+  and death bullets) and a status of this date; the A-106, A-314 and A-316 entries, amended; GAPS: A-281's entry;
+  `docs/cli.md` (the `shards` form's attributes).
+- `crates/bridge-fuse`: `abi.rs` (`flags::SETXATTR_EXT`, `SETXATTR_IN_BYTES`, `COMPAT_SETXATTR_IN_BYTES`,
+  `SETXATTR_ACL_KILL_SGID`); `init.rs` (a guest's route asks for `FUSE_SETXATTR_EXT`; `kept_flags`, the flags an INIT
+  reply kept as its kernel reads them; `InitNegotiation::setxattr_ext`; the unit test
+  `an_init_reply_keeps_the_extended_setxattr_on_a_guests_route_alone_and_reads_back_whole`); `bridge.rs`
+  (`serve_setxattr` reads the form its bridge was told; `kill_sgid`); the test
+  `a_guests_acl_set_from_outside_the_files_group_clears_its_set_group_id_bit` in `tests/shards_fs.rs`.
+- `crates/bridge-core`: `Bridge::setxattr_ext` and `Bridge::set_setxattr_ext`, kept by `VolumeBridge` and passed
+  through by `ScopedBridge`.
+- `crates/bridge-virtiofs/src/device.rs`: the form read from each INIT reply the device sends, forgotten at a reset,
+  and told to the bridge before every chain; the test `a_device_parses_setxattr_in_the_form_its_guests_init_reply_kept`
+  in `tests/device.rs`.
+- `crates/server`: `shards.rs` (the stream's form, read from its INIT reply (`kept_at_init`), told to its bridge before
+  every request, saved in its tables and taken back at a RESTORE and from a held session; `tell_session`, which a
+  RESTORE now calls too); `shards/resync.rs` (`Kept`: the session keeps the form beside the owner view;
+  `tell_session`; `from_session` refuses a form it does not know); `shards/tables.rs` (format 2,
+  `StreamTables::setxattr_ext`); the tests `a_guests_extended_setxattr_is_parsed_from_its_init_and_after_its_restore`
+  (`tests/shards.rs`), the INIT's and the RESTORE's sessions (`tests/shards_resync.rs`), and the extended form served
+  after a daemon's death (`tests/shards_resync_restart.rs`).
+- `crates/anchor/src/held.rs`: `SESSION_CAP`, 64 bytes (was 32).
+
+- **What was there.** A-314 asked a guest's kernel to enforce its ACLs (`FUSE_POSIX_ACL`) and not for
+  `FUSE_SETXATTR_EXT`, so the kernel sent SETXATTR's short form, which has no room to say that an ACL's setter is
+  outside the file's group. Linux's own filesystems clear a file's set-group-ID bit at such a set
+  (`posix_acl_update_mode`, the rule `chmod` keeps through `setattr_should_drop_sgid`), so that whoever sets an ACL
+  without being in the file's group keeps no bit that runs a program as that group. A FUSE kernel leaves the clearing
+  to its server and says when (`fs/fuse/acl.c` `fuse_set_acl`: `FUSE_SETXATTR_ACL_KILL_SGID` where the connection has
+  POSIX ACLs and the setter is neither in the group nor holds `CAP_FSETID`). slates' guests kept the bit.
+- **The form is the connection's.** A kernel sends the extended `fuse_setxattr_in` (16 bytes before the name, where
+  the short form has 8) once an INIT reply kept `FUSE_SETXATTR_EXT` (`fs/fuse/inode.c` `process_init_reply`, at any
+  minor; `fs/fuse/xattr.c` `fuse_setxattr`), so a server must read every SETXATTR by the form its connection settled.
+  Each transport reads it from the INIT reply the shared dispatch wrote, the connection's truth (the virtio-fs device's
+  own negotiation is a host's, which asks for no ACL), and tells its bridge: the device before every chain, since a
+  guest can read the INIT's reply and send a SETXATTR that the same pass serves; a Shards stream before every request.
+  A host's mount asks for neither flag and keeps the short form. A SETXATTR too short for the extended head is `EIO`.
+- **The clearing.** Once `system.posix_acl_access` is set with the flag, the file's set-group-ID bit is cleared by a
+  chmod of its mode less the bit, in the same request. After the set, so a refused set changes nothing, as Linux keeps
+  neither the mode it computed nor the ACL on a refusal; and the set made the inode current, so the chmod needs no
+  room. A default ACL's set leaves the bit, flag or not, since Linux clears it for an access ACL alone.
+- **What a stream carries.** A resynced stream's device sends no INIT (A-316), nor does a restored guest's kernel
+  (A-303), so the form rides with what each keeps: the anchor's held session, a word beside the token and the owner
+  view (40 bytes, past the anchor's 32-byte cap, which is now 64; an anchor and its daemons are one build), and the
+  SAVE tables, format 2. A session naming a form this daemon does not know is refused, never read as the short form.
+  Rejected: reading tables of format 1 as the short form. It would be right for them, since their daemon never offered
+  the extended form, but it keeps a second decoder for VMs saved before an upgrade; they are refused with their reason,
+  as A-303 refuses any other format.
+- **Found beside it.** A RESTORE set its stream's owner view and never told the anchor, so the held session kept the
+  fresh stream's identity view, and a daemon's death after a restore served the guest the volume's owners unswapped
+  (A-281). A RESTORE now tells the anchor the restored guest's session; the resync test asserts it.
+- **Evidence.** On a Mac Studio, the focused tests pass (kiln run r3591): the INIT's unit test, the stream's
+  attribute and ACL tests and the dispatch's attribute tests, the device's, the anchor's channel, the session's and the
+  tables' unit tests, `shards_resync`, `shards_resync_restart`, and the stream's save, restore, attribute, ACL and owner
+  tests. Each of fourteen guards removed alone fails the tests named for it (r3599 and r3623): the guest's INIT asking
+  for the form; the dispatch's extended parse; the setter's flag; the access ACL alone; the device telling its bridge,
+  before every chain rather than once a pass, from the reply's kept flag; the stream reading its INIT's form, telling
+  its bridge, saving it, taking it at a restore and telling the anchor then; the session keeping it; and a successor
+  taking it. The device's test first served each chain in a pass of its own, since a volume holding an inode past its
+  committed ceiling holds every reply for the barrier (A-150), so the guard "once a pass" passed it (r3599); it now
+  serves the INIT and the SETXATTR in one pass and asserts so. Linux: GitHub's ubuntu runner passes the same tests and
+  the virtio-fs device's attribute test (run 44357398816, the device's test in its first form).
+- **Cost.** None on a host's mount. A guest's SETXATTR reads eight more bytes; an access ACL set with the flag adds a
+  GETATTR and, where the bit is set, a chmod to its request. Each INIT reply is read again for its flags, a few words.
+
+### A-381 — A client's ring wakes only the shard that serves it: the doorbell thread kicks the shards the rings marked (2026-11-18, built for goals 231 and 257, 1,000 clients under 1 ms; §4.7, D-10)
+Applied in the same change to: §4.7 (the status of 2026-11-18), GAPS (the load test's entry),
+`crates/ipc/src/rendezvous.rs` (the macOS and Windows bootstrap object: `MAGIC` `SLB2`, `AT_CLAIM_RUNG`, the summary
+and pending mark words, `Bell::ring_for`, `Bell::ring_claim`, `Bell::take_pending`; `Doorbell::ring` names the shard;
+`DoorbellWaiter::take_pending`; `Pending`), `crates/ipc/src/endpoint.rs` (`ClientEnd::send` rings for its region's
+shard), `crates/server/src/doorbell.rs` (the thread kicks what the rings marked, `kick_pending`),
+`crates/server/src/daemon.rs` (each kick paired with its shard's id), and the tests below.
+- **What was wrong.** On macOS and Windows a client rings the bootstrap object's daemon-wide word when its shard has
+  announced itself idle, and the daemon's one doorbell thread, woken, kicked every shard and flagged the control shard's
+  claim poller. A shard serves the clients whose regions name it and no other, so every kick but one was a wake for
+  nothing, and every request its client sent to a parked shard woke every other shard as well. Measured on the Mac
+  Studio at 1,000 clients over 23 shards (the g083 trace diagnostic, 2026-11-18, load 14 to 17, 14,476 replies a
+  second): each shard parked and woke 344,631 to 379,811 times in 49.3 s, about 7,500 times a second, alike on shards
+  serving one connection and two, while it served about 600 of its own clients' requests a second.
+- **The rule.** A ring marks the shard its client's region names, a bit a shard id (a region's shard is a `u16`, so
+  every id has one), and its word in a summary of a bit a word, before it moves the doorbell word and wakes the thread;
+  a claim marks the claim's word instead. The thread, woken by the word's move, takes the claim's mark and the summary,
+  then each pending word the summary names, and kicks the control shard for a claim (and flags its claim poller) and
+  each shard marked. A mark is taken by a swap, so a ring landing while the thread takes is either taken now or moves
+  the word again and is taken at the next wait. A mark naming no shard of this daemon (a client of the daemon before a
+  restart) kicks nothing. The kick stays unconditional for a shard marked: its park does not look at its clients'
+  rings, so a kick skipped because it was not parked yet could be lost.
+- **Format.** The bootstrap object grows by the summary (16 words) and the pending words (1,024): 8,320 bytes. Its
+  magic is `SLB2`: an object or a client of the layout before (`SLBT`) is refused by the other as another layout.
+  Pre-release; no shim.
+- **Tests.** `a_ring_marks_only_the_shard_it_names_and_a_claim_marks_the_claim` (`slates-ipc`): rings for shards 3, 64,
+  3 again and 65,535 and a claim are taken as the claim and those three shards, each once, and a second take is empty.
+  `a_clients_ring_wakes_only_the_shard_that_serves_it` (`crates/server/tests/doorbell.rs`): one client's 200 paced
+  cycles, each a create and a destroy on its own shard of a three-shard daemon, wake that shard at least once a cycle and
+  a shard neither it nor the control shard fewer than half as often; red with the thread kicking every shard (at 100
+  cycles on the Mac Studio such a shard woke 114 times against the client's shard's 100 with every shard kicked, and 14
+  times with A-381).
+- **Measured** (BENCHMARKS, "Where a 1,000-client request's time goes, and a client's ring that wakes only its shard";
+  Mac Studio, 1,000 clients, 23 shards, six pairs back to back at think means of 50 and 20 ms, 2026-11-18): each shard's
+  parks fell by 59% at both loads (4.71 to 1.92 million a level at 50 ms, 2.74 to 1.13 million at 20 ms) and the shards'
+  CPU by 34% and 20%. The latencies swung ten- to twentyfold with the box's load (14 to 52) within each arm, so those
+  pairs cannot tell the arms' latencies apart; the 1,000-client rung's record run is the supervisor's.
+
+### A-341 — A holder the takeover never asked lets its copy go where the kept retirement shows the object recovered within tolerance (2026-11-18, kiln goal g250; §4.8 "Promotion and takeover"; A-309's owed rule, its safe part; A-335)
+Applied in the same change to: A-309's holder rule (above), GAPS (the unasked holder's entry), `crates/db/src/register.rs`
+(`RegionalConfiguration::within_tolerance`; `Lineage::Settled` and `settled_for` documented),
+`crates/db/tests/lineage_model.rs` (the holder rule, the never-placed copy's exemption from the oracle, the counts) and
+`crates/server/src/takeover.rs` (`Confirmation::Covered`, `fleet.takeover.unasked_covered`).
+- **What was there.** A-309 kept every copy of a holder the takeover never asked (`fleet.takeover.kept_unasked`): its
+  copy is one a neighbourhood the retired owner left still holds, which within tolerance is stale and past it may be
+  the only one. Nothing let it go, so it stayed for good.
+- **The first rule, rejected by the model before it was built.** Let every unasked copy go at the successor's
+  confirmation or the completion record, the oracle relaxed to accept a release where a placement had certified a
+  record at least as new on a cohort without the holder. The lineage model's A-309 oracle (an adoption after every copy
+  let go) failed it at seed 44: a region formed on host 1 alone admitted host 102, host 1 wrote an object jointly to
+  {1} and {1, 102}, placed at `f + 1`, then moved its neighbourhood to later joiners without settling and died. Its
+  takeover asked the joiners, learned nothing of the object, its successor confirmed, and 102 let go the last copy
+  after one failure at `f = 1`. The relaxed oracle had passed it: the "certification" was the dead owner's own cohort.
+- **The rule.** An unasked copy goes as a stale one goes (`let_go_stale`: its content kept while its retention rule
+  keeps it) only when its successor's confirmation is read from the kept retirement and each of the object's settled
+  recovery cohorts keeps its recovery quorum of members (`RegionalConfiguration::within_tolerance`). Every record
+  committed for the object is on `f + 1` of each settled cohort, or on all of a smaller one (the owner's settle report
+  placed it there, or its joint write did), so the round heard a recovery quorum of each and learned a record at least
+  as new. Past tolerance, or judged on a completion record (which keeps no neighbourhood), the copy is kept, counted as
+  before.
+- **Tests.** The lineage model, its oracle A-309's with never-placed copies exempt (a record never placed was never
+  acknowledged): no violation over its 400 seeds and 256 generated histories, `reclaimed_unasked` and `kept_unasked`
+  each reached; red with the tolerance unjudged, seed 44. `a_holder_the_takeover_never_asked_lets_go_what_was_recovered_within_tolerance`
+  (`crates/server/src/daemon.rs`): within tolerance at the first confirmation a plain register goes and a head naming
+  this holder's content stays for it; on the completion record both remaining copies stay. Kiln r41 on the Mac Studio,
+  2026-11-18, debug build: the model over 400 seeds `reclaimed_unasked` 10 and `kept_unasked` 214, no violation; with
+  the tolerance unjudged, seed 44's violation (102's copy of host 1's object, never adopted). The server test passes,
+  with every unasked copy covered the completion record's copy goes ((false, true, false)), and with none covered (A-309)
+  the plain register stays ((true, true, true)); `takeover::` and the holder tests 21 of 21, the register tests 76 of 76.
+- **Still owed (GAPS).** A copy first judged on a completion record (every object of the last successor to confirm)
+  or past tolerance stays; the completion record would need the retired host's settled neighbourhood to judge it.
+
+### A-384 — A CLI attachment's term is its holder's: renewed by every verb that uses it and by its holder's `Renew`, fresh after a restart, at most the failover delay and within it the tail of the holder's renewal gaps and a liveness window (2026-11-18, built for goal g255; the coordinator's ruling of the same day on who renews an attachment; A-230, A-363, A-375)
+
+- **What was there.** A-230's term was the operator's 10 s placeholder, renewed only by a verb naming the attachment (one
+  durable record per half term), so nothing could keep an idle attachment alive and every attachment had the same term.
+- **The rule** (the coordinator's ruling, 2026-11-18): a lease is renewed by whatever holds it. Every verb that uses an
+  attachment renews it, as before; an idle one expires after a term derived from the live estimators, an accrual term
+  per holder; `slates attach --hold` keeps one alive from a foreground process that renews it, and the client library's
+  and the SDKs' attachment objects renew while they live (both owed, the next changes); a mount renews through its own
+  activity (its attachment has no term).
+- **The term** (`verbs::attachment_term`): `min(F, the tail of the holder's renewal gaps + W)`. `F` is the node's
+  failover delay (A-363, `ShardState::failover_ns`): A-230's bound, since an abandoned attachment holds the volume's write
+  lease no longer than a failover would leave the volume unserved. The gaps' tail is RFC 6298's `smoothed + 4·deviation`
+  over the gaps between the attachment's uses on its owner shard (`state::AttachmentPace`, the estimator the failover
+  estimate's terms use), and `W` the lateness a live party may show before it is judged (A-228). An attachment with no gap
+  measured yet (just made, recovered by a restart, or used a term apart) has `F`. A holder renews at the cadence its
+  `Renewed` reply names, a third of the shorter of the term and `W` (`verbs::renewal_cadence`), so where `F` is longer
+  the term settles near four thirds of a liveness window, and where it is shorter (a laptop's, the recovery prior alone,
+  A-363), at `F`. Not a third of the term: the first build renewed so, the holder's gaps followed the term they shape,
+  and the term grew to the failover delay, 1.0 s to 4.0 s in ten renewals (the held-attachment test, the Mac Studio).
+- **The verb.** `RequestBody::Renew { attachment }` answered `ReplyBody::Renewed { term_ns, renew_every_ns }` (both appended and published:
+  `RequestBody` 77, `ReplyBody` 68, after A-267's `Drifted` and `Conflicts`), served on the attachment's owner shard: a renewal asked for is made durable, a whole
+  term from now; refused as any use is (`AttachmentExpired` past its term), and `BadRequest` for an attachment with no
+  term. `Client::renew`.
+- **Lifeguard's rule** (Dadgar et al. 2018: a member does not condemn others for its own unavailability): at a shard's
+  start, before its serve loop answers anything, every CLI attachment of its partition gets a fresh term, `F` from then,
+  and its pace starts again (`verbs::renew_termed_at_start`), so a restart longer than a term never ends an attachment
+  its holder could not renew meanwhile.
+- **What changes.** On a laptop a CLI attachment that nothing renews lasts about a second idle (`F` is the recovery prior
+  there), and in a quiet fleet about 4-5 s, where it was 10 s; a user who keeps one between commands holds it with
+  `--hold` or a library object. A held attachment that stops renewing ends at its own pace, about one and a half liveness
+  windows at most, where it waited out the 10 s.
+- **Not changed, owed.** The volume's write lease (D-16, `take_write_lease`) still takes the placeholder (writes do not
+  check it; its term gates another writer's take), with the landing target lease and the NFSv4 and delegation leases.
+- **Evidence.** `crates/server/tests/attachment_term.rs` on the Mac Studio (2026-11-18, load 10-48, debug build), 4 of 4,
+  twice: A-230's two tests, their failover delay held at 3 s by injection; `a_held_attachment_lives_while_its_holder_
+  renews_and_lapses_at_its_own_pace` (renewed by `Renew` alone for 8 s, twice its 4 s ceiling, the named terms rising
+  to about 2.0 s and settling at 1.43-1.47 s, then refused `AttachmentExpired` two terms after its last use, before
+  the ceiling); `a_restart_gives_a_cli_attachment_a_fresh_term` (the test as the anchor, two terms with no daemon, then
+  renewed and written at once). Red-checked: a term that ignores the pace fails the held test's late write; no renewal
+  at the start fails the restart test; a `Renew` that renews nothing fails the held test's renewals. The wire-order test
+  holds both appended tags.
+
+Applied in the same change to: §4.4 "Derived constants" (its status), GAPS (the `LIVENESS_BUDGET_NS` entry),
+`crates/ipc/src/protocol.rs`, `crates/ipc/tests/wire_order.txt`, `crates/client/src/client.rs`,
+`crates/server/src/{verbs,state,daemon}.rs`, `crates/server/tests/attachment_term.rs`.
 
 ### A-382 — A host admitted again lets go its own register copies, and a volume it lost ships no record: the superseded adopter's copy catches up (2026-11-18, g230, scale-out; §4.8 "Authority scope", "Promotion and takeover"; the chaos nemesis's convergence, seeds 6876545201569229162 and 7236833171758868842; A-334's holder side)
 Applied in the same change to: §4.8 "Authority scope" (its status), GAPS (the entry of 2026-11-18), the bug record

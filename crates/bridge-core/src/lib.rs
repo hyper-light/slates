@@ -760,6 +760,19 @@ pub trait Bridge {
     AttributeNamespaces::Host
   }
 
+  /// Whether this bridge's transport's kernel sends FUSE's extended `fuse_setxattr_in`, its setter's flags beside the
+  /// size and the `setxattr(2)` flags: a guest kernel's connection that kept `FUSE_SETXATTR_EXT` at its `INIT` (A-378),
+  /// as the transport last said ([`Bridge::set_setxattr_ext`]). No by default.
+  fn setxattr_ext(&mut self) -> bool {
+    false
+  }
+
+  /// Tells this bridge whether its transport's kernel sends the extended `fuse_setxattr_in` ([`Bridge::setxattr_ext`]),
+  /// before the transport hands it a request (A-378). The transport reads it from the `INIT` reply its connection kept,
+  /// so it can change between two requests one bridge serves: a virtio-fs device serves its guest's `INIT` and the
+  /// requests after it in one pass over one bridge. A bridge that keeps no form ignores it.
+  fn set_setxattr_ext(&mut self, _extended: bool) {}
+
   /// The store's DAX backings and its in-process DAX registry, lent to a backed DAX session (`dax_backing`) that a
   /// transport drives over this bridge. `None` for a bridge with no store.
   fn dax_state(&mut self) -> Option<DaxState<'_>> {

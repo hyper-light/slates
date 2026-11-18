@@ -1139,10 +1139,10 @@ struct GrantedRun {
   audit_from: u64,
 }
 
-/// A granted landing that ended before running: what its reply needs.
+/// A granted landing that ended before running: what its reply and its trail need.
 #[cfg(unix)]
 struct NotRun {
-  refusal: LandingRefusal,
+  refusal: Unrun,
   landing_id: u64,
   fresh: bool,
   volume: DbVolumeId,
@@ -1152,6 +1152,20 @@ struct NotRun {
   client: u32,
   /// The landing's signature, judged against a presentation its refusal answers with (A-321).
   signature: Option<Vec<u8>>,
+  /// The grant it was to run under.
+  grant: Option<u64>,
+  /// The audit ring's sequence when it began ([`GrantedRun`]'s).
+  audit_from: u64,
+}
+
+/// Why a granted landing ended before its run.
+#[cfg(unix)]
+enum Unrun {
+  /// The engine's refusal: of its beginning, its plan, its grant or its run's start.
+  Engine(LandingRefusal),
+  /// The server's, before the engine began: its target's lease, its volume gone, the head's snapshot, its base host
+  /// away, its target unopened.
+  Server(Refusal),
 }
 
 /// Where beginning a granted landing left it.
@@ -1161,11 +1175,9 @@ enum Begun {
   Planning(Box<Planning>),
   /// Running: stepped in slices.
   Running(Box<GrantedRun>),
-  /// Refused before running (its lease, the volume, the target, the grant): the reply is built where its
+  /// Refused before running (its lease, the volume, the target, the grant): the reply and the trail are made where its
   /// completion is recorded.
   NotRun(Box<NotRun>),
-  /// Refused before anything about the landing was known (no lease, no volume): the reply itself.
-  Refused(ReplyBody),
 }
 
 /// What one slice left the run at.
@@ -1281,7 +1293,6 @@ async fn advance_granted(
 fn answer_unrun(state: &mut ShardState, ended: Begun) -> ReplyBody {
   match ended {
     Begun::NotRun(not_run) => reply_not_run(state, *not_run),
-    Begun::Refused(reply) => reply,
     // `plan_granted` steps every plan to its end, so neither is left here: a defect, refused typed.
     Begun::Planning(_) | Begun::Running(_) => refused(Refusal::Unsupported {
       feature: "a granted landing answered before its plan or its run ended".to_owned(),
@@ -1616,39 +1627,20 @@ fn renewal_wait_ns(granted: &GrantedRun, ask: LeaseAsk) -> Option<u64> {
 
 /// Begins a granted landing on its owner shard: its id and request, the head's implicit snapshot for an
 /// unnamed landing, the writer (inside an overlay's own base host), and the engine's plan, grant and lease
-/// checks.
+/// checks. The attempt's id and where its records start in the engine's ring are decided first, so every refusal
+/// from here on, its target's lease included, ends as an attempt its trail names (§4.15 "Audit").
 #[cfg(unix)]
 fn begin_granted(
   state: &mut ShardState,
   prepared: Prepared,
   lease: Result<LandingLease, Refusal>,
 ) -> Begun {
-  let lease = match lease {
-    Ok(lease) => lease,
-    Err(refusal) => return Begun::Refused(refused(refusal)),
-  };
   // Where this run's records will start in the engine's audit ring, before it pushes any (§4.15 "Audit").
   let audit_from = state.landing.audit.next_seq();
   let presented = prepared.grant.and_then(|g| presentation_for(state, g));
   let landing_id = presented
     .unwrap_or_else(|| crate::verbs::landing_id(state.partition, state.landing.next_landing));
-  let Ok(slot) = state.volumes.get_mut(prepared.handle) else {
-    return Begun::Refused(refused(Refusal::NotFound));
-  };
-  // An unnamed landing lands the head as it is now: a snapshot of it, which the writers that go on
-  // between slices do not move.
-  let (source, implicit) = match prepared.source {
-    Source::Head => match slot.volume.snapshot(&mut state.store) {
-      Ok(id) => (Source::Snapshot(id), Some(id)),
-      Err(e) => {
-        state.count(LANDING_SNAPSHOT_REFUSED, 1);
-        return Begun::Refused(refused(refusal_of_vfs(&e)));
-      }
-    },
-    named => (named, None),
-  };
-  let was_overlay = slot.volume.is_overlay();
-  let not_run = |refusal: LandingRefusal, principal: Principal| {
+  let not_run = |refusal: Unrun, principal: Principal| {
     Begun::NotRun(Box::new(NotRun {
       refusal,
       landing_id,
@@ -1659,22 +1651,53 @@ fn begin_granted(
       principal,
       client: prepared.client,
       signature: prepared.signature.clone(),
+      grant: prepared.grant,
+      audit_from,
     }))
   };
+  let lease = match lease {
+    Ok(lease) => lease,
+    Err(refusal) => return not_run(Unrun::Server(refusal), prepared.principal.clone()),
+  };
+  let Ok(slot) = state.volumes.get_mut(prepared.handle) else {
+    return not_run(Unrun::Server(Refusal::NotFound), prepared.principal.clone());
+  };
+  // An unnamed landing lands the head as it is now: a snapshot of it, which the writers that go on
+  // between slices do not move.
+  let (source, implicit) = match prepared.source {
+    Source::Head => match slot.volume.snapshot(&mut state.store) {
+      Ok(id) => (Source::Snapshot(id), Some(id)),
+      Err(e) => {
+        state.count(LANDING_SNAPSHOT_REFUSED, 1);
+        return not_run(
+          Unrun::Server(refusal_of_vfs(&e)),
+          prepared.principal.clone(),
+        );
+      }
+    },
+    named => (named, None),
+  };
+  let was_overlay = slot.volume.is_overlay();
   let (os, land_target) = if was_overlay {
     let Some(host) = slot.host.take() else {
       drop_implicit(slot, &mut state.store, implicit, &mut state.refusals);
-      return Begun::Refused(refused(Refusal::BaseUnavailable {
-        path: prepared.target.clone(),
-        errno: 0,
-      }));
+      return not_run(
+        Unrun::Server(Refusal::BaseUnavailable {
+          path: prepared.target.clone(),
+          errno: 0,
+        }),
+        prepared.principal.clone(),
+      );
     };
     match OsLand::open_target_in(host, std::path::Path::new(&prepared.target)) {
       Ok(pair) => pair,
       Err((host, refusal)) => {
         slot.host = Some(host);
         drop_implicit(slot, &mut state.store, implicit, &mut state.refusals);
-        return Begun::Refused(refused(target_refusal(&refusal, &prepared.target)));
+        return not_run(
+          Unrun::Server(target_refusal(&refusal, &prepared.target)),
+          prepared.principal.clone(),
+        );
       }
     }
   } else {
@@ -1698,7 +1721,7 @@ fn begin_granted(
     Err(refusal) => {
       give_host_back(slot, HostSlot::Owned(os), was_overlay, land_target.dir);
       drop_implicit(slot, &mut state.store, implicit, &mut state.refusals);
-      return not_run(refusal, prepared.principal.clone());
+      return not_run(Unrun::Engine(refusal), prepared.principal.clone());
     }
   };
   let writer = if was_overlay {
@@ -1791,7 +1814,7 @@ fn finish_planning(
 ) -> Begun {
   let not_run = |planning: &Planning, refusal: LandingRefusal| {
     Begun::NotRun(Box::new(NotRun {
-      refusal,
+      refusal: Unrun::Engine(refusal),
       landing_id: planning.landing_id,
       fresh: planning.fresh,
       volume: planning.volume,
@@ -1800,6 +1823,8 @@ fn finish_planning(
       principal: planning.principal.clone(),
       client: planning.client,
       signature: planning.signature.clone(),
+      grant: planning.grant,
+      audit_from: planning.audit_from,
     }))
   };
   let Ok(slot) = state.volumes.get_mut(planning.handle) else {
@@ -2188,11 +2213,28 @@ fn complete_finish(
       &report,
       granted.grant,
     ),
-    Err(refusal) => not_landed(state, presenter, &ids, refusal),
+    Err(refusal) => {
+      if ends_refused(&refusal) {
+        let attempt = Attempt {
+          landing_id: granted.landing_id,
+          fresh: granted.fresh,
+          grant: granted.grant,
+          principal: &granted.principal,
+          volume: granted.volume,
+          target: &granted.target,
+          signature: granted.signature.as_deref(),
+          audit_from: granted.audit_from,
+        };
+        if let Err(e) = record_refused(state, &attempt) {
+          return refused(crate::error::refusal_of_db(&e));
+        }
+      }
+      not_landed(state, presenter, &ids, refusal)
+    }
   }
 }
 
-/// The reply to a granted landing refused before it ran.
+/// The reply to a granted landing refused before it ran, its trail recorded first ([`record_refused`]).
 #[cfg(unix)]
 fn reply_not_run(state: &mut ShardState, not_run: NotRun) -> ReplyBody {
   let ids = LandingIds {
@@ -2208,7 +2250,138 @@ fn reply_not_run(state: &mut ShardState, not_run: NotRun) -> ReplyBody {
     principal: &not_run.principal,
     signature: not_run.signature.as_deref(),
   };
-  not_landed(state, presenter, &ids, not_run.refusal)
+  let trailed = match &not_run.refusal {
+    Unrun::Engine(refusal) => ends_refused(refusal),
+    Unrun::Server(_) => true,
+  };
+  if trailed {
+    let attempt = Attempt {
+      landing_id: not_run.landing_id,
+      fresh: not_run.fresh,
+      grant: not_run.grant,
+      principal: &not_run.principal,
+      volume: not_run.volume,
+      target: &not_run.target,
+      signature: not_run.signature.as_deref(),
+      audit_from: not_run.audit_from,
+    };
+    if let Err(e) = record_refused(state, &attempt) {
+      return refused(crate::error::refusal_of_db(&e));
+    }
+  }
+  match not_run.refusal {
+    Unrun::Engine(refusal) => not_landed(state, presenter, &ids, refusal),
+    Unrun::Server(refusal) => refused(refusal),
+  }
+}
+
+/// Whether the engine's `refusal` ends a granted landing's attempt refused, which its trail records ([`record_refused`]).
+/// A plan no grant covers ends in a presentation instead, which records itself.
+#[cfg(unix)]
+fn ends_refused(refusal: &LandingRefusal) -> bool {
+  !matches!(refusal, LandingRefusal::GrantRequired(_))
+}
+
+/// Who a granted landing's attempt was, as its trail names it: its id, its grant, whom it ran for, what it would have
+/// landed where, its signature, and where its records start in the engine's ring.
+#[cfg(unix)]
+struct Attempt<'a> {
+  landing_id: u64,
+  /// Whether the id is a fresh one rather than its presentation's.
+  fresh: bool,
+  grant: Option<u64>,
+  principal: &'a Principal,
+  volume: DbVolumeId,
+  target: &'a str,
+  signature: Option<&'a [u8]>,
+  /// The audit ring's sequence when the attempt began ([`GrantedRun`]'s `audit_from`).
+  audit_from: u64,
+}
+
+/// Records a refused granted landing's trail (§4.15 "Audit", the state machine's `→ Refused` and `→ Aborted`), in its
+/// completion's atom: the records the engine's ring holds of the attempt from its beginning on (its plan, its
+/// validation, each entry it wrote or refused), then its end, a `LandingFinished` naming its terminal state
+/// ([`refused_state`]), the manifest it planned, or its grant's when it planned none, and its signature judged against
+/// that manifest. An attempt whose ring records hold its end already adds none. A fresh id is spent, as a finished
+/// landing's is, so no later landing's trail shares it. Before 2026-11-18 a refused granted landing recorded none of
+/// this, and its trail ended at its grant (found by g90 reading the code;
+/// `docs/bugs/2026-11-18-a-refused-granted-landing-left-no-trail.md`).
+#[cfg(unix)]
+fn record_refused(state: &mut ShardState, attempt: &Attempt<'_>) -> Result<(), slates_db::DbError> {
+  let ring: Vec<AuditRecord> = state
+    .landing
+    .audit
+    .records()
+    .into_iter()
+    .filter(|record| record.landing == attempt.landing_id && record.seq >= attempt.audit_from)
+    .cloned()
+    .collect();
+  let manifest = ring
+    .iter()
+    .rev()
+    .find(|record| record.kind == AuditKind::LandingPlanned)
+    .map(|record| record.manifest)
+    .or_else(|| {
+      let grant = state.landing.grants.get(GrantId(attempt.grant?))?;
+      Some(grant.manifest)
+    });
+  // A landing that names no manifest (refused before its plan, under a grant that names none) has no statement to judge
+  // a signature against; its end records no verdict, which `audit_verb` reads as none.
+  let verification = manifest.map(|manifest| {
+    landing_verdict(
+      state,
+      (attempt.volume, attempt.target, &manifest),
+      attempt.signature,
+    )
+    .1
+  });
+  // The ring holds an attempt's records only from its plan on, whose manifest judged the signature, so the stand-in is
+  // never what a mirrored plan or end keeps.
+  let unjudged = slates_ipc::protocol::Verification::Unsigned;
+  let judged = verification.as_ref().unwrap_or(&unjudged);
+  let mut records: Vec<DbAuditRecord> = ring
+    .iter()
+    .map(|record| db_audit(record, attempt.principal, judged))
+    .collect();
+  if !ring
+    .iter()
+    .any(|record| record.kind == AuditKind::LandingFinished)
+  {
+    let now = state.clock.monotonic_ns();
+    records.push(DbAuditRecord {
+      seq: 0,
+      at_ns: now,
+      kind: DbAuditKind::LandingFinished,
+      principal: attempt.principal.clone(),
+      grant: attempt.grant,
+      landing: Some(attempt.landing_id),
+      manifest,
+      outcome: Some(refused_state(&ring)),
+      signature: verification
+        .as_ref()
+        .and_then(crate::signed_work::to_record),
+    });
+  }
+  if attempt.fresh {
+    state.landing.next_landing = state.landing.next_landing.saturating_add(1);
+  }
+  let now = state.clock.monotonic_ns();
+  write_audit(state, records, now)
+}
+
+/// The terminal state a refused granted landing's trail names (§4.15's state machine): `Aborted` once the attempt wrote
+/// an entry, whose bytes the disk now holds, each entry old or new, for a resume to continue; else `Refused`, nothing
+/// written.
+#[cfg(unix)]
+fn refused_state(ring: &[AuditRecord]) -> DbLandingState {
+  if ring
+    .iter()
+    .any(|record| record.kind == AuditKind::EntryWritten)
+  {
+    DbLandingState::Aborted
+  } else {
+    DbLandingState::Refused
+  }
 }
 
 /// Where a landing attempt asks for its target's lease: from this shard to the control shard, for the
@@ -3528,13 +3701,14 @@ pub fn audit_verb(state: &ShardState, since: u64) -> ReplyBody {
       audit_kind: wire_audit_kind(record.kind),
       stage: record.outcome.map(wire_landing_stage),
       // A record of a landing as a whole — its presentation, a granted run's plan, its finish — says how the landing's
-      // signature was judged (A-321), unsigned when it carried none; no other record judges one. A verdict this build
-      // names no code for (a newer build's record) reads as none.
-      verification: matches!(
+      // signature was judged (A-321), unsigned when it carried none; no other record judges one, nor the end of a landing
+      // refused before anything named its manifest (`record_refused`), which had no statement to judge. A verdict this
+      // build names no code for (a newer build's record) reads as none.
+      verification: (matches!(
         record.kind,
         slates_db::catalog::AuditKind::LandingPlanned
           | slates_db::catalog::AuditKind::LandingFinished
-      )
+      ) && record.manifest.is_some())
       .then(|| crate::signed_work::of_record(record.signature))
       .flatten(),
     };
@@ -3888,8 +4062,9 @@ fn grant_state_name(state: DbGrantState) -> String {
 #[cfg(all(test, unix))]
 mod tests {
   use super::{
-    ENROLL_DOMAIN, REVOKE_DOMAIN, SpanObserver, attest_proof, enroll_proof, release_target_lease,
-    revoke_proof, take_target_lease,
+    AuditKind, AuditRecord, DbLandingState, ENROLL_DOMAIN, REVOKE_DOMAIN, SpanObserver,
+    attest_proof, enroll_proof, refused_state, release_target_lease, revoke_proof,
+    take_target_lease,
   };
   use slates_ipc::protocol::Refusal;
   use slates_vfs::clock::Clock;
@@ -3920,6 +4095,36 @@ mod tests {
     // The paused holder: the test stands in for a descheduled landing attempt.
     #[allow(clippy::disallowed_methods)]
     std::thread::sleep(std::time::Duration::from_nanos(2 * SHORT_TERM_NS));
+  }
+
+  /// §4.15's state machine (`→ Refused`, `→ Aborted`): a refused granted landing's end names what it left on the disk.
+  /// Do: decide the end of an attempt whose ring records hold its plan, its validation and an entry it refused, and of
+  /// one whose records hold an entry it wrote as well. Expect `Refused` for the first, nothing written, and `Aborted` for
+  /// the second, its written entry on the disk for a resume to continue.
+  #[test]
+  fn a_refused_attempts_end_is_aborted_once_it_wrote_an_entry() {
+    let record = |kind| AuditRecord {
+      seq: 0,
+      at_ns: 0,
+      kind,
+      grant: None,
+      landing: 1,
+      manifest: [0; 32],
+      outcome: None,
+    };
+    let refused_whole = [
+      record(AuditKind::LandingPlanned),
+      record(AuditKind::LandingValidated),
+      record(AuditKind::EntryRefused),
+    ];
+    assert_eq!(refused_state(&refused_whole), DbLandingState::Refused);
+    let wrote_one = [
+      record(AuditKind::LandingPlanned),
+      record(AuditKind::LandingValidated),
+      record(AuditKind::EntryWritten),
+      record(AuditKind::EntryRefused),
+    ];
+    assert_eq!(refused_state(&wrote_one), DbLandingState::Aborted);
   }
 
   /// §4.15 step 4 (AUD-29-03): the control shard's target lease has one holder until it is released or its

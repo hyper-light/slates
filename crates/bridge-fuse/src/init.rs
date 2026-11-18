@@ -142,11 +142,13 @@ pub fn negotiate(body: &[u8], coherence: CacheCoherence) -> Result<InitNegotiati
 
 /// The ACL check a transport asks its kernel for (A-314): a guest kernel's route, whose ACLs are the guest's own,
 /// asks for `FUSE_POSIX_ACL`, so the guest's kernel judges each access by the ACL it reads, as a Linux bind mount
-/// enforces a container's `setfacl`; a host's mount reaches no ACL (A-302) and asks for none.
+/// enforces a container's `setfacl`; a host's mount reaches no ACL (A-302) and asks for none. With it the guest's route
+/// asks for `FUSE_SETXATTR_EXT` (A-378), the only form in which the kernel says that an ACL's setter is outside the
+/// file's group, so the file's set-group-ID bit goes, as Linux's own filesystems clear it.
 fn acl_wanted(namespaces: AttributeNamespaces) -> u64 {
   match namespaces {
     AttributeNamespaces::Host => 0,
-    AttributeNamespaces::Guest => flags::POSIX_ACL,
+    AttributeNamespaces::Guest => flags::POSIX_ACL | flags::SETXATTR_EXT,
   }
 }
 
@@ -224,7 +226,44 @@ pub fn negotiate_offering(
   })
 }
 
+/// Format: where an `INIT` reply's body (`fuse_init_out`, as [`InitNegotiation::to_bytes`] writes it) holds its flags'
+/// low word, past the major, the minor and `max_readahead`.
+const AT_FLAGS: usize = 3 * size_of::<u32>();
+/// Format: where it holds `flags2`, past the low word, `max_background` and `congestion_threshold`, `max_write`,
+/// `time_gran`, and `max_pages` with `map_alignment`.
+const AT_FLAGS2: usize = 8 * size_of::<u32>();
+
+/// The flags an `INIT` reply's body kept (`fuse_init_out`'s flags and, the reply carrying `FUSE_INIT_EXT`, its
+/// `flags2` above them), as its kernel reads them: what a transport learns of its connection from the reply the shared
+/// dispatch wrote (the form of `SETXATTR`, A-378). `None` for a body too short to be one.
+#[must_use]
+pub fn kept_flags(reply_body: &[u8]) -> Option<u64> {
+  let word = |at: usize| {
+    reply_body
+      .get(at..at.checked_add(size_of::<u32>())?)
+      .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+      .map(u32::from_le_bytes)
+  };
+  let low = u64::from(word(AT_FLAGS)?);
+  // Format: the high half of the flags word is `flags2`.
+  const HIGH_HALF_SHIFT: u32 = 32;
+  let high = if low & flags::INIT_EXT != 0 {
+    u64::from(word(AT_FLAGS2)?) << HIGH_HALF_SHIFT
+  } else {
+    0
+  };
+  Some(low | high)
+}
+
 impl InitNegotiation {
+  /// Whether the connection kept [`flags::SETXATTR_EXT`]: its kernel sends the extended `fuse_setxattr_in` from now on
+  /// (A-378), which a transport must tell its bridge ([`slates_bridge_core::Bridge::set_setxattr_ext`]) for every
+  /// request after.
+  #[must_use]
+  pub fn setxattr_ext(&self) -> bool {
+    self.flags & flags::SETXATTR_EXT != 0
+  }
+
   /// Writes the `fuse_init_out` reply body in field order: major, minor, max_readahead,
   /// flags, max_background, congestion_threshold, max_write, time_gran, max_pages,
   /// map_alignment, flags2, then reserved words (left zero).
@@ -250,5 +289,56 @@ impl InitNegotiation {
     w.u32(high); // flags2
     w.pad(RESERVED_WORDS);
     w.into_bytes()
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// A `fuse_init_in` body of a kernel at 7.40 offering `offered` (its low word in `flags`, its high in `flags2`).
+  fn init_in(offered: u64) -> Vec<u8> {
+    let mut body = Vec::new();
+    for word in [
+      FUSE_KERNEL_VERSION,
+      40,
+      65_536,
+      u32::try_from(offered & u64::from(u32::MAX)).unwrap(),
+      u32::try_from(offered >> 32).unwrap(),
+    ] {
+      body.extend_from_slice(&word.to_le_bytes());
+    }
+    body.extend_from_slice(&[0u8; 44]);
+    body
+  }
+
+  /// A-378. Do: negotiate with a kernel offering `FUSE_POSIX_ACL`, `FUSE_SETXATTR_EXT`, `FUSE_INIT_EXT` and
+  /// `FUSE_HAS_EXPIRE_ONLY` (in `flags2`) as a guest's route and as a host's mount; read back the flags each reply
+  /// keeps. Expect the guest's reply to keep `FUSE_SETXATTR_EXT` and `FUSE_POSIX_ACL` and the host's neither, each reply
+  /// read back as exactly the flags its negotiation kept, the second word included; and a body too short refused.
+  #[test]
+  fn an_init_reply_keeps_the_extended_setxattr_on_a_guests_route_alone_and_reads_back_whole() {
+    let offered = flags::POSIX_ACL | flags::SETXATTR_EXT | flags::INIT_EXT | flags::HAS_EXPIRE_ONLY;
+    for (namespaces, extended) in [
+      (AttributeNamespaces::Guest, true),
+      (AttributeNamespaces::Host, false),
+    ] {
+      let negotiated = negotiate_offering(
+        &init_in(offered),
+        CacheCoherence::Invalidated,
+        DaxOffer::Withheld,
+        namespaces,
+      )
+      .unwrap();
+      assert_eq!(negotiated.setxattr_ext(), extended);
+      assert_eq!(negotiated.flags & flags::POSIX_ACL != 0, extended);
+      assert_eq!(kept_flags(&negotiated.to_bytes()), Some(negotiated.flags));
+      assert_ne!(
+        negotiated.flags & flags::HAS_EXPIRE_ONLY,
+        0,
+        "the second word reads back too"
+      );
+    }
+    assert_eq!(kept_flags(&[0u8; AT_FLAGS]), None);
   }
 }
