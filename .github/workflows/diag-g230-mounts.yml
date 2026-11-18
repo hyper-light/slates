@@ -1,0 +1,63 @@
+name: diag-g230-mounts
+# A diagnostic for g230's A-346 (never main): the Linux-only FUSE half of a superseded owner's mounts, green and
+# red-checked per guard, the server crate's Linux clippy, and the NFS half beside it.
+on:
+  push:
+    branches: ['diag-g230-mounts-*']
+jobs:
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    env:
+      SLATES_FLEET_TRACE: "1"
+      SLATES_TEST_FLEET_DEADLINE_SECS: "120"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: FUSE on the runner
+        run: |
+          command -v fusermount3 >/dev/null || { sudo apt-get update && sudo apt-get install -y fuse3; }
+          grep -qx user_allow_other /etc/fuse.conf 2>/dev/null || echo user_allow_other | sudo tee -a /etc/fuse.conf
+          ls -l /dev/fuse
+      - name: Clippy, the server crate as Linux sees it
+        run: cargo clippy --locked -p slates-server --all-targets -- -D warnings
+      - name: Green, the FUSE binary whole
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked -p slates-server --test fuse_mount -- --nocapture --test-threads=1 2>&1 | tee green.log
+          if grep -q "SKIP" green.log; then echo "a FUSE test skipped"; exit 1; fi
+      - name: Green, the NFS half
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked -p slates-server --test fleet -- --exact a_superseded_owners_nfs_mount_answers_stale --nocapture 2>&1 | tee nfs.log
+      - name: Red, each FUSE guard alone
+        shell: bash
+        run: |
+          L=crates/server/src/live_ship.rs; F=crates/server/src/fuse.rs
+          cp $L /tmp/live_ship.rs.keep; cp $F /tmp/fuse.rs.keep
+          red() {
+            if cargo test --locked -p slates-server --test fuse_mount -- --exact "$1" --nocapture > "red-$2.log" 2>&1; then
+              echo "RED-CHECK FAILED: $1 passed without $2"; tail -20 "red-$2.log"; return 1
+            fi
+            echo "red as expected: $1 without $2"; grep -E "panicked at|assertion|refused|dropped" "red-$2.log" | head -6
+          }
+          status=0
+          perl -0pi -e 's/crate::fuse::superseded\(state, slates_db::catalog::VolumeId \{ bytes: volume \}\);/let _told = ();/; s/crate::fuse::superseded\(state, id\);/let _told = ();/' $L
+          grep -c "let _told = ();" $L
+          red a_held_descriptor_on_a_superseded_volume_reads_nothing_more the-mounts-told || status=1
+          cp /tmp/live_ship.rs.keep $L
+          perl -0pi -e 's/if crate::live_ship::superseded\(s, mount\.volume\) && /if false \&\& crate::live_ship::superseded(s, mount.volume) \&\& /' $F
+          grep -c "if false && crate::live_ship::superseded" $F
+          red a_fuse_mount_over_a_kept_fence_ends_at_its_next_request the-turns-gate || status=1
+          cp /tmp/fuse.rs.keep $F
+          exit $status
