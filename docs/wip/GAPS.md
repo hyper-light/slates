@@ -1,5 +1,35 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A host admitted again refused its successor's records for good, so its live copy never caught up: fixed
+> (2026-11-18, A-382, §4.8 "Authority scope"; g230; the chaos nemesis's convergence, seeds 6876545201569229162 and
+> 7236833171758868842 on arm64, CI diag 44345243646).** The superseded adopter, admitted again under its id, kept its
+> register copies of the objects it had adopted under its own authority, at their old generation: its re-admission
+> forgot its own routes, and the install moves a copy only along its route. So it refused the creator's catalog and
+> head `ForeignGeneration` every period (660 to 796 a run), and the creator, which ships a live log only to a holder
+> holding its catalog, never sent it the log: its live copy stayed at fence 2 behind the creator's fence 3 for a whole
+> fleet wait. Fixed: the re-admission lets those copies go (`readmission::let_go_own_registers`,
+> `fleet.readmission.registers_let_go`), so the successor's next record makes them afresh, and a volume a node lost to
+> a successor ships no catalog or head record (`fleet::unplaced_heads`). Tests:
+> `every_copy_catches_up_once_the_creator_takes_its_volume_back_from_the_adopter`,
+> `every_copy_catches_up_once_the_third_node_takes_the_volume_from_the_adopter` and
+> `a_superseded_owner_restarted_warm_ships_no_record_of_the_volume_it_lost` (`crates/server/tests/fleet.rs`). Bug
+> record: `docs/bugs/2026-11-18-a-readmitted-adopters-own-register-copies-refused-its-successor-for-good.md`.
+> - **Not this entry: the x86_64 runs of the same seeds** ended two daemons each by their watchdogs ("shard N is
+>   spinning, 1000 ms of CPU without a step") right after the supersession, so the dead nodes' copies read none: the
+>   live takeover's materialization in one turn, g251's item, as seed 17036665960917068132.
+> - **Open: a superseded owner's shipper that is never told its fence ships on.** In 2 of 12 runs of the third node's
+>   case (CI diag 44358084443) the re-admitted adopter's own log of the volume, yielded but never fenced, built 119 and
+>   1,714 installs for the creator, which refused each `not_the_acting_owner`; the adopter never learned its fence from
+>   those answers, though the creator's copy was fenced above it. A-349 stops a fenced log only. Next: why that answer
+>   does not fence the sender (`live_ship::not_served`, `Shipper::on_reply`), and whether a yielded log should stop
+>   as a fenced one does (its waiting writers then need a refusal of their own).
+> - **Owed: the let-go and the yield survive a warm restart only once published.** The let-go rides the control shard's
+>   next publication; a warm restart before it restores the copies and routes them to this host again; and the yield
+>   is memory-only (`ShardState::yielded`), so a warm restart forgets that the node lost the volume at all (A-334).
+> - **Owed: a copy made afresh takes the first member's record at the current generation as its owner's,** as a new
+>   candidate's does. A node that knows it lost a volume (yielded or fenced) ships it no record; a stale owner that
+>   does not know yet was retired, so it is no member until its re-admission yields.
+
 > **Partly closed (g262, 2026-11-18): every wire enum of the protocol and of the records is held to its published
 > tags by a test.** Two guards read each wire enum's schema, which names its variants in tag order:
 > `crates/ipc/tests/wire_order.rs` (43 enums, 410 tags) and `crates/db/tests/wire_order.rs` (17 enums, 152 tags, `Op`
@@ -671,9 +701,10 @@
 > **What Hex and Mantle need from slates (2026-11-18, goal g268).**
 > - **Hex** reaches other products only through a trait with a simulator and one conformance suite (its `CLAUDE.md`
 >   §9). **Built (A-310):** `slates_api::Volumes`, implemented by `Instance` and by `SimVolumes`, held to one suite
->   (`crates/api/tests/api.rs`). **Owed:** a typed class for a pinned snapshot's destroy, answered `Invalid::Request`
->   today (the contract's, goal g262); Hex's own use of the seam when it takes slates (kiln's plan T7, CP-T7.8 and
->   CP-T7.13). **Decided (Ada, 2026-11-18):** Hex's microVM disks stay per machine (its D281); slates workspaces alone
+>   (`crates/api/tests/api.rs`). A pinned snapshot's destroy is typed since `CONTRACT` 15 (`Busy::Volume(Pinned)`, the
+>   simulator's answer and the suite's assertion too); at `CONTRACT` 30 the suite passes over an instance and over the
+>   simulator (kiln run r160, 2026-11-18). **Owed:** Hex's own use of the seam when it takes slates (kiln's plan T7,
+>   CP-T7.8 and CP-T7.13). **Decided (Ada, 2026-11-18):** Hex's microVM disks stay per machine (its D281); slates workspaces alone
 >   replicate across runners (g267's entry).
 > - **Mantle**'s agent, asked on 2026-11-18 whether it waits on slates, has not answered; its kiln track (plan T10)
 >   puts kiln's bytes on Mantle through kiln's `Blobs`, and two of its steps reach slates, neither started: CP-T10.4 keeps slates snapshots on Mantle, which needs a snapshot's
@@ -2381,6 +2412,14 @@
 >   after one record (`docs/bugs/2026-11-09-the-cadence-tests-approach-predicted-the-next-record-from-the-last.md`).
 >   Open, raft's: the trigger times replay work on the wall, so preemption counts as work; the thread's CPU time would
 >   remove the spikes from the trigger and the test alike.
+>   **The record-mix test (2026-11-18, g251):** it held a whole recovery, the snapshot's decode in it, to the tail's
+>   budget, which the design's bound does not (the decode plus the larger of the budget and a snapshot's size of tail),
+>   and a macOS CI runner failed its eighth check at 11.6 ms where a near-empty tail cost 1.7 ms (run 44260193629). It
+>   now judges each check past a baseline recovery of the settled segment, within the inner-quartile spread of five
+>   recoveries (`docs/bugs/2026-11-18-the-cadence-mix-test-held-the-snapshot-decode-to-the-budget.md`). **Open:** the
+>   commits' measure of the tail's replay and the replay itself diverge by machine and moment (the commits about 1.7x
+>   over on a Mac Studio, 0.4x to 1.25x on the CI runner), so where they under-measure the tail replays past the budget
+>   before the trigger fires.
 >
 > - **A forward refused at admission left its client waiting** (found 2026-11-07 by fixtures' f = 1 replica-kill
 >   rung, placed by the forward hop counters). A shard with a full task arena drops a spawn unrun, and the forwards
@@ -4198,6 +4237,25 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 >       A-351 (g225, the promotion gate) and A-354 (g230, `DurabilityPending` at the SLO), all four pass on a Mac Studio
 >       (2026-11-18): taken over in 2.23 to 2.67 s; held writes refused after 10.03 to 10.09 s, the stopped owner's
 >       answered after 2.57 s.
+>     - **Fixed in the flow (g229): the kill-at-ack flow kept six bounded claims on one fleet.** On CI's 7 GB macOS
+>       runner (diag-supervisor-live-2, run 44350386549, 2026-11-18) no survivor served iteration 3's probe, nor
+>       iteration 4's, within the fleet wait. No write was lost: the other survivor held the whole log through the probe
+>       (both survivors at head 9 of the NFS iteration's log; head 8, the end of a client-write iteration's log, as the
+>       passing iterations' successors adopted). The successor rebuilt the volume from the adopted log
+>       (`fleet.live.taken_over`), then its restore was refused `BudgetExceeded` once a period for the failover SLO's 100
+>       periods, and it gave the volume up (`fleet.materialize.given_up` 1, then 2), so every verb on it answers
+>       `NotRecovered { TakeoverIncomplete }`. Every flow volume was a bounded claim of the stream's bound, 782 MiB, and
+>       both of the successor's shards already held one it had taken over earlier (`committed=819986432` of
+>       `reserve=1073741824`, two shards a daemon). The bound's doc called it "a quota, not memory", which only a dynamic
+>       volume is (§4.2 "sacred bounded claims"). The flow's volumes are now dynamic (`Claim::Dynamic`); the other flows
+>       keep their one bounded claim, which a takeover re-admits on a shard holding nothing else.
+>       Red first on a Mac Studio (2026-11-18, kiln r138), the runner's geometry scaled to the Studio's 16 GiB shard
+>       (bounded claims of 12,512 MiB, 782/1024 of it, the flow's own bounded as before): iterations 2, 4 and 5 failed
+>       the same way (`fleet.materialize.refused.budget_exceeded`, then `fleet.materialize.given_up`). Green with the
+>       flow's volumes dynamic and the other claims still scaled: 2 of 2 (47 s and 35 s), every probe served 1.92 to
+>       9.32 s after its owner's death.
+>       **Owed (§4.2, found here):** a candidate makes no admission before it holds a live log, so nothing reserves a
+>       bounded claim on the node that may take it over (SLATES_DESIGN §4.2, status of this date).
 >     - g230's: Continuity in five flows (A-329: a successor's positions no longer start again at 1) and the nemesis's
 >       fence lag.
 >
@@ -7809,7 +7867,7 @@ or executable regression was performed by this docs change.
 
 | Id | Gap and source finding | Design contract | Closure gate / owning phase |
 |---|---|---|---|
-| GAP-A9-1 | Per-host admission is all-cost on one code path (2026-09-13): content charged at its buddy block, snapshot retention charged from unpromised capacity by the retaining operation (refused typed before mutation, balanced through destroy and recovery), metadata laid out against the class and every volume's records reserved from a per-shard ledger; effective capacity clamped to the OS/job/cgroup bound; mapped and usable reported; an admitted claim protected through resize and recovery; proven by the charge oracle (150 histories) and AC-2.11's neighbour test. **Pressure signal DONE 2026-09-21** (a hold on each shard's byte budget, sampled from `memory_available_now` at the liveness cadence and fanned as the host shortfall's per-shard share; shrinks admittable only, never a committed claim, so a raised hold refuses a new create `BudgetExceeded` while an admitted volume's within-entitlement writes land — `crates/server/tests/nfs_mount.rs`, the pure budget unit; admission.md §5.5). Owed: the Windows job-object bound, guest and open-reference bytes (docs/wip/admission.md). (Was: locked flag without locked store, mapped-vs-usable capacity, dynamic allocations competing with bounded claims (BUG-1–3); uncharged metadata/transient/retained bytes could defeat the cap.) | §4.2: atomic all-cost per-host admission; disjoint shard credits; protect outstanding entitlement through resize, pressure and recovery. | AC-0.10/T-0.10; AC-2.11/T-2.13; Phases 0/2. |
+| GAP-A9-1 | Per-host admission is all-cost on one code path (2026-09-13): content charged at its buddy block, snapshot retention charged from unpromised capacity by the retaining operation (refused typed before mutation, balanced through destroy and recovery), metadata laid out against the class and every volume's records reserved from a per-shard ledger; effective capacity clamped to the OS/job/cgroup bound; mapped and usable reported; an admitted claim protected through resize and recovery; proven by the charge oracle (150 histories) and AC-2.11's neighbour test. **Pressure signal DONE 2026-09-21** (a hold on each shard's byte budget, sampled from `memory_available_now` at the liveness cadence and fanned as the host shortfall's per-shard share; shrinks admittable only, never a committed claim, so a raised hold refuses a new create `BudgetExceeded` while an admitted volume's within-entitlement writes land — `crates/server/tests/nfs_mount.rs`, the pure budget unit; admission.md §5.5). Owed: the Windows job-object bound, guest and open-reference bytes (docs/wip/admission.md); a candidate's admission of a live log's bounded claim before it holds the log, and the held log's bytes (2026-11-18, SLATES_DESIGN §4.2 status). (Was: locked flag without locked store, mapped-vs-usable capacity, dynamic allocations competing with bounded claims (BUG-1–3); uncharged metadata/transient/retained bytes could defeat the cap.) | §4.2: atomic all-cost per-host admission; disjoint shard credits; protect outstanding entitlement through resize, pressure and recovery. | AC-0.10/T-0.10; AC-2.11/T-2.13; Phases 0/2. |
 | GAP-A9-2 | Live bases and immutable complete snapshots conflated; remote delta-only clone drops untouched state; base capture not implemented. | §4.4/§4.15/§4.10: retained BaseRef and explicit coverage; stable-source requirement for complete atomic capture. | AC-1.16/T-1.20; AC-8.21/T-8.19; Phases 1/8. |
 | GAP-A9-3 | **Swept 2026-09-14 (`991c84e`..`b4eeb2d`)**: base lookup loads the listing on demand and every metadata mutation copies up through the base plane; the FUSE flags are checked against the kernel header by 18 independent vectors (which found and fixed `flags2` never negotiated); READDIRPLUS/FSYNC/LINK dispatch, every setattr field and rename flag honoured or refused `EINVAL`, statfs truthful to the shard budget, invalidations delivered from the journal and watcher hints with a bounded lifetime for live base entries. Still open: the mounted conformance run over native FUSE in the Linux lane (native Linux still mounts through the root NFS adapter, `MountMethod::LinuxRoot`). Closed since (reconciled 2026-11-06, Step 15): the FUSE loop's first compile and a real-kernel serve (dadbdc17, 153ca633), and the owner fields of base entries (13309ce5). (Was: base lookup depends on listing, FUSE flag mismatch, undispatched advertised operations, ignored metadata/rename flags, false statfs (BUG-5–10); coherence delivery and metadata copy-up need sweep.) | §4.5–§4.6: complete shared operations, independent ABI checks, truthful capacity, real invalidations and mounted conformance. | AC-1.17/T-1.21 (by use on one host: closed); AC-3.10/T-3.13 (edge and vectors: closed; mounted: Linux lane); Phases 1/3. |
 | GAP-A9-4 | **Closed 2026-09-21** (the 2026-09-14 pieces stand: bounded generation-checked handles, the deadline-bounded helper handshake that reaps or cancels on every exit, generations with in-flight pins and a barrier refusing typed `BarrierIncomplete`). Now: the daemon holds **one attachment registry per shard** every transport rides — a mount's request is admitted under the registry attachment its capability maps to (admitted on first use, revoked and drained when the catalog attachment ends), the NFS export serves through the shared registry (`Export::over`), and a guest device is admitted into it (`admit` takes the owner's registry; the device keeps its id, its service passes and terminal step take the registry through `BridgeAccess`); `snapshot` runs the barrier over the volume before freezing the root and its reply **says what it covers** (`SnapshotCoverage { boundary: Complete | ServerVisible, attachments_closed }` — server-visible over an NFS mount, whose client buffers acknowledged writes until its `COMMIT`); the FUSE writeback flush has no work left (writeback cache refused at `FUSE_INIT`, 2026-09-19); and a host mount **binds its mount point** (`BindMount` → `AttachForm::ChosenPath`, §4.4 `Binding → Bound`; `slates mount` binds after `mount_nfs`; `status` lists bound mounts under a budget). Proven by use over the real NFS socket (`crates/server/tests/nfs_mount.rs`: coverage complete/0 → server-visible/1 → complete/0 with the mount's life; a bound mount listed, another principal and an SDK attachment refused, the detach unlisting it), the device suites over the shared registry, and the live kernel-mount CLI flow (`status ID` names the mount point while mounted, none after `umount`). **Reopened and fixed 2026-10-23:** a FUSE mount that ended in its serve turn (an unmount, a failed device) was dropped there, so `ended` never revoked or drained its registry attachment. That leaked one slot of the shard's 4096 per unmount, until every attach on the shard was refused. Now `turn` always puts the mount back and `ended` tears it down. Proven by `a_fuse_mounts_unmount_frees_its_registry_attachment` (status `registry_attachments` back to its count before the mount), red then green on the box (`docs/bugs/2026-10-23-a-fuse-mount-that-ends-in-its-turn-keeps-its-registry-attachment.md`). (Was: attachment record is not a mounted path; dirty client caches lack a seal barrier; handles grow and helper error exits can orphan children (BUG-4/14).) | §4.4/§4.6: authenticated binding, ready path/device, barriers, generations, bounded drain/revoke/reuse. | AC-3.11/T-3.14 (seam: closed; kernel-buffered writes: Linux lane); AC-3.12/T-3.15 (closed on this host); Phase 3. |
