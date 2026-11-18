@@ -489,8 +489,24 @@ pub(crate) fn resolve_held_objects(state: &mut ShardState, local: HostId) {
 }
 
 /// [`resolve_held_objects`] for one held copy, `object`'s, under `regional`: the walk of an install takes the copies a
-/// slice a turn (`fleet::install_on_copy`, A-398), and this whole pass is its oracle in the daemon's unit tests.
+/// slice a turn (`fleet::install_on_copy`, A-398), and this whole pass is its oracle in the daemon's unit tests. The copy
+/// is judged by its route ([`resolve_by_route`]), then follows its object's move, if the configuration moved it (A-291,
+/// [`crate::moves::follow_moved_object`]), whatever the route judged: a copy routed to its live old owner follows the
+/// move too (A-485).
 pub(crate) fn resolve_held_object(
+  state: &mut ShardState,
+  local: HostId,
+  regional: &RegionalConfiguration,
+  object: ObjectId,
+) {
+  resolve_by_route(state, local, regional, object);
+  crate::moves::follow_moved_object(state, regional, local, object);
+}
+
+/// [`resolve_held_object`]'s judgment of one held copy by its route: a copy routed to a live member is let go once its
+/// successor's confirmation shows it stale; one routed to a retired host moves to the successor its lineage ranks, or
+/// is kept, counted, or let go as its line ends.
+fn resolve_by_route(
   state: &mut ShardState,
   local: HostId,
   regional: &RegionalConfiguration,
@@ -544,8 +560,6 @@ pub(crate) fn resolve_held_object(
       }
     }
   }
-  // A copy the configuration moved to another member (A-291) follows its move.
-  crate::moves::follow_moved_objects(state);
 }
 
 /// Lets a stale copy of `object` go ([`reclaim`]) unless this holder still holds content for it once its retention
@@ -684,7 +698,7 @@ fn reclaim(state: &mut ShardState, object: ObjectId) {
 /// Drops this holder's copy of `object`: its acceptor, its routing entry, its lease-gate record, a green's
 /// replica, and whatever content it held for the object, a partial stage included (AUD-29-43: a stale copy's bytes are
 /// reclaimed with its records, never kept for a head this holder no longer backs). A takeover's reclaim ([`reclaim`])
-/// and a planned move's (A-291, `crate::moves::follow_moved_objects`, once the move's new owner has sealed the volume
+/// and a planned move's (A-291, `crate::moves::follow_moved_object`, once the move's new owner has sealed the volume
 /// under its own placement, which leaves this holder out) both end a copy so.
 pub(crate) fn drop_copy(state: &mut ShardState, object: ObjectId) {
   state.holder_records.remove(&object);
@@ -2953,6 +2967,94 @@ mod tests {
     );
     install_council(state);
     others
+  }
+
+  /// Installs the audit node's council configuration and walks it onto its held copy of `object`, as an install's walk
+  /// reaches each copy (`fleet::install_on_copy`, A-398).
+  fn walk_install_onto(state: &mut ShardState, object: ObjectId) {
+    install_council(state);
+    let local = state.fleet.host();
+    let regional = state.council.configuration().clone();
+    let retired: std::collections::BTreeSet<HostId> = regional.retired.keys().copied().collect();
+    crate::fleet::install_on_copy(
+      state,
+      local,
+      (&regional, &retired),
+      regional.version,
+      object,
+    );
+  }
+
+  /// A-485 (A-291's move, §4.8 "Authority scope"; A-398's install walk): a holder's copy of a moved volume follows the
+  /// move when the install's walk reaches it, so the takeover of a target that dies before adopting it lists the copy
+  /// for the target's successor. Do: in A-340's region, hold a copy of another member's volume under that member's
+  /// authority; move the volume to a third member and walk the install onto the copy; retire the target and walk the
+  /// next install onto the copy. Expect the copy routed to the target after the move's install, and listed for the
+  /// target's successor in the target's takeover, as the successor's page asks (`copies_falling_to`). Before, the walk's
+  /// per-copy step followed a move only for a copy whose route named a retired host: a copy routed to its live old owner
+  /// kept that route and that authority, no takeover of the target listed it, every successor confirmed without it, and
+  /// the configuration handed the volume's line to a successor that never adopted it, while the old owner let its
+  /// frozen copy go (`a_move_whose_target_dies_at_the_switch_is_served_by_its_successor`, every run since A-398).
+  #[test]
+  fn a_held_copy_follows_its_move_at_the_install_walk_and_falls_to_the_dead_targets_successor() {
+    let (owners, routed, listed) = crate::daemon::audit_on_shard(|state| {
+      use slates_cluster::config_group::Reconfiguration;
+      let local = state.fleet.host();
+      let others = whole_region(state);
+      let (owner, target) = (others[0], others[1]);
+      let volume = ObjectId::new(owner, 0);
+      let generation = state.fleet.configuration().version;
+      let mut acceptor = Acceptor::new(local, Authority { generation, owner });
+      acceptor
+        .accept(&Record {
+          owner,
+          object: volume,
+          sequence: 0,
+          epoch: HostEpoch(1),
+          generation,
+          value: b"head".to_vec(),
+        })
+        .unwrap();
+      state.holder_records.insert(volume, acceptor);
+      state.fleet.track_object_owner(volume, owner);
+      assert!(
+        state.council.propose(Reconfiguration::Move {
+          object: volume,
+          from: owner,
+          to: target,
+          cohort: vec![owner, local, target],
+        }),
+        "the move commits"
+      );
+      walk_install_onto(state, volume);
+      let routed = state.fleet.object_owner(volume);
+      assert!(
+        state.council.propose(Reconfiguration::TakeOver(target)),
+        "the target retires before it adopts"
+      );
+      walk_install_onto(state, volume);
+      let listed = state
+        .council
+        .configuration()
+        .successor(target, volume)
+        .map(|successor| {
+          (
+            successor,
+            copies_falling_to(state, target, successor, None).contains(&volume),
+          )
+        });
+      ((owner, target), routed, listed)
+    });
+    let (owner, target) = owners;
+    assert_eq!(
+      routed,
+      Some(target),
+      "the copy follows the move to its target (owner {owner:?})"
+    );
+    assert!(
+      matches!(listed, Some((_, true))),
+      "the target's takeover lists the copy for its successor: {listed:?}"
+    );
   }
 
   /// A round of the audit node's for `departed`'s takeover that has learned `object` and adopted nothing.

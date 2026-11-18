@@ -45,11 +45,9 @@ less) nothing changed: the gap stayed well inside the bound.
 
 ## Siblings (reported, not changed here)
 
-- The daemon's watchdog has the same shape (A-308): a look a window or more after the one before restarts a shard's
-  still time (`ShardWatch::judge`, `unwatched`), and the watchdog looks a beat apart whatever its own lateness
-  (`recv_timeout(HEARTBEAT_NS)`). So a watchdog thread delayed by a window less a beat at every look never judges a
-  wedged shard, and since it beats at each of those looks the anchor sees no lapse either. A-308 meant the rule for a
-  process frozen or paging whole, whose shards' stillness is the process's; a watchdog held off its CPU while one shard
-  is wedged and the rest run is not told apart from it. Not measured; owed a test at that lateness before any change.
+- The daemon's watchdog had the same shape (A-308): a look a window or more after the one before restarted a shard's
+  still time (`ShardWatch::judge`, `unwatched`), and the watchdog looks a beat apart whatever its own lateness, so a
+  watchdog delayed by a window less a beat at every look never judged a wedged shard. Fixed by A-474:
+  `2026-11-18-the-watchdog-never-judged-a-wedged-shard-once-its-own-looks-ran-a-window-late.md`.
 - The daemon's reap loop paces its sweep by a fixed tick too (`daemon.rs` `reap_loop`); it is moving to an
   event-driven reaper (A-470's entry), which retires the tick.

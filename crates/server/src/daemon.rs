@@ -2837,13 +2837,9 @@ impl Daemon {
         (adopted, identities)
       })?;
     if let Some(through) = adopted_through {
+      // Its ledger's, with the versions its durable checkpoint stands for (A-404, A-476).
       let mut ledger = self.observe(self.shards.first().copied(), move |s| {
-        (1..=through)
-          .filter_map(|version| {
-            crate::merge_origin::ledger_value(s, object, version)
-              .map(|value| (version, value.increment))
-          })
-          .collect::<Vec<_>>()
+        crate::merge_origin::ledger_identities(s, object, through)
       })?;
       ledger.append(&mut identities);
       identities = ledger;
@@ -4660,6 +4656,7 @@ async fn init_shard(
     council_learner_pace: crate::fleet::LearnerPace::default(),
     learner_fetch: crate::fleet::LearnerFetchLog::default(),
     root_learner_pace: crate::fleet::LearnerPace::default(),
+    root_newer_seen: None,
     record_sessions: std::collections::BTreeMap::new(),
     record_dials: std::collections::BTreeMap::new(),
     link_waiters: std::collections::BTreeMap::new(),
@@ -7279,7 +7276,7 @@ mod tests {
       }));
       assert!(state.council.configuration().version > installed);
       let query = crate::owner_location::Query::new(state, object, 0);
-      crate::owner_location::serve(state, &query.to_bytes())
+      crate::owner_location::serve(state, HostId(local.0 ^ 1), &query.to_bytes())
     });
     assert!(
       matches!(claimed, Ok((_, None))),

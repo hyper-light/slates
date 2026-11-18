@@ -139,6 +139,9 @@ pub struct SimHost {
   /// when its outcome comes back, those still written out — unchanged since — are durable, and nothing else is, however
   /// it was written out meanwhile.
   barrier_covers: BTreeSet<u64>,
+  /// The files (by inode) whose mode or Windows bits a landing set in place (a metadata entry, A-458) and no barrier has
+  /// synced since: what a power loss could take back (A-472). A barrier that names the file covers it.
+  meta_set: BTreeSet<u64>,
   /// Every name a landing temporary became visible under, other than a hidden landing name, while it was not yet
   /// durable ([`SimHost::visible_before_durable`]): a power loss then could leave that name holding bytes or a mode the
   /// landing never wrote (§4.15 step 8: an entry is placed only after the barrier that covers it).
@@ -267,6 +270,7 @@ impl SimHost {
       dirty_temps: BTreeSet::new(),
       written_out: BTreeSet::new(),
       barrier_covers: BTreeSet::new(),
+      meta_set: BTreeSet::new(),
       visible_unsynced: Vec::new(),
       calls: 0,
       armed: Vec::new(),
@@ -427,6 +431,27 @@ impl SimHost {
     self.written_out.remove(&ino);
     self.barrier_covers.remove(&ino);
     self.dirty_temps.insert(ino);
+  }
+
+  /// The inode a barrier taken now covers for `file`: a temporary's once written out since its last change, a file's whose
+  /// metadata a landing set in place (A-472); `None` for anything else; `StaleHandle` for no open file.
+  fn coverable(&self, file: HostFile) -> Result<Option<u64>, HostError> {
+    Ok(match self.opens.get(&file.0) {
+      Some(Open::Temp { node, .. }) => Some(node.ino).filter(|ino| self.written_out.contains(ino)),
+      Some(Open::File { ino, .. }) => Some(*ino).filter(|ino| self.meta_set.contains(ino)),
+      Some(_) => None,
+      None => return Err(HostError::StaleHandle),
+    })
+  }
+
+  /// The inode of an open temporary or file; `None` for a directory; `StaleHandle` for no open handle.
+  fn open_ino(&self, file: HostFile) -> Result<Option<u64>, HostError> {
+    match self.opens.get(&file.0) {
+      Some(Open::Temp { node, .. }) => Ok(Some(node.ino)),
+      Some(Open::File { ino, .. }) => Ok(Some(*ino)),
+      Some(_) => Ok(None),
+      None => Err(HostError::StaleHandle),
+    }
   }
 
   /// The inode of an open landing temporary; `None` for another open file; `StaleHandle` for no open file.
@@ -761,6 +786,14 @@ impl SimHost {
       n.windows = bits;
       n.ctime_ns = now;
     }
+  }
+
+  /// Whether the file at `path` holds a mode or Windows bits a landing set in place that no barrier has synced since
+  /// (A-472): what a power loss could take back from a landing that reported it.
+  pub fn holds_unsynced_metadata(&self, path: &str) -> bool {
+    self
+      .node(&Self::split(path))
+      .is_some_and(|node| self.meta_set.contains(&node.ino))
   }
 
   /// An entry's Windows attribute bits as the simulated disk holds them (A-262), none for a missing one: what a test of
@@ -1156,12 +1189,9 @@ impl LandFs for SimHost {
     self.fault(SimVerb::Barrier, "")?;
     let mut covers = BTreeSet::new();
     for file in files {
-      // Only a file written out since its last change is covered: a dirty one stays dirty.
-      covers.extend(
-        self
-          .temp_ino(*file)?
-          .filter(|ino| self.written_out.contains(ino)),
-      );
+      // Only a temporary written out since its last change is covered (a dirty one stays dirty), and a file whose
+      // metadata a landing set in place (A-472), which has no writeback to start.
+      covers.extend(self.coverable(*file)?);
     }
     self.barrier_covers = covers;
     let refusal = self.fault(SimVerb::BarrierRun, "").err();
@@ -1176,10 +1206,11 @@ impl LandFs for SimHost {
     let covers = std::mem::take(&mut self.barrier_covers);
     ran?;
     for file in files {
-      if let Some(ino) = self.temp_ino(*file)?
+      if let Some(ino) = self.open_ino(*file)?
         && covers.contains(&ino)
       {
         self.written_out.remove(&ino);
+        self.meta_set.remove(&ino);
       }
     }
     Ok(())
@@ -1214,6 +1245,8 @@ impl LandFs for SimHost {
           n.mode = mode;
           n.ctime_ns = now;
         }
+        // Set in place, as a landing's metadata entry sets it: unsynced until a barrier names the file (A-472).
+        self.meta_set.insert(ino);
         Ok(())
       }
       _ => Err(HostError::StaleHandle),
@@ -1245,6 +1278,8 @@ impl LandFs for SimHost {
           n.windows = windows;
           n.ctime_ns = now;
         }
+        // Set in place: unsynced until a barrier names the file (A-472).
+        self.meta_set.insert(ino);
         Ok(())
       }
       _ => Err(HostError::StaleHandle),

@@ -1297,8 +1297,8 @@ mod served {
     /// Offers the filled copy's descriptor on the socket route (macOS), judged first to authorize the copy alone in the
     /// map's access (`slates_ipc::route::confined_map`), behind a fresh single-use secret the reply carries; the
     /// backing held on the client's slot since the copy was made. The reply; `MapUnavailable` (counted) where the
-    /// volume, the file or the copy went, the mapping id does not fit, the descriptor is unconfined, no secret can be
-    /// drawn or no offer kept.
+    /// volume, the file or the copy went, the mapping id does not fit, the descriptor is unconfined, or no secret can be
+    /// drawn.
     #[cfg(target_os = "macos")]
     fn offer(&mut self, state: &mut ShardState) -> ReplyBody {
       use std::os::fd::AsFd;
@@ -1307,7 +1307,7 @@ mod served {
         return refused(Refusal::MapUnavailable);
       };
       // The client may be served by any shard (A-188): it claims the offer by the mapping id, whose high bits name this
-      // one. An offer it never claims expires, and its reap lets the copy go before then.
+      // one. An offer it never claims stays until the copy is let go, which its reap does (A-492: no clock ends it).
       let size = state
         .volumes
         .get(self.volume)
@@ -1339,11 +1339,9 @@ mod served {
         return refused(Refusal::MapUnavailable);
       };
       let key = (slates_ipc::route::OfferKind::Map, mapping_id);
-      // A map's copy rides alone: only a stream's offer carries a resync end (A-339).
-      if !crate::shards_route::offer(state, key, secret, (descriptor, None)) {
-        state.count(FELL_BACK, 1);
-        return refused(Refusal::MapUnavailable);
-      }
+      // A map's copy rides alone: only a stream's offer carries a resync end (A-339). The offer is this fill's client's,
+      // waiting for its claim while it lives (A-492).
+      crate::shards_route::offer(state, key, self.client_id, secret, (descriptor, None));
       // Held in the table since the copy was made: the fill lets go of it no more.
       self.backing = None;
       state.count(HANDED, 1);
