@@ -1,5 +1,13 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **KIND on Ubuntu 26.04 ran out of inotify instances: fixed in the lane (2026-11-09).** The KIND lane failed at
+> formation on `ubuntu-latest` once it became 26.04 (`peers_probed=0`), and passed on 24.04. The image keeps the
+> kernel's `fs.inotify.max_user_instances = 128` (24.04's set 1280), which kind's six privileged nodes share as the
+> host's root; kube-proxy crash-looped on 4 of 5 workers, so pods there never reached the cluster's DNS. Raised to
+> kind's documented 512 (and 524288 watches), 6 of 6 kube-proxies ran with 0 restarts (diag-release-14). The job
+> raises them before the lane; the image stays 26.04. Record:
+> `docs/bugs/2026-11-09-kind-on-ubuntu-26-04-ran-out-of-inotify-instances.md`.
+
 > **The dirty-page test's precondition, proved each attempt (2026-11-09, A-248).**
 > `a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path` failed intermittently ("the sync says so:
 > Ok(())", B10's gate, adacachy2, load about 66) when the kernel wrote the store's page back before the replacement. On
