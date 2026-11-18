@@ -936,3 +936,66 @@ fn a_granted_landing_refused_its_targets_lease_records_its_refusal() {
   drop(client);
   daemon.stop();
 }
+
+/// Shape: grant ids no approval issued: the daemon numbers its grants from one, one an approval.
+const UNISSUED_GRANTS: [u64; 2] = [u64::MAX, u64::MAX - 1];
+
+/// §4.15 "Audit", A-321: the end of a granted landing refused before anything named its manifest records no verdict,
+/// since it had no statement to judge a signature against, and each such landing's end names an id of its own. Do: write
+/// a scratch volume's file, hold an empty target's lease for another attempt, and land the volume into it twice, each
+/// time under a grant no approval issued and carrying a signature; read the audit. Expect each landing refused
+/// `LandingLeaseHeld`, and one `landing_finished` under each grant: `refused`, naming neither a manifest nor a verdict,
+/// the two under different landing ids. Read as a verdict, the end would claim the signed landing `Unsigned`; and a
+/// refused landing that spent no fresh id would leave the next one's trail under its own.
+#[test]
+fn a_granted_landing_refused_before_any_manifest_records_no_verdict() {
+  let (daemon, instance) = daemon("refused-unnamed", None);
+  let target = target_dir();
+  let mut client = connect(&instance);
+  let volume = volume_holding(&mut client, "refused-unnamed", "u.txt", b"unnamed");
+  let key = lease_key_of(&target.path);
+  hold(&daemon, &key, OTHER_HOLDER, HOLD_TERM_NS).unwrap();
+  for grant in UNISSUED_GRANTS {
+    let landed = client.land_with_signature(
+      (volume, None),
+      &target.path,
+      Filter::default(),
+      Some(grant),
+      Some(b"a signature over no statement"),
+    );
+    assert!(
+      matches!(
+        landed,
+        Err(ClientError::Refused(Refusal::LandingLeaseHeld {
+          holder: OTHER_HOLDER
+        }))
+      ),
+      "{landed:?}"
+    );
+  }
+  release(&daemon, &key, OTHER_HOLDER);
+  let audit = client.audit(0).unwrap();
+  let mut landings = Vec::new();
+  for grant in UNISSUED_GRANTS {
+    let ends: Vec<_> = audit
+      .iter()
+      .filter(|record| record.grant == Some(grant))
+      .collect();
+    assert_eq!(ends.len(), 1, "one end under grant {grant}: {audit:?}");
+    let end = ends[0];
+    assert_eq!(
+      (end.audit_kind, end.stage, end.manifest, end.verification),
+      (
+        AuditKind::LandingFinished,
+        Some(LandingStage::Refused),
+        None,
+        None
+      ),
+      "{end:?}"
+    );
+    landings.push(end.landing);
+  }
+  assert_ne!(landings[0], landings[1], "{audit:?}");
+  drop(client);
+  daemon.stop();
+}
