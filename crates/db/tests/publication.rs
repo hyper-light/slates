@@ -125,6 +125,7 @@ fn volume(n: u64, name: &str) -> VolumeRecord {
     access: Vec::new(),
     created_ns: NOW_NS,
     catalog_version: 0,
+    taken_over: None,
   }
 }
 
