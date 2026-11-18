@@ -9744,7 +9744,7 @@ fn clone_named_elsewhere(
         confirmed: false,
       },
     };
-    let reserved = crate::xshard::call_within(
+    let reserved = crate::xshard::call_in_shard_time(
       this,
       name_shard,
       move |s| alias_step(s, &reservation),
@@ -9771,7 +9771,7 @@ fn clone_named_elsewhere(
       } else {
         Op::NameAliasReleased { name }
       };
-      let settled = crate::xshard::call_within(
+      let settled = crate::xshard::call_in_shard_time(
         this,
         name_shard,
         move |s| alias_step(s, &settle),
