@@ -888,13 +888,68 @@ fn a_signed_landing_is_judged_and_read_back_through_the_contract() {
     &mut instance,
     &VolumeSpec::overlay("signed-landing", &folder.path, ROOM),
   );
-  write_file(&mut instance, volume, "/s.txt", b"signed\n");
+  let (landing, verified) = land_signed(&mut instance, &launcher, volume, &folder);
+  expect_the_signed_landing_audited(&mut instance, landing, verified);
+  daemon.stop();
+}
+
+/// Shape: the instances that read the audit in the cross-shard test beside the one that landed. A client's shard is its
+/// id's residue over the shards and fresh ids are handed out in turn, so the four sit on both of kiln's shards
+/// whichever the first took.
+#[cfg(unix)]
+const AUDIT_READERS: usize = 3;
+
+/// AC-5.10 / AC-5.12 (A-321, A-265; §4.15 "Ownership facts": the audit log is written through the control shard;
+/// §4.12) on the shards kiln starts: do land an overlay signed and approve it as
+/// `a_signed_landing_is_judged_and_read_back_through_the_contract` does, the overlay named so that the shard other than
+/// the control shard owns it; then read the audit from the instance that landed and from three more attached after it.
+/// Expect every reader to read the landing's planned and finished records, verified. Before A-265 `Audit` read only the
+/// partition of the reader's own shard while a landing's records were written on its volume's, so a reader on the
+/// control shard read none of them and the landing's verdict with them (GAPS, found by g90).
+#[cfg(unix)]
+#[test]
+fn a_signed_landings_audit_reads_back_on_every_shard_kiln_starts() {
+  let (daemon, mut instance) = kiln_grouped("audit-shards");
+  let launcher = issuer_of(&daemon);
+  let folder = Folder::new();
+  let name = (0..)
+    .map(|n| format!("audited-elsewhere-{n}"))
+    .find(|name| slates_server::verbs::owner_of_name(name, usize::from(KILN_SHARDS)) != 0)
+    .unwrap();
+  let volume = provision(
+    &mut instance,
+    &VolumeSpec::overlay(&name, &folder.path, ROOM),
+  );
+  let (landing, verified) = land_signed(&mut instance, &launcher, volume, &folder);
+  let mut readers: Vec<Instance> = (0..AUDIT_READERS)
+    .map(|_| Instance::attach(instance.name()).unwrap())
+    .collect();
+  expect_the_signed_landing_audited(&mut instance, landing, verified);
+  for reader in &mut readers {
+    expect_the_signed_landing_audited(reader, landing, verified);
+  }
+  drop(readers);
+  daemon.stop();
+}
+
+/// The signed landing of `a_signed_landing_is_judged_and_read_back_through_the_contract`: do trust a fresh key on
+/// `volume` with the `launcher`'s authority, write a file into it, plan its landing into `folder`, sign the statement
+/// the plan states and land with the signature, and approve what that asks. Expect what that test names; the landing
+/// and the verdict it was answered with.
+#[cfg(unix)]
+fn land_signed(
+  instance: &mut Instance,
+  launcher: &slates_api::Issuer,
+  volume: VolumeId,
+  folder: &Folder,
+) -> (u64, Verification) {
+  write_file(instance, volume, "/s.txt", b"signed\n");
   let key = signer::TestSigner::fresh();
   let trusted = TrustedSigner::from_wire(key.public()).unwrap();
   instance
-    .set_signers(volume, std::slice::from_ref(&trusted), &launcher)
+    .set_signers(volume, std::slice::from_ref(&trusted), launcher)
     .unwrap();
-  let request = landing_into(volume, &folder);
+  let request = landing_into(volume, folder);
   let LandOutcome::ApprovalRequired(plan) = instance.plan_landing(&request).unwrap() else {
     panic!("a plan presents");
   };
@@ -916,13 +971,12 @@ fn a_signed_landing_is_judged_and_read_back_through_the_contract() {
     None,
     "nothing written before the approval"
   );
-  let LandOutcome::Written(report) = instance.approve_landing(&asked, &launcher).unwrap() else {
+  let LandOutcome::Written(report) = instance.approve_landing(&asked, launcher).unwrap() else {
     panic!("the approved manifest lands");
   };
   assert_eq!(report.verification, verified);
   assert_eq!(folder.read("s.txt").unwrap(), b"signed\n");
-  expect_the_signed_landing_audited(&mut instance, report.landing, verified);
-  daemon.stop();
+  (report.landing, verified)
 }
 
 /// The audit of `a_signed_landing_is_judged_and_read_back_through_the_contract`. Expect every record of `landing` that
