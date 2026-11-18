@@ -2778,6 +2778,14 @@ async fn send_from_control(origin: u16, control: u16, sends: Vec<Send>) {
     origin,
     control,
     move || async move {
+      // DIAG (g076b prototype): the control shard keeps polling through the exchange and after it, for the next
+      // dispatch.
+      let diag_hold = std::env::var("SLATES_DIAG_CONTROL_HOLD_NS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
+      if let Some(hold) = diag_hold {
+        slates_rt::registry::with_current(|ctx| ctx.hold_idle_window(hold));
+      }
       let made = sends.iter().map(|send| send.made_ns).min().unwrap_or(0);
       hop_diag::record_here(
         hop_diag::TO_CONTROL,
@@ -2789,6 +2797,9 @@ async fn send_from_control(origin: u16, control: u16, sends: Vec<Send>) {
         lanes.push(Box::pin(ship_to_holder(origin, holder, sends, budget)));
       }
       every(lanes).await;
+      if let Some(hold) = diag_hold {
+        slates_rt::registry::with_current(|ctx| ctx.hold_idle_window(hold));
+      }
     },
     deadline,
   )
