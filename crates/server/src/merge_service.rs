@@ -1499,6 +1499,10 @@ pub(crate) fn status_merge_volume(
       takeover_kept: 0,
       // A green or a work volume has no base folder (A-299).
       base: None,
+      // A green's state is its versions, each committed by its merge record before it is answered (§4.16 "Commit"),
+      // not owner-local edits a seal would place; the volume loss window (AC-8.3) does not describe it, so none is
+      // reported rather than a zero it was not measured to be.
+      loss: slates_ipc::protocol::LossReport::default(),
     }),
   })
 }

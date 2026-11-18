@@ -76,9 +76,12 @@ pub fn wrap(
   namer: &Namer,
   segment: u32,
 ) -> Result<Archive, EnvelopeError> {
-  let mut entries = Vec::with_capacity(archive.chunks.len().saturating_add(1));
-  let mut chunks = Vec::with_capacity(entries.capacity());
-  let mut largest = 0u64;
+  let mut sealing = Sealing {
+    entries: Vec::with_capacity(archive.chunks.len().saturating_add(1)),
+    chunks: Vec::with_capacity(archive.chunks.len().saturating_add(1)),
+    stored: std::collections::BTreeSet::new(),
+    largest: 0,
+  };
   // A chunk's keyed name depends on its identity alone, so a repeat is skipped before it is sealed.
   let mut named = std::collections::BTreeSet::new();
   for chunk in &archive.chunks {
@@ -90,7 +93,7 @@ pub fn wrap(
     }
     let sealed = seal_chunk(lineage, namer, chunk, segment)?;
     let name = entry_name(CHUNK_PREFIX, &sealed.name);
-    push_sealed(sealed, name, &mut entries, &mut chunks, &mut largest)?;
+    sealing.push(sealed, name)?;
   }
   let without_chunks = Archive {
     chunks: Vec::new(),
@@ -104,7 +107,13 @@ pub fn wrap(
     segment,
   )?;
   let name = entry_name(MANIFEST_PREFIX, &manifest.name);
-  push_sealed(manifest, name, &mut entries, &mut chunks, &mut largest)?;
+  sealing.push(manifest, name)?;
+  let Sealing {
+    mut entries,
+    chunks,
+    largest,
+    ..
+  } = sealing;
   entries.sort_by(|a, b| a.name.cmp(&b.name));
   let largest = u32::try_from(largest).map_err(|_| EnvelopeError::TooLarge)?;
   Ok(Archive {
@@ -146,7 +155,14 @@ pub fn open(
   if manifests.next().is_some() {
     return Err(EnvelopeError::Manifest);
   }
-  let manifest_chunk = open_entry(envelope, manifest_entry, lineage, namer)?;
+  // The envelope's chunks by identity, so each entry finds its chunk in log time: a scan per entry made opening `n`
+  // chunks cost `n²` identity comparisons, about 1.3e8 at 1 GiB of 64 KiB chunks, on the takeover's path.
+  let stored: std::collections::BTreeMap<&[u8; 32], &Chunk> = envelope
+    .chunks
+    .iter()
+    .map(|chunk| (&chunk.identity, chunk))
+    .collect();
+  let manifest_chunk = open_entry(&stored, manifest_entry, lineage, namer)?;
   let bytes = Archive::content(&manifest_chunk).map_err(|_| EnvelopeError::Malformed)?;
   let mut archive = Archive::decode(&bytes).map_err(|_| EnvelopeError::Malformed)?;
   let wanted = archive.referenced_chunks();
@@ -163,7 +179,7 @@ pub fn open(
       .ok()
       .and_then(|at| entries.get(at))
       .ok_or(EnvelopeError::Missing)?;
-    let chunk = open_entry(envelope, entry, lineage, namer)?;
+    let chunk = open_entry(&stored, entry, lineage, namer)?;
     if chunk.identity != *identity {
       return Err(EnvelopeError::Sealed(SealedError::Name));
     }
@@ -173,45 +189,52 @@ pub fn open(
   Ok(archive)
 }
 
-/// Adds one sealed chunk to the envelope: its bytes as a raw chunk, and a file entry naming it.
-fn push_sealed(
-  sealed: SealedChunk,
-  name: String,
-  entries: &mut Vec<Entry>,
-  chunks: &mut Vec<Chunk>,
-  largest: &mut u64,
-) -> Result<(), EnvelopeError> {
-  let identity = sealed.sealed_hash();
-  let len = u64::try_from(sealed.bytes.len()).map_err(|_| EnvelopeError::TooLarge)?;
-  *largest = (*largest).max(len);
-  entries.push(Entry {
-    name,
-    meta: NodeMeta {
-      mode: ENTRY_MODE,
-      size: len,
-      nlink: 1,
-      ..NodeMeta::default()
-    },
-    node: Node::File(vec![Extent {
-      offset: 0,
-      len,
-      chunk: identity,
-      chunk_offset: 0,
-    }]),
-  });
-  if !chunks
-    .iter()
-    .any(|chunk: &Chunk| chunk.identity == identity)
-  {
-    chunks.push(Archive::raw_chunk(sealed.bytes));
+/// An envelope being made ([`wrap`]): its entries, its chunks, the identities of the chunks it already stores, and the
+/// largest sealed chunk's length.
+struct Sealing {
+  entries: Vec<Entry>,
+  chunks: Vec<Chunk>,
+  /// The identities in `chunks`, so a sealed chunk already stored is found in log time: a scan of `chunks` per push
+  /// made wrapping `n` chunks cost `n²` identity comparisons (about 1.3e8 at 1 GiB of 64 KiB chunks), in one turn of the
+  /// owner shard.
+  stored: std::collections::BTreeSet<[u8; 32]>,
+  largest: u64,
+}
+
+impl Sealing {
+  /// Adds one sealed chunk to the envelope: a file entry naming it, and its bytes as a raw chunk unless the envelope
+  /// already stores a chunk of that identity (the manifest can seal to the bytes of a chunk only if it is that chunk's
+  /// plaintext).
+  fn push(&mut self, sealed: SealedChunk, name: String) -> Result<(), EnvelopeError> {
+    let identity = sealed.sealed_hash();
+    let len = u64::try_from(sealed.bytes.len()).map_err(|_| EnvelopeError::TooLarge)?;
+    self.largest = self.largest.max(len);
+    self.entries.push(Entry {
+      name,
+      meta: NodeMeta {
+        mode: ENTRY_MODE,
+        size: len,
+        nlink: 1,
+        ..NodeMeta::default()
+      },
+      node: Node::File(vec![Extent {
+        offset: 0,
+        len,
+        chunk: identity,
+        chunk_offset: 0,
+      }]),
+    });
+    if self.stored.insert(identity) {
+      self.chunks.push(Archive::raw_chunk(sealed.bytes));
+    }
+    Ok(())
   }
-  Ok(())
 }
 
 /// The sealed chunk `entry` names, opened: the entry must be a file of one whole extent over one of the envelope's
 /// chunks, and its name must carry the keyed name the opened chunk is checked against.
 fn open_entry(
-  envelope: &Archive,
+  stored: &std::collections::BTreeMap<&[u8; 32], &Chunk>,
   entry: &Entry,
   lineage: &WrappingKey,
   namer: &Namer,
@@ -223,10 +246,9 @@ fn open_entry(
     return Err(EnvelopeError::Shape);
   };
   let name = keyed_name(&entry.name).ok_or(EnvelopeError::Shape)?;
-  let stored = envelope
-    .chunks
-    .iter()
-    .find(|chunk| chunk.identity == extent.chunk)
+  let stored = stored
+    .get(&extent.chunk)
+    .copied()
     .ok_or(EnvelopeError::Missing)?;
   let bytes = Archive::content(stored).map_err(|_| EnvelopeError::Shape)?;
   if extent.offset != 0
