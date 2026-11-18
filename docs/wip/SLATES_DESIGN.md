@@ -7028,7 +7028,9 @@ it builds against the contract and adds to it rather than around it.
 > closed taxonomy with one exhaustive table over the wire's refusals, the channel's and this
 > process's own faults (`error`), and `Instance::{provision, read, land, plan_landing,
 > approval_entries, approve, merge, rebase, retry_pause_ns}` over today's daemon, on which every
-> landing with something to write asks and the launcher approves it with the issuer; `CONTRACT` = 1.
+> landing with something to write asks and the launcher approves it with the issuer; `CONTRACT` = 1,
+> then 2 the same day (`Denied::Policy`, the class a policy refusal takes outside a landing or a merge,
+> agreed with A-285's owner before its `Refusal::PolicyForbids` reaches the wire).
 > The CLI's mount, grant, enroll, revoke, run and recover map the taxonomy to its exit codes.
 > Proven by use over an in-process daemon (`crates/api/tests/api.rs`: the group missing is
 > `Unusable(NoGroup)`; provisioning from each source, `AlreadyExists` naming the holder, a destroyed
@@ -21283,7 +21285,9 @@ contract", new, with its status), GAPS (the A-299 entry and the Embedding librar
   it, so a mount still reads the daemon's port.
 - **Closed, and versioned for a pinning consumer.** The A-278 crate's enums were `#[non_exhaustive]`, which forces a
   wildcard and lets a new variant fall through it unhandled. Kiln vendors slates at a commit; a new variant should stop
-  its build where it must decide, so every contract enum is exhaustive and `CONTRACT` (1) is raised with every change.
+  its build where it must decide, so every contract enum is exhaustive and `CONTRACT` is raised with every change: 1 as
+  first published, 2 the same day for `Denied::Policy` (the class `Refusal::PolicyForbids` maps to outside a landing or a
+  merge, defined before A-285's owner appends that refusal, so its arm in the exhaustive table is mechanical).
 - **Write permission, split between the crate and the daemon.** The modes are enforced where agents reach slates — the
   daemon, through the MCP server, the SDKs and the mounts as much as this crate — so the daemon keeps them (A-285's
   owner). The crate publishes the types now so kiln's agents (g263–g266) build against them. Until the daemon's side

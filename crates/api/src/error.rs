@@ -43,6 +43,8 @@ use slates_ipc::protocol::{
 };
 use slates_ipc::{DeliveryFault, IpcError};
 
+use crate::policy::PolicyRefusal;
+
 /// Words for a person, carried beside a typed variant: what the daemon or the OS said in prose. A consumer decides on
 /// the variant; a note is only shown, so its one accessor is [`fmt::Display`].
 #[derive(Clone, PartialEq, Eq)]
@@ -204,8 +206,10 @@ pub enum Denied {
   },
   /// The consumer capability a harness delivers on an inherited descriptor could not be taken (§4.13).
   CapabilityNotDelivered(DeliveryFault),
-  /// A write policy refused the act (A-285): nothing was written.
-  Policy(crate::policy::PolicyRefusal),
+  /// A write policy refused the act (A-299): the daemon's refusal where a call other than a landing or a merge meets
+  /// it. A landing and a merge answer it as their own outcome ([`crate::LandOutcome::Refused`],
+  /// [`crate::MergeOutcome::Refused`]), since in a forbidding mode it is the expected answer.
+  Policy(PolicyRefusal),
 }
 
 /// Which bound is reached.

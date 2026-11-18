@@ -6,7 +6,8 @@
 > policy's typed refusal); signed work's types (`WorkSignature`, `Verification::{Verified, Unsigned, Invalid}`, a
 > volume's `require_signed_merges`); `LandOutcome`, `MergeOutcome`, `RebaseOutcome`, `Approval` with a typed summary;
 > typed landing and merge conflicts; typed provisioning (`VolumeSpec` over each source), status and drift; one closed
-> `Error` whose class is what a consumer does, mapped from every wire refusal in one exhaustive table; `CONTRACT` = 1.
+> `Error` whose class is what a consumer does, mapped from every wire refusal in one exhaustive table; `CONTRACT` = 2
+> (2 adds `Denied::Policy`, where A-285's `Refusal::PolicyForbids` maps outside a landing or a merge).
 > **Owed, in order:**
 > - the starter handed the launcher's authority on every platform (Linux: the anchor passes the segment's descriptor
 >   back to its starter);
