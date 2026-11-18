@@ -2,11 +2,13 @@
 //! §4.14, §4.15 "Audit"). The wire names a grant's state, an audit record's kind and a landing's state in words from
 //! closed tables the daemon keeps (`crates/server/src/landing.rs`: `grant_state_name`, `audit_kind_name`,
 //! `landing_state_name`); this module reads each word into its enum in one place, and a word the table does not hold is
-//! a protocol fault — a client and a daemon of different builds — never a guess.
+//! a protocol fault — a client and a daemon of different builds — never a guess. A record of a landing as a whole
+//! carries how the landing's signature was judged (A-321), typed as the wire carries it.
 
 use slates_ipc::protocol::{AuditEntry, GrantScope, GrantSummary, VolumeId};
 
 use crate::error::{Error, ProtocolFault};
+use crate::signed::Verification;
 
 /// A grant as the daemon lists it (§4.13).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,6 +57,10 @@ pub struct AuditRecord {
   pub manifest: Option<[u8; 32]>,
   /// The landing's state when the record was made, for a finished landing.
   pub outcome: Option<LandingStage>,
+  /// How the landing's signature was judged (signed work, A-321), on a record of the landing as a whole — its
+  /// presentation's and a granted run's [`AuditKind::LandingPlanned`], its [`AuditKind::LandingFinished`]
+  /// ([`Verification::Unsigned`] when it carried none): the landing's provenance. `None` on every other record.
+  pub verification: Option<Verification>,
 }
 
 /// What an audit record records.
@@ -142,6 +148,7 @@ pub(crate) fn audit_of(entry: AuditEntry) -> Result<AuditRecord, Error> {
     landing: entry.landing,
     manifest: entry.manifest,
     outcome,
+    verification: entry.verification.map(Verification::of_wire),
   })
 }
 
@@ -214,6 +221,7 @@ mod tests {
       landing: Some(5),
       manifest: None,
       outcome: outcome.map(str::to_owned),
+      verification: None,
     };
     for (word, kind) in [
       ("grant_issued", AuditKind::GrantIssued),

@@ -21,9 +21,10 @@
 //!   write — bypass, ask, forbid ([`WriteMode`]) — set by the launcher per consumer or volume, never raised by an
 //!   agent. A landing answers [`LandOutcome`], a merge [`MergeOutcome`], a rebase [`RebaseOutcome`] ([`outcome`]).
 //! - *Conflicts* are verdicts, typed per path ([`LandingConflict`], [`MergeConflict`]); nothing is ever inferred (D-27).
-//! - *Signed work* ([`signed`], A-321): a merge may carry a signature over its statement, its outcome says how it was
-//!   judged ([`Verification`]) and its record keeps it ([`MergeRecord`]); a volume's trusted signers are the launcher's
-//!   to set, and its policy may require signed merges. Signatures never gate permission. A landing's signature is owed.
+//! - *Signed work* ([`signed`], A-321): a merge or a landing may carry a signature over its statement, its outcome says
+//!   how it was judged ([`Verification`]) and its record keeps it (a merge's [`MergeRecord`], a landing's
+//!   [`AuditRecord`]); a volume's trusted signers are the launcher's to set, and its policy may require signed merges.
+//!   Signatures never gate permission.
 //! - *Errors* ([`error`]): one closed taxonomy whose variant is what a consumer does about it.
 //! - *The seam* ([`seam`], [`sim`]): the volume verbs as a trait, for hosts that need a simulator (A-310).
 //!
@@ -46,7 +47,7 @@
 //! types re-exported here grow append-only (D-15) and count as the contract's where it returns them.
 //!
 //! **What is owed** (GAPS, the A-278, A-299 and A-321 rows): the starter handed the launcher's authority on every
-//! platform; a landing's signature verified on the daemon's side (A-321); typed fields on the wire
+//! platform; typed fields on the wire
 //! for drift, a presentation's conflicts and a merge's versions, replacing what this crate reads from text; a paged
 //! listing; an async form over a host's reactor (R6); a typed class for a pinned snapshot's destroy, which the daemon
 //! answers untyped (`Invalid::Request`, A-310).
@@ -145,10 +146,14 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// destroy among them (A-299; the same day). 16: `Instance::unmount` and the seam's `unmount` answer what was removed ([`Unmounted`]): on
 /// Windows each volume the scan could not ask is named there when another volume reported the drive (it was named only
 /// when none did), and a host refusal renders in words, the daemon's `TargetUnavailable` by that name (A-299; the same
-/// day).
+/// day). 17: signed landings (A-321): `land` sends its signature and the daemon judges it, so `Unsupported::SignedWork`
+/// is gone; a [`LandingApproval`] carries the landing's `statement` (what a signer signs) and the `signature` it
+/// carried, which `approve_landing` presents and lands with again; a [`LandingReport`]'s `verification` is the verdict on
+/// what was written, no longer always unsigned; an [`AuditRecord`] of a landing as a whole carries its `verification`
+/// (the same day).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 16;
+pub const CONTRACT: u32 = 17;
 
 /// The typed client and its own types, for the verbs [`Instance::client`] lends outside the contract.
 pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, VhostUserDevice};

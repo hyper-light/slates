@@ -4739,6 +4739,7 @@ fn dispatch_inner(
       target,
       filter,
       grant,
+      signature,
     } => crate::landing::land_verb(
       state,
       client_id,
@@ -4750,6 +4751,7 @@ fn dispatch_inner(
         filter: &filter,
         grant,
         present_only: false,
+        signature: signature.as_deref(),
       },
     ),
     RequestBody::Present {
@@ -4757,6 +4759,7 @@ fn dispatch_inner(
       snapshot,
       target,
       filter,
+      signature,
     } => crate::landing::land_verb(
       state,
       client_id,
@@ -4768,6 +4771,7 @@ fn dispatch_inner(
         filter: &filter,
         grant: None,
         present_only: true,
+        signature: signature.as_deref(),
       },
     ),
     RequestBody::FsWrite {
@@ -4955,16 +4959,19 @@ fn consumer_gate(
       target,
       filter,
       grant: None,
+      signature,
     } => match policy.land {
       WriteMode::Forbid => {
         state.count("policy_forbids.land", 1);
         Err(forbids(WriteAct::Land))
       }
+      // A signed landing is presented as an unsigned one is, its signature judged for the approval request (A-321).
       WriteMode::Ask => Ok(RequestBody::Present {
         volume,
         snapshot,
         target,
         filter,
+        signature,
       }),
       WriteMode::Bypass => Ok(RequestBody::Land {
         volume,
@@ -4972,6 +4979,7 @@ fn consumer_gate(
         target,
         filter,
         grant: None,
+        signature,
       }),
     },
     RequestBody::Submit { .. }

@@ -522,6 +522,11 @@ pub enum RequestBody {
     filter: Filter,
     /// A grant the caller already holds (from `slates grant`), or none to be presented.
     grant: Option<u64>,
+    /// A signature over the landing's statement (signed work, A-321; `slates_server::signed_work::landing_statement`,
+    /// signed under the namespace `slates-work`): judged under the volume's trusted signers against the manifest the
+    /// landing writes (or presents), recorded with the landing's audit records and answered. It permits nothing: the
+    /// landing follows its write mode.
+    signature: Option<Vec<u8>>,
   },
   /// The caller's grants (a read; creating a grant is off-ring).
   Grants,
@@ -942,6 +947,9 @@ pub enum RequestBody {
     target: String,
     /// The filter.
     filter: Filter,
+    /// A signature over the presented landing's statement, judged as `Land`'s is (A-321): what a held landing of an
+    /// asking session carries to its approval request.
+    signature: Option<Vec<u8>>,
   },
   /// A `Submit` whose caller's own policy asks (A-285): served as a submit under an ask mode whatever the volumes'
   /// modes, so the merge is answered `MergeApprovalRequired` (or refused, if a volume forbids it). What an agent's
@@ -3088,6 +3096,9 @@ pub struct LandingOutcome {
   /// The batch barriers the landing took (§4.15 step 8, A-130): each made a batch of written-out files durable
   /// before any of them was placed, so fewer than the files written whenever a batch held more than one.
   pub barriers: u64,
+  /// How the landing's signature was judged against the manifest it wrote (signed work, A-321), as its finished
+  /// record keeps it: `Unsigned` when the landing carried none.
+  pub verification: Verification,
 }
 
 /// The durability a landing achieved (§4.15 step 8).
@@ -3207,6 +3218,10 @@ pub struct AuditEntry {
   pub manifest: Option<[u8; 32]>,
   /// The terminal state, for a finished landing.
   pub outcome: Option<String>,
+  /// How the landing's signature was judged (signed work, A-321), on a record of the landing as a whole: its
+  /// presentation's and a granted run's `landing_planned`, and its `landing_finished` (`Unsigned` when it carried
+  /// none). `None` on every other record.
+  pub verification: Option<Verification>,
 }
 
 /// The closed refusal taxonomy on the wire (§4.4, §4.13). (`Eq` is not derived because the durability
@@ -3893,6 +3908,12 @@ pub enum ReplyBody {
     summary: LandingSummary,
     /// Conflicts found before any write (empty when the landing is clean).
     conflicts: Vec<String>,
+    /// The exact statement a signature over this landing signs (signed work, A-321;
+    /// `slates_server::signed_work::landing_statement`: the volume, the target as the request named it and this
+    /// manifest, one field a line): sign it under the namespace `slates-work` and land with the signature.
+    statement: Vec<u8>,
+    /// How the request's signature was judged against this manifest (A-321): `Unsigned` when it carried none.
+    verification: Verification,
   },
   /// A landing finished (or partially).
   Landed {
