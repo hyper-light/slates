@@ -10858,27 +10858,27 @@ fn a_successors_live_log_goes_on_past_every_position_durable_before_it() {
   );
 }
 
+/// Format: a node's count of live volumes it took over from their logs (`live_ship::archive_from_live`).
+const LIVE_TAKEN_OVER: &str = "fleet.live.taken_over";
+
 /// Cuts `daemons[0]` off on the probe plane alone, both ways, its record plane whole (the chaos relay's shape before
-/// A-330), until both others retire it; then gives it its probe plane back. Whether they retired it.
-fn retired_on_the_probe_plane(daemons: &[Daemon], hosts: &[HostId]) -> bool {
+/// A-330), until `successor` has taken the volume over from its live log (counted `fleet.live.taken_over`); then gives
+/// it its probe plane back. Whether the takeover was counted.
+fn taken_over_on_the_probe_plane(daemons: &[Daemon], hosts: &[HostId], successor: &Daemon) -> bool {
+  let before = refusal_count(successor, LIVE_TAKEN_OVER).unwrap_or(0);
   let cut = daemons[0]
     .inject_probe_deafness(&[hosts[1], hosts[2]])
     .and_then(|()| daemons[1].inject_probe_deafness(&[hosts[0]]))
     .and_then(|()| daemons[2].inject_probe_deafness(&[hosts[0]]));
   let observed: Vec<&Daemon> = daemons.iter().collect();
-  let retired = cut.is_ok()
+  let taken = cut.is_ok()
     && poll_until(&observed, RETIREMENT_DEADLINE, || {
-      let gone = |daemon: &Daemon| {
-        daemon
-          .fleet_members()
-          .map(|members| !members.contains(&hosts[0]))
-      };
-      Ok(gone(&daemons[1])? && gone(&daemons[2])?)
+      refusal_count(successor, LIVE_TAKEN_OVER).map(|count| count > before)
     });
   let healed = daemons
     .iter()
     .all(|daemon| daemon.inject_probe_deafness(&[]).is_ok());
-  retired && healed
+  taken && healed
 }
 
 /// Writes `path` through a client of `daemons[through]` until a write is answered `FsDone`, within each fleet wait judged
@@ -10900,13 +10900,19 @@ fn written_through(
       intent: Intent::Write,
       form: AttachRequest::Root,
     }) {
-      ReplyBody::Attached { attachment, .. } => client.call(&RequestBody::FsWrite {
-        volume,
-        attachment,
-        path: path.to_owned(),
-        bytes: path.as_bytes().to_vec(),
-        mode: 0o644,
-      }),
+      ReplyBody::Attached { attachment, .. } => {
+        let written = client.call(&RequestBody::FsWrite {
+          volume,
+          attachment,
+          path: path.to_owned(),
+          bytes: path.as_bytes().to_vec(),
+          mode: 0o644,
+        });
+        // The write lease goes with the attachment, so the next writer, here or on another node, is not refused
+        // `LeaseHeld` by this one.
+        client.call(&RequestBody::Detach { attachment });
+        written
+      }
       refused => refused,
     };
     let done = matches!(reply, ReplyBody::FsDone { .. });
@@ -10918,8 +10924,8 @@ fn written_through(
 
 /// A-338 (§4.8 "Promotion and takeover", R8; the chaos nemesis's stranded owner): a superseded owner steps down, so a
 /// client of its node reaches the volume's successor. Do: three nodes at `f = 1`; on a, a live-shipped volume written
-/// six files and shared with the fleet; cut a off on the probe plane alone (its record plane whole) until b and c retire
-/// it, wait for the survivor the volume ranks first to serve it, and give a its probe plane back; then write through a
+/// six files and shared with the fleet; cut a off on the probe plane alone (its record plane whole) until the survivor the
+/// volume ranks first has taken it over from its live log, and give a its probe plane back; then write through a
 /// client of a's node until a write is answered, and the same through the third node. Expect the successor shipping the
 /// volume's log under a higher epoch at once, before any write reaches it; a write through each node answered at
 /// durability; the successor's head past a's durable position after them; and both files read back through the
@@ -10934,12 +10940,11 @@ fn a_superseded_owners_clients_reach_its_successor() {
   let (id, written) = live_volume_written(&mut client, &daemons, "superseded");
   let durable = owned_live_line(&mut client, id).and_then(|(_, durable, _)| durable);
   drop(client);
-  let retired = retired_on_the_probe_plane(&daemons, &hosts);
   let successor =
     rendezvous_first(&[hosts[1], hosts[2]], ObjectId(id.bytes)).expect("a survivor takes over");
   let successor = &daemons[if successor == hosts[1] { 1 } else { 2 }];
+  let taken = taken_over_on_the_probe_plane(&daemons, &hosts, successor);
   let observed: Vec<&Daemon> = daemons.iter().collect();
-  let served = poll_status_answers(&observed, successor.instance(), id);
   let mut watcher = Client::connect(successor.instance());
   let shipping_at_once = poll_until(&observed, PLACEMENT_DEADLINE, || {
     Ok(owned_live_head(&mut watcher, id).is_some())
@@ -10961,7 +10966,7 @@ fn a_superseded_owners_clients_reach_its_successor() {
     daemon.stop();
   }
   eprintln!(
-    "superseded owner: retired {retired}, served {served}, the successor shipping before any write {shipping_at_once}; \
+    "superseded owner: taken over {taken}, the successor shipping before any write {shipping_at_once}; \
      writes through a {through_a:?}, through the third node {through_third:?}; the successor's head {after:?} against \
      a's durable {durable:?}; read {read:?}"
   );
@@ -10972,8 +10977,8 @@ fn a_superseded_owners_clients_reach_its_successor() {
     "every write on a was answered: {written:?}"
   );
   assert!(
-    retired && served,
-    "b and c retired a, and the successor serves the volume"
+    taken,
+    "the successor took the volume over from its live log"
   );
   assert!(
     shipping_at_once,

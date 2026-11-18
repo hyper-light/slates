@@ -7009,9 +7009,25 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   shard now keeps the adopted head from its takeover (`live_ship::adopt_head`) until the volume's shipper is made,
 >   which starts there: its first entry is numbered one past the adopted head, which is at or past every durable position.
 >   Held by `a_successors_first_entry_is_numbered_past_the_head_its_takeover_adopted` (`live_ship`'s unit tests) and
->   `a_successors_live_log_goes_on_past_every_position_durable_before_it` (`crates/server/tests/fleet.rs`). Owed: the
->   adopted head lives in the successor shard's memory until the volume's first publication, as the volume's own image
->   does (GAPS, A-325's live-shipped item).
+>   `a_successors_live_log_goes_on_past_every_position_durable_before_it` (`crates/server/tests/fleet.rs`). Since A-338
+>   the successor publishes the volume at its takeover, so the adopted head is used at once.
+> - **A superseded owner stranded its clients (fixed 2026-11-18, A-338).** The nemesis (seeds 6876545201569229162,
+>   10695597685579409771 and 12136749566337968553) failed with "a fence-2 copy behind the fence-1 owner's durable head".
+>   Reproduced in-process (the owner cut off on the probe plane alone, its record plane whole, as the relay left it
+>   before A-330): the takeover completes, the holders' fences go to the successor's epoch, and the old owner learns it
+>   from a holder's `StaleEpoch` and keeps the volume fenced, as designed on 2026-11-05. But the old owner is the
+>   volume's creator, and a node forwarded only a volume it neither created nor recorded, so every verb through the
+>   old owner's node was answered there `StaleEpoch` for good; a third node's forward went to the creator too, while its
+>   process lived, though the council had retired it; and the successor shipped nothing until a write reached it. So a
+>   stream whose front node was the old owner never reached the successor, the successor never shipped, and the only
+>   line shipping the volume was the old owner's fenced one. Now a superseded owner steps down: a volume whose log is
+>   fenced at a later epoch is routed to its current owner as any non-owner's is (`verbs::owned_by_another_host`); a
+>   node never routes to itself as the creator (`owner_location`'s `known_owner`); a host the installed configuration
+>   does not hold as a member is no eligible owner in this region, however alive its process; and the successor
+>   publishes a live volume at its takeover, so it ships from the adopted head at once. Held by
+>   `a_superseded_owners_clients_reach_its_successor` (`crates/server/tests/fleet.rs`). Owed: a mount on the old owner
+>   (NFS, FUSE) still answers `StaleEpoch` for the volume; it is to be routed as a non-owner node's attachment is
+>   (GAPS).
 
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
@@ -24276,3 +24292,25 @@ Applied in the same change to:
 - **The rule.** The live takeover records, on the owner shard where it materializes the volume, the head phase one
   adopted. The volume's shipper, made at its first publication, starts from that head and takes it once. A volume
   made on its own node starts from nothing, as before.
+
+### A-338 — A superseded owner steps down: its verbs on the volume it lost go to the successor, and the successor ships at its takeover (2026-11-18, g230, scale-out; §4.8 "Promotion and takeover", R8; the chaos nemesis's stranded owner)
+Applied in the same change to:
+- §4.10 live shipping: the chaos flows' status (a superseded owner stranded its clients); A-329's bullet.
+- `crates/server/src/verbs.rs`: `owned_by_another_host` routes a superseded volume. `crates/server/src/live_ship.rs`:
+  `superseded`. `crates/server/src/owner_location.rs`: `known_owner` never takes this node as the creator route;
+  `ineligibility` drops a host the installed configuration does not hold as a member in this node's region
+  (`fleet.owner_location.route_dropped.owner_ineligible.retired`). `crates/server/src/fleet.rs`: the live takeover
+  publishes at its materialization (`published_before_served`).
+- Tests: `a_superseded_owners_clients_reach_its_successor` (`crates/server/tests/fleet.rs`).
+- GAPS: the entry of 2026-11-18; A-325's and A-329's live-shipped items closed.
+- **What was there.** A superseded owner kept its volume fenced and refused every write `StaleEpoch` (2026-11-05,
+  `a_superseded_owner_resumed_after_its_takeover_is_fenced`), and a node forwarded a verb only for a volume it had not
+  created and held no record of, so the old owner, its creator, answered every verb itself, for good. A third node
+  routed to the creator while its process lived, though the council had retired it. The successor made its shipper
+  only at its first publication, which no write reached.
+- **The rule.** A node that does not own a volume routes its verbs to the volume's owner, whoever created it (R8): a
+  node whose log of the volume was fenced at a later epoch does not own it, a node is never its own creator route
+  when it forwards, and a host the installed configuration retired owns nothing, however alive. A successor publishes
+  a volume it took over before serving it, so a live volume ships from the adopted head at once (A-329) and a restart
+  finds its image (A-325). The superseded owner's own first write after its loss may still be the one that finds the
+  fence, and is refused `StaleEpoch`; the next goes to the successor.

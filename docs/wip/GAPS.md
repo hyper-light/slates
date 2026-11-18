@@ -1,5 +1,18 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A superseded owner stranded its clients: it steps down, and its successor ships at once (2026-11-18, A-338, §4.8,
+> R8; g230, the chaos nemesis's "fence-2 copy behind the fence-1 owner's durable head").** After a takeover the old
+> owner kept its volume fenced and answered every verb `StaleEpoch` for good, since a node forwarded only a volume it
+> had not created; a third node routed to the retired creator while its process lived; and the successor shipped
+> nothing until a write reached it, so the only line shipping the volume was the old owner's fenced one. Now a
+> superseded volume is routed to its current owner, a node is never its own creator route, a retired host owns
+> nothing however alive, and a successor publishes a live volume at its takeover. Test:
+> `a_superseded_owners_clients_reach_its_successor` (`crates/server/tests/fleet.rs`).
+> - **Owed (g230, next):** a mount on the old owner (NFS, FUSE) still answers `StaleEpoch` for the volume it lost; it is
+>   to be routed as a non-owner node's attachment is.
+> - **Owed (the supervisor's):** the nemesis seeds on the fix (6876545201569229162 Linux x86_64, 10695597685579409771
+>   arm64, 12136749566337968553 macOS).
+
 > **A successor's live log began again at position 0: it goes on from the head its takeover adopted (2026-11-18, A-329,
 > Continuity, T-8.6; g230).** `live_ship::published` made every shipper with no start, so a successor's first entry was
 > position 0 at genesis under its higher epoch: holders took it by rank and NoLoss held, but the chaos flows' Continuity
@@ -9,14 +22,11 @@
 > `a_successors_live_log_goes_on_past_every_position_durable_before_it` (`crates/server/tests/fleet.rs`).
 > - **Owed (the supervisor's):** the five chaos flows' Continuity on the fix (they failed alike on both Linux arches,
 >   diag 44269183565).
-> - **Open, not numbering (read from that run's log, seed 6876545201569229162, and the macOS one's):** the nemesis's
->   "a fence-2 copy behind the fence-1 owner's durable head". Both holders' fences stand at 2, raised by a takeover's
->   phase one that never completed, while the owner b, still the owner at fence 1, ships epoch-1 entries neither takes
->   (its head 6,810, durable 6,808, c at 6,808 and a at 6,588): a fence an abandoned takeover raised strands its owner.
->   No successor shipped, so no position was renumbered; A-329 does not touch it.
-> - **Owed:** the adopted head lives in the successor shard's memory until the volume's first publication, as the
->   volume's own image does for a live-shipped takeover (A-325's owed item): a successor restarted before then loses
->   both.
+> - **Not numbering, and since fixed (A-338, above):** the nemesis's "a fence-2 copy behind the fence-1 owner's durable
+>   head" (seed 6876545201569229162, and the macOS one's). The takeover completed and the old owner was fenced, but its
+>   clients were stranded and the successor had not shipped, so the old owner's fenced line was the only one shipping.
+> - **Closed (2026-11-18, A-338):** the adopted head lived in the successor shard's memory until the volume's first
+>   publication; the successor now publishes at its takeover.
 
 > **A reply carried home past a full channel was dropped: fixed (goal 238, 2026-11-18, A-296, from perf's branch of
 > 2026-11-09; §4.3, CLAUDE.md §2 items 8 and 9).** `xshard::send_back` waited one coordinator period for room and then
@@ -114,9 +124,8 @@
 >   image after a takeover until the volume's first write, so a successor restarted before then refused it `NoImage`
 >   and never served it again. A volume taken over from its seal is now published before it is served. Test:
 >   `a_successors_takeover_report_survives_its_warm_restart`.
-> - **Owed:** a live-shipped volume taken over is still published first by its first write's barrier, so a successor
->   restarted before that write loses it the same way; publishing it at the takeover starts the successor's live log
->   there (`live_ship::published`), a change to the live takeover's shape that needs its own piece and its chaos runs.
+> - **Closed (2026-11-18, A-338):** a live-shipped volume taken over is published at its takeover too, so a successor
+>   restarted before its first write keeps it, and ships its log from the adopted head at once.
 
 > **A sealed envelope's wrap and open were quadratic in its chunks: linear (2026-11-17, A-92 piece 3b; g230).** The
 > wrap (`slates_cluster::envelope::wrap`) checked each sealed chunk against every chunk already stored, and the open
