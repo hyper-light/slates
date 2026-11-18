@@ -15,13 +15,14 @@ slates-mem = { workspace = true }
 # A join a shard waits on, marked so the watchdog reads it as the joined thread runs (A-228's transitive wait).
 slates-rt = { workspace = true }
 slates-wire = { workspace = true }
+# On every platform: the reply spin's per-kind choice (`spin_choice`, pure and tested on every host) weighs its replies
+# by the machine profile's stopping rule. A direct dep too so a cross-lint for the Windows target from a host with no
+# MSVC assembler can enable blake3's pure-Rust backend with `--features slates-machine/pure-hash` (as ipc/client do);
+# the CI Windows build uses the default SIMD C path. The host reads the machine's allocation granularity from it, which
+# bounds a purge's write (A-190).
+slates-machine = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-# A direct dep so a cross-lint for the Windows target from a host with no MSVC assembler can enable
-# blake3's pure-Rust backend with `--features slates-machine/pure-hash` (as ipc/client do); the CI
-# Windows build uses the default SIMD C path. The host reads the machine's allocation granularity from it, which bounds
-# a purge's write (A-190).
-slates-machine = { workspace = true }
 windows-sys = { workspace = true, features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_SystemServices"] }
 # The purge client's process (A-190 moved out of the daemon, §4.6): its spawn into a kill-on-close job and its pipe.
 slates-ipc = { workspace = true }
