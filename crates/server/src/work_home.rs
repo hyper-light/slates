@@ -897,6 +897,7 @@ struct AskItem {
   id: RequestId,
   principal: Principal,
   back: ReplyRoute,
+  queued_ns: u64,
 }
 
 /// A shard's asks to one owner shard: those waiting, and whether a batch is out. One batch is out at a time, so a burst
@@ -964,6 +965,8 @@ fn start_ask(
     through_work: true,
   };
   let outbox = state.work_home.outboxes.entry(owner).or_default();
+  let queued_ns = slates_machine::clock::monotonic_ns();
+  let outbox = state.work_home.outboxes.entry(owner).or_default();
   outbox.waiting.push_back(AskItem {
     queue,
     need,
@@ -973,6 +976,7 @@ fn start_ask(
     id,
     principal: principal.clone(),
     back,
+    queued_ns,
   });
   let already = std::mem::replace(&mut outbox.sending, true);
   state.count(ASKED_THE_OWNER, 1);
@@ -1017,6 +1021,17 @@ async fn send_batches(here: u16, owner: u16) {
       return;
     }
     let keys: Vec<DbVolumeId> = batch.iter().map(|item| item.queue).collect();
+    let _ = state::with_state(|s| {
+      let sent = slates_machine::clock::monotonic_ns();
+      for item in &batch {
+        let span = s.tracer.open_unlinked(
+          item.id,
+          slates_wire::observe::Chokepoint::ShardOp,
+          item.queued_ns,
+        );
+        crate::telemetry::emit(s, span.end(10, sent));
+      }
+    });
     let deadline = crate::lease::lease_bound_ns();
     let answers = crate::xshard::call_within_room(
       here,
@@ -1086,6 +1101,28 @@ fn staged(state: &ShardState, item: &AskItem) -> bool {
 
 /// One ask answered on the owner's shard.
 fn answer_on_owner(state: &mut ShardState, item: AskItem) -> Outcome {
+  let start = state.clock.monotonic_ns();
+  let span = state
+    .tracer
+    .open_unlinked(item.id, slates_wire::observe::Chokepoint::ShardOp, start);
+  let label = match &item.need {
+    Need::Files(_) => 2,
+    Need::Page { .. } => 3,
+    Need::Sizes => 4,
+    Need::Verdict { .. } => 5,
+    Need::Rebase { .. } => 6,
+    Need::Admit { .. } => 7,
+    Need::Route => 8,
+  };
+  let outer = state.current_span.replace(span.context());
+  let outcome = answer_on_owner_diag(state, item);
+  state.current_span = outer;
+  let end = state.clock.monotonic_ns();
+  crate::telemetry::emit(state, span.end(label, end));
+  outcome
+}
+
+fn answer_on_owner_diag(state: &mut ShardState, item: AskItem) -> Outcome {
   let AskItem {
     need,
     green,
