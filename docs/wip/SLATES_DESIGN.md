@@ -6819,7 +6819,7 @@ holder duty is balanced by neighbourhood changes; operators keep an explicit mov
 >   cohort, so the target's takeover could recover the volume.
 > - **Switch.** The committed exception names the new owner; every node routes the volume there (a lookup asks the
 >   exception's owner first), every holder takes the new owner's authority, and the old owner's records are refused.
-> - **Adopt.** The new owner runs phase one by name over the recorded cohort (`MOVE_STREAM`, 26): the old owner
+> - **Adopt.** The new owner runs phase one by name over the recorded cohort (`MOVE_STREAM`, 28): the old owner
 >   answers from its captured records, every other member from its copy; the newest of each register is re-committed
 >   under the new owner's placement at the round's epoch, the volume is materialized as a takeover's successor
 >   materializes it, sealed under the new owner's placement, and once that seal is placed the move is reported

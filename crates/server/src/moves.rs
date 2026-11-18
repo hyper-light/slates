@@ -70,8 +70,10 @@ use crate::fleet::{Dispatch, LateReplies, return_sessions, take_sessions};
 use crate::state::{self, ShardState};
 
 /// Format: the stream a moved object's new owner asks its cohort on, by name ([`serve_move_prepare`]): distinct from
-/// every other stream a record session multiplexes (1 to 24, and 25, which the live log's batches take).
-pub(crate) const MOVE_STREAM: u64 = 26;
+/// every other stream a record session multiplexes (1 to 27: 25 the work route's, 26 the live log's batches, 27 the
+/// lineage hand-off's). It was 26 until main gave 26 to the live batches; the match in `fleet.rs` then took every move
+/// request for a live batch, which only the compiler's unreachable-pattern warning showed.
+pub(crate) const MOVE_STREAM: u64 = 28;
 
 /// Counter: moves a shard began (the volume frozen with its head handed over).
 const MOVE_BEGUN: &str = "fleet.move.begun";
