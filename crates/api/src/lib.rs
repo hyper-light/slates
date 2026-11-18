@@ -209,10 +209,13 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 33: a volume's move to another fleet member (A-291, the same day): `Instance::move_volume` and `Instance::member`,
 /// `MoveProgress`, and its refusals' details (`Busy::Attached`, `Busy::Moving`, `Unusable::Unmovable`,
 /// `Invalid::MoveTarget`, `RetryCause::MoveUnplaced`). 34: `Instance::capture_base`, an overlay's base captured whole so
-/// its clones move (A-291, the same day).
+/// its clones move (A-291, the same day). 35: only a granted landing ends its audit trail when refused: one whose grant
+/// the daemon held as it began, so every such [`AuditKind::LandingFinished`] names its manifest and its verdict. A
+/// landing under a grant the daemon does not hold is presented once planned, and refused before its plan it is a
+/// refused request with no trail; under 30 it wrote an end naming no manifest (the same day).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 34;
+pub const CONTRACT: u32 = 35;
 
 /// What a rewitness did (§4.15 `rewitness`): the paths one reply holds and the count of the rest (A-267).
 pub use slates_client::Rewitnessed;

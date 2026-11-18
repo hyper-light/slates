@@ -59,6 +59,11 @@
 //! once it holds the version: as a record's own recomputation (`merge_service::fold_replica`) and at each version a
 //! rebuild or an advance recomputes. No later increment is based below the floor, so the fold changes no verdict.
 //!
+//! **A replica keeps a durable checkpoint (A-404).** Each merge record also names the newest version its owner knew
+//! committed (`MergeRecordValue::checkpoint_floor`), and a holder keeps its replica's checkpoint there as a held piece
+//! (`merge_service::checkpoint_replica`); a rebuild applies it to the origin it seeds and recomputes only the versions
+//! after it. It is what lets a replica release the records and inputs below it.
+//!
 //! At `f = 0` none of it runs: the local append is the placement (R8).
 
 use slates_archive::Archive;
@@ -122,6 +127,10 @@ pub(crate) const REPLICA_RECORDS_SHORT: &str = "merge.replica.records_short";
 /// (A-333): the non-vacuity counter of an adoption whose replica was one or more versions behind.
 /// Format: a refusal name in the daemon's status report.
 pub(crate) const REPLICA_ADVANCED: &str = "merge.replica.advanced";
+/// Counted on a holder each time a rebuild of its replica of a green started from the durable checkpoint it keeps
+/// (A-404) instead of recomputing every version from the first: the non-vacuity counter of a checkpointed rebuild.
+/// Format: a refusal name in the daemon's status report.
+pub(crate) const REPLICA_FROM_CHECKPOINT: &str = "merge.replica.from_checkpoint";
 /// Counted on a node each time it rewound its replica of a green below a version whose record its ledger replaced with
 /// a higher epoch's different value (A-373): the non-vacuity counter of a replica that follows its ledger.
 /// Format: a refusal name in the daemon's status report.
@@ -1220,10 +1229,30 @@ impl ReplicaSeed {
       self.install(state, replica);
       return Ok(Some(()));
     }
-    self.reached = 1;
+    // A durable checkpoint this holder keeps (A-404) carries the replica to its version at once, its record's identity
+    // checked as each recomputed version's is; the versions after it are recomputed as before.
+    let mut from = 1;
+    if let Some(held) = state.merge.checkpoints.get(&self.object).cloned()
+      && held.at <= self.through
+    {
+      let checkpoint = slates_merge::checkpoint::Checkpoint::decode(&held.bytes)
+        .map_err(|_| INPUTS_UNDECODABLE)?;
+      replica = replica.with_checkpoint(&checkpoint);
+      let identity = ledger_value(state, self.object, held.at)
+        .map(|value| value.identity)
+        .ok_or(REPLICA_RECORDS_SHORT)?;
+      self.check(state, &mut replica, identity)?;
+      state.count(REPLICA_FROM_CHECKPOINT, 1);
+      if held.at >= self.through {
+        self.install(state, replica);
+        return Ok(Some(()));
+      }
+      from = held.at.saturating_add(1);
+    }
+    self.reached = from;
     self.stage = SeedStage::Chain(Box::new(ChainStep {
       replica,
-      version: 1,
+      version: from,
       reading: None,
     }));
     Ok(None)
@@ -1264,7 +1293,14 @@ impl ReplicaSeed {
           .replica
           .record_signature(step.version, crate::signed_work::adopted(signature));
       }
-      // Folded where the owner had folded when it made the record (A-385), as the record's own recomputation folds.
+      // Checkpointed at the committed floor the record names (A-404), then folded where the owner had folded (A-385), as
+      // the record's own recomputation does.
+      crate::merge_service::checkpoint_replica(
+        state,
+        self.object,
+        &step.replica,
+        value.checkpoint_floor,
+      );
       crate::merge_service::fold_replica(state, &mut step.replica, value.folded_below);
     }
     state.count(REPLICA_REBUILT_VERSIONS, 1);
@@ -1608,6 +1644,7 @@ mod tests {
         completion: None,
         signature: None,
         folded_below: *folded_below,
+        checkpoint_floor: 0,
       };
       acceptor
         .accept(&Record {
@@ -1962,6 +1999,7 @@ mod tests {
       completion: None,
       signature: None,
       folded_below: 0,
+      checkpoint_floor: 0,
     };
     Record {
       owner,
@@ -2368,6 +2406,140 @@ mod tests {
       rebuilt,
       Some((2, after_two, 2, None)),
       "the rebuilt replica is at version 2, folded below it where the owner folded"
+    );
+  }
+
+  /// `record` with its value naming `floor` as the newest version its owner knew committed when it made it (A-404).
+  fn with_committed(mut record: Record, floor: u64) -> Record {
+    let mut value = MergeRecordValue::from_record_bytes(&record.value).unwrap();
+    value.checkpoint_floor = floor;
+    record.value = value.to_record_bytes();
+    record
+  }
+
+  /// §4.16 "Apply on holders" (A-404): a holder keeps a durable checkpoint of its replica at the committed floor its
+  /// owner's record names. Do: give a holder of a scratch green versions 0 and 1 (`f` created) and a replica at version
+  /// 1; serve it the shipment of version 2, its record naming version 1 committed. Expect version 2 acknowledged; the
+  /// holder keeping a checkpoint at version 1 that, applied to an empty green, reaches version 1's identity; one
+  /// checkpoint counted; and the checkpoint carried by the holder's image and back through its restore.
+  #[test]
+  fn a_holder_keeps_a_checkpoint_of_its_replica_at_the_committed_floor_its_owner_names() {
+    use slates_db::register::Ack;
+    let one = creating("f", b"one", 1, 0);
+    let two = overwriting("f", b"two", 2, 1);
+    let object = ObjectId([44; 16]);
+    let (after_one, after_two) = (identity_after(&[&one]), identity_after(&[&one, &two]));
+    let manifest = InputsBuilder::whole(&two.encode())
+      .finish(0, 4096)
+      .manifest_identity();
+    let (acked, kept, counted, restored) = crate::daemon::audit_on_shard(move |state| {
+      let host = holder_of_a_dying_owners_version(state, object, &one);
+      let record = with_committed(
+        merge_record(host, object, (2, 1), (Some(manifest), after_two)),
+        1,
+      );
+      let reply =
+        crate::fleet::serve_merge_shipment(state, host.0, host.0, &shipment_of(&record, &two));
+      let acked =
+        Ack::decode(&reply).is_ok_and(|ack| ack.sequence == 2 && ack.identity == record.identity());
+      let kept = state.merge.checkpoints.get(&object).cloned();
+      let counted = count_of(state, crate::merge_service::REPLICA_CHECKPOINTED);
+      let pieces = crate::content_holder::held_image(state);
+      let held = crate::content_holder::split_held(&pieces).unwrap();
+      state.merge.checkpoints.clear();
+      let local = state.fleet.host();
+      let _ = crate::content_holder::restore_held_registers(state, local, held);
+      (
+        acked,
+        kept,
+        counted,
+        state.merge.checkpoints.get(&object).cloned(),
+      )
+    });
+    assert!(acked, "version 2 is acknowledged");
+    let kept = kept.expect("the holder keeps a checkpoint");
+    assert_eq!(kept.at, 1, "at the committed floor the record names");
+    let checkpoint = slates_merge::checkpoint::Checkpoint::decode(&kept.bytes).unwrap();
+    assert_eq!(
+      Green::new().with_checkpoint(&checkpoint).head_identity(),
+      after_one,
+      "the checkpoint holds the green at version 1"
+    );
+    assert_eq!(counted, 1, "one checkpoint counted");
+    assert_eq!(
+      restored,
+      Some(kept),
+      "the holder's image carries the checkpoint, and its restore keeps it"
+    );
+  }
+
+  /// §4.16 "Apply on holders" (A-313, A-404): a holder's rebuild starts from the durable checkpoint it keeps and
+  /// recomputes only the versions after it, so the increments below it need not be held. Do: give a holder of a
+  /// scratch green no replica, the records of versions 0 to 3, a checkpoint at version 2, and only version 3's increment
+  /// held; rebuild through version 3. Expect the replica at version 3 at the serial engine's identity, built from the
+  /// checkpoint once, with one version recomputed. Red without the checkpoint's start: versions 1 and 2's increments are
+  /// not held, and the rebuild installs nothing.
+  #[test]
+  fn a_rebuilt_replica_starts_from_the_checkpoint_its_holder_keeps() {
+    let one = creating("f", b"one", 1, 0);
+    let two = overwriting("f", b"two", 2, 1);
+    let three = creating("g", b"three", 3, 2);
+    let identities = (
+      identity_after(&[]),
+      identity_after(&[&one]),
+      identity_after(&[&one, &two]),
+      identity_after(&[&one, &two, &three]),
+    );
+    let object = ObjectId([45; 16]);
+    let (rebuilt, counts) = crate::daemon::audit_on_shard(move |state| {
+      let mut serial = Green::new();
+      let _ = serial.submit(&one);
+      let _ = serial.submit(&two);
+      let checkpoint = serial.checkpoint(2).unwrap();
+      let three_inputs = hold_encoded(state, object, &three.encode());
+      let unheld = InputsBuilder::whole(&one.encode())
+        .finish(0, 4096)
+        .manifest_identity();
+      let also_unheld = InputsBuilder::whole(&two.encode())
+        .finish(0, 4096)
+        .manifest_identity();
+      accept_records(
+        state,
+        object,
+        &[
+          (0, None, identities.0),
+          (1, Some(unheld), identities.1),
+          (2, Some(also_unheld), identities.2),
+          (3, Some(three_inputs), identities.3),
+        ],
+      );
+      state.merge.checkpoints.insert(
+        object,
+        crate::merge_service::HeldCheckpoint {
+          at: 2,
+          bytes: checkpoint.encode(),
+        },
+      );
+      let mut seed = ReplicaSeed::rebuild(object, None, identities.0, 3);
+      let _ = seed_to_end(state, &mut seed);
+      let rebuilt = replica_at(state, object);
+      (
+        rebuilt,
+        [
+          count_of(state, REPLICA_FROM_CHECKPOINT),
+          count_of(state, REPLICA_REBUILT_VERSIONS),
+        ],
+      )
+    });
+    assert_eq!(
+      rebuilt,
+      Some((3, identities.3)),
+      "the replica is rebuilt to version 3 from the checkpoint"
+    );
+    assert_eq!(
+      counts,
+      [1, 1],
+      "built from the checkpoint once, one version recomputed after it"
     );
   }
 }

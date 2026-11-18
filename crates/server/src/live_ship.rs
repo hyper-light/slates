@@ -265,6 +265,15 @@ pub(crate) struct LiveVolume {
   /// A whole entry being sealed in turns, and the publications made since, queued to follow it in order ([`WholeBuild`],
   /// A-377): while it is here nothing is appended to the log.
   building: Option<Box<WholeBuild>>,
+  /// When the publication being built reached the shipper, on the host's monotonic clock: taken by the entry appended for
+  /// it ([`LiveVolume::newest`]), the start of its hops (`fleet.live.hop.*`).
+  publishing_ns: Option<u64>,
+  /// The newest entry appended, by position, with when its publication reached the shipper: the round its durability
+  /// ends is timed hop by hop when the answer that makes it durable is folded ([`count_hops`]).
+  newest: Option<(u64, u64)>,
+  /// When the fold that made the newest entry durable ran, on the host's monotonic clock: a reply held for it times its
+  /// own wake from there ([`wait_durable`], `fleet.live.hop.reply`).
+  resolved_ns: Option<u64>,
 }
 
 /// One candidate's copy of a live log as its shard's recovery image keeps it (A-200; §4.8 "Recovery": a warm restart
@@ -899,6 +908,19 @@ pub(crate) async fn wait_durable(volume: slates_db::catalog::VolumeId, target: u
       },
       1,
     );
+    // The reply's own wake, from the fold that made the volume's newest entry durable ([`HOP_REPLY`]).
+    let resolved = s
+      .live
+      .shipping
+      .get_mut(&volume.bytes)
+      .and_then(|live| live.resolved_ns.take());
+    if let (true, Some(resolved_ns)) = (durable, resolved) {
+      count_hop(
+        s,
+        HOP_REPLY,
+        slates_machine::clock::monotonic_ns().saturating_sub(resolved_ns),
+      );
+    }
   });
   durable
 }
@@ -1802,6 +1824,9 @@ struct Send {
   holder: HostId,
   stream: u64,
   bytes: Vec<u8>,
+  /// When it was made on the owner shard, on the host's monotonic clock: where its round's hop to the control shard
+  /// begins ([`LaneStamps`]).
+  made_ns: u64,
 }
 
 /// Whether the volume with `id` is live-shipped, by its policy on this partition.
@@ -1925,6 +1950,8 @@ pub(crate) fn published(
   let Some(live) = state.live.shipping.get_mut(&id.bytes) else {
     return;
   };
+  // Where this publication's hops begin: the entry appended for it takes the stamp ([`append_entry`]).
+  live.publishing_ns = Some(slates_machine::clock::monotonic_ns());
   let whole = live.owes_whole || record.is_none() || reaches_size;
   // A whole entry being sealed in turns holds the chain: this publication is captured now, as it stands, and queued
   // behind it (A-377).
@@ -2016,6 +2043,11 @@ fn append_entry(
     live.shipper.append(payload.clone())
   };
   let entry = appended.map_err(NotAppended::Refused)?;
+  let published_ns = live
+    .publishing_ns
+    .take()
+    .unwrap_or_else(slates_machine::clock::monotonic_ns);
+  live.newest = Some((entry.head().position, published_ns));
   let shipped = u64::try_from(payload.len()).unwrap_or(u64::MAX);
   if whole {
     live.owes_whole = false;
@@ -2527,6 +2559,9 @@ fn new_live_volume(shipper: Shipper) -> LiveVolume {
     heard: 0,
     unanswered_since_ns: None,
     building: None,
+    publishing_ns: None,
+    newest: None,
+    resolved_ns: None,
   }
 }
 
@@ -3154,6 +3189,7 @@ fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
             holder: *holder,
             stream: slates_cluster::live::LIVE_ENTRY_STREAM,
             bytes: entry.encode(),
+            made_ns: slates_machine::clock::monotonic_ns(),
           });
         }
       }
@@ -3204,6 +3240,7 @@ fn install_for(live: &LiveVolume, object: ObjectId, holder: HostId) -> (Option<S
     holder,
     stream: slates_cluster::live::LIVE_STATE_STREAM,
     bytes: install.encode(),
+    made_ns: slates_machine::clock::monotonic_ns(),
   };
   (Some(send), false)
 }
@@ -3440,10 +3477,17 @@ async fn send_from_control(origin: u16, control: u16, sends: Vec<Send>) {
     origin,
     control,
     move || async move {
+      // Where the round's hop to the control shard ends ([`LaneStamps`]).
+      let began_ns = slates_machine::clock::monotonic_ns();
       drain_stragglers();
       let mut lanes: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>> = Vec::new();
       for (holder, sends) in by_holder(sends) {
-        lanes.push(Box::pin(ship_to_holder(origin, holder, sends, budget)));
+        lanes.push(Box::pin(ship_to_holder(
+          origin,
+          (holder, began_ns),
+          sends,
+          budget,
+        )));
       }
       every(lanes).await;
     },
@@ -3484,7 +3528,7 @@ async fn every(mut lanes: Vec<std::pin::Pin<Box<dyn std::future::Future<Output =
 /// dispatch or the record period sends what the holder lacks.
 async fn ship_to_holder(
   origin: u16,
-  holder: HostId,
+  (holder, began_ns): (HostId, u64),
   sends: Vec<Send>,
   budget: slates_cluster::CommitBudget,
 ) {
@@ -3494,7 +3538,7 @@ async fn ship_to_holder(
       objects.push(send.object);
     }
   }
-  let answered = ship_lane(origin, holder, sends, budget).await;
+  let answered = ship_lane(origin, (holder, began_ns), sends, budget).await;
   // After the lane's own folds, so the owner sends what the holder lacks given its last answer.
   let control = state::with_state(|s| s.shard).unwrap_or(origin);
   crate::xshard::run_on_counted(control, origin, move |s| {
@@ -3508,20 +3552,31 @@ async fn ship_to_holder(
 /// holder back from a stall caught up on the retained tail a round trip an entry.
 async fn ship_lane(
   origin: u16,
-  holder: HostId,
+  (holder, began_ns): (HostId, u64),
   sends: Vec<Send>,
   budget: slates_cluster::CommitBudget,
 ) -> bool {
   let mut queue: VecDeque<Send> = sends.into();
+  // When this lane was free to take its next message: the dispatch's arrival, then each exchange's end.
+  let mut ready_ns = began_ns;
   while let Some(first) = queue.pop_front() {
     let sessions = borrow_session(holder, budget.max_deadline_ns()).await;
     let send = take_batch(first, &mut queue, &sessions);
     // Each message under its own budget: the liveness budget plus its transfer on the session it rides, so an install of
     // the whole volume is not given up the moment an entry would be (`exchange_budget`).
     let exchange = exchange_budget(send.bytes.len(), &sessions);
+    let sent_ns = slates_machine::clock::monotonic_ns();
     let exchanged =
       slates_cluster::live::exchange((send.stream, &send.bytes), sessions, exchange, |_, _| true)
         .await;
+    let answered_ns = slates_machine::clock::monotonic_ns();
+    let stamps = LaneStamps {
+      made_ns: send.made_ns,
+      began_ns: ready_ns.max(send.made_ns),
+      sent_ns,
+      answered_ns,
+    };
+    ready_ns = answered_ns;
     let (replies, stragglers) = settle_sessions(exchanged);
     let answered = !replies.is_empty();
     if !answered {
@@ -3533,7 +3588,9 @@ async fn ship_lane(
       .collect();
     if !replies.is_empty() {
       let control = state::with_state(|s| s.shard).unwrap_or(origin);
-      crate::xshard::run_on_counted(control, origin, move |s| fold_into(s, replies));
+      crate::xshard::run_on_counted(control, origin, move |s| {
+        fold_into(s, replies, Some(stamps));
+      });
     }
     // After the answers are on their way to the owner, so durability waits for no straggler.
     finish_stragglers(origin, send.object, stragglers).await;
@@ -3603,6 +3660,7 @@ fn take_batch(
     holder: first.holder,
     stream: slates_cluster::live::LIVE_ENTRIES_STREAM,
     bytes: batch,
+    made_ns: first.made_ns,
   }
 }
 
@@ -3733,7 +3791,7 @@ fn deliver_late(
   crate::fleet::return_sessions(sessions);
   if !replies.is_empty() {
     let control = state::with_state(|s| s.shard).unwrap_or(origin);
-    crate::xshard::run_on_counted(control, origin, move |s| fold_into(s, replies));
+    crate::xshard::run_on_counted(control, origin, move |s| fold_into(s, replies, None));
   }
 }
 
@@ -3794,8 +3852,98 @@ fn lose_links(hosts: &[HostId]) {
   });
 }
 
-/// Folds replies into the owner shard's shippers and ships what the holders still lack.
-fn fold_into(state: &mut ShardState, replies: Vec<(ObjectId, HostId, Vec<u8>)>) {
+/// One message's way through a lane, on the host's monotonic clock (one origin across shards and processes,
+/// `slates_machine::clock`): made on the owner shard, its lane free to take it on the control shard, sent, and answered.
+/// The fold that makes the newest entry durable reads its round from them, hop by hop ([`count_hops`]).
+#[derive(Clone, Copy, Debug)]
+struct LaneStamps {
+  made_ns: u64,
+  began_ns: u64,
+  sent_ns: u64,
+  answered_ns: u64,
+}
+
+/// Counter pairs (how many were timed, and their nanoseconds) of a live write's round, hop by hop (§4.10 "Live shipping";
+/// the record's owed breakdown of A-200's 2026-11-05 measurement). Each pair is counted once a write, by the fold that
+/// makes its entry durable, so over a run the five hops' nanoseconds add up to the round's exactly, and a mean is
+/// nanoseconds over count. On the owner node.
+/// The entry built on the owner shard: from its publication reaching the shipper to its message made.
+const HOP_BUILD: (&str, &str) = ("fleet.live.hop.build", "fleet.live.hop.build_ns");
+/// From the message made on the owner shard to its lane on the control shard free to take it: the cross-shard hop and
+/// the wait behind a lane's earlier message.
+const HOP_TO_CONTROL: (&str, &str) = ("fleet.live.hop.to_control", "fleet.live.hop.to_control_ns");
+/// On the control shard, from the lane free to the message sent: the session's borrow, the batch and its budget.
+const HOP_LANE: (&str, &str) = ("fleet.live.hop.lane", "fleet.live.hop.lane_ns");
+/// The exchange, from the message sent to the holder's answer read on the control shard.
+const HOP_EXCHANGE: (&str, &str) = ("fleet.live.hop.exchange", "fleet.live.hop.exchange_ns");
+/// From the answer read on the control shard to its fold running on the owner shard: the cross-shard hop back.
+const HOP_TO_OWNER: (&str, &str) = ("fleet.live.hop.to_owner", "fleet.live.hop.to_owner_ns");
+/// The whole round, from the publication reaching the shipper to the fold that made its entry durable: the five hops
+/// above, end to end.
+const HOP_ROUND: (&str, &str) = ("fleet.live.hop.round", "fleet.live.hop.round_ns");
+/// From that fold to the reply held for it seeing it durable ([`wait_durable`]: a stable NFS write's or `COMMIT`'s, a
+/// Shards stream's `FSYNC`); a reply that saw it durable at once counts the time since the fold.
+const HOP_REPLY: (&str, &str) = ("fleet.live.hop.reply", "fleet.live.hop.reply_ns");
+/// On a holder: an entry or batch served, from its arrival to its answer, the publication that keeps it included.
+const HOP_HOLDER: (&str, &str) = ("fleet.live.hop.holder", "fleet.live.hop.holder_ns");
+
+/// Counts one timed hop of `ns` nanoseconds ([`HOP_BUILD`] and its siblings).
+fn count_hop(state: &mut ShardState, (count, sum): (&'static str, &'static str), ns: u64) {
+  state.count(count, 1);
+  state.count(sum, ns);
+}
+
+/// The round of `volume`'s newest entry, hop by hop, once an answer made it durable: its publication's arrival at the
+/// shipper and the lane's `stamps` partition it into the build, the hop to the control shard, the lane, the exchange and
+/// the hop back, each a difference of consecutive stamps on one clock, so they add up to the round. A fold with no
+/// stamps (a straggler's late answer) times nothing; the entry is let go either way. The fold's own time is kept for the
+/// reply's wake ([`HOP_REPLY`]).
+fn count_hops(state: &mut ShardState, volume: [u8; 16], stamps: Option<LaneStamps>) {
+  let now = slates_machine::clock::monotonic_ns();
+  let Some(live) = state.live.shipping.get_mut(&volume) else {
+    return;
+  };
+  let Some((position, published_ns)) = live.newest else {
+    return;
+  };
+  if live
+    .shipper
+    .durable()
+    .is_none_or(|durable| durable < position)
+  {
+    return;
+  }
+  live.newest = None;
+  live.resolved_ns = Some(now);
+  let Some(stamps) = stamps else {
+    return;
+  };
+  let hops = [
+    (HOP_BUILD, stamps.made_ns.saturating_sub(published_ns)),
+    (
+      HOP_TO_CONTROL,
+      stamps.began_ns.saturating_sub(stamps.made_ns),
+    ),
+    (HOP_LANE, stamps.sent_ns.saturating_sub(stamps.began_ns)),
+    (
+      HOP_EXCHANGE,
+      stamps.answered_ns.saturating_sub(stamps.sent_ns),
+    ),
+    (HOP_TO_OWNER, now.saturating_sub(stamps.answered_ns)),
+    (HOP_ROUND, now.saturating_sub(published_ns)),
+  ];
+  for (hop, ns) in hops {
+    count_hop(state, hop, ns);
+  }
+}
+
+/// Folds replies into the owner shard's shippers and ships what the holders still lack. `stamps` are the lane's, when the
+/// replies came from one exchange of a lane ([`ship_lane`]); a straggler's come with none.
+fn fold_into(
+  state: &mut ShardState,
+  replies: Vec<(ObjectId, HostId, Vec<u8>)>,
+  stamps: Option<LaneStamps>,
+) {
   let mut touched = Vec::new();
   for (object, host, bytes) in replies {
     let Some(live) = state.live.shipping.get_mut(&object.0) else {
@@ -3817,6 +3965,7 @@ fn fold_into(state: &mut ShardState, replies: Vec<(ObjectId, HostId, Vec<u8>)>) 
       note_heard(live);
     }
     if live.shipper.durable() > before {
+      count_hops(state, object.0, stamps);
       state.count(LIVE_DURABLE, 1);
       resolve(state, object.0);
       // What became durable left the credit: a sealed whole entry or a queued publication waiting for it goes on now.
@@ -4089,6 +4238,7 @@ fn serve_taken(
   (request, epoch): (&[u8], Option<HostEpoch>),
   decode: impl FnOnce(&[u8], usize) -> Result<Vec<Entry>, LiveError>,
 ) -> Vec<u8> {
+  let arrived_ns = slates_machine::clock::monotonic_ns();
   let object = slates_db::live::object_of(request);
   let bound = match admitted(state, local, peer, object) {
     Ok(bound) => bound,
@@ -4108,7 +4258,13 @@ fn serve_taken(
     }
     Ok(_) => {
       state.count(LIVE_HELD, taken);
-      acknowledged(state, encode_reply(&reply))
+      let answer = acknowledged(state, encode_reply(&reply));
+      count_hop(
+        state,
+        HOP_HOLDER,
+        slates_machine::clock::monotonic_ns().saturating_sub(arrived_ns),
+      );
+      answer
     }
   }
 }

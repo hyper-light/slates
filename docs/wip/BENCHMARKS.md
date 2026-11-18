@@ -8596,7 +8596,8 @@ and max about 100 ms, where the plain volume's p999 is 0.6 ms, on a box at load 
 cores. Measured inside the daemon at load 48 (temporary counters, removed): an entry costs 13.3 µs to build (read,
 encode, seal) and its dispatch round (owner shard to control shard, the exchange, back) 90.7 µs on average, against
 about 25 µs for the exchange alone (`replication_bench`): the cross-shard hops and the session borrow are most of it.
-Owed: the same command on a quiet machine; the round's hops measured apart; the rare 100 ms tail explained.
+Owed: the same command on a quiet machine; the round's hops measured apart (counted since 2026-11-18, `fleet.live.hop.*`:
+SLATES_DESIGN §4.10 status "The round, counted hop by hop"); the rare 100 ms tail explained.
 
 **The 100 ms tail, explained and removed (2026-11-05).** The same command, with the owner's `fleet.live.*` counters
 printed at the end. Two causes, each found by its counter and each a wait for the next record period (100 ms):
