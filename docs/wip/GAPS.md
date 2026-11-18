@@ -9,28 +9,23 @@
 > with Firecracker, crosvm and Cloud Hypervisor (41318050347, 41319438579). Still open, and not this plan's: the
 > inventory's built-but-unrun cells (its order of work, item 5).
 
-> **A grant is signed by a key only the human holds (2026-11-18, R10, D-22, §4.13; A-285, Ada's decision: fs-server's
-> option D, with A as the fallback, on every OS).** This closes, once built, "No grant can be issued on Linux from the
-> CLI" (A-201's entry). **Built (piece 1):** the signed statement and its SSH-signature verifier
-> (`crates/server/src/grant_signature.rs`; `ssh-ed25519` and `sk-ssh-ed25519`, the touch required, namespace
-> `slates-grant`), 10 unit tests against a real `ssh-keygen -Y sign` vector: forged, unregistered, changed manifest
-> and every other field, another namespace, expired, untouched, hostile bytes. **Built (piece 2, 2026-11-18):** each
-> presentation draws a 256-bit nonce and `land` returns it (`nonce:` / `"nonce"`); a `Grant` carries either proof
-> form (`GrantProofBody`); a signed one is decided by `landing::verify_signed_grant` against the shard's registered
-> keys, the presentation's own target and nonce, and the wall clock, and its nonce is spent by the grant it proves
-> (a replay refused `Replayed`, counted `grant_signature_replayed`). No key can be registered yet, so every signed
-> grant is refused `UnregisteredKey` until piece 3. **Owed, in order:**
-> - durable key registration: the first key only through A's terminal prompt (a standalone anchor) or kiln's person
->   session (a kiln-managed anchor, WebAuthn; the supervisor's direction, put to Ada); later keys signed by a
->   registered key; no agent channel adds one;
-> - `slates grant` signing through `ssh-keygen -Y sign`, and A's prompt over a pty;
-> - the exported-variables issuer surface removed on macOS and Windows (GAP-A9-9's macOS segment then closes by name);
->   `enroll`, `revoke`, `run` and `recover` prove authority with the same issuer secret and need the signed proof too;
-> - the Windows confirm-per-use path (OpenSSH's agent, or FIDO through Windows Hello), recorded;
-> - the WebAuthn form verified (its challenge is the statement's SHA-256; g263 and g264 own kiln's side);
-> - a real FIDO key's signature (the unit test stands a software key in for the authenticator);
-> - the end-to-end proof on adacachy, `SLATES_TEST_GRANT=1`: registration through A over a pty, a landing granted by
->   a confirmed ssh-agent key and written, the askpass refusing, an unregistered key and a replay refused.
+> **Write permission follows the mode the user gave the agent (2026-11-18, R10, D-22, §4.13; A-285, Ada's decisions,
+> revised the same day).** Bypass merges and lands at once; ask answers a typed approval request bound to the
+> manifest, which the harness presents; a forbidding mode is refused. The launcher (kiln passes each agent's mode) or
+> the harness sets the policy, the stricter of consumer and volume governs, unset is ask, and an agent never raises
+> its own. Signed work is provenance, not permission. This closes, once built, "No grant can be issued on Linux from
+> the CLI" (A-201's entry): under bypass the daemon grants its own landing. The first reading (a human-only proof,
+> fs-server's options A–E) is withdrawn by Ada; its piece 2 (the presentation nonce and the signed `Grant`,
+> d1a46ae9) is reverted, and the SSH verifier (1c31d1c7) is kept for signed work. **Owed, in order** (types agreed
+> with g262, slates-api's owner):
+> - `WriteAct`, `WriteMode { Bypass, Ask, Forbid }`, `WritePolicy { merge, land }`, `PolicySubject`, the issuer-proven
+>   `SetPolicy` (refused on a consumer-bound channel) and `Refusal::PolicyForbids { act, by }`;
+> - a landing under the effective mode, Linux included; then merges (submit) under it;
+> - the MCP and SDK land verb gated by the policy (the grant kind stays refused there);
+> - signed work: a merge or landing may carry an SSH signature, checked and recorded (verified with its signer,
+>   unsigned, invalid with its reason), and a volume may require signed merges;
+> - the end-to-end proof on adacachy: a bypass agent's landing written at once, an ask agent's after approval, a
+>   signed merge verified and an invalid signature reported.
 
 > **git's history, Mercurial and Subversion join the workload roster (2026-11-17, Part 6 "Real workloads"; A-289;
 > Ada's goal of 2026-11-18).** Until now one 15-line git script was all the version control any route ran: no clone,

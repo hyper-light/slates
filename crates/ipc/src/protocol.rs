@@ -104,33 +104,6 @@ pub enum GrantScope {
   Session,
 }
 
-/// The human authority's proof a `Grant` carries (§4.13 "Grants", R10, D-22, A-285).
-#[derive(Wire, Clone, Debug, PartialEq, Eq)]
-pub enum GrantProofBody {
-  /// `BLAKE3_keyed(issuer_secret, landing ‖ manifest ‖ scope ‖ term)` under the secret the daemon minted into the
-  /// anchor segment, which the daemon recomputes. Replaced by the signed form once `slates grant` signs (A-285).
-  IssuerHash {
-    /// The keyed hash.
-    proof: [u8; 32],
-  },
-  /// An SSH signature (OpenSSH `PROTOCOL.sshsig`, namespace `slates-grant`) by a key the human registered, over the
-  /// grant statement (`slates_server::grant_signature::GrantStatement`): the landing, the manifest, the target, the
-  /// scope and term, the nonce the presentation carried, and this expiry.
-  SshSignature {
-    /// The signature blob (the armour's base64, decoded).
-    signature: Vec<u8>,
-    /// The statement's expiry, in Unix seconds.
-    expires_unix_s: u64,
-  },
-}
-
-impl From<[u8; 32]> for GrantProofBody {
-  /// A bare 32-byte proof is the keyed hash under the issuer secret.
-  fn from(proof: [u8; 32]) -> GrantProofBody {
-    GrantProofBody::IssuerHash { proof }
-  }
-}
-
 /// The durability scope of `await placed` (§4.8 D-18): the owner's region, or the mirror.
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scope {
@@ -349,8 +322,9 @@ pub enum RequestBody {
     /// The paths, or the whole base.
     paths: Option<Vec<String>>,
   },
-  /// A grant for a presented landing (§4.15 step 3, §4.13 "Grants"): carries the human authority's
-  /// **proof** ([`GrantProofBody`]), which the daemon verifies before it issues anything. Without a
+  /// A grant for a presented landing (§4.15 step 3, §4.13 "Grants"): carries the human surface's
+  /// **proof of issuer authority** — `BLAKE3_keyed(issuer_secret, landing ‖ manifest ‖ scope ‖ term)` —
+  /// which the daemon recomputes against the secret it minted into the anchor segment. Without a
   /// verifying proof the grant refuses `GrantIssuerUnverified` (AC-2.8: the kind arriving from an agent
   /// channel — the MCP server and the SDKs carry no proof by construction — is refused and counted);
   /// with one, the landing's grant is issued bound to that exact manifest.
@@ -363,8 +337,8 @@ pub enum RequestBody {
     scope: GrantScope,
     /// The grant's validity, nanoseconds from issue.
     term_ns: u64,
-    /// The proof of the human's authority.
-    proof: GrantProofBody,
+    /// The proof of issuer authority.
+    proof: [u8; 32],
   },
   /// Enroll a consumer under a host account (§4.13 "Principals"): the human surface, proving issuer
   /// authority as for a grant, mints a consumer id and the secret capability the workload will bind its
@@ -3469,9 +3443,6 @@ pub enum ReplyBody {
     landing: u64,
     /// The manifest hash the grant must bind.
     manifest: [u8; 32],
-    /// The nonce a signed grant's statement must carry (A-285): fresh for each presentation and spent by the first
-    /// grant it proves, so a signature is made only after the presentation and proves one grant.
-    nonce: [u8; 32],
     /// The summary of what would be written.
     summary: LandingSummary,
     /// Conflicts found before any write (empty when the landing is clean).

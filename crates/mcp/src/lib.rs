@@ -858,7 +858,6 @@ impl McpServer {
       Landing::GrantRequired {
         landing,
         manifest,
-        nonce: _,
         summary,
         conflicts,
       } => Ok(json!({

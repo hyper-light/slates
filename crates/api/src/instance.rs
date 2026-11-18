@@ -44,8 +44,6 @@ pub struct LandingPlan {
   pub landing: u64,
   /// The manifest hash a grant binds: what the person approves.
   pub manifest: [u8; 32],
-  /// The presentation's nonce, which a signed grant's statement carries (A-285).
-  pub nonce: [u8; 32],
   /// What the landing would write: entries per action, bytes, entries the filter left out.
   pub summary: LandingSummary,
   /// Conflicts found before any write: entries the disk changed under the volume (empty when the landing is clean).
@@ -59,7 +57,6 @@ impl LandingPlan {
     GrantClaim {
       landing: self.landing,
       manifest: self.manifest,
-      nonce: self.nonce,
       scope,
       term_ns,
     }
@@ -101,13 +98,11 @@ fn planned(landing: Landing) -> Planned {
     Landing::GrantRequired {
       landing,
       manifest,
-      nonce,
       summary,
       conflicts,
     } => Planned::Plan(LandingPlan {
       landing,
       manifest,
-      nonce,
       summary,
       conflicts,
     }),
