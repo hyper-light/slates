@@ -706,7 +706,7 @@
 > Record: `docs/bugs/2026-11-18-the-watchdogs-end-left-its-writer-unjoined.md`.
 
 > **Open (g222, 2026-11-17, A-273): rebases and named-version reads of a green on the shards holding its works.**
-> Designed; steps 1, 2 and 3 of five built. The owner spends 51–53% of its wall on verdicts and rebases at the 3,000-client rung (W1),
+> Designed; steps 1 to 4 of five built. The owner spends 51–53% of its wall on verdicts and rebases at the 3,000-client rung (W1),
 > rebases the larger share (about 71,000 a run against 49,000 verdicts), and W1's rebase at 1,000 clients is slower
 > than main's because it crosses to the owner. A replica holds the green's metadata (about 14.2 MB at the rung, 3.8% of
 > a shard's 373.5 MB metadata budget on the Studio) and reads the owner's content in place, never a copy (the
@@ -721,8 +721,21 @@
 > 2026-11-18, g083):** the green's content in sealed blocks (`slates_mem::sealed`), current files and history chunks
 > alike: a replica is made from the owner whole and reads the owner's blocks in place, holding no content of its own
 > (its current bytes are the owner's memory, by pointer, in the oracle); its replay adopts the owner's blocks in order,
-> checked byte for byte; the owner frees a released block once every replica has passed its release. **Owed, in
-> order:** the lag bound that drops a replica holding too much; the code on the shards; the supervisor's A/B.
+> checked byte for byte; the owner frees a released block once every replica has passed its release. A replica's
+> lifetime is bounded by its owner's: the owner's holder makes every replica leave before it gives the owner up
+> (`SealedBlocks::end`), and an owner dropped with one still registered frees nothing and is counted (Miri found a
+> test that never made its reader leave; the bug record of 2026-11-18). **Built (step 4, 2026-11-18, g083):** the
+> bounds, each derived from the machine by a stated formula (`crates/merge/src/replica.rs`) and each a typed refusal
+> after which the replica is rebuilt from the owner or given back, its work going to the owner: the replicas an owner
+> takes, `replica_limit` = (shards − 1) × 2, none with one shard (`ReplicaRefusal::Full`); a replica's metadata
+> (`Green::metadata_bytes`) against `replica_budget` = min(the owner's per-green budget, its shard's room)
+> (`OverBudget`, at its making, at a rebuild and after a message); the bytes an owner keeps for them against
+> `held_limit` = the per-green budget less the owner's own retention, past which its slowest replica is evicted
+> (`FeedRefusal::Evicted`, keeping its frees until it leaves); a change made while the last was unsent evicting every
+> replica (one message's blocks recorded at most). **Owed, in order:** the code on the shards (step 5: the holder
+> applies the derivations to the machine's figures and logs them, charges a replica to its shard's budget, routes a
+> refused or evicted replica's rebases and reads to the owner, counted, gives back an idle one, and makes a green's
+> replicas leave before it gives the owner up); the supervisor's A/B.
 >
 > **A Shards guest's unprivileged run could not write a host-owned volume: built, the stream takes Shards' owner word
 > (2026-11-18, §4.6 the Shards form; A-281; goal g268).** Shards' init names the run's owner on a share's root with
@@ -801,8 +814,16 @@
 >   rests on them, its device end handed to the client beside the stream's; and the successor's half (A-433, the same
 >   day): the held end adopted, a fresh pipe duplicated into the holder the session names (checked by its creation
 >   time) and named in a `Resync`, the replies kept for a resend, and `slates shards` handing the end where
->   `{resync}` stands. Owed on Windows: a stream's DAX sections held by the anchor (it gives its resync up at its
->   first map). **Built since (A-402, 2026-11-18):** the write log on
+>   `{resync}` stands; and its DAX sections (A-448, the same day): the anchor holds a duplicate of each section a
+>   resynced stream's guest maps (read, write and query, under the section's confining descriptor) before the answer
+>   naming it goes out, its id marked apart from every attachment's, the sections held to a bound of their own
+>   (`shards × dax_range_slots`, refused `Bound`); a successor adopts them whole, claims them for the stream and answers
+>   the device's asks after the `Resync` with the same sections. Owed on Windows: its real-process restart with DAX on
+>   CI's runners (filed for main, `run-requests.md`); and the handoff's length: every held entry rides one environment
+>   variable (`SLATES_ANCHOR_HANDLES`), and a user-defined variable is at most 32,767 characters by
+>   `SetEnvironmentVariableW`'s documentation (from memory, to verify on a runner), which the anchor's bounds were never
+>   set against, a section's entry being about 90 characters and a mount's up to about 1,100. **Built since (A-402,
+>   2026-11-18):** the write log on
 >   Windows, so a Windows stream's acknowledged writes outlive its daemon's death, replayed into the volume (its Windows
 >   run is main's, `run-requests.md`); before, a Windows stream's acknowledged writes since the last publication were
 >   lost at its daemon's death. Found with A-365 (Linux), **fixed by A-389 (2026-11-18)**:
@@ -3735,14 +3756,39 @@
 >   `task_within` left waits for a reason stated beside it (the caller's own period or cadence, a remote wait, or a
 >   peer's one-at-a-time serve), and every other cross-shard wait is judged in its target's own time. Owed, found on the
 >   way: an adopted move's seal is still taken again when its answer is lost to a stopped shard; recording the seal on
->   the owner shard would make `moves::seal_adopted` idempotent. Class B (the
+>   the owner shard would make `moves::seal_adopted` idempotent. **Class C, the rendezvous's claim (A-443, 2026-11-18,
+>   g251):** a client's claim waited a fixed second for its answer (`rendezvous::CLAIM_WAIT_NS`), so a daemon alive and
+>   slow to answer was reported gone; it now waits while its rendezvous's owner lives, ending at once at its death (on
+>   Linux the socket, reset with the listener's owner; on macOS the owner's bootstrap name, looked up at twice the time
+>   waited each time), and within the caller's restart bound only where a live anchor holds the rendezvous
+>   (`a_claim_on_a_daemon_that_answers_past_the_claim_wait_is_served`,
+>   `a_claim_on_a_daemon_that_died_ends_by_its_owners_life_not_a_clock`). Windows since A-447 (2026-11-18, g251): the
+>   daemon writes its process id and creation time into the bootstrap header (layout `SLB3`), and a claim with no live
+>   anchor opens that process for `SYNCHRONIZE` and a limited query alone, judges it by its creation time (a reused pid is
+>   never taken for the daemon), and waits on the claim's Event and the process at once, ending at the daemon's exit; a
+>   process handle keeps no object the process named, so neither the bootstrap name nor the owner's token outlives the
+>   daemon and no successor's takeover is refused (A-176). The macOS region fetch since A-452 (2026-11-18, g251): it
+>   waited a fixed second to send and again to receive, so an owner alive and slow to answer was reported gone and one
+>   that went away was reported keeping nothing; now neither has a timeout, a dead owner's port refuses the send and the
+>   kernel's send-once notification ends the receive (`a_fetch_answered_past_the_claim_wait_is_served`,
+>   `a_fetch_whose_owner_went_away_is_refused_by_its_departure`). The fleet tests' `CREDIT_WAIT` since A-454 (2026-11-18,
+>   g251): their client's connect is one claim, which waits while its daemon lives, so a refusal fails the test at once,
+>   and a full request ring is waited out while its shard steps, `FROZEN_CAP` the one wall bound, where both waited five
+>   seconds on the wall. Owed in C-a: the same constant in `ack_release.rs`, `attach_forms.rs` and `shards.rs`, the
+>   same two waits; Windows' run of the cross-process rendezvous file is filed for main. Class B (the
 >   transport's round-trip estimate) is open, but for the owner-location round (2026-11-18, A-437, goal g255: one
 >   liveness window, hard, for its asks and its lent sessions; now the record plane's round budget over the slowest
 >   asked path's measured tail, `owner_location::round_budget_for`), an operator's promotion forwarded to the root
 >   group's leader (A-439: one liveness window; now the stall every forward over a leader session takes, the window and
 >   the path's measured round-trip tail, `verbs::forward_stall_ns`), every callback on an NFSv4.1 back channel (A-442:
 >   one liveness window; now the carrying connection's learned round trip, RFC 6298 with Karn's rule, backed off after a
->   timeout up to the NFSv4 lease, `callback::bound_ns`, sharing A-431's learner, `learned_wait`) and the forward
+>   timeout up to the NFSv4 lease, `callback::bound_ns`, sharing A-431's learner, `learned_wait`), a live exchange to a
+>   holder (A-444: one liveness window, hard; now its session's persistent-congestion duration, RFC 9002 §7.6.1 from the
+>   session plane's estimator, plus the transfer, and that duration's floor where no session is at hand,
+>   `live_ship::exchange_budget`, `fleet::live_budget`; `return_sessions`' silence floor the session's own probe timeout),
+>   a held reply's durability window (A-446: one liveness window; now that same floor of a gone holder path, its
+>   silence still judged after a drained receiver, `live_ship::durable_wait_ns`)
+>   and the forward
 >   lane's stall (2026-11-18, A-315,
 >   goal g255): a batch
 >   quiet for its budget is given up only once a turn of its lane begun after the silence was seen has read the
@@ -3775,8 +3821,10 @@
 >   rounds wait on a silent peer and the waits when the control shard is busy. On main as of `9addf53ef` every rewrite
 >   made the five-node takeover test fail some runs, where that base's own budget passed it; on main as of `bfc34cace`
 >   this one passes it 16 of 16, as main does (what changed between the bases was not traced).
->   Still class B: the location round's own wait for silent peers, `SESSION_WAIT_NS`, `fleet::live_budget`, the NFS
->   callback probe and the leader forward (`promote_region_here_or_forward`), each a liveness budget of wall time.
+>   Class B since closed (goal g255, 2026-11-18): the location round's own wait for silent peers (A-437), the leader
+>   forward (A-439), the NFS callback probe and recall (A-442), `fleet::live_budget` and a holder's live exchange (A-444),
+>   a held reply's durability window (A-446), and `sweep_departed`'s shard-time window stated with the test support's
+>   session wait derived from one record-plane exchange's span (A-449, `daemon::session_wait_ns`).
 >   Class C siblings found by A-352's starved runs, each a wait on a live daemon's answer on the wall: the rendezvous
 >   claim wait (`slates_ipc::rendezvous::CLAIM_WAIT_NS`, a second; a starved burst's connect met it in 1 of 20 runs) and
 >   the fleet tests' `CREDIT_WAIT` (5 s), which every fleet test's `Client::connect` and `send_burst` keep; the two
@@ -18633,8 +18681,11 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   privilege enabled for its thread alone where the process holds it; its Windows test filed for main's lanes; still
   owed with it: a directory link's type, which the seam does not carry, a Windows base reading a link back in A-275's
   `/` form rather than its print name's `\`, and the Developer Mode route for an account without the privilege,
-  measured); a reflink (`FSCTL_DUPLICATE_EXTENTS_TO_FILE` on ReFS); A-262's landing half (the volume's other attribute
-  bits); and
+  measured); a reflink (`FSCTL_DUPLICATE_EXTENTS_TO_FILE` on ReFS), **built by A-445 the same day** for the batch's
+  own duplicates (§4.15 step 6's rule, the batch as the hash index; ReFS and a Dev Drive in whole-cluster regions
+  under 4 GiB; its Windows test over a ReFS directory and the oracle's filed for main's lanes; still owed with it:
+  Linux's `FICLONE` and macOS's `clonefile`, duplicates across batches, and the measured gain); A-262's landing half
+  (the volume's other attribute bits); and
   the seam's numbering: refusals the engine tells apart are POSIX numbers and the rest Win32 codes, so a Win32 code equal
   to one of the engine's numbers (`ERROR_NOT_SAME_DEVICE` 17, `ERROR_INSUFFICIENT_BUFFER` 122, among five) would read as
   that refusal; none of the writer's calls is known to answer one, and a typed refusal at the seam would close it.

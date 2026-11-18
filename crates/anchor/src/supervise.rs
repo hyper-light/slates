@@ -327,16 +327,21 @@ impl Supervisor {
     Ok(())
   }
 
-  /// Opens the Windows hold channel before the first child is spawned. `bound` is the number of live attachments
-  /// this daemon can admit, as for Unix's device bound (A-198). Acknowledgement follows duplication into the anchor.
+  /// Opens the Windows hold channel before the first child is spawned. `bounds` holds each class of entry to its own
+  /// bound: the live attachments this daemon can admit, as for Unix's device bound (A-198), and the DAX sections its
+  /// shards' fill budgets can count, as for Unix's copy bound (A-365, A-448). Acknowledgement follows duplication into
+  /// the anchor.
   #[cfg(windows)]
-  pub fn hold_handles(&mut self, bound: usize) -> Result<(), crate::handles::HandleRefusal> {
+  pub fn hold_handles(
+    &mut self,
+    bounds: crate::handles::HoldBounds,
+  ) -> Result<(), crate::handles::HandleRefusal> {
     if self.child.is_some() || self.windows_handles.is_some() {
       return Err(crate::handles::HandleRefusal::Malformed {
         reason: "the Windows hold must be configured once before starting",
       });
     }
-    self.windows_handles = Some(windows::Hold::new(bound)?);
+    self.windows_handles = Some(windows::Hold::new(bounds)?);
     Ok(())
   }
 

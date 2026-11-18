@@ -297,8 +297,11 @@ pub(crate) fn end_hosts(state: &mut ShardState, anchors: &[u64]) -> Result<u64, 
 }
 
 /// The reap loop's look at departures (A-222), run on the control shard each liveness budget: the departed anchors,
-/// then their attachments ended on every shard, each through a call bounded by the budget. Owed again at the next look
-/// unless every shard answered.
+/// then their attachments ended on every shard, each through a call judged in that shard's own time
+/// (`xshard::call_in_shard_time`, A-65, A-408), whose budget is the window every such wait takes: one liveness window
+/// on the wall, then more while the shard runs or waits for a CPU, so a starved shard's end is heard and a wedged
+/// one's given up (A-449, R3's class B, item B-f: the departure itself was decided by the fleet's membership, its own
+/// estimators, A-363). Owed again at the next look unless every shard answered.
 pub(crate) async fn sweep_departed() {
   let Some((control, shards, gone)) = crate::state::with_state(|state| {
     let control = state.shards.first().copied()?;

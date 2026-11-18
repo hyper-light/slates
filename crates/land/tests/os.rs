@@ -543,6 +543,75 @@ fn a_symlink_in_a_landing_is_a_windows_symbolic_link() {
   );
 }
 
+/// Format: the environment variable naming a writable directory on a ReFS volume or a Dev Drive, where the reflink test
+/// lands (a runner makes one from a VHD it formats; without it the test skips, saying so).
+#[cfg(windows)]
+const REFS_DIR: &str = "SLATES_TEST_REFS_DIR";
+
+/// A-445 (a reflink in a Windows landing, ReFS block cloning). Do: land a scratch volume holding two files with the same
+/// bytes (three 64 KiB clusters and 17 bytes, so the last cluster is partial on either of ReFS's clusters) and one with
+/// other bytes, into a directory on a volume that shares clusters (`SLATES_TEST_REFS_DIR`; skipped loudly without one,
+/// or where the volume says it shares nothing). Expect the landing `Done`, every entry written, the second identical
+/// file cloned (`cloned` 1), both identical files whole at their exact length, and no hidden name left.
+#[cfg(windows)]
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn a_duplicate_file_is_cloned_on_a_volume_that_shares_clusters() {
+  let Some(refs) = std::env::var_os(REFS_DIR) else {
+    eprintln!("skipped: {REFS_DIR} names no directory on a ReFS volume or a Dev Drive");
+    return;
+  };
+  let ws = Workspace::new(Path::new(&refs), "clone");
+  seed_dir(&ws.path.join("out"));
+  let (mut host, target) = OsLand::open_target(&ws.path.join("out")).unwrap();
+  if !host.capabilities(target.dir).unwrap().reflink {
+    eprintln!(
+      "skipped: the volume under {} shares no clusters between files",
+      ws.path.display()
+    );
+    return;
+  }
+  let same: Vec<u8> = (0..3 * 65_536 + 17u32)
+    .map(|at| u8::try_from(at % 251).unwrap())
+    .collect();
+  let mut store = store();
+  let mut vol = scratch(&mut store);
+  write_file(&mut vol, &mut host, &mut store, "/a.bin", &same);
+  write_file(&mut vol, &mut host, &mut store, "/b.bin", &same);
+  write_file(&mut vol, &mut host, &mut store, "/c.bin", b"other");
+  let mut session = Session::new();
+  let mut setup = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  };
+  let report = setup.land(request(1)).unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert!(
+    report
+      .entries
+      .iter()
+      .all(|entry| entry.outcome == Some(Outcome::Written)),
+    "{report:?}"
+  );
+  assert_eq!(report.cloned, 1, "{report:?}");
+  let out = ws.path.join("out");
+  assert_eq!(read(&out.join("a.bin")).unwrap(), same);
+  assert_eq!(
+    read(&out.join("b.bin")).unwrap(),
+    same,
+    "the clone, whole at its exact length"
+  );
+  assert_eq!(read(&out.join("c.bin")).unwrap(), b"other");
+  assert_eq!(
+    names_in(&out),
+    ["a.bin", "b.bin", "c.bin"],
+    "no hidden name left"
+  );
+}
+
 /// Format: `FILE_ATTRIBUTE_READONLY` (winnt.h), as `MetadataExt::file_attributes` reads it.
 #[cfg(windows)]
 const READONLY: u32 = 0x1;

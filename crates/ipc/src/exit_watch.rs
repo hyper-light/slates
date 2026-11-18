@@ -53,6 +53,32 @@ impl ExitWatch {
     })
   }
 
+  /// A watch on the process `pid` names only if it is the one created at `created` (`GetProcessTimes`' creation time,
+  /// in 100 ns intervals since 1601): a process exited and its pid reused by another is never taken for it, and the watch
+  /// reads exited at once. The handle is opened for `SYNCHRONIZE` and `PROCESS_QUERY_LIMITED_INFORMATION` alone, the
+  /// least that reads the creation time: it keeps the process object (and so its pid) but none of the objects the process
+  /// named, so a bootstrap object or an owner's token it made dies with it (A-176, A-447).
+  #[cfg(windows)]
+  pub fn on_created(pid: u32, created: u64) -> Result<ExitWatch, IpcError> {
+    Ok(ExitWatch {
+      inner: platform::ExitWatch::on_created(pid, created)?,
+    })
+  }
+
+  /// The watched process's handle, to wait on beside another object (`crate::wake::Event::wait_or_exit`); `None` when
+  /// the process was already gone at the watch.
+  #[cfg(windows)]
+  pub fn handle(&self) -> Option<std::os::windows::io::BorrowedHandle<'_>> {
+    self.inner.handle()
+  }
+
+  /// This process's creation time (`GetProcessTimes`, 100 ns intervals since 1601): what a claimant judges a pid by
+  /// ([`ExitWatch::on_created`]).
+  #[cfg(windows)]
+  pub fn own_creation() -> Result<u64, IpcError> {
+    platform::own_creation()
+  }
+
   /// Whether the watched process has exited, without waiting. A watch that can no longer be read
   /// answers exited, as an unusable control socket does on Linux: either way the daemon cannot be
   /// vouched for, and the caller's recovery reconnects to whichever daemon holds the instance now.
@@ -211,9 +237,10 @@ mod platform {
 mod platform {
   use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
-  use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, WAIT_TIMEOUT};
+  use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, FILETIME, HANDLE, WAIT_TIMEOUT};
   use windows_sys::Win32::System::Threading::{
-    OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+    GetCurrentProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE, WaitForSingleObject,
   };
 
   use crate::error::IpcError;
@@ -245,6 +272,42 @@ mod platform {
       })
     }
 
+    pub(super) fn on_created(pid: u32, created: u64) -> Result<ExitWatch, IpcError> {
+      // SAFETY: plain values; a null return is the failure, read from the thread's last error below.
+      let raw = unsafe {
+        OpenProcess(
+          PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+          0,
+          pid,
+        )
+      };
+      if raw.is_null() {
+        let error = std::io::Error::last_os_error();
+        // No such process: the daemon exited before the watch.
+        if error.raw_os_error() == i32::try_from(ERROR_INVALID_PARAMETER).ok() {
+          return Ok(ExitWatch { process: None });
+        }
+        return Err(IpcError::OsRefused {
+          call: "OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION)",
+          code: error.raw_os_error(),
+        });
+      }
+      // SAFETY: `raw` is the open handle `OpenProcess` just returned, owned by nothing else.
+      let process = unsafe { OwnedHandle::from_raw_handle(raw) };
+      // Another process created at another time holds the pid now: the daemon is gone, and its pid was reused.
+      if creation_of(process.as_raw_handle())? != created {
+        return Ok(ExitWatch { process: None });
+      }
+      Ok(ExitWatch {
+        process: Some(process),
+      })
+    }
+
+    pub(super) fn handle(&self) -> Option<std::os::windows::io::BorrowedHandle<'_>> {
+      use std::os::windows::io::AsHandle;
+      self.process.as_ref().map(AsHandle::as_handle)
+    }
+
     pub(super) fn exited(&self) -> bool {
       let Some(process) = &self.process else {
         return true;
@@ -254,6 +317,32 @@ mod platform {
       // Signalled (exited) or failed (unusable): not vouched for.
       waited != WAIT_TIMEOUT
     }
+  }
+
+  /// The creation time of the process `process` names, a handle with a query right.
+  fn creation_of(process: HANDLE) -> Result<u64, IpcError> {
+    let mut times = [FILETIME {
+      dwLowDateTime: 0,
+      dwHighDateTime: 0,
+    }; 4];
+    let [creation, exit, kernel, user] = &mut times;
+    // SAFETY: `process` is a live handle with a query right for the call, and the four out-parameters are live records
+    // the call writes and nothing else reads meanwhile.
+    let read = unsafe { GetProcessTimes(process, creation, exit, kernel, user) };
+    if read == 0 {
+      return Err(IpcError::OsRefused {
+        call: "GetProcessTimes",
+        code: std::io::Error::last_os_error().raw_os_error(),
+      });
+    }
+    let [creation, ..] = times;
+    Ok((u64::from(creation.dwHighDateTime) << u32::BITS) | u64::from(creation.dwLowDateTime))
+  }
+
+  /// This process's creation time.
+  pub(super) fn own_creation() -> Result<u64, IpcError> {
+    // SAFETY: the pseudo-handle of the calling process, always valid and never closed.
+    creation_of(unsafe { GetCurrentProcess() })
   }
 }
 
