@@ -4512,10 +4512,29 @@ mod tests {
       &bs_cohort,
     );
     assert_eq!(regional.version, version, "refused moves change nothing");
+    expect_a_move_back_to_its_creator_kept_as_an_exception(
+      &mut regional,
+      object,
+      (creator, b, c),
+      (&bs_cohort, &cs_cohort),
+      before,
+    );
+  }
 
-    assert!(regional.move_object(object, b, c, &bs_cohort));
+  /// The end of `a_move_names_the_objects_owner_and_only_its_owner_moves_it`. Do: with `object` moved from `creator`
+  /// to `b` at version `before + 1`, move it on to `c`, then back to `creator`, then from `c` to `b`. Expect the move
+  /// back to keep an exception naming the creator and `c` at version `before + 3` (A-291: the creator released its copy
+  /// and adopts it back as any member does), and the member it left to move it no more.
+  fn expect_a_move_back_to_its_creator_kept_as_an_exception(
+    regional: &mut RegionalConfiguration,
+    object: ObjectId,
+    (creator, b, c): (HostId, HostId, HostId),
+    (bs_cohort, cs_cohort): (&[HostId], &[HostId]),
+    before: u64,
+  ) {
+    assert!(regional.move_object(object, b, c, bs_cohort));
     assert_eq!(regional.owner_of(object), Some(c));
-    assert!(regional.move_object(object, c, creator, &cs_cohort));
+    assert!(regional.move_object(object, c, creator, cs_cohort));
     assert_eq!(
       regional.moved.get(&object),
       Some(&Moved {
@@ -4528,7 +4547,7 @@ mod tests {
     );
     assert_eq!(regional.owner_of(object), Some(creator));
     assert!(
-      !regional.move_object(object, c, b, &cs_cohort),
+      !regional.move_object(object, c, b, cs_cohort),
       "the member it left moves it no more"
     );
   }
@@ -4560,18 +4579,30 @@ mod tests {
       "adopted: the owner and its generation kept, the member it left let go"
     );
     assert_eq!(regional.version, moved_at + 1);
+    expect_each_move_to_owe_its_own_adoption(&mut regional, object, b, c);
+  }
+
+  /// The end of `a_moves_adoption_is_reported_by_its_new_owner_and_lets_the_member_it_left_go`. Do: with `object`'s
+  /// move to `owner` adopted, report it adopted again; move it on to `next` and report that move adopted. Expect the
+  /// second report refused and the next move to owe, and take, its own adoption.
+  fn expect_each_move_to_owe_its_own_adoption(
+    regional: &mut RegionalConfiguration,
+    object: ObjectId,
+    owner: HostId,
+    next: HostId,
+  ) {
     assert!(
-      !regional.adopt_move(object, b),
+      !regional.adopt_move(object, owner),
       "an adopted move is adopted once"
     );
-    assert_eq!(regional.owner_of(object), Some(b));
-    assert!(regional.move_object(object, b, c, &[b, HostId(4), HostId(5)]));
+    assert_eq!(regional.owner_of(object), Some(owner));
+    assert!(regional.move_object(object, owner, next, &[owner, HostId(4), HostId(5)]));
     assert!(
-      regional.adopts_move(object, c),
+      regional.adopts_move(object, next),
       "the next move owes its own"
     );
-    assert!(regional.adopt_move(object, c));
-    assert_eq!(regional.owner_of(object), Some(c));
+    assert!(regional.adopt_move(object, next));
+    assert_eq!(regional.owner_of(object), Some(next));
   }
 
   /// The first move of `a_move_names_the_objects_owner_and_only_its_owner_moves_it`. Do: move `object` from

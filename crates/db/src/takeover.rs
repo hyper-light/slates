@@ -618,22 +618,60 @@ mod tests {
         acceptor(holder, from, generation, Some((unmoved, 3))),
       ),
     ]);
-    let none = BTreeMap::new();
-    let prepare = |owner: HostId, epoch: u64, named: Vec<ObjectId>| HostPrepare {
+    expect_only_the_moved_owner_promised(
+      &regional,
+      &mut acceptors,
+      (from, to, other, holder),
+      object,
+    );
+    expect_an_unmoved_object_and_a_lower_epoch_refused(
+      &regional,
+      &mut acceptors,
+      (from, to, holder),
+      (object, unmoved),
+    );
+    expect_the_member_it_left_to_answer_its_own_records(
+      &mut regional,
+      &mut acceptors,
+      (from, to, holder),
+      object,
+    );
+  }
+
+  /// A move's phase-one question from `owner` at `epoch` for `named`, under `regional`'s generation now.
+  fn move_prepare(
+    regional: &RegionalConfiguration,
+    owner: HostId,
+    epoch: u64,
+    named: Vec<ObjectId>,
+  ) -> HostPrepare {
+    HostPrepare {
       departed: owner,
       owner,
       epoch: HostEpoch(epoch),
-      generation,
+      generation: regional.version,
       after: None,
       named,
-    };
-    let asked = prepare(other, 5, vec![object, object.catalog()]);
-    let refused = answer_move(holder, &asked, &regional, &mut acceptors, &none, usize::MAX);
+    }
+  }
+
+  /// The first part of `a_holder_promises_a_moved_object_only_to_the_owner_the_configuration_moved_it_to`. Do: ask
+  /// `holder` for `object` and its catalog from `other`, then from `to`; then offer the copy a record from `from`.
+  /// Expect `other` refused for both and the copy untouched; `to` answered with the copy's record and the catalog's
+  /// nothing, the copy's authority now `to`'s; and `from`'s next record refused.
+  fn expect_only_the_moved_owner_promised(
+    regional: &RegionalConfiguration,
+    acceptors: &mut BTreeMap<ObjectId, Acceptor>,
+    (from, to, other, holder): (HostId, HostId, HostId, HostId),
+    object: ObjectId,
+  ) {
+    let none = BTreeMap::new();
+    let asked = move_prepare(regional, other, 5, vec![object, object.catalog()]);
+    let refused = answer_move(holder, &asked, regional, acceptors, &none, usize::MAX);
     assert_eq!(refused.refused, 2, "the configuration moved it to another");
     assert_eq!(acceptors[&object].owner(), from, "the copy is untouched");
-
-    let asked = prepare(to, 5, vec![object, object.catalog()]);
-    let answer = answer_move(holder, &asked, &regional, &mut acceptors, &none, usize::MAX);
+    let asked = move_prepare(regional, to, 5, vec![object, object.catalog()]);
+    let answer = answer_move(holder, &asked, regional, acceptors, &none, usize::MAX);
     assert_eq!(answer.refused, 0);
     assert_eq!(answer.promise.entries.len(), 1);
     assert_eq!(answer.promise.entries[0].0, object);
@@ -645,29 +683,50 @@ mod tests {
       object,
       sequence: 4,
       epoch: HostEpoch(1),
-      generation,
+      generation: regional.version,
       value: b"late".to_vec(),
     };
     assert!(
       acceptors.get_mut(&object).unwrap().accept(&stale).is_err(),
       "the old owner's next record is refused"
     );
+  }
 
-    let asked = prepare(to, 5, vec![unmoved]);
-    let answer = answer_move(holder, &asked, &regional, &mut acceptors, &none, usize::MAX);
+  /// The middle of `a_holder_promises_a_moved_object_only_to_the_owner_the_configuration_moved_it_to`, after `to`'s
+  /// round at epoch 5. Do: ask `holder` from `to` for `unmoved`, then for `object` at epoch 4. Expect the object that
+  /// never moved refused and its copy untouched, and the lower epoch answered with the fence it must exceed.
+  fn expect_an_unmoved_object_and_a_lower_epoch_refused(
+    regional: &RegionalConfiguration,
+    acceptors: &mut BTreeMap<ObjectId, Acceptor>,
+    (from, to, holder): (HostId, HostId, HostId),
+    (object, unmoved): (ObjectId, ObjectId),
+  ) {
+    let none = BTreeMap::new();
+    let asked = move_prepare(regional, to, 5, vec![unmoved]);
+    let answer = answer_move(holder, &asked, regional, acceptors, &none, usize::MAX);
     assert_eq!(answer.refused, 1, "an object that never moved");
     assert_eq!(acceptors[&unmoved].owner(), from);
-
-    let asked = prepare(to, 4, vec![object]);
-    let answer = answer_move(holder, &asked, &regional, &mut acceptors, &none, usize::MAX);
+    let asked = move_prepare(regional, to, 4, vec![object]);
+    let answer = answer_move(holder, &asked, regional, acceptors, &none, usize::MAX);
     assert_eq!(
       answer.promise.fenced,
       Some(HostEpoch(5)),
       "a round below the fence is told the fence"
     );
     assert!(answer.promise.entries.is_empty());
+  }
 
-    // The member the move left keeps no copy of its own object, only the records it wrote as its owner.
+  /// The end of `a_holder_promises_a_moved_object_only_to_the_owner_the_configuration_moved_it_to`. Do: ask `from`,
+  /// which keeps no copy of its own object, only the records it wrote as its owner, and `holder` handed those records
+  /// as the owner's; then report the move adopted and ask `from` again. Expect `from` to answer its own newest records
+  /// of the head and the catalog, never that it holds nothing; `holder` to answer from its copy; and an adopted move
+  /// answered by no one.
+  fn expect_the_member_it_left_to_answer_its_own_records(
+    regional: &mut RegionalConfiguration,
+    acceptors: &mut BTreeMap<ObjectId, Acceptor>,
+    (from, to, holder): (HostId, HostId, HostId),
+    object: ObjectId,
+  ) {
     let written = |sequence: u64| Accepted {
       sequence,
       epoch: HostEpoch(2),
@@ -675,8 +734,8 @@ mod tests {
     };
     let own = BTreeMap::from([(object, written(4)), (object.catalog(), written(2))]);
     let mut nothing_held: BTreeMap<ObjectId, Acceptor> = BTreeMap::new();
-    let asked = prepare(to, 6, vec![object, object.catalog()]);
-    let answer = answer_move(from, &asked, &regional, &mut nothing_held, &own, usize::MAX);
+    let asked = move_prepare(regional, to, 6, vec![object, object.catalog()]);
+    let answer = answer_move(from, &asked, regional, &mut nothing_held, &own, usize::MAX);
     assert_eq!(answer.refused, 0);
     assert_eq!(
       answer.promise.entries,
@@ -684,19 +743,15 @@ mod tests {
       "the member it left answers its own newest records, never that it holds nothing"
     );
     assert!(answer.promise.nothing.is_empty());
-    let answer = answer_move(holder, &asked, &regional, &mut acceptors, &own, usize::MAX);
+    let answer = answer_move(holder, &asked, regional, acceptors, &own, usize::MAX);
     assert_eq!(
       answer.promise.entries,
       vec![(object, acceptors[&object].highest_accepted(object).unwrap())],
       "a holder answers from its copy, whatever records it is handed as the owner's"
     );
-
     assert!(regional.adopt_move(object, to));
-    let asked = HostPrepare {
-      generation: regional.version,
-      ..prepare(to, 7, vec![object])
-    };
-    let answer = answer_move(from, &asked, &regional, &mut nothing_held, &own, usize::MAX);
+    let asked = move_prepare(regional, to, 7, vec![object]);
+    let answer = answer_move(from, &asked, regional, &mut nothing_held, &own, usize::MAX);
     assert_eq!(answer.refused, 1, "an adopted move owes no round");
   }
 

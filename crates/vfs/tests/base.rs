@@ -1983,28 +1983,46 @@ fn a_captured_base_holds_every_byte_and_its_clone_needs_no_base_directory() {
   host.replace_file("/sub/big", b"rewritten on the disk");
   host.replace_file("/late", b"added on the disk");
   let mut clone = Volume::clone_without_base(&store, &mut vol, s, clone_config(9)).unwrap();
-  let read = |clone: &Volume, store: &Store, path: &str| {
-    let no = clone.resolve(store, path).unwrap().inode;
-    let size = clone.stat(store, no).unwrap().size;
-    let mut buf = vec![0u8; usize::try_from(size).unwrap()];
-    let n = clone.read(store, no, 0, &mut buf).unwrap();
-    buf.truncate(n);
-    buf
-  };
-  assert_eq!(read(&clone, &store, "/small"), b"a small file");
+  expect_the_clone_to_hold_the_capture(&clone, &store, &big);
+  let small = clone.resolve(&store, "/small").unwrap().inode;
+  clone.write(&mut store, small, 0, b"A").unwrap();
+  assert_eq!(read_clone(&clone, &store, "/small"), b"A small file");
   assert_eq!(
-    read(&clone, &store, "/sub/big"),
+    read_all(&mut vol, &mut host, &mut store, "/small").unwrap(),
+    b"a small file",
+    "the clone's write is the clone's alone"
+  );
+  expect_a_pin_to_archive_short_where_the_capture_archives_whole(&mut store, &vol, s, &big);
+}
+
+/// Reads `path` of `clone` whole, with no host.
+fn read_clone(clone: &Volume, store: &Store, path: &str) -> Vec<u8> {
+  let no = clone.resolve(store, path).unwrap().inode;
+  let size = clone.stat(store, no).unwrap().size;
+  let mut buf = vec![0u8; usize::try_from(size).unwrap()];
+  let n = clone.read(store, no, 0, &mut buf).unwrap();
+  buf.truncate(n);
+  buf
+}
+
+/// The clone of `a_captured_base_holds_every_byte_and_its_clone_needs_no_base_directory`, read with no host at all.
+/// Expect the captured bytes of both files (the disk's later ones never), the link's target, and exactly the captured
+/// names at the root.
+fn expect_the_clone_to_hold_the_capture(clone: &Volume, store: &Store, big: &[u8]) {
+  assert_eq!(read_clone(clone, store, "/small"), b"a small file");
+  assert_eq!(
+    read_clone(clone, store, "/sub/big"),
     big,
     "the large file's captured bytes"
   );
-  let link = clone.resolve(&store, "/link").unwrap().inode;
-  assert_eq!(&*clone.readlink(&store, link).unwrap(), "sub/big");
-  let root = clone.resolve(&store, "/").unwrap();
+  let link = clone.resolve(store, "/link").unwrap().inode;
+  assert_eq!(&*clone.readlink(store, link).unwrap(), "sub/big");
+  let root = clone.resolve(store, "/").unwrap();
   let Child::Dir(root) = root.child else {
     panic!("the root is a directory");
   };
   let names: BTreeSet<String> = clone
-    .readdir(&store, root)
+    .readdir(store, root)
     .unwrap()
     .iter()
     .map(|row| row.name.to_owned())
@@ -2017,36 +2035,39 @@ fn a_captured_base_holds_every_byte_and_its_clone_needs_no_base_directory() {
       .collect(),
     "the captured names, never the disk's later one"
   );
-  let small = clone.resolve(&store, "/small").unwrap().inode;
-  clone.write(&mut store, small, 0, b"A").unwrap();
-  assert_eq!(read(&clone, &store, "/small"), b"A small file");
-  assert_eq!(
-    read_all(&mut vol, &mut host, &mut store, "/small").unwrap(),
-    b"a small file",
-    "the clone's write is the clone's alone"
-  );
+}
 
+/// The end of `a_captured_base_holds_every_byte_and_its_clone_needs_no_base_directory`. Do: pin a tree holding the
+/// same large file and snapshot it; archive both snapshots. Expect the pin's refused `RecoveryIncomplete` (it keeps the
+/// large file on its descriptor, its bytes not all in the volume) and the capture's snapshot `captured` of `captured_vol`
+/// archived whole, so a fleet member can serve it from its holders.
+fn expect_a_pin_to_archive_short_where_the_capture_archives_whole(
+  store: &mut Store,
+  captured_vol: &Volume,
+  captured: slates_vfs::ids::SnapshotId,
+  big: &[u8],
+) {
   let mut pinned_host = SimHost::new();
   pinned_host.mkdir("/sub");
-  pinned_host.replace_file("/sub/big", &big);
-  let mut pinned = overlay(&mut pinned_host, &mut store);
+  pinned_host.replace_file("/sub/big", big);
+  let mut pinned = overlay(&mut pinned_host, store);
   walk_to_end(
     &mut pinned,
     &mut pinned_host,
-    &mut store,
+    store,
     &mut slates_vfs::base::PinWalk::new(None),
   )
   .unwrap();
-  let p = pinned.snapshot(&mut store).unwrap();
+  let p = pinned.snapshot(store).unwrap();
   assert!(
     matches!(
-      archive_whole(&pinned, &store, p),
+      archive_whole(&pinned, store, p),
       Err(VfsError::RecoveryIncomplete)
     ),
     "a pin keeps the large file on its descriptor, so its snapshot cannot be archived whole"
   );
   assert!(
-    archive_whole(&vol, &store, s).is_ok(),
+    archive_whole(captured_vol, store, captured).is_ok(),
     "the capture's snapshot archives whole, so a fleet member can serve it from its holders"
   );
 }

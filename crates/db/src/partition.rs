@@ -614,6 +614,32 @@ impl Partition {
   }
 
   /// Applies a work's floor or pending-submit record (A-247).
+  /// Erases volume `id`'s keys with its record (A-92; seal.md §3.1, cryptographic erase): its lineage and naming keys,
+  /// whose one wrapped copy was here, so every chunk sealed under them, on any holder, opens for no one after this; and
+  /// its tenant's key when `tenant` has no other volume on this partition (a tenant key wraps only its volumes' lineage
+  /// keys). The scan is bounded by the partition's volume cap, once per destroy or release.
+  fn erase_volume_keys(&mut self, id: VolumeId, tenant: Option<u64>) {
+    self.seal_keys.remove(&SealKeyOwner::Lineage { volume: id });
+    self.seal_keys.remove(&SealKeyOwner::Naming { volume: id });
+    if let Some(account) = tenant
+      && !self
+        .volumes()
+        .iter()
+        .any(|volume| volume.owner.tenant() == account)
+    {
+      self.seal_keys.remove(&SealKeyOwner::Tenant { account });
+    }
+  }
+
+  /// A moved volume's release (A-291): as a destroy's apply, but no tombstone, since the volume's registers are the
+  /// member's it moved to; this node's copies of its keys go with its record, its new owner holding its own.
+  fn release_volume(&mut self, id: VolumeId) -> Result<(), DbError> {
+    let tenant = self.volume(id).map(|volume| volume.owner.tenant());
+    self.remove_volume(id)?;
+    self.erase_volume_keys(id, tenant);
+    Ok(())
+  }
+
   fn apply_work_floor(&mut self, op: &Op) {
     match op {
       Op::WorkFloorSet { green, work, base } => self.set_work_floor(*green, *work, *base),
@@ -1522,41 +1548,10 @@ impl Partition {
         }
         // The volume's lineage key goes with it, in the same record (A-92; seal.md §3.1, cryptographic erase): its
         // one wrapped copy was here, so every chunk sealed under it, on any holder, opens for no one after this.
-        self
-          .seal_keys
-          .remove(&SealKeyOwner::Lineage { volume: *id });
-        self.seal_keys.remove(&SealKeyOwner::Naming { volume: *id });
-        // A tenant key wraps only its volumes' lineage keys, so with the tenant's last volume on this partition it is
-        // erased too, in the same record. The scan is bounded by the partition's volume cap, once per destroy.
-        if let Some(account) = tenant
-          && !self
-            .volumes()
-            .iter()
-            .any(|volume| volume.owner.tenant() == account)
-        {
-          self.seal_keys.remove(&SealKeyOwner::Tenant { account });
-        }
+        self.erase_volume_keys(*id, tenant);
         Ok(())
       }
-      Op::VolumeReleased { id } => {
-        // As a destroy's apply, but no tombstone: the volume's registers are the member's it moved to (A-291), and this
-        // node's copies of its keys go with its record, its new owner holding its own.
-        let tenant = self.volume(*id).map(|volume| volume.owner.tenant());
-        self.remove_volume(*id)?;
-        self
-          .seal_keys
-          .remove(&SealKeyOwner::Lineage { volume: *id });
-        self.seal_keys.remove(&SealKeyOwner::Naming { volume: *id });
-        if let Some(account) = tenant
-          && !self
-            .volumes()
-            .iter()
-            .any(|volume| volume.owner.tenant() == account)
-        {
-          self.seal_keys.remove(&SealKeyOwner::Tenant { account });
-        }
-        Ok(())
-      }
+      Op::VolumeReleased { id } => self.release_volume(*id),
       Op::BaseCaptured { volume, snapshot } => {
         self.captured_bases.insert(CapturedBase {
           volume: *volume,
