@@ -883,7 +883,7 @@ impl fmt::Display for Error {
         crate::volume_id_text(*existing)
       ),
       Self::AlreadyExists(Existing::Group) => f.write_str("this instance's consensus group exists already"),
-      Self::Denied(denied) => write!(f, "denied: {denied:?}"),
+      Self::Denied(denied) => write!(f, "denied: {denied}"),
       Self::Exhausted(exhausted) => write!(f, "a bound is reached: {exhausted:?}"),
       Self::Busy(busy) => write!(f, "held by another: {busy:?}"),
       Self::Stale(stale) => write!(f, "stale: {stale:?}; read the current state and ask again"),
@@ -901,6 +901,46 @@ impl fmt::Display for Error {
       Self::Mount(fault) => write!(f, "{fault}"),
       Self::Start(fault) => write!(f, "{fault}"),
       Self::Protocol(fault) => write!(f, "a fault in slates (report it): {fault:?}"),
+    }
+  }
+}
+
+impl fmt::Display for Denied {
+  /// Each denial in words, the daemon's refusal named where it has one, so a person sees why (until 2026-11-18 this
+  /// class printed its `Debug`: a missing issuer authority read `NoAuthority(NoHandoff)`, not the anchor's surface it
+  /// needs).
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::Rights { verb } => write!(
+        f,
+        "Forbidden: the caller's rights on the volume do not include {verb}"
+      ),
+      Self::NotShared { principal } => {
+        write!(
+          f,
+          "NotShared: nothing shares the volume with the requester ({principal:?})"
+        )
+      }
+      Self::NotEnrolled => {
+        f.write_str("the daemon requires an enrolled consumer for this, and the caller is not one")
+      }
+      Self::Revoked => f.write_str("the caller's consumer enrollment was revoked"),
+      Self::SessionUnproven => f.write_str("the client named a session its key does not prove"),
+      Self::GrantChannel { channel } => write!(f, "a grant cannot be asked on {channel}"),
+      Self::Unproven => f.write_str("the authority's proof did not verify"),
+      Self::NoAuthority(fault) => write!(f, "{fault}"),
+      Self::PeerNotDaemonUser { uid } => write!(
+        f,
+        "the process answering at the instance is not the daemon's user (uid {uid}); it is never trusted"
+      ),
+      Self::CapabilityNotDelivered(fault) => {
+        write!(
+          f,
+          "the consumer capability on the inherited descriptor could not be taken: {fault}"
+        )
+      }
+      Self::Volume(refusal) => write!(f, "the volume's rules forbid it: {refusal:?}"),
+      Self::Policy(refusal) => write!(f, "{refusal}"),
     }
   }
 }
@@ -1317,8 +1357,8 @@ mod tests {
   use slates_ipc::protocol::{Refusal, VolumeId};
 
   use super::{
-    Busy, Error, Exhausted, Existing, HostFault, Missing, Note, ProtocolFault, RetryCause, Stale,
-    Unreported, Unusable,
+    Busy, Denied, Error, Exhausted, Existing, HostFault, Missing, Note, ProtocolFault, RetryCause,
+    Stale, Unreported, Unusable,
   };
 
   /// Shape: the pause a test's retryable refusal carries.
@@ -1536,6 +1576,28 @@ mod tests {
         && words.contains("NotRecovered")
         && words.contains("BaseMissing"),
       "{words}"
+    );
+  }
+
+  /// The integrator's report (2026-11-18, the CLI flow on d1323898: `slates enroll` with no anchor in the environment
+  /// printed `denied: NoAuthority(NoHandoff)`). Do: render a missing issuer authority and a rights denial. Expect the
+  /// issuer fault's own words (the anchor's surface it needs) and the daemon's `Forbidden` with the verb, never a
+  /// `Debug`.
+  #[test]
+  fn a_denial_renders_in_words() {
+    let missing = Error::Denied(Denied::NoAuthority(super::IssuerFault::NoHandoff)).to_string();
+    assert!(
+      missing.contains("no anchor in this environment"),
+      "{missing}"
+    );
+    assert!(!missing.contains("NoHandoff"), "{missing}");
+    let rights = Error::Denied(Denied::Rights {
+      verb: Note::new("status"),
+    })
+    .to_string();
+    assert!(
+      rights.contains("Forbidden") && rights.contains("status"),
+      "{rights}"
     );
   }
 }
