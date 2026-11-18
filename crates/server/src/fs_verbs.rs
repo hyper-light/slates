@@ -177,7 +177,10 @@ pub(crate) fn writable_file(
       match found.kind {
         Kind::File => Ok(found.ino),
         Kind::Dir => Err(VfsError::IsDirectory),
-        Kind::Symlink | Kind::Fifo | Kind::Socket => Err(VfsError::Invalid),
+        // A device node is never mapped as content (A-294), as a FIFO or socket name is not.
+        Kind::Symlink | Kind::Fifo | Kind::Socket | Kind::BlockDevice | Kind::CharDevice => {
+          Err(VfsError::Invalid)
+        }
       }
     },
   )?

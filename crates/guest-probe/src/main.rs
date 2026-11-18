@@ -6,9 +6,16 @@
 #[cfg(target_os = "linux")]
 mod guest;
 
+/// The guest's `/init` only as the kernel's first process. Run any other way, as the copy a guest's test runs from a
+/// mount to learn whether the mount honoured its set-id bits (A-94), it says its ids and ends: it never takes a
+/// console, mounts anything or ends a machine it was not started to be the first process of.
 #[cfg(target_os = "linux")]
-fn main() {
-  guest::run()
+fn main() -> std::process::ExitCode {
+  if rustix::process::getpid().is_init() {
+    guest::run()
+  } else {
+    guest::say_identity()
+  }
 }
 
 /// Off Linux there is no guest to be: the binary says so and exits.

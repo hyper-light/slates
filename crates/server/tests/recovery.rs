@@ -261,6 +261,53 @@ fn refused_unpublished_create(daemon: &Daemon, client: &mut Client) -> RequestId
   create_id
 }
 
+/// GAPS (an open sibling found by reading `reconcile_unpublished_effects`, 2026-10-24; proven here 2026-11-18): a clone
+/// whose transaction is rolled back gives back its pin on its origin's snapshot. Do: create a volume and snapshot it; with
+/// the next publication refused before its append, clone the snapshot (refused `Unpublished`, the transaction rolled back
+/// and the orphaned clone torn down); then destroy the snapshot. Expect the clone refused typed, one rollback counted, and
+/// the snapshot destroyed. Before, the teardown kept the clone's pin on the snapshot, and its destroy was refused
+/// `Pinned` until the daemon restarted.
+#[test]
+fn a_clone_rolled_back_unpublished_gives_back_its_pin_on_the_origins_snapshot() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-clone-pin-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let anchor = held_anchor("clone-pin", &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let origin = client.create(&scratch("pin-origin")).unwrap();
+  let snapshot = client.snapshot(origin).unwrap();
+  daemon
+    .inject_publication_fault(Some(slates_db::replay::PublicationFault::BeforeAppend))
+    .expect("the fault is installed");
+  let cloned = client.clone_snapshot(origin, snapshot, "pin-clone");
+  let rollbacks = rollbacks_of(&daemon);
+  daemon
+    .inject_publication_fault(None)
+    .expect("the faults still pending on the other shards are cleared");
+  let destroyed = client.destroy_snapshot(origin, snapshot);
+  daemon.stop();
+  drop(anchor);
+  assert!(
+    matches!(
+      cloned,
+      Err(ClientError::Refused(Refusal::Unpublished { .. }))
+    ),
+    "the clone is refused typed as unpublished: {cloned:?}"
+  );
+  assert_eq!(
+    rollbacks, 1,
+    "the shard rolled the clone's transaction back"
+  );
+  assert!(
+    destroyed.is_ok(),
+    "the origin's snapshot is destroyed, no pin left by the rolled-back clone: {destroyed:?}"
+  );
+}
+
 /// The volume names the daemon lists, sorted.
 fn names_listed(client: &mut Client) -> Vec<String> {
   let mut names: Vec<String> = client
@@ -4966,7 +5013,17 @@ fn overlay_clones_read(
     matches!(own.as_deref(), Ok(bytes) if bytes == b"the clone's own"),
     "{when}: the clone reads its own file: {own:?}"
   );
-  for volume in [origin, other] {
+  clones_own_file_reads_in_no_other_volume(client, [origin, other], when);
+}
+
+/// The other half of `overlay_clones_read`: expect the file one clone wrote refused `NotFound` in each of `volumes`,
+/// `when` naming the moment for a failure's message.
+fn clones_own_file_reads_in_no_other_volume(
+  client: &mut Client,
+  volumes: [VolumeId; 2],
+  when: &str,
+) {
+  for volume in volumes {
     let absent = read_answered(client, volume, "clone.txt");
     assert!(
       matches!(absent, Err(ClientError::Refused(Refusal::NotFound))),

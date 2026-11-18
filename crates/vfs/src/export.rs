@@ -72,6 +72,10 @@ pub const MODE_SYMLINK: u32 = 0o120_000;
 pub const MODE_FIFO: u32 = 0o010_000;
 /// Format: POSIX S_IFSOCK, a metadata-only socket name.
 pub const MODE_SOCKET: u32 = 0o140_000;
+/// Format: POSIX `S_IFBLK`, a block device node, its number carried in the manifest metadata (A-294).
+pub const MODE_BLOCK_DEVICE: u32 = 0o060_000;
+/// Format: POSIX `S_IFCHR`, a character device node, its number carried in the manifest metadata (A-294).
+pub const MODE_CHAR_DEVICE: u32 = 0o020_000;
 
 /// Format: the archive header's name-policy id for byte-exact names.
 const POLICY_EXACT: u32 = 0;
@@ -89,7 +93,23 @@ pub fn kind_of_mode(mode: u32) -> Option<Kind> {
     MODE_SYMLINK => Some(Kind::Symlink),
     MODE_FIFO => Some(Kind::Fifo),
     MODE_SOCKET => Some(Kind::Socket),
+    MODE_BLOCK_DEVICE => Some(Kind::BlockDevice),
+    MODE_CHAR_DEVICE => Some(Kind::CharDevice),
     _ => None,
+  }
+}
+
+/// The type bits of a mode for an object of `kind` (POSIX `S_IFMT`): what a manifest, a FUSE attribute and an
+/// NFS mode carry beside the permission bits.
+pub const fn mode_of_kind(kind: Kind) -> u32 {
+  match kind {
+    Kind::Dir => MODE_DIRECTORY,
+    Kind::File => MODE_FILE,
+    Kind::Symlink => MODE_SYMLINK,
+    Kind::Fifo => MODE_FIFO,
+    Kind::Socket => MODE_SOCKET,
+    Kind::BlockDevice => MODE_BLOCK_DEVICE,
+    Kind::CharDevice => MODE_CHAR_DEVICE,
   }
 }
 
@@ -440,7 +460,9 @@ impl SnapshotArchiver {
       Kind::Dir => self.enter_directory(volume, store, dir, next)?,
       Kind::File => self.begin_file(volume, store, next)?,
       Kind::Symlink => self.take_symlink(volume, store, next)?,
-      Kind::Fifo | Kind::Socket => self.take_special(volume, store, next)?,
+      Kind::Fifo | Kind::Socket | Kind::BlockDevice | Kind::CharDevice => {
+        self.take_special(volume, store, next)?
+      }
     };
     Ok(Step::Worked(cost))
   }
@@ -686,19 +708,25 @@ impl SnapshotArchiver {
     Ok(len)
   }
 
-  /// Records only the type and metadata of an IPC name, never kernel state (A-26).
+  /// Records only the type and metadata of a name with no content, never kernel state (A-26): a FIFO or socket name,
+  /// or a device node with its number (A-294).
   fn take_special(
     &mut self,
     volume: &Volume,
     store: &Store,
     next: Pending,
   ) -> Result<u64, VfsError> {
-    let type_bits = if next.kind == Kind::Fifo {
-      MODE_FIFO
-    } else {
-      MODE_SOCKET
-    };
-    let meta = meta_of(volume, store, self.snapshot, next.inode, type_bits)?;
+    let mut meta = meta_of(
+      volume,
+      store,
+      self.snapshot,
+      next.inode,
+      mode_of_kind(next.kind),
+    )?;
+    if let Some(number) = volume.device_in(store, self.snapshot, next.inode)? {
+      meta.device_major = number.major;
+      meta.device_minor = number.minor;
+    }
     let queued = attributes_of(volume, store, self.snapshot, next.inode)?;
     self.start(
       volume,
@@ -877,6 +905,8 @@ fn node_meta(no: InodeNo, attrs: &Attrs, type_bits: u32) -> NodeMeta {
     nlink: attrs.nlink,
     uid: attrs.uid,
     gid: attrs.gid,
+    device_major: 0,
+    device_minor: 0,
     xattrs: Vec::new(),
   }
 }

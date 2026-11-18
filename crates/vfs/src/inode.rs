@@ -30,12 +30,113 @@ pub enum Kind {
   Fifo,
   /// A UNIX socket name; listeners and connections are not volume content (A-26).
   Socket,
+  /// A block device node: its device number is metadata, and no route slates serves opens the device it names (A-294).
+  BlockDevice,
+  /// A character device node: its device number is metadata, and no route slates serves opens the device it names
+  /// (A-294). A whiteout as overlayfs writes one is a character device numbered 0/0, kept like any other.
+  CharDevice,
 }
 
 impl Kind {
-  /// Whether regular-file I/O must refuse this metadata-only IPC name (A-26).
+  /// Whether this is a name with no content, which regular-file I/O refuses: a FIFO or socket name (A-26) or a device
+  /// node (A-294).
   pub const fn is_special(self) -> bool {
-    matches!(self, Self::Fifo | Self::Socket)
+    matches!(
+      self,
+      Self::Fifo | Self::Socket | Self::BlockDevice | Self::CharDevice
+    )
+  }
+
+  /// Whether this is a device node (A-294).
+  pub const fn is_device(self) -> bool {
+    matches!(self, Self::BlockDevice | Self::CharDevice)
+  }
+}
+
+/// A device node's number (A-294): its major and its minor, each the 32 bits NFS carries (`specdata3`, RFC 1813
+/// §2.6; `specdata4`, RFC 8881 §3.3.4), kept exactly as made. A route whose own encoding holds less (the Linux
+/// kernel's 12-bit major and 20-bit minor, which FUSE and an ext4 image carry) converts at its edge
+/// ([`DeviceNumber::to_linux`]), so the volume never narrows a number another route made.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DeviceNumber {
+  /// The major number: which driver.
+  pub major: u32,
+  /// The minor number: which device of that driver.
+  pub minor: u32,
+}
+
+impl DeviceNumber {
+  /// The number `major`:`minor`.
+  pub const fn new(major: u32, minor: u32) -> DeviceNumber {
+    DeviceNumber { major, minor }
+  }
+
+  /// The number in the Linux kernel's 32-bit encoding (`new_encode_dev`, `include/linux/kdev_t.h`), which a FUSE
+  /// attribute's `rdev` and an ext4 inode carry; `None` for a major of 2^12 or more or a minor of 2^20 or more, which
+  /// no Linux device number holds. The one encoder is the image format's (`slates_image::layout::new_encode`).
+  pub fn to_linux(self) -> Option<u32> {
+    slates_image::layout::new_encode(self.major, self.minor)
+  }
+
+  /// The number a Linux kernel's 32-bit encoding names (`new_decode_dev`): what a FUSE `MKNOD` and an ext4 inode
+  /// carry. The one decoder is the image format's (`slates_image::layout::major_minor`).
+  pub fn from_linux(word: u32) -> DeviceNumber {
+    let (major, minor) = slates_image::layout::major_minor(word);
+    DeviceNumber { major, minor }
+  }
+}
+
+/// What a `mknod` makes: a name with no content (A-26, A-294). A device node carries its number, and nothing else
+/// does, so a FIFO with a device number cannot be asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpecialNode {
+  /// A named pipe.
+  Fifo,
+  /// A UNIX socket name.
+  Socket,
+  /// A block device node and its number.
+  BlockDevice(DeviceNumber),
+  /// A character device node and its number.
+  CharDevice(DeviceNumber),
+}
+
+impl SpecialNode {
+  /// The kind of inode it makes.
+  pub const fn kind(self) -> Kind {
+    match self {
+      Self::Fifo => Kind::Fifo,
+      Self::Socket => Kind::Socket,
+      Self::BlockDevice(_) => Kind::BlockDevice,
+      Self::CharDevice(_) => Kind::CharDevice,
+    }
+  }
+
+  /// Its device number, for a device node.
+  pub const fn device(self) -> Option<DeviceNumber> {
+    match self {
+      Self::BlockDevice(number) | Self::CharDevice(number) => Some(number),
+      Self::Fifo | Self::Socket => None,
+    }
+  }
+
+  /// The node of kind `kind`, a device node numbered `device` (ignored for a FIFO or socket name); `None` for a kind
+  /// with content.
+  pub const fn of(kind: Kind, device: DeviceNumber) -> Option<SpecialNode> {
+    match kind {
+      Kind::Fifo => Some(Self::Fifo),
+      Kind::Socket => Some(Self::Socket),
+      Kind::BlockDevice => Some(Self::BlockDevice(device)),
+      Kind::CharDevice => Some(Self::CharDevice(device)),
+      Kind::File | Kind::Dir | Kind::Symlink => None,
+    }
+  }
+
+  /// The body its inode holds: a device node its number, a FIFO or socket name nothing.
+  pub(crate) const fn body(self) -> Body {
+    match self.device() {
+      Some(number) => Body::Device(number),
+      None => Body::None,
+    }
   }
 }
 
@@ -211,6 +312,10 @@ pub enum Body {
   /// it. A copy-up makes it a plain [`Body::Symlink`]. Before 2026-10-08 a base symlink was a plain symlink, so a
   /// landing planned every one of them as a change and a fresh listing dropped every symlink the volume created.
   BaseLink(Box<str>),
+  /// A device node's number (A-294): the whole of what a device node holds beside its attributes. Eight bytes inside
+  /// a body that is already larger, so no inode should grow (`cargo run -p slates-vfs --example tree_heap` prints
+  /// `Inode`'s size, 168 bytes before this variant).
+  Device(DeviceNumber),
 }
 
 /// An inode's extended attributes (§4.5): each name and the attribute inode that holds its value,
@@ -376,7 +481,9 @@ impl WindowsAttributes {
     match kind {
       Kind::Dir => Self::KEPT,
       Kind::Symlink => (Self::KEPT & !Self::READONLY) | Self::LINK_DIRECTORY,
-      Kind::File | Kind::Fifo | Kind::Socket => Self::KEPT & !Self::READONLY,
+      Kind::File | Kind::Fifo | Kind::Socket | Kind::BlockDevice | Kind::CharDevice => {
+        Self::KEPT & !Self::READONLY
+      }
     }
   }
 
@@ -468,6 +575,14 @@ impl Home {
 }
 
 impl Inode {
+  /// A device node's number (A-294); `None` for every other kind.
+  pub fn device(&self) -> Option<DeviceNumber> {
+    match self.body {
+      Body::Device(number) => Some(number),
+      _ => None,
+    }
+  }
+
   /// For an attribute inode, the inode whose attribute it holds; `None` for a namespace inode.
   pub fn attribute_of(&self) -> Option<InodeNo> {
     self.attribute_owner.map(|owner| InodeNo(owner.get()))

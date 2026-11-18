@@ -361,6 +361,7 @@ fn an_init_through_a_dax_offering_transport_keeps_the_dax_flags_and_names_the_al
     &body,
     slates_bridge_core::CacheCoherence::Revalidated,
     offer,
+    slates_bridge_core::AttributeNamespaces::Guest,
   )
   .unwrap()
   .to_bytes();
@@ -379,6 +380,7 @@ fn an_init_through_a_dax_offering_transport_keeps_the_dax_flags_and_names_the_al
     &body,
     slates_bridge_core::CacheCoherence::Revalidated,
     offer,
+    slates_bridge_core::AttributeNamespaces::Guest,
   )
   .unwrap()
   .to_bytes();
@@ -618,6 +620,8 @@ fn entry_out_is_written_at_the_headers_offsets() {
       nlink: 2,
       uid: 501,
       gid: 20,
+      // A device's number in the kernel's encoding (A-294): 8:1.
+      rdev: 0x0801,
       blksize: 4096,
       dax: false,
     },
@@ -676,7 +680,7 @@ fn assert_fuse_attr_at(b: &[u8], at: usize) {
   );
   assert_eq!(
     [u32_at(b, at + 76), u32_at(b, at + 80), u32_at(b, at + 84)],
-    [0, 4096, 0],
+    [0x0801, 4096, 0],
     "rdev, blksize, flags"
   );
 }

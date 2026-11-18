@@ -416,7 +416,20 @@ impl ShardWatch {
     // rise; the state says so instead. A rise says it waited between two looks, seen in neither.
     let waiting = look.run.is_some_and(|run| run.state == RunState::Runnable)
       || matches!((self.waited_ns, waited_ns), (Some(before), Some(now)) if now > before);
-    let next = self.after_still_look(&look, progress, rose, rose || waiting);
+    // A look a window or more after the watchdog's last one saw nothing in between: the watchdog's own thread was kept off
+    // its CPU, as a process frozen whole or paging is, and whether the shard waited for a CPU in that gap was never asked.
+    // Its stillness there is the process's, so the shard's measures start again at this look, its still time and its time
+    // without CPU alike, and a wedge is judged only over a window the watchdog watched (A-308). Before, a fleet test binary
+    // was ended with exit 4 on a wedge verdict that came 146 s past its window, when the whole process had gone
+    // unscheduled at 0.2 to 1 GB free (g231, load 62 to 131). A stuck shard is still judged a window after the watchdog's
+    // looks come back.
+    let unwatched = look.now_ns.saturating_sub(self.looked_ns) >= window_ns;
+    let next = self.after_still_look(
+      &look,
+      progress,
+      rose || unwatched,
+      rose || waiting || unwatched,
+    );
     let still_for = look.now_ns.saturating_sub(next.moved_ns);
     if still_for >= window_ns {
       return (Verdict::Wedged { for_ns: still_for }, next);
@@ -619,8 +632,12 @@ fn verdict_lateness_ns(now_ns: u64, still_after_ns: u64) -> Option<u64> {
 ///
 /// The verdict is logged first, but the end never waits on the log for longer than one beat: a shard can be wedged in a
 /// write to a standard error nobody drains, holding the lock every log line takes, and a watchdog that waited on that
-/// lock would never end anything. So the line is written by a thread of its own, which the exit ends if it is still
-/// blocked; the exit is that thread's owner.
+/// lock would never end anything. So the line is written by a thread of its own. The end joins it once it says the line
+/// is written, which it does as its last act, so the join returns at once; a writer still blocked after a beat cannot be
+/// joined, and the exit ends it, so the exit is its owner then. Joined, a written line leaves no thread that finished
+/// unjoined: ThreadSanitizer reported that one as a leak at the exit, after its own one-second exit sleep, and turned
+/// the exit code into its own 66 (diag-g218-tsan-2, run 44217144677: exit 66 seen 27.4 s after the hold, where the
+/// verdict came at 1.09 s).
 fn end_process(cause: Cause, late_ns: u64, verdict_late_ns: Option<u64>) -> ! {
   let line = match cause {
     Cause::Stuck { shard, verdict } => format!(
@@ -648,8 +665,13 @@ fn end_process(cause: Cause, late_ns: u64, verdict_late_ns: Option<u64>) -> ! {
       slates_machine::log_line!("{line}");
       let _ = written.send(());
     });
-  if writer.is_ok() {
-    let _ = logged.recv_timeout(std::time::Duration::from_nanos(HEARTBEAT_NS));
+  if let Ok(writer) = writer
+    && logged
+      .recv_timeout(std::time::Duration::from_nanos(HEARTBEAT_NS))
+      .is_ok()
+  {
+    // The line is written and the writer's last act is done; its end is all that is left to wait for.
+    let _ = writer.join();
   }
   std::process::exit(i32::from(FAILED_EXIT_CODE))
 }
@@ -898,6 +920,43 @@ mod tests {
     }
     let (verdict, _) = watch.judge(look(2, false, Some((10, 10)), 11 * TURN), WINDOW);
     assert_eq!(verdict, Verdict::Alive);
+  }
+
+  /// A-308, §4.14. Do: watch a shard that stops stepping and runs no CPU, blocked at every look, with a gap of a window
+  /// and a half in the watchdog's own looks (its thread kept off its CPU, as a process frozen whole or paging is). Expect:
+  /// no verdict at the look after the gap, since nothing watched the shard across it, and wedged a window of looks
+  /// later, so a stuck shard is still judged. Before, the look after the gap judged it wedged for the gap's length.
+  #[test]
+  fn a_gap_in_the_watchdogs_own_looks_is_not_counted_as_a_wedge() {
+    let (_, mut watch) = ShardWatch::default().judge(look(5, false, Some((10, 10)), TURN), WINDOW);
+    let still = |now_ns: u64| Look {
+      run: blocked(None),
+      ..look(5, false, Some((10, 10)), now_ns)
+    };
+    let (verdict, next) = watch.judge(still(2 * TURN), WINDOW);
+    watch = next;
+    assert_eq!(verdict, Verdict::Alive);
+    let after_gap = 2 * TURN + WINDOW + WINDOW / 2;
+    let (verdict, next) = watch.judge(still(after_gap), WINDOW);
+    watch = next;
+    assert_eq!(
+      verdict,
+      Verdict::Alive,
+      "the look after the watchdog's own gap judges nothing of the gap"
+    );
+    let mut first_wedged = None;
+    for turn in 1..=20 {
+      let (verdict, next) = watch.judge(still(after_gap + turn * TURN), WINDOW);
+      watch = next;
+      if matches!(verdict, Verdict::Wedged { .. }) && first_wedged.is_none() {
+        first_wedged = Some(turn);
+      }
+    }
+    assert_eq!(
+      first_wedged,
+      Some(10),
+      "wedged a whole watched window after the gap, not before"
+    );
   }
 
   /// A-228, §4.14. Do: watch a shard whose thread runs on the CPU without completing a step (a task that never
