@@ -10363,7 +10363,7 @@ fn a_shards_seals_are_walked_in_turns_and_every_one_places() {
   );
 }
 
-/// Format: the owner's count of seals whose envelope was refused though the node seals (`fleet::envelope_of`).
+/// Format: the owner's count of seals whose envelope was refused though the node seals (`fleet::wrap_slice`).
 const SEAL_ENVELOPE_REFUSED: &str = "fleet.seal.envelope_refused";
 /// Shape: the refused envelopes the test waits for before it lets the seal through: two, so the seal was started
 /// again after its first refusal.
@@ -10477,7 +10477,87 @@ fn a_seal_whose_envelope_was_refused_is_started_again_and_places() {
     "the seal was started again after its envelope was refused ({refused} refusals counted)"
   );
   assert!(destroyed, "the altered naming record was destroyed");
-  assert!(placed, "the snapshot placed once its envelope was no longer refused");
+  assert!(
+    placed,
+    "the snapshot placed once its envelope was no longer refused"
+  );
+}
+
+/// Shape: the distinct files of the wrapped volume, each its own chunk, so its envelope seals that many chunks.
+const WRAPPED_CHUNKS: usize = 24;
+/// Format: the owner's count of the owner-shard turns its envelope wraps took (`fleet::wrap_slice`).
+const SEAL_WRAP_SLICES: &str = "fleet.seal.wrap_slices";
+
+/// A-323, §4.10 "Content replication", CLAUDE.md "Bounded work everywhere": a seal's envelope is wrapped in turns of the
+/// shard's step quantum, a chunk at least, never the whole archive in one turn. Do: three nodes at `f = 1`; on a, one
+/// volume of 24 files of distinct bytes (24 distinct chunks), detached; cut the owner's turns to one unit
+/// (`Daemon::inject_seal_walk_quantum(Some(0))`), snapshot the volume and wait for it to place; read the owner shard's
+/// longest step. Expect the snapshot placed, at least 24 turns of the wrap (a chunk a turn), and the owner shard's
+/// longest step under the watchdog's window (`LIVENESS_BUDGET_NS`). Before, the whole archive was wrapped in the turn its
+/// walk ended: one turn whatever the volume, 98 ms for 64 MiB, so at about a GiB the turn ran past the window, and the
+/// watchdog ended the owner at every seal of that volume.
+#[test]
+fn a_seals_envelope_is_wrapped_in_turns_and_places() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, _hosts) = formed_mesh(&["a", "b", "c"]);
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id } = client.call(&scratch("wrapped")) else {
+    panic!("the volume was created");
+  };
+  let attachment = write_attachment(&mut client, id);
+  let written: Vec<ReplyBody> = (0..WRAPPED_CHUNKS)
+    .map(|index| {
+      client.call(&RequestBody::FsWrite {
+        volume: id,
+        attachment,
+        path: format!("/wrapped-{index}"),
+        bytes: vec![u8::try_from(index).unwrap(); WALKED_FILE_BYTES],
+        mode: 0o644,
+      })
+    })
+    .collect();
+  let detached = client.call(&RequestBody::Detach { attachment });
+  daemons[0].inject_seal_walk_quantum(Some(0)).unwrap();
+  let before = refusal_count(&daemons[0], SEAL_WRAP_SLICES).unwrap();
+  let snapshot = match client.call(&RequestBody::Snapshot { volume: id }) {
+    ReplyBody::Snapshotted { id, .. } => Some(id),
+    _ => None,
+  };
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let placed =
+    snapshot.is_some_and(|snapshot| poll_snapshot_placed(&observed, &mut client, id, snapshot));
+  let turns = refusal_count(&daemons[0], SEAL_WRAP_SLICES)
+    .unwrap()
+    .saturating_sub(before);
+  let longest_step_ns = control_longest_poll_ns(&daemons[0]);
+  daemons[0].inject_seal_walk_quantum(None).unwrap();
+  drop(observed);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "wrap in turns: placed {placed}, {turns} wrap turns for {WRAPPED_CHUNKS} chunks, the owner shard's longest step \
+     {longest_step_ns} ns"
+  );
+  assert!(
+    written
+      .iter()
+      .all(|reply| matches!(reply, ReplyBody::FsDone { .. })),
+    "every file was written: {written:?}"
+  );
+  assert!(
+    matches!(detached, ReplyBody::Detached),
+    "the attachment was let go: {detached:?}"
+  );
+  assert!(placed, "the snapshot placed");
+  assert!(
+    turns >= u64::try_from(WRAPPED_CHUNKS).unwrap(),
+    "the envelope was wrapped a chunk a turn: {turns} turns for {WRAPPED_CHUNKS} chunks"
+  );
+  assert!(
+    longest_step_ns < LIVENESS_BUDGET_NS,
+    "the owner shard's longest step {longest_step_ns} ns stayed under the watchdog's window {LIVENESS_BUDGET_NS} ns"
+  );
 }
 
 /// One volume of `a_shards_live_volumes_are_visited_by_the_period_in_slices_and_none_is_starved`, the `index`th. Do:
@@ -12104,6 +12184,184 @@ fn loss_of(
   }
 }
 
+/// One write of `path`'s own name as its bytes through `attachment` of `volume`: the reply.
+fn write_own_name(client: &mut Client, volume: VolumeId, attachment: u64, path: &str) -> ReplyBody {
+  client.call(&RequestBody::FsWrite {
+    volume,
+    attachment,
+    path: path.to_owned(),
+    bytes: path.as_bytes().to_vec(),
+    mode: 0o644,
+  })
+}
+
+/// A snapshot of `volume` through `client`: its id, or none when it was refused.
+fn snapshot_taken(client: &mut Client, volume: VolumeId) -> Option<SnapshotId> {
+  match client.call(&RequestBody::Snapshot { volume }) {
+    ReplyBody::Snapshotted { id, .. } => Some(id),
+    _ => None,
+  }
+}
+
+/// A read of `path` at `volume`'s head through `client`: the reply.
+fn read_at_head(client: &mut Client, volume: VolumeId, path: &str) -> ReplyBody {
+  client.call(&RequestBody::Read {
+    volume,
+    path: path.to_owned(),
+    at: ReadAt::Head,
+  })
+}
+
+/// What the loss-window test saw on the owner before it died ([`loss_window_before_the_loss`]).
+struct BeforeTheLoss {
+  /// The three writes' replies: the sealed file, the file under the unplaced seal, the unsealed file.
+  written: [ReplyBody; 3],
+  /// Whether the first seal placed, and both survivors held its head.
+  placed: bool,
+  survivors_hold: bool,
+  /// Both survivors' refusal of the owner's records, installed.
+  refusing: Result<(), ObserveError>,
+  /// The second seal, taken on the owner.
+  second: Option<SnapshotId>,
+  /// The owner's loss report (and its host epoch) at the placed seal, and after the later writes.
+  sealed: Option<(slates_ipc::protocol::LossReport, u64)>,
+  unsealed: Option<(slates_ipc::protocol::LossReport, u64)>,
+}
+
+/// The loss-window test's life of the volume on its owner `daemons[0]`: one file sealed and placed with both survivors
+/// holding its head; then both survivors refusing the owner's records, a second file sealed (never placed) and a third
+/// written and never sealed; the owner's loss report read at the placed seal and after the later writes.
+fn loss_window_before_the_loss(
+  daemons: &[Daemon],
+  hosts: &[HostId],
+  client: &mut Client,
+  id: VolumeId,
+) -> BeforeTheLoss {
+  let attachment = write_attachment(client, id);
+  let object = ObjectId(id.bytes);
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let sealed_written = write_own_name(client, id, attachment, "/sealed");
+  let first = snapshot_taken(client, id).expect("the volume was sealed");
+  let placed = poll_snapshot_placed(&observed, client, id, first);
+  let survivors_hold = poll_all_hold(&[&daemons[1], &daemons[2]], object);
+  let sealed = loss_of(client, id);
+  // The next head reaches neither b nor c, so the second seal is taken on a but never placed.
+  let refusing = daemons[1]
+    .inject_record_refusal(&[hosts[0]])
+    .and_then(|()| daemons[2].inject_record_refusal(&[hosts[0]]));
+  let unplaced_written = write_own_name(client, id, attachment, "/unplaced");
+  let second = snapshot_taken(client, id);
+  let unsealed_written = write_own_name(client, id, attachment, "/unsealed");
+  let unsealed = loss_of(client, id);
+  BeforeTheLoss {
+    written: [sealed_written, unplaced_written, unsealed_written],
+    placed,
+    survivors_hold,
+    refusing,
+    second,
+    sealed,
+    unsealed,
+  }
+}
+
+/// What the loss-window test saw on the successor after the owner died ([`loss_window_after_the_loss`]).
+struct AfterTheLoss {
+  /// Whether the successor answered `status` for the volume.
+  served: bool,
+  /// The successor's loss report, and its host epoch.
+  taken: Option<(slates_ipc::protocol::LossReport, u64)>,
+  /// The three files read at the successor's head, in the order they were written.
+  read: [ReplyBody; 3],
+}
+
+/// The loss-window test after the owner died: the survivor `object` ranks first serves the volume, reports its loss
+/// window and reads each file back (the survivors are `daemons`, the owner's removed).
+fn loss_window_after_the_loss(daemons: &[Daemon], hosts: &[HostId], id: VolumeId) -> AfterTheLoss {
+  let object = ObjectId(id.bytes);
+  let successor = rendezvous_first(&[hosts[1], hosts[2]], object).expect("a survivor takes over");
+  let successor_index = usize::from(successor != hosts[1]);
+  let successor_instance = daemons[successor_index].instance().to_owned();
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let served = poll_status_answers(&survivors, &successor_instance, id);
+  let mut reader = Client::connect(&successor_instance);
+  let taken = loss_of(&mut reader, id);
+  let read = ["/sealed", "/unplaced", "/unsealed"].map(|path| read_at_head(&mut reader, id, path));
+  AfterTheLoss {
+    served,
+    taken,
+    read,
+  }
+}
+
+/// The loss-window test's owner side: every write answered, the first seal placed and held, the refusals installed,
+/// the second seal taken; nothing at risk at the placed seal and a window above zero after the later writes, both naming
+/// the placed seal's head sequence. Returns that sequence and the owner's host epoch.
+fn assert_owner_loss_reports(before: &BeforeTheLoss) -> (u64, u64) {
+  assert!(
+    before
+      .written
+      .iter()
+      .all(|written| matches!(written, ReplyBody::FsDone { .. })),
+    "every write was answered: {:?}",
+    before.written
+  );
+  assert!(
+    before.placed && before.survivors_hold,
+    "the first seal placed and both survivors held its head"
+  );
+  assert!(
+    before.refusing.is_ok(),
+    "both survivors refuse a's records: {:?}",
+    before.refusing
+  );
+  assert!(before.second.is_some(), "the second seal was taken on a");
+  let (sealed, owner_epoch) = before
+    .sealed
+    .clone()
+    .expect("a reported its loss window at its placed seal");
+  let at_seal = sealed
+    .placed_sequence
+    .expect("a named its placed seal's head sequence");
+  assert!(
+    sealed.at_risk_ns == Some(0) && !sealed.live_shipped,
+    "nothing is at risk while the volume is exactly its placed seal: {sealed:?}"
+  );
+  let (unsealed, _) = before
+    .unsealed
+    .clone()
+    .expect("a reported its loss window after the later writes");
+  assert!(
+    unsealed.at_risk_ns.is_some_and(|ns| ns > 0) && unsealed.placed_sequence == Some(at_seal),
+    "the writes after the placed seal are at risk, and the unplaced seal moves nothing: {unsealed:?}"
+  );
+  (at_seal, owner_epoch)
+}
+
+/// The loss-window test's successor side: it serves the volume, reports the takeover served from the seal the owner
+/// named (not a live log) under a later epoch, and holds the sealed file while both later writes are gone.
+fn assert_successor_loss_report(after: &AfterTheLoss, at_seal: u64, owner_epoch: u64) {
+  assert!(after.served, "the successor serves the volume");
+  let taken = after
+    .taken
+    .as_ref()
+    .and_then(|(loss, _)| loss.taken_over.clone())
+    .expect("the successor reports its takeover");
+  assert!(
+    !taken.from_live_log && taken.head_sequence == at_seal && taken.epoch > owner_epoch,
+    "served from the seal a named, under a later epoch: {taken:?}, a's placed seal {at_seal} under epoch {owner_epoch}"
+  );
+  let [sealed, unplaced, unsealed] = &after.read;
+  assert!(
+    matches!(sealed, ReplyBody::ReadBytes { bytes } if bytes == b"/sealed"),
+    "the sealed file survived: {sealed:?}"
+  );
+  assert!(
+    !matches!(unplaced, ReplyBody::ReadBytes { .. })
+      && !matches!(unsealed, ReplyBody::ReadBytes { .. }),
+    "the writes after the placed seal were the window, and are gone: {unplaced:?} {unsealed:?}"
+  );
+}
+
 /// AC-8.3, §4.10 "Auto-seal": the loss window reported after an owner loss equals the edits after the last placed seal,
 /// measured against the owner's own report before the loss. Do: three nodes at `f = 1`; on a, a volume with one file,
 /// sealed and placed; then both other nodes refuse a's records, so the next seal (a second file) is taken but never
@@ -12121,112 +12379,19 @@ fn a_successor_reports_the_loss_window_its_takeover_left() {
     panic!("the volume was created");
   };
   share_with_fleet(&mut client, id, &daemons);
-  let attachment = write_attachment(&mut client, id);
-  let write = |client: &mut Client, path: &str| {
-    client.call(&RequestBody::FsWrite {
-      volume: id,
-      attachment,
-      path: path.to_owned(),
-      bytes: path.as_bytes().to_vec(),
-      mode: 0o644,
-    })
-  };
-  let snapshot = |client: &mut Client| match client.call(&RequestBody::Snapshot { volume: id }) {
-    ReplyBody::Snapshotted { id, .. } => Some(id),
-    _ => None,
-  };
-  let object = ObjectId(id.bytes);
-  let observed: Vec<&Daemon> = daemons.iter().collect();
-  let sealed_written = write(&mut client, "/sealed");
-  let first = snapshot(&mut client).expect("the volume was sealed");
-  let placed = poll_snapshot_placed(&observed, &mut client, id, first);
-  let survivors_hold = poll_all_hold(&[&daemons[1], &daemons[2]], object);
-  let sealed_loss = loss_of(&mut client, id);
-  // The next head reaches neither b nor c, so the second seal is taken on a but never placed.
-  let refusing = daemons[1]
-    .inject_record_refusal(&[hosts[0]])
-    .and_then(|()| daemons[2].inject_record_refusal(&[hosts[0]]));
-  let unplaced_written = write(&mut client, "/unplaced");
-  let second = snapshot(&mut client);
-  let unsealed_written = write(&mut client, "/unsealed");
-  let unsealed_loss = loss_of(&mut client, id);
-  drop(observed);
+  let before = loss_window_before_the_loss(&daemons, &hosts, &mut client, id);
   let owner = daemons.remove(0);
   owner.stop();
-  let successor = rendezvous_first(&[hosts[1], hosts[2]], object).expect("a survivor takes over");
-  let successor_index = usize::from(successor != hosts[1]);
-  let successor_instance = daemons[successor_index].instance().to_owned();
-  let survivors: Vec<&Daemon> = daemons.iter().collect();
-  let served = poll_status_answers(&survivors, &successor_instance, id);
-  drop(survivors);
-  let mut reader = Client::connect(&successor_instance);
-  let taken_loss = loss_of(&mut reader, id);
-  let read = |reader: &mut Client, path: &str| {
-    reader.call(&RequestBody::Read {
-      volume: id,
-      path: path.to_owned(),
-      at: ReadAt::Head,
-    })
-  };
-  let sealed_read = read(&mut reader, "/sealed");
-  let unplaced_read = read(&mut reader, "/unplaced");
-  let unsealed_read = read(&mut reader, "/unsealed");
-  drop(reader);
+  let after = loss_window_after_the_loss(&daemons, &hosts, id);
   for daemon in daemons {
     daemon.stop();
   }
   eprintln!(
-    "loss window: sealed {sealed_loss:?}, unsealed {unsealed_loss:?}, after the takeover {taken_loss:?}; \
-     reads {sealed_read:?} {unplaced_read:?} {unsealed_read:?}"
+    "loss window: sealed {:?}, unsealed {:?}, after the takeover {:?}; reads {:?}",
+    before.sealed, before.unsealed, after.taken, after.read
   );
-  assert!(
-    [&sealed_written, &unplaced_written, &unsealed_written]
-      .iter()
-      .all(|written| matches!(written, ReplyBody::FsDone { .. })),
-    "every write was answered: {sealed_written:?} {unplaced_written:?} {unsealed_written:?}"
-  );
-  assert!(
-    placed && survivors_hold,
-    "the first seal placed and both survivors held its head"
-  );
-  assert!(
-    refusing.is_ok(),
-    "both survivors refuse a's records: {refusing:?}"
-  );
-  assert!(second.is_some(), "the second seal was taken on a");
-  assert!(served, "the successor serves the volume");
-  let (sealed_loss, owner_epoch) =
-    sealed_loss.expect("a reported its loss window at its placed seal");
-  let at_seal = sealed_loss
-    .placed_sequence
-    .expect("a named its placed seal's head sequence");
-  assert!(
-    sealed_loss.at_risk_ns == Some(0) && !sealed_loss.live_shipped,
-    "nothing is at risk while the volume is exactly its placed seal: {sealed_loss:?}"
-  );
-  let (unsealed_loss, _) =
-    unsealed_loss.expect("a reported its loss window after the later writes");
-  assert!(
-    unsealed_loss.at_risk_ns.is_some_and(|ns| ns > 0)
-      && unsealed_loss.placed_sequence == Some(at_seal),
-    "the writes after the placed seal are at risk, and the unplaced seal moves nothing: {unsealed_loss:?}"
-  );
-  let taken = taken_loss
-    .and_then(|(loss, _)| loss.taken_over)
-    .expect("the successor reports its takeover");
-  assert!(
-    !taken.from_live_log && taken.head_sequence == at_seal && taken.epoch > owner_epoch,
-    "served from the seal a named, under a later epoch: {taken:?}, a's placed seal {at_seal} under epoch {owner_epoch}"
-  );
-  assert!(
-    matches!(&sealed_read, ReplyBody::ReadBytes { bytes } if bytes == b"/sealed"),
-    "the sealed file survived: {sealed_read:?}"
-  );
-  assert!(
-    !matches!(unplaced_read, ReplyBody::ReadBytes { .. })
-      && !matches!(unsealed_read, ReplyBody::ReadBytes { .. }),
-    "the writes after the placed seal were the window, and are gone: {unplaced_read:?} {unsealed_read:?}"
-  );
+  let (at_seal, owner_epoch) = assert_owner_loss_reports(&before);
+  assert_successor_loss_report(&after, at_seal, owner_epoch);
 }
 
 /// AC (§4.8 "Promotion and takeover" — the successor "adopts the newest records, and serves"; §4.10

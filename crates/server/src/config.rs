@@ -1166,6 +1166,14 @@ fn archive_slice_bytes(blake3_bytes_per_second: u64, quantum_ns: u64) -> u64 {
     / PERMILLE
 }
 
+/// Derived: how long one turn may spend wrapping a seal's envelope (A-323) within a turn of `quantum_ns`: the archive
+/// walk's share of a step, `quantum_ns × ARCHIVE_SLICE_PERMILLE / 1000`. The wrap seals a chunk at least whatever it is,
+/// and has no measured rate of its own in the boot profile (it costs a seal and three BLAKE3 passes a byte, where the
+/// walk's slice is sized by one), so it is held to the shard's clock rather than to a byte count.
+pub fn wrap_slice_ns(quantum_ns: u64) -> u64 {
+  quantum_ns.saturating_mul(ARCHIVE_SLICE_PERMILLE) / PERMILLE
+}
+
 /// The direct maps' copies one shard may hold at once, handed or being filled (§4.6, A-171): the direct maps' share of
 /// the process's descriptor limit and of its mapping limit, each over what one copy holds, the smaller of the two, over
 /// the shards. The backings' slab capacity (`max_chunks` a shard) bounds it where no OS limit binds lower. Zero where

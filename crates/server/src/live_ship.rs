@@ -52,7 +52,7 @@ const KIND_DELTA: u8 = 0;
 /// Format: the second byte: the body is sealed under the volume's lineage key (A-92).
 const BODY_SEALED: u8 = 1;
 /// Format: the second byte: the body is in the clear, where this node cannot seal at all (no sealing root), as a
-/// seal's archive is placed then (`fleet::envelope_of`).
+/// seal's archive is placed then (`fleet::advance_seal`).
 const BODY_CLEAR: u8 = 0;
 
 /// Counter: a live volume's publication that could not be shipped as an entry, because its content could not be read,
