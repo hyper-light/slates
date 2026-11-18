@@ -1,0 +1,47 @@
+name: diag-b13-bisect
+on:
+  push:
+    branches: ['diag-b13-bisect-*']
+jobs:
+  forward-windows:
+    name: the two forward tests on windows-latest, five runs each
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: build
+        run: cargo test -p slates-server --test fleet --no-run
+      - name: runs
+        run: |
+          nproc || true
+          for t in a_starved_origin_keeps_its_forward_to_a_live_owner an_unanswered_forward_is_sent_again_within_the_takeover_bound; do
+            pass=0; fail=0
+            for run in 1 2 3 4 5; do
+              if out=$(cargo test -p slates-server --test fleet -- --exact $t --test-threads=1 --nocapture 2>&1); then pass=$((pass+1)); else fail=$((fail+1)); echo "### $t run $run failed"; echo "$out" | grep -E 'panicked|assert|left|right|forward|gave up|resent' | tail -25; fi
+            done
+            echo "## $t: $pass passed, $fail failed"
+          done
+  reseal-linux:
+    name: the takeover reseal test on ubuntu-latest, twenty runs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: build
+        run: cargo test -p slates-server --test fleet --no-run
+      - name: runs
+        run: |
+          t=a_takeover_successor_serves_the_dead_owners_content_over_nfs; pass=0; fail=0
+          for run in $(seq 1 20); do
+            if out=$(cargo test -p slates-server --test fleet -- --exact $t --nocapture 2>&1); then pass=$((pass+1)); else fail=$((fail+1)); echo "### run $run failed"; echo "$out" | grep -E 'panicked|a seal taken|head|epoch|heal|republish' | tail -30; fi
+          done
+          echo "## $t: $pass passed, $fail failed"
