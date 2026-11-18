@@ -141,6 +141,8 @@ pub(crate) struct WriteLog {
   used: usize,
   stamp: u64,
   /// Whether an acknowledged write has gone unlogged since the last clear: then only a publication makes it survive.
+  /// Read by FUSE's flush rule alone ([`WriteLog::holds_every_write`]; Linux): a Shards stream's flush always publishes.
+  #[cfg(target_os = "linux")]
   overflowed: bool,
   /// How far into the record area pages may be resident since they were last given back ([`WriteLog::purge`]): the
   /// furthest any record reached, or the whole area for a log opened over memory a predecessor may have written.
@@ -223,10 +225,14 @@ impl WriteLog {
       written: capacity,
       used: 0,
       stamp: image_generation,
+      #[cfg(target_os = "linux")]
       overflowed: false,
     };
     let recovered = log.read(object, image_generation);
-    log.overflowed = recovered.everything_lost;
+    #[cfg(target_os = "linux")]
+    {
+      log.overflowed = recovered.everything_lost;
+    }
     if recovered.records.is_empty() && !recovered.everything_lost {
       let _ = log.clear(object, image_generation);
     }
@@ -380,12 +386,16 @@ impl WriteLog {
   /// Records that an acknowledged write could not be logged, so the next daemon reports every file as having lost
   /// writes rather than replaying an incomplete log.
   pub(crate) fn overflow(&mut self, object: &mut SparseObject) -> Result<(), Unwritten> {
-    self.overflowed = true;
+    #[cfg(target_os = "linux")]
+    {
+      self.overflowed = true;
+    }
     self.store(object, AT_OVERFLOW, &1u64.to_le_bytes())
   }
 
   /// Whether every write acknowledged since the last publication is in the log, so a successor replays them all: then
-  /// a `close`'s `flush` owes no publication of its own (A-63).
+  /// a FUSE `close`'s `flush` owes no publication of its own (A-63; Linux, where FUSE is).
+  #[cfg(target_os = "linux")]
   pub(crate) fn holds_every_write(&self) -> bool {
     !self.overflowed
   }
@@ -400,7 +410,10 @@ impl WriteLog {
     let logged = self.used;
     self.used = 0;
     self.stamp = stamp;
-    self.overflowed = false;
+    #[cfg(target_os = "linux")]
+    {
+      self.overflowed = false;
+    }
     // The header first (a crash mid-scrub then replays nothing), but the scrub runs whatever the header's writes
     // answered: the records are plaintext, and a refused header write that returned early left them in place while
     // this log already counted itself empty, so nothing would scrub them (2026-10-07). The first refusal is returned.

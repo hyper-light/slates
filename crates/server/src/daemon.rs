@@ -879,13 +879,12 @@ impl Daemon {
     let shards: Vec<ShardId> = runtime.shard_ids().to_vec();
     // The lock ledger's entry for this daemon starts empty, before any shard recovers and reserves again.
     crate::lock_ledger::reset(shards.first().map_or(0, |shard| shard.0));
-    // What the anchor held across the restart (A-61, A-113): the FUSE devices, each moved to the shard that owns its
-    // mount, and the NFS loopback connections, served again on the listener's shard below.
+    // What the anchor held across the restart (A-61, A-113): the devices (FUSE devices on Linux, Shards streams' resync
+    // ends on Linux and macOS, A-316, A-339), each moved to the shard that owns its attachment, and the NFS loopback
+    // connections, served again on the listener's shard below.
     let handed = crate::anchor_hold::adopt(config.held_device_bound());
-    #[cfg(target_os = "linux")]
-    let mut inherited_fuse = crate::fuse_hold::split(handed.devices, shards.len()).into_iter();
-    #[cfg(all(unix, not(target_os = "linux")))]
-    release_devices_without_fuse(handed.devices);
+    #[cfg(unix)]
+    let mut inherited_devices = crate::fuse_hold::split(handed.devices, shards.len()).into_iter();
     // The writable copies (A-197), each moved to the shard that holds its map: Linux alone sends the anchor one.
     #[cfg(target_os = "linux")]
     let mut inherited_copies = crate::held_copy::split(handed.copies, shards.len()).into_iter();
@@ -906,10 +905,12 @@ impl Daemon {
       let partition = u16::try_from(index).unwrap_or(u16::MAX);
       let all: Vec<u16> = shards.iter().map(|s| s.0).collect();
       let retained = retained.clone();
-      #[cfg(target_os = "linux")]
-      let held = inherited_fuse.next().unwrap_or_default();
-      #[cfg(target_os = "linux")]
-      let copies = inherited_copies.next().unwrap_or_default();
+      #[cfg(unix)]
+      let holds = ShardHolds {
+        devices: inherited_devices.next().unwrap_or_default(),
+        #[cfg(target_os = "linux")]
+        copies: inherited_copies.next().unwrap_or_default(),
+      };
       #[cfg(windows)]
       let windows_holds = (
         inherited_winfsp.next().unwrap_or_default(),
@@ -924,7 +925,7 @@ impl Daemon {
       // that could wait on it (a kept mount with no device answers `ENOTCONN`), so it counts as learned at once. A
       // macOS shard learns its kept NFS mounts from its catalog, which it reads only as it starts.
       #[cfg(target_os = "linux")]
-      let learning = (!held.is_empty()).then(|| gate.learning());
+      let learning = (!holds.devices.is_empty()).then(|| gate.learning());
       #[cfg(target_os = "macos")]
       let learning = Some(gate.learning());
       #[cfg(windows)]
@@ -948,8 +949,8 @@ impl Daemon {
           (partition, sealing, learning),
           all,
           retained,
-          #[cfg(target_os = "linux")]
-          (held, copies),
+          #[cfg(unix)]
+          holds,
           #[cfg(windows)]
           windows_holds,
         ));
@@ -2687,41 +2688,58 @@ impl Daemon {
   ) -> Result<Vec<(u64, [u8; 32])>, ObserveError> {
     let object = slates_db::register::ObjectId(green.bytes);
     let volume = slates_db::catalog::VolumeId { bytes: green.bytes };
-    self.observe(self.shard_of_object(object), move |s| {
-      // The versions up to the green's checkpoint (W3) are named by the identities it keeps with them; the chain
-      // holds the versions after it.
-      let partition = s.db.partition();
-      let (held, mut identities) =
-        partition
+    let (adopted_through, mut identities) =
+      self.observe(self.shard_of_object(object), move |s| {
+        // The versions up to the green's checkpoint (W3) are named by the identities it keeps with them; the chain
+        // holds the versions after the green's floor: its checkpoint, else its adoption (A-333), else 0.
+        let partition = s.db.partition();
+        let held = partition.green_floor(volume);
+        let mut identities: Vec<(u64, [u8; 32])> = partition
           .green_checkpoint(volume)
-          .map_or((0, Vec::new()), |(held, bytes)| {
-            let accepted = slates_merge::checkpoint::Checkpoint::decode(bytes)
+          .map(|(_, bytes)| {
+            slates_merge::checkpoint::Checkpoint::decode(bytes)
               .map(|checkpoint| checkpoint.accepted)
-              .unwrap_or_default();
-            (
-              held,
-              accepted
-                .into_iter()
-                .map(|(id, version)| (version, id))
-                .collect(),
-            )
-          });
-      identities.sort_unstable();
-      identities.extend(partition.green_chain(volume).iter().enumerate().filter_map(
-        |(index, bytes)| {
-          slates_merge::chain_entry::decode(bytes).ok().map(|entry| {
-            (
-              u64::try_from(index)
-                .unwrap_or(u64::MAX)
-                .saturating_add(held)
-                .saturating_add(1),
-              entry.increment.id,
-            )
+              .unwrap_or_default()
+              .into_iter()
+              .map(|(id, version)| (version, id))
+              .collect()
           })
-        },
-      ));
-      identities
-    })
+          .unwrap_or_default();
+        identities.sort_unstable();
+        identities.extend(partition.green_chain(volume).iter().enumerate().filter_map(
+          |(index, bytes)| {
+            slates_merge::chain_entry::decode(bytes).ok().map(|entry| {
+              (
+                u64::try_from(index)
+                  .unwrap_or(u64::MAX)
+                  .saturating_add(held)
+                  .saturating_add(1),
+                entry.increment.id,
+              )
+            })
+          },
+        ));
+        // A green its takeover adopted from this node's holder ledger, with no checkpoint past the adoption, names the
+        // versions up to it by the ledger's records, which the control shard holds.
+        let adopted = partition
+          .green_adoption(volume)
+          .filter(|_| partition.green_checkpoint(volume).is_none())
+          .map(|adoption| adoption.version);
+        (adopted, identities)
+      })?;
+    if let Some(through) = adopted_through {
+      let mut ledger = self.observe(self.shards.first().copied(), move |s| {
+        (1..=through)
+          .filter_map(|version| {
+            crate::merge_origin::ledger_value(s, object, version)
+              .map(|value| (version, value.increment))
+          })
+          .collect::<Vec<_>>()
+      })?;
+      ledger.append(&mut identities);
+      identities = ledger;
+    }
+    Ok(identities)
   }
 
   /// The bytes the snapshot of `green`'s partition encodes to now (§4.8): what every snapshot taken when its log
@@ -3249,6 +3267,16 @@ impl Daemon {
   ) -> Result<(), ObserveError> {
     self.observe(self.shards.first().copied(), move |s| {
       s.injected_forward_silence = volume;
+    })
+  }
+
+  /// Test support: while `withheld` is set, this node sends no confirmation of a takeover share it has finished
+  /// (counted `fleet.takeover.confirmation_withheld_by_fault`), as a confirmation late to commit leaves its share owed
+  /// while the other survivors confirm theirs, each confirmation a new configuration (A-353). Lifting it lets the next
+  /// period confirm. Delivered like [`Self::inject_takeover_silence`]; `Ok` once installed, else the typed refusal.
+  pub fn inject_confirmation_withheld(&self, withheld: bool) -> Result<(), ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      s.injected_confirmation_withheld = withheld;
     })
   }
 
@@ -3795,8 +3823,9 @@ fn image_range(
   }
 }
 
-/// This shard's content range for its recovery images (§4.8).
-#[cfg(not(target_os = "linux"))]
+/// This shard's content range for its recovery images (§4.8). Windows keeps no write log: neither a WinFsp mount nor a
+/// Shards stream there logs its writes yet (GAPS).
+#[cfg(windows)]
 fn content_slice(
   config: &DaemonConfig,
   partition: u16,
@@ -3805,11 +3834,11 @@ fn content_slice(
   image_range(config, partition, content)
 }
 
-/// This shard's content range for its recovery images (§4.8), and the FUSE write log at the slice's front with what
-/// the previous daemon left in it to replay (A-63, `crate::write_log`), opened against the generation of the
-/// committed image, before anything this daemon does can publish and clear it. No log and nothing to replay without
-/// a content object.
-#[cfg(target_os = "linux")]
+/// This shard's content range for its recovery images (§4.8), and the write log at the slice's front with what the
+/// previous daemon left in it to replay (A-63, `crate::write_log`: a FUSE mount's writes on Linux, a Shards stream's on
+/// Linux and macOS, A-316, A-339), opened against the generation of the committed image, before anything this daemon
+/// does can publish and clear it. No log and nothing to replay without a content object.
+#[cfg(unix)]
 fn content_slice(
   config: &DaemonConfig,
   partition: u16,
@@ -3872,6 +3901,18 @@ fn shard_arena(
   Ok((arena, slice))
 }
 
+/// What the anchor handed back for one shard's partition (Unix): its held devices, FUSE devices (Linux) and Shards
+/// streams' resync ends (A-61, A-316, A-339), and on Linux its held writable copies (A-197).
+#[cfg(unix)]
+#[derive(Debug, Default)]
+struct ShardHolds {
+  /// The held devices.
+  devices: Vec<crate::fuse_hold::HeldDevice>,
+  /// The held writable copies.
+  #[cfg(target_os = "linux")]
+  copies: Vec<crate::held_copy::InheritedCopy>,
+}
+
 /// A shard's start, run alone on its shard ([`futures::spawn_alone`]): its boot fault if the tests set one, then
 /// [`init_shard`], and the boot log's line of how long it took and in how many slices.
 async fn start_shard(
@@ -3881,10 +3922,7 @@ async fn start_shard(
   (partition, sealing, learning): (u16, crate::seal_keys::RootState, ShardLearning),
   all: Vec<u16>,
   retained: Option<crate::retention::Retained>,
-  #[cfg(target_os = "linux")] held: (
-    Vec<crate::fuse_hold::HeldDevice>,
-    Vec<crate::held_copy::InheritedCopy>,
-  ),
+  #[cfg(unix)] holds: ShardHolds,
   #[cfg(windows)] windows_holds: (
     Vec<crate::winfsp::InheritedMount>,
     Option<std::os::windows::io::OwnedHandle>,
@@ -3906,8 +3944,8 @@ async fn start_shard(
     (partition, sealing, learning),
     &all,
     retained,
-    #[cfg(target_os = "linux")]
-    held,
+    #[cfg(unix)]
+    holds,
     #[cfg(windows)]
     windows_holds,
   )
@@ -4034,10 +4072,7 @@ async fn init_shard(
   (partition, sealing, learning): (u16, crate::seal_keys::RootState, ShardLearning),
   config_shards: &[u16],
   retained: Option<crate::retention::Retained>,
-  #[cfg(target_os = "linux")] (inherited_fuse, inherited_copies): (
-    Vec<crate::fuse_hold::HeldDevice>,
-    Vec<crate::held_copy::InheritedCopy>,
-  ),
+  #[cfg(unix)] holds: ShardHolds,
   #[cfg(windows)] (inherited_winfsp, windows_channel): (
     Vec<crate::winfsp::InheritedMount>,
     Option<std::os::windows::io::OwnedHandle>,
@@ -4155,15 +4190,15 @@ async fn init_shard(
   let (root, node_regions, region_mirrors) = build_root_group(config, host);
   // The anchor-owned content object that survives a restart (§4.8), if the anchor provides one.
   // Shards share the one object, partitioned by index: this shard owns the slice `[start, end)`.
-  #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+  #[cfg_attr(windows, allow(unused_mut))]
   let mut content = match AnchorSegment::open_content(env) {
     Some(result) => Some(result?),
     None => None,
   };
-  #[cfg(target_os = "linux")]
+  #[cfg(unix)]
   let (content_range, write_log, recovered_writes) =
     content_slice(config, partition, content.as_mut());
-  #[cfg(not(target_os = "linux"))]
+  #[cfg(windows)]
   let content_range = content_slice(config, partition, content.as_ref());
   // The telemetry sink keeps the most recent spans up to one client ring's depth (§4.14): a shard
   // processes at most a ring of in-flight requests, so a ring's depth of recent spans covers the
@@ -4208,15 +4243,15 @@ async fn init_shard(
     checkpoint_buffer: Vec::new(),
     published_keys: std::collections::BTreeSet::new(),
     published_held: crate::content_holder::PublishedHeld::default(),
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     write_log,
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     writes_lost: recovered_writes.everything_lost,
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     replay: recovered_writes.records,
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     pending_replies: std::collections::BTreeMap::new(),
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     recovered_replies: std::collections::BTreeMap::new(),
     write_verifier: now.to_be_bytes(),
     nfs_v4: None,
@@ -4263,13 +4298,13 @@ async fn init_shard(
     #[cfg(windows)]
     adopt_winfsp: Vec::new(),
     stale_fuse_mounts: Vec::new(),
+    #[cfg(unix)]
+    inherited_fuse: holds.devices,
     #[cfg(target_os = "linux")]
-    inherited_fuse,
-    #[cfg(target_os = "linux")]
-    inherited_copies,
+    inherited_copies: holds.copies,
     #[cfg(target_os = "linux")]
     adopt_fuse: Vec::new(),
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     adopt_shards: Vec::new(),
     snapshot_views: std::collections::BTreeMap::new(),
     #[cfg(unix)]
@@ -4359,6 +4394,7 @@ async fn init_shard(
     injected_content_ack_delay_ns: None,
     injected_forward_silence: None,
     injected_takeover_silence: std::collections::BTreeSet::new(),
+    injected_confirmation_withheld: false,
     injected_deaf_session: None,
     injected_discovery_hold: None,
     dead_session_dropped_at: std::collections::BTreeMap::new(),
@@ -4471,8 +4507,9 @@ async fn init_shard(
   // predecessor counted and left for their users to unmount (AUD-29-64, A-102).
   #[cfg(target_os = "linux")]
   crate::fuse::adopt_held();
-  // The Shards streams whose resync ends the anchor held, served again on fresh streams (A-316).
-  #[cfg(target_os = "linux")]
+  // The Shards streams whose resync ends the anchor held, served again on fresh streams (A-316, A-339), and every held
+  // device no record claimed released.
+  #[cfg(unix)]
   crate::shards::adopt_held();
   #[cfg(windows)]
   crate::winfsp::adopt_held();
@@ -4703,8 +4740,8 @@ async fn seal_idle_content() {
   purge_if_idle().await;
 }
 
-/// The idle shard's emptied FUSE write log, its pages given back (`crate::write_log::WriteLog::purge`).
-#[cfg(target_os = "linux")]
+/// The idle shard's emptied write log, its pages given back (`crate::write_log::WriteLog::purge`).
+#[cfg(unix)]
 fn purge_write_log(s: &mut ShardState) -> (usize, bool) {
   let slice = give_back_slice(s);
   let started = slates_vfs::clock::Clock::monotonic_ns(&mut s.clock);
@@ -4716,8 +4753,8 @@ fn purge_write_log(s: &mut ShardState) -> (usize, bool) {
   (purged.bytes, purged.more)
 }
 
-/// No write log off Linux (A-63 logs the FUSE mount's writes).
-#[cfg(not(target_os = "linux"))]
+/// No write log on Windows (see `content_slice`).
+#[cfg(windows)]
 fn purge_write_log(_s: &mut ShardState) -> (usize, bool) {
   (0, false)
 }
@@ -5749,6 +5786,9 @@ async fn control_loop(
   }
   // Every shard has recovered and no client is admitted yet, so no clone is between its steps: the names' aliases are
   // reconciled with the clones they name (A-236).
+  // Every green a partition holds by its takeover's adoption is rebuilt from this node's ledger first (A-333), so no
+  // client meets one half built and every work over one is replayed after it.
+  crate::green_adopt::readopt_at_boot(control, &shards).await;
   // Likewise no work is between its steps: a work whose green lives on another partition is replayed through that
   // green's owner, and only then is every floor compared with the work it holds for (A-247).
   recover_works_across_partitions(control, &shards).await;
@@ -6215,30 +6255,6 @@ fn start_shards_route(
 /// Counter: the Shards stream route that did not bind its socket (macOS): the Shards form is refused while it stands.
 #[cfg(target_os = "macos")]
 const SHARDS_ROUTE_UNBOUND: &str = "shards.route_unbound";
-
-/// Releases and closes FUSE devices the anchor handed back to a daemon on a platform without FUSE: there is no mount to
-/// serve them, and an anchor that keeps them would hand them to every daemon after. Reported, since a device here means
-/// an anchor shared with another platform's daemon or a corrupted handoff.
-#[cfg(all(unix, not(target_os = "linux")))]
-fn release_devices_without_fuse(devices: Vec<crate::anchor_hold::HandedDevice>) {
-  for crate::anchor_hold::HandedDevice {
-    attachment,
-    device,
-    session,
-  } in devices
-  {
-    slates_machine::log_line!(
-      "slates-server: the anchor handed back FUSE device {attachment:x} ({}), which this platform cannot serve; released",
-      if session.is_some() {
-        "negotiated"
-      } else {
-        "not negotiated"
-      }
-    );
-    drop(device);
-    let _ = crate::anchor_hold::send(&slates_anchor::held::Outgoing::Release { attachment });
-  }
-}
 
 /// Raises this process's soft descriptor limit to the hard one (no privilege needed); `(before, after)` when it changed.
 /// The daemon calls it at start; the anchor too, since it holds a duplicate of every FUSE device and NFS connection
@@ -7253,11 +7269,28 @@ mod tests {
     object: slates_db::register::ObjectId,
     sequence: u64,
   ) -> (slates_db::HostId, slates_db::HostId) {
-    use slates_cluster::config_group::{Reconfiguration, RegionalCouncil};
-    use slates_db::register::{Acceptor, Authority, FIRST_EPOCH, HostId, Quorum, Record};
     let local = state.fleet.host();
-    let departed = HostId(local.0 ^ 1);
-    let third = HostId(local.0 ^ 2);
+    retire_a_named_owner_of_a_held_record(
+      state,
+      object,
+      sequence,
+      (
+        slates_db::HostId(local.0 ^ 1),
+        slates_db::HostId(local.0 ^ 2),
+      ),
+    )
+  }
+
+  /// [`retire_the_owner_of_a_held_record`] with the other two members named: `departed`, the owner retired, and `third`.
+  fn retire_a_named_owner_of_a_held_record(
+    state: &mut crate::state::ShardState,
+    object: slates_db::register::ObjectId,
+    sequence: u64,
+    (departed, third): (slates_db::HostId, slates_db::HostId),
+  ) -> (slates_db::HostId, slates_db::HostId) {
+    use slates_cluster::config_group::{Reconfiguration, RegionalCouncil};
+    use slates_db::register::{Acceptor, Authority, FIRST_EPOCH, Quorum, Record};
+    let local = state.fleet.host();
     state.council = RegionalCouncil::new(
       local,
       vec![local, departed, third],
@@ -7378,6 +7411,62 @@ mod tests {
     assert!(
       HostPromise::decode(&lapsed).is_ok(),
       "once its answers can no longer feed the owner's lease, the holder promises"
+    );
+  }
+
+  /// A-351 (§4.8 "Leases and reads", AUD-08; the chaos nemesis's deafened owner, seed 6876545201569229162): a holder that
+  /// keeps answering a retired owner's probes still promises the owner's objects once its last answer under the owner's
+  /// membership is past the horizon. Do: learn a peer on contact; make it the owner of a record this node holds, this
+  /// node's last answer to it while it was a member past the horizon; retire it; answer its probe, announcing an older
+  /// configuration, as the probes of an owner deaf to every answer keep coming; then answer the successor's takeover
+  /// page. Expect: the probe answered with no standing, and the page promising the record. Before, every answer to the
+  /// retired owner closed the gate again, so a holder deferred every page for as long as the owner probed, and the
+  /// takeover gave the owner's objects up.
+  #[test]
+  fn a_holder_answering_a_retired_owners_probes_still_promises_its_objects() {
+    use slates_db::register::{HostEpoch, HostPrepare, HostPromise, ObjectId};
+    let (answered, page) = audit_on_shard(|state| {
+      let local = state.fleet.host();
+      let anchor = slates_db::HostId(local.0 ^ 0x40);
+      let owner = crate::deploy::member_id(anchor, 1);
+      crate::fleet::learn_member(state, anchor, 1, owner);
+      let object = ObjectId([31; 16]);
+      let (departed, successor) = retire_a_named_owner_of_a_held_record(
+        state,
+        object,
+        0,
+        (owner, slates_db::HostId(local.0 ^ 2)),
+      );
+      let now = slates_machine::clock::monotonic_ns();
+      state
+        .answers_given
+        .alive_answers
+        .insert(departed, now - crate::lease::horizon_ns() - 1);
+      let older = state.council.configuration().version.saturating_sub(1);
+      let answered = crate::member_task::answer_probe(state, departed, 1, older);
+      let prepare = HostPrepare {
+        departed,
+        owner: successor,
+        epoch: HostEpoch(2),
+        generation: state.fleet.configuration().version,
+        after: None,
+        named: Vec::new(),
+      }
+      .encode();
+      let page = crate::takeover::serve_host_prepare(state, local, successor, &prepare);
+      (answered, page)
+    });
+    assert_eq!(
+      answered.map(|(_, standing)| standing),
+      Some(None),
+      "the retired owner is answered, with no standing"
+    );
+    let promise = HostPromise::decode(&page);
+    assert!(
+      promise
+        .as_ref()
+        .is_ok_and(|promise| promise.entries.len() == 1),
+      "the holder promises the retired owner's record: {promise:?}"
     );
   }
 

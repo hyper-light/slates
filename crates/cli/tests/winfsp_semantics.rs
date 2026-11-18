@@ -1132,3 +1132,129 @@ fn a_raw_link_set_needs_the_privilege_enabled_at_its_open() {
     );
   }
 }
+
+/// The text (`S-1-…`) of the SID at `sid`, as Windows writes it (`ConvertSidToStringSidW`).
+fn sid_text(sid: windows_sys::Win32::Security::PSID) -> String {
+  let mut text: windows_sys::core::PWSTR = std::ptr::null_mut();
+  // SAFETY: `sid` points at a valid SID for the call; the call allocates the text with `LocalAlloc` into a local.
+  let converted =
+    unsafe { windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW(sid, &mut text) };
+  assert!(
+    converted != 0 && !text.is_null(),
+    "ConvertSidToStringSidW: {}",
+    std::io::Error::last_os_error()
+  );
+  // SAFETY: `text` is the NUL-terminated string the call allocated; it is read whole, then freed once.
+  unsafe {
+    let length = (0..).take_while(|&at| *text.add(at) != 0).count();
+    let owned = String::from_utf16_lossy(std::slice::from_raw_parts(text, length));
+    windows_sys::Win32::Foundation::LocalFree(text.cast());
+    owned
+  }
+}
+
+/// The text of the SID a token-information `class` of this process's token names: its account (`TokenUser`) or its
+/// primary group (`TokenPrimaryGroup`), each structure's first field a pointer to the SID.
+fn this_process_token_sid(class: windows_sys::Win32::Security::TOKEN_INFORMATION_CLASS) -> String {
+  use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY};
+  use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+  let mut token = std::ptr::null_mut();
+  // SAFETY: this process's pseudo-handle and an out-pointer to a local; the token is closed below.
+  let opened = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
+  assert!(
+    opened != 0,
+    "OpenProcessToken: {}",
+    std::io::Error::last_os_error()
+  );
+  let mut needed = 0u32;
+  // SAFETY: a size query with no buffer; it fails by design and writes the size to a local.
+  unsafe { GetTokenInformation(token, class, std::ptr::null_mut(), 0, &mut needed) };
+  let mut buffer = vec![0u64; usize::try_from(needed).unwrap().div_ceil(8)];
+  // SAFETY: `buffer` holds at least `needed` bytes, aligned for the token structures.
+  let read = unsafe {
+    GetTokenInformation(
+      token,
+      class,
+      buffer.as_mut_ptr().cast(),
+      needed,
+      &mut needed,
+    )
+  };
+  assert!(
+    read != 0,
+    "GetTokenInformation: {}",
+    std::io::Error::last_os_error()
+  );
+  // SAFETY: the structure's first field is the pointer to its SID, which lies in `buffer`, alive here.
+  let sid = unsafe { *buffer.as_ptr().cast::<windows_sys::Win32::Security::PSID>() };
+  let text = sid_text(sid);
+  // SAFETY: the token opened above, closed once.
+  unsafe { windows_sys::Win32::Foundation::CloseHandle(token) };
+  text
+}
+
+/// The owner and the group Windows reports for `path` (`GetNamedSecurityInfoW`), as SID text.
+fn owner_and_group(path: &str) -> (String, String) {
+  use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+  use windows_sys::Win32::Security::{GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION};
+  let name = wide(path);
+  let (mut owner, mut group, mut descriptor) = (
+    std::ptr::null_mut(),
+    std::ptr::null_mut(),
+    std::ptr::null_mut(),
+  );
+  // SAFETY: a NUL-terminated name and out-pointers to locals; the descriptor the call allocates holds both SIDs and
+  // is freed once, after they are read.
+  let status = unsafe {
+    GetNamedSecurityInfoW(
+      name.as_ptr(),
+      SE_FILE_OBJECT,
+      OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION,
+      &mut owner,
+      &mut group,
+      std::ptr::null_mut(),
+      std::ptr::null_mut(),
+      &mut descriptor,
+    )
+  };
+  assert_eq!(status, 0, "GetNamedSecurityInfoW({path}) answered {status}");
+  let read = (sid_text(owner), sid_text(group));
+  // SAFETY: the descriptor the call allocated, freed once; `owner` and `group` point into it and are not used again.
+  unsafe { windows_sys::Win32::Foundation::LocalFree(descriptor) };
+  read
+}
+
+/// A-350 (CI run 44271637767: git refused every repository on the drive, "detected dubious ownership", owner Everyone
+/// `S-1-1-0`). NTFS reports a new object's owner and group from its maker's token, and git trusts a repository whose
+/// owner is the user. Do: make a directory and a file through the drive, and ask Windows for their owner and group and
+/// the drive root's. Expect each owner this process's account (`TokenUser`) and each group its primary group
+/// (`TokenPrimaryGroup`): a daemon's clients are its own account, and this test's daemon runs as this process's.
+#[test]
+fn what_this_account_makes_on_the_drive_reports_it_as_owner_as_ntfs_does() {
+  if !live_mount_runs() {
+    return;
+  }
+  let account = this_process_token_sid(windows_sys::Win32::Security::TokenUser);
+  let primary_group = this_process_token_sid(windows_sys::Win32::Security::TokenPrimaryGroup);
+  let drive = Drive::mount("owner");
+  std::fs::create_dir(drive.path("repository")).unwrap();
+  std::fs::write(drive.path("repository\\file.txt"), b"made here").unwrap();
+  for path in [
+    format!("{}\\", drive.letter),
+    drive.path("repository"),
+    drive.path("repository\\file.txt"),
+  ] {
+    let (owner, group) = owner_and_group(&path);
+    eprintln!(
+      "A-350 {path}: owner {owner}, group {group}; this account {account}, primary group {primary_group}"
+    );
+    assert_eq!(
+      owner, account,
+      "{path}'s owner is this account, not {owner}"
+    );
+    assert_eq!(
+      group, primary_group,
+      "{path}'s group is this account's primary group"
+    );
+  }
+}
