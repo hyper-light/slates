@@ -2978,6 +2978,16 @@
 >     - **Open, the owner's one thread:** a first touch of a base file, a verdict, a rebase and a read of the green each
 >       still cross to the green's owner and queue there (A-273's replicas would take the reads and rebases off it).
 >
+>     **The rung's starved clients were the harness's hot set, and the round is reported, not judged (2026-11-18, g083,
+>     A-416).** Every 1,000-client run had 16 to 29 clients starved, and the bound requires none: the harness drew its
+>     `--hot-files 800` with replacement over `kernel/`'s 700-odd eligible files, so every file was hot and some three
+>     to five times hotter than the rest. The hot set is now that many distinct files and at most half the files long
+>     enough to edit, refused (`refused`, exit 1) otherwise, so the rung's 800 need a larger tree (`fs/`, 2,365 files).
+>     And the bound judges every request kind and the cycle, a whole edit and merge, as §1.4's status names them; a
+>     round, as many edits and merges as its conflicts make, stays in the `latency` row (191 ms at its p99 with every
+>     request at 0.47 to 1.33 ms, the Mac Studio, 50 ms think mean). **Owed, measurement (the supervisor's):** the
+>     rung under the set rule (`--tree <linux-v7.4-rc1>/fs`) at think means of 200, 100, 50 and 20 ms.
+>
 >     **Owed, measurement (the supervisor's):** the 1,000-client rung on main with W1 (A-247 step one, landed
 >     2026-11-17) against main before it (02c6469e5). Each think mean runs as its own invocation with a fresh daemon,
 >     interleaved across builds: every kind's p50, p99, p999 and max, the `offered` row and the `bound` row. A think
@@ -4216,7 +4226,9 @@
 >   pairs match (run 42049001999). On the test tag `v0.1.0-test.2` (run 42054339412), all seven pairs matched, macOS
 >   included, and the draft carries both digests of each. The numbers are in A-210.
 > - **Not yet:** the macOS `Slates.app` bundle, code signing and notarization (B.7; they need an Apple Developer
->   identity); `cargo-binstall` metadata.
+>   identity). `cargo-binstall` metadata is built (2026-11-18, A-413): `cargo binstall --git
+>   https://github.com/hyper-light/slates slates-cli` takes the release binary for a shipped target, and `cargo xtask
+>   version` holds its overrides to `ASSETS`; its first install against a published release is owed (run request).
 
 > **WinFsp's hold release, DLL version and long paths fixed (2026-11-04, A-206; audit steps 4 and 6).** Run
 > [41978665514](https://github.com/hyper-light/slates/actions/runs/41978665514), `windows-latest` and `windows-11-arm`,
@@ -10884,7 +10896,14 @@ Open:
     ping and waits at FileVault's unlock screen. A panic is suspected and not yet read.
   - Its report (`/Library/Logs/DiagnosticReports/panic-full-*.panic`) is the next step: the GAPS entry below.
 
-### 2026-10-06: two fsync-acknowledged files came back empty after daemon kills on the macOS NFS mount (fixed server-side, A-358; the kernel-client run with the fix open)
+### 2026-10-06: two fsync-acknowledged files came back empty after daemon kills on the macOS NFS mount (fixed server-side, A-358; closed 2026-11-18 by the kernel-client run with the fix)
+
+> **Closed 2026-11-18 (main): the kernel-client run with A-358 kept every fsynced file.** GitHub's macos-latest (macOS
+> 26.7.2 25G332, Apple M1 virtual machine, 3 CPUs, xnu-12377.161.15), main c0d386107, run 44379621688:
+> `SLATES=<release slates> ROUNDS=8 KILLS=15 DURATION=30 bash docs/wip/bench/kill_fsync_macos.sh`. Over 8 rounds and
+> 120 SIGKILLs, 32,954 fsynced files were checked: every one intact, 0 empty, 0 corrupt, 0 missing, 0 resurrected, no
+> panic report. Before A-358 the same script lost one file per run on Studio-2 (table below). Run on a CI runner, as
+> Ada asked (a crash there disrupts nobody), since Studio-2 sat behind FileVault after its October panic.
 
 > **2026-11-18 (g079): reproduced through Apple's kernel client, traced, and fixed server-side (A-358).**
 > - **Machine.** Adas-Mac-Studio-2 (kiln b24c5c95): M4 Max, macOS 26.2 (25C56), xnu-12377.61.12, NFS kext
@@ -10977,11 +10996,13 @@ client is the leading suspect, not proven: the kernel run under A-113 (no reconn
 > | FUSE mounts (Linux) | the write log in anchor memory, replayed by the successor (A-63) | `a_closed_files_writes_survive_a_kill_from_the_write_log_alone` |
 > | Shards streams (Linux, macOS), where a VM outlives its daemon (A-316, A-339, A-365) | the write log, before the reply (`shards::log_write`) | `a_stream_is_resynced_after_its_daemons_death_and_its_unanswered_create_is_answered_once` |
 > | WinFsp drives (Windows) | the barrier, before every write's reply (A-379) | `a_write_answered_before_its_daemons_kill_is_kept_or_its_flush_refused` |
-> | Shards streams (Windows) | nothing; the stream ends with its daemon, so no successor serves it | owed with "Windows streams have no write log" (g268) |
-> | vhost-user (crosvm, QEMU; Linux) | nothing; the VM ends with its device's daemon | owed with "a VM that outlives its device's daemon" (Phase 8 step 4) |
+> | Shards streams (Windows) | the write log, before the reply (A-402); the stream itself still ends with its daemon (its resync is g268's) | `a_streams_acknowledged_write_outlives_its_daemon_through_the_write_log` |
+> | vhost-user (crosvm, QEMU; Linux) and the in-process guest seam | the write log, before the used element; a write the log cannot keep waits for the barrier (A-410); the VM still ends with its device's daemon | `a_guests_acknowledged_write_outlives_its_daemon_through_the_write_log` |
 >
-> - **Owed.** The cost of A-379: a publication per paging write, measured through a WinFsp drive before and after. For
->   the last two routes: the work that lets a guest outlive its daemon must bring the write log or A-358's rule first.
+> - **Owed.** The cost of A-379: a publication per paging write, measured through a WinFsp drive before and after. The
+>   last two routes log since A-402 and A-410 (2026-11-18), so a guest that outlives its daemon there meets its
+>   acknowledged writes in the successor; what each still owes is the successor serving that guest (a Windows stream's
+>   resync; a vhost-user device the anchor holds).
 > - **Record.** `docs/bugs/2026-11-18-a-winfsp-write-answered-before-its-publication-was-lost-across-a-daemon-kill.md`.
 
 
@@ -18073,10 +18094,10 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     as in step 3; `guest_dax.rs` 3 of 3 beside them. **Found:** the A-170 bug below, in 2 rounds of 3 before the fix.
   - **Owed, a later goal:** a VM that outlives its device's daemon. The anchor would have to hold the device's socket
     end and its state (vrings, memory table, back-end channel, windows) across the restart, as A-61 holds a FUSE device.
-    This vhost-user route answers a guest's write before any publication and does not log it. That is safe only because
-    the VM dies with the daemon here. Work that lets a VM outlive its device's daemon on this route must publish each
-    write before its reply (A-358) or log it. The Shards stream route already lets a VM outlive its daemon, and it logs:
-    see the route table in GAPS 2026-11-18, "a WinFsp write answered before its publication was lost".
+    This vhost-user route logs each guest write in the shard's write log before its used element since A-410
+    (2026-11-18; before, it answered a write with neither a log record nor a publication, safe only because the VM died
+    with the daemon), so that precondition is met. The Shards stream route already lets a VM outlive its daemon, and it
+    logs: see the route table in GAPS 2026-11-18, "a WinFsp write answered before its publication was lost".
 - **Fixed 2026-10-25 (A-170), found by step 4: a clone's copy-up sealed its origin's open extent behind the origin's
   image, so a crash lost the shard.** `docs/bugs/2026-10-25-a-clones-copy-up-sealed-its-origins-open-extent-behind-its-image.md`.
   - **Symptom:** the daemon-kill test failed 2 rounds of 3, then 3 of 4, always the fastest rounds. The successor logged

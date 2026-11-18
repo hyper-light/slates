@@ -62,6 +62,7 @@ pub const ENV_COPIES: &str = "SLATES_ANCHOR_COPIES";
 /// encoding to grow without a channel change. A Shards stream's resync session is 40 (its token, its owner view and its
 /// connection's form, A-378), past the 32 this held until then; an anchor and its daemons are always one build (the
 /// anchor restarts its own executable, A-145), so the channel's message length changes with both at once.
+/// Format: the power of two at or above the largest session (40 bytes), as 32 was above the earlier largest.
 pub const SESSION_CAP: usize = 64;
 
 /// Format: a message's kind, its first byte.
