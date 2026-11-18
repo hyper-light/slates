@@ -1,6 +1,6 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
-> **A reply carried home past a full channel was dropped: fixed (goal 238, 2026-11-18, from perf's branch of
+> **A reply carried home past a full channel was dropped: fixed (goal 238, 2026-11-18, A-296, from perf's branch of
 > 2026-11-09; §4.3, CLAUDE.md §2 items 8 and 9).** `xshard::send_back` waited one coordinator period for room and then
 > dropped the result (`xshard.reply_dropped`); `xshard::hand_reply_home` (fuse, image, landing, lease_wait, live_ship,
 > the merge plane's deferred acceptances, winfsp) handed a reply over once and counted it undelivered on a full
@@ -16,9 +16,11 @@
 > never ends.
 >
 > Now each shard has a carrier (`xshard::carrier`, spawned first by the shard's start): a message that meets a full
-> channel, or finds messages for the same shard kept, is kept in order behind them and sent as soon as there is room,
-> for as long as the shard it goes to lives; only a shard gone (its daemon stopping) leaves one undelivered. The sender
-> holds nothing meanwhile, and nothing is spawned. That matters twice. perf's branch waited in a task per reply, which a
+> channel, or finds messages for the same shard kept, is kept in order behind them, for as long as the shard it goes to
+> lives; only a shard gone (its daemon stopping) leaves one undelivered. The carrier asks that shard to tell it when its
+> channel next has room (A-279's wake), tries once more, and waits with no timer until the drain that makes the room
+> wakes it; its first form, and perf's branch, tried again every tenth of a coordinator period. The sender holds
+> nothing meanwhile, and nothing is spawned. That matters twice. perf's branch waited in a task per reply, which a
 > full arena refused. And a task refused at admission drops inside the runtime's admission, where no task can be
 > spawned at all; a wake there still marks the carrier ready. Both fail first in `crates/server/src/xshard.rs`
 > (`a_reply_handed_home_while_this_shards_arena_is_full_waits_for_room`,
@@ -28,7 +30,8 @@
 > keeps at most `DaemonConfig::kept_bound` (`2 × clients_per_shard × slots × shards` plus the task arenas, in the boot
 > log); past it a message is refused to its sender and counted (`xshard.keep_refused`), which
 > `the_carrier_keeps_its_bound_in_order_and_refuses_one_past_it` holds on a daemon's derived bound, with the order of
-> what was kept. Counted per shard thread, not in
+> what was kept; its stand-in for the client's shard tells the waiting shards after each message it takes, as a drain
+> does (`Registration::tell_room`), and a carrier that does not ask is never woken. Counted per shard thread, not in
 > the shard's state, which a caller that keeps a reply may be borrowing: `xshard.room_waits_started`, `_ended`, `_peak`.
 > Swept: every `send_back`, `send_reply_home` and `hand_reply_home` caller, `run_on_waiting` (A-192's connection ends,
 > now carried the same way), and every direct `send_control` of a reply in `crates/server/src`. Siblings reported, not
@@ -887,9 +890,10 @@
 >     resend came within 21 ms every time). It now owes the answer within the liveness budget of the owner's last
 >     progress through them, and asserts the room wake's counts
 >     (`docs/bugs/2026-11-17-a-kept-forward-polled-for-room-and-its-test-timed-the-owners-queue.md`).
->   - Open: the scatter's parts and a result carried home still poll a full channel every `REPLY_PACE_NS`
->     (`xshard::given_room_within`, `given_room`); `retry_forwards` stops at the first refused forward, so one full
->     owner holds back kept forwards to owners with room.
+>   - ~~Open: the scatter's parts and a result carried home still poll a full channel every `REPLY_PACE_NS`
+>     (`xshard::given_room_within`, `given_room`)~~: closed 2026-11-18 (A-296), both ask for room and wait for the
+>     drain's word. Open: `retry_forwards` stops at the first refused forward, so one full owner holds back kept
+>     forwards to owners with room.
 >   - Unmeasured: under a saturated owner, an idle client shard whose resend keeps losing the room to busy shards is
 >     told at every drain, so it wakes about once per its own wake latency, where the timer woke it once per idle
 >     window (100 wakes). The owner pays a kick per such shard per tell. Owed: kicks and CPU at the 10k fan-in rung.

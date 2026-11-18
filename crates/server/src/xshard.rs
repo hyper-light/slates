@@ -16,13 +16,15 @@
 //! A call to the caller's own shard runs the closure directly, so the same code path serves one shard and
 //! many (R8).
 //!
-//! What goes back is never refused for want of room (§4.3, goal 238): a reply, a scatter part's result or a call's
-//! answer that meets the origin's full control channel is kept by the sending shard's carrier ([`carrier`]), behind
-//! anything kept for the same shard, and sent as soon as the channel has room, for as long as that shard lives. The
-//! carrier needs no task per message, so neither a full task arena nor the runtime's admission, where a task refused
-//! there answers its client, can refuse one; what it keeps answers requests in flight, which bound it
-//! (`DaemonConfig::kept_bound`), and every wait is counted ([`room_waits`]). Measured on main 80be552a before: 4,074 to
-//! 4,518 results a run of the 3,000-client load rung dropped after one coordinator period's wait.
+//! What goes back is never refused for want of room (§4.3, goal 238, A-296): a reply, a scatter part's result or a
+//! call's answer that meets the origin's full control channel is kept by the sending shard's carrier ([`carrier`]),
+//! behind anything kept for the same shard, for as long as that shard lives. The carrier asks the full shard to tell it
+//! when its channel next has room (A-279's room wake, `slates_rt::room`) and sends what it keeps when the drain that
+//! made the room says so, with no timer. It needs no task per message, so neither a full task arena nor the runtime's
+//! admission, where a task refused there answers its client, can refuse one; what it keeps answers requests in flight,
+//! which bound it (`DaemonConfig::kept_bound`), and every wait is counted ([`room_waits`]). Measured on main 80be552a
+//! before: 4,074 to 4,518 results a run of the 3,000-client load rung dropped after one coordinator period's wait. A
+//! scatter's part on its way out waits for room the same way, within a budget ([`given_room_within`]).
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
@@ -258,10 +260,12 @@ fn carry(target: u16, message: Control) -> Result<(), RtError> {
   }
 }
 
-/// Puts `message` behind what this shard keeps for `target`, counted as a wait for room: the carrier's waker, when it
-/// waits, for the caller to wake once the keeper is let go. The message back, unkept, when no carrier runs, the bound is
-/// reached (both counted `xshard.keep_refused`), or the keeper is borrowed, which nothing allows: no code that runs
-/// while it is borrowed calls back here.
+/// Puts `message` behind what this shard keeps for `target`, counted as a wait for room: the carrier's waker, for the
+/// caller to wake once the keeper is let go, when this is the first message kept for `target` and the carrier waits
+/// (it must ask `target` for room, [`asked_for_room`]); a message kept behind others needs no wake, since the carrier
+/// asked `target` when it kept the first. The message back, unkept, when no carrier runs, the bound is reached (both
+/// counted `xshard.keep_refused`), or the keeper is borrowed, which nothing allows: the keeper is borrowed only inside
+/// this module's functions, and none of them keeps while it holds the borrow.
 fn keep(target: u16, message: Control) -> Result<Option<Waker>, Control> {
   KEPT.with(|kept| {
     let Ok(mut kept) = kept.try_borrow_mut() else {
@@ -276,34 +280,88 @@ fn keep(target: u16, message: Control) -> Result<Option<Waker>, Control> {
       return Err(message);
     }
     kept.held = kept.held.saturating_add(1);
-    kept
-      .queues
-      .entry(target)
-      .or_default()
-      .push_back((message, RoomWait::begin()));
-    Ok(kept.carrier.take())
+    let queue = kept.queues.entry(target).or_default();
+    let first = queue.is_empty();
+    queue.push_back((message, RoomWait::begin()));
+    Ok(if first { kept.carrier.take() } else { None })
   })
 }
 
-/// Sends what this shard keeps, each target's messages in order until its channel is full: how many are still kept.
-/// What was kept for a target that is gone is let go of ([`let_go_of`]): its clients went with it.
-fn flush_kept() -> usize {
+/// Sends what this shard keeps, each target's messages in order until its channel is full: the targets whose channels
+/// are still full, which the carrier asks for room. What was kept for a target that is gone is let go of
+/// ([`let_go_of`]): its clients went with it.
+fn flush_kept() -> Vec<u16> {
   let mut gone = Vec::new();
-  let held = KEPT.with(|kept| {
-    // Never borrowed here: nothing that runs while the keeper is borrowed calls back. Were it, the carrier would try
-    // again at its pace rather than wait for a keep that may not come.
+  let full = KEPT.with(|kept| {
+    // Never borrowed here: the keeper is borrowed only inside this module's functions, and none of them keeps while it
+    // holds the borrow (a message let go of is dropped after the borrow ends).
     let Ok(mut kept) = kept.try_borrow_mut() else {
-      return usize::MAX;
+      return Vec::new();
     };
     for (target, queue) in &mut kept.queues {
       flush_queue(*target, queue, &mut gone);
     }
     kept.queues.retain(|_, queue| !queue.is_empty());
     kept.held = kept.queues.values().map(VecDeque::len).sum();
-    kept.held
+    kept.queues.keys().copied().collect()
   });
   let_go_of(gone);
-  held
+  full
+}
+
+/// Sends what this shard keeps for `target`, in order until its channel is full: the carrier's second try, after it
+/// asked `target` for room. A target gone lets go of it ([`let_go_of`]).
+fn flush_kept_for(target: u16) {
+  let mut gone = Vec::new();
+  KEPT.with(|kept| {
+    let Ok(mut kept) = kept.try_borrow_mut() else {
+      return;
+    };
+    let Some(queue) = kept.queues.get_mut(&target) else {
+      return;
+    };
+    flush_queue(target, queue, &mut gone);
+    if queue.is_empty() {
+      kept.queues.remove(&target);
+    }
+    kept.held = kept.queues.values().map(VecDeque::len).sum();
+  });
+  let_go_of(gone);
+}
+
+/// Takes what this shard keeps for `target` out of the keeper, for [`let_go_of`]: `target` has left its loop and will
+/// never drain its channel again.
+fn take_kept_for(target: u16) -> Vec<(Option<Control>, RoomWait)> {
+  KEPT.with(|kept| {
+    kept.try_borrow_mut().map_or_else(
+      |_| Vec::new(),
+      |mut kept| {
+        let queue = kept.queues.remove(&target).unwrap_or_default();
+        kept.held = kept.held.saturating_sub(queue.len());
+        queue
+          .into_iter()
+          .map(|(message, wait)| (Some(message), wait))
+          .collect()
+      },
+    )
+  })
+}
+
+/// Asks `target`, whose control channel refused a send, to tell this shard when that channel next has room, for the task
+/// polled now (`slates_rt::futures::want_room`; A-279's room wake, `slates_rt::room`). The caller then tries its send
+/// once more and waits only if that try is refused too: either the try finds the room a drain made meanwhile, or that
+/// drain finds the ask and wakes the task. `false` when `target` has left its loop, so it will never drain again. An ask
+/// refused otherwise is counted (`xshard.room_wait_refused`) and answers `true`, so the try is made all the same: only a
+/// task's poll on a shard can ask, which every caller is, so it is a tripwire.
+fn asked_for_room(target: u16) -> bool {
+  match slates_rt::futures::want_room(target) {
+    Ok(()) => true,
+    Err(RtError::ShardGone { .. }) => false,
+    Err(_) => {
+      state::with_state_counted(|s| s.count(ROOM_WAIT_REFUSED, 1));
+      true
+    }
+  }
 }
 
 /// Sends `queue`'s messages to `target` in order until its channel is full (the rest stay, the first refused at the
@@ -385,9 +443,11 @@ thread_local! {
 }
 
 /// The carrier: sends what this shard keeps for other shards whose control channels were full ([`carry`]), each
-/// target's messages in order. While any is kept it tries again every [`REPLY_PACE_NS`], and at once whenever another
-/// is kept; while none is, it waits to be woken by the next. Each shard's start spawns it before anything else
-/// (`crate::daemon`), so nothing the shard sends is without it; `bound` is the most it keeps at once
+/// target's messages in order. A target whose channel is still full is asked to tell this shard when it next has room
+/// ([`asked_for_room`], A-279's room wake) and tried once more; then the carrier waits, with no timer, until a target it
+/// asked drains its channel, which wakes it here, or the first message is kept for a target it has not asked. A target
+/// that has left its loop is let go of, with what is kept for it. Each shard's start spawns the carrier before anything
+/// else (`crate::daemon`), so nothing the shard sends is without it; `bound` is the most it keeps at once
 /// ([`crate::config::DaemonConfig::kept_bound`]). Dropped at the shard's shutdown, it lets go of what it keeps (counted
 /// `xshard.reply_dropped`: the clients go with the daemon), and the shard keeps nothing more.
 pub(crate) fn carrier(bound: usize) -> Carrier {
@@ -398,7 +458,6 @@ pub(crate) fn carrier(bound: usize) -> Carrier {
   });
   Carrier {
     _running: CarrierRunning,
-    pace: None,
   }
 }
 
@@ -406,49 +465,23 @@ pub(crate) fn carrier(bound: usize) -> Carrier {
 pub(crate) struct Carrier {
   /// Lets go of what is kept when the carrier is dropped.
   _running: CarrierRunning,
-  /// The pause before the next try while something is kept.
-  pace: Option<slates_rt::futures::Sleep>,
 }
 
 impl Future for Carrier {
   type Output = ();
 
   fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-    let this = self.get_mut();
-    while flush_kept() > 0 {
-      if !this.paced(cx) {
-        // Kept still: the pause or the next keep wakes the carrier.
-        wait_for_keep(cx.waker());
-        return Poll::Pending;
+    for target in flush_kept() {
+      if asked_for_room(target) {
+        flush_kept_for(target);
+      } else {
+        let_go_of(take_kept_for(target));
       }
     }
-    // Nothing kept: only the next keep wakes the carrier.
-    this.pace = None;
+    // What is still kept waits for its target's drain, which wakes this task; the first message kept for another
+    // target wakes it through this waker.
     wait_for_keep(cx.waker());
     Poll::Pending
-  }
-}
-
-impl Carrier {
-  /// Polls the pause before the next try, armed at [`REPLY_PACE_NS`] if none runs: whether it has passed, so the
-  /// carrier tries again now. `false` while it runs, and when none can be armed (off a shard, a tripwire; counted), when
-  /// only the next keep wakes the carrier.
-  fn paced(&mut self, cx: &mut Context<'_>) -> bool {
-    let pace = self
-      .pace
-      .get_or_insert_with(|| slates_rt::futures::sleep(REPLY_PACE_NS));
-    match Pin::new(pace).poll(cx) {
-      Poll::Pending => false,
-      Poll::Ready(Ok(())) => {
-        self.pace = None;
-        true
-      }
-      Poll::Ready(Err(_)) => {
-        self.pace = None;
-        state::with_state_counted(|s| s.count(ROOM_PAUSE_REFUSED, 1));
-        false
-      }
-    }
   }
 }
 
@@ -512,48 +545,68 @@ pub fn run_on_waiting(
   }
 }
 
-/// Sends `message` to `target`, waiting out a full channel for at most `budget_ns` of time, asked again every
-/// [`REPLY_PACE_NS`] and never past the budget's deadline: whether it was sent. `false` past the deadline, at once for a
-/// shard gone, or once a pause is refused (off a shard, where no wait can succeed; counted). A scatter's part waits this
-/// way (`crate::verbs::send_part`), within a budget its client can still hear the answer in. The budget is a span of the
+/// Sends `message` to `target`, waiting out a full channel for at most `budget_ns` of time: whether it was sent. A full
+/// channel's shard is asked to tell this shard when it next has room ([`asked_for_room`], A-279's room wake) and the
+/// send tried once more; then the task waits for its first wake, the drain's tell or the deadline, and tries again.
+/// `false` past the deadline, at once for a shard gone, or when the deadline cannot be armed (not a task's poll on a
+/// shard, where no wait can succeed; counted `xshard.room_wait_refused`). A scatter's part waits this way
+/// (`crate::verbs::send_part`), within a budget its client can still hear the answer in. The budget is a span of the
 /// shard's clock, not a count of tries: until 2026-11-06 it was `budget / pace + 1` tries of one pause each, and on a
 /// starved shard every pause ran late, so the wait stretched with the starvation (51 tries took 1.54 s against a
 /// 500 ms budget with the shard kept off its CPU 20 ms at a time; `a_status_on_a_starved_shard_is_refused_overloaded_on_time`
-/// in `crates/server/tests/ack_release.rs`).
+/// in `crates/server/tests/ack_release.rs`). Until 2026-11-18 (A-296) it tried again every tenth of a coordinator
+/// period, a timer each time, whether the channel had room or not.
 pub(crate) async fn given_room_within(target: u16, mut message: Control, budget_ns: u64) -> bool {
   let deadline = slates_rt::futures::now_ns().saturating_add(budget_ns);
   let mut waiting: Option<RoomWait> = None;
   loop {
-    match registry::send_control_or_return(target, message) {
-      Ok(()) => return true,
-      Err(registry::RefusedControl {
-        error: RtError::ControlFull { .. },
-        message: Some(unsent),
-      }) => message = unsent,
-      Err(_) => return false,
-    }
+    message = match tried(target, message) {
+      Tried::Full(unsent) => unsent,
+      done => return matches!(done, Tried::Sent),
+    };
     waiting.get_or_insert_with(RoomWait::begin);
     let left = deadline.saturating_sub(slates_rt::futures::now_ns());
-    if left == 0 {
+    if left == 0 || !asked_for_room(target) {
       return false;
     }
-    if slates_rt::futures::sleep(left.min(REPLY_PACE_NS))
-      .await
-      .is_err()
-    {
-      state::with_state_counted(|s| s.count(ROOM_PAUSE_REFUSED, 1));
+    message = match tried(target, message) {
+      Tried::Full(unsent) => unsent,
+      done => return matches!(done, Tried::Sent),
+    };
+    let woken = slates_rt::futures::within(left, slates_rt::futures::idle()).await;
+    if woken.is_err() {
+      state::with_state_counted(|s| s.count(ROOM_WAIT_REFUSED, 1));
       return false;
     }
   }
 }
 
-/// Counter: a scatter part's pause for room refused ([`given_room_within`]), or the carrier's ([`carrier`]): only off
-/// a shard, so a tripwire.
-pub(crate) const ROOM_PAUSE_REFUSED: &str = "xshard.room_pause_refused";
+/// One try of a send that waits for room ([`tried`]).
+enum Tried {
+  /// The channel took the message.
+  Sent,
+  /// The channel was full: the message back, for the next try.
+  Full(Control),
+  /// Refused otherwise (the target gone): the message dropped.
+  Refused,
+}
 
-/// Shape: the pace of the retries for room — a tenth of a coordinator period, the collection loops' cadence
-/// (`crate::fleet::POLL_PER_PERIOD`), so a kept reply is tried about as often as the shard's loops turn.
-const REPLY_PACE_NS: u64 = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;
+/// Tries to send `message` to `target` once ([`Tried`]).
+fn tried(target: u16, message: Control) -> Tried {
+  match registry::send_control_or_return(target, message) {
+    Ok(()) => Tried::Sent,
+    Err(registry::RefusedControl {
+      error: RtError::ControlFull { .. },
+      message: Some(unsent),
+    }) => Tried::Full(unsent),
+    Err(_) => Tried::Refused,
+  }
+}
+
+/// Counter: a wait for room whose ask ([`asked_for_room`]) or deadline ([`given_room_within`]) was refused for want of
+/// a task's poll on a shard, which every caller is: a tripwire. Until 2026-11-18 (A-296) its pause was counted here as
+/// `xshard.room_pause_refused`.
+pub(crate) const ROOM_WAIT_REFUSED: &str = "xshard.room_wait_refused";
 
 /// Format: the status counter of waits for room this shard began: messages its carrier kept ([`carry`]) and scatter
 /// parts that met a full channel ([`given_room_within`]).
@@ -863,10 +916,15 @@ mod tests {
   /// Shape: the bounded wait the starved-shard test gives a scatter part's room: one coordinator period.
   const REPLY_ROOM_NS: u64 = crate::daemon::HEARTBEAT_NS;
 
+  /// Shape: how often the test thread looks at a flag a shard's task sets: a tenth of a coordinator period, the
+  /// collection loops' cadence (`crate::fleet::POLL_PER_PERIOD`).
+  const LOOK_EVERY_NS: u64 = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;
+
   /// A result carried home waits for room (2026-10-07). Do: on a shard, register a stand-in slot whose control channel
   /// holds one message, fill it, and send a result home to it with `send_back`; from the test thread, take the filler
-  /// off the channel. Expect: the result's message arrives after the filler. Before, the full channel dropped it at
-  /// once; until 2026-11-18 it waited a coordinator period and was dropped after.
+  /// off the channel and tell the shards waiting for room, as a drain does. Expect: the result's message arrives after
+  /// the filler. Before, the full channel dropped it at once; until 2026-11-18 it waited a coordinator period and was
+  /// dropped after.
   #[test]
   // The test thread stands for the origin shard draining later: it must wait off-shard while the reply retries.
   #[allow(clippy::disallowed_methods)]
@@ -889,8 +947,8 @@ mod tests {
     // The filler occupies the one slot, so the reply behind it can only land once this takes it. Both waits take the
     // daemon's budget for a slow shard: two pacing intervals were not enough on a loaded shared runner, which failed
     // this with the daemon behaving correctly (CI run 39073360651, macOS lane), and a reply that is lost never comes.
-    assert!(receiver.recv_timeout(MESSAGE_WAIT).is_ok(), "the filler");
-    let carried = receiver.recv_timeout(MESSAGE_WAIT);
+    assert!(take(&receiver, &registration).is_ok(), "the filler");
+    let carried = take(&receiver, &registration);
     assert!(
       carried.is_ok(),
       "the result's message arrived once there was room"
@@ -902,9 +960,9 @@ mod tests {
   /// A reply handed home by a caller that cannot await waits for room too (§4.3 "backpressure, never a drop";
   /// [`hand_reply_home`], [`AnswerUnstarted`]). Do: on a shard, register a stand-in slot whose control channel holds one
   /// message, fill it, and hand a reply home to it with `hand_reply_home`, from the shard's state as its callers do; from
-  /// the test thread, take the filler off the channel. Expect: the hand-off reported no refusal, and the reply's message
-  /// arrives after the filler. Handed to the channel once, as until 2026-11-07, or dropped on a full channel, nothing
-  /// arrives.
+  /// the test thread, take the filler off the channel and tell the shards waiting for room, as a drain does. Expect: the
+  /// hand-off reported no refusal, and the reply's message arrives after the filler. Handed to the channel once, as
+  /// until 2026-11-07, or dropped on a full channel, nothing arrives.
   #[test]
   // The test thread stands for the client's shard draining later: it must wait off-shard while the reply waits.
   #[allow(clippy::disallowed_methods)]
@@ -924,9 +982,9 @@ mod tests {
       (registration, receiver, handed)
     });
     assert!(handed.is_ok(), "the hand-off was refused: {handed:?}");
-    assert!(receiver.recv_timeout(MESSAGE_WAIT).is_ok(), "the filler");
+    assert!(take(&receiver, &registration).is_ok(), "the filler");
     assert!(
-      receiver.recv_timeout(MESSAGE_WAIT).is_ok(),
+      take(&receiver, &registration).is_ok(),
       "the reply's message arrived once there was room"
     );
     drop(registration);
@@ -959,12 +1017,28 @@ mod tests {
   const MESSAGE_WAIT: std::time::Duration =
     std::time::Duration::from_nanos(crate::daemon::OBSERVE_BUDGET_NS);
 
+  /// Test support: takes the next message off a stand-in slot's channel within [`MESSAGE_WAIT`] and then tells the
+  /// shards waiting for room in it, as a shard's drain that took a message tells them (`Registration::tell_room`,
+  /// A-279). The test thread stands for the slot's shard draining, and a carrier waiting on it is moved by that word
+  /// alone: it has no timer.
+  fn take(
+    receiver: &std::sync::mpsc::Receiver<Control>,
+    registration: &registry::Registration,
+  ) -> Result<Control, std::sync::mpsc::RecvTimeoutError> {
+    let taken = receiver.recv_timeout(MESSAGE_WAIT);
+    if taken.is_ok() {
+      registration.tell_room();
+    }
+    taken
+  }
+
   /// A reply handed home waits for room even while this shard's task arena is full (goal 238; §4.3, banned items 8 and
   /// 9). Do: on a shard, register a stand-in slot whose control channel holds one message and fill it; fill this
   /// shard's task arena with tasks that park by yielding; and hand a reply home to the stand-in with `hand_reply_home`,
   /// from the shard's state as its callers do. Expect: the hand-off reported no refusal, and once the filler is taken
-  /// off the channel the reply's message arrives. Until 2026-11-18 the wait for room was a task spawned on this shard,
-  /// which the full arena refused: the reply was lost, counted by its caller.
+  /// off the channel (the shards waiting for room told, as a drain tells them) the reply's message arrives. Until
+  /// 2026-11-18 the wait for room was a task spawned on this shard, which the full arena refused: the reply was lost,
+  /// counted by its caller.
   #[test]
   // The test thread stands for the client's shard draining later: it must wait off-shard while the reply waits.
   #[allow(clippy::disallowed_methods)]
@@ -994,8 +1068,8 @@ mod tests {
       "the arena refused a filler (the precondition): {fillers} spawned"
     );
     assert!(handed.is_ok(), "the hand-off was refused: {handed:?}");
-    assert!(receiver.recv_timeout(MESSAGE_WAIT).is_ok(), "the filler");
-    let carried = receiver.recv_timeout(MESSAGE_WAIT);
+    assert!(take(&receiver, &registration).is_ok(), "the filler");
+    let carried = take(&receiver, &registration);
     RELEASED.store(true, Ordering::Release);
     assert!(
       carried.is_ok(),
@@ -1010,8 +1084,8 @@ mod tests {
   /// task of this shard, fill its task arena with tasks that park by yielding, top it up after a turn, and send this
   /// shard's own control channel a task owing the client its answer ([`AnswerUnstarted`]). The shard refuses that task
   /// at admission and drops it inside the admission, as it drops every refused task, where nothing can be spawned. Once
-  /// the dropped task's guard has met the full channel, take the filler off it. Expect: the owing task never ran, and the
-  /// answer's message arrives. Until 2026-11-18 the answer waited on a task spawned there, which the full arena and the
+  /// the dropped task's guard has met the full channel, take the filler off it and tell the shards waiting for room, as a
+  /// drain does. Expect: the owing task never ran, and the answer's message arrives. Until 2026-11-18 the answer waited on a task spawned there, which the full arena and the
   /// admission itself refused: lost, counted `xshard.unstarted_unanswered`, and its client waited while the daemon lived
   /// (A-232).
   #[test]
@@ -1094,10 +1168,10 @@ mod tests {
         began.elapsed() < MESSAGE_WAIT,
         "the owing task was dropped within {MESSAGE_WAIT:?}"
       );
-      std::thread::sleep(std::time::Duration::from_nanos(REPLY_PACE_NS));
+      std::thread::sleep(std::time::Duration::from_nanos(LOOK_EVERY_NS));
     }
-    assert!(receiver.recv_timeout(MESSAGE_WAIT).is_ok(), "the filler");
-    let answered = receiver.recv_timeout(MESSAGE_WAIT);
+    assert!(take(&receiver, &registration).is_ok(), "the filler");
+    let answered = take(&receiver, &registration);
     RELEASED.store(true, Ordering::Release);
     assert!(
       FILLED.load(Ordering::Acquire),
@@ -1122,10 +1196,11 @@ mod tests {
   /// shard's state as `hand_reply_home`'s callers do, then one more. Expect: each of the `bound` hand-offs was taken,
   /// and the one past them was refused to its sender and never ran; the shard's report counts one
   /// `xshard.keep_refused`, and its waits for room `bound` begun, all held at once. Then take every message off the
-  /// channel, running each: the fillers arrive, then the `bound` replies in the order they were handed home, and
-  /// nothing else; every wait has ended. The channel holds half of what is kept, so every drain meets it full
-  /// part-way. Kept past its bound, the last hand-off is taken; a send refused part-way and put back behind the rest
-  /// rather than in front, the numbers arrive out of order.
+  /// channel, running each and telling the shards waiting for room after each, as a drain does: the fillers arrive,
+  /// then the `bound` replies in the order they were handed home, and nothing else; every wait has ended. The channel
+  /// holds half of what is kept, so every send of what is kept meets it full part-way. Kept past its bound, the last
+  /// hand-off is taken; a send refused part-way and put back behind the rest rather than in front, the numbers arrive
+  /// out of order; a carrier that does not ask its target for room is never woken again, and no reply arrives.
   #[test]
   // The test thread stands for the client's shard draining later: it must wait off-shard while the replies wait.
   #[allow(clippy::disallowed_methods)]
@@ -1191,7 +1266,7 @@ mod tests {
     );
     let mut ran = 0_usize;
     while NEXT.load(Ordering::Acquire) < bound {
-      match receiver.recv_timeout(MESSAGE_WAIT) {
+      match take(&receiver, &registration) {
         Ok(Control::Spawn(mut request)) => {
           let mut context = Context::from_waker(Waker::noop());
           assert!(
@@ -1284,16 +1359,18 @@ mod tests {
 
   /// A bounded wait for room (`given_room_within`, a scatter part's) is a span of time on a busy shard too (2026-11-06).
   /// Do: on a shard, fill a stand-in slot's one-message channel and never drain it; keep the shard busy 20 ms at a time
-  /// back to back with a task that spins and yields; and wait for room there within one coordinator period. Expect: the wait gives up about one
-  /// coordinator period after it began, not much more. Before, it was a count of tries of one pause each, and each try
-  /// lasted a pause plus the shard's busy poll.
+  /// back to back with a task that spins and yields; and wait for room there within one coordinator period. Expect: the
+  /// wait gives up about one coordinator period after it began, not much more. Before 2026-11-06 it was a count of tries
+  /// of one pause each, and each try lasted a pause plus the shard's busy poll; since 2026-11-18 (A-296) it asks for
+  /// room and waits for the drain's word, which never comes here, so only its deadline ends it.
   #[test]
   // The test thread waits for the result off the shard.
   #[allow(clippy::disallowed_methods)]
   fn a_bounded_wait_for_room_waits_its_period_in_time_on_a_starved_shard() {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    /// Shape: how long the starver keeps the shard busy at a time: twice the room wait's pause.
-    const STARVED_FOR_NS: u64 = 2 * REPLY_PACE_NS;
+    /// Shape: how long the starver keeps the shard busy at a time: a fifth of the room wait's budget (20 ms), so the
+    /// deadline falls inside a busy poll.
+    const STARVED_FOR_NS: u64 = REPLY_ROOM_NS / 5;
     static DONE: AtomicBool = AtomicBool::new(false);
     static WAITED_NS: AtomicU64 = AtomicU64::new(0);
     static SENT: AtomicBool = AtomicBool::new(true);
@@ -1353,13 +1430,14 @@ mod tests {
         started.elapsed() < std::time::Duration::from_secs(10),
         "the wait ended"
       );
-      std::thread::sleep(std::time::Duration::from_nanos(REPLY_PACE_NS));
+      std::thread::sleep(std::time::Duration::from_nanos(LOOK_EVERY_NS));
     }
     let waited = WAITED_NS.load(Ordering::Acquire);
     let longest = LONGEST_POLL_NS.load(Ordering::Acquire);
     // The budget, then at most the busy poll under way at the deadline and the waiter's own next turn behind another,
-    // and one pause: a deadline overshoots by that, where a count of tries overshoots by a poll for every try.
-    let bound = REPLY_ROOM_NS + 2 * longest + REPLY_PACE_NS;
+    // and a tenth of a period for the deadline's timer tick and wake: a deadline overshoots by that, where a count of
+    // tries overshoots by a poll for every try.
+    let bound = REPLY_ROOM_NS + 2 * longest + LOOK_EVERY_NS;
     println!(
       "a result's wait for room on a busy shard: {waited} ns (longest busy poll {longest} ns, bound {bound} ns)"
     );

@@ -1513,21 +1513,24 @@ cluster.
 > all (`crates/rt/tests/room.rs`), and `forward_retry.rs`, whose answer is now owed within the
 > liveness budget of the owner's last progress through the flood queued ahead of it. Its budget from the hold's end
 > had counted the drain of 41,125 queued tasks, 64 ms to 4.33 s under load (8 of 30 failed at load ~35). Record:
-> `docs/bugs/2026-11-17-a-kept-forward-polled-for-room-and-its-test-timed-the-owners-queue.md`. Owed: the scatter's
-> parts and a result carried home still poll a full channel every `REPLY_PACE_NS` (`xshard::given_room_within`).
+> `docs/bugs/2026-11-17-a-kept-forward-polled-for-room-and-its-test-timed-the-owners-queue.md`. ~~Owed: the scatter's
+> parts and a result carried home still poll a full channel every `REPLY_PACE_NS` (`xshard::given_room_within`).~~
+> Closed 2026-11-18 by A-296 (the next status): both ask for room and wait for the drain's word.
 
-> **Status (2026-11-18, a reply carried home waits for room while its shard lives).** A result going to another
+> **Status (2026-11-18, A-296: a reply carried home waits for room while its shard lives).** A result going to another
 > shard's control channel waits for room for as long as that shard lives. That covers a forwarded verb's answer, a
 > scatter part's result and a cross-shard call's result. It also covers a reply handed home by a shard that holds its
 > state (FUSE, WinFsp, images, landings, lease waits, live shipping, the merge plane's deferred acceptances), the answer
 > of a task refused at admission, and a closed connection's end (A-192). Only a shard gone, its daemon stopping, leaves
 > one undelivered (`xshard.reply_dropped`).
 > - The mechanism: each shard's carrier (`xshard::carrier`, spawned first by the shard's start). A message that meets
->   a full channel, or finds messages for the same shard already kept, is kept in order behind them. The carrier sends
->   what it keeps as soon as there is room: at once when another message is kept, else every tenth of a coordinator
->   period. The sender holds nothing meanwhile, and nothing is spawned. So neither a full task arena nor the runtime's
->   admission can refuse the wait. A task refused at admission is dropped inside the admission, where no task can be
->   spawned, but a wake there only marks the carrier ready, which can.
+>   a full channel, or finds messages for the same shard already kept, is kept in order behind them. The carrier asks
+>   each shard it keeps messages for to tell it when that shard's channel next has room (A-279's room wake), tries once
+>   more, and waits with no timer: the drain that makes the room wakes it, and it sends what it keeps, in order, until
+>   the channel is full again. The first message kept for a shard it has not asked wakes it to ask. A shard that has
+>   left its loop is let go of with what is kept for it. The sender holds nothing meanwhile, and nothing is spawned. So
+>   neither a full task arena nor the runtime's admission can refuse the wait. A task refused at admission is dropped
+>   inside the admission, where no task can be spawned, but a wake there only marks the carrier ready, which can.
 > - What bounds it (banned item 8): every kept message answers a request in flight or is awaited by a task, so a
 >   shard keeps at most `2 × clients_per_shard × slots × shards + the task arenas` (`DaemonConfig::kept_bound`, in the
 >   boot log). Past it a message is refused to its sender, which counts the loss (`xshard.keep_refused`); the requests
@@ -1535,14 +1538,17 @@ cluster.
 > - Counted per shard thread, never through the shard's state, which a caller that keeps a reply may be borrowing:
 >   `xshard.room_waits_started`, `_ended` and `_peak` (the most held at once), with a scatter part's waits.
 > - A scatter's part on its way out is a request, not a reply: it still waits at most `PART_ROOM_BUDGET_NS` and is
->   answered `Overloaded`, typed.
+>   answered `Overloaded`, typed. It waits the same way, asking for room and waking at the drain's word or its deadline
+>   (`xshard::given_room_within`), where it tried again every tenth of a coordinator period, a timer each time.
+> - An ask can be refused only off a task's poll on a shard, which every caller is: a tripwire, counted
+>   `xshard.room_wait_refused` (it replaces `xshard.room_pause_refused`, the pause's).
 > - Before: `xshard::send_back` waited one coordinator period and dropped the result, and a reply handed home met a
 >   full channel once. That dropped 4,074 to 4,518 results a run of the 3,000-client load rung on main 80be552a. A
 >   diagnostic build of db9c514e found every one an acknowledgement scatter's part (4,364 of 4,364 and 4,418 of
 >   4,418), whose entry in `ShardState::ack_scatters` then stayed for good. Since A-232 a client waits for a reply
 >   while its daemon lives, so a lost verb reply would be a call that never ends. An intermediate form (perf's
 >   branch, never on main alone) waited in a task per reply, which a full arena or an admission refused, and polled
->   each one at the pace.
+>   each one every tenth of a coordinator period; the carrier's first form polled at that pace too.
 >
 > Tests: `a_forwarded_answer_waits_for_room_on_its_clients_shard_rather_than_being_dropped`
 > (`crates/server/tests/reply_room.rs`), and in `crates/server/src/xshard.rs`
@@ -1550,7 +1556,9 @@ cluster.
 > `a_reply_handed_home_while_this_shards_arena_is_full_waits_for_room`,
 > `a_task_refused_at_admission_answers_its_client_through_a_full_channel` (these two fail on the task-per-reply
 > form) and `the_carrier_keeps_its_bound_in_order_and_refuses_one_past_it` (a daemon's derived bound reached, one
-> message past it refused to its sender and counted, and what was kept sent in the order it was kept).
+> message past it refused to its sender and counted, and what was kept sent in the order it was kept). Each test's
+> stand-in for the client's shard tells the waiting shards after every message it takes, as a drain does
+> (`slates_rt::registry::Registration::tell_room`), and nothing else moves the carrier.
 
 **Failure matrix.** Driver setup refused (seccomp): Masked (epoll). Task arena full: Refused
 (`TooManyTasks`, admission). A task exceeding the bounded-work rule (a poll past the step quantum on
@@ -20986,3 +20994,38 @@ GAP-A9-9's macOS segment by name, its option 1); the Windows confirm-per-use pat
   expiry and an untouched security key are each refused with their own reason; hostile bytes are refused, never a
   panic (`crates/server/src/grant_signature.rs`, 10 tests). The golden test was red until the vector was re-signed over
   the exact encoding, since the first vector was signed before the target gained its length prefix.
+
+### A-296 — A result carried home is kept by its shard's carrier and sent at the full channel's word, never dropped while its shard lives (2026-11-18, built for goal g238, main never loses a reply)
+
+Applied in the same change to:
+- §4.3: the status of 2026-11-18 (A-296), and A-279's status, whose owed item this closes.
+- `crates/server/src/xshard.rs`: the carrier (`carrier`, `carry`, `keep`, `flush_kept`, `flush_kept_for`,
+  `asked_for_room`); `send_back`, `send_reply_home`, `hand_reply_home` and `run_on_waiting` carry through it;
+  `given_room_within` asks for room; the counters `xshard.room_waits_started`, `_ended`, `_peak`,
+  `xshard.keep_refused` and `xshard.room_wait_refused`. `crates/server/src/config.rs`: `DaemonConfig::kept_bound`, in
+  the boot log. `crates/server/src/daemon.rs`: each shard's start spawns the carrier first. `crates/rt/src/registry.rs`:
+  `Registration::tell_room`, a stand-in's drain telling as a shard's does. The tests: `crates/server/tests/reply_room.rs`
+  and five in `xshard.rs`. `crates/client/examples/load_bench.rs` prints the daemon's losses and waits at a run's end.
+- GAPS: the 2026-11-18 entry, and the kept-forward entry's open item on polling.
+- **What was there.** A result carried home to another shard's full control channel waited one coordinator period
+  and was then dropped (`xshard.reply_dropped`); a reply handed home by a shard holding its state (FUSE, WinFsp,
+  images, landings, lease waits, live shipping, the merge plane's deferred acceptances) met the channel once; and the
+  answer of a task refused at admission was sent once. Main 80be552a dropped 4,074 to 4,518 a run of the 3,000-client
+  load rung, every one an acknowledgement scatter's part, whose entry in `ack_scatters` then stayed for good. Since
+  A-232 a client waits for a reply while its daemon lives, so a lost verb reply would be a call that never ends.
+- **The rule.** A message that meets a full channel, or finds messages kept for the same shard, is kept by the
+  sending shard's carrier, in order behind them, for as long as the target lives. The carrier asks each target for
+  room (A-279), tries once more, and waits with no timer; the target's drain wakes it. Nothing is spawned per message,
+  so neither a full task arena nor the runtime's admission can refuse a wait. Bound (CLAUDE.md §2 item 8): every kept
+  message answers a request in flight or is awaited by a task, so a shard keeps at most
+  `2 × forward_lane_bound + the task arenas`; past it a message is refused to its sender and counted. A target that has
+  left its loop is let go of, counted. A scatter's outgoing part, a request, keeps its budget and waits the same way.
+- **Why.** Goal g238 (perf's branch of 2026-11-09, agents/perf-replies). That branch waited in a task per reply,
+  which a full arena refused, and which a guard dropped inside the admission could not spawn at all: both fail first in
+  `xshard.rs`. Its pace, a tenth of a coordinator period, and the carrier's first form's, armed a timer a try and held a
+  reply up to that pace after the room came; A-279's wake, landed the day before for kept forwards, replaces it here.
+- **Cost.** A keep: a map insert, and a wake for the first message kept for a target. The carrier, at each wake: a send
+  try per target with messages kept, and for a target still full an ask (a map insert, two read-modify-writes and a
+  fence) and one more try. A target pays A-279's fence and load per drain that took a message. To measure (the
+  supervisor's): the 3,000-client rung's `xshard.reply_dropped` (about 4,200 before, 0 expected),
+  `xshard.room_waits_peak`, and each verb's p99 against main.
