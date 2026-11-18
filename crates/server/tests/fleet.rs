@@ -20528,6 +20528,379 @@ fn expect_version_two_through_the_rebuilt_replica(
   );
 }
 
+/// Shape: each partition's merge budget in [`a_successor_adopts_a_greens_ledger_past_its_merge_budget_and_keeps_it_across_its_restart`]:
+/// a quarter of the base's bytes, so the green's origin is past it as the Linux kernel's 1.67 GB is past the merge
+/// budget a 64 GB machine of 16 shards derives (a quarter of a shard's metadata reserve, about 333 MB), while every chain
+/// entry and work log the test makes is well within it.
+const ADOPT_MERGE_BUDGET: usize = ORIGIN_FILES * ORIGIN_FILE_BYTES / 4;
+/// Shape: the starts each node of the adoption test has an identity for: its first, and one warm restart.
+const ADOPT_STARTS: usize = 2;
+
+/// The three nodes of the adoption test over segments that outlive their daemons, each partition's merge budget
+/// [`ADOPT_MERGE_BUDGET`]: what starts each node, and restarts one warm over its segment.
+struct AdoptionFleet {
+  profiles: Vec<MachineProfile>,
+  anchors: Vec<HostId>,
+  seeds: Vec<HostId>,
+  identities: Vec<Vec<Identity>>,
+  certificates: Vec<rustls::pki_types::CertificateDer<'static>>,
+  _ports_lease: PortLease,
+  ports: Vec<(u16, u16)>,
+  configs: Vec<DaemonConfig>,
+  held: Vec<common::anchor::Anchor>,
+}
+
+impl AdoptionFleet {
+  /// The fleet, nothing started.
+  fn new() -> AdoptionFleet {
+    let pid = std::process::id();
+    let profiles: Vec<_> = ["adopt-a", "adopt-b", "adopt-c"]
+      .into_iter()
+      .map(profile)
+      .collect();
+    let anchors: Vec<_> = profiles.iter().map(anchor_of).collect();
+    let seeds: Vec<_> = anchors.iter().map(|anchor| member_id(*anchor, 0)).collect();
+    let identities: Vec<_> = profiles
+      .iter()
+      .map(|_| same_identity(ADOPT_STARTS))
+      .collect();
+    let certificates: Vec<_> = identities
+      .iter()
+      .map(|pair| pair[0].certificate())
+      .collect();
+    let (ports_lease, ports) = mesh_serve_ports(profiles.len());
+    let mut fleet = AdoptionFleet {
+      profiles,
+      anchors,
+      seeds,
+      identities,
+      certificates,
+      _ports_lease: ports_lease,
+      ports,
+      configs: Vec::new(),
+      held: Vec::new(),
+    };
+    for node in 0..fleet.profiles.len() {
+      let name = format!("adopt-{node}-{pid}");
+      let mut config = fleet_config(
+        &fleet.profiles[node],
+        &name,
+        fleet.anchors[node],
+        fleet.seeds[node],
+        &fleet.peers(node),
+        &Default::default(),
+      );
+      config.caps.green_chain_bytes = ADOPT_MERGE_BUDGET;
+      fleet.held.push(common::anchor::held_anchor(
+        &name,
+        &fleet.profiles[node],
+        &config,
+      ));
+      fleet.configs.push(config);
+    }
+    fleet
+  }
+
+  /// Node `node`'s peers: every other node, at its anchor, seed and serve ports.
+  fn peers(&self, node: usize) -> Vec<FleetPeer> {
+    (0..self.profiles.len())
+      .filter(|peer| *peer != node)
+      .map(|peer| {
+        fleet_peer_at(
+          self.anchors[peer],
+          self.seeds[peer],
+          self.ports[peer],
+          &self.certificates[peer],
+        )
+      })
+      .collect()
+  }
+
+  /// Starts node `node` over its segment: its first start, or a warm restart after a stop.
+  fn start(&mut self, node: usize) -> Daemon {
+    let identity = self.identities[node]
+      .pop()
+      .expect("an identity is left for this start");
+    start_fleet_node(
+      &self.profiles[node],
+      self.configs[node].clone(),
+      identity,
+      self.ports[node],
+      self.peers(node),
+      common::anchor::source_of(&self.held[node]),
+    )
+  }
+}
+
+/// On node a (`daemons[0]`): a green over the base of [`origin_base`], shared with the fleet, version 0 placed and held
+/// by both other nodes, then two versions submitted (each work `work-n` making `file-n`) and recomputed by both: the
+/// green, else what did not hold.
+fn based_green_at_version_two(daemons: &[Daemon]) -> Result<VolumeId, String> {
+  let mut client = Client::connect(daemons[0].instance());
+  let base = origin_base(&mut client, daemons[0].instance());
+  let created = client.call(&RequestBody::CreateGreen {
+    name: "adopted-green".to_owned(),
+    require_evidence: false,
+    base: Some(base),
+  });
+  let ReplyBody::GreenCreated { id: green } = created else {
+    return Err(format!("create the green over the base: {created:?}"));
+  };
+  share_with_fleet(&mut client, green, daemons);
+  let refs: Vec<&Daemon> = daemons.iter().collect();
+  let held_at = |version: u64| {
+    all_hold(daemons[1..].iter().map(|holder| {
+      holder
+        .merge_holder_state(green)
+        .map(|state| state.version.is_some_and(|at| at >= version))
+    }))
+  };
+  let placed = poll_until(&refs, ORIGIN_PLACE_WAIT, || {
+    Ok(daemons[0].merge_record_placed(green, 0)? && held_at(0)?)
+  });
+  if !placed {
+    return Err("version 0 placed and held by both holders".to_owned());
+  }
+  let answers = timed_submits(&mut client, green, 2);
+  let accepted = answers.iter().all(|(_, _, submitted, _)| {
+    matches!(
+      submitted,
+      ReplyBody::Submitted {
+        version: Some(_),
+        ..
+      }
+    )
+  });
+  if !accepted || !poll_until(&refs, PLACEMENT_DEADLINE, || held_at(2)) {
+    return Err(format!("two versions held by both holders: {answers:?}"));
+  }
+  Ok(green)
+}
+
+/// What a successor serves of the green it adopted: whether its head `version - 1` is placed, version 0's read of a base
+/// file, the head's read of version `version - 1`'s file, the reply to version `version`'s submit, and its counters.
+#[derive(Debug)]
+struct ServedGreen {
+  placed: bool,
+  origin_file: Result<bool, String>,
+  last_file: Result<Vec<u8>, String>,
+  next: ReplyBody,
+  counters: std::collections::BTreeMap<&'static str, u64>,
+}
+
+/// Observes the green `daemons[index]` adopted, `version - 1` versions in, and submits version `version` on it from a new
+/// work `work-n` making `file-n` (`n` being `version - 1`).
+fn served_and_advanced(
+  daemons: &[Daemon],
+  index: usize,
+  green: VolumeId,
+  version: u64,
+) -> ServedGreen {
+  let successor = &daemons[index];
+  let refs: Vec<&Daemon> = daemons.iter().collect();
+  let head = version.saturating_sub(1);
+  let placed = poll_until(&refs, PLACEMENT_DEADLINE, || {
+    successor.merge_record_placed(green, head)
+  });
+  let mut reader = origin_client(successor.instance());
+  let origin_file = reader
+    .read(green, &origin_green_path(0), ReadAt::Version { version: 0 })
+    .map(|bytes| bytes == origin_file_bytes(0))
+    .map_err(|error| format!("{error:?}"));
+  let last_file = reader
+    .read(
+      green,
+      &format!("file-{}", head.saturating_sub(1)),
+      ReadAt::Head,
+    )
+    .map_err(|error| format!("{error:?}"));
+  let next = submit_version_on(successor, green, version);
+  let counters = successor.refusals_on_every_shard().unwrap_or_default();
+  ServedGreen {
+    placed,
+    origin_file,
+    last_file,
+    next,
+    counters,
+  }
+}
+
+/// Submits version `version` of `green` on `node` from a new work `work-n` making `file-n` (`n` being `version - 1`): the
+/// submit's reply, or the refusal of the step before it.
+fn submit_version_on(node: &Daemon, green: VolumeId, version: u64) -> ReplyBody {
+  let index = version.saturating_sub(1);
+  let mut client = Client::connect(node.instance());
+  let created = client
+    .try_call(
+      &RequestBody::CreateWork {
+        green,
+        name: format!("work-{index}"),
+      },
+      *DEADLINE_NS,
+    )
+    .unwrap_or_else(|e| refused_placeholder(&e));
+  let ReplyBody::WorkCreated { id: work, .. } = created else {
+    return created;
+  };
+  let edited = client.call(&RequestBody::Edit {
+    work,
+    path: format!("file-{index}"),
+    at: 0,
+    delete_len: 0,
+    bytes: b"hello".to_vec(),
+  });
+  if !matches!(edited, ReplyBody::Edited) {
+    return edited;
+  }
+  client
+    .try_call(
+      &RequestBody::Submit {
+        work,
+        evidence: Vec::new(),
+      },
+      u64::try_from(PLACEMENT_DEADLINE.as_nanos()).unwrap_or(u64::MAX),
+    )
+    .unwrap_or_else(|e| refused_placeholder(&e))
+}
+
+/// A work over `green` made on `node`, with one edit of a file `kept` declared and not submitted: the work, or the
+/// refusal of the step that failed.
+fn work_with_an_unsubmitted_edit(node: &Daemon, green: VolumeId) -> Result<VolumeId, ReplyBody> {
+  let mut client = Client::connect(node.instance());
+  let created = client
+    .try_call(
+      &RequestBody::CreateWork {
+        green,
+        name: "work-kept".to_owned(),
+      },
+      *DEADLINE_NS,
+    )
+    .unwrap_or_else(|e| refused_placeholder(&e));
+  let ReplyBody::WorkCreated { id: work, .. } = created else {
+    return Err(created);
+  };
+  let edited = client.call(&RequestBody::Edit {
+    work,
+    path: "kept".to_owned(),
+    at: 0,
+    delete_len: 0,
+    bytes: b"kept".to_vec(),
+  });
+  match edited {
+    ReplyBody::Edited => Ok(work),
+    other => Err(other),
+  }
+}
+
+/// Submits `work` on `node`: the reply.
+fn submit_on(node: &Daemon, work: VolumeId) -> ReplyBody {
+  Client::connect(node.instance())
+    .try_call(
+      &RequestBody::Submit {
+        work,
+        evidence: Vec::new(),
+      },
+      u64::try_from(PLACEMENT_DEADLINE.as_nanos()).unwrap_or(u64::MAX),
+    )
+    .unwrap_or_else(|e| refused_placeholder(&e))
+}
+
+/// The adoption test's expectations of what the successor served `when`: its head placed, version 0 reading the base's
+/// file, the head reading the last version's file, version `version` accepted, and `counter` moved.
+fn expect_served(served: &ServedGreen, when: &str, version: u64, counter: &str) {
+  assert!(
+    served.placed,
+    "the successor placed the green's head {when}: {served:?}"
+  );
+  assert_eq!(
+    served.origin_file,
+    Ok(true),
+    "version 0 reads the base's file {when}: {served:?}"
+  );
+  assert_eq!(
+    served.last_file,
+    Ok(b"hello".to_vec()),
+    "the head reads the last version's file {when}: {served:?}"
+  );
+  assert!(
+    matches!(served.next, ReplyBody::Submitted { version: Some(at), .. } if at == version),
+    "version {version} is accepted {when}: {served:?}"
+  );
+  assert!(
+    served.counters.get(counter).copied().unwrap_or(0) > 0,
+    "{counter} moved {when}: {served:?}"
+  );
+}
+
+/// §4.16 owner-loss recovery ("Masked after takeover on a candidate that holds the ledger") and its failure matrix (a
+/// green's owner restart is masked), A-333; GAPS, "The many-client load test from 10,000 to 100,000 clients": one primary
+/// and two replicas editing the Linux kernel. A takeover successor rebuilt a green beside its ledger, recording the
+/// origin's bytes and every increment again in its partition, whose merge budget refused a kernel-sized origin: the
+/// takeover was given up, and losing the primary lost the green. Do: on three nodes at `f = 1` whose partitions' merge
+/// budget is a quarter of a base's bytes and whose state outlives their daemons, create a green over the base on node a
+/// (its origin past every node's budget), advance it two versions, stop a for good; then restart the successor warm.
+/// Expect the survivor rendezvous ranks first to adopt the green from its ledger (counted) and serve it — version 0 reads
+/// a base file, the head reads the second version's file, a third version commits with the other holder — and, after its
+/// restart, to re-adopt the green from the same ledger at boot (counted) and serve it again: a fourth version committed,
+/// and a work made on the successor before its restart, its edit unsubmitted, submitted as the fifth.
+#[test]
+fn a_successor_adopts_a_greens_ledger_past_its_merge_budget_and_keeps_it_across_its_restart() {
+  let _serial = serialize_fleet_tests();
+  let mut fleet = AdoptionFleet::new();
+  let mut daemons: Vec<Daemon> = (0..fleet.profiles.len())
+    .map(|node| fleet.start(node))
+    .collect();
+  daemons[0].bootstrap(true).unwrap();
+  settle_initial_consensus(&daemons, &fleet.seeds, &Default::default(), Quorum { f: 1 });
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  let green = match based_green_at_version_two(&daemons) {
+    Ok(green) => green,
+    Err(why) => {
+      for daemon in daemons {
+        daemon.stop();
+      }
+      panic!("setup: {why}");
+    }
+  };
+  daemons.remove(0).stop();
+  let successor = rendezvous_first(&[hosts[1], hosts[2]], ObjectId(green.bytes))
+    .expect("a survivor takes over the green");
+  let index = usize::from(successor != hosts[1]);
+  let adopted = served_and_advanced(&daemons, index, green, 3);
+  let kept = work_with_an_unsubmitted_edit(&daemons[index], green);
+  daemons.remove(index).stop();
+  daemons.insert(index, fleet.start(index + 1));
+  let readopted = served_and_advanced(&daemons, index, green, 4);
+  let kept_submitted = kept.as_ref().map(|work| submit_on(&daemons[index], *work));
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "adoption: after the takeover {adopted:?}; after the restart {readopted:?}; the kept work {kept:?}, submitted \
+     {kept_submitted:?}"
+  );
+  expect_served(&adopted, "after the takeover", 3, "merge.takeover.adopted");
+  expect_served(
+    &readopted,
+    "after the successor's restart",
+    4,
+    "merge.takeover.readopted",
+  );
+  assert!(
+    matches!(
+      kept_submitted,
+      Ok(ReplyBody::Submitted {
+        version: Some(5),
+        ..
+      })
+    ),
+    "the work made before the restart kept its edit and submitted it as version 5: {kept_submitted:?}"
+  );
+}
+
 /// §4.10 content retention, §4.16 "Commit" (the bug record of 2026-11-07, retention decoded every merge record per put).
 /// A holder's retention rule asked, for each manifest it held, whether any position of the green's merge ledger named it,
 /// decoding every position each time: quadratic in the green's history, so a submit at `f = 1` slowed by about 40 µs a

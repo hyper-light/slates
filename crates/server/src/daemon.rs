@@ -2688,41 +2688,58 @@ impl Daemon {
   ) -> Result<Vec<(u64, [u8; 32])>, ObserveError> {
     let object = slates_db::register::ObjectId(green.bytes);
     let volume = slates_db::catalog::VolumeId { bytes: green.bytes };
-    self.observe(self.shard_of_object(object), move |s| {
-      // The versions up to the green's checkpoint (W3) are named by the identities it keeps with them; the chain
-      // holds the versions after it.
-      let partition = s.db.partition();
-      let (held, mut identities) =
-        partition
+    let (adopted_through, mut identities) =
+      self.observe(self.shard_of_object(object), move |s| {
+        // The versions up to the green's checkpoint (W3) are named by the identities it keeps with them; the chain
+        // holds the versions after the green's floor: its checkpoint, else its adoption (A-333), else 0.
+        let partition = s.db.partition();
+        let held = partition.green_floor(volume);
+        let mut identities: Vec<(u64, [u8; 32])> = partition
           .green_checkpoint(volume)
-          .map_or((0, Vec::new()), |(held, bytes)| {
-            let accepted = slates_merge::checkpoint::Checkpoint::decode(bytes)
+          .map(|(_, bytes)| {
+            slates_merge::checkpoint::Checkpoint::decode(bytes)
               .map(|checkpoint| checkpoint.accepted)
-              .unwrap_or_default();
-            (
-              held,
-              accepted
-                .into_iter()
-                .map(|(id, version)| (version, id))
-                .collect(),
-            )
-          });
-      identities.sort_unstable();
-      identities.extend(partition.green_chain(volume).iter().enumerate().filter_map(
-        |(index, bytes)| {
-          slates_merge::chain_entry::decode(bytes).ok().map(|entry| {
-            (
-              u64::try_from(index)
-                .unwrap_or(u64::MAX)
-                .saturating_add(held)
-                .saturating_add(1),
-              entry.increment.id,
-            )
+              .unwrap_or_default()
+              .into_iter()
+              .map(|(id, version)| (version, id))
+              .collect()
           })
-        },
-      ));
-      identities
-    })
+          .unwrap_or_default();
+        identities.sort_unstable();
+        identities.extend(partition.green_chain(volume).iter().enumerate().filter_map(
+          |(index, bytes)| {
+            slates_merge::chain_entry::decode(bytes).ok().map(|entry| {
+              (
+                u64::try_from(index)
+                  .unwrap_or(u64::MAX)
+                  .saturating_add(held)
+                  .saturating_add(1),
+                entry.increment.id,
+              )
+            })
+          },
+        ));
+        // A green its takeover adopted from this node's holder ledger, with no checkpoint past the adoption, names the
+        // versions up to it by the ledger's records, which the control shard holds.
+        let adopted = partition
+          .green_adoption(volume)
+          .filter(|_| partition.green_checkpoint(volume).is_none())
+          .map(|adoption| adoption.version);
+        (adopted, identities)
+      })?;
+    if let Some(through) = adopted_through {
+      let mut ledger = self.observe(self.shards.first().copied(), move |s| {
+        (1..=through)
+          .filter_map(|version| {
+            crate::merge_origin::ledger_value(s, object, version)
+              .map(|value| (version, value.increment))
+          })
+          .collect::<Vec<_>>()
+      })?;
+      ledger.append(&mut identities);
+      identities = ledger;
+    }
+    Ok(identities)
   }
 
   /// The bytes the snapshot of `green`'s partition encodes to now (§4.8): what every snapshot taken when its log
@@ -5769,6 +5786,9 @@ async fn control_loop(
   }
   // Every shard has recovered and no client is admitted yet, so no clone is between its steps: the names' aliases are
   // reconciled with the clones they name (A-236).
+  // Every green a partition holds by its takeover's adoption is rebuilt from this node's ledger first (A-333), so no
+  // client meets one half built and every work over one is replayed after it.
+  crate::green_adopt::readopt_at_boot(control, &shards).await;
   // Likewise no work is between its steps: a work whose green lives on another partition is replayed through that
   // green's owner, and only then is every floor compared with the work it holds for (A-247).
   recover_works_across_partitions(control, &shards).await;
