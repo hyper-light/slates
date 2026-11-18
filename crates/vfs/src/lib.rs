@@ -32,6 +32,7 @@
 
 pub mod algebra;
 pub mod base;
+pub mod captured;
 pub mod checkpoint_log;
 pub mod clock;
 pub mod content;

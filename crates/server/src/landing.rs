@@ -587,6 +587,60 @@ struct Prepared {
   signature: Option<Vec<u8>>,
 }
 
+/// The captured snapshot a clone of a captured base is landed against (§4.15 `capture_base`, A-291's landing, stage 1):
+/// that snapshot's tree, when `volume` is a scratch clone of a snapshot recorded captured (`Op::BaseCaptured`) whose
+/// volume this shard serves; `None` for any other volume, which lands as before. A clone and its origin share one store
+/// (D-5), so a captured clone's capture is on its own shard; a capture it names that is not served here (its origin
+/// left unrecovered) is refused, never landed as a scratch volume, which would plan every file as a create and carry
+/// no removal. A clone moved to another node keeps no lineage there and still lands as a scratch volume (stage 2, GAPS
+/// g267).
+fn capture_of(
+  state: &ShardState,
+  volume: DbVolumeId,
+) -> Result<Option<slates_vfs::captured::FrozenTree>, Refusal> {
+  let partition = state.db.partition();
+  let scratch = partition
+    .volume(volume)
+    .is_some_and(|record| matches!(record.base, slates_db::catalog::BaseRecord::Scratch));
+  let Some(edge) = partition.lineage(volume).filter(|_| scratch) else {
+    return Ok(None);
+  };
+  if !partition.is_captured(edge.origin_volume, edge.origin_snapshot) {
+    return Ok(None);
+  }
+  let snapshot = crate::verbs::core_snapshot(SnapshotId {
+    value: edge.origin_snapshot.value,
+  });
+  let Some(origin) = state
+    .by_id
+    .get(&edge.origin_volume)
+    .and_then(|handle| state.volumes.get(*handle).ok())
+  else {
+    return Err(Refusal::Unsupported {
+      feature: "landing a captured clone whose capture this node does not serve".to_owned(),
+    });
+  };
+  origin
+    .volume
+    .frozen_tree(snapshot)
+    .map(Some)
+    .map_err(|error| refusal_of_vfs(&error))
+}
+
+/// A landing's beginning: against its capture for a captured clone ([`capture_of`]), else from the volume's own
+/// diverged entries.
+fn landing_beginning(
+  vol: &slates_vfs::volume::Volume,
+  target: &slates_land::engine::LandingTarget,
+  request: &LandingRequest,
+  against: Option<slates_vfs::captured::FrozenTree>,
+) -> Result<slates_land::engine::Beginning, slates_land::engine::LandingRefusal> {
+  match against {
+    Some(base) => slates_land::engine::Beginning::against_capture(vol, target, request, base),
+    None => slates_land::engine::Beginning::new(vol, target, request),
+  }
+}
+
 /// A presentation (§4.15 steps 1–3; AUD-29-07): the landing planned and its entries checked against the target without
 /// a write, answered `GrantRequired` with what a human grants. Planned in a task of the volume's owner shard a unit at a
 /// time (`slates_land::engine::Beginning` through `image::sliced`, §4.3 "Bounded work everywhere"), its reply deferred
@@ -603,6 +657,10 @@ fn defer_presentation(state: &mut ShardState, prepared: Prepared) -> ReplyBody {
   // The id names its owner partition (`verbs::landing_id`), so the `Grant` that later covers it routes to this shard,
   // where the presented record waits.
   let landing_id = crate::verbs::landing_id(state.partition, state.landing.next_landing);
+  let against = match capture_of(state, prepared.volume) {
+    Ok(against) => against,
+    Err(refusal) => return refused(refusal),
+  };
   let Ok(slot) = state.volumes.get_mut(prepared.handle) else {
     return refused(Refusal::NotFound);
   };
@@ -654,7 +712,7 @@ fn defer_presentation(state: &mut ShardState, prepared: Prepared) -> ReplyBody {
     media_durability: false,
     large_class_bytes: state.config.large_class_bytes,
   };
-  let beginning = match slates_land::engine::Beginning::new(&slot.volume, &land_target, &request) {
+  let beginning = match landing_beginning(&slot.volume, &land_target, &request, against) {
     Ok(beginning) => beginning,
     Err(refusal) => {
       give_host_back(slot, HostSlot::Owned(os), was_overlay, land_target.dir);
@@ -1599,6 +1657,10 @@ fn begin_granted(
     Ok(lease) => lease,
     Err(refusal) => return not_run(Unrun::Server(refusal), prepared.principal.clone()),
   };
+  let against = match capture_of(state, prepared.volume) {
+    Ok(against) => against,
+    Err(refusal) => return not_run(Unrun::Server(refusal), prepared.principal.clone()),
+  };
   let Ok(slot) = state.volumes.get_mut(prepared.handle) else {
     return not_run(Unrun::Server(Refusal::NotFound), prepared.principal.clone());
   };
@@ -1656,7 +1718,7 @@ fn begin_granted(
     media_durability: false,
     large_class_bytes: state.config.large_class_bytes,
   };
-  let beginning = match slates_land::engine::Beginning::new(&slot.volume, &land_target, &request) {
+  let beginning = match landing_beginning(&slot.volume, &land_target, &request, against) {
     Ok(beginning) => beginning,
     Err(refusal) => {
       give_host_back(slot, HostSlot::Owned(os), was_overlay, land_target.dir);

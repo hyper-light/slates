@@ -2,14 +2,23 @@
 //! its witnessed base and its overlay identity, in a canonical order with a canonical
 //! encoding, so the BLAKE3 of the encoding names exactly what a grant allows to be written.
 //! Planning walks the overlay's loaded nodes only (the diverged set), never the base.
+//!
+//! A clone of a captured base (§4.15 `capture_base`, A-291) is planned another way
+//! ([`PlanWalk::against_capture`]): its source tree against the captured snapshot's, over the paths where the two part
+//! (`slates_vfs::captured`), every entry judged by content alone ([`Judged::Content`]). Its files hold no witness of
+//! the target (the capture made every body the volume's own, and the target is another folder than the one the
+//! capture read), so a witness there is the BLAKE3 of the bytes the capture held and nothing else.
 
 use std::collections::BTreeMap;
 
 use slates_vfs::base::{Diverged, Divergence};
+use slates_vfs::captured::{ChangedPaths, FrozenTree, Held};
 use slates_vfs::dir::Child;
 use slates_vfs::error::VfsError;
 use slates_vfs::host::HostFs;
+use slates_vfs::ids::InodeNo;
 use slates_vfs::inode::{Fingerprint, Kind, Witness};
+use slates_vfs::names::NameEquivalence;
 use slates_vfs::volume::{Store, Volume};
 
 use crate::source::Source;
@@ -23,6 +32,15 @@ fn under(path: &str, prefix: &str) -> bool {
 const MAGIC: &[u8; 4] = b"SLMF";
 /// Format: the encoding version; bumped with any change to the layout.
 const VERSION: u16 = 1;
+/// Format: the encoding version of a manifest judged by content ([`Judged::Content`], A-291): the layout of
+/// [`VERSION`] with each witness tagged [`WITNESS_CONTENT`], so no grant of one binds a manifest of the other.
+const VERSION_CONTENT: u16 = 2;
+/// Format: a witness tag: none.
+const WITNESS_NONE: u8 = 0;
+/// Format: a witness tag: a fingerprint and an identity ([`Judged::Witness`]).
+const WITNESS_FINGERPRINT: u8 = 1;
+/// Format: a witness tag: an identity alone ([`Judged::Content`]).
+const WITNESS_CONTENT: u8 = 2;
 /// Format: the action tags of the encoding, in the order the design lists the actions.
 const TAG_CREATE: u8 = 0;
 /// Format: see `TAG_CREATE`.
@@ -95,6 +113,20 @@ pub struct OverlayIdentity {
   pub mtime_ns: i64,
 }
 
+/// How an entry's verdict judges the disk (§4.15 step 4).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Judged {
+  /// Against the witness the volume took of this host's own base: its fingerprint first, its bytes when that moved
+  /// (an overlay over the directory its base reads; a scratch volume, which has none).
+  #[default]
+  Witness,
+  /// By content alone, against what a captured base held (§4.15 `capture_base`, A-291's landing): the witness's
+  /// identity is the BLAKE3 of the captured bytes and its fingerprint means nothing, since the target is another
+  /// folder than the one the capture read; the disk is hashed for every entry with a witness
+  /// ([`crate::verdict::content_verdict`]).
+  Content,
+}
+
 /// One entry of the manifest.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LandingEntry {
@@ -107,6 +139,8 @@ pub struct LandingEntry {
   pub witnessed: Option<Witness>,
   /// The overlay's identity, for files.
   pub overlay: Option<OverlayIdentity>,
+  /// How its verdict judges the disk.
+  pub judged: Judged,
 }
 
 impl LandingEntry {
@@ -145,6 +179,9 @@ pub struct Manifest {
   pub summary: Summary,
   /// BLAKE3 of the canonical encoding.
   pub hash: [u8; 32],
+  /// How its entries are judged: a manifest judged by content is a captured clone's, whose landing leaves the volume
+  /// as it was (no base is taken from the target, A-291), even when it lands nothing.
+  pub basis: Judged,
 }
 
 /// The caller's filter: include and exclude prefixes; an entry is kept when it matches an
@@ -165,11 +202,16 @@ impl Filter {
 }
 
 impl Manifest {
-  /// The canonical encoding: little-endian, length-prefixed strings, entries in order.
-  pub fn encode(entries: &[LandingEntry]) -> Vec<u8> {
+  /// The canonical encoding: little-endian, length-prefixed strings, entries in order. A manifest judged by content
+  /// carries its own version and tags each witness as an identity alone.
+  pub fn encode(entries: &[LandingEntry], basis: Judged) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(MAGIC);
-    out.extend_from_slice(&VERSION.to_le_bytes());
+    let version = match basis {
+      Judged::Witness => VERSION,
+      Judged::Content => VERSION_CONTENT,
+    };
+    out.extend_from_slice(&version.to_le_bytes());
     out.extend_from_slice(
       &u32::try_from(entries.len())
         .unwrap_or(u32::MAX)
@@ -193,13 +235,17 @@ impl Manifest {
         }
         Action::Clear => out.push(TAG_CLEAR),
       }
-      match &e.witnessed {
-        Some(w) => {
-          out.push(1);
+      match (&e.witnessed, e.judged) {
+        (Some(w), Judged::Witness) => {
+          out.push(WITNESS_FINGERPRINT);
           put_fingerprint(&mut out, &w.fingerprint);
           out.extend_from_slice(&w.identity);
         }
-        None => out.push(0),
+        (Some(w), Judged::Content) => {
+          out.push(WITNESS_CONTENT);
+          out.extend_from_slice(&w.identity);
+        }
+        (None, _) => out.push(WITNESS_NONE),
       }
       match &e.overlay {
         Some(o) => {
@@ -216,7 +262,12 @@ impl Manifest {
   }
 
   /// Builds a manifest from entries: sorts them into landing order, summarizes, hashes.
-  pub fn from_entries(mut entries: Vec<LandingEntry>, filtered_out: usize) -> Self {
+  pub fn from_entries(entries: Vec<LandingEntry>, filtered_out: usize) -> Self {
+    Self::from_judged(entries, filtered_out, Judged::Witness)
+  }
+
+  /// [`Manifest::from_entries`] for a manifest whose entries are judged as `basis` says.
+  pub fn from_judged(mut entries: Vec<LandingEntry>, filtered_out: usize, basis: Judged) -> Self {
     entries.sort_by(|a, b| a.class().cmp(&b.class()).then_with(|| a.path.cmp(&b.path)));
     // Removals go bottom-up: deeper paths first within their class.
     let (mut keep, mut removals): (Vec<LandingEntry>, Vec<LandingEntry>) = entries
@@ -264,11 +315,12 @@ impl Manifest {
         .bytes
         .saturating_add(e.overlay.map_or(0, |o| o.size));
     }
-    let hash = *blake3::hash(&Self::encode(&entries)).as_bytes();
+    let hash = *blake3::hash(&Self::encode(&entries, basis)).as_bytes();
     Self {
       entries,
       summary,
       hash,
+      basis,
     }
   }
 
@@ -334,6 +386,24 @@ enum PlanStage {
     entries: Vec<LandingEntry>,
     filtered_out: usize,
   },
+  /// A clone of a captured base: the paths where its source parts from the capture, being found.
+  CaptureChanges {
+    /// The captured snapshot's tree.
+    base: FrozenTree,
+    /// The source's tree (a snapshot's, for a sliced plan).
+    source: FrozenTree,
+    /// The search.
+    changed: ChangedPaths,
+  },
+  /// Each candidate judged against the capture, in path order.
+  CaptureEntries {
+    base: FrozenTree,
+    source: FrozenTree,
+    paths: Vec<String>,
+    next: usize,
+    entries: Vec<LandingEntry>,
+    filtered_out: usize,
+  },
   /// Ended: the manifest was given out.
   Ended,
 }
@@ -348,6 +418,29 @@ impl PlanWalk {
     Ok(PlanWalk {
       source,
       stage: PlanStage::Diverged(walk),
+    })
+  }
+
+  /// A plan of `source` judged against the captured base `base` (§4.15 `capture_base`, A-291's landing): the paths
+  /// where `source` parts from the capture, each an entry judged by content ([`Judged::Content`]). For a clone of a
+  /// captured snapshot, which shares that snapshot's nodes; `base` must stay frozen while the plan runs (a capture is
+  /// pinned while a clone of it lives).
+  pub fn against_capture(
+    vol: &Volume,
+    source: Source,
+    base: FrozenTree,
+  ) -> Result<PlanWalk, VfsError> {
+    let tree = match source {
+      Source::Head => vol.head_tree(),
+      Source::Snapshot(id) => vol.frozen_tree(id)?,
+    };
+    Ok(PlanWalk {
+      source,
+      stage: PlanStage::CaptureChanges {
+        base,
+        source: tree,
+        changed: ChangedPaths::new(base, tree),
+      },
     })
   }
 
@@ -409,9 +502,225 @@ impl PlanWalk {
         };
         Ok(None)
       }
+      PlanStage::CaptureChanges {
+        base,
+        source,
+        mut changed,
+      } => {
+        self.stage = match changed.unit(store)? {
+          Some(paths) => PlanStage::CaptureEntries {
+            base,
+            source,
+            paths,
+            next: 0,
+            entries: Vec::new(),
+            filtered_out: 0,
+          },
+          None => PlanStage::CaptureChanges {
+            base,
+            source,
+            changed,
+          },
+        };
+        Ok(None)
+      }
+      PlanStage::CaptureEntries {
+        base,
+        source,
+        paths,
+        next,
+        mut entries,
+        mut filtered_out,
+      } => {
+        let Some(path) = paths.get(next) else {
+          return Ok(Some(Manifest::from_judged(
+            entries,
+            filtered_out,
+            Judged::Content,
+          )));
+        };
+        if filter.keeps(path) {
+          let trees = (base, source);
+          entries.extend(capture_entries(store, vol.policy(), trees, path)?);
+        } else {
+          filtered_out = filtered_out.saturating_add(1);
+        }
+        self.stage = PlanStage::CaptureEntries {
+          base,
+          source,
+          paths,
+          next: next.saturating_add(1),
+          entries,
+          filtered_out,
+        };
+        Ok(None)
+      }
       PlanStage::Ended => Err(VfsError::Invalid),
     }
   }
+}
+
+/// A witness judged by content: the identity of what a capture held, and no fingerprint ([`Judged::Content`]).
+fn content_witness(identity: [u8; 32]) -> Witness {
+  Witness {
+    fingerprint: Fingerprint::default(),
+    identity,
+    witnessed_at: 0,
+    racy: false,
+  }
+}
+
+/// The BLAKE3 of file `no`'s bytes in `tree`, read whole as the overlay's plan reads a file.
+fn tree_identity(
+  store: &Store,
+  tree: FrozenTree,
+  no: InodeNo,
+  size: u64,
+) -> Result<[u8; 32], VfsError> {
+  let mut bytes = vec![0u8; usize::try_from(size).map_err(|_| VfsError::FileTooLarge)?];
+  let read = slates_vfs::captured::read_file(store, tree, no, 0, &mut bytes)?;
+  bytes.truncate(read);
+  Ok(*blake3::hash(&bytes).as_bytes())
+}
+
+/// What the capture held at a path, as a witness judged by content: a file's bytes' identity, a symlink's target's.
+fn captured_identity(store: &Store, base: FrozenTree, held: &Held) -> Result<[u8; 32], VfsError> {
+  match held {
+    Held::File { no, size, .. } => tree_identity(store, base, *no, *size),
+    Held::Symlink { target } => Ok(*blake3::hash(target.as_bytes()).as_bytes()),
+    Held::Absent | Held::Dir { .. } | Held::Special => Ok([0; 32]),
+  }
+}
+
+/// The entries one candidate path makes (§4.15 step 1 for a captured clone, A-291): none where the capture and the
+/// source hold the same, else what the source holds there written over what the capture held. A file or symlink of
+/// the capture the source no longer holds is removed (`Delete`), a directory of it removed once emptied (`Rmdir`); a
+/// name whose kind changed is both a removal and a making, which the landing's class order meets as a type conflict
+/// (owed: a kind change lands as one entry). A symlink pointed elsewhere is one `Symlink`, as an overlay's is.
+fn capture_entries(
+  store: &Store,
+  policy: NameEquivalence,
+  (base, source): (FrozenTree, FrozenTree),
+  path: &str,
+) -> Result<Vec<LandingEntry>, VfsError> {
+  let was = slates_vfs::captured::held_at(store, base, policy, path)?;
+  let now = slates_vfs::captured::held_at(store, source, policy, path)?;
+  let entry =
+    |action: Action, witnessed: Option<Witness>, overlay: Option<OverlayIdentity>| LandingEntry {
+      path: path.into(),
+      action,
+      witnessed,
+      overlay,
+      judged: Judged::Content,
+    };
+  match (&was, &now) {
+    (Held::Absent, Held::Absent) | (Held::Dir { .. }, Held::Dir { .. }) => Ok(Vec::new()),
+    (
+      Held::File { .. },
+      Held::File {
+        no,
+        size,
+        mode,
+        mtime_ns,
+      },
+    ) => {
+      let captured = captured_identity(store, base, &was)?;
+      let hash = tree_identity(store, source, *no, *size)?;
+      Ok(if hash == captured {
+        Vec::new()
+      } else {
+        vec![entry(
+          Action::Replace,
+          Some(content_witness(captured)),
+          Some(OverlayIdentity {
+            hash,
+            size: *size,
+            mode: *mode,
+            mtime_ns: *mtime_ns,
+          }),
+        )]
+      })
+    }
+    (Held::Symlink { target: before }, Held::Symlink { target }) => Ok(if before == target {
+      Vec::new()
+    } else {
+      vec![entry(
+        Action::Symlink {
+          target: target.clone(),
+        },
+        None,
+        None,
+      )]
+    }),
+    _ => {
+      let mut out = Vec::new();
+      if let Some((action, witness)) = removal_of(store, base, &was)? {
+        out.push(entry(action, Some(witness), None));
+      }
+      if let Some((action, overlay)) = made_entry(store, source, &now)? {
+        out.push(entry(action, None, overlay));
+      }
+      Ok(out)
+    }
+  }
+}
+
+/// What removing what the capture held at a path does: a file, symlink or special name deleted while it is still what
+/// the capture held, a directory removed once emptied; nothing for a name the capture did not hold.
+fn removal_of(
+  store: &Store,
+  base: FrozenTree,
+  was: &Held,
+) -> Result<Option<(Action, Witness)>, VfsError> {
+  Ok(match was {
+    Held::Absent => None,
+    Held::Dir { .. } => Some((Action::Rmdir, content_witness([0; 32]))),
+    Held::File { .. } | Held::Symlink { .. } | Held::Special => Some((
+      Action::Delete,
+      content_witness(captured_identity(store, base, was)?),
+    )),
+  })
+}
+
+/// What making `held` writes: its action and, for a file or directory, its identity.
+fn made_entry(
+  store: &Store,
+  source: FrozenTree,
+  held: &Held,
+) -> Result<Option<(Action, Option<OverlayIdentity>)>, VfsError> {
+  Ok(match held {
+    Held::Absent => None,
+    Held::File {
+      no,
+      size,
+      mode,
+      mtime_ns,
+    } => Some((
+      Action::Create,
+      Some(OverlayIdentity {
+        hash: tree_identity(store, source, *no, *size)?,
+        size: *size,
+        mode: *mode,
+        mtime_ns: *mtime_ns,
+      }),
+    )),
+    Held::Dir { mode, mtime_ns } => Some((
+      Action::Mkdir,
+      Some(OverlayIdentity {
+        hash: [0; 32],
+        size: 0,
+        mode: *mode,
+        mtime_ns: *mtime_ns,
+      }),
+    )),
+    Held::Symlink { target } => Some((
+      Action::Symlink {
+        target: target.clone(),
+      },
+      None,
+    )),
+    Held::Special => return Err(VfsError::SpecialFileOperation),
+  })
 }
 
 fn origin_of(vol: &Volume, store: &Store, source: Source, path: &str) -> Option<Box<str>> {
@@ -451,6 +760,7 @@ fn entry_for(
         action,
         witnessed,
         overlay: None,
+        judged: Judged::Witness,
       }))
     }
     Divergence::Redirect => {
@@ -468,6 +778,7 @@ fn entry_for(
         action: Action::Rename { from },
         witnessed,
         overlay: None,
+        judged: Judged::Witness,
       }))
     }
     Divergence::Created | Divergence::Witnessed => {
@@ -499,6 +810,7 @@ fn entry_for(
               mode: attrs.mode,
               mtime_ns: attrs.mtime,
             }),
+            judged: Judged::Witness,
           }))
         }
         Child::Symlink(no) => Ok(Some(LandingEntry {
@@ -508,6 +820,7 @@ fn entry_for(
           },
           witnessed: None,
           overlay: None,
+          judged: Judged::Witness,
         })),
         Child::Fifo(_) | Child::Socket(_) | Child::BlockDevice(_) | Child::CharDevice(_) => {
           Err(VfsError::SpecialFileOperation)
@@ -533,6 +846,7 @@ fn entry_for(
               mode: attrs.mode,
               mtime_ns: attrs.mtime,
             }),
+            judged: Judged::Witness,
           }))
         }
         Child::Whiteout => Ok(None),

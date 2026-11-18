@@ -2986,54 +2986,7 @@ impl Volume {
       .snapshots
       .get(snapshot_handle(id))
       .map_err(|_| VfsError::StaleHandle)?;
-    let inode = exact_inode(store, s.inode_root, no)?;
-    if inode.kind.is_special() {
-      return Err(VfsError::SpecialFileOperation);
-    }
-    let size = inode.attrs.size;
-    if off >= size {
-      return Ok(0);
-    }
-    let want = usize::try_from(
-      size
-        .saturating_sub(off)
-        .min(u64::try_from(buf.len()).unwrap_or(u64::MAX)),
-    )
-    .unwrap_or(0);
-    let out = buf.get_mut(..want).unwrap_or_default();
-    out.fill(0);
-    let read_end = off.saturating_add(u64::try_from(want).unwrap_or(u64::MAX));
-    match &inode.body {
-      Body::Inline(bytes) => copy_range(bytes, 0, off, out),
-      Body::Sealed(extents) => {
-        for e in overlapping(extents, off, read_end) {
-          store.content.read_extent_into(e, off, out)?;
-        }
-      }
-      Body::Open { open, sealed } => {
-        for e in overlapping(sealed, off, read_end) {
-          store.content.read_extent_into(e, off, out)?;
-        }
-        copy_range(store.content.open_bytes(open), open.off, off, out);
-      }
-      // A base-backed file as the snapshot froze it: the same rule as the head's `read` — its pinned
-      // extents serve, an unpinned range needs the host (a snapshot has none lent: `BaseUnavailable`),
-      // and a lost entry is `BaseDrift`, never zeros presented as content.
-      Body::Base(b) => {
-        if b.lost {
-          return Err(VfsError::BaseDrift);
-        }
-        let unpinned = off < b.base_len && !covers(&b.pinned, off, read_end);
-        if unpinned {
-          return Err(VfsError::BaseUnavailable(0));
-        }
-        for e in overlapping(&b.pinned, off, read_end) {
-          store.content.read_extent_into(e, off, out)?;
-        }
-      }
-      Body::None | Body::Directory(_) | Body::Symlink(_) | Body::BaseLink(_) | Body::Device(_) => {}
-    }
-    Ok(want)
+    read_frozen_body(store, exact_inode(store, s.inode_root, no)?, off, buf)
   }
 
   /// A symlink's target as a snapshot holds it.
@@ -7134,6 +7087,63 @@ fn materialized_windows_in(
     _ => {}
   }
   map
+}
+
+/// The bytes of a frozen inode's body from `off`, as far as `buf` holds (a snapshot's file, or a captured base's in
+/// [`crate::captured::read_file`]): its inline bytes, its sealed and open extents, or a base body's pinned ranges.
+pub(crate) fn read_frozen_body(
+  store: &Store,
+  inode: &Inode,
+  off: u64,
+  buf: &mut [u8],
+) -> Result<usize, VfsError> {
+  if inode.kind.is_special() {
+    return Err(VfsError::SpecialFileOperation);
+  }
+  let size = inode.attrs.size;
+  if off >= size {
+    return Ok(0);
+  }
+  let want = usize::try_from(
+    size
+      .saturating_sub(off)
+      .min(u64::try_from(buf.len()).unwrap_or(u64::MAX)),
+  )
+  .unwrap_or(0);
+  let out = buf.get_mut(..want).unwrap_or_default();
+  out.fill(0);
+  let read_end = off.saturating_add(u64::try_from(want).unwrap_or(u64::MAX));
+  match &inode.body {
+    Body::Inline(bytes) => copy_range(bytes, 0, off, out),
+    Body::Sealed(extents) => {
+      for e in overlapping(extents, off, read_end) {
+        store.content.read_extent_into(e, off, out)?;
+      }
+    }
+    Body::Open { open, sealed } => {
+      for e in overlapping(sealed, off, read_end) {
+        store.content.read_extent_into(e, off, out)?;
+      }
+      copy_range(store.content.open_bytes(open), open.off, off, out);
+    }
+    // A base-backed file as the snapshot froze it: the same rule as the head's `read` — its pinned
+    // extents serve, an unpinned range needs the host (a snapshot has none lent: `BaseUnavailable`),
+    // and a lost entry is `BaseDrift`, never zeros presented as content.
+    Body::Base(b) => {
+      if b.lost {
+        return Err(VfsError::BaseDrift);
+      }
+      let unpinned = off < b.base_len && !covers(&b.pinned, off, read_end);
+      if unpinned {
+        return Err(VfsError::BaseUnavailable(0));
+      }
+      for e in overlapping(&b.pinned, off, read_end) {
+        store.content.read_extent_into(e, off, out)?;
+      }
+    }
+    Body::None | Body::Directory(_) | Body::Symlink(_) | Body::BaseLink(_) | Body::Device(_) => {}
+  }
+  Ok(want)
 }
 
 /// The inode numbered exactly `no` under the inode table `root`. The table is keyed by the number's 48-bit

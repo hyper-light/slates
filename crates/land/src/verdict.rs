@@ -1,6 +1,9 @@
 //! The per-entry verdict (§4.15 step 4; AC-1.12): a pure function of three inputs, the
 //! witnessed base, the disk now, and the overlay; the table is the specification and the test
 //! enumerates it. No verdict ever writes; a conflict refuses the whole landing.
+//!
+//! An entry of a captured clone's landing is judged by content alone ([`content_verdict`]; §4.15 `capture_base`,
+//! A-291): the witness is the identity of what the capture held, and the disk's bytes are what is compared with it.
 
 use slates_vfs::inode::{Fingerprint, Witness};
 
@@ -95,6 +98,83 @@ pub fn verdict(
     },
     Action::Clear | Action::Rmdir => removed_dir(action, witnessed, disk),
     Action::Rename { .. } => renamed(witnessed, disk),
+  }
+}
+
+/// The verdict for an entry judged by content alone ([`crate::manifest::Judged::Content`]; §4.15 `capture_base`,
+/// A-291's landing): the witness's identity is the BLAKE3 of what a capture held there, its fingerprint is ignored (the
+/// target is another folder than the one the capture read), and the disk's bytes are hashed for every entry with a
+/// witness. A file is overwritten only while the disk still holds the captured bytes (or accepted when it already holds
+/// the volume's), removed only while it still holds them, and a directory is removed only once nothing is left in it
+/// that this landing does not remove itself (`holds_only_ours` over the manifest's removals), never with what an
+/// outsider put there. Creations hold no witness and are judged as the witness table judges them; a content manifest
+/// makes no clear and no rename (a moved directory is its paths removed and made).
+pub fn content_verdict(
+  action: &Action,
+  witnessed: Option<&Witness>,
+  disk: DiskState,
+  overlay: Option<&OverlayIdentity>,
+) -> Verdict {
+  match action {
+    Action::Replace => content_replaced(witnessed, disk, overlay),
+    Action::Delete => match (witnessed, disk) {
+      (_, DiskState::Absent) => Verdict::Skip,
+      (
+        Some(w),
+        DiskState::File {
+          identity: Some(id), ..
+        },
+      ) if id == w.identity => Verdict::Apply,
+      (_, DiskState::File { .. }) => Verdict::Conflict(ConflictClass::DeleteModify),
+      (_, DiskState::Symlink) => Verdict::Apply,
+      (_, DiskState::Dir { .. } | DiskState::AtDestination(_)) => {
+        Verdict::Conflict(ConflictClass::TypeChanged)
+      }
+    },
+    Action::Rmdir => match disk {
+      DiskState::Absent => Verdict::Skip,
+      DiskState::Dir {
+        holds_only_ours: true,
+        ..
+      } => Verdict::Apply,
+      DiskState::Dir { .. } | DiskState::AtDestination(_) => {
+        Verdict::Conflict(ConflictClass::DeleteModify)
+      }
+      DiskState::File { .. } | DiskState::Symlink => Verdict::Conflict(ConflictClass::TypeChanged),
+    },
+    Action::Create
+    | Action::Symlink { .. }
+    | Action::Mkdir
+    | Action::Clear
+    | Action::Rename { .. } => verdict(action, witnessed, disk, overlay),
+  }
+}
+
+/// A file the capture held, which the volume changed: written while the disk still holds the captured bytes.
+fn content_replaced(
+  witnessed: Option<&Witness>,
+  disk: DiskState,
+  overlay: Option<&OverlayIdentity>,
+) -> Verdict {
+  let Some(w) = witnessed else {
+    return created(&Action::Create, disk, overlay);
+  };
+  match disk {
+    DiskState::Absent => Verdict::Conflict(ConflictClass::ModifyDelete),
+    DiskState::Dir { .. } | DiskState::Symlink | DiskState::AtDestination(_) => {
+      Verdict::Conflict(ConflictClass::TypeChanged)
+    }
+    DiskState::File { identity, .. } => {
+      let ours = overlay.map(|o| o.hash);
+      if ours == Some(w.identity) {
+        return Verdict::Skip;
+      }
+      match identity {
+        Some(id) if id == w.identity => Verdict::Apply,
+        Some(id) if Some(id) == ours => Verdict::AcceptIdentical,
+        _ => Verdict::Conflict(ConflictClass::ModifyModify),
+      }
+    }
   }
 }
 
@@ -500,6 +580,172 @@ mod tests {
         "{action:?} witnessed={witnessed:?} disk={disk:?}"
       );
     }
+  }
+
+  /// AC-1.12 for a captured clone's landing (A-291): each row of the content table. The fingerprints differ from the
+  /// witness's in every row (the target is another folder than the capture read), so only the bytes decide: an
+  /// untouched target is written, one already holding the volume's bytes is accepted, one an outsider changed is a
+  /// conflict, a deletion is carried only over the captured bytes, and a directory is removed only once emptied.
+  #[test]
+  fn the_content_table() {
+    let captured = [1u8; 32];
+    let ours = [2u8; 32];
+    let outsider = [3u8; 32];
+    let w = Witness {
+      fingerprint: Fingerprint::default(),
+      ..witness(7, captured)
+    };
+    let disk = |id: [u8; 32]| file(fp(99, 50), Some(id));
+    let rows: Vec<Row> = vec![
+      (
+        Action::Replace,
+        Some(w),
+        disk(captured),
+        Some(overlay(ours)),
+        Verdict::Apply,
+      ),
+      (
+        Action::Replace,
+        Some(w),
+        disk(ours),
+        Some(overlay(ours)),
+        Verdict::AcceptIdentical,
+      ),
+      (
+        Action::Replace,
+        Some(w),
+        disk(outsider),
+        Some(overlay(ours)),
+        Verdict::Conflict(ConflictClass::ModifyModify),
+      ),
+      (
+        Action::Replace,
+        Some(w),
+        file(fp(99, 50), None),
+        Some(overlay(ours)),
+        Verdict::Conflict(ConflictClass::ModifyModify),
+      ),
+      (
+        Action::Replace,
+        Some(w),
+        DiskState::Absent,
+        Some(overlay(ours)),
+        Verdict::Conflict(ConflictClass::ModifyDelete),
+      ),
+      (
+        Action::Replace,
+        Some(w),
+        dir(dir_fp(99)),
+        Some(overlay(ours)),
+        Verdict::Conflict(ConflictClass::TypeChanged),
+      ),
+      (
+        Action::Replace,
+        Some(w),
+        disk(outsider),
+        Some(overlay(captured)),
+        Verdict::Skip,
+      ),
+      (
+        Action::Delete,
+        Some(w),
+        disk(captured),
+        None,
+        Verdict::Apply,
+      ),
+      (
+        Action::Delete,
+        Some(w),
+        disk(outsider),
+        None,
+        Verdict::Conflict(ConflictClass::DeleteModify),
+      ),
+      (
+        Action::Delete,
+        Some(w),
+        DiskState::Absent,
+        None,
+        Verdict::Skip,
+      ),
+      (
+        Action::Delete,
+        Some(w),
+        dir(dir_fp(99)),
+        None,
+        Verdict::Conflict(ConflictClass::TypeChanged),
+      ),
+      (
+        Action::Rmdir,
+        Some(w),
+        DiskState::Absent,
+        None,
+        Verdict::Skip,
+      ),
+      (
+        Action::Rmdir,
+        Some(w),
+        DiskState::Dir {
+          fingerprint: dir_fp(99),
+          holds_only_ours: true,
+        },
+        None,
+        Verdict::Apply,
+      ),
+      (
+        Action::Rmdir,
+        Some(w),
+        dir(dir_fp(99)),
+        None,
+        Verdict::Conflict(ConflictClass::DeleteModify),
+      ),
+      (
+        Action::Rmdir,
+        Some(w),
+        disk(captured),
+        None,
+        Verdict::Conflict(ConflictClass::TypeChanged),
+      ),
+      (
+        Action::Create,
+        None,
+        DiskState::Absent,
+        Some(overlay(ours)),
+        Verdict::Apply,
+      ),
+      (
+        Action::Create,
+        None,
+        disk(ours),
+        Some(overlay(ours)),
+        Verdict::Skip,
+      ),
+      (
+        Action::Create,
+        None,
+        disk(outsider),
+        Some(overlay(ours)),
+        Verdict::Conflict(ConflictClass::CreateCreate),
+      ),
+      (Action::Mkdir, None, DiskState::Absent, None, Verdict::Apply),
+    ];
+    for (action, witnessed, disk, overlay, expected) in rows {
+      let got = content_verdict(&action, witnessed.as_ref(), disk, overlay.as_ref());
+      assert_eq!(
+        got, expected,
+        "{action:?} disk={disk:?} overlay={overlay:?}"
+      );
+    }
+    // The witness table would have taken the moved fingerprint for an outsider's change: the same untouched target
+    // is a conflict there, which is why a captured clone's entries are judged by content.
+    assert_eq!(
+      verdict(
+        &Action::Replace,
+        Some(&w),
+        disk(captured),
+        Some(&overlay(ours))
+      ),
+      Verdict::Conflict(ConflictClass::ModifyModify)
+    );
   }
 
   /// A racy witness (fingerprint inside the timestamp window) is trusted only with the hash.
