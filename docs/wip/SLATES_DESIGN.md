@@ -30537,6 +30537,8 @@ Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class A), 
 - **Test.** `a_location_round_waits_for_its_slowest_asked_peers_measured_round_trip` (`crates/server/src/
   owner_location.rs`): the round's budget with no path measured extends past its base; with the slowest asked path's
   tail at two liveness windows, its base deadline and its span are past that tail.
-  EVIDENCE_PLACEHOLDER
+  Run on the Mac Studio (kiln, 2026-11-18, load 7-12, debug build, `cargo test --locked -p slates-server --lib --
+  owner_location`): 6 of 6. Red-checked once: with the round back at one liveness window, hard, the test fails at its
+  first look, a quiet round that never extends. The fleet's location flows are filed for main's run.
 
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class B), `crates/server/src/{owner_location,fleet}.rs`.
