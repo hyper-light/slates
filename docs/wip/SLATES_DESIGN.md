@@ -10526,9 +10526,11 @@ blocks it. Rejects are non-blocking; the merge task never stalls on a conflict.
 **Rebase off the owner (A-273).** A shard that holds works of a green keeps a replica of it: the engine made from the
 owner's, fed the owner's versions and folds in order, its content the owner's sealed blocks read in place, so a rebase
 and a read at a version it holds need not cross to the owner's one thread. Each structure the replica adds is bounded
-by its holder's derivation with a typed refusal (its own metadata against its shard's class, the replicas an owner
-takes, the bytes an owner keeps for a lagging one, one message's blocks), and every refusal sends the replica's work
-to the owner. Built in the engine (steps 1 to 4); on the shards owed (step 5).
+by a derivation from the machine with a typed refusal: the replicas an owner takes (one on each other shard of its
+node and its rebuild's fresh one; none with one shard), a replica's own metadata (no more than its owner's per-green
+budget and its shard's room), the bytes an owner keeps for lagging ones (the room its per-green budget leaves beyond
+its own retention), and one message's blocks; and every refusal sends the replica's work to the owner until it is
+rebuilt. Built in the engine (steps 1 to 4); on the shards owed (step 5).
 
 **Attachments and versions.** Mounts and SDK attachments of green pin a version;
 `advance(attachment, version)` re-pins and invalidates exactly the paths the manifest diff
@@ -25009,22 +25011,33 @@ its owner's (2026-11-18, found by Miri): the owner's holder makes every replica 
 (`SealedBlocks::end`, refused while a reader is registered); an owner dropped with a replica still registered frees
 nothing, since the replica may still read, and is counted (`sealed::dropped_with_readers`; the bug record of
 2026-11-18, "a sealed-block writer dropped with a reader kept its blocks"). Step 4 built 2026-11-18 (g083): the
-bounds, each a typed refusal that ends with the replica given back (`Replica::leave`) and its work going to the owner.
-A replica's metadata (`Green::metadata_bytes`: piece lists, change index, IPC history, deltas, accepted record and its
-chunk table, running totals all) is held to the budget its holder gives it, a share of its shard's metadata class:
-refused at its making (`Unfit::OverBudget`) and after a message that takes it past (`FeedRefusal::OverBudget`). The
-owner takes as many replicas as its holder allows (one a shard that may hold its works; `ReplicaRefusal::Full`). Past
-the bytes its holder lets it keep for them (`Green::set_replica_held_limit`, from its memory class's headroom), the
-owner evicts its slowest replica, one at a time; every later message names it and it refuses the first it is given
+bounds, each derived from the machine by a stated formula its holder applies (`crates/merge/src/replica.rs`) and each a
+typed refusal that ends with the replica rebuilt from the owner (`Replica::rebuild`) or given back (`Replica::leave`),
+its work going to the owner until one is made again. The replicas an owner takes: `replica_limit` = (shards − 1) × 2,
+one on each other shard of its node and beside it the fresh one its rebuild makes before the old one is given back;
+none with one shard (R8); past it `ReplicaRefusal::Full`, and a replica makes none (`ReplicaRefusal::NotAnOwner`). A
+replica's metadata (`Green::metadata_bytes`: piece lists, change index, IPC history, deltas, accepted record and its
+chunk table, running totals all): `replica_budget` = min(the per-green budget its owner's retention is folded to, the
+partition's `green_chain_bytes`, its shard's table share; the room its own shard has for it now), since a replica folds
+where its owner folds and is never larger than its owner may be; refused at its making and at a rebuild
+(`Unfit::OverBudget`, the fresh green's registration given back) and after a message that takes it past
+(`FeedRefusal::OverBudget`). The bytes an owner keeps for its replicas, which are charged to its own per-green budget:
+`held_limit` = that budget less the owner's own retention (`Green::retention_charge` less `Green::content_held_bytes`;
+`Green::set_replica_held_limit`), so a lagging replica never takes the room of the owner's own work. Past it the owner
+evicts its slowest replica, one at a time; every later message names it and it refuses the first it is given
 (`FeedRefusal::Evicted`, before any other check), keeping its frees until it leaves, so the bound costs a replica,
 never a read of freed bytes (`merge.replica.dropped_lagging`). A change made while the last was still unsent evicts
 every replica, which could not be fed in order (`merge.replica.dropped_unfed`), so the owner records one message's
 blocks at most. The key indexes, one entry a path, are the owner's own bound; a reader's live table is the owner's live
 blocks, and its adoption queue one message's. Proven by the sealed blocks' tests (a join past the limit refused; the
 slowest reader evicted past the held limit, reading what it holds until it leaves; a change left unfed evicting every
-reader) and the replica's (each bound driven to its refusal, the replica given back and made again; red with the
-eviction disabled, both lag tests fail). The derivations of the limits, an idle replica's give-back and the shards' use
-of it (step 5) are owed. The text and its measurements are perf's (2026-11-11, `agents/perf-a273`, never pushed); the
+reader; every writer ended once its readers left) and the replica's (each bound driven to its refusal at its derived
+value, the replica rebuilt or given back and made again; one shard takes no replica; an owner with no room beyond its
+own retention evicts at its first release; red with the eviction disabled, RED_CHECK_RESULT). Owed (step 5): the
+holder on the shards applies the derivations to the machine's figures and logs them with the boot profile's, charges a
+replica's metadata to its shard's budget, routes a refused or evicted replica's rebases and reads to the owner, counted,
+gives back an idle one (its idle period derived from the feed's cost per version against the rebases it served), and
+makes a green's replicas leave before it gives the owner up. The text and its measurements are perf's (2026-11-11, `agents/perf-a273`, never pushed); the
 content question it left open was decided by the supervisor on 2026-11-17 by A-64 and D-7 (below). W1 (A-247), whose
 works off the owner it builds on, landed on 2026-11-17 (3c0af9399).
 

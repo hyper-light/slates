@@ -724,14 +724,18 @@
 > checked byte for byte; the owner frees a released block once every replica has passed its release. A replica's
 > lifetime is bounded by its owner's: the owner's holder makes every replica leave before it gives the owner up
 > (`SealedBlocks::end`), and an owner dropped with one still registered frees nothing and is counted (Miri found a
-> test that never made its reader leave; the bug record of 2026-11-18). **Built (step 4,
-> 2026-11-18, g083):** the bounds, each a typed refusal that gives the replica back and sends its work to the owner: its
-> metadata (`Green::metadata_bytes`) against its holder's budget (`OverBudget`, at its making and after a message); the
-> replicas an owner takes (`ReplicaRefusal::Full`); past the bytes an owner keeps for them, its slowest replica evicted
+> test that never made its reader leave; the bug record of 2026-11-18). **Built (step 4, 2026-11-18, g083):** the
+> bounds, each derived from the machine by a stated formula (`crates/merge/src/replica.rs`) and each a typed refusal
+> after which the replica is rebuilt from the owner or given back, its work going to the owner: the replicas an owner
+> takes, `replica_limit` = (shards − 1) × 2, none with one shard (`ReplicaRefusal::Full`); a replica's metadata
+> (`Green::metadata_bytes`) against `replica_budget` = min(the owner's per-green budget, its shard's room)
+> (`OverBudget`, at its making, at a rebuild and after a message); the bytes an owner keeps for them against
+> `held_limit` = the per-green budget less the owner's own retention, past which its slowest replica is evicted
 > (`FeedRefusal::Evicted`, keeping its frees until it leaves); a change made while the last was unsent evicting every
 > replica (one message's blocks recorded at most). **Owed, in order:** the code on the shards (step 5: the holder
-> derives each limit from the machine, routes a refused or evicted replica's rebases and reads to the owner, counted,
-> and gives back an idle one); the supervisor's A/B.
+> applies the derivations to the machine's figures and logs them, charges a replica to its shard's budget, routes a
+> refused or evicted replica's rebases and reads to the owner, counted, gives back an idle one, and makes a green's
+> replicas leave before it gives the owner up); the supervisor's A/B.
 >
 > **A Shards guest's unprivileged run could not write a host-owned volume: built, the stream takes Shards' owner word
 > (2026-11-18, §4.6 the Shards form; A-281; goal g268).** Shards' init names the run's owner on a share's root with

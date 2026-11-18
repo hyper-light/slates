@@ -26,15 +26,16 @@ use common::generated::{Raw, increment_of, origin_of, path, raw};
 use proptest::prelude::*;
 use slates_mem::sealed::Passed;
 use slates_merge::engine::{Green, Outcome};
-use slates_merge::replica::{Fed, FeedBody, FeedMessage, FeedRefusal, Replica};
+use slates_merge::replica::{Fed, FeedBody, FeedMessage, FeedRefusal, Replica, replica_limit};
 
 /// Shape: the alphabet's indices the comparisons walk: every path `common::generated::path` can name.
 const PATH_INDICES: u8 = 7;
 /// Shape: the generated increments each final comparison rebases over every base both greens hold.
 const PROBES: usize = 3;
-/// Shape: the replicas the owner takes: a rebuild holds two registrations for a moment, the fresh one made before the
-/// old one is given back.
-const READERS: usize = 2;
+/// Shape: the owner's node: its own shard and the replica's. The owner takes the replicas this derives
+/// ([`replica_limit`]), so a rebuild, which holds two registrations for a moment (the fresh one made before the old one
+/// is given back), is within the derived bound.
+const SHARDS: usize = 2;
 /// Shape: the replica's budget: unbounded, since the oracle holds the replica equal to its owner, not to a bound (the
 /// bounds' own tests are the unit tests of `crates/merge/src/replica.rs`).
 const BUDGET: usize = usize::MAX;
@@ -166,7 +167,7 @@ impl History {
 
   /// The replica rebuilt from the owner now, after it refused a message; its old registration given back.
   fn rebuild(&mut self) {
-    let fresh = self.owner.replica(READERS).unwrap();
+    let fresh = self.owner.replica(replica_limit(SHARDS)).unwrap();
     let left = self
       .replica
       .as_mut()
@@ -260,7 +261,7 @@ impl History {
           self.owner.leave_replica(old.leave().unwrap());
           self.acks.clear();
         }
-        self.replica = Some(Replica::new(self.owner.replica(READERS).unwrap(), BUDGET).unwrap());
+        self.replica = Some(Replica::new(self.owner.replica(replica_limit(SHARDS)).unwrap(), BUDGET).unwrap());
       }
     }
     self.check_at_the_replicas_head();
@@ -308,16 +309,7 @@ impl History {
   fn finish(mut self, probes: &[Raw]) -> Ran {
     self.deliver(self.inflight.len());
     self.acknowledge(self.acks.len());
-    // A lost last message is followed by none the replica could refuse as a gap, so it stays behind, as a lagging
-    // replica does: the owner's next message would be refused and the replica rebuilt. The history ends before one is
-    // sent, so that rebuild is made here.
-    if self
-      .replica
-      .as_ref()
-      .is_some_and(|replica| replica.position() < self.owner.feed_position())
-    {
-      self.rebuild();
-    }
+    self.rebuild_if_behind();
     let names = self.names();
     let Some(mut replica) = self.replica.take() else {
       return self.ran;
@@ -325,57 +317,9 @@ impl History {
     self.acknowledge(self.acks.len());
     let owner = &mut self.owner;
     let green = replica.green_mut();
-    assert_eq!(green.head(), owner.head(), "the replica caught up");
-    assert_eq!(green.head_identity(), owner.head_identity());
-    assert_eq!(
-      green.head_identity(),
-      green.head_identity_from_scratch(),
-      "the replica's identity is its state's"
-    );
-    assert_eq!(
-      green.folded_below(),
-      owner.folded_below(),
-      "the replica keeps the history its owner keeps, and no more"
-    );
-    for name in &names {
-      if let (Some(mine), Some(theirs)) = (green.content(name), owner.content(name)) {
-        assert!(
-          std::ptr::eq(mine.as_ptr(), theirs.as_ptr()) && mine.len() == theirs.len(),
-          "{name}'s current bytes are the owner's own, read in place"
-        );
-      }
-    }
-    assert_eq!(green.content_reads_refused(), 0);
-    let floor = owner.folded_below();
-    for version in floor..=owner.head() {
-      for name in &names {
-        assert_eq!(
-          green.content_at(name, version),
-          owner.content_at(name, version),
-          "{name} at version {version}"
-        );
-      }
-      assert_eq!(
-        green.changed_since(version),
-        owner.changed_since(version),
-        "the paths changed since version {version}"
-      );
-    }
-    for (at, probe) in probes.iter().enumerate() {
-      for base in floor..=owner.head() {
-        let increment = increment_of(probe).with_id(id(usize::MAX - at), base);
-        let answer = green.rebase(&increment);
-        assert_eq!(
-          answer,
-          owner.rebase(&increment),
-          "a rebase over base {base}"
-        );
-        self.ran.rebases += 1;
-        if matches!(answer, slates_merge::engine::Rebased::Conflict { .. }) {
-          self.ran.rebase_conflicts += 1;
-        }
-      }
-    }
+    equal_whole(green, owner, &names);
+    equal_at_every_version(green, owner, &names);
+    compare_rebases(green, owner, probes, &mut self.ran);
     self.ran.frees_held = owner.content_frees_held();
     owner.leave_replica(replica.leave().unwrap());
     assert_eq!(
@@ -388,6 +332,84 @@ impl History {
       owner.history_bytes_recounted()
     );
     self.ran
+  }
+
+  /// A lost last message is followed by none the replica could refuse as a gap, so it stays behind, as a lagging
+  /// replica does: the owner's next message would be refused and the replica rebuilt. The history ends before one is
+  /// sent, so that rebuild is made here.
+  fn rebuild_if_behind(&mut self) {
+    if self
+      .replica
+      .as_ref()
+      .is_some_and(|replica| replica.position() < self.owner.feed_position())
+    {
+      self.rebuild();
+    }
+  }
+}
+
+/// The replica, caught up, is its owner's green whole: its head and identity (its state's own), its fold floor, and every
+/// name's current bytes the owner's own memory, read in place, with no read of its refused.
+fn equal_whole(green: &mut Green, owner: &mut Green, names: &[String]) {
+  assert_eq!(green.head(), owner.head(), "the replica caught up");
+  assert_eq!(green.head_identity(), owner.head_identity());
+  assert_eq!(
+    green.head_identity(),
+    green.head_identity_from_scratch(),
+    "the replica's identity is its state's"
+  );
+  assert_eq!(
+    green.folded_below(),
+    owner.folded_below(),
+    "the replica keeps the history its owner keeps, and no more"
+  );
+  for name in names {
+    if let (Some(mine), Some(theirs)) = (green.content(name), owner.content(name)) {
+      assert!(
+        std::ptr::eq(mine.as_ptr(), theirs.as_ptr()) && mine.len() == theirs.len(),
+        "{name}'s current bytes are the owner's own, read in place"
+      );
+    }
+  }
+  assert_eq!(green.content_reads_refused(), 0);
+}
+
+/// At every version from the owner's fold floor to its head, the replica holds every name's bytes, and the paths changed
+/// since it, as its owner does.
+fn equal_at_every_version(green: &Green, owner: &Green, names: &[String]) {
+  for version in owner.folded_below()..=owner.head() {
+    for name in names {
+      assert_eq!(
+        green.content_at(name, version),
+        owner.content_at(name, version),
+        "{name} at version {version}"
+      );
+    }
+    assert_eq!(
+      green.changed_since(version),
+      owner.changed_since(version),
+      "the paths changed since version {version}"
+    );
+  }
+}
+
+/// Every probe, rebased over every base from the owner's fold floor to its head, is answered by the replica as by its
+/// owner; each comparison counted in `ran`, and the conflicts among them.
+fn compare_rebases(green: &mut Green, owner: &mut Green, probes: &[Raw], ran: &mut Ran) {
+  for (at, probe) in probes.iter().enumerate() {
+    for base in owner.folded_below()..=owner.head() {
+      let increment = increment_of(probe).with_id(id(usize::MAX - at), base);
+      let answer = green.rebase(&increment);
+      assert_eq!(
+        answer,
+        owner.rebase(&increment),
+        "a rebase over base {base}"
+      );
+      ran.rebases += 1;
+      if matches!(answer, slates_merge::engine::Rebased::Conflict { .. }) {
+        ran.rebase_conflicts += 1;
+      }
+    }
   }
 }
 

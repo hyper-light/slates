@@ -48,12 +48,13 @@
 //! with a live block, which the writer kept (`docs/bugs/2026-11-18-a-sealed-block-writer-dropped-with-a-reader-kept-its-blocks.md`).
 //!
 //! **Bounds (A-273 step 4).** Nothing here grows without a bound and a typed refusal at it:
-//! - Readers: a join past the limit its writer's holder gives (one reader a shard that may read, the machine's) is
-//!   refused ([`JoinRefused`]).
-//! - The bytes kept for readers: past the limit the writer's holder gives ([`SealedBlocks::set_held_limit`], the room
-//!   its memory class leaves), the slowest reader is evicted, one at a time: every later [`Changes`] names it, and it
-//!   refuses each ([`ReaderRefusal::Evicted`]) until its holder makes it leave. It keeps its frees until then, since it
-//!   may still read: the bound costs a reader, never a read of freed bytes.
+//! - Readers: a join past the limit its writer's holder derives (for a green's owner, one reader on each other shard
+//!   of its node and its rebuild's fresh one, A-273) is refused ([`JoinRefused`]).
+//! - The bytes kept for readers: past the limit the writer's holder derives ([`SealedBlocks::set_held_limit`]; for a
+//!   green's owner, the room its budget leaves beyond its own retention, A-273), the slowest reader is evicted, one at
+//!   a time: every later [`Changes`] names it, and it refuses each ([`ReaderRefusal::Evicted`]) until its holder makes
+//!   it leave. It keeps its frees until then, since it may still read: the bound costs a reader, never a read of freed
+//!   bytes.
 //! - The blocks recorded for the next [`Changes`]: one message's worth. A writer that records a second message's
 //!   changes before taking the first ([`SealedBlocks::evict_all`], called by its holder at the next change) evicts every
 //!   reader, which could not be fed in order, and records nothing more until a reader joins again.
@@ -1002,17 +1003,14 @@ mod tests {
     assert_eq!(store.evictions(), (1, 0), "one at a time, until it leaves");
     let second = store.take_changes();
     assert_eq!(slow.admit(&second), Err(ReaderRefusal::Evicted));
-    assert_eq!(
-      slow.read(a),
-      Some(&[1u8; 8][..]),
-      "it reads what it holds until it leaves"
-    );
+    // It reads what it holds until it leaves.
+    reader_reads(&slow, a, Some(&[1u8; 8][..]));
     fast.admit(&second).unwrap();
     store.acknowledge(fast.pass(&second).unwrap());
-    assert_eq!(store.held_bytes(), 24);
+    writer_holds(&store, 0, 24);
+    // Kept for the evicted reader alone: freed at its leave.
     store.leave(slow.leave());
-    assert_eq!(store.held_bytes(), 0, "kept for the evicted reader alone");
-    assert_eq!(store.held_bytes(), store.held_bytes_recounted());
+    writer_holds(&store, 0, 0);
     let rebuilt = BlockReader::new(store.join(READERS).unwrap());
     assert_eq!(rebuilt.live_blocks(), 0, "it names only what is live");
     store.leave(rebuilt.leave());
@@ -1050,8 +1048,9 @@ mod tests {
     let changes = store.take_changes();
     again.admit(&changes).unwrap();
     store.acknowledge(again.pass(&changes).unwrap());
-    assert_eq!(again.read(first), Some(&[3u8; 4][..]));
-    assert_eq!(again.read(later), None, "released and passed");
+    reader_reads(&again, first, Some(&[3u8; 4][..]));
+    // Released and passed: no longer in its live table.
+    reader_reads(&again, later, None);
     store.leave(again.leave());
     assert!(store.end().is_ok(), "every reader left: the writer ends");
   }

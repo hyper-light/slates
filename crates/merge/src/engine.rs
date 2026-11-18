@@ -3530,8 +3530,9 @@ impl Green {
   /// A replica of this green now (A-273 step 3): every index, history and delta the owner holds, cloned, and its
   /// content named as the owner names it and read in place, never copied: it is registered with the owner's blocks,
   /// which keep every block it may read until it has passed the message that released it. It applies the owner's
-  /// feed from the owner's feed position now. Refused past `limit` replicas (its holder's, one a shard that may hold
-  /// its works; A-273 step 4) and on a replica, which has no blocks of its own to give.
+  /// feed from the owner's feed position now. Refused past `limit` replicas (its holder's, derived from its node's
+  /// shards by [`crate::replica::replica_limit`]; A-273 step 4) and on a replica, which has no blocks of its own to
+  /// give.
   pub fn replica(&mut self, limit: usize) -> Result<Green, crate::replica::ReplicaRefusal> {
     let chunks = self.chunks.replica(limit)?;
     Ok(Green {
@@ -3633,7 +3634,7 @@ impl Green {
   }
 
   /// The bytes of content this owner keeps for its replicas past which the slowest is evicted (A-273 step 4): the room
-  /// its memory class leaves for them, derived by its holder.
+  /// its per-green budget leaves beyond its own retention, derived by its holder ([`crate::replica::held_limit`]).
   pub fn set_replica_held_limit(&mut self, bytes: usize) {
     self.chunks.set_held_limit(bytes);
   }

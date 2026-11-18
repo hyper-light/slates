@@ -811,6 +811,19 @@ mod tests {
   /// Shape: the replicas a test's owner takes, more than any test makes.
   const READERS: usize = 4;
 
+  /// `value` read through `chunks`: `bytes`.
+  fn reads(value: &Value, chunks: &Chunks, bytes: &[u8]) {
+    assert_eq!(value.materialize(chunks), bytes);
+  }
+
+  /// The bytes the owner's chunks keep for its replicas: `held`, equal to their recount.
+  fn keeps(chunks: &Chunks, held: usize) {
+    assert_eq!(
+      (chunks.held_bytes(), chunks.held_bytes_recounted()),
+      (held, held)
+    );
+  }
+
   /// A-273 "Frees deferred until every replica has passed them", step 3. Do: an owner's value of 64 bytes; a replica's
   /// chunks are made from the owner's, so its copy of the value reads the owner's block in place; the owner releases
   /// its value and stores another of other bytes, and takes the feed message's changes; the replica replays the same
@@ -827,26 +840,19 @@ mod tests {
     owner.release(&mut chunks);
     let second = Value::whole(&mut chunks, &[9u8; 64]);
     let changes = chunks.take_changes().unwrap();
-    assert_eq!(
-      replica.materialize(&replica_chunks),
-      first,
-      "the replica reads the bytes it named, in place"
-    );
+    // The replica reads the bytes it named, in place, and the owner keeps them for it.
+    reads(&replica, &replica_chunks, &first);
     assert_eq!(chunks.frees_held(), 1);
-    assert_eq!(chunks.held_bytes(), first.len());
+    keeps(&chunks, first.len());
     replica_chunks.begin(&changes).unwrap();
     replica.release(&mut replica_chunks);
     let adopted = Value::whole(&mut replica_chunks, &[9u8; 64]);
     let passed = replica_chunks.finish(&changes).unwrap();
-    assert_eq!(
-      chunks.held_bytes(),
-      first.len(),
-      "freed at the acknowledgement"
-    );
+    // Passed, but not yet acknowledged: still kept; freed at the acknowledgement.
+    keeps(&chunks, first.len());
     chunks.acknowledge(passed);
-    assert_eq!(chunks.held_bytes(), 0);
-    assert_eq!(chunks.held_bytes_recounted(), 0);
-    assert_eq!(adopted.materialize(&replica_chunks), vec![9u8; 64]);
+    keeps(&chunks, 0);
+    reads(&adopted, &replica_chunks, &[9u8; 64]);
     assert_eq!(adopted, second, "the replica names the owner's chunk");
     assert_eq!(replica_chunks.reads_refused(), 0);
     chunks.leave(replica_chunks.into_left().unwrap());
