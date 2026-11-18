@@ -8489,6 +8489,22 @@ it builds against the contract and adds to it rather than around it.
 > its attempt took, then a `LandingFinished` whose outcome is `Refused`, or `Aborted` once it wrote an entry
 > (§4.15's status of the same day); such an end that names no manifest carries no `verification`. No type changed; the
 > `audit` verb's answer did, so the number moves. Until then a refused landing's trail ended at its grant.
+> **`CONTRACT` = 31, the async form (R6), first piece:** `AsyncInstance` over a host's `Reactor`. The host lends one
+> wait: the client's completion signal readable, or the driver's next deadline, whichever comes first. Each call goes
+> through `slates_client::driver`, one at a time: submit, arm, pump, wait, tick. A future dropped mid-call cancels its
+> ticket, so a cancelled call leaks nothing and the instance goes on serving. It awaits provisioning from every source,
+> a snapshot, a status and a destroy. `into_instance` and `new` move between the forms. `into_instance` stops the
+> completion signal first: on macOS (and Windows) it is a bridge thread waiting where a parked synchronous call waits,
+> and the daemon wakes one waiter per reply, so with the bridge running a parked synchronous call slept to its reply
+> deadline (16 to 19 of 20 calls, Mac Studio, 2026-11-18;
+> `docs/bugs/2026-11-18-the-async-signal-took-the-synchronous-forms-wakes.md`). Proof:
+> `an_async_instance_provisions_snapshots_reports_and_destroys` (`crates/api/tests/api.rs`), whose reactor is a
+> blocking `poll(2)` and whose executor is a bare poll loop: no runtime is added (D-9). It drops 65 calls, twice the
+> client's outstanding bound and one more, then makes 20 synchronous calls that each park. Each guard turns it red
+> alone: a parked call that waited its whole deadline without the bridge's stop; the 29th round refused
+> `AcknowledgementOwed` without the periodic acknowledgement; a call left waiting past the suite's wait without the
+> cancel. Owed: the paged verbs (list, read, a landing's entries), landings and merges, and the policy and observation
+> verbs, awaited the same way.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,

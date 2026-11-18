@@ -781,6 +781,12 @@
 >   an overlay's drift is built (`StatusReport::base`, `CONTRACT` = 8), and a presentation's conflicts are read typed
 >   from its entries;
 > - owed: a typed field on the wire for a merge's versions (the work's base beside the head);
+> - the async form (R6), first piece built (`CONTRACT` = 31): `AsyncInstance` over a host's `Reactor`, awaiting
+>   provisioning, a snapshot, a status and a destroy; handing it back stops its completion bridge, which took the
+>   synchronous form's wakes (`docs/bugs/2026-11-18-the-async-signal-took-the-synchronous-forms-wakes.md`); owed: the
+>   paged verbs, landings, merges, policies and observation, awaited the same way; and the Node SDK's `Client`, whose
+>   synchronous verbs park beside the bridge its `completionFd()` starts (the same stolen wake, on macOS and Windows;
+>   reported, not changed);
 > - a run of the Linux and Windows arms (mount, the CLI's Windows unmount): not compiled on the Mac that built piece 4.
 
 > **git, Mercurial and Subversion over the WinFsp drive (2026-11-17, Part 6 "Real workloads", §4.6; A-300; Ada's
