@@ -18,7 +18,7 @@
 >   signs and the trusted signers a launcher registers;
 > - typed fields on the wire for an overlay's drift, a presentation's conflicts, a landing target's refusal and a
 >   merge's versions (the work's base beside the head), replacing the crate's reading of the status text;
-> - a paged volume listing; typed audit kinds and grant states;
+> - a paged volume listing (typed audit kinds and grant states built, piece 6, `CONTRACT` = 4);
 > - a run of the Linux and Windows arms (mount, the CLI's Windows unmount): not compiled on the Mac that built piece 4.
 
 > **git, Mercurial and Subversion over the WinFsp drive (2026-11-17, Part 6 "Real workloads", §4.6; A-300; Ada's
