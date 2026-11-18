@@ -2152,6 +2152,67 @@ fn serve_consensus_control(
   })
 }
 
+/// The verbs a client's channel answers itself, before any routing: its status, a consumer's attestation and revocation
+/// (§4.13), and a consumer's own write policy, set or read (A-285). `Break` with what was served; `Continue` with the
+/// request's body when it is none of them, for [`serve`] to route.
+fn serve_on_channel(
+  state: &mut ShardState,
+  client: Handle<ClientSlot>,
+  request: &Request,
+  (client_id, principal): (u32, &Principal),
+  body: RequestBody,
+) -> std::ops::ControlFlow<Served, RequestBody> {
+  use std::ops::ControlFlow::{Break, Continue};
+  if let Some(reply) = status_on_channel(state, client, request.request, &body) {
+    return Break(reply);
+  }
+  if let RequestBody::Attest { consumer, proof } = body {
+    return Break(attest_on_channel(
+      state,
+      client.index(),
+      request.request,
+      client_id,
+      consumer,
+      proof,
+    ));
+  }
+  if let RequestBody::Revoke { consumer, proof } = body {
+    return Break(revoke_on_channel(
+      state,
+      client.index(),
+      request.request,
+      consumer,
+      proof,
+    ));
+  }
+  if let RequestBody::SetPolicy {
+    subject: slates_ipc::protocol::PolicySubject::Consumer { consumer },
+    policy,
+    version,
+    proof,
+  } = body
+  {
+    return Break(set_consumer_policy_on_channel(
+      state,
+      (client.index(), request.request),
+      principal,
+      (consumer, policy, version),
+      proof,
+    ));
+  }
+  if let RequestBody::Policy {
+    subject: slates_ipc::protocol::PolicySubject::Consumer { consumer },
+  } = body
+  {
+    return Break(consumer_policy_on_channel(
+      state,
+      (client.index(), request.request),
+      consumer,
+    ));
+  }
+  Continue(body)
+}
+
 /// Serves a client request: recover a previous completion or dispatch the operation to its owner
 /// shard. Scatter operations record their completion after every shard has answered.
 pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Request) -> Served {
@@ -2241,43 +2302,10 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
       refused(Refusal::ConsumerRevoked),
     ));
   }
-  if let Some(reply) = status_on_channel(state, client, request.request, &body) {
-    return reply;
-  }
-  if let RequestBody::Attest { consumer, proof } = body {
-    return attest_on_channel(
-      state,
-      client.index(),
-      request.request,
-      client_id,
-      consumer,
-      proof,
-    );
-  }
-  if let RequestBody::Revoke { consumer, proof } = body {
-    return revoke_on_channel(state, client.index(), request.request, consumer, proof);
-  }
-  if let RequestBody::SetPolicy {
-    subject: slates_ipc::protocol::PolicySubject::Consumer { consumer },
-    policy,
-    version,
-    proof,
-  } = body
-  {
-    return set_consumer_policy_on_channel(
-      state,
-      (client.index(), request.request),
-      &principal,
-      (consumer, policy, version),
-      proof,
-    );
-  }
-  if let RequestBody::Policy {
-    subject: slates_ipc::protocol::PolicySubject::Consumer { consumer },
-  } = body
-  {
-    return consumer_policy_on_channel(state, (client.index(), request.request), consumer);
-  }
+  let body = match serve_on_channel(state, client, request, (client_id, &principal), body) {
+    std::ops::ControlFlow::Continue(body) => body,
+    std::ops::ControlFlow::Break(served) => return served,
+  };
   // A consumer's own write policy (A-285) holds its merges and landings here, before they are routed to the volume's
   // owner, which then holds them to the volume's: the stricter of the two governs.
   let body = match consumer_gate(state, client, body) {
