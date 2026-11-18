@@ -296,10 +296,11 @@ enum Held {
   Map(crate::held_copy::InheritedCopy),
 }
 
-/// Takes back every object the anchor handed this shard, while recovery rebuilds it and before the write log's replay:
-/// A-197's writable copies (Linux), awake, so every write the replay applies is written into them, and the Shards
-/// streams' DAX objects, dormant until their streams take them ([`claim`]); together in ascending order of the handles
-/// their backings had (the registry's `insert_at` contract). One that cannot be taken back is let go and counted; then
+/// Takes back every object the anchor handed this shard, while recovery rebuilds it and before the write log's replay,
+/// each dormant through the replay, since it already holds every write the dead daemon made, in order with the stores
+/// made through it: A-197's writable copies (Linux), woken once the replay is done (`crate::held_copy::wake_adopted`,
+/// A-389), and the Shards streams' DAX objects, woken when their streams take them ([`claim`]); together in ascending
+/// order of the handles their backings had (the registry's `insert_at` contract). One that cannot be taken back is let go and counted; then
 /// every range the table names for a backing not taken back is forgotten. How many were taken back.
 pub(crate) fn adopt_inherited(state: &mut ShardState) -> usize {
   let mut order: Vec<(u32, Held)> = std::mem::take(&mut state.inherited_dax)

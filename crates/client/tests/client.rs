@@ -1306,12 +1306,13 @@ fn a_read_map_of_a_directory_is_refused_typed() {
 }
 
 /// A-299's sibling sweep (the integrator, 2026-11-18): a read of a directory is refused as the volume core's typed
-/// `IsDirectory`, whether whole (`Read`, which the asynchronous SDKs send) or paged (`ReadRange`, which
-/// `Client::read` and the library send). Do: on a volume holding a directory, read it both ways. Expect:
-/// `Refusal::Volume { IsDirectory }` from each. Until 2026-11-18 each was `BadRequest { "the path is a directory" }`
-/// (`crates/server/src/merge_service.rs`, `read_plain` and `read_plain_range`).
+/// `IsDirectory`, never in words. Do: on a volume holding a directory, read it (`ReadRange`, which `Client::read` and
+/// the library send). Expect: `Refusal::Volume { IsDirectory }`. Until 2026-11-18 it was `BadRequest { "the path is a
+/// directory" }` (`crates/server/src/merge_service.rs`, `read_plain_range`). The whole-file `Read`, the other read the
+/// sweep typed, is retired (A-267): refused `Unsupported` whatever it names, in its published wire place
+/// (`crates/server/tests/base_read_pages.rs`).
 #[test]
-fn a_read_of_a_directory_is_refused_typed_whole_or_paged() {
+fn a_paged_read_of_a_directory_is_refused_typed() {
   let (_daemon, mut client, _instance) = one_shard_daemon("readdir");
   let id = client.create(&room_for("readdir", 4 << 10)).unwrap();
   let writing = client.attach(id, None, Intent::Write).unwrap().attachment;
@@ -1319,14 +1320,6 @@ fn a_read_of_a_directory_is_refused_typed_whole_or_paged() {
   let typed = Refusal::Volume {
     refusal: VolumeRefusal::IsDirectory,
   };
-  match client.call(&RequestBody::Read {
-    volume: id,
-    path: "/d".to_owned(),
-    at: slates_client::ReadAt::Head,
-  }) {
-    Err(ClientError::Refused(refusal)) => assert_eq!(refusal, typed, "a whole read"),
-    other => panic!("a typed refusal expected of a whole read: {other:?}"),
-  }
   match client.read(id, "/d", slates_client::ReadAt::Head) {
     Err(ClientError::Refused(refusal)) => assert_eq!(refusal, typed, "a paged read"),
     other => panic!("a typed refusal expected of a paged read: {other:?}"),
@@ -3780,5 +3773,55 @@ fn a_connect_is_answered_within_a_tenth_of_the_claim_wait() {
   assert!(
     quickest < Duration::from_nanos(slates_ipc::CLAIM_WAIT_NS / 10),
     "the quickest of {CONNECTS_TIMED} connects took {quickest:?}, a tenth of the claim wait or more"
+  );
+}
+
+/// Shape: the failover delay the hold test holds its daemon at (injected, A-384): a CLI attachment's term is at most this,
+/// so three of them with no verb would end an attachment nothing renews.
+const HOLD_CEILING: Duration = Duration::from_secs(2);
+
+/// A-384, the library's holder: a CLI attachment held by a `slates_client::Hold` outlives any idle time while the hold
+/// lives, and lapses once the hold is dropped. Do: on a one-shard daemon whose failover delay is held at
+/// [`HOLD_CEILING`], attach a volume for write in the CLI's form and hold it; leave it with no verb for three ceilings;
+/// write under it; drop the hold; wait two ceilings; write again. Expect the first write accepted (the hold's renewals
+/// alone kept the attachment through three ceilings), and the second refused `AttachmentExpired` naming it (dropping the
+/// hold ended the renewals, and no term outlasts the ceiling).
+#[test]
+fn a_hold_keeps_an_idle_cli_attachment_and_its_drop_lets_it_lapse() {
+  let (daemon, mut client, instance) = one_shard_daemon("hold");
+  daemon
+    .inject_failover(Some(u64::try_from(HOLD_CEILING.as_nanos()).unwrap()))
+    .expect("the failover delay is held");
+  let volume = client.create(&room_for("held", 64)).unwrap();
+  let attachment = client
+    .attach_with(
+      volume,
+      None,
+      Intent::Write,
+      slates_client::AttachRequest::Termed,
+    )
+    .unwrap()
+    .attachment;
+  let hold =
+    slates_client::Hold::new(&instance, deadlines(), attachment).expect("the attachment is held");
+  #[allow(clippy::disallowed_methods)] // three ceilings with no verb but the hold's renewals
+  std::thread::sleep(HOLD_CEILING.saturating_mul(3));
+  let held_write = client.fs_write((volume, attachment), "held.txt", b"held", 0o644);
+  drop(hold);
+  #[allow(clippy::disallowed_methods)] // two ceilings with no renewal
+  std::thread::sleep(HOLD_CEILING.saturating_mul(2));
+  let late = client.fs_write((volume, attachment), "late.txt", b"late", 0o644);
+  drop(client);
+  daemon.stop();
+  assert!(
+    held_write.is_ok(),
+    "the hold alone kept the attachment through three ceilings: {held_write:?}"
+  );
+  assert!(
+    matches!(
+      late,
+      Err(ClientError::Refused(Refusal::AttachmentExpired { attachment: named })) if named == attachment
+    ),
+    "the dropped hold let the attachment lapse: {late:?}"
   );
 }

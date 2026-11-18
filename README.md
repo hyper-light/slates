@@ -134,6 +134,18 @@ chmod +x slates-linux-x64 && sudo mv slates-linux-x64 /usr/local/bin/slates
 > NFS on a loopback socket and the built-in `mount_nfs` mounts it. Linux and Windows mounts are
 > limited today; the table above says how.
 
+On Windows a mount is a WinFsp drive. An Administrator installs WinFsp 2.1 once and, once, lets its
+driver make Mount Manager drives for programs that are not elevated: Windows resolves a file's final
+path on its drive letter only for such a drive (git with its symbolic links on, Python's `realpath`
+and Rust's `canonicalize` each ask for it):
+
+```bat
+reg add HKLM\SOFTWARE\WOW6432Node\WinFsp /v MountUseMountmgrFromFSD /t REG_DWORD /d 1 /f
+```
+
+Without it `slates mount` is refused `MountManagerNotAllowed`. A drive is then the machine's, seen
+in every session, and only its account, SYSTEM and the Administrators may open what is on it.
+
 ## Quickstart
 
 Start the daemon in one terminal and leave it running:

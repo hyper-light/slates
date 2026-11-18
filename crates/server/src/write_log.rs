@@ -16,9 +16,10 @@
 //! does the log record that it overflowed: the next daemon then cannot replay every write, and reports every file a
 //! taken-over mount had open as having lost writes (`slates_bridge_core::LostWrites`), never a silent hole.
 //!
-//! The log holds the `FORGET`s since the last publication too: a `FORGET` gives back lookup references the kernel
-//! held, takes no reply, and is never resent, so one served after the last publication and lost with its daemon left
-//! the references counted for good (GAPS, A-154's sibling). A successor gives back each logged `FORGET` after the
+//! The log holds the `FORGET`s since the last publication too, a FUSE mount's and a Shards stream's whose resync end the
+//! anchor holds (A-390): a `FORGET` gives back lookup references the kernel held, takes no reply, and is never resent,
+//! so one served after the last publication and lost with its daemon left the references counted for good (GAPS, A-154's
+//! sibling). A successor gives back each logged `FORGET` after the
 //! writes logged before it. A `FORGET` the log cannot take forces a publication as a write does; a refused one is
 //! counted, never marked as an overflow, since no write was lost.
 //!
@@ -465,6 +466,45 @@ impl WriteLog {
   fn store(&self, object: &mut SparseObject, offset: usize, bytes: &[u8]) -> Result<(), Unwritten> {
     let at = self.start.checked_add(offset).ok_or(Unwritten)?;
     object.write(at, bytes).map_err(|_| Unwritten)
+  }
+}
+
+/// Format: the counter of a `FORGET` the write log could not take and no publication carried: its lookups stay
+/// counted across a restart, a bounded leak (GAPS, A-154's sibling), never a lost write.
+const FORGET_UNLOGGED: &str = "write_log.forget_unlogged";
+
+/// Logs the lookups `forgotten` (each a file and a count) gave back through `attachment` on `volume` in the shard's
+/// write log (GAPS, A-154's sibling): a FUSE mount's `FORGET`s, and a Shards stream's whose resync end the anchor holds
+/// (A-390). A `FORGET` takes no reply and is never resent, so one served after the last publication would otherwise
+/// leave its references counted in the image for good. A log with no room forces a publication, which carries the
+/// `FORGET` (already applied) and empties the log; one still refused is counted, and never marks the log overflowed,
+/// which would report every taken-over file as having lost writes.
+pub(crate) fn log_forgets(
+  s: &mut crate::state::ShardState,
+  (volume, attachment): (slates_db::catalog::VolumeId, u64),
+  forgotten: Vec<(u64, u64)>,
+) {
+  for (inode, count) in forgotten {
+    let forgotten = Forgotten {
+      volume: volume.bytes,
+      attachment,
+      inode,
+      count,
+    };
+    let appended = match (s.write_log.as_mut(), s.content.as_mut()) {
+      (Some(log), Some(object)) => log.append_forget(object, forgotten),
+      _ => return,
+    };
+    let logged = match appended {
+      Ok(()) => true,
+      Err(Refused::Full) => {
+        crate::verbs::publish_shard(s).is_ok_and(|published| published.skipped.is_empty())
+      }
+      Err(Refused::Unwritten) => false,
+    };
+    if !logged {
+      s.count(FORGET_UNLOGGED, 1);
+    }
   }
 }
 

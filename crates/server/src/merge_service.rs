@@ -403,6 +403,10 @@ pub struct MergeRetention {
   pub history: u64,
   /// The same, recounted from the histories (the balance check).
   pub history_recounted: u64,
+  /// The change index's bytes (the paths each version changed, A-264), as the engine's running total.
+  pub changes: u64,
+  /// The same, recounted from the index (the balance check).
+  pub changes_recounted: u64,
   /// The rejected-result cache's bytes.
   pub rejected: u64,
   /// The bytes the green has charged to the shard's budget as retention.
@@ -428,6 +432,8 @@ pub(crate) fn merge_retention(state: &ShardState, green: DbVolumeId) -> MergeRet
     content: as_u64(retained.content),
     history: as_u64(retained.history),
     history_recounted: as_u64(engine.history_bytes_recounted()),
+    changes: as_u64(retained.changes),
+    changes_recounted: as_u64(engine.changes_recounted()),
     rejected: as_u64(retained.rejected),
     charged: state.green_retention.get(&green).copied().unwrap_or(0),
     folded_below: engine.folded_below(),
@@ -1050,57 +1056,7 @@ pub(crate) fn advance(
   );
   // A move up may raise the reachable floor: fold and credit what that releases.
   let _ = settle_green_retention(state, pin.green);
-  ReplyBody::Advanced {
-    version: target,
-    invalidated,
-  }
-}
-
-/// `read(volume, path, at)` (§4.12 `slates.fs.read`): a file's bytes at a view. A green serves
-/// its head, a named version (`UnknownBase` past the head) or the version an attachment pins (the
-/// attachment must be of this green); a work serves its live content (`BadRequest` for a version
-/// or attachment view, which a work has no chain for); a plain volume serves its live tree through
-/// the volume core (an overlay through its host). A path that names nothing is `NotFound`; a
-/// directory is `BadRequest`.
-pub(crate) fn read(
-  state: &mut ShardState,
-  principal: &Principal,
-  volume: VolumeId,
-  path: &str,
-  at: ReadAt,
-) -> ReplyBody {
-  let record = match find_record(state, volume) {
-    Ok(record) => record,
-    Err(refusal) => return refused(refusal),
-  };
-  if !rights_of(&record, principal).read {
-    return forbidden("read");
-  }
-  let key = canonical_path(path);
-  match record.policy.role {
-    Role::Green { .. } => read_green(state, record.id, key, at),
-    Role::Work { .. } => match at {
-      ReadAt::Head => match state.works.get(&record.id) {
-        Some(w) => match w.files.get(work_base(state, w), key) {
-          Ok(Some(bytes)) => ReplyBody::ReadBytes {
-            bytes: bytes.to_vec(),
-          },
-          Ok(None) => refused(Refusal::NotFound),
-          Err(_) => refused(unreadable_base(w)),
-        },
-        None => refused(Refusal::NotFound),
-      },
-      ReadAt::Version { .. } | ReadAt::Attachment { .. } => refused(Refusal::BadRequest {
-        reason: "a work volume has no versions to read at; read its head".to_owned(),
-      }),
-    },
-    Role::Plain => match at {
-      ReadAt::Head => read_plain(state, volume, path),
-      ReadAt::Version { .. } | ReadAt::Attachment { .. } => refused(Refusal::BadRequest {
-        reason: "a plain volume has no green versions; read its head".to_owned(),
-      }),
-    },
-  }
+  crate::verbs::advanced_reply(target, invalidated)
 }
 
 /// Format: the encoded bytes of a `ReadPage` reply beside its page (variant, lengths, total, stamp), with room to
@@ -1284,78 +1240,6 @@ fn read_plain_range(
   }
 }
 
-/// A green's file at the head, a named version, or an attachment's pinned version.
-fn read_green(state: &ShardState, green: DbVolumeId, path: &str, at: ReadAt) -> ReplyBody {
-  let Some(engine) = state.greens.get(&green) else {
-    return refused(Refusal::NotFound);
-  };
-  let version = match at {
-    ReadAt::Head => engine.head(),
-    ReadAt::Version { version } => version,
-    ReadAt::Attachment { attachment } => match state.merge.attachments.get(&attachment) {
-      Some(pin) if pin.green == green => pin.version,
-      Some(_) => {
-        return refused(Refusal::BadRequest {
-          reason: "the attachment pins another green".to_owned(),
-        });
-      }
-      None => return refused(Refusal::NotFound),
-    },
-  };
-  if version > engine.head() {
-    return refused(Refusal::UnknownBase {
-      green: wire_id(green),
-      version,
-    });
-  }
-  match engine.content_at(path, version) {
-    Some(bytes) => ReplyBody::ReadBytes { bytes },
-    None => refused(Refusal::NotFound),
-  }
-}
-
-/// A plain volume's file at its head, through the volume core: an overlay through its host (an
-/// untouched entry reads the disk), a scratch volume from the store.
-fn read_plain(state: &mut ShardState, volume: VolumeId, path: &str) -> ReplyBody {
-  let (handle, _) = match find(state, volume) {
-    Ok(found) => found,
-    Err(reply) => return *reply,
-  };
-  let ShardState { store, volumes, .. } = state;
-  let Ok(slot) = volumes.get_mut(handle) else {
-    return refused(Refusal::NotFound);
-  };
-  let read = match slot.host.as_mut() {
-    Some(host) => {
-      let mut overlay = slot.volume.with_host(host);
-      overlay.resolve(store, path).and_then(|located| {
-        if matches!(located.child, Child::Dir(_)) {
-          return Err(slates_vfs::error::VfsError::IsDirectory);
-        }
-        let size = overlay.stat(store, located.inode)?.size;
-        let mut bytes = vec![0u8; usize::try_from(size).unwrap_or(usize::MAX)];
-        let read = overlay.read(store, located.inode, 0, &mut bytes)?;
-        bytes.truncate(read);
-        Ok(bytes)
-      })
-    }
-    None => slot.volume.resolve(store, path).and_then(|located| {
-      if matches!(located.child, Child::Dir(_)) {
-        return Err(slates_vfs::error::VfsError::IsDirectory);
-      }
-      let size = slot.volume.stat(store, located.inode)?.size;
-      let mut bytes = vec![0u8; usize::try_from(size).unwrap_or(usize::MAX)];
-      let read = slot.volume.read(store, located.inode, 0, &mut bytes)?;
-      bytes.truncate(read);
-      Ok(bytes)
-    }),
-  };
-  match read {
-    Ok(bytes) => ReplyBody::ReadBytes { bytes },
-    Err(e) => refused(refusal_of_vfs(&e)),
-  }
-}
-
 /// `destroy` of a merge volume, or `None` for a plain one (the store-backed destroy runs). A work
 /// is removed with its declared operations; a green with its engine, its pins and its works'
 /// ability to merge (their next submit refuses `UnknownBase`, §4.16 failure matrix). Every
@@ -1489,7 +1373,7 @@ pub(crate) fn status_merge_volume(
       attachments: u32::try_from(attachments).unwrap_or(u32::MAX),
       head: SnapshotId { value: head },
       drifted: Vec::new(),
-      watcher: "merge".to_owned(),
+      watcher: crate::verbs::WATCHER_MERGE.to_owned(),
       snapshots: u32::try_from(head).unwrap_or(u32::MAX),
       placed,
       nfs_port: u16::try_from(crate::daemon::NFS_PORT.load(std::sync::atomic::Ordering::Acquire))
@@ -1499,6 +1383,7 @@ pub(crate) fn status_merge_volume(
       // attachments, the record form).
       mounts: Vec::new(),
       mounts_elided: 0,
+      drifted_elided: 0,
       // A green or a work volume keeps no op log (its history is the merge engine's), so it has no journal to report.
       journal: slates_ipc::protocol::JournalReport::default(),
       // A merge volume serves no FUSE mount of its own, so nothing is kept for one (U10).
@@ -1536,12 +1421,15 @@ pub(crate) fn status_merge_volume(
 //
 // Holder side. A merge record arrives on its own stream (`MERGE_RECORD_STREAM`), dispatched by
 // kind. The holder finds the version's inputs in its content hold (else refuses
-// `merge.inputs_unheld` — the record waits), replays them into its replica of the green (an
+// `merge.inputs_unheld` — the record waits), gathers them extent by extent with what it holds of
+// them charged to its shard's budget (else refuses `merge.inputs_over_budget` — the record waits;
+// A-383), replays them into its replica of the green (an
 // engine of its own, at the version before), and compares the replica's head identity with the
 // record's: a mismatch is refused, counted (`merge.recompute_mismatch`), printed loudly, and the
 // green is never served from this holder again (fatal for the green here; the owner and the other
 // holders carry on, Degraded — §4.16 failure matrix); a match accepts the record into the holder's
-// acceptor exactly as a head record is. An out-of-order record (a version past the replica's next)
+// acceptor exactly as a head record is, its replica folded where the record says the owner's engine had folded
+// (A-385). An out-of-order record (a version past the replica's next)
 // is refused and counted; the owner re-ships it once its predecessor is acknowledged.
 
 use std::collections::BTreeSet;
@@ -1605,6 +1493,18 @@ pub(crate) const OUT_OF_ORDER: &str = "merge.out_of_order";
 /// Counted on a holder whose held inputs did not decode as an increment or origin (a corrupt hold).
 /// Format: a refusal name in the daemon's status report.
 pub(crate) const INPUTS_UNDECODABLE: &str = "merge.inputs_undecodable";
+/// Counted on a holder whose shard's budget could not take what recomputing a version from its held inputs holds
+/// ([`RECOMPUTE_COPIES`] of their declared size, A-383): the record waits, as for inputs not yet held, and its owner
+/// ships it again, so the holder recomputes it once its shard has room.
+/// Format: a refusal name in the daemon's status report.
+pub(crate) const INPUTS_OVER_BUDGET: &str = "merge.inputs_over_budget";
+/// Derived: the copies of a version's inputs a holder's recomputation holds at once (A-383): the bytes gathered from its
+/// hold, and the increment decoded from them, whose post-state is a copy of at most as many (`Increment::decode`).
+const RECOMPUTE_COPIES: u64 = 2;
+/// Counted on a holder, by the versions its replica of a green folded at the floor its owner's record named (A-385):
+/// the non-vacuity counter of a replica that keeps no more history than its owner.
+/// Format: a refusal name in the daemon's status report.
+pub(crate) const REPLICA_FOLDED: &str = "merge.replica.folded";
 
 /// Format: the one entry of an inputs archive's manifest — a file holding the version's inputs.
 pub(crate) const INPUTS_ENTRY_NAME: &str = "inputs";
@@ -1619,8 +1519,9 @@ pub(crate) const RECORD_AWAITS_WORK_CATALOG: &str = "merge.record.awaits_work_ca
 /// earlier layout wrote begins with its version number, whose low word is the magic only at version 1,129,467,207.
 const RECORD_MAGIC: u32 = u32::from_le_bytes(*b"GMRC");
 /// Format: a merge record's format version (A-255: 1 is the first versioned format, with the submit's completion key; 2
-/// carries the submitting work beside the key, A-288); a decoder refuses any other.
-const RECORD_VERSION: u32 = 2;
+/// carries the submitting work beside the key, A-288; 3 carries the owner's fold floor, A-385); a decoder refuses any
+/// other.
+const RECORD_VERSION: u32 = 3;
 /// Format: a merge record's magic and its version are each a little-endian `u32`.
 const RECORD_WORD_BYTES: usize = size_of::<u32>();
 /// Format: the magic and version before a merge record's value.
@@ -1666,6 +1567,11 @@ pub struct MergeRecordValue {
   /// it: a successor records it with the version, so the version's provenance outlives its owner. `None` for an
   /// unsigned submit and for version 0, which no submit made. Appended.
   pub signature: Option<slates_db::catalog::SignatureVerdict>,
+  /// The version below which the owner's engine had folded the green's histories when it made this record (§4.16 "delta
+  /// retention before folding", A-385): never past the oldest version a live reader of the green names, so no later
+  /// increment is based below it. A holder folds its replica there once it holds this version, so a replica keeps no more
+  /// of the green's history than its owner does. 0 for version 0. Appended.
+  pub folded_below: u64,
 }
 
 /// A submit's completion key as a merge record carries it ([`MergeRecordValue::completion`]): the client's host, the
@@ -2159,6 +2065,9 @@ fn enqueue_record_with(
     .get(&green)
     .and_then(|engine| engine.signature(version))
     .map(crate::signed_work::shipped);
+  // Where the engine has folded the green's histories (A-385): its holders fold their replicas there once they hold
+  // this version, so no replica keeps more of the green's history than its owner.
+  let folded_below = state.greens.get(&green).map_or(0, Green::folded_below);
   let mut value = MergeRecordValue {
     version,
     increment,
@@ -2171,6 +2080,7 @@ fn enqueue_record_with(
     owner,
     completion,
     signature,
+    folded_below,
   };
   // Version 0 of a green over a base names its origin as its inputs: made a share at a time, and the record enqueued
   // once they are (A-286), never walked, encoded and archived in this poll.
@@ -3279,11 +3189,15 @@ pub(crate) fn accepted_reply(state: &ShardState, green: DbVolumeId, version: u64
         version: Some(version),
         conflicts: Vec::new(),
         verification,
+        conflicts_elided: 0,
+        verdict: 0,
       }
     }
     Some(slates_ipc::protocol::Verification::Unsigned) | None => ReplyBody::Submitted {
       version: Some(version),
       conflicts: Vec::new(),
+      conflicts_elided: 0,
+      verdict: 0,
     },
   }
 }
@@ -3524,15 +3438,24 @@ pub(crate) fn accept_merge_record(
   }
   let inputs = match value.inputs {
     None => None,
-    Some(manifest) => match held_inputs(state, object, &manifest) {
-      Some(bytes) => Some(bytes),
-      None => {
-        state.count(INPUTS_UNHELD, 1);
+    Some(manifest) => match held_inputs(state, object, manifest) {
+      Ok(held) => Some(held),
+      Err(reason) => {
+        state.count(reason, 1);
         return Vec::new();
       }
     },
   };
-  match recompute(state, object, &value, inputs.as_deref()) {
+  let recomputed = recompute(
+    state,
+    object,
+    &value,
+    inputs.as_ref().map(|held| held.bytes.as_slice()),
+  );
+  if let Some(held) = inputs {
+    state.store.budget.release(held.charge);
+  }
+  match recomputed {
     Ok(()) => crate::fleet::accept_held_record(state, local, peer_host, record),
     Err(reason) => {
       state.count(reason, 1);
@@ -3551,29 +3474,41 @@ pub(crate) fn accept_merge_record(
   }
 }
 
-/// The inputs bytes a manifest names, from this holder's content hold — the one file, restored within
-/// the bytes the hold admitted (its chunks' raw bytes and one chunk's decode space: a well-formed inputs
-/// archive names each chunk once, so its file is never longer, and a hostile one naming a chunk many
-/// times is refused before allocating, AUD-29-13) — with a test's corruption fault applied once if set
-/// (the last byte of the post-state, so the increment still decodes but recomputes to different bytes).
-fn held_inputs(state: &mut ShardState, object: ObjectId, manifest: &[u8; 32]) -> Option<Vec<u8>> {
-  let archive = state
-    .held_content
-    .archive_of(state.store.content.arena(), object, manifest)?;
-  let held = archive
-    .chunks
-    .iter()
-    .fold(0u64, |total, chunk| total.saturating_add(chunk.raw_len));
-  let largest = archive
-    .chunks
-    .iter()
-    .map(|chunk| chunk.raw_len)
-    .max()
-    .unwrap_or(0);
-  let mut restored = slates_archive::restore(&archive, held.saturating_add(largest)).ok()?;
-  let mut bytes = restored.files.remove(INPUTS_ENTRY_NAME)?.dense()?;
-  corrupt_if_faulted(state, &mut bytes);
-  Some(bytes)
+/// A version's inputs gathered from this holder's hold, and the charge they hold against the shard's budget until the
+/// recomputation that reads them is done (A-383).
+struct HeldInputs {
+  /// The inputs' bytes.
+  bytes: Vec<u8>,
+  /// What recomputing from them holds, charged to the shard's budget: the caller releases it once it recomputed.
+  charge: slates_mem::budget::Reservation,
+}
+
+/// The inputs bytes a manifest names, from this holder's content hold (A-383): the one file gathered extent by extent
+/// (`crate::merge_origin::PlannedInputs`), as the replica's rebuild and seed gather it, with a test's corruption fault
+/// applied once if set (the last byte of the post-state, so the increment still decodes but recomputes to different
+/// bytes). Before a byte is reserved, what the recomputation holds ([`RECOMPUTE_COPIES`] of the declared size) is charged
+/// to the shard's budget, so a manifest naming one chunk at many extents makes a holder hold no more than its shard
+/// admits: past that the record waits, refused [`INPUTS_OVER_BUDGET`]. Until A-383 the file was restored from the
+/// archive within its distinct chunks' bytes and one chunk more, on the rule that an inputs archive names each chunk
+/// once; but inputs are cut at fixed offsets, so inputs repeating a chunk's bytes at the cut name a chunk more than once,
+/// and every holder refused them at every shipment, for good.
+fn held_inputs(
+  state: &mut ShardState,
+  object: ObjectId,
+  manifest: [u8; 32],
+) -> Result<HeldInputs, &'static str> {
+  let planned = crate::merge_origin::PlannedInputs::of(state, object, manifest)?;
+  let charge = state
+    .store
+    .grow(planned.size().saturating_mul(RECOMPUTE_COPIES))
+    .map_err(|_| INPUTS_OVER_BUDGET)?;
+  match planned.gather(state, object) {
+    Ok(bytes) => Ok(HeldInputs { bytes, charge }),
+    Err(reason) => {
+      state.store.budget.release(charge);
+      Err(reason)
+    }
+  }
 }
 
 /// A test's corruption fault, applied once to the next inputs a holder recomputes from, if it is set (never from the
@@ -3659,8 +3594,25 @@ fn recompute(
   if let Some(signature) = value.signature {
     replica.record_signature(value.version, crate::signed_work::adopted(signature));
   }
+  // Folded where the owner had folded when it made this record (A-385): nothing at or past the floor is lost, and no
+  // later increment is based below it.
+  fold_replica(state, &mut replica, value.folded_below);
   state.merge.replicas.insert(object, replica);
   Ok(())
+}
+
+/// Folds a holder's `replica` of a green below `floor`, the version below which its owner's engine had folded the
+/// green's histories when it made the record this holder now holds (§4.16 "delta retention before folding", A-385): the
+/// replica then keeps no more of the green's history than its owner does. A floor at or below the replica's own fold
+/// is no change. The versions it folds are counted (`merge.replica.folded`), the non-vacuity counter of a holder that
+/// follows its owner's fold.
+pub(crate) fn fold_replica(state: &mut ShardState, replica: &mut Green, floor: u64) {
+  let before = replica.folded_below();
+  if floor <= before {
+    return;
+  }
+  replica.fold_history_before(floor);
+  state.count(REPLICA_FOLDED, floor.saturating_sub(before));
 }
 
 /// A holder's view of `object`'s replica, for a test.
@@ -3798,6 +3750,7 @@ mod tests {
         },
         completion: None,
         signature: None,
+        folded_below: 0,
       },
       inputs: Placement {
         candidates: candidates.clone(),
@@ -3897,6 +3850,7 @@ mod tests {
               },
               completion: None,
               signature: None,
+              folded_below: 0,
             },
             inputs: Placement {
               candidates: candidates.clone(),
@@ -3998,6 +3952,7 @@ mod tests {
         detail: 0,
         fingerprint: [15u8; 32],
       }),
+      folded_below: 2,
     }
   }
 
@@ -4022,6 +3977,7 @@ mod tests {
       },
       completion: None,
       signature: None,
+      folded_below: 0,
     };
     assert_eq!(
       MergeRecordValue::from_record_bytes(&origin_only.to_record_bytes()),
@@ -4151,6 +4107,106 @@ mod tests {
       !by_tree,
       "a record naming the tree's identity finds nothing"
     );
+  }
+
+  /// Holds `archive` for `object` in the shard's own content hold, as a holder that acknowledged its put holds it: the
+  /// manifest identity held.
+  fn hold_for(state: &mut ShardState, object: ObjectId, archive: Archive) -> [u8; 32] {
+    state
+      .held_content
+      .hold(
+        &mut crate::content_holder::hold_space(&mut state.store),
+        object,
+        slates_cluster::content::Placed::default(),
+        archive,
+      )
+      .expect("the inputs archive is whole and verifies")
+  }
+
+  /// A-383, §4.16 "Apply on holders": inputs are cut into chunks at fixed offsets, so inputs that repeat a chunk's bytes
+  /// at the cut name one chunk at more than one extent, and a holder that restored them within the archive's distinct
+  /// chunks and one chunk more refused them at every shipment, for good. Do: hold the inputs archive of bytes holding a
+  /// run of one byte three chunks long, and read the inputs as a holder recomputing a version does. Expect the very
+  /// bytes; the archive naming a chunk at more than one extent (the case meant); twice their size charged to the shard's
+  /// budget while they are held, and all of it given back once the charge is released.
+  #[test]
+  fn a_holder_reads_inputs_that_repeat_a_chunk_and_charges_them_while_it_holds_them() {
+    let chunk = crate::merge_origin::inputs_chunk_bytes();
+    let mut bytes = b"before the run".to_vec();
+    bytes.extend(std::iter::repeat_n(b'r', chunk * 3));
+    bytes.extend_from_slice(b"after the run");
+    let archive = MergeShardState::inputs_archive(&bytes, 0, 4096);
+    let named_twice = archive.chunks.len() > archive.referenced_chunks().len();
+    let object = ObjectId::new(slates_db::HostId(1), 1);
+    let (read, charged, left) = crate::daemon::audit_on_shard(move |state| {
+      let manifest = hold_for(state, object, archive);
+      let before = state.store.budget.committed();
+      let held = held_inputs(state, object, manifest);
+      let charged = state.store.budget.committed() - before;
+      let read = held.map(|held| {
+        state.store.budget.release(held.charge);
+        held.bytes
+      });
+      (read, charged, state.store.budget.committed() - before)
+    });
+    assert!(named_twice, "the inputs archive names one chunk twice");
+    assert_eq!(read, Ok(bytes.clone()), "the holder reads the very inputs");
+    assert_eq!(
+      charged,
+      u64::try_from(bytes.len()).unwrap() * RECOMPUTE_COPIES,
+      "what the recomputation holds is charged while it holds it"
+    );
+    assert_eq!(left, 0, "the charge is given back whole");
+  }
+
+  /// Shape: the reduced reserve the over-budget test's shard runs with, so a manifest naming one chunk past what the
+  /// shard admits names a few dozen extents, not the machine's measured production reserve.
+  const OVER_BUDGET_RESERVE: u64 = 32 << 20;
+
+  /// A-383, CLAUDE.md §4 hostile input (AUD-29-13): a manifest naming one chunk at more extents than the shard can hold
+  /// the inputs of is refused before a byte of them is reserved, as the cap of distinct chunks refused it before. Do: on
+  /// a shard with a reduced reserve, hold an inputs archive of one chunk named at enough extents that twice their bytes
+  /// pass what the shard could admit, and read the inputs as a holder recomputing a version does. Expect the read
+  /// refused `merge.inputs_over_budget`, with the shard's budget as it was.
+  #[test]
+  fn inputs_naming_a_chunk_past_what_the_shard_admits_are_refused_before_any_is_gathered() {
+    let object = ObjectId::new(slates_db::HostId(1), 1);
+    let (refused, before, after) = crate::daemon::audit_on_shard_configured(
+      move |state| {
+        let chunk = crate::merge_origin::inputs_chunk_bytes();
+        let mut archive = MergeShardState::inputs_archive(&vec![b'r'; chunk], 0, 4096);
+        let len = u64::try_from(chunk).unwrap();
+        let named = state.store.admittable() / (len * RECOMPUTE_COPIES) + 1;
+        let slates_archive::Node::Directory(entries) = &mut archive.manifest else {
+          panic!("an inputs archive is one directory");
+        };
+        let entry = entries
+          .first_mut()
+          .expect("an inputs archive has its one file");
+        let slates_archive::Node::File(extents) = &mut entry.node else {
+          panic!("the inputs entry is a file");
+        };
+        let one = *extents.first().expect("one chunk, one extent");
+        *extents = (0..named)
+          .map(|at| slates_archive::Extent {
+            offset: at * len,
+            ..one
+          })
+          .collect();
+        entry.meta.size = named * len;
+        let manifest = hold_for(state, object, archive);
+        let before = state.store.budget.committed();
+        let refused = held_inputs(state, object, manifest).err();
+        (refused, before, state.store.budget.committed())
+      },
+      |config| config.reserve_per_shard = OVER_BUDGET_RESERVE,
+    );
+    assert_eq!(
+      refused,
+      Some(INPUTS_OVER_BUDGET),
+      "the inputs are refused at the shard's budget"
+    );
+    assert_eq!(before, after, "nothing is left charged");
   }
 
   /// A version's inputs archive over two whole inputs chunks and half of a third (A-286).

@@ -49,9 +49,15 @@ impl StreamSender {
     self.installed = installed;
   }
 
-  /// Buffers application bytes to send, in order.
-  pub fn write(&mut self, data: &[u8]) {
-    self.buffered.extend_from_slice(data);
+  /// Buffers application bytes to send, in order. A sender with nothing buffered takes `data` itself, so a reply handed
+  /// over whole is never copied: the frames are cut from it in place (`next_frame`). Copied, a takeover's answer of a
+  /// 300 MB live log was one memcpy of all of it in the serving shard's turn (g251).
+  pub fn write(&mut self, data: Vec<u8>) {
+    if self.buffered.is_empty() {
+      self.buffered = data;
+    } else {
+      self.buffered.extend_from_slice(&data);
+    }
   }
 
   /// Raises the send credit to the peer's absolute `MaxStreamData` ceiling (monotonic; a lower grant
@@ -386,7 +392,7 @@ mod tests {
   #[test]
   fn credit_bounds_what_the_sender_emits() {
     let mut sender = StreamSender::new();
-    sender.write(&[0u8; 100]);
+    sender.write(vec![0u8; 100]);
     assert!(
       sender.next_frame(1, 4096).is_none(),
       "no credit, nothing to send"
@@ -413,7 +419,7 @@ mod tests {
   #[test]
   fn the_frame_cap_bounds_a_frame() {
     let mut sender = StreamSender::new();
-    sender.write(&[7u8; 100]);
+    sender.write(vec![7u8; 100]);
     sender.grant_credit(100);
     let frame = sender.next_frame(1, 10).unwrap();
     let Frame::Stream { data, offset, .. } = frame else {
@@ -432,7 +438,7 @@ mod tests {
       .map(|i| u8::try_from(i % 251).unwrap_or(0))
       .collect();
     let mut sender = StreamSender::new();
-    sender.write(&content);
+    sender.write(content.clone());
     sender.grant_credit(content.len() as u64);
     sender.finish();
 

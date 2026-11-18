@@ -20,10 +20,10 @@ use slates_wire::request::{ClientWindow, Seen};
 use crate::Art;
 use crate::catalog::{
   AttachmentRecord, AuditRecord, CompletionRecord, Consumer, ConsumerRecord, GrantRecord,
-  LandingLeaseRecord, LandingRecord, LeaseRecord, LineageEdge, NameAliasRecord, NfsCallRecord,
-  NfsClientRecord, NfsDelegationRecord, NfsLockRecord, NfsOpenRecord, NfsPurgeRecord,
-  NfsSessionRecord, Principal, SEAL_KEY_RECORD_BYTES, SEAL_RECIPIENT_RECORD_MAX, SealKeyOwner,
-  SealKeyRecord, SnapshotId, SnapshotRecord, Tombstone, VolumeId, VolumeRecord,
+  GrantState, LandingLeaseRecord, LandingRecord, LeaseRecord, LineageEdge, NameAliasRecord,
+  NfsCallRecord, NfsClientRecord, NfsDelegationRecord, NfsLockRecord, NfsOpenRecord,
+  NfsPurgeRecord, NfsSessionRecord, Principal, SEAL_KEY_RECORD_BYTES, SEAL_RECIPIENT_RECORD_MAX,
+  SealKeyOwner, SealKeyRecord, SnapshotId, SnapshotRecord, Tombstone, VolumeId, VolumeRecord,
 };
 use crate::error::DbError;
 use crate::op::Op;
@@ -48,6 +48,9 @@ pub struct PartitionCaps {
   /// The bytes all green merge chains together may hold in the partition (§4.16); a new increment
   /// past it is a typed capacity refusal (bounded growth until checkpointing folds old entries).
   pub green_chain_bytes: usize,
+  /// The audit records the partition retains (§4.15, §4.14; A-265): past it the oldest is dropped and counted. The
+  /// daemon derives it from memory (`DaemonConfig`), so the audit is bounded with nothing invented.
+  pub audit_records: usize,
 }
 
 /// One client's completion state, as the snapshot carries it.
@@ -102,7 +105,7 @@ pub struct PartitionSnapshot {
   pub landing_leases: Vec<LandingLeaseRecord>,
   /// The landings, by id order.
   pub landings: Vec<LandingRecord>,
-  /// The audit records retained (the ring holds the rest).
+  /// The audit records retained, oldest first: the partition's bounded window (A-265).
   pub audit: Vec<AuditRecord>,
   /// Each green volume's merge chain, by green order (§4.16; appended for append-only evolution).
   pub green_chains: Vec<GreenChain>,
@@ -150,6 +153,19 @@ pub struct PartitionSnapshot {
   pub pending_creations: Vec<crate::catalog::PendingCreationRecord>,
   /// Each green this node took over and adopted from its own holder ledger of it (A-333; 2026-11-18; appended).
   pub green_adoptions: Vec<GreenAdoption>,
+  /// The sequence the next audit record takes (A-265; appended): numbered in `apply`, so a recovery numbers each
+  /// record as the live partition did.
+  pub audit_next_seq: u64,
+  /// The audit records dropped past the bound (A-265; appended).
+  pub audit_dropped: u64,
+  /// The highest grant id ever issued here (A-266; appended): the table holds live grants only.
+  pub grants_issued_through: u64,
+  /// The audit records owed the control partition and not yet acknowledged, oldest first (A-265's crossing; appended).
+  pub audit_outbox: Vec<AuditRecord>,
+  /// The crossing sequence the next owed record takes (A-265; appended).
+  pub audit_outbox_next: u64,
+  /// On the control partition, what each owing partition has delivered (A-265; appended), by partition order.
+  pub audit_received: Vec<crate::catalog::AuditReceivedMark>,
 }
 
 /// A green adopted by its takeover successor from the successor's own holder ledger of it (§4.16 owner-loss recovery;
@@ -241,7 +257,27 @@ pub struct Partition {
   consumers: BTreeMap<u64, ConsumerRecord>,
   landing_leases: Art<LandingLeaseRecord>,
   landings: BTreeMap<u64, LandingRecord>,
-  audit: Vec<AuditRecord>,
+  /// The audit records retained, oldest first: at most `caps.audit_records` (A-265).
+  audit: std::collections::VecDeque<AuditRecord>,
+  /// The audit records dropped oldest first past the bound (A-265), snapshotted with the window.
+  audit_dropped: u64,
+  /// The sequence the next audit record takes (A-265): a counter of the partition's own, snapshotted, so the numbers
+  /// never depend on which records are retained.
+  audit_next_seq: u64,
+  /// The audit records this partition owes the control partition and has not had acknowledged, oldest first, each
+  /// carrying its crossing sequence in `seq` (A-265's crossing, made durable 2026-11-18): kept from the atom that made
+  /// it until the control partition has appended it, so a crash between the two loses none. At most
+  /// `caps.audit_records`; past it the oldest leaves, counted in `audit_dropped`, as the control partition's window
+  /// would drop it.
+  audit_outbox: std::collections::VecDeque<AuditRecord>,
+  /// The crossing sequence the next owed record takes (A-265), snapshotted: the records before it were owed already.
+  audit_outbox_next: u64,
+  /// On the control partition: for each partition that owes it records, the crossing sequence of the first it has not
+  /// appended (A-265), snapshotted, so a batch sent again appends only what is new. One entry a partition.
+  audit_received: BTreeMap<u16, u64>,
+  /// The highest grant id ever issued here (A-266): the table holds live grants only, so this mark, snapshotted, is
+  /// what keeps an ended grant's id from being issued again after a restart.
+  grants_issued_through: u64,
   /// Each green volume's merge chain (§4.16): its accepted increments after its checkpoint (all of them while it holds
   /// none), encoded, in commit order, so recovery replays them to rebuild the green. Bounded by `green_chain_bytes`
   /// against the cap.
@@ -360,7 +396,8 @@ impl Partition {
       nfs_instance: 0,
       landing_leases: Art::new(),
       landings: BTreeMap::new(),
-      audit: Vec::new(),
+      audit: std::collections::VecDeque::new(),
+      audit_dropped: 0,
       green_chains: BTreeMap::new(),
       green_origins: BTreeMap::new(),
       green_chain_bytes: 0,
@@ -368,6 +405,11 @@ impl Partition {
       green_origin_refs: BTreeMap::new(),
       green_adoptions: BTreeMap::new(),
       green_checkpoints: BTreeMap::new(),
+      audit_next_seq: 0,
+      audit_outbox: std::collections::VecDeque::new(),
+      audit_outbox_next: 0,
+      audit_received: BTreeMap::new(),
+      grants_issued_through: 0,
       tombstones: BTreeMap::new(),
     }
   }
@@ -685,6 +727,18 @@ impl Partition {
     self.volumes.get(h).ok()
   }
 
+  /// The first `limit` volumes past `after` (from the first when `None`) in volume-id order (§4.4 `list`, A-267): a
+  /// bounded ordered read of the id index ([`crate::art::Art::after`]), so a page of the listing costs the volumes it
+  /// passes, never the table.
+  pub fn volumes_after(&self, after: Option<VolumeId>, limit: usize) -> Vec<&VolumeRecord> {
+    self
+      .by_id
+      .after(after.as_ref().map(|id| id.bytes.as_slice()), limit)
+      .into_iter()
+      .filter_map(|(_, h)| self.volumes.get(*h).ok())
+      .collect()
+  }
+
   /// Every volume, by id order.
   pub fn volumes(&self) -> Vec<&VolumeRecord> {
     self
@@ -878,14 +932,23 @@ impl Partition {
       })
   }
 
-  /// The grants made for a principal (a walk of the table; a `slates grants` read, never a
-  /// hot path).
-  pub fn grants_of(&self, principal: &Principal) -> Vec<&GrantRecord> {
+  /// `principal`'s grants past grant id `after` (`None`: from the first), in grant-id order (§4.13, A-266, A-267): a
+  /// range from the cursor over the id-ordered table, so a page of a principal's grants costs the grants it passes, never
+  /// the whole table; collecting every grant of the principal and then skipping to the cursor cost the table each page.
+  pub fn grants_of_after<'a>(
+    &'a self,
+    principal: &'a Principal,
+    after: Option<u64>,
+  ) -> impl Iterator<Item = &'a GrantRecord> + 'a {
+    let from = match after {
+      Some(after) => std::ops::Bound::Excluded(after),
+      None => std::ops::Bound::Unbounded,
+    };
     self
       .grants
-      .values()
-      .filter(|g| &g.principal == principal)
-      .collect()
+      .range((from, std::ops::Bound::Unbounded))
+      .map(|(_, grant)| grant)
+      .filter(move |grant| &grant.principal == principal)
   }
 
   /// A grant.
@@ -896,6 +959,25 @@ impl Partition {
   /// Every grant, by id order: what a restarted shard rebuilds its runtime grants from (AUD-29-06).
   pub fn grants(&self) -> impl Iterator<Item = &GrantRecord> {
     self.grants.values()
+  }
+
+  /// A grant's state change: at a terminal step (consumed, expired, revoked) it leaves the table (A-266), which holds
+  /// live grants; its history is the audit log.
+  fn change_grant_state(&mut self, id: u64, state: GrantState) -> Result<(), DbError> {
+    if matches!(
+      state,
+      GrantState::Consumed | GrantState::Expired | GrantState::Revoked
+    ) {
+      self.grants.remove(&id).ok_or(DbError::NotFound)?;
+    } else {
+      self.grants.get_mut(&id).ok_or(DbError::NotFound)?.state = state;
+    }
+    Ok(())
+  }
+
+  /// The highest grant id ever issued here (A-266), whatever grants have since ended and left the table.
+  pub fn grants_issued_through(&self) -> u64 {
+    self.grants_issued_through
   }
 
   /// An enrolled consumer's record (§4.13), or `None` if no such consumer was ever enrolled.
@@ -1058,9 +1140,99 @@ impl Partition {
     self.landings.keys().next_back().copied()
   }
 
-  /// The audit records retained in memory (the ring is the durable stream).
-  pub fn audit(&self) -> &[AuditRecord] {
-    &self.audit
+  /// The audit records retained, oldest first (A-265): the newest `caps.audit_records` of them. Their history is the
+  /// log and the snapshots that carry this window; what fell past the bound is counted ([`Partition::audit_dropped`]).
+  pub fn audit(&self) -> impl Iterator<Item = &AuditRecord> {
+    self.audit.iter()
+  }
+
+  /// The audit records from sequence `since` on, oldest first (A-265, A-267): a seek, never a scan of the window. The
+  /// window is in sequence order (each record is numbered as it is appended, and the oldest leave first), so a page of
+  /// the audit costs the records it carries and a binary search, not the window's length; filtering the window from its
+  /// start made a walk of it quadratic in the window.
+  pub fn audit_from(&self, since: u64) -> impl Iterator<Item = &AuditRecord> {
+    let start = self.audit.partition_point(|record| record.seq < since);
+    self.audit.range(start..)
+  }
+
+  /// The audit records dropped oldest first past the bound since the partition began (A-265).
+  pub fn audit_dropped(&self) -> u64 {
+    self.audit_dropped
+  }
+
+  /// Appends an audit record, numbered here in log order whatever it carried (A-265): the guard-then-apply rule, so a
+  /// replay numbers each record as the live partition did. Bounded: the oldest leaves, counted, once the window is
+  /// full, from the caps alone, so a replay keeps the same window.
+  fn append_audit(&mut self, record: &AuditRecord) {
+    let mut record = record.clone();
+    record.seq = self.audit_next_seq;
+    self.audit_next_seq = self.audit_next_seq.saturating_add(1);
+    self.audit.push_back(record);
+    while self.audit.len() > self.caps.audit_records {
+      self.audit.pop_front();
+      self.audit_dropped = self.audit_dropped.saturating_add(1);
+    }
+  }
+
+  /// The audit records this partition owes the control partition, oldest first, each carrying its crossing sequence in
+  /// `seq` (A-265): what a batch sends, from the oldest, so a batch that was lost is in the next one.
+  pub fn audit_outbox(&self) -> impl Iterator<Item = &AuditRecord> {
+    self.audit_outbox.iter()
+  }
+
+  /// On the control partition: the crossing sequence of the first record partition `origin` owes that is not appended
+  /// here (A-265); 0 for a partition that delivered none.
+  pub fn audit_received(&self, origin: u16) -> u64 {
+    self.audit_received.get(&origin).copied().unwrap_or(0)
+  }
+
+  /// The audit crossing's three records (A-265), unconditional so a replay repeats them:
+  /// - `AuditOwed`: the record enters the outbox under the next crossing sequence; past the bound the oldest leaves,
+  ///   counted, from the caps alone, as `append_audit`'s window does.
+  /// - `AuditDelivered`: the records before `through` leave the outbox; an older acknowledgement than one already
+  ///   applied removes nothing.
+  /// - `AuditBatchAppended`: the records at or past `origin`'s mark are appended, in order, and the mark moves to the
+  ///   batch's end; a record before the mark was appended by an earlier batch and is passed over. A batch whose first
+  ///   record is past the mark appends from its first: the records between were dropped from the outbox's bound, and
+  ///   counted there.
+  fn apply_audit_crossing(&mut self, op: &Op) {
+    match op {
+      Op::AuditOwed { record } => {
+        let mut record = record.clone();
+        record.seq = self.audit_outbox_next;
+        self.audit_outbox_next = self.audit_outbox_next.saturating_add(1);
+        self.audit_outbox.push_back(record);
+        while self.audit_outbox.len() > self.caps.audit_records {
+          self.audit_outbox.pop_front();
+          self.audit_dropped = self.audit_dropped.saturating_add(1);
+        }
+      }
+      Op::AuditDelivered { through } => {
+        while self
+          .audit_outbox
+          .front()
+          .is_some_and(|record| record.seq < *through)
+        {
+          self.audit_outbox.pop_front();
+        }
+      }
+      Op::AuditBatchAppended {
+        origin,
+        first,
+        records,
+      } => {
+        let from = self.audit_received(*origin);
+        for (crossing, record) in (*first..).zip(records) {
+          if crossing >= from {
+            self.append_audit(record);
+          }
+        }
+        let count = u64::try_from(records.len()).unwrap_or(u64::MAX);
+        let end = first.saturating_add(count);
+        self.audit_received.insert(*origin, from.max(end));
+      }
+      _ => {}
+    }
   }
 
   // ------------------------------------------------------------------ the guard
@@ -1312,7 +1484,11 @@ impl Partition {
         Ok(())
       }
       Op::LandingStateChanged { id, .. } => self.landing(*id).map(|_| ()).ok_or(DbError::NotFound),
-      Op::AuditAppended { .. } => Ok(()),
+      // The audit is never refused (A-265): its records are the history of what happened, kept or counted as dropped.
+      Op::AuditAppended { .. }
+      | Op::AuditOwed { .. }
+      | Op::AuditDelivered { .. }
+      | Op::AuditBatchAppended { .. } => Ok(()),
       Op::GreenAdvanced { green, increment } => {
         self.volume(*green).ok_or(DbError::NotFound)?;
         // Bounded growth (§4.16; CLAUDE.md): the chain grows per accepted version, so a new increment
@@ -1775,13 +1951,11 @@ impl Partition {
         Ok(())
       }
       Op::GrantIssued { record } => {
+        self.grants_issued_through = self.grants_issued_through.max(record.id);
         self.grants.insert(record.id, record.clone());
         Ok(())
       }
-      Op::GrantStateChanged { id, state } => {
-        self.grants.get_mut(id).ok_or(DbError::NotFound)?.state = *state;
-        Ok(())
-      }
+      Op::GrantStateChanged { id, state } => self.change_grant_state(*id, *state),
       Op::ConsumerEnrolled { record } => {
         self.consumers.insert(record.consumer, record.clone());
         Ok(())
@@ -1830,7 +2004,11 @@ impl Partition {
         Ok(())
       }
       Op::AuditAppended { record } => {
-        self.audit.push(record.clone());
+        self.append_audit(record);
+        Ok(())
+      }
+      Op::AuditOwed { .. } | Op::AuditDelivered { .. } | Op::AuditBatchAppended { .. } => {
+        self.apply_audit_crossing(op);
         Ok(())
       }
       Op::GreenAdvanced { green, increment } => {
@@ -2112,7 +2290,7 @@ impl Partition {
       grants: self.grants.values().cloned().collect(),
       landing_leases: self.landing_leases.iter().map(|(_, l)| l.clone()).collect(),
       landings: self.landings.values().cloned().collect(),
-      audit: self.audit.clone(),
+      audit: self.audit.iter().cloned().collect(),
       consumers: self.consumers.values().cloned().collect(),
       nfs_opens: self.nfs_opens.values().cloned().collect(),
       nfs_delegations: self.nfs_delegations.values().cloned().collect(),
@@ -2153,6 +2331,19 @@ impl Partition {
       pending_submits: self.pending_submits.values().cloned().collect(),
       pending_creations: self.pending_creations.values().cloned().collect(),
       expired_attachments: self.expired_attachments.iter().copied().collect(),
+      audit_next_seq: self.audit_next_seq,
+      audit_dropped: self.audit_dropped,
+      grants_issued_through: self.grants_issued_through,
+      audit_outbox: self.audit_outbox.iter().cloned().collect(),
+      audit_outbox_next: self.audit_outbox_next,
+      audit_received: self
+        .audit_received
+        .iter()
+        .map(|(origin, through)| crate::catalog::AuditReceivedMark {
+          origin: *origin,
+          through: *through,
+        })
+        .collect(),
       nfs_instance: self.nfs_instance,
       tombstones: self.tombstones().collect(),
       green_chains: {
@@ -2347,7 +2538,17 @@ impl Partition {
     for l in &snapshot.landings {
       p.landings.insert(l.id, l.clone());
     }
-    p.audit = snapshot.audit.clone();
+    p.audit = snapshot.audit.iter().cloned().collect();
+    p.audit_dropped = snapshot.audit_dropped;
+    p.audit_next_seq = snapshot.audit_next_seq;
+    p.grants_issued_through = snapshot.grants_issued_through;
+    p.audit_outbox = snapshot.audit_outbox.iter().cloned().collect();
+    p.audit_outbox_next = snapshot.audit_outbox_next;
+    p.audit_received = snapshot
+      .audit_received
+      .iter()
+      .map(|mark| (mark.origin, mark.through))
+      .collect();
     p.restore_merge(snapshot);
     p.restore_nfs(snapshot);
     p.restore_name_aliases(snapshot);

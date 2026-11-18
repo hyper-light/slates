@@ -210,9 +210,6 @@ pub(crate) const fn bulk_chunk_bytes() -> u64 {
 /// Shape: the landing slots the segment holds: landings in flight per daemon, one per shard
 /// plus one for the control shard's presentation.
 const LANDING_SLOTS_PER_SHARD: u32 = 1;
-/// Shape: the audit ring: a page per shard; the audit rate is measured from the first landings
-/// (§4.15's derived table) and the ring re-sized at the next start.
-const AUDIT_PAGES_PER_SHARD: u64 = 1;
 
 /// The store's caps per shard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -752,6 +749,24 @@ impl DaemonConfig {
       ["table_bytes"]
     );
     derivations.push(note("volumes_per_shard", &volumes));
+    // The audit's window (§4.15's derived table; A-265): what the partition's table bytes hold of its records, the
+    // memory ceiling that bounds it whatever the landing rate. The design's `landing rate × operator audit horizon ×
+    // record size` may lower it once a landing rate is measured; none is yet, so the horizon is not applied.
+    let audit_record_bytes =
+      u64::try_from(size_of::<slates_db::catalog::AuditRecord>()).unwrap_or(1);
+    let audit_records: Derived<usize> = derived!(
+      usize::try_from(
+        tables
+          .get()
+          .checked_div(audit_record_bytes.max(1))
+          .unwrap_or(0)
+      )
+      .unwrap_or(usize::MAX)
+      .max(1),
+      "table_bytes / size_of::<AuditRecord>()",
+      ["table_bytes"]
+    );
+    derivations.push(note("audit_records_per_shard", &audit_records));
     // §4.7 "Derived constants": a client ring holds what one client may have in flight — Little's law
     // on the request rate × p99 service time (`requests_in_flight_per_shard`, the admission value that
     // sizes one client's in-flight work) — rounded up to a power of two. Until 2026-09-22 it was the
@@ -870,9 +885,6 @@ impl DaemonConfig {
         .max(page),
       log_bytes: log_bytes.get(),
       snapshot_bytes: snapshot_bytes.get(),
-      audit_bytes: AUDIT_PAGES_PER_SHARD
-        .saturating_mul(page)
-        .saturating_mul(shards),
       landing_slots: LANDING_SLOTS_PER_SHARD
         .saturating_mul(runtime.shards.max(1).into())
         .saturating_add(1),
@@ -891,6 +903,7 @@ impl DaemonConfig {
       // bytes the records draw from, so a green's persisted chain is bounded by measured memory, not
       // a magic count. Checkpointing to fold old chain entries (the design's optimization) is owed.
       green_chain_bytes: usize::try_from(tables.get()).unwrap_or(usize::MAX),
+      audit_records: audit_records.get(),
     };
     // The store's tables (§4.2 metadata dimension): each slab's bound is the metadata class — the
     // shard's second memory class, one reserve — over the true slot cost of the dimension's unit
@@ -1449,7 +1462,13 @@ impl DaemonConfig {
   /// The content bytes one slice of copy-bound work (a DAX backing's fill, an image's build) may move on the calling
   /// shard now: half its live step quantum at the machine's measured memcpy rate.
   pub fn copy_slice_bytes(&self) -> u64 {
-    copy_slice_bytes(self.memcpy_bytes_per_second, self.step_quantum_ns())
+    self.copy_slice_bytes_within(self.step_quantum_ns())
+  }
+
+  /// [`DaemonConfig::copy_slice_bytes`] for a turn of `quantum_ns` (a takeover's turns, whose quantum a test may cut,
+  /// `fleet::seal_quantum_ns`): half of it at the machine's measured memcpy rate.
+  pub fn copy_slice_bytes_within(&self, quantum_ns: u64) -> u64 {
+    copy_slice_bytes(self.memcpy_bytes_per_second, quantum_ns)
   }
 
   /// Derived: the pages an idle shard pre-faults in one slice of its reserve's refill now (A-214): its step quantum
@@ -2119,12 +2138,7 @@ mod tests {
         let rings: u64 = geometry
           .regions()
           .iter()
-          .filter(|region| {
-            matches!(
-              region.kind,
-              slates_anchor::RegionKind::Log(_) | slates_anchor::RegionKind::Audit
-            )
-          })
+          .filter(|region| matches!(region.kind, slates_anchor::RegionKind::Log(_)))
           .map(|region| region.len)
           .sum();
         assert!(

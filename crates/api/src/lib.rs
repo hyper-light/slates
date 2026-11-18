@@ -30,6 +30,8 @@
 //!   Signatures never gate permission.
 //! - *Errors* ([`error`]): one closed taxonomy whose variant is what a consumer does about it.
 //! - *The seam* ([`seam`], [`sim`]): the volume verbs as a trait, for hosts that need a simulator (A-310).
+//! - *The async form* ([`asynchronous`]): verbs a host awaits on its own loop through its [`Reactor`], never a thread
+//!   blocked on a round trip (R6).
 //!
 //! **Starting an instance with no slates binary** ([`start`], [`role`]). A host starts its instance from its own
 //! executable: [`Instance::start`] runs `HOST_EXE PREFIX... --instance NAME anchor`, and the host's `main` hands the
@@ -65,6 +67,7 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
+pub mod asynchronous;
 pub mod error;
 pub mod exec;
 pub mod grant;
@@ -74,6 +77,7 @@ pub mod launcher;
 pub mod mount;
 pub mod observe;
 pub mod outcome;
+pub mod page;
 pub mod policy;
 pub mod role;
 pub mod seam;
@@ -82,6 +86,7 @@ pub mod sim;
 pub mod start;
 pub mod volume;
 
+pub use asynchronous::{AsyncInstance, Completion, Reactor, Waiting, Woke};
 pub use error::{
   Absence, Busy, Denied, Elsewhere, Error, Exhausted, Existing, HostFault, Invalid, IssuerFault,
   KindMismatch, Missing, MountFault, MountMissing, Note, PathFault, ProtocolFault, RetryCause,
@@ -99,6 +104,7 @@ pub use outcome::{
   MergeApproval, MergeConflict, MergeConflictClass, MergeConflicts, MergeOutcome, MergeRecord,
   RebaseOutcome, Summary, Work,
 };
+pub use page::Page;
 pub use policy::{PolicyReason, PolicyRefusal, PolicySubject, WriteAct, WriteMode, WritePolicy};
 pub use seam::Volumes;
 pub use signed::{
@@ -107,7 +113,8 @@ pub use signed::{
 pub use sim::SimVolumes;
 pub use start::{Anchor, StartSpec, Started};
 pub use volume::{
-  BaseState, Drift, DriftKind, DriftReport, Provisioned, Source, VolumeSpec, VolumeStatus, Watcher,
+  BaseState, Drift, DriftKind, DriftPage, DriftReport, Provisioned, Source, VolumeSpec,
+  VolumeStatus, Watcher,
 };
 
 /// The crate's version: the workspace's one hand-edited version (§4.12 "One version"), which a host reports beside its
@@ -181,20 +188,40 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// unprivileged user namespaces; [`exec::command`] builds the command that runs it from a host's own executable, which
 /// [`role::main`] serves; [`exec::check`] answers the host's [`Readiness`]; its refusals are [`ExecFault`] (A-370; the
 /// same day).
+/// 26: lists a page at a time (A-263 to A-267): `Page`, `Instance::{list_page, grants_page, audit_page,
+/// changed_since, changed_since_page, drift_page}`, `DriftPage`, `DriftReport::elided`, `ChangedCursor`;
+/// `Instance::drift` reads every entry; a landing target longer than a grant's listing holds is refused
+/// `TargetRefusal::TooLong` (A-266) (the same day). 27: a list a verb's own reply carries counts what one reply could
+/// not hold (A-267): `Instance::rewitness` answers `Rewitnessed { paths, paths_elided }`, `Stale::Disk` carries
+/// `elided`, `LandingReport` carries `degraded_elided`, and a presentation is clean only when it carries and counts no
+/// conflict (the same day). 28: `Stale::Verdict`, a merge's or a rebase's conflict windows read after the work's verdict
+/// was replaced; `merge` and `rebase` answer every window of a verdict however many, a signed merge's too (A-267) (the
+/// same day). 29: `drift_page` reads past an inode (`after: Option<u64>`), in inode order, re-checking the entries it
+/// passes; `drift` answers its lists in path order (A-267) (the same day). 30: a granted landing that is refused ends
+/// its audit trail: the records of the steps its attempt took, then an [`AuditKind::LandingFinished`] whose `outcome` is
+/// [`LandingStage::Refused`], or [`LandingStage::Aborted`] once it wrote an entry; such an end that names no manifest
+/// (refused before any plan, under a grant that names none) carries no `verification`. Until then a refused landing's
+/// trail ended at its grant (found by g90; the same day). 31: the async form ([`AsyncInstance`] over a host's
+/// [`Reactor`]: provisioning from every source, a snapshot, a status and a destroy, awaited on the host's own loop
+/// through the client's driver; [`AsyncInstance::into_instance`] stops the completion signal, so the synchronous form's
+/// waits are woken; R6) (A-299; the same day).
+/// 32: `AuditKind::GrantExpired`, the record a grant's end at its term leaves in the audit (A-266) (the same day).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 25;
+pub const CONTRACT: u32 = 32;
 
+/// What a rewitness did (§4.15 `rewitness`): the paths one reply holds and the count of the rest (A-267).
+pub use slates_client::Rewitnessed;
 /// The typed client and its own types, for the verbs [`Instance::client`] lends outside the contract.
 pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, VhostUserDevice};
 /// The wire's types the contract takes and returns (§4.9; append-only, D-15).
 pub use slates_ipc::protocol::{
-  AttachTransport, ConflictClass, DaemonReport, DatabaseRefusal, FailoverReport, Filter,
-  GrantScope, GreenBase, HostAnswer, HostPathReason, Intent, JournalReport, LandingDegradation,
-  LandingDurability, LossReport, MountReport, NamePolicy, OwnMountUse, PastTolerance, PlacedState,
-  PlannedAction, PlannedContent, PlannedEntry, Principal, ReadAt, RecoveryCause, Shortfall,
-  SnapshotId, TargetRefusal, TelemetryReport, TransportReport, UnsupportedReason, VolumeId,
-  VolumeRefusal, VolumeSummary, VolumeTakeover,
+  AttachTransport, ChangedCursor, ConflictClass, DaemonReport, DatabaseRefusal, FailoverReport,
+  Filter, GrantScope, GreenBase, HostAnswer, HostPathReason, Intent, JournalReport,
+  LandingDegradation, LandingDurability, LossReport, MountReport, NamePolicy, OwnMountUse,
+  PastTolerance, PlacedState, PlannedAction, PlannedContent, PlannedEntry, Principal, ReadAt,
+  RecoveryCause, Shortfall, SnapshotId, TargetRefusal, TelemetryReport, TransportReport,
+  UnsupportedReason, VolumeId, VolumeRefusal, VolumeSummary, VolumeTakeover,
 };
 /// The rendezvous's and the channel's own typed refusals the contract carries.
 pub use slates_ipc::{DeliveryFault, error::RouteRefusal};

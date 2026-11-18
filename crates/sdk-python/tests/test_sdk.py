@@ -22,6 +22,7 @@ BOUND_VERBS = {
     "create",
     "snapshot",
     "status",
+    "drifted",
     "list",
     "resize",
     "destroy",
@@ -204,6 +205,8 @@ class SlatesSdkRoundTrip(unittest.TestCase):
             self.assertIsNone(status["mirror_age_ns"])
             self.assertIn("nfs_port", status)
             self.assertEqual(status["drifted"], [])
+            # drifted → every drifted entry, past what a status carries (A-267): a scratch volume has none.
+            self.assertEqual(client.drifted(volume), {"drifted": [], "unverified": [], "oversized": 0})
 
             # list → the volume appears with its fields (a scratch volume is not an overlay).
             listed = client.list()
