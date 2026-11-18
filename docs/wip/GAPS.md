@@ -3279,6 +3279,13 @@
 >   `panic = "abort"`). Every shipped print site now writes through `slates_machine::log`, which counts a refused line
 >   and drops it. The failing-first test is `an_anchor_whose_log_reader_went_away_keeps_supervising`
 >   (`crates/cli/tests/cli.rs`). Record: `docs/bugs/2026-11-05-a-closed-log-pipe-ended-the-anchor.md`.
+> - **Closed 2026-11-18 (A-357): the Windows x86_64 binary did not start in Nano Server** (found by the test tag
+>   `v0.1.0-test.3`, run 44326428333: `slates version` exited 0xC0000139, `STATUS_ENTRYPOINT_NOT_FOUND`, so `stage`
+>   could not run and no draft was made). A-223 had imported three kernel32 functions that Nano Server's kernel32
+>   lacks (`EnableThreadProfiling`, `ReadThreadProfilingData`, `DisableThreadProfiling`). `slates-machine` now finds
+>   them at run time, and where they are missing the switch count is unknown, as when the OS refuses the profiling.
+>   Only the release lane runs the Nano Server check, so no push to main showed it. Record:
+>   `docs/bugs/2026-11-18-the-windows-binary-did-not-start-in-nano-server.md`.
 > - **Reproducible from the tag (2026-11-05, AC-9.5).** Every target is built twice on separate runners, and the
 >   release is refused unless the two copies are the same bytes. The four Linux binaries already were. The Windows
 >   ones differed in 20 bytes, the linker's timestamps and PDB GUID (run 42046848954), until `/Brepro`; with it, all six

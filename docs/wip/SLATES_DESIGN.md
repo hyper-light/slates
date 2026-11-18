@@ -996,6 +996,9 @@ volume requires a matching profile), `MeasurementTimeout`.
 > announcement stood in: the probe read 0.14–0.85 µs, and the window, quantum and spin derived from it were a hundred
 > times too small. Now it reads 6.0–9.1 µs on CI's quiet runners. The daemon's idle window, which it then scaled, is
 > R9's floor on Linux and macOS since A-223's window rule (§4.7, 2026-11-11); Windows keeps the multiple (GAPS).
+> The three profiling calls are found in kernel32 at run time (A-357, 2026-11-18): Nano Server's kernel32 lacks them,
+> and the binary that imported them did not start there. Where they are missing the switch count is unknown, as when
+> the OS refuses the profiling.
 
 > **Status (2026-09-25, the wake probe measures one event and reports its mean).** The probe timed every park/unpark round trip, so it mixed an on-CPU handoff (about 0.45 µs, the waiter still running or on the waker's CPU) with a real wake (about 10 µs); thread placement holds for a run, so runs split between the two (median 416 ns or 10,041 ns on the same two container cores, a minute apart), and it stopped on the median's interval while its consumers read the p99 — often the maximum of 64 samples (667 ns to 511,042 ns). Now the waiter is confirmed asleep (Linux `/proc` state, macOS `thread_info`; Windows the waiter's announcement, reported unconfirmed), the pair is placed as production is (the control core waking a shard core where the OS pins; unpinned on macOS, with the same-CPU share recorded), the probe converges the mean — the spin-then-park rule's threshold is the expected cost of parking, and a spinning waiter on the same pinned cores never saw the tail (p99 ≤ 209 ns) while a parked one did (285–639 µs) — and five fresh-thread rounds are compared by their medians (a disagreement lists the probe degraded, `wake.rounds`). Measured on a quiet host: the median held at 8.9–10.8 µs over ten container runs and the mean at 15.1–17.6 µs on four CPUs; macOS's mean held at 2.03–2.49 µs. The spin window, the step quantum and the timer tick now read the mean, the runtime's inbound ring the p99 at its overflow target, the guest credit's kick round trip the mean; a profile of another format version is refused by name, and a daemon handed one by an older anchor measures its own. The boot mean is quick on a virtual machine (±20–30 % in 250 ms at a coefficient of variation of five to seven); since A-31 (2026-09-25) it is only the prior of each shard's and each client's online estimate, refined from the confirmed wakes they pay (§4.3 and §4.7 status), and the long-step count attributes each long poll to its task or to the host rather than reading wall time. Record: `docs/bugs/2026-09-22-wake-probe-mixes-two-events-and-reports-an-unconverged-tail.md`.
 
@@ -25792,3 +25795,25 @@ Applied in the same change to: §4.10's chaos status, GAPS ("Chaos from outside 
 - **Sibling, owed.** A-309 piece 2 (the register takeover past tolerance, `slates_db::takeover`) passes over a falsely
   retired holder of the newest register record the same way.
 - Record: `docs/bugs/2026-11-18-a-false-death-let-the-members-that-exist-now-stand-in-for-the-holder-of-the-newest-entries.md`.
+
+### A-357 — The thread-profiling calls are found in kernel32 at run time, so the Windows binary starts where kernel32 lacks them (2026-11-18, the release goals g236 and g237; a bug in A-223 found by the test tag `v0.1.0-test.3`)
+Applied in the same change to: §4.1 (A-223's status), GAPS (the binary release lane's entry), `crates/machine`
+(`switches.rs`), `unsafe-budget.toml` (`slates-machine` 81 → 85), and the bug record of 2026-11-18.
+- **The defect.** A-223's `switches.rs` imported `EnableThreadProfiling`, `ReadThreadProfilingData` and
+  `DisableThreadProfiling` from kernel32. Nano Server's kernel32 exports none of them, and Windows refuses to start a
+  binary that imports a function its DLL lacks: on the test tag `v0.1.0-test.3` (run 44326428333, main 1cd57d18b) the
+  x86_64 binary exited 0xC0000139, `STATUS_ENTRYPOINT_NOT_FOUND`, in a process-isolated `nanoserver:ltsc2025`
+  container, where main's binary of that morning (843f527ff, run 44266895044) had answered `slates version`. The two
+  binaries' import tables (`llvm-objdump -p`: 215 functions and 218) differ by exactly those three.
+- **The decision.** Find the three at a thread's first read with `GetModuleHandleW` and `GetProcAddress`, typed by the
+  documented signatures, as `slates-rt` finds `NtQuerySystemInformation` (`thread_clock.rs`), and answer `None` where
+  any is missing: the answer the module already gave when the OS refuses the profiling. The wake probe reads it as
+  an unknown sleep, and a shard learns its park's wake without the unslept filter, as on macOS. No second path is
+  added: where kernel32 has them, the same calls run with the same arguments. Rejected: running the gate in Server Core instead of Nano Server, which would keep a binary
+  that cannot start in the smallest Windows image and weaken the check that proves the C runtime is linked in.
+- **Proof (diag-g071-nano-1, run 44332283768, 2026-11-18).** Built as the release lane builds it and started in a
+  process-isolated `nanoserver:ltsc2025` on `windows-2025`: main 68148152d exited 0xC0000139, the same commit with this
+  change answered `slates 0.1.0`, and its import table holds none of the three. The module's test
+  (`a_blocked_thread_switched_and_a_running_one_did_not`) passed on Windows x86_64 and arm64, where kernel32 has them.
+- **Not covered by a push.** Only the release lane runs the Nano Server check (a tag or a dry run). A regression of
+  this kind shows on the next test tag, not on the push that makes it.
