@@ -890,10 +890,8 @@ mod tests {
     let reading = |handle: u64| super::run_readings(&[handle]).pop().flatten();
     let mut ends: [libc::c_int; 2] = [0; 2];
     // SAFETY: `ends` is this frame's own pair for the call to fill; the status is checked.
-    assert_eq!(
-      unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) },
-      0
-    );
+    let made = unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) };
+    assert_eq!(made, 0, "a pipe for the held thread's child");
     let [read_end, write_end] = ends;
     let (handles, handed) = mpsc::channel();
     let (release, waited) = mpsc::channel::<()>();
