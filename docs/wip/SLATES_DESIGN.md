@@ -995,7 +995,8 @@ volume requires a matching profile), `MeasurementTimeout`.
 > a Windows park that never switched out by the same count, as Linux does by its voluntary switches. Before this, the
 > announcement stood in: the probe read 0.14–0.85 µs, and the window, quantum and spin derived from it were a hundred
 > times too small. Now it reads 6.0–9.1 µs on CI's quiet runners. The daemon's idle window, which it then scaled, is
-> R9's floor on Linux and macOS since A-223's window rule (§4.7, 2026-11-11); Windows keeps the multiple (GAPS).
+> R9's floor on every platform: on Linux and macOS since A-223's window rule (§4.7, 2026-11-11), on Windows since
+> A-361 (2026-11-18), whose loaded wake had kept a hundred times the estimate there.
 > The three profiling calls are found in kernel32 at run time (A-357, 2026-11-18): Nano Server's kernel32 lacks them,
 > and the binary that imported them did not start there. Where they are missing the switch count is unknown, as when
 > the OS refuses the profiling.
@@ -1410,8 +1411,9 @@ only ever issued `PollAdd` and `Nop` through a ring — epoll's job — and the 
 that bought showed a 13% p50 win confined to the parked wake path against a loss of up to 23% at the
 8-client p99 in the spinning path, which is the one R9's sub-50 µs gate measures. It is removed, not
 kept behind a flag: the rule is replace, do not layer. macOS: kqueue with `EVFILT_USER` kicks and non-blocking socket I/O for the NFS
-server. Windows: IOCP with `PostQueuedCompletionStatus` kicks; WinFsp requests arrive on WinFsp's
-threads and are routed to the owning shard by handle. Simulation: a driver that replaces time,
+server. Windows: IOCP with `PostQueuedCompletionStatus` kicks, a blocked wait raised one priority level for as long as it
+blocks (A-361: a completion port's waiter gets none of the wake boost an event's waiter gets, so a kicked shard waited
+out its neighbours' turns); WinFsp requests arrive on WinFsp's threads and are routed to the owning shard by handle. Simulation: a driver that replaces time,
 randomness, sockets, rings, and the bridge with seeded in-process simulations for the whole
 cluster.
 
@@ -1873,8 +1875,10 @@ landing constants are in §4.15.
 > `F = D + E + R` every coordinator period from what it measures (`slates_cluster::failover`): `D` SWIM's count of its
 > detector's periods at their measured running tail, `E` the council's death-confirmation window at the measured period, `R` the tail of
 > the takeovers and volumes it timed (the ratified recovery budget before the first), and publishes it in its status
-> (`FleetReport::failover`). The operator's SLO above is still the 10 s placeholder its consumers read until each moves
-> to the estimate or to a term of its own (A-363's owed list; GAPS, the `LIVENESS_BUDGET_NS` entry).
+> (`FleetReport::failover`). **Since A-375 the waits that bound a failover read it** (a forward's bound, the location
+> round's cap, a held reply's total, a takeover's attempts), fanned to every shard in whole coordinator periods; the
+> lease terms still read the operator's 10 s placeholder above until each takes a term of its own (A-363's owed list;
+> GAPS, the `LIVENESS_BUDGET_NS` entry).
 
 **Worked example.** An agent clones snapshot S of a 2 million-file volume: the reply arrives in one
 ring round trip; the clone's `referenced_bytes` equals S's referenced bytes (charged in full),
@@ -5007,10 +5011,11 @@ drops.
 
 **Derived constants.** Ring depth = Little's law on measured per-client request rate × p99
 service time, rounded to a power of two; `spin_ns` = wake_ns.mean (the client's prior); `spin_shift`
-= ⌈log₂ (1.96 · wake_ns.sd / (0.05 · wake_ns.mean))²⌉; idle window = max(F, the shard's wake estimate ×
-the platform's multiple), where F = R9's provisioning floor, 50 µs (`PROVISION_FLOOR`, the requirement itself, which
-the bench gates on too) and the multiple, `loaded_wake_ratio()` (paired `#[cfg]` functions with one signature), is 0
-on Linux and macOS and 100 on Windows (A-223's window rule, below); closed-loop hold = 2F × the least k with
+= ⌈log₂ (1.96 · wake_ns.sd / (0.05 · wake_ns.mean))²⌉; idle window = F, R9's provisioning floor, 50 µs
+(`PROVISION_FLOOR`, the requirement itself, which the bench gates on too), on every platform, no multiple of the wake
+estimate pricing it (`NO_ESTIMATE_MULTIPLE`; A-223's window rule and A-361, below); idle spin ceiling = the liveness
+budget less one beat, 900 ms (`IDLE_SPIN_CEILING`), which no idle spin passes whatever its window or a hold asks, so
+none reaches the watchdog's spin window (A-361); closed-loop hold = 2F × the least k with
 ((S − 1)/S)^k ≤ 1/100, S the shards and 1/100 R9's tail (`config::closed_loop_hold`: 700 µs at two shards, 1.2 ms at
 three, 6.7 ms at fifteen), held by a forward for a request that came within F of its shard's last client I/O, and never
 more cycles of 2F than its loop had run before it (`verbs::loop_hold`; A-326, below).
@@ -5024,8 +5029,8 @@ more cycles of 2F than its loop had run before it (`verbs::loop_hold`; A-326, be
 > spinning cannot lengthen it. The boot probe's smallest confirmed wake was weighed as the other input and dropped: on
 > a quiet boot it is the smallest of many confirmed wakes (5.4–6.6 µs on Linux), but a daemon booted beside spinners
 > read 6.8–346 µs, past F in 5 of 9 boots on each Linux runner, and the daemon cannot tell a loaded boot from a slow
-> machine. Windows keeps the multiple of 100: a Windows shard parked under load waits 50–100 ms to run again, and at
-> F alone every loaded request paid it (GAPS, open). Both live readers, the shard's idle spin and the serve loop,
+> machine. Windows kept the multiple of 100 until A-361 (below): a Windows shard parked under load waited 14–42 ms
+> to run again, and at F alone every loaded request paid it. Both live readers, the shard's idle spin and the serve loop,
 > read the one window (`ShardContext::idle_window_ns`); the step quantum still reads the estimate's mean. Measured: BENCHMARKS, "The idle window's rule"; test:
 > `crates/server/tests/idle_window.rs`.
 
@@ -5044,6 +5049,25 @@ more cycles of 2F than its loop had run before it (`verbs::loop_hold`; A-326, be
 > behind when it ends is at most what the loop itself took, and a paced client's create (after its pause) and its
 > destroy (the first request of a run) hold nothing. No estimate is an input, so (i) still holds. Test:
 > `crates/server/tests/closed_loop.rs` (a loop over three shards finds them polling; a paced client holds none).
+
+> **Status (2026-11-18, A-361: Windows' own window, and every idle spin under the watchdog's).** Windows wakes a thread
+> blocked on an event, a semaphore or an address a priority level up, and a thread dequeued from an I/O completion port
+> at its own level, which is how a parked shard waited. Beside two spinners a logical CPU at the shard's level, on CI's
+> windows-latest and windows-11-arm (`diag-g234-wake-1`), a completion-port waiter woke 29 ms and 14 ms after its kick
+> at the median, 95–112 ms and 32–48 ms at the p99, waiting out the spinners' turns of 31.6 ms, while an event's or
+> WaitOnAddress's waiter woke in 15 µs and 6–7 µs; with its boost disabled the event's waiter waited the same 29 and
+> 14 ms. Now a blocked wait raises a shard at the normal level one level for as long as it blocks and puts it back
+> before it runs anything (§4.3 "Drivers"). The hundred times the estimate Windows kept had priced the window on those
+> waits: windows of seconds, which after a WinFsp request spun past the watchdog's window, and the anchor killed a live
+> daemon in 3 of 3 runs on windows-latest (g258, 2026-11-18). So the window is R9's floor on Windows too, and every
+> idle spin, window or hold, ends by the idle spin's ceiling, a beat under the liveness budget, the least spin window
+> the watchdog judges by (asserted at compile time beside the constants). Measured at two shards (`diag-g234-winbench-1`,
+> three rounds, every N in BENCHMARKS "Windows' own window"): a 1 ms-paced client's CPU fell from 94 and 199 thousandths
+> of a core quiet and 756 and 787 loaded to 7 and 25 quiet and 20 loaded; the loaded single-client p99 from 157 µs with
+> 4 of 9 runs at 56–83 ms (x86_64) and 108 µs with one at 31.9 ms (arm64) to 130 and 148 µs, none past 192 µs; the
+> quiet p99 stayed within main's spread (24 against 26 µs, 31 against 32 µs). Open: a process whose job fixes its
+> priority class (kiln's agent job on jupiter) keeps a raised level where it was, so there a parked shard still waits
+> out its neighbours' turns; the window no longer grows with that wait (GAPS).
 
 **Worked example.** From Python: `await client.create("scratch", bounded=4 GiB)`: the extension
 writes the slot, spins for `spin_ns`, and returns the reply without ever touching the event loop
@@ -5572,6 +5596,12 @@ epoch records that epoch even if the bytes equal the holder's older value. Match
 not justify keeping the old ballot: a later quorum could otherwise prefer a conflicting
 proposal from between those epochs (BUG-12). A replicated prefix must be checked for extension,
 not only length, before any mutation. No historical committed value may ever be rewritten.
+A holder accepts at a position any proposal at or above its promise: a higher epoch's different
+value replaces the one held there, which therefore never committed (every higher epoch's phase
+one adopts a committed value), and a second value under the epoch the position already holds is
+refused, since one ballot proposes one value a position (A-373; the `Accept` of
+`docs/wip/models/FencedLedger.tla`). What a holder derived from a replaced value, a green's
+replica, is rebuilt below it.
 
 Epoch allocation derives from configuration authority, not a simulation's access to unreachable
 holders' internal state. Checked counters refuse exhaustion. Quorum counts exclude duplicate,
@@ -7006,6 +7036,17 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > late. Red-checked: with the control-verb wait removed the last write returned at head 1, durable none, owed
 > (3 of 3); with the NFS wait removed the counter is zero and the race shows an undurable reply in 2 of 3.
 >
+> **The held replies' bound is met before a verb runs (2026-11-18).** A shard holds at most `awaiting_bound` such
+> replies (its client seats times ring slots). A recorded verb that could be held (one that changes a live-shipped
+> volume, or a destroy while `f > 0`) meets that bound before it runs (`live_ship::refuse_over_bound`, from
+> `verbs::run_recorded`): refused `Overloaded`, it changed nothing, and its resend under the same id runs it once, as on
+> a plain volume. Before, the bound was met in `defer`, after the verb's effects had committed with no completion
+> record, so the resend ran the verb again over them: a directory's resend was refused `AlreadyExists`, an append landed
+> twice (g232's finding). Held by
+> `a_live_shipped_verb_refused_at_the_held_reply_bound_changed_nothing_so_its_resend_runs_once`
+> (`crates/server/tests/fleet.rs`). An asynchronous outcome (a mapped file's sync, an image build) still meets the bound
+> in `defer`, after its commit (GAPS, OPEN).
+>
 > **Slice three (2026-11-05): takeover from the live log.** The whole-state kind (23) carries a successor's fetch beside
 > installs, by tag (`slates_db::live::Fetch`). A takeover that adopts a live-shipped volume's head runs phase one for
 > its log (`live_ship::fetch`): every candidate of the head's placement raises its fence to the head's placed epoch,
@@ -7305,6 +7346,14 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > acceptor whose changes do not account for its positions against what was published (one put in place of another) is
 > carried whole, as its pieces. Still carried whole when changed: the content hold's image (its every manifest and
 > chunk, at each publication that changed it) and the mirror records.
+>
+> **The content hold is its pieces (2026-11-18, A-376; image version 30).** The content hold's image was one piece,
+> every stored chunk, held manifest and stage, re-encoded at every publication and re-put whenever it changed: at
+> `f > 0` every version of a green, whose inputs its holders keep. Now each stored chunk, each manifest held for an object
+> and each stage is a piece (`ContentHold::pieces`), the hold keeps which it changed since the last committed
+> publication (`ContentHold::changed_pieces`), and a delta carries those; a recovery puts them back into the hold's image
+> (`ContentHold::image_from_pieces`) and rebuilds the hold from it as before, every chunk verified. Still carried whole
+> when changed: the mirror records.
 >
 > **One lane a holder, only to holders of the catalog, and no session left with a cancelled request (2026-11-07).**
 > The dispatch round (`live_ship::dispatch`, `send_from_control`) now ships the way the record plane's sessions allow.
@@ -11516,7 +11565,9 @@ Recipes to copy verbatim:
 - A `guard` job asserts the git tag equals the workspace version, or names a test of the lane
   (`v<version>-test.N`, accepted by the release lane alone; A-210). [C: release.yml:40-45]
 - Windows binaries link the C runtime statically (`+crt-static`), and the x86_64 one must start in a
-  process-isolated Nano Server container, which has no Visual C++ runtime (A-210).
+  process-isolated Nano Server container, which has no Visual C++ runtime (A-210). Every push starts CI's debug build
+  there too, the runtime's DLLs beside it, so an import Nano Server lacks fails the push that adds it (A-357); one
+  action (`.github/actions/nano-server-start`) serves both, and starts Docker's engine when a runner left it stopped.
 - The release smoke task (`cargo run -p xtask --bin release -- smoke`) runs each built binary on its own runner before it may ship: version,
   anchor and daemon start, bootstrap, a volume provisioned, a file written and read by one MCP
   client and read by a second client, the volume destroyed, the daemon gone with its anchor. It
@@ -16218,7 +16269,8 @@ round's clock and `judge_loop_request` judges each request, an acknowledgement a
 - **Owed (the supervisor's measurement):** `provision_bench` at the derived and at three shards on every CI runner and
   a many-core Linux machine, quiet and loaded, every N: single-client p99 against main's, parks per 1,000 in the
   spinning and paced forms, and the paced form's CPU (GAPS, A-223's entry).
-- **Not decided here: Windows' window** (A-223's open item (C)). The hold applies on Windows too, beside the multiple.
+- **Windows' window** (A-223's open item (C)) was decided by A-361 (2026-11-18): R9's floor there too, and every hold
+  under the idle spin's ceiling.
 
 ### A-223's window rule — The idle window is R9's floor; no estimate prices it on Linux and macOS (accepted 2026-11-11, the supervisor's decision A)
 Applied in the same change to: §4.1 (its status and derived constants), §4.3 (derived constants), §4.7 (derived
@@ -16257,7 +16309,8 @@ rule's table in `config.rs`.
   thousandths of a core quiet and 293–365 loaded (main 859–1,051), its loaded p99 0.34–5.60 ms. The plan's bar of 150
   quiet is not met on Linux or on Windows (131–341, the ×100 it keeps); what a shorter window costs in p99 is the
   plan's step 6. The paced-client test failed 6 of 6 on Linux before the rule and passed 6 of 6 after.
-- **Not decided here: Windows' window.** A Windows shard parked beside two spinners a CPU waits 50–100 ms to run again,
+- **Not decided here: Windows' window** (decided 2026-11-18 by A-361: R9's floor there too, once a blocked wait sits a
+  level up). A Windows shard parked beside two spinners a CPU waits 50–100 ms to run again,
   so F alone made that every loaded request's latency (97–100 ms on windows-latest, 48–56 ms on windows-11-arm,
   against 125–127 µs at the multiple). GAPS holds it open, and §5 lists the 100 as a residual literal.
 
@@ -26500,6 +26553,63 @@ Applied in the same change to:
   failover SLO from its hold: the operator's bound on how long an object may go unserved before a takeover serves it,
   past which a write not yet held is past what the fleet promises. The refusal is the request's recorded outcome.
 
+
+### A-361 — Windows' own window: a blocked completion-port wait raised a level, R9's floor on every platform, and every idle spin under the watchdog's window (2026-11-18, goal g234; A-223's open item (C); the regression of g258's now-x86 lane; the supervisor's guard "an idle shard polling for work is not a wedged shard")
+Applied in the same change to: §4.1 (its status), §4.3 ("Drivers"), §4.7 (derived constants, A-223's status, a status),
+A-223's window rule and A-326 (their Windows items), GAPS (A-223's entry, §5's residual literal, a new open entry),
+BENCHMARKS ("Windows' own window"), `crates/rt` (`iocp.rs`: `RaisedForWait`, `move_level`; `runtime.rs`:
+`WakeTracking::idle_ceiling_ns`, `NO_IDLE_CEILING_NS`; `shard.rs`: the window and the hold held to the ceiling),
+`crates/server` (`config.rs`: `NO_ESTIMATE_MULTIPLE` and `IDLE_SPIN_CEILING` replace `loaded_wake_ratio` and
+`idle_window_ns`, a compile-time assertion beside them), `unsafe-budget.toml` (slates-rt 101 → 102), the tests
+`crates/rt/tests/wake_estimate.rs` (`loaded_wake`), `crates/rt/tests/idle_spin.rs`, `crates/server/src/watchdog.rs`,
+`crates/server/tests/idle_window.rs` (now on Windows too), and the bug record
+`docs/bugs/2026-11-18-a-windows-shards-idle-spin-outran-its-watchdog.md`.
+- **Why a parked Windows shard waited 14–42 ms under load.** Windows raises a thread a priority level when a wait on an
+  event, a semaphore or an address ends, and none when a thread is dequeued from an I/O completion port, which is how a
+  shard parks. Measured on CI's runners beside two spinners a logical CPU at the shard's level (`diag-g234-wake-1`,
+  200 wakes an arm, two rounds; the job runs BelowNormal, base 6, and its turn is 31.6–32.2 ms on both): the waiter's
+  priority after a completion-port wake stayed 6, after an event's or WaitOnAddress's 7. Median wake: completion port
+  29 ms (windows-latest) and 14 ms (windows-11-arm), the runtime's own shard 25–30 and 14 ms, an event 15–17 µs and
+  6–7 µs, an event with its boost disabled 29 and 14 ms, a completion port raised a level for its wait 15–17 µs and
+  6–7 µs. Quiet, every arm woke in 6–15 µs. So the wait was not the clock: it was the kicked shard queued at its own
+  level behind spinners until one's turn ended.
+- **The raise.** A wait that may block raises a thread at the normal level to the next for as long as it blocks and
+  puts it back before it runs anything; a thread set to another level (a test that starves a shard at IDLE) is left
+  alone, and a zero-timeout harvest pays nothing. A raise and its restore cost 0.77–0.88 µs quiet and 1.3–5.5 µs loaded,
+  against a parked wake of 6–15 µs. Proven by `a_parked_shard_wakes_beside_spinners_as_soon_as_a_parked_thread_does`:
+  red on both Windows runners in 6 of 6 rounds (the shard's median 21.5–42 ms against a parked thread's 11–23 µs),
+  green in 6 of 6 with the raise (33–59 µs against 10–23 µs).
+- **One window rule.** The hundred times the estimate that Windows kept (the supervisor's decision of 2026-11-11, for
+  that wait) priced its window on it: seconds. After a WinFsp request a one-shard daemon on windows-latest spun that long
+  with no step, its watchdog judged it spinning ("1015 ms of CPU without a step") and withheld the beat, and the anchor
+  killed it in 3 of 3 runs (g258's now-x86 lane, run 44325673298; its arm from before A-223, whose estimate learned
+  handoffs, never). The window is now R9's floor on every platform. Measured at two shards (`diag-g234-winbench-1`,
+  three rounds, nine runs a cell): the paced client's CPU 94 → 7 and 199 → 25 thousandths of a core quiet, 756 → 20 and
+  787 → 20 loaded; the loaded single-client p99 157 µs with 4 of 9 runs at 56–83 ms → 130 µs, none past 151 µs
+  (x86_64), 108 µs with one at 31.9 ms → 148 µs, none past 192 µs (arm64); the quiet p99 24 against 26 µs and 31
+  against 32 µs. The raise alone with the multiple held the loaded p99 at 54 and 90 µs and kept the paced cost (732 and
+  777).
+- **The guard.** No idle spin runs past `IDLE_SPIN_CEILING`, the liveness budget less a beat, whatever its window, an
+  estimate or a closed loop's hold asks: the watchdog judges a shard spinning at its spin window of CPU without a step,
+  never below the budget (A-318), and an idle spin follows an empty step and ends in a step, a park or one idle slice,
+  so a spin under the budget by a beat cannot reach the verdict on any platform or in any build. A compile-time
+  assertion holds the ceiling under the budget by a beat; the watchdog's own judge sees a ceiling's spin alive at
+  every look in builds as fast as the machine and ten times slower, and a spin of two windows judged spinning; and a
+  runtime pricing its window on an estimate a hundred quiet stretches long, at the largest multiple, spins no longer
+  than its ceiling after an activity or a hold. A daemon-level test was tried and dropped: on main, with no ceiling, a
+  supervised daemon whose shards priced their window on such an estimate kept its beat on windows-latest,
+  windows-11-arm and macos-latest (largest gaps 112–175 ms against debug spin windows of 3.4–8.0 s, the budget held to
+  each build's slowdown; `diag-g234-guard-red-1`), so as built it could not fail. The daemon's own window test is the
+  daemon-level red: on main's Windows rule a paced client beside spinners grew a shard's window from 0.87 and 0.95 ms to
+  324 and 454 ms within 64 requests (windows-latest, windows-11-arm), and with this change it stays at its boot window
+  on all four runners (`diag-g234-guard-green-1`). The ceiling binds no rule in use (the longest is a closed loop's
+  hold over 1,024 shards, 471 ms).
+- **Open.** A process in a job that fixes its priority class (kiln's agents on jupiter: `JOB_OBJECT_LIMIT_PRIORITY_CLASS`,
+  BelowNormal) keeps a thread's level where it was: `SetThreadPriority` answers success and the level stays. There a
+  parked shard still waits out its neighbours' turns under load (jupiter: 30.75 ms against 12.5 µs), though its window
+  stays R9's floor. The loaded-wake test skips loudly there. Owed: a shard with no I/O outstanding parks where Windows
+  boosts the wake (an address of its parking word), which needs the parking protocol to name the object its kickers
+  signal, and the loom model with it.
 ### A-364 — A ledger is adopted position by position: modelled, and the record half of GAP-A9-7 built on it (2026-11-18, kiln goal g250; §4.8 "Promotion and takeover", §4.16 "Commit"; GAP-A9-7, BUG-12)
 
 - **The model.** `docs/wip/models/FencedLedger.tla` (text, configurations `FencedLedger.cfg`, `FencedLedger_3.cfg`,
@@ -26528,11 +26638,20 @@ Applied in the same change to:
   at the round's epoch (`takeover::commit_adopted`, the newest record's own path). A fence above the epoch starts the
   round over above it. Then the versions' inputs are fetched by identity (the input half) and the chain gathered.
   Counted `fleet.takeover.ledger_positions_adopted`, `_refused`, `_no_round`, `_fenced`, `_waiting`.
-- **Open (GAPS).** A holder's register refuses a different value at a position it holds (`ConflictingPosition`)
-  where the model's acceptor overwrites a lower epoch's; a never-committed divergent value cannot yet be replaced.
+- **Open (GAPS), closed by A-373.** A holder's register refused a different value at a position it holds
+  (`ConflictingPosition`) where the model's acceptor overwrites a lower epoch's; a never-committed divergent value could
+  not be replaced.
 
-Applied in the same change to: GAPS (the model table and its toolchain note; the record half's entry), and the model
-files.
+Held by `a_successor_two_versions_behind_adopts_the_versions_between_and_serves_the_green` (`crates/server/tests/fleet.rs`:
+the successor withholds versions 3 and 4, the owner dies; it adopts version 3's record, fetches both versions' inputs and
+serves version 4, in about 4 s on the Mac Studio; with the catch-up skipped it waited on its chain 100 periods and gave
+the green up, red before and after main's A-333 rebuilt the adoption), `a_ledger_is_adopted_position_by_position_in_order`
+(`crates/db/src/takeover.rs`), the codec's round trip and hostile input and
+`an_acceptor_reports_a_ledgers_positions_in_a_range` (`crates/db/src/register.rs`).
+
+Applied in the same change to: GAPS (the model table and its toolchain note; the record half's entry; the open
+`ConflictingPosition` item), the model files, `crates/db/src/{register,takeover}.rs`,
+`crates/server/src/{takeover,fleet,green_adopt}.rs` and `crates/server/tests/fleet.rs`.
 
 ### A-357 — The thread-profiling calls are found in kernel32 at run time, so the Windows binary starts where kernel32 lacks them (2026-11-18, the release goals g236 and g237; a bug in A-223 found by the test tag `v0.1.0-test.3`)
 Applied in the same change to: §4.1 (A-223's status), GAPS (the binary release lane's entry), `crates/machine`
@@ -26553,8 +26672,18 @@ Applied in the same change to: §4.1 (A-223's status), GAPS (the binary release 
   process-isolated `nanoserver:ltsc2025` on `windows-2025`: main 68148152d exited 0xC0000139, the same commit with this
   change answered `slates 0.1.0`, and its import table holds none of the three. The module's test
   (`a_blocked_thread_switched_and_a_running_one_did_not`) passed on Windows x86_64 and arm64, where kernel32 has them.
-- **Not covered by a push.** Only the release lane runs the Nano Server check (a tag or a dry run). A regression of
-  this kind shows on the next test tag, not on the push that makes it.
+- **Every push checks it (the CI half, 2026-11-18).** Until then only the release lane ran the Nano Server check (a
+  tag or a dry run), so this regression showed on the next test tag, not on the push that made it. Now CI's Windows
+  lane starts the debug binary its CLI tests built in the same container, with the Visual C++ runtime's DLLs beside it
+  (that build's C runtime is a DLL), so every other import must resolve from Nano Server's own. One composite action
+  (`.github/actions/nano-server-start`) serves both callers. It also starts Docker's engine first: its service, set to
+  start automatically, was stopped when the job began on 1 of 11 `windows-2025` runners sampled (diag runs
+  44352989836 and 44353300409), and the tag `v0.1.0`'s run read the missing engine as the binary's exit 1 (run
+  44347535833). A Docker failure is now named as the runner's. By use (diag-g071-ci-1, run 44354728411), each job
+  with Docker's service stopped first: CI's shape answered `slates 0.1.0` from this change and refused main 68148152d
+  with 0xC0000139, and the release's shape answered from test 4's static binary. The step adds 21 s to the lane (31 s
+  for the release's shape). Applied to `.github/workflows/ci.yml` (the Windows lane), `.github/workflows/release.yml`
+  (its Nano Server step), the new action, Appendix B.2, GAPS and the bug record.
 
 ### A-333 — A green's takeover successor adopts its holder ledger and the replica it built from it, instead of recording the green again; a restarted successor re-adopts it at boot (2026-11-18, built for goal g232, one primary and two replicas)
 Applied in the same change to:
@@ -26866,17 +26995,6 @@ test's ledger), `crates/db/src/register.rs` (`PositionChanges`, `Acceptor::track
   compared at every publication and re-put whole when it changed, which is every version of a green at `f > 0`: the same
   growth, in the content's bytes.
 
-Held by `a_successor_two_versions_behind_adopts_the_versions_between_and_serves_the_green` (`crates/server/tests/fleet.rs`:
-the successor withholds versions 3 and 4, the owner dies; it adopts version 3's record, fetches both versions' inputs and
-serves version 4, in about 4 s on the Mac Studio; with the catch-up skipped it waited on its chain 100 periods and gave
-the green up, red before and after main's A-333 rebuilt the adoption), `a_ledger_is_adopted_position_by_position_in_order`
-(`crates/db/src/takeover.rs`), the codec's round trip and hostile input and
-`an_acceptor_reports_a_ledgers_positions_in_a_range` (`crates/db/src/register.rs`).
-
-Applied in the same change to: GAPS (the model table and its toolchain note; the record half's entry; the open
-`ConflictingPosition` item), the model files, `crates/db/src/{register,takeover}.rs`,
-`crates/server/src/{takeover,fleet,green_adopt}.rs` and `crates/server/tests/fleet.rs`.
-
 ### A-363 — The failover delay is a live output: detection, confirmation and recovery estimated from what each node measures, every coordinator period (2026-11-18, built for goal g255; Ada's rule of the same day: "no arbitrary constants", and a value computed once at boot is still a constant, so the estimators keep learning from the traffic they judge)
 
 - **What was there.** `F` was the operator's failover SLO, `config::FAILOVER_SLO_NS`, a 10 s placeholder, and A-359
@@ -27051,6 +27169,8 @@ Applied in the same change to:
   loaded, `--apparmor-profile` binds and its command reads the volume as the runner's uid, runs `unconfined` and is
   refused its own `unshare -Ur`, while without the option the launcher is refused naming it; a test demanding the
   loaded regime with none loaded fails (the red check); the SDKs' plumbing tests pass against the built wheel and addon.
+  Each guard red-checked (diagnostics run 44353311142): without the step-out the launcher ran unasked under the loaded
+  profile; without the exec-time drop the command ran under the profile's label and held the grant.
 - **Rejected:** entering a named profile by `change_profile` from unconfined, and an enforce-mode profile confining the
   whole binary (§4.6, "The launcher on a restricted host", says why).
 - **What remains.** The daemon publishing its root mount, so `SLATES_ROOT` need not be named (GAPS). The release
@@ -27169,3 +27289,127 @@ Applied in the same change to:
   a slates-signed driver (an EV code-signing certificate and a Microsoft Partner Center account for attestation
   signing). Both are Ada's. Until then the drive on WinFsp as released makes no hard link and A-300's stated difference
   stands.
+
+### A-376 — A holder publishes what changed of its content hold: the hold's image is a piece per stored chunk, per held manifest and per stage, and a delta carries those the hold changed since the last committed publication (2026-11-18, goal g232: one primary and two replicas editing the Linux kernel tree; image version 30)
+Applied in the same change to: §4.8 (A-270's status: "The content hold is its pieces"), GAPS (the load test's
+ledger), `crates/cluster/src/content.rs` (`HoldPiece`, `ManifestPiece`, `ContentHold::changed_pieces`, `clear_changes`,
+`piece_bytes`, `pieces`, `image_from_pieces`, every change noted where the hold makes it; `manifest_image`, `chunk_image`,
+`stage_image`), `crates/server/src/content_holder.rs` (`KIND_CONTENT_CHUNK`, `KIND_CONTENT_MANIFEST`,
+`KIND_CONTENT_STAGE`, `hold_piece_key`, the content pieces in `held_image`, `held_changes`, `held_committed` and
+`split_held`, `HeldRefused::Content`), `crates/server/src/verbs.rs` (a recovered hold owes no change),
+`crates/vfs/src/recover.rs` (`IMAGE_VERSION` 30), and the tests below.
+- **What was there.** A-270 left the content hold's image whole: one piece holding every stored chunk, held manifest and
+  stage, recomputed at every publication (`ContentHold::to_image`) and re-put whenever its bytes changed. A holder of a
+  green holds every version's inputs, so every version's put and record re-encoded and re-wrote every input it held:
+  `sample` of the late-submit test at 1,000 versions (Mac Studio, debug, after A-372) found about a tenth of each
+  holder's time in that encoding, and its deltas big enough that the journal checkpointed about as often as it logged.
+- **The rule.** The hold's image is a piece per stored chunk (keyed by its identity's first 24 bytes), per manifest held
+  for an object (by the first 24 bytes of the BLAKE3 of its object and identity, since one manifest can be held for
+  several objects) and per stage (by its object). The hold notes each piece where it changes it (a chunk stored or
+  released, a manifest held, placed again or forgotten, a stage opened, grown or closed), and a delta carries the pieces
+  noted since the last committed publication, each put if held and removed if not; a checkpoint carries every piece.
+  A recovery puts the pieces back into the hold's image in its canonical order and rebuilds the hold from it as before,
+  every chunk verified, and the rebuilt hold owes no change.
+- **Tests.** `a_holders_publication_carries_the_content_it_puts_not_the_whole_hold` (`daemon.rs`: 64 puts, every delta
+  one size, the folded deltas the whole image); the held-pieces oracle (`daemon.rs`) puts and releases content between
+  deltas and checkpoints; the hold's model tests (`slates-cluster`) fold every step's changed pieces and hold them to
+  the hold's pieces, and the folded pieces to the hold's image, byte for byte.
+- **Measured.** Kiln r3543, the Mac Studio, 2026-11-18, debug build: on main's code a put's delta carried the whole hold,
+  170 bytes at the first of 64 puts and 158 more at each after (64 sizes); with this change one size each. The
+  late-submit test's late median at 300 versions 2.28 to 2.37 ms against the early 2.31 to 2.49 (after A-372, 2.92 to
+  3.28 against 1.87 to 1.96), and at 1,000 versions 3.76 ms against 6.00 (after A-372, 8.49 against 2.28; before A-367,
+  18.2 against 2.16): a version late in a green's history now costs what an early one does.
+
+### A-375 — The waits that bound a failover read the live estimate: a forward's bound, the location round's cap, a held reply's total and a takeover's attempts follow each node's failover delay, fanned to every shard in whole periods (2026-11-18, built for goal g255; A-363's owed consumers; Ada's rule of the same day that nothing sets the failover delay)
+
+- **What was there.** Each of these waits read the operator's 10 s placeholder (`DaemonConfig::failover_slo_ns`), which
+  A-363 left in place while it published the estimate.
+- **The rule.** The control shard's refresh sets `ShardState::failover_ns` each coordinator period: the estimate's total
+  rounded up to whole periods (`fleet::failover_in_periods`), the granularity every one of these waits acts at, so the
+  configuration fan (AUD-29-29's change-only `fleet::Fan`) carries it to the other shards only when it crosses a period.
+  Read by: `forward_lane::FailoverBound` and `note_floor` (A-315, A-352: the longer of the failover delay and the path's
+  measured floor, from the forward's first send); the location round's cap (`verbs`, A-317); a held reply's total
+  (`live_ship::durable_spans`, A-354); `fleet::takeover_attempts` for a taken-over volume's, green's and tombstone's
+  materialization, the takeover round's promise wait and retirement bound (`takeover`, A-304), and a green's
+  re-adoption from the ledger (`green_adopt`, A-333's hand-off and stepped replay, which count as a takeover does).
+- **Not moved, each owed a term of its own:** the lease terms (a landing's target lease, a CLI attachment's term, the
+  NFSv4 and delegation leases), the telemetry horizon (its `LeaseExpiring` follows the lease terms), FUSE's mount and
+  unmount helper bounds (a helper process's wait, not a failover) and the anchor's restart cap.
+- **Test support.** `Daemon::inject_failover(Some(ns))` holds a node's published delay (its control shard at once, the
+  others at the next fan) for a test whose subject is a bound's rule, not the estimate; `Daemon::failover_ns` reads what
+  the waits read. The settings that shaped these waits in the tests moved to it: A-352's floor test (one liveness
+  budget, below the path's floor), A-317's ceiling test (one nanosecond), A-304's lone-node fixture (one second, ten
+  attempts) and A-354's held reply (pinned at the node's own estimate, so the assertion cannot move under it); the
+  dead-session watches, the promise wait and the serve-delay test read the live value.
+- **What changes.** On a quiet three-node loopback fleet these bounds fall from 10 s to the estimate, about 4-5 s
+  (A-363's measurements): a forward to a dead owner is refused about 5 s after its first send instead of 10 (never below
+  its path's floor), a takeover gives an object up after about 45 periods without progress instead of 100, a held reply
+  is refused `DurabilityPending` after about 5 s. Under starvation the estimate grows with the stretched periods. The
+  A/B against the boot sum (a build of its own) under the starved and chaos profiles is owed to main.
+- **Evidence.** The fan's unit test (`fleet::tests::a_shard_is_fanned_the_failover_delay_when_it_moves`: the first fan
+  carries the delay, a moved delay is owed alone, nothing once it is delivered, and the receiver reads it). On the Mac
+  Studio (2026-11-18, load 11-14, debug build) the server's fan, forward-lane, takeover, live-ship and owner-location unit
+  tests pass, and eleven focused fleet tests pass in 44 s: A-352's floor test, A-317's two location tests, A-354's held
+  reply, A-304's lone-node volume and green give-ups, the serve-delay retry, the two dead-session tests, A-351's
+  readmission and A-363's estimate. Red-checked with each consumer read back from the configuration: the fan without the
+  delay fails its unit test, the location cap fails the ceiling test, the attempts fail the lone-node give-up, the held
+  reply's total fails A-354's test, and the forward's bound fails the floor test.
+
+Applied in the same change to: §4.4 "Derived constants" (its status), GAPS (the `LIVENESS_BUDGET_NS` entry),
+`crates/server/src/{state,daemon,fleet,forward_lane,verbs,live_ship,takeover,green_adopt}.rs`, `crates/server/tests/fleet.rs`.
+
+### A-373 — A held ledger position yields to a higher epoch's different value, as the model's acceptor does, and a green's replica follows its register (2026-11-18, kiln goal g250; §4.8 "Promotion and takeover", §4.16 "Apply on holders"; A-364, A-333, A-313, BUG-12)
+Applied in the same change to: §4.8 (the per-position acceptance paragraph), GAPS (the record half's open
+`ConflictingPosition` item, now fixed, and the replica's lag, owed), `crates/db/src/register.rs` (`Acceptor::check`;
+`RegisterError::ConflictingPosition` and `Acceptor::accept` documented), `crates/server/src/merge_origin.rs`
+(`rewind_replica`, `rewind_past_replaced`, the install's check, `merge.replica.rewound`, `merge.replica.superseded`),
+`crates/server/src/merge_service.rs` (`hold_replacing_record`, called by `accept_merge_record`),
+`crates/server/src/fleet.rs` (`hold_checked_record`, `fleet.record.replaced`; `serve_merge_shipment` holds a replacing
+record before its inputs) and `crates/server/src/takeover.rs` (`commit_adopted`).
+- **What was there.** `Acceptor::check` refused any value different from the one a holder held at a position
+  (`ConflictingPosition`), whatever its epoch. `docs/wip/models/FencedLedger.tla`'s `Accept` takes a proposal at or above
+  the holder's promise and replaces the entry held there, as Paxos's acceptor does.
+- **Decided by the model's proof obligations.** A refusal is always safe, since a refused phase-two message is a lost
+  one, so the question was what the refusal cost and what the model's safety needs. Agreement and Continuity hold in the
+  model because each epoch is one host's, each owner adopts at every position the value a majority reports under the
+  highest epoch before it proposes, and holders refuse proposals below their promise. A value that committed at a
+  position is then the one every higher epoch's owner adopts there, so a higher epoch's different value replaces only
+  one that never committed. Slates keeps each obligation: a record is accepted only from the object's authority owner
+  (`Unauthorized` otherwise), a successor writes a departed owner's objects only after its round adopted them, at or
+  above the round's epoch, and the superseded owner is fenced below that epoch. The refusal cost liveness. A holder that kept a
+  dying owner's uncommitted value refused the successor's different value there for good, and its replica, built on the
+  refused value, refused the green at the next version's recomputation; at `f = 1` that holder was the one failure the
+  green could take. A successor that kept such a value could never commit the value its round adopted
+  (`fleet.takeover.adopt_unplaced.local`), and the green waited for its bound. So the code took the model's rule. The
+  model is unchanged, and there is nothing to re-run.
+- **The rule.** A holder refuses a second value at a position under the epoch the position holds (one ballot proposes
+  one value a position, `ConflictingPosition` as before; the mirror's rule for committed records is unchanged) and
+  accepts a higher epoch's different value in place of the held one (`fleet.record.replaced`).
+- **The replica follows.** A green's replica on a holder or a successor is the engine its records are recomputed on
+  (A-313, A-333). One built over a replaced value no longer holds its ledger's chain, and a version cannot be undone, so
+  it is rebuilt from the ledger through the version before (`merge_origin::rewind_replica`, `merge.replica.rewound`).
+  - The register path (a successor's adoption committed again to every candidate, with no inputs) rewinds it as the
+    record is held (`fleet::hold_checked_record`), and so does the successor's own acceptance (`takeover::commit_adopted`);
+    the successor's engine then advances from the version before, naming the inputs it lacks (A-333).
+  - The record plane ships a successor's new value with its inputs. The door admits inputs only where a held record
+    names them or runs ahead of the held records, and the replaced value names others at that position, so the record
+    is held first (`merge_service::hold_replacing_record`, before the shipment's content frames), which rewinds the
+    replica; the value is then recomputed as the replica's next version and acknowledged only after that.
+  - A build that read a version its ledger replaced while it ran installs nothing (`merge.replica.superseded`).
+- **Tests.** `a_held_position_yields_to_a_higher_epochs_value_and_refuses_a_second_in_one_epoch`
+  (`crates/db/src/register.rs`); in `crates/server/src/merge_origin.rs`,
+  `a_holder_follows_a_higher_epochs_value_at_a_version_it_applied` (the record plane's shipments through
+  `fleet::serve_merge_shipment`), `a_replica_rewinds_below_a_value_its_ledger_replaced_and_advances_to_the_new_one` (the
+  register path, then the successor's engine) and `a_build_that_read_a_replaced_version_installs_nothing`. Kiln r3555 on
+  the Mac Studio, 2026-11-18, debug build, load 15 to 17: the `slates-db` register tests 76 of 76; `slates-server --lib`
+  merge_origin, green_adopt, takeover, merge_service and holder tests 45 of 45; the fleet's green takeover and shipment
+  tests 5 of 5. Red (r3573), each mutation in a scratch copy:
+  - the old rule: the db test and both holder tests fail, `y` refused and the position still `x`'s under epoch 1;
+  - no hold before the shipment's inputs: `y` unacknowledged, its inputs unheld once, the replica rewound to version 0;
+  - no rewind on the register path: `y` acknowledged with the replica still at `x`'s identity, and the successor's
+    engine never ready;
+  - no check at the install: the build installs `x`'s replica, and `merge.replica.superseded` never moves.
+- **Still owed (GAPS).** A holder that holds an adopted record past its replica (the register path carries no inputs)
+  answers the next version out of order until it fetches those inputs and advances; the green goes on at `f + 1` while
+  its other holders answer. The successor's own replacement is not driven end to end by a test: that wants two
+  takeovers with divergent uncommitted values; its rewind is the register path's, which the tests drive.

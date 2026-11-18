@@ -13374,6 +13374,63 @@ The paced-client test failed 6 of 6 on Linux before the rule (diag-liveness-36: 
 - **The paced-client test's non-vacuity bound is the estimate passing its boot prior, not a multiple of it.** At ten times the prior one macOS run of three missed (5.9 times, diag-liveness-37); at four, three of ten missed (1.06–1.8 times, diag-liveness-38), every window held at F. With the window at F the shards stop spinning and stop queueing each other's wakes, so the estimate rises far less than under ×100 (23–200 times). A window priced on the estimate passes its boot value as soon as the estimate passes the prior, so that is the bound that tells the rules apart.
 - **Windows is ×100, unchanged.** Its window is the estimate's multiple wherever that passes F (a 7–18 µs estimate gives 0.7–1.8 ms), so it computes what step 3's ×100 arm did, and its paced CPU sits in that arm's spread (177–435 quiet, 693–782 loaded). windows-latest's quiet p99, 53.8–86.7 µs against the ×100 arm's 31.4–39.9 µs, comes from identical window arithmetic; it is recorded as the runner's, and step 6 measures the arms interleaved on one runner.
 
+## Windows' own window: the raised wait and R9's floor (A-361; R9; CI; 2026-11-18)
+
+**Why a parked Windows shard woke late under load** (`diag-g234-wake-1`, run 44325923565; the probe
+`crates/rt/examples/wake_load.rs` on that branch only, release; a TIME_CRITICAL kicker on CPU 0, the waiter on CPU 1
+unless unpinned, 200 wakes an arm, two rounds; loaded = two `while :; do :; done` shell loops per logical CPU at the
+job's own BelowNormal level). Priority after the wake, then the wake's median and p99, rounds 1 · 2:
+
+| arm | windows-latest (Server 2025, 4 vCPU) | windows-11-arm (Win11 26200, 4 vCPU) |
+|---|---|---|
+| completion port (the shard's wait) | 6; 29.1 · 29.1 ms, p99 102 · 108 ms | 6; 14.0 · 14.0 ms, p99 48 · 48 ms |
+| completion port, unpinned | 6; 43.5 · 41.1 ms, p99 65 · 62 ms | 6; 20.0 · 20.6 ms, p99 27 · 31 ms |
+| completion port, boost disabled | 6; 29.5 · 29.1 ms | 6; 14.0 · 14.0 ms |
+| completion port, base one level up | 7; 19 · 15 µs | 7; 6 · 7 µs |
+| completion port, raised for the wait alone | 7; 17 · 15 µs | 7; 6 · 7 µs |
+| event | 7; 17 · 15 µs | 7; 6 · 6 µs |
+| event, boost disabled | 6; 29.2 · 29.1 ms | 6; 14.0 · 14.0 ms |
+| WaitOnAddress | 7; 15 · 15 µs | 7; 7 · 7 µs |
+| the runtime's shard | 6; 29.6 · 25.5 ms, p99 112 · 95 ms | 6; 14.0 · 14.0 ms, p99 32 · 32 ms |
+| the runtime's shard, one level up | 7; 16 · 16 µs | 7; 8 · 8 µs |
+
+Quiet, every arm's median was 6–15 µs. Two threads at one level on one CPU took turns of 31.6–32.2 ms (gaps' median),
+quiet, on both. A raise and its restore cost 0.77–0.88 µs a pair quiet, 1.3–5.5 µs loaded (x86_64).
+
+**The test** (`cargo test -p slates-rt --test wake_estimate a_parked_shard_wakes_beside_spinners -- --nocapture`, debug,
+two spinning threads per logical CPU in the test, 32 wakes of each kind; `diag-g234-loadedwake-{red,green}-{1,2}`):
+median shard wake against a parked thread's, three rounds a run, two runs:
+
+| tree | windows-latest | windows-11-arm |
+|---|---|---|
+| main (red, 6 of 6 failed) | 38.0 / 42.0 / 40.7 ms, 38.7 / 41.5 / 39.4 ms against 20–23 µs | 21.5 / 23.4 / 21.5 ms, 23.5 / 33.8 / 21.7 ms against 11–13 µs |
+| the raise (green, 6 of 6) | 57.7 / 56.5 / 59.2 µs, 46.9 / 51.9 / 47.5 µs against 18–23 µs | 32.8 / 33.6 / 33.4 µs, 35.4 / 36.0 / 36.3 µs against 10–11 µs |
+
+**The rule, by provision_bench** (`diag-g234-winbench-1`, run 44338692795: `PROVISION_BENCH_SHARDS=2
+PROVISION_BENCH_FORMS=spinning_1,parked_1 provision_bench`, release, each arm in its own tree and target, three rounds
+interleaved, loaded as above; main = a2693b1eb with the x100 multiple; raise = the raised wait with it; raiseF = the
+raised wait and R9's floor alone). Each cell the median of nine runs (three rounds of the bench's three):
+
+| runner | cond | arm | spinning_1 p50 | spinning_1 p99 (runs past 1 ms) | paced CPU, thousandths of a core | paced p99 |
+|---|---|---|---|---|---|---|
+| windows-latest | quiet | main | 11.2 µs | 26.4 µs | 94 (0–656) | 189 µs |
+| windows-latest | quiet | raise | 11.9 µs | 23.5 µs | 210 (3–299) | 199 µs |
+| windows-latest | quiet | raiseF | 12.7 µs | 24.4 µs | 7 (0–81) | 176 µs |
+| windows-latest | loaded | main | 13.5 µs | 157 µs (4 of 9: 56.3, 57.1, 79.9, 82.9 ms) | 756 (617–792) | 125.6 ms |
+| windows-latest | loaded | raise | 13.3 µs | 54.1 µs (0) | 732 (157–823) | 59.1 ms |
+| windows-latest | loaded | raiseF | 13.9 µs | 130.5 µs (0; max 151) | 20 (8–30) | 49.9 ms |
+| windows-11-arm | quiet | main | 15.7 µs | 31.7 µs | 199 (116–253) | 356 µs |
+| windows-11-arm | quiet | raise | 15.1 µs | 29.9 µs | 225 (146–312) | 355 µs |
+| windows-11-arm | quiet | raiseF | 15.3 µs | 31.4 µs | 25 (15–40) | 323 µs |
+| windows-11-arm | loaded | main | 17.2 µs | 108 µs (1 of 9: 31.9 ms) | 787 (761–800) | 63.2 ms |
+| windows-11-arm | loaded | raise | 16.4 µs | 89.5 µs (0) | 777 (707–795) | 57.1 ms |
+| windows-11-arm | loaded | raiseF | 16.7 µs | 147.6 µs (0; max 192) | 20 (10–34) | 27.7 ms |
+
+raiseF is the rule landed: the paced cost falls ten- to forty-fold, the loaded p99's millisecond runs are gone, and the
+quiet rows stay within main's spread. The raise alone holds the loaded p99 lower (54 and 90 µs) at main's paced cost,
+which the window's multiple spends. The paced p99 under load, 28–126 ms in every arm, is not explained by these runs
+(the bench's paced client pauses in a timed `park_timeout`, whose own wake was not measured).
+
 ## The idle window's rule at three and more shards: R9's floor alone fails a closed loop; a fixed S-scaled window fails a paced client (A-223 step 6, A-326; R9; CI and adacachy2; 2026-11-12)
 
 **What it is.** The plan's step 6 ran the rule as built (`adb383f26`) against main (`29ef4521`) at each runner's
