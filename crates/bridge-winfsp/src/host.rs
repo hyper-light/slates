@@ -284,6 +284,14 @@ enum Op<T> {
     to: String,
     replace: bool,
   },
+  /// A hard link (A-360): `path` becomes another name of the file the open `object` names. Only a WinFsp driver with
+  /// `docs/wip/winfsp-patches` applied forwards one; the receive worker serves it before WinFsp's DLL, which has no case
+  /// for it. `replace` is ReplaceIfExists.
+  Link {
+    object: T,
+    path: String,
+    replace: bool,
+  },
   /// `SetFileSize` with `SetAllocationSize`: an allocation below the file's size truncates the file to it (WinFsp's
   /// contract for `SetFileSize`; an open with `TRUNCATE_EXISTING` arrives so, A-209, `t/base/05.t`), and any other
   /// allocation changes nothing the volume keeps.
@@ -369,6 +377,7 @@ impl<T> Op<T> {
         | Op::SetTimes { .. }
         | Op::SetAllocation { .. }
         | Op::Rename { .. }
+        | Op::Link { .. }
         | Op::Flush { .. }
         | Op::FlushVolume
         | Op::Cleanup { .. }
@@ -692,6 +701,15 @@ fn bind(op: Op<u64>, ledger: &Ledger<SparseObject>) -> Result<Op<Open>, crate::o
       replace,
     },
     Op::Rename { from, to, replace } => Op::Rename { from, to, replace },
+    Op::Link {
+      object,
+      path,
+      replace,
+    } => Op::Link {
+      object: ledger.get(object)?,
+      path,
+      replace,
+    },
     Op::CanDelete { object } => Op::CanDelete {
       object: ledger.get(object)?,
     },
@@ -817,7 +835,13 @@ fn file_info(attr: &NodeAttr) -> Result<FileInfo, VfsError> {
     last_write_time: filetime_from_unix_ns(attr.mtime),
     change_time: filetime_from_unix_ns(attr.ctime),
     index_number: attr.ino,
-    hard_links: 0,
+    // A file's names (A-360): a driver with `docs/wip/winfsp-patches` reports them as `NumberOfLinks`; a directory
+    // has one there, as on NTFS, whatever POSIX counts for it.
+    hard_links: if attr.kind == Kind::Dir {
+      0
+    } else {
+      attr.nlink
+    },
     ea_size: 0,
   })
 }
@@ -971,6 +995,11 @@ fn run(bridge: &mut dyn Bridge, cx: &OpContext, op: Op<Open>) -> Result<Reply, V
       object_reply(&attr, 0)?
     }
     Op::Rename { from, to, replace } => op_rename(bridge, cx, &from, &to, replace)?,
+    Op::Link {
+      object,
+      path,
+      replace,
+    } => op_link(bridge, cx, object.object, &path, replace)?,
     Op::CanDelete { object } => op_can_delete(bridge, cx, object.object, object.fh)?,
     Op::SetAllocation { object, new_size } => {
       op_set_allocation(bridge, cx, object.object, new_size)?
@@ -1238,6 +1267,69 @@ fn op_rename(
     },
   )?;
   Ok(Reply::Ok)
+}
+
+/// A hard link (A-360; `FileLinkInformation`): `path` becomes another name of `object`, by Windows' rules (MS-FSA
+/// 2.1.5.15.7). A taken name is refused `STATUS_OBJECT_NAME_COLLISION` unless the caller asked to replace it; a name of
+/// the file itself is left as it is; a replaced name is never a directory's or a read-only file's (`STATUS_ACCESS_DENIED`,
+/// as a rename's, [`replaces_a_directory`], [`crate::refuses_replacement`]). A directory takes no second name
+/// (`STATUS_FILE_IS_A_DIRECTORY`; the driver refuses it first). A replace is made under a name of its own and renamed over
+/// the taken one, so a refusal at either step leaves the taken name as it was; one shard turn serves all of it, so no
+/// other request sees the name between.
+fn op_link(
+  bridge: &mut dyn Bridge,
+  cx: &OpContext,
+  object: ObjectId,
+  path: &str,
+  replace: bool,
+) -> Result<Reply, VfsError> {
+  if bridge.getattr(object, cx)?.kind == Kind::Dir {
+    return Err(VfsError::IsDirectory);
+  }
+  let (name, parent) = match split_parent(bridge, cx, path)? {
+    Ok(pair) => pair,
+    Err(status) => return Ok(Reply::Err(status)),
+  };
+  let taken = match bridge.lookup(parent, cx, name) {
+    Ok(attr) => attr,
+    Err(VfsError::NotFound) => {
+      bridge.link(object, parent, cx, name)?;
+      return Ok(Reply::Ok);
+    }
+    Err(error) => return Err(error),
+  };
+  if !replace {
+    return Err(VfsError::AlreadyExists);
+  }
+  if (taken.ino, taken.generation) == (object.inode, object.generation) {
+    return Ok(Reply::Ok);
+  }
+  if matches!(taken.kind, Kind::Dir) || crate::refuses_replacement(&taken) {
+    return Err(VfsError::NotPermitted);
+  }
+  let staging = staging_name(object);
+  match bridge.lookup(parent, cx, &staging) {
+    Err(VfsError::NotFound) => {}
+    Ok(_) => return Err(VfsError::AlreadyExists),
+    Err(error) => return Err(error),
+  }
+  bridge.link(object, parent, cx, &staging)?;
+  if let Err(error) = bridge.rename(parent, parent, cx, &staging, name, RenameFlags::default()) {
+    if let Err(undo) = bridge.unlink(parent, cx, &staging) {
+      slates_machine::log_line!(
+        "slates-winfsp: a refused link's staging name {staging} stays beside {name}: {undo:?}"
+      );
+    }
+    return Err(error);
+  }
+  Ok(Reply::Ok)
+}
+
+/// The name a replacing link is made under before it is renamed over the taken name: one per file, so two links of
+/// different files cannot meet, and a name no Windows program makes (`:` is refused in a component by Win32 and by
+/// WinFsp's driver). Never seen: the shard serves the link and the rename in one turn.
+fn staging_name(object: ObjectId) -> String {
+  format!(":slates-link:{:x}:{:x}", object.inode, object.generation)
 }
 
 /// Whether a rename asked to replace would replace a directory other than its own source: Windows never does
@@ -2254,6 +2346,28 @@ extern "C" fn rename(
   }
 }
 
+/// Serves a hard link the patched driver forwards (A-360) on the receive worker, which takes it before WinFsp's DLL: the
+/// DLL has no case for `FileLinkInformation` (`src/dll/fsop.c` answers it `STATUS_INVALID_PARAMETER`). Every access
+/// check a rename's replace makes in the DLL (`FspFileSystemRenameCheck`) passes on this drive, whose objects all carry
+/// [`EVERYONE_SDDL`]'s descriptor, so none is made here either.
+///
+/// # Safety
+///
+/// `fs` is this host's live file system, as every callback's is.
+pub(crate) unsafe fn link(fs: *mut FileSystem, link: &crate::inflight::Link) -> Ntstatus {
+  // SAFETY: the caller's contract: our live file system.
+  let handler = unsafe { handler(fs) };
+  match handler.call(Op::Link {
+    object: link.context,
+    path: link.path.clone(),
+    replace: link.replace,
+  }) {
+    Reply::Ok => STATUS_SUCCESS.as_i32(),
+    Reply::Err(status) => status,
+    _ => crate::status_unsuccessful(),
+  }
+}
+
 extern "C" fn read_directory(
   fs: *mut FileSystem,
   context: Pvoid,
@@ -2469,6 +2583,9 @@ impl Mounted {
       // daemon itself holds no privilege (R10).
       | ffi::VOLUME_FLAG_REPARSE_POINTS
       | ffi::VOLUME_FLAG_FLUSH_AND_PURGE_ON_CLEANUP
+      // The volume makes hard links (A-360): a driver with `docs/wip/winfsp-patches` forwards `FileLinkInformation`; the
+      // released driver ignores the bit and refuses the link itself.
+      | ffi::VOLUME_FLAG_HARD_LINKS
       // Each open's `FileContext` is its own ledger token (A-198), retired by its own Close. Without this flag the
       // file node supplies its first open's context to every later open. The old boxed-context implementation freed
       // that first box twice (run 40251802164); a stable token would likewise name the wrong open.

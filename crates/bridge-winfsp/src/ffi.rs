@@ -89,6 +89,10 @@ pub(crate) const VOLUME_FLAG_PERSISTENT_ACLS: u32 = 1 << 3;
 /// Format: `ReparsePoints` — bit 4: the file system serves reparse points, so WinFsp calls the reparse slots and
 /// follows a symbolic link it finds while opening a path (A-275; `fsctl.h` v2.1, `FSP_FSCTL_VOLUME_PARAMS_V0_FIELD_DEFN`).
 pub(crate) const VOLUME_FLAG_REPARSE_POINTS: u32 = 1 << 4;
+/// Format: `HardLinks` — bit 7: the file system makes hard links. WinFsp's driver as released ignores it (it answers
+/// `FileLinkInformation` `STATUS_NOT_SUPPORTED` itself and advertises no link support, `src/sys/fileinfo.c`,
+/// `volinfo.c`, v2.1 to v2.2); a driver with `docs/wip/winfsp-patches` applied forwards the link (A-360).
+pub(crate) const VOLUME_FLAG_HARD_LINKS: u32 = 1 << 7;
 /// Format: `ReadOnlyVolume` — bit 9: Windows refuses every write to the volume before it reaches the shard.
 pub(crate) const VOLUME_FLAG_READ_ONLY_VOLUME: u32 = 1 << 9;
 /// Format: `FlushAndPurgeOnCleanup` — bit 14: at a file's last handle's cleanup the kernel writes its cached pages back

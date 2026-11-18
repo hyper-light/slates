@@ -18,6 +18,10 @@
 //! - `CreateSymbolicLinkW` must make a link Windows follows and reads back (`t/reparse/02.t` and `03.t`, A-275), as
 //!   git and npm make links on Windows; the drive answered `ERROR_INVALID_FUNCTION`, since it served no reparse point.
 //!
+//! - `CreateHardLinkW` must give a file a second name (A-360), as git's local clone links its objects; WinFsp's driver as
+//!   released refuses the link itself (`STATUS_NOT_SUPPORTED`), so the test skips loudly there and runs where the
+//!   driver carries `docs/wip/winfsp-patches`.
+//!
 //! Windows only, and gated on `SLATES_TEST_CLI=1` and `WINFSP_TEST_MOUNT=1`, as `tests/winfsp.rs` is; without them
 //! each test skips loudly and passes. CI's Windows lanes install WinFsp and set both.
 #![cfg(windows)]
@@ -53,6 +57,9 @@ const SERVING_LINE: &str = "slates daemon: instance ";
 const ERROR_ALREADY_EXISTS: i32 = 183;
 /// Format: Win32's `ERROR_ACCESS_DENIED` (winerror.h): what `MoveFileExW` answers for a directory asked to be replaced.
 const ERROR_ACCESS_DENIED: i32 = 5;
+/// Format: Win32's `ERROR_NOT_SUPPORTED` (winerror.h): what `CreateHardLinkW` answers where WinFsp's driver refuses
+/// `FileLinkInformation` itself (`STATUS_NOT_SUPPORTED`, `src/sys/fileinfo.c`, WinFsp v2.1 to v2.2 as released; A-360).
+const ERROR_NOT_SUPPORTED: i32 = 50;
 /// Format: Win32's `ERROR_DIR_NOT_EMPTY` (winerror.h).
 const ERROR_DIR_NOT_EMPTY: i32 = 145;
 /// Format: the bytes the truncation test writes first: winfstest's own length (`SetEndOfFile %s 42`).
@@ -314,6 +321,107 @@ fn a_move_not_asked_to_replace_refuses_a_taken_name_and_leaves_both_files() {
   assert_eq!(replaced, Ok(()), "asked to replace, the move succeeds");
   assert_eq!(std::fs::read(drive.path("to.txt")).unwrap(), b"the source");
   assert!(std::fs::metadata(drive.path("from.txt")).is_err());
+}
+
+/// `CreateHardLinkW(link, existing)`: Ok, or the Win32 error it set.
+fn create_hard_link(link: &str, existing: &str) -> Result<(), i32> {
+  let (link, existing) = (wide(link), wide(existing));
+  // SAFETY: both are NUL-terminated UTF-16 strings that live across the call; no security attributes are passed.
+  let linked = unsafe {
+    windows_sys::Win32::Storage::FileSystem::CreateHardLinkW(
+      link.as_ptr(),
+      existing.as_ptr(),
+      std::ptr::null(),
+    )
+  };
+  if linked != 0 {
+    Ok(())
+  } else {
+    Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(-1))
+  }
+}
+
+/// A file's link count and its file index, as `GetFileInformationByHandle` answers them for an open of `path`.
+fn links_and_index(path: &str) -> (u32, u64) {
+  use std::os::windows::io::AsRawHandle;
+  let file = std::fs::File::open(path).unwrap();
+  let mut info: windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION =
+    // SAFETY: a plain-data struct of integers and FILETIMEs, for which all zero bits are a valid value.
+    unsafe { std::mem::zeroed() };
+  // SAFETY: the handle is the open file's and lives across the call; `info` is a valid, writable struct.
+  let answered = unsafe {
+    windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandle(
+      file.as_raw_handle(),
+      &mut info,
+    )
+  };
+  assert_ne!(answered, 0, "GetFileInformationByHandle({path}) failed");
+  (
+    info.nNumberOfLinks,
+    (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+  )
+}
+
+/// A-360. Do: make a file on the drive and give it a second name with `CreateHardLinkW`, as git's local clone links its
+/// objects; write through the second name, read through the first and through slates; delete the first name; link onto
+/// a taken name. Expect: one file under two names (one file index, two links), the write seen through both, the second
+/// name keeping the bytes with one link once the first is gone, and the taken name refused `ERROR_ALREADY_EXISTS`. Skips
+/// loudly where WinFsp's driver refuses the link itself (`ERROR_NOT_SUPPORTED`): only a driver carrying
+/// `docs/wip/winfsp-patches` forwards it.
+#[test]
+fn a_hard_link_made_through_the_drive_names_the_same_file() {
+  if !live_mount_runs() {
+    return;
+  }
+  let drive = Drive::mount("hardlink");
+  std::fs::write(drive.path("first.txt"), b"one file").unwrap();
+  match create_hard_link(&drive.path("second.txt"), &drive.path("first.txt")) {
+    Ok(()) => {}
+    Err(ERROR_NOT_SUPPORTED) => {
+      eprintln!(
+        "SKIP: this WinFsp's driver refuses hard links itself (ERROR_NOT_SUPPORTED); a driver carrying \
+         docs/wip/winfsp-patches forwards them (A-360)"
+      );
+      return;
+    }
+    Err(error) => panic!("CreateHardLinkW answered Win32 error {error}"),
+  }
+  let (first_links, first_index) = links_and_index(&drive.path("first.txt"));
+  let (second_links, second_index) = links_and_index(&drive.path("second.txt"));
+  assert_eq!(first_index, second_index, "both names are one file");
+  assert_eq!(
+    (first_links, second_links),
+    (2, 2),
+    "the file has two names"
+  );
+  std::fs::write(drive.path("second.txt"), b"written through the second name").unwrap();
+  assert_eq!(
+    std::fs::read(drive.path("first.txt")).unwrap(),
+    b"written through the second name"
+  );
+  assert_eq!(
+    drive.read_through_slates("first.txt").as_deref(),
+    Some("written through the second name")
+  );
+  std::fs::remove_file(drive.path("first.txt")).unwrap();
+  assert_eq!(
+    std::fs::read(drive.path("second.txt")).unwrap(),
+    b"written through the second name"
+  );
+  assert_eq!(
+    links_and_index(&drive.path("second.txt")),
+    (1, second_index)
+  );
+  std::fs::write(drive.path("third.txt"), b"another file").unwrap();
+  assert_eq!(
+    create_hard_link(&drive.path("third.txt"), &drive.path("second.txt")),
+    Err(ERROR_ALREADY_EXISTS),
+    "a taken name is refused"
+  );
+  assert_eq!(
+    std::fs::read(drive.path("third.txt")).unwrap(),
+    b"another file"
+  );
 }
 
 /// A-209, `t/base/04.t` case 26. Do: make two directories on the drive and move one onto the other with
