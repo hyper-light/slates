@@ -1,5 +1,14 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Partly closed (g262, 2026-11-18): the protocol's wire enums are held to their published tags by a test.**
+> `crates/ipc/tests/wire_order.rs` reads each wire enum's schema, which names its variants in tag order, and compares
+> it with `tests/wire_order.txt`: 43 enums, 410 tags. A second test fails when the protocol's source derives `Wire`
+> for an enum it does not hold. An append is published in its change by the `--ignored` writer
+> (`publish_appended_variants`), which refuses while any published tag moved. `SubmitApproved` stays at 71: moving it
+> back would be a second move, and builds since 04d7ea465 speak 71. Still owed, from the entry below:
+> - the records' enums held the same way: `crates/db`'s 17 wire enums, with the same test over their schemas;
+> - the completion record framed with its reply's schema hash (the log's owner).
+
 > **Open (g267, 2026-11-18): the wire's append-only rule (D-15) is kept by review alone, and a persisted reply is read
 > outside every schema check.** A variant's wire tag is its index in its enum (`crates/wire-derive/src/lib.rs`,
 > `expand_enum`). 04d7ea465 (A-285) inserted `RequestBody::SubmitHeld` and `EditSubmitHeld` before `SubmitApproved`, so
