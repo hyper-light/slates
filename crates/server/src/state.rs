@@ -317,6 +317,10 @@ pub struct ShardState {
   pub checkpoint_buffer: Vec<u8>,
   /// The volume keys the committed journal holds, so a delta names the volumes gone since (A-68).
   pub published_keys: std::collections::BTreeSet<[u8; 16]>,
+  /// Whether the last publication kept a record of a volume it left out, and so kept every deferred block the arena
+  /// holds (A-430, `verbs::keep_left_out_records_blocks`): until one that keeps none commits, a publication run only to
+  /// relieve the arena releases nothing, and is not run.
+  pub(crate) deferred_kept: bool,
   /// What of the held pieces the committed journal holds that a delta cannot tell from the tracked maps alone
   /// (A-270; `crate::content_holder::held_changes`): the whole pieces' bytes and each live copy's published slots.
   pub(crate) published_held: crate::content_holder::PublishedHeld,

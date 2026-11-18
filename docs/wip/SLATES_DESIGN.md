@@ -5741,6 +5741,15 @@ remain separate gaps. The two reported daemon overlay failures now pass on macOS
 > 0.11–0.16 ms at 256 MiB. A block the committed image names is never reused before a newer image commits
 > (deferred frees). Recovery claims exactly the image's blocks and sweeps what no rebuilt volume reaches. The
 > rebuilt store equals the live one, including a snapshot's and a clone's sharing. Proofs are listed in A-64.
+>
+> **Status (2026-11-18, A-430: a volume a publication cannot image keeps its committed record, and the blocks it
+> names).** A delta that cannot image a volume keeps the record the journal already holds for it. A checkpoint used to
+> leave such a volume out entirely, and a recovery from it refused the volume until a later publication captured it;
+> it now carries that record (`checkpoint_log::committed_volume`, the committed checkpoint folded with its deltas, as
+> a recovery folds it). The kept record may name blocks the volume has freed since it was taken. Such blocks are
+> deferred, and a plain commit released them, so the delta path's kept record could name a block handed out again. A
+> publication that keeps a left-out record now keeps every deferred block (`ChunkArena::capture_deferred`), and the next
+> one that keeps none releases them; meanwhile the arena's relief publishes nothing, since it could release none.
 
 For each ledger position, distinguish a holder's promised epoch from its accepted
 `(epoch, value)`. Phase one consults an authorized quorum of distinct holders and adopts the
@@ -30442,6 +30451,74 @@ Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class A, A
 
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class A), `crates/server/src/{reap,landing,
 live_ship,daemon}.rs`.
+
+### A-430 — A volume a publication cannot image keeps its committed record, and every block that record names stays allocated (2026-11-18, goal g268; found by reading in A-422's sibling sweep; §4.8, D-18; amends A-64's commit rule and A-68's checkpoint)
+Applied in the same change to:
+- `crates/mem`: `Buddy::capture_deferred` and `ChunkArena::capture_deferred` (every deferred block joins the open
+  capture, so the commit keeps it); the unit test `a_commit_that_keeps_the_deferred_blocks_hands_none_of_them_out`, and
+  the deferral model's history now commits keeping every deferred block in a third of its commits.
+- `crates/vfs`: `checkpoint_log::committed_volume` and `ShardImage::committed_volume` (one volume's record as a
+  recovery would rebuild it, decoded one volume at a time); the oracle test
+  `a_volumes_committed_record_is_what_a_recovery_rebuilds_for_it` (`tests/checkpoint_log.rs`).
+- `crates/server/src/verbs.rs`: `publish_checkpoint` carries a left-out volume's record (`carry_record`,
+  `stream_checkpoint`), `published_keys` counts it; `publish_shard` keeps every deferred block when a publication kept
+  a left-out record (`keep_left_out_records_blocks`, counted `arena.deferred_kept_for_left_out`); `relieve_deferred`
+  publishes nothing meanwhile (`arena.relief_withheld`); `ShardState::deferred_kept`. Tests: the streamed checkpoint
+  test now expects the carried record; `a_left_out_volumes_kept_record_keeps_the_blocks_it_names`.
+- §4.8 (the status after A-64's), GAPS (A-422's entry, its first sibling), the bug record
+  `docs/bugs/2026-11-18-a-checkpoint-left-out-a-volume-it-could-not-image-and-a-kept-record-named-reused-blocks.md`.
+
+- **What was there.** A publication that cannot image a volume (an overlay whose base host is away, or whose image
+  refuses) leaves it out. A delta keeps the volume's committed record ("a skipped volume keeps its committed record, so
+  it stays present"). A checkpoint dropped it: its image held the volume not at all. So a recovery from that checkpoint
+  refused the volume (`NoImage`) until a later publication captured it, though its content had been acknowledged
+  durable at earlier publications. The delta's kept record had a hazard of its own. A-64 defers the free of a block the
+  committed image names until a newer image commits, and each commit releases the deferred blocks its own capture does
+  not name. A left-out volume's blocks freed since its record was taken are exactly such blocks, so the first commit
+  that left it out handed them out again while the kept record named them. A recovery then rebuilt the volume over
+  whatever took a block next, or refused the whole shard for a block named two ways.
+- **The rule.** A volume a publication cannot image keeps the record the journal holds for it, in a delta and in a
+  checkpoint alike: the checkpoint carries it, read from the committed checkpoint and folded with the deltas after it,
+  one volume at a time. Every block a kept record names stays allocated until a publication captures the volume again.
+  Those blocks are among the deferred ones, since every commit since the record was taken kept them, so a publication
+  that keeps a left-out record keeps every deferred block. The next publication that keeps none releases those its own
+  image does not name. While blocks are kept so, a publication run only to relieve the arena would release none, so it
+  is not run, and an operation the arena cannot fit meets its typed `PublishNeeded` (EAGAIN on a FUSE mount).
+- **Why every deferred block, and the cost.** The precise set is the blocks the kept records name, which takes each
+  kept record's extents and a capture per chunk piece (A-118's trimmed chunks). Every deferred block is a superset
+  that is correct with no new bookkeeping. It costs the frees of every volume on the shard while one volume stays left
+  out: memory is not reclaimed until the left-out volume is captured or destroyed. A left-out volume is rare: its
+  image refuses only with its host away, which a landing holds within one synchronous unit, or on an internal refusal.
+  The precise set is owed (GAPS) if a lasting left-out volume ever shows in the counters.
+- **Evidence (Mac Studio, 2026-11-18, debug).**
+  - mem: the keeping commit's test and the deferral model's two histories pass with the keeping commits, 4 of 4.
+  - vfs: `committed_volume` equals `Journal::recover`'s fold for a volume changed by a delta, one carried whole, one
+    removed, one added and one never published.
+  - server: the streamed checkpoint now commits the overlay's record as a recovery had rebuilt it before. The block
+    test keeps the 524,288 deferred bytes of a cut file across the publication that leaves its overlay out, and
+    releases them when the overlay is captured. Both pass with the write log's and the replay's tests, 18 of 18.
+  - Each half was red once with its part removed: no record carried, and the 524,288 bytes released (`left: 0`).
+
+### A-434 — A work's verb held for its quorum commit, or for its work's route, waits the failover delay, a held reply's total (2026-11-18, built for goal g255; R3's class B; AUD-11, A-247, A-298, A-354, A-363, A-375)
+- **What was there.** A work's verb whose verdict its green's owner takes to answer at its quorum commit (AUD-11), or
+  that waits for its work's route to commit (A-298), was held up to the owner lease's bound (`lease::lease_bound_ns`,
+  the membership horizon less its clock tolerance, about 0.9 s), then answered `Overloaded`, unrecorded, for its retry
+  to run it again. That bound is the one a verb waits for its own owner lease to confirm (`lease_wait`); a commit at
+  the quorum is not a lease's confirmation: when a holder is lost it waits for the fleet to fail over, which the
+  failover delay bounds (A-363), so a verb given up at the lease's bound came back to wait again, once a lease bound
+  for as long as the failover took.
+- **The rule.** Such a verb is held at most the node's failover delay (`work_home::park_bound_ns`, the fanned
+  `ShardState::failover_ns`), a held reply's total (A-354, A-375, the durable spans `live_ship` reads): the most any
+  reply waits for a commit to be durable, one number for both. A batch of asks to the owner keeps the lease's bound as
+  its first window, judged in the owner's own time past it (A-426).
+- **Test.** `a_verb_held_for_its_quorum_commit_waits_the_failover_delay` (`crates/server/src/work_home.rs`): on a shard
+  whose failover delay is held at three lease bounds, a verb deferred for its quorum commit is still held a lease bound
+  after its deferral and released at the failover delay.
+  Run on the Mac Studio (kiln, 2026-11-18, load 4-7, debug build, `cargo test --locked -p slates-server --lib --
+  work_home lease_wait`): 1 of 1. Red-checked once: with the bound back at the lease's, the test fails at its first
+  look, the verb released. The green owner's flows and the load rungs that park verbs are filed for main's run.
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class A), `crates/server/src/work_home.rs`.
 
 ### A-435 — An adopted move's seal, a takeover's give-up record and a revocation's mount wait wait in their target's own time; the moves read and the pressure room sample are wall bounds by their reasons (2026-11-18, goal 85 via g251; R3's class A; A-65, A-408, A-432)
 

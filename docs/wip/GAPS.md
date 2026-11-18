@@ -3682,19 +3682,20 @@
 >   `a_lease_take_waits_for_a_control_shard_that_works_past_its_term`). Kept on the wall by their reason, stated beside
 >   each: a live log's claim admissions (inside the peer's one-at-a-time serve, the owner asking again at its period),
 >   the claim reconciliation and re-admission (the record period's, before its materializations), and the live
->   dispatch's wait (its lanes bounded by the live budget, its answer unread). Then an adopted move's seal, a takeover's
->   give-up record and a revocation's wait for its fenced FUSE mounts (A-435, 2026-11-18, g251: the seal is not
->   idempotent, so an answer dropped at a period's end took a second seal the next period and left the adopted snapshot
->   behind; the give-up is one attempt, so a busy owner shard left its objects unrecorded for good;
+>   dispatch's wait (its lanes bounded by the live budget, its answer unread); and a work's verb held for its quorum
+>   commit or its route (A-434, goal g255: the owner lease's bound, about 0.9 s; now the failover delay, a held reply's
+>   total, A-354/A-375, `work_home::park_bound_ns`). Then an adopted move's seal, a takeover's give-up record and a
+>   revocation's wait for its fenced FUSE mounts (A-435, 2026-11-18, g251: the seal is not idempotent, so an answer
+>   dropped at a period's end took a second seal the next period and left the adopted snapshot behind; the give-up is
+>   one attempt, so a busy owner shard left its objects unrecorded for good;
 >   `an_adopted_moves_seal_is_recorded_from_an_owner_shard_that_works_past_a_period`,
 >   `a_given_up_object_is_recorded_on_an_owner_shard_that_works_past_a_period`). Kept on the wall by their reason, stated
 >   beside each: the record period's read of each shard's moves (a pure read, asked again next period) and the pressure
 >   sampler's free-room read (the reap cadence's, a shard unanswered reading as no room, which the debt covers). Owed in
->   class A: the park bound of a verb waiting on a green's owner (`work_home`, the lease bound on the wall), and five of
->   the 25 `xshard::call_within` and `task_within` sites on the wall (`shards_route.rs`, `remote_attach.rs`,
->   `mirror.rs`, `fleet.rs`, `anchor_hold_windows.rs`; g251's since 2026-11-18). Owed, found here: an adopted move's
->   seal is still taken again when its answer is lost to a stopped shard; recording the seal on the owner shard would
->   make `moves::seal_adopted` idempotent. Class B (the
+>   class A: five of the 25 `xshard::call_within` and `task_within` sites on the wall (`shards_route.rs`,
+>   `remote_attach.rs`, `mirror.rs`, `fleet.rs`, `anchor_hold_windows.rs`; g251's since 2026-11-18). Owed, found here:
+>   an adopted move's seal is still taken again when its answer is lost to a stopped shard; recording the seal on the
+>   owner shard would make `moves::seal_adopted` idempotent. Class B (the
 >   transport's round-trip estimate) is open, but for the forward lane's stall (2026-11-18, A-315, goal g255): a batch
 >   quiet for its budget is given up only once a turn of its lane begun after the silence was seen has read the
 >   session's own socket empty, or found no session at all, so an origin kept off its CPU reads its owner's replies
@@ -11244,8 +11245,14 @@ since A-402, which also makes the log option 2 names available to the WinFsp dri
 >     `an_overflow_marked_before_a_restamp_stays_reported`.
 >   - The run through a real daemon restart is main's (`run-requests.md`, 2026-11-18).
 > - **Open (siblings, from reading).**
->   1. A checkpoint leaves a volume it cannot image out entirely, where a delta keeps its committed record. Recovery
->      then refuses that volume until a later publication captures it whole.
+>   1. **Fixed 2026-11-18 (A-430):** a checkpoint left a volume it could not image out entirely, where a delta kept its
+>      committed record, so recovery refused that volume until a later publication captured it; a checkpoint now
+>      carries the record. Reading the delta path for it found the record kept there named blocks the first commit
+>      handed out again; a publication that keeps a left-out record now keeps every deferred block
+>      (`docs/bugs/2026-11-18-a-checkpoint-left-out-a-volume-it-could-not-image-and-a-kept-record-named-reused-blocks.md`).
+>      **Owed:** the precise set (only the blocks the kept records name, with A-118's trimmed pieces), should a lasting
+>      left-out volume show in `arena.deferred_kept_for_left_out`: until it is captured, its shard reclaims no freed
+>      block.
 >   2. **Fixed 2026-11-18 (A-429):** the replay wrote an overlay's logged write without the overlay's host, so a base
 >      file the image held uncopied had the bytes of its window before the write read as zeros. The replay now writes
 >      through the host, copying the file up first, as the bridge did
