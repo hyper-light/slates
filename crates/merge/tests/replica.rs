@@ -1,13 +1,15 @@
-//! A replica fed its owner's feed is its owner's green at every version it holds (A-273 step 2; §4.16 "Rebase, the only
-//! corrective path"). Each generated history runs one owner green over a generated origin: works submit over bases
-//! behind the head (conflicts met, over every dimension), fresh files are made and edited, and the owner folds its
-//! history, to a floor or as far as a budget needs. A replica joins from the owner's seed at any point. The owner's feed
-//! messages travel in order and arrive late: delivered a few at a time, still in flight when the replica is rebuilt (so
-//! it must pass them over), or lost (so the next must be refused as a gap and the replica rebuilt). After every step the
-//! replica's head must be a version the owner committed and its identity the owner's at that version, and every name's
-//! bytes at its head the owner's. At the end of every history, with everything delivered, it must equal the owner whole:
-//! the head and its identity, every name's bytes and the paths changed since every version both hold, the answer to a
-//! rebase over every such base, and the refusal of a base below its own floor, which goes to the owner.
+//! A replica fed its owner's feed is its owner's green at every version it holds, and reads its owner's content in
+//! place (A-273 steps 2 and 3; §4.16 "Rebase, the only corrective path"). Each generated history runs one owner green
+//! over a generated origin: works submit over bases behind the head (conflicts met, over every dimension), fresh files
+//! are made and edited, and the owner folds its history, to a floor or as far as a budget needs. A replica is made from
+//! the owner at any point. The owner's feed messages travel in order and arrive late: delivered a few at a time, still
+//! in flight when the replica is rebuilt (so it must pass them over), or lost (so the next must be refused as a gap and
+//! the replica rebuilt); the replica's acknowledgements reach the owner late too, and the owner frees only what they
+//! say was passed. After every step the replica's head must be a version the owner committed, its identity the owner's
+//! at that version, every name's bytes at its head the owner's, and no read of its refused. At the end of every
+//! history, with everything delivered and acknowledged, it must equal the owner whole: the head and its identity,
+//! every name's bytes and the paths changed since every version, the answer to a rebase over every base, the fold
+//! floor, and its current bytes the owner's own memory, never a copy; and once it leaves, the owner keeps nothing for it.
 // Test harness code: an unwrap or a panic in a helper is a failed test, which is what it should be.
 #![allow(
   clippy::unwrap_used,
@@ -22,8 +24,9 @@ use std::collections::{BTreeMap, VecDeque};
 
 use common::generated::{Raw, increment_of, origin_of, path, raw};
 use proptest::prelude::*;
+use slates_mem::sealed::Passed;
 use slates_merge::engine::{Green, Outcome};
-use slates_merge::replica::{FeedMessage, FeedRefusal, Replica};
+use slates_merge::replica::{Fed, FeedBody, FeedMessage, FeedRefusal, Replica};
 
 /// Shape: the alphabet's indices the comparisons walk: every path `common::generated::path` can name.
 const PATH_INDICES: u8 = 7;
@@ -45,14 +48,16 @@ enum Step {
   FoldToBudget(u8),
   /// This many messages in flight reach the replica.
   Deliver(u8),
+  /// This many of the replica's acknowledgements reach the owner.
+  Acknowledge(u8),
   /// The oldest message in flight never arrives.
   Lose,
-  /// A replica joins from the owner's seed (a new one, if one was there).
+  /// A replica is made from the owner (a new one, if one was there, which leaves).
   Join,
 }
 
 fn step() -> impl Strategy<Value = Step> {
-  (0u8..16, raw(), any::<u8>(), any::<u8>(), any::<u8>()).prop_map(
+  (0u8..17, raw(), any::<u8>(), any::<u8>(), any::<u8>()).prop_map(
     |(kind, raw, first, second, third)| match kind {
       0..=3 => Step::Submit(raw, first % 6),
       4..=5 => Step::Fresh(first % 8),
@@ -60,7 +65,8 @@ fn step() -> impl Strategy<Value = Step> {
       8 => Step::Fold(first % 4),
       9 => Step::FoldToBudget(first),
       10..=12 => Step::Deliver(first % 6),
-      13 => Step::Lose,
+      13 => Step::Acknowledge(first % 6),
+      14 => Step::Lose,
       _ => Step::Join,
     },
   )
@@ -85,8 +91,8 @@ struct Ran {
   /// Rebases compared with the owner's, and the conflicts among them.
   rebases: u64,
   rebase_conflicts: u64,
-  /// Bases below the replica's floor that it refused and the owner answered.
-  below_floor: u64,
+  /// Frees the owner kept for the replica, read at the end: content the replica read in place that the owner released.
+  frees_held: u64,
 }
 
 /// One history in progress: the owner, its replica if one has joined, the messages in flight to it, and what the owner
@@ -96,6 +102,8 @@ struct History {
   owner: Green,
   replica: Option<Replica>,
   inflight: VecDeque<FeedMessage>,
+  /// The replica's acknowledgements on their way to the owner.
+  acks: VecDeque<Passed>,
   /// The owner's identity at every version it committed, and at the origin.
   identities: BTreeMap<u64, [u8; 32]>,
   fresh: Vec<String>,
@@ -112,6 +120,7 @@ impl History {
       owner,
       replica: None,
       inflight: VecDeque::new(),
+      acks: VecDeque::new(),
       identities,
       fresh: Vec::new(),
       ran: Ran::default(),
@@ -135,7 +144,10 @@ impl History {
     let (outcome, applied) = self.owner.submit_resolved(&increment);
     if let (Outcome::Accepted { version }, Some(applied)) = (&outcome, applied) {
       self.identities.insert(*version, self.owner.head_identity());
-      let message = self.owner.feed_version(*version, increment, applied, None);
+      let message = self
+        .owner
+        .feed_version(*version, increment, applied, None)
+        .unwrap();
       self.send(message);
     }
     outcome
@@ -148,11 +160,21 @@ impl History {
     }
   }
 
-  /// The replica rebuilt from a fresh seed of the owner's, after it refused a message.
+  /// The replica rebuilt from the owner now, after it refused a message; its old registration given back.
   fn rebuild(&mut self) {
-    let seed = self.owner.replica_seed().unwrap();
-    let origin = origin_of(&self.origin_rows);
-    self.replica.as_mut().unwrap().rebuild(origin, &seed);
+    let fresh = self.owner.replica().unwrap();
+    let left = self.replica.as_mut().unwrap().rebuild(fresh).unwrap();
+    self.owner.leave_replica(left);
+  }
+
+  /// Up to `count` of the replica's acknowledgements reach the owner, oldest first.
+  fn acknowledge(&mut self, count: usize) {
+    for _ in 0..count {
+      let Some(passed) = self.acks.pop_front() else {
+        return;
+      };
+      self.owner.acknowledge_replica(passed);
+    }
   }
 
   /// Up to `count` messages in flight reach the replica, in order; a refusal is followed by a rebuild.
@@ -162,18 +184,15 @@ impl History {
       else {
         return;
       };
-      let before = replica.counts();
       match replica.apply(&message) {
-        Ok(_) => {
-          let after = replica.counts();
-          self.ran.passed_over += after.passed_over - before.passed_over;
-          if after.applied > before.applied {
-            match message.body {
-              slates_merge::replica::FeedBody::Version { .. } => self.ran.versions_applied += 1,
-              slates_merge::replica::FeedBody::Fold { .. } => self.ran.folds_applied += 1,
-            }
+        Ok(Fed::Applied { passed }) => {
+          self.acks.push_back(passed);
+          match message.body {
+            FeedBody::Version { .. } => self.ran.versions_applied += 1,
+            FeedBody::Fold { .. } => self.ran.folds_applied += 1,
           }
         }
+        Ok(Fed::PassedOver) => self.ran.passed_over += 1,
         Err(FeedRefusal::Gap { expected, sent }) => {
           assert!(sent > expected, "a gap is a message past the next one");
           self.ran.gaps += 1;
@@ -222,12 +241,16 @@ impl History {
         }
       }
       Step::Deliver(count) => self.deliver(usize::from(*count)),
+      Step::Acknowledge(count) => self.acknowledge(usize::from(*count)),
       Step::Lose => {
         self.inflight.pop_front();
       }
       Step::Join => {
-        let seed = self.owner.replica_seed().unwrap();
-        self.replica = Some(Replica::build(origin_of(&self.origin_rows), &seed));
+        if let Some(old) = self.replica.take() {
+          self.owner.leave_replica(old.leave().unwrap());
+          self.acks.clear();
+        }
+        self.replica = Replica::new(self.owner.replica().unwrap());
       }
     }
     self.check_at_the_replicas_head();
@@ -251,6 +274,11 @@ impl History {
     let head = replica.green().head();
     assert!(head <= self.owner.head(), "a replica ahead of its owner");
     assert_eq!(
+      replica.green().content_reads_refused(),
+      0,
+      "a read the replica could not answer in place"
+    );
+    assert_eq!(
       Some(replica.green_mut().head_identity()),
       self.identities.get(&head).copied(),
       "the replica's identity at version {head} against the owner's there"
@@ -269,6 +297,7 @@ impl History {
   /// Everything in flight delivered, the replica equals the owner whole (module docs). Returns what the history did.
   fn finish(mut self, probes: &[Raw]) -> Ran {
     self.deliver(self.inflight.len());
+    self.acknowledge(self.acks.len());
     // A lost last message is followed by none the replica could refuse as a gap, so it stays behind, as a lagging
     // replica does: the owner's next message would be refused and the replica rebuilt. The history ends before one is
     // sent, so that rebuild is made here.
@@ -283,6 +312,7 @@ impl History {
     let Some(mut replica) = self.replica.take() else {
       return self.ran;
     };
+    self.acknowledge(self.acks.len());
     let owner = &mut self.owner;
     let green = replica.green_mut();
     assert_eq!(green.head(), owner.head(), "the replica caught up");
@@ -292,13 +322,21 @@ impl History {
       green.head_identity_from_scratch(),
       "the replica's identity is its state's"
     );
-    assert!(
-      green.folded_below() >= owner.folded_below(),
-      "the replica keeps no history its owner dropped: its floor {} against the owner's {}",
+    assert_eq!(
       green.folded_below(),
-      owner.folded_below()
+      owner.folded_below(),
+      "the replica keeps the history its owner keeps, and no more"
     );
-    let floor = green.folded_below().max(owner.folded_below());
+    for name in &names {
+      if let (Some(mine), Some(theirs)) = (green.content(name), owner.content(name)) {
+        assert!(
+          std::ptr::eq(mine.as_ptr(), theirs.as_ptr()) && mine.len() == theirs.len(),
+          "{name}'s current bytes are the owner's own, read in place"
+        );
+      }
+    }
+    assert_eq!(green.content_reads_refused(), 0);
+    let floor = owner.folded_below();
     for version in floor..=owner.head() {
       for name in &names {
         assert_eq!(
@@ -327,19 +365,18 @@ impl History {
           self.ran.rebase_conflicts += 1;
         }
       }
-      if green.folded_below() > owner.folded_below() {
-        let below = green.folded_below() - 1;
-        let increment = increment_of(probe).with_id(id(usize::MAX - at), below);
-        assert!(
-          matches!(
-            green.rebase(&increment),
-            slates_merge::engine::Rebased::BaseUnavailable { .. }
-          ),
-          "a base below the replica's floor is the owner's to answer"
-        );
-        self.ran.below_floor += 1;
-      }
     }
+    self.ran.frees_held = owner.content_frees_held();
+    owner.leave_replica(replica.leave().unwrap());
+    assert_eq!(
+      owner.content_held_bytes(),
+      0,
+      "the owner keeps nothing for a replica that left"
+    );
+    assert_eq!(
+      owner.retained_bytes().history,
+      owner.history_bytes_recounted()
+    );
     self.ran
   }
 }
@@ -369,11 +406,11 @@ proptest! {
   }
 }
 
-/// Non-vacuity, A-273: one fixed history reaches every path of the feed. Do: a replica joins, versions and a fold are
-/// delivered, a version is made while a message is in flight and the replica is rebuilt (so it passes the message
+/// Non-vacuity, A-273: one fixed history reaches every path of the feed. Do: a replica is made, versions and a fold
+/// are delivered, a version is made while a message is in flight and the replica is made anew (so it passes the message
 /// over), a message is lost (so the next is refused as a gap and the replica rebuilt), and the final comparison
 /// rebases over every base. Expect: versions and folds applied, a message passed over, a gap refused, rebases compared,
-/// a conflict among them, and a base below the replica's floor refused to it.
+/// a conflict among them, and frees the owner kept for the replica's in-place reads.
 #[test]
 fn a_fixed_history_reaches_every_path_of_the_feed() {
   // A generated step's shape: kind, path index, a second path, the offset (0, so every overwrite fits) and the byte.
@@ -410,5 +447,5 @@ fn a_fixed_history_reaches_every_path_of_the_feed() {
   assert!(ran.gaps >= 1, "{ran:?}");
   assert!(ran.rebases >= 1, "{ran:?}");
   assert!(ran.rebase_conflicts >= 1, "{ran:?}");
-  assert!(ran.below_floor >= 1, "{ran:?}");
+  assert!(ran.frees_held >= 1, "{ran:?}");
 }

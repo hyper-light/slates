@@ -45,6 +45,7 @@ pub mod origin;
 pub mod range;
 pub mod replica;
 pub mod splice;
+mod store;
 pub mod verdict;
 
 pub use derive::{ContentOp, compose_content, compose_content_sized};

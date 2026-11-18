@@ -739,4 +739,99 @@ mod tests {
     assert_eq!(store.frees_held(), u64::from(MESSAGES) - 1);
     assert_eq!(store.live_bytes(), 64);
   }
+
+  /// One reader of the generated histories: the reader, the blocks the model says it may read, and the messages sent it
+  /// and not yet taken.
+  struct Modelled {
+    reader: BlockReader,
+    live: std::collections::BTreeSet<Block>,
+    inbox: VecDeque<Changes>,
+  }
+
+  proptest::proptest! {
+    #![proptest_config(slates_test_seeds::unseeded(proptest::prelude::ProptestConfig::with_cases(slates_test_seeds::cases(256))))]
+
+    /// A-273 step 3, the lifetime rule over generated histories. Do: generated steps of a writer sealing blocks,
+    /// releasing them and taking each message's changes; readers joining, each admitting and passing its oldest
+    /// message; acknowledgements delivered late and in any order; readers leaving. Expect, after every step: a reader
+    /// reads exactly the blocks the model says are in its live table, each with its sealed bytes, and each still
+    /// allocated by its writer (never freed before every reader passed its release); the writer reads every block it
+    /// names; its kept bytes equal their recount; and at the end, every reader gone and every block released, nothing is
+    /// live or kept.
+    #[test]
+    #[cfg_attr(miri, ignore)] // generated histories under Miri take minutes; the plain tests above run there
+    fn no_reader_reads_a_block_its_writer_freed(
+      steps in proptest::collection::vec(
+        (0u8..7, proptest::prelude::any::<u8>(), proptest::collection::vec(proptest::prelude::any::<u8>(), 0..48)),
+        1..96,
+      ),
+    ) {
+      let mut store = SealedBlocks::new();
+      let mut sealed: BTreeMap<Block, Vec<u8>> = BTreeMap::new();
+      let mut named: Vec<Block> = Vec::new();
+      let mut readers: Vec<Modelled> = Vec::new();
+      let mut acks: Vec<Passed> = Vec::new();
+      for (kind, pick, bytes) in steps {
+        let pick = usize::from(pick);
+        match kind {
+          0 => {
+            let block = store.seal(bytes.clone());
+            sealed.insert(block, bytes);
+            named.push(block);
+          }
+          1 if !named.is_empty() => store.release(named.remove(pick % named.len())),
+          2 => {
+            let changes = store.take_changes();
+            for modelled in &mut readers {
+              modelled.inbox.push_back(changes.clone());
+            }
+          }
+          3 => readers.push(Modelled {
+            reader: BlockReader::new(store.join()),
+            live: named.iter().copied().collect(),
+            inbox: VecDeque::new(),
+          }),
+          4 if !readers.is_empty() => {
+            let at = pick % readers.len();
+            let modelled = &mut readers[at];
+            if let Some(changes) = modelled.inbox.pop_front() {
+              modelled.reader.admit(&changes).unwrap();
+              modelled.live.extend(changes.sealed());
+              acks.push(modelled.reader.pass(&changes).unwrap());
+              for block in changes.released() {
+                modelled.live.remove(block);
+              }
+            }
+          }
+          5 if !acks.is_empty() => store.acknowledge(acks.remove(pick % acks.len())),
+          6 if !readers.is_empty() => {
+            let modelled = readers.remove(pick % readers.len());
+            store.leave(modelled.reader.leave());
+          }
+          _ => {}
+        }
+        for modelled in &readers {
+          for (block, bytes) in &sealed {
+            if modelled.live.contains(block) {
+              proptest::prop_assert_eq!(modelled.reader.read(*block), Some(bytes.as_slice()));
+              proptest::prop_assert!(store.bytes(*block).is_some(), "freed under a reader");
+            } else {
+              proptest::prop_assert_eq!(modelled.reader.read(*block), None);
+            }
+          }
+        }
+        for block in &named {
+          proptest::prop_assert_eq!(store.bytes(*block), sealed.get(block).map(Vec::as_slice));
+        }
+        proptest::prop_assert_eq!(store.held_bytes(), store.held_bytes_recounted());
+      }
+      for modelled in readers {
+        store.leave(modelled.reader.leave());
+      }
+      for block in named {
+        store.release(block);
+      }
+      proptest::prop_assert_eq!((store.live_bytes(), store.held_bytes()), (0, 0));
+    }
+  }
 }
