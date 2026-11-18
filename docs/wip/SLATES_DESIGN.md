@@ -4977,7 +4977,11 @@ nothing where the OS refuses the count, A-223), and, for SDK event loops, signal
 the completion fd (eventfd / pipe / socket) so `add_reader`/`uv_poll` fires. Where no descriptor can be
 shared (macOS, Windows), a client-local bridge thread makes its pipe or socket readable after every
 return from its wait while the client is armed and a reply waits in its ring: a level, never an edge
-(A-44). The client folds a
+(A-44). The bridge waits where a parked synchronous call of the same client waits, and the daemon wakes one
+waiter: a synchronous park raises a mark before its flag, and a bridge woken while the mark stands wakes once
+more, so the parked call is never left to its deadline (2026-11-18: before, 16 to 19 of 20 parked calls beside
+a running bridge slept to it). A bridge whose thread the OS refuses is refused typed, never started without
+it. The client folds a
 confirmed stamp inside its wait into its estimate (stamp to return). Shards poll rings while any
 client has activity within the
 measured idle window, then park in the driver; a parked shard is woken by the driver kick the
@@ -8651,6 +8655,11 @@ it builds against the contract and adds to it rather than around it.
 > `Instance::member`, `MoveProgress`, and the move's refusals' details: `Busy::Attached`, `Busy::Moving`,
 > `Unusable::Unmovable`, `Invalid::MoveTarget`, `RetryCause::MoveUnplaced`), then an overlay's base captured whole so
 > its clones move (`Instance::capture_base`).
+> **`CONTRACT` = 35:** only a granted landing ends its audit trail when refused: one whose grant the daemon held as it
+> began. So every such `LandingFinished` names its manifest and verdict, and its landing record reaches the same
+> terminal state in the same atom (§4.15's status of the same day). A landing under a grant the daemon does not hold is
+> presented once planned; refused before its plan, it is a refused request with no trail. Under 30 it wrote an end that
+> named no manifest.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -9287,9 +9296,13 @@ would need a privilege slates never holds (R10).
 > a `LandingFinished` whose outcome is `Refused`, or `Aborted` once the attempt wrote an entry. It names the manifest
 > the attempt planned (its grant's when it planned none) and its signature's verdict against that manifest. A plan no
 > grant covers ends in a presentation instead, which records itself. Before, a refused landing's trail ended at its
-> grant. An end that names no manifest (refused before any plan, under a grant that names none) records no verdict, and
-> `Audit` reads none on it. Proven by four refusals in `crates/server/tests/presentations.rs`, three of them red before
-> (macOS arm64, Mac Studio, 2026-11-18). Record: `docs/bugs/2026-11-18-a-refused-granted-landing-left-no-trail.md`.
+> grant. Since a later change the same day the landing's record reaches the same terminal state in the same atom: its
+> presentation's record moves there, and a fresh id's record is made, so a restart's landing counter passes the id.
+> Only a granted landing, one whose grant the shard held as it began, leaves this trail; a landing under a grant it does
+> not hold is presented once planned, and refused before its plan it is a refused request (`CONTRACT` = 35). Proven by
+> four tests in `crates/server/tests/presentations.rs`, three of them red before the first change and each reading the
+> record's state since the second (macOS arm64, Mac Studio, 2026-11-18). Record:
+> `docs/bugs/2026-11-18-a-refused-granted-landing-left-no-trail.md`.
 
 > **Status (2026-10-01, AUD-29-62: contained base access on every platform).** The Windows base host is
 > descriptor-relative like the Unix one: it retains a handle per opened directory and opens each entry with
@@ -16717,12 +16730,16 @@ the green's shard.
   Of a rung's operations, edits, reads, rebases and creations are about 92%. None of them needs the green's
   sequence. Only a submit's verdict does: it must see every accepted increment before it in one order.
 - **The rule.**
-  - *Where a work lives.* A work is placed on the partition its name hashes to (`owner_of_name`), on the green's node in
-    this first step, and its id carries that partition, so its edits, reads, staging and submit arrive there. The name
-    rule is the plain volumes': a name is created and looked up on the partition it hashes to, so a work's name is
-    unique beside theirs and no alias is needed. Hashing spreads a green's works over the shards whatever shard their
-    clients came in on, and a request forwarded from another node, which has no creating shard, places the same way.
-    The second step (across nodes) amends this rule when it is built.
+  - *Where a work lives (A-400, since 2026-11-18).* A work lives on the shard that serves its creation: its client's own
+    for a local client, and its id carries that partition, so its edits, reads, staging and submit are read and
+    answered there with no hop between shards; only what needs the green crosses to the owner. Its name is held at the
+    partition the name hashes to, as every name is: by an alias of the work's id when that is another partition
+    (A-236's reservation, asked before the green's admission, confirmed once the creation commits). A creation
+    forwarded from another node is served on the green's owner, which places it there. Until A-400 a work was placed on
+    the partition its name hashes to, so a client's every work verb crossed from its shard to the work's and back:
+    measured, that cost an edit about 40% at the median and half its p99 at 1,000 clients (BENCHMARKS, 2026-11-18),
+    and slowed a single client's edit and merge on every daemon of more than one shard (BENCHMARKS, the same day). The
+    second step (across nodes) amends this rule when it is built.
   - *Creation.* `CreateWork` runs on the work's partition. It asks the green's owner once: may this principal create a
     work, and at which head. The owner records the work's base as a floor (below) in the same step and answers the head.
     The work's record is then made on its own partition, under the request's completion key.
@@ -29116,6 +29133,34 @@ Applied in the same change to: `xtask/src/release.rs` (`runner_image`, `checked_
   differs keeps the plain refusal: that is a reproducibility bug.
 - **Owed.** Pin the MSVC toolset and the Windows SDK the Windows binaries link, so a tag's bytes do not depend on which
   image a runner has (GAPS).
+
+### A-400 — A work lives on the shard that serves its creation, its client's own; its name is held where the name hashes to, by an alias (2026-11-18, built for goals 231 and 257, 1,000 clients under 1 ms; amends A-247's "Where a work lives")
+Applied in the same change to: §4.16 (A-247's rule, "Where a work lives"), GAPS (the load test's entry),
+`crates/server/src/verbs.rs` (`serve`: a local client's `CreateWork` is served on its own shard; `create_work`,
+`create_work_here`, `this_requests_pending_creation`, `settle_work_alias`), `crates/server/src/work_home.rs`
+(`Need::ReserveName`, `Answered::Named`, `WorkHome::named`, `create_need`, `reserve_name`, `start_ask`'s target, a
+resumed creation parking again at its queue's front), `crates/db/src/partition.rs` (an alias's reservation refused for a
+name a work pending admission holds), and the tests below.
+- **What was measured.** A-247 placed a work on the partition its name hashes to, so a client's verbs on its work
+  crossed from the client's shard to the work's and back: two thread hand-offs more for every edit, submit and rebase.
+  The g083 trace on the Mac Studio at 1,000 clients put those legs at p99 267 and 238 µs for an edit at 50 ms (load 14
+  to 17). Naming each work so it hashed to its client's own shard (the harness's `--local-names`, a diagnostic build
+  never on main) took them away: in five of six pairs back to back an edit's p99 fell by about half (0.90 to 0.47 ms,
+  2.04 to 0.61, 5.38 to 1.07 at 50 ms; 1.97 to 0.69, 1.63 to 0.83 at 20 ms), its p50 by about 40% in all six (112 to
+  69 µs at 50 ms), and the shards' CPU by 20 to 25%. And W1 had slowed a single client's edit and merge on every
+  daemon of more than one shard, its work hashed away from it.
+- **The rule.** A work lives on the shard that serves its creation: a local client's own (`serve` serves `CreateWork`
+  there), the green's owner for a creation forwarded from another node. Its name is held at the partition it hashes
+  to: there itself when that is the work's, else by an alias of the work's id, reserved by an ask of that partition's
+  shard before the green's admission (a reservation answered again for the id it already holds, refused
+  `AlreadyExists` for any other holder, a work pending admission there among them), and confirmed by a message once
+  the creation's transaction commits, or released if the creation was refused. A crash between the steps leaves a
+  reserved alias with no work, which the next start's reconcile releases (A-236), and a pending creation, which the
+  start drops (A-247). A destroy releases the alias as every destroy of a volume named elsewhere does.
+- **Tests.** `a_name_pending_a_works_admission_and_an_alias_exclude_each_other` (`crates/db/tests/alias.rs`); the W1
+  suite (`crates/server/tests/works_off_owner.rs`), whose greens are now made by a client of another shard, since a
+  work lives on its client's; `works_created_at_once_off_their_greens_shard_get_their_own_ids` reserves 24 names at one
+  partition at once and refuses the repeated one by its alias.
 
 ### A-404 — A replica keeps a durable checkpoint of its green at the owner's committed floor, and its rebuild starts there (2026-11-18, goal g232: one primary and two replicas editing the Linux kernel tree; §4.16 "Apply on holders" and its failure matrix; A-238's owed item, the replica's records and inputs, step one)
 

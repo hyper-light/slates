@@ -19241,14 +19241,28 @@ fn two_shard_fleet() -> (PortLease, Daemon, Daemon, String) {
 }
 
 /// A green on its owner's node and a work over it placed on another shard of that node, with one edit (A-247).
-fn green_and_off_shard_work(client: &mut Client) -> (VolumeId, VolumeId) {
-  let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
-    name: "off-shard-green".to_owned(),
-    require_evidence: false,
-    base: None,
-  }) else {
-    panic!("create green");
-  };
+/// A green made by a client of another shard than `client`'s on a [`TWO_SHARDS`] daemon (A-400: a work lives on the
+/// shard of the client that makes it, and a green on its maker's), so every work `client` makes is off its green's shard.
+fn green_off_shard_of(client: &Client, instance: &str, name: &str) -> VolumeId {
+  let here = client.client % u32::from(TWO_SHARDS);
+  loop {
+    let mut maker = Client::connect(instance);
+    if maker.client % u32::from(TWO_SHARDS) == here {
+      continue;
+    }
+    let ReplyBody::GreenCreated { id } = maker.call(&RequestBody::CreateGreen {
+      name: name.to_owned(),
+      require_evidence: false,
+      base: None,
+    }) else {
+      panic!("create green");
+    };
+    return id;
+  }
+}
+
+fn green_and_off_shard_work(client: &mut Client, instance: &str) -> (VolumeId, VolumeId) {
+  let green = green_off_shard_of(client, instance, "off-shard-green");
   let name = (0u32..)
     .map(|suffix| format!("off-shard-work-{suffix}"))
     .find(|name| {
@@ -19273,7 +19287,7 @@ fn a_submit_off_its_greens_shard_is_held_to_its_quorum_and_the_works_next_verb_b
   let _serial = serialize_fleet_tests();
   let (_ports, daemon_a, daemon_b, instance_a) = two_shard_fleet();
   let mut client = Client::connect(&instance_a);
-  let (green, work) = green_and_off_shard_work(&mut client);
+  let (green, work) = green_and_off_shard_work(&mut client, &instance_a);
   let appended = |at: u64, bytes: &[u8]| RequestBody::Edit {
     work,
     path: "f".to_owned(),
@@ -30441,13 +30455,7 @@ fn a_submit_off_its_greens_shard_waits_for_its_works_catalog_record_before_its_v
   assert_fleet_forms(&daemons, &hosts, &names);
   let fleet: Vec<&Daemon> = daemons.iter().collect();
   let mut client = Client::connect(daemons[0].instance());
-  let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
-    name: "routed-green".to_owned(),
-    require_evidence: false,
-    base: None,
-  }) else {
-    panic!("create green");
-  };
+  let green = green_off_shard_of(&client, daemons[0].instance(), "routed-green");
   let origin_placed = poll_until(&fleet, PLACEMENT_DEADLINE, || {
     daemons[0].merge_record_placed(green, 0)
   });

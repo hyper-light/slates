@@ -199,10 +199,13 @@
 >   were dropped, and nothing recorded its end. Now every attempt, from the moment its id is decided, records in its
 >   completion's atom the ring's records of it and a `landing_finished`. That record names `refused` (`aborted` once
 >   the attempt wrote an entry), the manifest it planned (its grant's when it planned none) and its verdict. The
->   server's own refusals count too: the lease, the volume, the snapshot, the host and the target. Proven by three
->   tests in `crates/server/tests/presentations.rs` (a conflict in the run, a grant mismatch in the plan, a lease held
->   before it), each red on main 79aee2a17 (Mac Studio, r3614), a fourth for an end that names no manifest, and the
->   unit test of the `aborted` rule (`docs/bugs/2026-11-18-a-refused-granted-landing-left-no-trail.md`);
+>   server's own refusals count too: the lease, the volume, the snapshot, the host and the target. Since a later change
+>   the same day the landing's record reaches the same terminal state in the same atom, so the record and the audit
+>   cannot disagree. Only a landing whose grant the shard held as it began leaves the trail; one under a grant it does
+>   not hold is a refused request (`CONTRACT` = 35). Proven by three tests in `crates/server/tests/presentations.rs`
+>   (a conflict in the run, a grant mismatch in the plan, a lease held before it), each red on main 79aee2a17 (Mac
+>   Studio, r3614) and each reading the record's state; a fourth for a grant the shard does not hold; and the unit test
+>   of the `aborted` rule (`docs/bugs/2026-11-18-a-refused-granted-landing-left-no-trail.md`);
 > - a real FIDO key's signature end to end (the touch flag is proven with a software stand-in): it needs a physical key,
 >   which only a person holds, or OpenSSH's software authenticator (`regress/misc/sk-dummy`, built from OpenSSH's source
 >   and loaded by `ssh-keygen -w`), a tool build CLAUDE.md §2 item 14 reserves for Ada; macOS's OpenSSH 10.2p1 on the
@@ -913,9 +916,13 @@
 > - the async form (R6), first piece built (`CONTRACT` = 31): `AsyncInstance` over a host's `Reactor`, awaiting
 >   provisioning, a snapshot, a status and a destroy; handing it back stops its completion bridge, which took the
 >   synchronous form's wakes (`docs/bugs/2026-11-18-the-async-signal-took-the-synchronous-forms-wakes.md`); owed: the
->   paged verbs, landings, merges, policies and observation, awaited the same way; and the Node SDK's `Client`, whose
->   synchronous verbs park beside the bridge its `completionFd()` starts (the same stolen wake, on macOS and Windows;
->   reported, not changed);
+>   paged verbs, landings, merges, policies and observation, awaited the same way. The Node SDK's `Client`, whose
+>   synchronous verbs park beside the bridge its `completionFd()` starts, had the same stolen wake on macOS and Windows:
+>   closed the same day at the source, since a bridge now passes on a wake it took while a synchronous park waits
+>   (`a_synchronous_park_beside_a_running_bridge_is_woken_by_its_reply`, red without the pass-on: round 0 took 502 ms of
+>   its 500 ms deadline). The Node by-use test (`sdk.test.mjs`, parked calls beside the signal, with `spinFor` and
+>   `parkRatio` bound) is filed for main's run. A bridge whose thread the OS refuses is now refused typed
+>   (`a_bridge_whose_thread_the_os_refuses_is_refused_typed`);
 > - a run of the Linux and Windows arms (mount, the CLI's Windows unmount): not compiled on the Mac that built piece 4.
 
 > **git, Mercurial and Subversion over the WinFsp drive (2026-11-17, Part 6 "Real workloads", §4.6; A-300; Ada's
@@ -2938,9 +2945,12 @@
 >     - **Closed: an ask waiting out the batch before it (A-388, 2026-11-18).** One batch of asks was out to an owner at
 >       a time, and the wait for it was about half of an ask's way to the owner (p99 1.6 to 2.1 ms for submits and
 >       rebases at 50 ms); a shard now keeps two out.
->     - **Open, the hops (by the trace):** an edit of a work off its client's shard crosses four thread hand-offs (the
->       client's shard, the work's, the owner's, back), each waiting for its thread to run; and a first touch, a
->       verdict, a rebase and a read of the green each queue on the owner's one thread.
+>     - **Closed: a work's hop from its client's shard (A-400, 2026-11-18).** A work lived on the shard its name hashes
+>       to, so every verb of it crossed from its client's shard and back; it now lives on its client's shard, its name
+>       held by an alias where the name hashes. Priced first by naming works onto their clients' shards: an edit's p99
+>       about halved and its p50 40% lower at 1,000 clients.
+>     - **Open, the owner's one thread:** a first touch of a base file, a verdict, a rebase and a read of the green each
+>       still cross to the green's owner and queue there (A-273's replicas would take the reads and rebases off it).
 >
 >     **Owed, measurement (the supervisor's):** the 1,000-client rung on main with W1 (A-247 step one, landed
 >     2026-11-17) against main before it (02c6469e5). Each think mean runs as its own invocation with a fresh daemon,

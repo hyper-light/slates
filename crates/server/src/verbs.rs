@@ -2498,9 +2498,11 @@ pub fn serve(
     ));
   }
   let owner = match &body {
-    RequestBody::Create { name, .. } | RequestBody::CreateWork { name, .. } => {
-      Some(owner_of_name(name, state.shards.len()))
-    }
+    RequestBody::Create { name, .. } => Some(owner_of_name(name, state.shards.len())),
+    // A work lives on the shard that serves its creation, its client's own (A-400): its edits and its submits are read
+    // and answered there with no hop, and its name is held at the partition it hashes to, by an alias when that is
+    // another (A-236).
+    RequestBody::CreateWork { .. } => Some(state.partition),
     RequestBody::Detach { attachment }
     | RequestBody::Advance { attachment, .. }
     | RequestBody::BindMount { attachment, .. }
@@ -7448,9 +7450,91 @@ pub(crate) fn encoded_len<T: Wire>(value: &T) -> usize {
   encoded.len()
 }
 
-/// Creates a work volume over a green (§4.16): an agent's private place to declare operations,
-/// based on the green's current head. The green must be owned by this shard (it holds the engine).
+/// Creates a work volume over a green (§4.16) on this shard, the one that serves its creation (A-400): an agent's
+/// private place to declare operations, based on the green's current head. A name that hashes to another partition is
+/// held there by an alias of the work's id, reserved before the creation (`crate::work_home`) and confirmed once it
+/// commits, or released if it did not ([`settle_work_alias`]).
 fn create_work(
+  state: &mut ShardState,
+  principal: &Principal,
+  green: VolumeId,
+  name: &str,
+) -> ReplyBody {
+  let reserved = (owner_of_name(name, state.shards.len()) != state.partition)
+    .then(|| this_requests_pending_creation(state, name))
+    .flatten();
+  let reply = create_work_here(state, principal, green, name);
+  if let Some(id) = reserved {
+    settle_work_alias(state, id, name);
+  }
+  reply
+}
+
+/// The work id this request's own pending creation of `name` holds on this partition (A-247), if any.
+fn this_requests_pending_creation(state: &ShardState, name: &str) -> Option<DbVolumeId> {
+  let (origin, id) = state.current_request?;
+  state
+    .db
+    .partition()
+    .pending_creation(name)
+    .filter(|pending| {
+      (pending.origin, pending.client, pending.sequence) == (origin, id.client, id.sequence)
+    })
+    .map(|pending| pending.work)
+}
+
+/// Settles the alias `name`'s partition holds for `work`, a work this shard was making (A-400, A-236's last step): once
+/// this step's transaction is committed, confirmed there if the work stands here under its name, else released. A task of
+/// this shard decides from what committed, and the message to the name's shard is taken only while the alias still names
+/// `work`; one lost (counted) is the next start's reconcile's to settle.
+fn settle_work_alias(state: &mut ShardState, work: DbVolumeId, name: &str) {
+  let name_partition = owner_of_name(name, state.shards.len());
+  let (Some(here), Some(name_shard)) = (
+    shard_of_partition(state, state.partition),
+    shard_of_partition(state, name_partition),
+  ) else {
+    state.count(ALIAS_STEP_UNTAKEN, 1);
+    return;
+  };
+  let name = name.to_owned();
+  let settling = slates_rt::futures::spawn(async move {
+    // A refused borrow (counted by `with_state_counted`) decides nothing: the alias stays reserved, never released for
+    // a work that may stand, and the next start's reconcile settles it (A-236).
+    let Some(made) = crate::state::with_state_counted(|s| {
+      s.db
+        .partition()
+        .volume(work)
+        .is_some_and(|record| record.name == name)
+    }) else {
+      return;
+    };
+    crate::xshard::run_on_counted(here, name_shard, move |s| {
+      if !s
+        .db
+        .partition()
+        .name_alias(&name)
+        .is_some_and(|alias| alias.volume == work)
+      {
+        return;
+      }
+      let step = if made {
+        Op::NameAliasConfirmed { name }
+      } else {
+        Op::NameAliasReleased { name }
+      };
+      if alias_step(s, &step).is_err() {
+        s.count(ALIAS_STEP_UNTAKEN, 1);
+      }
+    });
+  })
+  .and_then(slates_rt::futures::detach);
+  if settling.is_err() {
+    state.count(ALIAS_STEP_UNTAKEN, 1);
+  }
+}
+
+/// [`create_work`]'s creation itself, on this shard.
+fn create_work_here(
   state: &mut ShardState,
   principal: &Principal,
   green: VolumeId,
@@ -7486,14 +7570,22 @@ fn create_work(
       };
       // The work is the green at its head: it holds nothing of its own until it changes a file, and reads every
       // other file from the green there (`crate::work_files`), so an edit to a base file splices what the file holds.
-      (green_id, engine.head(), None)
+      // A name held for it at another partition holds the id its pending creation was given (A-400).
+      (
+        green_id,
+        engine.head(),
+        this_requests_pending_creation(state, name),
+      )
     }
   };
   // An admitted work holds its own name while it waits (A-247): that is its own hold, released here.
   if let Some(existing) = name_held(state, name)
     && Some(to_db_volume(existing)) != minted
   {
-    if let Some(id) = minted {
+    // Only an owner on another shard recorded a floor for the work at its admission; a green here records it below.
+    if let Some(id) = minted
+      && owner_of(green) != state.partition
+    {
       crate::work_home::tell_floor(state, green_id, id, None);
     }
     return refused(Refusal::AlreadyExists { existing });
@@ -7539,17 +7631,20 @@ fn create_work(
     taken_over: None,
   };
   let now = state.clock.monotonic_ns();
+  // A green elsewhere recorded the work's floor when it admitted the work; a green here records it below. The id may be
+  // minted here as well (a name held by an alias elsewhere, A-400), so where the floor is recorded follows the green.
+  let admitted_elsewhere = owner_of(green) != state.partition;
   if let Err(e) = state
     .db
     .mutate(&mut state.segment, &Op::VolumeCreated { record }, now)
   {
-    if minted.is_some() {
+    if admitted_elsewhere {
       crate::work_home::tell_floor(state, green_id, id, None);
     }
     return refused(refusal_of_db(&e));
   }
-  // The green keeps this base while the work holds it (A-247); a green elsewhere recorded it when it admitted the work.
-  if minted.is_none()
+  // The green keeps this base while the work holds it (A-247).
+  if !admitted_elsewhere
     && let Err(e) = state.db.mutate(
       &mut state.segment,
       &Op::WorkFloorSet {
