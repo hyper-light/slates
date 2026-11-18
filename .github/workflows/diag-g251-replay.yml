@@ -1,4 +1,5 @@
-# Diagnostics only, never merged (g251): the write-log replay routing fix on Linux, where the write log and its replay
+# Diagnostics only, never merged (g251): the write-log replay routing fix on Linux (and, on the landing's tree, A-318's
+# x86-64 chain and the IPC mount tests), where the write log and its replay
 # are compiled (cfg(target_os = "linux")). Green, the red with the prefix routing put back, then slates-vfs and
 # slates-server whole, then the lint wall over the two crates.
 name: diag-g251-replay
@@ -60,6 +61,16 @@ jobs:
           SLATES_TEST_RESTART_SLOWDOWN: "10"
           SLATES_TEST_FLEET_DEADLINE_SECS: "120"
         run: cargo test --locked -p slates-server --no-fail-fast
+      - name: The build cost on x86-64 (A-318) and the IPC mount tests at once (both tests, their own roots)
+        if: success() || failure()
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked -p slates-machine build_cost 2>&1 | grep -E '^test |^test result'
+          for run in 1 2 3; do
+            cargo test --locked -p slates-bridge-fuse --test ipc_mount 2>&1 | tee ipc-$run.log | grep -E '^test |^test result|skipping'
+          done
+          ! grep -q 'skipping' ipc-*.log
       - name: The lint wall over the server alone
         if: success() || failure()
         run: cargo clippy --locked -p slates-server --all-targets -- -D warnings

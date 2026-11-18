@@ -1499,6 +1499,10 @@ pub(crate) fn status_merge_volume(
       takeover_kept: 0,
       // A green or a work volume has no base folder (A-299).
       base: None,
+      // A green's state is its versions, each committed by its merge record before it is answered (§4.16 "Commit"),
+      // not owner-local edits a seal would place; the volume loss window (AC-8.3) does not describe it, so none is
+      // reported rather than a zero it was not measured to be.
+      loss: slates_ipc::protocol::LossReport::default(),
     }),
   })
 }
@@ -2783,6 +2787,10 @@ pub(crate) async fn run_merge_period(
   }
 }
 
+/// The inputs a version's record travels with, while its targets lack them (A-286): the shipment, and the identity the
+/// record names its inputs by, so the targets' answers about them are read against it.
+type VersionInputs = (Option<ShipInputs>, Option<[u8; 32]>);
+
 /// Ships a version's record to its targets over [`MERGE_RECORD_STREAM`] through the owner's own
 /// acceptor at `f + 1` — with its inputs (the content exchange's offer and at most a shipment's bound of the chunks the
 /// targets lack, A-286) in the same message while the targets lack them, so a version commits in one exchange — and
@@ -2796,12 +2804,7 @@ async fn ship_record(
   shard: u16,
   local: HostId,
   owner_acceptor: &mut Acceptor,
-  (object, version, record, (inputs, manifest)): (
-    ObjectId,
-    u64,
-    Record,
-    (Option<ShipInputs>, Option<[u8; 32]>),
-  ),
+  (object, version, record, (inputs, manifest)): (ObjectId, u64, Record, VersionInputs),
   targets: Vec<HostId>,
   shape: Placement,
   quorum: Quorum,
@@ -3306,8 +3309,9 @@ const ACCEPTANCE_REJOINED: &str = "merge.acceptance_rejoined";
 /// A resolved acceptance whose completion record could not be made durable (rolled back); the
 /// client's retry re-executes and meets the idempotent accept.
 const ACCEPTANCE_UNRECORDED: &str = "merge.acceptance_unrecorded";
-/// A resolved acceptance whose delivery task the client's shard refused at its admission bound; the
-/// completion record answers the client's retry.
+/// A resolved acceptance whose reply could not be carried to its client's shard (`xshard::hand_reply_home`): that
+/// shard gone, as its daemon stops, or this shard's carrier at its bound. The completion record answers the client's
+/// resend. (Until goal 238, 2026-11-18, a full channel there lost it too.)
 const ACCEPTANCE_UNDELIVERED: &str = "merge.acceptance_undelivered";
 /// A holder withheld a merge record's acknowledgement (the injected fault).
 const RECORD_WITHHELD: &str = "merge.record_withheld";

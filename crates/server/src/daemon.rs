@@ -230,6 +230,8 @@ pub struct Daemon {
   doorbell: Option<DoorbellThread>,
   /// The liveness watchdog (A-228): the beat's writer, stopped after the shards.
   watchdog: Option<crate::watchdog::Watchdog>,
+  /// The writer of the shards' log lines (A-305), stopped after the shards, so it writes every line they queued.
+  log_writer: Option<slates_machine::log::LogWriter>,
   config: DaemonConfig,
   shards: Vec<ShardId>,
   /// The loopback port the NFS transport (§4.6) listens on, when it is serving; `None` if the
@@ -809,6 +811,15 @@ impl Daemon {
       slates_machine::log_line!("slates-server: descriptor limit raised from {was} to {now}");
     }
     let retained = crate::retention::load(&segment)?;
+    // The writer every shard's log lines go through (A-305): a shard never waits on standard error, where a thread
+    // starved while it held the lock every line takes, or a reader slow to take a line, held a shard a window and the
+    // watchdog called it wedged. Started before the shards, stopped after them.
+    let log_writer = slates_machine::log::LogWriter::start().map_err(|error| {
+      ServerError::Ipc(slates_ipc::IpcError::OsRefused {
+        call: "spawn the log writer thread",
+        code: error.raw_os_error(),
+      })
+    })?;
     // The control shard first, in start order (`shards.first()`): sized for every forward its lane admits.
     let runtime = Runtime::start_sized(&config.runtime, &[config.control_shard_capacity().get()])?;
     let shards: Vec<ShardId> = runtime.shard_ids().to_vec();
@@ -864,7 +875,12 @@ impl Daemon {
       let learning = Some(gate.learning());
       #[cfg(windows)]
       let learning = ();
+      let log_route = log_writer.route();
       runtime.spawn_on(*shard, async move {
+        // Before anything this shard logs: its lines go to the daemon's log writer from here on (A-305).
+        if let Some(route) = log_route {
+          route.install();
+        }
         // This daemon's learning gate is entered on the shard's own thread before its start (A-227).
         #[cfg(unix)]
         gate.enter();
@@ -968,6 +984,7 @@ impl Daemon {
       segment,
       doorbell,
       watchdog: Some(watchdog),
+      log_writer: Some(log_writer),
       config,
       shards,
       nfs_port,
@@ -2726,6 +2743,19 @@ impl Daemon {
     Ok(())
   }
 
+  /// Test support: the quantum the record period's seal walk turns are cut by on every shard (`fleet::seal_walk_slice`),
+  /// in place of the shard's own step quantum; `None` gives the shard its own back. Zero ends each turn after one volume,
+  /// so a test sees the slicing whatever the machine's speed. Delivered like [`Self::inject_live_period_quantum`]; `Ok`
+  /// once installed, else the typed refusal.
+  pub fn inject_seal_walk_quantum(&self, quantum_ns: Option<u64>) -> Result<(), ObserveError> {
+    for shard in self.shards.iter().copied() {
+      self.observe(Some(shard), move |s| {
+        s.seal_walk_quantum_ns = quantum_ns;
+      })?;
+    }
+    Ok(())
+  }
+
   /// Test support: while `withhold` is set, this node's record serve side holds each live-state reply (a takeover's
   /// report or log fetch) after its request arrived, and answers everything else, probes included, as usual: a holder
   /// alive and in contact whose answer to a takeover misses the asker's budget. Delivered like
@@ -3121,6 +3151,18 @@ impl Daemon {
     })
   }
 
+  /// Test support: leaves unanswered every takeover page and question by name this node, as a holder, is asked by one of
+  /// `askers` (§4.8 phase one; counted `fleet.takeover.silenced_by_fault`), while it answers everything else on the same
+  /// sessions: a holder cut off from one successor alone, which the council never retires since every other member hears
+  /// it. Replaces any earlier set; an empty `askers` restores full service. Delivered like
+  /// [`Self::inject_serve_delay`]; `Ok` once installed, else the typed refusal.
+  pub fn inject_takeover_silence(&self, askers: &[slates_db::HostId]) -> Result<(), ObserveError> {
+    let askers: std::collections::BTreeSet<slates_db::HostId> = askers.iter().copied().collect();
+    self.observe(self.shards.first().copied(), move |s| {
+      s.injected_takeover_silence = askers;
+    })
+  }
+
   /// The owner's sealed manifest for `object` once its content has placed on its holders (§4.10), read on the shard
   /// that owns it; `Ok(None)` before then or when this node does not own it. A test or an operator reads it to follow
   /// a seal before its head ships.
@@ -3160,6 +3202,28 @@ impl Daemon {
       }
     }
     Ok(())
+  }
+
+  /// Test support: while `anchor` is set, this node's owner shards deliver no pair key to the node at that stable anchor,
+  /// as a delivery whose recipient answer never comes back fails each period (`fleet.seal.pair_recipient_unknown`);
+  /// every other delivery goes on and no pair delivered is forgotten (unlike [`Self::inject_pair_withhold`]), so a
+  /// node replaced at that anchor never receives this node's pairs while the rest of the fleet does. `None` lifts it.
+  /// `Ok` once installed on the control shard, where deliveries are made.
+  pub fn inject_pair_withhold_to(&self, anchor: Option<u64>) -> Result<(), ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      s.injected_pair_withhold_to = anchor;
+    })
+  }
+
+  /// Test support: the position of the newest entry of the live log this node holds for `object` as a candidate
+  /// (A-200), or `None` while it holds none; read on the control shard, where held logs live.
+  pub fn fleet_live_held(
+    &self,
+    object: slates_db::register::ObjectId,
+  ) -> Result<Option<u64>, ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      crate::live_ship::held_position(s, object)
+    })
   }
 
   /// Test support: makes each of this node's campaigns count the record sessions of `voters` as out of their
@@ -3374,6 +3438,15 @@ impl Daemon {
       .map(|watchdog| watchdog.turns().read())
   }
 
+  /// The CPU one poll may run without a step before the watchdog judges its shard spinning: the liveness budget held to
+  /// this build (A-318, [`crate::watchdog::spin_window_ns`]). `None` once the daemon has stopped its watchdog.
+  pub fn spin_window_ns(&self) -> Option<u64> {
+    self
+      .watchdog
+      .as_ref()
+      .map(crate::watchdog::Watchdog::spin_window_ns)
+  }
+
   /// The shards.
   pub fn shards(&self) -> &[ShardId] {
     &self.shards
@@ -3420,6 +3493,12 @@ impl Daemon {
     // Last, so a draining daemon still beats while its shards step (A-228).
     if let Some(mut watchdog) = self.watchdog.take() {
       watchdog.stop();
+    }
+    // After the shards, whose ended threads let their routes go, so the writer has every line they queued. A shard that
+    // never ended still holds its route, and a standard error that takes nothing holds the writer: it is waited for a
+    // window, then left to the process's end, never waited for without end.
+    if let Some(mut log_writer) = self.log_writer.take() {
+      log_writer.stop(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS));
     }
   }
 }
@@ -3850,6 +3929,12 @@ async fn init_shard(
     Option<std::os::windows::io::OwnedHandle>,
   ),
 ) -> Result<crate::recovery_slices::SliceReport, ServerError> {
+  // The carrier of what this shard sends other shards whose control channels are full (§4.3, `xshard::carrier`):
+  // first, so nothing the shard sends is ever without it. Refused, the shard serves nothing: a typed initialization
+  // failure, as a refused serve loop is below.
+  futures::spawn(crate::xshard::carrier(config.kept_bound().get()))
+    .and_then(futures::detach)
+    .map_err(ServerError::Runtime)?;
   let mut slices = crate::recovery_slices::RecoverySlices::begin(config.copy_slice_ns());
   let (handoff, len) = handoff_of(env)?;
   let mut segment = AnchorSegment::attach(&handoff, len, identity)?;
@@ -4133,6 +4218,8 @@ async fn init_shard(
     demuxes: Vec::new(),
     holder_records: crate::tracked::Tracked::default(),
     live: crate::live_ship::LiveState::default(),
+    taken_over: std::collections::BTreeMap::new(),
+    seal_walk_quantum_ns: None,
     host_takeovers: std::collections::BTreeMap::new(),
     config_refresh_wanted: false,
     council_learner_pace: crate::fleet::LearnerPace::default(),
@@ -4149,11 +4236,13 @@ async fn init_shard(
     injected_serve_delay_ns: None,
     injected_content_ack_delay_ns: None,
     injected_forward_silence: None,
+    injected_takeover_silence: std::collections::BTreeSet::new(),
     injected_deaf_session: None,
     injected_discovery_hold: None,
     dead_session_dropped_at: std::collections::BTreeMap::new(),
     dead_session_recovered_ns: None,
     injected_pair_withhold: false,
+    injected_pair_withhold_to: None,
     served_sessions: std::collections::BTreeMap::new(),
     campaign_session_hold: None,
     record_refused_from: std::collections::BTreeSet::new(),
@@ -6088,7 +6177,8 @@ mod limits {
 
 #[cfg(test)]
 pub(crate) use tests::{
-  audit_daemon, audit_on_shard, audit_on_shard_configured, observe_first, test_profile,
+  audit_daemon, audit_daemon_configured, audit_on_shard, audit_on_shard_configured, observe_first,
+  test_profile,
 };
 
 #[cfg(test)]
@@ -6268,6 +6358,14 @@ mod tests {
   /// A running one-shard audit daemon, bootstrapped, for a test whose work outlives one observation (a task it spawns
   /// that must still run after the observation returns); the test stops it.
   pub(crate) fn audit_daemon() -> super::Daemon {
+    audit_daemon_configured(|_| {})
+  }
+
+  /// [`audit_daemon`] with its derived configuration changed by `configure` before it starts, as
+  /// [`audit_on_shard_configured`] changes an audit's: a test that must reach a derived bound shrinks what derives it.
+  pub(crate) fn audit_daemon_configured(
+    configure: impl FnOnce(&mut crate::DaemonConfig),
+  ) -> super::Daemon {
     let profile = test_profile();
     static NEXT_KEPT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let instance = format!(
@@ -6275,7 +6373,8 @@ mod tests {
       std::process::id(),
       NEXT_KEPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
-    let config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    configure(&mut config);
     audit_daemon_with(&profile, config, instance)
   }
 

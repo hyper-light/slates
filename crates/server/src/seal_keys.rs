@@ -142,6 +142,9 @@ pub enum SealKeyError {
   Seal(hyper_seal::SealError),
   /// A new key's record could not be made durable; the partition was rolled back and the key is not used.
   Record,
+  /// A key handed over that the volume's sealing gives no way to check (it carries no naming record): refused, never
+  /// kept unchecked (A-295).
+  Unchecked,
 }
 
 impl From<hyper_seal::SealError> for SealKeyError {
@@ -657,14 +660,15 @@ pub fn head_sealing(
   })
 }
 
-/// A successor's lineage key for a taken-over volume (A-92 piece 4c), on its control shard: its own entry in the head's
-/// `sealing`, unwrapped under the pair key the owner's shard delivered to this node, then wrapped under this node's root
-/// for the owner shard of the volume here (a 61-byte record, never the key's bytes, crosses the shards). `None` when the
-/// head names no entry for this node (it acknowledged the head before its pair arrived) or the pair is unrecorded.
-pub fn successor_lineage(
+/// This node's own entry in a head's `sealing`, unwrapped under the pair key the owner's shard delivered to this node:
+/// the volume's lineage key, on the control shard, which holds the pair keys. `None` when the head names no entry for
+/// this node's anchor (it acknowledged the head before its pair arrived) or the pair the entry names is unrecorded here.
+/// It never leaves the shard in the clear: [`successor_lineage`] wraps it under the root, [`hand_lineage`] to a
+/// successor's recipient key.
+fn own_lineage_secret(
   state: &crate::state::ShardState,
   sealing: &crate::head::HeadSealing,
-) -> Option<([u8; 16], Vec<u8>)> {
+) -> Option<Secret32> {
   let own = sealing
     .keys
     .iter()
@@ -690,9 +694,63 @@ pub fn successor_lineage(
     }
   };
   let pair = pair_key(state, owner).ok()?;
-  let secret = pair.unwrap(&wrapped).ok()?;
+  pair.unwrap(&wrapped).ok()
+}
+
+/// A successor's lineage key for a taken-over volume (A-92 piece 4c), on its control shard: its own entry in the head's
+/// `sealing` ([`own_lineage_secret`]), wrapped under this node's root for the owner shard of the volume here (a 61-byte
+/// record, never the key's bytes, crosses the shards). `None` when it holds no entry or pair for the volume; the key a
+/// fellow candidate hands over then stands in ([`accept_handed_lineage`], A-295).
+pub fn successor_lineage(
+  state: &crate::state::ShardState,
+  sealing: &crate::head::HeadSealing,
+) -> Option<([u8; 16], Vec<u8>)> {
+  let secret = own_lineage_secret(state, sealing)?;
   let root = state.seal_root.as_ref()?;
   Some((sealing.lineage, root.wrap(&secret).ok()?.encode().to_vec()))
+}
+
+/// A volume's lineage key handed to its successor (A-295), on a fellow candidate's control shard: this node's own entry
+/// in its own copy of the volume's `sealing` ([`own_lineage_secret`]), wrapped to the successor's recipient key as a
+/// pair is (hyper-seal `docs/seal.md` §6, "a hand-off to a successor": ML-KEM-1024 with P-384, about 1.7 KB, once a
+/// takeover). The caller has established that the asker acts for the volume and that `successor` is the recipient key it
+/// keeps for that member. `None` when this node holds no entry or pair for the volume.
+pub fn hand_lineage(
+  state: &crate::state::ShardState,
+  sealing: &crate::head::HeadSealing,
+  successor: &hyper_seal::recipient::RecipientPublic,
+) -> Option<Vec<u8>> {
+  let secret = own_lineage_secret(state, sealing)?;
+  hyper_seal::recipient::wrap_to(
+    successor,
+    hyper_seal::recipient::Mode::Hybrid,
+    KeyId(sealing.lineage),
+    &secret,
+  )
+  .ok()
+}
+
+/// A lineage key a fellow candidate handed this node as the volume's successor (A-295), on its control shard: opened
+/// with this node's recipient key, then checked against the `sealing` it is for before it is kept. The volume's naming
+/// key, which the owner wrapped under the lineage key (`HeadNaming`), must open under it (key wrap's integrity check: a
+/// forgery passes once in 2^64), so a wrong key is refused here rather than taken for the volume's. Returned as
+/// [`successor_lineage`] returns a key, wrapped under this node's root.
+pub fn accept_handed_lineage(
+  state: &crate::state::ShardState,
+  sealing: &crate::head::HeadSealing,
+  delivery: &[u8],
+) -> Result<([u8; 16], Vec<u8>), SealKeyError> {
+  let naming = sealing.naming.as_ref().ok_or(SealKeyError::Unchecked)?;
+  let recipient = state
+    .seal_recipient
+    .as_ref()
+    .ok_or(SealKeyError::Unavailable)?;
+  let root = state.seal_root.as_ref().ok_or(SealKeyError::Unavailable)?;
+  let secret = recipient.unwrap(KeyId(sealing.lineage), delivery)?;
+  let kept = root.wrap(&secret)?.encode().to_vec();
+  let lineage = WrappingKey::new(KeyId(sealing.lineage), KEY_GENERATION, secret);
+  lineage.unwrap(&hyper_seal::keys::Wrapped::decode(&naming.wrapped)?)?;
+  Ok((sealing.lineage, kept))
 }
 
 /// Records a taken-over volume's lineage key on its new owner shard (A-92 piece 4c): `wrapped` (the key under this node's

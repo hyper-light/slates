@@ -55,8 +55,10 @@
 //! Rows: `offered\t<n>\t…` (above); `latency\t<n>\t<kind>\t<count>\t<p50>\t<p99>\t<p999>\t<max>` in nanoseconds, each
 //! attempt timed alone; then `operation\t…` in the same columns, each logical operation from its first attempt to its
 //! answer, refusals for now and resends included; then `oracle\t<n>\t…` lines; a nonzero `oracle_failures` exits 1;
-//! then `bound\t<n>\t…` (above). Last, `lost\t<counter>\t<count>` for each of the daemon's counters of a lost reply or
-//! ask.
+//! then `bound\t<n>\t…` (above). Last, from the daemon's own report: `lost\t<counter>\t<count>` for each of its
+//! counters of a lost reply, result, release or ask; `room\t<counter>\t<count>` for its waits for room (begun and
+//! ended, summed over the shards, and the most one shard held at once, goal 238); and `counter\t<counter>\t<count>` for
+//! where a work's submissions were composed.
 // Bench harness code: an unwrap here is a failed run.
 #![allow(
   clippy::unwrap_used,
@@ -1990,44 +1992,56 @@ fn arg(name: &str) -> Option<String> {
   args.find(|a| a == name).and_then(|_| args.next())
 }
 
-/// Format: the daemon's counters of a reply or an ask that was lost or refused for want of room, read at the end of a
-/// run: `lost\t<counter>\t<count>`, all shards summed, a zero printed too. A lost reply leaves its client waiting out
-/// its whole reply deadline, so a run's latencies alone do not show one.
-const LOSS_COUNTERS: [&str; 7] = [
+/// Format: the daemon's counters of a reply, a result, a release or an ask that was lost or refused for want of room, read
+/// at the end of a run: `lost\t<counter>\t<count>`, all shards summed, a zero printed too. Since A-232 a client waits
+/// for a lost reply while its daemon lives, so a run's latencies alone do not show one (goal 238: about 4,200
+/// `xshard.reply_dropped` a run of the 3,000-client rung on main before the carrier).
+const LOSS_COUNTERS: [&str; 15] = [
   "xshard.reply_dropped",
+  "xshard.keep_refused",
+  "xshard.unstarted_unanswered",
+  "ack.release_refused",
+  "fuse.reply_undelivered",
+  "image.reply_undelivered",
+  "landing.reply_undelivered",
   "lease.wait.undelivered",
+  "fleet.live.undelivered",
   "merge.acceptance_undelivered",
+  "winfsp.reply_undelivered",
   "merge.work.ask_unanswered",
   "merge.work.park_full",
   "merge.work.pending_stuck",
   "merge.work.floor_not_sent",
 ];
 
-/// Prints [`LOSS_COUNTERS`] from the daemon's own report.
+/// Prints [`LOSS_COUNTERS`], the daemon's waits for room (`room\t<counter>\t<count>`: begun and ended summed over the
+/// shards, and the most any one shard held at once) and where a work's submissions were composed
+/// (`counter\t<counter>\t<count>`), from the daemon's own report.
 fn report_losses(client: &mut Client) {
   let report = client.daemon_status().unwrap();
+  let per_shard = |name: &'static str| {
+    report.shards.iter().map(move |shard| {
+      shard
+        .refusals
+        .iter()
+        .filter(|refusal| refusal.kind == name)
+        .map(|refusal| refusal.count)
+        .sum::<u64>()
+    })
+  };
   for name in LOSS_COUNTERS {
-    let count: u64 = report
-      .shards
-      .iter()
-      .flat_map(|shard| shard.refusals.iter())
-      .filter(|refusal| refusal.kind == name)
-      .map(|refusal| refusal.count)
-      .sum();
-    println!("lost\t{name}\t{count}");
+    println!("lost\t{name}\t{}", per_shard(name).sum::<u64>());
   }
+  for name in ["xshard.room_waits_started", "xshard.room_waits_ended"] {
+    println!("room\t{name}\t{}", per_shard(name).sum::<u64>());
+  }
+  let peak = per_shard("xshard.room_waits_peak").max().unwrap_or(0);
+  println!("room\txshard.room_waits_peak\t{peak}");
   for name in [
     "merge.work.composed_on_work",
     "merge.work.composed_by_owner",
   ] {
-    let count: u64 = report
-      .shards
-      .iter()
-      .flat_map(|shard| shard.refusals.iter())
-      .filter(|refusal| refusal.kind == name)
-      .map(|refusal| refusal.count)
-      .sum();
-    println!("counter\t{name}\t{count}");
+    println!("counter\t{name}\t{}", per_shard(name).sum::<u64>());
   }
 }
 
