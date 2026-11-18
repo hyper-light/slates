@@ -2545,6 +2545,20 @@
 > - a rebuild over a long chain recomputes every version the holder accepted (300,000 at the 100,000-client rung's three
 >   rounds), since the holder keeps no checkpoint of its replica; the holder's growth per version is A-238's owed item.
 >
+> **Fixed 2026-11-18 (g232, A-367): every version re-published every version its holders kept.** A held register was
+> one piece holding every position its acceptor kept (A-270), and a green's register on its holders is a ledger, never
+> compacted; a holder publishes before it acknowledges each version, so each version's publication re-encoded and
+> re-wrote the holder's whole ledger, and a commit at `f > 0` grew by a position a version (Mac Studio, debug build:
+> `a_submit_late_in_a_greens_history_is_answered_as_fast_as_an_early_one`'s late medians 4.3 to 7.1 ms against early
+> 1.9 to 3.6 ms over 300 versions; at the goal's 300,000 versions about 60 MB a version on each replica). Now a register
+> is a head piece and a piece per accepted position, and a delta carries the positions a holder's acceptor accepted or
+> dropped since its last committed publication (`Acceptor::tracking_changes`; image version 29). Test:
+> `a_holders_publication_carries_the_position_it_acknowledges_not_the_whole_ledger` (`crates/server/tests/recovery.rs`):
+> on main's code a delta carried 2,165 bytes at the second of 64 positions and 67,885 at the last; now one size each
+> (kiln r3432, Mac Studio). The timing test's late medians stayed 4.4 to 6.4 ms against early 2.0 to 2.4 ms, so the rest
+> of the growth is elsewhere; still open, the same growth in the content's bytes: the content hold's image is one piece, every manifest and chunk a
+> holder keeps, recomputed and compared at each publication and re-put whole when it changed, which is every version.
+>
 > **Fixed 2026-11-18 (g232, A-333): losing the primary of a kernel-sized green lost the green.** The takeover successor
 > rebuilt the green beside the ledger it holds as one of the green's holders: version 0's inputs and every increment's
 > restored whole and every accepted record decoded in one poll, then the origin's bytes and every increment recorded
@@ -4070,33 +4084,45 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 >     step is its own kiln command with 1-2 s of dispatch, so on a quiet pair most of a phase is kiln's: g066b and
 >     g066c took 47 and 45 s in all. The record sessions' smoothed round trip ran from 17 ms (adacachy at load 34) to
 >     724 ms (at load 122.6), with probe timeouts up to 3.3 s.
->   - **Open: one forwarded verb refused `OwnerUnreachable { region: 0 }` (run g066d, about 15:00 UTC, server on
->     adacachy at 1750).** The client's `work` was refused about 125 s after the root group formed, after the client's
->     first read of the same green had answered. At the refusal the client node held configuration version 0 with no
->     members while the server held version 1 with both, each node had replaced its record session after a loss 15
->     (client) and 17 (server) times, and both had a probe session. Its identities phase took 27.7 s (2.8 to 20.6 s in
->     the other runs), so a machine or the path was slow then. It did not recur in the 8 runs after it, 5 of them in
->     the same direction on the same ports. The mechanics are known: `verbs::resolve_and_forward` resends to a live
->     owner until the failover SLO (`FAILOVER_SLO_NS`, 10 s) passes and then refuses `OwnerUnreachable`, a typed
->     refusal a consumer retries; and a learner fetches the configuration only over a record session
->     (`fleet::drive_learner_fetch`). The run kept no node logs, so the cause is not known. Starvation of the server
->     is ruled out as the whole of it: with the same pair and direction (run g066s2), the server node's unit held to a
->     2% CPU quota (`systemctl --user set-property --runtime UNIT CPUQuota=2%`, cpu.max `2000 100000`) for 45 s right
->     after the root group formed and for 30 s while the client made a work, the client held configuration version 1
->     throughout, every forwarded `work` was answered within 0.5 to 8.6 s (the first made the work, the rest were
->     refused `AlreadyExists` for the experiment's repeated name), the read after the lift answered in 0.7 s, and the
->     flow landed exactly the 4 merged files. What remains is the path: the client reached adacachy over the Mac's
->     Wi-Fi, and 15 and 17 replaced sessions are re-dials after losses, so a run of losses longer than the SLO fits.
->     The program now keeps each node's last 400 log lines and its whole status on a failure. Owed under plan step 4:
->     drive the client's first configuration fetch across a link that drops everything for longer than the SLO and
->     then heals (the relay of `crates/cli/tests/live_chaos.rs`, a node bound apart from its advertised address,
->     A-277), and require the configuration and a forwarded verb back within a derived bound of the heal; a miss is a
->     learner or session defect and gets its failing test first.
+>   - **One forwarded verb refused `OwnerUnreachable { region: 0 }` (run g066d, about 15:00 UTC, server on adacachy at
+>     1750): not reproduced, and the recovery it put in doubt is now a test.** The client's `work` was refused about
+>     125 s after the root group formed, after the client's first read of the same green had answered. At the refusal
+>     the client node held configuration version 0 with no members while the server held version 1 with both, each node
+>     had replaced its record session after a loss 15 (client) and 17 (server) times, and both had a probe session. Its
+>     identities phase took 27.7 s (2.8 to 20.6 s in the other runs). It did not recur in the 8 runs after it, 5 of
+>     them in the same direction on the same ports, and the run kept no node logs (the program now keeps each node's
+>     last 400 lines and its whole status on a failure), so its cause is not known; the refusal itself is the designed
+>     one (`verbs::resolve_and_forward` resends to a live owner until the failover SLO, `FAILOVER_SLO_NS`, 10 s, then
+>     refuses `OwnerUnreachable`, which a consumer retries). Two causes are ruled out:
+>     - Starvation of the server (run g066s2, the same pair and direction): the server node's unit held to a 2% CPU
+>       quota (`systemctl --user set-property --runtime UNIT CPUQuota=2%`) for 45 s right after the root group formed
+>       and for 30 s while the client made a work; the client held configuration version 1 throughout, every forwarded
+>       `work` was answered within 0.5 to 8.6 s, the read after the lift in 0.7 s, and the flow landed exactly the 4
+>       merged files.
+>     - A link down past the failover delay as the root forms:
+>       `a_client_node_cut_off_as_the_root_forms_is_configured_and_forwards_within_its_bound_once_the_link_heals`
+>       (`crates/cli/tests/fs_server.rs`) puts every datagram between the two nodes through `live_chaos.rs`'s relay
+>       (A-277), cuts it both ways before the server bootstraps the root alone, makes and shares the green while cut,
+>       holds the cut 10.9 s (the failover SLO plus a membership horizon) and heals it. The client then held a
+>       configuration naming both nodes and answered a forwarded read within a bound derived from its own estimates
+>       before the cut (the handshake's initial probe timeout, RFC 9002 §6.2.2; four of the session's probe timeouts;
+>       the detector's verdict for the pair, expected arrival plus margin; two coordinator periods; a membership
+>       horizon). Forwarded read answered 0.25 to 1.53 s after the heal against bounds of 1.82 to 3.37 s: 13 of 13 on
+>       Adas-Mac-Studio (macOS arm64, load 9 to 18) and 18 of 18 on GitHub's ubuntu x86_64 and arm64 runners (diag
+>       runs 44342202455, 44342920360 and, merged with main, 44344637800), with 53 to 11,611 datagrams dropped each
+>       way at the relay.
+>     What remains for g066d is the path itself: the client reached adacachy over the Mac's Wi-Fi. Seen in 2 of those
+>     runs and passed to g255 (forward-lane budgets): right after the heal a forward lane's floor read 175 s, past the
+>     10 s SLO, from a probe timeout of 24.9 s, about 64 times the session's live one, as if still backed off by the
+>     outage (a hypothesis; no log of the backoff count).
 >   - Gotcha: a transient unit's service manager substitutes `${NAME}` anywhere in its command (systemd.service(5),
 >     "Command lines"; systemd 262), so the first run's `"${f#./}"` reached bash empty and its disk read lost every
 >     path while the flow itself passed; the program passes every `$` as `$$`.
-> - **Remote attach is owed (§4.10):** another node's `attach` is refused `NotFound`, so a client on another node
->   pushes through a green, never through a write attachment.
+> - **Remote attach for writing is done (§4.10; A-222, 2026-11-05).** Another node's `slates attach ID --write`
+>   attaches the owner's volume in the record form and `slates write` writes through it
+>   (`a_client_node_attaches_a_server_volume_for_writing_and_writes_through_it` in `fs_server.rs`, and the A-222
+>   entry above); the two-machine flow still pushes through a green, as an agent's work does. Open, as A-222 records:
+>   ownership migration to a writer that stays, and the read-only remote attach of a snapshot.
 > - **A self-signed fleet certificate must be a leaf.** OpenSSL's default (`CA:TRUE`) is refused
 >   `CaUsedAsEndEntity`; the manifest's documentation does not say so.
 
