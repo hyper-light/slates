@@ -79,16 +79,31 @@
 > - losing the green's owner twice needs the ledger-prefix transfer (GAP-A9-7);
 > - the cross-region case is not yet tested;
 > - the 0.35 ms could be overlapped by a pipelined dispatch;
-> - **the route has no end for a work whose owner died, a store with no bound (CLAUDE.md §2 item 8).** Only a volume's
->   owner writes its tombstone, and a work never comes back to have one, so nothing retires its catalog record. The
->   adopter keeps it placed (`fleet::owed_adopted_work_catalogs`, which scans every adopted work catalog each record
->   period), its holders keep it in `holder_records`, and `pending_catalogs` drops an entry only at a materialization or
->   a tombstone, neither of which comes for a work. Every work alive when its owner dies is held so for as long as the
->   fleet runs. Found by reading on 2026-11-17, in the sibling sweep after A-255 landed; no test shows it yet. How the
->   route should end is a decision for Ada. One option: the adopter retires the record once the green's owner holds no
->   completion of the work's submits, which needs the work's id in the merge record beside the request key. The other:
->   a cap per adopter, derived from the fleet's outstanding-completion capacity, which retires the oldest record first,
->   and a resend past it is refused `NotFound`.
+> - ~~the route has no end for a work whose owner died, a store with no bound (CLAUDE.md §2 item 8)~~: **ended
+>   (2026-11-17, A-288).** Nothing retired a work's catalog record: only a volume's owner writes its tombstone, and a
+>   work never comes back, so every work alive at an owner's death was held, by its adopter and every holder, for as
+>   long as the fleet ran. Now the route is kept only while the green's owner holds a completion of the work's submits
+>   that the route can reach, one a client on another node than the work's owner made and has not acknowledged. A
+>   client of the owner's own node resends to that node, never through the route. The merge record (format 2) and
+>   chain entry (version 3) name such a submit's work, and the successor records the completion under it
+>   (`CompletionRecord::work`, `Partition::completions_routed_by`). The route's adopter asks the green's owner each
+>   period (`crate::work_route`, fleet stream 25), and a route answered "none" closes through the destroy's two
+>   tombstone stages. The owner also drops its own takeover copies when a tombstone retires, which a destroyed
+>   taken-over volume had kept too. Red first: on main 7c6faee27 the route was still held by both survivors after the
+>   acknowledgement (`retired false, counted 0`, 429 s on a loaded Mac).
+>   `a_works_route_ends_once_the_greens_owner_holds_none_of_its_completions` now also holds a work its own owner's
+>   client submitted from, retired with nothing acknowledged. Green on the same Mac (macOS arm64, debug, load 11 to
+>   37): both routes retired on both survivors, counted twice, in 6.91 s. Still held, A-288's open list:
+>   - a route to a green destroyed, or lost to a second takeover it cannot survive (GAP-A9-7), while the route is
+>     kept: the green has no owner to answer;
+>   - a route whose completion its client never acknowledges (a client of another node that died, or one that never
+>     writes to the green again), as the completion record itself is: only an acknowledgement or a client lease ends
+>     either, and RIFL's client leases are not built;
+>   - a route kept by an adopter that restarts warm. Its holder copies come back with it, but the routes it kept
+>     (`pending_catalogs`) do not, so it neither re-places nor retires them. This is A-255's own gap, found by reading
+>     on 2026-11-17; no test shows it yet.
+>
+>   `docs/bugs/2026-11-17-a-works-route-was-never-retired.md`.
 >
 > `docs/bugs/2026-11-09-a-submit-resent-after-its-greens-takeover-was-never-answered-its-version.md`.
 

@@ -978,8 +978,11 @@ pub struct ShardState {
   pub pending_green_materializations: BTreeMap<ObjectId, crate::merge_service::MergeRecordValue>,
   /// Taken-over volumes whose register this node adopted as a **tombstone** (AUD-29-43), with the tombstone's
   /// sequence: awaiting `Op::TombstoneAdopted` on the shard the id routes to, from where the record plane
-  /// ships the tombstone's remaining stages. Never materialized. Bounded by the objects this node owns.
+  /// ships the tombstone's remaining stages. Never materialized. Bounded by the objects this node owns. A work whose
+  /// route this node retired joins them (A-288, `crate::work_route`).
   pub pending_tombstones: BTreeMap<ObjectId, u64>,
+  /// On the control shard: the work route keeper's nudge and waker (A-288, `crate::work_route`).
+  pub(crate) work_routes: crate::work_route::WorkRoutes,
 }
 
 /// A work volume's accumulated declared operations (§4.16), composed into an increment on submit.

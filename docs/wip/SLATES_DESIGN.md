@@ -5957,6 +5957,13 @@ failure.
 > that catalog is committed, and the record plane ships the catalog at the work's creation. A merge record carries
 > format version 1; another version is refused typed.
 
+> **Status (2026-11-17, A-288: a work's route ends).** The route is kept only while the green's owner holds a completion
+> it can reach: a submit forwarded from another node than the work's owner, not yet acknowledged. The merge record
+> (format 2) and chain entry (version 3) name such a submit's work. The successor records the completion under it, and
+> the route's adopter asks the green's owner each period and retires the route through the destroy's tombstone stages
+> once none is held. Still held: a route to a green destroyed or lost while it is kept, one whose completion is never
+> acknowledged, and one its adopter kept across a warm restart (GAPS).
+
 > **Status (2026-11-07, A-245: an acknowledgement names the ids still owed).** A watermark is contiguous, so one held or
 > slow request kept every later completion of its client: the owner pruned none of them, and past `2 × slots` refused
 > the client's next requests `AcknowledgementOwed`. At `f = 1`, where nearly every slow submit is held, that was the
@@ -16342,9 +16349,69 @@ Applied in the same change to:
 - **Open.**
   - A second loss of the green's owner needs the ledger-prefix transfer (GAP-A9-7).
   - The cross-region case is owed a test.
-  - The route has no end for a work whose owner died. Only a volume's owner writes its tombstone, and a work never
-    comes back, so its adopted catalog record is kept placed for as long as the fleet runs: a store with no bound,
-    which CLAUDE.md §2 bans. How it should end is reserved for Ada (GAPS, A-255's entry, 2026-11-17).
+  - ~~The route has no end for a work whose owner died~~: ended by A-288 (2026-11-17). A route is kept while the
+    green's owner holds a completion only the route can reach, then its adopter retires it.
+
+### A-288 — A work's route ends once its green's owner holds no completion the route can reach (accepted and built 2026-11-17; amends A-255; the supervisor's option A)
+
+Applied in the same change to:
+- `crates/merge`: `chain_entry` version 3: a completion names its submitting work when the client was on another node.
+- `crates/db`: `CompletionRecord::work` (appended); `Partition::completions_routed_by`, kept beside the windows and
+  released by the acknowledgement that releases the completion.
+- `crates/anchor`: `LAYOUT_VERSION` 8.
+- `crates/server`:
+  - `MergeRecordValue` format 2 (`SubmitCompletion::work`); `record_taken_over_completions` records the work;
+  - `work_route` (the keeper, its question on fleet stream 25, and the retirement);
+  - `takeover::record_adoption` wakes the keeper, and `forget_owner_on_every_shard`;
+  - `fleet::retire_shard_tombstones` drops the owner's own copies of a retired object's registers.
+- The test `a_works_route_ends_once_the_greens_owner_holds_none_of_its_completions` (red on main 7c6faee27: retired
+  false, counted 0), §4.16's status, GAPS, and `docs/bugs/2026-11-17-a-works-route-was-never-retired.md`.
+
+- **What was there.** A-255 made a work's catalog record, which names its green, the route a resend of its submit
+  takes after the work's owner is taken over. Its adopter keeps it placed (`fleet::owed_adopted_work_catalogs`). Nothing
+  ever retired it: only a volume's owner writes its tombstone, and a work never comes back to have one. Every work alive
+  at an owner's death was held by its adopter and every holder for as long as the fleet ran, a store with no bound
+  (CLAUDE.md §2 item 8).
+- **The rule.**
+  - A route is kept exactly while the green's owner retains a completion that a resend can reach only through it.
+    RIFL keeps a completion until its client acknowledges it, and moves it with its object (Lee et al., SOSP 2015, §3),
+    so the route lives as long as those records.
+  - Only a client on another node than the work's owner reaches its completion through the route. A client of the
+    owner's own node resends to that node, which answers from the records it made, since its partition still holds the
+    work. If the node is gone, so is the client. So a merge record names the submit's work only for a forwarded submit.
+    This is what ends the commonest route, a work its own owner's clients submitted from.
+  - The green's successor records each such completion under its work, durably (`CompletionRecord::work`). Its
+    partition counts what each work still has (`Partition::completions_routed_by`), and the acknowledgement that
+    releases the last ends the count.
+  - The route's adopter asks the green's owner every record period, for the works whose routes it keeps, whether any is
+    still held (`work_route::Question`, fleet stream 25). Only the shard that serves the green answers. A green pending
+    materialization, owned elsewhere or not found gives no answer, and the route stays.
+  - A work answered "none" moves from the adopter's pending catalogs to its pending tombstones, at sequence 1, where the
+    work's own destroy would have closed its registers. AUD-29-43's two stages then drop every holder's copy. When the
+    tombstone retires, the owner drops its own copies of both registers too: a successor had kept its takeover's
+    acceptors and its placement of an adopted catalog for good, for a destroyed taken-over volume as well.
+  - The keeper is its own task, parked while its node keeps no route, so a slow question never holds the record
+    plane's coordinator and an idle node takes no wakeup for it. A question names at most as many works as fit one
+    fleet frame (71). An owner that leaves one question unanswered is not asked its green's others that period, so a
+    pass spends at most one liveness budget on it, however many routes lead there.
+- **Rejected.**
+  - (B) A cap per adopter, the oldest route retired first. It refuses a resend that could have been answered.
+  - (C) Leaving the store unbounded.
+  - Counting every adopted completion, a local client's too. That is the literal "holds no completion", but a local
+    client's completion of a dead owner is never acknowledged. Its route would never end, for the commonest work.
+  - Judging a completion by whether the council still holds its client's node as a member. A restarted node is a new
+    member, and its old id is retired before the new one is admitted (`fleet::LearnedOutcome::Restarted`, from
+    reading). A route retired in that gap refuses a resend its surviving client is owed.
+- **Open.**
+  - A green destroyed, or lost to a second takeover it cannot survive (GAP-A9-7), while a route to it is kept leaves
+    that route held: the green has no owner to answer.
+  - A completion its client never acknowledges keeps its route, as it keeps the record itself. This covers a client of
+    another node that died, and one that never writes to the green again. Only an acknowledgement or a client lease
+    ends either, and RIFL's client leases are not built.
+  - An adopter that restarts warm gets its holder copies back but not the routes it kept (`pending_catalogs`), so it
+    neither re-places nor retires them. This is A-255's own gap, found by reading; no test shows it yet.
+- **Wire.** A merge record of format 1 and a chain entry of version 2 are refused typed. An older segment is refused at
+  layout 8. A peer of an older build does not answer the route's question, which it does not know, so the route stays.
 
 ### A-254 — The owner of an instance is decided before anything is created (accepted 2026-11-08)
 Applied in the same change to: §4.7 (the rendezvous's status), GAPS, `crates/cli/src/anchor.rs` (`run`),

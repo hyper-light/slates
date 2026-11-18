@@ -145,6 +145,7 @@ fn recorded_create(db: &mut Db, segment: &mut AnchorSegment, n: u64, name: &str)
         client: CLIENT,
         sequence: sequence_of(n),
         result: name.as_bytes().to_vec(),
+        work: None,
       },
     },
     NOW_NS,

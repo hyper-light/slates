@@ -276,6 +276,24 @@ fn stale_after_confirmation(
       .is_some_and(|placement| !placement.place(object).candidates.contains(&local))
 }
 
+/// Forgets `object`'s owner in this shard's routing and in every other shard's: the end [`track_owner_on_every_shard`]
+/// owes once the object's registers are retired (AUD-29-43), or every shard but this one kept the entry for good. A shard
+/// the message does not reach is counted (`xshard.run_refused`).
+pub(crate) fn forget_owner_on_every_shard(state: &mut ShardState, object: ObjectId) {
+  state.fleet.forget_object(object);
+  let origin = state.shard;
+  for shard in state
+    .shards
+    .iter()
+    .copied()
+    .filter(|shard| *shard != origin)
+  {
+    crate::xshard::run_on_counted(origin, shard, move |s| {
+      s.fleet.forget_object(object);
+    });
+  }
+}
+
 /// Drops this holder's copy of `object`: its acceptor, its routing entry, its lease-gate record, a green's
 /// replica, and the content it held for the object (AUD-29-43: a stale copy's bytes are reclaimed with its
 /// records, never kept for a head this holder no longer backs). Counted [`TAKEOVER_RECLAIMED`].
@@ -1183,15 +1201,20 @@ fn record_adoption(
   }
   if object.is_catalog() {
     // A volume's catalog register: its successor rebuilds the volume under it (AUD-29-17) — unless the
-    // volume's own register was adopted as a tombstone (AUD-29-43): a destroyed volume is not rebuilt.
+    // volume's own register was adopted as a tombstone (AUD-29-43): a destroyed volume is not rebuilt. A work's catalog
+    // is the route a resend of its submits takes (A-255), which the route keeper ends once nothing can use it (A-288).
     if let Some(catalog) = crate::catalog::CatalogValue::from_record_bytes(&record.value)
       && !state
         .pending_tombstones
         .contains_key(&object.placement_key())
     {
+      let route = catalog.work_of.is_some();
       state
         .pending_catalogs
         .insert(object.placement_key(), (record.sequence, catalog));
+      if route {
+        crate::work_route::nudge(state);
+      }
     }
   } else if let Some(tombstone) = crate::tombstone::TombstoneValue::from_record_bytes(&record.value)
   {

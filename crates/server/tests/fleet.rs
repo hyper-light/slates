@@ -15225,6 +15225,196 @@ fn a_submit_resent_after_its_owner_was_taken_over_is_answered_its_version() {
   }
 }
 
+/// A-288, A-255's route has an end (CLAUDE.md §2 item 8): a work no member owns keeps its catalog record, the route a
+/// resend of its submit takes to the green's owner, only while the green's owner holds a completion of the work's
+/// submits that the route can reach; then the record's adopter retires it. Do: three nodes at `f = 1`; on a, a green
+/// and two works; through b's client an edit and a submit of the first, answered version 1; through a's own client an
+/// edit and a submit of the second, answered version 2; a dies and a survivor takes the green over; b's client resends
+/// under its id, answered version 1. Expect, first: no survivor holds the second work's catalog record, with no
+/// acknowledgement at all, while every survivor still holds the first's (non-vacuous: that route was placed and used):
+/// a client of the work's own owner resends to its own node, never through the route, and that node is gone. Then b's
+/// client acknowledges every reply and creates a third work of the green, whose forwarded write carries the
+/// acknowledgement to the green's owner (a local client's acknowledgement reaches every partition of its node). Expect:
+/// no survivor holds the first work's catalog record either, and the routes' adopters counted both retirements
+/// (`fleet.work_route.retired`). Before, both records were held for as long as the fleet ran: only a volume's owner
+/// writes its tombstone, and a work never comes back to have one.
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn a_works_route_ends_once_the_greens_owner_holds_none_of_its_completions() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let mut owner_client = Client::connect(daemons[0].instance());
+  let (green, work) = green_with_work(&mut owner_client, "route-ends", &daemons);
+  let mut client = Client::connect(daemons[1].instance());
+  let (routed, last) = poll_status_served(&daemons, &mut client, work, COUNCIL_RETIRE_DEADLINE);
+  let submit = RequestBody::Submit {
+    work,
+    evidence: Vec::new(),
+  };
+  if routed {
+    edit_work(&mut client, work, 0, "hello");
+  }
+  let first = routed.then(|| client.call(&submit));
+  // The second work, made and submitted by a's own client, on another file so the two versions never conflict.
+  let own_work = match owner_client.call(&RequestBody::CreateWork {
+    green,
+    name: "route-ends-own".to_owned(),
+  }) {
+    ReplyBody::WorkCreated { id, .. } => Some(id),
+    _ => None,
+  };
+  let own_submitted = own_work.map(|own_work| {
+    let edited = owner_client.call(&RequestBody::Edit {
+      work: own_work,
+      path: "g".to_owned(),
+      at: 0,
+      delete_len: 0,
+      bytes: b"own".to_vec(),
+    });
+    let submitted = owner_client.call(&RequestBody::Submit {
+      work: own_work,
+      evidence: Vec::new(),
+    });
+    (edited, submitted)
+  });
+  let (caught_up, _) = holders_before_owner_death_at(&daemons, green, 2);
+  daemons.remove(0).stop();
+  let object = ObjectId(green.bytes);
+  let successor_host =
+    rendezvous_first(&[hosts[1], hosts[2]], object).expect("a survivor takes over the green");
+  let successor_index = usize::from(successor_host != hosts[1]);
+  let catalog = ObjectId(work.bytes).catalog();
+  let own_catalog = own_work.map(|own_work| ObjectId(own_work.bytes).catalog());
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let materialized = poll_until(&survivors, PLACEMENT_DEADLINE, || {
+    daemons[successor_index].merge_record_placed(green, 2)
+  });
+  let again = resend_while_refused_retryable(&mut client, &submit);
+  // The second work's route ends with no acknowledgement; the first's is still held when it does.
+  let own_retired = own_catalog.is_some_and(|own_catalog| {
+    poll_until(&survivors, PLACEMENT_DEADLINE, || {
+      all_hold(daemons.iter().map(|daemon| {
+        daemon
+          .fleet_held_record(own_catalog)
+          .map(|held| held.is_none())
+      }))
+    })
+  });
+  let held_by_both = poll_until(&survivors, PLACEMENT_DEADLINE, || {
+    all_hold(
+      daemons
+        .iter()
+        .map(|daemon| daemon.fleet_held_record(catalog).map(|held| held.is_some())),
+    )
+  });
+  let up_to = client.sequence;
+  let acknowledged = client.call(&RequestBody::Acknowledge {
+    up_to,
+    owed: Vec::new(),
+  });
+  let third = client.call(&RequestBody::CreateWork {
+    green,
+    name: "after-the-route".to_owned(),
+  });
+  let retired = poll_until(&survivors, PLACEMENT_DEADLINE, || {
+    all_hold(
+      daemons
+        .iter()
+        .map(|daemon| daemon.fleet_held_record(catalog).map(|held| held.is_none())),
+    )
+  });
+  let counted: u64 = daemons
+    .iter()
+    .filter_map(|daemon| daemon.refusals_on_every_shard().ok())
+    .map(|counts| counts.get("fleet.work_route.retired").copied().unwrap_or(0))
+    .sum();
+  let held_at_end: Vec<_> = daemons
+    .iter()
+    .map(|daemon| daemon.fleet_held_record(catalog).map(|held| held.is_some()))
+    .collect();
+  drop(survivors);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "own work {own_work:?} {own_submitted:?}, its route retired {own_retired}; the resend was answered {again:?}; \
+     held by both survivors {held_by_both}; acknowledged {acknowledged:?}; third work {third:?}; retired {retired}, \
+     counted {counted}; held at the end {held_at_end:?}"
+  );
+  assert!(routed, "b routed the work to its owner: {last:?}");
+  assert_eq!(
+    first,
+    Some(ReplyBody::Submitted {
+      version: Some(1),
+      conflicts: Vec::new(),
+    }),
+    "the submit committed at version 1"
+  );
+  assert!(
+    matches!(
+      own_submitted,
+      Some((
+        ReplyBody::Edited,
+        ReplyBody::Submitted {
+          version: Some(2),
+          ..
+        }
+      ))
+    ),
+    "a's own client's submit of the second work committed at version 2: {own_submitted:?}"
+  );
+  assert!(
+    caught_up,
+    "both holders held version 2 before the owner died"
+  );
+  assert!(
+    materialized,
+    "the successor took the green over at version 2"
+  );
+  assert_eq!(
+    again.expect("the resend through the takeover is answered"),
+    ReplyBody::Submitted {
+      version: Some(1),
+      conflicts: Vec::new(),
+    },
+    "the route answered the resend the version it was accepted as"
+  );
+  assert!(
+    own_retired,
+    "no survivor holds the route of the work its own owner's client submitted from, with nothing acknowledged"
+  );
+  assert!(
+    held_by_both,
+    "both survivors held the first work's catalog record, the route, while its completion was held"
+  );
+  assert_eq!(acknowledged, ReplyBody::Acknowledged, "the acknowledgement");
+  assert!(
+    matches!(third, ReplyBody::WorkCreated { .. }),
+    "the third work, whose forwarded write carries the acknowledgement: {third:?}"
+  );
+  assert!(
+    retired,
+    "no survivor holds the first work's catalog record once the green's owner holds none of its completions: \
+     {held_at_end:?}"
+  );
+  assert!(
+    counted >= 2,
+    "the routes' adopters counted both retirements: {counted}"
+  );
+}
+
 /// AC (§4.8 "Leases and reads"; AUD-08): in a three-node `f = 1` fleet a green advances three versions on
 /// its owner, then the owner is **isolated** on the probe plane (both directions) — it is not stopped, its
 /// client connection stays open. Its owner lease lapses by the host clock (measured across a scheduling
