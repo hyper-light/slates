@@ -957,6 +957,11 @@ pub struct ShardState {
   pub(crate) learner_fetch: crate::fleet::LearnerFetchLog,
   /// When an uninitialized root learner fetches next, and the wait after it.
   pub(crate) root_learner_pace: crate::fleet::LearnerPace,
+  /// On the control shard: the newest root configuration version a peer showed this node it holds, past the one this
+  /// node holds, and that peer (§4.8 Lookup, D-14 learners, A-489): a location query is bound to its asker's root view,
+  /// so one bound to a newer view than this node's says this node is behind and who is not. The root learner's next
+  /// period fetches from that peer and takes it (`fleet::root_learner_fetch`). One entry, the newest version seen.
+  pub(crate) root_newer_seen: Option<(u64, slates_db::register::HostId)>,
   /// This node's client record sessions to its candidate holder peers (§4.8), keyed by peer host: each
   /// per-peer link task (`crate::fleet::establish_record_link`) brings its session up on one socket and
   /// installs it here as `Some`; the record-plane coordinator borrows a session for each dispatch — leaving
