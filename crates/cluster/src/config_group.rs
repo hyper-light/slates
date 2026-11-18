@@ -1741,6 +1741,9 @@ mod tests {
         object: ObjectId::new(OWNER, 9),
         owner: B,
       },
+      ConfigCommand::Seat {
+        voters: vec![OWNER, A, B],
+      },
     ];
     for command in commands {
       assert_eq!(
@@ -1758,6 +1761,7 @@ mod tests {
           | ConfigCommand::MirrorAdopted { .. }
           | ConfigCommand::Move { .. }
           | ConfigCommand::MovedForgotten { .. }
+          | ConfigCommand::Seat { .. }
       ) {
         assert_eq!(
           ConfigCommand::decode(&trailing),
@@ -1778,9 +1782,18 @@ mod tests {
       "empty bytes decode to nothing"
     );
     assert_eq!(
-      ConfigCommand::decode(&[9, 9, 9]),
+      ConfigCommand::decode(&[u8::MAX, 9, 9]),
       None,
       "an unknown tag decodes to nothing"
+    );
+    // A-380: a record of the voters whose count lies about the ids that follow is refused before anything is allocated.
+    let mut lying = vec![COMMAND_SEAT];
+    lying.extend_from_slice(&u64::MAX.to_le_bytes());
+    lying.extend_from_slice(&OWNER.0.to_le_bytes());
+    assert_eq!(
+      ConfigCommand::decode(&lying),
+      None,
+      "a count past the bytes decodes to nothing"
     );
   }
 
@@ -3175,6 +3188,9 @@ mod tests {
       }
       Reconfiguration::MovedForgotten { object, owner } => {
         oracle.forget_moved(*object, *owner);
+      }
+      Reconfiguration::Seat(voters) => {
+        oracle.seat(voters);
       }
     }
   }
