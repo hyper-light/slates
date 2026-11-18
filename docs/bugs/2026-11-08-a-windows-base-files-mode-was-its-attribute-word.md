@@ -33,3 +33,12 @@ deletion. Stage 1 was held from landing until this fix.
 Test: `an_untouched_base_file_reports_the_disks_windows_attribute_bits_and_follows_their_change`
 (`crates/vfs/tests/base.rs`). Red with the adoption removed: the outsider's cleared `HIDDEN` never arrived (`34` stayed
 `34`).
+
+## Found first through the Windows landing writer (2026-10-26; landed 2026-11-18, A-185)
+
+The Windows landing writer, built on 2026-10-26 by another session and left uncommitted until 2026-11-18, met this bug
+first: on jupiter the worked example's landing (`crates/land/tests/os.rs`, `the_worked_example_lands_on_a_real_directory`)
+ended `Conflict(TypeChanged)` for its removal of the directory `/tree`, since the manifest decides a witnessed entry's
+kind by `mode & S_IFMT == S_IFDIR` (`kind_is_dir`) and the directory's attribute word `0x10` read as a file. That writer
+carried its own mapping of the same shape (`posix_mode`); when it landed, the mapping above replaced it, and the worked
+example lands with this one.
