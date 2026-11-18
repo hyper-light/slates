@@ -268,7 +268,7 @@ pub(crate) fn wake(s: &ShardState, volume: VolumeId) {
 /// ([`bound_ns`]) has passed, without blocking the shard. Counted, and learned from: a told wait is a sample of the
 /// shard's told times, an overdue one backs the bound off ([`ToldTimes`]).
 pub(crate) async fn wait(owed: Owed) -> Waited {
-  let bound = state::with_state(bound_ns).unwrap_or(crate::daemon::LIVENESS_BUDGET_NS);
+  let bound = state::with_state(|s| bound_ns(s)).unwrap_or(crate::daemon::LIVENESS_BUDGET_NS);
   let began = slates_rt::futures::now_ns();
   let late = match slates_rt::futures::within(bound, Parked { owed, id: None }).await {
     Ok(Some(())) => None,

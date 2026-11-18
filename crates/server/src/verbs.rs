@@ -5511,8 +5511,8 @@ async fn revoke_everywhere(origin: u16, owner: u16, shards: &[u16], consumer: u6
 /// counted and the revocation acknowledged anyway, since every request of the mount is already refused.
 #[cfg(target_os = "linux")]
 async fn revoked_mounts_ended(origin: u16, fenced: Vec<(u16, Vec<(u64, DbVolumeId)>)>) {
-  let bound =
-    crate::state::with_state(crate::told::bound_ns).unwrap_or(crate::daemon::LIVENESS_BUDGET_NS);
+  let bound = crate::state::with_state(|s| crate::told::bound_ns(s))
+    .unwrap_or(crate::daemon::LIVENESS_BUDGET_NS);
   for (shard, mounts) in fenced {
     let ended = crate::xshard::task_within(
       origin,
