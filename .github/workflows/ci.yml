@@ -28,6 +28,15 @@ env:
   DOWNLOAD_RETRIES: "20"
   DOWNLOAD_RETRY_SECONDS: "60"
   DOWNLOAD_TRY_SECONDS: "120"
+  # Mercurial and Subversion for the Windows lanes' version-control workloads over the WinFsp drive (A-300), pinned:
+  # Mercurial from PyPI, whose 7.2.4 release publishes win_amd64 and win_arm64 wheels; Subversion's command-line build
+  # from VisualSVN (Apache Subversion 1.15.0: svn, svnadmin and svnlook in each zip's bin), each zip with the SHA-256 of
+  # the file downloaded on 2026-11-17. Git for Windows, whose `sh` runs the scripts, is the runner image's own.
+  MERCURIAL_VERSION: "7.2.4"
+  SUBVERSION_X64_URL: https://www.visualsvn.com/files/Apache-Subversion-1.15.0-x64.zip
+  SUBVERSION_X64_SHA256: 98bb798dd6c70cc875b9bdacd600594351cf88f0a39a831a5055df061c871bb5
+  SUBVERSION_ARM64_URL: https://www.visualsvn.com/files/Apache-Subversion-1.15.0-ARM64.zip
+  SUBVERSION_ARM64_SHA256: 65bf60ed3d01e55912cab14a1f60a373a7689edf73023c071b3fb587871033d4
   # kind and kubectl, pinned, each with the SHA-256 its release publishes (kind-linux-amd64.sha256sum, kubectl.sha256; read
   # 2026-11-08). They are installed by a step of this workflow, not helm/kind-action, whose installer runs curl without
   # --fail: a 504 wrote an error page over the checksum file and the step failed with "no properly formatted checksum
@@ -802,6 +811,41 @@ jobs:
         if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 30
         run: cargo xtask conformance run --suite winfstest --records target/conformance-records --scratch target/conformance-scratch --keep
+      # A-300 (Ada's goal of 2026-11-18: git, Mercurial and Subversion on every route): the roster's version-control
+      # workloads over the drive, each script run by Git for Windows' `sh` in an NTFS folder and on the drive and compared
+      # byte for byte under the roster's exclusions and the drive's one stated difference (it makes no hard link, so a
+      # local clone copies there where NTFS links). Mercurial and Subversion are installed pinned (the `env` above), and
+      # Git for Windows' `bin`, which holds `sh`, joins the PATH.
+      - name: Mercurial and Subversion for the workloads (native Windows)
+        id: vcs-tools
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
+        timeout-minutes: 45
+        run: |
+          python -m pip install --disable-pip-version-check --no-input "mercurial==$env:MERCURIAL_VERSION"
+          if ($LASTEXITCODE -ne 0) { throw "pip could not install Mercurial $env:MERCURIAL_VERSION" }
+          python -c "import sysconfig; print(sysconfig.get_path('scripts'))" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          $zip = Join-Path $env:RUNNER_TEMP 'subversion.zip'
+          try {
+            Invoke-WebRequest -Uri $env:SUBVERSION_X64_URL -OutFile $zip -MaximumRetryCount $env:DOWNLOAD_RETRIES -RetryIntervalSec $env:DOWNLOAD_RETRY_SECONDS -TimeoutSec $env:DOWNLOAD_TRY_SECONDS
+          } catch {
+            throw "Subversion could not be downloaded from $env:SUBVERSION_X64_URL after $env:DOWNLOAD_RETRIES retries ($($_.Exception.Message))."
+          }
+          $found = (Get-FileHash $zip -Algorithm SHA256).Hash
+          if ($found -ne $env:SUBVERSION_X64_SHA256) { throw "Subversion's zip hashes $found, not $env:SUBVERSION_X64_SHA256" }
+          $svn = Join-Path $env:RUNNER_TEMP 'subversion'
+          Expand-Archive -Path $zip -DestinationPath $svn -Force
+          foreach ($tool in 'svn', 'svnadmin', 'svnlook') {
+            $exe = Join-Path $svn "bin\$tool.exe"
+            if (-not (Test-Path $exe)) { throw "Subversion's zip holds no bin\$tool.exe" }
+            & $exe --version --quiet
+            if ($LASTEXITCODE -ne 0) { throw "$tool --version answered $LASTEXITCODE" }
+          }
+          (Join-Path $svn 'bin') | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "C:\Program Files\Git\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: git, Mercurial and Subversion over the WinFsp drive (native Windows)
+        if: ${{ !cancelled() && steps.vcs-tools.outcome == 'success' }}
+        timeout-minutes: 30
+        run: cargo xtask conformance run --suite workloads --records target/conformance-records --scratch target/conformance-scratch --keep
       - name: Upload the Windows conformance records (native Windows)
         if: always()
         uses: actions/upload-artifact@v4
@@ -1118,6 +1162,37 @@ jobs:
         if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 30
         run: cargo xtask conformance run --suite winfstest --records target/conformance-records --scratch target/conformance-scratch --keep
+      # A-300: the roster's version-control workloads over the drive, as on the x86_64 lane, with Subversion's ARM64 build.
+      - name: Mercurial and Subversion for the workloads (native arm64 Windows)
+        id: vcs-tools
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
+        timeout-minutes: 45
+        run: |
+          python -m pip install --disable-pip-version-check --no-input "mercurial==$env:MERCURIAL_VERSION"
+          if ($LASTEXITCODE -ne 0) { throw "pip could not install Mercurial $env:MERCURIAL_VERSION" }
+          python -c "import sysconfig; print(sysconfig.get_path('scripts'))" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          $zip = Join-Path $env:RUNNER_TEMP 'subversion.zip'
+          try {
+            Invoke-WebRequest -Uri $env:SUBVERSION_ARM64_URL -OutFile $zip -MaximumRetryCount $env:DOWNLOAD_RETRIES -RetryIntervalSec $env:DOWNLOAD_RETRY_SECONDS -TimeoutSec $env:DOWNLOAD_TRY_SECONDS
+          } catch {
+            throw "Subversion could not be downloaded from $env:SUBVERSION_ARM64_URL after $env:DOWNLOAD_RETRIES retries ($($_.Exception.Message))."
+          }
+          $found = (Get-FileHash $zip -Algorithm SHA256).Hash
+          if ($found -ne $env:SUBVERSION_ARM64_SHA256) { throw "Subversion's zip hashes $found, not $env:SUBVERSION_ARM64_SHA256" }
+          $svn = Join-Path $env:RUNNER_TEMP 'subversion'
+          Expand-Archive -Path $zip -DestinationPath $svn -Force
+          foreach ($tool in 'svn', 'svnadmin', 'svnlook') {
+            $exe = Join-Path $svn "bin\$tool.exe"
+            if (-not (Test-Path $exe)) { throw "Subversion's zip holds no bin\$tool.exe" }
+            & $exe --version --quiet
+            if ($LASTEXITCODE -ne 0) { throw "$tool --version answered $LASTEXITCODE" }
+          }
+          (Join-Path $svn 'bin') | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "C:\Program Files\Git\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: git, Mercurial and Subversion over the WinFsp drive (native arm64 Windows)
+        if: ${{ !cancelled() && steps.vcs-tools.outcome == 'success' }}
+        timeout-minutes: 30
+        run: cargo xtask conformance run --suite workloads --records target/conformance-records --scratch target/conformance-scratch --keep
       - name: Upload the Windows conformance records (native arm64 Windows)
         if: always()
         uses: actions/upload-artifact@v4

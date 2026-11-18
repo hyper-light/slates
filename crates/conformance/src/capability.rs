@@ -13,7 +13,8 @@
 //! adapter for the other suites — running those over the FUSE mount itself is owed (pjdfstest's root cases
 //! need `allow_other`, an operator's `user_allow_other`); on Windows (A-209, 2026-11-05) the harness mounts the
 //! volume as a WinFsp drive (`slates mount ID E:`) and runs WinFsp's own two suites over it, the fsx port and
-//! winfstest, each built from its pinned source with MSVC, on both Windows lanes;
+//! winfstest, each built from its pinned source with MSVC, on both Windows lanes, and since A-300 the workload
+//! roster's version-control workloads (git, Mercurial, Subversion) through Git for Windows' shell;
 //! virtio-fs runs a live Linux guest through QEMU's vhost-user-fs, which mounts the tag and runs the workload
 //! roster identically on slates and on its RAM (`crates/server/tests/virtiofs.rs`), while the other suites have
 //! no guest leg yet; the OCI container
@@ -325,10 +326,15 @@ fn native_windows(suite: Suite) -> Availability {
       root: RootNeed::None,
       adapter: None,
     },
-    Suite::Workloads => Availability::Owed(
-      "the harness mounts the drive (A-209), but the roster's tools and their byte-identity comparison are POSIX's \
-       (git over a mode-keeping tree, cargo, rsync, sqlite, a watcher) and no Windows roster is defined yet",
-    ),
+    // The roster's version-control workloads over the drive (A-300), each script run by Git for Windows' shell in an
+    // NTFS folder and on the drive and compared byte for byte, with the drive's one stated difference (it makes no
+    // hard link); the roster's other workloads are owed a Windows form (`Workload::runs_on_windows`).
+    Suite::Workloads => Availability::Runnable {
+      on,
+      tools: &[WINFSP_LIBRARY, "sh"],
+      root: RootNeed::None,
+      adapter: None,
+    },
     Suite::Hermeticity => Availability::Owed("no ETW filesystem-write tracer is wired for Windows"),
     Suite::Pressure | Suite::Failure => Availability::Owed(NO_PRESSURE_OR_FAILURE_SUITE),
   }
@@ -444,10 +450,11 @@ mod tests {
     );
   }
 
-  /// A-209: the Windows transport runs fsx and winfstest on the Windows lane with no root and no adapter.
+  /// A-209: the Windows transport runs fsx and winfstest on the Windows lane with no root and no adapter; A-300: and the
+  /// workload roster, whose scripts need a POSIX shell on the `PATH` (Git for Windows').
   #[test]
-  fn windows_runs_fsx_and_winfstest() {
-    for suite in [Suite::Fsx, Suite::Winfstest] {
+  fn windows_runs_fsx_winfstest_and_the_workloads() {
+    for suite in [Suite::Fsx, Suite::Winfstest, Suite::Workloads] {
       assert!(
         matches!(
           availability(Transport::NativeWindowsWinfsp, suite),
@@ -461,6 +468,10 @@ mod tests {
         "{suite:?}"
       );
     }
+    assert!(matches!(
+      availability(Transport::NativeWindowsWinfsp, Suite::Workloads),
+      Availability::Runnable { tools, .. } if tools.contains(&"sh")
+    ));
   }
 
   /// A-209: winfstest applies to no other transport, and pjdfstest and fsstress do not apply to Windows.
