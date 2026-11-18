@@ -863,8 +863,12 @@
 >   through kiln's server and the manifest written per runner with kiln's CA as its enrollment root (K2), and the
 >   operator's choice of which runners join, with `f` and each node's address, a chosen runner's Slates started with
 >   `StartSpec.fleet` once `role::check_fleet` (contract 39) read the manifest it wrote as its start will (K3).
-> - **Owed, in order:** kiln's relocation of an agent with its volume (detach, move, attach on the
->   target) and its workspaces made as clones of a captured base; the automatic migration by the origin of the last N
+> - **Kiln moves an agent with its volume (A-450, kiln K4, 2026-11-18):** through the library alone (`move_volume` to the
+>   target's member id, followed until `Moved`, every refusal by kind, the agent left running where it was), the
+>   target's runner mounting the moved volume under its own place once its new owner serves it. Today's kiln
+>   workspaces are overlays and are refused `NotPlain`; they move once made as clones of a captured base (K5). The live
+>   move across two Mac runners is filed for main.
+> - **Owed, in order:** kiln's workspaces made as clones of a captured base (K5); the automatic migration by the origin of the last N
 >   writes (AC-8.16's other half); a move carrying snapshots other than the head; a multi-runner test with injected
 >   faults. The capture's own owed parts: admission reserving its cost ahead, a large file read across slices rather
 >   than whole in one, and the report of bytes read and retained and of the elapsed cost (§4.15's status).

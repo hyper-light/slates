@@ -8054,6 +8054,11 @@ holder duty is balanced by neighbourhood changes; operators keep an explicit mov
 > moves between three daemons.
 > Owed: the automatic migration by the origin of the last N writes (AC-8.16's other half: N is to be derived from a
 > measured migration against the measured cross-host write), and a move carrying snapshots other than the head.
+> A consumer drives the explicit move through the library alone (A-450): kiln moves an agent between its runners with
+> its workspace volume by `Instance::move_volume` to the target's member id (its runner says the member its daemon
+> serves as at every start, `Instance::member`), following `MoveProgress` until `Moved` with no clock of its own (the
+> move ends itself: `Moved`, or `MoveUnplaced` once it thaws), every refusal reported by its kind and the agent left where
+> it was; the target mounts the moved volume once its new owner serves it (its `Retry` pauses waited out).
 
 **Green volumes in a fleet (D-27).** A green volume's owner runs its merge task; an increment's
 post-state is a sealed snapshot of the work volume, placed to the work volume's candidates by
@@ -31047,3 +31052,29 @@ remote_attach}.rs`.
 
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class C), `crates/ipc/src/{rendezvous,exit_watch,
 wake}.rs`, `unsafe-budget.toml` (slates-ipc 141 to 146).
+
+### A-450 — A consumer moves an agent with its volume through the library alone (2026-11-18, g267, kiln goal 95101ef3 K4; §4.10 "Ownership follows the writer", A-291)
+
+- **What was there.** A-291 built the explicit move (`slates move ID --to HOST`, `Instance::move_volume`, contract 33)
+  and the form a consumer's workspace moves in (a clone of a captured base, contract 34), but no consumer drove it:
+  kiln refused to move an agent whose workspace was a volume, saying the workspace couldn't follow it.
+- **The rule.** A consumer moves a volume between fleet members by the library alone, never by a copy through a disk:
+  it names the target by the member id the target's own daemon serves as (`Instance::member`, read again after every
+  daemon start, since a restarted daemon is a new member), asks `move_volume` and follows its `MoveProgress` until
+  `Moved`, with no deadline of its own (the move bounds itself: it answers `Moved`, or thaws and answers `MoveUnplaced`
+  within the fleet's failover bound). Every refusal is a typed `Error` the consumer reports by kind (`Busy::Attached`,
+  `Busy::Moving`, `Unusable::Unmovable(NotPlain | Lineage | Snapshots)`, `Invalid::MoveTarget(NotMember |
+  OutsideNeighbourhood)`, `RetryCause::MoveUnplaced`), leaving the volume where it was. The target attaches the moved
+  volume once its new owner serves it, waiting out the `Retry` pauses the library derives. Kiln's side (kiln main,
+  `workspace::slates_move`, `harness::relocate`, `harness::session`'s hand-over): both runners in its Slates fleet,
+  the target's node serving, the agent's harness down and its mount let go before the move, the workspace mounted again
+  on a refusal, the session handed over after `Moved`, the volume's mount re-placed under the target's own place for
+  workspaces. A workspace laid over its machine's folder is refused `NotPlain` (§4.10 "Overlay volumes in a fleet");
+  kiln's workspaces move once they are clones of a captured base (kiln's K5).
+- **Tests.** Kiln's unit tests (`k4_slates_refusals_of_a_move_are_reported_by_kind`,
+  `k4_the_source_follows_slates_answers_to_the_move`, `k4_the_plan_moves_a_workspace_only_inside_the_fleet_to_a_serving_node`,
+  `k4_a_volume_agent_moves_only_inside_kilns_slates_fleet`, `k4_a_nodes_member_id_rides_its_runners_word`,
+  `k4_a_workspace_that_moved_here_is_placed_under_this_machines_own_place`). Slates' own move is held by the
+  three-daemon tests A-291 names; no library change was needed. The live move between two Mac runners is filed for main.
+
+Applied in the same change to: §4.10's status (the consumer's paragraph), GAPS (g267).
