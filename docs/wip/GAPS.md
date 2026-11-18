@@ -27,8 +27,10 @@
 > **Owed, in order:**
 > - the launcher's own authority, outliving its restarts (agreed with A-285's owner, 2026-11-18): a launcher secret the
 >   starter provides at every start, published by the anchor (built: the segment's field and its reader,
->   `AnchorSegment::launcher_secret`), delivered on the anchor's standard input with `Issuer::from_launcher_secret`
->   (owed, next), and verified by the daemon beside the issuer secret (owed, A-285's owner);
+>   `AnchorSegment::launcher_secret`; its delivery on the anchor's standard input, `StartSpec::with_launcher`, and
+>   `Issuer::from_launcher_secret`, `CONTRACT` = 7), verified by the daemon beside the issuer secret (A-285's owner,
+>   0366b68a), and proven by use across a daemon restart (`tests/start.rs`) — built; owed only its run on Linux and
+>   Windows (the start tests run where the integrator's lanes run them);
 > - the daemon's side (A-285's owner): a volume's land mode is built (203ad8fa) and reaches the contract
 >   (`set_write_policy`, `write_policy`, `Refused` outcomes; piece 5, `CONTRACT` = 3), and merges under a mode with
 >   their approvals and the present-only verb reach it too (`approve_merge`, `plan_landing` on `Present`; `CONTRACT`
