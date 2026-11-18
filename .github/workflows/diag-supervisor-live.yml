@@ -1,0 +1,54 @@
+# DIAG (not for main): every live_chaos and live_fleet flow on main after g229/g225/g230/g250's fixes, Linux x86_64 and
+# arm64 and macOS, release, each flow on its own and capped, logs kept.
+name: diag-supervisor-live
+on:
+  push:
+    branches: ['diag-supervisor-live-*']
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  live:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (release)
+        run: cargo test --locked --release -p slates-cli --test live_chaos --test live_fleet --no-run
+      - name: Every live_chaos and live_fleet flow, capped
+        shell: bash
+        env:
+          SLATES_TEST_CLI: "1"
+          SLATES_FLEET_TRACE: "1"
+        run: |
+          ulimit -n 65536 2>/dev/null || ulimit -n "$(ulimit -Hn)"
+          mkdir -p target/live
+          slowest_pass_s=425
+          cap_s=$((slowest_pass_s * 4))
+          failed=0; total=0
+          for t in live_chaos live_fleet; do
+            bin=$(cargo test --locked --release -p slates-cli --test "$t" --no-run --message-format=json 2>/dev/null \
+              | jq -r "select(.executable != null and .target.name == \"$t\") | .executable" | tail -1)
+            for flow in $("$bin" --list --format terse 2>/dev/null | sed -n 's/: test$//p'); do
+              total=$((total + 1)); began=$(date +%s)
+              if command -v timeout >/dev/null; then T="timeout ${cap_s}"; else T="gtimeout ${cap_s}"; fi
+              if $T "$bin" --exact "${flow}" --test-threads=1 --nocapture > "target/live/${t}-${flow}.log" 2>&1; then r=ok; else r=FAILED; failed=$((failed + 1)); fi
+              echo "${t}::${flow}: ${r} ($(( $(date +%s) - began )) s)"
+              [ "$r" = ok ] || tail -40 "target/live/${t}-${flow}.log"
+            done
+          done
+          echo "flows failed: ${failed} of ${total}"
+          [ "${failed}" -eq 0 ]
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-${{ matrix.os }}
+          path: target/live/
