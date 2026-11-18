@@ -1296,11 +1296,12 @@ mod asynchronous_form {
   }
 
   /// A-299, R6: do drive the async form over a daemon: provision an empty volume, snapshot it, read its status,
-  /// provision a clone of the snapshot, ask the status of a volume no one made, then drop more status calls than the
-  /// client admits outstanding twice over, each while its wait has not answered, ask again, destroy the clone, and give
-  /// the instance back to the synchronous form. Expect each answer as the synchronous verb answers it, the stranger
-  /// refused `NotFound` naming the volume, every dropped call cancelled (the next call answered, where calls left
-  /// in the driver would have it refused `TooManyOutstanding`), and the synchronous form still serving afterwards.
+  /// provision a clone of the snapshot, ask the status of a volume no one made; then, more times than twice the calls
+  /// the client admits outstanding, drop a status call while its wait has not answered and ask again; destroy the
+  /// clone, and give the instance back to the synchronous form. Expect each answer as the synchronous verb answers it,
+  /// the stranger refused `NotFound` naming the volume, every call after a dropped one answered (a dropped call is
+  /// cancelled and its reply dropped when it comes; calls left in the driver would fill it and have one refused
+  /// `TooManyOutstanding`), and the synchronous form still serving afterwards.
   #[test]
   fn an_async_instance_provisions_snapshots_reports_and_destroys() {
     let (daemon, mut instance) = grouped("async");
@@ -1326,14 +1327,21 @@ mod asynchronous_form {
       block_on(instance.status(&Blocking, NOWHERE)),
       Err(Error::NotFound(Missing::Volume(NOWHERE)))
     );
-    eprintln!("dropping {abandoned} calls while they wait");
-    for _ in 0..abandoned {
-      let waiting = instance.status(&Never, volume);
-      let mut waiting = pin!(waiting);
-      let mut context = Context::from_waker(Waker::noop());
+    eprintln!("dropping {abandoned} calls while they wait, each followed by a call answered");
+    for round in 0..abandoned {
+      {
+        let waiting = instance.status(&Never, volume);
+        let mut waiting = pin!(waiting);
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(
+          waiting.as_mut().poll(&mut context).is_pending(),
+          "round {round}: the call waits on the host's loop"
+        );
+      }
+      let answered = block_on(instance.status(&Blocking, volume));
       assert!(
-        waiting.as_mut().poll(&mut context).is_pending(),
-        "the call waits on the host's loop"
+        answered.is_ok(),
+        "round {round}: a dropped call is cancelled, so the next is answered: {answered:?}"
       );
     }
     assert_eq!(
