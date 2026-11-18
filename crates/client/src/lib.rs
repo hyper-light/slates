@@ -36,7 +36,7 @@ pub mod driver;
 pub mod error;
 
 pub use client::{
-  Advanced, Attachment, Client, Connecting, CreateSpec, Deadlines, Digest, ImageBuilt,
+  Advanced, Attachment, Client, Connecting, CreateSpec, Deadlines, Digest, EntriesPage, ImageBuilt,
   LAST_SEQUENCE, Landing, Rebased, SESSION_KEY_BYTES, Session, ShardsStream, StreamEnd, Submitted,
   VhostUserDevice,
 };
@@ -50,15 +50,16 @@ pub use error::ClientError;
 pub use slates_ipc::delivery::{Capability, Delivered, Delivery, DeliveryFault, ENV_CONSUMER_FD};
 pub use slates_ipc::protocol::{
   AbsenceIs, ActionCount, AttachRequest, AttachTransport, AttachmentCapability, AuditEntry,
-  CauseRecord, CheckoutReport, ChokepointReport, Conformance, DaemonReport, DeleteWhileOpen,
-  DetectorPeerReport, DetectorPoolReport, DetectorRelayReport, DirEntry, EntryKind, Established,
-  Filter, FleetReport, GrantScope, GrantSummary, GreenBase, GroupReport, HostAnswer,
-  HostMountEvidence, HostPathReason, IMAGE_FILE, ImageMergeReport, Intent, JournalReport,
-  KernelCache, LandingDegradation, LandingDurability, LandingOutcome, LandingSummary,
-  LearnerReport, NamePolicy, OciBinding, PlacedState, Principal, ReadAt, ReadWritePolicy,
-  RecoveryCause, Refusal, RefusalCount, Residency, RetirementReport, Rights, Scope, SessionReport,
-  ShardReport, SharingSemantics, Signal, SizeClass, SnapshotBoundary, SnapshotCoverage, SnapshotId,
-  SpanRecord, StatusReport, TakeoverReport, TargetPathConstraint, TelemetryReport, TransportReport,
+  CauseRecord, CheckoutReport, ChokepointReport, ConflictClass, Conformance, DaemonReport,
+  DeleteWhileOpen, DetectorPeerReport, DetectorPoolReport, DetectorRelayReport, DirEntry,
+  EntriesCursor, EntryKind, Established, Filter, FleetReport, GrantScope, GrantSummary, GreenBase,
+  GroupReport, HostAnswer, HostMountEvidence, HostPathReason, IMAGE_FILE, ImageMergeReport, Intent,
+  JournalReport, KernelCache, LandingDegradation, LandingDurability, LandingOutcome,
+  LandingSummary, LearnerReport, NamePolicy, OciBinding, PlacedState, PlannedAction,
+  PlannedContent, PlannedEntry, Principal, ReadAt, ReadWritePolicy, RecoveryCause, Refusal,
+  RefusalCount, Residency, RetirementReport, Rights, Scope, SessionReport, ShardReport,
+  SharingSemantics, Signal, SizeClass, SnapshotBoundary, SnapshotCoverage, SnapshotId, SpanRecord,
+  StatusReport, TakeoverReport, TargetPathConstraint, TelemetryReport, TransportReport,
   UnsupportedReason, VolumeId, VolumeSummary, WorkOp,
 };
 /// The request id [`Client::begin`] returns and [`Client::poll_reply`] matches on — the async

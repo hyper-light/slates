@@ -254,11 +254,42 @@ pub enum WorkloadStatus {
     /// The first difference found.
     detail: String,
   },
+  /// The script failed alike on both sides: the same nonzero exit code, so nothing it did is evidence (Part 6 "Real
+  /// workloads" asks exit codes 0 before byte-identity). Before 2026-11-17 such a run was judged identical.
+  Failed {
+    /// The exit code both sides returned.
+    exit_code: i32,
+    /// The host output's last lines.
+    detail: String,
+  },
   /// The tool is absent on this host.
   Skipped {
     /// The tool that was absent.
     tool: String,
   },
+}
+
+impl WorkloadStatus {
+  /// Whether this verdict fails the workload suite: a difference, or a script that failed on both sides. An absent
+  /// tool does not (its record names the tool); every leg that runs the roster judges its suite by this one rule.
+  pub fn fails_the_suite(&self) -> bool {
+    matches!(
+      self,
+      WorkloadStatus::Differs { .. } | WorkloadStatus::Failed { .. }
+    )
+  }
+
+  /// The note a suite's record carries for this verdict, if it fails the suite: the workload's name, then what
+  /// differed or how the script failed.
+  pub fn failure_note(&self, workload: &str) -> Option<String> {
+    match self {
+      WorkloadStatus::Differs { detail } => Some(format!("{workload}: {detail}")),
+      WorkloadStatus::Failed { exit_code, detail } => Some(format!(
+        "{workload}: the script exited {exit_code} on both sides; host output tail: {detail}"
+      )),
+      WorkloadStatus::Identical | WorkloadStatus::Skipped { .. } => None,
+    }
+  }
 }
 
 /// The counts a run produced, per suite.
