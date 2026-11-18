@@ -208,6 +208,12 @@ pub(crate) fn supervise(options: &ProcessOptions, daemon_args: &[String]) -> Res
   let launcher = crate::launcher::from_standard_input()
     .map_err(|fault| Failure::Refused(format!("the launcher's secret: {fault}")))?;
   let profile: MachineProfile = measure(options.quick)?;
+  // This build's cost, measured here, before any start is judged by it ([`start_spin_window_ns`]), and said once.
+  slates_machine::log_line!(
+    "slates anchor: a start's busiest thread is judged spinning past {} ms of CPU without a beat (the liveness budget \
+     held to this build, A-318)",
+    start_spin_window_ns() / NS_PER_MS
+  );
   let config = DaemonConfig::derive(&profile, &options.instance, options.shards);
   // The owner first (A-254, the rule of A-176 and A-178): a second anchor of a live instance is refused here, having
   // created nothing. On macOS a segment's creation unlinks any holder of its name and its drop unlinks the name again,
@@ -391,9 +397,21 @@ fn judge_start_of(
   // Before 2026-11-08 a start had no scheduler reading, so a start held off its CPUs for a window was killed as stuck
   // ("made no progress for 1014 ms; killing it" in `held_rendezvous` on CI's Windows runner). Before A-336 a process
   // waiting on memory, every thread off the CPU, was stuck the same way, a daemon paging whole killed at its lapse.
-  judge_start_by(watch, (now, memory), clock, || {
+  judge_start_by(watch, (now, memory, start_spin_window_ns()), clock, || {
     pid.and_then(slates_rt::process_run_reading)
   })
+}
+
+/// The CPU a start's busiest thread may run without a beat before the start is judged spinning: the liveness budget held
+/// to this build (`slates_server::watchdog::spin_window_ns`, A-318), measured once in this process
+/// (`slates_machine::build_cost::build_cost`). The anchor runs the executable it starts its daemon from (the roles'
+/// prefix, A-278), so its build is its daemon's. Before, the anchor judged a start at the bare budget whatever the
+/// build, while A-318 had held the daemon's own watchdog to it: under ThreadSanitizer a start's unit of work runs its
+/// slowdown's worth of CPU (17.9 to 35.3 times machine code on CI's runners), as a poll does, and a unit of a
+/// millisecond or two natively, a pair ring, a registration, is a few tens of milliseconds there, the beat after each
+/// unit (A-312) notwithstanding.
+fn start_spin_window_ns() -> u64 {
+  slates_server::watchdog::spin_window_ns(slates_machine::build_cost::build_cost())
 }
 
 /// The start's rule over its readings, taken in this order (g243's rule for an observation, which the watchdog's look
@@ -404,9 +422,11 @@ fn judge_start_of(
 /// window whose call returned just then ran and blocked again before the scheduler looked, and was judged stuck, the
 /// window still and never runnable; the anchor kills a start on that verdict. A runnable answer is starved, not stuck,
 /// whatever the clock, so it needs no second read.
+/// The busiest thread's CPU without a beat is judged against `spin_window_ns` ([`start_spin_window_ns`]); the wedged and
+/// starved judgments against the wall's budget, whatever the build.
 fn judge_start_by(
   watch: &mut ShardWatch,
-  (now, memory): (u64, Option<slates_machine::memory_stall::StallReading>),
+  (now, memory, spin_window_ns): (u64, Option<slates_machine::memory_stall::StallReading>, u64),
   mut clock: impl FnMut() -> Option<(u64, u64)>,
   scheduler: impl FnOnce() -> Option<slates_rt::RunReading>,
 ) -> Verdict {
@@ -426,9 +446,7 @@ fn judge_start_by(
     memory,
     now_ns: now,
   };
-  // A start's thread is held to the liveness budget itself, whatever the build: A-318 holds only the daemon's own
-  // watchdog to the build's measured slowdown and leaves the anchor's judgments at the budget.
-  let (verdict, next) = watch.judge(look, LIVENESS_BUDGET_NS, LIVENESS_BUDGET_NS);
+  let (verdict, next) = watch.judge(look, LIVENESS_BUDGET_NS, spin_window_ns);
   *watch = next;
   verdict
 }
@@ -879,7 +897,7 @@ mod lapse_tests {
       for look in 1..=looks {
         let verdict = judge_start_by(
           watch,
-          (look * HEARTBEAT_NS, None),
+          (look * HEARTBEAT_NS, None, LIVENESS_BUDGET_NS),
           || Some((10, 10)),
           blocked,
         );
@@ -894,7 +912,12 @@ mod lapse_tests {
     let mut moved = ShardWatch::default();
     watched(&mut moved);
     let mut reads = [Some((10, 10)), Some((12, 12))].into_iter();
-    let verdict = judge_start_by(&mut moved, (ends, None), || reads.next().flatten(), blocked);
+    let verdict = judge_start_by(
+      &mut moved,
+      (ends, None, LIVENESS_BUDGET_NS),
+      || reads.next().flatten(),
+      blocked,
+    );
     assert_eq!(
       verdict,
       Verdict::Alive,
@@ -902,10 +925,64 @@ mod lapse_tests {
     );
     let mut still = ShardWatch::default();
     watched(&mut still);
-    let verdict = judge_start_by(&mut still, (ends, None), || Some((10, 10)), blocked);
+    let verdict = judge_start_by(
+      &mut still,
+      (ends, None, LIVENESS_BUDGET_NS),
+      || Some((10, 10)),
+      blocked,
+    );
     assert!(
       matches!(verdict, Verdict::Wedged { .. }),
       "still at both reads and blocked: stuck a window after it last moved, {verdict:?}"
+    );
+  }
+
+  /// A-318's sibling, §4.14. Do: judge a start whose busiest thread is on a whole CPU without a beat, look by look for
+  /// four budgets, with a spin window three budgets long (a build measured three times as slow as machine code, as an
+  /// unoptimized one is, 3.4 times on a Mac Studio; ThreadSanitizer's 17.9 to 35.3). Expect: alive while its thread's CPU
+  /// is under the spin window, though past one budget (a unit of work this build runs slower, no spin); spinning once it
+  /// reaches the spin window. Before, the anchor judged every start at the bare budget, whatever the build A-318 had held
+  /// the daemon's own watchdog to.
+  #[test]
+  fn a_starts_thread_is_judged_spinning_only_past_the_window_held_to_its_build() {
+    let spin_window = 3 * LIVENESS_BUDGET_NS;
+    let runnable = || {
+      Some(slates_rt::RunReading {
+        state: slates_rt::RunState::Runnable,
+        waited_ns: None,
+        uninterruptible: Some(false),
+      })
+    };
+    let mut watch = ShardWatch::default();
+    let mut first_spinning = None;
+    for look in 1..=(4 * LIVENESS_BUDGET_NS / HEARTBEAT_NS) {
+      let cpu = look * HEARTBEAT_NS;
+      let verdict = judge_start_by(
+        &mut watch,
+        (cpu, None, spin_window),
+        || Some((cpu, cpu)),
+        runnable,
+      );
+      match verdict {
+        Verdict::Spinning { cpu_ns, window_ns } => {
+          first_spinning.get_or_insert((look, cpu_ns, window_ns));
+        }
+        other => assert_eq!(
+          other,
+          Verdict::Alive,
+          "look {look}: on the CPU, so alive until the spin window"
+        ),
+      }
+    }
+    let (look, cpu_ns, window_ns) =
+      first_spinning.expect("the start was judged spinning past the spin window");
+    assert!(
+      cpu_ns >= spin_window && cpu_ns < spin_window + HEARTBEAT_NS,
+      "look {look}: {cpu_ns} ns of CPU"
+    );
+    assert_eq!(
+      window_ns, spin_window,
+      "the verdict names the window it judged"
     );
   }
 
