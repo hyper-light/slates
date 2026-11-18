@@ -415,6 +415,16 @@ inputs the daemon reads at boot or observes at runtime, never constants in the c
 | Kernel-cached op vs daemon op | < 1 µs vs 10+ µs | same | [C: EdenFS Caching.md] | must-measure |
 | Copies of a volume's sealed content | 1 (archive export on demand) | f+1 across failure domains, chosen from 2f+1 candidates in the owner's neighbourhood | [A: Vertical Paxos; A: Copysets] | f from the failure-domain tree; the scatter width from measured re-replication bandwidth and the accepted loss probability |
 
+> **Status (2026-11-18, A-297, Ada's decision): the many-client merge bound is stated at the fleet row's increment
+> rate.** "1,000 clients under 1 ms" holds when every kind's p99 stays under 1 ms while one green takes 10³ or more
+> verdicts a second from 1,000 clients, the floor of the row "Increments per green volume per second" above, with no
+> oracle failure. Every kind is each request, attempt by attempt and end to end with its resends, and a whole edit and
+> merge with the client's own think pauses left out. The load test judges each level against it
+> (`crates/client/examples/load_bench.rs`, its `bound` row). A level with no think time is the rung's capacity in
+> verdicts a second and is never judged against the bound: its clients queue on the green's one serialized verdict,
+> so a request waits about the clients times the verdict's cost (Little's law), 21 ms at 1,000 clients on the owner's
+> measured 21.0–26.9 µs a verdict (BENCHMARKS, 2026-11-09).
+
 ---
 
 ## Part 2 — The shape of the system
@@ -21140,3 +21150,34 @@ its `SealedWork`'s work in the record), the test below, GAPS.
   the work's shard counts the wait (`merge.work.awaited_route`), and once lifted the submit is answered version 1 and
   the green holds one version. A-255's own test runs one shard a node, where every work shares its green's shard, so it
   could not see this.
+
+### A-297 — The many-client merge bound is stated at the fleet row's increment rate, and the load test judges it (accepted 2026-11-18, Ada's decision; g231)
+Applied in the same change to: §1.4 (the status under the table), GAPS (the load test's entry: the statement and the
+judgment), `crates/client/examples/load_bench.rs` (the `bound` row; `Cycle` and `Round` leave out the client's think
+pauses; a cycle starts at its first edit's first send), BENCHMARKS (a note on the paced cycle figures before it).
+- **The question.** The goal "1,000 clients under 1 ms" named no offered load, and none can be met at think time 0: a
+  client's round holds one verdict, the green's one serialized step, so in a closed loop a round takes at least the
+  clients times the owner's CPU a verdict (21.0–26.9 µs on W1, BENCHMARKS 2026-11-09), 21 ms at 1,000 clients. Holding
+  each of a round's six requests under 1 ms there needs a verdict of at most 6 µs at 1,000 clients and 60 ns at
+  100,000, on any build. g231 put three statements to Ada (2026-11-17): §1.4's own increment rate per green; a
+  measured agent's pace (one sample of this Mac's agents: a median of 1,640 s between writes); and think time 0.
+- **The decision (Ada, 2026-11-18).** The first: the bound is measured at up to 1,000 merges a second, §1.4's
+  fleet-session row ("thousands"). It holds when every kind's p99 stays under 1 ms at 10³ or more verdicts a second with
+  1,000 clients and no oracle failures. Each rung sweeps its think mean so its verdicts a second span 10³ to 10⁴, and
+  reports the highest rate at which the bound holds, its capacity at the bound, which only ratchets upward.
+- **The judgment.** Each level prints `bound`: the bound and its rate, the level's verdicts a second, the worst p99 of
+  every kind (each attempt and each operation) with its row and kind, the clients held, given up or starved, the
+  oracle's failures, and `met`. A level meets it only at the rate or above, every p99 under 1 ms (exactly 1 ms is not
+  under), no failure, and no client given up or starved.
+- **A whole edit and merge leaves out the client's pauses.** The harness thinks after every reply, so a cycle (a round's
+  first edit to its first verdict) held five pauses: about 1 s of them at the pace that offers 10³ verdicts a second
+  from 1,000 clients, so no paced level could meet a bound over every kind. A pause is the client's own time. A
+  refusal's pause and a held send stay in, since the service or the harness kept the client waiting. A cycle also
+  starts at its first edit's first send, so a refusal for now of that edit is in it. At think time 0 a cycle is its
+  wall, as before.
+- **Proven by** the example's unit tests (`cargo test -p slates-client --example load_bench`): a round's cycle and round
+  are its requests' time and none of its pauses, through a conflict's resolution too; a cycle starts at the first send;
+  the row meets the bound with every kind under it at the rate and names the kind over it, and does not meet it below
+  the rate, with an oracle failure, with a client given up or starved, or with nothing timed. The measurement is the
+  supervisor's (CLAUDE.md §8): the 1,000-client rung on main with W1 at think means that span 10³ to 10⁴ verdicts a
+  second.

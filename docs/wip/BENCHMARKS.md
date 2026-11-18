@@ -12355,6 +12355,11 @@ in every round:
 | 3,000 clients, Round p99 | 8,159.9, 7,324.4, 7,465.3, 7,746.0, 7,961.8 | 3,761.9, 3,463.5, 3,692.8, 3,652.6, 3,489.0 |
 | 3,000 clients, owner µs a verdict / a rebase | 47.9–52.2 / 27.0–30.6 | 21.5–22.5 / 11.8–12.8 |
 
+Since 2026-11-18 (g231, the load test's `bound` row, Ada's decision of that day) a paced level's `Cycle` and `Round`
+leave out the client's own think pauses. The paced figures in this section and the two after it hold them: a pause
+after every reply, five in each cycle (a fixed `--think-us` until 2026-11-17, then an exponential draw of that mean).
+The unpaced figures are unchanged by it.
+
 **Equal offered load.** Main unpaced; W1's clients paced with `--think-us 19000`, found by trying 1,000 to 22,000 µs
 (think time 22,000 gave 5,673 verdicts/s, 16,000 gave 8,217), so both run main's verdict rate at 3,000 clients. 5 rounds
 each, interleaved, load 19.0 to 22.5. Verdicts a second: main 6,018, 6,739, 6,662, 6,308, 6,973; W1 6,880, 7,182, 6,913,

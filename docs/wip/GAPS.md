@@ -1032,11 +1032,12 @@
 >     submit), and holding each under 1 ms at think time 0 would need a verdict of at most 6 µs at 1,000 clients and
 >     60 ns at 100,000. A conflict adds verdicts and rebases to the round, and lowers both bounds further.
 >
->     **The proposed statement (a decision for Ada, owner g231).** The bound holds at §1.4's offered increment rate per
->     green: tens of increments a second for a few agents, thousands for a fleet session (hecate MERGE.md §7). The green
->     rate is the same at every rung, so a client's share falls as the clients grow. At 100,000 clients a thousand
->     increments a second is one submit a client every 100 s, about an agent's pace; at 1,000 clients it is one a
->     second each.
+>     **The statement (Ada's decision, 2026-11-18, the option g231 proposed).** "1,000 clients under 1 ms" is measured
+>     at up to 1,000 merges a second, §1.4's offered increment rate per green: tens of increments a second for a few
+>     agents, thousands for a fleet session (hecate MERGE.md §7). The bound holds when every kind's p99 stays under
+>     1 ms at 10³ or more verdicts a second with 1,000 clients and no oracle failures. The green rate is the same at
+>     every rung, so a client's share falls as the clients grow. At 100,000 clients a thousand increments a second is
+>     one submit a client every 100 s, about an agent's pace; at 1,000 clients it is one a second each.
 >     - Each rung sweeps its think mean so the verdicts a second (the `offered` row) span the fleet row, 10³ to 10⁴.
 >     - Each rung reports the highest rate at which every kind's p99 stays under 1 ms: the rung's capacity at the
 >       bound, which ratchets upward only.
@@ -1044,11 +1045,24 @@
 >     - The closed loop at think time 0 is the rung's capacity, reported in verdicts a second and never against the
 >       bound.
 >
+>     **The judgment is the harness's (2026-11-18, g231).** Every level prints a `bound` row after its oracle: the
+>     bound (1 ms) and the rate it is stated at (10³ verdicts a second); the level's verdicts a second; the worst p99 of
+>     every kind, each attempt's and each operation's, with its row and kind; the clients held, given up or starved;
+>     the oracle's failures; and `met` yes or no. A level meets the bound only at the stated rate or above, with every
+>     p99 under it, no failure, and no client given up or starved. `Cycle` and `Round` now leave out their client's own
+>     think pauses: left in, a cycle at about 200 ms a pause holds five of them, and no paced level could meet the
+>     bound. A cycle also starts at its first edit's first send, so a refusal for now of that edit and its pause are in
+>     it. Unit tests in the example: a round's cycle and round are its requests' time and none of its pauses, through
+>     a conflict's resolution too; a cycle starts at the first send; the row meets the bound with every kind under it at
+>     the rate, names the kind over it (a p99 of exactly 1 ms is not under), and fails below the rate, with an oracle
+>     failure, with a client given up or starved, and with nothing timed.
+>
 >     **Owed, measurement (the supervisor's):** the 1,000-client rung on main with W1 (A-247 step one, landed
 >     2026-11-17) against main before it (02c6469e5). Each think mean runs as its own invocation with a fresh daemon,
->     interleaved across builds: every kind's p50, p99, p999 and max, and the `offered` row. A think mean of about
->     200 ms gives about 10³ verdicts a second at 1,000 clients (a round of about six requests a client), and about
->     20 ms gives about 10⁴. The run's own verdicts a second are the figure.
+>     interleaved across builds: every kind's p50, p99, p999 and max, the `offered` row and the `bound` row. A think
+>     mean of about 200 ms gives about 10³ verdicts a second at 1,000 clients (a round of about six requests a client),
+>     and about 20 ms gives about 10⁴. The run's own verdicts a second are the figure. The goal is met when a level at
+>     1,000 clients reads `met yes` at 10³ verdicts a second or more.
 >
 >   The 10,000-client rung (same Studio, load 9.8 to 10.9, 313 connections) did not finish within its 30-minute bound.
 >   After 1,775 s about 2,170 of 10,000 clients were done and about 11,600 submits counted, with daemon RSS 17.6 GB.
