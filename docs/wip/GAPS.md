@@ -16,16 +16,21 @@
 > **Built since (A-302, 2026-11-18):** a guest's POSIX ACLs (`setfacl`'s `system.posix_acl_access` and a directory's
 > `system.posix_acl_default`) are its data on the same routes, checked as Linux checks one, their named users and
 > groups kept through the stream's owner view; stored and not enforced, as Shards' own server keeps them.
+> **Built since (A-303, 2026-11-18):** a stream's tables for a VM's save and restore (Shards' D176 part 5): a SAVE
+> waits for the guest's stores through its maps, takes and publishes a snapshot at the cut and answers tables naming
+> it with the guest's references, opens, scope and owner view; a RESTORE, a fresh stream's first frame, takes them onto
+> the volume saved while unchanged since the cut or a clone of the cut's snapshot, else `[1, why]` with nothing changed.
+> Found with it: a clone keeps no orphan record for a nameless file it carries from its snapshot, so nothing reclaims
+> it until the clone is destroyed (any clone of a snapshot taken while a file was held with no name). A SAVE's snapshot
+> is published on the owner shard, not yet waited for at a live-shipped volume's candidates (§4.10).
 > **Still owed for Shards, in its coordinator's order (2026-11-18):**
-> - A stream's tables for a VM's save and restore (Shards' D176 part 5): SAVE takes a snapshot of the volume at the
->   cut and names it in opaque tables within Shards' `MAX_TABLES`; RESTORE takes them on a new stream before any
->   request, against that snapshot, a clone of it, or the live volume unchanged since the cut, else `[1, why]`.
 > - A stream that survives a daemon restart, answering Shards' RESEND, each non-idempotent request (CREATE with
 >   O_EXCL, MKDIR, LINK, RENAME, UNLINK) answered at most once from the dead daemon's durable record of its outcome;
 >   else the stream ends typed and counted. The owner view then has to be kept with the attachment's record.
 > - Shards' side, after its v0.8.0 tag and landed by its coordinator from signed branches: its guest test over a
 >   slates stream on Linux and macOS (`tests/slates_fs.rs`, Windows only today), the bump of the slates revision it
->   pins (f71282e1f), and the WHP window patches 0001 to 0003 (`docs/wip/shards-patches/`).
+>   pins (f71282e1f), the WHP window patches 0001 to 0003 (`docs/wip/shards-patches/`), and `shards restore` handing a
+>   restored VM a served share (`--slates-fs-fd`, `--slates-fs-handle`) with a real-VM test of a save and a restore.
 
 > **The consumer contract is published (2026-11-18, §4.12 "The consumer contract"; A-299, Ada's widening of goal
 > g262).** Everything a consumer touches goes through `slates-api`, answered with typed outcomes and closed typed errors.

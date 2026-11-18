@@ -1204,9 +1204,10 @@ fn a_closed_stream_gives_back_what_its_guest_held() {
   drop(daemon);
 }
 
-/// Shards' control asks are answered in the forms its device reads, and the stream goes on: a snapshot's, a restore's
-/// and an unknown ask by a control frame whose first byte is not zero and whose rest is the reason; a DAX descriptor ask
-/// for the root, a directory, by a `shards_ipc` message of a nonzero kind carrying Linux's `EISDIR`, little-endian.
+/// Shards' control asks are answered in the forms its device reads, and the stream goes on: a SAVE that brings bytes
+/// (Shards' brings none), a RESTORE after the stream's first frame (A-303) and an unknown ask by a control frame whose
+/// first byte is not zero and whose rest is the reason; a DAX descriptor ask for the root, a directory, by a
+/// `shards_ipc` message of a nonzero kind carrying Linux's `EISDIR`, little-endian.
 fn control_asks_are_refused_in_shards_forms(hostile: &mut Guest) {
   for ask in [ASK_SAVE, ASK_RESTORE, 0x7f] {
     hostile.send_frame(CONTROL, &[ask, 1, 2, 3]);
@@ -1323,10 +1324,16 @@ fn hostile_frames_are_refused_and_end_only_their_own_stream() {
   }
   assert_eq!(bystander.lookup(ROOT, "nothing"), Err(ENOENT));
   guest_writes(&mut bystander, ROOT, "still-served.txt", FROM_GUEST);
-  assert!(
-    wait_for_count(&daemon, "shards.control_refused", 3) >= 3,
-    "each refused control ask is counted"
-  );
+  for kind in [
+    "shards.save_refused",
+    "shards.restore_refused",
+    "shards.control_refused",
+  ] {
+    assert!(
+      wait_for_count(&daemon, kind, 1) >= 1,
+      "each refused control ask is counted by its kind: {kind}"
+    );
+  }
   assert!(
     wait_for_count(&daemon, "shards.dax_not_a_file", 1) >= 1,
     "the descriptor ask for the root is counted by its kind"
@@ -3475,4 +3482,171 @@ fn a_guests_acknowledged_attribute_survives_a_daemon_restart() {
   drop(host);
   second.stop();
   drop(anchor);
+}
+
+/// Asks SAVE over `guest`'s stream and returns the tables a granted answer brings; fails the test on a refusal.
+fn saved(guest: &mut Guest) -> Vec<u8> {
+  guest.send_frame(CONTROL, &[ASK_SAVE]);
+  let (control, answer) = guest.reply_frame().expect("the SAVE was answered");
+  assert!(control, "a SAVE is answered by a control frame");
+  assert_eq!(
+    answer.first(),
+    Some(&0),
+    "the SAVE is granted: {:?}",
+    String::from_utf8_lossy(answer.get(1..).unwrap_or_default())
+  );
+  answer[1..].to_vec()
+}
+
+/// Asks RESTORE with `tables` over `guest`'s stream: `Ok` for a granted one, the reason in words for a refusal.
+fn restored(guest: &mut Guest, tables: &[u8]) -> Result<(), String> {
+  let mut ask = vec![ASK_RESTORE];
+  ask.extend_from_slice(tables);
+  guest.send_frame(CONTROL, &ask);
+  let (control, answer) = guest.reply_frame().expect("the RESTORE was answered");
+  assert!(control, "a RESTORE is answered by a control frame");
+  match answer.split_first() {
+    Some((0, rest)) => {
+      assert!(rest.is_empty(), "a granted RESTORE brings nothing");
+      Ok(())
+    }
+    Some((_, why)) => Err(String::from_utf8(why.to_vec()).expect("a refusal's reason is in words")),
+    None => panic!("an empty control answer"),
+  }
+}
+
+/// A-303 (Shards' D176 part 5), by use on a real daemon: a VM saved, and restored over a clone of its cut. Do: over a
+/// stream, make a directory, write a file kept open, and write another unlinked while it is open, as a guest's kernel
+/// holds them; ask SAVE; end the stream, as the VM's process ends at its save; clone the head snapshot the save took; on
+/// a fresh stream of the clone ask RESTORE with the tables and no INIT first, as a restored guest's kernel sends none;
+/// then read both files through their old handles, write on through one, close both and give the lookups back. Expect
+/// the SAVE granted and one more snapshot held, the volume's head; the RESTORE granted; every byte read back, the
+/// nameless file's too, which only the clone of the cut still holds; the write in the clone, read by another stream;
+/// both old handles closed cleanly; and the save and the restore counted, nothing refused.
+#[test]
+fn a_saved_guest_goes_on_over_a_clone_of_its_cut() {
+  let (daemon, mut client, id) = provisioned("shards-save-clone");
+  let mut guest = Guest::over(attach(&daemon, id, None, Intent::Write).unwrap());
+  guest.init();
+  let dir = guest.mkdir(ROOT, "d").unwrap();
+  let (kept, kept_fh) = guest.create(ROOT, "kept.txt").unwrap();
+  assert_eq!(guest.write(kept, kept_fh, 0, b"kept bytes"), Ok(10));
+  let (gone, gone_fh) = guest.create(ROOT, "gone.txt").unwrap();
+  assert_eq!(guest.write(gone, gone_fh, 0, b"nameless bytes"), Ok(14));
+  assert_eq!(guest.unlink(ROOT, "gone.txt"), 0);
+  let before = status(&mut client, id).snapshots;
+  let tables = saved(&mut guest);
+  let report = status(&mut client, id);
+  assert_eq!(
+    report.snapshots,
+    before + 1,
+    "the save took a snapshot of the volume"
+  );
+  drop(guest);
+  let ReplyBody::Cloned { id: clone } = client.call(&RequestBody::Clone {
+    volume: id,
+    snapshot: report.head,
+    name: "restored".to_owned(),
+  }) else {
+    panic!("the cut's snapshot was not cloned");
+  };
+  let mut restored_guest = Guest::over(attach(&daemon, clone, None, Intent::Write).unwrap());
+  assert_eq!(restored(&mut restored_guest, &tables), Ok(()));
+  assert_eq!(
+    restored_guest.read(kept, kept_fh, 0, 64),
+    Ok(b"kept bytes".to_vec())
+  );
+  assert_eq!(
+    restored_guest.read(gone, gone_fh, 0, 64),
+    Ok(b"nameless bytes".to_vec()),
+    "the nameless file the saved guest held is the restored guest's"
+  );
+  assert_eq!(restored_guest.write(kept, kept_fh, 10, b" and more"), Ok(9));
+  assert_eq!(restored_guest.close(kept, kept_fh), (0, 0));
+  assert_eq!(restored_guest.close(gone, gone_fh), (0, 0));
+  for node in [dir, kept, gone] {
+    restored_guest.forget(node, 1);
+  }
+  let mut reader = Guest::over(attach(&daemon, clone, None, Intent::Read).unwrap());
+  reader.init();
+  let file = reader.lookup(ROOT, "kept.txt").unwrap();
+  let fh = reader.open(file, 0).unwrap();
+  assert_eq!(
+    reader.read(file, fh, 0, 64),
+    Ok(b"kept bytes and more".to_vec()),
+    "the restored guest wrote on into the clone"
+  );
+  assert_eq!(reader.lookup(ROOT, "gone.txt"), Err(ENOENT));
+  assert_eq!(wait_for_count(&daemon, "shards.saved", 1), 1);
+  assert_eq!(wait_for_count(&daemon, "shards.restored", 1), 1);
+  none_counted(
+    &daemon,
+    &[
+      "shards.save_refused",
+      "shards.restore_refused",
+      "shards.frame_refused",
+      "shards.stream_failed",
+      "shards.barrier_refused",
+    ],
+  );
+  drop(reader);
+  drop(restored_guest);
+  drop(client);
+  drop(daemon);
+}
+
+/// A-303, by use on a real daemon: a VM restored onto the volume it was saved from, and the RESTOREs refused. Do: over
+/// a stream, write a file kept open; ask SAVE; end the stream. On fresh streams of the volume ask RESTORE after an INIT,
+/// with the tables cut short, with one bit of them flipped, and on a stream presenting a directory; then with the tables
+/// whole as a stream's first frame, and read the file through its old handle there. Then make a file through another
+/// stream and ask RESTORE again on a fresh one. Expect the four refused, each with its reason; the whole tables taken on
+/// the volume unchanged since the cut, its old handle reading the file's bytes; and the RESTORE after the change
+/// refused, since the volume is no longer the cut's.
+#[test]
+fn a_saved_guest_is_restored_on_its_volume_unchanged_and_refused_otherwise() {
+  let (daemon, client, id) = provisioned("shards-save-same");
+  let mut guest = Guest::over(attach(&daemon, id, None, Intent::Write).unwrap());
+  guest.init();
+  assert!(guest.mkdir(ROOT, "d").is_ok());
+  let (kept, kept_fh) = guest.create(ROOT, "kept.txt").unwrap();
+  assert_eq!(guest.write(kept, kept_fh, 0, b"kept bytes"), Ok(10));
+  let tables = saved(&mut guest);
+  drop(guest);
+  let mut damaged = tables.clone();
+  damaged[tables.len() / 2] ^= 0x10;
+  let fresh = || Guest::over(attach(&daemon, id, None, Intent::Write).unwrap());
+  let mut after_init = fresh();
+  after_init.init();
+  for (mut stream, bytes, why) in [
+    (after_init, tables.clone(), "first frame"),
+    (fresh(), tables[..tables.len() - 1].to_vec(), "damaged"),
+    (fresh(), damaged, "damaged"),
+    (
+      Guest::over(attach(&daemon, id, Some("d"), Intent::Write).unwrap()),
+      tables.clone(),
+      "another directory",
+    ),
+  ] {
+    let refused = restored(&mut stream, &bytes).unwrap_err();
+    assert!(refused.contains(why), "{why}: {refused}");
+  }
+  let mut back = fresh();
+  assert_eq!(
+    restored(&mut back, &tables),
+    Ok(()),
+    "the volume unchanged since the cut"
+  );
+  assert_eq!(back.read(kept, kept_fh, 0, 64), Ok(b"kept bytes".to_vec()));
+  assert_eq!(back.close(kept, kept_fh), (0, 0));
+  drop(back);
+  let mut writer = fresh();
+  writer.init();
+  assert!(writer.create(ROOT, "after.txt").is_ok());
+  drop(writer);
+  let refused = restored(&mut fresh(), &tables).unwrap_err();
+  assert!(refused.contains("unchanged"), "{refused}");
+  assert_eq!(wait_for_count(&daemon, "shards.restore_refused", 5), 5);
+  assert_eq!(wait_for_count(&daemon, "shards.restored", 1), 1);
+  drop(client);
+  drop(daemon);
 }

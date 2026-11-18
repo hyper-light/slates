@@ -316,6 +316,17 @@ pub enum Split<'a> {
 /// refused `InvalidData` as soon as its length word has arrived, before anything is allocated for it, as is a control
 /// frame with no ask byte. A frame of length zero is a request with no bytes, which the answer that follows refuses.
 pub fn split_frame(bytes: &[u8], max: usize) -> io::Result<Split<'_>> {
+  split_frame_bounded(bytes, max, max)
+}
+
+/// [`split_frame`], with a control frame bounded apart from a request: `request_most` for a guest's request and
+/// `control_most` for a control frame. A restore's tables may run past any request a guest sends (A-303), so a stream
+/// allows a longer control frame before its first frame, and only then.
+pub fn split_frame_bounded(
+  bytes: &[u8],
+  request_most: usize,
+  control_most: usize,
+) -> io::Result<Split<'_>> {
   let Some(word) = bytes.get(..LENGTH_BYTES) else {
     return Ok(Split::Partial(LENGTH_BYTES));
   };
@@ -324,6 +335,7 @@ pub fn split_frame(bytes: &[u8], max: usize) -> io::Result<Split<'_>> {
   );
   let control = word & CONTROL_FRAME != 0;
   let len = usize::try_from(word & !CONTROL_FRAME).unwrap_or(usize::MAX);
+  let max = if control { control_most } else { request_most };
   if len > max {
     return Err(io::Error::new(
       io::ErrorKind::InvalidData,
@@ -349,14 +361,34 @@ pub fn split_frame(bytes: &[u8], max: usize) -> io::Result<Split<'_>> {
 /// The answer to a control ask slates does not serve: a control frame whose first byte is not zero, then the reason
 /// in words, as Shards' device reads one (its `control`: zero is a granted ask, anything else a refusal it reports).
 pub fn control_refusal(reason: &str) -> Vec<u8> {
-  let mut body = Vec::with_capacity(1usize.saturating_add(reason.len()));
-  body.push(IPC_REFUSED);
-  body.extend_from_slice(reason.as_bytes());
-  let len = u32::try_from(body.len()).unwrap_or(0) | CONTROL_FRAME;
-  let mut frame = Vec::with_capacity(LENGTH_BYTES.saturating_add(body.len()));
+  control_frame(IPC_REFUSED, reason.as_bytes()).unwrap_or_default()
+}
+
+/// Format: the first byte of a granted control answer, before what it brings (Shards' `control`: zero).
+const CONTROL_GRANTED: u8 = 0;
+
+/// Derived: the most a control answer brings: its length word's 31 bits ([`CONTROL_FRAME`] less one), less its first
+/// byte.
+pub const CONTROL_ANSWER_MOST: usize = (CONTROL_FRAME - 1) as usize - 1;
+
+/// The answer to a control ask slates grants (A-303): a control frame whose first byte is zero, then what it brings
+/// (a SAVE's tables; nothing for a RESTORE). `None` for more than [`CONTROL_ANSWER_MOST`] bytes, which no control frame
+/// carries.
+pub fn control_answer(brought: &[u8]) -> Option<Vec<u8>> {
+  control_frame(CONTROL_GRANTED, brought)
+}
+
+/// A control frame of `first` and `rest`: `None` where its length is past what the length word's 31 bits say.
+fn control_frame(first: u8, rest: &[u8]) -> Option<Vec<u8>> {
+  if rest.len() > CONTROL_ANSWER_MOST {
+    return None;
+  }
+  let len = u32::try_from(rest.len().saturating_add(1)).ok()? | CONTROL_FRAME;
+  let mut frame = Vec::with_capacity(LENGTH_BYTES.saturating_add(rest.len()).saturating_add(1));
   frame.extend_from_slice(&len.to_le_bytes());
-  frame.extend_from_slice(&body);
-  frame
+  frame.push(first);
+  frame.extend_from_slice(rest);
+  Some(frame)
 }
 
 /// Format: a DESCRIPTOR ask's body after its ask byte, as Shards' device sends it today: the node (le64) and the

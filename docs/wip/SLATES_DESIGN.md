@@ -4199,6 +4199,15 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
   range or more) while the shard's fill budget has room. On Windows (A-180) the object is a section under A-175's
   confining descriptor, reserved at the machine's memory and committed a range at a time. It is duplicated into the
   process the ask names, once the handle that process names is shown to be this stream's own object;
+- a VM's save and restore (Shards' D176 part 5; A-303): a SAVE, which the device sends while it is paused and so
+  between requests, waits for the guest's stores through its maps to reach the volume, then takes a snapshot of the
+  volume for the attachment's own principal, publishes it, and is answered with the stream's tables, opaque to Shards
+  and checked by a CRC-32C: the volume and the snapshot, the directory presented, the owner view, and each inode the
+  guest holds with its references and opens. A RESTORE is taken only as a fresh stream's first frame, onto the volume
+  saved while unchanged since the cut or a clone of the cut's snapshot, presenting the same directory; the stream's
+  attachment then holds what the saved one did, a file the guest held with no name left included, and its guest is
+  shown the same owners. A handle the restored guest's kernel kept gives its open back at its release, as one from
+  before a takeover does (A-152). Anything else is refused with its reason, and changes nothing;
 - the peer's close, a hostile frame, a detach, a revocation, the volume's destroy and the daemon's stop end the
   attachment one way: its references swept, its record removed. Nothing survives a restart.
 
@@ -4270,6 +4279,15 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 > set over a second stream; a default ACL on a file is refused `EACCES`; a host's mount neither lists nor sets them
 > (`crates/bridge-fuse/src/posix_acl.rs` and `tests/shards_fs.rs`; `crates/server/tests/shards.rs`). They are not
 > enforced, as Shards' own server enforces none.
+
+> **Status (2026-11-18, A-303, a VM's save and restore).** Built and proven by use. Over a real daemon, a guest's SAVE
+> is answered with tables and leaves the volume's newest snapshot; a fresh stream of a clone of that snapshot takes
+> them without an INIT and its guest reads, through the handles it kept, a file it holds with no name left, writes on
+> and closes them cleanly; a fresh stream of the volume takes them while the volume is unchanged since the cut and
+> refuses them after a change, as it refuses a restore after a first frame, damaged tables and another directory
+> (`crates/server/tests/shards.rs`; the tables' codec `crates/server/src/shards/tables.rs`; `Volume::held_by` and
+> `Volume::adopt_held`, `crates/vfs/tests/held.rs`). Owed on Shards' side: `shards restore` handing a restored VM a
+> served share (`--slates-fs-fd`, `--slates-fs-handle`), and its real-VM test of a save and a restore over slates.
 
 **Writeback and snapshot barrier.** Kernel/guest cache negotiation changes when writes reach
 the owner. `snapshot`, `submit`, `advance`, clean `detach`, migration and archive must identify
@@ -19139,7 +19157,9 @@ Applied in the same change to:
 - **The control asks are refused in Shards' forms.** slates keeps no tables a VM's snapshot can carry, and a file's
   descriptor would be the content object (A-135): a snapshot's or a restore's ask is answered with a control frame
   whose first byte is not zero and its reason, a descriptor ask with a `shards_ipc` message of kind 1 carrying Linux's
-  `EOPNOTSUPP`. A share served by slates is launched without a DAX window until part 3's backing exists.
+  `EOPNOTSUPP`. A share served by slates is launched without a DAX window until part 3's backing exists. (Amended
+  2026-11-18 by A-303: a SAVE is answered with the stream's tables and a RESTORE takes them; A-163 had answered the
+  descriptor ask.)
 - **How it ends.** The peer's close, a frame refused as hostile, a stream error, a detach, a revocation, the volume's
   destroy and the daemon's stop all end it one way: the references the guest still holds are swept (a guest sends no
   forget per reference at its end), the registry entry revoked and drained, the descriptor closed, the record removed.
@@ -21640,3 +21660,60 @@ Applied in the same change to:
   holding the host's and the run's files, and the real daemon's stream, whose second stream reads the ACL as set and
   whose NFSv4.2 port lists no ACL. Owed: Shards' own guest test over a slates stream (`tests/slates_fs.rs`), after its
   v0.8.0 tag and its bump of the slates revision it pins.
+
+### A-303 — A Shards stream hands its device tables at a VM's save and takes them back at its restore (2026-11-18, built for goal g268, what Shards needs from slates; Shards' D176 part 5)
+
+Applied in the same change to:
+- §4.6, the Shards form: the save-and-restore bullet and the status of this date; A-161's entry, whose control-ask
+  bullet is amended. GAPS: A-281's entry, whose owed list loses the tables.
+- `crates/vfs`: `Volume::held_by` (one attachment's references and opens, in inode order, the recovery image's own
+  record) and `Volume::adopt_held` (a fresh attachment given them, all checked before any is given). The tests:
+  `crates/vfs/tests/held.rs`.
+- `crates/bridge-core`: `OwnerView::swapped`, the pair a view swaps, which the tables keep.
+- `crates/bridge-fuse`: `shards_fs.rs` adds `split_frame_bounded` (a control frame bounded apart from a request),
+  `control_answer` and `CONTROL_ANSWER_MOST`.
+- `crates/server`: `shards/tables.rs` (the tables, their codec and their bound, with their unit tests, hostile ones
+  among them); `shards.rs` answers SAVE (`answer_save`, `save`, held for an ingest by `dax::hold_save_for_ingest`) and
+  RESTORE (`answer_restore`, `restore`), counts `shards.saved` and `shards.restored`, and ledgers
+  `shards.save_refused` and `shards.restore_refused`; `verbs.rs` lends the snapshot verb's body out as
+  `take_snapshot`. The tests: `a_saved_guest_goes_on_over_a_clone_of_its_cut` and
+  `a_saved_guest_is_restored_on_its_volume_unchanged_and_refused_otherwise` (`tests/shards.rs`), and the hostile
+  control asks' counts by kind.
+
+- **What was there.** Shards' device asks each share's server for its tables while it pauses a VM to save it, keeps
+  them in the VM's snapshot, and hands them to the restored VM's server before its first request (Shards' D176 part
+  5: each node by the server's id with its lookups, each open handle, and the bytes of files held with no name). A
+  slates stream refused both asks, so a VM with a slates share could not be saved, and kiln's plan to move a VM's
+  snapshot and its slates overlay together (CP-T4.8) had nothing to stand on. Shards' coordinator confirmed the
+  contract (2026-11-18): SAVE answers `[0, tables]`, opaque; SAVE takes a slates snapshot at the cut and names it;
+  RESTORE comes on a new stream before any request and accepts the named snapshot, a clone of it, or the live volume
+  unchanged since the cut, else `[1, why]`.
+- **What the tables hold, and why so little.** The volume and the snapshot the SAVE took, the directory presented, the
+  owner view (A-281), and each inode the guest holds with its references and how many are open handles, exactly as the
+  volume keeps them for the attachment. A node is an inode number, and a clone shares its origin's numbers (A-166), so
+  no translation is needed. No handle table: a request names its node, a READDIR its cookies, and a handle the
+  restored stream never issued gives its open back at its release through the takeover path that already exists
+  (A-152). No file's bytes either: a file the guest holds with no name left is in the snapshot of the cut, so a clone
+  of the snapshot holds it, where Shards' server, keeping no snapshot, must carry the bytes.
+- **The cut.** The SAVE first waits for the guest's stores through its DAX maps to reach the volume (the ingest a
+  `FSYNC` waits for), since a restored VM refills its maps from the volume and would otherwise lose them. It then takes
+  the snapshot with the snapshot verb's own body (its barrier included, so another attachment's request in flight
+  refuses the save and it may be asked again), for the attachment's own principal, so a save does nothing that
+  principal could not ask itself; and it publishes the shard before answering, so the snapshot the VM's snapshot names
+  survives a daemon restart.
+- **The restore's checks.** The RESTORE must be the stream's first frame. The tables are bounded before anything is
+  allocated for them by the longest a shard could make (its inode slab's capacity, an entry each, from the encoding
+  itself), then checked by their CRC-32C, their format and a canonical decode. The stream must present the directory
+  the saved one did, and serve either the volume saved, unchanged since the cut (`Volume::unchanged_since`, A-201), or
+  a clone of the cut's snapshot (its lineage edge). The volume then checks every entry before giving any: one inode
+  once, in rising order, each referenced, no more opens than references, an inode it holds, a count it can take. A
+  refused restore changes nothing. The live volume holds no file the saved guest held with no name once the saved
+  stream ended (its sweep reclaimed it), so such a guest is restored onto a clone of the cut.
+- **Not here.** A SAVE's snapshot is published on the owner shard; a live-shipped volume's candidates (§4.10) are not
+  waited for, as a `FSYNC`'s durable reply waits. A clone keeps no orphan record for a nameless file it carries from
+  its snapshot, so once a restored guest lets such a file go nothing reclaims it until the clone is destroyed; that is
+  so for any clone of a snapshot taken while a file was held with no name, restored or not (GAPS).
+- **Evidence.** The tables' unit tests (a round trip, the same bytes twice, every cut, every bit flipped, another
+  format, trailing bytes, a vector of `u32::MAX` entries, the bound's arithmetic), the volume's three tests, and the two
+  by-use tests over a real daemon named above. Owed on Shards' side: `shards restore` taking a served share and its
+  real-VM test of a save and a restore over slates, after its v0.8.0 tag.

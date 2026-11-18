@@ -280,6 +280,13 @@ impl OwnerView {
   pub fn kept_gid(&self, shown: u32) -> u32 {
     self.shown_gid(shown)
   }
+
+  /// The two owners swapped, the volume's (uid, gid) then the run's, none for the identity: what a stream's tables keep
+  /// so that a restored stream shows its guest the owners the saved one did (A-303), as
+  /// [`OwnerView::swapping`] makes the view again.
+  pub fn swapped(&self) -> Option<((u32, u32), (u32, u32))> {
+    self.swap.map(|swap| (swap.kept, swap.run))
+  }
 }
 
 /// `id` with `a` and `b` exchanged: `b` for `a`, `a` for `b`, any other unchanged.
@@ -853,6 +860,10 @@ mod tests {
       (1000, 1000),
       "a run of the host's own owner changes nothing"
     );
+    // A-303: the pair a stream's tables keep makes the same view again, and the identity keeps none.
+    let (kept, run) = view.swapped().unwrap();
+    assert_eq!(OwnerView::swapping(kept, run), view);
+    assert_eq!(OwnerView::IDENTITY.swapped(), None);
   }
 
   /// A-290, A-302. Do: ask a host's mount and a guest's route about names in each namespace, the two ACL names, bare
