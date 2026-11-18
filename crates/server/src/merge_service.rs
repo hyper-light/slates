@@ -3725,6 +3725,20 @@ pub(crate) fn unheld_green_inputs(
   Some(unheld)
 }
 
+/// The versions of a taken-over green's ledger whose records this node does not know (A-364, GAP-A9-7's record half):
+/// from the first version below the `adopted` one that [`green_ledger_values`] lacks up to the adopted version, not
+/// included, which the successor's round adopts position by position (`takeover::adopt_ledger_positions`). `None` when
+/// it knows every version's record.
+pub(crate) fn missing_green_records(
+  state: &ShardState,
+  object: ObjectId,
+  adopted: &MergeRecordValue,
+) -> Option<(u64, u64)> {
+  let values = green_ledger_values(state, object, adopted);
+  let first = (0..adopted.version).find(|version| !values.contains_key(version))?;
+  Some((first, adopted.version))
+}
+
 /// A holder's view of `object`'s replica, for a test.
 pub(crate) fn holder_state(state: &ShardState, object: ObjectId) -> HolderMergeState {
   HolderMergeState {

@@ -17557,20 +17557,30 @@ suite on adacachy2 and 1 of 3 of the stack's (the supervisor's gate); alone it p
   the shard panicked ("assertion failed: matches!(crate::merge_service::merge_role(state, id), Some(MergeRole::Green {
   .. }))") and the test failed; with the refusal it answers `AlreadyExists` and the plain volume stays plain and served
   (`slates-server --lib` 266 of 266, macOS arm64, 2026-11-18).
-- **Open, the record half (GAP-A9-7):** a successor whose own records end two or more versions below the adopted one
-  lacks the intermediate records themselves (phase one reports each holder's highest record only), which no fetch by
-  identity can fill; it is still given up `chain` at the bound. **Modelled (A-364, g250, 2026-11-18):**
+- **Fixed, the record half (GAP-A9-7; A-364, g250, 2026-11-18):** a successor whose own records ended two or more
+  versions below the adopted one lacked the intermediate records themselves (phase one reports each holder's highest
+  record only), which no fetch by identity can fill, and gave the green up `chain` at the bound. Modelled first:
   `docs/wip/models/FencedLedger.tla` adopts a ledger position by position, as §4.8 states it, and TLC finds no error at
-  two epochs (2,683,673 distinct states; Agreement, Continuity, AdoptedIsPrefix, StaleNeverCommits, ReadSafety), while
-  the register's rule, the highest record alone, fails Continuity (the model table below). Owed, the build (g250): the
-  successor's green materialization, finding positions between its own highest record and the adopted version unknown
-  here (`merge_service::unheld_green_inputs` answering none), asks the members of the green's recovery cohorts for the
-  positions in that range under the round's epoch (a holder promises the object, raising its fence, and reports each
-  accepted position with its epoch), adopts at each position the record accepted under the highest epoch among a
-  recovery quorum of each cohort, re-commits each under its own epoch (phase-two acceptance at a new epoch records that
-  epoch, BUG-12), and then gathers the chain; holders already keep a ledger's every position (`Acceptor::accepted`,
-  never compacted for a merge chain). The takeover's share stays open while the green is pending (A-345's
-  `takeover::materializing`), so its holders still authorize the question.
+  two epochs (2,683,673 distinct states; Agreement, Continuity, AdoptedIsPrefix, StaleNeverCommits, ReadSafety) while
+  the register's rule, the highest record alone, fails Continuity (the model table below). Built on it: the successor's
+  green materialization, finding versions below the adopted one whose records it does not know
+  (`merge_service::missing_green_records`), asks every member of the green's recovery cohorts for the positions in that
+  range under its round's epoch (`slates_db::register::LedgerPrepare` on stream 28; a holder answers through the checks
+  a by-name question runs, promising the object first: `slates_db::takeover::answer_ledger`), adopts at each position,
+  in order, the record accepted under the highest epoch once a recovery quorum of each cohort promised it
+  (`slates_db::takeover::ledger_positions`), commits each again under its own epoch (`takeover::commit_adopted`, shared
+  with the newest record's adoption), and then fetches the versions' inputs and gathers the chain. Holders already kept
+  a ledger's every position (`Acceptor::accepted`, never compacted for a merge chain), and the takeover's share stays
+  open while the green is pending (A-345's `takeover::materializing`), so its holders still authorize the question.
+  Test: `a_successor_two_versions_behind_adopts_the_versions_between_and_serves_the_green`
+  (`crates/server/tests/fleet.rs`), with the db's `a_ledger_is_adopted_position_by_position_in_order`, the codec's
+  round trip and hostile input, and `an_acceptor_reports_a_ledgers_positions_in_a_range`.
+- **Open (A-364): a held position never yields to a higher epoch.** `Acceptor::check` refuses a record whose value
+  differs from the one a holder already accepted at that position (`ConflictingPosition`), where the model's acceptor
+  overwrites a lower-epoch value (Paxos per position). A position whose divergent value was never committed (two
+  takeovers, the first adopting without it) cannot then be re-committed on the holders that keep the stale one; with
+  the successor among them its own commit is refused and the range waits for its bound. Not reached at `f = 1` with one
+  takeover; owed: accept a higher epoch's different value at an uncommitted position, held to the model.
 
 ### 2026-11-07: a daemon killed inside its profile's republication refused every successor — fixed
 

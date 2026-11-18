@@ -1711,6 +1711,14 @@ async fn serve_peer_records(
             crate::takeover::serve_host_prepare(s, local, peer_host, &request)
           })
           .unwrap_or_default(),
+          crate::takeover::TAKEOVER_LEDGER_STREAM => state::with_state(|s| {
+            let peer_host = s
+              .learned_members
+              .get(&peer_anchor)
+              .map_or(seed, |learned| learned.host);
+            crate::takeover::serve_ledger_prepare(s, local, peer_host, &request)
+          })
+          .unwrap_or_default(),
           stream if is_content_stream(stream) => {
             let reply = state::with_state(|s| {
               let peer_host = s
@@ -4550,16 +4558,21 @@ async fn adopt_and_serve(
   in_flight.extend(crate::takeover::drive_takeovers(local, budget).await);
   in_flight.extend(crate::mirror::drive_promotion(local, budget).await);
   crate::mirror::adopt_assigned(local, budget, in_flight).await;
-  materialize_adopted_objects(origin, local, budget).await;
+  materialize_adopted_objects(origin, local, budget, in_flight).await;
 }
 
 /// One period's materialization of everything this node took over: the plain volumes whose heads it
 /// adopted ([`materialize_pending`]), then the greens whose newest merge records it adopted
 /// ([`materialize_pending_greens`]).
-async fn materialize_adopted_objects(origin: u16, local: HostId, budget: CommitBudget) {
+async fn materialize_adopted_objects(
+  origin: u16,
+  local: HostId,
+  budget: CommitBudget,
+  in_flight: &mut Vec<Dispatch>,
+) {
   adopt_pending_tombstones(origin).await;
   materialize_pending(origin, local, budget).await;
-  materialize_pending_greens(origin, local, budget).await;
+  materialize_pending_greens(origin, local, budget, in_flight).await;
 }
 
 /// Records each adopted tombstone (AUD-29-43) on the shard the destroyed volume's id routes to, with the
@@ -4700,7 +4713,12 @@ const TOMBSTONE_ADOPT_GIVEN_UP: &str = "fleet.tombstone.given_up";
 /// input the ledger names; and, for a wait on its catalog register while the takeover round that adopted it still
 /// pages, an advance of that round ([`paging_round`]). Before, every branch retried each period without end: the
 /// green-share takeover test once waited out its 4,000-period budget so (GAPS 2026-11-09).
-async fn materialize_pending_greens(origin: u16, local: HostId, budget: CommitBudget) {
+async fn materialize_pending_greens(
+  origin: u16,
+  local: HostId,
+  budget: CommitBudget,
+  in_flight: &mut Vec<Dispatch>,
+) {
   let pending: Vec<(ObjectId, crate::state::PendingGreen)> = state::with_state(|s| {
     s.pending_green_materializations
       .iter()
@@ -4710,7 +4728,8 @@ async fn materialize_pending_greens(origin: u16, local: HostId, budget: CommitBu
   .unwrap_or_default();
   let paging = state::with_state(|s| crate::takeover::rounds_still_paging(s)).unwrap_or_default();
   for (object, pending) in pending {
-    let Err(waited) = materialize_green(origin, object, &pending, budget).await else {
+    let Err(waited) = materialize_green(origin, (object, local), &pending, budget, in_flight).await
+    else {
       continue;
     };
     count_refusal(waited.counter());
@@ -4820,9 +4839,10 @@ fn paging_round(
 /// owner shard (and is no longer pending), else what it waited on.
 async fn materialize_green(
   origin: u16,
-  object: ObjectId,
+  (object, local): (ObjectId, HostId),
   pending: &crate::state::PendingGreen,
   budget: CommitBudget,
+  in_flight: &mut Vec<Dispatch>,
 ) -> Result<(), GreenWait> {
   let adopted = &pending.merge;
   // The green's catalog register, adopted in the same round as its merge record (the owner ships no merge
@@ -4845,8 +4865,10 @@ async fn materialize_green(
     None => {
       // The chain is short here. A version commits at `f + 1`, so a successor one version behind the quorum knows the
       // adopted record (it re-committed it) but never received that version's inputs, which only the dead owner
-      // shipped and the survivors that accepted the version hold (GAPS 2026-11-09). Fetch what it lacks by identity
-      // from them, then gather again.
+      // shipped and the survivors that accepted the version hold (GAPS 2026-11-09). One two or more versions behind
+      // also lacks the records between, which phase one's pages never report: those are adopted position by position
+      // first (A-364). Then fetch what it lacks by identity from them, and gather again.
+      adopt_missing_records(object, pending, local, budget, in_flight).await?;
       fetch_green_inputs(object, pending, budget).await?;
       state::with_state(gather)
         .flatten()
@@ -4888,6 +4910,32 @@ async fn materialize_green(
     s.pending_catalogs.remove(&object);
   });
   Ok(())
+}
+
+/// Adopts the records of a taken-over green's versions this node (`local`) does not know (A-364, GAP-A9-7's record
+/// half): the versions from the first record [`crate::merge_service::missing_green_records`] finds missing up to the one
+/// the takeover round of `pending.departed` adopted, position by position (`takeover::adopt_ledger_positions`), each
+/// committed again under this node. Nothing to do when every record is known. `Err(GreenWait::Chain)` while the range is
+/// not adopted whole (the attempt waits, toward its bound), or for a green no round adopted (a mirror's promotion, whose
+/// chain has no round to ask under). The dispatches go to the coordinator (`in_flight`) to recover their stragglers.
+async fn adopt_missing_records(
+  object: ObjectId,
+  pending: &crate::state::PendingGreen,
+  local: HostId,
+  budget: CommitBudget,
+  in_flight: &mut Vec<Dispatch>,
+) -> Result<(), GreenWait> {
+  let missing =
+    state::with_state(|s| crate::merge_service::missing_green_records(s, object, &pending.merge))
+      .flatten();
+  let Some(range) = missing else {
+    return Ok(());
+  };
+  let departed = pending.departed.ok_or(GreenWait::Chain)?;
+  let (adopted, dispatches) =
+    crate::takeover::adopt_ledger_positions(departed, object, range, local, budget).await;
+  in_flight.extend(dispatches);
+  adopted.map(|_| ()).map_err(|_| GreenWait::Chain)
 }
 
 /// Fetches the inputs the taken-over green `object`'s ledger names and this node does not hold
@@ -10086,7 +10134,7 @@ mod request_kind_tests {
   /// took none of it (2026-11-17, g230).
   #[test]
   fn every_request_kind_the_record_session_dispatches_is_its_own() {
-    let kinds: [(&str, u64); 26] = [
+    let kinds: [(&str, u64); 27] = [
       ("record", slates_cluster::RECORD_STREAM),
       (
         "content offer",
@@ -10122,6 +10170,7 @@ mod request_kind_tests {
       ("live entries", slates_cluster::live::LIVE_ENTRIES_STREAM),
       ("lineage", super::LINEAGE_STREAM),
       ("ledger promote", slates_cluster::LEDGER_PROMOTE_STREAM),
+      ("takeover ledger", crate::takeover::TAKEOVER_LEDGER_STREAM),
     ];
     let mut shared = Vec::new();
     for (at, (name, kind)) in kinds.iter().enumerate() {

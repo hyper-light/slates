@@ -26195,9 +26195,27 @@ Applied in the same change to:
 - **Results** (GAPS' model table): per-position adoption, no error at two epochs, 2,683,673 distinct states, depth 27;
   the register's rule, Continuity violated at depth 14. The 2026-09-04 runs of `FencedRegister_2.cfg` and `Reconfig.cfg`
   were re-run on the same toolchain and give the same counts. The three-epoch configuration is owed its result.
-- **The build owed** (GAPS, the record half): the green successor's materialization adopts, by this rule, the positions
-  between its own highest record and the adopted version from the members of the green's recovery cohorts, and
-  re-commits each under its own epoch, before it gathers the chain.
+- **The build (the record half).** A green successor that does not know the records of versions below the one its
+  round adopted (`merge_service::missing_green_records`) asks every member of the green's recovery cohorts, settled
+  and current, for its positions in that range under the round's epoch and generation (`LedgerPrepare` /
+  `LedgerPromise`, stream 28, appended to the record session's kinds). A holder admits the question as it admits a page
+  (`takeover::question_refused`), answers only for the ledger's successor and a copy in this round
+  (`slates_db::takeover::answer_ledger`), promises the object at the epoch first, lists each position it accepted with
+  its epoch, paged by the frame, and answers once its publish keeps the raised fence. The successor counts each
+  position as the round counts an object (`slates_db::takeover::ledger_positions`: a member promised a position when it
+  reported it or its answer covers it and lists nothing there, `CountingRule::NamedAnswer`, within and past tolerance
+  as A-309 counts), adopts, in order, the value accepted under the highest epoch, and commits each again under itself
+  at the round's epoch (`takeover::commit_adopted`, the newest record's own path). A fence above the epoch starts the
+  round over above it. Then the versions' inputs are fetched by identity (the input half) and the chain gathered.
+  Counted `fleet.takeover.ledger_positions_adopted`, `_refused`, `_no_round`, `_fenced`, `_waiting`.
+- **Open (GAPS).** A holder's register refuses a different value at a position it holds (`ConflictingPosition`)
+  where the model's acceptor overwrites a lower epoch's; a never-committed divergent value cannot yet be replaced.
 
-Applied in the same change to: GAPS (the model table and its toolchain note; the record half's entry), and the model
-files.
+Held by `a_successor_two_versions_behind_adopts_the_versions_between_and_serves_the_green` (`crates/server/tests/fleet.rs`:
+the successor withholds versions 3 and 4, the owner dies; it adopts version 3's record, fetches both versions' inputs and
+serves version 4), `a_ledger_is_adopted_position_by_position_in_order` (`crates/db/src/takeover.rs`), the codec's round
+trip and hostile input and `an_acceptor_reports_a_ledgers_positions_in_a_range` (`crates/db/src/register.rs`).
+
+Applied in the same change to: GAPS (the model table and its toolchain note; the record half's entry; the open
+`ConflictingPosition` item), the model files, `crates/db/src/{register,takeover}.rs`,
+`crates/server/src/{takeover,fleet,merge_service}.rs` and `crates/server/tests/fleet.rs`.
