@@ -32307,7 +32307,12 @@ Applied in the same change to: §4.16 ("Rebase off the owner (A-273)"); A-273's 
 - **Test.** `a_shard_is_judged_wedged_though_the_watchers_own_looks_run_a_window_late` (`crates/server/src/watchdog.rs`:
   looks a beat and a window apart by a watcher whose p99 says so, the shard judged wedged at the first late look; and
   gaps past the ceiling under a runaway reading, never judged across them).
-- EVIDENCE_A474
+- **Evidence.** Built and run on the Mac Studio (kiln r435, 2026-11-18, load 6.3-16.7, debug build): `cargo test
+  --locked -p slates-server --lib -- watchdog` 28 of 28 and `cargo test --locked -p slates-api --lib -- role::anchor` 12
+  of 12 (one ignored, the held process's role). Red-checked once with A-308's reset at any gap of a window: the shard
+  behind looks a window late was never judged. `cargo clippy -p slates-server -p slates-api --all-targets` found nothing
+  in A-474's lines (two cognitive-complexity findings in `crates/api/tests/api.rs`, 1324 and 1630, are another
+  change's), and `cargo xtask check` none in its files.
 
 Applied in the same change to: §4.14 (a status block on `daemon.alive`), GAPS (A-308's entry), `docs/bugs/` (a record,
 and A-467's record's sibling line), `crates/server/src/watchdog.rs`, `crates/api/src/role/anchor.rs`.
