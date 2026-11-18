@@ -1,0 +1,34 @@
+# DIAG (not for main): how often slates-anchor's a_daemon_killed_after_it_served_is_restarted_every_time fails
+# (anchor.rs:675, "left: ([], None)", first seen on main c1b33245a, CI run 44310013691 ubuntu gates), on Linux
+# x86_64 and arm64, debug as the gates build it: the anchor binary as `cargo test --workspace` runs it, then beside
+# one spinner a CPU.
+name: diag-integrator-anchor
+on:
+  push:
+    branches: ['diag-integrator-anchor-*']
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  anchor-rate:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the anchor tests (debug)
+        run: cargo test --locked -p slates-anchor --test anchor --no-run
+      - name: The anchor binary x30 as the gates run it, then x20 beside one spinner a CPU
+        run: bash .github/diag-integrator-anchor.sh
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: anchor-results-${{ matrix.os }}
+          path: target/anchor-*
