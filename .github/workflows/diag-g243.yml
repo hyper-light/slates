@@ -1,0 +1,76 @@
+name: DIAG g243-3, an observation of a starved shard released between the rule's two reads, old rule against the fix (not for main)
+
+# A diagnostics branch, never merged (goal g243). ShardTime read the shard's CPU clock, then asked the scheduler; a
+# starved shard released between the two runs, answers and parks, and the scheduler's answer (blocked) then reads as a
+# wedge. Both arms widen that gap to 200 ms (a sleep between the clock read and the scheduler's look, lines tagged G243)
+# so the release lands in it: `old` is main's rule, `fixed` reads the clock again after the scheduler answers.
+# an_observation_of_a_starved_shard_is_answered alone, 8 times an arm, on windows-latest; the fixed arm runs the rule's
+# unit tests too.
+
+on:
+  push:
+    branches: ['diag-g243-*']
+
+jobs:
+  observe-starved:
+    strategy:
+      fail-fast: false
+      matrix:
+        arm: [old, fixed]
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: Install NASM
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: The old rule in place (old arm)
+        if: matrix.arm == 'old'
+        run: cp diag/observe-old.rs crates/server/src/observe.rs && grep -c "G243 old rule" crates/server/src/observe.rs
+      - name: Build
+        run: cargo test --locked -p slates-server --test liveness --no-run 2>&1 | tail -5
+      - id: runs
+        name: The test alone 8 times
+        run: |
+          set +e
+          mkdir -p out
+          echo "arm ${{ matrix.arm }}, $NUMBER_OF_PROCESSORS CPUs, $(date -u), commit $(git rev-parse --short HEAD)" > out/runner.txt
+          failed=0
+          for run in 1 2 3 4 5 6 7 8; do
+            timeout 300 cargo test --locked -q -p slates-server --test liveness -- --exact \
+              an_observation_of_a_starved_shard_is_answered --nocapture > "out/alone-$run.log" 2>&1
+            code=$?
+            echo "alone $run exit $code" | tee -a out/exits.txt
+            [ $code = 0 ] || failed=1
+          done
+          if [ "${{ matrix.arm }}" = fixed ]; then
+            cargo test --locked -q -p slates-server --lib observe:: -- --nocapture > out/unit.log 2>&1
+            code=$?
+            echo "unit exit $code" | tee -a out/exits.txt
+            [ $code = 0 ] || failed=1
+          fi
+          exit $failed
+      - name: Summary
+        if: always()
+        run: |
+          set +e
+          cat out/runner.txt out/exits.txt
+          for log in out/*.log; do
+            echo "== $log"
+            grep -aE 'G243|observation of a starved|test result|FAILED|panicked|given up on|did not starve' "$log" | cut -c1-500 | head -40
+          done
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g243-3-${{ matrix.arm }}
+          path: out/
+          retention-days: 14
