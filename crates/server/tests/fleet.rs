@@ -2220,8 +2220,8 @@ fn a_restarted_peer_is_learned_on_contact_under_its_fresh_identity() {
 /// Whether the daemon at `instance` lists `volume` among its own: a listing gathers its shards' catalogs only.
 fn lists_volume(instance: &str, volume: VolumeId) -> bool {
   matches!(
-    Client::connect(instance).call(&RequestBody::List),
-    ReplyBody::Listed { volumes } if volumes.iter().any(|summary| summary.id == volume)
+    Client::connect(instance).call(&RequestBody::List { after: None }),
+    ReplyBody::Listed { volumes, .. } if volumes.iter().any(|summary| summary.id == volume)
   )
 }
 
@@ -4986,13 +4986,15 @@ fn a_volume_awaited_in_the_mirror_is_served_there_after_its_home_region_is_lost_
   let mut last = None;
   let served = promoted
     && poll_until(&observed, COUNCIL_RETIRE_DEADLINE, || {
-      let reply = client_x.call(&RequestBody::Read {
+      let reply = client_x.call(&RequestBody::ReadRange {
         volume: id,
         path: "/hello".to_owned(),
         at: ReadAt::Head,
+        offset: 0,
+        max: u64::MAX,
       });
       let served =
-        matches!(&reply, ReplyBody::ReadBytes { bytes } if bytes == b"hello across regions");
+        matches!(&reply, ReplyBody::ReadPage { bytes, .. } if bytes == b"hello across regions");
       last = Some(reply);
       Ok(served)
     });
@@ -7799,7 +7801,7 @@ fn the_harness_reads_a_paged_status_whole_across_an_acknowledgement() {
   // One request short of an acknowledgement: the report's first page goes out without one, its second falls due.
   while client.sequence.saturating_sub(client.acknowledged) + 1 < every {
     assert!(matches!(
-      client.call(&RequestBody::List),
+      client.call(&RequestBody::List { after: None }),
       ReplyBody::Listed { .. }
     ));
   }
@@ -10383,13 +10385,15 @@ fn five_nodes_at_f_2_keep_every_acknowledged_live_write_through_the_loss_of_the_
     let mut last = None;
     let read_all = poll_until(&survivors, SERVE_DEADLINE, || {
       for file in 0..F2_LIVE_FILES {
-        let reply = reader.call(&RequestBody::Read {
+        let reply = reader.call(&RequestBody::ReadRange {
           volume: id,
           path: format!("/f2-{file}"),
           at: ReadAt::Head,
+          offset: 0,
+          max: u64::MAX,
         });
         let whole =
-          matches!(&reply, ReplyBody::ReadBytes { bytes } if *bytes == f2_live_body(file));
+          matches!(&reply, ReplyBody::ReadPage { bytes, .. } if *bytes == f2_live_body(file));
         if !whole {
           last = Some((file, reply));
           return Ok(false);
@@ -11257,7 +11261,7 @@ fn a_takeovers_envelope_is_opened_in_turns_and_served() {
   let read: Vec<bool> = (0..OPENED_CHUNKS)
     .map(|file| {
       let reply = read_at_head(&mut reader, id, &format!("/opened-{file}"));
-      matches!(reply, ReplyBody::ReadBytes { bytes } if bytes == opened_body(file))
+      matches!(reply, ReplyBody::ReadPage { bytes, .. } if bytes == opened_body(file))
     })
     .collect();
   drop(reader);
@@ -11647,7 +11651,7 @@ fn a_live_takeover_is_rebuilt_in_turns_and_joined_while_it_runs() {
   let read: Vec<bool> = (0..LIVE_TURN_FILES)
     .map(|file| {
       let reply = read_at_head(&mut reader, id, &format!("/turns-{file}"));
-      matches!(reply, ReplyBody::ReadBytes { bytes } if bytes == continuity_body(file))
+      matches!(reply, ReplyBody::ReadPage { bytes, .. } if bytes == continuity_body(file))
     })
     .collect();
   drop(reader);
@@ -11737,7 +11741,7 @@ fn through_the_successor(
   let read = (0..CONTINUITY_FILES)
     .map(|file| {
       let reply = read_at_head(&mut reader, volume, &format!("/continuity-{file}"));
-      matches!(reply, ReplyBody::ReadBytes { bytes } if bytes == continuity_body(file))
+      matches!(reply, ReplyBody::ReadPage { bytes, .. } if bytes == continuity_body(file))
     })
     .collect();
   ThroughTheSuccessor {
@@ -11848,7 +11852,7 @@ fn after_the_restart(daemons: &[Daemon], instance: &str, volume: VolumeId) -> Af
   let read = (0..CONTINUITY_FILES)
     .map(|file| {
       let reply = read_at_head(&mut client, volume, &format!("/continuity-{file}"));
-      matches!(reply, ReplyBody::ReadBytes { bytes } if bytes == continuity_body(file))
+      matches!(reply, ReplyBody::ReadPage { bytes, .. } if bytes == continuity_body(file))
     })
     .collect();
   AfterTheRestart {
@@ -12191,7 +12195,7 @@ fn a_superseded_owners_clients_reach_its_successor() {
       .iter()
       .zip(["/through-the-old-owner", "/through-the-third-node"])
       .all(
-        |(reply, path)| matches!(reply, ReplyBody::ReadBytes { bytes } if bytes == path.as_bytes())
+        |(reply, path)| matches!(reply, ReplyBody::ReadPage { bytes, .. } if bytes == path.as_bytes())
       ),
     "each write reads back through the successor: {read:?}"
   );
@@ -13183,13 +13187,15 @@ fn reads_through(daemon: &Daemon, volume: VolumeId) -> Vec<ReplyBody> {
   let began = Instant::now();
   let mut answers = Vec::new();
   while began.elapsed() < READMITTED_READS {
-    let answer = client.call(&RequestBody::Read {
+    let answer = client.call(&RequestBody::ReadRange {
       volume,
       path: "/second".to_owned(),
       at: ReadAt::Head,
+      offset: 0,
+      max: u64::MAX,
     });
     let served =
-      matches!(&answer, ReplyBody::ReadBytes { bytes } if *bytes == written_by_the_successor());
+      matches!(&answer, ReplyBody::ReadPage { bytes, .. } if *bytes == written_by_the_successor());
     answers.push(answer);
     if served {
       break;
@@ -13239,7 +13245,7 @@ fn an_owner_admitted_again_forwards_the_volume_its_successor_took_over_and_never
   let stale: Vec<&ReplyBody> = answers
     .iter()
     .filter(|answer| match answer {
-      ReplyBody::ReadBytes { bytes } => *bytes != written_by_the_successor(),
+      ReplyBody::ReadPage { bytes, .. } => *bytes != written_by_the_successor(),
       ReplyBody::Refused { refusal } => matches!(refusal, Refusal::NotFound),
       _ => false,
     })
@@ -13251,7 +13257,7 @@ fn an_owner_admitted_again_forwards_the_volume_its_successor_took_over_and_never
   assert!(
     answers
       .last()
-      .is_some_and(|answer| matches!(answer, ReplyBody::ReadBytes { .. })),
+      .is_some_and(|answer| matches!(answer, ReplyBody::ReadPage { .. })),
     "a read through the owner admitted again reached the successor's write: {answers:?}"
   );
   assert!(
@@ -14373,8 +14379,8 @@ type SealedNamed = (VolumeId, [u8; 32], Option<Vec<u64>>, usize);
 
 /// Whether volume `id` is live-shipped as `instance`'s listing reports it.
 fn is_live_shipped(instance: &str, id: VolumeId) -> bool {
-  match Client::connect(instance).call(&RequestBody::List) {
-    ReplyBody::Listed { volumes } => volumes
+  match Client::connect(instance).call(&RequestBody::List { after: None }) {
+    ReplyBody::Listed { volumes, .. } => volumes
       .iter()
       .any(|volume| volume.id == id && volume.live_shipped),
     _ => false,
@@ -14396,7 +14402,7 @@ fn sealed_with_a_named_remote(
   let (id, placed) = seal_and_place_hello(instance, daemons, name, |owner| {
     if live {
       let mut client = Client::connect(owner.instance());
-      if let ReplyBody::Listed { volumes } = client.call(&RequestBody::List)
+      if let ReplyBody::Listed { volumes, .. } = client.call(&RequestBody::List { after: None })
         && let Some(volume) = volumes.iter().find(|volume| volume.name == name)
       {
         let _ = client.call(&RequestBody::LiveShip {
@@ -15169,10 +15175,12 @@ fn a_successor_reports_the_loss_window_its_takeover_left() {
   let mut reader = Client::connect(&successor_instance);
   let taken_loss = loss_of(&mut reader, id);
   let read = |reader: &mut Client, path: &str| {
-    reader.call(&RequestBody::Read {
+    reader.call(&RequestBody::ReadRange {
       volume: id,
       path: path.to_owned(),
       at: ReadAt::Head,
+      offset: 0,
+      max: u64::MAX,
     })
   };
   let sealed_read = read(&mut reader, "/sealed");
@@ -15250,12 +15258,12 @@ fn expect_the_sealed_file_alone_survived(
   unsealed: &ReplyBody,
 ) {
   assert!(
-    matches!(sealed, ReplyBody::ReadBytes { bytes } if bytes == b"/sealed"),
+    matches!(sealed, ReplyBody::ReadPage { bytes, .. } if bytes == b"/sealed"),
     "the sealed file survived: {sealed:?}"
   );
   assert!(
-    !matches!(unplaced, ReplyBody::ReadBytes { .. })
-      && !matches!(unsealed, ReplyBody::ReadBytes { .. }),
+    !matches!(unplaced, ReplyBody::ReadPage { .. })
+      && !matches!(unsealed, ReplyBody::ReadPage { .. }),
     "the writes after the placed seal were the window, and are gone: {unplaced:?} {unsealed:?}"
   );
 }
@@ -15279,12 +15287,15 @@ fn snapshot_taken(client: &mut Client, volume: VolumeId) -> Option<SnapshotId> {
   }
 }
 
-/// A read of `path` at `volume`'s head through `client`: the reply.
+/// A read of `path` at `volume`'s head through `client`, one page from its start (every file these tests read fits
+/// one; the whole-file `Read` is gone, A-267): the reply.
 fn read_at_head(client: &mut Client, volume: VolumeId, path: &str) -> ReplyBody {
-  client.call(&RequestBody::Read {
+  client.call(&RequestBody::ReadRange {
     volume,
     path: path.to_owned(),
     at: ReadAt::Head,
+    offset: 0,
+    max: u64::MAX,
   })
 }
 
@@ -15531,7 +15542,7 @@ fn a_successors_takeover_report_survives_its_warm_restart() {
     "a warm restart keeps the successor's member id"
   );
   assert!(
-    matches!(&read, ReplyBody::ReadBytes { bytes } if bytes == b"/taken"),
+    matches!(&read, ReplyBody::ReadPage { bytes, .. } if bytes == b"/taken"),
     "the file reads back after the restart: {read:?}"
   );
 }
@@ -15647,7 +15658,7 @@ fn a_successor_restarted_before_any_write_keeps_the_live_volume_it_took_over() {
   let read: Vec<bool> = (0..CONTINUITY_FILES)
     .map(|file| {
       let reply = read_at_head(&mut reader, id, &format!("/continuity-{file}"));
-      matches!(reply, ReplyBody::ReadBytes { bytes } if bytes == continuity_body(file))
+      matches!(reply, ReplyBody::ReadPage { bytes, .. } if bytes == continuity_body(file))
     })
     .collect();
   drop(reader);
@@ -15722,7 +15733,7 @@ fn continuity_read(instance: &str, volume: VolumeId, files: usize) -> Vec<bool> 
   (0..files)
     .map(|file| {
       let reply = read_at_head(&mut reader, volume, &format!("/continuity-{file}"));
-      matches!(reply, ReplyBody::ReadBytes { bytes } if bytes == continuity_body(file))
+      matches!(reply, ReplyBody::ReadPage { bytes, .. } if bytes == continuity_body(file))
     })
     .collect()
 }
@@ -15979,7 +15990,7 @@ fn a_superseded_owner_restarted_warm_answers_reads_with_its_successors_writes() 
   let observed: Vec<&Daemon> = daemons.iter().collect();
   let read = poll_for_periods(&observed, PLACEMENT_DEADLINE, SUPERSEDED_PERIODS, || {
     let reply = read_at_head(&mut reader, id, &path);
-    let answered = matches!(&reply, ReplyBody::ReadBytes { bytes } if *bytes == continuity_body(CONTINUITY_FILES));
+    let answered = matches!(&reply, ReplyBody::ReadPage { bytes, .. } if *bytes == continuity_body(CONTINUITY_FILES));
     last = Some(reply);
     Ok(answered)
   });
@@ -17090,7 +17101,7 @@ fn a_fleet_refuses_a_write_its_configuration_cannot_hold_to_the_declared_durabil
     OTHER_PARTITION,
     usize::from(TWO_SHARDS),
   )));
-  let listed = client.call(&RequestBody::List);
+  let listed = client.call(&RequestBody::List { after: None });
   let status = client.call(&RequestBody::DaemonStatus);
   daemon_a.stop();
   daemon_b.stop();
@@ -17115,7 +17126,7 @@ fn a_fleet_refuses_a_write_its_configuration_cannot_hold_to_the_declared_durabil
     "the other owner shard refuses with the shortfall it measured from the fanned configuration: {on_other:?}"
   );
   assert!(
-    matches!(&listed, ReplyBody::Listed { volumes } if volumes.is_empty()),
+    matches!(&listed, ReplyBody::Listed { volumes, .. } if volumes.is_empty()),
     "reads continue, and the refused creates created nothing: {listed:?}"
   );
   let ReplyBody::DaemonStatus { report } = status else {
@@ -17587,10 +17598,12 @@ fn a_submit_off_its_greens_shard_is_held_to_its_quorum_and_the_works_next_verb_b
     .get("merge.work.answered_late")
     .copied()
     .unwrap_or(0);
-  let read = client.call(&RequestBody::Read {
+  let read = client.call(&RequestBody::ReadRange {
     volume: work,
     path: "f".to_owned(),
     at: ReadAt::Head,
+    offset: 0,
+    max: u64::MAX,
   });
   drop(pipelined);
   drop(client);
@@ -17624,7 +17637,7 @@ fn assert_held_to_its_quorum(
     "and the edit after it: {edited:?}"
   );
   assert!(
-    matches!(read, ReplyBody::ReadBytes { bytes } if bytes == b"hello!"),
+    matches!(read, ReplyBody::ReadPage { bytes, .. } if bytes == b"hello!"),
     "the work reads the edit over the accepted version: {read:?}"
   );
 }
@@ -18350,12 +18363,14 @@ fn write_hello_through(client: &mut Client, volume: VolumeId) {
 /// `hello.txt` of `volume` at its head, read through `client` (no attachment), or the reply that was not its bytes, as
 /// bytes of its own description.
 fn read_hello_through(client: &mut Client, volume: VolumeId) -> Vec<u8> {
-  match client.call(&RequestBody::Read {
+  match client.call(&RequestBody::ReadRange {
     volume,
     path: "/hello.txt".to_owned(),
     at: ReadAt::Head,
+    offset: 0,
+    max: u64::MAX,
   }) {
-    ReplyBody::ReadBytes { bytes } => bytes,
+    ReplyBody::ReadPage { bytes, .. } => bytes,
     other => format!("{other:?}").into_bytes(),
   }
 }
@@ -19335,10 +19350,12 @@ fn a_seal_its_owner_had_not_placed_at_a_warm_restart_places_after_it() {
     Ok(daemons[1].held_position(object)? >= Some(1) && daemons[2].held_position(object)? >= Some(1))
   });
   drop(observed);
-  let read = client.call(&RequestBody::Read {
+  let read = client.call(&RequestBody::ReadRange {
     volume: id,
     path: "/kept".to_owned(),
     at: ReadAt::Head,
+    offset: 0,
+    max: u64::MAX,
   });
   drop(client);
   for daemon in daemons {
@@ -19375,7 +19392,7 @@ fn a_seal_its_owner_had_not_placed_at_a_warm_restart_places_after_it() {
   assert!(placed_after, "the seal placed after the warm restart");
   assert!(survivors_hold, "both survivors hold the seal's head");
   assert!(
-    matches!(&read, ReplyBody::ReadBytes { bytes } if bytes == b"kept across a warm restart"),
+    matches!(&read, ReplyBody::ReadPage { bytes, .. } if bytes == b"kept across a warm restart"),
     "the file reads back after the restart: {read:?}"
   );
 }
@@ -20089,6 +20106,8 @@ fn a_submit_to_a_green_on_a_non_control_shard_is_answered_once_its_record_commit
     ReplyBody::Submitted {
       version: Some(1),
       conflicts: Vec::new(),
+      conflicts_elided: 0,
+      verdict: 0,
     },
     "the submit is accepted once its record commits; the record placed {placed:?}; the owner's merge counters \
      {counters:?}"
@@ -20209,6 +20228,8 @@ fn a_work_catalog_with_no_session_to_ship_over_waits_for_the_period() {
     Some(ReplyBody::Submitted {
       version: Some(1),
       conflicts: Vec::new(),
+      conflicts_elided: 0,
+      verdict: 0,
     }),
     "once the sessions returned the catalog committed and the submit was answered"
   );
@@ -20333,6 +20354,8 @@ fn a_submit_made_while_the_council_forms_is_answered_once_its_record_commits() {
     Some(ReplyBody::Submitted {
       version: Some(1),
       conflicts: Vec::new(),
+      conflicts_elided: 0,
+      verdict: 0,
     }),
     "accepted as version 1"
   );
@@ -20390,6 +20413,8 @@ fn a_submit_at_f1_is_answered_without_waiting_for_the_coordinators_period() {
       ReplyBody::Submitted {
         version: Some(index + 1),
         conflicts: Vec::new(),
+        conflicts_elided: 0,
+        verdict: 0,
       },
       "submit {index} is accepted as the next version"
     );
@@ -20475,6 +20500,8 @@ fn a_merge_version_reaches_each_holder_with_its_inputs_in_one_exchange() {
       ReplyBody::Submitted {
         version: Some(index + 1),
         conflicts: Vec::new(),
+        conflicts_elided: 0,
+        verdict: 0,
       },
       "submit {index} is accepted as the next version"
     );
@@ -21955,6 +21982,8 @@ fn check_resent_after_restart(seen: ResentAfterRestart) {
     Some(Ok(ReplyBody::Submitted {
       version: Some(1),
       conflicts: Vec::new(),
+      conflicts_elided: 0,
+      verdict: 0,
     })),
     "the submit resent under its id after the restart is answered the version it was accepted as: {:?}",
     seen.counters
@@ -23361,6 +23390,8 @@ fn a_submit_resent_after_two_takeovers_in_sequence_is_answered_its_version() {
     Some(ReplyBody::Submitted {
       version: Some(1),
       conflicts: Vec::new(),
+      conflicts_elided: 0,
+      verdict: 0,
     }),
     "the submit committed at version 1"
   );
@@ -23385,6 +23416,8 @@ fn a_submit_resent_after_two_takeovers_in_sequence_is_answered_its_version() {
     ReplyBody::Submitted {
       version: Some(1),
       conflicts: Vec::new(),
+      conflicts_elided: 0,
+      verdict: 0,
     },
     "the resend after two takeovers in sequence is answered the version it was accepted as"
   );
@@ -23468,6 +23501,8 @@ fn a_works_head_is_never_placed_so_a_takeover_cannot_bring_it_back_to_run_a_rese
     ReplyBody::Submitted {
       version: Some(1),
       conflicts: Vec::new(),
+      conflicts_elided: 0,
+      verdict: 0,
     },
     "the submit committed at version 1"
   );
@@ -23756,6 +23791,8 @@ fn a_submit_resent_after_its_owner_was_taken_over_is_answered_its_version() {
     Some(ReplyBody::Submitted {
       version: Some(1),
       conflicts: Vec::new(),
+      conflicts_elided: 0,
+      verdict: 0,
     }),
     "the submit committed at version 1"
   );
@@ -23777,6 +23814,8 @@ fn a_submit_resent_after_its_owner_was_taken_over_is_answered_its_version() {
     ReplyBody::Submitted {
       version: Some(1),
       conflicts: Vec::new(),
+      conflicts_elided: 0,
+      verdict: 0,
     },
     "the resend through the takeover is answered the version it was accepted as"
   );
@@ -23931,6 +23970,8 @@ fn a_works_route_ends_once_the_greens_owner_holds_none_of_its_completions() {
     Some(ReplyBody::Submitted {
       version: Some(1),
       conflicts: Vec::new(),
+      conflicts_elided: 0,
+      verdict: 0,
     }),
     "the submit committed at version 1"
   );
@@ -23960,6 +24001,8 @@ fn a_works_route_ends_once_the_greens_owner_holds_none_of_its_completions() {
     ReplyBody::Submitted {
       version: Some(1),
       conflicts: Vec::new(),
+      conflicts_elided: 0,
+      verdict: 0,
     },
     "the route answered the resend the version it was accepted as"
   );
@@ -24935,16 +24978,18 @@ fn read_green_file(
 ) -> Result<Vec<u8>, Box<ReplyBody>> {
   match client
     .try_call(
-      &RequestBody::Read {
+      &RequestBody::ReadRange {
         volume: green,
         path: "f".to_owned(),
         at,
+        offset: 0,
+        max: u64::MAX,
       },
       *DEADLINE_NS,
     )
     .unwrap_or_else(|e| refused_placeholder(&e))
   {
-    ReplyBody::ReadBytes { bytes } => Ok(bytes),
+    ReplyBody::ReadPage { bytes, .. } => Ok(bytes),
     other => Err(Box::new(other)),
   }
 }
@@ -28025,6 +28070,8 @@ fn a_submit_whose_answer_was_lost_with_its_owner_is_answered_its_version_by_the_
     Some(Ok(ReplyBody::Submitted {
       version: Some(1),
       conflicts: Vec::new(),
+      conflicts_elided: 0,
+      verdict: 0,
     })),
     "the submit resent after its owner died is answered its version by the green's successor"
   );
@@ -28159,6 +28206,8 @@ fn a_versions_merge_record_waits_for_its_works_catalog_record() {
     Some(Ok(ReplyBody::Submitted {
       version: Some(1),
       conflicts: Vec::new(),
+      conflicts_elided: 0,
+      verdict: 0,
     })),
     "the submit was answered its version once its record committed"
   );
@@ -28298,6 +28347,8 @@ fn a_submit_off_its_greens_shard_waits_for_its_works_catalog_record_before_its_v
     Some(Ok(ReplyBody::Submitted {
       version: Some(1),
       conflicts: Vec::new(),
+      conflicts_elided: 0,
+      verdict: 0,
     })),
     "the submit was answered its version once its route and its record committed"
   );
@@ -28500,6 +28551,8 @@ fn a_request_id_copied_into_another_session_reaches_no_completion_through_a_take
     Some(Ok(ReplyBody::Submitted {
       version: Some(1),
       conflicts: Vec::new(),
+      conflicts_elided: 0,
+      verdict: 0,
     })),
     "the victim's own resend is answered its version"
   );
@@ -28682,6 +28735,8 @@ fn a_survivor_holding_no_copy_of_the_works_catalog_learns_its_green_from_a_locat
     Some(Ok(ReplyBody::Submitted {
       version: Some(1),
       conflicts: Vec::new(),
+      conflicts_elided: 0,
+      verdict: 0,
     })),
     "d's resend is answered its version through the green the location round named"
   );
