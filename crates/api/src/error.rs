@@ -1270,6 +1270,9 @@ pub enum MountMissing {
   SharedMount,
   /// A subtree or shared mount is the Unix mounts'; a WinFsp mount presents the whole volume at a drive.
   WindowsSubtreeOrShared,
+  /// The machine does not let WinFsp's driver make a mount's drive (Windows, A-369): an Administrator sets
+  /// `MountUseMountmgrFromFSD` to 1 once, which the driver reads at every mount (A-417).
+  MountManager,
 }
 
 impl fmt::Display for MountMissing {
@@ -1297,6 +1300,10 @@ impl fmt::Display for MountMissing {
       }
       Self::WindowsSubtreeOrShared => {
         "a subtree or shared mount is the Unix mounts'; a WinFsp mount presents the whole volume at a drive letter"
+      }
+      Self::MountManager => {
+        "this machine does not let WinFsp's driver make a mount's drive: an Administrator allows it once with \
+         `reg add HKLM\\SOFTWARE\\WOW6432Node\\WinFsp /v MountUseMountmgrFromFSD /t REG_DWORD /d 1 /f`"
       }
     })
   }

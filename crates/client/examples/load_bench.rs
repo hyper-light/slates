@@ -61,6 +61,21 @@
 //! the level is `max_drain_gap_ns` in the `harness` row. A tail in `latency` with none in `floor` may be the harness's;
 //! a tail in `floor` is not.
 //!
+//! **Workers wait, as the clients they stand for do (A-421).** A worker that swept and found nothing to take or send
+//! spins on for the daemon's published spin window (`Client::published_spin_ns`), the window an async client spins
+//! before it parks. Then it arms the completion of every connection with a request in flight (`Client::arm_async`),
+//! drains them once more, which closes the race with a reply that landed before its arm, and parks until a reply wakes
+//! it or its next deadline comes: the earliest due send, overdue check or progress report. It wakes early by the spin
+//! window and by how late its timed-out parks have come back on average, and spins the rest of the way, so a due
+//! client is sent on time. Until 2026-11-18 every worker spun for the whole level: eight spinning workers took eight
+//! cores from the daemon they measured, and on a loaded Mac Studio their sweeps took 25 to 127 ms, with 6.9 clients
+//! held on average against 2.2 in flight at 1,000 clients. A reply that comes while its worker is parked costs the
+//! daemon a wake and the worker its wakeup, inside that reply's latency, as it does for an agent's async client.
+//! Linux polls the rendezvous's eventfd; macOS polls each connection's completion bridge pipe with `poll(2)`. Under a
+//! launchd job's timer policy that wait comes back about 2 ms late, where `nanosleep` and `select` come back about
+//! 76 ms late (2026-10-26). Windows polls each completion bridge's socket with `WSAPoll`. The `harness` row counts
+//! the parks, those a reply ended, the time parked, and the mean lateness of those that met their deadline.
+//!
 //! **The bound (the `bound` row; Ada's decision of 2026-11-18, A-297).** "1,000 clients under 1 ms" is stated at up to
 //! 10³ verdicts a second, the floor of §1.4's fleet-session row ("Increments per green volume per second: thousands").
 //! A level meets it when every kind's p99, each attempt's (`latency`) and each operation's (`operation`), is under 1 ms
@@ -286,6 +301,15 @@ struct Tally {
   thinking_ns: u64,
   paused_ns: u64,
   held_ns: u64,
+  /// The workers' parks (the module's "Workers wait"): parks begun, those a reply's completion ended (the rest met their
+  /// deadline), and the worker-nanoseconds parked.
+  parks: u64,
+  parks_woken: u64,
+  parked_ns: u64,
+  /// How late the parks that met their deadline came back, summed, and how many did: their mean is how early a worker
+  /// wakes for its next deadline ([`Worker::park_margin_ns`]).
+  park_late_ns: u64,
+  parks_timed_out: u64,
 }
 
 impl Tally {
@@ -328,6 +352,11 @@ impl Tally {
     self.thinking_ns = self.thinking_ns.saturating_add(tally.thinking_ns);
     self.paused_ns = self.paused_ns.saturating_add(tally.paused_ns);
     self.held_ns = self.held_ns.saturating_add(tally.held_ns);
+    self.parks = self.parks.saturating_add(tally.parks);
+    self.parks_woken = self.parks_woken.saturating_add(tally.parks_woken);
+    self.parked_ns = self.parked_ns.saturating_add(tally.parked_ns);
+    self.park_late_ns = self.park_late_ns.saturating_add(tally.park_late_ns);
+    self.parks_timed_out = self.parks_timed_out.saturating_add(tally.parks_timed_out);
   }
 }
 
@@ -1013,10 +1042,17 @@ struct Connection {
   /// When this connection's last drain began, the clock read before its ring was read: a reply that drain did not take
   /// arrived after it (the module's "floor").
   read_began_ns: u64,
+  /// What the daemon makes readable on a reply while this connection is armed, which its worker parks on (the module's
+  /// "Workers wait"); taken again after a reconnect, whose channel is new, and `None` once a reconnected channel could
+  /// not give one (the connection is failed then, and never waited on).
+  completion: Option<Completion>,
 }
 
 impl Connection {
-  fn new(client: Client, now: u64) -> Connection {
+  /// A connection over `client`, its async completion enabled for its worker's parks: a client that cannot have one is
+  /// a failed run, since a worker that could not park on it would measure another harness.
+  fn new(mut client: Client, now: u64) -> Connection {
+    let completion = client.enable_async_completion().unwrap();
     Connection {
       client,
       inflight: BTreeMap::new(),
@@ -1024,6 +1060,7 @@ impl Connection {
       resend: Vec::new(),
       resend_since: 0,
       read_began_ns: now,
+      completion: Some(completion),
     }
   }
 
@@ -1034,6 +1071,95 @@ impl Connection {
       self.resend_since = now;
     }
   }
+}
+
+/// A connection's completion (the module's "Workers wait"): the descriptor its daemon makes readable on a reply while
+/// the connection is armed, the rendezvous's eventfd on Linux and a completion bridge's pipe on macOS.
+#[cfg(unix)]
+type Completion = std::os::fd::RawFd;
+/// A connection's completion on Windows: its completion bridge's loopback socket.
+#[cfg(windows)]
+type Completion = std::os::windows::io::RawSocket;
+
+/// Waits until one of `completions` is readable or `timeout_ns` passes, and says which are. `poll(2)`, which XNU builds
+/// on kqueue: under a launchd job's timer policy its timeout comes back about 2 ms late where `nanosleep` and `select`
+/// come back about 76 ms late (2026-10-26). A completion whose connection has nothing in flight is never made readable,
+/// so with every connection's completion in the set the wait is also the worker's timed wait for its next deadline. An
+/// interrupted wait reports none ready, and the worker sweeps again.
+#[cfg(unix)]
+fn park(completions: &[Completion], timeout_ns: u64) -> Vec<bool> {
+  use rustix::event::{Nsecs, PollFd, PollFlags, Secs, Timespec};
+  let mut fds: Vec<PollFd<'_>> = completions
+    .iter()
+    .map(|fd| {
+      // SAFETY: each descriptor is its connection's completion, which the connection's client holds open while the
+      // connection lives, and the worker that owns the connections is the caller, so each outlives this call.
+      let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(*fd) };
+      PollFd::from_borrowed_fd(borrowed, PollFlags::IN)
+    })
+    .collect();
+  let wait = Duration::from_nanos(timeout_ns);
+  let timeout = Timespec {
+    tv_sec: Secs::try_from(wait.as_secs()).unwrap_or(Secs::MAX),
+    tv_nsec: Nsecs::try_from(wait.subsec_nanos()).unwrap_or(0),
+  };
+  match rustix::event::poll(&mut fds, Some(&timeout)) {
+    Ok(_) => fds
+      .iter()
+      .map(|fd| {
+        fd.revents()
+          .intersects(PollFlags::IN | PollFlags::ERR | PollFlags::HUP)
+      })
+      .collect(),
+    Err(_) => vec![false; completions.len()],
+  }
+}
+
+/// Waits until one of `completions` is readable or `timeout_ns` passes, and says which are: `WSAPoll`, whose timeout is
+/// whole milliseconds (rounded down: a worker wakes early and spins the rest). Its caller passes every connection's
+/// completion, so the set is never empty, which `WSAPoll` refuses.
+#[cfg(windows)]
+fn park(completions: &[Completion], timeout_ns: u64) -> Vec<bool> {
+  use windows_sys::Win32::Networking::WinSock::{POLLRDNORM, WSAPOLLFD, WSAPoll};
+  let wait = Duration::from_nanos(timeout_ns);
+  let mut fds: Vec<WSAPOLLFD> = completions
+    .iter()
+    .map(|socket| WSAPOLLFD {
+      fd: usize::try_from(*socket).unwrap(),
+      events: POLLRDNORM,
+      revents: 0,
+    })
+    .collect();
+  let count = u32::try_from(fds.len()).unwrap();
+  let millis = i32::try_from(wait.as_millis()).unwrap_or(i32::MAX);
+  // SAFETY: `fds` holds `count` initialized entries for the whole call, each naming its connection's completion socket,
+  // which the connection's client holds open while the connection lives; `WSAPoll` writes only their `revents`.
+  let ready = unsafe { WSAPoll(fds.as_mut_ptr(), count, millis) };
+  if ready <= 0 {
+    return vec![false; fds.len()];
+  }
+  fds.iter().map(|fd| fd.revents != 0).collect()
+}
+
+/// How a worker's park ended (the module's "Workers wait").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Parked {
+  /// A connection's completion fired: a reply came for a request in flight.
+  Woken,
+  /// Its deadline came first.
+  TimedOut,
+  /// It did not park: its deadline was nearer than its margin, a reply was there once its connections were armed, or a
+  /// connection could not be armed.
+  Not,
+}
+
+/// How long a worker parks at `now` for `deadline` (both its clock), waking `margin_ns` early so it spins the rest of the
+/// way, or `None` when the deadline is no farther than the margin and it spins to it.
+fn park_timeout_ns(now: u64, deadline: u64, margin_ns: u64) -> Option<u64> {
+  deadline
+    .checked_sub(now)?
+    .checked_sub(margin_ns)
+    .filter(|timeout| *timeout > 0)
 }
 
 /// One worker's state: its connections, its logical clients, the clients ready to send, and what it measured.
@@ -1048,6 +1174,9 @@ struct Worker {
   think: Think,
   tally: Tally,
   clock: Clock,
+  /// The longest spin window the daemons behind the worker's connections publish (`Client::published_spin_ns`): how
+  /// long the worker sweeps on after its last reply or send before it parks, and the least it wakes early by.
+  spin_ns: u64,
 }
 
 /// The clients' pauses between requests: each drawn from the exponential distribution of the stated mean, and each
@@ -1148,10 +1277,11 @@ impl Worker {
 
   /// Sends for every ready client, in order, until one cannot go (each connection's ring and bound are its own, so
   /// a client that cannot go is kept and the rest are tried). Each due client's wait past the instant it was due (or
-  /// was last kept) is counted held: the harness's sweep or its connection's bound kept it back.
-  fn send_ready(&mut self) {
+  /// was last kept) is counted held: the harness's sweep or its connection's bound kept it back. Returns how many went.
+  fn send_ready(&mut self) -> usize {
     let now = self.clock.now();
     let mut kept = Vec::new();
+    let mut went = 0;
     while let Some(std::cmp::Reverse((due, a))) = self.ready.peek().copied() {
       if due > now {
         break;
@@ -1161,11 +1291,142 @@ impl Worker {
         continue;
       }
       self.tally.held_ns = self.tally.held_ns.saturating_add(now.saturating_sub(due));
-      if !self.send(a) {
+      if self.send(a) {
+        went += 1;
+      } else {
         kept.push(std::cmp::Reverse((now, a)));
       }
     }
     self.ready.extend(kept);
+    went
+  }
+
+  /// When the earliest client waiting to send is due, on the worker's clock.
+  fn next_due(&self) -> Option<u64> {
+    self.ready.peek().map(|std::cmp::Reverse((due, _))| *due)
+  }
+
+  /// How early a park wakes for its deadline: the spin window, and the mean of how late this worker's parks that met
+  /// their deadline came back (none yet: nothing), so the worker spins the rest of the way and a due client goes on time.
+  fn park_margin_ns(&self) -> u64 {
+    let late = self
+      .tally
+      .park_late_ns
+      .checked_div(self.tally.parks_timed_out)
+      .unwrap_or(0);
+    self.spin_ns.saturating_add(late)
+  }
+
+  /// Parks the worker until a reply comes for one of its requests in flight or `deadline` (its clock) less its margin
+  /// passes (the module's "Workers wait"). Every connection with a request in flight is armed and drained once more
+  /// first: a reply that landed before its arm was seen is taken then, and the worker does not park; one that lands
+  /// after it makes the connection's completion readable, which ends the park. The wait is on every connection's
+  /// completion, armed or not, since one with nothing in flight is never made readable and a wait needs one at least.
+  /// Every arm is cleared before it returns, so a reply taken while the worker sweeps costs the daemon no wake.
+  fn park_until(&mut self, deadline: u64) -> Parked {
+    let Some(timeout) = park_timeout_ns(self.clock.now(), deadline, self.park_margin_ns()) else {
+      return Parked::Not;
+    };
+    let waited: Vec<(usize, Completion)> = self
+      .conns
+      .iter()
+      .enumerate()
+      .filter_map(|(c, conn)| conn.completion.map(|completion| (c, completion)))
+      .collect();
+    if waited.is_empty() {
+      return Parked::Not;
+    }
+    let Some(armed) = self.arm_in_flight() else {
+      return Parked::Not;
+    };
+    let answered = self.tally.answered;
+    for &c in &armed {
+      self.drain(c);
+    }
+    if self.tally.answered != answered || self.unsettled() {
+      self.disarm(&armed);
+      return Parked::Not;
+    }
+    let completions: Vec<Completion> = waited.iter().map(|(_, completion)| *completion).collect();
+    let began = self.clock.now();
+    let fired = park(&completions, timeout);
+    let ended = self.clock.now();
+    self.disarm(&armed);
+    for ((c, _), _) in waited.iter().zip(&fired).filter(|(_, fired)| **fired) {
+      self.conns[*c].client.drain_completion();
+    }
+    self.count_park((began, ended, timeout), fired.contains(&true))
+  }
+
+  /// Arms every connection with a request in flight and returns them, or `None` when one could not be armed: that
+  /// connection is failed, its clients given up, and the arms made before it are cleared.
+  fn arm_in_flight(&mut self) -> Option<Vec<usize>> {
+    let armed: Vec<usize> = (0..self.conns.len())
+      .filter(|c| !self.conns[*c].inflight.is_empty())
+      .collect();
+    for (at, &c) in armed.iter().enumerate() {
+      if let Err(e) = self.conns[c].client.arm_async() {
+        self.disarm(armed.get(..at).unwrap_or_default());
+        self.fail_connection(c, &format!("arm: {e}"));
+        return None;
+      }
+    }
+    Some(armed)
+  }
+
+  /// Whether a connection is reconnecting or resending: its own pacing is the sweeps', so the worker does not park.
+  fn unsettled(&self) -> bool {
+    self
+      .conns
+      .iter()
+      .any(|conn| conn.reconnecting.is_some() || !conn.resend.is_empty())
+  }
+
+  /// Counts a park from `began` to `ended` (the worker's clock) that waited for at most `timeout`, and says how it
+  /// ended: woken when a completion fired, else timed out, its lateness past the timeout kept for the margin.
+  fn count_park(&mut self, (began, ended, timeout): (u64, u64, u64), woken: bool) -> Parked {
+    self.tally.parks = self.tally.parks.saturating_add(1);
+    self.tally.parked_ns = self
+      .tally
+      .parked_ns
+      .saturating_add(ended.saturating_sub(began));
+    if woken {
+      self.tally.parks_woken = self.tally.parks_woken.saturating_add(1);
+      return Parked::Woken;
+    }
+    self.tally.parks_timed_out = self.tally.parks_timed_out.saturating_add(1);
+    self.tally.park_late_ns = self
+      .tally
+      .park_late_ns
+      .saturating_add(ended.saturating_sub(began.saturating_add(timeout)));
+    Parked::TimedOut
+  }
+
+  /// One sweep: every connection recovered (while it reconnects or resends) or drained (while it has a request in
+  /// flight), then every due client sent. Whether it moved anything: took a reply, sent a request or worked a
+  /// recovery, after which the worker spins on rather than parks.
+  fn sweep(&mut self) -> bool {
+    let answered = self.tally.answered;
+    let mut recovering = false;
+    for c in 0..self.conns.len() {
+      if self.conns[c].reconnecting.is_some() || !self.conns[c].resend.is_empty() {
+        recovering = true;
+        self.recover(c);
+      } else if !self.conns[c].inflight.is_empty() {
+        self.drain(c);
+      }
+    }
+    let went = self.send_ready();
+    recovering || went > 0 || self.tally.answered != answered
+  }
+
+  /// Clears the arm of each connection in `armed`; one that cannot be cleared is failed, its clients given up.
+  fn disarm(&mut self, armed: &[usize]) {
+    for &c in armed {
+      if let Err(e) = self.conns[c].client.disarm_async() {
+        self.fail_connection(c, &format!("disarm: {e}"));
+      }
+    }
   }
 
   /// Drains connection `c`'s ring and moves each reply's client on. Each reply is stamped after the ring was read, so
@@ -1329,6 +1590,14 @@ impl Worker {
         Ok(true) => {
           self.tally.reconnects += 1;
           conn.reconnecting = None;
+          // The reconnected channel is a new one, with a completion of its own for the worker's parks.
+          match conn.client.enable_async_completion() {
+            Ok(completion) => conn.completion = Some(completion),
+            Err(e) => {
+              conn.completion = None;
+              return self.fail_connection(c, &format!("completion after reconnect: {e}"));
+            }
+          }
         }
         Ok(false) => return,
         Err(e) => return self.fail_connection(c, &format!("reconnect: {e}")),
@@ -1461,7 +1730,9 @@ impl Worker {
 /// daemon's and the ring's, not the time the harness took to reach the client), moves each answered client on and
 /// sends its next request at once, then sends for clients still waiting for room. Every `PROGRESS_EVERY` it prints how
 /// many of its clients are done and the submits it has seen. Each client first waits one pause drawn from `think`, as
-/// it does after every reply, so the clients start apart as independent agents do.
+/// it does after every reply, so the clients start apart as independent agents do. A sweep that took no reply and sent
+/// nothing is followed by more for the spin window, then by a park until a reply or the worker's next deadline (the
+/// module's "Workers wait"), except while a connection is reconnecting or resending, whose own pacing the sweeps keep.
 fn drive(
   conns: Vec<Connection>,
   agents: Vec<Agent>,
@@ -1476,6 +1747,11 @@ fn drive(
   let check_every = conns.first().map_or(1, |conn| {
     (conn.client.deadlines().reply_ns / OVERDUE_CHECKS_PER_DEADLINE).max(1)
   });
+  let spin_ns = conns
+    .iter()
+    .map(|conn| conn.client.published_spin_ns())
+    .max()
+    .unwrap_or(0);
   let mut state = Worker {
     conns,
     agents,
@@ -1483,6 +1759,7 @@ fn drive(
     think,
     tally,
     clock,
+    spin_ns,
   };
   let mut reported = Instant::now();
   let mut checked = state.clock.now();
@@ -1490,16 +1767,11 @@ fn drive(
   let mut moved = Instant::now();
   let mut answers = 0u64;
   let mut dumped = false;
+  // The last time a sweep took a reply, sent a request or worked a reconnect: the spin window runs from it.
+  let mut active = checked;
   while state.agents.iter().any(|agent| agent.step != Step::Done) {
     let sweep = Instant::now();
-    for c in 0..state.conns.len() {
-      if state.conns[c].reconnecting.is_some() || !state.conns[c].resend.is_empty() {
-        state.recover(c);
-      } else if !state.conns[c].inflight.is_empty() {
-        state.drain(c);
-      }
-    }
-    state.send_ready();
+    let moved_any = state.sweep();
     state.tally.max_sweep_ns = state
       .tally
       .max_sweep_ns
@@ -1522,6 +1794,21 @@ fn drive(
       dumped = true;
       state.stall_dump(worker, moved.elapsed(), now);
     }
+    if moved_any {
+      active = now;
+      continue;
+    }
+    if now.saturating_sub(active) < state.spin_ns {
+      continue;
+    }
+    let report_in = PROGRESS_EVERY.saturating_sub(reported.elapsed());
+    let report_at = now.saturating_add(u64::try_from(report_in.as_nanos()).unwrap_or(u64::MAX));
+    let deadline = state
+      .next_due()
+      .unwrap_or(u64::MAX)
+      .min(checked.saturating_add(check_every))
+      .min(report_at);
+    state.park_until(deadline);
   }
   state.tally
 }
@@ -1630,8 +1917,9 @@ fn report(n: usize, tally: &mut Tally) {
   for (why, count) in &tally.refusals {
     println!("refusal\t{n}\t{count}\t{why}");
   }
+  // The parks' columns come last, so a reader of the earlier columns by position reads what it always did.
   println!(
-    "harness\t{n}\tstarved\t{}\trebase_conflicts\t{}\tmax_sweep_ns\t{}\tmax_drain_gap_ns\t{}\treconnects\t{}\tresent\t{}\tmax_outage_ns\t{}\tbackpressure\t{}\tretried\t{}\tunconfirmed\t{}",
+    "harness\t{n}\tstarved\t{}\trebase_conflicts\t{}\tmax_sweep_ns\t{}\tmax_drain_gap_ns\t{}\treconnects\t{}\tresent\t{}\tmax_outage_ns\t{}\tbackpressure\t{}\tretried\t{}\tunconfirmed\t{}\tparks\t{}\tparks_woken\t{}\tparked_ns\t{}\tpark_late_mean_ns\t{}",
     tally.starved,
     tally.rebase_conflicts,
     tally.max_sweep_ns,
@@ -1641,7 +1929,14 @@ fn report(n: usize, tally: &mut Tally) {
     tally.max_outage_ns,
     tally.backpressure,
     tally.retried,
-    tally.unconfirmed
+    tally.unconfirmed,
+    tally.parks,
+    tally.parks_woken,
+    tally.parked_ns,
+    tally
+      .park_late_ns
+      .checked_div(tally.parks_timed_out)
+      .unwrap_or(0)
   );
 }
 
@@ -2841,6 +3136,7 @@ mod tests {
     agent.green = green;
     agent.work = None;
     agent.step = Step::CreateWork;
+    let spin_ns = client.published_spin_ns();
     Worker {
       conns: vec![Connection::new(client, 0)],
       agents: vec![agent],
@@ -2852,22 +3148,32 @@ mod tests {
       tally: Tally::default(),
       // Epoch 0: the worker's instants are the host's monotonic clock itself, the daemon's spans' clock.
       clock: Clock { read, epoch: 0 },
+      spin_ns,
     }
   }
 
-  /// Every span the daemon's one shard holds, drained.
+  /// Keeps the calling thread from its work for `interval`, yielding its CPU meanwhile: the tests' stand-in for the host
+  /// taking a worker off its CPU, as the harness's own `patiently` waits. A blocking sleep is D-9's to refuse, and on
+  /// macOS under a launchd job's timer policy it comes back about 76 ms late (2026-10-26).
+  fn away_for(interval: Duration) {
+    let until = Instant::now() + interval;
+    while Instant::now() < until {
+      std::thread::yield_now();
+    }
+  }
+
+  /// Every span the daemon's one shard holds, drained, and the chokepoints' names the last report gave.
   fn spans(observer: &mut Client) -> (Vec<String>, Vec<slates_ipc::protocol::SpanRecord>) {
-    let mut names = Vec::new();
     let mut spans = Vec::new();
     loop {
       let report = observer.telemetry(0).unwrap();
-      names = report
-        .chokepoints
-        .iter()
-        .map(|point| point.name.clone())
-        .collect();
       spans.extend(report.spans);
       if report.remaining == 0 {
+        let names = report
+          .chokepoints
+          .iter()
+          .map(|point| point.name.clone())
+          .collect();
         return (names, spans);
       }
     }
@@ -2907,7 +3213,7 @@ mod tests {
       if std::mem::take(&mut first) {
         SEND_HOLD.release();
       }
-      std::thread::sleep(PREEMPTION);
+      away_for(PREEMPTION);
       slates_machine::clock::monotonic_ns()
     });
     let mut worker = worker_creating_a_work(client, green, read);
@@ -2946,7 +3252,7 @@ mod tests {
       let now = slates_machine::clock::monotonic_ns();
       if std::mem::take(&mut preempted) {
         REPLY_HOLD.release();
-        std::thread::sleep(PREEMPTION);
+        away_for(PREEMPTION);
       }
       now
     });
@@ -2961,6 +3267,94 @@ mod tests {
       replied_ns > ring.start_ns,
       "the reply is stamped {} ns before the daemon read its request",
       ring.start_ns.saturating_sub(replied_ns)
+    );
+    daemon.stop();
+  }
+
+  /// The module's "Workers wait" (A-421): a park lasts until its deadline less its margin, and a deadline no farther
+  /// than the margin is no park; the worker spins the rest of the way.
+  #[test]
+  fn a_park_wakes_its_margin_before_its_deadline() {
+    assert_eq!(park_timeout_ns(100, 1_000, 50), Some(850));
+    assert_eq!(park_timeout_ns(100, 1_000, 0), Some(900));
+    assert_eq!(park_timeout_ns(100, 150, 50), None);
+    assert_eq!(park_timeout_ns(100, 140, 50), None);
+    assert_eq!(park_timeout_ns(200, 100, 0), None);
+  }
+
+  /// The park test's hold.
+  static PARK_HOLD: Hold = Hold::new();
+  /// Shape: the deadline of the park the reply ends: fifty holds of the stamp tests' length, so a park that waited it
+  /// out is told from one the reply ended past any scheduling delay of a loaded host.
+  const PARK_DEADLINE: Duration = Duration::from_secs(5);
+  /// Shape: the deadline of the park nothing ends: thousands of times the daemon's published spin window (its measured
+  /// mean cost of a wake, microseconds), so the worker parks rather than spins on any host, and short enough to cost the
+  /// test nothing.
+  const QUIET_PARK: Duration = Duration::from_millis(20);
+  /// Shape: the clock read inside [`Worker::park_until`] at which the park test lets its shard go: the third, the
+  /// re-check drain's read after its ring was read (the first is the park's own, the second the drain's before the
+  /// ring), so the reply can come only once the connection is armed and its ring was found empty.
+  const RELEASE_AT_READ: u32 = 3;
+
+  /// The module's "Workers wait" (A-421): a worker whose request is in flight while the daemon's one shard is held
+  /// parks, and the daemon's reply, let go once the worker has armed its connection and found its ring empty, ends the
+  /// park long before its deadline and is there to be taken at once. With nothing in flight its next park meets its
+  /// deadline, less its margin, and the worker learns how late that wait came back.
+  #[test]
+  fn a_parked_worker_is_woken_by_its_reply() {
+    let (daemon, _observer, client, green) = stamp_daemon("park");
+    let holder = hold_the_shard(&daemon, &PARK_HOLD);
+    let mut worker =
+      worker_creating_a_work(client, green, Box::new(slates_machine::clock::monotonic_ns));
+    assert!(worker.send(0), "the creation went");
+    let mut reads = 0u32;
+    worker.clock.read = Box::new(move || {
+      reads = reads.saturating_add(1);
+      if reads >= RELEASE_AT_READ {
+        PARK_HOLD.release();
+      }
+      slates_machine::clock::monotonic_ns()
+    });
+    let parked_at = slates_machine::clock::monotonic_ns();
+    let deadline = parked_at + u64::try_from(PARK_DEADLINE.as_nanos()).unwrap();
+    let parked = worker.park_until(deadline);
+    let woke_after = slates_machine::clock::monotonic_ns() - parked_at;
+    // Let go before judging: a shard held past the watchdog's window would end the whole test process.
+    PARK_HOLD.release();
+    holder.join().unwrap();
+    assert_eq!(
+      parked,
+      Parked::Woken,
+      "the reply did not end the park (a park whose clock reads moved needs RELEASE_AT_READ moved with them)"
+    );
+    assert!(
+      woke_after < u64::try_from(PARK_DEADLINE.as_nanos()).unwrap() / 2,
+      "the park the reply should have ended lasted {woke_after} ns"
+    );
+    assert_eq!(
+      (worker.tally.parks, worker.tally.parks_woken),
+      (1, 1),
+      "one park, ended by the reply"
+    );
+    worker.drain(0);
+    assert_eq!(worker.agents[0].inflight, None, "the reply was there");
+    assert_eq!(worker.agents[0].step, Step::Edit(0), "the work was made");
+    let quiet_at = worker.clock.now();
+    let quiet = u64::try_from(QUIET_PARK.as_nanos()).unwrap();
+    let margin = worker.park_margin_ns();
+    assert_eq!(worker.park_until(quiet_at + quiet), Parked::TimedOut);
+    assert!(
+      worker.clock.now() - quiet_at >= quiet - margin,
+      "the park left before its deadline less its margin"
+    );
+    assert_eq!(
+      (worker.tally.parks, worker.tally.parks_timed_out),
+      (2, 1),
+      "the second park met its deadline"
+    );
+    assert!(
+      worker.park_margin_ns() >= worker.spin_ns,
+      "the margin is the spin window and the parks' lateness"
     );
     daemon.stop();
   }

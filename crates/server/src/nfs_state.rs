@@ -292,7 +292,7 @@ pub(crate) fn file_state(s: &mut ShardState) -> Option<FileState> {
   );
   let mut files = restored;
   // A recalled file is not delegated again for a lease (RFC 8881 §10.4, A-78).
-  files.set_delegation_quiet(s.config.failover_slo_ns);
+  files.set_delegation_quiet(crate::nfs::v4_lease_ns(s));
   // The gate starts closed on every file a kept delegation names (a restart must not let a change slip past one), set
   // whole once; the restore's own changed inodes are then already reflected.
   s.store.recall_gate.reset(files.delegated_holders());

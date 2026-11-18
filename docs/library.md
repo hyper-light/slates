@@ -177,7 +177,8 @@ nothing answers until detached) and mounts nothing (a mount is a record). The co
   more marked for its guest to map while the shard's fill budget has room), `serve_vhost_user(..)`
   (Linux), `detach(attachment)`.
   `slates_api::mount::available()` says, with no daemon, whether this machine can mount a volume
-  and through what (`MountKind`), or what is missing (`MountMissing`). `slates_api::mount::unmount_busy(path)`
+  and through what (`MountKind`), or what is missing (`MountMissing`; on Windows that includes
+  `MountManager`, the one-time setting that lets WinFsp's driver make the drive). `slates_api::mount::unmount_busy(path)`
   lets go of a mount that a leftover process still uses, with no daemon and no privilege, and answers how
   (`LetGo`): `Detached` on Linux (`fusermount3 -u -z`: the holder reads on until it closes), `Forced` on macOS and
   the BSDs (`umount -f`: the holder's next call fails; the loopback NFS mount is `hard`, so this is the way off it
@@ -293,6 +294,13 @@ fn workspace(folder: &std::path::Path, at: &str) -> Result<(), slates_api::Error
 
 ## What is owed
 
+The gap ledger's consumer-contract entry audits this library clause by clause, naming the tests
+that hold each one and where they run. What it found owed, with the rest:
+
 1. A typed field on the wire for a merge's versions (the work's base beside the head).
 2. The async form for the remaining verbs: the paged reads, landings, merges, policies and
    observation.
+3. Tests through the library on Windows for changes, drift, landing plans and grant-bound
+   landing (the daemon lands there, and these tests run on Unix only), and for the Shards stream.
+4. A test of `serve_vhost_user` through the library (Linux).
+5. The example above compiled by a test, so it cannot drift from the API.

@@ -399,15 +399,29 @@ pub fn available() -> Result<MountKind, MountFault> {
   fuse_available(command_on_path("fusermount3"), device.is_ok())
 }
 
-/// See the macOS arm: Windows needs WinFsp's library to load (its own `FspLoad` search).
+/// See the macOS arm: Windows needs WinFsp's library to load (its own `FspLoad` search), and the machine to let WinFsp's
+/// driver make the mount's drive (A-369), which the driver decides at every mount from `MountUseMountmgrFromFSD` (A-417):
+/// without it a host was told it could mount, and each mount was then refused `MountManagerNotAllowed`.
 #[cfg(windows)]
 pub fn available() -> Result<MountKind, MountFault> {
-  if slates_bridge_winfsp::host::installed() {
-    Ok(MountKind::WinFsp)
-  } else {
-    Err(MountFault::Unsupported {
+  winfsp_available(
+    slates_bridge_winfsp::host::installed(),
+    slates_bridge_winfsp::host::mount_manager_allowed(),
+  )
+}
+
+/// WinFsp's availability from the two facts it needs: its library loads, and the machine lets its driver make the
+/// mount's drive. Pure, so every case tests on any host.
+#[cfg(any(windows, test))]
+fn winfsp_available(library_loads: bool, drive_allowed: bool) -> Result<MountKind, MountFault> {
+  match (library_loads, drive_allowed) {
+    (true, true) => Ok(MountKind::WinFsp),
+    (false, _) => Err(MountFault::Unsupported {
       missing: MountMissing::WinFsp,
-    })
+    }),
+    (true, false) => Err(MountFault::Unsupported {
+      missing: MountMissing::MountManager,
+    }),
   }
 }
 
@@ -676,6 +690,7 @@ const BUSY_UNMOUNT: LetGo = LetGo::Forced;
 mod tests {
   use super::{
     MountBackend, MountKind, classify, export_path, fuse_available, mount_args, nfs_available,
+    winfsp_available,
   };
   use crate::error::{MountFault, MountMissing};
 
@@ -811,6 +826,41 @@ mod tests {
       Err(MountFault::Unsupported {
         missing: MountMissing::MountNfs
       })
+    );
+  }
+
+  /// §4.6, A-369, A-417 — a Windows host is told it can mount only when the mount would be made: WinFsp's library loads
+  /// and the machine lets WinFsp's driver make the drive (`MountUseMountmgrFromFSD`). Do: each pair of the two facts.
+  /// Expect `WinFsp` with both, the library named first without it (no drive is asked for then), and the Mount Manager
+  /// setting named when only it is missing. Before A-417 the second fact was not asked, so a machine without the
+  /// setting was told it could mount and each mount was refused `MountManagerNotAllowed` after its volume was made.
+  /// Pure, so every case runs on any host.
+  #[test]
+  fn a_windows_mount_is_available_only_where_winfsps_driver_may_make_its_drive() {
+    assert_eq!(winfsp_available(true, true), Ok(MountKind::WinFsp));
+    assert_eq!(
+      winfsp_available(true, false),
+      Err(MountFault::Unsupported {
+        missing: MountMissing::MountManager
+      })
+    );
+    assert_eq!(
+      winfsp_available(false, true),
+      Err(MountFault::Unsupported {
+        missing: MountMissing::WinFsp
+      })
+    );
+    assert_eq!(
+      winfsp_available(false, false),
+      Err(MountFault::Unsupported {
+        missing: MountMissing::WinFsp
+      }),
+      "the library is named first: without it no drive is ever asked for"
+    );
+    let words = MountMissing::MountManager.to_string();
+    assert!(
+      words.contains("MountUseMountmgrFromFSD") && words.contains("REG_DWORD /d 1"),
+      "the refusal names the one command that allows it: {words}"
     );
   }
 

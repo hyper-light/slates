@@ -18,7 +18,7 @@ use slates_machine::wake::WakeEstimate;
 
 use crate::error::IpcError;
 use crate::region::{
-  ClientRegion, PARKED_STAMP_SLOT_ONE, PARKED_STAMP_SLOT_ZERO, REPLY_STAMP_CONFIRMED,
+  ClientRegion, PARKED_ASYNC, PARKED_STAMP_SLOT_ONE, PARKED_STAMP_SLOT_ZERO, REPLY_STAMP_CONFIRMED,
   REPLY_STAMP_SLOTS,
 };
 use crate::slot::{Slot, SlotKind};
@@ -351,17 +351,19 @@ impl ClientEnd {
 
   /// Arms the completion signal before the SDK yields to its event loop: the daemon wakes a parked
   /// client on a reply, making the completion fd readable, and the bridges nudge their pipe or socket
-  /// only while armed. This is the same `parked` flag the sync [`Self::wait`] sets; the async path manages
-  /// it explicitly because it never calls `wait`. A caller re-checks [`Self::try_take`] right after
-  /// arming to close the race with a reply that landed during the spin; the park protocol's fence
-  /// ([`crate::park::after_arming`]) orders that re-check after the flag, so a reply it misses is one the
-  /// daemon sees the flag for and wakes on (before 2026-09-29 there was no fence, and both could miss).
+  /// only while armed. This is the same `parked` flag the sync [`Self::wait`] sets, with a value of its own
+  /// ([`PARKED_ASYNC`]), so a running bridge tells a synchronous park, whose wake it passes on, from the
+  /// arm; the async path manages it explicitly because it never calls `wait`. A caller re-checks
+  /// [`Self::try_take`] right after arming to close the race with a reply that landed during the spin; the
+  /// park protocol's fence ([`crate::park::after_arming`]) orders that re-check after the flag, so a reply
+  /// it misses is one the daemon sees the flag for and wakes on (before 2026-09-29 there was no fence, and
+  /// both could miss).
   pub fn arm_async(&self) -> Result<(), IpcError> {
-    // The async path times no wake, so its stamp slot is never read: slot 0's flag only marks it armed.
+    // The async path times no wake, so the stamp slot the daemon reads its value as (slot 0) is never read.
     self
       .region
       .client_parked()?
-      .store(PARKED_STAMP_SLOT_ZERO, Ordering::Release);
+      .store(PARKED_ASYNC, Ordering::Release);
     crate::park::after_arming();
     Ok(())
   }
@@ -555,15 +557,8 @@ impl ClientEnd {
         *given_up = None;
       }
       self.region.reply_stamp(slot)?.store(0, Ordering::Relaxed);
-      // A running completion bridge waits where this park does: the mark, raised before the flag, has it pass on a wake
-      // it takes while this park waits (see `crate::completion`).
-      #[cfg(any(target_os = "macos", windows))]
-      let _passed_on = SyncPark::raise(
-        self
-          .bridge
-          .as_ref()
-          .map(crate::completion::CompletionBridge::sync_parked),
-      );
+      // A running completion bridge waits where this park does: the flag's value, a stamp slot's and never the async
+      // arm's, has it pass on a wake it takes while this park waits (see `crate::completion`).
       self
         .region
         .client_parked()?
@@ -608,31 +603,6 @@ impl ClientEnd {
         }
         return Err(IpcError::DeadlineExceeded);
       }
-    }
-  }
-}
-
-/// A synchronous park's mark for a running completion bridge (`CompletionBridge::sync_parked`): raised before the park's
-/// flag, lowered when the park's turn ends, so a wake the bridge takes meanwhile is passed on to the parked call.
-#[cfg(any(target_os = "macos", windows))]
-struct SyncPark(Option<&'static std::sync::atomic::AtomicBool>);
-
-#[cfg(any(target_os = "macos", windows))]
-impl SyncPark {
-  /// Raises `mark`, when the client has a bridge.
-  fn raise(mark: Option<&'static std::sync::atomic::AtomicBool>) -> SyncPark {
-    if let Some(mark) = mark {
-      mark.store(true, Ordering::SeqCst);
-    }
-    SyncPark(mark)
-  }
-}
-
-#[cfg(any(target_os = "macos", windows))]
-impl Drop for SyncPark {
-  fn drop(&mut self) {
-    if let Some(mark) = self.0 {
-      mark.store(false, Ordering::SeqCst);
     }
   }
 }

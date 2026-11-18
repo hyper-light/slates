@@ -402,6 +402,12 @@ impl OwnTime {
 /// What one attempt of an observation established: an end (an admitted task, or a final refusal), or
 /// a capacity refusal to retry inside the budget — kept, so a deadline reached by a later attempt that
 /// met no refusal of its own still names the refusal that held the observation up.
+/// Why an observation's task was not admitted: it ended (refused for good, or past its deadline), or it is asked again.
+enum NotAdmitted {
+  Ended(ObserveError),
+  Retry(RtError),
+}
+
 enum Attempt<T> {
   Ended(Result<Admitted<T>, ObserveError>),
   Retry(RtError),
@@ -529,7 +535,8 @@ where
         attempts,
         time: *time,
       })),
-      Err(attempt) => attempt,
+      Err(NotAdmitted::Ended(error)) => Attempt::Ended(Err(error)),
+      Err(NotAdmitted::Retry(refusal)) => Attempt::Retry(refusal),
     }
   }
 
@@ -568,13 +575,13 @@ where
     attempts: u32,
     began: Instant,
     deadline: Instant,
-  ) -> Result<TaskId, Attempt<T>> {
-    Err(Attempt::Ended(Err(match admission {
+  ) -> Result<TaskId, NotAdmitted> {
+    Err(NotAdmitted::Ended(match admission {
       Some(Admission::Admitted(task)) => return Ok(task),
       Some(Admission::Refused(refusal @ RtError::TooManyTasks { .. }))
         if Instant::now() < deadline =>
       {
-        return Err(Attempt::Retry(refusal));
+        return Err(NotAdmitted::Retry(refusal));
       }
       Some(Admission::Refused(refusal @ RtError::TooManyTasks { .. })) => {
         self.deadline(ObserveStage::Admission, attempts, began, Some(refusal))
@@ -589,7 +596,7 @@ where
         attempts,
       },
       None => self.deadline(ObserveStage::Admission, attempts, began, None),
-    })))
+    }))
   }
 
   /// The deadline error for `stage`.

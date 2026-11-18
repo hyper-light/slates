@@ -954,13 +954,16 @@ fn a_landings_signature_decides_nothing_its_mode_decides() {
   daemon.stop();
 }
 
+/// A signer by name: its name and the function that signs bytes with it.
+type NamedSigner<'a> = (&'a str, &'a dyn Fn(&[u8]) -> Vec<u8>);
+
 /// One invalid landing of `a_landings_signature_decides_nothing_its_mode_decides`. Do: land a bypass volume `name`
 /// trusting `trusted`, signed by `sign` over the statement its presentation stated. Expect it written at once and
 /// answered invalid for `fault`: the verdict is provenance and refuses nothing.
 fn expect_landed_invalid(
   client: &mut Client,
   (secret, trusted): (&[u8; 32], &TestSigner),
-  (name, sign): (&str, &dyn Fn(&[u8]) -> Vec<u8>),
+  (name, sign): NamedSigner<'_>,
   fault: SignatureFault,
 ) {
   let (volume, target, statement) = bypassed(client, secret, (name, name.as_bytes()), trusted);
