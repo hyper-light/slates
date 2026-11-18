@@ -6398,8 +6398,27 @@ reconstruction budget are derived, never fixed (D-O6).
 > once at the walk's end. Counted `fleet.seal.walks` / `fleet.seal.walk_slices` (`fleet.mirror.*` for the mirror
 > track). Held by `a_shards_seals_are_walked_in_turns_and_every_one_places` (`crates/server/tests/fleet.rs`: 12 volumes
 > sealed at once with the turn cut to one volume, every snapshot placed). Owed (measurement): the owner shard's longest
-> step while hundreds of volumes seal at once, before and after; and the envelope wrap at a seal's end
-> (`fleet::envelope_of`) is still one turn of the whole archive's new chunks (64 MiB took 98 ms, 2026-10-05).
+> step while hundreds of volumes seal at once, before and after. The envelope wrap at a seal's end, one turn of the
+> whole archive until 2026-11-18, is in turns too (A-323, below).
+
+> **Status (2026-11-18, A-322 and A-323, g230: a seal's envelope in turns, and a refused one started again).** On a
+> node that seals, a seal's archive is wrapped in its envelope (A-92 piece 3b) before its content is put. The wrap ran
+> whole in the turn the archive walk ended (`fleet::envelope_of`): 98 ms for 64 MiB of 64 KiB chunks (`envelope_bench`,
+> 2026-10-05), so at about a GiB one turn ran past the watchdog's window of a second, and the watchdog ended the owner at
+> every seal of such a volume. It now runs in turns (A-323): the job keeps the plain archive inside a
+> `slates_cluster::envelope::Wrapping`, and each visit of the seal walk seals its chunks, one at least, until the share of
+> the turn's quantum the archive walk takes has passed on the shard's clock (`config::wrap_slice_ns`; the wrap has no
+> measured rate of its own, so it is held to the clock), then seals the manifest last; the envelope is the very one a
+> whole wrap makes. The volume's keys are found again each turn, since a volume's lineage and naming keys are made once
+> and never replaced. Counted `fleet.seal.wrap_slices` (`fleet.mirror.wrap_slices` for a mirror shipment). And a refused
+> envelope now drops its seal (A-322): the job was kept with its walk spent and no archive, so every later period found
+> it complete with nothing to put, its head never placed whatever the keys did next, and a heal kept that way shut the
+> healer out of the volume. Held by `a_seals_envelope_is_wrapped_in_turns_and_places` and
+> `a_seal_whose_envelope_was_refused_is_started_again_and_places` (`crates/server/tests/fleet.rs`) and by
+> `an_envelope_wrapped_in_slices_is_the_whole_wraps_to_the_byte` and `a_wrap_ends_at_its_envelope_or_its_refusal`
+> (`crates/cluster/tests/envelope.rs`). Owed (measurement): the owner shard's longest step while a GiB volume seals,
+> before and after. Owed: a seal's archive walk and its wrap each advance one slice a record period, so a large volume
+> takes many periods to place (GAPS); and a takeover's open of the envelope still runs in one turn of the successor.
 
 **Auto-seal.** Each volume seals at its derived cadence (or on explicit `snapshot`, on `detach`,
 on `archive`, and when the owner is asked to drain); publishing a server root is O(1), while
@@ -12856,7 +12875,8 @@ hand-off to a successor), and only for the member its committed configuration na
 successor keeps it only when the volume's naming record opens under it. "A successor takes a volume only by a key
 wrapped to it" holds: the key reaches a candidate of the volume and no other node, wrapped to that candidate.
 Built (2026-10-05): piece 3b, the envelope archive (`slates_cluster::envelope`), on hyper-raft `f9a2c8e`. When a seal's
-archive is complete, the owner shard wraps it (`fleet::envelope_of`). Each chunk is sealed under a data key derived from
+archive is complete, the owner shard wraps it (`fleet::wrap_slice`; in turns of its step quantum since A-323, 2026-11-18,
+where one turn wrapped it whole before). Each chunk is sealed under a data key derived from
 the volume's lineage key and the BLAKE3 of exactly the record sealed (hyper-seal `FileSealer::content_keyed`, seal.md
 §4). Keying by the record and not the chunk's identity matters: one identity can be stored under two encodings, and
 keying by it would seal two plaintexts under one key and nonce (`keyed_names_match_within_a_tenant_and_differ_across_
@@ -12866,7 +12886,8 @@ creation time zeroed, is sealed as one more chunk, so a re-seal of the same snap
 same envelope. The envelope's clear tree names `c<keyed name>` per sealed chunk and `m<keyed name>` for the manifest.
 Its root metadata carries inode `u64::MAX`, which no volume root has, and the manifest identity a head pins covers
 it, so a holder cannot make a reader take one kind of archive for the other. A node that seals never places in the
-clear: a key or a seal that refuses drops the seal (`fleet.seal.envelope_refused`) for the next period; a node whose
+clear: a key or a seal that refuses drops the seal (`fleet.seal.envelope_refused`) for the next period (so since A-322,
+2026-11-18: the job was kept with nothing to do before, and its head never placed); a node whose
 sealing is `unavailable` (no locked key region or root) places as before, and status says so. A successor adopts the
 lineage and naming keys from the head before it materializes and opens the envelope with them; without them it
 refuses (`fleet.seal.envelope_unopened`) and never serves ciphertext as files. Proven:
@@ -23516,3 +23537,46 @@ Applied in the same change to:
   fence) and one more try. A target pays A-279's fence and load per drain that took a message. To measure (the
   supervisor's): the 3,000-client rung's `xshard.reply_dropped` (about 4,200 before, 0 expected),
   `xshard.room_waits_peak`, and each verb's p99 against main.
+
+### A-322 — A seal whose envelope is refused is dropped and started again the next period (2026-11-18, g230, scale-out; a bug against A-92 piece 3b's own words)
+Applied in the same change to:
+- §4.10 "Content replication": the status of 2026-11-18 (A-322 and A-323); the A-92 record's piece 3b paragraph.
+- `crates/server/src/fleet.rs`: `wrap_slice`'s refusal drops the seal job from its track's map (`advance_seal` is the
+  caller), so the next period starts it again; `envelope_of` is gone (A-323).
+- Tests: `a_seal_whose_envelope_was_refused_is_started_again_and_places` (`crates/server/tests/fleet.rs`).
+- GAPS: the entry of 2026-11-18. The bug record: `docs/bugs/2026-11-18-a-refused-envelope-left-its-seal-with-nothing-to-do.md`.
+- **What was there.** A-92 piece 3b says a key or a seal that refuses "drops the seal for the next period". The code kept
+  the job with its walk spent (`archiver: None`) and no archive. `advance_seal` read a job with no walk as complete, and
+  `content_work` found no archive to put, every period after: the seal never started again, its head never placed
+  while that snapshot was the head, and a heal kept that way shut the healer out of the volume, since the healer passes
+  over a volume with a job.
+- **The rule.** A seal whose envelope is refused, by a key or by the seal, leaves its track's map at once, counted
+  `fleet.seal.envelope_refused`; the next period's walk finds no job and starts the seal again, from its archive walk.
+
+### A-323 — The envelope wrap at a seal's end runs in turns of the shard's step quantum (2026-11-18, g230, scale-out; CLAUDE.md "Bounded work everywhere")
+Applied in the same change to:
+- §4.10 "Content replication": the status of 2026-11-18 (A-322 and A-323) and the seal walk's status; the A-92 record's
+  piece 3b paragraph.
+- `crates/cluster/src/envelope.rs`: `Wrapping` (`new`, `advance`, `chunks_left`), `EnvelopeError::Spent`; `wrap` is one
+  whole advance; the module doc.
+- `crates/server/src/fleet.rs`: `SealSlicing`, `advance_seal` (the walk, then the wrap), `wrap_slice` and `wrap_until`,
+  counters `fleet.seal.wrap_slices` and `fleet.mirror.wrap_slices`; `crates/server/src/head.rs` (`SealJob::wrapping`);
+  `crates/server/src/config.rs` (`wrap_slice_ns`).
+- Tests: `an_envelope_wrapped_in_slices_is_the_whole_wraps_to_the_byte` and `a_wrap_ends_at_its_envelope_or_its_refusal`
+  (`crates/cluster/tests/envelope.rs`); `a_seals_envelope_is_wrapped_in_turns_and_places` (`crates/server/tests/fleet.rs`).
+- GAPS: the entry of 2026-11-18; the envelope's and the seal walk's entries of 2026-11-17 (their wrap item closed).
+- **What was there.** The owner shard wrapped a seal's whole archive in the turn its walk ended: 98 ms for 64 MiB of
+  64 KiB chunks at load 14 on an M5 Max (`envelope_bench`, 2026-10-05), about 1.5 s a GiB. The watchdog ends a daemon
+  whose shard runs a whole window of CPU without finishing a step (A-228; the window is a second), so a seal of a volume
+  of about a GiB ended its owner, and the restart sealed it again.
+- **The rule.** The archive the walk completes moves into a `Wrapping` on the seal job. Each visit of the seal walk
+  seals the archive's chunks in the order the archive lists them, one at a time, until `wrap_slice_ns` of the turn's
+  quantum (the archive walk's share, half) has passed on the shard's clock, one chunk at least, and seals the archive
+  without its chunks last. The wrap has no measured rate of its own in the boot profile (a seal and three BLAKE3 passes
+  a byte, where the walk's slice is sized by one), so it is held to the clock, not to a byte count. A turn is then about
+  a quantum and one chunk, whatever the volume. The envelope is the one a whole wrap makes, byte for byte, so a holder
+  and the healer see no difference. The keys are found again each turn: a volume's lineage and naming keys are made once
+  and never replaced. A refusal at any turn drops the seal (A-322).
+- **Cost.** A large volume's seal places later: the walk and the wrap each advance a slice a record period. The plain
+  archive is kept in the job until the wrap ends, as the whole wrap kept it (and copied it once more) for its turn.
+

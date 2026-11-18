@@ -2775,7 +2775,7 @@ fn open_mirror_walk(state: &mut ShardState, local: HostId) -> bool {
 fn advance_mirror_seal(
   state: &mut ShardState,
   (id, handle): (DbVolumeId, slates_mem::Handle<crate::state::VolumeSlot>),
-  (slice_bytes, created_unix): (u64, u64),
+  slicing: SealSlicing,
   round: CommitBudget,
 ) -> Option<ContentWork> {
   let object = ObjectId(id.bytes);
@@ -2791,12 +2791,12 @@ fn advance_mirror_seal(
     state.mirror_seals.remove(&object);
   }
   if !state.mirror_seals.contains_key(&object) {
-    if !start_mirror_seal(state, object, handle, head, created_unix) {
+    if !start_mirror_seal(state, object, handle, head, slicing.created_unix) {
       return None;
     }
     state.count(MIRROR_JOB_STARTED, 1);
   }
-  if !advance_seal(state, Track::Mirror, object, handle, slice_bytes) {
+  if !advance_seal(state, Track::Mirror, object, handle, slicing) {
     return None;
   }
   let quorum = state.fleet.configuration().quorum;
@@ -2851,6 +2851,7 @@ fn start_mirror_seal(
       sequence,
       put_sequence: sequence,
       archiver: Some(archiver),
+      wrapping: None,
       archive: None,
       manifest: None,
       content: Placement {
@@ -2961,7 +2962,7 @@ fn advance_home_seal(
   state: &mut ShardState,
   local: HostId,
   (id, handle): (DbVolumeId, slates_mem::Handle<crate::state::VolumeSlot>),
-  (slice_bytes, created_unix): (u64, u64),
+  slicing: SealSlicing,
   round: CommitBudget,
 ) -> Option<ContentWork> {
   let object = ObjectId(id.bytes);
@@ -2987,13 +2988,13 @@ fn advance_home_seal(
       handle,
       head,
       sequence,
-      created_unix,
+      slicing.created_unix,
       None,
     )
   {
     return None;
   }
-  if !advance_seal(state, Track::Home, object, handle, slice_bytes) {
+  if !advance_seal(state, Track::Home, object, handle, slicing) {
     return None;
   }
   let quorum = state.fleet.configuration().quorum;
@@ -3036,14 +3037,15 @@ fn seal_walk_slice(
   if opening && track == Track::Mirror && !open_mirror_walk(state, local) {
     return (Vec::new(), None);
   }
-  let slicing = (
-    state.config.archive_slice_bytes(),
-    u64::try_from(state.clock.wall_ns()).unwrap_or(0) / NANOS_PER_SECOND,
-  );
   let quantum = state
     .seal_walk_quantum_ns
     .or_else(futures::step_budget_ns)
     .unwrap_or(state.config.runtime.step_budget_ns);
+  let slicing = SealSlicing {
+    archive_bytes: state.config.archive_slice_bytes(),
+    wrap_ns: crate::config::wrap_slice_ns(quantum),
+    created_unix: u64::try_from(state.clock.wall_ns()).unwrap_or(0) / NANOS_PER_SECOND,
+  };
   let began = futures::now_ns();
   let mut cursor = after;
   let mut work = Vec::new();
@@ -3070,7 +3072,7 @@ fn seal_walk_slice(
     }
   };
   if remaining.is_none() && track == Track::Home {
-    heal_one_placed_snapshot(state, local, slicing.1);
+    heal_one_placed_snapshot(state, local, slicing.created_unix);
   }
   (work, remaining)
 }
@@ -3425,6 +3427,7 @@ fn start_seal(
       sequence,
       put_sequence,
       archiver: Some(archiver),
+      wrapping: None,
       archive: None,
       manifest: None,
       content,
@@ -3460,15 +3463,30 @@ fn restoring(job: &SealJob) -> bool {
   job.healing && !job.republish
 }
 
-/// Advances `object`'s seal one slice of `slice_bytes`; `true` once its archive is complete (this slice or
-/// an earlier one). A snapshot that cannot be archived whole (an overlay's base bytes are not in RAM) stays
-/// `Local`, counted so an operator sees why it never places (§4.4 coverage is never upgraded).
+/// How one turn of the seal walk slices each volume's seal ([`seal_walk_slice`]): the bytes its archive walk may hash,
+/// the time its envelope's wrap may take (A-323), and the creation time a new archive carries.
+#[derive(Clone, Copy, Debug)]
+struct SealSlicing {
+  /// The bytes one archive-walk slice may hash (`DaemonConfig::archive_slice_bytes`).
+  archive_bytes: u64,
+  /// How long one wrap slice may seal chunks for (`config::wrap_slice_ns` of the turn's quantum); a chunk at least.
+  wrap_ns: u64,
+  /// The informational creation time a new archive carries, Unix seconds.
+  created_unix: u64,
+}
+
+/// Advances `object`'s seal one slice: its archive walk one slice of `slicing.archive_bytes`, then, once the archive is
+/// complete on a node that seals, its envelope one slice of `slicing.wrap_ns` ([`wrap_slice`]); `true` once the archive
+/// the content puts carry is complete (this turn or an earlier one). A snapshot that cannot be archived whole (an
+/// overlay's base bytes are not in RAM) stays `Local`, counted so an operator sees why it never places (§4.4 coverage is
+/// never upgraded). An archive whose envelope is refused drops the job, so the next period starts the seal again
+/// (A-322).
 fn advance_seal(
   state: &mut ShardState,
   track: Track,
   object: ObjectId,
   handle: slates_mem::Handle<crate::state::VolumeSlot>,
-  slice_bytes: u64,
+  slicing: SealSlicing,
 ) -> bool {
   // The track's map is picked field by field, so the job is borrowed beside the volumes and the store.
   let jobs = match track {
@@ -3478,47 +3496,59 @@ fn advance_seal(
   let Some(job) = jobs.get_mut(&object) else {
     return false;
   };
-  let Some(archiver) = job.archiver.as_mut() else {
-    return true;
-  };
-  let Ok(slot) = state.volumes.get(handle) else {
-    return false;
-  };
-  let archive = match archiver.advance(&slot.volume, &state.store, slice_bytes) {
-    Ok(Progress::More) => return false,
-    Ok(Progress::Done(archive)) => {
-      job.archiver = None;
-      archive
-    }
-    Err(_) => {
-      job.archiver = None;
-      state.count(SEAL_REFUSED, 1);
+  if let Some(archiver) = job.archiver.as_mut() {
+    let Ok(slot) = state.volumes.get(handle) else {
       return false;
+    };
+    match archiver.advance(&slot.volume, &state.store, slicing.archive_bytes) {
+      Ok(Progress::More) => return false,
+      Ok(Progress::Done(archive)) => {
+        job.archiver = None;
+        // Where this node cannot seal at all (its key region or root unavailable, reported in status) the archive is
+        // placed as it is; where it can, the archive is wrapped first, from this turn on.
+        if state.seal_root.is_none() {
+          job.manifest = Some(archive.manifest_identity());
+          job.archive = Some(archive);
+          return true;
+        }
+        let segment = archive.base_page_size;
+        job.wrapping = Some(slates_cluster::envelope::Wrapping::new(archive, segment));
+      }
+      Err(_) => {
+        job.archiver = None;
+        state.count(SEAL_REFUSED, 1);
+        return false;
+      }
     }
-  };
-  let Some(archive) = envelope_of(state, object, archive) else {
-    return false;
-  };
-  let Some(job) = seal_jobs(state, track).get_mut(&object) else {
-    return false;
-  };
-  job.manifest = Some(archive.manifest_identity());
-  job.archive = Some(archive);
-  true
+  }
+  if job.wrapping.is_none() {
+    return true;
+  }
+  wrap_slice(state, track, object, slicing.wrap_ns)
 }
 
-/// The archive a seal places (A-92 piece 3b): `archive` wrapped in an envelope under the volume's lineage and naming
-/// keys (`slates_cluster::envelope`), so holders keep ciphertext and hold no key, in segments of the volume's base page
-/// (seal.md §4: the smallest unit slates reads and seals at). Where this node cannot seal at all (its key region or
-/// root unavailable, reported in status) the archive is placed as it is. Where it can but a key or the seal refuses,
-/// `None`: the seal is refused and counted, and the next period starts it again; content is never placed in the clear
-/// by a node that seals.
-fn envelope_of(state: &mut ShardState, object: ObjectId, archive: Archive) -> Option<Archive> {
-  if state.seal_root.is_none() {
-    return Some(archive);
-  }
+/// What one turn's slice of an envelope's wrap came to ([`wrap_slice`]).
+enum Wrapped {
+  /// The envelope is complete: the archive the content puts carry.
+  Envelope(Archive),
+  /// Chunks remain for a later turn.
+  More,
+  /// A key or the seal refused.
+  Refused,
+}
+
+/// One turn's slice of `object`'s envelope (A-92 piece 3b, A-323): the archive the seal places wrapped under the
+/// volume's lineage and naming keys (`slates_cluster::envelope`), so holders keep ciphertext and hold no key, in segments
+/// of the volume's base page (seal.md §4: the smallest unit slates reads and seals at). Chunks are sealed until `wrap_ns`
+/// has passed on the shard's clock, one at least, so no turn seals the whole archive (64 MiB took 98 ms in one turn,
+/// 2026-10-05, and about a GiB ran past the watchdog's window). The keys are found again each turn, which costs a few
+/// key unwraps: a volume's lineage and naming keys are made once and never replaced (`crate::seal_keys`), so every turn
+/// seals under the keys the first did. `true` once the envelope is complete. Where a key or the seal refuses, the seal
+/// is dropped and counted (A-322), and the next period starts it again; content is never placed in the clear by a node
+/// that seals.
+fn wrap_slice(state: &mut ShardState, track: Track, object: ObjectId, wrap_ns: u64) -> bool {
   let id = DbVolumeId { bytes: object.0 };
-  let sealed = state
+  let keys = state
     .db
     .partition()
     .volume(id)
@@ -3526,13 +3556,68 @@ fn envelope_of(state: &mut ShardState, object: ObjectId, archive: Archive) -> Op
     .and_then(|account| {
       let lineage = crate::seal_keys::lineage(state, id, account).ok()?;
       let namer = crate::seal_keys::namer(state, id, account).ok()?;
-      slates_cluster::envelope::wrap(&archive, &lineage, &namer, archive.base_page_size).ok()
+      Some((lineage, namer))
     });
-  if sealed.is_none() {
-    state.count(SEAL_ENVELOPE_REFUSED, 1);
+  let began = futures::now_ns();
+  let wrapped = match (&keys, seal_jobs(state, track).get_mut(&object)) {
+    (Some((lineage, namer)), Some(job)) => match job.wrapping.as_mut() {
+      Some(wrapping) => wrap_until(wrapping, (lineage, namer), began, wrap_ns),
+      None => return true,
+    },
+    (None, Some(_)) => Wrapped::Refused,
+    (_, None) => return false,
+  };
+  let slices = match track {
+    Track::Home => SEAL_WRAP_SLICES,
+    Track::Mirror => MIRROR_WRAP_SLICES,
+  };
+  state.count(slices, 1);
+  match wrapped {
+    Wrapped::Envelope(envelope) => {
+      let Some(job) = seal_jobs(state, track).get_mut(&object) else {
+        return false;
+      };
+      job.wrapping = None;
+      job.manifest = Some(envelope.manifest_identity());
+      job.archive = Some(envelope);
+      true
+    }
+    Wrapped::More => false,
+    Wrapped::Refused => {
+      // A refused envelope drops the seal, so the next period starts it again (A-322). Until 2026-11-18 the job was
+      // kept with its walk spent and no archive: every later period found it complete and nothing to put, so its head
+      // never placed, whatever the keys did next; a heal kept that way shut the healer out of the volume as well.
+      seal_jobs(state, track).remove(&object);
+      state.count(SEAL_ENVELOPE_REFUSED, 1);
+      false
+    }
   }
-  sealed
 }
+
+/// Seals `wrapping`'s chunks one at a time under `keys` until `wrap_ns` has passed since `began` on the shard's clock,
+/// one chunk at least ([`wrap_slice`]).
+fn wrap_until(
+  wrapping: &mut slates_cluster::envelope::Wrapping,
+  (lineage, namer): (&hyper_seal::keys::WrappingKey, &hyper_seal::name::Namer),
+  began: u64,
+  wrap_ns: u64,
+) -> Wrapped {
+  loop {
+    // A budget of one byte seals exactly one chunk (or, with none left, the manifest), so the clock is read between
+    // chunks.
+    match wrapping.advance(lineage, namer, 1) {
+      Ok(Some(envelope)) => return Wrapped::Envelope(envelope),
+      Ok(None) if futures::now_ns().saturating_sub(began) < wrap_ns => {}
+      Ok(None) => return Wrapped::More,
+      Err(_) => return Wrapped::Refused,
+    }
+  }
+}
+
+/// Counter: one owner-shard turn's slice of a home seal's envelope wrap ([`wrap_slice`], A-323).
+const SEAL_WRAP_SLICES: &str = "fleet.seal.wrap_slices";
+/// Counter: one owner-shard turn's slice of a mirror shipment's envelope wrap.
+const MIRROR_WRAP_SLICES: &str = "fleet.mirror.wrap_slices";
 
 /// Derived: how many put-latency readings the owner shard keeps for the content class's p95 — the
 /// acknowledgements of one recovery budget of seals. A seal is put to at most `2f` remote candidates, one

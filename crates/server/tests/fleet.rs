@@ -10363,6 +10363,219 @@ fn a_shards_seals_are_walked_in_turns_and_every_one_places() {
   );
 }
 
+/// Format: the owner's count of seals whose envelope was refused though the node seals (`fleet::wrap_slice`).
+const SEAL_ENVELOPE_REFUSED: &str = "fleet.seal.envelope_refused";
+/// Shape: the refused envelopes the test waits for before it lets the seal through: two, so the seal was started
+/// again after its first refusal.
+const REFUSED_ENVELOPES: u64 = 2;
+/// Shape: the owner's periods the test gives the seal to be refused again: a seal visits its volume once a period, so
+/// the second refusal is owed the period after the first; fifty periods leave room for a period the seal walk skips
+/// under load, and keep a red run (the refusal never repeats) to about five seconds of the fleet's time.
+const REFUSAL_PERIODS: u64 = 50;
+/// Format: the id the altered naming record is recorded under (any id: nothing looks a naming key up by it).
+const ALTERED_NAMING_ID: [u8; 16] = [0xA5; 16];
+
+/// On `daemon`'s control shard (the fleet tests' one shard), records `volume`'s naming key as a record that is well formed
+/// but wrapped under the node's root rather than the volume's lineage key: an altered record, which `seal_keys::namer`
+/// refuses. Whether the node seals (its root held), and whether the record was recorded.
+fn record_altered_naming(daemon: &Daemon, volume: slates_db::catalog::VolumeId) -> (bool, bool) {
+  let naming = slates_db::catalog::SealKeyOwner::Naming { volume };
+  daemon
+    .observe_control(slates_server::daemon::OBSERVE_BUDGET_NS, move |state| {
+      let Some(root) = state.seal_root.as_ref() else {
+        return (false, false);
+      };
+      let Ok((_, wrapped)) = root.make_child() else {
+        return (true, false);
+      };
+      let record = slates_db::catalog::SealKeyRecord {
+        owner: naming,
+        id: ALTERED_NAMING_ID,
+        record: wrapped.encode().to_vec(),
+      };
+      let now = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
+      let recorded = state.db.mutate(
+        &mut state.segment,
+        &slates_db::Op::SealKeySet { record },
+        now,
+      );
+      (true, recorded.is_ok())
+    })
+    .unwrap()
+}
+
+/// On `daemon`'s control shard, destroys `volume`'s naming key record: whether it was destroyed.
+fn destroy_naming(daemon: &Daemon, volume: slates_db::catalog::VolumeId) -> bool {
+  let naming = slates_db::catalog::SealKeyOwner::Naming { volume };
+  daemon
+    .observe_control(slates_server::daemon::OBSERVE_BUDGET_NS, move |state| {
+      let now = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
+      state
+        .db
+        .mutate(
+          &mut state.segment,
+          &slates_db::Op::SealKeyDestroyed { owner: naming },
+          now,
+        )
+        .is_ok()
+    })
+    .unwrap()
+}
+
+/// A volume named `name` on `client`'s node, `/sealed` written once and the attachment let go.
+fn written_once_and_let_go(client: &mut Client, name: &str) -> VolumeId {
+  let ReplyBody::Created { id } = client.call(&scratch(name)) else {
+    panic!("the volume was created");
+  };
+  let attachment = write_attachment(client, id);
+  let written = client.call(&RequestBody::FsWrite {
+    volume: id,
+    attachment,
+    path: "/sealed".to_owned(),
+    bytes: vec![7; WALKED_FILE_BYTES],
+    mode: 0o644,
+  });
+  assert!(
+    matches!(written, ReplyBody::FsDone { .. }),
+    "the write: {written:?}"
+  );
+  let detached = client.call(&RequestBody::Detach { attachment });
+  assert!(
+    matches!(detached, ReplyBody::Detached),
+    "the attachment was let go: {detached:?}"
+  );
+  id
+}
+
+/// A-322, A-92 piece 3b (§4.10 "a key or a seal that refuses drops the seal (`fleet.seal.envelope_refused`) for the next
+/// period"): a seal whose envelope is refused is started again the next period, and places once the refusal has passed.
+/// Do: three nodes at `f = 1`; on a, a volume written once and detached; on a, record the volume's naming key as a record
+/// that is well formed but wrapped under the node's root rather than the volume's lineage key, an altered record
+/// `seal_keys::namer` refuses; snapshot the volume and wait for a to count two refused envelopes; then destroy the altered
+/// record. Expect a sealing (its root held), the envelope refused twice (the seal started again after its first
+/// refusal) and the snapshot placed. Before, the refused job was kept with its walk spent and no archive: it counted
+/// one refusal, did nothing every period after, and its head never placed, whatever the keys did next.
+#[test]
+fn a_seal_whose_envelope_was_refused_is_started_again_and_places() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, _hosts) = formed_mesh(&["a", "b", "c"]);
+  let mut client = Client::connect(daemons[0].instance());
+  let id = written_once_and_let_go(&mut client, "refused-envelope");
+  let volume = slates_db::catalog::VolumeId { bytes: id.bytes };
+  let (sealing, altered) = record_altered_naming(&daemons[0], volume);
+  let before = refusal_count(&daemons[0], SEAL_ENVELOPE_REFUSED).unwrap();
+  let snapshot = snapshot_taken(&mut client, id);
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let refused_again = poll_for_periods(&observed, PLACEMENT_DEADLINE, REFUSAL_PERIODS, || {
+    refusal_count(&daemons[0], SEAL_ENVELOPE_REFUSED)
+      .map(|count| count >= before + REFUSED_ENVELOPES)
+  });
+  let refused = refusal_count(&daemons[0], SEAL_ENVELOPE_REFUSED)
+    .unwrap()
+    .saturating_sub(before);
+  let destroyed = destroy_naming(&daemons[0], volume);
+  let placed =
+    snapshot.is_some_and(|snapshot| poll_snapshot_placed(&observed, &mut client, id, snapshot));
+  drop(observed);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "refused envelope: sealing {sealing}, altered {altered}, refused {refused}, destroyed {destroyed}, placed {placed}"
+  );
+  assert!(
+    sealing && altered,
+    "a seals, and the altered naming record was recorded"
+  );
+  assert!(snapshot.is_some(), "the volume was snapshotted");
+  assert!(
+    refused_again,
+    "the seal was started again after its envelope was refused ({refused} refusals counted)"
+  );
+  assert!(destroyed, "the altered naming record was destroyed");
+  assert!(
+    placed,
+    "the snapshot placed once its envelope was no longer refused"
+  );
+}
+
+/// Shape: the distinct files of the wrapped volume, each its own chunk, so its envelope seals that many chunks.
+const WRAPPED_CHUNKS: usize = 24;
+/// Format: the owner's count of the owner-shard turns its envelope wraps took (`fleet::wrap_slice`).
+const SEAL_WRAP_SLICES: &str = "fleet.seal.wrap_slices";
+
+/// A-323, §4.10 "Content replication", CLAUDE.md "Bounded work everywhere": a seal's envelope is wrapped in turns of the
+/// shard's step quantum, a chunk at least, never the whole archive in one turn. Do: three nodes at `f = 1`; on a, one
+/// volume of 24 files of distinct bytes (24 distinct chunks), detached; cut the owner's turns to one unit
+/// (`Daemon::inject_seal_walk_quantum(Some(0))`), snapshot the volume and wait for it to place; read the owner shard's
+/// longest step. Expect the snapshot placed, at least 24 turns of the wrap (a chunk a turn), and the owner shard's
+/// longest step under the watchdog's window (`LIVENESS_BUDGET_NS`). Before, the whole archive was wrapped in the turn its
+/// walk ended: one turn whatever the volume, 98 ms for 64 MiB, so at about a GiB the turn ran past the window, and the
+/// watchdog ended the owner at every seal of that volume.
+#[test]
+fn a_seals_envelope_is_wrapped_in_turns_and_places() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, _hosts) = formed_mesh(&["a", "b", "c"]);
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id } = client.call(&scratch("wrapped")) else {
+    panic!("the volume was created");
+  };
+  let attachment = write_attachment(&mut client, id);
+  let written: Vec<ReplyBody> = (0..WRAPPED_CHUNKS)
+    .map(|index| {
+      client.call(&RequestBody::FsWrite {
+        volume: id,
+        attachment,
+        path: format!("/wrapped-{index}"),
+        bytes: vec![u8::try_from(index).unwrap(); WALKED_FILE_BYTES],
+        mode: 0o644,
+      })
+    })
+    .collect();
+  let detached = client.call(&RequestBody::Detach { attachment });
+  daemons[0].inject_seal_walk_quantum(Some(0)).unwrap();
+  let before = refusal_count(&daemons[0], SEAL_WRAP_SLICES).unwrap();
+  let snapshot = match client.call(&RequestBody::Snapshot { volume: id }) {
+    ReplyBody::Snapshotted { id, .. } => Some(id),
+    _ => None,
+  };
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let placed =
+    snapshot.is_some_and(|snapshot| poll_snapshot_placed(&observed, &mut client, id, snapshot));
+  let turns = refusal_count(&daemons[0], SEAL_WRAP_SLICES)
+    .unwrap()
+    .saturating_sub(before);
+  let longest_step_ns = control_longest_poll_ns(&daemons[0]);
+  daemons[0].inject_seal_walk_quantum(None).unwrap();
+  drop(observed);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "wrap in turns: placed {placed}, {turns} wrap turns for {WRAPPED_CHUNKS} chunks, the owner shard's longest step \
+     {longest_step_ns} ns"
+  );
+  assert!(
+    written
+      .iter()
+      .all(|reply| matches!(reply, ReplyBody::FsDone { .. })),
+    "every file was written: {written:?}"
+  );
+  assert!(
+    matches!(detached, ReplyBody::Detached),
+    "the attachment was let go: {detached:?}"
+  );
+  assert!(placed, "the snapshot placed");
+  assert!(
+    turns >= u64::try_from(WRAPPED_CHUNKS).unwrap(),
+    "the envelope was wrapped a chunk a turn: {turns} turns for {WRAPPED_CHUNKS} chunks"
+  );
+  assert!(
+    longest_step_ns < LIVENESS_BUDGET_NS,
+    "the owner shard's longest step {longest_step_ns} ns stayed under the watchdog's window {LIVENESS_BUDGET_NS} ns"
+  );
+}
+
 /// One volume of `a_shards_live_volumes_are_visited_by_the_period_in_slices_and_none_is_starved`, the `index`th. Do:
 /// create it, live-ship it, write it once and let its attachment go. Expect it live-shipped, the write answered at
 /// durability and the attachment let go. Returns the volume.
@@ -12239,6 +12452,14 @@ fn expect_the_sealed_file_alone_survived(
       && !matches!(unsealed, ReplyBody::ReadBytes { .. }),
     "the writes after the placed seal were the window, and are gone: {unplaced:?} {unsealed:?}"
   );
+}
+
+/// A snapshot of `volume` through `client`: its id, or none when it was refused.
+fn snapshot_taken(client: &mut Client, volume: VolumeId) -> Option<SnapshotId> {
+  match client.call(&RequestBody::Snapshot { volume }) {
+    ReplyBody::Snapshotted { id, .. } => Some(id),
+    _ => None,
+  }
 }
 
 /// AC (§4.8 "Promotion and takeover" — the successor "adopts the newest records, and serves"; §4.10
