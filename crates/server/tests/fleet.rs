@@ -12290,23 +12290,28 @@ fn summed_count(daemon: &Daemon, name: &str) -> u64 {
 /// A-351 (§4.8 "Promotion and takeover", A-304's bound, A-15's rejoin; T-8.5's convergence): a takeover that gave
 /// objects up while its retired host was cut off starts over once the host is heard alive again, so the fleet settles on
 /// one configuration once its faults stop. Do: three nodes at `f = 1`; a volume on a, sealed and its head held by b and
-/// c; b and c each leave the other's takeover questions unanswered; cut a off on the probe plane until b and c have
-/// retired it and the volume's successor has given the volume up; let b and c answer each other again; heal a. Expect
-/// every node to hold one configuration that names all three as members and voters, installed, and the probe mesh
-/// whole, within the periods a re-admission takes, and the successor to have judged its round afresh. Before, nothing
-/// but a configuration change started a round that gave objects up over, the retirement it owed stayed kept, a kept
-/// retirement refuses its host's re-admission, and the fleet stayed split for good (the chaos nemesis's split, the
-/// survivors at two members and a at three).
+/// c; the survivor that is not the volume's successor leaves the successor's takeover questions unanswered, while its
+/// own are answered, so its share confirms and nothing else changes the configuration; cut a off on the probe plane until
+/// b and c have retired it and the successor has given the volume up; let the other survivor answer; heal a. Expect every
+/// node to hold one configuration that names all three as members and voters, installed, and the probe mesh whole,
+/// within the periods a re-admission takes, and the successor to have judged its round afresh. Before, nothing but a
+/// configuration change started a round that gave objects up over, the retirement it owed stayed kept, a kept retirement
+/// refuses its host's re-admission, and the fleet stayed split for good (the chaos nemesis's split, the survivors at two
+/// members and a at three: there the other survivor's share had confirmed early, as here).
 #[test]
 fn a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again() {
   let _serial = serialize_fleet_tests();
   let (_serve_lease, daemons, hosts) = formed_mesh(&["a", "b", "c"]);
   let id = held_by_both_survivors(&daemons, "given-up-then-heard");
-  silence_each_other(&daemons, &hosts);
   let successor = rendezvous_first(&[hosts[1], hosts[2]], ObjectId(id.bytes)).unwrap();
-  let at = if successor == hosts[1] { 1 } else { 2 };
+  let (at, other) = if successor == hosts[1] {
+    (1, 2)
+  } else {
+    (2, 1)
+  };
+  let silenced = daemons[other].inject_takeover_silence(&[hosts[at]]);
   let observed: Vec<&Daemon> = daemons.iter().collect();
-  let cut = probe_plane_cut(&daemons, &hosts, true);
+  let cut = silenced.is_ok() && probe_plane_cut(&daemons, &hosts, true);
   let given_up = cut
     && poll_for_periods(
       &observed,
@@ -12315,9 +12320,7 @@ fn a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again()
       || Ok(summed_count(&daemons[at], "fleet.takeover.given_up") > 0),
     );
   let at_give_up: Vec<String> = daemons.iter().map(configuration_view).collect();
-  let answering = daemons[1..]
-    .iter()
-    .all(|daemon| daemon.inject_takeover_silence(&[]).is_ok());
+  let answering = daemons[other].inject_takeover_silence(&[]).is_ok();
   let healed = probe_plane_cut(&daemons, &hosts, false);
   let settled = answering
     && healed
@@ -12345,7 +12348,7 @@ fn a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again()
   );
   assert!(
     answering && healed,
-    "b and c answer each other again and a is healed"
+    "the other survivor answers the successor again and a is healed"
   );
   assert!(
     settled,
