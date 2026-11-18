@@ -4754,23 +4754,8 @@ pub mod platform {
       assert!(holder_goes(&own), "that daemon went");
     }
 
-    /// A-447, A-468 (golden vectors and hostile images). Do: put a daemon's mark and an anchor's into a header's image as
-    /// they write them and read each back; read an image with no marks, one with a zero process id, one with a zero
-    /// creation time, one too short, and one of every bit set. Expect: the daemon's process id's four bytes
-    /// little-endian at 24 and its creation time's eight at 32, the anchor's at 28 and 40, each mark read back whole and
-    /// neither for the other; none for the unwritten, zero and short images; the all-set image read as written, for the
-    /// system to refuse its pid; and the layout's magic `SLB4`.
-    #[test]
-    fn the_process_marks_are_little_endian_at_their_offsets_and_none_is_read_where_none_was_written()
-     {
-      let daemon = ProcessMark {
-        pid: 0x0403_0201,
-        created: 0x1817_1615_1413_1211,
-      };
-      let anchor = ProcessMark {
-        pid: 0x0807_0605,
-        created: 0x2827_2625_2423_2221,
-      };
+    /// A header's image with `daemon`'s mark and `anchor`'s put in as each process writes its own (A-447, A-468).
+    fn header_with(daemon: ProcessMark, anchor: ProcessMark) -> [u8; HEADER_BYTES] {
       let mut header = [0u8; HEADER_BYTES];
       for (mark, pid_at, created_at) in [
         (daemon, AT_DAEMON_PID, AT_DAEMON_CREATED),
@@ -4780,6 +4765,24 @@ pub mod platform {
         header[pid_at..pid_at + pid.len()].copy_from_slice(&pid);
         header[created_at..created_at + created.len()].copy_from_slice(&created);
       }
+      header
+    }
+
+    /// A-447, A-468 (golden vectors). Do: put a daemon's mark and an anchor's into a header's image as they write them,
+    /// and read each back. Expect: the daemon's process id's four bytes little-endian at 24 and its creation time's
+    /// eight at 32, the anchor's at 28 and 40, each mark read back whole and neither for the other, and the layout's
+    /// magic `SLB4`.
+    #[test]
+    fn the_process_marks_are_little_endian_at_their_offsets() {
+      let daemon = ProcessMark {
+        pid: 0x0403_0201,
+        created: 0x1817_1615_1413_1211,
+      };
+      let anchor = ProcessMark {
+        pid: 0x0807_0605,
+        created: 0x2827_2625_2423_2221,
+      };
+      let header = header_with(daemon, anchor);
       assert_eq!(&header[24..28], &[0x01, 0x02, 0x03, 0x04]);
       assert_eq!(&header[28..32], &[0x05, 0x06, 0x07, 0x08]);
       assert_eq!(
@@ -4792,6 +4795,26 @@ pub mod platform {
       );
       assert_eq!(ProcessMark::daemon_of(&header), Some(daemon));
       assert_eq!(ProcessMark::anchor_of(&header), Some(anchor));
+      assert_eq!(MAGIC.to_le_bytes(), *b"SLB4");
+    }
+
+    /// A-447, A-468 (hostile images). Do: read the marks of an image with none written, of one whose daemon's process
+    /// id is zero, of one whose anchor's creation time is zero, of one too short to hold the anchor's, and of one of every
+    /// bit set. Expect: none for the unwritten, zeroed and short marks, the other mark read whole beside a zeroed one, and
+    /// the all-set image read as written, for the system to refuse its pid.
+    #[test]
+    fn no_mark_is_read_where_none_was_written_and_a_hostile_one_is_read_as_written() {
+      let anchor = ProcessMark {
+        pid: 0x0807_0605,
+        created: 0x2827_2625_2423_2221,
+      };
+      let header = header_with(
+        ProcessMark {
+          pid: 0x0403_0201,
+          created: 0x1817_1615_1413_1211,
+        },
+        anchor,
+      );
       assert_eq!(
         ProcessMark::daemon_of(&[0u8; HEADER_BYTES]),
         None,
@@ -4830,7 +4853,6 @@ pub mod platform {
         }),
         "a hostile mark is read as written; the system refuses its pid"
       );
-      assert_eq!(MAGIC.to_le_bytes(), *b"SLB4");
     }
 
     /// AUD-29-19 (a cancelled connect). Do: begin a claim on a daemon end that has not accepted it, then
