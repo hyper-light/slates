@@ -401,6 +401,15 @@
 >   volume's whole image in one turn, at every whole entry and install image); and, after A-347's open, the takeover's
 >   restore (`slates_archive::restore` in `verbs::materialize_taken_over`) lays the whole archive out in the one turn
 >   that makes the volume, and the sealed manifest is opened in one turn (its cost grows with the entries).
+>   **The live takeover's half closed 2026-11-18 (A-374, g251):** the nemesis's watchdog kills of successors ("shard 1 is
+>   spinning", seeds 17036665960917068132 and 2120743995065985386, both Linux arches and macOS) were a live takeover's
+>   whole materialization in one owner-shard turn (0.73 to 2.84 s at 152 to 306 MB of sealed log on a Mac Studio), and
+>   each period's attempt, its 100 ms deadline outlasted, fetched and rebuilt the whole log again. The log is now rebuilt
+>   a payload a slice by a task of the owner shard, the archive, the restore and the making each a turn, and a later
+>   attempt joins the task running (`a_live_takeover_is_rebuilt_in_turns_and_joined_while_it_runs`; the bug record of
+>   2026-11-18, "a live takeover made its volume in one turn"). Still owed: the archive's layout and the restore in quantum
+>   slices (each one turn, about 0.1 s at 300 MB), the first publication's whole entry (the item above), and a sealed
+>   volume's restore.
 >   - **Measured (2026-11-18):** g251's trace of the nemesis spin kills found a taken-over volume's first publication
 >     (`fleet::published_before_served` -> `live_ship::published`, its whole entry) at 1.06 s in one turn; the
 >     measurer's 32-writer run (128 MiB, diag-measurer-7) lost a daemon to the watchdog in 3 of 8 runs at 1,000-1,002 ms
@@ -3068,6 +3077,12 @@
 >   rename +74.8, unlink +31.2. Cut (c)'s no-wake variant and cut (b), the per-kind spin choice, were measured and
 >   rejected; the request channel's bound was fixed (A-348). Main lost no more than about 9 µs of this since cut (c)
 >   (diag-g258-5).
+> - **2026-11-18, goal g258 closed at its stated condition (BENCHMARKS, "Main after A-348 against the DLL and against
+>   69cd38b2"):** diag-g258-9 (run 44325673298), main `093fef96` against the DLL arm, a control and 69cd38b2. arm64, 5
+>   runs: 10 cells of 36 beyond the DLL's spread, the same p50 gap (quiet stat +44.9 µs, rename +76.3, unlink +41.1;
+>   loaded write +85.3), and main within the control's spread of 69cd38b2 in 32 of 36 cells. x86_64: 2 runs done and 5
+>   failed, main's daemon killed under load (A-223's idle spin, fixed since by A-361), so no verdict there; the x86_64
+>   lane is owed again with A-361 in main. No cut is open under g258; the levers below are the next goal's.
 > - **Open, the levers left** (each in BENCHMARKS' record): a spin choice that reads contention (the per-kind median form
 >   took 42.3 µs off arm64's loaded write p50 and lost a wake on x86_64); a fresh per-phase profile of arm64's quiet stat,
 >   rename and unlink (the last attributed 18 µs of a stat to crash safety); and, **a decision for Ada**, the shard threads
