@@ -18158,7 +18158,7 @@ fn a_superseded_owners_nfs_mount_answers_stale() {
   let (_serve_lease, daemons, hosts) = formed_mesh(&["a", "b", "c"]);
   let name = "superseded-nfs";
   let mut client = Client::connect(daemons[0].instance());
-  live_volume_named(&mut client, &daemons, name);
+  let id = live_volume_named(&mut client, &daemons, name);
   drop(client);
   let port = daemons[0].nfs_port().expect("the daemon serves NFS");
   let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the NFS port");
