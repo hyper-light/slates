@@ -251,6 +251,21 @@ pub(crate) fn run_resumed(
   refusal: Option<ReplyBody>,
   served: Option<&'static str>,
 ) {
+  let start = state.clock.monotonic_ns();
+  let span = state
+    .tracer
+    .open_unlinked(verb.id, slates_wire::observe::Chokepoint::ShardOp, start);
+  run_resumed_diag(state, verb, refusal, served);
+  let end = state.clock.monotonic_ns();
+  crate::telemetry::emit(state, span.end(9, end));
+}
+
+fn run_resumed_diag(
+  state: &mut ShardState,
+  verb: ResumedVerb,
+  refusal: Option<ReplyBody>,
+  served: Option<&'static str>,
+) {
   let ResumedVerb {
     route,
     origin,
