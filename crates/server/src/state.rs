@@ -1078,6 +1078,10 @@ pub struct ShardState {
   /// test can hold a wait's bound below a path's floor, or short enough to watch a give-up (`Daemon::inject_failover`).
   /// `None` in every deployment.
   pub injected_failover_ns: Option<u64>,
+  /// Each CLI attachment's renewals as this, its owner shard, has seen them (A-384): when it was last used and the gaps
+  /// between its uses, which its term follows (`verbs::attachment_term`). In memory only: a restart starts each again,
+  /// with a fresh term. Bounded by the partition's attachments: an entry leaves when its attachment ends.
+  pub attachment_paces: BTreeMap<u64, AttachmentPace>,
   /// What this node holds as a **content candidate** for other owners' snapshots (§4.10 "Content
   /// replication"): the distinct chunks by identity and each manifest held whole, verified before
   /// anything is stored — served on the record session's content stream by the fleet loop. It is what
@@ -1592,6 +1596,34 @@ impl PendingTombstone {
   }
 }
 
+/// A CLI attachment's pace (A-384): when it was last used, and the running estimate of the gaps between its uses
+/// (RFC 6298's estimator, as the failover estimate's terms are), so its term is its holder's own.
+#[derive(Debug, Default)]
+pub struct AttachmentPace {
+  /// The shard's clock at its last use, or at its making.
+  pub last_use_ns: u64,
+  /// The gaps between its uses.
+  pub gaps: slates_cluster::failover::RunningDuration,
+}
+
+impl AttachmentPace {
+  /// A pace begun by a use at `now_ns`, no gap measured yet.
+  pub fn begun(now_ns: u64) -> AttachmentPace {
+    AttachmentPace {
+      last_use_ns: now_ns,
+      gaps: slates_cluster::failover::RunningDuration::new(),
+    }
+  }
+
+  /// A use at `now_ns`: the gap since the last is a sample. A clock that read earlier is no sample.
+  pub fn used(&mut self, now_ns: u64) {
+    if let Some(gap) = now_ns.checked_sub(self.last_use_ns) {
+      self.gaps.on_sample(gap);
+    }
+    self.last_use_ns = now_ns;
+  }
+}
+
 /// A taken-over volume awaiting materialization (§4.8 "Promotion and takeover", §4.10;
 /// `ShardState::pending_materializations`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1731,6 +1763,7 @@ mod tests {
       },
       completion: None,
       signature: None,
+      folded_below: 0,
     }
   }
 

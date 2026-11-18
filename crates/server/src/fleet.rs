@@ -1597,7 +1597,7 @@ async fn serve_peer_records(
       };
     let (stream_id, stream, request) = match next {
       crate::forward_lane::Next::Forwarded { stream_id, reply } => {
-        if endpoint.reply(stream_id, &reply).is_err() {
+        if endpoint.reply(stream_id, reply).is_err() {
           return;
         }
         continue;
@@ -1613,7 +1613,34 @@ async fn serve_peer_records(
           verbs::serve_forward(control, peer_anchor, &request).await
         });
         if let Some(reply) = served
-          && endpoint.reply(stream_id, &reply).is_err()
+          && endpoint.reply(stream_id, reply).is_err()
+        {
+          return;
+        }
+        continue;
+      }
+      // A takeover's fetch of a live log is laid out in turns of this shard (g251), so it too runs on its own task: a
+      // long log's answer holds no other request of the peer.
+      crate::forward_lane::Next::Request {
+        stream_id,
+        kind,
+        request,
+      } if kind == slates_cluster::live::LIVE_STATE_STREAM
+        && enrolled
+        && slates_db::live::is_fetch(&request) =>
+      {
+        let peer_host = state::with_state(|s| {
+          s.learned_members
+            .get(&peer_anchor)
+            .map_or(seed, |learned| learned.host)
+        })
+        .unwrap_or(seed);
+        let served = forwards.spawn(stream_id, async move {
+          withheld_live_state().await;
+          crate::live_ship::serve_fetch(local, peer_host, request).await
+        });
+        if let Some(reply) = served
+          && endpoint.reply(stream_id, reply).is_err()
         {
           return;
         }
@@ -1629,7 +1656,7 @@ async fn serve_peer_records(
           crate::work_route::serve(control, &request).await
         });
         if let Some(reply) = served
-          && endpoint.reply(stream_id, &reply).is_err()
+          && endpoint.reply(stream_id, reply).is_err()
         {
           return;
         }
@@ -1671,12 +1698,8 @@ async fn serve_peer_records(
           count_refusal(ACCEPT_REFUSED);
           return Vec::new();
         }
-        // Test support: a fault holds a live-state reply after its request arrived (never reachable from the wire),
-        // so a takeover's question to this node misses its budget while the probe plane still answers.
         if stream == slates_cluster::live::LIVE_STATE_STREAM {
-          while state::with_state(|state| state.live_state_withhold_replies).unwrap_or(false) {
-            crate::daemon::pace(HEARTBEAT_NS / POLL_PER_PERIOD).await;
-          }
+          withheld_live_state().await;
         }
         match stream {
           crate::member_task::PLANE_EPOCH_STREAM => plane_secret
@@ -1854,13 +1877,22 @@ async fn serve_peer_records(
       }
     }
     .await;
-    let served = endpoint.reply(stream_id, &reply);
+    let served = endpoint.reply(stream_id, reply);
     // The sender's state on the connection the peer dialed: where its forwards and reads come back from this node.
     let seen = crate::state::RecordLink::seen(peer_anchor, &endpoint);
     state::with_state(|s| s.served_sessions.insert(peer_anchor.0, seen));
     if served.is_err() {
       return;
     }
+  }
+}
+
+/// Test support: while a fault holds this node's live-state replies (`ShardState::live_state_withhold_replies`, never
+/// reachable from the wire), a reply on that kind waits after its request arrived, so a takeover's question to this node
+/// misses its budget while the probe plane still answers.
+async fn withheld_live_state() {
+  while state::with_state(|state| state.live_state_withhold_replies).unwrap_or(false) {
+    crate::daemon::pace(HEARTBEAT_NS / POLL_PER_PERIOD).await;
   }
 }
 
@@ -2316,6 +2348,15 @@ fn unplaced_heads(state: &ShardState, local: HostId) -> Vec<Head> {
     let Some(record) = state.db.partition().volume(slot.id) else {
       continue;
     };
+    // A volume this node lost to a successor (yielded at its re-admission, A-334, or its log fenced, A-338) ships no
+    // record (A-382): its successor owns its registers, so each record here is stale, and a holder's copy made afresh
+    // (a re-admitted holder lets its own go, `readmission::let_go_own_registers`) takes the first member's record it
+    // meets as its owner's. Shipped, a re-admitted creator's stale catalog could reach such a copy before the
+    // successor's, and every holder refused the rest of them each period (`fleet.record.refused.unauthorized`, 218 in
+    // one nemesis run).
+    if crate::verbs::lost_to_a_successor(state, slot.id) {
+      continue;
+    }
     let object = ObjectId(slot.id.bytes);
     // A volume being destroyed ships its tombstone, never its catalog or a head (AUD-29-43): its registers
     // close at the sequence the destroy's record will keep, so the tombstone is continuous with it.
@@ -5917,14 +5958,13 @@ async fn make_live_in_turns(
   } = making;
   let crate::live_ship::Fetched {
     head: adopted,
-    payloads,
+    log,
     lineage,
     naming,
     ..
   } = fetched;
   let begun = state::with_state(|s| {
-    let begun =
-      crate::live_ship::Rebuilding::begin(s, id, &catalog.owner, (lineage, naming), payloads);
+    let begun = crate::live_ship::Rebuilding::begin(s, id, &catalog.owner, (lineage, naming), log);
     begun.map_err(|why| crate::live_ship::rebuild_refused(s, why))
   })
   .ok_or(MATERIALIZE_UNANSWERED)?;
@@ -5934,9 +5974,9 @@ async fn make_live_in_turns(
     let slice_ns = state::with_state(|s| crate::config::wrap_slice_ns(seal_quantum_ns(s)))
       .ok_or(MATERIALIZE_UNANSWERED)?;
     let began = futures::now_ns();
-    let before = rebuilding.left();
+    let before = rebuilding.applied();
     let advanced = rebuilding.advance(|| futures::now_ns().saturating_sub(began) >= slice_ns);
-    let applied = before.saturating_sub(rebuilding.left());
+    let applied = rebuilding.applied().saturating_sub(before);
     let done = state::with_state(|s| {
       s.count(LIVE_REBUILD_SLICES, 1);
       s.count(
@@ -6250,8 +6290,9 @@ fn recorded_keys(
 }
 
 /// The quantum a seal's turns are cut by on this shard (its archive walk's, its envelope's wrap and, on a successor, an
-/// envelope's open): the shard's step quantum, or the one a test injected (`Daemon::inject_seal_walk_quantum`).
-fn seal_quantum_ns(state: &ShardState) -> u64 {
+/// envelope's open and a live log's rebuild), and a takeover fetch's answer (`live_ship::FetchAnswer`): the shard's step
+/// quantum, or the one a test injected (`Daemon::inject_seal_walk_quantum`).
+pub(crate) fn seal_quantum_ns(state: &ShardState) -> u64 {
   state
     .seal_walk_quantum_ns
     .or_else(futures::step_budget_ns)

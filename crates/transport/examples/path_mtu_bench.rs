@@ -131,7 +131,7 @@ fn one_run(payload: &'static [u8]) -> Run {
     .unwrap();
     server.establish().await.unwrap();
     let (request, _kind, received) = server.next_request().await.unwrap();
-    server.reply(request, &digest(&received)).unwrap();
+    server.reply(request, digest(&received)).unwrap();
     server.settle().await.unwrap();
     let _ = done_tx.send(());
   })

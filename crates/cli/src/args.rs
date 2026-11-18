@@ -36,7 +36,7 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   read VOLUME PATH [--version N | --attachment A]  a file's bytes at a view (raw bytes)
   write VOLUME ATTACHMENT PATH [--mode OCTAL] [--json]   replace a plain volume's file with stdin's bytes
   volume placed ID [--snapshot N] [--mirror] [--json]   await a durability scope
-  attach ID [--read | --write] [--snapshot N]
+  attach ID [--read | --write] [--snapshot N] [--hold]
             [--oci-source HOST_PATH --oci-destination CONTAINER_PATH] [--json]
   detach ATTACHMENT [--volume ID] [--json]   (--volume: an attachment another host's owner holds)
   bootstrap (root | region) [--json]             explicitly create a new consensus group
@@ -384,6 +384,17 @@ pub(crate) enum Verb {
     /// `--oci-source` to `--oci-destination` (§4.6 A-9).
     form: slates_client::AttachRequest,
   },
+  /// Attach in the CLI's form and keep the attachment alive from this process until it ends (`slates attach --hold`,
+  /// A-384): a renewer of its own renews it at the cadence the daemon names; the process ending ends the renewals, and
+  /// the attachment lapses at its holder's pace.
+  Hold {
+    /// The volume.
+    volume: slates_client::VolumeId,
+    /// The snapshot.
+    snapshot: Option<slates_client::SnapshotId>,
+    /// The intent.
+    intent: Intent,
+  },
   /// Detach.
   Detach {
     /// The attachment.
@@ -728,6 +739,7 @@ const SWITCHES: &[&str] = &[
   "--require-evidence",
   "--keep",
   "--apparmor-profile",
+  "--hold",
 ];
 
 /// Takes the untouched command after `--` (`exec` and `run` share this boundary).
@@ -1635,7 +1647,7 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
     ["attach", id] => {
       taken.only(&Spec {
         values: &["--snapshot", "--oci-source", "--oci-destination"],
-        switches: &["--read", "--write"],
+        switches: &["--read", "--write", "--hold"],
       })?;
       let snapshot = taken.value("--snapshot").map(snapshot).transpose()?;
       let intent = if taken.switch("--write") {
@@ -1643,6 +1655,22 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
       } else {
         Intent::Read
       };
+      // `--hold`: this process keeps the CLI attachment alive until it ends (A-384); a container bind has its own life.
+      if taken.switch("--hold") {
+        if taken.value("--oci-source").is_some() || taken.value("--oci-destination").is_some() {
+          return Err(ParseError::Missing(
+            "no --oci-source or --oci-destination with --hold: a container bind is not held",
+          ));
+        }
+        return Ok(client(
+          &taken,
+          Verb::Hold {
+            volume: volume(id)?,
+            snapshot,
+            intent,
+          },
+        ));
+      }
       let form = match (
         taken.value("--oci-source"),
         taken.value("--oci-destination"),
@@ -2365,6 +2393,28 @@ mod tests {
         intent: Intent::Write,
         form: slates_client::AttachRequest::Termed,
       }
+    );
+    // `--hold` keeps the CLI attachment alive from this process (A-384); a container bind is not held.
+    let Command::Client(request) = parse(&args(
+      "attach 00000000000000000000000000000001 --write --hold",
+    ))
+    .unwrap() else {
+      panic!("client");
+    };
+    assert_eq!(
+      request.verb,
+      Verb::Hold {
+        volume: parse_volume_id("00000000000000000000000000000001").unwrap(),
+        snapshot: None,
+        intent: Intent::Write,
+      }
+    );
+    assert!(
+      parse(&args(
+        "attach 00000000000000000000000000000001 --hold --oci-source /a --oci-destination /b",
+      ))
+      .is_err(),
+      "a container bind is not held"
     );
     assert_eq!(
       parse(&args("anchor --quick --shards 2 --instance z")),
