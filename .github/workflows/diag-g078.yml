@@ -1,0 +1,79 @@
+# Diagnostics only (never main): what an AppArmor profile granting `userns,` changes for the launcher's sequence on
+# runners whose AppArmor restricts unprivileged user namespaces (GAPS 8a-launcher-ci; goal g078).
+name: diag-g078
+on:
+  push:
+    branches: ['diag-g078-*']
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm, ubuntu-latest]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Facts
+        shell: bash
+        run: |
+          uname -a; head -4 /etc/os-release; id
+          for f in /proc/sys/kernel/apparmor_restrict_unprivileged_userns /proc/sys/kernel/apparmor_restrict_unprivileged_unconfined \
+                   /proc/sys/kernel/apparmor_restrict_unprivileged_io_uring /proc/sys/kernel/unprivileged_userns_clone /proc/sys/user/max_user_namespaces; do
+            echo "$f: $(cat $f 2>&1)"
+          done
+          echo "this shell's label: $(cat /proc/self/attr/apparmor/current 2>&1)"
+          echo "profiles readable unprivileged?"; head -3 /sys/kernel/security/apparmor/profiles 2>&1 || true
+          ls -ld /sys/kernel/security /sys/kernel/security/apparmor /sys/kernel/security/apparmor/profiles 2>&1 || true
+          ls /sys/kernel/security/apparmor/features/ 2>&1 || true
+          echo "userns feature: $(ls /sys/kernel/security/apparmor/features/namespaces 2>&1)"
+          apparmor_parser --version 2>&1 | head -1 || true
+          grep -v '^#' /etc/apparmor/parser.conf 2>/dev/null | grep . || true
+          echo "--- unprivileged_userns:"; cat /etc/apparmor.d/unprivileged_userns 2>&1 || true
+          echo "--- a shipped userns profile:"; cat /etc/apparmor.d/chrome 2>&1 || cat /etc/apparmor.d/code 2>&1 || true
+          rustc --version
+      - name: Build the probe
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          rustc --edition 2021 -O diag/probe.rs -o "$RUNNER_TEMP/bin/slates"
+          readlink -f "$RUNNER_TEMP/bin/slates"
+          d="$RUNNER_TEMP/x"; mkdir -p "$d/root/vol" "$d/at"; echo marker-ok > "$d/root/vol/marker"
+      - name: Without a profile
+        shell: bash
+        run: |
+          d="$RUNNER_TEMP/x"
+          "$RUNNER_TEMP/bin/slates" bind "$d/root/vol" "$d/at" || true
+          echo "host sees at: [$(ls -A "$d/at")]"
+          sudo dmesg | grep -i 'apparmor=' | tail -6 || true
+      - name: Load a profile named by its path (from a file)
+        shell: bash
+        run: |
+          exe=$(readlink -f "$RUNNER_TEMP/bin/slates")
+          printf 'abi <abi/4.0>,\n\nprofile %s flags=(unconfined) {\n  userns,\n}\n' "$exe" > "$RUNNER_TEMP/profile"
+          cat "$RUNNER_TEMP/profile"
+          sudo apparmor_parser -r "$RUNNER_TEMP/profile" && echo loaded
+          sudo grep -i 'bin/slates' /sys/kernel/security/apparmor/profiles || true
+          "$RUNNER_TEMP/bin/slates" label
+      - name: With the profile
+        shell: bash
+        run: |
+          d="$RUNNER_TEMP/x"
+          "$RUNNER_TEMP/bin/slates" bind "$d/root/vol" "$d/at" || true
+          "$RUNNER_TEMP/bin/slates" stepout "$d/root/vol" "$d/at" || true
+          "$RUNNER_TEMP/bin/slates" exec-drop "$d/root/vol" "$d/at" || true
+          echo "host sees at: [$(ls -A "$d/at")]"
+          sudo dmesg | grep -i 'apparmor=' | tail -12 || true
+      - name: The same binary at another path (a copy) is not attached
+        shell: bash
+        run: |
+          d="$RUNNER_TEMP/x"; cp "$RUNNER_TEMP/bin/slates" "$RUNNER_TEMP/slates-copy"
+          "$RUNNER_TEMP/slates-copy" bind "$d/root/vol" "$d/at" || true
+      - name: Unload, then load from standard input under a short name with an attachment
+        shell: bash
+        run: |
+          d="$RUNNER_TEMP/x"; exe=$(readlink -f "$RUNNER_TEMP/bin/slates")
+          sudo apparmor_parser -R "$RUNNER_TEMP/profile" && echo removed
+          "$RUNNER_TEMP/bin/slates" label
+          printf 'abi <abi/4.0>,\n\nprofile slates %s flags=(unconfined) {\n  userns,\n}\n' "$exe" | sudo apparmor_parser -r && echo loaded-from-stdin
+          "$RUNNER_TEMP/bin/slates" label
+          "$RUNNER_TEMP/bin/slates" bind "$d/root/vol" "$d/at" || true
