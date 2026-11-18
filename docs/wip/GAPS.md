@@ -3739,8 +3739,11 @@
 > A-455's ceiling (`role/anchor.rs` `anchor_window_ns`), which a silent watchdog's process is judged by too; and a
 > graceful stop is judged in the daemon's own beating (`slates_anchor::StopBounds`, `supervise::stop_overdue`: deaf or
 > overdue once its last beat is a window past the request or its deadline; the lapse at the running lapse bound).
-> Still on `W` itself, each owed its own change (class D): the anchor's lapse bound and observation cadence
-> (`lapse_bound_ns`, `lapse_wait`; D-b's rest), the daemon's own supervision waits (`reap_loop`, `log_late_beat`,
+> **Since A-467 D-b is closed**: the anchor's lapse bound (the window plus its lateness p99) has A-455's ceiling, so a
+> runaway reading cannot blind it, and its observation gap is the bound less its lateness p99 and a beat, at least a
+> beat (`Lateness::observation_gap_ns`), where half the bound let every gap pass the bound once the anchor ran a window
+> late, each look then taken for a sleep and a wedged daemon never found lapsed.
+> Still on `W` itself, each owed its own change (class D): the daemon's own supervision waits (`reap_loop`, `log_late_beat`,
 > `starved_share_ns`, `stop_parts`, `start_with_fleet`, the anchor's hold windows, `held_copy`; D-c), and a laptop's
 > failover detection term (A-405's supervision window), which should follow the windows the watchdog now judges by.
 >

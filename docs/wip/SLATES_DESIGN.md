@@ -9511,6 +9511,19 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > yet: the anchor's lapse bound (`lapse_bound_ns`, the liveness window plus its lateness p99) and its observation
 > cadence (GAPS).
 
+> **Status (2026-11-18, A-467): the anchor's lapse bound has a ceiling, and its looks keep their gaps inside it.** The
+> lapse bound stays the liveness window plus the anchor's measured lateness p99 (A-228), never past the ceiling the
+> watchdog holds its own windows to (A-455, the daemon's observation budget), so a runaway reading (a host paused twice
+> among the last hundred waits) cannot hold a wedged daemon's lapse past it. The observation loop's longest wait is the
+> bound less the anchor's own lateness p99 and a beat, never less than a beat (`Lateness::observation_gap_ns`), where it
+> was half the bound. A look that comes more than the bound after the one before reads as the host having slept and
+> restarts the daemon's silence (`lapsed`), so under a lateness past a window every gap of the old loop passed the bound
+> and a wedged daemon was never found lapsed; now the gap stays inside the bound at the anchor's p99, with a beat to
+> spare. A quiet anchor looks at a running daemon about once a window rather than twice. Regressions:
+> `the_lapse_bound_is_the_window_plus_the_anchors_own_lateness` (the ceiling),
+> `a_wedged_daemon_is_found_lapsed_though_the_anchors_own_looks_run_twice_a_window_late` and
+> `the_loop_waits_at_most_its_gap_and_finds_a_lapse_at_the_budgets_end` (`crates/api/src/role/anchor.rs`).
+
 > **Telemetry oracle correction (2026-09-20, AC-0.11).** A drain request itself emits spans.
 > The daemon integration oracle now derives convergence from the reply quota minus the
 > maximum spans a drain emits, and checks progress on each batch. A four-span reply scenario
@@ -31804,3 +31817,33 @@ new, four tests; `src/captured_tests.rs`, one; `tests/oracle.rs`, A-451's bits t
 Applied in the same change to: §2.5 (the graceful stop's status), §4.14 (a status block on `daemon.alive`), GAPS (the
 `LIVENESS_BUDGET_NS` entry), `crates/api/src/role/anchor.rs`, `crates/anchor/src/{supervise,lib}.rs`,
 `crates/anchor/tests/anchor.rs`, `crates/cli/tests/cli.rs`.
+
+### A-467 — The anchor's lapse bound has the watchdog's ceiling, and its observation gap is the bound less its own lateness and a beat (2026-11-18, built for goal g255; R3's class D, item D-b's second half, closing D-b; §4.14 `daemon.alive`; A-228, A-232, A-455, A-461)
+- **What was there.** The anchor's lapse bound was the liveness window plus its own lateness p99 over its last hundred
+  timed waits (A-228), with no ceiling: two host pauses among those waits held every lapse past the pause, the anchor
+  blind to a wedged daemon that long. Its observation loop waited at most half the bound between looks of a running
+  daemon (`OBSERVATION_GAP_PARTS`, a `Shape:` two), whatever its own lateness. A look more than the bound after the one
+  before reads as the host having slept and restarts the daemon's silence (`lapsed`, 2026-10-04), so once its own
+  lateness passed a window, half the bound and the lateness passed the bound at every look, and a wedged daemon was
+  never found lapsed.
+- **The bound.** The liveness window plus the measured lateness p99, never past A-455's ceiling
+  (`slates_server::watchdog::WINDOW_CEILING_NS`, the daemon's observation budget), as A-461's window is capped. A live
+  daemon's beat is refreshed every beat and goes stale only by as much as its watchdog is held off its CPU, which the
+  anchor's lateness measures; one whose beat outlives the ceiling while alive is still spared, since a lapse with its
+  watchdog silent is judged by its process (A-232).
+- **The cadence.** `Lateness::observation_gap_ns`: the bound less the lateness p99 and a beat, never less than a beat,
+  the daemon's own cadence (the loop never looks at a running daemon more often than it beats). The loop's own gap,
+  its wait and its lateness, then stays inside the bound at its p99 with a beat to spare; where the bound leaves no such
+  room (a lateness past the ceiling) the loop looks every beat. A starting or unrecovered daemon is still looked at
+  every beat (`observation_pause`).
+- **What changes.** On a quiet host nothing in the bound, and the loop wakes about once a window (900 ms) where it woke
+  twice. Under a lateness past a window a wedged daemon is found lapsed within the anchor's lateness of the bound, where
+  it was never found. The kill line names the ceiling.
+- **Tests.** `the_lapse_bound_is_the_window_plus_the_anchors_own_lateness` (a runaway hour-late reading holds the bound
+  at the ceiling), `a_wedged_daemon_is_found_lapsed_though_the_anchors_own_looks_run_twice_a_window_late` (the loop's
+  replay with every look two windows late: found after the bound, within the lateness of it) and
+  `the_loop_waits_at_most_its_gap_and_finds_a_lapse_at_the_budgets_end`, in `crates/api/src/role/anchor.rs`.
+- EVIDENCE_A467
+
+Applied in the same change to: §4.14 (a status block on `daemon.alive`), GAPS (the `LIVENESS_BUDGET_NS` entry),
+`crates/api/src/role/anchor.rs`.
