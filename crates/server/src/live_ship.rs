@@ -117,6 +117,28 @@ pub(crate) fn held_sealings(
   })
 }
 
+/// The sealing of the whole entry `object`'s live log begins with on this holder, when it holds that log sealed: what a
+/// fellow candidate hands the volume's successor its key from (A-295), never a sealing the asker sends.
+pub(crate) fn held_sealing(
+  state: &ShardState,
+  object: ObjectId,
+) -> Option<crate::head::HeadSealing> {
+  let held = state.live.held.get(&object)?;
+  sealed_body(held.entries.front()?)?.sealing
+}
+
+/// The position of the newest entry of the live log this node holds for `object` as a candidate, or `None` while it holds
+/// none (`Daemon::fleet_live_held`).
+pub(crate) fn held_position(state: &ShardState, object: ObjectId) -> Option<u64> {
+  state
+    .live
+    .held
+    .get(&object)?
+    .replica
+    .head()
+    .map(|head| head.position)
+}
+
 pub(crate) fn let_go(state: &mut ShardState, object: ObjectId) {
   if state.live.held.remove(&object).is_some() {
     state.count(LIVE_LET_GO, 1);
@@ -3247,26 +3269,47 @@ pub(crate) async fn fetch(
     return Ok(None);
   };
   let refused = state::with_state(|s| s.live.refused_rebuilds.get(&object).cloned()).flatten();
-  let key_here = refused
-    .as_ref()
-    .and_then(|refused| refused.sealing.as_ref())
-    .is_some_and(|sealing| {
-      state::with_state(|s| crate::seal_keys::successor_lineage(s, sealing).is_some())
-        .unwrap_or(false)
-    });
-  match next_fetch(
+  // The hosts that answered phase one, this node left out: the fellow candidates a key this node lacks is asked of.
+  let answered: Vec<HostId> = reports
+    .iter()
+    .map(|(host, _)| *host)
+    .filter(|host| *host != local)
+    .collect();
+  // A key handed over for an earlier attempt at this log, kept with its refusal (A-295).
+  let mut handed = refused.as_ref().and_then(|refused| refused.handed.clone());
+  let key_here = handed.is_some()
+    || refused
+      .as_ref()
+      .and_then(|refused| refused.sealing.as_ref())
+      .is_some_and(|sealing| {
+        state::with_state(|s| crate::seal_keys::successor_lineage(s, sealing).is_some())
+          .unwrap_or(false)
+      });
+  let mut decision = next_fetch(
     refused.as_ref(),
     head,
     slates_rt::futures::now_ns(),
     key_here,
-  ) {
+  );
+  // Only the owner's shard delivers a pair, so with the owner lost the key a successor lacks can come only from a fellow
+  // candidate that holds it (A-295): asked once an attempt while the wait lasts.
+  if decision == NextFetch::WaitsKey
+    && let Some(sealing) = refused
+      .as_ref()
+      .and_then(|refused| refused.sealing.as_ref())
+    && let Some(key) = handed_lineage(object, sealing, &answered).await
+  {
+    handed = Some(key);
+    decision = NextFetch::Fetch;
+  }
+  match decision {
     NextFetch::Fetch => {
       if key_here
         && refused
           .as_ref()
           .is_some_and(|refused| refused.why == REFUSED_NO_KEY)
       {
-        let _ = state::with_state(|s| s.count(LIVE_TAKEOVER_KEY_ARRIVED, 1));
+        let _ = state::with_state_counted(|s| s.count(LIVE_TAKEOVER_KEY_ARRIVED, 1));
       }
     }
     NextFetch::WaitsNewHead => return Err(LIVE_TAKEOVER_WAITS_NEW_HEAD),
@@ -3290,9 +3333,19 @@ pub(crate) async fn fetch(
     .first()
     .and_then(|first| sealed_body(first))
     .and_then(|body| body.sealing);
-  let lineage = sealing.as_ref().and_then(|sealing| {
+  // This node's own entry; else the key a fellow candidate handed over for this lineage, asked for now when none was
+  // (A-295), so a successor that holds no entry of its own is served at its first attempt, not a refusal later.
+  let own = sealing.as_ref().and_then(|sealing| {
     state::with_state(|s| crate::seal_keys::successor_lineage(s, sealing)).flatten()
   });
+  let lineage = match (own, sealing.as_ref()) {
+    (Some(own), _) => Some(own),
+    (None, Some(sealing)) => match handed.filter(|(id, _)| *id == sealing.lineage) {
+      Some(handed) => Some(handed),
+      None => handed_lineage(object, sealing, &answered).await,
+    },
+    (None, None) => None,
+  };
   let naming = sealing.as_ref().and_then(|sealing| sealing.naming.clone());
   Ok(Some(Fetched {
     head,
@@ -3301,6 +3354,25 @@ pub(crate) async fn fetch(
     naming,
     sealing,
   }))
+}
+
+/// The lineage key of the log `sealing` belongs to, handed to this successor by a fellow candidate (A-295): asked of the
+/// hosts that answered phase one (`fleet::ask_handed_lineage`), counted, and kept with the log's refusal when it has
+/// one, so a later attempt fetches with it rather than asking again. `None` when none handed one that checked.
+async fn handed_lineage(
+  object: ObjectId,
+  sealing: &crate::head::HeadSealing,
+  answered: &[HostId],
+) -> Option<([u8; 16], Vec<u8>)> {
+  let key = crate::fleet::ask_handed_lineage(object, sealing, answered).await?;
+  let kept = key.clone();
+  let _ = state::with_state_counted(|s| {
+    if let Some(refused) = s.live.refused_rebuilds.get_mut(&object) {
+      refused.handed = Some(kept);
+    }
+    s.count(LIVE_TAKEOVER_KEY_HANDED, 1);
+  });
+  Some(key)
 }
 
 /// A rebuild refused at a head ([`note_rebuild`]): what decides whether, and when, the log is fetched again
@@ -3316,6 +3388,10 @@ pub(crate) struct Refused {
   pub(crate) since: u64,
   /// The log's whole entry's sealing, when it was sealed.
   pub(crate) sealing: Option<crate::head::HeadSealing>,
+  /// A key a fellow candidate handed this node for the log while it waited for one (A-295): the key's id and the key
+  /// wrapped under this node's root, as `seal_keys::successor_lineage` returns one. Kept with the refusal it answers, so
+  /// it lives exactly as long as the takeover waiting for it.
+  pub(crate) handed: Option<([u8; 16], Vec<u8>)>,
 }
 
 /// What a successor does about a live volume's log at the head phase one adopted ([`next_fetch`]).
@@ -3337,6 +3413,10 @@ const LIVE_TAKEOVER_WAITS_KEY: &str = "fleet.live.takeover_waits_key";
 /// Counter: a takeover that fetched the log again because the key it lacked has come ([`next_fetch`]): once per arrival.
 /// Format: a counter name in the daemon's status report.
 const LIVE_TAKEOVER_KEY_ARRIVED: &str = "fleet.live.takeover_key_arrived";
+/// Counter: a takeover handed the log's key by a fellow candidate, at its first fetch or while it waited for the key
+/// (A-295): once a key handed.
+/// Format: a counter name in the daemon's status report.
+const LIVE_TAKEOVER_KEY_HANDED: &str = "fleet.live.takeover_key_handed";
 /// Counter: a takeover whose key for the adopted log did not come within [`NO_KEY_WAIT_NS`]: no longer waited for at
 /// that head, answered typed.
 /// Format: a counter name in the daemon's status report.
@@ -3382,15 +3462,24 @@ pub(crate) fn note_rebuild(
   why: Option<&'static str>,
   sealing: Option<crate::head::HeadSealing>,
 ) {
-  let _ = state::with_state(|s| match why {
+  let _ = state::with_state_counted(|s| match why {
     // Only a refusal of the log itself: one from the volume's restore says nothing about the log's bytes.
     Some(why) if REBUILD_REFUSALS.contains(&why) => {
       let now = slates_rt::futures::now_ns();
+      let previous = s.live.refused_rebuilds.get(&object);
       // The first refusal at this head for this reason starts the clock its bound runs from; a repeat keeps it.
-      let since = match s.live.refused_rebuilds.get(&object) {
+      let since = match previous {
         Some(refused) if refused.head == head && refused.why == why => refused.since,
         _ => now,
       };
+      // A key handed over stays while it is for the log's lineage (A-295).
+      let handed = previous
+        .and_then(|refused| refused.handed.clone())
+        .filter(|(id, _)| {
+          sealing
+            .as_ref()
+            .is_some_and(|sealing| sealing.lineage == *id)
+        });
       s.live.refused_rebuilds.insert(
         object,
         Refused {
@@ -3398,6 +3487,7 @@ pub(crate) fn note_rebuild(
           why,
           since,
           sealing,
+          handed,
         },
       );
     }
@@ -3841,6 +3931,7 @@ mod tests {
       why,
       since: 0,
       sealing: None,
+      handed: None,
     };
     for kind in [
       REFUSED_OPEN,
@@ -3972,6 +4063,7 @@ mod tests {
       why: REFUSED_NO_KEY,
       since,
       sealing: None,
+      handed: None,
     };
     let inside = since + NO_KEY_WAIT_NS - 1;
     assert_eq!(
