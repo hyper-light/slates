@@ -11321,33 +11321,48 @@ fn takeover_outcomes(daemons: &[Daemon]) -> Vec<(u64, u64)> {
     .collect()
 }
 
-/// The fleet converges on one configuration once its faults stop (§4.8 "Membership fed by SWIM", A-15's rejoin; T-8.5's
-/// convergence and T-8.7's partitions; the chaos nemesis's deafened owner, seeds 6876545201569229162 and
-/// 7236833171758868842). Do: three nodes at `f = 1`; on a, a live-shipped volume written six files and shared with the
-/// fleet; make a deaf to b and c on the probe plane (its probes still reach them, and their answers never reach it: the
-/// nemesis's `Deafened` owner) until b and c have retired it, then keep it deaf while its takeover runs, until a
-/// survivor has taken the volume over or given an object up, or the round's bound has passed twice; heal. Expect every
-/// node to hold one configuration that names all three as members and voters, installed, and the probe mesh whole,
-/// within the periods a re-admission takes.
-#[test]
-fn a_fleet_whose_deafened_owner_was_retired_settles_on_one_configuration_once_it_hears_again() {
-  let _serial = serialize_fleet_tests();
-  let (_serve_lease, daemons, hosts) = formed_mesh(&["a", "b", "c"]);
-  let mut client = Client::connect(daemons[0].instance());
-  let (_id, written) = live_volume_written(&mut client, &daemons, "deafened");
-  drop(client);
+/// What one deaf spell of [`deaf_until_its_takeover_resolves`] did: whether the node was made deaf and healed, whether
+/// the others retired it and its takeover resolved meanwhile, each node's live takeovers and given-up objects before
+/// and after, and every node's configuration at the retirement and at the heal.
+struct DeafSpell {
+  deafened: bool,
+  retired: bool,
+  resolved: bool,
+  healed: bool,
+  outcomes: (Vec<(u64, u64)>, Vec<(u64, u64)>),
+  at_retirement: Vec<String>,
+  at_heal: Vec<String>,
+}
+
+/// Makes `daemons[deaf]` deaf to every other node on the probe plane (its probes still reach them, and their answers
+/// never reach it: the chaos nemesis's `Deafened` partition) until the others have retired it, keeps it deaf while its
+/// takeover runs, until a survivor has taken a live volume over or given an object up, or the round's bound has passed
+/// twice, and then heals it.
+fn deaf_until_its_takeover_resolves(daemons: &[Daemon], hosts: &[HostId], deaf: usize) -> DeafSpell {
   let observed: Vec<&Daemon> = daemons.iter().collect();
-  let deafened = daemons[0].inject_probe_deafness(&[hosts[1], hosts[2]]);
-  let retired = deafened.is_ok()
+  let others: Vec<HostId> = hosts
+    .iter()
+    .enumerate()
+    .filter(|(index, _)| *index != deaf)
+    .map(|(_, host)| *host)
+    .collect();
+  let deafened = daemons[deaf].inject_probe_deafness(&others).is_ok();
+  let retired = deafened
     && poll_until(&observed, RETIREMENT_DEADLINE, || {
-      all_hold(daemons[1..].iter().map(|survivor| {
-        survivor
-          .council_members()
-          .map(|members| !members.contains(&hosts[0]))
-      }))
+      all_hold(
+        daemons
+          .iter()
+          .enumerate()
+          .filter(|(index, _)| *index != deaf)
+          .map(|(_, survivor)| {
+            survivor
+              .council_members()
+              .map(|members| !members.contains(&hosts[deaf]))
+          }),
+      )
     });
   let at_retirement: Vec<String> = daemons.iter().map(configuration_view).collect();
-  let before = takeover_outcomes(&daemons);
+  let before = takeover_outcomes(daemons);
   let resolved = retired
     && poll_for_periods(
       &observed,
@@ -11355,17 +11370,60 @@ fn a_fleet_whose_deafened_owner_was_retired_settles_on_one_configuration_once_it
       promise_wait_periods().saturating_mul(2),
       || {
         Ok(
-          takeover_outcomes(&daemons)
+          takeover_outcomes(daemons)
             .iter()
             .zip(&before)
             .any(|(now, then)| now.0 > then.0 || now.1 > then.1),
         )
       },
     );
-  let while_deaf = takeover_outcomes(&daemons);
+  let after = takeover_outcomes(daemons);
   let at_heal: Vec<String> = daemons.iter().map(configuration_view).collect();
-  let healed = daemons[0].inject_probe_deafness(&[]);
-  let settled = healed.is_ok()
+  let healed = daemons[deaf].inject_probe_deafness(&[]).is_ok();
+  DeafSpell {
+    deafened,
+    retired,
+    resolved,
+    healed,
+    outcomes: (before, after),
+    at_retirement,
+    at_heal,
+  }
+}
+
+/// The fleet converges on one configuration once its faults stop, after a takeover of a volume a takeover gave its
+/// owner (§4.8 "Membership fed by SWIM", A-15's rejoin; T-8.5's convergence and T-8.7's partitions). The chaos
+/// nemesis's shape, seeds 6876545201569229162 (both arches) and 7236833171758868842 (x86_64): its first fault cut the
+/// volume's creator off and a survivor took the volume over; the creator was re-admitted under its id; a later fault
+/// cut the new owner off, its takeover gave the volume up, and the fleet stayed split for good (the survivors two
+/// members, the new owner three). Do: three nodes at `f = 1`; on a, a live-shipped volume written six files and shared
+/// with the fleet; cut a off on the probe plane until the survivor the volume ranks first has taken it over, heal, and
+/// wait for one configuration of all three; write through that successor; make it deaf to the others
+/// ([`deaf_until_its_takeover_resolves`]); heal. Expect every node to hold one configuration that names all three as
+/// members and voters, installed, and the probe mesh whole, within the periods a re-admission takes, after each fault.
+#[test]
+fn a_fleet_settles_on_one_configuration_after_the_owner_a_takeover_made_is_retired_in_turn() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let mut client = Client::connect(daemons[0].instance());
+  let (id, written) = live_volume_written(&mut client, &daemons, "adopted");
+  drop(client);
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let successor = rendezvous_first(&[hosts[1], hosts[2]], ObjectId(id.bytes))
+    .expect("a survivor takes over");
+  let adopter = if successor == hosts[1] { 1 } else { 2 };
+  let taken = taken_over_on_the_probe_plane(&daemons, &hosts, &daemons[adopter]);
+  let readmitted = taken
+    && poll_for_periods(
+      &observed,
+      RETIREMENT_DEADLINE,
+      readmission_periods(&observed),
+      || settled_on_one_configuration(&daemons, &hosts),
+    );
+  let after_first: Vec<String> = daemons.iter().map(configuration_view).collect();
+  let through_adopter = written_through(&daemons, adopter, id, "/through-the-adopter");
+  let spell = deaf_until_its_takeover_resolves(&daemons, &hosts, adopter);
+  let settled = spell.healed
     && poll_for_periods(
       &observed,
       RETIREMENT_DEADLINE,
@@ -11377,10 +11435,17 @@ fn a_fleet_whose_deafened_owner_was_retired_settles_on_one_configuration_once_it
     daemon.stop();
   }
   eprintln!(
-    "deafened owner: retired {retired}; takeover resolved while deaf {resolved} (live takeovers, given up per node \
-     {before:?} -> {while_deaf:?}); settled {settled}\nat retirement:\n{}\nat the heal:\n{}\nat the end:\n{}",
-    at_retirement.join("\n"),
-    at_heal.join("\n"),
+    "adopter retired in turn: the first takeover {taken}, a re-admitted {readmitted}; the adopter (node {adopter}) \
+     deaf {} retired {} its takeover resolved while deaf {} (live takeovers, given up per node {:?} -> {:?}); settled \
+     {settled}\nafter the first takeover:\n{}\nat the adopter's retirement:\n{}\nat the heal:\n{}\nat the end:\n{}",
+    spell.deafened,
+    spell.retired,
+    spell.resolved,
+    spell.outcomes.0,
+    spell.outcomes.1,
+    after_first.join("\n"),
+    spell.at_retirement.join("\n"),
+    spell.at_heal.join("\n"),
     at_end.join("\n")
   );
   assert!(
@@ -11390,17 +11455,24 @@ fn a_fleet_whose_deafened_owner_was_retired_settles_on_one_configuration_once_it
     "every write on a was answered: {written:?}"
   );
   assert!(
-    deafened.is_ok() && healed.is_ok(),
-    "a was made deaf and healed: {deafened:?} {healed:?}"
+    taken && readmitted,
+    "the adopter took the volume over and a was re-admitted: {}",
+    after_first.join("; ")
   );
   assert!(
-    retired,
-    "b and c retired a while it heard neither: {}",
-    at_retirement.join("; ")
+    through_adopter
+      .last()
+      .is_some_and(|reply| matches!(reply, ReplyBody::FsDone { .. })),
+    "a write through the adopter was answered: {through_adopter:?}"
+  );
+  assert!(
+    spell.deafened && spell.retired && spell.healed,
+    "the adopter was made deaf, retired and healed: {}",
+    spell.at_retirement.join("; ")
   );
   assert!(
     settled,
-    "every node holds one configuration naming a, b and c, all voting and meshed, once a hears again: {}",
+    "every node holds one configuration naming a, b and c, all voting and meshed, once the adopter hears again: {}",
     at_end.join("; ")
   );
 }
