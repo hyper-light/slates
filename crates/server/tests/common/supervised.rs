@@ -61,11 +61,9 @@ pub(crate) fn run(role: &str, name: &str, shards: u16) {
     .into_iter()
     .map(str::to_owned)
     .collect();
-  // No restart: the role runs once, and its exit is the test's verdict.
-  let policy = RestartPolicy {
-    window_ns: u64::MAX,
-    max_restarts: 0,
-  };
+  // The role runs once: its first exit is the test's verdict, and the watch ends at the step that reports it, whatever
+  // the supervisor does next (A-311 restarts a first failed start at once; the restarted role is stopped on return).
+  let policy = RestartPolicy::derive(config.failover_slo_ns).get();
   let mut supervisor = Supervisor::new(segment, &args, policy).unwrap();
   supervisor.hold_environment(ROLE_ENV, role.to_owned());
   supervisor.hold_environment(INSTANCE_ENV, instance);
@@ -87,6 +85,8 @@ pub(crate) fn run(role: &str, name: &str, shards: u16) {
       }
     }
   };
+  // The role restarted at its exit is stopped at once, before it runs the body again.
+  supervisor.stop().unwrap();
   assert_eq!(
     exit,
     Some(0),

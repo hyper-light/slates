@@ -55,6 +55,7 @@ fn report() -> ReplyBody {
       anchor_log_lines_refused: 103,
       dumps_local_full: true,
       anchor: 97,
+      recovered: true,
       fleet: FleetReport {
         host: 19,
         f: 0,

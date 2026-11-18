@@ -16,6 +16,8 @@
   clippy::indexing_slicing
 )]
 
+#[path = "support/recovered.rs"]
+mod recovered;
 #[path = "../../anchor/tests/windows_access/mod.rs"]
 mod windows_access;
 
@@ -31,6 +33,9 @@ const SHARDS: &str = "2";
 const WAIT_FOR: Duration = Duration::from_secs(10);
 /// Shape: the pause between polls of a change or a start.
 const POLL: Duration = Duration::from_millis(20);
+/// Derived: how long a daemon gets to be judged recovered (A-311): [`WAIT_FOR`] to serve, as a successor gets, and as long
+/// again to serve as long as its start took.
+const RECOVERED_WAIT: Duration = WAIT_FOR.saturating_mul(2);
 /// Shape: consecutive answers to `volume list` a start waits for, so the anchor's one startup restart has settled.
 const STABLE_STREAK: u32 = 10;
 /// Shape: the most `volume list` attempts a start makes after the daemon's serving line (`crates/cli/tests/cli.rs`
@@ -655,7 +660,9 @@ fn a_winfsp_drive_handle_and_view_survive_twenty_killed_daemons() {
   assert_eq!(read_uncached_page(&handle).unwrap(), vec![b'A'; FILE_BYTES]);
   assert_eq!(view.page(), vec![b'A'; FILE_BYTES]);
   for iteration in 1..=TAKEOVER_KILLS {
-    let killed = daemon_pid(&fixture.instance).expect("the daemon answers before the kill");
+    // Each daemon is killed once the anchor has judged it recovered (A-311): a daemon killed sooner is a failed start,
+    // and the second in a row is a crash loop the anchor backs off, which this test does not test.
+    let killed = recovered::await_recovered(&fixture.instance, &|_| true, POLL, RECOVERED_WAIT);
     kill_daemon(killed);
     wait_for_successor(&fixture.instance, &drive, &original, killed, iteration);
     let served = successor_bytes(&mut fixture, &handle, &view, iteration);
