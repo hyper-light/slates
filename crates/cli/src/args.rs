@@ -2488,6 +2488,11 @@ mod tests {
       .is_err(),
       "a container bind is not held"
     );
+  }
+
+  /// The process verbs' grammar: the anchor's and the MCP server's options, a global instance among them.
+  #[test]
+  fn the_grammar_parses_the_process_verbs() {
     assert_eq!(
       parse(&args("anchor --quick --shards 2 --instance z")),
       Ok(Command::Anchor(ProcessOptions {

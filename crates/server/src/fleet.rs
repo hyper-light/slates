@@ -1006,7 +1006,7 @@ const ROUND_ANCHORS: RoundAnchors = RoundAnchors {
 ///   gathers no new reply for as long as a peer may go unheard before it is suspected — or for one round-trip
 ///   tail, whichever is longer — is judged stalled, not merely slow, and is left to time out at its current
 ///   deadline.
-fn consensus_budget(slowest_tail_ns: Option<u64>) -> CommitBudget {
+pub(crate) fn consensus_budget(slowest_tail_ns: Option<u64>) -> CommitBudget {
   round_budget(&ROUND_ANCHORS, slowest_tail_ns)
 }
 
@@ -1516,6 +1516,46 @@ impl Drop for DialedIn {
   }
 }
 
+/// The stable anchor of the peer that presented `certificate`: the roster's for that certificate, or the one the
+/// certificate itself derives when the roster names it not (task #22's two-id model).
+fn rostered_anchor(roster: &[Rostered], certificate: &CertificateDer<'static>) -> HostId {
+  roster
+    .iter()
+    .find(|peer| peer.certificate == *certificate)
+    .map_or_else(
+      || crate::deploy::host_id_of_certificate(certificate),
+      |peer| peer.anchor,
+    )
+}
+
+/// Whether this node's discovery recognizes the peer that presented `certificate` (its enrollment).
+fn discovery_recognizes(certificate: &CertificateDer<'static>) -> bool {
+  state::with_state(|state| {
+    state
+      .discovery
+      .as_ref()
+      .and_then(|discovery| discovery.recognizes(certificate))
+  })
+  .flatten()
+  .is_some()
+}
+
+/// The peer's next request, or a forward this node finished for it; none once the session ends (a peer's reset
+/// counted).
+async fn next_or_end(
+  endpoint: &mut Endpoint,
+  forwards: &mut crate::forward_lane::ServedForwards,
+) -> Option<crate::forward_lane::Next> {
+  match crate::forward_lane::next_request_or_forwarded(endpoint, forwards).await {
+    Ok(next) => Some(next),
+    Err(EndpointError::PeerReset) => {
+      count_refusal(SERVE_PEER_RESET);
+      None
+    }
+    Err(_) => None,
+  }
+}
+
 /// The record serve side (§4.8 "records are sent to all candidates"; "Promotion and takeover"): complete
 /// the accepted session's handshake and loop answering the peer over this node's per-object holds — a
 /// **record** commit is accepted into the object's durable acceptor (this node backs the peer as a
@@ -1549,13 +1589,7 @@ async fn serve_peer_records(
     count_refusal(ACCEPT_REFUSED);
     return;
   };
-  let peer_anchor = roster
-    .iter()
-    .find(|peer| peer.certificate == certificate)
-    .map_or_else(
-      || crate::deploy::host_id_of_certificate(&certificate),
-      |peer| peer.anchor,
-    );
+  let peer_anchor = rostered_anchor(&roster, &certificate);
   let seed = crate::deploy::member_id(peer_anchor, 0);
   // The peer dialed this session and keeps it only while it keeps direct contact with this node (A-337).
   let _dialed_in = DialedIn::counted(peer_anchor);
@@ -1575,26 +1609,12 @@ async fn serve_peer_records(
   let mut forwards = crate::forward_lane::ServedForwards::new();
   loop {
     // Enrolled once the discovery recognizes the peer's certificate, and asked again only until then.
-    enrolled = enrolled
-      || state::with_state(|state| {
-        state
-          .discovery
-          .as_ref()
-          .and_then(|discovery| discovery.recognizes(&certificate))
-      })
-      .flatten()
-      .is_some();
+    enrolled = enrolled || discovery_recognizes(&certificate);
     // A forwarded verb runs on its own task (`crate::forward_lane::ServedForwards`), so one waiting on its owner shard
     // holds no other request of this peer; every other request is served here, one at a time, as before.
-    let next =
-      match crate::forward_lane::next_request_or_forwarded(&mut endpoint, &mut forwards).await {
-        Ok(next) => next,
-        Err(EndpointError::PeerReset) => {
-          count_refusal(SERVE_PEER_RESET);
-          return;
-        }
-        Err(_) => return,
-      };
+    let Some(next) = next_or_end(&mut endpoint, &mut forwards).await else {
+      return;
+    };
     let (stream_id, stream, request) = match next {
       crate::forward_lane::Next::Forwarded { stream_id, reply } => {
         if endpoint.reply(stream_id, reply).is_err() {
@@ -6137,6 +6157,45 @@ async fn injected_turn_pause() {
   }
 }
 
+/// A placed seal's archive (none for a contentless volume), the successor's lineage key to adopt and the head's
+/// naming key ([`Source::Archive`]).
+type ArchiveSource = (
+  Option<Archive>,
+  Option<([u8; 16], Vec<u8>)>,
+  Option<crate::head::HeadNaming>,
+);
+
+/// A taken-over volume's placed archive, opened in a turn of its owner shard: a copy this node froze for a move it made
+/// (A-291) let go before the volume's keys are adopted ([`let_frozen_go`]; an envelope's open let it go in its first
+/// turn); the volume's lineage key adopted, so this node seals under the key the dead owner did (A-92 pieces 3b and 4c;
+/// an envelope's was adopted before its open, [`open_in_turns`]; a head that carried no entry for this node, having
+/// acknowledged before its pair arrived, leaves a plain archive's volume to a new key); and the archive itself. A
+/// sealed archive is opened before this task begins, so what arrives here is a plain one, or none for a contentless
+/// volume.
+async fn archive_opened(
+  object: ObjectId,
+  id: DbVolumeId,
+  catalog: &crate::catalog::CatalogValue,
+  (archive, lineage, naming): ArchiveSource,
+) -> Result<Option<Archive>, &'static str> {
+  futures::yield_now().await;
+  making_turn(object, |s| {
+    let_frozen_go(s, id)?;
+    if let Some(lineage) = lineage
+      && crate::seal_keys::adopt_lineage(s, id, &catalog.owner, lineage, naming.as_ref()).is_err()
+    {
+      s.count(LINEAGE_UNADOPTED, 1);
+    }
+    match archive {
+      Some(archive) => opened_archive(archive).map(Some).ok_or_else(|| {
+        s.count(ENVELOPE_UNOPENED, 1);
+        ENVELOPE_UNOPENED
+      }),
+      None => Ok(None),
+    }
+  })?
+}
+
 /// The turns of a taken-over volume's materialization on its owner shard, each a turn of its own:
 /// - from a live log, its payloads opened and applied a slice a turn ([`crate::live_ship::Rebuilding`], counted
 ///   [`LIVE_REBUILD_SLICES`]), then laid out as an archive; from a placed seal, the successor's lineage key adopted and
@@ -6172,33 +6231,10 @@ async fn make_in_turns(making: MakeTaken, source: Source) -> Result<(), &'static
       archive,
       lineage,
       naming,
-    } => {
-      futures::yield_now().await;
-      let opened = making_turn(object, |s| {
-        // A copy this node froze for a move it made (A-291) goes before the volume's keys are adopted
-        // ([`let_frozen_go`]); an envelope's open let it go in its first turn.
-        let_frozen_go(s, id)?;
-        // The volume's lineage key, so this node seals under the same key the dead owner did (A-92 pieces 3b and 4c);
-        // an envelope's was adopted before its open ([`open_in_turns`]). A head that carried no entry for this node
-        // (it acknowledged before its pair arrived) leaves a plain archive's volume to a new key.
-        if let Some(lineage) = lineage
-          && crate::seal_keys::adopt_lineage(s, id, &catalog.owner, lineage, naming.as_ref())
-            .is_err()
-        {
-          s.count(LINEAGE_UNADOPTED, 1);
-        }
-        // A sealed archive is opened before this task begins ([`open_in_turns`]); what arrives here is a plain one, or
-        // none for a contentless volume.
-        match archive {
-          Some(archive) => opened_archive(archive).map(Some).ok_or_else(|| {
-            s.count(ENVELOPE_UNOPENED, 1);
-            ENVELOPE_UNOPENED
-          }),
-          None => Ok(None),
-        }
-      })??;
-      (opened, None)
-    }
+    } => (
+      archive_opened(object, id, &catalog, (archive, lineage, naming)).await?,
+      None,
+    ),
   };
   let from_live_log = adopted.is_some();
   futures::yield_now().await;

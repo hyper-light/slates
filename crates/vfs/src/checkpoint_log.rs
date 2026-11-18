@@ -624,6 +624,53 @@ impl Journal {
   }
 }
 
+/// The image a recovery would rebuild for the volume keyed `key` from the journal in `checkpoints` and `log` (A-430):
+/// its image in the committed checkpoint, folded with each of its records in the committed deltas after it, in order,
+/// as [`Journal::recover`] folds every volume's (a full record replaces it, a delta applies, a removal drops it).
+/// `None` when the journal holds no such volume: never published, or removed. A checkpoint that cannot image a volume
+/// carries this record instead of leaving the volume out. Only the checkpoint slot's bytes, that volume's image and one
+/// delta at a time are held, so the carry costs that volume, not every volume's image. Refused as `recover` refuses.
+pub fn committed_volume<C: ImageRead + ?Sized, L: ImageRead + ?Sized>(
+  checkpoints: &C,
+  log: &L,
+  key: &[u8; 16],
+) -> Result<Option<crate::recover::VolumeImage>, VfsError> {
+  let Some((committed, mut image)) = ShardImage::committed_volume(checkpoints, key)? else {
+    return Ok(None);
+  };
+  let (mut generation, mut tail) = (committed.generation, 0usize);
+  while let Some((next, delta, total)) = read_frame(log, tail, committed.generation)? {
+    if next != generation.saturating_add(1) {
+      break;
+    }
+    if delta.magic != DELTA_MAGIC {
+      return Err(VfsError::RecoveryIncomplete);
+    }
+    if delta.version != DELTA_VERSION {
+      return Err(VfsError::RecoveryVersion {
+        found: delta.version,
+        expected: DELTA_VERSION,
+      });
+    }
+    if let Ok(at) = delta.volumes.binary_search_by_key(key, |keyed| keyed.key) {
+      let keyed = delta.volumes.get(at).ok_or(VfsError::RecoveryIncomplete)?;
+      match &keyed.record {
+        VolumeRecord::Full { image: whole } => image = Some(whole.clone()),
+        VolumeRecord::Delta { delta: changes } => image
+          .as_mut()
+          .ok_or(VfsError::RecoveryIncomplete)?
+          .apply(changes)?,
+      }
+    }
+    if delta.removed.binary_search(key).is_ok() {
+      image = None;
+    }
+    generation = next;
+    tail = tail.saturating_add(total);
+  }
+  Ok(image)
+}
+
 /// The generation of the last committed publication in a journal's memories — the committed checkpoint's, advanced
 /// over every valid delta frame after it — without decoding a delta: what a transport's write log is stamped
 /// against at startup (A-63). `0` when nothing committed.

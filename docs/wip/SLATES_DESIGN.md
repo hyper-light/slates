@@ -2917,6 +2917,15 @@ before the report is published, so a tool never reads attributes newer than the 
 > zeros. `verbs::replay_one` now writes an overlay's record as the bridge does: the file copied up and its windows read
 > from the disk first. Proven by `a_replayed_write_into_an_overlays_base_file_keeps_the_disks_bytes_around_it`
 > (`docs/bugs/2026-11-18-a-replayed-write-into-an-overlays-base-file-zeroed-the-bytes-before-it.md`).
+> **A full log's forced publication settles a write by its own volume (2026-11-18, A-436).** A write the log has no room
+> for forces a publication. That write counted as logged only when the publication left no volume out, so one that left
+> out another volume marked the overflow for a write its image held, and every taken-over file was reported as having
+> lost writes. The write now counts as kept when the publication captured its volume, and is appended again when the
+> publication left its volume out, since A-422's retain gave the room back; only a write nothing keeps marks the
+> overflow (`write_log::log_acknowledged_write`, which the FUSE mount and the Shards stream share). A `FORGET` is kept
+> the same way. Proven by `a_full_logs_forced_publication_keeps_a_captured_volumes_write_and_reports_no_loss` and
+> `a_full_logs_forced_publication_appends_a_left_out_volumes_write_again`
+> (`docs/bugs/2026-11-18-a-full-logs-forced-publication-reported-a-captured-volumes-write-as-lost.md`).
 > **The takeover round is built (2026-10-23, A-158).** A restored mount tells its kernel what its predecessor may not
 > have: the epoch bump and an invalidation of the root and of every restored reference and replayed inode, in slices.
 > Proven on Linux 7.2.9 through the real binary, each test red with the change's files at the previous commit:
@@ -5741,6 +5750,15 @@ remain separate gaps. The two reported daemon overlay failures now pass on macOS
 > 0.11–0.16 ms at 256 MiB. A block the committed image names is never reused before a newer image commits
 > (deferred frees). Recovery claims exactly the image's blocks and sweeps what no rebuilt volume reaches. The
 > rebuilt store equals the live one, including a snapshot's and a clone's sharing. Proofs are listed in A-64.
+>
+> **Status (2026-11-18, A-430: a volume a publication cannot image keeps its committed record, and the blocks it
+> names).** A delta that cannot image a volume keeps the record the journal already holds for it. A checkpoint used to
+> leave such a volume out entirely, and a recovery from it refused the volume until a later publication captured it;
+> it now carries that record (`checkpoint_log::committed_volume`, the committed checkpoint folded with its deltas, as
+> a recovery folds it). The kept record may name blocks the volume has freed since it was taken. Such blocks are
+> deferred, and a plain commit released them, so the delta path's kept record could name a block handed out again. A
+> publication that keeps a left-out record now keeps every deferred block (`ChunkArena::capture_deferred`), and the next
+> one that keeps none releases them; meanwhile the arena's relief publishes nothing, since it could release none.
 
 For each ledger position, distinguish a holder's promised epoch from its accepted
 `(epoch, value)`. Phase one consults an authorized quorum of distinct holders and adopts the
@@ -24923,17 +24941,28 @@ Applied in the same change to: GAPS (A-273's entry). Nothing else yet: the tests
 Status: step 1 built 2026-11-17 (the owner's frees held for its replicas, below). Step 2 built 2026-11-18 (g083): the
 replica and its feed, in `crates/merge/src/replica.rs`. The owner makes a message for each version it commits
 (`Green::feed_version`) and for each fold that moves its floor (`fold_and_feed`, `fold_to_budget_and_feed`), at its feed
-position, which it then moves past. A replica is built from the owner's checkpoint at its head over the green's origin,
-joined at the owner's feed position then (`Green::replica_seed`, `Replica::build`), so a base below that version is
-the owner's to answer. It applies the message at its next position through `Green::apply_recorded` or
+position, which it then moves past. A replica was built from the owner's checkpoint at its head over the green's origin,
+joined at the owner's feed position then, so a base below that version was the owner's to answer (step 3 replaced
+this: a replica is now made from the owner whole). It applies the message at its next position through `Green::apply_recorded` or
 `fold_history_before`, passes over one below it, and refuses one above it (`FeedRefusal::Gap`), or a version that
 would replay as another (`FeedRefusal::Diverged`), before anything changes; its holder then rebuilds it, counted
 (`Replica::rebuild`, `Replica::counts`). Proven by `crates/merge/tests/replica.rs`: over generated histories with a
 message delivered late, lost, or in flight across a rebuild, the replica is the owner's green at its head after every
 step (its identity and every name's bytes), and at the end equals the owner whole (every version both hold, the paths
-changed since each, every rebase over each base, and a base below its floor refused). Its content is still its own;
-the sealed blocks read in place (step 3), its bounds (step 4) and the shards' use of it (step 5) are owed. The text and
-its measurements are perf's (2026-11-11, `agents/perf-a273`, never pushed); the
+changed since each, every rebase over each base, and a base below its floor refused). Step 3 built 2026-11-18 (g083):
+the green's content in sealed blocks (`slates_mem::sealed`, `crates/merge/src/store.rs`), its current files and its
+history chunks alike. The owner seals each run of bytes once and releases what it names no more; a replica is made from
+the owner whole (`Green::replica`: every index, history and delta cloned, the content named by the owner's blocks), so
+it holds no byte of content of its own and serves every base the owner does, and reads each block in place through its
+own live table, which only the owner's messages fill. A replay's seals adopt the blocks the owner sealed in the same
+message, in its order, each checked to hold exactly the bytes the replay made, else the message is refused
+(`FeedRefusal::NotTheOwners`). The owner frees a released block once every replica has passed the message that
+released it (`Fed::Applied`'s `Passed`, `Green::acknowledge_replica`), and nothing for a replica that left
+(`Green::leave_replica`); step 1's frees by position now live in the sealed blocks. Proven by the sealed blocks' tests
+(a reader on another thread reads in place what its writer frees behind it; generated histories of seals, releases,
+joins, passes, late acknowledgements and leaves, every live block allocated and read as sealed) and the replica's
+oracle, which now holds every current file's bytes to be the owner's own memory. Its bounds (step 4) and the shards'
+use of it (step 5) are owed. The text and its measurements are perf's (2026-11-11, `agents/perf-a273`, never pushed); the
 content question it left open was decided by the supervisor on 2026-11-17 by A-64 and D-7 (below). W1 (A-247), whose
 works off the owner it builds on, landed on 2026-11-17 (3c0af9399).
 
@@ -30382,6 +30411,216 @@ no new contract number); `unsafe-budget.toml` (`slates-ipc` 139 → 140); and:
   holder named in a `Resync`, the replies kept for a resend and the `FORGET`s logged); `slates shards` handing the
   resync end to its command (`{resync}`); and the real-process Windows restart test, filed with the successor's half:
   all built by A-433.
+
+### A-431 — AC-3.3's told wait is learned: a writer waits the tail of the told waits its shard measured plus a liveness window, backed off after an overdue wait up to the failover delay (2026-11-18, built for goal g255; R3's class A; A-141, A-191, A-196, A-228, A-232, A-354, A-375)
+- **What was there.** A writer outside FUSE waited for every FUSE mount of its volume to be told of its change at most
+  `told::TOLD_WAIT_NS`, half a liveness window on the wall, then was answered anyway, the late mount counted
+  `fuse.told_overdue` (A-191); a guest device's held reply (A-196) and a revocation's wait for its fenced mounts
+  (AUD-29-84) took the same bound. Its stated reasons were the near-miss share of the window and that a writer held to
+  it kept the other half of its client's reply deadline; since 2026-11-13 a client waits for a live daemon's answer
+  however long (A-232), so the second was gone, and the first is a logging threshold, not a judgment of the mounts. On a
+  machine whose mounts are told late but told (a loaded host, a large invalidation round), every such writer was
+  answered overdue, the case AC-3.3 exists to prevent.
+- **The rule.** The bound is learned as RFC 6298 learns a retransmission timeout (`told::ToldTimes`, per shard, over
+  `slates_cluster::failover::RunningDuration`): the tail of the told waits the shard measured (`smoothed + max(4 ·
+  deviation, G)`; none before the first) plus a liveness window, the lateness a live party may show before it is judged
+  (A-228). A wait cut short at its bound is not a sample (Karn's rule: its true length is unknown) but doubles the bound
+  for the next (§5.5), never past the node's failover delay (`ShardState::failover_ns`), the most a reply is held
+  (A-354, A-375); the next wait that ends told ends the back-off. A guest device's reply published at the bound backs it
+  off too. So a host whose mounts are told slowly is waited for at its own pace, a mount that never answers holds each
+  writer at most a failover delay, and the learned pace is never cut by the ceiling: the ceiling caps a back-off. Read
+  by every writer's wait (`told::wait`), a guest device's held reply (`virtiofs`'s `told_bound_ns`) and a revocation's
+  wait for its fenced mounts (`verbs::revoked_mounts_ended`, as the revoking shard learned it).
+- **Tests.** `a_writers_told_bound_follows_the_told_waits_it_measured` and
+  `an_overdue_told_wait_backs_the_bound_off_to_the_failover_delay_and_a_told_one_ends_it` (`crates/server/src/told.rs`,
+  host-independent: the learner over scripted waits). The told wait itself runs only where FUSE mounts do (Linux): the
+  FUSE told suite, the guest device's and the Shards stream's told counts are filed for main's Linux run.
+  Run on the Mac Studio (kiln, 2026-11-18, load 4-8, debug build, `cargo test --locked -p slates-server --lib -- told
+  virtiofs`): 3 of 3, both new tests among them. Red-checked once: with the bound ignoring the waits it measured, the
+  first test fails at its quick waits' bound.
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class A, AUD-29-84's line), `crates/server/src/
+{told,state,daemon,virtiofs,verbs}.rs`.
+
+### A-432 — The reaper's cleanup calls and a granted landing's lease and audit waits wait in their target's own time; the live log's admission, reconciliation and dispatch waits are wall bounds by their reasons (2026-11-18, goal 85 via g251; R3's class A; A-65, A-408, A-426)
+
+- **What was there.** Fifteen of the cross-shard calls A-408 left (g255's list at main 4553e8650) waited their budget on
+  the wall. The reaper's five (`reap::remove_on_owners`: a client's held maps written back, its presentations
+  abandoned, its attachments read and removed a batch at a time, its maps let go) waited the liveness window each, and a
+  shard alive and busy deferred the reap `Overloaded`, the next sweep sending the same write-back again beside the
+  first. A granted landing's five (`landing.rs`: the target lease's take, its compensation, its renewal between
+  slices, its release before the reply, and the audit append the reply waits on, A-265) waited the lease's term, so a
+  busy control shard refused the take `Overloaded` after a compensation, left a lease to its term, or sent a reply
+  without its audit record. The live log's five (`live_ship.rs`) waited a record period or the live budget.
+- **The rule.** The reaper's and the landing's calls wait by `xshard::call_in_shard_time` and `task_in_shard_time`
+  (A-65's rule, as A-403 and A-408): their budget's window, then on while the target works or waits for a CPU, until it
+  has run the budget's CPU (held to this build), so only a target that stopped, or ran its budget without answering,
+  ends the wait with the same typed refusal as before. A take run past its own deadline still refuses itself
+  (`take_target_lease`), so a take waited longer is answered or refused typed, never left unknown. The live log's
+  waits stay on the wall, each for a stated reason beside it: a claim admission (`admit_claim`, `serve_admit`) runs
+  inside the record plane's serve of a peer's message, which serves that peer one request at a time, and its owner asks
+  again at the record period (`ADMISSION_WAIT_NS`), while the admission's closure, idempotent, still runs on its shard;
+  the claim reconciliation and re-admission (`reconcile_claims`, `readmit`) run in the control shard's record period
+  before its materializations, a shard unanswered staying marked for the next; and the live dispatch's wait
+  (`send_from_control`) has lanes bounded on the wall by the live budget and an answer nothing reads, and bounds how
+  long the owner's task that sent it stays, a lane being taken free again at the same bound.
+- **Tests.** `a_reaps_calls_wait_for_a_shard_that_works_past_their_first_window` (`reap.rs`) and
+  `a_lease_take_waits_for_a_control_shard_that_works_past_its_term` (`landing.rs`): a two-shard daemon whose second
+  shard runs one poll of three windows on the wall, on its CPU a fifth of it (`daemon::hold_busy`), the reap and the take
+  sent behind it. Red: each waited one window on the wall, the reap deferred `Overloaded` and the take refused
+  `Overloaded` with its lease released by its compensation.
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class A), `crates/server/src/{reap,landing,
+live_ship,daemon}.rs`.
+
+### A-430 — A volume a publication cannot image keeps its committed record, and every block that record names stays allocated (2026-11-18, goal g268; found by reading in A-422's sibling sweep; §4.8, D-18; amends A-64's commit rule and A-68's checkpoint)
+Applied in the same change to:
+- `crates/mem`: `Buddy::capture_deferred` and `ChunkArena::capture_deferred` (every deferred block joins the open
+  capture, so the commit keeps it); the unit test `a_commit_that_keeps_the_deferred_blocks_hands_none_of_them_out`, and
+  the deferral model's history now commits keeping every deferred block in a third of its commits.
+- `crates/vfs`: `checkpoint_log::committed_volume` and `ShardImage::committed_volume` (one volume's record as a
+  recovery would rebuild it, decoded one volume at a time); the oracle test
+  `a_volumes_committed_record_is_what_a_recovery_rebuilds_for_it` (`tests/checkpoint_log.rs`).
+- `crates/server/src/verbs.rs`: `publish_checkpoint` carries a left-out volume's record (`carry_record`,
+  `stream_checkpoint`), `published_keys` counts it; `publish_shard` keeps every deferred block when a publication kept
+  a left-out record (`keep_left_out_records_blocks`, counted `arena.deferred_kept_for_left_out`); `relieve_deferred`
+  publishes nothing meanwhile (`arena.relief_withheld`); `ShardState::deferred_kept`. Tests: the streamed checkpoint
+  test now expects the carried record; `a_left_out_volumes_kept_record_keeps_the_blocks_it_names`.
+- §4.8 (the status after A-64's), GAPS (A-422's entry, its first sibling), the bug record
+  `docs/bugs/2026-11-18-a-checkpoint-left-out-a-volume-it-could-not-image-and-a-kept-record-named-reused-blocks.md`.
+
+- **What was there.** A publication that cannot image a volume (an overlay whose base host is away, or whose image
+  refuses) leaves it out. A delta keeps the volume's committed record ("a skipped volume keeps its committed record, so
+  it stays present"). A checkpoint dropped it: its image held the volume not at all. So a recovery from that checkpoint
+  refused the volume (`NoImage`) until a later publication captured it, though its content had been acknowledged
+  durable at earlier publications. The delta's kept record had a hazard of its own. A-64 defers the free of a block the
+  committed image names until a newer image commits, and each commit releases the deferred blocks its own capture does
+  not name. A left-out volume's blocks freed since its record was taken are exactly such blocks, so the first commit
+  that left it out handed them out again while the kept record named them. A recovery then rebuilt the volume over
+  whatever took a block next, or refused the whole shard for a block named two ways.
+- **The rule.** A volume a publication cannot image keeps the record the journal holds for it, in a delta and in a
+  checkpoint alike: the checkpoint carries it, read from the committed checkpoint and folded with the deltas after it,
+  one volume at a time. Every block a kept record names stays allocated until a publication captures the volume again.
+  Those blocks are among the deferred ones, since every commit since the record was taken kept them, so a publication
+  that keeps a left-out record keeps every deferred block. The next publication that keeps none releases those its own
+  image does not name. While blocks are kept so, a publication run only to relieve the arena would release none, so it
+  is not run, and an operation the arena cannot fit meets its typed `PublishNeeded` (EAGAIN on a FUSE mount).
+- **Why every deferred block, and the cost.** The precise set is the blocks the kept records name, which takes each
+  kept record's extents and a capture per chunk piece (A-118's trimmed chunks). Every deferred block is a superset
+  that is correct with no new bookkeeping. It costs the frees of every volume on the shard while one volume stays left
+  out: memory is not reclaimed until the left-out volume is captured or destroyed. A left-out volume is rare: its
+  image refuses only with its host away, which a landing holds within one synchronous unit, or on an internal refusal.
+  The precise set is owed (GAPS) if a lasting left-out volume ever shows in the counters.
+- **Evidence (Mac Studio, 2026-11-18, debug).**
+  - mem: the keeping commit's test and the deferral model's two histories pass with the keeping commits, 4 of 4.
+  - vfs: `committed_volume` equals `Journal::recover`'s fold for a volume changed by a delta, one carried whole, one
+    removed, one added and one never published.
+  - server: the streamed checkpoint now commits the overlay's record as a recovery had rebuilt it before. The block
+    test keeps the 524,288 deferred bytes of a cut file across the publication that leaves its overlay out, and
+    releases them when the overlay is captured. Both pass with the write log's and the replay's tests, 18 of 18.
+  - Each half was red once with its part removed: no record carried, and the 524,288 bytes released (`left: 0`).
+
+### A-434 — A work's verb held for its quorum commit, or for its work's route, waits the failover delay, a held reply's total (2026-11-18, built for goal g255; R3's class B; AUD-11, A-247, A-298, A-354, A-363, A-375)
+- **What was there.** A work's verb whose verdict its green's owner takes to answer at its quorum commit (AUD-11), or
+  that waits for its work's route to commit (A-298), was held up to the owner lease's bound (`lease::lease_bound_ns`,
+  the membership horizon less its clock tolerance, about 0.9 s), then answered `Overloaded`, unrecorded, for its retry
+  to run it again. That bound is the one a verb waits for its own owner lease to confirm (`lease_wait`); a commit at
+  the quorum is not a lease's confirmation: when a holder is lost it waits for the fleet to fail over, which the
+  failover delay bounds (A-363), so a verb given up at the lease's bound came back to wait again, once a lease bound
+  for as long as the failover took.
+- **The rule.** Such a verb is held at most the node's failover delay (`work_home::park_bound_ns`, the fanned
+  `ShardState::failover_ns`), a held reply's total (A-354, A-375, the durable spans `live_ship` reads): the most any
+  reply waits for a commit to be durable, one number for both. A batch of asks to the owner keeps the lease's bound as
+  its first window, judged in the owner's own time past it (A-426).
+- **Test.** `a_verb_held_for_its_quorum_commit_waits_the_failover_delay` (`crates/server/src/work_home.rs`): on a shard
+  whose failover delay is held at three lease bounds, a verb deferred for its quorum commit is still held a lease bound
+  after its deferral and released at the failover delay.
+  Run on the Mac Studio (kiln, 2026-11-18, load 4-7, debug build, `cargo test --locked -p slates-server --lib --
+  work_home lease_wait`): 1 of 1. Red-checked once: with the bound back at the lease's, the test fails at its first
+  look, the verb released. The green owner's flows and the load rungs that park verbs are filed for main's run.
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class A), `crates/server/src/work_home.rs`.
+
+### A-437 — The owner-location round asks by the record plane's round budget over its slowest asked path, and waits for a lent session the span of one record-plane exchange (2026-11-18, built for goal g255; R3's class B, item B-a; §4.8 "Lookup"; the supervisor's ruling of 2026-11-07; A-317)
+- **What was there.** A location round (`owner_location::locate_round`) asked the admitted home-region peers within one
+  liveness window, hard (`CommitBudget::hard`), and waited for peers whose record session was lent out when it began
+  until the same window had passed since its start, then counted them `session_never_returned`. A live peer whose
+  path is slower than a window was never heard, and a session lent to an exchange that runs under the record plane's
+  budget (longer than a window when a path is slow) was given up while it was coming back.
+- **The rule** (the supervisor's ruling of 2026-11-07: the slowest asked peer's tail and the record-plane exchange
+  budget). The round asks under the record plane's round budget (`fleet::consensus_budget`) over the slowest measured
+  round-trip tail among the peers it may ask (`PathRtt`, RFC 6298 per path; `owner_location::round_budget_for`): a base
+  deadline of the longer of a coordinator period and that tail, extended while replies keep arriving, ended once none
+  arrives for the stall window, as every record-plane exchange is. It waits for a lent session until the budget's whole
+  span (`max_deadline_ns`) has passed since it began: the longest one record-plane exchange runs, the bound every
+  borrower of a record session runs its exchange under, so a session lent when the round begins comes back within it.
+  A peer with no session at all is still not waited for (the bounded neighbourhood).
+- **Test.** `a_location_round_waits_for_its_slowest_asked_peers_measured_round_trip` (`crates/server/src/
+  owner_location.rs`): the round's budget with no path measured extends past its base; with the slowest asked path's
+  tail at two liveness windows, its base deadline and its span are past that tail.
+  Run on the Mac Studio (kiln, 2026-11-18, load 7-12, debug build, `cargo test --locked -p slates-server --lib --
+  owner_location`): 6 of 6. Red-checked once: with the round back at one liveness window, hard, the test fails at its
+  first look, a quiet round that never extends. The fleet's location flows are filed for main's run.
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class B), `crates/server/src/{owner_location,fleet}.rs`.
+
+### A-436 — A full write log's forced publication settles the write it could not take by the write's own volume (2026-11-18, goal g268; found by reading in A-422's sibling sweep; §4.6 "Linux", §4.8; amends A-63's full-log rule)
+Applied in the same change to: `crates/server/src/write_log.rs` (`keep_record`, `log_acknowledged_write`,
+`log_forgets`), `crates/server/src/fuse.rs` and `crates/server/src/shards.rs` (each `log_write` calls
+`log_acknowledged_write`), the tests `a_full_logs_forced_publication_keeps_a_captured_volumes_write_and_reports_no_loss`
+and `a_full_logs_forced_publication_appends_a_left_out_volumes_write_again` (`crates/server/src/verbs.rs`), §4.6 (the
+takeover status, after A-429's), GAPS (A-422's entry, its third sibling) and the bug record
+`docs/bugs/2026-11-18-a-full-logs-forced-publication-reported-a-captured-volumes-write-as-lost.md`.
+
+- **What was there.** A-63: a write the log has no room for forces a publication, which carries the write and empties
+  the log; only a refused publication leaves the write unlogged, marked as an overflow. The test the transports wrote
+  for "carries" was that the publication left no volume out. A publication that left out another volume therefore
+  marked the overflow for a write its image held, and the next daemon reported every taken-over file as having lost
+  writes. A write to the left-out volume was marked too, though A-422's retain had just given back the room the
+  captured volumes' records took.
+- **The rule.** A record a full log refused is settled by its own volume after the publication it forced. Captured,
+  the image carries it, the effect already applied. Left out, the volume's records stand under the new stamp beside
+  the room the others gave back, and the record is appended again. Only a refused publication, a span the content
+  object refuses, or a log still full leaves the record unkept: a write then marks the overflow, counted, and a
+  `FORGET` is counted (`write_log.forget_unlogged`). One function holds the rule for both transports, where each had
+  its own copy.
+- **Evidence.** Two unit tests on a shard whose reserve is cut to 32 MiB, so its write log is 8 MiB. Each fills the
+  log with a plain volume's records beside an overlay that cannot be imaged, then logs a write: one to the plain
+  volume, one to the overlay. Both pass (Mac Studio, 2026-11-18, debug) beside the write log's eleven and A-422's and
+  A-430's tests, 16 of 16. Each first asserts that the forced publication left the overlay out (it kept the overlay's
+  record, counted). With the old rule put back, both failed at the overflow mark.
+
+### A-435 — An adopted move's seal, a takeover's give-up record and a revocation's mount wait wait in their target's own time; the moves read and the pressure room sample are wall bounds by their reasons (2026-11-18, goal 85 via g251; R3's class A; A-65, A-408, A-432)
+
+- **What was there.** Five more of the cross-shard calls g255 listed waited on the wall. An adopted move's settle
+  (`moves::settle_adopted`) asked the owner shard to seal the volume within a record period; the seal
+  (`seal_adopted`, a snapshot) is not idempotent, so an answer dropped at the period's end while the shard worked was
+  lost, the next period's settle took a second seal superseding the first, and the adopted snapshot it should have
+  dropped was left behind. A takeover's give-up by name (`takeover::record_given_up`, A-340) recorded the objects
+  unrecovered on their owner shards within a period, once: a busy owner shard settled none of its objects, which then
+  answered as volumes no member serves for good. A revocation's wait for the FUSE mounts it fenced
+  (`verbs::revoked_mounts_ended`, Linux) counted a shard busy with its other work as the kernels' overrun. The record
+  period's read of each shard's moves (`moves::drive_outgoing`) and the pressure sampler's free-room read
+  (`daemon::free_room_of`) waited a period and a heartbeat.
+- **The rule.** The settle and the give-up wait by `xshard::call_in_shard_time` with the liveness window as their
+  budget, as A-408's calls do: a shard alive and working answers, and only one that stopped, or ran a window of CPU
+  without answering (which the watchdog judges spinning), is given up, the settle asked again next period. The
+  revocation's wait is `task_in_shard_time` with the told bound (A-431) as its budget, so the bound is the kernels'.
+  The moves read and the room sample stay on the wall, each for a stated reason beside it: the moves read is pure and
+  asked again each period, so a busy shard's moves wait a period rather than holding the period's takeovers and
+  materializations behind it; the room sample is the reap cadence's, beside its lease expiries and reaps, and a shard
+  unanswered reads as no room, its share going to the others or to the debt the next growth takes on.
+- **Tests.** `an_adopted_moves_seal_is_recorded_from_an_owner_shard_that_works_past_a_period` (`moves.rs`: a volume
+  made on the second shard of a two-shard daemon, its adoption recorded on the first, the second held in one poll of
+  three periods at a fifth of its CPU, `daemon::hold_busy`; the seal recorded in the adoption) and
+  `a_given_up_object_is_recorded_on_an_owner_shard_that_works_past_a_period` (`takeover.rs`: the object settled
+  recorded and held unrecovered on its shard). Red with the period's wall bound: the seal unrecorded, the object
+  settled unrecorded. The revocation's wait is Linux's and its mounts the kernel's: its run is filed for main's Linux lane.
+- **Owed.** The seal is still taken again when its answer is lost to a stopped shard: recording it on the owner shard
+  would make `seal_adopted` idempotent (GAPS).
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class A), `crates/server/src/{moves,takeover,verbs,
+daemon}.rs`.
 
 ### A-433 — A Windows Shards stream outlives its daemon: the successor adopts the held resync end, duplicates a fresh stream into the holder the session names, and answers a resent request from the reply kept for it (2026-11-18, goal 90, item b, piece four; A-316's successor half on Windows; A-418's wire, A-423's hold, A-427's attach half)
 Applied in the same change to: §4.6, the Shards form's resync and death bullets; A-427's owed list; GAPS, A-281's entry

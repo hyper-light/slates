@@ -5506,17 +5506,21 @@ async fn revoke_everywhere(origin: u16, owner: u16, shards: &[u16], consumer: u6
 
 /// Waits until every FUSE mount the revocation fenced (each shard's, by attachment and volume) has had its kernel drop
 /// what it cached and ended (AUD-29-84; `crate::fuse::fence_if_mounted`), so no process reads, after the revocation is
-/// acknowledged, a page the consumer's kernel held. Each shard is waited on for at most [`crate::told::TOLD_WAIT_NS`],
-/// the bound a writer waits for the same kernels to be told of a change; one past it is counted and the revocation
-/// acknowledged anyway, since every request of the mount is already refused.
+/// acknowledged, a page the consumer's kernel held. Each shard is waited on for at most the bound a writer here waits for
+/// the same kernels to be told of a change (`crate::told::bound_ns`, A-431, as this shard learned it); one past it is
+/// counted and the revocation acknowledged anyway, since every request of the mount is already refused.
 #[cfg(target_os = "linux")]
 async fn revoked_mounts_ended(origin: u16, fenced: Vec<(u16, Vec<(u64, DbVolumeId)>)>) {
+  let bound = crate::state::with_state(|s| crate::told::bound_ns(s))
+    .unwrap_or(crate::daemon::LIVENESS_BUDGET_NS);
   for (shard, mounts) in fenced {
-    let ended = crate::xshard::task_within(
+    // Waited in the shard's own time (A-435): the bound is for the kernels the shard waits on, so a shard busy with
+    // its other work, or starved, is waited for rather than counted overdue; one idle past the bound is the kernels'.
+    let ended = crate::xshard::task_in_shard_time(
       origin,
       shard,
       move || crate::fuse::revoked_mounts_ended(mounts),
-      crate::told::TOLD_WAIT_NS,
+      bound,
     )
     .await;
     if ended.is_none() {
@@ -10227,6 +10231,33 @@ pub(crate) fn publish_clone_as(
   }
 }
 
+/// The consumer an attachment records. Another host's client's attachment names its host and client (A-222); a local
+/// client's is its own, a CLI one's lapsing at its term (A-230); a container bind's is its parent attachment's. Whether
+/// that source is shared with other users is the parent attachment's record, which only this resolves, so the bind's
+/// evidence is stamped here rather than in `oci::bind`, which sees the mount table and not the attachment: a rootful
+/// runtime needs it true, a rootless one does not (§4.6 A-9, `HostMountEvidence::shared_with_other_users`).
+fn attach_consumer(
+  state: &mut ShardState,
+  (client_id, principal): (u32, &Principal),
+  record: &VolumeRecord,
+  snapshot: Option<SnapshotId>,
+  form: &AttachRequest,
+  binding: Option<&mut crate::oci::Binding>,
+) -> Result<slates_db::catalog::Consumer, Refusal> {
+  let Some(binding) = binding else {
+    let expires_ns = termed_expiry(state);
+    return crate::remote_attach::consumer(state, form, client_id, expires_ns);
+  };
+  let (consumer, shared_source) = binding.consumer(
+    state.db.partition(),
+    record.id,
+    principal,
+    snapshot.map(to_db_snapshot),
+  )?;
+  binding.entry.evidence.shared_with_other_users = shared_source;
+  Ok(consumer)
+}
+
 /// Attaches in the requested form (§4.4 `attach(volume|snapshot, consumer, transport, chosen_path?)`;
 /// §4.6 A-9), in the order that takes nothing before it is allowed: the rights for the intent first
 /// (§4.13: checked before any lookup or effect), then the form's establishment (a container bind is
@@ -10269,34 +10300,17 @@ fn attach(
     Ok(binding) => binding,
     Err(refusal) => return refused(refusal),
   };
-  let expires_ns = termed_expiry(state);
-  let resolved = binding.as_ref().map_or_else(
-    // Another host's client's attachment names its host and client (A-222); a local client's is its own, a CLI one's
-    // lapsing at `expires_ns` (A-230).
-    || {
-      crate::remote_attach::consumer(state, &form, client_id, expires_ns)
-        .map(|consumer| (consumer, false))
-    },
-    |binding| {
-      binding.consumer(
-        state.db.partition(),
-        record.id,
-        principal,
-        snapshot.map(to_db_snapshot),
-      )
-    },
-  );
-  let (consumer, shared_source) = match resolved {
-    Ok(resolved) => resolved,
+  let consumer = match attach_consumer(
+    state,
+    (client_id, principal),
+    &record,
+    snapshot,
+    &form,
+    binding.as_mut(),
+  ) {
+    Ok(consumer) => consumer,
     Err(refusal) => return refused(refusal),
   };
-  // Whether the source is shared with other users is the parent attachment's record, which only `consumer`
-  // above has resolved — so the evidence is stamped here rather than in `oci::bind`, which sees the mount
-  // table and not the attachment. A rootful runtime needs it true; a rootless one does not (§4.6 A-9, and
-  // `HostMountEvidence::shared_with_other_users`).
-  if let Some(binding) = binding.as_mut() {
-    binding.entry.evidence.shared_with_other_users = shared_source;
-  }
   let scope = match scope_of(state, volume, &form) {
     Ok(scope) => scope,
     Err(refusal) => return refused(refusal),
@@ -16723,11 +16737,12 @@ pub fn publish_shard(state: &mut ShardState) -> Result<Published, slates_vfs::Vf
   // of one is deferred, so the committed image never names a reused block (A-64). Settled here on every outcome.
   state.store.content.arena_mut().capture();
   let outcome = publish_captured(state);
-  match outcome {
-    Ok(_) => {
+  match &outcome {
+    Ok(published) => {
       // Every volume the publication recorded has its ceiling raised (`Volume::mark_published`, A-150); a volume still
       // short sets the flag again at its next number.
       state.store.counters_low = false;
+      keep_left_out_records_blocks(state, published);
       state.store.content.arena_mut().commit_capture();
       crate::live_ship::ship_captured(state);
       // The committed image names no block of a wholly free extent, and no deferred free holds one: it goes back to
@@ -16742,6 +16757,28 @@ pub fn publish_shard(state: &mut ShardState) -> Result<Published, slates_vfs::Vf
   }
   outcome
 }
+
+/// Keeps every deferred block named once the publication `published` commits, when it kept a record of a volume it left
+/// out (A-430): a delta keeps the volume's committed record and a checkpoint carries it, and that record may name
+/// blocks the volume has freed since it was taken. Each such block is deferred, since the image committed then named it
+/// and every commit after kept it so, and a plain commit would hand it out again while the kept record names it: a
+/// recovery would then rebuild the volume over another's bytes, or refuse the shard for a block named twice. Before
+/// A-430 the delta path did exactly that. The next publication that keeps no left-out record releases them. While
+/// blocks are kept so, the arena's relief publishes nothing ([`relieve_deferred`]): it could release none of them.
+fn keep_left_out_records_blocks(state: &mut ShardState, published: &Published) {
+  let kept = published
+    .skipped
+    .iter()
+    .any(|id| state.published_keys.contains(&id.bytes));
+  state.deferred_kept = kept;
+  if kept {
+    state.store.content.arena_mut().capture_deferred();
+    state.count(DEFERRED_KEPT, 1);
+  }
+}
+
+/// Format: the status counter of publications that kept every deferred block for a left-out volume's record (A-430).
+const DEFERRED_KEPT: &str = "arena.deferred_kept_for_left_out";
 
 /// The body of [`publish_shard`] once its capture is taken: a delta of what changed since the last publication,
 /// appended to the shard's journal (A-68), or — at the first publication, once the deltas since the last checkpoint
@@ -16908,6 +16945,10 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
   // in the slot, and the slot commits only when its header is written last, so the abandoned stream commits nothing.
   // Each restart leaves out one more volume, so there are at most as many restarts as volumes.
   let mut skipped: Vec<(DbVolumeId, slates_vfs::VfsError)> = Vec::new();
+  // Each left-out volume's record as the journal holds it, which the restarted checkpoint carries in its place (A-430):
+  // a volume left out of a checkpoint would otherwise be missing from it, and refused by a recovery from it, until a
+  // later publication captured it, where a delta keeps its record.
+  let mut carried: Vec<(DbVolumeId, slates_vfs::recover::VolumeImage)> = Vec::new();
   // An attempt that leaves a volume out owes the write log its restamp before it can commit (A-422).
   let mut restamp_owed = false;
   let outcome = loop {
@@ -16918,11 +16959,14 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
     match stream_checkpoint(
       state,
       &handles,
-      &skipped,
+      (&skipped, &carried),
       &mut held,
       (&mut replies, &mut calls, &mut nfs_replies, &mut nfs_states),
     ) {
-      Ok(Streamed::Uncaptured(id, e)) => skipped.push((id, e)),
+      Ok(Streamed::Uncaptured(id, e)) => {
+        carry_record(state, id, &mut carried);
+        skipped.push((id, e));
+      }
       Ok(Streamed::Committed(published)) => break Ok(published),
       Ok(Streamed::Refused(e)) => break Err(publish_refused(state, e)),
       Err(e) => break Err(e),
@@ -16955,7 +16999,13 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
       }
     }
   }
-  state.published_keys = published.volumes.iter().map(|id| id.bytes).collect();
+  // The image holds the volumes it captured and the records it carried (A-430).
+  state.published_keys = published
+    .volumes
+    .iter()
+    .chain(carried.iter().map(|(id, _)| id))
+    .map(|id| id.bytes)
+    .collect();
   crate::content_holder::held_committed(state, whole, true);
   crate::live_ship::owned_committed(state, owned, true);
   call_records_published(state);
@@ -16964,6 +17014,65 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
   settle_write_log(state, &published.skipped, state.journal.generation());
   Ok(published)
 }
+
+/// Adds the record the journal holds for volume `id`, which a checkpoint could not image, to `carried` (A-430): the
+/// committed checkpoint folded with the deltas after it, exactly what a recovery would rebuild for it
+/// (`checkpoint_log::committed_volume`). Nothing for a volume the committed image does not hold; a journal that
+/// cannot be read is counted, and the volume is left out as before.
+fn carry_record(
+  state: &mut ShardState,
+  id: DbVolumeId,
+  carried: &mut Vec<(DbVolumeId, slates_vfs::recover::VolumeImage)>,
+) {
+  if !state.published_keys.contains(&id.bytes) || carried_record(carried, id).is_some() {
+    return;
+  }
+  let record = match state.content.as_ref() {
+    Some(object) => {
+      let (images, deltas) = (state.content_range, state.delta_range);
+      slates_vfs::checkpoint_log::committed_volume(
+        &ContentView {
+          object,
+          start: images.0,
+          len: images.1.saturating_sub(images.0),
+        },
+        &ContentView {
+          object,
+          start: deltas.0,
+          len: deltas.1.saturating_sub(deltas.0),
+        },
+        &id.bytes,
+      )
+    }
+    None => Err(slates_vfs::VfsError::RecoveryIncomplete),
+  };
+  match record {
+    Ok(Some(image)) => {
+      carried.push((id, image));
+      state.count(LEFT_OUT_CARRIED, 1);
+    }
+    Ok(None) => {}
+    Err(_) => state.count(LEFT_OUT_CARRY_REFUSED, 1),
+  }
+}
+
+/// The record `carried` holds for volume `id`, if one.
+fn carried_record(
+  carried: &[(DbVolumeId, slates_vfs::recover::VolumeImage)],
+  id: DbVolumeId,
+) -> Option<&slates_vfs::recover::VolumeImage> {
+  carried
+    .iter()
+    .find(|(carried_id, _)| *carried_id == id)
+    .map(|(_, image)| image)
+}
+
+/// Format: the status counter of left-out volumes whose committed record a checkpoint carried (A-430).
+const LEFT_OUT_CARRIED: &str = "publish.left_out_carried";
+
+/// Format: the refusal counter of a left-out volume's record a checkpoint could not read from the journal (A-430): the
+/// volume is left out of that checkpoint, and a recovery from it refuses the volume until a publication captures it.
+const LEFT_OUT_CARRY_REFUSED: &str = "publish.left_out_carry_refused";
 
 /// How one streamed checkpoint attempt ended.
 enum Streamed {
@@ -16983,7 +17092,10 @@ enum Streamed {
 fn stream_checkpoint(
   state: &mut ShardState,
   handles: &[Handle<VolumeSlot>],
-  skipped: &[(DbVolumeId, slates_vfs::VfsError)],
+  (skipped, carried): (
+    &[(DbVolumeId, slates_vfs::VfsError)],
+    &[(DbVolumeId, slates_vfs::recover::VolumeImage)],
+  ),
   held: &mut Vec<slates_vfs::recover::HeldPiece>,
   (replies, calls, nfs_replies, nfs_states): (
     &mut Vec<slates_vfs::recover::HeldReply>,
@@ -16997,7 +17109,8 @@ fn stream_checkpoint(
   };
   let mut count = 0usize;
   for handle in handles {
-    if !left_out(state.volumes.get(*handle)?) {
+    let slot = state.volumes.get(*handle)?;
+    if !left_out(slot) || carried_record(carried, slot.id).is_some() {
       count = count.saturating_add(1);
     }
   }
@@ -17026,6 +17139,14 @@ fn stream_checkpoint(
       continue;
     }
     if left_out(slot) {
+      // A volume the checkpoint cannot image keeps the record the journal holds for it (A-430), as a delta keeps it.
+      if let Some(image) = carried_record(carried, slot.id) {
+        stream.buf().extend_from_slice(&slot.id.bytes);
+        image.encode(stream.buf());
+        if let Err(e) = stream.settle() {
+          return Ok(Streamed::Refused(stream.refused().cloned().unwrap_or(e)));
+        }
+      }
       continue;
     }
     let id = slot.id;
@@ -17105,6 +17226,19 @@ fn publish_delta(state: &mut ShardState) -> Result<Published, slates_vfs::VfsErr
   outcome
 }
 
+/// Keeps a live-shipped volume's just-encoded publication `record` to ship once the publication commits (A-200,
+/// `crate::live_ship`); a volume not live-shipped keeps nothing.
+fn capture_live_record(state: &mut ShardState, id: DbVolumeId, record: Option<&[u8]>) {
+  if state
+    .db
+    .partition()
+    .volume(id)
+    .is_some_and(|volume| volume.policy.live_shipped)
+  {
+    state.live.captured.push((id, record.map(<[u8]>::to_vec)));
+  }
+}
+
 /// [`publish_delta`] into `encoded`.
 fn publish_delta_into(
   state: &mut ShardState,
@@ -17146,18 +17280,11 @@ fn publish_delta_into(
         published.volumes.push(id);
         recorded.push(*handle);
         count = count.saturating_add(1);
-        // A live-shipped volume's record ships once the publication commits (A-200, `crate::live_ship`).
-        if state
-          .db
-          .partition()
-          .volume(id)
-          .is_some_and(|volume| volume.policy.live_shipped)
-        {
-          let record = encoded
-            .get(mark.saturating_add(id.bytes.len())..)
-            .map(<[u8]>::to_vec);
-          state.live.captured.push((id, record));
-        }
+        capture_live_record(
+          state,
+          id,
+          encoded.get(mark.saturating_add(id.bytes.len())..),
+        );
       }
       Err(e) => {
         encoded.truncate(mark);
@@ -17306,6 +17433,13 @@ pub(crate) fn relieve_deferred(state: &mut ShardState) {
   if free >= state.store.budget.headroom() {
     return;
   }
+  // The last publication kept every deferred block for a volume it left out (A-430), and one now would keep them
+  // again while that volume stays out: it would relieve nothing, and every unit of work would pay for one. The next
+  // publication that captures the volume releases them.
+  if state.deferred_kept {
+    state.count(RELIEF_WITHHELD, 1);
+    return;
+  }
   if publish_shard(state).is_ok() {
     let relieved = state.refusals.entry(DEFERRED_RELIEVED).or_insert(0);
     *relieved = relieved.saturating_add(1);
@@ -17315,6 +17449,10 @@ pub(crate) fn relieve_deferred(state: &mut ShardState) {
 /// Format: the status counter of publications run to top up a volume's reserve of inode numbers (A-150), before a unit
 /// of work that might hand one out.
 pub(crate) const COUNTERS_TOPPED_UP: &str = "publish.counters_topped_up";
+
+/// Format: the status counter of reliefs not run because the last publication kept every deferred block for a left-out
+/// volume's record (A-430).
+const RELIEF_WITHHELD: &str = "arena.relief_withheld";
 
 /// Whether an effect a client keeps across a restart waits for volume `volume`'s next publication
 /// (`Volume::awaits_publication`: an unreserved inode number, A-150; a release the committed publication still counts
@@ -17723,7 +17861,8 @@ fn settle_references(state: &mut ShardState, record: &VolumeRecord) -> usize {
 /// its next restart. Zero is the healthy reading.
 const TAKEOVER_KEPT_UNRELEASED: &str = "recovery.takeover_kept_unreleased";
 /// Format: revocations acknowledged while a FUSE mount they fenced was still dropping its kernel's cache, past
-/// `told::TOLD_WAIT_NS` (AUD-29-84): its requests were refused, but a page its kernel held may have been read meanwhile.
+/// the told bound (`told::bound_ns`, AUD-29-84): its requests were refused, but a page its kernel held may have been read
+/// meanwhile.
 /// Zero is the healthy reading.
 #[cfg(target_os = "linux")]
 const REVOKED_MOUNTS_OVERDUE: &str = "fuse.revoked_overdue";
@@ -18919,14 +19058,17 @@ mod tests {
     });
   }
 
-  /// §4.8 (a streamed checkpoint, 2026-10-06): a checkpoint is streamed straight into its slot, so when a volume cannot
-  /// be captured the bytes of the volumes before it may already be there; the checkpoint restarts without it. Do:
-  /// create a volume of 2,000 files (its image several stream stages long), then an overlay whose base host is taken
-  /// away (as a landing holds it), so it sorts after the first and cannot be imaged; publish a checkpoint; read the
-  /// committed image back; then give the host back and publish again. Expect: the first publish captures the plain
-  /// volume and skips the overlay, and the committed image holds exactly the plain volume's image; the second captures
-  /// both. Non-vacuity: the plain volume sorts first and its image is longer than a stage, so the abandoned attempt had
-  /// written into the slot before the overlay refused.
+  /// §4.8 (a streamed checkpoint, 2026-10-06), A-430: a checkpoint is streamed straight into its slot, so when a volume
+  /// cannot be captured the bytes of the volumes before it may already be there; the checkpoint restarts without
+  /// capturing it, and carries the record the journal holds for it in its place. Do: create a volume of 2,000 files
+  /// (its image several stream stages long), then an overlay whose base host is taken away (as a landing holds it), so
+  /// it sorts after the first and cannot be imaged; note the overlay's record as a recovery would rebuild it; publish a
+  /// checkpoint; read the committed image back; then give the host back and publish again. Expect: the first publish
+  /// captures the plain volume and leaves the overlay out, and the committed image holds the plain volume's image,
+  /// whole, and the overlay's record as it was, so a recovery from it rebuilds the overlay; the second captures both.
+  /// Non-vacuity: the plain volume sorts first and its image is longer than a stage, so the abandoned attempt had
+  /// written into the slot before the overlay refused. Before A-430 the committed image held the plain volume alone,
+  /// and a recovery from it refused the overlay until a later publication captured it.
   #[test]
   fn a_streamed_checkpoint_restarts_without_a_volume_it_cannot_capture() {
     crate::daemon::audit_on_shard(|state| {
@@ -18946,6 +19088,7 @@ mod tests {
       );
       let host = state.volumes.get_mut(overlay_handle).unwrap().host.take();
       assert!(host.is_some(), "the overlay has a base host");
+      let overlay_record = recovered_record(state, overlay).expect("the overlay was published");
 
       let published = super::publish_checkpoint(state).expect("the shard publishes");
       assert_eq!(published.volumes, vec![plain], "{published:?}");
@@ -18957,8 +19100,8 @@ mod tests {
         .collect();
       assert_eq!(
         committed,
-        vec![(plain.bytes, plain_image)],
-        "the committed image holds the plain volume's image, whole, and nothing else"
+        vec![(plain.bytes, plain_image), (overlay.bytes, overlay_record)],
+        "the committed image holds the plain volume's image, whole, and the overlay's record as it was"
       );
 
       state.volumes.get_mut(overlay_handle).unwrap().host = host;
@@ -18966,6 +19109,88 @@ mod tests {
       assert_eq!(published.volumes, vec![plain, overlay], "{published:?}");
       assert!(published.skipped.is_empty(), "{published:?}");
     });
+  }
+
+  /// A-430: a record kept for a volume a publication leaves out keeps the blocks it names. Do: on a shard holding an
+  /// overlay of this crate's sources, write two chunks' worth of bytes into a new file of it and publish (the committed
+  /// image names the file's blocks); copy one of its base files up, so its next publication is its whole image; cut the
+  /// file to nothing, which frees its blocks (deferred, since the committed image names them); take the overlay's base
+  /// host away; publish, which leaves the overlay out and keeps its record; then give the host back and publish again.
+  /// Expect: after the first publish the freed block is still deferred, never handed out, and the publication counted
+  /// as keeping it; after the second, which captures the overlay, nothing is deferred. Before A-430 the first publish
+  /// released the block while the record it kept still named it, so a recovery would have rebuilt the overlay's file
+  /// over whatever took the block next.
+  #[test]
+  fn a_left_out_volumes_kept_record_keeps_the_blocks_it_names() {
+    let (left_out, deferred_before, deferred_kept, kept, deferred_after) =
+      crate::daemon::audit_on_shard(|state| {
+        let principal = Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 1234,
+        };
+        let base = concat!(env!("CARGO_MANIFEST_DIR"), "/src").to_owned();
+        let (overlay, handle) = dynamic_volume(state, &principal, "kept-blocks", Some(base));
+        let chunk = state.store.content.chunk_bytes();
+        let file = {
+          let super::ShardState { store, volumes, .. } = &mut *state;
+          let slot = volumes.get_mut(handle).unwrap();
+          let root = slot.volume.root_inode(store).unwrap();
+          let host = slot.host.as_mut().unwrap();
+          let mut overlay_fs = slot.volume.with_host(host);
+          let file = overlay_fs
+            .create_file_no(store, root, "kept", 0o644)
+            .unwrap();
+          overlay_fs
+            .write(store, file, 0, &vec![b'a'; 2 * chunk])
+            .unwrap();
+          file
+        };
+        super::publish_shard(state).expect("the shard publishes the file");
+        {
+          let super::ShardState { store, volumes, .. } = &mut *state;
+          let slot = volumes.get_mut(handle).unwrap();
+          let root = slot.volume.root_inode(store).unwrap();
+          let host = slot.host.as_mut().unwrap();
+          let mut overlay_fs = slot.volume.with_host(host);
+          let copied = overlay_fs.lookup_no(store, root, "lib.rs").unwrap().inode;
+          overlay_fs.write(store, copied, 0, b"copied up").unwrap();
+          overlay_fs.truncate(store, file, 0).unwrap();
+        }
+        let deferred_before = state.store.content.arena().deferred_bytes();
+        let host = state.volumes.get_mut(handle).unwrap().host.take();
+        let published =
+          super::publish_shard(state).expect("the shard publishes without the overlay");
+        let deferred_kept = state.store.content.arena().deferred_bytes();
+        let kept = state
+          .refusals
+          .get(super::DEFERRED_KEPT)
+          .copied()
+          .unwrap_or(0);
+        state.volumes.get_mut(handle).unwrap().host = host;
+        super::publish_shard(state).expect("the shard publishes the overlay");
+        let deferred_after = state.store.content.arena().deferred_bytes();
+        (
+          published.skipped == vec![overlay],
+          deferred_before,
+          deferred_kept,
+          kept,
+          deferred_after,
+        )
+      });
+    assert!(left_out, "the publication left the overlay out");
+    assert!(
+      deferred_before > 0,
+      "the cut freed the file's blocks, deferred for the committed image"
+    );
+    assert_eq!(
+      deferred_kept, deferred_before,
+      "the publication that kept the overlay's record kept every block it names"
+    );
+    assert_eq!(kept, 1, "counted as keeping them");
+    assert_eq!(
+      deferred_after, 0,
+      "the publication that captured the overlay released them"
+    );
   }
 
   /// Shape: the bytes of the overlay's acknowledged write in the left-out volume's test.
@@ -19102,6 +19327,211 @@ mod tests {
     );
   }
 
+  /// Shape: the bytes of each record the full-log tests fill the write log with, and of the write each then logs: one
+  /// size, so the log that refused a filler refuses the write too.
+  const FILLER_BYTES: usize = 64 * 1024;
+
+  /// The full-log tests' shard: a plain volume and an overlay of this crate's sources, each with a published file; one
+  /// of the overlay's base files copied up and its host taken away, so its next publication is its whole image and
+  /// cannot be taken; and the write log filled with the plain volume's records until it refuses one. Returns the two
+  /// volumes and their files.
+  fn a_full_log_beside_a_left_out_overlay(
+    state: &mut crate::state::ShardState,
+  ) -> (
+    super::DbVolumeId,
+    slates_vfs::ids::InodeNo,
+    super::DbVolumeId,
+    slates_vfs::ids::InodeNo,
+  ) {
+    let principal = Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 1234,
+    };
+    let base = concat!(env!("CARGO_MANIFEST_DIR"), "/src").to_owned();
+    let (plain, plain_handle) = dynamic_volume(state, &principal, "full-log-plain", None);
+    let (overlay, overlay_handle) =
+      dynamic_volume(state, &principal, "full-log-overlay", Some(base));
+    let plain_file = {
+      let super::ShardState { store, volumes, .. } = &mut *state;
+      let slot = volumes.get_mut(plain_handle).unwrap();
+      let root = slot.volume.root_inode(store).unwrap();
+      slot
+        .volume
+        .create_file_no(store, root, "kept", 0o644)
+        .unwrap()
+    };
+    let overlay_file = {
+      let super::ShardState { store, volumes, .. } = &mut *state;
+      let slot = volumes.get_mut(overlay_handle).unwrap();
+      let root = slot.volume.root_inode(store).unwrap();
+      let host = slot.host.as_mut().unwrap();
+      slot
+        .volume
+        .with_host(host)
+        .create_file_no(store, root, "kept", 0o644)
+        .unwrap()
+    };
+    super::publish_shard(state).expect("the shard publishes both files");
+    {
+      let super::ShardState { store, volumes, .. } = &mut *state;
+      let slot = volumes.get_mut(overlay_handle).unwrap();
+      let root = slot.volume.root_inode(store).unwrap();
+      let host = slot.host.as_mut().unwrap();
+      let mut overlay_fs = slot.volume.with_host(host);
+      let copied = overlay_fs.lookup_no(store, root, "lib.rs").unwrap().inode;
+      overlay_fs.write(store, copied, 0, b"copied up").unwrap();
+    }
+    let host = state.volumes.get_mut(overlay_handle).unwrap().host.take();
+    assert!(host.is_some(), "the overlay had a base host");
+    let filler = vec![b'f'; FILLER_BYTES];
+    loop {
+      let super::ShardState {
+        write_log, content, ..
+      } = &mut *state;
+      match write_log.as_mut().unwrap().append(
+        content.as_mut().unwrap(),
+        (plain.bytes, plain_file.0),
+        0,
+        &filler,
+      ) {
+        Ok(()) => {}
+        Err(crate::write_log::Refused::Full) => break,
+        Err(other) => panic!("the log refused a filler: {other:?}"),
+      }
+    }
+    (plain, plain_file, overlay, overlay_file)
+  }
+
+  /// The write log as a restarted daemon would find it now, against the generation the shard's journal committed.
+  fn log_as_a_successor_finds_it(
+    state: &mut crate::state::ShardState,
+  ) -> crate::write_log::Recovered {
+    let generation = {
+      let object = state.content.as_ref().unwrap();
+      let (images, deltas) = (state.content_range, state.delta_range);
+      slates_vfs::checkpoint_log::committed_generation(
+        &super::ContentView {
+          object,
+          start: images.0,
+          len: images.1 - images.0,
+        },
+        &super::ContentView {
+          object,
+          start: deltas.0,
+          len: deltas.1 - deltas.0,
+        },
+      )
+    };
+    let super::ShardState {
+      write_log, content, ..
+    } = &mut *state;
+    write_log
+      .as_ref()
+      .unwrap()
+      .reopened(content.as_mut().unwrap(), generation)
+      .unwrap()
+  }
+
+  /// A-436 (A-422's third sibling, from reading): a write a full log cannot take is kept by the publication it forces
+  /// when that publication captures the write's volume, though it leaves another volume out. Do: on a shard with a
+  /// reduced reserve (so its write log is small), a plain volume and an overlay that cannot be imaged, the log filled
+  /// with the plain volume's records; write into the plain volume's file and log it as a transport does. Expect: the
+  /// forced publication left the overlay out (it kept the overlay's record, counted) and captured the plain volume; the
+  /// log is not marked overflowed, nothing is counted unlogged, and a restarted daemon is told nothing was lost. Before
+  /// A-436 the write counted unlogged because the overlay was left out, the overflow was marked, and every file a
+  /// taken-over mount had open was reported as having lost writes, though the image held the write.
+  #[test]
+  fn a_full_logs_forced_publication_keeps_a_captured_volumes_write_and_reports_no_loss() {
+    let (left_out, holds_every_write, unlogged, recovered) =
+      crate::daemon::audit_on_shard_configured(
+        |state| {
+          let (plain, plain_file, _, _) = a_full_log_beside_a_left_out_overlay(state);
+          let payload = vec![b'p'; FILLER_BYTES];
+          let handle = *state.by_id.get(&plain).unwrap();
+          {
+            let super::ShardState { store, volumes, .. } = &mut *state;
+            let slot = volumes.get_mut(handle).unwrap();
+            slot.volume.write(store, plain_file, 0, &payload).unwrap();
+          }
+          crate::write_log::log_acknowledged_write(state, plain, (plain_file.0, 0), &payload);
+          (
+            state
+              .refusals
+              .get(super::DEFERRED_KEPT)
+              .copied()
+              .unwrap_or(0),
+            state.write_log.as_ref().unwrap().holds_every_write(),
+            state
+              .refusals
+              .get(super::WRITE_LOG_UNWRITTEN)
+              .copied()
+              .unwrap_or(0),
+            log_as_a_successor_finds_it(state),
+          )
+        },
+        |config| config.reserve_per_shard = RELIEF_RESERVE,
+      );
+    assert_eq!(left_out, 1, "the forced publication left the overlay out");
+    assert!(holds_every_write, "the log is not marked overflowed");
+    assert_eq!(unlogged, 0, "nothing was counted unlogged");
+    assert!(
+      !recovered.everything_lost,
+      "a restarted daemon is told nothing was lost"
+    );
+  }
+
+  /// A-436: a write a full log cannot take, to the volume the publication it forces leaves out, is appended again into
+  /// the room that publication gave back (A-422's retain drops the captured volumes' records). Do: as in
+  /// [`a_full_logs_forced_publication_keeps_a_captured_volumes_write_and_reports_no_loss`], but write into the
+  /// overlay's own file. Expect: the publication left the overlay out; the log is not marked overflowed; and a
+  /// restarted daemon is handed the overlay's write and told nothing was lost. Before A-436 the write was in neither
+  /// the image nor the log, and the overflow was marked.
+  #[test]
+  fn a_full_logs_forced_publication_appends_a_left_out_volumes_write_again() {
+    let (left_out, holds_every_write, overlay, overlay_file, recovered) =
+      crate::daemon::audit_on_shard_configured(
+        |state| {
+          let (_, _, overlay, overlay_file) = a_full_log_beside_a_left_out_overlay(state);
+          let payload = vec![b'o'; FILLER_BYTES];
+          let handle = *state.by_id.get(&overlay).unwrap();
+          {
+            let super::ShardState { store, volumes, .. } = &mut *state;
+            let slot = volumes.get_mut(handle).unwrap();
+            slot.volume.write(store, overlay_file, 0, &payload).unwrap();
+          }
+          crate::write_log::log_acknowledged_write(state, overlay, (overlay_file.0, 0), &payload);
+          (
+            state
+              .refusals
+              .get(super::DEFERRED_KEPT)
+              .copied()
+              .unwrap_or(0),
+            state.write_log.as_ref().unwrap().holds_every_write(),
+            overlay,
+            overlay_file,
+            log_as_a_successor_finds_it(state),
+          )
+        },
+        |config| config.reserve_per_shard = RELIEF_RESERVE,
+      );
+    assert_eq!(left_out, 1, "the forced publication left the overlay out");
+    assert!(holds_every_write, "the log is not marked overflowed");
+    assert!(
+      !recovered.everything_lost,
+      "a restarted daemon is told nothing was lost"
+    );
+    assert_eq!(
+      recovered.records,
+      vec![crate::write_log::Logged::Write(crate::write_log::Record {
+        volume: overlay.bytes,
+        inode: overlay_file.0,
+        offset: 0,
+        bytes: vec![b'o'; FILLER_BYTES],
+      })],
+      "a restarted daemon is handed the overlay's write, and none of the captured volume's"
+    );
+  }
+
   /// A dynamic volume named `name` (over `base` when given), created through the verb: its id and its slot.
   fn dynamic_volume(
     state: &mut crate::state::ShardState,
@@ -19158,7 +19588,35 @@ mod tests {
     slot.volume.to_image(&state.store, None).unwrap()
   }
 
-  /// The shard image committed in the shard's checkpoint slots.
+  /// The shard image committed in the shard's checkpoint slots. The image a recovery would rebuild for `volume` from
+  /// the shard's journal as it stands, the committed checkpoint and its deltas folded by `Journal::recover`; `None`
+  /// when the journal holds no such volume.
+  fn recovered_record(
+    state: &crate::state::ShardState,
+    volume: super::DbVolumeId,
+  ) -> Option<slates_vfs::recover::VolumeImage> {
+    let object = state.content.as_ref().unwrap();
+    let (images, deltas) = (state.content_range, state.delta_range);
+    let (image, _) = slates_vfs::checkpoint_log::Journal::recover(
+      &super::ContentView {
+        object,
+        start: images.0,
+        len: images.1 - images.0,
+      },
+      &super::ContentView {
+        object,
+        start: deltas.0,
+        len: deltas.1 - deltas.0,
+      },
+    )
+    .unwrap();
+    image?
+      .volumes
+      .into_iter()
+      .find(|keyed| keyed.key == volume.bytes)
+      .map(|keyed| keyed.image)
+  }
+
   fn committed_image(state: &mut crate::state::ShardState) -> super::ShardImage {
     let (start, end) = state.content_range;
     let slots = super::ContentSlots {

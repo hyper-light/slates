@@ -1175,6 +1175,12 @@ impl ChunkArena {
     self.held_mut().for_each(|s| s.buddy.capture());
   }
 
+  /// The publication being captured keeps a volume's older record, which may name blocks freed since (A-430): every
+  /// deferred block joins the capture, so the commit keeps it ([`Buddy::capture_deferred`]).
+  pub fn capture_deferred(&mut self) {
+    self.held_mut().for_each(|s| s.buddy.capture_deferred());
+  }
+
   /// The publication of the last [`ChunkArena::capture`] committed: frees every deferred block the new image
   /// cannot name.
   pub fn commit_capture(&mut self) {

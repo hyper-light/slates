@@ -882,6 +882,34 @@ impl Buddy {
     }
   }
 
+  /// Adds every deferred block to the open capture, so the commit that follows keeps them all deferred and named
+  /// (A-430). A publication that leaves a volume out keeps that volume's last committed record, which may name blocks
+  /// the volume has freed since: those are exactly blocks deferred now, since every commit after the record was taken
+  /// kept them this way, and a plain commit would hand them out again while the record still names them. The next
+  /// commit that does not keep them releases each one its image cannot name. Nothing without an open capture.
+  pub fn capture_deferred(&mut self) {
+    if !self.capturing {
+      return;
+    }
+    for at in 0..self.deferring.words.len() {
+      let mut summary = self.deferring.summary(at, false);
+      while summary != 0 {
+        let bit = summary.trailing_zeros();
+        summary &= summary.wrapping_sub(1);
+        let word = at
+          .saturating_mul(Bits::WORD_BITS)
+          .saturating_add(usize::try_from(bit).unwrap_or(0));
+        let deferred = self.deferred.words.get(word).copied().unwrap_or(0);
+        if let Some(capture) = self.capture.words.get_mut(word) {
+          *capture |= deferred;
+          self.uncommitted.insert(word);
+          // The word now holds more than `live & !deferred`: the next capture recomputes it.
+          self.changed.insert(word);
+        }
+      }
+    }
+  }
+
   /// The publication of the last [`Buddy::capture`] committed: its heads become the committed set, and every
   /// deferred block the new image cannot name is freed. One freed while the capture was open stays deferred,
   /// since the new image may name it, and the next commit frees it.
@@ -1762,6 +1790,40 @@ mod tests {
     assert_eq!(b.largest_free(), b.region_bytes());
   }
 
+  /// A-430. Do: allocate a block, publish an image that names it (capture, commit), free it (deferred), then commit
+  /// a publication that keeps every deferred block (`capture_deferred`), as one that keeps a left-out volume's older
+  /// record does; then a plain commit. Expect: the block stays allocated and deferred across the keeping commit (no
+  /// allocation can take its granules), and the plain commit releases it. Before A-430 the first commit released it
+  /// while the kept record still named it.
+  #[test]
+  fn a_commit_that_keeps_the_deferred_blocks_hands_none_of_them_out() {
+    let mut b = Buddy::new(4096, 1).unwrap();
+    let block = b.alloc(4096).unwrap();
+    b.capture();
+    b.commit_capture();
+    assert!(
+      b.free_or_defer(block).unwrap(),
+      "the committed image names it"
+    );
+    b.capture();
+    b.capture_deferred();
+    b.commit_capture();
+    assert_eq!(
+      b.deferred_bytes(),
+      4096,
+      "kept for the record that names it"
+    );
+    assert_eq!(
+      b.alloc(8192).ok(),
+      None,
+      "its granules are not handed out again"
+    );
+    b.capture();
+    b.commit_capture();
+    assert_eq!(b.deferred_bytes(), 0, "a plain commit releases it");
+    assert_eq!(b.largest_free(), b.region_bytes());
+  }
+
   /// The deferral's model: the blocks live, the spans the committed image names, the spans an open capture
   /// names, and the spans freed but deferred.
   #[derive(Default)]
@@ -1814,11 +1876,16 @@ mod tests {
       }
     }
 
-    fn settle(&mut self, b: &mut Buddy, commit: bool) {
-      let Some(taken) = self.capture.take() else {
+    /// Settles the open capture: a commit (keeping every deferred block in it when `keep`, A-430) or an abandon.
+    fn settle(&mut self, b: &mut Buddy, commit: bool, keep: bool) {
+      let Some(mut taken) = self.capture.take() else {
         return;
       };
       if commit {
+        if keep {
+          b.capture_deferred();
+          taken.extend(self.deferred.iter().copied());
+        }
         b.commit_capture();
         self.deferred.retain(|span| taken.contains(span));
         self.committed = taken;
@@ -1840,8 +1907,9 @@ mod tests {
     }
   }
 
-  /// A-64, the deferral against a model. Do: a random history of allocations, frees, captures, commits and
-  /// abandons. The model keeps the blocks the committed image names and those the open capture names. Expect:
+  /// A-64, the deferral against a model. Do: a random history of allocations, frees, captures, commits (some keeping
+  /// every deferred block, A-430) and abandons. The model keeps the blocks the committed image names and those the
+  /// open capture names. Expect:
   /// no allocation ever overlaps a block either image names; every free is deferred exactly when one of them names
   /// it; and the free bytes plus the live and deferred bytes always equal the region.
   #[test]
@@ -1873,8 +1941,9 @@ mod tests {
         5..=7 => model.free(&mut b, &mut rng),
         8 => model.capture(&mut b),
         _ => {
-          let commit = rng.below(2) == 0;
-          model.settle(&mut b, commit);
+          // A commit, a commit keeping every deferred block (A-430), or an abandon.
+          let settle = rng.below(3);
+          model.settle(&mut b, settle < 2, settle == 1);
         }
       }
       model.check_totals(&b);

@@ -92,58 +92,64 @@ fn begin(state: &mut ShardState, silence_ns: u64) -> Vec<(Handle<ClientSlot>, u3
 /// running later; only frozen attachment ids cross the mutating boundary, never a live client query.
 /// On each shard the client's direct maps held there (§4.6, A-188) bracket the removal: a writable map's stores reach
 /// its file only through the attachment it was made under, so they are written back first (A-186), a store to a shared
-/// map outliving its process; and the copies are let go once the attachments are gone. A write-back that does not end
-/// within the deadline defers the reap, which is retried, rather than removing an attachment its stores still need.
+/// map outliving its process; and the copies are let go once the attachments are gone.
+///
+/// Each call waits in its shard's own time (A-432; R3's class A, A-65): a window of `budget_ns`, then on while the
+/// shard works or waits for a CPU, until it has run `budget_ns` of CPU (held to this build), so a shard alive and busy
+/// (a long write-back, a starved thread) is waited for, and only one that stopped, or ran its budget without answering,
+/// defers the reap `Overloaded`, which the next sweep retries rather than removing an attachment its stores still need.
+/// Each waited one window on the wall, so a busy owner deferred every reap that met it and the next sweep sent the same
+/// write-back again beside the first.
 async fn remove_on_owners(
   origin: u16,
   shards: &[u16],
   batch: usize,
   client: u32,
-  deadline: u64,
+  budget_ns: u64,
 ) -> Result<(), Refusal> {
   for &shard in shards {
-    crate::xshard::task_within(
+    crate::xshard::task_in_shard_time(
       origin,
       shard,
       move || crate::direct_map::write_back_held(client),
-      deadline,
+      budget_ns,
     )
     .await
     .ok_or(Refusal::Overloaded { shard })?;
     // The client's presentations there are abandoned with it (AUD-29-07): nothing waits on them now.
-    crate::xshard::call_within(
+    crate::xshard::call_in_shard_time(
       origin,
       shard,
       move |state| crate::landing::abandon_presentations(state, client),
-      deadline,
+      budget_ns,
     )
     .await
     .ok_or(Refusal::Overloaded { shard })?;
-    let attachments = crate::xshard::call_within(
+    let attachments = crate::xshard::call_in_shard_time(
       origin,
       shard,
       move |state| state.db.partition().attachments_of_client(client),
-      deadline,
+      budget_ns,
     )
     .await
     .ok_or(Refusal::Overloaded { shard })?;
     for ids in attachments.chunks(batch) {
       let ids = ids.to_vec();
-      crate::xshard::call_within(
+      crate::xshard::call_in_shard_time(
         origin,
         shard,
         move |state| remove_batch(state, client, &ids),
-        deadline,
+        budget_ns,
       )
       .await
       .ok_or(Refusal::Overloaded { shard })??;
       slates_rt::futures::yield_now().await;
     }
-    crate::xshard::call_within(
+    crate::xshard::call_in_shard_time(
       origin,
       shard,
       move |state| crate::direct_map::let_go_held(state, client),
-      deadline,
+      budget_ns,
     )
     .await
     .ok_or(Refusal::Overloaded { shard })?;
@@ -221,4 +227,65 @@ fn finish(state: &mut ShardState, handle: Handle<ClientSlot>, client_id: u32) ->
     crate::daemon::release_client_id(client_id, control);
   }
   true
+}
+
+#[cfg(test)]
+mod tests {
+  use std::time::Duration;
+
+  /// Shape: the budget each of the reap's calls is waited in this test: a tenth of a second, short beside its target's
+  /// busy poll.
+  const BUDGET_NS: u64 = 100_000_000;
+  /// Shape: the target's one busy poll on the wall: three budgets, so a call waited one budget on the wall gives up.
+  const BUSY_NS: u64 = 3 * BUDGET_NS;
+  /// Shape: the client the reap retires, which holds nothing on the target, so each call answers once it runs.
+  const CLIENT: u32 = 7;
+  /// Shape: how long the test thread waits for the reap's answer: ten busy polls.
+  const ANSWER_WAIT_NS: u64 = 10 * BUSY_NS;
+
+  /// R3's class A (A-432). Do: on a two-shard daemon, hold the second shard in one poll for three budgets of wall time,
+  /// on its CPU a fifth of it (a busy or starved shard), and from the first shard retire a client there, each call
+  /// waited with a budget's window. Expect: the reap ends `Ok`, after more than a budget of waiting. Each call waited a
+  /// budget on the wall, so the reap was deferred `Overloaded` with its target alive and working, and the next sweep
+  /// sent the same work again beside the first.
+  #[test]
+  fn a_reaps_calls_wait_for_a_shard_that_works_past_their_first_window() {
+    let daemon = crate::daemon::audit_daemon_of(2);
+    let (sent, answered) = std::sync::mpsc::sync_channel(1);
+    crate::daemon::observe_first(&daemon, move |state| {
+      let origin = state.shard;
+      let target = state
+        .shards
+        .iter()
+        .copied()
+        .find(|&shard| shard != origin)
+        .unwrap();
+      // The busy poll goes first on the target's channel, so each of the reap's calls waits behind it.
+      let busy = crate::xshard::call_on(origin, target, || {
+        crate::daemon::hold_busy(BUSY_NS);
+        Some(())
+      })
+      .unwrap();
+      drop(busy);
+      let reap = slates_rt::futures::spawn(async move {
+        let started = std::time::Instant::now();
+        let reaped = super::remove_on_owners(origin, &[target], 1, CLIENT, BUDGET_NS).await;
+        let _ = sent.send((reaped, started.elapsed()));
+      })
+      .unwrap();
+      slates_rt::futures::detach(reap).unwrap();
+    });
+    let answer = answered.recv_timeout(Duration::from_nanos(ANSWER_WAIT_NS));
+    daemon.stop();
+    let (reaped, waited) = answer.expect("the reap answered");
+    println!("a reap behind a busy poll of {BUSY_NS} ns: {reaped:?} after {waited:?}");
+    assert!(
+      reaped.is_ok(),
+      "the reap of a client on a shard alive and working was deferred: {reaped:?} after {waited:?}"
+    );
+    assert!(
+      waited > Duration::from_nanos(BUDGET_NS),
+      "the reap ended within one window ({waited:?}), before its target's busy poll did"
+    );
+  }
 }

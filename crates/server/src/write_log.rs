@@ -635,18 +635,74 @@ impl WriteLog {
   }
 }
 
+/// Keeps one record with `append`, an acknowledged write's or a `FORGET`'s through `volume`, before its reply (A-63):
+/// whether it is kept, by the log or by an image; `None` without a log (no content object, so nothing outlives the
+/// daemon). A log with no room forces a publication, which settles the record by its own volume (A-436). One that
+/// captured the volume carries the record, the effect already applied. One that left the volume out kept that
+/// volume's records under its stamp and gave back the room the others' took (A-422), so the record is appended again.
+/// Before A-436 any volume left out counted the record unkept, so a captured volume's write marked the log overflowed
+/// and every file a taken-over mount had open was reported as having lost writes, though the image held it.
+fn keep_record(
+  s: &mut crate::state::ShardState,
+  volume: slates_db::catalog::VolumeId,
+  mut append: impl FnMut(&mut WriteLog, &mut SparseObject) -> Result<(), Refused>,
+) -> Option<bool> {
+  let appended = match (s.write_log.as_mut(), s.content.as_mut()) {
+    (Some(log), Some(object)) => append(log, object),
+    _ => return None,
+  };
+  Some(match appended {
+    Ok(()) => true,
+    Err(Refused::Full) => match crate::verbs::publish_shard(s) {
+      Ok(published) if published.captured(volume) => true,
+      Ok(_) => match (s.write_log.as_mut(), s.content.as_mut()) {
+        (Some(log), Some(object)) => append(log, object).is_ok(),
+        _ => false,
+      },
+      Err(_) => false,
+    },
+    Err(Refused::Unwritten) => false,
+  })
+}
+
+/// Logs a write the volume took before its reply (A-63), `data` at `offset` of `inode` through `volume`, where a replay
+/// puts it (an inode number alone names the origin of a clone's inherited file): a FUSE mount's and a Shards stream's.
+/// Logged before the reply, so a write applied and never answered is resent, not replayed twice over a later write. One
+/// neither the log nor an image keeps ([`keep_record`]: a refused publication, or a span the content object refused)
+/// marks the log overflowed, so the next daemon reports the loss rather than replay around it; counted.
+pub(crate) fn log_acknowledged_write(
+  s: &mut crate::state::ShardState,
+  volume: slates_db::catalog::VolumeId,
+  (inode, offset): (u64, u64),
+  data: &[u8],
+) {
+  let kept = keep_record(s, volume, |log, object| {
+    log.append(object, (volume.bytes, inode), offset, data)
+  });
+  if kept != Some(false) {
+    return;
+  }
+  s.count(crate::verbs::WRITE_LOG_UNWRITTEN, 1);
+  if let (Some(log), Some(object)) = (s.write_log.as_mut(), s.content.as_mut())
+    && log.overflow(object).is_err()
+  {
+    s.count(crate::verbs::WRITE_LOG_UNWRITTEN, 1);
+  }
+}
+
 /// Format: the counter of a `FORGET` the write log could not take and no publication carried: its lookups stay
-/// counted across a restart, a bounded leak (GAPS, A-154's sibling), never a lost write. Unix only, as `log_forgets`
-/// is.
+/// counted across a restart, a bounded leak (GAPS, A-154's sibling), never a lost write. Every platform's, as
+/// `log_forgets` is (A-433).
 const FORGET_UNLOGGED: &str = "write_log.forget_unlogged";
 
 /// Logs the lookups `forgotten` (each a file and a count) gave back through `attachment` on `volume` in the shard's
 /// write log (GAPS, A-154's sibling): a FUSE mount's `FORGET`s, and a Shards stream's whose resync end the anchor holds
 /// (A-390). A `FORGET` takes no reply and is never resent, so one served after the last publication would otherwise
 /// leave its references counted in the image for good. A log with no room forces a publication, which carries the
-/// `FORGET` (already applied) and empties the log; one still refused is counted, and never marks the log overflowed,
-/// which would report every taken-over file as having lost writes. A FUSE mount is Linux's; a stream whose resync end
-/// the anchor holds is every platform's (Windows since A-433).
+/// `FORGET` (already applied) when it captured the volume, and gives back room for it again when it left the volume out
+/// ([`keep_record`], A-436); one still unkept is counted, and never marks the log overflowed, which would report every
+/// taken-over file as having lost writes. A FUSE mount is Linux's; a stream whose resync end the anchor holds is every
+/// platform's (Windows since A-433).
 pub(crate) fn log_forgets(
   s: &mut crate::state::ShardState,
   (volume, attachment): (slates_db::catalog::VolumeId, u64),
@@ -659,19 +715,12 @@ pub(crate) fn log_forgets(
       inode,
       count,
     };
-    let appended = match (s.write_log.as_mut(), s.content.as_mut()) {
-      (Some(log), Some(object)) => log.append_forget(object, forgotten),
-      _ => return,
-    };
-    let logged = match appended {
-      Ok(()) => true,
-      Err(Refused::Full) => {
-        crate::verbs::publish_shard(s).is_ok_and(|published| published.skipped.is_empty())
-      }
-      Err(Refused::Unwritten) => false,
-    };
-    if !logged {
-      s.count(FORGET_UNLOGGED, 1);
+    match keep_record(s, volume, |log, object| {
+      log.append_forget(object, forgotten)
+    }) {
+      None => return,
+      Some(true) => {}
+      Some(false) => s.count(FORGET_UNLOGGED, 1),
     }
   }
 }

@@ -1640,9 +1640,10 @@ pub(crate) fn rounds_the_bound_ended(
 /// shard records the object unrecovered, `TakeoverIncomplete { waited_on: "retirement" }`, every verb on it answers
 /// `NotRecovered` rather than a retryable `OwnerUnreachable`, and this node, the successor the round ranked, claims it to
 /// lookups. Its holders keep their copies, the line now unresolved (counted `fleet.takeover.kept_unresolved` on each).
-/// Counted [`TAKEOVER_GIVEN_UP`] and [`TAKEOVER_GIVEN_UP_DROPPED`], with one log line. An owner shard that does not
-/// answer within the period leaves its objects unrecorded: the round is forgotten here, so they are not given up again
-/// (one attempt, as the bound's drop is one event), and are answered as any volume no member serves.
+/// Counted [`TAKEOVER_GIVEN_UP`] and [`TAKEOVER_GIVEN_UP_DROPPED`], with one log line. An owner shard that stopped, or
+/// ran a window of CPU without answering ([`record_given_up`]), leaves its objects unrecorded: the round is forgotten
+/// here, so they are not given up again (one attempt, as the bound's drop is one event), and are answered as any volume
+/// no member serves.
 async fn give_up_dropped(departed: HostId, learned: Vec<ObjectId>, local: HostId) {
   let settled = record_given_up(&learned, RETIREMENT_WAIT).await;
   let Some(first) = settled.first().map(|(object, _)| *object) else {
@@ -1669,9 +1670,11 @@ async fn give_up_dropped(departed: HostId, learned: Vec<ObjectId>, local: HostId
 /// verb on it answers `NotRecovered`: the give-up a takeover round makes by name ([`give_up_unpromised`],
 /// [`give_up_dropped`]). A catalog register has no verbs of its own (its volume waits for it in its materialization and
 /// is given up there, naming `catalog`), and an object whose partition no shard here serves has nowhere to be recorded:
-/// each is settled unrecorded. Returns every object settled, each with whether its owner shard recorded it; an owner
-/// shard that does not answer within the period settles none of its objects. Bounded work: one call per owner shard,
-/// whatever the objects' number.
+/// each is settled unrecorded. Returns every object settled, each with whether its owner shard recorded it. Each owner
+/// shard is waited for in its own time (A-435), since the give-up is one attempt: a shard alive and busy records its
+/// objects, and only one that stopped, or ran a window of CPU without answering, settles none of them. It was waited a
+/// period on the wall, and a busy owner shard left its objects answering as volumes no member serves for good. Bounded
+/// work: one call per owner shard, whatever the objects' number.
 async fn record_given_up(objects: &[ObjectId], waited_on: &'static str) -> Vec<(ObjectId, bool)> {
   let Some(origin) = state::with_state(|s| s.shard) else {
     return Vec::new();
@@ -1696,7 +1699,7 @@ async fn record_given_up(objects: &[ObjectId], waited_on: &'static str) -> Vec<(
       .iter()
       .map(|object| slates_db::catalog::VolumeId { bytes: object.0 })
       .collect();
-    let recorded = crate::xshard::call_within(
+    let recorded = crate::xshard::call_in_shard_time(
       origin,
       shard,
       move |s| {
@@ -1709,7 +1712,7 @@ async fn record_given_up(objects: &[ObjectId], waited_on: &'static str) -> Vec<(
           );
         }
       },
-      crate::daemon::HEARTBEAT_NS,
+      crate::daemon::LIVENESS_BUDGET_NS,
     )
     .await
     .is_some();
@@ -2404,6 +2407,75 @@ fn share_done(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// Shape: the owner shard's one busy poll in the give-up test, three periods of wall time, so a record waited one
+  /// period on the wall gives up.
+  const BUSY_NS: u64 = 3 * crate::daemon::HEARTBEAT_NS;
+  /// Shape: how long the test thread waits for the give-up's answer: ten busy polls.
+  const ANSWER_WAIT_NS: u64 = 10 * BUSY_NS;
+
+  /// R3's class A (A-435). Do: on a two-shard daemon, hold the second shard in one poll for three periods of wall time,
+  /// on its CPU a fifth of it (a busy or starved shard), and from the first give up by name an object whose partition
+  /// is the second's. Expect: the object settled as recorded, after more than a period of waiting, and recorded
+  /// unrecovered on its shard. The record waited a period on the wall, so a busy owner shard settled none of its objects
+  /// and, the give-up being one attempt, they answered as volumes no member serves for good.
+  #[test]
+  fn a_given_up_object_is_recorded_on_an_owner_shard_that_works_past_a_period() {
+    let daemon = crate::daemon::audit_daemon_of(2);
+    let (sent, answered) = std::sync::mpsc::sync_channel(1);
+    crate::daemon::observe_first(&daemon, move |state| {
+      let origin = state.shard;
+      let (partition, target) = state
+        .shards
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, shard)| *shard != origin)
+        .unwrap();
+      let mut bytes = [0u8; 16];
+      bytes[8..10].copy_from_slice(&u16::try_from(partition).unwrap().to_be_bytes());
+      let object = ObjectId(bytes);
+      // The busy poll goes first on the owner shard's channel, so the record waits behind it.
+      let busy = crate::xshard::call_on(origin, target, || {
+        crate::daemon::hold_busy(BUSY_NS);
+        Some(())
+      })
+      .unwrap();
+      drop(busy);
+      let task = slates_rt::futures::spawn(async move {
+        let started = std::time::Instant::now();
+        let settled = record_given_up(&[object], RETIREMENT_WAIT).await;
+        let waited = started.elapsed();
+        let id = slates_db::catalog::VolumeId { bytes: object.0 };
+        let recorded = crate::xshard::call_in_shard_time(
+          origin,
+          target,
+          move |s| s.unrecovered.contains_key(&id),
+          crate::daemon::LIVENESS_BUDGET_NS,
+        )
+        .await;
+        let _ = sent.send((object, settled, waited, recorded));
+      })
+      .unwrap();
+      slates_rt::futures::detach(task).unwrap();
+    });
+    let answer = answered.recv_timeout(std::time::Duration::from_nanos(ANSWER_WAIT_NS));
+    daemon.stop();
+    let (object, settled, waited, recorded) = answer.expect("the give-up answered");
+    println!(
+      "a give-up behind a busy poll of {BUSY_NS} ns: {settled:?} after {waited:?}; recorded there: {recorded:?}"
+    );
+    assert_eq!(
+      settled,
+      vec![(object, true)],
+      "the object given up on a busy owner shard was settled unrecorded (after {waited:?})"
+    );
+    assert!(
+      waited > std::time::Duration::from_nanos(crate::daemon::HEARTBEAT_NS),
+      "the give-up ended within one period ({waited:?}), before its owner shard's busy poll did"
+    );
+    assert_eq!(recorded, Some(true), "the owner shard holds the record");
+  }
 
   /// The takeover bound's paging gate (`rounds_still_paging`): a round still pages while any member it asks has not
   /// answered every page, a member never asked counting as not answered. Do: judge two asked members with one page
