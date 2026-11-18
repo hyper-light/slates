@@ -438,3 +438,60 @@ fn a_grant_a_landing_found_past_its_term_still_ends_and_is_audited() {
     "every grant a landing found past its term has its expiry audited; these do not: {unaudited:?}"
   );
 }
+
+/// AC-2.3 (§4.8 transactions) and A-266 (the table holds live grants). Do: present a volume's landing twice; approve the
+/// first; approve the second with the shard's next publication refused before its append, so the grant's atom rolls
+/// back; then land the second presentation naming the id the refused issue took, one past the first grant's. Expect the
+/// approval refused `Unpublished`, one rollback counted, and the landing refused `GrantInvalid`: no grant stands that the
+/// refusal said was not made. Before 2026-11-18 the shard's own table kept the grant the rolled-back atom issued, bound
+/// to the presented landing, and a landing naming its id ran under it.
+#[test]
+fn a_grant_whose_issue_was_refused_covers_no_landing() {
+  let (daemon, instance) = daemon("refused-issue");
+  let mut client = connect(&instance);
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let target = target_dir();
+  let volume = client.create(&scratch("refused-issue")).unwrap();
+  let granted = common::landing::approve(&mut client, &secret, volume, None, &target.path);
+  let Ok(slates_client::Landing::GrantRequired {
+    landing, manifest, ..
+  }) = client.land(volume, None, &target.path, Filter::default(), None)
+  else {
+    panic!("the second landing was presented");
+  };
+  let scope = slates_ipc::protocol::GrantScope::Once;
+  let term = common::landing::GRANT_TERM_NS;
+  let proof = slates_server::landing::grant_proof(&secret, landing, &manifest, scope, term);
+  daemon
+    .inject_publication_fault(Some(slates_db::replay::PublicationFault::BeforeAppend))
+    .unwrap();
+  let refused = client.grant(landing, manifest, scope, term, proof);
+  daemon.inject_publication_fault(None).unwrap();
+  let rollbacks: u64 = daemon
+    .db_publication_counters()
+    .unwrap()
+    .iter()
+    .map(|counters| counters.rollbacks)
+    .sum();
+  let landed = client.land(
+    volume,
+    None,
+    &target.path,
+    Filter::default(),
+    Some(granted + 1),
+  );
+  drop(client);
+  daemon.stop();
+  assert!(
+    matches!(
+      refused,
+      Err(ClientError::Refused(Refusal::Unpublished { .. }))
+    ),
+    "the approval is refused, its atom rolled back: {refused:?}"
+  );
+  assert_eq!(rollbacks, 1, "the grant's atom was the one rolled back");
+  assert!(
+    matches!(landed, Err(ClientError::Refused(Refusal::GrantInvalid))),
+    "a landing naming the refused grant's id is refused as one with no valid grant: {landed:?}"
+  );
+}

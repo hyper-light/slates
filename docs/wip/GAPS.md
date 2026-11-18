@@ -1243,10 +1243,12 @@
 >     `a_grant_a_landing_found_past_its_term_still_ends_and_is_audited` (`crates/server/tests/grants_pages.rs`),
 >     `a_grant_a_landing_found_past_its_term_is_still_due_for_the_sweep` (`crates/land/src/grant.rs`)
 >     (`docs/bugs/2026-11-18-a-grant-a-landing-found-past-its-term-was-never-ended.md`).
->   - **Open (sibling, found 2026-11-18):** `issue_grant` issues in the shard's table before the durable `GrantIssued`,
->     and nothing takes it back when that append or its atom's commit is refused, so a refused issue leaves a grant the
->     durable table never held, which the sweep cannot record (`NotFound` each tick) and which stays until a restart.
->     Reached only through a refused log append.
+>   - **A grant whose issue was refused covers nothing: fixed (sibling, 2026-11-18, goal g247).** `issue_grant` issues
+>     in the shard's table before the durable `GrantIssued`, and nothing took the grant back when that record or its
+>     atom's commit was refused: the approval was answered `Unpublished`, and a landing naming the id the refused issue
+>     took ran under it. A refused record now ends the grant there, and a rolled-back atom's grants leave the shard's
+>     table (`reconcile_unpublished_effects`, `Grants::retain`). Test: `a_grant_whose_issue_was_refused_covers_no_landing`
+>     (`crates/server/tests/grants_pages.rs`).
 > - **A status's drift: the first that fit, a count, and a paged read (A-267, 2026-11-08).** A status with 600 drifted
 >   entries was refused; it now carries what fits beside its other fields and `drifted_elided`, `Drifted` reads them all a
 >   page at a time, `slates status --drift` walks it, and both SDKs read it whole with `drifted(volume)`. Since

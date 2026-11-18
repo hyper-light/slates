@@ -27701,6 +27701,10 @@ tick), `crates/server/src/verbs.rs` (the gather, the target bound), `crates/ipc/
   - A check only reads. A landing's check marked a grant past its term expired in its shard's table alone, and the
     sweep, which takes issued grants past their term, passed it over: it was never recorded ended, stayed listed as
     issued, and stayed in the table until a restart. Now it is refused as expired and left for the sweep.
+  - A grant whose issue was refused is held nowhere (AC-2.3): the shard's table issued it before the durable record,
+    and a refused record or a rolled-back atom left it there, bound to the presented landing, so a landing naming its
+    id ran under a grant the approval was told was not made. A refused record ends it; a rollback keeps in the table
+    only what the durable one holds (`reconcile_unpublished_effects`, `Grants::retain`).
 
 ### A-267 — A status's drift is carried as far as one reply holds, counted past it, and paged (accepted 2026-11-08)
 Applied in the same change to: §4.12 (the SDKs' `status`), `crates/ipc/src/protocol.rs` (`StatusReport::drifted_elided`,

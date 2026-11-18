@@ -64,6 +64,11 @@ audit record, all six expiries over the two shards had no `grant_expired` record
 
 ## Siblings
 
-- **Open:** `issue_grant` issues in the shard's table before the durable `GrantIssued`, and nothing takes the grant
-  back when that append or its atom's commit is refused. Such a grant is not in the durable table, so the sweep's record
-  is refused `NotFound` at every tick and the grant stays until a restart. Reached only through a refused log append.
+- **Fixed the same day (its own commit):** `issue_grant` issues in the shard's table before the durable `GrantIssued`,
+  and nothing took the grant back when that record or its atom's commit was refused. The approval was answered
+  `Unpublished`, yet the shard's table held the grant, bound to the presented landing: a landing naming the id the
+  refused issue took ran under it, and the sweep's record of its end was refused `NotFound` at every tick. A refused
+  record now ends the grant in the shard's table, and a rolled-back atom's grants leave it
+  (`reconcile_unpublished_effects` with `Grants::retain`). Test: `a_grant_whose_issue_was_refused_covers_no_landing`;
+  red with both takeouts undone: the landing naming the refused grant's id ran, and its completion was refused
+  `NotFound` (the grant it consumed was in no durable table), where it is refused `GrantInvalid` before anything runs.

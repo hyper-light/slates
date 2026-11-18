@@ -3423,11 +3423,17 @@ pub fn issue_grant(
     outcome: None,
     signature: None,
   };
-  state
+  if let Err(e) = state
     .db
     .mutate(&mut state.segment, &Op::GrantIssued { record }, now)
-    .and_then(|_| write_audit(state, vec![audit], now))
-    .map_err(|e| crate::error::refusal_of_db(&e))?;
+  {
+    // The issue was refused durably and nothing was applied, so the grant leaves this shard's table too (A-266):
+    // nothing lands under a grant the caller was told was not made. A commit refused later in the atom rolls the
+    // record back, and `reconcile_unpublished_effects` takes the grant out then.
+    state.landing.grants.end(id);
+    return Err(crate::error::refusal_of_db(&e));
+  }
+  write_audit(state, vec![audit], now).map_err(|e| crate::error::refusal_of_db(&e))?;
   Ok(id.0)
 }
 

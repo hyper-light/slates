@@ -213,6 +213,13 @@ impl Grants {
     self.records.remove(&id);
   }
 
+  /// Keeps only the grants `held` says the durable table holds (A-266; AC-2.3): after an atom that issued a grant here
+  /// was rolled back, the grant leaves this table too, so nothing lands under a grant whose issue was refused. An id it
+  /// held stays refused as ended, as one [`Grants::end`] removed is.
+  pub fn retain(&mut self, mut held: impl FnMut(GrantId) -> bool) {
+    self.records.retain(|id, _| held(*id));
+  }
+
   /// The grants past their term at `now_ns` that are still usable, for the sweep that ends them.
   pub fn expired_at(&self, now_ns: u64) -> Vec<GrantId> {
     self
