@@ -293,13 +293,18 @@ impl Replica {
     self.green.into_left()
   }
 
-  /// Takes `message` from the owner's feed (module docs): applies it at the replica's next position, passes over one
-  /// below it, and refuses one above it, or a version that would replay as another, changing nothing; a replay that seals
-  /// other content than the owner did is refused after it.
+  /// Takes `message` from the owner's feed (module docs): passes over one below the replica's next position; refuses,
+  /// changing nothing, one that says the owner evicted it, one above its next position, and a version that would replay
+  /// as another; applies the rest, refusing after the replay one that sealed other content than the owner did, or that
+  /// took the replica past its budget.
   pub fn apply(&mut self, message: &FeedMessage) -> Result<Fed, FeedRefusal> {
     if message.position < self.next {
       self.passed_over = self.passed_over.saturating_add(1);
       return Ok(Fed::PassedOver);
+    }
+    // The owner's eviction first: it says this replica goes, whatever else the message would find (step 4).
+    if self.green.evicted_by(&message.changes) {
+      return Err(self.refuse(FeedRefusal::Evicted));
     }
     if message.position > self.next {
       return Err(self.refuse(FeedRefusal::Gap {

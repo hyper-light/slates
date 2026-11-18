@@ -136,6 +136,14 @@ impl Store {
     }
   }
 
+  /// Whether `changes` says the owner evicted this replica, read without taking it; never on the owner.
+  pub(crate) fn evicted_by(&self, changes: &Changes) -> bool {
+    match self {
+      Store::Read(reading) => reading.reader.evicted_by(changes),
+      Store::Own(..) => false,
+    }
+  }
+
   /// Replicas the owner evicted: for what it kept for them, and for changes left unfed.
   pub(crate) fn evictions(&self) -> (u64, u64) {
     match self {

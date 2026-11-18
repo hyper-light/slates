@@ -211,6 +211,11 @@ impl Chunks {
     self.store.evictions()
   }
 
+  /// Whether `changes` says the owner evicted this replica.
+  pub(crate) fn evicted_by(&self, changes: &Changes) -> bool {
+    self.store.evicted_by(changes)
+  }
+
   /// The bytes a replica's own table of these chunks costs (A-273 step 4): its slots.
   pub(crate) fn table_bytes(&self) -> usize {
     self

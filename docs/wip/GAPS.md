@@ -706,7 +706,7 @@
 > Record: `docs/bugs/2026-11-18-the-watchdogs-end-left-its-writer-unjoined.md`.
 
 > **Open (g222, 2026-11-17, A-273): rebases and named-version reads of a green on the shards holding its works.**
-> Designed; steps 1, 2 and 3 of five built. The owner spends 51–53% of its wall on verdicts and rebases at the 3,000-client rung (W1),
+> Designed; steps 1 to 4 of five built. The owner spends 51–53% of its wall on verdicts and rebases at the 3,000-client rung (W1),
 > rebases the larger share (about 71,000 a run against 49,000 verdicts), and W1's rebase at 1,000 clients is slower
 > than main's because it crosses to the owner. A replica holds the green's metadata (about 14.2 MB at the rung, 3.8% of
 > a shard's 373.5 MB metadata budget on the Studio) and reads the owner's content in place, never a copy (the
@@ -721,8 +721,14 @@
 > 2026-11-18, g083):** the green's content in sealed blocks (`slates_mem::sealed`), current files and history chunks
 > alike: a replica is made from the owner whole and reads the owner's blocks in place, holding no content of its own
 > (its current bytes are the owner's memory, by pointer, in the oracle); its replay adopts the owner's blocks in order,
-> checked byte for byte; the owner frees a released block once every replica has passed its release. **Owed, in
-> order:** the lag bound that drops a replica holding too much; the code on the shards; the supervisor's A/B.
+> checked byte for byte; the owner frees a released block once every replica has passed its release. **Built (step 4,
+> 2026-11-18, g083):** the bounds, each a typed refusal that gives the replica back and sends its work to the owner: its
+> metadata (`Green::metadata_bytes`) against its holder's budget (`OverBudget`, at its making and after a message); the
+> replicas an owner takes (`ReplicaRefusal::Full`); past the bytes an owner keeps for them, its slowest replica evicted
+> (`FeedRefusal::Evicted`, keeping its frees until it leaves); a change made while the last was unsent evicting every
+> replica (one message's blocks recorded at most). **Owed, in order:** the code on the shards (step 5: the holder
+> derives each limit from the machine, routes a refused or evicted replica's rebases and reads to the owner, counted,
+> and gives back an idle one); the supervisor's A/B.
 >
 > **A Shards guest's unprivileged run could not write a host-owned volume: built, the stream takes Shards' owner word
 > (2026-11-18, §4.6 the Shards form; A-281; goal g268).** Shards' init names the run's owner on a share's root with

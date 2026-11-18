@@ -635,6 +635,11 @@ impl BlockReader {
     self.next
   }
 
+  /// Whether `changes` says its writer evicted this reader, read without taking it.
+  pub fn evicted_by(&self, changes: &Changes) -> bool {
+    changes.writer == self.writer && changes.evicted.contains(&self.reader)
+  }
+
   /// Reads refused since it was made: a name not in its live table.
   pub fn refused(&self) -> u64 {
     self.refused.get()

@@ -3608,6 +3608,11 @@ impl Green {
     self.chunks.begin(changes)
   }
 
+  /// Whether `changes` says this replica's owner evicted it (A-273 step 4), read without taking it.
+  pub(crate) fn evicted_by(&self, changes: &slates_mem::sealed::Changes) -> bool {
+    self.chunks.evicted_by(changes)
+  }
+
   /// A replica done replaying it: passed, and what its owner frees by; none when its replay was not its owner's.
   pub(crate) fn finish_replay(
     &mut self,

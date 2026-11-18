@@ -10489,6 +10489,13 @@ The agent reads green's bytes for each window (a read of the named version), rew
 bytes, and calls `rebase` again. A rebased increment has a new identity; deduplication never
 blocks it. Rejects are non-blocking; the merge task never stalls on a conflict.
 
+**Rebase off the owner (A-273).** A shard that holds works of a green keeps a replica of it: the engine made from the
+owner's, fed the owner's versions and folds in order, its content the owner's sealed blocks read in place, so a rebase
+and a read at a version it holds need not cross to the owner's one thread. Each structure the replica adds is bounded
+by its holder's derivation with a typed refusal (its own metadata against its shard's class, the replicas an owner
+takes, the bytes an owner keeps for a lagging one, one message's blocks), and every refusal sends the replica's work
+to the owner. Built in the engine (steps 1 to 4); on the shards owed (step 5).
+
 **Attachments and versions.** Mounts and SDK attachments of green pin a version;
 `advance(attachment, version)` re-pins and invalidates exactly the paths the manifest diff
 between the two versions names (O(changed) by structural sharing); no attachment's view changes
@@ -24961,8 +24968,23 @@ released it (`Fed::Applied`'s `Passed`, `Green::acknowledge_replica`), and nothi
 (`Green::leave_replica`); step 1's frees by position now live in the sealed blocks. Proven by the sealed blocks' tests
 (a reader on another thread reads in place what its writer frees behind it; generated histories of seals, releases,
 joins, passes, late acknowledgements and leaves, every live block allocated and read as sealed) and the replica's
-oracle, which now holds every current file's bytes to be the owner's own memory. Its bounds (step 4) and the shards'
-use of it (step 5) are owed. The text and its measurements are perf's (2026-11-11, `agents/perf-a273`, never pushed); the
+oracle, which now holds every current file's bytes to be the owner's own memory. Step 4 built 2026-11-18 (g083): the
+bounds, each a typed refusal that ends with the replica given back (`Replica::leave`) and its work going to the owner.
+A replica's metadata (`Green::metadata_bytes`: piece lists, change index, IPC history, deltas, accepted record and its
+chunk table, running totals all) is held to the budget its holder gives it, a share of its shard's metadata class:
+refused at its making (`Unfit::OverBudget`) and after a message that takes it past (`FeedRefusal::OverBudget`). The
+owner takes as many replicas as its holder allows (one a shard that may hold its works; `ReplicaRefusal::Full`). Past
+the bytes its holder lets it keep for them (`Green::set_replica_held_limit`, from its memory class's headroom), the
+owner evicts its slowest replica, one at a time; every later message names it and it refuses the first it is given
+(`FeedRefusal::Evicted`, before any other check), keeping its frees until it leaves, so the bound costs a replica,
+never a read of freed bytes (`merge.replica.dropped_lagging`). A change made while the last was still unsent evicts
+every replica, which could not be fed in order (`merge.replica.dropped_unfed`), so the owner records one message's
+blocks at most. The key indexes, one entry a path, are the owner's own bound; a reader's live table is the owner's live
+blocks, and its adoption queue one message's. Proven by the sealed blocks' tests (a join past the limit refused; the
+slowest reader evicted past the held limit, reading what it holds until it leaves; a change left unfed evicting every
+reader) and the replica's (each bound driven to its refusal, the replica given back and made again; red with the
+eviction disabled, both lag tests fail). The derivations of the limits, an idle replica's give-back and the shards' use
+of it (step 5) are owed. The text and its measurements are perf's (2026-11-11, `agents/perf-a273`, never pushed); the
 content question it left open was decided by the supervisor on 2026-11-17 by A-64 and D-7 (below). W1 (A-247), whose
 works off the owner it builds on, landed on 2026-11-17 (3c0af9399).
 
