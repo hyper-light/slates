@@ -11902,6 +11902,7 @@ fn a_submit_off_its_greens_shard_is_held_to_its_quorum_and_the_works_next_verb_b
       refuse_content_puts: false,
       corrupt_next_inputs: false,
       refuse_records: true,
+      refuse_work_catalogs: false,
     })
     .unwrap();
   let mut pipelined = common::client::connect(&instance_a);
