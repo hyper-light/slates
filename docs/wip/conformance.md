@@ -48,7 +48,11 @@
 > four Win32 bugs, each fixed with a failing test first (`docs/bugs/2026-11-05-winfstest-found-win32-semantics-the-drive-broke.md`).
 > fsx wedges over the drive (an open bug, listed as `fsx-seed-1-unfinished:10000` in
 > `expected-failures/native-windows-winfsp.fsx.txt`); every fsx run now has a 300 s bound and is judged against its
-> transport's list. On arm64 Linux, `linux-arm64`
+> transport's list. Since A-300 (2026-11-17) both Windows lanes run the workload roster's version-control workloads
+> (git, git's history, Mercurial, Subversion) over the drive through Git for Windows' shell, each judged against the same
+> script in an NTFS folder. The drive makes no hard link (WinFsp's driver refuses `FileLinkInformation`), so a local
+> clone copies there where NTFS links, and the three lines that count a clone's links are its stated difference,
+> recorded with both sides; the cell's record is re-recorded from the lanes' first run. On arm64 Linux, `linux-arm64`
 > runs fsx, fsstress and pjdfstest over the three Linux transports against the x86_64 lists: 0 unexpected, 0 listed
 > passing (diagnostics run 41975493604). The Windows records are diagnostics run 42061904713's x86_64 records (arm64's
 > gave the same counts).
@@ -557,7 +561,8 @@ still be established separately.
 - The native macOS root rerun and its reviewed expectations; the macOS lane's sidecar
   behaviour (environmental). Linux adapter records and its first root review are now tracked.
 - A daemon transport for the FUSE bridge, so the Linux cells can be RAN, not LIMITED.
-- A Windows workload roster over the drive (the mount step exists since A-209); an ETW tracer.
+- ~~A Windows workload roster over the drive~~ built for the version-control workloads (A-300, 2026-11-17): their
+  first record from the lanes; the roster's other workloads' Windows forms; an ETW tracer.
 - The Windows features the drive does not keep (A-209's stated differences: security descriptors, generic reparse data,
   named streams, and the three a POSIX link brings to symbolic links, A-275), each a reason on winfstest's list; a
   feature built later strikes its cases from the list, as the settable creation time did (A-259, `t/base/06.t` case 5),

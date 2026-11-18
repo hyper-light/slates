@@ -967,6 +967,7 @@ impl Partition {
       | Op::AccessChanged { id, .. }
       | Op::LiveShippingChanged { id, .. }
       | Op::LiveHoldersCommitted { id, .. }
+      | Op::VolumeWritePolicySet { id, .. }
       | Op::VolumeRebased { id, .. } => self.volume(*id).map(|_| ()).ok_or(DbError::NotFound),
       Op::SnapshotTaken { record } => {
         self.volume(record.volume).ok_or(DbError::NotFound)?;
@@ -1289,6 +1290,11 @@ impl Partition {
       // The catalog register carries the holder set (A-240), so its version moves as the flag's does.
       Op::LiveHoldersCommitted { id, holders } => self.update_volume(*id, |v| {
         v.policy.live_holders = Some(holders.clone());
+        v.catalog_version = v.catalog_version.saturating_add(1);
+      }),
+      // The catalog register carries the policy (A-285), so its version moves as the live-shipping flag's does.
+      Op::VolumeWritePolicySet { id, policy } => self.update_volume(*id, |v| {
+        v.policy.write = Some(*policy);
         v.catalog_version = v.catalog_version.saturating_add(1);
       }),
       Op::VolumeDestroyed { id } => {

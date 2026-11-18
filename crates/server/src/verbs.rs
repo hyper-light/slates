@@ -4018,6 +4018,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::TableAtCapacity { .. } => "table_at_capacity",
     Refusal::NotRecovered { .. } => "not_recovered",
     Refusal::NotShared { .. } => "not_shared",
+    Refusal::PolicyForbids { .. } => "policy_forbids",
     Refusal::ImageRefused { .. } => "image_refused",
     Refusal::NotRootLeader => "not_root_leader",
     Refusal::ConsensusNotInitialized => "consensus_not_initialized",
@@ -4483,6 +4484,12 @@ fn dispatch_inner(
       proof,
     } => crate::landing::grant_verb(state, principal, landing, manifest, scope, term_ns, proof),
     RequestBody::Enroll { account, proof } => enroll(state, account, proof),
+    RequestBody::SetPolicy {
+      subject,
+      policy,
+      proof,
+    } => crate::landing::set_policy_verb(state, principal, subject, policy, proof),
+    RequestBody::Policy { subject } => crate::landing::policy_verb(state, principal, subject),
     RequestBody::Share {
       volume,
       principal: subject,
@@ -5158,6 +5165,7 @@ fn create(
       role: Role::Plain,
       live_shipped: false,
       live_holders: None,
+      write: None,
     },
     base: match base {
       None => BaseRecord::Scratch,
@@ -5834,6 +5842,7 @@ fn found_green(
       },
       live_shipped: false,
       live_holders: None,
+      write: None,
     },
     base: BaseRecord::Scratch,
     head: DbSnapshotId::default(),
@@ -6127,6 +6136,7 @@ fn create_work(
       },
       live_shipped: false,
       live_holders: None,
+      write: None,
     },
     base: BaseRecord::Scratch,
     head: DbSnapshotId::default(),
@@ -9605,6 +9615,7 @@ pub(crate) fn materialize_taken_over_green(
         },
         live_shipped: false,
         live_holders: None,
+        write: None,
       },
       base: BaseRecord::Scratch,
       head: DbSnapshotId::default(),
@@ -9983,6 +9994,7 @@ pub(crate) fn materialize_taken_over(
       // The holder set the dead owner's shipper recorded (A-240), kept until this node's own shipper records its own:
       // a catalog shipped meanwhile still names the holders that hold the log.
       live_holders: catalog.live_holders.clone(),
+      write: None,
     },
     // Placed content is always whole in RAM (an overlay's base-backed bodies are never sealed), so the
     // successor serves it with no base beneath.
@@ -13215,6 +13227,7 @@ mod tests {
         role: Role::Plain,
         live_shipped: false,
         live_holders: None,
+        write: None,
       },
       base: BaseRecord::Scratch,
       head: SnapshotId::default(),
