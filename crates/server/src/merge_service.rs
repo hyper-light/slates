@@ -1651,6 +1651,10 @@ pub struct MergeRecordValue {
   /// completion record must move with it", Lee et al., SOSP 2015, §3). A green's successor records it, so the submit's
   /// resend after a takeover is answered its version. Appended.
   pub completion: Option<SubmitCompletion>,
+  /// How the signature of the submit that made this version was judged (A-321), as the version's chain entry records
+  /// it: a successor records it with the version, so the version's provenance outlives its owner. `None` for an
+  /// unsigned submit and for version 0, which no submit made. Appended.
+  pub signature: Option<slates_db::catalog::SignatureVerdict>,
 }
 
 /// A submit's completion key as a merge record carries it ([`MergeRecordValue::completion`]): the client's host, the
@@ -2136,6 +2140,12 @@ fn enqueue_record_with(
   // answers above: there the head identity, a hash of every byte the green holds, had been made on
   // every accept and dropped (113 of 120 profile samples of a 1,000-file green's submit, 2026-11-04).
   let identity = identity_of(state);
+  // The version's provenance (A-321), recorded in the green's engine when its entry became durable.
+  let signature = state
+    .greens
+    .get(&green)
+    .and_then(|engine| engine.signature(version))
+    .map(crate::signed_work::shipped);
   let mut value = MergeRecordValue {
     version,
     increment,
@@ -2147,6 +2157,7 @@ fn enqueue_record_with(
     require_evidence,
     owner,
     completion,
+    signature,
   };
   // Version 0 of a green over a base names its origin as its inputs: made a share at a time, and the record enqueued
   // once they are (A-286), never walked, encoded and archived in this poll.
@@ -3619,6 +3630,14 @@ pub(crate) struct GreenRecovery {
   pub chain: Vec<Vec<u8>>,
   /// Each version's submit completion key as its merge record carried it, version 1 first, beside `chain` (A-255).
   pub completions: Vec<Option<SubmitCompletion>>,
+  /// Each version's signature verdict as its merge record carried it, version 1 first, beside `chain` (A-321).
+  pub signatures: Vec<Option<slates_db::catalog::SignatureVerdict>>,
+  /// The green's write policy, from its adopted catalog register (A-285, A-321).
+  pub write: Option<slates_db::catalog::WritePolicy>,
+  /// The policy's version, from the same register.
+  pub write_version: u64,
+  /// The green's trusted signers, from the same register (A-321).
+  pub signers: Vec<Vec<u8>>,
   /// The adopted head version.
   pub head: u64,
   /// The adopted head's identity, which the rebuilt engine must reproduce.
@@ -3643,6 +3662,7 @@ pub(crate) fn recover_green_inputs(
   let mut origin = None;
   let mut chain = Vec::with_capacity(usize::try_from(adopted.version).unwrap_or(0));
   let mut completions = Vec::with_capacity(chain.capacity());
+  let mut signatures = Vec::with_capacity(chain.capacity());
   for version in 0..=adopted.version {
     let value = values.get(&version)?;
     let inputs = match value.inputs {
@@ -3655,6 +3675,7 @@ pub(crate) fn recover_green_inputs(
       (_, Some(bytes)) => {
         chain.push(bytes);
         completions.push(value.completion);
+        signatures.push(value.signature);
       }
       (_, None) => return None,
     }
@@ -3668,6 +3689,10 @@ pub(crate) fn recover_green_inputs(
     origin,
     chain,
     completions,
+    signatures,
+    write: catalog.write,
+    write_version: catalog.write_version,
+    signers: catalog.signers.clone(),
     head: adopted.version,
     identity: adopted.identity,
   })
@@ -3859,6 +3884,7 @@ mod tests {
           uid: 0,
         },
         completion: None,
+        signature: None,
       },
       inputs: Placement {
         candidates: candidates.clone(),
@@ -3957,6 +3983,7 @@ mod tests {
                 uid: 0,
               },
               completion: None,
+              signature: None,
             },
             inputs: Placement {
               candidates: candidates.clone(),
@@ -4053,6 +4080,11 @@ mod tests {
         sequence: 13,
         work: Some(DbVolumeId { bytes: [14u8; 16] }),
       }),
+      signature: Some(slates_db::catalog::SignatureVerdict {
+        kind: 1,
+        detail: 0,
+        fingerprint: [15u8; 32],
+      }),
     }
   }
 
@@ -4076,6 +4108,7 @@ mod tests {
         uid: 0,
       },
       completion: None,
+      signature: None,
     };
     assert_eq!(
       MergeRecordValue::from_record_bytes(&origin_only.to_record_bytes()),

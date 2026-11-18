@@ -1291,6 +1291,7 @@ mod tests {
           uid: 0,
         },
         completion: None,
+        signature: None,
       };
       acceptor
         .accept(&Record {
