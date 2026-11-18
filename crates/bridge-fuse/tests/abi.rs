@@ -361,6 +361,7 @@ fn an_init_through_a_dax_offering_transport_keeps_the_dax_flags_and_names_the_al
     &body,
     slates_bridge_core::CacheCoherence::Revalidated,
     offer,
+    slates_bridge_core::AttributeNamespaces::Guest,
   )
   .unwrap()
   .to_bytes();
@@ -379,6 +380,7 @@ fn an_init_through_a_dax_offering_transport_keeps_the_dax_flags_and_names_the_al
     &body,
     slates_bridge_core::CacheCoherence::Revalidated,
     offer,
+    slates_bridge_core::AttributeNamespaces::Guest,
   )
   .unwrap()
   .to_bytes();

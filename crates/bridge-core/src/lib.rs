@@ -30,6 +30,7 @@ pub mod dax_backing;
 pub mod delivery;
 pub mod durable_bound;
 pub mod links;
+pub mod posix_acl;
 pub mod scoped;
 pub mod volume_bridge;
 

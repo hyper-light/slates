@@ -16,6 +16,16 @@
 > **Built since (A-302, 2026-11-18):** a guest's POSIX ACLs (`setfacl`'s `system.posix_acl_access` and a directory's
 > `system.posix_acl_default`) are its data on the same routes, checked as Linux checks one, their named users and
 > groups kept through the stream's owner view; stored and not enforced, as Shards' own server keeps them.
+> **Built since (A-314, 2026-11-18):** enforced, at Shards' coordinator's ask. A guest route's INIT asks the guest's
+> kernel for `FUSE_POSIX_ACL`, so it judges every access by the access ACL it reads; the shared seam keeps Linux's
+> rules on every route: the mode is the access ACL's owner, mask and other entries (a set changes the mode, a chmod
+> anywhere is read back as the ACL's change, an ACL that says no more than a mode is kept as none), and a directory's
+> default ACL is what everything made in it takes, whoever makes it, in place of the umask. Proven by use with a model
+> of Linux's permission check over the dispatch's answers (`crates/bridge-fuse/tests/shards_fs.rs`). Not kept: Linux's
+> clearing of set-group-ID when a caller outside the file's group sets an ACL, which the FUSE wire carries only under
+> `FUSE_SETXATTR_EXT`, not negotiated (a per-connection request form a restored or resynced stream would have to
+> carry). Owed: a real guest's run of it (a Shards guest over a stream; a VM over slates' own virtio-fs device) and the
+> GETXATTR round trips it adds to a non-owner's access, measured by the integrator.
 > **Built since (A-303, 2026-11-18):** a stream's tables for a VM's save and restore (Shards' D176 part 5): a SAVE
 > waits for the guest's stores through its maps, takes and publishes a snapshot at the cut and answers tables naming
 > it with the guest's references, opens, scope and owner view; a RESTORE, a fresh stream's first frame, takes them onto
@@ -27,7 +37,8 @@
 > - A stream that survives a daemon restart, answering Shards' RESEND, each non-idempotent request (CREATE with
 >   O_EXCL, MKDIR, LINK, RENAME, UNLINK) answered at most once from the dead daemon's durable record of its outcome;
 >   else the stream ends typed and counted. The owner view then has to be kept with the attachment's record.
-> - Shards' side, after its v0.8.0 tag and landed by its coordinator from signed branches: its guest test over a
+> - Shards' side, after its v0.8.0 tag and landed by its coordinator from signed branches: its own server enforcing a
+>   guest's ACLs as slates now does (`FUSE_POSIX_ACL`, queued by its coordinator), its guest test over a
 >   slates stream on Linux and macOS (`tests/slates_fs.rs`, Windows only today), the bump of the slates revision it
 >   pins (f71282e1f; handed to it as the signed branch `agents/g268-slates-rev-bump`, 808cdc1e4, pinning ac30fc77a
 >   and Rust 1.98.1), the WHP window patches 0001 to 0003 (the signed branch `agents/g268-whp-window-edge-cases`,

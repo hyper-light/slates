@@ -15,9 +15,10 @@ use crate::init::negotiate_offering;
 use crate::reply::{Attr, AttrOut, DirBuffer, EntryOut, OpenOut, ReplyHeader, StatfsOut, WriteOut};
 use crate::request::{ReadIn, RenameIn, Request, SetAttrIn, WriteIn, parse_name};
 
+use slates_bridge_core::posix_acl::{self, AclRefusal, Toward};
 use slates_bridge_core::{
-  AttributeNamespaces, CacheCoherence, CacheLifetime, DaxOffer, FsStat, NodeAttr, ObjectId,
-  OpContext, OwnerView, RenameFlags, SetAttr, whole_cookie_groups,
+  AttributeNamespaces, CacheLifetime, DaxOffer, FsStat, NodeAttr, ObjectId, OpContext, OwnerView,
+  RenameFlags, SetAttr, whole_cookie_groups,
 };
 pub use slates_bridge_core::{Bridge, DirEntry};
 use slates_vfs::error::VfsError;
@@ -123,13 +124,15 @@ pub fn dispatch(message: &[u8], bridge: &mut dyn Bridge, cx: &OpContext, out: &m
   // A creating request stamps the creating process's uid and gid on what it makes (AUD-29-81): ownership
   // metadata from the kernel's request header, never authority — the attachment's enrolled subject is
   // unchanged, and the shared seam applies the set-group-ID parent rule. A guest whose run named its owner names
-  // ids the volume keeps as another's (A-281): they are kept as the volume's, as a chown's are.
+  // ids the volume keeps as another's (A-281): they are kept as the volume's, as a chown's are. Its umask goes with
+  // them for the seam to apply, which a parent's default ACL replaces (A-314).
   let creator;
   let cx = if creates(opcode) {
     let view = bridge.owner_view();
     creator = OpContext {
       owner_uid: Some(view.kept_uid(request.header.uid)),
       owner_gid: Some(view.kept_gid(request.header.gid)),
+      umask: creation_umask(opcode, request.body),
       ..cx.clone()
     };
     &creator
@@ -137,7 +140,7 @@ pub fn dispatch(message: &[u8], bridge: &mut dyn Bridge, cx: &OpContext, out: &m
     cx
   };
   match opcode {
-    Opcode::Init => serve_init(request.body, unique, cx.coherence, bridge.dax_offer(), out),
+    Opcode::Init => serve_init(request.body, unique, cx, bridge, out),
     Opcode::Lookup => serve_lookup(bridge, &request, cx, out),
     Opcode::GetAttr => serve_getattr(bridge, &request, cx, out),
     Opcode::Open => serve_open(bridge, &request, cx, Opcode::Open, out),
@@ -613,13 +616,22 @@ fn creates(opcode: Opcode) -> bool {
   )
 }
 
-/// A creation mode with the request's umask applied (AUD-29-80): the permission bits less the umask's.
-/// Under `FUSE_DONT_MASK` the kernel sends the mode unmasked and the umask beside it; without it the kernel
-/// masked the mode already and masking again changes nothing (`m & !u & !u == m & !u`), so the creation
-/// policy is applied exactly once in effect on either negotiated path. A body too short to carry the umask
-/// is refused before this (`EIO`).
-fn masked(mode: u32, umask: u32) -> u32 {
-  permission_bits(mode) & !umask
+/// The umask a creating request carries beside its mode (AUD-29-80): third in `fuse_create_in` (`FUSE_TMPFILE`'s too)
+/// and `fuse_mknod_in`, second in `fuse_mkdir_in`; none for any other request. Under `FUSE_DONT_MASK` the kernel sends
+/// the mode unmasked and the umask beside it, for the server to apply, which the shared seam does unless the parent's
+/// default ACL governs instead (Linux's `posix_acl_create`; A-314). A kernel that did not take `FUSE_DONT_MASK` masked
+/// the mode already, and masking again changes nothing (`m & !u & !u == m & !u`). A body too short to carry the umask
+/// is refused by its handler before any effect (`EIO`), so the `None` this gives one is never used.
+fn creation_umask(opcode: Opcode, body: &[u8]) -> Option<u32> {
+  /// Format: the umask's offset in `fuse_create_in` (after flags and mode) and `fuse_mknod_in` (after mode and rdev).
+  const THIRD_WORD: usize = 2 * size_of::<u32>();
+  /// Format: its offset in `fuse_mkdir_in` (after mode).
+  const SECOND_WORD: usize = size_of::<u32>();
+  match opcode {
+    Opcode::Create | Opcode::TmpFile | Opcode::MkNod => body_u32(body, THIRD_WORD),
+    Opcode::MkDir => body_u32(body, SECOND_WORD),
+    _ => None,
+  }
 }
 
 /// The little-endian `u32` at `at` in a request body, if the body holds it.
@@ -912,14 +924,21 @@ fn recover_unique(message: &[u8]) -> Option<u64> {
     .map(|b| u64::from_le_bytes(b.try_into().unwrap_or_default()))
 }
 
+/// `FUSE_INIT`: negotiated for the transport `bridge` serves, which says whether it offers per-inode DAX and whether its
+/// kernel is a guest's, asked to check the guest's ACLs (A-314).
 fn serve_init(
   body: &[u8],
   unique: u64,
-  coherence: CacheCoherence,
-  dax: DaxOffer,
+  cx: &OpContext,
+  bridge: &mut dyn Bridge,
   out: &mut [u8],
 ) -> usize {
-  match negotiate_offering(body, coherence, dax) {
+  match negotiate_offering(
+    body,
+    cx.coherence,
+    bridge.dax_offer(),
+    bridge.attribute_namespaces(),
+  ) {
     Ok(n) => write_or_drop(ReplyHeader::write_ok(unique, &n.to_bytes(), out), out),
     Err(_) => write_or_drop(ReplyHeader::write_error(unique, EIO, out), out),
   }
@@ -1273,10 +1292,7 @@ fn serve_create(
     return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
   }
   let flags = body_u32(req.body, 0).unwrap_or_default();
-  let mode = masked(
-    body_u32(req.body, size_of::<u32>()).unwrap_or_default(),
-    body_u32(req.body, size_of::<u32>().saturating_mul(2)).unwrap_or_default(),
-  );
+  let mode = permission_bits(body_u32(req.body, size_of::<u32>()).unwrap_or_default());
   let name = match parse_name(req.body.get(HEAD..).unwrap_or_default()) {
     Ok(name) => name,
     Err(refusal) => return refuse_unparsed(req.header.unique, refusal, out),
@@ -1324,10 +1340,7 @@ fn serve_tmpfile(
     return write_or_drop(ReplyHeader::write_error(unique, EIO, out), out);
   }
   let flags = body_u32(req.body, 0).unwrap_or_default();
-  let mode = masked(
-    body_u32(req.body, size_of::<u32>()).unwrap_or_default(),
-    body_u32(req.body, size_of::<u32>().saturating_mul(2)).unwrap_or_default(),
-  );
+  let mode = permission_bits(body_u32(req.body, size_of::<u32>()).unwrap_or_default());
   let parent = match resolve(bridge, cx, req.header.nodeid) {
     Ok(object) => object,
     Err(e) => return reply_err(unique, e, out),
@@ -1484,16 +1497,7 @@ fn serve_mknod(
     Err(error) => return reply_err(req.header.unique, error, out),
   };
   let result = bridge
-    .mknod(
-      parent,
-      cx,
-      name,
-      masked(
-        mode,
-        body_u32(head, size_of::<u32>().saturating_mul(2)).unwrap_or_default(),
-      ),
-      kind,
-    )
+    .mknod(parent, cx, name, permission_bits(mode), kind)
     .and_then(|node| referenced(bridge, cx, node));
   let result = entry_reply(bridge, cx, result);
   reply(req.header.unique, result, |entry| entry.to_bytes(), out)
@@ -1510,10 +1514,7 @@ fn serve_mkdir(
   if req.body.len() < HEAD {
     return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
   }
-  let mode = masked(
-    body_u32(req.body, 0).unwrap_or_default(),
-    body_u32(req.body, size_of::<u32>()).unwrap_or_default(),
-  );
+  let mode = permission_bits(body_u32(req.body, 0).unwrap_or_default());
   let name = match parse_name(req.body.get(HEAD..).unwrap_or_default()) {
     Ok(name) => name,
     Err(refusal) => return refuse_unparsed(req.header.unique, refusal, out),
@@ -1776,12 +1777,21 @@ fn acl_turned(
   bridge: &mut dyn Bridge,
   name: Option<&[u8]>,
   value: &[u8],
-  toward: crate::posix_acl::Toward,
-) -> Result<Option<Vec<u8>>, crate::posix_acl::AclRefusal> {
+  toward: Toward,
+) -> Result<Option<Vec<u8>>, AclRefusal> {
   if !name.is_some_and(slates_bridge_core::is_posix_acl) {
     return Ok(None);
   }
-  crate::posix_acl::translated(value, bridge.owner_view(), toward).map(Some)
+  posix_acl::translated(value, bridge.owner_view(), toward).map(Some)
+}
+
+/// The errno a set of an ACL Linux would refuse is answered with, as `posix_acl_from_xattr` and `posix_acl_valid` answer
+/// it (`fs/posix_acl.c`): `EOPNOTSUPP` for another format version, `EINVAL` for anything else malformed.
+fn acl_refusal_errno(refusal: AclRefusal) -> i32 {
+  match refusal {
+    AclRefusal::Version => EOPNOTSUPP,
+    AclRefusal::Invalid => EINVAL,
+  }
 }
 
 /// `GETXATTR` (and, `list`, `LISTXATTR`): `fuse_getxattr_in` is the caller's buffer size and padding, then for a
@@ -1829,7 +1839,7 @@ fn serve_getxattr(
     Err(e) => return reply_err(unique, e, out),
   };
   // A stored ACL no ACL parse takes is the volume's fault, never the caller's: EIO.
-  let value = match acl_turned(bridge, name, &value, crate::posix_acl::Toward::Shown) {
+  let value = match acl_turned(bridge, name, &value, Toward::Shown) {
     Ok(Some(shown)) => shown,
     Ok(None) => value,
     Err(_) => return write_or_drop(ReplyHeader::write_error(unique, EIO, out), out),
@@ -1850,7 +1860,8 @@ fn serve_getxattr(
 /// `SETXATTR`: `fuse_setxattr_in` is the value's size and the `setxattr(2)` flags (slates does not negotiate
 /// `FUSE_SETXATTR_EXT`, so the short form), then the name, then the value. Only a name in a namespace the transport
 /// reaches is stored; any other is `EOPNOTSUPP`, what a filesystem without that namespace answers. A POSIX ACL is
-/// checked as Linux checks one and kept with its named owners turned through the bridge's view (A-302).
+/// checked as Linux checks one and kept with its named owners turned through the bridge's view (A-302), and the seam
+/// keeps the file's mode with an access ACL (A-314).
 fn serve_setxattr(
   bridge: &mut dyn Bridge,
   req: &Request<'_>,
@@ -1886,11 +1897,14 @@ fn serve_setxattr(
   if let Some(errno) = default_acl_refused(bridge, cx, object, name) {
     return write_or_drop(ReplyHeader::write_error(unique, errno, out), out);
   }
-  let value = match acl_turned(bridge, Some(name), value, crate::posix_acl::Toward::Kept) {
+  let value = match acl_turned(bridge, Some(name), value, Toward::Kept) {
     Ok(Some(kept)) => std::borrow::Cow::Owned(kept),
     Ok(None) => std::borrow::Cow::Borrowed(value),
     Err(refusal) => {
-      return write_or_drop(ReplyHeader::write_error(unique, refusal.errno(), out), out);
+      return write_or_drop(
+        ReplyHeader::write_error(unique, acl_refusal_errno(refusal), out),
+        out,
+      );
     }
   };
   reply(

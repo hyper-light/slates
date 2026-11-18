@@ -457,6 +457,10 @@ command that cannot run is a failure (exit 4), its attachment ended with the end
 A guest whose init names its run's owner, as Shards' does with `trusted.shards.owner`, is shown the files the host
 made as that owner's, so an unprivileged run writes them; the volume keeps the host's own ids for what the run makes,
 so every other route shows those files as the host's.
+A guest's own attributes (`trusted.`, `security.`) and its POSIX ACLs are kept in the volume as its data, on this
+route and on `vhost-user`'s, and no host's mount shows them. The guest's kernel enforces its ACLs, so what its
+`setfacl` grants or denies holds for its accesses; a file's mode keeps step with its ACL (a chmod from the host
+changes the ACL's mask), and what anyone makes in a directory with a default ACL takes it, as on Linux.
 Linux sends the end over the client's control socket; macOS claims it on the daemon's socket route, an encrypted
 exchange keyed by a single-use secret. Windows refuses the form by kind (`AttachmentUnsupported`,
 `DescriptorRouteNotBuilt`) until a route hands a client a handle.
