@@ -1,0 +1,83 @@
+# DIAG (not for main): goal 88's library part, g262's filed runs -- every clause is held by a test on main; these are
+# the runs that have only compiled or run on macOS: slates-api's api suite and doctests on Windows x64 and arm64 (gap
+# (a)'s 28 lifted gates, gap (b)'s Shards and seam tests), the Linux api suite with FUSE (gap (c)'s vhost-user test,
+# the Shards DAX test, the busy-mount test) and doctests, and the macOS busy-mount test over its NFS loopback.
+name: diag-supervisor-lib88
+on:
+  push:
+    branches: ['diag-supervisor-lib88-*']
+env:
+  CARGO_TERM_COLOR: never
+  WINFSP_MSI_URL: https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi
+  WINFSP_MSI_SHA256: 073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a
+  DOWNLOAD_RETRIES: "20"
+  DOWNLOAD_RETRY_SECONDS: "60"
+  DOWNLOAD_TRY_SECONDS: "120"
+jobs:
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Install WinFsp
+        id: winfsp
+        timeout-minutes: 45
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP 'winfsp.msi'
+          Invoke-WebRequest -Uri $env:WINFSP_MSI_URL -OutFile $msi -MaximumRetryCount $env:DOWNLOAD_RETRIES -RetryIntervalSec $env:DOWNLOAD_RETRY_SECONDS -TimeoutSec $env:DOWNLOAD_TRY_SECONDS
+          $found = (Get-FileHash $msi -Algorithm SHA256).Hash
+          if ($found -ne $env:WINFSP_MSI_SHA256) { throw "WinFsp's installer hashes $found, not $env:WINFSP_MSI_SHA256" }
+          $install = Start-Process msiexec -ArgumentList '/i', "`"$msi`"", '/qn', '/norestart' -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "WinFsp's installer answered $($install.ExitCode)" }
+          New-ItemProperty -Path 'HKLM:\SOFTWARE\WOW6432Node\WinFsp' -Name MountUseMountmgrFromFSD -Value 1 -PropertyType DWord -Force | Out-Null
+          "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: slates-api's api suite (Windows)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: cargo test --locked -p slates-api --test api -- --test-threads=1
+      - name: slates-api's doctests (Windows)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: cargo test --locked -p slates-api --doc
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: FUSE for the busy-mount and vhost-user tests
+        run: |
+          command -v fusermount3 >/dev/null || { sudo apt-get update && sudo apt-get install -y fuse3; }
+          grep -qx user_allow_other /etc/fuse.conf 2>/dev/null || echo user_allow_other | sudo tee -a /etc/fuse.conf
+      - name: slates-api's api suite with kernel mounts (Linux)
+        if: ${{ !cancelled() }}
+        env:
+          SLATES_TEST_MOUNT: "1"
+        run: cargo test --locked -p slates-api --test api -- --test-threads=1
+      - name: slates-api's doctests (Linux)
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p slates-api --doc
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: The busy-mount test over the NFS loopback (macOS)
+        env:
+          SLATES_TEST_MOUNT: "1"
+        run: cargo test --locked -p slates-api --test api -- a_busy_mount_is_let_go_of_the_oss_way --nocapture --test-threads=1
