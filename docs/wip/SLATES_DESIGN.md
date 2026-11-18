@@ -9882,9 +9882,13 @@ stays in the overlay.
 > from its drive's root one component at a time, refusing a link, a junction or a mount point; a target on one of this
 > daemon's own WinFsp drives is refused before any open (A-227); and it must be owned by this user. A file's mode sets
 > or clears its `READONLY` bit alone (A-262: a file's read-only state is its mode), every other attribute bit kept.
-> Not built: a symbolic link, which Windows makes only with a privilege slates never asks for (R10), so such an entry
-> fails, typed; and the volume's other Windows attribute bits, which a landing carries and does not yet apply (A-262's
-> landing half). Built on 2026-10-26 by another session and landed on 2026-11-18; the evidence is A-185's.
+> Not built: the volume's other Windows attribute bits, which a landing carries and does not yet apply (A-262's landing
+> half). Built on 2026-10-26 by another session and landed on 2026-11-18; the evidence is A-185's. **Since A-438 (the same
+> day)** a symbolic link lands as the Windows one, in A-275's form (`slates_vfs::host::windows_link`, the drive's own),
+> made handle-relative at the landing's hidden name and moved into place without replacing, its buffer set with
+> `SeCreateSymbolicLinkPrivilege` enabled for its thread alone where the process holds it; where NTFS refuses the set (a
+> standard account outside Developer Mode) the entry fails `EPERM`, typed, as every link did before. A link lands as a
+> file link: the seam carries no link's type.
 
 > **Status (2026-09-29, A-47, AUD-29-03).** One host target has one landing lease, whichever shard owns
 > the landing volume and whichever spelling names the target. Before, each owner shard kept its own lease
@@ -19373,6 +19377,8 @@ and `crates/bridge-winfsp` (`symlink.rs`; the reparse slots, `GetSecurityByName`
   has just made, replaces it with a volume link at its name, keeping its attribute bits; `FSCTL_DELETE_REPARSE_POINT`
   turns a link back into an empty file or directory. Generic reparse data (every other tag) is its own change, owed
   after named streams; it still answers `STATUS_INVALID_DEVICE_REQUEST`, as every reparse request did before.
+  **Since A-438 (2026-11-18)** the map between a volume link and its buffer lives in `slates_vfs::host::windows_link`,
+  shared by the drive and the landing's Windows writer, which lands each volume link in this form.
 - **1. A link's type.** A Windows link is typed: a directory link carries `FILE_ATTRIBUTE_DIRECTORY` and is removed by
   `RemoveDirectory`, a file link by `DeleteFile`. A volume symlink is untyped.
   - A link Windows made keeps the type it was created with: the empty object `CreateSymbolicLinkW` made is a directory
@@ -30682,6 +30688,50 @@ Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class B), 
 
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class A), `crates/server/src/{shards_route,
 anchor_hold_windows,remote_attach,mirror,fleet}.rs`.
+
+### A-438 — A symbolic link in a Windows landing is the Windows one, in the form the drive shows (2026-11-18, g085; A-185's owed item, A-275's form)
+Applied in the same change to: §4.15 (A-185's status), A-275 (its form now shared), GAPS (A-185's owed list),
+`crates/vfs` (`src/host/windows_link.rs`, new: A-275's map moved from the bridge, its tests with it; `src/host/mod.rs`,
+`LandFs::symlink` takes the landing's staged name; `src/host/sim.rs`), `crates/bridge-winfsp` (`src/symlink.rs`: the
+shared form re-exported, `status_of` for its `NTSTATUS`es; `src/host.rs`, the two refusals), `crates/land`
+(`src/os_windows.rs`: the link made, `set_reparse`, `as_link_maker`, `link_token`; `src/os.rs`; `src/engine.rs`, the
+staged name; `Cargo.toml`, `Wdk_System_SystemServices`; `tests/os.rs`,
+`a_symlink_in_a_landing_is_a_windows_symbolic_link`; `tests/os_escape.rs` and `tests/os_removal.rs`, the seam's new
+argument), and `unsafe-budget.toml` (`slates-land` 23 → 29).
+- **What was there.** A-185's writer refused every symbolic link `EPERM`. The stated reason was that Windows makes a
+  link only through a path (`CreateSymbolicLinkW`) or with a privilege. Both halves of that hold, but neither forbids a
+  handle-relative link: NTFS takes a link's reparse buffer on any handle (`FSCTL_SET_REPARSE_POINT`, as
+  `CreateSymbolicLinkW` itself sets it), from a caller with the privilege enabled. So a landing of any volume holding a
+  link, a git checkout with relative links or an npm tree, failed those entries on every Windows machine.
+- **The form.** One map from a volume link to the Windows one, A-275's, now in `slates_vfs::host::windows_link`, where
+  the drive answers with it and the landing writes it: a relative target with `\` and `SYMLINK_FLAG_RELATIVE`, a
+  Windows-absolute one under `\??\`, a POSIX-absolute one unchanged (it resolves to nothing, as on the drive). A link
+  lands as a file link, as A-275 presents a link POSIX made: the seam carries no link's type, so a directory link
+  Windows made in the volume (`LINK_DIRECTORY`) lands as a file link until the volume's other attribute bits reach a
+  landing (A-185's owed list).
+- **The writer.** The empty object is made at the landing's own hidden name (`NtCreateFile` with `FILE_CREATE` and
+  `FILE_OPEN_REPARSE_POINT`, relative to the parent's handle). Its buffer is set, then it is moved to its name with the
+  rename that never replaces, so the name never holds half a link. Whatever refuses a step, the object is removed;
+  a crash between steps leaves only a hidden sibling, which the landing's sweep removes. The seam's
+  `symlink` takes that staged name from the engine; a writer that makes a link in one step (`symlinkat`) ignores it,
+  so nothing changes on Unix.
+- **The privilege.** NTFS sets a link's buffer only for a caller with `SeCreateSymbolicLinkPrivilege` enabled, unless
+  Developer Mode lets it. An administrator's token holds it disabled, and `CreateSymbolicLinkW` enables it around its
+  own call (measured for the drive's tests, `crates/cli/tests/winfsp_semantics.rs` `set_link_privilege`). The writer does
+  the same for its set alone: it runs on its thread under a copy of the process token with the privilege enabled, made
+  once a process, and reverts after. Every other thread, the shard's other work included, runs as before. No privilege
+  is asked for that the process does not hold (R10): where the token holds none, the set runs as the process is and
+  NTFS decides, and a refusal fails the entry `EPERM`, typed, as every link did before.
+- **Tests.** `a_symlink_in_a_landing_is_a_windows_symbolic_link` (`crates/land/tests/os.rs`, Windows): a relative link
+  lands as a Windows file link reading `..\src\lib.rs`, the file read through it, no staged name left. It skips loudly
+  where the account may make no link at all (std's `CreateSymbolicLinkW` probe refused 1314). It is red on A-185's
+  writer (the entry failed `EPERM`); its Windows runs, green and that red, are filed for main's lanes. The shared form's
+  tests moved with it and run on every host (`slates-vfs` `host::windows_link`), and the bridge keeps its status and
+  privilege tests. Compiled for `x86_64-pc-windows-msvc`.
+- **Owed.** A link's type (a directory link as one), with the volume's other attribute bits; a Windows base host still
+  reads a link back by its print name, with `\` (`slates_base`'s `link_target`), where A-275 stores `/`. So after a
+  landing, a volume holding `../src/lib.rs` reads its base's `..\src\lib.rs` until the base reads links with the shared
+  map; the Developer Mode route for an account without the privilege, measured (the filed run says).
 
 ### A-433 — A Windows Shards stream outlives its daemon: the successor adopts the held resync end, duplicates a fresh stream into the holder the session names, and answers a resent request from the reply kept for it (2026-11-18, goal 90, item b, piece four; A-316's successor half on Windows; A-418's wire, A-423's hold, A-427's attach half)
 Applied in the same change to: §4.6, the Shards form's resync and death bullets; A-427's owed list; GAPS, A-281's entry

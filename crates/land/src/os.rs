@@ -832,7 +832,14 @@ impl LandFs for OsLand {
     rustix::fs::unlinkat(self.dir(dir)?, name, AtFlags::REMOVEDIR).map_err(refusal)
   }
 
-  fn symlink(&mut self, dir: HostDir, name: &str, target: &str) -> Result<(), HostError> {
+  /// `symlinkat` makes the link whole at `name` in one step, so `staged` is not used (the seam's contract).
+  fn symlink(
+    &mut self,
+    dir: HostDir,
+    name: &str,
+    target: &str,
+    _staged: &str,
+  ) -> Result<(), HostError> {
     rustix::fs::symlinkat(target, self.dir(dir)?, name).map_err(refusal)
   }
 

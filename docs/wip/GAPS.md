@@ -18567,9 +18567,13 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   Red-checked on windows-latest (run 44367207034): the `ARCHIVE` set-aside and the default owner each; the own-drive
   refusal passes on both runners (run 44376034930), its red-check filed for main's run.
   **Owed:** `crates/server/tests/audit_crossing.rs` (main's, 2026-11-18) is gated to Unix only for its landing target
-  and has not run on Windows: lift its gate once a Windows run passes it; a symbolic link in a landing on Windows
-  (refused `EPERM`: no unprivileged, handle-relative way to make one);
-  a reflink (`FSCTL_DUPLICATE_EXTENTS_TO_FILE` on ReFS); A-262's landing half (the volume's other attribute bits); and
+  and has not run on Windows: lift its gate once a Windows run passes it; a symbolic link in a landing on Windows,
+  **built by A-438 the same day** (the Windows link in A-275's form, handle-relative, staged and moved into place, the
+  privilege enabled for its thread alone where the process holds it; its Windows test filed for main's lanes; still
+  owed with it: a directory link's type, which the seam does not carry, a Windows base reading a link back in A-275's
+  `/` form rather than its print name's `\`, and the Developer Mode route for an account without the privilege,
+  measured); a reflink (`FSCTL_DUPLICATE_EXTENTS_TO_FILE` on ReFS); A-262's landing half (the volume's other attribute
+  bits); and
   the seam's numbering: refusals the engine tells apart are POSIX numbers and the rest Win32 codes, so a Win32 code equal
   to one of the engine's numbers (`ERROR_NOT_SAME_DEVICE` 17, `ERROR_INSUFFICIENT_BUFFER` 122, among five) would read as
   that refusal; none of the writer's calls is known to answer one, and a typed refusal at the seam would close it.
