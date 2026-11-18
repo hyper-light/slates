@@ -13854,7 +13854,7 @@ fn a_successor_restarted_before_any_write_keeps_the_live_volume_it_took_over() {
   let read: Vec<bool> = (0..CONTINUITY_FILES)
     .map(|file| {
       let reply = read_at_head(&mut reader, id, &format!("/continuity-{file}"));
-      matches!(reply, ReplyBody::ReadBytes { bytes } if bytes == continuity_body(file))
+      matches!(reply, ReplyBody::ReadPage { bytes, .. } if bytes == continuity_body(file))
     })
     .collect();
   drop(reader);
