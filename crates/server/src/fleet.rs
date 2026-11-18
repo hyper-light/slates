@@ -8454,13 +8454,15 @@ fn sync_config_from_council(local: HostId) {
 fn fan_configs_to_shards(origin: u16, shards: &[u16]) {
   let Some(fans) = state::with_state(|s| {
     // Prune the owner-lease ledgers to the current members each period (a restarted peer's retired id
-    // leaves; §4.8 "Leases and reads", AUD-08), then fan this node's lease evidence to every owner shard —
+    // leaves; §4.8 "Leases and reads", AUD-08; a former member's last answer stays until its horizon passes, since a
+    // promotion of its objects waits on it, A-351), then fan this node's lease evidence to every owner shard —
     // the verb gate (`verbs::dispatch`) and the mount (`crate::nfs`) run there and must read the same
     // confirmation the control shard's probe tasks collected. `answers_given` and `departed_owners` stay on
     // the control shard (only the takeover drive reads them), so they are not fanned.
     let members = s.fleet.members();
     s.lease.retain_members(members);
-    s.answers_given.retain_members(members);
+    s.answers_given
+      .retain_members(members, slates_machine::clock::monotonic_ns());
     s.fanned.observe_lease(&s.lease);
     // This shard's own parked lease reads meet the evidence it just pruned and observed.
     crate::lease_wait::resolve(s);

@@ -12174,6 +12174,93 @@ fn a_taken_over_object_a_survivor_never_promises_is_given_up_by_name() {
   );
 }
 
+/// Cuts `daemons[0]` off on the probe plane, both ways, its record plane whole (the shape of
+/// [`taken_over_on_the_probe_plane`]), or heals it: whether every node took the change.
+fn probe_plane_cut(daemons: &[Daemon], hosts: &[HostId], cut: bool) -> bool {
+  let others: Vec<HostId> = if cut { hosts[1..].to_vec() } else { Vec::new() };
+  let alone: Vec<HostId> = if cut { vec![hosts[0]] } else { Vec::new() };
+  daemons[0].inject_probe_deafness(&others).is_ok()
+    && daemons[1..]
+      .iter()
+      .all(|daemon| daemon.inject_probe_deafness(&alone).is_ok())
+}
+
+/// A counter of `daemon`'s, summed over its shards.
+fn counted(daemon: &Daemon, name: &str) -> u64 {
+  summed_counters(daemon).get(name).copied().unwrap_or(0)
+}
+
+/// A-351 (§4.8 "Promotion and takeover", A-304's bound, A-15's rejoin; T-8.5's convergence): a takeover that gave
+/// objects up while its retired host was cut off starts over once the host is heard alive again, so the fleet settles on
+/// one configuration once its faults stop. Do: three nodes at `f = 1`; a volume on a, sealed and its head held by b and
+/// c; b and c each leave the other's takeover questions unanswered; cut a off on the probe plane until b and c have
+/// retired it and the volume's successor has given the volume up; let b and c answer each other again; heal a. Expect
+/// every node to hold one configuration that names all three as members and voters, installed, and the probe mesh
+/// whole, within the periods a re-admission takes, and the successor to have judged its round afresh. Before, nothing
+/// but a configuration change started a round that gave objects up over, the retirement it owed stayed kept, a kept
+/// retirement refuses its host's re-admission, and the fleet stayed split for good (the chaos nemesis's split, the
+/// survivors at two members and a at three).
+#[test]
+fn a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let id = held_by_both_survivors(&daemons, "given-up-then-heard");
+  silence_each_other(&daemons, &hosts);
+  let successor = rendezvous_first(&[hosts[1], hosts[2]], ObjectId(id.bytes)).unwrap();
+  let at = if successor == hosts[1] { 1 } else { 2 };
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let cut = probe_plane_cut(&daemons, &hosts, true);
+  let given_up = cut
+    && poll_for_periods(
+      &observed,
+      RETIREMENT_DEADLINE,
+      promise_wait_periods().saturating_mul(3),
+      || Ok(counted(&daemons[at], "fleet.takeover.given_up") > 0),
+    );
+  let at_give_up: Vec<String> = daemons.iter().map(configuration_view).collect();
+  let answering = daemons[1..]
+    .iter()
+    .all(|daemon| daemon.inject_takeover_silence(&[]).is_ok());
+  let healed = probe_plane_cut(&daemons, &hosts, false);
+  let settled = answering
+    && healed
+    && poll_for_periods(
+      &observed,
+      RETIREMENT_DEADLINE,
+      readmission_periods(&observed),
+      || settled_on_one_configuration(&daemons, &hosts),
+    );
+  let judged_afresh = counted(&daemons[at], "fleet.takeover.judged_afresh");
+  let at_end: Vec<String> = daemons.iter().map(configuration_view).collect();
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "given up, then heard: cut {cut}, given up {given_up}, answering again {answering}, healed {healed}, settled \
+     {settled}, judged afresh {judged_afresh}\nat the give-up:\n{}\nat the end:\n{}",
+    at_give_up.join("\n"),
+    at_end.join("\n")
+  );
+  assert!(
+    cut && given_up,
+    "a was cut off and the volume's successor gave it up: {}",
+    at_give_up.join("; ")
+  );
+  assert!(
+    answering && healed,
+    "b and c answer each other again and a is healed"
+  );
+  assert!(
+    settled,
+    "every node holds one configuration naming a, b and c, all voting and meshed, once a is heard again: {}",
+    at_end.join("; ")
+  );
+  assert!(
+    judged_afresh > 0,
+    "the successor judged its round afresh once a was heard again (non-vacuity)"
+  );
+}
+
 /// On `daemons[0]`, a scratch volume named `name`, shared with the fleet and snapshotted, once its head is placed and
 /// both survivors-to-be (`daemons[1]` and `daemons[2]`) hold it, so a successor learns it from its own copy whichever
 /// it is. The volume.
