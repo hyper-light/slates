@@ -50,8 +50,9 @@ before A-263 a create took names up to 4,062 bytes, with the same result.
 ## Siblings
 
 - **The status's mount budget (A-267, 2026-11-17) was not reproduced.** The 400-mount test met the partition's
-  attachment table's own bound (`PartitionCaps::attachments`, the admission limit) and was refused `TableAtCapacity {
-  table: "attachments" }` at an attach, before any status. That happened in its "red" run on 2026-11-17 and again in
+  attachment table's own bound and was refused `TableAtCapacity { table: "attachments" }` at an attach, before any
+  status. That bound is `PartitionCaps::attachments`, the admission limit: 4,000,000 requests a second at a 5 µs p99,
+  which is 20 a partition on every host, and the rewritten test bound 20 (r1472). That happened in its "red" run on 2026-11-17 and again in
   the green run here, which is how it was found. At that bound, the path-only count overshot the quarter-reply budget
   by at most twelve bytes a mount. The drift is carried in whatever room is left, so no status was ever refused.
   Counting whole encodings is kept as an accounting correction. The test now binds mounts at 160-byte paths up to the
