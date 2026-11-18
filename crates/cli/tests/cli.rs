@@ -3741,6 +3741,28 @@ fn formation_counter_allowed(line: &str) -> bool {
     // superseded link work — exactly what this assertion permits — and it is counted during formation
     // since the list was last kept (seen on the CI ubuntu lane, run 39073360651, 2026-10-17).
     "fleet.link.invalid.member_changed",
+    // Events and readings of formation's normal work that the counter map has carried since 2026-11-17, which the
+    // three-process flows met the first time CI's ubuntu lane reached this step again (run 44298844583, 2026-11-18;
+    // every earlier run had stopped at a red `Test` step): the serve sockets' sessions opened and their pool's
+    // high-water mark (`fleet::SERVE_OPENED`, `SERVE_HIGH_WATER`), the record links' dials, readings at the report
+    // and the calls made (`fleet::DIAL_RECORD_*`, 96eda8992), the period's seal and mirror walks and their turns
+    // (`fleet::SEAL_WALKS`, `MIRROR_WALKS` and their slices, 8636d8510), and the record period's live work and a
+    // returned holder's walk in turns (`live_ship::LIVE_PERIODS`, `LIVE_PERIOD_SLICES`, bdd767167;
+    // `LIVE_REACHED_SLICES`, A-324). The serve sockets' refusals (`fleet.serve.setup_refused`,
+    // `peer_sessions_refused`, `peers_refused`) are not among them, and still fail here.
+    "fleet.serve.opened",
+    "fleet.serve.high_water",
+    "fleet.dial.record.dialing",
+    "fleet.dial.record.longest_call_ms",
+    "fleet.dial.record.longest_enroll_ms",
+    "fleet.dial.record.calls",
+    "fleet.seal.walks",
+    "fleet.seal.walk_slices",
+    "fleet.mirror.walks",
+    "fleet.mirror.walk_slices",
+    "fleet.live.periods",
+    "fleet.live.period_slices",
+    "fleet.live.reached_slices",
   ]
   .contains(&counter)
 }
