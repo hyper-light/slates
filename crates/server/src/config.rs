@@ -1043,11 +1043,11 @@ impl DaemonConfig {
     );
     derivations.push(note("idle_window_ns", &idle_window));
     derivations.push(note("idle_spin_ceiling_ns", &IDLE_SPIN_CEILING));
-    runtime.spin_ns = idle_window.get();
+    runtime.spin_ns = PROVISION_FLOOR_NS.max(d.spin_before_park_ns.get().saturating_mul(100));
     // A shard that tracks its wake keeps the same window (§4.3): no multiple of the estimate, R9's floor, and every spin
     // under the watchdog's window whatever a hold asks. `spin_ns` is the window of a runtime that tracks no estimate.
     if let Some(tracking) = runtime.wake_tracking.as_mut() {
-      tracking.idle_ratio = NO_ESTIMATE_MULTIPLE.get();
+      tracking.idle_ratio = 100;
       tracking.idle_floor_ns = PROVISION_FLOOR_NS;
       tracking.idle_ceiling_ns = IDLE_SPIN_CEILING_NS;
     }
