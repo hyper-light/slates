@@ -1488,7 +1488,10 @@ fn old_handoff_limit() -> usize {
     .arg("ARG_MAX")
     .output()
     .expect("getconf runs");
-  assert!(answer.status.success(), "getconf ARG_MAX answered {answer:?}");
+  assert!(
+    answer.status.success(),
+    "getconf ARG_MAX answered {answer:?}"
+  );
   String::from_utf8(answer.stdout)
     .expect("getconf prints text")
     .trim()
