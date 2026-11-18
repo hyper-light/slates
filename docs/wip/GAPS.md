@@ -3,17 +3,21 @@
 > **Open (g267, 2026-11-18): a volume moves between fleet nodes, and kiln's runners form the fleet.** Kiln moves an
 > agent between runners only without a volume (`harness/relocate.rs` refuses one), so the work owed is §4.10's
 > planned handoff ("Ownership follows the writer", Phase 8 task 9, AC-8.16, T-8.14), then kiln as the fleet's operator.
-> - **Built:** a local clone of an overlay (below, 2026-11-05's list) and the configuration's moved-object exceptions
->   (§4.8 "Authority scope", its status of this date): a move is reported, bounded, committed, followed through
->   takeovers and dropped at a destroy.
-> - **Owed, in order:** the holders' side of a committed move (the object's copies take the new owner's authority and
->   refuse the old owner); the handoff in the daemon (drain, the head or live log durable, the report, the new owner's
->   phase one for the one object, materialize, serve; routing follows the exception; a `slates volume move` verb); an
->   overlay's move (its base stays on its source host, §4.10 "Overlay volumes in a fleet", so it is refused typed
->   until a remote base service or a captured base exists); kiln's runners as members (certificates under kiln's CA,
->   seeds from kiln's runner directory); a multi-runner test with injected faults.
-> - **Decision owed (Ada):** Hex's D281 reads "Volumes stay per machine (2026-11-14)", while this goal replicates a
->   volume's changes to copies on other runners and moves a volume with its agent.
+> - **Built:** a local clone of an overlay (below, 2026-11-05's list); the configuration's moved-object exceptions
+>   (§4.8 "Authority scope"); and the planned move of a plain volume (A-291, §4.10's status): place, switch, adopt
+>   and release, the old owner keeping its copy until the new owner has sealed the volume under its own placement,
+>   `slates move ID --to HOST`, every refusal a typed `MoveRefusal`, a move back to the creator, a destroyed moved
+>   volume's exception dropped.
+> - **Owed, in order:** the move in `slates-api` (`Instance::move_volume`); kiln's runners as members (certificates
+>   under kiln's CA as the manifest's enrollment root, seeds from kiln's runner directory); kiln's relocation of an
+>   agent with its volume (detach, move, attach on the target); an overlay's move (its base stays on its source host,
+>   §4.10 "Overlay volumes in a fleet": refused `NotPlain` until a captured base (§4.15 `capture_base`, the design's
+>   preferred delta-plus-base form) or a remote base service exists; kiln's workspaces are overlays); the automatic
+>   migration by the origin of the last N writes (AC-8.16's other half); a move carrying snapshots other than the
+>   head; a multi-runner test with injected faults.
+> - **Decided (Ada, 2026-11-18):** the persistent disks Hex gives microVMs stay on their own machine (Hex's D281,
+>   "volumes stay per machine", stands); only slates workspaces replicate across kiln runners, so the moves and copies
+>   this entry owes are of slates volumes alone.
 
 > **The dirty-page test's precondition, proved each attempt (2026-11-09, A-248).**
 > `a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path` failed intermittently ("the sync says so:

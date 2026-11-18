@@ -300,6 +300,7 @@ slates audit [--since N] [--json]
 slates enroll [--account UID] [--json]
 slates revoke CONSUMER [--json]
 slates share ID PRINCIPAL [--read] [--write] [--admin] [--json]
+slates move ID --to HOST [--json]
 slates run [--keep] [--json] -- CMD [ARG ...]
 slates exec --volume V --at PATH -- CMD [ARG ...]
 slates shards ID [--subtree DIR] [--read-only] --fd N [--json] -- CMD [ARG ...]
@@ -319,6 +320,17 @@ slates mcp [--instance NAME] [--http PORT]
 `slates live-ship ID [--off]` turns a volume's live shipping on (or off): in a fleet each of its publications
 is then shipped to its candidates, and a sync is answered once the owner and `f` of them hold it (design A-200).
 It needs `admin` on the volume, as `share` does.
+
+`slates move ID --to HOST [--json]` asks the volume's owner to move it to another fleet member, named by the host id
+`status` gives its members (design A-291). The owner freezes the volume, places its records and reports the move; from
+the switch every node forwards its verbs to the member, which adopts the volume, serves it and seals it under its own
+placement, and only then does the old owner let its copy go. One call is one ask: it prints `moving HOST` while the move
+is under way and `moved HOST` once the member owns it, so call it again until it says `moved`; the member answers
+`Overloaded` (retry) until it serves the volume. The volume must be a plain volume (no base directory) with no
+attachment (detach first), no clone, and no snapshot but its head (a move carries the head), and the member must be
+in the owner's neighbourhood; otherwise it is refused `MoveRefused` naming why (`NotPlain`, `Attached`, `Lineage`,
+`Snapshots`, `Target`, `Neighbourhood`, `Unplaced`, `Pending`). Share the volume with the account that will use it on
+the member before moving it. It needs `admin` on the volume.
 
 Sizes take a binary unit (`512MiB`, `4GiB`; `B`, `KiB`, `MiB`, `GiB`, `TiB`) or plain bytes.
 Ids are 32 hexadecimal characters as `create` prints them.

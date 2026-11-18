@@ -460,6 +460,14 @@ pub enum Op {
     /// The version it waits for.
     version: u64,
   },
+  /// A volume moved to another fleet member left this node (§4.10 "Ownership follows the writer", A-291): its record,
+  /// snapshots, lineage and this node's copies of its keys go, as a destroy's do, but no tombstone stays. Its registers
+  /// belong to the member the configuration's moved-object exception names, which adopted them, so nothing here may
+  /// close them. Appended (2026-11-18).
+  VolumeReleased {
+    /// The volume.
+    id: VolumeId,
+  },
 }
 
 impl Op {
@@ -531,6 +539,7 @@ impl Op {
       Op::LiveShippingChanged { .. } => "live_shipping_changed",
       Op::LiveHoldersCommitted { .. } => "live_holders_committed",
       Op::CompletionAwaiting { .. } => "completion_awaiting",
+      Op::VolumeReleased { .. } => "volume_released",
     }
   }
 }

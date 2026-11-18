@@ -796,6 +796,17 @@ pub enum RequestBody {
     /// The evidence references (opaque to slates), possibly none.
     evidence: Vec<[u8; 32]>,
   },
+  /// Move `volume` to the fleet member `to` (§4.10 "Ownership follows the writer": "operators keep an explicit move";
+  /// A-291): its owner freezes it, places its records and reports the move, and the member `to` adopts it, serves it
+  /// and seals it under its own placement before the owner lets its copy go. Answered `Moving` until the configuration
+  /// names `to`, then `Moved`; the caller asks again until `Moved`. A volume that cannot move is refused
+  /// [`Refusal::MoveRefused`]. `admin` on the volume is required. Appended.
+  Move {
+    /// The volume.
+    volume: VolumeId,
+    /// The member it moves to, by its host id.
+    to: u64,
+  },
 }
 
 /// The bytes an [`RequestBody::EditSubmit`] inserts (A-225): carried in the request, or, for an edit larger than one
@@ -1491,7 +1502,8 @@ impl RequestBody {
       RequestBody::Share { volume, .. }
       | RequestBody::LiveShip { volume, .. }
       | RequestBody::DetachOf { volume, .. }
-      | RequestBody::RemoteReap { volume, .. } => Some(*volume),
+      | RequestBody::RemoteReap { volume, .. }
+      | RequestBody::Move { volume, .. } => Some(*volume),
     }
   }
 
@@ -1524,6 +1536,7 @@ impl RequestBody {
         | RequestBody::FsRename { .. }
         | RequestBody::FsMkdir { .. }
         | RequestBody::Checkout { .. }
+        | RequestBody::Move { .. }
     )
   }
 
@@ -3095,6 +3108,38 @@ pub enum Refusal {
     /// The requester, by its host's certificate anchor and its account.
     principal: Principal,
   },
+  /// A planned move of a volume to another fleet member (`Move`, §4.10 "Ownership follows the writer", A-291) was
+  /// refused, for a reason a caller can act on by its kind. Nothing moved, and the volume is served where it was.
+  /// Appended.
+  MoveRefused {
+    /// Why.
+    reason: MoveRefusal,
+  },
+}
+
+/// Why a planned move was refused ([`Refusal::MoveRefused`], A-291): each names what the caller can change. Append-only.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveRefusal {
+  /// The volume is not a plain live volume: an overlay (its base stays on its source host, §4.10 "Overlay volumes in a
+  /// fleet"), an image, a green or a work, or one being destroyed.
+  NotPlain,
+  /// The volume has an attachment or a lease: a writer detaches first.
+  Attached,
+  /// The volume is a clone, has clones, or is a green's origin: each shares its records on its owner.
+  Lineage,
+  /// The volume has snapshots other than its head: a move carries the head, and the others would be lost with the old
+  /// owner's copy. Destroy them first.
+  Snapshots,
+  /// The target is not another member of the volume's region.
+  Target,
+  /// The target is outside the owner's neighbourhood (it holds no key to the volume's sealed content), or its own
+  /// neighbourhood does not cover the cohort the volume's records sit in (its takeover could not recover the volume).
+  Neighbourhood,
+  /// The volume's records were not placed within the fleet's failover SLO, so the move was not reported; the volume
+  /// thawed. Ask again.
+  Unplaced,
+  /// The volume is already moving to another member.
+  Pending,
 }
 
 /// Why recovery could not rebuild a volume its catalog holds ([`Refusal::NotRecovered`], §4.8). Append-only.
@@ -3576,6 +3621,17 @@ pub enum ReplyBody {
   LiveShippingSet {
     /// Whether it is live-shipped now.
     live_shipped: bool,
+  },
+  /// A volume's move is under way (`Move`, A-291): it is frozen, and the move waits for its records to be placed or for
+  /// the configuration to name its new owner. Ask again. Appended.
+  Moving {
+    /// The member it moves to.
+    to: u64,
+  },
+  /// The configuration names a volume's new owner (`Move`, A-291): verbs on it go there now. Appended.
+  Moved {
+    /// The member it moved to.
+    to: u64,
   },
 }
 

@@ -93,8 +93,10 @@ impl Query {
     CachedRoute { query: self, owner }
   }
 
-  /// Reuse this client's most recent route, or the id's live creator when it is still in the
-  /// object's home. A dead creator never turns into a rendezvous guess over unrelated members.
+  /// Reuse this client's most recent route, or the id's live first owner when it is still in the object's home: the
+  /// owner a moved object's exception names (A-291; §4.8 "Lookup": "an ownership or home move is a configuration
+  /// exception naming the affected volume"), else its creator. A dead one never turns into a rendezvous guess over
+  /// unrelated members. Asked on the control shard, where the council's configuration is.
   pub(crate) fn known_owner(
     self,
     state: &ShardState,
@@ -104,12 +106,14 @@ impl Query {
       .filter(|route| self.reuses(state, *route).is_none())
       .map(|route| route.owner)
       .or_else(|| {
-        eligible(
-          state,
-          ObjectId(self.object).creator(),
-          RegionId(self.region),
-        )
-        .then_some(ObjectId(self.object).creator())
+        let object = ObjectId(self.object);
+        let first = state
+          .council
+          .configuration()
+          .moved
+          .get(&object.placement_key())
+          .map_or_else(|| object.creator(), |moved| moved.owner);
+        eligible(state, first, RegionId(self.region)).then_some(first)
       })
   }
 }

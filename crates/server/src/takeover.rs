@@ -250,6 +250,8 @@ pub(crate) fn resolve_held_objects(state: &mut ShardState, local: HostId) {
       Lineage::Settled => reclaim(state, object),
     }
   }
+  // A copy the configuration moved to another member (A-291) follows its move.
+  crate::moves::follow_moved_objects(state);
 }
 
 /// Whether this holder's copy of `object`, now owned by the member `owner` after a takeover, is stale: its
@@ -276,10 +278,18 @@ fn stale_after_confirmation(
       .is_some_and(|placement| !placement.place(object).candidates.contains(&local))
 }
 
+/// Drops this holder's copy of `object` after a takeover ([`drop_copy`]). Counted [`TAKEOVER_RECLAIMED`].
+fn reclaim(state: &mut ShardState, object: ObjectId) {
+  drop_copy(state, object);
+  let count = state.refusals.entry(TAKEOVER_RECLAIMED).or_insert(0);
+  *count = count.saturating_add(1);
+}
+
 /// Drops this holder's copy of `object`: its acceptor, its routing entry, its lease-gate record, a green's
 /// replica, and the content it held for the object (AUD-29-43: a stale copy's bytes are reclaimed with its
-/// records, never kept for a head this holder no longer backs). Counted [`TAKEOVER_RECLAIMED`].
-fn reclaim(state: &mut ShardState, object: ObjectId) {
+/// records, never kept for a head this holder no longer backs). A takeover's reclaim and a planned move's (A-291,
+/// `crate::moves::follow_moved_objects`) both end a copy so.
+pub(crate) fn drop_copy(state: &mut ShardState, object: ObjectId) {
   state.holder_records.remove(&object);
   state.held_content.forget_object(
     &mut crate::content_holder::hold_space(&mut state.store),
@@ -288,8 +298,6 @@ fn reclaim(state: &mut ShardState, object: ObjectId) {
   state.fleet.forget_object(object);
   state.departed_owners.remove(&object);
   state.merge.replicas.remove(&object);
-  let count = state.refusals.entry(TAKEOVER_RECLAIMED).or_insert(0);
-  *count = count.saturating_add(1);
 }
 
 /// Answers one page of a successor's takeover round on [`TAKEOVER_STREAM`] (§4.8): after checking the asker is
@@ -564,7 +572,13 @@ async fn drive_host_takeover(
   }
   let ready = state::with_state(|s| ready_objects(s, departed, local)).unwrap_or_default();
   for (object, adopted) in ready {
-    dispatches.extend(adopt(departed, object, adopted, local, budget).await);
+    let Some(epoch) =
+      state::with_state(|s| s.host_takeovers.get(&departed).map(|take| take.epoch)).flatten()
+    else {
+      continue;
+    };
+    let (dispatch, _) = adopt_at(departed, object, adopted, epoch, local, budget).await;
+    dispatches.extend(dispatch);
   }
   let done = state::with_state(|s| round_done(s, departed, local)).unwrap_or(false);
   if done {
@@ -1046,18 +1060,21 @@ fn newest_of(best: Accepted, next: Accepted) -> Accepted {
 }
 
 /// Adopts `object` (§4.8 "completes safe adoption under the new epoch"): re-commits the newest reported record
-/// under this node's own placement of it at the round's epoch, through the object's acceptor here (created
+/// under this node's own placement of it at the round's `epoch`, through the object's acceptor here (created
 /// under this node's authority when it held nothing). Once placed, this node owns the object: it is tracked as
 /// its own, its placement recorded, its lease-gate record dropped, and its content or green queued to be
-/// served. Short of placement it stays learned and is adopted again next period.
-async fn adopt(
+/// served. Short of placement it stays learned and is adopted again next period. Returns the dispatch to settle and
+/// whether the record was placed. `departed` names the takeover round the object was learned in; a moved volume's
+/// adoption (A-291, `crate::moves`) names this node itself, which no takeover round is kept for.
+pub(crate) async fn adopt_at(
   departed: HostId,
   object: ObjectId,
   adopted: Accepted,
+  epoch: HostEpoch,
   local: HostId,
   budget: CommitBudget,
-) -> Option<Dispatch> {
-  let (mut acceptor, shape, quorum, record) = state::with_state(|s| {
+) -> (Option<Dispatch>, bool) {
+  let Some((mut acceptor, shape, quorum, record)) = state::with_state(|s| {
     let config = s.fleet.configuration();
     let generation = config.version;
     let quorum = config.quorum;
@@ -1065,7 +1082,6 @@ async fn adopt(
       acked: Vec::new(),
       ..config.place(object)
     };
-    let epoch = s.host_takeovers.get(&departed)?.epoch;
     let mut acceptor = s.holder_records.remove(&object).unwrap_or_else(|| {
       Acceptor::new(
         local,
@@ -1087,9 +1103,10 @@ async fn adopt(
       generation,
       value: adopted.value,
     };
-    Some((acceptor, shape, quorum, record))
-  })
-  .flatten()?;
+    (acceptor, shape, quorum, record)
+  }) else {
+    return (None, false);
+  };
   let holders = take_sessions("fleet.lent_to.adopt", |host| {
     host != local && shape.candidates.contains(&host)
   });
@@ -1144,6 +1161,7 @@ async fn adopt(
     Ok(_) | Err(ClusterError::Uncertain { .. } | ClusterError::NotPlaced { .. }) => None,
     Err(_) => None,
   };
+  let placed = placement.is_some();
   state::with_state(|s| {
     s.holder_records.insert(object, acceptor);
     if let Some(placement) = placement {
@@ -1153,7 +1171,7 @@ async fn adopt(
       s.count(unplaced_cause, 1);
     }
   });
-  Some(dispatch)
+  (Some(dispatch), placed)
 }
 
 /// Records `object` adopted by this node: tracked as its own, its placement kept at the adoption's sequence

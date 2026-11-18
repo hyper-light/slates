@@ -1676,6 +1676,15 @@ async fn serve_peer_records(
             crate::takeover::serve_host_prepare(s, local, peer_host, &request)
           })
           .unwrap_or_default(),
+          // A moved volume's new owner asks its cohort by name (A-291).
+          crate::moves::MOVE_STREAM => state::with_state(|s| {
+            let peer_host = s
+              .learned_members
+              .get(&peer_anchor)
+              .map_or(seed, |learned| learned.host);
+            crate::moves::serve_move_prepare(s, local, peer_host, &request)
+          })
+          .unwrap_or_default(),
           stream if is_content_stream(stream) => state::with_state(|s| {
             let peer_host = s
               .learned_members
@@ -3858,6 +3867,9 @@ async fn adopt_and_serve(
   in_flight: &mut Vec<Dispatch>,
 ) {
   in_flight.extend(crate::takeover::drive_takeovers(local, budget).await);
+  // Each volume the configuration moved to this node: phase one over its recorded cohort, adoption, then its seal and
+  // the report that it is adopted (A-291).
+  crate::moves::drive_adoptions(origin, local, budget, in_flight).await;
   in_flight.extend(crate::mirror::drive_promotion(local, budget).await);
   crate::mirror::adopt_assigned(local, budget, in_flight).await;
   materialize_adopted_objects(origin, local, budget).await;
@@ -7627,6 +7639,10 @@ async fn follow_configuration(
   // period so a dispatch a full control channel refused self-heals; the receiving install/adopt are
   // version-gated, so an unchanged configuration is a no-op there (see `fan_configs_to_shards`).
   fan_configs_to_shards(origin, shards);
+  // Planned moves (A-291): each move this node's shards began is reported until the switch, routed to its new owner
+  // from then on, and released once adopted; a destroyed moved volume's exception is reported forgotten.
+  crate::moves::drive_outgoing(origin, local, owner_acceptor, budget, in_flight).await;
+  crate::moves::report_forgotten(local, budget, in_flight).await;
   // Report this node's neighbourhood change placed once every shard holds all it owns at `f + 1` of each
   // cohort of its current placement, so the council retires the old set (§4.8 "Neighbourhood changes").
   report_settlement(origin, shards, local, budget, in_flight).await;
@@ -8046,6 +8062,8 @@ async fn retire_shard_tombstones(
   for object in retired {
     owner_acceptor.forget_object(object);
     owner_acceptor.forget_object(object.catalog());
+    // A destroyed volume this node owned under a moved-object exception: the exception goes with it (A-291).
+    let _ = state::with_state(|s| crate::moves::note_destroyed(s, object, local));
     // The routing forgets the volume too, as a holder's does when it accepts the retirement (`tombstone::on_held`).
     // A successor that took a destroyed volume over tracks itself its owner (`takeover::record_adoption`); kept after
     // the retirement, it answered every verb on the volume `Overloaded` as an owned volume not yet materialized, for

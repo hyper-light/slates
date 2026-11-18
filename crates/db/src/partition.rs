@@ -517,6 +517,16 @@ impl Partition {
     self.lineage.get(&child.bytes)
   }
 
+  /// Whether a volume of this partition is a clone of `origin` (its lineage edge names it): a clone shares its origin's
+  /// records here, so the origin cannot leave this node while one stands (A-291). A scan bounded by the partition's
+  /// volume cap.
+  pub fn has_clones(&self, origin: VolumeId) -> bool {
+    self
+      .lineage
+      .iter()
+      .any(|(_, edge)| edge.origin_volume == origin)
+  }
+
   /// The volume a principal holds a lease on.
   pub fn lease_of(&self, holder: &Principal) -> Option<VolumeId> {
     self.leases_by_holder.get(&holder.key()).copied()
@@ -928,6 +938,17 @@ impl Partition {
             table: "tombstone sequence",
           })
       }
+      // A moved volume leaves only as a whole record (A-291): no attachment of it may be left behind to name it.
+      Op::VolumeReleased { id } => {
+        self.volume(*id).ok_or(DbError::NotFound)?;
+        let attachments = self.attachments_of(*id).len();
+        if attachments > 0 {
+          return Err(DbError::Attached {
+            attachments: u32::try_from(attachments).unwrap_or(u32::MAX),
+          });
+        }
+        Ok(())
+      }
       Op::TombstoneAdopted { tombstone } => {
         if self.volume(tombstone.volume).is_some()
           || self.tombstones.contains_key(&tombstone.volume)
@@ -1289,6 +1310,25 @@ impl Partition {
         self.seal_keys.remove(&SealKeyOwner::Naming { volume: *id });
         // A tenant key wraps only its volumes' lineage keys, so with the tenant's last volume on this partition it is
         // erased too, in the same record. The scan is bounded by the partition's volume cap, once per destroy.
+        if let Some(account) = tenant
+          && !self
+            .volumes()
+            .iter()
+            .any(|volume| volume.owner.tenant() == account)
+        {
+          self.seal_keys.remove(&SealKeyOwner::Tenant { account });
+        }
+        Ok(())
+      }
+      Op::VolumeReleased { id } => {
+        // As a destroy's apply, but no tombstone: the volume's registers are the member's it moved to (A-291), and this
+        // node's copies of its keys go with its record, its new owner holding its own.
+        let tenant = self.volume(*id).map(|volume| volume.owner.tenant());
+        self.remove_volume(*id)?;
+        self
+          .seal_keys
+          .remove(&SealKeyOwner::Lineage { volume: *id });
+        self.seal_keys.remove(&SealKeyOwner::Naming { volume: *id });
         if let Some(account) = tenant
           && !self
             .volumes()

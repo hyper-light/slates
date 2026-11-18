@@ -512,6 +512,14 @@ pub(crate) enum Verb {
     /// Whether it is live-shipped from now on.
     live_shipped: bool,
   },
+  /// Move a volume to another fleet member (`move ID --to HOST`, §4.10, A-291): asks its owner until the configuration
+  /// names the member.
+  Move {
+    /// The volume.
+    volume: slates_client::VolumeId,
+    /// The member's host id, as `status` names the members.
+    to: u64,
+  },
 }
 
 /// A principal as `share` names it: a host account (`uid:N`), or a consumer — under the caller's own
@@ -1314,9 +1322,31 @@ fn parse_enrollment(taken: &Taken, words: &[&str]) -> Result<Option<Command>, Pa
         },
       )))
     }
+    ["move", id] => {
+      taken.only(&Spec {
+        values: &["--to"],
+        switches: &[],
+      })?;
+      let to = taken
+        .value("--to")
+        .ok_or(ParseError::Missing("move ID --to HOST"))?
+        .parse::<u64>()
+        .map_err(|e| ParseError::BadValue {
+          what: "--to",
+          reason: e.to_string(),
+        })?;
+      Ok(Some(client(
+        taken,
+        Verb::Move {
+          volume: volume(id)?,
+          to,
+        },
+      )))
+    }
     ["revoke"] => Err(ParseError::Missing("CONSUMER")),
     ["share", ..] => Err(ParseError::Missing("share ID PRINCIPAL")),
     ["live-ship", ..] => Err(ParseError::Missing("live-ship ID")),
+    ["move", ..] => Err(ParseError::Missing("move ID --to HOST")),
     _ => Ok(None),
   }
 }

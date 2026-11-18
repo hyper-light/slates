@@ -726,6 +726,21 @@ fn mapped_access_refused(call: &'static str, error: &slates_mem::MemError) -> Cl
   })
 }
 
+/// Where a volume's move stands after one ask ([`Client::move_volume`], A-291).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveState {
+  /// Under way: frozen, waiting for its records' placement or for the configuration to name its new owner.
+  Moving {
+    /// The member it moves to.
+    to: u64,
+  },
+  /// Done: the configuration names its new owner, where its verbs go now.
+  Moved {
+    /// The member it moved to.
+    to: u64,
+  },
+}
+
 /// Maps a decoded reply body to a result: a refusal becomes the typed error, any other body passes
 /// through — the same rule [`Client::exchange`] applies to a synchronous reply.
 fn resolved(body: ReplyBody) -> Result<ReplyBody, ClientError> {
@@ -3979,6 +3994,18 @@ impl Client {
     })? {
       ReplyBody::LiveShippingSet { live_shipped } => Ok(live_shipped),
       _ => Err(ClientError::UnexpectedReply { verb: "live-ship" }),
+    }
+  }
+
+  /// Asks the owner to move `volume` to the fleet member `to` (§4.10 "Ownership follows the writer", A-291; `admin` on
+  /// the volume is required, and it must be a plain volume with no attachment, clone, lineage or snapshot but its
+  /// head). One ask: the move goes on between asks, and the caller asks again until it is done ([`MoveState::Moved`]).
+  /// A volume that cannot move is refused `Refusal::MoveRefused`, its `MoveRefusal` saying why.
+  pub fn move_volume(&mut self, volume: VolumeId, to: u64) -> Result<MoveState, ClientError> {
+    match self.call(&RequestBody::Move { volume, to })? {
+      ReplyBody::Moving { to } => Ok(MoveState::Moving { to }),
+      ReplyBody::Moved { to } => Ok(MoveState::Moved { to }),
+      _ => Err(ClientError::UnexpectedReply { verb: "move" }),
     }
   }
 

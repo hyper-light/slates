@@ -1682,6 +1682,21 @@ impl Acceptor {
       .map(|(&(_, sequence), (_, value))| (sequence, value.as_slice()))
   }
 
+  /// The highest record this acceptor holds of `object` as phase one reports it ([`Accepted`]: its position, the epoch it
+  /// was accepted at and its value), or `None` when it holds none. What the member a move left answers for its own
+  /// object from its owner's acceptor (A-291).
+  pub fn highest_accepted(&self, object: ObjectId) -> Option<Accepted> {
+    self
+      .accepted
+      .range((object, 0)..=(object, u64::MAX))
+      .next_back()
+      .map(|(&(_, sequence), (epoch, value))| Accepted {
+        sequence,
+        epoch: *epoch,
+        value: value.clone(),
+      })
+  }
+
   /// The value accepted for `object` at `sequence`, if this acceptor holds that position: one lookup, where
   /// [`Acceptor::values`] walks every position the object holds.
   pub fn value_at(&self, object: ObjectId, sequence: u64) -> Option<&[u8]> {
@@ -2359,21 +2374,34 @@ pub struct RegionalConfiguration {
   /// unrelated volumes"; §4.10 "operators keep an explicit move"), keyed by the object's placement key, so every register
   /// class of a volume moves as one ([`ObjectId::placement_key`]). Moved objects only: an object absent here is owned
   /// along its creator's line ([`owner_of`](RegionalConfiguration::owner_of)). An entry is made by its owner's move
-  /// ([`move_object`](RegionalConfiguration::move_object)), follows its owner's takeover at the successor's
-  /// confirmation, and is dropped when the object moves back to its creator or its owner reports it destroyed
-  /// ([`forget_moved`](RegionalConfiguration::forget_moved)), so it holds only live moved objects; a move past the
-  /// bound its proposer derives is refused before it is proposed.
+  /// ([`move_object`](RegionalConfiguration::move_object)), a move back to its creator included (the creator released
+  /// its copy when the object left, so it adopts the object back as any member does, A-291), follows its owner's
+  /// takeover at the successor's confirmation, and is dropped when that successor is the creator or its owner reports
+  /// it destroyed ([`forget_moved`](RegionalConfiguration::forget_moved)), so it holds only live moved objects; a move
+  /// past the bound its proposer derives is refused before it is proposed.
   pub moved: std::collections::BTreeMap<ObjectId, Moved>,
 }
 
 /// One object's explicit move off its creator's line ([`RegionalConfiguration::moved`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Moved {
   /// The member the object moved to: its owner from then on, and the host its line starts from when that member
   /// retires.
   pub owner: HostId,
   /// The configuration version the move committed at: the object's ownership generation (§4.8 "Authority scope").
   pub version: u64,
+  /// The member an explicit move took the object from, its owner until the move (A-291). The new owner adopts the
+  /// object by phase one over its cohort without counting it: it released its copy at the switch, and its own
+  /// acknowledgement may be one of the `f + 1` that placed the newest records, so its answer could say nothing of a
+  /// record the others hold. `None` when the exception followed a takeover, whose successor adopted the object in the
+  /// takeover's own round. Cleared once the new owner reports the object adopted
+  /// ([`adopt_move`](RegionalConfiguration::adopt_move)), which is when the member it left lets its copy go.
+  pub from: Option<HostId>,
+  /// The cohort the move's records were placed in: the candidates the member it left held the object's head and
+  /// catalog at `f + 1` of when it reported the move, itself among them (A-291). The new owner's phase one asks these
+  /// hosts by name and counts them, whatever its own placement of the object is, so the two need not be one set. In id
+  /// order; empty once `from` is.
+  pub cohort: Vec<HostId>,
 }
 
 /// One promoted object's adoption in the mirror region (`docs/wip/mirroring.md` decision 4): the member that adopts it,
@@ -2751,21 +2779,64 @@ impl RegionalConfiguration {
     }
   }
 
-  /// Moves `object` from its owner `from` to the member `to`, as [`moves`](RegionalConfiguration::moves) allows: its
-  /// exception names `to` at the new version, its ownership generation; or it is dropped when `to` is the object's
-  /// creator, whose line the object is back on. Advances the version. Returns whether the configuration changed.
-  pub fn move_object(&mut self, object: ObjectId, from: HostId, to: HostId) -> bool {
-    if !self.moves(object, from, to) {
+  /// Moves `object` from its owner `from` to the member `to`, as [`moves`](RegionalConfiguration::moves) allows, its
+  /// records placed at `f + 1` of `cohort`: its exception names `to` at the new version, its ownership generation,
+  /// `from`, the owner the move took it from, and `cohort`, where `to`'s phase one finds the records. A move back to the
+  /// creator keeps an exception too (A-291): the creator released its copy when the object left, and adopts it back by
+  /// the same round any member does, which an exception names (an object absent from the exceptions is its creator's
+  /// without one). Refused with an empty cohort or one without `from` (the owner is among its own candidates).
+  /// Advances the version. Returns whether the configuration changed.
+  pub fn move_object(
+    &mut self,
+    object: ObjectId,
+    from: HostId,
+    to: HostId,
+    cohort: &[HostId],
+  ) -> bool {
+    if !self.moves(object, from, to) || !cohort.contains(&from) {
       return false;
     }
     let Some(version) = self.version.checked_add(1) else {
       return false;
     };
-    let key = object.placement_key();
-    if to == key.creator() {
-      self.moved.remove(&key);
-    } else {
-      self.moved.insert(key, Moved { owner: to, version });
+    let mut cohort = cohort.to_vec();
+    cohort.sort_unstable_by_key(|host| host.0);
+    cohort.dedup();
+    self.moved.insert(
+      object.placement_key(),
+      Moved {
+        owner: to,
+        version,
+        from: Some(from),
+        cohort,
+      },
+    );
+    self.version = version;
+    true
+  }
+
+  /// Whether `owner` may report `object`'s move adopted: the object's exception names `owner` and still names the
+  /// member the move took it from (A-291).
+  pub fn adopts_move(&self, object: ObjectId, owner: HostId) -> bool {
+    self
+      .moved
+      .get(&object.placement_key())
+      .is_some_and(|moved| moved.owner == owner && moved.from.is_some())
+  }
+
+  /// Records `object`'s move adopted by its new owner `owner` (A-291): the exception keeps its owner and drops the
+  /// member it left and the move's cohort, which is that member's word to let its copy go, and no round is owed any
+  /// more. The ownership generation is unchanged. Advances the version. Returns whether the configuration changed.
+  pub fn adopt_move(&mut self, object: ObjectId, owner: HostId) -> bool {
+    if !self.adopts_move(object, owner) {
+      return false;
+    }
+    let Some(version) = self.version.checked_add(1) else {
+      return false;
+    };
+    if let Some(moved) = self.moved.get_mut(&object.placement_key()) {
+      moved.from = None;
+      moved.cohort = Vec::new();
     }
     self.version = version;
     true
@@ -2819,6 +2890,8 @@ impl RegionalConfiguration {
           Moved {
             owner: successor,
             version,
+            from: None,
+            cohort: Vec::new(),
           },
         );
       }
@@ -4400,25 +4473,39 @@ mod tests {
   /// §4.8 "Authority scope" and "Lookup", §4.10 "operators keep an explicit move" (T-8.14's configuration half). Do: in
   /// a five-member region, move host 1's object to host 2, then try every move that is not its owner's; move it on to
   /// host 3; move it back to its creator. Expect each owner's move to change the configuration once, the exception to
-  /// name the owner at the move's version, every other move refused (not the owner, to itself, to a non-member), and
-  /// the move back to the creator to drop the exception; the object's catalog register moves with it, and an unrelated
-  /// object of host 1 never does.
+  /// name the owner at the move's version and the member the move took it from, every other move refused (not the
+  /// owner, to itself, to a non-member), and the move back to the creator to keep an exception naming the creator and
+  /// host 3 (A-291: the creator released its copy and adopts it back as any member does); the object's catalog register
+  /// moves with it, and an unrelated object of host 1 never does.
   #[test]
   fn a_move_names_the_objects_owner_and_only_its_owner_moves_it() {
     let (mut regional, _) = wide_region();
     let (creator, b, c) = (HostId(1), HostId(2), HostId(3));
     let object = ObjectId::new(creator, 7);
     let unrelated = ObjectId::new(creator, 8);
+    // The cohorts the records sit in, each mover among its own (given out of order: the exception keeps id order).
+    let (creators_cohort, bs_cohort, cs_cohort) = (
+      [HostId(4), creator, HostId(3)],
+      [b, HostId(5), HostId(4)],
+      [c, HostId(1), HostId(2)],
+    );
     assert_eq!(regional.owner_of(object), Some(creator));
 
     let before = regional.version;
-    assert!(regional.move_object(object, creator, b));
+    assert!(
+      !regional.move_object(object, creator, b, &[b, HostId(4)]),
+      "a cohort without the mover is no placement of its records"
+    );
+    assert!(!regional.move_object(object, creator, b, &[]));
+    assert!(regional.move_object(object, creator, b, &creators_cohort));
     assert_eq!(regional.version, before + 1);
     assert_eq!(
       regional.moved.get(&object),
       Some(&Moved {
         owner: b,
-        version: before + 1
+        version: before + 1,
+        from: Some(creator),
+        cohort: vec![creator, HostId(3), HostId(4)],
       })
     );
     assert_eq!(regional.owner_of(object), Some(b));
@@ -4434,24 +4521,78 @@ mod tests {
     );
 
     assert!(
-      !regional.move_object(object, creator, c),
+      !regional.move_object(object, creator, c, &creators_cohort),
       "the old owner no longer moves it"
     );
-    assert!(!regional.move_object(object, b, b), "not to its own owner");
     assert!(
-      !regional.move_object(object, b, HostId(9)),
+      !regional.move_object(object, b, b, &bs_cohort),
+      "not to its own owner"
+    );
+    assert!(
+      !regional.move_object(object, b, HostId(9), &bs_cohort),
       "not to a non-member"
     );
     assert_eq!(regional.version, before + 1, "refused moves change nothing");
 
-    assert!(regional.move_object(object, b, c));
+    assert!(regional.move_object(object, b, c, &bs_cohort));
     assert_eq!(regional.owner_of(object), Some(c));
-    assert!(regional.move_object(object, c, creator));
-    assert!(
-      !regional.moved.contains_key(&object),
-      "back on its creator's line, with no exception"
+    assert!(regional.move_object(object, c, creator, &cs_cohort));
+    assert_eq!(
+      regional.moved.get(&object),
+      Some(&Moved {
+        owner: creator,
+        version: before + 3,
+        from: Some(c),
+        cohort: vec![creator, b, c],
+      }),
+      "back with its creator under an exception the creator's adoption follows"
     );
     assert_eq!(regional.owner_of(object), Some(creator));
+    assert!(
+      !regional.move_object(object, c, b, &cs_cohort),
+      "the member it left moves it no more"
+    );
+  }
+
+  /// A-291 (§4.10 "Ownership follows the writer": "the new owner runs phase one"). Do: move host 1's object to host 2;
+  /// report it adopted from host 3, then from host 2, then again from host 2; then move it on to host 3 and report that
+  /// move adopted. Expect only the owner's first report to change the configuration: the exception keeps its owner and
+  /// ownership generation and drops the member the move left and the move's cohort, which is that member's word to let
+  /// its copy go, and a second report changes nothing; each move owes its own adoption.
+  #[test]
+  fn a_moves_adoption_is_reported_by_its_new_owner_and_lets_the_member_it_left_go() {
+    let (mut regional, _) = wide_region();
+    let (creator, b, c) = (HostId(1), HostId(2), HostId(3));
+    let object = ObjectId::new(creator, 7);
+    assert!(regional.move_object(object, creator, b, &[creator, c, HostId(4)]));
+    let moved_at = regional.version;
+    assert!(!regional.adopt_move(object, c), "only its owner adopts it");
+    assert_eq!(regional.version, moved_at);
+    assert!(regional.adopts_move(object, b));
+    assert!(regional.adopt_move(object, b));
+    assert_eq!(
+      regional.moved.get(&object),
+      Some(&Moved {
+        owner: b,
+        version: moved_at,
+        from: None,
+        cohort: Vec::new(),
+      }),
+      "adopted: the owner and its generation kept, the member it left let go"
+    );
+    assert_eq!(regional.version, moved_at + 1);
+    assert!(
+      !regional.adopt_move(object, b),
+      "an adopted move is adopted once"
+    );
+    assert_eq!(regional.owner_of(object), Some(b));
+    assert!(regional.move_object(object, b, c, &[b, HostId(4), HostId(5)]));
+    assert!(
+      regional.adopts_move(object, c),
+      "the next move owes its own"
+    );
+    assert!(regional.adopt_move(object, c));
+    assert_eq!(regional.owner_of(object), Some(c));
   }
 
   /// §4.8 "Authority scope" with "Promotion and takeover". Do: move host 1's object to host 2; take host 2 over;
@@ -4464,7 +4605,7 @@ mod tests {
     let (mut regional, scatter) = wide_region();
     let (creator, b) = (HostId(1), HostId(2));
     let object = ObjectId::new(creator, 7);
-    assert!(regional.move_object(object, creator, b));
+    assert!(regional.move_object(object, creator, b, &[creator]));
     regional.take_over(b, scatter);
     let Lineage::Successor { successor, .. } = regional.lineage(b, object) else {
       panic!("a takeover with survivors names a successor");
@@ -4478,9 +4619,12 @@ mod tests {
       "the retirement is dropped"
     );
     assert_eq!(
-      regional.moved.get(&object).map(|moved| moved.owner),
-      Some(successor),
-      "the exception followed the takeover"
+      regional
+        .moved
+        .get(&object)
+        .map(|moved| (moved.owner, moved.from)),
+      Some((successor, None)),
+      "the exception followed the takeover, whose own round adopted the object (no move's round owed)"
     );
     assert_eq!(regional.owner_of(object), Some(successor));
 
@@ -4516,7 +4660,7 @@ mod tests {
     let (creator, moved_to) = (HostId(1), HostId(2));
     let objects: Vec<ObjectId> = (0..64).map(|index| ObjectId::new(creator, index)).collect();
     for object in &objects {
-      assert!(regional.move_object(*object, creator, moved_to));
+      assert!(regional.move_object(*object, creator, moved_to, &[creator]));
     }
     regional.take_over(moved_to, scatter);
     let successor_of = |regional: &RegionalConfiguration, object: ObjectId| match regional
@@ -4609,7 +4753,7 @@ mod tests {
       !regional.moves(object, successor, successor),
       "not to itself"
     );
-    assert!(regional.move_object(object, successor, to));
+    assert!(regional.move_object(object, successor, to, &[successor]));
     assert_eq!(regional.owner_of(object), Some(to));
     assert!(
       !regional.moves(object, successor, departed),

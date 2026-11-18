@@ -288,6 +288,93 @@ pub fn answer_by_name(
   answer
 }
 
+/// `holder`'s answer to a moved object's new owner (§4.10 "Ownership follows the writer", A-291: "the new owner runs
+/// phase one"), each object `prepare` names answered alone, as [`answer_by_name`] answers a takeover's successor. The
+/// question rides its own stream and carries the asker as its `departed` (a move retires no one). What authorizes it is
+/// the committed configuration alone: the object's moved-object exception names the asker its owner and still names the
+/// member the move took it from ([`RegionalConfiguration::moved`]), so a holder never installs the asker over an
+/// object that was not moved to it, whatever the copy's authority names, and answers no round once the move is adopted.
+/// A held copy is promised as a takeover's is ([`promise_object`]: the asker's authority installed, the fence raised to
+/// the round's epoch, the highest record reported); none held is said for that object alone. The member the move left
+/// answers from `own`, the newest records it wrote as the object's owner (it froze the object before it reported the
+/// move, so they are the newest there are, and it writes no more), so the round counts it truthfully: it may be one of
+/// the `f + 1` that placed them. The answer stops before `budget` bytes, at least one object answered.
+pub fn answer_move(
+  holder: HostId,
+  prepare: &HostPrepare,
+  regional: &RegionalConfiguration,
+  acceptors: &mut impl AcceptorStore,
+  own: &BTreeMap<ObjectId, Accepted>,
+  budget: usize,
+) -> NamedAnswer {
+  let mut answer = NamedAnswer {
+    promise: HostPromise {
+      holder,
+      departed: prepare.departed,
+      epoch: prepare.epoch,
+      generation: prepare.generation,
+      entries: Vec::new(),
+      next: None,
+      fenced: None,
+      unpromised: 0,
+      nothing: Vec::new(),
+    },
+    refused: 0,
+  };
+  let mut used = crate::register::HOST_PROMISE_HEADER_BYTES
+    .saturating_add(crate::register::OBJECT_LIST_HEADER_BYTES);
+  for object in &prepare.named {
+    let moved = regional.moved.get(&object.placement_key());
+    let moved_to_asker = moved.is_some_and(|moved| moved.from.is_some())
+      && regional.owner_of(*object) == Some(prepare.owner);
+    if !moved_to_asker || prepare.departed != prepare.owner {
+      answer.refused = answer.refused.saturating_add(1);
+      continue;
+    }
+    let left_by_holder = moved.is_some_and(|moved| moved.from == Some(holder));
+    if let Some(written) = own.get(object).filter(|_| left_by_holder) {
+      let size = HostPromise::entry_bytes(written);
+      if used.saturating_add(size) > budget && answered(&answer.promise) {
+        break;
+      }
+      used = used.saturating_add(size);
+      answer.promise.entries.push((*object, written.clone()));
+      continue;
+    }
+    let Some(acceptor) = acceptors.acceptor_mut(object) else {
+      if used.saturating_add(OBJECT_BYTES) > budget && answered(&answer.promise) {
+        break;
+      }
+      used = used.saturating_add(OBJECT_BYTES);
+      answer.promise.nothing.push(*object);
+      continue;
+    };
+    match promise_object(acceptor, *object, prepare, false) {
+      Ok(Some(highest)) => {
+        let size = HostPromise::entry_bytes(&highest);
+        if used.saturating_add(size) > budget && answered(&answer.promise) {
+          break;
+        }
+        used = used.saturating_add(size);
+        answer.promise.entries.push((*object, highest));
+      }
+      Ok(None) => {
+        if used.saturating_add(OBJECT_BYTES) > budget && answered(&answer.promise) {
+          break;
+        }
+        used = used.saturating_add(OBJECT_BYTES);
+        answer.promise.nothing.push(*object);
+      }
+      Err(RegisterError::StaleEpoch { current }) => {
+        let fence = HostEpoch(current);
+        answer.promise.fenced = Some(answer.promise.fenced.map_or(fence, |seen| seen.max(fence)));
+      }
+      Err(_) => answer.promise.unpromised = answer.promise.unpromised.saturating_add(1),
+    }
+  }
+  answer
+}
+
 /// Whether `promise` has answered any object yet, so a budget never leaves a question with no answer at all.
 fn answered(promise: &HostPromise) -> bool {
   !promise.entries.is_empty() || !promise.nothing.is_empty()
@@ -494,6 +581,123 @@ mod tests {
       !falls_to(&regional, departed, object, departed, successor),
       "the new successor's own round, not the first host's, even though it is the successor named"
     );
+  }
+
+  /// A-291 (§4.10 "Ownership follows the writer"), the holder's half of a moved object's phase one. Do: in a five-member
+  /// region move host 1's object to host 2; ask a holder of its copy (under host 1's authority) and of its catalog
+  /// register (held nowhere) as host 2 at an epoch above the copy's; then as host 3; then ask about an object that never
+  /// moved; then ask as host 2 again at the copy's own epoch; then ask host 1, the member the move left, which holds no
+  /// copy but its own records, and ask a holder that holds the same records as its own (no one else may answer from
+  /// them); then report the move adopted and ask again. Expect host 2's question answered with the copy's record and
+  /// the catalog's nothing, the copy's authority now host 2's and its fence at the epoch, so host 1's next record is
+  /// refused; host 3's question refused for both, the copy untouched; the unmoved object refused; the lower epoch
+  /// answered with the fence it must exceed; host 1 answering its own newest records, the head's and the catalog's,
+  /// where it has no acceptor to say it holds nothing; the other holder's own records ignored; and an adopted move
+  /// answered by no one.
+  #[test]
+  fn a_holder_promises_a_moved_object_only_to_the_owner_the_configuration_moved_it_to() {
+    let mut regional = RegionalConfiguration::formed(
+      (1..=5).map(HostId).collect(),
+      Quorum { f: 1 },
+      BTreeMap::new(),
+      3,
+      false,
+    );
+    let (from, to, other, holder) = (HostId(1), HostId(2), HostId(3), HostId(4));
+    let object = ObjectId::new(from, 7);
+    let unmoved = ObjectId::new(from, 8);
+    assert!(regional.move_object(object, from, to, &[from, holder, HostId(5)]));
+    let generation = regional.version;
+    let mut acceptors = BTreeMap::from([
+      (
+        object,
+        acceptor(holder, from, generation, Some((object, 3))),
+      ),
+      (
+        unmoved,
+        acceptor(holder, from, generation, Some((unmoved, 3))),
+      ),
+    ]);
+    let none = BTreeMap::new();
+    let prepare = |owner: HostId, epoch: u64, named: Vec<ObjectId>| HostPrepare {
+      departed: owner,
+      owner,
+      epoch: HostEpoch(epoch),
+      generation,
+      after: None,
+      named,
+    };
+    let asked = prepare(other, 5, vec![object, object.catalog()]);
+    let refused = answer_move(holder, &asked, &regional, &mut acceptors, &none, usize::MAX);
+    assert_eq!(refused.refused, 2, "the configuration moved it to another");
+    assert_eq!(acceptors[&object].owner(), from, "the copy is untouched");
+
+    let asked = prepare(to, 5, vec![object, object.catalog()]);
+    let answer = answer_move(holder, &asked, &regional, &mut acceptors, &none, usize::MAX);
+    assert_eq!(answer.refused, 0);
+    assert_eq!(answer.promise.entries.len(), 1);
+    assert_eq!(answer.promise.entries[0].0, object);
+    assert_eq!(answer.promise.entries[0].1.sequence, 3);
+    assert_eq!(answer.promise.nothing, vec![object.catalog()]);
+    assert_eq!(acceptors[&object].owner(), to, "the new owner's authority");
+    let stale = crate::register::Record {
+      owner: from,
+      object,
+      sequence: 4,
+      epoch: HostEpoch(1),
+      generation,
+      value: b"late".to_vec(),
+    };
+    assert!(
+      acceptors.get_mut(&object).unwrap().accept(&stale).is_err(),
+      "the old owner's next record is refused"
+    );
+
+    let asked = prepare(to, 5, vec![unmoved]);
+    let answer = answer_move(holder, &asked, &regional, &mut acceptors, &none, usize::MAX);
+    assert_eq!(answer.refused, 1, "an object that never moved");
+    assert_eq!(acceptors[&unmoved].owner(), from);
+
+    let asked = prepare(to, 4, vec![object]);
+    let answer = answer_move(holder, &asked, &regional, &mut acceptors, &none, usize::MAX);
+    assert_eq!(
+      answer.promise.fenced,
+      Some(HostEpoch(5)),
+      "a round below the fence is told the fence"
+    );
+    assert!(answer.promise.entries.is_empty());
+
+    // The member the move left keeps no copy of its own object, only the records it wrote as its owner.
+    let written = |sequence: u64| Accepted {
+      sequence,
+      epoch: HostEpoch(2),
+      value: b"the owner's own".to_vec(),
+    };
+    let own = BTreeMap::from([(object, written(4)), (object.catalog(), written(2))]);
+    let mut nothing_held: BTreeMap<ObjectId, Acceptor> = BTreeMap::new();
+    let asked = prepare(to, 6, vec![object, object.catalog()]);
+    let answer = answer_move(from, &asked, &regional, &mut nothing_held, &own, usize::MAX);
+    assert_eq!(answer.refused, 0);
+    assert_eq!(
+      answer.promise.entries,
+      vec![(object, written(4)), (object.catalog(), written(2))],
+      "the member it left answers its own newest records, never that it holds nothing"
+    );
+    assert!(answer.promise.nothing.is_empty());
+    let answer = answer_move(holder, &asked, &regional, &mut acceptors, &own, usize::MAX);
+    assert_eq!(
+      answer.promise.entries,
+      vec![(object, acceptors[&object].highest_accepted(object).unwrap())],
+      "a holder answers from its copy, whatever records it is handed as the owner's"
+    );
+
+    assert!(regional.adopt_move(object, to));
+    let asked = HostPrepare {
+      generation: regional.version,
+      ..prepare(to, 7, vec![object])
+    };
+    let answer = answer_move(from, &asked, &regional, &mut nothing_held, &own, usize::MAX);
+    assert_eq!(answer.refused, 1, "an adopted move owes no round");
   }
 
   /// A-251's persisted field, as the supervisor bounded it: an install records the owner it moved the authority from only

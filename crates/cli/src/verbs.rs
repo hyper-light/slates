@@ -901,6 +901,29 @@ fn emit_image_merge(
   Ok(())
 }
 
+/// `move ID --to HOST` (§4.10, A-291): one ask of the volume's owner to move it to the member. The move goes on between
+/// asks, so a caller asks again until it is done, as a client of the verb does. Prints `moving HOST` while it is under
+/// way and `moved HOST` once the configuration names the member, or `{ "moved": bool, "to": HOST }`.
+fn emit_moved(
+  client: &mut Client,
+  volume: VolumeId,
+  to: u64,
+  json: bool,
+) -> Result<(), ClientError> {
+  let (moved, to) = match client.move_volume(volume, to)? {
+    slates_client::MoveState::Moving { to } => (false, to),
+    slates_client::MoveState::Moved { to } => (true, to),
+  };
+  if json {
+    slates_machine::out_line!("{}", serde_json::json!({ "moved": moved, "to": to }));
+  } else if moved {
+    slates_machine::out_line!("moved {to}");
+  } else {
+    slates_machine::out_line!("moving {to}");
+  }
+  Ok(())
+}
+
 /// `volume placed`: whether the scope is durable and the mirror's age, as two text lines or a JSON
 /// `{ "placed", "mirror_age_ns" }` (a null `mirror_age_ns` when there is no mirror).
 fn emit_placed(
@@ -1393,6 +1416,7 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
         json,
       );
     }
+    Verb::Move { volume, to } => emit_moved(client, *volume, *to, json)?,
     // Served in `run`, before this: their authority comes from the anchor, not the client.
     Verb::Bootstrap { .. }
     | Verb::RecoveryPlan { .. }

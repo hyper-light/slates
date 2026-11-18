@@ -767,11 +767,19 @@ pub fn encode_regional_configuration(config: &RegionalConfiguration) -> Vec<u8> 
     out.extend_from_slice(&object.0);
     put_u64(&mut out, moved.owner.0);
     put_u64(&mut out, moved.version);
+    // The member a move took it from and the cohort its records sit in (A-291): a flag, then, when it is set, the host
+    // and the cohort's hosts.
+    out.push(u8::from(moved.from.is_some()));
+    if let Some(from) = moved.from {
+      put_u64(&mut out, from.0);
+      encode_hosts(&mut out, &moved.cohort);
+    }
   }
   out
 }
 
-/// Decodes the moved-object exceptions (count, then each `(object, owner, version)`), bounding the count.
+/// Decodes the moved-object exceptions (count, then each `(object, owner, version, from)`, `from` a flag and, when the
+/// flag is set, the host and the move's cohort), bounding every count.
 fn decode_moved(
   bytes: &[u8],
 ) -> Result<(std::collections::BTreeMap<ObjectId, Moved>, &[u8]), RaftWireError> {
@@ -781,11 +789,21 @@ fn decode_moved(
     let (object, tail) = take_object(rest)?;
     let (owner, tail) = take_u64(tail)?;
     let (version, tail) = take_u64(tail)?;
+    let (moved_from, tail) = take_bool(tail)?;
+    let (from, cohort, tail) = if moved_from {
+      let (from, tail) = take_u64(tail)?;
+      let (cohort, tail) = decode_hosts(tail)?;
+      (Some(HostId(from)), cohort, tail)
+    } else {
+      (None, Vec::new(), tail)
+    };
     moved.insert(
       object,
       Moved {
         owner: HostId(owner),
         version,
+        from,
+        cohort,
       },
     );
     rest = tail;
@@ -1810,7 +1828,7 @@ mod tests {
       "round-trip is identity with an adoption in flight"
     );
     // A moved object's exception (§4.8 "Authority scope") survives it too.
-    assert!(config.move_object(ObjectId::new(B, 5), B, HostId(3)));
+    assert!(config.move_object(ObjectId::new(B, 5), B, HostId(3), &[B, A, HostId(3)]));
     assert_eq!(config.moved.len(), 1);
     let bytes = encode_regional_configuration(&config);
     assert_eq!(
@@ -1832,10 +1850,11 @@ mod tests {
       3,
       false,
     );
-    assert!(config.move_object(ObjectId::new(A, 5), A, B));
+    assert!(config.move_object(ObjectId::new(A, 5), A, B, &[A]));
     let bytes = encode_regional_configuration(&config);
-    // The exceptions are last: a count, then one entry of an object id and two words.
-    let entry = OBJECT_BYTES + 2 * size_of::<u64>();
+    // The exceptions are last: a count, then one entry of an object id, two words, the `from` flag, its word and the
+    // cohort (a count and one host).
+    let entry = OBJECT_BYTES + 4 * size_of::<u64>() + 1 + size_of::<u32>();
     let count_at = bytes.len() - entry - size_of::<u32>();
     let mut lying = bytes.clone();
     lying[count_at..count_at + size_of::<u32>()].copy_from_slice(&u32::MAX.to_le_bytes());
@@ -1850,6 +1869,15 @@ mod tests {
         "a configuration cut {cut} bytes short is refused"
       );
     }
+    // The `from` flag is a flag: any other byte is refused by name.
+    let flag_at = bytes.len() - 2 * size_of::<u64>() - size_of::<u32>() - 1;
+    let mut forged = bytes.clone();
+    forged[flag_at] = 2;
+    assert_eq!(
+      decode_regional_configuration(&forged),
+      Err(RaftWireError::BadFlag { flag: 2 }),
+      "a forged `from` flag is refused"
+    );
   }
 
   /// A retirement whose confirmed-host count lies — more ids than the bytes back — is refused before

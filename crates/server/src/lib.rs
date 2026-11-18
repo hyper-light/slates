@@ -79,6 +79,8 @@ mod live_ship;
 mod member_task;
 pub mod merge_service;
 mod mirror;
+/// The planned move of a volume to another fleet member (§4.10, A-291).
+mod moves;
 mod remote_attach;
 #[cfg(target_os = "linux")]
 mod write_log;

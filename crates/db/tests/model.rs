@@ -1831,6 +1831,90 @@ fn a_tenants_key_is_erased_with_its_last_volume_on_the_partition() {
   assert!(!tenant_key(&recovered, first_account) && tenant_key(&recovered, other_account));
 }
 
+/// A-291 (§4.10 "Ownership follows the writer"): do create a volume, record a snapshot of it and an attachment, release
+/// it, end the attachment, release it again, and recover the database. Expect the first release refused `Attached`
+/// with nothing changed; the second to take the volume's record, its snapshot and its name with it and to leave no
+/// tombstone, since its registers are the member's it moved to and no holder may be told to close them; a later create
+/// under the same name admitted; and the recovered database to agree.
+#[test]
+fn a_moved_volume_is_released_whole_and_leaves_no_tombstone() {
+  let mut segment = segment("slates-db-move-release", LOG_BYTES);
+  let mut db = open(&mut segment);
+  let moved = volume(1, "moved");
+  db.mutate(
+    &mut segment,
+    &Op::VolumeCreated {
+      record: moved.clone(),
+    },
+    0,
+  )
+  .unwrap();
+  db.mutate(
+    &mut segment,
+    &Op::SnapshotTaken {
+      record: SnapshotRecord {
+        id: SnapshotId { value: 1 },
+        volume: moved.id,
+        epoch: 1,
+        identity: None,
+        placed: PlacementState::Local,
+        taken_ns: 0,
+      },
+    },
+    0,
+  )
+  .unwrap();
+  let attachment = AttachmentRecord {
+    id: 1,
+    volume: moved.id,
+    consumer: Consumer::Bridge,
+    snapshot: None,
+    form: AttachForm::Root,
+    principal: principal(0),
+    rights: Rights {
+      read: true,
+      write: true,
+      admin: false,
+    },
+    token: [1; 16],
+  };
+  db.mutate(&mut segment, &Op::AttachmentAdded { record: attachment }, 0)
+    .unwrap();
+  assert_eq!(
+    db.mutate(&mut segment, &Op::VolumeReleased { id: moved.id }, 0),
+    Err(DbError::Attached { attachments: 1 }),
+    "a volume leaves only whole"
+  );
+  assert!(db.partition().volume(moved.id).is_some());
+  db.mutate(&mut segment, &Op::AttachmentRemoved { id: 1 }, 0)
+    .unwrap();
+  db.mutate(&mut segment, &Op::VolumeReleased { id: moved.id }, 0)
+    .unwrap();
+  let released = |db: &Db| {
+    db.partition().volume(moved.id).is_none()
+      && db.partition().volume_by_name("moved").is_none()
+      && db.partition().snapshots_of(moved.id).is_empty()
+      && db.partition().tombstone(moved.id).is_none()
+      && db.partition().tombstones().next().is_none()
+  };
+  assert!(
+    released(&db),
+    "record, snapshot and name gone, no tombstone"
+  );
+  drop(db);
+  let mut recovered = open(&mut segment);
+  assert!(released(&recovered), "the recovered database agrees");
+  recovered
+    .mutate(
+      &mut segment,
+      &Op::VolumeCreated {
+        record: volume(2, "moved"),
+      },
+      0,
+    )
+    .unwrap();
+}
+
 // ---------------------------------------------------------------- acknowledgements that name owed ids
 
 /// One step of a client whose acknowledgements name the ids it still owes (§4.9), and of their delivery to the
