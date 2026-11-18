@@ -3493,7 +3493,8 @@
 >   count changes across their awaits, so the bound cannot be judged when they begin. The fix owed is a seat held for
 >   such a reply from the task's start, refused `Overloaded` before the task runs.
 
-> **A live-shipped volume fails a waiting writer when its candidates are slow (2026-11-05, A-200; OPEN, owner raft).**
+> **A live-shipped volume fails a waiting writer when its candidates are slow (2026-11-05, A-200; CLOSED 2026-11-18 on
+> macOS and Linux, below; Windows OPEN, raft).**
 > A-200 says holders that do not answer "make the writer wait: backpressure, never a false success". A stable reply on a
 > live-shipped volume waits at most the daemon's liveness budget (1 s, `live_ship::DURABLE_WAIT_NS`) and is then answered
 > `NFS3ERR_JUKEBOX` (NFS) or `EIO` (a held FUSE reply, `fuse.rs`). The macOS mount is `soft,intr` (§4.6), so its client
@@ -3509,7 +3510,8 @@
 > `SLATES_TEST_LIVE_CONFORMANCE=1` and `SLATES_TEST_BINARY` until raft's fix, when it joins a CI step. Owner: raft
 > (`crates/server/src/live_ship.rs`, the barrier waits; `crates/server/src/nfs.rs` `stable_once_durable`; `fuse.rs`'s
 > held replies).
-> - **The same suites found two more faults, 2026-11-06, this Mac, each a fresh fleet a suite (OPEN, raft).** Plain:
+> - **The same suites found two more faults, 2026-11-06, this Mac, each a fresh fleet a suite (neither recurred on
+>   macOS or Linux by 2026-11-18, below).** Plain:
 >   fsx 10,000 operations passed in 21.1 s, fsstress 4 × 500 in about 11 s, pjdfstest's 238 files in about 5.5 minutes.
 >   Live-shipped:
 >   - fsstress (319 of 2,000 operations logged) and pjdfstest (16 files in 10 minutes, its calls answered `ETIMEDOUT`,
@@ -3523,8 +3525,9 @@
 >     0 replicas again"), so fsx failed.
 >   `cargo xtask conformance compare --plain … --live …` names 8,647 differences. The commands and records:
 >   `docs/wip/conformance.md` (the live-shipped pair).
-> - **Linux and Windows, diagnostics run 42150662467 (2026-11-06; OPEN, raft).** On `ubuntu-latest` the live fsx passed
->   on all three transports, its log durable at its head and held by both candidates (head 6801 or 4422), as plain. The
+> - **Linux and Windows, diagnostics run 42150662467 (2026-11-06; Linux CLOSED 2026-11-18, below; Windows OPEN, raft).**
+>   On `ubuntu-latest` the live fsx passed on all three transports, its log durable at its head and held by both
+>   candidates (head 6801 or 4422), as plain. The
 >   live fsstress over the NFSv3 adapter then hung for over three hours until the run was cancelled, so no live fsstress
 >   or pjdfstest result exists for Linux; plain, all three transports passed every suite against their lists. On
 >   Windows, where no fleet test had run before:
@@ -3534,11 +3537,29 @@
 >   - `windows-11-arm`: the fleet did not form for fsx. It formed for winfstest, whose 628 cases matched plain exactly
 >     (0 differing), but shipping failed: candidate b held no live log, the owner counted `no_session` 7,663,
 >     `unanswered` 5,596 and `refused` 138, and only candidate c held entries (4,741).
-> - **macOS conforms (2026-11-18, main `40efd7456`; Linux OPEN, owner g226).** On Adas-MacBook-Pro-3 (macOS 26.6, NFS
+> - **macOS conforms (2026-11-18, main `40efd7456`).** On Adas-MacBook-Pro-3 (macOS 26.6, NFS
 >   loopback, load averages 7 to 14), fsx (10,000 operations), fsstress (4 × 500) and unprivileged pjdfstest (8,686 cases)
 >   ran plain and live-shipped. `compare` found 0 differences, and every live run shipped. The writer's `ETIMEDOUT` went
 >   with A-229's hard mount; the log stuck at `head=2 durable=none` and the takeover off the mounted node did not recur.
->   Commands and counts: `docs/wip/conformance.md` (the live-shipped pair). Linux and Windows remain as recorded above.
+>   Commands and counts: `docs/wip/conformance.md` (the live-shipped pair).
+> - **Linux conforms, the writer waits on both, and the pair runs in CI (2026-11-18, g076a).** Diagnostics run
+>   44362281881 (main 9e684f48e, Ubuntu 24.04.5) ran each suite plain and then live-shipped over every Linux transport:
+>   `native-linux-fuse` through its NFS adapter, `native-linux-nfs4`, and `oci-linux` over the daemon's own FUSE mount.
+>   On `ubuntu-24.04-arm` and `ubuntu-latest` fsx and fsstress passed both ways, and pjdfstest gave 8,798 cases a
+>   transport, as root, with the same verdicts both ways. `compare`: 0 differing over 3 outputs and 9 records on each
+>   runner. The live fsstress that hung three hours on 2026-11-06 took 7 to 40 s a transport (3 to 4 s plain). The macOS
+>   pair again on main 7993026, a Mac Studio (macOS 26.4, load 10 to 26, unprivileged): 0 differing. Every live run
+>   shipped. The stopped-candidates test passes on both: the size change waited for the candidates and succeeded after
+>   149.3 s on the Studio (A-229's hard mount), and after 124.0 s and 124.3 s on Linux (the kernel's client retries
+>   `NFS3ERR_JUKEBOX` and never fails the call). So it no longer waits for a fix to join CI. CI's conformance lane now
+>   runs the pair on `ubuntu-latest` and `macos-latest` (diagnostics run 44371380372): the plain `all`, then fsx,
+>   fsstress and pjdfstest live-shipped (each verdict gates, and a run that did not ship fails), `compare --suites
+>   fsx,fsstress,pjdfstest`, and the stopped-candidates test. Found on the way and fixed: the harness's macOS unmount
+>   was plain, so that test left its hard mount of a stopped fleet behind
+>   (`docs/bugs/2026-11-18-a-conformance-sessions-hard-mount-outlived-its-session.md`). Not a difference, a cost: a live
+>   run is slower than a plain one (fsx 8.5 s to 164.5 s on the Studio, with 407 whole states shipped past the live
+>   credit, `refused.no_credit` 411; 6 to 27 s to 62 to 82 s on Linux arm64), which is AC-8.9's credit and live-write
+>   latency's to cut (g230, g076b). Windows remains as recorded above.
 
 > **The many-client load test over the network (loadtest; 2026-11-05).** The harness
 > (`crates/client/examples/load_bench.rs`, `--green` to drive a green on another node) and its launcher
