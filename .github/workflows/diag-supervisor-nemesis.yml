@@ -1,0 +1,52 @@
+# DIAG (not for main), nemesis 5: the five recorded nemesis seeds replayed after A-382, A-386 and A-394, the yield's
+# holder-side half) on Linux x86_64 and arm64 and macOS, release, each seed capped at four times the slowest live
+# pass (425 s), logs kept. Seeds: 7236833171758868842, 17036665960917068132, 6876545201569229162,
+# 2120743995065985386, 18189587465523915115.
+name: diag-supervisor-nemesis
+on:
+  push:
+    branches: ['diag-supervisor-nemesis-*']
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  nemesis:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (release)
+        run: cargo test --locked --release -p slates-cli --test live_chaos --no-run
+      - name: Every recorded seed, capped
+        shell: bash
+        env:
+          SLATES_TEST_CLI: "1"
+          SLATES_FLEET_TRACE: "1"
+        run: |
+          ulimit -n 65536 2>/dev/null || ulimit -n "$(ulimit -Hn)"
+          mkdir -p target/live
+          cap_s=$((425 * 4))
+          bin=$(cargo test --locked --release -p slates-cli --test live_chaos --no-run --message-format=json 2>/dev/null \
+            | jq -r 'select(.executable != null and .target.name == "live_chaos") | .executable' | tail -1)
+          failed=0
+          for seed in 7236833171758868842 17036665960917068132 6876545201569229162 2120743995065985386 18189587465523915115; do
+            began=$(date +%s); log="target/live/nemesis-${seed}.log"
+            if SLATES_CHAOS_SEED=${seed} perl -e 'alarm shift; exec @ARGV' "${cap_s}" "$bin" --exact a_seeded_nemesis_of_single_faults_keeps_every_register_invariant --test-threads=1 --nocapture > "$log" 2>&1; then r=ok; else r=FAILED; failed=$((failed + 1)); fi
+            echo "seed ${seed}: ${r} ($(( $(date +%s) - began )) s)"
+            [ "$r" = ok ] || { grep -E "panicked|violat|watchdog|StaleNeverCommits|NoLoss|Continuity|TotalOrder|ReadSafety" "$log" | head -20; tail -40 "$log"; }
+          done
+          echo "seeds failed: ${failed} of 5"
+          [ "${failed}" -eq 0 ]
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nemesis-${{ matrix.os }}
+          path: target/live/
