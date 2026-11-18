@@ -1879,6 +1879,16 @@
 > - StaleNeverCommits: writes through a superseded owner refused, survivors fenced at the takeover's epoch;
 > - Convergence: every candidate at the owner's head, durable, nothing owed.
 >
+> - **Open (g229, 2026-11-17): loss, a running node cut off, and ReadSafety and Continuity across real processes.**
+>   SIGSTOP stops a whole process and drops nothing, so no flow here injects loss, keeps an isolated owner running
+>   (its lease lapsing, its peers judged dead from its side), or cuts one direction only; only KIND's netem injects
+>   loss (`cargo xtask kind live`, which no lane runs). Built first: a node may bind elsewhere than it advertises
+>   (A-277, the manifest's `bind`), so a relay in the test can own every node's advertised ports and forward to their
+>   bind blocks, unprivileged, on macOS and Linux. Owed next: the relay (loss, delay, jitter, duplication, one-way
+>   cuts per pair of nodes) and its flows, and two invariants the flows do not yet judge from outside: ReadSafety (a
+>   latest-state read begun after a write's acknowledgement never answers older bytes, through any node) and
+>   Continuity (a takeover's adopted head covers every position durable under an earlier epoch).
+>
 > - **Fixed: a destroy was answered before its tombstone was placed** (record
 >   `docs/bugs/2026-11-06-a-destroy-was-answered-before-its-tombstone-was-placed.md`).
 >   - With both candidates stopped, a live volume's destroy was answered done; the owner was SIGKILLed, and a survivor
