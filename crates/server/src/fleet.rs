@@ -184,8 +184,14 @@ pub struct FleetPeer {
 pub struct FleetTransport<Serve = ServeSockets> {
   /// This node's fleet TLS identity (operator-provisioned).
   pub identity: Identity,
-  /// The address this node publishes to authenticated peers.
+  /// The probe-plane address this node publishes to authenticated peers: where they dial its probes, its advertised
+  /// address and base port.
   pub advertise: NodeAddress,
+  /// The record-plane address this node publishes to authenticated peers: where they dial its record links (the
+  /// advertised base port's next in a manifest's layout). Never the port its record socket is bound to, which differs
+  /// behind a port mapping (A-277): a peer told the bound port redials around the mapping, or to a port the mapping does
+  /// not forward (A-330).
+  pub advertise_record: NodeAddress,
   /// Operator trust anchors for certificates of nodes absent from the seed manifest.
   pub enrollment_roots: Vec<CertificateDer<'static>>,
   /// The TLS server name this node presents and its peers pin.
@@ -440,6 +446,7 @@ impl FleetTransport<ServeAddresses> {
     let FleetTransport {
       identity,
       advertise,
+      advertise_record,
       enrollment_roots,
       name,
       serve,
@@ -449,6 +456,7 @@ impl FleetTransport<ServeAddresses> {
     Ok(FleetTransport {
       identity,
       advertise,
+      advertise_record,
       enrollment_roots,
       name,
       serve: serve.bind()?,
@@ -1049,6 +1057,7 @@ fn serve_export(export: Option<ExportListener>, identity: Kept<Identity>) {
 pub async fn run_membership(transport: FleetTransport) {
   let FleetTransport {
     advertise,
+    advertise_record,
     enrollment_roots,
     identity,
     name,
@@ -1065,12 +1074,6 @@ pub async fn run_membership(transport: FleetTransport) {
     // No peers — nothing to probe; the placement path still runs the `FleetNode`, degenerate (R8).
     return;
   }
-  // The record port discovery publishes is the one the record socket is bound to; a socket that cannot
-  // say (the OS refusing `getsockname`) cannot be published, counted like a socket that would not bind.
-  let Ok(record_port) = record_socket.local_addr().map(|address| address.port()) else {
-    count_refusal(BIND_REFUSED);
-    return;
-  };
   // The identity is shared by every serve session and client dial of this shard — it is not `Clone` (it
   // holds a private key), so the control shard owns the one copy for its life (`ShardContext::keep`) and
   // each task names it by its `Kept` handle, reaching it only inside a closure while this shard runs
@@ -1098,14 +1101,16 @@ pub async fn run_membership(transport: FleetTransport) {
   let neighbourhood =
     state::with_state(|state| state.config.fleet_peer_capacity.saturating_add(1)).unwrap_or(1);
   let local = state::with_state(|s| s.fleet.host()).unwrap_or(HostId(0));
+  // Discovery announces both planes where this node advertises them, never where it binds (A-277, A-330): a peer
+  // prefers the announcement at every dial (`resolve_peer_address`), and behind a port mapping the bound record port is
+  // reached around the mapping or not at all.
   let initialized = state::with_state(|state| {
     state.discovery = Some(crate::discovery::Discovery::new(
       state,
       name.clone(),
       enrollment_roots.clone(),
       certificate,
-      advertise,
-      record_port,
+      (advertise, advertise_record),
       &peers,
     )?);
     crate::discovery::restore(state)
@@ -5777,6 +5782,16 @@ pub(crate) fn direct_contact_reason(state: &ShardState, peer: HostId) -> String 
 enum DirectContact {
   /// The fleet's consensus groups are not both initialized yet: everyone is contacted.
   Forming,
+  /// This node is not a member of the council configuration it holds (A-331): a fresh member whose first fetch was
+  /// answered before the council admitted it, or a member retired while it was away. It is no peer's neighbour and
+  /// holds nothing under that configuration, and the voters it knows are its join donor's, which may be the member it
+  /// replaced alone. Judged by the member rule a fresh member kept no peer at all: every record link idled, its learner
+  /// fetched over no session, and it never learned the configuration that admits it (live_chaos's fresh-member flow, 2
+  /// of 48 runs at one CPU; diag-raft-chaos-ab-68b-2: council at version 8, in contact with none of its four live
+  /// members, `fleet.learner.no_session` 113 in 48 s); a retired member kept only the old neighbours of the placement it
+  /// last installed. Every member it holds alive is contacted, as while forming, until it holds a configuration that
+  /// names it.
+  Unadmitted,
   /// Believed dead, but only as a manifest **seed** this node has not yet replaced by a learned id: the seed
   /// was never a live incarnation, so its death (folded where a neighbour learned the peer's real id, and
   /// gossiped here) says only that the peer has a real incarnation this node has not reached. Contact is
@@ -5851,8 +5866,8 @@ fn direct_contact(state: &ShardState, peer: HostId) -> DirectContact {
     .is_some_and(|belief| belief.liveness == Liveness::Dead);
   if believed_dead {
     dead_contact(state, peer)
-  } else if !state.council.initialized() || !state.root.initialized() {
-    DirectContact::Forming
+  } else if let Some(joining) = joining_contact(state) {
+    joining
   } else if !state.council.configuration().members.contains(&peer) {
     DirectContact::NotInCouncilConfiguration
   } else if state.fleet.configuration().neighbours(peer) {
@@ -5871,6 +5886,25 @@ fn direct_contact(state: &ShardState, peer: HostId) -> DirectContact {
     DirectContact::AsVoter
   } else {
     DirectContact::OutsideNeighbourhood
+  }
+}
+
+/// The contact this node keeps with every live peer while it is not yet a member under its consensus groups, whatever
+/// the peer's role: [`DirectContact::Forming`] before both groups are initialized, [`DirectContact::Unadmitted`] while
+/// the council configuration it holds does not name it (A-331). `None` once it is a member, where the role rule applies.
+/// Both are judged of this node alone, so the member rule below them never meets a node with no neighbourhood.
+fn joining_contact(state: &ShardState) -> Option<DirectContact> {
+  if !state.council.initialized() || !state.root.initialized() {
+    Some(DirectContact::Forming)
+  } else if !state
+    .council
+    .configuration()
+    .members
+    .contains(&state.fleet.host())
+  {
+    Some(DirectContact::Unadmitted)
+  } else {
+    None
   }
 }
 
@@ -9537,6 +9571,7 @@ pub(crate) async fn forward_over_leader_session(
     peer,
     &[request],
     deadline_ns,
+    crate::forward_lane::failover_bound_from(slates_rt::futures::now_ns()),
     &mut crate::forward_lane::Place::default(),
   )
   .await
@@ -9553,17 +9588,20 @@ pub(crate) async fn forward_over_leader_session(
 /// [`forward_over_leader_session`] for several requests at once — a read-ahead batch of windows
 /// (`RequestBody::ReadWindow`) — all sent together on the borrowed session ([`slates_cluster::requests_within`]).
 /// `stall_ns` bounds the wait for the session and, once it is borrowed, any stretch with no progress: a batch that
-/// keeps delivering is never cut off for its size. Returns the replies in order (`None` for one not answered) with
-/// how they streamed ([`slates_cluster::BatchReplies`]), or `None` when the session never came back within the
-/// budget. The batch is queued at `place` in the peer's lane: a resend passes the place its first issue recorded there
+/// keeps delivering is never cut off for its size. A stretch with no progress is given up once the lane's shard has
+/// read what came, or at once past `bound_ns`, the failover bound on the wall from the forward's first send
+/// ([`crate::forward_lane`]'s stall, A-315). Returns the replies in order (`None` for one not answered) with how they
+/// streamed ([`slates_cluster::BatchReplies`]), or `None` when the session never came back within the budget. The
+/// batch is queued at `place` in the peer's lane: a resend passes the place its first issue recorded there
 /// ([`crate::forward_lane::Place`]).
 pub(crate) async fn forward_batch_over_leader_session(
   peer: HostId,
   requests: &[Vec<u8>],
   stall_ns: u64,
+  bound_ns: u64,
   place: &mut crate::forward_lane::Place,
 ) -> Option<slates_cluster::BatchReplies> {
-  crate::forward_lane::forward_batch(peer, requests, stall_ns, place).await
+  crate::forward_lane::forward_batch(peer, requests, stall_ns, bound_ns, place).await
 }
 
 #[cfg(test)]

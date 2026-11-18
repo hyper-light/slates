@@ -99,6 +99,7 @@ fn volume(id: VolumeId, name: &str) -> VolumeRecord {
       live_holders: None,
       write: None,
       write_version: 0,
+      signers: Vec::new(),
     },
     base: BaseRecord::Scratch,
     head: SnapshotId { value: 0 },
