@@ -547,7 +547,6 @@ impl Op {
       Op::LiveHoldersCommitted { .. } => "live_holders_committed",
       Op::CompletionAwaiting { .. } => "completion_awaiting",
       Op::VolumeWritePolicySet { .. } => "volume_write_policy_set",
-  },
       Op::VolumeReleased { .. } => "volume_released",
     }
   }
