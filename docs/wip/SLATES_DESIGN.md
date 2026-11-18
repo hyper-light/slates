@@ -10538,7 +10538,10 @@ by a derivation from the machine with a typed refusal: the replicas an owner tak
 node and its rebuild's fresh one; none with one shard), a replica's own metadata (no more than its owner's per-green
 budget and its shard's room), the bytes an owner keeps for lagging ones (the room its per-green budget leaves beyond
 its own retention), and one message's blocks; and every refusal sends the replica's work to the owner until it is
-rebuilt. Built in the engine (steps 1 to 4); on the shards owed (step 5).
+rebuilt. Built in the engine (steps 1 to 4); on the shards (step 5a, A-457) the owner makes a replica on every other
+shard of its node before the green's first change, feeds it each change over the cross-shard carrier, charges it to its
+own shard, and makes every replica leave before it gives the engine up. A work's rebases and named-version reads served
+from its shard's replica are owed (step 5b).
 
 **Attachments and versions.** Mounts and SDK attachments of green pin a version;
 `advance(attachment, version)` re-pins and invalidates exactly the paths the manifest diff
@@ -25043,11 +25046,12 @@ reader; every writer ended once its readers left) and the replica's (each bound 
 value, the replica rebuilt or given back and made again; one shard takes no replica; an owner with no room beyond its
 own retention evicts at its first release; with the eviction past the held limit disabled at a release, both of the
 replica's held-limit tests and the sealed blocks' slowest-reader test fail, the unfed one passing: r316 on the Mac
-Studio, 2026-11-18). Owed (step 5): the holder on the shards applies the derivations to the machine's figures and logs
-them with the boot profile's, charges a replica's metadata to its shard's budget, routes a refused or evicted replica's
-rebases and reads to the owner, counted, gives back an idle one (its idle period derived from the feed's cost per
-version against the rebases it served), and makes a green's replicas leave before it gives the owner up. The text and
-its measurements are perf's (2026-11-11, `agents/perf-a273`, never pushed); the
+Studio, 2026-11-18). Step 5a built 2026-11-18 (g083, A-457, below): the derivations in the boot profile; a replica on
+every other shard of the node, made before the green's first change, fed over the cross-shard carrier and charged to its
+own shard; and every replica leaving before its owner is given up. Owed: step 5b (a work's rebases and named-version
+reads served from its shard's replica, a refused or evicted replica's routed to the owner, counted); an idle replica's
+give-back (its idle period derived from the feed's cost per version against the rebases it served); the supervisor's
+A/B. The text and its measurements are perf's (2026-11-11, `agents/perf-a273`, never pushed); the
 content question it left open was decided by the supervisor on 2026-11-17 by A-64 and D-7 (below). W1 (A-247), whose
 works off the owner it builds on, landed on 2026-11-17 (3c0af9399).
 
@@ -31204,3 +31208,52 @@ Windows item); `docs/wip/shards/dax-protocol.md` ("Windows", after a daemon's de
   through the fresh stream) on CI's Windows runners, filed for main; Shards' device half (its coordinator's condition
   4c). Found beside it (GAPS): the Windows handoff names every held entry in one environment variable, whose length
   Windows bounds, and the anchor's bounds were never set against it.
+
+### A-457 — The shards hold a green's replicas: made before the green's first change, fed over the cross-shard carrier, charged to their own shards, and left before their owner is given up (2026-11-18, goal 87 via g083; A-273 step 5a; §4.16 "Rebase off the owner"; D-7, D-8, D-11; A-247, A-296, A-400)
+
+Applied in the same change to: §4.16 ("Rebase off the owner (A-273)"); A-273's status; GAPS (A-273's entry); and:
+- `crates/server`: `green_replicas.rs` (new: `ensure`, `feed_version`, `feed_fold`, `hold_within`, `give_up`, `close`,
+  `outstanding`, the messages and their carrier, and the tests); `config.rs` (`DaemonConfig::replica_limit` and the
+  boot notes `replica_limit`, `replica_budget_bytes`, `replica_held_limit_bytes`); `state.rs` (`green_replicas`);
+  `daemon.rs` (the stop's `give_back_replicas`; the test support's `observe_at`); `verbs.rs` (the submit's `ensure`
+  and `feed_version`; `give_up` at a fence, a re-install, an adoption and a rollback); `merge_service.rs` (the settle's
+  fold fed and its held limit; the destroy's `give_up`); `lib.rs`.
+- `crates/merge`: `Green::replicas_registered` (`engine.rs`, `history.rs`, `store.rs`), asserted by use in
+  `replica.rs`'s `an_owner_takes_the_replicas_its_shards_derive_and_no_more`.
+
+- **What was there.** A-273's steps 1 to 4 built the replica in the engine (`crates/merge/src/replica.rs`): made from
+  its owner whole, fed by feed position, its content the owner's sealed blocks read in place, and each of its bounds
+  derived with a typed refusal. Nothing on the shards made one.
+- **The rule.** Before the first change a green's owner shard makes to the green after installing it (the submit,
+  ahead of its settle), the owner makes a replica on every other shard of the node, up to `replica_limit`
+  (`green_replicas::ensure`): moved to its shard whole, its content named by the owner's blocks, never copied (D-7,
+  D-8). After each version it commits (once its chain entry is recorded) and each fold of its history (at the settle),
+  it takes the message that carries the change and sends it to every shard it fed, in order; at each settle it holds
+  what it keeps for them to `held_limit`. A replica's shard takes a replica within `replica_budget` (the per-green
+  budget and its shard's admittable room then) and charges the replica's metadata to its shard's budget as memory held
+  for another owner (`ShardBudget::charge_replicated`), trued up after each message. A replica that refuses a message
+  (a gap, an eviction, a replay not its owner's), or whose growth its shard cannot take, leaves, counted; it is not
+  made again here (step 5b routes its work to the owner).
+- **Giving the owner up.** A destroyed, fenced, rolled-back or re-installed green's engine retires until every replica
+  of it has left, each asked to (`green_replicas::give_up`), and is dropped only then. The daemon's stop closes every
+  shard's replicas and waits, within an observation's budget, until no shard holds a registration, a replica or a
+  registration owed home (`Daemon::give_back_replicas`), so no owner is dropped with a replica registered
+  (`slates_mem::sealed::dropped_with_readers` stays at zero; what is left at the budget is logged).
+- **Messages.** Every message rides the cross-shard carrier (`xshard::hand_reply_home`, A-296): kept until its target
+  has room, and run there even when its arena refuses the task. One the carrier refuses (its target gone, its keep
+  bound reached) is owed again from that shard's next replica step when it carries a registration or a leave (a
+  delivery its owner could not send is taken back at once); a feed message or an acknowledgement is counted lost
+  (`merge.replica.not_carried`): the replica meets a lost message as a gap and leaves, and a later acknowledgement
+  covers a lost one.
+- **Why before the first change, not at the install.** A recovering daemon installs its greens while its other shards
+  may not run yet, and a green that never changes needs no replica. The first change pays one clone of the green's
+  metadata for each other shard; a green made empty pays almost nothing.
+- **Boot profile (D-11).** `replica_limit` = (shards − 1) × 2; `replica_budget_bytes` = min(`green_chain_bytes`,
+  `reserve_per_shard`) at boot, each making taking its shard's admittable room then; `replica_held_limit_bytes` =
+  `green_chain_bytes` less the owner's own retention, none at boot, each settle taking its own retention then.
+- **Counters.** `merge.replica.sent`, `.full`, `.held`, `.over_budget`, `.applied`, `.refused`, `.left`, `.retired`,
+  `.unheld`, `.not_carried`, `.stray` (`crates/server/src/green_replicas.rs`).
+- **Checks.** CHECKS_RESULT
+- **Owed.** Step 5b: a work's rebases and named-version reads served from its shard's replica, and a refused or
+  evicted replica's routed to the owner, counted; then an idle replica's give-back; then the supervisor's A/B at 1,000
+  clients and more. Main's runs: the server's green suites and the merge crate whole.

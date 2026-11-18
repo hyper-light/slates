@@ -706,7 +706,7 @@
 > Record: `docs/bugs/2026-11-18-the-watchdogs-end-left-its-writer-unjoined.md`.
 
 > **Open (g222, 2026-11-17, A-273): rebases and named-version reads of a green on the shards holding its works.**
-> Designed; steps 1 to 4 of five built. The owner spends 51–53% of its wall on verdicts and rebases at the 3,000-client rung (W1),
+> Designed; steps 1 to 4 and step 5a built. The owner spends 51–53% of its wall on verdicts and rebases at the 3,000-client rung (W1),
 > rebases the larger share (about 71,000 a run against 49,000 verdicts), and W1's rebase at 1,000 clients is slower
 > than main's because it crosses to the owner. A replica holds the green's metadata (about 14.2 MB at the rung, 3.8% of
 > a shard's 373.5 MB metadata budget on the Studio) and reads the owner's content in place, never a copy (the
@@ -732,10 +732,15 @@
 > (`OverBudget`, at its making, at a rebuild and after a message); the bytes an owner keeps for them against
 > `held_limit` = the per-green budget less the owner's own retention, past which its slowest replica is evicted
 > (`FeedRefusal::Evicted`, keeping its frees until it leaves); a change made while the last was unsent evicting every
-> replica (one message's blocks recorded at most). **Owed, in order:** the code on the shards (step 5: the holder
-> applies the derivations to the machine's figures and logs them, charges a replica to its shard's budget, routes a
-> refused or evicted replica's rebases and reads to the owner, counted, gives back an idle one, and makes a green's
-> replicas leave before it gives the owner up); the supervisor's A/B.
+> replica (one message's blocks recorded at most). **Built (step 5a, 2026-11-18, g083, A-457):** the shards hold a
+> green's replicas (`crates/server/src/green_replicas.rs`): the owner makes one on every other shard of the node, up to
+> the limit, before the green's first change; feeds each change over the cross-shard carrier; a replica is charged to
+> its own shard's budget within its derived budget and leaves, counted, when it refuses a message or its growth; a
+> destroyed, fenced, rolled-back or re-installed green's engine retires until every replica left, and the daemon's stop
+> closes every shard's replicas and waits for their registrations (no owner dropped with a reader); the limit and
+> budgets in the boot profile. **Owed, in order:** step 5b (a work's rebases and named-version reads served from its
+> shard's replica, a refused or evicted replica's routed to the owner, counted); an idle replica's give-back; the
+> supervisor's A/B.
 >
 > **A Shards guest's unprivileged run could not write a host-owned volume: built, the stream takes Shards' owner word
 > (2026-11-18, §4.6 the Shards form; A-281; goal g268).** Shards' init names the run's owner on a share's root with

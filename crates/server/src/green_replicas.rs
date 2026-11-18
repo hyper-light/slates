@@ -115,7 +115,8 @@ struct Held {
   charged: u64,
 }
 
-/// What one shard sends another about a green's replicas.
+/// What one shard sends another about a green's replicas. The engine and the feed message are boxed: each message is
+/// moved whole between shards, and the small ones need not carry their size.
 #[derive(Debug)]
 enum Message {
   /// Owner to a replica's shard: a replica of install `install` of `green`, owned on shard `owner`.
@@ -123,13 +124,13 @@ enum Message {
     green: VolumeId,
     install: u64,
     owner: u16,
-    replica: Green,
+    replica: Box<Green>,
   },
   /// Owner to a replica's shard: the next message of the green's feed.
   Feed {
     green: VolumeId,
     install: u64,
-    message: FeedMessage,
+    message: Box<FeedMessage>,
   },
   /// Owner to a replica's shard: the owner gives the engine up, and the replica leaves.
   Leave { green: VolumeId, install: u64 },
@@ -221,7 +222,7 @@ fn settle_owed(state: &mut ShardState) {
         owner,
         replica,
       } if owner == state.shard => {
-        if let Some(left) = replica.into_left() {
+        if let Some(left) = (*replica).into_left() {
           left_home(state, (green, install), target, left);
         }
       }
@@ -240,7 +241,7 @@ fn handle(state: &mut ShardState, message: Message) {
       install,
       owner,
       replica,
-    } => receive(state, (green, install), owner, replica),
+    } => receive(state, (green, install), owner, *replica),
     Message::Feed {
       green,
       install,
@@ -319,7 +320,7 @@ fn make_one(state: &mut ShardState, (green, install): (VolumeId, u64), target: u
       green,
       install,
       owner,
-      replica,
+      replica: Box::new(replica),
     },
   );
   true
@@ -385,7 +386,7 @@ fn broadcast(
       Message::Feed {
         green,
         install,
-        message: message.clone(),
+        message: Box::new(message.clone()),
       },
     );
   }
@@ -437,7 +438,8 @@ fn receive(state: &mut ShardState, key: (VolumeId, u64), owner: u16, replica: Gr
     give_home(state, key, owner, replica.into_left());
     return;
   }
-  let room = usize::try_from(state.store.budget.admittable()).unwrap_or(usize::MAX);
+  // The shard's free room: what its arena holds and could still claim from its pool, less its commitments (A-98).
+  let room = usize::try_from(state.store.admittable()).unwrap_or(usize::MAX);
   let budget = replica_budget(crate::merge_service::rejected_cache_budget(state), room);
   let replica = match Replica::new(replica, budget) {
     Ok(replica) => replica,
@@ -448,7 +450,7 @@ fn receive(state: &mut ShardState, key: (VolumeId, u64), owner: u16, replica: Gr
     }
   };
   let bytes = metadata_charge(&replica);
-  if state.store.budget.charge_replicated(bytes).is_err() {
+  if !charge(state, bytes) {
     state.count(OVER_BUDGET, 1);
     give_home(state, key, owner, replica.leave());
     return;
@@ -468,6 +470,13 @@ fn receive(state: &mut ShardState, key: (VolumeId, u64), owner: u16, replica: Gr
 /// The bytes a replica's metadata charges its shard.
 fn metadata_charge(replica: &Replica) -> u64 {
   u64::try_from(replica.green().metadata_bytes()).unwrap_or(u64::MAX)
+}
+
+/// Charges `bytes` of a replica's metadata to this shard's budget as memory held for another owner, the arena grown
+/// from its pool first by what the charge lacks, as every admission is (A-98): whether the budget took it.
+fn charge(state: &mut ShardState, bytes: u64) -> bool {
+  state.store.make_room(bytes);
+  state.store.budget.charge_replicated(bytes).is_ok()
 }
 
 /// Sends `left`, a replica's registration, home to its owner.
@@ -540,12 +549,7 @@ fn recharge(state: &mut ShardState, green: VolumeId) -> bool {
     state.store.budget.credit_replicated(charged.saturating_sub(bytes));
     return true;
   }
-  if state
-    .store
-    .budget
-    .charge_replicated(bytes.saturating_sub(charged))
-    .is_ok()
-  {
+  if charge(state, bytes.saturating_sub(charged)) {
     return true;
   }
   if let Some(held) = state.green_replicas.held.get_mut(&green) {
