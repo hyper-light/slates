@@ -32548,18 +32548,19 @@ Unix sibling built); and:
   `hostile_handoff_pointers_and_tables_are_refused`, `a_tables_own_descriptor_is_never_named_again`. Real processes
   (`tests/anchor.rs`, Linux and macOS): `a_table_past_the_old_exec_limit_reaches_the_successor_whole`, a real supervisor
   whose first daemon holds enough devices with full sessions to pass the platform's old limit by a tenth (about 975 on
-  Linux, 7,800 on macOS) and whose successor reads every one live from the table.
+  Linux, 7,800 on macOS) and whose successor reads every one live from the table; the limit is read from the machine
+  the test runs on (its page size times 32 on Linux, `getconf ARG_MAX` on macOS), never frozen from one machine.
 - **Evidence.** Red first, on main at `b2909fc` with the tests alone, on a Mac Studio (2026-11-18): `slates-anchor`'s lib
   tests did not build (49 errors: no `Table`, `TableBounds`, `TableObject`, `encode_table`, `decode_table`,
   `encode_pointer`, `parse_pointer`, `table_cap`, `read_table`, `check_table_owner`, `POINTER_TEXT_CAP`, nor the parts
-  named for what they are). Green on the tree as merged with main, the same day and machine: `cargo test -p
-  slates-anchor --lib -- handles:: held::` 34 of 34, the three above among them, the sealed object made and read on
-  macOS; `cargo check` of `slates-anchor`, `slates-server` (the in-process tests that play the anchor) and
-  `slates-cli` (`--test cli`) clean; `cargo xwin check` of `slates-anchor` and `slates-server` (lib and tests) and
-  `slates-cli` (tests) clean; rustfmt's layout taken; `cargo clippy --all-targets -D warnings` clean for
-  `slates-anchor` and `slates-rt` on macOS and for `slates-anchor` on Windows, and for `slates-server` but for seven
-  findings in code this change does not touch (filed for main). The x86_64 Linux check and the real-process restarts
-  are filed for main.
+  named for what they are). Green on the tree as merged with main at `5fef5b1` (`383b0f8`), the same day and machine:
+  `cargo test --locked -p slates-anchor --lib -- handles:: held::` 34 of 34, the three above among them, the sealed
+  object made and read on macOS; `cargo fmt --check` clean for the four crates; `cargo clippy --locked --all-targets
+  -- -D warnings` clean for `slates-anchor`, `slates-server` and `slates-cli` on macOS and, through `cargo xwin`, for
+  `slates-anchor` and `slates-server` on Windows; `cargo xwin check` of `slates-cli`'s tests clean; `cargo xtask`'s
+  structural, unsafe, version, toolchain and capabilities checks pass, and its literal check finds nothing in this
+  change's files (its five findings are in `crates/base/src/s3/list.rs`, main's `125d07953`, filed for main). The
+  x86_64 Linux check and the real-process restarts are filed for main.
 - **Found beside it, and fixed in the same landing** (main's workspace clippy and `xtask check`, r343): four findings in
   `handles.rs` (a test past the complexity bound, a constant assertion, a string sliced by index, and
   `WHAT_SHARDS_DAX`'s `Format:` line out of the literal check's four-line reach); the same kinds in this change's

@@ -1479,11 +1479,21 @@ fn old_handoff_limit() -> usize {
   rustix::param::page_size().saturating_mul(32)
 }
 
-/// Format: macOS's `ARG_MAX`, the arguments and environment of an exec together, 1,048,576 bytes by `getconf ARG_MAX`
-/// and `sysctl kern.argmax` on the Mac Studio (macOS 26.4, 2026-11-18).
+/// Measured: macOS's `ARG_MAX`, the bytes of an exec's arguments and environment together, read from the machine the
+/// test runs on (`getconf ARG_MAX`, which answers `sysconf(_SC_ARG_MAX)`; 1,048,576 on the Mac Studio, macOS 26.4,
+/// 2026-11-18), never a value frozen from one machine.
 #[cfg(target_os = "macos")]
 fn old_handoff_limit() -> usize {
-  1_048_576
+  let answer = std::process::Command::new("getconf")
+    .arg("ARG_MAX")
+    .output()
+    .expect("getconf runs");
+  assert!(answer.status.success(), "getconf ARG_MAX answered {answer:?}");
+  String::from_utf8(answer.stdout)
+    .expect("getconf prints text")
+    .trim()
+    .parse()
+    .expect("getconf prints ARG_MAX as a number")
 }
 
 /// Derived: the devices the full table holds: enough, each at its shortest, to pass the old limit by
