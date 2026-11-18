@@ -31,6 +31,13 @@ pub const LIVE_ENTRY_STREAM: u64 = 22;
 /// apart by their tag (`slates_db::live::is_fetch`), never by guessing at the bytes.
 /// Format: as [`LIVE_ENTRY_STREAM`]; a whole state is large, so it rides the `Bulk` class.
 pub const LIVE_STATE_STREAM: u64 = 23;
+/// The request kind a batch of entries rides (`slates_db::live::encode_batch`, A-200 amended 2026-11-17): the entries a
+/// holder lacks in one exchange. Its sender holds a batch to the session's congestion window, so it rides the `Control`
+/// class with single entries without holding that class longer than a round of the window.
+/// Format: as [`LIVE_ENTRY_STREAM`]; the next kind after a work route's question (25, A-288), which took 25 while this
+/// kind was on its branch claiming it too: the record session dispatches by kind, so every batch went to the route's
+/// handler, was answered with nothing, and was sent again at once, about 500 batches a second (2026-11-17).
+pub const LIVE_ENTRIES_STREAM: u64 = 26;
 
 /// What one dispatch left: the sessions that answered, for the next write, and those still in flight.
 pub struct Shipped {
@@ -199,6 +206,44 @@ pub fn serve_entry(
     Admitted::Held => Ok(replica.head()),
   });
   encode_reply(&reply)
+}
+
+/// A holder's answer to a batch's bytes ([`LIVE_ENTRIES_STREAM`]): each entry in order as [`serve_entry`] serves one,
+/// until one is neither applied nor held; the answer is the head reached, or the first refusal when no entry was
+/// applied or held. Bytes over `cap` or malformed are answered as a malformed entry is.
+pub fn serve_entries(
+  replica: &mut Replica,
+  request: &[u8],
+  cap: usize,
+  mut apply: impl FnMut(&Entry) -> bool,
+) -> Vec<u8> {
+  let reply = slates_db::live::decode_batch(request, cap).and_then(|entries| {
+    let mut reached = None;
+    for entry in &entries {
+      match take(replica, entry, &mut apply) {
+        Ok(head) => reached = Some(head),
+        Err(refusal) => return reached.ok_or(refusal),
+      }
+    }
+    reached.ok_or(LiveError::Malformed)
+  });
+  encode_reply(&reply)
+}
+
+/// One entry of a batch, as [`serve_entry`] takes one: the head held after it, or why not.
+fn take(
+  replica: &mut Replica,
+  entry: &Entry,
+  apply: &mut impl FnMut(&Entry) -> bool,
+) -> Result<Option<slates_db::live::Head>, LiveError> {
+  match replica.check(entry)? {
+    Admitted::Apply(head) if apply(entry) => {
+      replica.commit(entry.epoch, head);
+      Ok(Some(head))
+    }
+    Admitted::Apply(_) => Err(LiveError::Malformed),
+    Admitted::Held => Ok(replica.head()),
+  }
 }
 
 /// A holder's answer to an install's bytes, as [`serve_entry`]: `apply` replaces the holder's state with the install's.

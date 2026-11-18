@@ -9617,6 +9617,131 @@ fn five_daemons_take_over_a_dead_owners_head_over_a_multi_holder_quorum() {
   );
 }
 
+/// Shape: the files a five-node `f = 2` live volume is written before its owner and a holder are lost together.
+const F2_LIVE_FILES: usize = 8;
+
+/// The bytes the `f = 2` live test writes into its file `file`: distinct per file, so a file served from another's
+/// write or a lost one is told apart.
+fn f2_live_body(file: usize) -> Vec<u8> {
+  format!("written {file} on the owner, answered at durability at f = 2\n").into_bytes()
+}
+
+/// The head of `volume`'s live log `daemon` holds as a candidate (its status's holding line), `None` while it shows none.
+fn held_live_head(daemon: &Daemon, volume: VolumeId) -> Option<u64> {
+  let ReplyBody::DaemonStatus { report } =
+    Client::connect(daemon.instance()).call(&RequestBody::DaemonStatus)
+  else {
+    return None;
+  };
+  report
+    .shards
+    .iter()
+    .flat_map(|shard| shard.live.iter())
+    .find(|live| live.volume == volume && live.holding)
+    .and_then(|live| live.head)
+}
+
+/// A-200 at `f = 2`, scale out (g230): five nodes, every node a candidate of every object, so a live volume's owner ships
+/// to four holders and a write is durable once the owner and two of them hold it (`W = max(n − f, f)`). Do: on a, a live
+/// volume written [`F2_LIVE_FILES`] files, each answered at durability; then stop a and the holder holding the highest
+/// head together, two losses, the most `f = 2` tolerates. Expect a survivor to take the volume over, and a client of each
+/// of the three survivors to read every acknowledged file byte for byte. Phase one counts `f + 1 = 3` reports among the
+/// four recorded holders, of which three survive, and a durable write is on two of the four, so at least one survivor
+/// holds each.
+#[test]
+fn five_nodes_at_f_2_keep_every_acknowledged_live_write_through_the_loss_of_the_owner_and_a_holder()
+{
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c", "d", "e"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let mut daemons = start_mesh_with_f(nodes, &hosts, &certs, &serve, 2);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id } = client.call(&scratch("f2-live")) else {
+    panic!("the volume was created");
+  };
+  share_with_fleet(&mut client, id, &daemons);
+  let attachment = write_attachment(&mut client, id);
+  let shipped = client.call(&RequestBody::LiveShip {
+    volume: id,
+    live_shipped: true,
+  });
+  assert!(
+    matches!(shipped, ReplyBody::LiveShippingSet { live_shipped: true }),
+    "the volume is live-shipped: {shipped:?}"
+  );
+  for file in 0..F2_LIVE_FILES {
+    let written = client.call(&RequestBody::FsWrite {
+      volume: id,
+      attachment,
+      path: format!("/f2-{file}"),
+      bytes: f2_live_body(file),
+      mode: 0o644,
+    });
+    assert!(
+      matches!(written, ReplyBody::FsDone { .. }),
+      "write {file} answered at durability: {written:?}"
+    );
+  }
+  let heads: Vec<(usize, Option<u64>)> = (1..daemons.len())
+    .map(|index| (index, held_live_head(&daemons[index], id)))
+    .collect();
+  let lost_holder = heads
+    .iter()
+    .max_by_key(|(_, head)| *head)
+    .map(|(index, _)| *index)
+    .expect("four holders");
+  let holder = daemons.remove(lost_holder);
+  let owner = daemons.remove(0);
+  owner.stop();
+  holder.stop();
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let mut served = Vec::new();
+  for survivor in &daemons {
+    let mut reader = Client::connect(survivor.instance());
+    let mut last = None;
+    let read_all = poll_until(&survivors, SERVE_DEADLINE, || {
+      for file in 0..F2_LIVE_FILES {
+        let reply = reader.call(&RequestBody::Read {
+          volume: id,
+          path: format!("/f2-{file}"),
+          at: ReadAt::Head,
+        });
+        let whole =
+          matches!(&reply, ReplyBody::ReadBytes { bytes } if *bytes == f2_live_body(file));
+        if !whole {
+          last = Some((file, reply));
+          return Ok(false);
+        }
+      }
+      Ok(true)
+    });
+    served.push((survivor.instance().to_owned(), read_all, last));
+  }
+  drop(survivors);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "f = 2 live: holder heads before the losses {heads:?}, lost holder {lost_holder}; served {served:?}"
+  );
+  for (instance, read_all, last) in served {
+    assert!(
+      read_all,
+      "a client of survivor {instance} reads every acknowledged file byte for byte (last miss {last:?})"
+    );
+  }
+}
+
 /// Shape: the bytes a fleet test writes into a volume over NFS and expects back — under the NFS
 /// client's 400-byte read, and distinctive.
 const CONTENT: &[u8] =
@@ -9981,6 +10106,355 @@ fn a_takeover_question_a_holder_never_answered_leaves_its_link_dialed_afresh() {
     lent.is_empty(),
     "the link to a holder that never answered is dropped and dialed afresh, not left lent to the takeover with no \
      session behind it (asked {rounds} times; left lent: {lent:?})"
+  );
+}
+
+/// Shape: the files written into the burst test's volume before it is live-shipped, and each file's bytes: half a MiB,
+/// so its whole state (its log's first entry) is far larger than the burst's changes. Each file is one request, so
+/// it stays under the test client's 4 KiB ring slot with its framing.
+const BURST_VOLUME_FILES: usize = 256;
+/// Shape: see [`BURST_VOLUME_FILES`].
+const BURST_VOLUME_FILE_BYTES: usize = 2 << 10;
+/// Shape: the burst test volume's size limit: room for its files, the burst and their metadata.
+const BURST_VOLUME_LIMIT: u64 = 8 << 20;
+/// Shape: the burst's writers, each a client of its own writing one page at once.
+const BURST_WRITERS: usize = 16;
+/// Shape: each burst write's bytes: half a page, one request under the test client's ring slot.
+const BURST_WRITE_BYTES: usize = 2 << 10;
+/// Shape: how long both holders are held off their only shard while the burst is sent, so every write's entry waits in
+/// flight together: a quarter of a liveness window, inside the half a held shard may take (A-232).
+const BURST_HOLD_NS: u64 = LIVENESS_BUDGET_NS / 4;
+/// Shape: the entries the daemon's credit let be in flight before 2026-11-17, a fixed two: the burst must pass it, or
+/// the test shows nothing.
+const OLD_CREDIT_ENTRIES: u64 = 2;
+/// Format: the owner's count of whole records appended to a live log (`live_ship::LIVE_WHOLE`).
+const LIVE_WHOLE: &str = "fleet.live.whole";
+/// Format: the owner's count of publications turned away for credit.
+const LIVE_NO_CREDIT: &str = "fleet.live.refused.no_credit";
+/// Format: the owner's count of entries appended to a live log.
+const LIVE_APPENDED: &str = "fleet.live.appended";
+/// Format: the owner's count of batches it sent a holder, each the entries it lacked in one exchange.
+const LIVE_BATCHES: &str = "fleet.live.batches";
+/// Format: the owner's count of entries those batches carried.
+const LIVE_BATCHED: &str = "fleet.live.batched";
+/// Format: a holder's count of live entries it took into its copy (`live_ship::LIVE_HELD`), alone or in a batch.
+const LIVE_HELD: &str = "fleet.live.held";
+
+/// A write attachment of `volume` through `client`.
+fn write_attachment(client: &mut Client, volume: VolumeId) -> u64 {
+  match client.call(&RequestBody::Attach {
+    volume,
+    snapshot: None,
+    intent: Intent::Write,
+    form: AttachRequest::Root,
+  }) {
+    ReplyBody::Attached { attachment, .. } => attachment,
+    other => panic!("attach {volume:?} for writing: {other:?}"),
+  }
+}
+
+/// `volume`'s entries in flight on its owner as the owner's status reports its live log (the head's position past the
+/// durable one), or `None` while the status shows no log for it.
+fn live_in_flight(client: &mut Client, volume: VolumeId) -> Option<u64> {
+  let ReplyBody::DaemonStatus { report } = client.call(&RequestBody::DaemonStatus) else {
+    return None;
+  };
+  report
+    .shards
+    .iter()
+    .flat_map(|shard| shard.live.iter())
+    .find(|live| live.volume == volume && !live.holding)
+    .and_then(|live| {
+      let head = live.head?;
+      Some(match live.durable {
+        Some(durable) => head.saturating_sub(durable),
+        None => head.saturating_add(1),
+      })
+    })
+}
+
+/// Shape: the live volumes the period-slicing test's owner ships, each its own slice under the injected quantum.
+const SLICED_LIVE_VOLUMES: usize = 24;
+/// Format: the owner's count of record periods' live work (`live_ship::period`).
+const LIVE_PERIODS: &str = "fleet.live.periods";
+/// Format: the owner's count of the owner-shard turns that work took.
+const LIVE_PERIOD_SLICES: &str = "fleet.live.period_slices";
+
+/// The owner's live line for `volume` (its own log, not a candidate's copy): head, durable, owed.
+fn owned_live_line(
+  client: &mut Client,
+  volume: VolumeId,
+) -> Option<(Option<u64>, Option<u64>, bool)> {
+  let ReplyBody::DaemonStatus { report } = client.call(&RequestBody::DaemonStatus) else {
+    return None;
+  };
+  report
+    .shards
+    .iter()
+    .flat_map(|shard| shard.live.iter())
+    .find(|live| live.volume == volume && !live.holding)
+    .map(|live| (live.head, live.durable, live.owed))
+}
+
+/// CLAUDE.md "Bounded work everywhere", A-200's record period: a shard's live volumes are visited a slice of about a
+/// step quantum at a time (`live_ship::period_slice`), never all in one turn. Do: three nodes at `f = 1`; on a, 24
+/// live-shipped volumes, each written once, answered at durability and detached; cut the owner's slices after one volume
+/// each (`Daemon::inject_live_period_quantum(Some(0))`) and let three record periods pass. Expect at least 24 slices for each
+/// period that passed whole (one volume each, and one that finds none left), and every volume's log durable at its head
+/// with nothing owed: the slicing starved none. Before, one turn visited every live volume the shard owned.
+#[test]
+fn a_shards_live_volumes_are_visited_by_the_period_in_slices_and_none_is_starved() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, _hosts) = formed_mesh(&["a", "b", "c"]);
+  let mut client = Client::connect(daemons[0].instance());
+  let mut volumes = Vec::new();
+  for index in 0..SLICED_LIVE_VOLUMES {
+    let ReplyBody::Created { id } = client.call(&scratch(&format!("sliced-{index}"))) else {
+      panic!("volume {index} was created");
+    };
+    let attachment = write_attachment(&mut client, id);
+    let shipped = client.call(&RequestBody::LiveShip {
+      volume: id,
+      live_shipped: true,
+    });
+    assert!(
+      matches!(shipped, ReplyBody::LiveShippingSet { live_shipped: true }),
+      "volume {index} is live-shipped: {shipped:?}"
+    );
+    let written = client.call(&RequestBody::FsWrite {
+      volume: id,
+      attachment,
+      path: "/sliced".to_owned(),
+      bytes: vec![u8::try_from(index % 251).unwrap(); 64],
+      mode: 0o644,
+    });
+    assert!(
+      matches!(written, ReplyBody::FsDone { .. }),
+      "volume {index}'s write answered at durability: {written:?}"
+    );
+    // A partition's attachments are capped at the node's derived admission limit (`PartitionCaps::attachments`), which
+    // can sit below this test's volume count (a Mac Studio refused one `TableAtCapacity`, 2026-11-17); the log ships
+    // with no attachment held.
+    let detached = client.call(&RequestBody::Detach { attachment });
+    assert!(
+      matches!(detached, ReplyBody::Detached),
+      "volume {index}'s attachment was let go: {detached:?}"
+    );
+    volumes.push(id);
+  }
+  let counts = |daemon: &Daemon| {
+    [LIVE_PERIODS, LIVE_PERIOD_SLICES].map(|kind| refusal_count(daemon, kind).unwrap())
+  };
+  daemons[0].inject_live_period_quantum(Some(0)).unwrap();
+  let before = counts(&daemons[0]);
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let passed = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    refusal_count(&daemons[0], LIVE_PERIODS).map(|periods| periods >= before[0] + 3)
+  });
+  let after = counts(&daemons[0]);
+  daemons[0].inject_live_period_quantum(None).unwrap();
+  let lines: Vec<_> = volumes
+    .iter()
+    .map(|volume| owned_live_line(&mut client, *volume))
+    .collect();
+  drop(observed);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!("period slicing: periods, slices before {before:?} after {after:?}; lines {lines:?}");
+  assert!(passed, "three record periods passed");
+  let (periods, slices) = (
+    after[0].saturating_sub(before[0]),
+    after[1].saturating_sub(before[1]),
+  );
+  let volumes_per_period = u64::try_from(SLICED_LIVE_VOLUMES).unwrap();
+  assert!(
+    slices >= periods.saturating_sub(1) * volumes_per_period,
+    "each whole period took a slice a volume ({periods} periods, {slices} slices)"
+  );
+  for (index, line) in lines.iter().enumerate() {
+    assert!(
+      matches!(line, Some((Some(head), Some(durable), false)) if head == durable),
+      "volume {index}'s log is durable at its head with nothing owed: {line:?}"
+    );
+  }
+}
+
+/// AC-8.9, A-200 amended 2026-11-17: a burst of barriers on one live volume ships its changes, not the volume. Do: three
+/// nodes at `f = 1`; on a, a volume of half a MiB, then live-shipped and written once (its log's first entry, the whole
+/// state, durable); hold both holders off their shards while sixteen clients each write half a page at once, so every write's
+/// entry waits in flight together. Expect every write answered `FsDone`, no publication turned away for credit, still
+/// one whole record on the log, an entry appended for every write, more than two entries in flight at once (seen in the
+/// owner's status), and the entries each held holder lacked sent as batches of several an exchange once it answered
+/// (`fleet.live.batches`, `fleet.live.batched`). Before, the credit was a fixed two entries: the burst's third
+/// publication was turned away, and the volume's next entry was a copy of all of it; and a holder was sent one entry an
+/// exchange.
+#[test]
+fn a_burst_of_writes_to_a_live_volume_ships_its_changes_not_the_volume() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, _hosts) = formed_mesh(&["a", "b", "c"]);
+  let owner = daemons[0].instance().to_owned();
+  let mut client = Client::connect(&owner);
+  let ReplyBody::Created { id } = client.call(&RequestBody::Create {
+    name: "burst".to_owned(),
+    size: SizeClass::Bounded {
+      limit: BURST_VOLUME_LIMIT,
+    },
+    names: NamePolicy::Exact,
+    require_locked: false,
+    base: None,
+  }) else {
+    panic!("the burst volume was created");
+  };
+  let attachment = write_attachment(&mut client, id);
+  for file in 0..BURST_VOLUME_FILES {
+    let written = client.call(&RequestBody::FsWrite {
+      volume: id,
+      attachment,
+      path: format!("/base-{file}"),
+      bytes: vec![u8::try_from(file % 251).unwrap(); BURST_VOLUME_FILE_BYTES],
+      mode: 0o644,
+    });
+    assert!(
+      matches!(written, ReplyBody::FsDone { .. }),
+      "base file {file}: {written:?}"
+    );
+  }
+  let shipped = client.call(&RequestBody::LiveShip {
+    volume: id,
+    live_shipped: true,
+  });
+  assert!(
+    matches!(shipped, ReplyBody::LiveShippingSet { live_shipped: true }),
+    "the volume is live-shipped: {shipped:?}"
+  );
+  let first = client.call(&RequestBody::FsWrite {
+    volume: id,
+    attachment,
+    path: "/first".to_owned(),
+    bytes: vec![1; BURST_WRITE_BYTES],
+    mode: 0o644,
+  });
+  assert!(
+    matches!(first, ReplyBody::FsDone { .. }),
+    "the first live write is answered at durability: {first:?}"
+  );
+  let counts = |daemon: &Daemon| {
+    [
+      LIVE_WHOLE,
+      LIVE_NO_CREDIT,
+      LIVE_APPENDED,
+      LIVE_BATCHES,
+      LIVE_BATCHED,
+    ]
+    .map(|kind| refusal_count(daemon, kind).unwrap())
+  };
+  let before = counts(&daemons[0]);
+  let taken = |daemon: &Daemon| refusal_count(daemon, LIVE_HELD).unwrap();
+  let taken_before = [taken(&daemons[1]), taken(&daemons[2])];
+  let writers: Vec<(Client, u64)> = (0..BURST_WRITERS)
+    .map(|_| {
+      let mut writer = Client::connect(&owner);
+      let attached = write_attachment(&mut writer, id);
+      (writer, attached)
+    })
+    .collect();
+  let start = std::sync::Barrier::new(BURST_WRITERS + 1);
+  let holds = [&daemons[1], &daemons[2]].map(|holder| {
+    holder
+      .starve_control_shard(BURST_HOLD_NS)
+      .expect("a holder's shard is held")
+  });
+  let (replies, deepest) = std::thread::scope(|scope| {
+    let threads: Vec<_> = writers
+      .into_iter()
+      .enumerate()
+      .map(|(index, (mut writer, attached))| {
+        let start = &start;
+        scope.spawn(move || {
+          start.wait();
+          writer.call(&RequestBody::FsWrite {
+            volume: id,
+            attachment: attached,
+            path: format!("/burst-{index}"),
+            bytes: vec![u8::try_from(index % 251).unwrap(); BURST_WRITE_BYTES],
+            mode: 0o644,
+          })
+        })
+      })
+      .collect();
+    start.wait();
+    let began = Instant::now();
+    let mut deepest = 0;
+    while threads.iter().any(|thread| !thread.is_finished()) && began.elapsed() < PLACEMENT_DEADLINE
+    {
+      if let Some(in_flight) = live_in_flight(&mut client, id) {
+        deepest = deepest.max(in_flight);
+      }
+      std::thread::yield_now();
+    }
+    let replies: Vec<ReplyBody> = threads
+      .into_iter()
+      .map(|thread| thread.join().unwrap())
+      .collect();
+    (replies, deepest)
+  });
+  let held: Vec<_> = holds.into_iter().map(|hold| hold.answer()).collect();
+  let after = counts(&daemons[0]);
+  // The holders' takes are counted as each answers, after the writes it made durable were answered: polled.
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let mut taken_after = taken_before;
+  let burst = u64::try_from(BURST_WRITERS).unwrap();
+  let all_taken = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    taken_after = [taken(&daemons[1]), taken(&daemons[2])];
+    Ok(
+      taken_after
+        .iter()
+        .zip(taken_before)
+        .all(|(after, before)| after.saturating_sub(before) >= burst),
+    )
+  });
+  drop(observed);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "burst: whole, no-credit, appended, batches, batched before {before:?} after {after:?}; deepest in flight \
+     {deepest}; holds {held:?}; holders took {taken_before:?} -> {taken_after:?}"
+  );
+  assert!(
+    replies
+      .iter()
+      .all(|reply| matches!(reply, ReplyBody::FsDone { .. })),
+    "every write of the burst is answered at durability: {replies:?}"
+  );
+  assert_eq!(
+    after[1], before[1],
+    "no publication of the burst was turned away for credit"
+  );
+  assert_eq!(
+    after[0], before[0],
+    "no whole record: the burst shipped its changes, not the volume"
+  );
+  assert!(
+    after[2].saturating_sub(before[2]) >= u64::try_from(BURST_WRITERS).unwrap(),
+    "an entry for every write of the burst"
+  );
+  assert!(
+    deepest > OLD_CREDIT_ENTRIES,
+    "the burst had more entries in flight at once than the old credit let be ({deepest})"
+  );
+  let (batches, batched) = (
+    after[3].saturating_sub(before[3]),
+    after[4].saturating_sub(before[4]),
+  );
+  assert!(
+    batches > 0 && batched > batches,
+    "the entries the held holders lacked went as batches, several an exchange ({batches} batches, {batched} entries)"
+  );
+  assert!(
+    all_taken,
+    "each holder took every entry of the burst: {taken_before:?} -> {taken_after:?}"
   );
 }
 
@@ -12689,6 +13163,160 @@ fn a_forwarded_submit_refused_overloaded_while_it_commits_is_answered_under_its_
     committed,
     answer,
   });
+}
+
+/// A formed two-node `f = 1` fleet of two shards a node, and node A's instance (A-247: a work can be on another shard).
+fn two_shard_fleet() -> (PortLease, Daemon, Daemon, String) {
+  let (ports, [pa_probe, pa_record, pb_probe, pb_record]) = four_free_ports();
+  let a = node("a", pa_probe, pa_record);
+  let b = node("b", pb_probe, pb_record);
+  let instance_a = format!("fleet-{}-{}", a.host.0, std::process::id());
+  let peer_of_a = Peer {
+    anchor: b.origin_anchor,
+    host: b.host,
+    address: b.address,
+    record_address: b.record_address,
+    certificate: b.identity.certificate(),
+  };
+  let peer_of_b = Peer {
+    anchor: a.origin_anchor,
+    host: a.host,
+    address: a.address,
+    record_address: a.record_address,
+    certificate: a.identity.certificate(),
+  };
+  let daemon_a = start_sharded(a, peer_of_a, TWO_SHARDS);
+  let daemon_b = start_sharded(b, peer_of_b, TWO_SHARDS);
+  assert!(
+    form_and_settle(&[&daemon_a, &daemon_b]),
+    "the fleet's groups formed before the test acts"
+  );
+  (ports, daemon_a, daemon_b, instance_a)
+}
+
+/// A green on its owner's node and a work over it placed on another shard of that node, with one edit (A-247).
+fn green_and_off_shard_work(client: &mut Client) -> (VolumeId, VolumeId) {
+  let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
+    name: "off-shard-green".to_owned(),
+    require_evidence: false,
+    base: None,
+  }) else {
+    panic!("create green");
+  };
+  let name = (0u32..)
+    .map(|suffix| format!("off-shard-work-{suffix}"))
+    .find(|name| {
+      slates_server::verbs::owner_of_name(name, usize::from(TWO_SHARDS))
+        != slates_server::verbs::owner_of(green)
+    })
+    .unwrap();
+  let ReplyBody::WorkCreated { id: work, .. } =
+    client.call(&RequestBody::CreateWork { green, name })
+  else {
+    panic!("create work");
+  };
+  (green, work)
+}
+
+/// A-247, AUD-11. Do: in a two-node `f = 1` fleet whose holder withholds every merge record, submit from a client on the
+/// green's node a work on another shard of that node, and pipeline an edit behind it. Expect: the acceptance waits at
+/// the quorum on the owner, and neither verb is answered; once the holder takes the record the submit is answered the
+/// version and the edit after it, in order, and the work reads the edit over the accepted version.
+#[test]
+fn a_submit_off_its_greens_shard_is_held_to_its_quorum_and_the_works_next_verb_behind_it() {
+  let _serial = serialize_fleet_tests();
+  let (_ports, daemon_a, daemon_b, instance_a) = two_shard_fleet();
+  let mut client = Client::connect(&instance_a);
+  let (green, work) = green_and_off_shard_work(&mut client);
+  let appended = |at: u64, bytes: &[u8]| RequestBody::Edit {
+    work,
+    path: "f".to_owned(),
+    at,
+    delete_len: 0,
+    bytes: bytes.to_vec(),
+  };
+  assert!(matches!(
+    client.call(&appended(0, b"hello")),
+    ReplyBody::Edited
+  ));
+  daemon_b
+    .inject_merge_fault(slates_server::merge_service::MergeFault {
+      refuse_content_puts: false,
+      corrupt_next_inputs: false,
+      refuse_records: true,
+      refuse_work_catalogs: false,
+    })
+    .unwrap();
+  let mut pipelined = common::client::connect(&instance_a);
+  let submit = pipelined
+    .begin(&RequestBody::Submit {
+      work,
+      evidence: Vec::new(),
+    })
+    .unwrap();
+  let both = [&daemon_a, &daemon_b];
+  assert!(
+    poll_until(&both, PLACEMENT_DEADLINE, || Ok(
+      daemon_a.merge_awaiting(green)? == 1
+    )),
+    "the acceptance waits at the owner"
+  );
+  let after = pipelined.begin(&appended(5, b"!")).unwrap();
+  assert!(
+    matches!(pipelined.poll_reply(after), Ok(None)),
+    "the edit behind the deferred submit is not answered"
+  );
+  daemon_b
+    .inject_merge_fault(slates_server::merge_service::MergeFault::default())
+    .unwrap();
+  let submitted = answer_within(&mut pipelined, submit.word());
+  let edited = answer_within(&mut pipelined, after.word());
+  let answered_late = daemon_a
+    .refusals_on_every_shard()
+    .unwrap()
+    .get("merge.work.answered_late")
+    .copied()
+    .unwrap_or(0);
+  let read = client.call(&RequestBody::Read {
+    volume: work,
+    path: "f".to_owned(),
+    at: ReadAt::Head,
+  });
+  drop(pipelined);
+  drop(client);
+  daemon_a.stop();
+  daemon_b.stop();
+  assert!(
+    answered_late > 0,
+    "the quorum's commit resumed the parked submit, not a deadline and a retry"
+  );
+  assert_held_to_its_quorum(submitted, edited, &read);
+}
+
+/// What [`a_submit_off_its_greens_shard_is_held_to_its_quorum_and_the_works_next_verb_behind_it`] must have seen.
+fn assert_held_to_its_quorum(
+  submitted: Option<Result<ReplyBody, String>>,
+  edited: Option<Result<ReplyBody, String>>,
+  read: &ReplyBody,
+) {
+  assert!(
+    matches!(
+      submitted,
+      Some(Ok(ReplyBody::Submitted {
+        version: Some(1),
+        ..
+      }))
+    ),
+    "the submit answers its version: {submitted:?}"
+  );
+  assert!(
+    matches!(edited, Some(Ok(ReplyBody::Edited))),
+    "and the edit after it: {edited:?}"
+  );
+  assert!(
+    matches!(read, ReplyBody::ReadBytes { bytes } if bytes == b"hello!"),
+    "the work reads the edit over the accepted version: {read:?}"
+  );
 }
 
 /// What the forwarded resend run observed, for [`assert_resent_under_its_id`].
@@ -20817,6 +21445,154 @@ fn a_versions_merge_record_waits_for_its_works_catalog_record() {
       conflicts: Vec::new(),
     })),
     "the submit was answered its version once its record committed"
+  );
+}
+
+/// A-298 (A-255 under A-247): a work on another shard than its green asks for its verdict only once its catalog record,
+/// its submit's route, is committed, so the version's merge record, which carries the completion, never exists before
+/// its route. The owner's own gate cannot see such a work's catalog, since the owner's partition holds no record of it.
+/// Do: three nodes at `f = 1`, two shards each; on a, a green whose version 0 is placed; both holders withhold every
+/// work's catalog record; on a, a work whose name puts it on the other shard, one edit and a submit, its answer not
+/// read; watch over four liveness budgets of the fleet's periods; then lift the fault, and send the submit again under
+/// its id if its wait outlasted the lease bound (answered `Overloaded`, unrecorded). Expect: version 1's record never
+/// placed while the work's catalog is withheld, the work's shard counting the wait (`merge.work.awaited_route`,
+/// non-vacuous), and, once lifted, the submit answered version 1, its record placed, and the green at version 1.
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn a_submit_off_its_greens_shard_waits_for_its_works_catalog_record_before_its_verdict() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh_with(
+    nodes,
+    &hosts,
+    &certs,
+    &serve,
+    1,
+    TWO_SHARDS,
+    &std::collections::BTreeMap::new(),
+    &std::collections::BTreeMap::new(),
+  );
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let fleet: Vec<&Daemon> = daemons.iter().collect();
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
+    name: "routed-green".to_owned(),
+    require_evidence: false,
+    base: None,
+  }) else {
+    panic!("create green");
+  };
+  let origin_placed = poll_until(&fleet, PLACEMENT_DEADLINE, || {
+    daemons[0].merge_record_placed(green, 0)
+  });
+  let withheld = slates_server::merge_service::MergeFault {
+    refuse_work_catalogs: true,
+    ..Default::default()
+  };
+  let faulted: Vec<_> = daemons[1..]
+    .iter()
+    .map(|holder| holder.inject_merge_fault(withheld))
+    .collect();
+  let name = (0u32..)
+    .map(|suffix| format!("routed-work-{suffix}"))
+    .find(|name| {
+      slates_server::verbs::owner_of_name(name, usize::from(TWO_SHARDS))
+        != slates_server::verbs::owner_of(green)
+    })
+    .unwrap();
+  let ReplyBody::WorkCreated { id: work, .. } =
+    client.call(&RequestBody::CreateWork { green, name })
+  else {
+    panic!("create work");
+  };
+  let edited = client.call(&RequestBody::Edit {
+    work,
+    path: "f".to_owned(),
+    at: 0,
+    delete_len: 0,
+    bytes: b"hello".to_vec(),
+  });
+  let submit = RequestBody::Submit {
+    work,
+    evidence: Vec::new(),
+  };
+  let mut submitter = common::client::connect(daemons[0].instance());
+  let word = submitter.begin(&submit).map(|id| id.word());
+  let placed_while_withheld =
+    poll_for_periods(&fleet, WORK_SEAL_WATCH, WORK_SEAL_WATCH_PERIODS, || {
+      daemons[0].merge_record_placed(green, 1)
+    });
+  let waits = daemons[0]
+    .refusals_on_every_shard()
+    .map(|counts| counts.get("merge.work.awaited_route").copied().unwrap_or(0));
+  let lifted: Vec<_> = daemons[1..]
+    .iter()
+    .map(|holder| holder.inject_merge_fault(slates_server::merge_service::MergeFault::default()))
+    .collect();
+  // A wait past the lease bound was answered `Overloaded`, unrecorded; the retry under its id meets the route again.
+  let answer = word
+    .as_ref()
+    .ok()
+    .and_then(|word| match answer_within(&mut submitter, *word) {
+      Some(Err(refusal)) if refusal.starts_with("Overloaded") => {
+        resent_answer(&mut submitter, *word, &submit)
+      }
+      other => other,
+    });
+  let placed_after = poll_until(&fleet, PLACEMENT_DEADLINE, || {
+    daemons[0].merge_record_placed(green, 1)
+  });
+  let head = client.call(&RequestBody::Versions { green });
+  drop(fleet);
+  drop(submitter);
+  drop(client);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    origin_placed,
+    "the green's version 0 was placed before the fault"
+  );
+  assert!(
+    faulted.iter().chain(&lifted).all(Result::is_ok),
+    "the holders' faults were installed and lifted: {faulted:?} {lifted:?}"
+  );
+  assert!(matches!(edited, ReplyBody::Edited), "the edit: {edited:?}");
+  assert!(word.is_ok(), "the submit was sent: {word:?}");
+  assert!(
+    !placed_while_withheld,
+    "version 1's merge record was not placed while its work's catalog record was withheld"
+  );
+  assert!(
+    waits.as_ref().is_ok_and(|waits| *waits > 0),
+    "the work's shard held the submit for its route: {waits:?}"
+  );
+  assert_eq!(
+    answer,
+    Some(Ok(ReplyBody::Submitted {
+      version: Some(1),
+      conflicts: Vec::new(),
+    })),
+    "the submit was answered its version once its route and its record committed"
+  );
+  assert!(
+    placed_after,
+    "version 1's record was placed once the work's catalog could commit"
+  );
+  assert_eq!(
+    head,
+    ReplyBody::Versions { head: 1 },
+    "the green holds the one version"
   );
 }
 

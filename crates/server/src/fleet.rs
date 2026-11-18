@@ -1679,6 +1679,14 @@ async fn serve_peer_records(
             crate::live_ship::serve_state(s, local, peer_host, &request)
           })
           .unwrap_or_default(),
+          slates_cluster::live::LIVE_ENTRIES_STREAM => state::with_state(|s| {
+            let peer_host = s
+              .learned_members
+              .get(&peer_anchor)
+              .map_or(seed, |learned| learned.host);
+            crate::live_ship::serve_entries(s, local, peer_host, &request)
+          })
+          .unwrap_or_default(),
           crate::mirror::MIRROR_RECORD_STREAM => state::with_state(|s| {
             let peer_host = s
               .learned_members
@@ -2377,7 +2385,9 @@ pub(crate) async fn ship_owed_catalog(
 ///   completion the record carries.
 ///
 /// A volume with no record here owes no catalog: a destroyed volume's tombstone stands for both registers (AUD-29-43).
-/// Read on the green's owner shard, which holds its works too.
+/// Read on the shard that holds the volume's record: a green's on its owner shard, and a work's there too when the work
+/// shares its green's shard; a work on another shard (A-247) is read on its own shard before its verdict is asked
+/// (A-298), so the owner's gate finds no record of it here and passes.
 pub(crate) fn catalog_committed(state: &ShardState, id: DbVolumeId, local: HostId) -> bool {
   state
     .db
@@ -9277,6 +9287,68 @@ mod probe_mesh_tests {
     assert!(
       !mesh(&[], &[], &[a], true).meshed(),
       "a fleet of several with no peer in contact"
+    );
+  }
+}
+
+#[cfg(test)]
+mod request_kind_tests {
+  /// §4.8, D-14: a record session multiplexes every fleet request by its kind, and `serve_peer_records` dispatches by
+  /// kind alone, "never a guess from the bytes" — so two kinds sharing a value send one plane's requests to another's
+  /// handler. Do: list every request kind a fleet connection carries (each `serve_peer_records` dispatches, and the
+  /// ledger's promote). Expect no two equal. Found when live batches
+  /// (`LIVE_ENTRIES_STREAM`) and A-288's work route questions both took 25 on branches merged the same day: every batch
+  /// was answered by the route's handler with nothing and sent again at once, about 500 a second, while the holders
+  /// took none of it (2026-11-17, g230).
+  #[test]
+  fn every_request_kind_the_record_session_dispatches_is_its_own() {
+    let kinds: [(&str, u64); 25] = [
+      ("record", slates_cluster::RECORD_STREAM),
+      (
+        "content offer",
+        slates_cluster::content::CONTENT_OFFER_STREAM,
+      ),
+      (
+        "content chunk",
+        slates_cluster::content::CONTENT_CHUNK_STREAM,
+      ),
+      (
+        "content fetch",
+        slates_cluster::content::CONTENT_FETCH_STREAM,
+      ),
+      ("council", super::CONFIG_STREAM),
+      ("council fetch", super::CONFIG_FETCH_STREAM),
+      ("root", super::ROOT_STREAM),
+      ("root fetch", super::ROOT_FETCH_STREAM),
+      ("forward", super::FORWARD_STREAM),
+      ("merge record", crate::merge_service::MERGE_RECORD_STREAM),
+      ("discovery", crate::discovery::STREAM),
+      ("owner location", crate::owner_location::STREAM),
+      ("report", super::REPORT_STREAM),
+      ("takeover", crate::takeover::TAKEOVER_STREAM),
+      ("plane epoch", crate::member_task::PLANE_EPOCH_STREAM),
+      ("recipient", super::RECIPIENT_STREAM),
+      ("pair key", super::PAIR_KEY_STREAM),
+      ("mirror record", crate::mirror::MIRROR_RECORD_STREAM),
+      ("mirror promise", crate::mirror::MIRROR_PROMISE_STREAM),
+      ("live entry", slates_cluster::live::LIVE_ENTRY_STREAM),
+      ("live state", slates_cluster::live::LIVE_STATE_STREAM),
+      ("death", super::DEATH_STREAM),
+      ("work route", crate::work_route::STREAM),
+      ("live entries", slates_cluster::live::LIVE_ENTRIES_STREAM),
+      ("ledger promote", slates_cluster::LEDGER_PROMOTE_STREAM),
+    ];
+    let mut shared = Vec::new();
+    for (at, (name, kind)) in kinds.iter().enumerate() {
+      for (other, other_kind) in kinds.iter().skip(at + 1) {
+        if kind == other_kind {
+          shared.push((*name, *other, *kind));
+        }
+      }
+    }
+    assert!(
+      shared.is_empty(),
+      "request kinds that share a value: {shared:?}"
     );
   }
 }

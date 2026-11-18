@@ -259,7 +259,82 @@
 > - signed work: a merge or landing may carry an SSH signature, checked and recorded (verified with its signer,
 >   unsigned, invalid with its reason), and a volume may require signed merges;
 > - the end-to-end proof on adacachy: a bypass agent's landing written at once, an ask agent's after approval, a
->   signed merge verified and an invalid signature reported.
+>   signed merge verified and an invalid signature reported. **The landing half ran on Linux (2026-11-18):**
+>   `write_policy.rs` 9 of 9 on Linux x86_64 and arm64, a real daemon and client over a real target directory (GitHub
+>   run 44240968028, main 821d12f7d); signed work stays owed;
+> - **built (2026-11-18, found by the two-node filesystem-server flow):** an agent approves no landing of its own. A
+>   landing's grant verified its proof and manifest but not its channel, so a consumer-bound channel holding a genuine
+>   launcher-class proof was granted, where a policy setting and a merge's approval are refused `Forbidden` whatever
+>   the proof. `grant_verb` now refuses it first (`grant_by_consumer`): `an_agent_cannot_approve_its_own_landing` (red
+>   without the guard: granted) and `fs_server.rs`'s server-node agent
+>   (`docs/bugs/2026-11-18-an-agents-own-channel-could-approve-its-own-landing.md`). **Open, its siblings:** `Enroll`
+>   and `Revoke` still verify the proof alone, so a consumer-bound channel holding a genuine proof could enroll a fresh
+>   consumer (binding a channel that escapes its own consumer policy) or revoke another; the same guard is owed.
+
+> **W1 would have let a work off its green's shard merge under one volume's write policy: fixed before W1 landed
+> (2026-11-18, g231; A-307, §4.16).** A-285 judges a merge's policy from the work's and the green's records on one
+> partition; W1 (A-247) asks the green's owner for the verdict of a work on another shard, where neither shard holds
+> both records, and its gate parks a verb before the verb runs, so a `SubmitApproved` would have reached the owner
+> before its proof was checked. The work's mode now travels with the ask, the owner judges the stricter of the two, and
+> an approval leaves the work's shard only once it verifies. Test:
+> `a_merge_off_its_greens_shard_follows_both_volumes_write_policy` (eight shards). A-285's own tests run one shard.
+
+> **W1 would have let a merge record reach its holders before its route: fixed before W1 landed (2026-11-17, g231;
+> A-298, §4.16).** A-255 holds a version's merge record, which carries its submit's completion, until the submitting
+> work's catalog register is committed, checking it on the green's owner shard. W1 (A-247) puts most works on other
+> shards, whose records the owner's partition does not hold, so the check passed for them unseen; merging the two also
+> failed to compile where A-255's record named a `work_id` that W1's owner half does not have. A submit off its green's
+> shard now asks for its verdict only once its work's register is committed, waiting on the work's own shard
+> (`work_home::Need::Route`). Test: `a_submit_off_its_greens_shard_waits_for_its_works_catalog_record_before_its_verdict`
+> (three nodes at `f = 1`, two shards each, the holders withholding work catalogs). A-255's own test runs one shard a
+> node, so every work there shares its green's shard.
+
+> **A rebased work was restated into other bytes: fixed (perf, 2026-11-09, §4.16 "Rebase, the only corrective path").**
+> A rename over a file, rebased and submitted, left the destination with the moved bytes followed by its own: 20 bytes
+> where 10 were renamed in. An edit that replaced bytes came back with the work's own byte kept and an inserted one
+> deleted. `rebased_from` restated a rename as a whole-file insert, and restated net ops (one pass over the head) at
+> their head offsets in a journal that is replayed one operation at a time. A rename is now restated as a `Rename`, and
+> each op where the pass stands when it reaches it. The oracle `a_rebased_work_submits_as_it_would_have` holds a rebased
+> work to the same answer and head as the same work submitted, after a generated work merged ahead of it: 400 cases,
+> red-checked on each fix. `docs/bugs/2026-11-09-a-rebased-work-was-restated-into-other-bytes.md`.
+>
+> **Open and owed (found by perf, 2026-11-09, §4.16 "Composition at seal"): an edit after a rename is accepted and
+> lost.** A work renames `a` over `b`, writes at the end of `b`, and submits. It is accepted, and `b` holds `a`'s head
+> bytes alone. This is on main with no rebase involved. The verdict skips a renamed-into path's content ops
+> (`decide_content`) and copies the source's head bytes (`merge_rename`). The chain entry's `Applied::Copied { dst, from }`
+> has no ops to replay, and replay maps an entry's effects before committing any, so a second `Spliced` effect cannot
+> carry them. Owed: `Copied` carries the destination's ops, mapped through the source's deltas (a chain-entry format
+> change), and the rebase restates them after the `Rename`. Red test, parked: `an_edit_after_a_rename_over_a_file_is_merged_with_it`
+> (`crates/server/tests/green_post_state.rs`). The rebase oracle's generator stays out of this case until then.
+
+> **The live record period visited every live volume of a shard in one turn: sliced (2026-11-17, A-200, CLAUDE.md
+> "Bounded work everywhere"; g230).** `live_ship::period` ran each live volume's period work (`follow_candidates`,
+> `resolve`, the whole record or image it owed, `pending_sends`) for all of the shard's volumes inside one
+> `call_within` turn, a cost that grew with the volumes the shard owns while its clients waited. It now runs in slices
+> of about the shard's step quantum (`period_slice`, counted `fleet.live.period_slices` against `fleet.live.periods`),
+> each resuming after the last volume visited. Test: `a_shards_live_volumes_are_visited_by_the_period_in_slices_and_none_is_starved`
+> (the quantum injected to one volume a slice, `Daemon::inject_live_period_quantum`). **Owed (measurement, the
+> supervisor's):** the owner shard's longest step and its clients' p99 with thousands of live volumes, before and after.
+
+> **A burst on a live volume shipped the whole volume: fixed (2026-11-17, AC-8.9, A-200 amended; g230).** The owner's
+> credit was a fixed two entries (`live_ship::CREDIT`, R3 debt, with `RETAIN = 4`), and a publication it turned away
+> left the volume owing a whole record: its next entry carried every byte of the volume to every holder. Every barrier
+> publishes, so many writers on one volume put several publications inside one round trip, and the third shipped the
+> volume (sixteen writers of half a page each, both holders held off their shards for a quarter of a liveness window:
+> `a_burst_of_writes_to_a_live_volume_ships_its_changes_not_the_volume`, `crates/server/tests/fleet.rs`: on the fixed
+> credit 13 of the 16 publications were turned away and the log took two more whole copies of the half-MiB volume; with
+> the change none, no whole record, 16 entries and 16 in flight at once; this Mac, debug, 2026-11-17). Now the entries
+> not yet durable and the retained tail are held to the wire bytes of the whole state an install would send
+> (`slates_db::live::Bounds::of_whole`), so the volume ships whole only where that is the cheaper catch-up; the model
+> and unit tests run in bytes (`crates/db/tests/live.rs`, three new). Bug record
+> `docs/bugs/2026-11-17-a-burst-on-a-live-volume-shipped-the-whole-volume.md`.
+> - **Owed (measurement, the supervisor's):** many writers on one large live volume, before and after: whole records,
+>   bytes shipped, and the write's p50/p99/p999 (`fleet.live.whole`, `fleet.live.refused.no_credit`).
+> - **Fixed the same day:** a lane shipped a holder's entries one exchange at a time (`live_ship::ship_lane`), so a burst
+>   of `n` entries reached a holder in `n` round trips; the entries a holder lacks now go as one batch a congestion
+>   window (`take_batch`, `serve_entries`, request kind 26; A-200's second amendment of 2026-11-17; 25 collided with
+>   A-288's work route on merge, caught and fixed the same day, every fleet request kind now held distinct by a test). Owed (measurement):
+>   a stalled holder's catch-up time and a burst's last-write latency, before and after, on a WAN-shaped path.
 
 > **git's history, Mercurial and Subversion join the workload roster (2026-11-17, Part 6 "Real workloads"; A-289;
 > Ada's goal of 2026-11-18).** Until now one 15-line git script was all the version control any route ran: no clone,
@@ -398,6 +473,25 @@
 > now re-enqueues every replayed version's record. Red test: the version never committed in 60 s after the restart;
 > now it commits, and the test ends in 3.3 s. Record:
 > `docs/bugs/2026-11-07-a-version-appended-before-its-owner-restarted-never-committed.md`.
+
+> **Open (perf, 2026-11-08): A-247's step two, works across nodes.** Step one spreads a green's works over the shards of
+> its owner's node (`crates/server/src/work_home.rs`). A `CreateWork` forwarded from another node still places the work
+> on the green's shard, so the three-node `f = 1` rungs are not yet helped (every verb still forwards to the owner's
+> node). What it owes: a rule for the work's node (the creating client's, with its name reachable from any node), the
+> owner's asks over the fleet exchange, and the lease gate on the owner's half of a remote verdict.
+
+> **Open (perf, 2026-11-09): A-247 step one's verdict tail.** At 3,000 clients on one node the rung takes 4.3–4.6 s against
+> main's 8.0, every edit, read and creation faster and no reply lost, but SubmitAccepted p99 is 56–72 ms against main's
+> 42–62 (BENCHMARKS). The owner is the bottleneck, and rebases cost it more than verdicts (`map_rebase` 333 samples
+> against `judge_submission` 226 of 1,121). Owed: the owner's cost per verdict and per rebase.
+>
+> **Open (perf, 2026-11-09): main drops acknowledgement parts at 3,000 clients.** `xshard.reply_dropped` counts 4,074 to
+> 4,474 a run (main 80be552a and db9c514e): results carried home past a full channel for one coordinator period. A
+> diagnostic build of db9c514e counted every one as an acknowledgement scatter's part (4,364 of 4,364 and 4,418 of 4,418);
+> no verb's reply was among them and no client waited out a reply deadline (this entry said so until the diagnostic). A
+> lost part leaves its shard's release unsettled, so the client is refused `AcknowledgementOwed` until a later
+> acknowledgement settles it, 25,868 to 28,995 times a run, each a pause and a resend. Fixed on agents/perf-replies
+> (every result waits for room while its shard lives). BENCHMARKS, "Why main's two figures differ".
 
 > **Open (perf, 2026-11-08): the give-back's slice is learned from wall time.** `learn_give_back_rate` divides by the
 > shard's clock, so on a loaded host a preempted step teaches a small slice and a give-back takes thousands of steps
@@ -653,7 +747,16 @@
 > owes nothing and is never silent. On loopback a stopped peer is judged about 2 s into its silence, not 1 s
 > (fleet-transport §5 status; tests in `crates/transport/tests/exchanges.rs`).
 
-> **Open (live-durability, 2026-11-09): the regional configuration's encoding carries no version or schema check.**
+> **Fixed (g230, 2026-11-17): the regional and root configurations carry a magic and a layout version, refused by
+> name.** `raft_wire::encode_regional_configuration` and `encode_root_configuration` now begin with a magic ("RCFG",
+> "RTCF") and a layout version (1); a decoder refuses another kind or an unversioned layout `ForeignLayout`, another
+> version `LayoutVersion`, before reading any field, and a retained council or root of another build's layout refuses
+> recovery by name (`retention::configuration_refused`). Tests: `a_configuration_of_another_layout_is_refused_by_name`,
+> `a_retained_council_of_another_layout_refuses_recovery_by_name`. A-272's "The encoding" status. **Open (the sweep):**
+> the configuration group's commands (`config_group::ConfigCommand`) carry a tag byte but no layout version, so a
+> change to an existing command's fields would be read by position.
+>
+> **Was open (live-durability, 2026-11-09): the regional configuration's encoding carries no version or schema check.**
 > `raft_wire::encode_regional_configuration` is a fixed sequence of fields with no version byte. A-272 appended a
 > field (`dropped_unconfirmed`); an old entry is refused only because it runs out of bytes there (`Truncated`), and a
 > new one at an old build because bytes are left over (`LengthMismatch`). Every caller refuses rather than defaults:
@@ -1390,13 +1493,16 @@
 >     - The checkpoint walk is not sliced.
 >
 > - **The quiet arm's first rungs: correct, and far from 1 ms** (Mac Studio, load 5 to 9, one node; BENCHMARKS, "The
->   load test's quiet arm"). At 1,000 clients p50 is 35 to 73 ms and p99 158 to 227 ms; at 3,000, p50 197 to 219 ms.
->   The oracle had 0 failures. Every operation of a green's works is served on the green's one shard (about 112 µs
->   an operation, 8,960 a second), so a closed-loop client's latency is clients × service time. At 3,000 clients the
->   green's retention cap refused 2,405 submits `BudgetExceeded`: a version keeps the whole previous bytes of every
->   file it overwrote, and the history folds only down to the oldest base a live work holds. Walls owed for the
->   10k–100k rungs (the green chain's checkpointing above is closed on the owner):
->   - a green's works served off its owner's shard, with only the verdict serialized;
+>   load test's quiet arm"). At 1,000 clients p50 is 35 to 73 ms and p99 158 to 227 ms; at 3,000, p50 197 to 219 ms. The
+>   oracle had 0 failures. Before A-247 every operation of a green's works was served on the green's one shard (about
+>   112 µs an operation, 8,960 a second), so a closed-loop client's latency was clients × service time. At 3,000 clients
+>   the green's retention cap refused 2,405 submits `BudgetExceeded`: a version keeps the whole previous bytes of every
+>   file it overwrote, and the history folds only down to the oldest base a live work holds. Walls owed for the 10k–100k
+>   rungs (the green chain's checkpointing above is closed on the owner):
+>   - ~~a green's works served off its owner's shard~~ **step one on main (A-247, landed 2026-11-17 by g231)**: on
+>     the owner's node a work lives on the shard its name hashes to. Its creation, its first read of each base file,
+>     its verdict and its rebase ask the owner; every other verb runs on the work's shard. Across nodes (step two) is
+>     open (above). The asks still queue on the owner, so its CPU a verdict and a rebase is the next wall (perf);
 >   - ~~history that keeps what a version overwrote, not whole files~~ **closed (A-242, 2026-11-07)**: the
 >     history is copy-on-write (`crates/merge/src/history.rs`). A version costs the bytes it wrote and its piece
 >     lists. Behind a held floor, 64 versions of 64-byte overwrites of a 1 MiB file under a 16 MiB cap: 16 of 64
@@ -1419,16 +1525,17 @@
 >     **Why think time 0 cannot meet the bound, on any build.** Each round of a client holds a verdict, the green's one
 >     serialized step. In the closed loop at think time 0 the owner finishes at most one round per verdict's cost of its
 >     CPU, so a round takes at least the clients × that cost (Little's law). The owner's CPU a verdict was 21.0–26.9 µs
->     on W1 and 37.6–50.9 µs on main db9c514e (agents/perf-w1's BENCHMARKS, 2026-11-09). So at 1,000 clients a round
->     takes at least 21 ms on W1 and 38 ms on main. A round is six requests (four edits, the append and the submit),
->     and holding each under 1 ms at think time 0 would need a verdict of at most 6 µs at 1,000 clients and 60 ns at
->     100,000. A conflict adds verdicts and rebases to the round, and lowers both bounds further.
+>     on W1 and 37.6–50.9 µs on main db9c514e (BENCHMARKS, A-247's owner-CPU tables, 2026-11-09). So at 1,000 clients a
+>     round takes at least 21 ms on W1 and 38 ms on main. A round is six requests (four edits, the append and the
+>     submit), and holding each under 1 ms at think time 0 would need a verdict of at most 6 µs at 1,000 clients and
+>     60 ns at 100,000. A conflict adds verdicts and rebases to the round, and lowers both bounds further.
 >
->     **The proposed statement (a decision for Ada, owner g231).** The bound holds at §1.4's offered increment rate per
->     green: tens of increments a second for a few agents, thousands for a fleet session (hecate MERGE.md §7). The green
->     rate is the same at every rung, so a client's share falls as the clients grow. At 100,000 clients a thousand
->     increments a second is one submit a client every 100 s, about an agent's pace; at 1,000 clients it is one a
->     second each.
+>     **The statement (Ada's decision, 2026-11-18, the option g231 proposed).** "1,000 clients under 1 ms" is measured
+>     at up to 1,000 merges a second, §1.4's offered increment rate per green: tens of increments a second for a few
+>     agents, thousands for a fleet session (hecate MERGE.md §7). The bound holds when every kind's p99 stays under
+>     1 ms at 10³ or more verdicts a second with 1,000 clients and no oracle failures. The green rate is the same at
+>     every rung, so a client's share falls as the clients grow. At 100,000 clients a thousand increments a second is
+>     one submit a client every 100 s, about an agent's pace; at 1,000 clients it is one a second each.
 >     - Each rung sweeps its think mean so the verdicts a second (the `offered` row) span the fleet row, 10³ to 10⁴.
 >     - Each rung reports the highest rate at which every kind's p99 stays under 1 ms: the rung's capacity at the
 >       bound, which ratchets upward only.
@@ -1436,10 +1543,24 @@
 >     - The closed loop at think time 0 is the rung's capacity, reported in verdicts a second and never against the
 >       bound.
 >
->     **Owed, measurement (the supervisor's):** the 1,000-client rung on main, and on W1 once it lands. Each think mean
->     runs as its own invocation with a fresh daemon, interleaved across builds: every kind's p50, p99, p999 and max,
->     and the `offered` row. A think mean of about 200 ms gives about 10³ verdicts a second at 1,000 clients (a round of
->     about six requests a client), and about 20 ms gives about 10⁴. The run's own verdicts a second are the figure.
+>     **The judgment is the harness's (2026-11-18, g231).** Every level prints a `bound` row after its oracle: the
+>     bound (1 ms) and the rate it is stated at (10³ verdicts a second); the level's verdicts a second; the worst p99 of
+>     every kind, each attempt's and each operation's, with its row and kind; the clients held, given up or starved;
+>     the oracle's failures; and `met` yes or no. A level meets the bound only at the stated rate or above, with every
+>     p99 under it, no failure, and no client given up or starved. `Cycle` and `Round` now leave out their client's own
+>     think pauses: left in, a cycle at about 200 ms a pause holds five of them, and no paced level could meet the
+>     bound. A cycle also starts at its first edit's first send, so a refusal for now of that edit and its pause are in
+>     it. Unit tests in the example: a round's cycle and round are its requests' time and none of its pauses, through
+>     a conflict's resolution too; a cycle starts at the first send; the row meets the bound with every kind under it at
+>     the rate, names the kind over it (a p99 of exactly 1 ms is not under), and fails below the rate, with an oracle
+>     failure, with a client given up or starved, and with nothing timed.
+>
+>     **Owed, measurement (the supervisor's):** the 1,000-client rung on main with W1 (A-247 step one, landed
+>     2026-11-17) against main before it (02c6469e5). Each think mean runs as its own invocation with a fresh daemon,
+>     interleaved across builds: every kind's p50, p99, p999 and max, the `offered` row and the `bound` row. A think
+>     mean of about 200 ms gives about 10³ verdicts a second at 1,000 clients (a round of about six requests a client),
+>     and about 20 ms gives about 10⁴. The run's own verdicts a second are the figure. The goal is met when a level at
+>     1,000 clients reads `met yes` at 10³ verdicts a second or more.
 >
 >   The 10,000-client rung (same Studio, load 9.8 to 10.9, 313 connections) did not finish within its 30-minute bound.
 >   After 1,775 s about 2,170 of 10,000 clients were done and about 11,600 submits counted, with daemon RSS 17.6 GB.
@@ -2461,8 +2582,8 @@
 > plane has lent (`ship_head`). Fixed the same day: a holder behind the retained tail no longer puts a whole copy of the volume on the log ahead of every later write; it is installed from an image made beside the log (§4.10 status "An install image beside the log"). Open: one exchange per message to every holder starved the second holder (never
 > accepted an entry, in six of nine process flows) and was rejected; why is not pinned down. Open, toward a filesystem
 > server replicated per write in under 1 ms: AC-8.9's credit backpressure (since 2026-11-05 a local checkpoint ships a
-> live volume's changes, not a whole copy: 1 whole record in 2,051 where main made about 420; the credit itself is
-> still the fixed two, not yet derived from the measured apply rate and round trip); a candidate's copy kept across its own
+> live volume's changes, not a whole copy: 1 whole record in 2,051 where main made about 420; since 2026-11-17 the credit
+> is the whole state's bytes, not a fixed two entries, A-200 amended, the entry at the top of this ledger); a candidate's copy kept across its own
 > restart; real-process chaos
 > (partitions, injected latency, volume failure, client disconnect). `put_wal` and the
 > loss-window report are unbuilt; a head still waits up to the 100 ms record period before its commit starts.
@@ -2770,7 +2891,31 @@
 >   (`crates/base/tests/host.rs`).
 > - **No grant can be issued on Linux from the CLI.** The anchor's issuer segment is a descriptor only its children
 >   hold (`PRINTS_ISSUER_SURFACE` in `crates/cli/tests/cli.rs`), so a Linux server's landing stops at its
->   presentation. Needs a decision on the Linux issuer surface (§4.13).
+>   presentation. **Closed for the launcher's path (2026-11-18, A-285, fs-server plan step 1):** the launcher (kiln,
+>   or this test acting as it) starts the server's anchor with its secret on standard input (A-299) and sets the
+>   volume's write policy through `slates-api`; bypass then lands in the one `slates land`, and ask lands once the
+>   launcher approves exactly the presented manifest. `crates/cli/tests/fs_server.rs`, two anchored nodes:
+>   `a_bypass_server_lands_the_client_nodes_merge_in_one_call` (4 entries written, the project exactly the merged
+>   files) and `an_ask_server_lands_the_client_nodes_merge_once_its_launcher_approves_that_manifest` (the approval
+>   request writes nothing; agents' channels set and approve nothing, `NotFound` on the client node, `Forbidden` on
+>   the server's; another manifest refused `GrantMismatch`; the approved one writes 4 entries). Passed on macOS arm64,
+>   Linux x86_64 and Linux arm64 (GitHub run 44248664367: `fs_server` 8 of 8, `write_policy` 10 of 10); red with the
+>   bypass policy or the launcher's approval taken away, and with the grant guard taken out (run 44248681152: each
+>   mutated test fails at its own assertion; the agent's own grant issued, `Ok(1)`). **Still open:** a person at a bare
+>   CLI, with no launcher, has no approval verb of their own; one would read the launcher's secret from a descriptor
+>   the person passes, never an argument or the environment.
+> - **The server in its own container lands into the volume attached to it (2026-11-18, fs-server plan step 2).** The
+>   container leg of 2026-11-05 stopped at the grant; it now lands. `fs_server.rs`'s `in_a_container` (Linux; gated
+>   `SLATES_TEST_CLI=1` and `SLATES_TEST_CONTAINER=1`, set in CI's Linux CLI step): the server node is `slates anchor` in
+>   an `ubuntu:24.04` container on a Docker network of its own, its launcher's secret on standard input through
+>   `StartSpec::anchor_command` with `docker run` as the program, its projects a bind-mounted volume; the client node runs
+>   on the host at the bridge's gateway. The launcher's role runs inside the container (the test binary re-invoked
+>   there, the secret on its standard input), since a launcher reaches its instance only where it runs. Under ask the
+>   land answers the approval request and the host reads the project unchanged until the launcher approves exactly the
+>   presented manifest (4 written, none failed); under bypass the one `slates land` writes 4 entries; the host reads every
+>   merged byte from its side of the attached volume. 3 of 3 runs on GitHub's ubuntu runner (run 44254100848, kernel 7.0,
+>   Docker 29.4); red with the launcher's approval taken away (fails at the asked project's read) and with bypass
+>   replaced by ask (the one land writes nothing).
 > - **Remote attach is owed (§4.10):** another node's `attach` is refused `NotFound`, so a client on another node
 >   pushes through a green, never through a write attachment.
 > - **A self-signed fleet certificate must be a leaf.** OpenSSL's default (`CA:TRUE`) is refused
