@@ -20,7 +20,7 @@
 //!
 //! - `CreateHardLinkW` must give a file a second name (A-360), as git's local clone links its objects; WinFsp's driver as
 //!   released refuses the link itself (`STATUS_NOT_SUPPORTED`), so the test skips loudly there and runs where the
-//!   driver carries `docs/wip/winfsp-patches`.
+//!   driver carries `docs/wip/winfsp-patches`; `SLATES_WINFSP_HARD_LINKS=1` makes a refusal fail there.
 //!
 //! Windows only, and gated on `SLATES_TEST_CLI=1` and `WINFSP_TEST_MOUNT=1`, as `tests/winfsp.rs` is; without them
 //! each test skips loudly and passes. CI's Windows lanes install WinFsp and set both.
@@ -60,6 +60,9 @@ const ERROR_ACCESS_DENIED: i32 = 5;
 /// Format: Win32's `ERROR_NOT_SUPPORTED` (winerror.h): what `CreateHardLinkW` answers where WinFsp's driver refuses
 /// `FileLinkInformation` itself (`STATUS_NOT_SUPPORTED`, `src/sys/fileinfo.c`, WinFsp v2.1 to v2.2 as released; A-360).
 const ERROR_NOT_SUPPORTED: i32 = 50;
+/// Format: set where WinFsp's driver carries `docs/wip/winfsp-patches` (A-360), so the hard-link test fails, never
+/// skips, when the link is refused.
+const EXPECT_HARD_LINKS: &str = "SLATES_WINFSP_HARD_LINKS";
 /// Format: Win32's `ERROR_DIR_NOT_EMPTY` (winerror.h).
 const ERROR_DIR_NOT_EMPTY: i32 = 145;
 /// Format: the bytes the truncation test writes first: winfstest's own length (`SetEndOfFile %s 42`).
@@ -367,7 +370,7 @@ fn links_and_index(path: &str) -> (u32, u64) {
 /// a taken name. Expect: one file under two names (one file index, two links), the write seen through both, the second
 /// name keeping the bytes with one link once the first is gone, and the taken name refused `ERROR_ALREADY_EXISTS`. Skips
 /// loudly where WinFsp's driver refuses the link itself (`ERROR_NOT_SUPPORTED`): only a driver carrying
-/// `docs/wip/winfsp-patches` forwards it.
+/// `docs/wip/winfsp-patches` forwards it. With [`EXPECT_HARD_LINKS`] set (a machine with that driver), a refusal fails.
 #[test]
 fn a_hard_link_made_through_the_drive_names_the_same_file() {
   if !live_mount_runs() {
@@ -378,6 +381,12 @@ fn a_hard_link_made_through_the_drive_names_the_same_file() {
   match create_hard_link(&drive.path("second.txt"), &drive.path("first.txt")) {
     Ok(()) => {}
     Err(ERROR_NOT_SUPPORTED) => {
+      // A run on a driver that forwards links (a test-signing machine with the patch) says so, and a refusal there is
+      // a failure, never a skip.
+      assert!(
+        std::env::var_os(EXPECT_HARD_LINKS).is_none(),
+        "{EXPECT_HARD_LINKS} is set, but the link was refused ERROR_NOT_SUPPORTED: the driver or the drive makes none"
+      );
       eprintln!(
         "SKIP: this WinFsp's driver refuses hard links itself (ERROR_NOT_SUPPORTED); a driver carrying \
          docs/wip/winfsp-patches forwards them (A-360)"
