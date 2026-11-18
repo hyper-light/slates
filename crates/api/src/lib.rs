@@ -51,16 +51,14 @@
 //! compile errors of the matches it must extend — never as a variant falling silently through a wildcard. The wire
 //! types re-exported here grow append-only (D-15) and count as the contract's where it returns them.
 //!
-//! **What is owed** (GAPS, the A-278, A-299 and A-321 rows): the starter handed the launcher's authority on every
-//! platform; typed fields on the wire
-//! for drift, a presentation's conflicts and a merge's versions, replacing what this crate reads from text; a paged
-//! listing; an async form over a host's reactor (R6); a typed class for a pinned snapshot's destroy, which the daemon
-//! answers untyped (`Invalid::Request`, A-310).
+//! **What is owed** (GAPS, the A-278 and A-299 rows): a typed field on the wire for a merge's versions (the work's
+//! base beside the green's head), which this crate reads in a second call after the verdict; and the async form for
+//! the verbs it does not serve yet (the paged reads, landings, merges, policies and observation).
 //!
 //! **The seam (A-310).** A host whose rules reach other products only through a trait with a simulator and a
 //! conformance suite (Hex's `CLAUDE.md` §9) holds [`Volumes`]: the contract's volume verbs, implemented by [`Instance`]
 //! and by [`SimVolumes`], an in-memory stand-in that answers the same typed outcomes and errors. One conformance suite
-//! runs over both (`tests/seam.rs`).
+//! runs over both (`the_seam_conforms` in `tests/api.rs`).
 
 // The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds are exempt.
 // The panic rule: a print macro panics on a refused write, and a library prints nothing: every outcome is returned.

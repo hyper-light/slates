@@ -1665,6 +1665,12 @@ mod shards {
   const INIT_OUT_FLAGS_AT: usize = 12;
   const INIT_OUT_ALIGNMENT_AT: usize = 28;
   const INIT_OUT_FLAGS2_AT: usize = 32;
+  /// Format: `fuse_attr.flags`' `FUSE_ATTR_DAX`, the guest maps this file with DAX, and where it lies in a LOOKUP reply
+  /// (`fuse_entry_out`: 40 bytes before its `fuse_attr`, whose last word is `flags`, at 84).
+  const ATTR_DAX: u32 = 1 << 1;
+  const ENTRY_ATTR_FLAGS_AT: usize = OUT_HEADER_LEN + 40 + 84;
+  /// Shape: a file of a DAX range and a half (`FUSE_DAX_SZ`, the range a guest maps a file in): one the stream marks.
+  const LARGE_BYTES: u64 = slates_mem::DAX_RANGE_BYTES + slates_mem::DAX_RANGE_BYTES / 2;
 
   /// Shards' fs device as the end's holder speaks it: a little-endian length, then the FUSE request; one reply frame
   /// back.
@@ -1700,16 +1706,29 @@ mod shards {
     -i32::from_le_bytes(reply[4..8].try_into().unwrap())
   }
 
+  /// Whether a successful LOOKUP reply marks its file `FUSE_ATTR_DAX`.
+  fn marked_dax(reply: &[u8]) -> bool {
+    assert_eq!(errno(reply), 0, "the LOOKUP is answered");
+    let flags = &reply[ENTRY_ATTR_FLAGS_AT..ENTRY_ATTR_FLAGS_AT + 4];
+    u32::from_le_bytes(flags.try_into().unwrap()) & ATTR_DAX != 0
+  }
+
   /// AC-5.12 / T-5.14 (A-278; §4.6, the Shards route, A-161; Shards part 3, the DAX offer): do serve a volume holding a
-  /// file over the library's Shards stream, then speak FUSE through the end as Shards' device does, its `INIT` offering
-  /// the DAX flags a `dax=inode` guest offers. Expect INIT answered keeping `FUSE_MAP_ALIGNMENT` and
-  /// `FUSE_HAS_INODE_DAX` with the host's page as the alignment, the file found by LOOKUP, and a name the volume lacks
-  /// answered `ENOENT`: the end serves that volume, offers its guest DAX, and no host mount is involved.
+  /// small file and one of a DAX range and a half over the library's Shards stream, then speak FUSE through the end as
+  /// Shards' device does, its `INIT` offering the DAX flags a `dax=inode` guest offers. Expect INIT answered keeping
+  /// `FUSE_MAP_ALIGNMENT` and `FUSE_HAS_INODE_DAX` with the host's page as the alignment, both files found by LOOKUP,
+  /// the large one marked `FUSE_ATTR_DAX` and the small one not, and a name the volume lacks answered `ENOENT`: the end
+  /// serves that volume, offers its guest DAX per file, and no host mount is involved.
   #[test]
   fn a_shards_stream_end_serves_the_volume_it_was_made_for() {
     let (daemon, mut instance) = grouped("shards");
-    let volume = provision(&mut instance, &VolumeSpec::empty("guest", ROOM));
+    let large = vec![0x5a_u8; usize::try_from(LARGE_BYTES).unwrap()];
+    let volume = provision(
+      &mut instance,
+      &VolumeSpec::empty("guest", ROOM + LARGE_BYTES),
+    );
     write_file(&mut instance, volume, "/present", b"through the stream\n");
+    write_file(&mut instance, volume, "/large", &large);
     let served = instance.serve_shards(volume, Intent::Write, None).unwrap();
     let stream = UnixStream::from(served.stream);
     stream.set_read_timeout(Some(START_WAIT)).unwrap();
@@ -1751,8 +1770,14 @@ mod shards {
       "the host's page as the alignment"
     );
     let found = device.ask(Opcode::Lookup, ROOT, b"present\0");
-    assert_eq!(errno(&found), 0, "LOOKUP of the volume's file");
-    assert!(found.len() > OUT_HEADER_LEN);
+    assert!(
+      !marked_dax(&found),
+      "the volume's small file is found and not marked"
+    );
+    assert!(
+      marked_dax(&device.ask(Opcode::Lookup, ROOT, b"large\0")),
+      "a file of a range or more is found and marked"
+    );
     let missing = device.ask(Opcode::Lookup, ROOT, b"absent\0");
     assert_eq!(errno(&missing), ENOENT, "a name the volume lacks is ENOENT");
     drop(device);
