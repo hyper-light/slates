@@ -93,12 +93,23 @@
 > its signature; the contract's `land` sends it and `approve_landing` carries it (`CONTRACT` 20). Proven by four
 > landing tests in `signed_work.rs` and the contract's `a_signed_landing_is_judged_and_read_back_through_the_contract`
 > (macOS arm64, 2026-11-18), each guard red alone. **Owed, in order:**
-> - the verdict carried by a version's merge record (`MergeRecordValue`) to holders and a takeover successor, which
->   records none today, so a green taken over reads its merged versions unsigned;
-> - **a sibling found here, open (A-285's too):** a takeover successor makes a volume's record with no write policy and
->   no trusted signers (`verbs::materialize_taken_over`, and `record_adopted_green` since A-333: `write: None`), since the
->   catalog register (`catalog::CatalogValue`) carries neither, so a volume taken over merges and lands as an unset
->   one does, its signed-merge requirement dropped; the catalog register should carry both;
+> - **owned by the replication goal (g230) from 2026-11-18 (g090 closed):** signed work across a takeover. (a) The
+>   verdict carried by a version's merge record (`MergeRecordValue`) to its holders and a takeover successor: today a
+>   successor records none, so a green taken over reads its merged versions unsigned. (b) The catalog register keeping
+>   the write policy, its version and the trusted signers: a successor makes a volume's record with none
+>   (`verbs::materialize_taken_over`, and `record_adopted_green` since A-333: `write: None`), since
+>   `catalog::CatalogValue` carries neither, so a volume taken over merges and lands as an unset one does, its
+>   signed-merge requirement dropped (A-285's sibling too). Both are built and tested, unlanded, on branch
+>   `agents/g090-signed-work-takeover` (09a5747b6, merged with main 90216d741): `MergeRecordValue::signature`, recorded
+>   in each holder's replica as it accepts the record (`merge_service::recompute`) and as a replica is advanced or
+>   rebuilt from the ledger (`merge_origin`), so the engine a successor adopts (A-333) answers each version as its owner
+>   judged it; `CatalogValue::write`, `write_version` and `signers`, carried by `AdoptedGreen` and used by
+>   `record_adopted_green` and `materialize_taken_over`. Its `crates/server/tests/fleet.rs` tests on three nodes at
+>   `f = 1`, `a_greens_policy_signers_and_verdicts_survive_its_owner` and
+>   `a_volumes_policy_and_signers_survive_its_owner`, pass with main's A-333 adoption tests (Mac Studio, 2026-11-18),
+>   and each fails with its guard removed alone (the adoption or a plain successor dropping the catalog's policy, read
+>   `(None, 0)`; a holder's replica dropping the verdict, read `Unsigned`; the owner shipping none or the catalog
+>   carrying none, never held);
 > - **found here, open (§4.15 "Audit", §4.14):** on a daemon of more than one shard `Audit` reads only the partition of
 >   the shard that serves it (`RequestBody::Audit` routes to the client's own shard, `landing::audit_verb`), while a
 >   landing's records are written on its volume's owner shard, so a consumer misses every landing whose volume another
@@ -107,7 +118,10 @@
 >   of the landing at all; on one shard every step. §4.15 says the audit log is written through the control shard. The
 >   fix needs a read over every partition with a cursor per partition (each keeps its own sequence), or the records
 >   written where the design says;
-> - a real FIDO key's signature end to end (the touch flag is proven with a software stand-in);
+> - a real FIDO key's signature end to end (the touch flag is proven with a software stand-in): it needs a physical key,
+>   which only a person holds, or OpenSSH's software authenticator (`regress/misc/sk-dummy`, built from OpenSSH's source
+>   and loaded by `ssh-keygen -w`), a tool build CLAUDE.md §2 item 14 reserves for Ada; macOS's OpenSSH 10.2p1 on the
+>   Mac Studio carries only `ssh-sk-helper`'s hardware middleware (checked 2026-11-18);
 > - the integrator's runs on Linux and Windows (the merge tests are platform-free but for the agent's own channel; the
 >   landing tests run where the daemon lands, on Unix, and a Windows landing writer, when it lands, must judge and
 >   record a signature as `landing::landing_verdict` does, which is gated with the Unix landing path).
