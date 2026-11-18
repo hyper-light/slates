@@ -1,9 +1,9 @@
 //! A-232 step 5, §4.7 and §4.14: the client's one rule — a call waits while its daemon lives — and its liveness bound,
 //! proved against the anchor that ships. The test is this crate's own anchor: a child process of this test binary runs
-//! [`crate::anchor::supervise`], the `slates anchor` path after its arguments, so the lapse, the lateness it measures and
+//! [`super::anchor::supervise`], the `slates anchor` path after its arguments, so the lapse, the lateness it measures and
 //! the kill are the product's, not a copy's. The daemon it supervises is this binary again, re-invoked as
-//! [`a_daemon_role`]: [`crate::daemon::start`] over the anchor's segment from the environment (`SegmentSource::FromEnv`,
-//! a supervised daemon), then [`crate::daemon::serve`], as `slates daemon` runs. The daemon inherits the anchor's
+//! [`a_daemon_role`]: [`super::daemon::start`] over the anchor's segment from the environment (`SegmentSource::FromEnv`,
+//! a supervised daemon), then [`super::daemon::serve`], as `slates daemon` runs. The daemon inherits the anchor's
 //! standard streams, so the parent reads both processes' lines on one pipe and tells the first daemon, on standard
 //! input, which client's shard to hold.
 //!
@@ -45,7 +45,7 @@ use slates_server::Daemon;
 use slates_server::daemon::{HEARTBEAT_NS, LIVENESS_BUDGET_NS, OBSERVE_BUDGET_NS};
 use slates_server::state::ShardState;
 
-use crate::args::ProcessOptions;
+use super::ProcessOptions;
 
 /// Format: the environment variables that select the anchor role, name the instance, and say what the first daemon
 /// holds (`wedged`, or `none` to serve).
@@ -55,7 +55,7 @@ const INSTANCE: &str = "SLATES_A232_INSTANCE";
 const HOLD: &str = "SLATES_A232_HOLD";
 const WEDGED: &str = "wedged";
 /// Format: the daemon role's test path, which the anchor re-invokes this binary with.
-const DAEMON_ROLE: &str = "liveness_tests::a_daemon_role";
+const DAEMON_ROLE: &str = "role::liveness_tests::a_daemon_role";
 /// Format: the roles' tags, looked for anywhere in a line (libtest's banner is glued to a role's first line).
 const DAEMON_READY: &str = "A232-DAEMON-READY";
 const HELD_TAG: &str = "A232-HELD";
@@ -137,7 +137,7 @@ fn an_anchor_role() {
     .iter()
     .map(|arg| (*arg).to_owned())
     .collect();
-  crate::anchor::supervise(&options(instance), &daemon_args).unwrap();
+  super::anchor::supervise(&options(instance), &daemon_args).unwrap();
 }
 
 /// The daemon role, started by the anchor role: the first daemon (no restart before it) makes the local group and, when
@@ -152,7 +152,7 @@ fn a_daemon_role() {
   let Ok(instance) = std::env::var(INSTANCE) else {
     return;
   };
-  let started = crate::daemon::start(&options(instance)).unwrap();
+  let started = super::daemon::start(&[], &options(instance)).unwrap();
   let restarts = started
     .daemon
     .segment()
@@ -176,7 +176,7 @@ fn a_daemon_role() {
     let daemon = &started.daemon;
     wedge_for_good(daemon, serving(daemon, client_id));
   }
-  crate::daemon::serve(started).unwrap();
+  super::daemon::serve(started).unwrap();
 }
 
 /// Which of `daemon`'s shards serves the client `client_id`, once its connection is seated.
@@ -282,7 +282,7 @@ impl AnchorRole {
       .args([
         "--ignored",
         "--exact",
-        "liveness_tests::an_anchor_role",
+        "role::liveness_tests::an_anchor_role",
         "--nocapture",
       ])
       .env(ROLE, ANCHOR_ROLE)
@@ -452,7 +452,7 @@ fn margin_ns(after: Duration, bound: Duration) -> i128 {
   i128::try_from(after.as_nanos()).unwrap() - i128::try_from(bound.as_nanos()).unwrap()
 }
 
-/// A-232 step 5, §4.7, §4.14. Do: under the anchor that ships ([`crate::anchor::supervise`]), wedge the shard that
+/// A-232 step 5, §4.7, §4.14. Do: under the anchor that ships ([`super::anchor::supervise`]), wedge the shard that
 /// serves a client at `t0` (one poll asleep for good) and keep a call of that client outstanding. Expect: the
 /// watchdog's wedged line says it withholds the beat; the anchor's kill line comes within `2·W + B + L` of `t0`, `L` the
 /// watchdog's first look's lateness and the anchor's logged age past the window (the module doc); so the client's
