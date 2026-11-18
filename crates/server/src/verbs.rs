@@ -14009,6 +14009,16 @@ fn restore_nfs_answers(
     })
     .collect();
   let restored = state.recovered_nfs_replies.len();
+  let keys: Vec<String> = state
+    .recovered_nfs_replies
+    .keys()
+    .map(|(connection, xid)| format!("{connection}/{xid:#x}"))
+    .collect();
+  eprintln!(
+    "diag-nfs restored pid={} held replies [{}]",
+    std::process::id(),
+    keys.join(",")
+  );
   if restored > 0 {
     state.count(
       crate::nfs::HELD_REPLY_RESTORED,

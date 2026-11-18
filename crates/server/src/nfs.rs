@@ -493,6 +493,14 @@ fn held_reply_answer(
 ) -> Option<(AcceptStatus, Vec<u8>)> {
   let (accepted, results) = s.recovered_nfs_replies.remove(&(connection, xid))?;
   s.count(HELD_REPLY_ANSWERED, 1);
+  diag::line(format_args!(
+    "held-answer conn={connection} xid={xid:#x} accepted={accepted} {}",
+    diag::result(
+      NFS_PROGRAM,
+      u32::MAX,
+      &(AcceptStatus::Success, results.clone())
+    )
+  ));
   Some(if accepted {
     (AcceptStatus::Success, results)
   } else {
@@ -554,6 +562,17 @@ fn barrier(
   reply: (AcceptStatus, Vec<u8>),
 ) -> (AcceptStatus, Vec<u8>) {
   let outcome = state::with_state(crate::verbs::publish_shard);
+  diag::line(format_args!(
+    "barrier proc={procedure} volume={volume:?} published={}",
+    match &outcome {
+      Some(Ok(published)) => format!(
+        "ok captured={}",
+        volume.is_some_and(|v| published.captured(v))
+      ),
+      Some(Err(error)) => format!("err {error:?}"),
+      None => "none".to_owned(),
+    }
+  ));
   let reply = publication_reply(procedure, volume, outcome, reply);
   // A live-shipped volume's stable reply waits until `f` candidates hold the publication (A-200): noted here, waited
   // for by the serve's task (`stable_once_durable`), never inside this synchronous step.
@@ -1105,6 +1124,31 @@ fn serve_local(
   args: &[u8],
   port: u16,
 ) -> ((AcceptStatus, Vec<u8>), Option<crate::told::Owed>) {
+  let who = format!(
+    "shard={} conn={:?} held={:?} inherited={}",
+    registry::current_shard().unwrap_or(u16::MAX),
+    requester.connection,
+    requester.held,
+    requester.inherited
+  );
+  let asked = diag::args(program, procedure, args);
+  let (served, owed) = serve_local_untraced(requester, xid, program, procedure, args, port);
+  diag::line(format_args!(
+    "call {who} xid={xid:#x} prog={program} proc={procedure} {asked} -> {}",
+    diag::result(program, procedure, &served)
+  ));
+  (served, owed)
+}
+
+/// [`serve_local`] without its diagnostic line.
+fn serve_local_untraced(
+  requester: Requester,
+  xid: u32,
+  program: u32,
+  procedure: u32,
+  args: &[u8],
+  port: u16,
+) -> ((AcceptStatus, Vec<u8>), Option<crate::told::Owed>) {
   if let Some(early) = answered_or_refused(&requester, xid, program, procedure, args) {
     return (early, None);
   }
@@ -1234,6 +1278,11 @@ fn stale_write_back(
   if verdict.applies() {
     return None;
   }
+  diag::line(format_args!(
+    "stale-write-back-refused conn={connection} ino={} at={at} len={}",
+    handle.inode,
+    data.len()
+  ));
   Some((AcceptStatus::Success, io_failure_reply(NFSPROC3_WRITE)?))
 }
 
@@ -2751,6 +2800,7 @@ pub(crate) fn adopt_held(
       continue;
     }
     note(NFS_CONNECTIONS_ADOPTED);
+    diag::line(format_args!("adopted conn={connection}"));
     let mut adopted = Connection::new(stream, port, Some(connection));
     adopted.inherited = true;
     spawn_connection(adopted);
@@ -3313,7 +3363,21 @@ async fn send_run(
     }
   }
   let count = through.saturating_sub(*consumed);
+  let xids: Vec<String> = run
+    .iter()
+    .filter_map(|record| record_xid(record))
+    .map(|xid| format!("{xid:#x}"))
+    .collect();
+  diag::line(format_args!(
+    "sent conn={} xids=[{}] consuming={count}",
+    connection.id,
+    xids.join(",")
+  ));
   let discarded = consume(connection, count);
+  diag::line(format_args!(
+    "consumed conn={} bytes={count} ok={discarded}",
+    connection.id
+  ));
   *consumed = through;
   discarded
 }
@@ -3791,5 +3855,138 @@ mod tests {
       .unwrap();
     runtime.run_until_idle();
     assert_eq!(received.try_recv().unwrap(), None);
+  }
+}
+
+/// Diagnostics for g079 (a diagnostic branch, never merged): one stderr line per served NFSv3 call, held-reply answer,
+/// send run, consume, adoption and barrier, stamped with wall time and the daemon's pid.
+mod diag {
+  use super::{
+    AcceptStatus, NFS_PROGRAM, NFSPROC3_COMMIT, NFSPROC3_CREATE, NFSPROC3_LOOKUP, NFSPROC3_READ,
+    NFSPROC3_REMOVE, NFSPROC3_SETATTR, NFSPROC3_WRITE, Nfsfh3, XdrReader,
+  };
+
+  /// Writes one diagnostic line.
+  pub(super) fn line(text: std::fmt::Arguments<'_>) {
+    let now = std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .map(|elapsed| elapsed.as_secs_f64())
+      .unwrap_or(0.0);
+    eprintln!("diag-nfs {now:.6} pid={} {text}", std::process::id());
+  }
+
+  /// A `sattr3`'s size, if it sets one; the reader is left past the attributes.
+  fn sattr_size(reader: &mut XdrReader<'_>) -> Option<Option<u64>> {
+    for _ in 0..3 {
+      if reader.u32().ok()? == 1 {
+        reader.u32().ok()?;
+      }
+    }
+    let size = if reader.u32().ok()? == 1 {
+      Some(reader.u64().ok()?)
+    } else {
+      None
+    };
+    for _ in 0..2 {
+      if reader.u32().ok()? == 2 {
+        reader.u64().ok()?;
+      }
+    }
+    Some(size)
+  }
+
+  /// A call's arguments, summarized.
+  pub(super) fn args(program: u32, procedure: u32, args: &[u8]) -> String {
+    if program != NFS_PROGRAM {
+      return String::new();
+    }
+    let mut reader = XdrReader::new(args);
+    let Ok(fh) = Nfsfh3::decode(&mut reader) else {
+      return "fh=?".to_owned();
+    };
+    let ino = slates_bridge_nfs::handle::FileHandle::from_fh(&fh)
+      .map(|handle| format!("{}:{}", handle.inode, handle.generation))
+      .unwrap_or_else(|_| "root".to_owned());
+    let rest = match procedure {
+      NFSPROC3_WRITE => {
+        let at = reader.u64().ok();
+        let count = reader.u32().ok();
+        let stable = reader.u32().ok();
+        let data = reader.opaque(usize::MAX).ok();
+        let digest = data.map(|bytes| {
+          bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+          })
+        });
+        format!(
+          " at={at:?} count={count:?} stable={stable:?} len={:?} fnv={digest:x?}",
+          data.map(<[u8]>::len)
+        )
+      }
+      NFSPROC3_COMMIT | NFSPROC3_READ => {
+        let at = reader.u64().ok();
+        let count = reader.u32().ok();
+        format!(" at={at:?} count={count:?}")
+      }
+      NFSPROC3_CREATE | NFSPROC3_REMOVE | NFSPROC3_LOOKUP => {
+        let name = reader
+          .opaque(1024)
+          .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+          .unwrap_or_default();
+        if procedure == NFSPROC3_CREATE {
+          let how = reader.u32().ok();
+          let size = if how.is_some_and(|how| how < 2) {
+            sattr_size(&mut reader)
+          } else {
+            None
+          };
+          format!(" name={name} how={how:?} size={size:?}")
+        } else {
+          format!(" name={name}")
+        }
+      }
+      NFSPROC3_SETATTR => format!(" size={:?}", sattr_size(&mut reader)),
+      _ => String::new(),
+    };
+    format!("ino={ino}{rest}")
+  }
+
+  /// A reply, summarized: its accept status, its NFS status, and for a WRITE or COMMIT its stability and verifier, for
+  /// a CREATE the handle it made.
+  pub(super) fn result(program: u32, procedure: u32, reply: &(AcceptStatus, Vec<u8>)) -> String {
+    let (accepted, results) = reply;
+    if !matches!(accepted, AcceptStatus::Success) || program != NFS_PROGRAM {
+      return format!("{accepted:?}");
+    }
+    let mut reader = XdrReader::new(results);
+    let status = reader.u32().ok();
+    let tail = |from_end: usize, len: usize| {
+      results
+        .len()
+        .checked_sub(from_end)
+        .and_then(|start| results.get(start..start.checked_add(len)?))
+        .map(|bytes| {
+          bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+        })
+    };
+    let extra = match (status, procedure) {
+      (Some(0), NFSPROC3_WRITE) => format!(" committed={:?} verf={:?}", tail(12, 4), tail(8, 8)),
+      (Some(0), NFSPROC3_COMMIT) => format!(" verf={:?}", tail(8, 8)),
+      (Some(0), NFSPROC3_CREATE) => {
+        let made = reader
+          .u32()
+          .ok()
+          .filter(|follows| *follows == 1)
+          .and_then(|_| Nfsfh3::decode(&mut reader).ok())
+          .and_then(|fh| slates_bridge_nfs::handle::FileHandle::from_fh(&fh).ok())
+          .map(|handle| format!("{}:{}", handle.inode, handle.generation));
+        format!(" made={made:?}")
+      }
+      _ => format!(" len={} tail8={:?}", results.len(), tail(8, 8)),
+    };
+    format!("status={status:?}{extra}")
   }
 }
