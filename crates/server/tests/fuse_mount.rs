@@ -286,7 +286,9 @@ fn a_file_is_no_mount_point(client: &mut slates_client::Client, volume: slates_c
   assert!(
     matches!(
       refused,
-      Err(ClientError::Refused(Refusal::TargetUnavailable { .. }))
+      Err(ClientError::Refused(Refusal::Target {
+        refusal: slates_ipc::protocol::TargetRefusal::NotDirectory
+      }))
     ),
     "a mount point that is not a directory is refused typed: {refused:?}"
   );
