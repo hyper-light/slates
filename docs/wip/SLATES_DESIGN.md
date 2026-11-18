@@ -6110,6 +6110,15 @@ failure.
 > pin it (`a_forwarded_submit_refused_overloaded_while_it_commits_is_answered_under_its_own_id`;
 > `docs/bugs/2026-11-06-a-resend-under-its-id-was-already-acknowledged.md`).
 
+> **Status (2026-11-17, an `Overloaded` verb is never its own completion).** `Overloaded` means the request was not
+> started, so its id stays unanswered and a resend under it runs the verb. Raised inside a verb (a held copy not yet
+> materialized in the takeover's settle window; a deferred verb whose task the full arena refused), it was recorded as
+> the completion, and every resend under the id met it for good. `run_recorded` now leaves it unrecorded, counted
+> `verb.overloaded_unrecorded`; a verb that refuses it part-way ends what it began itself, as the Shards attach ends its
+> attachment (`a_resend_under_the_id_of_an_overloaded_verb_runs_the_verb`;
+> `docs/bugs/2026-11-17-an-overloaded-verb-was-recorded-as-its-completion.md`). Open (GAPS): a live-shipped verb whose
+> effects committed before its held-reply bound refused it, and a deferred task that ends on `Overloaded`.
+
 > **Status (2026-11-08, A-252: a request waiting for a version is a durable state).** A submit whose acceptance waits for
 > its version's commit was waited on in memory, so after a restart its resend under its own id found no record and ran
 > again as a new version. The accept now logs `Op::CompletionAwaiting` in the transaction that appends the version, so

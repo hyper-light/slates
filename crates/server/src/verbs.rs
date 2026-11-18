@@ -2526,6 +2526,8 @@ fn run_recorded(
   deferred |= live_target.is_some() || destroy_target.is_some();
   let reply = if deferred {
     reply
+  } else if not_started(&reply) {
+    unrecorded_not_started(state, reply)
   } else {
     record_completion(state, origin, id, reply)
   };
@@ -2696,6 +2698,39 @@ fn status_on_channel(
     return Some(scatter_status(state, client.index(), request));
   }
   None
+}
+
+/// Format: the count of verbs answered `Overloaded` whose answer was left unrecorded, so a resend under the request's
+/// id runs the verb ([`not_started`]). Shown in `slates status`.
+const OVERLOADED_UNRECORDED: &str = "verb.overloaded_unrecorded";
+
+/// Whether `reply` says its verb was not started: `Overloaded`, which the protocol defines as "the request was not
+/// started and may be retried" under the same id (`slates_ipc::protocol::Refusal::Overloaded`; the client holds such an
+/// id for its resend, `slates_client::Client::begin_again`). Such a reply is never a completion (§4.9 RIFL): recorded,
+/// it was what every resend under the id met for good (GAPS, "The many-client load test from 10,000 to 100,000
+/// clients"; `docs/bugs/2026-11-17-an-overloaded-verb-was-recorded-as-its-completion.md`).
+fn not_started(reply: &ReplyBody) -> bool {
+  matches!(
+    reply,
+    ReplyBody::Refused {
+      refusal: Refusal::Overloaded { .. }
+    }
+  )
+}
+
+/// Answers a verb that was not started ([`not_started`]) without recording a completion, so the request's id stays
+/// unanswered and a resend under it runs the verb; counted by the refusal's name and [`OVERLOADED_UNRECORDED`]. Its
+/// transaction commits what the verb applied before refusing, which a resend meets as its own: nothing; the verb's
+/// undoing of what it began (`crate::shards::attach` ends the attachment it recorded when its stream's task cannot be
+/// spawned); or the write lease a FUSE or WinFsp mount took before its task, which the resend's attach renews as its
+/// holder's own ([`take_write_lease`]).
+fn unrecorded_not_started(state: &mut ShardState, reply: ReplyBody) -> ReplyBody {
+  state.served = state.served.saturating_add(1);
+  if let ReplyBody::Refused { refusal } = &reply {
+    state.count(refusal_name(refusal), 1);
+  }
+  state.count(OVERLOADED_UNRECORDED, 1);
+  reply
 }
 
 /// Records the completion (RIFL) and counts the refusal; the reply is then durable and may be
@@ -15745,6 +15780,73 @@ mod tests {
         "a retry must not turn a failed publish into success"
       );
     }
+  }
+
+  /// §4.9 (RIFL), the protocol's `Overloaded` ("the request was not started and may be retried" under its id), GAPS
+  /// "The many-client load test from 10,000 to 100,000 clients"
+  /// (`docs/bugs/2026-11-17-an-overloaded-verb-was-recorded-as-its-completion.md`): a verb answered `Overloaded` ran
+  /// nothing, so its id stays unanswered and a resend under it runs the verb. It was recorded as the completion, so
+  /// every resend under the id met it for good. Do: snapshot a volume this node holds a copy of and has not
+  /// materialized (the takeover's settle window, answered `Overloaded`); then, the copy gone, send the same request
+  /// again under its id. Expect: `Overloaded` first, counted unrecorded once; the resend runs the verb and answers what
+  /// it answers now, `NotFound`, not the first answer again.
+  #[test]
+  fn a_resend_under_the_id_of_an_overloaded_verb_runs_the_verb() {
+    let (first, resent, unrecorded) = crate::daemon::audit_on_shard(|state| {
+      let owner = HostId(7);
+      let volume = VolumeId {
+        bytes: ObjectId::new(owner, 3).0,
+      };
+      let object = ObjectId(volume.bytes);
+      state.holder_records.insert(
+        object,
+        slates_db::register::Acceptor::new(
+          owner,
+          slates_db::register::Authority {
+            generation: 1,
+            owner,
+          },
+        ),
+      );
+      let id = slates_wire::request::RequestId {
+        client: 1,
+        sequence: 1,
+      };
+      let principal = Principal::Uid {
+        host: HostId(0),
+        uid: 0,
+      };
+      let request = super::RequestBody::Snapshot { volume };
+      let first = super::run_forwarded(state, 1, id, 1, &principal, request.clone(), None);
+      state.holder_records.remove(&object);
+      let resent = super::run_forwarded(state, 1, id, 1, &principal, request, None);
+      let unrecorded = state
+        .refusals
+        .get(super::OVERLOADED_UNRECORDED)
+        .copied()
+        .unwrap_or(0);
+      (first, resent, unrecorded)
+    });
+    assert!(
+      matches!(
+        first,
+        Some(ReplyBody::Refused {
+          refusal: Refusal::Overloaded { .. }
+        })
+      ),
+      "a held copy not yet materialized answers Overloaded: {first:?}"
+    );
+    assert_eq!(
+      resent,
+      Some(ReplyBody::Refused {
+        refusal: Refusal::NotFound
+      }),
+      "the resend under the same id ran the verb"
+    );
+    assert_eq!(
+      unrecorded, 1,
+      "the Overloaded answer was left unrecorded once"
+    );
   }
 
   /// AC (§4.8 "Lookup"): a volume homed in another region is redirected there (naming that region); a volume

@@ -1202,8 +1202,18 @@
 >   - The proof: `a_forwarded_submit_refused_overloaded_while_it_commits_is_answered_under_its_own_id`, red
 >     `DuplicateRequest`, green `Submitted { version: Some(1) }`
 >     (`docs/bugs/2026-11-06-a-resend-under-its-id-was-already-acknowledged.md`).
->   - Open: an `Overloaded` raised inside a verb is recorded as its completion, so a resend under its id meets it for
->     good.
+>   - **Fixed 2026-11-17 (g232): an `Overloaded` raised inside a verb was recorded as its completion**, so a resend
+>     under its id met it for good, though the protocol defines `Overloaded` as "not started". Raised inside a verb it
+>     is a held copy not yet materialized (`verbs::absent`, the takeover's settle window) or a deferred verb whose task
+>     the full arena refused (a work's checkout, a pin, a green over a base, a presentation, a granted landing). Now
+>     `run_recorded` leaves it unrecorded and counts it (`verb.overloaded_unrecorded`), and the resend runs the verb
+>     (`a_resend_under_the_id_of_an_overloaded_verb_runs_the_verb`, red with the reply recorded;
+>     `docs/bugs/2026-11-17-an-overloaded-verb-was-recorded-as-its-completion.md`). Siblings found, open:
+>     - A verb on a live-shipped volume commits its effects with no completion, and `live_ship::defer` then refuses
+>       `Overloaded` past its held-reply bound, so the resend runs the verb a second time over its own effects.
+>     - A deferred verb's task records its final reply, and some tasks end on `Overloaded`: a granted landing whose
+>       target lease went unanswered (`landing::acquire_target_lease`, answered through `finish_unrun`), so its
+>       resend meets it for good.
 >
 > - **The whole kernel as the workload: the pin holds; creating the green held its shard until 2026-11-07** (the
 >   `CreateGreen` half fixed on `agents/reland-a207-3`). It is now walked, hashed and seeded in slices with its reply
