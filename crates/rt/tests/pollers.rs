@@ -38,6 +38,9 @@ fn config() -> RuntimeConfig {
 
 /// The doorbell: rung by a client (set), consumed by the poller's question (swapped to false).
 static RUNG: AtomicBool = AtomicBool::new(false);
+/// How many times the shard has asked the doorbell's question: once in each step's pass over its pollers, and over and
+/// over in its idle spin, which asks on every turn.
+static ASKED: AtomicU64 = AtomicU64::new(0);
 /// How many times the doorbell task was polled awake: once at its start, once per served ring.
 static SERVED: AtomicU64 = AtomicU64::new(0);
 
@@ -46,7 +49,13 @@ static SERVED: AtomicU64 = AtomicU64::new(0);
 async fn doorbell_loop() {
   if let Some(task) = futures::current_task() {
     registry::with_current(|ctx| {
-      ctx.register_poller(task, Box::new(|| RUNG.swap(false, Ordering::AcqRel)))
+      ctx.register_poller(
+        task,
+        Box::new(|| {
+          ASKED.fetch_add(1, Ordering::AcqRel);
+          RUNG.swap(false, Ordering::AcqRel)
+        }),
+      )
     })
     .unwrap()
     .unwrap();
@@ -71,6 +80,11 @@ fn wait_until(deadline: Duration, done: impl Fn() -> bool) -> bool {
 /// Shape: rings the idle-spin test sends, each into a window the shard has just opened: more than one, so a ring that
 /// a loaded machine delays past the window, into the park the kick ends, does not leave the spin untested.
 const RINGS: u64 = 8;
+
+/// Shape: the doorbell's questions after a window opens that only the idle spin asks. The step that ran the window's task
+/// asks once, as does the step after it that finds nothing; every ask after those two is the spin's, which asks on
+/// every turn, so a ring sent then lands in the spin by construction.
+const ASKS_BEFORE_THE_SPIN: u64 = 2;
 
 /// How many of the window-opening tasks have run.
 static NOTED: AtomicU64 = AtomicU64::new(0);
@@ -102,6 +116,16 @@ fn a_ring_during_the_idle_spin_wakes_a_consuming_poller() {
     assert!(
       wait_until(BACKSTOP, || NOTED.load(Ordering::Acquire) > noted),
       "ring {ring}: the shard opened its idle window"
+    );
+    // The ring lands in the spin: sent only once the spin has asked the doorbell's question. Sent as soon as the window's
+    // task had run, a build that runs each step slower (ThreadSanitizer's, A-318's measure) rang before the steps that
+    // follow the task were done, and those steps' own passes over the pollers served it: all 8 rings so, 1 run in 4 on
+    // CI's TSan lane (run 44260193629, "spin hits 0").
+    let asked = ASKED.load(Ordering::Acquire);
+    assert!(
+      wait_until(BACKSTOP, || ASKED.load(Ordering::Acquire)
+        > asked + ASKS_BEFORE_THE_SPIN),
+      "ring {ring}: the shard spun in its idle window, asking the doorbell's question"
     );
     RUNG.store(true, Ordering::Release);
     let _ = registry::with_entry(shard.0, |entry| entry.kick.kick());

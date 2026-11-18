@@ -260,6 +260,11 @@ pub struct HostTakeover {
   /// held alive at a newer one, it has been heard since, and a round that gave objects up starts over
   /// ([`HostTakeover::heard_since`], A-351).
   judged_incarnation: u64,
+  /// When this node began the round, on the shard's clock, kept across a restart: the takeover's recovery is timed from
+  /// here to its share done, into the failover estimate (A-363).
+  began_ns: u64,
+  /// Whether that recovery has been timed: a share stays done while its retirement completes, and is timed once.
+  timed: bool,
 }
 
 /// One learned object's wait for its recovery cohorts' promises (§4.8 phase one), as the round's bound counts it: the
@@ -302,8 +307,9 @@ struct Page {
 }
 
 impl HostTakeover {
-  /// A round under `generation` at `epoch`, having asked nothing yet, its retired host held at `incarnation`.
-  fn new(generation: u64, epoch: HostEpoch, incarnation: u64) -> HostTakeover {
+  /// A round under `generation` at `epoch`, having asked nothing yet, its retired host held at `incarnation`, begun at
+  /// `began_ns` on the shard's clock.
+  fn new(generation: u64, epoch: HostEpoch, incarnation: u64, began_ns: u64) -> HostTakeover {
     HostTakeover {
       generation,
       epoch,
@@ -317,7 +323,19 @@ impl HostTakeover {
       given_up: BTreeSet::new(),
       past_tolerance: BTreeMap::new(),
       judged_incarnation: incarnation,
+      began_ns,
+      timed: false,
     }
+  }
+
+  /// Times this round's recovery into `failover` the first time its share is done, at `now_ns`: from its beginning,
+  /// however many times a new configuration started it over (A-363). Later calls fold nothing.
+  fn time_done(&mut self, now_ns: u64, failover: &mut slates_cluster::failover::Failover) {
+    if self.timed {
+      return;
+    }
+    self.timed = true;
+    failover.takeover_done(now_ns.saturating_sub(self.began_ns));
   }
 
   /// Starts the round over at `generation` and `epoch`, its retired host held at `incarnation`: every promise was for
@@ -944,6 +962,15 @@ async fn drive_host_takeover(
   let past = state::with_state(|s| unpromised_past_the_bound(s, departed)).unwrap_or_default();
   give_up_unpromised(departed, past, local).await;
   let done = state::with_state(|s| round_done(s, departed, local)).unwrap_or(false);
+  if done {
+    // The share is done: its takeover's recovery is a sample of the failover estimate, folded once (A-363), whether or
+    // not its confirmation is withheld below.
+    let _ = state::with_state_counted(|s| {
+      if let Some(take) = s.host_takeovers.get_mut(&departed) {
+        take.time_done(slates_rt::futures::now_ns(), &mut s.failover);
+      }
+    });
+  }
   // Test support: a confirmation withheld, as one late to commit leaves the share owed (A-353).
   let withheld = done
     && state::with_state(|s| {
@@ -990,10 +1017,14 @@ pub(crate) fn begin_round(
   };
   let held = state.fleet.membership().state(departed);
   let incarnation = held.map_or(0, |held| held.incarnation);
-  let take = state
-    .host_takeovers
-    .entry(departed)
-    .or_insert_with(|| HostTakeover::new(regional.version, first_epoch, incarnation));
+  let take = state.host_takeovers.entry(departed).or_insert_with(|| {
+    HostTakeover::new(
+      regional.version,
+      first_epoch,
+      incarnation,
+      slates_rt::futures::now_ns(),
+    )
+  });
   let mut restarted = false;
   if take.generation != regional.version {
     let epoch = take.epoch.max(first_epoch);
@@ -1319,7 +1350,7 @@ pub(crate) fn ready_objects(
   if local_promises {
     answer_own_copies_by_name(state, departed, local, &regional);
   }
-  let bound = crate::fleet::takeover_attempts(state.config.failover_slo_ns);
+  let bound = crate::fleet::takeover_attempts(state.failover_ns);
   let Some(take) = state.host_takeovers.get_mut(&departed) else {
     return Vec::new();
   };
@@ -1441,7 +1472,7 @@ pub(crate) fn unpromised_past_the_bound(
   state: &ShardState,
   departed: HostId,
 ) -> Vec<(ObjectId, u32)> {
-  let bound = crate::fleet::takeover_attempts(state.config.failover_slo_ns);
+  let bound = crate::fleet::takeover_attempts(state.failover_ns);
   state
     .host_takeovers
     .get(&departed)
@@ -1785,7 +1816,7 @@ async fn commit_adopted(
   local: HostId,
   budget: CommitBudget,
 ) -> Option<(Dispatch, Record, Result<Placement, &'static str>)> {
-  let (mut acceptor, shape, quorum, record) = state::with_state(|s| {
+  let (mut acceptor, shape, quorum, record, replaces) = state::with_state(|s| {
     let config = s.fleet.configuration();
     let generation = config.version;
     let quorum = config.quorum;
@@ -1807,6 +1838,10 @@ async fn commit_adopted(
       generation,
       owner: local,
     });
+    // This node holds another value at the adopted position, a lower epoch's that never committed (A-373).
+    let replaces = acceptor
+      .value_at(object, adopted.sequence)
+      .is_some_and(|held| held != adopted.value.as_slice());
     let record = Record {
       owner: local,
       object,
@@ -1815,7 +1850,7 @@ async fn commit_adopted(
       generation,
       value: adopted.value,
     };
-    Some((acceptor, shape, quorum, record))
+    Some((acceptor, shape, quorum, record, replaces))
   })
   .flatten()?;
   let holders = take_sessions("fleet.lent_to.adopt", |host| {
@@ -1874,8 +1909,15 @@ async fn commit_adopted(
     }
     Err(_) => Err(unplaced_cause),
   };
+  // The local acceptance replaced that value: a replica of the green built over it follows (A-373), so the adoption's
+  // engine is advanced from the version before, never served from a value the ledger no longer holds.
+  let replaced =
+    replaces && acceptor.value_at(object, record.sequence) == Some(record.value.as_slice());
   state::with_state(|s| {
     s.holder_records.insert(object, acceptor);
+    if replaced {
+      crate::merge_origin::rewind_past_replaced(s, &record);
+    }
   });
   Some((dispatch, record, placement))
 }
@@ -2322,7 +2364,7 @@ mod tests {
   #[test]
   fn a_round_advances_only_when_a_member_moves_on_and_a_restart_keeps_the_count() {
     let member = HostId(2);
-    let mut take = HostTakeover::new(5, HostEpoch(3), 0);
+    let mut take = HostTakeover::new(5, HostEpoch(3), 0, 0);
     let page = |after: u64, complete: bool| Page {
       after: (!complete).then_some(ObjectId::new(HostId(1), after)),
       complete,
@@ -2366,7 +2408,7 @@ mod tests {
       })
     };
     let given_up = ObjectId::new(HostId(1), 7);
-    let mut take = HostTakeover::new(5, HostEpoch(3), 4);
+    let mut take = HostTakeover::new(5, HostEpoch(3), 4, 0);
     assert!(
       !take.heard_since(held(Liveness::Alive, 5)),
       "nothing given up: nothing to judge afresh"
@@ -2610,6 +2652,7 @@ mod tests {
           uid: 0,
         },
         completion: None,
+        signature: None,
       };
       state.pending_green_materializations.insert(
         green,
@@ -2726,7 +2769,7 @@ mod tests {
 
   /// A round of the audit node's for `departed`'s takeover that has learned `object` and adopted nothing.
   fn round_that_learned(state: &mut ShardState, departed: HostId, object: ObjectId) {
-    let mut take = HostTakeover::new(state.council.configuration().version, HostEpoch(2), 0);
+    let mut take = HostTakeover::new(state.council.configuration().version, HostEpoch(2), 0, 0);
     take.learned.insert(object, BTreeMap::new());
     state.host_takeovers.insert(departed, take);
   }

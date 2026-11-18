@@ -168,23 +168,30 @@ struct HeldPosition {
   value: Vec<u8>,
 }
 
-/// Format: the kind byte of a held piece's key (A-270; `slates_vfs::recover::HeldPiece`): the content hold's image, the
-/// mirror records, one held register's head, one live copy's head, one live copy's entry, one live log this shard ships
-/// as its owner (A-344), and one held register's accepted position (A-367). Key order is kind, then object, then
-/// position.
-const KIND_CONTENT: u8 = 0;
-/// Format: see [`KIND_CONTENT`].
+/// Format: the kind byte of a held piece's key (A-270; `slates_vfs::recover::HeldPiece`): the mirror records, one held
+/// register's head, one live copy's head, one live copy's entry, one live log this shard ships as its owner (A-344), one
+/// held register's accepted position (A-367), and one stored chunk, one held manifest and one stage of the content hold
+/// (A-376). Key order is kind, then object, then position. Kind 0, the content hold's whole image before layout 30, is
+/// cut no more.
 const KIND_MIRRORED: u8 = 1;
-/// Format: see [`KIND_CONTENT`].
+/// Format: see [`KIND_MIRRORED`].
 const KIND_REGISTER: u8 = 2;
-/// Format: see [`KIND_CONTENT`].
+/// Format: see [`KIND_MIRRORED`].
 const KIND_LIVE_HEAD: u8 = 3;
-/// Format: see [`KIND_CONTENT`].
+/// Format: see [`KIND_MIRRORED`].
 const KIND_LIVE_ENTRY: u8 = 4;
-/// Format: see [`KIND_CONTENT`]; its bytes are a `live_ship::OwnedLive` (A-344).
+/// Format: see [`KIND_MIRRORED`]; its bytes are a `live_ship::OwnedLive` (A-344).
 const KIND_LIVE_OWNED: u8 = 5;
-/// Format: see [`KIND_CONTENT`]; its bytes are a [`HeldPosition`], its key's position the position's sequence (A-367).
+/// Format: see [`KIND_MIRRORED`]; its bytes are a [`HeldPosition`], its key's position the position's sequence (A-367).
 const KIND_REGISTER_POSITION: u8 = 6;
+/// Format: see [`KIND_MIRRORED`]; a stored chunk of the content hold (A-376), keyed by its identity's first 24 bytes (a
+/// BLAKE3 output's prefix: a collision is a 2^96 search), its bytes the chunk's image (`ContentHold::piece_bytes`).
+const KIND_CONTENT_CHUNK: u8 = 7;
+/// Format: see [`KIND_MIRRORED`]; a manifest held for an object (A-376), keyed by the first 24 bytes of the BLAKE3 of its
+/// object and identity (one manifest may be held for several objects), its bytes its identity and image.
+const KIND_CONTENT_MANIFEST: u8 = 8;
+/// Format: see [`KIND_MIRRORED`]; an object's stage of the content hold (A-376), keyed by its object, its bytes its image.
+const KIND_CONTENT_STAGE: u8 = 9;
 
 /// A held piece's key: what [`slates_vfs::recover::HELD_PIECE_KEY_BYTES`] says.
 type PieceKey = [u8; slates_vfs::recover::HELD_PIECE_KEY_BYTES];
@@ -208,9 +215,38 @@ fn piece_key(kind: u8, object: [u8; 16], position: u64) -> PieceKey {
   key
 }
 
+/// The key of the content hold's `piece` (A-376): a chunk by its identity's first 24 bytes, a manifest by the first 24
+/// bytes of the BLAKE3 of its object and identity, a stage by its object.
+fn hold_piece_key(piece: &slates_cluster::content::HoldPiece) -> PieceKey {
+  use slates_cluster::content::HoldPiece;
+  let digest_key = |kind: u8, digest: &[u8; 32]| {
+    let object_bytes = size_of::<ObjectId>();
+    let object: [u8; 16] = digest
+      .get(..object_bytes)
+      .and_then(|bytes| bytes.try_into().ok())
+      .unwrap_or_default();
+    let position = digest
+      .get(object_bytes..object_bytes.saturating_add(size_of::<u64>()))
+      .and_then(|bytes| bytes.try_into().ok())
+      .map_or(0, u64::from_be_bytes);
+    piece_key(kind, object, position)
+  };
+  match piece {
+    HoldPiece::Chunk(identity) => digest_key(KIND_CONTENT_CHUNK, identity),
+    HoldPiece::Manifest(object, identity) => {
+      let mut hasher = blake3::Hasher::new();
+      hasher.update(&object.0);
+      hasher.update(identity);
+      digest_key(KIND_CONTENT_MANIFEST, hasher.finalize().as_bytes())
+    }
+    HoldPiece::Stage(object) => piece_key(KIND_CONTENT_STAGE, object.0, 0),
+  }
+}
+
 /// A piece key's kind, object and position.
 fn split_key(key: &PieceKey) -> (u8, [u8; 16], u64) {
-  let kind = key.first().copied().unwrap_or(KIND_CONTENT);
+  // A key always has its kind byte; `u8::MAX`, a kind no build cuts, is refused as unknown should one not.
+  let kind = key.first().copied().unwrap_or(u8::MAX);
   let object = key
     .get(KEY_OBJECT_AT..KEY_POSITION_AT)
     .and_then(|bytes| bytes.try_into().ok())
@@ -222,11 +258,12 @@ fn split_key(key: &PieceKey) -> (u8, [u8; 16], u64) {
   (kind, object, position)
 }
 
-/// What a holder keeps for other owners, as its shard's recovery image carries it (A-270): the content it holds
-/// (`ContentHold`'s own image, AUD-29-59) and the mirror records, each one whole piece; each register it holds as a head
-/// piece, with its fence, and a piece per position it accepted (A-367), so an acknowledgement's publication carries the
-/// record it acknowledged; and each copy of another owner's live log (A-200) as a head piece and a piece per entry, so a
-/// live write's publication carries the entry it added. A warm restart keeps the member id, so all
+/// What a holder keeps for other owners, as its shard's recovery image carries it (A-270): the content it holds as a
+/// piece per stored chunk, per held manifest and per stage (`ContentHold::pieces`, AUD-29-59, A-376), so a put's
+/// publication carries the content it put; the mirror records, one whole piece; each register it holds as a head piece,
+/// with its fence, and a piece per position it accepted (A-367), so an acknowledgement's publication carries the record
+/// it acknowledged; and each copy of another owner's live log (A-200) as a head piece and a piece per entry, so a live
+/// write's publication carries the entry it added. A warm restart keeps the member id, so all
 /// of it must survive one: an acknowledged record a restarted holder no longer had would let its takeover promise count
 /// toward `f + 1` without it (Vertical Paxos II's acceptor; Raft, Figure 2: persistent state before responding).
 pub(crate) fn held_image(state: &ShardState) -> Vec<slates_vfs::recover::HeldPiece> {
@@ -234,6 +271,16 @@ pub(crate) fn held_image(state: &ShardState) -> Vec<slates_vfs::recover::HeldPie
     .into_iter()
     .map(|(key, bytes)| slates_vfs::recover::HeldPiece { key, bytes })
     .collect();
+  pieces.extend(
+    state
+      .held_content
+      .pieces()
+      .into_iter()
+      .map(|(piece, bytes)| slates_vfs::recover::HeldPiece {
+        key: hold_piece_key(&piece),
+        bytes,
+      }),
+  );
   for (object, acceptor) in &state.holder_records {
     pieces.push(register_head_piece(*object, acceptor));
     pieces.extend(
@@ -265,14 +312,10 @@ fn owned_piece(
   }
 }
 
-/// The pieces carried whole and compared by their bytes: the content hold's image and the mirror records, each only
-/// when not empty. (Owed: each carried by its own changes, as the registers and live copies are.)
+/// The pieces carried whole and compared by their bytes: the mirror records, only when not empty. (Owed: carried by
+/// their own changes, as the registers, the live copies and, since A-376, the content hold are.)
 fn whole_pieces(state: &ShardState) -> BTreeMap<PieceKey, Vec<u8>> {
   let mut pieces = BTreeMap::new();
-  let content = state.held_content.to_image();
-  if !content.is_empty() {
-    pieces.insert(piece_key(KIND_CONTENT, [0; 16], 0), content);
-  }
   if !state.mirror_records.is_empty() {
     let mirrored: Vec<Vec<u8>> = state
       .mirror_records
@@ -470,6 +513,18 @@ pub(crate) fn held_changes(state: &ShardState) -> HeldChanges {
   for object in state.holder_records.changed() {
     register_changes(state, *object, (&mut put, &mut removed));
   }
+  // The content hold's pieces it changed since the last committed publication (A-376): each held now put, each gone
+  // removed. The hold's whole image was re-encoded at every publication and re-put whenever it changed, which at f > 0
+  // is every version of a green its holder takes.
+  for piece in state.held_content.changed_pieces() {
+    match state.held_content.piece_bytes(piece) {
+      Some(bytes) => put.push(slates_vfs::recover::HeldPiece {
+        key: hold_piece_key(piece),
+        bytes,
+      }),
+      None => removed.push(hold_piece_key(piece)),
+    }
+  }
   for object in state.live.held.changed() {
     let published = state.published_held.live.get(object).copied();
     match state.live.held.get(object) {
@@ -570,6 +625,8 @@ pub(crate) fn held_committed(
     .fold(state.live.slot_floor, u64::max);
   state.live.slot_floor = floor;
   registers_committed(state, everything);
+  // What the publication carried of the content hold, its every change or, a checkpoint, all of it (A-376).
+  state.held_content.clear_changes();
   state.holder_records.clear_changed();
   state.live.held.clear_changed();
 }
@@ -628,7 +685,7 @@ fn registers_committed(state: &mut ShardState, everything: bool) {
 pub(crate) fn whole_of(pieces: &[slates_vfs::recover::HeldPiece]) -> BTreeMap<PieceKey, Vec<u8>> {
   pieces
     .iter()
-    .filter(|piece| matches!(split_key(&piece.key).0, KIND_CONTENT | KIND_MIRRORED))
+    .filter(|piece| split_key(&piece.key).0 == KIND_MIRRORED)
     .map(|piece| (piece.key, piece.bytes.clone()))
     .collect()
 }
@@ -686,6 +743,8 @@ pub(crate) enum HeldRefused {
   SlotGap([u8; 16]),
   /// A held register's position with no head piece for its register (A-367).
   PositionWithoutHead([u8; 16]),
+  /// The content hold's pieces do not make its image (A-376).
+  Content(slates_cluster::content::HoldImageError),
 }
 
 impl std::fmt::Display for HeldRefused {
@@ -698,6 +757,12 @@ impl std::fmt::Display for HeldRefused {
       }
       HeldRefused::SlotGap(object) => {
         write!(f, "the live copy of {object:02x?} has a gap in its entries")
+      }
+      HeldRefused::Content(refused) => {
+        write!(
+          f,
+          "the content hold's pieces do not make its image: {refused:?}"
+        )
       }
       HeldRefused::PositionWithoutHead(object) => {
         write!(
@@ -731,10 +796,14 @@ pub(crate) fn split_held(
   let mut entries: BTreeMap<[u8; 16], Vec<(u64, Vec<u8>)>> = BTreeMap::new();
   let mut positions: BTreeMap<[u8; 16], Vec<slates_db::register::PersistedPosition>> =
     BTreeMap::new();
+  // The content hold's chunk, manifest and stage pieces (A-376), put back into its image once all are read.
+  let mut content: (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>) = Default::default();
   for piece in pieces {
     let (kind, object, slot) = split_key(&piece.key);
     match kind {
-      KIND_CONTENT => held.content.clone_from(&piece.bytes),
+      KIND_CONTENT_CHUNK => content.0.push(piece.bytes.clone()),
+      KIND_CONTENT_MANIFEST => content.1.push(piece.bytes.clone()),
+      KIND_CONTENT_STAGE => content.2.push(piece.bytes.clone()),
       KIND_MIRRORED => held.mirrored = Vec::<Vec<u8>>::from_bytes(&piece.bytes)?,
       KIND_REGISTER => held.registers.push(HeldRegister::from_bytes(&piece.bytes)?),
       KIND_REGISTER_POSITION => {
@@ -767,6 +836,9 @@ pub(crate) fn split_held(
     }
   }
   join_positions(&mut held.registers, positions)?;
+  held.content =
+    slates_cluster::content::ContentHold::image_from_pieces(&content.0, &content.1, &content.2)
+      .map_err(HeldRefused::Content)?;
   if let Some(object) = entries.keys().find(|object| !heads.contains_key(*object)) {
     return Err(HeldRefused::EntryWithoutHead(*object));
   }

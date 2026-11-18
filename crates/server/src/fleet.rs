@@ -113,7 +113,7 @@ use crate::daemon::HEARTBEAT_NS;
 use crate::deploy::NodeAddress;
 use crate::dns::{self, Resolver};
 use crate::head::{HeadValue, PlacedHead, SealJob};
-use crate::state::{self, LearnedMember, ShardState};
+use crate::state::{self, LearnedMember, Making, ShardState};
 use crate::verbs;
 use crate::xshard::{call_within, run_on};
 
@@ -1958,8 +1958,15 @@ fn count_record_refusal(state: &mut ShardState, error: &RegisterError) {
 /// refused (§4.8 persistence before reply). Format: a refusal name in the daemon's status report.
 const RECORD_UNPUBLISHED: &str = "fleet.record.unpublished";
 
+/// The status count of held records accepted in place of a different value held at their position, a lower epoch's,
+/// which never committed (A-373): what a green's replica built over the replaced value follows. Format: a refusal name
+/// in the daemon's status report.
+const RECORD_REPLACED: &str = "fleet.record.replaced";
+
 /// Holds `record` from `peer_host` once its authority was checked ([`check_held_record`]): the acceptance into this
-/// holder's register for the object, the routing it learns, and the acknowledgement or the refusal's reply.
+/// holder's register for the object, the routing it learns, and the acknowledgement or the refusal's reply. A record
+/// that replaces a different value held at its position (a higher epoch's, A-373) rewinds this holder's replica of the
+/// green it belongs to past the value it replaced (`merge_origin::rewind_past_replaced`).
 pub(crate) fn hold_checked_record(
   state: &mut ShardState,
   local: HostId,
@@ -1967,6 +1974,11 @@ pub(crate) fn hold_checked_record(
   record: &Record,
 ) -> Vec<u8> {
   let generation = state.fleet.configuration().version;
+  let replaces = state
+    .holder_records
+    .get(&record.object)
+    .and_then(|acceptor| acceptor.value_at(record.object, record.sequence))
+    .is_some_and(|held| held != record.value.as_slice());
   let accepted = match state.holder_records.get_mut(&record.object) {
     Some(acceptor) => acceptor.accept(record),
     None => {
@@ -2002,6 +2014,12 @@ pub(crate) fn hold_checked_record(
       // departed owner: the object has an authorized live owner again, and the promotion gate this holder
       // kept for it has served its purpose.
       state.departed_owners.remove(&record.object);
+      // The register holds the new value from here, acknowledged or not: a replica built over the one it replaced
+      // follows it now.
+      if replaces {
+        state.count(RECORD_REPLACED, 1);
+        crate::merge_origin::rewind_past_replaced(state, record);
+      }
       match state
         .fleet
         .track_object(record.object, peer_host, state.council.configuration())
@@ -2092,8 +2110,10 @@ fn serve_content_request(
 /// inputs (A-286): a content acknowledgement bound to them when it holds them whole (`merge_service::inputs_held`), to
 /// a peer that may place them here; else the content plane's answer to the shipment's offer asked again after its
 /// chunks, the chunks it still lacks; else nothing. So inputs larger than one shipment cross in as many as they take,
-/// each carrying only what this holder lacks.
-fn serve_merge_shipment(
+/// each carrying only what this holder lacks. A record that replaces a different value held at its position (a
+/// higher epoch's, A-373) is held before its content frames, whose inputs the door admits only once a held record names
+/// them (`merge_service::hold_replacing_record`).
+pub(crate) fn serve_merge_shipment(
   s: &mut ShardState,
   local: HostId,
   peer_host: HostId,
@@ -2108,6 +2128,7 @@ fn serve_merge_shipment(
   let Ok(record) = Record::decode(record) else {
     return Vec::new();
   };
+  crate::merge_service::hold_replacing_record(s, local, peer_host, &record);
   if !content.is_empty() {
     s.count(crate::merge_service::INPUTS_CARRIED, 1);
   }
@@ -4396,7 +4417,7 @@ async fn materialize_pending(origin: u16, local: HostId, budget: CommitBudget) {
     };
     let round = paging_round(waited.waits_on_the_round(), departed, &paging);
     let given_up = state::with_state(|s| {
-      let bound = takeover_attempts(s.config.failover_slo_ns);
+      let bound = takeover_attempts(s.failover_ns);
       let pending = s.pending_materializations.get_mut(&object)?;
       if round.is_some_and(|advances| pending.record_round(advances)) {
         // Its round moved on toward the register it waits for: progress, its attempts start again.
@@ -4693,7 +4714,7 @@ async fn adopt_pending_tombstones(origin: u16) {
     };
     let given_up = state::with_state(|s| {
       s.count(waited, 1);
-      let bound = takeover_attempts(s.config.failover_slo_ns);
+      let bound = takeover_attempts(s.failover_ns);
       let pending = s.pending_tombstones.get_mut(&object)?;
       let attempts = pending.attempts.saturating_add(1);
       let given_up = pending.count_attempt(bound);
@@ -4779,7 +4800,7 @@ async fn materialize_pending_greens(
     }
     let round = paging_round(waited.waits_on_the_round(), pending.departed, &paging);
     let given_up = state::with_state(|s| {
-      let bound = takeover_attempts(s.config.failover_slo_ns);
+      let bound = takeover_attempts(s.failover_ns);
       let pending = s.pending_green_materializations.get_mut(&object)?;
       if round.is_some_and(|advances| pending.record_round(advances)) {
         // Its round moved on toward the register it waits for: progress, its attempts start again.
@@ -4867,12 +4888,13 @@ impl GreenWait {
 }
 
 /// Derived: the materialization attempts without progress a taken-over volume or green gets before it is given up on:
-/// the failover SLO's worth of the fleet's periods (`failover_slo_ns / HEARTBEAT_NS`, at least one), each one attempt.
+/// the failover delay's worth of the fleet's periods (`failover_ns / HEARTBEAT_NS`, at least one), each one attempt.
 /// Counted in attempts, not wall time, so a loaded node whose periods run late is given its attempts all the same; the
-/// SLO is the operator's bound on how long a takeover may leave an object unserved (§4.8). The same bound counts a
+/// failover delay is how long a takeover is expected to leave an object unserved, this node's live estimate (§4.8,
+/// A-363; it was the operator's 10 s placeholder). The same bound counts a
 /// learned object's wait for its recovery cohorts' promises in the takeover round itself (`takeover::PromiseWait`).
-pub(crate) fn takeover_attempts(failover_slo_ns: u64) -> u32 {
-  u32::try_from((failover_slo_ns / HEARTBEAT_NS).max(1)).unwrap_or(u32::MAX)
+pub(crate) fn takeover_attempts(failover_ns: u64) -> u32 {
+  u32::try_from((failover_ns / HEARTBEAT_NS).max(1)).unwrap_or(u32::MAX)
 }
 
 /// The page advances so far of the round a taken-over object's attempt waited on, when it waited on one: a wait for a
@@ -5104,6 +5126,9 @@ fn handed_green(
     owner: adopted.owner.clone(),
     access: catalog.access.clone(),
     catalog_sequence,
+    write: catalog.write,
+    write_version: catalog.write_version,
+    signers: catalog.signers.clone(),
     head: adopted.version,
     identity: adopted.identity,
     origin,
@@ -5194,6 +5219,8 @@ async fn give_up_taken_over(
             waited_on: waited.to_owned(),
           },
         );
+        // A live materialization's record is forgotten with the volume: nothing reads its end now (g251).
+        s.making_taken_over.remove(&object);
       },
       HEARTBEAT_NS,
     )
@@ -5489,6 +5516,20 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
     // The control shard's state out of reach (its shutdown): nothing is attempted, nothing is counted.
     None => return Ok(()),
   };
+  // A live volume's materialization runs in turns on its owner shard, by a task of that shard ([`make_live`], g251): an
+  // attempt that finds one running joins it, one that finds one ended reads its end, and only one that finds neither
+  // fetches the log and begins one. Before, every attempt fetched the whole log and rebuilt it inside one owner-shard
+  // turn, which ran past the watchdog's spin window (the nemesis's successors, 0.3 to 2.8 s), and an attempt that turn
+  // outlasted (its call's deadline a period, 100 ms) counted as unanswered, so the next period fetched and rebuilt the
+  // whole log again.
+  if catalog.live_shipped && catalog.live_holders.is_some() {
+    match making_of(origin, target, object).await {
+      Some(Joined::None) => {}
+      Some(Joined::Running(turns)) => return making_runs(object, turns),
+      Some(Joined::Ended(ended)) => return live_ended(object, ended),
+      None => return materialize_unanswered(),
+    }
+  }
   // A live-shipped volume is served from its live log, which holds every acknowledged write (A-200): phase one over its
   // candidates under the takeover's epoch, the greatest head adopted, `f + 1` counted among the holders the catalog
   // records (A-240). A catalog that records none had a shipper that never shipped (it ships only once its holders are
@@ -5511,10 +5552,6 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
     None
   };
   let region = head.content_holders.clone();
-  // The head the live log was adopted at, kept apart from the log (moved to the owner shard), so a refused rebuild is
-  // remembered at it (`live_ship::note_rebuild`).
-  let adopted_head = live.as_ref().map(|fetched| fetched.head);
-  let adopted_sealing = live.as_ref().and_then(|fetched| fetched.sealing.clone());
   // The successor's own copy of the volume's lineage key (A-92 piece 4c), unwrapped here on the control shard, which
   // holds the pair keys, and handed to the owner shard wrapped under this node's root. A successor that holds no entry
   // of its own in a sealed head whose envelope it must open (a node replaced at its anchor before the owner's pair
@@ -5560,6 +5597,20 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
     registers_short,
     live.as_ref().and_then(|fetched| fetched.past_tolerance),
   );
+  if let Some(fetched) = live {
+    let making = MakeLive {
+      object,
+      id,
+      head,
+      catalog,
+      catalog_sequence,
+      placed,
+      catalog_placed,
+      region,
+      past_tolerance,
+    };
+    return begin_live(origin, target, making, fetched).await;
+  }
   let served = call_within(
     origin,
     target,
@@ -5574,7 +5625,7 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
         takeover: slates_db::catalog::TakeoverRecord {
           epoch: placed.epoch.0,
           head_sequence: sequence,
-          from_live_log: live.is_some(),
+          from_live_log: false,
           past_tolerance,
         },
       };
@@ -5585,22 +5636,6 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
         && crate::seal_keys::adopt_lineage(s, id, &catalog.owner, lineage, naming.as_ref()).is_err()
       {
         s.count(LINEAGE_UNADOPTED, 1);
-      }
-      // The live log, when the volume has one: it is the volume as acknowledged, rebuilt here (A-200).
-      if let Some(fetched) = &live {
-        let rebuilt = crate::live_ship::archive_from_live(s, id, &catalog.owner, fetched)?;
-        past_the_pressure_hold(s, |s| {
-          verbs::materialize_taken_over(s, id, &taken, region, Some(&rebuilt))
-        })
-        .map_err(|refusal| materialize_refusal_counter(&refusal))?;
-        // The successor's log goes on from the head it adopted (A-329), past every position durable before it.
-        crate::live_ship::adopt_head(s, id, fetched.head);
-        s.placed_heads.insert(object, placed);
-        s.placed_heads.insert(object.catalog(), catalog_placed);
-        // Published before it is served (A-343): its image is what a restart rebuilds it from, and its shipper is made
-        // from the adopted head at once.
-        published_before_served(s)?;
-        return Ok(());
       }
       // Open a content archive (a sealed one needs the lineage key); a contentless volume has none to open.
       // An envelope is opened before this turn ([`open_in_turns`]), so what arrives here is a plain archive.
@@ -5628,18 +5663,13 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
     HEARTBEAT_NS,
   )
   .await;
-  if let Some(adopted) = adopted_head {
-    match &served {
-      Some(Ok(())) => crate::live_ship::note_rebuild(object, adopted, None, adopted_sealing),
-      Some(Err(refusal)) => {
-        crate::live_ship::note_rebuild(object, adopted, Some(refusal), adopted_sealing)
-      }
-      None => {}
-    }
-  }
   let outcome = state::with_state(|s| match served {
     Some(Ok(())) => {
-      s.pending_materializations.remove(&object);
+      // Served: its recovery, from its adoption to now, is a sample of the failover estimate (A-363).
+      if let Some(pending) = s.pending_materializations.remove(&object) {
+        s.failover
+          .volume_served(slates_rt::futures::now_ns().saturating_sub(pending.adopted_ns));
+      }
       s.pending_catalogs.remove(&object);
       Ok(())
     }
@@ -5661,6 +5691,350 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
   outcome.unwrap_or(Ok(()))
 }
 
+/// A live volume's materialization as its owner shard holds it, read by an attempt of the control shard ([`making_of`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Joined {
+  /// None runs or ended there: the attempt fetches the log and begins one.
+  None,
+  /// One runs: the turns it has taken.
+  Running(u64),
+  /// One ended, made or refused by the named counter: read once, and forgotten there.
+  Ended(Result<(), &'static str>),
+}
+
+/// Where `object`'s live materialization stands on its owner shard `target` ([`make_live`]), an ended one forgotten
+/// there once read; `None` when the shard did not answer in its own time.
+async fn making_of(origin: u16, target: u16, object: ObjectId) -> Option<Joined> {
+  crate::xshard::call_in_shard_time(
+    origin,
+    target,
+    move |s| match s.making_taken_over.get(&object).copied() {
+      None => Joined::None,
+      Some(Making::Running { turns }) => Joined::Running(turns),
+      Some(Making::Made) => {
+        s.making_taken_over.remove(&object);
+        Joined::Ended(Ok(()))
+      }
+      Some(Making::Refused(why)) => {
+        s.making_taken_over.remove(&object);
+        Joined::Ended(Err(why))
+      }
+    },
+    HEARTBEAT_NS,
+  )
+  .await
+}
+
+/// An attempt that found its volume's materialization running on the owner shard: the turns it has taken recorded (more
+/// than at the last look is progress, so a materialization that moves is never given up on) and the wait counted.
+fn making_runs(object: ObjectId, turns: u64) -> Result<(), VolumeWait> {
+  let counted = state::with_state(|s| {
+    if let Some(pending) = s.pending_materializations.get_mut(&object) {
+      pending.record_turns(turns);
+    }
+    s.count(MATERIALIZE_WAITS_MAKING, 1);
+  });
+  match counted {
+    Some(()) => Err(VolumeWait::Making),
+    // The control shard's state out of reach (its shutdown): nothing more is attempted.
+    None => Ok(()),
+  }
+}
+
+/// The end of a live volume's materialization where the control shard learns it: made, the takeover's pending entries
+/// are done with; refused, counted as an owner shard's refusals are, and a refusal of the log remembered at the head it
+/// was fetched at ([`crate::live_ship::note_rebuild`]), so the log is not fetched again at a head it cannot rebuild.
+fn live_ended(object: ObjectId, ended: Result<(), &'static str>) -> Result<(), VolumeWait> {
+  let adopted = state::with_state(|s| {
+    s.pending_materializations
+      .get(&object)
+      .and_then(|pending| pending.live_adopted.clone())
+  })
+  .flatten();
+  if let Some((head, sealing)) = adopted {
+    crate::live_ship::note_rebuild(object, head, ended.err(), sealing);
+  }
+  let outcome = state::with_state(|s| match ended {
+    Ok(()) => {
+      // Served: its recovery, from its adoption to now, is a sample of the failover estimate (A-363), as a one-turn
+      // materialization's is.
+      if let Some(pending) = s.pending_materializations.remove(&object) {
+        s.failover
+          .volume_served(slates_rt::futures::now_ns().saturating_sub(pending.adopted_ns));
+      }
+      s.pending_catalogs.remove(&object);
+      Ok(())
+    }
+    Err(refusal) => {
+      s.count(MATERIALIZE_REFUSED, 1);
+      s.count(refusal, 1);
+      Err(VolumeWait::Refused)
+    }
+  });
+  // The control shard's state out of reach (its shutdown): nothing more is attempted.
+  outcome.unwrap_or(Ok(()))
+}
+
+/// An attempt whose question to the owner shard was not answered in that shard's own time: counted, retried next
+/// period.
+fn materialize_unanswered() -> Result<(), VolumeWait> {
+  let counted = state::with_state(|s| {
+    s.count(MATERIALIZE_REFUSED, 1);
+    s.count(MATERIALIZE_UNANSWERED, 1);
+  });
+  match counted {
+    Some(()) => Err(VolumeWait::Refused),
+    None => Ok(()),
+  }
+}
+
+/// What a live volume's materialization takes to its owner shard besides the log: the takeover's adopted registers and
+/// their placements, the content holders the head recorded and the shortfall it was adopted past (A-332).
+struct MakeLive {
+  object: ObjectId,
+  id: DbVolumeId,
+  head: HeadValue,
+  catalog: crate::catalog::CatalogValue,
+  catalog_sequence: u64,
+  placed: crate::head::PlacedHead,
+  catalog_placed: crate::head::PlacedHead,
+  region: Vec<u64>,
+  past_tolerance: Option<slates_db::catalog::TakeoverPastTolerance>,
+}
+
+/// Begins a live volume's materialization on its owner shard `target` as a task of that shard ([`make_live`]) and waits
+/// a period for its end: an end within that is read at once; one still running is joined by the next attempt
+/// ([`making_of`], which asks in the shard's own time), its log never fetched or rebuilt again meanwhile, so the wait
+/// needs no longer than the period it holds the control shard's coordinator for. Waited for in the owner shard's own
+/// time instead, the coordinator was held for the whole materialization (1.2 s of a test's paused turns), its council
+/// and its heads with it. The head and sealing the log was fetched at are kept with the pending volume, for its end's
+/// [`crate::live_ship::note_rebuild`].
+async fn begin_live(
+  origin: u16,
+  target: u16,
+  making: MakeLive,
+  fetched: crate::live_ship::Fetched,
+) -> Result<(), VolumeWait> {
+  let object = making.object;
+  let _ = state::with_state_counted(|s| {
+    if let Some(pending) = s.pending_materializations.get_mut(&object) {
+      pending.live_adopted = Some((fetched.head, fetched.sealing.clone()));
+    }
+  });
+  let ended = crate::xshard::task_within(
+    origin,
+    target,
+    move || make_live(making, fetched),
+    HEARTBEAT_NS,
+  )
+  .await;
+  match ended {
+    Some(ended) => {
+      // Read here, so the owner shard forgets the record its task left for a later attempt.
+      crate::xshard::run_on_counted(origin, target, move |s| {
+        if matches!(
+          s.making_taken_over.get(&object),
+          Some(Making::Made | Making::Refused(_))
+        ) {
+          s.making_taken_over.remove(&object);
+        }
+      });
+      live_ended(object, ended)
+    }
+    // Still running on the owner shard, or not begun there: the next attempt reads which.
+    None => making_runs(object, 0),
+  }
+}
+
+/// A live volume's materialization, a task of its owner shard (g251, CLAUDE.md "Bounded work everywhere"): it claims the
+/// volume's record (`ShardState::making_taken_over`), makes the volume in turns of the shard's clock
+/// ([`make_live_in_turns`]), and leaves its end in the record for the control shard to read. Refused
+/// [`MAKING_ALREADY`] when a materialization of the volume already runs there, which the control shard joins instead.
+async fn make_live(
+  making: MakeLive,
+  fetched: crate::live_ship::Fetched,
+) -> Result<(), &'static str> {
+  let object = making.object;
+  let claimed = state::with_state(|s| {
+    if s.making_taken_over.contains_key(&object) {
+      return false;
+    }
+    s.making_taken_over
+      .insert(object, Making::Running { turns: 0 });
+    true
+  });
+  match claimed {
+    Some(true) => {}
+    Some(false) => return Err(MAKING_ALREADY),
+    None => return Err(MATERIALIZE_UNANSWERED),
+  }
+  let ended = make_live_in_turns(making, fetched).await;
+  // Recorded only while the record is still this task's: a takeover the control shard gave up on meanwhile forgot it
+  // ([`give_up_taken_over`]), and nothing would read an end left then.
+  let recorded = state::with_state(|s| {
+    if let Some(record) = s.making_taken_over.get_mut(&object) {
+      *record = match ended {
+        Ok(()) => Making::Made,
+        Err(why) => Making::Refused(why),
+      };
+    }
+  });
+  if recorded.is_none() {
+    return Err(MATERIALIZE_UNANSWERED);
+  }
+  ended
+}
+
+/// One more turn taken by `object`'s materialization on this owner shard, counted for the control shard's progress.
+fn turned(state: &mut ShardState, object: ObjectId) {
+  if let Some(Making::Running { turns }) = state.making_taken_over.get_mut(&object) {
+    *turns = turns.saturating_add(1);
+  }
+}
+
+/// The turns of a live volume's materialization on its owner shard: the log's payloads opened and applied a slice a
+/// turn, each held to the turn's share of the seal quantum (`config::wrap_slice_ns`, a payload at least:
+/// [`crate::live_ship::Rebuilding`]), counted [`LIVE_REBUILD_SLICES`]; then the rebuilt volume laid out as an archive, a
+/// turn; then the archive restored, a turn (`verbs::restore_taken_over`); then the volume made from the restore and
+/// published before it is served (A-343), its shipper made from the head the takeover adopted (A-329), a turn, so no
+/// client meets it unpublished. Before, all of it ran in one owner-shard turn: on a Mac Studio the nemesis's successors took 0.68 to
+/// 1.08 s to rebuild 152 to 306 MB of log, 0.24 to 0.32 s to restore and populate the volume and up to 0.48 s to publish,
+/// past the watchdog's spin window, which ended the successor's process.
+async fn make_live_in_turns(
+  making: MakeLive,
+  fetched: crate::live_ship::Fetched,
+) -> Result<(), &'static str> {
+  let MakeLive {
+    object,
+    id,
+    head,
+    catalog,
+    catalog_sequence,
+    placed,
+    catalog_placed,
+    region,
+    past_tolerance,
+  } = making;
+  let crate::live_ship::Fetched {
+    head: adopted,
+    payloads,
+    lineage,
+    naming,
+    ..
+  } = fetched;
+  let begun = state::with_state(|s| {
+    let begun =
+      crate::live_ship::Rebuilding::begin(s, id, &catalog.owner, (lineage, naming), payloads);
+    begun.map_err(|why| crate::live_ship::rebuild_refused(s, why))
+  })
+  .ok_or(MATERIALIZE_UNANSWERED)?;
+  let mut rebuilding = begun?;
+  let _ = state::with_state_counted(|s| s.count(LIVE_REBUILDS_BEGUN, 1));
+  loop {
+    let slice_ns = state::with_state(|s| crate::config::wrap_slice_ns(seal_quantum_ns(s)))
+      .ok_or(MATERIALIZE_UNANSWERED)?;
+    let began = futures::now_ns();
+    let before = rebuilding.left();
+    let advanced = rebuilding.advance(|| futures::now_ns().saturating_sub(began) >= slice_ns);
+    let applied = before.saturating_sub(rebuilding.left());
+    let done = state::with_state(|s| {
+      s.count(LIVE_REBUILD_SLICES, 1);
+      s.count(
+        LIVE_REBUILD_PAYLOADS,
+        u64::try_from(applied).unwrap_or(u64::MAX),
+      );
+      turned(s, object);
+      advanced.map_err(|why| crate::live_ship::rebuild_refused(s, why))
+    })
+    .ok_or(MATERIALIZE_UNANSWERED)??;
+    if done {
+      break;
+    }
+    futures::yield_now().await;
+    // A test's wait between the turns (`Daemon::inject_live_turn_pause`); nothing in production.
+    if let Some(pause_ns) = state::with_state(|s| s.live_turn_pause_ns).flatten()
+      && futures::sleep(pause_ns).await.is_err()
+    {
+      count_refusal(LIVE_TURN_PAUSE_UNTIMED);
+    }
+  }
+  futures::yield_now().await;
+  let archive = rebuilding.archive();
+  let archive = state::with_state(|s| {
+    turned(s, object);
+    archive.map_err(|why| crate::live_ship::rebuild_refused(s, why))
+  })
+  .ok_or(MATERIALIZE_UNANSWERED)??;
+  futures::yield_now().await;
+  // The archive restored in a turn of its own: a volume made here already (a retry after its publication was refused)
+  // restores nothing.
+  let restored = state::with_state(|s| {
+    turned(s, object);
+    past_the_pressure_hold(s, |s| match verbs::made_already(s, id, &catalog)? {
+      true => Ok(None),
+      false => verbs::restore_taken_over(s, &catalog, Some(&archive)),
+    })
+    .map_err(|refusal| materialize_refusal_counter(&refusal))
+  })
+  .ok_or(MATERIALIZE_UNANSWERED)??;
+  drop(archive);
+  futures::yield_now().await;
+  state::with_state(|s| {
+    turned(s, object);
+    let sequence = placed.sequence;
+    // The takeover is recorded with the volume (AC-8.3, A-325): its loss report then survives this node's restart.
+    let taken = verbs::TakenOver {
+      head: &head,
+      catalog: &catalog,
+      catalog_sequence,
+      sequence,
+      takeover: slates_db::catalog::TakeoverRecord {
+        epoch: placed.epoch.0,
+        head_sequence: sequence,
+        from_live_log: true,
+        past_tolerance,
+      },
+    };
+    past_the_pressure_hold(s, |s| {
+      verbs::materialize_taken_over_restored(s, id, &taken, region, restored.as_ref())
+    })
+    .map_err(|refusal| materialize_refusal_counter(&refusal))?;
+    // The successor's log goes on from the head it adopted (A-329), past every position durable before it.
+    crate::live_ship::adopt_head(s, id, adopted);
+    s.placed_heads.insert(object, placed);
+    s.placed_heads.insert(object.catalog(), catalog_placed);
+    // Published before it is served (A-343): its image is what a restart rebuilds it from, and its shipper is made
+    // from the adopted head at once. Counted taken over only then, in this turn, as the one-turn materialization counted
+    // it: a test that restarts the successor once the count rises found a volume made and published.
+    published_before_served(s)?;
+    crate::live_ship::taken_over(s);
+    Ok(())
+  })
+  .ok_or(MATERIALIZE_UNANSWERED)?
+}
+
+/// Counter: one owner-shard turn's slice of a live volume's rebuild from its log ([`make_live_in_turns`], g251).
+/// Format: a counter name in the daemon's status report.
+const LIVE_REBUILD_SLICES: &str = "fleet.live.rebuild_slices";
+/// Counter: the payloads a live volume's rebuild applied, in all its turns (g251): with [`LIVE_REBUILD_SLICES`], how
+/// many a turn took.
+/// Format: a counter name in the daemon's status report.
+const LIVE_REBUILD_PAYLOADS: &str = "fleet.live.rebuild_payloads";
+/// Counter: a live volume's rebuild from its log begun on its owner shard (g251): once a takeover, however many attempts
+/// its control shard makes while it runs.
+/// Format: a counter name in the daemon's status report.
+const LIVE_REBUILDS_BEGUN: &str = "fleet.live.rebuilds_begun";
+/// Counter: a test's wait between a live rebuild's turns the runtime could not time; the next turn went at once.
+/// Format: a counter name in the daemon's status report.
+const LIVE_TURN_PAUSE_UNTIMED: &str = "fleet.live.turn_pause_untimed";
+/// Counter: an attempt that found its volume's live materialization running on the owner shard and joined it (g251).
+/// Format: a counter name in the daemon's status report.
+const MATERIALIZE_WAITS_MAKING: &str = "fleet.materialize.waits.making";
+/// Counter: a live materialization begun while another of the same volume ran on its owner shard, which the control
+/// shard joins instead (g251).
+/// Format: a counter name in the daemon's status report.
+const MAKING_ALREADY: &str = "fleet.materialize.making_already";
+
 /// What a taken-over volume's materialization waited on when an attempt could not finish ([`materialize_pending`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum VolumeWait {
@@ -5678,6 +6052,8 @@ enum VolumeWait {
   Live,
   /// The owner shard refused the materialization, or did not answer within the period.
   Refused,
+  /// Its live materialization runs in turns on the owner shard ([`make_live`], g251).
+  Making,
 }
 
 impl VolumeWait {
@@ -5691,6 +6067,7 @@ impl VolumeWait {
       VolumeWait::CatalogPlacement => MATERIALIZE_WAITS_CATALOG_PLACEMENT,
       VolumeWait::Shard => MATERIALIZE_WAITS_SHARD,
       VolumeWait::Live | VolumeWait::Refused => MATERIALIZE_REFUSED,
+      VolumeWait::Making => MATERIALIZE_WAITS_MAKING,
     }
   }
 
@@ -5710,6 +6087,7 @@ impl VolumeWait {
       VolumeWait::Shard => "shard",
       VolumeWait::Live => "live",
       VolumeWait::Refused => "refused",
+      VolumeWait::Making => "making",
     }
   }
 }
@@ -8959,6 +9337,7 @@ pub(crate) struct Delivered {
   root: u64,
   ready: Option<bool>,
   lease: u64,
+  failover: u64,
 }
 
 /// The control shard's memory of the configuration fan (AUD-29-29): what each other shard last received, and
@@ -8993,11 +9372,13 @@ impl Fanned {
       root: (root.version > had.root).then(|| root.clone()),
       ready: (had.ready != Some(state.consensus_ready)).then_some(state.consensus_ready),
       lease: (self.lease_generation > had.lease).then(|| self.lease.clone()),
+      failover: (state.failover_ns != had.failover).then_some(state.failover_ns),
       now: Delivered {
         placement: placement.version,
         root: root.version,
         ready: Some(state.consensus_ready),
         lease: self.lease_generation,
+        failover: state.failover_ns,
       },
     };
     fan.carries().then_some(fan)
@@ -9015,12 +9396,18 @@ struct Fan {
   root: Option<slates_db::register::RootConfiguration>,
   ready: Option<bool>,
   lease: Option<crate::lease::OwnerLease>,
+  /// The control shard's failover delay, in whole periods (A-363).
+  failover: Option<u64>,
   now: Delivered,
 }
 
 impl Fan {
   fn carries(&self) -> bool {
-    self.placement.is_some() || self.root.is_some() || self.ready.is_some() || self.lease.is_some()
+    self.placement.is_some()
+      || self.root.is_some()
+      || self.ready.is_some()
+      || self.lease.is_some()
+      || self.failover.is_some()
   }
 
   fn delivered(&self) -> Delivered {
@@ -9056,7 +9443,38 @@ impl Fan {
     if let Some(lease) = self.lease {
       s.lease = lease;
     }
+    // The failover delay the control shard estimated, which this shard's waits read (A-363).
+    if let Some(failover_ns) = self.failover {
+      s.failover_ns = failover_ns;
+    }
   }
+}
+
+/// Refreshes this node's failover estimate for the period (§4.8 "Derived constants", A-363): the detection term from the
+/// member plane (SWIM's count of periods from a crashed peer's last answer to its condemnation, each at the detector's
+/// measured period's running tail, `MemberPlane::detection`), and the confirmation from the council's election timing
+/// this period derived, at the coordinator's measured period. The recovery term moves as takeovers and volumes complete
+/// (`takeover::drive_host_takeover`, `fleet::materialize`). Nothing sets the estimate: it is what this node measured.
+fn refresh_failover(state: &mut ShardState) {
+  let detection = state
+    .plane
+    .plane
+    .as_ref()
+    .and_then(slates_cluster::member_plane::MemberPlane::detection);
+  let timing = state.council_timing;
+  let estimate = state.failover.refresh(detection, &timing, HEARTBEAT_NS);
+  // What this shard's waits read, and the fan carries to the others when it moves.
+  state.failover_ns = state
+    .injected_failover_ns
+    .unwrap_or_else(|| failover_in_periods(estimate.total_ns()));
+}
+
+/// Derived: a failover delay of `ns` in whole coordinator periods, rounded up (A-363): the granularity every wait that
+/// reads it acts at (a takeover counts its attempts a period at a time, and the forward lane and the location round
+/// look a period apart), so the fan carries the estimate only when it crosses a period, not at every jitter of its
+/// tails.
+pub(crate) fn failover_in_periods(ns: u64) -> u64 {
+  ns.div_ceil(HEARTBEAT_NS).saturating_mul(HEARTBEAT_NS)
 }
 
 /// The record-plane coordinator (§4.8 "records are sent to all candidates; committed at `f + 1`"; "Promotion
@@ -9107,6 +9525,9 @@ async fn run_record_plane(local: HostId) {
     // it (`merge_service::PLACED_WITHIN_PERIOD`).
     let _ = state::with_state(|s| {
       s.merge.coordinator_period = s.merge.coordinator_period.saturating_add(1);
+      // The period's length is a sample of the coordinator's period, which the council's death watch counts in
+      // (A-363): a starved coordinator's periods stretch, and its failover estimate with them.
+      s.failover.period_began(slates_rt::futures::now_ns());
     });
     in_flight.retain_mut(|dispatch| !dispatch.settle());
     // This period's round budget, derived from the slowest measured peer path — every dispatch below (a
@@ -9117,6 +9538,9 @@ async fn run_record_plane(local: HostId) {
     // Drive the configuration authority first — an election or a replication heartbeat over the transport —
     // then the records under the configuration it maintains.
     drive_config_council(local, budget, &mut council_timer, &mut in_flight).await;
+    // The failover estimate for this period, from the detector as it stands and the council's timing just derived
+    // (A-363): published in the daemon's status as it moves.
+    let _ = state::with_state_counted(refresh_failover);
     // Drive the root group across regions on the same coordinator (§4.8, D-14): a brief borrow of the
     // root-voter sessions, sequential with the council's and the record ships, so it never contends.
     drive_root_group(local, budget, &mut root_timer, &mut in_flight).await;
@@ -11129,6 +11553,41 @@ mod tests {
     });
   }
 
+  /// A-363. Do: fan a shard everything, then move the control shard's failover delay by a period, then deliver it, then
+  /// install a fan carrying a failover delay on a shard. Expect the first fan to carry the delay; a moved delay owed
+  /// alone, nothing else; nothing owed once it is delivered; and the receiver to read the delay it was fanned: every
+  /// shard's waits read the control shard's estimate, sent only when it moves.
+  #[test]
+  fn a_shard_is_fanned_the_failover_delay_when_it_moves() {
+    crate::daemon::audit_on_shard(|s| {
+      s.fanned.observe_lease(&s.lease);
+      let first = s.fanned.owed(s, OTHER_SHARD).expect("a first fan is owed");
+      assert_eq!(
+        first.failover,
+        Some(s.failover_ns),
+        "the first fan carries the delay"
+      );
+      s.fanned.record(OTHER_SHARD, first.delivered());
+      assert!(s.fanned.owed(s, OTHER_SHARD).is_none(), "nothing moved");
+      s.failover_ns = s.failover_ns.saturating_add(HEARTBEAT_NS);
+      let moved = s.fanned.owed(s, OTHER_SHARD).expect("the delay moved");
+      assert_eq!(moved.failover, Some(s.failover_ns));
+      assert!(
+        moved.placement.is_none()
+          && moved.root.is_none()
+          && moved.ready.is_none()
+          && moved.lease.is_none(),
+        "the delay is owed alone"
+      );
+      s.fanned.record(OTHER_SHARD, moved.delivered());
+      assert!(s.fanned.owed(s, OTHER_SHARD).is_none(), "delivered");
+      let fanned = s.failover_ns;
+      s.failover_ns = 0;
+      moved.install(s);
+      assert_eq!(s.failover_ns, fanned, "the receiver reads the fanned delay");
+    });
+  }
+
   /// AUD-29-29. Do: install a fan carrying only a lease on a shard whose lease is empty. Expect: the shard's
   /// lease is the fanned one and nothing else it holds changes.
   #[test]
@@ -11145,6 +11604,7 @@ mod tests {
         root: None,
         ready: None,
         lease: Some(fanned.clone()),
+        failover: None,
         now: Delivered::default(),
       }
       .install(s);
