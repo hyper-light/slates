@@ -71,6 +71,7 @@ pub(crate) const TAKEOVER_STREAM: u64 = 16;
 
 /// The record-session stream a successor asks a ledger's positions over (A-364; [`LedgerPrepare`],
 /// [`serve_ledger_prepare`]): a green's merge-record log adopted position by position.
+/// Format: a record-session stream id, the next free one when A-364 took it; ids are never reused or renumbered.
 pub(crate) const TAKEOVER_LEDGER_STREAM: u64 = 28;
 
 /// Counter: positions of a ledger a successor adopted and committed again under its own epoch (A-364,

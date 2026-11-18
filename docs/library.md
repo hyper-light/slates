@@ -60,9 +60,9 @@ fn main() -> ExitCode {
   Its authority is a secret of its own: make one once with `LauncherSecret::generate()`, keep its
   `bytes()` where the host keeps its secrets, and start with
   `StartSpec::new(..).with_launcher(LauncherSecret::from_bytes(kept)?)` at every start; then
-  `Issuer::from_launcher_secret(&secret)` is the authority `approve_landing`, `approve_merge` and
-  `set_write_policy` take, after the host's restart as before it. (The daemon's verification of it is
-  being built, A-285.)
+  `Issuer::from_launcher_secret(&secret)` is the authority `approve_landing`, `approve_merge`,
+  `set_write_policy` and `set_signers` take, after the host's restart and the daemon's as before them:
+  the daemon verifies every launcher proof under that secret beside its own issuer's (A-285).
 
 ## The consumer contract
 
@@ -173,7 +173,9 @@ nothing answers until detached) and mounts nothing (a mount is a record). The co
 - Serving: `mount(volume, path, &MountOptions)` and `unmount(path)` (macOS: the loopback NFS mount;
   Linux: FUSE; Windows: a WinFsp drive; it answers `Unmounted`, whose `unreported` names each volume a
   Windows unmount could not ask for its mounts), `serve_shards(volume, intent, subtree)` (a stream end to
-  hand `shards run --slates-fs-fd N`), `serve_vhost_user(..)` (Linux), `detach(attachment)`.
+  hand `shards run --slates-fs-fd N`; its guest is offered DAX per file, each file of a 2 MiB range or
+  more marked for its guest to map while the shard's fill budget has room), `serve_vhost_user(..)`
+  (Linux), `detach(attachment)`.
   `slates_api::mount::available()` says, with no daemon, whether this machine can mount a volume
   and through what (`MountKind`), or what is missing (`MountMissing`). `slates_api::mount::unmount_busy(path)`
   lets go of a mount that a leftover process still uses, with no daemon and no privilege, and answers how
@@ -191,9 +193,10 @@ nothing answers until detached) and mounts nothing (a mount is a record). The co
   `merge_statement(&work, &evidence)`, `merge_record(green, version)`, `set_signers` and `signers`
   for signed merges. `Instance::client()` lends the raw client for the declared edits on a work volume (`edit`,
   `declare`) and the file verbs, outside the contract.
-- The launcher's authority: `Issuer::from_environment()` (the anchor's handoff, as `slates grant`
-  has it) or `Issuer::from_handoff(pairs)`. The SDKs and the MCP server cannot approve: they do not
-  depend on this crate.
+- The launcher's authority: `Issuer::from_launcher_secret(&secret)` (the starter's own secret, above),
+  `Issuer::from_environment()` (the anchor's handoff, as `slates grant` has it) or
+  `Issuer::from_handoff(pairs)`. The SDKs and the MCP server cannot approve: they do not depend on
+  this crate.
 - Moving a volume to another fleet member (A-291): `member()` is this instance's member id, and
   `move_volume(volume, to)` asks the volume's owner to move it to the member `to` (another
   instance's `member()`): one ask, answered `MoveProgress::Moving` until the switch and
@@ -213,7 +216,9 @@ nothing answers until detached) and mounts nothing (a mount is a record). The co
   refused `Error::Unsupported`. A large file is read whole, so the capture costs its bytes in memory
   once more while it runs.
 - Observation: `daemon_status`, `audit` (typed `AuditRecord`s), `grants` (typed `GrantRecord`s),
-  `telemetry`.
+  `telemetry`. The audit is one log, written through the control shard, so an instance on any shard
+  reads every landing's records. A granted landing that is refused ends its trail: a
+  `LandingFinished` record whose `outcome` is `Refused`, or `Aborted` once it wrote an entry.
 - Lists a page at a time: the daemon answers every list a reply at a time, so a host that shows a
   list a screen at a time reads one `Page { items, next }` a screen and holds no more:
   `list_page(after)` (volumes in id order), `grants_page(after)`, `audit_page(since)`,
@@ -235,10 +240,16 @@ nothing answers until detached) and mounts nothing (a mount is a record). The co
   (`Unrestricted`, `ProfileLoaded`, `ProfileMissing`, `Unsupported`), and every refusal is an
   `ExecFault` naming its remedy.
 
-Calls are synchronous: a provisioning verb answers in microseconds, and a landing or a mount waits
-while the daemon lives. A host on its own async runtime runs them on its blocking pool until the
-async form lands. `slates_api::VERSION` is the crate's version, the workspace's one version;
-`slates_api::CONTRACT` is the contract's.
+Calls on `Instance` are synchronous: a provisioning verb answers in microseconds, and a landing or a
+mount waits while the daemon lives. A host on its own event loop awaits the verbs `AsyncInstance` serves:
+provisioning from every source, a snapshot, a status and a destroy. It lends one wait, `Reactor::wait`:
+the client's completion signal readable, or a timeout, whichever comes first. Nothing spawns and no runtime
+is added; a future dropped mid-call cancels its call. `AsyncInstance::new(instance)` and
+`into_instance()` move between the forms; deregister the completion descriptor from the loop first,
+since handing back closes it. The other verbs run on the host's blocking pool until the async form
+serves them too. `slates_api::VERSION` is the crate's version, the workspace's one version;
+`slates_api::CONTRACT` is the contract's, and its doc comment names what each version changed (a
+test holds every version to a line there).
 
 ## A host's workspace flow
 
@@ -282,6 +293,6 @@ fn workspace(folder: &std::path::Path, at: &str) -> Result<(), slates_api::Error
 
 ## What is owed
 
-1. The starter handed the launcher's authority on every platform.
-2. Typed fields on the wire for drift, a presentation's conflicts and a merge's versions.
-3. An async form over the host's own reactor.
+1. A typed field on the wire for a merge's versions (the work's base beside the head).
+2. The async form for the remaining verbs: the paged reads, landings, merges, policies and
+   observation.

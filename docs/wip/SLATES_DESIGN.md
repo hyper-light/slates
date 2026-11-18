@@ -419,7 +419,8 @@ inputs the daemon reads at boot or observes at runtime, never constants in the c
 > rate.** "1,000 clients under 1 ms" holds when every kind's p99 stays under 1 ms while one green takes 10³ or more
 > verdicts a second from 1,000 clients, the floor of the row "Increments per green volume per second" above, with no
 > oracle failure. Every kind is each request, attempt by attempt and end to end with its resends, and a whole edit and
-> merge with the client's own think pauses left out. The load test judges each level against it
+> merge with the client's own think pauses left out. A round to its accept, which holds as many edits and merges as
+> its conflicts make, is reported and not judged (A-416). The load test judges each level against it
 > (`crates/client/examples/load_bench.rs`, its `bound` row). A level with no think time is the rung's capacity in
 > verdicts a second and is never judged against the bound: its clients queue on the green's one serialized verdict,
 > so a request waits about the clients times the verdict's cost (Little's law), 21 ms at 1,000 clients on the owner's
@@ -2397,6 +2398,14 @@ Linux runner; then teardown proofs (detach, destroy, a daemon restart).
 > given back, when the publication did not capture the volume. A guest's acknowledged close survives a
 > daemon restart (`crates/server/tests/virtiofs.rs`). Group commit across a pass's chains is not built: one
 > publication per held chain, as the FUSE and NFS paths do.
+
+> **Status (2026-11-18, A-410: a guest's acknowledged write outlives its daemon through the write log).** A plain
+> `WRITE` is not held for the barrier: the bridge hands each one to the shard's write log in the anchor's content
+> object before its used element is published (`VolumeBridge::logging_writes`, given the log by `ShardBridge`), as a
+> FUSE mount and a Shards stream do (A-63, A-316), and a successor replays it. A write the log cannot keep makes the
+> bridge owe a publication (`Bridge::awaits_publication`), so the device holds that reply for the barrier and answers
+> `EIO` if it does not capture the volume (A-358's rule). Before, a write acknowledged after the last publication was
+> lost at a daemon's death (`a_guests_acknowledged_write_outlives_its_daemon_through_the_write_log`).
 
 > **Status (2026-10-01, AUD-29-83 and AUD-29-87: the guest and FUSE paths answer to the owner lease; a busy
 > guest cannot postpone revocation).** Before every pass the guest loop asks the owner whether it may serve the
@@ -8394,8 +8403,9 @@ command and every host start, mount and grant through one implementation.
   rewitness; serving as a host mount (§4.6, every platform's own mechanism; `mount::available` says
   without a daemon whether the machine can mount and what is missing, and `mount::unmount_busy` lets
   go of a mount a leftover process still holds, detached on Linux and forced on macOS and the BSDs) or as a descriptor a
-  VMM takes (the Shards
-  stream, A-161; the vhost-user socket); landing and merging under the caller's write mode, and
+  VMM takes (the Shards stream, A-161, whose guest is offered DAX per file, held through the library by
+  `a_shards_stream_end_serves_the_volume_it_was_made_for`; the vhost-user socket); landing and merging under the
+  caller's write mode, and
   approving exactly the manifest shown (the consumer contract below, A-299, which replaced A-278's
   `land_approved`); observation (daemon status, audit, grants, telemetry). `Instance::client` lends
   the whole typed client for the rest (a work volume's declared edits, the file verbs).
@@ -8523,7 +8533,10 @@ it builds against the contract and adds to it rather than around it.
   does the same for the records the log keeps. A variant appended is published in its change by
   the test's `--ignored` writer, which refuses to publish a moved tag. Anything else fails, naming
   the enum and the first tag that moved (since 2026-11-18, after `SubmitApproved` moved from 69 to
-  71; it stays at 71).
+  71; it stays at 71). The history a consumer reads is held the same way: `CONTRACT`'s doc comment
+  names what each version changed, and a doc-truth test fails a raised number without its line, a
+  line out of order or one past the number (`the_contract_history_names_every_version_in_order`,
+  `crates/api/src/lib.rs`).
 - *Laptop and fleet (R8).* One contract and one code path: the same calls, outcomes and errors on a
   laptop instance and on a fleet node; a fleet's own refusals (`Elsewhere`, `Retry` for an owner
   not confirmed) are variants a laptop never sends.
@@ -11969,7 +11982,9 @@ native since GitHub's `windows-11-arm` image (actions/runner-images#14592)]
 Recipes to copy verbatim:
 - One raw binary per platform attached to the GitHub release, no archive; `cargo-binstall`
   overrides name each asset explicitly and "unsupported targets fail instead of guessing".
-  [C: release.yml:1-16; crates/cli/Cargo.toml:78-103]
+  [C: release.yml:1-16; crates/cli/Cargo.toml:78-103] Built in slates since 2026-11-18 (A-413):
+  `crates/cli/Cargo.toml`'s `[package.metadata.binstall]`, one override per entry of `xtask/src/targets.rs`'s `ASSETS`,
+  held to it by `cargo xtask version`; the workspace names its `repository`, which `{ repo }` reads.
 - musl lanes build inside official `rust:alpine` containers, native per arch, with `apk add
   build-base`, `RUSTFLAGS="-C target-feature=+crt-static"`, the `LINKER=cc` environment override
   (env outranks `.cargo/config.toml`), and an `ldd` staticness gate that accepts both "not a
@@ -29501,6 +29516,86 @@ code below.
   checkpoint) and `a_ledger_compacted_between_keeps_its_first_position_and_the_checkpoints_own` (`register.rs`); the
   server's merge, retention, state and takeover unit tests 35 of 35 and the acceptor tests 9 of 9 (kiln, the Mac Studio,
   2026-11-18, debug).
+
+### A-413 — cargo-binstall installs a release binary: the CLI manifest names each shipped target's asset, and the version audit holds it to the shipped targets (2026-11-18, the release goals g236 and g237; B.2's recipe, A-210's "not yet")
+Applied in the same change to: `crates/cli/Cargo.toml` (`repository.workspace = true` and
+`[package.metadata.binstall]`), the root `Cargo.toml` (`[workspace.package] repository`), `xtask/src/version.rs`
+(`Binstall`, `read_binstall`, `audit_binstall`, five findings, and the tests
+`the_binstall_table_names_exactly_the_shipped_binaries` and `the_trees_binstall_table_names_the_release_binaries`),
+Appendix B.2, GAPS and `docs/publish.md`.
+- **What it does.** `cargo binstall --git https://github.com/hyper-light/slates slates-cli` reads the CLI manifest
+  and downloads the release binary for the machine's target: `pkg-fmt = "bin"` (a release attaches raw binaries) and
+  one override per shipped target naming `{ repo }/releases/download/v{ version }/<asset>`. A target slates does not
+  ship has no override, so the default archive names find nothing and cargo-binstall builds from source; quick-install,
+  a third party's builds, is off. vorpal's manifest is the model.
+- **Held to the shipped targets.** `cargo xtask version`, in `cargo xtask check` on every push and in every tag lane's
+  guard, refuses a shipped target with no override, an override for a target slates does not ship, an override
+  addressing another asset, an archive format, and a crate with no repository, each as its own finding.
+- **Owed.** An install against a published release (run request); publishing the crate to crates.io would let
+  `cargo binstall slates-cli` drop `--git`.
+
+### A-410 — Slates' own virtio-fs device keeps each guest write in the write log before its used element: A-358's rule on the vhost-user route (2026-11-18, goal g268; g079's route table, "the vhost-user device neither saves nor logs a write before replying"; §4.6 virtio-fs, §4.8 barrier, D-18; A-63, A-316, A-358, A-379, A-402)
+Applied in the same change to:
+- `crates/bridge-core`: `VolumeBridge::logging_writes` (a transport's write log, handed each write the volume took;
+  one it did not keep makes `awaits_publication` true); `Bridge::awaits_publication`'s doc; the unit test
+  `a_bridge_hands_each_write_to_its_log_and_owes_a_publication_for_one_it_did_not_keep`
+  (`crates/bridge-core/tests/volume_bridge.rs`).
+- `crates/server/src/virtiofs.rs`: `ShardBridge::with_bridge` gives each pass's bridge the shard's write log and
+  content object; the module doc. `crates/bridge-fuse/src/bridge.rs`: `needs_barrier`'s doc.
+- The test `a_guests_acknowledged_write_outlives_its_daemon_through_the_write_log` (`crates/server/tests/virtiofs.rs`).
+- §4.6 (the virtio-fs status after AUD-29-82's); GAPS: the route table in the WinFsp write's entry (2026-11-18), with
+  the Windows streams' row brought to A-402, and Phase 8 step 4's owed line.
+
+- **What was there.** The virtio-fs device held a request's used element for the owner's barrier only when
+  `needs_barrier` named it (namespace and attribute changes, `fsync`, the `flush` a close sends) or the volume owed a
+  publication. A plain `WRITE` was answered with neither a publication nor a log record, so a write acknowledged after
+  the last publication was lost at a daemon's death. g079's sibling sweep (A-379) found it; it was safe only while the
+  VM died with its device's daemon (crosvm ends the VM at a back end's hangup), and the volume itself outlives the
+  daemon, so a write the guest was told succeeded was missing from it afterwards.
+- **The rule.** A-358's: a write a client is told succeeded survives the daemon's death before the reply. Here it is
+  kept as a FUSE mount and a Shards stream keep it: the bridge appends each write the volume took to the shard's write
+  log before the device publishes the used element, and a successor replays the log at recovery. A write the log does
+  not keep (no room, or a span the content object refused) makes the bridge owe a publication; the device then holds
+  the reply for the owner's barrier, which publishes and answers `EIO` if the publication did not capture the volume. A
+  device with no anchor's content object (no log) is a daemon nothing outlives, and owes nothing for its writes.
+- **Why not the barrier per write.** A-379 publishes every WinFsp write because Windows had no write log. The log is
+  on every platform since A-402, and a logged write costs an append into anchor-held memory, where a publication writes
+  the shard's whole recovery image; A-399 measured a stream's close publishing nothing the log held at 15.7-16.0 µs p50
+  against 17.5-20.0 µs.
+- **Evidence.** The unit test drives a bridge with a keeping log, a refusing log and none. The integration test runs
+  the in-process guest seam under a daemon whose anchor the test holds: a guest creates a file (its barrier publishes
+  it) and writes into it, the daemon is killed by a fenced stop that publishes nothing, and a successor over the same
+  segment reads the bytes back over NFS. Without the change the file comes back empty, as its create's publication left
+  it. The vhost-user front end's run on Linux is main's (`run-requests.md`, 2026-11-18).
+
+### A-416 — The many-client bound judges every request and the cycle, and reports the round; the load test's hot set is a set (2026-11-18, built for goals 231 and 257, 1,000 clients under 1 ms; amends A-297's "The judgment")
+Applied in the same change to: §1.4 (the status under the table), GAPS (the load test's entry),
+`crates/client/examples/load_bench.rs` (`Kind::judged`, `bound_row`, `hot_set`, `plan_round`, `level`'s `refused` row,
+the module's "The workload" and "The bound"), and the example's tests below.
+- **The round is reported, not judged.** A-297 judged "every kind", and the harness took that as every kind it timed,
+  the round among them. §1.4's status names the kinds as each request and a whole edit and merge, which the cycle is (a
+  round's first edit to its first verdict). A round is not one: it runs from its first edit to its accept, so it holds
+  as many edits and merges as its conflicts make, and its p99 grows with the conflict rate the hot set sets, not with
+  any request's time. On the Mac Studio at 1,000 clients and a think mean of 50 ms (1,102 verdicts a second, works on
+  their clients' shards, 2026-11-18) every request's p99 was 0.47 to 1.33 ms and the cycle's 104 ms (pauses left out),
+  while the round's was 191 ms. The bound now judges every request kind and the cycle; the round stays in the `latency`
+  row. This is g231's option (b), whose stated trigger, a measurement with the round alone over the bound, was met;
+  decided by the principle above, Ada's to veto.
+- **The hot set is a set.** The harness drew `--hot-files` indices with replacement, so a file drawn twice was twice as
+  hot as the rest of the set, and 800 draws over `kernel/`'s 700-odd eligible files made every file hot and some three
+  to five times hotter: 19 to 28 of 1,000 clients starved (ran out of resolutions) in every run, and the bound requires
+  none. The hot set is now `--hot-files` distinct files (a Fisher–Yates shuffle's first places, by the plan's own
+  draws), and at most half the files long enough to edit, so a pick from the whole tree misses it at least half the
+  time and the tree's picks stay mostly disjoint, as the workload states. A larger one is refused before the level
+  runs (`refused`, exit 1), never shrunk to fit; the 1,000-client rung's 800 hot files need a tree of 1,600 eligible
+  files or more (`fs/` of linux v7.4-rc1 holds 2,365 files). `--hot-files 0` is a level with no hot set; before, it
+  indexed an empty set.
+- **Tests** (`cargo test -p slates-client --example load_bench`): a round at 191 ms with every request and the cycle
+  under the bound meets it and names the cycle, and a cycle over it fails the level
+  (`a_round_is_reported_and_not_judged_and_a_cycle_is_judged`); a hot set names each file once and the same seed draws
+  it again (`a_hot_set_names_each_file_once`); a hot set past half the eligible files is refused and exactly half is
+  one (`a_hot_set_past_half_the_eligible_files_is_refused`); with no hot set every pick is from the whole tree and no
+  shared slot is written (`with_no_hot_set_every_pick_is_from_the_whole_tree`).
 
 ### A-412 — A holder behind its own records catches up from them, fetching their inputs from the record's owner (2026-11-18, kiln goal g250; §4.16 "Apply on holders"; A-313, A-333, A-364, A-373)
 Applied in the same change to: GAPS (the entry at its head), the bug record of 2026-11-18 on a holder behind its own

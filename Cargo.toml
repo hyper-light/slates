@@ -13,6 +13,9 @@ edition = "2024"
 license = "MIT"
 rust-version = "1.98"
 readme = "README.md"
+# Where the source and the releases are: cargo-binstall builds each release binary's address from it (`{ repo }` in
+# `crates/cli/Cargo.toml`'s `[package.metadata.binstall]`, Appendix B.2).
+repository = "https://github.com/hyper-light/slates"
 
 [workspace.dependencies]
 slates-machine = { path = "crates/machine", version = "0.1.0", default-features = false }

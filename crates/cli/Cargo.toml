@@ -6,7 +6,40 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 readme.workspace = true
+repository.workspace = true
 description = "The `slates` command: the anchor process that owns the segment and supervises the daemon, the daemon itself, and the lifecycle verbs over the Rust client (design §2.5, §2.6, §4.4, §4.12; Phase 2 task 5)."
+
+# `cargo binstall --git https://github.com/hyper-light/slates slates-cli` installs the release's binary for this machine
+# (Appendix B.2, A-413). A release attaches one raw binary per shipped target, named by `ASSETS` in
+# xtask/src/targets.rs, so each shipped target has an override naming its file, and a target slates does not ship has
+# none: cargo-binstall's default archive names find nothing there, so it builds from source instead, and quick-install,
+# a third party's builds, is off.
+# `cargo xtask version` refuses any drift from `ASSETS`.
+[package.metadata.binstall]
+pkg-fmt = "bin"
+bin-dir = "{ bin }{ binary-ext }"
+disabled-strategies = ["quick-install"]
+
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/slates-macos-arm64"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/slates-linux-x64"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/slates-linux-arm64"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-musl]
+pkg-url = "{ repo }/releases/download/v{ version }/slates-linux-x64-musl"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-musl]
+pkg-url = "{ repo }/releases/download/v{ version }/slates-linux-arm64-musl"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/slates-windows-x64.exe"
+
+[package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/slates-windows-arm64.exe"
 
 [[bin]]
 name = "slates"

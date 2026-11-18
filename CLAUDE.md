@@ -300,30 +300,24 @@ Every test is written as "do X, expect Y" and names the acceptance criterion or 
 - Every claim carries a number, a date, and a command or a citation. "From memory" is flagged as such and listed for verification.
 - Plain English in every document and comment; no jargon that a careful engineer new to the project cannot act on.
 
-## 8. Every agent: implement, run focused unit and integration tests, merge (Ada, 2026-11-18, binding on every agent and subagent, forever)
+## 8. Every agent: implement, run its unit tests, merge, and end (Ada, 2026-11-18, binding on every agent and subagent, forever; "the LAST time I'm going to remind you")
 
-1. **Implement** the change, with its tests (a bug's failing test first, red-checked) and the design, GAPS and docs lines it makes true, in one commit in the style above.
-2. **Test, focused:** run the unit tests that exercise the change (`cargo test -p <crate> --lib <filter>`) and at
-   most the one named integration test that does, if it runs in seconds in a debug build (`cargo test -p <crate>
-   --test <file> <name>`), plus `cargo fmt`. A bug's failing test is red-checked once. Never yourself: whole-crate or
-   workspace suites, clippy, cross-platform builds or runs, lint matrices, `xtask`, doc builds, e2e, chaos or live
-   flows, conformance suites, diag CI branches, A/B or benchmark rounds, repeated red/green runs, seed replays, TLC
-   model checks, kernel-scale or load runs, or waiting on CI or a queued machine. File each run you want in the
-   supervisor's run-request queue with its exact command, its platform and what red would look like; main runs it
-   and sends the failures back; take your next piece meanwhile. Windows code that cannot run on your host merges on a
-   clean `cargo xwin check` of its crates. A performance change is implemented (both designs, on two branches, when
-   they are close) with its counters; main runs the A/B and the winner lands with main's figures.
-3. **Merge it yourself:**
-   - `git fetch origin && git merge origin/main` into your branch;
-   - rerun those focused tests if the merge changed what they cover;
-   - read `git diff --stat origin/main HEAD`: your files alone;
-   - `git push origin HEAD:main`, as its own command.
+An agent does exactly four things, then stops:
 
-   Never land a commit built with `git commit-tree` from your branch's tree: it reverts whatever main gained since
-   your last merge (2026-11-18: one such push removed 40 files of main for two minutes).
+1. **Implement** one piece: the change, its unit tests (a bug's failing unit test first), and the design, GAPS and docs
+   lines it makes true, in one commit in the style above.
+2. **Run its unit tests:** `cargo test -p <crate> --lib <filter>` for what it changed, plus `cargo fmt`. Nothing heavier,
+   ever: no integration suites, fleet, e2e, chaos or live flows, conformance suites, diag CI branches, other platforms'
+   runs, A/B or benchmark rounds, repeated runs, seed replays, TLC, kernel-scale or load runs, clippy, lint matrices,
+   `xtask`, doc builds, or waiting on CI or a queued machine. Windows code that cannot run on its host merges on a clean
+   `cargo xwin check` of its crates.
+3. **Merge it itself:** `git fetch origin && git merge origin/main`; read `git diff --stat origin/main HEAD` (its files
+   alone); `git push origin HEAD:main` as its own command. If refused, fetch, merge and push again. Never force-push,
+   rewrite main, or land a commit built with `git commit-tree` (on 2026-11-18 one removed 40 files of main).
+4. **End:** record what landed and what is left in its progress file, put any heavier test it wants in the supervisor's
+   run-request queue (the exact command, the platform, what red would look like), report in a few lines, and stop. It
+   does not start its next piece; the supervisor starts it.
 
-   If the push is refused because main moved, fetch, merge and push again. Never force-push or rewrite main.
-
-Main (the supervisor) runs clippy, the full suites, build, cross-platform runs, e2e, CI and measurement on main after
-merges, does the fixes, and sends a breakage it cannot fix in place back to the commit's author, who fixes it the same
-way. This section overrides older instructions in this file about gates before landing and about who lands.
+Main (the supervisor) runs everything heavier (clippy, the full suites, cross-platform builds and runs, e2e, chaos, CI,
+measurement and A/B) on main after merges, does the fixes, and sends a breakage it cannot fix in place back to the
+commit's author as a new piece. This section overrides older instructions in this file about gates, testing and landing.

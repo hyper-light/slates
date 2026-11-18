@@ -491,6 +491,89 @@ fn a_guests_acknowledged_close_survives_a_daemon_restart() {
   drop(anchor);
 }
 
+/// A-410 (A-358's rule for a guest device, kept by A-63's write log). Do: under a daemon whose anchor segment the test
+/// holds, a guest creates a file, whose barrier publishes it, and writes bytes into it, the write acknowledged after
+/// that last publication and never flushed or closed; with the guest still attached, kill the daemon (a fenced stop,
+/// which publishes nothing, as a killed process does) and start a second one over the same segment. Expect: the second
+/// daemon reads the guest's bytes back over NFS, replayed from the shard's write log. Before A-410 the device neither
+/// logged nor published a write before its reply, so the file came back as its create's publication left it, empty.
+#[test]
+fn a_guests_acknowledged_write_outlives_its_daemon_through_the_write_log() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-guest-write-log-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(1));
+  let anchor = held_anchor("guest-write-log", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&scratch("guest-write-log")) else {
+    panic!("the volume was not created");
+  };
+  let guest = common::guest::start_guest(
+    &first,
+    id,
+    Principal::Uid {
+      host: slates_db::HostId(common::this_host()),
+      uid: my_uid(),
+    },
+    slates_server::virtiofs::GuestView::default(),
+    |kick_write, call_read| {
+      Box::pin(async move {
+        let created = round_trip(
+          &kick_write,
+          &call_read,
+          &message(Opcode::Create.to_wire(), 1, 1, &create_body("logged.txt")),
+        )
+        .await;
+        let ino = u64_at(&created, OUT_HEADER_LEN);
+        let fh = u64_at(&created, OUT_HEADER_LEN + EntryOut::LEN);
+        let written = round_trip(
+          &kick_write,
+          &call_read,
+          &message(Opcode::Write.to_wire(), 2, ino, &write_body(fh, PAYLOAD)),
+        )
+        .await;
+        // The guest's ends come back to the test, open: a hang-up would end the device before the death.
+        (
+          [reply_error(&created), reply_error(&written)],
+          kick_write,
+          call_read,
+        )
+      })
+    },
+  );
+  let (errors, kick_write, call_read) = guest
+    .script
+    .recv_timeout(common::guest::WAIT)
+    .expect("the guest script finished");
+  assert_eq!(errors, [0, 0], "the create and the write succeeded");
+  first.inject_consensus_failure().unwrap();
+  first.stop();
+  drop(kick_write);
+  drop(call_read);
+  drop(client);
+
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  let capability = second
+    .mount_capability("guest-write-log")
+    .expect("the owner shard answers")
+    .expect("the volume was recovered");
+  let port = second.nfs_port().expect("the daemon is serving NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root = mount(&mut stream, &capability, 1);
+  let file = lookup(&mut stream, &root, "logged.txt", 2);
+  assert_eq!(
+    read(&mut stream, &file, 3),
+    PAYLOAD,
+    "the guest's acknowledged write outlived its daemon, replayed from the write log"
+  );
+  drop(stream);
+  second.stop();
+  drop(anchor);
+}
+
 /// Shape: heartbeats the guest watches its requests after the revocation — several of the loop's pass
 /// boundaries, so a loop that went on serving would have answered them.
 const REVOKED_WATCH_HEARTBEATS: u64 = 5;

@@ -228,10 +228,10 @@ pub fn negotiate_offering(
 
 /// Format: where an `INIT` reply's body (`fuse_init_out`, as [`InitNegotiation::to_bytes`] writes it) holds its flags'
 /// low word, past the major, the minor and `max_readahead`.
-const AT_FLAGS: usize = 3 * size_of::<u32>();
+const AT_FLAGS: usize = size_of::<[u32; 3]>();
 /// Format: where it holds `flags2`, past the low word, `max_background` and `congestion_threshold`, `max_write`,
 /// `time_gran`, and `max_pages` with `map_alignment`.
-const AT_FLAGS2: usize = 8 * size_of::<u32>();
+const AT_FLAGS2: usize = size_of::<[u32; 8]>();
 
 /// The flags an `INIT` reply's body kept (`fuse_init_out`'s flags and, the reply carrying `FUSE_INIT_EXT`, its
 /// `flags2` above them), as its kernel reads them: what a transport learns of its connection from the reply the shared
