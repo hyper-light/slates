@@ -3949,13 +3949,19 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 >     the same direction on the same ports. The mechanics are known: `verbs::resolve_and_forward` resends to a live
 >     owner until the failover SLO (`FAILOVER_SLO_NS`, 10 s) passes and then refuses `OwnerUnreachable`, a typed
 >     refusal a consumer retries; and a learner fetches the configuration only over a record session
->     (`fleet::drive_learner_fetch`). The cause is a hypothesis, since the run kept no node logs: the server node, held
->     to CPU weight 1 on adacachy under a load near 100 (in g066e, at load 112.9, its control shard ran 627, 923 and
->     1,104 ms late against its 1,000 ms watchdog window), answered its record sessions late for longer than the SLO.
+>     (`fleet::drive_learner_fetch`). The run kept no node logs, so the cause is not known. Starvation of the server
+>     is ruled out as the whole of it: with the same pair and direction (run g066s2), the server node's unit held to a
+>     2% CPU quota (`systemctl --user set-property --runtime UNIT CPUQuota=2%`, cpu.max `2000 100000`) for 45 s right
+>     after the root group formed and for 30 s while the client made a work, the client held configuration version 1
+>     throughout, every forwarded `work` was answered within 0.5 to 8.6 s (the first made the work, the rest were
+>     refused `AlreadyExists` for the experiment's repeated name), the read after the lift answered in 0.7 s, and the
+>     flow landed exactly the 4 merged files. What remains is the path: the client reached adacachy over the Mac's
+>     Wi-Fi, and 15 and 17 replaced sessions are re-dials after losses, so a run of losses longer than the SLO fits.
 >     The program now keeps each node's last 400 log lines and its whole status on a failure. Owed under plan step 4:
->     reproduce it on one box with the server node held to a CPU quota (`systemd-run --user -p CPUQuota=`) and tell
->     from its log whether the refusal is the SLO doing its job, the configuration arriving once the starvation ends,
->     or a session or learner defect, which then gets its failing test first.
+>     drive the client's first configuration fetch across a link that drops everything for longer than the SLO and
+>     then heals (the relay of `crates/cli/tests/live_chaos.rs`, a node bound apart from its advertised address,
+>     A-277), and require the configuration and a forwarded verb back within a derived bound of the heal; a miss is a
+>     learner or session defect and gets its failing test first.
 >   - Gotcha: a transient unit's service manager substitutes `${NAME}` anywhere in its command (systemd.service(5),
 >     "Command lines"; systemd 262), so the first run's `"${f#./}"` reached bash empty and its disk read lost every
 >     path while the flow itself passed; the program passes every `$` as `$$`.
