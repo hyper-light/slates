@@ -242,6 +242,8 @@ pub struct LandCall<'a> {
   pub filter: &'a slates_ipc::protocol::Filter,
   /// The grant, when one was issued.
   pub grant: Option<u64>,
+  /// Present only (`Present`, A-285): answer the presentation whatever the write policy, never land.
+  pub present_only: bool,
 }
 
 /// Lands `volume`'s snapshot into `target` (§4.15). Without a grant covering the planned
@@ -501,6 +503,7 @@ fn land_verb_unix(
     target,
     filter,
     grant,
+    present_only,
   } = call;
   let (handle, record) = match find(state, volume) {
     Ok(x) => x,
@@ -512,14 +515,14 @@ fn land_verb_unix(
   // The write policy (A-285): a forbidding mode refuses every landing, granted or not, before any host access; a
   // bypass mode grants the landing the daemon presents and lands it in the same request.
   let mode = land_mode(&record);
-  if mode == slates_db::catalog::WriteMode::Forbid {
+  if mode == slates_db::catalog::WriteMode::Forbid && !present_only {
     state.count(POLICY_FORBIDS_LAND, 1);
     return refused(Refusal::PolicyForbids {
       act: WriteAct::Land,
       by: PolicySubject::Volume { volume },
     });
   }
-  let bypass = grant.is_none() && mode == slates_db::catalog::WriteMode::Bypass;
+  let bypass = !present_only && grant.is_none() && mode == slates_db::catalog::WriteMode::Bypass;
   let db_volume = to_db_volume(volume);
   // A landing without a grant ends in a presentation, and the shard holds only so many: past the bound it
   // is refused before any host access, id or record (AUD-29-07).
@@ -887,6 +890,7 @@ fn land_under_policy(
             target: &job.target,
             filter: &requested.filter,
             grant: Some(grant),
+            present_only: false,
           },
         )
       }
@@ -2763,8 +2767,11 @@ pub fn grant_verb(
   let Some(awaiting) = state.landing.awaiting.get(&landing_id).cloned() else {
     return crate::verbs::refused(Refusal::NotFound);
   };
-  let expected = grant_proof(&state.issuer_secret, landing_id, &manifest, scope, term_ns);
-  if !constant_time_eq(&expected, &proof) {
+  if !proven_by_launcher(
+    state,
+    |secret| grant_proof(secret, landing_id, &manifest, scope, term_ns),
+    &proof,
+  ) {
     state.count("grant_issuer_unverified", 1);
     return crate::verbs::refused(Refusal::GrantIssuerUnverified);
   }
@@ -2848,20 +2855,57 @@ pub enum Issuer {
 /// Format: the domain tag of a policy proof, so it never verifies as a grant, enrollment or revocation proof.
 const POLICY_DOMAIN: &[u8] = b"slates.policy";
 
-/// The proof a `SetPolicy` request carries (A-285): the keyed hash, under the issuer secret, of the policy domain
-/// tag, the subject and the policy, in their wire encodings. Only the launcher or the harness, which holds the issuer,
-/// can make one; an agent's consumer channel never holds it.
+/// The proof a `SetPolicy` request carries (A-285): the keyed hash, under the launcher's secret, of the policy domain
+/// tag, the subject and the policy in their wire encodings, and the policy version the setter read. Only the launcher
+/// or the harness can make one; an agent's consumer channel never holds the secret. The version makes a captured proof
+/// good for one change: once the policy has moved past it, the proof is refused `PolicyChanged`.
 pub fn policy_proof(
   secret: &[u8; slates_anchor::layout::ISSUER_SECRET_BYTES],
   subject: &PolicySubject,
   policy: &WritePolicy,
+  version: u64,
 ) -> [u8; 32] {
   let mut bytes = Vec::new();
   slates_wire::Wire::encode(subject, &mut bytes);
   slates_wire::Wire::encode(policy, &mut bytes);
+  bytes.extend_from_slice(&version.to_le_bytes());
   let mut hasher = blake3::Hasher::new_keyed(secret);
   hasher.update(POLICY_DOMAIN);
   hasher.update(&bytes);
+  *hasher.finalize().as_bytes()
+}
+
+/// Whether `proof` is the launcher's (A-285, R10): `make`'s proof under the secret this daemon minted at its start (the
+/// issuer, held by the anchor's tree), or under the launcher secret its starter handed the anchor (kept by the launcher
+/// across its own restarts and the daemon's), compared in constant time. The same formula and domain under either:
+/// the launcher's authority is one, however it is held.
+pub(crate) fn proven_by_launcher(
+  state: &ShardState,
+  make: impl Fn(&[u8; slates_anchor::layout::ISSUER_SECRET_BYTES]) -> [u8; 32],
+  proof: &[u8; 32],
+) -> bool {
+  let by_issuer = constant_time_eq(&make(&state.issuer_secret), proof);
+  let by_launcher = state
+    .launcher_secret
+    .as_ref()
+    .is_some_and(|secret| constant_time_eq(&make(secret), proof));
+  by_issuer | by_launcher
+}
+
+/// Format: the domain tag of a merge approval's proof.
+const MERGE_APPROVAL_DOMAIN: &[u8] = b"slates.merge-approval";
+
+/// The proof a `SubmitApproved` request carries (A-285): the keyed hash, under the issuer secret, of the merge approval
+/// domain tag, the work volume and the approved increment's identity.
+pub fn merge_approval_proof(
+  secret: &[u8; slates_anchor::layout::ISSUER_SECRET_BYTES],
+  work: VolumeId,
+  identity: &[u8; 32],
+) -> [u8; 32] {
+  let mut hasher = blake3::Hasher::new_keyed(secret);
+  hasher.update(MERGE_APPROVAL_DOMAIN);
+  hasher.update(&work.bytes);
+  hasher.update(identity);
   *hasher.finalize().as_bytes()
 }
 
@@ -2872,16 +2916,18 @@ pub fn policy_proof(
 pub fn set_policy_verb(
   state: &mut ShardState,
   principal: &Principal,
-  subject: PolicySubject,
-  policy: WritePolicy,
+  (subject, policy, version): (PolicySubject, WritePolicy, u64),
   proof: [u8; 32],
 ) -> ReplyBody {
   if matches!(principal, Principal::Consumer { .. }) {
     state.count("policy_set_by_consumer", 1);
     return crate::verbs::forbidden("set_policy");
   }
-  let expected = policy_proof(&state.issuer_secret, &subject, &policy);
-  if !constant_time_eq(&expected, &proof) {
+  if !proven_by_launcher(
+    state,
+    |secret| policy_proof(secret, &subject, &policy, version),
+    &proof,
+  ) {
     state.count("grant_issuer_unverified", 1);
     return crate::verbs::refused(Refusal::GrantIssuerUnverified);
   }
@@ -2890,8 +2936,15 @@ pub fn set_policy_verb(
       feature: "a consumer's write policy (A-285, owed)".to_owned(),
     });
   };
-  if let Err(reply) = crate::verbs::find(state, volume) {
-    return *reply;
+  let current = match policy_record(state, volume) {
+    Ok(record) => record.policy.write_version,
+    Err(reply) => return *reply,
+  };
+  // The setter's version is the one the policy is at (A-285): a proof made for an earlier state of the policy, a
+  // replayed or a raced one, changes nothing.
+  if version != current {
+    state.count("policy_changed", 1);
+    return crate::verbs::refused(Refusal::PolicyChanged { current });
   }
   let now = state.clock.monotonic_ns();
   let op = Op::VolumeWritePolicySet {
@@ -2916,8 +2969,8 @@ pub fn policy_verb(
       feature: "a consumer's write policy (A-285, owed)".to_owned(),
     });
   };
-  let record = match crate::verbs::find(state, volume) {
-    Ok((_, record)) => record,
+  let record = match policy_record(state, volume) {
+    Ok(record) => record,
     Err(reply) => return *reply,
   };
   if !crate::verbs::rights_of(&record, principal).read {
@@ -2925,7 +2978,29 @@ pub fn policy_verb(
   }
   ReplyBody::Policy {
     policy: record.policy.write.map(wire_policy),
+    version: record.policy.write_version,
   }
+}
+
+/// The catalog record a policy is set on or read from (A-285): any volume this shard holds — a store-backed volume, a
+/// green or a work, which holds no store slot — refused `NotFound` for one it does not and `Destroying` for one going.
+fn policy_record(
+  state: &ShardState,
+  volume: VolumeId,
+) -> Result<slates_db::catalog::VolumeRecord, Box<ReplyBody>> {
+  let record = state
+    .db
+    .partition()
+    .volume(crate::verbs::to_db_volume(volume))
+    .cloned()
+    .ok_or_else(|| Box::new(crate::verbs::refused(Refusal::NotFound)))?;
+  if matches!(
+    record.state,
+    slates_db::catalog::VolumeState::Destroying | slates_db::catalog::VolumeState::Destroyed
+  ) {
+    return Err(Box::new(crate::verbs::refused(Refusal::Destroying)));
+  }
+  Ok(record)
 }
 
 /// A volume's landing mode (A-285): its policy's, or ask while none is set.

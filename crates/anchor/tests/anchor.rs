@@ -161,6 +161,29 @@ fn a_published_sealing_root_is_adopted_by_a_later_attachment() {
   );
 }
 
+/// A-299: do create a segment and read its launcher secret, publish one as the anchor does before its first daemon, then
+/// read it through a later attachment (a daemon re-attaching the anchor's segment); expect none on the fresh segment, the
+/// later attachment reading the very secret the anchor published, and the issuer secret and the session secret beside
+/// it left alone.
+#[test]
+fn a_published_launcher_secret_is_read_by_a_later_attachment() {
+  let id = identity();
+  let mut created =
+    AnchorSegment::create(&unique_name("slates-anchor-test-launcher"), &id, geometry()).unwrap();
+  assert_eq!(
+    created.launcher_secret().unwrap(),
+    None,
+    "a fresh segment holds no launcher secret"
+  );
+  let secret = [5u8; 32];
+  created.publish_launcher_secret(&secret).unwrap();
+  let (handoff, len) = handoff_of(&created);
+  let later = AnchorSegment::attach(&handoff, len, &id).unwrap();
+  assert_eq!(later.launcher_secret().unwrap(), Some(secret));
+  assert_eq!(later.issuer_secret().unwrap(), [0u8; 32]);
+  assert_eq!(later.session_secret().unwrap(), None);
+}
+
 /// A payload larger than its region, another machine's identity and the wrong length are
 /// refused with nothing written.
 #[test]

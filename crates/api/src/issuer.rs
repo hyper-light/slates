@@ -133,11 +133,13 @@ impl Issuer {
     &self,
     subject: &slates_ipc::protocol::PolicySubject,
     policy: &slates_ipc::protocol::WritePolicy,
+    version: u64,
   ) -> Result<[u8; 32], Error> {
     Ok(slates_server::landing::policy_proof(
       &self.secret()?,
       subject,
       policy,
+      version,
     ))
   }
 
@@ -165,5 +167,17 @@ impl GrantAuthority for Issuer {
       claim.scope,
       claim.term_ns,
     )))
+  }
+
+  /// The keyed hash of exactly `work` and its increment `identity`, under the merge approval's own domain (A-285).
+  fn prove_merge(
+    &self,
+    work: slates_ipc::protocol::VolumeId,
+    identity: &[u8; 32],
+  ) -> Result<GrantProof, Error> {
+    let secret = self.secret()?;
+    Ok(GrantProof::IssuerHash(
+      slates_server::landing::merge_approval_proof(&secret, work, identity),
+    ))
   }
 }

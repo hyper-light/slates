@@ -14,27 +14,27 @@
 //! [`MergeOutcome::ApprovalRequired`], forbid answers its `Refused` outcome. The launcher sets a volume's mode with
 //! [`Instance::set_write_policy`] under its authority (the instance's issuer); the daemon keeps and enforces it (A-285,
 //! kiln agent g220): a bypass volume lands in the presenting request, a forbidding one is refused before any host
-//! access, an unset one asks. [`Instance::approve`] approves an ask with the launcher's authority, never more than the
-//! manifest the approver was shown. A consumer's own mode, merges under a mode and signed work are the daemon's next
-//! pieces (GAPS).
+//! access, an unset one asks; a merge follows its work's and green's modes the same way. [`Instance::approve_landing`]
+//! and [`Instance::approve_merge`] approve an ask with the launcher's authority, never more than the manifest or the
+//! increment the approver was shown. A consumer's own mode and signed work are the daemon's next pieces (GAPS).
 
 use slates_client::{
   Attachment, Client, ClientError, CreateSpec, Landing, Rebased, ShardsStream, Submitted,
   VhostUserDevice,
 };
 use slates_ipc::protocol::{
-  AuditEntry, DaemonReport, Filter, GrantScope, GrantSummary, Intent, MergeWindow, PlannedEntry,
-  ReadAt, Refusal, ReplyBody, RequestBody, SizeClass, SnapshotId, TelemetryReport, VolumeId,
-  VolumeSummary,
+  DaemonReport, Filter, GrantScope, Intent, MergeWindow, PlannedEntry, ReadAt, Refusal, ReplyBody,
+  RequestBody, SizeClass, SnapshotId, TelemetryReport, VolumeId, VolumeSummary,
 };
 
 use crate::error::{Error, Missing, ProtocolFault, Unsupported};
 use crate::grant::{GrantAuthority, GrantClaim, GrantProof};
+use crate::observe::{AuditRecord, GrantRecord, audit_of, grant_of};
 use crate::outcome::{
-  Approval, Awaiting, LandOutcome, LandingConflict, MergeConflict, MergeConflicts, MergeOutcome,
-  RebaseOutcome, Work, merge_class_of, report_of, summary_of,
+  LandOutcome, LandingApproval, LandingConflict, MergeApproval, MergeConflict, MergeConflicts,
+  MergeOutcome, RebaseOutcome, Work, merge_class_of, report_of, summary_of,
 };
-use crate::policy::{PolicyRefusal, PolicySubject, WriteMode, WritePolicy};
+use crate::policy::{PolicyRefusal, PolicySubject, WritePolicy};
 use crate::signed::{Verification, WorkSignature};
 use crate::volume::{
   BaseState, DriftReport, Provisioned, Source, VolumeSpec, VolumeStatus, status_of,
@@ -66,7 +66,7 @@ pub struct LandingRequest {
 /// A presentation as the daemon answered it, typed: a plan to approve, or what needs none.
 enum Presented {
   /// A plan with something to write and no conflict: its id, manifest and summary.
-  Plan(Approval),
+  Plan(LandingApproval),
   /// Anything else: written at once (nothing needed an approval), or conflicted.
   Settled(LandOutcome),
 }
@@ -391,7 +391,7 @@ impl Instance {
   }
 
   /// Lands `request` under the caller's write mode (§4.15): [`LandOutcome::Written`] when it runs,
-  /// [`LandOutcome::ApprovalRequired`] when the mode asks (what would be written, for [`Instance::approve`]),
+  /// [`LandOutcome::ApprovalRequired`] when the mode asks (what would be written, for [`Instance::approve_landing`]),
   /// [`LandOutcome::Conflicted`] when the disk changed entries the volume changed too, [`LandOutcome::Refused`] when a
   /// policy forbids it. A `signature` makes the landing signed work ([`crate::signed`]); refused
   /// `Unsupported(SignedWork)` until the daemon verifies signed work.
@@ -403,29 +403,23 @@ impl Instance {
     if signature.is_some() {
       return Err(Error::Unsupported(Unsupported::SignedWork));
     }
-    Ok(match self.present(request)? {
+    let landing = self.land_with(request, None);
+    Ok(match self.presented(request, landing)? {
       Presented::Plan(approval) => LandOutcome::ApprovalRequired(approval),
       Presented::Settled(outcome) => outcome,
     })
   }
 
-  /// Presents the landing of `request` without writing it, whatever the caller's mode (§4.15 steps 1–2): the plan as
-  /// an approval (its manifest, its summary), or the conflicts found before any write. A landing with nothing to write
-  /// is finished at once and answers [`LandOutcome::Written`] with nothing written. What a reviewer asks before
-  /// approving: [`Instance::approval_entries`] lists the plan path by path.
-  ///
-  /// The daemon presents and lands a bypass volume in one request, and offers no verb that presents alone yet (owed,
-  /// A-285's owner), so a landing of a volume whose own land mode is [`crate::WriteMode::Bypass`] is refused
-  /// `Unsupported(WritePolicies)` here rather than written: the volume's mode is read first, and a launcher that
-  /// raises it to bypass between the read and the presentation is the one race left until the verb lands.
+  /// Presents the landing of `request` without writing it, whatever the caller's write mode (§4.15 steps 1–2; the
+  /// daemon's present-only verb, A-285): the plan as an approval (its manifest, its summary), or the conflicts found
+  /// before any write. What a reviewer asks before approving: [`Instance::approval_entries`] lists the plan path by
+  /// path. A forbidding mode presents too, since a reviewer reads changes it may not land.
   pub fn plan_landing(&mut self, request: &LandingRequest) -> Result<LandOutcome, Error> {
-    let subject = PolicySubject::Volume(request.volume);
-    if let Some(policy) = self.write_policy(subject)?
-      && policy.land == WriteMode::Bypass
-    {
-      return Err(Error::Unsupported(Unsupported::WritePolicies));
-    }
-    self.land(request, None)
+    let presented = self.present_only(request);
+    Ok(match self.presented(request, presented)? {
+      Presented::Plan(approval) => LandOutcome::ApprovalRequired(approval),
+      Presented::Settled(outcome) => outcome,
+    })
   }
 
   /// Every entry an approved landing would write (§4.15 step 2, "the full entry list on demand"; A-287): path by path
@@ -435,32 +429,38 @@ impl Instance {
   /// reads against its entry: a volume reads only at its head, so a mismatch means it changed since the approval's
   /// snapshot and the landing is presented again. Read from the presentation the approval names, which lives until
   /// this client presents the same volume and target again, lands it, or goes: [`Missing::Presentation`] after that.
-  pub fn approval_entries(&mut self, approval: &Approval) -> Result<Vec<PlannedEntry>, Error> {
-    if let Awaiting::Merge(_) = approval.awaiting {
-      return Err(Error::Unsupported(Unsupported::WritePolicies));
-    }
+  pub fn approval_entries(
+    &mut self,
+    approval: &LandingApproval,
+  ) -> Result<Vec<PlannedEntry>, Error> {
     self
       .client
-      .landing_entries(approval.id, approval.manifest)
-      .map_err(|e| self.fail(e, Some(Missing::Presentation { id: approval.id })))
+      .landing_entries(approval.presentation, approval.manifest)
+      .map_err(|e| {
+        self.fail(
+          e,
+          Some(Missing::Presentation {
+            id: approval.presentation,
+          }),
+        )
+      })
   }
 
-  /// Approves exactly what `approval` showed (§4.13 "Grants", §4.15), with the launcher's `authority`: presents the
-  /// landing again, and when its manifest is still the approved one, has the authority prove a grant of that manifest
-  /// for one landing, and lands under it — [`LandOutcome::Written`]. When the volume or the disk changed since, nothing
-  /// is approved or written, and the answer is the new presentation ([`LandOutcome::ApprovalRequired`] to show
-  /// instead, or [`LandOutcome::Conflicted`]). An approval never covers more than the manifest its approver saw,
-  /// however long they took. A merge's approval is refused `Unsupported(WritePolicies)` until the daemon asks for one.
-  pub fn approve(
+  /// Approves exactly the landing `approval` showed (§4.13 "Grants", §4.15), with the launcher's `authority`:
+  /// presents the landing again (never writing), and when its manifest is still the approved one, has the authority
+  /// prove a grant of that manifest for one landing, and lands under it — [`LandOutcome::Written`]. When the volume or
+  /// the disk changed since, nothing is approved or written, and the answer is the new presentation
+  /// ([`LandOutcome::ApprovalRequired`] to show instead, or [`LandOutcome::Conflicted`]). An approval never covers more
+  /// than the manifest its approver saw, however long they took, and it works from any instance: it is bound to the
+  /// request and the manifest, never to the client that first presented it.
+  pub fn approve_landing(
     &mut self,
-    approval: &Approval,
+    approval: &LandingApproval,
     authority: &dyn GrantAuthority,
   ) -> Result<LandOutcome, Error> {
-    let request = match &approval.awaiting {
-      Awaiting::Landing(request) => request,
-      Awaiting::Merge(_) => return Err(Error::Unsupported(Unsupported::WritePolicies)),
-    };
-    let fresh = match self.present(request)? {
+    let request = &approval.request;
+    let presented = self.present_only(request);
+    let fresh = match self.presented(request, presented)? {
       Presented::Plan(fresh) => fresh,
       Presented::Settled(outcome) => return Ok(outcome),
     };
@@ -468,7 +468,7 @@ impl Instance {
       return Ok(LandOutcome::ApprovalRequired(fresh));
     }
     let claim = GrantClaim {
-      landing: fresh.id,
+      landing: fresh.presentation,
       manifest: fresh.manifest,
       scope: GrantScope::Once,
       term_ns: crate::GRANT_TERM_NS,
@@ -480,19 +480,25 @@ impl Instance {
         outcome,
         Verification::Unsigned,
       )?)),
-      // The grant does not cover what is planned now, or the disk moved between the grant and the landing's
-      // validation: nothing was written; what holds now is presented.
       Err(ClientError::Refused(Refusal::PolicyForbids { act, by })) => {
         Ok(LandOutcome::Refused(PolicyRefusal::forbidden(act, by)))
       }
+      // The grant does not cover what is planned now, or the disk moved between the grant and the landing's
+      // validation: nothing was written; what holds now is presented.
       Ok(Landing::GrantRequired { .. })
       | Err(ClientError::Refused(Refusal::GrantMismatch | Refusal::LandingConflict { .. })) => {
-        Ok(match self.present(request)? {
+        let again = self.present_only(request);
+        Ok(match self.presented(request, again)? {
           Presented::Plan(again) => LandOutcome::ApprovalRequired(again),
           Presented::Settled(outcome) => outcome,
         })
       }
-      Err(error) => Err(self.fail(error, Some(Missing::Presentation { id: fresh.id }))),
+      Err(error) => Err(self.fail(
+        error,
+        Some(Missing::Presentation {
+          id: fresh.presentation,
+        }),
+      )),
     }
   }
 
@@ -514,9 +520,13 @@ impl Instance {
       .map_err(|e| self.fail(e, Some(Missing::Presentation { id: claim.landing })))
   }
 
-  /// One presentation of `request`, typed.
-  fn present(&mut self, request: &LandingRequest) -> Result<Presented, Error> {
-    match self.land_with(request, None) {
+  /// A presentation's reply, typed: a plan to approve, conflicts, written at once, or refused by a policy.
+  fn presented(
+    &mut self,
+    request: &LandingRequest,
+    reply: Result<Landing, ClientError>,
+  ) -> Result<Presented, Error> {
+    match reply {
       Ok(Landing::Landed(outcome)) => Ok(Presented::Settled(LandOutcome::Written(report_of(
         outcome,
         Verification::Unsigned,
@@ -527,9 +537,9 @@ impl Instance {
         summary,
         conflicts,
       }) => {
-        let approval = Approval {
-          awaiting: Awaiting::Landing(request.clone()),
-          id: landing,
+        let approval = LandingApproval {
+          request: request.clone(),
+          presentation: landing,
           manifest,
           summary: summary_of(&summary)?,
           verification: Verification::Unsigned,
@@ -549,7 +559,7 @@ impl Instance {
 
   /// A conflicted presentation's conflicts, typed, read from its entries (§4.15 step 2; A-287): each entry the
   /// preliminary verdict found in conflict, with its class and the bytes the volume would land there.
-  fn conflicts_of(&mut self, approval: &Approval) -> Result<LandOutcome, Error> {
+  fn conflicts_of(&mut self, approval: &LandingApproval) -> Result<LandOutcome, Error> {
     let conflicts = self
       .approval_entries(approval)?
       .into_iter()
@@ -562,6 +572,16 @@ impl Instance {
       })
       .collect();
     Ok(LandOutcome::Conflicted(conflicts))
+  }
+
+  /// One presentation of `request` that never writes, whatever the mode (the daemon's `Present`, A-285).
+  fn present_only(&mut self, request: &LandingRequest) -> Result<Landing, ClientError> {
+    self.client.present(
+      request.volume,
+      request.snapshot,
+      &request.target,
+      request.filter.clone(),
+    )
   }
 
   /// One `land` call: presented without a grant, run with one.
@@ -581,18 +601,57 @@ impl Instance {
 
   /// Merges `work` into its green under the caller's write mode (§4.16, D-27): [`MergeOutcome::Merged`] at the green's
   /// new version, [`MergeOutcome::Conflicted`] with every conflict window typed and the green's head (rebase, resolve,
-  /// merge again), [`MergeOutcome::ApprovalRequired`] when the mode asks, [`MergeOutcome::Refused`] when a policy
-  /// forbids it or the green requires signed merges. A `signature` makes the merge signed work; refused
+  /// merge again), [`MergeOutcome::ApprovalRequired`] when the mode asks (the increment's identity, for
+  /// [`Instance::approve_merge`]), [`MergeOutcome::Refused`] when a policy forbids it. `evidence` is what a green that
+  /// requires evidence takes (§4.16; empty for one that does not). A `signature` makes the merge signed work; refused
   /// `Unsupported(SignedWork)` until the daemon verifies signed work.
   pub fn merge(
     &mut self,
     work: &Work,
+    evidence: &[[u8; 32]],
     signature: Option<&WorkSignature>,
   ) -> Result<MergeOutcome, Error> {
     if signature.is_some() {
       return Err(Error::Unsupported(Unsupported::SignedWork));
     }
-    match self.client.submit(work.volume) {
+    let submitted = self.client.submit_with_evidence(work.volume, evidence);
+    self.merged(work, evidence, submitted)
+  }
+
+  /// Merges exactly the increment `approval` showed (A-285), with the launcher's `authority`: the daemon merges it only
+  /// while the work's increment is still that identity. When the work changed since, nothing is merged and the merge is
+  /// asked again: the answer is what the work's mode gives now (a fresh [`MergeOutcome::ApprovalRequired`] to show
+  /// instead, or its conflicts).
+  pub fn approve_merge(
+    &mut self,
+    approval: &MergeApproval,
+    authority: &dyn GrantAuthority,
+  ) -> Result<MergeOutcome, Error> {
+    let work = approval.work;
+    let proof = authority.prove_merge(work.volume, &approval.identity)?;
+    let submitted = self.client.submit_approved(
+      work.volume,
+      &approval.evidence,
+      approval.identity,
+      proof.wire(),
+    );
+    match submitted {
+      // The work's increment is no longer the approved one: nothing was merged; what holds now is asked again.
+      Err(ClientError::Refused(Refusal::GrantMismatch)) => {
+        self.merge(&work, &approval.evidence, None)
+      }
+      other => self.merged(&work, &approval.evidence, other),
+    }
+  }
+
+  /// A submit's reply, typed.
+  fn merged(
+    &mut self,
+    work: &Work,
+    evidence: &[[u8; 32]],
+    reply: Result<Submitted, ClientError>,
+  ) -> Result<MergeOutcome, Error> {
+    match reply {
       Ok(Submitted::Accepted(version)) => Ok(MergeOutcome::Merged {
         version,
         verification: Verification::Unsigned,
@@ -600,6 +659,15 @@ impl Instance {
       Ok(Submitted::Conflict(windows)) => self
         .merge_conflicts(work, windows)
         .map(MergeOutcome::Conflicted),
+      Ok(Submitted::ApprovalRequired { identity, paths }) => {
+        Ok(MergeOutcome::ApprovalRequired(MergeApproval {
+          work: *work,
+          evidence: evidence.to_vec(),
+          identity,
+          paths,
+          verification: Verification::Unsigned,
+        }))
+      }
       Err(ClientError::Refused(Refusal::PolicyForbids { act, by })) => {
         Ok(MergeOutcome::Refused(PolicyRefusal::forbidden(act, by)))
       }
@@ -657,20 +725,26 @@ impl Instance {
   ) -> Result<(), Error> {
     let wire_policy = policy.wire()?;
     let wire_subject = subject.wire();
-    let proof = launcher.policy_proof(&wire_subject, &wire_policy)?;
+    // The setting names the version it replaces (A-285): read it, then set from it. One raced in between is refused
+    // `Stale::Policy`, and nothing changes.
+    let (_, version) = self
+      .client
+      .policy(wire_subject)
+      .map_err(|e| self.fail(e, Some(missing_subject(subject))))?;
+    let proof = launcher.policy_proof(&wire_subject, &wire_policy, version)?;
     self
       .client
-      .set_policy(wire_subject, wire_policy, proof)
+      .set_policy(wire_subject, (wire_policy, version), proof)
       .map_err(|e| self.fail(e, Some(missing_subject(subject))))
   }
 
-  /// `subject`'s write policy as the daemon holds it, or `None` while nobody has set one, which asks for both acts
-  /// ([`WritePolicy::UNSET`]).
+  /// `subject`'s write policy as the daemon holds it, or `None` while nobody has set one, which merges at once and
+  /// asks for landings ([`WritePolicy::UNSET`]).
   pub fn write_policy(&mut self, subject: PolicySubject) -> Result<Option<WritePolicy>, Error> {
     self
       .client
       .policy(subject.wire())
-      .map(|policy| policy.map(WritePolicy::of_wire))
+      .map(|(policy, _)| policy.map(WritePolicy::of_wire))
       .map_err(|e| self.fail(e, Some(missing_subject(subject))))
   }
 
@@ -680,14 +754,27 @@ impl Instance {
     self.client.daemon_status().map_err(|e| self.error(e))
   }
 
-  /// The audit log from record `since` (§4.15, §4.14): grants, manifests and landing outcomes, in order.
-  pub fn audit(&mut self, since: u64) -> Result<Vec<AuditEntry>, Error> {
-    self.client.audit(since).map_err(|e| self.error(e))
+  /// The audit log from record `since` (§4.15, §4.14), typed: grants, presentations, validations, entries and
+  /// landings finished, in order.
+  pub fn audit(&mut self, since: u64) -> Result<Vec<AuditRecord>, Error> {
+    self
+      .client
+      .audit(since)
+      .map_err(|e| self.error(e))?
+      .into_iter()
+      .map(audit_of)
+      .collect()
   }
 
-  /// The caller's grants (§4.13): each with its scope, term and state.
-  pub fn grants(&mut self) -> Result<Vec<GrantSummary>, Error> {
-    self.client.grants().map_err(|e| self.error(e))
+  /// The caller's grants (§4.13), typed: each with its volume, target, manifest, scope and state.
+  pub fn grants(&mut self) -> Result<Vec<GrantRecord>, Error> {
+    self
+      .client
+      .grants()
+      .map_err(|e| self.error(e))?
+      .into_iter()
+      .map(grant_of)
+      .collect()
   }
 
   /// One shard's telemetry drain (§4.14): the chokepoint spans its bounded ring holds, up to one reply's quota, with
