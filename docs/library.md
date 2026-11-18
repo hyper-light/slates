@@ -24,7 +24,11 @@ mounts and grants exactly as the command does.
 - Landing: `plan_landing(&LandingRequest)` presents a landing and returns its plan (the manifest a
   person approves, its summary, its conflicts); `land_approved(&issuer, &request, &manifest, ..)`
   grants and lands only that manifest, or returns the new plan when the volume or the disk changed
-  since; `land(&request, grant)` lands under a grant already issued.
+  since; `land(&request, grant)` lands under a grant already issued. `landing_entries(&plan)` lists
+  what the plan writes, path by path (each file's BLAKE3 and length, a rename's origin, a symlink's
+  target, the conflict found at it): a reviewer with no mount of the volume builds the change from
+  it, checking each file it reads at the head against its entry, and presents the landing again on
+  a mismatch.
 - The issuer: `Issuer::from_environment()` (the anchor's handoff, as `slates grant` has it) or
   `Issuer::from_handoff(pairs)`. Only a confirmation surface a person drives should hold one. The
   SDKs and the MCP server cannot issue grants: they do not depend on this crate.
@@ -73,4 +77,3 @@ fn workspace(folder: &Path, at: &str) -> Result<(), slates_api::Error> {
    the issuer handed to the host that started it (on Linux too).
 2. An async form over the host's own reactor.
 3. A seam trait with a simulator and a conformance suite.
-4. A landing plan's per-path entries, for a person to review file by file.
