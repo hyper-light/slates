@@ -9,7 +9,7 @@
 > green's accepted record and the checkpoint that folds the entry. It is answered on the merge and read back with
 > `MergeRecord`. A green or a work can require signed merges (`WritePolicy::require_signed_merges`, launcher-set); an
 > unsigned or invalid merge is refused `SignatureRequired` when it would merge, in every mode. A consumer's policy
-> cannot require it. The contract carries all of it (`CONTRACT` 12). Proven by `crates/server/tests/signed_work.rs`
+> cannot require it. The contract carries all of it (`CONTRACT` 13). Proven by `crates/server/tests/signed_work.rs`
 > (8 of 8, macOS arm64, 2026-11-17; each red with its guard removed), the verifier's 11 unit tests over new
 > `ssh-keygen -Y sign` vectors, the chain and checkpoint codecs' tests and the contract's by-use test. **Owed, in
 > order:**
@@ -224,7 +224,16 @@
 > **Still owed for Shards, in its coordinator's order (2026-11-18):**
 > - A stream that survives a daemon restart, answering Shards' RESEND, each non-idempotent request (CREATE with
 >   O_EXCL, MKDIR, LINK, RENAME, UNLINK) answered at most once from the dead daemon's durable record of its outcome;
->   else the stream ends typed and counted. The owner view then has to be kept with the attachment's record.
+>   else the stream ends typed and counted. **Built since (A-316, 2026-11-18), the attach's half, on Linux:** the
+>   resync channel beside the stream, its token told to the device first (`Attached`) and kept with the daemon's end,
+>   which the anchor holds with the owner view as its session (so the owner view needs no record of its own), handed
+>   to the client after the stream (`slates shards --resync-fd`, `ShardsStream::resync`, `CONTRACT` 12). **And the
+>   successor's half, on Linux:** recovery keeps a stream whose resync end the anchor held and serves it on a fresh
+>   stream, sending the device a `Resync` with its end; a resent request the dead daemon published is answered from its
+>   published reply, never run twice; a stream's writes are logged as a mount's are (A-63), which also fixes their loss
+>   at a death for streams that are not resynced. **Owed:** macOS (the channel's hand-off and the write log); the anchor
+>   holding a stream's DAX objects (until then a stream gives its resync up at its guest's first DAX map); Windows on
+>   Shards' handle path. Shards owes its device's half, after its v0.8.0 tag.
 > - Shards' side, after its v0.8.0 tag and landed by its coordinator from signed branches: its own server enforcing a
 >   guest's ACLs as slates now does (`FUSE_POSIX_ACL`, queued by its coordinator), its guest test over a
 >   slates stream on Linux and macOS (`tests/slates_fs.rs`, Windows only today), the bump of the slates revision it
@@ -285,7 +294,7 @@
 >   their approvals and the present-only verb reach it too (`approve_merge`, `plan_landing` on `Present`; `CONTRACT`
 >   = 6); owed: a consumer's own mode, the MCP and SDK land verb under the mode, signed work verified with the
 >   statement a signer signs and the trusted signers a launcher registers — signed merges built (A-321, `CONTRACT` =
->   12), a signed landing owed;
+>   13), a signed landing owed;
 > - typed fields on the wire for a landing target's refusal (`TargetUnavailable` carries words), a merge's versions
 >   (the work's base beside the head), and the words the crate still reads from the daemon's closed tables (a landing's
 >   state, a summary's actions, the audit's kinds, a grant's state); an overlay's drift is built (`StatusReport::base`,
@@ -1647,11 +1656,14 @@
 >     5 (load 33 to 56). The order itself is held by `a_resend_is_begun_ahead_of_every_forward_first_queued_after_it`
 >     and a model test, both red with the place ignored
 >     (`docs/bugs/2026-11-18-a-resent-forward-lost-its-place-in-the-lane.md`).
->   - **Open (2026-11-18, goal g245): a forward still queued is given up at its stall budget while its lane moves.**
->     Nothing of it was sent, and with its place kept its resend loses nothing, but each one costs its forwarder a give-up
->     and a resend on the control shard: behind the burst above, 17,000 to 52,000 batches given up a run, the most in
->     the runs that starved. Owed: a queued forward's quiet counts its lane's progress (a forward begun or a reply taken),
->     so it is given up only when the lane does not move for a stall budget, the failover bound still capping it.
+>   - **Fixed (2026-11-18, A-315, goal g255): a forward still queued was given up at its stall budget while its lane
+>     moved.** Nothing of it was sent, and with its place kept its resend lost nothing, but each one cost its forwarder
+>     a give-up and a resend on the control shard: behind the burst above, 17,000 to 52,000 batches given up a run, the
+>     most in the runs that starved. A queued forward's quiet now counts its lane's progress (a forward begun, a reply
+>     taken, bytes of a reply read), so it is given up only when the lane does not move for a stall budget, and the
+>     lane's progress holds it only until the failover bound from its first send (`forward_lane::Stall`,
+>     `fleet.forward.held_by_lane`). Unit-tested (`a_queued_forward_behind_a_moving_lane_is_kept_past_its_own_budget`,
+>     red with the lane's progress ignored); owed: the burst's count of batches given up, run again on main.
 >
 > - **A forward lane turned without end while its forwards waited on the stream credit** (found 2026-11-08 on the f = 1
 >   primary-kill rung). After the primary restarted, a turn ended at once whenever any forward was queued, and with
@@ -2217,11 +2229,19 @@
 >   1.52–1.58 s); the forwarded verbs and a peer's remote reap (a peer's read of a volume whose owner shard was starved
 >   answered `NotFound` after 1.302 s, now served after 1.70–2.11 s); the direct map's hand-off on Linux and Windows (a
 >   client whose shard was starved at its hand-off read by copy, now mapped directly). Class A is done; class B (the
->   transport's round-trip estimate) is open. C+D (A-232): the client's part is done, since a call waits while its
->   daemon lives (2026-11-14, `docs/bugs/2026-11-13-a-live-starved-daemons-call-was-failed-stalled.md`); the window
->   itself, `W`, is still a fixed budget (R3 debt). Found on
->   the way: a Windows channel (a `Sid`) can never attest a consumer (`verify_attestation` takes a uid only), and two
->   server unit tests of landing fail on Windows, where CI does not run them. Record: `docs/bugs/2026-11-06-a-cross-shard-wait-lost-a-starved-shards-answer.md`.
+>   transport's round-trip estimate) is open, but for the forward lane's stall (2026-11-18, A-315, goal g255): a batch
+>   quiet for its budget is given up only once a turn of its lane begun after the silence was seen has read the
+>   session's own socket empty, or found no session at all, so an origin kept off its CPU reads its owner's replies
+>   before it calls the owner silent, and the failover bound from the forward's first send caps it
+>   (`a_held_origin_gives_up_no_forward_whose_reply_came_while_it_was_held`;
+>   `docs/bugs/2026-11-18-a-forward-lanes-silence-was-judged-before-its-shard-read-what-came.md`). loadtest-scale's lane
+>   poll clock (`6da9670d`, CPU-credited turns of a 10 ms pace) did not land: it assumed an idle shard's timer fires on
+>   time, and Windows' 15.6 ms tick broke it (reverted from the B13 stack, `b458723c9`). C+D (A-232): the client's part
+>   is done, since a call waits while its daemon lives (2026-11-14,
+>   `docs/bugs/2026-11-13-a-live-starved-daemons-call-was-failed-stalled.md`); the window itself, `W`, is still a fixed
+>   budget (R3 debt). Found on the way: a Windows channel (a `Sid`) can never attest a consumer (`verify_attestation`
+>   takes a uid only), and two server unit tests of landing fail on Windows, where CI does not run them. Record:
+>   `docs/bugs/2026-11-06-a-cross-shard-wait-lost-a-starved-shards-answer.md`.
 
 > **A-190's purge client leaves the daemon's process (2026-11-06, fixed); the sweep for the rest (open).** No daemon
 > thread opens a path on a volume the daemon serves (§4.6). The coherent purge's opens, writes and reads now run in a
@@ -3053,7 +3073,36 @@
 >     2026-11-17): forwarding and the answer's way back, a one-way cut, a node muted and deafened, loss, delay and
 >     duplication, attribution by process, and the draws. The flows' first runs are the supervisor's (CLAUDE.md §8):
 >     `SLATES_TEST_CLI=1 cargo test --release -p slates-cli --test live_chaos -- --test-threads=1` on macOS and Linux.
->     Linux's census has run nowhere yet.
+>   - **First runs (2026-11-18), 11 of 35 flows failed on macOS arm64 (main bfc34cace) and the same on Linux x86_64 and
+>     arm64 (69cd38b22).** Linux's census ran there for the first time and attributed every socket but two datagrams.
+>     - **Fixed (A-330): the relay never carried the record plane.** The three owner-partition flows failed
+>       StaleNeverCommits: their cut-off owners acknowledged 2,086, 3,528 and 2,412 writes after the cut, each durable on
+>       a candidate, over record links that went around the relay, since a node announced its record plane at its bound
+>       port and formation's redial dialed it. Every relayed flow was vacuous on that plane; each now requires a
+>       record-plane datagram per acknowledged write from its relay (`judge_relayed`). Red first:
+>       `a_candidate_behind_a_port_mapping_is_redialed_through_it_so_a_cut_there_holds_its_record_plane`
+>       (`docs/bugs/2026-11-18-a-redial-went-around-the-port-mapping-the-record-plane-was-announced-at-its-bound-port.md`).
+>     - **Open (g229): ReadSafety through a resumed owner.** In the SIGSTOP owner flow the old owner, read the moment it
+>       resumed, answered `NotFound` for the successor's acknowledged writes (2.29 s and 3.00 s into the run, 70 to 780
+>       ms after their acknowledgements), where it must refuse or answer them. The flow now notes the reader's state when
+>       a read answers missing (`note_missing`), and its first run with it (Mac Studio, 2026-11-18) showed the cause: the
+>       old owner was retired and re-admitted under its own id (`fleet_host_epoch` 2), its catalog still held the volume
+>       with its epoch-1 shipper, and its lease confirmed again (`lease.refused.superseded` 1, `lease.wait.parked` 1,
+>       `lease.wait.served` 1), so it served its stale copy. A re-admission yields an owner's objects only in its
+>       routing table (`FleetNode::install_configuration`), and `verbs::owned_by_another_host` serves every volume its
+>       node created or still catalogues.
+>     - **Fixed in the flow (g229): the big-entry flow judged a forwarder as its successor.** It took the first
+>       survivor that served the three files, which a survivor forwarding to the real successor does too, and a
+>       forwarder shows no shipping head after a write through it: every write through it was acknowledged and read
+>       back, yet `first_head` was none. The flow now takes the survivor that took the volume over (`took_over`, the
+>       rule `wait_serving` and `wait_taken_over` share) and names every survivor's live lines. Run on the Mac Studio
+>       (2026-11-18): the successor's first write acknowledged with its head shown, held; Continuity alone failed
+>       (g230's).
+>     - **Open (g229): a replaced member never meshed** (`a_member_that_never_held_the_log_never_stands_in_for_its_holder`,
+>       macOS): the replacement sat at configuration version 0, in contact with no peer, its four record links idle as
+>       out of contact (`fleet.link.out_of_contact` 4) through a whole fleet wait, while the owner had already recorded
+>       it as a live holder.
+>     - g230's: Continuity in five flows (a successor's positions start again at 1) and the nemesis's fence lag.
 >
 > - **Fixed: a destroy was answered before its tombstone was placed** (record
 >   `docs/bugs/2026-11-06-a-destroy-was-answered-before-its-tombstone-was-placed.md`).

@@ -1722,10 +1722,12 @@ pub(crate) async fn resolve_and_forward(
     },
   };
   // Every resend keeps the place the first send had in the owner's lane (A-306), so forwards first queued after it
-  // never go ahead of it however often it is sent again.
+  // never go ahead of it however often it is sent again. Every send is judged against the same failover bound, from
+  // the first: the lane's progress holds a forward still queued only until then (A-315).
   let mut place = crate::forward_lane::Place::default();
+  let bound_at = began.saturating_add(bound);
   let (decoded, later) = loop {
-    let (decoded, later) = forward_once(owner, &requests, &mut place).await;
+    let (decoded, later) = forward_once(owner, &requests, bound_at, &mut place).await;
     // Unanswered (sent, no reply in time) or unsent (the session to the owner stayed with another task the whole
     // budget): on a lossy path both are transient while the owner lives (measured 2026-10-09 at 10% loss: contested
     // reads refused after forwards that never left, `fleet.owner_location.forward_unsent`).
@@ -1767,12 +1769,14 @@ pub(crate) async fn resolve_and_forward(
 const FORWARD_RETRIED: &str = "fleet.forward.retried";
 
 /// One forward of `requests` to `owner`, within one liveness budget plus the measured round-trip tail of the path to
-/// it, queued at `place` in the owner's lane (the first send's, for a resend): the decoded reply to the first (`None`
-/// when nothing was sent, `Some(None)` when it went unanswered) and the decoded replies to the rest that came back, in
-/// order, up to the first that did not.
+/// it, queued at `place` in the owner's lane (the first send's, for a resend) and judged against `bound_at`, the
+/// failover bound on the wall from the first send (`crate::forward_lane`'s stall, A-315): the decoded reply to the
+/// first (`None` when nothing was sent, `Some(None)` when it went unanswered) and the decoded replies to the rest that
+/// came back, in order, up to the first that did not.
 async fn forward_once(
   owner: Option<HostId>,
   requests: &[Vec<u8>],
+  bound_at: u64,
   place: &mut crate::forward_lane::Place,
 ) -> (Option<Option<ReplyBody>>, Vec<ReplyBody>) {
   let Some(owner) = owner else {
@@ -1792,6 +1796,7 @@ async fn forward_once(
     owner,
     requests,
     crate::daemon::LIVENESS_BUDGET_NS.saturating_add(tail_ns),
+    bound_at,
     place,
   )
   .await;
@@ -14893,6 +14898,19 @@ fn reconcile_lost(state: &mut ShardState, record: &VolumeRecord) -> (usize, usiz
       // An SDK client's write attachment that writes back a copy the anchor held is kept, its copy taken back (A-197).
       #[cfg(target_os = "linux")]
       if crate::held_copy::keeps(&state.inherited_copies, a.id) {
+        return false;
+      }
+      // A Shards stream whose resync end the anchor held is kept, and served again on a fresh stream its device is handed
+      // over that end (A-316); any other dies with the process, as before.
+      #[cfg(target_os = "linux")]
+      if matches!(a.form, AttachForm::ShardsFs { .. })
+        && let Some(at) = state
+          .inherited_fuse
+          .iter()
+          .position(|held| held.attachment == a.id)
+      {
+        let held = state.inherited_fuse.swap_remove(at);
+        state.adopt_shards.push(((**a).clone(), held));
         return false;
       }
       #[cfg(windows)]
