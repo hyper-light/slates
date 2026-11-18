@@ -8365,6 +8365,205 @@ mod tests {
     assert!(!held, "the stale copy is gone");
   }
 
+  /// The content hazard's fixture (A-335; docs/bugs/2026-11-18-a-stale-copy-reclaim-dropped-content-a-successor-still-
+  /// fetched.md): in a seven-member `f = 1` region whose every neighbourhood is the whole region, the audit node the
+  /// council's sole voter, the audit node holds a second member's volume head naming the member and itself as the
+  /// content's holders (`f + 1` of them, as a seal places it), and that content whole; the volume's successor in the
+  /// member's takeover is a third member that places it away from the audit node and holds none of the content. Returns
+  /// the member, the volume and the content's manifest identity.
+  fn hold_a_head_naming_this_holder(
+    state: &mut crate::state::ShardState,
+  ) -> (
+    slates_db::register::HostId,
+    slates_db::register::ObjectId,
+    [u8; 32],
+  ) {
+    use slates_cluster::config_group::RegionalCouncil;
+    use slates_db::register::{Acceptor, Authority, FIRST_EPOCH, HostId, ObjectId, Quorum, Record};
+    let local = state.fleet.host();
+    let departed = HostId(local.0 ^ 1);
+    let mut members = vec![local, departed];
+    members.extend((2..7).map(|key| HostId(local.0 ^ key)));
+    // Shape: a neighbourhood of every member, so the audit node survives the departed one and is asked in its round.
+    let scatter = 7;
+    state.council = RegionalCouncil::new(
+      local,
+      members,
+      vec![local],
+      Quorum { f: 1 },
+      std::collections::BTreeMap::new(),
+      scatter,
+      false,
+    );
+    install_council(state);
+    let mut retired = state.council.configuration().clone();
+    retired.take_over(departed, scatter).unwrap();
+    let volume = (0..1024u64)
+      .map(|index| ObjectId::new(departed, index))
+      .find(|object| {
+        retired
+          .successor(departed, *object)
+          .is_some_and(|successor| {
+            successor != local
+              && retired
+                .configuration_for(successor)
+                .is_some_and(|placement| !placement.place(*object).candidates.contains(&local))
+          })
+      })
+      .expect(
+        "some volume of the departed member is placed by its successor away from this holder",
+      );
+    let archive =
+      crate::merge_service::MergeShardState::inputs_archive(b"the volume's sealed bytes", 0, 4096);
+    let manifest = archive.manifest_identity();
+    let head = crate::head::HeadValue {
+      manifest: Some(manifest),
+      content_holders: vec![departed.0, local.0],
+      sealing: None,
+    };
+    let generation = state.fleet.configuration().version;
+    let mut acceptor = Acceptor::new(
+      local,
+      Authority {
+        generation,
+        owner: departed,
+      },
+    );
+    acceptor
+      .accept(&Record {
+        owner: departed,
+        object: volume,
+        sequence: 0,
+        epoch: FIRST_EPOCH,
+        generation,
+        value: head.to_record_bytes(),
+      })
+      .unwrap();
+    state.holder_records.insert(volume, acceptor);
+    state.fleet.track_object_owner(volume, departed);
+    state
+      .held_content
+      .hold(
+        &mut crate::content_holder::hold_space(&mut state.store),
+        volume,
+        slates_cluster::content::Placed { sequence: 0 },
+        archive,
+      )
+      .expect("the audit shard holds the volume's content");
+    (departed, volume, manifest)
+  }
+
+  /// A-335, red before it (the bug record named in [`hold_a_head_naming_this_holder`]): a holder outside the
+  /// successor's placement keeps the copy whose content its head names it for, when the successor confirms and when the
+  /// takeover completes. Do: hold such a head and its content (the fixture); take the departed member over and install;
+  /// have the volume's successor alone confirm its share and install; then every other survivor, so the takeover
+  /// completes, and install again. Expect the head and the content held after both installs, each counted
+  /// `fleet.takeover.kept_holding_content`, and nothing reclaimed. A successor confirms once it adopted the head
+  /// register, before its materialization has fetched the content, and it fetches from the head's holders alone
+  /// (`fleet::fetch_into_hold`): before, this holder let the head and the content go at the confirmation, so with the
+  /// dead owner the head's only other holder the successor could fetch from nobody, and one failure lost the volume.
+  #[test]
+  fn a_holder_outside_the_successors_placement_keeps_the_content_its_head_names() {
+    let (after_one, after_all, kept, reclaimed) = audit_on_shard(|state| {
+      use slates_cluster::config_group::Reconfiguration;
+      let local = state.fleet.host();
+      let (departed, volume, manifest) = hold_a_head_naming_this_holder(state);
+      assert!(state.council.propose(Reconfiguration::TakeOver(departed)));
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      let successor = state
+        .council
+        .configuration()
+        .successor(departed, volume)
+        .expect("the volume ranks a survivor");
+      assert_eq!(
+        state.fleet.object_owner(volume),
+        Some(successor),
+        "the copy moves to its successor at the takeover"
+      );
+      let holds = |state: &crate::state::ShardState| {
+        state.holder_records.contains_key(&volume)
+          && state.held_content.holds_manifest(volume, &manifest)
+      };
+      assert!(state.council.propose(Reconfiguration::Confirm {
+        departed,
+        successor,
+      }));
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      let after_one = holds(state);
+      for survivor in state.council.configuration().survivors_of(departed) {
+        state.council.propose(Reconfiguration::Confirm {
+          departed,
+          successor: survivor,
+        });
+      }
+      assert!(
+        state
+          .council
+          .configuration()
+          .completed
+          .contains_key(&departed),
+        "the takeover completed"
+      );
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      (
+        after_one,
+        holds(state),
+        count("fleet.takeover.kept_holding_content"),
+        count("fleet.takeover.reclaimed"),
+      )
+    });
+    assert!(
+      after_one,
+      "the successor's confirmation leaves the content its head names, which the successor may still fetch"
+    );
+    assert!(after_all, "and so does the completed takeover");
+    assert_eq!(kept, 2, "each install counts the copy kept for its content");
+    assert_eq!(reclaimed, 0, "nothing is reclaimed");
+  }
+
+  /// A-335, red before it: a holder that installs a takeover only once it completed keeps the copy whose content its head
+  /// names it for. Do: hold such a head and its content (the fixture of
+  /// [`a_holder_outside_the_successors_placement_keeps_the_content_its_head_names`]); take the departed member over and
+  /// have every survivor confirm before the audit node installs anything, then install. Expect the head and the content
+  /// held, counted `fleet.takeover.kept_holding_content`. The copy's line ends at the takeover's completion record, which
+  /// names the audit node among the survivors that confirmed; before, that let the copy go whole, the content the
+  /// adopted head names with it.
+  #[test]
+  fn a_lagging_holder_keeps_the_content_its_head_names_when_the_takeover_completes() {
+    let (held, kept, reclaimed) = audit_on_shard(|state| {
+      use slates_cluster::config_group::Reconfiguration;
+      let local = state.fleet.host();
+      let (departed, volume, manifest) = hold_a_head_naming_this_holder(state);
+      assert!(state.council.propose(Reconfiguration::TakeOver(departed)));
+      for survivor in state.council.configuration().survivors_of(departed) {
+        state.council.propose(Reconfiguration::Confirm {
+          departed,
+          successor: survivor,
+        });
+      }
+      assert!(
+        state.council.configuration().settled_for(departed, local),
+        "the takeover completed with the audit node among those that confirmed"
+      );
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      (
+        state.holder_records.contains_key(&volume)
+          && state.held_content.holds_manifest(volume, &manifest),
+        count("fleet.takeover.kept_holding_content"),
+        count("fleet.takeover.reclaimed"),
+      )
+    });
+    assert!(held, "the copy and the content its head names stay");
+    assert_eq!(kept, 1, "counted kept for its content");
+    assert_eq!(reclaimed, 0, "nothing is reclaimed");
+  }
+
   /// A-309: a holder the takeover never asked keeps its copy when the successor confirms, however the confirmation is
   /// read. Do: make the audit node hold a copy of a member's object although it is in none of that member's
   /// neighbourhoods (a copy an earlier neighbourhood of the member left there), in a six-member `f = 1` region whose

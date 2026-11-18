@@ -1001,7 +1001,27 @@
 > - **Open (A-309): a holder the round never asked keeps its copy** (`fleet.takeover.kept_unasked`). A neighbourhood an
 >   owner settled away from keeps the owner's copies; before A-309 they went when the owner's takeover settled, safe
 >   only within tolerance. Owed: such a holder lets them go at the settle, on the owner's report that every record it
->   owns is placed on the new neighbourhood.
+>   owns is placed on the new neighbourhood. **Wrong as stated (A-335, g250, 2026-11-18):** the settle report covers
+>   records, not content; the head goes on naming its content's holders, the healer leaves a named holder outside the
+>   candidates and relies on it keeping the copy (A-276's open item), and a holder that dropped its content at the
+>   settle would leave the owner's head naming a holder without it. Owed now, in order: register copies whose content
+>   no head the holder holds names go on that rule (g250's next piece); content goes only on the content's own
+>   certificate, the release below.
+> - **Fixed (A-335, g250, 2026-11-18): a stale-copy reclaim dropped content a successor still fetched.** A holder
+>   outside the successor's placement let its copy go whole at the successor's confirmation or the completion record,
+>   while the confirmation certifies the record adopted and the successor fetches content from the adopted head's holders
+>   alone; at `f = 1`, with the dead owner the head's only other holder, one failure lost the volume. A stale copy now
+>   goes only once its retention rule leaves no content held for it, else it is kept whole
+>   (`fleet.takeover.kept_holding_content`). Tests: `a_holder_outside_the_successors_placement_keeps_the_content_its_
+>   head_names`, `a_lagging_holder_keeps_the_content_its_head_names_when_the_takeover_completes`
+>   (`crates/server/src/daemon.rs`), red before. Bug record:
+>   `docs/bugs/2026-11-18-a-stale-copy-reclaim-dropped-content-a-successor-still-fetched.md`.
+> - **Open (A-335): the release of a copy kept for its content** (`fleet.takeover.kept_holding_content`). It stays
+>   until a newer record reaches its holder, and a holder outside the successor's placement receives none: a leak
+>   bounded by what it holds, never a loss. Owed (g250): a successor confirms its share only once its adopted volumes'
+>   content is re-placed under its own placement (the head republished naming that set, as the healer's replace does),
+>   and an owner's settle certifies its content as well as its records; a holder outside the placement then lets go.
+>   With it, A-276's open item (a named holder outside the candidates) closes the same way.
 > - **Residual, recorded:** a line through a retirement the bound let go before it completed stays unresolved and
 >   unrecovered; re-ranking it could adopt a stale copy beside a live adopter the configuration no longer knows. A
 >   neighbourhood an unsettled owner wrote to before the last one it moved to is not recorded: past tolerance a copy
@@ -10556,7 +10576,9 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
     the cohort) refuses a placement from the owner (`content_authority`), so it can be neither re-offered to nor
     verified: the heal leaves it named and counts `fleet.heal.named_outside_candidates`. If it loses its copy, the head
     names a holder without the content. Recommended: replace it as a departed holder is (one republish per volume per
-    such change), so every holder a head names is one the owner can restore.
+    such change), so every holder a head names is one the owner can restore. (Since A-335, 2026-11-18, a takeover's
+    stale-copy reclaim no longer drops such a holder's content either: it keeps the copy whole while it holds content;
+    the release that ends it is owed with this replace, g250.)
   - A departure is healed at the healer's cadence, one placed snapshot per hundred periods at rest, so a node owning
     many volumes leaves the last of them naming the departed holder for a long walk; a second failure inside that walk
     loses them at `f = 1`. Recommended: on a retirement, heal first the volumes whose placement names the retired host.
