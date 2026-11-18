@@ -1,0 +1,57 @@
+name: diag-g234-a387
+
+# Diagnostics only, never on main (A-387, goal g234): the focused tests of macOS holding no shard for a closed loop.
+# The -green branch is the change; the -red branch is the change with macOS's hold put back to the loop's return (main's
+# rule), so the macOS verdict must fail there. Linux runs the other platforms' verdict on the green branch.
+on:
+  push:
+    branches: ["diag-g234-a387-*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  tests:
+    name: a387 (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - name: Build
+        run: |
+          set +e
+          cargo test --locked -p slates-server --test closed_loop --test idle_window --no-run > build.log 2>&1; status=$?
+          cargo test --locked -p slates-server --lib --no-run >> build.log 2>&1 || status=1
+          grep -E '^(error|warning)' -A6 build.log | head -40; tail -3 build.log
+          exit $status
+      - name: The focused tests
+        run: |
+          set +e
+          fails=0
+          run() {
+            echo "== $* ($(date -u +%H:%M:%S))"
+            "$@" > run.log 2>&1; status=$?
+            grep -E '^test |test result|panicked|closed loop:|SKIP|parked [0-9]+ times|held no shard' run.log | cut -c1-700 | head -40
+            [ $status -eq 0 ] || fails=$((fails+1))
+            echo "== exit $status"
+          }
+          for round in 1 2 3; do
+            run cargo test --locked -p slates-server --test closed_loop -- --nocapture
+          done
+          run cargo test --locked -p slates-server --test idle_window -- --nocapture
+          run cargo test --locked -p slates-server --lib -- config::tests
+          echo "== $fails failed"
+          exit $fails
