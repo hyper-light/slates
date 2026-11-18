@@ -97,3 +97,10 @@ The same two reads, in the same order:
   `slates_rt::process_runnable`, under the same whole-window rule.
 
 Neither has been seen to fail. Each would take the same second read to close.
+
+Closed 2026-11-18 (g251): the watchdog folds a second read of each suspected shard's pulse and clock, taken after the
+scheduler's answer, into its look (`after_the_answer` in `crates/server/src/watchdog.rs`), and the anchor's start
+judgment reads the process clock again when the scheduler answers a block (`judge_start_by` in
+`crates/api/src/role/anchor.rs`). Their tests script the reads, as the rule's own do:
+`a_shard_that_moves_between_the_look_and_the_schedulers_answer_has_moved` and
+`a_start_that_runs_between_its_clock_and_the_schedulers_answer_has_moved`, each red with the second read ignored.

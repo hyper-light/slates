@@ -5761,6 +5761,13 @@ refinement and revalidation before those results can be applied to the corrected
 > one failure (`docs/bugs/2026-11-18-a-stale-copy-reclaim-dropped-content-a-successor-still-fetched.md`). Owed: the
 > release of a copy kept so (GAPS).
 
+> **Status (2026-11-18, A-340: the retirement bound's drop is typed and counted).** The bound lets a takeover go before it
+> completes only with more of them outstanding than members (A-309); the rounds it ends now give every object they had
+> learned and not adopted up by name (`NotRecovered { cause: TakeoverIncomplete { waited_on: "retirement" } }`, counted
+> `fleet.takeover.given_up.retirement_dropped`), and every holder counts the copies it keeps on an unresolved line
+> (`fleet.takeover.kept_unresolved`) or a lost one (`fleet.takeover.kept_lost`). Why it must drop, and what the operator
+> sees, are A-340's.
+
 **Neighbourhood changes.** A host's neighbourhood changes only through the group (a member
 left, a fresh member joined, a rebalancing). While a change is in flight the owner writes to a
 quorum of the old candidates and a quorum of the new ones (joint writes); the group retires the
@@ -7257,6 +7264,17 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   the gates read `verbs::lost_to_a_successor` (the fenced log or the yield), and the yield ends the volume's FUSE
 >   mounts at once (`an_idle_volumes_nfs_mount_on_an_owner_admitted_again_answers_stale`). The guest device, the Shards
 >   stream and the WinFsp mount still hold or serve such a volume (GAPS).
+> - **A superseded owner shipped on and starved its own takeover round (fixed 2026-11-18, A-349).** The nemesis (seed
+>   6876545201569229162, both Linux arches, 5 of 6 rounds) gave up two objects within tolerance. Its owner, isolated,
+>   superseded and admitted again, still sent each holder its fenced log's entries every record period, each refused
+>   `StaleEpoch`. The next departure's objects fell to it, and its round asked the other survivor for its page each period
+>   and found its record session out on that loan every time (`fleet.takeover.pages_unsent` 213 to 928, the diagnostic
+>   line `lent_to live_ship`), until A-304's bound gave them up: no survivor withheld a promise, the round never asked.
+>   `learn_superseded` said a superseded owner ships no more of the volume; the record period's visit did not ask. Now a
+>   fenced volume sends nothing and does no period work (`live_ship::pending_sends`, `period_volume`). Held by
+>   `a_superseded_owner_ships_nothing_more_of_the_volume_it_lost` (`crates/server/tests/fleet.rs`). Owed (GAPS): the round's
+>   adoption there meets the node's own superseded copy, which a takeover must replace (A-334's re-adoption); a lane that
+>   ends on a refusal is sent again at once.
 
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
@@ -24751,6 +24769,7 @@ and unrecovered: the configuration no longer knows whether the successor it rank
 re-ranked there could adopt a stale copy beside a live adopter it cannot see. The bound lets a retirement go only past
 one per member, a region with more takeovers outstanding than members. A neighbourhood the owner wrote to before the
 last one it moved to, while unsettled, is not recorded: past tolerance a copy there is neither learned nor let go.
+(Since A-340 the drop is typed and counted, and why the bound must drop it is stated there.)
 
 Two corrections to piece 1 made with piece 2: `stale_after_confirmation` builds the successor's placement only once
 the confirmation is found (every install resolves every held copy; built first, it laid out an owner's copysets for each
@@ -25402,6 +25421,90 @@ content go.
 Applied in the same change to: §4.8 "Promotion and takeover" (status), A-309 (its holder rule and its owed line), GAPS
 (A-272 (ii)'s entry and the content hazard), `crates/server/src/takeover.rs`, `crates/server/src/daemon.rs` (tests) and
 the bug record.
+
+### A-340 — The retirement bound's drop of a takeover that had not completed is typed and counted: the rounds it ends give what they learned up by name, and holders count what they keep (2026-11-18, kiln goal g250; A-309's residual)
+
+A-309 keeps at most one retirement per member (`RegionalConfiguration::retirement_bound`) and, past it, lets go first one
+nobody owes or carries (it can never complete) and then the oldest, with every retirement that carries it. A takeover let
+go before it completed leaves its lines unresolved: holders keep their copies (A-272) and no round recovers them. Until
+now nothing said so. The successors' rounds of it were forgotten without a word (`takeover::drive_takeovers` forgot a
+takeover it no longer owed), a volume its round had learned and not adopted answered a retryable `OwnerUnreachable` for
+good, and a holder kept the copy uncounted.
+
+**Why the bound must drop it.**
+- The configuration is replicated on every member and bounded by its members (banned item 8). A retirement stays kept
+  while a member owes its share or a kept retirement carries it, so more than `members` of them accumulate only when
+  hosts retire faster than survivors finish their rounds: a crash loop retires a fresh id at every restart, and a
+  survivor keeps its share open while an object waits for, or was given up on, a cohort member cut off from it alone
+  (A-304, which the council never retires).
+- Each alternative is worse. Keeping every outstanding retirement grows the configuration with every restart for as long
+  as one share stays open. Refusing admissions at the bound stops the region from growing back for as long as one round
+  is stuck, which A-304 shows can be indefinite. Refusing a takeover leaves a dead host unfenced. Ranking the dropped
+  takeover's objects again among the members that remain could adopt a stale copy beside a live adopter the
+  configuration no longer names (A-309's residual). So the bound still drops; A-340 changes no rule of the configuration.
+
+**What the operator sees.**
+- **On each successor whose round the drop ended:** every volume and green its round had learned and not adopted is given
+  up by name. Its shard records it unrecovered, so its status and every verb on it answer `NotRecovered { cause:
+  TakeoverIncomplete { waited_on: "retirement" } }` and `volume list` shows `not_recovered=TakeoverIncomplete`; this node
+  claims it to lookups, so a read from another node meets that answer. Counted `fleet.takeover.given_up` and
+  `fleet.takeover.given_up.retirement_dropped`, with one log line naming the retired host and the first object
+  (`takeover::rounds_the_bound_ended`, `takeover::give_up_dropped`; the recording is A-304's, shared as
+  `takeover::record_given_up`).
+- **On every holder** of a copy whose line runs through it: the copy is kept, as unresolved never reclaims, and counted
+  `fleet.takeover.kept_unresolved` at each install that judges it; a line through a retirement with no survivor counts
+  `fleet.takeover.kept_lost`.
+- **A volume no round had learned** when its retirement went (a round still paging, or no asked member holding it) is
+  served by no member: a verb on it answers `OwnerUnreachable` once the lookup's bound passes, and only its holders'
+  `kept_unresolved` shows it. Owed (GAPS): a holder answers the owner-location exchange for a copy on an unresolved line,
+  so that lookup too answers `NotRecovered` by name.
+
+Held by, in `crates/server/src/takeover.rs`: `a_round_the_retirement_bound_ended_names_what_it_had_learned` (seven members
+at `f = 1`; four takeovers outstanding with two members left; the bound ends exactly the round of the takeover it let
+go, naming its learned object, never a completed takeover's; the held copy kept, counted) and
+`a_round_the_retirement_bound_ended_gives_its_learned_volumes_up_by_name` (a volume recorded `TakeoverIncomplete
+{ waited_on: "retirement" }` and claimed; the volume and its catalog register counted).
+
+Applied in the same change to: §4.8 "Promotion and takeover" (status), A-309 (its residual), GAPS (A-272 (ii)'s entry)
+and `crates/server/src/takeover.rs`.
+
+### A-349 — A superseded owner ships nothing more of the volume it lost, so its record sessions are free for its own takeover rounds (2026-11-18, kiln goal g250; §4.10 live shipping, §4.8 "Promotion and takeover"; the chaos nemesis, seed 6876545201569229162; A-304, A-338)
+
+- **What was there.** An owner that learns its fence (a holder answered its log `StaleEpoch` at a later epoch) refuses
+  every write waiting on the volume and ships nothing more of it (`live_ship::learn_superseded`; `Next::Fenced`: "must
+  stop shipping and serving"). The paths that ship from a publication, a lane's end and a holder's return honoured
+  that; the record period did not. Its visit followed the volume's candidates and made whole records and images for it,
+  and `pending_sends` built each holder the entries or the install it lacked, every period, each refused `StaleEpoch`.
+  Each send borrows the holder's record session for its exchange (`borrow_session`, `fleet.lent_to.live_ship`), and the
+  coordinator starts the period's lanes just before it drives the takeover rounds (`run_record_period`, then
+  `adopt_and_serve`). A round's page question takes a session only if it is in its link at that instant
+  (`takeover::ask_pages`), so the old owner's rounds met it out on that loan every period. In the nemesis (diag-g250-
+  nemesis-2, CI run 44320668620, 5 of 6 rounds over both arches) the owner X1, isolated, superseded and admitted again,
+  was a survivor of the next departure (its successor X2, deafened); X2's objects fell to X1, the volume's home; X1's
+  round never sent the other survivor its page (`fleet.takeover.pages_unsent` 213 to 928) and A-304's bound gave both
+  up (NotRecovered) within tolerance. No survivor withheld a promise: the round never asked.
+- **The rule.** A fenced volume does nothing at the record period and sends nothing from any path
+  (`live_ship::pending_sends`, `period_volume`). Its writers were refused when the fence was learned, and later verbs go
+  to its successor (A-338).
+- **What it costs.** Nothing a superseded owner sent could land. Each period had sent each holder its stale entries or
+  a stale install (the whole volume: about 2,240 installs of 340 KB a run in the nemesis).
+- **Owed, found by this reading (GAPS).** The round on the old owner now adopts the objects that fall to it, and its
+  materialization meets the node's own superseded copy: `verbs::materialize_taken_over` keeps a volume the node already
+  holds, so the adopted state would never replace the stale copy, its fenced shipper or its kept fence (A-334's owed
+  re-adoption; g229 told). A lane that ends on any answer, a refusal included, sends the holder what it lacks again at
+  once (`lane_ended`): X2, retired before it knew, sent its log to the two members that refused it `not_a_member` about
+  86,000 times each in one run, its sessions out on that loop throughout. And a round's question still takes a session
+  only if it is in its link at that instant, so any borrower that takes it every period would starve it the same way.
+
+Held by `a_superseded_owner_ships_nothing_more_of_the_volume_it_lost` (`crates/server/tests/fleet.rs`: the owner cut off
+on the probe plane until its volume is taken over, healed, one write through it to meet the fence, then 20 record
+periods watched): red with the fix reverted, each holder refusing the old owner's fenced entry again every period (19
+in the 20, and 102 before the window, `not_the_acting_owner` once the old owner was admitted again), and with it each
+holder's one refusal is the write that met the fence (kiln r2346, Mac Studio).
+
+Applied in the same change to: §4.10 (the chaos flows' status), GAPS (the nemesis entry), `crates/server/src/live_ship.rs`,
+`crates/server/tests/fleet.rs` and the bug record
+`docs/bugs/2026-11-18-a-superseded-owners-shipper-starved-its-own-takeover-round.md`.
 
 ### A-334 — A host admitted again under its own id yields the volumes it catalogued (2026-11-18, goal g229, the SIGSTOP owner flow's ReadSafety finding; realizes §4.8 "Authority scope" for a re-admission)
 Applied in the same change to: §4.8 "Leases and reads" (its status), §4.10 live shipping (the chaos flows' status, A-346's
