@@ -10881,6 +10881,11 @@ fn taken_over_on_the_probe_plane(daemons: &[Daemon], hosts: &[HostId], successor
   taken && healed
 }
 
+/// Shape: the fleet's periods the superseded-owner test gives each step after the takeover (the successor's first
+/// shipment, a write through each node): a takeover's materialization publishes at once and a forward is a location
+/// round and one exchange, each a few periods; a hundred leave room for load, and keep a red run to seconds.
+const SUPERSEDED_PERIODS: u64 = 100;
+
 /// Writes `path` through a client of `daemons[through]` until a write is answered `FsDone`, within each fleet wait judged
 /// by progress: the old owner's first write after its takeover may be the one that finds its log fenced, and is refused.
 /// Every reply, the last the one that ended the wait.
@@ -10893,7 +10898,7 @@ fn written_through(
   let mut client = Client::connect(daemons[through].instance());
   let mut replies = Vec::new();
   let observed: Vec<&Daemon> = daemons.iter().collect();
-  poll_until(&observed, PLACEMENT_DEADLINE, || {
+  poll_for_periods(&observed, PLACEMENT_DEADLINE, SUPERSEDED_PERIODS, || {
     let reply = match client.call(&RequestBody::Attach {
       volume,
       snapshot: None,
@@ -10909,8 +10914,8 @@ fn written_through(
           mode: 0o644,
         });
         // The write lease goes with the attachment, so the next writer, here or on another node, is not refused
-        // `LeaseHeld` by this one.
-        client.call(&RequestBody::Detach { attachment });
+        // `LeaseHeld` by this one; let go by volume, so it is forwarded to the owner that recorded it (A-222).
+        client.call(&RequestBody::DetachOf { volume, attachment });
         written
       }
       refused => refused,
@@ -10946,9 +10951,10 @@ fn a_superseded_owners_clients_reach_its_successor() {
   let taken = taken_over_on_the_probe_plane(&daemons, &hosts, successor);
   let observed: Vec<&Daemon> = daemons.iter().collect();
   let mut watcher = Client::connect(successor.instance());
-  let shipping_at_once = poll_until(&observed, PLACEMENT_DEADLINE, || {
-    Ok(owned_live_head(&mut watcher, id).is_some())
-  });
+  let shipping_at_once =
+    poll_for_periods(&observed, PLACEMENT_DEADLINE, SUPERSEDED_PERIODS, || {
+      Ok(owned_live_head(&mut watcher, id).is_some())
+    });
   drop(watcher);
   let through_a = written_through(&daemons, 0, id, "/through-the-old-owner");
   let third = if successor.instance() == daemons[1].instance() {

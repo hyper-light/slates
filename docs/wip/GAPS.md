@@ -5,13 +5,16 @@
 > owner kept its volume fenced and answered every verb `StaleEpoch` for good, since a node forwarded only a volume it
 > had not created; a third node routed to the retired creator while its process lived; and the successor shipped
 > nothing until a write reached it, so the only line shipping the volume was the old owner's fenced one. Now a
-> superseded volume is routed to its current owner, a node is never its own creator route, a retired host owns
-> nothing however alive, and a successor publishes a live volume at its takeover. Test:
+> superseded volume is routed to its current owner, a node asks its own routing before the creator and is never its
+> own creator route, and a successor publishes a live volume at its takeover. Test:
 > `a_superseded_owners_clients_reach_its_successor` (`crates/server/tests/fleet.rs`).
 > - **Owed (g230, next):** a mount on the old owner (NFS, FUSE) still answers `StaleEpoch` for the volume it lost; it is
 >   to be routed as a non-owner node's attachment is.
 > - **Owed (the supervisor's):** the nemesis seeds on the fix (6876545201569229162 Linux x86_64, 10695597685579409771
 >   arm64, 12136749566337968553 macOS).
+> - **Owed:** a node that holds no copy of an object still takes a live creator for its owner, and a creator the
+>   council retired keeps being eligible while its process lives; held by the routing a holder keeps in a fleet where
+>   every node holds every object (`f = 1`, three nodes), not yet where a third node holds none.
 
 > **A successor's live log began again at position 0: it goes on from the head its takeover adopted (2026-11-18, A-329,
 > Continuity, T-8.6; g230).** `live_ship::published` made every shipper with no start, so a successor's first entry was

@@ -146,14 +146,6 @@ fn ineligibility(state: &ShardState, host: HostId, region: RegionId) -> Option<&
   if state.node_regions.get(&host) != Some(&region) {
     return Some("fleet.owner_location.route_dropped.owner_ineligible.region");
   }
-  // In this node's own region a host owns objects only while the installed configuration holds it as a member: a member
-  // the council retired is a non-member, however alive its process (A-338). Its objects are its successors', and a route
-  // to it met a volume it had lost (a retired creator refuted its death and kept answering for its volumes).
-  if state.node_regions.get(&state.fleet.host()) == Some(&region)
-    && !state.fleet.members().contains(&host)
-  {
-    return Some("fleet.owner_location.route_dropped.owner_ineligible.retired");
-  }
   match state.fleet.membership().state(host) {
     None => Some("fleet.owner_location.route_dropped.owner_ineligible.unknown"),
     Some(member) if member.liveness == Liveness::Dead => {
