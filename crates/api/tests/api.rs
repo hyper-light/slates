@@ -1656,16 +1656,19 @@ mod asynchronous_form {
   const ROUNDS_PER_DROP: usize = 4;
 
   /// A host's reactor in miniature: its wait blocks this thread in `poll(2)` until the completion signal is readable
-  /// or the timeout passes, then answers at once, so an awaited call ends in the one poll [`block_on`] gives it. A wait
-  /// with no timeout is bounded by the suite's wait and fails past it, so a call that would wait for good fails the
-  /// test instead of hanging it. It counts how its waits ended, the evidence a test prints: a wait that timed out is
-  /// the driver's deadline, not a reply's signal.
+  /// or the timeout passes, then answers at once, so an awaited call ends in the one poll [`block_on`] gives it. A call
+  /// that would wait for good fails the test instead of hanging it: a wait with no timeout is bounded by the suite's
+  /// wait, and so are the waits a call times out one after another with no signal between them (a live daemon's call
+  /// goes on waiting through its deadlines, A-232, so only the host bounds it). It counts how its waits ended, the
+  /// evidence a test prints: a wait that timed out is the driver's deadline, not a reply's signal.
   #[derive(Default)]
   struct Blocking {
     /// Waits the completion signal ended.
     readable: Cell<u64>,
     /// Waits the timeout ended.
     timed_out: Cell<u64>,
+    /// How long the waits since the last signal timed out, in all.
+    unsignalled: Cell<Duration>,
   }
 
   impl Reactor for Blocking {
@@ -1689,8 +1692,21 @@ mod asynchronous_form {
         Err(errno) => Err(std::io::Error::from(errno)),
       };
       let counted = match woke {
-        Ok(Woke::Readable) => &self.readable,
-        Ok(Woke::TimedOut) => &self.timed_out,
+        Ok(Woke::Readable) => {
+          self.unsignalled.set(Duration::ZERO);
+          &self.readable
+        }
+        Ok(Woke::TimedOut) => {
+          let unsignalled = self.unsignalled.get().saturating_add(bound);
+          self.unsignalled.set(unsignalled);
+          if unsignalled > START_WAIT {
+            return Box::pin(std::future::ready(Err(std::io::Error::new(
+              std::io::ErrorKind::TimedOut,
+              "no reply was signalled within the suite's wait",
+            ))));
+          }
+          &self.timed_out
+        }
         Err(_) => return Box::pin(std::future::ready(woke)),
       };
       counted.set(counted.get().saturating_add(1));
