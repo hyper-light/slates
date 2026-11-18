@@ -715,15 +715,16 @@ pub async fn request_raft(
 /// earlier, unversioned layout wrote begins with its configuration version, whose low word is the magic only at version
 /// 1,195,787,090, which no fleet's council reaches.
 const REGIONAL_MAGIC: u32 = u32::from_le_bytes(*b"RCFG");
-/// Format: the regional configuration's layout version: 2 since A-309, which put the completion records (`completed`)
+/// Format: the regional configuration's layout version: 3 since A-372, which appended the council's recorded voters
+/// (`voters`, a host set) after the moved-object exceptions. Layout 2 (A-309) put the completion records (`completed`)
 /// where layout 1 carried A-272's `dropped_unconfirmed` and gave each retirement its current neighbourhood (a presence
-/// byte, then its settled form, after its unconfirmed hosts); the moved-object exceptions, `moved`, stay last. Layout 1
-/// was the first versioned layout. A decoder refuses any other by name ([`RaftWireError::LayoutVersion`]) rather than
-/// read another layout's fields by position: before the version, a field appended to the layout was refused only by the
+/// byte, then its settled form, after its unconfirmed hosts). Layout 1 was the first versioned layout. A decoder
+/// refuses any other by name ([`RaftWireError::LayoutVersion`]) rather than read another layout's fields by position:
+/// before the version, a field appended to the layout was refused only by the
 /// accident of a length (`Truncated` one way, `LengthMismatch` the other), and a change that kept the length would have
 /// been read with a field defaulted (GAPS, live-durability 2026-11-09). A-309's change keeps the length when nothing was
 /// dropped and no retirement is kept, which only the version tells apart.
-const REGIONAL_LAYOUT: u32 = 2;
+const REGIONAL_LAYOUT: u32 = 3;
 /// Format: a root configuration's magic, "RTCF" little-endian, as [`REGIONAL_MAGIC`] is the regional one's: an
 /// unversioned root configuration's version matches it only at 1,178,817,618.
 const ROOT_MAGIC: u32 = u32::from_le_bytes(*b"RTCF");
@@ -830,6 +831,7 @@ pub fn encode_regional_configuration(config: &RegionalConfiguration) -> Vec<u8> 
     put_u64(&mut out, moved.owner.0);
     put_u64(&mut out, moved.version);
   }
+  encode_hosts(&mut out, &config.voters);
   out
 }
 
@@ -997,6 +999,7 @@ pub fn decode_regional_configuration(bytes: &[u8]) -> Result<RegionalConfigurati
   let (adoptions, rest) = decode_adoptions(rest)?;
   let (completed, rest) = decode_completed(rest)?;
   let (moved, rest) = decode_moved(rest)?;
+  let (voters, rest) = decode_hosts(rest)?;
   expect_end(rest)?;
   Ok(RegionalConfiguration {
     version,
@@ -1011,6 +1014,7 @@ pub fn decode_regional_configuration(bytes: &[u8]) -> Result<RegionalConfigurati
     adoptions,
     completed,
     moved,
+    voters,
   })
 }
 
@@ -1898,6 +1902,9 @@ mod tests {
     complete_every_retirement(&mut config);
     assert!(!config.completed.is_empty());
     expect_round_trip(&config, "round-trip is identity with completion records");
+    // The council's recorded voters (A-372) survive it too.
+    assert!(config.seat(&[HostId(3), B]));
+    expect_round_trip(&config, "round-trip is identity with recorded voters");
   }
 
   /// Confirms every survivor's share of every retirement `config` keeps, so each completes into a record (A-309).
@@ -1973,8 +1980,9 @@ mod tests {
       .unwrap();
     assert!(config.moved.is_empty());
     let bytes = encode_regional_configuration(&config);
-    // The record is the last one: its confirmed ids (a count, then each) are followed only by the moved objects' count.
-    let tail = confirmed * size_of::<u64>() + size_of::<u32>();
+    // The record is the last one: its confirmed ids (a count, then each) are followed only by the moved objects' count
+    // and the recorded voters' count (none of either here, A-372).
+    let tail = confirmed * size_of::<u64>() + 2 * size_of::<u32>();
     let count_at = bytes.len() - tail - size_of::<u32>();
     let mut lying = bytes.clone();
     lying[count_at..count_at + size_of::<u32>()].copy_from_slice(&u32::MAX.to_le_bytes());
@@ -2005,9 +2013,11 @@ mod tests {
     );
     assert!(config.move_object(ObjectId::new(A, 5), A, B));
     let bytes = encode_regional_configuration(&config);
-    // The exceptions are last: a count, then one entry of an object id and two words.
+    // The exceptions come before the recorded voters' count alone (none here, A-372): a count, then one entry of an
+    // object id and two words.
+    let voters = size_of::<u32>();
     let entry = OBJECT_BYTES + 2 * size_of::<u64>();
-    let count_at = bytes.len() - entry - size_of::<u32>();
+    let count_at = bytes.len() - voters - entry - size_of::<u32>();
     let mut lying = bytes.clone();
     lying[count_at..count_at + size_of::<u32>()].copy_from_slice(&u32::MAX.to_le_bytes());
     assert_eq!(
@@ -2015,7 +2025,7 @@ mod tests {
       Err(RaftWireError::LengthMismatch),
       "a count beyond the bytes is refused"
     );
-    for cut in 1..=entry {
+    for cut in 1..=voters + entry {
       assert!(
         decode_regional_configuration(&bytes[..bytes.len() - cut]).is_err(),
         "a configuration cut {cut} bytes short is refused"
@@ -2039,9 +2049,9 @@ mod tests {
     let bytes = encode_regional_configuration(&config);
     // The last retirement ends with its confirmed ids (a count, none here), its unconfirmed ids (a count, none here)
     // and its current neighbourhood's presence byte (none here, A-309): make the confirmed count claim every id there
-    // is. The adoptions' count, the completion records' count and the moved objects' count (none of each here) follow
-    // the last retirement, in that order.
-    let tail = 5 * size_of::<u32>() + 1;
+    // is. The adoptions' count, the completion records' count, the moved objects' count and the recorded voters' count
+    // (none of each here, the last A-372's) follow the last retirement, in that order.
+    let tail = 6 * size_of::<u32>() + 1;
     let confirmed_count_at = bytes.len() - tail;
     let mut lying = bytes.clone();
     lying[confirmed_count_at..confirmed_count_at + size_of::<u32>()]

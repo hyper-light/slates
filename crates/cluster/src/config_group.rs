@@ -147,6 +147,12 @@ pub enum ConfigCommand {
     /// Its owner, the reporter.
     owner: HostId,
   },
+  /// The leader records the voters the council's last committed seat change left (A-372;
+  /// [`RegionalConfiguration::seat`]), so a learner learns who votes by the configuration's version.
+  Seat {
+    /// The voters, in id order.
+    voters: Vec<HostId>,
+  },
 }
 
 /// Format: a config command is a one-byte tag followed by its little-endian fields; these are the tags.
@@ -165,6 +171,9 @@ const COMMAND_MIRROR_ADOPTED: u8 = 6;
 const COMMAND_MOVE: u8 = 7;
 /// Format: the tag of a moved object's owner's report that it is destroyed ([`ConfigCommand::MovedForgotten`]).
 const COMMAND_MOVED_FORGOTTEN: u8 = 8;
+/// Format: the tag of the leader's record of the council's voters ([`ConfigCommand::Seat`]): a little-endian u64 count,
+/// then each voter's id.
+const COMMAND_SEAT: u8 = 9;
 /// Format: an admission's domain is a presence byte — absent (unique-per-host) or present, in which case
 /// the domain id follows as a little-endian u64.
 const DOMAIN_ABSENT: u8 = 0;
@@ -242,6 +251,17 @@ impl ConfigCommand {
         out.extend_from_slice(&object.0);
         out.extend_from_slice(&owner.0.to_le_bytes());
       }
+      ConfigCommand::Seat { voters } => {
+        out.push(COMMAND_SEAT);
+        out.extend_from_slice(
+          &u64::try_from(voters.len())
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+        );
+        for voter in voters {
+          out.extend_from_slice(&voter.0.to_le_bytes());
+        }
+      }
     }
     out
   }
@@ -282,9 +302,27 @@ impl ConfigCommand {
       }
       COMMAND_MIRROR_ADOPT | COMMAND_MIRROR_ADOPTED => decode_mirror(tag, rest),
       COMMAND_MOVE | COMMAND_MOVED_FORGOTTEN => decode_move(tag, rest),
+      COMMAND_SEAT => decode_seat(rest),
       _ => None,
     }
   }
+}
+
+/// Decodes the leader's record of the voters (`COMMAND_SEAT`) after its tag: a count, then each id, the count checked
+/// against the bytes that follow before anything is allocated, or `None` for malformed bytes or trailing ones.
+fn decode_seat(rest: &[u8]) -> Option<ConfigCommand> {
+  let (count, mut rest) = take_word(rest)?;
+  let count = usize::try_from(count).ok()?;
+  if count.checked_mul(size_of::<u64>())? != rest.len() {
+    return None;
+  }
+  let mut voters = Vec::with_capacity(count);
+  for _ in 0..count {
+    let (voter, tail) = take_host(rest)?;
+    voters.push(voter);
+    rest = tail;
+  }
+  Some(ConfigCommand::Seat { voters })
 }
 
 /// Decodes a move command (`COMMAND_MOVE`, `COMMAND_MOVED_FORGOTTEN`) after its tag, or `None` for malformed bytes or
@@ -485,6 +523,8 @@ pub enum Reconfiguration {
     /// Its owner.
     owner: HostId,
   },
+  /// Record the voters the council's last committed seat change left ([`ConfigCommand::Seat`], A-372).
+  Seat(Vec<HostId>),
 }
 
 /// The voter set the council moves to (§4.8, D-14 — "a small elected council per region"), in id order: up
@@ -594,10 +634,6 @@ pub struct RegionalCouncil {
   /// A changed learner view must survive before it is published to serving shards.
   view_pending: bool,
   learned: Option<RegionalConfiguration>,
-  /// The council's voters as the last fetched view named them, while this node is a learner. A learner's Raft state
-  /// is its join state's and nothing updates it, so these are how it knows who votes now; empty until a fetch has told
-  /// it. Bounded by the council's voters. Held in RAM: a restart fetches again.
-  learned_voters: Vec<HostId>,
   scatter: u64,
   /// Monotone count of the events that defer this node's own election — a leader's append answered here, or a
   /// vote this node granted a candidate (Raft Figure 2's two follower timer-resets). The drive loop's election
@@ -762,7 +798,6 @@ impl RegionalCouncil {
       raft,
       fold: Fold::new(configuration),
       learned: None,
-      learned_voters: Vec::new(),
       view_pending: false,
       scatter,
       leader_contact: 0,
@@ -1154,6 +1189,10 @@ impl RegionalCouncil {
         ConfigCommand::MovedForgotten { object, owner },
         self.fold.state().forgets_moved(object, owner),
       ),
+      Reconfiguration::Seat(voters) => {
+        let would = self.fold.state().seats(&voters);
+        (ConfigCommand::Seat { voters }, would)
+      }
     };
     if !would_change {
       return false;
@@ -1275,33 +1314,26 @@ impl RegionalCouncil {
     proposed
   }
 
-  /// Who this node knows to vote now: the Raft voter set on a voter, and on a learner the voters its last fetched view
-  /// named, or its join state's voters before any fetch has told it. A learner's Raft state never moves after its join,
-  /// so reading it alone left a learner contacting a voter long gone and dropping the leader it needed.
+  /// Who this node knows to vote now: the Raft voter set on a voter, and on a learner the voters its configuration
+  /// records (A-372, [`RegionalConfiguration::voters`]), or its join state's before any is recorded. A learner's Raft
+  /// state never moves after its join, so reading it alone left a learner contacting a voter long gone and dropping the
+  /// leader it needed.
   pub fn known_voters(&self) -> Vec<HostId> {
-    if self.learned_voters.is_empty() || self.raft.is_voter(self.raft.id()) {
+    let recorded = &self.configuration().voters;
+    if recorded.is_empty() || self.raft.is_voter(self.raft.id()) {
       self.voters()
     } else {
-      self.learned_voters.clone()
+      recorded.clone()
     }
   }
 
   /// Whether this node knows `node` to be a voter now ([`known_voters`](RegionalCouncil::known_voters)).
   pub fn known_voter(&self, node: HostId) -> bool {
-    if self.learned_voters.is_empty() || self.raft.is_voter(self.raft.id()) {
+    let recorded = &self.configuration().voters;
+    if recorded.is_empty() || self.raft.is_voter(self.raft.id()) {
       self.is_voter(node)
     } else {
-      self.learned_voters.contains(&node)
-    }
-  }
-
-  /// Records the voters a fetched configuration's answerer named, on a learner ([`known_voters`]). An empty list changes
-  /// nothing, so an answer that names none cannot erase what is known.
-  ///
-  /// [`known_voters`]: RegionalCouncil::known_voters
-  pub fn learn_voters(&mut self, voters: Vec<HostId>) {
-    if !voters.is_empty() {
-      self.learned_voters = voters;
+      recorded.contains(&node)
     }
   }
 
@@ -1378,6 +1410,20 @@ impl RegionalCouncil {
       }
       CatchUp::Pending | CatchUp::NotLeader => false,
     }
+  }
+
+  /// **DRIVE** (leader): records the voters in force in the configuration once they differ from the ones it records
+  /// (A-372, [`RegionalConfiguration::seat`]): only while no change is in flight — this leader caught up and its voters
+  /// out of any joint configuration, so they are the ones the council's last committed seat change left. A learner
+  /// takes no part in the council's Raft and learns a change by the configuration's version, and a seat change is a
+  /// Raft configuration entry that moves no version, so without this record a learner knew only the voters of its join
+  /// and of whatever answered its last fetch, and kept a voter long gone as its only one. Returns whether it proposed.
+  pub fn record_voters(&mut self) -> bool {
+    if !self.is_leader() || !self.caught_up() || self.raft.in_joint_configuration() {
+      return false;
+    }
+    let sitting = self.raft.all_voters();
+    self.propose(Reconfiguration::Seat(sitting))
   }
 
   /// The voter set [`reconcile_voters`](Self::reconcile_voters) moves toward from `sitting`: [`council_voters`] of the
@@ -1541,6 +1587,9 @@ fn apply_command(configuration: &mut RegionalConfiguration, command: &[u8], scat
     }
     Some(ConfigCommand::MovedForgotten { object, owner }) => {
       configuration.forget_moved(object, owner);
+    }
+    Some(ConfigCommand::Seat { voters }) => {
+      configuration.seat(&voters);
     }
     None => {}
   }
@@ -2659,6 +2708,96 @@ mod tests {
       "the live learner was caught up, then promoted to the free seat: {change:?}"
     );
     assert_eq!(councils[&OWNER].voters(), vec![OWNER, A, C]);
+  }
+
+  /// A-372 (§4.8 learners): the leader records the voters in force in the configuration once no change is in flight, and
+  /// a learner knows who votes by the configuration it adopts, through a seat change too. Do: five members at `f = 1`
+  /// (three voters, two learners); elect the first; record the voters and commit; let the last member, a learner, adopt
+  /// the leader's configuration; take a voter over and drive the voter change that refills its seat; record again and
+  /// let the learner adopt again. Expect each record to advance the version by one, a record with nothing new to propose
+  /// nothing, and the learner to name the leader's voters after each adoption, the second time the changed set. Before,
+  /// a seat change moved no version, so the learner kept the voters of its join and named a voter taken over.
+  #[test]
+  fn a_learner_names_the_voters_the_configuration_records_through_a_seat_change() {
+    const D: HostId = HostId(5);
+    let members = [OWNER, A, B, C, D];
+    let mut councils = councils(&members);
+    elect_among(&mut councils, OWNER, &members);
+    settle(&mut councils, OWNER, &members, 2);
+    let first = record_and_commit(&mut councils, &members);
+    assert!(
+      !councils
+        .get_mut(&OWNER)
+        .is_some_and(RegionalCouncil::record_voters),
+      "nothing new to record proposes nothing"
+    );
+    assert_eq!(
+      learner_names_after_adopting(&mut councils, D),
+      first,
+      "the learner names the voters recorded"
+    );
+    let survivors = [OWNER, A, C, D];
+    let declared: Vec<(HostId, Option<DomainId>)> =
+      survivors.iter().map(|host| (*host, None)).collect();
+    assert!(
+      councils
+        .get_mut(&OWNER)
+        .is_some_and(|leader| leader.reconcile_alive(&declared, &[B]))
+    );
+    settle(&mut councils, OWNER, &survivors, 2);
+    let change = drive_voter_change(&mut councils, OWNER, &survivors, &survivors);
+    assert!(change.moved_once(), "B's seat was refilled: {change:?}");
+    let second = record_and_commit(&mut councils, &survivors);
+    assert!(
+      second != first && !second.contains(&B),
+      "the seat change left other voters: {first:?} then {second:?}"
+    );
+    assert_eq!(
+      learner_names_after_adopting(&mut councils, D),
+      second,
+      "the learner names the changed voters"
+    );
+  }
+
+  /// Has the leader `OWNER` record its voters and commits the record over `reachable`. Expect the record proposed and
+  /// committed one version on, naming the voters in force. Those voters.
+  fn record_and_commit(
+    councils: &mut std::collections::BTreeMap<HostId, RegionalCouncil>,
+    reachable: &[HostId],
+  ) -> Vec<HostId> {
+    let before = councils[&OWNER].configuration().version;
+    let proposed = councils
+      .get_mut(&OWNER)
+      .is_some_and(RegionalCouncil::record_voters);
+    settle(councils, OWNER, reachable, 2);
+    let voters = councils[&OWNER].voters();
+    assert!(proposed, "the leader recorded the voters in force");
+    assert_eq!(
+      (
+        councils[&OWNER].configuration().version,
+        councils[&OWNER].configuration().voters.clone()
+      ),
+      (before + 1, voters.clone()),
+      "the record committed one version on"
+    );
+    voters
+  }
+
+  /// Has `learner` adopt the leader's configuration, as its fetch does. The voters it names after.
+  fn learner_names_after_adopting(
+    councils: &mut std::collections::BTreeMap<HostId, RegionalCouncil>,
+    learner: HostId,
+  ) -> Vec<HostId> {
+    let configuration = councils[&OWNER].configuration().clone();
+    let Some(council) = councils.get_mut(&learner) else {
+      return Vec::new();
+    };
+    assert!(!council.is_voter(learner), "{learner:?} is a learner");
+    assert!(
+      council.adopt(configuration),
+      "the learner adopts the newer view"
+    );
+    council.known_voters()
   }
 
   /// Shape: leader periods the test below allows: a stalled staging is judged at the second CheckQuorum tick
