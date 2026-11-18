@@ -4185,8 +4185,12 @@
 >   20261116.315.1 (Visual Studio 18.12) beside 20261103.298.1 (18.11), the tag `v0.1.0`'s two x86_64 copies landed on
 >   different images and differed in 2,559,679 of 15,139,328 bytes, while each image built the same bytes every time
 >   (d3498b4f twice, 871a057d three times, test 4's included; run 44347535833). The artifacts task now names both images
->   in its refusal, and one copy is run again until the pair shares an image. Owed: pin the MSVC toolset and the
->   Windows SDK the Windows binaries link, so a tag's bytes do not depend on which image a runner has.
+>   in its refusal, and one copy is run again until the pair shares an image. Since A-411 (2026-11-18) the release's
+>   Windows builds pin MSVC toolset 14.44 and Windows SDK 10.0.26100.0, which both images and the arm64 one carry: the
+>   two binaries' Rich headers differed only in the default toolset's tools (linker 14.51.36260 against 14.52.37029,
+>   its runtime objects 35721 against 36815), the SDK's 204 objects alike. Owed: the first release run across two
+>   images with the pin (run request of 2026-11-18); clang-cl, which builds AWS-LC's C on arm64, still comes from
+>   the image.
 > - **Reproducible from the tag (2026-11-05, AC-9.5).** Every target is built twice on separate runners, and the
 >   release is refused unless the two copies are the same bytes. The four Linux binaries already were. The Windows
 >   ones differed in 20 bytes, the linker's timestamps and PDB GUID (run 42046848954), until `/Brepro`; with it, all six
