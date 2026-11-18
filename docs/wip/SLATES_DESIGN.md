@@ -7172,6 +7172,12 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   The announcement now carries the advertised port, and every relayed flow requires the relay to have carried at least
 >   one record-plane datagram per acknowledged write (`judge_relayed`, its non-vacuity count;
 >   `docs/bugs/2026-11-18-a-redial-went-around-the-port-mapping-the-record-plane-was-announced-at-its-bound-port.md`).
+> - **A false death let the members that exist now stand in for a holder (fixed 2026-11-18, A-345).** With every relayed
+>   flow's faults reaching the record plane, the next gated run (main ca216dbf8, Linux x86_64) lost four acknowledged
+>   writes in the fresh-member flow: the holder with the owner's newest entries, stopped 3 s, was retired on a false
+>   death, and the stale holder's takeover went past tolerance (A-309) and adopted its own older head. A live takeover now
+>   counts a retired holder it never saw restart as one that may return, and waits for it
+>   (`docs/bugs/2026-11-18-a-false-death-let-the-members-that-exist-now-stand-in-for-the-holder-of-the-newest-entries.md`).
 
 > - **A successor's log began again at genesis (fixed 2026-11-18, A-329).** The flows' first gated run (macOS, main
 >   bfc34cace, kiln r1246) failed Continuity in five takeover flows: the successor's head after its first write was
@@ -25142,3 +25148,29 @@ code below.
   the creator rule on the client's shard (`remote_attach::elsewhere`, the remote-attach reap) still take a yielded
   volume for this node's own.
 - Record: `docs/bugs/2026-11-18-an-owner-admitted-again-served-the-copy-its-successor-had-passed.md`.
+
+### A-345 — A live takeover counts a retired holder it never saw restart as one that may return (2026-11-18, goal g229, the fresh-member flow's data loss; amends A-309 piece 3)
+Applied in the same change to: §4.10's chaos status, GAPS ("Chaos from outside the processes"), and the code below.
+- **What was there.** A-309 piece 3 judged a live takeover past tolerance once fewer than `f + 1` of the volume's
+  recorded holders were council members, and then adopted the greatest head among the members that exist now. A host
+  retired on a death verdict is not a member, though the verdict may be false: SWIM and the council cannot tell a stopped
+  or cut-off process from a dead one, and such a host refutes with its RAM, its copy of the log among it, whole.
+- **What it broke.** NoLoss. In `a_member_that_never_held_the_log_never_stands_in_for_its_holder` (CI diag run
+  44288273676, Linux x86_64) the owner was killed and the holder with its newest entries stopped for 3 s, long enough
+  to be retired. The stale holder's phase one went past tolerance, waited for the members b, d and the replacement e'
+  (two of which never held the log), and adopted its own head 167. Writes chaos-166 to 169, acknowledged, were lost:
+  the members that exist now stood in for the holder, which A-240 forbids.
+- **The rule.** A recorded holder may still hold the log while it is a member, or while it is not but this node never
+  saw its anchor restart under another member id (`state::LearnedMember::previous`, kept at a restart, the one event
+  that ends a host's RAM copies). Such a holder counts toward tolerance, so within it A-240's count waits for its
+  report. Past tolerance, which now means that a missing holder was seen restarted, the round waits for every recorded
+  holder that may still hold the log, as well as the cohorts' members. A-309's store-destroyed case is unchanged, since
+  its destroyed holder comes back restarted.
+- **The cost.** A holder away past the failover SLO's worth of attempts has the volume given up (`NotRecovered`) where
+  A-309 served it from the other members; a decision for Ada (GAPS), recommended kept.
+- **The failing test.** `a_retired_holder_never_seen_restarted_is_waited_for_and_its_newer_head_adopted`
+  (`crates/server/src/live_ship.rs`): the flow's decision alone. It waits for the retired holder and then adopts its
+  170, where A-309's rule adopted 167 at once; and with the holder seen restarted it adopts past tolerance as before.
+- **Sibling, owed.** A-309 piece 2 (the register takeover past tolerance, `slates_db::takeover`) passes over a falsely
+  retired holder of the newest register record the same way.
+- Record: `docs/bugs/2026-11-18-a-false-death-let-the-members-that-exist-now-stand-in-for-the-holder-of-the-newest-entries.md`.

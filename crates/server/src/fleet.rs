@@ -562,6 +562,7 @@ pub(crate) fn learn_member(
         .or_insert(LearnedMember {
           boot_nonce,
           host: announced,
+          previous: None,
         });
     }
     LearnedOutcome::Restarted { old } => {
@@ -572,6 +573,7 @@ pub(crate) fn learn_member(
         LearnedMember {
           boot_nonce,
           host: announced,
+          previous: Some(old),
         },
       );
       // A discovery exchange pending on this anchor's link addresses the old incarnation: woken now, it
@@ -10254,6 +10256,7 @@ mod tests {
         LearnedMember {
           boot_nonce: 11,
           host: first,
+          previous: None,
         },
       );
       let mut client = Some(pending_dial());
@@ -10266,6 +10269,7 @@ mod tests {
         LearnedMember {
           boot_nonce: 22,
           host: second,
+          previous: None,
         },
       );
       let now = refresh_record_identity_in(state, anchor, first, &mut client, &mut cursor);
@@ -10318,6 +10322,7 @@ mod tests {
         LearnedMember {
           boot_nonce: 7,
           host: real,
+          previous: None,
         },
       );
       let learned_seed = keeps_direct_contact_with(state, seed);
@@ -10349,6 +10354,7 @@ mod tests {
     let known = LearnedMember {
       boot_nonce: 0,
       host: seed,
+      previous: None,
     };
     assert_eq!(
       classify_announced(Some(&known), anchor, 0, seed),
@@ -10363,6 +10369,7 @@ mod tests {
     let restarted = LearnedMember {
       boot_nonce: 1,
       host: next,
+      previous: None,
     };
     assert_eq!(
       classify_announced(Some(&restarted), anchor, 0, seed),

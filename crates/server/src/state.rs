@@ -119,6 +119,11 @@ pub struct LearnedMember {
   pub boot_nonce: u64,
   /// The member id at that boot_nonce — what membership, ownership and records name the peer by.
   pub host: slates_db::HostId,
+  /// The member id this anchor had before its last restart, `None` before any: an id this node saw end, whose RAM copies
+  /// (a live log's among them) are gone with its process. A live takeover past tolerance counts on it (A-345,
+  /// `live_ship::fetch`): a retired holder not seen restarted may return with its copy. One a anchor, bounded by the
+  /// roster as the map is.
+  pub previous: Option<slates_db::HostId>,
 }
 
 /// One peer's record session as the control shard keeps it (§4.8): the session itself, `None` while it is

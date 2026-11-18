@@ -3391,6 +3391,17 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 >       head a stream of `LONG_LOG` writes ever makes (from 962, then from 965, 40 more, against a log that ended at
 >       1,001: CI diag runs 44274378785 and 44288273676, Linux x86_64). Each step's target is now absolute, from one
 >       reading (`until_durable`).
+>     - **Fixed (A-345): a false death lost acknowledged writes.** The fresh-member flow on main ca216dbf8 (CI diag run
+>       44288273676, Linux x86_64) read chaos-166..169 `NotFound` after the owner's loss: the holder with the newest
+>       entries, stopped 3 s, was retired, and the stale holder's live takeover went past tolerance (A-309 piece 3) and
+>       adopted its own head 167 beside two members that never held the log. A retired holder this node never saw
+>       restart now counts as one that may return, so the takeover waits for its report. Red first:
+>       `a_retired_holder_never_seen_restarted_is_waited_for_and_its_newer_head_adopted`
+>       (`docs/bugs/2026-11-18-a-false-death-let-the-members-that-exist-now-stand-in-for-the-holder-of-the-newest-entries.md`).
+>       **Decision for Ada:** a holder away past the failover SLO now has the volume given up (`NotRecovered`, final on the
+>       successor), where A-309 served it without the writes only that holder held; recommended kept (no silent loss of
+>       an acknowledged write). **Owed:** A-309 piece 2's register takeover passes over a falsely retired holder of the
+>       newest register record the same way.
 >     - g230's: Continuity in five flows (a successor's positions start again at 1) and the nemesis's fence lag.
 >
 > - **Fixed: a destroy was answered before its tombstone was placed** (record
