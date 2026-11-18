@@ -2134,8 +2134,20 @@ fn sized(name: &str, size: SizeClass) -> RequestBody {
   }
 }
 
+/// Acknowledges every completion `client` was answered so far, so the records it leaves unacknowledged stay a small
+/// window (the raw test client never acknowledges on its own).
+fn acknowledge(client: &mut Client) {
+  let up_to = client.sequence;
+  let ReplyBody::Acknowledged = client.call(&RequestBody::Acknowledge {
+    up_to,
+    owed: Vec::new(),
+  }) else {
+    panic!("acknowledge");
+  };
+}
+
 /// Makes empty files in `volume` until one is refused: how many were made, and the refusal. Empty files cost no bytes,
-/// so only the inode dimension refuses them.
+/// so only the inode dimension refuses them. Every [`ACK_EVERY`] files the completions are acknowledged.
 fn fill_with_empty_files(client: &mut Client, volume: VolumeId) -> (u64, Refusal) {
   let ReplyBody::Attached { attachment, .. } = client.call(&RequestBody::Attach {
     volume,
@@ -2156,8 +2168,14 @@ fn fill_with_empty_files(client: &mut Client, volume: VolumeId) -> (u64, Refusal
       bytes: Vec::new(),
       mode: 0o644,
     }) {
-      ReplyBody::Refused { refusal } => return (made, refusal),
+      ReplyBody::Refused { refusal } => {
+        acknowledge(client);
+        return (made, refusal);
+      }
       _ => made += 1,
+    }
+    if made % u64::try_from(ACK_EVERY).unwrap() == 0 {
+      acknowledge(client);
     }
   }
 }
