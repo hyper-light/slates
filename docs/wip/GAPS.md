@@ -3751,10 +3751,10 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 >       table. Now each shard yields its catalogued volumes when its own host's epoch advances (`crate::readmission`): a
 >       verb on one is forwarded to the successor, its latest state refused here (`LeaseVerdict::LostToSuccessor`). Red first:
 >       `an_owner_admitted_again_forwards_the_volume_its_successor_took_over_and_never_serves_its_own_copy`
->       (`docs/bugs/2026-11-18-an-owner-admitted-again-served-the-copy-its-successor-had-passed.md`). **Owed:** a later
->       takeover naming the host a yielded volume's successor again keeps the copy (`verbs::materialize_taken_over`
->       returns early for an id it has), so the volume stays yielded there until a rebuild replaces it; releasing a
->       yielded copy's memory (GAP-A9-7); and the creator rule's two siblings on the client's shard,
+>       (`docs/bugs/2026-11-18-an-owner-admitted-again-served-the-copy-its-successor-had-passed.md`). A later takeover
+>       naming the host a yielded volume's successor again relinquishes the stale copy and lifts the yield (A-362,
+>       g250). **Owed:** releasing a yielded copy's memory (GAP-A9-7); and the creator rule's two siblings on the
+>       client's shard,
 >       `remote_attach::elsewhere` (a mount attach of a yielded volume attaches the copy, whose live tree is now fenced)
 >       and the remote-attach reap (a record-form attach of one is forwarded but not remembered, so it ends at its lease
 >       term).
@@ -3765,10 +3765,11 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 >       rule `wait_serving` and `wait_taken_over` share) and names every survivor's live lines. Run on the Mac Studio
 >       (2026-11-18): the successor's first write acknowledged with its head shown, held; Continuity alone failed
 >       (g230's).
->     - **Open (g229): a replaced member never meshed** (`a_member_that_never_held_the_log_never_stands_in_for_its_holder`,
+>     - **Fixed (A-331, g225): a replaced member never meshed** (`a_member_that_never_held_the_log_never_stands_in_for_its_holder`,
 >       macOS): the replacement sat at configuration version 0, in contact with no peer, its four record links idle as
 >       out of contact (`fleet.link.out_of_contact` 4) through a whole fleet wait, while the owner had already recorded
->       it as a live holder.
+>       it as a live holder: a node its council configuration does not name now keeps contact with every member it holds
+>       alive.
 >     - **Fixed in the flow (g229): the long-log flow's last step asked past the stream's end.** Its step read the owner's
 >       durable position once to size the step and again inside the wait to start it, so the wait's target could pass the
 >       head a stream of `LONG_LOG` writes ever makes (from 962, then from 965, 40 more, against a log that ended at
@@ -3789,7 +3790,16 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 >       holder held. Kept: NoLoss is a register invariant the design proves (§4.8), and a typed final refusal is
 >       recoverable by the operator where a silent loss of an acknowledged write is not (R4). **Owed:** A-309 piece 2's
 >       register takeover passes over a falsely retired holder of the newest register record the same way.
->     - g230's: Continuity in five flows (a successor's positions start again at 1) and the nemesis's fence lag.
+>     - **Held in the flows (g229): a partitioned owner is taken over, and every write sent to it answered, within the
+>       failover bound.** The four partition flows let the deafened owner be taken over after 22.7 and 34.8 s and hold its
+>       in-flight write 41 to 85 s, and the cut-off and muted owners' about 20.5 s, each until the relay healed (CI diag
+>       runs 44302631709 and 44315314779). They now require the takeover within the failover SLO (`FAILOVER_BOUND`) and
+>       every write to the old owner answered within the SLO and a liveness budget (`HELD_WRITE_BOUND`). On main with
+>       A-351 (g225, the promotion gate) and A-354 (g230, `DurabilityPending` at the SLO), all four pass on a Mac Studio
+>       (2026-11-18): taken over in 2.23 to 2.67 s; held writes refused after 10.03 to 10.09 s, the stopped owner's
+>       answered after 2.57 s.
+>     - g230's: Continuity in five flows (A-329: a successor's positions no longer start again at 1) and the nemesis's
+>       fence lag.
 >
 > - **Fixed: a destroy was answered before its tombstone was placed** (record
 >   `docs/bugs/2026-11-06-a-destroy-was-answered-before-its-tombstone-was-placed.md`).
