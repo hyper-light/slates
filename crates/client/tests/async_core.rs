@@ -201,7 +201,7 @@ fn poll_until(client: &mut Client, daemon: &Daemon, id: RequestId) -> ReplyBody 
 
 /// Begins `List` and takes its reply, driving the ring until it lands.
 fn list_round_trip(client: &mut Client, daemon: &Daemon) {
-  let id = client.begin(&RequestBody::List).unwrap();
+  let id = client.begin(&RequestBody::List { after: None }).unwrap();
   client.begin_ack_if_due().unwrap();
   let _ = poll_until(client, daemon, id);
 }
@@ -231,7 +231,7 @@ fn an_awaited_reply_survives_any_drain_and_admission_refuses_at_the_bound() {
     .expect("the fixture explicitly creates its local consensus group");
   let mut client = connect(&instance);
 
-  let early = client.begin(&RequestBody::List).unwrap();
+  let early = client.begin(&RequestBody::List { after: None }).unwrap();
   drain_until_ready(&mut client, &daemon, early);
   let limit = fill_to_the_bound(&mut client, &daemon);
   for _ in 0..limit * 3 {
@@ -268,7 +268,7 @@ fn drain_until_ready(client: &mut Client, daemon: &Daemon, id: RequestId) {
 fn fill_to_the_bound(client: &mut Client, daemon: &Daemon) -> usize {
   let mut held = Vec::new();
   let limit = loop {
-    match client.begin(&RequestBody::List) {
+    match client.begin(&RequestBody::List { after: None }) {
       Ok(id) => held.push(id),
       Err(ClientError::TooManyOutstanding { limit }) => break limit,
       Err(e) => panic!("{e}"),
@@ -287,7 +287,7 @@ fn fill_to_the_bound(client: &mut Client, daemon: &Daemon) -> usize {
 
 /// An abandoned call's buffered reply is gone, and a late reply to an abandoned call is dropped and counted.
 fn assert_abandoned_replies_are_dropped(client: &mut Client, daemon: &Daemon) {
-  let abandoned = client.begin(&RequestBody::List).unwrap();
+  let abandoned = client.begin(&RequestBody::List { after: None }).unwrap();
   drain_until_ready(client, daemon, abandoned);
   let dropped_before = client.unawaited_dropped();
   assert!(client.abandon(abandoned.word()));
@@ -295,7 +295,7 @@ fn assert_abandoned_replies_are_dropped(client: &mut Client, daemon: &Daemon) {
     client.poll_reply(abandoned).unwrap().is_none(),
     "an abandoned reply is gone"
   );
-  let late = client.begin(&RequestBody::List).unwrap();
+  let late = client.begin(&RequestBody::List { after: None }).unwrap();
   client.abandon(late.word());
   await_live(daemon, "the late reply arrives and is dropped", || {
     let _ = client.take_ready().unwrap();

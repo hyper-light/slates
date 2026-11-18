@@ -80,6 +80,10 @@ pub struct LandingState {
   pub grants: Grants,
   /// The runtime audit log (mirrored to `AuditRecord`).
   pub audit: Audit,
+  /// The audit records this shard's current atom built while it is not the control shard (A-265): sent to the control
+  /// partition, one batch, once the atom commits, and dropped with it when it is refused. Empty between atoms, so it
+  /// holds one atom's records at most.
+  pub audit_owed: Vec<DbAuditRecord>,
   /// The next landing id.
   pub next_landing: u64,
   /// A landing awaiting a grant: its id, the manifest it planned, the volume and the target,
@@ -198,6 +202,7 @@ impl Default for LandingState {
     LandingState {
       grants: Grants::default(),
       audit: Audit::new(AUDIT_RETAIN),
+      audit_owed: Vec::new(),
       next_landing: 1,
       awaiting: std::collections::BTreeMap::new(),
       in_flight: std::collections::BTreeMap::new(),
@@ -792,13 +797,15 @@ async fn run_presentation(mut job: PresentJob) {
     }
   };
   let request = job.request_id;
-  let _ = crate::state::with_state(|s| {
+  let Some(Some((reply, route, owed, (shard, budget)))) = crate::state::with_state(|s| {
     job.settle(s);
-    // A bypass policy (A-285): a planned presentation is granted by the policy and landed in this same request.
+    // A bypass policy (A-285): a planned presentation is granted by the policy and landed in this same request. Its
+    // reply, when it is not the landing's to give, goes out as a presentation's does: after its audit (A-265).
     let ended = match (job.bypass.take(), ended) {
       (Some(requested), Some(Ok(slates_land::engine::Planned::Presented(plan)))) => {
-        land_under_policy(s, &job, request, requested, plan);
-        return;
+        let (reply, route) = land_under_policy(s, &job, request, requested, plan)?;
+        let owed = std::mem::take(&mut s.landing.audit_owed);
+        return Some((reply, route, owed, (s.shard, s.config.failover_slo_ns)));
       }
       (_, ended) => ended,
     };
@@ -828,8 +835,14 @@ async fn run_presentation(mut job: PresentJob) {
         None => refused(Refusal::NotFound),
       }
     });
-    crate::image::deliver(s, reply, route);
-  });
+    let owed = std::mem::take(&mut s.landing.audit_owed);
+    Some((reply, route, owed, (s.shard, s.config.failover_slo_ns)))
+  }) else {
+    return;
+  };
+  // The presentation's record reaches the audit before its reply does (A-265).
+  append_owed_audit(shard, owed, budget).await;
+  let _ = crate::state::with_state(|s| crate::image::deliver(s, reply, route));
 }
 
 /// Lands a planned presentation under a bypass policy (A-285): the presentation is recorded, the policy issues its
@@ -838,6 +851,10 @@ async fn run_presentation(mut job: PresentJob) {
 /// the presentation, the grant and, when the landing could not start, the request's completion: a landing that starts
 /// answers the request itself when it ends. The landing plans again under the grant, so a volume changed since the
 /// presentation lands what the grant bound or is refused `GrantMismatch`, never something no one planned.
+///
+/// The reply and its route once the transaction commits, for the caller to deliver after the audit records the atom
+/// owed the control partition (A-265); `None` when the landing took the request over, whose own completion answers it.
+/// Then the atom's owed records are sent at once, so none waits on this shard's next atom.
 #[cfg(unix)]
 fn land_under_policy(
   s: &mut ShardState,
@@ -845,7 +862,7 @@ fn land_under_policy(
   request: (u64, slates_wire::request::RequestId),
   requested: Requested,
   plan: Box<slates_land::engine::Presented>,
-) {
+) -> Option<(ReplyBody, Option<crate::merge_service::ReplyRoute>)> {
   let route = crate::image::take_in_flight(s, request);
   s.db.begin();
   s.current_request = Some(request);
@@ -901,11 +918,13 @@ fn land_under_policy(
   let route = s.reply_route.take();
   let (origin, id) = request;
   if std::mem::take(&mut s.acceptance_deferred) {
-    // The granted landing took the request over and answers it when it ends; what led to it commits now.
+    // The granted landing took the request over and answers it when it ends; what led to it commits now, and the
+    // presentation's and the grant's audit records go to the control partition now (A-265).
     if s.db.commit(&mut s.segment).is_err() {
       crate::verbs::reconcile_unpublished_effects(s);
     }
-    return;
+    send_owed_audit(s);
+    return None;
   }
   let reply = crate::verbs::record_completion(s, origin, id, reply);
   let reply = match s.db.commit(&mut s.segment) {
@@ -915,7 +934,7 @@ fn land_under_policy(
       refused(crate::error::refusal_of_db(&e))
     }
   };
-  crate::image::deliver(s, reply, route);
+  Some((reply, route))
 }
 
 /// The reply to a landing the engine did not land: its presentation when it needs a grant, else the typed
@@ -932,13 +951,23 @@ fn not_landed(
     // The engine hands back every entry's report; the refusal names the conflicting ones alone (§4.15: a conflict
     // refuses the whole landing, and the person resolving it needs only the entries in conflict). Before 2026-10-06
     // every entry was named, so an entry that would only have been created read as a conflict.
-    LandingRefusal::Conflict(entries) => refused(Refusal::LandingConflict {
-      entries: entries
+    LandingRefusal::Conflict(entries) => {
+      let conflicting: Vec<String> = entries
         .iter()
         .filter(|e| matches!(e.verdict, Some(slates_land::verdict::Verdict::Conflict(_))))
         .map(|e| e.path.to_string())
-        .collect(),
-    }),
+        .collect();
+      // As many as one reply holds, the rest counted (A-267): presenting again lists every one.
+      let room = crate::verbs::reply_room(&refused(Refusal::LandingConflict {
+        entries: Vec::new(),
+        entries_elided: 0,
+      }));
+      let (entries, entries_elided) = crate::verbs::carried(conflicting, room);
+      refused(Refusal::LandingConflict {
+        entries,
+        entries_elided,
+      })
+    }
     LandingRefusal::LeaseHeld(held) => refused(Refusal::LandingLeaseHeld {
       holder: held.holder,
     }),
@@ -1037,6 +1066,14 @@ fn defer_granted_landing(state: &mut ShardState, mut prepared: Prepared) -> Repl
     };
     let finished =
       drive_granted_landing(prepared, taken, request, cause, (renew, key.clone())).await;
+    // The landing's records reach the audit before its reply does (A-265).
+    let finished = match finished {
+      Some((reply, route, owed)) => {
+        append_owed_audit(shard, owed, term).await;
+        Some((reply, route))
+      }
+      None => None,
+    };
     // The lease goes before the reply, so the caller's next landing into the target finds it free.
     let released = !held
       || crate::xshard::call_within(
@@ -1144,6 +1181,25 @@ enum Stepped {
   Ended(Box<Result<LandingReport, LandingRefusal>>),
 }
 
+/// A granted landing's completed reply, where it goes, and the audit records its completion owed the control partition
+/// (A-265), sent before the reply.
+#[cfg(unix)]
+type Finished = (
+  ReplyBody,
+  Option<crate::merge_service::ReplyRoute>,
+  Vec<DbAuditRecord>,
+);
+
+/// `completed` with the audit records its atom owed, taken in the same turn of the shard, so no other verb's send
+/// takes them first (`send_owed_audit`).
+#[cfg(unix)]
+fn owing(
+  state: &mut ShardState,
+  (reply, route): (ReplyBody, Option<crate::merge_service::ReplyRoute>),
+) -> Finished {
+  (reply, route, std::mem::take(&mut state.landing.audit_owed))
+}
+
 /// Drives a granted landing under its lease: begins it, steps it one slice per turn of the shard (yielding
 /// between, so the shard serves its other clients, lease checks and shutdown while a large landing runs),
 /// and finishes it where its records and the request's completion commit as one atom.
@@ -1154,7 +1210,7 @@ async fn drive_granted_landing(
   request: (u64, slates_wire::request::RequestId),
   cause: Option<slates_wire::observe::SpanContext>,
   (renew, key): (LeaseAsk, String),
-) -> Option<(ReplyBody, Option<crate::merge_service::ReplyRoute>)> {
+) -> Option<Finished> {
   let mut granted = match start_granted(prepared, lease, renew, &key).await? {
     Begun::Running(granted) => granted,
     ended => return finish_unrun(request, cause, ended),
@@ -1180,12 +1236,16 @@ async fn drive_granted_landing(
         recall_before_finish(&mut granted, renew, &key).await;
         let outcome = advance_granted(&mut granted, renew, &key).await?;
         return crate::state::with_state(move |s| {
-          complete_landing_with(s, request, cause, |s| complete_finish(s, *granted, outcome))
+          let completed =
+            complete_landing_with(s, request, cause, |s| complete_finish(s, *granted, outcome));
+          owing(s, completed)
         });
       }
       Stepped::Ended(ended) => {
         return crate::state::with_state(move |s| {
-          complete_landing_with(s, request, cause, |s| complete_finish(s, *granted, *ended))
+          let completed =
+            complete_landing_with(s, request, cause, |s| complete_finish(s, *granted, *ended));
+          owing(s, completed)
         });
       }
     }
@@ -1235,9 +1295,10 @@ fn finish_unrun(
   request: (u64, slates_wire::request::RequestId),
   cause: Option<slates_wire::observe::SpanContext>,
   ended: Begun,
-) -> Option<(ReplyBody, Option<crate::merge_service::ReplyRoute>)> {
+) -> Option<Finished> {
   crate::state::with_state(move |s| {
-    complete_landing_with(s, request, cause, |s| answer_unrun(s, ended))
+    let completed = complete_landing_with(s, request, cause, |s| answer_unrun(s, ended));
+    owing(s, completed)
   })
 }
 
@@ -2236,6 +2297,7 @@ pub(crate) fn deferred_reply() -> ReplyBody {
       barriers: 0,
       stage: slates_ipc::protocol::LandingStage::Planning,
       verification: slates_ipc::protocol::Verification::Unsigned,
+      degraded_elided: 0,
     },
   }
 }
@@ -2419,6 +2481,25 @@ fn present(
     landing_verdict(state, (ids.volume, ids.target, &hash), signature);
   let summary = summary_of(&manifest);
   let landing_id = ids.landing_id;
+  // The presentation's reply must fit one reply whatever it carries (A-267), and its statement names the target
+  // (A-321): a target too long to be answered beside this summary and verdict is refused here, before anything is
+  // recorded, with the longest this presentation's reply holds.
+  if let Some(longest) = presentation_overflow(
+    &ReplyBody::GrantRequired {
+      landing: landing_id,
+      manifest: hash,
+      summary: summary.clone(),
+      conflicts: Vec::new(),
+      statement: statement.clone(),
+      verification,
+      conflicts_elided: u32::MAX,
+    },
+    ids.target.len(),
+  ) {
+    return refused(Refusal::Target {
+      refusal: slates_ipc::protocol::TargetRefusal::TooLong { longest },
+    });
+  }
   // A client presenting the same volume and target again replaces its earlier presentation, whose id is no
   // longer grantable (AUD-29-07): re-planning costs no room.
   state.landing.awaiting.retain(|_, awaiting| {
@@ -2451,27 +2532,36 @@ fn present(
     written: 0,
     conflicts: u32::try_from(conflicts.len()).unwrap_or(u32::MAX),
   };
-  let ops = [
-    Op::LandingRecorded { record },
-    Op::AuditAppended {
-      record: DbAuditRecord {
-        seq: 0,
-        at_ns: now,
-        kind: DbAuditKind::LandingPlanned,
-        principal: principal.clone(),
-        grant: None,
-        landing: Some(landing_id),
-        manifest: Some(hash),
-        outcome: None,
-        signature: crate::signed_work::to_record(&verification),
-      },
-    },
-  ];
-  for op in &ops {
-    if let Err(e) = state.db.mutate(&mut state.segment, op, now) {
-      return refused(crate::error::refusal_of_db(&e));
-    }
+  let planned = DbAuditRecord {
+    seq: 0,
+    at_ns: now,
+    kind: DbAuditKind::LandingPlanned,
+    principal: principal.clone(),
+    grant: None,
+    landing: Some(landing_id),
+    manifest: Some(hash),
+    outcome: None,
+    signature: crate::signed_work::to_record(&verification),
+  };
+  if let Err(e) = state
+    .db
+    .mutate(&mut state.segment, &Op::LandingRecorded { record }, now)
+    .and_then(|_| write_audit(state, vec![planned], now))
+  {
+    return refused(crate::error::refusal_of_db(&e));
   }
+  // The presentation is recorded, so its reply must always fit (A-267): the conflicts one reply holds beside the
+  // summary, the rest counted; every entry, its conflict among it, is read a page at a time (`LandingEntries`).
+  let room = crate::verbs::reply_room(&ReplyBody::GrantRequired {
+    landing: landing_id,
+    manifest: hash,
+    summary: summary.clone(),
+    conflicts: Vec::new(),
+    statement: statement.clone(),
+    verification,
+    conflicts_elided: 0,
+  });
+  let (conflicts, conflicts_elided) = crate::verbs::carried(conflicts, room);
   ReplyBody::GrantRequired {
     landing: landing_id,
     manifest: hash,
@@ -2479,6 +2569,7 @@ fn present(
     conflicts,
     statement,
     verification,
+    conflicts_elided,
   }
 }
 
@@ -2575,27 +2666,34 @@ fn finish(
       conflicts: record.conflicts,
     }
   }];
-  // Mirror this run's audit records into the durable log, each once: the ring's records of the landing from the run's
-  // beginning on. Before 2026-11-18 every record the ring held for the landing's id was mirrored, so a presented landing's
-  // plan, which its presentation had recorded, was recorded again, and a resumed landing re-recorded its first attempt.
-  for audit in state.landing.audit.records() {
-    if audit.landing == landing_id && audit.seq >= audit_from {
-      ops.push(Op::AuditAppended {
-        record: db_audit(audit, principal, &verification),
-      });
-    }
-  }
   ops.extend(closing_ops(state, ids, grant));
+  // Mirror this run's audit records into the durable log, on the control partition (A-265), each once: the ring's
+  // records of the landing from the run's beginning on. Before 2026-11-18 every record the ring held for the landing's
+  // id was mirrored, so a presented landing's plan, which its presentation had recorded, was recorded again, and a
+  // resumed landing re-recorded its first attempt.
+  let records: Vec<DbAuditRecord> = state
+    .landing
+    .audit
+    .records()
+    .into_iter()
+    .filter(|audit| audit.landing == landing_id && audit.seq >= audit_from)
+    .map(|audit| db_audit(audit, principal, &verification))
+    .collect();
   for op in &ops {
     if let Err(e) = state.db.mutate(&mut state.segment, op, now) {
       return refused(crate::error::refusal_of_db(&e));
     }
   }
+  if let Err(e) = write_audit(state, records, now) {
+    return refused(crate::error::refusal_of_db(&e));
+  }
+  // A grant whose consumption committed leaves the runtime table as it left the durable one (A-266).
+  end_grants_recorded_ended(state, &ops);
   if let Some(refusal) = publish_landed(state, ids, report) {
     return refusal;
   }
-  ReplyBody::Landed {
-    outcome: LandingOutcome {
+  landed_reply(
+    LandingOutcome {
       landing: landing_id,
       state: landing_state_name(db_state),
       stage: wire_landing_stage(db_state),
@@ -2606,12 +2704,67 @@ fn finish(
       bytes_written: report.bytes_written,
       held: u64::try_from(report.held).unwrap_or(u64::MAX),
       durability: durability_of(&report.durability),
-      degraded: report.degraded.iter().map(degradation_of).collect(),
+      degraded: Vec::new(),
       barriers: u64::try_from(report.barriers).unwrap_or(u64::MAX),
       verification,
+      degraded_elided: 0,
+    },
+    report.degraded.iter().map(degradation_of).collect(),
+  )
+}
+
+/// A finished landing's reply (§4.15 step 9): `outcome` with as many of `degraded` as one reply holds beside it, the
+/// rest counted (A-267). The landing has run, so its reply must always fit: a host that refuses every directory's sync
+/// meets a degraded cell a directory, and a landing over hundreds of directories met more than a reply holds.
+#[cfg(unix)]
+pub(crate) fn landed_reply(
+  outcome: LandingOutcome,
+  degraded: Vec<slates_ipc::protocol::LandingDegradation>,
+) -> ReplyBody {
+  let room = crate::verbs::reply_room(&ReplyBody::Landed {
+    outcome: outcome.clone(),
+  });
+  let (degraded, degraded_elided) = crate::verbs::carried(degraded, room);
+  ReplyBody::Landed {
+    outcome: LandingOutcome {
+      degraded,
+      degraded_elided,
+      ..outcome
     },
   }
 }
+
+/// Ends in the runtime table every grant `ops` recorded at a terminal step (A-266), once those ops committed.
+#[cfg(unix)]
+fn end_grants_recorded_ended(state: &mut ShardState, ops: &[Op]) {
+  for op in ops {
+    if let Op::GrantStateChanged { id, state: ended } = op
+      && !matches!(ended, DbGrantState::Issued)
+    {
+      state.landing.grants.end(slates_land::grant::GrantId(*id));
+    }
+  }
+}
+
+/// The grants past their term end (A-266), once a reap tick: each is recorded `Expired`, which takes it out of the
+/// durable table, and then leaves the runtime one. A grant that cannot be recorded stays, and the next tick tries
+/// again; one in use by a running landing is unaffected, since the run holds its own copy of the grant it checked.
+pub fn end_expired_grants(state: &mut ShardState) {
+  let now = state.clock.monotonic_ns();
+  for id in state.landing.grants.expired_at(now) {
+    let op = Op::GrantStateChanged {
+      id: id.0,
+      state: DbGrantState::Expired,
+    };
+    if state.db.mutate(&mut state.segment, &op, now).is_ok() {
+      state.landing.grants.end(id);
+      state.count(GRANTS_EXPIRED, 1);
+    }
+  }
+}
+
+/// Counter: grants ended at their term by the reap tick's sweep (A-266).
+pub const GRANTS_EXPIRED: &str = "landing.grants_expired";
 
 /// The ops that close a finished landing's records: its grant's transition, and the volume's new base when
 /// the landing made a scratch volume an overlay.
@@ -3220,15 +3373,11 @@ pub fn issue_grant(
     outcome: None,
     signature: None,
   };
-  for op in [
-    Op::GrantIssued { record },
-    Op::AuditAppended { record: audit },
-  ] {
-    state
-      .db
-      .mutate(&mut state.segment, &op, now)
-      .map_err(|e| crate::error::refusal_of_db(&e))?;
-  }
+  state
+    .db
+    .mutate(&mut state.segment, &Op::GrantIssued { record }, now)
+    .and_then(|_| write_audit(state, vec![audit], now))
+    .map_err(|e| crate::error::refusal_of_db(&e))?;
   Ok(id.0)
 }
 
@@ -3273,15 +3422,21 @@ pub fn restore_grants(state: &mut ShardState) {
       },
     });
   }
+  // The table holds live grants only (A-266): an ended grant's id is known by the partition's mark alone.
+  let issued_through = state.db.partition().grants_issued_through();
+  state.landing.grants.restore_issued_through(issued_through);
 }
 
 /// The caller's grants, from the durable records.
-pub fn grants_verb(state: &ShardState, principal: &Principal) -> ReplyBody {
+pub(crate) fn grants_part(
+  state: &ShardState,
+  principal: &Principal,
+  after: Option<u64>,
+) -> crate::verbs::PagePart<GrantSummary> {
   let grants = state
     .db
     .partition()
-    .grants_of(principal)
-    .into_iter()
+    .grants_of_after(principal, after)
     .map(|g| GrantSummary {
       id: g.id,
       volume: to_wire_volume(g.volume),
@@ -3290,43 +3445,215 @@ pub fn grants_verb(state: &ShardState, principal: &Principal) -> ReplyBody {
       scope: wire_grant_scope(&g.scope),
       state: grant_state_name(g.state),
       grant_state: wire_grant_state(g.state),
-    })
-    .collect();
-  ReplyBody::Grants { grants }
+    });
+  // `grants_of_after` walks the partition's grants in id order from the cursor, lazily, so the first that fit are the
+  // page's and the walk stops there.
+  let (items, more) = crate::verbs::fitting(grants, grants_page_room());
+  crate::verbs::PagePart { items, more }
 }
 
-/// The audit log from `since`, from the durable records.
+/// The bytes a grants page's summaries may take: one reply chunk less the page's own framing, its cursor included.
+pub(crate) fn grants_page_room() -> usize {
+  let chunk = usize::try_from(crate::config::bulk_chunk_bytes()).unwrap_or(usize::MAX);
+  let empty = ReplyBody::Grants {
+    grants: Vec::new(),
+    next: Some(u64::MAX),
+  };
+  chunk.saturating_sub(slates_ipc::protocol::framed_len(&empty))
+}
+
+/// The longest target `skeleton`'s presentation could carry when it does not fit one reply chunk (§4.3; A-267): a
+/// presentation's reply carries the target in the statement a signature over it signs (A-321), so a reply past the
+/// chunk is short of exactly its overflow in target bytes. `None` when the reply fits, conflicts aside (they are
+/// carried as far as the room left holds and counted past it).
+#[cfg(unix)]
+fn presentation_overflow(skeleton: &ReplyBody, target_len: usize) -> Option<u64> {
+  let chunk = usize::try_from(crate::config::bulk_chunk_bytes()).unwrap_or(usize::MAX);
+  let overflow = slates_ipc::protocol::framed_len(skeleton).checked_sub(chunk)?;
+  (overflow > 0).then(|| u64::try_from(target_len.saturating_sub(overflow)).unwrap_or(u64::MAX))
+}
+
+/// Derived: the longest landing target, in bytes, a grant's summary on one grants page holds alone (§4.15, §4.3): the
+/// page's room less a summary with an empty target in its longest state. A grant is issued for a presented landing and
+/// listed with its target, so a presentation past it is refused `TargetUnavailable` before anything is made. A `land`
+/// request carries a target of about 4,046 bytes, past what a page held beside a grant's other fields (2026-11-08).
+pub fn longest_grantable_target() -> usize {
+  let longest_state = [
+    DbGrantState::Issued,
+    DbGrantState::Consumed,
+    DbGrantState::Expired,
+    DbGrantState::Revoked,
+  ]
+  .into_iter()
+  .map(grant_state_name)
+  .max_by_key(String::len)
+  .unwrap_or_default();
+  let untargeted = GrantSummary {
+    id: u64::MAX,
+    volume: VolumeId::default(),
+    target: String::new(),
+    manifest: [u8::MAX; 32],
+    scope: slates_ipc::protocol::GrantScope::Session,
+    state: longest_state,
+    grant_state: slates_ipc::protocol::GrantState::Issued,
+  };
+  grants_page_room().saturating_sub(crate::verbs::encoded_len(&untargeted))
+}
+
+/// The grants page the shards' `parts` make: their grants in id order, as many as one reply chunk holds, and the
+/// cursor past the last when any part, or the merge, left more.
+pub(crate) fn grants_page(parts: Vec<crate::verbs::PagePart<GrantSummary>>) -> ReplyBody {
+  let (grants, more) = crate::verbs::merged_page(parts, grants_page_room(), |grant| grant.id);
+  let next = more.then(|| grants.last().map(|grant| grant.id)).flatten();
+  ReplyBody::Grants { grants, next }
+}
+
+/// One page of the audit (§4.15, A-265), answered on the control shard, whose partition holds every record: the
+/// retained records from sequence `since` on, as many as one reply chunk holds, and whether more follow.
 pub fn audit_verb(state: &ShardState, since: u64) -> ReplyBody {
-  let records = state
-    .db
-    .partition()
-    .audit()
-    .iter()
-    .filter(|r| r.seq >= since)
-    .map(|r| AuditEntry {
-      seq: r.seq,
-      at_ns: r.at_ns,
-      kind: audit_kind_name(r.kind),
-      grant: r.grant,
-      landing: r.landing,
-      manifest: r.manifest,
-      outcome: r.outcome.map(landing_state_name),
-      audit_kind: wire_audit_kind(r.kind),
-      stage: r.outcome.map(wire_landing_stage),
+  let room = audit_page_room();
+  let mut used = 0usize;
+  let mut records = Vec::new();
+  let mut more = false;
+  // A seek to `since`, so a page costs what it carries, never the retained window (A-267).
+  for record in state.db.partition().audit_from(since) {
+    let entry = AuditEntry {
+      seq: record.seq,
+      at_ns: record.at_ns,
+      kind: audit_kind_name(record.kind),
+      grant: record.grant,
+      landing: record.landing,
+      manifest: record.manifest,
+      outcome: record.outcome.map(landing_state_name),
+      audit_kind: wire_audit_kind(record.kind),
+      stage: record.outcome.map(wire_landing_stage),
       // A record of a landing as a whole — its presentation, a granted run's plan, its finish — says how the landing's
       // signature was judged (A-321), unsigned when it carried none; no other record judges one. A verdict this build
       // names no code for (a newer build's record) reads as none.
       verification: matches!(
-        r.kind,
+        record.kind,
         slates_db::catalog::AuditKind::LandingPlanned
           | slates_db::catalog::AuditKind::LandingFinished
       )
-      .then(|| crate::signed_work::of_record(r.signature))
+      .then(|| crate::signed_work::of_record(record.signature))
       .flatten(),
-    })
-    .collect();
-  ReplyBody::Audit { records }
+    };
+    let bytes = crate::verbs::encoded_len(&entry);
+    if !records.is_empty() && used.saturating_add(bytes) > room {
+      more = true;
+      break;
+    }
+    used = used.saturating_add(bytes);
+    records.push(entry);
+  }
+  ReplyBody::Audit { records, more }
 }
+
+/// The bytes an audit page's records may take: one reply chunk less the page's own framing (§4.3). A record is a fixed
+/// kind name, ids, a manifest hash and a terminal state's name, so every record fits a page alone.
+pub(crate) fn audit_page_room() -> usize {
+  let chunk = usize::try_from(crate::config::bulk_chunk_bytes()).unwrap_or(usize::MAX);
+  let empty = ReplyBody::Audit {
+    records: Vec::new(),
+    more: true,
+  };
+  chunk.saturating_sub(slates_ipc::protocol::framed_len(&empty))
+}
+
+/// Format: the partition that holds the audit (§4.15 "written through the control shard", §4.8's one `AuditLog`):
+/// the control shard's, the first of the daemon's shards.
+pub(crate) const AUDIT_PARTITION: u16 = 0;
+
+/// Writes `records` to the audit (A-265): applied in the current atom when this shard is the control shard, else owed
+/// to it, as one batch the atom's caller sends once the atom commits ([`send_owed_audit`], [`append_owed_audit`]).
+fn write_audit(
+  state: &mut ShardState,
+  records: Vec<DbAuditRecord>,
+  now: u64,
+) -> Result<(), slates_db::DbError> {
+  if state.partition != AUDIT_PARTITION {
+    state.landing.audit_owed.extend(records);
+    return Ok(());
+  }
+  for record in records {
+    state
+      .db
+      .mutate(&mut state.segment, &Op::AuditAppended { record }, now)?;
+  }
+  Ok(())
+}
+
+/// Appends a batch of audit records another shard's atom owed (A-265), on the control shard, as one transaction:
+/// whether it committed. A record's sequence is the control partition's next, decided as it applies.
+fn append_audit_batch(state: &mut ShardState, records: Vec<DbAuditRecord>) -> bool {
+  let now = state.clock.monotonic_ns();
+  state.db.begin();
+  let applied = records.into_iter().all(|record| {
+    state
+      .db
+      .mutate(&mut state.segment, &Op::AuditAppended { record }, now)
+      .is_ok()
+  });
+  let committed = state.db.commit(&mut state.segment).is_ok();
+  if !(applied && committed) {
+    state.count(AUDIT_UNAPPENDED, 1);
+  }
+  applied && committed
+}
+
+/// Sends what this shard's committed verb owed the audit to the control shard (A-265), a counted refusal when it
+/// cannot reach it ([`AUDIT_UNAPPENDED`]): after a sync verb's transaction (`verbs::run_recorded`), which cannot wait.
+/// Nothing when nothing is owed. A refused transaction's owed records went with it (`reconcile_unpublished_effects`).
+pub(crate) fn send_owed_audit(state: &mut ShardState) {
+  if state.landing.audit_owed.is_empty() {
+    return;
+  }
+  let records = std::mem::take(&mut state.landing.audit_owed);
+  let Some(control) = crate::verbs::shard_of_partition(state, AUDIT_PARTITION) else {
+    state.count(AUDIT_UNAPPENDED, 1);
+    return;
+  };
+  crate::xshard::run_on_waiting(
+    state.shard,
+    control,
+    move |s| {
+      append_audit_batch(s, records);
+    },
+    AUDIT_UNAPPENDED,
+  );
+}
+
+/// Appends `owed` on the control shard and waits for it, at most `budget_ns` (A-265): a task's completion owed it, and
+/// its reply waits on it, so the caller's next `audit` reads it. Whether it was appended; counted when not.
+#[cfg(unix)]
+async fn append_owed_audit(shard: u16, owed: Vec<DbAuditRecord>, budget_ns: u64) -> bool {
+  if owed.is_empty() {
+    return true;
+  }
+  let control =
+    crate::state::with_state(|s| crate::verbs::shard_of_partition(s, AUDIT_PARTITION)).flatten();
+  let answered = match control {
+    Some(control) => {
+      crate::xshard::call_within(
+        shard,
+        control,
+        move |s| append_audit_batch(s, owed),
+        budget_ns,
+      )
+      .await
+    }
+    None => None,
+  };
+  // A batch the control shard refused is counted there; one that never reached it, here.
+  if answered.is_none() {
+    let _ = crate::state::with_state(|s| s.count(AUDIT_UNAPPENDED, 1));
+  }
+  answered.unwrap_or(false)
+}
+
+/// Format: the landing-plane counter of an audit batch that did not reach the control partition (A-265): refused at
+/// its channel, unanswered within its budget, or refused by its transaction.
+pub(crate) const AUDIT_UNAPPENDED: &str = "landing.audit_unappended";
 
 fn to_wire_volume(id: DbVolumeId) -> VolumeId {
   VolumeId { bytes: id.bytes }
@@ -3839,5 +4166,109 @@ mod tests {
       }),
       "the domain tag is part of the proof"
     );
+  }
+}
+
+#[cfg(all(test, unix))]
+mod landed_reply_tests {
+  use slates_ipc::protocol::{
+    HostAnswer, LandingDegradation, LandingDurability, LandingOutcome, ReplyBody, framed_len,
+  };
+
+  /// Shape: the degraded cells the test's landing met: one a directory, several replies' worth at these paths.
+  const CELLS: usize = 400;
+
+  /// A-267 (§4.15 step 9). Do: build a finished landing's reply that met 400 directory syncs the host refused (one a
+  /// directory, as a filesystem that refuses a directory's sync answers every one), each directory's path about eighty
+  /// bytes. Expect: the reply fits one reply chunk, carrying the first cells in the order met and counting the rest,
+  /// the two making 400. Before, every cell rode in the reply, and one this long was refused "reply too large for the
+  /// bulk area" after the landing had run.
+  #[test]
+  fn a_landing_that_met_more_degraded_cells_than_one_reply_holds_still_answers() {
+    let degraded: Vec<LandingDegradation> = (0..CELLS)
+      .map(|n| LandingDegradation::Unsynced {
+        dir: format!("/a-directory-whose-sync-the-host-refused-as-a-network-filesystem-may-{n:05}"),
+        answer: HostAnswer::Errno { errno: 22 },
+      })
+      .collect();
+    let outcome = LandingOutcome {
+      landing: 7,
+      state: "done".to_owned(),
+      written: 1,
+      skipped: 0,
+      conflicts: 0,
+      failed: 0,
+      bytes_written: 1,
+      held: 1,
+      durability: LandingDurability {
+        data_synced: true,
+        dirs_synced: false,
+        media: false,
+        media_requested: false,
+        dirs: 0,
+      },
+      degraded: Vec::new(),
+      barriers: 1,
+      stage: slates_ipc::protocol::LandingStage::Done,
+      verification: slates_ipc::protocol::Verification::Unsigned,
+      degraded_elided: 0,
+    };
+    let reply = super::landed_reply(outcome, degraded.clone());
+    let chunk = usize::try_from(crate::config::bulk_chunk_bytes()).unwrap();
+    assert!(framed_len(&reply) <= chunk, "the reply fits one chunk");
+    let ReplyBody::Landed { outcome } = reply else {
+      panic!("a landing's reply");
+    };
+    assert!(outcome.degraded_elided > 0, "the test outgrows one reply");
+    assert_eq!(
+      outcome.degraded.len() + outcome.degraded_elided as usize,
+      CELLS
+    );
+    assert_eq!(
+      outcome.degraded,
+      degraded[..outcome.degraded.len()],
+      "the first cells, in the order met"
+    );
+  }
+
+  /// A presentation's reply at `target`: its statement names the target (A-321), with no conflict, the summary and
+  /// verdict at their smallest, and the conflicts' count at its widest.
+  fn presentation(target: &str) -> ReplyBody {
+    ReplyBody::GrantRequired {
+      landing: u64::MAX,
+      manifest: [u8::MAX; 32],
+      summary: slates_ipc::protocol::LandingSummary {
+        by_action: Vec::new(),
+        bytes: u64::MAX,
+        filtered_out: u64::MAX,
+        actions: slates_ipc::protocol::ActionTally::default(),
+      },
+      conflicts: Vec::new(),
+      statement: crate::signed_work::landing_statement(&[u8::MAX; 16], target, &[u8::MAX; 32]),
+      verification: slates_ipc::protocol::Verification::Unsigned,
+      conflicts_elided: u32::MAX,
+    }
+  }
+
+  /// A-267 with A-321's statement (§4.15 step 2, §4.3). Do: size a presentation's reply whose statement names a target
+  /// as long as a grant's listing takes, then one as long as the guard names. Expect the first past one reply chunk,
+  /// the guard naming a longest shorter than its target, and the second within the chunk with the guard silent: a
+  /// presentation is answered whole or refused before anything is recorded. Since the statement joined the reply
+  /// (main's signed landings, 2026-11-18), a target the listing takes could make a reply no chunk holds, refused "reply
+  /// too large" after the presentation was recorded.
+  #[test]
+  fn a_presentation_too_long_for_one_reply_names_the_longest_that_fits() {
+    let chunk = usize::try_from(crate::config::bulk_chunk_bytes()).unwrap();
+    let listed = "t".repeat(super::longest_grantable_target());
+    let longest = super::presentation_overflow(&presentation(&listed), listed.len())
+      .expect("a grant's longest target overflows a presentation's reply");
+    let longest = usize::try_from(longest).unwrap();
+    assert!(longest < listed.len(), "{longest} of {}", listed.len());
+    let fitting = "t".repeat(longest);
+    assert!(
+      super::presentation_overflow(&presentation(&fitting), fitting.len()).is_none(),
+      "the longest named fits"
+    );
+    assert!(framed_len(&presentation(&fitting)) <= chunk);
   }
 }
