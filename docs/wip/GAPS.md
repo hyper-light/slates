@@ -29,8 +29,25 @@
 >   else the stream ends typed and counted. The owner view then has to be kept with the attachment's record.
 > - Shards' side, after its v0.8.0 tag and landed by its coordinator from signed branches: its guest test over a
 >   slates stream on Linux and macOS (`tests/slates_fs.rs`, Windows only today), the bump of the slates revision it
->   pins (f71282e1f), the WHP window patches 0001 to 0003 (`docs/wip/shards-patches/`), and `shards restore` handing a
+>   pins (f71282e1f, now f524cd817 or newer), the WHP window patches 0001 to 0003 (handed to it as the signed branch
+>   `agents/g268-whp-window-edge-cases`, 2026-11-18, their record renumbered PM M620), and `shards restore` handing a
 >   restored VM a served share (`--slates-fs-fd`, `--slates-fs-handle`) with a real-VM test of a save and a restore.
+> - Until the restart's resync is agreed, a daemon's death ends the stream: the device reads the end, and recovery
+>   removes the guest's record, counted in its report's `attachments_dropped` (Shards' option (a)).
+
+> **What Hex and Mantle need from slates (2026-11-18, goal g268).**
+> - **Hex** reaches other products only through a trait with a simulator and one conformance suite (its `CLAUDE.md`
+>   §9). **Built (A-310):** `slates_api::Volumes`, implemented by `Instance` and by `SimVolumes`, held to one suite
+>   (`crates/api/tests/api.rs`). **Owed:** a typed class for a pinned snapshot's destroy, answered `Invalid::Request`
+>   today (the contract's, goal g262); Hex's own use of the seam when it takes slates (kiln's plan T7, CP-T7.8 and
+>   CP-T7.13). **Decided (Ada, 2026-11-18):** Hex's microVM disks stay per machine (its D281); slates workspaces alone
+>   replicate across runners (g267's entry).
+> - **Mantle**'s agent, asked on 2026-11-18 whether it waits on slates, has not answered; its kiln track (plan T10)
+>   puts kiln's bytes on Mantle through kiln's `Blobs`, and two of its steps reach slates, neither started: CP-T10.4 keeps slates snapshots on Mantle, which needs a snapshot's
+>   archive taken out through `slates-api` and a volume made from one (the archive exists inside the daemon, for the
+>   fleet's copies and a takeover, with no verb for a host); CP-T10.5 lays a slates overlay over Mantle's objects until
+>   Mantle's file system ships, which needs a base read from an object store rather than a host folder (§4.15 knows
+>   only a host folder). Both wait on T10.1 to T10.3.
 
 > **Open (g267, 2026-11-18): a volume moves between fleet nodes, and kiln's runners form the fleet.** Kiln moves an
 > agent between runners only without a volume (`harness/relocate.rs` refuses one), so the work owed is §4.10's
