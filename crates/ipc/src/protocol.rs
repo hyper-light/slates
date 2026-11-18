@@ -3356,7 +3356,8 @@ pub enum RecoveryCause {
   /// one attempt. Every verb on it answers this rather than waiting without end. Appended.
   TakeoverIncomplete {
     /// What the last attempt waited on: `promises` (a recovery cohort never gave its quorum of promises in the takeover
-    /// round, A-304), `catalog` (its catalog register or that register's placement never adopted), `catalog_placement`,
+    /// round, A-304), `quorum` (a recovery cohort has fewer members left than its recovery quorum: the object is lost),
+    /// `catalog` (its catalog register or that register's placement never adopted), `catalog_placement`,
     /// `content` (a volume's content not held here, and not served whole by a recorded holder), `live` (a live-shipped
     /// volume's log), `shard` (no shard here for its partition), `chain` (a version's record not known here: the adopted
     /// version beyond this node's accepted records), `inputs` (an input its ledger names not held here, and not served

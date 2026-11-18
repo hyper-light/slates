@@ -5412,11 +5412,14 @@ refinement and revalidation before those results can be applied to the corrected
 > (`verbs::materialize_taken_over`, the green's, and an adopted tombstone's record). A catalog register given up records nothing of its own: its volume waits for it in
 > the materialization and is given up there, naming `catalog`. A given-up volume is answered on its owner shard and never
 > forwarded (`verbs::owned_by_another_host`): forwarded, it met this node's own routing and answered `Overloaded` for good
-> on any fleet of more than one node, the materialization's give-ups too (proven on a lone node, which never forwards).
+> on any fleet of more than one node, the materialization's give-ups too (proven on a lone node, which never forwards). A
+> lost object (a cohort left with fewer members than its recovery quorum) is recorded the same way, naming `quorum`
+> (`takeover::record_lost`); before, it too answered `Overloaded` for as long as the daemon ran.
 > Regressions:
 > `a_taken_over_object_a_survivor_never_promises_is_given_up_by_name` (three nodes; each survivor leaves the other's
 > takeover questions unanswered, `Daemon::inject_takeover_silence`; the owner stops) and
-> `a_promise_wait_counts_only_periods_with_no_new_promise_and_no_page_advance`.
+> `a_promise_wait_counts_only_periods_with_no_new_promise_and_no_page_advance`, and for a lost object
+> `a_taken_over_object_whose_cohort_lost_its_quorum_is_refused_by_name` (five nodes; the owner and a holder stop together).
 
 **Neighbourhood changes.** A host's neighbourhood changes only through the group (a member
 left, a fresh member joined, a rebalancing). While a change is in flight the owner writes to a
@@ -21682,6 +21685,9 @@ materialization; an unrecovered volume is answered on its owner shard, never for
   `Overloaded` for good, so on a fleet of more than one node no client ever saw the materialization's `NotRecovered`
   either; its tests ran on a lone node, which never forwards. A volume its shard records unrecovered is now answered
   there (`verbs::owned_by_another_host`).
+- **Lost objects too (the same day).** An object whose cohort is left short of its recovery quorum is lost (A-272 keeps
+  its share unconfirmed and its holders' copies) and was never recorded unrecovered, so it too answered `Overloaded` for
+  good; `takeover::record_lost` records it through the same batched recorder, naming `quorum`.
 - **What it does not change.** Adoption still needs every cohort's recovery quorum (Flexible Paxos, A-251's counting
   rule); a given-up object keeps the share unconfirmed (A-272), so the retirement stays kept and its holders keep their
   copies; a new configuration judges it afresh, so a member retired late (detection past the SLO under load) costs a

@@ -9965,6 +9965,114 @@ fn a_taken_over_object_a_survivor_never_promises_is_given_up_by_name() {
   }
 }
 
+/// A-304's sibling, §4.8 phase one: an object whose recovery cohort is left with fewer members than its recovery quorum
+/// is lost, and every verb on it says so by name rather than answering a retryable `Overloaded` for good. Do: five nodes
+/// at f = 1; a volume on a node outside the council's voters where one is (so two deaths leave the council its quorum),
+/// sealed and its head held by its two other candidates; the owner and one of those two stop together, which the council
+/// retires. Expect: the surviving holder answers the volume's status `NotRecovered { TakeoverIncomplete { waited_on:
+/// "quorum" } }` within the serve deadline (as its successor, or forwarding to it), and a survivor counted the object lost
+/// and recorded. Before, it answered `Overloaded` for as long as it ran, the object counted lost and never answered.
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn a_taken_over_object_whose_cohort_lost_its_quorum_is_refused_by_name() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, hosts) = formed_mesh(&["a", "b", "c", "d", "e"]);
+  let voters = daemons[0]
+    .council_voters()
+    .ok()
+    .flatten()
+    .unwrap_or_default();
+  let owner = (0..daemons.len())
+    .find(|index| !voters.contains(&hosts[*index]))
+    .unwrap_or(0);
+  let mut client = Client::connect(daemons[owner].instance());
+  let ReplyBody::Created { id } = client.call(&scratch("lost-quorum")) else {
+    panic!("create on the owner")
+  };
+  share_with_fleet(&mut client, id, &daemons);
+  let ReplyBody::Snapshotted { id: snapshot, .. } =
+    client.call(&RequestBody::Snapshot { volume: id })
+  else {
+    panic!("snapshot on the owner")
+  };
+  let object = ObjectId(id.bytes);
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  assert!(
+    poll_snapshot_placed(&observed, &mut client, id, snapshot),
+    "the volume's head placed"
+  );
+  drop(client);
+  // The owner's two other candidates, once both hold the head.
+  let mut holders = Vec::new();
+  let found = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    holders.clear();
+    for (index, daemon) in daemons.iter().enumerate() {
+      if index != owner && daemon.fleet_holder_head(object)?.is_some() {
+        holders.push(index);
+      }
+    }
+    Ok(holders.len() >= 2)
+  });
+  drop(observed);
+  assert!(found, "two other nodes hold the volume's head: {holders:?}");
+  let (lost_with_owner, survivor) = (holders[0], holders[1]);
+  let mut slots: Vec<Option<Daemon>> = daemons.into_iter().map(Some).collect();
+  for index in [owner, lost_with_owner] {
+    if let Some(daemon) = slots.get_mut(index).and_then(Option::take) {
+      daemon.stop();
+    }
+  }
+  let survivors: Vec<&Daemon> = slots.iter().flatten().collect();
+  // The surviving holder, asked; the volume's successor is it, or a member its routing forwards to.
+  let asked = slots[survivor].as_ref().unwrap();
+  let mut client = Client::connect(asked.instance());
+  let mut last = None;
+  let refused = poll_until(&survivors, SERVE_DEADLINE, || {
+    let reply = call_or_show_pulses(&mut client, &survivors, &RequestBody::Status { volume: id });
+    let named = matches!(
+      &reply,
+      ReplyBody::Refused {
+        refusal: Refusal::NotRecovered {
+          cause: slates_ipc::protocol::RecoveryCause::TakeoverIncomplete { waited_on },
+        },
+      } if waited_on == "quorum"
+    );
+    last = Some(reply);
+    Ok(named)
+  });
+  drop(client);
+  // Each survivor's takeover counters: the successor among them counted the object lost and recorded it.
+  let counted: Vec<Vec<(&'static str, u64)>> = survivors
+    .iter()
+    .map(|daemon| {
+      daemon
+        .fleet_refusals()
+        .map(|counters| takeover_counters(&counters))
+        .unwrap_or_default()
+    })
+    .collect();
+  drop(survivors);
+  for daemon in slots.into_iter().flatten() {
+    daemon.stop();
+  }
+  assert!(
+    refused,
+    "the surviving holder answers the lost volume naming its cohort's quorum, within {SERVE_DEADLINE:?}; its last \
+     reply {last:?}; the survivors' counters {counted:?}; voters {voters:?}, owner {owner}, holders {holders:?}"
+  );
+  let counts = |name: &str| {
+    counted.iter().any(|one| {
+      one
+        .iter()
+        .any(|(counter, count)| *counter == name && *count > 0)
+    })
+  };
+  assert!(
+    counts("fleet.takeover.lost") && counts("fleet.takeover.lost.recorded"),
+    "a survivor counted the object lost and recorded it: {counted:?}"
+  );
+}
+
 /// A-251 (d), the process test (§4.8 "Promotion and takeover"; NoLoss): a takeover adopts a committed head that a holder
 /// left out of its pages because its routing lost the copy, the warm-restart case of
 /// `docs/bugs/2026-11-07-a-holder-restarted-warm-lost-its-copies-routing.md` (A-250 restores routing on a warm restart, so
