@@ -106,6 +106,8 @@ mod staging;
 mod work_charge;
 pub mod work_files;
 mod work_log;
+// A work's route after its owner's takeover ends once the green's owner holds none of its completions (A-288).
+mod work_route;
 // The container bind form of `attach` (§4.6 A-9): the host mount verified through the kernel's mount
 // table and the runtime-specification entry; paired per platform inside, so it compiles everywhere.
 pub mod oci;

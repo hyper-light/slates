@@ -1,8 +1,10 @@
-//! The library by use (§4.12 "Embedding", A-278): an embedding host's whole flow over a daemon in this process — attach,
-//! the consensus group, volumes made, snapshotted, cloned and destroyed, an overlay written, its drift read, a landing
-//! planned, granted under the issuer authority and landed exactly as approved, a Shards stream that serves the volume,
-//! and the daemon observed — each refusal asserted as its typed variant. Every test drives the crate's own verbs and
-//! judges only what a host could observe: the daemon's answers and the bytes on the disk.
+//! The library and its consumer contract by use (§4.12 "Embedding", A-278; "The consumer contract", A-299): an
+//! embedding host's whole flow over a daemon in this process — attach, the consensus group, volumes provisioned from
+//! each source, snapshotted, cloned and destroyed, an overlay written, its drift read typed, a landing presented for
+//! approval and approved exactly as shown, a conflict typed per path, a merge accepted and a merge conflicted, signed
+//! work refused until the daemon verifies it, a Shards stream that serves the volume, and the daemon observed — each
+//! outcome and each refusal asserted as its typed variant. Every test drives the crate's own verbs and judges only what
+//! a host could observe: the daemon's answers and the bytes on the disk.
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(
   clippy::unwrap_used,
@@ -18,7 +20,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use slates_api::{
-  Error, Filter, Instance, Intent, IssuerFault, PathFault, Planned, Refusal, SnapshotId, VolumeId,
+  Approval, AuditKind, Awaiting, BaseState, ConflictClass, Denied, Drift, DriftKind, Error,
+  Existing, Filter, GrantState, Instance, Intent, Invalid, IssuerFault, LandOutcome,
+  LandingConflict, LandingStage, LandingState, MergeOutcome, Missing, PathFault, PolicyReason,
+  PolicyRefusal, PolicySubject, Provisioned, RebaseOutcome, SnapshotId, Unsupported, Unusable,
+  Verification, VolumeId, VolumeSpec, Work, WorkSignature, WriteAct, WriteMode, WritePolicy,
 };
 use slates_machine::{MachineError, MachineProfile, ProfileOptions};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
@@ -149,9 +155,13 @@ fn write_file(instance: &mut Instance, volume: VolumeId, path: &str, bytes: &[u8
 /// `path`'s bytes at `volume`'s head.
 fn read_file(instance: &mut Instance, volume: VolumeId, path: &str) -> Vec<u8> {
   instance
-    .client()
-    .read(volume, path, slates_ipc::protocol::ReadAt::Head)
+    .read(volume, path, slates_api::ReadAt::Head)
     .unwrap()
+}
+
+/// The volume `spec` makes.
+fn provision(instance: &mut Instance, spec: &VolumeSpec) -> VolumeId {
+  instance.provision(spec).unwrap().volume()
 }
 
 /// The landing of `volume`'s head into `folder`, `.git` left out as kiln's landings leave it.
@@ -167,57 +177,72 @@ fn landing_into(volume: VolumeId, folder: &Folder) -> slates_api::LandingRequest
   }
 }
 
-/// The issuer authority of `daemon`'s instance: its anchor segment's handoff, as the anchor hands it to its children.
+/// The launcher's authority over `daemon`'s instance: its anchor segment's handoff, as the anchor hands it to its
+/// children.
 fn issuer_of(daemon: &Daemon) -> slates_api::Issuer {
   slates_api::Issuer::from_handoff(&daemon.segment().handoff_env().unwrap()).unwrap()
 }
 
-/// T-5.1's library form (A-278, §4.7): do attach to an instance no daemon serves; expect the typed `Unavailable`,
-/// never a hang or a panic, naming the instance asked.
+/// A signature in `ssh-keygen -Y sign`'s armour, for the refusals that come before any verifier reads it.
+fn a_signature() -> WorkSignature {
+  WorkSignature::from_armoured(
+    "-----BEGIN SSH SIGNATURE-----\nU1NIU0lH\n-----END SSH SIGNATURE-----",
+  )
+  .unwrap()
+}
+
+/// T-5.1's library form (A-278, §4.7; A-299): do attach to an instance no daemon serves; expect the typed
+/// `Unavailable`, retryable once an instance runs, never a hang or a panic, naming the instance asked.
 #[test]
 fn attaching_where_no_daemon_serves_is_refused_unavailable() {
   let name = format!("api-nobody-{}", std::process::id());
   let refused = Instance::attach(&name).unwrap_err();
-  assert!(refused.is_unavailable(), "{refused:?}");
+  assert!(
+    refused.is_unavailable() && refused.is_retryable(),
+    "{refused:?}"
+  );
   assert!(
     matches!(&refused, Error::Unavailable { instance, .. } if *instance == name),
     "{refused:?}"
   );
 }
 
-/// AC-5.12 / T-5.14 (A-278; §4.8 `bootstrap root`): do make an instance's group twice; expect both to succeed (a host's start path may run it
-/// again), and a volume created only once the group exists, while before it the create is refused
-/// `ConsensusNotInitialized` — the refusal a host meets if it skips the step.
+/// AC-5.12 / T-5.14 (A-278, A-299; §4.8 `bootstrap root`): do make an instance's group twice; expect both to succeed (a
+/// host's start path may run it again), and a volume provisioned only once the group exists, while before it the
+/// provision is refused `Unusable(NoGroup)` — the refusal a host meets if it skips the step.
 #[test]
 fn a_group_is_made_once_and_made_again_harmlessly_before_any_volume() {
   let (daemon, mut instance) = daemon("group");
   assert_eq!(
-    instance.create(&slates_api::scratch("early", ROOM)),
-    Err(Error::Refused(Refusal::ConsensusNotInitialized))
+    instance.provision(&VolumeSpec::empty("early", ROOM)),
+    Err(Error::Unusable(Unusable::NoGroup))
   );
   instance.ensure_group().unwrap();
   instance.ensure_group().unwrap();
-  instance.create(&slates_api::scratch("late", ROOM)).unwrap();
+  provision(&mut instance, &VolumeSpec::empty("late", ROOM));
   daemon.stop();
 }
 
-/// AC-5.12 / T-5.14 (A-278; §4.4, D-5): do create a scratch volume, write a file, snapshot, clone the snapshot, write the origin
-/// again, then destroy the clone; expect the clone to read the snapshot's bytes while the origin reads its own, the
-/// names to be listed and then the clone's gone, and a second create of a held name refused `AlreadyExists` naming
-/// the holder.
+/// AC-5.12 / T-5.14 (A-278, A-299; §4.4, D-5): do provision an empty volume, write a file, snapshot, provision a clone
+/// of the snapshot, write the origin again, then destroy the clone; expect the clone to read the snapshot's bytes while
+/// the origin reads its own, the names to be listed and then the clone's gone and a verb on it `NotFound` naming it, a
+/// second volume under a held name refused `AlreadyExists` naming the holder, a scratch volume's status to have no base,
+/// and an overlay over a relative folder refused `Invalid(Path)` before the daemon is asked.
 #[test]
-fn a_volume_is_created_snapshotted_cloned_and_destroyed() {
+fn a_volume_is_provisioned_snapshotted_cloned_and_destroyed() {
   let (daemon, mut instance) = grouped("lifecycle");
-  let origin = instance
-    .create(&slates_api::scratch("origin", ROOM))
-    .unwrap();
+  let origin = provision(&mut instance, &VolumeSpec::empty("origin", ROOM));
   assert_eq!(
-    instance.create(&slates_api::scratch("origin", ROOM)),
-    Err(Error::Refused(Refusal::AlreadyExists { existing: origin }))
+    instance.provision(&VolumeSpec::empty("origin", ROOM)),
+    Err(Error::AlreadyExists(Existing::Volume { existing: origin }))
   );
+  assert_eq!(instance.status(origin).unwrap().base, None);
   write_file(&mut instance, origin, "/f", b"at the snapshot");
   let snapshot: SnapshotId = instance.snapshot(origin).unwrap();
-  let clone = instance.clone_snapshot(origin, snapshot, "clone").unwrap();
+  let clone = provision(
+    &mut instance,
+    &VolumeSpec::clone_of("clone", origin, snapshot),
+  );
   write_file(&mut instance, origin, "/f", b"the origin's own");
   assert_eq!(read_file(&mut instance, clone, "/f"), b"at the snapshot");
   assert_eq!(read_file(&mut instance, origin, "/f"), b"the origin's own");
@@ -247,49 +272,54 @@ fn a_volume_is_created_snapshotted_cloned_and_destroyed() {
     );
     std::thread::yield_now();
   }
+  assert_eq!(
+    instance.snapshot(clone),
+    Err(Error::NotFound(Missing::Volume(clone)))
+  );
+  assert_eq!(
+    instance.provision(&VolumeSpec::overlay("o", "relative/dir", ROOM)),
+    Err(Error::Invalid(Invalid::Path {
+      path: "relative/dir".to_owned(),
+      fault: PathFault::NotAbsolute
+    }))
+  );
   daemon.stop();
 }
 
-/// AC-5.12 (A-278; §4.15, D-25): do make an overlay spec over a relative directory; expect the typed `NotAbsolute`, since
-/// the daemon would resolve it against its own working directory.
+/// AC-5.10 (A-278, A-299; §4.13 "Grants"): do make the launcher's authority from no handoff, and from a handoff with no
+/// or a malformed length; expect it denied `NoAuthority` with `NoHandoff` and `Malformed` — a process with no anchor in
+/// its environment holds no authority.
 #[test]
-fn an_overlay_over_a_relative_directory_is_refused_before_the_daemon() {
-  assert_eq!(
-    slates_api::overlay("o", Path::new("relative/dir"), ROOM).unwrap_err(),
-    Error::Path {
-      path: "relative/dir".to_owned(),
-      fault: PathFault::NotAbsolute
-    }
-  );
-}
-
-/// AC-5.10 (A-278; §4.13 "Grants"): do make an issuer from no handoff, and from a handoff with no or a malformed length; expect the
-/// typed `NoHandoff` and `Malformed` — a process with no anchor in its environment holds no authority.
-#[test]
-fn an_issuer_needs_the_anchors_handoff() {
+fn the_launchers_authority_needs_the_anchors_handoff() {
   assert_eq!(
     slates_api::Issuer::from_handoff(&[]).unwrap_err(),
-    Error::Issuer(IssuerFault::NoHandoff)
+    Error::Denied(Denied::NoAuthority(IssuerFault::NoHandoff))
   );
   assert!(matches!(
     slates_api::Issuer::from_handoff(&[("SLATES_ANCHOR".to_owned(), "x".to_owned())]),
-    Err(Error::Issuer(IssuerFault::Malformed { .. }))
+    Err(Error::Denied(Denied::NoAuthority(
+      IssuerFault::Malformed { .. }
+    )))
   ));
   assert!(matches!(
     slates_api::Issuer::from_handoff(&[
       ("SLATES_ANCHOR".to_owned(), "x".to_owned()),
       ("SLATES_ANCHOR_LEN".to_owned(), "many".to_owned())
     ]),
-    Err(Error::Issuer(IssuerFault::Malformed { .. }))
+    Err(Error::Denied(Denied::NoAuthority(
+      IssuerFault::Malformed { .. }
+    )))
   ));
 }
 
-/// AC-5.10 / T-5.12 and AC-5.12 / T-5.14 (A-278; §4.15, D-25, D-26) on the landing a host drives (Unix: the daemon lands on Unix). Do: lay an
-/// overlay over a folder holding a file and a `.git`, change the file, add one and change `.git/HEAD` in the volume;
-/// plan the landing with `/.git` left out; land it under a grant bound to the approved manifest. Expect: the folder
-/// untouched until the landing; the plan presented with a manifest and no conflict; the landing `done` and the folder
-/// then holding exactly the volume's two files, `.git/HEAD` as it was; a grant for a manifest the person never saw is
-/// never asked for — the approval of a stale manifest writes nothing and returns the new plan.
+/// AC-5.10 / T-5.12 and AC-5.12 / T-5.14 (A-278, A-299; §4.15, D-25, D-26) on the landing a host drives (Unix: the
+/// daemon lands on Unix). Do: lay an overlay over a folder holding a file and a `.git`, change the file, add one and
+/// change `.git/HEAD` in the volume; land it with `/.git` left out under the ask mode every landing has today; approve
+/// an approval of another manifest; approve the one shown. Expect: the folder untouched until the approval; the
+/// landing answered `ApprovalRequired` with a typed summary (one create, one replace, `.git` filtered out), unsigned,
+/// listing exactly the two files as they read; the stale approval writing nothing and answering the fresh
+/// presentation; the shown one `Written`, `Done`, two entries, and the folder then holding exactly the volume's two
+/// files with `.git/HEAD` as it was; a signed landing refused `Unsupported(SignedWork)` before anything is sent.
 #[cfg(unix)]
 #[test]
 fn an_overlay_lands_exactly_what_was_approved_and_nothing_else() {
@@ -297,9 +327,10 @@ fn an_overlay_lands_exactly_what_was_approved_and_nothing_else() {
   let folder = Folder::new();
   folder.write("a.txt", b"a\n");
   folder.write(".git/HEAD", b"ref: refs/heads/main\n");
-  let volume = instance
-    .create(&slates_api::overlay("work", Path::new(&folder.path), ROOM).unwrap())
-    .unwrap();
+  let volume = provision(
+    &mut instance,
+    &VolumeSpec::overlay("work", &folder.path, ROOM),
+  );
   assert_eq!(read_file(&mut instance, volume, "/a.txt"), b"a\n");
   write_file(&mut instance, volume, "/a.txt", b"a2\n");
   write_file(&mut instance, volume, "/n.txt", b"n\n");
@@ -317,14 +348,29 @@ fn an_overlay_lands_exactly_what_was_approved_and_nothing_else() {
   assert_eq!(folder.read("n.txt"), None);
 
   let request = landing_into(volume, &folder);
-  let Planned::Plan(plan) = instance.plan_landing(&request).unwrap() else {
-    panic!("a landing with changes needs a grant");
+  assert_eq!(
+    instance.land(&request, Some(&a_signature())),
+    Err(Error::Unsupported(Unsupported::SignedWork))
+  );
+  let LandOutcome::ApprovalRequired(approval) = instance.land(&request, None).unwrap() else {
+    panic!("a landing with changes asks under today's mode");
   };
-  assert!(plan.conflicts.is_empty(), "{:?}", plan.conflicts);
-  assert!(plan.summary.filtered_out >= 1, "{:?}", plan.summary);
-  assert_eq!(plan.manifest_text().len(), 64);
-  // A-287: the plan's entry list is what its grant writes, path by path, `/.git` left out, each file as it reads.
-  let entries = instance.landing_entries(&plan).unwrap();
+  assert_eq!(approval.awaiting, Awaiting::Landing(request.clone()));
+  assert_eq!(approval.verification, Verification::Unsigned);
+  assert_eq!(
+    (
+      approval.summary.actions.create,
+      approval.summary.actions.replace
+    ),
+    (1, 1),
+    "{:?}",
+    approval.summary
+  );
+  assert_eq!(approval.summary.actions.total(), 2);
+  assert!(approval.summary.filtered_out >= 1, "{:?}", approval.summary);
+  assert_eq!(approval.manifest_text().len(), 64);
+  // A-287: the approval's entry list is what it writes, path by path, `/.git` left out, each file as it reads.
+  let entries = instance.approval_entries(&approval).unwrap();
   let listed: Vec<_> = entries
     .iter()
     .map(|entry| {
@@ -353,33 +399,24 @@ fn an_overlay_lands_exactly_what_was_approved_and_nothing_else() {
   }
 
   let issuer = issuer_of(&daemon);
-  let stale = [0u8; 32];
-  let changed = instance
-    .land_approved(
-      &issuer,
-      &request,
-      &stale,
-      (slates_api::GrantScope::Once, slates_api::GRANT_TERM_NS),
-    )
-    .unwrap();
+  let stale = Approval {
+    manifest: [0u8; 32],
+    ..approval.clone()
+  };
+  let changed = instance.approve(&stale, &issuer).unwrap();
   assert!(
-    matches!(&changed, slates_api::Approved::Changed(again) if again.manifest == plan.manifest),
+    matches!(&changed, LandOutcome::ApprovalRequired(fresh) if fresh.manifest == approval.manifest),
     "an approval of another manifest is no approval of this one: {changed:?}"
   );
   assert_eq!(folder.read("a.txt").unwrap(), b"a\n", "nothing was written");
 
-  let landed = instance
-    .land_approved(
-      &issuer,
-      &request,
-      &plan.manifest,
-      (slates_api::GrantScope::Once, slates_api::GRANT_TERM_NS),
-    )
-    .unwrap();
-  let slates_api::Approved::Landed(outcome) = landed else {
+  let landed = instance.approve(&approval, &issuer).unwrap();
+  let LandOutcome::Written(report) = landed else {
     panic!("the approved manifest lands: {landed:?}");
   };
-  assert_eq!(outcome.state, "done", "{outcome:?}");
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert_eq!(report.written, 2, "{report:?}");
+  assert_eq!(report.verification, Verification::Unsigned);
   assert_eq!(folder.read("a.txt").unwrap(), b"a2\n");
   assert_eq!(folder.read("n.txt").unwrap(), b"n\n");
   assert_eq!(
@@ -387,53 +424,251 @@ fn an_overlay_lands_exactly_what_was_approved_and_nothing_else() {
     b"ref: refs/heads/main\n",
     "git's own files were left out"
   );
+  // The approval and the landing are audited and listed, typed (A-299): the presentation, the grant the launcher
+  // issued, the landing finished `Done`, and the single-use grant consumed by it.
+  let audit = instance.audit(0).unwrap();
+  let kinds: Vec<AuditKind> = audit.iter().map(|record| record.kind).collect();
   assert!(
-    !instance.audit(0).unwrap().is_empty(),
-    "the grant and the landing are audited"
+    kinds.contains(&AuditKind::LandingPlanned) && kinds.contains(&AuditKind::GrantIssued),
+    "{kinds:?}"
+  );
+  assert!(
+    audit
+      .iter()
+      .any(|record| record.kind == AuditKind::LandingFinished
+        && record.outcome == Some(LandingStage::Done)),
+    "{audit:?}"
+  );
+  let grants = instance.grants().unwrap();
+  assert!(
+    grants
+      .iter()
+      .any(|grant| grant.manifest == approval.manifest && grant.state == GrantState::Consumed),
+    "{grants:?}"
   );
   daemon.stop();
 }
 
-/// AC-5.12 / T-5.14 (A-278; §4.15 "Drift"): do change a file in an overlay, then change the same file on the disk; expect the drift
-/// list to name it and the landing's plan to carry it as a conflict; and a landing under a grant id nobody issued to
-/// write nothing and present its plan again (an unknown grant is no grant).
+/// AC-5.12 / T-5.14 (A-278, A-299; §4.15 "Drift", step 4): do change a file in an overlay, then change the same file on
+/// the disk; expect no drift before and, after, the drift typed — the file `Modified` at its whole path, the base read
+/// with a watcher — and the landing answered `Conflicted` with the file's class `ModifyModify` and the bytes the volume
+/// would land there, nothing written.
 #[cfg(unix)]
 #[test]
-fn a_file_changed_on_disk_after_the_volume_changed_it_is_drift_and_a_conflict() {
+fn a_file_changed_on_disk_after_the_volume_changed_it_is_typed_drift_and_a_typed_conflict() {
   let (daemon, mut instance) = grouped("drift");
   let folder = Folder::new();
   folder.write("d.txt", b"base\n");
-  let volume = instance
-    .create(&slates_api::overlay("drifting", Path::new(&folder.path), ROOM).unwrap())
-    .unwrap();
+  let volume = provision(
+    &mut instance,
+    &VolumeSpec::overlay("drifting", &folder.path, ROOM),
+  );
   write_file(&mut instance, volume, "/d.txt", b"the volume's\n");
-  assert!(instance.drift(volume).unwrap().is_empty());
+  let before = instance.drift(volume).unwrap().unwrap();
+  assert!(before.drifted.is_empty(), "{before:?}");
   folder.write("d.txt", b"the person's\n");
-  let drifted = instance.drift(volume).unwrap();
-  assert!(
-    drifted.iter().any(|entry| entry.starts_with("/d.txt")),
-    "{drifted:?}"
+  let after = instance.drift(volume).unwrap().unwrap();
+  assert_eq!(
+    after.drifted,
+    vec![Drift {
+      path: "/d.txt".to_owned(),
+      kind: DriftKind::Modified
+    }]
   );
-  let request = landing_into(volume, &folder);
-  let Planned::Plan(plan) = instance.plan_landing(&request).unwrap() else {
-    panic!("a drifted overlay still presents its plan");
-  };
-  assert!(
-    plan.conflicts.iter().any(|c| c.contains("d.txt")),
-    "{:?}",
-    plan.conflicts
-  );
-  let unissued = instance.land(&request, u64::MAX).unwrap();
-  assert!(
-    matches!(&unissued, Planned::Plan(again) if again.manifest == plan.manifest),
-    "a grant nobody issued lands nothing: {unissued:?}"
+  assert!(after.watcher.is_some(), "{after:?}");
+  assert!(matches!(
+    instance.status(volume).unwrap().base,
+    Some(BaseState::Read(_))
+  ));
+  let landed = instance.land(&landing_into(volume, &folder), None).unwrap();
+  let volume_bytes = b"the volume's\n";
+  assert_eq!(
+    landed,
+    LandOutcome::Conflicted(vec![LandingConflict {
+      path: "/d.txt".to_owned(),
+      class: ConflictClass::ModifyModify,
+      planned: Some(slates_api::PlannedContent {
+        hash: *blake3::hash(volume_bytes).as_bytes(),
+        size: u64::try_from(volume_bytes.len()).unwrap(),
+      }),
+    }])
   );
   assert_eq!(folder.read("d.txt").unwrap(), b"the person's\n");
   daemon.stop();
 }
 
-/// AC-5.12 / T-5.14 (A-278; §4.14): do read the daemon's status and a shard's telemetry through the library; expect the daemon's shards reported
-/// and the drain answered for the shard it has.
+/// AC-5.10 / AC-5.12 (A-299, A-285; Ada's rule of 2026-11-18): do set overlays' write policies with the launcher's
+/// authority — one bypass, one forbid — and land each, plan the bypass one, and ask for a policy that requires signed
+/// merges. Expect: an unset volume's policy reads back as none; the bypass volume read back as set and landed in the one
+/// call, `Written` and `Done`, its file on the disk; its plan refused `Unsupported(WritePolicies)` before anything is
+/// written, since no verb presents a bypass landing alone yet; the forbid volume's landing answered `Refused` by its own
+/// policy and nothing written; and the signed-merge requirement refused `Unsupported(SignedWork)` before anything is
+/// sent, since the daemon does not keep it yet.
+#[cfg(unix)]
+#[test]
+fn a_landing_follows_its_volumes_write_mode() {
+  let (daemon, mut instance) = grouped("modes");
+  let launcher = issuer_of(&daemon);
+  let bypassed = Folder::new();
+  let forbidden = Folder::new();
+  let open = provision(
+    &mut instance,
+    &VolumeSpec::overlay("open", &bypassed.path, ROOM),
+  );
+  let shut = provision(
+    &mut instance,
+    &VolumeSpec::overlay("shut", &forbidden.path, ROOM),
+  );
+  assert_eq!(
+    instance.write_policy(PolicySubject::Volume(open)).unwrap(),
+    None,
+    "nobody set one: it asks"
+  );
+  let bypass = WritePolicy {
+    merge: WriteMode::Ask,
+    land: WriteMode::Bypass,
+    require_signed_merges: false,
+  };
+  instance
+    .set_write_policy(PolicySubject::Volume(open), &bypass, &launcher)
+    .unwrap();
+  assert_eq!(
+    instance.write_policy(PolicySubject::Volume(open)).unwrap(),
+    Some(bypass)
+  );
+  write_file(&mut instance, open, "/w.txt", b"written at once\n");
+  let request = landing_into(open, &bypassed);
+  assert_eq!(
+    instance.plan_landing(&request),
+    Err(Error::Unsupported(Unsupported::WritePolicies)),
+    "a plan never writes"
+  );
+  assert_eq!(bypassed.read("w.txt"), None);
+  let LandOutcome::Written(report) = instance.land(&request, None).unwrap() else {
+    panic!("a bypass volume lands in the one call");
+  };
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert_eq!(bypassed.read("w.txt").unwrap(), b"written at once\n");
+
+  let forbid = WritePolicy {
+    merge: WriteMode::Forbid,
+    land: WriteMode::Forbid,
+    require_signed_merges: false,
+  };
+  instance
+    .set_write_policy(PolicySubject::Volume(shut), &forbid, &launcher)
+    .unwrap();
+  write_file(&mut instance, shut, "/f.txt", b"never landed\n");
+  assert_eq!(
+    instance
+      .land(&landing_into(shut, &forbidden), None)
+      .unwrap(),
+    LandOutcome::Refused(PolicyRefusal {
+      act: WriteAct::Land,
+      by: PolicySubject::Volume(shut),
+      reason: PolicyReason::Forbidden,
+    })
+  );
+  assert_eq!(forbidden.read("f.txt"), None, "nothing was written");
+  assert_eq!(
+    instance.set_write_policy(
+      PolicySubject::Volume(shut),
+      &WritePolicy {
+        require_signed_merges: true,
+        ..forbid
+      },
+      &launcher
+    ),
+    Err(Error::Unsupported(Unsupported::SignedWork))
+  );
+  daemon.stop();
+}
+
+/// AC-5.12 / T-5.14 (A-299; §4.16, D-27): do provision a green and work volumes over it; merge a seed, then two works
+/// based on the same version that rewrite the same bytes, one after the other; rebase and merge a third that changed
+/// another file. Expect the seed and the first `Merged` at versions 1 and 2, unsigned; the second `Conflicted` with a
+/// window on the rewritten bytes and the green's head 2, nothing merged; the third rebased onto 2 and merged at 3; and a
+/// signed merge refused `Unsupported(SignedWork)` before anything is sent.
+#[test]
+fn a_merge_is_accepted_or_conflicted_typed() {
+  let (daemon, mut instance) = grouped("merge");
+  let green = provision(
+    &mut instance,
+    &VolumeSpec {
+      name: "green".to_owned(),
+      source: slates_api::Source::Green {
+        base: None,
+        require_evidence: false,
+      },
+    },
+  );
+  let work = |instance: &mut Instance, name: &str| match instance
+    .provision(&VolumeSpec::work(name, green))
+    .unwrap()
+  {
+    Provisioned::Work { work, base } => (work, base),
+    other => panic!("a work volume provisions as one: {other:?}"),
+  };
+  let (seed, base) = work(&mut instance, "seed");
+  assert_eq!((seed.green, base), (green, 0));
+  instance
+    .client()
+    .edit(seed.volume, "f", 0, 0, b"aaaaaaaa")
+    .unwrap();
+  assert_eq!(
+    instance.merge(&seed, Some(&a_signature())),
+    Err(Error::Unsupported(Unsupported::SignedWork))
+  );
+  assert_eq!(
+    instance.merge(&seed, None).unwrap(),
+    MergeOutcome::Merged {
+      version: 1,
+      verification: Verification::Unsigned
+    }
+  );
+  let (first, _) = work(&mut instance, "first");
+  let (second, _) = work(&mut instance, "second");
+  let (third, _): (Work, u64) = work(&mut instance, "third");
+  instance
+    .client()
+    .edit(first.volume, "f", 0, 4, b"XXXX")
+    .unwrap();
+  assert!(matches!(
+    instance.merge(&first, None).unwrap(),
+    MergeOutcome::Merged { version: 2, .. }
+  ));
+  instance
+    .client()
+    .edit(second.volume, "f", 0, 4, b"YYYY")
+    .unwrap();
+  let MergeOutcome::Conflicted(conflicts) = instance.merge(&second, None).unwrap() else {
+    panic!("a rewrite of bytes the green changed since the base conflicts");
+  };
+  assert_eq!(conflicts.head, 2);
+  assert!(
+    conflicts
+      .conflicts
+      .iter()
+      .any(|conflict| conflict.path == "f" && conflict.at < 4),
+    "the conflict names the rewritten range: {conflicts:?}"
+  );
+  instance
+    .client()
+    .edit(third.volume, "g", 0, 0, b"other")
+    .unwrap();
+  assert_eq!(
+    instance.rebase(&third).unwrap(),
+    RebaseOutcome::Rebased { version: 2 }
+  );
+  assert!(matches!(
+    instance.merge(&third, None).unwrap(),
+    MergeOutcome::Merged { version: 3, .. }
+  ));
+  daemon.stop();
+}
+
+/// AC-5.12 / T-5.14 (A-278; §4.14): do read the daemon's status and a shard's telemetry through the library; expect the
+/// daemon's shards reported and the drain answered for the shard it has.
 #[test]
 fn the_daemon_is_observed_through_the_library() {
   let (daemon, mut instance) = grouped("observe");
@@ -503,9 +738,7 @@ mod shards {
   #[test]
   fn a_shards_stream_end_serves_the_volume_it_was_made_for() {
     let (daemon, mut instance) = grouped("shards");
-    let volume = instance
-      .create(&slates_api::scratch("guest", ROOM))
-      .unwrap();
+    let volume = provision(&mut instance, &VolumeSpec::empty("guest", ROOM));
     write_file(&mut instance, volume, "/present", b"through the stream\n");
     let served = instance.serve_shards(volume, Intent::Write, None).unwrap();
     let stream = UnixStream::from(served.stream);
