@@ -30029,7 +30029,10 @@ lease docs), `crates/client/tests/reap.rs`, `crates/server/tests/landing_fairnes
   daemon whose failover SLO is one liveness window, a client table of one under the listener's limits keeps a client
   silent for Linux's renewal floor and a liveness window less a nanosecond (a second client refused `NFS4ERR_DELAY`),
   and makes room once it has been silent a whole lease.
-  EVIDENCE_PLACEHOLDER
+  Run on the Mac Studio (kiln, 2026-11-18, load 5-10, debug build, `cargo test --locked -p slates-server --lib -- nfs
+  delegation recall config::`): 22 of 22. Red-checked once: with the limits reading the failover SLO again, the test
+  fails at its first ask (the idle client dropped for the second). The NFS suites that run the delegation recall,
+  the NFSv3 gate and the landings held for a recall, now on the listener's own knob, are filed for main's run.
 
 Applied in the same change to: §4.4 "Derived constants" (its status), GAPS (the `LIVENESS_BUDGET_NS` entry),
 `crates/server/src/{config,nfs,nfs_state,delegation,landing}.rs`, `crates/server/tests/{nfs_mount,recovery}.rs`.
