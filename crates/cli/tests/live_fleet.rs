@@ -2503,11 +2503,19 @@ fn write_files_through_transient(
         continue;
       }
       let attachment = value_of(&out, "attachment");
-      let (code, err) = run_with_stdin(
+      let path = format!("/file-{file}");
+      let answered = run_with_stdin_within(
         owner,
-        &["write", id, &attachment, &format!("/file-{file}")],
+        &["write", id, &attachment, &path],
         live_body(file).as_bytes(),
+        FLEET_WAIT,
       );
+      let Some((code, err)) = answered else {
+        panic!(
+          "a write of {path} through the restarted owner was never answered within {FLEET_WAIT:?}: {:?}",
+          live_line(owner, "shipping", id)
+        );
+      };
       let (detached, _, detach_err) = run(owner, &["detach", &attachment]);
       assert!(
         detached == 0 || detach_err.contains("refused: NotFound"),
@@ -2518,13 +2526,51 @@ fn write_files_through_transient(
       }
       assert!(
         transient(&err) && Instant::now() < deadline,
-        "write /file-{file}: {err}"
+        "write {path}: {err}"
       );
       refusals.push(err.trim().to_owned());
       pause();
     }
   }
   refusals
+}
+
+/// [`run_with_stdin`] given `within` to exit: its exit code and standard error, or `None` once `within` has passed, the
+/// command then killed and reaped, so a reply the daemon never sends fails the flow rather than holding it for good (a
+/// restarted owner's log begun again at genesis held its first write past 23 minutes, the red run of 2026-11-18).
+fn run_with_stdin_within(
+  instance: &str,
+  args: &[&str],
+  input: &[u8],
+  within: Duration,
+) -> Option<(i32, String)> {
+  use std::io::{Read, Write};
+  let mut child = slates()
+    .arg("--instance")
+    .arg(instance)
+    .args(args)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  child.stdin.take().unwrap().write_all(input).unwrap();
+  let deadline = Instant::now() + within;
+  loop {
+    if let Some(status) = child.try_wait().unwrap() {
+      let mut err = String::new();
+      if let Some(mut stderr) = child.stderr.take() {
+        stderr.read_to_string(&mut err).unwrap();
+      }
+      return Some((status.code().unwrap_or(-1), err));
+    }
+    if Instant::now() >= deadline {
+      let _ = child.kill();
+      let _ = child.wait();
+      return None;
+    }
+    pause();
+  }
 }
 
 // ── Every transport's durability claim on a live volume (A-200, AC-8.3): FUSE `fsync` and the NFS stable write and
