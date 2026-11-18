@@ -268,6 +268,14 @@ impl AsyncInstance {
     reactor: &dyn Reactor,
     body: RequestBody,
   ) -> Result<ReplyBody, CallFault> {
+    // The periodic acknowledgement first, unawaited, as the SDKs send it: the sync round trip acknowledges inline,
+    // and without it the daemon's retained completion records reach their bound and refuse the next call
+    // (`AcknowledgementOwed`; the by-use test met it at its 64th request).
+    self
+      .instance
+      .client
+      .begin_ack_if_due()
+      .map_err(CallFault::Client)?;
     let begin: Begin = Box::new(move |client: &mut Client| client.begin(&body));
     let ticket = self
       .driver
