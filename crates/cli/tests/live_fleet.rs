@@ -43,6 +43,11 @@ const START_WAIT: Duration = Duration::from_secs(20);
 const POLL_MS: u64 = 20;
 /// Shape: shards per daemon: two, so a volume's owner shard need not be the control shard, where the sessions are.
 const SHARDS: &str = "2";
+
+/// DIAG (g076b): the shards each daemon runs, `SLATES_TEST_LIVE_SHARDS` or [`SHARDS`].
+fn shards() -> String {
+  std::env::var("SLATES_TEST_LIVE_SHARDS").unwrap_or_else(|_| SHARDS.to_owned())
+}
 /// Shape: the fleet's TLS name.
 const FLEET_NAME: &str = "slates-fleet";
 /// Shape: the nodes, in manifest order.
@@ -237,7 +242,7 @@ fn start_fleet_daemon(
       verb,
       "--quick",
       "--shards",
-      SHARDS,
+      &shards(),
       "--fleet",
       manifest,
       "--node",
@@ -330,7 +335,7 @@ fn wait_settled(instances: &[String]) {
       })
       .collect();
     let pairs_wanted =
-      u64::try_from((FLEET_NODES.len() - 1) * SHARDS.parse::<usize>().unwrap()).unwrap();
+      u64::try_from((FLEET_NODES.len() - 1) * shards().parse::<usize>().unwrap()).unwrap();
     let whole = views.iter().all(|(voters, members, sessions, pairs)| {
       voters.trim() == FLEET_NODES.len().to_string()
         && members.trim() == FLEET_NODES.len().to_string()
