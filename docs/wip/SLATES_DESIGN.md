@@ -6243,6 +6243,25 @@ attachment flush barriers, hashing and puts have separately measured costs. An a
 without a client barrier covers only server-visible writes (§4.6); the volume reports `last_placed_snapshot_age` and `mirror_age`
 so an agent that needs durability can `await placed(scope)`.
 
+> **Status (2026-11-17, AC-8.3: the loss window is reported; g230).** `status` carries the volume's loss window
+> (`LossReport`, appended to the status report; `slates status` prints it as `loss_*`, MCP as `loss`, and slates-api
+> carries it as `VolumeStatus::loss`, CONTRACT 10):
+> - `at_risk_ns`, `last_placed_snapshot_age` made exact: zero while the volume is exactly its newest seal placed on
+>   `f + 1` hosts, or while it is live-shipped in a fleet (A-200: a write is answered at durability only once `f`
+>   holders hold it); otherwise the age of that seal; with none placed, the age of the volume, which on a laptop
+>   (`f = 0`) is always the case. `None`, never zero, when the time is from another boot of the clock.
+> - `placed_sequence`: that seal's head sequence, the one a takeover would serve from now.
+> - on a successor, `taken_over`: the epoch it serves under, the head sequence it served from, and whether from the
+>   live log.
+>
+> Measured against the owner's own report (`a_successor_reports_the_loss_window_its_takeover_left`,
+> `crates/server/tests/fleet.rs`): a seal placed, a second seal kept from placing by refusing the owner's records, a
+> third write unsealed, then the owner lost. The owner named the first seal's sequence before and after the second;
+> the successor reported serving that sequence under a later epoch; the first file survived and both later ones were
+> gone. **Owed:** auto-seal at a derived cadence (Phase 8 task 8, which needs the operator's loss-window SLO: a
+> decision for Ada), so the window is bounded; and the takeover report kept across the successor's own restart (it
+> lives in the shard's memory).
+
 > **Status (2026-11-05, A-222: another host's write attachment).** A client on another node attaches a volume in the
 > record form, through the fleet's forward, and writes it through the file verbs; the owner records it under the
 > client's host and client, ends it at a detach by volume, the client node's reap or the host's retirement, and a

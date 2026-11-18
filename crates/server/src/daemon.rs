@@ -4125,6 +4125,7 @@ async fn init_shard(
     demuxes: Vec::new(),
     holder_records: crate::tracked::Tracked::default(),
     live: crate::live_ship::LiveState::default(),
+    taken_over: std::collections::BTreeMap::new(),
     host_takeovers: std::collections::BTreeMap::new(),
     config_refresh_wanted: false,
     council_learner_pace: crate::fleet::LearnerPace::default(),

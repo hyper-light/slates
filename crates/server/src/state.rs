@@ -769,6 +769,10 @@ pub struct ShardState {
   /// Live shipping (§4.10, A-200; [`crate::live_ship`]): the live volumes this shard owns and ships, and on the control
   /// shard what this node holds of others' as a candidate.
   pub(crate) live: crate::live_ship::LiveState,
+  /// The takeovers that made this node the owner of a volume this shard serves, by volume (AC-8.3, the loss report in
+  /// `slates status`): the epoch, the head sequence served from, and whether from the volume's live log. One entry a
+  /// taken-over volume of this shard, dropped when the volume is destroyed.
+  pub(crate) taken_over: BTreeMap<VolumeId, slates_ipc::protocol::VolumeTakeover>,
   /// This node's takeovers in progress (§4.8 "Promotion and takeover"; [`crate::takeover`]): for each kept
   /// retirement whose survivors include this node and that it has not confirmed its share of yet, the round —
   /// its epoch, each asked member's progress, the objects learned and adopted. Only the control shard drives it;

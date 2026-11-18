@@ -2202,6 +2202,9 @@ pub struct StatusReport {
   /// text for people, for a consumer to match. `None` for a volume with no base folder (a scratch volume, a clone of
   /// one, a green, a work volume). Appended.
   pub base: Option<BaseReport>,
+  /// What an owner loss would lose of the volume now, and what the takeover that made this node its owner lost (§4.10
+  /// "Auto-seal", AC-8.3, D-18). Appended.
+  pub loss: LossReport,
 }
 
 /// An overlay's base as a status read it (§4.15 "Drift"; A-299). Append-only.
@@ -2251,6 +2254,40 @@ pub enum WatcherState {
   Overflowed,
   /// None on this host or folder: fingerprints alone.
   Unavailable,
+}
+
+/// A volume's loss window (§4.10 "Auto-seal", AC-8.3, D-18): what of it lives on its owner alone, and what the takeover
+/// that made this node its owner lost. Every time is this host's own clock's, so no two hosts' clocks are compared; a
+/// seal is named by its head sequence, which the owner and every successor share.
+#[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
+pub struct LossReport {
+  /// The window an owner loss would lose now, nanoseconds (the design's `last_placed_snapshot_age`, made exact): zero
+  /// when every change is on another host too (the head sealed and placed with nothing changed since, or a live-shipped
+  /// log in a fleet, whose acknowledged writes are durable on its holders); otherwise the age of the newest seal placed
+  /// on `f + 1` hosts, or of the volume itself when none is (on a laptop, `f = 0`, nothing is on another host). `None`
+  /// when the time is unknown (taken under another boot of this host's clock) or not measured: never reported as zero.
+  pub at_risk_ns: Option<u64>,
+  /// The head sequence of the newest seal placed on `f + 1` hosts: the one a takeover would serve from now, so the
+  /// edits after it are the window. `None` while no seal is placed on another host.
+  pub placed_sequence: Option<u64>,
+  /// Whether the volume ships its live log to holders in a fleet (A-200), so an owner loss loses no write acknowledged
+  /// at durability.
+  pub live_shipped: bool,
+  /// Set on a node that took the volume over from a lost owner: what it serves from, and so what the loss took. Kept in
+  /// this node's memory: a restart of this node forgets it.
+  pub taken_over: Option<VolumeTakeover>,
+}
+
+/// The takeover that made this node a volume's owner (AC-8.3): the loss window an owner loss left.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct VolumeTakeover {
+  /// The epoch the volume has been served under since.
+  pub epoch: u64,
+  /// Served from the volume's live log: every write the lost owner acknowledged at durability survived.
+  pub from_live_log: bool,
+  /// The head sequence served from: when the volume was not served from its live log, the lost owner's edits after the
+  /// seal it names (its `placed_sequence` when it was lost) are the loss window.
+  pub head_sequence: u64,
 }
 
 /// A volume's journal as its consuming rounds measured it (§4.5 "Journal"). The budget's formula is the mutation rate

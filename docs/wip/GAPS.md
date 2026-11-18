@@ -1,5 +1,19 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A volume reported no loss window: built (2026-11-17, AC-8.3, §4.10 "Auto-seal"; g230).** Nothing told an agent
+> what an owner loss would cost it, or a successor's client what one had cost: the status promised
+> `last_placed_snapshot_age` and carried nothing. `status` now carries `LossReport`: `at_risk_ns` (zero at a placed,
+> unchanged head or a live-shipped volume in a fleet; the newest placed seal's age otherwise; the volume's age with
+> none placed, always on a laptop), `placed_sequence` (that seal's head sequence) and, on a successor, `taken_over`
+> (epoch, head sequence served from, from the live log or not); a consumer reads it through slates-api
+> (`VolumeStatus::loss`, CONTRACT 10). Test:
+> `a_successor_reports_the_loss_window_its_takeover_left` (`crates/server/tests/fleet.rs`; a second seal kept from
+> placing by refusing the owner's records, so the window is the edits after the last *placed* seal, not the last seal).
+> - **Owed:** auto-seal at a derived cadence (Phase 8 task 8), which bounds the window; it needs the operator's
+>   loss-window SLO, a decision for Ada (options in the g230 progress record).
+> - **Owed:** the takeover report survives the successor's restart; it lives in the shard's memory, so a restarted
+>   successor reports no takeover (the window it reports from then on is still exact).
+
 > **Open (g222, 2026-11-17, A-273): rebases and named-version reads of a green on the shards holding its works.**
 > Designed, not built. The owner spends 51–53% of its wall on verdicts and rebases at the 3,000-client rung (W1),
 > rebases the larger share (about 71,000 a run against 49,000 verdicts), and W1's rebase at 1,000 clients is slower

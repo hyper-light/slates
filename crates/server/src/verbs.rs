@@ -9593,6 +9593,7 @@ pub(crate) fn reconcile_unpublished_effects(state: &mut ShardState) -> usize {
     }
     state.by_id.remove(id);
     crate::live_ship::forget(state, *id);
+    state.taken_over.remove(id);
   }
   let partition = state.db.partition();
   state.greens.retain(|id, _| partition.volume(*id).is_some());
@@ -9722,6 +9723,7 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
       }
       state.by_id.remove(&id);
       crate::live_ship::forget(state, id);
+      state.taken_over.remove(&id);
       retire_local_tombstones(state);
     }
   }
@@ -9830,6 +9832,7 @@ fn record_unrecovered_destroy(
   release_name_alias(state, record.id, &record.name);
   release_origin_pin(state, origin_pin);
   crate::live_ship::forget(state, record.id);
+  state.taken_over.remove(&record.id);
   retire_local_tombstones(state);
   Ok(())
 }
@@ -9896,6 +9899,13 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
   let accounting = slot.volume.accounting();
   let journal = journal_report(&slot.volume);
   let takeover_kept = u32::try_from(slot.volume.takeover_kept()).unwrap_or(u32::MAX);
+  let unchanged_since_head = record.epoch > 0
+    && slot
+      .volume
+      .unchanged_since(core_snapshot(SnapshotId {
+        value: record.head.value,
+      }))
+      .unwrap_or(false);
   // An overlay's base, as text for people (`drifted`, `watcher`) and typed for consumers (`base`, A-299).
   let (drifted, watcher, base) = match slot.host.as_mut() {
     Some(host) => match slot.volume.with_host(host).status(&mut state.store) {
@@ -9946,6 +9956,7 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
       journal,
       takeover_kept,
       base,
+      loss: loss_report(state, &record, unchanged_since_head),
     }),
   }
 }
@@ -9977,6 +9988,70 @@ fn base_report(status: &slates_vfs::base::BaseStatus) -> slates_ipc::protocol::B
       slates_vfs::host::WatchState::Overflowed => WatcherState::Overflowed,
       slates_vfs::host::WatchState::Unavailable => WatcherState::Unavailable,
     },
+  }
+}
+
+/// A volume's loss window for its status (§4.10 "Auto-seal", AC-8.3, D-18): what an owner loss would lose now, and the
+/// takeover that made this node its owner. `unchanged_since_head` is whether the volume is exactly its head snapshot.
+fn loss_report(
+  state: &ShardState,
+  record: &VolumeRecord,
+  unchanged_since_head: bool,
+) -> slates_ipc::protocol::LossReport {
+  let placed = newest_placed_seal(state, record);
+  slates_ipc::protocol::LossReport {
+    at_risk_ns: at_risk_ns(state, record, unchanged_since_head, placed),
+    placed_sequence: placed.map(|snapshot| snapshot.epoch),
+    live_shipped: record.policy.live_shipped,
+    taken_over: state.taken_over.get(&record.id).cloned(),
+  }
+}
+
+/// The newest seal of `record`'s volume placed on `f + 1` hosts, by head sequence: the one a takeover would serve from
+/// now (§4.8: a successor adopts the newest committed head, and a seal is recorded placed only once its head is). None
+/// on a laptop (`f = 0`), where a seal is placed on the owner alone.
+fn newest_placed_seal<'a>(
+  state: &'a ShardState,
+  record: &VolumeRecord,
+) -> Option<&'a SnapshotRecord> {
+  if state.fleet.configuration().quorum.f == 0 {
+    return None;
+  }
+  state
+    .db
+    .partition()
+    .snapshots_of(record.id)
+    .into_iter()
+    .filter(|snapshot| matches!(snapshot.placed, PlacementState::Placed { .. }))
+    .max_by_key(|snapshot| snapshot.epoch)
+}
+
+/// The window an owner loss would lose of `record`'s volume now (AC-8.3), on this host's monotonic clock:
+/// - zero for a live-shipped volume in a fleet, whose writes are durable on its holders before they are answered
+///   (A-200);
+/// - zero for a volume that is exactly its head snapshot when that snapshot is `placed`, the newest seal on `f + 1`
+///   hosts;
+/// - otherwise the age of `placed`, the edits after which live on the owner alone;
+/// - and with none placed, the age of the volume itself: on a laptop (`f = 0`) nothing is on another host, a
+///   live-shipped volume's log included, so the volume's whole life is at risk to the loss of its one host.
+///
+/// `None` when that time is from another boot of the clock: an unknown window is never reported as zero, as
+/// [`mirror_age_ns`] reports the mirror's lag.
+fn at_risk_ns(
+  state: &ShardState,
+  record: &VolumeRecord,
+  unchanged_since_head: bool,
+  placed: Option<&SnapshotRecord>,
+) -> Option<u64> {
+  if record.policy.live_shipped && state.fleet.configuration().quorum.f > 0 {
+    return Some(0);
+  }
+  // The shard's clock is the host's monotonic clock (`HostClock`), read here without borrowing it mutably.
+  let now = slates_machine::clock::monotonic_ns();
+  match placed {
+    Some(snapshot) if snapshot.id == record.head && unchanged_since_head => Some(0),
+    Some(snapshot) => now.checked_sub(snapshot.taken_ns),
+    None => now.checked_sub(record.created_ns),
   }
 }
 
