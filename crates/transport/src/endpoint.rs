@@ -1050,6 +1050,18 @@ impl Endpoint {
     self.handshake_budgets_spent
   }
 
+  /// DIAG: this end's local address (its own socket's; a shared one's is the demultiplexer's) and its peer's.
+  pub fn diag_addrs(&self) -> String {
+    let local = match &self.link {
+      Link::Own(socket) => socket
+        .local_addr()
+        .map(|addr| format!("{addr}"))
+        .unwrap_or_default(),
+      Link::Shared { .. } => "shared".to_string(),
+    };
+    format!("{local} -> {}", self.peer)
+  }
+
   /// One `establish` call's turns over the connection; `last_flight` is the flight this end most recently
   /// sent (carried in from the previous call and left for the next when the budget runs out).
   async fn establish_turns(&mut self, last_flight: &mut Flight) -> Result<(), EndpointError> {
@@ -1216,6 +1228,12 @@ impl Endpoint {
         },
         None => {
           attempts = attempts.saturating_add(1);
+          if self.quic.is_client() && attempts.is_power_of_two() && attempts >= 8 {
+            slates_machine::log_line!(
+              "slates-transport: DIAG dialer {} silent through {attempts} retransmits",
+              self.diag_addrs()
+            );
+          }
           if attempts > MAX_HANDSHAKE_RETRANSMITS {
             return Err(self.stalled(HandshakeStall::Silence));
           }

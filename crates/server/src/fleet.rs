@@ -1409,9 +1409,22 @@ async fn establish_session(
     Some(endpoint) => Some(endpoint),
     None => client_for(identity, name, (address, plane), certificate, resolver).await,
   };
+  if let Some(endpoint) = client.as_ref() {
+    slates_machine::log_line!(
+      "slates-server: DIAG dial {plane:?} {name}: {} begins (budgets spent {})",
+      endpoint.diag_addrs(),
+      endpoint.handshake_budgets_spent()
+    );
+  }
   match client {
     Some(mut endpoint) => match endpoint.establish().await {
-      Ok(()) => (None, Some(endpoint)),
+      Ok(()) => {
+        slates_machine::log_line!(
+          "slates-server: DIAG dial {plane:?} {name}: {} established",
+          endpoint.diag_addrs()
+        );
+        (None, Some(endpoint))
+      }
       // The handshake ran out a budget with the peer silent: keep the socket and its pending flight for
       // the next period's call, which resends the flight (`Endpoint::establish`), up to
       // `ESTABLISH_BUDGETS_BEFORE_REDIAL` budgets. Past that — or on any protocol fault (a peer whose

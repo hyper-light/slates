@@ -610,6 +610,12 @@ impl Demux {
       return;
     }
     if let Some(slot) = inner.by_source.get(&from).copied() {
+      if inner.established(slot) {
+        slates_machine::log_line!(
+          "slates-transport: DIAG demux {:?}: a handshake datagram from {from} reaches an established session",
+          self.socket.local_addr().ok()
+        );
+      }
       inner.deliver(self.inbox_datagrams, slot, datagram);
       return;
     }
@@ -618,6 +624,10 @@ impl Demux {
     // roster fault read as a full pool).
     match inner.open(self, from) {
       Ok(slot) => {
+        slates_machine::log_line!(
+          "slates-transport: DIAG demux {:?}: opens a session for {from}",
+          self.socket.local_addr().ok()
+        );
         inner.deliver(self.inbox_datagrams, slot, datagram);
         if let Some(waker) = inner.accept_waker.take() {
           waker.wake();
