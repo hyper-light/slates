@@ -198,10 +198,22 @@ fn block_in_a_read(held: Duration) {
 /// the block began. The stop is timed from the block's own start, since under load the observation reaches the shard
 /// some time after it is sent, and the beat resumes once the block ends, so only the first window-long gap counts.
 fn a_blocked_shard_stops_the_beat(role: &str, name: &str, block: fn(Duration)) {
+  a_blocked_shard_stops_the_beat_while(role, name, block, None);
+}
+
+/// [`a_blocked_shard_stops_the_beat`] with the host's memory reading the watchdog takes put in its place first:
+/// `Some(true)` a host reporting a memory stall throughout (A-336), `None` the host's own.
+fn a_blocked_shard_stops_the_beat_while(
+  role: &str,
+  name: &str,
+  block: fn(Duration),
+  memory_stalled: Option<bool>,
+) {
   let Some((daemon, _, other)) = supervised(role) else {
     return;
   };
   let _serving = beating(&daemon);
+  assert!(daemon.inject_memory_stall(memory_stalled));
   let held = WINDOW * 3;
   let base = Instant::now();
   let began_us = &*Box::leak(Box::new(AtomicU64::new(0)));
@@ -298,6 +310,173 @@ fn a_shard_blocked_in_a_syscall_stops_the_beat_role() {
     "a_shard_blocked_in_a_syscall_stops_the_beat_role",
     "syscall",
     block_in_a_read,
+  );
+}
+
+/// Shape: the stack the held shard's child runs its two calls on (a read and an exit).
+#[cfg(target_os = "linux")]
+const CHILD_STACK: usize = 64 * 1024;
+
+/// The child of [`hold_where_memory_holds`]: reads one byte from the pipe whose read end `fd` points at, then exits. It
+/// runs on its own stack in the daemon's memory, so it makes no allocation and takes no lock: two system calls.
+#[cfg(target_os = "linux")]
+extern "C" fn read_one_byte_then_exit(fd: *mut libc::c_void) -> libc::c_int {
+  let mut byte = 0_u8;
+  // SAFETY: `fd` points at the parent's descriptor number, on the parent's frame, which stays put while the parent waits
+  // for this child (`CLONE_VFORK`); `byte` is this frame's own.
+  unsafe {
+    libc::syscall(
+      libc::SYS_read,
+      libc::c_long::from(*fd.cast::<libc::c_int>()),
+      (&raw mut byte).cast::<libc::c_void>(),
+      1_usize,
+    );
+    libc::_exit(0)
+  }
+}
+
+/// Holds the calling thread (a shard's) where a thread waiting on memory is, until a byte arrives on `reader`: on Linux
+/// in a wait the kernel holds it in past signals (`D`), as a page-in does, the wait a vfork's parent is kept in
+/// (`CLONE_VM | CLONE_VFORK`, as `slates_rt`'s `thread_clock` tests hold one) while its child reads the pipe.
+#[cfg(target_os = "linux")]
+fn hold_where_memory_holds(reader: std::io::PipeReader) {
+  use std::os::fd::AsRawFd;
+  let mut stack = vec![0_u8; CHILD_STACK];
+  let top = stack.as_mut_ptr().wrapping_add(CHILD_STACK);
+  let mut fd = reader.as_raw_fd();
+  // SAFETY: the child runs `read_one_byte_then_exit` on `stack`, which outlives it (the call returns only once the child
+  // has exited, `CLONE_VFORK`), and reads `fd` on this frame, which stays put meanwhile; `reader` keeps the descriptor
+  // open until then. The child touches nothing else.
+  let child = unsafe {
+    libc::clone(
+      read_one_byte_then_exit,
+      top.cast(),
+      libc::CLONE_VM | libc::CLONE_VFORK | libc::SIGCHLD,
+      (&raw mut fd).cast(),
+    )
+  };
+  assert!(child > 0, "the held shard's child was cloned");
+  let mut status = 0;
+  // SAFETY: reaps this thread's own child; `status` is this frame's own.
+  unsafe { libc::waitpid(child, &raw mut status, 0) };
+  drop(stack);
+  drop(reader);
+}
+
+/// Holds the calling thread (a shard's) where a thread waiting on memory is, until a byte arrives on `reader`: off the
+/// CPU in a wait, which is all macOS and Windows tell of a page-in's thread.
+#[cfg(not(target_os = "linux"))]
+fn hold_where_memory_holds(mut reader: std::io::PipeReader) {
+  use std::io::Read;
+  let mut byte = [0_u8];
+  let _ = reader.read(&mut byte);
+}
+
+/// Format: the role of [`a_shard_waiting_on_memory_keeps_the_beat_while_the_host_stalls_and_stops_it_a_window_after`].
+const MEMORY_HOLD_ROLE: &str =
+  "a_shard_waiting_on_memory_keeps_the_beat_while_the_host_stalls_and_stops_it_a_window_after_role";
+
+/// A-336, §4.14, the watchdog's own loop. Do: on the shard that is not the control shard, hold one poll where a thread
+/// waiting on memory is (on Linux in the kernel past signals, `D`; elsewhere blocked off the CPU), with the host's
+/// memory reading the watchdog takes put in its place as a stall; watch three windows; then clear the reading and watch
+/// until the beat stops. Expect: the watchdog withholds no look while the host stalls, three windows of a shard that
+/// neither runs nor is runnable; the beat stops within a window and three beats of the clearing. Before, the beat
+/// stopped a window into the hold, and a lone daemon at a few hundred megabytes free ended itself (g231, 2026-11-17).
+#[test]
+fn a_shard_waiting_on_memory_keeps_the_beat_while_the_host_stalls_and_stops_it_a_window_after() {
+  common::supervised::run(MEMORY_HOLD_ROLE, "liveness-memory", 2);
+}
+
+/// The role [`a_shard_waiting_on_memory_keeps_the_beat_while_the_host_stalls_and_stops_it_a_window_after`] runs as a
+/// supervised daemon's process: anchored, so a stuck verdict withholds the beat rather than ending the process.
+#[test]
+#[ignore = "a role: run by a_shard_waiting_on_memory_keeps_the_beat_while_the_host_stalls_and_stops_it_a_window_after"]
+fn a_shard_waiting_on_memory_keeps_the_beat_while_the_host_stalls_and_stops_it_a_window_after_role()
+{
+  let Some((daemon, _, other)) = supervised(MEMORY_HOLD_ROLE) else {
+    return;
+  };
+  let _serving = beating(&daemon);
+  assert!(daemon.inject_memory_stall(Some(true)));
+  let (reader, mut writer) = std::io::pipe().unwrap();
+  let held = &*Box::leak(Box::new(AtomicBool::new(false)));
+  let worker = on_shard(&daemon, other, move || {
+    held.store(true, Ordering::Release);
+    hold_where_memory_holds(reader);
+  });
+  while !held.load(Ordering::Acquire) {
+    wait(SAMPLE);
+  }
+  let before = daemon.watchdog_turns().unwrap();
+  let (largest_while_stalled, _) = watch_beat(&daemon, WINDOW * 3);
+  let during = daemon.watchdog_turns().unwrap();
+  assert!(daemon.inject_memory_stall(Some(false)));
+  let cleared = Instant::now();
+  let mut stopped_after = None;
+  let mut last = beat(&daemon);
+  let mut last_seen = cleared.elapsed();
+  while cleared.elapsed() < WINDOW * 3 {
+    wait(SAMPLE);
+    let now = beat(&daemon);
+    if now != last {
+      last = now;
+      last_seen = cleared.elapsed();
+    } else if cleared.elapsed().saturating_sub(last_seen) >= WINDOW {
+      stopped_after = Some(last_seen);
+      break;
+    }
+  }
+  let after = daemon.watchdog_turns().unwrap();
+  {
+    use std::io::Write;
+    writer.write_all(b"x").unwrap();
+  }
+  worker.join().unwrap();
+  let (looks, withheld) = (during.0 - before.0, during.1 - before.1);
+  println!(
+    "a shard waiting on memory: while the host stalled the watchdog looked {looks} times and withheld the beat at \
+     {withheld}, the largest gap {largest_while_stalled:?}; after the clearing it withheld {} more, the beat stopping \
+     {stopped_after:?} in",
+    after.1 - during.1
+  );
+  assert_eq!(
+    withheld, 0,
+    "the beat was withheld at {withheld} of {looks} looks while the host stalled"
+  );
+  let stopped_after = stopped_after.unwrap_or_else(|| {
+    panic!("the beat never stopped for a whole window after the stall cleared (last advanced {last_seen:?} in)")
+  });
+  assert!(
+    stopped_after <= WINDOW + BEAT * 3,
+    "the beat stopped {stopped_after:?} after the stall cleared, past a window and three beats"
+  );
+  daemon.stop();
+}
+
+/// A-336, §4.14, the stuck extreme where the kernel tells the wait (Linux). Do: with the host's memory reading put in
+/// its place as a stall throughout, block one poll on a channel nobody sends on, a futex sleep (`S`), for three windows.
+/// Expect: the beat stops within a window and three beats of the block: a thread whose own state says it is not waiting
+/// on memory is not excused, however the host stalls.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_shard_asleep_while_the_host_stalls_stops_the_beat() {
+  common::supervised::run(
+    "a_shard_asleep_while_the_host_stalls_stops_the_beat_role",
+    "liveness-asleep-stalled",
+    2,
+  );
+}
+
+/// The role [`a_shard_asleep_while_the_host_stalls_stops_the_beat`] runs as a supervised daemon's process.
+#[test]
+#[cfg(target_os = "linux")]
+#[ignore = "a role: run by a_shard_asleep_while_the_host_stalls_stops_the_beat as a supervised child"]
+fn a_shard_asleep_while_the_host_stalls_stops_the_beat_role() {
+  a_blocked_shard_stops_the_beat_while(
+    "a_shard_asleep_while_the_host_stalls_stops_the_beat_role",
+    "asleep while the host stalls",
+    block_on_a_channel,
+    Some(true),
   );
 }
 

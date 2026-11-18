@@ -1,0 +1,118 @@
+# Diagnostics only, never merged (g251, A-336): a shard waiting on memory while the host stalls is starved, not
+# wedged. Linux is where the thread's own wait is told (`D`), so the green, three red-checks (the excuse removed, the
+# `D` gate removed, the anchor's reading withheld) and the touched crates' suites run here, x86_64 and arm64.
+name: diag-g251-pressure
+
+on:
+  push:
+    branches: ['diag-g251-pressure-*']
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  pressure:
+    name: memory stall on Linux (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 175
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: The host's reading
+        if: success() || failure()
+        run: |
+          cat /proc/pressure/memory || echo "no PSI here"
+          uname -a
+      - name: Green (the rule, the readings, the watchdog's loop, the anchor's judgment)
+        if: success() || failure()
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked -p slates-machine --lib memory_stall -- --nocapture 2>&1 | tee green-machine.log
+          cargo test --locked -p slates-rt --lib thread_clock 2>&1 | tee green-rt.log
+          cargo test --locked -p slates-server --lib watchdog 2>&1 | tee green-watchdog.log
+          cargo test --locked -p slates-server --test liveness -- --nocapture 2>&1 | tee green-liveness.log
+          cargo test --locked -p slates-api --lib role::anchor -- --nocapture 2>&1 | tee green-api.log
+          grep -q 'a_thread_the_kernel_holds_reads_uninterruptible_and_a_sleeping_one_does_not ... ok' green-rt.log
+          grep -q 'a_shard_waiting_on_memory_keeps_the_beat_while_the_host_stalls_and_stops_it_a_window_after ... ok' green-liveness.log
+          grep -q 'a_shard_asleep_while_the_host_stalls_stops_the_beat ... ok' green-liveness.log
+          grep -q 'a_process_waiting_on_memory_is_spared_while_the_host_stalls_and_stuck_a_window_after ... ok' green-api.log
+      - name: Red A (the memory excuse removed from the judgment)
+        if: success() || failure()
+        shell: bash
+        run: |
+          set +e
+          F=crates/server/src/watchdog.rs
+          cp "$F" watchdog.orig
+          perl -0pi -e 's/let memory = !waiting && held_for_memory\(/let memory = false && held_for_memory(/' "$F"
+          echo "mutant sites: $(grep -c 'let memory = false && held_for_memory(' "$F")"
+          cargo test --locked -p slates-server --lib watchdog::tests::a_shard_waiting_on_memory > red-a-unit.log 2>&1
+          unit=$?
+          cargo test --locked -p slates-server --test liveness -- a_shard_waiting_on_memory_keeps_the_beat > red-a-live.log 2>&1
+          live=$?
+          cp watchdog.orig "$F"
+          grep -E '^error|panicked at|^test result|withheld|left|right' red-a-unit.log red-a-live.log | head -40
+          echo "red A unit exit $unit, by-use exit $live; restored: $(grep -c 'let memory = false' "$F")"
+          test "$unit" -ne 0 && test "$live" -ne 0 && ! grep -q '^error\[' red-a-unit.log red-a-live.log
+      - name: Red B (the thread's own wait no longer gates the excuse)
+        if: success() || failure()
+        shell: bash
+        run: |
+          set +e
+          F=crates/server/src/watchdog.rs
+          cp "$F" watchdog.orig
+          perl -0pi -e 's/run\.uninterruptible != Some\(false\)\)/(run.uninterruptible != Some(false) || run.uninterruptible == Some(false)))/' "$F"
+          echo "mutant sites: $(grep -c 'run.uninterruptible == Some(false)))' "$F")"
+          cargo test --locked -p slates-server --lib watchdog::tests::a_shard_asleep_or_unread > red-b-unit.log 2>&1
+          unit=$?
+          cargo test --locked -p slates-server --test liveness -- a_shard_asleep_while_the_host_stalls_stops_the_beat > red-b-live.log 2>&1
+          live=$?
+          cp watchdog.orig "$F"
+          grep -E '^error|panicked at|^test result|never stopped|left|right' red-b-unit.log red-b-live.log | head -40
+          echo "red B unit exit $unit, by-use exit $live; restored: $(grep -c 'run.uninterruptible == Some(false)))' "$F")"
+          test "$unit" -ne 0 && test "$live" -ne 0 && ! grep -q '^error\[' red-b-unit.log red-b-live.log
+      - name: Red C (the anchor's judgment reads no memory stall)
+        if: success() || failure()
+        shell: bash
+        run: |
+          set +e
+          F=crates/api/src/role/anchor.rs
+          cp "$F" anchor.orig
+          perl -0pi -e 's/    run,\n    memory,\n    now_ns: now,/    run,\n    memory: memory.filter(|_| false),\n    now_ns: now,/' "$F"
+          echo "mutant sites: $(grep -c 'memory.filter(|_| false)' "$F")"
+          cargo test --locked -p slates-api --lib role::anchor::lapse_tests::a_process_waiting_on_memory > red-c.log 2>&1
+          code=$?
+          cp anchor.orig "$F"
+          grep -E '^error|panicked at|^test result|stuck while' red-c.log | head -20
+          echo "red C exit $code; restored: $(grep -c 'memory.filter(|_| false)' "$F")"
+          test "$code" -ne 0 && grep -q 'stuck while the host stalled' red-c.log && ! grep -q '^error\[' red-c.log
+      - name: slates-machine
+        if: success() || failure()
+        run: cargo test --locked -p slates-machine
+      - name: slates-rt
+        if: success() || failure()
+        run: cargo test --locked -p slates-rt
+      - name: slates-api and slates-cli (lib)
+        if: success() || failure()
+        run: cargo test --locked -p slates-api -p slates-cli --lib
+      - name: slates-server
+        if: success() || failure()
+        env:
+          SLATES_FLEET_TRACE: "1"
+          SLATES_TEST_HEDGE_STARVATION_SECS: "20"
+          SLATES_TEST_RESTART_SLOWDOWN: "10"
+          SLATES_TEST_FLEET_DEADLINE_SECS: "120"
+        run: cargo test --locked -p slates-server --no-fail-fast
+      - name: The lint wall over the touched crates and their downstream
+        if: success() || failure()
+        run: cargo clippy --locked -p slates-machine -p slates-rt -p slates-server -p slates-api -p slates-cli --all-targets -- -D warnings
