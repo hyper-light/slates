@@ -4426,6 +4426,7 @@ async fn init_shard(
     journal: slates_vfs::checkpoint_log::Journal::default(),
     checkpoint_buffer: Vec::new(),
     published_keys: std::collections::BTreeSet::new(),
+    deferred_kept: false,
     published_held: crate::content_holder::PublishedHeld::default(),
     write_log,
     #[cfg(unix)]
