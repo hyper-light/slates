@@ -1111,6 +1111,10 @@ struct NotRun {
   signature: Option<Vec<u8>>,
   /// The grant it was to run under.
   grant: Option<u64>,
+  /// The manifest its grant binds, when the shard held the grant as the attempt began: a granted landing, whose
+  /// refusal its trail and its landing record keep ([`record_refused`]). `None` for a grant the shard does not hold
+  /// (never issued, or ended): such a landing is not a granted one, and the engine presents it once planned.
+  granted: Option<[u8; 32]>,
   /// The audit ring's sequence when it began ([`GrantedRun`]'s).
   audit_from: u64,
 }
@@ -1568,6 +1572,10 @@ fn begin_granted(
   let presented = prepared.grant.and_then(|g| presentation_for(state, g));
   let landing_id = presented
     .unwrap_or_else(|| crate::verbs::landing_id(state.partition, state.landing.next_landing));
+  let granted = prepared
+    .grant
+    .and_then(|grant| state.landing.grants.get(GrantId(grant)))
+    .map(|grant| grant.manifest);
   let not_run = |refusal: Unrun, principal: Principal| {
     Begun::NotRun(Box::new(NotRun {
       refusal,
@@ -1580,6 +1588,7 @@ fn begin_granted(
       client: prepared.client,
       signature: prepared.signature.clone(),
       grant: prepared.grant,
+      granted,
       audit_from,
     }))
   };
@@ -1679,6 +1688,7 @@ fn begin_granted(
     target_dir: land_target.dir,
     implicit,
     signature: prepared.signature,
+    granted,
     audit_from,
   }))
 }
@@ -1704,6 +1714,8 @@ struct Planning {
   implicit: Option<slates_vfs::ids::SnapshotId>,
   /// The landing's signature, if its request carried one (A-321).
   signature: Option<Vec<u8>>,
+  /// The manifest its grant binds, when the shard held the grant as it began ([`NotRun`]'s).
+  granted: Option<[u8; 32]>,
   /// The audit ring's sequence when this run began ([`GrantedRun`]'s).
   audit_from: u64,
 }
@@ -1749,6 +1761,7 @@ fn finish_planning(
       client: planning.client,
       signature: planning.signature.clone(),
       grant: planning.grant,
+      granted: planning.granted,
       audit_from: planning.audit_from,
     }))
   };
@@ -2128,11 +2141,14 @@ fn complete_finish(
           landing_id: granted.landing_id,
           fresh: granted.fresh,
           grant: granted.grant,
+          granted: granted.run.grant().manifest,
           principal: &granted.principal,
           volume: granted.volume,
+          snapshot: granted.snapshot,
           target: &granted.target,
           signature: granted.signature.as_deref(),
           audit_from: granted.audit_from,
+          conflicts: conflicts_of(&refusal),
         };
         if let Err(e) = record_refused(state, &attempt) {
           return refused(crate::error::refusal_of_db(&e));
@@ -2158,20 +2174,28 @@ fn reply_not_run(state: &mut ShardState, not_run: NotRun) -> ReplyBody {
     principal: &not_run.principal,
     signature: not_run.signature.as_deref(),
   };
-  let trailed = match &not_run.refusal {
-    Unrun::Engine(refusal) => ends_refused(refusal),
-    Unrun::Server(_) => true,
+  let (ended, conflicts) = match &not_run.refusal {
+    Unrun::Engine(refusal) => (ends_refused(refusal), conflicts_of(refusal)),
+    Unrun::Server(_) => (true, 0),
   };
-  if trailed {
+  // Only a granted landing leaves a trail: one whose grant the shard held as it began. A landing under a grant the shard
+  // does not hold is presented once planned (the engine's `GrantRequired`), so refused before its plan it is a refused
+  // request, as an ungranted one is.
+  if let Some(granted) = not_run.granted
+    && ended
+  {
     let attempt = Attempt {
       landing_id: not_run.landing_id,
       fresh: not_run.fresh,
       grant: not_run.grant,
+      granted,
       principal: &not_run.principal,
       volume: not_run.volume,
+      snapshot: not_run.snapshot,
       target: &not_run.target,
       signature: not_run.signature.as_deref(),
       audit_from: not_run.audit_from,
+      conflicts,
     };
     if let Err(e) = record_refused(state, &attempt) {
       return refused(crate::error::refusal_of_db(&e));
@@ -2189,29 +2213,60 @@ fn ends_refused(refusal: &LandingRefusal) -> bool {
   !matches!(refusal, LandingRefusal::GrantRequired(_))
 }
 
-/// Who a granted landing's attempt was, as its trail names it: its id, its grant, whom it ran for, what it would have
-/// landed where, its signature, and where its records start in the engine's ring.
+/// Who a granted landing's attempt was, as its trail and its landing record name it: its id, its grant and the
+/// manifest the grant binds, whom it ran for, what it would have landed where, its signature, where its records start
+/// in the engine's ring, and the entries its refusal found in conflict.
 struct Attempt<'a> {
   landing_id: u64,
   /// Whether the id is a fresh one rather than its presentation's.
   fresh: bool,
   grant: Option<u64>,
+  /// The manifest its grant binds: what it was approved to land, named when it planned nothing.
+  granted: [u8; 32],
   principal: &'a Principal,
   volume: DbVolumeId,
+  snapshot: DbSnapshotId,
   target: &'a str,
   signature: Option<&'a [u8]>,
   /// The audit ring's sequence when the attempt began ([`GrantedRun`]'s `audit_from`).
   audit_from: u64,
+  /// The entries a conflict refused it for; zero for any other refusal.
+  conflicts: u32,
 }
 
-/// Records a refused granted landing's trail (§4.15 "Audit", the state machine's `→ Refused` and `→ Aborted`), in its
-/// completion's atom: the records the engine's ring holds of the attempt from its beginning on (its plan, its
-/// validation, each entry it wrote or refused), then its end, a `LandingFinished` naming its terminal state
-/// ([`refused_state`]), the manifest it planned, or its grant's when it planned none, and its signature judged against
-/// that manifest. An attempt whose ring records hold its end already adds none. A fresh id is spent, as a finished
-/// landing's is, so no later landing's trail shares it. Before 2026-11-18 a refused granted landing recorded none of
-/// this, and its trail ended at its grant (found by g90 reading the code;
-/// `docs/bugs/2026-11-18-a-refused-granted-landing-left-no-trail.md`).
+/// The entries `refusal` names in conflict (§4.15 step 4): a conflict's entries whose verdict is a conflict, as its
+/// answer names them; zero for any other refusal.
+fn conflicts_of(refusal: &LandingRefusal) -> u32 {
+  match refusal {
+    LandingRefusal::Conflict(entries) => u32::try_from(
+      entries
+        .iter()
+        .filter(|entry| {
+          matches!(
+            entry.verdict,
+            Some(slates_land::verdict::Verdict::Conflict(_))
+          )
+        })
+        .count(),
+    )
+    .unwrap_or(u32::MAX),
+    _ => 0,
+  }
+}
+
+/// Records a refused granted landing's end (§4.15 "Audit", the state machine's `→ Refused` and `→ Aborted`), in its
+/// completion's atom. Two things are written:
+/// - **The trail.** The records the engine's ring holds of the attempt from its beginning on (its plan, its validation,
+///   each entry it wrote or refused), then a `LandingFinished`. That record names the terminal state
+///   ([`refused_state`]), the manifest the attempt planned, or its grant's when it planned none, and its signature
+///   judged against that manifest. An attempt whose ring records hold its end already adds none.
+/// - **The landing record, at the same terminal state.** Its presentation's record moves there, and a fresh id's is
+///   made, so the record and the audit cannot disagree. A fresh id is spent, as a finished landing's is, and the
+///   record keeps it spent across a restart (`verbs::next_landing_counter`).
+///
+/// Before 2026-11-18 a refused granted landing recorded none of this: its trail ended at its grant (found by g90
+/// reading the code; `docs/bugs/2026-11-18-a-refused-granted-landing-left-no-trail.md`). Until a later change the same
+/// day its record stayed as presented, or was never made, while its trail said it was refused.
 fn record_refused(state: &mut ShardState, attempt: &Attempt<'_>) -> Result<(), slates_db::DbError> {
   let ring: Vec<AuditRecord> = state
     .landing
@@ -2225,34 +2280,29 @@ fn record_refused(state: &mut ShardState, attempt: &Attempt<'_>) -> Result<(), s
     .iter()
     .rev()
     .find(|record| record.kind == AuditKind::LandingPlanned)
-    .map(|record| record.manifest)
-    .or_else(|| {
-      let grant = state.landing.grants.get(GrantId(attempt.grant?))?;
-      Some(grant.manifest)
-    });
-  // A landing that names no manifest (refused before its plan, under a grant that names none) has no statement to judge
-  // a signature against; its end records no verdict, which `audit_verb` reads as none.
-  let verification = manifest.map(|manifest| {
-    landing_verdict(
-      state,
-      (attempt.volume, attempt.target, &manifest),
-      attempt.signature,
-    )
-    .1
-  });
-  // The ring holds an attempt's records only from its plan on, whose manifest judged the signature, so the stand-in is
-  // never what a mirrored plan or end keeps.
-  let unjudged = slates_ipc::protocol::Verification::Unsigned;
-  let judged = verification.as_ref().unwrap_or(&unjudged);
+    .map_or(attempt.granted, |record| record.manifest);
+  let (_, verification) = landing_verdict(
+    state,
+    (attempt.volume, attempt.target, &manifest),
+    attempt.signature,
+  );
+  let ended = refused_state(&ring);
+  let written = u32::try_from(
+    ring
+      .iter()
+      .filter(|record| record.kind == AuditKind::EntryWritten)
+      .count(),
+  )
+  .unwrap_or(u32::MAX);
   let mut records: Vec<DbAuditRecord> = ring
     .iter()
-    .map(|record| db_audit(record, attempt.principal, judged))
+    .map(|record| db_audit(record, attempt.principal, &verification))
     .collect();
+  let now = state.clock.monotonic_ns();
   if !ring
     .iter()
     .any(|record| record.kind == AuditKind::LandingFinished)
   {
-    let now = state.clock.monotonic_ns();
     records.push(DbAuditRecord {
       seq: 0,
       at_ns: now,
@@ -2260,17 +2310,37 @@ fn record_refused(state: &mut ShardState, attempt: &Attempt<'_>) -> Result<(), s
       principal: attempt.principal.clone(),
       grant: attempt.grant,
       landing: Some(attempt.landing_id),
-      manifest,
-      outcome: Some(refused_state(&ring)),
-      signature: verification
-        .as_ref()
-        .and_then(crate::signed_work::to_record),
+      manifest: Some(manifest),
+      outcome: Some(ended),
+      signature: crate::signed_work::to_record(&verification),
     });
   }
+  let landing = if state.db.partition().landing(attempt.landing_id).is_some() {
+    Op::LandingStateChanged {
+      id: attempt.landing_id,
+      state: ended,
+      written,
+      conflicts: attempt.conflicts,
+    }
+  } else {
+    Op::LandingRecorded {
+      record: LandingRecord {
+        id: attempt.landing_id,
+        volume: attempt.volume,
+        snapshot: attempt.snapshot,
+        target: attempt.target.to_owned(),
+        manifest,
+        grant: attempt.grant,
+        state: ended,
+        written,
+        conflicts: attempt.conflicts,
+      },
+    }
+  };
+  state.db.mutate(&mut state.segment, &landing, now)?;
   if attempt.fresh {
     state.landing.next_landing = state.landing.next_landing.saturating_add(1);
   }
-  let now = state.clock.monotonic_ns();
   write_audit(state, records, now)
 }
 
@@ -3633,9 +3703,9 @@ pub fn audit_verb(state: &ShardState, since: u64) -> ReplyBody {
       audit_kind: wire_audit_kind(record.kind),
       stage: record.outcome.map(wire_landing_stage),
       // A record of a landing as a whole — its presentation, a granted run's plan, its finish — says how the landing's
-      // signature was judged (A-321), unsigned when it carried none; no other record judges one, nor the end of a landing
-      // refused before anything named its manifest (`record_refused`), which had no statement to judge. A verdict this
-      // build names no code for (a newer build's record) reads as none.
+      // signature was judged (A-321), unsigned when it carried none; no other record judges one, nor one that names no
+      // manifest, which had no statement to judge. A verdict this build names no code for (a newer build's record) reads
+      // as none.
       verification: (matches!(
         record.kind,
         slates_db::catalog::AuditKind::LandingPlanned

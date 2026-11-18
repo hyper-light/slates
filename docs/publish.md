@@ -76,7 +76,9 @@ installing it would do:
 7. When the anchor is stopped, the daemon leaves with it.
 
 Every target is built twice, each copy on a runner of its own, and the release is refused unless the two copies are
-the same bytes (AC-9.5). The Windows binaries are linked with `/Brepro`, so MSVC's linker takes its timestamps and
+the same bytes (AC-9.5). Both copies must run on one runner image: the Windows binaries link the image's MSVC C runtime, so
+two images can build two binaries from one tag. A pair from two images is refused with both images named (A-407);
+run one copy again (`gh run rerun <run> --job <job>`) until the pair shares an image. The Windows binaries are linked with `/Brepro`, so MSVC's linker takes its timestamps and
 PDB GUID from the content, not the clock.
 
 The smoke test records the binary's SHA-256 and BLAKE3, its `rustc -vV`, the runner image and

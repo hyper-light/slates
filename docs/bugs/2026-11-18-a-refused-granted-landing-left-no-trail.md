@@ -61,11 +61,28 @@ was right in every case, and nothing else read the ring.
 - `crates/api/src/observe.rs`: the docs of `AuditRecord::outcome` and `AuditRecord::verification`.
 - Design §4.15 (a status blockquote); GAPS (the A-321 list's entry).
 
-## Siblings swept
+## The landing record, the same day (second change)
 
-- A refused granted landing's durable `LandingRecord` is unchanged. A presented one stays `AwaitingGrant` (its
-  presentation is still grantable), and a fresh one has none. Nothing reads a landing record's state: `present` and
-  `finish` write it, and no code in `crates/server` or `crates/db` reads it. Reported, not changed.
+The first fix left a refused granted landing's durable `LandingRecord` as it was. A presented one stayed
+`AwaitingGrant` while its trail said `refused`, and a fresh one had no record at all. Nothing reads a landing record's
+state, but a restart's landing counter (`verbs::next_landing_counter`) is one past the highest recorded id. So a
+refused fresh attempt's spent id could be minted again after a restart, and two landings' trails would share it.
+
+`record_refused` now writes the record in the same atom as the trail. A presentation's record moves to the terminal
+state (`LandingStateChanged`, with the entries written and those in conflict), and a fresh id's record is made
+(`LandingRecorded`).
+
+The same change narrows the trail to granted landings, those whose grant the shard held as the attempt began
+(`NotRun::granted`, `Planning::granted`, the run's own grant). A landing under a grant the shard does not hold (never
+issued, or ended) is presented once planned, the engine's `GrantRequired`. So refused before its plan, it is a refused
+request, with no id spent and no trail. Under the first change it spent an id and wrote an end naming no manifest,
+with no record behind it. Every refused granted landing's end now names its manifest and verdict (`CONTRACT` = 35).
+
+The tests read the record's state: `Refused` with the conflict counted, and `Refused` for the mismatch and the lease.
+`a_landing_under_a_grant_the_shard_does_not_hold_refused_before_its_plan_leaves_no_trail` replaces the test of an end
+with no manifest.
+
+## Siblings swept
 - Refusals the `Land` verb answers before its task starts are refusals of the request, recorded as its completion,
   not landing attempts. These are the volume or snapshot not found, the caller's rights, a forbidding policy, the
   target not opened, and a second landing of a volume already running. Unchanged.
