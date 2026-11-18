@@ -115,8 +115,9 @@ fn a_grant_issued_before_the_walk_is_listed_exactly_once() {
 }
 
 /// §4.15, §4.3. Do: present a landing whose target is one byte longer than a grant's summary can carry on one page.
-/// Expect: `TargetUnavailable` naming both lengths, before the daemon touches the host or presents anything: a landing
-/// that could be granted is one whose grant can be listed.
+/// Expect: `Target { TooLong }` naming the longest the daemon takes, before the daemon touches the host or presents
+/// anything: a landing that could be granted is one whose grant can be listed. Typed since main's A-299 sweep made
+/// `TargetUnavailable`'s words a protocol fault (2026-11-18); it carried both lengths in words before.
 #[test]
 fn a_target_longer_than_a_grants_page_holds_is_refused_before_presenting() {
   let (daemon, instance) = daemon("long-target");
@@ -126,10 +127,13 @@ fn a_target_longer_than_a_grants_page_holds_is_refused_before_presenting() {
   eprintln!("the longest grantable target: {longest} bytes");
   let target = format!("/{}", "t".repeat(longest));
   match client.land(volume, None, &target, Filter::default(), None) {
-    Err(ClientError::Refused(Refusal::TargetUnavailable { reason })) => {
-      assert!(
-        reason.contains(&target.len().to_string()) && reason.contains(&longest.to_string()),
-        "the refusal names both lengths: {reason}"
+    Err(ClientError::Refused(Refusal::Target {
+      refusal: slates_ipc::protocol::TargetRefusal::TooLong { longest: named },
+    })) => {
+      assert_eq!(
+        usize::try_from(named).ok(),
+        Some(longest),
+        "the refusal names the longest target the daemon takes"
       );
     }
     other => panic!("a {}-byte target: {other:?}", target.len()),

@@ -41,6 +41,12 @@ pub enum VfsError {
   TooManyLinks,
   /// `ENOSPC`: the quota, or the pressure source, refused the bytes; nothing changed.
   NoSpace,
+  /// `ENOSPC` at a mount, typed apart from the quota (§4.2 `RetentionBudgetExceeded`): keeping what a snapshot pins (a
+  /// retained inode version, or the bytes a change would let go of) would take capacity no admission left unpromised,
+  /// or go past the volume's retention allowance; nothing changed. Destroying a snapshot frees it. Until 2026-11-18 it
+  /// was `NoSpace`, which a consumer read as its quota: kiln's review of a snapshot was refused "a bound is reached:
+  /// Quota" when the bound was the shard's version slab (A-342).
+  RetentionExceeded,
   /// `EFBIG`: an offset or length beyond what the volume addresses.
   FileTooLarge,
   /// `EXDEV`: a move across volumes.
@@ -163,7 +169,7 @@ impl VfsError {
       Self::InvalidName => "EINVAL",
       Self::NameTooLong | Self::TreeTooDeep { .. } => "ENAMETOOLONG",
       Self::TooManyLinks => "EMLINK",
-      Self::NoSpace => "ENOSPC",
+      Self::NoSpace | Self::RetentionExceeded => "ENOSPC",
       Self::FileTooLarge => "EFBIG",
       Self::CrossVolumeMove => "EXDEV",
       Self::StaleHandle => "ESTALE",

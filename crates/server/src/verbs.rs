@@ -4257,6 +4257,8 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::PolicyChanged { .. } => "policy_changed",
     Refusal::SignatureRequired { .. } => "signature_required",
     Refusal::Volume { .. } => "volume",
+    Refusal::Database { .. } => "database",
+    Refusal::Target { .. } => "target",
     Refusal::VerdictReplaced { .. } => "verdict_replaced",
     Refusal::ImageRefused { .. } => "image_refused",
     Refusal::NotRootLeader => "not_root_leader",
@@ -12631,12 +12633,11 @@ fn refused_before_dispatch(
   if let RequestBody::Land { target, .. } = body
     && target.len() > crate::landing::longest_grantable_target()
   {
-    return Some(Refusal::TargetUnavailable {
-      reason: format!(
-        "a target of {} bytes is longer than the {} a grant's listing holds",
-        target.len(),
-        crate::landing::longest_grantable_target()
-      ),
+    // Typed (A-299's `Refusal::Target`): the length a grant's listing holds, which the caller compares its own with.
+    return Some(Refusal::Target {
+      refusal: slates_ipc::protocol::TargetRefusal::TooLong {
+        longest: u64::try_from(crate::landing::longest_grantable_target()).unwrap_or(u64::MAX),
+      },
     });
   }
   if new_volume_name(body).is_some_and(|name| name.len() > longest_name()) {

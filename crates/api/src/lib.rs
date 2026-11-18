@@ -148,18 +148,27 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// destroy among them (A-299; the same day). 16: `Instance::unmount` and the seam's `unmount` answer what was removed ([`Unmounted`]): on
 /// Windows each volume the scan could not ask is named there when another volume reported the drive (it was named only
 /// when none did), and a host refusal renders in words, the daemon's `TargetUnavailable` by that name (A-299; the same
-/// day). 17: lists a page at a time (A-263 to A-267): `Page`, `Instance::{list_page, grants_page, audit_page,
+/// day). 17: the daemon's database refusals typed (`DatabaseRefusal`, unusable as `Unusable::Database`): until then a
+/// corrupt record, a regressed NFSv4 instance, a checkpoint out of range, a malformed sealing key and a refused encoding
+/// reached a consumer as an invalid request carrying words (A-299; the same day). 18: a snapshot's retention refused is
+/// typed apart from the quota (`VolumeRefusal::RetentionExceeded`, exhausted as `Exhausted::Volume`): until then the
+/// volume core answered it `NoSpace`, which a consumer read as its own quota (kiln's review, A-342's record; the same
+/// day). 19: a target's refusal is typed (`HostFault::Target(TargetRefusal)`, the wire's appended `Refusal::Target`):
+/// until then a landing target's, a mount point's and a mount's refusals carried the daemon's words; the superseded
+/// `TargetUnavailable` is a protocol fault, since no daemon of this build sends it (A-299; the same day).
+/// 20: lists a page at a time (A-263 to A-267): `Page`, `Instance::{list_page, grants_page, audit_page,
 /// changed_since, changed_since_page, drift_page}`, `DriftPage`, `DriftReport::elided`, `ChangedCursor`;
-/// `Instance::drift` reads every entry (the same day). 18: a list a verb's own reply carries counts what one reply could
+/// `Instance::drift` reads every entry; a landing target longer than a grant's listing holds is refused
+/// `TargetRefusal::TooLong` (A-266) (the same day). 21: a list a verb's own reply carries counts what one reply could
 /// not hold (A-267): `Instance::rewitness` answers `Rewitnessed { paths, paths_elided }`, `Stale::Disk` carries
 /// `elided`, `LandingReport` carries `degraded_elided`, and a presentation is clean only when it carries and counts no
-/// conflict (the same day). 19: `Stale::Verdict`, a merge's or a rebase's conflict windows read after the work's verdict
+/// conflict (the same day). 22: `Stale::Verdict`, a merge's or a rebase's conflict windows read after the work's verdict
 /// was replaced; `merge` and `rebase` answer every window of a verdict however many, a signed merge's too (A-267) (the
-/// same day). 20: `drift_page` reads past an inode (`after: Option<u64>`), in inode order, re-checking the entries it
+/// same day). 23: `drift_page` reads past an inode (`after: Option<u64>`), in inode order, re-checking the entries it
 /// passes; `drift` answers its lists in path order (A-267) (the same day).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 20;
+pub const CONTRACT: u32 = 23;
 
 /// What a rewitness did (§4.15 `rewitness`): the paths one reply holds and the count of the rest (A-267).
 pub use slates_client::Rewitnessed;
@@ -167,11 +176,12 @@ pub use slates_client::Rewitnessed;
 pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, VhostUserDevice};
 /// The wire's types the contract takes and returns (§4.9; append-only, D-15).
 pub use slates_ipc::protocol::{
-  AttachTransport, ChangedCursor, ConflictClass, DaemonReport, Filter, GrantScope, GreenBase,
-  HostAnswer, HostPathReason, Intent, JournalReport, LandingDegradation, LandingDurability,
-  LossReport, MountReport, NamePolicy, OwnMountUse, PlacedState, PlannedAction, PlannedContent,
-  PlannedEntry, Principal, ReadAt, RecoveryCause, SnapshotId, TelemetryReport, TransportReport,
-  UnsupportedReason, VolumeId, VolumeRefusal, VolumeSummary, VolumeTakeover,
+  AttachTransport, ChangedCursor, ConflictClass, DaemonReport, DatabaseRefusal, Filter, GrantScope,
+  GreenBase, HostAnswer, HostPathReason, Intent, JournalReport, LandingDegradation,
+  LandingDurability, LossReport, MountReport, NamePolicy, OwnMountUse, PlacedState, PlannedAction,
+  PlannedContent, PlannedEntry, Principal, ReadAt, RecoveryCause, SnapshotId, TargetRefusal,
+  TelemetryReport, TransportReport, UnsupportedReason, VolumeId, VolumeRefusal, VolumeSummary,
+  VolumeTakeover,
 };
 /// The rendezvous's and the channel's own typed refusals the contract carries.
 pub use slates_ipc::{DeliveryFault, error::RouteRefusal};

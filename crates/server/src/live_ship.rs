@@ -2219,6 +2219,16 @@ pub(crate) fn catalog_placed(state: &mut ShardState, catalog: ObjectId) {
 /// owed at a checkpoint the holder already holds cannot move it, so instead the volume is marked to owe a fresh whole
 /// record (its next publication or the period appends one, and the install is made from that).
 fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
+  // A superseded owner ships nothing more of the volume it lost (A-349): every holder refuses its log `StaleEpoch`, and
+  // each send held that holder's record session for an exchange that could never land. Until 2026-11-18 the record
+  // period sent the entries a holder lacked again every period: an owner admitted again after its takeover had its
+  // sessions out on that loan at the start of every period, where its own takeover round of another departure met
+  // them, never asked the other survivor and gave up two objects within tolerance (the chaos nemesis, seed
+  // 6876545201569229162: `fleet.live.install_built` about 2,240 after its fence, `fleet.takeover.pages_unsent` 213 to
+  // 928).
+  if fenced(state, volume).is_some() {
+    return Vec::new();
+  }
   if !holders_placed(state, volume) {
     return Vec::new();
   }
@@ -3052,6 +3062,12 @@ fn period_slice(s: &mut ShardState, after: Option<[u8; 16]>) -> Option<[u8; 16]>
 /// The period's visit to one live volume: follows its candidates, retries holders whose last lane went unanswered,
 /// answers writers whose wait a condition met, and owes or ships the whole record or image it is due.
 fn period_volume(s: &mut ShardState, volume: [u8; 16]) {
+  // A superseded owner's log does no more period work (A-349): no holder takes it ([`pending_sends`]), its writers were
+  // refused when it learned its fence ([`learn_superseded`]), and following its candidates would record a holder set,
+  // or make a whole record or an image, for a volume that is not its own any more.
+  if fenced(s, volume).is_some() {
+    return;
+  }
   let id = slates_db::catalog::VolumeId { bytes: volume };
   follow_candidates(s, volume);
   // The period is what retries a holder whose last lane went unanswered ([`LiveVolume::unreachable`]).

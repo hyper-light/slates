@@ -245,7 +245,9 @@ fn unmount_verb(instance: &str, path: &str) -> Result<(), Failure> {
 }
 
 /// A library refusal as the command's failure: a refusal (exit 1) for every class the daemon or the machine refused
-/// with, no daemon (exit 3), or the command's own (exit 4), as [`failure_of`] maps the client's (A-299's taxonomy).
+/// with, no daemon (exit 3), or the command's own (exit 4), as [`failure_of`] maps the client's (A-299's taxonomy). A
+/// missing issuer authority is the command's own: nothing was asked of the daemon, since the anchor's surface is not in
+/// this command's environment (`docs/cli.md`'s exit 4; until 2026-11-18 it exited 1, the integrator's CLI flow found it).
 fn failure_of_api(error: slates_api::Error, instance: &str) -> Failure {
   use slates_api::Error as E;
   match error {
@@ -253,6 +255,7 @@ fn failure_of_api(error: slates_api::Error, instance: &str) -> Failure {
       instance: instance.to_owned(),
       cause: cause.to_string(),
     },
+    own @ E::Denied(slates_api::Denied::NoAuthority(_)) => Failure::Failed(own.to_string()),
     E::Mount(
       fault @ (slates_api::MountFault::Unsupported { .. } | slates_api::MountFault::NoCapability),
     ) => Failure::Refused(fault.to_string()),
@@ -3024,8 +3027,29 @@ mod harness_tests {
 
 #[cfg(test)]
 mod tests {
-  use super::{chokepoint_value, digest_json, signal_value};
+  use super::{chokepoint_value, digest_json, failure_of_api, signal_value};
+  use crate::Failure;
   use slates_client::{AbsenceIs, ChokepointReport, Digest, Signal};
+
+  /// The integrator's report (2026-11-18, the CLI flow on d1323898: `slates enroll` with no anchor in the environment
+  /// exited 1 printing `denied: NoAuthority(NoHandoff)`). Do: map a missing issuer authority and a revoked consumer's
+  /// denial to the command's failure. Expect the first the command's own (exit 4) naming the anchor's surface it needs,
+  /// as `docs/cli.md` says, and the second the daemon's refusal (exit 1).
+  #[test]
+  fn a_missing_issuer_authority_fails_the_command_and_a_denial_is_a_refusal() {
+    let missing = failure_of_api(
+      slates_api::Error::Denied(slates_api::Denied::NoAuthority(
+        slates_api::IssuerFault::NoHandoff,
+      )),
+      "i",
+    );
+    assert!(
+      matches!(&missing, Failure::Failed(text) if text.contains("no anchor in this environment")),
+      "{missing:?}"
+    );
+    let revoked = failure_of_api(slates_api::Error::Denied(slates_api::Denied::Revoked), "i");
+    assert!(matches!(revoked, Failure::Refused(_)), "{revoked:?}");
+  }
 
   /// A chokepoint renders its activity when fresh, and `absent/<meaning>` when its newest span is past
   /// the horizon or it never reported — the stale age stated as a last sighting, never as a live value

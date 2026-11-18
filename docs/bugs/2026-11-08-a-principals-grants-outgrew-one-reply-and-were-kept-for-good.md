@@ -23,7 +23,8 @@ on one page could need more room than the page holds.
   keeps the highest id ever issued (`grants_issued_through`, snapshotted), so a grant id is never reused and an absent
   id at or below it is refused as spent (`GrantInvalid`), never taken for a new presentation.
 - The reap tick ends grants past their term (`end_expired_grants`, counted `landing.grants_expired`).
-- A landing target is refused `TargetUnavailable` past the longest a grant's summary holds alone on one grants page
+- A landing target is refused (`TargetUnavailable` then; `Target { TooLong }` since 2026-11-18, A-299's typed targets)
+  past the longest a grant's summary holds alone on one grants page
   (`longest_grantable_target`: the page's room less a summary with an empty target in its longest state, 3,995 bytes),
   before the daemon touches the host. Landing runs on macOS and Linux: on macOS a path past 1,023 bytes (`PATH_MAX`
   less its NUL) cannot be opened anyway, so the bound binds on Linux, where `PATH_MAX` is 4,096.

@@ -76,6 +76,8 @@ memory refusal now go through `refusal_of_mem` (`crates/server/src/error.rs`). I
 No test reaches these arms by use today. Each reservation refuses only `BudgetExceeded` (`Ledger::take`), and the
 registry shares its bound, `caps.volumes`, with the database's volume table, which a create checks first. So their
 proof is the mapping's unit test, `every_memory_refusal_at_admission_is_typed`.
-Still owed: `refusal_of_db`'s last catch-all sends `Corrupt`, `NfsInstanceRegressed`, `CheckpointOutOfRange`,
-`SealKeyMalformed` and `Wire` as words.
+`refusal_of_db`'s last catch-all, which sent `Corrupt`, `NfsInstanceRegressed`, `CheckpointOutOfRange`,
+`SealKeyMalformed` and `Wire` as words, was removed the same day. Each is now `Refusal::Database { DatabaseRefusal }`,
+appended, and the contract classes it `Unusable::Database` (`CONTRACT` 17). The match is exhaustive. Unit tests:
+`every_database_refusal_is_typed` (server) and `a_database_refusal_is_typed_unusable` (api).
 
