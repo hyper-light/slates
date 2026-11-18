@@ -92,7 +92,13 @@
 > - **Owed:** auto-seal at a derived cadence (Phase 8 task 8), which bounds the window; it needs the operator's
 >   loss-window SLO, a decision for Ada (options in the g230 progress record).
 > - **Closed (2026-11-18, A-325):** the takeover report survives the successor's restart: it is kept in the volume's
->   record (`VolumeRecord::taken_over`). Test: `a_successors_takeover_report_survives_its_warm_restart`.
+>   record (`VolumeRecord::taken_over`). The test found that the volume itself did not: nothing published the shard's
+>   image after a takeover until the volume's first write, so a successor restarted before then refused it `NoImage`
+>   and never served it again. A volume taken over from its seal is now published before it is served. Test:
+>   `a_successors_takeover_report_survives_its_warm_restart`.
+> - **Owed:** a live-shipped volume taken over is still published first by its first write's barrier, so a successor
+>   restarted before that write loses it the same way; publishing it at the takeover starts the successor's live log
+>   there (`live_ship::published`), a change to the live takeover's shape that needs its own piece and its chaos runs.
 
 > **A sealed envelope's wrap and open were quadratic in its chunks: linear (2026-11-17, A-92 piece 3b; g230).** The
 > wrap (`slates_cluster::envelope::wrap`) checked each sealed chunk against every chunk already stored, and the open
