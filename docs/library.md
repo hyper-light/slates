@@ -46,8 +46,12 @@ fn main() -> ExitCode {
 - Every process of the instance carries `--instance NAME` in its arguments, so a host or a test can
   find exactly its own instance's processes.
 - The starter is the launcher: it sets its agents' write modes and approves what an ask mode holds.
-  Handing it the instance's issuer on every platform is owed (A-299); today it holds the issuer where
-  the anchor's handoff reaches it.
+  Its authority is a secret of its own: make one once with `LauncherSecret::generate()`, keep its
+  `bytes()` where the host keeps its secrets, and start with
+  `StartSpec::new(..).with_launcher(LauncherSecret::from_bytes(kept)?)` at every start; then
+  `Issuer::from_launcher_secret(&secret)` is the authority `approve_landing`, `approve_merge` and
+  `set_write_policy` take, after the host's restart as before it. (The daemon's verification of it is
+  being built, A-285.)
 
 ## The consumer contract
 
@@ -111,6 +115,17 @@ The variant says what to do:
 No enum of the contract is `#[non_exhaustive]`. Pin the contract: `slates_api::CONTRACT` is raised
 with every change to a type or a verb, so assert the one you wrote against, and match exhaustively
 where you must decide; a moved contract then fails your build at the place to update.
+
+### The seam and its simulator
+
+A host whose rules reach other products only through a trait with a simulator (Hex's) holds
+`slates_api::Volumes`: provision, snapshot, destroy a snapshot, destroy, list, serve to a Shards VMM,
+mount, unmount and detach, each with the `Instance` verb's own signature. `Instance` implements it,
+and so does `SimVolumes::new(most)`, an in-memory stand-in for tests with no daemon: it answers the
+same outcomes and typed errors (names unique, clones pinning snapshots, works only over greens), holds
+at most `most` volumes and `most` attachments, serves no bytes (a stream it hands out is a real end
+nothing answers until detached) and mounts nothing (a mount is a record). The conformance suite in
+`crates/api/tests/api.rs` (`the_seam_conforms`) runs over both.
 
 ## What is built (2026-11-18)
 
@@ -198,4 +213,4 @@ fn workspace(folder: &std::path::Path, at: &str) -> Result<(), slates_api::Error
 3. Typed fields on the wire for drift, a presentation's conflicts and a merge's versions.
 4. A paged volume listing.
 5. An async form over the host's own reactor.
-6. A seam trait with a simulator and a conformance suite.
+6. A typed class for a pinned snapshot's destroy, answered `Invalid::Request` today.

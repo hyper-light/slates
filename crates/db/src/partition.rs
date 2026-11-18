@@ -1118,7 +1118,7 @@ impl Partition {
         }
         Ok(())
       }
-      Op::ConsumerRevoked { consumer } => self
+      Op::ConsumerRevoked { consumer } | Op::ConsumerWritePolicySet { consumer, .. } => self
         .consumers
         .get(consumer)
         .map(|_| ())
@@ -1295,6 +1295,7 @@ impl Partition {
       // The catalog register carries the policy (A-285), so its version moves as the live-shipping flag's does.
       Op::VolumeWritePolicySet { id, policy } => self.update_volume(*id, |v| {
         v.policy.write = Some(*policy);
+        v.policy.write_version = v.policy.write_version.saturating_add(1);
         v.catalog_version = v.catalog_version.saturating_add(1);
       }),
       Op::VolumeDestroyed { id } => {
@@ -1563,6 +1564,12 @@ impl Partition {
           .get_mut(consumer)
           .ok_or(DbError::NotFound)?
           .revoked = true;
+        Ok(())
+      }
+      Op::ConsumerWritePolicySet { consumer, policy } => {
+        let record = self.consumers.get_mut(consumer).ok_or(DbError::NotFound)?;
+        record.write = Some(*policy);
+        record.write_version = record.write_version.saturating_add(1);
         Ok(())
       }
       Op::LandingLeaseTaken { record } => {

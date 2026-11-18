@@ -270,11 +270,11 @@ impl Instance {
   /// `volume`'s status (§4.14), typed: its bytes, lease, attachments, head, placement, transports, mounts, journal, and
   /// an overlay's base with its drift.
   pub fn status(&mut self, volume: VolumeId) -> Result<VolumeStatus, Error> {
-    let report = self
+    self
       .client
       .status(volume)
-      .map_err(|e| self.fail(e, Some(Missing::Volume(volume))))?;
-    status_of(report)
+      .map(status_of)
+      .map_err(|e| self.fail(e, Some(Missing::Volume(volume))))
   }
 
   /// An overlay's drift (§4.15 "Drift"): each entry the disk changed after the volume changed it, typed by what
@@ -702,10 +702,16 @@ impl Instance {
   ) -> Result<(), Error> {
     let wire_policy = policy.wire()?;
     let wire_subject = subject.wire();
-    let proof = launcher.policy_proof(&wire_subject, &wire_policy)?;
+    // The setting names the version it replaces (A-285): read it, then set from it. One raced in between is refused
+    // `Stale::Policy`, and nothing changes.
+    let (_, version) = self
+      .client
+      .policy(wire_subject)
+      .map_err(|e| self.fail(e, Some(missing_subject(subject))))?;
+    let proof = launcher.policy_proof(&wire_subject, &wire_policy, version)?;
     self
       .client
-      .set_policy(wire_subject, wire_policy, proof)
+      .set_policy(wire_subject, (wire_policy, version), proof)
       .map_err(|e| self.fail(e, Some(missing_subject(subject))))
   }
 
@@ -715,7 +721,7 @@ impl Instance {
     self
       .client
       .policy(subject.wire())
-      .map(|policy| policy.map(WritePolicy::of_wire))
+      .map(|(policy, _)| policy.map(WritePolicy::of_wire))
       .map_err(|e| self.fail(e, Some(missing_subject(subject))))
   }
 

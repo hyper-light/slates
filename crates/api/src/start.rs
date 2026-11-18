@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 
 use crate::error::{Error, StartFault};
 use crate::instance::Instance;
+use crate::launcher::{ENV_LAUNCHER, LAUNCHER_ON_STDIN, LauncherSecret, record_of};
 use crate::role::{FleetSelection, ProcessOptions, Role};
 
 /// What starts an instance: its name, the executable that serves the roles and the prefix before a role's arguments,
@@ -48,6 +49,9 @@ pub struct StartSpec {
   /// The fleet this node joins (§2.6 boot step 6); `None` for an instance run alone, whose group [`Instance::start`]
   /// makes.
   pub fleet: Option<FleetSelection>,
+  /// The launcher's secret (A-299, [`crate::launcher`]), handed to the anchor at the start so the host's authority
+  /// outlives its own restarts and the daemon's; `None` for an instance whose authority is the anchor segment's alone.
+  pub launcher: Option<LauncherSecret>,
 }
 
 impl StartSpec {
@@ -60,7 +64,14 @@ impl StartSpec {
       shards: None,
       quick: false,
       fleet: None,
+      launcher: None,
     }
+  }
+
+  /// This spec with the launcher's secret `secret`, which the host keeps and provides again at every start.
+  pub fn with_launcher(mut self, secret: LauncherSecret) -> StartSpec {
+    self.launcher = Some(secret);
+    self
   }
 
   /// The anchor role this spec starts.
@@ -74,19 +85,48 @@ impl StartSpec {
   }
 
   /// The anchor's command: `PROGRAM PREFIX... --instance NAME anchor [--quick] [--shards N] [--fleet PATH --node
-  /// NAME]`, with standard input closed (no role reads it). Standard output and error are the host's to direct: the
-  /// roles write their log lines to standard error. On Unix the anchor leads a process group of its own, so a signal
-  /// meant for the host's group (a terminal's interrupt) does not stop the instance; a host stops it through
-  /// [`Anchor::stop`], or by sending the anchor `SIGTERM` itself.
-  pub fn anchor_command(&self) -> Command {
+  /// NAME]`. Its standard input is closed, or, with a launcher's secret, a pipe holding the secret's record and then its
+  /// end ([`crate::launcher`]), so the anchor's read always ends; a host that wraps the command (`systemd-run --scope`)
+  /// keeps the command's standard input, which an exec passes unchanged. Standard output and error are the host's to
+  /// direct: the roles write their log lines to standard error. On Unix the anchor leads a process group of its own, so
+  /// a signal meant for the host's group (a terminal's interrupt) does not stop the instance; a host stops it through
+  /// [`Anchor::stop`], or by sending the anchor `SIGTERM` itself. Refused [`StartFault::Launcher`] when the pipe cannot
+  /// be made.
+  pub fn anchor_command(&self) -> Result<Command, Error> {
     let mut command = Command::new(&self.program);
     command
       .args(self.prefix.iter().map(OsString::from))
-      .args(self.role().args())
-      .stdin(Stdio::null());
+      .args(self.role().args());
+    match &self.launcher {
+      None => {
+        command.stdin(Stdio::null()).env_remove(ENV_LAUNCHER);
+      }
+      Some(secret) => {
+        command
+          .stdin(launcher_input(secret)?)
+          .env(ENV_LAUNCHER, LAUNCHER_ON_STDIN);
+      }
+    }
     in_its_own_group(&mut command);
-    command
+    Ok(command)
   }
+}
+
+/// A pipe holding `secret`'s record, its write end closed: the anchor's standard input (A-299).
+fn launcher_input(secret: &LauncherSecret) -> Result<Stdio, Error> {
+  use std::io::Write;
+  let refused = |error: std::io::Error| {
+    Error::Start(StartFault::Launcher {
+      errno: error.raw_os_error(),
+    })
+  };
+  let (reader, mut writer) = std::io::pipe().map_err(refused)?;
+  let mut record = record_of(secret);
+  let written = writer.write_all(&record);
+  record.fill(0);
+  written.map_err(refused)?;
+  drop(writer);
+  Ok(Stdio::from(reader))
 }
 
 /// See [`StartSpec::anchor_command`]: a process group of the anchor's own (`setpgid(0, 0)` in the child).
@@ -201,7 +241,7 @@ impl Instance {
       Err(error) if error.is_unavailable() => {}
       Err(error) => return Err(error),
     }
-    let mut child = spec.anchor_command().spawn().map_err(|error| {
+    let mut child = spec.anchor_command()?.spawn().map_err(|error| {
       Error::Start(StartFault::Spawn {
         program: spec.program.to_string_lossy().into_owned(),
         errno: error.raw_os_error(),
