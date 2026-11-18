@@ -230,8 +230,9 @@ pub enum RegisterError {
     /// The holder's current generation.
     current: u64,
   },
-  /// A different value offered at a ledger position that already holds one — a committed position is
-  /// never rewritten (§4.8, BUG-12).
+  /// A second value offered at a ledger position under the epoch it already holds a value at: one ballot proposes one
+  /// value a position (§4.8, BUG-12). A higher epoch's different value replaces a held one, which never committed
+  /// (A-373).
   ConflictingPosition,
 }
 
@@ -1926,9 +1927,10 @@ impl Acceptor {
   /// Accepts `record` under this holder's authority and fence, storing it before acknowledging, or
   /// refusing with a typed reason. The order is authority (a stale or foreign configuration generation, or
   /// an unauthorized owner, refuses before touching the fence), then the fence (a stale epoch refuses), then
-  /// the position (a *different* value at a position already accepted is a conflict — a committed position is
-  /// never rewritten; the *same* value re-acknowledges idempotently). On acceptance the promise is raised and
-  /// the accepted `(epoch, value)` recorded — recording the new epoch even when the value is unchanged
+  /// the position (a *different* value under the epoch the position already holds, or a lower one, is a conflict — one
+  /// ballot proposes one value a position; a higher epoch's replaces it, since a value that committed is the one every
+  /// higher epoch's phase one adopts, A-373; the *same* value re-acknowledges idempotently). On acceptance the promise
+  /// is raised and the accepted `(epoch, value)` recorded — recording the new epoch even when the value is unchanged
   /// (BUG-12) — before the [`Ack`] is returned.
   ///
   /// The configuration-generation gate is split by direction, so the sender learns *which way* it is out of
@@ -2072,8 +2074,14 @@ impl Acceptor {
       });
     }
     let position = (record.object, record.sequence);
-    if let Some((_, existing)) = self.accepted.get(&position)
+    // One ballot proposes one value a position: a second value under the epoch the position already holds is refused. A
+    // higher epoch's different value replaces the held one, as Paxos's acceptor accepts any proposal at or above its
+    // promise (the fence above refuses a lower one): the value it replaces never committed, or that epoch's phase one
+    // would have adopted it (A-373; `docs/wip/models/FencedLedger.tla`'s `Accept`, under which Agreement and
+    // Continuity hold). Refused before, a successor holding such a value could never commit the one its round adopted.
+    if let Some((held_epoch, existing)) = self.accepted.get(&position)
       && existing != &record.value
+      && *held_epoch >= record.epoch
     {
       return Err(RegisterError::ConflictingPosition);
     }
@@ -6238,6 +6246,56 @@ mod tests {
       matches!(resolved, Lineage::Successor { departed, successor }
         if departed == owner && survivors.contains(&successor)),
       "{resolved:?}"
+    );
+  }
+
+  /// A-373 (§4.8 "For each ledger position ... Phase-two acceptance at a new epoch records that epoch", BUG-12; the
+  /// acceptor of `docs/wip/models/FencedLedger.tla`): a held position yields to a higher epoch's different value, as
+  /// Paxos's acceptor accepts any proposal at or above its promise, and only one ballot's second value there is refused.
+  /// Do: accept `v` at position 3 under epoch 1 (a dying owner's last proposal, reaching this holder alone); offer `w` at
+  /// position 3 under epoch 2 (a successor whose phase one did not see `v`, so `v` never committed); then `u` at position
+  /// 3 under epoch 2 (a second value in that ballot); then `v` again under epoch 1. Expect: `w` accepted and held at
+  /// position 3 under epoch 2, the model's `Accept`; `u` refused `ConflictingPosition`; `v` refused by the fence. Before,
+  /// `w` was refused `ConflictingPosition` whatever its epoch, so a successor holding such a stale value could never
+  /// commit the value its round adopted there, nor could any holder that kept one count toward its quorum.
+  #[test]
+  fn a_held_position_yields_to_a_higher_epochs_value_and_refuses_a_second_in_one_epoch() {
+    let owner = HostId(1);
+    let object = ObjectId::new(owner, 7);
+    let mut acceptor = Acceptor::new(
+      HostId(2),
+      Authority {
+        generation: 1,
+        owner,
+      },
+    );
+    let record = |epoch: u64, value: &[u8]| Record {
+      owner,
+      object,
+      sequence: 3,
+      epoch: HostEpoch(epoch),
+      generation: 1,
+      value: value.to_vec(),
+    };
+    acceptor.accept(&record(1, b"v")).unwrap();
+    assert!(
+      acceptor.accept(&record(2, b"w")).is_ok(),
+      "a higher epoch's different value is accepted"
+    );
+    assert_eq!(
+      acceptor.position(object, 3),
+      Some((HostEpoch(2), b"w".as_slice())),
+      "held under the higher epoch"
+    );
+    assert_eq!(
+      acceptor.accept(&record(2, b"u")),
+      Err(RegisterError::ConflictingPosition),
+      "one ballot proposes one value a position"
+    );
+    assert_eq!(
+      acceptor.accept(&record(1, b"v")),
+      Err(RegisterError::StaleEpoch { current: 2 }),
+      "the fence refuses the lower epoch"
     );
   }
 

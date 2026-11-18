@@ -1077,6 +1077,15 @@ pub struct ShardState {
   /// detector and the council's timing. Live on the control shard, which runs the coordinator; a laptop's, and every
   /// other shard's, is the recovery prior alone.
   pub failover: slates_cluster::failover::Failover,
+  /// The failover delay the waits that bound a failover read on this shard (A-363): a forward's bound, the location
+  /// round's cap, a held reply's total, a takeover's attempts. The control shard's estimate in whole coordinator periods,
+  /// set by its refresh each period and fanned to every other shard (`fleet::Fan`) when it moves; the recovery prior
+  /// until the first fan. Nothing sets it but the estimate (or a test's injection, [`ShardState::injected_failover_ns`]).
+  pub failover_ns: u64,
+  /// Test support: while `Some`, the control shard publishes this as its failover delay in place of its estimate, so a
+  /// test can hold a wait's bound below a path's floor, or short enough to watch a give-up (`Daemon::inject_failover`).
+  /// `None` in every deployment.
+  pub injected_failover_ns: Option<u64>,
   /// What this node holds as a **content candidate** for other owners' snapshots (§4.10 "Content
   /// replication"): the distinct chunks by identity and each manifest held whole, verified before
   /// anything is stored — served on the record session's content stream by the fleet loop. It is what
