@@ -3690,7 +3690,10 @@
 >   total, A-354/A-375, `work_home::park_bound_ns`). Owed in class A: ten of the 25 `xshard::call_within` and
 >   `task_within` sites on the wall (`moves.rs` 2, `daemon.rs`, `verbs.rs`, `takeover.rs`, `shards_route.rs`,
 >   `remote_attach.rs`, `mirror.rs`, `fleet.rs`, `anchor_hold_windows.rs`; g251's since 2026-11-18). Class B (the
->   transport's round-trip estimate) is open, but for the forward lane's stall (2026-11-18, A-315, goal g255): a batch
+>   transport's round-trip estimate) is open, but for the owner-location round (2026-11-18, A-437, goal g255: one
+>   liveness window, hard, for its asks and its lent sessions; now the record plane's round budget over the slowest
+>   asked path's measured tail, `owner_location::round_budget_for`) and the forward lane's stall (2026-11-18, A-315,
+>   goal g255): a batch
 >   quiet for its budget is given up only once a turn of its lane begun after the silence was seen has read the
 >   session's own socket empty, or found no session at all, so an origin kept off its CPU reads its owner's replies
 >   before it calls the owner silent, and the failover bound from the forward's first send caps it

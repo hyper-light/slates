@@ -30530,3 +30530,26 @@ Applied in the same change to:
   look, the verb released. The green owner's flows and the load rungs that park verbs are filed for main's run.
 
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class A), `crates/server/src/work_home.rs`.
+
+### A-437 — The owner-location round asks by the record plane's round budget over its slowest asked path, and waits for a lent session the span of one record-plane exchange (2026-11-18, built for goal g255; R3's class B, item B-a; §4.8 "Lookup"; the supervisor's ruling of 2026-11-07; A-317)
+- **What was there.** A location round (`owner_location::locate_round`) asked the admitted home-region peers within one
+  liveness window, hard (`CommitBudget::hard`), and waited for peers whose record session was lent out when it began
+  until the same window had passed since its start, then counted them `session_never_returned`. A live peer whose
+  path is slower than a window was never heard, and a session lent to an exchange that runs under the record plane's
+  budget (longer than a window when a path is slow) was given up while it was coming back.
+- **The rule** (the supervisor's ruling of 2026-11-07: the slowest asked peer's tail and the record-plane exchange
+  budget). The round asks under the record plane's round budget (`fleet::consensus_budget`) over the slowest measured
+  round-trip tail among the peers it may ask (`PathRtt`, RFC 6298 per path; `owner_location::round_budget_for`): a base
+  deadline of the longer of a coordinator period and that tail, extended while replies keep arriving, ended once none
+  arrives for the stall window, as every record-plane exchange is. It waits for a lent session until the budget's whole
+  span (`max_deadline_ns`) has passed since it began: the longest one record-plane exchange runs, the bound every
+  borrower of a record session runs its exchange under, so a session lent when the round begins comes back within it.
+  A peer with no session at all is still not waited for (the bounded neighbourhood).
+- **Test.** `a_location_round_waits_for_its_slowest_asked_peers_measured_round_trip` (`crates/server/src/
+  owner_location.rs`): the round's budget with no path measured extends past its base; with the slowest asked path's
+  tail at two liveness windows, its base deadline and its span are past that tail.
+  Run on the Mac Studio (kiln, 2026-11-18, load 7-12, debug build, `cargo test --locked -p slates-server --lib --
+  owner_location`): 6 of 6. Red-checked once: with the round back at one liveness window, hard, the test fails at its
+  first look, a quiet round that never extends. The fleet's location flows are filed for main's run.
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class B), `crates/server/src/{owner_location,fleet}.rs`.
