@@ -15405,8 +15405,39 @@ suite on adacachy2 and 1 of 3 of the stack's (the supervisor's gate); alone it p
   green-share test therefore fails with the branch named, not by its 4,000-period wait. Landed on main 2026-11-18,
   ported from bug-sweep's 98c5a166 onto 48c64720 (the cause kind now reads `RecoveryCause::kind`, which main moved into
   the protocol, and names it `TakeoverIncomplete`).
-- **Sibling, open:** a taken-over **volume**'s materialization (`fleet::materialize`, the `fleet.materialize.waits.*`
-  counters: content, placement, catalog, catalog placement, shard) waits each period the same way, with no bound.
+- **Sibling, bounded 2026-11-18:** a taken-over **volume**'s materialization (`fleet::materialize`, the
+  `fleet.materialize.waits.*` counters: content, placement, catalog, catalog placement, shard, and the live log or a
+  refused or unanswered materialization) waited each period the same way, with no bound. Each pending volume
+  (`state::PendingVolume`) now counts its attempts against the same `takeover_attempts`, and at the bound the give-up
+  both kinds share (`fleet::give_up_taken_over`) records it unrecovered, `NotRecovered { TakeoverIncomplete { waited_on
+  } }` naming `content`, `placement`, `catalog`, `catalog_placement`, `shard`, `live` or `refused`, counted
+  `fleet.materialize.given_up`. Progress is more of the head's content staged than ever before
+  (`PendingVolume::record_staged`), so a large volume whose fetch its deadline cuts every period is given up only once
+  the fetch stops advancing. An object whose partition has no shard here is dropped at the bound and no longer claimed
+  to lookups; a mirror-seeded volume given up is reported adopted, unrecovered on its successor. Ported from
+  bug-sweep's b412d4b7 (never pushed), with the progress rule added.
+- **Found while porting it, fixed 2026-11-18: the bound counted a catalog register still on its way.** A catalog
+  register's class byte sorts it after every head of its creator's partition (`ObjectId::catalog`), and a takeover round
+  reads one page (about 55 objects) a member a period, so on a dead host with more than the bound's worth of pages of
+  heads in one partition (100 periods, about 5,500 objects, at the default SLO) every head's catalog was adopted after
+  the bound: the green bound on main since e4ac9d7b counted those `catalog` waits and would have given each
+  green up (and the volume bound each volume) while its catalog was still paging in. Now a wait for the catalog
+  register or its placement, while the round that adopted the object still pages, reads that round's page advances
+  (`takeover::rounds_still_paging`, `HostTakeover::page_advances`, `fleet::paging_round`): an advance since the previous
+  attempt is the object's progress and starts its attempts again (`record_round` on `PendingVolume` and
+  `PendingGreen`), so the wait counts only while the round stands still (a member that never answers, or answers
+  without moving its page on) and, as every wait does, once the round stops paging. This port's first form left the wait
+  uncounted for as long as the round paged, which would have held an object pending for as long as a stalled round
+  never finished: the unbounded wait the bound exists to end. Found by reading (the takeover measurement's paging doc,
+  `takeover_periods_scale_with_the_retired_hosts_object_count`), not seen in a run: the 1024-volume takeover served its
+  last volume at about 33 periods.
+- **Evidence (2026-11-18, macOS arm64, Adas-MacBook-Pro-3, load 23-29, the change merged with main 474b45f5):** red
+  first with `takeover_attempts` multiplied by 1000 in a scratch copy, the two volume tests
+  (`a_taken_over_volume_whose_catalog_never_comes_is_refused_by_name`,
+  `a_taken_over_volume_whose_content_never_comes_is_refused_by_name`) answered `NotFound` after 99 and 100 attempts in
+  100 periods (2 of 2); with the bound, `NotRecovered` naming `catalog` and `content` after 10. The two green bound
+  tests, the volume and green takeover tests and the mirror promotion beside them, 19 of 19 in 71.6 s; `slates-server
+  --lib` 265 of 265 with the counting rule's unit tests.
 - **The cause, named by the bound (diag-clients-green-1, 98c5a166 with the failure print, CI 2026-11-09):** the share
   test 10 times per lane at nice 19 beside two spinners a CPU; ubuntu-24.04-arm 2 of 10 red (load 13.7-14.0),
   ubuntu-latest 0 of 10. Both reds waited on the `chain`: the successor's holder state at version 2 and the other

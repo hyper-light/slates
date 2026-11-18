@@ -5625,6 +5625,29 @@ version.
 > answers a retryable `Overloaded` for an object this node holds a copy of (a recovery candidate), never `NotFound`
 > for an object that exists. `docs/bugs/2026-10-11-taken-over-scratch-volumes-never-become-servable.md`.
 
+> **Status (2026-11-18, a taken-over volume's materialization is bounded).** Each wait of a taken-over volume's
+> materialization (`fleet.materialize.waits.*`: its content, placement, catalog, catalog placement or shard; its live
+> log; a refused or unanswered materialization) retried every period without end. Now each pending volume counts its
+> attempts, one a period, and past the failover SLO's worth without progress (`failover_slo_ns / HEARTBEAT_NS`, the
+> bound a taken-over green has had since 2026-11-09) it is given up on: its owner shard records it unrecovered, every
+> verb on it answers `NotRecovered { cause: TakeoverIncomplete { waited_on } }` naming the wait (`content`, `placement`,
+> `catalog`, `catalog_placement`, `shard`, `live`, `refused`), and `fleet.materialize.given_up` counts it. Progress is
+> more of the head's content staged than ever before, so a large volume whose fetch is cut by its deadline each period
+> is given up only once the fetch stops advancing. For a wait on its catalog register (or that register's placement)
+> while the takeover round that adopted it still pages, progress is an advance of that round's pages, for a green as
+> for a volume (`takeover::rounds_still_paging`, `fleet::paging_round`): a catalog register sorts after every head of
+> its creator's partition and a round reads a page (about 55 objects) a member a period, so on a host with more than
+> the bound's worth of pages of heads in one partition every catalog arrives after the bound, and the green bound of
+> 2026-11-09 counted those waits. The wait counts only while the round stands still, so a round that never finishes
+> paging cannot hold the object pending without end. A mirror-seeded volume given up is reported adopted to the
+> council, unrecovered on its successor. Regressions: `a_taken_over_volume_whose_catalog_never_comes_is_refused_by_name`,
+> `a_taken_over_volume_whose_content_never_comes_is_refused_by_name` (GAPS 2026-11-09, the sibling bullet), and the
+> counting rule's unit tests (`a_catalog_wait_reads_its_round_only_while_the_round_pages`,
+> `a_round_advances_only_when_a_member_moves_on_and_a_restart_keeps_the_count`,
+> `a_wait_on_a_paging_round_is_progress_only_while_the_round_advances`,
+> `a_round_pages_until_every_asked_member_has_answered_every_page`,
+> `a_volumes_attempts_start_again_only_at_a_new_high_of_staged_content`).
+
 > **Owner location (2026-09-17).** A foreign node cannot reconstruct a historic copyset from
 > present membership. After its creator route stops being usable, it asks authenticated
 > home-region peers through a bounded read-only exchange. A peer claims itself only when its
