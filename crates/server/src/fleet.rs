@@ -1828,7 +1828,11 @@ pub(crate) fn accept_held_record(
   record: &Record,
 ) -> Vec<u8> {
   // A test's injected refusal: this holder behaves as one that never received the owner's records.
-  if state.record_refused_from.contains(&peer_host) {
+  if state.record_refused_from.contains(&peer_host)
+    || (state.merge.fault.refuse_work_catalogs
+      && crate::catalog::CatalogValue::from_record_bytes(&record.value)
+        .is_some_and(|catalog| catalog.work_of.is_some()))
+  {
     state.count(RECORD_REFUSED_BY_FAULT, 1);
     return Vec::new();
   }
@@ -2206,17 +2210,61 @@ fn unplaced_heads(state: &ShardState, local: HostId) -> Vec<Head> {
       local,
     ));
   }
-  // A green's catalog register too (AUD-29-17): its access list is what a successor admits by, and the merge plane
-  // ships no record of the green before the register's current version is committed (`green_catalog_committed`).
-  for id in state.greens.keys() {
-    if let Some(record) = state.db.partition().volume(*id) {
-      heads.extend(owed_catalog(state, config, record, local).0);
-    }
-  }
+  heads.extend(owed_merge_catalogs(state, config, local));
+  heads.extend(owed_adopted_work_catalogs(state, config, local));
   for tombstone in state.db.partition().tombstones() {
     heads.extend(owed_tombstone(state, config, tombstone, local));
   }
   heads
+}
+
+/// The catalog registers of this shard's merge volumes, which have no store slot, as this owner still owes them.
+/// - A green's (AUD-29-17): its access list is what a successor admits by, and the merge plane ships no record of the
+///   green before the register's current version is committed (`catalog_committed`).
+/// - A work's (A-255): a work's head is never placed, so its catalog is the only record of it a successor holds, and
+///   it names the work's green. A resend that names the work reaches the work's successor, which sends it on to the
+///   green's owner, where the submit's completion is (in its merge record).
+fn owed_merge_catalogs(
+  state: &ShardState,
+  config: &slates_db::register::Configuration,
+  local: HostId,
+) -> Vec<Head> {
+  state
+    .greens
+    .keys()
+    .chain(state.works.keys())
+    .filter_map(|id| state.db.partition().volume(*id))
+    .filter_map(|record| owed_catalog(state, config, record, local).0)
+    .collect()
+}
+
+/// The catalog registers of works this node adopted at a takeover, as it still owes them to some remote candidate
+/// (A-255). After its owner's takeover a work has no owner and is never materialized, so its catalog record, which names
+/// its green, is the only route a resend of its submit has, and the successor that adopted it is that record's owner. It
+/// keeps the record placed as any owner keeps its records, under its own placement at its configuration's epoch: a
+/// second failure among the record's holders, within the fault budget, then leaves it held. Kept until the work's
+/// tombstone replaces it (`crate::tombstone`).
+fn owed_adopted_work_catalogs(
+  state: &ShardState,
+  config: &slates_db::register::Configuration,
+  local: HostId,
+) -> Vec<Head> {
+  state
+    .pending_catalogs
+    .iter()
+    .filter(|(_, (_, catalog))| catalog.work_of.is_some())
+    .map(|(key, (sequence, catalog))| (key.catalog(), *sequence, catalog))
+    .filter(|(object, _, _)| state.fleet.object_owner(*object) == Some(local))
+    .filter_map(|(object, sequence, catalog)| {
+      owed_record(
+        state,
+        config,
+        (object, sequence),
+        catalog.to_record_bytes(),
+        local,
+      )
+    })
+    .collect()
 }
 
 /// The catalog register of `record` (AUD-29-17) as this owner still owes it to some remote candidate, and whether
@@ -2245,11 +2293,47 @@ fn owed_catalog(
   (owed, ready)
 }
 
-/// Whether the green `id`'s catalog register is ready for its merge records to ship (AUD-29-17; see [`owed_catalog`]):
-/// a successor materializes a green only with its adopted catalog, so a merge record that could be adopted without
-/// one would leave the green unserved. A green with no record here owes no catalog: a destroyed green's tombstone
-/// stands for both registers (AUD-29-43). Read on the green's owner shard.
-pub(crate) fn green_catalog_committed(state: &ShardState, id: DbVolumeId, local: HostId) -> bool {
+/// A catalog register this owner still owes some candidate, for the merge plane to ship on demand (A-255): a version's
+/// merge record waits for its submitting work's catalog ([`catalog_committed`]), and catalogs otherwise ship on the
+/// coordinator's period, so a submit made right after its work was created waited out a whole period (median 109.2 ms
+/// against 1.24 ms, twenty submits each, an idle Mac Studio, 2026-11-09).
+pub(crate) struct OwedCatalog(Head);
+
+/// The catalog register work `work` still owes some candidate, read on its owner shard; `None` when every candidate
+/// holds its current version or the work has no record here.
+pub(crate) fn owed_work_catalog(
+  state: &ShardState,
+  work: DbVolumeId,
+  local: HostId,
+) -> Option<OwedCatalog> {
+  let record = state.db.partition().volume(work)?;
+  owed_catalog(state, state.fleet.configuration(), record, local)
+    .0
+    .map(OwedCatalog)
+}
+
+/// Ships an owed catalog register as the period's head shipment does ([`ship_head`]): to every candidate still missing
+/// it, committed at `f + 1`, its placement recorded on its owner shard.
+pub(crate) async fn ship_owed_catalog(
+  origin: u16,
+  owner_acceptor: &mut Acceptor,
+  local: HostId,
+  catalog: &OwedCatalog,
+  budget: CommitBudget,
+) -> Option<Dispatch> {
+  ship_head(origin, owner_acceptor, local, &catalog.0, budget).await
+}
+
+/// Whether the merge volume `id`'s catalog register is committed, so a merge record that depends on it may ship (see
+/// [`owed_catalog`]):
+/// - a green's (AUD-29-17): a successor materializes a green only with its adopted catalog, so a merge record that
+///   could be adopted without one would leave the green unserved;
+/// - a submitting work's (A-255): the work's catalog names its green, the only route a resend of the submit has to the
+///   completion the record carries.
+///
+/// A volume with no record here owes no catalog: a destroyed volume's tombstone stands for both registers (AUD-29-43).
+/// Read on the green's owner shard, which holds its works too.
+pub(crate) fn catalog_committed(state: &ShardState, id: DbVolumeId, local: HostId) -> bool {
   state
     .db
     .partition()
@@ -4725,7 +4809,9 @@ async fn establish_record_link(driver: PeerDriver, dial: PeerDial) {
       discovery_wait = HEARTBEAT_NS;
       discovery_due = 0;
     }
-    if !absent && futures::now_ns() >= discovery_due {
+    let discovery_held =
+      state::with_state(|s| s.injected_discovery_hold == Some(peer_host)).unwrap_or(false);
+    if !absent && !discovery_held && futures::now_ns() >= discovery_due {
       let before = discovery_cursor.settled();
       refresh_discovery(peer_host, anchor, &mut discovery_cursor, driver).await;
       discovery_wait = next_discovery_wait(before, discovery_cursor.settled(), discovery_wait);
@@ -4937,6 +5023,9 @@ async fn refresh_discovery(
         }
       } else {
         state.record_sessions.remove(&peer_host);
+        state
+          .dead_session_dropped_at
+          .insert(peer_host, futures::now_ns());
       }
     });
   }
@@ -7920,6 +8009,12 @@ pub(crate) fn take_sessions(
   .unwrap_or_default()
 }
 
+/// Format: nanoseconds per millisecond, for the link's log lines.
+const NS_PER_MS: u64 = 1_000_000;
+/// The status count of a record session dropped on its return because its peer was silent past the rule
+/// ([`return_sessions`]), for the link to dial again.
+const LINK_SESSION_JUDGED_DEAD: &str = "fleet.link.session_judged_dead";
+
 /// Returns borrowed sessions to the shard state after a dispatch. A slot is refilled only by the session
 /// that left it — the entry still there, its session out, and the returning session's connection id the
 /// one the borrow was tagged with. Anything else is a late return — a peer retired meanwhile (its entry
@@ -7928,6 +8023,16 @@ pub(crate) fn take_sessions(
 /// never installed over a newer session. A session its peer reset (A-261) is never put back: its link is dropped, so the
 /// link task dials the peer's new process at its next pace rather than lending a dead session to every later borrower
 /// (a restarted primary's client node forwarded into one for 25 to 135 s, loadtest-scale 2026-11-08).
+///
+/// A session whose peer is gone without a word is dropped here too, and its entry with it: the transport's one
+/// judgement of a dead session (`Endpoint::peer_silent_past`, fleet-transport.md §5), an ack-eliciting packet
+/// unanswered for a liveness budget or the session's persistent-congestion duration, whichever is longer. It covers a
+/// reset lost and a peer that is silent. Judged at the one place every borrower hands the session back, and every
+/// borrower's hold is bounded by a derived budget, so a silent session is judged within its window plus one hold: with
+/// a deaf session under a 256-client burst the council's replication held it 120 times in 10 s while the forward lane's
+/// own check never got a turn (2026-11-09). A starved node can judge a live peer dead: that costs a session replaced,
+/// and the forwards on it are answered unanswered and sent again under their own ids, never run twice. A reset is
+/// checked first, so it is counted as one.
 pub(crate) fn return_sessions(sessions: Vec<(HostId, Endpoint)>) {
   state::with_state(|s| {
     for (host, mut endpoint) in sessions {
@@ -7938,6 +8043,25 @@ pub(crate) fn return_sessions(sessions: Vec<(HostId, Endpoint)>) {
         {
           s.record_sessions.remove(&host);
           s.count(LINK_PEER_RESET, 1);
+          s.dead_session_dropped_at.insert(host, futures::now_ns());
+        }
+        Some(link)
+          if link.endpoint.is_none()
+            && link.borrowed == returned
+            && endpoint.peer_silent_past(crate::daemon::LIVENESS_BUDGET_NS) =>
+        {
+          s.record_sessions.remove(&host);
+          s.count(LINK_SESSION_JUDGED_DEAD, 1);
+          // How far past the window the judgment came, so the margin over the duration is on record, not just a count.
+          slates_machine::log_line!(
+            "slates-server: record session to {host:?} dropped silent after {} ms, its window {} ms",
+            endpoint.peer_silence_ns().unwrap_or(0) / NS_PER_MS,
+            endpoint
+              .persistent_congestion_duration()
+              .max(crate::daemon::LIVENESS_BUDGET_NS)
+              / NS_PER_MS
+          );
+          s.dead_session_dropped_at.insert(host, futures::now_ns());
         }
         Some(link) if link.endpoint.is_none() && link.borrowed == returned => {
           link.last_seen = Some(crate::state::RecordLink::seen(host, &endpoint));

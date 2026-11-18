@@ -113,7 +113,7 @@ pub(crate) fn with_writer<T>(
     Err(reply) => return Err(refusal_in(*reply)),
   };
   // A CLI attachment is renewed by the verb, or refused once its term lapsed (A-230).
-  crate::verbs::use_attachment(state, attachment)?;
+  crate::verbs::use_attachment(state, principal, attachment)?;
   let Some(catalog) = state.db.partition().attachment(attachment).cloned() else {
     return Err(Refusal::NotFound);
   };

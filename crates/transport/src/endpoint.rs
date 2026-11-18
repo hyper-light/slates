@@ -271,6 +271,12 @@ pub struct EndpointCensus {
   pub arriving: usize,
   /// The peer's complete requests not yet served.
   pub ready: usize,
+  /// Exchanges marked completed and not yet taken ([`Endpoint::take_completed`]); an exchange taken by
+  /// [`Endpoint::take_reply`] or abandoned leaves it. Until 2026-11-08 only `take_completed` emptied it, which a record
+  /// session never calls, so the set grew with every exchange such a session ever completed.
+  pub completed: usize,
+  /// Exchanges marked as having read reply bytes and not yet taken ([`Endpoint::take_progressed`]).
+  pub progressed: usize,
 }
 
 impl EndpointCensus {
@@ -512,6 +518,9 @@ pub struct Endpoint {
   /// undecryptable packet is discarded, never fatal). A counter, so a test can assert the discard path
   /// ran.
   discarded: u64,
+  /// Test support (never set in production): drops every datagram this end receives before the connection sees it, as
+  /// a session whose peer went away without a word does (`slates_server`'s `Daemon::inject_session_deafness`).
+  deaf: bool,
   /// This end's open exchanges by exchange id (requests begun, replies not yet taken), each with its stream
   /// once bound and the reply bytes read so far — bounded by the stream credit (a limit's worth bound past
   /// it) and the queue below, and each reply by its flow-control window.
@@ -536,6 +545,10 @@ pub struct Endpoint {
   /// many exchanges open asks only after these instead of probing every one each turn (a fetch with ~340 chunk
   /// requests open on a session spent its time doing that, 2026-10-05).
   completed: std::collections::BTreeSet<u64>,
+  /// This end's exchanges whose replies read more bytes since [`Endpoint::take_progressed`] last took them: a caller
+  /// judging many open exchanges' progress asks after these alone, as [`Endpoint::take_completed`] does for
+  /// completions. Both sets lose an exchange when it is taken or abandoned, so they hold only open exchanges.
+  progressed: std::collections::BTreeSet<u64>,
   /// Refused receives on this end's own socket that its receive read past, by kind ([`Endpoint::receive_refusals`]);
   /// a socket gone is the one refusal that ends a receive.
   receive_refused: crate::receive::ReceiveRefusals,
@@ -595,6 +608,7 @@ impl Endpoint {
       reset_answered_at: None,
       resets_sent: 0,
       discarded: 0,
+      deaf: false,
       exchanges: BTreeMap::new(),
       by_stream: BTreeMap::new(),
       queued: VecDeque::new(),
@@ -602,6 +616,7 @@ impl Endpoint {
       arriving: BTreeMap::new(),
       ready: BTreeMap::new(),
       completed: std::collections::BTreeSet::new(),
+      progressed: std::collections::BTreeSet::new(),
       receive_refused: crate::receive::ReceiveRefusals::default(),
     })
   }
@@ -648,6 +663,7 @@ impl Endpoint {
       reset_answered_at: None,
       resets_sent: 0,
       discarded: 0,
+      deaf: false,
       exchanges: BTreeMap::new(),
       by_stream: BTreeMap::new(),
       queued: VecDeque::new(),
@@ -655,6 +671,7 @@ impl Endpoint {
       arriving: BTreeMap::new(),
       ready: BTreeMap::new(),
       completed: std::collections::BTreeSet::new(),
+      progressed: std::collections::BTreeSet::new(),
       receive_refused: crate::receive::ReceiveRefusals::default(),
     })
   }
@@ -703,6 +720,7 @@ impl Endpoint {
       reset_answered_at: None,
       resets_sent: 0,
       discarded: 0,
+      deaf: false,
       exchanges: BTreeMap::new(),
       by_stream: BTreeMap::new(),
       queued: VecDeque::new(),
@@ -710,6 +728,7 @@ impl Endpoint {
       arriving: BTreeMap::new(),
       ready: BTreeMap::new(),
       completed: std::collections::BTreeSet::new(),
+      progressed: std::collections::BTreeSet::new(),
       receive_refused: crate::receive::ReceiveRefusals::default(),
     })
   }
@@ -1750,6 +1769,9 @@ impl Endpoint {
   /// acknowledgement newly frees a packet (RFC 9002 §5.1: the round trip is now minus that packet's send
   /// time).
   fn ingest(&mut self, datagram: &[u8]) -> Result<(), EndpointError> {
+    if self.deaf {
+      return Ok(());
+    }
     let now = now_ns();
     let cid = self.connection_id()?;
     let keys = self.keys.as_mut().ok_or(EndpointError::NotReady)?;
@@ -1885,6 +1907,19 @@ impl Endpoint {
       .collect()
   }
 
+  /// The exchanges whose replies read more bytes since the last call and are still open: what a caller judging each
+  /// open exchange's progress reads instead of asking every one ([`Endpoint::reply_bytes_read`]). The forward lane
+  /// asked every one, each ask a drain of the session, and with about 20,000 forwards open a turn held its shard
+  /// 1.09 s (the f = 1 primary-kill rung, 2026-11-08).
+  pub fn take_progressed(&mut self) -> Vec<u64> {
+    self.drain();
+    let progressed = std::mem::take(&mut self.progressed);
+    progressed
+      .into_iter()
+      .filter(|id| self.exchanges.contains_key(id))
+      .collect()
+  }
+
   /// The reply of exchange `id` if it has arrived whole, taking it (the exchange is then finished and its
   /// receiving half closed); `None` while it is still waiting or arriving, or for an unknown exchange. A
   /// receive stream counts complete only once every byte through its `fin` has been read, so the reply
@@ -1897,6 +1932,8 @@ impl Endpoint {
     }
     let exchange = self.exchanges.remove(&id)?;
     self.by_stream.remove(&stream);
+    self.completed.remove(&id);
+    self.progressed.remove(&id);
     self.conn.close_recv(stream);
     Some(exchange.reply)
   }
@@ -1916,6 +1953,8 @@ impl Endpoint {
     let Some(exchange) = self.exchanges.remove(&id) else {
       return;
     };
+    self.completed.remove(&id);
+    self.progressed.remove(&id);
     match exchange.stream {
       Some(stream) => {
         self.by_stream.remove(&stream);
@@ -2064,6 +2103,12 @@ impl Endpoint {
     self.conn.next_timeout()
   }
 
+  /// Test support (never called in production): makes this end drop every datagram it receives from now on, before the
+  /// connection sees it: what the session's holder then judges is the product's own judgment, unchanged.
+  pub fn set_deaf(&mut self) {
+    self.deaf = true;
+  }
+
   /// The congestion window, bytes (for reports).
   pub fn congestion_window(&self) -> u64 {
     self.conn.congestion_window()
@@ -2098,6 +2143,8 @@ impl Endpoint {
       exchanges: self.exchanges.len(),
       arriving: self.arriving.len(),
       ready: self.ready.len(),
+      completed: self.completed.len(),
+      progressed: self.progressed.len(),
     }
   }
 
@@ -2111,9 +2158,12 @@ impl Endpoint {
   /// anything else as a request arriving (a server's); a request that reached its `fin` moves to `ready`
   /// with its receiving half closed. Reading is what slides the flow-control window forward.
   fn drain(&mut self) {
-    let now = now_ns();
+    let readable = self.conn.take_readable();
+    // A drain with nothing readable reads no clock: the callers that ask after one exchange each drain first, and a
+    // clock read a call was a third of a spinning control shard's samples (the forward lane, 2026-11-08).
+    let now = if readable.is_empty() { 0 } else { now_ns() };
     let role = self.conn.role();
-    for id in self.conn.take_readable() {
+    for id in readable {
       let chunk = self.conn.read_stream(now, id);
       if crate::streams::initiator(id) == role {
         // A reply to this end's exchange. One no longer open (taken or abandoned) is already closed at the
@@ -2122,10 +2172,13 @@ impl Endpoint {
         match exchange_id.and_then(|exchange| self.exchanges.get_mut(&exchange)) {
           Some(exchange) => {
             exchange.reply.extend_from_slice(&chunk);
-            if let Some(exchange_id) = exchange_id
-              && self.conn.recv_stream_complete(id)
-            {
-              self.completed.insert(exchange_id);
+            if let Some(exchange_id) = exchange_id {
+              if !chunk.is_empty() {
+                self.progressed.insert(exchange_id);
+              }
+              if self.conn.recv_stream_complete(id) {
+                self.completed.insert(exchange_id);
+              }
             }
           }
           None => self.conn.stop_sending(id),

@@ -1777,7 +1777,24 @@ fn a_write_at_a_colossal_offset_is_refused_and_the_daemon_survives() {
 /// this test's first MOUNT 3 of 3 times on `d61c3be2`, after 1.00 s (adacachy).
 #[test]
 fn a_mount_routed_to_a_starved_owner_is_answered_and_to_a_wedged_one_refused() {
-  let (daemon, instance) = two_shard_daemon("starved-owner");
+  common::supervised::run(
+    "a_mount_routed_to_a_starved_owner_is_answered_and_to_a_wedged_one_refused_role",
+    "srv-starved-owner",
+    2,
+  );
+}
+
+/// The role [`a_mount_routed_to_a_starved_owner_is_answered_and_to_a_wedged_one_refused`] runs as a supervised daemon's process: its second half wedges the owner shard past a window
+/// while the control shard answers, which only an anchored daemon lives through (A-232).
+#[test]
+#[ignore = "a role: run by a_mount_routed_to_a_starved_owner_is_answered_and_to_a_wedged_one_refused as a supervised child"]
+fn a_mount_routed_to_a_starved_owner_is_answered_and_to_a_wedged_one_refused_role() {
+  let Some((daemon, instance)) = common::supervised::daemon(
+    "a_mount_routed_to_a_starved_owner_is_answered_and_to_a_wedged_one_refused_role",
+  ) else {
+    return;
+  };
+  daemon.bootstrap(true).unwrap();
   let name = provision_remote_volume(&instance);
   let export = daemon.mount_capability(&name).unwrap().unwrap();
   let port = daemon.nfs_port().unwrap();

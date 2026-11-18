@@ -131,8 +131,10 @@ pub struct VolumeStatus {
   pub host_epoch: i64,
 }
 
-/// A volume in a listing (§4.4) as a plain JS object — its id (hex), name, byte accounting, and whether
-/// it overlays a host directory. napi's camelCase keys; the u64 counts range-checked to JS-safe integers.
+/// A volume in a listing (§4.4) as a plain JS object — its id (hex), name, byte accounting, whether it
+/// overlays a host directory, whether it is live-shipped (A-200), and `notRecovered`: `null`, or for a volume
+/// recovery could not rebuild, its cause's kind (`"BaseMissing"`, …; its status gives the whole cause). napi's
+/// camelCase keys; the u64 counts range-checked to JS-safe integers.
 #[napi(object)]
 pub struct VolumeEntry {
   pub id: String,
@@ -140,6 +142,8 @@ pub struct VolumeEntry {
   pub referenced_bytes: i64,
   pub unique_bytes: i64,
   pub overlay: bool,
+  pub live_shipped: bool,
+  pub not_recovered: Option<String>,
 }
 
 /// A work volume created over a green (§4.16): its id (hex) and the green base version its edits submit
@@ -489,6 +493,11 @@ fn volume_entry(volume: VolumeSummary) -> Result<VolumeEntry> {
     referenced_bytes: status_i64(volume.referenced_bytes, "referencedBytes")?,
     unique_bytes: status_i64(volume.unique_bytes, "uniqueBytes")?,
     overlay: volume.overlay,
+    live_shipped: volume.live_shipped,
+    not_recovered: volume
+      .not_recovered
+      .as_ref()
+      .map(|cause| cause.kind().to_owned()),
   })
 }
 
@@ -614,7 +623,7 @@ pub struct Client {
 }
 
 /// One driver event as it crosses into JS: a reply landed for `ticket` (poll it by `word`), or the call
-/// failed with `error` — its kind first (`DaemonGone`, `Stalled`, …), so `async.mjs` names it.
+/// failed with `error` — its kind first (`DaemonGone`, `CompletionLost`, …), so `async.mjs` names it.
 #[napi(object)]
 pub struct DriverEvent {
   /// The call's ticket.
@@ -731,23 +740,10 @@ impl Client {
     begin: Begin,
     spin: impl FnOnce(&mut RustClient, RequestId, u64) -> Result<Option<T>>,
   ) -> Result<(String, Option<T>)> {
-    self.begin_spin_with(begin, spin, false)
-  }
-
-  /// [`Self::begin_spin`], waiting for a deferred reply while the daemon lives when `patient` (a granted
-  /// landing; `slates_client::defers_reply`).
-  fn begin_spin_with<T>(
-    &mut self,
-    begin: Begin,
-    spin: impl FnOnce(&mut RustClient, RequestId, u64) -> Result<Option<T>>,
-    patient: bool,
-  ) -> Result<(String, Option<T>)> {
-    let ticket = if patient {
-      self.driver.submit_patient(&mut self.inner, begin)
-    } else {
-      self.driver.submit(&mut self.inner, begin)
-    }
-    .map_err(refusal)?;
+    let ticket = self
+      .driver
+      .submit(&mut self.inner, begin)
+      .map_err(refusal)?;
     self.inner.begin_ack_if_due().map_err(refusal)?;
     let Some(word) = self.driver.word_of(ticket) else {
       return Ok((ticket.to_string(), None));
@@ -1389,7 +1385,7 @@ impl Client {
       Some(value) => Some(checked_u64(value, "grant")?),
       None => None,
     };
-    let (word, fast) = self.begin_spin_with(
+    let (word, fast) = self.begin_spin(
       Box::new(move |c: &mut RustClient| c.land_begin(id, snap, &target, filter.clone(), grant)),
       |c: &mut RustClient, id: RequestId, spin: u64| {
         let fast = match c.land_spin(id, spin).map_err(refusal)? {
@@ -1398,7 +1394,6 @@ impl Client {
         };
         Ok(fast)
       },
-      grant.is_some(),
     )?;
     Ok(LandBegin { word, fast })
   }

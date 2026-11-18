@@ -110,7 +110,8 @@ pub enum LinkAfter {
 /// A-114), or nothing.
 #[derive(Clone, Debug)]
 pub enum SegmentSource {
-  /// Create a fresh segment and a fresh rendezvous (tests, a daemon run alone without an anchor).
+  /// Create a fresh segment and a fresh rendezvous (tests, a daemon run alone without an anchor). Nobody reads such a
+  /// daemon's beat, so its watchdog ends its process on a stuck verdict (A-232, [`SegmentSource::supervision`]).
   Create {
     /// The object's name.
     name: String,
@@ -132,6 +133,60 @@ pub enum SegmentSource {
     /// maps it, no daemon after the first could otherwise make its own.
     rendezvous: Adoption,
   },
+}
+
+/// Derived: the CPU a [`Daemon::starve_control_shard`] hold runs each beat over `span_ns`: one beat times half a liveness
+/// window over the span, at most the whole beat, so the hold's whole CPU is at most half a window and the watchdog never
+/// finds it spinning, while each beat's share shows CPU progress, so it is never wedged either (A-228's rule).
+pub fn starved_share_ns(span_ns: u64) -> u64 {
+  HEARTBEAT_NS
+    .saturating_mul(LIVENESS_BUDGET_NS / 2)
+    .checked_div(span_ns)
+    .unwrap_or(HEARTBEAT_NS)
+    .min(HEARTBEAT_NS)
+}
+
+/// Test support: runs the calling thread for `span_ns` as a starved thread runs, a little CPU at a time (A-232): each
+/// beat it spins for its share ([`starved_share_ns`]) and sleeps the rest, so the shard it runs on steps nothing else
+/// for the span while the watchdog sees it move every look, alive and never stuck. Returns the span it measured,
+/// nanoseconds. [`Daemon::starve_control_shard`] runs it on the control shard; a test that keeps another shard silent
+/// past a window runs it in that shard's observation, where a sleep would be a wedge that ends a daemon no anchor
+/// supervises (`tests/fleet.rs`, `a_silent_owner_leaves_no_forward_the_lane_admitted_unrun`).
+pub fn starve_this_thread(span_ns: u64) -> u64 {
+  let share_ns = starved_share_ns(span_ns);
+  let begin = slates_rt::futures::now_ns();
+  let end = begin.saturating_add(span_ns);
+  let mut beat_began = begin;
+  while slates_rt::futures::now_ns() < end {
+    let share_ends = beat_began.saturating_add(share_ns).min(end);
+    while slates_rt::futures::now_ns() < share_ends {
+      std::hint::spin_loop();
+    }
+    let beat_ends = beat_began.saturating_add(HEARTBEAT_NS).min(end);
+    let rest = beat_ends.saturating_sub(slates_rt::futures::now_ns());
+    // The point of the fixture: off the CPU for the rest of the beat, as a starved thread is.
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(std::time::Duration::from_nanos(rest));
+    beat_began = beat_ends;
+  }
+  slates_rt::futures::now_ns().saturating_sub(begin)
+}
+
+impl SegmentSource {
+  /// Whether an anchor reads the beat of a daemon started over this source (A-232), which decides what the watchdog does
+  /// on a stuck verdict ([`crate::watchdog::decide`]). `FromEnv` is the anchor across the spawn, which kills a daemon
+  /// whose beat lapses. `Handoff` is an anchor in this process: it may read the beat, but it cannot end a stuck daemon
+  /// without ending itself, so nothing would, and its watchdog ends the process as a lone daemon's does. `Create` has no
+  /// anchor at all. A test that needs a supervised daemon to live on stuck plays the anchor across a spawn
+  /// (`crates/server/tests/common/supervised.rs`).
+  pub fn supervision(&self) -> crate::watchdog::Supervision {
+    match self {
+      SegmentSource::FromEnv => crate::watchdog::Supervision::Anchored,
+      SegmentSource::Create { .. } | SegmentSource::Handoff { .. } => {
+        crate::watchdog::Supervision::Alone
+      }
+    }
+  }
 }
 
 /// A held register record as a holder keeps it ([`Daemon::fleet_held_record`]).
@@ -666,6 +721,7 @@ impl Daemon {
       }))
     })?;
     let identity = profile.facts.identity.clone();
+    let supervision = source.supervision();
     // The rendezvous comes from wherever the segment does (A-114): an anchor across the spawn names both in the
     // environment, an anchor in this process hands both over, and a daemon with no anchor makes its own.
     let adoption = match &source {
@@ -842,6 +898,7 @@ impl Daemon {
       AnchorSegment::attach(&watch_handoff, watch_len, &identity)?,
       holders,
       control_alive,
+      supervision,
     )
     .map_err(|error| {
       ServerError::Ipc(slates_ipc::IpcError::OsRefused {
@@ -2207,10 +2264,16 @@ impl Daemon {
   /// Test support: **starves** this daemon's control shard for `span_ns` — the CPU starvation a shared,
   /// oversubscribed box inflicts on a live daemon (measured here at load average 41: a live root voter was
   /// retired and re-admitted in a loop), injected deterministically so the fleet's tolerance of it is a
-  /// test, not a hope. The hold is a task spawned onto the control shard that spins on the shard clock
-  /// until the span has passed: the shard is cooperative, so while the hold runs nothing else on that shard
+  /// test, not a hope. The hold is a task spawned onto the control shard that runs until the span has passed:
+  /// the shard is cooperative, so while the hold runs nothing else on that shard
   /// does — its probe serve tasks (so its acknowledgements to every peer's probes stop for the whole span,
-  /// then resume), its own probes, its record plane and its consensus loops. Admission is retried while the
+  /// then resume), its own probes, its record plane and its consensus loops.
+  ///
+  /// It runs as a starved thread runs, a little CPU at a time (A-232): each beat it spins for its share and sleeps the
+  /// rest, its share being what keeps its whole CPU over the span to half a liveness window
+  /// ([`starved_share_ns`]). Until A-232 it spun the whole span, and the watchdog's own rule (A-228) calls a window of
+  /// CPU without a step a spinning, stuck shard, not a starved one: an anchor would kill that daemon, and since A-232 a
+  /// lone one ends itself. So a span past a window was a stuck daemon, not the live, starved one this models. Admission is retried while the
   /// control channel is full ([`Self::observation`]); the typed refusal when there is no control shard or
   /// the hold was not admitted within the observe budget, otherwise the **admitted** hold, whose answer
   /// ([`Admitted::answer`]) is its **measured span** (nanoseconds) once it ends — so a test proves the
@@ -2230,12 +2293,7 @@ impl Daemon {
         OBSERVE_BUDGET_NS.saturating_add(span_ns),
         move || {
           let _ = spinning.send(());
-          let begin = slates_rt::futures::now_ns();
-          let end = begin.saturating_add(span_ns);
-          while slates_rt::futures::now_ns() < end {
-            std::hint::spin_loop();
-          }
-          Ok(slates_rt::futures::now_ns().saturating_sub(begin))
+          Ok(starve_this_thread(span_ns))
         },
       )?
       .admit()?;
@@ -2952,6 +3010,28 @@ impl Daemon {
     })
   }
 
+  /// Test support: while `Some(peer)`, this node's record link to `peer` pages no discovery, so the link's own refresh
+  /// never takes that session from its slot (`None` lifts it). Delivered like [`Self::inject_serve_delay`].
+  pub fn inject_discovery_hold(&self, peer: Option<slates_db::HostId>) -> Result<(), ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      s.injected_discovery_hold = peer;
+    })
+  }
+
+  /// Test support: makes this node's record session to `peer` drop everything it receives from the forward lane's next
+  /// borrow of it: a session whose peer is gone without a word (a restarted process that kept its member id, a reset
+  /// that was lost). Once, so the session the link dials to replace it is healthy. Delivered like
+  /// [`Self::inject_serve_delay`]; `Ok` once installed, else the typed refusal.
+  pub fn inject_session_deafness(&self, peer: slates_db::HostId) -> Result<(), ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      s.injected_deaf_session = Some(peer);
+      // Only a drop after this one counts toward the recovery a test reads: formation's own failed pages drop sessions
+      // too, and their recovery would read as this one's.
+      s.dead_session_dropped_at.clear();
+      s.dead_session_recovered_ns = None;
+    })
+  }
+
   /// Test support: leaves every forwarded verb on `volume` unanswered while set, on the session that keeps carrying
   /// this node's other replies (`None` lifts it, and the held verbs are served then). An owner alive and answering
   /// others but never this exchange, as the 205 submits a restarted primary could not commit were (fixtures' 1,000-client
@@ -3526,7 +3606,7 @@ async fn start_shard(
     .boot_fault
     .filter(|fault| fault.partition == partition)
   {
-    hold_start(fault);
+    hold_start(fault, config.copy_slice_ns()).await;
   }
   let outcome = init_shard(
     &config,
@@ -3571,7 +3651,12 @@ const NANOS_PER_MICRO: u64 = 1_000;
 
 /// Holds a shard's start as a [`crate::config::BootFault`] says: on the CPU (a long recovery) or asleep (a stuck
 /// shard), for its duration. Only the boot tests set one.
-fn hold_start(fault: crate::config::BootFault) {
+///
+/// A long recovery runs in slices that each end a step ([`crate::recovery_slices`], A-228), so the busy hold runs in the
+/// same slices, under the same budget. Until A-232 it spun its whole span as one poll, which the watchdog's rule calls a
+/// spinning, stuck shard, and which an anchor kills: since A-232 a daemon with no anchor in another process ends itself on
+/// it, so a hold past a window modelled a stuck start, not the long recovery its tests are about.
+async fn hold_start(fault: crate::config::BootFault, slice_ns: u64) {
   let duration = std::time::Duration::from_nanos(fault.for_ns);
   match fault.kind {
     // A stuck shard is a thread blocked without using CPU, which only a blocking wait models (D-9's exception for
@@ -3580,9 +3665,12 @@ fn hold_start(fault: crate::config::BootFault) {
     crate::config::BootFaultKind::Stuck => std::thread::sleep(duration),
     crate::config::BootFaultKind::Busy => {
       let started = std::time::Instant::now();
+      let mut slices = crate::recovery_slices::RecoverySlices::begin(slice_ns);
       while started.elapsed() < duration {
         std::hint::spin_loop();
+        slices.unit_done().await;
       }
+      let _report = slices.finish();
     }
   }
 }
@@ -3957,6 +4045,10 @@ async fn init_shard(
     probe_deaf_to: std::collections::BTreeSet::new(),
     injected_serve_delay_ns: None,
     injected_forward_silence: None,
+    injected_deaf_session: None,
+    injected_discovery_hold: None,
+    dead_session_dropped_at: std::collections::BTreeMap::new(),
+    dead_session_recovered_ns: None,
     injected_pair_withhold: false,
     served_sessions: std::collections::BTreeMap::new(),
     campaign_session_hold: None,
@@ -6551,6 +6643,7 @@ mod tests {
           host: slates_db::HostId(0),
           uid: 0,
         },
+        completion: None,
       };
       let record = Record {
         owner,
@@ -7064,6 +7157,64 @@ mod tests {
       "listed by the owner it moved from: {page:?}"
     );
     assert_eq!(counted, 1);
+  }
+
+  /// A-251 (b), the moved case across a warm restart: the held image keeps the retired owner a copy's authority moved
+  /// from, so after the restore, which routes the copy to the successor as a live owner, the successor's page still
+  /// lists it. Do: retire the owner of a record this node holds; run the authority reconcile; write the held image, drop
+  /// the acceptors, routing and lineage, and restore them from the image; answer the successor's page. Expect: the
+  /// restored acceptor names the retired owner it moved from, and the page lists the copy.
+  #[test]
+  fn a_restored_copy_keeps_the_owner_it_moved_from_and_is_still_listed() {
+    use slates_db::register::{HostEpoch, HostPrepare, HostPromise, ObjectId};
+    let object = ObjectId([43; 16]);
+    let (restored_from, departed, page) = audit_on_shard(move |state| {
+      let local = state.fleet.host();
+      let (departed, successor) = retire_the_owner_of_a_held_object(state, object);
+      crate::fleet::reconcile_held_authority(state);
+      let image = crate::content_holder::held_image(state);
+      state.holder_records.clear();
+      state.fleet.forget_object(object);
+      state.departed_owners.remove(&object);
+      let held = crate::content_holder::split_held(&image).unwrap();
+      assert_eq!(
+        crate::content_holder::restore_held_registers(state, local, held),
+        1
+      );
+      let restored_from = state
+        .holder_records
+        .get(&object)
+        .and_then(|acceptor| acceptor.moved_from());
+      state.answers_given.alive_answers.insert(
+        departed,
+        slates_machine::clock::monotonic_ns() - crate::lease::horizon_ns() - 1,
+      );
+      let prepare = HostPrepare {
+        departed,
+        owner: successor,
+        epoch: HostEpoch(2),
+        generation: state.fleet.configuration().version,
+        after: None,
+        named: Vec::new(),
+      };
+      let page = crate::takeover::serve_host_prepare(state, local, successor, &prepare.encode());
+      (restored_from, departed, page)
+    });
+    assert_eq!(
+      restored_from,
+      Some(departed),
+      "the image kept the owner the copy moved from"
+    );
+    let page = HostPromise::decode(&page).expect("the page answers");
+    assert_eq!(
+      page
+        .entries
+        .iter()
+        .map(|(listed, _)| *listed)
+        .collect::<Vec<_>>(),
+      vec![object],
+      "the restored copy is listed: {page:?}"
+    );
   }
 
   /// A-251 (b), shape (i) as one rule, the asker's own object: a copy under the asker's own authority, which no install
@@ -7592,6 +7743,7 @@ mod tests {
           host: slates_db::HostId(0),
           uid: 0,
         },
+        completion: None,
       };
       let record = Record {
         owner,

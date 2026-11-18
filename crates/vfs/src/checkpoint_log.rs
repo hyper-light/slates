@@ -36,9 +36,10 @@ const DELTA_MAGIC: u32 = u32::from_le_bytes(*b"SLD1");
 /// (`delta::InodePatch`), not its whole image; 3 (A-127, 2026-10-09) the call records changed and purged since the
 /// last publication; 4 (A-128, 2026-10-09) the held NFSv3 replies, whole, when they changed; 6 (A-262, 2026-11-08)
 /// every inode image it carries holds the Windows attribute bits kept beside the mode (image version 23); 7 (A-262,
-/// 2026-11-08) every fingerprint a witness in it carries holds the disk's Windows attribute bits (image version 24).
+/// 2026-11-08) every fingerprint a witness in it carries holds the disk's Windows attribute bits (image version 24); 8
+/// (A-251, 2026-11-09) the held replicas' image it carries holds each register's moved-from owner (image version 25).
 /// Format: the delta format's version, the latest entry of the history above.
-const DELTA_VERSION: u16 = 7;
+const DELTA_VERSION: u16 = 8;
 /// Format: a log frame's header — a little-endian payload length then a CRC-32C of the payload.
 const LOG_HEADER: usize = 2 * size_of::<u32>();
 /// Format: a log frame's payload prefix — its generation and its base checkpoint's generation.

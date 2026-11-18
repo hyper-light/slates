@@ -5,11 +5,10 @@
 
 /// Format: the segment's magic, `SLAN` in little-endian ASCII.
 pub const MAGIC: u32 = 0x4E41_4C53;
-/// Format: the layout version, changed for header, region, timestamp or record semantics: 3 a host-wide monotonic
-/// origin, 4 the content pool's owner words (A-98), 5 every principal recorded with the host whose account it is
-/// (A-237), 6 a green's chain entries record what each version changed (A-257). An older segment is refused, never read
-/// under semantics it was not written with.
-pub const LAYOUT_VERSION: u32 = 6;
+/// Format: the layout version, changed for header, region, timestamp or record semantics: 3 a host-wide origin, 4 pool
+/// owner words (A-98), 5 host-scoped principals (A-237), 6 chain entries record each version's changes (A-257), 7 they
+/// and merge records carry the submit's completion key (A-255). An older segment is refused, never misread.
+pub const LAYOUT_VERSION: u32 = 7;
 /// Format: the layout before A-237's host-scoped principals, refused with what to do about it.
 pub const LAYOUT_BEFORE_HOST_SCOPED_PRINCIPALS: u32 = 4;
 /// Format: one content-pool extent's owner word (A-98): 0 while the extent is free, else its owning partition plus
@@ -130,6 +129,14 @@ pub const SUP_LOG_REFUSALS: usize = 200;
 /// exit under it counts, as before.
 /// Format: the byte offset inside the supervision block, the word after the refused log lines.
 pub const SUP_SERVING: usize = 208;
+/// The current daemon's **looked** word (A-232): when, in the heartbeat's host domain, its watchdog last looked at its
+/// shards, written at every look whether the look beat or withheld the beat; zero until the first, and zeroed at every
+/// start. A beat that lapses while the looks go on is the watchdog's verdict (a stuck shard, or a control loop that
+/// ended), and the anchor kills; a beat that lapses because the watchdog itself has not looked is a daemon whose
+/// watchdog was kept off its CPU, which the anchor judges by its process's own CPU time, as it judges a start, and
+/// spares while it is starved.
+/// Format: the byte offset inside the supervision block, the word after the serving word.
+pub const SUP_LOOKED: usize = 216;
 /// The node's **client session secret** published word: `1` once a daemon has published the secret after it, `0` before
 /// (a fresh segment, or one an older anchor wrote). The secret is made by the first daemon under this anchor and adopted
 /// by every daemon after it, so a client's session key (`slates_server::session_key`), which only it and the daemon

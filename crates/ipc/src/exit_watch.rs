@@ -19,7 +19,8 @@
 //! - Linux: a pidfd (`pidfd_open(2)`, Linux 5.3), bound to the process as the kqueue note is, readable once it
 //!   exits.
 //!
-//! A stopped process has not exited, so a stall stays a stall. A Linux client needs no watch (the control socket's
+//! A stopped process has not exited, so a call to it waits (A-232: a call waits while its daemon lives, and a stuck one
+//! is ended by its supervisor or its own watchdog, which this watch then sees). A Linux client needs no watch (the control socket's
 //! peer end closes with the daemon's process); the supervising anchor does, to restart a daemon the moment it dies
 //! rather than at its next observation (A-113's follow-up): on Unix the watch's descriptor
 //! (`ExitWatch::readiness`, the Unix arm) becomes readable at the exit, so the anchor waits on it beside its hold channel. For a

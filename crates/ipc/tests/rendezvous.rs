@@ -470,7 +470,8 @@ fn rendezvous_restart_child() {
 }
 
 /// GAPS §8a-sdk-stamp, A-143 (found 2026-10-22: on macOS an async SDK call to a stopped daemon, restarted once,
-/// ended `DaemonGone` where it must end `Stalled`). Do: hold the rendezvous as an anchor does, and run in a child
+/// ended `DaemonGone` though its daemon lived: then it had to end `Stalled`, and since A-232 it waits and is answered
+/// once the daemon runs). Do: hold the rendezvous as an anchor does, and run in a child
 /// under it: daemon A, a client's claim begun while A is published, A dropped unanswered (a killed daemon), then
 /// daemon B, which answers the claim. Expect: the client judges B alive. Before A-143 the client kept the start stamp
 /// it saw when its claim began, A's, while it watched B's process, and so judged the live B gone. Linux passes by

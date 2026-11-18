@@ -26,9 +26,11 @@ mod common;
 
 /// Shape: two shards, so a client's shard and a volume's owner differ.
 const TEST_SHARDS: u16 = 2;
-/// Shape: how long the owner shard is held while its control channel is filled: the liveness budget, long enough for
-/// the forward to meet the full channel and be kept.
-const HOLD: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS);
+/// Shape: how long the owner shard is held while its control channel is filled: half the liveness budget, long enough
+/// for the flood and for the forward to meet the full channel and be kept (microseconds), and short of the window in
+/// which the watchdog judges an unmoving shard wedged: this daemon has no anchor, and since A-232 that verdict ends its
+/// process, this test binary with it. A-232's own held-daemon tests hold half a window for the same reason.
+const HOLD: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS / 2);
 /// Shape: how long the kept forward's answer may take once the owner runs again: the liveness budget, far past the
 /// owner's drain of the flood (microseconds) and the origin's retry, and far short of forever.
 const ANSWER_WAIT: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS);

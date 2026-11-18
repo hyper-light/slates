@@ -24,13 +24,15 @@ export interface VolumeStatus {
   hostEpoch: number
 }
 
-/** A volume in a listing. */
+/** A volume in a listing. `notRecovered` is null, or for a volume recovery could not rebuild its cause's kind. */
 export interface VolumeEntry {
   id: string
   name: string
   referencedBytes: number
   uniqueBytes: number
   overlay: boolean
+  liveShipped: boolean
+  notRecovered: string | null
 }
 
 /** A work volume created over a green: its id (hex) and the green base version its edits submit against. */
@@ -93,9 +95,10 @@ export class Client {
 /**
  * The async-primary client (R6, D-19): every verb returns a Promise resolved by the completion fd's
  * readiness (a libuv-polled socket/pipe), never blocking the event loop. The fast path resolves within
- * the daemon's spin window without touching the loop. Every call ends: answered, refused typed, failed
- * `Stalled` at its reply deadline, `DaemonGone` when recovery finds no daemon, or `CompletionLost` when
- * the completion reader fails (AUD-29-20). Calls past the outstanding bound are refused
+ * the daemon's spin window without touching the loop. A call waits while its daemon lives; a daemon that
+ * will never answer is ended by its anchor or its own watchdog (A-232). Every call ends: answered, refused
+ * typed, `DaemonGone` when recovery finds no daemon, or `CompletionLost` when the completion reader fails
+ * (AUD-29-20). Calls past the outstanding bound are refused
  * `TooManyOutstanding` at once.
  */
 export class AsyncClient {

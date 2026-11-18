@@ -18,19 +18,35 @@
 //! base, and submits again — at most `MAX_RESOLUTIONS` times a round; a client that runs out is counted as starved,
 //! never hidden.
 //!
-//! **The oracle (offline, after the run).** Every submit is recorded with its base, its send and reply instants,
-//! its slots and its outcome. The accepted versions must be exactly `1..=V`, each once. An accepted submit at `v`
-//! must have no slot that an accepted version in `(base, v)` touched while the green's bytes at `v - 1` differ from
-//! the slot's (the verdict's rule). A conflict's windows must equal the rule's expected set at some head the verdict
-//! could have seen: between the newest version whose reply came back before the submit was sent and the newest
-//! version whose submit was sent before this reply came back. And the green's head bytes of every file the run
-//! touched must equal the version-ordered replay of the accepted submits over the files' version-0 bytes.
+//! **The oracle (offline, after the run; `support/load_oracle.rs` states it exactly).** Every submit is recorded with
+//! its base, its send and reply instants, its slots and its outcome. The accepted versions must be exactly `1..=V`,
+//! each once. An accepted submit at `v` must have no slot that an accepted version in `(base, v)` touched while the
+//! green's bytes at `v - 1` differ from the slot's (the verdict's rule). A conflict's windows must equal the rule's
+//! expected set at some head the verdict could have seen, bounded by the accepted submits whose replies came back
+//! before the submit was sent and those sent before its reply came back. And the green's head bytes of every file the
+//! run touched must equal the version-ordered replay of the accepted submits over the files' bytes before the level.
 //!
-//! Rows: `latency\t<n>\t<kind>\t<count>\t<p50>\t<p99>\t<p999>\t<max>` in nanoseconds, each attempt timed alone; then
-//! `operation\t…` in the same columns, each logical operation from its first attempt to its answer, refusals for now
-//! and resends included; then `oracle\t<n>\t…` lines;
-//! a nonzero `oracle_failures` exits 1. Last, `lost\t<counter>\t<count>` for each of the daemon's counters of a lost
-//! reply or ask.
+//! **The offered load (`--think-us <mean>`).** A client waits for each reply before its next request, as an agent does,
+//! and then thinks: a pause drawn afresh after every reply from the exponential distribution of the stated mean, and
+//! one draw before its first request, so no two clients start or stay in step. Many independent clients' requests
+//! together approach a Poisson stream whatever each one's own pauses (the Palm–Khintchine theorem), so this is the
+//! stream a fleet of independent agents offers. The fixed pause it replaced sent every client's first request at the
+//! same instant and kept the clients bunched after, which no fleet of independent agents does. A mean of 0 is the
+//! closed loop at capacity: every client always waits on a request or is ready to send one, so its latency is the
+//! clients over the throughput (Little's law), not a service time.
+//!
+//! **Where each client's time went.** A client not yet done is at each instant in flight (a request sent, its reply
+//! not yet taken), thinking, pausing after a refusal for now, or held: due to send and not yet sent, by the harness's
+//! sweep or by its connection's ring or in-flight bound. Each is summed where it happens (a held client's wait at its
+//! send, from the instant it was due), and the `offered` row gives each as the time-averaged number of clients, with
+//! the replies and verdicts a second. A latency is stamped at a send, so the time a client is held before a send is in
+//! no `latency` row, and before an operation's first send in no `operation` row either: a level with clients held
+//! measures less than its clients wait, and says so here.
+//!
+//! Rows: `offered\t<n>\t…` (above); `latency\t<n>\t<kind>\t<count>\t<p50>\t<p99>\t<p999>\t<max>` in nanoseconds, each
+//! attempt timed alone; then `operation\t…` in the same columns, each logical operation from its first attempt to its
+//! answer, refusals for now and resends included; then `oracle\t<n>\t…` lines; a nonzero `oracle_failures` exits 1.
+//! Last, `lost\t<counter>\t<count>` for each of the daemon's counters of a lost reply or ask.
 // Bench harness code: an unwrap here is a failed run.
 #![allow(
   clippy::unwrap_used,
@@ -48,6 +64,12 @@ use slates_client::{
 use slates_ipc::protocol::{EntryKind, GreenBase, MergeWindow, Refusal, ReplyBody, RequestBody};
 use slates_machine::{MachineProfile, ProfileOptions};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
+
+// The oracle: the design's rule over the level's submits, in its own file so its test
+// (`crates/client/tests/load_oracle.rs`) names the same code.
+#[path = "support/load_oracle.rs"]
+mod load_oracle;
+use load_oracle::{Outcome, Slot, SubmitEvent};
 
 /// Shape: rounds of edit-and-submit each client runs, unless `--rounds` says otherwise.
 const ROUNDS: usize = 3;
@@ -77,14 +99,6 @@ const PERMILLE: u64 = 1000;
 /// Shape: the seed of the deterministic plan (splitmix64), so a run is reproducible.
 const SEED: u64 = 0x5eed_1a7e_57c0_ffee;
 
-/// One slot an edit overwrites.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Slot {
-  path: String,
-  at: u64,
-  bytes: Vec<u8>,
-}
-
 /// The kinds of operation timed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Kind {
@@ -100,32 +114,6 @@ enum Kind {
   Cycle,
   /// A round from its first edit to its accept, conflicts and their resolution included.
   Round,
-}
-
-/// What a submit came back with.
-#[derive(Clone, Debug)]
-enum Outcome {
-  Accepted(u64),
-  Conflict(Vec<(String, u64, u64)>),
-  /// The client gave up with the submit in flight (the daemon gone past its reconnect budget, a reply lost): the
-  /// green may or may not have taken it, which the oracle settles from the green itself ([`resolve_unknown`]).
-  Unknown,
-}
-
-/// The conflict classes a conflict reply named, kept beside the windows for the event dump.
-type Classes = Vec<u8>;
-
-/// One submit, as the oracle judges it.
-#[derive(Clone, Debug)]
-struct SubmitEvent {
-  base: u64,
-  sent_ns: u64,
-  replied_ns: u64,
-  slots: Vec<Slot>,
-  outcome: Outcome,
-  agent: usize,
-  round: usize,
-  classes: Classes,
 }
 
 /// What a client is doing.
@@ -184,6 +172,9 @@ struct Agent {
   /// refusal retryable under its id), doubling while they repeat (`Client::retry_pause_ns`), zero once a reply moves
   /// it on. Resent at once, 1,000 clients refused `LeaseUnconfirmed` after a primary's kill sent 20,000 a second.
   pause_ns: u64,
+  /// When the request in flight was sent, this attempt alone (a retry under its id keeps its first send in `inflight`
+  /// for its latency): the start of the client's time in flight.
+  attempt_sent_ns: u64,
 }
 
 /// What a worker brings back.
@@ -216,6 +207,13 @@ struct Tally {
   /// The longest wait between two drains of one connection's completion ring: the resolution of every latency here,
   /// since a reply's arrival is stamped when its ring is drained.
   max_drain_gap_ns: u64,
+  /// Where the clients' time went, summed over clients in client-nanoseconds: in flight, thinking (the pauses drawn),
+  /// pausing after a refusal for now, and held (due to send and not yet sent, [`Worker::send_ready`]). A request given
+  /// up while in flight is counted in none.
+  in_flight_ns: u64,
+  thinking_ns: u64,
+  paused_ns: u64,
+  held_ns: u64,
 }
 
 impl Tally {
@@ -250,11 +248,24 @@ impl Tally {
     self.retried += tally.retried;
     self.unconfirmed += tally.unconfirmed;
     self.max_drain_gap_ns = self.max_drain_gap_ns.max(tally.max_drain_gap_ns);
+    self.answered = self.answered.saturating_add(tally.answered);
+    self.in_flight_ns = self.in_flight_ns.saturating_add(tally.in_flight_ns);
+    self.thinking_ns = self.thinking_ns.saturating_add(tally.thinking_ns);
+    self.paused_ns = self.paused_ns.saturating_add(tally.paused_ns);
+    self.held_ns = self.held_ns.saturating_add(tally.held_ns);
   }
 }
 
 /// splitmix64: a reproducible plan without a dependency.
 struct Rng(u64);
+
+/// Format: the uniform draws behind a think: a draw's high 32 bits, offset by half a step and divided by 2³², is
+/// uniform on (0, 1) and never 0, so its logarithm is finite.
+const UNIFORM_STEPS: f64 = 4_294_967_296.0;
+/// Format: half of one uniform step (above).
+const HALF_STEP: f64 = 0.5;
+/// Format: the bits a 64-bit draw is shifted down by to keep its high 32.
+const HIGH_HALF: u32 = 32;
 
 impl Rng {
   fn next(&mut self) -> u64 {
@@ -266,6 +277,21 @@ impl Rng {
   }
   fn below(&mut self, n: u64) -> u64 {
     self.next() % n.max(1)
+  }
+
+  /// A draw from the exponential distribution of mean `mean_ns`, in nanoseconds, by inversion (`-mean · ln U`, `U`
+  /// uniform on (0, 1)); 0 for a mean of 0. The largest draw is `mean · ln 2³³`, about 23 means, past which the
+  /// distribution holds e⁻²³ of its mass, about 10⁻¹⁰.
+  fn exponential_ns(&mut self, mean_ns: u64) -> u64 {
+    if mean_ns == 0 {
+      return 0;
+    }
+    let high = u32::try_from(self.next() >> HIGH_HALF).unwrap_or(u32::MAX);
+    let uniform = (f64::from(high) + HALF_STEP) / UNIFORM_STEPS;
+    let seconds = Duration::from_nanos(mean_ns).as_secs_f64() * -uniform.ln();
+    Duration::try_from_secs_f64(seconds).map_or(u64::MAX, |pause| {
+      u64::try_from(pause.as_nanos()).unwrap_or(u64::MAX)
+    })
   }
 }
 
@@ -738,8 +764,9 @@ fn record(tally: &mut Tally, kind: Kind, elapsed: u64) {
   tally.latencies.entry(kind).or_default().push(elapsed);
 }
 
-/// How many of the client's reply deadlines a request may wait past its send before the harness counts its reply lost:
-/// one, unless `--reply-patience <n>` asks more (to tell a late reply from one never sent).
+/// How many reconnect budgets the harness keeps asking again past a retryable refusal before it gives the request up:
+/// one, unless `--reply-patience <n>` asks more. A request with no reply yet is waited for while its daemon lives, the
+/// client's rule (A-232), so this bounds no reply wait.
 fn reply_patience() -> u64 {
   arg("--reply-patience").map_or(1, |n| n.parse().expect("--reply-patience n"))
 }
@@ -772,10 +799,12 @@ fn conn_reconnect_ns(conns: &[Connection], c: usize) -> u64 {
     .map_or(0, |conn| conn.client.deadlines().reconnect_ns)
 }
 
-/// The pause each client takes after a reply before its next request (`--think-us <µs>`, default none: a closed loop
-/// with no think time, every client always waiting on a request). An agent between its requests thinks, reads its
-/// tree or runs a build: the offered load the latency bound is stated for. A latency never includes the pause.
-fn think_ns() -> u64 {
+/// The mean of the pause each client takes after a reply before its next request (`--think-us <µs>`, default none: a
+/// closed loop with no think time, every client always waiting on a request). Each pause is drawn from the exponential
+/// distribution of this mean ([`Rng::exponential_ns`]), and so is a pause before each client's first request. An agent
+/// between its requests thinks, reads its tree or runs a build: the offered load the latency bound is stated for. A
+/// latency never includes the pause.
+fn think_mean_ns() -> u64 {
   arg("--think-us").map_or(0, |us| {
     us.parse::<u64>()
       .expect("--think-us µs")
@@ -855,10 +884,39 @@ struct Worker {
   /// Clients with nothing in flight and a step to send, by when each may send: its last reply plus the think time
   /// (`--think-us`), earliest first.
   ready: std::collections::BinaryHeap<std::cmp::Reverse<(u64, usize)>>,
-  /// The pause a client takes after each reply before its next request (`--think-us`), nanoseconds.
-  think_ns: u64,
+  /// The mean pause a client takes after each reply before its next request (`--think-us`), nanoseconds, and the
+  /// worker's own draws of it.
+  think: Think,
   tally: Tally,
   epoch: Instant,
+}
+
+/// The clients' pauses between requests: each drawn from the exponential distribution of the stated mean, and each
+/// counted in the tally's thinking time.
+struct Think {
+  mean_ns: u64,
+  draws: Rng,
+}
+
+impl Think {
+  /// The pause before a client's next request, counted.
+  fn draw(&mut self, tally: &mut Tally) -> u64 {
+    let pause = self.draws.exponential_ns(self.mean_ns);
+    tally.thinking_ns = tally.thinking_ns.saturating_add(pause);
+    pause
+  }
+}
+
+/// Shape: the seed of a worker's think draws, apart from the plan's (`SEED`), so the plan is the same whatever the
+/// pacing: worker `w` at level `n` draws from `THINK_SEED ^ n ^ (w << 32)`.
+const THINK_SEED: u64 = 0x7a1c_0ff5_e7ba_c0de;
+
+/// The pause after a refusal for now (or a refusal retryable under its id): the client's own doubling pause, counted in
+/// the tally's paused time.
+fn refusal_pause(client: &Client, last_pause_ns: u64, tally: &mut Tally) -> u64 {
+  let pause = client.retry_pause_ns(last_pause_ns);
+  tally.paused_ns = tally.paused_ns.saturating_add(pause);
+  pause
 }
 
 impl Worker {
@@ -878,6 +936,7 @@ impl Worker {
         Ok(true) => {
           agent.retry = None;
           agent.inflight = Some((word, first_sent_ns, retried_kind));
+          agent.attempt_sent_ns = ns_since(self.epoch);
           conn.inflight.insert(word, a);
           self.tally.retried += 1;
           true
@@ -899,6 +958,7 @@ impl Worker {
         let now = ns_since(self.epoch);
         agent.op_since.get_or_insert(now);
         agent.inflight = Some((id.word(), now, kind));
+        agent.attempt_sent_ns = now;
         conn.inflight.insert(id.word(), a);
         true
       }
@@ -920,7 +980,8 @@ impl Worker {
   }
 
   /// Sends for every ready client, in order, until one cannot go (each connection's ring and bound are its own, so
-  /// a client that cannot go is kept and the rest are tried).
+  /// a client that cannot go is kept and the rest are tried). Each due client's wait past the instant it was due (or
+  /// was last kept) is counted held: the harness's sweep or its connection's bound kept it back.
   fn send_ready(&mut self) {
     let now = ns_since(self.epoch);
     let mut kept = Vec::new();
@@ -932,6 +993,7 @@ impl Worker {
       if self.agents[a].step == Step::Done || self.agents[a].inflight.is_some() {
         continue;
       }
+      self.tally.held_ns = self.tally.held_ns.saturating_add(now.saturating_sub(due));
       if !self.send(a) {
         kept.push(std::cmp::Reverse((now, a)));
       }
@@ -988,6 +1050,10 @@ impl Worker {
     let Some((_, sent_ns, kind)) = agent.inflight.take() else {
       return;
     };
+    self.tally.in_flight_ns = self
+      .tally
+      .in_flight_ns
+      .saturating_add(now.saturating_sub(agent.attempt_sent_ns));
     if let ReplyBody::Refused { refusal } = &reply
       && retryable_under_its_id(refusal)
     {
@@ -1005,7 +1071,11 @@ impl Worker {
         return;
       }
       agent.retry = Some((word, sent_ns, kind));
-      agent.pause_ns = self.conns[agent.conn].client.retry_pause_ns(agent.pause_ns);
+      agent.pause_ns = refusal_pause(
+        &self.conns[agent.conn].client,
+        agent.pause_ns,
+        &mut self.tally,
+      );
       self
         .ready
         .push(std::cmp::Reverse((now.saturating_add(agent.pause_ns), a)));
@@ -1032,11 +1102,15 @@ impl Worker {
     }
     if agent.step != Step::Done {
       let wait = if for_now {
-        agent.pause_ns = self.conns[agent.conn].client.retry_pause_ns(agent.pause_ns);
+        agent.pause_ns = refusal_pause(
+          &self.conns[agent.conn].client,
+          agent.pause_ns,
+          &mut self.tally,
+        );
         agent.pause_ns
       } else {
         agent.pause_ns = 0;
-        self.think_ns
+        self.think.draw(&mut self.tally)
       };
       self
         .ready
@@ -1106,9 +1180,9 @@ impl Worker {
   }
 
   /// No reply yet to some request: past the client's own derived reply deadline, a gone daemon starts the restart
-  /// path; a reply the daemon defers past one deadline while it lives (`Client::defers`) is waited for, as the
-  /// synchronous call waits; anything else past `reply_patience` deadlines is counted lost and named, never waited on
-  /// for ever.
+  /// path, and a live one's request is waited for, the client's own rule (A-232). A worker whose replies stop coming
+  /// is named by its stall dump ([`Self::stall_dump`]). Until 2026-11-13 a request the daemon would not defer
+  /// (`Client::defers`, now gone) was counted lost past `reply_patience` deadlines while its daemon lived.
   fn overdue(&mut self) {
     let now = ns_since(self.epoch);
     for c in 0..self.conns.len() {
@@ -1117,35 +1191,13 @@ impl Worker {
         continue;
       }
       let deadline = conn.client.deadlines().reply_ns;
-      let mut lost = Vec::new();
-      let mut gone = false;
-      for (word, a) in &conn.inflight {
-        let Some((_, sent_ns, kind)) = self.agents[*a].inflight else {
-          continue;
-        };
-        let waited = now.saturating_sub(sent_ns);
-        if waited <= deadline {
-          continue;
-        }
-        if conn.client.daemon_gone() {
-          gone = true;
-          break;
-        }
-        if !conn.client.defers(*word) && waited > deadline.saturating_mul(reply_patience()) {
-          lost.push((*word, *a, kind));
-        }
-      }
-      if gone {
+      let overdue = conn.inflight.values().any(|a| {
+        self.agents[*a]
+          .inflight
+          .is_some_and(|(_, sent_ns, _)| now.saturating_sub(sent_ns) > deadline)
+      });
+      if overdue && conn.client.daemon_gone() {
         conn.lost(self.epoch);
-        continue;
-      }
-      for (word, a, kind) in lost {
-        self.conns[c].inflight.remove(&word);
-        self.conns[c].client.abandon(word);
-        self.agents[a].give_up(
-          &mut self.tally,
-          &format!("no reply to {kind:?} within the reply deadline (daemon gone: false)"),
-        );
       }
     }
   }
@@ -1171,10 +1223,7 @@ impl Worker {
             .inflight
             .map_or(0, |(_, sent, _)| now.saturating_sub(sent) / 1_000_000);
           let kind = agent.inflight.map(|(_, _, kind)| kind);
-          format!(
-            "{word:#x}:{kind:?}:{age}ms:defers={}",
-            conn.client.defers(*word)
-          )
+          format!("{word:#x}:{kind:?}:{age}ms")
         })
         .collect();
       println!(
@@ -1227,10 +1276,18 @@ impl Worker {
 /// is done. A sweep drains every connection's ring first (stamping each reply's arrival, so a latency here is the
 /// daemon's and the ring's, not the time the harness took to reach the client), moves each answered client on and
 /// sends its next request at once, then sends for clients still waiting for room. Every `PROGRESS_EVERY` it prints how
-/// many of its clients are done and the submits it has seen.
-fn drive(conns: Vec<Connection>, agents: Vec<Agent>, epoch: Instant, worker: usize) -> Tally {
+/// many of its clients are done and the submits it has seen. Each client first waits one pause drawn from `think`, as
+/// it does after every reply, so the clients start apart as independent agents do.
+fn drive(
+  conns: Vec<Connection>,
+  agents: Vec<Agent>,
+  epoch: Instant,
+  worker: usize,
+  mut think: Think,
+) -> Tally {
+  let mut tally = Tally::default();
   let ready = (0..agents.len())
-    .map(|a| std::cmp::Reverse((0, a)))
+    .map(|a| std::cmp::Reverse((think.draw(&mut tally), a)))
     .collect();
   let check_every = conns.first().map_or(1, |conn| {
     (conn.client.deadlines().reply_ns / OVERDUE_CHECKS_PER_DEADLINE).max(1)
@@ -1239,8 +1296,8 @@ fn drive(conns: Vec<Connection>, agents: Vec<Agent>, epoch: Instant, worker: usi
     conns,
     agents,
     ready,
-    think_ns: think_ns(),
-    tally: Tally::default(),
+    think,
+    tally,
     epoch,
   };
   let mut reported = Instant::now();
@@ -1409,200 +1466,83 @@ fn report(n: usize, tally: &mut Tally) {
   );
 }
 
-/// Each slot's writes by the accepted versions, in version order: what the green held at a slot at any version is the
-/// last write at or before it, else the file's version-0 bytes. Built once, linear in the accepted slots, so judging a
-/// verdict at a head is a lookup per slot. (The oracle had replayed a whole copy of every touched file for every
-/// version: 1,600 versions × 677 files at 1,000 clients, minutes of the harness's own CPU after the clients were done,
-/// which read as a hung daemon.)
-type SlotWrites<'a> = BTreeMap<(&'a str, u64), Vec<(u64, &'a [u8])>>;
+/// Format: nanoseconds a second.
+const NS_PER_S: u128 = 1_000_000_000;
+/// Format: tenths in a unit, the `offered` row's one decimal place.
+const TENTHS: u128 = 10;
 
-fn slot_writes<'a>(accepted: &[&'a SubmitEvent]) -> SlotWrites<'a> {
-  let mut writes: SlotWrites<'a> = BTreeMap::new();
-  for (index, event) in accepted.iter().enumerate() {
-    let version = index as u64 + 1;
-    for slot in &event.slots {
-      writes
-        .entry((slot.path.as_str(), slot.at))
-        .or_default()
-        .push((version, slot.bytes.as_slice()));
-    }
-  }
-  writes
+/// `part` over `whole` to one decimal place: a time-averaged number of clients from their summed time and the wall.
+fn tenths(part: u64, whole: u64) -> String {
+  let scaled = (u128::from(part) * TENTHS)
+    .checked_div(u128::from(whole))
+    .unwrap_or(0);
+  format!("{}.{}", scaled / TENTHS, scaled % TENTHS)
 }
 
-/// The green's bytes at slot `(path, at)` of `len` bytes as of `version`.
-fn slot_at<'a>(
-  writes: &SlotWrites<'a>,
-  base: &'a BTreeMap<String, Vec<u8>>,
-  (path, at, len): (&str, u64, usize),
-  version: u64,
-) -> &'a [u8] {
-  let written = writes.get(&(path, at)).and_then(|history| {
-    history
-      .iter()
-      .rev()
-      .find(|(written, _)| *written <= version)
-      .map(|(_, bytes)| *bytes)
-  });
-  written.unwrap_or_else(|| {
-    let start = usize::try_from(at).unwrap();
-    &base[path][start..start + len]
-  })
+/// `count` events over `wall_ns` as a rate a second.
+fn per_second(count: u64, wall_ns: u64) -> u128 {
+  u128::from(count)
+    .saturating_mul(NS_PER_S)
+    .checked_div(u128::from(wall_ns))
+    .unwrap_or(0)
 }
 
-/// The green's bytes of every touched file after the last accepted version.
-fn replay(base: &BTreeMap<String, Vec<u8>>, writes: &SlotWrites<'_>) -> BTreeMap<String, Vec<u8>> {
-  let mut state = base.clone();
-  for ((path, at), history) in writes {
-    if let Some((_, bytes)) = history.last() {
-      let start = usize::try_from(*at).unwrap();
-      state.get_mut(*path).unwrap()[start..start + bytes.len()].copy_from_slice(bytes);
-    }
-  }
-  state
-}
-
-/// The windows the verdict's rule expects for `event` judged against head `head`: each slot that a version in
-/// `(base, head]` touched, where the green's bytes at `head` differ from the slot's.
-fn expected_windows(
-  event: &SubmitEvent,
-  (writes, base): (&SlotWrites<'_>, &BTreeMap<String, Vec<u8>>),
-  head: u64,
-) -> BTreeSet<(String, u64, u64)> {
-  event
-    .slots
-    .iter()
-    .filter(|slot| {
-      writes
-        .get(&(slot.path.as_str(), slot.at))
-        .is_some_and(|history| history.iter().any(|(v, _)| *v > event.base && *v <= head))
+/// The level's offered load and where its clients' time went: the think's stated mean; the replies taken, the verdicts
+/// (submits answered, accepted or in conflict) and the rebases a second; and the time-averaged number of clients in
+/// flight, thinking, pausing after a refusal for now, and held, with their sum, the clients not yet done. In the closed
+/// loop that sum is the throughput times each operation's cycle, request and pause together (Little's law), so `held`
+/// is the share of the clients the harness or a connection's bound kept back: their wait is in no latency row.
+fn offered_row(n: usize, think_mean_ns: u64, wall_ns: u64, tally: &Tally) -> String {
+  let count = |kind: Kind| {
+    tally.latencies.get(&kind).map_or(0, |samples| {
+      u64::try_from(samples.len()).unwrap_or(u64::MAX)
     })
-    .filter(|slot| {
-      slot_at(writes, base, (&slot.path, slot.at, slot.bytes.len()), head) != slot.bytes.as_slice()
-    })
-    .map(|slot| (slot.path.clone(), slot.at, SLOT_BYTES))
-    .collect()
-}
-
-/// Why the oracle did not expect a window at `(path, at)`: the versions that wrote it, and the head's bytes there
-/// against the submit's.
-fn explain(
-  event: &SubmitEvent,
-  (writes, base): (&SlotWrites<'_>, &BTreeMap<String, Vec<u8>>),
-  (path, at): (&str, u64),
-  head: u64,
-) -> String {
-  let touched: Vec<u64> = writes
-    .get(&(path, at))
-    .map(|history| history.iter().map(|(v, _)| *v).collect())
-    .unwrap_or_default();
-  let mine = event
-    .slots
-    .iter()
-    .find(|slot| slot.path == path && slot.at == at);
-  let held = slot_at(writes, base, (path, at, 16), head);
+  };
+  let verdicts = count(Kind::SubmitAccepted).saturating_add(count(Kind::SubmitConflict));
+  let alive = tally
+    .in_flight_ns
+    .saturating_add(tally.thinking_ns)
+    .saturating_add(tally.paused_ns)
+    .saturating_add(tally.held_ns);
   format!(
-    "{path}@{at}: touched by versions {touched:?}; head {:?}; mine {:?}",
-    String::from_utf8_lossy(held),
-    mine.map(|slot| String::from_utf8_lossy(&slot.bytes[..16]).into_owned())
+    "offered\t{n}\tthink_mean_ns\t{think_mean_ns}\treplies_per_s\t{}\tverdicts_per_s\t{}\trebases_per_s\t{}\talive\t{}\tin_flight\t{}\tthinking\t{}\tpaused\t{}\theld\t{}",
+    per_second(tally.answered, wall_ns),
+    per_second(verdicts, wall_ns),
+    per_second(count(Kind::Rebase), wall_ns),
+    tenths(alive, wall_ns),
+    tenths(tally.in_flight_ns, wall_ns),
+    tenths(tally.thinking_ns, wall_ns),
+    tenths(tally.paused_ns, wall_ns),
+    tenths(tally.held_ns, wall_ns),
   )
 }
 
-/// Judges every submit and the final bytes; returns the failures, each printed.
+/// Judges the level (the rule is `support/load_oracle.rs`'s): every submit over `base`, the touched files' bytes before
+/// the level, then the green's head of each file as `read_head` reads it, one file at a time. Prints the first
+/// failures, the summary row and the oracle's own time (`oracle_ns`: the submits' judgment, then the heads' with
+/// their reads), so a level's wall is told from the harness's own work after it; returns the failures.
 fn oracle(
   n: usize,
   submits: &[SubmitEvent],
-  base: &BTreeMap<String, Vec<u8>>,
-  head: &BTreeMap<String, Vec<u8>>,
+  base: BTreeMap<String, Vec<u8>>,
+  read_head: impl FnMut(&str) -> Vec<u8>,
 ) -> u64 {
-  let mut failures = 0u64;
-  let mut fail = |what: String| {
-    failures += 1;
-    if failures <= 20 {
-      println!("oracle_failure\t{n}\t{what}");
-    }
-  };
-  let mut accepted: Vec<&SubmitEvent> = submits
-    .iter()
-    .filter(|e| matches!(e.outcome, Outcome::Accepted(_)))
-    .collect();
-  accepted.sort_by_key(|e| match e.outcome {
-    Outcome::Accepted(v) => v,
-    Outcome::Conflict(_) | Outcome::Unknown => 0,
-  });
-  for (index, event) in accepted.iter().enumerate() {
-    if let Outcome::Accepted(v) = event.outcome
-      && v != index as u64 + 1
-    {
-      fail(format!(
-        "accepted versions are not 1..=V: position {index} holds {v}"
-      ));
-    }
-  }
-  let writes = slot_writes(&accepted);
-  let judged = (&writes, base);
-  for event in submits {
-    match &event.outcome {
-      Outcome::Accepted(v) => {
-        let expected = expected_windows(event, judged, v - 1);
-        if !expected.is_empty() {
-          fail(format!(
-            "version {v} (base {}) was accepted over conflicts {expected:?}",
-            event.base
-          ));
-        }
-      }
-      // An outcome still unknown after `resolve_unknown` was not taken by the green: it judges nothing.
-      Outcome::Unknown => {}
-      Outcome::Conflict(windows) => {
-        let reported: BTreeSet<(String, u64, u64)> = windows.iter().cloned().collect();
-        let low = accepted
-          .iter()
-          .filter(|e| e.replied_ns < event.sent_ns)
-          .count() as u64;
-        let high = accepted
-          .iter()
-          .filter(|e| e.sent_ns < event.replied_ns)
-          .count() as u64;
-        let fits =
-          (low.max(event.base)..=high).any(|h| expected_windows(event, judged, h) == reported);
-        if !fits {
-          let top = expected_windows(event, judged, high);
-          let why: Vec<String> = reported
-            .difference(&top)
-            .map(|(path, at, _)| explain(event, judged, (path, *at), high))
-            .collect();
-          fail(format!(
-            "conflict (agent {}, base {}) reported {reported:?}; no head in {low}..={high} expects that; at {high} \
-             expected {top:?}; unexpected: {why:?}",
-            event.agent, event.base
-          ));
-        }
-      }
-    }
-  }
-  let replayed = &replay(base, &writes);
-  for (path, bytes) in replayed {
-    if head.get(path) != Some(bytes) {
-      fail(format!(
-        "the green's head of {path} differs from the replay of the accepted submits"
-      ));
-    }
+  let judging = Instant::now();
+  let (judged, writes) = load_oracle::judge_submits(submits, &base);
+  let judge_ns = judging.elapsed().as_nanos();
+  let reading = Instant::now();
+  let mut failures = judged.failures;
+  let files_checked = load_oracle::judge_heads(base, &writes, read_head, &mut failures);
+  let heads_ns = reading.elapsed().as_nanos();
+  for what in &failures.named {
+    println!("oracle_failure\t{n}\t{what}");
   }
   println!(
-    "oracle\t{n}\taccepted\t{}\tconflicts\t{}\tunknown\t{}\tfiles_checked\t{}\toracle_failures\t{failures}",
-    accepted.len(),
-    submits
-      .iter()
-      .filter(|e| matches!(e.outcome, Outcome::Conflict(_)))
-      .count(),
-    submits
-      .iter()
-      .filter(|e| matches!(e.outcome, Outcome::Unknown))
-      .count(),
-    replayed.len()
+    "oracle\t{n}\taccepted\t{}\tconflicts\t{}\tunknown\t{}\tfiles_checked\t{files_checked}\toracle_failures\t{}",
+    judged.accepted, judged.conflicts, judged.unknown, failures.count
   );
-  failures
+  println!("oracle_ns\t{n}\tsubmits\t{judge_ns}\theads\t{heads_ns}");
+  failures.count
 }
 
 /// Settles the submits whose outcome their clients never learned, from the green itself: every version of this level
@@ -1672,7 +1612,8 @@ fn read_files(
     .collect()
 }
 
-/// A file read that a busy daemon may stall past one reply deadline, or refuse for now: tried again (`patiently`).
+/// A file read that a busy daemon may refuse for now: tried again (`patiently`). A late reply is waited for while the
+/// daemon lives (A-232).
 fn read_patiently(client: &mut Client, green: VolumeId, path: &str, at: ReadAt) -> Vec<u8> {
   patiently(client, &format!("read {path}"), |client| {
     client.read(green, path, at)
@@ -1684,8 +1625,8 @@ fn versions_patiently(client: &mut Client, green: VolumeId) -> u64 {
   patiently(client, "versions", |client| client.versions(green))
 }
 
-/// An oracle or setup call tried again while its answer is only late or refused for now: a stall past one reply
-/// deadline (the daemon draining after every client is done), its daemon gone for longer than one reconnect budget, `LeaseUnconfirmed` (an owner confirming its lease after a node's
+/// An oracle or setup call tried again while its answer is refused for now: its daemon gone for longer than one
+/// reconnect budget, `LeaseUnconfirmed` (an owner confirming its lease after a node's
 /// kill: fixtures' 1,000-client replica-kill rung aborted the harness on one, 2026-11-07), `Overloaded` or
 /// `OwnerUnreachable`. Paced by the client's own retry pause and bounded by `reply_patience` reconnect budgets, past
 /// which the harness stops with the last answer named.
@@ -1706,10 +1647,9 @@ fn patiently<T>(
     match call(client) {
       Ok(answer) => return answer,
       Err(
-        ClientError::Stalled { .. }
         // A kill rung's restarted node may take longer than one reconnect budget to come back; each call reconnects
         // again (fixtures' 1,000-client primary kill: `versions` met `DaemonGone` 7.52 s in, 2026-11-07).
-        | ClientError::DaemonGone { .. }
+        ClientError::DaemonGone { .. }
         | ClientError::Refused(
           Refusal::LeaseUnconfirmed { .. }
           | Refusal::Overloaded { .. }
@@ -1766,6 +1706,7 @@ fn spread(
       round_since: None,
       op_since: None,
       pause_ns: 0,
+      attempt_sent_ns: 0,
     });
   }
   groups
@@ -1841,6 +1782,7 @@ fn level(
     per_connection <= limit,
     "--per-connection {per_connection} exceeds the connection's in-flight bound {limit}"
   );
+  let think_mean = think_mean_ns();
   let epoch = Instant::now();
   let tallies: Vec<Tally> = std::thread::scope(|scope| {
     let handles: Vec<_> = groups
@@ -1852,7 +1794,11 @@ fn level(
             .into_iter()
             .map(|client| Connection::new(client, epoch))
             .collect();
-          drive(conns, agents, epoch, worker)
+          let think = Think {
+            mean_ns: think_mean,
+            draws: Rng(THINK_SEED ^ (n as u64) ^ ((worker as u64) << HIGH_HALF)),
+          };
+          drive(conns, agents, epoch, worker, think)
         })
       })
       .collect();
@@ -1870,6 +1816,15 @@ fn level(
     "level\t{n}\twall_ns\t{}\tworkers\t{workers}",
     wall.as_nanos()
   );
+  println!(
+    "{}",
+    offered_row(
+      n,
+      think_mean,
+      u64::try_from(wall.as_nanos()).unwrap_or(u64::MAX),
+      &total
+    )
+  );
   report(n, &mut total);
   // Version numbers in the events are absolute; rebase them to this level's first version for the oracle.
   for event in &mut total.submits {
@@ -1882,7 +1837,6 @@ fn level(
   // has since restarted (its `versions` answered `DaemonGone` after the primary's kill, 2026-11-07).
   let mut reader = connect(first_instance(instance)).unwrap();
   let unexplained = resolve_unknown(&mut reader, green, head_before, &mut total.submits);
-  let head = read_files(&mut reader, green, &paths, ReadAt::Head);
   if std::env::args().any(|a| a == "--events") {
     for event in &total.submits {
       let slots: Vec<String> = event
@@ -1907,8 +1861,11 @@ fn level(
       "oracle_failure\t{n}\tversion {version} is on the green but no submit of this level, known or unknown, explains it"
     );
   }
+  let judged = oracle(n, &total.submits, base, |path| {
+    read_patiently(&mut reader, green, path, ReadAt::Head)
+  });
   u64::try_from(unexplained.len()).unwrap_or(u64::MAX)
-    + oracle(n, &total.submits, &base, &head)
+    + judged
     + own_files_oracle(n, &mut reader, green, &total.submits)
 }
 
@@ -2057,5 +2014,119 @@ fn main() {
   }
   if failures > 0 {
     std::process::exit(1);
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// Shape: the draws each distribution test takes: enough that five standard errors are about 1% of the mean.
+  const DRAWS: u64 = 200_000;
+  /// Shape: the stated mean the tests draw at, a millisecond.
+  const MEAN_NS: u64 = 1_000_000;
+  /// Shape: the standard errors a sample statistic may stray before a test fails (about one false failure in 1.7
+  /// million runs for a normal statistic).
+  const STANDARD_ERRORS: u64 = 5;
+
+  /// AC-9.1 (the load test's stated offered load): a level at a mean of 0 draws no pause, so it stays the closed loop
+  /// at capacity, every client always waiting on a request.
+  #[test]
+  fn a_mean_of_zero_draws_no_pause() {
+    let mut draws = Rng(THINK_SEED);
+    assert!((0..DRAWS).all(|_| draws.exponential_ns(0) == 0));
+  }
+
+  /// AC-9.1: the pauses follow the exponential distribution of the stated mean: draw 200,000 at a mean of 1 ms, and
+  /// their mean is the stated mean, the share of them past the mean is e⁻¹ and the share past twice the mean e⁻²
+  /// (the memoryless distribution's own shares; a fixed pause would put all or none past), each within five standard
+  /// errors.
+  #[test]
+  fn pauses_follow_the_exponential_distribution_of_the_stated_mean() {
+    let mut draws = Rng(THINK_SEED);
+    let pauses: Vec<u64> = (0..DRAWS).map(|_| draws.exponential_ns(MEAN_NS)).collect();
+    let sum: u128 = pauses.iter().map(|pause| u128::from(*pause)).sum();
+    let mean = u64::try_from(sum / u128::from(DRAWS)).unwrap();
+    // The exponential's standard deviation is its mean, so the sample mean's standard error is the mean over √n.
+    let tolerance = STANDARD_ERRORS * MEAN_NS / DRAWS.isqrt();
+    assert!(
+      mean.abs_diff(MEAN_NS) <= tolerance,
+      "the draws' mean is {mean} ns against a stated {MEAN_NS} ± {tolerance}"
+    );
+    for multiple in [1u64, 2] {
+      let past = pauses
+        .iter()
+        .filter(|pause| **pause > multiple * MEAN_NS)
+        .count();
+      let share =
+        f64::from(u32::try_from(past).unwrap()) / f64::from(u32::try_from(DRAWS).unwrap());
+      let expected = (-f64::from(u32::try_from(multiple).unwrap())).exp();
+      let error = (expected * (1.0 - expected) / f64::from(u32::try_from(DRAWS).unwrap())).sqrt();
+      assert!(
+        (share - expected).abs() <= f64::from(u32::try_from(STANDARD_ERRORS).unwrap()) * error,
+        "{share} of the pauses run past {multiple} means against e^-{multiple} = {expected}"
+      );
+    }
+  }
+
+  /// AC-9.1: two workers draw their own pauses, so clients on different workers do not keep step: of the first 1,000
+  /// draws of workers 0 and 1 at one level, fewer than 1% fall on the same nanosecond at the same position.
+  #[test]
+  fn two_workers_draw_their_own_pauses() {
+    let draws = |worker: u64| {
+      let mut rng = Rng(THINK_SEED ^ 1_000 ^ (worker << HIGH_HALF));
+      (0..1_000)
+        .map(|_| rng.exponential_ns(MEAN_NS))
+        .collect::<Vec<u64>>()
+    };
+    let same = draws(0)
+      .iter()
+      .zip(draws(1).iter())
+      .filter(|(first, second)| first == second)
+      .count();
+    assert!(
+      same < 10,
+      "{same} of 1,000 draws fell on the same nanosecond"
+    );
+  }
+
+  /// AC-9.1: a level's clients' time is reported whole: over a 2 s wall, clients on average 600 in flight, 300
+  /// thinking, 50 pausing and 50 held are 1,000 not yet done, beside 20,000 replies a second, so a level whose harness
+  /// kept clients back from sending shows it next to latencies that cannot.
+  #[test]
+  fn the_offered_row_reports_each_state_of_the_clients_and_their_sum() {
+    const WALL_NS: u64 = 2_000_000_000;
+    let tally = Tally {
+      answered: 40_000,
+      in_flight_ns: 600 * WALL_NS,
+      thinking_ns: 300 * WALL_NS,
+      paused_ns: 50 * WALL_NS,
+      held_ns: 50 * WALL_NS,
+      ..Tally::default()
+    };
+    let row = offered_row(1_000, MEAN_NS, WALL_NS, &tally);
+    for field in [
+      "\treplies_per_s\t20000\t",
+      "\talive\t1000.0\t",
+      "\tin_flight\t600.0\t",
+      "\tthinking\t300.0\t",
+      "\tpaused\t50.0\t",
+    ] {
+      assert!(row.contains(field), "{row:?} lacks {field:?}");
+    }
+    assert!(row.ends_with("\theld\t50.0"), "{row:?}");
+  }
+
+  /// AC-9.1: a level that ended before any time passed reports rates and clients of 0, never a division by zero.
+  #[test]
+  fn a_level_of_no_wall_time_reports_zeroes() {
+    let tally = Tally {
+      answered: 7,
+      held_ns: 3,
+      ..Tally::default()
+    };
+    let row = offered_row(1, 0, 0, &tally);
+    assert!(row.contains("\treplies_per_s\t0\t"), "{row:?}");
+    assert!(row.ends_with("\theld\t0.0"), "{row:?}");
   }
 }

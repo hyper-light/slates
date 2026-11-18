@@ -1581,13 +1581,11 @@ fn two_asks_for_one_node_answer_one_object_the_peer_cannot_resize() {
   drop(daemon);
 }
 
-/// Shape: a starved poll's CPU burst and its time off the CPU, a fifth of the time on it, as a thread kept off its core
-/// by spinners runs a little at a time (as `tests/liveness.rs`).
-const STARVED_BURST: Duration = Duration::from_millis(10);
-const STARVED_OFF: Duration = Duration::from_millis(40);
-
-/// Holds `daemon`'s first shard in one poll for `span`, on the CPU a fifth of the time, as a starved shard runs.
-/// Returns once the poll has begun, with the thread that waits for it to end.
+/// Holds `daemon`'s first shard in one poll for `span`, as a starved shard runs, a little CPU each beat
+/// (`slates_server::daemon::starve_this_thread`, whose whole CPU over any span is half a window). This daemon has no
+/// anchor, and a window of CPU in one poll is a spinning shard, a verdict that ends the daemon's process and this test
+/// binary with it (A-232): on the CPU a fixed fifth of the time, the 7.5 s hold ran 1,013 ms of CPU and ended it
+/// (CI's ubuntu-latest, 2026-11-17). Returns once the poll has begun, with the thread that waits for it to end.
 fn hold_starved(daemon: &Daemon, span: Duration) -> std::thread::JoinHandle<()> {
   let began: &'static std::sync::atomic::AtomicBool =
     Box::leak(Box::new(std::sync::atomic::AtomicBool::new(false)));
@@ -1597,15 +1595,7 @@ fn hold_starved(daemon: &Daemon, span: Duration) -> std::thread::JoinHandle<()> 
       slates_server::daemon::OBSERVE_BUDGET_NS,
       move |_: &mut slates_server::state::ShardState| {
         began.store(true, std::sync::atomic::Ordering::Release);
-        let started = Instant::now();
-        while started.elapsed() < span {
-          let burst = Instant::now();
-          while burst.elapsed() < STARVED_BURST {
-            std::hint::spin_loop();
-          }
-          let (_hold, off) = channel::<()>();
-          let _ = off.recv_timeout(STARVED_OFF);
-        }
+        let _ = slates_server::daemon::starve_this_thread(u64::try_from(span.as_nanos()).unwrap());
       },
     )
     .unwrap();
@@ -1621,8 +1611,8 @@ fn hold_starved(daemon: &Daemon, span: Duration) -> std::thread::JoinHandle<()> 
 }
 
 /// The guest waits for a working daemon past one window, and counts it (2026-11-07). Do: on a one-shard daemon, write
-/// a 3 MiB file; hold the shard in one poll for a window and a half of [`CREDIT_WAIT`], on the CPU a fifth of the time
-/// as a starved shard runs; meanwhile ask for the file's writable DAX map. Expect the map answered once the poll ends,
+/// a 3 MiB file; hold the shard in one poll for a window and a half of [`CREDIT_WAIT`], a little CPU each beat as a
+/// starved shard runs ([`hold_starved`]); meanwhile ask for the file's writable DAX map. Expect the map answered once the poll ends,
 /// and the guest's extension counted (`Waits::extended`): it waited past one window because the shard kept running.
 /// The guest before 2026-11-07 gave the daemon one window of wall time, and the ask failed `EAGAIN`, as a starved
 /// daemon's did under load 150 to 170 on macOS.

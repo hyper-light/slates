@@ -267,7 +267,7 @@ fn await_stable_daemon(instance: &str, bootstrap: bool) {
     };
     if streak >= STABLE_STREAK {
       if bootstrap {
-        bootstrap_through_stalls(instance, &mut progress);
+        bootstrap_once(instance);
       }
       return;
     }
@@ -542,23 +542,20 @@ fn strict_volume_or_typed_refusal(instance: &str) -> Option<String> {
   None
 }
 
-/// §4.14 `daemon.alive` (2026-10-10, when the anchor began waiting for the lapse instead of looking every beat): a daemon
-/// that stops beating is killed at its heartbeat lapse and restarted. Do: start an anchor, freeze its daemon
-/// (`SIGSTOP`: alive and silent), and wait for another daemon to answer. Expect the frozen one gone, killed once, and the
-/// anchor's own kill line to say the beat it judged was at least its lapse bound old (the liveness window plus the
-/// anchor's lateness p99), never less than the window; and the new daemon answering within the suite's start wait past
-/// that bound.
+/// §4.14 `daemon.alive`, A-232: a daemon frozen whole is killed by its process judgment once its heartbeat lapses, and
+/// restarted. Do: start an anchor, freeze its daemon (`SIGSTOP`: alive and silent), and wait for another daemon to
+/// answer. Expect the frozen one gone, killed once, and the anchor's kill line to be its process judgment, never a
+/// withheld beat's: the line names a beat at least a window old and a process that made no progress for at least the
+/// window and at most one more, the window being the liveness budget; and the new daemon answering within the suite's
+/// start wait.
 ///
-/// The lower bound is the anchor's own predicate, read from its kill line, because the test cannot see how old the last
-/// beat was when it stopped the daemon. Since A-228 the beat is the watchdog's, and on a loaded machine a beat can come
-/// late (0.26 s measured on a starved shard), so the lapse can end sooner after the stop than a window less one beat.
-/// Main CI run 42184319025 (macOS, 2026-11-07) replaced the daemon 869.8 ms after the stop, with the anchor right, and
-/// failed the old bound of the window less a beat (900 ms).
-///
-/// Since A-228 the beat is the daemon's watchdog thread's, and a frozen process stops every thread at once, the watchdog
-/// with them, so nothing in the daemon can say it is only starved. A stopped process is indistinguishable from a hung one,
-/// and the kill here is the intended outcome: measured 2026-11-06 on macOS arm64 at load 54, killed at 1,045 ms against a
-/// 1,044 ms bound (the liveness window plus the anchor's own lateness p99 of 44 ms over 15 waits).
+/// A frozen process stops its watchdog with every other thread, so the watchdog's silence cannot say whether the daemon
+/// is stuck or only starved; since A-232 the anchor then judges the process by the start's rule, sparing a starved one
+/// and killing a frozen one a window after the lapse (`crates/cli/src/anchor.rs` `on_lapse`). Until A-232 it killed at
+/// the lapse itself, as a withheld beat: measured 2026-11-06 on macOS arm64 at load 54, 1,045 ms against a 1,044 ms
+/// bound (the liveness window plus the anchor's lateness p99 of 44 ms over 15 waits). Still waiting for those words, this
+/// test timed out on the landing of A-232 (CI's ubuntu-latest, 2026-11-17), whose kill line read "has not looked for
+/// 2004 ms, its heartbeat 2004 ms old; its process made no progress for 1004 ms (the 1000 ms liveness window)".
 #[test]
 fn a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted() {
   if std::env::var_os("SLATES_TEST_CLI").is_none() {
@@ -574,7 +571,7 @@ fn a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted() {
   anchor.drain = Some(std::thread::spawn(move || {
     for line in std::io::BufRead::lines(stderr).map_while(Result::ok) {
       eprintln!("{line}");
-      if line.contains(LAPSE_KILL_LINE) {
+      if line.contains(PROCESS_KILL_LINE) || line.contains(LAPSE_KILL_LINE) {
         let _ = kills.send(line);
       }
     }
@@ -602,9 +599,14 @@ fn a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted() {
     .recv_timeout(START_WAIT)
     .expect("the anchor said why it killed the daemon");
   drop(anchor);
-  let (age, bound, window) = lapse_of(&line);
+  assert!(
+    line.contains(PROCESS_KILL_LINE) && !line.contains(LAPSE_KILL_LINE),
+    "the anchor killed the frozen daemon by its process judgment, not as a withheld beat: {line}"
+  );
+  let (age, still, window) = frozen_kill_of(&line);
   println!(
-    "frozen daemon: replaced after {replaced_after:?}; the anchor's beat was {age:?} old against its {bound:?} bound"
+    "frozen daemon: replaced after {replaced_after:?}; the anchor's beat was {age:?} old, its process still for {still:?} \
+     against its {window:?} window"
   );
   assert_ne!(successor, frozen);
   assert!(!frozen_alive, "the frozen daemon was killed");
@@ -614,36 +616,45 @@ fn a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted() {
     "the anchor's window is the liveness budget"
   );
   assert!(
-    age >= bound && age >= window,
-    "not killed before its heartbeat lapsed: the beat was {age:?} old against a {bound:?} bound ({line})"
+    age >= window && still >= window,
+    "not killed before its heartbeat lapsed and its process made no progress for a window: the beat was {age:?} old, \
+     the process still for {still:?} ({line})"
   );
-  // Killed at the lapse: within one more window of it. How soon the successor then answers is the machine's, and
+  // Killed by the judgment: within one more window of it. How soon the successor then answers is the machine's, and
   // `await_daemon` judges it by the successor's progress.
   assert!(
-    age <= bound + window,
-    "killed within a window of the lapse: the beat was {age:?} old against a {bound:?} bound ({line})"
+    still <= window + window,
+    "killed within a window of the judgment: the process was still for {still:?} against a {window:?} window ({line})"
   );
 }
 
-/// Format: the words of the anchor's kill line for a lapsed beat (`crates/cli/src/anchor.rs`).
+/// Format: the words of the anchor's kill line for a beat its watchdog withheld while looking (`crates/cli/src/anchor.rs`
+/// `on_lapse`): never a frozen daemon's, whose watchdog is frozen with it.
 const LAPSE_KILL_LINE: &str = "the daemon's heartbeat lapsed (";
 
-/// The beat's age, the lapse bound and the window the anchor's kill line names, in that order: "(N ms old, past B ms: the
-/// W ms window …".
-fn lapse_of(line: &str) -> (Duration, Duration, Duration) {
-  let (_, rest) = line.split_once(LAPSE_KILL_LINE).expect("a kill line");
+/// Format: the words of the anchor's kill line for a daemon whose watchdog has gone silent and whose process the start's
+/// rule finds stuck (`on_lapse`, A-232): "the daemon's watchdog has not looked for L ms, its heartbeat A ms old; its
+/// process made no progress for F ms (the W ms liveness window); killing it".
+const PROCESS_KILL_LINE: &str = "; its process made no progress for ";
+
+/// The beat's age, how long the process made no progress, and the window the anchor's process kill line names: its
+/// four numbers are the watchdog's silence, the beat's age, the process's stillness and the window, in that order.
+fn frozen_kill_of(line: &str) -> (Duration, Duration, Duration) {
+  let (_, rest) = line
+    .split_once("the daemon's watchdog has not looked for ")
+    .expect("a process kill line");
   let numbers: Vec<u64> = rest
     .split(|c: char| !c.is_ascii_digit())
     .filter(|word| !word.is_empty())
-    .take(3)
+    .take(4)
     .map(|word| word.parse().unwrap())
     .collect();
-  let [age, bound, window] = numbers[..] else {
-    panic!("the kill line names the age, the bound and the window: {line}");
+  let [_silent, age, still, window] = numbers[..] else {
+    panic!("the kill line names the silence, the beat's age, the stillness and the window: {line}");
   };
   (
     Duration::from_millis(age),
-    Duration::from_millis(bound),
+    Duration::from_millis(still),
     Duration::from_millis(window),
   )
 }
@@ -3439,34 +3450,13 @@ fn await_daemon(instance: &str, replaced: Option<u32>, held: &[u16]) -> u32 {
   }
 }
 
-/// Format: the client's words when a live daemon has not answered inside its reply deadline (`ClientError::Stalled`,
-/// `crates/client/src/error.rs`).
-const STALLED_WORDS: &str = "no reply within";
-
-/// Bootstraps the consensus group, waiting out a reply that stalls while the daemon progresses ([`StartProgress`]). At 8
-/// spinners a CPU (2026-11-07) `bootstrap root` was refused "no reply within 1000000000 ns" in five of fifteen runs: the
-/// client's reply deadline is a wall second against a daemon that was alive and starved (the client's deadlines are
-/// clients' A-232). A stalled bootstrap may still land, so after a stall the group being already initialized is the
-/// bootstrap done; any other refusal fails the test.
-fn bootstrap_through_stalls(instance: &str, progress: &mut StartProgress) {
-  let mut stalled = false;
-  loop {
-    let (code, _, error) = run(instance, &["bootstrap", "root"]);
-    if code == 0 {
-      return;
-    }
-    let squashed = error.to_ascii_lowercase().replace('_', "");
-    if stalled && squashed.contains("consensusalreadyinitialized") {
-      return;
-    }
-    assert!(
-      error.contains(STALLED_WORDS),
-      "explicit first-time bootstrap: {error}"
-    );
-    stalled = true;
-    progress.check(instance, "the bootstrap's reply");
-    pause();
-  }
+/// Bootstraps the consensus group once; the bootstrap must succeed. The client waits for the reply while the daemon
+/// lives (A-232), so a live daemon starved past its reply deadline answers late, never refused. Until 2026-11-13 the
+/// client failed that late reply `Stalled` ("no reply within 1000000000 ns", five of fifteen runs at 8 spinners a CPU,
+/// 2026-11-07) and this asked again, taking `ConsensusAlreadyInitialized` after a stall as the bootstrap done.
+fn bootstrap_once(instance: &str) {
+  let (code, _, error) = run(instance, &["bootstrap", "root"]);
+  assert_eq!(code, 0, "explicit first-time bootstrap: {error}");
 }
 
 /// Derived: the longest any wait for a daemon runs, however it progresses: the start wait at the slowest share of a
@@ -8120,17 +8110,95 @@ fn a_shared_map_a_second_mount_and_the_sdk_agree_with_the_volume_through_a_gener
 /// control's and the second mount's bytes, the second store not applied, and the sync refused.
 ///
 /// Linux only: on macOS the NFS v3 mount does the same since A-192 (the test after this one).
+///
+/// **Its precondition, proved each attempt.** The rule is tested only if the store's page is still dirty when the other
+/// path writes. The kernel may write it back first. On adacachy2's 7.3 kernel a process spawn from the test's process
+/// while the page is dirty did so, as a sibling test's spawn would: with one `Command` spawn between the store and the
+/// replacement, 6 attempts of 6 found the page written back first, 3-6 ms after the store (2026-11-09, a daemon trace),
+/// while a 50 ms sleep there left it dirty. That write-back is fresh, so it is rightly applied, and the sync then has
+/// nothing to refuse. Before 2026-11-09 the test took that run for a lost refusal ("the sync says so: Ok(())", B10's
+/// gate at load about 66). So each attempt reads the daemon's `fuse.writebacks_applied` just before the store and just
+/// after the other path's write: an applied write-back between them can only have come first, since after the write
+/// every byte of a page fetched before it is stale. An attempt whose precondition did not hold says so and starts
+/// again with a fresh fixture, up to [`DIRTY_PAGE_ATTEMPTS`]; it never passes or fails on the rule.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path() {
   if !live_mount_runs() {
     return;
   }
-  let mut fixture = MappedThroughAMount::with_pages("mapdirty", b'A', 2);
+  let mut missed = Vec::new();
+  for attempt in 1..=DIRTY_PAGE_ATTEMPTS {
+    match dirty_page_attempt(attempt) {
+      DirtyPageAttempt::Held => return,
+      DirtyPageAttempt::Missed(miss) => {
+        eprintln!(
+          "attempt {attempt} of {DIRTY_PAGE_ATTEMPTS}: precondition not held, retrying: {miss}"
+        );
+        missed.push(miss);
+      }
+    }
+  }
+  panic!(
+    "the precondition (a store's page still dirty when another path writes) never held in {DIRTY_PAGE_ATTEMPTS} \
+     attempts, so the write-back rule was never tested: {missed:?}"
+  );
+}
+
+/// Derived: attempts at [`a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path`]'s precondition.
+/// The run on main held it 10 of 10 at load 66-68 (adacachy2, 2026-11-09), a miss rate under 30% at 95% confidence (3
+/// / 10, the rule of three); at 30% six attempts all miss with 0.3^6 = 0.0007, under one in a thousand.
+#[cfg(target_os = "linux")]
+const DIRTY_PAGE_ATTEMPTS: u32 = 6;
+
+/// How one attempt at the dirty-page rule went: its precondition held and every assertion passed, or it did not hold
+/// in the phase named (the kernel wrote the store's page back before the other path's write).
+#[cfg(target_os = "linux")]
+enum DirtyPageAttempt {
+  Held,
+  Missed(String),
+}
+
+/// One attempt at the dirty-page rule, with a fresh fixture: [`DirtyPageAttempt::Missed`] naming the phase whose
+/// precondition did not hold, the rule's own assertions otherwise.
+#[cfg(target_os = "linux")]
+fn dirty_page_attempt(attempt: u32) -> DirtyPageAttempt {
+  let mut fixture = MappedThroughAMount::with_pages(&format!("mapdirty{attempt}"), b'A', 2);
   let second = fixture.mount_again();
+  if let Some(miss) = stale_whole_file_phase(&mut fixture) {
+    return DirtyPageAttempt::Missed(miss);
+  }
+  match stale_part_phase(&mut fixture, &second) {
+    Some(miss) => DirtyPageAttempt::Missed(miss),
+    None => DirtyPageAttempt::Held,
+  }
+}
+
+/// The daemon's applied cache write-backs and refused ones (`fuse.writebacks_applied`, `fuse.writeback_conflicts`).
+#[cfg(target_os = "linux")]
+fn writeback_counts(instance: &str) -> (u64, u64) {
+  (
+    status_counter(instance, "fuse.writebacks_applied"),
+    status_counter(instance, "fuse.writeback_conflicts"),
+  )
+}
+
+/// The whole-file phase: a store left dirty, the whole file replaced through the SDK, the sync refused. Then the control:
+/// a store into the page fetched after the replacement, applied whole. `Some` naming the miss when the store's page was
+/// written back before the replacement.
+#[cfg(target_os = "linux")]
+fn stale_whole_file_phase(fixture: &mut MappedThroughAMount) -> Option<String> {
   let length = fixture.length;
+  let (applied_before, conflicts_before) = writeback_counts(&fixture.instance);
   fixture.view()[10] = b'M';
   fixture.replace_through_slates(b'S');
+  let (applied_after, _) = writeback_counts(&fixture.instance);
+  let early = applied_after.saturating_sub(applied_before);
+  if early > 0 {
+    return Some(format!(
+      "the whole-file phase: {early} write-back(s) of the store's page applied before the replacement"
+    ));
+  }
   let stale_whole = fixture.try_sync_map();
   assert!(
     fixture.volume_bytes() == vec![b'S'; length],
@@ -8139,6 +8207,10 @@ fn a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path() {
   assert!(
     stale_whole.is_err(),
     "the write-back of a page the replacement made stale is refused, and the sync says so: {stale_whole:?}"
+  );
+  assert!(
+    writeback_counts(&fixture.instance).1 > conflicts_before,
+    "the refusal is counted (fuse.writeback_conflicts, the rule's non-vacuity count)"
   );
   assert!(
     fixture.follows(b'S'),
@@ -8152,9 +8224,26 @@ fn a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path() {
     fresh.is_ok() && fixture.volume_bytes() == expected,
     "a write-back of a page fetched after the replacement is applied whole: {fresh:?}"
   );
+  None
+}
+
+/// The second-mount phase: a store left dirty, other bytes of its page written through a second mount, the sync
+/// refused whole. `Some` naming the miss when the store's page was written back before the second mount's write.
+#[cfg(target_os = "linux")]
+fn stale_part_phase(fixture: &mut MappedThroughAMount, second: &SecondMount) -> Option<String> {
+  let mut expected = vec![b'S'; fixture.length];
+  expected[10] = b'M';
+  let (applied_before, conflicts_before) = writeback_counts(&fixture.instance);
   fixture.view()[20] = b'N';
   let written = 100..200;
   second.write_at(written.start, &vec![b'R'; written.len()]);
+  let (applied_after, _) = writeback_counts(&fixture.instance);
+  let early = applied_after.saturating_sub(applied_before);
+  if early > 0 {
+    return Some(format!(
+      "the second-mount phase: {early} write-back(s) of the store's page applied before the second mount's write"
+    ));
+  }
   let stale_part = fixture.try_sync_map();
   expected[written.clone()].fill(b'R');
   assert!(
@@ -8166,9 +8255,14 @@ fn a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path() {
     "the write-back of a page another mount changed is refused whole, and the sync says so: {stale_part:?}"
   );
   assert!(
+    writeback_counts(&fixture.instance).1 > conflicts_before,
+    "the refusal is counted (fuse.writeback_conflicts)"
+  );
+  assert!(
     fixture.follows_bytes(&expected),
     "the map reads the file as slates holds it within {WAIT_FOR:?}"
   );
+  None
 }
 
 /// §4.6 the mount route's dirty pages on macOS (A-192). Apple's NFS client writes a page dirtied through a shared map back

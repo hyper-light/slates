@@ -110,8 +110,21 @@ fn name_this_process() {
   }
 }
 
-/// Runs the daemon.
+/// Runs the daemon: [`start`], then [`serve`] until a reason to stop.
 pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
+  serve(start(options)?)
+}
+
+/// A started daemon and its watch on the anchor, between [`start`] and [`serve`].
+pub(crate) struct Started {
+  /// The daemon, serving.
+  pub(crate) daemon: Daemon,
+  /// Its watch on its anchor.
+  parent: ParentWatch,
+}
+
+/// Starts the daemon over the anchor's segment from the environment (or its own, run alone) and marks it serving.
+pub(crate) fn start(options: &ProcessOptions) -> Result<Started, Failure> {
   #[cfg(windows)]
   slates_ipc::process_access::confine_current_holder()
     .map_err(|error| failed("process handle authority", error))?;
@@ -197,6 +210,13 @@ pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
       " alone"
     }
   );
+  Ok(Started { daemon, parent })
+}
+
+/// Serves a [`start`]ed daemon until a stop is requested, the anchor is gone or the control shard's watch ends, then
+/// stops it.
+pub(crate) fn serve(started: Started) -> Result<(), Failure> {
+  let Started { daemon, parent } = started;
   // The process thread waits for a reason to stop without polling: the control shard's heartbeat asks the anchor's
   // stop request and these two at its own cadence and wakes this thread once one holds.
   let watch = parent;

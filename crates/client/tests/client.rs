@@ -1170,7 +1170,7 @@ const LONG_MAP_BYTES: usize = 16 << 20;
 /// as long as the file takes, and the client waits for them while its daemon lives, as it does for a read map's fill
 /// (A-171), never reporting a live daemon stalled. Do: on a one-shard daemon, attach a volume holding a 16 MiB file for
 /// writing; from a client whose reply deadline is [`IMPATIENT_REPLY_NS`], map the file read and write under that
-/// attachment, store a phrase, sync and release. Expect: each answers, none `Stalled`; the sync writes the phrase's
+/// attachment, store a phrase, sync and release. Expect: each answers; the sync writes the phrase's
 /// differing bytes and the file holds them. Found by CI's ThreadSanitizer lane, whose slowdown took a 4 MiB map's
 /// release past the one-second deadline (run 40816824486).
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
@@ -3190,7 +3190,8 @@ fn a_restarted_daemon_adopts_its_anchors_sealing_root_and_a_fresh_anchor_mints_a
 /// its `stop` cannot fire the client's process-exit watch (the daemon is this very process); the client learns the
 /// daemon is gone only once the successor republishes the stamp (`daemon_gone` = the exit watch OR a changed start
 /// stamp). With a 1 ms reply deadline this raced the publish and the client reported `Stalled { after_ns: 1_000_000 }`
-/// instead of awaiting the restart (CI macOS `Test` + TSan lanes, run 38537130473). `SLATES_TEST_RESTART_SLOWDOWN`
+/// instead of awaiting the restart (CI macOS `Test` + TSan lanes, run 38537130473); since A-232 (2026-11-13) the client
+/// waits for a live daemon's late reply, so the race costs a re-armed deadline, not a failed call. `SLATES_TEST_RESTART_SLOWDOWN`
 /// (an integer ≥ 1, default 1) scales every restart timing together so a slow lane gives the publish room; the
 /// invariant the test rests on holds at any scale — publish ≪ reply ≪ recovery ≪ reconnect budget.
 static RESTART_SLOWDOWN: LazyLock<u64> = LazyLock::new(|| {

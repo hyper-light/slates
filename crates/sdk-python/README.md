@@ -49,8 +49,10 @@ client = await slates.AsyncClient.connect("default", 5_000_000, 10_000_000)
 volumes = await client.list()
 ```
 
-Every async call ends: answered, refused typed, `Stalled` at its reply deadline, `DaemonGone` when the
-daemon is gone and no restart answers within the reconnect budget, or `CompletionLost` when the
+A call waits while its daemon lives, however long a busy machine keeps the daemon off its CPU: a daemon
+that will never answer is ended (by its anchor, or by its own watchdog when it runs alone), and its calls
+are then resent to the restarted daemon. Every async call ends: answered, refused typed, `DaemonGone` when
+the daemon is gone and no restart answers within the reconnect budget, or `CompletionLost` when the
 completion reader fails; a call cancelled by its task is released. Calls past the client's bound (its
 `outstanding_limit()` in flight, as many again queued) raise `TooManyOutstanding` at once. **On Windows** the completion channel is a socket
 (D-10), and `add_reader` on a socket needs a `SelectorEventLoop` — the default `ProactorEventLoop`
