@@ -1,5 +1,30 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Device nodes are kept as metadata (2026-11-17, §4.5, §4.6, §4.15, §4.16; A-294, Ada's option (c) for A-26 of
+> 2026-11-18; replaces A-268's `EPERM`).** A block or character device node is now an inode whose body is its number,
+> kept through the volume, its recovery image (26) and delta (9), archives (manifest minor 4), merges and ext4 images,
+> and made and reported by FUSE (`rdev`) and NFS (`rdev`, NFSv4 `rawdev`) with its number. Linux's rule decides who
+> makes one: root, except a whiteout (a character device 0/0) for any caller who may write the directory. Nothing opens
+> one as a device: a landing refuses it before its first write, and each consumer's kernel is guarded (slates' own
+> mounts `nosuid,nodev`, the Linux FUSE mount now stating both itself; a pod's device cgroup; a guest asked for
+> `nodev`). Proven by each crate's unit tests (A-294 names them). **Owed:**
+> - **every root pjdfstest list re-recorded with its record from a real run (the integrator's lanes).** The
+>   device-fixture entries (1,798 of the Linux FUSE list's 1,800; every entry of the NFSv4, OCI and virtio-fs lists;
+>   1,788 of the macOS list's 1,905) are expected to pass now, so each lane reports them listed-now-passing until the
+>   re-record; a list cannot be edited ahead of its run, since `a_record_names_the_expected_failure_list_as_tracked`
+>   holds each record to its list's digest;
+> - the real-kernel tests run on the Linux lanes: `a_device_node_reaches_the_mount_with_its_number_and_is_never_opened`
+>   (FUSE) and `a_device_node_is_made_with_its_number_and_never_opened` (the NFSv4 kernel client, which now mounts
+>   `nosuid,nodev`);
+> - the KIND lane's first run of its device probe (`device_probe` in `xtask/src/kind_export.rs`, written with this
+>   change): a root pod makes `/dev/null`'s and `/dev/mem`'s numbers in the volume, and an unprivileged pod must open
+>   the first (the control: the pod's bind is not `nodev`) and be refused `EPERM` on the second by the device cgroup;
+> - a guest's proof over virtio-fs, beside g260's `nodev` guest mount;
+> - Windows: a device node (and a FIFO or socket) has no WinFsp form, and a directory holding one fails its whole
+>   listing today (`read_all_entries` in `crates/bridge-winfsp/src/host.rs` takes each entry's attribute word with `?`),
+>   a sibling defect since A-26 that kept device nodes make common (an unpacked `/dev`); WSL's form, a reparse point
+>   tagged `IO_REPARSE_TAG_LX_CHR` or `_LX_BLK`, is the candidate.
+
 > **A grant is signed by a key only the human holds (2026-11-18, R10, D-22, §4.13; A-285, Ada's decision: fs-server's
 > option D, with A as the fallback, on every OS).** This closes, once built, "No grant can be issued on Linux from the
 > CLI" (A-201's entry). **Built (piece 1):** the signed statement and its SSH-signature verifier
@@ -55,7 +80,8 @@
 > naming the precondition. adacachy2: 10 of 10 before (load 66-68) and 10 of 10 after (load 66-77), no attempt missed. Record:
 > `docs/bugs/2026-11-09-a-dirty-page-test-took-an-early-write-back-for-a-lost-refusal.md`.
 
-> **A refused device node reached programs as "Unknown error 527": fixed (2026-11-08, §4.6, A-26; A-268).** MKNOD of a
+> **A refused device node reached programs as "Unknown error 527": fixed (2026-11-08, §4.6, A-26; A-268; the refusal
+> itself replaced by A-294 on 2026-11-17, which makes the node).** MKNOD of a
 > block or character device, and NFSv4's CREATE of one, answered `BADTYPE`, which the Linux client turns into its
 > internal `EBADTYPE` (errno 527): 331 cases of a full pjdfstest run over NFSv4, and the NFSv3 lane alike. Now a taken
 > name is `EEXIST`, an unwritable directory `EACCES`, then `EPERM`, as a local file system without device nodes answers
@@ -8071,7 +8097,9 @@ drops the flags. A local Docker bind of a `nosuid` mount keeps them, so this is 
 
 **Response.**
 - `docs/deploy.md` now requires `allowPrivilegeEscalation: false` (Pod Security `restricted`; `no_new_privs` makes setuid
-  bits inert on exec). `nodev` stays moot, since slates refuses device nodes.
+  bits inert on exec). `nodev` stays moot, since slates refuses device nodes. (No longer, since A-294 of 2026-11-17:
+  device nodes are kept, and in a pod the container runtime's device cgroup is the guard; its KIND proof is owed, see
+  the A-294 entry at the top.)
 - The lane checks the behaviour instead of the flags. A root pod plants a setuid-root coreutils `id`. A non-root pod
   without the setting must run it as 0, the control that proves the probe can see an escalation. A pod with the setting
   must run it as 65534.

@@ -342,6 +342,7 @@ impl VolumeBridge<'_> {
       btime: owner_attrs.btime,
       windows: 0,
       change: self.volume.view_change(self.store, owner)?,
+      device: None,
     })
   }
 

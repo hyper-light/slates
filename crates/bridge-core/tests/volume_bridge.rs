@@ -423,7 +423,7 @@ fn a_created_object_takes_the_request_group_when_the_credential_names_one() {
 /// take each request's owner and group while the attachment's enrolled principal stays fixed.
 #[test]
 fn every_created_kind_takes_the_current_requests_unix_owner() {
-  use slates_vfs::inode::Kind;
+  use slates_vfs::inode::{DeviceNumber, SpecialNode};
   let mut store = store();
   let mut vol = volume(&mut store);
   let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
@@ -437,16 +437,92 @@ fn every_created_kind_takes_the_current_requests_unix_owner() {
     let (file, handle) = bridge.create(parent, &cx, "file", 0o600, 0).unwrap();
     let link = bridge.symlink(parent, &cx, "link", "file").unwrap();
     let fifo = bridge
-      .mknod(parent, &cx, "fifo", 0o600, Kind::Fifo)
+      .mknod(parent, &cx, "fifo", 0o600, SpecialNode::Fifo)
       .unwrap();
     let socket = bridge
-      .mknod(parent, &cx, "socket", 0o600, Kind::Socket)
+      .mknod(parent, &cx, "socket", 0o600, SpecialNode::Socket)
       .unwrap();
-    for node in [dir, file, link, fifo, socket] {
+    // A whiteout is the one device node any caller may make (A-294).
+    let whiteout = bridge
+      .mknod(
+        parent,
+        &cx,
+        "whiteout",
+        0o600,
+        SpecialNode::CharDevice(DeviceNumber::new(0, 0)),
+      )
+      .unwrap();
+    for node in [dir, file, link, fifo, socket, whiteout] {
       let attr = bridge.getattr(oid(node.ino), &cx).unwrap();
       assert_eq!((attr.uid, attr.gid), (uid, uid), "{:?}", node.kind);
     }
     bridge.release(oid(file.ino), &cx, handle).unwrap();
+  }
+}
+
+/// A-294 / §4.6: a device node is made for a caller acting as root alone, as Linux's `vfs_mknod` asks `CAP_MKNOD` and
+/// `nfsd` drops it from every other uid; a whiteout (a character device 0/0) for any caller who may write the
+/// directory. Do: as uid 1001 make a block device, a character device and a whiteout; then as root make the two
+/// devices. Expect the first two refused `NotPermitted` with no name made, the whiteout made, and root's devices made,
+/// each attribute reply and a later lookup and listing reporting its kind and its number.
+#[test]
+fn a_device_node_is_made_for_root_alone_and_reports_its_number() {
+  use slates_vfs::inode::{DeviceNumber, Kind, SpecialNode};
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  let user = rw_cx_as(1001);
+  let root_cx = rw_cx_as(0);
+  let root = oid(bridge.root(&root_cx).unwrap());
+  let disk = SpecialNode::BlockDevice(DeviceNumber::new(8, 1));
+  let null = SpecialNode::CharDevice(DeviceNumber::new(1, 3));
+  for (name, node) in [("disk", disk), ("null", null)] {
+    assert_eq!(
+      bridge.mknod(root, &user, name, 0o600, node),
+      Err(VfsError::NotPermitted)
+    );
+    assert_eq!(
+      bridge.lookup(root, &user, name).map(|_| ()),
+      Err(VfsError::NotFound),
+      "a refused device node leaves no name"
+    );
+  }
+  let whiteout = bridge
+    .mknod(
+      root,
+      &user,
+      "whiteout",
+      0o600,
+      SpecialNode::CharDevice(DeviceNumber::new(0, 0)),
+    )
+    .unwrap();
+  assert_eq!(
+    (whiteout.kind, whiteout.device),
+    (Kind::CharDevice, Some(DeviceNumber::new(0, 0)))
+  );
+  for (name, node) in [("disk", disk), ("null", null)] {
+    let made = bridge.mknod(root, &root_cx, name, 0o640, node).unwrap();
+    assert_eq!((made.kind, made.device), (node.kind(), node.device()));
+    let looked = bridge.lookup(root, &root_cx, name).unwrap();
+    assert_eq!((looked.kind, looked.device), (node.kind(), node.device()));
+  }
+  let handle = bridge.opendir(root, &root_cx).unwrap();
+  let listed: Vec<(String, Kind)> = bridge
+    .readdir(root, &root_cx, handle, 0, usize::MAX)
+    .unwrap()
+    .into_iter()
+    .filter(|entry| !entry.name.starts_with('.'))
+    .map(|entry| (entry.name, entry.kind))
+    .collect();
+  for (name, kind) in [
+    ("disk", Kind::BlockDevice),
+    ("null", Kind::CharDevice),
+    ("whiteout", Kind::CharDevice),
+  ] {
+    assert!(
+      listed.contains(&(name.to_owned(), kind)),
+      "{name} listed as {kind:?}: {listed:?}"
+    );
   }
 }
 

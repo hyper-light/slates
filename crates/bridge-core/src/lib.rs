@@ -39,7 +39,7 @@ pub use changed::{DataChange, TO_THE_END};
 pub use volume_bridge::{LostWrites, VolumeBridge, new_handle_store};
 
 use slates_vfs::error::VfsError;
-use slates_vfs::inode::Kind;
+use slates_vfs::inode::{DeviceNumber, Kind, SpecialNode};
 
 /// The neutral POSIX attributes of a filesystem object, independent of any transport's wire form.
 /// Times are nanoseconds since the Unix epoch (the volume core's native form); each transport
@@ -79,6 +79,9 @@ pub struct NodeAttr {
   /// The change counter: it moves on every change to the object and never repeats, whatever the
   /// wall clock does (A-38). A transport with a change attribute (NFSv4 `change`) serves it.
   pub change: u64,
+  /// A device node's number (A-294), which each transport reports in its own encoding (FUSE's `rdev`, NFSv3's
+  /// `rdev`, NFSv4's `rawdev`); `None` for every other kind.
+  pub device: Option<DeviceNumber>,
 }
 
 /// One entry of a directory listing: the child's inode number, its kind, its name, and the cookie that
@@ -434,14 +437,17 @@ pub trait Bridge {
     mode: u32,
     flags: u32,
   ) -> Result<(NodeAttr, u64), VfsError>;
-  /// Creates a FIFO/socket name, with no open reference or kernel endpoint (A-26).
+  /// Creates a name with no content under `cx`, with no open reference or kernel endpoint: a FIFO or socket name
+  /// (A-26), or a device node whose number is metadata that nothing slates serves opens (A-294). A device node other
+  /// than a whiteout (a character device 0/0) is made only for a caller acting as root, as a local file system makes
+  /// one only for a caller holding `CAP_MKNOD`; any other caller is refused `NotPermitted` (`EPERM`).
   fn mknod(
     &mut self,
     parent: ObjectId,
     cx: &OpContext,
     name: &str,
     mode: u32,
-    kind: Kind,
+    node: SpecialNode,
   ) -> Result<NodeAttr, VfsError>;
   /// Release handle `fh` of `object`, under `cx`.
   fn release(&mut self, object: ObjectId, cx: &OpContext, fh: u64) -> Result<(), VfsError>;

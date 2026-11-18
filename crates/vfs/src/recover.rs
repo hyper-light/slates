@@ -81,9 +81,10 @@ const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// every fingerprint carries the Windows attribute bits its disk holds, so a recovered witness compares them too.
 /// 25 (A-251, 2026-11-09) each held register carries the acceptor's whole persisted state, the retired owner an install
 /// last moved its authority from too (`slates_db::register::PersistedAcceptor`), so a warm restart keeps the move.
+/// 26 (A-294, 2026-11-17) block and character device nodes, each kind with its number as its body.
 /// Format: the image layout version, bumped with any change to the types below or to the held replicas'
 /// image they carry.
-const IMAGE_VERSION: u16 = 25;
+const IMAGE_VERSION: u16 = 26;
 
 /// A recorded attachment's references in an image (A-61): its durable id and its share by inode.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
@@ -149,6 +150,11 @@ pub enum KindImage {
   Fifo,
   /// A socket name, without a listener or connection.
   Socket,
+  /// A block device node; its number is its body ([`BodyImage::Device`], A-294). Appended, so every earlier kind's
+  /// tag is unchanged.
+  BlockDevice,
+  /// A character device node; its number is its body (A-294).
+  CharDevice,
 }
 
 /// POSIX attributes in an image (§4.5 `Attrs`); every field is fixed-width, so the encoding is
@@ -248,6 +254,13 @@ pub enum BodyImage {
   BaseLink {
     /// The target path.
     target: String,
+  },
+  /// A device node's number ([`Body::Device`], A-294), its major and minor as made; appended, as `BaseLink` was.
+  Device {
+    /// The major number.
+    major: u32,
+    /// The minor number.
+    minor: u32,
   },
 }
 
@@ -1343,6 +1356,8 @@ const fn kind_image(kind: Kind) -> KindImage {
     Kind::Symlink => KindImage::Symlink,
     Kind::Fifo => KindImage::Fifo,
     Kind::Socket => KindImage::Socket,
+    Kind::BlockDevice => KindImage::BlockDevice,
+    Kind::CharDevice => KindImage::CharDevice,
   }
 }
 
@@ -1576,7 +1591,12 @@ impl Volume {
       let no = inode.no;
       if !matches!(
         inode.kind,
-        Kind::File | Kind::Symlink | Kind::Fifo | Kind::Socket
+        Kind::File
+          | Kind::Symlink
+          | Kind::Fifo
+          | Kind::Socket
+          | Kind::BlockDevice
+          | Kind::CharDevice
       ) {
         // Directories are always carried in full; their entries are small and their structure is
         // this snapshot's own.
@@ -1773,6 +1793,13 @@ impl Volume {
         },
         Kind::File => file_body_image(store, &inode.body)?,
         Kind::Fifo | Kind::Socket => BodyImage::Empty,
+        Kind::BlockDevice | Kind::CharDevice => match inode.body {
+          Body::Device(number) => BodyImage::Device {
+            major: number.major,
+            minor: number.minor,
+          },
+          _ => return Err(VfsError::RecoveryIncomplete),
+        },
       }
     })
   }
@@ -1898,7 +1925,12 @@ impl Volume {
     let mut entries = Vec::with_capacity(dir.len());
     for entry in dir.iter(&store.blocks) {
       let child = match entry.child {
-        Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => Some(no),
+        Child::File(no)
+        | Child::Symlink(no)
+        | Child::Fifo(no)
+        | Child::Socket(no)
+        | Child::BlockDevice(no)
+        | Child::CharDevice(no) => Some(no),
         Child::Dir(handle) => Some(
           store
             .dirs
@@ -2049,7 +2081,7 @@ fn file_body_image(store: &Store, body: &Body) -> Result<BodyImage, VfsError> {
         born: open.born.0,
       }),
     }),
-    Body::Directory(_) | Body::Symlink(_) | Body::BaseLink(_) | Body::Base(_) => {
+    Body::Directory(_) | Body::Symlink(_) | Body::BaseLink(_) | Body::Base(_) | Body::Device(_) => {
       Err(VfsError::RecoveryIncomplete)
     }
   }
@@ -2059,7 +2091,12 @@ fn file_body_image(store: &Store, body: &Body) -> Result<BodyImage, VfsError> {
 /// a whiteout names none.
 pub(crate) fn child_number(store: &Store, child: &Child) -> Result<Option<u64>, VfsError> {
   Ok(match child {
-    Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => Some(no.0),
+    Child::File(no)
+    | Child::Symlink(no)
+    | Child::Fifo(no)
+    | Child::Socket(no)
+    | Child::BlockDevice(no)
+    | Child::CharDevice(no) => Some(no.0),
     Child::Dir(handle) => Some(
       store
         .dirs
@@ -2096,6 +2133,8 @@ const fn kind_from_image(kind: KindImage) -> Kind {
     KindImage::Symlink => Kind::Symlink,
     KindImage::Fifo => Kind::Fifo,
     KindImage::Socket => Kind::Socket,
+    KindImage::BlockDevice => Kind::BlockDevice,
+    KindImage::CharDevice => Kind::CharDevice,
   }
 }
 
@@ -2859,7 +2898,7 @@ fn body_crc(body: &BodyImage) -> u32 {
     BodyImage::Symlink { target } | BodyImage::BaseLink { target } => crc32c(target.as_bytes()),
     BodyImage::Empty => crc32c(&[]),
     BodyImage::Directory { .. } => 0,
-    BodyImage::Base { .. } => crc32c(&body.to_bytes()),
+    BodyImage::Base { .. } | BodyImage::Device { .. } => crc32c(&body.to_bytes()),
   }
 }
 
@@ -2883,6 +2922,13 @@ fn body_for(
       }
       Ok(Body::None)
     }
+    // A device node's body is its number and nothing else (A-294): an image giving one content or a size is corrupt.
+    KindImage::BlockDevice | KindImage::CharDevice => match image_inode.body {
+      BodyImage::Device { major, minor } if image_inode.attrs.size == 0 => {
+        Ok(Body::Device(crate::inode::DeviceNumber::new(major, minor)))
+      }
+      _ => Err(VfsError::RecoveryIncomplete),
+    },
     KindImage::Symlink => match &image_inode.body {
       BodyImage::Symlink { target } => Ok(Body::Symlink(target.as_str().into())),
       BodyImage::BaseLink { target } => Ok(Body::BaseLink(target.as_str().into())),
@@ -2936,9 +2982,10 @@ fn file_body_from_image(claims: &Claims, body: &BodyImage, size: u64) -> Result<
       lost: *lost,
       file: crate::inode::FileTag::from_word(*file),
     })),
-    BodyImage::Directory { .. } | BodyImage::Symlink { .. } | BodyImage::BaseLink { .. } => {
-      Err(VfsError::RecoveryIncomplete)
-    }
+    BodyImage::Directory { .. }
+    | BodyImage::Symlink { .. }
+    | BodyImage::BaseLink { .. }
+    | BodyImage::Device { .. } => Err(VfsError::RecoveryIncomplete),
   }
 }
 
@@ -3357,6 +3404,8 @@ fn child_for(
     KindImage::Symlink => Ok(Child::Symlink(child_no)),
     KindImage::Fifo => Ok(Child::Fifo(child_no)),
     KindImage::Socket => Ok(Child::Socket(child_no)),
+    KindImage::BlockDevice => Ok(Child::BlockDevice(child_no)),
+    KindImage::CharDevice => Ok(Child::CharDevice(child_no)),
     KindImage::Dir => {
       let handle = *dirs.get(&child).ok_or(VfsError::RecoveryIncomplete)?;
       let node = store.dirs.get_mut(handle)?;

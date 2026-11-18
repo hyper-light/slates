@@ -193,8 +193,18 @@ impl BaseRead {
         late.overwrite(name, 8, b"zz");
       }
       BaseRead::SpecialKind => {
-        made.special(name, common::generated::node(2));
-        changed.special(name, common::generated::node(4));
+        // The same node with its owner changed: a metadata change that keeps the kind, so the late mode is judged
+        // against the node's history at its base (a node of another kind would be a conflict, never a change).
+        let node = common::generated::node(2);
+        made.special(name, node);
+        changed.special(
+          name,
+          slates_merge::special::SpecialNode {
+            uid: 4,
+            gid: 4,
+            ..node
+          },
+        );
         late.setmode(name, 0o600);
       }
     }

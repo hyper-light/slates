@@ -45,6 +45,10 @@ const DT_LNK: u32 = 10;
 const DT_FIFO: u32 = 1;
 /// Format: POSIX directory entry type for a socket.
 const DT_SOCK: u32 = 12;
+/// Format: POSIX directory entry type for a block device (A-294).
+const DT_BLK: u32 = 6;
+/// Format: POSIX directory entry type for a character device (A-294).
+const DT_CHR: u32 = 2;
 /// Format: Linux EOPNOTSUPP, a refused special-file operation.
 pub(crate) const EOPNOTSUPP: i32 = 95;
 /// Format: Linux ENODATA, the attribute a get or remove names is not set (`getxattr(2)`'s ENOATTR).
@@ -707,6 +711,8 @@ fn dtype(kind: Kind) -> u32 {
     Kind::Symlink => DT_LNK,
     Kind::Fifo => DT_FIFO,
     Kind::Socket => DT_SOCK,
+    Kind::BlockDevice => DT_BLK,
+    Kind::CharDevice => DT_CHR,
   }
 }
 
@@ -736,16 +742,21 @@ fn fuse_attr(node: &NodeAttr, dax: bool) -> Attr {
     nlink: node.nlink,
     uid: node.uid,
     gid: node.gid,
+    rdev: wire_rdev(node),
     blksize: BLKSIZE,
   }
 }
 
-/// Format: `S_IFREG`, the `<sys/stat.h>` file-type bits of `st_mode` for a regular file.
-const S_IFREG: u32 = 0o100_000;
-/// Format: `S_IFDIR`, the file-type bits for a directory.
-const S_IFDIR: u32 = 0o040_000;
-/// Format: `S_IFLNK`, the file-type bits for a symbolic link.
-const S_IFLNK: u32 = 0o120_000;
+/// A device node's number as the FUSE wire carries it, the Linux kernel's encoding (A-294); zero for every other kind.
+/// A number past the kernel's 12-bit major and 20-bit minor, which the volume keeps as an NFS client made it, reads as
+/// zero, as Linux's own NFS client reads one (`fs/nfs/nfs3xdr.c` `xdr_decode_specdata3`).
+fn wire_rdev(node: &NodeAttr) -> u32 {
+  node
+    .device
+    .and_then(slates_vfs::inode::DeviceNumber::to_linux)
+    .unwrap_or(0)
+}
+
 /// Format: the permission bits below the type bits (`07777`: the permission triads and the set-id
 /// and sticky bits).
 const PERMISSION_BITS: u32 = 0o7777;
@@ -758,14 +769,7 @@ const PERMISSION_BITS: u32 = 0o7777;
 /// permission bits alone, so the root's first `GETATTR` made the mount unusable on a real kernel
 /// (`docs/bugs/2026-09-19-fuse-attribute-replies-carry-no-file-type-bits.md`).
 fn wire_mode(kind: Kind, permissions: u32) -> u32 {
-  let kind_bits = match kind {
-    Kind::File => S_IFREG,
-    Kind::Dir => S_IFDIR,
-    Kind::Symlink => S_IFLNK,
-    Kind::Fifo => slates_vfs::export::MODE_FIFO,
-    Kind::Socket => slates_vfs::export::MODE_SOCKET,
-  };
-  kind_bits | (permissions & PERMISSION_BITS)
+  slates_vfs::export::mode_of_kind(kind) | (permissions & PERMISSION_BITS)
 }
 
 /// The permission bits of a mode the kernel sent (`fuse_create_in.mode` carries `S_IFREG`, a
@@ -1446,7 +1450,9 @@ fn serve_destroy(
   )
 }
 
-/// Linux fuse_mknod_in (four u32 words), followed by the NUL-terminated name (A-26).
+/// Linux fuse_mknod_in (four u32 words), followed by the NUL-terminated name: a FIFO or socket name (A-26), or a
+/// device node whose number is kept as metadata (A-294); the mount is `nodev`, so the kernel opens none of them as a
+/// device.
 fn serve_mknod(
   bridge: &mut dyn Bridge,
   req: &Request<'_>,
@@ -1465,9 +1471,16 @@ fn serve_mknod(
       .try_into()
       .unwrap_or_default(),
   );
-  let kind = match slates_vfs::export::kind_of_mode(mode) {
-    Some(kind @ (Kind::Fifo | Kind::Socket)) => kind,
-    _ => return reply_err(req.header.unique, VfsError::SpecialFileOperation, out),
+  // The kernel sends a device's number in its own encoding (`fuse_mknod`: `new_encode_dev`), zero for any other kind.
+  let device = slates_vfs::inode::DeviceNumber::from_linux(
+    body_u32(head, size_of::<u32>()).unwrap_or_default(),
+  );
+  let node = match slates_vfs::export::kind_of_mode(mode)
+    .and_then(|kind| slates_vfs::inode::SpecialNode::of(kind, device))
+  {
+    Some(node) => node,
+    // A regular file is made by `CREATE`, which this mount serves; any other type here is refused.
+    None => return reply_err(req.header.unique, VfsError::SpecialFileOperation, out),
   };
   let name = match parse_name(req.body.get(HEAD..).unwrap_or_default()) {
     Ok(name) => name,
@@ -1486,7 +1499,7 @@ fn serve_mknod(
         mode,
         body_u32(head, size_of::<u32>().saturating_mul(2)).unwrap_or_default(),
       ),
-      kind,
+      node,
     )
     .and_then(|node| referenced(bridge, cx, node));
   let result = entry_reply(bridge, cx, result);

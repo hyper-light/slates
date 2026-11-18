@@ -438,7 +438,8 @@ FUSE bug: a component past `NAME_MAX` was refused `EINVAL` (creation) or `ENOENT
 `ENAMETOOLONG`. It is fixed on every bridge
 (`docs/bugs/2026-10-01-a-long-name-was-einval-or-enoent-not-enametoolong.md`). The rerun's failures are exactly
 the 1,798 reviewed cases. `expected-failures/oci-linux.pjdfstest.txt` carries each one with its reason unchanged
-(device-fixture cascades; A-26 refuses block and character devices). Its gate is the same as every list's: an
+(device-fixture cascades; A-26 refused block and character devices, which A-294 keeps since 2026-11-17, so these
+cases are expected to pass and the list is owed its re-record, §6). Its gate is the same as every list's: an
 unlisted failure, a listed pass or an absent listed case fails the run. The record is `records/oci-linux.pjdfstest.json`.
 
 ### 3.5 Hermeticity — SKIPPED(privilege) here; wired for the lanes
@@ -548,6 +549,11 @@ still be established separately.
 
 ## 6. Owed
 
+- Every root pjdfstest list and its record re-recorded from a real run since A-294 (2026-11-17) keeps device nodes: the
+  device-fixture entries citing A-26 (1,798 of the Linux FUSE list's 1,800; every entry of the NFSv4, OCI and
+  virtio-fs lists; 1,788 of the macOS list's 1,905) are expected to pass, and each lane reports them
+  listed-now-passing until then. A list is not edited ahead of its run: `a_record_names_the_expected_failure_list_as_tracked`
+  holds every record to its list's digest.
 - The native macOS root rerun and its reviewed expectations; the macOS lane's sidecar
   behaviour (environmental). Linux adapter records and its first root review are now tracked.
 - A daemon transport for the FUSE bridge, so the Linux cells can be RAN, not LIMITED.
