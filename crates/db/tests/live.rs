@@ -136,6 +136,28 @@ enum EmptyReport {
   CountWithoutFence,
 }
 
+/// How an owner restarted over its own log resumes it (A-344): its daemon restarts warm, its memory gone, its recovery
+/// image kept, and its shipper is made again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Restart {
+  /// The design: the image kept the log's epoch and the greatest position the owner may have shipped (the position its
+  /// last imaged publication took, or would have taken had the crash not come first), and its first entry takes the
+  /// next position under the same epoch (`Shipper::resumed`).
+  PastShipped,
+  /// A mutation, the daemon before A-344: the shipper is made again from nothing under the same epoch, so its chain
+  /// begins again at position 0 (the owner's state with it, since the model's state is one value a position).
+  FromGenesis,
+  /// A mutation: the chain resumes past the position the owner knew durable, using again the positions it shipped past
+  /// that.
+  PastDurable,
+}
+
+/// Shape: the chance, per mille, that a step of a restarting run restarts the current owner: about nine restarts in a
+/// run's 3,000 steps.
+const RESTART_PER_MILLE: u64 = 3;
+/// Shape: the chance, per mille, that a restart falls between a publication's image and its entry's append.
+const BETWEEN_PER_MILLE: u64 = 500;
+
 /// The bounds that hold `credit` entries in flight and `retain` retained, each entry of `payload` bytes counted at its
 /// wire size as the shipper counts it ([`Entry::wire_bytes`]): the model's and the unit tests' entries are of one size,
 /// so a count of them is exact.
@@ -237,6 +259,12 @@ struct Run {
   chained: u64,
   /// Whether the history is printed as it happens ([`Run::traced`]): what each step did that bears on the invariants.
   traced: bool,
+  /// How the current owner resumes its log when its daemon restarts (`None`: owners never restart; A-344).
+  restart: Option<Restart>,
+  /// The owner restarts made.
+  restarts: u64,
+  /// Of those, the ones that fell between a publication's image and its entry's append.
+  restarts_between: u64,
 }
 
 impl Run {
@@ -303,6 +331,9 @@ impl Run {
       joined: 0,
       chained: 0,
       traced: false,
+      restart: None,
+      restarts: 0,
+      restarts_between: 0,
     }
   }
 
@@ -352,6 +383,12 @@ impl Run {
   /// This run with fresh members joining the candidates at an owner's loss ([`Run::newcomers`]).
   fn with_newcomers(mut self) -> Run {
     self.newcomers = true;
+    self
+  }
+
+  /// This run with the current owner's daemon restarting now and then, its log resumed by `restart` (A-344).
+  fn restarting(mut self, restart: Restart) -> Run {
+    self.restart = Some(restart);
     self
   }
 
@@ -972,6 +1009,96 @@ impl Run {
     }
   }
 
+  /// The current owner's daemon restarts warm over its own log (A-344): its shipper is made again by the run's
+  /// [`Restart`] rule, under the same epoch, shipping to the holder set the volume's record names (the shipper's own
+  /// without `following`). Half the time the crash fell between a publication's image and its entry's append: the value
+  /// is in the owner's state and the image counted its position, but no holder was sent it.
+  fn restart_owner(&mut self) {
+    let Some(rule) = self.restart else {
+      return;
+    };
+    let index = self.current;
+    if self.owners[index].fenced {
+      return;
+    }
+    let between = self.rng.chance(BETWEEN_PER_MILLE);
+    let quorum = Quorum {
+      f: u32::try_from(self.f).unwrap(),
+    };
+    let value = self.next_value;
+    let following = self.following.is_some();
+    let owner = &mut self.owners[index];
+    let (host, epoch) = (owner.host, owner.shipper.epoch());
+    let holders = if following {
+      owner.recorded.clone()
+    } else {
+      owner.shipper.holders().to_vec()
+    };
+    let head = owner.shipper.head().map(|head| head.position);
+    let next = owner.shipper.next_position().unwrap();
+    let durable = owner.shipper.durable();
+    if between {
+      owner.state.push(value);
+    }
+    owner.shipper = match rule {
+      Restart::PastShipped => {
+        // The image kept the position its last publication's entry took (one before the next), or, when the crash fell
+        // between the image and the append, the one it would have taken (the next): what the daemon's kept piece holds,
+        // whether or not this incarnation appended anything.
+        let past = if between {
+          Some(next)
+        } else {
+          next.checked_sub(1)
+        };
+        Shipper::resumed(
+          (host, OBJECT, epoch),
+          quorum,
+          &holders,
+          past,
+          bounds_of(8, 16, 8),
+        )
+        .unwrap()
+      }
+      Restart::FromGenesis => {
+        owner.state.clear();
+        Shipper::new(
+          (host, OBJECT, epoch),
+          quorum,
+          &holders,
+          None,
+          bounds_of(8, 16, 8),
+        )
+      }
+      Restart::PastDurable => {
+        owner
+          .state
+          .truncate(durable.map_or(0, |durable| usize::try_from(durable + 1).unwrap()));
+        Shipper::resumed(
+          (host, OBJECT, epoch),
+          quorum,
+          &holders,
+          durable,
+          bounds_of(8, 16, 8),
+        )
+        .unwrap()
+      }
+    };
+    if between {
+      self.next_value += 1;
+      self.restarts_between += 1;
+    }
+    self.restarts += 1;
+    self.note(|| {
+      format!(
+        "owner {index} (host {}, epoch {}) restarts {rule:?}, head {head:?}, durable {durable:?}, between {between}",
+        host.0, epoch.0
+      )
+    });
+    if following {
+      self.follow();
+    }
+  }
+
   /// A superseded owner keeps writing and re-shipping.
   fn stale_owner_step(&mut self) {
     let stale: Vec<usize> = (0..self.owners.len())
@@ -987,6 +1114,11 @@ impl Run {
   }
 
   fn step(&mut self) {
+    // An owner restart now and then (A-344), drawn only in runs that restart owners, so every other run replays as before.
+    if self.restart.is_some() && self.rng.chance(RESTART_PER_MILLE) {
+      self.restart_owner();
+      return;
+    }
     let roll = self.rng.below(100);
     match roll {
       0..=29 => self.write(self.current),
@@ -1032,6 +1164,7 @@ impl Run {
   fn settle(&mut self) {
     self.cut.clear();
     self.everyone_learns();
+    self.publish_after_a_restart();
     while self.following.is_some() && u64::try_from(self.configuration.len()).unwrap() < 2 * self.f
     {
       self.reconfigure();
@@ -1072,6 +1205,14 @@ impl Run {
         Some(value),
         "NoLoss at the end: durable position {position}"
       );
+    }
+  }
+
+  /// A restarted owner ships its log again at its next publication (A-344), as the daemon makes its shipper again then:
+  /// one write, if the current owner made none since its restart.
+  fn publish_after_a_restart(&mut self) {
+    if self.restarts > 0 && self.owners[self.current].shipper.head().is_none() {
+      self.write(self.current);
     }
   }
 
@@ -1241,6 +1382,254 @@ fn an_empty_report_without_a_fence_lets_a_superseded_owner_commit() {
       .any(|(_, _, message)| message.contains("StaleNeverCommits")),
     "an unfenced empty report let a superseded owner commit: {broken:?}"
   );
+}
+
+/// What a restarting nemesis run counted ([`run_restarting`]): restarts, restarts between an image and its append,
+/// installs, takeovers and durable positions.
+type RestartCounts = (u64, u64, u64, u64, u64);
+
+/// Runs the nemesis with the current owner's daemon restarting now and then over its own log under `restart` (A-344),
+/// at `f = 1` and `f = 2` over every seed, the candidates fixed and following a joint transition: the broken seeds with
+/// their messages, and the totals of the passing ones.
+fn run_restarting(restart: Restart) -> (Vec<BrokenSeed>, RestartCounts) {
+  let mut broken = Vec::new();
+  let mut totals = (0, 0, 0, 0, 0);
+  for following in [None, Some(Following::Joint)] {
+    for f in [1, 2] {
+      for seed in 0..SEEDS {
+        let outcome = std::panic::catch_unwind(|| {
+          let mut run = Run::new(f, seed, EmptyReport::FenceAndCount);
+          if let Some(following) = following {
+            run = run.following(following);
+          }
+          let mut run = run.restarting(restart);
+          for _ in 0..STEPS {
+            run.step();
+          }
+          run.settle();
+          (
+            run.restarts,
+            run.restarts_between,
+            run.installs,
+            run.takeovers,
+            u64::try_from(run.durable.len()).unwrap(),
+          )
+        });
+        match outcome {
+          Ok(counts) => {
+            totals.0 += counts.0;
+            totals.1 += counts.1;
+            totals.2 += counts.2;
+            totals.3 += counts.3;
+            totals.4 += counts.4;
+          }
+          Err(panic) => {
+            let message = panic
+              .downcast_ref::<String>()
+              .cloned()
+              .or_else(|| panic.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+              .unwrap_or_default();
+            broken.push((f, seed, format!("{following:?}: {message}")));
+          }
+        }
+      }
+    }
+  }
+  eprintln!(
+    "{restart:?}: {} broken seeds, first {:?}; passing seeds: {} restarts ({} between an image and its append), {} \
+     installs, {} takeovers, {} durable positions",
+    broken.len(),
+    broken.first(),
+    totals.0,
+    totals.1,
+    totals.2,
+    totals.3,
+    totals.4
+  );
+  (broken, totals)
+}
+
+/// A-344 (§4.10, §4.8 "Recovery"): do run the nemesis with the current owner's daemon restarting warm now and then over
+/// its own log, its shipper made again past the greatest position its recovery image says it may have shipped, under
+/// the same epoch (half the restarts falling between a publication's image and its entry's append), at `f = 1` and
+/// `f = 2`, with the candidates fixed and following a joint transition. Expect every history to hold Agreement, NoLoss,
+/// StaleNeverCommits and Convergence; and, so the run is not vacuous, restarts made, some of them between an image and
+/// its append, holders installed, owners taken over and writes durable.
+#[test]
+fn a_live_log_resumed_past_every_position_it_may_have_shipped_holds_the_invariants() {
+  let (broken, (restarts, between, installs, takeovers, durable)) =
+    run_restarting(Restart::PastShipped);
+  assert!(
+    broken.is_empty(),
+    "resumed past what it shipped: {broken:?}"
+  );
+  assert!(
+    restarts > 0 && between > 0 && installs > 0 && takeovers > 0 && durable > 0,
+    "restarts {restarts}, between {between}, installs {installs}, takeovers {takeovers}, durable {durable}"
+  );
+}
+
+/// A-344, the daemon before it as a mutation: do run the restarting nemesis with each restarted owner's shipper made
+/// again from nothing under the same epoch. Expect a broken seed: two chains at one epoch, so a position durable with two
+/// values (Agreement) or a takeover adopting the old chain's greater head without what the new one made durable
+/// (NoLoss).
+#[test]
+fn a_live_log_begun_again_at_genesis_under_the_same_epoch_breaks_agreement() {
+  let (broken, _) = run_restarting(Restart::FromGenesis);
+  let (agreement, no_loss) = broken_by_invariant(&broken);
+  assert!(
+    agreement + no_loss > 0,
+    "a chain begun again at genesis broke Agreement or NoLoss: {broken:?}"
+  );
+}
+
+/// Of `broken` seeds, how many broke Agreement and how many NoLoss, printed with the total.
+fn broken_by_invariant(broken: &[BrokenSeed]) -> (usize, usize) {
+  let count = |name: &str| {
+    broken
+      .iter()
+      .filter(|(_, _, message)| message.contains(name))
+      .count()
+  };
+  let (agreement, no_loss) = (count("Agreement"), count("NoLoss"));
+  eprintln!(
+    "{} broken seeds: {agreement} Agreement, {no_loss} NoLoss, the rest Convergence",
+    broken.len()
+  );
+  (agreement, no_loss)
+}
+
+/// A-344, the rule's other half as a mutation: do run the restarting nemesis with each restarted owner resuming past the
+/// position it knew durable rather than past every position it may have shipped. Expect a broken seed: a position it
+/// shipped past its durable one and a holder kept is used again with another value (Agreement), or adopted over the
+/// new chain's durable writes (NoLoss).
+#[test]
+fn a_live_log_resumed_past_its_durable_position_alone_breaks_agreement() {
+  let (broken, _) = run_restarting(Restart::PastDurable);
+  let (agreement, no_loss) = broken_by_invariant(&broken);
+  assert!(
+    agreement + no_loss > 0,
+    "a chain resumed past its durable position alone broke Agreement or NoLoss: {broken:?}"
+  );
+}
+
+/// A-344: do make an owner's shipper, ship positions 0 to 5 to holder 2 (holder 3 holds nothing), restart it as
+/// resumed past position 5 under the same epoch, and append once. Expect its next position 6 before the append and the
+/// entry at 6 after it, one entry in flight and nothing durable before any holder acknowledges this chain; holder 2, on
+/// the old chain at 5, and holder 3, holding nothing, each refuse the entry and are owed an install, which each
+/// applies; the entry durable at 6 once one of them reports it.
+#[test]
+fn a_resumed_owners_first_entry_is_past_every_position_it_may_have_shipped() {
+  let hosts = [HostId(1), HostId(2), HostId(3)];
+  let mut old = holder_of_an_old_chain(&hosts, 6);
+  let mut resumed = Shipper::resumed(
+    (hosts[0], OBJECT, HostEpoch(1)),
+    Quorum { f: 1 },
+    &hosts,
+    Some(5),
+    bounds_of(8, 16, 1),
+  )
+  .unwrap();
+  assert_eq!(resumed.next_position(), Some(6));
+  assert_eq!(resumed.durable(), None);
+  let entry = resumed.append(vec![6]).unwrap();
+  assert_eq!(
+    entry.position, 6,
+    "the first entry is past every position shipped"
+  );
+  assert_eq!(resumed.next_position(), Some(7));
+  assert_eq!(resumed.durable(), None, "no holder holds this chain yet");
+  assert_eq!(
+    resumed.in_flight(),
+    1,
+    "only the entry appended here is in flight, not the positions before it"
+  );
+  let mut empty = Replica::new(hosts[0], OBJECT);
+  for (holder, replica) in [(hosts[1], &mut old), (hosts[2], &mut empty)] {
+    installed_past_its_chain(&mut resumed, holder, replica, &entry);
+  }
+  assert_eq!(
+    resumed.on_reply(hosts[1], Ok(old.head())),
+    Next::Nothing,
+    "an installed holder is on the new chain"
+  );
+  assert_eq!(resumed.durable(), Some(6));
+}
+
+/// A-344 with A-240's joint transition: do resume an owner's shipper past position 5 (holders 2 and 3), begin a
+/// transition to holders 4 and 5, and ask whether the target holds the log before any entry, after the first entry is
+/// appended, and after holder 4 installs it. Expect it short until `f` of the target hold that first entry, which carries
+/// every write made durable on the chain before the restart. Judged at once, nothing being durable on the new chain yet,
+/// the record could name a set that holds none of those writes, and a takeover counting it would lose them.
+#[test]
+fn a_resumed_owners_new_holders_count_only_once_they_hold_its_first_entry() {
+  let hosts = [HostId(1), HostId(2), HostId(3)];
+  let mut resumed = Shipper::resumed(
+    (hosts[0], OBJECT, HostEpoch(1)),
+    Quorum { f: 1 },
+    &hosts,
+    Some(5),
+    bounds_of(8, 16, 1),
+  )
+  .unwrap();
+  assert!(resumed.begin_transition(&[HostId(4), HostId(5)]));
+  assert!(
+    !resumed.transferred(),
+    "no member of the target holds anything of the resumed chain"
+  );
+  let entry = resumed.append(vec![6]).unwrap();
+  assert!(
+    !resumed.transferred(),
+    "the first entry is appended and no member of the target holds it"
+  );
+  let mut four = Replica::new(hosts[0], OBJECT);
+  installed_past_its_chain(&mut resumed, HostId(4), &mut four, &entry);
+  assert_eq!(resumed.on_reply(HostId(4), Ok(four.head())), Next::Nothing);
+  assert!(
+    resumed.transferred(),
+    "f of the target hold the first entry, and with it every write durable before the restart"
+  );
+}
+
+/// A holder's copy of a chain of `entries` entries host `hosts[0]` shipped at epoch 1, positions 0 on.
+fn holder_of_an_old_chain(hosts: &[HostId; 3], entries: u8) -> Replica {
+  let mut before = Shipper::new(
+    (hosts[0], OBJECT, HostEpoch(1)),
+    Quorum { f: 1 },
+    hosts,
+    None,
+    bounds_of(8, 16, 1),
+  );
+  let mut old = Replica::new(hosts[0], OBJECT);
+  for value in 0..entries {
+    let entry = before.append(vec![value]).unwrap();
+    old.accept(&entry).unwrap();
+  }
+  old
+}
+
+/// Expects `holder`'s copy (`replica`) to refuse `entry`, the resumed shipper's first, as off its chain, the shipper to
+/// owe it an install, and the copy to apply that install at the entry's head; then commits it.
+fn installed_past_its_chain(
+  resumed: &mut Shipper,
+  holder: HostId,
+  replica: &mut Replica,
+  entry: &Entry,
+) {
+  let refused = replica.check(entry);
+  assert!(
+    matches!(refused, Err(LiveError::Behind { .. })),
+    "holder {holder:?} refuses an entry off its chain: {refused:?}"
+  );
+  let reply = refused.map(|_| replica.head());
+  assert_eq!(resumed.on_reply(holder, reply), Next::Install);
+  let install = resumed.install(vec![0; 7]).unwrap();
+  assert_eq!(
+    replica.check_install(&install),
+    Ok(Admitted::Apply(entry.head())),
+    "the install at position 6 ranks above the old chain"
+  );
+  replica.commit(install.epoch, install.head);
 }
 
 /// AC-8.9: the owner holds at most its credit's bytes of entries that are not durable; past it a write is refused
