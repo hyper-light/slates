@@ -23422,7 +23422,8 @@ form, the judgment under the route's stated differences), and CI's `windows-lint
     the `git` workload's link goes through the drive's reparse points (A-275) on one side and NTFS's on the other.
     Every other shell ignores the variable. **Amended by A-327 (2026-11-18):** the variable is set on the workload's
     `ln -s` alone, since git reads it too and then cannot change directory on the drive; and the shared environment
-    sets `MSYS_NO_PATHCONV`, so the shell hands Subversion's `^/` URLs on as written.
+    has the shell hand Subversion's `^/` URLs on as written (`MSYS2_ARG_CONV_EXCL=^/` since the same day's correction
+    in A-327; A-327's first form, `MSYS_NO_PATHCONV`, stopped every conversion, and Mercurial's launcher needs one).
 - **The drive's stated difference: no hard link.** WinFsp's driver answers `FileLinkInformation` with
   `STATUS_NOT_SUPPORTED` itself, before any file system is asked (v2.1, `src/sys/fileinfo.c` 2023-2025); its volume
   parameters' `HardLinks` bit reads "unimplemented; set to 0" (`inc/winfsp/fsctl.h` 213); and its NTFS compatibility
@@ -24799,6 +24800,23 @@ with a decision for Ada), and `crates/conformance/src/workload.rs` (`ENVIRONMENT
   Subversion workload's own paths are already in the drive form, `pwd -W`).
 - **The failing test** is the lanes' workloads step itself, red in run 44260193629 on both architectures; nothing else
   runs Git for Windows. Its next run is the check.
+- **Corrected the same day (CI run 44271637767, both architectures).** That run had Subversion identical, and every
+  `hg` exit 2 on both sides: `python.exe: can't open file 'D:\\c\\hostedtoolcache\\…\\Scripts\\hg'`. pip's `hg` is a script
+  whose `#!` line names `python.exe`; the shell starts Python with the script's path as its first argument, and that
+  path, `/c/hostedtoolcache/…/Scripts/hg` as the shell found it on the `PATH`, is one the shell must convert, which
+  `MSYS_NO_PATHCONV` stops for every argument (Git for Windows' runtime: `find_path_start_and_type` in
+  `winsup/cygwin/msys2_path_conv.cc`). Python read it on the current drive, `D:\c\…`. The shared environment now names
+  the one prefix to leave alone instead, `MSYS2_ARG_CONV_EXCL=^/` (a `;`-separated list of argument prefixes the
+  runtime passes on unconverted, `arg_heuristic_with_exclusions` in `winsup/cygwin/path.cc`, called for each argument
+  of a Windows program in `spawn.cc`), so Subversion's `^/` URLs reach `svn` as written and every other argument is
+  converted as before A-327. By the runtime's own rules each other argument the four scripts pass comes through as
+  written: a `file:///D:/…` URL is copied as a URL, `D:/…`, `svn:date` and `1:HEAD` as Windows paths, relative paths
+  and words as they are (`find_path_start_and_type`); under them Mercurial ran identical in CI run 44260193629, while
+  the Subversion script stopped at its first `^/` there (the harness runs every script under `set -e`). Test:
+  `under_the_environment_git_for_windows_sh_starts_hg_and_hands_on_a_relative_url`
+  (`crates/conformance/src/workload.rs`, run by both Windows lanes once their tools are installed): `hg version` and
+  Python's echo of `^/trunk` under the shared environment, red under `MSYS_NO_PATHCONV` (exit 2) and under no setting
+  (`^C:\Program Files\Git\trunk`).
 
 ### A-328 — A new object takes its group by the rule of the kernel its route serves: System V's for Linux kernels, its host's own over the NFS export, BSD's on macOS (2026-11-18, A-289's macOS run; Ada's goal of 2026-11-18)
 Applied in the same change to: §4.6 ("POSIX and transparency acceptance": the group a new object takes), GAPS (A-289's
@@ -24824,7 +24842,8 @@ entry; the AUD-29-81 row), `crates/bridge-core/src/group_rule.rs` (new: `GroupRu
   of the request and never authority. It is no mode switch: each route keeps one rule, the one its kernel has.
 - **Kept.** The volume root is its provisioning user's (`stamp_root_owner`), so in an ordinary tree BSD's parent group
   is the user's own group, as the root:wheel fix of 2026-09-09 asked; only a parent of another group now gives that
-  group, as APFS does. pjdfstest accepts either group for a new object (`mkdir/00.t`, `open/00.t`).
+  group, as APFS does. pjdfstest accepts either group for a new object (`mkdir/00.t`, `open/00.t`); `chown/00.t` does
+  not, for an object root makes (below).
 - **Tests.** Red first: `bsds_rule_gives_each_new_object_its_parents_group_and_no_directory_the_bit`
   (`crates/bridge-core/tests/volume_bridge.rs`), a directory made in a set-group-ID parent reading the bit before the
   stamp asked the rule; with it, `system_vs_rule_gives_a_set_group_id_parents_group_and_bit_and_else_the_creators_group`
@@ -24835,6 +24854,18 @@ entry; the AUD-29-81 row), `crates/bridge-core/src/group_rule.rs` (new: `GroupRu
   `crates/server/tests/nfs_mount.rs`) expected System V's group on every host and failed on macOS once A-328 landed
   (MKDIR's group 20, the root's, where it expected the caller's 1001; found by g251, 2026-11-18): it now states the
   rule per host, the parent's group on macOS and the caller's elsewhere, each owner still the caller.
+- **What it broke in the conformance harness (2026-11-18).** The macOS leg's pjdfstest, run as root (CI run
+  44271637767), failed 63 cases of `chown/00.t` its reviewed list does not name, cases 292 to 370 and 1055 to 1278,
+  each `expected 0,0, got 0,20`, where the run before A-328 had none. Those cases make an object as root, leave its
+  owner alone and expect it in group 0, which BSD's rule gives only in a directory of group 0: the test makes its own
+  directory in the one it starts in, and that one was the harness's, made as its own user, in group staff (20). APFS
+  would answer the same. pjdfstest is root's suite, run in the file system under test (its README: "You must be root",
+  then `cd /path/to/filesystem/under/test`), whose directory there is root's, group 0 included; so a root run now starts
+  in a directory handed to root, owner and group 0 (`hand_to_root`, `xtask/src/conformance/suites.rs`), on every host,
+  and its record's command says so. Linux's System V rule gave root's objects group 0 whatever the directory's group,
+  so nothing changes there, and no listed case is about a group. Test:
+  `what_root_makes_where_a_root_run_starts_is_in_group_0` (the same file), run by CI's macOS gates job, whose runner
+  has passwordless `sudo`; it skips loudly without it.
 
 ### A-309 — An unresolved object is recovered, not just kept: a takeover settles only on its completion record, and the members that exist now recover what a cohort past its tolerance holds (accepted 2026-11-18, kiln goal g250, A-272 (ii); built 2026-11-18)
 
