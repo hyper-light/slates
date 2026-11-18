@@ -1,6 +1,10 @@
 //! The daemon's `image build` and `image merge` (§4.6, A-160; the volume's side is [`slates_vfs::image`]): a snapshot
 //! rendered as an ext2 image file in a new volume, for a VMM that shares no folder with its guest (Firecracker), and
-//! the image a guest has written merged into a new clone of the snapshot it was built from.
+//! the image a guest has written merged into a new clone of the snapshot it was built from. And `archive export`
+//! (§4.11, A-441): a snapshot rendered as its content-addressed archive file in a new volume, for a consumer that keeps
+//! a snapshot's bytes elsewhere (Mantle, kiln's object store) and reads the file a page at a time. It runs as a build
+//! does: checked at once, walked in slices by a task of the volume's owner shard, its volume and the request's
+//! completion committed as one atom.
 //!
 //! **Running.** Each verb checks what it can at once — the volume, the right, the name, the snapshot — and defers its
 //! reply to a task of the volume's owner shard, as a granted landing does (AUD-29-03). The task steps the work a slice
@@ -39,7 +43,8 @@ use slates_db::catalog::{
 };
 use slates_image::{Builder, Identity, Progress, Segments, Timestamp, Walk, Walked};
 use slates_ipc::protocol::{
-  IMAGE_FILE, ImageMergeReport, NamePolicy, Refusal, ReplyBody, SizeClass, SnapshotId, VolumeId,
+  ARCHIVE_FILE, IMAGE_FILE, ImageMergeReport, NamePolicy, Refusal, ReplyBody, SizeClass,
+  SnapshotId, VolumeId,
 };
 use slates_mem::Handle;
 use slates_vfs::clock::{Clock, HostClock};
@@ -1243,6 +1248,417 @@ async fn merge_steps(job: &mut MergeJob) -> Result<MergeReport, Refusal> {
   loop {
     if let Some(report) = with(|s| job.merge_step(s))? {
       return Ok(report);
+    }
+    slates_rt::futures::yield_now().await;
+  }
+}
+
+/// Format: the archive file's permissions: its owner's read and write alone, since it holds the whole snapshot.
+const ARCHIVE_MODE: u32 = 0o600;
+
+/// `ArchiveExport` (§4.11 "Archive", D-17; Mantle's CP-T10.4, A-441): checks the volume, the right, the name and the
+/// snapshot at once, then walks the snapshot into its archive and writes it into a new volume in a task of this shard,
+/// and defers the reply to it, as an image build does. An archive copies only what a reader can read, and the snapshot
+/// is pinned only while the export runs, so `read` is the right it needs; the archive volume is the caller's own.
+pub(crate) fn archive_verb(
+  state: &mut ShardState,
+  principal: &Principal,
+  volume: VolumeId,
+  snapshot: SnapshotId,
+  name: String,
+) -> ReplyBody {
+  if !state.consensus_ready {
+    return refused(Refusal::ConsensusNotInitialized);
+  }
+  let (handle, record) = match find_store_backed(state, volume, StoreVerb::Archive) {
+    Ok(found) => found,
+    Err(reply) => return *reply,
+  };
+  if !rights_of(&record, principal).read {
+    return forbidden("archive_export");
+  }
+  // The name as its own partition holds it too: a volume another partition made under an alias there (A-236).
+  if let Some(existing) = crate::verbs::name_held(state, &name) {
+    return refused(Refusal::AlreadyExists { existing });
+  }
+  let known = state
+    .db
+    .partition()
+    .snapshot(record.id, to_db_snapshot(snapshot))
+    .is_some();
+  let present = state
+    .volumes
+    .get(handle)
+    .is_ok_and(|slot| slot.volume.snapshot_info(core_snapshot(snapshot)).is_ok());
+  if !known || !present {
+    return refused(Refusal::NotFound);
+  }
+  let Some(request) = state.current_request else {
+    return refused(Refusal::Unsupported {
+      feature: "an archive export outside a recorded request".to_owned(),
+    });
+  };
+  let (alias, archive) = match name_alias(state, &name) {
+    Ok(minted) => minted,
+    Err(refusal) => return refused(refusal),
+  };
+  let job = ArchiveJob {
+    request,
+    principal: principal.clone(),
+    source: record.id,
+    record,
+    snapshot,
+    name,
+    pinned: None,
+    archiver: None,
+    bytes: Vec::new(),
+    written: 0,
+    manifest: [0; 32],
+    admitted: None,
+    file: InodeNo(0),
+    archive,
+  };
+  defer(state, run_archive(job, alias))
+}
+
+/// An archive export between its slices: what it holds, released by [`ArchiveJob::release`] on a refusal or by its
+/// drop.
+struct ArchiveJob {
+  request: (u64, RequestId),
+  principal: Principal,
+  /// The volume exported.
+  source: DbVolumeId,
+  /// Its record, whose size policy's kind and locking the archive volume takes.
+  record: VolumeRecord,
+  snapshot: SnapshotId,
+  name: String,
+  /// The volume slot whose snapshot this export pinned.
+  pinned: Option<Handle<VolumeSlot>>,
+  /// The walk of the snapshot into its archive (`slates_vfs::export`).
+  archiver: Option<slates_vfs::export::SnapshotArchiver>,
+  /// The archive's encoding, written into the archive file a chunk a unit.
+  bytes: Vec<u8>,
+  /// How many of `bytes` the file holds.
+  written: usize,
+  /// The archive's manifest identity.
+  manifest: [u8; 32],
+  /// The archive volume, admitted and not yet recorded.
+  admitted: Option<Admitted>,
+  /// The archive file in it.
+  file: InodeNo,
+  /// The archive volume's id, minted when its archive is written (or by its name's alias).
+  archive: Option<DbVolumeId>,
+}
+
+impl Drop for ArchiveJob {
+  fn drop(&mut self) {
+    if self.admitted.is_some() || self.pinned.is_some() {
+      // A task that ended early: what it holds goes back. With the state unreachable (a shutdown) nothing can be,
+      // and the process's end returns it.
+      if crate::state::with_state(|s| self.release(s)).is_none() {
+        self.admitted = None;
+        self.pinned = None;
+      }
+    }
+  }
+}
+
+impl ArchiveJob {
+  /// Pins the snapshot and starts its walk. The archive header's volume identity is the exported volume's own suffix
+  /// (as the fleet's archives carry), and its creation time the host's wall clock: both informational, never part of
+  /// the manifest's identity.
+  fn start(&mut self, state: &mut ShardState) -> Result<(), Refusal> {
+    let handle = slot_of(state, self.source)?;
+    let created_unix =
+      u64::try_from(HostClock::new().wall_ns().div_euclid(NANOS_PER_SECOND)).unwrap_or(0);
+    let local = self
+      .source
+      .bytes
+      .get(size_of::<u64>()..)
+      .and_then(|low| <[u8; 8]>::try_from(low).ok())
+      .map_or(0, u64::from_be_bytes);
+    let ShardState {
+      volumes,
+      store,
+      config,
+      ..
+    } = state;
+    let slot = volumes.get_mut(handle).map_err(|_| Refusal::NotFound)?;
+    slot
+      .volume
+      .pin(core_snapshot(self.snapshot))
+      .map_err(|error| refusal_of_vfs(&error))?;
+    self.pinned = Some(handle);
+    let archiver = slates_vfs::export::SnapshotArchiver::new(
+      &slot.volume,
+      store,
+      core_snapshot(self.snapshot),
+      local,
+      created_unix,
+      config.codec.clone(),
+    )
+    .map_err(|error| refusal_of_archive(&error))?;
+    self.archiver = Some(archiver);
+    Ok(())
+  }
+
+  /// The archive volume's size class: the source's kind at `limit` bytes.
+  fn size(&self, limit: u64) -> SizeClass {
+    match self.record.policy.size {
+      DbSizeClass::Bounded { .. } => SizeClass::Bounded { limit },
+      DbSizeClass::Dynamic { .. } => SizeClass::Dynamic { max: limit },
+    }
+  }
+
+  /// One slice of the walk; the archive once whole.
+  fn walk_step(
+    &mut self,
+    state: &mut ShardState,
+  ) -> Result<Option<slates_archive::Archive>, Refusal> {
+    let source = self.source;
+    let archiver = self.archiver.as_mut().ok_or_else(unreachable)?;
+    sliced(state, |s| {
+      let handle = slot_of(s, source)?;
+      let slot = s.volumes.get(handle).map_err(|_| Refusal::NotFound)?;
+      match archiver
+        .advance(&slot.volume, &s.store, ONE_UNIT)
+        .map_err(|error| refusal_of_archive(&error))?
+      {
+        slates_vfs::export::Progress::More => Ok(None),
+        slates_vfs::export::Progress::Done(archive) => Ok(Some(archive)),
+      }
+    })
+  }
+
+  /// Encodes `archive` and admits its volume, sized to hold the encoding whole: its bytes rounded up to whole chunks,
+  /// since a write is charged its chunk window (§4.5), and at least one chunk. The archive file is made empty and owned
+  /// as the root is; the writing fills it. The encoding is one unit of the archive's size (owed: a streamed encoder,
+  /// GAPS A-441).
+  fn prepare(
+    &mut self,
+    state: &mut ShardState,
+    archive: slates_archive::Archive,
+  ) -> Result<(), Refusal> {
+    // The id its name's alias already names (A-236), or one minted here.
+    let id = match self.archive {
+      Some(id) => id,
+      None => fresh_volume_id(state).ok_or_else(crate::verbs::ids_exhausted)?,
+    };
+    self.archiver = None;
+    self.manifest = archive.manifest_identity();
+    self.bytes = archive.encode();
+    drop(archive);
+    let length = u64::try_from(self.bytes.len()).unwrap_or(u64::MAX);
+    let chunk = u64::try_from(state.store.content.chunk_bytes().max(1)).unwrap_or(u64::MAX);
+    let size = self.size(length.div_ceil(chunk).max(1).saturating_mul(chunk));
+    let admitted = crate::verbs::admit(
+      state,
+      &self.principal,
+      size,
+      NamePolicy::Exact,
+      self.record.policy.require_locked,
+      None,
+    )
+    .map_err(|reply| crate::verbs::reply_refusal(*reply))?;
+    // Held from here, so a refusal below discards it.
+    let volume = &mut self.admitted.insert(admitted).volume;
+    let store = &mut state.store;
+    let root = volume
+      .root_inode(store)
+      .map_err(|error| refusal_of_vfs(&error))?;
+    let file = volume
+      .create_file_no(store, root, ARCHIVE_FILE, ARCHIVE_MODE)
+      .map_err(|error| refusal_of_vfs(&error))?;
+    let owner = volume
+      .stat(store, root)
+      .map_err(|error| refusal_of_vfs(&error))?;
+    volume
+      .chown(store, file, owner.uid, owner.gid)
+      .map_err(|error| refusal_of_vfs(&error))?;
+    self.file = file;
+    self.archive = Some(id);
+    Ok(())
+  }
+
+  /// One slice of the writing, a chunk of the encoding a unit; `Some` once the file holds all of it.
+  fn write_step(&mut self, state: &mut ShardState) -> Result<Option<()>, Refusal> {
+    let file = self.file;
+    let admitted = self.admitted.as_mut().ok_or_else(unreachable)?;
+    let (bytes, written) = (&self.bytes, &mut self.written);
+    sliced(state, |s| {
+      let chunk = s.store.content.chunk_bytes().max(1);
+      let rest = bytes.get(*written..).unwrap_or_default();
+      let piece = rest.get(..chunk.min(rest.len())).unwrap_or(rest);
+      if piece.is_empty() {
+        return Ok(Some(()));
+      }
+      let at = u64::try_from(*written).unwrap_or(u64::MAX);
+      let wrote = admitted
+        .volume
+        .write(&mut s.store, file, at, piece)
+        .map_err(|error| refusal_of_vfs(&error))?;
+      if wrote == 0 {
+        // A write that lands nothing would loop for good: the volume's own refusal, which a short write stands for.
+        return Err(refusal_of_vfs(&slates_vfs::VfsError::NoSpace));
+      }
+      *written = written.saturating_add(wrote);
+      Ok((*written >= bytes.len()).then_some(()))
+    })
+  }
+
+  /// Records the archive volume — a plain volume of its own, naming nothing of its source — moves it into the registry
+  /// and publishes it, then gives back the snapshot's pin; the reply.
+  fn publish(&mut self, state: &mut ShardState) -> Result<ReplyBody, Refusal> {
+    let id = self.archive.ok_or_else(unreachable)?;
+    let admitted = self.admitted.take().ok_or_else(unreachable)?;
+    let limit = admitted.volume.capacity_bytes();
+    let record = VolumeRecord {
+      id,
+      name: self.name.clone(),
+      owner_shard: state.partition,
+      policy: PolicyRecord {
+        size: crate::verbs::db_size(self.size(limit)),
+        names: slates_db::catalog::NamePolicy::Exact,
+        require_locked: self.record.policy.require_locked,
+        role: Role::Plain,
+        live_shipped: false,
+        live_holders: None,
+        write: None,
+        write_version: 0,
+        signers: Vec::new(),
+      },
+      base: BaseRecord::Scratch,
+      head: DbSnapshotId::default(),
+      epoch: 0,
+      referenced_bytes: 0,
+      unique_bytes: 0,
+      state: VolumeState::Live,
+      lease: None,
+      owner: self.principal.clone(),
+      access: Vec::new(),
+      created_ns: state.clock.monotonic_ns(),
+      catalog_version: 0,
+      taken_over: None,
+    };
+    let Admitted {
+      volume,
+      host,
+      credits,
+    } = admitted;
+    let reply = crate::verbs::publish_created_volume(
+      state,
+      id,
+      volume,
+      host,
+      (
+        credits.reservation,
+        credits.version,
+        credits.metadata,
+        credits.lock,
+      ),
+      record,
+    );
+    if let ReplyBody::Refused { refusal } = reply {
+      return Err(refusal);
+    }
+    publish_new_volume(state, id)?;
+    // The archive is the volume's own bytes now: the source's snapshot is free to go.
+    if let Some(handle) = self.pinned.take() {
+      crate::verbs::unpin_origin(state, handle, self.snapshot);
+    }
+    Ok(ReplyBody::ArchiveExported {
+      id: wire_id(id),
+      archive_bytes: u64::try_from(self.bytes.len()).unwrap_or(u64::MAX),
+      manifest: self.manifest,
+    })
+  }
+
+  /// Releases what the export made: its encoding and what is left of its walk, at once, since each is one allocation
+  /// or a walk already spent ([`shed_in_slices`] takes one unit). Nothing is left after.
+  fn shed(&mut self) -> bool {
+    self.bytes = Vec::new();
+    self.archiver = None;
+    false
+  }
+
+  /// Gives back what the export holds: the archive volume, discarded with its credits, and the snapshot's pin.
+  fn release(&mut self, state: &mut ShardState) {
+    if let Some(admitted) = self.admitted.take() {
+      crate::verbs::discard_admitted(state, admitted);
+    }
+    if let Some(handle) = self.pinned.take() {
+      crate::verbs::unpin_origin(state, handle, self.snapshot);
+    }
+  }
+}
+
+/// The refusal a snapshot's walk into its archive is answered with: a base-backed entry, whose bytes are on the disk
+/// and which an archive cannot carry (`slates_vfs::export`), refused by its kind with the way out; any other, the
+/// volume core's own.
+fn refusal_of_archive(error: &slates_vfs::VfsError) -> Refusal {
+  match error {
+    slates_vfs::VfsError::RecoveryIncomplete => Refusal::Unsupported {
+      feature: "an archive of a snapshot whose entries still read the disk: capture the overlay's base first \
+                (capture_base) and export the captured snapshot"
+        .to_owned(),
+    },
+    other => refusal_of_vfs(other),
+  }
+}
+
+/// Exports the archive a slice at a time; then commits its volume, or the refusal, as one atom and delivers the reply;
+/// then releases what the export made.
+async fn run_archive(mut job: ArchiveJob, alias: Option<NameAlias>) {
+  let reserved = reserve(alias.as_ref()).await;
+  let outcome = match &reserved {
+    Ok(()) => archive_steps(&mut job).await,
+    Err(refusal) => Err(refusal.clone()),
+  };
+  let request = job.request;
+  let completed = crate::state::with_state(|s| {
+    complete(s, request, |s| {
+      match outcome.and_then(|()| job.publish(s)) {
+        Ok(reply) => reply,
+        Err(refusal) => {
+          job.release(s);
+          refused(refusal)
+        }
+      }
+    })
+  });
+  let delivered = match completed {
+    Some((reply, route)) => {
+      settle(
+        alias,
+        reserved,
+        matches!(reply, ReplyBody::ArchiveExported { .. }),
+      )
+      .await;
+      crate::state::with_state(|s| deliver(s, reply, route))
+    }
+    None => None,
+  };
+  if delivered.is_none() {
+    // The shard's state was unreachable (its shutdown): no record committed, so the client's retry, on the shard that
+    // succeeds it, runs the verb again; the job's drop frees what it made.
+    return;
+  }
+  shed_in_slices(|| job.shed()).await;
+}
+
+/// The export's slices: pin and walk the snapshot into its archive, encode it and admit its volume, write the file.
+async fn archive_steps(job: &mut ArchiveJob) -> Result<(), Refusal> {
+  with(|s| job.start(s))?;
+  let archive = loop {
+    if let Some(archive) = with(|s| job.walk_step(s))? {
+      break archive;
+    }
+    slates_rt::futures::yield_now().await;
+  };
+  with(|s| job.prepare(s, archive))?;
+  loop {
+    if with(|s| job.write_step(s))?.is_some() {
+      return Ok(());
     }
     slates_rt::futures::yield_now().await;
   }

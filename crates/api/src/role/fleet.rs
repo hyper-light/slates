@@ -515,7 +515,7 @@ impl FleetCheck {
 }
 
 /// `selection`'s manifest read and this node's deployment planned exactly as its anchor and daemon do at their start
-/// (contract 38): for a starter that writes the manifest itself (kiln's runners, kiln goal 95101ef3, K3) to refuse a
+/// (contract 39): for a starter that writes the manifest itself (kiln's runners, kiln goal 95101ef3, K3) to refuse a
 /// manifest before it starts an instance on it, in the words the start would end with. Reads the manifest and the
 /// files it names, and the host's resolver configuration when a root is trusted or a node is named; writes nothing.
 pub fn check_fleet(selection: &FleetSelection) -> Result<FleetCheck, Failure> {
@@ -553,7 +553,7 @@ mod tests {
     (files, text)
   }
 
-  /// Contract 38 (kiln's runners write the manifest their instance starts with): do plan node `a` of a three-node
+  /// Contract 39 (kiln's runners write the manifest their instance starts with): do plan node `a` of a three-node
   /// manifest from files handed in, as the start does from the disk; expect the fleet's name, its `f` and the two
   /// peers. A node the manifest does not name, and a key that is no DER key, are refused by name; no resolver is asked
   /// of a manifest of literal addresses and no roots.

@@ -56,7 +56,7 @@ fn main() -> ExitCode {
   or not.
 - `StartSpec.fleet = Some(role::FleetSelection { manifest, node })` starts the instance as a node of the
   fleet the manifest names (`--fleet PATH --node NAME`). A starter that writes the manifest itself checks
-  it first with `role::check_fleet(&selection)` (contract 38): the manifest and the files it names read
+  it first with `role::check_fleet(&selection)` (contract 39): the manifest and the files it names read
   and the node's deployment planned exactly as its anchor and daemon do at their start, answering the
   fleet's name, `f`, the node's peers and roots (`role::FleetCheck`), or the refusal that start would end
   with (kiln writes each runner's manifest and checks it so; kiln goal 95101ef3).

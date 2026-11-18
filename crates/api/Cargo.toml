@@ -69,10 +69,12 @@ slates-db = { workspace = true }
 slates-bridge-fuse = { workspace = true }
 # The landing test checks each listed file's bytes against the BLAKE3 its plan's entry names (A-287).
 blake3 = { workspace = true }
+# The archive export test decodes and restores the archive it reads back, as a consumer that keeps it would (A-441).
+slates-archive = { workspace = true }
 # The signed-merge test signs with a software Ed25519 key as `ssh-keygen -Y sign` signs (A-321), through the one
 # cryptographic library slates builds on (A-66), which the server links already.
 aws-lc-rs = { workspace = true }
-# The fleet manifest's planning test mints its nodes' certificates as the server's deployment tests do (contract 38).
+# The fleet manifest's planning test mints its nodes' certificates as the server's deployment tests do (contract 39).
 rcgen = { workspace = true }
 
 # The vhost-user test plays the VMM over the device's end the library hands (§4.6, G-vhost): the daemon's own test

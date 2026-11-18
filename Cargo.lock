@@ -1307,6 +1307,7 @@ dependencies = [
  "rustix",
  "serde_json",
  "slates-anchor",
+ "slates-archive",
  "slates-bridge-fuse",
  "slates-bridge-nfs",
  "slates-bridge-virtiofs",
@@ -1646,6 +1647,7 @@ dependencies = [
  "blake3",
  "proptest",
  "shuttle",
+ "slates-mem",
  "slates-merge",
  "slates-test-seeds",
 ]

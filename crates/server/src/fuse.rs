@@ -1271,8 +1271,8 @@ fn fail(s: &mut ShardState, attachment: u64) {
 /// acknowledged before the next publication, so a daemon that dies first must leave its bytes for its successor to
 /// replay. Logged before the reply, so a write applied and never answered is resent, not replayed twice over a
 /// different later write (the kernel resends it with the same bytes at the same offset). A log with no room forces a
-/// publication, which carries this write (already applied) and empties the log; only a refused publication leaves the
-/// write unlogged, marked as an overflow so the next daemon reports the loss rather than replaying around it.
+/// publication that settles the write by its own volume (`crate::write_log::log_acknowledged_write`, A-436); only a
+/// write nothing keeps is marked as an overflow, so the next daemon reports the loss rather than replaying around it.
 fn log_write(s: &mut ShardState, volume: VolumeId, dispatched: &Dispatched) {
   if dispatched.opcode != Some(slates_bridge_fuse::Opcode::Write) || dispatched.error != 0 {
     return;
@@ -1282,26 +1282,7 @@ fn log_write(s: &mut ShardState, volume: VolumeId, dispatched: &Dispatched) {
   let Some((offset, data)) = dispatched.written() else {
     return;
   };
-  let appended = match (s.write_log.as_mut(), s.content.as_mut()) {
-    (Some(log), Some(object)) => {
-      log.append(object, (volume.bytes, dispatched.nodeid()), offset, data)
-    }
-    _ => return,
-  };
-  let logged = match appended {
-    Ok(()) => true,
-    Err(crate::write_log::Refused::Full) => {
-      // The publication carries this write and, capturing every volume, empties the log.
-      crate::verbs::publish_shard(s).is_ok_and(|published| published.skipped.is_empty())
-    }
-    Err(crate::write_log::Refused::Unwritten) => false,
-  };
-  if !logged {
-    s.count(crate::verbs::WRITE_LOG_UNWRITTEN, 1);
-    if let (Some(log), Some(object)) = (s.write_log.as_mut(), s.content.as_mut()) {
-      let _ = log.overflow(object);
-    }
-  }
+  crate::write_log::log_acknowledged_write(s, volume, (dispatched.nodeid(), offset), data);
 }
 
 /// Sends the anchor this mount's session once its `INIT` has been answered (A-61), so a restarted daemon can

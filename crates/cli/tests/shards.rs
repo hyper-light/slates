@@ -549,6 +549,11 @@ impl ShardsDevice {
       init.extend_from_slice(&word.to_le_bytes());
     }
     assert_eq!(errno(&self.ask(Opcode::Init, 0, &init)), 0, "INIT");
+    self.read_file(path)
+  }
+
+  /// LOOKUP, OPEN, READ and RELEASE of `path` under the root: its first bytes.
+  fn read_file(&mut self, path: &str) -> Vec<u8> {
     let mut name = path.as_bytes().to_vec();
     name.push(0);
     let found = self.ask(Opcode::Lookup, ROOT_NODE, &name);
@@ -617,4 +622,152 @@ fn errno(reply: &[u8]) -> i32 {
 
 fn word_at(bytes: &[u8], at: usize) -> u64 {
   u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
+}
+
+/// Format: the role of the probe that is resynced across its daemon's kill (A-433).
+const RESYNCER: &str = "role=resyncer";
+/// Format: the test the resyncer probe is re-invoked as.
+const RESYNC_TEST: &str = "slates_shards_resyncs_its_programs_stream_after_its_daemon_is_killed";
+/// Format: where the command's arguments name the resync end's handle (`slates shards`' `{resync}`, A-433).
+const RESYNC_PLACEHOLDER: &str = "{resync}";
+/// Format: the line the resyncer prints once it has read the file through its first stream and its channel's
+/// `Attached`.
+const READY_LINE: &str = "shards-resync-ready";
+/// Shape: how long the test waits for the anchor's next daemon to serve the stream again and the resyncer to read the
+/// file through it: a restart's recovery on a loaded runner, well past `WAIT_FOR`.
+const RESYNC_WAIT: Duration = Duration::from_secs(120);
+
+/// A-433, the Windows stream's resync across a real daemon's death (§4.6, A-316's channel on Windows). Do: under
+/// `slates anchor`, run `slates shards ID -- <this binary> ... {handle} {resync}`, the probe reading the file through
+/// its stream after the channel's `Attached`; kill the daemon (`TerminateProcess`, as `kill -9`); let the anchor start
+/// the next. Expect: the probe reads a Windows `Resync` naming its attachment and token, its own process as the holder
+/// and a live handle there, and reads the file's bytes through that fresh stream with no `INIT`; the command exits 0;
+/// the next daemon counts `shards.resynced`. Red before A-433: the next daemon released the held end and ended the
+/// attachment, so the probe read the channel's end and failed.
+#[test]
+fn slates_shards_resyncs_its_programs_stream_after_its_daemon_is_killed() {
+  if std::env::args().any(|argument| argument == RESYNCER) {
+    resyncer();
+  }
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "SKIP: the shards resync needs SLATES_TEST_CLI=1 (an anchor and its daemon on this runner)"
+    );
+    return;
+  }
+  let instance = format!("cr{}", std::process::id());
+  let _anchor = start_anchor(&instance);
+  let id = a_volume_with_the_file(&instance);
+  let mut command = slates();
+  let mut child = command
+    .args(["--instance", &instance, "shards", &id, "--"])
+    .arg(std::env::current_exe().unwrap())
+    .args([
+      "--exact",
+      RESYNC_TEST,
+      "--nocapture",
+      RESYNCER,
+      PLACEHOLDER,
+      RESYNC_PLACEHOLDER,
+    ])
+    .stdout(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let mut out = std::io::BufReader::new(child.stdout.take().unwrap());
+  let mut line = String::new();
+  loop {
+    line.clear();
+    assert!(
+      out.read_line(&mut line).unwrap() > 0,
+      "the probe ended before it was ready"
+    );
+    if line.contains(READY_LINE) {
+      break;
+    }
+  }
+  let (code, status, error) = run(&instance, &["status"]);
+  assert_eq!(code, 0, "status: {error}");
+  kill_hard(value_of(&status, "pid").parse().unwrap());
+  let started = Instant::now();
+  let mut read = None;
+  while read.is_none() {
+    line.clear();
+    assert!(
+      out.read_line(&mut line).unwrap() > 0,
+      "the probe ended without reading through a resynced stream"
+    );
+    read = line
+      .find(READ_TAG)
+      .map(|at| unhex(line[at + READ_TAG.len()..].trim()));
+    assert!(
+      started.elapsed() < RESYNC_WAIT,
+      "the resync came within the bound"
+    );
+  }
+  assert_eq!(read.as_deref(), Some(SHARDS_FILE));
+  assert_eq!(child.wait().unwrap().code(), Some(0), "the command's exit");
+  assert!(
+    counter(&instance, "shards.resynced") >= 1,
+    "the next daemon resynced the stream"
+  );
+}
+
+/// The resyncer probe (A-433): its stream and resync ends are its last two arguments. Reads `Attached`, the file through
+/// the stream, says it is ready, then waits on the channel for a `Resync`, takes the handle it names in this process,
+/// and reads the file again through it, with no `INIT`. Never returns.
+fn resyncer() -> ! {
+  use slates_bridge_fuse::shards_resync::{
+    HandedResync, RESYNC_HANDLE_MESSAGE_BYTES, ResyncKind, ResyncMessage,
+  };
+  let values: Vec<u64> = std::env::args()
+    .rev()
+    .take(2)
+    .map(|value| value.parse().unwrap())
+    .collect();
+  let (resync, stream) = (values[0], values[1]);
+  let channel = slates_ipc::handle_route::adopt_stream(resync).unwrap();
+  let end = slates_ipc::handle_route::adopt_stream(stream).unwrap();
+  let mut message = [0u8; RESYNC_HANDLE_MESSAGE_BYTES];
+  let read = slates_ipc::stream::read_waiting(channel.as_handle(), &mut message).unwrap();
+  let attached = ResyncMessage::parse(&message[..read]).unwrap();
+  assert_eq!(attached.kind, ResyncKind::Attached);
+  let mut device = ShardsDevice { end, unique: 0 };
+  assert_eq!(device.mount_and_read("hello.txt"), SHARDS_FILE);
+  println!("{READY_LINE}");
+  std::io::stdout().flush().unwrap();
+  let read = slates_ipc::stream::read_waiting(channel.as_handle(), &mut message).unwrap();
+  let resync = HandedResync::parse(&message[..read]).unwrap();
+  assert!(
+    resync.resyncs(&attached),
+    "the resync names its attachment and token"
+  );
+  assert_eq!(
+    resync.holder,
+    std::process::id(),
+    "this process holds the fresh end"
+  );
+  let fresh = slates_ipc::handle_route::adopt_stream(resync.handle).unwrap();
+  let mut device = ShardsDevice {
+    end: fresh,
+    unique: device.unique,
+  };
+  let bytes = device.read_file("hello.txt");
+  let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+  println!("{READ_TAG}{hex}");
+  std::io::stdout().flush().unwrap();
+  std::process::exit(0);
+}
+
+/// Ends process `pid` at once, as `kill -9` does (`TerminateProcess`).
+fn kill_hard(pid: u32) {
+  use windows_sys::Win32::Foundation::CloseHandle;
+  use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+  // SAFETY: the pid came from the daemon's own status; only the right to end it is asked, with no inheritance.
+  let process = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+  assert!(!process.is_null(), "OpenProcess({pid})");
+  // SAFETY: the live handle just opened, used once and closed here.
+  let ended = unsafe { TerminateProcess(process, 1) };
+  // SAFETY: the same handle, closed once.
+  unsafe { CloseHandle(process) };
+  assert_ne!(ended, 0, "kill the daemon");
 }

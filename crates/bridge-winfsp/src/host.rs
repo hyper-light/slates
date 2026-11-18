@@ -1982,7 +1982,7 @@ fn put_link(reply: Reply, out: Option<(&mut [u8], &mut usize)>) -> Ntstatus {
   };
   let data = match crate::symlink::reparse_data(&target) {
     Ok(data) => data,
-    Err(refusal) => return refusal.status().as_i32(),
+    Err(refusal) => return crate::symlink::status_of(refusal).as_i32(),
   };
   let Some(room) = buffer.get_mut(..data.len()) else {
     return crate::symlink::STATUS_BUFFER_TOO_SMALL.as_i32();
@@ -2122,7 +2122,7 @@ extern "C" fn set_reparse_point(
       path,
       target,
     })),
-    Err(refusal) => refusal.status().as_i32(),
+    Err(refusal) => crate::symlink::status_of(refusal).as_i32(),
   }
 }
 

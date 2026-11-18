@@ -1811,6 +1811,7 @@ pub(crate) fn run_shards(request: &ShardsRequest) -> Result<(), Failure> {
     at: request.handed,
     resync: shards.resync,
     resync_at: request.resync_at,
+    resync_named: request.resync_named,
   };
   hand_to(client, OsStr::new(program), args, handed)
 }
@@ -1828,12 +1829,14 @@ struct Handed {
   stream: slates_client::StreamEnd,
   /// Where the command finds it.
   at: crate::args::HandOff,
-  /// The stream's resync end, when the daemon handed one (A-316).
-  #[cfg_attr(windows, allow(dead_code))]
+  /// The stream's resync end, when the daemon handed one (A-316; Windows, A-433).
   resync: Option<slates_client::StreamEnd>,
   /// Where the command finds its resync end, when it asked for one (`--resync-fd`).
   #[cfg_attr(windows, allow(dead_code))]
   resync_at: Option<i32>,
+  /// Whether the command's arguments name its resync end where `{resync}` stands (Windows, A-433).
+  #[cfg_attr(unix, allow(dead_code))]
+  resync_named: bool,
 }
 
 /// Replaces this process with `program`, the stream end at the descriptor number `handed` names
@@ -1898,11 +1901,21 @@ fn hand_to(
     ));
   }
   let name = program.to_string_lossy();
-  let mut child = slates_ipc::stream::spawn_with(
+  // The resync end goes where `{resync}` stands, the daemon's or one already ended (A-433), so the command reads its end
+  // and knows, as it would from the daemon's, that no resync will come.
+  let resync = if handed.resync_named {
+    Some((
+      handed_resync_end(handed.resync)?,
+      crate::args::RESYNC_PLACEHOLDER,
+    ))
+  } else {
+    None
+  };
+  let mut child = slates_ipc::stream::spawn_with_ends(
     program,
     args,
-    handed.stream,
-    crate::args::HANDLE_PLACEHOLDER,
+    (handed.stream, crate::args::HANDLE_PLACEHOLDER),
+    resync,
   )
   .map_err(|e| Failure::Failed(format!("shards: running {name} with its end's handle: {e}")))?;
   if let Err(e) =
@@ -1928,6 +1941,26 @@ fn hand_to(
     code => Err(Failure::ChildExited { code }),
   }
 }
+
+/// The resync end a command that names `{resync}` is handed (Windows, A-433): the daemon's, or, where it handed none, the
+/// device's end of a message-mode pipe whose other end is closed at once, so the command reads the channel's end.
+#[cfg(windows)]
+fn handed_resync_end(
+  handed: Option<slates_client::StreamEnd>,
+) -> Result<slates_client::StreamEnd, Failure> {
+  if let Some(handed) = handed {
+    return Ok(handed);
+  }
+  let (ended, end) = slates_ipc::stream::message_pair(ENDED_CHANNEL_BYTES)
+    .map_err(|e| Failure::Failed(format!("shards: an ended resync channel: {e}")))?;
+  drop(ended);
+  Ok(end)
+}
+
+/// Format: the buffer of a resync channel handed already ended (Windows, A-433): none, since no message is ever written
+/// to it; its reader reads the channel's end at once.
+#[cfg(windows)]
+const ENDED_CHANNEL_BYTES: usize = 0;
 
 /// `vhost-user ID [--tag NAME] [--subtree DIR] [--read-only] [--dax-window SIZE] -- VMM [ARG ...]` (§4.6; goal G-vhost):
 /// attaches the volume to slates' own virtio-fs device, announces the attachment, and replaces this process with the

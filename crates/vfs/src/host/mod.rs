@@ -9,6 +9,9 @@
 //! lint wall refuses write-capable syscalls (R1).
 
 pub mod sim;
+/// A volume symlink as a Windows symbolic link (A-275): the reparse buffer the WinFsp drive shows and a Windows landing
+/// writes (A-438).
+pub mod windows_link;
 
 use crate::inode::Fingerprint;
 
@@ -232,8 +235,18 @@ pub trait LandFs: HostFs {
   fn mkdir(&mut self, dir: HostDir, name: &str, mode: u32) -> Result<(), HostError>;
   /// Removes an empty directory.
   fn rmdir(&mut self, dir: HostDir, name: &str) -> Result<(), HostError>;
-  /// Creates a symlink.
-  fn symlink(&mut self, dir: HostDir, name: &str, target: &str) -> Result<(), HostError>;
+  /// Creates the symlink `name` under `dir` to `target`, refused `EEXIST` when the name exists, so that `name` is never
+  /// seen holding anything but the whole link. A writer that makes a link in one step (`symlinkat`) makes it at `name`
+  /// and ignores `staged`; one that needs two (Windows: the empty object, then its reparse buffer, A-438) makes it at
+  /// `staged`, a hidden name the landing owns, and moves it to `name` without replacing, so a crash between the steps
+  /// leaves only a hidden sibling the landing's sweep removes.
+  fn symlink(
+    &mut self,
+    dir: HostDir,
+    name: &str,
+    target: &str,
+    staged: &str,
+  ) -> Result<(), HostError>;
   /// Makes the directory's entries durable (`fsync` on its descriptor).
   fn sync_dir(&mut self, dir: HostDir) -> Result<(), HostError>;
   /// One media barrier on the target after the entries' data syncs (§4.15 step 8: macOS

@@ -499,7 +499,10 @@ its successor recovers the attachment, the successor hands a fresh stream end na
 message is one packet; on macOS the channel is a stream, so read each message whole by its 28 bytes. Reading the
 channel's end means no such stream will come (the attachment ended, or the daemon could not keep it); a platform that
 makes no channel yet hands one already ended. A program that ends its share closes the channel's end with the
-stream's.
+stream's. On Windows, name the channel where `{resync}` stands in the command's arguments, as the stream where `{handle}`
+stands: the command inherits a handle of a message-mode pipe, each message one read, whose `Resync` (40 bytes) names
+the fresh stream end's handle in the process holding the stream (the command, which `slates shards` names to the
+daemon), where the successor put it.
 A guest whose init names its run's owner, as Shards' does with `trusted.shards.owner`, is shown the files the host
 made as that owner's, so an unprivileged run writes them; the volume keeps the host's own ids for what the run makes,
 so every other route shows those files as the host's.

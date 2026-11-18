@@ -559,13 +559,10 @@ async fn promote_region_here_or_forward(region: u64, principal: Principal) -> Re
         ack_up_to: None,
         ack_owed: Vec::new(),
       });
-      match crate::fleet::forward_over_leader_session(
-        leader,
-        request,
-        crate::daemon::LIVENESS_BUDGET_NS,
-      )
-      .await
-      {
+      // The stall every forward over a leader session runs under (A-439): a liveness window and the path's tail.
+      let stall_ns = crate::state::with_state(|s| forward_stall_ns(s, leader))
+        .unwrap_or(crate::daemon::LIVENESS_BUDGET_NS);
+      match crate::fleet::forward_over_leader_session(leader, request, stall_ns).await {
         Some(reply) if !reply.is_empty() => {
           decode_body::<ReplyBody>(&reply).unwrap_or_else(|_| refused(Refusal::NotRootLeader))
         }
@@ -1805,8 +1802,23 @@ pub(crate) async fn resolve_and_forward(
 /// budget (`resolve_and_forward`).
 const FORWARD_RETRIED: &str = "fleet.forward.retried";
 
-/// One forward of `requests` to `owner`, within one liveness budget plus the measured round-trip tail of the path to
-/// it, queued at `place` in the owner's lane (the first send's, for a resend) and judged against `bound_at`, the
+/// Derived: the stall budget a forward over the leader session to `peer` runs under (the forward lane's silence window,
+/// `crate::forward_lane`, A-315): one liveness window, the lateness a live party may show before it is judged (A-228),
+/// plus the measured round-trip tail of the path to `peer` (`PathRtt`, RFC 6298's estimator per path; none before the
+/// first sample), so a forward's reply is never refused for crossing a path the local window did not allow for. Every
+/// forward over a leader session reads it: a verb's to its owner ([`forward_once`]) and an operator's promotion to the
+/// root group's leader ([`promote_region_here_or_forward`], A-439, which until then ran under the window alone).
+pub(crate) fn forward_stall_ns(state: &ShardState, peer: HostId) -> u64 {
+  let tail_ns = state
+    .peer_paths
+    .get(&peer)
+    .and_then(slates_cluster::timing::PathRtt::tail_ns)
+    .unwrap_or(0);
+  crate::daemon::LIVENESS_BUDGET_NS.saturating_add(tail_ns)
+}
+
+/// One forward of `requests` to `owner`, within [`forward_stall_ns`] (one liveness window plus the measured round-trip
+/// tail of the path to it), queued at `place` in the owner's lane (the first send's, for a resend) and judged against `bound_at`, the
 /// failover bound on the wall from the first send (`crate::forward_lane`'s stall, A-315): the decoded reply to the
 /// first (`None` when nothing was sent, `Some(None)` when it went unanswered) and the decoded replies to the rest that
 /// came back, in order, up to the first that did not.
@@ -1819,24 +1831,10 @@ async fn forward_once(
   let Some(owner) = owner else {
     return (None, Vec::new());
   };
-  // One liveness budget, plus the measured round-trip tail of the path to the owner: a WAN forward's reply is never
-  // refused for crossing a path the local budget did not allow for.
-  let tail_ns = crate::state::with_state(|state| {
-    state
-      .peer_paths
-      .get(&owner)
-      .and_then(slates_cluster::timing::PathRtt::tail_ns)
-  })
-  .flatten()
-  .unwrap_or(0);
-  let forwarded = crate::fleet::forward_batch_over_leader_session(
-    owner,
-    requests,
-    crate::daemon::LIVENESS_BUDGET_NS.saturating_add(tail_ns),
-    bound,
-    place,
-  )
-  .await;
+  let stall_ns = crate::state::with_state(|state| forward_stall_ns(state, owner))
+    .unwrap_or(crate::daemon::LIVENESS_BUDGET_NS);
+  let forwarded =
+    crate::fleet::forward_batch_over_leader_session(owner, requests, stall_ns, bound, place).await;
   if forwarded.is_none() {
     crate::state::with_state(|state| {
       state.count("fleet.owner_location.forward_unsent", 1);
@@ -4488,6 +4486,7 @@ fn claims_placed_durability(body: &RequestBody) -> bool {
       | RequestBody::SubmitSigned { .. }
       | RequestBody::ImageBuild { .. }
       | RequestBody::ImageMerge { .. }
+      | RequestBody::ArchiveExport { .. }
   )
 }
 
@@ -4901,6 +4900,11 @@ fn dispatch_inner(
     RequestBody::ImageMerge { image, name } => {
       crate::image::merge_verb(state, principal, image, name)
     }
+    RequestBody::ArchiveExport {
+      volume,
+      snapshot,
+      name,
+    } => crate::image::archive_verb(state, principal, volume, snapshot, name),
     RequestBody::Checkout {
       green,
       base,
@@ -5514,7 +5518,9 @@ async fn revoked_mounts_ended(origin: u16, fenced: Vec<(u16, Vec<(u64, DbVolumeI
   let bound = crate::state::with_state(|s| crate::told::bound_ns(s))
     .unwrap_or(crate::daemon::LIVENESS_BUDGET_NS);
   for (shard, mounts) in fenced {
-    let ended = crate::xshard::task_within(
+    // Waited in the shard's own time (A-435): the bound is for the kernels the shard waits on, so a shard busy with
+    // its other work, or starved, is waited for rather than counted overdue; one idle past the bound is the kernels'.
+    let ended = crate::xshard::task_in_shard_time(
       origin,
       shard,
       move || crate::fuse::revoked_mounts_ended(mounts),
@@ -14195,7 +14201,8 @@ fn new_volume_name(body: &RequestBody) -> Option<&str> {
     | RequestBody::CreateWork { name, .. }
     | RequestBody::Clone { name, .. }
     | RequestBody::ImageBuild { name, .. }
-    | RequestBody::ImageMerge { name, .. } => Some(name),
+    | RequestBody::ImageMerge { name, .. }
+    | RequestBody::ArchiveExport { name, .. } => Some(name),
     _ => None,
   }
 }
@@ -15455,15 +15462,10 @@ pub(crate) async fn rebuild_recovered(
   restore_nfs_answers(state, calls, nfs_replies);
   // The barrier replies the dead daemon published and never delivered, for the mounts (Linux) and streams (A-316,
   // A-339) the anchor held (A-61).
-  #[cfg(unix)]
-  {
-    state.recovered_replies = replies
-      .into_iter()
-      .map(|reply| (reply.attachment, (reply.unique, reply.reply)))
-      .collect();
-  }
-  #[cfg(windows)]
-  drop(replies);
+  state.recovered_replies = replies
+    .into_iter()
+    .map(|reply| (reply.attachment, (reply.unique, reply.reply)))
+    .collect();
   let mut rebuilt = Rebuilt::default();
   // Every block the images name is claimed before anything else allocates in the arena (A-64): the held
   // replicas and the merge volumes below allocate fresh blocks, which must never land on one an image names.
@@ -16914,13 +16916,7 @@ fn held_nfs_replies_changed(state: &ShardState) -> bool {
 
 /// The barrier replies not yet delivered, which ride with the effects they answer (A-61).
 fn pending_replies(state: &ShardState) -> Vec<slates_vfs::recover::HeldReply> {
-  #[cfg(unix)]
-  return state.pending_replies.values().cloned().collect();
-  #[cfg(windows)]
-  {
-    let _ = state;
-    Vec::new()
-  }
+  state.pending_replies.values().cloned().collect()
 }
 
 /// A checkpoint of every volume into the free slot (§4.8): the whole shard, as every publication was before A-68.
@@ -18166,6 +18162,18 @@ fn reconcile_lost(state: &mut ShardState, record: &VolumeRecord) -> (usize, usiz
         state.adopt_shards.push(((**a).clone(), held));
         return false;
       }
+      // A Windows stream whose resync end the anchor held is kept the same way (A-433).
+      #[cfg(windows)]
+      if matches!(a.form, AttachForm::ShardsFs { .. })
+        && let Some(at) = state
+          .inherited_resync
+          .iter()
+          .position(|held| held.attachment == a.id)
+      {
+        let held = state.inherited_resync.swap_remove(at);
+        state.adopt_shards.push(((**a).clone(), held));
+        return false;
+      }
       #[cfg(windows)]
       if matches!(a.form, AttachForm::WinFspMount { .. })
         && let Some(at) = state
@@ -19321,6 +19329,211 @@ mod tests {
         bytes: LEFT_OUT_WRITE.to_vec(),
       })],
       "the restarted daemon replays the left-out overlay's write, and not the plain volume's, which the delta carries"
+    );
+  }
+
+  /// Shape: the bytes of each record the full-log tests fill the write log with, and of the write each then logs: one
+  /// size, so the log that refused a filler refuses the write too.
+  const FILLER_BYTES: usize = 64 * 1024;
+
+  /// The full-log tests' shard: a plain volume and an overlay of this crate's sources, each with a published file; one
+  /// of the overlay's base files copied up and its host taken away, so its next publication is its whole image and
+  /// cannot be taken; and the write log filled with the plain volume's records until it refuses one. Returns the two
+  /// volumes and their files.
+  fn a_full_log_beside_a_left_out_overlay(
+    state: &mut crate::state::ShardState,
+  ) -> (
+    super::DbVolumeId,
+    slates_vfs::ids::InodeNo,
+    super::DbVolumeId,
+    slates_vfs::ids::InodeNo,
+  ) {
+    let principal = Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 1234,
+    };
+    let base = concat!(env!("CARGO_MANIFEST_DIR"), "/src").to_owned();
+    let (plain, plain_handle) = dynamic_volume(state, &principal, "full-log-plain", None);
+    let (overlay, overlay_handle) =
+      dynamic_volume(state, &principal, "full-log-overlay", Some(base));
+    let plain_file = {
+      let super::ShardState { store, volumes, .. } = &mut *state;
+      let slot = volumes.get_mut(plain_handle).unwrap();
+      let root = slot.volume.root_inode(store).unwrap();
+      slot
+        .volume
+        .create_file_no(store, root, "kept", 0o644)
+        .unwrap()
+    };
+    let overlay_file = {
+      let super::ShardState { store, volumes, .. } = &mut *state;
+      let slot = volumes.get_mut(overlay_handle).unwrap();
+      let root = slot.volume.root_inode(store).unwrap();
+      let host = slot.host.as_mut().unwrap();
+      slot
+        .volume
+        .with_host(host)
+        .create_file_no(store, root, "kept", 0o644)
+        .unwrap()
+    };
+    super::publish_shard(state).expect("the shard publishes both files");
+    {
+      let super::ShardState { store, volumes, .. } = &mut *state;
+      let slot = volumes.get_mut(overlay_handle).unwrap();
+      let root = slot.volume.root_inode(store).unwrap();
+      let host = slot.host.as_mut().unwrap();
+      let mut overlay_fs = slot.volume.with_host(host);
+      let copied = overlay_fs.lookup_no(store, root, "lib.rs").unwrap().inode;
+      overlay_fs.write(store, copied, 0, b"copied up").unwrap();
+    }
+    let host = state.volumes.get_mut(overlay_handle).unwrap().host.take();
+    assert!(host.is_some(), "the overlay had a base host");
+    let filler = vec![b'f'; FILLER_BYTES];
+    loop {
+      let super::ShardState {
+        write_log, content, ..
+      } = &mut *state;
+      match write_log.as_mut().unwrap().append(
+        content.as_mut().unwrap(),
+        (plain.bytes, plain_file.0),
+        0,
+        &filler,
+      ) {
+        Ok(()) => {}
+        Err(crate::write_log::Refused::Full) => break,
+        Err(other) => panic!("the log refused a filler: {other:?}"),
+      }
+    }
+    (plain, plain_file, overlay, overlay_file)
+  }
+
+  /// The write log as a restarted daemon would find it now, against the generation the shard's journal committed.
+  fn log_as_a_successor_finds_it(
+    state: &mut crate::state::ShardState,
+  ) -> crate::write_log::Recovered {
+    let generation = {
+      let object = state.content.as_ref().unwrap();
+      let (images, deltas) = (state.content_range, state.delta_range);
+      slates_vfs::checkpoint_log::committed_generation(
+        &super::ContentView {
+          object,
+          start: images.0,
+          len: images.1 - images.0,
+        },
+        &super::ContentView {
+          object,
+          start: deltas.0,
+          len: deltas.1 - deltas.0,
+        },
+      )
+    };
+    let super::ShardState {
+      write_log, content, ..
+    } = &mut *state;
+    write_log
+      .as_ref()
+      .unwrap()
+      .reopened(content.as_mut().unwrap(), generation)
+      .unwrap()
+  }
+
+  /// A-436 (A-422's third sibling, from reading): a write a full log cannot take is kept by the publication it forces
+  /// when that publication captures the write's volume, though it leaves another volume out. Do: on a shard with a
+  /// reduced reserve (so its write log is small), a plain volume and an overlay that cannot be imaged, the log filled
+  /// with the plain volume's records; write into the plain volume's file and log it as a transport does. Expect: the
+  /// forced publication left the overlay out (it kept the overlay's record, counted) and captured the plain volume; the
+  /// log is not marked overflowed, nothing is counted unlogged, and a restarted daemon is told nothing was lost. Before
+  /// A-436 the write counted unlogged because the overlay was left out, the overflow was marked, and every file a
+  /// taken-over mount had open was reported as having lost writes, though the image held the write.
+  #[test]
+  fn a_full_logs_forced_publication_keeps_a_captured_volumes_write_and_reports_no_loss() {
+    let (left_out, holds_every_write, unlogged, recovered) =
+      crate::daemon::audit_on_shard_configured(
+        |state| {
+          let (plain, plain_file, _, _) = a_full_log_beside_a_left_out_overlay(state);
+          let payload = vec![b'p'; FILLER_BYTES];
+          let handle = *state.by_id.get(&plain).unwrap();
+          {
+            let super::ShardState { store, volumes, .. } = &mut *state;
+            let slot = volumes.get_mut(handle).unwrap();
+            slot.volume.write(store, plain_file, 0, &payload).unwrap();
+          }
+          crate::write_log::log_acknowledged_write(state, plain, (plain_file.0, 0), &payload);
+          (
+            state
+              .refusals
+              .get(super::DEFERRED_KEPT)
+              .copied()
+              .unwrap_or(0),
+            state.write_log.as_ref().unwrap().holds_every_write(),
+            state
+              .refusals
+              .get(super::WRITE_LOG_UNWRITTEN)
+              .copied()
+              .unwrap_or(0),
+            log_as_a_successor_finds_it(state),
+          )
+        },
+        |config| config.reserve_per_shard = RELIEF_RESERVE,
+      );
+    assert_eq!(left_out, 1, "the forced publication left the overlay out");
+    assert!(holds_every_write, "the log is not marked overflowed");
+    assert_eq!(unlogged, 0, "nothing was counted unlogged");
+    assert!(
+      !recovered.everything_lost,
+      "a restarted daemon is told nothing was lost"
+    );
+  }
+
+  /// A-436: a write a full log cannot take, to the volume the publication it forces leaves out, is appended again into
+  /// the room that publication gave back (A-422's retain drops the captured volumes' records). Do: as in
+  /// [`a_full_logs_forced_publication_keeps_a_captured_volumes_write_and_reports_no_loss`], but write into the
+  /// overlay's own file. Expect: the publication left the overlay out; the log is not marked overflowed; and a
+  /// restarted daemon is handed the overlay's write and told nothing was lost. Before A-436 the write was in neither
+  /// the image nor the log, and the overflow was marked.
+  #[test]
+  fn a_full_logs_forced_publication_appends_a_left_out_volumes_write_again() {
+    let (left_out, holds_every_write, overlay, overlay_file, recovered) =
+      crate::daemon::audit_on_shard_configured(
+        |state| {
+          let (_, _, overlay, overlay_file) = a_full_log_beside_a_left_out_overlay(state);
+          let payload = vec![b'o'; FILLER_BYTES];
+          let handle = *state.by_id.get(&overlay).unwrap();
+          {
+            let super::ShardState { store, volumes, .. } = &mut *state;
+            let slot = volumes.get_mut(handle).unwrap();
+            slot.volume.write(store, overlay_file, 0, &payload).unwrap();
+          }
+          crate::write_log::log_acknowledged_write(state, overlay, (overlay_file.0, 0), &payload);
+          (
+            state
+              .refusals
+              .get(super::DEFERRED_KEPT)
+              .copied()
+              .unwrap_or(0),
+            state.write_log.as_ref().unwrap().holds_every_write(),
+            overlay,
+            overlay_file,
+            log_as_a_successor_finds_it(state),
+          )
+        },
+        |config| config.reserve_per_shard = RELIEF_RESERVE,
+      );
+    assert_eq!(left_out, 1, "the forced publication left the overlay out");
+    assert!(holds_every_write, "the log is not marked overflowed");
+    assert!(
+      !recovered.everything_lost,
+      "a restarted daemon is told nothing was lost"
+    );
+    assert_eq!(
+      recovered.records,
+      vec![crate::write_log::Logged::Write(crate::write_log::Record {
+        volume: overlay.bytes,
+        inode: overlay_file.0,
+        offset: 0,
+        bytes: vec![b'o'; FILLER_BYTES],
+      })],
+      "a restarted daemon is handed the overlay's write, and none of the captured volume's"
     );
   }
 
@@ -21715,6 +21928,37 @@ mod tests {
         "lapsed, and the read attachment keeps no write lease"
       );
       assert_eq!(super::lease_kept_until(state, volume, &other, before), None);
+    });
+  }
+
+  /// R3's class B (B-b, A-439). Do: on one shard, measure the path to a peer at two liveness windows a round trip, then
+  /// derive the stall a forward over that peer's leader session runs under, and one to a peer with no path measured.
+  /// Expect: past the slow path's round-trip tail by a liveness window, and one window for the unmeasured one. Before, an
+  /// operator's promotion forwarded to the root group's leader ran under one liveness window whatever its path, so a
+  /// leader across a slow path had its answer given up and the operator was told `NotRootLeader`.
+  #[test]
+  fn a_forward_over_a_slow_path_gets_its_round_trip_tail_on_top_of_a_window() {
+    crate::daemon::audit_on_shard(|state| {
+      let slow = HostId(77);
+      let path = state.peer_paths.entry(slow).or_default();
+      for _ in 0..4 {
+        path.on_sample(2 * crate::daemon::LIVENESS_BUDGET_NS);
+      }
+      let tail = state
+        .peer_paths
+        .get(&slow)
+        .and_then(slates_cluster::timing::PathRtt::tail_ns)
+        .unwrap();
+      assert!(tail >= 2 * crate::daemon::LIVENESS_BUDGET_NS);
+      assert!(
+        super::forward_stall_ns(state, slow) >= tail + crate::daemon::LIVENESS_BUDGET_NS,
+        "the slow path's round trip is allowed for on top of a window"
+      );
+      assert_eq!(
+        super::forward_stall_ns(state, HostId(78)),
+        crate::daemon::LIVENESS_BUDGET_NS,
+        "a path with nothing measured is given the window"
+      );
     });
   }
 }
