@@ -2141,10 +2141,10 @@ mod tests {
     assert_eq!(
       (regional_bytes.get(..8), root_bytes.get(..8)),
       (
-        Some(b"RCFG\x02\x00\x00\x00".as_slice()),
+        Some(b"RCFG\x03\x00\x00\x00".as_slice()),
         Some(b"RTCF\x01\x00\x00\x00".as_slice())
       ),
-      "golden: each layout begins with its magic and version, little-endian: the regional one's 2 since A-309"
+      "golden: each layout begins with its magic and version, little-endian: the regional one's 3 since A-380, which added the seated voters (2 since A-309)"
     );
     assert_eq!(decode_regional_configuration(&regional_bytes), Ok(regional));
     assert_eq!(decode_root_configuration(&root_bytes), Ok(root));
