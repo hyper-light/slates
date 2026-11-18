@@ -1359,7 +1359,7 @@ pub(crate) fn status_merge_volume(
       attachments: u32::try_from(attachments).unwrap_or(u32::MAX),
       head: SnapshotId { value: head },
       drifted: Vec::new(),
-      watcher: "merge".to_owned(),
+      watcher: crate::verbs::WATCHER_MERGE.to_owned(),
       snapshots: u32::try_from(head).unwrap_or(u32::MAX),
       placed,
       nfs_port: u16::try_from(crate::daemon::NFS_PORT.load(std::sync::atomic::Ordering::Acquire))

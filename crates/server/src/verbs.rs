@@ -10006,18 +10006,27 @@ fn bind_mount(
   }
 }
 
-/// Derived: the bytes of mounts one status report carries — a quarter of the reply's bulk chunk
+/// Derived: the most bytes of mounts one status report carries — a quarter of the reply's bulk chunk
 /// (`BULK_CHUNK_BYTES` / 4), so the mounts never crowd the report's other fields out of the slot; the
 /// rest are counted (`mounts_elided`). Each mount is counted at its whole encoding (its attachment, its path's length
-/// prefix and its path), not its path alone: counted by path, 400 short mounts outgrew the reply (A-267, 2026-11-17).
+/// prefix and its path), not its path alone, and the mounts take no more than the room the rest of the report leaves
+/// (A-267, 2026-11-18): a long name can leave less than this.
 const MOUNTS_REPORT_BYTES: usize = 1024;
 
+/// Format: the watcher text of a status of a volume with no base (a scratch volume, a clone of one).
+const WATCHER_SCRATCH: &str = "scratch";
+/// Format: the watcher text of a status whose base could not be read now.
+const WATCHER_UNAVAILABLE: &str = "unavailable";
+/// Format: the watcher text of a green's or a work volume's status (`crate::merge_service`).
+pub(crate) const WATCHER_MERGE: &str = "merge";
+
 /// The volume's bound host mounts for its status (§4.4 `Bound`; GAP-A9-4): each `Consumer::Bridge`
-/// attachment whose form is a chosen path, as many as the mount budget carries (in id order), and the
+/// attachment whose form is a chosen path, as many as `budget` bytes carry (in id order), and the
 /// count of those it did not.
 fn mounts_of(
   state: &ShardState,
   volume: DbVolumeId,
+  budget: usize,
 ) -> (Vec<slates_ipc::protocol::MountReport>, u32) {
   let mut mounts = Vec::new();
   let mut elided = 0u32;
@@ -10034,7 +10043,7 @@ fn mounts_of(
       path: path.to_owned(),
     };
     let bytes = encoded_len(&mount);
-    if carried.saturating_add(bytes) > MOUNTS_REPORT_BYTES {
+    if carried.saturating_add(bytes) > budget {
       elided = elided.saturating_add(1);
       continue;
     }
@@ -10763,7 +10772,6 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
     return forbidden("status");
   }
   let transports = crate::transports::report(&crate::transports::situation(state, &rights));
-  let (mounts, mounts_elided) = mounts_of(state, record.id);
   let Ok(slot) = state.volumes.get_mut(handle) else {
     return refused(Refusal::NotFound);
   };
@@ -10781,7 +10789,7 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
   // same entries in both, filled as far as one reply holds (A-267).
   let read = drift_entries(slot, &mut state.store);
   let attachments = state.db.partition().attachments_of(record.id).len();
-  let reply = ReplyBody::Status {
+  let mut reply = ReplyBody::Status {
     report: Box::new(StatusReport {
       id: volume,
       name: record.name.clone(),
@@ -10801,8 +10809,8 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
         .ok()
         .filter(|port| *port != 0),
       transports: Box::new(transports),
-      mounts,
-      mounts_elided,
+      mounts: Vec::new(),
+      mounts_elided: 0,
       journal,
       takeover_kept,
       base: read.base.clone(),
@@ -10810,6 +10818,12 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
       drifted_elided: 0,
     }),
   };
+  // The mounts, then the drift, each in the room the report leaves (A-267): the mounts up to their budget.
+  let room = reply_room(&reply);
+  if let ReplyBody::Status { report } = &mut reply {
+    (report.mounts, report.mounts_elided) =
+      mounts_of(state, record.id, room.min(MOUNTS_REPORT_BYTES));
+  }
   with_drift(reply, read)
 }
 
@@ -10944,7 +10958,7 @@ fn drift_entries(slot: &mut VolumeSlot, store: &mut slates_vfs::volume::Store) -
   let Some(host) = slot.host.as_mut() else {
     return DriftRead {
       items: Vec::new(),
-      watcher: "scratch".to_owned(),
+      watcher: WATCHER_SCRATCH.to_owned(),
       base: None,
       refused: None,
     };
@@ -10988,7 +11002,7 @@ fn drift_entries(slot: &mut VolumeSlot, store: &mut slates_vfs::volume::Store) -
     }
     Err(refusal) => DriftRead {
       items: Vec::new(),
-      watcher: "unavailable".to_owned(),
+      watcher: WATCHER_UNAVAILABLE.to_owned(),
       base: Some(BaseReport::Unreadable),
       refused: Some(refusal),
     },
@@ -12103,7 +12117,7 @@ fn refused_before_dispatch(
       ),
     });
   }
-  if new_volume_name(body).is_some_and(|name| name.len() > longest_listable_name()) {
+  if new_volume_name(body).is_some_and(|name| name.len() > longest_name()) {
     return Some(Refusal::InvalidName);
   }
   match body {
@@ -12208,6 +12222,112 @@ fn longest_listable_name() -> usize {
     .max()
     .unwrap_or(0);
   list_page_room().saturating_sub(unnamed)
+}
+
+/// Derived: the longest volume name, in bytes, every reply that names the volume holds: the lesser of what a listing
+/// page leaves a summary's name ([`longest_listable_name`], A-263) and what a status leaves its name beside its other
+/// fields at their widest ([`longest_statused_name`], A-267). A create refuses a longer name `InvalidName` before
+/// anything is made. Read once: it is a function of the wire's shapes and the reply chunk alone.
+fn longest_name() -> usize {
+  static LONGEST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+  *LONGEST.get_or_init(|| longest_listable_name().min(longest_statused_name()))
+}
+
+/// Derived: the longest name a status holds beside its other fields at their widest on any host (A-267): a reply
+/// chunk less the widest status with an empty name ([`widest_unnamed_status`]). The status's two lists, its mounts and
+/// its drift, are carried in the room it leaves and counted past it, so they take none here. Bounded by the listing
+/// alone, a volume was created and listed under a name of 4,012 bytes whose status was refused "reply too large for
+/// the bulk area" (`crates/server/tests/reply_bounds.rs`, 2026-11-18).
+fn longest_statused_name() -> usize {
+  reply_room(&ReplyBody::Status {
+    report: Box::new(widest_unnamed_status()),
+  })
+}
+
+/// Format: a status at its widest but for its name and the two lists it carries as far as its room allows (its mounts,
+/// its drift): every optional field present, every number at its largest, the watcher's text at the longest a status
+/// writes, the transports at their widest on any host (`crate::transports::widest_report`), the base read, and a
+/// takeover reported. The literal names every field, so a field appended to the report does not compile until it is
+/// given its widest here.
+fn widest_unnamed_status() -> StatusReport {
+  use slates_ipc::protocol::{
+    BaseReport, JournalReport, LossReport, PlacedState, VolumeTakeover, WatcherState,
+  };
+  StatusReport {
+    id: VolumeId::default(),
+    name: String::new(),
+    referenced_bytes: u64::MAX,
+    unique_bytes: u64::MAX,
+    lease_epoch: Some(u64::MAX),
+    attachments: u32::MAX,
+    head: SnapshotId { value: u64::MAX },
+    drifted: Vec::new(),
+    watcher: longest_watcher_text(),
+    snapshots: u32::MAX,
+    placed: PlacedState {
+      region: true,
+      mirror_age_ns: Some(u64::MAX),
+      host_epoch: u64::MAX,
+    },
+    nfs_port: Some(u16::MAX),
+    transports: Box::new(crate::transports::widest_report()),
+    mounts: Vec::new(),
+    mounts_elided: u32::MAX,
+    journal: JournalReport {
+      budget_bytes: u64::MAX,
+      retained_bytes: u64::MAX,
+      retained_records: u64::MAX,
+      mean_record_bytes: u64::MAX,
+      appended: u64::MAX,
+      dropped: u64::MAX,
+      rounds: u64::MAX,
+      overruns: u64::MAX,
+      largest_records: u64::MAX,
+      largest_bytes: u64::MAX,
+      largest_lag_ns: u64::MAX,
+      longest_lag_ns: u64::MAX,
+      readers: u64::MAX,
+      slowest_reader_behind: u64::MAX,
+      grown_bytes: u64::MAX,
+      growth_refused: u64::MAX,
+    },
+    takeover_kept: u32::MAX,
+    base: Some(BaseReport::Read {
+      drifted: Vec::new(),
+      unverified: Vec::new(),
+      watcher: WatcherState::Unavailable,
+    }),
+    loss: LossReport {
+      at_risk_ns: Some(u64::MAX),
+      placed_sequence: Some(u64::MAX),
+      live_shipped: true,
+      taken_over: Some(VolumeTakeover {
+        epoch: u64::MAX,
+        from_live_log: true,
+        head_sequence: u64::MAX,
+      }),
+    },
+    drifted_elided: u32::MAX,
+  }
+}
+
+/// Format: the longest watcher text a status writes: a scratch volume's, an unreadable base's, a merge volume's, or a
+/// base watcher's state by name (`drift_entries`).
+fn longest_watcher_text() -> String {
+  use slates_vfs::host::WatchState;
+  [WATCHER_SCRATCH, WATCHER_UNAVAILABLE, WATCHER_MERGE]
+    .map(str::to_owned)
+    .into_iter()
+    .chain(
+      [
+        WatchState::Live,
+        WatchState::Overflowed,
+        WatchState::Unavailable,
+      ]
+      .map(|state| format!("{state:?}")),
+    )
+    .max_by_key(String::len)
+    .unwrap_or_default()
 }
 
 /// Format: every recovery cause with its text empty: the fixed part of the cause a listed volume may carry, which the

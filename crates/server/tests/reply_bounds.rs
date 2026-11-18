@@ -266,42 +266,123 @@ fn a_granted_landing_on_more_conflicts_than_one_reply_holds_is_refused_typed() {
   daemon.stop();
 }
 
-/// A-267 (§4.4 `status`, GAP-A9-4). Do: bind 400 host mounts of one volume, each at a path of two to four bytes, then
-/// ask the volume's status. Expect: the status answered, carrying some mounts and counting the rest, the two making 400.
-/// Before, the mounts' budget (a quarter of a reply) counted their paths' bytes alone and not each entry's own (its
-/// attachment and its length prefix, twelve bytes), so short mounts outgrew the reply four times over.
+/// Shape: the bytes of each mount path the mounts test binds: long enough that a few outgrow the status's mount budget.
+const MOUNT_PATH_BYTES: usize = 160;
+
+/// A scratch volume of `name`.
+fn scratch(client: &mut Client, name: &str) -> Result<VolumeId, ClientError> {
+  client.create(&CreateSpec {
+    name: name.into(),
+    size: SizeClass::Bounded {
+      limit: OVERLAY_BYTES,
+    },
+    names: NamePolicy::Exact,
+    require_locked: false,
+    base: None,
+  })
+}
+
+/// Binds host mounts of `volume` at paths of [`MOUNT_PATH_BYTES`] until the partition's attachment table is full (its
+/// own bound: refused `TableAtCapacity`): the mounts bound.
+fn bind_mounts_to_capacity(client: &mut Client, volume: VolumeId) -> usize {
+  for n in 0.. {
+    let attached = match client.attach_mount(volume, Intent::Read) {
+      Ok(attached) => attached,
+      Err(ClientError::Refused(Refusal::TableAtCapacity { table })) if table == "attachments" => {
+        return n;
+      }
+      Err(other) => panic!("mount {n}: {other:?}"),
+    };
+    let path = format!("/{n:04}-{}", "m".repeat(MOUNT_PATH_BYTES - 6));
+    let bound = client.call(&RequestBody::BindMount {
+      attachment: attached.attachment,
+      path,
+    });
+    assert!(matches!(bound, Ok(ReplyBody::MountBound)), "{bound:?}");
+  }
+  panic!("the attachment table is bounded")
+}
+
+/// A-267 (§4.4 `status`, GAP-A9-4). Do: bind host mounts of one volume at paths of 160 bytes until the attachment
+/// table refuses one more, then ask the volume's status. Expect: the status answered, carrying some mounts and counting
+/// the rest, the two making every mount bound. The mount budget (a quarter of a reply) counts each mount's whole
+/// encoding; it counted paths alone before, which at the table's bound overshot the budget by twelve bytes a mount and
+/// was never refused, since the drift is carried in what room the rest leaves.
 #[test]
 fn a_status_with_more_mounts_than_its_budget_holds_is_answered() {
   let (daemon, instance) = daemon("mounts");
   let mut client = connect(&instance);
-  let volume = client
-    .create(&CreateSpec {
-      name: "mounted".into(),
-      size: SizeClass::Bounded {
-        limit: OVERLAY_BYTES,
-      },
-      names: NamePolicy::Exact,
-      require_locked: false,
-      base: None,
-    })
-    .unwrap();
-  for n in 0..MANY {
-    let attached = client.attach_mount(volume, Intent::Read).unwrap();
-    let bound = client.call(&RequestBody::BindMount {
-      attachment: attached.attachment,
-      path: format!("/{n}"),
-    });
-    assert!(matches!(bound, Ok(ReplyBody::MountBound)), "{bound:?}");
-  }
+  let volume = scratch(&mut client, "mounted").unwrap();
+  let bound = bind_mounts_to_capacity(&mut client, volume);
+  eprintln!("mounts bound to the attachment table's bound: {bound}");
   let report = client.status(volume);
   let Ok(report) = report else {
     panic!("the status is answered: {report:?}");
   };
   assert!(
     report.mounts_elided > 0,
-    "the test outgrows the mounts' budget"
+    "the test outgrows the mounts' budget: {bound} bound"
   );
-  assert_eq!(report.mounts.len() + report.mounts_elided as usize, MANY);
+  assert_eq!(report.mounts.len() + report.mounts_elided as usize, bound);
+  drop(client);
+  daemon.stop();
+}
+
+/// Shape: a name length no create accepts: a reply chunk's whole size, past what a create's request carries.
+const NAME_PAST_EVERY_BOUND: usize = 4096;
+
+/// The longest name a create accepts, found by asking: a name one byte longer is refused `InvalidName`, or is more than
+/// the create's request carries (`PayloadTooLarge`). Every create that succeeds on the way makes a scratch volume of its
+/// own name.
+fn longest_accepted_name(client: &mut Client) -> String {
+  let (mut accepted, mut refused) = (1usize, NAME_PAST_EVERY_BOUND);
+  while refused - accepted > 1 {
+    let middle = accepted + (refused - accepted) / 2;
+    match scratch(client, &"n".repeat(middle)) {
+      Ok(_) => accepted = middle,
+      Err(
+        ClientError::Refused(Refusal::InvalidName)
+        | ClientError::Ipc(slates_ipc::error::IpcError::PayloadTooLarge { .. }),
+      ) => refused = middle,
+      Err(other) => panic!("a create of a {middle}-byte name: {other:?}"),
+    }
+  }
+  "n".repeat(accepted)
+}
+
+/// A-263, A-267 (§4.4 `create`, `list`, `status`). Do: find the longest name a create accepts (one byte longer is
+/// refused `InvalidName`), then list the volume made under it and ask its status, bare and then with host mounts bound
+/// to the attachment table's bound. Expect: listed and answered each time, the name whole. A create bounds a name so
+/// every reply that names the volume holds it; a status names it beside its other fields.
+#[test]
+fn a_volume_under_the_longest_name_a_create_accepts_is_listed_and_statused() {
+  let (daemon, instance) = daemon("longest-name");
+  let mut client = connect(&instance);
+  let name = longest_accepted_name(&mut client);
+  eprintln!("the longest name a create accepts: {} bytes", name.len());
+  let volume = client
+    .list()
+    .unwrap()
+    .into_iter()
+    .find(|summary| summary.name == name)
+    .map(|summary| summary.id)
+    .expect("the volume under the longest name is listed");
+  let bare = client.status(volume);
+  assert!(
+    bare.as_ref().is_ok_and(|report| report.name == name),
+    "a {}-byte name's status: {bare:?}",
+    name.len()
+  );
+  let bound = bind_mounts_to_capacity(&mut client, volume);
+  let mounted = client.status(volume);
+  assert!(
+    mounted
+      .as_ref()
+      .is_ok_and(|report| report.name == name
+        && report.mounts.len() + report.mounts_elided as usize == bound),
+    "a {}-byte name's status beside {bound} mounts: {mounted:?}",
+    name.len()
+  );
   drop(client);
   daemon.stop();
 }

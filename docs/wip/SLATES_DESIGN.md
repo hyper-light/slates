@@ -23630,7 +23630,9 @@ as a chain), `crates/server/tests/volume_list.rs`, `crates/cli/tests/cli.rs`, bo
   replaced, not joined by a second verb.
 - **And a name bound:** a `create` carried names up to 4,062 bytes, whose summary no page held. A new volume's name is
   refused `InvalidName` past the longest whose summary one page holds alone (4,012 bytes, derived from the page's room
-  with room for a recovery cause's fixed part), so every volume a client can create is one it can list. An unrecovered
+  with room for a recovery cause's fixed part), so every volume a client can create is one it can list. Since
+  2026-11-18 it is also no longer than a status holds beside its other fields at their widest, 2,931 bytes (A-267, "A
+  name every reply holds"). An unrecovered
   volume's cause (B8's `not_recovered`: a base's path, a host's refusal) is cut to what the page holds beside it; the
   record and `NotRecovered` keep it whole, a base path bounded at `create` by the platform's maximum and the refusal's
   room (1,023 bytes on macOS, 3,812 on Linux and Windows; `BaseUnavailable` with `ENAMETOOLONG` past it) and a reason,
@@ -23739,7 +23741,12 @@ Applied in the same change to: §4.12 (the SDKs' `status`), `crates/ipc/src/prot
 `Drifted { volume, after }`, `Drifted { drifted, unverified, next, oversized }`), `crates/server/src/verbs.rs` (`with_drift`,
 `drift_entries`, `drifted`), `crates/client/src/client.rs` (`Client::drifted`), `crates/cli/src/verbs.rs`,
 `crates/mcp/src/lib.rs`, both SDKs, `crates/merge/src/engine.rs` (`base_at` and `current_base`'s docs, stale since every
-dimension was read from its history), GAPS, `docs/bugs/2026-11-08-a-status-with-much-drift-outgrew-one-reply.md`.
+dimension was read from its history), GAPS, `docs/bugs/2026-11-08-a-status-with-much-drift-outgrew-one-reply.md`; and
+since 2026-11-17 to `crates/server/src/{verbs,landing,merge_service,state,snapshot_view,transports}.rs` (the carried
+lists, the kept verdicts, `longest_name`, `widest_report`), `crates/vfs/src/base.rs` (`drift_page`,
+`read_base_range`), `crates/db/src/{partition,art}.rs` (the seeks), `crates/client`, `crates/api` (`CONTRACT` 11 to
+14), `docs/bugs/2026-11-17-lists-a-verbs-own-reply-carries-outgrew-one-reply.md` and
+`docs/bugs/2026-11-18-a-volume-under-the-longest-name-could-not-be-statused.md`.
 - **Status stays one reply:** it carries the first drifted entries that fit beside its other fields and counts the rest.
 - **A paged read:** `Drifted` from a position, an entry too long for any page passed over and counted. Since the drift
   travels typed (A-299's `StatusReport::base`, 2026-11-18), a page is typed the same way (`Drifted { drifted:
@@ -23773,8 +23780,10 @@ dimension was read from its history), GAPS, `docs/bugs/2026-11-08-a-status-with-
   `LandingConflict::entries_elided` (presenting again lists them). Two siblings the same sweep found:
   `LandingOutcome::degraded_elided`, since a host that refuses every directory's sync meets a degraded cell a directory
   and a finished landing's reply outgrew a chunk after the landing ran (`landing::landed_reply`); and a status's mount
-  budget, which counted each mount's path and not its whole encoding (twelve bytes more), so 400 short mounts outgrew
-  the status reply. The client, the CLI, MCP, both SDKs and `slates-api` carry the counts (`CONTRACT` = 12:
+  budget, which counted each mount's path and not its whole encoding (twelve bytes more). The mounts were never a
+  refusal: a partition holds a bounded number of attachments (`PartitionCaps::attachments`), and the 400-mount test met
+  that bound before any status (corrected 2026-11-18). The client, the CLI, MCP, both SDKs and `slates-api` carry the
+  counts (`CONTRACT` = 12:
   `Rewitnessed`, `Stale::Disk::elided`, `LandingReport::degraded_elided`; a presentation is clean only when it carries
   and counts no conflict).
 - **A merge verdict's windows (2026-11-17, goal g247):** `Submitted` and `Rebased` carried every conflict window and
@@ -23792,9 +23801,19 @@ dimension was read from its history), GAPS, `docs/bugs/2026-11-08-a-status-with-
   synchronously and as a chain under the call's word (`VerdictChain`), so `Submitted::Conflict` and
   `Rebased::Conflict` hold every window and no consumer changed; `slates-api` maps `VerdictReplaced` to
   `Stale::Verdict` (`CONTRACT` = 13).
+- **A name every reply holds (2026-11-18, goal g247):** A-263 bounded a new volume's name by the listing alone (4,012
+  bytes). A status names the volume beside its transports, journal, loss window and mounts, so a volume under such a
+  name was listed and its status refused "reply too large for the bulk area" (reproduced by use,
+  `a_volume_under_the_longest_name_a_create_accepts_is_listed_and_statused`). A name is now bounded by the lesser of
+  the two (`longest_name`). The status's share is a chunk less `widest_unnamed_status`: every field at its widest, the
+  host facts cut at `HOST_FACT_BYTES` (255, macOS's `uname` field), and the transports of the widest situation on any
+  platform, each entry refused with a reason (`transports::widest_report`). That is 2,931 bytes on every host. A
+  status's mounts take no more than the room the rest of its report leaves, then its drift what is left
+  (`docs/bugs/2026-11-18-a-volume-under-the-longest-name-could-not-be-statused.md`).
 - **The byte lists (2026-11-17, goal g247):** `read_base` read the whole base file into the daemon's memory and
-  answered it in one reply, refused past about four kilobytes (`crates/server/tests/base_read_pages.rs`), so an agent
-  reconciling a drifted entry could read no real file. It is answered a page at a time from the volume core's
+  answered it in one reply, refused past about four kilobytes (`crates/server/tests/base_read_pages.rs`; its whole
+  read of 100 KiB, run on main 843f527ff on 2026-11-18, answered `Refused(BadRequest { reason: "reply too large for
+  the bulk area" })`), so an agent reconciling a drifted entry could read no real file. It is answered a page at a time from the volume core's
   `Overlay::read_base_range` (the bytes from an offset, the file's size and a stamp of its fingerprint: device,
   inode, size, modification, change and birth times, folded by BLAKE3), and the client walks the pages as `read` walks
   `ReadRange`'s, refusing a mix of two states. The whole-file `Read` verb, a second read path beside the paged

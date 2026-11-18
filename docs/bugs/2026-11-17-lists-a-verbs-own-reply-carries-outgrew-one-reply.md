@@ -60,10 +60,13 @@ A-267's first part bounded a status's drift; these four ride in the reply of a v
   hundred directories answered "reply too large" after it had run. `landing::landed_reply` carries what fits and
   `degraded_elided` counts the rest; read by every surface (the CLI's line, MCP's and the Node SDK's field,
   `slates-api`'s `LandingReport::degraded_elided`). Its unit test builds 400 such cells.
-- **A status's mounts**, fixed here: the budget (a quarter of a reply) counted each mount's path and not its whole
-  encoding (its attachment and its length prefix, twelve bytes more), so 400 mounts at paths of two to four bytes
-  outgrew the status reply. `mounts_of` now counts each mount's encoding. Reproduced by use
-  (`a_status_with_more_mounts_than_its_budget_holds_is_answered`).
+- **A status's mounts**, corrected here: the budget (a quarter of a reply) counted each mount's path and not its whole
+  encoding (its attachment and its length prefix, twelve bytes more). `mounts_of` now counts each mount's encoding.
+  **Not reproduced (corrected 2026-11-18):** the 400-mount test met the attachment table's own bound
+  (`TableAtCapacity { table: "attachments" }`) at an attach, before the status, in its red run and its green one alike.
+  At that bound the overshoot was at most twelve bytes a mount, which the drift's room absorbs, so no status was
+  refused. See `docs/bugs/2026-11-18-a-volume-under-the-longest-name-could-not-be-statused.md`, which rewrote the test to
+  the table's bound and found the long name a status could not hold.
 - **`read_base` and the whole-file `Read`**, fixed in a later change: each read a whole file into the daemon's memory
   and answered it in one reply, refused past about four kilobytes. `read_base` is paged with a stamp
   (`crates/server/tests/base_read_pages.rs`); `Read`, a second path beside the paged `ReadRange`, is removed.
