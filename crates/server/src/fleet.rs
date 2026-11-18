@@ -8502,6 +8502,9 @@ fn reconcile_council_membership(s: &mut ShardState) {
   // (docs/bugs/2026-09-22-council-seats-follow-id-order-not-liveness.md).
   let voting: Vec<HostId> = alive.iter().map(|(host, _)| *host).collect();
   s.council.reconcile_voters(&voting);
+  // Once no change is in flight, the voters in force go into the configuration, so a learner learns them by its version
+  // (A-380): a seat change alone moves none.
+  s.council.record_voters();
 }
 
 /// One period as the council **leader**: reconcile the membership ([`reconcile_council_membership`]),

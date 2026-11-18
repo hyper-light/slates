@@ -336,18 +336,23 @@ impl std::fmt::Debug for Doorbell {
 }
 
 impl Doorbell {
-  /// Rings.
-  pub fn ring(&self) -> Result<(), IpcError> {
+  /// Rings for the client of `shard`, the shard its region names (A-381): only that shard is woken. On Linux the
+  /// descriptor is that shard's own kick, so the name is already in it; on macOS and Windows the ring marks the shard
+  /// in the bootstrap object before it wakes the daemon's doorbell thread, which kicks the shards marked and no other.
+  pub fn ring(&self, shard: u16) -> Result<(), IpcError> {
     match self {
       #[cfg(target_os = "linux")]
-      Doorbell::Eventfd(fd) => rustix::io::write(fd, &1u64.to_ne_bytes())
-        .map(|_| ())
-        .map_err(|e| IpcError::OsRefused {
-          call: "eventfd write",
-          code: Some(e.raw_os_error()),
-        }),
+      Doorbell::Eventfd(fd) => {
+        let _ = shard;
+        rustix::io::write(fd, &1u64.to_ne_bytes())
+          .map(|_| ())
+          .map_err(|e| IpcError::OsRefused {
+            call: "eventfd write",
+            code: Some(e.raw_os_error()),
+          })
+      }
       #[cfg(any(target_os = "macos", windows))]
-      Doorbell::Word(bell) => bell.ring(),
+      Doorbell::Word(bell) => bell.ring_for(shard),
       #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
       _ => Err(IpcError::Unsupported {
         feature: "the doorbell",
@@ -382,11 +387,26 @@ impl DoorbellWaiter {
     self.inner.wait(seen, timeout_ns)
   }
 
-  /// Rings the doorbell as a client does: bumps the word and wakes the waiting thread (the daemon
-  /// rings it to stop its own thread).
+  /// Rings the doorbell with nothing marked: bumps the word and wakes the waiting thread, which kicks no shard (the
+  /// daemon rings it to stop its own thread).
   pub fn ring(&self) -> Result<(), IpcError> {
     self.inner.ring()
   }
+
+  /// What the rings since the last call asked for, taken (A-381): whether a claim rang, and each shard a client rang
+  /// for, each once however often it rang. The thread calls it once the word has moved.
+  pub fn take_pending(&self) -> Result<Pending, IpcError> {
+    self.inner.take_pending()
+  }
+}
+
+/// What the doorbell's rings asked of the daemon since its thread last looked (A-381).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Pending {
+  /// A client's claim rang: the control shard, which answers claims, is to be kicked.
+  pub claim: bool,
+  /// The shards a client rang for, each once, in ascending order: the shard each client's region names.
+  pub shards: Vec<u16>,
 }
 
 /// Shape: how long a client waits for the daemon to answer a claim before reporting it unavailable
@@ -758,6 +778,10 @@ pub mod platform {
     }
 
     pub(super) fn ring(&self) -> Result<(), IpcError> {
+      match *self {}
+    }
+
+    pub(super) fn take_pending(&self) -> Result<super::Pending, IpcError> {
       match *self {}
     }
   }
@@ -2731,7 +2755,7 @@ pub mod platform {
 pub mod platform {
   //! macOS and Windows: the bootstrap object with claim slots.
 
-  use std::sync::atomic::{AtomicU32, Ordering};
+  use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
   use slates_mem::{Handoff, SharedObject, Width, WordRun, Words};
 
@@ -2741,17 +2765,22 @@ pub mod platform {
   #[cfg(not(windows))]
   use crate::wake;
 
-  /// Format: the bootstrap object's magic, `SLBT` in little-endian ASCII.
-  const MAGIC: u32 = 0x5442_4C53;
-  /// Format: the bootstrap header: magic (4), slots (4), the daemon-wide doorbell word (4),
-  /// padding (4), the daemon's start stamp (8), padding (4), the holding anchor's process id (4),
-  /// padding to a cache line. The padding after the stamp held the daemon's process id until A-159: a client judges the
-  /// daemon that answered its claim by the pid in the answer (A-143), so the header's copy had no reader left.
+  /// Format: the bootstrap object's magic, `SLB2` in little-endian ASCII: the layout with the rings' marks (A-381). The
+  /// layout before it, `SLBT`, had no marks, and a client of it rings without naming its shard, so an object or a client
+  /// of either layout is refused by the other as another layout, never served with its rings unheard.
+  const MAGIC: u32 = 0x3242_4C53;
+  /// Format: the bootstrap header: magic (4), slots (4), the daemon-wide doorbell word (4), the claim's mark (4,
+  /// A-381), the daemon's start stamp (8), padding (4), the holding anchor's process id (4), padding to a cache line.
+  /// The padding after the stamp held the daemon's process id until A-159: a client judges the daemon that answered its
+  /// claim by the pid in the answer (A-143), so the header's copy had no reader left.
   const HEADER_BYTES: usize = 64;
   /// Format: the slot count's offset in the header (after the magic).
   const AT_SLOT_COUNT: usize = 4;
   /// Format: the doorbell word's offset in the header.
   pub const AT_DOORBELL: usize = 8;
+  /// Format: the claim's mark in the header (A-381): a client's claim sets it before it rings, and the doorbell thread
+  /// kicks the control shard, which answers claims, only when it finds it set.
+  const AT_CLAIM_RUNG: usize = 12;
   /// Format: the start stamp's offset in the header: the wall clock in nanoseconds when the
   /// daemon opened the object, so a client that remembers it tells a restarted daemon (a new
   /// stamp) from a slow one (the same stamp).
@@ -3009,6 +3038,44 @@ pub mod platform {
       Ok(self.object.atomic_u32(AT_DOORBELL)?)
     }
 
+    /// Rings for the client of `shard` (A-381): marks the shard pending, its pending word in the summary, then rings.
+    /// The marks come before the word moves, so the thread that sees the word move finds them.
+    pub(super) fn ring_for(&self, shard: u16) -> Result<(), IpcError> {
+      let (word, bit) = word_and_bit(usize::from(shard));
+      mark(&self.object, AT_PENDING, word)?.fetch_or(bit, Ordering::Release);
+      let (summary, summary_bit) = word_and_bit(word);
+      mark(&self.object, AT_SUMMARY, summary)?.fetch_or(summary_bit, Ordering::Release);
+      self.ring()
+    }
+
+    /// Rings for a claim (A-381): marks the claim, then rings.
+    pub(super) fn ring_claim(&self) -> Result<(), IpcError> {
+      self
+        .object
+        .atomic_u32(AT_CLAIM_RUNG)?
+        .store(1, Ordering::Release);
+      self.ring()
+    }
+
+    /// What the rings since the last call marked, taken (A-381): the claim's mark, and each shard marked, found
+    /// through the summary words, so only a pending word a ring touched is read.
+    pub(super) fn take_pending(&self) -> Result<super::Pending, IpcError> {
+      let claim = self
+        .object
+        .atomic_u32(AT_CLAIM_RUNG)?
+        .swap(0, Ordering::AcqRel)
+        != 0;
+      let mut shards = Vec::new();
+      for summary in 0..SUMMARY_WORDS {
+        let touched = mark(&self.object, AT_SUMMARY, summary)?.swap(0, Ordering::AcqRel);
+        for word in set_bits(summary, touched) {
+          let bits = mark(&self.object, AT_PENDING, word)?.swap(0, Ordering::AcqRel);
+          shards.extend(set_bits(word, bits).filter_map(|shard| u16::try_from(shard).ok()));
+        }
+      }
+      Ok(super::Pending { claim, shards })
+    }
+
     /// Rings: bumps the word, then wakes the waiting thread.
     pub(super) fn ring(&self) -> Result<(), IpcError> {
       let word = self.word()?;
@@ -3043,15 +3110,32 @@ pub mod platform {
   /// The daemon's doorbell waiter is the bell itself.
   pub type DoorbellWaiter = Bell;
 
-  /// Format: the bootstrap object's length: the header and the claim slots.
-  const OBJECT_BYTES: usize = HEADER_BYTES + SLOTS * SLOT_BYTES;
+  /// Format: the bits one mark word, a `u64`, holds.
+  const MARK_BITS: usize = 64;
+  /// Format: a mark word's bytes.
+  const MARK_BYTES: usize = size_of::<u64>();
+  /// Format: the shard ids a ring can mark (A-381): a region names its shard as a `u16` (`crate::region`), so every id
+  /// has a bit and no shard a ring names is ever left unmarked.
+  const SHARD_IDS: usize = 1 << u16::BITS;
+  /// Format: the pending words, a bit a shard id (A-381).
+  const PENDING_WORDS: usize = SHARD_IDS / MARK_BITS;
+  /// Format: the summary words, a bit a pending word, so the doorbell thread takes only the pending words a ring
+  /// touched and not all of them at every ring.
+  const SUMMARY_WORDS: usize = PENDING_WORDS / MARK_BITS;
+  /// Format: the summary's offset, after the claim slots.
+  const AT_SUMMARY: usize = HEADER_BYTES + SLOTS * SLOT_BYTES;
+  /// Format: the pending words' offset, after the summary.
+  const AT_PENDING: usize = AT_SUMMARY + SUMMARY_WORDS * MARK_BYTES;
+  /// Format: the bootstrap object's length: the header, the claim slots, the summary and the pending words.
+  const OBJECT_BYTES: usize = AT_PENDING + PENDING_WORDS * MARK_BYTES;
 
-  /// The bootstrap object's declared atomic words (AUD-29-09): the doorbell, the start stamp (the
-  /// header's publication word) and every claim slot's state word; the rest is plain, owned by whichever
-  /// side the slot's state names.
+  /// The bootstrap object's declared atomic words (AUD-29-09): the doorbell, the claim's mark, the start stamp (the
+  /// header's publication word), every claim slot's state word, and the rings' marks (A-381); the rest is plain, owned
+  /// by whichever side the slot's state names.
   fn bootstrap_words() -> Words {
     Words::new()
       .with(WordRun::one(AT_DOORBELL, Width::U32))
+      .with(WordRun::one(AT_CLAIM_RUNG, Width::U32))
       .with(WordRun::one(AT_GENERATION, Width::U64))
       .with(WordRun::strided(
         HEADER_BYTES + AT_STATE,
@@ -3059,6 +3143,53 @@ pub mod platform {
         SLOTS,
         Width::U32,
       ))
+      .with(WordRun::strided(
+        AT_SUMMARY,
+        MARK_BYTES,
+        SUMMARY_WORDS,
+        Width::U64,
+      ))
+      .with(WordRun::strided(
+        AT_PENDING,
+        MARK_BYTES,
+        PENDING_WORDS,
+        Width::U64,
+      ))
+  }
+
+  /// The mark word at `index` of the run at `first`.
+  fn mark(object: &SharedObject, first: usize, index: usize) -> Result<&AtomicU64, IpcError> {
+    let offset = index
+      .checked_mul(MARK_BYTES)
+      .and_then(|bytes| bytes.checked_add(first))
+      .ok_or(IpcError::Layout {
+        reason: "a ring's mark past the bootstrap object",
+      })?;
+    Ok(object.atomic_u64(offset)?)
+  }
+
+  /// The word and the bit within it that stand for `index` among words of [`MARK_BITS`] bits.
+  fn word_and_bit(index: usize) -> (usize, u64) {
+    let word = index.checked_div(MARK_BITS).unwrap_or(0);
+    let bit = index.checked_rem(MARK_BITS).unwrap_or(0);
+    (
+      word,
+      1u64
+        .checked_shl(u32::try_from(bit).unwrap_or(0))
+        .unwrap_or(0),
+    )
+  }
+
+  /// Each index whose bit is set in `bits`, the word's `word`th, ascending.
+  fn set_bits(word: usize, mut bits: u64) -> impl Iterator<Item = usize> {
+    std::iter::from_fn(move || {
+      if bits == 0 {
+        return None;
+      }
+      let low = usize::try_from(bits.trailing_zeros()).unwrap_or(0);
+      bits &= bits.wrapping_sub(1);
+      word.checked_mul(MARK_BITS)?.checked_add(low)
+    })
   }
 
   fn slot_at(index: usize) -> usize {
@@ -3720,7 +3851,7 @@ pub mod platform {
     let bell = SharedObject::open(&handoff, OBJECT_BYTES, bootstrap_words())
       .map_err(IpcError::from)
       .and_then(|mapping| Bell::new(mapping, instance));
-    let bell = match bell.and_then(|bell| bell.ring().map(|()| bell)) {
+    let bell = match bell.and_then(|bell| bell.ring_claim().map(|()| bell)) {
       Ok(bell) => bell,
       Err(error) => {
         // The claim cannot be announced: give the slot back rather than leave it claimed.
@@ -3932,6 +4063,35 @@ pub mod platform {
       SharedObject::open(&handoff, OBJECT_BYTES, bootstrap_words()).unwrap()
     }
 
+    /// A-381 (§4.7, D-10). Do: clients ring for shards 3, 64, 3 again and 65,535, the last id a region can name, then a
+    /// claim rings; the daemon's thread takes what the rings marked, then takes again. Expect: the word moved once a
+    /// ring, so the thread is woken for each; the first take holds the claim and exactly shards 3, 64 and 65,535, each
+    /// once, in order; the second holds nothing. Before A-381 a ring marked nothing, and the thread kicked every shard.
+    #[test]
+    fn a_ring_marks_only_the_shard_it_names_and_a_claim_marks_the_claim() {
+      let name = instance("marks");
+      let listener = Listener::open(&name, None).unwrap();
+      let waiter = listener.doorbell_waiter().unwrap().unwrap();
+      let before = waiter.current().unwrap();
+      let bell = Bell::new(client_mapping(&name), &name).unwrap();
+      for shard in [3u16, 64, 3, u16::MAX] {
+        bell.ring_for(shard).unwrap();
+      }
+      bell.ring_claim().unwrap();
+      assert_eq!(waiter.current().unwrap(), before.wrapping_add(5));
+      assert_eq!(
+        waiter.take_pending().unwrap(),
+        crate::rendezvous::Pending {
+          claim: true,
+          shards: vec![3, 64, u16::MAX],
+        }
+      );
+      assert_eq!(
+        waiter.take_pending().unwrap(),
+        crate::rendezvous::Pending::default()
+      );
+    }
+
     /// AUD-29-09 (the claim protocol). Do: a client takes slot 0 `CLAIMING` and has not written its
     /// fields; the daemon accepts; the client writes its wanted id and publishes `CLAIMED`; the daemon
     /// accepts again. Expect: nothing answered while the fields were unwritten (before 2026-09-30 a claim
@@ -4094,6 +4254,10 @@ pub mod platform {
     }
 
     pub(super) fn ring(&self) -> Result<(), IpcError> {
+      match *self {}
+    }
+
+    pub(super) fn take_pending(&self) -> Result<super::Pending, IpcError> {
       match *self {}
     }
   }
