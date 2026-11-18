@@ -861,6 +861,10 @@ pub struct ShardState {
   /// set, the session carrying its other replies as before, as an owner alive but never answering one exchange is to
   /// its asker (`Daemon::inject_forward_silence`). `None` in production.
   pub injected_forward_silence: Option<slates_ipc::protocol::VolumeId>,
+  /// Test support (never reachable from the wire): the successors whose takeover pages and questions by name this
+  /// holder leaves unanswered while set, as a holder cut off from one successor alone is to it: the council never
+  /// retires it, since every other member hears it (`Daemon::inject_takeover_silence`). Empty in production.
+  pub injected_takeover_silence: std::collections::BTreeSet<slates_db::HostId>,
   /// Test support (never reachable from the wire): the peer whose record session is made deaf by the forward lane's next
   /// borrow of it, once (`Daemon::inject_session_deafness`). `None` in production.
   pub injected_deaf_session: Option<slates_db::HostId>,

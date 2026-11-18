@@ -4501,6 +4501,11 @@ async fn adopt_pending_tombstones(origin: u16) {
             if recorded && let Some(placed) = placed {
               s.placed_heads.insert(object, placed);
             }
+            if recorded {
+              // A round that gave the object up waiting for its cohorts' promises, then adopted it under a later
+              // configuration, left its record here (`takeover::give_up_unpromised`); its tombstone answers now.
+              s.unrecovered.remove(&tombstone.volume);
+            }
             recorded
           },
           HEARTBEAT_NS,
@@ -4666,8 +4671,9 @@ impl GreenWait {
 /// Derived: the materialization attempts without progress a taken-over volume or green gets before it is given up on:
 /// the failover SLO's worth of the fleet's periods (`failover_slo_ns / HEARTBEAT_NS`, at least one), each one attempt.
 /// Counted in attempts, not wall time, so a loaded node whose periods run late is given its attempts all the same; the
-/// SLO is the operator's bound on how long a takeover may leave an object unserved (§4.8).
-fn takeover_attempts(failover_slo_ns: u64) -> u32 {
+/// SLO is the operator's bound on how long a takeover may leave an object unserved (§4.8). The same bound counts a
+/// learned object's wait for its recovery cohorts' promises in the takeover round itself (`takeover::PromiseWait`).
+pub(crate) fn takeover_attempts(failover_slo_ns: u64) -> u32 {
   u32::try_from((failover_slo_ns / HEARTBEAT_NS).max(1)).unwrap_or(u32::MAX)
 }
 
