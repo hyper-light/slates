@@ -5680,6 +5680,19 @@ version.
 > read now takes 1.8 to 2.4 ms (`crate::forward_lane`; `forwards_to_one_owner_never_wait_behind_each_other`;
 > `docs/bugs/2026-11-06-forwards-to-one-owner-went-one-at-a-time.md`).
 
+> **Status (2026-11-18, A-306: a resend keeps its place in the lane).** A forward given up at its stall budget, or cut
+> off by its session's replacement, is sent again by its caller under its own ids (`verbs::resolve_and_forward`). Each
+> send took fresh tickets at the back of the peer's lane, so behind a backlog the lane begins more slowly than a stall
+> budget a resend was given up again before it was begun, while forwards first queued after it went ahead: a read
+> through a client node whose session to its owner died was refused `OwnerUnreachable` at its failover bound in 1 of 10
+> runs behind a 256-client burst, and answered after 9.2 and 9.5 s in two more (load 37 to 46). A forward's place is
+> now its first send's ticket, and its resends are queued there (`forward_lane::Place`): the lane begins forwards in
+> the order of their first send. The same read was answered in 4.1 to 6.5 s, 10 of 10 (load 27 to 33).
+> `a_resend_is_begun_ahead_of_every_forward_first_queued_after_it` and its model test hold the order, and
+> `a_read_through_a_dead_session_keeps_its_place_behind_a_burst` the read
+> (`docs/bugs/2026-11-18-a-resent-forward-lost-its-place-in-the-lane.md`). Owed: a forward still queued is given up at
+> its stall budget while its lane moves, so the backlog is cycled once a budget on the control shard (GAPS).
+
 > **Status (2026-10-07, same-region lookups).** A lookup by id now reaches its creator from any node of the
 > creator's own region, not only from another region. Before, the server forwarded only a volume homed in another
 > region, and a client of another node in the owner's region was answered `NotFound` (found on two Docker
@@ -7121,7 +7134,25 @@ command and every host start, mount and grant through one implementation.
 > in-process daemon (`crates/api/tests/api.rs`) and by a test binary that is itself the host
 > (`crates/api/tests/start.rs`, no libtest harness: its `main` serves the roles). Owed, in order:
 > an async form over a host's reactor (R6: a readiness wait and a timer over the client's driver);
-> a seam trait with a simulator and a conformance suite for hosts whose rules ask for one.
+> a seam trait with a simulator and a conformance suite for hosts whose rules ask for one (built 2026-11-18, A-310:
+> "The seam" below).
+
+**The seam (A-310).** A host whose rules reach every other product only through a trait that a simulator implements
+and one conformance suite holds both to (Hex's `CLAUDE.md` §9; kiln's `kiln-seams`) reaches slates through
+`slates_api::Volumes`: the contract's volume verbs (provision from every source, snapshot, destroy a snapshot, destroy,
+list, serve to a Shards VMM, mount, unmount, detach), each with the signature and the types the `Instance` verb of the
+same name has, so it is no second API. `Instance` implements it, and so does `SimVolumes`, an in-memory stand-in that
+answers each verb with the outcome or the typed error an instance answers for the same request: names unique, a clone
+pinning its snapshot, a green over a snapshot holding its volume (A-217), a work only over a green at its first version.
+It serves no file system: a stream it hands out is a real connected pair it never answers until a detach or the volume's
+destroy closes it, and a mount is a record of one. Its tables are bounded by its caller and refuse `Exhausted::Table`
+past that. One flow of the verbs, every outcome and refusal asserted as its typed value, runs over both
+(`crates/api/tests/api.rs`, `the_seam_conforms`).
+
+> **Status (2026-11-18, A-310).** Built: `crates/api/src/seam.rs`, `crates/api/src/sim.rs`, the contract at version 9,
+> and the suite over an in-process instance and over the simulator. A pinned snapshot's destroy reaches a consumer as
+> `Invalid::Request` with the volume core's `Pinned` as its note, untyped; the simulator answers the same, and a typed
+> class for it is owed to the contract.
 
 **The consumer contract (A-299).** Everything a consumer touches goes through `slates-api` (Ada,
 2026-11-18): provisioning and managing volumes, serving them, landing, merging, their conflicts,
@@ -7256,6 +7287,11 @@ it builds against the contract and adds to it rather than around it.
 > secret, a stranger's refused `Unproven`, the daemon killed and restarted by its anchor, and the
 > launcher's next setting verified by the new daemon); an anchor handed garbage or a short record
 > refuses to start.
+> **`CONTRACT` = 8:** an overlay's drift travels typed on the wire (`StatusReport::base`, appended:
+> `BaseReport`, `DriftEntry`, `DriftKind`, `WatcherState`), and the crate reads only that field; its
+> text reader is gone. A green's or a work volume's status had failed as a protocol fault (the merge
+> service names their watcher `merge`), and now reads with no base
+> (`docs/bugs/2026-11-18-a-greens-status-failed-in-the-contract.md`).
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -21590,7 +21626,8 @@ Applied in the same change to:
   `crates/api/src/mount.rs` (with pure `fuse_available`/`nfs_available` tested on every host), `lib.rs`
   (`MountKind`), `docs/library.md`, §4.12's text and status, GAPS.
 - **Owed, in order.** (1) An async form over a host's reactor (R6). (2) A seam trait with a simulator and a
-  conformance suite, for hosts whose rules ask for one (Hex's §9, kiln's `kiln-seams`). A landing plan's per-path
+  conformance suite, for hosts whose rules ask for one (Hex's §9, kiln's `kiln-seams`): built 2026-11-18, A-310. A
+  landing plan's per-path
   entries, paged, were built by A-287 the same day (`Instance::landing_entries`).
 - **Checked.** `crates/api/tests/api.rs` over a daemon in the test process: no daemon is `Unavailable`; a create before
   the group is `ConsensusNotInitialized` and the group is made twice harmlessly; create, snapshot, clone and destroy;
@@ -21969,6 +22006,13 @@ contract", new, with its status), GAPS (the A-299 entry and the Embedding librar
   a short record each refused at the anchor's start). The daemon's verification landed the same hour (A-285's owner,
   0366b68a), and `the_launchers_secret_proves_its_policy_across_a_daemon_restart` proves the whole path by use: the
   daemon killed and restarted by its anchor verifies the launcher's next setting.
+- **Typed drift on the wire, the same day; `CONTRACT` 8.** `StatusReport` gains `base: Option<BaseReport>`, appended
+  (D-15), filled by the status verb from the base plane's own status and `None` from the merge service; the crate reads
+  it and nothing else, and its text reader goes (replaced, not layered). Found by the test first: a green's status
+  failed `Protocol(UnknownName { field: "watcher state" })`, since the merge service names a green's watcher `merge`
+  (`docs/bugs/2026-11-18-a-greens-status-failed-in-the-contract.md`). `DriftReport::watcher` is a `Watcher`. Applied to
+  `crates/ipc/src/protocol.rs`, `crates/server/src/{verbs,merge_service}.rs`, `crates/api/src/{volume,instance,lib}.rs`,
+  `tests/api.rs`.
 - **Checked.** `cargo test -p slates-api` (37 unit, 9 by use, 5 start, 1 doc) and `cargo test -p slates-cli` on
   macOS arm64 (kiln runner, 2026-11-18): the cases in §4.12's status. The Linux and Windows arms of the mount and the
   CLI's Windows unmount are not compiled on this host; the integrator's lanes are their first compiler.
@@ -22228,6 +22272,67 @@ Applied in the same change to:
   format, trailing bytes, a vector of `u32::MAX` entries, the bound's arithmetic), the volume's three tests, and the two
   by-use tests over a real daemon named above. Owed on Shards' side: `shards restore` taking a served share and its
   real-VM test of a save and a restore over slates, after its v0.8.0 tag.
+
+### A-310 — slates-api's seam: the volume verbs as a trait an instance and a simulator implement, held to one conformance suite (2026-11-18, built for goal g268, what Hex needs from slates)
+
+Applied in the same change to:
+- §4.12: "The seam" and its status; the embedding status's owed line, and A-278's owed list, marked built. GAPS: the
+  embedding library row. `docs/library.md`: the seam's section and the owed list.
+- `crates/api`: `seam.rs` (`Volumes`, implemented by `Instance`), `sim.rs` (`SimVolumes`), `lib.rs` (the modules, their
+  exports, the crate's notes, `CONTRACT` 9), `error.rs` (`Error::of_ipc` lent to the crate, for the simulator's pair).
+  The tests: `the_seam_conforms` run by `an_instance_answers_the_seams_conformance_suite` and
+  `the_simulator_answers_the_seams_conformance_suite`, and `the_simulator_holds_what_it_was_given_room_for`
+  (`tests/api.rs`).
+
+- **Why.** Hex, kiln's scheduler and runtime, keeps its volumes on slates (its design's README; kiln's plan T7,
+  CP-T7.8 volumes through a CSI-like interface and CP-T7.13 claims on slates), and its rules reach another product only
+  through its `-api` crate, "each trait with a simulator implementation and a conformance suite both pass" (Hex
+  `CLAUDE.md` §9). Its own simulated cluster (`hex-sim`, after kwok) runs no daemon. A-278 and A-299 left the seam owed;
+  their owner (goal g262) handed it to g268 on 2026-11-18, on the condition that it add no type to the contract.
+- **The rule.** `Volumes` carries what a scheduler does with volumes and nothing it does not: provision (overlay,
+  empty, clone, green, work), snapshot, destroy a snapshot, destroy, list, serve to a Shards VMM, mount, unmount,
+  detach, each with the `Instance` verb's own signature and types. Landings, merges and write policy stay on the
+  instance. `SimVolumes` answers what an instance answers for every case the suite runs, and documents what it does
+  not do (serve bytes, mount anything); its tables are bounded by the caller's own number.
+- **Rejected: an associated type for what serving returns.** A simulator could hand out a token instead of a stream end,
+  but then the trait's `serve_shards` would not be the contract's, and a host could not move from the simulator to an
+  instance without a type changing. The simulator makes a real connected pair (`slates_ipc::stream::pair`, a duplex
+  pipe on Windows) and keeps its end unanswered, so a host's plumbing, a VMM's spawn with the end included, runs the
+  same over both.
+- **Found.** A pinned snapshot's destroy reaches a consumer as `Invalid::Request("Pinned")`: the daemon maps the volume
+  core's `Pinned` through its catch-all (`refusal_of_vfs`) to `BadRequest`. The suite asserts the class over both, and a
+  typed class is owed to the contract (told to its owner).
+- **Evidence.** The suite over an in-process daemon and over the simulator, and the simulator's bound. Owed: Hex's own
+  use of it, when Hex takes slates (its agent was idle until 2026-11-19).
+
+### A-306 — A resent forward keeps the place its first send had in the forward lane (2026-11-18, built for goal g245, a dead lent session; finding (b) of the bug record of 2026-11-09)
+Applied in the same change to:
+- §4.8 "Lookup": the status of 2026-11-18.
+- `crates/server/src/forward_lane.rs`: `Place`; each ticket's place, and the lane's queue ordered by place, then
+  ticket; `ForwardLanes::queue` and `leave` (the queue's discipline apart from the shard's state) and
+  `begin_queued_with` (apart from the session); the count `fleet.forward.resent_in_place`; the module doc.
+  `crates/server/src/fleet.rs` (`forward_batch_over_leader_session` takes the place) and `crates/server/src/verbs.rs`
+  (`resolve_and_forward` keeps one place across its resends; `forward_once` passes it).
+- Tests: `a_resend_is_begun_ahead_of_every_forward_first_queued_after_it` and the model test
+  `a_lanes_forwards_are_begun_in_the_order_they_were_first_queued` (`forward_lane.rs`), and
+  `a_read_through_a_dead_session_keeps_its_place_behind_a_burst` (`crates/server/tests/fleet.rs`).
+- GAPS: the load test's "dead record session" entry. The bug record:
+  `docs/bugs/2026-11-18-a-resent-forward-lost-its-place-in-the-lane.md`.
+- **What was there.** A forwarder gives its batch up once none of its forwards has progressed for its stall budget,
+  queued or begun, and its caller sends the same requests again under their own ids while the owner is not confirmed
+  dead and the failover bound allows. Every send was a new batch with fresh tickets, and a lane begins its queue in
+  ticket order, so every resend went to the back.
+- **The rule.** A forward's place is the ticket its first send was given; a resend is queued at it, each request of a
+  batch at its own first ticket. A lane begins its queued forwards in the order of their places: the order of first
+  sends, whatever has been given up and sent again since. Its wait is bounded by the forwards first sent before it.
+- **Why.** Goal g245, finding (b): behind a 256-client burst a read through a client node whose session to its owner
+  died was refused at its failover bound in 1 of 10 runs and answered after 9.2 and 9.5 s in two more (2.3 to 10.5 s
+  in all), its every resend given up again behind forwards first sent after it. With its place kept: 4.1 to 6.5 s in
+  10 of 10.
+- **Cost.** None new: a queued forward's key in the same ordered set is a pair, and a resend's insert and a leave's
+  remove are the same logarithmic steps. A forward still queued is given up and resent at its stall budget as before:
+  with its place kept that loses it nothing, but it cycles the backlog once a budget on the control shard, which is
+  owed apart (GAPS).
 
 ### A-298 — A submit off its green's shard asks for its verdict only once its work's route is committed (A-255 under A-247; 2026-11-17, g231, landing W1)
 Applied in the same change to: §4.16 (Submission), A-247's rule ("A submit's route"), A-255's rule (the record plane's

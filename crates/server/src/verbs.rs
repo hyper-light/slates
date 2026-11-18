@@ -1722,8 +1722,11 @@ pub(crate) async fn resolve_and_forward(
       },
     },
   };
+  // Every resend keeps the place the first send had in the owner's lane (A-306), so forwards first queued after it
+  // never go ahead of it however often it is sent again.
+  let mut place = crate::forward_lane::Place::default();
   let (decoded, later) = loop {
-    let (decoded, later) = forward_once(owner, &requests).await;
+    let (decoded, later) = forward_once(owner, &requests, &mut place).await;
     // Unanswered (sent, no reply in time) or unsent (the session to the owner stayed with another task the whole
     // budget): on a lossy path both are transient while the owner lives (measured 2026-10-09 at 10% loss: contested
     // reads refused after forwards that never left, `fleet.owner_location.forward_unsent`).
@@ -1765,11 +1768,13 @@ pub(crate) async fn resolve_and_forward(
 const FORWARD_RETRIED: &str = "fleet.forward.retried";
 
 /// One forward of `requests` to `owner`, within one liveness budget plus the measured round-trip tail of the path to
-/// it: the decoded reply to the first (`None` when nothing was sent, `Some(None)` when it went unanswered) and the
-/// decoded replies to the rest that came back, in order, up to the first that did not.
+/// it, queued at `place` in the owner's lane (the first send's, for a resend): the decoded reply to the first (`None`
+/// when nothing was sent, `Some(None)` when it went unanswered) and the decoded replies to the rest that came back, in
+/// order, up to the first that did not.
 async fn forward_once(
   owner: Option<HostId>,
   requests: &[Vec<u8>],
+  place: &mut crate::forward_lane::Place,
 ) -> (Option<Option<ReplyBody>>, Vec<ReplyBody>) {
   let Some(owner) = owner else {
     return (None, Vec::new());
@@ -1788,6 +1793,7 @@ async fn forward_once(
     owner,
     requests,
     crate::daemon::LIVENESS_BUDGET_NS.saturating_add(tail_ns),
+    place,
   )
   .await;
   if forwarded.is_none() {
@@ -10429,7 +10435,8 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
   let accounting = slot.volume.accounting();
   let journal = journal_report(&slot.volume);
   let takeover_kept = u32::try_from(slot.volume.takeover_kept()).unwrap_or(u32::MAX);
-  let (drifted, watcher) = match slot.host.as_mut() {
+  // An overlay's base, as text for people (`drifted`, `watcher`) and typed for consumers (`base`, A-299).
+  let (drifted, watcher, base) = match slot.host.as_mut() {
     Some(host) => match slot.volume.with_host(host).status(&mut state.store) {
       Ok(s) => (
         s.drift
@@ -10442,13 +10449,15 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
           )
           .collect(),
         format!("{:?}", s.watcher),
+        Some(base_report(&s)),
       ),
       Err(e) => (
         vec![format!("status refused: {e:?}")],
         "unavailable".to_owned(),
+        Some(slates_ipc::protocol::BaseReport::Unreadable),
       ),
     },
-    None => (Vec::new(), "scratch".to_owned()),
+    None => (Vec::new(), "scratch".to_owned(), None),
   };
   let attachments = state.db.partition().attachments_of(record.id).len();
   ReplyBody::Status {
@@ -10475,7 +10484,38 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
       mounts_elided,
       journal,
       takeover_kept,
+      base,
     }),
+  }
+}
+
+/// An overlay's base as a status read it, typed for the wire (§4.15 "Drift"; A-299).
+fn base_report(status: &slates_vfs::base::BaseStatus) -> slates_ipc::protocol::BaseReport {
+  use slates_ipc::protocol::{DriftEntry, DriftKind, WatcherState};
+  slates_ipc::protocol::BaseReport::Read {
+    drifted: status
+      .drift
+      .iter()
+      .map(|(path, kind)| DriftEntry {
+        path: path.clone(),
+        kind: match kind {
+          slates_vfs::base::DriftKind::Modified => DriftKind::Modified,
+          slates_vfs::base::DriftKind::Deleted => DriftKind::Deleted,
+          slates_vfs::base::DriftKind::Replaced => DriftKind::Replaced,
+          slates_vfs::base::DriftKind::TypeChanged => DriftKind::TypeChanged,
+        },
+      })
+      .collect(),
+    unverified: status
+      .unverified
+      .iter()
+      .map(|(path, _)| path.clone())
+      .collect(),
+    watcher: match status.watcher {
+      slates_vfs::host::WatchState::Live => WatcherState::Live,
+      slates_vfs::host::WatchState::Overflowed => WatcherState::Overflowed,
+      slates_vfs::host::WatchState::Unavailable => WatcherState::Unavailable,
+    },
   }
 }
 
