@@ -20,11 +20,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use slates_api::{
-  Approval, Awaiting, BaseState, ConflictClass, Denied, Drift, DriftKind, Error, Existing, Filter,
-  Instance, Intent, Invalid, IssuerFault, LandOutcome, LandingConflict, LandingState, MergeOutcome,
-  Missing, PathFault, PolicyReason, PolicyRefusal, PolicySubject, Provisioned, RebaseOutcome,
-  SnapshotId, Unsupported, Unusable, Verification, VolumeId, VolumeSpec, Work, WorkSignature,
-  WriteAct, WriteMode, WritePolicy,
+  Approval, AuditKind, Awaiting, BaseState, ConflictClass, Denied, Drift, DriftKind, Error,
+  Existing, Filter, GrantState, Instance, Intent, Invalid, IssuerFault, LandOutcome,
+  LandingConflict, LandingStage, LandingState, MergeOutcome, Missing, PathFault, PolicyReason,
+  PolicyRefusal, PolicySubject, Provisioned, RebaseOutcome, SnapshotId, Unsupported, Unusable,
+  Verification, VolumeId, VolumeSpec, Work, WorkSignature, WriteAct, WriteMode, WritePolicy,
 };
 use slates_machine::{MachineError, MachineProfile, ProfileOptions};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
@@ -424,9 +424,27 @@ fn an_overlay_lands_exactly_what_was_approved_and_nothing_else() {
     b"ref: refs/heads/main\n",
     "git's own files were left out"
   );
+  // The approval and the landing are audited and listed, typed (A-299): the presentation, the grant the launcher
+  // issued, the landing finished `Done`, and the single-use grant consumed by it.
+  let audit = instance.audit(0).unwrap();
+  let kinds: Vec<AuditKind> = audit.iter().map(|record| record.kind).collect();
   assert!(
-    !instance.audit(0).unwrap().is_empty(),
-    "the grant and the landing are audited"
+    kinds.contains(&AuditKind::LandingPlanned) && kinds.contains(&AuditKind::GrantIssued),
+    "{kinds:?}"
+  );
+  assert!(
+    audit
+      .iter()
+      .any(|record| record.kind == AuditKind::LandingFinished
+        && record.outcome == Some(LandingStage::Done)),
+    "{audit:?}"
+  );
+  let grants = instance.grants().unwrap();
+  assert!(
+    grants
+      .iter()
+      .any(|grant| grant.manifest == approval.manifest && grant.state == GrantState::Consumed),
+    "{grants:?}"
   );
   daemon.stop();
 }

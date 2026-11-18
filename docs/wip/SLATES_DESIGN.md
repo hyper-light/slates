@@ -7058,7 +7058,9 @@ it builds against the contract and adds to it rather than around it.
 > (`a_landing_follows_its_volumes_write_mode`: unset reads back as none; a bypass volume lands in
 > the one call, `Done`, its file on the disk, while its plan is refused and writes nothing; a
 > forbidding one answers `Refused` by its own policy, nothing written; the signed requirement
-> refused before the daemon is asked).
+> refused before the daemon is asked). **Piece 6:** the audit log and the grant listing typed
+> (`AuditRecord` with `AuditKind` and a `LandingStage` outcome; `GrantRecord` with `GrantState`), each
+> word of the daemon's closed tables read in one place and a stranger a protocol fault; `CONTRACT` = 4.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -21387,6 +21389,10 @@ contract", new, with its status), GAPS (the A-299 entry and the Embedding librar
   from the wire's, its signed-merge requirement refused before sending; `plan_landing` refusing a bypass volume until a
   present-only verb exists; `CONTRACT` 3. Applied to `crates/api/src/{policy,issuer,instance,error,lib}.rs`,
   `tests/api.rs` (`a_landing_follows_its_volumes_write_mode`), §4.12's status, GAPS, `docs/library.md`.
+- **Piece 6, the same day:** the audit log and the grant listing typed (`observe.rs`: `AuditRecord`, `AuditKind`,
+  `LandingStage`, `GrantRecord`, `GrantState`), read from the daemon's closed name tables in one place; `CONTRACT` 4.
+  Checked by unit tests over every word and a stranger, and by use: after a landing the audit holds the presentation,
+  the issued grant and the landing finished `Done`, and the single-use grant is listed `Consumed`.
 - **Checked.** `cargo test -p slates-api` (37 unit, 9 by use, 5 start, 1 doc) and `cargo test -p slates-cli` on
   macOS arm64 (kiln runner, 2026-11-18): the cases in §4.12's status. The Linux and Windows arms of the mount and the
   CLI's Windows unmount are not compiled on this host; the integrator's lanes are their first compiler.

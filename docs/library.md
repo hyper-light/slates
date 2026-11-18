@@ -140,7 +140,8 @@ where you must decide; a moved contract then fails your build at the place to up
 - The launcher's authority: `Issuer::from_environment()` (the anchor's handoff, as `slates grant`
   has it) or `Issuer::from_handoff(pairs)`. The SDKs and the MCP server cannot approve: they do not
   depend on this crate.
-- Observation: `daemon_status`, `audit`, `grants`, `telemetry`.
+- Observation: `daemon_status`, `audit` (typed `AuditRecord`s), `grants` (typed `GrantRecord`s),
+  `telemetry`.
 
 Calls are synchronous: a provisioning verb answers in microseconds, and a landing or a mount waits
 while the daemon lives. A host on its own async runtime runs them on its blocking pool until the
@@ -193,6 +194,6 @@ fn workspace(folder: &std::path::Path, at: &str) -> Result<(), slates_api::Error
 2. The daemon's side of the write modes, merge approvals and signed work, and the verbs that set a
    policy and hand out the statement a signer signs.
 3. Typed fields on the wire for drift, a presentation's conflicts and a merge's versions.
-4. A paged volume listing; typed audit kinds and grant states.
+4. A paged volume listing.
 5. An async form over the host's own reactor.
 6. A seam trait with a simulator and a conformance suite.
