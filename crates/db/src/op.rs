@@ -467,6 +467,13 @@ pub enum Op {
     /// The policy.
     policy: crate::catalog::WritePolicy,
   },
+  /// An enrolled consumer's write policy was set by its launcher (A-285). Appended (2026-11-18).
+  ConsumerWritePolicySet {
+    /// The consumer.
+    consumer: u64,
+    /// The policy.
+    policy: crate::catalog::WritePolicy,
+  },
   /// A work's base is held for it on its green's partition, wherever the work lives (A-247): made at the work's
   /// creation, moved by its accept and rebase. Appended (2026-11-18), with the five after it: each variant's index is
   /// its tag on the log, so A-247's records follow every variant main had when they landed.
@@ -583,6 +590,7 @@ impl Op {
       Op::LiveHoldersCommitted { .. } => "live_holders_committed",
       Op::CompletionAwaiting { .. } => "completion_awaiting",
       Op::VolumeWritePolicySet { .. } => "volume_write_policy_set",
+      Op::ConsumerWritePolicySet { .. } => "consumer_write_policy_set",
     }
   }
 }

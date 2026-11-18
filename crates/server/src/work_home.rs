@@ -260,7 +260,7 @@ fn may_ask(state: &ShardState, principal: &Principal, body: &RequestBody) -> boo
     return false;
   };
   match body {
-    RequestBody::Submit { .. } | RequestBody::Rebase { .. } => {
+    RequestBody::Submit { .. } | RequestBody::SubmitHeld { .. } | RequestBody::Rebase { .. } => {
       require_work(state, principal, volume, false, "ask").is_ok()
     }
     // An approval reaches the verdict only once it verifies (A-285): the owner trusts what it is sent, so a consumer's
@@ -277,6 +277,7 @@ fn may_ask(state: &ShardState, principal: &Principal, body: &RequestBody) -> boo
     RequestBody::Edit { .. }
     | RequestBody::EditStaged { .. }
     | RequestBody::EditSubmit { .. }
+    | RequestBody::EditSubmitHeld { .. }
     | RequestBody::Declare { .. } => require_work(state, principal, volume, true, "ask").is_ok(),
     _ => crate::merge_service::find_record(state, volume)
       .is_ok_and(|record| crate::verbs::rights_of(&record, principal).read),
@@ -324,28 +325,22 @@ fn need_of(state: &ShardState, work: DbVolumeId, body: &RequestBody) -> Option<N
     }
     | RequestBody::Status { .. } => (!fetched).then_some(Need::Sizes),
     RequestBody::Declare { op, .. } => declare_need(fetched, op),
-    RequestBody::Submit { evidence, .. } => {
+    RequestBody::Submit { evidence, .. }
+    | RequestBody::SubmitHeld { evidence, .. }
+    | RequestBody::SubmitApproved { evidence, .. } => {
       if home.verdict.is_some() {
         return None;
       }
+      let approval = match body {
+        RequestBody::SubmitApproved { identity, .. } => crate::verbs::Approval::Of(*identity),
+        RequestBody::SubmitHeld { .. } => crate::verbs::Approval::Held,
+        _ => crate::verbs::Approval::None,
+      };
       Some(verdict_need(
         state,
         work,
         seal(state, work),
-        (evidence, None),
-      ))
-    }
-    RequestBody::SubmitApproved {
-      evidence, identity, ..
-    } => {
-      if home.verdict.is_some() {
-        return None;
-      }
-      Some(verdict_need(
-        state,
-        work,
-        seal(state, work),
-        (evidence, Some(*identity)),
+        (evidence, approval),
       ))
     }
     RequestBody::Rebase { .. } => {
@@ -366,6 +361,14 @@ fn need_of(state: &ShardState, work: DbVolumeId, body: &RequestBody) -> Option<N
       insert,
       evidence,
       ..
+    }
+    | RequestBody::EditSubmitHeld {
+      path,
+      at,
+      delete_len,
+      insert,
+      evidence,
+      ..
     } => {
       if let Some(need) = file_if_unheld(path) {
         return Some(need);
@@ -373,8 +376,13 @@ fn need_of(state: &ShardState, work: DbVolumeId, body: &RequestBody) -> Option<N
       if home.verdict.is_some() {
         return None;
       }
+      let approval = if matches!(body, RequestBody::EditSubmitHeld { .. }) {
+        crate::verbs::Approval::Held
+      } else {
+        crate::verbs::Approval::None
+      };
       sealed_with_edit(state, work, (path, *at, *delete_len, insert))
-        .map(|sealed| verdict_need(state, work, sealed, (evidence, None)))
+        .map(|sealed| verdict_need(state, work, sealed, (evidence, approval)))
     }
     _ => None,
   }
@@ -387,7 +395,7 @@ fn verdict_need(
   state: &ShardState,
   work: DbVolumeId,
   sealed: SealedWork,
-  (evidence, approved): (&[[u8; 32]], Option<[u8; 32]>),
+  (evidence, approval): (&[[u8; 32]], crate::verbs::Approval),
 ) -> Need {
   if !route_committed(state, work) {
     return Need::Route;
@@ -397,7 +405,7 @@ fn verdict_need(
     sealed: composed(state, sealed, evidence.to_vec()),
     policy: crate::verbs::SubmitPolicy {
       work_mode: crate::verbs::merge_mode_of(state, work),
-      approved,
+      approval,
     },
   })
 }
@@ -582,8 +590,10 @@ fn reset_refusal(state: &mut ShardState, work: DbVolumeId, body: &RequestBody) -
   if !matches!(
     body,
     RequestBody::Submit { .. }
+      | RequestBody::SubmitHeld { .. }
       | RequestBody::SubmitApproved { .. }
       | RequestBody::EditSubmit { .. }
+      | RequestBody::EditSubmitHeld { .. }
   ) || state.work_home.verdict.is_some()
   {
     return None;

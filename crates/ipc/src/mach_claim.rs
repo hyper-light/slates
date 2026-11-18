@@ -863,6 +863,9 @@ mod tests {
   fn a_stranger_cannot_plant_a_region_for_a_client() {
     let (name, _service) = token("plant");
     let exe = std::env::current_exe().unwrap();
+    // The stranger runs for as long as a test binary starts: a descriptor another test made in its close-on-exec
+    // window would go with it for that long ([`crate::descriptor_test_gate`]).
+    let _gate = crate::descriptor_test_gate();
     let status = std::process::Command::new("sh")
       .arg("-c")
       .arg(format!(

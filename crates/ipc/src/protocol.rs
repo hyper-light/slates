@@ -860,7 +860,9 @@ pub enum RequestBody {
     subject: PolicySubject,
     /// The policy.
     policy: WritePolicy,
-    /// The keyed hash under the issuer secret.
+    /// The policy version the setter read (`Policy`'s `version`): refused `PolicyChanged` once the policy has moved.
+    version: u64,
+    /// The keyed hash under the launcher's secret, over the subject, the policy and the version.
     proof: [u8; 32],
   },
   /// Reads a write policy (A-285): `None` when none is set, which is ask. Appended.
@@ -881,6 +883,31 @@ pub enum RequestBody {
     target: String,
     /// The filter.
     filter: Filter,
+  },
+  /// A `Submit` whose caller's own policy asks (A-285): served as a submit under an ask mode whatever the volumes'
+  /// modes, so the merge is answered `MergeApprovalRequired` (or refused, if a volume forbids it). What an agent's
+  /// channel sends in place of `Submit` when the consumer's merge mode asks; never needed from a client. Appended.
+  SubmitHeld {
+    /// The work volume.
+    work: VolumeId,
+    /// The evidence references (opaque to slates), possibly none.
+    evidence: Vec<[u8; 32]>,
+  },
+  /// An `EditSubmit` whose caller's own policy asks (A-285): the edit applies, and the submit is held as
+  /// `SubmitHeld`'s is. Appended.
+  EditSubmitHeld {
+    /// The work volume.
+    work: VolumeId,
+    /// The file.
+    path: String,
+    /// The offset.
+    at: u64,
+    /// Bytes removed at `at`.
+    delete_len: u64,
+    /// The bytes inserted at `at`.
+    insert: EditBytes,
+    /// The evidence references (opaque to slates), possibly none.
+    evidence: Vec<[u8; 32]>,
   },
   /// Submits a work whose merge an ask policy held for approval (A-285): the launcher's or the harness's approval of
   /// exactly the increment `identity` names (the identity a `MergeApprovalRequired` reply carried), proven by the keyed
@@ -1559,6 +1586,8 @@ impl RequestBody {
       | RequestBody::StagePut { work: volume, .. }
       | RequestBody::EditStaged { work: volume, .. }
       | RequestBody::EditSubmit { work: volume, .. }
+      | RequestBody::EditSubmitHeld { work: volume, .. }
+      | RequestBody::SubmitHeld { work: volume, .. }
       | RequestBody::FsWrite { volume, .. }
       | RequestBody::FsWriteStaged { volume, .. }
       | RequestBody::FsRemove { volume, .. }
@@ -1619,6 +1648,8 @@ impl RequestBody {
         | RequestBody::Edit { .. }
         | RequestBody::EditStaged { .. }
         | RequestBody::EditSubmit { .. }
+        | RequestBody::EditSubmitHeld { .. }
+        | RequestBody::SubmitHeld { .. }
         | RequestBody::Declare { .. }
         | RequestBody::Submit { .. }
         | RequestBody::SubmitApproved { .. }
@@ -3304,6 +3335,12 @@ pub enum Refusal {
     /// The subject whose policy forbids it.
     by: PolicySubject,
   },
+  /// A `SetPolicy` named a policy version the policy has moved past (A-285): a raced or replayed setting changes nothing.
+  /// Read the policy again and set it from there. Appended.
+  PolicyChanged {
+    /// The policy's version now.
+    current: u64,
+  },
 }
 
 /// Why recovery could not rebuild a volume its catalog holds ([`Refusal::NotRecovered`], §4.8). Append-only.
@@ -3805,6 +3842,8 @@ pub enum ReplyBody {
   Policy {
     /// The policy.
     policy: Option<WritePolicy>,
+    /// The policy's version: how many times it was set, which a `SetPolicy` names.
+    version: u64,
   },
   /// A merge an ask policy holds for approval (A-285): nothing was merged. `identity` names the increment exactly
   /// (`blake3` of the work, its base, its post-state and its ops document, §4.16), so an approval

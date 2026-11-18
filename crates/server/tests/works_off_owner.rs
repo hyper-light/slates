@@ -1188,15 +1188,20 @@ fn a_rename_rebased_then_submitted_off_the_owner_merges_as_on_it() {
   assert_eq!(said[0], said[1]);
 }
 
-/// Sets `volume`'s write policy as the launcher does, under the daemon's issuer secret, merging as `merge` says.
-fn merging(client: &mut Client, secret: &[u8; 32], volume: VolumeId, merge: WriteMode) {
-  let subject = PolicySubject::Volume { volume };
+/// Sets `subject`'s write policy as the launcher does, under the daemon's issuer secret, in place of the version it
+/// holds, merging as `merge` says.
+fn merging(client: &mut Client, secret: &[u8; 32], subject: PolicySubject, merge: WriteMode) {
   let policy = WritePolicy {
     merge,
     land: WriteMode::Ask,
   };
+  let (_, version) = client.policy(subject).unwrap();
   client
-    .set_policy(subject, policy, policy_proof(secret, &subject, &policy))
+    .set_policy(
+      subject,
+      (policy, version),
+      policy_proof(secret, &subject, &policy, version),
+    )
     .unwrap();
 }
 
@@ -1207,8 +1212,9 @@ fn merging(client: &mut Client, secret: &[u8; 32], volume: VolumeId, merge: Writ
 /// launcher's approval of the one asked; ask on the green and edit-and-submit a work. Expect: the green's forbid
 /// refuses `PolicyForbids` naming the green; the work's ask answers its identity and one path; `GrantMismatch`,
 /// `Forbidden` and `GrantIssuerUnverified` with nothing merged; the launcher's approval accepted; the green's ask
-/// answers the edit-and-submit with its identity, the edit kept in the work, and an approval of it accepted. The
-/// owner was asked for each verdict, so each ran across the shards.
+/// answers the edit-and-submit with its identity, the edit kept in the work, and an approval of it accepted; and the
+/// agent's own session asking (its consumer's policy), its merge of its own work off the green's shard held with
+/// nothing merged. The owner was asked for each verdict, so each ran across the shards.
 #[test]
 fn a_merge_off_its_greens_shard_follows_both_volumes_write_policy() {
   let (daemon, instance) = daemon(MANY_SHARDS, "policy");
@@ -1217,7 +1223,12 @@ fn a_merge_off_its_greens_shard_follows_both_volumes_write_policy() {
   let asked_before = asked_of_the_owner(&daemon);
 
   let (green, work) = green_and_edited_work(&mut client, "policy-forbid");
-  merging(&mut client, &secret, green, WriteMode::Forbid);
+  merging(
+    &mut client,
+    &secret,
+    PolicySubject::Volume { volume: green },
+    WriteMode::Forbid,
+  );
   let refused = client.submit(work);
   assert!(
     matches!(
@@ -1232,7 +1243,12 @@ fn a_merge_off_its_greens_shard_follows_both_volumes_write_policy() {
   assert_eq!(client.versions(green).unwrap(), 1, "nothing merged");
 
   let (green, work) = green_and_edited_work(&mut client, "policy-ask");
-  merging(&mut client, &secret, work, WriteMode::Ask);
+  merging(
+    &mut client,
+    &secret,
+    PolicySubject::Volume { volume: work },
+    WriteMode::Ask,
+  );
   let Ok(Submitted::ApprovalRequired { identity, paths }) = client.submit(work) else {
     panic!("the work's ask answers an approval request");
   };
@@ -1300,7 +1316,12 @@ fn a_merge_off_its_greens_shard_follows_both_volumes_write_policy() {
   );
 
   let (green, work) = green_and_edited_work(&mut client, "policy-green-ask");
-  merging(&mut client, &secret, green, WriteMode::Ask);
+  merging(
+    &mut client,
+    &secret,
+    PolicySubject::Volume { volume: green },
+    WriteMode::Ask,
+  );
   let Ok(Submitted::ApprovalRequired { identity, .. }) =
     client.edit_and_submit((work, "f"), 1, 1, b"Y", &[])
   else {
@@ -1321,6 +1342,25 @@ fn a_merge_off_its_greens_shard_follows_both_volumes_write_policy() {
     ),
     Ok(Submitted::Accepted(2))
   );
+  // The agent's own session asks (A-285's consumer policy): its merge of its own work off the green's shard is held
+  // there too, with nothing merged, though both volumes would merge at once.
+  merging(
+    &mut client,
+    &secret,
+    PolicySubject::Consumer { consumer },
+    WriteMode::Ask,
+  );
+  let green = agent.create_green("policy-session-green", false).unwrap();
+  let (work, _) = agent
+    .create_work(green, &off_owner_name(green, "policy-session"))
+    .unwrap();
+  agent.edit(work, "f", 0, 0, b"agent's").unwrap();
+  let held = agent.submit(work);
+  assert!(
+    matches!(held, Ok(Submitted::ApprovalRequired { paths: 1, .. })),
+    "the session's ask holds its agent's merge: {held:?}"
+  );
+  assert_eq!(agent.versions(green).unwrap(), 0, "nothing merged");
   assert!(
     asked_of_the_owner(&daemon) > asked_before,
     "the verdicts were asked of the green's owner"
