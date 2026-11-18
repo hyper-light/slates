@@ -3235,6 +3235,26 @@ impl Daemon {
     Ok(pooled.map(|pool| pool.saturating_add(held).saturating_add(debt)))
   }
 
+  /// Test support (A-393): every shard's write log is marked overflowed, as a log is when it could not take an
+  /// acknowledged write and the publication that would have emptied it was refused (A-63): the next daemon then reports
+  /// every file a taken-over attachment had open as having lost writes. A test of what a successor tells its guest sets
+  /// the very predicate the log keeps, rather than starving a publication. Whether every shard holding a log marked
+  /// it, or the first shard's typed refusal.
+  #[cfg(unix)]
+  pub fn inject_write_log_overflow(&self) -> Result<bool, ObserveError> {
+    let mut marked = true;
+    for shard in self.shards.iter().copied() {
+      let this = self.observe(Some(shard), |s| {
+        match (s.write_log.as_mut(), s.content.as_mut()) {
+          (Some(log), Some(object)) => log.overflow(object).is_ok(),
+          _ => true,
+        }
+      })?;
+      marked = marked && this;
+    }
+    Ok(marked)
+  }
+
   /// Test support: every shard refuses (or takes again) the NFSv4 purges sent to it, as an owner that cannot make a
   /// drop durable answers `NFS4ERR_DELAY` (2026-10-10). A test leaves a dropped client's purge owed with it, then proves
   /// the purge outlives a restart.

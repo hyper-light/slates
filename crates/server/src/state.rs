@@ -328,7 +328,7 @@ pub struct ShardState {
   pub(crate) replay: Vec<crate::write_log::Logged>,
   /// Whether the previous daemon acknowledged a write it could not log (its log overflowed and the publication that
   /// would have emptied it was refused): every file a taken-over mount had open is then reported as having lost
-  /// writes (A-61, A-63), and a resynced Shards stream is counted as one whose guest is not told (A-339; GAPS).
+  /// writes (A-61, A-63), and so is every file a resynced Shards stream's guest had open (A-393).
   #[cfg(unix)]
   pub(crate) writes_lost: bool,
   /// The barrier reply each FUSE mount (Linux) or resyncable Shards stream (A-316, A-339) is about to deliver (A-61):
