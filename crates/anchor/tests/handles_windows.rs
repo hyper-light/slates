@@ -345,6 +345,12 @@ fn fixture_identity() -> Identity {
 /// Owns the supervisor through unwinding as well as success, so no failed process assertion leaves its daemon alive.
 struct Supervised(Supervisor);
 
+/// The restart policy the fixtures supervise under: the anchor's derivation over a failover SLO of a fixture's whole
+/// wait, past every backoff a fixture here reaches.
+fn policy() -> RestartPolicy {
+  RestartPolicy::derive(u64::from(WAIT_MS) * 1_000_000).get()
+}
+
 impl Drop for Supervised {
   fn drop(&mut self) {
     if let Err(error) = self.0.stop() {
@@ -362,12 +368,9 @@ fn the_supervisor_acknowledges_the_hold_before_commit_and_hands_it_to_its_succes
     .iter()
     .map(|argument| argument.to_string_lossy().into_owned())
     .collect();
-  // Shape: one restart is required; a second departure ends the fixture's observation with CrashLoop.
-  let policy = RestartPolicy {
-    window_ns: u64::from(WAIT_MS) * 1_000_000,
-    max_restarts: 1,
-  };
-  let mut anchor = Supervised(Supervisor::new(fixture_segment(), &args, policy).unwrap());
+  // The child never serves: its first departure is restarted at once, and the second, a second failed start in a row, is
+  // a crash loop (A-311), which ends the fixture's observation.
+  let mut anchor = Supervised(Supervisor::new(fixture_segment(), &args, policy()).unwrap());
   anchor.0.hold_handles(1).unwrap();
   anchor.0.hold_environment(ROLE, ROLE_SUPERVISED.to_owned());
   anchor
@@ -501,12 +504,9 @@ fn refusals_while_supervising(role: &str) -> u64 {
     .iter()
     .map(|argument| argument.to_string_lossy().into_owned())
     .collect();
-  // Shape: one restart is required; a second departure ends the fixture's observation with CrashLoop.
-  let policy = RestartPolicy {
-    window_ns: u64::from(WAIT_MS) * 1_000_000,
-    max_restarts: 1,
-  };
-  let mut anchor = Supervised(Supervisor::new(fixture_segment(), &args, policy).unwrap());
+  // The child never serves: its first departure is restarted at once, and the second, a second failed start in a row, is
+  // a crash loop (A-311), which ends the fixture's observation.
+  let mut anchor = Supervised(Supervisor::new(fixture_segment(), &args, policy()).unwrap());
   anchor.0.hold_handles(GARBLERS_HOLDS).unwrap();
   anchor.0.hold_environment(ROLE, role.to_owned());
   anchor
@@ -564,12 +564,10 @@ fn a_hold_is_answered_at_its_channels_wake_not_at_the_supervisors_pause() {
     .iter()
     .map(|argument| argument.to_string_lossy().into_owned())
     .collect();
-  // Shape: no restart; the child's one exit ends the observation.
-  let policy = RestartPolicy {
-    window_ns: u64::from(WAIT_MS) * 1_000_000,
-    max_restarts: 0,
-  };
-  let mut anchor = Supervised(Supervisor::new(fixture_segment(), &args, policy).unwrap());
+  // The child's one exit is a failed start (it never serves), restarted at once (A-311), and that restart ends the
+  // observation. Its successor's first hold waits on an anchor that steps no more, so it publishes nothing over the
+  // first child's answers, and the fixture's drop stops it.
+  let mut anchor = Supervised(Supervisor::new(fixture_segment(), &args, policy()).unwrap());
   anchor.0.hold_handles(PROMPT_HOLDS).unwrap();
   anchor.0.hold_environment(ROLE, ROLE_PROMPT.to_owned());
   anchor
@@ -585,7 +583,7 @@ fn a_hold_is_answered_at_its_channels_wake_not_at_the_supervisors_pause() {
     let now = u64::try_from(clock.elapsed().as_nanos()).unwrap();
     match anchor.0.step(now).unwrap() {
       Step::Running => anchor.0.await_work(pause),
-      Step::CrashLoop { exit_code, .. } => {
+      Step::Restarted { exit_code, .. } => {
         assert_eq!(exit_code, Some(ROLE_EXIT), "the child's body ran");
         exited = true;
         break;
