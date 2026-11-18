@@ -30442,3 +30442,35 @@ Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class A, A
 
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class A), `crates/server/src/{reap,landing,
 live_ship,daemon}.rs`.
+
+### A-435 — An adopted move's seal, a takeover's give-up record and a revocation's mount wait wait in their target's own time; the moves read and the pressure room sample are wall bounds by their reasons (2026-11-18, goal 85 via g251; R3's class A; A-65, A-408, A-432)
+
+- **What was there.** Five more of the cross-shard calls g255 listed waited on the wall. An adopted move's settle
+  (`moves::settle_adopted`) asked the owner shard to seal the volume within a record period; the seal
+  (`seal_adopted`, a snapshot) is not idempotent, so an answer dropped at the period's end while the shard worked was
+  lost, the next period's settle took a second seal superseding the first, and the adopted snapshot it should have
+  dropped was left behind. A takeover's give-up by name (`takeover::record_given_up`, A-340) recorded the objects
+  unrecovered on their owner shards within a period, once: a busy owner shard settled none of its objects, which then
+  answered as volumes no member serves for good. A revocation's wait for the FUSE mounts it fenced
+  (`verbs::revoked_mounts_ended`, Linux) counted a shard busy with its other work as the kernels' overrun. The record
+  period's read of each shard's moves (`moves::drive_outgoing`) and the pressure sampler's free-room read
+  (`daemon::free_room_of`) waited a period and a heartbeat.
+- **The rule.** The settle and the give-up wait by `xshard::call_in_shard_time` with the liveness window as their
+  budget, as A-408's calls do: a shard alive and working answers, and only one that stopped, or ran a window of CPU
+  without answering (which the watchdog judges spinning), is given up, the settle asked again next period. The
+  revocation's wait is `task_in_shard_time` with the told bound (A-431) as its budget, so the bound is the kernels'.
+  The moves read and the room sample stay on the wall, each for a stated reason beside it: the moves read is pure and
+  asked again each period, so a busy shard's moves wait a period rather than holding the period's takeovers and
+  materializations behind it; the room sample is the reap cadence's, beside its lease expiries and reaps, and a shard
+  unanswered reads as no room, its share going to the others or to the debt the next growth takes on.
+- **Tests.** `an_adopted_moves_seal_is_recorded_from_an_owner_shard_that_works_past_a_period` (`moves.rs`: a volume
+  made on the second shard of a two-shard daemon, its adoption recorded on the first, the second held in one poll of
+  three periods at a fifth of its CPU, `daemon::hold_busy`; the seal recorded in the adoption) and
+  `a_given_up_object_is_recorded_on_an_owner_shard_that_works_past_a_period` (`takeover.rs`: the object settled
+  recorded and held unrecovered on its shard). Red with the period's wall bound: the seal unrecorded, the object
+  settled unrecorded. The revocation's wait is Linux's and its mounts the kernel's: its run is filed for main's Linux lane.
+- **Owed.** The seal is still taken again when its answer is lost to a stopped shard: recording it on the owner shard
+  would make `seal_adopted` idempotent (GAPS).
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class A), `crates/server/src/{moves,takeover,verbs,
+daemon}.rs`.

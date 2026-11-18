@@ -3682,10 +3682,19 @@
 >   `a_lease_take_waits_for_a_control_shard_that_works_past_its_term`). Kept on the wall by their reason, stated beside
 >   each: a live log's claim admissions (inside the peer's one-at-a-time serve, the owner asking again at its period),
 >   the claim reconciliation and re-admission (the record period's, before its materializations), and the live
->   dispatch's wait (its lanes bounded by the live budget, its answer unread). Owed in class A: the park bound of a verb
->   waiting on a green's owner (`work_home`, the lease bound on the wall), and ten of the 25 `xshard::call_within` and
->   `task_within` sites on the wall (`moves.rs` 2, `daemon.rs`, `verbs.rs`, `takeover.rs`, `shards_route.rs`,
->   `remote_attach.rs`, `mirror.rs`, `fleet.rs`, `anchor_hold_windows.rs`; g251's since 2026-11-18). Class B (the
+>   dispatch's wait (its lanes bounded by the live budget, its answer unread). Then an adopted move's seal, a takeover's
+>   give-up record and a revocation's wait for its fenced FUSE mounts (A-435, 2026-11-18, g251: the seal is not
+>   idempotent, so an answer dropped at a period's end took a second seal the next period and left the adopted snapshot
+>   behind; the give-up is one attempt, so a busy owner shard left its objects unrecorded for good;
+>   `an_adopted_moves_seal_is_recorded_from_an_owner_shard_that_works_past_a_period`,
+>   `a_given_up_object_is_recorded_on_an_owner_shard_that_works_past_a_period`). Kept on the wall by their reason, stated
+>   beside each: the record period's read of each shard's moves (a pure read, asked again next period) and the pressure
+>   sampler's free-room read (the reap cadence's, a shard unanswered reading as no room, which the debt covers). Owed in
+>   class A: the park bound of a verb waiting on a green's owner (`work_home`, the lease bound on the wall), and five of
+>   the 25 `xshard::call_within` and `task_within` sites on the wall (`shards_route.rs`, `remote_attach.rs`,
+>   `mirror.rs`, `fleet.rs`, `anchor_hold_windows.rs`; g251's since 2026-11-18). Owed, found here: an adopted move's
+>   seal is still taken again when its answer is lost to a stopped shard; recording the seal on the owner shard would
+>   make `moves::seal_adopted` idempotent. Class B (the
 >   transport's round-trip estimate) is open, but for the forward lane's stall (2026-11-18, A-315, goal g255): a batch
 >   quiet for its budget is given up only once a turn of its lane begun after the silence was seen has read the
 >   session's own socket empty, or found no session at all, so an origin kept off its CPU reads its owner's replies
