@@ -138,8 +138,20 @@ fn assert_same(
     other.head_identity_from_scratch(),
     "the rebuilt green's identity is its state's"
   );
-  // Every version's signature verdict (A-321), folded into the checkpoint or still in the chain: provenance outlives the
-  // entry that carried it.
+  assert_same_signatures(live, other);
+  assert_same_content(live, other, from, fresh);
+  for (increment, version) in accepted {
+    assert_eq!(
+      other.submit(increment),
+      Outcome::Accepted { version: *version },
+      "a retry is answered its original version"
+    );
+  }
+}
+
+/// Every version's signature verdict (A-321) is the same on `live` and `other`, folded into the checkpoint or still in the
+/// chain: provenance outlives the entry that carried it.
+fn assert_same_signatures(live: &Green, other: &Green) {
   for version in 1..=live.head() {
     assert_eq!(
       live.signature(version),
@@ -147,6 +159,11 @@ fn assert_same(
       "version {version}'s signature verdict"
     );
   }
+}
+
+/// Every name the run can touch (the path alphabet and `fresh`) reads the same through `live` and `other` at every version
+/// from `from` on.
+fn assert_same_content(live: &Green, other: &Green, from: u64, fresh: &[String]) {
   for version in from..=live.head() {
     let alphabet = (0..PATH_INDICES).map(|index| path(index).to_owned());
     for name in alphabet.chain(fresh.iter().cloned()) {
@@ -156,13 +173,6 @@ fn assert_same(
         "{name} at version {version}"
       );
     }
-  }
-  for (increment, version) in accepted {
-    assert_eq!(
-      other.submit(increment),
-      Outcome::Accepted { version: *version },
-      "a retry is answered its original version"
-    );
   }
 }
 

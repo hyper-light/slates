@@ -1,0 +1,46 @@
+# The volume core's refusals reached consumers as words (2026-11-18, A-299, found by A-310)
+
+## Description
+
+Twenty kinds of volume-core refusal reached every client as `Refusal::BadRequest { reason: "<the error's name>" }`:
+a pinned snapshot's destroy (`"Pinned"`), a volume a green's origin holds, a guest-mapped file's change
+(`"DaxMapped"`), a scoped mount of a file (`"NotDirectory"`), a non-empty directory's removal, a stale handle, and the
+rest. The consumer contract (A-299) could only pass them on as `Error::Invalid(Invalid::Request(note))`, so kiln could
+not tell "end the clone first" from "the request is malformed", and A-310's simulator had to answer the word to
+conform.
+
+## Root cause
+
+`refusal_of_vfs` (`crates/server/src/error.rs`) named some volume-core errors and sent every other through a catch-all
+arm, `other => Refusal::BadRequest { reason: format!("{other:?}") }`. A catch-all is an uncategorized refusal
+(CLAUDE.md §3), and it also meant a new volume-core error compiled without anyone deciding its class.
+`VfsError::BarrierIncomplete`, which the wire has its own variant for, went through it too.
+
+## Impact
+
+Every verb whose volume-core refusal was one of those: snapshot destroys, rewitness, the file verbs and mounts, since
+the daemon began. A client saw a typed refusal class only for the errors named before the catch-all.
+
+## Fix
+
+- The wire appends `Refusal::Volume { refusal: VolumeRefusal }`, one variant per volume-core error the others do not
+  name (the journal's and the recovery image's numbers kept).
+- `refusal_of_vfs` is exhaustive: each error maps to its variant, and `BarrierIncomplete` to the wire's own. No
+  catch-all remains, so a new error does not compile until it is classified.
+- `slates-api` classes each by what a consumer does: `Busy::Volume` (`Pinned`, `DaxMapped`), `Stale::Volume`,
+  `Denied::Volume`, `Exhausted::Volume`, `Unusable::Volume`, `Invalid::Volume`. The simulator answers a pinned
+  destroy `Busy::Volume(Pinned)`, as the daemon does.
+
+## Evidence
+
+- `crates/server/tests/recovery.rs`: the two recovered-pin tests now expect `Refusal::Volume { refusal: Pinned }`.
+- `crates/server/tests/fuse_mount.rs` (Linux): a scoped mount of a file expects `Volume { NotDirectory }`.
+- `crates/api/tests/api.rs`, `the_seam_conforms`: a pinned snapshot's destroy is `Busy::Volume(Pinned)` from both
+  the daemon and the simulator.
+- `each_volume_core_refusal_is_typed_into_its_class` (unit) places every reason in its class.
+
+## Siblings
+
+The other words the daemon sends in place of types are tracked in GAPS under A-299: `TargetUnavailable`'s reason,
+`Unsupported`'s feature, `Unpublished`'s reason, `ImageRefused`'s reason, `TableAtCapacity`'s table, and the
+landing-state, action, audit-kind and grant-state words the contract reads from closed tables.

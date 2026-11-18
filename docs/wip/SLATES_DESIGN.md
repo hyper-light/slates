@@ -986,12 +986,24 @@ A microbenchmark exceeding its wall-time bound: Degraded, widened interval recor
 **Refusals.** `ProfileUnavailable` (segment unreadable), `ProfileStale` (identity mismatch while a
 volume requires a matching profile), `MeasurementTimeout`.
 
+> **Status (2026-11-06, A-223: the Windows wake is a confirmed sleeper's too).** Windows has no per-thread wait
+> state short of a system-wide snapshot. So the probe's waker kicks a waiter only once it has announced its park and
+> two reads of its cycle count (`QueryThreadCycleTime`) agree. It drops and counts (`WakeLatency::woke_running`) a wake
+> whose count moved again before the kick, or across whose wait the waiter's own context-switch count
+> (`ReadThreadProfilingData`, `slates_machine::switches`) did not move. The cycle count alone is no proof: a spinning
+> thread read the same twice in 2.4–18 % of back-to-back pairs on CI's x86_64 runner. The shards' online estimate drops
+> a Windows park that never switched out by the same count, as Linux does by its voluntary switches. Before this, the
+> announcement stood in: the probe read 0.14–0.85 µs, and the window, quantum and spin derived from it were a hundred
+> times too small. Now it reads 6.0–9.1 µs on CI's quiet runners. The daemon's idle window, which it then scaled, is
+> R9's floor on Linux and macOS since A-223's window rule (§4.7, 2026-11-11); Windows keeps the multiple (GAPS).
+
 > **Status (2026-09-25, the wake probe measures one event and reports its mean).** The probe timed every park/unpark round trip, so it mixed an on-CPU handoff (about 0.45 µs, the waiter still running or on the waker's CPU) with a real wake (about 10 µs); thread placement holds for a run, so runs split between the two (median 416 ns or 10,041 ns on the same two container cores, a minute apart), and it stopped on the median's interval while its consumers read the p99 — often the maximum of 64 samples (667 ns to 511,042 ns). Now the waiter is confirmed asleep (Linux `/proc` state, macOS `thread_info`; Windows the waiter's announcement, reported unconfirmed), the pair is placed as production is (the control core waking a shard core where the OS pins; unpinned on macOS, with the same-CPU share recorded), the probe converges the mean — the spin-then-park rule's threshold is the expected cost of parking, and a spinning waiter on the same pinned cores never saw the tail (p99 ≤ 209 ns) while a parked one did (285–639 µs) — and five fresh-thread rounds are compared by their medians (a disagreement lists the probe degraded, `wake.rounds`). Measured on a quiet host: the median held at 8.9–10.8 µs over ten container runs and the mean at 15.1–17.6 µs on four CPUs; macOS's mean held at 2.03–2.49 µs. The spin window, the step quantum and the timer tick now read the mean, the runtime's inbound ring the p99 at its overflow target, the guest credit's kick round trip the mean; a profile of another format version is refused by name, and a daemon handed one by an older anchor measures its own. The boot mean is quick on a virtual machine (±20–30 % in 250 ms at a coefficient of variation of five to seven); since A-31 (2026-09-25) it is only the prior of each shard's and each client's online estimate, refined from the confirmed wakes they pay (§4.3 and §4.7 status), and the long-step count attributes each long poll to its task or to the host rather than reading wall time. Record: `docs/bugs/2026-09-22-wake-probe-mixes-two-events-and-reports-an-unconverged-tail.md`.
 
 > **Status (2026-11-07, a starved wake probe measures; a stuck one refuses).** Past its wall (`PROBE_WALL_BUDGET`, 250 ms) the probe runs on while each round's waiter runs at all, rounds doubling from one window to `PROBE_WALL_BUDGET · 2^(WAKE_ROUNDS − 1)` (4 s), and refuses `MeasurementTimeout` after a round whose waiter was never scheduled. That is the watchdog's rule (A-228) and the anchor's start judgment applied to the probe: slow progress is starvation, no progress is stuck. The extension past the wall is bounded by 31 windows (7.75 s). Under 144 nice-19 spinners on 18 CPUs a wake took 68-174 ms at the median, the floor needed over a second, and the 250 ms wall refused the quick profile, and the anchor's boot with it, 19 times in 20. Record: `docs/bugs/2026-11-07-a-busy-machine-refused-the-anchors-boot-at-the-wake-probe.md`.
 
 **Derived constants.** Spin window = wake_ns.mean (Karlin: the 2-competitive threshold is the
-expected cost of parking, and the wake's heavy tail is part of that cost, not noise); the cooperative
+expected cost of parking, and the wake's heavy tail is part of that cost, not noise), the runtime's own
+spin-then-park; the daemon's idle window is §4.7's, which no estimate prices on Linux and macOS (A-223); the cooperative
 step quantum = wake_ns.mean — both as the prior of the online estimate a shard and a client refine
 from their own confirmed wakes (A-31), weighted over about 2^shift wakes with shift =
 ⌈log₂ (1.96 · wake_ns.sd / (0.05 · wake_ns.mean))²⌉, the sample size at which the estimate is as
@@ -1600,7 +1612,10 @@ platform cannot attribute (macOS off the CPU, Windows everywhere): counted unatt
 
 **Derived constants.** Task arena size = admission limit (Little's law on measured request rate ×
 p99 service time); batch bound = latency budget / measured per-item cost; idle spin window =
-the shard's wake estimate × the spin-to-park ratio; the step quantum (the I/O harvest cadence, the
+max(F, the shard's wake estimate × the idle ratio), where the runtime's own spin-then-park has ratio 1 and no F (the
+2-competitive spin) and the daemon's has §4.7's: F, R9's provisioning floor, and the platform's multiple (A-223),
+held open longer for a closed loop's forwards by §4.7's closed-loop hold (`ShardContext::hold_idle_window`, A-326); the
+step quantum (the I/O harvest cadence, the
 slices of a destroy, an archive or a pre-fault, and the long-step count) = the shard's wake estimate,
 seeded with wake_ns.mean and refined from the shard's own confirmed wakes over about 2^shift of them
 (shift from the probe's spread).
@@ -4763,7 +4778,8 @@ slots alternate park by park, A-199), set `parked` to that slot's value (1 or 2)
 the wake word, fence and read `parked`; if set, advance the word once more, stamp the host clock into
 the `reply_stamp` slot the flag's value names (the first reply of the park only), wake (futex wake / wake by address / `SetEvent`),
 mark that stamp confirmed when the wake reports it found a sleeper (Linux and macOS; Windows' Event
-cannot tell, so there a stamp inside the wait is taken unconfirmed), and, for SDK event loops, signal
+cannot tell, so there the client confirms its own sleep by its switch count across the wait, and learns
+nothing where the OS refuses the count, A-223), and, for SDK event loops, signal
 the completion fd (eventfd / pipe / socket) so `add_reader`/`uv_poll` fires. Where no descriptor can be
 shared (macOS, Windows), a client-local bridge thread makes its pipe or socket readable after every
 return from its wait while the client is armed and a reply waits in its ring: a level, never an edge
@@ -4796,6 +4812,20 @@ drops.
 > returned and its confirmation is final. The region's layout goes to version 3. Interleaved, 100 runs each, the
 > learning case failed 100 of 100 before and 0 of 100 after on one CPU with two busy loops, and 89 and 0 on two
 > CPUs with four. Record: `docs/bugs/2026-11-04-a-late-wake-confirmation-cost-the-client-two-samples.md`.
+
+> **Status (2026-11-11, A-223 sibling (d): the Windows client's wake is a confirmed sleeper's).** Windows' auto-reset
+> Event cannot say whether its signal met a sleeper, and a signal set before the wait is consumed without blocking, so
+> the client took any stamp inside its wait. A reply that landed between its re-check and its block was learned as an
+> on-CPU handoff. Now the client reads its own context-switch count (`slates_machine::switches`) before and after the
+> wait, as the shards judge their parks, and a wait across which the count did not move, or whose count the OS
+> refused, teaches nothing (`wait_may_teach` in `crates/ipc/src/endpoint.rs`); Linux and macOS keep the daemon's
+> confirmation. The race is rare for the client. Against a daemon replying the instant the flag rose, 11–95 of 16,384
+> parks a run on CI's Windows runners never switched out, and main learned 11–48 of them a run;
+> `a_reply_sent_before_the_client_blocked_teaches_its_wake_nothing` (`crates/ipc/tests/rings.rs`) reads the client
+> thread's own count around each trip, and failed 10 runs in 10 on main and passed 10 in 10 with the check
+> (`diag-liveness-client-4`). So the mean on main stayed a sleeper's: the parked bench form's client estimate read
+> 17–33 µs on both Windows runners before and after (`Client::wake_estimate`, provision_bench's `client wake` line),
+> against a published window of 8.8–9.9 µs (`diag-liveness-client-1`, `-2`).
 
 > **Status (2026-09-29, A-42: the idle spin is opened by client activity and ends with its window).** The
 > daemon set a shard "active" at its first client's handoff and nothing cleared it, so from then on every
@@ -4860,8 +4890,43 @@ drops.
 
 **Derived constants.** Ring depth = Little's law on measured per-client request rate × p99
 service time, rounded to a power of two; `spin_ns` = wake_ns.mean (the client's prior); `spin_shift`
-= ⌈log₂ (1.96 · wake_ns.sd / (0.05 · wake_ns.mean))²⌉; idle window = the shard's wake estimate ×
-measured spin-to-park ratio target.
+= ⌈log₂ (1.96 · wake_ns.sd / (0.05 · wake_ns.mean))²⌉; idle window = max(F, the shard's wake estimate ×
+the platform's multiple), where F = R9's provisioning floor, 50 µs (`PROVISION_FLOOR`, the requirement itself, which
+the bench gates on too) and the multiple, `loaded_wake_ratio()` (paired `#[cfg]` functions with one signature), is 0
+on Linux and macOS and 100 on Windows (A-223's window rule, below); closed-loop hold = 2F × the least k with
+((S − 1)/S)^k ≤ 1/100, S the shards and 1/100 R9's tail (`config::closed_loop_hold`: 700 µs at two shards, 1.2 ms at
+three, 6.7 ms at fifteen), held by a forward for a request that came within F of its shard's last client I/O, and never
+more cycles of 2F than its loop had run before it (`verbs::loop_hold`; A-326, below).
+
+> **Status (2026-11-11, A-223's window rule: the idle window is R9's floor, not a multiple of the estimate).** The
+> window was the shard's live wake estimate × 100. The estimate counts the time a woken shard waits for a CPU, which
+> its own spinning lengthens, so under load the window followed it to hundreds of milliseconds, and on Linux a client
+> paced at 1 ms kept its shards spinning at 1.5–2.0 cores even quiet. Now the window is `max(F, wake × multiple)`:
+> F, R9's 50 µs floor, keeps a closed-loop client that meets R9 (its next request within F of its last reply) on
+> polling shards, and the multiple is 0 on Linux and macOS, so there no estimate prices the window and a shard's
+> spinning cannot lengthen it. The boot probe's smallest confirmed wake was weighed as the other input and dropped: on
+> a quiet boot it is the smallest of many confirmed wakes (5.4–6.6 µs on Linux), but a daemon booted beside spinners
+> read 6.8–346 µs, past F in 5 of 9 boots on each Linux runner, and the daemon cannot tell a loaded boot from a slow
+> machine. Windows keeps the multiple of 100: a Windows shard parked under load waits 50–100 ms to run again, and at
+> F alone every loaded request paid it (GAPS, open). Both live readers, the shard's idle spin and the serve loop,
+> read the one window (`ShardContext::idle_window_ns`); the step quantum still reads the estimate's mean. Measured: BENCHMARKS, "The idle window's rule"; test:
+> `crates/server/tests/idle_window.rs`.
+
+> **Status (2026-11-18, A-326: a closed loop holds the shards it goes round).** R9's floor covers a closed loop's
+> return to its own shard, but a create goes to the partition its name hashes to and every later verb to its volume's
+> owner, so with S shards a loop comes back to a given owner only after a geometric number of cycles. At F alone a
+> quiet single client's p99 on ubuntu-24.04-arm's three shards was 116.4 µs against main's 27.1, its shards parking
+> 144–331 times per 1,000 creates (the A-223 plan's step 6, 2026-11-12); a fixed `F × S` window brought it to 36.8 µs
+> and `2F × S` to 29.5, but a fixed window costs a paced client the same spin (1,386–2,289 thousandths of a core at
+> fifteen shards against main's 664), so the rule had to tell the two clients apart. The shard that reads a request
+> does: one that came within F of the shard's last client I/O (a request read or a reply written; a client's own
+> acknowledgement keeps the clock but never lengthens a loop) continues a closed loop, R9's own definition of one, and a
+> forward made for it carries a hold for its owner (`ShardContext::hold_idle_window`) of the loop's return at R9's
+> percentile, 2F × the least k with ((S − 1)/S)^k ≤ 1/100, 2F being a cycle of a loop that meets R9 (its request and its
+> think time). A hold never spans more cycles than the loop had run before the request, so the spin a loop leaves
+> behind when it ends is at most what the loop itself took, and a paced client's create (after its pause) and its
+> destroy (the first request of a run) hold nothing. No estimate is an input, so (i) still holds. Test:
+> `crates/server/tests/closed_loop.rs` (a loop over three shards finds them polling; a paced client holds none).
 
 **Worked example.** From Python: `await client.create("scratch", bounded=4 GiB)`: the extension
 writes the slot, spins for `spin_ns`, and returns the reply without ever touching the event loop
@@ -6532,8 +6597,27 @@ reconstruction budget are derived, never fixed (D-O6).
 > once at the walk's end. Counted `fleet.seal.walks` / `fleet.seal.walk_slices` (`fleet.mirror.*` for the mirror
 > track). Held by `a_shards_seals_are_walked_in_turns_and_every_one_places` (`crates/server/tests/fleet.rs`: 12 volumes
 > sealed at once with the turn cut to one volume, every snapshot placed). Owed (measurement): the owner shard's longest
-> step while hundreds of volumes seal at once, before and after; and the envelope wrap at a seal's end
-> (`fleet::envelope_of`) is still one turn of the whole archive's new chunks (64 MiB took 98 ms, 2026-10-05).
+> step while hundreds of volumes seal at once, before and after. The envelope wrap at a seal's end, one turn of the
+> whole archive until 2026-11-18, is in turns too (A-323, below).
+
+> **Status (2026-11-18, A-322 and A-323, g230: a seal's envelope in turns, and a refused one started again).** On a
+> node that seals, a seal's archive is wrapped in its envelope (A-92 piece 3b) before its content is put. The wrap ran
+> whole in the turn the archive walk ended (`fleet::envelope_of`): 98 ms for 64 MiB of 64 KiB chunks (`envelope_bench`,
+> 2026-10-05), so at about a GiB one turn ran past the watchdog's window of a second, and the watchdog ended the owner at
+> every seal of such a volume. It now runs in turns (A-323): the job keeps the plain archive inside a
+> `slates_cluster::envelope::Wrapping`, and each visit of the seal walk seals its chunks, one at least, until the share of
+> the turn's quantum the archive walk takes has passed on the shard's clock (`config::wrap_slice_ns`; the wrap has no
+> measured rate of its own, so it is held to the clock), then seals the manifest last; the envelope is the very one a
+> whole wrap makes. The volume's keys are found again each turn, since a volume's lineage and naming keys are made once
+> and never replaced. Counted `fleet.seal.wrap_slices` (`fleet.mirror.wrap_slices` for a mirror shipment). And a refused
+> envelope now drops its seal (A-322): the job was kept with its walk spent and no archive, so every later period found
+> it complete with nothing to put, its head never placed whatever the keys did next, and a heal kept that way shut the
+> healer out of the volume. Held by `a_seals_envelope_is_wrapped_in_turns_and_places` and
+> `a_seal_whose_envelope_was_refused_is_started_again_and_places` (`crates/server/tests/fleet.rs`) and by
+> `an_envelope_wrapped_in_slices_is_the_whole_wraps_to_the_byte` and `a_wrap_ends_at_its_envelope_or_its_refusal`
+> (`crates/cluster/tests/envelope.rs`). Owed (measurement): the owner shard's longest step while a GiB volume seals,
+> before and after. Owed: a seal's archive walk and its wrap each advance one slice a record period, so a large volume
+> takes many periods to place (GAPS); and a takeover's open of the envelope still runs in one turn of the successor.
 
 **Auto-seal.** Each volume seals at its derived cadence (or on explicit `snapshot`, on `detach`,
 on `archive`, and when the owner is asked to drain); publishing a server root is O(1), while
@@ -6557,8 +6641,21 @@ so an agent that needs durability can `await placed(scope)`.
 > third write unsealed, then the owner lost. The owner named the first seal's sequence before and after the second;
 > the successor reported serving that sequence under a later epoch; the first file survived and both later ones were
 > gone. **Owed:** auto-seal at a derived cadence (Phase 8 task 8, which needs the operator's loss-window SLO: a
-> decision for Ada), so the window is bounded; and the takeover report kept across the successor's own restart (it
-> lives in the shard's memory).
+> decision for Ada), so the window is bounded.
+>
+> **Status (2026-11-18, A-325: a successor's restart keeps the volume it took over, and its takeover report; g230).**
+> The takeover lived in the successor shard's memory, so a successor restarted warm over its anchor reported none. It
+> is now kept in the volume's record (`VolumeRecord::taken_over`, appended; `slates_db::catalog::TakeoverRecord`),
+> written in the same record that makes the taken-over volume on its successor, replayed from the anchor at a restart
+> and gone with the volume. The test found a worse loss behind it: nothing published the shard's image after a
+> takeover until the volume's first write, so a successor restarted before then found no image for the volume
+> (`NoImage`) and never served it again, though its records named it the owner. A volume taken over from its seal is
+> now published before it is served (`fleet::published_before_served`; a refused publication keeps the takeover
+> pending, counted `fleet.materialize.unpublished`). Held by `a_successors_takeover_report_survives_its_warm_restart`
+> (`crates/server/tests/fleet.rs`: a successor restarted warm serves the volume, reports the very takeover it reported
+> before, its member id unchanged, the file read back). **Owed:** a live-shipped volume taken over is still published
+> first by its first write's barrier; publishing it at the takeover starts the successor's live log there
+> (`live_ship::published`), a change to the live takeover's shape left to its own piece (GAPS).
 
 > **Status (2026-11-05, A-222: another host's write attachment).** A client on another node attaches a volume in the
 > record form, through the fleet's forward, and writes it through the file verbs; the owner records it under the
@@ -6985,6 +7082,17 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > live volumes, the quantum cut to one volume a slice, every log durable at its head after three periods). Owed
 > (measurement): the owner shard's longest step with thousands of live volumes, before and after.
 >
+> **A holder's return in turns (2026-11-18, A-324, g230).** When a holder's record session is established again, every
+> shard sends it what its live volumes owe it at once (`live_ship::holder_reached`). That ran in one turn of each shard:
+> every live volume visited, and every message the holder lacked built, an install a copy of the whole volume each. It
+> now walks each shard's live volumes in turns of the shard's step quantum, as the period does (`reached_walk` and
+> `reached_slice`, one task of the control shard a shard, each turn awaited within the live exchange's budget), each
+> turn's messages dispatched before the next; a turn the shard does not answer ends the walk, and the period sends the
+> rest. Counted `fleet.live.reached_slices`. Held by `a_holders_return_is_walked_in_turns_and_it_takes_every_log`
+> (`crates/server/tests/fleet.rs`: 12 live volumes, a holder held off its shard for two liveness budgets while each is
+> written, the turn cut to one volume; at least 12 turns, and the holder at the owner's head on every volume). Owed
+> (measurement): the owner shard's longest step when a holder of thousands of live volumes returns, before and after.
+>
 > **The credit in bytes (2026-11-17, A-200 amended that day, AC-8.9).** The owner's credit was a fixed two entries, and
 > a publication past it shipped the whole volume next. Now the entries not yet durable and the retained tail are each
 > held to the wire bytes of the whole state an install would send (`slates_db::live::Bounds::of_whole`, set at each whole
@@ -7036,6 +7144,18 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   The announcement now carries the advertised port, and every relayed flow requires the relay to have carried at least
 >   one record-plane datagram per acknowledged write (`judge_relayed`, its non-vacuity count;
 >   `docs/bugs/2026-11-18-a-redial-went-around-the-port-mapping-the-record-plane-was-announced-at-its-bound-port.md`).
+
+> - **A successor's log began again at genesis (fixed 2026-11-18, A-329).** The flows' first gated run (macOS, main
+>   bfc34cace, kiln r1246) failed Continuity in five takeover flows: the successor's head after its first write was
+>   position 1, against 72 to 1,000 made durable under the dead owner's epoch. `Shipper::new` takes the head a takeover
+>   adopted as its start, and `live_ship::published` had passed none since A-200's first slice, so every successor's
+>   log began at position 0; ranks still grew by epoch, so holders took it, and NoLoss held. The successor's owner
+>   shard now keeps the adopted head from its takeover (`live_ship::adopt_head`) until the volume's shipper is made,
+>   which starts there: its first entry is numbered one past the adopted head, which is at or past every durable position.
+>   Held by `a_successors_first_entry_is_numbered_past_the_head_its_takeover_adopted` (`live_ship`'s unit tests) and
+>   `a_successors_live_log_goes_on_past_every_position_durable_before_it` (`crates/server/tests/fleet.rs`). Owed: the
+>   adopted head lives in the successor shard's memory until the volume's first publication, as the volume's own image
+>   does (GAPS, A-325's live-shipped item).
 
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
@@ -7695,6 +7815,15 @@ it builds against the contract and adds to it rather than around it.
 > (`a_signed_merge_is_judged_and_read_back_through_the_contract`: a requiring green refuses an
 > unsigned merge, the statement signed by the trusted key merges at 1 verified, its record reads back
 > verified and the origin's unsigned).
+> **`CONTRACT` = 14** (10 to 13 landed beside it): `StartSpec::anchor_command_under(wrapper)`, the anchor's command under a
+> wrapper that execs it (`systemd-run --user --scope -- ...`, kiln's Linux start), the launcher's
+> record kept on its standard input; proven under `/usr/bin/env`, an exec wrapper, by a policy set
+> under the launcher's secret.
+> **`CONTRACT` = 15:** the volume core's refusals typed on the wire (`Refusal::Volume { refusal:
+> VolumeRefusal }`, appended; `refusal_of_vfs` exhaustive, its catch-all gone): until then each
+> reached a client as `BadRequest` carrying its name, a pinned snapshot's destroy among them (A-310's
+> seam found it). The contract puts each in the class a consumer acts on (`Busy::Volume` for `Pinned`
+> and `DaxMapped`, `Stale`, `Denied`, `Exhausted`, `Unusable` or `Invalid` `::Volume` for the rest).
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -11700,8 +11829,8 @@ connection; the handoff's `activate` and `ACTIVATION_LOST` removed; `Daemon::idl
   0.08–0.11 % of a CPU after its client (1.6–1.8 % before); idle fleet pods at 2.3–3.6 s of CPU in 190 s
   (28–62 s before). The fleet suite passes 59 of 59 and the CLI suite 13 of 13.
 - What it does not change: the serve loop's polling window and its doorbell protocol; the window's
-  length (the shard's wake estimate × `IDLE_WINDOW_RATIO`); a request after a quiet window pays one kick,
-  as before.
+  length (then the shard's wake estimate × 100; R9's floor on Linux and macOS since A-223's window rule); a request
+  after a quiet window pays one kick, as before.
 
 ### A-43 — A landing removes an entry only as the object it moved aside and checked (2026-09-29)
 Applied in the same change to: §4.15 (step 6's removals, step 11's resume, "Exchange fallback", the
@@ -13078,7 +13207,8 @@ hand-off to a successor), and only for the member its committed configuration na
 successor keeps it only when the volume's naming record opens under it. "A successor takes a volume only by a key
 wrapped to it" holds: the key reaches a candidate of the volume and no other node, wrapped to that candidate.
 Built (2026-10-05): piece 3b, the envelope archive (`slates_cluster::envelope`), on hyper-raft `f9a2c8e`. When a seal's
-archive is complete, the owner shard wraps it (`fleet::envelope_of`). Each chunk is sealed under a data key derived from
+archive is complete, the owner shard wraps it (`fleet::wrap_slice`; in turns of its step quantum since A-323, 2026-11-18,
+where one turn wrapped it whole before). Each chunk is sealed under a data key derived from
 the volume's lineage key and the BLAKE3 of exactly the record sealed (hyper-seal `FileSealer::content_keyed`, seal.md
 §4). Keying by the record and not the chunk's identity matters: one identity can be stored under two encodings, and
 keying by it would seal two plaintexts under one key and nonce (`keyed_names_match_within_a_tenant_and_differ_across_
@@ -13088,7 +13218,8 @@ creation time zeroed, is sealed as one more chunk, so a re-seal of the same snap
 same envelope. The envelope's clear tree names `c<keyed name>` per sealed chunk and `m<keyed name>` for the manifest.
 Its root metadata carries inode `u64::MAX`, which no volume root has, and the manifest identity a head pins covers
 it, so a holder cannot make a reader take one kind of archive for the other. A node that seals never places in the
-clear: a key or a seal that refuses drops the seal (`fleet.seal.envelope_refused`) for the next period; a node whose
+clear: a key or a seal that refuses drops the seal (`fleet.seal.envelope_refused`) for the next period (so since A-322,
+2026-11-18: the job was kept with nothing to do before, and its head never placed); a node whose
 sealing is `unavailable` (no locked key region or root) places as before, and status says so. A successor adopts the
 lineage and naming keys from the head before it materializes and opens the envelope with them; without them it
 refuses (`fleet.seal.envelope_unopened`) and never serves ciphertext as files. Proven:
@@ -15446,6 +15577,117 @@ support), GAPS, `docs/bugs/2026-11-05-a-call-waited-for-its-acknowledgements-sca
 - **What it does not change.** The bound (`2 × slots`), `AcknowledgementOwed`, the client's cadence and its watermark,
   and an acknowledgement's own refusal on the client's shard, which is still its reply.
 - **Next lever (C, GAPS):** carry the watermark in every request, so no separate acknowledgement is needed at all.
+
+### A-326 — A closed loop's forwards hold the shards it goes round for its return at R9's percentile (accepted and built 2026-11-18, goal g234; amends A-223's window rule)
+Applied in the same change to: §4.3 (derived constants), §4.7 (derived constants and a status), GAPS (A-223's entry),
+BENCHMARKS ("The idle window's rule": step 6's multi-shard rows and what is owed), `crates/rt` (`ShardContext::
+hold_idle_window`, `Counters::idle_holds`, the spin reading the hold), `crates/server` (`config::closed_loop_hold`,
+`loop_revisit_cycles`, `PROVISION_TAIL`, `CLOSED_LOOP_CYCLE_NS`, `DaemonConfig::closed_loop_hold_ns`; `verbs::loop_hold`,
+the forward carrying its hold, `PendingForward::hold_ns`; `ShardState::forward_hold_ns`, `loop_run`,
+`last_client_io_ns` and `loop_io`, stamped by `serve_round` at the end of a round's client I/O; `serve` takes the
+round's clock and `judge_loop_request` judges each request, an acknowledgement apart), and the tests
+`crates/server/tests/closed_loop.rs`, `crates/rt/tests/idle_spin.rs` (the held window) and the hold's derivation in
+`config.rs`.
+- **The defect.** A-223's window rule keeps a closed loop's own shard polling: the client's next request comes within
+  F of its last reply. It does not keep the loop's other shards polling. A create goes to the partition its name hashes
+  to, and every later verb to its volume's owner, so with three or more shards an owner hears from the loop only after
+  the loop has gone round the others, longer than F. At F alone the A-223 plan's step 6 measured a quiet single
+  client's p99 of 116.4 µs on ubuntu-24.04-arm's three shards against main's 27.1 (runs split 41–44 and 114–122 µs),
+  its shards parking 144–331 times per 1,000 creates (diag-liveness-42, -43). Main kept the owners polling only
+  because its window was the estimate × 100, which also made a paced client spin; at fifteen shards main itself failed
+  R9 (102–176 µs on adacachy2).
+- **Why not a fixed window.** `F × S` measured 36.8 µs at three shards, 3–7 parks per 1,000; `2F × S` 29.5 µs, within
+  main's spread. But a fixed window spins for a paced client as long as for a closed one: a 1 ms-paced client cost
+  365–584 thousandths of a core at three shards and 1,386–2,289 at fifteen, against main's 664 there and F's 222
+  (step 6, diag-liveness-44 and adacachy2). The rule must tell the two clients apart, and only the shard that reads the
+  request can.
+- **The rule.** A request read within F of the end of its shard's last round of client I/O (a request read or a reply
+  written; never its background work, whose slices went on through a paced client's pause and made 1 to 3 of 24 paced
+  cycles look like a loop's in the first build; a client's own acknowledgement keeps a loop's clock running within F
+  and ends a loop after a pause, but never lengthens a run or holds a shard: counted, it made a paced client's destroy
+  the third request of a loop, and skipped, it ended a debug loop at every acknowledgement) continues a closed loop,
+  R9's definition of one (its
+  client's next request within F of its last reply); a forward made for it carries a hold, and the owner keeps its
+  idle window open at least that long (`ShardContext::hold_idle_window`; the longest hold asked stands). The hold is
+  2F × k, with 2F a cycle of a loop that meets R9 (its request within F at R9's percentile and its think time within F)
+  and k the least count with ((S − 1)/S)^k ≤ 1/100: each request lands on a given owner with probability 1/S, so the
+  cycles until the loop returns are geometric, and k covers all but R9's tail of returns (k = 7, 12, 67 at 2, 3, 15
+  shards: 0.7, 1.2, 6.7 ms). Its inputs are R9's floor, R9's percentile and the shard count, so no load moves it and
+  item (i) holds as before. A hold never spans more cycles of 2F than the loop had run before the request
+  (`verbs::loop_hold`), so the spin a loop leaves behind when it ends costs at most what the loop itself took, the
+  ski-rental bound counted in the loop's own cycles; a paced client's create, after its pause, ends any loop, and its
+  destroy, the first request of a new one, holds nothing.
+- **What it costs.** Nothing for a paced client, whose requests hold nothing (the paced form of `provision_bench` keeps
+  A-223's window rule's cost). For a client in a closed loop, every shard the loop goes round keeps polling while it
+  runs, as on main, and for at most its hold once it ends. On a loaded machine a loop's think time passes F and the
+  holds lapse, which keeps the window rule's loaded gain.
+- **Owed (the supervisor's measurement):** `provision_bench` at the derived and at three shards on every CI runner and
+  a many-core Linux machine, quiet and loaded, every N: single-client p99 against main's, parks per 1,000 in the
+  spinning and paced forms, and the paced form's CPU (GAPS, A-223's entry).
+- **Not decided here: Windows' window** (A-223's open item (C)). The hold applies on Windows too, beside the multiple.
+
+### A-223's window rule — The idle window is R9's floor; no estimate prices it on Linux and macOS (accepted 2026-11-11, the supervisor's decision A)
+Applied in the same change to: §4.1 (its status and derived constants), §4.3 (derived constants), §4.7 (derived
+constants and a status), A-42's entry (its wording), GAPS (A-223's entry, §5), BENCHMARKS ("The idle window's rule"),
+`crates/server` (`config.rs`: `PROVISION_FLOOR`, `loaded_wake_ratio` and `idle_window_ns` replace the idle
+ratio of 100; `daemon.rs`: the serve loop reads the shard's window, `ShardPulse` reports it), `crates/rt`
+(`WakeTracking::idle_floor_ns`, `ShardContext::idle_window_ns`, `Pulse::idle_window_ns`), `provision_bench` (it reads
+F from the library), and the tests `crates/server/tests/idle_window.rs`, `crates/rt/tests/wake_estimate.rs` and the
+rule's table in `config.rs`.
+- **The defect.** The idle window was the shard's live wake estimate × 100. The estimate learns each kicked park,
+  including the time the woken shard waits for a CPU, and a spinning shard lengthens that wait for everyone. So the
+  window fed on its own spinning. Under two spinners a logical CPU the estimates reached 0.2–6.1 ms and the windows
+  hundreds of milliseconds. Even quiet, a Linux client paced at 1 ms kept its owner shard spinning at 1.5–2.0 cores on
+  main, because its live estimate of 34–70 µs made a 3.4–7.0 ms window over a 1 ms pause.
+- **The rule.** `W = max(F, wake × loaded_wake_ratio())`. F is R9's provisioning floor, 50 µs, written as a `derived!`
+  whose formula is R9's bound (AC-2.1): it is a requirement, not a measurement, so no load moves it, and the bench's
+  gate reads the same constant. A closed-loop client that meets R9 sends its next request within F of its last reply,
+  so it finds its shards still polling. The multiple is 0 on Linux and macOS, so there no estimate prices the window,
+  and item (i), the window cannot count delay its own spinning causes, holds by construction. On Windows it is the
+  old 100, kept until Windows' own window is measured. Both live readers read the one window: the shard's idle spin,
+  and the serve loop. The step quantum still reads the estimate's mean. (A kept forward's re-send no longer reads it:
+  since A-279, 2026-11-17, the owner's drain tells the sender.)
+- **Why not the boot probe's smallest wake.** Option 2 as proposed was `max(F, the probe's smallest confirmed wake)`.
+  On a quiet boot that minimum is trustworthy: it is taken once, before any client, as the smallest of many confirmed
+  wakes (5.4–6.6 µs on CI's Linux runners, 0.9–2.8 µs on macOS, 3.1–7.1 µs on Windows). But a daemon booted beside two
+  spinners a CPU read 6.8–259 µs on ubuntu-latest and 8.2–346 µs on ubuntu-24.04-arm, past F in 5 of 9 boots on each.
+  The daemon cannot tell a loaded boot from a slow machine, and the term only ever lengthened the window, so it was
+  dropped.
+- **Measured and rejected** (BENCHMARKS, "The idle window's rule"): the floor of confirmed wakes (it queued as well,
+  0.33–33.8 ms at two shards); that floor less Linux's run-queue time (0–1.75 µs, so the shards parked between a
+  client's requests); the live floor × 100 capped at 4F (no better on any criterion, at twice the paced CPU on Linux).
+- **Measured** (diag-liveness-35, two shards, every N in BENCHMARKS). On Linux the paced client's CPU fell from main's
+  1,451–2,023 to 155–224 thousandths of a core. The loaded single-client p99 halved (8.0 → 4.0 ms on x86_64, 9.8 → 4.0
+  ms on arm64). The quiet p99 stayed within main's spread. macOS's paced CPU fell from 105–333 to 85–112. Built
+  (diag-liveness-37, every N in BENCHMARKS "The idle window's rule as built"): Linux's paced client costs 188–219
+  thousandths of a core quiet and 293–365 loaded (main 859–1,051), its loaded p99 0.34–5.60 ms. The plan's bar of 150
+  quiet is not met on Linux or on Windows (131–341, the ×100 it keeps); what a shorter window costs in p99 is the
+  plan's step 6. The paced-client test failed 6 of 6 on Linux before the rule and passed 6 of 6 after.
+- **Not decided here: Windows' window.** A Windows shard parked beside two spinners a CPU waits 50–100 ms to run again,
+  so F alone made that every loaded request's latency (97–100 ms on windows-latest, 48–56 ms on windows-11-arm,
+  against 125–127 µs at the multiple). GAPS holds it open, and §5 lists the 100 as a residual literal.
+
+### A-223 — The Windows wake estimate confirms its sleeper (accepted and built 2026-11-06)
+Applied in the same change to: §4.1 (a status note), §4.3 (the online estimate's unslept filter on Windows), GAPS,
+`crates/machine` (`switches.rs`, `wake.rs`, profile format 5), `crates/rt` (`attribution.rs`), the workspace's
+`windows-sys` features, `unsafe-budget.toml`, and the bug record of 2026-11-06.
+- **The defect.** On Windows both wake measurements took a handoff for a wake. The probe trusted the waiter's
+  announcement; the shards learned kicks that landed before their thread blocked. jupiter's shards read 0.62–0.83 µs.
+  Their owner parked during 221–546 of 2,000 single-client creates, and 20–21 of each run's 21 slowest creates had
+  their owner park during the create.
+- **The decision.** The waiter's own context-switch count is the Windows proof of a sleep, per wait, at 14–49 ns a
+  read. The cycle count of the waiter is the waker's gate before a kick, which keeps the dropped wakes few (0–2 a
+  profile). The supervisor's plan named the cycle count; CI showed it is not proof alone, so both are used.
+- **Measured.** At two shards on both CI Windows runners, owner parks per 1,000 single-client creates fell to 0–1, and
+  the quiet single-client p99 fell by 4–32 %. The 8-client p99 moved within 7 %. CPU with no client stayed 0–0.005 core.
+- **Not decided here.** The idle window's ratio to the wake now costs 0.21–0.38 core under a client paced at 1 ms, and
+  follows a loaded shard's run-queue wait. GAPS holds it open.
+- **The client (sibling (d), built 2026-11-11).** The ipc client's Windows wait learned an unconfirmed stamp, since the
+  Event cannot report a sleeper found. It now reads its own switch count across the wait and drops a wait that never
+  switched out, or whose count the OS refused, keeping its seed then. On CI's Windows runners main learned 11–48 of
+  the 11–49 racing parks a run (of 16,384) that never switched out, and the fixed client none. Applied to §4.7 (wake
+  strategy, status), `crates/ipc` (`endpoint.rs`, `tests/rings.rs`) and `crates/client` (`Client::wake_estimate`,
+  provision_bench's `client wake` line).
 
 ### A-218 — The macOS idle spin's policy (measured and rejected 2026-11-05; main's spin stays)
 Applied in the same change to: §4.3 (its "Loop" paragraph: on macOS the zero-timeout harvest sleeps about 15 µs, kept),
@@ -22748,6 +22990,23 @@ contract", new, with its status), GAPS (the A-299 entry and the Embedding librar
   (`docs/bugs/2026-11-18-a-greens-status-failed-in-the-contract.md`). `DriftReport::watcher` is a `Watcher`. Applied to
   `crates/ipc/src/protocol.rs`, `crates/server/src/{verbs,merge_service}.rs`, `crates/api/src/{volume,instance,lib}.rs`,
   `tests/api.rs`.
+- **`CONTRACT` 14, the same day (g263's ask; 9 to 13 landed beside it):** `StartSpec::anchor_command_under(wrapper)`, since a host cannot take
+  a `Command`'s standard input out to hand its wrapper's: the wrapper's words, then the anchor's program, prefix and
+  role, with the launcher's record on standard input, the marker and the process group. Proven by
+  `an_anchor_started_under_an_exec_wrapper_keeps_the_launchers_secret` (`/usr/bin/env` execs the anchor; a policy set
+  under the launcher's secret verifies; the anchor stops at `SIGTERM`, exit 0).
+- **`CONTRACT` 15, the same day: the volume core's refusals typed.** `refusal_of_vfs` (`crates/server/src/error.rs`)
+  ended in a catch-all that sent every volume-core error it did not name as `BadRequest { reason: "<its name>" }`, an
+  uncategorized refusal (CLAUDE.md §3): `Pinned` (a snapshot a clone holds, a green's origin), `DaxMapped`,
+  `NotDirectory`, `NotEmpty`, `StaleHandle` and fifteen more reached every consumer as words. A-310's seam found it
+  (its simulator had to answer `Invalid::Request("Pinned")`). The wire appends `Refusal::Volume { refusal:
+  VolumeRefusal }`, one variant per volume-core error, with the journal's and the recovery image's numbers; the mapping
+  is exhaustive, so a new volume-core error does not compile until it is classified, and `BarrierIncomplete` now
+  reaches the wire's own variant. The contract classes each: `Pinned` and `DaxMapped` a holder (`Busy::Volume`), a stale
+  handle and a drifted base a moved view (`Stale::Volume`), the volume's rules a denial, its bounds exhaustion, an
+  unreadable journal or image unusable, the operations an entry does not take invalid. Applied to
+  `crates/ipc/src/protocol.rs`, `crates/server/src/{error,verbs}.rs`, `crates/server/tests/{recovery,fuse_mount}.rs`,
+  `crates/api/src/{error,sim,lib}.rs`, `tests/api.rs` (the seam's suite asserts the typed `Pinned`).
 - **Checked.** `cargo test -p slates-api` (37 unit, 9 by use, 5 start, 1 doc) and `cargo test -p slates-cli` on
   macOS arm64 (kiln runner, 2026-11-18): the cases in §4.12's status. The Linux and Windows arms of the mount and the
   CLI's Windows unmount are not compiled on this host; the integrator's lanes are their first compiler.
@@ -24595,6 +24854,109 @@ test), and the bug record `docs/bugs/2026-11-18-a-fresh-member-joined-before-its
 - **What it does not change.** Who the council admits, who votes, and what a learner adopts. A learner's known voters
   can still go back through another learner's answer (the bug record's sibling); an admitted member has its
   neighbourhood to fetch through, so that no longer strands anyone.
+
+### A-322 — A seal whose envelope is refused is dropped and started again the next period (2026-11-18, g230, scale-out; a bug against A-92 piece 3b's own words)
+Applied in the same change to:
+- §4.10 "Content replication": the status of 2026-11-18 (A-322 and A-323); the A-92 record's piece 3b paragraph.
+- `crates/server/src/fleet.rs`: `wrap_slice`'s refusal drops the seal job from its track's map (`advance_seal` is the
+  caller), so the next period starts it again; `envelope_of` is gone (A-323).
+- Tests: `a_seal_whose_envelope_was_refused_is_started_again_and_places` (`crates/server/tests/fleet.rs`).
+- GAPS: the entry of 2026-11-18. The bug record: `docs/bugs/2026-11-18-a-refused-envelope-left-its-seal-with-nothing-to-do.md`.
+- **What was there.** A-92 piece 3b says a key or a seal that refuses "drops the seal for the next period". The code kept
+  the job with its walk spent (`archiver: None`) and no archive. `advance_seal` read a job with no walk as complete, and
+  `content_work` found no archive to put, every period after: the seal never started again, its head never placed
+  while that snapshot was the head, and a heal kept that way shut the healer out of the volume, since the healer passes
+  over a volume with a job.
+- **The rule.** A seal whose envelope is refused, by a key or by the seal, leaves its track's map at once, counted
+  `fleet.seal.envelope_refused`; the next period's walk finds no job and starts the seal again, from its archive walk.
+
+### A-323 — The envelope wrap at a seal's end runs in turns of the shard's step quantum (2026-11-18, g230, scale-out; CLAUDE.md "Bounded work everywhere")
+Applied in the same change to:
+- §4.10 "Content replication": the status of 2026-11-18 (A-322 and A-323) and the seal walk's status; the A-92 record's
+  piece 3b paragraph.
+- `crates/cluster/src/envelope.rs`: `Wrapping` (`new`, `advance`, `chunks_left`), `EnvelopeError::Spent`; `wrap` is one
+  whole advance; the module doc.
+- `crates/server/src/fleet.rs`: `SealSlicing`, `advance_seal` (the walk, then the wrap), `wrap_slice` and `wrap_until`,
+  counters `fleet.seal.wrap_slices` and `fleet.mirror.wrap_slices`; `crates/server/src/head.rs` (`SealJob::wrapping`);
+  `crates/server/src/config.rs` (`wrap_slice_ns`).
+- Tests: `an_envelope_wrapped_in_slices_is_the_whole_wraps_to_the_byte` and `a_wrap_ends_at_its_envelope_or_its_refusal`
+  (`crates/cluster/tests/envelope.rs`); `a_seals_envelope_is_wrapped_in_turns_and_places` (`crates/server/tests/fleet.rs`).
+- GAPS: the entry of 2026-11-18; the envelope's and the seal walk's entries of 2026-11-17 (their wrap item closed).
+- **What was there.** The owner shard wrapped a seal's whole archive in the turn its walk ended: 98 ms for 64 MiB of
+  64 KiB chunks at load 14 on an M5 Max (`envelope_bench`, 2026-10-05), about 1.5 s a GiB. The watchdog ends a daemon
+  whose shard runs a whole window of CPU without finishing a step (A-228; the window is a second), so a seal of a volume
+  of about a GiB ended its owner, and the restart sealed it again.
+- **The rule.** The archive the walk completes moves into a `Wrapping` on the seal job. Each visit of the seal walk
+  seals the archive's chunks in the order the archive lists them, one at a time, until `wrap_slice_ns` of the turn's
+  quantum (the archive walk's share, half) has passed on the shard's clock, one chunk at least, and seals the archive
+  without its chunks last. The wrap has no measured rate of its own in the boot profile (a seal and three BLAKE3 passes
+  a byte, where the walk's slice is sized by one), so it is held to the clock, not to a byte count. A turn is then about
+  a quantum and one chunk, whatever the volume. The envelope is the one a whole wrap makes, byte for byte, so a holder
+  and the healer see no difference. The keys are found again each turn: a volume's lineage and naming keys are made once
+  and never replaced. A refusal at any turn drops the seal (A-322).
+- **Cost.** A large volume's seal places later: the walk and the wrap each advance a slice a record period. The plain
+  archive is kept in the job until the wrap ends, as the whole wrap kept it (and copied it once more) for its turn.
+
+### A-324 — A returned holder's walk over a shard's live volumes runs in turns of the step quantum (2026-11-18, g230, scale-out; CLAUDE.md "Bounded work everywhere")
+Applied in the same change to:
+- §4.10 live shipping (A-200): the status "A holder's return in turns".
+- `crates/server/src/live_ship.rs`: `holder_reached` spawns one walk a shard; `reached_walk`, `reached_slice` and
+  `reached_volume` (the part of the old `send_to_reached` one volume needs); counters `fleet.live.reached_slices` and
+  `fleet.live.reached_unwalked`. `crates/server/src/daemon.rs`: `inject_live_period_quantum` cuts these turns too.
+- Tests: `a_holders_return_is_walked_in_turns_and_it_takes_every_log` (`crates/server/tests/fleet.rs`).
+- GAPS: the entry of 2026-11-18.
+- **What was there.** `holder_reached` ran `send_to_reached` on every shard as one closure: it visited every live volume
+  the shard owns, and for each that had given the holder up built every message it lacked, entries or an install (a copy
+  of the whole volume each), all in one turn of the shard, however many volumes it owned.
+- **The rule.** A holder's return is walked on each shard a turn of its step quantum at a time, by a task of the control
+  shard (one a shard, detached, bounded by the shard's live volumes), each turn's messages dispatched before the next.
+  A turn always visits one volume, so the walk always ends; a turn the shard does not answer within the live exchange's
+  budget ends it, and the record period, which retries every holder its lanes gave up, sends the rest.
+- **Cost.** A holder's catch-up on a shard of many live volumes is spread over turns, each a cross-shard call; the period
+  had always been its backstop.
+
+### A-325 — A successor's restart keeps the volume it took over from a seal, and its takeover report (2026-11-18, g230, scale-out; AC-8.3, §4.8 "persistence before reply")
+Applied in the same change to:
+- §4.10 "Auto-seal": the status of 2026-11-18 (A-325) and the loss window's status of 2026-11-17 (its owed item
+  closed).
+- `crates/db/src/catalog.rs`: `TakeoverRecord`; `VolumeRecord::taken_over` (appended: the partition's log and images
+  change schema, as A-285's appended policy fields did). Every record made elsewhere carries `None`.
+- `crates/server/src/verbs.rs`: `TakenOver::takeover`, written into the record `materialize_taken_over` makes;
+  `loss_report` reads it from the record. `crates/server/src/fleet.rs`: the takeover builds it (`note_taken_over` and
+  the shard's `taken_over` map are gone, with the map's removals at a destroy); `published_before_served` and the
+  counter `fleet.materialize.unpublished`.
+- Tests: `a_successors_takeover_report_survives_its_warm_restart` (`crates/server/tests/fleet.rs`, with its
+  `AnchoredFleet` fixture).
+- GAPS: the loss window's entry of 2026-11-17 (its owed item closed).
+- **What was there.** The takeover was noted in the owner shard's memory after the volume was materialized, so a
+  successor restarted over its anchor, which keeps the volume's records and content, reported no takeover. And nothing
+  published the shard's image after the materialization: a successor restarted before the volume's first write found
+  no image for it (`NoImage`, the boot recovery's refusal), so the volume its records named it the owner of was never
+  served again.
+- **The rule.** The takeover is part of the record that makes the taken-over volume on its successor: one durable
+  record, replayed at a restart and removed with the volume. A volume made on its own node carries none. A volume taken
+  over from its seal is published before it is served; a refused publication keeps the takeover pending, and its next
+  attempt, finding the volume made, publishes again. A live-shipped volume is published by its first write, as before
+  (owed: publishing it at the takeover starts its successor's live log there).
+
+### A-329 — A successor's live log goes on from the head its takeover adopted (2026-11-18, g230, scale-out; Continuity, T-8.6)
+Applied in the same change to:
+- §4.10 live shipping: the chaos flows' status (a successor's log began again at genesis).
+- `crates/server/src/live_ship.rs`: `LiveState::adopted`, `adopt_head`; `published` makes a new shipper from the
+  adopted head when there is one (`Shipper::new`'s `start`); `forget` drops it with the volume.
+  `crates/server/src/fleet.rs`: the live takeover records the head it adopted on the owner shard.
+- Tests: `a_successors_first_entry_is_numbered_past_the_head_its_takeover_adopted` (`live_ship`'s unit tests) and
+  `a_successors_live_log_goes_on_past_every_position_durable_before_it` (`crates/server/tests/fleet.rs`).
+- GAPS: the entry of 2026-11-18.
+- **What was there.** `Shipper::new` has always taken a start ("a takeover's adopted head otherwise"), and the shipper
+  counts it settled and on its chain. `live_ship::published` passed none, so a successor's first entry was position 0
+  at genesis under its higher epoch. Holders judge by rank (epoch, then position), which still grew, so they took the
+  successor's log and no acknowledged write was lost; but T-8.6's Continuity is positional, "the successor's first head
+  is past every position durable under an earlier epoch", and five chaos flows failed it (position 1 against 72 to
+  1,000).
+- **The rule.** The live takeover records, on the owner shard where it materializes the volume, the head phase one
+  adopted. The volume's shipper, made at its first publication, starts from that head and takes it once. A volume
+  made on its own node starts from nothing, as before.
 
 ### A-342 — A dynamic volume holds a version slot for each inode it makes, never its maximum's whole allowance; only a bounded claim reserves its allowance (2026-11-18, kiln goal g266: the HVF microVM review; decided by the supervisor under §4.2's rule, Ada may veto)
 Applied in the same change to: §4.2 "Dynamic volumes and base cache", GAPS (the AUD-29-25–30 row's open question, and

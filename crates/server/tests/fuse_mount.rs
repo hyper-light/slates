@@ -735,7 +735,12 @@ fn a_scoped_fuse_mount_presents_one_directory_and_follows_it() {
   let file = target_dir();
   let refused = client.attach_scoped_fuse(volume, Intent::Read, &file.path, "/private/secret");
   assert!(
-    matches!(&refused, Err(ClientError::Refused(Refusal::BadRequest { reason })) if reason == "NotDirectory"),
+    matches!(
+      &refused,
+      Err(ClientError::Refused(Refusal::Volume {
+        refusal: slates_ipc::protocol::VolumeRefusal::NotDirectory
+      }))
+    ),
     "{refused:?}"
   );
   daemon.stop();

@@ -138,10 +138,14 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// `signers` ([`TrustedSigner`]); a volume's policy may require signed merges, refused
 /// [`PolicyReason::SignatureRequired`], and a consumer's that does `Invalid::SignedMergesNotAVolume`;
 /// `SignatureFault::Expired` gone, since no statement expires; a signed landing still `Unsupported(SignedWork)` (the same
-/// day).
+/// day). 14: `StartSpec::anchor_command_under`, the anchor's command under a wrapper that execs it (`systemd-run
+/// --scope`), the launcher's standard input kept (A-299; the same day). 15: the volume core's refusals typed
+/// (`VolumeRefusal`, each in the class a consumer acts on as `Busy`, `Stale`, `Denied`, `Exhausted`, `Unusable` or
+/// `Invalid` `::Volume`): until then each reached a consumer as an invalid request carrying a word, a pinned snapshot's
+/// destroy among them (A-299; the same day).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 13;
+pub const CONTRACT: u32 = 15;
 
 /// The typed client and its own types, for the verbs [`Instance::client`] lends outside the contract.
 pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, VhostUserDevice};
@@ -151,7 +155,7 @@ pub use slates_ipc::protocol::{
   HostPathReason, Intent, JournalReport, LandingDegradation, LandingDurability, LossReport,
   MountReport, NamePolicy, OwnMountUse, PlacedState, PlannedAction, PlannedContent, PlannedEntry,
   Principal, ReadAt, RecoveryCause, SnapshotId, TelemetryReport, TransportReport,
-  UnsupportedReason, VolumeId, VolumeSummary, VolumeTakeover,
+  UnsupportedReason, VolumeId, VolumeRefusal, VolumeSummary, VolumeTakeover,
 };
 /// The rendezvous's and the channel's own typed refusals the contract carries.
 pub use slates_ipc::{DeliveryFault, error::RouteRefusal};
