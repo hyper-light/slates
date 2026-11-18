@@ -32391,6 +32391,13 @@ and A-467's record's sibling line), `crates/server/src/watchdog.rs`, `crates/api
   answered seal's head and the catalog placed at `f + 1`; a third ask with that seal). Expect the second ask to answer
   the first seal (the same epoch, superseding the handed-over snapshot), the head sealed once, the settle `Placed`, and
   the seal the only snapshot the volume holds.
+- **Evidence.** Mac Studio (kiln r13, 2026-11-19, debug build). Red once, the product as it was before the fix with the
+  test in place: the second ask answered a second seal (`Sealed(0, 2)` then `Sealed(4294967296, 3)`, head epochs 1 to
+  3), and after the settle the volume held the handed-over snapshot 0 beside the second seal. Green: `cargo test
+  --locked -p slates-server --lib -- moves::` 4 of 4 (the second ask answered `Sealed(0, 2)` again, head epochs 1 to 2,
+  the seal the only snapshot held; A-435's busy-shard test passing beside it). `cargo fmt --check` and `cargo clippy
+  --locked -p slates-server --all-targets -- -D warnings` clean; `cargo xtask check`'s 45 literal findings are all in
+  other changes' files (`crates/land`, `crates/base/src/s3/list.rs`, `crates/anchor/src/handles.rs`), none in these.
 
 Applied in the same change to: A-435's entry (its owed item done), GAPS (the `LIVENESS_BUDGET_NS` entry's class A, its
 owed line closed), `docs/bugs/2026-11-18-an-adopted-moves-seal-was-taken-again-after-its-answer-was-lost.md`,
