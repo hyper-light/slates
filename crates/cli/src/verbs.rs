@@ -98,7 +98,7 @@ fn emit_recovery(
   json: bool,
 ) -> Result<(), Failure> {
   use slates_ipc::protocol::{ReplyBody, RequestBody};
-  let proof = match crate::recovery_key::load()? {
+  let proof = match slates_api::role::recovery_key()? {
     Some(key) => key.proof(&plan),
     None => issuer()?
       .recovery_proof(&plan)
@@ -214,7 +214,12 @@ fn unmount_verb(instance: &str, path: &str) -> Result<(), Failure> {
       if !unreported.is_empty() =>
     {
       for volume in &unreported {
-        slates_machine::log_line!("slates: {volume}: its mounts are unknown");
+        slates_machine::log_line!(
+          "slates: volume {} ({}) refused {}: its mounts are unknown",
+          volume.name,
+          slates_api::volume_id_text(volume.volume),
+          volume.refusal
+        );
       }
       Err(failure_of_api(
         slates_api::Error::Mount(slates_api::MountFault::NotMounted { path, unreported }),
@@ -233,18 +238,32 @@ fn unmount_verb(instance: &str, path: &str) -> Result<(), Failure> {
     .map_err(|fault| failure_of_api(slates_api::Error::Mount(fault), instance))
 }
 
-/// A library refusal as the command's failure: the daemon's refusal (exit 1), no daemon (exit 3), or the command's own
-/// (exit 4), as [`failure_of`] maps the client's.
+/// A library refusal as the command's failure: a refusal (exit 1) for every class the daemon or the machine refused
+/// with, no daemon (exit 3), or the command's own (exit 4), as [`failure_of`] maps the client's (A-299's taxonomy).
 fn failure_of_api(error: slates_api::Error, instance: &str) -> Failure {
+  use slates_api::Error as E;
   match error {
-    slates_api::Error::Refused(refusal) => failure_of(ClientError::Refused(refusal), instance),
-    slates_api::Error::Unavailable { cause, .. } | slates_api::Error::Channel(cause) => {
-      failure_of(cause, instance)
-    }
-    slates_api::Error::Mount(
+    E::Unavailable { cause, .. } => Failure::Unavailable {
+      instance: instance.to_owned(),
+      cause: cause.to_string(),
+    },
+    E::Mount(
       fault @ (slates_api::MountFault::Unsupported { .. } | slates_api::MountFault::NoCapability),
     ) => Failure::Refused(fault.to_string()),
-    other => Failure::Failed(other.to_string()),
+    refused @ (E::NotFound(_)
+    | E::AlreadyExists(_)
+    | E::Denied(_)
+    | E::Exhausted(_)
+    | E::Busy(_)
+    | E::Stale(_)
+    | E::Retry { .. }
+    | E::Unsupported(_)
+    | E::Invalid(_)
+    | E::Unusable(_)
+    | E::Elsewhere(_)) => Failure::Refused(refused.to_string()),
+    other @ (E::Host(_) | E::Mount(_) | E::Start(_) | E::Protocol(_)) => {
+      Failure::Failed(other.to_string())
+    }
   }
 }
 
@@ -410,7 +429,7 @@ fn serve_mcp_http(server: slates_mcp::McpServer, port: u16, instance: &str) -> R
   use slates_rt::tcp::{Ipv4Addr, SocketAddrV4, TcpListener};
   let mcp =
     |what: &str, e: &dyn std::fmt::Display| Failure::Failed(format!("mcp http {what}: {e}"));
-  let profile = crate::daemon::measure(true)?;
+  let profile = slates_api::role::measure(true)?;
   let config = slates_server::config::DaemonConfig::derive(&profile, instance, Some(1));
   let runtime =
     slates_rt::runtime::LocalRuntime::new(&config.runtime).map_err(|e| mcp("runtime", &e))?;
@@ -744,15 +763,6 @@ fn emit_create(client: &mut Client, spec: &CreateSpec, json: bool) -> Result<(),
 
 /// `volume snapshot`: the snapshot's sequence number, as text or a JSON `{ "snapshot" }` (the MCP
 /// `slates.volume.snapshot` schema).
-/// A failure's text for a message that reports two of them at once (the NFS mount's bind-then-unmount).
-#[cfg(all(unix, not(target_os = "linux")))]
-fn failure_text(failure: &Failure) -> String {
-  match failure {
-    Failure::Refused(text) | Failure::Failed(text) => text.clone(),
-    other => format!("{other:?}"),
-  }
-}
-
 fn emit_snapshot(client: &mut Client, volume: VolumeId, json: bool) -> Result<(), ClientError> {
   let (snapshot, coverage) = client.snapshot_with_coverage(volume)?;
   // What the barrier could claim (§4.6 "Writeback and snapshot barrier"): `complete` when every write
@@ -2651,7 +2661,7 @@ fn id_list_text(ids: &[u64]) -> String {
 
 /// `slates profile`: the machine profile, as its derived constants or as JSON.
 pub(crate) fn profile(options: &ProfileOptions) -> Result<(), Failure> {
-  let profile = crate::daemon::measure(options.quick)?;
+  let profile = slates_api::role::measure(options.quick)?;
   if options.json {
     let json = profile
       .to_json()
@@ -2707,7 +2717,7 @@ mod harness_tests {
   const TEST_SHARDS: u16 = 2;
 
   /// The machine profile this binary's test daemons derive from, measured **once per process** (§4.1), as
-  /// production measures once at the anchor's boot — `crate::daemon::measure` itself is per-invocation and
+  /// production measures once at the anchor's boot — `slates_api::role::measure` itself is per-invocation and
   /// right to be, which is why this wrapper exists only for the tests.
   ///
   /// Measured afresh per test, the wake probe runs beside the other tests' probes and daemons, measures their
@@ -2721,7 +2731,7 @@ mod harness_tests {
     static PROFILE: std::sync::OnceLock<Result<slates_machine::MachineProfile, String>> =
       std::sync::OnceLock::new();
     PROFILE
-      .get_or_init(|| crate::daemon::measure(true).map_err(|e| format!("{e:?}")))
+      .get_or_init(|| slates_api::role::measure(true).map_err(|e| format!("{e:?}")))
       .clone()
       .expect("the machine profile measures")
   }

@@ -415,6 +415,14 @@ mod tests {
       os,
       transport,
       root_available: super::super::is_root() || super::super::sudo_without_prompt(),
+      // The NFS mount whose waiting writer A-200 concerns: on Linux the FUSE transport's NFS adapter, which the plain
+      // volume's suites this test compares with mount through; elsewhere the transport's own mount.
+      reach: match transport {
+        slates_conformance::Transport::NativeLinuxFuse => {
+          super::super::slates::Reach::LinuxNfsAdapter
+        }
+        _ => super::super::slates::Reach::Own,
+      },
       scratch: super::super::Scratch::open(&options, transport).unwrap(),
     };
     let session = super::super::slates::Session::open_with(

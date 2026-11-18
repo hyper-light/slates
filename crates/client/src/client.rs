@@ -27,6 +27,7 @@ use slates_ipc::protocol::{
   Scope, SizeClass, SnapshotCoverage, SnapshotId, StatusReport, TelemetryReport, VolumeId,
   VolumeSummary, WorkOp, unpack,
 };
+use slates_ipc::protocol::{EntriesCursor, PlannedEntry, PolicySubject, WritePolicy};
 #[cfg(unix)]
 use slates_ipc::rendezvous::ControlDelivery;
 use slates_ipc::{
@@ -176,6 +177,20 @@ pub struct CreateSpec {
   pub require_locked: bool,
   /// A host directory to overlay, or nothing for a scratch volume.
   pub base: Option<String>,
+}
+
+/// One page of a presented landing's entry list ([`Client::landing_entries_page`]; §4.15 step 2): the bytes of the
+/// entries' encodings from the page's cursor, the first and the last entry possibly in part.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EntriesPage {
+  /// The bytes.
+  pub bytes: Vec<u8>,
+  /// Where the next page starts, or `None` when this page ends the list.
+  pub next: Option<EntriesCursor>,
+  /// The entries the manifest holds.
+  pub total: u64,
+  /// The manifest's hash: the one the landing's `GrantRequired` named.
+  pub manifest: [u8; 32],
 }
 
 /// What a `land` call returns: the landing ran, or it needs a grant a human must make.
@@ -3937,6 +3952,111 @@ impl Client {
     })? {
       ReplyBody::Granted { grant } => Ok(grant),
       _ => Err(ClientError::UnexpectedReply { verb: "grant" }),
+    }
+  }
+
+  /// Sets a write policy (A-285): the launcher's or the harness's act, proven by `proof`, the keyed hash under the
+  /// instance's issuer secret (`slates_server::landing::policy_proof`). Refused `Forbidden` on a consumer-bound
+  /// channel (an agent never sets its own policy) and `GrantIssuerUnverified` without the proof.
+  pub fn set_policy(
+    &mut self,
+    subject: PolicySubject,
+    policy: WritePolicy,
+    proof: [u8; 32],
+  ) -> Result<(), ClientError> {
+    match self.call(&RequestBody::SetPolicy {
+      subject,
+      policy,
+      proof,
+    })? {
+      ReplyBody::PolicySet => Ok(()),
+      _ => Err(ClientError::UnexpectedReply { verb: "set_policy" }),
+    }
+  }
+
+  /// A write policy (A-285): `None` while none is set, which is ask.
+  pub fn policy(&mut self, subject: PolicySubject) -> Result<Option<WritePolicy>, ClientError> {
+    match self.call(&RequestBody::Policy { subject })? {
+      ReplyBody::Policy { policy } => Ok(policy),
+      _ => Err(ClientError::UnexpectedReply { verb: "policy" }),
+    }
+  }
+
+  /// One page of a presented landing's entry list (§4.15 step 2, "the full entry list on demand"): the landing a
+  /// [`Landing::GrantRequired`] named, its entries' encodings from `from` (the zero cursor, then each page's `next`).
+  /// Refused `NotFound` for a landing presented to another principal, or one consumed, replaced or abandoned.
+  /// [`Self::landing_entries`] joins the pages and decodes them.
+  pub fn landing_entries_page(
+    &mut self,
+    landing: u64,
+    from: EntriesCursor,
+  ) -> Result<EntriesPage, ClientError> {
+    match self.call(&RequestBody::LandingEntries { landing, from })? {
+      ReplyBody::LandingEntries {
+        bytes,
+        next,
+        total,
+        manifest,
+      } => Ok(EntriesPage {
+        bytes,
+        next,
+        total,
+        manifest,
+      }),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "landing entries",
+      }),
+    }
+  }
+
+  /// Every entry of a presented landing, in the manifest's order (§4.15 step 2): what a grant of `manifest`, the hash
+  /// its [`Landing::GrantRequired`] named, would write, path by path. The pages are read in order from the list's
+  /// start, and each entry is decoded as soon as its last byte has come, so no more than one entry's part is held
+  /// between pages. A page of another manifest or another count, one whose cursor does not move on, and bytes that do
+  /// not decode into exactly the entries its cursor says are whole are refused `UnexpectedReply`, never joined.
+  pub fn landing_entries(
+    &mut self,
+    landing: u64,
+    manifest: [u8; 32],
+  ) -> Result<Vec<PlannedEntry>, ClientError> {
+    let unexpected = || ClientError::UnexpectedReply {
+      verb: "landing entries",
+    };
+    let mut entries: Vec<PlannedEntry> = Vec::new();
+    // The bytes of the entry the last page ended within: its first `from.byte`.
+    let mut part: Vec<u8> = Vec::new();
+    let mut from = EntriesCursor::default();
+    let mut total: Option<u64> = None;
+    loop {
+      let page = self.landing_entries_page(landing, from)?;
+      let expected = *total.get_or_insert(page.total);
+      if page.manifest != manifest || page.total != expected {
+        return Err(unexpected());
+      }
+      // The entries this page completes: those before the next page's (all of them, at the list's end).
+      let whole = page.next.map_or(expected, |next| next.entry);
+      if page
+        .next
+        .is_some_and(|next| next <= from || next.entry > expected)
+      {
+        return Err(unexpected());
+      }
+      part.extend_from_slice(&page.bytes);
+      let mut input: &[u8] = &part;
+      while u64::try_from(entries.len()).unwrap_or(u64::MAX) < whole {
+        let entry =
+          <PlannedEntry as slates_wire::Wire>::decode(&mut input).map_err(|_| unexpected())?;
+        entries.push(entry);
+      }
+      let left = u64::try_from(input.len()).unwrap_or(u64::MAX);
+      match page.next {
+        None if left == 0 => return Ok(entries),
+        Some(next) if left == next.byte => {
+          part = input.to_vec();
+          from = next;
+        }
+        _ => return Err(unexpected()),
+      }
     }
   }
 

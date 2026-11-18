@@ -1300,17 +1300,23 @@ dependencies = [
 name = "slates-api"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "libc",
  "rustix",
+ "serde_json",
  "slates-anchor",
  "slates-bridge-fuse",
  "slates-bridge-nfs",
+ "slates-bridge-winfsp",
  "slates-client",
  "slates-db",
  "slates-ipc",
  "slates-machine",
  "slates-mem",
+ "slates-rt",
  "slates-server",
+ "slates-vfs",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1680,6 +1686,7 @@ dependencies = [
 name = "slates-server"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
  "blake3",
  "hyper-datagram",
  "hyper-seal",

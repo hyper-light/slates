@@ -23,7 +23,7 @@ use std::process::Command;
 
 use slates_ipc::protocol::{Intent, VolumeId};
 
-use crate::error::{Error, MountFault};
+use crate::error::{Error, Missing, MountFault, MountMissing};
 use crate::instance::Instance;
 
 /// How a volume is mounted.
@@ -98,20 +98,19 @@ impl Instance {
     // runtime profile's identity rule), so nothing need be shared with other local users.
     if options.shared {
       return Err(Error::Mount(MountFault::Unsupported {
-        reason: "a shared mount is the Linux FUSE mount's allow_other; a macOS host mount reaches a container \
-                 through Docker Desktop's file sharing as the mounting user",
+        missing: MountMissing::SharedMount,
       }));
     }
-    if backend() == MountBackend::Unsupported {
-      return Err(Error::Mount(MountFault::Unsupported {
-        reason: "`mount_nfs` is not on the PATH — slates's loopback mount needs it (it is built into macOS and the \
-                 BSDs); no kernel extension, FUSE library, or Apple entitlement is required",
-      }));
-    }
+    available().map_err(Error::Mount)?;
     // The mount point as the kernel records it (a read, never a write): the daemon finds the mount it binds and the
     // mounts it keeps across a restart in the kernel's table by exactly this path (A-227).
     let real = real_path(path)?;
-    let report = self.status(volume)?;
+    // The raw status: a mount needs only the volume's name and the daemon's port, so a base the status could not read
+    // now does not stop it.
+    let report = self
+      .client
+      .status(volume)
+      .map_err(|e| self.fail(e, Some(Missing::Volume(volume))))?;
     let port = report
       .nfs_port
       .ok_or(Error::Mount(MountFault::NoNfsListener))?;
@@ -119,7 +118,7 @@ impl Instance {
       Some(subtree) => self.client.attach_scoped_mount(volume, intent, subtree),
       None => self.client.attach_mount(volume, intent),
     }
-    .map_err(|e| Error::of(&self.name, e))?;
+    .map_err(|e| self.fail(e, Some(Missing::Volume(volume))))?;
     let token = attachment
       .token
       .ok_or(Error::Mount(MountFault::NoCapability))?;
@@ -134,7 +133,12 @@ impl Instance {
     // shows it; a bind the daemon refuses takes the mount down again rather than leave a mount whose record says it
     // is bound nowhere.
     if let Err(error) = self.client.bind_mount(attachment.attachment, &real) {
-      let bind = Error::of(&self.name, error);
+      let bind = self.fail(
+        error,
+        Some(Missing::Attachment {
+          attachment: attachment.attachment,
+        }),
+      );
       return Err(match unmount(&real) {
         Ok(()) => bind,
         Err(fault) => Error::Mount(MountFault::Unbound {
@@ -170,7 +174,7 @@ impl Instance {
         .attach_scoped_fuse(volume, intent, &real, subtree),
       (None, false) => self.client.attach_fuse(volume, intent, &real),
     }
-    .map_err(|e| Error::of(&self.name, e))?;
+    .map_err(|e| self.fail(e, Some(Missing::Volume(volume))))?;
     Ok(Mounted {
       attachment: attachment.attachment,
       path: attachment.path.unwrap_or(real),
@@ -189,14 +193,13 @@ impl Instance {
   ) -> Result<Mounted, Error> {
     if options.subtree.is_some() || options.shared {
       return Err(Error::Mount(MountFault::Unsupported {
-        reason: "a subtree or shared mount is the Unix mounts'; a WinFsp mount presents the whole volume at a drive \
-                 letter",
+        missing: MountMissing::WindowsSubtreeOrShared,
       }));
     }
     let attachment = self
       .client
       .attach_winfsp(volume, intent, path)
-      .map_err(|e| Error::of(&self.name, e))?;
+      .map_err(|e| self.fail(e, Some(Missing::Volume(volume))))?;
     Ok(Mounted {
       attachment: attachment.attachment,
       path: attachment.path.unwrap_or_else(|| path.to_owned()),
@@ -230,12 +233,18 @@ impl Instance {
               .map(|mount| mount.attachment);
           }
         }
-        Err(slates_client::ClientError::Refused(refusal)) => unreported.push(format!(
-          "volume {} ({}) refused {refusal:?}",
-          summary.name,
-          crate::volume_id_text(summary.id)
-        )),
-        Err(other) => return Err(Error::of(&self.name, other)),
+        Err(slates_client::ClientError::Refused(refusal)) => {
+          unreported.push(crate::error::Unreported {
+            volume: summary.id,
+            name: summary.name,
+            refusal: Box::new(Error::of_refusal(
+              refusal,
+              Some(Missing::Volume(summary.id)),
+              self.client.retry_pause_ns(0),
+            )),
+          })
+        }
+        Err(other) => return Err(self.error(other)),
       }
     }
     match found {
@@ -294,7 +303,7 @@ const MACOS_TRANSFER_BYTES: u32 = 128 * 1024;
 /// The loopback mount mechanism a host offers (§4.6), the analogue of sylk's FUSE-backend selection. slates serves its
 /// own NFS, so its mechanism is `mount_nfs` — built into macOS and the BSDs, needing no FUSE library, kernel
 /// extension, or Apple entitlement.
-#[cfg(any(all(unix, not(target_os = "linux")), test))]
+#[cfg(any(all(unix, not(target_os = "macos"), not(target_os = "linux")), test))]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum MountBackend {
   /// The loopback NFS mount, via `mount_nfs`.
@@ -317,7 +326,7 @@ pub(crate) fn classify(command_exists: impl Fn(&str) -> bool) -> MountBackend {
 
 /// Whether `name` resolves to an executable on the `PATH` (the analogue of sylk's `commandAvailable` over
 /// `exec.LookPath`): a directory of the `PATH` holds an entry `name` the caller may execute.
-#[cfg(all(unix, not(target_os = "macos"), not(target_os = "linux")))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn command_on_path(name: &str) -> bool {
   let Some(paths) = std::env::var_os("PATH") else {
     return false;
@@ -326,17 +335,90 @@ fn command_on_path(name: &str) -> bool {
     .any(|dir| rustix::fs::access(dir.join(name), rustix::fs::Access::EXEC_OK).is_ok())
 }
 
-/// The loopback mount mechanism this host offers. macOS mounts through `mount(2)` itself (§4.6 A-34), always present;
-/// the other BSDs need `mount_nfs` on the real `PATH`.
-#[cfg(target_os = "macos")]
-pub(crate) fn backend() -> MountBackend {
-  MountBackend::NfsLoopback
-}
-
-/// The loopback mount mechanism this host offers, probing the real `PATH` for `mount_nfs`.
+/// The loopback mount mechanism a BSD other than macOS offers, probing the real `PATH` for `mount_nfs`; macOS mounts
+/// through `mount(2)` itself (§4.6 A-34), always present ([`available`]).
 #[cfg(all(unix, not(target_os = "macos"), not(target_os = "linux")))]
 pub(crate) fn backend() -> MountBackend {
   classify(command_on_path)
+}
+
+/// The host-mount mechanism a machine offers (§4.6), as [`available`] finds it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MountKind {
+  /// The loopback NFS bridge: `mount(2)` on macOS (A-34), `mount_nfs` on the other BSDs.
+  NfsLoopback,
+  /// FUSE, mounted by the daemon through the OS's `fusermount3` (Linux).
+  Fuse,
+  /// A WinFsp drive the daemon mounts and serves (Windows).
+  WinFsp,
+}
+
+/// Format: the FUSE device `fusermount3` opens for the daemon (Linux).
+#[cfg(target_os = "linux")]
+const FUSE_DEVICE: &str = "/dev/fuse";
+
+/// Whether this machine can serve a volume as a host mount, and through what (§4.6): the fact a host reports before it
+/// asks for a mount (kiln's runner facts). Refused [`MountFault::Unsupported`] naming what is missing. It reads the
+/// machine's state — this process's `PATH`, `/dev/fuse`, WinFsp's library — and mounts nothing, so it needs no daemon;
+/// a daemon started from this process finds the same `PATH`. macOS always offers its loopback mount, `mount(2)` being
+/// built in.
+#[cfg(target_os = "macos")]
+pub fn available() -> Result<MountKind, MountFault> {
+  Ok(MountKind::NfsLoopback)
+}
+
+/// See the macOS arm: the other BSDs need `mount_nfs` on the `PATH`.
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "linux")))]
+pub fn available() -> Result<MountKind, MountFault> {
+  nfs_available(backend())
+}
+
+/// See the macOS arm: Linux needs `fusermount3` on the `PATH` and `/dev/fuse` this user may read and write.
+#[cfg(target_os = "linux")]
+pub fn available() -> Result<MountKind, MountFault> {
+  let device = rustix::fs::access(
+    FUSE_DEVICE,
+    rustix::fs::Access::READ_OK | rustix::fs::Access::WRITE_OK,
+  );
+  fuse_available(command_on_path("fusermount3"), device.is_ok())
+}
+
+/// See the macOS arm: Windows needs WinFsp's library to load (its own `FspLoad` search).
+#[cfg(windows)]
+pub fn available() -> Result<MountKind, MountFault> {
+  if slates_bridge_winfsp::host::installed() {
+    Ok(MountKind::WinFsp)
+  } else {
+    Err(MountFault::Unsupported {
+      missing: MountMissing::WinFsp,
+    })
+  }
+}
+
+/// The loopback mount's availability from the backend a BSD offers. Pure, so it tests on any host.
+#[cfg(any(all(unix, not(target_os = "macos"), not(target_os = "linux")), test))]
+fn nfs_available(backend: MountBackend) -> Result<MountKind, MountFault> {
+  match backend {
+    MountBackend::NfsLoopback => Ok(MountKind::NfsLoopback),
+    MountBackend::Unsupported => Err(MountFault::Unsupported {
+      missing: MountMissing::MountNfs,
+    }),
+  }
+}
+
+/// FUSE's availability from the two facts it needs: `fusermount3` found on the `PATH`, and the FUSE device usable by
+/// this user. Pure, so every case tests on any host.
+#[cfg(any(target_os = "linux", test))]
+fn fuse_available(helper_found: bool, device_usable: bool) -> Result<MountKind, MountFault> {
+  match (helper_found, device_usable) {
+    (true, true) => Ok(MountKind::Fuse),
+    (false, _) => Err(MountFault::Unsupported {
+      missing: MountMissing::Fusermount3,
+    }),
+    (true, false) => Err(MountFault::Unsupported {
+      missing: MountMissing::FuseDevice,
+    }),
+  }
 }
 
 /// The `mount_nfs` arguments to mount the volume named `name`, served on the daemon's loopback `port`, at `path`, under
@@ -499,8 +581,31 @@ fn mount_volume(
 /// unmounted by detaching it ([`Instance::unmount`]), so this is the Unix hosts' alone.
 #[cfg(not(windows))]
 pub fn unmount(path: &str) -> Result<(), MountFault> {
+  run_unmount(UNMOUNT_ARGS, path)
+}
+
+/// Lets go of the mount at `path` even while processes still use it (Linux: `fusermount3 -u -z`): the kernel takes it
+/// out of the namespace now and finishes the unmount once its last user closes — what a host does for an ended agent
+/// whose leftover process still holds a file there, where [`unmount`] is refused busy. Like [`unmount`] it needs no
+/// daemon and no privilege. Elsewhere refused [`MountFault::Unsupported`]: macOS and the BSDs have no lazy unmount.
+#[cfg(target_os = "linux")]
+pub fn unmount_lazy(path: &str) -> Result<(), MountFault> {
+  run_unmount(LAZY_UNMOUNT_ARGS, path)
+}
+
+/// See the Linux arm: no lazy unmount here.
+#[cfg(all(unix, not(target_os = "linux")))]
+pub fn unmount_lazy(_path: &str) -> Result<(), MountFault> {
+  Err(MountFault::Unsupported {
+    missing: MountMissing::LazyUnmount,
+  })
+}
+
+/// Runs [`UNMOUNT_PROGRAM`] with `args` on `path`: its exit status, or the error number of starting it, typed.
+#[cfg(not(windows))]
+fn run_unmount(args: &[&str], path: &str) -> Result<(), MountFault> {
   let status = Command::new(UNMOUNT_PROGRAM)
-    .args(UNMOUNT_ARGS)
+    .args(args)
     .arg(path)
     .status()
     .map_err(|error| MountFault::Unmount {
@@ -526,6 +631,9 @@ const UNMOUNT_PROGRAM: &str = "fusermount3";
 /// Format: see [`UNMOUNT_PROGRAM`].
 #[cfg(target_os = "linux")]
 const UNMOUNT_ARGS: &[&str] = &["-u"];
+/// Format: `fusermount3`'s lazy unmount (`-z`: the kernel's `MNT_DETACH`), for [`unmount_lazy`].
+#[cfg(target_os = "linux")]
+const LAZY_UNMOUNT_ARGS: &[&str] = &["-u", "-z"];
 /// Format: see the Linux form.
 #[cfg(all(unix, not(target_os = "linux")))]
 const UNMOUNT_PROGRAM: &str = "umount";
@@ -535,7 +643,10 @@ const UNMOUNT_ARGS: &[&str] = &[];
 
 #[cfg(test)]
 mod tests {
-  use super::{MountBackend, classify, export_path, mount_args};
+  use super::{
+    MountBackend, MountKind, classify, export_path, fuse_available, mount_args, nfs_available,
+  };
+  use crate::error::{MountFault, MountMissing};
 
   /// §4.6 A-34 — a read-only mount asks the kernel for `rdonly` (with the daemon refusing writes under the read-only
   /// capability too); a writable mount does not.
@@ -633,5 +744,77 @@ mod tests {
       MountBackend::Unsupported,
       "another mount tool is not mount_nfs"
     );
+  }
+
+  /// §4.6, A-278 — what a host reports before it mounts: FUSE is available only with both `fusermount3` on the `PATH`
+  /// and a usable `/dev/fuse`, and each missing piece is refused by its own reason; a BSD's loopback mount follows its
+  /// `mount_nfs`. Pure, so every case runs on any host.
+  #[test]
+  fn a_mount_is_available_only_when_every_piece_it_needs_is_there() {
+    assert_eq!(fuse_available(true, true), Ok(MountKind::Fuse));
+    assert_eq!(
+      fuse_available(false, true),
+      Err(MountFault::Unsupported {
+        missing: MountMissing::Fusermount3
+      })
+    );
+    assert_eq!(
+      fuse_available(false, false),
+      Err(MountFault::Unsupported {
+        missing: MountMissing::Fusermount3
+      }),
+      "the helper is named first: without it the device is never opened"
+    );
+    assert_eq!(
+      fuse_available(true, false),
+      Err(MountFault::Unsupported {
+        missing: MountMissing::FuseDevice
+      })
+    );
+    assert_eq!(
+      nfs_available(MountBackend::NfsLoopback),
+      Ok(MountKind::NfsLoopback)
+    );
+    assert_eq!(
+      nfs_available(MountBackend::Unsupported),
+      Err(MountFault::Unsupported {
+        missing: MountMissing::MountNfs
+      })
+    );
+  }
+
+  /// §4.6 A-34, A-278 — on macOS the loopback mount is always available: `mount(2)` is built in, so a host's fact is
+  /// `NfsLoopback` with nothing to install.
+  #[cfg(target_os = "macos")]
+  #[test]
+  fn macos_always_offers_its_loopback_mount() {
+    assert_eq!(super::available(), Ok(MountKind::NfsLoopback));
+  }
+
+  /// A-278 — a lazy unmount is Linux's: elsewhere it is refused `Unsupported` before any program runs.
+  #[cfg(all(unix, not(target_os = "linux")))]
+  #[test]
+  fn a_lazy_unmount_is_refused_where_the_os_has_none() {
+    assert!(matches!(
+      super::unmount_lazy(env!("CARGO_MANIFEST_DIR")),
+      Err(MountFault::Unsupported { .. })
+    ));
+  }
+
+  /// A-278 — a lazy unmount runs `fusermount3 -u -z`, which refuses a path where nothing is mounted: the refusal comes
+  /// back typed with the program's exit status, and nothing changes (this crate's own directory is never a mount).
+  /// Skips loudly where `fusermount3` is not installed.
+  #[cfg(target_os = "linux")]
+  #[test]
+  fn a_lazy_unmount_of_a_path_where_nothing_is_mounted_is_refused_with_the_programs_status() {
+    if !super::command_on_path("fusermount3") {
+      eprintln!("SKIP: fusermount3 is not on the PATH");
+      return;
+    }
+    let path = env!("CARGO_MANIFEST_DIR");
+    assert!(matches!(
+      super::unmount_lazy(path),
+      Err(MountFault::Unmount { path: refused, status: Some(_), errno: None }) if refused == path
+    ));
   }
 }

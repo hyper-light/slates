@@ -104,6 +104,51 @@ pub enum GrantScope {
   Session,
 }
 
+/// A kind of write a policy governs (A-285).
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteAct {
+  /// A merge (a work's submit into its green).
+  Merge,
+  /// A landing to the host's disk.
+  Land,
+}
+
+/// How one kind of write is permitted: the mode the user gave the harness or agent (A-285).
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteMode {
+  /// Written at once, with no approval asked (Claude Code's `bypassPermissions`, Codex's full access).
+  Bypass,
+  /// Answered with an approval request the harness presents; written once an approval binds the manifest.
+  Ask,
+  /// Refused (a mode that forbids writing, such as plan).
+  Forbid,
+}
+
+/// A write policy: the mode for merges and the mode for landings (A-285).
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WritePolicy {
+  /// How a merge is permitted.
+  pub merge: WriteMode,
+  /// How a landing is permitted.
+  pub land: WriteMode,
+}
+
+/// What a write policy is set on (A-285): an enrolled consumer (a session's agent) or a volume. The stricter of the
+/// caller's consumer and the volume governs.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicySubject {
+  /// An enrolled consumer.
+  Consumer {
+    /// The consumer id.
+    consumer: u64,
+  },
+  /// A volume.
+  Volume {
+    /// The volume.
+    volume: VolumeId,
+  },
+}
+
 /// The durability scope of `await placed` (§4.8 D-18): the owner's region, or the mirror.
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scope {
@@ -796,6 +841,33 @@ pub enum RequestBody {
     /// The evidence references (opaque to slates), possibly none.
     evidence: Vec<[u8; 32]>,
   },
+  /// A presented landing's entries, a page at a time (§4.15 step 2: the confirmation surface shows "the full entry list
+  /// on demand"): the landing a `GrantRequired` reply named, its entries' encodings from `from` (the start, then each
+  /// page's `next`). Served where the landing was presented (its id names its owner partition), to the principal it was
+  /// presented to, while it awaits its grant; one consumed, replaced or abandoned is `NotFound`. A read. Appended.
+  LandingEntries {
+    /// The presented landing.
+    landing: u64,
+    /// Where the page starts.
+    from: EntriesCursor,
+  },
+  /// Sets a write policy (A-285): the launcher's or the harness's act, proven by the keyed hash under the issuer
+  /// secret (`slates_server::landing::policy_proof`). Refused `Forbidden` on a consumer-bound channel whatever its
+  /// proof, so an agent can never set, and so never raise, its own policy; `GrantIssuerUnverified` without the proof.
+  /// A volume's policy is served on the volume's owner shard. Appended.
+  SetPolicy {
+    /// What the policy is set on.
+    subject: PolicySubject,
+    /// The policy.
+    policy: WritePolicy,
+    /// The keyed hash under the issuer secret.
+    proof: [u8; 32],
+  },
+  /// Reads a write policy (A-285): `None` when none is set, which is ask. Appended.
+  Policy {
+    /// What the policy is set on.
+    subject: PolicySubject,
+  },
   /// Move `volume` to the fleet member `to` (§4.10 "Ownership follows the writer": "operators keep an explicit move";
   /// A-291): its owner freezes it, places its records and reports the move, and the member `to` adopts it, serves it
   /// and seals it under its own placement before the owner lets its copy go. Answered `Moving` until the configuration
@@ -1476,6 +1548,15 @@ impl RequestBody {
       | RequestBody::Land { volume, .. }
       | RequestBody::ImageBuild { volume, .. }
       | RequestBody::ImageMerge { image: volume, .. } => Some(*volume),
+      // A volume's policy lives in its record, on its owner shard.
+      RequestBody::SetPolicy {
+        subject: PolicySubject::Volume { volume },
+        ..
+      }
+      | RequestBody::Policy {
+        subject: PolicySubject::Volume { volume },
+      } => Some(*volume),
+      RequestBody::SetPolicy { .. } | RequestBody::Policy { .. } => None,
       // A checkout writes its green's base volume, on the owner shard of both (`green --base` runs there).
       RequestBody::Checkout { base, .. } => Some(base.volume),
       // A green over a base is born on the base volume's owner shard, where the snapshot is walked.
@@ -1496,6 +1577,7 @@ impl RequestBody {
       | RequestBody::Acknowledge { .. }
       | RequestBody::Telemetry { .. }
       | RequestBody::Grant { .. }
+      | RequestBody::LandingEntries { .. }
       | RequestBody::Enroll { .. }
       | RequestBody::Attest { .. }
       | RequestBody::Revoke { .. } => None,
@@ -1536,6 +1618,7 @@ impl RequestBody {
         | RequestBody::FsRename { .. }
         | RequestBody::FsMkdir { .. }
         | RequestBody::Checkout { .. }
+        | RequestBody::SetPolicy { .. }
         | RequestBody::Move { .. }
     )
   }
@@ -2617,6 +2700,92 @@ pub struct LandingSummary {
   pub filtered_out: u64,
 }
 
+/// One entry of a presented landing's manifest (§4.15 step 2, "the full entry list on demand"): what the landing would
+/// do at one path, as the manifest its grant binds names it. `LandingEntries` pages them, in the manifest's order (its
+/// landing order: directories made first, removals last and deepest first).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct PlannedEntry {
+  /// The path, from the target's root (`/src/a.rs`).
+  pub path: String,
+  /// What the landing does there.
+  pub action: PlannedAction,
+  /// A file's planned bytes, for a create or a replace; none for anything else.
+  pub content: Option<PlannedContent>,
+  /// The mode a file or a directory lands with (the volume's, as `stat` reports it); none for a symlink and for a
+  /// removal or a rename, which land no mode of the volume's.
+  pub mode: Option<u32>,
+  /// Whether the entry replaces or removes what the volume witnessed on the disk; false for what it creates.
+  pub witnessed: bool,
+  /// The conflict the presentation's preliminary verdict found at this path, or none: a landing with any is refused.
+  pub conflict: Option<ConflictClass>,
+}
+
+/// What a landing does at one path (§4.15 "Plan"; the manifest's actions).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum PlannedAction {
+  /// A file the disk did not have, written.
+  Create,
+  /// A file the disk had, replaced.
+  Replace,
+  /// A file the disk had, removed.
+  Delete,
+  /// A directory the disk had, moved here whole from its origin, as one rename.
+  Rename {
+    /// The origin, from the target's root.
+    from: String,
+  },
+  /// A directory made.
+  Mkdir,
+  /// A directory the disk had, removed with everything beneath it.
+  Rmdir,
+  /// A symlink made, or one the disk had replaced.
+  Symlink {
+    /// Its target, as the volume holds it.
+    target: String,
+  },
+  /// A directory the disk had, emptied of everything beneath it and kept (the volume removed it and made it again).
+  Clear,
+}
+
+/// A conflict class of §4.15 step 4's verdict table: why a landing would refuse an entry.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConflictClass {
+  /// The volume and the disk both changed the entry, differently.
+  ModifyModify,
+  /// The volume changed it; the disk deleted it.
+  ModifyDelete,
+  /// The volume deleted it; the disk changed it.
+  DeleteModify,
+  /// The volume renamed the directory; the disk moved its origin.
+  RenameRename,
+  /// The volume and the disk both created the entry, with different bytes.
+  CreateCreate,
+  /// A file became a directory, or the reverse.
+  TypeChanged,
+  /// Someone else replaced the file between the check and the write.
+  TargetInUse,
+}
+
+/// A planned file's bytes, as the manifest binds them: their BLAKE3 and their length. A reader of the volume's file
+/// checks what it read against them, so what it read is what the grant would land.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlannedContent {
+  /// BLAKE3 of the bytes.
+  pub hash: [u8; 32],
+  /// Their length.
+  pub size: u64,
+}
+
+/// Where a page of a presented landing's entries starts (`LandingEntries`): an entry, by its place in the manifest's
+/// order, and a byte within its encoding. The list starts at the zero cursor; each page names the next.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq, Default, PartialOrd, Ord)]
+pub struct EntriesCursor {
+  /// The entry.
+  pub entry: u64,
+  /// The byte within the entry's encoding.
+  pub byte: u64,
+}
+
 /// A finished landing's outcome (§4.15): the counts, and what the landing achieved and met — its
 /// durability, every Degraded cell, the entries it kept private, and the barriers it took (AUD-29-05:
 /// until 2026-09-29 the reply carried the counts only, and a landing that did not sync read as done).
@@ -3107,6 +3276,14 @@ pub enum Refusal {
     verb: String,
     /// The requester, by its host's certificate anchor and its account.
     principal: Principal,
+  },
+  /// The write policy forbids this act (A-285): the mode the user gave the agent forbids writing. `by` names the
+  /// subject whose policy decided. Appended.
+  PolicyForbids {
+    /// The act refused.
+    act: WriteAct,
+    /// The subject whose policy forbids it.
+    by: PolicySubject,
   },
   /// A planned move of a volume to another fleet member (`Move`, §4.10 "Ownership follows the writer", A-291) was
   /// refused, for a reason a caller can act on by its kind. Nothing moved, and the volume is served where it was.
@@ -3621,6 +3798,26 @@ pub enum ReplyBody {
   LiveShippingSet {
     /// Whether it is live-shipped now.
     live_shipped: bool,
+  },
+  /// One page of a presented landing's entries (`LandingEntries`): the bytes of their encodings, one [`PlannedEntry`]
+  /// after another in the manifest's order, from the request's cursor to as many as one reply holds, so an entry may
+  /// begin on one page and end on a later one. Appended.
+  LandingEntries {
+    /// The bytes.
+    bytes: Vec<u8>,
+    /// Where the next page starts, or `None` when this page ends the list.
+    next: Option<EntriesCursor>,
+    /// The entries the manifest holds.
+    total: u64,
+    /// The manifest's hash, the one its `GrantRequired` named, so a reader joining pages knows each is of one manifest.
+    manifest: [u8; 32],
+  },
+  /// A write policy was set (A-285). Appended.
+  PolicySet,
+  /// A write policy (A-285): `None` when none is set, which is ask. Appended.
+  Policy {
+    /// The policy.
+    policy: Option<WritePolicy>,
   },
   /// A volume's move is under way (`Move`, A-291): it is frozen, and the move waits for its records to be placed or for
   /// the configuration to name its new owner. Ask again. Appended.

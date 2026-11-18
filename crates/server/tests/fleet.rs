@@ -3204,7 +3204,8 @@ fn settle_initial_consensus(
       .iter()
       .map(|daemon| format!(
         "host={:?} ready={:?} council={:?} voters={:?} root={:?} leaders={:?}/{:?} alive={:?} meshed={:?} \
-         record_links(host, out)={:?} council_state={:?} refusals={:?}",
+         record_links(host, out)={:?} record_dials={:?} pending_discovery={:?} demux={:?} council_state={:?} \
+         refusals={:?}",
         daemon.member_identity(),
         daemon.consensus_ready(),
         daemon.council_members(),
@@ -3215,6 +3216,9 @@ fn settle_initial_consensus(
         daemon.fleet_members(),
         daemon.fleet_meshed(),
         daemon.fleet_record_links(),
+        daemon.fleet_record_dials(),
+        daemon.fleet_pending_discovery(),
+        daemon.fleet_demux_counters(),
         daemon.council_debug(),
         daemon.fleet_refusals(),
       ))
@@ -17514,7 +17518,7 @@ fn plant_taken_over_green(daemon: &Daemon, with_catalog: bool) {
         s.pending_green_materializations.insert(
           object,
           // No survivor reported its version: a planted green has no sources to fetch from.
-          slates_server::state::PendingGreen::adopted(merge, Vec::new()),
+          slates_server::state::PendingGreen::adopted(merge, None, Vec::new()),
         );
       },
     )
@@ -17549,6 +17553,281 @@ fn status_of_planted_green(daemon: &Daemon, periods: u64) -> Option<Refusal> {
   last
 }
 
+/// Which wait a planted taken-over volume meets ([`plant_taken_over_volume`]).
+#[derive(Clone, Copy)]
+enum PlantedVolume {
+  /// A contentless head, placed, with no catalog register adopted.
+  NoCatalog,
+  /// A head naming content this node does not hold, with no holder to fetch it from.
+  NoContent,
+}
+
+/// Plants on `daemon`'s control shard a taken-over volume awaiting materialization, as a takeover's adoption leaves one
+/// (`takeover::adopt`), under the planted green's id: its head and its head's placement, and what `planted` leaves out.
+fn plant_taken_over_volume(daemon: &Daemon, planted: PlantedVolume) {
+  daemon
+    .observation_on_control(
+      LIVENESS_BUDGET_NS,
+      move |s: &mut slates_server::state::ShardState| {
+        let object = ObjectId(PLANTED_GREEN);
+        let head = match planted {
+          PlantedVolume::NoCatalog => HeadValue {
+            manifest: None,
+            content_holders: Vec::new(),
+            sealing: None,
+          },
+          // Holder 7 is no member: no session reaches it, so no fetch can bring the content.
+          PlantedVolume::NoContent => HeadValue {
+            manifest: Some([9; 32]),
+            content_holders: vec![7],
+            sealing: None,
+          },
+        };
+        s.placed_heads.insert(
+          object,
+          slates_server::head::PlacedHead {
+            sequence: 1,
+            epoch: slates_db::register::HostEpoch(1),
+            placement: slates_db::register::Placement {
+              candidates: Vec::new(),
+              acked: Vec::new(),
+              mirror_acked: None,
+              joint: Vec::new(),
+            },
+          },
+        );
+        s.pending_materializations.insert(
+          object,
+          slates_server::state::PendingVolume::adopted(head, None),
+        );
+      },
+    )
+    .unwrap()
+    .wait()
+    .unwrap();
+}
+
+/// CLAUDE.md §2 item 8, the volume sibling of the bounded green (GAPS 2026-11-09, "Sibling, open"): a taken-over volume
+/// whose catalog register never comes is not retried without end. Do: on a one-node fleet with a one-second failover
+/// SLO, plant a taken-over contentless volume with its head and that head's placement adopted and no catalog register;
+/// ask its status each period. Expect, within a hundred periods, `NotRecovered` naming `catalog`, after its ten
+/// attempts. Before, every period counted `fleet.materialize.waits.catalog` and retried for as long as the daemon ran.
+#[test]
+fn a_taken_over_volume_whose_catalog_never_comes_is_refused_by_name() {
+  let _serial = serialize_fleet_tests();
+  let daemon = lone_fleet_node("volume-no-catalog");
+  plant_taken_over_volume(&daemon, PlantedVolume::NoCatalog);
+  let answered = status_of_planted_green(&daemon, GIVE_UP_WITHIN_PERIODS);
+  let record = green_takeover_record(&daemon);
+  daemon.stop();
+  assert_eq!(
+    answered,
+    Some(Refusal::NotRecovered {
+      cause: slates_ipc::protocol::RecoveryCause::TakeoverIncomplete {
+        waited_on: "catalog".to_owned()
+      }
+    }),
+    "the volume is given up on within its bound, naming what it waited on ({record})"
+  );
+}
+
+/// The same rule, the content branch: a taken-over volume whose content this node does not hold and cannot fetch (no
+/// recorded holder reachable, so nothing is ever staged) is not retried without end. Do: plant a taken-over volume
+/// whose head names content no holder here serves. Expect, within a hundred periods, `NotRecovered` naming `content`.
+/// Before, every period counted a fetch with no holder session and retried for as long as the daemon ran.
+#[test]
+fn a_taken_over_volume_whose_content_never_comes_is_refused_by_name() {
+  let _serial = serialize_fleet_tests();
+  let daemon = lone_fleet_node("volume-no-content");
+  plant_taken_over_volume(&daemon, PlantedVolume::NoContent);
+  let answered = status_of_planted_green(&daemon, GIVE_UP_WITHIN_PERIODS);
+  let record = green_takeover_record(&daemon);
+  daemon.stop();
+  assert_eq!(
+    answered,
+    Some(Refusal::NotRecovered {
+      cause: slates_ipc::protocol::RecoveryCause::TakeoverIncomplete {
+        waited_on: "content".to_owned()
+      }
+    }),
+    "the volume is given up on within its bound, naming what it waited on ({record})"
+  );
+}
+
+/// Shape: a planted tombstone's object id whose partition (bytes 8 and 9, `verbs::owner_of`) no daemon here runs a
+/// shard for, so its record can never be made on this node.
+const PLANTED_TOMBSTONE_NO_SHARD: [u8; 16] = [
+  0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0xff, 0xff, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22,
+];
+
+/// Shape: the tombstone sequence a planted tombstone carries (any past a volume's creation head).
+const PLANTED_TOMBSTONE_SEQUENCE: u64 = 3;
+
+/// Plants on `daemon`'s control shard a taken-over tombstone for `object` awaiting its record, as a takeover's adoption
+/// leaves one (`takeover::record_adoption`).
+fn plant_taken_over_tombstone(daemon: &Daemon, object: ObjectId) {
+  daemon
+    .observation_on_control(
+      LIVENESS_BUDGET_NS,
+      move |s: &mut slates_server::state::ShardState| {
+        s.pending_tombstones.insert(
+          object,
+          slates_server::state::PendingTombstone::adopted(PLANTED_TOMBSTONE_SEQUENCE),
+        );
+      },
+    )
+    .unwrap()
+    .wait()
+    .unwrap();
+}
+
+/// What `daemon`'s control shard holds of the tombstone for `object`, and its `fleet.tombstone*` counters.
+fn tombstone_record(
+  daemon: &Daemon,
+  object: ObjectId,
+) -> (
+  Option<slates_server::state::PendingTombstone>,
+  std::collections::BTreeMap<String, u64>,
+) {
+  daemon
+    .observation_on_control(
+      LIVENESS_BUDGET_NS,
+      move |s: &mut slates_server::state::ShardState| {
+        let counted = s
+          .refusals
+          .iter()
+          .filter(|(name, _)| name.starts_with("fleet.tombstone"))
+          .map(|(name, count)| ((*name).to_owned(), *count))
+          .collect();
+        (s.pending_tombstones.get(&object).copied(), counted)
+      },
+    )
+    .unwrap()
+    .wait()
+    .unwrap()
+}
+
+/// Reads the tombstone for `object` on `daemon` each fleet period until it is given up, for at most `periods` periods
+/// of wall time, and then for `after` periods more; what it held at the give-up (or last) and at the end.
+fn tombstone_given_up_within(
+  daemon: &Daemon,
+  object: ObjectId,
+  periods: u64,
+  after: u64,
+) -> [(
+  Option<slates_server::state::PendingTombstone>,
+  std::collections::BTreeMap<String, u64>,
+); 2] {
+  // A channel nobody sends on paces the reads, as the lint wall wants.
+  let (_held, pace) = std::sync::mpsc::channel::<()>();
+  let started = Instant::now();
+  let mut last = tombstone_record(daemon, object);
+  while started.elapsed() < Duration::from_nanos(HEARTBEAT_NS.saturating_mul(periods))
+    && !last.0.is_some_and(|tombstone| tombstone.given_up)
+  {
+    let _ = pace.recv_timeout(Duration::from_nanos(HEARTBEAT_NS));
+    last = tombstone_record(daemon, object);
+  }
+  let _ = pace.recv_timeout(Duration::from_nanos(HEARTBEAT_NS.saturating_mul(after)));
+  [last, tombstone_record(daemon, object)]
+}
+
+/// Shape: the periods a test reads a given-up tombstone on after its give-up, to see that nothing more is attempted.
+const AFTER_GIVE_UP_PERIODS: u64 = 10;
+
+/// CLAUDE.md §2 item 8, the tombstone sibling of the bounded volume and green (AUD-29-43): a taken-over tombstone whose
+/// partition has no shard on this node is not attempted without end. Do: on a one-node fleet with a one-second failover
+/// SLO, plant a taken-over tombstone whose id names a partition no shard here serves, and read it each period. Expect,
+/// within a hundred periods, the tombstone given up after its ten attempts, each counted `fleet.tombstone.waits.shard`,
+/// and `fleet.tombstone.given_up` once; ten periods on, nothing more attempted and the tombstone still held, marked.
+/// Before, it was skipped every period with nothing counted, for as long as the daemon ran.
+#[test]
+fn a_taken_over_tombstone_whose_partition_has_no_shard_here_is_given_up_by_name() {
+  let _serial = serialize_fleet_tests();
+  let daemon = lone_fleet_node("tombstone-no-shard");
+  let object = ObjectId(PLANTED_TOMBSTONE_NO_SHARD);
+  plant_taken_over_tombstone(&daemon, object);
+  let [(at_give_up, counted), (after, counted_after)] = tombstone_given_up_within(
+    &daemon,
+    object,
+    GIVE_UP_WITHIN_PERIODS,
+    AFTER_GIVE_UP_PERIODS,
+  );
+  daemon.stop();
+  assert_eq!(
+    at_give_up,
+    Some(slates_server::state::PendingTombstone {
+      sequence: PLANTED_TOMBSTONE_SEQUENCE,
+      attempts: 10,
+      given_up: true,
+    }),
+    "given up after the failover SLO's ten attempts (counted {counted:?})"
+  );
+  assert_eq!(
+    counted.get("fleet.tombstone.waits.shard"),
+    Some(&10),
+    "{counted:?}"
+  );
+  assert_eq!(
+    counted.get("fleet.tombstone.given_up"),
+    Some(&1),
+    "{counted:?}"
+  );
+  assert_eq!(
+    (after, counted_after),
+    (at_give_up, counted),
+    "nothing more attempted after the give-up"
+  );
+}
+
+/// The same rule, a refusal: a taken-over tombstone whose owner shard refuses its record (here a live volume holds the
+/// id) is given up at the bound, and the live volume is left as it was. Do: create a volume on a one-node fleet with a
+/// one-second failover SLO, plant a taken-over tombstone under its id, and read it each period. Expect the tombstone
+/// given up after its ten attempts, each counted `fleet.tombstone.adopt_refused` (or `adopt_unanswered`, for a period
+/// whose call the loaded shard did not answer in time), and the volume still answering its status. Before, the refusal
+/// was retried every period for as long as the daemon ran.
+#[test]
+fn a_taken_over_tombstone_its_shard_refuses_is_given_up_and_the_live_volume_stays() {
+  let _serial = serialize_fleet_tests();
+  let daemon = lone_fleet_node("tombstone-refused");
+  let mut client = Client::connect(daemon.instance());
+  let ReplyBody::Created { id } = client.call(&scratch("tombstone-refused")) else {
+    panic!("create on the lone node")
+  };
+  let object = ObjectId(id.bytes);
+  plant_taken_over_tombstone(&daemon, object);
+  let [(at_give_up, counted), _] =
+    tombstone_given_up_within(&daemon, object, GIVE_UP_WITHIN_PERIODS, 0);
+  let status = client.call(&RequestBody::Status { volume: id });
+  daemon.stop();
+  assert_eq!(
+    at_give_up.map(|tombstone| (tombstone.attempts, tombstone.given_up)),
+    Some((10, true)),
+    "given up after the failover SLO's ten attempts (counted {counted:?})"
+  );
+  let refused = counted
+    .get("fleet.tombstone.adopt_refused")
+    .copied()
+    .unwrap_or(0);
+  let unanswered = counted
+    .get("fleet.tombstone.adopt_unanswered")
+    .copied()
+    .unwrap_or(0);
+  assert!(
+    refused >= 1 && refused + unanswered == 10,
+    "each attempt refused, or unanswered in its period: {counted:?}"
+  );
+  assert_eq!(
+    counted.get("fleet.tombstone.given_up"),
+    Some(&1),
+    "{counted:?}"
+  );
+  assert!(
+    matches!(status, ReplyBody::Status { .. }),
+    "the live volume still answers its status: {status:?}"
+  );
+}
+
 /// What `daemon`'s control shard counted of its taken-over greens (`merge.takeover*`), and whether the planted green is
 /// still pending there: for a failure's message.
 fn green_takeover_record(daemon: &Daemon) -> String {
@@ -17559,13 +17838,20 @@ fn green_takeover_record(daemon: &Daemon) -> String {
         let counted: Vec<(String, u64)> = s
           .refusals
           .iter()
-          .filter(|(name, _)| name.starts_with("merge.takeover"))
+          .filter(|(name, _)| {
+            name.starts_with("merge.takeover") || name.starts_with("fleet.materialize")
+          })
           .map(|(name, count)| ((*name).to_owned(), *count))
           .collect();
         let pending = s
           .pending_green_materializations
           .get(&ObjectId(PLANTED_GREEN))
-          .map(|pending| pending.attempts);
+          .map(|pending| pending.attempts)
+          .or_else(|| {
+            s.pending_materializations
+              .get(&ObjectId(PLANTED_GREEN))
+              .map(|pending| pending.attempts)
+          });
         format!(
           "counted {counted:?}; pending with attempts {pending:?}; coordinator periods {}",
           s.merge.coordinator_period
@@ -18418,20 +18704,122 @@ fn a_settled_fleet_admits_a_create_on_every_node() {
   );
 }
 
-/// Shape: how long after its owner's restart a read through b may take to reach the new process once b's session to
-/// the old one is reset (A-261): the reset itself is a round trip, then one heartbeat for b's link task to come round
-/// to the dropped link, a dial and a discovery page, all well inside one liveness budget. loadtest-scale's lane-side
-/// bound for the same case, with no reset, is two budgets (its `DEAD_SESSION_BOUND`).
-const RESET_LANE_BOUND: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS);
+/// Shape: how long after its owner's restart a read through b may take to reach the new process: ten liveness budgets,
+/// a bound on liveness alone. Whether the reset moved b's link is judged by b's own counters, not by time, so the test
+/// holds at a load that stretches every wait.
+const RESET_REACH_BOUND: Duration = Duration::from_nanos(10 * LIVENESS_BUDGET_NS);
+
+/// Shape: restarts the test makes before it gives up on an attempt that counts (a reset reached b before b's liveness
+/// judged a dead; [`ResetAttempt::counted`]).
+/// Derived: an attempt with no reset is not the reset case and is made again, so the test fails on bad luck only if
+/// every attempt misses. Measured misses, 2026-11-09: 1 of 97 attempts drew no reset since the precondition was read
+/// from b's own state (diag-63, 64, 69 and 71 on CI at two spinners a core and at one busy CPU: 1 of 81; the Studio,
+/// unloaded: 0 of 16). Its one-sided 95% upper bound is 4.9% (exact binomial, 1 of 97), so four attempts all miss with
+/// probability at most 0.049^4 ≈ 6e-6 a run, and three would leave 1.2e-4. The test's first form, one attempt a run,
+/// drew no reset in 3 of 4 runs at Mac load 46 to 232 (b's session lent, replaced or judged dead first, GAPS A-261):
+/// a regime past this bound, where the test fails and says so rather than pass on nothing.
+const RESET_ATTEMPTS: usize = 4;
+
+/// What one restart of a showed from b.
+#[derive(Debug)]
+struct ResetAttempt {
+  /// Whether the attempt is the reset case: b counted a reset (`fleet.link.peer_reset`) before its liveness judged a
+  /// dead. The restarted a resets only a 1-RTT packet whose connection id names no session it has, from a source with
+  /// no session there (`slates_transport::demux`, "Stateless reset"; RFC 9000 §10.3). That id is the one both ends
+  /// derived from a completed handshake, so the session it names finished its handshake with a process other than the
+  /// new a: on b's link to a, the old a. A reset counted on b therefore shows that b still held a session from the old
+  /// process when the new one met it, whatever b's slot showed at any instant.
+  counted: bool,
+  /// Resets the restarted a's demultiplexers sent over the attempt (to b's old session, and to c's).
+  sent_by_a: u64,
+  /// `fleet.link.peer_reset` counted on b over the attempt.
+  resets: u64,
+  /// Whether b's liveness judged a dead (`believed_dead` moved) before the reset was seen.
+  judged_first: bool,
+  /// When the first read through b reached the restarted a, if it did within [`RESET_REACH_BOUND`].
+  reached: Option<Duration>,
+  /// When b's reset count first moved.
+  reset_seen: Option<Duration>,
+}
+
+/// b's counters the verdict reads: believed dead, reset.
+fn link_counters(b: &Daemon) -> (u64, u64) {
+  (
+    refusal_count(b, "fleet.link.invalid.believed_dead").unwrap(),
+    refusal_count(b, "fleet.link.peer_reset").unwrap(),
+  )
+}
+
+/// Restarts `daemons[0]` with `identity` and reads `read` through `daemons[1]` until the restarted a answers or
+/// [`RESET_REACH_BOUND`] passes: what b showed.
+fn restart_and_reach(
+  daemons: &mut Vec<Daemon>,
+  restart: impl FnOnce() -> Daemon,
+  probe: &mut Client,
+  read: &RequestBody,
+) -> ResetAttempt {
+  let before = link_counters(&daemons[1]);
+  daemons.remove(0).stop();
+  daemons.insert(0, restart());
+  let restarted = Instant::now();
+  // The attempt is judged by its outcome, not by a reading of b's slot at an instant: every such reading raced either
+  // the reset or b's own replacement of the slot (diag-69 and 71 judged 1 of 16 and 1 of 24 runs vacuous whose every
+  // restart reset and reached; read at the stop it never held, 0 of 12 on a Mac).
+  let mut reset_seen = None;
+  let mut judged_first = false;
+  let reached = loop {
+    let reply = probe.call(read);
+    let (dead_now, resets_now) = link_counters(&daemons[1]);
+    if reset_seen.is_none() && resets_now > before.1 {
+      reset_seen = Some(restarted.elapsed());
+      judged_first = dead_now > before.0;
+    }
+    let from_b = matches!(
+      reply,
+      ReplyBody::Refused {
+        refusal: Refusal::OwnerUnreachable { .. } | Refusal::HomedElsewhere { .. }
+      }
+    );
+    if !from_b {
+      break Some(restarted.elapsed());
+    }
+    if restarted.elapsed() > RESET_REACH_BOUND {
+      break None;
+    }
+  };
+  let sent_by_a = daemons[0]
+    .fleet_demux_counters()
+    .map(|counters| counters.iter().map(|counter| counter.resets_sent).sum())
+    .unwrap_or(0);
+  ResetAttempt {
+    counted: reset_seen.is_some() && !judged_first,
+    sent_by_a,
+    resets: link_counters(&daemons[1]).1 - before.1,
+    judged_first,
+    reached,
+    reset_seen,
+  }
+}
 
 /// A-261 (RFC 9000 §10.3), loadtest-scale's primary-kill case (2026-11-08): a primary restarted under the same member id
 /// left the client node's record session to it in place, lent and dead, for 25 to 135 s. With stateless reset the
-/// restarted process answers the first packet on that session with a reset ending in the token its identity issued
-/// for it, and b drops the link and dials the new process. Do: three nodes; a volume owned by a, read through b; restart
-/// a with its identity on its ports; read through b until a answers. Expect: b counted the reset
-/// (`fleet.link.peer_reset`), and the first read to reach the restarted a came within [`RESET_LANE_BOUND`].
+/// restarted process answers the first packet on that session with a reset ending in the token its identity issued for
+/// it, and b drops the link and dials the new process.
+///
+/// Do: three nodes; a volume owned by a, read through b; restart a with its identity on its ports; read through b until
+/// a answers.
+///
+/// An attempt counts when a reset reached b before b's liveness judged a dead ([`ResetAttempt::counted`]). The new a
+/// resets only a 1-RTT packet naming a session it never knew (`slates_transport::demux`, "Stateless reset"), so such a
+/// reset shows b still held a session from the old process when the new one met it. An attempt with none is not the
+/// reset case (under load b's session can be lent, replaced or judged dead first) and a is restarted again, at most
+/// [`RESET_ATTEMPTS`] times, a bound derived at the constant.
+///
+/// Expect: some attempt counted, and in each that did:
+/// - the restarted a sent a reset (its demultiplexers' `resets_sent`) and b counted one (`fleet.link.peer_reset`);
+/// - b's liveness had not judged a dead before it, so the reset moved the link;
+/// - a read through b reached the restarted a within [`RESET_REACH_BOUND`].
 #[test]
-#[ignore = "A-261: parked until it holds its own precondition (b still holding its session to the old a at the restart); on a Mac at load 46-48 it failed 2 of 3 with 0 resets while b reached the restarted a in 207-263 ms, its session lent or replaced first; GAPS A-261"]
 #[allow(clippy::cognitive_complexity)]
 fn a_restarted_owner_resets_its_old_session_and_b_reaches_the_new_process() {
   let _serial = serialize_fleet_tests();
@@ -18442,10 +18830,14 @@ fn a_restarted_owner_resets_its_old_session_and_b_reaches_the_new_process() {
     .collect();
   let anchors: Vec<_> = profiles.iter().map(anchor_of).collect();
   let seeds: Vec<_> = anchors.iter().map(|anchor| member_id(*anchor, 0)).collect();
-  let mut identities: Vec<_> = profiles.iter().map(|_| same_identity(2)).collect();
+  // One copy of a's identity for each process it runs as: the first and every restart.
+  let mut identities: Vec<_> = profiles
+    .iter()
+    .map(|_| same_identity(1 + RESET_ATTEMPTS))
+    .collect();
   let certificates: Vec<_> = identities
     .iter()
-    .map(|pair| pair[0].certificate())
+    .map(|copies| copies[0].certificate())
     .collect();
   let (_ports_lease, ports) = mesh_serve_ports(profiles.len());
   let peers = |node| {
@@ -18496,48 +18888,34 @@ fn a_restarted_owner_resets_its_old_session_and_b_reaches_the_new_process() {
   settle_initial_consensus(&daemons, &seeds, &Default::default(), Quorum { f: 1 });
   let mut owner = Client::connect(daemons[0].instance());
   let volume = volume_owned_by(&mut owner, 0, "reset-lane", &daemons);
+  drop(owner);
   let mut probe = Client::connect(daemons[1].instance());
   let (routed, last) = poll_status_served(&daemons, &mut probe, volume, COUNCIL_RETIRE_DEADLINE);
   let read = RequestBody::Status { volume };
-  let resets_before = refusal_count(&daemons[1], "fleet.link.peer_reset").unwrap();
-  drop(owner);
-  daemons.remove(0).stop();
-  daemons.insert(
-    0,
-    start_fleet_node(
-      &profiles[0],
-      configs[0].clone(),
-      identities[0].pop().unwrap(),
-      ports[0],
-      peers(0),
-      source(0),
-    ),
-  );
-  let restarted = Instant::now();
-  let mut answers = Vec::new();
-  let mut reset_seen = None;
-  let reached = loop {
-    let reply = probe.call(&read);
-    if reset_seen.is_none()
-      && refusal_count(&daemons[1], "fleet.link.peer_reset").unwrap() > resets_before
-    {
-      reset_seen = Some(restarted.elapsed());
-    }
-    let from_b = matches!(
-      reply,
-      ReplyBody::Refused {
-        refusal: Refusal::OwnerUnreachable { .. } | Refusal::HomedElsewhere { .. }
-      }
+  let mut attempts = Vec::new();
+  for _ in 0..RESET_ATTEMPTS {
+    let identity = identities[0].pop().unwrap();
+    let attempt = restart_and_reach(
+      &mut daemons,
+      || {
+        start_fleet_node(
+          &profiles[0],
+          configs[0].clone(),
+          identity,
+          ports[0],
+          peers(0),
+          source(0),
+        )
+      },
+      &mut probe,
+      &read,
     );
-    answers.push((restarted.elapsed(), reply));
-    if !from_b {
-      break Some(restarted.elapsed());
+    let counted = attempt.counted;
+    attempts.push(attempt);
+    if counted {
+      break;
     }
-    if restarted.elapsed() > 10 * RESET_LANE_BOUND {
-      break None;
-    }
-  };
-  let resets = refusal_count(&daemons[1], "fleet.link.peer_reset").unwrap() - resets_before;
+  }
   let counters: Vec<(&str, u64)> = daemons[1]
     .fleet_refusals()
     .unwrap()
@@ -18547,30 +18925,36 @@ fn a_restarted_owner_resets_its_old_session_and_b_reaches_the_new_process() {
   for daemon in daemons {
     daemon.stop();
   }
+  let counted = attempts.iter().filter(|attempt| attempt.counted).count();
   eprintln!(
-    "the first read through b to reach the restarted a came {reached:?} after its restart, b's reset seen by {reset_seen:?} \
-     ({resets} resets; {} answers before, the last {:?}); b's forward and link counters {counters:?}",
-    answers.len().saturating_sub(1),
-    answers.last()
+    "{} restarts, {counted} counted (a reset reached b before its liveness judged a dead); each: {attempts:?}; b's \
+     forward and link counters {counters:?}",
+    attempts.len()
   );
   assert!(
     routed,
     "b routed the volume to a before the restart: {last:?}"
   );
   assert!(
-    resets >= 1,
-    "b's session to the old a was reset: {counters:?}"
+    counted >= 1,
+    "no reset reached b before its liveness judged a dead in {} restarts: {attempts:?}",
+    attempts.len()
   );
-  let reached = reached.unwrap_or_else(|| {
-    panic!(
-      "no read through b reached the restarted a within {:?}: {answers:?}",
-      10 * RESET_LANE_BOUND
-    )
-  });
-  assert!(
-    reached <= RESET_LANE_BOUND,
-    "a read through b reached the restarted a {reached:?} after its restart, past {RESET_LANE_BOUND:?}"
-  );
+  for attempt in attempts.iter().filter(|attempt| attempt.counted) {
+    assert!(
+      attempt.sent_by_a >= 1 && attempt.resets >= 1 && attempt.reset_seen.is_some(),
+      "the restarted a sent a reset and b's session to the old a was reset while its reads waited: {attempt:?}; \
+       {counters:?}"
+    );
+    assert!(
+      !attempt.judged_first,
+      "the reset, not b's liveness, moved the link: {attempt:?}"
+    );
+    assert!(
+      attempt.reached.is_some(),
+      "a read through b reached the restarted a within {RESET_REACH_BOUND:?}: {attempt:?}"
+    );
+  }
 }
 
 /// Shape: how long the owner's shard is kept in one starved poll: a window and a half, so an answer behind it comes past

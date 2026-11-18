@@ -476,7 +476,7 @@ fn execute_side(
   dir: &str,
   on_host: &Path,
 ) -> Result<slates_conformance::workload::Run, Failure> {
-  let mut env: Vec<(String, String)> = super::workloads::GIT_IDENTITY
+  let mut env: Vec<(String, String)> = slates_conformance::workload::ENVIRONMENT
     .iter()
     .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
     .collect();
@@ -598,9 +598,7 @@ pub(crate) fn run_workloads(run: &Run<'_>) -> Result<SuiteResult, Failure> {
       ));
     }
     let status = compare(workload, &host, &mount);
-    if let WorkloadStatus::Differs { detail } = &status {
-      notes.push(format!("{}: {detail}", workload.name));
-    }
+    notes.extend(status.failure_note(workload.name));
     println!("workloads (container): {}: {status:?}", workload.name);
     tools.push(WorkloadResult {
       name: workload.name.to_owned(),
@@ -609,9 +607,7 @@ pub(crate) fn run_workloads(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   }
   notes.extend(leg.session.size_note.clone());
   drop(leg);
-  let ok = !tools
-    .iter()
-    .any(|t| matches!(t.status, WorkloadStatus::Differs { .. }));
+  let ok = !tools.iter().any(|t| t.status.fails_the_suite());
   let run_count = tools
     .iter()
     .filter(|t| !matches!(t.status, WorkloadStatus::Skipped { .. }))
