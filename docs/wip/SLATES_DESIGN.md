@@ -3211,7 +3211,11 @@ directory mounts refused (NTFS reparse point); ProjFS never.
 > extension after a cached write past a hole and a shrink, inside Windows below the single receiver; it is a listed
 > failure (`fsx-seed-1-unfinished:10000`) until fixed. Since A-300 (2026-11-17) the lanes also run the workload
 > roster's version-control workloads over the drive (git, Mercurial and Subversion, through Git for Windows' shell),
-> judged against NTFS with the drive's one stated difference: no hard links.
+> judged against NTFS with the drive's one stated difference: no hard links. Their first run (CI 44260193629,
+> 2026-11-18, both architectures) found Mercurial identical but for that difference, and the drive's one limitation
+> (A-327): Windows answers no final path (`GetFinalPathNameByHandleW` with `VOLUME_NAME_DOS`, error 1005) for a file on
+> a drive that `DefineDosDeviceW` made rather than the Mount Manager, which only Administrators may ask, so git with
+> its own symbolic links on cannot change directory there. The lanes run git as Git for Windows ships it.
 
 > **Status (2026-11-02, A-198, Step 9.2: Windows handle holding).** The anchor's Windows hold channel and explicit
 > successor inheritance are built. A hold is acknowledged after duplication into the anchor, before the child publishes
@@ -22598,7 +22602,9 @@ form, the judgment under the route's stated differences), and CI's `windows-lint
   - Git for Windows' shell copies the target for `ln -s` by default. `MSYS=winsymlinks:nativestrict` in the shared
     environment makes it a Windows symbolic link, and a failure where it cannot make one, as POSIX's `ln -s` does. So
     the `git` workload's link goes through the drive's reparse points (A-275) on one side and NTFS's on the other.
-    Every other shell ignores the variable.
+    Every other shell ignores the variable. **Amended by A-327 (2026-11-18):** the variable is set on the workload's
+    `ln -s` alone, since git reads it too and then cannot change directory on the drive; and the shared environment
+    sets `MSYS_NO_PATHCONV`, so the shell hands Subversion's `^/` URLs on as written.
 - **The drive's stated difference: no hard link.** WinFsp's driver answers `FileLinkInformation` with
   `STATUS_NOT_SUPPORTED` itself, before any file system is asked (v2.1, `src/sys/fileinfo.c` 2023-2025); its volume
   parameters' `HardLinks` bit reads "unimplemented; set to 0" (`inc/winfsp/fsctl.h` 213); and its NTFS compatibility
@@ -23682,6 +23688,37 @@ Applied in the same change to:
 - **Cost.** Only at a restart, and only for a green whose record arrives: one version's recomputation per version the
   holder accepted, as its first acceptance cost, in slices. A rebuilt replica holds what the replica held before the
   restart; its growth per version is the open item it was (GAPS).
+
+### A-327 — The Windows lanes run git as Git for Windows ships it and hand Subversion its `^/` URLs as written; a drive the Mount Manager did not make answers no final path (2026-11-18, A-300's first run; Ada's goal of 2026-11-18)
+Applied in the same change to: §4.6 (the Windows conformance status), A-300 (its `MSYS` bullet), GAPS (A-300's entry,
+with a decision for Ada), and `crates/conformance/src/workload.rs` (`ENVIRONMENT`; the `git` workload's `ln -s`).
+- **What the first run found.** CI run 44260193629 was the first to reach the Windows lanes' workloads step, on x86_64
+  and arm64 alike. Mercurial ran identical but for the drive's stated lines. git and git's history failed on the drive
+  alone, `git init .` with `fatal: cannot mkdir .: File exists` and `git init --bare upstream.git` with `fatal: cannot
+  chdir to upstream.git: No such device`. Subversion failed on both sides with `svn: E020024: Error resolving case of
+  '^C:\Program Files\Git\trunk'`.
+- **Why git failed: the drive has no final path.** Git for Windows turns its own symbolic links on when `MSYS` names
+  `winsymlinks:nativestrict` (`compat/mingw.c` `mingw_platform_has_symlinks`), which the shared environment set for
+  `ln -s`. With them on, `mingw_chdir` opens each directory and asks `GetFinalPathNameByHandleW` for its path with
+  `VOLUME_NAME_DOS` before it changes to it, and fails the change when that fails. Windows can translate a volume's
+  device name to a drive only for a drive the Mount Manager made, or a network drive; for one `DefineDosDeviceW` made,
+  as WinFsp makes an `X:` mount, it answers `ERROR_UNRECOGNIZED_VOLUME` (1005), which git reports as `ENODEV` (WinFsp
+  issues 410 and 427: the translation never reaches WinFsp, and its maintainer knows no workaround inside it). WinFsp
+  mounts through the Mount Manager when the mount point is spelled `\\.\X:`, which only an Administrator may ask.
+- **The decision.** The workloads run git as Git for Windows ships it: the variable is set on the `git` workload's one
+  `ln -s` alone, so the link is still a Windows symbolic link through the drive's reparse points (A-275), and git keeps
+  its own links off, as its installer does unless asked. The limitation is stated, not hidden: on the drive, git with its
+  symbolic links on cannot change directory, and any program that asks a file's final path with `VOLUME_NAME_DOS` is
+  refused alike. Mounting through the Mount Manager would need an Administrator, which R10 never requires; a WinFsp
+  network file system would have a final path, a UNC one every tool would then print in place of the drive. Which, if
+  either, to offer is Ada's decision (GAPS).
+- **Why Subversion failed: the shell rewrote its argument.** Git for Windows' shell rewrites an argument that looks
+  like a POSIX path before it starts a Windows program, and it took Subversion's repository-relative URL `^/trunk` for
+  one. The shared environment now sets `MSYS_NO_PATHCONV=1`, Git for Windows' switch for handing every argument on as
+  written; every other shell ignores it, and no workload passes a POSIX path a Windows program needs rewritten (the
+  Subversion workload's own paths are already in the drive form, `pwd -W`).
+- **The failing test** is the lanes' workloads step itself, red in run 44260193629 on both architectures; nothing else
+  runs Git for Windows. Its next run is the check.
 
 ### A-309 — An unresolved object is recovered, not just kept: a takeover settles only on its completion record, and the members that exist now recover what a cohort past its tolerance holds (accepted 2026-11-18, kiln goal g250, A-272 (ii); built 2026-11-18)
 
