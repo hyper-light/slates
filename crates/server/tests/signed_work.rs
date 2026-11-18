@@ -813,7 +813,8 @@ fn a_signed_landing_is_judged_recorded_and_read_back() {
   trust(&mut client, &secret, volume, &[&key]);
   set(&mut client, &secret, volume, landing(WriteMode::Ask));
   let unsigned = presented(&mut client, volume, &target, None);
-  let (first, manifest, statement) = expect_the_statement_a_person_reads(&unsigned, volume, &target);
+  let (first, manifest, statement) =
+    expect_the_statement_a_person_reads(&unsigned, volume, &target);
   let signature = key.sign(&statement);
   let asked = land_signed(&mut client, (volume, &target), None, Some(&signature)).unwrap();
   let (second, again, _) = shown(&asked);
@@ -822,12 +823,22 @@ fn a_signed_landing_is_judged_recorded_and_read_back() {
     (manifest, signer_of(&key)),
     "judged over the manifest shown, and still asked"
   );
-  assert_eq!(on_disk(&target), None, "nothing written before the approval");
+  assert_eq!(
+    on_disk(&target),
+    None,
+    "nothing written before the approval"
+  );
   let proof = grant_proof(&secret, second, &manifest, GrantScope::Once, GRANT_TERM_NS);
   let grant = client
     .grant(second, manifest, GrantScope::Once, GRANT_TERM_NS, proof)
     .unwrap();
-  let landed = land_signed(&mut client, (volume, &target), Some(grant), Some(&signature)).unwrap();
+  let landed = land_signed(
+    &mut client,
+    (volume, &target),
+    Some(grant),
+    Some(&signature),
+  )
+  .unwrap();
   assert_eq!(landed_verdict(&landed), signer_of(&key));
   assert_eq!(on_disk(&target).as_deref(), Some(&b"signed landing"[..]));
   expect_the_landings_audited(&mut client, (first, second), &key);
@@ -939,7 +950,9 @@ fn a_landings_signature_decides_nothing_its_mode_decides() {
   expect_landed_invalid(
     &mut client,
     (&secret, &trusted),
-    ("namespace", &|statement| trusted.sign_under("git", statement)),
+    ("namespace", &|statement| {
+      trusted.sign_under("git", statement)
+    }),
     SignatureFault::Namespace,
   );
   expect_a_stale_signature_landed_bad(&mut client, &secret, &trusted);
@@ -975,19 +988,20 @@ fn expect_landed_invalid(
     Verification::Invalid { reason: fault },
     "{name}"
   );
-  assert_eq!(
-    on_disk(&target).as_deref(),
-    Some(name.as_bytes()),
-    "{name}"
-  );
+  assert_eq!(on_disk(&target).as_deref(), Some(name.as_bytes()), "{name}");
 }
 
 /// The stale landing of `a_landings_signature_decides_nothing_its_mode_decides`. Do: sign the statement of a bypass
 /// volume's landing with the trusted key, change `f`, and land with that signature. Expect it written with `f` as it
 /// is now, and answered `BadSignature`: the statement it signed named a manifest the volume moved past.
 #[cfg(unix)]
-fn expect_a_stale_signature_landed_bad(client: &mut Client, secret: &[u8; 32], trusted: &TestSigner) {
-  let (volume, target, statement) = bypassed(client, secret, ("stale", b"before the signature"), trusted);
+fn expect_a_stale_signature_landed_bad(
+  client: &mut Client,
+  secret: &[u8; 32],
+  trusted: &TestSigner,
+) {
+  let (volume, target, statement) =
+    bypassed(client, secret, ("stale", b"before the signature"), trusted);
   let signature = trusted.sign(&statement);
   write_f(client, volume, b"after the signature");
   let landed = land_signed(client, (volume, &target), None, Some(&signature)).unwrap();
@@ -997,17 +1011,30 @@ fn expect_a_stale_signature_landed_bad(client: &mut Client, secret: &[u8; 32], t
       reason: SignatureFault::BadSignature
     }
   );
-  assert_eq!(on_disk(&target).as_deref(), Some(&b"after the signature"[..]));
+  assert_eq!(
+    on_disk(&target).as_deref(),
+    Some(&b"after the signature"[..])
+  );
 }
 
 /// The forbidden landing of `a_landings_signature_decides_nothing_its_mode_decides`. Do: sign a bypass volume's landing
 /// statement with the trusted key, forbid the volume's landings, and land with the signature. Expect `PolicyForbids`
 /// naming the landing and the volume, and nothing written: a forbidden landing is refused signed or not.
 #[cfg(unix)]
-fn expect_a_verified_signature_forbidden(client: &mut Client, secret: &[u8; 32], trusted: &TestSigner) {
-  let (volume, target, statement) = bypassed(client, secret, ("forbidden", b"never landed"), trusted);
+fn expect_a_verified_signature_forbidden(
+  client: &mut Client,
+  secret: &[u8; 32],
+  trusted: &TestSigner,
+) {
+  let (volume, target, statement) =
+    bypassed(client, secret, ("forbidden", b"never landed"), trusted);
   set(client, secret, volume, landing(WriteMode::Forbid));
-  let refused = land_signed(client, (volume, &target), None, Some(&trusted.sign(&statement)));
+  let refused = land_signed(
+    client,
+    (volume, &target),
+    None,
+    Some(&trusted.sign(&statement)),
+  );
   assert!(
     matches!(
       &refused,
@@ -1037,7 +1064,11 @@ fn asking_agent(launcher: &mut Client, secret: &[u8; 32], instance: &str) -> Cli
     require_signed_merges: false,
   };
   launcher
-    .set_policy(subject, (asked, 0), policy_proof(secret, &subject, &asked, 0))
+    .set_policy(
+      subject,
+      (asked, 0),
+      policy_proof(secret, &subject, &asked, 0),
+    )
     .unwrap();
   let mut agent = connect(instance);
   agent.attest(consumer, &capability).unwrap();
@@ -1061,7 +1092,13 @@ fn an_agents_asked_landing_keeps_its_signature() {
   trust(&mut launcher, &secret, volume, &[&key]);
   set(&mut launcher, &secret, volume, landing(WriteMode::Bypass));
   let (_, manifest, statement) = shown(&presented(&mut agent, volume, &target, None));
-  let asked = land_signed(&mut agent, (volume, &target), None, Some(&key.sign(&statement))).unwrap();
+  let asked = land_signed(
+    &mut agent,
+    (volume, &target),
+    None,
+    Some(&key.sign(&statement)),
+  )
+  .unwrap();
   let (_, shown_again, _) = shown(&asked);
   assert_eq!(
     (shown_again, asked.verification),

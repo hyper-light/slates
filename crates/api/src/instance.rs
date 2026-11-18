@@ -501,10 +501,7 @@ impl Instance {
           .presented(request, signature, again)
           .map(Presented::outcome)
       }
-      Err(error) => Err(self.fail(
-        error,
-        Some(Missing::Presentation { id: presentation }),
-      )),
+      Err(error) => Err(self.fail(error, Some(Missing::Presentation { id: presentation }))),
     }
   }
 
@@ -571,7 +568,9 @@ impl Instance {
         landing: Landing::GrantRequired { .. },
         statement: None,
         ..
-      }) => Err(Error::Protocol(ProtocolFault::UnexpectedReply { verb: "land" })),
+      }) => Err(Error::Protocol(ProtocolFault::UnexpectedReply {
+        verb: "land",
+      })),
       Err(ClientError::Refused(Refusal::PolicyForbids { act, by })) => Ok(Presented::Settled(
         LandOutcome::Refused(PolicyRefusal::forbidden(act, by)),
       )),

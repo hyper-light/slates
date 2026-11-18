@@ -901,7 +901,11 @@ fn a_signed_landing_is_judged_and_read_back_through_the_contract() {
     (asked.manifest, asked.verification, asked.signature.as_ref()),
     (plan.manifest, verified, Some(&signature))
   );
-  assert_eq!(folder.read("s.txt"), None, "nothing written before the approval");
+  assert_eq!(
+    folder.read("s.txt"),
+    None,
+    "nothing written before the approval"
+  );
   let LandOutcome::Written(report) = instance.approve_landing(&asked, &launcher).unwrap() else {
     panic!("the approved manifest lands");
   };
@@ -930,7 +934,10 @@ fn expect_the_signed_landing_audited(
     "{audit:?}"
   );
   for kind in [AuditKind::LandingPlanned, AuditKind::LandingFinished] {
-    assert!(judged.iter().any(|(judged, _)| *judged == kind), "{audit:?}");
+    assert!(
+      judged.iter().any(|(judged, _)| *judged == kind),
+      "{audit:?}"
+    );
   }
   assert!(
     audit

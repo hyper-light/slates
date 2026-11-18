@@ -3284,7 +3284,8 @@ pub fn audit_verb(state: &ShardState, since: u64) -> ReplyBody {
       // names no code for (a newer build's record) reads as none.
       verification: matches!(
         r.kind,
-        slates_db::catalog::AuditKind::LandingPlanned | slates_db::catalog::AuditKind::LandingFinished
+        slates_db::catalog::AuditKind::LandingPlanned
+          | slates_db::catalog::AuditKind::LandingFinished
       )
       .then(|| crate::signed_work::of_record(r.signature))
       .flatten(),
