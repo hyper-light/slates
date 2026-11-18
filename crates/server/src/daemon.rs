@@ -3003,6 +3003,17 @@ impl Daemon {
     })
   }
 
+  /// Test support: makes this node, as a content holder, hold each acknowledgement of a placement `delay_ns` before it
+  /// leaves (`None` restores immediate answers). The hold has already taken the content, so an owner whose round stops
+  /// collecting at its hedge delay first receives the acknowledgement as a straggler's, as it does from a holder whose
+  /// refill outlasts the round under load. A missing set or a refusal goes at once. Delivered like
+  /// [`Self::inject_serve_delay`]; `Ok` once installed, else the typed refusal.
+  pub fn inject_content_ack_delay(&self, delay_ns: Option<u64>) -> Result<(), ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      s.injected_content_ack_delay_ns = delay_ns;
+    })
+  }
+
   /// Test support: while `Some(peer)`, this node's record link to `peer` pages no discovery, so the link's own refresh
   /// never takes that session from its slot (`None` lifts it). Delivered like [`Self::inject_serve_delay`].
   pub fn inject_discovery_hold(&self, peer: Option<slates_db::HostId>) -> Result<(), ObserveError> {
@@ -4036,6 +4047,7 @@ async fn init_shard(
     probe_windows: crate::fleet::ProbeWindows::default(),
     probe_deaf_to: std::collections::BTreeSet::new(),
     injected_serve_delay_ns: None,
+    injected_content_ack_delay_ns: None,
     injected_forward_silence: None,
     injected_deaf_session: None,
     injected_discovery_hold: None,

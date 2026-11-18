@@ -1676,14 +1676,18 @@ async fn serve_peer_records(
             crate::takeover::serve_host_prepare(s, local, peer_host, &request)
           })
           .unwrap_or_default(),
-          stream if is_content_stream(stream) => state::with_state(|s| {
-            let peer_host = s
-              .learned_members
-              .get(&peer_anchor)
-              .map_or(seed, |learned| learned.host);
-            serve_content_request(s, local, peer_host, stream, &request)
-          })
-          .unwrap_or_default(),
+          stream if is_content_stream(stream) => {
+            let reply = state::with_state(|s| {
+              let peer_host = s
+                .learned_members
+                .get(&peer_anchor)
+                .map_or(seed, |learned| learned.host);
+              serve_content_request(s, local, peer_host, stream, &request)
+            })
+            .unwrap_or_default();
+            injected_content_ack_delay(&reply).await;
+            reply
+          }
           // A green's merge record with the inputs it names while this holder lacks them (§4.16 "Apply on holders",
           // "Commit" in one exchange a version): the inputs are held, then the record recomputed and accepted.
           crate::merge_service::MERGE_RECORD_STREAM => state::with_state(|s| {
@@ -2996,7 +3000,7 @@ fn heal_one_placed_snapshot(state: &mut ShardState, local: HostId, created_unix:
     return;
   };
   state.healer.after = Some(id);
-  start_seal(
+  let started = start_seal(
     state,
     local,
     object,
@@ -3005,6 +3009,14 @@ fn heal_one_placed_snapshot(state: &mut ShardState, local: HostId, created_unix:
     sequence,
     created_unix,
     true,
+  );
+  state.count(
+    if started {
+      "diag.heal.started"
+    } else {
+      "diag.heal.start_refused"
+    },
+    1,
   );
 }
 
@@ -3555,7 +3567,11 @@ async fn put_seal_content(origin: u16, local: HostId, work: ContentWork) -> Opti
     if round == 0 && job.first_round_at_ns.is_none() {
       job.first_round_at_ns = Some(dispatched_ns);
     }
+    let healing = job.healing;
     let Some(placement) = placement else {
+      if healing {
+        s.count("diag.heal.round_no_placement", 1);
+      }
       return;
     };
     job.rounds = job.rounds.saturating_add(1);
@@ -3569,6 +3585,8 @@ async fn put_seal_content(origin: u16, local: HostId, work: ContentWork) -> Opti
     } else {
       0
     };
+    let refilled_count = refilled.len();
+    let acked_in_round = placement.acked.len();
     for host in placement.acked {
       fold_content_ack(job, host);
     }
@@ -3577,6 +3595,30 @@ async fn put_seal_content(origin: u16, local: HostId, work: ContentWork) -> Opti
       .repairs
       .saturating_add(u64::try_from(repaired).unwrap_or(u64::MAX));
     s.put_outcomes.record(placed);
+    if healing {
+      let as_u64 = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+      s.count("diag.heal.round", 1);
+      s.count("diag.heal.refilled_in_round", as_u64(refilled_count));
+      s.count("diag.heal.repaired_in_round", as_u64(repaired));
+      s.count(
+        "diag.heal.refilled_unacked_in_round",
+        as_u64(refilled_count.saturating_sub(repaired)),
+      );
+      s.count("diag.heal.acked_in_round", as_u64(acked_in_round));
+      if placed {
+        s.count("diag.heal.round_placed", 1);
+      }
+      eprintln!(
+        "DIAG heal round {round} object {:?} refilled {:?} acked_in_round {} repaired {} placed {} p95 {:?} readings {}",
+        object,
+        refilled,
+        acked_in_round,
+        repaired,
+        placed,
+        s.put_latency.p95_ns(),
+        s.put_latency.len()
+      );
+    }
   });
   dispatch
 }
@@ -3590,6 +3632,11 @@ async fn put_seal_content(origin: u16, local: HostId, work: ContentWork) -> Opti
 fn record_placed_seals(state: &mut ShardState) {
   let quorum = state.fleet.configuration().quorum;
   let now = state.clock.monotonic_ns();
+  let healed = state
+    .seals
+    .values()
+    .filter(|job| job.healing && job.manifest.is_some() && job.content.placed(quorum))
+    .count();
   let done: Vec<(ObjectId, DbSnapshotId, [u8; 32], Vec<u64>)> = state
     .seals
     .iter()
@@ -3606,6 +3653,12 @@ fn record_placed_seals(state: &mut ShardState) {
       Some((*object, job.snapshot, identity, region))
     })
     .collect();
+  if healed > 0 && !done.is_empty() {
+    state.count(
+      "diag.heal.recorded",
+      u64::try_from(healed.min(done.len())).unwrap_or(0),
+    );
+  }
   for (object, snapshot, identity, region) in done {
     let volume = DbVolumeId { bytes: object.0 };
     // A mirror placement already recorded is kept: a home seal that completes again for a mirrored snapshot (the
@@ -4011,6 +4064,23 @@ async fn injected_serve_delay() {
 /// Counter: a test's injected serve delay the runtime could not time; the answer went at once.
 /// Format: a counter name in the daemon's status report.
 const SERVE_DELAY_UNTIMED: &str = "fleet.serve_delay_untimed";
+
+/// Waits out a test's injected acknowledgement delay (`Daemon::inject_content_ack_delay`) before this holder's content
+/// `reply` leaves, when the reply is an acknowledgement; nothing in production. The hold took the content before the
+/// wait, so the owner meets the condition a holder whose refill outlasts the round meets under load: its round stops
+/// collecting at the hedge delay and the acknowledgement arrives as a straggler's. A sleep the runtime could not time is
+/// counted and the reply goes at once.
+async fn injected_content_ack_delay(reply: &[u8]) {
+  let Some(delay_ns) = state::with_state(|s| s.injected_content_ack_delay_ns).flatten() else {
+    return;
+  };
+  if !matches!(ContentMessage::decode(reply), Ok(ContentMessage::Ack(_))) {
+    return;
+  }
+  if slates_rt::futures::sleep(delay_ns).await.is_err() {
+    count_refusal(SERVE_DELAY_UNTIMED);
+  }
+}
 
 /// Runs `recovery` on this shard with the memory-pressure hold lifted for exactly its duration, then sets the hold
 /// back. A takeover's materialization (its fetch's staging, the restore, the volume's reservations and the writes
@@ -5393,11 +5463,18 @@ fn fold_late_content(late: LateReplies, replies: &[(HostId, TimedReply)]) {
         Track::Home => s.put_latency.record(latency_ns),
         Track::Mirror => s.mirror_put_latency.record(latency_ns),
       }
+      let mut late_heal = false;
       if let Some(job) = seal_jobs(s, track).get_mut(&object)
         && job.snapshot == snapshot
         && job.content.candidates.contains(holder)
       {
+        late_heal = job.healing && !job.content.acked.contains(holder);
         fold_content_ack(job, *holder);
+      }
+      s.count("diag.late_ack", 1);
+      if late_heal {
+        s.count("diag.heal.late_ack", 1);
+        eprintln!("DIAG heal late ack object {object:?} holder {holder:?} latency_ns {latency_ns}");
       }
     }
   });
