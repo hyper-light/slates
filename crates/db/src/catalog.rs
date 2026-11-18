@@ -272,6 +272,29 @@ pub struct PolicyRecord {
   /// catalog register before the shipper's first entry, so a takeover counts phase one's reports from exactly the hosts
   /// a durable entry is held by. `None` until a shipper commits one. Appended.
   pub live_holders: Option<LiveHolders>,
+  /// The volume's write policy (A-285): how a merge and a landing of it are permitted, set by the launcher or the
+  /// harness through the issuer, never by an agent. `None` until one is set, which is ask. Appended.
+  pub write: Option<WritePolicy>,
+}
+
+/// How one kind of write is permitted (A-285): the mode the user gave the harness or agent.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteMode {
+  /// Written at once, with no approval asked.
+  Bypass,
+  /// Answered with an approval request the harness presents; written once the approval binds the manifest.
+  Ask,
+  /// Refused.
+  Forbid,
+}
+
+/// A volume's write policy (A-285): the mode for its merges and the mode for its landings.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WritePolicy {
+  /// How a merge into the volume is permitted.
+  pub merge: WriteMode,
+  /// How a landing of the volume is permitted.
+  pub land: WriteMode,
 }
 
 /// A live shipper's holder set and the epoch it ships under (A-240): the `2f` candidates it ships to, as their host
@@ -692,6 +715,8 @@ pub enum GrantSurface {
     /// The harness.
     harness: String,
   },
+  /// The volume's write policy (A-285): the daemon issued the grant itself under a bypass policy. Appended.
+  Policy,
 }
 
 /// A grant's scope.
