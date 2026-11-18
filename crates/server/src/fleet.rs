@@ -5873,7 +5873,7 @@ fn recorded_keys(
 
 /// The quantum a seal's turns are cut by on this shard (its archive walk's, its envelope's wrap and, on a successor, an
 /// envelope's open): the shard's step quantum, or the one a test injected (`Daemon::inject_seal_walk_quantum`).
-fn seal_quantum_ns(state: &ShardState) -> u64 {
+pub(crate) fn seal_quantum_ns(state: &ShardState) -> u64 {
   state
     .seal_walk_quantum_ns
     .or_else(futures::step_budget_ns)
