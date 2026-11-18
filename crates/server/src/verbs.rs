@@ -9643,6 +9643,12 @@ pub(crate) fn reconcile_unpublished_effects(state: &mut ShardState) -> usize {
     keep
   });
   crate::work_charge::release(state, released);
+  // A rolled-back clone's pin on its origin's snapshot: the record that named the origin went with the rollback, so the
+  // pins are recounted against the lineage the catalog still records, as a recovery recounts them. Before 2026-11-18
+  // the teardown kept the pin, and the snapshot's destroy was refused `Pinned` until a restart.
+  if !orphans.is_empty() {
+    reconcile_clone_pins(state);
+  }
   // A Shards stream whose attachment the rollback removed serves nothing, and its end is handed to no one (A-161).
   crate::shards::reconcile_unrecorded(state);
   // Nor does a vhost-user device the verb handed out (G-vhost).
