@@ -459,10 +459,20 @@
 >   whole materialization in one owner-shard turn (0.73 to 2.84 s at 152 to 306 MB of sealed log on a Mac Studio), and
 >   each period's attempt, its 100 ms deadline outlasted, fetched and rebuilt the whole log again. The log is now rebuilt
 >   a payload a slice by a task of the owner shard, the archive, the restore and the making each a turn, and a later
->   attempt joins the task running (`a_live_takeover_is_rebuilt_in_turns_and_joined_while_it_runs`; the bug record of
->   2026-11-18, "a live takeover made its volume in one turn"). Still owed: the archive's layout and the restore in quantum
->   slices (each one turn, about 0.1 s at 300 MB), the first publication's whole entry (the item above), and a sealed
->   volume's restore.
+>   attempt joins the task running (`a_live_takeover_is_fetched_and_rebuilt_in_turns_and_joined_while_it_runs`; the bug
+>   record of 2026-11-18, "a live takeover made its volume in one turn"). **Its fetch closed the same day (A-386, g251):**
+>   the candidate's answer (every entry cloned, then copied into one growing answer) and the successor's decode (every
+>   payload copied out) were each one turn of a control shard, 406 MB of log beside a 557 ms poll in a nemesis run
+>   (seed 18189587465523915115); the answer is now laid out a copy slice a turn on a task of the serve loop and handed to
+>   the transport uncopied, and the successor reads the payloads in place as it applies them (the bug record of
+>   2026-11-18, "a takeover fetch copied the whole log in one turn"). Still owed: the archive's layout and the restore in
+>   quantum slices (each one turn, about 0.1 s at 300 MB), the first publication's whole entry (the item above), a
+>   sealed volume's restore, and the plain (unlogged) takeover's restore and population, still one owner-shard turn
+>   behind a call whose deadline is a period (g232's kernel base volume: 97,254 files, 1.99 GB, seconds of one poll).
+>   **The restore's steps exist (A-391, g251, 2026-11-18):** `slates_archive::Planning`, `Planned::restoring` and
+>   `Restoring` make a restore a piece at a time (no piece past one chunk's bytes but a merge onto a file's growing
+>   piece); the server still calls the one-call `restore` until the population in steps and the plain takeover path's
+>   owner-shard task follow (g251's next change).
 >   - **Measured (2026-11-18):** g251's trace of the nemesis spin kills found a taken-over volume's first publication
 >     (`fleet::published_before_served` -> `live_ship::published`, its whole entry) at 1.06 s in one turn; the
 >     measurer's 32-writer run (128 MiB, diag-measurer-7) lost a daemon to the watchdog in 3 of 8 runs at 1,000-1,002 ms
@@ -2740,6 +2750,9 @@
 >       now it marks the shard its region names and the doorbell thread kicks only the shards marked. Each shard's
 >       parks fell 59% and the shards' CPU 20 to 34% at 1,000 clients; the latencies moved with the box's load (14 to 52)
 >       more than with the change, so no latency is claimed for it (BENCHMARKS, 2026-11-18).
+>     - **Closed: an ask waiting out the batch before it (A-388, 2026-11-18).** One batch of asks was out to an owner at
+>       a time, and the wait for it was about half of an ask's way to the owner (p99 1.6 to 2.1 ms for submits and
+>       rebases at 50 ms); a shard now keeps two out.
 >     - **Open, the hops (by the trace):** an edit of a work off its client's shard crosses four thread hand-offs (the
 >       client's shard, the work's, the owner's, back), each waiting for its thread to run; and a first touch, a
 >       verdict, a rebase and a read of the green each queue on the owner's one thread.

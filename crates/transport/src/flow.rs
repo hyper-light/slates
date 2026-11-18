@@ -281,7 +281,7 @@ mod tests {
     );
 
     let mut source = StreamSender::new();
-    source.write(&content);
+    source.write(content.clone());
     source.finish();
     let flow = FlowController::new(WINDOW_AHEAD, WINDOW_AHEAD, 0);
     let mut assembler = StreamAssembler::new(flow.stream_max(STREAM_ID));
