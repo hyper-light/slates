@@ -1040,6 +1040,11 @@ pub struct ShardState {
   pub council_timing: slates_cluster::timing::ElectionTiming,
   /// The root group's election timing, derived as the council's is over the root voters' paths.
   pub root_timing: slates_cluster::timing::ElectionTiming,
+  /// The failover delay as this node estimates it (§4.8 "Derived constants", A-363): the coordinator's measured period,
+  /// the takeovers and volumes it timed, and the detection and confirmation terms the last period derived from the
+  /// detector and the council's timing. Live on the control shard, which runs the coordinator; a laptop's, and every
+  /// other shard's, is the recovery prior alone.
+  pub failover: slates_cluster::failover::Failover,
   /// What this node holds as a **content candidate** for other owners' snapshots (§4.10 "Content
   /// replication"): the distinct chunks by identity and each manifest held whole, verified before
   /// anything is stored — served on the record session's content stream by the fleet loop. It is what
@@ -1552,11 +1557,14 @@ pub struct PendingVolume {
   /// which the volume's loss report names once it is served (`slates_db::catalog::TakeoverPastTolerance::registers`).
   /// `None` within tolerance and for a volume no round adopted.
   pub registers_short: Option<slates_db::catalog::RecoveryShortfall>,
+  /// When it was adopted, on the shard's clock (zero off a shard): its recovery is timed from here to its service, into
+  /// the failover estimate (A-363).
+  pub adopted_ns: u64,
 }
 
 impl PendingVolume {
   /// A volume just adopted with its head `head` by `departed`'s takeover round, the retired owner having placed it on
-  /// `cohort_hosts`: no attempt made yet.
+  /// `cohort_hosts`: no attempt made yet, adopted now.
   pub fn adopted(
     head: crate::head::HeadValue,
     departed: Option<slates_db::register::HostId>,
@@ -1570,6 +1578,7 @@ impl PendingVolume {
       round_seen: None,
       cohort_hosts,
       registers_short: None,
+      adopted_ns: slates_rt::futures::now_ns(),
     }
   }
 
