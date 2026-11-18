@@ -847,6 +847,40 @@ pub(crate) fn ledger_value(
   MergeRecordValue::from_record_bytes(bytes).filter(|value| value.version == version)
 }
 
+/// Each version of `object` from 1 to `through`, in order, with the identity of the increment that committed it, as this
+/// node's ledger names it (A-476): what a takeover successor's chain is through the version its adoption stands for
+/// (`Daemon::merge_chain_identities`, A-333). A version whose position the ledger let go of, below the durable checkpoint
+/// this holder keeps (A-404), is named by the checkpoint's own record of what it accepted. Before, the ledger alone was
+/// read, so a successor whose checkpoint stood for version 1 named its chain from version 2 (the fleet test of a
+/// successor two versions behind, 2 of 4 runs).
+pub(crate) fn ledger_identities(
+  state: &ShardState,
+  object: ObjectId,
+  through: u64,
+) -> Vec<(u64, [u8; 32])> {
+  let checkpointed: std::collections::BTreeMap<u64, [u8; 32]> = state
+    .merge
+    .checkpoints
+    .get(&object)
+    .and_then(|held| slates_merge::checkpoint::Checkpoint::decode(&held.bytes).ok())
+    .map(|checkpoint| {
+      checkpoint
+        .accepted
+        .into_iter()
+        .map(|(increment, version)| (version, increment))
+        .collect()
+    })
+    .unwrap_or_default();
+  (1..=through)
+    .filter_map(|version| {
+      ledger_value(state, object, version)
+        .map(|value| value.increment)
+        .or_else(|| checkpointed.get(&version).copied())
+        .map(|increment| (version, increment))
+    })
+    .collect()
+}
+
 /// Runs `seed`'s first slice now; if the seed does not end in it, a task of this shard goes on with it, owned by the
 /// green's entry in `seeding`. Whether the seed ended now.
 fn build(state: &mut ShardState, mut seed: ReplicaSeed) -> bool {
@@ -2540,6 +2574,84 @@ mod tests {
       counts,
       [1, 1],
       "built from the checkpoint once, one version recomputed after it"
+    );
+  }
+
+  /// `record` with its value naming `increment` as the increment its version committed.
+  fn with_increment(mut record: Record, increment: &Increment) -> Record {
+    let mut value = MergeRecordValue::from_record_bytes(&record.value).unwrap();
+    value.increment = increment.id;
+    record.value = value.to_record_bytes();
+    record
+  }
+
+  /// A-476 (the bug record of 2026-11-18, "a successor's chain lacked the versions its checkpoint stood for"): a takeover
+  /// successor names every version its adoption stands for, those its durable checkpoint stands for too. Do: give a
+  /// holder of a scratch green versions 0 and 1; serve it version 2 naming version 1 committed and version 3 naming
+  /// version 2 committed, as the successor of the fleet test held them before its owner died, so it keeps a checkpoint at
+  /// version 2 and lets go of position 1 (A-404); read the identities its ledger names through version 3, as its chain
+  /// through an adoption of version 3 is read. Expect versions 1, 2 and 3, each with its increment's identity, the ledger
+  /// keeping positions 0, 2 and 3. Red before: version 1, whose position the checkpoint let go of, was left out, as the
+  /// successor's chain in `a_successor_two_versions_behind_adopts_the_versions_between_and_serves_the_green` (2 of 4 runs).
+  #[test]
+  fn a_successors_chain_names_the_versions_its_checkpoint_stands_for() {
+    let one = creating("f", b"one", 1, 0);
+    let two = overwriting("f", b"two", 2, 1);
+    let three = creating("g", b"three", 3, 2);
+    let object = ObjectId([47; 16]);
+    let (after_two, after_three) = (
+      identity_after(&[&one, &two]),
+      identity_after(&[&one, &two, &three]),
+    );
+    let manifest = |increment: &Increment| {
+      InputsBuilder::whole(&increment.encode())
+        .finish(0, 4096)
+        .manifest_identity()
+    };
+    let (positions, named) = crate::daemon::audit_on_shard(move |state| {
+      let host = holder_of_a_dying_owners_version(state, object, &one);
+      let records = [
+        with_increment(
+          with_committed(
+            merge_record(host, object, (2, 1), (Some(manifest(&two)), after_two)),
+            1,
+          ),
+          &two,
+        ),
+        with_increment(
+          with_committed(
+            merge_record(host, object, (3, 1), (Some(manifest(&three)), after_three)),
+            2,
+          ),
+          &three,
+        ),
+      ];
+      for (record, increment) in records.iter().zip([&two, &three]) {
+        let _ = crate::fleet::serve_merge_shipment(
+          state,
+          host.0,
+          host.0,
+          &shipment_of(record, increment),
+        );
+      }
+      let positions: Vec<u64> = state
+        .holder_records
+        .get(&object)
+        .map(|acceptor| {
+          acceptor
+            .positions()
+            .filter(|(held, ..)| *held == object)
+            .map(|(_, sequence, ..)| sequence)
+            .collect()
+        })
+        .unwrap_or_default();
+      (positions, ledger_identities(state, object, 3))
+    });
+    assert_eq!(positions, vec![0, 2, 3], "the checkpoint at version 2 let go of position 1");
+    assert_eq!(
+      named,
+      vec![(1, [1; 32]), (2, [2; 32]), (3, [3; 32])],
+      "every version through the adopted one, version 1 by the checkpoint's record of it"
     );
   }
 

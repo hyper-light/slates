@@ -3323,6 +3323,15 @@
 > by the versions its owner has not yet committed. A-238's owed "the holders' replicas and records grow per version" is
 > closed by A-385 and A-404.
 >
+> **Fixed 2026-11-18 (g083, A-476): a takeover successor's chain lacked the versions its checkpoint stood for.** A
+> successor that had let go of its ledger's positions below its held checkpoint (A-404) named its adopted versions by
+> the ledger alone, so its chain began after them (`a_successor_two_versions_behind_adopts_the_versions_between_and_serves_the_green`,
+> 2 of 4 runs on Linux, at and before A-273). The versions through its adoption are now named by the ledger where it
+> holds the position and by the checkpoint's record of what it accepted where it let go of it
+> (`merge_origin::ledger_identities`; test `a_successors_chain_names_the_versions_its_checkpoint_stands_for`). Its
+> engine, its rebuild and its durable state were right throughout. Record:
+> `docs/bugs/2026-11-18-a-successors-chain-lacked-the-versions-its-checkpoint-stood-for.md`.
+>
 > **Fixed 2026-11-18 (g232, A-385): a holder's replica of a green kept every version's values.** An owner folds its
 > green's histories to its per-green budget, never past a live reader's version; a holder's replica, the engine it
 > recomputes every version on and a takeover adopts, folded nothing. Now each merge record names where the owner's engine
