@@ -111,8 +111,11 @@ const MOVE_QUESTIONS_UNSENT: &str = "fleet.move.questions_unsent";
 const MOVE_ANSWER_UNBOUND: &str = "fleet.move.answer_unbound";
 /// Counter: rounds whose epoch could not be raised past a holder's fence (`u64::MAX`).
 const MOVE_EPOCH_EXHAUSTED: &str = "fleet.move.epoch_exhausted";
-/// Counter: registers whose cohort has fewer members left than its recovery quorum.
+/// Counter: registers whose promising members reported no record of them (a cohort that lost the move's records).
 const MOVE_LOST: &str = "fleet.move.lost";
+/// Counter: registers adopted past tolerance: fewer of the cohort left than its recovery quorum, every survivor promised,
+/// and the newest record any of them holds adopted (A-309).
+const MOVE_ADOPTED_PAST_TOLERANCE: &str = "fleet.move.adopted_past_tolerance";
 /// Counter: moved volumes this node adopted whole (head and catalog), to be served.
 const MOVE_ADOPTED: &str = "fleet.move.adopted";
 /// Counter: seals of an adopted volume the shard refused this period (retried next period).
@@ -1257,10 +1260,11 @@ fn fold(state: &mut ShardState, key: ObjectId, answers: Vec<(HostId, HostPromise
 }
 
 /// The registers of `key` ready to adopt, each with the newest record reported and the round's epoch: the recorded
-/// cohort's recovery quorum promised it ([`readiness`] under the named-answer rule, the cohort's members only). A
-/// register no promising member reported a record of waits: its records were placed before the move was reported, so a
-/// quorum saying nothing is a cohort that lost them, counted lost, never adopted as empty. A cohort with fewer members
-/// left than the quorum is counted lost too and waits (the move stays the new owner's, its records where they are).
+/// cohort's recovery quorum promised it ([`readiness`] under the named-answer rule, the cohort's members only), or, with
+/// fewer members left than that quorum, every surviving member did (A-309: the newest any of them holds, counted). A
+/// register no promising member reported a record of waits: its records were placed before the move was reported, so
+/// promises saying nothing are a cohort that lost them, counted lost, never adopted as empty (the move stays the new
+/// owner's, its records where they are).
 fn ready_registers(
   state: &mut ShardState,
   key: ObjectId,
@@ -1271,7 +1275,7 @@ fn ready_registers(
     return Vec::new();
   };
   let mut ready = Vec::new();
-  let mut lost: u64 = 0;
+  let (mut lost, mut adopted_past_tolerance): (u64, u64) = (0, 0);
   let empty = BTreeMap::new();
   let none = BTreeSet::new();
   for register in registers(key) {
@@ -1285,23 +1289,39 @@ fn ready_registers(
       named_nothing: adoption.named_nothing.get(&register).unwrap_or(&none),
       local: None,
     };
-    match readiness(
+    // The recorded cohort is the only one: the move placed the records there, under one owner, with no neighbourhood
+    // change of the record's own in flight.
+    let verdict = readiness(
       &[cohort.to_vec()],
+      &[],
       |host| regional.members.contains(&host),
       regional.quorum,
       &heard,
       CountingRule::NamedAnswer,
-    ) {
-      Readiness::Ready => match reports.values().cloned().reduce(newest) {
-        Some(newest) => ready.push((register, newest, adoption.epoch)),
-        None => lost = lost.saturating_add(1),
-      },
-      Readiness::Lost { .. } => lost = lost.saturating_add(1),
+    );
+    let past_tolerance = matches!(verdict, Readiness::ReadyPastTolerance { .. });
+    match verdict {
+      Readiness::Ready | Readiness::ReadyPastTolerance { .. } => {
+        match reports.values().cloned().reduce(newest) {
+          Some(newest) => {
+            // Past tolerance every surviving member of the cohort promised, and the newest record any of them holds is
+            // adopted, as a takeover's round adopts one (A-309).
+            if past_tolerance {
+              adopted_past_tolerance = adopted_past_tolerance.saturating_add(1);
+            }
+            ready.push((register, newest, adoption.epoch));
+          }
+          None => lost = lost.saturating_add(1),
+        }
+      }
       Readiness::Waiting => {}
     }
   }
   if lost > 0 {
     state.count(MOVE_LOST, lost);
+  }
+  if adopted_past_tolerance > 0 {
+    state.count(MOVE_ADOPTED_PAST_TOLERANCE, adopted_past_tolerance);
   }
   ready
 }
