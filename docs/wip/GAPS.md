@@ -3395,7 +3395,10 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 >       44288273676, Linux x86_64) read chaos-166..169 `NotFound` after the owner's loss: the holder with the newest
 >       entries, stopped 3 s, was retired, and the stale holder's live takeover went past tolerance (A-309 piece 3) and
 >       adopted its own head 167 beside two members that never held the log. A retired holder this node never saw
->       restart now counts as one that may return, so the takeover waits for its report. Red first:
+>       restart now counts as one that may return, so the takeover waits for its report; and a takeover's share stays
+>       open while an object its round adopted is still materializing (`takeover::materializing`), so the retirement
+>       the other holders authorize the successor by is kept until it holds the volume (its first run without that gave
+>       the volume up: the stale holder refused every report once the retirement was gone). Red first:
 >       `a_retired_holder_never_seen_restarted_is_waited_for_and_its_newer_head_adopted`
 >       (`docs/bugs/2026-11-18-a-false-death-let-the-members-that-exist-now-stand-in-for-the-holder-of-the-newest-entries.md`).
 >       **Decision for Ada:** a holder away past the failover SLO now has the volume given up (`NotRecovered`, final on the

@@ -56,6 +56,15 @@ the same shape for a falsely retired holder of the newest register record. It is
   - The unit test `a_retired_holder_never_seen_restarted_is_waited_for_and_its_newer_head_adopted` is the flow's decision
     alone: red before (past tolerance at once, b's 167 adopted) and green after (waits, then c's 170). With c seen
     restarted it adopts past tolerance, as A-309 does.
+- `crates/server/src/takeover.rs`: a share is not done while an object its round adopted is still being materialized
+  here (`materializing`, a fact of `share_done`). This was found by the first run of the flow with the change above
+  (Mac Studio, release, 2026-11-18). The loss was gone, but the successor gave the volume up after 99 waits for its
+  quorum. The stale holder e refused it every report once c came back (`fleet.live.hold_refused.fetch_unauthorized` 82,
+  after 18 reports). e keeps no record of the head (`fleet_held_records` 0), so it authorizes a reader through the
+  departed owner's kept retirement (`fleet::content_authority`). The round had adopted the registers, so its share had
+  confirmed, and the retirement completed and went while the live takeover still waited (c's re-admission needed it
+  gone). Held by `a_round_confirms_only_once_every_object_it_learned_is_adopted` and
+  `a_round_is_materializing_only_while_an_object_it_adopted_is_pending_here`.
 - §4.10's chaos status, A-345, GAPS.
 
 ## What it costs, and the decision left

@@ -25166,11 +25166,23 @@ Applied in the same change to: §4.10's chaos status, GAPS ("Chaos from outside 
   report. Past tolerance, which now means that a missing holder was seen restarted, the round waits for every recorded
   holder that may still hold the log, as well as the cohorts' members. A-309's store-destroyed case is unchanged, since
   its destroyed holder comes back restarted.
+- **A share holds its retirement until its adoptions are held.** Waiting for the retired holder outlived the departed
+  owner's retirement: the round had adopted the registers, its share confirmed, and the retirement completed and went
+  (the returning holder's re-admission needs that). The stale holder, which keeps no record of the head, authorizes a
+  reader only through that kept retirement (`fleet::content_authority`), so it refused the successor every report
+  (`fleet.live.hold_refused.fetch_unauthorized` 82 on the Mac Studio) and the volume was given up. A share is now not
+  done while an object its round adopted is still being materialized on this node (`takeover::materializing`, a fact of
+  `share_done`): the retirement stays kept until the successor holds what it adopted. Hosts the retirement names are
+  admitted again only after that, and answer reports meanwhile.
 - **The cost.** A holder away past the failover SLO's worth of attempts has the volume given up (`NotRecovered`) where
   A-309 served it from the other members; a decision for Ada (GAPS), recommended kept.
-- **The failing test.** `a_retired_holder_never_seen_restarted_is_waited_for_and_its_newer_head_adopted`
+- **The failing tests.** `a_retired_holder_never_seen_restarted_is_waited_for_and_its_newer_head_adopted`
   (`crates/server/src/live_ship.rs`): the flow's decision alone. It waits for the retired holder and then adopts its
   170, where A-309's rule adopted 167 at once; and with the holder seen restarted it adopts past tolerance as before.
+  `a_round_confirms_only_once_every_object_it_learned_is_adopted` (`crates/server/src/takeover.rs`) now holds a share
+  open while an adopted object is still materializing, and
+  `a_round_is_materializing_only_while_an_object_it_adopted_is_pending_here` holds the predicate to the round's own
+  pending volumes and greens.
 - **Sibling, owed.** A-309 piece 2 (the register takeover past tolerance, `slates_db::takeover`) passes over a falsely
   retired holder of the newest register record the same way.
 - Record: `docs/bugs/2026-11-18-a-false-death-let-the-members-that-exist-now-stand-in-for-the-holder-of-the-newest-entries.md`.
