@@ -8,17 +8,19 @@
 //! protocol, so neither end touches a shared counter on the hot path.
 //!
 //! **A reply is waited for while its daemon lives, and the wait ends at the daemon's departure (§4.7 "Failure matrix";
-//! A-232, A-456).** [`ClientEnd::wait_while_daemon_lives`] parks on the reply and on the daemon's process together
-//! where the platform can wait on both: on Linux a `poll` of the completion eventfd beside the control socket, whose
-//! peer end the kernel closes as the daemon's process ends; on Windows `WaitForMultipleObjects` on the reply's Event and
-//! the daemon's process handle. macOS wakes a park through the wake word (`os_sync_wait_on_address`), which no wait
-//! takes beside a descriptor or a process, so there the park looks at the daemon's exit watch on A-443's doubling: the
-//! first look once the wait has lasted twice the longer of the time it had waited when it first parked and the client's
-//! wake estimate, each later one at twice the time waited (`Looks`). The looks then cost the logarithm of the wait,
-//! counted in wakes, and a departure is seen within the time already waited. Until A-456 every wait re-armed at the
-//! client's reply deadline, the anchor's liveness budget (a second), and asked the daemon's liveness there, so a call
-//! whose daemon died waited up to that second to learn it. [`ClientEnd::wait`] keeps its caller's deadline and asks
-//! nothing of the daemon.
+//! A-232, A-456).** [`ClientEnd::wait_while_daemon_lives`] parks on the reply and on the daemon's going together where
+//! the platform can wait on both. On Linux that is a `poll` of the completion eventfd beside the control socket, whose
+//! peer end closes as the daemon goes, its process ending or the daemon stopping inside it. On Windows it is
+//! `WaitForMultipleObjects` on the reply's Event and the daemon's process handle, which ends the wait at the process's
+//! exit. macOS wakes a park through the wake word (`os_sync_wait_on_address`), which no wait takes beside a descriptor
+//! or a process. So on macOS, and on Windows for a daemon restarted inside its own process, the park asks the daemon's
+//! liveness (`Liveness::daemon_gone`: its exit watch, and the start stamp in the instance's bootstrap object, which such
+//! a restart changes and nothing else) on A-443's doubling: the first look once the wait has lasted twice the longer of
+//! the time it had waited when it first parked and the client's wake estimate, each later one at twice the time waited
+//! (`Looks`). The looks cost the logarithm of the wait, counted in wakes, and such a departure is seen within the time
+//! already waited. Until A-456 every wait re-armed at the client's reply deadline, the anchor's liveness budget (a
+//! second), and asked the daemon's liveness there, so a call whose daemon died waited up to that second to learn it.
+//! [`ClientEnd::wait`] keeps its caller's deadline and asks nothing of the daemon.
 
 #[cfg(target_os = "linux")]
 use std::os::fd::AsFd;
@@ -75,9 +77,10 @@ pub struct Reply {
 pub enum Waited {
   /// The next reply.
   Reply(Reply),
-  /// The daemon's process ended with no reply left in the ring: the caller reconnects and sends again under the same
-  /// id, as it does for a daemon found gone (§4.7 "Failure matrix"). A reply the daemon wrote before it ended is taken
-  /// first, as [`Waited::Reply`].
+  /// The daemon went with no reply left in the ring: its process ended, or it stopped and another started inside the
+  /// same process (Linux: its control socket closed; macOS and Windows: a new start stamp). The caller reconnects and
+  /// sends again under the same id, as it does for a daemon found gone (§4.7 "Failure matrix"). A reply the daemon
+  /// wrote before it went is taken first, as [`Waited::Reply`].
   Departed,
 }
 
@@ -109,11 +112,11 @@ pub struct ClientEnd {
   /// (a waker's confirmation not yet landed): settled at a later park's arming, and given up when the slot is armed
   /// again (`region::REPLY_STAMP_SLOTS`).
   unsettled: [Option<Unsettled>; REPLY_STAMP_SLOTS],
-  /// Looks made at the daemon's life by a wait that cannot wait on its departure (macOS's doubling, A-456): a
-  /// non-vacuity count, zero where the park waits on the departure itself (Linux, Windows).
+  /// Looks made at the daemon's life by a departure wait (macOS's and Windows' doubling, A-456): a non-vacuity count,
+  /// zero on Linux, whose park waits on every departure itself.
   liveness_looks: u64,
-  /// The current departure wait's look schedule (macOS, A-456; reset as each wait begins).
-  #[cfg(target_os = "macos")]
+  /// The current departure wait's look schedule (macOS, Windows; A-456; reset as each wait begins).
+  #[cfg(any(target_os = "macos", windows))]
   looks: Looks,
   /// Whether a departure park read the running completion bridge's pipe (Linux, A-456): the level the async loop
   /// polls, which the wait gives back as it ends ([`Self::give_back_bridge_level`]).
@@ -162,7 +165,7 @@ impl ClientEnd {
       wake_samples: 0,
       unsettled: [None; REPLY_STAMP_SLOTS],
       liveness_looks: 0,
-      #[cfg(target_os = "macos")]
+      #[cfg(any(target_os = "macos", windows))]
       looks: Looks::default(),
       #[cfg(target_os = "linux")]
       bridge_level_owed: false,
@@ -437,8 +440,8 @@ impl ClientEnd {
     self.liveness.as_ref().is_none_or(|l| l.daemon_gone())
   }
 
-  /// Looks made at the daemon's life by [`Self::wait_while_daemon_lives`] where its park cannot wait on the departure
-  /// (macOS, A-456): logarithmic in the time waited; none on Linux and Windows, whose parks wait on the departure itself.
+  /// Looks made at the daemon's life by [`Self::wait_while_daemon_lives`] where its park cannot wait on every departure
+  /// (macOS, Windows; A-456): logarithmic in the time waited; none on Linux, whose park waits on every departure itself.
   pub fn liveness_looks(&self) -> u64 {
     self.liveness_looks
   }
@@ -598,7 +601,7 @@ impl ClientEnd {
   /// ring holds nothing, as [`Self::daemon_gone`] reads it gone. On Linux an end with a liveness check and no
   /// completion descriptor is refused `Unsupported` (every rendezvous hands one over).
   pub fn wait_while_daemon_lives(&mut self) -> Result<Waited, IpcError> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     {
       self.looks = Looks::default();
     }
@@ -768,18 +771,20 @@ impl ClientEnd {
     })
   }
 
-  /// macOS: the departure's look, when the doubling makes one due (A-443, A-456; `Looks`): a park here waits on the
-  /// wake word alone, so the daemon's exit watch is looked at on that schedule. `Park` until the next look, made now
-  /// when one was due and found the daemon alive (the park re-checks the ring as it arms); `Ended` once a look finds its
-  /// process gone (a reply it wrote before taken first), or at once for an end with no liveness check.
-  #[cfg(target_os = "macos")]
+  /// macOS and Windows: the departure's look, when the doubling makes one due (A-443, A-456; `Looks`). A macOS park waits
+  /// on the wake word alone, and a Windows park's process handle does not fire for a daemon restarted inside its
+  /// process, so each asks the daemon's liveness on that schedule (`Liveness::daemon_gone`: the exit watch, and the
+  /// start stamp such a restart changes). `Park` until the next look, made now when one was due and found the daemon
+  /// alive (the park re-checks the ring as it arms); `Ended` once a look finds it gone (a reply it wrote before taken
+  /// first), or at once for an end with no liveness check.
+  #[cfg(any(target_os = "macos", windows))]
   fn departure_due(&mut self, elapsed_ns: u64) -> Result<Before, IpcError> {
     let Some(liveness) = self.liveness.as_ref() else {
       return Ok(Before::Ended(Waited::Departed));
     };
     if self.looks.due(elapsed_ns, self.wake.mean_ns()) {
       self.liveness_looks = self.liveness_looks.saturating_add(1);
-      if liveness.departed() {
+      if liveness.daemon_gone() {
         return self.after_departure().map(Before::Ended);
       }
       self.looks.looked(elapsed_ns);
@@ -787,9 +792,10 @@ impl ClientEnd {
     Ok(Before::Park(self.looks.until(elapsed_ns)))
   }
 
-  /// Linux and Windows: the park waits on the departure itself, so no look is ever due and the park has no timeout; an
-  /// end with no liveness check has no daemon to wait on.
-  #[cfg(not(target_os = "macos"))]
+  /// Linux: the park waits on the departure itself (the control socket closes as the daemon goes, a stop inside its
+  /// process too), so no look is ever due and the park has no timeout; an end with no liveness check has no daemon to
+  /// wait on.
+  #[cfg(not(any(target_os = "macos", windows)))]
   fn departure_due(&mut self, _elapsed_ns: u64) -> Result<Before, IpcError> {
     Ok(if self.liveness.is_none() {
       Before::Ended(Waited::Departed)
@@ -890,15 +896,16 @@ impl ClientEnd {
     self.park_until(expected, timeout_ns)
   }
 
-  /// Windows: the region's Event and the daemon's process handle in one wait, with no timeout (A-456), as a claim waits
-  /// beside its answer's (A-447). The Event cannot tell a signal that met a sleeper from one consumed later, so the
-  /// client judges its own sleep.
+  /// Windows: the region's Event and the daemon's process handle in one wait (A-456), as a claim waits beside its
+  /// answer's (A-447), until the next look at the daemon's start stamp ([`Self::departure_due`]). The Event cannot tell
+  /// a signal that met a sleeper from one consumed later, so the client judges its own sleep.
   #[cfg(windows)]
   fn park_until_departure(
     &mut self,
     _expected: u32,
-    _timeout_ns: Option<u64>,
+    timeout_ns: Option<u64>,
   ) -> Result<Parked, IpcError> {
+    use crate::wake::EventOrExit;
     let Some(process) = self
       .liveness
       .as_ref()
@@ -906,10 +913,10 @@ impl ClientEnd {
     else {
       return Ok(Parked::DEPARTED);
     };
-    let signaled = self.region.wake_wait_or_exit(process)?;
+    let ended = self.region.wake_wait_or_exit(process, timeout_ns)?;
     Ok(Parked {
-      woken: signaled,
-      departed: !signaled,
+      woken: ended == EventOrExit::Signaled,
+      departed: ended == EventOrExit::Exited,
       waker_confirms: false,
     })
   }
@@ -1015,20 +1022,20 @@ struct Unsettled {
   waker_confirms: bool,
 }
 
-/// When a departure wait whose park cannot wait on the departure next looks at the daemon's life (macOS; A-456 on
-/// A-443's doubling). The first look comes once the wait has lasted twice the longer of the time it had waited at its
+/// When a departure wait whose park cannot wait on every departure next looks at the daemon's life (macOS, Windows;
+/// A-456 on A-443's doubling). The first look comes once the wait has lasted twice the longer of the time it had waited at its
 /// first park and the client's wake estimate: a look costs a park's timeout and a wake, so none comes sooner than twice
 /// the measured cost of one. Each later look comes at twice the time waited at the one before. A wait of `t` then makes
 /// at most `log2(t / first) + 1` looks, and a departure is seen by twice the time waited when it happened, or at the
 /// first look when it came before that.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", windows, test))]
 #[derive(Clone, Copy, Debug, Default)]
 struct Looks {
   /// The time waited at which the next look is due; `None` until the wait's first park fixes it.
   next_ns: Option<u64>,
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", windows, test))]
 impl Looks {
   /// Whether a look is due at `elapsed_ns` waited; the first call fixes the first look from `elapsed_ns` and the wake
   /// estimate `wake_ns` ([`first_look_ns`]).
@@ -1058,7 +1065,7 @@ impl Looks {
 
 /// Derived: the time waited at a departure wait's first look (`Looks`): twice the longer of the time waited at its first
 /// park and the wake estimate.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", windows, test))]
 fn first_look_ns(elapsed_ns: u64, wake_ns: u64) -> u64 {
   slates_machine::derived!(
     elapsed_ns.max(wake_ns).saturating_mul(2).max(1),
@@ -1430,9 +1437,9 @@ mod departure {
   const OLD_REPLY_DEADLINE_NS: u64 = 1_000_000_000;
   /// Shape: how long the late-reply test's daemon holds its answer: half again the old reply deadline.
   const LATE_NS: u64 = OLD_REPLY_DEADLINE_NS + OLD_REPLY_DEADLINE_NS / 2;
-  /// Shape: how far into the wait the departure test's daemon ends: a quarter of the old reply deadline, so even
-  /// macOS's doubling, which sees a departure within the time waited, sees it within half the old deadline, short of
-  /// the lateness its timer allows.
+  /// Shape: how far into the wait the departure tests' daemon goes: a quarter of the old reply deadline, so even the
+  /// doubling looks (macOS, Windows), which see a departure within the time waited, see it within half the old deadline,
+  /// short of the lateness their timers allow.
   const DEPARTS_AFTER_NS: u64 = OLD_REPLY_DEADLINE_NS / 4;
   /// Shape: how long a stand-in daemon process lives unless the test ends it, in seconds: past any of these tests.
   #[cfg(any(target_os = "macos", windows))]
@@ -1453,8 +1460,16 @@ mod departure {
     format!("{test}-{}", std::process::id())
   }
 
+  /// What a live daemon of `instance` publishes, standing in for one (macOS, Windows): its rendezvous, whose bootstrap
+  /// object holds the start stamp a client's liveness check compares. Kept for the test; Linux's check is the control
+  /// socket alone.
+  #[cfg(any(target_os = "macos", windows))]
+  fn published(instance: &str) -> crate::rendezvous::Listener {
+    crate::rendezvous::Listener::open(instance, None).unwrap()
+  }
+
   /// The daemon's process as these tests stand it in, ended when dropped: on Linux the daemon's end of a control
-  /// socket, which the kernel closes as the process ends; on macOS and Windows a child process the client end's exit
+  /// socket, which the kernel closes as the daemon goes; on macOS and Windows a child process the client end's exit
   /// watch is on.
   struct DaemonLife {
     #[cfg(target_os = "linux")]
@@ -1473,7 +1488,7 @@ mod departure {
 
   /// A stand-in daemon's life and the liveness check a client end watches it by.
   #[cfg(target_os = "linux")]
-  fn daemon_life() -> (DaemonLife, Liveness) {
+  fn daemon_life(_instance: &str) -> (DaemonLife, Liveness) {
     use rustix::net::{AddressFamily, SocketFlags, SocketType};
     let (daemon, client) = rustix::net::socketpair(
       AddressFamily::UNIX,
@@ -1488,26 +1503,28 @@ mod departure {
     )
   }
 
-  /// A stand-in daemon's life and the liveness check a client end watches it by.
+  /// A stand-in daemon's life and the liveness check a client end watches it by: `instance`'s published stamp and the
+  /// child's process.
   #[cfg(target_os = "macos")]
-  fn daemon_life() -> (DaemonLife, Liveness) {
+  fn daemon_life(instance: &str) -> (DaemonLife, Liveness) {
     let process = std::process::Command::new("/bin/sleep")
       .arg(STAND_IN_LIFE_S)
       .spawn()
       .unwrap();
-    let liveness = Liveness::of_process(process.id()).unwrap();
+    let liveness = Liveness::of_daemon(instance, process.id()).unwrap();
     (DaemonLife { process }, liveness)
   }
 
-  /// A stand-in daemon's life and the liveness check a client end watches it by.
+  /// A stand-in daemon's life and the liveness check a client end watches it by: `instance`'s published stamp and the
+  /// child's process.
   #[cfg(windows)]
-  fn daemon_life() -> (DaemonLife, Liveness) {
+  fn daemon_life(instance: &str) -> (DaemonLife, Liveness) {
     let process = std::process::Command::new("cmd")
       .args(["/C", "ping", "-n", STAND_IN_LIFE_S, "127.0.0.1"])
       .stdout(std::process::Stdio::null())
       .spawn()
       .unwrap();
-    let liveness = Liveness::of_process(process.id()).unwrap();
+    let liveness = Liveness::of_daemon(instance, process.id()).unwrap();
     (DaemonLife { process }, liveness)
   }
 
@@ -1565,13 +1582,16 @@ mod departure {
 
   /// §4.7 "Failure matrix" (A-232, A-456). Do: wait on a live daemon for the reply it sends half again the old reply
   /// deadline after the request, its process alive throughout. Expect: the reply taken, after the daemon held it; on
-  /// Linux and Windows no look at the daemon's life at all, the park having waited on its departure itself; on macOS at
+  /// Linux no look at the daemon's life at all, the park having waited on its departure itself; on macOS and Windows at
   /// least one look, and no more than the doubling allows: the logarithm of the wait over twice the spin window the
   /// region published (the wake estimate when the wait began), plus two.
   #[test]
   fn a_reply_after_the_old_reply_deadline_is_taken_while_its_daemon_lives() {
     let _gate = crate::descriptor_test_gate();
-    let (life, liveness) = daemon_life();
+    let instance = unique_name("slates-endpoint-late-reply-daemon");
+    #[cfg(any(target_os = "macos", windows))]
+    let _rendezvous = published(&instance);
+    let (life, liveness) = daemon_life(&instance);
     let mut rings = rings("slates-endpoint-late-reply", liveness);
     let open_daemon = rings.daemon_end();
     rings.client.send(&Slot::inline(1, b"hi").unwrap()).unwrap();
@@ -1605,7 +1625,7 @@ mod departure {
       took >= Duration::from_nanos(LATE_NS),
       "taken after {took:?}"
     );
-    if cfg!(target_os = "macos") {
+    if cfg!(any(target_os = "macos", windows)) {
       // The first park comes after the spin, the published seed at the wait's start, so the first look comes no sooner
       // than twice it, and every later one at twice the time waited.
       let first = 2 * u64::from(geometry().spin_ns);
@@ -1622,12 +1642,15 @@ mod departure {
 
   /// A-456. Do: wait on a daemon that never answers, and end its process a quarter of the old reply deadline into the
   /// wait. Expect: the wait ends `Departed` before the old reply deadline, at which it first asked after the daemon
-  /// before A-456: on Linux and Windows at the departure itself, never having looked; on macOS at the first look after
-  /// it, within the time waited.
+  /// before A-456: on Linux at the departure itself, never having looked; on Windows at the departure itself, through
+  /// the process handle; on macOS at the first look after it, within the time waited.
   #[test]
   fn a_daemons_departure_ends_the_wait_before_the_old_reply_deadline() {
     let _gate = crate::descriptor_test_gate();
-    let (life, liveness) = daemon_life();
+    let instance = unique_name("slates-endpoint-departure-daemon");
+    #[cfg(any(target_os = "macos", windows))]
+    let _rendezvous = published(&instance);
+    let (life, liveness) = daemon_life(&instance);
     let mut rings = rings("slates-endpoint-departure", liveness);
     let _daemon = rings.daemon_end()();
     rings.client.send(&Slot::inline(1, b"hi").unwrap()).unwrap();
@@ -1655,11 +1678,87 @@ mod departure {
       "the wait ended {:?} after it began, not before the old reply deadline",
       ended.duration_since(asked)
     );
-    if cfg!(target_os = "macos") {
-      assert!(looks >= 1, "the departure was found by a look");
-    } else {
+    if cfg!(target_os = "linux") {
       assert_eq!(looks, 0, "the park waited on the departure, never looked");
+    } else if cfg!(target_os = "macos") {
+      assert!(looks >= 1, "the departure was found by a look");
     }
+  }
+
+  /// The A-456 regression (2026-11-18): a daemon restarted inside the client's own process (the in-process daemons of
+  /// the client and server tests, an embedding that restarts its daemon) changes only its start stamp; its process never
+  /// ends. Do: wait on a daemon of this very process for a reply it never sends, and a quarter of the old reply deadline
+  /// into the wait restart it inside the process: its rendezvous dropped and opened again, a new stamp published. Expect:
+  /// the wait ends `Departed` before the old reply deadline, at a look that finds the new stamp. Before the fix the looks
+  /// asked the process's exit alone, and the wait went on until the restarted side answered the old ring, which the
+  /// test does once twice the old deadline has passed, so it ended with that reply.
+  #[cfg(any(target_os = "macos", windows))]
+  #[test]
+  fn a_daemon_restarted_inside_its_own_process_ends_the_wait() {
+    use std::sync::mpsc::channel;
+    type OpenDaemon = Box<dyn FnOnce() -> DaemonEnd + Send>;
+    let instance = unique_name("slates-endpoint-in-process-daemon");
+    let (published_tx, published_rx) = channel::<()>();
+    let (daemon_tx, daemon_rx) = channel::<OpenDaemon>();
+    let (ended_tx, ended_rx) = channel::<()>();
+    let restarter = {
+      let instance = instance.clone();
+      std::thread::spawn(move || {
+        let first = published(&instance);
+        published_tx.send(()).unwrap();
+        let open_daemon = daemon_rx.recv().unwrap();
+        #[allow(clippy::disallowed_methods)]
+        // the daemon lives a while into the wait on purpose: its restart is tested.
+        std::thread::sleep(Duration::from_nanos(DEPARTS_AFTER_NS));
+        drop(first);
+        let second = published(&instance);
+        let restarted = Instant::now();
+        // The restarted daemon is held until the wait ends. A wait still going twice the old deadline later missed the
+        // restart, and is answered on its old ring, so the test ends rather than hangs.
+        let missed = ended_rx
+          .recv_timeout(Duration::from_nanos(2 * OLD_REPLY_DEADLINE_NS))
+          .is_err();
+        if missed {
+          let mut daemon = open_daemon();
+          if let Some(request) = daemon.try_take().unwrap() {
+            daemon
+              .reply(&Slot::inline(request.request, b"rescued").unwrap())
+              .unwrap();
+          }
+        }
+        drop(second);
+        (restarted, missed)
+      })
+    };
+    published_rx.recv().unwrap();
+    let liveness = Liveness::of_daemon(&instance, std::process::id()).unwrap();
+    let mut rings = rings("slates-endpoint-in-process", liveness);
+    daemon_tx.send(Box::new(rings.daemon_end())).unwrap();
+    rings.client.send(&Slot::inline(1, b"hi").unwrap()).unwrap();
+    let asked = Instant::now();
+    let waited = rings.client.wait_while_daemon_lives().unwrap();
+    let ended = Instant::now();
+    let _ = ended_tx.send(());
+    let (restarted, missed) = restarter.join().unwrap();
+    let looks = rings.client.liveness_looks();
+    println!(
+      "a daemon restarted {:?} into the wait inside this process: {waited:?} {:?} after it, {:?} after the ask, {looks} \
+       looks",
+      restarted.duration_since(asked),
+      ended.saturating_duration_since(restarted),
+      ended.duration_since(asked)
+    );
+    assert!(
+      !missed && waited == Waited::Departed,
+      "the restart inside the daemon's process went unseen: the wait ended {waited:?} after {:?}",
+      ended.duration_since(asked)
+    );
+    assert!(
+      ended.duration_since(asked) < Duration::from_nanos(OLD_REPLY_DEADLINE_NS),
+      "the wait ended {:?} after it began, not before the old reply deadline",
+      ended.duration_since(asked)
+    );
+    assert!(looks >= 1, "the restart was found by a look");
   }
 }
 

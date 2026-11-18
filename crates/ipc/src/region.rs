@@ -509,15 +509,16 @@ impl ClientRegion {
     self.wake_event.wait(timeout_ns)
   }
 
-  /// Waits on the region's cross-process wake (Windows: the named Event) beside the daemon's process `process`, with no
-  /// timeout (A-456): `true` when the Event was signaled, `false` when the process ended with the Event unsignaled. The
+  /// Waits on the region's cross-process wake (Windows: the named Event) beside the daemon's process `process`, up to
+  /// `timeout_ns` (`None`: no timeout; A-456): which ended the wait, the Event, the process's exit or the timeout. The
   /// caller has published the parked flag and re-checked the reply first, as for [`Self::wake_wait`].
   #[cfg(windows)]
   pub fn wake_wait_or_exit(
     &self,
     process: std::os::windows::io::BorrowedHandle<'_>,
-  ) -> Result<bool, IpcError> {
-    self.wake_event.wait_or_exit(process)
+    timeout_ns: Option<u64>,
+  ) -> Result<crate::wake::EventOrExit, IpcError> {
+    self.wake_event.wait_or_exit(process, timeout_ns)
   }
 
   /// Signals the region's cross-process wake (Windows: `SetEvent` on the named Event), waking a parked

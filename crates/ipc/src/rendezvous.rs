@@ -636,14 +636,6 @@ impl Liveness {
     self.inner.daemon_gone()
   }
 
-  /// Whether the daemon's process has ended (A-456): on Linux its control socket's peer end has closed, which the kernel
-  /// does as the process ends; on macOS and Windows the exit watch on the process that answered the claim (A-143) has
-  /// fired. It is the one question a reply wait asks. A daemon process that lives answers its client's ring, whichever
-  /// daemon holds the instance's bootstrap object now, so unlike [`Self::daemon_gone`] this reads nothing of that object.
-  pub fn departed(&self) -> bool {
-    self.inner.departed()
-  }
-
   /// The daemon's process handle, to wait on beside the reply's Event (Windows, A-456), as a claim waits beside its
   /// answer's (A-447); `None` when the process was already gone when the watch was taken.
   #[cfg(windows)]
@@ -661,12 +653,13 @@ impl Liveness {
     })
   }
 
-  /// A liveness check on process `pid` alone, under no instance (macOS, Windows): its exit is what a test's reply wait
-  /// asks ([`Self::departed`]); [`Self::daemon_gone`] reads it gone, as no bootstrap object names it.
+  /// A liveness check on the daemon of `instance` whose process is `pid` (macOS, Windows): the start stamp the instance's
+  /// bootstrap object holds now, and an exit watch on `pid`, as a claim's answer would give a client. Refused when no
+  /// daemon has published the object.
   #[cfg(all(test, any(target_os = "macos", windows)))]
-  pub(crate) fn of_process(pid: u32) -> Result<Liveness, IpcError> {
+  pub(crate) fn of_daemon(instance: &str, pid: u32) -> Result<Liveness, IpcError> {
     Ok(Liveness {
-      inner: platform::Liveness::of_process(pid)?,
+      inner: platform::Liveness::of_daemon(instance, pid)?,
     })
   }
 
@@ -1139,12 +1132,6 @@ pub mod platform {
         // Reset, or an unusable descriptor: the channel is gone either way.
         Err(_) => true,
       }
-    }
-
-    /// The daemon's process has ended ([`super::Liveness::departed`]): here that is the socket's peer end closed, the
-    /// one fact `daemon_gone` reads on this platform.
-    pub(super) fn departed(&self) -> bool {
-      self.daemon_gone()
     }
 
     /// A liveness check over a test's `socket`, its deliveries opened under the stand-in seal (A-187's test channel).
@@ -3001,24 +2988,22 @@ pub mod platform {
       self.watch.exited() || generation_of(&self.instance).is_none_or(|now| now != self.generation)
     }
 
-    /// The daemon's process has ended ([`super::Liveness::departed`]): its exit watch alone, one zero-timeout `kevent`
-    /// on macOS, one zero-timeout wait on Windows; the bootstrap object is not read.
-    pub(super) fn departed(&self) -> bool {
-      self.watch.exited()
-    }
-
     /// The daemon's process handle (Windows; [`super::Liveness::exit_handle`]).
     #[cfg(windows)]
     pub(super) fn exit_handle(&self) -> Option<std::os::windows::io::BorrowedHandle<'_>> {
       self.watch.handle()
     }
 
-    /// A liveness check on process `pid` alone, under no instance ([`super::Liveness::of_process`]).
+    /// A liveness check on `instance`'s daemon whose process is `pid` ([`super::Liveness::of_daemon`]).
     #[cfg(test)]
-    pub(super) fn of_process(pid: u32) -> Result<Liveness, IpcError> {
+    pub(super) fn of_daemon(instance: &str, pid: u32) -> Result<Liveness, IpcError> {
+      let generation = generation_of(instance).ok_or_else(|| IpcError::DaemonUnavailable {
+        endpoint: instance.to_owned(),
+        why: "the daemon has not yet published its rendezvous object",
+      })?;
       Ok(Liveness {
-        instance: String::new(),
-        generation: 0,
+        instance: instance.to_owned(),
+        generation,
         watch: crate::exit_watch::ExitWatch::on(pid)?,
       })
     }
@@ -4217,7 +4202,7 @@ pub mod platform {
           Ends::WithDaemon(daemon) => {
             // The answer's Event or the daemon's exit, whichever comes first; one already exited is read at the poll.
             if let Some(process) = daemon.handle() {
-              self.ready_event.wait_or_exit(process)?;
+              self.ready_event.wait_or_exit(process, None)?;
             }
             continue;
           }
@@ -4695,11 +4680,6 @@ pub mod platform {
 
   impl Liveness {
     pub(super) fn daemon_gone(&self) -> bool {
-      true
-    }
-
-    /// No daemon here, so none lives.
-    pub(super) fn departed(&self) -> bool {
       true
     }
   }
