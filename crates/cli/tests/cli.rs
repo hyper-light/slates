@@ -802,9 +802,13 @@ fn start_cpu_ns(instance: &str, shards: usize) -> u64 {
 /// A-228, §2.6 boot step 1: a start is judged by the watchdog's rule, one thread at a time, never by the sum of its threads.
 /// Do: measure what one shard adds to a start's CPU (a start of as many shards as the machine runs at once, less a start of
 /// one, over the shards between), then start an anchor with enough shards that their starts sum past three liveness
-/// windows. Expect: the daemon serves, and the anchor killed no start. On main 92dcd16c the anchor read the process's
-/// summed CPU, held it to one window, and killed every start of 48 shards on an 18-CPU Mac and of 23 on a 32-CPU Studio,
-/// though no thread came near a window.
+/// windows, or with the most one process runs where that is fewer (`slates_rt::registry::MAX_SHARDS`). Expect: the daemon
+/// serves, and the anchor killed no start. On main 92dcd16c the anchor read the process's summed CPU, held it to one
+/// window, and killed every start of 48 shards on an 18-CPU Mac and of 23 on a 32-CPU Studio, though no thread came near
+/// a window. On CI's 4-CPU runners a shard's start was cheap enough that three windows asked 1,417 and 1,574 shards
+/// (runs 44298844583 and 44310013691), past the registry: the daemon could never register them, and the anchor
+/// restarted it for good. The count is bounded by the registry now, and a start of the most shards whose sum does not
+/// pass one window is skipped, loudly, as a machine the premise cannot be met on.
 #[cfg(unix)]
 #[test]
 fn a_start_whose_shards_sum_past_a_window_comes_up() {
@@ -825,10 +829,21 @@ fn a_start_whose_shards_sum_past_a_window_comes_up() {
     per_shard > 0,
     "a shard costs its start something: {one} ns, {many} ns"
   );
-  let shards = usize::try_from((3 * window).div_ceil(per_shard)).unwrap();
+  let past_three = usize::try_from((3 * window).div_ceil(per_shard)).unwrap();
+  let most = slates_rt::registry::MAX_SHARDS;
+  let shards = past_three.min(most);
+  let summed_ns = u64::try_from(shards).unwrap().saturating_mul(per_shard);
   eprintln!(
-    "a start of 1 shard ran {one} ns, of {at_once} {many} ns: {per_shard} ns a shard, so {shards} shards sum past three windows"
+    "a start of 1 shard ran {one} ns, of {at_once} {many} ns: {per_shard} ns a shard, so {past_three} shards sum past \
+     three windows; one process runs at most {most}, and {shards} sum {summed_ns} ns against a window of {window} ns"
   );
+  if summed_ns <= window {
+    eprintln!(
+      "skipping the many-shard start: the most shards one process runs ({most}) sum {summed_ns} ns on this machine, \
+       not past one window ({window} ns)"
+    );
+    return;
+  }
   let instance = format!("cli-sum-{}", std::process::id());
   let (anchor, mut stderr) = spawn_anchor_from(
     env!("CARGO_BIN_EXE_slates"),
