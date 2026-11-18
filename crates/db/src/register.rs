@@ -2735,6 +2735,12 @@ pub struct RegionalConfiguration {
   /// ([`forget_moved`](RegionalConfiguration::forget_moved)), so it holds only live moved objects; a move past the
   /// bound its proposer derives is refused before it is proposed.
   pub moved: std::collections::BTreeMap<ObjectId, Moved>,
+  /// The council's voters as the configuration last recorded them (§4.8 learners, A-380): the voter set the council's
+  /// last committed seat change left, in id order, recorded by its leader once that change has committed
+  /// ([`seat`](RegionalConfiguration::seat)). A learner takes no part in the council's Raft, so it knows who votes from
+  /// the configuration it fetches, and learns of a seat change as of any other change: by its version. Empty until the
+  /// first seat is recorded. Bounded by the members.
+  pub voters: Vec<HostId>,
 }
 
 /// One object's explicit move off its creator's line ([`RegionalConfiguration::moved`]).
@@ -2757,6 +2763,14 @@ pub struct Adoption {
   pub head: Vec<u8>,
   /// The adopted catalog record.
   pub catalog: Vec<u8>,
+}
+
+/// `hosts` in id order with no repeat: a voter set's one form, so two that name the same hosts compare equal.
+fn in_id_order(hosts: &[HostId]) -> Vec<HostId> {
+  let mut ordered = hosts.to_vec();
+  ordered.sort_unstable_by_key(|host| host.0);
+  ordered.dedup();
+  ordered
 }
 
 impl RegionalConfiguration {
@@ -2786,6 +2800,7 @@ impl RegionalConfiguration {
       adoptions: std::collections::BTreeMap::new(),
       completed: std::collections::BTreeMap::new(),
       moved: std::collections::BTreeMap::new(),
+      voters: Vec::new(),
     };
     config.fix_neighbourhoods(scatter);
     // A formed region owns nothing yet: every member's first neighbourhood is already settled.
@@ -2795,6 +2810,32 @@ impl RegionalConfiguration {
       .map(|(owner, neighbourhood)| (*owner, Settled::of(neighbourhood, &config.domains)))
       .collect();
     config
+  }
+
+  /// Whether recording `voters` as the council's voters would change the configuration ([`seat`]): they differ, as a
+  /// set, from the voters it records.
+  ///
+  /// [`seat`]: RegionalConfiguration::seat
+  pub fn seats(&self, voters: &[HostId]) -> bool {
+    in_id_order(voters) != self.voters
+  }
+
+  /// Records `voters` as the council's voters, in id order, once the council has committed the seat change that left
+  /// them, and advances the version, so every learner learns of the change as of any other (A-380). A set equal to the
+  /// one recorded, or a version with no successor, changes nothing. Returns whether the configuration changed.
+  pub fn seat(&mut self, voters: &[HostId]) -> bool {
+    let voters = in_id_order(voters);
+    if voters == self.voters {
+      return false;
+    }
+    // A version with no successor refuses the change before anything moves, identically on every replica that applies
+    // it (AUD-29-26's sibling: a repeated version would name two configurations).
+    let Some(version) = self.version.checked_add(1) else {
+      return false;
+    };
+    self.voters = voters;
+    self.version = version;
+    true
   }
 
   /// Fixes every member's bounded neighbourhood from the current membership (`select_neighbourhood`): the
@@ -5021,6 +5062,36 @@ mod tests {
     assert!(
       !regional.retired.contains_key(&departed),
       "dropped with the last confirmation"
+    );
+  }
+
+  /// A-380 (§4.8 learners): the configuration records the council's voters, in id order, and a recorded change advances
+  /// its version as any change does. Do: in a five-member region, seat three voters given out of order, seat the same
+  /// set again in another order, then seat another set. Expect the first and the last to change the configuration, each
+  /// advancing the version by one and recording the set in id order, and the repeat to change nothing (`seats` false).
+  #[test]
+  fn a_seat_records_the_voters_in_id_order_and_advances_the_version_only_when_they_change() {
+    let (mut regional, _) = wide_region();
+    let before = regional.version;
+    let voters = [HostId(3), HostId(1), HostId(2)];
+    assert!(regional.seats(&voters) && regional.seat(&voters));
+    assert_eq!(
+      (regional.version, regional.voters.clone()),
+      (before + 1, vec![HostId(1), HostId(2), HostId(3)]),
+      "the voters recorded in id order, one version on"
+    );
+    let again = [HostId(2), HostId(3), HostId(1)];
+    assert!(
+      !regional.seats(&again) && !regional.seat(&again),
+      "the same set in another order is no change"
+    );
+    assert_eq!(regional.version, before + 1, "nothing moved");
+    let other = [HostId(4), HostId(2), HostId(3)];
+    assert!(regional.seat(&other));
+    assert_eq!(
+      (regional.version, regional.voters.clone()),
+      (before + 2, vec![HostId(2), HostId(3), HostId(4)]),
+      "a new set recorded, one version on"
     );
   }
 
