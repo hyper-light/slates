@@ -1103,6 +1103,16 @@ impl RaftNode {
   /// Unlike reconstructing from a term and a log alone, this also restores compacted membership.
   pub fn restore(saved: SavedRaft) -> Result<RaftNode, RaftRecoveryError> {
     saved.validate()?;
+    slates_machine::log_line!(
+      "slates-cluster: DIAG raft {} restores: t{} log {} entries over snapshot {}, commit {}, base {:?}, window {}",
+      saved.id.0,
+      saved.term,
+      saved.log.len(),
+      saved.snapshot_index,
+      saved.commit_index,
+      saved.base,
+      saved.window.len()
+    );
     let mut node = RaftNode::new(saved.id, saved.base.voters);
     node.joint = saved.base.joint;
     node.current_term = saved.term;
@@ -1470,6 +1480,15 @@ impl RaftNode {
   /// Adopts `term` as the current term, reverting to a follower and forgetting this term's vote and any
   /// gathered votes.
   fn step_down(&mut self, term: u64) {
+    if self.role == Role::Leader {
+      slates_machine::log_line!(
+        "slates-cluster: DIAG raft {} steps down from leading t{} to t{term} (last {}, commit {})",
+        self.id.0,
+        self.current_term,
+        self.last_log_index(),
+        self.commit_index
+      );
+    }
     self.retention_pending |= self.current_term != term || self.voted_for.is_some();
     self.current_term = term;
     self.voted_for = None;
@@ -1509,6 +1528,13 @@ impl RaftNode {
       return;
     }
     self.role = Role::Leader;
+    slates_machine::log_line!(
+      "slates-cluster: DIAG raft {} leads t{} at last {} commit {}",
+      self.id.0,
+      self.current_term,
+      self.last_log_index(),
+      self.commit_index
+    );
     self.recover(recovery);
     self.transfer = None;
     self.staging.clear();
@@ -1949,6 +1975,13 @@ impl RaftNode {
     let committed_above_snapshot = self.committed_through().saturating_sub(self.snapshot_index);
     let count = usize::try_from(committed_above_snapshot).unwrap_or(usize::MAX);
     self.log.get(..count).unwrap_or(&self.log)
+  }
+
+  /// DIAG: the entries after the committed ones.
+  pub fn uncommitted_entries(&self) -> &[LogEntry] {
+    let committed_above_snapshot = self.committed_through().saturating_sub(self.snapshot_index);
+    let count = usize::try_from(committed_above_snapshot).unwrap_or(usize::MAX);
+    self.log.get(count..).unwrap_or(&[])
   }
 
   /// The index up to which the log has been compacted into a snapshot (zero when nothing is compacted).
@@ -3413,6 +3446,15 @@ impl RaftNode {
       return false;
     }
     self.read_round = None;
+    slates_machine::log_line!(
+      "slates-cluster: DIAG raft {} t{} begins a joint change at index {}: {:?} -> {:?} (commit {})",
+      self.id.0,
+      self.current_term,
+      self.last_log_index().saturating_add(1),
+      current.voters,
+      new_voters,
+      self.commit_index
+    );
     // Append the joint configuration `C_old,new` as a log entry — it takes effect on append (§6), so the
     // very next quorum check needs a majority of both sets. It replicates like any entry.
     self.leader_append(LogEntry::configuration(
@@ -3455,6 +3497,15 @@ impl RaftNode {
 
   /// Truncates the log from the one-based `index` onward (removing that entry and every later one).
   fn truncate_from(&mut self, index: u64) {
+    slates_machine::log_line!(
+      "slates-cluster: DIAG raft {} {:?} t{} truncates its log from {index} (last {}, commit {}, snapshot {})",
+      self.id.0,
+      self.role,
+      self.current_term,
+      self.last_log_index(),
+      self.commit_index,
+      self.snapshot_index
+    );
     let keep = usize::try_from(index.saturating_sub(self.snapshot_index).saturating_sub(1))
       .unwrap_or(usize::MAX);
     self.retention_pending |= keep < self.log.len();

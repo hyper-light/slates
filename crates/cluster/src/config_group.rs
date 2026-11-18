@@ -722,6 +722,11 @@ impl RegionalCouncil {
     if saved.id == self.raft.id() {
       return Err(RaftRecoveryError::ReusedIdentity);
     }
+    slates_machine::log_line!(
+      "slates-cluster: DIAG council {} joins from donor {}'s state",
+      self.raft.id().0,
+      saved.id.0
+    );
     // A compacted donor's base is its snapshot's state; a snapshot paired with another base would fold a
     // different history, so it is refused before anything is installed.
     let fold = Fold::for_saved(&saved, base)?;
@@ -847,18 +852,34 @@ impl RegionalCouncil {
         },
       )
       .collect();
+    let tail: Vec<String> = self
+      .raft
+      .uncommitted_entries()
+      .iter()
+      .map(
+        |entry| match (&entry.config, ConfigCommand::decode(&entry.command)) {
+          (Some(config), _) => format!("t{} cfg{config:?}", entry.term),
+          (None, Some(command)) => format!("t{} {command:?}", entry.term),
+          (None, None) => format!("t{} noop", entry.term),
+        },
+      )
+      .collect();
     format!(
-      "role={:?} term={} voters={:?} joint={} commit={} last_log={} applied={} members={:?} v{} log=[{}]",
+      "role={:?} term={} voters={:?} joint={} commit={} last_log={} snapshot={} applied={} members={:?} v{} log=[{}] \
+       tail=[{}] window={}",
       self.raft.role(),
       self.raft.term(),
       self.raft.all_voters(),
       self.raft.in_joint_configuration(),
       self.raft.commit_index(),
       self.raft.last_log_index(),
+      self.raft.snapshot_index(),
       self.fold.applied(),
       self.fold.state().members,
       self.fold.state().version,
-      log.join(" | ")
+      log.join(" | "),
+      tail.join(" | "),
+      self.raft.window().len()
     )
   }
 

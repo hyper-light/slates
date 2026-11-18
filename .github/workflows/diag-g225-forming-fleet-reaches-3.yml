@@ -1,0 +1,77 @@
+name: DIAG g225 three-node formations looped at one CPU, Raft log diagnostics (not for main)
+
+# Diagnostics branch of g225 (a forming fleet reaches every candidate); never merged. It looks for "initial membership did
+# not commit" (settle_initial_consensus; the integrator's diag-green-44269355181 arm64 run 7: the leader at voters [a],
+# last log 6, commit 6, while a follower holds a joint entry at index 7 the leader lacks, in the same term). Two
+# three-node fleet tests that settle the initial consensus, each alone in its process, pinned with its daemons to CPU 0
+# beside two busy loops there, looped. This tree logs every Raft truncation, restore, joint-change start, election win
+# and leader step-down, and the council's debug state carries its uncommitted tail; a failure keeps every DIAG line and
+# the formation report.
+
+on:
+  push:
+    branches: [diag-g225-forming-fleet-reaches-3]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  loop:
+    name: ${{ matrix.os }} sample ${{ matrix.sample }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 200
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+        sample: [1, 2]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: Build the fleet test binary
+        run: cargo test --locked -p slates-server --test fleet --no-run
+      - name: Looped formations at one CPU
+        shell: bash
+        run: |
+          set +e +o pipefail
+          R=$GITHUB_WORKSPACE/../results.txt
+          echo "runner ${{ matrix.os }}, $(nproc) CPUs, $(date -u), $(git rev-parse --short=9 HEAD), sample ${{ matrix.sample }}" > $R
+          BIN=$(ls -t target/debug/deps/fleet-* | grep -v '\.d$' | head -1)
+          TESTS="three_daemons_elect_one_stable_council_leader_over_the_transport
+          a_campaign_waits_for_a_voters_session_that_is_out_for_a_moment"
+          deadline=$(( $(date +%s) + 150 * 60 ))
+          round=0
+          while [ $(date +%s) -lt $deadline ]; do
+            round=$((round + 1))
+            for t in $TESTS; do
+              LOADPG=""
+              for i in 1 2; do setsid taskset -c 0 bash -c 'while :; do :; done' & LOADPG="$LOADPG $!"; done
+              started=$(date +%s)
+              status=0
+              timeout 900 taskset -c 0 "$BIN" --exact "$t" --nocapture --test-threads=1 > ../run.log 2>&1 || status=$?
+              took=$(( $(date +%s) - started ))
+              for g in $LOADPG; do kill -KILL -- -$g 2>/dev/null; done
+              wait 2>/dev/null
+              echo "RUN round=$round status=$status took=${took}s load=$(cut -d' ' -f1-3 /proc/loadavg) $t" >> $R
+              if [ $status -ne 0 ]; then
+                echo "-- failure ($t, round $round)" >> $R
+                grep -E 'DIAG|initial membership did not commit|panicked|gave up' ../run.log | cut -c1-30000 >> $R
+                echo "-- last 80 lines" >> $R
+                tail -80 ../run.log | cut -c1-30000 >> $R
+              fi
+            done
+          done
+          echo "SUMMARY" >> $R
+          grep '^RUN ' $R | awk '{print $3, $NF}' | sort | uniq -c >> $R
+      - name: Copy the results into the workspace
+        if: always()
+        run: cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+      - name: Keep the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-${{ matrix.os }}-${{ matrix.sample }}
+          path: results.txt
+          if-no-files-found: warn
