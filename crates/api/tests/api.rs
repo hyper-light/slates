@@ -910,8 +910,8 @@ fn reads_its_end(_end: &slates_api::StreamEnd) -> bool {
 /// refused `AlreadyExists` naming it; both volumes listed; the strangers refused `NotFound` naming the volume, the
 /// snapshot or the attachment; the relative folder refused `NotAbsolute`; the work at the green's first version, the
 /// others refused `NotGreen` and `NotFound`; a stream of the Shards transport whose peer reads its end once detached;
-/// the pinned snapshot's destroy refused as an invalid request (untyped yet, see the owed note) and the unpinned one's
-/// done; the clone gone from the list, and refused `NotFound` after.
+/// the pinned snapshot's destroy refused `Busy` by the volume core's `Pinned` (a holder to end first, typed since
+/// A-299) and the unpinned one's done; the clone gone from the list, and refused `NotFound` after.
 fn the_seam_conforms<V: Volumes>(seam: &mut V) {
   let origin = made(seam, &VolumeSpec::empty("seam-origin", ROOM));
   assert_eq!(
@@ -991,7 +991,9 @@ fn the_seam_conforms<V: Volumes>(seam: &mut V) {
   assert!(
     matches!(
       seam.destroy_snapshot(origin, snapshot),
-      Err(Error::Invalid(Invalid::Request(_)))
+      Err(Error::Busy(slates_api::Busy::Volume(
+        slates_api::VolumeRefusal::Pinned
+      )))
     ),
     "a snapshot a clone pins is not destroyed"
   );

@@ -39,7 +39,7 @@ use slates_client::ClientError;
 use slates_ipc::error::RouteRefusal;
 use slates_ipc::protocol::{
   AttachTransport, HostPathReason, OwnMountUse, Principal, RecoveryCause, Refusal, SnapshotId,
-  UnsupportedReason, VolumeId,
+  UnsupportedReason, VolumeId, VolumeRefusal,
 };
 use slates_ipc::{DeliveryFault, IpcError};
 
@@ -206,6 +206,8 @@ pub enum Denied {
   },
   /// The consumer capability a harness delivers on an inherited descriptor could not be taken (§4.13).
   CapabilityNotDelivered(DeliveryFault),
+  /// The volume's rules forbid it: `NotPermitted`, `LinkProtected` (A-299).
+  Volume(VolumeRefusal),
   /// A write policy refused the act (A-299): the daemon's refusal where a call other than a landing or a merge meets
   /// it. A landing and a merge answer it as their own outcome ([`crate::LandOutcome::Refused`],
   /// [`crate::MergeOutcome::Refused`]), since in a forbidding mode it is the expected answer.
@@ -250,6 +252,8 @@ pub enum Exhausted {
     /// The bound.
     bound: u64,
   },
+  /// A bound of the volume or its file: `TooManyLinks`, `FileTooLarge`, `DigestCacheFull`, `Memory` (A-299).
+  Volume(VolumeRefusal),
   /// This client has issued its last request sequence: make a new instance (AUD-29-21).
   Sequences {
     /// The exhausted client id.
@@ -287,6 +291,9 @@ pub enum Busy {
   },
   /// A live process already holds the instance's rendezvous (A-176).
   Instance,
+  /// The volume core's holder: `Pinned` (a live clone, or a green's origin, holds the snapshot or the volume: end it
+  /// first), `DaxMapped` (a guest maps the file: wait for the map's end) (A-299).
+  Volume(VolumeRefusal),
 }
 
 /// What has moved on.
@@ -327,6 +334,9 @@ pub enum Stale {
   Bootstrap,
   /// The reviewed state or the daemon's authority changed before a recovery was authorized.
   Recovery,
+  /// The volume core's view moved on: `StaleHandle` (a freed inode, a destroyed snapshot), `BaseDrift` (the disk
+  /// changed beneath a read) (A-299).
+  Volume(VolumeRefusal),
   /// A write policy moved after it was read (A-285): read it again and set it from there.
   Policy {
     /// The policy's version now.
@@ -479,6 +489,9 @@ pub enum Invalid {
     /// The process named.
     pid: u32,
   },
+  /// The entry or the volume is the wrong one for the operation: `NotDirectory`, `IsDirectory`, `NotEmpty`, `Invalid`,
+  /// `NoAttribute`, `SpecialFileOperation`, `CrossVolumeMove`, `NotOverlay` (A-299).
+  Volume(VolumeRefusal),
 }
 
 /// A volume of the wrong kind for the verb.
@@ -509,6 +522,8 @@ pub enum Unusable {
   NoGroup,
   /// No complete group state is available to recover from, or its counters cannot advance safely.
   RecoveryUnavailable,
+  /// The volume core cannot serve it from what it holds: `JournalIncomplete`, `RecoveryVersion` (A-299).
+  Volume(VolumeRefusal),
   /// The fleet's configuration cannot hold the write to the operator's declared durability (§4.8 "Placement"); reads
   /// continue.
   DurabilityUnmet {
@@ -806,6 +821,35 @@ impl Error {
       Refusal::BaseUnavailable { path, errno } => Error::Host(HostFault::Base { path, errno }),
       Refusal::TargetUnavailable { reason } => Error::Host(HostFault::Target(Note::new(reason))),
       Refusal::DuplicateRequest => Error::Protocol(ProtocolFault::DuplicateRequest),
+      Refusal::Volume { refusal } => Error::of_volume(refusal),
+    }
+  }
+}
+
+impl Error {
+  /// A volume-core refusal, by the class of thing a consumer does about it (A-299).
+  fn of_volume(refusal: VolumeRefusal) -> Error {
+    match refusal {
+      VolumeRefusal::Pinned | VolumeRefusal::DaxMapped => Error::Busy(Busy::Volume(refusal)),
+      VolumeRefusal::StaleHandle | VolumeRefusal::BaseDrift => Error::Stale(Stale::Volume(refusal)),
+      VolumeRefusal::NotPermitted | VolumeRefusal::LinkProtected => {
+        Error::Denied(Denied::Volume(refusal))
+      }
+      VolumeRefusal::TooManyLinks
+      | VolumeRefusal::FileTooLarge
+      | VolumeRefusal::DigestCacheFull
+      | VolumeRefusal::Memory => Error::Exhausted(Exhausted::Volume(refusal)),
+      VolumeRefusal::JournalIncomplete { .. } | VolumeRefusal::RecoveryVersion { .. } => {
+        Error::Unusable(Unusable::Volume(refusal))
+      }
+      VolumeRefusal::NotDirectory
+      | VolumeRefusal::IsDirectory
+      | VolumeRefusal::NotEmpty
+      | VolumeRefusal::Invalid
+      | VolumeRefusal::NoAttribute
+      | VolumeRefusal::SpecialFileOperation
+      | VolumeRefusal::CrossVolumeMove
+      | VolumeRefusal::NotOverlay => Error::Invalid(Invalid::Volume(refusal)),
     }
   }
 }
@@ -1275,6 +1319,69 @@ mod tests {
       Error::Unusable(Unusable::NoGroup)
     );
     assert!(!typed(Refusal::ConsumerRevoked).is_retryable());
+  }
+
+  /// A-299: do type each refusal of the volume core by the class a consumer acts on; expect a pinned snapshot and a
+  /// guest's map a holder (`Busy`), a stale handle and a drifted base a moved view (`Stale`), the volume's rules a denial,
+  /// its bounds exhaustion, an unreadable journal or image unusable, and every operation the entry does not take an
+  /// invalid request — each carrying the core's reason, never a word.
+  #[test]
+  fn each_volume_core_refusal_is_typed_into_its_class() {
+    use super::{Denied, Invalid};
+    use slates_ipc::protocol::VolumeRefusal as V;
+    let typed = |refusal: V| {
+      Error::of_client(
+        "i",
+        ClientError::Refused(Refusal::Volume { refusal }),
+        None,
+        PAUSE_NS,
+      )
+    };
+    assert_eq!(typed(V::Pinned), Error::Busy(Busy::Volume(V::Pinned)));
+    assert_eq!(typed(V::DaxMapped), Error::Busy(Busy::Volume(V::DaxMapped)));
+    assert_eq!(
+      typed(V::StaleHandle),
+      Error::Stale(Stale::Volume(V::StaleHandle))
+    );
+    assert_eq!(
+      typed(V::BaseDrift),
+      Error::Stale(Stale::Volume(V::BaseDrift))
+    );
+    for denied in [V::NotPermitted, V::LinkProtected] {
+      assert_eq!(typed(denied), Error::Denied(Denied::Volume(denied)));
+    }
+    for bound in [
+      V::TooManyLinks,
+      V::FileTooLarge,
+      V::DigestCacheFull,
+      V::Memory,
+    ] {
+      assert_eq!(typed(bound), Error::Exhausted(Exhausted::Volume(bound)));
+    }
+    for unusable in [
+      V::JournalIncomplete {
+        needed: 1,
+        oldest: 2,
+      },
+      V::RecoveryVersion {
+        found: 3,
+        expected: 4,
+      },
+    ] {
+      assert_eq!(typed(unusable), Error::Unusable(Unusable::Volume(unusable)));
+    }
+    for invalid in [
+      V::NotDirectory,
+      V::IsDirectory,
+      V::NotEmpty,
+      V::Invalid,
+      V::NoAttribute,
+      V::SpecialFileOperation,
+      V::CrossVolumeMove,
+      V::NotOverlay,
+    ] {
+      assert_eq!(typed(invalid), Error::Invalid(Invalid::Volume(invalid)));
+    }
   }
 
   /// A-299: do type a `NotFound` for a call that names nothing that could be missing, and a daemon gone past the
