@@ -1856,10 +1856,7 @@ impl Green {
       .rposition(|(recorded, _)| *recorded <= version)?;
     let value = history.get(index)?.1.as_ref()?;
     if index.saturating_add(1) == history.len() {
-      return self
-        .content
-        .get(path)
-        .map(|bytes| Cow::Borrowed(bytes.as_slice()));
+      return self.current(path).map(Cow::Borrowed);
     }
     Some(Cow::Owned(value.materialize(&self.chunks)))
   }
@@ -1885,8 +1882,7 @@ impl Green {
       .min(total);
     let page = if index.saturating_add(1) == history.len() {
       self
-        .content
-        .get(path)
+        .current(path)
         .and_then(|bytes| bytes.get(start..end))
         .unwrap_or_default()
         .to_vec()
@@ -2396,11 +2392,7 @@ impl Green {
         crate::map::Mapped::Overlaps => span.start,
       };
       let agent_bytes = span_bytes(&inc.post_state, op.src, op.len);
-      let current = self
-        .content
-        .get(path)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
+      let current = self.current(path).unwrap_or_default();
       let start = usize::try_from(head_start).unwrap_or(usize::MAX);
       let end = start.saturating_add(agent_bytes.len());
       let identical = current.get(start..end) == Some(agent_bytes);
