@@ -596,7 +596,7 @@
 >     parks per 1,000 creates, since a create goes to the partition its name hashes to and a loop returns to an owner
 >     only after going round the others. A fixed `F × S` or `2F × S` window fixed it there (36.8 and 29.5 µs) but spun
 >     for a paced client too (1,386–2,289 thousandths of a core at fifteen shards against main's 664). Now a forward
->     made for a request read within F of its shard's last work holds its owner open for the loop's return at R9's
+>     made for a request read within F of its shard's last client I/O holds its owner open for the loop's return at R9's
 >     percentile, 2F × the least k with ((S − 1)/S)^k ≤ 1/100, never more cycles than the loop had run (§4.7, A-326;
 >     `crates/server/tests/closed_loop.rs`). A paced client's requests hold nothing.
 >   - **Owed: the supervisor's measurement of A-223, its window rule and A-326 on main** (`provision_bench`, every N,

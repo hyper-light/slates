@@ -4184,6 +4184,7 @@ async fn init_shard(
     current_span: None,
     forward_hold_ns: 0,
     loop_run: 0,
+    last_client_io_ns: 0,
     reply_route: None,
     told_waiters: crate::told::ToldWaiters::default(),
     nfs_writeback: crate::nfs_writeback::WritebackStates::default(),

@@ -4820,7 +4820,7 @@ the platform's multiple), where F = R9's provisioning floor, 50 µs (`PROVISION_
 the bench gates on too) and the multiple, `loaded_wake_ratio()` (paired `#[cfg]` functions with one signature), is 0
 on Linux and macOS and 100 on Windows (A-223's window rule, below); closed-loop hold = 2F × the least k with
 ((S − 1)/S)^k ≤ 1/100, S the shards and 1/100 R9's tail (`config::closed_loop_hold`: 700 µs at two shards, 1.2 ms at
-three, 6.7 ms at fifteen), held by a forward for a request that came within F of its shard's last work, and never
+three, 6.7 ms at fifteen), held by a forward for a request that came within F of its shard's last client I/O, and never
 more cycles of 2F than its loop had run before it (`verbs::loop_hold`; A-326, below).
 
 > **Status (2026-11-11, A-223's window rule: the idle window is R9's floor, not a multiple of the estimate).** The
@@ -4844,7 +4844,8 @@ more cycles of 2F than its loop had run before it (`verbs::loop_hold`; A-326, be
 > 144–331 times per 1,000 creates (the A-223 plan's step 6, 2026-11-12); a fixed `F × S` window brought it to 36.8 µs
 > and `2F × S` to 29.5, but a fixed window costs a paced client the same spin (1,386–2,289 thousandths of a core at
 > fifteen shards against main's 664), so the rule had to tell the two clients apart. The shard that reads a request
-> does: one that came within F of the shard's last work continues a closed loop, R9's own definition of one, and a
+> does: one that came within F of the shard's last client I/O (a request read or a reply written) continues a closed
+> loop, R9's own definition of one, and a
 > forward made for it carries a hold for its owner (`ShardContext::hold_idle_window`) of the loop's return at R9's
 > percentile, 2F × the least k with ((S − 1)/S)^k ≤ 1/100, 2F being a cycle of a loop that meets R9 (its request and its
 > think time). A hold never spans more cycles than the loop had run before the request, so the spin a loop leaves
@@ -15290,7 +15291,8 @@ Applied in the same change to: §4.3 (derived constants), §4.7 (derived constan
 BENCHMARKS ("The idle window's rule": step 6's multi-shard rows and what is owed), `crates/rt` (`ShardContext::
 hold_idle_window`, `Counters::idle_holds`, the spin reading the hold), `crates/server` (`config::closed_loop_hold`,
 `loop_revisit_cycles`, `PROVISION_TAIL`, `CLOSED_LOOP_CYCLE_NS`, `DaemonConfig::closed_loop_hold_ns`; `verbs::loop_hold`,
-the forward carrying its hold, `PendingForward::hold_ns`; `ShardState::forward_hold_ns`, `loop_run`), and the tests
+the forward carrying its hold, `PendingForward::hold_ns`; `ShardState::forward_hold_ns`, `loop_run`,
+`last_client_io_ns`; `serve_round` reads its clock before the deferred replies it writes), and the tests
 `crates/server/tests/closed_loop.rs`, `crates/rt/tests/idle_spin.rs` (the held window) and the hold's derivation in
 `config.rs`.
 - **The defect.** A-223's window rule keeps a closed loop's own shard polling: the client's next request comes within
@@ -15306,7 +15308,9 @@ the forward carrying its hold, `PendingForward::hold_ns`; `ShardState::forward_h
   365–584 thousandths of a core at three shards and 1,386–2,289 at fifteen, against main's 664 there and F's 222
   (step 6, diag-liveness-44 and adacachy2). The rule must tell the two clients apart, and only the shard that reads the
   request can.
-- **The rule.** A request read within F of its shard's last work continues a closed loop, R9's definition of one (its
+- **The rule.** A request read within F of its shard's last client I/O (a request read or a reply written; never its
+  background work, whose slices went on through a paced client's pause and made 3 of 24 paced cycles look like a
+  loop's in the first build) continues a closed loop, R9's definition of one (its
   client's next request within F of its last reply); a forward made for it carries a hold, and the owner keeps its
   idle window open at least that long (`ShardContext::hold_idle_window`; the longest hold asked stands). The hold is
   2F × k, with 2F a cycle of a loop that meets R9 (its request within F at R9's percentile and its think time within F)
