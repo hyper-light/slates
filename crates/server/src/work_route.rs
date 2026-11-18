@@ -33,12 +33,14 @@
 //! The keeper runs on its own task, parked while this node keeps no route ([`nudge`]), so a slow question never holds the
 //! record plane's coordinator, and an idle node takes no wakeup for it.
 //!
-//! **Not yet.** A green destroyed, or lost to a second takeover it cannot survive (GAP-A9-7), while a route to it is kept
-//! leaves that route held: the green has no owner, so no answer comes. And a completion its client never acknowledges
-//! (a client of another node that died, or one that never writes to the green again) keeps its route as it keeps the
-//! record itself: only an acknowledgement or a client lease ends either, and RIFL's client leases are not built. And an
-//! adopter that restarts warm gets its holder copies back but not the routes it kept (`pending_catalogs` starts empty),
-//! so it neither re-places nor retires them: A-255's own gap, found by reading (GAPS, A-288's entry).
+//! **Not yet.** A green destroyed, or lost to a second takeover it cannot survive (GAP-A9-7), while a route to it is
+//! kept leaves that route held: the green has no owner, so no answer comes. So does a green its successor gave up on: it
+//! is never served, so its shard answers nothing, though it recorded no completion the route could reach. A completion
+//! its client never acknowledges (a client of another node that died, or one that never writes to the green again)
+//! keeps its route as it keeps the record itself: only an acknowledgement or a client lease ends either, and RIFL's
+//! client leases are not built. And an adopter that restarts warm gets its holder copies back but not the routes it
+//! kept (`pending_catalogs` starts empty), so it neither re-places nor retires them: A-255's own gap, found by reading
+//! (GAPS, A-288's entry).
 
 use std::collections::BTreeMap;
 

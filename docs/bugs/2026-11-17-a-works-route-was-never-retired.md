@@ -37,9 +37,12 @@ the fleet ran: a store with no bound (CLAUDE.md §2 item 8).
   `retired false, counted 0; held at the end [Ok(true), Ok(true)]`.
 - Runner adas-macbook-pro.local, load average 109, debug build, 429 s, 2026-11-17. The log is kept at
   `~/.cache/slates-scratch/g241-submit-resent-after/red-2026-11-17-main-7c6faee27.log`.
-- The test then gained the work a's own client submitted from. With the fix, on the same runner (macOS arm64, debug
-  build, load 11 to 37, 2026-11-17): `its route retired true; ... held by both survivors true; ... retired true,
-  counted 2; held at the end [Ok(false), Ok(false)]`, in 6.91 s.
+- The test then gained the work a's own client submitted from. That form is red on main dbf53afa2 too, on the same
+  runner: `its route retired false; ... held by both survivors true; ... retired false, counted 0; held at the end
+  [Ok(true), Ok(true)]`, 860 s at load 57 to 91, failing at the own client's work.
+- With the fix, on the same runner (macOS arm64, debug build, 2026-11-17): `its route retired true; ... held by both
+  survivors true; ... retired true, counted 2; held at the end [Ok(false), Ok(false)]`, in 6.91 s at load 11 to 37 on
+  7c6faee27, and in 8.56 s at load 108 merged with main b7c294959.
 
 ## Exact edits (A-288)
 
@@ -79,12 +82,18 @@ the fleet ran: a store with no bound (CLAUDE.md §2 item 8).
 
 - A route to a green destroyed, or lost to a second takeover it cannot survive (GAP-A9-7), while the route is kept: no
   owner answers.
+- A route to a green its successor gave up on (main's give-up after the failover SLO's attempts, d3f4ddbe2): the green
+  is never served, so its shard answers no question, and the route stays. Its successor never recorded the adopted
+  completions, so nothing the route leads to can answer. The next piece answers such a green from its partition's
+  count.
 - A route whose completion its client never acknowledges keeps it, as the completion record itself is kept. This is
   RIFL's client lease, not built.
+- A route its adopter kept across a warm restart (the last sibling below).
 
 ## Sibling inconsistencies seen, not changed
 
-- `verbs::materialize_taken_over_green` uses `debug_assert!` in production code, which CLAUDE.md §2 item 6 bans.
+- `verbs::materialize_taken_over_green` used `debug_assert!` in production code, which CLAUDE.md §2 item 6 bans. Fixed
+  on main the same day by 9b6b35fb3 (a green of another role is refused `AlreadyExists`).
 - A restarted owner re-enqueues a recovered version's merge record with no work for the A-255 gate
   (`enqueue_recovered_record` passes `None`). Such a record can ship before its work's catalog is committed, if the
   owner restarted between the two. The chain entry now carries the work for a forwarded submit, so the gate could take

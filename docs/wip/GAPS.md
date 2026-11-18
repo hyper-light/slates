@@ -97,7 +97,12 @@
 > `a_survivor_holding_no_copy_of_the_works_catalog_learns_its_green_from_a_location_round` (`040da0d9a`, on main since
 > A-255 landed) was killed at its 240 s deadline in the Windows fleet lane of PR #11's first CI run (job 134508155910:
 > 123 passed, 0 failed, 1 timed out) and passed in the next (job 134523028813: 123 passed, 0 failed, 0 timed out).
-> PR #11 does not touch it. **Owed:** its rate on main's own Windows lane.
+> PR #11 does not touch it. **Owed:** its rate on main's own Windows lane. It also failed once on macOS (2026-11-17,
+> adas-macbook-pro, debug, load 190, on 7c6faee27 with A-288's change, which the failure does not involve), another way:
+> d's resend was answered `NotFound` because the green was never materialized on its successor
+> (`merge.takeover_incomplete` counted 4,561, every work route question unanswered, none retired). That is the gap main's
+> 5e14a4098 closed, a successor one version behind never receiving the adopted version's inputs. Merged with main
+> b7c294959, it passed in 5 s at load 104.
 
 > **The dirty-page test's precondition, proved each attempt (2026-11-09, A-248).**
 > `a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path` failed intermittently ("the sync says so:
@@ -191,10 +196,15 @@
 >   taken-over volume had kept too. Red first: on main 7c6faee27 the route was still held by both survivors after the
 >   acknowledgement (`retired false, counted 0`, 429 s on a loaded Mac).
 >   `a_works_route_ends_once_the_greens_owner_holds_none_of_its_completions` now also holds a work its own owner's
->   client submitted from, retired with nothing acknowledged. Green on the same Mac (macOS arm64, debug, load 11 to
->   37): both routes retired on both survivors, counted twice, in 6.91 s. Still held, A-288's open list:
+>   client submitted from, retired with nothing acknowledged. That form is red on main dbf53afa2 too (`its route
+>   retired false; ... retired false, counted 0; held at the end [Ok(true), Ok(true)]`, 860 s at load 57 to 91), and
+>   green with the fix on the same Mac (macOS arm64, debug): 6.91 s at load 11 to 37 on 7c6faee27, and 8.56 s at load
+>   108 merged with main b7c294959. Both routes retired on both survivors, counted twice. Still held, A-288's open list:
 >   - a route to a green destroyed, or lost to a second takeover it cannot survive (GAP-A9-7), while the route is
 >     kept: the green has no owner to answer;
+>   - a route to a green its successor gave up on (the give-up after the failover SLO's attempts, d3f4ddbe2): the green
+>     is never served, so its shard answers no question and the route stays, though nothing it leads to can answer.
+>     The next piece answers such a green from its partition's count;
 >   - a route whose completion its client never acknowledges (a client of another node that died, or one that never
 >     writes to the green again), as the completion record itself is: only an acknowledgement or a client lease ends
 >     either, and RIFL's client leases are not built;
@@ -1257,7 +1267,11 @@
 > `docs/bugs/2026-11-08-a-starved-shard-was-judged-wedged.md`. Still open from it:
 > - **A kill the rule does not touch (open).** `rungs9/ab-clean-2`'s lapse came 6.4 s after its last wedged line and right
 >   after `shard 0 is spinning: 1045 ms of CPU without a step`, on a shard that had run 580 ms of CPU in the last 1.3 s.
->   A poll that long at `CPUWeight=1` is still killed; whether it is a real non-yielding task is not established.
+>   A poll that long at `CPUWeight=1` is still killed; whether it is a real non-yielding task is not established. Seen
+>   again 2026-11-17 in an in-process fleet test binary (adas-macbook-pro, macOS arm64, debug, load 23 to 56, beside
+>   another fleet test process): `shard 0 is spinning, 1077 ms of CPU without a step` ended the binary (exit 4) in the
+>   third of 13 A-255 and tombstone tests; which test it was is not known. The 11 it never ran passed one to a process
+>   at load 70 to 116, so it did not reproduce.
 > - **Siblings with the same blind spot.** `crate::observe::ShardTime` (`next_window_ns`), used by observations and the
 >   cross-shard waits (`xshard`), gave up on a window with no CPU progress, so a starved shard's observation or call
 >   ended early: **fixed 2026-11-08 (bug-sweep).** A window with no CPU progress now ends the wait only if the scheduler

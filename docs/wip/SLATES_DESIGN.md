@@ -6021,8 +6021,8 @@ failure.
 > it can reach: a submit forwarded from another node than the work's owner, not yet acknowledged. The merge record
 > (format 2) and chain entry (version 3) name such a submit's work. The successor records the completion under it, and
 > the route's adopter asks the green's owner each period and retires the route through the destroy's tombstone stages
-> once none is held. Still held: a route to a green destroyed or lost while it is kept, one whose completion is never
-> acknowledged, and one its adopter kept across a warm restart (GAPS).
+> once none is held. Still held: a route to a green destroyed, lost or given up while it is kept, one whose completion is
+> never acknowledged, and one its adopter kept across a warm restart (GAPS).
 
 > **Status (2026-11-07, A-245: an acknowledgement names the ids still owed).** A watermark is contiguous, so one held or
 > slow request kept every later completion of its client: the owner pruned none of them, and past `2 × slots` refused
@@ -16533,8 +16533,9 @@ Applied in the same change to:
   - `work_route` (the keeper, its question on fleet stream 25, and the retirement);
   - `takeover::record_adoption` wakes the keeper, and `forget_owner_on_every_shard`;
   - `fleet::retire_shard_tombstones` drops the owner's own copies of a retired object's registers.
-- The test `a_works_route_ends_once_the_greens_owner_holds_none_of_its_completions` (red on main 7c6faee27: retired
-  false, counted 0), §4.16's status, GAPS, and `docs/bugs/2026-11-17-a-works-route-was-never-retired.md`.
+- The test `a_works_route_ends_once_the_greens_owner_holds_none_of_its_completions` (red on main 7c6faee27 and
+  dbf53afa2: retired false, counted 0; green with the fix, both routes retired, counted 2), §4.16's status, GAPS, and
+  `docs/bugs/2026-11-17-a-works-route-was-never-retired.md`.
 
 - **What was there.** A-255 made a work's catalog record, which names its green, the route a resend of its submit
   takes after the work's owner is taken over. Its adopter keeps it placed (`fleet::owed_adopted_work_catalogs`). Nothing
@@ -16574,6 +16575,9 @@ Applied in the same change to:
 - **Open.**
   - A green destroyed, or lost to a second takeover it cannot survive (GAP-A9-7), while a route to it is kept leaves
     that route held: the green has no owner to answer.
+  - A green its successor gave up on (the give-up after the failover SLO's attempts) is never served, so its shard
+    answers no question and a route to it stays, though nothing it leads to can answer: the successor never recorded
+    the adopted completions. The next piece answers such a green from its partition's count.
   - A completion its client never acknowledges keeps its route, as it keeps the record itself. This covers a client of
     another node that died, and one that never writes to the green again. Only an acknowledgement or a client lease
     ends either, and RIFL's client leases are not built.
