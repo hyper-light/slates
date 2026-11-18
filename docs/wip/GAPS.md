@@ -2057,7 +2057,8 @@
 >   client whose shard was starved at its hand-off read by copy, now mapped directly). Class A is done; class B (the
 >   transport's round-trip estimate) is open, but for the forward lane's stall (2026-11-18, A-315, goal g255): a batch
 >   quiet for its budget is given up only once a turn of its lane begun after the silence was seen has read the
->   session's own socket empty, so an origin kept off its CPU reads its owner's replies before it calls the owner
+>   session's own socket empty, or found no session at all, so an origin kept off its CPU reads its owner's replies
+>   before it calls the owner
 >   silent, and the failover bound from the forward's first send caps it
 >   (`a_held_origin_gives_up_no_forward_whose_reply_came_while_it_was_held`;
 >   `docs/bugs/2026-11-18-a-forward-lanes-silence-was-judged-before-its-shard-read-what-came.md`). loadtest-scale's lane

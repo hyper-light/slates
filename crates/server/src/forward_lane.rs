@@ -39,7 +39,11 @@
 //! replies unread in its socket, and its forwarders, run before the lane's driver, gave those replies' batches up to a
 //! live owner. The shard's waits in its driver (A-292's receiver rule) prove nothing here: the shard waits while
 //! another borrower (the link's discovery page) holds the session, and a shard busy with other forwards' replies rarely
-//! waits at all.
+//! waits at all. A lane whose peer has no session at all has nothing left to read, so a driving turn that finds none
+//! counts as one that read the socket empty ([`note_sessionless_turn`]): a dropped session's replies are never settled
+//! into the lane, and its forwards are answered unanswered by the next session. Without it a survivor's read through a
+//! forward to a stopped owner, whose silent session was dropped before the forward's silence was seen, was held to its
+//! failover bound (the bug record of 2026-11-18).
 //!
 //! A forward still queued counts its lane's progress as its own (a forward begun, a reply taken, bytes of a reply
 //! read), since nothing of it has been sent: before, a backlog longer than a budget gave every forward behind it up and
@@ -118,6 +122,9 @@ const GIVEN_UP_AT_BOUND: &str = "fleet.forward.given_up_at_bound";
 /// The status count of a batch whose silence first waited for its receiver to drain ([`Stall`]): the non-vacuity count
 /// of the confirmation, so a test of a held origin shows its silences were held for the receiver, not never reached.
 const SILENCE_AWAITED_RECEIVER: &str = "fleet.forward.silence_awaited_receiver";
+/// The status count of a driving turn that found its peer with no session at all, counted as a turn that read the
+/// session's socket empty ([`note_sessionless_turn`]): the non-vacuity count of that proof.
+const SESSIONLESS_TURN: &str = "fleet.forward.sessionless_turn";
 /// The status count of a batch with a forward still queued that its lane's progress kept past its own stall budget
 /// ([`Stall`]), once a batch: the non-vacuity count of a queued forward's lane credit (A-315).
 const HELD_BY_LANE: &str = "fleet.forward.held_by_lane";
@@ -201,11 +208,13 @@ struct Lane {
   /// When the lane last moved, on the wall (0: never): a forward begun on its session, a reply taken, or bytes of a
   /// reply read. A forward still queued counts it as its own progress ([`Stall`], A-315).
   progress_ns: u64,
-  /// The driving turns begun on the lane so far: each borrow of its session by its driver, counted as it begins.
+  /// The driving turns begun on the lane so far: each borrow of its session by its driver, and each look of its driver
+  /// that found the peer with no session at all ([`note_sessionless_turn`]), counted as it begins.
   turns_begun: u64,
   /// The number ([`Lane::turns_begun`]) of the latest driving turn that read the session's own socket empty
-  /// ([`left_empty`]; 0: none yet). What a silence is confirmed by ([`Stall`]): a turn begun after the silence was seen
-  /// that read the socket empty has read everything that reached it before, and settled it into the lane.
+  /// ([`left_empty`]) or found no session to read ([`note_sessionless_turn`]); 0: none yet. What a silence is
+  /// confirmed by ([`Stall`]): a turn begun after the silence was seen that read the socket empty has read everything
+  /// that reached it before, and settled it into the lane, and one that found no session has nothing left to read.
   drained_turn: u64,
 }
 
@@ -417,7 +426,7 @@ struct Heard {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GaveUp {
   /// Quiet for its stall budget, and a turn of its lane begun after the quiet was first seen had read the session's own
-  /// socket empty.
+  /// socket empty, or found the peer with no session at all.
   Silent,
   /// Quiet for its stall budget past its failover bound: given up without waiting for the receiver.
   AtTheBound,
@@ -448,9 +457,10 @@ struct Noted {
 ///   still queued, its lane's progress, the last counted only up to the failover bound. A lane that moves holds a
 ///   queued forward, and a lane that does not move for a stall budget gives it up as before.
 /// - **Confirmed against the receiver.** Quiet for its stall budget before the bound, the batch is given up only once
-///   a driving turn of its lane, begun after the quiet was first seen, has read the session's own socket empty
-///   ([`Lane::drained_turn`]), looking again every [`CONFIRM_LOOK_NS`]: that turn has read everything that reached the
-///   socket before and settled it into the lane. Its shard's waits in its driver (A-292's receiver rule) were the first
+///   a driving turn of its lane, begun after the quiet was first seen, has read the session's own socket empty or found
+///   the peer with no session at all ([`Lane::drained_turn`]), looking again every [`CONFIRM_LOOK_NS`]: that turn has
+///   read everything that reached the socket before and settled it into the lane, or there is nothing left to read.
+///   Its shard's waits in its driver (A-292's receiver rule) were the first
 ///   proof tried, and are not one here: while another borrower holds the session (the link's discovery page) the shard
 ///   waits with the lane's replies unsettled, which gave every waiting batch up in 2 of 18 CI runs, and a control shard
 ///   kept busy by other forwards' replies rarely waits at all, which held a silence its owner never answered past its
@@ -795,6 +805,7 @@ async fn turn(peer: HostId, left_ns: u64) -> Turn {
   let Some((_, mut endpoint)) =
     crate::fleet::take_sessions("fleet.lent_to.forward_lane", |host| host == peer).pop()
   else {
+    note_sessionless_turn(peer);
     return Turn::SessionOut;
   };
   let this_turn = begin_turn(peer);
@@ -861,9 +872,30 @@ fn begin_turn(peer: HostId) -> u64 {
   .unwrap_or(0)
 }
 
+/// Counts a driving turn of `peer`'s lane that found no session to borrow as one begun and read empty, when the peer
+/// has no session at all ([`Lane::drained_turn`]): none was established, or the last was dropped (judged dead or reset
+/// where a borrower returned it, a discovery page failed, or its peer went out of contact, retired or restarted).
+/// Nothing is left for the lane to read: a dropped session is never put back (`fleet::return_sessions` drops a late
+/// return), so no reply on it is ever settled into the lane, and a forward begun on it is answered unanswered by the
+/// next session's settle. Only the driver runs it, between its own turns, so no turn of this lane holds the dropped
+/// session meanwhile. A session lent to another borrower is not counted: that borrower reads the socket, and the lane
+/// settles what it read when the session comes back (the refused first proof of A-315).
+fn note_sessionless_turn(peer: HostId) {
+  let _ = state::with_state_counted(|s| {
+    if s.record_sessions.contains_key(&peer) {
+      return;
+    }
+    if let Some(lane) = s.forward_lanes.lanes.get_mut(&peer) {
+      lane.turns_begun = lane.turns_begun.saturating_add(1);
+      lane.drained_turn = lane.turns_begun;
+      s.count(SESSIONLESS_TURN, 1);
+    }
+  });
+}
+
 /// Records that `peer`'s lane read its session's own socket empty in its turn numbered `turn` ([`Lane::drained_turn`]).
 fn mark_drained(peer: HostId, turn: u64) {
-  let _ = state::with_state(|s| {
+  let _ = state::with_state_counted(|s| {
     if let Some(lane) = s.forward_lanes.lanes.get_mut(&peer) {
       lane.drained_turn = lane.drained_turn.max(turn);
     }

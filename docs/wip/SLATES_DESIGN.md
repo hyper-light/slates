@@ -5823,7 +5823,9 @@ version.
 > owner's replies unread in its socket, and its waiting forwarders, woken by their timers ahead of the lane's driver,
 > gave those batches up to a live owner. Now a batch quiet for its budget is given up only once a turn of its lane,
 > begun after the silence was first seen, has read the session's own socket empty: the record link's sessions read
-> their own sockets (`Endpoint::client`), so that turn has read everything that reached the socket before. The shard's
+> their own sockets (`Endpoint::client`), so that turn has read everything that reached the socket before. A turn that
+> finds the peer with no session at all counts as one that read it empty, since a dropped session's replies never
+> reach the lane (a survivor's forward to a stopped owner was otherwise held to its failover bound). The shard's
 > waits in its driver (A-292's receiver rule) do not prove it here: the shard waits while another borrower (the link's
 > discovery page) holds the session, and a shard kept busy by other forwards' replies rarely waits at all. A forward
 > still queued, of
@@ -22855,12 +22857,14 @@ Applied in the same change to:
 - §4.8 "Lookup": the status of 2026-11-18 (A-315), and A-306's status, whose owed item this builds.
 - `crates/server/src/forward_lane.rs`: `Stall` (pure, with `Heard`, `Verdict`, `GaveUp` and `Noted`), the lane's
   `progress_ns` (a forward begun, a reply taken, bytes of a reply read), `turns_begun` and `drained_turn` (`begin_turn`,
-  `mark_drained`: the latest turn that read the session's own socket empty, `left_empty`), `look_in` and `answer_with`
+  `mark_drained`: the latest turn that read the session's own socket empty, `left_empty`; `note_sessionless_turn`: a
+  driving turn that found the peer with no session at all), `look_in` and `answer_with`
   (the view and the reply's bookkeeping apart from the shard and the session), `failover_bound_from`; the counts
-  `fleet.forward.given_up_silent`, `fleet.forward.given_up_at_bound`, `fleet.forward.silence_awaited_receiver` and
-  `fleet.forward.held_by_lane`; the module doc. `crates/server/src/fleet.rs` (`forward_batch_over_leader_session` takes
-  the bound; `forward_over_leader_session` passes one from its own send) and `crates/server/src/verbs.rs`
-  (`resolve_and_forward` passes its failover bound, from the first send, to every send through `forward_once`).
+  `fleet.forward.given_up_silent`, `fleet.forward.given_up_at_bound`, `fleet.forward.silence_awaited_receiver`,
+  `fleet.forward.held_by_lane` and `fleet.forward.sessionless_turn`; the module doc. `crates/server/src/fleet.rs`
+  (`forward_batch_over_leader_session` takes the bound; `forward_over_leader_session` passes one from its own send) and
+  `crates/server/src/verbs.rs` (`resolve_and_forward` passes its failover bound, from the first send, to every send
+  through `forward_once`).
   `crates/transport/src/endpoint.rs`: `Endpoint::datagrams_received`, the datagrams an established session took, by
   which a lane's turn knows it read the socket empty (stream bytes would not tell: a datagram of acknowledgements alone
   consumes none), and `Endpoint::reads_its_own_socket`, since only a session that reads its own socket proves the
@@ -22872,7 +22876,8 @@ Applied in the same change to:
   `a_batch_whose_own_forwards_progress_is_never_given_up_at_its_bound`,
   `a_queued_forward_behind_a_moving_lane_is_kept_past_its_own_budget` and the model test
   `a_stall_judges_every_history_as_the_rule_reads_it`; in `crates/server/tests/fleet.rs`,
-  `a_held_origin_gives_up_no_forward_whose_reply_came_while_it_was_held`.
+  `a_held_origin_gives_up_no_forward_whose_reply_came_while_it_was_held`, and
+  `a_takeover_adopts_the_newest_head_a_holder_left_out_of_its_pages`, which failed without the sessionless turn.
 - GAPS: the load test's "dead record session" entry (A-306's open item, closed) and the R3 debt of
   `LIVENESS_BUDGET_NS` (class B, the forward lane). The bug record:
   `docs/bugs/2026-11-18-a-forward-lanes-silence-was-judged-before-its-shard-read-what-came.md`.
@@ -22888,7 +22893,8 @@ Applied in the same change to:
   batch quiet for its stall budget before the bound is given up only once a driving turn of its lane, begun after the
   silence was first seen, has read the session's own socket empty (`forward_lane::left_empty`: its drive took no
   datagram, or one more receive that does not wait took none, counted by `Endpoint::datagrams_received`;
-  `Lane::drained_turn`), looking again every poll interval (`HEARTBEAT_NS / POLL_PER_PERIOD`); progress meanwhile ends
+  `Lane::drained_turn`) or has found the peer with no session at all (`forward_lane::note_sessionless_turn`), looking
+  again every poll interval (`HEARTBEAT_NS / POLL_PER_PERIOD`); progress meanwhile ends
   the confirmation, and a later silence is confirmed afresh. Past the bound a quiet batch is given up at once. A batch
   whose own forwards progress is never given up: a long read stalls only when no byte of it comes for a budget, never
   at a deadline.
@@ -22896,7 +22902,13 @@ Applied in the same change to:
   empty has read every datagram that reached it before, its settles putting the replies into the lane; begun after the
   silence was first seen, it has read everything that came before the silence was judged. Turns are ordered by the
   lane's own count (`Lane::turns_begun`), exact on the one shard thread, where clock readings within one step need not
-  be. Two proofs were tried first, and the CI runs refused both. The control shard's two waits in its driver since the
+  be. A lane whose peer has no session at all has nothing left to read: a dropped session is never put back
+  (`fleet::return_sessions` drops a late return), so none of its replies reaches the lane, and a forward begun on it is
+  answered unanswered by the next session's settle; one lent to another borrower is not such a lane, since that
+  borrower reads the socket and the lane settles it on the session's return. Without the sessionless turn a survivor's
+  forward to a stopped owner, whose session its link dropped before the forward's silence was seen, was held to its
+  failover bound (`fleet.forward.no_session` and `fleet.forward.given_up_at_bound` 1 each, 3 of 3 runs). Two proofs
+  were tried first, and the CI runs refused both. The control shard's two waits in its driver since the
   silence (A-292's receiver rule) gave all 7 waiting batches up in 2 of 18 runs of the held-origin test, each run's lane
   having found its session lent to the link (`fleet.lent_to.link` 1): the shard waits while the link's discovery page
   holds the session, the lane's replies unsettled. And a turn begun after those waits that took nothing kept a forward
@@ -22923,7 +22935,12 @@ Applied in the same change to:
   windows-latest on the merged tree, none given up, 6 or 7 silences held for the receiver a run (run 44260700333), with
   the lane's other promises kept (the silent forward given up while others flow, 12 of 12; a forward resent at its
   budget, 6 of 6; the dead-session tests, 6 of 6 each). Each of six mutations of the rule turns a unit test red (run
-  44260700876). The bug record has the forms that did not land.
+  44260700876). The server suite found the sessionless case before landing:
+  `a_takeover_adopts_the_newest_head_a_holder_left_out_of_its_pages` failed 8 of 8 on ubuntu-latest without the
+  sessionless turn, its serve poll lasting 10.01 s, the bound (run 44269560693), where main passed it 8 of 8 (run
+  44269560657); with it, 8 of 8, and 4 of 4 on windows-latest where it had failed 3 of 3 (runs 44271632046 and
+  44271632037), the lane's other tests unchanged, and sixteen runs a side served its volumes in 2.11 to 3.13 s, main
+  in 2.15 to 3.37 s (runs 44272364924 and 44272413371). The bug record has the forms that did not land.
 - **Cost.** A look reads the lane's two turn counts. A silence awaiting its receiver looks again every poll interval
   while it lasts, and a turn that read a datagram makes one more receive that does not wait. The lane's progress is one
   stored instant per begin, reply and byte-bearing turn.

@@ -67,6 +67,15 @@ sent, inside a's half-budget delay, and held it 1.500 to 1.649 s.
   putting the replies into the lane. Turns are ordered by the lane's own count (`Lane::turns_begun`), exact on the one
   shard thread. Progress meanwhile ends the confirmation; a later silence is confirmed afresh. A datagram count, not
   stream bytes: a datagram of acknowledgements alone, or of bytes past a gap, consumes no stream byte.
+- A driving turn that finds the peer with no session at all counts as one that read the socket empty
+  (`forward_lane::note_sessionless_turn`, counted `fleet.forward.sessionless_turn`): none was established, or the last
+  was dropped (judged dead or reset where a borrower returned it, a discovery page that failed, its peer out of contact,
+  retired or restarted). Nothing is left to read: a dropped session is never put back (`fleet::return_sessions` drops a
+  late return), so no reply on it is settled into the lane, and a forward begun on it is answered unanswered by the next
+  session's settle. Only the driver counts it, between its own turns, so no turn of the lane holds the dropped session
+  meanwhile. A session lent to another borrower is not counted: that borrower reads the socket, and the lane settles
+  what it read when the session comes back (the first proof's failure, below). Without it the form before was held to
+  its failover bound behind a stopped owner (the next section).
 - Three proofs came first, and the CI runs refused each:
   - The control shard's two waits in its driver since the silence (A-292's receiver rule) alone. That form passed 16
     of 18 runs on GitHub's three runners (`diag-g255-lane-green-1` 9 of 9, run 44253484990; `-green-2` 7 of 9, run
@@ -107,6 +116,29 @@ with boosts off beside time-critical spinners, and Windows' priorities are stric
 test is not brought here; this record's test holds the shard the same way on every platform. The receiver's waits are
 counted the same way on every platform, and the judge reads no clock but the wall.
 
+### Found before landing: a lane with no session
+
+The server suite's run of the form without the sessionless turn (`diag-g255-full-5`, ubuntu-latest) failed one of the
+154 tests it ran in `fleet`: `a_takeover_adopts_the_newest_head_a_holder_left_out_of_its_pages` (three nodes; the owner
+a stopped; b, whose routing forgot both volumes, and c asked for their status until each is served; c must then hold
+each volume's second head). Run alone on ubuntu-latest it failed 8 of 8 on that tree, 12 to 13 s a run
+(`diag-g255-takeover-green-1`, run 44269560693), and passed 8 of 8 on main, 4 to 6 s a run (`-red-1`, run
+44269560657). In each failed run the serve poll lasted 10.01 s, the forward's failover bound, and c then held a third
+position of one of the two volumes where the test wants the second. b's counts, 3 of 3 runs alike (`diag-g255-tkc-1`,
+run 44271632037): `fleet.forward.given_up_at_bound` 1, `fleet.forward.no_session` 1,
+`fleet.forward.silence_awaited_receiver` 1, `fleet.link.out_of_contact` 1 and `fleet.link.stale_return` 1. b's forward
+to a was begun on its session to the stopped owner; b's link then found a out of contact and dropped that session's
+entry, and a borrower's return of the session found the entry gone and dropped it. From then on the lane had no
+session, no turn could read anything, and the forward's silence, first seen after, waited for its bound.
+
+With the sessionless turn the test passed 8 of 8 on ubuntu-latest (`diag-g255-fix-1`, run 44271632046), and b's lane
+counted `fleet.forward.sessionless_turn` (26 to 594 a run) and `fleet.forward.given_up_silent`, none given up at the
+bound. On windows-latest it failed 3 of 3 without the sessionless turn (12 to 14 s a run, `diag-g255-tkc-1`) and
+passed 4 of 4 with it, 5 to 7 s a run (`diag-g255-fix-1`). Sixteen runs a side on ubuntu-latest served the volumes
+2.11 to 3.13 s into the serve poll with it, each run giving one forward up silent, and 2.15 to 3.37 s on main, 16 of 16
+passing on each (`diag-g255-tkab-fix-1`, run 44272364924; `-main-2`, run 44272413371): the survivor's read is as prompt
+as main's.
+
 ## Tests
 
 - `forward_lane::stall_tests`: the rule's unit tests
@@ -117,7 +149,8 @@ counted the same way on every platform, and the judge reads no clock but the wal
   `a_batch_whose_own_forwards_progress_is_never_given_up_at_its_bound`), a lane-level test
   (`a_queued_forward_behind_a_moving_lane_is_kept_past_its_own_budget`), and a model test of generated histories
   against the rule read off the whole history (`a_stall_judges_every_history_as_the_rule_reads_it`).
-- `crates/server/tests/fleet.rs` `a_held_origin_gives_up_no_forward_whose_reply_came_while_it_was_held`.
+- `crates/server/tests/fleet.rs` `a_held_origin_gives_up_no_forward_whose_reply_came_while_it_was_held`, and for the
+  sessionless turn `a_takeover_adopts_the_newest_head_a_holder_left_out_of_its_pages` (red 8 of 8 without it, above).
 
 Red-checks of the rule's unit tests, each a mutation of `Stall` or the lane run in a copy of the tree on GitHub's
 ubuntu-latest (`diag-g255-mut-4`, run 44260700876; the first five held their result on the earlier forms too, `-mut-1`
@@ -143,7 +176,15 @@ The other forward tests keep their results with the form that landed (`-green-7`
 `a_silent_forward_gives_up_while_its_session_carries_others` (the 298 forwards' regression: an open forward is still
 given up while other replies flow) 12 of 12, `a_forward_lane_leaves_a_session_that_hears_nothing_for_a_new_one` and
 `a_read_through_a_dead_session_keeps_its_place_behind_a_burst` 6 of 6 each. The macOS runners' queue held their jobs past
-landing; the first form ran all four 9 of 9 on the three runners (`-green-2`).
+landing; the first form ran all four 9 of 9 on the three runners (`-green-2`). With the sessionless turn
+(`diag-g255-fix-1`, run 44271632046) the held-origin and silent-forward tests passed 6 of 6 each, the other three
+forward tests and `a_forward_waits_for_the_owners_session_while_it_is_out` (a session lent out, which the sessionless
+turn must not count) 3 of 3 each, on ubuntu-latest and windows-latest alike.
+
+The left-out-head takeover test reads c's held position once both volumes are served and wants exactly the second
+head, while its own words ask only that c hold the second, not the first. Each of the 8 runs that served late (10 s)
+read a third position of one volume, so a serve delayed for any reason fails it; what committed the third position was
+not traced. Reported, not changed.
 
 Waits on remote hosts that still run on a liveness budget of wall time (R3 class B, GAPS): the location round's wait
 for its silent peers (`owner_location::locate_round`), the forwarded owner location's own budget (A-317 owns it), the
