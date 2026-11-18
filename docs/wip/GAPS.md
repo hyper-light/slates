@@ -1339,6 +1339,13 @@
 >   surviving recorded holder and every surviving member of the retired owner's cohorts for the volume, and adopts the
 >   greatest head (`fleet.live.taken_over_past_tolerance`). Owed: the supervisor's store-destroyed flow
 >   (`crates/cli/tests/live_chaos.rs`) on merged main, both Linux arches, for the end-to-end evidence.
+> - **Fixed (A-332, g250, 2026-11-18): a takeover past tolerance shows in the volume's status.** Its loss report's
+>   `taken_over.past_tolerance` names the shortfall of the head register's cohort and of the live log's recorded holders
+>   (the hosts recovery needed, how many remained), kept in the volume's takeover record (`CONTRACT` 20); `slates status`
+>   prints `taken_over_past_tolerance`. Test: `a_takeover_past_its_tolerance_shows_in_the_volumes_loss_report`
+>   (`crates/server/src/verbs.rs`); the AC-8.3 fleet test holds it `None` within tolerance, and the store-destroyed flow
+>   holds the report to the successor's own counts (the supervisor's run). Still Ada's (Decisions): whether a volume
+>   recovered past tolerance also refuses writes until an operator acknowledges it.
 > - **Open (A-309): a holder the round never asked keeps its copy** (`fleet.takeover.kept_unasked`). A neighbourhood an
 >   owner settled away from keeps the owner's copies; before A-309 they went when the owner's takeover settled, safe
 >   only within tolerance. Owed: such a holder lets them go at the settle, on the owner's report that every record it

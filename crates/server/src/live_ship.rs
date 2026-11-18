@@ -3628,6 +3628,9 @@ pub(crate) struct Fetched {
   pub(crate) naming: Option<crate::head::HeadNaming>,
   /// The first payload's sealing, when the log is sealed: kept with a refusal for a missing key ([`Refused`]).
   pub(crate) sealing: Option<crate::head::HeadSealing>,
+  /// Set when phase one adopted the head past tolerance (A-309, A-332): `f + 1` of the recorded holders, and how many of
+  /// them were members ([`live_shortfall`]). The volume's loss report names it.
+  pub(crate) past_tolerance: Option<slates_db::catalog::RecoveryShortfall>,
 }
 
 /// Phase one's question, on the control shard: each of `others` with a session in its link is asked to raise its copy
@@ -3716,6 +3719,9 @@ pub(crate) async fn fetch(
   let members: Vec<HostId> =
     state::with_state(|s| s.council.configuration().members.clone()).unwrap_or_default();
   let wait = past_tolerance_wait(&holders, &cohort_hosts, &members, local, quorum);
+  let past_tolerance = wait
+    .as_ref()
+    .map(|_| live_shortfall(&holders, &members, quorum));
   let others = others_to_ask(candidates, &holders, wait.as_deref(), local);
   // Phase one proper: every other candidate and recorded holder reports its head and the bytes it keeps, a few bytes
   // each, within the liveness budget whatever the path.
@@ -3801,7 +3807,25 @@ pub(crate) async fn fetch(
     lineage,
     naming,
     sealing,
+    past_tolerance,
   }))
+}
+
+/// The shortfall a live phase one past tolerance recovered at (A-332): the `f + 1` of the recorded `holders` its count
+/// needs, and how many of them are `members`.
+fn live_shortfall(
+  holders: &[HostId],
+  members: &[HostId],
+  quorum: slates_db::register::Quorum,
+) -> slates_db::catalog::RecoveryShortfall {
+  let remaining = holders
+    .iter()
+    .filter(|holder| members.contains(holder))
+    .count();
+  slates_db::catalog::RecoveryShortfall {
+    needed: u64::from(quorum.f).saturating_add(1),
+    remaining: u64::try_from(remaining).unwrap_or(u64::MAX),
+  }
 }
 
 /// The lineage key a rebuild opens the log sealed under `sealing` with: this node's own entry; else the key a fellow

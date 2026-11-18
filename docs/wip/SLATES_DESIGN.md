@@ -7954,6 +7954,12 @@ it builds against the contract and adds to it rather than around it.
 > when it gave one); a WinFsp drive the anchor's hold did not answer, or whose detach already waits. The words go to
 > the daemon's log. The contract carries the reason as `HostFault::Target(TargetRefusal)` and renders it after the
 > daemon's `TargetUnavailable`. The superseded variant is a protocol fault, since no daemon of this build sends it.
+> **`CONTRACT` = 20 (A-332):** a takeover past the volume's tolerance shows in its loss report.
+> `VolumeTakeover::past_tolerance`, appended, is a `PastTolerance` naming the `Shortfall` (the hosts recovery needed,
+> and how many remained members) of its head register's cohort and of its live log's recorded holders, each `None`
+> when that part was recovered within tolerance; the takeover record keeps it with the volume, so it survives the
+> successor's restart. `slates status` prints `taken_over_past_tolerance: registers <remaining>/<needed>|within
+> live_log ...`, and the JSON (CLI and MCP) carries it under `loss.taken_over.past_tolerance`.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -25486,3 +25492,34 @@ holder's one refusal is the write that met the fence (kiln r2346, Mac Studio).
 Applied in the same change to: §4.10 (the chaos flows' status), GAPS (the nemesis entry), `crates/server/src/live_ship.rs`,
 `crates/server/tests/fleet.rs` and the bug record
 `docs/bugs/2026-11-18-a-superseded-owners-shipper-starved-its-own-takeover-round.md`.
+
+### A-332 — A takeover past the volume's tolerance shows in its loss report (2026-11-18, kiln goal g250; §4.10 "Auto-seal", AC-8.3, §4.12 "The consumer contract"; A-309, A-325)
+
+- **What was there.** Past tolerance (more of a cohort lost than `f`) A-309 recovers a volume from the newest copy the
+  members that exist now hold, counted on the successor (`fleet.takeover.recovered_past_tolerance` for its registers,
+  `fleet.live.taken_over_past_tolerance` for its live log). A write acknowledged only to the lost hosts may be gone, and
+  nothing a consumer reads said so: the volume's loss report named the takeover (A-325) the same whether it kept every
+  acknowledged write or not.
+- **The rule.** The takeover records how it went past tolerance with the volume (`TakeoverRecord::past_tolerance`, a
+  `TakeoverPastTolerance` of two `RecoveryShortfall`s, appended), and the loss report carries it
+  (`VolumeTakeover::past_tolerance`, a `PastTolerance` of two `Shortfall`s, appended; `CONTRACT` 20):
+  - `registers`: the head register's first cohort short of its recovery quorum when the round adopted the newest record
+    every surviving member of the volume's cohorts held (`Readiness::ReadyPastTolerance`'s `needed` and `members`,
+    kept by the round per object and handed to the volume's pending materialization at its adoption);
+  - `live_log`: `f + 1` of the log's recorded holders and how many of them were members when phase one adopted past
+    tolerance (`live_ship::fetch`).
+  Each is `None` when its part was recovered within tolerance, and the whole is `None` when both were. The catalog
+  register shares the head's cohorts, so the head's verdict stands for both.
+- **Surfaces.** `slates status` prints `taken_over_past_tolerance: registers <remaining>/<needed>|within live_log ...`;
+  the JSON (CLI and MCP, one schema) carries `loss.taken_over.past_tolerance`.
+- **Left to Ada (Decisions).** Whether such a volume also refuses writes until an operator acknowledges the loss: the
+  report is what that acknowledgement would read.
+
+Held by `a_takeover_past_its_tolerance_shows_in_the_volumes_loss_report` (`crates/server/src/verbs.rs`: a takeover
+recorded past tolerance and one within, each volume's status read as its owner), the AC-8.3 fleet test
+(`a_successor_reports_the_loss_window_its_takeover_left`: within tolerance, `None`), and the store-destroyed chaos flow,
+which holds each part of the report to the successor's own past-tolerance counts (the supervisor's run).
+
+Applied in the same change to: §4.12 (the `CONTRACT` 20 status line), GAPS (A-272 (ii)'s entry),
+`crates/db/src/catalog.rs`, `crates/ipc/src/protocol.rs`, `crates/server/src/{takeover,state,live_ship,fleet,verbs}.rs`,
+`crates/cli/src/verbs.rs`, `crates/mcp/src/lib.rs`, `crates/api/src/lib.rs`, and the tests named above.

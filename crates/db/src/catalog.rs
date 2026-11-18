@@ -445,6 +445,34 @@ pub struct TakeoverRecord {
   pub head_sequence: u64,
   /// Whether the volume was rebuilt from its live log rather than from the seal the head names.
   pub from_live_log: bool,
+  /// Set when the takeover recovered the volume past its tolerance (A-309, A-332): more of the hosts holding it were lost
+  /// than its placement tolerates, so it was rebuilt from the newest copy the hosts that remained held, and a write
+  /// acknowledged only to the lost hosts may be gone. `None` within tolerance. Appended.
+  pub past_tolerance: Option<TakeoverPastTolerance>,
+}
+
+/// How a takeover went past a volume's tolerance (A-309, A-332): which of its parts were recovered from fewer surviving
+/// holders than recovery counts on, and by how much. At least one part is set.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TakeoverPastTolerance {
+  /// The volume's head register: its first cohort short of the recovery quorum when the takeover round adopted the newest
+  /// record every surviving member of the volume's cohorts held (`slates_db::takeover::Readiness::ReadyPastTolerance`).
+  /// `None` when the register was recovered within tolerance.
+  pub registers: Option<RecoveryShortfall>,
+  /// The volume's live log (A-200): its recorded holders short of `f + 1` members when phase one adopted the greatest head
+  /// every surviving recorded holder reported (`slates_db::live::past_tolerance`). `None` when the log was recovered
+  /// within tolerance, or the volume has none.
+  pub live_log: Option<RecoveryShortfall>,
+}
+
+/// A recovery count short of its quorum (A-332): the hosts recovery counts on, and how many of them were still members
+/// when it recovered past tolerance.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecoveryShortfall {
+  /// The hosts recovery needed: a cohort's recovery quorum, or `f + 1` of a live log's recorded holders.
+  pub needed: u64,
+  /// How many of the hosts that count were members then (fewer than `needed`).
+  pub remaining: u64,
 }
 
 /// Where a snapshot's records and content are held (§4.8).

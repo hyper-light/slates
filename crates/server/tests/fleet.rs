@@ -13511,7 +13511,7 @@ fn a_successor_reports_the_loss_window_its_takeover_left() {
 /// The reports of `a_successor_reports_the_loss_window_its_takeover_left`. Expect the owner's report at its placed seal
 /// (`sealed`) to put nothing at risk and name that seal's head sequence; its report after the later writes
 /// (`unsealed`) to put them at risk, still naming that seal; and the successor's (`taken`) to report a takeover served
-/// from that seal, not a live log, under a later epoch.
+/// from that seal, not a live log, under a later epoch, within tolerance (A-332).
 fn expect_the_loss_window_reported_then_taken(
   sealed: Option<(slates_ipc::protocol::LossReport, u64)>,
   unsealed: Option<(slates_ipc::protocol::LossReport, u64)>,
@@ -13537,6 +13537,10 @@ fn expect_the_loss_window_reported_then_taken(
   assert!(
     !taken.from_live_log && taken.head_sequence == at_seal && taken.epoch > owner_epoch,
     "served from the seal a named, under a later epoch: {taken:?}, a's placed seal {at_seal} under epoch {owner_epoch}"
+  );
+  assert_eq!(
+    taken.past_tolerance, None,
+    "two of three members survived at f = 1, so the takeover was within tolerance (A-332): {taken:?}"
   );
 }
 

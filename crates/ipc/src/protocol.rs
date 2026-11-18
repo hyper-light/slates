@@ -2406,8 +2406,9 @@ pub struct LossReport {
   /// Whether the volume ships its live log to holders in a fleet (A-200), so an owner loss loses no write acknowledged
   /// at durability.
   pub live_shipped: bool,
-  /// Set on a node that took the volume over from a lost owner: what it serves from, and so what the loss took. Kept in
-  /// this node's memory: a restart of this node forgets it.
+  /// Set on a node that took the volume over from a lost owner: what it serves from, and so what the loss took, and
+  /// whether the takeover went past the volume's tolerance (A-332). Recorded with the volume (A-325), so it survives this
+  /// node's restart.
   pub taken_over: Option<VolumeTakeover>,
 }
 
@@ -2421,6 +2422,34 @@ pub struct VolumeTakeover {
   /// The head sequence served from: when the volume was not served from its live log, the lost owner's edits after the
   /// seal it names (its `placed_sequence` when it was lost) are the loss window.
   pub head_sequence: u64,
+  /// Set when the takeover recovered the volume past its tolerance (A-309, A-332): more of the hosts holding it were lost
+  /// than its placement tolerates, so it was rebuilt from the newest copy the hosts that remained held, and a write
+  /// acknowledged only to the lost hosts may be gone. `None` within tolerance, where every write the lost owner
+  /// acknowledged at durability survived. Appended.
+  pub past_tolerance: Option<PastTolerance>,
+}
+
+/// How a takeover went past a volume's tolerance (A-309, A-332): which of its parts were recovered from fewer surviving
+/// holders than recovery counts on, and by how much. At least one part is set.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PastTolerance {
+  /// The volume's head register: its first cohort short of the recovery quorum when the takeover adopted the newest
+  /// record every surviving member of the volume's cohorts held. `None` when it was recovered within tolerance.
+  pub registers: Option<Shortfall>,
+  /// The volume's live log (A-200): its recorded holders short of `f + 1` members when the takeover adopted the greatest
+  /// head every surviving recorded holder reported. `None` when the log was recovered within tolerance, or the volume
+  /// has none.
+  pub live_log: Option<Shortfall>,
+}
+
+/// A recovery count short of its quorum (A-332): the hosts recovery counts on, and how many of them were still members
+/// when the takeover recovered past tolerance.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Shortfall {
+  /// The hosts recovery needed: a cohort's recovery quorum, or `f + 1` of a live log's recorded holders.
+  pub needed: u64,
+  /// How many of the hosts that count were members then (fewer than `needed`).
+  pub remaining: u64,
 }
 
 /// A volume's journal as its consuming rounds measured it (§4.5 "Journal"). The budget's formula is the mutation rate
