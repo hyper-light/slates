@@ -28404,5 +28404,10 @@ closed; the model table: nine `InstallInTurns` runs), `docs/wip/models/InstallIn
   period. Counted `fleet.config.install_walks`, `install_slices`, `installs_walked`, `install_unwalked`.
 - **Tests.** `a_holders_copies_take_an_install_in_turns_and_every_copy_follows` (`crates/server/tests/fleet.rs`: three
   nodes at `f = 1`; four volumes on a, held by b and c; b's and c's walks cut to one copy a turn; a cut off on the probe
-  plane until every head is placed on its successor): RESULTS. The whole-map passes stay as the daemon's unit-test
-  oracle of the per-copy steps.
+  plane until every head is placed on its successor): green 2 of 2 on macOS (Mac Studio, debug): b held 8 copies and
+  walked them in 27 turns over 3 walks, none sharing a poll, and every head was placed on its successor; red with each
+  walk in one turn (5 turns over 5 walks for the 8 copies). The fleet binary's `takeover`, `successor`, `retired`,
+  `readmitted` and `adopt` filters on the change: 60 passed and 2 failed, both a write after a warm restart refused
+  `DurabilityPending` at the live failover estimate (2.4 to 3.4 s), the failure A-344's owner-restart test shows on main
+  itself (g255's A-392); the successor's run to be told apart on main. The whole-map passes stay, as the daemon's
+  unit-test oracle of the per-copy steps.
