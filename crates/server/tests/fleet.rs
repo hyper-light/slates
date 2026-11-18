@@ -533,6 +533,7 @@ fn start_with_policy(
   let transport = FleetTransport {
     identity: this.identity,
     advertise: this.address.into(),
+    advertise_record: this.record_address.into(),
     enrollment_roots: Vec::new(),
     name: NAME.to_owned(),
     serve: held_serve_sockets(this.address, this.record_address),
@@ -2156,6 +2157,7 @@ fn start_fleet_node(
     identity,
     name: NAME.to_owned(),
     advertise: loopback(bind.0).into(),
+    advertise_record: loopback(bind.1).into(),
     enrollment_roots: Vec::new(),
     serve: held_serve_sockets(loopback(bind.0), loopback(bind.1)),
     peers,
@@ -3077,6 +3079,41 @@ fn start_mesh_unbootstrapped(
     slates_db::register::RegionId,
   >,
 ) -> Vec<Daemon> {
+  start_mesh_bound_and_advertised(
+    nodes,
+    started,
+    hosts,
+    certs,
+    (serve, serve),
+    f,
+    shards,
+    regions,
+    mirrors,
+  )
+}
+
+/// Each node's (probe, record) serve port pair, in node order.
+type PortPairs = [(u16, u16)];
+
+/// [`start_mesh_unbootstrapped`] with each node bound at its pair of `bound` and advertised at its pair of `advertised`
+/// (A-277): its peers dial it at the advertised pair and it announces that pair, so a node advertised where a port
+/// mapping listens is reached only through the mapping. Where the two pairs are the same, the node binds where it
+/// advertises, as every other mesh does.
+#[allow(clippy::too_many_arguments)]
+fn start_mesh_bound_and_advertised(
+  nodes: Vec<(MachineProfile, HostId, Identity)>,
+  started: usize,
+  hosts: &[HostId],
+  certs: &[rustls::pki_types::CertificateDer<'static>],
+  (bound, advertised): (&PortPairs, &PortPairs),
+  f: u32,
+  shards: u16,
+  regions: &std::collections::BTreeMap<HostId, slates_db::register::RegionId>,
+  mirrors: &std::collections::BTreeMap<
+    slates_db::register::RegionId,
+    slates_db::register::RegionId,
+  >,
+) -> Vec<Daemon> {
   let pid = std::process::id();
   let n = hosts.len();
   // Each node's stable anchor (the machine-identity hash its member ids derive from, task #22), so every
@@ -3095,8 +3132,8 @@ fn start_mesh_unbootstrapped(
         .map(|j| FleetPeer {
           anchor: anchors[j],
           host: hosts[j],
-          address: loopback(serve[j].0).into(),
-          record_address: loopback(serve[j].1).into(),
+          address: loopback(advertised[j].0).into(),
+          record_address: loopback(advertised[j].1).into(),
           certificate: certs[j].clone(),
         })
         .collect();
@@ -3116,9 +3153,10 @@ fn start_mesh_unbootstrapped(
       let transport = FleetTransport {
         identity,
         name: NAME.to_owned(),
-        advertise: loopback(serve[i].0).into(),
+        advertise: loopback(advertised[i].0).into(),
+        advertise_record: loopback(advertised[i].1).into(),
         enrollment_roots: Vec::new(),
-        serve: held_serve_sockets(loopback(serve[i].0), loopback(serve[i].1)),
+        serve: held_serve_sockets(loopback(bound[i].0), loopback(bound[i].1)),
         peers,
         resolver: None,
       };
@@ -10812,6 +10850,330 @@ fn live_ship_after_its_base_and_one_write(client: &mut Client, id: VolumeId, att
   );
 }
 
+/// Shape: how long a [`PortMapping`]'s socket waits for a datagram before it looks at its stop flag again: the latency
+/// of its stop alone, never of a datagram, which ends the wait at once.
+const MAPPING_READ_WAIT: Duration = Duration::from_millis(20);
+/// Format: the largest UDP payload; a [`PortMapping`] receives each datagram whole into a buffer this large.
+const MAPPING_DATAGRAM_CAP: usize = 65_535;
+/// Shape: how long [`a_candidate_behind_a_port_mapping_is_redialed_through_it_so_a_cut_there_holds_its_record_plane`]
+/// watches a write it must not see acknowledged: twice what the redial around the mappings took before A-330. That
+/// was the live exchange given up unanswered at the liveness budget (`fleet::live_budget`), the record link dropped and
+/// dialed again at its next turn, a heartbeat at most, and the entry shipped and answered at the period after.
+const CUT_WRITE_WATCH: Duration = Duration::from_nanos(2 * (LIVENESS_BUDGET_NS + 2 * HEARTBEAT_NS));
+
+/// A port mapping in front of one node (A-277, A-330): a NAT's port forward, or a container runtime's published ports,
+/// in the test's own threads. It listens at two ports of its own, where the node is advertised for its probes and for
+/// its records, and sends each datagram on to the node's bound socket for the same plane from a flow socket it keeps
+/// for that sender (one outer address an inner socket, as a NAT keeps one mapping an inner address), and each answer
+/// back out of the listener. Only what crosses it reaches the node from a peer that dials where the node is advertised.
+/// The record plane can be cut, both ways, and healed; what crossed it there is counted. Dropped, it stops and joins
+/// every thread it started.
+struct PortMapping {
+  /// The mapping's two ports: where the node is advertised for its probes, and for its records.
+  advertised: (u16, u16),
+  records_cut: &'static std::sync::atomic::AtomicBool,
+  records_crossed: &'static std::sync::atomic::AtomicU64,
+  stop: &'static std::sync::atomic::AtomicBool,
+  planes: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl PortMapping {
+  /// Starts forwarding to `bound`, the node's bound probe and record ports. The flags its threads share are leaked
+  /// once a mapping, which only a test makes.
+  fn start(bound: (u16, u16)) -> PortMapping {
+    let records_cut: &'static std::sync::atomic::AtomicBool =
+      Box::leak(Box::new(std::sync::atomic::AtomicBool::new(false)));
+    let records_crossed: &'static std::sync::atomic::AtomicU64 =
+      Box::leak(Box::new(std::sync::atomic::AtomicU64::new(0)));
+    let stop: &'static std::sync::atomic::AtomicBool =
+      Box::leak(Box::new(std::sync::atomic::AtomicBool::new(false)));
+    let probe = std::net::UdpSocket::bind(loopback(0)).unwrap();
+    let record = std::net::UdpSocket::bind(loopback(0)).unwrap();
+    let advertised = (
+      probe.local_addr().unwrap().port(),
+      record.local_addr().unwrap().port(),
+    );
+    let planes = [
+      (probe, loopback(bound.0), None),
+      (
+        record,
+        loopback(bound.1),
+        Some((records_cut, records_crossed)),
+      ),
+    ]
+    .into_iter()
+    .map(|(listener, node, records)| {
+      std::thread::spawn(move || forward_plane(listener, node, records, stop))
+    })
+    .collect();
+    PortMapping {
+      advertised,
+      records_cut,
+      records_crossed,
+      stop,
+      planes,
+    }
+  }
+
+  /// Cuts the record plane both ways, or heals it.
+  fn cut_records(&self, cut: bool) {
+    self
+      .records_cut
+      .store(cut, std::sync::atomic::Ordering::Release);
+  }
+
+  /// The record-plane datagrams that have crossed the mapping, both ways.
+  fn records_crossed(&self) -> u64 {
+    self
+      .records_crossed
+      .load(std::sync::atomic::Ordering::Acquire)
+  }
+}
+
+impl Drop for PortMapping {
+  fn drop(&mut self) {
+    self.stop.store(true, std::sync::atomic::Ordering::Release);
+    for plane in self.planes.drain(..) {
+      let _ = plane.join();
+    }
+  }
+}
+
+/// The record plane's cut and count, for a [`PortMapping`]'s record listener and its flows; `None` on the probe plane.
+type RecordPlane = Option<(
+  &'static std::sync::atomic::AtomicBool,
+  &'static std::sync::atomic::AtomicU64,
+)>;
+
+/// Whether a datagram may cross `plane` now, counting it on the record plane when it may.
+fn crosses(plane: RecordPlane) -> bool {
+  match plane {
+    None => true,
+    Some((cut, crossed)) => {
+      let open = !cut.load(std::sync::atomic::Ordering::Acquire);
+      if open {
+        crossed.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+      }
+      open
+    }
+  }
+}
+
+/// One plane of a [`PortMapping`]: each datagram `listener` receives goes on to `node` from its sender's flow socket,
+/// opened on the sender's first datagram with a thread that carries the node's answers back; until `stop`, then every
+/// flow's thread joined.
+fn forward_plane(
+  listener: std::net::UdpSocket,
+  node: SocketAddrV4,
+  plane: RecordPlane,
+  stop: &'static std::sync::atomic::AtomicBool,
+) {
+  listener.set_read_timeout(Some(MAPPING_READ_WAIT)).unwrap();
+  let mut flows: std::collections::BTreeMap<std::net::SocketAddr, std::net::UdpSocket> =
+    std::collections::BTreeMap::new();
+  let mut answers = Vec::new();
+  let mut buffer = vec![0u8; MAPPING_DATAGRAM_CAP];
+  while !stop.load(std::sync::atomic::Ordering::Acquire) {
+    // A timed-out wait, or an error the socket reported once: look at the stop flag and wait again.
+    let Ok((length, sender)) = listener.recv_from(&mut buffer) else {
+      continue;
+    };
+    let flow = flows.entry(sender).or_insert_with(|| {
+      let flow = std::net::UdpSocket::bind(loopback(0)).unwrap();
+      flow.set_read_timeout(Some(MAPPING_READ_WAIT)).unwrap();
+      let (answers_from, back) = (flow.try_clone().unwrap(), listener.try_clone().unwrap());
+      answers.push(std::thread::spawn(move || {
+        answer_flow(answers_from, back, (sender, node), plane, stop);
+      }));
+      flow
+    });
+    if crosses(plane) {
+      let _ = flow.send_to(&buffer[..length], node);
+    }
+  }
+  for answer in answers {
+    let _ = answer.join();
+  }
+}
+
+/// A [`PortMapping`] flow's answers: each datagram the node (`route.1`) sends `flow` goes back out of the listener
+/// (`back`) to the sender it is kept for (`route.0`); anything from elsewhere is a stray and dropped. Until `stop`.
+fn answer_flow(
+  flow: std::net::UdpSocket,
+  back: std::net::UdpSocket,
+  route: (std::net::SocketAddr, SocketAddrV4),
+  plane: RecordPlane,
+  stop: &'static std::sync::atomic::AtomicBool,
+) {
+  let (sender, node) = route;
+  let mut buffer = vec![0u8; MAPPING_DATAGRAM_CAP];
+  while !stop.load(std::sync::atomic::Ordering::Acquire) {
+    let Ok((length, from)) = flow.recv_from(&mut buffer) else {
+      continue;
+    };
+    if from == std::net::SocketAddr::V4(node) && crosses(plane) {
+      let _ = back.send_to(&buffer[..length], sender);
+    }
+  }
+}
+
+/// Starts the fleet of [`a_candidate_behind_a_port_mapping_is_redialed_through_it_so_a_cut_there_holds_its_record_plane`]:
+/// three nodes, a b and c, formed and settled at `f = 1`, b and c each bound at its own pair and advertised at a
+/// [`PortMapping`] in front of it, a bound where it advertises. The port lease, the two mappings (b's, c's) and the
+/// daemons in node order.
+fn mesh_with_mapped_candidates() -> (PortLease, [PortMapping; 2], Vec<Daemon>) {
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let seeds: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (lease, bound) = mesh_serve_ports(names.len());
+  let mappings = [PortMapping::start(bound[1]), PortMapping::start(bound[2])];
+  let advertised = vec![bound[0], mappings[0].advertised, mappings[1].advertised];
+  let regions = std::collections::BTreeMap::new();
+  let daemons = start_mesh_bound_and_advertised(
+    nodes,
+    names.len(),
+    &seeds,
+    &certs,
+    (bound.as_slice(), advertised.as_slice()),
+    1,
+    1,
+    &regions,
+    &std::collections::BTreeMap::new(),
+  );
+  bootstrap_mesh(&daemons, &seeds, &regions);
+  settle_initial_consensus(&daemons, &seeds, &regions, Quorum { f: 1 });
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  (lease, mappings, daemons)
+}
+
+/// What [`write_across_a_record_cut`] saw: the replies that came while the record planes were cut and once healed, and
+/// the record datagrams that had crossed the mappings before the cut, at the heal and after.
+struct AcrossTheCut {
+  while_cut: Vec<(Duration, u32, ReplyBody)>,
+  after_heal: Vec<(Duration, u32, ReplyBody)>,
+  crossed: [u64; 3],
+}
+
+/// Cuts every one of `mappings`' record planes, sends `write` through `client` and watches its reply for
+/// [`CUT_WRITE_WATCH`], heals, and waits for the reply that has not come within the placement deadline (or makes a
+/// write refused while cut again).
+fn write_across_a_record_cut(
+  client: &mut Client,
+  mappings: &[PortMapping],
+  write: &RequestBody,
+) -> AcrossTheCut {
+  let crossed = |mappings: &[PortMapping]| {
+    mappings
+      .iter()
+      .map(PortMapping::records_crossed)
+      .sum::<u64>()
+  };
+  let before = crossed(mappings);
+  for mapping in mappings {
+    mapping.cut_records(true);
+  }
+  client.send_burst(write, 1);
+  let while_cut = client.collect_timed(1, CUT_WRITE_WATCH, Instant::now());
+  for mapping in mappings {
+    mapping.cut_records(false);
+  }
+  let at_heal = crossed(mappings);
+  let after_heal = if while_cut.is_empty() {
+    client.collect_timed(1, PLACEMENT_DEADLINE, Instant::now())
+  } else {
+    // A refusal while cut is no acknowledgement; the write is made again once healed.
+    vec![(Duration::ZERO, 0, client.call(write))]
+  };
+  AcrossTheCut {
+    while_cut,
+    after_heal,
+    crossed: [before, at_heal, crossed(mappings)],
+  }
+}
+
+/// A-277, A-330, A-200 (StaleNeverCommits as a client sees it, AC-8.1; T-8.7's partition, at a port mapping): a node
+/// behind a port mapping is dialed through the mapping on every dial, a redial included, so a partition at the mapping
+/// partitions its record plane too. Do: start a three-node fleet whose candidates b and c each bind elsewhere than they
+/// advertise, a [`PortMapping`] at each advertised pair ([`mesh_with_mapped_candidates`]); make a live volume on a,
+/// its owner, and write it once; cut both mappings' record planes (their probes go on, so no one is suspected and
+/// nothing is taken over); write again; heal. Expect: the first write answered at durability, with record datagrams
+/// across a mapping; the second never acknowledged while the record planes are cut (no candidate can hold it, so
+/// nothing may claim it durable), however its exchanges fail and its links are dialed again; and acknowledged once
+/// healed, more record datagrams having crossed the mappings. Before A-330 each candidate announced its bound record
+/// port, its owner redialed there, around the mapping, and the second write was acknowledged while cut: the fault
+/// relay's chaos flows saw 2,086 writes acknowledged by an owner cut off from both candidates
+/// (`docs/bugs/2026-11-18-a-redial-went-around-the-port-mapping-the-record-plane-was-announced-at-its-bound-port.md`).
+#[test]
+fn a_candidate_behind_a_port_mapping_is_redialed_through_it_so_a_cut_there_holds_its_record_plane()
+{
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, mappings, daemons) = mesh_with_mapped_candidates();
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id } = client.call(&scratch("behind-a-mapping")) else {
+    panic!("the live volume is created on its owner");
+  };
+  let attachment = write_attachment(&mut client, id);
+  let shipped = client.call(&RequestBody::LiveShip {
+    volume: id,
+    live_shipped: true,
+  });
+  assert!(
+    matches!(shipped, ReplyBody::LiveShippingSet { live_shipped: true }),
+    "the volume is live-shipped: {shipped:?}"
+  );
+  let write = |path: &str| RequestBody::FsWrite {
+    volume: id,
+    attachment,
+    path: path.to_owned(),
+    bytes: vec![1; BURST_WRITE_BYTES],
+    mode: 0o644,
+  };
+  let first = client.call(&write("/first"));
+  assert!(
+    matches!(first, ReplyBody::FsDone { .. }),
+    "the first write is answered at durability: {first:?}"
+  );
+  let seen = write_across_a_record_cut(&mut client, &mappings, &write("/during"));
+  drop(daemons);
+  drop(mappings);
+  let [before, at_heal, after] = seen.crossed;
+  assert!(
+    before > 0,
+    "the record plane crossed a mapping before the cut"
+  );
+  let acknowledged_while_cut: Vec<&Duration> = seen
+    .while_cut
+    .iter()
+    .filter(|(_, _, reply)| matches!(reply, ReplyBody::FsDone { .. }))
+    .map(|(at, _, _)| at)
+    .collect();
+  assert!(
+    acknowledged_while_cut.is_empty(),
+    "a write no candidate could hold was acknowledged while both candidates' record planes were cut at their \
+     mappings, after {acknowledged_while_cut:?}: the owner reached them around the mappings ({before} record \
+     datagrams had crossed them before the cut, {at_heal} by the heal)"
+  );
+  assert!(
+    seen
+      .after_heal
+      .iter()
+      .any(|(_, _, reply)| matches!(reply, ReplyBody::FsDone { .. })),
+    "the write is acknowledged once the mappings heal: {:?}",
+    seen.after_heal
+  );
+  assert!(
+    after > at_heal,
+    "the healed write's record datagrams crossed the mappings ({at_heal} by the heal, {after} after)"
+  );
+}
+
 /// Shape: how long [`a_takeover_completes_when_one_survivor_never_received_the_head`] holds the owner's record
 /// session to one survivor out — the placement deadline, longer than the placements and the owner's stop it
 /// has to cover; the hold ends with the owner in any case.
@@ -16147,6 +16509,7 @@ fn an_unlisted_node_enrolls_through_one_seed_and_joins_the_existing_quorum() {
       identity,
       name: NAME.to_owned(),
       advertise: loopback(addresses[node].0).into(),
+      advertise_record: loopback(addresses[node].1).into(),
       serve: held_serve_sockets(loopback(addresses[node].0), loopback(addresses[node].1)),
       peers,
       resolver: None,
@@ -20962,6 +21325,7 @@ fn lone_fleet_node(tag: &str) -> Daemon {
       ),
       name: NAME.to_owned(),
       advertise: loopback(probe).into(),
+      advertise_record: loopback(record).into(),
       serve: held_serve_sockets(loopback(probe), loopback(record)),
       peers: Vec::new(),
       resolver: None,
@@ -21632,6 +21996,7 @@ impl ExportNode {
         identity: Identity::from_der(node_cert, node_key),
         name: NAME.to_owned(),
         advertise: loopback(probe).into(),
+        advertise_record: loopback(record).into(),
         serve,
         peers: Vec::new(),
         resolver: None,
