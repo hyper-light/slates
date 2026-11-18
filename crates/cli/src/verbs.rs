@@ -580,7 +580,8 @@ fn merge_edit(
 }
 
 /// `advance ATTACHMENT [VERSION]`: the version now pinned and the invalidated paths, as text lines or
-/// a JSON `{ "version", "invalidated" }`.
+/// a JSON `{ "version", "invalidated", "invalidated_elided" }`: past what one reply holds the paths are counted
+/// (A-267), and a line says how many more changed.
 fn merge_advance(
   client: &mut Client,
   attachment: u64,
@@ -591,12 +592,22 @@ fn merge_advance(
   if json {
     slates_machine::out_line!(
       "{}",
-      serde_json::json!({ "version": advanced.version, "invalidated": advanced.invalidated })
+      serde_json::json!({
+        "version": advanced.version,
+        "invalidated": advanced.invalidated,
+        "invalidated_elided": advanced.invalidated_elided,
+      })
     );
   } else {
     slates_machine::out_line!("version: {}", advanced.version);
     for path in advanced.invalidated {
       slates_machine::out_line!("{path}");
+    }
+    if advanced.invalidated_elided > 0 {
+      slates_machine::out_line!(
+        "and {} more paths changed: every path counts as invalidated",
+        advanced.invalidated_elided
+      );
     }
   }
   Ok(())
@@ -746,7 +757,9 @@ fn emit_daemon_status(client: &mut Client, json: bool) -> Result<(), ClientError
 }
 
 /// `status ID` / `volume stat ID`: the report as text, its drifted paths (`--drift`), or the whole
-/// report as JSON (the MCP `status_json` schema; `--drift` narrows only the text form).
+/// report as JSON (the MCP `status_json` schema; `--drift` narrows only the text form). `--drift` names every drifted
+/// entry: the report carries those that fit beside its other fields (A-267), so past them the paged read
+/// (`Client::drifted`) walks the rest; an entry too long for any page is counted on standard error.
 fn emit_status(
   client: &mut Client,
   volume: slates_client::VolumeId,
@@ -757,13 +770,44 @@ fn emit_status(
   if json {
     slates_machine::out_line!("{}", slates_mcp::status_json(&report));
   } else if drift {
-    for path in &report.drifted {
+    let (entries, oversized) = if report.drifted_elided > 0 {
+      let whole = client.drifted(volume)?;
+      let oversized = whole.oversized;
+      (drift_lines(whole), oversized)
+    } else {
+      (report.drifted, 0)
+    };
+    for path in &entries {
       slates_machine::out_line!("{path}");
+    }
+    if oversized > 0 {
+      slates_machine::log_line!(
+        "{oversized} drifted entries too long for a reply were passed over"
+      );
     }
   } else {
     slates_machine::out_text!("{}", status_text(&report));
   }
   Ok(())
+}
+
+/// A drift walked a page at a time, as text in path order: `PATH (KIND)` for an entry the disk changed, as a status
+/// names it, and `PATH (unverified)` for one whose re-check the host refused (a page carries no refusal's words).
+fn drift_lines(whole: slates_client::DriftedPage) -> Vec<String> {
+  let mut lines: Vec<(String, String)> = whole
+    .drifted
+    .into_iter()
+    .map(|entry| {
+      let line = format!("{} ({:?})", entry.path, entry.kind);
+      (entry.path, line)
+    })
+    .chain(whole.unverified.into_iter().map(|path| {
+      let line = format!("{path} (unverified)");
+      (path, line)
+    }))
+    .collect();
+  lines.sort();
+  lines.into_iter().map(|(_, line)| line).collect()
 }
 
 /// `volume create`: the new volume's id, as text (the id and its bridge path) or a JSON `{ "id" }`.
@@ -1109,8 +1153,8 @@ fn capability_text(c: &slates_client::AttachmentCapability) -> String {
   )
 }
 
-/// `base rewitness`: the paths whose base drifted, one per text line or a JSON `{ "paths" }` (the key
-/// `changed-since` uses, so a script reads `.paths` from both).
+/// `base rewitness`: the paths whose base drifted, one per text line or a JSON `{ "paths", "paths_elided" }` (the key
+/// `changed-since` uses, so a script reads `.paths` from both): past what one reply holds they are counted (A-267).
 fn emit_rewitness(
   client: &mut Client,
   volume: VolumeId,
@@ -1119,10 +1163,16 @@ fn emit_rewitness(
 ) -> Result<(), ClientError> {
   let rewitnessed = client.rewitness(volume, paths)?;
   if json {
-    slates_machine::out_line!("{}", serde_json::json!({ "paths": rewitnessed }));
+    slates_machine::out_line!(
+      "{}",
+      serde_json::json!({ "paths": rewitnessed.paths, "paths_elided": rewitnessed.paths_elided })
+    );
   } else {
-    for path in rewitnessed {
+    for path in rewitnessed.paths {
       slates_machine::out_line!("{path}");
+    }
+    if rewitnessed.paths_elided > 0 {
+      slates_machine::out_line!("and {} more paths rewitnessed", rewitnessed.paths_elided);
     }
   }
   Ok(())
@@ -1249,12 +1299,14 @@ fn landing_json(landing: &Landing) -> serde_json::Value {
       manifest,
       summary,
       conflicts,
+      conflicts_elided,
     } => serde_json::json!({
       "grant_required": true,
       "landing": landing,
       "manifest": hex32(manifest),
       "summary": slates_mcp::landing_summary_json(summary),
       "conflicts": conflicts,
+      "conflicts_elided": conflicts_elided,
       "grant_with": format!("slates grant {landing}"),
     }),
   }
@@ -2221,6 +2273,12 @@ fn print_landing(landing: slates_client::Landing) {
       for degradation in &outcome.degraded {
         slates_machine::out_line!("degraded: {}", slates_mcp::degradation_json(degradation));
       }
+      if outcome.degraded_elided > 0 {
+        slates_machine::out_line!(
+          "and {} more degraded cells, past what one reply holds",
+          outcome.degraded_elided
+        );
+      }
       slates_machine::out_line!("barriers: {}", outcome.barriers);
     }
     slates_client::Landing::GrantRequired {
@@ -2228,6 +2286,7 @@ fn print_landing(landing: slates_client::Landing) {
       manifest,
       summary,
       conflicts,
+      conflicts_elided,
     } => {
       slates_machine::out_line!("landing: {landing}");
       slates_machine::out_line!("manifest: {}", hex32(&manifest));
@@ -2238,6 +2297,11 @@ fn print_landing(landing: slates_client::Landing) {
       slates_machine::out_line!("filtered_out: {}", summary.filtered_out);
       for path in &conflicts {
         slates_machine::out_line!("conflict: {path}");
+      }
+      if conflicts_elided > 0 {
+        slates_machine::out_line!(
+          "and {conflicts_elided} more conflicts, past what one reply holds"
+        );
       }
       slates_machine::out_line!("grant with: slates grant {landing}");
     }
@@ -2295,7 +2359,11 @@ fn status_text(report: &StatusReport) -> String {
     report.head.value,
     report.snapshots,
     report.watcher,
-    report.drifted.len()
+    // Every drifted entry, those the report carried and those it counted (A-267).
+    report
+      .drifted
+      .len()
+      .saturating_add(usize::try_from(report.drifted_elided).unwrap_or(usize::MAX))
   ) + &format!(
     "placed: {}\nmirror_age_ns: {}\nhost_epoch: {}\n",
     report.placed.region,

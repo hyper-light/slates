@@ -25,8 +25,8 @@
 //! volume's trusted signers ([`Instance::set_signers`]).
 
 use slates_client::{
-  Attachment, Client, ClientError, CreateSpec, Landing, Rebased, ShardsStream, SignedLanding,
-  Submitted, VhostUserDevice,
+  Attachment, Client, ClientError, CreateSpec, Landing, Rebased, Rewitnessed, ShardsStream,
+  SignedLanding, Submitted, VhostUserDevice,
 };
 use slates_ipc::protocol::{
   DaemonReport, Filter, GrantScope, Intent, MergeWindow, PlannedEntry, ReadAt, Refusal, ReplyBody,
@@ -294,7 +294,8 @@ impl Instance {
       .map_err(|e| self.fail(e, Some(Missing::Volume(volume))))
   }
 
-  /// The caller's volumes. The daemon answers them in one reply today; a paged listing is owed (GAPS, A-299).
+  /// The caller's volumes, in name order: every one, walked a page at a time (A-263; [`Instance::list_page`] reads one
+  /// page, for a consumer that shows them a screen at a time).
   pub fn list(&mut self) -> Result<Vec<VolumeSummary>, Error> {
     self.client.list().map_err(|e| self.error(e))
   }
@@ -311,12 +312,41 @@ impl Instance {
 
   /// An overlay's drift (§4.15 "Drift"): each entry the disk changed after the volume changed it, typed by what
   /// happened — landing it would conflict — and each whose re-check the host refused now. `None` for a volume with no
-  /// base. Refused [`crate::HostFault::BaseUnreadable`] when the base could not be read now.
+  /// base. Refused [`crate::HostFault::BaseUnreadable`] when the base could not be read now. Every entry: what a status
+  /// could not carry is read a page at a time (A-267, [`Instance::drift_page`]), and [`DriftReport::elided`] then
+  /// counts only the entries too long for any reply.
   pub fn drift(&mut self, volume: VolumeId) -> Result<Option<DriftReport>, Error> {
-    match self.status(volume)?.base {
-      None => Ok(None),
-      Some(BaseState::Read(report)) => Ok(Some(report)),
-      Some(BaseState::Unreadable) => Err(Error::Host(crate::error::HostFault::BaseUnreadable)),
+    let report = match self.status(volume)?.base {
+      None => return Ok(None),
+      Some(BaseState::Read(report)) => report,
+      Some(BaseState::Unreadable) => {
+        return Err(Error::Host(crate::error::HostFault::BaseUnreadable));
+      }
+    };
+    if report.elided == 0 {
+      return Ok(Some(report));
+    }
+    let mut whole = DriftReport {
+      drifted: Vec::new(),
+      unverified: Vec::new(),
+      watcher: report.watcher,
+      elided: 0,
+    };
+    let mut after = None;
+    loop {
+      let page = self.drift_page(volume, after)?;
+      whole.drifted.extend(page.drifted);
+      whole.unverified.extend(page.unverified);
+      whole.elided = whole.elided.saturating_add(page.oversized);
+      match page.next {
+        None => {
+          // The pages come in inode order; the report names its entries in path order, as a status does.
+          whole.drifted.sort_by(|a, b| a.path.cmp(&b.path));
+          whole.unverified.sort();
+          return Ok(Some(whole));
+        }
+        next => after = next,
+      }
     }
   }
 
@@ -336,12 +366,13 @@ impl Instance {
   }
 
   /// Takes the disk's present state of drifted entries as their new base (all of them when `paths` is `None`, §4.15
-  /// `rewitness`); the paths done. The volume's own changes to them stay its own.
+  /// `rewitness`); the paths done, as many as one reply holds, and the count of the rest (A-267), which were taken
+  /// too. The volume's own changes to them stay its own.
   pub fn rewitness(
     &mut self,
     volume: VolumeId,
     paths: Option<Vec<String>>,
-  ) -> Result<Vec<String>, Error> {
+  ) -> Result<Rewitnessed, Error> {
     self
       .client
       .rewitness(volume, paths)
@@ -559,6 +590,7 @@ impl Instance {
             manifest,
             summary,
             conflicts,
+            conflicts_elided,
           },
         verification,
         statement: Some(statement),
@@ -572,7 +604,8 @@ impl Instance {
           statement,
           signature: signature.cloned(),
         };
-        if conflicts.is_empty() {
+        // A reply carries the conflicts one reply holds and counts the rest (A-267): clean only when it has neither.
+        if conflicts.is_empty() && conflicts_elided == 0 {
           Ok(Presented::Plan(approval))
         } else {
           self.conflicts_of(&approval).map(Presented::Settled)

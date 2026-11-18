@@ -642,13 +642,20 @@ pub struct ShardState {
   pub deferred: Vec<Deferred>,
   /// The shard's server task, woken when a client is added while it idles.
   pub server_task: Option<slates_rt::TaskId>,
-  /// Listings in flight: by request word, the client slot, the shards still to answer, and
-  /// the summaries so far (a scatter-gather over owners, §4.8 "Lookup").
-  pub scatters: BTreeMap<u64, (u32, usize, Vec<slates_ipc::protocol::VolumeSummary>)>,
+  /// Listing pages in flight: by request word, the client slot, the shards still to answer, and
+  /// their parts so far, each at most a page (a scatter-gather over owners, §4.8 "Lookup"; §4.4 `list`).
+  pub(crate) scatters: BTreeMap<u64, (u32, usize, crate::verbs::ListParts)>,
   /// `grants` reads in flight: the caller's grants live on the shards that presented their landings (a
   /// grant record is written where its landing was), so the read is a scatter-gather like a listing — by
   /// request word, the client slot, the shards still to answer, and the summaries so far.
-  pub grant_scatters: BTreeMap<u64, (u32, usize, Vec<slates_ipc::protocol::GrantSummary>)>,
+  pub(crate) grant_scatters: BTreeMap<
+    u64,
+    (
+      u32,
+      usize,
+      Vec<crate::verbs::PagePart<slates_ipc::protocol::GrantSummary>>,
+    ),
+  >,
   /// Every shard of the daemon, for the scatter.
   pub shards: Vec<u16>,
   /// What the last start's recovery found (the status reports it).
@@ -1205,6 +1212,21 @@ pub struct WorkState {
   /// version, so the work composes its increment off its green's shard (`Base::for_names`). Cleared with the base;
   /// charged with the work.
   pub entries: std::collections::BTreeMap<String, slates_merge::increment::Base>,
+  /// The work's last conflicting verdict (§4.16, A-267), kept for `Conflicts` until its next submit or rebase replaces
+  /// it, and cleared when one succeeds. Its windows are conflicts of the work's own declared operations, so their
+  /// number is bounded by the journal the merge budget charges; a restart forgets it, and a read of it is then refused
+  /// `VerdictReplaced`.
+  pub verdict: Option<KeptVerdict>,
+}
+
+/// A work's kept conflicting verdict (§4.16, A-267): its id, which the `Submitted` or `Rebased` reply named, and every
+/// window of it, in the verdict's order.
+#[derive(Clone, Debug)]
+pub struct KeptVerdict {
+  /// The verdict's id: the shard's monotonic clock when it was judged, and past the work's last.
+  pub id: u64,
+  /// Every window of the verdict.
+  pub windows: Vec<slates_ipc::protocol::MergeWindow>,
 }
 
 /// A reply waiting to be written into a client's ring.

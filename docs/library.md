@@ -211,6 +211,15 @@ nothing answers until detached) and mounts nothing (a mount is a record). The co
   once more while it runs.
 - Observation: `daemon_status`, `audit` (typed `AuditRecord`s), `grants` (typed `GrantRecord`s),
   `telemetry`.
+- Lists a page at a time: the daemon answers every list a reply at a time, so a host that shows a
+  list a screen at a time reads one `Page { items, next }` a screen and holds no more:
+  `list_page(after)` (volumes in id order), `grants_page(after)`, `audit_page(since)`,
+  `changed_since_page(green, version, from)` (what a green changed after a version, in every
+  dimension), and `drift_page(volume, from)` (an overlay's drift, typed). Pass a page's `next` back
+  to read the next one; `None` ends the list. An item that stands for the whole walk is read
+  exactly once. The whole-list verbs `list`, `grants`, `audit`, `changed_since` and `drift` walk the
+  pages for you. A status carries the first drifted entries that fit and counts the rest in
+  `DriftReport::elided`; `drift` reads every entry.
 - The chosen-path launcher (`slates_api::exec`, Linux, A-370): a volume shown at an existing directory
   for one command, in a namespace of its own, served by the host's own executable as `role::main`
   serves the roles. `exec::command(&spec, host_exe, &["slates-role".into()])` builds the command
@@ -272,6 +281,5 @@ fn workspace(folder: &std::path::Path, at: &str) -> Result<(), slates_api::Error
 
 1. The starter handed the launcher's authority on every platform.
 2. Typed fields on the wire for drift, a presentation's conflicts and a merge's versions.
-3. A paged volume listing.
-4. An async form over the host's own reactor.
-5. A typed class for a pinned snapshot's destroy, answered `Invalid::Request` today.
+3. An async form over the host's own reactor.
+4. A typed class for a pinned snapshot's destroy, answered `Invalid::Request` today.

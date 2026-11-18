@@ -338,8 +338,10 @@ pub enum Stale {
   Grant,
   /// The disk changed under these entries after the plan was made (§4.15 step 4): present again.
   Disk {
-    /// The entries, from the target's root.
+    /// The entries, from the target's root: as many as one reply holds (A-267).
     paths: Vec<String>,
+    /// Entries past what one reply holds (A-267): presenting again lists every one.
+    elided: u32,
   },
   /// A bootstrap naming another daemon start.
   Bootstrap,
@@ -352,6 +354,12 @@ pub enum Stale {
   Policy {
     /// The policy's version now.
     current: u64,
+  },
+  /// A merge's or a rebase's conflict windows were read after the work's verdict was replaced — by a later submit or
+  /// rebase of the work, or the daemon's restart (A-267): merge or rebase again for a new verdict.
+  Verdict {
+    /// The work volume.
+    work: VolumeId,
   },
 }
 
@@ -782,8 +790,15 @@ impl Error {
       Refusal::AttachmentExpired { attachment } => Error::Stale(Stale::Attachment { attachment }),
       Refusal::GrantMismatch => Error::Stale(Stale::Approval),
       Refusal::PolicyChanged { current } => Error::Stale(Stale::Policy { current }),
+      Refusal::VerdictReplaced { work } => Error::Stale(Stale::Verdict { work }),
       Refusal::GrantInvalid => Error::Stale(Stale::Grant),
-      Refusal::LandingConflict { entries } => Error::Stale(Stale::Disk { paths: entries }),
+      Refusal::LandingConflict {
+        entries,
+        entries_elided,
+      } => Error::Stale(Stale::Disk {
+        paths: entries,
+        elided: entries_elided,
+      }),
       Refusal::ConsensusBootstrapStale => Error::Stale(Stale::Bootstrap),
       Refusal::ConsensusRecoveryStale => Error::Stale(Stale::Recovery),
       Refusal::LeaseHeld { epoch } => Error::Busy(Busy::WriteLease { epoch }),
@@ -1051,6 +1066,9 @@ fn target_words(refusal: TargetRefusal) -> String {
       .to_owned(),
     TargetRefusal::DriveLetterTaken => {
       "the drive letter names another volume, on this machine or in the daemon's session".to_owned()
+    }
+    TargetRefusal::TooLong { longest } => {
+      format!("the path is longer than the {longest} bytes the daemon takes there")
     }
   }
 }
