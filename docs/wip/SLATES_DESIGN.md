@@ -6387,6 +6387,13 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   does.
 > - **An install never finishing inside an entry's budget (open).** The whole volume, sent to a candidate behind the
 >   retained tail, is resent without end (GAPS "Chaos from outside the processes").
+> - **Loss, and an owner partitioned while it runs (built 2026-11-17, goal g229; first runs owed).** A fault relay in
+>   the test (`crates/cli/tests/support/relay.rs`) owns every node's advertised ports and forwards to its bind block
+>   (A-277). It loses, holds, duplicates and reorders datagrams per path and cuts a running node off one way or both,
+>   with no privilege: T-8.7's partitions without the iptables or pf that R10 rules out. Its flows stream writes over
+>   lossy paths through a takeover, cut a running owner off, and deafen one, and also judge ReadSafety (a read through
+>   the partitioned owner never answers less than its successor acknowledged) and Continuity (the successor's first
+>   head is past every position durable under an earlier epoch) from outside the processes.
 
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
