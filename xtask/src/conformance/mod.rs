@@ -841,6 +841,8 @@ pub(crate) struct Run<'a> {
   pub(crate) os: HostOs,
   pub(crate) transport: Transport,
   pub(crate) root_available: bool,
+  /// How the cell reaches its volume: the transport's own mount, or the adapter the capability table names.
+  pub(crate) reach: slates::Reach,
   pub(crate) scratch: Scratch,
 }
 
@@ -922,6 +924,7 @@ fn run_suite_on(
     os,
     transport,
     root_available,
+    reach: slates::Reach::of(transport, suite),
     scratch: Scratch::open(options, transport)?,
   };
   let started = std::time::Instant::now();

@@ -9503,8 +9503,9 @@ may weaken an earlier phase's gates; ratchets only tighten.
 > Linux FUSE mount inside containers (`oci-linux`), and the live virtio-fs guest. Every leg sets one shared
 > environment (`slates_conformance::workload::ENVIRONMENT`), and a host determinism gate runs each of the four twice in
 > two directories a second apart and holds the runs identical, so a difference over a mount is the mount's. A script
-> that exits nonzero on both sides is a failed workload, never an identical one. Owed: the Windows WinFsp roster, and
-> a Linux FUSE leg outside a container.
+> that exits nonzero on both sides is a failed workload, never an identical one. Since A-293 the Linux lane runs the
+> roster over the daemon's own FUSE mount (`slates mount`, unprivileged), the route an agent's tools take, rather than
+> through the root NFS adapter. Owed: the Windows WinFsp roster.
 
 > **Editor workload correction (2026-09-17).** The host and mount must execute the same save
 > behavior even when their paths select different tool defaults. The Vim roster explicitly
@@ -20701,3 +20702,27 @@ judged by `fails_the_suite`), `crates/server/tests/virtiofs.rs` (the guest's env
   unsupported), so a local clone copies there while NTFS links, and a git repository's symbolic-link probe needs
   WinFsp reparse points, which the drive does not serve yet. A Linux FUSE leg outside a container (the native Linux
   lane reaches the daemon through the NFS adapter). The runs over each mount are the supervisor's (CLAUDE.md §8).
+
+### A-293 — The Linux lane runs the workload roster over the daemon's own FUSE mount (accepted 2026-11-17, Ada's goal of 2026-11-18: git, Mercurial and Subversion on every route, Linux FUSE among them)
+Applied in the same change to: Part 6's "Real workloads" status, GAPS, `docs/wip/conformance.md` (§4's Linux row),
+`crates/conformance/src/capability.rs` (the cell; `LINUX_NFS_ADAPTER` public), `xtask/src/conformance/slates.rs`
+(`Reach`, the FUSE mount), `mod.rs` (`Run::reach`), `bench.rs` and `live_fleet.rs` (their reach named), and the
+`conformance` job's comment in CI.
+- **The decision.** The native Linux transport is FUSE, and an agent's git, Mercurial and Subversion reach a volume
+  on Linux through `slates mount`, the daemon's own FUSE mount. The roster ran there only inside containers
+  (`oci-linux`); the native Linux lane ran it through a root `mount -t nfs` of the loopback export, an adapter
+  recorded LIMITED. The roster needs no root, and a user's processes reach the user's own FUSE mount without
+  `allow_other`, so its cell (`native-linux-fuse` × workloads) now names neither root nor an adapter: tools
+  `fusermount3` and `sh`, recorded RAN. The other suites keep the adapter (pjdfstest's root cases need `allow_other`,
+  the hermeticity tracer strips `fusermount3`'s setuid unless it runs as root), and over the FUSE mount they run in
+  the container lane.
+- **How a cell reaches its volume is the table's.** `Reach::of(transport, suite)` reads the cell's adapter from the
+  capability table, and `mount_volume` mounts by it: the transport's own mount, or the Linux NFS adapter. A run that
+  measures a mount of its own names its reach outright: the NFS bench measures NFSv3 beside NFSv4.2 (it asks for root
+  itself rather than borrow the workloads cell, whose reach is now FUSE), and the A-200 live-ship test keeps the soft
+  NFS mount it is about. `the_linux_nfs_adapter_is_the_only_adapter` holds every adapter the table names to the one
+  the harness can mount.
+- **Evidence.** `the_workloads_cell_reaches_linux_fuse_through_the_daemons_own_mount` opens the cell's session as
+  `conformance run --suite workloads` does, as a user with no root, and holds the kernel's mount table to a FUSE
+  mount and a file's second name to two links (gated on a built CLI, run in CI's Linux conformance step). The roster's
+  runs over the mount are the supervisor's (CLAUDE.md §8).

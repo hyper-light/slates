@@ -16,15 +16,16 @@
 > `fncache` written in a different order by each process (a Python set; now one hash seed), and a clone's reflog and
 > `undo.desc` naming its source by absolute path (now excluded with the reason). **Closed in the same change:** a
 > workload whose script failed alike on both sides was recorded `Identical` (`compare` asked only that the exit codes
-> be equal, while Part 6 asks them 0); it is now `Failed` on every leg, red-checked first. Subversion was absent from every
-> machine this change could use, so its workload runs first in CI. Locks: every leg runs a workload's two sides under
-> one kernel, whose own locks bind SQLite's, FSFS's and Mercurial's; served locks matter only between kernels.
+> be equal, while Part 6 asks them 0); it is now `Failed` on every leg, red-checked first. Subversion was absent from
+> every machine this change could use, so its workload runs first in CI. Locks: every leg runs a workload's two sides
+> under one kernel, whose own locks bind SQLite's, FSFS's and Mercurial's; served locks matter only between kernels.
 > **Open:** (1) the runs over each mount, which are the supervisor's (CLAUDE.md §8): any difference they find is a gap
 > to fix failing-test-first; (2) the Windows WinFsp roster: WinFsp's driver has no hard links (winfsp.dev's NTFS
 > compatibility page), so Mercurial and git copy where NTFS links, and git's symbolic-link probe needs reparse points,
-> which the drive does not serve yet; (3) a Linux FUSE leg outside a container; (4) git's fsmonitor (a daemon that
-> refuses network mounts by default) and submodules (their configuration names the source by absolute path) are not in
-> the roster.
+> which the drive does not serve yet; (3) ~~a Linux FUSE leg outside a container~~ **closed 2026-11-17 (A-293)**: the
+> native Linux lane runs the roster over the daemon's own FUSE mount, unprivileged, recorded RAN; (4) git's fsmonitor
+> (a daemon that refuses network mounts by default) and submodules (their configuration names the source by absolute
+> path) are not in the roster.
 
 > **The dirty-page test's precondition, proved each attempt (2026-11-09, A-248).**
 > `a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path` failed intermittently ("the sync says so:
