@@ -329,13 +329,24 @@ pub(crate) fn settle_green_retention_leaving(
 ) -> Result<(), u64> {
   let floor = reachable_floor(state, green);
   let budget = rejected_cache_budget(state);
+  let replicated = crate::green_replicas::has_replicas(state, green);
   let Some(engine) = state.greens.get_mut(&green) else {
     return Ok(());
   };
   // Oldest-first, only as far as the retention budget needs (the same derived cap the rejected
   // cache is bounded by: one merge byte bound per green) with `room` to spare, never past a live reader's version.
-  engine.fold_history_to_budget(floor, budget.saturating_sub(room));
+  // A green with replicas takes the fold's message for them (A-457, A-273 step 5a) and holds what it keeps for them to
+  // the room this budget leaves beyond its own retention.
+  let fold = if replicated {
+    let (_, fold) = engine.fold_to_budget_and_feed(floor, budget.saturating_sub(room));
+    crate::green_replicas::hold_within(engine, budget);
+    fold
+  } else {
+    engine.fold_history_to_budget(floor, budget.saturating_sub(room));
+    None
+  };
   let wanted = u64::try_from(engine.retention_charge()).unwrap_or(u64::MAX);
+  crate::green_replicas::feed_fold(state, green, fold);
   let charged = state.green_retention.get(&green).copied().unwrap_or(0);
   if wanted > charged {
     // Capacity is claimed as it is needed (A-98), and a green's works, which claim it by their charges, live on other
@@ -1325,7 +1336,8 @@ pub(crate) fn destroy_merge_volume(
     let _ = settle_green_retention(state, work.green);
   }
   crate::verbs::release_origin_snapshot(state, held.as_ref());
-  if state.greens.remove(&id).is_some() {
+  // Its engine is given up once every replica of it has left (A-457, A-273 step 5a).
+  if crate::green_replicas::give_up(state, id) {
     state.merge.attachments.retain(|_, pin| pin.green != id);
     release_green_retention(state, id);
     // Nothing of a destroyed green is left to place: its owner-side placement state goes with it, so the

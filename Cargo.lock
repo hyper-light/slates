@@ -1341,12 +1341,15 @@ dependencies = [
 name = "slates-base"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
  "blake3",
  "libc",
+ "proptest",
  "rustix",
  "slates-bridge-oci",
  "slates-machine",
  "slates-mem",
+ "slates-test-seeds",
  "slates-vfs",
  "windows-sys 0.60.2",
 ]

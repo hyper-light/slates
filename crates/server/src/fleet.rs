@@ -6265,20 +6265,7 @@ async fn make_in_turns(making: MakeTaken, source: Source) -> Result<(), &'static
     },
   };
   if !made {
-    let restored = match archive.as_ref() {
-      Some(archive) => Some(restore_in_turns((object, id), &catalog, archive).await?),
-      None => None,
-    };
-    drop(archive);
-    futures::yield_now().await;
-    making_turn(object, |s| {
-      let taken = taken_over();
-      past_the_pressure_hold(s, |s| verbs::begin_making(s, id, &taken))
-        .map_err(|refusal| materialize_refusal_counter(&refusal))
-    })??;
-    if let Some(restored) = restored.as_ref() {
-      populate_in_turns(object, id, restored).await?;
-    }
+    restore_and_begin((object, id), &catalog, archive, &taken_over()).await?;
   }
   futures::yield_now().await;
   making_turn(object, |s| {
@@ -6304,6 +6291,31 @@ async fn make_in_turns(making: MakeTaken, source: Source) -> Result<(), &'static
     }
     Ok(())
   })?
+}
+
+/// The making of a taken-over volume not made here yet ([`make_in_turns`]): its archive, when there is one, restored a
+/// slice a turn; the volume begun under `taken`; then the restored tree laid in a slice a turn. The archive is let go
+/// once restored, before the volume is begun.
+async fn restore_and_begin(
+  (object, id): (ObjectId, DbVolumeId),
+  catalog: &crate::catalog::CatalogValue,
+  archive: Option<Archive>,
+  taken: &verbs::TakenOver<'_>,
+) -> Result<(), &'static str> {
+  let restored = match archive.as_ref() {
+    Some(archive) => Some(restore_in_turns((object, id), catalog, archive).await?),
+    None => None,
+  };
+  drop(archive);
+  futures::yield_now().await;
+  making_turn(object, |s| {
+    past_the_pressure_hold(s, |s| verbs::begin_making(s, id, taken))
+      .map_err(|refusal| materialize_refusal_counter(&refusal))
+  })??;
+  if let Some(restored) = restored.as_ref() {
+    populate_in_turns(object, id, restored).await?;
+  }
+  Ok(())
 }
 
 /// A live log's rebuild on its owner shard, its payloads opened and applied a slice a turn, each held to the turn's
@@ -9851,7 +9863,7 @@ fn install_slice(s: &mut ShardState, local: HostId, version: u64) -> bool {
 /// its resumed stale self `StaleEpoch`), then the object moved to the successor its lineage ranks or let go as stale
 /// (`takeover::resolve_held_object`), then its authority moved to the owner its route names at `generation`
 /// ([`reconcile_held_copy`]).
-fn install_on_copy(
+pub(crate) fn install_on_copy(
   s: &mut ShardState,
   local: HostId,
   (regional, retired): (

@@ -1087,7 +1087,13 @@ fn stop_through_the_protocol(child: &str, tag: &str) -> (Stopping, Duration, Sta
   supervisor.request_stop(clock.monotonic_ns()).unwrap();
   while asked.elapsed() < Duration::from_millis(CHILD_WAIT_MS) {
     match supervisor
-      .stop_step(clock.monotonic_ns(), STOP_LIVENESS_MS * 1_000_000)
+      .stop_step(
+        clock.monotonic_ns(),
+        slates_anchor::StopBounds {
+          lapse_ns: STOP_LIVENESS_MS * 1_000_000,
+          window_ns: STOP_LIVENESS_MS * 1_000_000,
+        },
+      )
       .unwrap()
     {
       Stopping::Draining => {
@@ -1124,7 +1130,7 @@ fn a_graceful_stop_waits_for_the_daemon_to_drain_and_exit_without_a_kill() {
 }
 
 /// A daemon that never acknowledges the stop request (an older daemon, a loop no longer polling) is killed
-/// once the liveness budget has passed since the request — never before it.
+/// once it has beaten the window past the request, judged by its own beating (A-461) — never before it.
 #[test]
 fn a_daemon_that_never_acknowledges_a_stop_is_killed_after_the_liveness_budget() {
   let (outcome, took, state) = stop_through_the_protocol("deaf_stopping_child", "sa-stop-d");

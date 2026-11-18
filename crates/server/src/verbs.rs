@@ -8372,13 +8372,21 @@ fn build_increment(
   sealed: &crate::work_home::SealedWork,
   evidence: Vec<[u8; 32]>,
 ) -> Result<(DbVolumeId, slates_merge::engine::Increment), Refusal> {
+  build_increment_on(state.greens.get(&sealed.green), sealed, evidence)
+}
+
+/// [`build_increment`] over `engine`, the green's engine wherever it is held: its owner's, or a replica of it on the
+/// work's shard (A-465), which composes the same increment from the same state.
+fn build_increment_on(
+  engine: Option<&slates_merge::engine::Green>,
+  sealed: &crate::work_home::SealedWork,
+  evidence: Vec<[u8; 32]>,
+) -> Result<(DbVolumeId, slates_merge::engine::Increment), Refusal> {
   let green_id = sealed.green;
   let base_version = sealed.base_version;
   // The green is gone (destroyed), or the work's base is past the head it holds: the base names a
   // version this green does not have (§4.16 failure matrix, `UnknownBase`).
-  let engine = state
-    .greens
-    .get(&green_id)
+  let engine = engine
     .filter(|engine| base_version <= engine.head())
     .ok_or(Refusal::UnknownBase {
       green: to_wire_volume(green_id),
@@ -9159,6 +9167,9 @@ fn judge_submission(
   // Make room first: fold whatever the retention budget allows, leaving room for what is secured (never a live
   // reader's version).
   let room = usize::try_from(secured).unwrap_or(usize::MAX);
+  // The green's replicas on the node's other shards are made before its first change (A-457, A-273 step 5a), so the
+  // settle's fold and the verdict's version below are fed to them.
+  crate::green_replicas::ensure(state, green_id);
   if let Err(available) =
     crate::merge_service::settle_green_retention_leaving(state, green_id, room)
   {
@@ -9214,6 +9225,15 @@ fn judge_submission(
       ) {
         return refused(refusal);
       }
+      // The version goes to the green's replicas (A-457, A-273 step 5a) before anything else changes the green: a change
+      // left unfed would evict them all at the next.
+      crate::green_replicas::feed_version(
+        state,
+        green_id,
+        (version, &inc),
+        applied,
+        crate::signed_work::to_entry(&signed.verification),
+      );
       // The version's merge record, issued only once its inputs — the increment just appended — are
       // placed (§4.16 "Commit"; at `f = 0` the append is the placement).
       let completion = crate::merge_service::SubmitCompletion::of_current(state, sealed.work);
@@ -9404,12 +9424,21 @@ fn map_rebase(
   state: &mut ShardState,
   sealed: &crate::work_home::SealedWork,
 ) -> crate::work_home::RebaseAnswer {
+  rebase_on(state.greens.get_mut(&sealed.green), sealed)
+}
+
+/// [`map_rebase`] over `engine`, the green's engine wherever it is held: its owner's, or a replica of it on the work's
+/// shard (A-465), whose answer is the owner's for the same state, since it is computed by this same function.
+pub(crate) fn rebase_on(
+  engine: Option<&mut slates_merge::engine::Green>,
+  sealed: &crate::work_home::SealedWork,
+) -> crate::work_home::RebaseAnswer {
   use crate::work_home::RebaseAnswer;
-  let (green_id, inc) = match build_increment(state, sealed, Vec::new()) {
+  let (green_id, inc) = match build_increment_on(engine.as_deref(), sealed, Vec::new()) {
     Ok(built) => built,
     Err(refusal) => return RebaseAnswer::Reply(refused(refusal)),
   };
-  let Some(engine) = state.greens.get_mut(&green_id) else {
+  let Some(engine) = engine else {
     return RebaseAnswer::Reply(refused(Refusal::NotFound));
   };
   match engine.rebase(&inc) {
@@ -9565,8 +9594,18 @@ pub(crate) fn owner_files(
   version: u64,
   paths: &[String],
 ) -> crate::work_files::FetchedBase {
+  base_files(state.greens.get(&green), version, paths)
+}
+
+/// [`owner_files`] over `engine`, the green's engine wherever it is held: its owner's, or a replica of it on the
+/// work's shard (A-465).
+pub(crate) fn base_files(
+  engine: Option<&slates_merge::engine::Green>,
+  version: u64,
+  paths: &[String],
+) -> crate::work_files::FetchedBase {
   let mut fetched = crate::work_files::FetchedBase::default();
-  let Some(engine) = state.greens.get(&green) else {
+  let Some(engine) = engine else {
     fetched.gone = true;
     return fetched;
   };
@@ -9589,10 +9628,21 @@ pub(crate) fn owner_page(
   green: DbVolumeId,
   version: u64,
   path: String,
+  range: (u64, u64),
+) -> crate::work_files::FetchedBase {
+  base_page(state.greens.get(&green), version, path, range)
+}
+
+/// [`owner_page`] over `engine`, the green's engine wherever it is held: its owner's, or a replica of it on the work's
+/// shard (A-465).
+pub(crate) fn base_page(
+  engine: Option<&slates_merge::engine::Green>,
+  version: u64,
+  path: String,
   (offset, want): (u64, u64),
 ) -> crate::work_files::FetchedBase {
   let mut fetched = crate::work_files::FetchedBase::default();
-  let Some(engine) = state.greens.get(&green) else {
+  let Some(engine) = engine else {
     fetched.gone = true;
     return fetched;
   };
@@ -9611,8 +9661,17 @@ pub(crate) fn owner_sizes(
   green: DbVolumeId,
   version: u64,
 ) -> crate::work_files::FetchedBase {
+  base_sizes(state.greens.get(&green), version)
+}
+
+/// [`owner_sizes`] over `engine`, the green's engine wherever it is held: its owner's, or a replica of it on the work's
+/// shard (A-465).
+pub(crate) fn base_sizes(
+  engine: Option<&slates_merge::engine::Green>,
+  version: u64,
+) -> crate::work_files::FetchedBase {
   let mut fetched = crate::work_files::FetchedBase::default();
-  let Some(engine) = state.greens.get(&green) else {
+  let Some(engine) = engine else {
     fetched.gone = true;
     return fetched;
   };
@@ -10338,24 +10397,7 @@ fn attach(
     Ok(epoch) => epoch,
     Err(refusal) => return refused(refusal),
   };
-  let (db_form, established, mut capability) = match binding {
-    None => (
-      AttachForm::Root,
-      Established::Record,
-      crate::transports::root(&situation),
-    ),
-    Some(binding) => (
-      AttachForm::Oci {
-        source: binding.entry.source.clone(),
-        destination: binding.entry.destination.clone(),
-        read_only: binding.entry.read_only,
-      },
-      Established::OciBind {
-        binding: Box::new(binding.entry),
-      },
-      crate::transports::oci(&situation),
-    ),
-  };
+  let (db_form, established, mut capability) = established_form(binding, &situation);
   let attachment = next_attachment_id(state);
   let termed = matches!(consumer, Consumer::Termed { .. });
   let token = match capability_token(borrows_mount) {
@@ -10400,6 +10442,36 @@ fn attach(
     established,
     capability,
     token: (!borrows_mount).then_some(token),
+  }
+}
+
+/// What an attachment records and reports of its establishment: the record form when nothing was bound, or the OCI
+/// bind `binding` made, each with its transport's capability report in `situation`.
+fn established_form(
+  binding: Option<crate::oci::Binding>,
+  situation: &crate::transports::Situation,
+) -> (
+  AttachForm,
+  Established,
+  slates_ipc::protocol::AttachmentCapability,
+) {
+  match binding {
+    None => (
+      AttachForm::Root,
+      Established::Record,
+      crate::transports::root(situation),
+    ),
+    Some(binding) => (
+      AttachForm::Oci {
+        source: binding.entry.source.clone(),
+        destination: binding.entry.destination.clone(),
+        read_only: binding.entry.read_only,
+      },
+      Established::OciBind {
+        binding: Box::new(binding.entry),
+      },
+      crate::transports::oci(situation),
+    ),
   }
 }
 
@@ -11881,8 +11953,17 @@ pub(crate) fn reconcile_unpublished_effects(state: &mut ShardState) -> usize {
     state.by_id.remove(id);
     crate::live_ship::forget(state, *id);
   }
+  // A green whose record went with the rollback is given up once every replica of it has left (A-457, A-273 step 5a).
+  let gone: Vec<DbVolumeId> = state
+    .greens
+    .keys()
+    .copied()
+    .filter(|id| state.db.partition().volume(*id).is_none())
+    .collect();
+  for id in gone {
+    crate::green_replicas::give_up(state, id);
+  }
   let partition = state.db.partition();
-  state.greens.retain(|id, _| partition.volume(*id).is_some());
   let mut released = 0u64;
   state.works.retain(|id, work| {
     let keep = partition.volume(*id).is_some();
@@ -12918,6 +12999,8 @@ pub(crate) fn adopt_taken_over_green(
     ..
   } = adopted;
   engine.set_rejected_budget(crate::merge_service::rejected_cache_budget(state));
+  // An engine installed before under the id is given up once every replica of it has left (A-457, A-273 step 5a).
+  crate::green_replicas::give_up(state, id);
   state.greens.insert(id, engine);
   // The adopted replica holds every history in full; it is folded oldest-first to the budget and its retention charged,
   // as a recovered green's is (`install_green`). A retention the budget cannot hold fences the green.
@@ -15938,6 +16021,8 @@ fn install_green(
       return Vec::new();
     }
   };
+  // An engine installed before under the id is given up once every replica of it has left (A-457, A-273 step 5a).
+  crate::green_replicas::give_up(state, record.id);
   state.greens.insert(record.id, green);
   // The replay rebuilt every history in full; fold it oldest-first back to the budget and re-take the retention the
   // remaining histories hold, ahead of new claims (§4.2 recovery order). The works are rebuilt after their greens,
@@ -16296,7 +16381,8 @@ fn fence_green(
   record: &VolumeRecord,
   fence: crate::merge_service::GreenFence,
 ) {
-  state.greens.remove(&record.id);
+  // Its engine is given up once every replica of it has left (A-457, A-273 step 5a).
+  crate::green_replicas::give_up(state, record.id);
   crate::merge_service::release_green_retention(state, record.id);
   state.fenced_greens.insert(record.id, fence);
   state.count(GREEN_FENCED, 1);
@@ -17114,6 +17200,13 @@ enum Streamed {
   Refused(slates_vfs::VfsError),
 }
 
+/// The volumes a checkpoint leaves out by name: those it could not capture, each with why, and those whose committed
+/// record it carries in their place (A-430).
+type LeftOutVolumes<'a> = (
+  &'a [(DbVolumeId, slates_vfs::VfsError)],
+  &'a [(DbVolumeId, slates_vfs::recover::VolumeImage)],
+);
+
 /// One attempt at [`publish_checkpoint`]: the shard image streamed straight into the content object's free slot, each
 /// volume encoded as it is captured, leaving out the volumes being destroyed and those in `skipped`. The checkpoint was
 /// first held whole (every one left its own size in the daemon's footprint: 270 MB after 50,000 macOS files whose
@@ -17122,10 +17215,7 @@ enum Streamed {
 fn stream_checkpoint(
   state: &mut ShardState,
   handles: &[Handle<VolumeSlot>],
-  (skipped, carried): (
-    &[(DbVolumeId, slates_vfs::VfsError)],
-    &[(DbVolumeId, slates_vfs::recover::VolumeImage)],
-  ),
+  (skipped, carried): LeftOutVolumes<'_>,
   held: &mut Vec<slates_vfs::recover::HeldPiece>,
   (replies, calls, nfs_replies, nfs_states): (
     &mut Vec<slates_vfs::recover::HeldReply>,
@@ -17269,23 +17359,36 @@ fn capture_live_record(state: &mut ShardState, id: DbVolumeId, record: Option<&[
   }
 }
 
-/// [`publish_delta`] into `encoded`.
-fn publish_delta_into(
+/// What a delta's pass over its volumes gathered ([`encode_changed_volumes`]).
+struct DeltaVolumes {
+  /// The volumes whose publication the delta records, marked published once it commits.
+  recorded: Vec<Handle<VolumeSlot>>,
+  /// The keys whose record the shard holds once the delta commits: recorded, clean, or skipped with a committed one.
+  present: std::collections::BTreeSet<[u8; 16]>,
+  /// How many volume records the delta holds.
+  count: usize,
+}
+
+/// Encodes into `encoded`, in key order (the order a shard delta holds its volumes in: `ShardDelta::new` sorts by key),
+/// each changed volume's publication. A volume being destroyed is named in `published.destroying`; a clean one stays
+/// present unencoded; one whose publication cannot be encoded is counted, named in `published.skipped`, and keeps its
+/// committed record.
+fn encode_changed_volumes(
   state: &mut ShardState,
   encoded: &mut Vec<u8>,
-) -> Result<Published, slates_vfs::VfsError> {
-  let mut recorded = Vec::new();
-  let mut present = std::collections::BTreeSet::new();
-  let mut published = Published::default();
-  // In key order, the order a shard delta holds its volumes in (`ShardDelta::new` sorts by key).
+  published: &mut Published,
+) -> Result<DeltaVolumes, slates_vfs::VfsError> {
+  let mut volumes = DeltaVolumes {
+    recorded: Vec::new(),
+    present: std::collections::BTreeSet::new(),
+    count: 0,
+  };
   let mut keyed: Vec<_> = state
     .volumes
     .iter()
     .map(|(handle, slot)| (slot.id.bytes, handle))
     .collect();
   keyed.sort_by_key(|(key, _)| *key);
-  let count_at = slates_vfs::checkpoint_log::ShardDelta::encode_start(encoded);
-  let mut count = 0usize;
   for (_, handle) in &keyed {
     let slot = state.volumes.get_mut(*handle)?;
     let id = slot.id;
@@ -17294,7 +17397,7 @@ fn publish_delta_into(
       continue;
     }
     if slot.volume.is_clean(&state.store) {
-      present.insert(id.bytes);
+      volumes.present.insert(id.bytes);
       published.volumes.push(id);
       continue;
     }
@@ -17306,10 +17409,10 @@ fn publish_delta_into(
       encoded,
     ) {
       Ok(()) => {
-        present.insert(id.bytes);
+        volumes.present.insert(id.bytes);
         published.volumes.push(id);
-        recorded.push(*handle);
-        count = count.saturating_add(1);
+        volumes.recorded.push(*handle);
+        volumes.count = volumes.count.saturating_add(1);
         capture_live_record(
           state,
           id,
@@ -17322,11 +17425,26 @@ fn publish_delta_into(
         published.skipped.push(id);
         // A skipped volume keeps its committed record, so it stays present.
         if state.published_keys.contains(&id.bytes) {
-          present.insert(id.bytes);
+          volumes.present.insert(id.bytes);
         }
       }
     }
   }
+  Ok(volumes)
+}
+
+/// [`publish_delta`] into `encoded`.
+fn publish_delta_into(
+  state: &mut ShardState,
+  encoded: &mut Vec<u8>,
+) -> Result<Published, slates_vfs::VfsError> {
+  let mut published = Published::default();
+  let count_at = slates_vfs::checkpoint_log::ShardDelta::encode_start(encoded);
+  let DeltaVolumes {
+    recorded,
+    present,
+    count,
+  } = encode_changed_volumes(state, encoded, &mut published)?;
   let mut removed: Vec<[u8; 16]> = state
     .published_keys
     .iter()
@@ -19618,13 +19736,21 @@ mod tests {
     slot.volume.to_image(&state.store, None).unwrap()
   }
 
-  /// The shard image committed in the shard's checkpoint slots. The image a recovery would rebuild for `volume` from
-  /// the shard's journal as it stands, the committed checkpoint and its deltas folded by `Journal::recover`; `None`
-  /// when the journal holds no such volume.
+  /// The image a recovery would rebuild for `volume` from the shard's journal as it stands ([`recovered_volumes`]);
+  /// `None` when the journal holds no such volume.
   fn recovered_record(
     state: &crate::state::ShardState,
     volume: super::DbVolumeId,
   ) -> Option<slates_vfs::recover::VolumeImage> {
+    recovered_volumes(state)
+      .into_iter()
+      .find(|keyed| keyed.key == volume.bytes)
+      .map(|keyed| keyed.image)
+  }
+
+  /// Every volume a recovery would rebuild from the shard's journal as it stands, the committed checkpoint and its
+  /// deltas folded by `Journal::recover`; none when nothing ever committed.
+  fn recovered_volumes(state: &crate::state::ShardState) -> Vec<slates_vfs::recover::KeyedImage> {
     let object = state.content.as_ref().unwrap();
     let (images, deltas) = (state.content_range, state.delta_range);
     let (image, _) = slates_vfs::checkpoint_log::Journal::recover(
@@ -19640,13 +19766,10 @@ mod tests {
       },
     )
     .unwrap();
-    image?
-      .volumes
-      .into_iter()
-      .find(|keyed| keyed.key == volume.bytes)
-      .map(|keyed| keyed.image)
+    image.map_or_else(Vec::new, |image| image.volumes)
   }
 
+  /// The shard image committed in the shard's checkpoint slots.
   fn committed_image(state: &mut crate::state::ShardState) -> super::ShardImage {
     let (start, end) = state.content_range;
     let slots = super::ContentSlots {

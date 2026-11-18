@@ -455,23 +455,15 @@ fn map_and_store(
   (node, window, held)
 }
 
-/// After the resync: `other` reads the file through its own stream, where the dead daemon's guest's unsynced store must
-/// be (the successor ingested it before serving); `mapping` asks for the file's descriptor again and is given the very
-/// object it maps (a store through the old window reads back through a map of the new descriptor); and `other`'s write
-/// reaches the old window (the adopted backing takes every change again).
-fn kept_and_coherent(
-  daemon: &Daemon,
-  mapping: &mut Guest,
-  other: &mut Guest,
-  (node, window): (u64, &Window),
-) {
+/// The successor took the mapped object back (`shards.dax_adopted`) and ingested the guest's stores into it
+/// (`shards.dax_ingested`). The resynced stream's ingest runs before that stream serves anything; another stream's turns
+/// may come between its slices, so the count is waited for.
+fn assert_taken_back_and_ingested(daemon: &Daemon) {
   assert_eq!(
     counted(daemon, "shards.dax_adopted", 1),
     1,
     "the object is taken back"
   );
-  // The resynced stream's ingest of the guest's stores runs before that stream serves anything; another stream's turns
-  // may come between its slices, so the read waits for the ingest to have written.
   let ingested = counted(daemon, "shards.dax_ingested", 1);
   let ledger: Vec<(&str, u64)> = daemon
     .refusals_on_every_shard()
@@ -483,6 +475,19 @@ fn kept_and_coherent(
     ingested >= 1,
     "the adopted object's stores were ingested; the successor's ledger: {ledger:?}"
   );
+}
+
+/// After the resync: `other` reads the file through its own stream, where the dead daemon's guest's unsynced store must
+/// be (the successor ingested it before serving); `mapping` asks for the file's descriptor again and is given the very
+/// object it maps (a store through the old window reads back through a map of the new descriptor); and `other`'s write
+/// reaches the old window (the adopted backing takes every change again).
+fn kept_and_coherent(
+  daemon: &Daemon,
+  mapping: &mut Guest,
+  other: &mut Guest,
+  (node, window): (u64, &Window),
+) {
+  assert_taken_back_and_ingested(daemon);
   let (errno, body) = other.ask(LOOKUP, 1, b"mapped\0");
   assert_eq!(errno, 0);
   assert_eq!(u64::from_le_bytes(body[0..8].try_into().unwrap()), node);

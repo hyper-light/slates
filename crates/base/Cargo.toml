@@ -10,6 +10,9 @@ publish = false
 [dependencies]
 slates-machine = { workspace = true }
 slates-vfs = { workspace = true }
+# SHA-256 and HMAC-SHA256 for an S3 base's request signing (A-464, AWS Signature Version 4): the workspace's one
+# cryptographic library, which the base's TLS (rustls over aws-lc-rs, as the transport) will use too.
+aws-lc-rs = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }
@@ -22,6 +25,9 @@ slates-bridge-oci = { workspace = true }
 
 [dev-dependencies]
 slates-mem = { workspace = true }
+# The S3 listing reader's hostile-input properties (A-464): any truncation refused, any bytes never a panic.
+proptest = { workspace = true }
+slates-test-seeds = { workspace = true }
 # The differential's other leg for the clean-file digest (§4.15): the standard library's bytes hashed here.
 blake3 = { workspace = true }
 

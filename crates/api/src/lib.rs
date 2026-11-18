@@ -225,9 +225,12 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 40: [`Instance::import_archive`], a volume made from an archive a volume of the caller's holds as [`ARCHIVE_FILE`]
 /// ([`ArchiveImported`]), and its refusal by kind, [`Invalid::Archive`] naming an [`ArchiveFault`] (Mantle's
 /// CP-T10.4, A-453; the same day).
+/// 41: a landing carries a file whose mode or Windows attribute bits alone changed (A-458): [`PlannedAction::Chmod`]
+/// names such an entry with the mode and bits it had, and [`ActionTally::chmod`] counts them; until then such a change
+/// was planned as a replacement the verdict passed by, and it never landed (the same day).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 40;
+pub const CONTRACT: u32 = 41;
 
 /// What a rewitness did (§4.15 `rewitness`): the paths one reply holds and the count of the rest (A-267).
 pub use slates_client::Rewitnessed;
@@ -248,10 +251,10 @@ pub use slates_ipc::protocol::{
 /// The rendezvous's and the channel's own typed refusals the contract carries.
 pub use slates_ipc::{DeliveryFault, error::RouteRefusal};
 
-/// The client's deadlines as the product derives them (§4.7 "Failure matrix"; `Deadlines::derive`): a reply is waited
-/// for as long as the anchor waits for the daemon's heartbeat before it questions the daemon's liveness, and a
-/// reconnect is tried for the recovery budget a restart is bounded by. Every client this crate makes uses them, as the
-/// CLI's do.
+/// The client's deadlines as the product derives them (§4.7 "Failure matrix"; `Deadlines::derive`): a wait that cannot
+/// see the daemon's departure asks after the daemon's liveness as often as the anchor waits for the daemon's heartbeat
+/// (a synchronous call's reply is waited for until it comes or the daemon's process ends, A-456), and a reconnect is
+/// tried for the recovery budget a restart is bounded by. Every client this crate makes uses them, as the CLI's do.
 pub fn deadlines() -> Deadlines {
   Deadlines::derive(
     slates_server::daemon::LIVENESS_BUDGET_NS,

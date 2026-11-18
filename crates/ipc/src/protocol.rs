@@ -3205,6 +3205,8 @@ pub struct ActionTally {
   pub symlink: u64,
   /// Directories emptied and kept.
   pub clear: u64,
+  /// Files whose mode or Windows attribute bits alone are set, their bytes kept (A-458). Appended.
+  pub chmod: u64,
 }
 
 /// One entry of a presented landing's manifest (§4.15 step 2, "the full entry list on demand"): what the landing would
@@ -3252,6 +3254,16 @@ pub enum PlannedAction {
   },
   /// A directory the disk had, emptied of everything beneath it and kept (the volume removed it and made it again).
   Clear,
+  /// A file the disk had whose bytes the landing keeps and whose mode or Windows attribute bits it sets (A-458): the
+  /// entry's `mode` is the mode it lands with, beside what it had. Appended.
+  Chmod {
+    /// The permission bits it had (`0o7777` of its mode).
+    permissions_was: u32,
+    /// The Windows attribute bits it had (A-262, at Windows' values; none on Linux and macOS).
+    windows_was: u16,
+    /// The Windows attribute bits it lands with.
+    windows: u16,
+  },
 }
 
 /// A conflict class of §4.15 step 4's verdict table: why a landing would refuse an entry.
