@@ -14645,6 +14645,19 @@ fn reconcile_lost(state: &mut ShardState, record: &VolumeRecord) -> (usize, usiz
       if crate::held_copy::keeps(&state.inherited_copies, a.id) {
         return false;
       }
+      // A Shards stream whose resync end the anchor held is kept, and served again on a fresh stream its device is handed
+      // over that end (A-316); any other dies with the process, as before.
+      #[cfg(target_os = "linux")]
+      if matches!(a.form, AttachForm::ShardsFs { .. })
+        && let Some(at) = state
+          .inherited_fuse
+          .iter()
+          .position(|held| held.attachment == a.id)
+      {
+        let held = state.inherited_fuse.swap_remove(at);
+        state.adopt_shards.push(((**a).clone(), held));
+        return false;
+      }
       #[cfg(windows)]
       if matches!(a.form, AttachForm::WinFspMount { .. })
         && let Some(at) = state
