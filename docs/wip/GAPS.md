@@ -3128,15 +3128,14 @@
 >     request at 0.47 to 1.33 ms, the Mac Studio, 50 ms think mean). **Owed, measurement (the supervisor's):** the
 >     rung under the set rule (`--tree <linux-v7.4-rc1>/fs`) at think means of 200, 100, 50 and 20 ms.
 >
->     **The harness's workers park instead of spinning (2026-11-18, g083, A-421).** Each worker spun for its whole
->     level, a core each taken from the daemon it measured; on the loaded Mac Studio its sweeps took 25 to 127 ms and
->     held 6.9 clients on average against 2.2 in flight. A worker now sweeps on for the daemon's published spin window
->     after its last reply or send, then arms every connection with a request in flight and parks on their completions
->     until a reply or its next deadline, waking early by the spin window and its parks' measured lateness. The
->     `harness` row counts the parks. Unit tests: a worker parked with its request in flight is woken by the reply, and
->     with nothing in flight meets its deadline. **Owed, measurement (the supervisor's):** the A/B of main's spinning
->     harness against the parking one at the same daemon (`held`, `max_sweep_ns`, every kind's `latency` and `floor`
->     p99).
+>     **The harness's workers parking between replies: measured and rejected (2026-11-18, g083, A-421).** Each worker
+>     spins for its whole level, a core each taken from the daemon it measures. A-421 had a worker park on its
+>     connections' completions between replies and sends; the supervisor's A/B (run r155, the Mac Studio, `fs/`, 1,000
+>     clients, load 6 to 27) found the longest sweep shorter in 1 pair of 6, no client held either way, and the p99 worse
+>     once the box was loaded (an edit's 26.9 ms against 8.6 ms at load 25 to 28), so the parking was taken back out the
+>     same day and its lint fixes kept (BENCHMARKS, "A load-test worker that parks between replies"). The same runs
+>     show the goals' remaining gap: every edit and submit p99 under 1 ms at the lightest load but one run, 3 to 35 ms
+>     from load 11 to 28.
 >
 >     **Owed, measurement (the supervisor's):** the 1,000-client rung on main with W1 (A-247 step one, landed
 >     2026-11-17) against main before it (02c6469e5). Each think mean runs as its own invocation with a fresh daemon,
@@ -3703,7 +3702,9 @@
 >   owner shard would make `moves::seal_adopted` idempotent. Class B (the
 >   transport's round-trip estimate) is open, but for the owner-location round (2026-11-18, A-437, goal g255: one
 >   liveness window, hard, for its asks and its lent sessions; now the record plane's round budget over the slowest
->   asked path's measured tail, `owner_location::round_budget_for`) and the forward lane's stall (2026-11-18, A-315,
+>   asked path's measured tail, `owner_location::round_budget_for`), an operator's promotion forwarded to the root
+>   group's leader (A-439: one liveness window; now the stall every forward over a leader session takes, the window and
+>   the path's measured round-trip tail, `verbs::forward_stall_ns`) and the forward lane's stall (2026-11-18, A-315,
 >   goal g255): a batch
 >   quiet for its budget is given up only once a turn of its lane begun after the silence was seen has read the
 >   session's own socket empty, or found no session at all, so an origin kept off its CPU reads its owner's replies

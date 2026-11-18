@@ -559,13 +559,10 @@ async fn promote_region_here_or_forward(region: u64, principal: Principal) -> Re
         ack_up_to: None,
         ack_owed: Vec::new(),
       });
-      match crate::fleet::forward_over_leader_session(
-        leader,
-        request,
-        crate::daemon::LIVENESS_BUDGET_NS,
-      )
-      .await
-      {
+      // The stall every forward over a leader session runs under (A-439): a liveness window and the path's tail.
+      let stall_ns = crate::state::with_state(|s| forward_stall_ns(s, leader))
+        .unwrap_or(crate::daemon::LIVENESS_BUDGET_NS);
+      match crate::fleet::forward_over_leader_session(leader, request, stall_ns).await {
         Some(reply) if !reply.is_empty() => {
           decode_body::<ReplyBody>(&reply).unwrap_or_else(|_| refused(Refusal::NotRootLeader))
         }
@@ -1805,8 +1802,23 @@ pub(crate) async fn resolve_and_forward(
 /// budget (`resolve_and_forward`).
 const FORWARD_RETRIED: &str = "fleet.forward.retried";
 
-/// One forward of `requests` to `owner`, within one liveness budget plus the measured round-trip tail of the path to
-/// it, queued at `place` in the owner's lane (the first send's, for a resend) and judged against `bound_at`, the
+/// Derived: the stall budget a forward over the leader session to `peer` runs under (the forward lane's silence window,
+/// `crate::forward_lane`, A-315): one liveness window, the lateness a live party may show before it is judged (A-228),
+/// plus the measured round-trip tail of the path to `peer` (`PathRtt`, RFC 6298's estimator per path; none before the
+/// first sample), so a forward's reply is never refused for crossing a path the local window did not allow for. Every
+/// forward over a leader session reads it: a verb's to its owner ([`forward_once`]) and an operator's promotion to the
+/// root group's leader ([`promote_region_here_or_forward`], A-439, which until then ran under the window alone).
+pub(crate) fn forward_stall_ns(state: &ShardState, peer: HostId) -> u64 {
+  let tail_ns = state
+    .peer_paths
+    .get(&peer)
+    .and_then(slates_cluster::timing::PathRtt::tail_ns)
+    .unwrap_or(0);
+  crate::daemon::LIVENESS_BUDGET_NS.saturating_add(tail_ns)
+}
+
+/// One forward of `requests` to `owner`, within [`forward_stall_ns`] (one liveness window plus the measured round-trip
+/// tail of the path to it), queued at `place` in the owner's lane (the first send's, for a resend) and judged against `bound_at`, the
 /// failover bound on the wall from the first send (`crate::forward_lane`'s stall, A-315): the decoded reply to the
 /// first (`None` when nothing was sent, `Some(None)` when it went unanswered) and the decoded replies to the rest that
 /// came back, in order, up to the first that did not.
@@ -1819,24 +1831,10 @@ async fn forward_once(
   let Some(owner) = owner else {
     return (None, Vec::new());
   };
-  // One liveness budget, plus the measured round-trip tail of the path to the owner: a WAN forward's reply is never
-  // refused for crossing a path the local budget did not allow for.
-  let tail_ns = crate::state::with_state(|state| {
-    state
-      .peer_paths
-      .get(&owner)
-      .and_then(slates_cluster::timing::PathRtt::tail_ns)
-  })
-  .flatten()
-  .unwrap_or(0);
-  let forwarded = crate::fleet::forward_batch_over_leader_session(
-    owner,
-    requests,
-    crate::daemon::LIVENESS_BUDGET_NS.saturating_add(tail_ns),
-    bound,
-    place,
-  )
-  .await;
+  let stall_ns = crate::state::with_state(|state| forward_stall_ns(state, owner))
+    .unwrap_or(crate::daemon::LIVENESS_BUDGET_NS);
+  let forwarded =
+    crate::fleet::forward_batch_over_leader_session(owner, requests, stall_ns, bound, place).await;
   if forwarded.is_none() {
     crate::state::with_state(|state| {
       state.count("fleet.owner_location.forward_unsent", 1);
@@ -21923,6 +21921,37 @@ mod tests {
         "lapsed, and the read attachment keeps no write lease"
       );
       assert_eq!(super::lease_kept_until(state, volume, &other, before), None);
+    });
+  }
+
+  /// R3's class B (B-b, A-439). Do: on one shard, measure the path to a peer at two liveness windows a round trip, then
+  /// derive the stall a forward over that peer's leader session runs under, and one to a peer with no path measured.
+  /// Expect: past the slow path's round-trip tail by a liveness window, and one window for the unmeasured one. Before, an
+  /// operator's promotion forwarded to the root group's leader ran under one liveness window whatever its path, so a
+  /// leader across a slow path had its answer given up and the operator was told `NotRootLeader`.
+  #[test]
+  fn a_forward_over_a_slow_path_gets_its_round_trip_tail_on_top_of_a_window() {
+    crate::daemon::audit_on_shard(|state| {
+      let slow = HostId(77);
+      let path = state.peer_paths.entry(slow).or_default();
+      for _ in 0..4 {
+        path.on_sample(2 * crate::daemon::LIVENESS_BUDGET_NS);
+      }
+      let tail = state
+        .peer_paths
+        .get(&slow)
+        .and_then(slates_cluster::timing::PathRtt::tail_ns)
+        .unwrap();
+      assert!(tail >= 2 * crate::daemon::LIVENESS_BUDGET_NS);
+      assert!(
+        super::forward_stall_ns(state, slow) >= tail + crate::daemon::LIVENESS_BUDGET_NS,
+        "the slow path's round trip is allowed for on top of a window"
+      );
+      assert_eq!(
+        super::forward_stall_ns(state, HostId(78)),
+        crate::daemon::LIVENESS_BUDGET_NS,
+        "a path with nothing measured is given the window"
+      );
     });
   }
 }
