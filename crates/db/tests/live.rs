@@ -1164,10 +1164,7 @@ impl Run {
   fn settle(&mut self) {
     self.cut.clear();
     self.everyone_learns();
-    // A restarted owner ships its log again at its next publication (A-344): one write, if it made none since.
-    if self.restarts > 0 && self.owners[self.current].shipper.head().is_none() {
-      self.write(self.current);
-    }
+    self.publish_after_a_restart();
     while self.following.is_some() && u64::try_from(self.configuration.len()).unwrap() < 2 * self.f
     {
       self.reconfigure();
@@ -1208,6 +1205,14 @@ impl Run {
         Some(value),
         "NoLoss at the end: durable position {position}"
       );
+    }
+  }
+
+  /// A restarted owner ships its log again at its next publication (A-344), as the daemon makes its shipper again then:
+  /// one write, if the current owner made none since its restart.
+  fn publish_after_a_restart(&mut self) {
+    if self.restarts > 0 && self.owners[self.current].shipper.head().is_none() {
+      self.write(self.current);
     }
   }
 
@@ -1471,12 +1476,27 @@ fn a_live_log_resumed_past_every_position_it_may_have_shipped_holds_the_invarian
 #[test]
 fn a_live_log_begun_again_at_genesis_under_the_same_epoch_breaks_agreement() {
   let (broken, _) = run_restarting(Restart::FromGenesis);
+  let (agreement, no_loss) = broken_by_invariant(&broken);
   assert!(
-    broken
-      .iter()
-      .any(|(_, _, message)| message.contains("Agreement") || message.contains("NoLoss")),
+    agreement + no_loss > 0,
     "a chain begun again at genesis broke Agreement or NoLoss: {broken:?}"
   );
+}
+
+/// Of `broken` seeds, how many broke Agreement and how many NoLoss, printed with the total.
+fn broken_by_invariant(broken: &[BrokenSeed]) -> (usize, usize) {
+  let count = |name: &str| {
+    broken
+      .iter()
+      .filter(|(_, _, message)| message.contains(name))
+      .count()
+  };
+  let (agreement, no_loss) = (count("Agreement"), count("NoLoss"));
+  eprintln!(
+    "{} broken seeds: {agreement} Agreement, {no_loss} NoLoss, the rest Convergence",
+    broken.len()
+  );
+  (agreement, no_loss)
 }
 
 /// A-344, the rule's other half as a mutation: do run the restarting nemesis with each restarted owner resuming past the
@@ -1486,10 +1506,9 @@ fn a_live_log_begun_again_at_genesis_under_the_same_epoch_breaks_agreement() {
 #[test]
 fn a_live_log_resumed_past_its_durable_position_alone_breaks_agreement() {
   let (broken, _) = run_restarting(Restart::PastDurable);
+  let (agreement, no_loss) = broken_by_invariant(&broken);
   assert!(
-    broken
-      .iter()
-      .any(|(_, _, message)| message.contains("Agreement") || message.contains("NoLoss")),
+    agreement + no_loss > 0,
     "a chain resumed past its durable position alone broke Agreement or NoLoss: {broken:?}"
   );
 }
@@ -1502,18 +1521,7 @@ fn a_live_log_resumed_past_its_durable_position_alone_breaks_agreement() {
 #[test]
 fn a_resumed_owners_first_entry_is_past_every_position_it_may_have_shipped() {
   let hosts = [HostId(1), HostId(2), HostId(3)];
-  let mut before = Shipper::new(
-    (hosts[0], OBJECT, HostEpoch(1)),
-    Quorum { f: 1 },
-    &hosts,
-    None,
-    bounds_of(8, 16, 1),
-  );
-  let mut old = Replica::new(hosts[0], OBJECT);
-  for value in 0..6u8 {
-    let entry = before.append(vec![value]).unwrap();
-    old.accept(&entry).unwrap();
-  }
+  let mut old = holder_of_an_old_chain(&hosts, 6);
   let mut resumed = Shipper::resumed(
     (hosts[0], OBJECT, HostEpoch(1)),
     Quorum { f: 1 },
@@ -1538,20 +1546,7 @@ fn a_resumed_owners_first_entry_is_past_every_position_it_may_have_shipped() {
   );
   let mut empty = Replica::new(hosts[0], OBJECT);
   for (holder, replica) in [(hosts[1], &mut old), (hosts[2], &mut empty)] {
-    let refused = replica.check(&entry);
-    assert!(
-      matches!(refused, Err(LiveError::Behind { .. })),
-      "holder {holder:?} refuses an entry off its chain: {refused:?}"
-    );
-    let reply = refused.map(|_| replica.head());
-    assert_eq!(resumed.on_reply(holder, reply), Next::Install);
-    let install = resumed.install(vec![0; 7]).unwrap();
-    assert_eq!(
-      replica.check_install(&install),
-      Ok(Admitted::Apply(entry.head())),
-      "the install at position 6 ranks above the old chain"
-    );
-    replica.commit(install.epoch, install.head);
+    installed_past_its_chain(&mut resumed, holder, replica, &entry);
   }
   assert_eq!(
     resumed.on_reply(hosts[1], Ok(old.head())),
@@ -1559,6 +1554,47 @@ fn a_resumed_owners_first_entry_is_past_every_position_it_may_have_shipped() {
     "an installed holder is on the new chain"
   );
   assert_eq!(resumed.durable(), Some(6));
+}
+
+/// A holder's copy of a chain of `entries` entries host `hosts[0]` shipped at epoch 1, positions 0 on.
+fn holder_of_an_old_chain(hosts: &[HostId; 3], entries: u8) -> Replica {
+  let mut before = Shipper::new(
+    (hosts[0], OBJECT, HostEpoch(1)),
+    Quorum { f: 1 },
+    hosts,
+    None,
+    bounds_of(8, 16, 1),
+  );
+  let mut old = Replica::new(hosts[0], OBJECT);
+  for value in 0..entries {
+    let entry = before.append(vec![value]).unwrap();
+    old.accept(&entry).unwrap();
+  }
+  old
+}
+
+/// Expects `holder`'s copy (`replica`) to refuse `entry`, the resumed shipper's first, as off its chain, the shipper to
+/// owe it an install, and the copy to apply that install at the entry's head; then commits it.
+fn installed_past_its_chain(
+  resumed: &mut Shipper,
+  holder: HostId,
+  replica: &mut Replica,
+  entry: &Entry,
+) {
+  let refused = replica.check(entry);
+  assert!(
+    matches!(refused, Err(LiveError::Behind { .. })),
+    "holder {holder:?} refuses an entry off its chain: {refused:?}"
+  );
+  let reply = refused.map(|_| replica.head());
+  assert_eq!(resumed.on_reply(holder, reply), Next::Install);
+  let install = resumed.install(vec![0; 7]).unwrap();
+  assert_eq!(
+    replica.check_install(&install),
+    Ok(Admitted::Apply(entry.head())),
+    "the install at position 6 ranks above the old chain"
+  );
+  replica.commit(install.epoch, install.head);
 }
 
 /// AC-8.9: the owner holds at most its credit's bytes of entries that are not durable; past it a write is refused
