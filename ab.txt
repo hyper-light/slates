@@ -645,3 +645,9 @@ slates-server: shard 2 initialized in 2204 µs, 0 µs of its CPU, in 7 slices of
 slates-server: shard 0 initialized in 3007 µs, 0 µs of its CPU, in 5 slices of 6 units; the longest slice 2116 µs, the most CPU in one 0 µs, ending at unit 0 (a slice's floor 0 µs, 49 µs yielding)
 slates-winfsp: reply spin window = 12100 ns: the median one-way channel wake of 15 (the 2-competitive spin)
 ## run 1 of 10 FAILED (stalled), 2026-11-18T09:35:53Z
+remote: 
+remote: Create a pull request for 'diag-results/g258-44271751211-nowake-arm' on GitHub by visiting:        
+remote:      https://github.com/hyper-light/slates/pull/new/diag-results/g258-44271751211-nowake-arm        
+remote: 
+To https://github.com/hyper-light/slates
+ * [new branch]      fcbbd39a9a7e03cdc72c00d42947eb6db85cee37 -> diag-results/g258-44271751211-nowake-arm
