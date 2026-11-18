@@ -1846,6 +1846,15 @@ fn measure_what_live_shipping_adds_to_a_stable_nfs_write() {
   for line in status.lines().filter(|line| line.contains(" live ")) {
     eprintln!("measure-diag: owner status: {line}");
   }
+  for (index, instance) in fleet.instances.iter().enumerate() {
+    let (_, status, _) = run(instance, &["status"]);
+    for line in status
+      .lines()
+      .filter(|line| line.starts_with("fleet_session") || line.contains("path_mtu"))
+    {
+      eprintln!("measure-diag: node {index} session: {line}");
+    }
+  }
   let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
   drop((plain, live));
   drop(fleet.daemons);
