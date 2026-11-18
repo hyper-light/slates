@@ -13117,9 +13117,11 @@ fn volume_of_hex(text: &str) -> VolumeId {
   VolumeId { bytes }
 }
 
-/// The attachments `volume`'s status counts on `daemon`, or `None` while it does not answer the volume's status.
-fn attachments_on(daemon: &Daemon, volume: VolumeId) -> Option<u32> {
-  match Client::connect(daemon.instance()).call(&RequestBody::Status { volume }) {
+/// The attachments `volume`'s status counts through `client`, or `None` while its daemon does not answer the volume's
+/// status. One client held for a whole poll: a client per check outruns the reaper, which reaps no in-process client on
+/// macOS (its pid lives on), and the daemon refused "too many clients" (the first run of the test below).
+fn attachments_on(client: &mut Client, volume: VolumeId) -> Option<u32> {
+  match client.call(&RequestBody::Status { volume }) {
     ReplyBody::Status { report } => Some(report.attachments),
     _ => None,
   }
@@ -13178,14 +13180,16 @@ fn a_holder_of_a_volume_its_node_yielded_is_reaped_at_the_successor() {
     }
   };
   let observed: Vec<&Daemon> = daemons.iter().collect();
+  let mut status = Client::connect(daemons[successor].instance());
   let held = poll_until(&observed, REJOIN_DEADLINE, || {
-    Ok(attachments_on(&daemons[successor], id).is_some_and(|count| count >= 1))
+    Ok(attachments_on(&mut status, id).is_some_and(|count| count >= 1))
   });
   drop(holder);
   let reaped = poll_until(&observed, REJOIN_DEADLINE, || {
-    Ok(attachments_on(&daemons[successor], id) == Some(0))
+    Ok(attachments_on(&mut status, id) == Some(0))
   });
-  let left = attachments_on(&daemons[successor], id);
+  let left = attachments_on(&mut status, id);
+  drop(status);
   let ended_there = refusal_count(&daemons[successor], "remote_attach.ended");
   drop(observed);
   drop(daemons);
