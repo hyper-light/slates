@@ -2447,21 +2447,19 @@ pub(crate) fn holder_reached(holder: HostId) {
 }
 
 /// Walks `shard`'s live volumes for `holder`'s return a turn at a time ([`reached_slice`]), from a task of the control
-/// shard (`origin`), each turn awaited within the live exchange's longest budget. Bounded: a turn always moves the walk
+/// shard (`origin`), each turn awaited within the live exchange's longest budget and a turn of the shard of its own,
+/// the control shard's too ([`crate::xshard::Turns`]). Bounded: a turn always moves the walk
 /// on, the volumes are the shard's, and a turn the shard does not answer within its budget ends the walk (the record
 /// period sends the holder what it lacks then). Detached by [`holder_reached`]: nothing joins it, and its slot is reaped
 /// when it ends.
 async fn reached_walk(origin: u16, shard: u16, holder: HostId) {
   let deadline = crate::fleet::live_budget().max_deadline_ns();
+  let mut turns = crate::xshard::Turns::new(origin, shard);
   let mut after = None;
   loop {
-    let next = crate::xshard::call_within(
-      origin,
-      shard,
-      move |s| reached_slice(s, holder, after),
-      deadline,
-    )
-    .await;
+    let next = turns
+      .call(move |s| reached_slice(s, holder, after), deadline)
+      .await;
     match next {
       Some(Some(last)) => after = Some(last),
       _ => break,
@@ -2981,29 +2979,30 @@ const LIVE_PERIODS: &str = "fleet.live.periods";
 
 /// The record period's turn on `shard` (run from the control shard): re-ships what each holder of each live volume
 /// there still lacks, so a lost message or a holder that was away is caught up without waiting for the next write.
-/// The volumes are visited in slices, each one turn of the owner shard of about a step quantum ([`period_slice`]), so a
-/// shard owning many live volumes is never held for all of them in one turn (CLAUDE.md "Bounded work everywhere"):
+/// The volumes are visited in slices, each one turn of the owner shard of about a step quantum ([`period_slice`]) and a
+/// turn of its own, the control shard's too ([`crate::xshard::Turns`]), so a shard owning many live volumes is never
+/// held for all of them in one turn (CLAUDE.md "Bounded work everywhere"):
 /// until 2026-11-17 one turn visited every one, a cost that grew with the volumes the shard owned while every client
 /// of the shard waited behind it.
 pub(crate) async fn period(origin: u16, shard: u16) {
   drain_stragglers();
   let deadline = crate::fleet::live_budget().max_deadline_ns();
+  let mut turns = crate::xshard::Turns::new(origin, shard);
   let mut after = None;
   let mut first = true;
   loop {
     let counted = std::mem::take(&mut first);
-    let next = crate::xshard::call_within(
-      origin,
-      shard,
-      move |s| {
-        if counted {
-          s.count(LIVE_PERIODS, 1);
-        }
-        period_slice(s, after)
-      },
-      deadline,
-    )
-    .await;
+    let next = turns
+      .call(
+        move |s| {
+          if counted {
+            s.count(LIVE_PERIODS, 1);
+          }
+          period_slice(s, after)
+        },
+        deadline,
+      )
+      .await;
     match next {
       Some(Some(last)) => after = Some(last),
       _ => break,

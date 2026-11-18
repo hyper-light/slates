@@ -3061,10 +3061,7 @@ fn seal_walk_slice(
   if opening && track == Track::Mirror && !open_mirror_walk(state, local) {
     return (Vec::new(), None);
   }
-  let quantum = state
-    .seal_walk_quantum_ns
-    .or_else(futures::step_budget_ns)
-    .unwrap_or(state.config.runtime.step_budget_ns);
+  let quantum = seal_quantum_ns(state);
   let slicing = SealSlicing {
     archive_bytes: state.config.archive_slice_bytes(),
     wrap_ns: crate::config::wrap_slice_ns(quantum),
@@ -5278,6 +5275,26 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
     .sealing
     .as_ref()
     .and_then(|sealing| sealing.naming.clone());
+  // A sealed envelope is opened before the volume is made, in turns of its owner shard's clock, its lineage key adopted
+  // first (A-347); the turn that makes the volume then finds a plain archive. Opened in that turn, a GiB volume's open
+  // ran about a second, the watchdog's window.
+  let (archive, successor_lineage) = if envelope {
+    let owner = catalog.owner.clone();
+    match open_in_turns(
+      origin,
+      target,
+      id,
+      (owner, successor_lineage, naming.clone()),
+      archive,
+    )
+    .await
+    {
+      Ok(opened) => (opened, None),
+      Err(refusal) => return materialize_refused(refusal),
+    }
+  } else {
+    (archive, successor_lineage)
+  };
   let served = call_within(
     origin,
     target,
@@ -5295,17 +5312,14 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
           from_live_log: live.is_some(),
         },
       };
-      // The volume's lineage key, so this node opens what the dead owner sealed and seals under the same key (A-92
-      // pieces 3b and 4c). A head that carried no entry for this node (it acknowledged before its pair arrived) leaves
-      // a plain archive's volume to a new key, and an envelope unopened.
-      let adopted = successor_lineage.is_some_and(|lineage| {
-        let adopted =
-          crate::seal_keys::adopt_lineage(s, id, &catalog.owner, lineage, naming.as_ref()).is_ok();
-        if !adopted {
-          s.count(LINEAGE_UNADOPTED, 1);
-        }
-        adopted
-      });
+      // The volume's lineage key, so this node seals under the same key the dead owner did (A-92 pieces 3b and 4c); an
+      // envelope's was adopted before its open ([`open_in_turns`]). A head that carried no entry for this node (it
+      // acknowledged before its pair arrived) leaves a plain archive's volume to a new key.
+      if let Some(lineage) = successor_lineage
+        && crate::seal_keys::adopt_lineage(s, id, &catalog.owner, lineage, naming.as_ref()).is_err()
+      {
+        s.count(LINEAGE_UNADOPTED, 1);
+      }
       // The live log, when the volume has one: it is the volume as acknowledged, rebuilt here (A-200).
       if let Some(fetched) = &live {
         let rebuilt = crate::live_ship::archive_from_live(s, id, &catalog.owner, fetched)?;
@@ -5323,8 +5337,9 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
         return Ok(());
       }
       // Open a content archive (a sealed one needs the lineage key); a contentless volume has none to open.
+      // An envelope is opened before this turn ([`open_in_turns`]), so what arrives here is a plain archive.
       let opened = match archive {
-        Some(archive) => match opened_archive(s, id, &catalog.owner, adopted, archive) {
+        Some(archive) => match opened_archive(archive) {
           Some(opened) => Some(opened),
           None => {
             s.count(ENVELOPE_UNOPENED, 1);
@@ -5473,27 +5488,165 @@ fn published_before_served(s: &mut crate::state::ShardState) -> Result<(), &'sta
     .map_err(|_| MATERIALIZE_UNPUBLISHED)
 }
 
-/// The archive a taken-over volume is served from: a plain archive as it is; an envelope opened under the volume's
-/// lineage and naming keys once this node has adopted them (`adopted`), else `None` — ciphertext is never served as a
-/// volume's files.
-fn opened_archive(
+/// The archive a taken-over volume is served from: a plain archive as it is; an envelope, which [`open_in_turns`] opens
+/// before this, never: ciphertext is never served as a volume's files.
+fn opened_archive(archive: Archive) -> Option<Archive> {
+  (!slates_cluster::envelope::is_envelope(&archive)).then_some(archive)
+}
+
+/// A taken-over volume's materialization refused before its owner shard made it (an envelope that would not open):
+/// counted on this (control) shard as the owner shard's refusals are, and the materialization stays pending.
+fn materialize_refused(refusal: &'static str) -> Result<(), VolumeWait> {
+  let counted = state::with_state(|s| {
+    s.count(MATERIALIZE_REFUSED, 1);
+    s.count(refusal, 1);
+  });
+  match counted {
+    Some(()) => Err(VolumeWait::Refused),
+    // The control shard's state out of reach (its shutdown): nothing more is attempted.
+    None => Ok(()),
+  }
+}
+
+/// What one owner-shard turn of an envelope's open came to ([`open_slice`]).
+enum Sliced {
+  /// Every chunk is open: the real archive.
+  Opened(Archive),
+  /// Chunks remain: the open, to go on with at the next turn (boxed: it carries the envelope and the real archive).
+  More(Box<slates_cluster::envelope::Opening>),
+}
+
+/// The successor's adoption of a taken-over volume's keys (A-92 pieces 3b and 4c): the volume's owner, its lineage key
+/// under this node's root (none when the head carried no entry for this node), and the head's naming key.
+type Adoption = (
+  slates_db::catalog::Principal,
+  Option<([u8; 16], Vec<u8>)>,
+  Option<crate::head::HeadNaming>,
+);
+
+/// Opens a taken-over volume's sealed envelope on its owner shard `target`, in turns of that shard's clock (A-347): its
+/// lineage key adopted first, then the sealed manifest opened (the real archive's tree, never its content), then its
+/// chunks a slice a turn ([`open_slice`]), each a turn of the owner shard of its own however the shards fall
+/// ([`crate::xshard::Turns`]). The real archive, or the refusal, counted: [`ENVELOPE_UNOPENED`] for a key this node could
+/// not adopt or an envelope that would not open, [`MATERIALIZE_UNANSWERED`] for a turn the owner shard did not take
+/// within its wait. An open refused or cut short starts again from the envelope at the next attempt.
+async fn open_in_turns(
+  origin: u16,
+  target: u16,
+  id: DbVolumeId,
+  (owner, lineage, naming): Adoption,
+  archive: Option<Archive>,
+) -> Result<Option<Archive>, &'static str> {
+  let Some(archive) = archive else {
+    return Ok(None);
+  };
+  let mut turns = crate::xshard::Turns::new(origin, target);
+  let begun_owner = owner.clone();
+  let begun = turns
+    .call(
+    move |s| {
+      // A head that carried no entry for this node leaves the envelope unopened: its keys are not this node's.
+      let adopted = lineage.is_some_and(|lineage| {
+        let adopted =
+          crate::seal_keys::adopt_lineage(s, id, &begun_owner, lineage, naming.as_ref()).is_ok();
+        if !adopted {
+          s.count(LINEAGE_UNADOPTED, 1);
+        }
+        adopted
+      });
+      let opening = adopted
+        .then(|| {
+          let (lineage, namer) = recorded_keys(s, id, &begun_owner)?;
+          slates_cluster::envelope::Opening::new(archive, &lineage, &namer)
+            .ok()
+            .map(Box::new)
+        })
+        .flatten();
+      if opening.is_none() {
+        s.count(ENVELOPE_UNOPENED, 1);
+      }
+      opening.ok_or(ENVELOPE_UNOPENED)
+    },
+    HEARTBEAT_NS,
+    )
+    .await;
+  let mut opening = match begun {
+    Some(Ok(opening)) => opening,
+    Some(Err(refusal)) => return Err(refusal),
+    None => return Err(MATERIALIZE_UNANSWERED),
+  };
+  loop {
+    let slice_owner = owner.clone();
+    let sliced = turns
+      .call(
+        move |s| open_slice(s, id, &slice_owner, opening),
+        HEARTBEAT_NS,
+      )
+      .await;
+    match sliced {
+      Some(Ok(Sliced::Opened(opened))) => return Ok(Some(opened)),
+      Some(Ok(Sliced::More(rest))) => opening = rest,
+      Some(Err(refusal)) => return Err(refusal),
+      None => return Err(MATERIALIZE_UNANSWERED),
+    }
+  }
+}
+
+/// The lineage key and the namer a taken-over volume's envelope opens under, as recorded on this shard; `None` when
+/// either is not.
+fn recorded_keys(
   state: &mut ShardState,
   id: DbVolumeId,
   owner: &slates_db::catalog::Principal,
-  adopted: bool,
-  archive: Archive,
-) -> Option<Archive> {
-  if !slates_cluster::envelope::is_envelope(&archive) {
-    return Some(archive);
-  }
-  if !adopted {
-    return None;
-  }
+) -> Option<(hyper_seal::keys::WrappingKey, hyper_seal::name::Namer)> {
   let account = crate::seal_keys::tenant_of(owner);
   let lineage = crate::seal_keys::recorded_lineage(state, id, account).ok()??;
   let namer = crate::seal_keys::recorded_namer(state, id, account).ok()??;
-  slates_cluster::envelope::open(&archive, &lineage, &namer).ok()
+  Some((lineage, namer))
 }
+
+/// The quantum a seal's turns are cut by on this shard (its archive walk's, its envelope's wrap and, on a successor, an
+/// envelope's open): the shard's step quantum, or the one a test injected (`Daemon::inject_seal_walk_quantum`).
+fn seal_quantum_ns(state: &ShardState) -> u64 {
+  state
+    .seal_walk_quantum_ns
+    .or_else(futures::step_budget_ns)
+    .unwrap_or(state.config.runtime.step_budget_ns)
+}
+
+/// One owner-shard turn of [`open_in_turns`]: `opening`'s next chunks opened until the turn's share of the seal quantum
+/// is spent (the wrap's share, `config::wrap_slice_ns`: an open costs a seal's open and a BLAKE3 pass a byte, as the
+/// wrap does), a chunk at least, so a turn always moves the open on; counted [`ENVELOPE_OPEN_SLICES`].
+fn open_slice(
+  state: &mut ShardState,
+  id: DbVolumeId,
+  owner: &slates_db::catalog::Principal,
+  mut opening: Box<slates_cluster::envelope::Opening>,
+) -> Result<Sliced, &'static str> {
+  state.count(ENVELOPE_OPEN_SLICES, 1);
+  let Some((lineage, namer)) = recorded_keys(state, id, owner) else {
+    state.count(ENVELOPE_UNOPENED, 1);
+    return Err(ENVELOPE_UNOPENED);
+  };
+  let open_ns = crate::config::wrap_slice_ns(seal_quantum_ns(state));
+  let began = futures::now_ns();
+  loop {
+    // A budget of one byte opens exactly one chunk, so the clock is read between chunks.
+    match opening.advance(&lineage, &namer, 1) {
+      Ok(Some(opened)) => return Ok(Sliced::Opened(opened)),
+      Ok(None) if futures::now_ns().saturating_sub(began) < open_ns => {}
+      Ok(None) => return Ok(Sliced::More(opening)),
+      Err(_) => {
+        state.count(ENVELOPE_UNOPENED, 1);
+        return Err(ENVELOPE_UNOPENED);
+      }
+    }
+  }
+}
+
+/// Counter: one owner-shard turn's slice of a taken-over volume's envelope open ([`open_slice`], A-347).
+/// Format: a counter name in the daemon's status report.
+const ENVELOPE_OPEN_SLICES: &str = "fleet.seal.open_slices";
 
 /// Counter: a volume whose lineage key could not be made at its seal's start (A-92 piece 4c); its head then carries no
 /// key for successors until a later seal.
@@ -8792,8 +8945,9 @@ async fn follow_configuration(
 
 /// Advances `shard`'s seal jobs of `track` one bounded slice each on the owner shard and runs the content rounds of
 /// those whose archive is complete, keeping each round's dispatch for its stragglers. The walk over the shard's volumes
-/// runs in turns of about a step quantum each ([`seal_walk_slice`]), each turn's puts dispatched before the next turn,
-/// so the shard serves its clients between them. Whether the shard holds any job of the track at the walk's end.
+/// runs in turns of about a step quantum each ([`seal_walk_slice`]), each a turn of the shard of its own, the control
+/// shard's too ([`crate::xshard::Turns`]), each turn's puts dispatched before the next turn, so the shard serves its
+/// clients between them. Whether the shard holds any job of the track at the walk's end.
 async fn put_track_content(
   origin: u16,
   shard: u16,
@@ -8802,21 +8956,21 @@ async fn put_track_content(
   track: Track,
   in_flight: &mut Vec<Dispatch>,
 ) -> bool {
+  let mut turns = crate::xshard::Turns::new(origin, shard);
   let mut after = None;
   let mut opening = true;
   loop {
     let first = std::mem::take(&mut opening);
-    let (work, jobs, next) = call_within(
-      origin,
-      shard,
-      move |s| {
-        let (work, next) = seal_walk_slice(s, local, (track, first), after, budget);
-        (work, !seal_jobs(s, track).is_empty(), next)
-      },
-      HEARTBEAT_NS,
-    )
-    .await
-    .unwrap_or_default();
+    let (work, jobs, next) = turns
+      .call(
+        move |s| {
+          let (work, next) = seal_walk_slice(s, local, (track, first), after, budget);
+          (work, !seal_jobs(s, track).is_empty(), next)
+        },
+        HEARTBEAT_NS,
+      )
+      .await
+      .unwrap_or_default();
     for item in work {
       if let Some(dispatch) = put_seal_content(origin, local, item).await {
         in_flight.push(dispatch);
