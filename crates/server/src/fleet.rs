@@ -5092,6 +5092,31 @@ const GREEN_TAKEOVER_GIVEN_UP: &str = "merge.takeover_given_up";
 /// Format: a counter name in the daemon's status report.
 const GREEN_TAKEOVER_INPUTS_FETCHED: &str = "merge.takeover_inputs_fetched";
 
+/// The hosts a live takeover's phase one asks for `object` (A-240, A-309), and where the retired owner placed it: the
+/// takeover's `placed` candidates, then every candidate of the current placement not among them; and the retired
+/// owner's cohort hosts for the volume as the round that adopted it recorded them (`PendingVolume::cohort_hosts`),
+/// asked and waited for when the recorded holders are past tolerance (`live_ship::fetch`). With this shard's state out of
+/// reach (its shutdown) only the `placed` candidates, and no cohort hosts.
+fn live_candidates(object: ObjectId, placed: &[HostId]) -> (Vec<HostId>, Vec<HostId>) {
+  let mut candidates = placed.to_vec();
+  let (current, cohort_hosts) = state::with_state(|s| {
+    (
+      s.fleet.configuration().place(object).candidates,
+      s.pending_materializations
+        .get(&object)
+        .map(|pending| pending.cohort_hosts.clone())
+        .unwrap_or_default(),
+    )
+  })
+  .unwrap_or_default();
+  for host in current {
+    if !candidates.contains(&host) {
+      candidates.push(host);
+    }
+  }
+  (candidates, cohort_hosts)
+}
+
 /// The lineage key a taken-over volume's successor opens and seals its `head` with (A-92 piece 4c), wrapped under this
 /// node's root: its own copy where the head carried an entry for it; else, for an `envelope` it must open, the key a
 /// fellow candidate of the head (`candidates`, this node left out) hands it (A-295), counted; else none.
@@ -5199,15 +5224,8 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
     .filter(|_| catalog.live_shipped)
   {
     let holders: Vec<HostId> = recorded.holders.iter().copied().map(HostId).collect();
-    let mut candidates = placed.placement.candidates.clone();
-    let current =
-      state::with_state(|s| s.fleet.configuration().place(object).candidates).unwrap_or_default();
-    for host in current {
-      if !candidates.contains(&host) {
-        candidates.push(host);
-      }
-    }
-    match crate::live_ship::fetch(object, placed.epoch, candidates, holders).await {
+    let (candidates, cohort_hosts) = live_candidates(object, &placed.placement.candidates);
+    match crate::live_ship::fetch(object, placed.epoch, candidates, holders, cohort_hosts).await {
       Ok(fetched) => fetched,
       Err(waits) => {
         count_refusal(waits);
