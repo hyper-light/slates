@@ -1,0 +1,45 @@
+# DIAG (not for main): the idle-spin poller test under ThreadSanitizer, main's test (pollers_old) against the fixed one
+# (pollers), 16 runs each, interleaved (g251, the TSan pollers flake).
+name: diag-g251-pollers
+on:
+  push:
+    branches: ['diag-g251-pollers-*']
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  tsan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - name: Build both under ThreadSanitizer
+        env:
+          RUSTFLAGS: "-Zsanitizer=thread --cfg=rustix_use_libc"
+          RUSTDOCFLAGS: "-Zsanitizer=thread --cfg=rustix_use_libc"
+        run: cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu -p slates-rt --test pollers --test pollers_old --no-run
+      - name: Sixteen runs of each, interleaved
+        env:
+          RUSTFLAGS: "-Zsanitizer=thread --cfg=rustix_use_libc"
+          RUSTDOCFLAGS: "-Zsanitizer=thread --cfg=rustix_use_libc"
+          TSAN_OPTIONS: "halt_on_error=0"
+        run: |
+          mkdir -p target/diag
+          for i in $(seq 1 16); do
+            for t in pollers_old pollers; do
+              cargo +nightly test -q -Zbuild-std --target x86_64-unknown-linux-gnu -p slates-rt --test $t -- --exact a_ring_during_the_idle_spin_wakes_a_consuming_poller > target/diag/$t-$i.log 2>&1
+              echo "$t run $i rc=$? $(grep -ho 'spin hits [0-9]*' target/diag/$t-$i.log | head -1) $(grep -ho 'test result: [a-zA-Z]*' target/diag/$t-$i.log | head -1)"
+            done
+          done | tee target/diag/summary.txt
+          echo "old failed: $(grep -c '^pollers_old.*rc=[1-9]' target/diag/summary.txt) of 16; new failed: $(grep -c '^pollers .*rc=[1-9]' target/diag/summary.txt) of 16"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pollers-tsan
+          path: target/diag
