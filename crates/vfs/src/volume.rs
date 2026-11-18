@@ -637,8 +637,9 @@ pub(crate) struct VolumeSeed {
 }
 
 impl Volume {
-  /// The volume's inode-number prefix: the top bits of every inode number it issues, so an inode number names its
-  /// volume within a shard (what a write log's replay routes by, A-63).
+  /// The volume's inode-number prefix: the top bits of every inode number it issues. A clone keeps its origin's numbers
+  /// for every inode it inherits, so an inode number alone does not name its volume: a write log's replay goes by the
+  /// volume its record names (A-63; 2026-11-18).
   pub fn prefix(&self) -> u16 {
     self.prefix
   }
