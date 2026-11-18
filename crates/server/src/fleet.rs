@@ -5642,7 +5642,11 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
   }
   let outcome = state::with_state(|s| match served {
     Some(Ok(())) => {
-      s.pending_materializations.remove(&object);
+      // Served: its recovery, from its adoption to now, is a sample of the failover estimate (A-363).
+      if let Some(pending) = s.pending_materializations.remove(&object) {
+        s.failover
+          .volume_served(slates_rt::futures::now_ns().saturating_sub(pending.adopted_ns));
+      }
       s.pending_catalogs.remove(&object);
       Ok(())
     }
@@ -9062,6 +9066,21 @@ impl Fan {
   }
 }
 
+/// Refreshes this node's failover estimate for the period (§4.8 "Derived constants", A-363): the detection term from the
+/// member plane (SWIM's count of periods from a crashed peer's last answer to its condemnation, each at the detector's
+/// measured period's running tail, `MemberPlane::detection`), and the confirmation from the council's election timing
+/// this period derived, at the coordinator's measured period. The recovery term moves as takeovers and volumes complete
+/// (`takeover::drive_host_takeover`, `fleet::materialize`). Nothing sets the estimate: it is what this node measured.
+fn refresh_failover(state: &mut ShardState) {
+  let detection = state
+    .plane
+    .plane
+    .as_ref()
+    .and_then(slates_cluster::member_plane::MemberPlane::detection);
+  let timing = state.council_timing;
+  state.failover.refresh(detection, &timing, HEARTBEAT_NS);
+}
+
 /// The record-plane coordinator (§4.8 "records are sent to all candidates; committed at `f + 1`"; "Promotion
 /// and takeover"): one task per node that, each period, ships every unplaced head to all its candidates in
 /// one commit and drives every owed takeover over all surviving holders, borrowing the holder sessions the
@@ -9110,6 +9129,9 @@ async fn run_record_plane(local: HostId) {
     // it (`merge_service::PLACED_WITHIN_PERIOD`).
     let _ = state::with_state(|s| {
       s.merge.coordinator_period = s.merge.coordinator_period.saturating_add(1);
+      // The period's length is a sample of the coordinator's period, which the council's death watch counts in
+      // (A-363): a starved coordinator's periods stretch, and its failover estimate with them.
+      s.failover.period_began(slates_rt::futures::now_ns());
     });
     in_flight.retain_mut(|dispatch| !dispatch.settle());
     // This period's round budget, derived from the slowest measured peer path — every dispatch below (a
@@ -9120,6 +9142,9 @@ async fn run_record_plane(local: HostId) {
     // Drive the configuration authority first — an election or a replication heartbeat over the transport —
     // then the records under the configuration it maintains.
     drive_config_council(local, budget, &mut council_timer, &mut in_flight).await;
+    // The failover estimate for this period, from the detector as it stands and the council's timing just derived
+    // (A-363): published in the daemon's status as it moves.
+    let _ = state::with_state_counted(refresh_failover);
     // Drive the root group across regions on the same coordinator (§4.8, D-14): a brief borrow of the
     // root-voter sessions, sequential with the council's and the record ships, so it never contends.
     drive_root_group(local, budget, &mut root_timer, &mut in_flight).await;

@@ -2867,7 +2867,20 @@
 > is past `W` (every use is listed by class in A-359); the failover SLO derived as the membership horizon plus the
 > council's confirmation window plus `T` (2.9 s today) once each consumer that takes it as a lease term (a landing's
 > target lease, a CLI attachment's term, the NFSv4 and delegation leases, the restart cap) has its own term; and the
-> class C claim wait below.
+> class C claim wait below. **The failover delay is a live output since 2026-11-18 (A-363, goal g255), not A-359's boot
+> sum** (Ada, the same day: a value computed once at boot is still a constant). The control shard keeps `F = D + E + R`
+> as running estimates, refreshed each coordinator period: `D` SWIM's count of the detector's periods at their running
+> tail (NFD-E per pair with Lifeguard's local health; each pair's false-suspicion bound `β` is the one that minimizes
+> unavailability against the fleet's measured MTBF, φ-accrual's threshold `−log10 β`; the detector's own bound keeps the
+> longest period it ever ran and read 7-14 s on a quiet fleet, so it is not used); `E` the council's death-confirmation window at the
+> coordinator's measured period, with the retirement's commit round and its install; `R` the tail of the takeovers and
+> the volumes this node timed, the ratified `T` before the first. Published in the daemon's status
+> (`FleetReport::failover`, `CONTRACT` 24; `slates status` prints `fleet_failover`), each term with the measurements
+> behind it. Owed, each in its own change: the failover-shaped waits read it (a forward's bound, the location round's cap,
+> a live takeover's fetch, the takeover's attempts, the telemetry horizon); each lease takes its term from a φ-accrual
+> detector of its own holder's renewals (a CLI attachment once the CLI process sends a keepalive); `W`'s floor from the
+> pulses' running wake delay; then `FAILOVER_SLO_NS` and `with_failover_slo` go, since nothing sets `F`. The boot-time
+> sum is kept only as the A/B baseline, a build of its own, never a mode.
 >
 > - **Class A, a cross-shard wait judged in its target's own time (2026-11-06, in progress).** A verb's wait for
 >   another shard's answer gave up at the wall second while the target was alive and starved, and the work went on to
@@ -11638,6 +11651,14 @@ new process. In simulation the session ended one round trip after its first pack
   60 of 60, diag-live-fixes-56). A voter promoted after the last configuration commit stays unknown to a learner until
   the next one.
 - **Open sibling:** `drive_root_learner_fetch` filters on the root's voters the same way, and has no test yet.
+- **The departure wait's budget omitted the election, fixed 2026-11-18 (g225).** The three tests that stop the bootstrap
+  voter wait `departure_learned_periods`, which counted the detector's horizon, the death window and the commits but
+  not the election the stop leaves owed: the bootstrapper leads the council it created, and only a leader proposes the
+  retirement. At one CPU beside two busy loops (diag-g225-forming-fleet-reaches-2) 9 of 48 runs of the two tests waiting
+  on it spent their budget (94 periods) with every survivor still at the version of the stop, or the leader still naming
+  the stopped voter. The budget now adds the election's timeout (base and span, measured as the daemons derive it) and
+  its two rounds. Still open beside it: a learner's known voters move only with a newer configuration, and a seat change
+  moves none (the A-337 entry above).
 
 ### 2026-11-09: the formation check falls behind each new event counter (open)
 

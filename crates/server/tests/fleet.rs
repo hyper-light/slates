@@ -727,12 +727,19 @@ fn retirement_learned_periods(daemons: &[&Daemon]) -> u64 {
 }
 
 /// Derived: the coordinator periods the survivors take to learn a voter's departure: a membership horizon for the
-/// detector to hold it dead, the death window, the retirement's commit, the two commits of the joint change that
-/// refills its seat, the period a learner sees its divergence in, and its fetch round.
+/// detector to hold it dead, the death window, the election the departure leaves owed when the voter led the council
+/// (its timeout's base and span, [`election_periods`], and its two rounds, the pre-vote's and the vote's), the
+/// retirement's commit, the two commits of the joint change that refills its seat, the period a learner sees its
+/// divergence in, and its fetch round. The voter these tests stop is the bootstrapper, which leads the council it created
+/// unless a priority transfer moved its leadership, and only a leader proposes the retirement: without the election the
+/// budget ran out with the retirement still owed at one CPU beside two busy loops (diag-g225-forming-fleet-reaches-2,
+/// 2026-11-18: 9 of 48 runs of the two tests waiting on it, every survivor still at the version of the stop or the
+/// leader still naming the stopped voter, 94 periods spent).
 fn departure_learned_periods(daemons: &[&Daemon]) -> u64 {
   horizon_periods()
     .saturating_add(death_window_periods(daemons))
-    .saturating_add(commit_periods().saturating_mul(4))
+    .saturating_add(election_periods(daemons))
+    .saturating_add(commit_periods().saturating_mul(6))
     .saturating_add(1)
 }
 
@@ -9580,6 +9587,97 @@ fn three_daemons_take_over_a_dead_owners_head() {
     catalog.name, "taken-over",
     "the taken-over catalog survived the promotion and re-commit"
   );
+}
+
+/// The failover delay as a successor estimates it (§4.8 "Derived constants", A-363): an output that learns from the
+/// takeover it completes, never a setting. Do: three nodes at `f = 1`; on a, a volume shared with the fleet, its head
+/// held by both others; read each survivor's failover estimate; then a dies, and the successor serves the volume. Expect
+/// each survivor's estimate before the loss to carry detection from its detector and confirmation from the coordinator
+/// periods it timed, the recovery at its prior (the ratified recovery budget, nothing timed) and the total their sum; and
+/// the successor's, once its share is done, to have timed the takeover and the volume, the total still the sum of its
+/// terms.
+#[test]
+fn a_successors_failover_estimate_learns_the_takeover_it_completed() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, mut daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id } = client.call(&scratch("failover-learned")) else {
+    panic!("the volume was created");
+  };
+  share_with_fleet(&mut client, id, &daemons);
+  drop(client);
+  let object = ObjectId(id.bytes);
+  let survivors_hold = poll_all_hold(&[&daemons[1], &daemons[2]], object);
+  let before: Vec<Option<slates_ipc::protocol::FailoverReport>> = daemons
+    .iter()
+    .skip(1)
+    .map(|daemon| failover_through(&mut Client::connect(daemon.instance())))
+    .collect();
+  let owner = daemons.remove(0);
+  owner.stop();
+  let successor = rendezvous_first(&[hosts[1], hosts[2]], object).expect("a survivor takes over");
+  let successor_index = usize::from(successor != hosts[1]);
+  let successor_instance = daemons[successor_index].instance().to_owned();
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let served = poll_status_answers(&survivors, &successor_instance, id);
+  // One client for the whole wait: a client a poll would cost its shard a seat each time.
+  let mut status = Client::connect(&successor_instance);
+  let mut after = None;
+  let timed = poll_until(&survivors, SERVE_DEADLINE, || {
+    after = failover_through(&mut status);
+    Ok(after.is_some_and(|report| report.takeovers_timed > 0 && report.volumes_timed > 0))
+  });
+  drop(status);
+  drop(survivors);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!("failover estimates: before the loss {before:?}; the successor's after it {after:?}");
+  assert!(
+    survivors_hold,
+    "both survivors held the head before the loss"
+  );
+  for report in &before {
+    let report = report.expect("each survivor reported its failover estimate");
+    assert!(
+      report.detection_ns > 0 && report.confirmation_ns > 0 && report.confirmation_samples > 0,
+      "detection from the detector and confirmation from timed periods, measured: {report:?}"
+    );
+    assert_eq!(
+      (
+        report.takeovers_timed,
+        report.volumes_timed,
+        report.recovery_ns
+      ),
+      (0, 0, slates_db::replay::RECOVERY_BUDGET_NS),
+      "nothing recovered yet: the recovery is its prior"
+    );
+    assert_eq!(
+      report.total_ns,
+      report.detection_ns + report.confirmation_ns + report.recovery_ns,
+      "the failover delay is its terms' sum"
+    );
+  }
+  assert!(served, "the successor serves the volume");
+  assert!(
+    timed,
+    "the successor timed its takeover and the volume into its estimate: {after:?}"
+  );
+  let after = after.expect("the successor reported its failover estimate");
+  assert_eq!(
+    after.total_ns,
+    after.detection_ns + after.confirmation_ns + after.recovery_ns,
+    "the failover delay is its terms' sum: {after:?}"
+  );
+}
+
+/// The failover estimate the daemon `client` is connected to reports in its status (A-363), or `None` when it did not
+/// answer one.
+fn failover_through(client: &mut Client) -> Option<slates_ipc::protocol::FailoverReport> {
+  match client.call(&RequestBody::DaemonStatus) {
+    ReplyBody::DaemonStatus { report } => Some(report.fleet.failover),
+    _ => None,
+  }
 }
 
 /// Prints each survivor's refusal counters after a takeover that did not complete (`completed` false): which step
