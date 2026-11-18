@@ -6017,7 +6017,9 @@ pub(crate) fn wire_names(names: DbNamePolicy) -> NamePolicy {
   }
 }
 
-fn wire_size(size: DbSizeClass) -> SizeClass {
+/// A catalog's size class as the protocol names it: one conversion for a volume's record, a taken-over volume's catalog
+/// ([`taken_over_size`]) and an owner's admission ask (`live_ship::serve_admit`), so each reserves the same claim.
+pub(crate) fn wire_size(size: DbSizeClass) -> SizeClass {
   match size {
     DbSizeClass::Bounded { limit } => SizeClass::Bounded { limit },
     DbSizeClass::Dynamic { max } => SizeClass::Dynamic { max },
@@ -13173,10 +13175,7 @@ pub(crate) fn made_already(
 
 /// The size class a taken-over volume's catalog names.
 pub(crate) fn taken_over_size(catalog: &crate::catalog::CatalogValue) -> SizeClass {
-  match catalog.size {
-    DbSizeClass::Bounded { limit } => SizeClass::Bounded { limit },
-    DbSizeClass::Dynamic { max } => SizeClass::Dynamic { max },
-  }
+  wire_size(catalog.size)
 }
 
 /// A taken-over volume's archive restored for its making ([`begin_making`]) in one call, admitted before it allocates

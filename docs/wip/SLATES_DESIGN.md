@@ -1276,7 +1276,9 @@ on host B. Configuration and holder records expose the actual reservation and ge
 > refuses `BudgetExceeded` with the least room a candidate named, so nothing ships that a candidate could not take over.
 > A candidate that gave no answer within the exchange makes its admission as it takes the log's first entry. Owed: a
 > candidate that joins the placement later (a transition, a replacement) and cannot admit refuses that entry `NoRoom`,
-> but the configuration may still name it a successor; and a placed seal's successor still admits at its restore alone.
+> but the configuration may still name it a successor; a placed seal's successor still admits at its restore alone; and
+> the control shard's view of its claims can name one its partition has released, so an entry is then served as
+> claimed with no claim behind it (A-401's owed item).
 
 **Resource dimensions.** A byte quota cannot bound arbitrarily many empty files, names,
 xattrs, open handles or snapshots. Admission therefore publishes a resource vector: content
@@ -29248,10 +29250,28 @@ Applied in the same change to:
   log's first entry comes, or for the failover delay at most (`live_ship::settle_promised`), since past that the owner
   refused its own live-ship or was lost. A candidate that gave no answer makes its admission at the first entry. On a
   laptop there is no candidate to ask, so the verb decides at once, by the same verdict over no answers
-  (`live_ship::ship_after`). Evidence:
-  `a_live_ship_a_candidate_cannot_admit_is_refused_and_ships_once_it_can` (`crates/server/tests/fleet.rs`: one
-  candidate's shard filled, the ask refused `BudgetExceeded` with nothing shipped; the fill destroyed, the same volume
-  live-shipped); `an_owners_admission_asks_are_judged_by_the_least_room_and_the_unanswered` and the ask's wire test.
+  (`live_ship::ship_after`).
+  - Every ask is answered by the shard the volume's id routes to, whose admission answers a claim it holds already
+    (`verbs::admit_candidate_claim` is idempotent), never by the control shard's view of its claims, which can lag
+    the shard (see the owed item below). So an admitted answer names a claim the shard holds, and each ask starts its
+    promise again.
+  - The owner awaits the asks in the control shard's own time over the exchange's bound (A-408's rule,
+    `xshard::task_in_shard_time`). A busy or starved control shard is waited for; one that ran nothing for a whole
+    window is given up, and its candidates are counted unanswered.
+  - An answer that comes after the exchange gave up is counted (`fleet.live.admission_late`) and dropped, its session
+    returned (`live_ship::drop_late_answers`). It is not a holder's reply to a shipper, so it never reaches the
+    shipper's fold as a lane's late reply does.
+  - Evidence: `a_live_ship_a_candidate_cannot_admit_is_refused_and_ships_once_it_can` (`crates/server/tests/fleet.rs`:
+    one candidate's shard filled, the ask refused `BudgetExceeded` with nothing shipped; the fill destroyed, the same
+    volume live-shipped; 1 passed in 1.49 s on the Mac Studio before these three refinements, rerun owed by main);
+    `an_owners_admission_asks_are_judged_by_the_least_room_and_the_unanswered` and the ask's wire test.
+- **Owed under this number, found reviewing the second part.** The control shard's view of its claims
+  (`LiveState::claims`) can name a claim its partition has released. `claims_kept` keeps only copies that hold entries,
+  so a claim admitted for a message the copy then refused (`Behind`, a fence) is released at that partition's next
+  reconciliation, while the view keeps it. The copy's next entry is then served as claimed (`admit_claim` reads the
+  view) and charged against a claim that no longer exists, and a successor's restore finds none to take over. The fix
+  is to keep the claim while a copy is held at all, or to forget the view's claim when the partition releases it; it
+  needs its own failing test first. `live-ship`'s asks are not misled, since the partition answers them.
 - **The live chaos flows, in numbers.** Each of the 15 flows that keeps one volume claims the stream's bound, 782 MiB.
   On CI's 7 GB macOS runner a shard's reserve is 1 GiB (`reserve=1073741824`), so the claim is 76 % of a shard.
   - Before this amendment, a takeover admitted the claim again on the successor's shard at its restore. That needed 782

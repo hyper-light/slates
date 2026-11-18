@@ -5187,7 +5187,10 @@ const CLAIM_ASK_ADMITTED: &str = "fleet.live.claim_ask_admitted";
 /// the shard the volume's id routes to as a first entry's is ([`admit_claim`]), and kept until the log's first entry
 /// comes or the failover delay passes ([`settle_promised`]). Answered with the empty head when the claim is held,
 /// `NoRoom` when it cannot be, and nothing for a sender this node does not serve or an admission it could not finish
-/// within its call. Run on the control shard by the record plane.
+/// within its call. Every ask is answered by the volume's shard, whose admission answers a claim it holds already, and
+/// not by this shard's view of its claims ([`LiveState::claims`]), which a reconciliation may have left behind the
+/// shard; so an admitted answer always names a claim the shard holds, and its promise starts again at each ask. Run on
+/// the control shard by the record plane.
 pub(crate) async fn serve_admit(
   origin: u16,
   local: HostId,
@@ -5211,9 +5214,6 @@ pub(crate) async fn serve_admit(
     if let Err(why) = authority {
       count_refused(s, not_owner_counter(why));
       return Err(Vec::new());
-    }
-    if s.live.claims.contains_key(&object) {
-      return Err(encode_reply(&Ok(None)));
     }
     let target = s
       .shards
@@ -5239,14 +5239,7 @@ pub(crate) async fn serve_admit(
     None => return Vec::new(),
   };
   let id = slates_db::catalog::VolumeId { bytes: object.0 };
-  let size = match admit.size {
-    slates_db::catalog::SizeClass::Bounded { limit } => {
-      slates_ipc::protocol::SizeClass::Bounded { limit }
-    }
-    slates_db::catalog::SizeClass::Dynamic { max } => {
-      slates_ipc::protocol::SizeClass::Dynamic { max }
-    }
-  };
+  let size = crate::verbs::wire_size(admit.size);
   let require_locked = admit.require_locked;
   let answer = crate::xshard::call_within(
     origin,
@@ -5307,7 +5300,10 @@ pub(crate) fn admission_verdict(candidates: &[HostId], answers: &[(HostId, Vec<u
 }
 
 /// Asks each of `candidates` to make `admit`'s admission (§4.2, A-401), over this control shard's record sessions within
-/// the live exchange's budget: each answer, as its candidate gave it.
+/// the live exchange's budget: each answer, as its candidate gave it. The stragglers are finished here, as a lane's are
+/// ([`finish_stragglers`]), but a late answer is dropped ([`drop_late_answers`]): the verdict is taken without it, and an
+/// admission's answer is no holder's reply to a shipper, so it must not reach [`fold_into`]. Only a shard that can no
+/// longer time the wait, at its shutdown, leaves the rest to the drain ([`drain_stragglers`]).
 pub(crate) async fn ask_admissions(
   admit: slates_db::live::Admit,
   candidates: Vec<HostId>,
@@ -5323,13 +5319,48 @@ pub(crate) async fn ask_admissions(
     |_, _| false,
   )
   .await;
-  let (replies, stragglers) = settle_sessions(exchanged);
-  settle_stragglers(
-    state::with_state(|s| s.shard).unwrap_or_default(),
-    admit.object,
-    stragglers,
-  );
+  let (replies, mut stragglers) = settle_sessions(exchanged);
+  let (late, done) = stragglers.settle().await;
+  drop_late_answers(late);
+  if !done {
+    settle_stragglers(
+      state::with_state(|s| s.shard).unwrap_or_default(),
+      admit.object,
+      stragglers,
+    );
+  }
   replies
+}
+
+/// Counter: an admission ask's answer that came after its exchange gave up, dropped (§4.2, A-401; [`ask_admissions`]).
+/// Format: a counter name in the daemon's status report.
+const LIVE_ADMISSION_LATE: &str = "fleet.live.admission_late";
+
+/// Puts an admission exchange's late stragglers' sessions back (on the control shard): each answered holder's session to
+/// the pool, each unanswered holder's link dropped to be dialed afresh, as [`deliver_late`] does; their answers are
+/// counted and dropped, since the verdict they would have joined is taken.
+fn drop_late_answers(
+  late: Vec<(
+    HostId,
+    slates_cluster::TimedReply,
+    slates_transport::endpoint::Endpoint,
+  )>,
+) {
+  let mut sessions = Vec::new();
+  let mut lost = Vec::new();
+  for (host, reply, endpoint) in late {
+    if reply.round_trip_ns.is_none() {
+      lost.push(host);
+    } else {
+      sessions.push((host, endpoint));
+    }
+  }
+  let dropped = u64::try_from(sessions.len()).unwrap_or(u64::MAX);
+  lose_links(&lost);
+  crate::fleet::return_sessions(sessions);
+  if dropped > 0 {
+    let _ = state::with_state_counted(|s| s.count(LIVE_ADMISSION_LATE, dropped));
+  }
 }
 
 /// Counter: a `live-ship` refused `BudgetExceeded` because a candidate had no room for the volume's claim (A-401).
@@ -5372,7 +5403,10 @@ pub(crate) fn ship_after(
 /// shard `control`, which holds the sessions ([`ask_admissions`]), then completes the request as one atom
 /// (`image::complete`): the flag recorded when no candidate refused, else `BudgetExceeded` with the least room a
 /// candidate named, nothing recorded but the outcome ([`ship_after`]). So nothing is published before every candidate
-/// that answered holds its claim.
+/// that answered holds its claim. The asks are awaited in the control shard's own time (A-408's rule for a wait on
+/// another shard of this daemon, `xshard::task_in_shard_time`) over the exchange's own bound: a busy or starved control
+/// shard is waited for, and only one that ran nothing for a whole window is given up, its candidates then counted as
+/// unanswered.
 pub(crate) async fn admit_then_ship(
   (origin, control): (u16, u16),
   request: (u64, slates_wire::request::RequestId),
@@ -5381,14 +5415,11 @@ pub(crate) async fn admit_then_ship(
   candidates: Vec<HostId>,
 ) {
   let asked = candidates.clone();
-  let deadline = crate::fleet::live_budget()
-    .max_deadline_ns()
-    .saturating_mul(2);
-  let answers = crate::xshard::task_within(
+  let answers = crate::xshard::task_in_shard_time(
     origin,
     control,
     move || ask_admissions(admit, asked),
-    deadline,
+    crate::fleet::live_budget().max_deadline_ns(),
   )
   .await
   .unwrap_or_default();
