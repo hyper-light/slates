@@ -1018,10 +1018,10 @@ pub enum RequestBody {
     /// The keyed hash under the launcher's secret.
     proof: [u8; 32],
   },
-  /// A green version's merge record as a consumer reads it back (§4.16, A-321): the increment it committed and how that
-  /// merge's signature was judged. Served on the green's owner shard while the version's chain entry is held (above the
-  /// green's checkpoint; version 0 is the origin, which no merge made); a version folded into the checkpoint or not yet
-  /// committed is `NotFound`. A read. Appended.
+  /// A green version's merge record as a consumer reads it back (§4.16, A-321): how the signature of the merge that made
+  /// the version was judged, its provenance, kept with the green's accepted record (the version's chain entry, then the
+  /// checkpoint that folds it). Served on the green's owner shard; version 0 is the origin, which no merge made; a
+  /// version not yet committed is `NotFound`. A read. Appended.
   MergeRecord {
     /// The green.
     green: VolumeId,
@@ -4069,16 +4069,11 @@ pub enum ReplyBody {
   },
   /// A volume's trusted signers were set (A-321). Appended.
   SignersSet,
-  /// A green version's merge record (A-321): the increment it committed (zero for version 0, the origin), the version
-  /// that increment was based on, and how its merge's signature was judged (`Unsigned` for the origin and for a merge
-  /// that carried none). Appended.
+  /// A green version's merge record (A-321): how the signature of the merge that made it was judged (`Unsigned` for
+  /// version 0, the origin, and for a merge that carried none). Appended.
   MergeRecord {
     /// The version.
     version: u64,
-    /// The increment's identity.
-    increment: [u8; 32],
-    /// The version the increment was based on.
-    base: u64,
     /// How the merge's signature was judged.
     verification: Verification,
   },

@@ -157,8 +157,7 @@ pub enum Missing {
     /// The shard.
     shard: u16,
   },
-  /// A green's version whose merge record the green's owner does not hold (A-321): folded into the green's checkpoint,
-  /// or not yet committed.
+  /// A green's version not yet committed, so it has no merge record (A-321).
   Version {
     /// The green.
     green: VolumeId,
@@ -883,7 +882,7 @@ impl fmt::Display for Missing {
       Self::Shard { shard } => write!(f, "shard {shard}"),
       Self::Version { green, version } => write!(
         f,
-        "version {version} of green {} (folded into its checkpoint, or not yet committed)",
+        "version {version} of green {} (not yet committed)",
         crate::volume_id_text(*green)
       ),
     }

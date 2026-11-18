@@ -469,6 +469,11 @@ pub struct Green {
   /// retry of an accepted submit is answered from. Bounded by the chain (one entry per committed
   /// version), which the partition caps in bytes; recovery rebuilds it by replaying the chain.
   accepted: BTreeMap<[u8; 32], u64>,
+  /// How the signature of each version's submit was judged, for every version a signed submit committed (signed work,
+  /// A-321): the version's provenance, kept with the accepted record and bounded as it is (at most one entry per
+  /// committed version), carried by the chain entries and then by the checkpoint that folds them, so a version's verdict
+  /// reads back for as long as the green answers its idempotency record.
+  signatures: BTreeMap<u64, crate::chain_entry::Signature>,
   /// The **rejected-result cache** (§4.16; AUD-16): the conflict windows of increments that were
   /// refused, kept so a retry of the same increment is answered without re-judging — but a conflict
   /// is not in the chain, so nothing else bounds this; it is bounded here by `rejected_budget` bytes,
@@ -892,6 +897,11 @@ impl Green {
         .filter(|(_, version)| **version <= at)
         .map(|(id, version)| (*id, *version))
         .collect(),
+      signatures: self
+        .signatures
+        .range(..=at)
+        .map(|(version, signature)| (*version, *signature))
+        .collect(),
       files: self.changed_content_at(at),
       dirs: self
         .dir_history
@@ -948,6 +958,7 @@ impl Green {
       green.restore_xattr(changed);
     }
     green.accepted = checkpoint.accepted.iter().copied().collect();
+    green.signatures = checkpoint.signatures.iter().copied().collect();
     green.deltas_from = checkpoint.version;
     green.folded_below = checkpoint.version;
     green.identity_version = checkpoint.version;
@@ -2804,6 +2815,26 @@ impl Green {
     self.commit(effects, version);
     self.accepted.insert(inc.id, version);
     version
+  }
+
+  /// Records how the signature of the submit that committed `version` was judged (signed work, A-321): what the service
+  /// does once the version's chain entry is durable, and recovery as it replays the entry. A version past the head is
+  /// never committed, so it is not recorded, and its answer is `false`.
+  pub fn record_signature(
+    &mut self,
+    version: u64,
+    signature: crate::chain_entry::Signature,
+  ) -> bool {
+    if version == 0 || version > self.head() {
+      return false;
+    }
+    self.signatures.insert(version, signature);
+    true
+  }
+
+  /// How the signature of the submit that committed `version` was judged, if that submit carried one (A-321).
+  pub fn signature(&self, version: u64) -> Option<crate::chain_entry::Signature> {
+    self.signatures.get(&version).copied()
   }
 
   /// The effect a chain entry's resolved form stands for, its bytes read from the head and the increment's post-state.

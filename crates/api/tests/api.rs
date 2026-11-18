@@ -752,8 +752,9 @@ fn expect_a_rebased_work_merged(instance: &mut Instance, third: &Work) {
 /// with the launcher's authority; merge a work unsigned; ask for its statement, sign it with the trusted key and merge
 /// it; read the version's merge record back, and a version never committed. Expect the signers read back as set; the
 /// unsigned merge `Refused` by the green's requirement, unsigned, nothing merged; the statement naming the work, a
-/// person's text; the signed merge `Merged` at 1, verified naming the trusted key; its record naming the increment the
-/// statement named, verified; and the uncommitted version `NotFound` naming it.
+/// person's text; the signed merge `Merged` at 1, verified naming the trusted key; its record verified, read back after
+/// the checkpoint the merge let fold its chain entry (the work moved to 1, so nothing below it is live); the origin's
+/// record unsigned; and the uncommitted version `NotFound` naming it.
 #[test]
 fn a_signed_merge_is_judged_and_read_back_through_the_contract() {
   let (daemon, mut instance) = grouped("signed-merge");
@@ -825,10 +826,13 @@ fn a_signed_merge_is_judged_and_read_back_through_the_contract() {
     instance.merge_record(green, 1).unwrap(),
     MergeRecord {
       version: 1,
-      increment: statement.identity,
-      base: 0,
       verification: verified,
     }
+  );
+  assert_eq!(
+    instance.merge_record(green, 0).unwrap().verification,
+    Verification::Unsigned,
+    "the origin, which no merge made"
   );
   assert_eq!(
     instance.merge_record(green, 9),

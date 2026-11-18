@@ -53,6 +53,16 @@ fn daemon(tag: &str, shards: u16) -> (Daemon, String) {
   (daemon, instance)
 }
 
+/// The daemon's counter `name`, summed over its shards.
+fn counter(daemon: &Daemon, name: &str) -> u64 {
+  daemon
+    .refusals_on_every_shard()
+    .unwrap()
+    .get(name)
+    .copied()
+    .unwrap_or(0)
+}
+
 /// The signer `key` names on the wire: an Ed25519 key and its fingerprint.
 fn signer_of(key: &TestSigner) -> Verification {
   Verification::Verified {
@@ -114,8 +124,9 @@ fn signed(client: &mut Client, work: VolumeId, key: &TestSigner) -> Vec<u8> {
 /// A-321: do trust one key on a green; merge a work signed by it, one signed by a key nobody trusts, one signed over a
 /// statement its work has since moved past, and one unsigned; read each version's merge record back, and version 0's.
 /// Expect all four merged — a signature permits nothing and refuses nothing here, the green requiring none — answered
-/// and recorded: verified naming the trusted key, invalid `UnregisteredKey`, invalid `BadSignature`, and unsigned; each
-/// record naming the increment its statement named; version 0 the origin, unsigned.
+/// and recorded: verified naming the trusted key, invalid `UnregisteredKey`, invalid `BadSignature`, and unsigned, each
+/// record read back after the checkpoints that folded the versions' chain entries (each work moved past its version);
+/// version 0 the origin, unsigned.
 #[test]
 fn a_signed_merge_is_judged_recorded_and_read_back() {
   let (daemon, instance) = daemon("judged", TEST_SHARDS);
@@ -139,10 +150,10 @@ fn a_signed_merge_is_judged_recorded_and_read_back() {
       .unwrap(),
     (Submitted::Accepted(1), signer_of(&trusted))
   );
-  let record = client.merge_record(green, 1).unwrap();
   assert_eq!(
-    (record.increment, record.verification),
-    (statement.identity, signer_of(&trusted))
+    client.merge_record(green, 1).unwrap().verification,
+    signer_of(&trusted),
+    "read back after the checkpoint the merge let fold its chain entry"
   );
   let second = work_with(&mut client, green, "second", b"signed by a stranger");
   let by_stranger = signed(&mut client, second, &stranger);
@@ -160,10 +171,10 @@ fn a_signed_merge_is_judged_recorded_and_read_back() {
     client.merge_record(green, 2).unwrap().verification,
     unregistered
   );
-  let origin = client.merge_record(green, 0).unwrap();
   assert_eq!(
-    (origin.increment, origin.base, origin.verification),
-    ([0; 32], 0, Verification::Unsigned)
+    client.merge_record(green, 0).unwrap().verification,
+    Verification::Unsigned,
+    "the origin, which no merge made"
   );
   assert!(
     matches!(
@@ -171,6 +182,18 @@ fn a_signed_merge_is_judged_recorded_and_read_back() {
       Err(ClientError::Refused(Refusal::NotFound))
     ),
     "a version not yet committed has no record"
+  );
+  // Non-vacuity: the records were read back from checkpoints that folded the chain entries carrying them, and every
+  // verdict was the verifier's.
+  assert!(counter(&daemon, "merge.checkpoint.taken") > 0);
+  assert_eq!(
+    [
+      "signed_work.verified",
+      "signed_work.invalid.unregistered_key",
+      "signed_work.invalid.bad_signature",
+    ]
+    .map(|name| counter(&daemon, name)),
+    [1, 1, 1]
   );
   drop(client);
   daemon.stop();

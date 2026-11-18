@@ -3225,35 +3225,20 @@ pub(crate) fn join_awaiting(state: &mut ShardState, origin: u64, id: RequestId) 
   true
 }
 
-/// How the submit that made `green`'s `version` was signed, as the version's chain entry records it (A-321): `Unsigned`
-/// for one that carried no signature; `None` while this partition holds no entry for the version (version 0, the
-/// origin, which no submit made; one folded into the green's checkpoint; one not yet committed; or an entry this build
-/// cannot read).
+/// How the submit that made `green`'s `version` was signed (A-321), as the green's accepted record keeps it on its
+/// owner: from the version's chain entry, and once a checkpoint folds that, from the checkpoint. `Unsigned` for a
+/// version whose submit carried no signature and for version 0, the origin; `None` for a version past the head, for a
+/// green this shard does not hold, and for a verdict this build cannot read.
 pub(crate) fn recorded_verification(
   state: &ShardState,
   green: DbVolumeId,
   version: u64,
 ) -> Option<slates_ipc::protocol::Verification> {
-  let entry = chain_entry_of(state, green, version)?;
-  let recorded = slates_merge::chain_entry::signature_of(entry).ok()?;
-  crate::signed_work::of_entry(recorded)
-}
-
-/// `green`'s durable chain entry for `version`, while this partition holds it: the chain's entry `n` is version
-/// `checkpoint + n + 1` (`Partition::green_chain`).
-fn chain_entry_of(state: &ShardState, green: DbVolumeId, version: u64) -> Option<&[u8]> {
-  let held = state
-    .db
-    .partition()
-    .green_checkpoint(green)
-    .map_or(0, |(version, _)| version);
-  let index = usize::try_from(version.checked_sub(held)?.checked_sub(1)?).ok()?;
-  state
-    .db
-    .partition()
-    .green_chain(green)
-    .get(index)
-    .map(Vec::as_slice)
+  let engine = state.greens.get(&green)?;
+  if version > engine.head() {
+    return None;
+  }
+  crate::signed_work::of_entry(engine.signature(version))
 }
 
 /// The answer to a submit `green` accepted at `version` (§4.16; A-321): the version's own record answers, so a submit's
@@ -3276,10 +3261,9 @@ pub(crate) fn accepted_reply(state: &ShardState, green: DbVolumeId, version: u64
   }
 }
 
-/// Serves `MergeRecord` (A-321): a committed version's merge record as a consumer reads it back — the increment it
-/// committed, its base and how its merge's signature was judged — on the green's owner, to a principal with the read
-/// right. Version 0 is the origin, which no merge made; a version folded into the checkpoint or not yet committed is
-/// `NotFound`, as is an entry this build cannot read.
+/// Serves `MergeRecord` (A-321): a committed version's record as a consumer reads it back — how its merge's signature
+/// was judged when it merged, its provenance — on the green's owner, to a principal with the read right. Version 0 is
+/// the origin, which no merge made, so it reads unsigned; a version not yet committed is `NotFound`.
 pub(crate) fn merge_record_verb(
   state: &ShardState,
   principal: &Principal,
@@ -3290,25 +3274,13 @@ pub(crate) fn merge_record_verb(
     Ok(record) => record,
     Err(refusal) => return crate::verbs::refused(refusal),
   };
-  if version == 0 {
-    return ReplyBody::MergeRecord {
+  match recorded_verification(state, record.id, version) {
+    Some(verification) => ReplyBody::MergeRecord {
       version,
-      increment: [0u8; 32],
-      base: 0,
-      verification: slates_ipc::protocol::Verification::Unsigned,
-    };
-  }
-  let read = chain_entry_of(state, record.id, version).and_then(|bytes| {
-    let entry = slates_merge::chain_entry::decode(bytes).ok()?;
-    let verification = crate::signed_work::of_entry(entry.signature)?;
-    Some(ReplyBody::MergeRecord {
-      version,
-      increment: entry.increment.id,
-      base: entry.increment.base,
       verification,
-    })
-  });
-  read.unwrap_or_else(|| crate::verbs::refused(Refusal::NotFound))
+    },
+    None => crate::verbs::refused(Refusal::NotFound),
+  }
 }
 
 /// Answers every submit waiting on a version of `object` at or below `placed` (AUD-11): the

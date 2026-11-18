@@ -50,8 +50,9 @@ proptest! {
   /// `F`; submit one more generated increment based in `[F, head]` to both. Expect: the checkpoint round-trips through
   /// its encoding; the two greens have one head and one head identity (and the restored one's equals its identity from
   /// scratch); they hold the same files at every version from `F` to the head; they give the further increment the same
-  /// verdict; a base below `F` is refused `BaseUnavailable` by the restored green; and a retry of an increment accepted
-  /// at or before `F` is answered with its version.
+  /// verdict; a base below `F` is refused `BaseUnavailable` by the restored green; a retry of an increment accepted
+  /// at or before `F` is answered with its version; and every signed version's verdict at or before `F` is kept, none
+  /// after it, which a version's chain entry carries (A-321).
   #[test]
   fn a_green_restored_from_its_checkpoint_answers_as_the_green_it_was(
     origin_rows in prop::collection::vec(raw(), 0..12),
@@ -63,6 +64,12 @@ proptest! {
   ) {
     let (mut green, accepted) = chain_of(&origin_rows, &chain);
     let head = green.head();
+    // Every other version a signed submit made (A-321): its verdict is the version's provenance, which the checkpoint
+    // keeps once it folds the entry that carried it.
+    for version in (1..=head).filter(|version| version % 2 == 1) {
+      prop_assert!(green.record_signature(version, signature_of(version)));
+    }
+    prop_assert!(!green.record_signature(head + 1, signature_of(head + 1)), "no verdict for a version never committed");
     let at = u64::from(pick) % (head + 1);
     if fold {
       green.fold_history_before(at);
@@ -71,6 +78,10 @@ proptest! {
     prop_assert_eq!(&Checkpoint::decode(&checkpoint.encode()).unwrap(), &checkpoint);
     let mut restored = Green::restore(origin_of(&origin_rows), &checkpoint);
     prop_assert_eq!(restored.head(), at);
+    for version in 0..=head {
+      let kept = if version <= at { green.signature(version) } else { None };
+      prop_assert_eq!(restored.signature(version), kept, "version {}'s verdict", version);
+    }
     for (increment, version) in accepted.iter().filter(|(_, version)| *version > at) {
       prop_assert_eq!(restored.submit(increment), Outcome::Accepted { version: *version });
     }
@@ -98,12 +109,22 @@ proptest! {
   }
 }
 
+/// The signature verdict a test records for `version` (A-321): every field a function of the version.
+fn signature_of(version: u64) -> slates_merge::chain_entry::Signature {
+  slates_merge::chain_entry::Signature {
+    kind: u8::try_from(version % 251).unwrap(),
+    detail: u8::try_from(version % 7).unwrap(),
+    fingerprint: [u8::try_from(version % 253).unwrap(); 32],
+  }
+}
+
 /// A checkpoint touching every table, for the codec's tests.
 fn every_table() -> Checkpoint {
   Checkpoint {
     head_check: Some((9, [4; 32])),
     version: 7,
     accepted: vec![([3; 32], 2), ([1; 32], 5)],
+    signatures: vec![(5, signature_of(5)), (2, signature_of(2))],
     files: vec![
       Changed {
         key: "b".to_owned(),
@@ -157,6 +178,7 @@ fn a_checkpoint_encodes_to_one_byte_sequence_whatever_its_order() {
   let mut reordered = checkpoint.clone();
   reordered.files.reverse();
   reordered.accepted.reverse();
+  reordered.signatures.reverse();
   assert_eq!(checkpoint.encode(), reordered.encode());
   let mut canonical = checkpoint.clone();
   canonical.canonicalize();

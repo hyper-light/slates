@@ -685,17 +685,14 @@ impl Instance {
     }
   }
 
-  /// A green version's merge record (§4.16, A-321): the increment it committed, its base and how that merge's signature
-  /// was judged when it merged — its provenance, as the version's chain entry recorded it. Version 0 is the green's
-  /// origin, which no merge made; a version folded into the green's checkpoint, or not yet committed, is
-  /// [`Missing::Version`].
+  /// A green version's merge record (§4.16, A-321): how the signature of the merge that made it was judged when it
+  /// merged — its provenance, kept with the green's accepted record. Version 0 is the green's origin, which no merge made
+  /// (unsigned); a version not yet committed is [`Missing::Version`].
   pub fn merge_record(&mut self, green: VolumeId, version: u64) -> Result<MergeRecord, Error> {
     let read = self.client.merge_record(green, version);
     read
       .map(|record| MergeRecord {
         version: record.version,
-        increment: record.increment,
-        base: record.base,
         verification: Verification::of_wire(record.verification),
       })
       .map_err(|e| self.fail(e, Some(Missing::Version { green, version })))

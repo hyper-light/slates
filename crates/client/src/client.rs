@@ -71,11 +71,7 @@ pub struct MergeStatement {
 pub struct MergeRecord {
   /// The version.
   pub version: u64,
-  /// The increment it committed (zero for version 0, the origin).
-  pub increment: [u8; 32],
-  /// The version the increment was based on.
-  pub base: u64,
-  /// How the merge's signature was judged.
+  /// How the signature of the merge that made it was judged.
   pub verification: Verification,
 }
 
@@ -3609,8 +3605,8 @@ impl Client {
     }
   }
 
-  /// A green version's merge record (A-321): the increment it committed, its base and how its merge's signature was
-  /// judged. Refused `NotFound` for a version folded into the green's checkpoint or not yet committed.
+  /// A green version's merge record (A-321): how the signature of the merge that made it was judged. Refused `NotFound`
+  /// for a version not yet committed.
   pub fn merge_record(
     &mut self,
     green: VolumeId,
@@ -3619,13 +3615,9 @@ impl Client {
     match self.call(&RequestBody::MergeRecord { green, version })? {
       ReplyBody::MergeRecord {
         version,
-        increment,
-        base,
         verification,
       } => Ok(MergeRecord {
         version,
-        increment,
-        base,
         verification,
       }),
       _ => Err(ClientError::UnexpectedReply {

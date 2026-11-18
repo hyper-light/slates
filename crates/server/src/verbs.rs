@@ -8142,8 +8142,16 @@ fn record_accepted(
   state
     .db
     .mutate(&mut state.segment, &record, now)
-    .map(|_| ())
-    .map_err(|e| refusal_of_db(&e))
+    .map_err(|e| refusal_of_db(&e))?;
+  // The version's provenance (A-321), once its entry is durable: what the version's answers and its merge record read,
+  // and what a checkpoint keeps when it folds the entry.
+  if let (Some(signature), Some(engine)) = (
+    crate::signed_work::to_entry(verification),
+    state.greens.get_mut(&green),
+  ) {
+    engine.record_signature(version, signature);
+  }
+  Ok(())
 }
 
 fn chain_admits(
@@ -13063,6 +13071,10 @@ fn replay_chain_entry(
   let accepted = green.apply_recorded(&entry.increment, &entry.applied);
   if accepted != version {
     return Err(GreenFence::WrongVersion { version, accepted });
+  }
+  // The version's signature verdict, as its submit's was judged (A-321): provenance read back, never judged again.
+  if let Some(signature) = entry.signature {
+    green.record_signature(version, signature);
   }
   let identity = green.head_identity();
   let at_checkpoint = head_check.and_then(|(at, recorded)| (at == version).then_some(recorded));

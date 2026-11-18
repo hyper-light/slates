@@ -59,17 +59,14 @@ pub enum MergeOutcome {
   Refused(PolicyRefusal),
 }
 
-/// A green version's merge record as a consumer reads it back (§4.16, A-321; [`crate::Instance::merge_record`]): the
-/// increment it committed and how that merge's signature was judged when it merged, its provenance.
+/// A green version's merge record as a consumer reads it back (§4.16, A-321; [`crate::Instance::merge_record`]): how the
+/// signature of the merge that made the version was judged when it merged, its provenance, kept for as long as the green
+/// keeps the version's accepted record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MergeRecord {
   /// The version.
   pub version: u64,
-  /// The increment's identity (zero for version 0, the green's origin, which no merge made).
-  pub increment: [u8; 32],
-  /// The version the increment was based on.
-  pub base: u64,
-  /// How the merge's signature was judged (`Unsigned` for the origin and for a merge that carried none).
+  /// How the merge's signature was judged (`Unsigned` for version 0, the origin, and for a merge that carried none).
   pub verification: Verification,
 }
 

@@ -96,10 +96,13 @@ fn recovered(
       "version {version}'s completion key, as its entry recorded it, present or absent (A-255)"
     );
     assert_eq!(
-      (entry.signature, chain_entry::signature_of(bytes)),
-      (signature_for(version), Ok(signature_for(version))),
-      "version {version}'s signature verdict, decoded and read from its place, present or absent (A-321)"
+      entry.signature,
+      signature_for(version),
+      "version {version}'s signature verdict, as its entry recorded it, present or absent (A-321)"
     );
+    if let Some(signature) = entry.signature {
+      assert!(green.record_signature(version, signature));
+    }
     assert_eq!(
       identities.get(&version).copied(),
       Some(green.head_identity()),
@@ -135,6 +138,15 @@ fn assert_same(
     other.head_identity_from_scratch(),
     "the rebuilt green's identity is its state's"
   );
+  // Every version's signature verdict (A-321), folded into the checkpoint or still in the chain: provenance outlives the
+  // entry that carried it.
+  for version in 1..=live.head() {
+    assert_eq!(
+      live.signature(version),
+      other.signature(version),
+      "version {version}'s signature verdict"
+    );
+  }
   for version in from..=live.head() {
     let alphabet = (0..PATH_INDICES).map(|index| path(index).to_owned());
     for name in alphabet.chain(fresh.iter().cloned()) {
@@ -314,6 +326,10 @@ impl History {
         recorded,
         signature_for(*version),
       ));
+      // The service records a version's verdict once its entry is durable (A-321).
+      if let Some(signature) = signature_for(*version) {
+        assert!(self.live.record_signature(*version, signature));
+      }
       self.accepted.push((increment, *version));
     }
     outcome
@@ -654,6 +670,9 @@ fn two_clients_taking_turns_keep_folding_and_stay_bounded() {
       None,
       signature_for(version),
     ));
+    if let Some(signature) = signature_for(version) {
+      assert!(live.record_signature(version, signature));
+    }
     accepted.push((increment, version));
     let floor = bases[0].min(bases[1]);
     if floor > durable.held {
@@ -736,7 +755,6 @@ fn a_hostile_chain_entry_is_refused_typed() {
     Ok((Some(completion_of(2)), signature_for(2))),
     "the entry decodes, its completion key, submitting work and signature verdict with it"
   );
-  assert_eq!(chain_entry::signature_of(&bytes), Ok(signature_for(2)));
   for len in 0..bytes.len() {
     assert!(
       chain_entry::decode(&bytes[..len]).is_err(),
@@ -764,24 +782,11 @@ fn a_hostile_chain_entry_is_refused_typed() {
     Err(DocDecodeError::BadVersion),
     "an entry of version 2, before the submitting work rode it"
   );
-  // Nor one of the version before A-321, whose bytes before the digest are not a signature's section.
+  // Nor one of the version before A-321, which carried no signature's verdict.
   earlier[4..8].copy_from_slice(&3u32.to_le_bytes());
   assert_eq!(
-    chain_entry::signature_of(&earlier),
+    chain_entry::decode(&earlier),
     Err(DocDecodeError::BadVersion),
     "an entry of version 3, before the signature's verdict rode it"
   );
-  // A section whose absent marker sits over a verdict's bytes is malformed, not unsigned.
-  let unsigned = chain_entry::encode(&increment.encode(), &increment, &[], None, None, None);
-  assert_eq!(chain_entry::signature_of(&unsigned), Ok(None));
-  let mut smuggled = unsigned.clone();
-  let kind_at = smuggled.len() - 32 - 34;
-  smuggled[kind_at] = 1;
-  assert_eq!(
-    chain_entry::signature_of(&smuggled),
-    Err(DocDecodeError::BadKind)
-  );
-  for len in 0..16 {
-    assert!(chain_entry::signature_of(&bytes[..len]).is_err(), "{len}");
-  }
 }

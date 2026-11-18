@@ -18,8 +18,8 @@
 //! resend after a takeover and keeps the work's route only while it holds such a completion, A-288; and a restarted owner
 //! rebuilds that record byte for byte from this entry), the green's head identity at this version where one was
 //! computed, how the submit's signature was judged where it carried one (signed work, A-321: the version's provenance,
-//! a fixed-size section just before the digest, so a reader finds it without walking the entry, [`signature_of`]), and
-//! a digest of everything before it.
+//! which replay hands the green's accepted record, [`crate::engine::Green::record_signature`], so a checkpoint keeps it
+//! once the entry is folded), and a digest of everything before it.
 //!
 //! **The encoding** follows the origin's and the checkpoint's: magic and version, little-endian, every count checked
 //! against the bytes that remain before anything is allocated, any malformation refused typed ([`DocDecodeError`]).
@@ -48,8 +48,7 @@ const WORK_BYTES: usize = 16;
 /// Format: a completion key and its work: the origin host, the client, the sequence, and the submitting work's marker
 /// and id.
 const COMPLETION_BYTES: usize = 8 + 4 + 4 + 1 + WORK_BYTES;
-/// Format: a signature's verdict section: its marker, the verdict's kind and detail, and the signer's fingerprint,
-/// always written whole (zeros beside an absent marker), so it sits at a fixed distance from the entry's end.
+/// Format: a signature's verdict at its largest: its marker, the verdict's kind and detail, and the signer's fingerprint.
 const SIGNATURE_BYTES: usize = 1 + 1 + 1 + HASH_BYTES;
 /// Format: the fixed bytes of an entry around its parts: magic, version, the increment's length, the effect count, the
 /// completion's marker and key, the identity's marker and hash, the signature's section, and the digest.
@@ -256,6 +255,14 @@ pub fn encode(
     }
     None => out.push(ABSENT),
   }
+  put_signature(&mut out, signature);
+  let digest = *blake3::hash(&out).as_bytes();
+  out.extend_from_slice(&digest);
+  out
+}
+
+/// Appends a signature's verdict (module docs): a present marker and the verdict, or an absent marker alone.
+pub(crate) fn put_signature(out: &mut Vec<u8>, signature: Option<Signature>) {
   match signature {
     Some(verdict) => {
       out.push(PRESENT);
@@ -263,56 +270,25 @@ pub fn encode(
       out.push(verdict.detail);
       out.extend_from_slice(&verdict.fingerprint);
     }
-    None => out.extend_from_slice(&[0u8; SIGNATURE_BYTES]),
+    None => out.push(ABSENT),
   }
-  let digest = *blake3::hash(&out).as_bytes();
-  out.extend_from_slice(&digest);
-  out
 }
 
-/// The signature's verdict an entry records, read from its fixed place before the digest without walking the entry
-/// (what a submit's deferred answer and a merge record's read need of a version): its magic, version and length are
-/// checked, its digest is not (the decode at recovery checks it). `None` for a version whose submit carried no
-/// signature.
-pub fn signature_of(entry: &[u8]) -> Result<Option<Signature>, DocDecodeError> {
-  let mut reader = Reader::new(entry);
-  if reader.u32()? != MAGIC {
-    return Err(DocDecodeError::BadMagic);
-  }
-  if reader.u32()? != VERSION {
-    return Err(DocDecodeError::BadVersion);
-  }
-  let section_end = entry
-    .len()
-    .checked_sub(HASH_BYTES)
-    .ok_or(DocDecodeError::Truncated)?;
-  let section_start = section_end
-    .checked_sub(SIGNATURE_BYTES)
-    .filter(|start| *start >= ENTRY_HEADER_BYTES)
-    .ok_or(DocDecodeError::Truncated)?;
-  let section = entry
-    .get(section_start..section_end)
-    .ok_or(DocDecodeError::Truncated)?;
-  take_signature(&mut Reader::new(section))
-}
-
-/// Format: the bytes of an entry's magic and version.
-const ENTRY_HEADER_BYTES: usize = 4 + 4;
-
-/// Reads a signature's verdict section (module docs): a present marker and the verdict, or an absent marker and zeros.
-fn take_signature(reader: &mut Reader<'_>) -> Result<Option<Signature>, DocDecodeError> {
-  let marker = reader.u8()?;
-  let kind = reader.u8()?;
-  let detail = reader.u8()?;
-  let fingerprint = <[u8; HASH_BYTES]>::try_from(reader.bytes(HASH_BYTES)?)
-    .map_err(|_| DocDecodeError::Truncated)?;
-  match marker {
-    PRESENT => Ok(Some(Signature {
-      kind,
-      detail,
-      fingerprint,
-    })),
-    ABSENT if kind == 0 && detail == 0 && fingerprint == [0u8; HASH_BYTES] => Ok(None),
+/// Reads what [`put_signature`] wrote.
+pub(crate) fn take_signature(reader: &mut Reader<'_>) -> Result<Option<Signature>, DocDecodeError> {
+  match reader.u8()? {
+    PRESENT => {
+      let kind = reader.u8()?;
+      let detail = reader.u8()?;
+      let fingerprint = <[u8; HASH_BYTES]>::try_from(reader.bytes(HASH_BYTES)?)
+        .map_err(|_| DocDecodeError::Truncated)?;
+      Ok(Some(Signature {
+        kind,
+        detail,
+        fingerprint,
+      }))
+    }
+    ABSENT => Ok(None),
     _ => Err(DocDecodeError::BadKind),
   }
 }
