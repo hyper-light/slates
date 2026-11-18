@@ -463,8 +463,9 @@ pub(crate) fn track_owner_on_every_shard(state: &mut ShardState, object: ObjectI
 }
 
 /// Brings every object this holder holds to the owner the committed configuration names for it (§4.8), before the held
-/// acceptors' authority is reconciled to their owners; an install's walk does it a copy a turn ([`resolve_held_object`],
-/// `fleet::install_on_copy`, A-398), and this whole pass is that walk's oracle in the daemon's unit tests:
+/// acceptors' authority is reconciled to their owners; an install's walk does it a copy a turn
+/// ([`resolve_held_object`], `fleet::install_on_copy`, A-398), and this whole pass is that walk's oracle in the daemon's
+/// unit tests:
 ///
 /// - an object whose owner a kept retirement names is moved to the successor its lineage ranks, and remembers
 ///   the retired host whose takeover it is recovered in (`departed_owners`, the lease gate's record);

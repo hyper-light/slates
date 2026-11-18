@@ -92,8 +92,8 @@ impl<K: Ord + Copy, V> Tracked<K, V> {
     self.map.entry(key)
   }
 
-  /// Every value, mutably; marks every key changed. Test support since A-398: the install walks the copies one at a time
-  /// (`fleet::install_on_copy`), and nothing else reaches every value at once.
+  /// Every value, mutably; marks every key changed. Test support since A-398: the install walks the copies one at a
+  /// time (`fleet::install_on_copy`), and nothing else reaches every value at once.
   #[cfg(test)]
   pub(crate) fn values_mut(&mut self) -> btree_map::ValuesMut<'_, K, V> {
     self.changed.extend(self.map.keys().copied());
