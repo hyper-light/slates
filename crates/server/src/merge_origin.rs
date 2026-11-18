@@ -1261,13 +1261,13 @@ mod tests {
     }
   }
 
+  /// One merge record a holder accepted, as the tests below name it: its version, its inputs manifest (none for a scratch
+  /// green's version 0) and the head identity after it.
+  type AcceptedRecord = (u64, Option<[u8; 32]>, [u8; 32]);
+
   /// Gives `state` a holder's acceptor of `object` that accepted each of `records` (its version, its inputs manifest —
   /// none for a scratch green's version 0 — and the head identity after it), as a holder that recomputed them did.
-  fn accept_records(
-    state: &mut ShardState,
-    object: ObjectId,
-    records: &[(u64, Option<[u8; 32]>, [u8; 32])],
-  ) {
+  fn accept_records(state: &mut ShardState, object: ObjectId, records: &[AcceptedRecord]) {
     let owner = HostId(2);
     let mut acceptor = slates_db::register::Acceptor::new(
       HostId(1),

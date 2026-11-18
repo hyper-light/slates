@@ -3464,8 +3464,9 @@ fn a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover() {
         "NoLoss (successor)",
         vec!["no survivor served the volume within the fleet wait".to_owned()],
       );
-      // A-272: unserved, no surviving holder may have let its copy go. A takeover that adopted nothing must leave every
-      // copy where it is (`fleet.takeover.lost` counted, `reclaimed` none), for the round that can still recover it.
+      // A-272, A-309: unserved, no surviving holder may have let its copy go. A takeover that adopted nothing must leave
+      // every copy where it is (`reclaimed` none), for the round still waiting to recover it: past tolerance the members
+      // that exist now adopt (`fleet.takeover.recovered_past_tolerance`), where before A-309 it was lost for good.
       verdict.check(
         "NoLoss (copies kept while unserved)",
         survivors
