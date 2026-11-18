@@ -2728,7 +2728,7 @@ impl V4Client {
 #[test]
 fn a_write_from_another_client_recalls_the_read_delegation_first() {
   let (daemon, instance) = two_shard_daemon_with("recall", |config| {
-    config.failover_slo_ns = RECALL_LEASE.as_nanos().try_into().unwrap();
+    config.nfs_v4.lease_ns = RECALL_LEASE.as_nanos().try_into().unwrap();
   });
   let mut client = Client::connect(&instance);
   let name = local_volume_name(&mut client);
@@ -2788,7 +2788,7 @@ fn delegated_to_a(
   Vec<u8>,
 ) {
   let (daemon, instance) = two_shard_daemon_with(name, |config| {
-    config.failover_slo_ns = RECALL_LEASE.as_nanos().try_into().unwrap();
+    config.nfs_v4.lease_ns = RECALL_LEASE.as_nanos().try_into().unwrap();
   });
   let mut client = Client::connect(&instance);
   let volume = local_volume_name(&mut client);
@@ -2917,7 +2917,7 @@ const WANT_WRITE_DELEG: u32 = 0x0200;
 /// its instance's client, the holder, the other client, and the volume's component.
 fn holder_and_other(name: &str) -> (Daemon, Client, V4Client, V4Client, String) {
   let (daemon, instance) = two_shard_daemon_with(name, |config| {
-    config.failover_slo_ns = RECALL_LEASE.as_nanos().try_into().unwrap();
+    config.nfs_v4.lease_ns = RECALL_LEASE.as_nanos().try_into().unwrap();
   });
   let mut client = Client::connect(&instance);
   let volume = local_volume_name(&mut client);
@@ -3652,7 +3652,7 @@ fn a_granted_landing_waits_out_an_unreturned_delegation_and_lands() {
 #[test]
 fn recalls_asked_together_reach_the_one_slot_in_turn() {
   let (daemon, instance) = two_shard_daemon_with("recall-burst", |config| {
-    config.failover_slo_ns = RECALL_LEASE.as_nanos().try_into().unwrap();
+    config.nfs_v4.lease_ns = RECALL_LEASE.as_nanos().try_into().unwrap();
   });
   let mut client = Client::connect(&instance);
   let volume = local_volume_name(&mut client);

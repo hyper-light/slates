@@ -1344,9 +1344,9 @@ async fn recall_before_finish(granted: &mut GrantedRun, renew: LeaseAsk, key: &s
       }
       crate::delegation::drain(s);
       s.count(LANDING_HELD_FOR_RECALL, 1);
-      // The NFSv4 lease the server advertises (`nfs::v4_limits`), which a delegation's holder is owed after its recall:
-      // not the landing's own lease term.
-      Some((s.store.recall_gate.generation(), s.config.failover_slo_ns))
+      // The NFSv4 lease the listener advertises, which a delegation's holder is owed after its recall (A-425): the one
+      // number every wait on a recall reads, not the landing's own lease term.
+      Some((s.store.recall_gate.generation(), crate::nfs::v4_lease_ns(s)))
     })
     .flatten();
     let Some((generation, lease)) = asked else {

@@ -1923,9 +1923,12 @@ landing constants are in §4.15.
 > A-384 a CLI attachment's term is its holder's**, at most the failover delay; **since A-414 the volume's write lease,
 > a landing's target lease and a staging buffer take the failover delay as their term**, and the write lease stays its
 > holder's while any of its write attachments lives (renewed at each lapse, refused `LeaseHeld` to another principal
-> meanwhile). The NFSv4 and delegation leases, the anchor's restart cap and four bounds that are not leases (the FUSE
-> helper's, the status capture's, a move's and the telemetry horizon) still read the operator's 10 s placeholder above
-> until each takes a term of its own (A-414's owed list; GAPS, the `LIVENESS_BUDGET_NS` entry).
+> meanwhile). **Since A-425 the NFSv4 lease is derived** from what the clients it serves need, not the failover delay:
+> an idle Linux client's renewal floor (five seconds) and a liveness window, in whole seconds (6 s); the delegation
+> recall's wait, the quiet period, the NFSv3 gate's wait and a landing's recall wait all read it (`nfs::v4_lease_ns`).
+> The anchor's restart cap and four bounds that are not leases (the FUSE helper's, the status capture's, a move's and
+> the telemetry horizon) still read the operator's 10 s placeholder above until each takes a term of its own (A-414's
+> owed list; GAPS, the `LIVENESS_BUDGET_NS` entry).
 
 **Worked example.** An agent clones snapshot S of a 2 million-file volume: the reply arrives in one
 ring round trip; the clone's `referenced_bytes` equals S's referenced bytes (charged in full),
@@ -30073,6 +30076,42 @@ bound's derivation).
   nothing changed; compiled clean for Windows (`cargo xwin check`), its run filed for main.
 - **Owed.** The daemon's half: its hold of a resync end and its record's replacements over `crate::anchor_hold`'s
   exchange, and a successor adopting a handed resync entry (A-418's attach and successor halves).
+
+### A-425 — The NFSv4 lease is derived from the clients it serves, and every wait on a recalled delegation reads it: one number for the lease advertised, the recall's revocation, the quiet period, the NFSv3 gate and a landing (2026-11-18, built for goal g255; A-414's owed list; RFC 8881 §8.3, §10.4, §10.4.5; §4.6 A-35, A-78, A-79)
+- **What was there.** The listener granted and advertised (`FATTR4_LEASE_TIME`) the operator's failover SLO, the 10 s
+  placeholder, and five places read it each for itself: the session table's limits, the delegation drain's revocation of
+  a recall not answered within a lease, the quiet period before a recalled file is delegated again, the NFSv3 write the
+  recall gate refused, and a landing waiting on a recall. A failover setting decided an NFS client's lease, and a short
+  one broke the clients: an idle Linux client renews no sooner than five seconds after its last renewal whatever lease
+  it is told (`nfs4_schedule_state_renewal`, `if (timeout < 5 * HZ) timeout = 5 * HZ;`, fs/nfs/nfs4renewd.c, Linux
+  master, read 2026-11-18), so under a lease shorter than that it lapsed between two of its renewals and a full client
+  table dropped a live client's opens, locks and delegations.
+- **The rule.** The lease is what the clients it serves need, not the failover delay: the longest an idle Linux client
+  goes between two renewals (`config::NFS_V4_CLIENT_RENEWAL_FLOOR_NS`, the served client's fact) and a liveness window
+  for the renewal's delivery (A-228's lateness), rounded up to the whole seconds `FATTR4_LEASE_TIME` carries, so the
+  lease a client is told is the lease it holds: 6 s (`config::NfsV4Caps::lease_ns`, logged with its inputs at boot). The
+  failover delay is shorter on a laptop and in a quiet fleet (2 s and 4-5 s), and the lease cannot follow it below the
+  clients' renewals; a dead client's delegation now holds a landing or an NFSv3 writer at most 6 s, not 10. Every wait
+  on a recall reads the one accessor, `nfs::v4_lease_ns`, so the lease advertised and the waits on it are one number by
+  construction (the session table's limits, `delegation::drain`, the quiet period in `nfs_state::file_state`, the NFSv3
+  gate in `nfs::serve_local_held`, and `landing::recall_before_finish`).
+- **Not changed, owed.** The table's lapse is still one lease for every client; a client slower than Linux's floor (none
+  measured) would be judged by its own renewal gaps under A-384's accrual rule, a change of its own. The listener is
+  courteous (RFC 8881 §8.3): a lapsed client keeps its state until the table is full, so the lease bounds a dead
+  client's hold on a full table and on a recalled delegation, not a live client's.
+- **Test support.** The tests that ran a short NFSv4 lease set it on the listener's own knob (`config.nfs_v4.lease_ns`)
+  where they set the failover SLO (`crates/server/tests/nfs_mount.rs`, four; `crates/server/tests/recovery.rs`, one).
+- **Test.** `an_idle_linux_client_keeps_its_nfs_v4_lease_whatever_the_failover_slo` (`crates/server/src/nfs.rs`): on a
+  daemon whose failover SLO is one liveness window, a client table of one under the listener's limits keeps a client
+  silent for Linux's renewal floor and a liveness window less a nanosecond (a second client refused `NFS4ERR_DELAY`),
+  and makes room once it has been silent a whole lease.
+  Run on the Mac Studio (kiln, 2026-11-18, load 5-10, debug build, `cargo test --locked -p slates-server --lib -- nfs
+  delegation recall config::`): 22 of 22. Red-checked once: with the limits reading the failover SLO again, the test
+  fails at its first ask (the idle client dropped for the second). The NFS suites that run the delegation recall,
+  the NFSv3 gate and the landings held for a recall, now on the listener's own knob, are filed for main's run.
+
+Applied in the same change to: §4.4 "Derived constants" (its status), GAPS (the `LIVENESS_BUDGET_NS` entry),
+`crates/server/src/{config,nfs,nfs_state,delegation,landing}.rs`, `crates/server/tests/{nfs_mount,recovery}.rs`.
 
 ### A-424 — A captured clone lands against its capture, judged by content (2026-11-18, g267, stage 1 of the captured clone's landing; §4.15 `capture_base` and "Plan", A-291)
 

@@ -5728,8 +5728,9 @@ fn a_file_removed_while_open_over_nfsv4_is_freed_when_its_clients_lease_lapses()
   const LEASE: Duration = Duration::from_secs(2);
   let profile = common::machine_profile();
   let instance = format!("srv-v4-unlinked-lease-{}", std::process::id());
-  let mut config = DaemonConfig::derive(&profile, &instance, Some(1))
-    .with_failover_slo(u64::try_from(LEASE.as_nanos()).unwrap());
+  let mut config = DaemonConfig::derive(&profile, &instance, Some(1));
+  // The NFSv4 lease held short (A-425: derived from the idle Linux client's renewal floor otherwise).
+  config.nfs_v4.lease_ns = u64::try_from(LEASE.as_nanos()).unwrap();
   // One client at a time, so a second client's EXCHANGE_ID expires the lapsed first (the courteous server's rule).
   config.nfs_v4.clients = 1;
   let anchor = held_anchor("v4unlinkedlease", &profile, &config);
