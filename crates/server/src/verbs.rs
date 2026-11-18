@@ -5506,17 +5506,19 @@ async fn revoke_everywhere(origin: u16, owner: u16, shards: &[u16], consumer: u6
 
 /// Waits until every FUSE mount the revocation fenced (each shard's, by attachment and volume) has had its kernel drop
 /// what it cached and ended (AUD-29-84; `crate::fuse::fence_if_mounted`), so no process reads, after the revocation is
-/// acknowledged, a page the consumer's kernel held. Each shard is waited on for at most [`crate::told::TOLD_WAIT_NS`],
-/// the bound a writer waits for the same kernels to be told of a change; one past it is counted and the revocation
-/// acknowledged anyway, since every request of the mount is already refused.
+/// acknowledged, a page the consumer's kernel held. Each shard is waited on for at most the bound a writer here waits for
+/// the same kernels to be told of a change (`crate::told::bound_ns`, A-431, as this shard learned it); one past it is
+/// counted and the revocation acknowledged anyway, since every request of the mount is already refused.
 #[cfg(target_os = "linux")]
 async fn revoked_mounts_ended(origin: u16, fenced: Vec<(u16, Vec<(u64, DbVolumeId)>)>) {
+  let bound =
+    crate::state::with_state(crate::told::bound_ns).unwrap_or(crate::daemon::LIVENESS_BUDGET_NS);
   for (shard, mounts) in fenced {
     let ended = crate::xshard::task_within(
       origin,
       shard,
       move || crate::fuse::revoked_mounts_ended(mounts),
-      crate::told::TOLD_WAIT_NS,
+      bound,
     )
     .await;
     if ended.is_none() {
@@ -17734,7 +17736,8 @@ fn settle_references(state: &mut ShardState, record: &VolumeRecord) -> usize {
 /// its next restart. Zero is the healthy reading.
 const TAKEOVER_KEPT_UNRELEASED: &str = "recovery.takeover_kept_unreleased";
 /// Format: revocations acknowledged while a FUSE mount they fenced was still dropping its kernel's cache, past
-/// `told::TOLD_WAIT_NS` (AUD-29-84): its requests were refused, but a page its kernel held may have been read meanwhile.
+/// the told bound (`told::bound_ns`, AUD-29-84): its requests were refused, but a page its kernel held may have been read
+/// meanwhile.
 /// Zero is the healthy reading.
 #[cfg(target_os = "linux")]
 const REVOKED_MOUNTS_OVERDUE: &str = "fuse.revoked_overdue";

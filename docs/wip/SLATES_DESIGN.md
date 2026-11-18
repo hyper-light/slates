@@ -30320,3 +30320,31 @@ below.
 
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class A), `crates/server/src/{verbs,xshard,
 work_home,observe}.rs` (`observe::held_to_this_build` shared with the room rule).
+
+### A-431 — AC-3.3's told wait is learned: a writer waits the tail of the told waits its shard measured plus a liveness window, backed off after an overdue wait up to the failover delay (2026-11-18, built for goal g255; R3's class A; A-141, A-191, A-196, A-228, A-232, A-354, A-375)
+- **What was there.** A writer outside FUSE waited for every FUSE mount of its volume to be told of its change at most
+  `told::TOLD_WAIT_NS`, half a liveness window on the wall, then was answered anyway, the late mount counted
+  `fuse.told_overdue` (A-191); a guest device's held reply (A-196) and a revocation's wait for its fenced mounts
+  (AUD-29-84) took the same bound. Its stated reasons were the near-miss share of the window and that a writer held to
+  it kept the other half of its client's reply deadline; since 2026-11-13 a client waits for a live daemon's answer
+  however long (A-232), so the second was gone, and the first is a logging threshold, not a judgment of the mounts. On a
+  machine whose mounts are told late but told (a loaded host, a large invalidation round), every such writer was
+  answered overdue, the case AC-3.3 exists to prevent.
+- **The rule.** The bound is learned as RFC 6298 learns a retransmission timeout (`told::ToldTimes`, per shard, over
+  `slates_cluster::failover::RunningDuration`): the tail of the told waits the shard measured (`smoothed + max(4 ·
+  deviation, G)`; none before the first) plus a liveness window, the lateness a live party may show before it is judged
+  (A-228). A wait cut short at its bound is not a sample (Karn's rule: its true length is unknown) but doubles the bound
+  for the next (§5.5), never past the node's failover delay (`ShardState::failover_ns`), the most a reply is held
+  (A-354, A-375); the next wait that ends told ends the back-off. A guest device's reply published at the bound backs it
+  off too. So a host whose mounts are told slowly is waited for at its own pace, a mount that never answers holds each
+  writer at most a failover delay, and the learned pace is never cut by the ceiling: the ceiling caps a back-off. Read
+  by every writer's wait (`told::wait`), a guest device's held reply (`virtiofs`'s `told_bound_ns`) and a revocation's
+  wait for its fenced mounts (`verbs::revoked_mounts_ended`, as the revoking shard learned it).
+- **Tests.** `a_writers_told_bound_follows_the_told_waits_it_measured` and
+  `an_overdue_told_wait_backs_the_bound_off_to_the_failover_delay_and_a_told_one_ends_it` (`crates/server/src/told.rs`,
+  host-independent: the learner over scripted waits). The told wait itself runs only where FUSE mounts do (Linux): the
+  FUSE told suite, the guest device's and the Shards stream's told counts are filed for main's Linux run.
+  EVIDENCE_PLACEHOLDER
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class A, AUD-29-84's line), `crates/server/src/
+{told,state,daemon,virtiofs,verbs}.rs`.

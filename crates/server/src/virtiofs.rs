@@ -300,9 +300,10 @@ impl BridgeAccess for ShardBridge {
     crate::told::parked(self.volume, seq)
   }
 
-  /// Every writer's bound (`crate::told::TOLD_WAIT_NS`, A-191).
+  /// Every writer's bound, learned on the owner shard (`crate::told::bound_ns`, A-191, A-431); out of reach, the bound
+  /// with nothing learned, a liveness window.
   fn told_bound_ns(&mut self) -> u64 {
-    crate::told::TOLD_WAIT_NS
+    state::with_state(crate::told::bound_ns).unwrap_or(crate::daemon::LIVENESS_BUDGET_NS)
   }
 
   /// On the writers' ledger (`fuse.told_waits`, `fuse.told_overdue`).
