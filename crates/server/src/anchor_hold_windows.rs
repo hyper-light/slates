@@ -163,15 +163,15 @@ pub(crate) struct Handed {
 }
 
 /// Adopts the explicitly inherited channel and held entries exactly once, before handle values can be reused. `bound` is
-/// every entry the anchor may hold for this daemon, of every class (`HoldBounds::total`, A-448).
+/// every entry the anchor may hold for this daemon, of every class (`HoldBounds::total`, A-448). The entries come in the
+/// handoff table, read from the inherited section [`handles::ENV_HANDLES`] names (A-460), never from the environment
+/// itself, which a table at the bounds would pass.
 pub(crate) fn adopt(bound: usize) -> Handed {
   let mut handed = Handed::default();
   let Ok(value) = std::env::var(handles::ENV_HANDLES) else {
     return handed;
   };
-  // This bound is also the parser's allocation cap, derived from the admitted mount count at boot. The environment
-  // itself has Windows' fixed process-environment cap; no peer-controlled allocation precedes parse_env's checks.
-  let (channel, entries) = match handles::parse_env(&value, bound) {
+  let (channel, entries) = match handed_table(&value, bound) {
     Ok(parsed) => parsed,
     Err(error) => {
       slates_machine::log_line!("slates-server: Windows hold handoff refused: {error}");
@@ -251,12 +251,30 @@ pub(crate) fn adopt(bound: usize) -> Handed {
   handed
 }
 
+/// The channel's value and the entries of the handoff table `pointer` names (A-460): the inherited section and the
+/// table's length, both checked against `bound`'s capacity before anything is mapped or allocated; the section taken as
+/// this process's own (closed once read), its table read and checked as the anchor wrote it, and refused whole where it
+/// names the section again. Nothing a refused table names is taken.
+fn handed_table(
+  pointer: &str,
+  bound: usize,
+) -> Result<(u64, Vec<handles::HandedEntry>), HoldRefusal> {
+  let (section, len) = handles::parse_handoff(pointer, bound).map_err(HoldRefusal::Protocol)?;
+  let table = slates_anchor::held_windows::read_table(adopted(section)?, len)
+    .map_err(HoldRefusal::Protocol)?;
+  let (channel, entries) = handles::parse_env(&table, bound).map_err(HoldRefusal::Protocol)?;
+  handles::check_owners(section, channel, &entries).map_err(HoldRefusal::Protocol)?;
+  Ok((channel, entries))
+}
+
 fn adopted(value: u64) -> Result<OwnedHandle, HoldRefusal> {
   let value = usize::try_from(value).map_err(|_| HoldRefusal::Unavailable)?;
   if value == 0 || value == usize::MAX {
     return Err(HoldRefusal::Unavailable);
   }
-  // SAFETY: parse_env checked distinct ownership for every inherited value, and adoption runs once at start.
+  // SAFETY: every value is one the anchor handed this process at its spawn: the table's section, taken before anything
+  // else, then the table's values, which parse_env holds distinct from one another and check_owners from the section;
+  // adoption runs once, at start.
   let handle =
     unsafe { OwnedHandle::from_raw_handle(std::ptr::with_exposed_provenance_mut(value)) };
   slates_ipc::win_spawn::clear_inheritance(&handle)

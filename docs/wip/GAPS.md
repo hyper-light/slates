@@ -706,7 +706,7 @@
 > Record: `docs/bugs/2026-11-18-the-watchdogs-end-left-its-writer-unjoined.md`.
 
 > **Open (g222, 2026-11-17, A-273): rebases and named-version reads of a green on the shards holding its works.**
-> Designed; steps 1 to 4 of five built. The owner spends 51–53% of its wall on verdicts and rebases at the 3,000-client rung (W1),
+> Designed; steps 1 to 4 and step 5a built. The owner spends 51–53% of its wall on verdicts and rebases at the 3,000-client rung (W1),
 > rebases the larger share (about 71,000 a run against 49,000 verdicts), and W1's rebase at 1,000 clients is slower
 > than main's because it crosses to the owner. A replica holds the green's metadata (about 14.2 MB at the rung, 3.8% of
 > a shard's 373.5 MB metadata budget on the Studio) and reads the owner's content in place, never a copy (the
@@ -732,10 +732,15 @@
 > (`OverBudget`, at its making, at a rebuild and after a message); the bytes an owner keeps for them against
 > `held_limit` = the per-green budget less the owner's own retention, past which its slowest replica is evicted
 > (`FeedRefusal::Evicted`, keeping its frees until it leaves); a change made while the last was unsent evicting every
-> replica (one message's blocks recorded at most). **Owed, in order:** the code on the shards (step 5: the holder
-> applies the derivations to the machine's figures and logs them, charges a replica to its shard's budget, routes a
-> refused or evicted replica's rebases and reads to the owner, counted, gives back an idle one, and makes a green's
-> replicas leave before it gives the owner up); the supervisor's A/B.
+> replica (one message's blocks recorded at most). **Built (step 5a, 2026-11-18, g083, A-457):** the shards hold a
+> green's replicas (`crates/server/src/green_replicas.rs`): the owner makes one on every other shard of the node, up to
+> the limit, before the green's first change; feeds each change over the cross-shard carrier; a replica is charged to
+> its own shard's budget within its derived budget and leaves, counted, when it refuses a message or its growth; a
+> destroyed, fenced, rolled-back or re-installed green's engine retires until every replica left, and the daemon's stop
+> closes every shard's replicas and waits for their registrations (no owner dropped with a reader); the limit and
+> budgets in the boot profile. **Owed, in order:** step 5b (a work's rebases and named-version reads served from its
+> shard's replica, a refused or evicted replica's routed to the owner, counted); an idle replica's give-back; the
+> supervisor's A/B.
 >
 > **A Shards guest's unprivileged run could not write a host-owned volume: built, the stream takes Shards' owner word
 > (2026-11-18, §4.6 the Shards form; A-281; goal g268).** Shards' init names the run's owner on a share's root with
@@ -819,10 +824,20 @@
 >   naming it goes out, its id marked apart from every attachment's, the sections held to a bound of their own
 >   (`shards × dax_range_slots`, refused `Bound`); a successor adopts them whole, claims them for the stream and answers
 >   the device's asks after the `Resync` with the same sections. Owed on Windows: its real-process restart with DAX on
->   CI's runners (filed for main, `run-requests.md`); and the handoff's length: every held entry rides one environment
->   variable (`SLATES_ANCHOR_HANDLES`), and a user-defined variable is at most 32,767 characters by
->   `SetEnvironmentVariableW`'s documentation (from memory, to verify on a runner), which the anchor's bounds were never
->   set against, a section's entry being about 90 characters and a mount's up to about 1,100. **Built since (A-402,
+>   CI's runners (filed for main, `run-requests.md`). **The handoff's length, built since (A-460, the same day):** every
+>   held entry rode one environment variable (`SLATES_ANCHOR_HANDLES`), and "the maximum size of a user-defined
+>   environment variable is 32,767 characters" (Microsoft Learn, `SetEnvironmentVariableW`'s `lpValue` and "Environment
+>   Variables", read 2026-11-18), which a table reaches at about 30 mounts with full records (an entry up to
+>   `ENTRY_TEXT_CAP`, about 1,100 characters for a mount, about 90 for a DAX section), while the anchor's bounds admit
+>   `shards × 4096` mounts. The table now rides an inherited read-only section of its own length, and the variable names
+>   only that section and the length (at most 33 characters); its real-process restart past the limit is filed for
+>   main. **Found beside it, open (Unix):** the same table rides environment variables on Linux and macOS too
+>   (`SLATES_ANCHOR_DEVICES`, up to about 109 characters a device with a 40-byte resync session; `SLATES_ANCHOR_COPIES`,
+>   about 77 a DAX object), and Linux refuses an `execve` whose single string passes `MAX_ARG_STRLEN`, `PAGE_SIZE * 32`
+>   (`include/uapi/linux/binfmts.h`; 131,072 bytes on 4 KiB pages, so about 1,200 held devices or 1,700 copies), and
+>   macOS bounds arguments and environment together (`kern.argmax`, 1 MiB, from memory, to verify); the bounds admit
+>   `shards × 4096` devices, so a large Unix holding would leave the anchor unable to start its next daemon. **Built
+>   since (A-402,
 >   2026-11-18):** the write log on
 >   Windows, so a Windows stream's acknowledged writes outlive its daemon's death, replayed into the volume (its Windows
 >   run is main's, `run-requests.md`); before, a Windows stream's acknowledged writes since the last publication were
@@ -882,8 +897,12 @@
 >   through kiln's server and the manifest written per runner with kiln's CA as its enrollment root (K2), and the
 >   operator's choice of which runners join, with `f` and each node's address, a chosen runner's Slates started with
 >   `StartSpec.fleet` once `role::check_fleet` (contract 39) read the manifest it wrote as its start will (K3).
-> - **Owed, in order:** kiln's relocation of an agent with its volume (detach, move, attach on the
->   target) and its workspaces made as clones of a captured base; the automatic migration by the origin of the last N
+> - **Kiln moves an agent with its volume (A-450, kiln K4, 2026-11-18):** through the library alone (`move_volume` to the
+>   target's member id, followed until `Moved`, every refusal by kind, the agent left running where it was), the
+>   target's runner mounting the moved volume under its own place once its new owner serves it. Today's kiln
+>   workspaces are overlays and are refused `NotPlain`; they move once made as clones of a captured base (K5). The live
+>   move across two Mac runners is filed for main.
+> - **Owed, in order:** kiln's workspaces made as clones of a captured base (K5); the automatic migration by the origin of the last N
 >   writes (AC-8.16's other half); a move carrying snapshots other than the head; a multi-runner test with injected
 >   faults. The capture's own owed parts: admission reserving its cost ahead, a large file read across slices rather
 >   than whole in one, and the report of bytes read and retained and of the elapsed cost (§4.15's status).
@@ -3672,7 +3691,7 @@
 > ratified recovery budget `T` by rent or buy (a verdict waits as long as the recovery it starts costs), the heartbeat
 > `W / ELECTION_MARGIN`, the same values; the machine's wake p99 at boot is its floor, and the boot log names both and
 > says when the floor passes the window. Owed, in order: `W` held at runtime so a daemon runs at its floor where that
-> is past `W` (every use is listed by class in A-359); the failover SLO derived as the membership horizon plus the
+> is past `W` (every use is listed by class in A-359; the watchdog's since A-455, below); the failover SLO derived as the membership horizon plus the
 > council's confirmation window plus `T` (2.9 s today) once each consumer that takes it as a lease term (a landing's
 > target lease, a CLI attachment's term, the NFSv4 and delegation leases, the restart cap) has its own term; and the
 > class C claim wait below. **The failover delay is a live output since 2026-11-18 (A-363, goal g255), not A-359's boot
@@ -3701,10 +3720,22 @@
 > the request), a move's overdue bound and the telemetry freshness horizon. Owed, each in its own
 > change: each other lease takes its term from a φ-accrual
 > detector of its own holder's renewals (a CLI attachment once the CLI process sends a keepalive); `W`'s floor from the
-> pulses' running wake delay; then `FAILOVER_SLO_NS` and `with_failover_slo` go, since nothing sets `F`. The boot-time
-> sum is kept only as the A/B baseline, a build of its own, never a mode. **Since A-403 the recovery's cross-shard passes and the image's alias steps** (A-359's
-> class A list on the wall) wait in their target's own time (`xshard::call_in_shard_time`), so W's floor for them is the
-> target's measured progress, not a boot snapshot.
+> pulses' running overrun for the rest of class D; then `FAILOVER_SLO_NS` and `with_failover_slo` go, since nothing sets
+> `F`. The boot-time sum is kept only as the A/B baseline, a build of its own, never a mode. **Since A-403 the
+> recovery's cross-shard passes and the image's alias steps** (A-359's class A list on the wall) wait in their target's
+> own time (`xshard::call_in_shard_time`), so W's floor for them is the target's measured progress, not a boot snapshot.
+> **Since A-455 (2026-11-18, goal g255, D-a) the watchdog judges each shard by its own window**
+> (`watchdog::watch_window_ns`), read at every look: `W` raised to the scheduler overrun the shard measured (its
+> registry pulse's mirror of `ShardContext::scheduler_overrun_ns`) where that is longer, never past the daemon's
+> observation budget (`watchdog::WINDOW_CEILING_NS`, ten windows), its spin window that window held to the build
+> (A-318); each verdict's line names the window it was judged by, and the status carries each shard's as the health
+> signal `shard.watch_window_ns`. Before, a shard the host kept off its CPU longer than `W` was judged against `W`
+> whatever the host measured, and A-359 only said so at boot. The ceiling keeps the watchdog from going blind, since a
+> wedged shard never waits again and so never forgets a spike measured just before it wedged. Still on `W` itself, each
+> owed its own change (class D): the anchor's start and lapse judgments (`role/anchor.rs`, D-b), the daemon's own
+> supervision waits (`reap_loop`, `log_late_beat`, `starved_share_ns`, `stop_parts`, `start_with_fleet`, the anchor's
+> hold windows, `held_copy`; D-c), and a laptop's failover detection term (A-405's supervision window), which should
+> follow the windows the watchdog now judges by.
 >
 > - **Class A, a cross-shard wait judged in its target's own time (2026-11-06, in progress).** A verb's wait for
 >   another shard's answer gave up at the wall second while the target was alive and starved, and the work went on to
@@ -11343,14 +11374,22 @@ since A-402, which also makes the log option 2 names available to the WinFsp dri
 >   - The manifest's decode and Merkle identity in pieces: one piece today, a walk of the whole tree.
 >   - The full api suite, Linux and Windows lanes: filed for main (run-requests.md, 2026-11-18).
 
-### 2026-11-18: a snapshot exported as its archive through the library (Mantle's CP-T10.4; built, A-441); the volume from an archive built (A-453)
+### 2026-11-18: a snapshot exported as its archive through the library (Mantle's CP-T10.4; built, A-441); the volume from an archive built (A-453); the archive streamed (A-459)
 
 > - **Built.** `Instance::export_archive` (contract 38): a snapshot rendered as its archive file (`ARCHIVE_FILE`) in a
 >   new volume of the caller's, walked in slices on the owner shard, read back a page at a time with `read`.
 >   `a_snapshot_exported_as_its_archive_carries_every_file_and_entry` decodes and restores what it reads back: every
 >   file's bytes, length and mode, the directories, none of a write after the snapshot, the same manifest twice.
-> - **Owed.** A streamed encoder: the archive is held whole while it is encoded, one unit of its size. (The volume made
->   from an archive is built: A-453, the entry above.)
+> - **Closed (A-459, 2026-11-18): the streamed encoder.** The export walks the snapshot twice. The first walk measures
+>   each chunk and drops its bytes, and the archive is laid out and its volume admitted exactly. The second walk writes
+>   it through a stage emptied into the file at a copy slice, never past the threshold and one record of the largest
+>   chunk. The whole-buffer encoder is its oracle, byte for byte. Proven (Mac Studio, debug, kiln r349, r355):
+>   generated archives and 48 generated trees under measured codec points stream to the encoder's bytes; an archive
+>   more than twice the stage's bound streams within it, the stage emptied more often than the archive holds bounds;
+>   the export, import and hostile api tests pass through the daemon; red once each (the header outside the hash; the
+>   stage written only at the end).
+>   Owed: the manifest's encoding is held whole while it is written (metadata); an A/B of the second walk's cost.
+>   (The volume made from an archive is built: A-453, the entry above.)
 
 ### 2026-11-18: a volume a publication left out lost its logged writes at the next restart (found by reading; fixed, A-422)
 

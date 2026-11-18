@@ -1,6 +1,6 @@
 //! The Windows hold channel's formats (A-198; §4.6 "Windows", A-61's counterpart): the messages a daemon and the anchor
-//! exchange to hold a daemon's handles across its death, and the environment variable that hands every held handle to
-//! the next daemon. Windows has no `SCM_RIGHTS`, so a handle cannot travel with its message: a hold names the daemon's
+//! exchange to hold a daemon's handles across its death, and the handoff that hands every held handle to the next
+//! daemon. Windows has no `SCM_RIGHTS`, so a handle cannot travel with its message: a hold names the daemon's
 //! handle values, the anchor duplicates each out of its child (it holds the child's process handle from the spawn) and
 //! answers, and the daemon commits the record that names the hold only once the anchor has answered that it holds it.
 //! A daemon that dies before the anchor took its handles leaves nothing held (the duplicate out of a dead process is
@@ -20,14 +20,30 @@
 //! live attachment, and the DAX sections one per range a shard's fill budget can count. A guest that maps many files
 //! is refused [`Reason::Bound`] at its own bound and never crowds a mount or a stream's resync end out of the anchor.
 //!
+//! **The handoff rides a section, never the environment alone** (A-460). A user-defined environment variable holds at
+//! most 32,767 characters ("The maximum size of a user-defined environment variable is 32,767 characters":
+//! Microsoft Learn, `SetEnvironmentVariableW`'s `lpValue` and "Environment Variables", read 2026-11-18), and the table
+//! the anchor hands a spawned daemon ([`encode_env`]) reaches that at a few dozen mounts: an entry takes up to
+//! [`ENTRY_TEXT_CAP`] characters, about 1,100 for a mount's longest record, and the bounds admit `shards × 4096` of them.
+//! So the table's text is written into a read-only section of its own length, which the spawn hands the child as it
+//! hands the held handles, and [`ENV_HANDLES`] names only that section and the text's length ([`encode_handoff`], at
+//! most [`HANDOFF_TEXT_CAP`] characters whatever the table holds). The caps stay what the daemon can make, never what
+//! a variable can carry.
+//!
 //! Every message is [`MESSAGE_BYTES`] long, checksum-verified and checked by kind, counts and lengths before anything is kept: the channel
-//! crosses a process boundary, so its bytes are external input, and so is the environment a daemon parses. The
-//! transport is `crate::held_windows`; this module is pure and cfg-free, so it is tested on every host.
+//! crosses a process boundary, so its bytes are external input, and so are the environment and the table a daemon
+//! parses. The transport is `crate::held_windows`; this module is pure and cfg-free, so it is tested on every host.
 
-/// Format: the environment variable carrying the hold channel's daemon end and every held entry to a spawned daemon:
-/// `CHANNEL_HEX` then, for each entry, `;ID_HEX:WHAT_HEX:H1_HEX,H2_HEX,...:RECORD_HEX` (`-` for an empty record), then
-/// `#CRC32C_HEX` over the preceding text. Handles are inherited across the spawn at the values named.
+/// Format: the environment variable pointing a spawned daemon at its handoff table (A-460): `TABLE_HEX:LEN_HEX`, the
+/// value in the daemon of the inherited, read-only section holding the table's text, and the text's length in bytes
+/// ([`encode_handoff`]). The table is the hold channel's daemon end and every held entry: `CHANNEL_HEX` then, for each
+/// entry, `;ID_HEX:WHAT_HEX:H1_HEX,H2_HEX,...:RECORD_HEX` (`-` for an empty record), then `#CRC32C_HEX` over the
+/// preceding text ([`encode_env`]). Handles are inherited across the spawn at the values named.
 pub const ENV_HANDLES: &str = "SLATES_ANCHOR_HANDLES";
+
+/// Format: the most characters [`ENV_HANDLES`] takes ([`encode_handoff`]): two `u64`s in hexadecimal and the colon
+/// between them, whatever the table holds, far inside a user-defined environment variable's 32,767 characters.
+pub const HANDOFF_TEXT_CAP: usize = 2 * U64_HEX_DIGITS + 1;
 
 /// Format: what a hold holds, its `what` byte: a WinFsp mount's volume control handle and ledger (A-198), the volume
 /// keeping its Mount Manager drive (A-369).
@@ -554,7 +570,8 @@ pub struct HandedEntry {
   pub record: Vec<u8>,
 }
 
-/// The [`ENV_HANDLES`] value handing `channel` (the daemon's end, inherited) and `entries` to a spawned daemon.
+/// The handoff table's text handing `channel` (the daemon's end, inherited) and `entries` to a spawned daemon, which
+/// rides a section of its own length that [`ENV_HANDLES`] names ([`encode_handoff`], A-460).
 pub fn encode_env(channel: u64, entries: &[HandedEntry]) -> String {
   let mut value = format!("{channel:x}");
   for entry in entries {
@@ -582,15 +599,12 @@ fn checked_env(value: &str) -> String {
   )
 }
 
-/// Parses an [`ENV_HANDLES`] value: the channel's value and at most `bound` entries, each checked against the caps
-/// before anything is kept. A value that is not exactly the shape [`encode_env`] writes is refused whole.
+/// Parses a handoff table's text: the channel's value and at most `bound` entries, each checked against the caps before
+/// anything is kept. A text that is not exactly the shape [`encode_env`] writes is refused whole.
 pub fn parse_env(value: &str, bound: usize) -> Result<(u64, Vec<HandedEntry>), HandleRefusal> {
   // At most a channel and `bound` entries, each with bounded hexadecimal fields, plus the checksum suffix. Check
   // before hashing or allocating anything from the input.
-  let cap = bound
-    .checked_mul(ENTRY_TEXT_CAP)
-    .and_then(|entries| entries.checked_add(U64_HEX_DIGITS + CHECKSUM_HEX_DIGITS + 1))
-    .ok_or_else(|| malformed("environment capacity"))?;
+  let cap = table_cap(bound).ok_or_else(|| malformed("handoff capacity"))?;
   if value.len() > cap {
     return Err(malformed("handoff exceeds its entry-derived capacity"));
   }
@@ -655,6 +669,70 @@ fn parse_entry(part: &str) -> Result<HandedEntry, HandleRefusal> {
     values,
     record,
   })
+}
+
+/// Derived: the most bytes a handoff table of `bound` entries takes ([`encode_env`]): the channel's value, `bound`
+/// entries of at most [`ENTRY_TEXT_CAP`] characters each, and the checksum with its `#`. None where it overflows.
+pub fn table_cap(bound: usize) -> Option<usize> {
+  bound
+    .checked_mul(ENTRY_TEXT_CAP)
+    .and_then(|entries| entries.checked_add(U64_HEX_DIGITS + CHECKSUM_HEX_DIGITS + 1))
+}
+
+/// The [`ENV_HANDLES`] value pointing a spawned daemon at its handoff table (A-460): `TABLE_HEX:LEN_HEX`, the value in the
+/// daemon of the inherited read-only section holding the table's text ([`encode_env`]), and the text's length in bytes.
+pub fn encode_handoff(table: u64, len: usize) -> String {
+  format!("{table:x}:{len:x}")
+}
+
+/// Parses an [`ENV_HANDLES`] value: the table section's value and the text's length. Refused unless it is exactly the
+/// shape [`encode_handoff`] writes, in lowercase hexadecimal, names a handle (never zero), and a length from one byte to
+/// the most a table of `bound` entries takes ([`table_cap`]), all checked before anything is mapped or allocated.
+pub fn parse_handoff(value: &str, bound: usize) -> Result<(u64, usize), HandleRefusal> {
+  if value.len() > HANDOFF_TEXT_CAP {
+    return Err(malformed("a handoff pointer past HANDOFF_TEXT_CAP"));
+  }
+  let (table, len) = value
+    .split_once(':')
+    .ok_or_else(|| malformed("a handoff pointer is TABLE:LEN"))?;
+  let table = Some(table)
+    .filter(|text| lower_hex(text))
+    .and_then(hex_u64)
+    .filter(|table| *table != 0)
+    .ok_or_else(|| malformed("the handoff table's value"))?;
+  let len = Some(len)
+    .filter(|text| lower_hex(text))
+    .and_then(hex_u64)
+    .and_then(|len| usize::try_from(len).ok())
+    .filter(|len| *len > 0)
+    .ok_or_else(|| malformed("the handoff table's length"))?;
+  let cap = table_cap(bound).ok_or_else(|| malformed("handoff capacity"))?;
+  if len > cap {
+    return Err(malformed("a handoff table past its entry-derived capacity"));
+  }
+  Ok((table, len))
+}
+
+/// Refuses a handoff whose table names its own section `table` again, as the channel's value or an entry's handle: one
+/// inherited handle has one owner, and the daemon owns the section from the moment it reads the table.
+pub fn check_owners(
+  table: u64,
+  channel: u64,
+  entries: &[HandedEntry],
+) -> Result<(), HandleRefusal> {
+  if channel == table || entries.iter().any(|entry| entry.values.contains(&table)) {
+    return Err(malformed("the handoff table's handle has two owners"));
+  }
+  Ok(())
+}
+
+/// Whether `text` is lowercase hexadecimal digits alone, the only form [`encode_handoff`] writes: so one pointer has one
+/// encoding, with no sign and no capitals.
+fn lower_hex(text: &str) -> bool {
+  !text.is_empty()
+    && text
+      .bytes()
+      .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn hex_u64(text: &str) -> Option<u64> {
@@ -1123,5 +1201,134 @@ mod tests {
     for what in [WHAT_WINFSP_MOUNT, WHAT_SHARDS_RESYNC, WHAT_SHARDS_DAX] {
       assert!(!none.admits_another(what, 0), "kind {what} with no room");
     }
+  }
+
+  /// Format: a user-defined environment variable's most characters, as Microsoft documents it: "The maximum size of a
+  /// user-defined environment variable is 32,767 characters" (Microsoft Learn, `SetEnvironmentVariableW`'s `lpValue`,
+  /// and "Environment Variables", both read 2026-11-18).
+  const ENVIRONMENT_VARIABLE_CHARACTERS: usize = 32_767;
+  /// Shape: the mounts of the full table below, each with a record of the whole cap: past the limit above on their own.
+  const FULL_MOUNTS: u64 = 48;
+  /// Shape: the DAX sections of the full table below.
+  const FULL_SECTIONS: u64 = 512;
+  /// Format: a DAX section's record, the server's attachment-and-file record, three words.
+  const SECTION_RECORD_BYTES: usize = 3 * size_of::<u64>();
+  /// Format: the handle values the full table names: mounts' two each and sections' one, all distinct.
+  const VALUE_STRIDE: u64 = 4;
+
+  /// A table full at its bounds: [`FULL_MOUNTS`] mounts with records of [`RECORD_CAP`] bytes and [`FULL_SECTIONS`] DAX
+  /// sections, every handle value distinct.
+  fn full_table() -> (HoldBounds, Vec<HandedEntry>) {
+    let mut entries = Vec::new();
+    for index in 0..FULL_MOUNTS {
+      entries.push(HandedEntry {
+        id: index + 1,
+        what: WHAT_WINFSP_MOUNT,
+        values: vec![
+          0x1_0000 + index * 2 * VALUE_STRIDE,
+          0x1_0000 + (index * 2 + 1) * VALUE_STRIDE,
+        ],
+        record: vec![u8::try_from(index).unwrap(); RECORD_CAP],
+      });
+    }
+    for index in 0..FULL_SECTIONS {
+      entries.push(HandedEntry {
+        id: (1 << 63) | index,
+        what: WHAT_SHARDS_DAX,
+        values: vec![0x10_0000 + index * VALUE_STRIDE],
+        record: vec![0xD4; SECTION_RECORD_BYTES],
+      });
+    }
+    let bounds = HoldBounds {
+      attachments: usize::try_from(FULL_MOUNTS).unwrap(),
+      sections: usize::try_from(FULL_SECTIONS).unwrap(),
+    };
+    (bounds, entries)
+  }
+
+  /// A-460. Do: encode a table full at its bounds, far past what an environment variable holds, point a spawn at it by
+  /// a section and the text's length, and read the pointer and the table back; then point at a table of the most bytes
+  /// those bounds allow, and one byte more. Expect the table past 32,767 characters, the pointer within
+  /// [`HANDOFF_TEXT_CAP`], itself far inside the limit, and the table read back whole, every entry as it was handed, its
+  /// section owned once; the cap's length taken and one past it refused, before anything is read.
+  #[test]
+  fn a_table_past_an_environment_variables_limit_rides_the_handoff_whole() {
+    let (bounds, entries) = full_table();
+    let channel = 0x2c4;
+    let table = encode_env(channel, &entries);
+    assert!(
+      table.len() > ENVIRONMENT_VARIABLE_CHARACTERS,
+      "a full table of {} characters",
+      table.len()
+    );
+    let section = 0x2d8;
+    let pointer = encode_handoff(section, table.len());
+    assert!(pointer.len() <= HANDOFF_TEXT_CAP);
+    assert!(HANDOFF_TEXT_CAP < ENVIRONMENT_VARIABLE_CHARACTERS);
+    let (named, len) = parse_handoff(&pointer, bounds.total()).unwrap();
+    assert_eq!((named, len), (section, table.len()));
+    let (handed_channel, handed) = parse_env(&table[..len], bounds.total()).unwrap();
+    assert_eq!(handed_channel, channel);
+    assert_eq!(handed, entries);
+    check_owners(named, handed_channel, &handed).unwrap();
+    let cap = table_cap(bounds.total()).unwrap();
+    assert_eq!(
+      parse_handoff(&encode_handoff(section, cap), bounds.total()).unwrap(),
+      (section, cap)
+    );
+    assert!(matches!(
+      parse_handoff(&encode_handoff(section, cap + 1), bounds.total()),
+      Err(HandleRefusal::Malformed { .. })
+    ));
+  }
+
+  /// A-460: hostile input. Do: parse pointers of no text, no colon, an empty field, a zero section or length, a sign,
+  /// capitals, a third field, a field of seventeen digits, and one past [`HANDOFF_TEXT_CAP`]. Expect each refused as
+  /// malformed, none read.
+  #[test]
+  fn hostile_handoff_pointers_are_refused() {
+    let long = format!("{}:{}", "1".repeat(U64_HEX_DIGITS + 1), "1");
+    let past = "1".repeat(HANDOFF_TEXT_CAP + 1);
+    for pointer in [
+      "",
+      "2c4",
+      ":10",
+      "2c4:",
+      "0:10",
+      "2c4:0",
+      "+2c4:10",
+      "2c4:+10",
+      "2C4:10",
+      "2c4:10:1",
+      "2c4;10",
+      long.as_str(),
+      past.as_str(),
+    ] {
+      assert!(
+        matches!(
+          parse_handoff(pointer, 8),
+          Err(HandleRefusal::Malformed { .. })
+        ),
+        "pointer {pointer:?}"
+      );
+    }
+  }
+
+  /// A-460. Do: check a table that names its own section as the channel, as one of an entry's handles, and as nothing.
+  /// Expect the first two refused, the section having two owners, and the third taken.
+  #[test]
+  fn a_tables_own_section_is_never_named_again() {
+    let (_, entries) = full_table();
+    let named = entries
+      .last()
+      .and_then(|entry| entry.values.first())
+      .copied()
+      .unwrap();
+    assert!(
+      check_owners(0x2c4, 0x2c4, &entries).is_err(),
+      "as the channel"
+    );
+    assert!(check_owners(named, 0x2c4, &entries).is_err(), "as a handle");
+    assert!(check_owners(0x2d8, 0x2c4, &entries).is_ok());
   }
 }
