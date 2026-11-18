@@ -2447,6 +2447,22 @@
 >     the rate, names the kind over it (a p99 of exactly 1 ms is not under), and fails below the rate, with an oracle
 >     failure, with a client given up or starved, and with nothing timed.
 >
+>     **The harness's instants are sound, and it says what it may have added (2026-11-18, g083).** The measurer's
+>     1,000-client runs on main `7d760c4ea` (BENCHMARKS, "The 1,000-client bound on main") had three oracle failures,
+>     each at a point whose harness was starved of its CPU, and one recorded a submit's round trip of 5 µs where the
+>     run's submits took 374 to 399 µs. The cause was the harness's: it stamped a send after `Client::begin` had handed
+>     the request to its ring, and a reply before `take_ready` read the ring, so a worker the host preempted in either
+>     gap recorded a send after the verdict that reflected it, or a reply before it came, and the oracle's bounds
+>     (`support/load_oracle.rs`) were unsound. Now a send is read before its handing over and again after it, and a
+>     reply after its ring was read, on the host's monotonic clock (the daemon's spans' clock). Each attempt also has a
+>     `floor` row: its reply was not there when the connection's previous drain began, so the daemon and the ring took
+>     at least that long, whatever the harness's sweep did; `max_drain_gap_ns` is now the longest window a reply's
+>     arrival could not be placed in (it counted a connection's idle time before). Tests, failing first: a worker kept
+>     off its CPU right after handing a request over, while the daemon's one shard answers, still stamps its send before
+>     the daemon's reply was written; and one kept off right after its drain's clock read still stamps the reply it
+>     takes after the daemon read the request (`a_send_is_stamped_before_the_daemon_can_have_answered_it`,
+>     `a_reply_is_stamped_after_the_ring_it_was_taken_from_was_read`).
+>
 >     **Owed, measurement (the supervisor's):** the 1,000-client rung on main with W1 (A-247 step one, landed
 >     2026-11-17) against main before it (02c6469e5). Each think mean runs as its own invocation with a fresh daemon,
 >     interleaved across builds: every kind's p50, p99, p999 and max, the `offered` row and the `bound` row. A think
