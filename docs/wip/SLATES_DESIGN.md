@@ -10619,8 +10619,10 @@ budget and its shard's room), the bytes an owner keeps for lagging ones (the roo
 its own retention), and one message's blocks; and every refusal sends the replica's work to the owner until it is
 rebuilt. Built in the engine (steps 1 to 4); on the shards (step 5a, A-457) the owner makes a replica on every other
 shard of its node before the green's first change, feeds it each change over the cross-shard carrier, charges it to its
-own shard, and makes every replica leave before it gives the engine up. A work's rebases and named-version reads served
-from its shard's replica are owed (step 5b).
+own shard, and makes every replica leave before it gives the engine up. A work's shard answers from its replica
+(step 5b, A-465) what the work asks of its green, its base at its version and its rebase, by the owner's own functions
+over the replica's engine, with no hop; what the replica does not hold is asked of the owner, counted by why, and a
+replica that left after a refusal or an eviction is made again before the owner's next change.
 
 **Attachments and versions.** Mounts and SDK attachments of green pin a version;
 `advance(attachment, version)` re-pins and invalidates exactly the paths the manifest diff
@@ -25130,10 +25132,13 @@ own retention evicts at its first release; with the eviction past the held limit
 replica's held-limit tests and the sealed blocks' slowest-reader test fail, the unfed one passing: r316 on the Mac
 Studio, 2026-11-18). Step 5a built 2026-11-18 (g083, A-457, below): the derivations in the boot profile; a replica on
 every other shard of the node, made before the green's first change, fed over the cross-shard carrier and charged to its
-own shard; and every replica leaving before its owner is given up. Owed: step 5b (a work's rebases and named-version
-reads served from its shard's replica, a refused or evicted replica's routed to the owner, counted); an idle replica's
-give-back (its idle period derived from the feed's cost per version against the rebases it served); the supervisor's
-A/B. The text and its measurements are perf's (2026-11-11, `agents/perf-a273`, never pushed); the
+own shard; and every replica leaving before its owner is given up. Step 5b built 2026-11-18 (g083, A-465, below): a
+work's base reads (its files, a page, every file's length, at its base version) and its rebase answered by its shard's
+replica with no hop, by the owner's functions over the replica's engine (byte for byte the owner's, the oracle test);
+what the replica cannot serve asked of the owner, counted by why; a replica that left after a refusal or an eviction
+made again, counted, never one that left for its budget. Owed: an idle replica's give-back (its idle period derived from
+the feed's cost per version against the rebases it served); the supervisor's A/B at 1,000 clients and more. The text and
+its measurements are perf's (2026-11-11, `agents/perf-a273`, never pushed); the
 content question it left open was decided by the supervisor on 2026-11-17 by A-64 and D-7 (below). W1 (A-247), whose
 works off the owner it builds on, landed on 2026-11-17 (3c0af9399).
 
@@ -31734,3 +31739,44 @@ new, four tests; `src/captured_tests.rs`, one; `tests/oracle.rs`, A-451's bits t
   Siblings found, not fixed: a `touch` alone and a base directory's mode change alone still land nothing; a captured
   clone's replacement overwrites an outsider's mode change where an overlay's refuses it (T-1.14); and the manifest's
   canonical encoding, which grants bind, has no golden vector.
+
+### A-465 — A work's base reads and its rebase are answered by its shard's replica of its green, byte for byte the owner's, with no hop; what the replica cannot serve goes to the owner, counted by why; a replica that left is made again, bounded (2026-11-18, goal 87 via g083; A-273 step 5b; §4.16 "Rebase off the owner"; A-247, A-388, A-400, A-457)
+
+Applied in the same change to: §4.16 ("Rebase off the owner (A-273)"); A-273's status; GAPS (A-273's entry); and:
+- `crates/server`: `work_home.rs` (`start_ask` answers from the replica first: `answered_by_replica`, `answer_here`;
+  `RebaseAnswer` is `Debug`); `verbs.rs` (the owner's answers over any engine: `base_files`, `base_page`, `base_sizes`,
+  `rebase_on`, `build_increment_on`, each the core of `owner_files`, `owner_page`, `owner_sizes`, `owner_rebase` and
+  `build_increment`); `green_replicas.rs` (`serving` and its route reasons, `Gone` carried home with each registration,
+  the remake in `ensure`, and the tests).
+
+- **What was there.** A work on a shard other than its green's asked the owner for everything of the green it needed:
+  its base files and their entries, a page of a base file, every base file's length, its rebase (A-247), each a hop in
+  a batch of asks (A-388). Since A-457 a replica of the green sat on the work's shard, fed to the owner's head, unread.
+- **The rule.** Where a work's shard would ask its green's owner for the work's base at its base version (`Need::Files`,
+  `Need::Page`, `Need::Sizes`) or for its rebase (`Need::Rebase`, from the work's base), it first asks its own replica
+  of the green (`crate::green_replicas::serving`): one that holds the version asked, no older than its fold floor and
+  no newer than its head, answers by the function the owner answers by, over its own engine (`verbs::base_files`,
+  `base_page`, `base_sizes`, `rebase_on`). The verb is parked as before, and the answer settles it on its own shard as
+  an owner's answer does when it comes back (`answer_here`, a message to its own shard), so the order of a work's verbs,
+  the entries kept and the charge are the same. A rebase lands at the replica's head, never below the work's base; one
+  whose head lags the owner's moves the work there, and its next submit is judged by the owner against its own head, as
+  every stale base is. The verdict, the head read and every other need stay the owner's.
+- **Byte for byte.** The replica's engine at a version it holds is the owner's at that version (A-273's oracle), and its
+  answer is computed by the same function, so it is the owner's answer, compared whole in the unit test
+  (`what_a_replica_answers_is_the_owners_answer_whole`: two base files with their entries, one of them absent, a page,
+  every length, a clean rebase and one that conflicts).
+- **Routed, by why.** A request the replica cannot serve goes to the owner as before, counted by why: none here, never
+  made or given back when its owner asked (`merge.replica.route_absent`); one that holds no such version
+  (`route_behind`); one that left after refusing a feed message (`route_refused`), once its owner evicted it
+  (`route_evicted`), or for its budget (`route_over_budget`). A replica that leaves sends its reason home with its
+  registration, and its shard keeps the reason until another is held or the owner gives the engine up.
+- **Remade, bounded.** The owner makes a replica again before its next change on a shard whose replica left after a
+  refusal or an eviction (`merge.replica.remade`), never on one whose replica left for its budget, which it would meet
+  again. So each remade replica answers for a refusal or an eviction of the one before, and a replica too large for
+  its shard costs one making.
+- **Non-vacuity.** `merge.replica.served`, moved by every answer a replica gives, which the gate test asserts moved by
+  two (a base read and a rebase) with `merge.work.asked_owner` unchanged.
+- **Checks.** CHECKS_RESULT
+- **Owed.** An idle replica's give-back; the supervisor's A/B at 1,000 clients and more (the arms filed with this
+  change); main's runs of the green suites and `works_off_owner`, whose one-shard and many-shard replies must still be
+  the same.

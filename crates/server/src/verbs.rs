@@ -8372,13 +8372,21 @@ fn build_increment(
   sealed: &crate::work_home::SealedWork,
   evidence: Vec<[u8; 32]>,
 ) -> Result<(DbVolumeId, slates_merge::engine::Increment), Refusal> {
+  build_increment_on(state.greens.get(&sealed.green), sealed, evidence)
+}
+
+/// [`build_increment`] over `engine`, the green's engine wherever it is held: its owner's, or a replica of it on the
+/// work's shard (A-465), which composes the same increment from the same state.
+fn build_increment_on(
+  engine: Option<&slates_merge::engine::Green>,
+  sealed: &crate::work_home::SealedWork,
+  evidence: Vec<[u8; 32]>,
+) -> Result<(DbVolumeId, slates_merge::engine::Increment), Refusal> {
   let green_id = sealed.green;
   let base_version = sealed.base_version;
   // The green is gone (destroyed), or the work's base is past the head it holds: the base names a
   // version this green does not have (§4.16 failure matrix, `UnknownBase`).
-  let engine = state
-    .greens
-    .get(&green_id)
+  let engine = engine
     .filter(|engine| base_version <= engine.head())
     .ok_or(Refusal::UnknownBase {
       green: to_wire_volume(green_id),
@@ -9416,12 +9424,21 @@ fn map_rebase(
   state: &mut ShardState,
   sealed: &crate::work_home::SealedWork,
 ) -> crate::work_home::RebaseAnswer {
+  rebase_on(state.greens.get_mut(&sealed.green), sealed)
+}
+
+/// [`map_rebase`] over `engine`, the green's engine wherever it is held: its owner's, or a replica of it on the work's
+/// shard (A-465), whose answer is the owner's for the same state, since it is computed by this same function.
+pub(crate) fn rebase_on(
+  engine: Option<&mut slates_merge::engine::Green>,
+  sealed: &crate::work_home::SealedWork,
+) -> crate::work_home::RebaseAnswer {
   use crate::work_home::RebaseAnswer;
-  let (green_id, inc) = match build_increment(state, sealed, Vec::new()) {
+  let (green_id, inc) = match build_increment_on(engine.as_deref(), sealed, Vec::new()) {
     Ok(built) => built,
     Err(refusal) => return RebaseAnswer::Reply(refused(refusal)),
   };
-  let Some(engine) = state.greens.get_mut(&green_id) else {
+  let Some(engine) = engine else {
     return RebaseAnswer::Reply(refused(Refusal::NotFound));
   };
   match engine.rebase(&inc) {
@@ -9577,8 +9594,18 @@ pub(crate) fn owner_files(
   version: u64,
   paths: &[String],
 ) -> crate::work_files::FetchedBase {
+  base_files(state.greens.get(&green), version, paths)
+}
+
+/// [`owner_files`] over `engine`, the green's engine wherever it is held: its owner's, or a replica of it on the
+/// work's shard (A-465).
+pub(crate) fn base_files(
+  engine: Option<&slates_merge::engine::Green>,
+  version: u64,
+  paths: &[String],
+) -> crate::work_files::FetchedBase {
   let mut fetched = crate::work_files::FetchedBase::default();
-  let Some(engine) = state.greens.get(&green) else {
+  let Some(engine) = engine else {
     fetched.gone = true;
     return fetched;
   };
@@ -9601,10 +9628,21 @@ pub(crate) fn owner_page(
   green: DbVolumeId,
   version: u64,
   path: String,
+  range: (u64, u64),
+) -> crate::work_files::FetchedBase {
+  base_page(state.greens.get(&green), version, path, range)
+}
+
+/// [`owner_page`] over `engine`, the green's engine wherever it is held: its owner's, or a replica of it on the work's
+/// shard (A-465).
+pub(crate) fn base_page(
+  engine: Option<&slates_merge::engine::Green>,
+  version: u64,
+  path: String,
   (offset, want): (u64, u64),
 ) -> crate::work_files::FetchedBase {
   let mut fetched = crate::work_files::FetchedBase::default();
-  let Some(engine) = state.greens.get(&green) else {
+  let Some(engine) = engine else {
     fetched.gone = true;
     return fetched;
   };
@@ -9623,8 +9661,17 @@ pub(crate) fn owner_sizes(
   green: DbVolumeId,
   version: u64,
 ) -> crate::work_files::FetchedBase {
+  base_sizes(state.greens.get(&green), version)
+}
+
+/// [`owner_sizes`] over `engine`, the green's engine wherever it is held: its owner's, or a replica of it on the work's
+/// shard (A-465).
+pub(crate) fn base_sizes(
+  engine: Option<&slates_merge::engine::Green>,
+  version: u64,
+) -> crate::work_files::FetchedBase {
   let mut fetched = crate::work_files::FetchedBase::default();
-  let Some(engine) = state.greens.get(&green) else {
+  let Some(engine) = engine else {
     fetched.gone = true;
     return fetched;
   };
