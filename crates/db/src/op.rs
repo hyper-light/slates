@@ -467,6 +467,13 @@ pub enum Op {
     /// The policy.
     policy: crate::catalog::WritePolicy,
   },
+  /// An enrolled consumer's write policy was set by its launcher (A-285). Appended (2026-11-18).
+  ConsumerWritePolicySet {
+    /// The consumer.
+    consumer: u64,
+    /// The policy.
+    policy: crate::catalog::WritePolicy,
+  },
 }
 
 impl Op {
@@ -539,6 +546,7 @@ impl Op {
       Op::LiveHoldersCommitted { .. } => "live_holders_committed",
       Op::CompletionAwaiting { .. } => "completion_awaiting",
       Op::VolumeWritePolicySet { .. } => "volume_write_policy_set",
+      Op::ConsumerWritePolicySet { .. } => "consumer_write_policy_set",
     }
   }
 }

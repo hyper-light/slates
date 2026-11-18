@@ -6476,6 +6476,18 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > holder's `ConfigurationStale` now (pages and the adopted record), so a learner successor one version behind fetches
 > the configuration rather than asking under it for good (same bug record).
 >
+> **A candidate is covered only by its current incarnation's acceptance (2026-11-09, A-271).** "A key for every remote
+> candidate" above counts a candidate only once this shard's pair to its anchor was accepted by its current member id
+> (`live_ship::covered_anchor`): a node replaced at its own anchor (its store destroyed, a new member id) is not covered
+> by its predecessor's acceptance, so writes wait until it accepts its redelivered pair, and the whole entry already
+> written for the anchor then opens for it. A successor never makes the log's key: it reads only keys recorded here
+> (`seal_keys::recorded_lineage`, `recorded_namer`), a sealed log without them is refused `no_key`, and that refusal
+> waits for the key by event, bounded by `NO_KEY_WAIT_NS` (A-271 below). The store-destroyed flow on both Linux arches:
+> 48 of 48 taken over, the replacement the successor in 26, no key waited for (diag-live-durability-80; BENCHMARKS "A
+> live volume taken over by a node replaced at its own anchor"). Open: an owner lost after the replacement is
+> configured and before it accepts the owner's pair leaves the volume unserved while the replacement is its successor
+> (GAPS, 2026-11-17).
+>
 > **Phase one counts among the recorded holders (2026-11-06, A-240).** "Every candidate's report counts" above now
 > holds only for a candidate the shipper recorded as a holder. A member placed after the writes still reports and is
 > fenced, but does not count toward `f + 1`. Each shipper records its epoch and holders in the volume's catalog and
@@ -20943,6 +20955,56 @@ Applied in the same change to:
   - The process test, loadtest-scale's case: `a_restarted_owner_resets_its_old_session_and_b_reaches_the_new_process`
     (`crates/server/tests/fleet.rs`).
 
+### A-271 — A live volume's key reaches its successor before a write is durable on it; a successor never makes the key up, and waits for a missing one by event, bounded (accepted 2026-11-09)
+
+A node whose store is destroyed comes back under the same anchor with a new member id and none of its predecessor's
+keys. The owner's pair for that anchor had been accepted by the predecessor, and the durability gate counted the
+anchor (`covers_candidates`), so writes went durable on a key the replacement never received. As successor, its
+rebuild made a key on the spot, failed to open the log, refused the head for good, and kept the made-up key where the
+right one would go.
+
+- **Covered means accepted by the current incarnation.** A candidate counts toward a whole entry's cover only when
+  this shard's pair to its anchor was accepted by its current member id (`pairs_delivered` keeps the accepting member;
+  `covered_anchor`). New writes wait until a replacement accepts its redelivered pair (`fleet::deliver_pairs` already
+  owes one to a new incarnation).
+- **The pair is per (anchor, owner shard) by design** (`seal_keys::pair_for_delivery` reuses it), so the whole entry
+  already written for the anchor opens for the replacement the moment it accepts: no re-seal, no second whole entry. A
+  change to per-incarnation pairs must bring back a re-seal on acceptance and a read of the newest whole entry naming
+  the current incarnation.
+- **A holder's log begins at its newest whole entry or install image** (`live_ship::keep` and `serve_install` drop what
+  came before). A successor's fetch therefore reads the newest entry's key from the first payload. Pinned by
+  `a_holders_log_begins_at_the_newest_whole_entry_it_holds`; if retention changes, the fetch must read the newest whole
+  entry that names the successor (the fallback named here).
+- **A reader never makes a key.** Minting belongs to the owner's seal path (`seal_keys::lineage`, `namer`). Every
+  rebuild and successor path reads `recorded_lineage` and `recorded_namer`, and a sealed log with no keys recorded is
+  refused `no_key`, distinct from `open` (a payload that fails under keys held).
+- **A missing key is waited for by event, bounded.** The refusal keeps the head, the whole entry's sealing (a few
+  kilobytes, not the log) and when it began. Each attempt checks locally whether the key now unwraps; the log is
+  fetched once when it does or when the head moves; past `NO_KEY_WAIT_NS` (ten liveness budgets, `OBSERVE_BUDGET_NS`)
+  the takeover is answered `no_key_exhausted`, typed and counted, never waited on. The window this bounds: an owner
+  dying after a replacement joined and before it accepted its pair.
+
+Held by `a_pair_accepted_by_a_predecessor_at_the_same_anchor_does_not_cover_its_replacement`,
+`a_sealed_log_this_node_holds_no_key_for_is_refused_for_the_missing_key`,
+`a_missing_key_is_waited_for_and_the_log_fetched_once_it_comes`, `a_holders_log_begins_at_the_newest_whole_entry_it_holds`
+(`crates/server/src/live_ship.rs`) and `a_reader_without_the_key_records_none_and_adopts_the_right_one`
+(`crates/server/tests/seal.rs`). Owed: a deterministic skip in ranking computed from the durable whole entry's cover,
+model-first, if the bounded wait proves not enough.
+
+**The flow (2026-11-09, diag-live-durability-80).** The store-destroyed takeover (`crates/cli/tests/live_chaos.rs`:
+one candidate's node destroyed mid-stream and replaced at its anchor, the fleet recovered, then the owner killed), on
+A-271 with main db9c514e and the flows' fixed wait, release, 12 runs a leg, two legs on each Linux arch: 48 of 48
+served every acknowledged write. The replacement was the successor in 26 and served 1.997 to 2.481 s after the owner's
+kill; the key-wait counters read 0 on every survivor, so no successor lacked the key, the flow killing the owner only
+once the fleet has recovered (BENCHMARKS "A live volume taken over by a node replaced at its own anchor"). The window the bounded wait covers is held by the unit tests above, not by a flow, and the wait does not end
+it: only the owner's shard holds the replacement's pair (`fleet::deliver_pairs`), so with the owner dead the key never
+comes, and the volume is unserved while the replacement is its successor. So the bounded wait cannot be enough there:
+the skip in ranking owed above, or another way for the successor to obtain the key, is what ends it (GAPS "an owner
+lost before its replacement candidate accepted the owner's pair", 2026-11-17, read from the code).
+
+Applied in the same change to: §4.10's status (the cover rule), GAPS (A-271's entry, the recipient fix's, and the
+open window above), and BENCHMARKS.
+
 ### A-272 — A takeover's line is settled only on evidence; absence leaves it unresolved, and unresolved never reclaims (accepted 2026-11-09)
 
 A holder learns where a retired owner's object went from the configuration (`RegionalConfiguration::lineage`), and a
@@ -21610,8 +21672,11 @@ once as every merge did before policies. Built the same day: every launcher-clas
 approval, enroll, revoke) verifies under the daemon's issuer secret or the launcher secret its starter handed the anchor
 (`landing::proven_by_launcher`), so a launcher keeps its authority across its own restarts and the daemon's; and a
 `SetPolicy` names the policy version it replaces (`PolicyRecord.write_version`, covered by the proof), so a captured
-proof sets nothing once the policy has moved (`Refusal::PolicyChanged`). Owed, in order: a consumer's own policy, the
-MCP and SDK land verb gated by the policy, then signed work. The
+proof sets nothing once the policy has moved (`Refusal::PolicyChanged`). Built the same day: a consumer's own policy,
+kept in its record and on every shard's channels bound to it, held on the agent's shard before its request is routed
+(forbid refused; ask turns a landing into `Present` and a merge into `SubmitHeld`/`EditSubmitHeld`; bypass leaves the
+volume's mode to decide), so the stricter of consumer and volume governs; and the MCP and SDK land verbs, which send
+`Land` with no grant, say what the policy does. Owed: signed work. The
 SSH-signature verifier built first (below) stays, for signed work.
 - **The rule (Ada, 2026-11-18).** Merging and landing to disk follow the permission mode the user gave the harness or
   agent that asks. Bypass (Claude Code's `bypassPermissions`, Codex's full access): slates merges and writes, no

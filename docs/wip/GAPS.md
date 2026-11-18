@@ -140,8 +140,13 @@
 >   replaces, so a captured proof sets nothing once the policy moved (`Refusal::PolicyChanged`);
 >   `launcher_secret.rs` 1 of 1 (red with the launcher secret ignored), `write_policy.rs` 8 of 8 (the replay test red
 >   with the version check removed);
-> - a consumer's own policy, the stricter of consumer and volume governing (refused `Unsupported` today);
-> - the MCP and SDK land verb gated by the policy (the grant kind stays refused there);
+> - **built (2026-11-18):** a consumer's own policy (its record, set on the channel and reaching every shard's bound
+>   slots before the answer, as a revocation does), held on the agent's own shard before routing: forbid refused,
+>   ask turns a landing into a presentation and a merge into a held submit (`SubmitHeld`, `EditSubmitHeld`), bypass
+>   passes to the volume's mode, so the stricter governs; `write_policy.rs` 9 of 9, the consumer test red with the
+>   gate removed;
+> - **built (2026-11-18):** the MCP and SDK land verb follows the policy (it already sent `Land`; its promises now
+>   say so); `assert_materialize_lands_under_a_bypass_policy` over MCP;
 > - signed work: a merge or landing may carry an SSH signature, checked and recorded (verified with its signer,
 >   unsigned, invalid with its reason), and a volume may require signed merges;
 > - the end-to-end proof on adacachy: a bypass agent's landing written at once, an ask agent's after approval, a
@@ -466,6 +471,53 @@
 > Open: no process test yet takes over an old incarnation's volume after its replacement's key arrived (the retired
 > key's path). Bug record `docs/bugs/2026-11-07-a-node-back-at-its-anchor-with-fresh-ram-had-every-pair-key-refused.md`.
 
+> **Fixed (live-durability, 2026-11-09, A-271): a replacement at its own anchor could be the successor of a live volume
+> whose key it never received.** In the store-destroyed takeover (main, release on the Mac: 5 of 5 replacement-as-
+> successor runs out of 8 failed), the destroyed candidate's replacement came back under the same anchor with a new
+> member id. The owner's pair for that anchor had been accepted by the destroyed incarnation, and `covers_candidates`
+> counted the anchor, so writes went durable on a key the replacement never held. Its rebuild then made a fresh
+> lineage key through `seal_keys::lineage`, failed to open the log under it, and was refused `open`, final for the
+> head: it waited for a head that could not move (`takeover_waits_new_head` 368 to 381 a run), and the key it made
+> stayed recorded where `adopt_lineage` keeps one. Now:
+> - a candidate is covered only when its current member id accepted the anchor's pair (`covered_anchor`), for the
+>   durability gate (`covers_candidates`) and the period's re-checkpoint (`coverable_now`);
+> - a reader never makes a key: `seal_keys::recorded_lineage` and `recorded_namer` for every rebuild and successor
+>   path; a sealed log with no keys here is refused `no_key`;
+> - a `no_key` refusal waits for the key, checked locally from the refused entry's sealing with no fetch, fetches once
+>   when it unwraps or the head moves, and past `NO_KEY_WAIT_NS` (ten liveness budgets) is answered
+>   `takeover_no_key_exhausted`. Counted: `takeover_waits_key`, `takeover_key_arrived`, `takeover_no_key_exhausted`.
+> Before, a successor retried each period and re-fetched the whole log 104 to 204 times a run.
+> The flow (diag-live-durability-80: A-271 with main db9c514e, the recipient fix, and the flows' fixed wait; release,
+> GitHub `ubuntu-latest` and `ubuntu-24.04-arm`, 4 CPUs each, 12 runs a leg, two legs an arch): the store-destroyed
+> takeover passed 48 of 48, every acknowledged write served by the successor. The replacement was the successor and
+> served in 26 (13 a arch), 1.997 to 2.481 s after the owner's kill (median 2.014 s x86, 2.009 s arm); the other
+> survivor in 22. On every survivor of every run `takeover_waits_key`, `takeover_key_arrived`,
+> `takeover_no_key_exhausted`, `takeover_refused.no_key`, `fleet.takeover.reclaimed` and `fleet.takeover.lost` read 0:
+> each replacement had accepted its redelivered pair before the owner died, so no successor waited for a key. Before
+> the fixed wait (diag-live-durability-75, A-271 with B9 and the recipient fix) 45 of 48 failed, mode B (below). Owed:
+> the flow re-run on the merged main (BENCHMARKS "A live volume taken over by a node replaced at its own anchor").
+
+> **Open (g240, 2026-11-17, A-271's owed skip; read from the code, no run has reached it): an owner lost before its
+> replacement candidate accepted the owner's pair leaves the volume unserved while that replacement is its successor.**
+> A replacement enters the neighbourhood before it holds the owner shard's pair: the owner delivers one only to a
+> configured neighbour, once a record period (`fleet::deliver_pairs`), and no other node holds that pair. The
+> successor is the cohort member rendezvous ranks first, from the configuration alone
+> (`RegionalConfiguration::successor`), so the replacement can be it. If the owner dies in that window (from the
+> replacement's configuration to the owner's next record period that delivers the pair), the key the replacement
+> waits for can never come: its wait ends `takeover_no_key_exhausted` at that head for good, and the head cannot move
+> with the owner dead, so no survivor serves the volume until the replacement leaves. Nothing acknowledged is lost:
+> writes wait in that window (the cover gate above), and the holders keep their copies (A-272). The flows never reach
+> it: they kill the owner only once the fleet has recovered, and by then no successor lacked the key (48 of 48 runs,
+> every key-wait counter 0). While the replacement is not yet seated the owner's death is a second failure, past the
+> `f` the fleet has spent; but nothing orders the pair's acceptance before the seat, and a delivery that fails waits
+> for the next record period (`fleet.seal.pair_recipient_unknown`, `fleet.seal.pair_undelivered`), so how long the
+> window can outlast the seat, where the owner's death is a single failure, is not measured.
+> The sibling, read the same way: a sealed head's envelope opens only through the lineage key the head wraps for each
+> candidate's anchor under the same pair (A-92 piece 4c), so a replacement successor in that window leaves it unopened
+> (`fleet.seal.envelope_unopened`, `fleet::opened_archive`) and that volume unserved too. Owed for both: the
+> deterministic skip in ranking A-271 names (model-first, §4.8), or another way for the successor to obtain the key,
+> then a process test that kills the owner inside the window (`Daemon::inject_pair_withhold` holds it open).
+
 > **Fixed (live-durability, 2026-11-08): each caller judged a dead session by its own clock.** The live lane's watch
 > waited a fixed second of silence, and the forward lane its own. On the fabric the fixed second cut a live holder
 > whose answers a queue held back 1.1 to 2.0 s apart. The transport now makes the one judgement,
@@ -494,7 +546,8 @@
 > runs). The cached key now carries the member it was learned from (`fleet::kept_recipient`, red with the member ignored).
 > A sweep of every map keyed by anchor or certificate in `fleet`, the transport and `seal_keys` found no other keeping
 > anything from a lost store (docs/bugs/2026-11-09-a-replacements-pairs-were-wrapped-to-its-destroyed-predecessors-key.md).
-> The flow-level reproduction is re-run with A-271 once this lands.
+> Re-run with A-271 and the flows' fixed wait (diag-live-durability-80): 48 of 48 store-destroyed takeovers served, the
+> replacement the successor in 26, no key waited for (A-271's entry above).
 
 > **Fixed (live-durability, 2026-11-09, A-272): a takeover that adopted nothing could let every holder delete its copy.**
 > A round declared an object lost when its settled cohort had fewer members than its recovery quorum, dropped it from
@@ -520,6 +573,30 @@
 > **Open (A-272 ii):** an unresolved object is kept but recovered by no one. Owed: kept adoption records, so Settled
 > rests on one, and a round of the current members for unresolved objects, so `f + 1` counts the members that exist
 > now (here, the replacement that holds the live log).
+
+> **Open (live-durability, 2026-11-09; A-272 ii adjacent): an object whose line never passed through an unconfirmed
+> predecessor reads lost on a second failure inside that predecessor's takeover window.** A host that retires before
+> confirming its share of an earlier retirement records it as `unconfirmed`, and `RegionalConfiguration::recovery_cohorts`
+> then recovers **every** object of the host jointly with the predecessor's cohort, not only the objects it was taking
+> over from it. In the store-destroyed flow (diag-live-durability-77, x86 run 1): old b destroyed, the owner killed
+> before it confirmed old b's takeover; the owner's own volume, its cohort {owner, the replacement, c} short of the owner
+> alone, was recovered jointly with old b's {old b, owner, c}, of which only c was left; the survivor counted 8 objects
+> lost (A-272 keeps the copies; none is served). Owed, model first: whether the joint cohort may apply only to objects
+> whose line passes through the unconfirmed host, in §4.8's model text, with A-272 (ii)'s lineage model; a wrong
+> narrowing would lose data, so no change before it.
+
+> **Fixed (live-durability, 2026-11-09): the store-destroyed flow's mode B was the flow's own wait.** No survivor took
+> the volume over and every takeover counter read zero: 11 of 12 runs on A-271's tree (diag-live-durability-77) and 11
+> of 12 on main without it (-78), both arches; 3 of 3 passed on the Mac. The flow killed the owner once
+> `wait_council_seated` saw no joint and the same voters on every node, which holds before the replacement's voter
+> change begins: in 7 runs the replacement was not yet a voter and the owner's death left one live voter of three, in
+> 13 the change began after the wait and the owner died inside it, and in 1 the destroyed node's takeover was still
+> kept (the cohort finding above). `wait_recovered` now also needs every node's own member id among the voters and no
+> retirement kept, judged by progress as the wait it replaced was (it fails, naming what is missing, only after a whole
+> fleet wait with no change; since 2026-11-17 the nemesis flows' whole-recovery wait seats through it too). Red first:
+> `a_replacement_not_yet_voting_or_a_takeover_still_kept_is_not_recovered`. Not a slates defect. After, release on
+> both Linux arches: main B10 with the wait alone (diag-live-durability-79) passed the store-destroyed flow 24 of 24 and
+> the candidate-killed flow 12 of 12; with A-271 too (-80), store-destroyed 48 of 48.
 
 > **Fixed (live-durability, 2026-11-08): an OS socket awaited on the simulation driver woke only on its timers.**
 > The simulation driver took a readiness wait's handle for a fabric port, so an OS socket bound off a shard waited
