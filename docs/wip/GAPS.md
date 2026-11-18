@@ -502,7 +502,8 @@
 >   removed), a whole and a paged read's (`merge_service.rs`), a listing's of a file (`listing.rs`). Their tests are in
 >   `crates/client/tests/client.rs`. The 11 admission arms that sent a memory error other than `BudgetExceeded`, and the
 >   two that answered a full registry, in words now go through `refusal_of_mem` (`crates/server/src/error.rs`), as a
->   database's memory refusal does. `refusal_of_db`'s last catch-all, which sent `Corrupt`, `NfsInstanceRegressed`,
+>   database's memory refusal does. a snapshot's retention refused is typed apart from the quota (`VolumeRefusal::RetentionExceeded`, `CONTRACT` = 18,
+>   where it was `NoSpace`, read as the quota); `refusal_of_db`'s last catch-all, which sent `Corrupt`, `NfsInstanceRegressed`,
 >   `CheckpointOutOfRange`, `SealKeyMalformed` and `Wire` as words, is gone: each is `Refusal::Database {
 >   DatabaseRefusal }`, appended, which the contract classes `Unusable::Database` (`CONTRACT` = 17);) typed fields on the wire for a landing target's refusal (`TargetUnavailable` carries words), a merge's versions
 >   (the work's base beside the head), and the words the crate still reads from the daemon's closed tables (a landing's
@@ -1328,7 +1329,27 @@
 > - **Open (A-309): a holder the round never asked keeps its copy** (`fleet.takeover.kept_unasked`). A neighbourhood an
 >   owner settled away from keeps the owner's copies; before A-309 they went when the owner's takeover settled, safe
 >   only within tolerance. Owed: such a holder lets them go at the settle, on the owner's report that every record it
->   owns is placed on the new neighbourhood.
+>   owns is placed on the new neighbourhood. **Wrong as stated (A-335, g250, 2026-11-18):** the settle report covers
+>   records, not content; the head goes on naming its content's holders, the healer leaves a named holder outside the
+>   candidates and relies on it keeping the copy (A-276's open item), and a holder that dropped its content at the
+>   settle would leave the owner's head naming a holder without it. Owed now, in order: register copies whose content
+>   no head the holder holds names go on that rule (g250's next piece); content goes only on the content's own
+>   certificate, the release below.
+> - **Fixed (A-335, g250, 2026-11-18): a stale-copy reclaim dropped content a successor still fetched.** A holder
+>   outside the successor's placement let its copy go whole at the successor's confirmation or the completion record,
+>   while the confirmation certifies the record adopted and the successor fetches content from the adopted head's holders
+>   alone; at `f = 1`, with the dead owner the head's only other holder, one failure lost the volume. A stale copy now
+>   goes only once its retention rule leaves no content held for it, else it is kept whole
+>   (`fleet.takeover.kept_holding_content`). Tests: `a_holder_outside_the_successors_placement_keeps_the_content_its_
+>   head_names`, `a_lagging_holder_keeps_the_content_its_head_names_when_the_takeover_completes`
+>   (`crates/server/src/daemon.rs`), red before. Bug record:
+>   `docs/bugs/2026-11-18-a-stale-copy-reclaim-dropped-content-a-successor-still-fetched.md`.
+> - **Open (A-335): the release of a copy kept for its content** (`fleet.takeover.kept_holding_content`). It stays
+>   until a newer record reaches its holder, and a holder outside the successor's placement receives none: a leak
+>   bounded by what it holds, never a loss. Owed (g250): a successor confirms its share only once its adopted volumes'
+>   content is re-placed under its own placement (the head republished naming that set, as the healer's replace does),
+>   and an owner's settle certifies its content as well as its records; a holder outside the placement then lets go.
+>   With it, A-276's open item (a named holder outside the candidates) closes the same way.
 > - **Residual, recorded:** a line through a retirement the bound let go before it completed stays unresolved and
 >   unrecovered; re-ranking it could adopt a stale copy beside a live adopter the configuration no longer knows. A
 >   neighbourhood an unsettled owner wrote to before the last one it moved to is not recorded: past tolerance a copy
@@ -1807,12 +1828,41 @@
 > `fleet` binary exited 4 on a wedge verdict that came 146 s past its window (g231 on a 15-CPU Mac at load 62 to 131,
 > 0.2 to 1 GB free; one poll measured 160,662 ms): the whole process had gone unscheduled, the watchdog's thread with
 > it, and the look after its gap judged every shard still for the gap. A look a window or more after the watchdog's
-> last now starts each shard's still time again (`a_gap_in_the_watchdogs_own_looks_is_not_counted_as_a_wedge`). Open: a
-> shard held in the kernel past a watched window (a page-in at that pressure) is still judged wedged; telling `D` and
-> XNU's uninterruptible wait from a sleep is the 2026-10-22 entry's owed decision. Also from the same report, a test's
+> last now starts each shard's still time again (`a_gap_in_the_watchdogs_own_looks_is_not_counted_as_a_wedge`). Open
+> then, closed 2026-11-18 by A-336 (the entry below): a shard held in the kernel past a watched window (a page-in at that
+> pressure) was still judged wedged; telling `D` and XNU's uninterruptible wait from a sleep was the owed decision.
+> Also from the same report, a test's
 > bound, not the product: `a_lone_daemons_spinning_shard_ends_its_process_and_the_call_ends_daemon_gone` gave up its
 > loop at ten windows of wall while its call was inside its own bound after an exit that came 8.49 s after the hold;
 > the loop now runs to the call's bound after the exit.
+
+> **A shard waiting on memory was judged wedged (found 2026-11-17, decided and fixed 2026-11-18, A-336).** A thread
+> waiting on a page-in, a reclaim or a refault is neither running nor runnable, so A-228's rule called it wedged: a lone
+> daemon at a few hundred megabytes free ended itself (exit 4; fleet test binaries at 0.2 to 1 GB free on a 15-CPU Mac,
+> g231), and an anchor that found a daemon's watchdog silent judged the paging process stuck and killed it. Decided by
+> the supervisor by A-228's rule: at a look that suspects a shard the watchdog reads the host's memory stall (Linux PSI
+> memory `some` risen, macOS `kern.memorystatus_vm_pressure_level` above normal, Windows' low-memory notification), and
+> a still shard off the CPU in a wait memory shows as (Linux `D`; any blocked wait where the platform does not tell)
+> while the host stalled is `Starved { of: Memory }`, which beats; it is judged wedged a window after the stall clears.
+> The anchor's start and lapse judgment apply it to the whole process. `some`, not the decision's `full`: FULL never
+> holds on a busy machine's CPU that runs anything else (`kernel/sched/psi.c`), which is the case the rule is for.
+> Regressions: the watchdog's replays and table (`crates/server/src/watchdog.rs`), the watchdog's loop with the host's
+> reading put in its place and a shard held in the kernel by a vfork's wait (`crates/server/tests/liveness.rs`), the
+> anchor's judgment of a held child process (`crates/api/src/role/anchor.rs`), and the readers' tests. Open:
+> - **The waits judged in a shard's own time (A-228's sibling).** An observation and a cross-shard call
+>   (`observe::ShardTime`) still give up on a shard that waits on memory through a window: an observation ends
+>   `Deadline`, a cross-shard verb is refused. Next piece (g251).
+> - **A shard asleep on a lock whose holder pages (Linux).** Its own state is `S`, so it is judged wedged however the
+>   host stalls; the holder is not named, as for a starved holder ("the lock a starved test thread held is not named").
+>   macOS and Windows excuse any blocked wait while the host stalls, so they do not judge it.
+> - **Windows' per-thread wait reason.** The snapshot the watchdog already takes holds each thread's `WaitReason`
+>   (`WrPageIn`, `WrFreePage`, `WrVirtualMemory` and their kin), which would be the thread's own reading there, as `D` is
+>   on Linux. Not read; needs a Windows run.
+> - **A spinning verdict for the kernel's reclaim.** A poll whose CPU is direct reclaim on its behalf runs CPU without a
+>   step and can be judged spinning; not seen.
+> - **Evidence under real pressure.** The rule is proven by the readings put in place and by a thread held in the
+>   kernel; a daemon in a host truly short of memory (a bounded container with swap, a few hundred MB) is the
+>   measurer's run.
 
 > **ThreadSanitizer's slow polls ended in-process daemons' test binaries (found 2026-11-17, fixed 2026-11-18, A-318).**
 > Main's TSan lane had been red on every push since A-232: in run 44238377555 the `client` test binary died with
@@ -10995,7 +11045,9 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
     the cohort) refuses a placement from the owner (`content_authority`), so it can be neither re-offered to nor
     verified: the heal leaves it named and counts `fleet.heal.named_outside_candidates`. If it loses its copy, the head
     names a holder without the content. Recommended: replace it as a departed holder is (one republish per volume per
-    such change), so every holder a head names is one the owner can restore.
+    such change), so every holder a head names is one the owner can restore. (Since A-335, 2026-11-18, a takeover's
+    stale-copy reclaim no longer drops such a holder's content either: it keeps the copy whole while it holds content;
+    the release that ends it is owed with this replace, g250.)
   - A departure is healed at the healer's cadence, one placed snapshot per hundred periods at rest, so a node owning
     many volumes leaves the last of them naming the departed holder for a long walk; a second failure inside that walk
     loses them at `f = 1`. Recommended: on a retirement, heal first the volumes whose placement names the retired host.
