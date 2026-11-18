@@ -96,8 +96,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// (2026-11-18). 2: `Denied::Policy`, the class a write policy's refusal takes outside a landing or a merge (the
 /// same day). 3: `Instance::set_write_policy` and `Instance::write_policy`, over the daemon's policy verbs (A-285), and
 /// a landing or a merge a policy forbids answered as its `Refused` outcome (the same day). 4: the audit log and the
-/// grant listing typed (`AuditRecord`, `GrantRecord`; the same day).
-pub const CONTRACT: u32 = 4;
+/// grant listing typed (`AuditRecord`, `GrantRecord`; the same day). 5: `WritePolicy::UNSET` merges at once and asks
+/// for landings, as the daemon applies an unset policy (the same day).
+pub const CONTRACT: u32 = 5;
 
 /// The typed client and its own types, for the verbs [`Instance::client`] lends outside the contract.
 pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, VhostUserDevice};

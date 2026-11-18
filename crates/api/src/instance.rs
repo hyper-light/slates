@@ -641,8 +641,8 @@ impl Instance {
       .map_err(|e| self.fail(e, Some(missing_subject(subject))))
   }
 
-  /// `subject`'s write policy as the daemon holds it, or `None` while nobody has set one, which asks for both acts
-  /// ([`WritePolicy::UNSET`]).
+  /// `subject`'s write policy as the daemon holds it, or `None` while nobody has set one, which merges at once and
+  /// asks for landings ([`WritePolicy::UNSET`]).
   pub fn write_policy(&mut self, subject: PolicySubject) -> Result<Option<WritePolicy>, Error> {
     self
       .client

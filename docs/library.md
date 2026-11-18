@@ -68,7 +68,8 @@ green) follow the permission the user gave the harness or agent asking to write:
 
 Conflicts are their own outcome in both (`Conflicted`), typed per path. The launcher sets a
 `WritePolicy` per volume with `Instance::set_write_policy(PolicySubject::Volume(v), &policy, &issuer)`
-and reads it with `write_policy` (`None` while unset, which asks); an act follows the stricter of
+and reads it with `write_policy` (`None` while unset: merges run at once, landings ask); an act
+follows the stricter of
 the volume's and, once the daemon keeps them, the agent's own; an agent can never raise its own (the
 daemon refuses the verb on an agent's channel). The launcher approves an ask with
 `Instance::approve(&approval, &issuer)`, which writes exactly the manifest shown or answers the new

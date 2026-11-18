@@ -6965,8 +6965,9 @@ it builds against the contract and adds to it rather than around it.
   presents, and writes once it is approved; **forbid** answers a typed refusal (`Refused`). The
   launcher (kiln passes each agent's mode) or the harness sets a policy per enrolled consumer (an
   agent's session, §4.13 "Principals") or per volume; an act follows the stricter of its caller's
-  and its volume's (`WritePolicy::meet`); a subject with no policy is asked, which is how every
-  landing behaved before. No key, signature or person-only proof decides it. An agent never raises
+  and its volume's (`WritePolicy::meet`); a subject with no policy keeps what every subject did
+  before (`WritePolicy::UNSET`): its merges run at once (a change in memory) and its landings ask (a
+  write to disk waits for an approval, R10). No key, signature or person-only proof decides it. An agent never raises
   its own mode: setting a policy and approving need the launcher's authority — the instance's
   issuer, handed to whoever starts the instance — which the daemon refuses on a consumer's channel,
   and an agent holds only its consumer's capability. The daemon keeps and enforces the policies
@@ -7048,7 +7049,8 @@ it builds against the contract and adds to it rather than around it.
 
 > **Status (2026-11-18, A-299, piece 5: the write modes reach the contract).** Over A-285's policy
 > wire (203ad8fa): `Instance::set_write_policy(subject, &policy, &launcher)`, proven by the
-> launcher's issuer, and `Instance::write_policy(subject)` (`None` while unset, which asks); a
+> launcher's issuer, and `Instance::write_policy(subject)` (`None` while unset: merges at once,
+> landings ask); a
 > landing or a merge a policy forbids answers its `Refused` outcome (`PolicyRefusal { act, by,
 > reason }`), any other call `Denied::Policy`; a policy that requires signed merges is refused
 > `Unsupported(SignedWork)` before anything is sent, since the daemon keeps no such requirement yet;
@@ -7061,6 +7063,8 @@ it builds against the contract and adds to it rather than around it.
 > refused before the daemon is asked). **Piece 6:** the audit log and the grant listing typed
 > (`AuditRecord` with `AuditKind` and a `LandingStage` outcome; `GrantRecord` with `GrantState`), each
 > word of the daemon's closed tables read in one place and a stranger a protocol fault; `CONTRACT` = 4.
+> `CONTRACT` = 5: `WritePolicy::UNSET` merges at once and asks for landings, as the daemon applies an
+> unset policy (agreed with A-285's owner; R10 asks for a disk write, a merge changes memory).
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -21387,6 +21391,9 @@ contract", new, with its status), GAPS (the A-299 entry and the Embedding librar
   `LandingStage`, `GrantRecord`, `GrantState`), read from the daemon's closed name tables in one place; `CONTRACT` 4.
   Checked by unit tests over every word and a stranger, and by use: after a landing the audit holds the presentation,
   the issued grant and the landing finished `Done`, and the single-use grant is listed `Consumed`.
+- **`CONTRACT` 5, the same day:** `WritePolicy::UNSET` merges at once and asks for landings (it read ask for both).
+  The daemon applies an unset policy so (A-285's owner raised it): R10 asks for a write to disk, while a merge changes
+  memory, and every submit merged at once before write modes existed, kiln's included.
 - **Checked.** `cargo test -p slates-api` (37 unit, 9 by use, 5 start, 1 doc) and `cargo test -p slates-cli` on
   macOS arm64 (kiln runner, 2026-11-18): the cases in §4.12's status. The Linux and Windows arms of the mount and the
   CLI's Windows unmount are not compiled on this host; the integrator's lanes are their first compiler.
