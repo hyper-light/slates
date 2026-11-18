@@ -7108,6 +7108,13 @@ it builds against the contract and adds to it rather than around it.
 > `LandingApproval`, approved by `approve_landing`; `merge` takes evidence. Proven by use
 > (`a_merge_follows_its_greens_write_mode`: an ask green holds the merge, nothing merged; a stranger's
 > approval asks again; the shown one merges at 1; a forbidding green refuses).
+> **`CONTRACT` = 7, the launcher's own secret:** `LauncherSecret` (made from the TLS provider's
+> secure random, kept by the host), `StartSpec::with_launcher`, carried on the anchor's standard input
+> as one checked record in a pipe closed before the spawn, read first and published into the segment
+> before any daemon (a bad record refused, exit 1, before anything is held);
+> `Issuer::from_launcher_secret` proves with it after the host's restart as before (the daemon's
+> verification is A-285's owner's next piece). Proven by use: an instance started with a secret serves;
+> an anchor handed garbage or a short record refuses to start.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -21466,6 +21473,19 @@ contract", new, with its status), GAPS (the A-299 entry and the Embedding librar
   regions' names and the boot incarnation derive from it (A-176). Built here: `AnchorSegment::publish_launcher_secret`
   and `launcher_secret` (`crates/anchor`), with `a_published_launcher_secret_is_read_by_a_later_attachment`. Next: the
   starter's delivery on the anchor's standard input and `Issuer::from_launcher_secret`.
+- **The launcher secret, piece 2 (delivery and proofs), the same day; `CONTRACT` 7.** `crates/api/src/launcher.rs`:
+  `LauncherSecret` (`generate` from the TLS provider's secure random, `from_bytes` refusing all zero, a redacted
+  `Debug`), the record (magic `SLLA`, the secret, CRC32C; 40 bytes) with its typed `LauncherFault`s, and the anchor's
+  read. `StartSpec::launcher` / `with_launcher`; `anchor_command` (now fallible, `StartFault::Launcher`) writes the
+  record into a fresh pipe, closes its write end before the spawn and hands the read end as the anchor's standard
+  input with `SLATES_LAUNCHER=stdin`: never an environment variable, which every process of the user reads, and an
+  input that passes unchanged through `systemd-run --scope`'s exec. The anchor reads it before it measures, holds or
+  creates anything (a bad record refused `EXIT_REFUSED`) and publishes it before any daemon. `Issuer::from_launcher_secret`
+  proves grants, merges, policies, enrollments and revocations with no segment attached; a consensus recovery stays the
+  segment's (`IssuerFault::LauncherCannotRecover`). Checked by unit tests (the record whole and as written, each fault;
+  two generated secrets distinct) and by use in `tests/start.rs` (an instance started with a secret serves; garbage and
+  a short record each refused at the anchor's start). Owed: the daemon's verification under it (A-285's owner), then a
+  by-use proof that a launcher-keyed `set_write_policy` and approval verify after a daemon restart.
 - **Checked.** `cargo test -p slates-api` (37 unit, 9 by use, 5 start, 1 doc) and `cargo test -p slates-cli` on
   macOS arm64 (kiln runner, 2026-11-18): the cases in §4.12's status. The Linux and Windows arms of the mount and the
   CLI's Windows unmount are not compiled on this host; the integrator's lanes are their first compiler.
