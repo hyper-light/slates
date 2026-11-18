@@ -418,9 +418,16 @@
 >   successor's half, on Linux:** recovery keeps a stream whose resync end the anchor held and serves it on a fresh
 >   stream, sending the device a `Resync` with its end; a resent request the dead daemon published is answered from its
 >   published reply, never run twice; a stream's writes are logged as a mount's are (A-63), which also fixes their loss
->   at a death for streams that are not resynced. **Owed:** macOS (the channel's hand-off and the write log); the anchor
->   holding a stream's DAX objects (until then a stream gives its resync up at its guest's first DAX map); Windows on
->   Shards' handle path. Shards owes its device's half, after its v0.8.0 tag.
+>   at a death for streams that are not resynced. **And on macOS (A-339, 2026-11-18), the attach's half:** the channel
+>   a stream of 28-byte messages there (a datagram pair's survivor is never told its peer has gone), its device end
+>   beside the stream's in the socket route's confirmation, and the daemon keeping its own copy of its held end, since
+>   macOS flushes a socket whose every copy rides a message. **Owed:** macOS's successor's half (the write log there,
+>   recovery keeping the attachment, the fresh stream handed over the held end); the anchor holding a stream's DAX
+>   objects (until then a stream gives its resync up at its guest's first DAX map); Windows on Shards' handle path, and
+>   a write log for a Windows stream, whose acknowledged writes a death still loses whether or not it is resynced.
+>   Found beside it (Linux too): a resynced stream whose dead daemon's log overflowed is not told which writes it lost
+>   (a FUSE mount is, `LostWrites`); and a stream's `FORGET`s are not logged, so a resynced stream keeps the references
+>   a lost one gave back until it ends. Shards owes its device's half, after its v0.8.0 tag.
 > - Shards' side, after its v0.8.0 tag and landed by its coordinator from signed branches: its own server enforcing a
 >   guest's ACLs as slates now does (`FUSE_POSIX_ACL`, queued by its coordinator), its guest test over a
 >   slates stream on Linux and macOS (`tests/slates_fs.rs`, Windows only today), the bump of the slates revision it
