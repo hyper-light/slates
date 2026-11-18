@@ -30176,7 +30176,10 @@ Applied in the same change to: `crates/vfs/src/{captured,lib,volume}.rs` (`captu
   poll that sleeps, which takes no step and reads blocked, so each is still refused `Overloaded` at the first window, as
   they assert; the stand-in of `a_bounded_wait_for_room_waits_its_period_in_time_on_a_starved_shard` never steps and has
   no thread to read, so it is given up at its first window too.
-  EVIDENCE_PLACEHOLDER
+  Run on the Mac Studio (kiln, 2026-11-18, load 8-12, debug build, `cargo test --locked -p slates-server --lib -- room
+  xshard:: work_home`): 19 of 19, both new tests and every room wait's with them. Red-checked once: with the judge
+  never consulted past the first window, the stand-in test fails at its send. The scatter suites of
+  `ack_release.rs` and the green owner's batch flows are filed for main's run.
 
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class A), `crates/server/src/{verbs,xshard,
 work_home,observe}.rs` (`observe::held_to_this_build` shared with the room rule).
