@@ -559,6 +559,17 @@ impl Instance {
       Ok(Submitted::Conflict(windows)) => self
         .merge_conflicts(work, windows)
         .map(MergeOutcome::Conflicted),
+      // An ask write policy holds the merge (A-285): a merge has no presentation, so the approval binds the
+      // increment's identity, carried as the manifest. Placeholder shape until the contract maps it (g262).
+      Ok(Submitted::ApprovalRequired { identity, .. }) => {
+        Ok(MergeOutcome::ApprovalRequired(Approval {
+          awaiting: Awaiting::Merge(*work),
+          id: 0,
+          manifest: identity,
+          summary: crate::outcome::Summary::default(),
+          verification: Verification::Unsigned,
+        }))
+      }
       Err(error) => Err(self.fail(error, Some(Missing::Volume(work.volume)))),
     }
   }

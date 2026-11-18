@@ -21208,8 +21208,14 @@ Status: a volume's write policy and landing under it are built (2026-11-18): the
 volume's record (`PolicyRecord.write`, op `VolumeWritePolicySet`), set only under the issuer and never from a
 consumer-bound channel; a landing under it, on every Unix host: forbid refuses before any host access, ask answers the
 approval request a launcher's grant approves, bypass grants the planned presentation itself (`GrantSurface::Policy`)
-and lands it in the same request (`landing::land_under_policy`). Owed, in order: a consumer's own policy (the stricter
-of consumer and volume), merges under the policy, the MCP and SDK land verb gated by it, then signed work. The
+and lands it in the same request (`landing::land_under_policy`). Built the same day: `Present`, a landing presented and
+never landed whatever the mode (a reviewer's read of a bypass volume's changes writes nothing); merges under the policy,
+the stricter of the work's and the green's merge mode, forbid refused before the seal, ask answered
+`MergeApprovalRequired` with the increment's identity and its path count and merged by `SubmitApproved` under the
+launcher's proof of exactly that identity (`landing::merge_approval_proof`), a volume with no merge mode set merging at
+once as every merge did before policies. Owed, in order: the launcher secret (g262's, steps 1-4) and launcher-class
+proofs under it with a policy version against replay (mine), a consumer's own policy, the MCP and SDK land verb gated by
+the policy, then signed work. The
 SSH-signature verifier built first (below) stays, for signed work.
 - **The rule (Ada, 2026-11-18).** Merging and landing to disk follow the permission mode the user gave the harness or
   agent that asks. Bypass (Claude Code's `bypassPermissions`, Codex's full access): slates merges and writes, no

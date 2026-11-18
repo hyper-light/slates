@@ -4050,6 +4050,7 @@ fn claims_placed_durability(body: &RequestBody) -> bool {
       | RequestBody::Clone { .. }
       | RequestBody::Snapshot { .. }
       | RequestBody::Submit { .. }
+      | RequestBody::SubmitApproved { .. }
       | RequestBody::EditSubmit { .. }
       | RequestBody::ImageBuild { .. }
       | RequestBody::ImageMerge { .. }
@@ -4221,7 +4222,13 @@ fn dispatch_inner(
       bytes,
     } => edit(state, principal, work, &path, at, delete_len, &bytes),
     RequestBody::Declare { work, op } => declare(state, principal, work, op),
-    RequestBody::Submit { work, evidence } => submit(state, principal, work, evidence),
+    RequestBody::Submit { work, evidence } => submit(state, principal, work, evidence, None),
+    RequestBody::SubmitApproved {
+      work,
+      evidence,
+      identity,
+      proof,
+    } => submit_approved(state, principal, (work, evidence), identity, proof),
     RequestBody::EditSubmit {
       work,
       path,
@@ -4395,6 +4402,25 @@ fn dispatch_inner(
         target: &target,
         filter: &filter,
         grant,
+        present_only: false,
+      },
+    ),
+    RequestBody::Present {
+      volume,
+      snapshot,
+      target,
+      filter,
+    } => crate::landing::land_verb(
+      state,
+      client_id,
+      principal,
+      crate::landing::LandCall {
+        volume,
+        snapshot,
+        target: &target,
+        filter: &filter,
+        grant: None,
+        present_only: true,
       },
     ),
     RequestBody::FsWrite {
@@ -6320,7 +6346,7 @@ fn edit_and_submit(
     ),
   };
   match edited {
-    ReplyBody::Edited => submit(state, principal, work, evidence),
+    ReplyBody::Edited => submit(state, principal, work, evidence, None),
     refused_edit => refused_edit,
   }
 }
@@ -6775,17 +6801,81 @@ fn merge_windows(
 /// Submits a work volume's declared operations to its green as an increment (§4.16): compose the
 /// declared operations into the canonical document, seal the post-state, hash the identity, and run
 /// the green's merge verdict — accepted with the new version, or the conflict windows to rebase.
+/// Serves `SubmitApproved` (A-285): the launcher's approval of exactly one increment, proven under the issuer secret,
+/// then the submit with that approval. Refused `Forbidden` for a consumer principal, whatever its proof (an agent never
+/// approves its own merge), and `GrantIssuerUnverified` when the proof does not verify.
+fn submit_approved(
+  state: &mut ShardState,
+  principal: &Principal,
+  (work, evidence): (VolumeId, Vec<[u8; 32]>),
+  identity: [u8; 32],
+  proof: [u8; 32],
+) -> ReplyBody {
+  if matches!(principal, Principal::Consumer { .. }) {
+    state.count("merge_approved_by_consumer", 1);
+    return forbidden("submit_approved");
+  }
+  let expected = crate::landing::merge_approval_proof(&state.issuer_secret, work, &identity);
+  if !crate::landing::constant_time_eq(&expected, &proof) {
+    state.count("grant_issuer_unverified", 1);
+    return refused(Refusal::GrantIssuerUnverified);
+  }
+  submit(state, principal, work, evidence, Some(identity))
+}
+
+/// The merge mode a submit of `work` into `green` follows (A-285): the stricter of the two volumes' merge modes, and
+/// the volume whose mode it is. A volume with no policy set merges at once, as every merge did before write policies.
+fn merge_mode(
+  state: &ShardState,
+  work: DbVolumeId,
+  green: DbVolumeId,
+) -> (slates_db::catalog::WriteMode, DbVolumeId) {
+  use slates_db::catalog::WriteMode;
+  let mode_of = |id: DbVolumeId| {
+    state
+      .db
+      .partition()
+      .volume(id)
+      .and_then(|record| record.policy.write)
+      .map_or(WriteMode::Bypass, |policy| policy.merge)
+  };
+  let rank = |mode: WriteMode| match mode {
+    WriteMode::Forbid => 0u8,
+    WriteMode::Ask => 1,
+    WriteMode::Bypass => 2,
+  };
+  let (work_mode, green_mode) = (mode_of(work), mode_of(green));
+  if rank(green_mode) < rank(work_mode) {
+    (green_mode, green)
+  } else {
+    (work_mode, work)
+  }
+}
+
 fn submit(
   state: &mut ShardState,
   principal: &Principal,
   work: VolumeId,
   evidence: Vec<[u8; 32]>,
+  approved: Option<[u8; 32]>,
 ) -> ReplyBody {
   let (work_id, green_id) =
     match crate::merge_service::require_work(state, principal, work, false, "submit") {
       Ok((record, green)) => (record.id, green),
       Err(refusal) => return refused(refusal),
     };
+  // The write policy (A-285): a forbidding mode refuses before the seal; an asking one is answered below, once the
+  // increment it would approve is known.
+  let (mode, by) = merge_mode(state, work_id, green_id);
+  if mode == slates_db::catalog::WriteMode::Forbid {
+    state.count("policy_forbids.merge", 1);
+    return refused(Refusal::PolicyForbids {
+      act: slates_ipc::protocol::WriteAct::Merge,
+      by: slates_ipc::protocol::PolicySubject::Volume {
+        volume: to_wire_volume(by),
+      },
+    });
+  }
   // A green that requires evidence refuses an increment without any (§4.16 `EvidenceRequired`),
   // before the seal: nothing is composed for a submit that cannot be accepted.
   if evidence.is_empty()
@@ -6806,6 +6896,21 @@ fn submit(
     Ok(built) => built,
     Err(refusal) => return refused(refusal),
   };
+  // An asking policy merges only the increment an approval names: none yet is answered with what to approve, and an
+  // approval of another (the work changed since) is refused. Building the increment changed nothing.
+  if mode == slates_db::catalog::WriteMode::Ask {
+    match approved {
+      None => {
+        return ReplyBody::MergeApprovalRequired {
+          work,
+          identity: inc.id,
+          paths: u64::try_from(inc.doc.paths.paths().len()).unwrap_or(u64::MAX),
+        };
+      }
+      Some(identity) if identity != inc.id => return refused(Refusal::GrantMismatch),
+      Some(_) => {}
+    }
+  }
   // The increment is recorded durably so a restart replays it (§4.8, §4.16). Guard-then-apply: the
   // chain must be able to hold it *before* the verdict commits, so an accepted increment is always
   // recorded — otherwise a full-chain refusal after an in-memory commit would strand the green ahead

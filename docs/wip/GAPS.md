@@ -77,8 +77,11 @@
 > landing's own plan; its cost over a granted landing of the same volume (wall time and shard time, 1, 1,000 and
 > 10,000 files) says whether the granted landing should reuse the presentation's plan. **Owed, in order** (types
 > agreed with g262, slates-api's owner):
+> - **built (2026-11-18):** `Present` (never writes, whatever the mode) and merges under the policy (forbid refused,
+>   ask `MergeApprovalRequired` then `SubmitApproved` of exactly that increment, unset merges at once); 7 of 7 in
+>   `write_policy.rs`, the presentation test red with present-only broken;
+> - the launcher secret (g262) and launcher-class proofs verifying under it, with a policy version against replay;
 > - a consumer's own policy, the stricter of consumer and volume governing (refused `Unsupported` today);
-> - merges (submit) under the policy;
 > - the MCP and SDK land verb gated by the policy (the grant kind stays refused there);
 > - signed work: a merge or landing may carry an SSH signature, checked and recorded (verified with its signer,
 >   unsigned, invalid with its reason), and a volume may require signed merges;
