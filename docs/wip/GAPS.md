@@ -2738,7 +2738,10 @@
 > `fleet` binary exited 4 on a wedge verdict that came 146 s past its window (g231 on a 15-CPU Mac at load 62 to 131,
 > 0.2 to 1 GB free; one poll measured 160,662 ms): the whole process had gone unscheduled, the watchdog's thread with
 > it, and the look after its gap judged every shard still for the gap. A look a window or more after the watchdog's
-> last now starts each shard's still time again (`a_gap_in_the_watchdogs_own_looks_is_not_counted_as_a_wedge`). Open
+> last now starts each shard's still time again (`a_gap_in_the_watchdogs_own_looks_is_not_counted_as_a_wedge`); since
+> A-474 only a gap past the window and the watcher's own lateness p99 (capped at A-455's ceiling) does, since one its own
+> lateness explains is no unwatched span, and a watcher whose every look ran a window late never judged a wedged shard
+> (`a_shard_is_judged_wedged_though_the_watchers_own_looks_run_a_window_late`). Open
 > then, closed 2026-11-18 by A-336 (the entry below): a shard held in the kernel past a watched window (a page-in at that
 > pressure) was still judged wedged; telling `D` and XNU's uninterruptible wait from a sleep was the owed decision.
 > Also from the same report, a test's

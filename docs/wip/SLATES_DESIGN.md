@@ -9548,6 +9548,16 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > `a_wedged_daemon_is_found_lapsed_though_the_anchors_own_looks_run_twice_a_window_late` and
 > `the_loop_waits_at_most_its_gap_and_finds_a_lapse_at_the_budgets_end` (`crates/api/src/role/anchor.rs`).
 
+> **Status (2026-11-18, A-474): a watcher's own late looks are no span it did not watch.** A-308 starts a shard's still
+> time again at a look that comes after a span nothing watched; that span is now a gap past the shard's window and the
+> watcher's own lateness p99, capped at A-455's ceiling (`watchdog::slept_past_ns`), where it was any gap of a window.
+> The watchdog keeps its looks' lateness (`watchdog::LatenessTail`, its last hundred, nearest-rank p99), each `Look`
+> carries it, and the anchor's start and silent-watchdog judgments pass the anchor's own (the same tail). Before, a
+> watcher whose every look ran a window late restarted a wedged shard's stillness at each look and never judged it,
+> while it beat on (`docs/bugs/2026-11-18-the-watchdog-never-judged-a-wedged-shard-once-its-own-looks-ran-a-window-late.md`).
+> A process frozen whole is still told by its gap, a whole host's sleep a gap past the ceiling. Regression:
+> `a_shard_is_judged_wedged_though_the_watchers_own_looks_run_a_window_late` (`crates/server/src/watchdog.rs`).
+
 > **Telemetry oracle correction (2026-09-20, AC-0.11).** A drain request itself emits spans.
 > The daemon integration oracle now derives convergence from the reply quota minus the
 > maximum spans a drain emits, and checks progress on each batch. A four-span reply scenario
@@ -32276,3 +32286,28 @@ Applied in the same change to: §4.16 ("Rebase off the owner (A-273)"); A-273's 
   this change (it counts 52 literals in other crates' files); rustfmt's layout taken. Red with an idle replica never
   given back: the new test fails, nothing given back within an observation's budget.
 - **Owed.** The supervisor's A/B at 1,000 clients and more (running).
+
+### A-474 — A watcher's own late looks are no span it did not watch: A-308's reset waits for a gap past the window and the watcher's measured lateness (2026-11-18, built for goal g255; §4.14 `daemon.alive`; A-228, A-232, A-308, A-455, A-467)
+- **What was there.** A-308 started every shard's still time again at a look a window or more after the watchdog's last
+  one, taking the gap for the process frozen or paging whole. The watchdog looks a beat apart whatever its own lateness,
+  so a watchdog thread held off its CPU about a window at every look restarted a wedged shard's stillness at each look:
+  no verdict ever came, and since it beat at each look the anchor saw no lapse either. The anchor's start judgment and
+  its judgment of a silent watchdog's process run the same rule and had the same hole under its own late looks.
+- **The rule (`watchdog::slept_past_ns`).** A gap is a span nothing watched only past the shard's window plus the
+  watcher's own lateness p99, and never past A-455's ceiling nor under the window. A watcher's looks run late by up to
+  its p99, so a gap that lateness explains is its own late look, and across it a shard's CPU clock and its scheduler
+  state still say whether it moved: a thread leaves the run queue for a block only by running, which the clock shows.
+  It is the bound the anchor already takes a gap in its own looks for a sleep at (A-467: the liveness window plus its
+  lateness p99, capped), so both watchers attribute a gap alike. A process frozen whole, or a host asleep, still gaps
+  past it, so A-308's case stands; a runaway reading cannot stretch it past the ceiling.
+- **The lateness (`watchdog::LatenessTail`).** One bounded window of a watcher's lateness readings, its last hundred
+  with their nearest-rank p99 (A-228's form, moved from the anchor, which now keeps its waits' lateness in it too). The
+  watchdog records each look's lateness past its beat and gives every `Look` its p99 (`Look::watcher_late_ns`); the
+  anchor passes its own into its start and silent-watchdog judgments.
+- **Test.** `a_shard_is_judged_wedged_though_the_watchers_own_looks_run_a_window_late` (`crates/server/src/watchdog.rs`:
+  looks a beat and a window apart by a watcher whose p99 says so, the shard judged wedged at the first late look; and
+  gaps past the ceiling under a runaway reading, never judged across them).
+- EVIDENCE_A474
+
+Applied in the same change to: §4.14 (a status block on `daemon.alive`), GAPS (A-308's entry), `docs/bugs/` (a record,
+and A-467's record's sibling line), `crates/server/src/watchdog.rs`, `crates/api/src/role/anchor.rs`.
