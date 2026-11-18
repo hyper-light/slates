@@ -4655,6 +4655,38 @@ release build of `faad1562`.
 Every byte the writer wrote survived 80 SIGKILLs in all, each recovery replaying windowed patches. No fsync waited
 longer than 70 ms across a kill: the anchor restarts the daemon from its RAM in milliseconds.
 
+### Fsynced files through Apple's NFS client under daemon kills: one empty file per run until A-358 (2026-11-18)
+
+**Command:** `SLATES=<release slates> ROUNDS=1 KILLS=15 DURATION=30 SINK=<host:port> bash docs/wip/bench/kill_fsync_macos.sh`
+(new, `kill_fsync.sh`'s macOS counterpart).
+- The writer: files of 100 B to 300 KB written whole, fsynced and closed through `slates mount` (Apple's NFSv3 client,
+  `hard,intr`), each hashed only after both returned. Past 2,000 files an old one is deleted every other step.
+- The killer: the daemon `SIGKILL`ed `KILLS` times at random 0.4 to 1.6 s intervals; the anchor restarts it.
+- Afterwards the volume is unmounted while a daemon serves, mounted again, and every file is read back.
+- Machine: Adas-Mac-Studio-2 (kiln b24c5c95), Apple M4 Max, 14 cores, 36 GiB, macOS 26.2 (25C56), xnu-12377.61.12.
+  Load average 2–4; EXO and Docker Desktop running.
+- Release builds on d1323898.
+
+| binary | kills | files written | files checked | intact | empty | missing | resurrected | slowest file |
+|---|---|---|---|---|---|---|---|---|
+| main `1cd57d18b` | 2 | 4,050 | 3,025 | 3,024 | 1 | 0 | 0 | 25 ms |
+| main + a line per NFS call (`59c43709c`) | 15 | 11,214 | 6,607 | 6,606 | 1 | 0 | 0 | 27 ms |
+
+- The first row was meant to make no kill. BSD `seq 1 0` counts down, so it made two; the harness counts with a loop
+  now.
+- Each empty file was open across a kill, and its bytes were in one `UNSTABLE` WRITE that no publication carried before
+  the daemon died. Apple's client never wrote them again after the COMMIT answered a new verifier (A-358; the bug record
+  of 2026-11-18).
+- A-358's binary (`120c7d56`, every WRITE published before its reply) was started for eight rounds. The machine went
+  offline right after its first kill (GAPS, the A-113 entry). Its rounds and the A/B below are owed.
+
+Owed (the measurer's), on a Mac the kill run may panic only after its last panic is read:
+- the eight rounds again with A-358's binary;
+- the A/B of A-358's barrier per WRITE against its base: `bash docs/wip/bench/ab_write_macos.sh <base slates> <A-358
+  slates>` with `ROUNDS=3 DURATION=20 BIG_MIB=512`. It runs the writer above without kills, then one 512 MiB file in
+  1 MiB writes and an fsync, the binaries alternating on fresh anchors. Mounting without kills is safe on any Mac. Read
+  files a second, p50 and p99 file time, and the 512 MiB write's MiB/s.
+
 ### The hot-directory storm after the probe-storm fix: delegations granted again (condition 12; 2026-10-09)
 
 Command: `docs/wip/bench/hotdir/native.sh WORKERS 500` (Linux's own NFSv4.2 client against a daemon in the same

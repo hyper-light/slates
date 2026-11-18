@@ -1483,6 +1483,39 @@ pub(crate) fn count_refusal_in(state: &mut ShardState, kind: &'static str) {
   *count = count.saturating_add(1);
 }
 
+/// A record session `anchor`'s node dialed to this one, counted in [`ShardState::dialed_in`] for as long as this node
+/// serves it ([`serve_peer_records`]), however the serve ends (A-337). Made and dropped on the control shard, where
+/// sessions are served.
+struct DialedIn {
+  anchor: HostId,
+}
+
+impl DialedIn {
+  /// Counts a session `anchor` dialed, for this guard's life.
+  fn counted(anchor: HostId) -> DialedIn {
+    let _ = state::with_state_counted(|s| {
+      let sessions = s.dialed_in.entry(anchor).or_insert(0);
+      *sessions = sessions.saturating_add(1);
+    });
+    DialedIn { anchor }
+  }
+}
+
+impl Drop for DialedIn {
+  fn drop(&mut self) {
+    let anchor = self.anchor;
+    let _ = state::with_state_counted(|s| {
+      let left = s.dialed_in.get_mut(&anchor).map(|sessions| {
+        *sessions = sessions.saturating_sub(1);
+        *sessions
+      });
+      if left == Some(0) {
+        s.dialed_in.remove(&anchor);
+      }
+    });
+  }
+}
+
 /// The record serve side (§4.8 "records are sent to all candidates"; "Promotion and takeover"): complete
 /// the accepted session's handshake and loop answering the peer over this node's per-object holds — a
 /// **record** commit is accepted into the object's durable acceptor (this node backs the peer as a
@@ -1524,6 +1557,8 @@ async fn serve_peer_records(
       |peer| peer.anchor,
     );
   let seed = crate::deploy::member_id(peer_anchor, 0);
+  // The peer dialed this session and keeps it only while it keeps direct contact with this node (A-337).
+  let _dialed_in = DialedIn::counted(peer_anchor);
   // The membership plane's secret for this connection (A-67 H-2b), should the peer announce an epoch on it.
   let plane_secret = endpoint.export_secret(hyper_datagram::EXPORTER_LABEL).ok();
   // Serve the peer's commits and prepares against this node's **durable** per-object holds in the shard
@@ -4680,16 +4715,17 @@ const TOMBSTONE_WAITS_SHARD: &str = "fleet.tombstone.waits.shard";
 /// Format: a counter name in the daemon's status report.
 const TOMBSTONE_ADOPT_GIVEN_UP: &str = "fleet.tombstone.given_up";
 
-/// Materializes each taken-over **green** whose newest merge record this node adopted (§4.16
-/// owner-loss recovery; AUD-14) into an owned green **on the shard its id routes to**: the chain is
-/// gathered on this control shard from the node's own accepted merge records and the inputs it holds
-/// (`merge_service::recover_green_inputs`), moved by value to the owner shard, and there re-recorded
-/// durably and replayed into a fresh engine whose head identity must equal the adopted record's
-/// (`verbs::materialize_taken_over_green`). Inputs the ledger names and this node does not hold are fetched by identity
-/// from the survivors that reported the adopted version ([`fetch_green_inputs`]; 2026-11-18). A green whose catalog is
-/// not adopted, whose inputs no survivor serves, or whose adopted version lies beyond this node's accepted records (the
-/// ledger-prefix transfer of records, GAP-A9-7, is still owed) is counted and stays pending, as one the owner shard
-/// refused does.
+/// Materializes each taken-over **green** whose newest merge record this node adopted (§4.16 owner-loss recovery;
+/// AUD-14) as an owned green **on the shard its id routes to**, by adopting this node's own holder ledger of it (A-333,
+/// `crate::green_adopt`): the engine is this node's replica, brought to the adopted version on this control shard (taken
+/// as it is, advanced by the increments held here, or rebuilt from the ledger a slice at a time), the ledger's submit
+/// completions gathered beside it, then both moved by value to the owner shard, which records the green by its adoption
+/// (`verbs::adopt_taken_over_green`) and serves it. Inputs of the versions the replica lacks that this node does not
+/// hold are fetched by identity from the survivors that reported the adopted version ([`fetch_green_inputs`]). A green
+/// whose catalog is not adopted, whose inputs no survivor serves, whose adopted version lies beyond this node's records
+/// (the ledger-prefix transfer of records, GAP-A9-7, is still owed), or whose replica is off the adopted identity, is
+/// counted and stays pending, as one the owner shard refused does. Before A-333 the chain was gathered whole in one poll
+/// and recorded again in the owner's partition, origin bytes and all, which a kernel-sized origin was refused at.
 ///
 /// **Bounded** (2026-11-09; the supervisor's order: a wait no branch can clear is an unbounded retry, which the rules
 /// forbid whatever caused it). Each pending green is attempted once a period; past [`takeover_attempts`] attempts
@@ -4698,8 +4734,10 @@ const TOMBSTONE_ADOPT_GIVEN_UP: &str = "fleet.tombstone.given_up";
 /// node claims it to lookups so a read from elsewhere meets that answer. Progress is a fetch that leaves fewer of its
 /// inputs unheld than ever before (`state::PendingGreen::record_unheld`), so the count starts again at most once per
 /// input the ledger names; and, for a wait on its catalog register while the takeover round that adopted it still
-/// pages, an advance of that round ([`paging_round`]). Before, every branch retried each period without end: the
-/// green-share takeover test once waited out its 4,000-period budget so (GAPS 2026-11-09).
+/// pages, an advance of that round ([`paging_round`]). A period that finds the replica's build or the completions'
+/// gathering still running is not counted: each is a finite task of this shard, which the attempt that started it was
+/// counted for. Before, every branch retried each period without end: the green-share takeover test once waited out its
+/// 4,000-period budget so (GAPS 2026-11-09).
 async fn materialize_pending_greens(origin: u16, local: HostId, budget: CommitBudget) {
   let pending: Vec<(ObjectId, crate::state::PendingGreen)> = state::with_state(|s| {
     s.pending_green_materializations
@@ -4714,6 +4752,9 @@ async fn materialize_pending_greens(origin: u16, local: HostId, budget: CommitBu
       continue;
     };
     count_refusal(waited.counter());
+    if !waited.counts_an_attempt() {
+      continue;
+    }
     let round = paging_round(waited.waits_on_the_round(), pending.departed, &paging);
     let given_up = state::with_state(|s| {
       let bound = takeover_attempts(s.config.failover_slo_ns);
@@ -4752,9 +4793,16 @@ enum GreenWait {
   Inputs,
   /// No placement of its adopted record here, or no shard for the partition its id names.
   Placement,
-  /// The owner shard refused the rebuilt green (a recomputed identity that does not match the adopted record's, or a
-  /// catalog refusal), or did not answer within the period.
+  /// The owner shard refused the adoption (a catalog refusal: its name taken, a volume of another role under its id),
+  /// did not answer within the period, or this node's replica is off the adopted record's identity.
   Refused,
+  /// Its adoption's work began this attempt (A-333): this node's replica of the green being brought to the adopted
+  /// version (advanced from its head, or rebuilt from the ledger), or the ledger's completions being gathered; or the
+  /// task that does it could not be spawned.
+  Started,
+  /// The replica's build, or the gathering of the ledger's completions, is still running: a finite task of this shard,
+  /// which the attempt that started it was counted for, so not counted again.
+  Building,
 }
 
 impl GreenWait {
@@ -4766,7 +4814,15 @@ impl GreenWait {
       GreenWait::Inputs => GREEN_TAKEOVER_WAITS_INPUTS,
       GreenWait::Placement => GREEN_TAKEOVER_WAITS_PLACEMENT,
       GreenWait::Refused => GREEN_TAKEOVER_REFUSED,
+      GreenWait::Started => GREEN_TAKEOVER_STARTED,
+      GreenWait::Building => GREEN_TAKEOVER_BUILDING,
     }
+  }
+
+  /// Whether an attempt that waited so counts toward [`takeover_attempts`]: all but a period that found a build or a
+  /// gathering this shard runs still running, which the attempt that started it was counted for.
+  const fn counts_an_attempt(self) -> bool {
+    !matches!(self, GreenWait::Building)
   }
 
   /// Whether it waits for a register the takeover round that adopted the green may still bring on a later page: its
@@ -4783,6 +4839,7 @@ impl GreenWait {
       GreenWait::Inputs => "inputs",
       GreenWait::Placement => "placement",
       GreenWait::Refused => "refused",
+      GreenWait::Started | GreenWait::Building => "adoption",
     }
   }
 }
@@ -4824,7 +4881,6 @@ async fn materialize_green(
   pending: &crate::state::PendingGreen,
   budget: CommitBudget,
 ) -> Result<(), GreenWait> {
-  let adopted = &pending.merge;
   // The green's catalog register, adopted in the same round as its merge record (the owner ships no merge
   // record before its current catalog is committed): the green's access list. Until it and its
   // placement are adopted the materialization waits, as a volume's does (AUD-29-17).
@@ -4837,81 +4893,180 @@ async fn materialize_green(
   let Some(((catalog_sequence, catalog), catalog_placed)) = catalog else {
     return Err(GreenWait::Catalog);
   };
-  let gather = |s: &mut ShardState| {
-    crate::merge_service::recover_green_inputs(s, object, adopted, (catalog_sequence, &catalog))
-  };
-  let recovery = match state::with_state(gather).flatten() {
-    Some(recovery) => recovery,
-    None => {
-      // The chain is short here. A version commits at `f + 1`, so a successor one version behind the quorum knows the
-      // adopted record (it re-committed it) but never received that version's inputs, which only the dead owner
-      // shipped and the survivors that accepted the version hold (GAPS 2026-11-09). Fetch what it lacks by identity
-      // from them, then gather again.
-      fetch_green_inputs(object, pending, budget).await?;
-      state::with_state(gather)
-        .flatten()
-        .ok_or(GreenWait::Inputs)?
-    }
-  };
   let id = DbVolumeId { bytes: object.0 };
   let partition = verbs::owner_of(slates_ipc::protocol::VolumeId { bytes: object.0 });
+  let target = state::with_state(|s| s.shards.get(usize::from(partition)).copied())
+    .flatten()
+    .ok_or(GreenWait::Placement)?;
+  if served_already(origin, (object, target)).await {
+    return Ok(());
+  }
+  // This node's replica at the adopted version (A-333), or what it waits on: its chain and inputs, judged before the
+  // adopted record's placement, as the chain was gathered before it.
+  ready_engine(object, pending, budget).await?;
   // The takeover's placement of the adopted record (its promotion epoch and acknowledging holders),
   // recorded where the promotion ran; it moves to the owner shard with the green, as a head's does,
   // so the successor's record plane writes the green's next versions at the promotion epoch.
-  let (target, placed) = state::with_state(|s| {
-    let target = s.shards.get(usize::from(partition)).copied()?;
-    let placed = s.placed_heads.get(&object).cloned()?;
-    Some((target, placed))
+  let placed = state::with_state(|s| s.placed_heads.get(&object).cloned())
+    .flatten()
+    .ok_or(GreenWait::Placement)?;
+  // The promotion epoch the takeover re-committed the green's registers at: the green's records are written at it, and
+  // its adoption records it, so this node writes them there after a restart too, when `placed_heads` is forgotten.
+  let promotion = placed.epoch.0.max(catalog_placed.epoch.0);
+  let handed = state::with_state(|s| {
+    handed_green(s, object, pending, (catalog_sequence, &catalog), promotion)
   })
-  .flatten()
-  .ok_or(GreenWait::Placement)?;
-  let served = call_within(
+  .ok_or(GreenWait::Building)??;
+  let answer = call_within(
     origin,
     target,
     move |s| {
-      let served =
-        past_the_pressure_hold(s, |s| verbs::materialize_taken_over_green(s, id, recovery)).is_ok();
-      if served {
+      let adopted = past_the_pressure_hold(s, |s| verbs::adopt_taken_over_green(s, id, handed));
+      if adopted.is_ok() {
         s.placed_heads.insert(object, placed);
         s.placed_heads.insert(object.catalog(), catalog_placed);
       }
-      served
+      adopted
     },
     HEARTBEAT_NS,
   )
   .await;
-  if served != Some(true) {
-    return Err(GreenWait::Refused);
+  match answer {
+    Some(Ok(())) => {}
+    // Refused: the engine and the completions come back, and wait here for the next attempt.
+    Some(Err(back)) => {
+      state::with_state(|s| crate::green_adopt::give_back(s, object, *back));
+      return Err(GreenWait::Refused);
+    }
+    // Not answered within the period: the engine went with the call. If the owner shard installs it, the next attempt
+    // finds the green served ([`served_already`]); if not, it rebuilds the replica from the ledger.
+    None => return Err(GreenWait::Refused),
   }
-  state::with_state(|s| {
-    s.pending_green_materializations.remove(&object);
-    s.pending_catalogs.remove(&object);
-  });
+  finish_green(object);
   Ok(())
 }
 
-/// Fetches the inputs the taken-over green `object`'s ledger names and this node does not hold
-/// (`merge_service::unheld_green_inputs`) from the survivors that hold them (§4.16 failure matrix: owner loss is "Masked
-/// after takeover on a candidate that holds the ledger"; GAP-A9-7's input half): the members that reported the adopted
-/// version in the takeover's round (`pending.sources`), each of which accepted it, and with it every version before it,
-/// only once it held its inputs (A-244). Each manifest is fetched by identity, hedged across them and verified on
-/// arrival ([`fetch_manifest_into_hold`]), and staged as placed for its version, so the retention rule keeps it by that
-/// version's ledger position. Lowest version first; each one held whole is counted
-/// ([`GREEN_TAKEOVER_INPUTS_FETCHED`]), and the inputs still unheld after the attempt are recorded on the pending green
-/// (`state::PendingGreen::record_unheld`): fewer than ever before is progress, which starts its attempts again. An
-/// attempt starts no new fetch past one commit deadline (`CommitBudget::max_deadline_ns`, each fetch's own bound), so it
-/// stays bounded however much this node lacks; what a cut fetch kept stays staged for the next. `Err(GreenWait::Chain)`
-/// when a record itself is unknown here (no fetch by identity can fill it: the ledger-prefix transfer of records is
-/// owed); `Err(GreenWait::Inputs)` when an input is still not held.
-async fn fetch_green_inputs(
+/// Whether the owner shard (`target`) already serves `object`, asked only when this node holds no replica of it and no
+/// build of one runs: an earlier attempt's hand-off whose answer did not come within its period, which the owner shard
+/// installed after. The green is then no longer pending.
+async fn served_already(origin: u16, (object, target): (ObjectId, u16)) -> bool {
+  let replica_gone = state::with_state(|s| {
+    !s.merge.replicas.contains_key(&object) && !s.merge.seeding.contains(&object)
+  })
+  .unwrap_or(false);
+  if !replica_gone {
+    return false;
+  }
+  let id = DbVolumeId { bytes: object.0 };
+  let served = call_within(
+    origin,
+    target,
+    move |s| s.greens.contains_key(&id),
+    HEARTBEAT_NS,
+  )
+  .await;
+  if served == Some(true) {
+    finish_green(object);
+    return true;
+  }
+  false
+}
+
+/// A taken-over green adopted and served: no longer pending, and what its adoption gathered dropped.
+fn finish_green(object: ObjectId) {
+  state::with_state(|s| {
+    s.pending_green_materializations.remove(&object);
+    s.pending_catalogs.remove(&object);
+    crate::green_adopt::forget_completions(s, object);
+  });
+}
+
+/// Brings this node's replica of `object` to the version its takeover adopted (A-333), or says what it waits on: `Ok`
+/// once it is there with the adopted identity. Inputs of the versions the replica lacks that this node does not hold are
+/// fetched first ([`fetch_green_inputs`]).
+async fn ready_engine(
   object: ObjectId,
   pending: &crate::state::PendingGreen,
   budget: CommitBudget,
 ) -> Result<(), GreenWait> {
-  let unheld =
-    state::with_state(|s| crate::merge_service::unheld_green_inputs(s, object, &pending.merge))
-      .flatten()
-      .ok_or(GreenWait::Chain)?;
+  use crate::green_adopt::Engine;
+  let adopted = &pending.merge;
+  let at = (adopted.version, adopted.identity);
+  let mut engine = state::with_state(|s| crate::green_adopt::engine_for_adoption(s, object, at))
+    .ok_or(GreenWait::Building)?;
+  if let Engine::Unheld(unheld) = engine {
+    // A successor one or more versions behind the quorum holds the adopted record (its adoption committed it here) but
+    // not those versions' inputs, which the survivors that reported the adopted version hold (GAPS 2026-11-09).
+    fetch_green_inputs(object, pending, unheld, budget).await?;
+    engine = state::with_state(|s| crate::green_adopt::engine_for_adoption(s, object, at))
+      .ok_or(GreenWait::Building)?;
+  }
+  match engine {
+    Engine::Ready => Ok(()),
+    Engine::Building => Err(GreenWait::Building),
+    Engine::Started => Err(GreenWait::Started),
+    Engine::Unheld(_) => Err(GreenWait::Inputs),
+    Engine::RecordsShort(_) => Err(GreenWait::Chain),
+    Engine::Refused => Err(GreenWait::Refused),
+  }
+}
+
+/// The adoption of `object` this attempt hands its owner shard (A-333), once its replica is at the adopted version
+/// ([`ready_engine`]): the replica taken out of this node's replicas, the submit completions its ledger carried, the
+/// catalog facts the adoption records and the takeover's `promotion` epoch; else what it waits on (the completions
+/// still being gathered).
+fn handed_green(
+  state: &mut ShardState,
+  object: ObjectId,
+  pending: &crate::state::PendingGreen,
+  (catalog_sequence, catalog): (u64, &crate::catalog::CatalogValue),
+  promotion: u64,
+) -> Result<crate::green_adopt::AdoptedGreen, GreenWait> {
+  let adopted = &pending.merge;
+  let completions = match crate::green_adopt::gathered_completions(state, object, adopted.version) {
+    crate::green_adopt::Gathered::Done(completions) => completions,
+    crate::green_adopt::Gathered::Began => return Err(GreenWait::Started),
+    crate::green_adopt::Gathered::Running => return Err(GreenWait::Building),
+  };
+  // Version 0's inputs manifest, as the ledger names it: what the adoption records of the origin.
+  let origin = crate::merge_origin::ledger_value(state, object, 0).map(|zero| zero.inputs);
+  let (Some(origin), Some(engine)) = (origin, crate::green_adopt::take_engine(state, object))
+  else {
+    return Err(GreenWait::Chain);
+  };
+  Ok(crate::green_adopt::AdoptedGreen {
+    name: adopted.name.clone(),
+    require_evidence: adopted.require_evidence,
+    owner: adopted.owner.clone(),
+    access: catalog.access.clone(),
+    catalog_sequence,
+    head: adopted.version,
+    identity: adopted.identity,
+    origin,
+    epoch: promotion,
+    engine,
+    completions,
+  })
+}
+
+/// Fetches the inputs the taken-over green `object`'s ledger names for the versions its replica lacks and this node does
+/// not hold (`unheld`, each version and manifest, from `crate::green_adopt::engine_for_adoption`) from the survivors that
+/// hold them (§4.16 failure matrix: owner loss is "Masked after takeover on a candidate that holds the ledger";
+/// GAP-A9-7's input half): the members that reported the adopted version in the takeover's round (`pending.sources`),
+/// each of which accepted it, and with it every version before it, only once it held its inputs (A-244). Each manifest is
+/// fetched by identity, hedged across them and verified on arrival ([`fetch_manifest_into_hold`]), and staged as placed
+/// for its version, so the retention rule keeps it by that version's ledger position. Lowest version first; each one
+/// held whole is counted ([`GREEN_TAKEOVER_INPUTS_FETCHED`]), and the inputs still unheld after the attempt are recorded
+/// on the pending green (`state::PendingGreen::record_unheld`): fewer than ever before is progress, which starts its
+/// attempts again. An attempt starts no new fetch past one commit deadline (`CommitBudget::max_deadline_ns`, each fetch's
+/// own bound), so it stays bounded however much this node lacks; what a cut fetch kept stays staged for the next.
+/// `Err(GreenWait::Inputs)` when an input is still not held.
+async fn fetch_green_inputs(
+  object: ObjectId,
+  pending: &crate::state::PendingGreen,
+  unheld: Vec<(u64, [u8; 32])>,
+  budget: CommitBudget,
+) -> Result<(), GreenWait> {
   let started = futures::now_ns();
   let mut still_unheld = unheld.len();
   let mut fetched_all = true;
@@ -4996,6 +5151,7 @@ async fn give_up_taken_over(
       }
       TakenOver::Green => {
         s.pending_green_materializations.remove(&object);
+        crate::green_adopt::forget_completions(s, object);
       }
     }
     s.pending_catalogs.remove(&object);
@@ -5115,6 +5271,15 @@ const GREEN_TAKEOVER_REFUSED: &str = "merge.takeover_refused";
 /// stays pending and is retried. Before 2026-11-09 this branch was not counted at all.
 /// Format: a counter name in the daemon's status report.
 const GREEN_TAKEOVER_WAITS_PLACEMENT: &str = "merge.takeover_waits_placement";
+/// A taken-over green whose adoption's work began this period (A-333): its replica being brought to the adopted version
+/// (advanced from its head, or rebuilt from this node's ledger), or its ledger's completions being gathered; it stays
+/// pending and is attempted again.
+/// Format: a counter name in the daemon's status report.
+const GREEN_TAKEOVER_STARTED: &str = "merge.takeover_started";
+/// A taken-over green whose replica's build, or whose ledger's completions' gathering, was still running this period
+/// (A-333): not counted against the bound, since each is a finite task.
+/// Format: a counter name in the daemon's status report.
+const GREEN_TAKEOVER_BUILDING: &str = "merge.takeover_building";
 /// A taken-over green given up on past its attempts ([`takeover_attempts`]): every verb on it answers
 /// `NotRecovered { cause: TakeoverIncomplete }`. Zero is the healthy reading.
 /// Format: a counter name in the daemon's status report.
@@ -6126,6 +6291,16 @@ enum DirectContact {
   /// process lives under the same id (an anchor's warm restart). Contact is kept so the pair's plane is keyed and its
   /// probes, answered with the death, let it refute (hyper-swim's refutation needs the dead member's probe to be heard).
   Returned,
+  /// This node is the pair's canonical dialer (its anchor is the lower one) and serves a record session the peer dialed
+  /// to it, which the peer dials and keeps only while it keeps direct contact with this node (A-337): kept, so the pair's
+  /// plane is keyed whenever the peer's rule keeps it, whatever this node's own view says. Each role rule above is kept
+  /// from both sides only while both sides hold the same view: a learner told stale voters (a seat change moves no
+  /// configuration version, so no learner fetches on it, and a learner answered by another learner takes that one's
+  /// stale voters) dropped a voter as `OutsideNeighbourhood` while the voter kept it `AsVoter`, and where the learner was
+  /// the pair's lower anchor the pair was never keyed and its probe mesh never formed (fleet test
+  /// `a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone`, g251's diag run 44262759484, ubuntu,
+  /// 2026-11-18).
+  Dialed,
   /// Dropped: this node believes the peer dead.
   BelievedDead,
   /// Dropped: a council member outside this node's neighbourhood and no voter.
@@ -6185,9 +6360,25 @@ fn direct_contact(state: &ShardState, peer: HostId) -> DirectContact {
     DirectContact::Staged
   } else if state.council.is_voter(state.fleet.host()) || state.root.is_voter(state.fleet.host()) {
     DirectContact::AsVoter
+  } else if dialed_by_a_higher_anchor(state, peer) {
+    DirectContact::Dialed
   } else {
     DirectContact::OutsideNeighbourhood
   }
+}
+
+/// Whether this node is the pair's canonical dialer with `peer` (its anchor below the peer's, the side that announces the
+/// pair's plane epoch) and serves a record session the peer dialed to it ([`ShardState::dialed_in`]): the peer keeps
+/// direct contact with this node (A-337). Only the canonical dialer follows a peer's session, so two nodes never keep each
+/// other by their sessions alone: the higher anchor's contact never rests on the lower's dial.
+fn dialed_by_a_higher_anchor(state: &ShardState, peer: HostId) -> bool {
+  crate::member_task::anchor_of(state, peer).is_some_and(|anchor| {
+    anchor > state.origin_anchor
+      && state
+        .dialed_in
+        .get(&anchor)
+        .is_some_and(|sessions| *sessions > 0)
+  })
 }
 
 /// The contact this node keeps with every live peer while it is not yet a member under its consensus groups, whatever
@@ -8645,13 +8836,15 @@ fn sync_config_from_council(local: HostId) {
 fn fan_configs_to_shards(origin: u16, shards: &[u16]) {
   let Some(fans) = state::with_state(|s| {
     // Prune the owner-lease ledgers to the current members each period (a restarted peer's retired id
-    // leaves; §4.8 "Leases and reads", AUD-08), then fan this node's lease evidence to every owner shard —
+    // leaves; §4.8 "Leases and reads", AUD-08; a former member's last answer stays until its horizon passes, since a
+    // promotion of its objects waits on it, A-351), then fan this node's lease evidence to every owner shard —
     // the verb gate (`verbs::dispatch`) and the mount (`crate::nfs`) run there and must read the same
     // confirmation the control shard's probe tasks collected. `answers_given` and `departed_owners` stay on
     // the control shard (only the takeover drive reads them), so they are not fanned.
     let members = s.fleet.members();
     s.lease.retain_members(members);
-    s.answers_given.retain_members(members);
+    s.answers_given
+      .retain_members(members, slates_machine::clock::monotonic_ns());
     s.fanned.observe_lease(&s.lease);
     // This shard's own parked lease reads meet the evidence it just pruned and observed.
     crate::lease_wait::resolve(s);
