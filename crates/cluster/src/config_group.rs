@@ -128,6 +128,25 @@ pub enum ConfigCommand {
     /// The reporting successor.
     successor: HostId,
   },
+  /// An owner moves one of its objects to another member (§4.8 "Authority scope": a moved-object exception; §4.10
+  /// "operators keep an explicit move"), once the object is placed as it leaves it
+  /// ([`RegionalConfiguration::move_object`]).
+  Move {
+    /// The object moved.
+    object: ObjectId,
+    /// Its owner, the reporter.
+    from: HostId,
+    /// The member it moves to.
+    to: HostId,
+  },
+  /// A moved object's owner reports it destroyed, and its exception is dropped
+  /// ([`RegionalConfiguration::forget_moved`]).
+  MovedForgotten {
+    /// The object destroyed.
+    object: ObjectId,
+    /// Its owner, the reporter.
+    owner: HostId,
+  },
 }
 
 /// Format: a config command is a one-byte tag followed by its little-endian fields; these are the tags.
@@ -142,6 +161,10 @@ const COMMAND_CONFIRM: u8 = 4;
 const COMMAND_MIRROR_ADOPT: u8 = 5;
 /// Format: the tag of a successor's report that it serves an adopted object ([`ConfigCommand::MirrorAdopted`]).
 const COMMAND_MIRROR_ADOPTED: u8 = 6;
+/// Format: the tag of an owner's move of one object ([`ConfigCommand::Move`]).
+const COMMAND_MOVE: u8 = 7;
+/// Format: the tag of a moved object's owner's report that it is destroyed ([`ConfigCommand::MovedForgotten`]).
+const COMMAND_MOVED_FORGOTTEN: u8 = 8;
 /// Format: an admission's domain is a presence byte — absent (unique-per-host) or present, in which case
 /// the domain id follows as a little-endian u64.
 const DOMAIN_ABSENT: u8 = 0;
@@ -208,6 +231,17 @@ impl ConfigCommand {
         out.extend_from_slice(&object.0);
         out.extend_from_slice(&successor.0.to_le_bytes());
       }
+      ConfigCommand::Move { object, from, to } => {
+        out.push(COMMAND_MOVE);
+        out.extend_from_slice(&object.0);
+        out.extend_from_slice(&from.0.to_le_bytes());
+        out.extend_from_slice(&to.0.to_le_bytes());
+      }
+      ConfigCommand::MovedForgotten { object, owner } => {
+        out.push(COMMAND_MOVED_FORGOTTEN);
+        out.extend_from_slice(&object.0);
+        out.extend_from_slice(&owner.0.to_le_bytes());
+      }
     }
     out
   }
@@ -247,9 +281,29 @@ impl ConfigCommand {
         })
       }
       COMMAND_MIRROR_ADOPT | COMMAND_MIRROR_ADOPTED => decode_mirror(tag, rest),
+      COMMAND_MOVE | COMMAND_MOVED_FORGOTTEN => decode_move(tag, rest),
       _ => None,
     }
   }
+}
+
+/// Decodes a move command (`COMMAND_MOVE`, `COMMAND_MOVED_FORGOTTEN`) after its tag, or `None` for malformed bytes or
+/// trailing ones.
+fn decode_move(tag: u8, rest: &[u8]) -> Option<ConfigCommand> {
+  let (object, rest) = take_object(rest)?;
+  let (first, rest) = take_host(rest)?;
+  if tag == COMMAND_MOVED_FORGOTTEN {
+    return rest.is_empty().then_some(ConfigCommand::MovedForgotten {
+      object,
+      owner: first,
+    });
+  }
+  let (to, rest) = take_host(rest)?;
+  rest.is_empty().then_some(ConfigCommand::Move {
+    object,
+    from: first,
+    to,
+  })
 }
 
 /// Reads a u64 host id at the front of `bytes`, returning it and the remainder, or `None` if truncated.
@@ -326,6 +380,9 @@ pub enum ReportOutcome {
   /// Not a report a member makes about itself: a membership change, a report naming another host, or bytes
   /// that are no command at all.
   Refused,
+  /// A move the configuration has no room for: it holds as many moved-object exceptions as the leader's bound
+  /// ([`RegionalCouncil::report`]). Not proposed; the owner refuses its move typed.
+  Full,
 }
 
 /// Format: the one-byte wire tags of a [`ReportOutcome`].
@@ -336,6 +393,8 @@ const OUTCOME_UNCHANGED: u8 = 1;
 const OUTCOME_NOT_LEADER: u8 = 2;
 /// Format: the tag of [`ReportOutcome::Refused`].
 const OUTCOME_REFUSED: u8 = 3;
+/// Format: the tag of [`ReportOutcome::Full`].
+const OUTCOME_FULL: u8 = 4;
 
 impl ReportOutcome {
   /// The outcome's one-byte wire form.
@@ -345,6 +404,7 @@ impl ReportOutcome {
       ReportOutcome::Unchanged => OUTCOME_UNCHANGED,
       ReportOutcome::NotLeader => OUTCOME_NOT_LEADER,
       ReportOutcome::Refused => OUTCOME_REFUSED,
+      ReportOutcome::Full => OUTCOME_FULL,
     }]
   }
 
@@ -355,6 +415,7 @@ impl ReportOutcome {
       [OUTCOME_UNCHANGED] => Some(ReportOutcome::Unchanged),
       [OUTCOME_NOT_LEADER] => Some(ReportOutcome::NotLeader),
       [OUTCOME_REFUSED] => Some(ReportOutcome::Refused),
+      [OUTCOME_FULL] => Some(ReportOutcome::Full),
       _ => None,
     }
   }
@@ -407,6 +468,22 @@ pub enum Reconfiguration {
     object: ObjectId,
     /// The reporting successor.
     successor: HostId,
+  },
+  /// Move an object to another member at its owner's report ([`ConfigCommand::Move`]).
+  Move {
+    /// The object.
+    object: ObjectId,
+    /// Its owner.
+    from: HostId,
+    /// The member it moves to.
+    to: HostId,
+  },
+  /// Drop a destroyed object's exception at its owner's report ([`ConfigCommand::MovedForgotten`]).
+  MovedForgotten {
+    /// The object.
+    object: ObjectId,
+    /// Its owner.
+    owner: HostId,
   },
 }
 
@@ -1069,6 +1146,14 @@ impl RegionalCouncil {
         ConfigCommand::MirrorAdopted { object, successor },
         self.fold.state().owes_adopted(object, successor),
       ),
+      Reconfiguration::Move { object, from, to } => (
+        ConfigCommand::Move { object, from, to },
+        self.fold.state().moves(object, from, to),
+      ),
+      Reconfiguration::MovedForgotten { object, owner } => (
+        ConfigCommand::MovedForgotten { object, owner },
+        self.fold.state().forgets_moved(object, owner),
+      ),
     };
     if !would_change {
       return false;
@@ -1101,7 +1186,18 @@ impl RegionalCouncil {
   /// Only a caught-up leader proposes it ([`caught_up`](RegionalCouncil::caught_up)), and only when it would
   /// change the configuration, so a report the member repeats while its proposal is in flight is not
   /// appended twice; any other node answers [`ReportOutcome::NotLeader`] and the member sends it again.
-  pub fn report(&mut self, reporter: HostId, command: ConfigCommand) -> ReportOutcome {
+  ///
+  /// A member may also move one of its own objects to another member, and report one it moved destroyed (§4.8
+  /// "Authority scope": the moved-object exceptions). A move that would add an exception while the configuration
+  /// already holds `moved_bound` of them is answered [`ReportOutcome::Full`] and not proposed (banned item 8: the
+  /// exceptions are bounded, the bound derived by the leader's daemon, `slates_server::fleet::moved_bound`); a move
+  /// back to an object's creator, or of an object already moved, adds none.
+  pub fn report(
+    &mut self,
+    reporter: HostId,
+    command: ConfigCommand,
+    moved_bound: usize,
+  ) -> ReportOutcome {
     let change = match command {
       ConfigCommand::Settle { owner, generation } if owner == reporter => {
         Reconfiguration::Settle { owner, generation }
@@ -1116,10 +1212,24 @@ impl RegionalCouncil {
       ConfigCommand::MirrorAdopted { object, successor } if successor == reporter => {
         Reconfiguration::MirrorAdopted { object, successor }
       }
+      ConfigCommand::Move { object, from, to } if from == reporter => {
+        Reconfiguration::Move { object, from, to }
+      }
+      ConfigCommand::MovedForgotten { object, owner } if owner == reporter => {
+        Reconfiguration::MovedForgotten { object, owner }
+      }
       _ => return ReportOutcome::Refused,
     };
     if !self.is_leader() || !self.caught_up() {
       return ReportOutcome::NotLeader;
+    }
+    if let Reconfiguration::Move { object, to, .. } = &change {
+      let configuration = self.fold.state();
+      let adds =
+        !configuration.moved.contains_key(&object.placement_key()) && *to != object.creator();
+      if adds && configuration.moved.len() >= moved_bound {
+        return ReportOutcome::Full;
+      }
     }
     if self.propose(change) {
       ReportOutcome::Proposed
@@ -1426,6 +1536,12 @@ fn apply_command(configuration: &mut RegionalConfiguration, command: &[u8], scat
     Some(ConfigCommand::MirrorAdopted { object, successor }) => {
       configuration.adopted(object, successor);
     }
+    Some(ConfigCommand::Move { object, from, to }) => {
+      configuration.move_object(object, from, to);
+    }
+    Some(ConfigCommand::MovedForgotten { object, owner }) => {
+      configuration.forget_moved(object, owner);
+    }
     None => {}
   }
 }
@@ -1436,6 +1552,8 @@ mod tests {
 
   /// Shape: an append budget no batch reaches, for the tests of every rule but batching and compaction.
   const UNBOUNDED: usize = usize::MAX;
+  /// Shape: a moved-object bound no test reaches, for the report tests of every rule but the bound's.
+  const MOVES_UNBOUNDED: usize = usize::MAX;
 
   /// AC-8.1, §4.8, AUD-07: a replacement imports the original fold base, becomes a voter
   /// through joint consensus, then refuses an initial-state replay that would erase its vote.
@@ -1565,6 +1683,15 @@ mod tests {
         object: ObjectId::new(OWNER, 9),
         successor: A,
       },
+      ConfigCommand::Move {
+        object: ObjectId::new(OWNER, 9),
+        from: A,
+        to: B,
+      },
+      ConfigCommand::MovedForgotten {
+        object: ObjectId::new(OWNER, 9),
+        owner: B,
+      },
     ];
     for command in commands {
       assert_eq!(
@@ -1580,6 +1707,8 @@ mod tests {
           | ConfigCommand::Confirm { .. }
           | ConfigCommand::MirrorAdopt { .. }
           | ConfigCommand::MirrorAdopted { .. }
+          | ConfigCommand::Move { .. }
+          | ConfigCommand::MovedForgotten { .. }
       ) {
         assert_eq!(
           ConfigCommand::decode(&trailing),
@@ -1648,12 +1777,12 @@ mod tests {
       .unwrap();
     let leader = groups.get_mut(&OWNER).unwrap();
     assert_eq!(
-      leader.report(other, settle.clone()),
+      leader.report(other, settle.clone(), MOVES_UNBOUNDED),
       ReportOutcome::Refused,
       "no member reports for another"
     );
     assert_eq!(
-      leader.report(moved, ConfigCommand::Retire(A)),
+      leader.report(moved, ConfigCommand::Retire(A), MOVES_UNBOUNDED),
       ReportOutcome::Refused,
       "a membership change is never a report"
     );
@@ -1671,17 +1800,17 @@ mod tests {
     };
     let leader = groups.get_mut(&OWNER).unwrap();
     assert_eq!(
-      leader.report(moved, settle.clone()),
+      leader.report(moved, settle.clone(), MOVES_UNBOUNDED),
       ReportOutcome::Proposed
     );
     assert_eq!(
-      leader.report(moved, settle.clone()),
+      leader.report(moved, settle.clone(), MOVES_UNBOUNDED),
       ReportOutcome::NotLeader,
       "while its proposal is in flight the leader is not caught up, so it is not appended twice"
     );
     let follower = groups.get_mut(&A).unwrap();
     assert_eq!(
-      follower.report(moved, settle.clone()),
+      follower.report(moved, settle.clone(), MOVES_UNBOUNDED),
       ReportOutcome::NotLeader
     );
     replicate_round(&mut groups, OWNER, &[OWNER, A, B]);
@@ -1697,9 +1826,89 @@ mod tests {
       groups
         .get_mut(&OWNER)
         .unwrap()
-        .report(moved, settle.clone()),
+        .report(moved, settle.clone(), MOVES_UNBOUNDED),
       ReportOutcome::Unchanged,
       "a report already recorded changes nothing"
+    );
+  }
+
+  /// §4.8 "Authority scope", §4.10 "operators keep an explicit move" (T-8.14's council half). Do: on a three-voter
+  /// council, report a move of one of `A`'s objects to `B` from `B`, then from `A`; replicate; report another object's
+  /// move from `A` with the bound at the one exception already held, then that first object's move back to `A`
+  /// (its creator) at the same bound, then report it destroyed. Expect the report naming another host refused, `A`'s
+  /// proposed once and committed on every voter as `B`'s ownership, the second move answered `Full` and not proposed,
+  /// the move back proposed since it drops an exception, and a destroyed object's report changing nothing once it is
+  /// back on its creator's line.
+  #[test]
+  fn a_move_report_is_proposed_by_its_owner_and_held_to_the_bound() {
+    let mut groups = councils(&[OWNER, A, B]);
+    elect_among(&mut groups, OWNER, &[OWNER, A, B]);
+    // The new leader's own first entry commits before it is caught up and takes a report.
+    replicate_round(&mut groups, OWNER, &[OWNER, A, B]);
+    replicate_round(&mut groups, OWNER, &[OWNER, A, B]);
+    let object = ObjectId::new(A, 7);
+    let move_it = ConfigCommand::Move {
+      object,
+      from: A,
+      to: B,
+    };
+    let leader = groups.get_mut(&OWNER).unwrap();
+    assert_eq!(
+      leader.report(B, move_it.clone(), MOVES_UNBOUNDED),
+      ReportOutcome::Refused,
+      "only an object's owner reports its move"
+    );
+    assert_eq!(
+      leader.report(A, move_it.clone(), MOVES_UNBOUNDED),
+      ReportOutcome::Proposed
+    );
+    replicate_round(&mut groups, OWNER, &[OWNER, A, B]);
+    replicate_round(&mut groups, OWNER, &[OWNER, A, B]);
+    for voter in [OWNER, A, B] {
+      assert_eq!(
+        groups[&voter].configuration().owner_of(object),
+        Some(B),
+        "the committed move names B the owner on {voter:?}"
+      );
+    }
+    let leader = groups.get_mut(&OWNER).unwrap();
+    assert_eq!(
+      leader.report(
+        A,
+        ConfigCommand::Move {
+          object: ObjectId::new(A, 8),
+          from: A,
+          to: B,
+        },
+        1
+      ),
+      ReportOutcome::Full,
+      "a second exception past a bound of one is not proposed"
+    );
+    assert_eq!(
+      leader.report(
+        B,
+        ConfigCommand::Move {
+          object,
+          from: B,
+          to: A,
+        },
+        1
+      ),
+      ReportOutcome::Proposed,
+      "a move back to the creator adds no exception"
+    );
+    replicate_round(&mut groups, OWNER, &[OWNER, A, B]);
+    replicate_round(&mut groups, OWNER, &[OWNER, A, B]);
+    assert!(groups[&OWNER].configuration().moved.is_empty());
+    assert_eq!(
+      groups.get_mut(&OWNER).unwrap().report(
+        A,
+        ConfigCommand::MovedForgotten { object, owner: A },
+        1
+      ),
+      ReportOutcome::Unchanged,
+      "an object on its creator's line has no exception to forget"
     );
   }
 
@@ -1711,6 +1920,7 @@ mod tests {
       ReportOutcome::Unchanged,
       ReportOutcome::NotLeader,
       ReportOutcome::Refused,
+      ReportOutcome::Full,
     ] {
       assert_eq!(ReportOutcome::decode(&outcome.encode()), Some(outcome));
     }
@@ -2820,6 +3030,12 @@ mod tests {
       }
       Reconfiguration::MirrorAdopted { object, successor } => {
         oracle.adopted(*object, *successor);
+      }
+      Reconfiguration::Move { object, from, to } => {
+        oracle.move_object(*object, *from, *to);
+      }
+      Reconfiguration::MovedForgotten { object, owner } => {
+        oracle.forget_moved(*object, *owner);
       }
     }
   }

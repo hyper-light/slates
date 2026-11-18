@@ -17,9 +17,13 @@ use std::time::{Duration, Instant};
 
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestRunner};
-use slates_client::{Client, ClientError, Rebased, Refusal, RequestId, Submitted};
+use slates_client::{
+  Client, ClientError, PolicySubject, Rebased, Refusal, RequestId, Submitted, WriteAct, WriteMode,
+  WritePolicy,
+};
 use slates_ipc::protocol::{ReadAt, ReplyBody, RequestBody, VolumeId, WorkOp};
 use slates_server::daemon::OBSERVE_BUDGET_NS;
+use slates_server::landing::{enroll_proof, merge_approval_proof, policy_proof};
 use slates_server::state::ShardState;
 use slates_server::verbs::{owner_of, owner_of_name};
 use slates_server::{Daemon, DaemonConfig};
@@ -1179,4 +1183,146 @@ fn a_rename_rebased_then_submitted_off_the_owner_merges_as_on_it() {
   one_daemon.stop();
   many_daemon.stop();
   assert_eq!(said[0], said[1]);
+}
+
+/// Sets `volume`'s write policy as the launcher does, under the daemon's issuer secret, merging as `merge` says.
+fn merging(client: &mut Client, secret: &[u8; 32], volume: VolumeId, merge: WriteMode) {
+  let subject = PolicySubject::Volume { volume };
+  let policy = WritePolicy {
+    merge,
+    land: WriteMode::Ask,
+  };
+  client
+    .set_policy(subject, policy, policy_proof(secret, &subject, &policy))
+    .unwrap();
+}
+
+/// A-285 under A-247: a merge follows its write policy for a work off its green's shard too, where the green's owner
+/// holds no record of the work and the work's shard none of the green. Do, on a daemon with many shards, with works
+/// named onto other shards than their green's: forbid the green's merges and submit a work; set a work's own mode to
+/// ask, submit it, approve another increment, then from an agent's consumer channel, then with a forged proof, then the
+/// launcher's approval of the one asked; ask on the green and edit-and-submit a work. Expect: the green's forbid
+/// refuses `PolicyForbids` naming the green; the work's ask answers its identity and one path; `GrantMismatch`,
+/// `Forbidden` and `GrantIssuerUnverified` with nothing merged; the launcher's approval accepted; the green's ask
+/// answers the edit-and-submit with its identity, the edit kept in the work, and an approval of it accepted. The
+/// owner was asked for each verdict, so each ran across the shards.
+#[test]
+fn a_merge_off_its_greens_shard_follows_both_volumes_write_policy() {
+  let (daemon, instance) = daemon(MANY_SHARDS, "policy");
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let mut client = connect(&instance);
+  let asked_before = asked_of_the_owner(&daemon);
+
+  let (green, work) = green_and_edited_work(&mut client, "policy-forbid");
+  merging(&mut client, &secret, green, WriteMode::Forbid);
+  let refused = client.submit(work);
+  assert!(
+    matches!(
+      refused,
+      Err(ClientError::Refused(Refusal::PolicyForbids {
+        act: WriteAct::Merge,
+        by: PolicySubject::Volume { volume },
+      })) if volume == green
+    ),
+    "the green's forbid: {refused:?}"
+  );
+  assert_eq!(client.versions(green).unwrap(), 1, "nothing merged");
+
+  let (green, work) = green_and_edited_work(&mut client, "policy-ask");
+  merging(&mut client, &secret, work, WriteMode::Ask);
+  let Ok(Submitted::ApprovalRequired { identity, paths }) = client.submit(work) else {
+    panic!("the work's ask answers an approval request");
+  };
+  assert_eq!(paths, 1);
+  let mut other = identity;
+  other[0] ^= 1;
+  let mismatched = client.submit_approved(
+    work,
+    &[],
+    other,
+    merge_approval_proof(&secret, work, &other),
+  );
+  assert!(
+    matches!(
+      mismatched,
+      Err(ClientError::Refused(Refusal::GrantMismatch))
+    ),
+    "an approval of another increment: {mismatched:?}"
+  );
+  let account = rustix::process::getuid().as_raw();
+  let (consumer, capability) = client
+    .enroll(account, enroll_proof(&secret, account))
+    .unwrap();
+  let mut agent = connect(&instance);
+  agent.attest(consumer, &capability).unwrap();
+  let by_agent = agent.submit_approved(
+    work,
+    &[],
+    identity,
+    merge_approval_proof(&secret, work, &identity),
+  );
+  assert!(
+    matches!(
+      by_agent,
+      Err(ClientError::Refused(Refusal::Forbidden { .. }))
+    ),
+    "an agent's own approval: {by_agent:?}"
+  );
+  let forged = client.submit_approved(
+    work,
+    &[],
+    identity,
+    merge_approval_proof(&secret, work, &other),
+  );
+  assert!(
+    matches!(
+      forged,
+      Err(ClientError::Refused(Refusal::GrantIssuerUnverified))
+    ),
+    "a proof of another increment: {forged:?}"
+  );
+  assert_eq!(
+    client.versions(green).unwrap(),
+    1,
+    "nothing merged before the approval"
+  );
+  assert_eq!(
+    client.submit_approved(
+      work,
+      &[],
+      identity,
+      merge_approval_proof(&secret, work, &identity)
+    ),
+    Ok(Submitted::Accepted(2))
+  );
+
+  let (green, work) = green_and_edited_work(&mut client, "policy-green-ask");
+  merging(&mut client, &secret, green, WriteMode::Ask);
+  let Ok(Submitted::ApprovalRequired { identity, .. }) =
+    client.edit_and_submit((work, "f"), 1, 1, b"Y", &[])
+  else {
+    panic!("the green's ask answers an approval request");
+  };
+  assert_eq!(client.versions(green).unwrap(), 1, "nothing merged");
+  assert_eq!(
+    client.read(work, "f", ReadAt::Head).unwrap(),
+    b"XY..".to_vec(),
+    "the edit is kept"
+  );
+  assert_eq!(
+    client.submit_approved(
+      work,
+      &[],
+      identity,
+      merge_approval_proof(&secret, work, &identity)
+    ),
+    Ok(Submitted::Accepted(2))
+  );
+  assert!(
+    asked_of_the_owner(&daemon) > asked_before,
+    "the verdicts were asked of the green's owner"
+  );
+  drop(agent);
+  drop(client);
+  daemon.stop();
 }

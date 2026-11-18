@@ -4155,6 +4155,7 @@ async fn init_shard(
     region_mirrors,
     held_content: slates_cluster::content::ContentHold::new(),
     pending_tombstones: std::collections::BTreeMap::new(),
+    work_routes: crate::work_route::WorkRoutes::default(),
     seals: std::collections::BTreeMap::new(),
     mirror_seals: std::collections::BTreeMap::new(),
     mirror_neighbourhood: Vec::new(),

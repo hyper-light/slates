@@ -422,9 +422,6 @@ pub enum Unsupported {
   /// A merge or a landing that carries a signature: the daemon's verifier for signed work is not in this build
   /// ([`crate::signed`]). Nothing was sent.
   SignedWork,
-  /// A write-policy feature the daemon does not offer yet: an approval of a merge, or presenting a landing of a bypass
-  /// volume without writing it (no present-only verb yet; [`crate::Instance::plan_landing`]). Nothing was sent.
-  WritePolicies,
 }
 
 /// What is wrong with the request.

@@ -703,6 +703,12 @@ pub struct CompletionRecord {
   pub sequence: u32,
   /// The reply bytes.
   pub result: Vec<u8>,
+  /// For a completion a green's successor adopted from the green's merge records (A-255) whose resend can reach it only
+  /// through its work's route, the work whose submit it completes (A-288): the work's catalog record, that route, is kept
+  /// while the green's owner retains one such completion (`Partition::completions_routed_by`). `None` for every completion
+  /// a verb ran here, and for one of a client on the work's own owner node, whose resend that node's records answer.
+  /// Appended.
+  pub work: Option<VolumeId>,
 }
 
 /// The surface a grant came from (§4.15).

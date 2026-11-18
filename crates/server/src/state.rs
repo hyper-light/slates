@@ -1006,8 +1006,11 @@ pub struct ShardState {
   /// sequence and the attempts to record it: awaiting `Op::TombstoneAdopted` on the shard the id routes to, from where
   /// the record plane ships the tombstone's remaining stages. Never materialized. One given up on past the failover
   /// SLO's attempts stays, marked, so the volume is still known destroyed here and its catalog never rebuilt
-  /// (`fleet::adopt_pending_tombstones`). Bounded by the objects this node owns.
+  /// (`fleet::adopt_pending_tombstones`). Bounded by the objects this node owns. A work whose route this node retired
+  /// joins them (A-288, `crate::work_route`).
   pub pending_tombstones: BTreeMap<ObjectId, PendingTombstone>,
+  /// On the control shard: the work route keeper's nudge and waker (A-288, `crate::work_route`).
+  pub(crate) work_routes: crate::work_route::WorkRoutes,
 }
 
 /// A work volume's accumulated declared operations (§4.16), composed into an increment on submit.

@@ -214,6 +214,8 @@ enum Need {
   Verdict {
     evidence: Vec<[u8; 32]>,
     sealed: SealedWork,
+    /// The work's merge mode and the launcher's approval, if any (A-285): the green's owner holds no record of the work.
+    policy: crate::verbs::SubmitPolicy,
   },
   Rebase {
     sealed: SealedWork,
@@ -260,6 +262,17 @@ fn may_ask(state: &ShardState, principal: &Principal, body: &RequestBody) -> boo
   match body {
     RequestBody::Submit { .. } | RequestBody::Rebase { .. } => {
       require_work(state, principal, volume, false, "ask").is_ok()
+    }
+    // An approval reaches the verdict only once it verifies (A-285): the owner trusts what it is sent, so a consumer's
+    // or a forged approval runs here, where `verbs::submit_approved` refuses it, and nothing reaches the green.
+    RequestBody::SubmitApproved {
+      work,
+      identity,
+      proof,
+      ..
+    } => {
+      require_work(state, principal, volume, false, "ask").is_ok()
+        && crate::verbs::approval_verifies(state, principal, *work, (identity, proof))
     }
     RequestBody::Edit { .. }
     | RequestBody::EditStaged { .. }
@@ -315,7 +328,25 @@ fn need_of(state: &ShardState, work: DbVolumeId, body: &RequestBody) -> Option<N
       if home.verdict.is_some() {
         return None;
       }
-      Some(verdict_need(state, work, seal(state, work), evidence))
+      Some(verdict_need(
+        state,
+        work,
+        seal(state, work),
+        (evidence, None),
+      ))
+    }
+    RequestBody::SubmitApproved {
+      evidence, identity, ..
+    } => {
+      if home.verdict.is_some() {
+        return None;
+      }
+      Some(verdict_need(
+        state,
+        work,
+        seal(state, work),
+        (evidence, Some(*identity)),
+      ))
     }
     RequestBody::Rebase { .. } => {
       if home.rebased.is_some() {
@@ -343,19 +374,20 @@ fn need_of(state: &ShardState, work: DbVolumeId, body: &RequestBody) -> Option<N
         return None;
       }
       sealed_with_edit(state, work, (path, *at, *delete_len, insert))
-        .map(|sealed| verdict_need(state, work, sealed, evidence))
+        .map(|sealed| verdict_need(state, work, sealed, (evidence, None)))
     }
     _ => None,
   }
 }
 
 /// What a submit of `sealed` needs of the owner, once it has what it reads: its work's route first (A-298), then the
-/// base entries its composition lacks, then the verdict.
+/// base entries its composition lacks, then the verdict, carrying the work's merge mode, read here where the work's
+/// record is, and the approval the submit carries (A-285).
 fn verdict_need(
   state: &ShardState,
   work: DbVolumeId,
   sealed: SealedWork,
-  evidence: &[[u8; 32]],
+  (evidence, approved): (&[[u8; 32]], Option<[u8; 32]>),
 ) -> Need {
   if !route_committed(state, work) {
     return Need::Route;
@@ -363,6 +395,10 @@ fn verdict_need(
   base_missing(state, &sealed).unwrap_or_else(|| Need::Verdict {
     evidence: evidence.to_vec(),
     sealed: composed(state, sealed, evidence.to_vec()),
+    policy: crate::verbs::SubmitPolicy {
+      work_mode: crate::verbs::merge_mode_of(state, work),
+      approved,
+    },
   })
 }
 
@@ -545,7 +581,9 @@ pub(crate) fn gate(
 fn reset_refusal(state: &mut ShardState, work: DbVolumeId, body: &RequestBody) -> Option<Refusal> {
   if !matches!(
     body,
-    RequestBody::Submit { .. } | RequestBody::EditSubmit { .. }
+    RequestBody::Submit { .. }
+      | RequestBody::SubmitApproved { .. }
+      | RequestBody::EditSubmit { .. }
   ) || state.work_home.verdict.is_some()
   {
     return None;
@@ -1038,12 +1076,14 @@ fn answer_on_owner(state: &mut ShardState, item: AskItem) -> Outcome {
     Need::Sizes => Outcome::Answered(Answered::Base(crate::verbs::owner_sizes(
       state, green, version,
     ))),
-    Need::Verdict { evidence, sealed } => {
-      match crate::verbs::owner_judge(state, (origin, id), sealed, evidence, back) {
-        Some(reply) => Outcome::Answered(Answered::Verdict(reply)),
-        None => Outcome::Deferred,
-      }
-    }
+    Need::Verdict {
+      evidence,
+      sealed,
+      policy,
+    } => match crate::verbs::owner_judge(state, (origin, id), (sealed, evidence, policy), back) {
+      Some(reply) => Outcome::Answered(Answered::Verdict(reply)),
+      None => Outcome::Deferred,
+    },
     Need::Rebase { sealed } => {
       Outcome::Answered(Answered::Rebased(crate::verbs::owner_rebase(state, sealed)))
     }

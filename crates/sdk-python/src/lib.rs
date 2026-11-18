@@ -248,6 +248,15 @@ fn work_dict(py: Python<'_>, id: VolumeId, base: u64) -> PyResult<Py<PyDict>> {
 fn submitted_to_py(py: Python<'_>, outcome: Submitted) -> PyResult<PyObject> {
   let dict = match outcome {
     Submitted::Accepted(version) => merge_outcome_dict(py, Some(version), Vec::new())?,
+    // A merge an ask write policy holds (A-285): the increment's identity the launcher's approval binds, and its paths.
+    Submitted::ApprovalRequired { identity, paths } => {
+      let dict = merge_outcome_dict(py, None, Vec::new())?;
+      dict
+        .bind(py)
+        .set_item("approval_identity", hex32(&identity))?;
+      dict.bind(py).set_item("approval_paths", paths)?;
+      dict
+    }
     Submitted::Conflict(windows) => merge_outcome_dict(
       py,
       None,
