@@ -29512,5 +29512,8 @@ Applied in the same change to: §4.8 "Authority scope" (A-382's status), GAPS (A
 - **The rule.** The let-go publishes the shard at once when it let anything go (`readmission::let_go_own_registers`);
   a refused publication is counted `fleet.readmission.registers_let_go_unpublished`, and the removals stay marked
   changed (`crate::tracked`) for the next one.
-- **Tests.** The re-admission flows' fleet tests are filed for main (run-requests.md, A-415); the restart in the
-  window between a let-go and a publication has no in-process test of its own.
+- **Tests.** `a_readmissions_let_go_is_in_the_journal_a_restart_reads` (`readmission`'s unit tests, on a shard with
+  recovery storage): a copy naming the host held and published, the host re-admitted; the journal a restart reads
+  (`verbs::committed_held_agrees`) agrees with the shard at once, and with every publication refused around the
+  install the let-go is counted unpublished and the next publication carries it. The re-admission flows' fleet tests
+  are filed for main (run-requests.md, A-415).

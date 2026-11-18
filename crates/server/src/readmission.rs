@@ -148,3 +148,111 @@ fn yield_catalogued(state: &mut ShardState) {
     crate::fuse::superseded(state, volume);
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use slates_db::register::{Acceptor, Authority, HostEpoch, ObjectId, Record};
+
+  use crate::state::ShardState;
+
+  /// What [`a_readmissions_let_go_is_in_the_journal_a_restart_reads`] saw of one re-admission.
+  #[derive(Debug)]
+  struct LetGo {
+    /// The copy naming this host was accepted, published, and the journal agreed with the shard before the install.
+    committed_before: bool,
+    /// The copy is still held after the install.
+    held_after: bool,
+    /// The journal a restart reads agrees with what the shard holds right after the install.
+    agrees_after: bool,
+    /// The re-admission's let-go counted as unpublished.
+    unpublished: u64,
+    /// The journal agrees once the next publication commits.
+    agrees_after_next: bool,
+  }
+
+  /// Holds a register copy whose authority names this host (one a candidate kept of an object the host took over
+  /// before it was retired), publishes it, then installs this host's configuration at its next epoch (its
+  /// re-admission), with the publications refused around the install when `refused`; then publishes once more.
+  fn let_go_on(state: &mut ShardState, refused: bool) -> LetGo {
+    // This host as the install names it, which is what the let-go compares a copy's authority with.
+    let local = state.fleet.configuration().owner;
+    let object = ObjectId([0x41; 16]);
+    let mut copy = Acceptor::new(
+      local,
+      Authority {
+        generation: 1,
+        owner: local,
+      },
+    )
+    .tracking_changes();
+    let (promised, _) = copy.persisted();
+    let accepted = copy
+      .accept(&Record {
+        owner: local,
+        object,
+        sequence: 1,
+        epoch: promised,
+        generation: 1,
+        value: b"the head before the retirement".to_vec(),
+      })
+      .is_ok();
+    state.holder_records.insert(object, copy);
+    let published = crate::verbs::publish_shard(state).is_ok();
+    let committed_before = accepted && published && crate::verbs::committed_held_agrees(state);
+    // Without its recovery object every publication is refused (`RecoveryIncomplete`) before it touches anything,
+    // until the object is given back.
+    let content = if refused { state.content.take() } else { None };
+    let mut readmitted = state.fleet.configuration().clone();
+    readmitted.host_epoch = HostEpoch(readmitted.host_epoch.0.saturating_add(1));
+    let members = state.fleet.members().to_vec();
+    super::install_placement(state, readmitted, &members);
+    let held_after = state.holder_records.contains_key(&object);
+    let agrees_after = !refused && crate::verbs::committed_held_agrees(state);
+    let unpublished = state
+      .refusals
+      .get(super::REGISTERS_LET_GO_UNPUBLISHED)
+      .copied()
+      .unwrap_or(0);
+    if refused {
+      state.content = content;
+    }
+    let agrees_after_next =
+      crate::verbs::publish_shard(state).is_ok() && crate::verbs::committed_held_agrees(state);
+    LetGo {
+      committed_before,
+      held_after,
+      agrees_after,
+      unpublished,
+      agrees_after_next,
+    }
+  }
+
+  /// A-415 (A-382's owed item; §4.8 "Authority scope", "Recovery"). A warm restart restores a shard's held register
+  /// copies from its committed journal, so a let-go that only the next publication carried came back after a restart
+  /// in between, naming this host, and refused its successors again. Do: on a shard with recovery storage, hold and
+  /// publish a register copy naming this host, then re-admit the host (its configuration at its next epoch). Expect the
+  /// copy let go and the journal a restart reads agreeing with the shard at once, nothing counted unpublished. Then the
+  /// same with every publication refused around the install: the let-go counted unpublished once, and the next
+  /// publication carrying it, so the journal agrees again.
+  #[test]
+  fn a_readmissions_let_go_is_in_the_journal_a_restart_reads() {
+    let (published, refused) =
+      crate::daemon::audit_on_shard(|state| (let_go_on(state, false), let_go_on(state, true)));
+    assert!(
+      published.committed_before && !published.held_after,
+      "the copy naming this host was committed, then let go: {published:?}"
+    );
+    assert!(
+      published.agrees_after && published.unpublished == 0,
+      "the let-go is in the journal a restart reads at once: {published:?}"
+    );
+    assert!(
+      refused.committed_before && !refused.held_after && refused.unpublished == 1,
+      "a refused publication of the let-go is counted: {refused:?}"
+    );
+    assert!(
+      refused.agrees_after_next,
+      "the next publication carries the let-go: {refused:?}"
+    );
+  }
+}
