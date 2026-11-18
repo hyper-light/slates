@@ -9,28 +9,23 @@
 > with Firecracker, crosvm and Cloud Hypervisor (41318050347, 41319438579). Still open, and not this plan's: the
 > inventory's built-but-unrun cells (its order of work, item 5).
 
-> **A grant is signed by a key only the human holds (2026-11-18, R10, D-22, §4.13; A-285, Ada's decision: fs-server's
-> option D, with A as the fallback, on every OS).** This closes, once built, "No grant can be issued on Linux from the
-> CLI" (A-201's entry). **Built (piece 1):** the signed statement and its SSH-signature verifier
-> (`crates/server/src/grant_signature.rs`; `ssh-ed25519` and `sk-ssh-ed25519`, the touch required, namespace
-> `slates-grant`), 10 unit tests against a real `ssh-keygen -Y sign` vector: forged, unregistered, changed manifest
-> and every other field, another namespace, expired, untouched, hostile bytes. **Built (piece 2, 2026-11-18):** each
-> presentation draws a 256-bit nonce and `land` returns it (`nonce:` / `"nonce"`); a `Grant` carries either proof
-> form (`GrantProofBody`); a signed one is decided by `landing::verify_signed_grant` against the shard's registered
-> keys, the presentation's own target and nonce, and the wall clock, and its nonce is spent by the grant it proves
-> (a replay refused `Replayed`, counted `grant_signature_replayed`). No key can be registered yet, so every signed
-> grant is refused `UnregisteredKey` until piece 3. **Owed, in order:**
-> - durable key registration: the first key only through A's terminal prompt (a standalone anchor) or kiln's person
->   session (a kiln-managed anchor, WebAuthn; the supervisor's direction, put to Ada); later keys signed by a
->   registered key; no agent channel adds one;
-> - `slates grant` signing through `ssh-keygen -Y sign`, and A's prompt over a pty;
-> - the exported-variables issuer surface removed on macOS and Windows (GAP-A9-9's macOS segment then closes by name);
->   `enroll`, `revoke`, `run` and `recover` prove authority with the same issuer secret and need the signed proof too;
-> - the Windows confirm-per-use path (OpenSSH's agent, or FIDO through Windows Hello), recorded;
-> - the WebAuthn form verified (its challenge is the statement's SHA-256; g263 and g264 own kiln's side);
-> - a real FIDO key's signature (the unit test stands a software key in for the authenticator);
-> - the end-to-end proof on adacachy, `SLATES_TEST_GRANT=1`: registration through A over a pty, a landing granted by
->   a confirmed ssh-agent key and written, the askpass refusing, an unregistered key and a replay refused.
+> **Write permission follows the mode the user gave the agent (2026-11-18, R10, D-22, §4.13; A-285, Ada's decisions,
+> revised the same day).** Bypass merges and lands at once; ask answers a typed approval request bound to the
+> manifest, which the harness presents; a forbidding mode is refused. The launcher (kiln passes each agent's mode) or
+> the harness sets the policy, the stricter of consumer and volume governs, unset is ask, and an agent never raises
+> its own. Signed work is provenance, not permission. This closes, once built, "No grant can be issued on Linux from
+> the CLI" (A-201's entry): under bypass the daemon grants its own landing. The first reading (a human-only proof,
+> fs-server's options A–E) is withdrawn by Ada; its piece 2 (the presentation nonce and the signed `Grant`,
+> d1a46ae9) is reverted, and the SSH verifier (1c31d1c7) is kept for signed work. **Owed, in order** (types agreed
+> with g262, slates-api's owner):
+> - `WriteAct`, `WriteMode { Bypass, Ask, Forbid }`, `WritePolicy { merge, land }`, `PolicySubject`, the issuer-proven
+>   `SetPolicy` (refused on a consumer-bound channel) and `Refusal::PolicyForbids { act, by }`;
+> - a landing under the effective mode, Linux included; then merges (submit) under it;
+> - the MCP and SDK land verb gated by the policy (the grant kind stays refused there);
+> - signed work: a merge or landing may carry an SSH signature, checked and recorded (verified with its signer,
+>   unsigned, invalid with its reason), and a volume may require signed merges;
+> - the end-to-end proof on adacachy: a bypass agent's landing written at once, an ask agent's after approval, a
+>   signed merge verified and an invalid signature reported.
 
 > **git's history, Mercurial and Subversion join the workload roster (2026-11-17, Part 6 "Real workloads"; A-289;
 > Ada's goal of 2026-11-18).** Until now one 15-line git script was all the version control any route ran: no clone,
@@ -1617,6 +1612,17 @@
 > 0.8 to 4.0 ms beyond base's spread (base 12 to 21 µs), on both runners, so none is taken (BENCHMARKS, "A shard's
 > scheduling slice, measured and rejected"). **Open:** the loaded Linux tail itself (p99 6 to 27 ms under two spinners
 > a core), and why a sliced shard's median request waited milliseconds in some rounds.
+>
+> **Merge: the verdict's whole-file identity check follows the change, not the file (§4.16 "The verdict"; landed
+> 2026-11-17 from agents/perf-decide 63d63b23).** A length-changing edit overlapping an intervening change rebuilt the
+> base, applied the ops to a copy and compared the copy with the head: three passes over the file a verdict. Now
+> `Value::applied_equals` compares the history's runs, and runs both values share are equal unread. Oracle:
+> `applied_equals_is_the_bytes_compared` (2,000 cases, a head stored whole among them). Engine A/B
+> (`crates/merge/examples/verdict_bench.rs`): a 1 MiB file's conflict 41 µs to 0.42–0.45 µs, a 4 KiB file's 0.68–1.12 to
+> 0.47–0.66 µs (BENCHMARKS, "What a verdict compares and copies"). At the 3,000-client rung's 21 KiB files the owner's
+> CPU a verdict is even (W1: 21.3–22.0 against 21.1–22.1 µs). **Open:** an accept still follows the file (`apply` writes
+> the new file, 37 µs at 1 MiB); the rung's engine verdict is 13 µs where the bench's is under 2.5 µs (82% of the rung's
+> verdicts are conflicts); and the large-file daemon A/B is owed to the supervisor's measurement.
 >
 > **Merge: the same edit from two works was one increment; fixed 2026-11-04 (§4.16, agents/perf).** The increment's
 > identity left out its work and its base, so a second work's byte-identical edit from the same base was answered from

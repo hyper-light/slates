@@ -68,7 +68,7 @@ their numbers.
 | R7 | Plain English. A human implementer must be able to act on every sentence. | Terms of art are defined once in the glossary (0.4) and used consistently. Each algorithm is written as numbered steps. Each test case is written as "do X, expect Y". |
 | R8 | Both laptop and EdenFS scale, one code path. | Every subsystem carries a "laptop degenerate" section: the laptop is the derived N=1 case of one formula family, never a mode switch. A named differential test asserts that the N=1 configuration has the same observable semantics as the fleet configuration. |
 | R9 | Sub-50 µs provisioning. | The provisioning path is decomposed step by step with a cited cost per step and a per-step budget; the end-to-end histogram (p50, p99, p999, max) is a permanent CI gate. |
-| R10 | Disk is written only on a user permission grant. | A grant is a database record created only by the CLI or a confirmation surface a human operates; the MCP server and the SDKs have no verb that creates one; the landing engine refuses without a grant bound to the exact manifest it is about to write; every grant, manifest, and outcome is in the audit log (§4.15). |
+| R10 | Disk is written only on a user permission grant, and the grant follows the mode the user gave the agent (A-285). | A grant is a database record bound to the exact manifest it is about to write; the launcher's write policy decides whether the daemon issues it at once (bypass), answers an approval request that the harness presents (ask) or refuses (a forbidding mode); an agent can never raise its own policy; every grant, manifest, and outcome is in the audit log (§4.15). |
 
 **R1's access and residency contract (A-50, 2026-09-30; audit §9; decided by Ada, 2026-09-30).** slates is
 pure in memory: literal zero disk access is the baseline requirement — the entire point of the product —
@@ -860,10 +860,10 @@ plan schedules.
   distinguishes workloads within it. A channel label supplied by a caller cannot establish
   human authority. A trusted confirmation surface binds its approval to the exact manifest;
   transport checks supplement that authority check (§4.13).
-- A-285 (Ada, 2026-11-18): the human's authority is a signature by a key only the human holds (an ssh-agent key that
-  asks for confirmation on every use, or a FIDO key that needs a touch), over the exact landing and a nonce the daemon
-  issued; the anchor's own terminal is the fallback where no key is registered. No secret a process of the user can
-  read is authority any more.
+- A-285 (Ada, 2026-11-18): write permission follows the mode the user gave the agent's harness. Bypass merges and
+  lands; ask answers a typed approval request bound to the manifest, which the harness presents; a forbidding mode is
+  refused. The launcher or the harness sets the policy and an agent never raises its own. The earlier reading of a
+  human-only proof is withdrawn; signatures are signed-work provenance, not permission.
 - Evidence: `SO_PEERCRED`, `getpeereid`/`LOCAL_PEERTOKEN`, named-pipe client checks [B]; hecate's "an id is never a bearer capability" [C: survey-hecate.md §8.4]; vorpal's MCP enrollment rule [C: survey-vorpal.md §6.1].
 - Grants are created only through the CLI or a confirmation surface a human operates, for the same reason vorpal enrols servable roots by hand: a confirmation delivered through the agent's channel would be answered by the agent. A landing opens the target beneath its own directory descriptor (`openat2` with `RESOLVE_BENEATH` on Linux, `O_NOFOLLOW` chains elsewhere) so it can never write outside the granted directory [B: openat2(2)]; the target must be owned by the calling user and must not lie inside a slates mount.
 
@@ -6898,7 +6898,8 @@ command and every host start, mount and grant through one implementation.
   the group of an instance run alone; a host that launches the anchor under its service manager
   takes the command (`StartSpec::anchor_command`) and waits with `Instance::wait_for`. The starter
   is given no grant authority: under Ada's decision of 2026-11-18 a grant is proved by a key only
-  the human holds (A-285), presented through the crate's proof-agnostic grant call.
+  the human holds (A-285), presented through the crate's proof-agnostic grant call. (A-285 was revised
+  the same day: write permission follows the agent's mode and the launcher's authority is the issuer.)
 - *What a host holds.* An `Instance`: one held client of one running instance. A landing's
   presentation lives as long as the client that made it (A-46), so a plan a person is shown is
   granted and landed on the same client. An `Issuer`: the confirmation surface's authority (§4.13),
@@ -7097,12 +7098,11 @@ server, not inferred from command names.
 > every grant and a session grant was recorded spent at its first landing. Record:
 > `docs/bugs/2026-09-29-grants-were-lost-at-a-restart-and-session-grants-recorded-consumed.md`.
 
-> **Status (2026-11-18, A-285).** Ada chose the grant's proof: a signature by a key only the human holds, an SSH
-> signature under the namespace `slates-grant` (an ssh-agent key added with `ssh-add -c`, or a FIDO key) or a WebAuthn
-> assertion over the same statement; the anchor's own terminal where no key is registered. The statement, the SSH
-> verifier, the presentation's nonce and the signed `Grant` are built (`crates/server/src/grant_signature.rs`,
-> `landing::verify_signed_grant`); key registration and the CLI are owed, and the issuer secret still proves grants
-> until they land. Record: A-285, GAPS (2026-11-18).
+> **Status (2026-11-18, A-285).** Ada's rule: a grant follows the write mode the user gave the agent (bypass lands at
+> once, ask answers an approval request the harness presents, a forbidding mode refuses), set by the launcher or the
+> harness and never raised by the agent. The confirmation surface is whoever holds the launcher's authority, the
+> instance's issuer. The write policy is owed; until it lands, grants are made as before, by the issuer's keyed hash.
+> Record: A-285, GAPS (2026-11-18).
 
 *Refusals added.* `Forbidden{verb}`, `GrantChannelRefused{channel}`,
 `ConsumerNotEnrolled`, `ConsumerRevoked`, `GrantIssuerUnverified`; all are closed variants
@@ -20909,6 +20909,8 @@ Applied in the same change to:
   Ada's grant decision of the same day (A-285: a grant's proof is a signature by a key only the human holds, with a
   prompt on the anchor's terminal where none is registered) makes that wrong: a host process holding the issuer secret
   could grant without the person. So the starter is handed nothing, and the grant call takes the person's proof.
+  (A-285 was revised the same day: write permission follows the agent's mode, and the launcher, the issuer's holder,
+  approves.)
 - **Piece 3, the same day** (kiln's asks, g263): `mount::available() -> Result<MountKind, MountFault>`, the machine's
   mount mechanism with no daemon (macOS: `mount(2)`, always; the BSDs: `mount_nfs` on the `PATH`; Linux:
   `fusermount3` on the `PATH` and a `/dev/fuse` the user may read and write; Windows: WinFsp's library loads), each
@@ -21093,45 +21095,33 @@ Applied in the same change to: Part 6's "Real workloads" status, GAPS, `docs/wip
   mount and a file's second name to two links (gated on a built CLI, run in CI's Linux conformance step). The roster's
   runs over the mount are the supervisor's (CLAUDE.md §8).
 
-### A-285 — A grant is signed by a key only the human holds; the anchor's own terminal is the fallback, on every OS (accepted 2026-11-18, Ada's decision; piece 1 built 2026-11-18)
-Applied in the same change to: D-22 (A-285 line), §4.13 "Grants" (status), GAPS (2026-11-18 entry),
-`crates/server/src/grant_signature.rs`.
-Status: piece 1 built (the statement and the SSH-signature verifier, unit-tested); piece 2 built (the presentation's
-nonce, the signed `Grant` on the wire, the nonce spent once). Owed, in order: durable key registration (the first key only
-through A or kiln's person path, later keys signed by a registered key); `slates grant` signing through `ssh-keygen -Y
-sign` and A's terminal prompt; the exported-variables issuer surface removed on macOS and Windows (which closes
-GAP-A9-9's macOS segment by name, its option 1); the Windows confirm-per-use path recorded; the WebAuthn form verified.
-- Why: before, the anchor held the grant-issuer secret. On Linux it sat in a descriptor only the anchor's children
-  inherit, so no `slates grant` could be issued and a Linux server's landing stopped at its presentation (GAPS, A-201);
-  on macOS and Windows the anchor printed `export` variables, and any process of the user that held them could grant,
-  agents included. fs-server's options (2026-11-05):
-  - A. The anchor asks on its own controlling terminal, naming the exact manifest. Small and on every OS, but R10 rests
-    on who owns that terminal: an agent that started the anchor in its own shell can answer.
-  - B. A same-user socket to the anchor checked by `SO_PEERCRED`. Any process of the user, agents included, can
-    grant; it breaks D-22. Rejected.
-  - C. A separate operator account owns issuance (the peer's uid is checked). Strong and unprivileged, but a setup per
-    machine and the human switching accounts for each grant.
-  - **D. A grant signed by a key only the human holds**: an ssh-agent key added with `ssh-add -c` (the agent asks the
-    human through askpass on every use) or a FIDO key (`sk-ssh-ed25519`, a touch per signature). An agent with a shell
-    cannot make the signature unseen.
-  - E. Standing grants in a file the human writes. It weakens R10 to a policy, and agents must not be able to write
-    the file.
-
-  Ada chose D, with A only where no key is registered, the same on macOS, Windows and Linux (2026-11-18).
-- The proof: an SSH signature (OpenSSH `PROTOCOL.sshsig`) under the namespace `slates-grant`, over a plain-text
-  statement, one field a line: the landing, the manifest hash, the target (prefixed by its byte length), the scope and
-  term, a nonce the daemon issues with the presentation, and an expiry in Unix seconds. It covers all that the old
-  keyed proof bound. The nonce makes a signature usable once and only after the presentation. Keys: `ssh-ed25519` and
-  `sk-ssh-ed25519@openssh.com`, whose signature must carry the authenticator's user-presence flag; hashes `sha512` or
-  `sha256`; Ed25519 and SHA-2 from AWS-LC (A-66). A second form is accepted over the same bytes: a WebAuthn assertion
-  whose challenge is the statement's SHA-256, made in kiln's person session (a passkey or a security-key touch).
-- Registration is itself a grant-class act. A standalone anchor accepts its first key only through A's terminal
-  prompt. A kiln-managed anchor has no terminal; it registers and confirms through kiln's person session, a WebAuthn
-  ceremony whose public key reaches the anchor over kiln's authenticated person path, which agents cannot use (kiln
-  already refuses an agent a manifest-bearing land). This last route is the supervisor's direction, put to Ada as a
-  recommendation (2026-11-18). Each later key must be signed by a registered key. No agent channel can add a key.
-- Proven (piece 1): a real `ssh-keygen -Y sign` signature (OpenSSH 10.0p2) verifies; every single-bit flip of it is
-  refused; an unregistered key, a changed manifest or any other changed field, another namespace, a statement past its
-  expiry and an untouched security key are each refused with their own reason; hostile bytes are refused, never a
-  panic (`crates/server/src/grant_signature.rs`, 10 tests). The golden test was red until the vector was re-signed over
-  the exact encoding, since the first vector was signed before the target gained its length prefix.
+### A-285 — Write permission follows the mode the user gave the agent; signed work is provenance, never the permission gate (accepted 2026-11-18, Ada's decisions; revised the same day)
+Applied in the same change to: R10 (CLAUDE.md §1 and Part 1's rule table), D-22 (A-285 line), §4.13 "Grants" (status),
+GAPS (2026-11-18 entry), `crates/server/src/grant_signature.rs` (module docs).
+Status: the rule is recorded; the daemon side is owed, in order: the write policy and its wire (`WriteMode`,
+`SetPolicy`, `PolicyForbids`), landing under it (bypass lands at once, Linux included; ask answers an approval
+request; forbid refuses), merges under it, the MCP and SDK land verb gated by it, then signed work. The SSH-signature
+verifier built first (below) stays, for signed work.
+- **The rule (Ada, 2026-11-18).** Merging and landing to disk follow the permission mode the user gave the harness or
+  agent that asks. Bypass (Claude Code's `bypassPermissions`, Codex's full access): slates merges and writes, no
+  prompt. Ask: slates answers a typed approval request (the change's summary and manifest) that the harness presents
+  (its own prompt, an MCP elicitation, kiln's presentation), and writes once the approval comes back bound to that
+  manifest; a changed manifest is refused. A mode that forbids writing (plan): a typed refusal. The policy is carried
+  by the session's consumer or the volume and set by the launcher (kiln passes each agent's mode when it creates the
+  workspace) or the harness; the effective mode is the stricter of the two, unset is ask, and an agent can never raise
+  its own. The launcher's authority is the instance's issuer, which an agent's consumer channel never holds.
+- **Signed work (Ada: "we can (and should) support signed work").** A merge or a landing may carry an SSH signature
+  (OpenSSH `PROTOCOL.sshsig`); slates verifies it, records it as provenance and answers a typed check (verified with
+  its signer, unsigned, or invalid with its reason), and a volume can require signed merges. It never decides whether
+  a write is permitted.
+- **Withdrawn.** The same morning A-285 read R10 as a human-only proof: fs-server's options of 2026-11-05 (A, a prompt
+  on the anchor's terminal; B, a same-user socket; C, a separate operator account; D, a signature by a key only the
+  human holds; E, standing grants in a file the human writes), of which Ada first chose D with A as the fallback. Ada
+  withdrew that reading and the options (2026-11-18): agents can approve merges and landings within the mode their user
+  gave them. What was built for it and is withdrawn: the presentation's nonce and the signed `Grant` proof (piece 2,
+  d1a46ae9, reverted); never built: key registration and the terminal prompt.
+- **Kept.** The verifier (piece 1, 1c31d1c7): an SSH signature under a namespace, `ssh-ed25519` and `sk-ssh-ed25519`
+  (the user-presence flag required), `sha512` or `sha256`, Ed25519 and SHA-2 from AWS-LC (A-66), against a set of
+  keys; every failure a typed `SignatureRefusal`. Proven by 10 unit tests over a real `ssh-keygen -Y sign` vector
+  (OpenSSH 10.0p2): every single-bit flip, an unregistered key, a changed field, another namespace, an expired
+  statement, an untouched security key and hostile bytes are refused. Signed work reuses it over its own statement.
