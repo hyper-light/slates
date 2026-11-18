@@ -1,0 +1,42 @@
+# DIAG (not for main): g230's in-process reproduction of the nemesis's convergence failure (a volume taken back from
+# its adopter), on Linux x86_64, Linux arm64 and macOS arm64.
+name: diag-g230-yield
+on:
+  push:
+    branches: ['diag-g230-yield-*']
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  focused:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the fleet test binary
+        run: cargo test --locked -p slates-server --test fleet --no-run
+      - name: The focused tests
+        env:
+          G230_TESTS: every_copy_catches_up_once_the_creator_takes_its_volume_back_from_the_adopter every_copy_catches_up_once_the_third_node_takes_the_volume_from_the_adopter
+          G230_RUNS: "1 2"
+        run: |
+          set -u
+          for t in ${G230_TESTS}; do
+            for n in ${G230_RUNS}; do
+              timeout 1500 cargo test --locked -p slates-server --test fleet -- --exact "$t" --nocapture > "out-$t-$n.log" 2>&1; code=$?
+              echo "== $t run $n exit $code"
+              grep -E "^retaken from its adopter|^at the end|^Some\(|panicked at|test result" -A 1 "out-$t-$n.log" | cut -c1-2000
+            done
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: yield-logs-${{ matrix.os }}
+          path: out-*.log
