@@ -816,6 +816,11 @@ jobs:
       # byte for byte under the roster's exclusions and the drive's one stated difference (it makes no hard link, so a
       # local clone copies there where NTFS links). Mercurial and Subversion are installed pinned (the `env` above), and
       # Git for Windows' `bin`, which holds `sh`, joins the PATH.
+      - name: Python for Mercurial (native Windows)
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
       - name: Mercurial and Subversion for the workloads (native Windows)
         id: vcs-tools
         if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
@@ -1163,6 +1168,11 @@ jobs:
         timeout-minutes: 30
         run: cargo xtask conformance run --suite winfstest --records target/conformance-records --scratch target/conformance-scratch --keep
       # A-300: the roster's version-control workloads over the drive, as on the x86_64 lane, with Subversion's ARM64 build.
+      - name: Python for Mercurial (native arm64 Windows)
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
       - name: Mercurial and Subversion for the workloads (native arm64 Windows)
         id: vcs-tools
         if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
