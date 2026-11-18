@@ -32,16 +32,20 @@ const PROBE_MS: u64 = 5;
 /// up — `Daemon::start` returns as the shards come up, a beat before the rendezvous is connectable.
 const CONNECT_WAIT_SECS: u64 = 5;
 
-/// A live kernel mount, torn down (`umount` then `rmdir`) when dropped, so even a panic mid-demo leaves
-/// no mount or temp directory behind. Both steps are best-effort — a leftover mount is worse than a
-/// swallowed teardown error.
+/// A live kernel mount, torn down (`umount`, forced if refused, then `rmdir`) when dropped, so even a panic
+/// mid-demo leaves no mount or temp directory behind. Both steps are best-effort — a leftover mount is worse than a
+/// swallowed teardown error, and since A-229 the mount is hard, so one left behind once its daemon is gone hangs
+/// whatever touches it; a plain unmount is refused while a file on it is open.
 struct Mounted {
   path: String,
 }
 
 impl Drop for Mounted {
   fn drop(&mut self) {
-    let _ = Command::new("umount").arg(&self.path).output();
+    let plain = Command::new("umount").arg(&self.path).output();
+    if !plain.is_ok_and(|out| out.status.success()) {
+      let _ = Command::new("umount").arg("-f").arg(&self.path).output();
+    }
     let _ = Command::new("rmdir").arg(&self.path).output();
   }
 }

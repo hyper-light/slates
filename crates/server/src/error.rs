@@ -251,6 +251,11 @@ pub fn refusal_of_db(e: &DbError) -> Refusal {
       len: u64::try_from(*len).unwrap_or(u64::MAX),
     }),
     DbError::Wire(_) => database(DatabaseRefusal::Encoding),
+    // A moved volume's release refused while it holds attachment records (A-291): the move's own refusal of an
+    // attached volume, since a writer must detach before the volume leaves.
+    DbError::Attached { .. } => Refusal::MoveRefused {
+      reason: slates_ipc::protocol::MoveRefusal::Attached,
+    },
   }
 }
 
