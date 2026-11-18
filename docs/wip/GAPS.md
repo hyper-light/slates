@@ -15754,7 +15754,12 @@ Open:
   unanswered ask's age, so a run under load tells this cause from a holder's silence. Still open of it: a pair key's
   delivery is not tracked as an ask (it is per owner shard and candidate), so a wait on it alone holds to the failover
   SLO; and the ask is kept per volume, not per holder, so a stopped candidate's re-sent lane can stand in for an ask the
-  owner has not yet made of a live one (two faults at once, where the rule is A-292's alone).
+  owner has not yet made of a live one (two faults at once, where the rule is A-292's alone). Only progress clears the
+  ask: a holder that answers without moving anything (a refusal) leaves it standing, and so does a holder whose link was
+  dropped and whose session comes back (`live_ship::holder_reached`), so after a resume the wait still counts from the
+  first ask since anything was heard. Whether either reaches a healthy `fsync` under load is for the give-up records to
+  say (they name the oldest unanswered ask's age, the lanes and the unreachable holders); clearing on them would also
+  need a test that drives the daemon's bookkeeping, which today only the live flows do.
 - The virtio-fs serve loop times only the oldest held `FSYNC`'s next look (`serve_round`, `durable_oldest`); under
   windows a younger reply's look can come first, so its verdict waits for the oldest's look, at most a window late. Never
   a refusal, only a late one; the FUSE mount and WinFsp take the soonest look over every held reply.
