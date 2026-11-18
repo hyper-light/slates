@@ -1834,9 +1834,8 @@ pub(crate) fn published(
 }
 
 /// Appends `payload` (`whole`, and whether its install image may be refreshed from the volume's state now) to `id`'s
-/// log and keeps what follows from it: the bounds and the last whole state at a whole entry, the bytes a candidate keeps,
-/// the counters; refused for credit, the next publication owes a whole state. Whether it was appended. The caller ships
-/// it ([`ship_appended`]).
+/// log ([`append_entry`]); refused for credit, the next publication owes a whole state. Whether it was appended. The
+/// caller ships it ([`ship_appended`]).
 fn append_payload(
   state: &mut ShardState,
   id: slates_db::catalog::VolumeId,
@@ -1844,8 +1843,43 @@ fn append_payload(
   payload: Vec<u8>,
   anchors: Option<Vec<u64>>,
 ) -> bool {
+  match append_entry(state, id, (whole, image_now), payload, anchors) {
+    Ok(()) => true,
+    Err(NotAppended::Gone) => false,
+    Err(NotAppended::Unsealed) => {
+      refuse(state, id, "fleet.live.refused.no_payload");
+      false
+    }
+    Err(NotAppended::Refused(_)) => {
+      refuse(state, id, "fleet.live.refused.no_credit");
+      false
+    }
+  }
+}
+
+/// Why an entry was not appended ([`append_entry`], [`append_ready`]).
+enum NotAppended {
+  /// The volume ships no log here any more.
+  Gone,
+  /// Its body could not be sealed under the volume's keys.
+  Unsealed,
+  /// The shipper refused the entry: for credit, or past the last position.
+  Refused(LiveError),
+}
+
+/// Appends `payload` to `id`'s log and keeps what follows from it: the bounds and the last whole state at a whole entry,
+/// the bytes a candidate keeps, the counters. A refusal changes nothing, so a queued publication refused for credit can
+/// wait in its place ([`append_ready`]). A whole entry is the only entry that pays an owed whole state: a delta of a queue
+/// may follow a refusal it was captured before (A-377).
+fn append_entry(
+  state: &mut ShardState,
+  id: slates_db::catalog::VolumeId,
+  (whole, image_now): (bool, bool),
+  payload: Vec<u8>,
+  anchors: Option<Vec<u64>>,
+) -> Result<(), NotAppended> {
   let Some(live) = state.live.shipping.get_mut(&id.bytes) else {
-    return false;
+    return Err(NotAppended::Gone);
   };
   // A whole record is a checkpoint and may go one past the credit (`Shipper::append_checkpoint`); a delta waits for it.
   let appended = if whole {
@@ -1853,12 +1887,11 @@ fn append_payload(
   } else {
     live.shipper.append(payload.clone())
   };
-  let Ok(entry) = appended else {
-    refuse(state, id, "fleet.live.refused.no_credit");
-    return false;
-  };
+  let entry = appended.map_err(NotAppended::Refused)?;
   let shipped = u64::try_from(payload.len()).unwrap_or(u64::MAX);
-  live.owes_whole = false;
+  if whole {
+    live.owes_whole = false;
+  }
   live.kept = if whole {
     payload.len()
   } else {
@@ -1893,7 +1926,7 @@ fn append_payload(
     // The volume's state now is this publication's, so its image is exactly the head just appended.
     refresh_image(state, id);
   }
-  true
+  Ok(())
 }
 
 /// After entries were appended to `id`'s log: answers the writers whose wait they met and sends each holder what it
@@ -1913,7 +1946,7 @@ fn ship_appended(state: &mut ShardState, id: slates_db::catalog::VolumeId) {
 /// ([`durable_target`]) and a restart's kept position counts them ([`owned_piece`]). Until 2026-11-18 a whole entry was
 /// sealed in the one turn that published it, its AEAD and keyed names a byte: about a second a GiB, the watchdog's window.
 struct WholeBuild {
-  /// The publication's plain body (`LivePublication` bytes), captured in its turn.
+  /// The publication's plain body (`LivePublication` bytes), captured in its turn; emptied once its entry is appended.
   body: Vec<u8>,
   /// The offset in `body` of the next piece to seal.
   next: usize,
@@ -1923,6 +1956,8 @@ struct WholeBuild {
   sealing: Option<crate::head::HeadSealing>,
   /// See [`WholeBuild::sealing`].
   anchors: Vec<u64>,
+  /// Whether its whole entry is on the log: what is left is the queue behind it, waiting for credit ([`append_ready`]).
+  appended: bool,
   /// The publications made while it seals, each captured in its own turn, in order.
   queued: VecDeque<Queued>,
   /// The bytes of the deltas in `queued`: held to the credit, as their entries would be.
@@ -1936,6 +1971,7 @@ impl std::fmt::Debug for WholeBuild {
       .field("body_bytes", &self.body.len())
       .field("next", &self.next)
       .field("sealed", &self.sealed.len())
+      .field("appended", &self.appended)
       .field("queued", &self.queued.len())
       .field("queued_bytes", &self.queued_bytes)
       .finish()
@@ -1953,7 +1989,8 @@ struct Queued {
 enum Advance {
   /// Pieces remain: another turn follows.
   More,
-  /// It is appended, or it ended (its volume gone, superseded, or its keys refused): no turn follows.
+  /// Every piece is sealed and it is appended, or waits for credit, or it ended (its volume gone, superseded, or its keys
+  /// refused): no turn follows.
   Done,
 }
 
@@ -1963,7 +2000,7 @@ fn sealed_in_pieces(state: &ShardState, body: &[u8]) -> bool {
     && usize::try_from(slates_archive::format::MAX_CHUNK_BYTES).is_ok_and(|cap| body.len() > cap)
 }
 
-/// Whether a whole entry of `volume`'s log is being sealed in turns.
+/// Whether a whole entry of `volume`'s log is being sealed in turns, or the publications queued behind one wait.
 fn building(state: &ShardState, volume: [u8; 16]) -> bool {
   state
     .live
@@ -1978,7 +2015,7 @@ fn pending_entries(live: &LiveVolume) -> u64 {
   live.building.as_ref().map_or(0, |build| {
     u64::try_from(build.queued.len())
       .unwrap_or(u64::MAX)
-      .saturating_add(1)
+      .saturating_add(u64::from(!build.appended))
   })
 }
 
@@ -1989,7 +2026,7 @@ fn begin_whole_build(state: &mut ShardState, id: slates_db::catalog::VolumeId, b
 }
 
 /// [`begin_whole_build`] with the publications already queued behind it and their delta bytes (a queue's drain met a
-/// whole state of its own, [`drain_queued`]).
+/// whole state of its own, [`append_ready`]).
 fn begin_whole_build_with(
   state: &mut ShardState,
   id: slates_db::catalog::VolumeId,
@@ -1997,7 +2034,7 @@ fn begin_whole_build_with(
   (queued, queued_bytes): (VecDeque<Queued>, usize),
 ) {
   let Some((sealing, anchors)) = whole_sealing(state, id, true) else {
-    refuse(state, id, "fleet.live.refused.no_payload");
+    drop_queue(state, id, queued.len(), "fleet.live.refused.no_payload");
     return;
   };
   let Some(live) = state.live.shipping.get_mut(&id.bytes) else {
@@ -2011,6 +2048,7 @@ fn begin_whole_build_with(
     sealed: Vec::new(),
     sealing,
     anchors,
+    appended: false,
     queued,
     queued_bytes,
   }));
@@ -2025,9 +2063,10 @@ fn begin_whole_build_with(
   }
 }
 
-/// The task that seals a [`WholeBuild`] a turn at a time: it yields, then runs one turn, until the build is appended or
-/// has ended. Detached: nothing joins it, and its slot is reaped when it ends; a destroyed volume ends it at its next
-/// turn.
+/// The task that seals a [`WholeBuild`] a turn at a time: it yields, then runs one turn, until every piece is sealed or
+/// the build has ended. Detached: nothing joins it, and its slot is reaped when it ends; a destroyed volume ends it at its
+/// next turn. A sealed build the credit does not admit yet is appended later by what frees the credit ([`fold_into`]) or
+/// the record period, not by this task.
 async fn whole_build_task(id: slates_db::catalog::VolumeId) {
   loop {
     slates_rt::futures::yield_now().await;
@@ -2040,8 +2079,8 @@ async fn whole_build_task(id: slates_db::catalog::VolumeId) {
 
 /// One turn of `id`'s [`WholeBuild`]: its next pieces sealed until the seal turns' share of the shard's quantum has
 /// passed (`config::wrap_slice_ns`, as a seal's wrap and a takeover's open are held, A-323, A-347), one piece at least,
-/// so every turn moves it on; once every piece is sealed, the entry appended and the publications queued behind it
-/// after it ([`finish_whole_build`]). A build whose owner was superseded, or whose keys are refused, ends here.
+/// so every turn moves it on; once every piece is sealed, what the credit admits is appended ([`append_build`]). A
+/// build whose owner was superseded, or whose keys are refused, ends here.
 fn advance_whole_build(state: &mut ShardState, id: slates_db::catalog::VolumeId) -> Advance {
   let superseded = match state.live.shipping.get(&id.bytes) {
     Some(live) if live.building.is_some() => live.fenced.is_some(),
@@ -2098,97 +2137,188 @@ fn advance_whole_build(state: &mut ShardState, id: slates_db::catalog::VolumeId)
   if !sealed_whole {
     return Advance::More;
   }
-  finish_whole_build(state, id);
+  append_build(state, id);
   Advance::Done
 }
 
-/// Appends `id`'s sealed whole entry, then the publications queued behind it in order ([`drain_queued`]), and ships them.
-fn finish_whole_build(state: &mut ShardState, id: slates_db::catalog::VolumeId) {
-  let Some(build) = state
-    .live
-    .shipping
-    .get_mut(&id.bytes)
-    .and_then(|live| live.building.take())
-  else {
-    return;
-  };
-  let WholeBuild {
-    sealing,
-    sealed,
-    anchors,
-    queued,
-    ..
-  } = *build;
-  let mut payload = vec![KIND_WHOLE, BODY_SEALED];
-  payload.extend_from_slice(
-    &SealedBody {
-      sealing,
-      pieces: sealed,
-    }
-    .to_bytes(),
-  );
-  let appended = append_payload(state, id, (true, false), payload, Some(anchors));
-  drain_queued(state, id, queued, appended);
-  ship_appended(state, id);
+/// Appends what `id`'s [`WholeBuild`] holds ready ([`append_ready`]) and ships it.
+fn append_build(state: &mut ShardState, id: slates_db::catalog::VolumeId) {
+  if append_ready(state, id) {
+    ship_appended(state, id);
+  }
 }
 
-/// Appends the publications `queued` behind a whole entry, in order, sealing each now (a delta is small); a whole state
-/// among them is sealed in turns of its own with the rest queued behind it. Once one could not be appended (`appending`
-/// false: refused for credit, or its body not sealed), the chain cannot carry those after it, which follow a whole state
-/// later: the volume owes one, and each is counted dropped.
-fn drain_queued(
-  state: &mut ShardState,
-  id: slates_db::catalog::VolumeId,
-  mut queued: VecDeque<Queued>,
-  mut appending: bool,
-) {
-  while let Some(next) = queued.pop_front() {
-    if !appending {
-      let dropped = u64::try_from(queued.len())
-        .unwrap_or(u64::MAX)
-        .saturating_add(1);
-      state.count(LIVE_QUEUED_DROPPED, dropped);
-      return;
+/// Appends what `id`'s [`WholeBuild`] holds ready, in order: its whole entry once every piece is sealed and the credit
+/// admits a checkpoint (`Shipper::admits_checkpoint`), then each publication queued behind it as the credit admits it, a
+/// delta sealed now (it is small) and a whole state begun as a build of its own with the rest queued behind it. What the
+/// credit does not admit yet waits in its place, in order, for the acknowledgement that frees it ([`fold_into`]) or the
+/// record period: every publication given a position in the queue gets its entry there, so the writers waiting on that
+/// position are answered. Until 2026-11-18 a refusal dropped the rest of the queue into one whole state owed later, which
+/// took one position for all of them, and the writers waiting on the others were refused `DurabilityPending` at the
+/// failover SLO (`a_live_whole_entry_is_sealed_in_turns_and_writes_made_meanwhile_follow_it`: 4 of 8 writes, CI diag
+/// 44352143242). The build ends once its queue is empty. Whether anything was appended.
+fn append_ready(state: &mut ShardState, id: slates_db::catalog::VolumeId) -> bool {
+  let mut appended_any = false;
+  loop {
+    let Some(live) = state.live.shipping.get_mut(&id.bytes) else {
+      return appended_any;
+    };
+    let admits = live.shipper.admits_checkpoint();
+    let Some(build) = live.building.as_mut() else {
+      return appended_any;
+    };
+    if !build.appended {
+      if build.next < build.body.len() {
+        return appended_any;
+      }
+      if !admits {
+        state.count(LIVE_BUILD_WAITED, 1);
+        return appended_any;
+      }
+      let mut payload = vec![KIND_WHOLE, BODY_SEALED];
+      payload.extend_from_slice(
+        &SealedBody {
+          sealing: build.sealing.take(),
+          pieces: std::mem::take(&mut build.sealed),
+        }
+        .to_bytes(),
+      );
+      let anchors = std::mem::take(&mut build.anchors);
+      build.body = Vec::new();
+      build.appended = true;
+      match append_entry(state, id, (true, false), payload, Some(anchors)) {
+        Ok(()) => appended_any = true,
+        Err(_) => {
+          drop_build(state, id, "fleet.live.refused.no_position");
+          return appended_any;
+        }
+      }
+      continue;
+    }
+    let Some(next) = build.queued.pop_front() else {
+      live.building = None;
+      return appended_any;
+    };
+    if !next.whole {
+      build.queued_bytes = build.queued_bytes.saturating_sub(next.body.len());
     }
     if next.whole && sealed_in_pieces(state, &next.body) {
-      let bytes = queued
-        .iter()
-        .filter(|queued| !queued.whole)
-        .map(|queued| queued.body.len())
-        .fold(0usize, usize::saturating_add);
-      begin_whole_build_with(state, id, next.body, (queued, bytes));
-      return;
+      let rest = state
+        .live
+        .shipping
+        .get_mut(&id.bytes)
+        .and_then(|live| live.building.take())
+        .map_or((VecDeque::new(), 0), |build| {
+          (build.queued, build.queued_bytes)
+        });
+      begin_whole_build_with(state, id, next.body, rest);
+      return appended_any;
     }
-    appending = match sealed_payload(state, id, next.whole, next.body) {
-      Some((payload, anchors)) => append_payload(state, id, (next.whole, false), payload, anchors),
-      None => {
-        refuse(state, id, "fleet.live.refused.no_payload");
-        false
-      }
+    let sealed = sealed_payload(state, id, next.whole, next.body.clone());
+    let outcome = match sealed {
+      Some((payload, anchors)) => append_entry(state, id, (next.whole, false), payload, anchors),
+      None => Err(NotAppended::Unsealed),
     };
+    match outcome {
+      Ok(()) => appended_any = true,
+      Err(refused) => {
+        // Back in its place: refused for credit, it waits there and the writers behind it keep their positions; refused
+        // otherwise (its body not sealed, the last position), it is dropped with the rest, counted.
+        let waits = matches!(refused, NotAppended::Refused(LiveError::NoCredit { .. }));
+        if let Some(build) = state
+          .live
+          .shipping
+          .get_mut(&id.bytes)
+          .and_then(|live| live.building.as_mut())
+        {
+          if !next.whole {
+            build.queued_bytes = build.queued_bytes.saturating_add(next.body.len());
+          }
+          build.queued.push_front(next);
+        }
+        if waits {
+          state.count(LIVE_QUEUE_WAITED, 1);
+        } else {
+          drop_build(state, id, "fleet.live.refused.no_payload");
+        }
+        return appended_any;
+      }
+    }
   }
 }
 
 /// Ends `id`'s [`WholeBuild`] unappended (`why` counted): it and the publications queued behind it follow in a whole
-/// state the volume now owes.
+/// state the volume now owes ([`drop_queue`]).
 fn drop_build(state: &mut ShardState, id: slates_db::catalog::VolumeId, why: &'static str) {
-  let queued = state
+  let unappended = state
     .live
     .shipping
     .get_mut(&id.bytes)
     .and_then(|live| live.building.take())
     .map_or(0, |build| build.queued.len());
-  state.count(
-    LIVE_QUEUED_DROPPED,
-    u64::try_from(queued).unwrap_or(u64::MAX),
-  );
-  refuse(state, id, why);
+  drop_queue(state, id, unappended, why);
 }
 
-/// Captures a publication of `id` made while a whole entry seals and queues it behind it (A-377): its record, the
-/// volume's whole image when it ships whole, and its content runs read now, as they stand. A delta is queued while the
-/// deltas queued stay within the credit, as their entries would be; past it, refused for credit, it follows in a whole
-/// state the volume owes.
+/// Counts `dropped` queued publications that will follow in the whole state `id` now owes (`why` counted), and moves
+/// every writer of `id` waiting past that whole state's position onto it: the positions the dropped entries would have
+/// taken are not taken now, and the one whole state carries all their changes. A transport's barrier keeps the
+/// position it read and waits for the log to pass it, or for its bound (`DurableBound`).
+fn drop_queue(
+  state: &mut ShardState,
+  id: slates_db::catalog::VolumeId,
+  dropped: usize,
+  why: &'static str,
+) {
+  state.count(
+    LIVE_QUEUED_DROPPED,
+    u64::try_from(dropped).unwrap_or(u64::MAX),
+  );
+  refuse(state, id, why);
+  let owed = state
+    .live
+    .shipping
+    .get(&id.bytes)
+    .and_then(|live| live.shipper.next_position());
+  if let Some(owed) = owed {
+    fold_waiting_onto(state, id.bytes, owed);
+  }
+}
+
+/// Moves every writer of `volume` waiting for a position past `position` to wait for `position` instead.
+fn fold_waiting_onto(state: &mut ShardState, volume: [u8; 16], position: u64) {
+  let Some(first) = position.checked_add(1) else {
+    return;
+  };
+  let later: Vec<([u8; 16], u64)> = state
+    .live
+    .awaiting
+    .range((volume, first)..=(volume, u64::MAX))
+    .map(|(key, _)| *key)
+    .collect();
+  for key in later {
+    let Some(waiting) = state.live.awaiting.remove(&key) else {
+      continue;
+    };
+    for entry in &waiting {
+      state.live.awaiting_by_request.insert(
+        (entry.origin, entry.id.client, entry.id.sequence),
+        (volume, position),
+      );
+    }
+    state
+      .live
+      .awaiting
+      .entry((volume, position))
+      .or_default()
+      .extend(waiting);
+  }
+}
+
+/// Captures a publication of `id` made while a whole entry seals, or while the queue behind one waits, and queues it
+/// last (A-377): its record, the volume's whole image when it ships whole, and its content runs read now, as they stand.
+/// A delta is queued while the deltas queued stay within the credit the whole entry ahead of them sets (its own size,
+/// `Bounds::of_whole`, or the shipper's credit if that is greater), as their entries will be held to it; past it,
+/// refused for credit, it follows in a whole state the volume owes.
 fn queue_behind_build(
   state: &mut ShardState,
   id: slates_db::catalog::VolumeId,
@@ -2215,6 +2345,7 @@ fn queue_behind_build(
   let Some(build) = live.building.as_mut() else {
     return;
   };
+  let credit = credit.max(build.body.len());
   if !whole && build.queued_bytes > 0 && build.queued_bytes.saturating_add(body.len()) > credit {
     refuse(state, id, "fleet.live.refused.no_credit");
     return;
@@ -2235,13 +2366,18 @@ const LIVE_WHOLE_BUILD_TURNS: &str = "fleet.live.whole_build_turns";
 /// Counter: a publication captured while a whole entry sealed and queued behind it ([`queue_behind_build`]).
 /// Format: a counter name in the daemon's status report.
 const LIVE_QUEUED: &str = "fleet.live.queued";
-/// Counter: a queued publication that followed in a later whole state instead of its own entry ([`drain_queued`],
-/// [`drop_build`]).
+/// Counter: a queued publication that followed in a later whole state instead of its own entry ([`drop_queue`]).
 /// Format: a counter name in the daemon's status report.
 const LIVE_QUEUED_DROPPED: &str = "fleet.live.queued_dropped";
 /// Counter: a whole entry being sealed when its owner was superseded ([`advance_whole_build`]).
 /// Format: a counter name in the daemon's status report.
 const LIVE_BUILD_SUPERSEDED: &str = "fleet.live.build_superseded";
+/// Counter: a sealed whole entry that waited for the credit to admit it ([`append_ready`]).
+/// Format: a counter name in the daemon's status report.
+const LIVE_BUILD_WAITED: &str = "fleet.live.build_waited";
+/// Counter: a queued publication that waited in its place for the credit ([`append_ready`]).
+/// Format: a counter name in the daemon's status report.
+const LIVE_QUEUE_WAITED: &str = "fleet.live.queue_waited";
 
 /// A live volume's state on its owner shard as its shipper is made: its first publication ships the whole volume.
 fn new_live_volume(shipper: Shipper) -> LiveVolume {
@@ -3555,6 +3691,8 @@ fn fold_into(state: &mut ShardState, replies: Vec<(ObjectId, HostId, Vec<u8>)>) 
     if live.shipper.durable() > before {
       state.count(LIVE_DURABLE, 1);
       resolve(state, object.0);
+      // What became durable left the credit: a sealed whole entry or a queued publication waiting for it goes on now.
+      append_build(state, slates_db::catalog::VolumeId { bytes: object.0 });
     }
     if progressed && !touched.contains(&object.0) {
       touched.push(object.0);
@@ -3691,6 +3829,14 @@ fn period_volume(s: &mut ShardState, volume: [u8; 16]) {
   // failover SLO (A-354).
   resolve(s, volume);
   judge_held(s, volume);
+  // A whole entry being sealed in turns, or the queue behind one waiting for credit, is the whole state the volume owes,
+  // and its volume's state is past its head until it and its queue are appended (A-377): the period appends what the
+  // credit admits now and makes nothing beside it. Judged before the candidates' keys, which would owe another whole
+  // state for a log whose first whole entry is still sealing, and each publication meanwhile would be queued whole.
+  if building(s, volume) {
+    append_build(s, id);
+    return;
+  }
   // A log whose last whole entry no successor among the candidates could open is checkpointed again once this shard has
   // delivered the pairs that would let it ([`covers_candidates`]).
   if !covers_candidates(s, volume)
@@ -3701,11 +3847,6 @@ fn period_volume(s: &mut ShardState, volume: [u8; 16]) {
   }
   // A volume that owes a whole record ships one once its credit allows: a burst that outran the credit left its last
   // writes unshipped until another write came, and none might (three of five writes, `live_fleet`).
-  // A whole entry being sealed in turns is the whole state the volume owes, and its volume's state is past its head
-  // until it and its queue are appended (A-377): neither is made beside it.
-  if building(s, volume) {
-    return;
-  }
   if owes_whole_within_credit(s, volume) {
     published(s, id, None);
   } else if owes_image(s, volume) && published_whole(s, id) {

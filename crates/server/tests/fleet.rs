@@ -11624,6 +11624,16 @@ fn a_live_whole_entry_is_sealed_in_turns_and_writes_made_meanwhile_follow_it() {
     )
   });
   let line = owned_live_line(&mut client, id);
+  let owner_counters: Vec<(&'static str, u64)> = summed_counters(&daemons[0])
+    .into_iter()
+    .filter(|(name, _)| {
+      name.starts_with("fleet.live.refused")
+        || name.starts_with("fleet.live.queue")
+        || name.starts_with("fleet.live.build")
+        || name.starts_with("fleet.live.whole")
+        || name.starts_with("fleet.live.appended")
+    })
+    .collect();
   drop(observed);
   drop(client);
   for daemon in daemons {
@@ -11632,7 +11642,8 @@ fn a_live_whole_entry_is_sealed_in_turns_and_writes_made_meanwhile_follow_it() {
   let [builds, turns, queued] = [0, 1, 2].map(|kind| after[kind].saturating_sub(before[kind]));
   eprintln!(
     "whole entry in turns: shipped {shipped:?}, first write {first:?}, {} of {BUILT_WRITERS} writes during it answered; \
-     builds {builds}, turns {turns}, queued {queued}; a's log {line:?}, settled {settled}",
+     builds {builds}, turns {turns}, queued {queued}; a's log {line:?}, settled {settled}; a's counters \
+     {owner_counters:?}",
     during
       .iter()
       .filter(|reply| matches!(reply, ReplyBody::FsDone { .. }))
