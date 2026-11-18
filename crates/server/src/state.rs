@@ -671,6 +671,8 @@ pub struct ShardState {
   /// Verbs serving an object's latest state parked until its owner lease confirms (`crate::lease_wait`; §4.8
   /// "Leases and reads"), bounded by the shard's client credit.
   pub(crate) lease_waiters: crate::lease_wait::LeaseWaiters,
+  /// A shard's parked work verbs and the answer for the one now running (A-247; `crate::work_home`).
+  pub(crate) work_home: crate::work_home::WorkHome,
   /// The `ring.request` spans of requests this shard forwarded to another shard, or scattered, by request
   /// word (§4.14): opened at the slot read, ended when the reply comes back through `deliver` and is
   /// written, so a forwarded reply's ring span is timed from read to reply like a local one. Bounded by
@@ -890,6 +892,10 @@ pub struct ShardState {
   /// Test support: while set, this control shard delivers no pair keys (`Daemon::inject_pair_withhold`), as a
   /// neighbour's recipient answer that has not yet arrived holds a delivery back.
   pub injected_pair_withhold: bool,
+  /// Test support: the anchor whose node this control shard's owner shards deliver no pair key to
+  /// (`Daemon::inject_pair_withhold_to`), every other delivery going on and nothing delivered forgotten: a delivery
+  /// whose recipient answer never comes back. `None` in production.
+  pub injected_pair_withhold_to: Option<u64>,
   /// Test support (never reachable from the wire): voters whose record sessions each of this node's
   /// campaigns counts as out of their links, as a discovery page holds one, for the span after the
   /// campaign's round begins (`fleet::take_campaign_sessions`); so a test drives a campaign into sessions
@@ -1067,6 +1073,10 @@ pub struct WorkState {
   /// The bytes this work is charged against the shard's budget: its content's and journal's footprint
   /// (`crate::work_charge`), released when it shrinks, resets or is destroyed.
   pub charged: u64,
+  /// The base entries of the paths the work fetched (A-247), each as `Green::path_base` gave it at the work's base
+  /// version, so the work composes its increment off its green's shard (`Base::for_names`). Cleared with the base;
+  /// charged with the work.
+  pub entries: std::collections::BTreeMap<String, slates_merge::increment::Base>,
 }
 
 /// A reply waiting to be written into a client's ring.

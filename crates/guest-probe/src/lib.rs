@@ -9,6 +9,10 @@
 //! The protocol is text, so a run's console log reads as its own transcript, and pure, so it is parsed and encoded the
 //! same on every host and tested here. The guest is Linux only (`src/guest.rs`); on another host the binary says so and
 //! exits. It is test infrastructure: it never runs on a host and is never shipped (`publish = false`).
+//!
+//! The guest mounts what it is shared `nosuid,nodev`, as slates asks of every guest's mount of a volume (A-94, A-294),
+//! and can mount it again without either flag as a control, so a test shows by use that a set-id file or a device node
+//! made by another of the volume's writers acts in the guest only where a mount lets it ([`protocol::Mount`]).
 
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 

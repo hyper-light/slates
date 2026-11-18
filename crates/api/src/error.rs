@@ -1311,9 +1311,19 @@ mod tests {
       typed(Refusal::StaleLease { current: 4 }),
       Error::Stale(Stale::Lease { current: 4 })
     );
-    let overloaded = typed(Refusal::Overloaded { shard: 1 });
+    expect_an_overload_retried_after_the_pause(&typed(Refusal::Overloaded { shard: 1 }));
     assert_eq!(
-      overloaded,
+      typed(Refusal::ConsensusNotInitialized),
+      Error::Unusable(Unusable::NoGroup)
+    );
+    assert!(!typed(Refusal::ConsumerRevoked).is_retryable());
+  }
+
+  /// The retry of `each_refusal_is_typed_into_the_class_a_consumer_acts_on`: expect `overloaded`, shard 1's overload
+  /// typed, to be a retry of that cause after the pause it was typed with.
+  fn expect_an_overload_retried_after_the_pause(overloaded: &Error) {
+    assert_eq!(
+      *overloaded,
       Error::Retry {
         cause: RetryCause::Overloaded { shard: 1 },
         pause_ns: PAUSE_NS
@@ -1321,11 +1331,6 @@ mod tests {
     );
     assert!(overloaded.is_retryable());
     assert_eq!(overloaded.retry_pause_ns(), Some(PAUSE_NS));
-    assert_eq!(
-      typed(Refusal::ConsensusNotInitialized),
-      Error::Unusable(Unusable::NoGroup)
-    );
-    assert!(!typed(Refusal::ConsumerRevoked).is_retryable());
   }
 
   /// A-299: do type a `NotFound` for a call that names nothing that could be missing, and a daemon gone past the

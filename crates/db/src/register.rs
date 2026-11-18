@@ -4491,48 +4491,27 @@ mod tests {
     );
     assert_eq!(regional.owner_of(object), Some(creator));
 
-    let before = regional.version;
     assert!(
       !regional.move_object(object, creator, b, &[b, HostId(4)]),
       "a cohort without the mover is no placement of its records"
     );
     assert!(!regional.move_object(object, creator, b, &[]));
-    assert!(regional.move_object(object, creator, b, &creators_cohort));
-    assert_eq!(regional.version, before + 1);
-    assert_eq!(
-      regional.moved.get(&object),
-      Some(&Moved {
-        owner: b,
-        version: before + 1,
-        from: Some(creator),
-        cohort: vec![creator, HostId(3), HostId(4)],
-      })
+    let before = regional.version;
+    let version = expect_a_move_to_name_its_new_owner(
+      &mut regional,
+      object,
+      unrelated,
+      (creator, b),
+      &creators_cohort,
     );
-    assert_eq!(regional.owner_of(object), Some(b));
-    assert_eq!(
-      regional.owner_of(object.catalog()),
-      Some(b),
-      "a volume's catalog register moves with it"
+    expect_every_move_but_its_owners_refused(
+      &mut regional,
+      object,
+      (creator, b, c),
+      &creators_cohort,
+      &bs_cohort,
     );
-    assert_eq!(
-      regional.owner_of(unrelated),
-      Some(creator),
-      "a move fences nothing but its object"
-    );
-
-    assert!(
-      !regional.move_object(object, creator, c, &creators_cohort),
-      "the old owner no longer moves it"
-    );
-    assert!(
-      !regional.move_object(object, b, b, &bs_cohort),
-      "not to its own owner"
-    );
-    assert!(
-      !regional.move_object(object, b, HostId(9), &bs_cohort),
-      "not to a non-member"
-    );
-    assert_eq!(regional.version, before + 1, "refused moves change nothing");
+    assert_eq!(regional.version, version, "refused moves change nothing");
 
     assert!(regional.move_object(object, b, c, &bs_cohort));
     assert_eq!(regional.owner_of(object), Some(c));
@@ -4595,6 +4574,72 @@ mod tests {
     assert_eq!(regional.owner_of(object), Some(c));
   }
 
+  /// The first move of `a_move_names_the_objects_owner_and_only_its_owner_moves_it`. Do: move `object` from
+  /// `creator`, which made `unrelated` too, to `to`, its records in `cohort`. Expect the configuration's version to
+  /// advance by one, the exception to name `to` at that version with the member it left and the cohort (A-291), the
+  /// object and its catalog register owned by `to`, and `unrelated` still on its creator's line. Returns the version
+  /// the move committed at.
+  fn expect_a_move_to_name_its_new_owner(
+    regional: &mut RegionalConfiguration,
+    object: ObjectId,
+    unrelated: ObjectId,
+    (creator, to): (HostId, HostId),
+    cohort: &[HostId],
+  ) -> u64 {
+    let before = regional.version;
+    assert!(regional.move_object(object, creator, to, cohort));
+    assert_eq!(regional.version, before + 1);
+    // The exception keeps the cohort in id order (A-291).
+    let mut in_order = cohort.to_vec();
+    in_order.sort_unstable_by_key(|host| host.0);
+    in_order.dedup();
+    assert_eq!(
+      regional.moved.get(&object),
+      Some(&Moved {
+        owner: to,
+        version: before + 1,
+        from: Some(creator),
+        cohort: in_order,
+      })
+    );
+    assert_eq!(regional.owner_of(object), Some(to));
+    assert_eq!(
+      regional.owner_of(object.catalog()),
+      Some(to),
+      "a volume's catalog register moves with it"
+    );
+    assert_eq!(
+      regional.owner_of(unrelated),
+      Some(creator),
+      "a move fences nothing but its object"
+    );
+    regional.version
+  }
+
+  /// The refused moves of `a_move_names_the_objects_owner_and_only_its_owner_moves_it`. Do: with `object` moved from
+  /// `creator` to `owner`, move it from its old owner to `other`, from its owner to itself, and from its owner to a
+  /// host that is not a member. Expect every one refused.
+  fn expect_every_move_but_its_owners_refused(
+    regional: &mut RegionalConfiguration,
+    object: ObjectId,
+    (creator, owner, other): (HostId, HostId, HostId),
+    creators_cohort: &[HostId],
+    owners_cohort: &[HostId],
+  ) {
+    assert!(
+      !regional.move_object(object, creator, other, creators_cohort),
+      "the old owner no longer moves it"
+    );
+    assert!(
+      !regional.move_object(object, owner, owner, owners_cohort),
+      "not to its own owner"
+    );
+    assert!(
+      !regional.move_object(object, owner, HostId(9), owners_cohort),
+      "not to a non-member"
+    );
+  }
+
   /// §4.8 "Authority scope" with "Promotion and takeover". Do: move host 1's object to host 2; take host 2 over;
   /// confirm every survivor's share. Expect the object owned by its successor while the retirement is kept, the
   /// exception naming that successor from its confirmation on, and still the successor once the retirement is
@@ -4627,22 +4672,39 @@ mod tests {
       "the exception followed the takeover, whose own round adopted the object (no move's round owed)"
     );
     assert_eq!(regional.owner_of(object), Some(successor));
+    expect_only_its_owners_destroy_report_drops_the_exception(
+      &mut regional,
+      object,
+      creator,
+      successor,
+    );
+  }
 
+  /// The destroy of `a_moved_objects_exception_follows_its_owners_takeover_and_goes_with_its_destroy`. Do: with
+  /// `object`, made by `creator`, moved and owned by `owner`, report it destroyed from another member, then from its
+  /// owner, then from its owner again. Expect only its owner's first report to drop the exception, after which the
+  /// object is on its creator's line again and there is nothing left to forget.
+  fn expect_only_its_owners_destroy_report_drops_the_exception(
+    regional: &mut RegionalConfiguration,
+    object: ObjectId,
+    creator: HostId,
+    owner: HostId,
+  ) {
     let other = regional
       .members
       .iter()
       .copied()
-      .find(|host| *host != successor)
+      .find(|host| *host != owner)
       .expect("a five-member region keeps another member");
     assert!(
       !regional.forget_moved(object, other),
       "only its owner reports it destroyed"
     );
-    assert!(regional.forget_moved(object, successor));
+    assert!(regional.forget_moved(object, owner));
     assert!(!regional.moved.contains_key(&object));
     assert_eq!(regional.owner_of(object), Some(creator));
     assert!(
-      !regional.forget_moved(object, successor),
+      !regional.forget_moved(object, owner),
       "nothing left to forget"
     );
   }
@@ -4658,10 +4720,7 @@ mod tests {
   fn a_moved_objects_exception_follows_a_takeover_carried_into_another() {
     let (mut regional, scatter) = wide_region();
     let (creator, moved_to) = (HostId(1), HostId(2));
-    let objects: Vec<ObjectId> = (0..64).map(|index| ObjectId::new(creator, index)).collect();
-    for object in &objects {
-      assert!(regional.move_object(*object, creator, moved_to, &[creator]));
-    }
+    let objects = objects_moved(&mut regional, creator, moved_to);
     regional.take_over(moved_to, scatter);
     let successor_of = |regional: &RegionalConfiguration, object: ObjectId| match regional
       .lineage(moved_to, object)
@@ -4700,6 +4759,32 @@ mod tests {
       regional.moved.get(&carried).map(|moved| moved.owner),
       (adopter != creator).then_some(adopter)
     );
+    expect_every_moved_line_kept(&regional, &objects, home, creator);
+  }
+
+  /// The objects of `a_moved_objects_exception_follows_a_takeover_carried_into_another`: sixty-four of `creator`'s,
+  /// each moved to `to`. Expect every move made.
+  fn objects_moved(
+    regional: &mut RegionalConfiguration,
+    creator: HostId,
+    to: HostId,
+  ) -> Vec<ObjectId> {
+    let objects: Vec<ObjectId> = (0..64).map(|index| ObjectId::new(creator, index)).collect();
+    for object in &objects {
+      assert!(regional.move_object(*object, creator, to, &[creator]));
+    }
+    objects
+  }
+
+  /// The end of `a_moved_objects_exception_follows_a_takeover_carried_into_another`, both takeovers done. Expect
+  /// `home`, an object its creator `creator` adopted if there was one, back on its creator's line with no exception,
+  /// and every one of `objects` still owned by a member.
+  fn expect_every_moved_line_kept(
+    regional: &RegionalConfiguration,
+    objects: &[ObjectId],
+    home: Option<ObjectId>,
+    creator: HostId,
+  ) {
     if let Some(home) = home {
       assert!(
         !regional.moved.contains_key(&home),
@@ -4707,7 +4792,7 @@ mod tests {
       );
       assert_eq!(regional.owner_of(home), Some(creator));
     }
-    for object in &objects {
+    for object in objects {
       assert!(
         regional.owner_of(*object).is_some(),
         "no moved object's line is lost: {object:?}"
@@ -4766,6 +4851,17 @@ mod tests {
       .copied()
       .find(|host| *host != to)
       .expect("a four-member region keeps another member");
+    expect_no_member_moves_an_unresolved_object(&mut regional, unresolved, scatter);
+  }
+
+  /// The unresolved half of `a_member_moves_an_object_whose_takeover_is_done_and_never_an_unresolved_one`. Do: take
+  /// `unresolved` over and drop its retirement before every survivor confirms (A-272), so an object of its own is on
+  /// an unresolved line; then move that object from every member to every member. Expect every move refused.
+  fn expect_no_member_moves_an_unresolved_object(
+    regional: &mut RegionalConfiguration,
+    unresolved: HostId,
+    scatter: u64,
+  ) {
     let lost = ObjectId::new(unresolved, 4);
     regional.take_over(unresolved, scatter);
     regional.retired.remove(&unresolved);

@@ -2694,6 +2694,13 @@ impl Daemon {
     self.observe(self.shards.first().copied(), move |s| s.merge.fault = fault)
   }
 
+  /// Test support: loses the next verdict or admission the work's shard for `partition` is answered by its green's
+  /// owner (A-247; never reachable from the wire), as a crash between the owner's step and the work's would.
+  pub fn lose_next_owner_answer(&self, partition: u16) -> Result<(), ObserveError> {
+    let shard = self.shards.get(usize::from(partition)).copied();
+    self.observe(shard, |s| s.work_home.lose_next_answer = true)
+  }
+
   /// Test support: holds every discovery reply this node's record serve side would send (never reachable
   /// from the wire) while `withhold` is set, so a peer's refresh exchange to this node stays pending with
   /// its record endpoint borrowed by that exchange — the interrupted-discovery restart the
@@ -2704,6 +2711,19 @@ impl Daemon {
     self.observe(self.shards.first().copied(), move |s| {
       s.discovery_withhold_replies = withhold;
     })
+  }
+
+  /// Test support: the quantum the record period's live slices are cut by on every shard (`live_ship::period_slice`), in
+  /// place of the shard's own step quantum; `None` gives the shard its own back. Zero ends each slice after one volume, so
+  /// a test sees the slicing whatever the machine's wake cost. Delivered like [`Self::inject_live_state_withhold`]; `Ok`
+  /// once installed, else the typed refusal.
+  pub fn inject_live_period_quantum(&self, quantum_ns: Option<u64>) -> Result<(), ObserveError> {
+    for shard in self.shards.iter().copied() {
+      self.observe(Some(shard), move |s| {
+        s.live.period_quantum_ns = quantum_ns;
+      })?;
+    }
+    Ok(())
   }
 
   /// Test support: while `withhold` is set, this node's record serve side holds each live-state reply (a takeover's
@@ -3140,6 +3160,28 @@ impl Daemon {
       }
     }
     Ok(())
+  }
+
+  /// Test support: while `anchor` is set, this node's owner shards deliver no pair key to the node at that stable anchor,
+  /// as a delivery whose recipient answer never comes back fails each period (`fleet.seal.pair_recipient_unknown`);
+  /// every other delivery goes on and no pair delivered is forgotten (unlike [`Self::inject_pair_withhold`]), so a
+  /// node replaced at that anchor never receives this node's pairs while the rest of the fleet does. `None` lifts it.
+  /// `Ok` once installed on the control shard, where deliveries are made.
+  pub fn inject_pair_withhold_to(&self, anchor: Option<u64>) -> Result<(), ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      s.injected_pair_withhold_to = anchor;
+    })
+  }
+
+  /// Test support: the position of the newest entry of the live log this node holds for `object` as a candidate
+  /// (A-200), or `None` while it holds none; read on the control shard, where held logs live.
+  pub fn fleet_live_held(
+    &self,
+    object: slates_db::register::ObjectId,
+  ) -> Result<Option<u64>, ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      crate::live_ship::held_position(s, object)
+    })
   }
 
   /// Test support: makes each of this node's campaigns count the record sessions of `voters` as out of their
@@ -4089,6 +4131,7 @@ async fn init_shard(
     current_request: None,
     acceptance_deferred: false,
     lease_waiters: crate::lease_wait::LeaseWaiters::default(),
+    work_home: crate::work_home::WorkHome::default(),
     forwarded_rings: std::collections::BTreeMap::new(),
     telemetry_quota: config.telemetry_spans_per_reply,
     last_drain_ns: now,
@@ -4138,6 +4181,7 @@ async fn init_shard(
     dead_session_dropped_at: std::collections::BTreeMap::new(),
     dead_session_recovered_ns: None,
     injected_pair_withhold: false,
+    injected_pair_withhold_to: None,
     served_sessions: std::collections::BTreeMap::new(),
     campaign_session_hold: None,
     record_refused_from: std::collections::BTreeSet::new(),
@@ -4334,6 +4378,7 @@ async fn reap_loop() {
       CLIENTS_REAPED.fetch_add(u64::try_from(reaped).unwrap_or(u64::MAX), Ordering::AcqRel);
     }
     refresh_pressure_hold().await;
+
     crate::nfs::purge_owed_here().await;
     state::with_state(|s| {
       process_base_hints(s);
@@ -5168,6 +5213,168 @@ async fn restore_client_ids(listener: &mut Listener, origin: u16, shards: &[Shar
   true
 }
 
+/// Recovers what spans partitions, before any client is admitted: the names' aliases (A-236), the works off their
+/// green's shard, then every floor against the work it holds for (A-247).
+async fn recover_works_across_partitions(origin: u16, shards: &[ShardId]) {
+  let reconciled = reconcile_name_aliases(origin, shards).await;
+  if reconciled > 0 {
+    slates_machine::log_line!(
+      "slates-server: {reconciled} name alias(es) reconciled with their clones at recovery"
+    );
+  }
+  rebuild_remote_works(origin, shards).await;
+  drop_pending_creations(origin, shards).await;
+  let floors = reconcile_work_floors(origin, shards).await;
+  if floors > 0 {
+    slates_machine::log_line!(
+      "slates-server: {floors} work floor(s) reconciled with their works at recovery"
+    );
+  }
+}
+
+/// Replays each work whose green lives on another partition through that green's owner (A-247), its log being read
+/// from the work's partition. A shard that does not answer leaves its works unbuilt, and a retry of their verbs answers
+/// `NotFound`, as a work whose log would not replay does.
+async fn rebuild_remote_works(origin: u16, shards: &[ShardId]) {
+  for shard in shards.iter().copied() {
+    let Some(unbuilt) = crate::xshard::call_within(
+      origin,
+      shard.0,
+      |s| std::mem::take(&mut s.work_home.unbuilt),
+      LIVENESS_BUDGET_NS,
+    )
+    .await
+    else {
+      continue;
+    };
+    for work in unbuilt {
+      let id = work.work;
+      let Some(entries) = crate::xshard::call_within(
+        origin,
+        shard.0,
+        move |s| s.db.partition().work_log(id).to_vec(),
+        LIVENESS_BUDGET_NS,
+      )
+      .await
+      else {
+        continue;
+      };
+      let partition = crate::verbs::owner_of(crate::verbs::to_wire_volume(work.green));
+      let Some(owner) = shards.get(usize::from(partition)) else {
+        continue;
+      };
+      let (green, created_at) = (work.green, work.created_at);
+      let Some(replayed) = crate::xshard::call_within(
+        origin,
+        owner.0,
+        move |s| crate::verbs::owner_replay(s, green, created_at, &entries),
+        LIVENESS_BUDGET_NS,
+      )
+      .await
+      else {
+        continue;
+      };
+      let _ = crate::xshard::call_within(
+        origin,
+        shard.0,
+        move |s| crate::verbs::install_replayed_work(s, &work, replayed),
+        LIVENESS_BUDGET_NS,
+      )
+      .await;
+    }
+  }
+}
+
+/// Ends every work creation a restart caught waiting for its green's owner (A-247): its name and id go back, and the
+/// client's retry, finding no completion, creates it afresh. Any floor its admission left is dropped by the reconcile
+/// after, its work never having been made.
+async fn drop_pending_creations(origin: u16, shards: &[ShardId]) {
+  for shard in shards.iter().copied() {
+    let _ = crate::xshard::call_within(
+      origin,
+      shard.0,
+      |s| {
+        let names: Vec<String> = s
+          .db
+          .partition()
+          .pending_creations()
+          .map(|pending| pending.name.clone())
+          .collect();
+        for name in names {
+          s.db.begin();
+          let settled = crate::verbs::settle_creation(s, &name);
+          if settled.is_err() || s.db.commit(&mut s.segment).is_err() {
+            crate::verbs::reconcile_unpublished_effects(s);
+          }
+        }
+      },
+      LIVENESS_BUDGET_NS,
+    )
+    .await;
+  }
+}
+
+/// Compares every work floor with the work it holds for (A-247): one whose work is gone is dropped, and one that names
+/// a base the work no longer holds is moved to the work's. Only a crash between a work's step and its green's leaves
+/// either. Run before any client is admitted. Returns how many it changed.
+async fn reconcile_work_floors(origin: u16, shards: &[ShardId]) -> usize {
+  let mut reconciled = 0usize;
+  for shard in shards.iter().copied() {
+    let Some(floors) = crate::xshard::call_within(
+      origin,
+      shard.0,
+      |s| s.db.partition().work_floors().collect::<Vec<_>>(),
+      LIVENESS_BUDGET_NS,
+    )
+    .await
+    else {
+      continue;
+    };
+    for floor in floors {
+      let partition = crate::verbs::owner_of(crate::verbs::to_wire_volume(floor.work));
+      let Some(home) = shards.get(usize::from(partition)) else {
+        continue;
+      };
+      let work = floor.work;
+      let Some((exists, holds)) = crate::xshard::call_within(
+        origin,
+        home.0,
+        move |s| {
+          (
+            s.db.partition().volume(work).is_some(),
+            s.works.get(&work).map(|w| w.base_version),
+          )
+        },
+        LIVENESS_BUDGET_NS,
+      )
+      .await
+      else {
+        continue;
+      };
+      let change = match (exists, holds) {
+        (false, _) => Some(None),
+        (true, Some(base)) if base != floor.base => Some(Some(base)),
+        // A record whose work could not be rebuilt keeps its floor: its base may yet be read.
+        _ => None,
+      };
+      if let Some(base) = change {
+        let (green, work) = (floor.green, floor.work);
+        let moved = crate::xshard::call_within(
+          origin,
+          shard.0,
+          move |s| crate::verbs::owner_floor(s, green, work, base),
+          LIVENESS_BUDGET_NS,
+        )
+        .await;
+        if moved.is_some() {
+          reconciled = reconciled.saturating_add(1);
+        }
+      }
+    }
+  }
+  reconciled
+}
+
 /// A recovery's reconciliation of every name alias (A-236, `slates_db::alias::reconcile`): each shard's aliases asked
 /// for, the volume each names asked of its partition, and the alias confirmed when that volume holds the name, released
 /// when it does not. Run before any client is admitted, when no clone is between its steps. An alias whose question is
@@ -5358,12 +5565,9 @@ async fn control_loop(
   }
   // Every shard has recovered and no client is admitted yet, so no clone is between its steps: the names' aliases are
   // reconciled with the clones they name (A-236).
-  let reconciled = reconcile_name_aliases(control, &shards).await;
-  if reconciled > 0 {
-    slates_machine::log_line!(
-      "slates-server: {reconciled} name alias(es) reconciled with their clones at recovery"
-    );
-  }
+  // Likewise no work is between its steps: a work whose green lives on another partition is replayed through that
+  // green's owner, and only then is every floor compared with the work it holds for (A-247).
+  recover_works_across_partitions(control, &shards).await;
   // Clients this daemon handed out, so a wanted id that is live is not given twice; bounded
   // by the daemon's client capacity, refused typed beyond it (AC-2.6). A client's shard is
   // its id's residue, so a client reconnecting under its old id after a restart lands on the

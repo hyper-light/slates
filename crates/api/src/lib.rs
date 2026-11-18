@@ -105,11 +105,13 @@ pub use volume::{
 /// own.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Format: the consumer contract's version (§4.12 "Versioning", A-299), raised by one with every change to a type or a
-/// verb of the contract; a consumer asserts the one it was written against. 1: the contract as A-299 first published it
-/// (2026-11-18). 2: `Denied::Policy`, the class a write policy's refusal takes outside a landing or a merge (the
-/// same day). 3: `Instance::set_write_policy` and `Instance::write_policy`, over the daemon's policy verbs (A-285), and
-/// a landing or a merge a policy forbids answered as its `Refused` outcome (the same day). 4: the audit log and the
+/// The consumer contract's version (§4.12 "Versioning", A-299), raised by one with every change to a type or a verb
+/// of the contract; a consumer asserts the one it was written against.
+///
+/// 1: the contract as A-299 first published it (2026-11-18). 2: `Denied::Policy`, the class a write policy's refusal
+/// takes outside a landing or a merge (the same day). 3: `Instance::set_write_policy` and `Instance::write_policy`,
+/// over the daemon's policy verbs (A-285), and a landing or a merge a policy forbids answered as its `Refused` outcome
+/// (the same day). 4: the audit log and the
 /// grant listing typed (`AuditRecord`, `GrantRecord`; the same day). 5: `WritePolicy::UNSET` merges at once and asks
 /// for landings, as the daemon applies an unset policy (the same day). 6: a merge an ask mode holds is a
 /// `MergeApproval` (the increment's identity and paths) approved by `approve_merge`, and a landing's approval a
@@ -126,6 +128,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// `Instance::member`, `MoveProgress`, and its refusals' details (`Busy::Attached`, `Busy::Moving`,
 /// `Unusable::Unmovable`, `Invalid::MoveTarget`, `RetryCause::MoveUnplaced`). 11: `Instance::capture_base`, an
 /// overlay's base captured whole so its clones move (A-291, the same day).
+///
+/// Format: one whole number, the last of the versions above.
 pub const CONTRACT: u32 = 11;
 
 /// The typed client and its own types, for the verbs [`Instance::client`] lends outside the contract.

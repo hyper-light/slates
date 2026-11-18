@@ -3709,50 +3709,102 @@ fn lookupp_names_the_parent_and_is_noent_at_the_root() {
   );
 }
 
-/// A-26, A-268. Do: CREATE a character device and a block device in the root through NFSv4, then CREATE a directory
-/// and a character device of the directory's name. Expect: each device is `NFS4ERR_PERM` (a client's `EPERM`, what a
-/// local file system that holds no device nodes answers `mknod`), and the taken name is `NFS4ERR_EXIST` first. Before,
-/// both were `NFS4ERR_BADTYPE`, which the Linux client turns into its internal `EBADTYPE`, errno 527.
+/// A-26, A-294 (which replaced A-268's refusal). Do: as root, CREATE a character device numbered 1:2 and a block device
+/// numbered 259:1048575 in the root through NFSv4, and read each one's `type` and `rawdev` back with GETATTR; then
+/// CREATE a directory and a character device of the directory's name. Expect each device made and reported with its
+/// type (`NF4CHR`, `NF4BLK`) and its number (`specdata4`), and the taken name `NFS4ERR_EXIST`. Before A-294 each device
+/// was `NFS4ERR_PERM`; before A-268, `NFS4ERR_BADTYPE`, which the Linux client turns into its internal `EBADTYPE`,
+/// errno 527.
 #[test]
-fn a_device_create_is_refused_eperm_and_a_taken_name_eexist_first() {
+fn a_device_create_makes_the_node_and_getattr_reports_its_rawdev() {
+  /// Format: `nfs_ftype4` NF4DIR, NF4BLK and NF4CHR (RFC 7863).
+  const NF4DIR: u32 = 2;
+  const NF4BLK: u32 = 3;
+  const NF4CHR: u32 = 4;
+  /// Format: `FATTR4_RAWDEV`, attribute 41 (RFC 8881 §5.8.2.31).
+  const RAWDEV: u32 = 41;
   let mut store = store();
   let mut vol = volume(&mut store);
   let mut bridge = VolumeBridge::new(VOLUME, &mut vol, &mut store);
   let mut service = export(&mut bridge, 0);
   let mut server = Server::standalone();
   let mut client = Client::connect(&mut service, &mut server, b"host-devices");
-  let mut create = |kind: u32, name: &[u8]| {
+  let create = |client: &mut Client,
+                service: &mut Export<'_>,
+                server: &mut Server,
+                kind: u32,
+                name: &[u8],
+                (major, minor): (u32, u32)| {
     let mut args = client.sequenced(2);
     args.u32(op::PUTROOTFH);
     args.u32(op::CREATE);
     args.u32(kind);
-    if kind == 3 || kind == 4 {
-      args.u32(1); // specdata4 major
-      args.u32(2); // specdata4 minor
+    if kind == NF4BLK || kind == NF4CHR {
+      args.u32(major); // specdata4 major
+      args.u32(minor); // specdata4 minor
     }
     args.opaque(name);
     Bitmap::default().encode(&mut args);
     args.opaque(b"");
-    Client::call(&mut service, &mut server, args.as_slice()).status
+    Client::call(service, server, args.as_slice()).status
   };
-  /// Format: `nfs_ftype4` NF4DIR, NF4BLK and NF4CHR (RFC 7863).
-  const NF4DIR: u32 = 2;
-  const NF4BLK: u32 = 3;
-  const NF4CHR: u32 = 4;
+  let widest = (259, (1 << 20) - 1);
+  for (kind, name, number) in [
+    (NF4CHR, &b"char"[..], (1, 2)),
+    (NF4BLK, &b"block"[..], widest),
+  ] {
+    assert_eq!(
+      create(&mut client, &mut service, &mut server, kind, name, number),
+      Nfsstat4::Ok.wire(),
+      "root makes a device"
+    );
+    let mut args = client.sequenced(3);
+    args.u32(op::PUTROOTFH);
+    args.u32(op::LOOKUP);
+    args.opaque(name);
+    args.u32(op::GETATTR);
+    Bitmap::of(&[ATTR_TYPE, RAWDEV]).encode(&mut args);
+    let reply = Client::call(&mut service, &mut server, args.as_slice());
+    assert_eq!(reply.status, Nfsstat4::Ok.wire(), "GETATTR");
+    let mut body = reply.walk();
+    skip_sequence(&mut body);
+    expect_ok(&mut body, op::PUTROOTFH);
+    expect_ok(&mut body, op::LOOKUP);
+    expect_ok(&mut body, op::GETATTR);
+    let bitmap = Bitmap::decode(&mut body).unwrap();
+    assert!(bitmap.has(ATTR_TYPE) && bitmap.has(RAWDEV));
+    // The values in attribute order: `type`, then `rawdev`'s two words.
+    let mut values = XdrReader::new(body.opaque(64).unwrap());
+    assert_eq!(
+      (
+        values.u32().unwrap(),
+        values.u32().unwrap(),
+        values.u32().unwrap()
+      ),
+      (kind, number.0, number.1)
+    );
+  }
   assert_eq!(
-    create(NF4CHR, b"char"),
-    Nfsstat4::Perm.wire(),
-    "a character device"
+    create(
+      &mut client,
+      &mut service,
+      &mut server,
+      NF4DIR,
+      b"taken",
+      (0, 0)
+    ),
+    Nfsstat4::Ok.wire()
   );
   assert_eq!(
-    create(NF4BLK, b"block"),
-    Nfsstat4::Perm.wire(),
-    "a block device"
-  );
-  assert_eq!(create(NF4DIR, b"taken"), Nfsstat4::Ok.wire());
-  assert_eq!(
-    create(NF4CHR, b"taken"),
+    create(
+      &mut client,
+      &mut service,
+      &mut server,
+      NF4CHR,
+      b"taken",
+      (1, 2)
+    ),
     Nfsstat4::Exist.wire(),
-    "a taken name is EEXIST before the device's EPERM"
+    "a taken name is EEXIST"
   );
 }
