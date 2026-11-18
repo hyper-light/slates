@@ -246,6 +246,17 @@
 > must still meet the new fence, so each acceptor must be brought up to the installed version when it is next asked as
 > well as by the walk (a design change to §4.8's install, with its model).
 
+> **A verb's reply held for durability had no time bound: refused at the failover SLO (2026-11-18, A-354, §4.10 "Live
+> shipping"; g230).** `live_ship::defer` and `defer_destroy` held a reply until its log was durable, its owner fenced or
+> its volume destroyed, so a log that could never be held (A-353's catalog refused for good) kept its writer waiting 21
+> minutes. A hold now ends at the failover SLO, refused `DurabilityPending` and recorded as the request's outcome; the
+> writer still waits through a shorter silence. Test:
+> `a_reply_held_for_a_durability_it_cannot_reach_is_refused_at_the_failover_slo_and_runs_again`.
+> - **Owed (the integrator's):** live_chaos and live_fleet flows that keep a writer waiting past the failover SLO (10 s)
+>   now meet `DurabilityPending` where they waited; each flow's stops are a few liveness budgets, under it, but a flow
+>   that stops every candidate longer must treat the refusal as its write's outcome (not acknowledged, so never owed to
+>   a reader).
+
 > **A seal's envelope was wrapped in one turn, and a refused one never started again: in turns, and dropped (2026-11-18,
 > A-323 and A-322, §4.10 "Content replication"; g230).** The owner shard wrapped a seal's whole archive in the turn its
 > walk ended (98 ms for 64 MiB, `envelope_bench` 2026-10-05; about 1.5 s a GiB, past the watchdog's one-second window,
