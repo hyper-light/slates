@@ -1491,6 +1491,27 @@ cluster.
 >   `Overloaded` past it);
 > - the fleet's tasks are added to every shard though they run on the control shard alone.
 
+> **Status (2026-11-17, A-279: a full control channel tells the senders waiting for its room).** A sender refused
+> `ControlFull` keeps its message and sends it again once the channel has room. Until now nothing said when: the serve
+> loop, while it kept a forward, woke once per idle window to try again (0.3 to 21 ms on this Mac under 36 spinners;
+> the window is the wake estimate × 100, with no cap).
+> - The sender asks to be told (`ShardContext::want_room`, `futures::want_room`): its shard's mark in the target's
+>   `room_wanted`, a `SeqCst` fence, and one more try.
+> - The target, after each drain that took a message, fences `SeqCst` and tells every shard marked
+>   (`registry::give_room`). The tell marks the target in the asker's `room_given`, fences `SeqCst` (against the fence
+>   of a drain that re-armed its flag with a plain store), and publishes the asker's control flag, which wakes its
+>   tasks waiting on that target at its next drain.
+> - Either the second try finds the room or the drain finds the mark; an exiting shard tells every asker.
+>
+> The serve loop asks for its first kept forward's owner and then idles with no timer
+> (`verbs::ask_room_for_kept_forwards`). Proven by loom models of each half (`crates/rt/src/room.rs`; the tell's fence
+> rests on C++20's fence rules, since its model passes without it too), a runtime test whose sender has no timer at
+> all (`crates/rt/tests/room.rs`), and `forward_retry.rs`, whose answer is now owed within the
+> liveness budget of the owner's last progress through the flood queued ahead of it. Its budget from the hold's end
+> had counted the drain of 41,125 queued tasks, 64 ms to 4.33 s under load (8 of 30 failed at load ~35). Record:
+> `docs/bugs/2026-11-17-a-kept-forward-polled-for-room-and-its-test-timed-the-owners-queue.md`. Owed: the scatter's
+> parts and a result carried home still poll a full channel every `REPLY_PACE_NS` (`xshard::given_room_within`).
+
 **Failure matrix.** Driver setup refused (seccomp): Masked (epoll). Task arena full: Refused
 (`TooManyTasks`, admission). A task exceeding the bounded-work rule (a poll past the step quantum on
 the CPU, or waiting inside a call past it): Degraded, counted (`long_steps`, `blocked_steps`), the
@@ -6848,8 +6869,10 @@ command and every host start, mount and grant through one implementation.
   the anchor segment's handoff, attached for the length of one proof and never kept as a secret.
 - *Verbs.* Attach, the group of an instance run alone (`ensure_group`), create (an overlay over a
   host folder with a dynamic size, or scratch), snapshot, clone, destroy, list, status, drift and
-  rewitness; serving as a host mount (§4.6, every platform's own mechanism) or as a descriptor a VMM
-  takes (the Shards stream, A-161; the vhost-user socket); landing plans, landing under a grant, and
+  rewitness; serving as a host mount (§4.6, every platform's own mechanism; `mount::available` says
+  without a daemon whether the machine can mount and what is missing, and `mount::unmount_lazy` lets
+  go of a mount a leftover process still holds, Linux) or as a descriptor a VMM takes (the Shards
+  stream, A-161; the vhost-user socket); landing plans, landing under a grant, and
   `land_approved`, which grants and lands only the manifest a person approved and otherwise returns
   the new plan; observation (daemon status, audit, grants, telemetry). `Instance::client` lends the
   whole typed client for the rest (the merge verbs of §4.16, the file verbs).
@@ -6870,7 +6893,8 @@ command and every host start, mount and grant through one implementation.
 > and (piece 2) the anchor and daemon roles moved from the CLI (`role`), served by a host's own
 > executable through `role::main`, with `Instance::start`, `StartSpec::anchor_command`,
 > `Instance::wait_for` and `Anchor::stop`; and (A-287, g266) a landing plan's per-path entries,
-> paged, `Instance::landing_entries(&plan)`. The CLI's `anchor`, `daemon`, `mount`, `unmount`,
+> paged, `Instance::landing_entries(&plan)`; and (piece 3) `mount::available` and
+> `mount::unmount_lazy`. The CLI's `anchor`, `daemon`, `mount`, `unmount`,
 > `export`, `grant`, `enroll`, `revoke`, `run` and `recover` call it. Proven by use over an
 > in-process daemon (`crates/api/tests/api.rs`) and by a test binary that is itself the host
 > (`crates/api/tests/start.rs`, no libtest harness: its `main` serves the roles). Owed, in order:
@@ -20690,6 +20714,13 @@ Applied in the same change to:
   Ada's grant decision of the same day (A-285: a grant's proof is a signature by a key only the human holds, with a
   prompt on the anchor's terminal where none is registered) makes that wrong: a host process holding the issuer secret
   could grant without the person. So the starter is handed nothing, and the grant call takes the person's proof.
+- **Piece 3, the same day** (kiln's asks, g263): `mount::available() -> Result<MountKind, MountFault>`, the machine's
+  mount mechanism with no daemon (macOS: `mount(2)`, always; the BSDs: `mount_nfs` on the `PATH`; Linux:
+  `fusermount3` on the `PATH` and a `/dev/fuse` the user may read and write; Windows: WinFsp's library loads), each
+  missing piece refused by its own reason, the macOS mount's own check now the same function; and
+  `mount::unmount_lazy(path)`, `fusermount3 -u -z` on Linux, refused `Unsupported` elsewhere. Applied to
+  `crates/api/src/mount.rs` (with pure `fuse_available`/`nfs_available` tested on every host), `lib.rs`
+  (`MountKind`), `docs/library.md`, §4.12's text and status, GAPS.
 - **Owed, in order.** (1) An async form over a host's reactor (R6). (2) A seam trait with a simulator and a
   conformance suite, for hosts whose rules ask for one (Hex's §9, kiln's `kiln-seams`). A landing plan's per-path
   entries, paged, were built by A-287 the same day (`Instance::landing_entries`).
@@ -20805,6 +20836,43 @@ judged by `fails_the_suite`), `crates/server/tests/virtiofs.rs` (the guest's env
   unsupported), so a local clone copies there while NTFS links, and a git repository's symbolic-link probe needs
   WinFsp reparse points, which the drive does not serve yet. A Linux FUSE leg outside a container (the native Linux
   lane reaches the daemon through the NFS adapter). The runs over each mount are the supervisor's (CLAUDE.md §8).
+
+### A-279 — A full control channel tells the senders waiting for its room (2026-11-17, built for goal g239, a kept forward re-sent once the channel has room)
+
+Applied in the same change to:
+- §4.3: the status of 2026-11-17 (the room wake).
+- `crates/rt/src/room.rs` (new): `ShardSet`, the protocol and its three loom models. `crates/rt/src/registry.rs`:
+  each entry's `room_wanted` and `room_given`; `give_room`; `note_exited` tells every asker.
+  `crates/rt/src/shard.rs`: `want_room`; `drain_control` wakes the tasks a tell names and, after a drain that took a
+  message, fences and tells; the counters `room_waits` and `room_wakes`. `crates/rt/src/futures.rs`: `want_room`.
+  The tests: `crates/rt/tests/room.rs` and `room_gone.rs`.
+- `crates/server/src/daemon.rs` (`serve_loop`) and `crates/server/src/verbs.rs` (`ask_room_for_kept_forwards`,
+  `refuse_unsent_forward`): the timed idle while a forward is kept is gone. `Daemon::flood_control_channel_counting`
+  and `crates/server/tests/forward_retry.rs`.
+- GAPS: the load test's "A kept forward waited for another request". The bug record:
+  `docs/bugs/2026-11-17-a-kept-forward-polled-for-room-and-its-test-timed-the-owners-queue.md`.
+- **What was there.** A shard's control channel is bounded at its admission limit, and a spawn it refuses is kept by
+  its sender (§4.3: "backpressure, never a drop"). No message, flag or kick told the sender when the channel had room
+  again. The serve loop, while it kept a forward, idled at most one idle window and then tried again (2026-11-07), so
+  it armed a timer every window and the forward reached its owner up to a window after the room. The window is the
+  shard's measured wake × 100 and has no cap of its own.
+- **The rule.** A sender refused `ControlFull` may ask the target to tell it when the channel has room. It marks its
+  shard in the target's set, fences `SeqCst`, and tries once more, and it waits only if that try is refused too. The
+  target, after every drain that took a message, fences `SeqCst` and tells each shard its set names. A tell marks the
+  target in the asker's set, fences `SeqCst`, and publishes the asker's control flag, so a parked asker is kicked as a
+  message would kick it. That fence answers the one a drain makes after re-arming its flag with a plain store, which
+  ends a publication's release sequence; a message needs none, since the channel claims its slot with a `SeqCst`
+  operation. An exiting target tells every asker, and an ask after its exit is refused `ShardGone`. The serve loop asks before it idles with a
+  forward kept and then idles with no timer. Asks and the tasks they woke are counted per shard.
+- **Why.** Goal g239: the supervisor's runs of main failed `forward_retry.rs` 8 of 30 at load ~35, named a lost wake.
+  The test's timeline on this Mac (30 runs beside 36 spinners) found the resend within 21 ms of the room in every run;
+  the answer waited for the owner's drain of the 41,125 tasks the test had queued ahead of the forward, which took up
+  to 4.33 s. So the test now owes the answer within the liveness budget of the owner's last progress through that
+  queue. The exact wake was the 2026-11-07 record's owed sibling. With it, nothing but the owner's word moves a kept
+  forward while its shard idles, which the test now proves, and the timer a window is gone.
+- **Cost.** The sender pays only on a refusal: a map insert on its own shard, two read-modify-writes and a fence. The
+  target pays one `SeqCst` fence and one load for each drain that took a message, nothing when none came, and a fence
+  for each tell.
 
 ### A-293 — The Linux lane runs the workload roster over the daemon's own FUSE mount (accepted 2026-11-17, Ada's goal of 2026-11-18: git, Mercurial and Subversion on every route, Linux FUSE among them)
 Applied in the same change to: Part 6's "Real workloads" status, GAPS, `docs/wip/conformance.md` (§4's Linux row),

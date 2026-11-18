@@ -54,7 +54,7 @@ pub use error::{Error, IssuerFault, MountFault, PathFault, StartFault};
 pub use grant::{GrantAuthority, GrantClaim, GrantProof};
 pub use instance::{Approved, Instance, LandingPlan, LandingRequest, Planned};
 pub use issuer::{GRANT_TERM_NS, Issuer};
-pub use mount::{MountOptions, Mounted};
+pub use mount::{MountKind, MountOptions, Mounted};
 pub use start::{Anchor, StartSpec, Started};
 
 /// The crate's version: the workspace's one hand-edited version (§4.12 "One version"), which a host reports beside its
