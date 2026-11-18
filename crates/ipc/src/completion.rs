@@ -65,7 +65,10 @@
 //! names a stamp slot in it (1 or 2), and the async arm has a value of its own
 //! ([`crate::region::PARKED_ASYNC`]). A bridge woken while the flag reads a synchronous park
 //! ([`crate::park::parks_synchronously`]) wakes once more, and the only waiter left is the parked
-//! call. The Linux bridge waits on the eventfd, not the futex word, so it takes no such wake.
+//! call. On Linux a synchronous call that waits on its daemon's departure parks on a descriptor (A-456): the eventfd
+//! when no bridge runs, and the bridge's pipe while one does, since the bridge is then the eventfd's only reader and
+//! writes its pipe after every read. So the Linux bridge takes no wake from a parked call either; the call gives the
+//! pipe's level back when it has read it ([`crate::endpoint::ClientEnd::wait_while_daemon_lives`]).
 
 // The wake-word/Event bridges (macOS, Windows) park on the region and stop on a channel; the Linux bridge stops
 // through a pipe and waits on the eventfd, so it needs neither.
@@ -363,6 +366,13 @@ impl CompletionBridge {
   /// Node stream.
   pub fn completion_fd(&self) -> RawFd {
     self.read.as_raw_fd()
+  }
+
+  /// The pipe's read end, borrowed for a synchronous park's own wait (A-456): while the bridge runs it is the eventfd's
+  /// only reader and writes this pipe after every read, so a park that waits here meets every nudge, where one that
+  /// waited on the eventfd beside the bridge could find its nudge already read.
+  pub(crate) fn level(&self) -> std::os::fd::BorrowedFd<'_> {
+    std::os::fd::AsFd::as_fd(&self.read)
   }
 
   /// A dup of the read end the caller owns and closes (Node's `net.Socket` adopts and closes the fd it
