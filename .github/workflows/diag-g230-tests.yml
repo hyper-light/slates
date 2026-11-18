@@ -1,0 +1,32 @@
+# DIAG (not for main): g230's focused fleet tests on Linux x86_64 -- the two takeover tests held to the design's rule,
+# on the test-fix branch merged with main.
+name: diag-g230-tests
+on:
+  push:
+    branches: ['diag-g230-tests-*']
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  focused:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the fleet test binary
+        run: cargo test --locked -p slates-server --test fleet --no-run
+      - name: The focused tests
+        env:
+          G230_TESTS: a_successor_restarted_warm_takes_a_write_to_the_volume_it_took_over a_successors_own_copy_keeps_its_raised_fence_across_its_warm_restart a_holders_return_is_walked_in_turns_and_it_takes_every_log
+        run: |
+          set -u
+          for t in ${G230_TESTS}; do
+            for n in 1 2; do
+              timeout 900 cargo test --locked -p slates-server --test fleet -- --exact "$t" --nocapture > "out-$t-$n.log" 2>&1; code=$?
+              echo "== $t run $n exit $code"
+              grep -E "^(reached walk|restarted round|a write after the successor)|panicked at|test result" -A 1 "out-$t-$n.log" | cut -c1-300
+            done
+          done
