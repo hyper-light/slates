@@ -1319,6 +1319,193 @@ impl HostPromise {
   }
 }
 
+/// A successor's question for a ledger's positions (A-364; §4.8 "For each ledger position, ... phase one consults an
+/// authorized quorum of distinct holders and adopts the highest accepted proposal consistent with the committed prefix"):
+/// the takeover round of `departed` (its `epoch` and `generation`) asks a holder of `object`, a green's merge-record log,
+/// for every position it accepted in `from..to`. The holder promises the object at `epoch` first, as a page promises
+/// what it lists ([`HostPrepare`]). Phase one's pages report each object's highest record alone, which a successor whose
+/// own records end two or more positions below the adopted one cannot rebuild a chain from (GAP-A9-7's record half).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LedgerPrepare {
+  /// The retired host whose objects are taken over.
+  pub departed: HostId,
+  /// The successor asking.
+  pub owner: HostId,
+  /// The round's epoch: the ballot the holder promises.
+  pub epoch: HostEpoch,
+  /// The configuration generation the round runs under; a holder on another refuses.
+  pub generation: u64,
+  /// The ledger asked about.
+  pub object: ObjectId,
+  /// The first position asked.
+  pub from: u64,
+  /// The position past the last asked.
+  pub to: u64,
+}
+
+/// Format: a [`LedgerPrepare`]'s bytes: departed, owner, epoch, generation (u64 LE each), the object, then the range's
+/// ends (u64 LE each).
+pub const LEDGER_PREPARE_BYTES: usize = 6 * size_of::<u64>() + OBJECT_BYTES;
+
+impl LedgerPrepare {
+  /// The canonical bytes, [`LEDGER_PREPARE_BYTES`] of them.
+  pub fn encode(&self) -> Vec<u8> {
+    let mut out = Vec::with_capacity(LEDGER_PREPARE_BYTES);
+    out.extend_from_slice(&self.departed.0.to_le_bytes());
+    out.extend_from_slice(&self.owner.0.to_le_bytes());
+    out.extend_from_slice(&self.epoch.0.to_le_bytes());
+    out.extend_from_slice(&self.generation.to_le_bytes());
+    out.extend_from_slice(&self.object.0);
+    out.extend_from_slice(&self.from.to_le_bytes());
+    out.extend_from_slice(&self.to.to_le_bytes());
+    out
+  }
+
+  /// Reconstructs a question from its bytes, or [`RegisterError::MalformedRecord`] for anything short or long (a message
+  /// that crossed the network: hostile input).
+  pub fn decode(bytes: &[u8]) -> Result<LedgerPrepare, RegisterError> {
+    let mut reader = WireReader::new(bytes);
+    let prepare = LedgerPrepare {
+      departed: HostId(reader.word()?),
+      owner: HostId(reader.word()?),
+      epoch: HostEpoch(reader.word()?),
+      generation: reader.word()?,
+      object: reader.object()?,
+      from: reader.word()?,
+      to: reader.word()?,
+    };
+    reader.finish()?;
+    Ok(prepare)
+  }
+}
+
+/// A holder's answer to a [`LedgerPrepare`] (A-364): every position of the ledger it accepted in the asked range,
+/// ascending, each under the epoch it was accepted at, its fence raised to the round's epoch before the answer was
+/// formed; where the answer stopped when the range did not fit one frame (`next`, the next position to ask); or the
+/// fence above the epoch that kept it from promising (`fenced`, with no positions). A position it holds nothing at, in
+/// the part of the range it answered for, it promised to hold nothing at, as a page's empty listing does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LedgerPromise {
+  /// The answering holder.
+  pub holder: HostId,
+  /// The retired host (echoes the question).
+  pub departed: HostId,
+  /// The epoch promised (echoes the question).
+  pub epoch: HostEpoch,
+  /// The generation the holder answered under (echoes the question).
+  pub generation: u64,
+  /// The ledger (echoes the question).
+  pub object: ObjectId,
+  /// The positions it accepted in the range it answered for, ascending.
+  pub positions: Vec<Accepted>,
+  /// The next position to ask when this answer covers the range only up to it.
+  pub next: Option<u64>,
+  /// The holder's fence above the epoch, when it could not promise; its positions are then empty.
+  pub fenced: Option<HostEpoch>,
+}
+
+/// Format: the widest [`LedgerPromise`] header: holder, departed, epoch, generation (u64 LE each), the object, the next
+/// position's and the fence's presence bytes and values (u64 LE each), and the position count (u32 LE). A holder pages
+/// against it, so an answer with either field absent stays within its frame too.
+pub const LEDGER_PROMISE_HEADER_BYTES: usize =
+  4 * size_of::<u64>() + OBJECT_BYTES + 2 * (1 + size_of::<u64>()) + size_of::<u32>();
+
+/// Format: one [`LedgerPromise`] position's fixed bytes: its sequence and epoch (u64 LE each) and its value's length
+/// (u32 LE).
+pub const LEDGER_POSITION_BYTES: usize = 2 * size_of::<u64>() + size_of::<u32>();
+
+impl LedgerPromise {
+  /// Whether this answers `prepare`: the same retired host, epoch, generation and ledger, so an answer to another
+  /// question cannot be counted for this one.
+  pub fn binds(&self, prepare: &LedgerPrepare) -> bool {
+    self.departed == prepare.departed
+      && self.epoch == prepare.epoch
+      && self.generation == prepare.generation
+      && self.object == prepare.object
+  }
+
+  /// The bytes one position holding `accepted` adds to an answer, which a holder counts against its frame.
+  pub fn position_bytes(accepted: &Accepted) -> usize {
+    LEDGER_POSITION_BYTES.saturating_add(accepted.value.len())
+  }
+
+  /// The canonical bytes: the header words, the object, the next position's and the fence's optional fields, the
+  /// position count, then each position (sequence, epoch, value length, value).
+  pub fn encode(&self) -> Vec<u8> {
+    let mut out = Vec::with_capacity(LEDGER_PROMISE_HEADER_BYTES);
+    out.extend_from_slice(&self.holder.0.to_le_bytes());
+    out.extend_from_slice(&self.departed.0.to_le_bytes());
+    out.extend_from_slice(&self.epoch.0.to_le_bytes());
+    out.extend_from_slice(&self.generation.to_le_bytes());
+    out.extend_from_slice(&self.object.0);
+    put_optional_word(&mut out, self.next);
+    put_optional_word(&mut out, self.fenced.map(|fence| fence.0));
+    let count = u32::try_from(self.positions.len()).unwrap_or(u32::MAX);
+    out.extend_from_slice(&count.to_le_bytes());
+    for accepted in &self.positions {
+      out.extend_from_slice(&accepted.sequence.to_le_bytes());
+      out.extend_from_slice(&accepted.epoch.0.to_le_bytes());
+      let value_len = u32::try_from(accepted.value.len()).unwrap_or(u32::MAX);
+      out.extend_from_slice(&value_len.to_le_bytes());
+      out.extend_from_slice(&accepted.value);
+    }
+    out
+  }
+
+  /// Reconstructs an answer from its bytes, checking every length against what remains before reading or allocating:
+  /// a count beyond what the bytes could hold, a value length past the end, an unknown presence byte or trailing bytes
+  /// are [`RegisterError::MalformedRecord`], never a panic or an over-read.
+  pub fn decode(bytes: &[u8]) -> Result<LedgerPromise, RegisterError> {
+    let mut reader = WireReader::new(bytes);
+    let holder = HostId(reader.word()?);
+    let departed = HostId(reader.word()?);
+    let epoch = HostEpoch(reader.word()?);
+    let generation = reader.word()?;
+    let object = reader.object()?;
+    let next = reader.optional_word()?;
+    let fenced = reader.optional_word()?.map(HostEpoch);
+    let count = usize::try_from(reader.half()?).map_err(|_| RegisterError::MalformedRecord)?;
+    if count > reader.remaining() / LEDGER_POSITION_BYTES {
+      return Err(RegisterError::MalformedRecord);
+    }
+    let mut positions = Vec::with_capacity(count);
+    for _ in 0..count {
+      let sequence = reader.word()?;
+      let position_epoch = HostEpoch(reader.word()?);
+      let value_len =
+        usize::try_from(reader.half()?).map_err(|_| RegisterError::MalformedRecord)?;
+      let value = reader.take(value_len)?.to_vec();
+      positions.push(Accepted {
+        sequence,
+        epoch: position_epoch,
+        value,
+      });
+    }
+    reader.finish()?;
+    Ok(LedgerPromise {
+      holder,
+      departed,
+      epoch,
+      generation,
+      object,
+      positions,
+      next,
+      fenced,
+    })
+  }
+}
+
+/// Appends an optional word: a presence byte, then the word (u64 LE) when present.
+fn put_optional_word(out: &mut Vec<u8>, word: Option<u64>) {
+  match word {
+    None => out.push(FIELD_ABSENT),
+    Some(word) => {
+      out.push(FIELD_PRESENT);
+      out.extend_from_slice(&word.to_le_bytes());
+    }
+  }
+}
+
 /// Appends an optional object: a presence byte, then the object when present.
 fn put_optional_object(out: &mut Vec<u8>, object: Option<ObjectId>) {
   match object {
@@ -1406,6 +1593,15 @@ impl<'a> WireReader<'a> {
         .try_into()
         .map_err(|_| RegisterError::MalformedRecord)?,
     ))
+  }
+
+  /// An optional word: a presence byte, then the word when present; any other presence byte is malformed.
+  fn optional_word(&mut self) -> Result<Option<u64>, RegisterError> {
+    match self.byte()? {
+      FIELD_ABSENT => Ok(None),
+      FIELD_PRESENT => Ok(Some(self.word()?)),
+      _ => Err(RegisterError::MalformedRecord),
+    }
   }
 
   /// The next optional object: a presence byte, then the object when present.
@@ -1812,6 +2008,24 @@ impl Acceptor {
       .accepted
       .get(&(object, sequence))
       .map(|(_, value)| value.as_slice())
+  }
+
+  /// Every position of `object` this acceptor accepted in `from..to`, ascending, each with the epoch it was accepted
+  /// under: a ledger's answer to a successor's question for the positions it lacks (A-364, [`LedgerPrepare`]).
+  /// [`Acceptor::positions`] walks every position of every object.
+  pub fn positions_between(&self, object: ObjectId, from: u64, to: u64) -> Vec<Accepted> {
+    if from >= to {
+      return Vec::new();
+    }
+    self
+      .accepted
+      .range((object, from)..(object, to))
+      .map(|(&(_, sequence), (epoch, value))| Accepted {
+        sequence,
+        epoch: *epoch,
+        value: value.clone(),
+      })
+      .collect()
   }
 
   /// Every accepted value of `object`, in sequence order (a ledger's whole history).
@@ -6025,6 +6239,184 @@ mod tests {
         if departed == owner && survivors.contains(&successor)),
       "{resolved:?}"
     );
+  }
+
+  /// A sample question for a ledger's positions (A-364).
+  fn sample_ledger_prepare() -> LedgerPrepare {
+    LedgerPrepare {
+      departed: HostId(1),
+      owner: HostId(3),
+      epoch: HostEpoch(4),
+      generation: 9,
+      object: ObjectId::new(HostId(1), 3),
+      from: 3,
+      to: 5,
+    }
+  }
+
+  /// A sample answer to it: two positions, the next position to ask, no fence.
+  fn sample_ledger_promise() -> LedgerPromise {
+    LedgerPromise {
+      holder: HostId(2),
+      departed: HostId(1),
+      epoch: HostEpoch(4),
+      generation: 9,
+      object: ObjectId::new(HostId(1), 3),
+      positions: vec![
+        Accepted {
+          sequence: 3,
+          epoch: HostEpoch(2),
+          value: b"version three".to_vec(),
+        },
+        Accepted {
+          sequence: 4,
+          epoch: HostEpoch(2),
+          value: Vec::new(),
+        },
+      ],
+      next: Some(5),
+      fenced: None,
+    }
+  }
+
+  /// A-364 (§4.8 "For each ledger position"): a ledger question and its answer round-trip their wire forms, with and
+  /// without their optional fields; an answer binds only the question it echoes, its ledger included; and the paging
+  /// arithmetic counts exactly what the encoding writes. Do: encode and decode each form; bind against changed
+  /// questions. Expect equal round trips, the binds as stated, and the sizes the constants give.
+  #[test]
+  fn a_ledger_question_and_its_answer_round_trip_and_bind() {
+    let question = sample_ledger_prepare();
+    assert_eq!(
+      LedgerPrepare::decode(&question.encode()),
+      Ok(question.clone())
+    );
+    assert_eq!(question.encode().len(), LEDGER_PREPARE_BYTES);
+    let answer = sample_ledger_promise();
+    assert_eq!(LedgerPromise::decode(&answer.encode()), Ok(answer.clone()));
+    let fenced = LedgerPromise {
+      positions: Vec::new(),
+      next: None,
+      fenced: Some(HostEpoch(6)),
+      ..answer.clone()
+    };
+    assert_eq!(LedgerPromise::decode(&fenced.encode()), Ok(fenced));
+    assert!(answer.binds(&question));
+    for other in [
+      LedgerPrepare {
+        epoch: HostEpoch(5),
+        ..question.clone()
+      },
+      LedgerPrepare {
+        object: ObjectId::new(HostId(1), 4),
+        ..question.clone()
+      },
+      LedgerPrepare {
+        generation: 10,
+        ..question.clone()
+      },
+    ] {
+      assert!(!answer.binds(&other), "{other:?}");
+    }
+    // The widest header: both optional fields present.
+    let widest = LedgerPromise {
+      fenced: Some(HostEpoch(6)),
+      ..answer.clone()
+    };
+    assert_eq!(
+      widest.encode().len(),
+      LEDGER_PROMISE_HEADER_BYTES
+        + widest
+          .positions
+          .iter()
+          .map(LedgerPromise::position_bytes)
+          .sum::<usize>(),
+      "the paging arithmetic counts exactly what the widest encoding writes"
+    );
+  }
+
+  /// Hostile input (A-364): a ledger question or answer cut short at any length, carrying a trailing byte, an unknown
+  /// presence byte, or a position count beyond what its bytes could hold decodes to a typed refusal, never a panic or an
+  /// over-read.
+  #[test]
+  fn a_hostile_ledger_question_or_answer_is_refused() {
+    let question = sample_ledger_prepare().encode();
+    let answer = sample_ledger_promise().encode();
+    for cut in 0..question.len() {
+      assert_eq!(
+        LedgerPrepare::decode(&question[..cut]),
+        Err(RegisterError::MalformedRecord)
+      );
+    }
+    for cut in 0..answer.len() {
+      assert_eq!(
+        LedgerPromise::decode(&answer[..cut]),
+        Err(RegisterError::MalformedRecord)
+      );
+    }
+    for bytes in [&question, &answer] {
+      let mut trailing = bytes.clone();
+      trailing.push(0);
+      assert!(
+        LedgerPrepare::decode(&trailing).is_err() && LedgerPromise::decode(&trailing).is_err(),
+        "a stray byte"
+      );
+    }
+    // The next position's presence byte sits after the header words and the object.
+    let next_at = 4 * size_of::<u64>() + OBJECT_BYTES;
+    let mut flag = answer.clone();
+    flag[next_at] = 2;
+    assert_eq!(
+      LedgerPromise::decode(&flag),
+      Err(RegisterError::MalformedRecord)
+    );
+    // The position count follows both optional words (present next, absent fence).
+    let count_at = next_at + 1 + size_of::<u64>() + 1;
+    let mut lying = answer.clone();
+    lying[count_at..count_at + size_of::<u32>()].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert_eq!(
+      LedgerPromise::decode(&lying),
+      Err(RegisterError::MalformedRecord)
+    );
+  }
+
+  /// A-364: an acceptor's answer for a ledger's positions is every position it accepted in the range, ascending, each
+  /// under the epoch it was accepted at, and none outside it or of another object. Do: accept positions 0 to 4 of a
+  /// ledger (position 3 again under a later epoch) and one of another object; read 1..4 and an empty range. Expect
+  /// positions 1, 2 and 3 (3 under the later epoch), and nothing for the empty range.
+  #[test]
+  fn an_acceptor_reports_a_ledgers_positions_in_a_range() {
+    let owner = HostId(1);
+    let ledger = ObjectId::new(owner, 3);
+    let other = ObjectId::new(owner, 4);
+    let mut acceptor = Acceptor::new(
+      HostId(2),
+      Authority {
+        generation: 1,
+        owner,
+      },
+    );
+    let record = |object: ObjectId, sequence: u64, epoch: u64| Record {
+      owner,
+      object,
+      sequence,
+      epoch: HostEpoch(epoch),
+      generation: 1,
+      value: vec![u8::try_from(sequence).unwrap(); 2],
+    };
+    for sequence in 0..5 {
+      acceptor.accept(&record(ledger, sequence, 1)).unwrap();
+    }
+    acceptor.accept(&record(ledger, 3, 2)).unwrap();
+    acceptor.accept(&record(other, 2, 2)).unwrap();
+    let read = acceptor.positions_between(ledger, 1, 4);
+    assert_eq!(
+      read
+        .iter()
+        .map(|accepted| (accepted.sequence, accepted.epoch.0))
+        .collect::<Vec<_>>(),
+      vec![(1, 1), (2, 1), (3, 2)]
+    );
+    assert!(acceptor.positions_between(ledger, 4, 4).is_empty());
   }
 
   /// A sample answer to a takeover page: two objects' records, a next page and a fence above the epoch.

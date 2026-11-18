@@ -1746,6 +1746,14 @@ async fn serve_peer_records(
             crate::takeover::serve_host_prepare(s, local, peer_host, &request)
           })
           .unwrap_or_default(),
+          crate::takeover::TAKEOVER_LEDGER_STREAM => state::with_state(|s| {
+            let peer_host = s
+              .learned_members
+              .get(&peer_anchor)
+              .map_or(seed, |learned| learned.host);
+            crate::takeover::serve_ledger_prepare(s, local, peer_host, &request)
+          })
+          .unwrap_or_default(),
           // A moved volume's new owner asks its cohort by name (A-291).
           crate::moves::MOVE_STREAM => state::with_state(|s| {
             let peer_host = s
@@ -4649,16 +4657,21 @@ async fn adopt_and_serve(
   crate::moves::drive_adoptions(origin, local, budget, in_flight).await;
   in_flight.extend(crate::mirror::drive_promotion(local, budget).await);
   crate::mirror::adopt_assigned(local, budget, in_flight).await;
-  materialize_adopted_objects(origin, local, budget).await;
+  materialize_adopted_objects(origin, local, budget, in_flight).await;
 }
 
 /// One period's materialization of everything this node took over: the plain volumes whose heads it
 /// adopted ([`materialize_pending`]), then the greens whose newest merge records it adopted
 /// ([`materialize_pending_greens`]).
-async fn materialize_adopted_objects(origin: u16, local: HostId, budget: CommitBudget) {
+async fn materialize_adopted_objects(
+  origin: u16,
+  local: HostId,
+  budget: CommitBudget,
+  in_flight: &mut Vec<Dispatch>,
+) {
   adopt_pending_tombstones(origin).await;
   materialize_pending(origin, local, budget).await;
-  materialize_pending_greens(origin, local, budget).await;
+  materialize_pending_greens(origin, local, budget, in_flight).await;
 }
 
 /// Records each adopted tombstone (AUD-29-43) on the shard the destroyed volume's id routes to, with the
@@ -4802,7 +4815,12 @@ const TOMBSTONE_ADOPT_GIVEN_UP: &str = "fleet.tombstone.given_up";
 /// gathering still running is not counted: each is a finite task of this shard, which the attempt that started it was
 /// counted for. Before, every branch retried each period without end: the green-share takeover test once waited out its
 /// 4,000-period budget so (GAPS 2026-11-09).
-async fn materialize_pending_greens(origin: u16, local: HostId, budget: CommitBudget) {
+async fn materialize_pending_greens(
+  origin: u16,
+  local: HostId,
+  budget: CommitBudget,
+  in_flight: &mut Vec<Dispatch>,
+) {
   let pending: Vec<(ObjectId, crate::state::PendingGreen)> = state::with_state(|s| {
     s.pending_green_materializations
       .iter()
@@ -4812,7 +4830,8 @@ async fn materialize_pending_greens(origin: u16, local: HostId, budget: CommitBu
   .unwrap_or_default();
   let paging = state::with_state(|s| crate::takeover::rounds_still_paging(s)).unwrap_or_default();
   for (object, pending) in pending {
-    let Err(waited) = materialize_green(origin, object, &pending, budget).await else {
+    let Err(waited) = materialize_green(origin, (object, local), &pending, budget, in_flight).await
+    else {
       continue;
     };
     count_refusal(waited.counter());
@@ -4941,9 +4960,10 @@ fn paging_round(
 /// owner shard (and is no longer pending), else what it waited on.
 async fn materialize_green(
   origin: u16,
-  object: ObjectId,
+  (object, local): (ObjectId, HostId),
   pending: &crate::state::PendingGreen,
   budget: CommitBudget,
+  in_flight: &mut Vec<Dispatch>,
 ) -> Result<(), GreenWait> {
   // The green's catalog register, adopted in the same round as its merge record (the owner ships no merge
   // record before its current catalog is committed): the green's access list. Until it and its
@@ -4967,7 +4987,7 @@ async fn materialize_green(
   }
   // This node's replica at the adopted version (A-333), or what it waits on: its chain and inputs, judged before the
   // adopted record's placement, as the chain was gathered before it.
-  ready_engine(object, pending, budget).await?;
+  ready_engine(object, pending, budget, (local, in_flight)).await?;
   // The takeover's placement of the adopted record (its promotion epoch and acknowledging holders),
   // recorded where the promotion ran; it moves to the owner shard with the green, as a head's does,
   // so the successor's record plane writes the green's next versions at the promotion epoch.
@@ -5046,18 +5066,35 @@ fn finish_green(object: ObjectId) {
 }
 
 /// Brings this node's replica of `object` to the version its takeover adopted (A-333), or says what it waits on: `Ok`
-/// once it is there with the adopted identity. Inputs of the versions the replica lacks that this node does not hold are
-/// fetched first ([`fetch_green_inputs`]).
+/// once it is there with the adopted identity. The records of versions below the adopted one this node does not know
+/// are adopted first, position by position ([`adopt_missing_records`], A-364), and the inputs of the versions the
+/// replica lacks that this node does not hold are fetched ([`fetch_green_inputs`]).
 async fn ready_engine(
   object: ObjectId,
   pending: &crate::state::PendingGreen,
   budget: CommitBudget,
+  (local, in_flight): (HostId, &mut Vec<Dispatch>),
 ) -> Result<(), GreenWait> {
   use crate::green_adopt::Engine;
   let adopted = &pending.merge;
   let at = (adopted.version, adopted.identity);
   let mut engine = state::with_state(|s| crate::green_adopt::engine_for_adoption(s, object, at))
     .ok_or(GreenWait::Building)?;
+  if let Engine::RecordsShort(first) = engine {
+    // A successor two or more versions behind the quorum lacks the records between its own and the adopted one, which
+    // phase one's pages never report (each holder's highest record alone): adopted position by position (A-364).
+    adopt_missing_records(
+      object,
+      pending,
+      (first, adopted.version),
+      local,
+      budget,
+      in_flight,
+    )
+    .await?;
+    engine = state::with_state(|s| crate::green_adopt::engine_for_adoption(s, object, at))
+      .ok_or(GreenWait::Building)?;
+  }
   if let Engine::Unheld(unheld) = engine {
     // A successor one or more versions behind the quorum holds the adopted record (its adoption committed it here) but
     // not those versions' inputs, which the survivors that reported the adopted version hold (GAPS 2026-11-09).
@@ -5073,6 +5110,30 @@ async fn ready_engine(
     Engine::RecordsShort(_) => Err(GreenWait::Chain),
     Engine::Refused => Err(GreenWait::Refused),
   }
+}
+
+/// Adopts the records of a taken-over green's versions `from..to` this node (`local`) does not know (A-364, GAP-A9-7's
+/// record half): `from` the first version whose record its ledger lacks (`green_adopt::Engine::RecordsShort`), `to` the
+/// version the takeover round of `pending.departed` adopted, position by position (`takeover::adopt_ledger_positions`),
+/// each committed again under this node. `Err(GreenWait::Chain)` while the range is not adopted whole (the attempt
+/// waits, toward its bound), and for a green no round adopted (a mirror's promotion, with no round to ask under). The
+/// dispatches go to the coordinator (`in_flight`) to recover their stragglers.
+async fn adopt_missing_records(
+  object: ObjectId,
+  pending: &crate::state::PendingGreen,
+  (from, to): (u64, u64),
+  local: HostId,
+  budget: CommitBudget,
+  in_flight: &mut Vec<Dispatch>,
+) -> Result<(), GreenWait> {
+  if from >= to {
+    return Err(GreenWait::Chain);
+  }
+  let departed = pending.departed.ok_or(GreenWait::Chain)?;
+  let (adopted, dispatches) =
+    crate::takeover::adopt_ledger_positions(departed, object, (from, to), local, budget).await;
+  in_flight.extend(dispatches);
+  adopted.map(|_| ()).map_err(|_| GreenWait::Chain)
 }
 
 /// The adoption of `object` this attempt hands its owner shard (A-333), once its replica is at the adopted version
@@ -10372,7 +10433,7 @@ mod request_kind_tests {
   /// took none of it (2026-11-17, g230).
   #[test]
   fn every_request_kind_the_record_session_dispatches_is_its_own() {
-    let kinds: [(&str, u64); 27] = [
+    let kinds: [(&str, u64); 28] = [
       ("record", slates_cluster::RECORD_STREAM),
       (
         "content offer",
@@ -10408,6 +10469,7 @@ mod request_kind_tests {
       ("live entries", slates_cluster::live::LIVE_ENTRIES_STREAM),
       ("lineage", super::LINEAGE_STREAM),
       ("ledger promote", slates_cluster::LEDGER_PROMOTE_STREAM),
+      ("takeover ledger", crate::takeover::TAKEOVER_LEDGER_STREAM),
       ("move", crate::moves::MOVE_STREAM),
     ];
     let mut shared = Vec::new();

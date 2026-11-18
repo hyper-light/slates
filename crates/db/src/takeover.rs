@@ -21,8 +21,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::register::{
-  Accepted, Acceptor, Authority, HostEpoch, HostId, HostPrepare, HostPromise, Lineage,
-  OBJECT_BYTES, ObjectId, Prepare, Quorum, RegionalConfiguration, RegisterError,
+  Accepted, Acceptor, Authority, HostEpoch, HostId, HostPrepare, HostPromise,
+  LEDGER_PROMISE_HEADER_BYTES, LedgerPrepare, LedgerPromise, Lineage, OBJECT_BYTES, ObjectId,
+  Prepare, Quorum, RegionalConfiguration, RegisterError,
 };
 
 /// Which answers count as a member's promise of an object.
@@ -403,9 +404,170 @@ pub fn answer_move(
   answer
 }
 
+/// `holder`'s answer to the ledger question `prepare` (A-364), from `acceptors` (its own records), by the checks a by-name
+/// question runs ([`answer_by_name`]): the committed configuration names the asker the ledger's successor, and the
+/// copy's line falls to the asker in this round ([`copy_falls_to`]). A held copy is promised as a page promises it
+/// ([`promise_object`]: the asker's authority installed, the fence raised to the round's epoch), then every position it
+/// accepted in the range is listed, ascending, until `budget` bytes, at least one position listed; where it stopped is
+/// `next`. A holder with no acceptor for the ledger holds nothing of it and says so (no positions, the range covered).
+/// A fence above the epoch is reported, with no positions. `None`: refused (another successor or another round, or a
+/// promise refused for any other reason), which the asker counts as no answer.
+pub fn answer_ledger(
+  holder: HostId,
+  prepare: &LedgerPrepare,
+  regional: &RegionalConfiguration,
+  acceptors: &mut impl AcceptorStore,
+  budget: usize,
+) -> Option<LedgerPromise> {
+  if regional.successor(prepare.departed, prepare.object) != Some(prepare.owner) {
+    return None;
+  }
+  let mut promise = LedgerPromise {
+    holder,
+    departed: prepare.departed,
+    epoch: prepare.epoch,
+    generation: prepare.generation,
+    object: prepare.object,
+    positions: Vec::new(),
+    next: None,
+    fenced: None,
+  };
+  let Some(acceptor) = acceptors.acceptor_mut(&prepare.object) else {
+    return Some(promise);
+  };
+  if !copy_falls_to(
+    regional,
+    acceptor,
+    prepare.object,
+    prepare.departed,
+    prepare.owner,
+  ) {
+    return None;
+  }
+  let from_retired = regional.retired.contains_key(&acceptor.owner());
+  let page = HostPrepare {
+    departed: prepare.departed,
+    owner: prepare.owner,
+    epoch: prepare.epoch,
+    generation: prepare.generation,
+    after: None,
+    named: Vec::new(),
+  };
+  match promise_object(acceptor, prepare.object, &page, from_retired) {
+    Ok(_) => {}
+    Err(RegisterError::StaleEpoch { current }) => {
+      promise.fenced = Some(HostEpoch(current));
+      return Some(promise);
+    }
+    Err(_) => return None,
+  }
+  let mut used = LEDGER_PROMISE_HEADER_BYTES;
+  for accepted in acceptor.positions_between(prepare.object, prepare.from, prepare.to) {
+    let size = LedgerPromise::position_bytes(&accepted);
+    if !promise.positions.is_empty() && used.saturating_add(size) > budget {
+      promise.next = Some(accepted.sequence);
+      break;
+    }
+    used = used.saturating_add(size);
+    promise.positions.push(accepted);
+  }
+  Some(promise)
+}
+
 /// Whether `promise` has answered any object yet, so a budget never leaves a question with no answer at all.
 fn answered(promise: &HostPromise) -> bool {
   !promise.entries.is_empty() || !promise.nothing.is_empty()
+}
+
+/// What one member answered of a ledger's range (A-364, [`crate::register::LedgerPromise`]): the positions it accepted,
+/// by sequence, and the position its answer covers the range up to (the range's end, or where a paged answer stopped).
+/// Within `from..covered_to` a position it lists is its report, and one it does not list it promised to hold nothing at.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LedgerAnswered {
+  /// The positions it accepted, by sequence.
+  pub positions: BTreeMap<u64, Accepted>,
+  /// The position past the last its answer covers.
+  pub covered_to: u64,
+}
+
+/// What phase one adopts of a ledger's range, position by position (A-364; §4.8 "For each ledger position ... adopts the
+/// highest accepted proposal consistent with the committed prefix").
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LedgerAdoption {
+  /// The adopted positions, ascending from the range's start with no gap: at each, the value accepted under the highest
+  /// epoch among the members' reports.
+  pub adopted: Vec<Accepted>,
+  /// The first position not adopted, when the range was not adopted whole: its cohorts' promises are not all in, or no
+  /// member that promised it reported a value there (which a committed prefix never leaves).
+  pub stopped_at: Option<u64>,
+  /// Whether any adopted position was recovered past tolerance ([`Readiness::ReadyPastTolerance`]).
+  pub past_tolerance: bool,
+}
+
+/// The positions of a ledger's range `from..to` phase one adopts from `answers` (A-364), each member's answer counted per
+/// position as [`readiness`] counts a page's promise of an object under [`CountingRule::NamedAnswer`]: a member promised a
+/// position when it reported it, or when its answer covers it and lists nothing there. At each position, in order, once
+/// its cohorts (settled and current, members by `is_member`, under `quorum`) are ready, the value accepted under the
+/// highest epoch among the reports is adopted. The first position not ready, or ready with no report, ends the
+/// adoption: positions are adopted in order, since the merge plane ships a ledger's next position only once the last is
+/// placed, so a hole below a later position is never a committed prefix. Modelled by `docs/wip/models/FencedLedger.tla`
+/// (`PerPositionLog`), whose Continuity and AdoptedIsPrefix hold, and fail under the register's rule.
+pub fn ledger_positions(
+  (cohorts, current): (&[Vec<HostId>], &[Vec<HostId>]),
+  is_member: impl Fn(HostId) -> bool,
+  quorum: Quorum,
+  (from, to): (u64, u64),
+  answers: &BTreeMap<HostId, LedgerAnswered>,
+) -> LedgerAdoption {
+  let mut adoption = LedgerAdoption::default();
+  let no_complete = BTreeSet::new();
+  for position in from..to {
+    let reports: BTreeMap<HostId, Accepted> = answers
+      .iter()
+      .filter_map(|(host, answered)| {
+        answered
+          .positions
+          .get(&position)
+          .map(|accepted| (*host, accepted.clone()))
+      })
+      .collect();
+    let named_nothing: BTreeSet<HostId> = answers
+      .iter()
+      .filter(|(_, answered)| {
+        answered.covered_to > position && !answered.positions.contains_key(&position)
+      })
+      .map(|(host, _)| *host)
+      .collect();
+    let heard = Heard {
+      reports: &reports,
+      complete: &no_complete,
+      named_nothing: &named_nothing,
+      local: None,
+    };
+    let verdict = readiness(
+      cohorts,
+      current,
+      &is_member,
+      quorum,
+      &heard,
+      CountingRule::NamedAnswer,
+    );
+    let newest = reports
+      .into_values()
+      .reduce(|best, next| if next.epoch > best.epoch { next } else { best });
+    match (verdict, newest) {
+      (Readiness::Ready, Some(newest)) => adoption.adopted.push(newest),
+      (Readiness::ReadyPastTolerance { .. }, Some(newest)) => {
+        adoption.past_tolerance = true;
+        adoption.adopted.push(newest);
+      }
+      _ => {
+        adoption.stopped_at = Some(position);
+        return adoption;
+      }
+    }
+  }
+  adoption
 }
 
 #[cfg(test)]
@@ -419,6 +581,90 @@ mod tests {
       epoch: HostEpoch(1),
       value: vec![u8::try_from(sequence).unwrap_or(u8::MAX)],
     }
+  }
+
+  /// One member's answer of a ledger's range for [`ledger_positions`]: `positions` as `(sequence, epoch, value byte)`,
+  /// covering the range up to `covered_to`.
+  fn answered(positions: &[(u64, u64, u8)], covered_to: u64) -> LedgerAnswered {
+    LedgerAnswered {
+      positions: positions
+        .iter()
+        .map(|(sequence, epoch, byte)| {
+          (
+            *sequence,
+            Accepted {
+              sequence: *sequence,
+              epoch: HostEpoch(*epoch),
+              value: vec![*byte],
+            },
+          )
+        })
+        .collect(),
+      covered_to,
+    }
+  }
+
+  /// A-364 (§4.8 "For each ledger position"): a ledger's range is adopted position by position: at each, once a recovery
+  /// quorum of its cohort promised it, the value accepted under the highest epoch, in order, stopping at the first
+  /// position not ready, or ready with no report. Do: a cohort of the retired host and two members at `f = 1` (a quorum of
+  /// two); answers for positions 3 and 4 in four shapes: both members, one holding an older-epoch value at 3; one member
+  /// alone; a range both promised whose position 3 neither reports; one member's answer stopping at 4. Expect: 3 and 4
+  /// adopted, 3 under the higher epoch; nothing, stopped at 3; nothing, stopped at 3; 3 alone, stopped at 4.
+  #[test]
+  fn a_ledger_is_adopted_position_by_position_in_order() {
+    let (departed, a, b) = (HostId(9), HostId(1), HostId(2));
+    let cohorts = vec![vec![departed, a, b]];
+    let is_member = |host: HostId| host != departed;
+    let quorum = Quorum { f: 1 };
+    let adopt = |answers: BTreeMap<HostId, LedgerAnswered>| {
+      ledger_positions((&cohorts, &[]), is_member, quorum, (3, 5), &answers)
+    };
+    let both = adopt(BTreeMap::from([
+      (a, answered(&[(3, 2, 30), (4, 2, 40)], 5)),
+      (b, answered(&[(3, 1, 31)], 5)),
+    ]));
+    assert_eq!(
+      both
+        .adopted
+        .iter()
+        .map(|accepted| (accepted.sequence, accepted.epoch.0, accepted.value.clone()))
+        .collect::<Vec<_>>(),
+      vec![(3, 2, vec![30]), (4, 2, vec![40])],
+      "each position's value under the highest epoch"
+    );
+    assert_eq!((both.stopped_at, both.past_tolerance), (None, false));
+    let alone = adopt(BTreeMap::from([(
+      a,
+      answered(&[(3, 2, 30), (4, 2, 40)], 5),
+    )]));
+    assert!(
+      alone.adopted.is_empty() && alone.stopped_at == Some(3),
+      "{alone:?}"
+    );
+    let hole = adopt(BTreeMap::from([
+      (a, answered(&[(4, 2, 40)], 5)),
+      (b, answered(&[], 5)),
+    ]));
+    assert!(
+      hole.adopted.is_empty() && hole.stopped_at == Some(3),
+      "{hole:?}"
+    );
+    let paged = adopt(BTreeMap::from([
+      (a, answered(&[(3, 2, 30)], 4)),
+      (b, answered(&[(3, 2, 30), (4, 2, 40)], 5)),
+    ]));
+    assert_eq!(
+      (
+        paged
+          .adopted
+          .iter()
+          .map(|accepted| accepted.sequence)
+          .collect::<Vec<_>>(),
+        paged.stopped_at
+      ),
+      (vec![3], Some(4)),
+      "a position one member's answer did not reach waits for it"
+    );
   }
 
   /// The two rules differ only on a complete answer that did not list the object: today's counts it, A-251's needs it
