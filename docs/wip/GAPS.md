@@ -463,6 +463,13 @@
 >   writes (AC-8.16's other half); a move carrying snapshots other than the head; a multi-runner test with injected
 >   faults. The capture's own owed parts: admission reserving its cost ahead, a large file read across slices rather
 >   than whole in one, and the report of bytes read and retained and of the elapsed cost (§4.15's status).
+> - **Kiln's runners as members: the network each needs (written 2026-11-18, `docs/deploy.md` "What a node's firewall
+>   must let through").** Each runner's node takes inbound UDP at its manifest's base port (probes) and the next
+>   (records) from the other runners; TCP at the base port only for the network export, which kiln does not use (its
+>   agents mount their volumes on their own runner). As the supervisor reported on 2026-11-18, adacachy's `ufw` drops
+>   inbound UDP but kiln's own ports and adacachy2's passes LAN UDP 17202 and 17212 alone, so neither passes a slates
+>   block yet: each needs `ufw allow proto udp from <the LAN> to any port <base>:<base+1>` once, an operator's (root)
+>   step slates never takes (R10). The Macs' firewalls were not checked.
 > - **Fixed (2026-11-18): a move whose target dies at the switch is served by its successor.**
 >   `a_move_whose_target_dies_at_the_switch_is_served_by_its_successor` was red 3 of 3 on the Mac Studio after main
 >   ef7f0915a was merged, and again on a07bc2587 (the merge of main 3915879e3). Its log put the cause elsewhere than
