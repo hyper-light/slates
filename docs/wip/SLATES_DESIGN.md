@@ -22529,9 +22529,10 @@ Applied in the same change to:
 ### A-273 — A shard that holds a green's works keeps a replica of the green, fed the owner's accepted versions in order; a rebase and a read at a named version are served there, over the owner's content in place (2026-11-17; the text first, the code after W1 lands)
 Applied in the same change to: GAPS (A-273's entry). Nothing else yet: the tests come first, then the code.
 
-Status: designed. The text and its measurements are perf's (2026-11-11, `agents/perf-a273`, never pushed); the content
-question it left open was decided by the supervisor on 2026-11-17 by A-64 and D-7 (below). Code waits on W1 (A-247),
-whose works off the owner it builds on; W1 lands from `agents/g231-000-clients-loadtest-w1`.
+Status: step 1 built 2026-11-17 (the owner's frees held for its replicas, below); the replica itself, the feed and
+the sealed blocks owed. The text and its measurements are perf's (2026-11-11, `agents/perf-a273`, never pushed); the
+content question it left open was decided by the supervisor on 2026-11-17 by A-64 and D-7 (below). W1 (A-247), whose
+works off the owner it builds on, landed on 2026-11-17 (3c0af9399).
 
 - **Why (measured).** W1 (A-247) moves a work's edits and composition to the work's shard; the verdict and the rebase
   still run on the green's owner.
@@ -22546,8 +22547,10 @@ whose works off the owner it builds on; W1 lands from `agents/g231-000-clients-l
   own replay (`Green::apply_recorded`, the chain entry's `Applied` over its increment). One code path: a replica at
   version v is the owner's green at v by construction, the property replay already holds for recovery.
   - *The feed.* After a version is committed (A-252: after its quorum), the owner sends its chain entry to each shard
-    holding a replica, over the existing bounded control channel, in version order. A replica that sees a gap (a
-    version it lacks before the one it is sent) is rebuilt from the owner, counted.
+    holding a replica, over the existing bounded control channel, in version order. A fold of the owner's history
+    (retention, `Green::fold_history_before`) is a feed message too, in the same order, so a replica keeps no value
+    the owner has dropped. Each message has a feed position, one more than the last. A replica that sees a gap (a
+    position it lacks before the one it is sent) is rebuilt from the owner, counted.
   - *Served from the replica.* A rebase of a work on that shard, at the replica's head (never below the work's base;
     the work's next submit is judged by the owner against its own head, as every stale base is). A read of the green
     at a named version the replica holds (the 60% of A-247's reads). Everything else is unchanged: the verdict, the
@@ -22568,12 +22571,19 @@ whose works off the owner it builds on; W1 lands from `agents/g231-000-clients-l
     does.
   - *Frees deferred until every replica has passed them.* A-64's deferral holds a block only until the owner's next
     publication commits, and knows nothing of readers on other shards; alone it would let a replica read a block freed
-    and reused under it. So the owner frees a chunk whose last reference version v dropped only when every replica has
-    acknowledged a version at or past v. A replica acknowledges on the feed's own channel, after its turn has applied
-    the version and dropped every reference the version removed; the acknowledgement is per version (batched to the
-    latest), never per chunk, so the cost is one message a version a replica and no atomic on any per-item path (D-7's
-    quiescent-state rule, made by message). A replica dropped, rebuilt or ended acknowledges by leaving: its shard's
-    acknowledgement is removed, so a dead replica never holds a free.
+    and reused under it. So a chunk the owner's last piece leaves is stamped with the feed position of the message
+    that carries the change (`Green::feed_position`; the owner moves to the next as it sends one,
+    `Green::advance_feed`), and freed only when every replica has acknowledged that position. Positions, not
+    versions: a fold releases chunks with no new version, and a replica that had not folded would still read them (the
+    text of the same day said versions, and was wrong). A replica acknowledges on the feed's own channel, after its
+    turn has applied the message and dropped every piece it released; the acknowledgement is per message (batched to
+    the latest), never per chunk, so the cost is one message a feed message a replica and no atomic on any per-item
+    path (D-7's quiescent-state rule, made by message). A replica joins at the owner's position then
+    (`Green::hold_content`), naming only live chunks. A replica dropped, rebuilt or ended leaves
+    (`Green::leave_content`), so a dead replica never holds a free. Built 2026-11-17 in `crates/merge/src/history.rs`
+    (`Chunks::hold`, `acknowledge`, `leave`): a held chunk's room is not reused, its bytes are charged to the green's
+    retained history (`Green::retained_bytes`) and recounted from the held list, and the frees held are counted
+    (`Green::content_frees_held`). With no replica the owner frees at once, as before.
   - *Bounds.* The deferred bytes are charged to the owner's memory class, and they are bounded by the slowest
     replica's lag. A replica more than the derived lag behind (owed: its derivation, from the class's headroom against
     the bytes a version frees) is dropped, counted (`merge.replica.dropped_lagging`), and its rebases and reads go to
@@ -22612,9 +22622,11 @@ whose works off the owner it builds on; W1 lands from `agents/g231-000-clients-l
   - A lagging replica's rebase is answered exactly as the owner would answer it at the replica's head, and a rebase whose
     base is above the replica's head is forwarded and answered by the owner.
   - A read at a version the replica lacks is forwarded, and its answer equals the owner's.
-  - Lifetime: a replica holding a piece of a chunk whose last reference the owner has dropped reads the chunk's bytes
-    unchanged until it acknowledges, and the owner's free happens at that acknowledgement and not before; a replica
-    dropped mid-read releases its hold. Red with the acknowledgement ignored (the owner frees at once).
+  - Lifetime (built): a replica holding a piece of a chunk whose last reference the owner has dropped reads the
+    chunk's bytes unchanged until it acknowledges, and the owner's free happens at that acknowledgement and not before;
+    a replica that leaves releases its hold (`a_chunk_released_while_a_replica_reads_it_stays_until_the_replica_passes_its_release`,
+    `a_replica_that_leaves_holds_no_free`, and the generated `no_replica_reads_a_chunk_freed_before_it_passed_the_release`
+    in `crates/merge/src/history.rs`). Red with the hold ignored (the owner frees at once).
   - Non-vacuity: counters of rebases and reads served off the owner and of those forwarded, and of frees deferred for
     a replica (`merge.replica.frees_deferred`).
   - Then the A/B the supervisor runs: the anchor recipe, every round, with the owner's utilization before and after.

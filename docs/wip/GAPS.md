@@ -73,10 +73,13 @@
 > rebases the larger share (about 71,000 a run against 49,000 verdicts), and W1's rebase at 1,000 clients is slower
 > than main's because it crosses to the owner. A replica holds the green's metadata (about 14.2 MB at the rung, 3.8% of
 > a shard's 373.5 MB metadata budget on the Studio) and reads the owner's content in place, never a copy (the
-> supervisor, 2026-11-17, by A-64 and D-7). Owed, in order: W1 on main; the engine's content in sealed blocks that
-> never move; the owner's frees held until every replica has acknowledged a version past them; the tests first (the
-> replica equals the owner at every version, the lifetime red with the acknowledgement ignored); the code; the
-> supervisor's A/B.
+> supervisor, 2026-11-17, by A-64 and D-7). W1 is on main (3c0af9399). **Built (step 1):** the owner's frees held until
+> every replica has acknowledged the feed position that released them (positions, since a fold releases with no new
+> version), charged to the green's retained bytes and counted (`Green::hold_content`, `acknowledge_content`,
+> `leave_content`, `content_frees_held`; tests in `crates/merge/src/history.rs`). **Owed, in order:** the replica
+> (the green's metadata built from the owner's, the feed of versions and folds, the replica equal to the owner at every
+> version); the engine's content in sealed blocks another shard may read; the lag bound that drops a replica
+> holding too much; the code on the shards; the supervisor's A/B.
 >
 > **A Shards guest's unprivileged run could not write a host-owned volume: built, the stream takes Shards' owner word
 > (2026-11-18, §4.6 the Shards form; A-281; goal g268).** Shards' init names the run's owner on a share's root with
