@@ -303,14 +303,24 @@ Every test is written as "do X, expect Y" and names the acceptance criterion or 
 ## 8. Every agent: implement, run focused unit and integration tests, merge (Ada, 2026-11-18, binding on every agent and subagent, forever)
 
 1. **Implement** the change, with its tests (a bug's failing test first, red-checked) and the design, GAPS and docs lines it makes true, in one commit in the style above.
-2. **Test, focused:** run the unit tests and the integration tests that exercise the change, by name or filter
-   (`cargo test -p <crate> --lib <filter>`, `cargo test -p <crate> --test <file> <filter>`), on the host you work on,
-   plus `cargo fmt`. Not whole-crate or workspace suites, not clippy, not cross-platform builds, lint matrices,
-   `xtask`, doc builds, e2e suites, CI waits or benchmarks: main runs those and does the fixes.
+2. **Test, focused:** run the unit tests that exercise the change (`cargo test -p <crate> --lib <filter>`) and at
+   most the one named integration test that does, if it runs in seconds in a debug build (`cargo test -p <crate>
+   --test <file> <name>`), plus `cargo fmt`. A bug's failing test is red-checked once. Never yourself: whole-crate or
+   workspace suites, clippy, cross-platform builds or runs, lint matrices, `xtask`, doc builds, e2e, chaos or live
+   flows, conformance suites, diag CI branches, A/B or benchmark rounds, repeated red/green runs, seed replays, TLC
+   model checks, kernel-scale or load runs, or waiting on CI or a queued machine. File each run you want in the
+   supervisor's run-request queue with its exact command, its platform and what red would look like; main runs it
+   and sends the failures back; take your next piece meanwhile. Windows code that cannot run on your host merges on a
+   clean `cargo xwin check` of its crates. A performance change is implemented (both designs, on two branches, when
+   they are close) with its counters; main runs the A/B and the winner lands with main's figures.
 3. **Merge it yourself:**
    - `git fetch origin && git merge origin/main` into your branch;
    - rerun those focused tests if the merge changed what they cover;
-   - `git push origin HEAD:main`.
+   - read `git diff --stat origin/main HEAD`: your files alone;
+   - `git push origin HEAD:main`, as its own command.
+
+   Never land a commit built with `git commit-tree` from your branch's tree: it reverts whatever main gained since
+   your last merge (2026-11-18: one such push removed 40 files of main for two minutes).
 
    If the push is refused because main moved, fetch, merge and push again. Never force-push or rewrite main.
 

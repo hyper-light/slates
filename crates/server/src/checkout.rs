@@ -375,6 +375,12 @@ pub(crate) fn checkout_verb(
       feature: "a checkout outside a recorded request".to_owned(),
     });
   };
+  // On a live-shipped volume the checkout's reply waits for durability (`run`), so it is seated among the shard's held
+  // replies before its first step writes: the bound met now, with nothing written, never after (A-200;
+  // `crate::live_ship::take_seat`).
+  if let Err(refusal) = crate::live_ship::take_seat(state, to_db_volume(base.volume), request) {
+    return refused(refusal);
+  }
   let job = Job {
     request,
     principal: principal.clone(),
@@ -384,7 +390,11 @@ pub(crate) fn checkout_verb(
     report,
     steps: steps.into_iter(),
   };
-  crate::image::defer(state, run(job))
+  let reply = crate::image::defer(state, run(job));
+  if matches!(reply, ReplyBody::Refused { .. }) {
+    crate::live_ship::release_seat(state, request);
+  }
+  reply
 }
 
 /// A checkout between its slices.
