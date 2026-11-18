@@ -243,10 +243,12 @@ pub fn success_reply_bytes(opcode: Opcode) -> Option<usize> {
 /// daemon restart once the reply arrives (§4.8 barrier, D-18): a namespace or attribute change, an extended
 /// attribute set or removed (as NFSv4.2's `SETXATTR` and `REMOVEXATTR` are; until 2026-11-18 these two were missing,
 /// so an acknowledged `setcap` died with its daemon), an allocation (A-108), and the commit points of data — `fsync`
-/// and the `flush` every close sends — succeeded. A plain `write` is not one: like an NFS `UNSTABLE` write, its bytes
-/// are in the daemon when it returns and are made stable by the `flush` or `fsync` that follows. Every transport that
-/// serves this dispatch (the kernel's `/dev/fuse`, a virtio-fs guest, a Shards stream) holds such a reply until its
-/// owner's barrier has captured the volume (AUD-29-82).
+/// and the `flush` every close sends — succeeded. A plain `write` is not one: every transport that serves this dispatch
+/// keeps it in the shard's write log before its reply, for a successor to replay (a mount A-63, a Shards stream A-316,
+/// a virtio-fs guest A-410), and one the log has no room for is published before its reply instead (a virtio-fs
+/// guest's through [`Bridge::awaits_publication`]). Every transport that serves this dispatch (the kernel's
+/// `/dev/fuse`, a virtio-fs guest, a Shards stream) holds such a reply until its owner's barrier has captured the
+/// volume (AUD-29-82).
 pub fn needs_barrier(opcode: Option<Opcode>, error: i32) -> bool {
   error == 0
     && matches!(

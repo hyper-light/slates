@@ -2154,3 +2154,65 @@ fn a_scoped_readdir_with_a_crafted_cookie_terminates_and_leaks_no_alias() {
     assert!(pages < 1000, "the scoped readdir loop did not terminate");
   }
 }
+
+/// A-410 (a transport that keeps its writes in the shard's write log). Do: through a bridge whose log keeps every write,
+/// write twice into a file; then through one whose log keeps none, write once; and through one with no log, write once.
+/// Expect: the keeping log handed each write's inode, offset and bytes, in order, and the bridge owing no publication;
+/// the refusing log handed its write and the bridge owing one, so the transport publishes before the reply; and the
+/// bridge with no log owing none, as before A-410.
+#[test]
+fn a_bridge_hands_each_write_to_its_log_and_owes_a_publication_for_one_it_did_not_keep() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let cx = rw_cx();
+  let root = vol.root_inode(&store).unwrap();
+  let file = vol
+    .create_file_no(&mut store, root, "logged.bin", 0o644)
+    .unwrap();
+  // Published, as the file's create would be, so the volume owes no publication of its own (A-150) and what the bridge
+  // owes is its writes'.
+  vol.mark_published(&store);
+  let id = VolumeId { bytes: [0; 16] };
+  let mut kept: Vec<(u64, u64, Vec<u8>)> = Vec::new();
+  {
+    let mut keeping = |inode: u64, offset: u64, bytes: &[u8]| {
+      kept.push((inode, offset, bytes.to_vec()));
+      true
+    };
+    let mut bridge = VolumeBridge::new(id, &mut vol, &mut store).logging_writes(&mut keeping);
+    assert_eq!(bridge.write(oid(file.0), &cx, 0, b"first").unwrap(), 5);
+    assert_eq!(bridge.write(oid(file.0), &cx, 100, b"second").unwrap(), 6);
+    assert!(
+      !bridge.awaits_publication(),
+      "every write kept: no publication owed"
+    );
+  }
+  assert_eq!(
+    kept,
+    [
+      (file.0, 0, b"first".to_vec()),
+      (file.0, 100, b"second".to_vec())
+    ],
+    "the log was handed each write, in order"
+  );
+  let mut handed = 0;
+  {
+    let mut refusing = |_: u64, _: u64, _: &[u8]| {
+      handed += 1;
+      false
+    };
+    let mut bridge = VolumeBridge::new(id, &mut vol, &mut store).logging_writes(&mut refusing);
+    assert_eq!(bridge.write(oid(file.0), &cx, 0, b"third").unwrap(), 5);
+    assert!(
+      bridge.awaits_publication(),
+      "a write the log did not keep owes a publication before its reply"
+    );
+  }
+  assert_eq!(handed, 1, "the refusing log was handed the write");
+  let mut bridge = VolumeBridge::new(id, &mut vol, &mut store);
+  assert_eq!(bridge.write(oid(file.0), &cx, 0, b"fourth").unwrap(), 6);
+  assert!(
+    !bridge.awaits_publication(),
+    "a bridge with no log owes nothing"
+  );
+}
