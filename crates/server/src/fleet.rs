@@ -562,6 +562,7 @@ pub(crate) fn learn_member(
         .or_insert(LearnedMember {
           boot_nonce,
           host: announced,
+          previous: None,
         });
     }
     LearnedOutcome::Restarted { old } => {
@@ -572,6 +573,7 @@ pub(crate) fn learn_member(
         LearnedMember {
           boot_nonce,
           host: announced,
+          previous: Some(old),
         },
       );
       // A discovery exchange pending on this anchor's link addresses the old incarnation: woken now, it
@@ -6560,9 +6562,8 @@ async fn refresh_discovery(
         if session.peer_reset() {
           state.count(LINK_PEER_RESET, 1);
         }
-        state
-          .dead_session_dropped_at
-          .insert(peer_host, futures::now_ns());
+        let dropped = crate::state::WallAndPeriods::now(state);
+        state.dead_session_dropped_at.insert(peer_host, dropped);
       }
     });
   }
@@ -8583,7 +8584,9 @@ fn sync_config_from_council(local: HostId) {
     // allowance restarts from now (a takeover under this version cannot yet have committed).
     s.lease
       .installed(configuration.version, slates_machine::clock::monotonic_ns());
-    s.fleet.install_configuration(configuration, &members);
+    // At this host's own epoch advanced (retired while away, admitted again under its id), its catalogued volumes are
+    // yielded to their successors (A-334, `crate::readmission`).
+    crate::readmission::install_placement(s, configuration, &members);
     // Raise the fence for every held object to its owner's committed fencing epoch (§4.8 "every holder
     // raises its fence for that host to the new epoch"). A failed owner's epoch was bumped by the council's
     // takeover, so this fences a resumed stale owner `StaleEpoch` across all its objects **at once** — done
@@ -8770,7 +8773,8 @@ impl Fan {
         .as_ref()
         .and_then(|membership| membership.durability)
         .and_then(|bound| bound.shortfall(&placement));
-      s.fleet.install_configuration(placement, &members);
+      // This shard's own catalog is yielded at this host's epoch advanced, as the control shard's is (A-334).
+      crate::readmission::install_placement(s, placement, &members);
     }
     if let Some(root) = self.root {
       s.root.adopt(root);
@@ -9804,7 +9808,8 @@ pub(crate) fn return_sessions(sessions: Vec<(HostId, Endpoint)>) {
         {
           s.record_sessions.remove(&host);
           s.count(LINK_PEER_RESET, 1);
-          s.dead_session_dropped_at.insert(host, futures::now_ns());
+          let dropped = crate::state::WallAndPeriods::now(s);
+          s.dead_session_dropped_at.insert(host, dropped);
         }
         Some(link)
           if link.endpoint.is_none()
@@ -9822,7 +9827,8 @@ pub(crate) fn return_sessions(sessions: Vec<(HostId, Endpoint)>) {
               .max(crate::daemon::LIVENESS_BUDGET_NS)
               / NS_PER_MS
           );
-          s.dead_session_dropped_at.insert(host, futures::now_ns());
+          let dropped = crate::state::WallAndPeriods::now(s);
+          s.dead_session_dropped_at.insert(host, dropped);
         }
         Some(link) if link.endpoint.is_none() && link.borrowed == returned => {
           link.last_seen = Some(crate::state::RecordLink::seen(host, &endpoint));
@@ -9860,7 +9866,7 @@ pub(crate) async fn forward_over_leader_session(
     peer,
     &[request],
     deadline_ns,
-    crate::forward_lane::failover_bound_from(slates_rt::futures::now_ns()),
+    &mut crate::forward_lane::FailoverBound::from_now(),
     &mut crate::forward_lane::Place::default(),
   )
   .await
@@ -9878,8 +9884,8 @@ pub(crate) async fn forward_over_leader_session(
 /// (`RequestBody::ReadWindow`) — all sent together on the borrowed session ([`slates_cluster::requests_within`]).
 /// `stall_ns` bounds the wait for the session and, once it is borrowed, any stretch with no progress: a batch that
 /// keeps delivering is never cut off for its size. A stretch with no progress is given up once the lane's shard has
-/// read what came, or at once past `bound_ns`, the failover bound on the wall from the forward's first send
-/// ([`crate::forward_lane`]'s stall, A-315). Returns the replies in order (`None` for one not answered) with how they
+/// read what came, or at once past `bound`, the failover bound from the forward's first send, held to the floor of the
+/// path to `peer` where that is longer ([`crate::forward_lane`]'s stall, A-315, A-352). Returns the replies in order (`None` for one not answered) with how they
 /// streamed ([`slates_cluster::BatchReplies`]), or `None` when the session never came back within the budget. The
 /// batch is queued at `place` in the peer's lane: a resend passes the place its first issue recorded there
 /// ([`crate::forward_lane::Place`]).
@@ -9887,10 +9893,10 @@ pub(crate) async fn forward_batch_over_leader_session(
   peer: HostId,
   requests: &[Vec<u8>],
   stall_ns: u64,
-  bound_ns: u64,
+  bound: &mut crate::forward_lane::FailoverBound,
   place: &mut crate::forward_lane::Place,
 ) -> Option<slates_cluster::BatchReplies> {
-  crate::forward_lane::forward_batch(peer, requests, stall_ns, bound_ns, place).await
+  crate::forward_lane::forward_batch(peer, requests, stall_ns, bound, place).await
 }
 
 #[cfg(test)]
@@ -10448,6 +10454,7 @@ mod tests {
         LearnedMember {
           boot_nonce: 11,
           host: first,
+          previous: None,
         },
       );
       let mut client = Some(pending_dial());
@@ -10460,6 +10467,7 @@ mod tests {
         LearnedMember {
           boot_nonce: 22,
           host: second,
+          previous: None,
         },
       );
       let now = refresh_record_identity_in(state, anchor, first, &mut client, &mut cursor);
@@ -10512,6 +10520,7 @@ mod tests {
         LearnedMember {
           boot_nonce: 7,
           host: real,
+          previous: None,
         },
       );
       let learned_seed = keeps_direct_contact_with(state, seed);
@@ -10543,6 +10552,7 @@ mod tests {
     let known = LearnedMember {
       boot_nonce: 0,
       host: seed,
+      previous: None,
     };
     assert_eq!(
       classify_announced(Some(&known), anchor, 0, seed),
@@ -10557,6 +10567,7 @@ mod tests {
     let restarted = LearnedMember {
       boot_nonce: 1,
       host: next,
+      previous: None,
     };
     assert_eq!(
       classify_announced(Some(&restarted), anchor, 0, seed),
