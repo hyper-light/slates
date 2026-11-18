@@ -31,6 +31,15 @@
 //! up to 2 MiB is past the image file's end, and reads the bytes back from the device once its cached pages are dropped;
 //! `storm` stores and syncs over and over, each sync a flush of the device; `sweep` stores sweep after sweep, a byte at
 //! a time and in order, so a VM killed during one leaves a known boundary in the copy.
+//!
+//! **A mount that honours no set-id bit and opens no device node (A-94, A-294).** The guest mounts what the VMM shares,
+//! a tag or a volume's image, `nosuid,nodev`, as `docs/cli.md`'s guest mount line asks: a volume keeps set-id bits and
+//! device nodes as any writer made them, and only the guest's kernel can refuse to act on them. `bare` mounts the same
+//! file system again at [`BARE_MOUNT_POINT`] without either flag, the control: the flags belong to each mount, not to
+//! the file system, so a test can show that a bit or a node reached the guest and what the guest's own mount withholds.
+//! `exec` runs a file of either mount as a user the host names, and `open` opens a node of either as root. A copy of
+//! this binary run that way is not the first process, so it says its ids and ends ([`say_identity`]), which tells the
+//! test whether the mount honoured the copy's set-id bits.
 
 use std::ffi::{CStr, CString, c_int};
 use std::io::Write;
@@ -45,11 +54,18 @@ use rustix::system::RebootCommand;
 use rustix::termios::OptionalActions;
 use rustix::time::ClockId;
 use slates_guest_probe::protocol::{
-  Command, EntryKind, LONGEST_COMMAND, Reply, digest, sweep_value,
+  Command, EntryKind, LONGEST_COMMAND, Mount, Reply, digest, sweep_value,
 };
 
 /// Format: where the guest mounts the shared tag.
 const MOUNT_POINT: &str = "/mnt";
+/// Format: where the guest mounts what the VMM shares a second time, without `nosuid,nodev`: the control
+/// ([`Mount::Bare`]). The initramfs holds the directory, as it holds [`MOUNT_POINT`].
+const BARE_MOUNT_POINT: &str = "/bare";
+/// Format: the flags of the guest's own mount of what the VMM shares: `nosuid,nodev`, as `docs/cli.md`'s guest mount
+/// line asks (A-94, A-294). The kernel then runs a set-id file as its caller (`bprm_fill_uid`) and refuses to open a
+/// device node `EACCES` (`may_open_dev`), whoever made either in the volume.
+const HARDENED: MountFlags = MountFlags::NOSUID.union(MountFlags::NODEV);
 /// Format: the console the kernel gives the first process.
 const CONSOLE: &str = "/dev/console";
 /// Format: the kernel command line's key naming the virtio-fs tag to mount.
@@ -92,6 +108,8 @@ const LONGEST_WRITE: usize = 16 << 20;
 const LONGEST_CMDLINE: usize = 4096;
 /// Shape: the bytes the console is read in at a time.
 const CONSOLE_CHUNK: usize = 256;
+/// Shape: the bytes a reply read from a run's output may carry: none, since an identity carries no byte run.
+const NO_REPLY_BYTES: usize = 0;
 /// Format: microseconds in a millisecond.
 const MICROS_PER_MILLI: u64 = 1_000;
 /// Format: microseconds in a second.
@@ -120,7 +138,7 @@ pub(crate) fn run() -> ! {
   power_off(end)
 }
 
-/// Takes the console, mounts the tag or the block device, and answers commands until told to quit.
+/// Takes the console, mounts the tag or the block device `nosuid,nodev`, and answers commands until told to quit.
 fn serve(end: &mut End) -> Result<(), String> {
   attach_console()?;
   let cmdline = kernel_command_line()?;
@@ -128,15 +146,13 @@ fn serve(end: &mut End) -> Result<(), String> {
     *end = End::Reboot;
   }
   load_modules(&cmdline)?;
-  match option(&cmdline, BLOCK_KEY) {
-    Some(device) => {
-      await_node(device)?;
-      mount_block(&cmdline, device)?;
-    }
-    None => mount_tag(&cmdline)?,
+  if let Some(device) = option(&cmdline, BLOCK_KEY) {
+    await_node(device)?;
   }
+  mount_shared(&cmdline, MOUNT_POINT, HARDENED)?;
   say(&Reply::Ready)?;
   let mut map: Option<SharedMap> = None;
+  let mut bare = false;
   let mut console = LineReader::default();
   loop {
     let line = console.next_line()?;
@@ -146,6 +162,7 @@ fn serve(end: &mut End) -> Result<(), String> {
         list()?;
         Reply::Done
       }
+      Ok(Command::Bare) => mount_bare(&cmdline, &mut bare),
       Ok(command) => execute(command, &mut map, option(&cmdline, BLOCK_KEY)),
       Err(refusal) => Reply::Refused(refusal.to_string()),
     };
@@ -153,9 +170,28 @@ fn serve(end: &mut End) -> Result<(), String> {
   }
   drop(map);
   rustix::fs::sync();
-  rustix::mount::unmount(MOUNT_POINT, UnmountFlags::empty())
-    .map_err(|e| format!("unmount {MOUNT_POINT}: {e}"))?;
+  if bare {
+    unmount(BARE_MOUNT_POINT)?;
+  }
+  unmount(MOUNT_POINT)?;
   say(&Reply::Done)
+}
+
+/// Mounts what the VMM shares at [`BARE_MOUNT_POINT`] without `nosuid,nodev`, the control ([`Mount::Bare`]); once, so
+/// the end's one unmount leaves nothing mounted there.
+fn mount_bare(cmdline: &str, bare: &mut bool) -> Reply {
+  if *bare {
+    return Reply::Refused(format!("{BARE_MOUNT_POINT} is mounted already"));
+  }
+  let mounted = mount_shared(cmdline, BARE_MOUNT_POINT, MountFlags::empty());
+  *bare = mounted.is_ok();
+  done_or_refused(mounted)
+}
+
+/// Unmounts `target`.
+fn unmount(target: &str) -> Result<(), String> {
+  rustix::mount::unmount(target, UnmountFlags::empty())
+    .map_err(|e| format!("unmount {target}: {e}"))
 }
 
 /// One command, carried out against the map, the mounted file system or the block device `block` names.
@@ -178,6 +214,13 @@ fn execute(command: Command, map: &mut Option<SharedMap>, block: Option<&str>) -
       Reply::Done
     }
     Command::Device { at, bytes } => done_or_refused(write_device(block, at, &bytes)),
+    Command::Exec {
+      mount,
+      path,
+      uid,
+      gid,
+    } => run_as(mount, &path, uid, gid),
+    Command::Open { mount, path } => open_node(mount, &path),
     other => match map.as_ref() {
       Some(mapped) => mapped.answer(other),
       None => Reply::Refused("no map has been made".to_owned()),
@@ -190,8 +233,21 @@ fn done_or_refused(result: Result<(), String>) -> Reply {
   result.map_or_else(Reply::Refused, |()| Reply::Done)
 }
 
-/// `path` under the mount, refused when it climbs out of it.
+/// `path` under the guest's own mount, refused when it climbs out of it.
 fn under_mount(path: &str) -> Result<std::path::PathBuf, String> {
+  under(Mount::Hardened, path)
+}
+
+/// Where `mount` is mounted.
+fn mount_point(mount: Mount) -> &'static str {
+  match mount {
+    Mount::Hardened => MOUNT_POINT,
+    Mount::Bare => BARE_MOUNT_POINT,
+  }
+}
+
+/// `path` under `mount`, refused when it climbs out of it.
+fn under(mount: Mount, path: &str) -> Result<std::path::PathBuf, String> {
   let relative = std::path::Path::new(path.trim_start_matches('/'));
   if relative
     .components()
@@ -199,7 +255,99 @@ fn under_mount(path: &str) -> Result<std::path::PathBuf, String> {
   {
     return Err(format!("{path} is not a plain path under the mount"));
   }
-  Ok(std::path::Path::new(MOUNT_POINT).join(relative))
+  Ok(std::path::Path::new(mount_point(mount)).join(relative))
+}
+
+/// Runs the file `path` of `mount` as user `uid` and group `gid`, and answers what it says of itself
+/// ([`Reply::Identity`]), or the errno of a run the kernel refused ([`Reply::Failed`]). The standard library sets the
+/// group, drops every supplementary group and sets the user in the child before its exec, as a login does; the guest
+/// is root, so each is allowed. Whether the run's effective ids are the file's owner's is the kernel's to decide, by
+/// the file's set-id bits and its mount's `nosuid` (`bprm_fill_uid`).
+fn run_as(mount: Mount, path: &str, uid: u32, gid: u32) -> Reply {
+  use std::os::unix::process::CommandExt;
+  let program = match under(mount, path) {
+    Ok(program) => program,
+    Err(refusal) => return Reply::Refused(refusal),
+  };
+  match std::process::Command::new(&program)
+    .uid(uid)
+    .gid(gid)
+    .output()
+  {
+    Err(error) => error.raw_os_error().map_or_else(
+      || Reply::Refused(format!("run {}: {error}", program.display())),
+      |errno| Reply::Failed { errno },
+    ),
+    Ok(ran) if !ran.status.success() => Reply::Refused(format!(
+      "{} ended with {}: {}",
+      program.display(),
+      ran.status,
+      String::from_utf8_lossy(&ran.stderr).trim()
+    )),
+    Ok(ran) => said_identity(&ran.stdout).unwrap_or_else(|| {
+      Reply::Refused(format!(
+        "{} said no identity: {}",
+        program.display(),
+        String::from_utf8_lossy(&ran.stdout).trim()
+      ))
+    }),
+  }
+}
+
+/// The [`Reply::Identity`] line a run of the probe's binary wrote on its standard output, if it wrote one.
+fn said_identity(output: &[u8]) -> Option<Reply> {
+  String::from_utf8_lossy(output).lines().find_map(|line| {
+    match Reply::parse(line, NO_REPLY_BYTES) {
+      Some(Ok(identity @ Reply::Identity { .. })) => Some(identity),
+      _ => None,
+    }
+  })
+}
+
+/// Opens the node `path` of `mount` for reading, without blocking and as the guest's root, then closes it:
+/// [`Reply::Done`], or the open's errno ([`Reply::Failed`]). On a `nodev` mount the kernel refuses a device node
+/// `EACCES` before any driver is reached (`may_open_dev`); `NOCTTY`, so a terminal it reaches elsewhere never becomes
+/// the guest's controlling terminal.
+fn open_node(mount: Mount, path: &str) -> Reply {
+  let node = match under(mount, path) {
+    Ok(node) => node,
+    Err(refusal) => return Reply::Refused(refusal),
+  };
+  match rustix::fs::open(
+    node.as_path(),
+    OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
+    Mode::empty(),
+  ) {
+    Ok(opened) => {
+      drop(opened);
+      Reply::Done
+    }
+    Err(refused) => Reply::Failed {
+      errno: refused.raw_os_error(),
+    },
+  }
+}
+
+/// The probe run as anything but the guest's first process: a copy of this binary a guest's test runs from a mount
+/// ([`Command::Exec`]). It says its real and effective user and group ids on its standard output, one
+/// [`Reply::Identity`] line, and ends, touching neither the console, nor a mount, nor the machine's power. A
+/// set-user-id copy run from a mount that honours the bit runs as the file's owner; from a `nosuid` mount, as its
+/// caller.
+pub(crate) fn say_identity() -> std::process::ExitCode {
+  let identity = Reply::Identity {
+    uid: rustix::process::getuid().as_raw(),
+    euid: rustix::process::geteuid().as_raw(),
+    gid: rustix::process::getgid().as_raw(),
+    egid: rustix::process::getegid().as_raw(),
+  };
+  let mut out = std::io::stdout().lock();
+  match writeln!(out, "{}", identity.encode()).and_then(|()| out.flush()) {
+    Ok(()) => std::process::ExitCode::SUCCESS,
+    Err(e) => {
+      eprintln!("slates-guest-probe: the identity: {e}");
+      std::process::ExitCode::FAILURE
+    }
+  }
 }
 
 /// Makes `path` hold exactly `bytes`.
@@ -420,19 +568,22 @@ fn await_node(device: &str) -> Result<(), String> {
   }
 }
 
-/// Mounts block device `device` at [`MOUNT_POINT`] as the file system the command line names ([`FILESYSTEM_KEY`], or
-/// [`BLOCK_FILESYSTEM`]), with the `dax=` option it names.
-fn mount_block(cmdline: &str, device: &str) -> Result<(), String> {
+/// Mounts what the VMM shares at `target` with `flags`: the block device the command line names ([`BLOCK_KEY`]), or
+/// else the virtio-fs tag. A second mount of either at another target is the same file system, with flags of its own.
+fn mount_shared(cmdline: &str, target: &str, flags: MountFlags) -> Result<(), String> {
+  match option(cmdline, BLOCK_KEY) {
+    Some(device) => mount_block(cmdline, device, target, flags),
+    None => mount_tag(cmdline, target, flags),
+  }
+}
+
+/// Mounts block device `device` at `target` with `flags`, as the file system the command line names
+/// ([`FILESYSTEM_KEY`], or [`BLOCK_FILESYSTEM`]), with the `dax=` option it names.
+fn mount_block(cmdline: &str, device: &str, target: &str, flags: MountFlags) -> Result<(), String> {
   let filesystem = option(cmdline, FILESYSTEM_KEY).unwrap_or(BLOCK_FILESYSTEM);
   let data = dax_option(cmdline)?;
-  rustix::mount::mount(
-    device,
-    MOUNT_POINT,
-    filesystem,
-    MountFlags::empty(),
-    data.as_deref(),
-  )
-  .map_err(|e| format!("mount {device} as {filesystem} at {MOUNT_POINT}: {e}"))
+  rustix::mount::mount(device, target, filesystem, flags, data.as_deref())
+    .map_err(|e| format!("mount {device} as {filesystem} at {target}: {e}"))
 }
 
 /// The `dax=` mount option the command line names ([`DAX_KEY`]), if it names one.
@@ -483,18 +634,12 @@ fn option<'c>(cmdline: &'c str, key: &str) -> Option<&'c str> {
     .find_map(|word| word.strip_prefix(key))
 }
 
-/// Mounts the virtio-fs tag at [`MOUNT_POINT`], with the DAX option the command line names.
-fn mount_tag(cmdline: &str) -> Result<(), String> {
+/// Mounts the virtio-fs tag at `target` with `flags`, with the DAX option the command line names.
+fn mount_tag(cmdline: &str, target: &str, flags: MountFlags) -> Result<(), String> {
   let tag = option(cmdline, TAG_KEY).unwrap_or(DEFAULT_TAG);
   let data = dax_option(cmdline)?;
-  rustix::mount::mount(
-    tag,
-    MOUNT_POINT,
-    "virtiofs",
-    MountFlags::empty(),
-    data.as_deref(),
-  )
-  .map_err(|e| format!("mount virtiofs tag {tag} at {MOUNT_POINT}: {e}"))
+  rustix::mount::mount(tag, target, "virtiofs", flags, data.as_deref())
+    .map_err(|e| format!("mount virtiofs tag {tag} at {target}: {e}"))
 }
 
 /// Writes one reply line to the console.
@@ -675,7 +820,10 @@ impl SharedMap {
       | Command::Remove { .. }
       | Command::Mkdir { .. }
       | Command::Flush
-      | Command::Device { .. } => Err("not a command a map answers".to_owned()),
+      | Command::Device { .. }
+      | Command::Bare
+      | Command::Exec { .. }
+      | Command::Open { .. } => Err("not a command a map answers".to_owned()),
     };
     answered.unwrap_or_else(Reply::Refused)
   }
