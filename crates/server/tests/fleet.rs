@@ -3204,7 +3204,8 @@ fn settle_initial_consensus(
       .iter()
       .map(|daemon| format!(
         "host={:?} ready={:?} council={:?} voters={:?} root={:?} leaders={:?}/{:?} alive={:?} meshed={:?} \
-         record_links(host, out)={:?} council_state={:?} refusals={:?}",
+         record_links(host, out)={:?} record_dials={:?} pending_discovery={:?} demux={:?} council_state={:?} \
+         refusals={:?}",
         daemon.member_identity(),
         daemon.consensus_ready(),
         daemon.council_members(),
@@ -3215,6 +3216,9 @@ fn settle_initial_consensus(
         daemon.fleet_members(),
         daemon.fleet_meshed(),
         daemon.fleet_record_links(),
+        daemon.fleet_record_dials(),
+        daemon.fleet_pending_discovery(),
+        daemon.fleet_demux_counters(),
         daemon.council_debug(),
         daemon.fleet_refusals(),
       ))
@@ -17259,7 +17263,7 @@ fn plant_taken_over_green(daemon: &Daemon, with_catalog: bool) {
         s.pending_green_materializations.insert(
           object,
           // No survivor reported its version: a planted green has no sources to fetch from.
-          slates_server::state::PendingGreen::adopted(merge, Vec::new()),
+          slates_server::state::PendingGreen::adopted(merge, None, Vec::new()),
         );
       },
     )
@@ -17294,6 +17298,107 @@ fn status_of_planted_green(daemon: &Daemon, periods: u64) -> Option<Refusal> {
   last
 }
 
+/// Which wait a planted taken-over volume meets ([`plant_taken_over_volume`]).
+#[derive(Clone, Copy)]
+enum PlantedVolume {
+  /// A contentless head, placed, with no catalog register adopted.
+  NoCatalog,
+  /// A head naming content this node does not hold, with no holder to fetch it from.
+  NoContent,
+}
+
+/// Plants on `daemon`'s control shard a taken-over volume awaiting materialization, as a takeover's adoption leaves one
+/// (`takeover::adopt`), under the planted green's id: its head and its head's placement, and what `planted` leaves out.
+fn plant_taken_over_volume(daemon: &Daemon, planted: PlantedVolume) {
+  daemon
+    .observation_on_control(
+      LIVENESS_BUDGET_NS,
+      move |s: &mut slates_server::state::ShardState| {
+        let object = ObjectId(PLANTED_GREEN);
+        let head = match planted {
+          PlantedVolume::NoCatalog => HeadValue {
+            manifest: None,
+            content_holders: Vec::new(),
+            sealing: None,
+          },
+          // Holder 7 is no member: no session reaches it, so no fetch can bring the content.
+          PlantedVolume::NoContent => HeadValue {
+            manifest: Some([9; 32]),
+            content_holders: vec![7],
+            sealing: None,
+          },
+        };
+        s.placed_heads.insert(
+          object,
+          slates_server::head::PlacedHead {
+            sequence: 1,
+            epoch: slates_db::register::HostEpoch(1),
+            placement: slates_db::register::Placement {
+              candidates: Vec::new(),
+              acked: Vec::new(),
+              mirror_acked: None,
+              joint: Vec::new(),
+            },
+          },
+        );
+        s.pending_materializations.insert(
+          object,
+          slates_server::state::PendingVolume::adopted(head, None),
+        );
+      },
+    )
+    .unwrap()
+    .wait()
+    .unwrap();
+}
+
+/// CLAUDE.md §2 item 8, the volume sibling of the bounded green (GAPS 2026-11-09, "Sibling, open"): a taken-over volume
+/// whose catalog register never comes is not retried without end. Do: on a one-node fleet with a one-second failover
+/// SLO, plant a taken-over contentless volume with its head and that head's placement adopted and no catalog register;
+/// ask its status each period. Expect, within a hundred periods, `NotRecovered` naming `catalog`, after its ten
+/// attempts. Before, every period counted `fleet.materialize.waits.catalog` and retried for as long as the daemon ran.
+#[test]
+fn a_taken_over_volume_whose_catalog_never_comes_is_refused_by_name() {
+  let _serial = serialize_fleet_tests();
+  let daemon = lone_fleet_node("volume-no-catalog");
+  plant_taken_over_volume(&daemon, PlantedVolume::NoCatalog);
+  let answered = status_of_planted_green(&daemon, GIVE_UP_WITHIN_PERIODS);
+  let record = green_takeover_record(&daemon);
+  daemon.stop();
+  assert_eq!(
+    answered,
+    Some(Refusal::NotRecovered {
+      cause: slates_ipc::protocol::RecoveryCause::TakeoverIncomplete {
+        waited_on: "catalog".to_owned()
+      }
+    }),
+    "the volume is given up on within its bound, naming what it waited on ({record})"
+  );
+}
+
+/// The same rule, the content branch: a taken-over volume whose content this node does not hold and cannot fetch (no
+/// recorded holder reachable, so nothing is ever staged) is not retried without end. Do: plant a taken-over volume
+/// whose head names content no holder here serves. Expect, within a hundred periods, `NotRecovered` naming `content`.
+/// Before, every period counted a fetch with no holder session and retried for as long as the daemon ran.
+#[test]
+fn a_taken_over_volume_whose_content_never_comes_is_refused_by_name() {
+  let _serial = serialize_fleet_tests();
+  let daemon = lone_fleet_node("volume-no-content");
+  plant_taken_over_volume(&daemon, PlantedVolume::NoContent);
+  let answered = status_of_planted_green(&daemon, GIVE_UP_WITHIN_PERIODS);
+  let record = green_takeover_record(&daemon);
+  daemon.stop();
+  assert_eq!(
+    answered,
+    Some(Refusal::NotRecovered {
+      cause: slates_ipc::protocol::RecoveryCause::TakeoverIncomplete {
+        waited_on: "content".to_owned()
+      }
+    }),
+    "the volume is given up on within its bound, naming what it waited on ({record})"
+  );
+}
+
 /// What `daemon`'s control shard counted of its taken-over greens (`merge.takeover*`), and whether the planted green is
 /// still pending there: for a failure's message.
 fn green_takeover_record(daemon: &Daemon) -> String {
@@ -17304,13 +17409,20 @@ fn green_takeover_record(daemon: &Daemon) -> String {
         let counted: Vec<(String, u64)> = s
           .refusals
           .iter()
-          .filter(|(name, _)| name.starts_with("merge.takeover"))
+          .filter(|(name, _)| {
+            name.starts_with("merge.takeover") || name.starts_with("fleet.materialize")
+          })
           .map(|(name, count)| ((*name).to_owned(), *count))
           .collect();
         let pending = s
           .pending_green_materializations
           .get(&ObjectId(PLANTED_GREEN))
-          .map(|pending| pending.attempts);
+          .map(|pending| pending.attempts)
+          .or_else(|| {
+            s.pending_materializations
+              .get(&ObjectId(PLANTED_GREEN))
+              .map(|pending| pending.attempts)
+          });
         format!(
           "counted {counted:?}; pending with attempts {pending:?}; coordinator periods {}",
           s.merge.coordinator_period

@@ -70,6 +70,8 @@ pub enum SignatureRefusal {
   NotTouched,
   /// The statement's expiry has passed.
   Expired,
+  /// The presentation's nonce was already spent by a grant: the same signature offered again.
+  Replayed,
 }
 
 impl SignatureRefusal {
@@ -84,6 +86,7 @@ impl SignatureRefusal {
       SignatureRefusal::BadSignature => "grant_signature_bad",
       SignatureRefusal::NotTouched => "grant_signature_not_touched",
       SignatureRefusal::Expired => "grant_signature_expired",
+      SignatureRefusal::Replayed => "grant_signature_replayed",
     }
   }
 }
@@ -441,6 +444,65 @@ fn ed25519_verify(
     .map_err(|_| SignatureRefusal::BadSignature)
 }
 
+/// A software Ed25519 key that signs grant statements as `ssh-keygen -Y sign -n slates-grant` does, for the tests of
+/// this module and of the grant verb (`crate::landing`).
+#[cfg(test)]
+pub(crate) struct TestSigner {
+  /// The key pair.
+  pair: aws_lc_rs::signature::Ed25519KeyPair,
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+impl TestSigner {
+  /// A fresh key.
+  pub(crate) fn new() -> TestSigner {
+    use aws_lc_rs::signature::Ed25519KeyPair;
+    let document = Ed25519KeyPair::generate_pkcs8(&aws_lc_rs::rand::SystemRandom::new()).unwrap();
+    TestSigner {
+      pair: Ed25519KeyPair::from_pkcs8(document.as_ref()).unwrap(),
+    }
+  }
+
+  /// The key as the human registers it.
+  pub(crate) fn registered(&self) -> RegisteredKey {
+    use aws_lc_rs::signature::KeyPair;
+    let mut blob = Vec::new();
+    put_string(&mut blob, KEY_ED25519.as_bytes()).unwrap();
+    put_string(&mut blob, self.pair.public_key().as_ref()).unwrap();
+    RegisteredKey(blob)
+  }
+
+  /// The SSH signature blob over `statement` under `namespace`.
+  pub(crate) fn sign_under(&self, namespace: &str, statement: &GrantStatement) -> Vec<u8> {
+    let mut signed = SSHSIG_MAGIC.to_vec();
+    put_string(&mut signed, namespace.as_bytes()).unwrap();
+    put_string(&mut signed, b"").unwrap();
+    put_string(&mut signed, b"sha512").unwrap();
+    put_string(
+      &mut signed,
+      digest::digest(&digest::SHA512, &statement.encode()).as_ref(),
+    )
+    .unwrap();
+    let mut inner = Vec::new();
+    put_string(&mut inner, KEY_ED25519.as_bytes()).unwrap();
+    put_string(&mut inner, self.pair.sign(&signed).as_ref()).unwrap();
+    let mut blob = SSHSIG_MAGIC.to_vec();
+    blob.extend_from_slice(&SSHSIG_VERSION.to_be_bytes());
+    put_string(&mut blob, &self.registered().0).unwrap();
+    put_string(&mut blob, namespace.as_bytes()).unwrap();
+    put_string(&mut blob, b"").unwrap();
+    put_string(&mut blob, b"sha512").unwrap();
+    put_string(&mut blob, &inner).unwrap();
+    blob
+  }
+
+  /// The SSH signature blob over `statement` under [`NAMESPACE`].
+  pub(crate) fn sign(&self, statement: &GrantStatement) -> Vec<u8> {
+    self.sign_under(NAMESPACE, statement)
+  }
+}
+
 #[cfg(test)]
 mod tests {
   #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
@@ -618,21 +680,12 @@ PgowBcvcisBQ+rfA7nqv3MYxc2I5mR2Qs=
   /// A signature made under another namespace (a git commit's, a file's) is refused as such, though valid.
   #[test]
   fn a_signature_under_another_namespace_is_refused() {
-    let pair = fresh_pair();
-    let mut public_blob = Vec::new();
-    put_string(&mut public_blob, KEY_ED25519.as_bytes()).unwrap();
-    put_string(&mut public_blob, pair.public_key().as_ref()).unwrap();
-    let keys = vec![RegisteredKey(public_blob.clone())];
-    let sign = |signed: &[u8]| {
-      let mut inner = Vec::new();
-      put_string(&mut inner, KEY_ED25519.as_bytes()).unwrap();
-      put_string(&mut inner, pair.sign(signed).as_ref()).unwrap();
-      inner
-    };
+    let signer = TestSigner::new();
+    let keys = vec![signer.registered()];
     let statement = golden_statement();
-    let good = sshsig(&public_blob, NAMESPACE, &statement, sign);
+    let good = signer.sign(&statement);
     assert!(verify_grant_signature(&good, &statement, &keys, BEFORE_EXPIRY).is_ok());
-    let git = sshsig(&public_blob, "git", &statement, sign);
+    let git = signer.sign_under("git", &statement);
     assert_eq!(
       verify_grant_signature(&git, &statement, &keys, BEFORE_EXPIRY),
       Err(SignatureRefusal::Namespace)
