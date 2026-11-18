@@ -9556,6 +9556,16 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > `a_wedged_daemon_is_found_lapsed_though_the_anchors_own_looks_run_twice_a_window_late` and
 > `the_loop_waits_at_most_its_gap_and_finds_a_lapse_at_the_budgets_end` (`crates/api/src/role/anchor.rs`).
 
+> **Status (2026-11-18, A-474): a watcher's own late looks are no span it did not watch.** A-308 starts a shard's still
+> time again at a look that comes after a span nothing watched; that span is now a gap past the shard's window and the
+> watcher's own lateness p99, capped at A-455's ceiling (`watchdog::slept_past_ns`), where it was any gap of a window.
+> The watchdog keeps its looks' lateness (`watchdog::LatenessTail`, its last hundred, nearest-rank p99), each `Look`
+> carries it, and the anchor's start and silent-watchdog judgments pass the anchor's own (the same tail). Before, a
+> watcher whose every look ran a window late restarted a wedged shard's stillness at each look and never judged it,
+> while it beat on (`docs/bugs/2026-11-18-the-watchdog-never-judged-a-wedged-shard-once-its-own-looks-ran-a-window-late.md`).
+> A process frozen whole is still told by its gap, a whole host's sleep a gap past the ceiling. Regression:
+> `a_shard_is_judged_wedged_though_the_watchers_own_looks_run_a_window_late` (`crates/server/src/watchdog.rs`).
+
 > **Telemetry oracle correction (2026-09-20, AC-0.11).** A drain request itself emits spans.
 > The daemon integration oracle now derives convergence from the reply quota minus the
 > maximum spans a drain emits, and checks progress on each batch. A four-span reply scenario
@@ -10037,7 +10047,16 @@ entry either old or new, never torn).
    writer's dirty data on the filesystem: beside one busy writer a `syncfs` took up to 3.7 s, A-130;
    macOS one `F_FULLFSYNC` after the barriers when the grant asked for media durability, otherwise the
    barriers only; Windows `FlushFileBuffers` on the directory handles). The directory syncs and the media
-   barrier still run on the shard: A-132's measured residual, the next piece (GAPS).
+   barrier still run on the shard: A-132's measured residual, the next piece (GAPS). A metadata entry (a mode or bits
+   change alone, A-458, A-466) is durable before it is reported, through its file's own handle in the same batch: its
+   fields are set in place, the handle stays open in the batch, and the barrier syncs the file whole — Linux `fsync`,
+   which "also flushes the metadata information associated with the file" where `fdatasync` "does not flush modified
+   metadata unless that metadata is needed in order to allow a subsequent data retrieval" (fsync(2)); macOS `fsync`,
+   which moves "all modified data and attributes" (Apple's fsync(2)); Windows `FlushFileBuffers`, which "writes all the
+   buffered information for a specified file" through a handle that may write (its documentation). No source says a
+   directory's sync covers another inode's mode: fsync(2) names the file it flushes; ext4's documentation says a
+   power loss loses "as much as the latest 5 seconds of metadata changes" (`commit=`); XFS's says its transactions
+   are asynchronous until a log force (A-472).
    The outcome record states which durability the landing achieved, and the reply carries it with
    every Degraded cell met (A-45): a directory it could not open or sync (`Unsynced`), a media barrier
    asked for that failed (`MediaUnsynced`, as against `BarriersOnly` when not asked for), an entry of
@@ -32304,6 +32323,106 @@ Applied in the same change to: §4.16 ("Rebase off the owner (A-273)"); A-273's 
   this change (it counts 52 literals in other crates' files); rustfmt's layout taken. Red with an idle replica never
   given back: the new test fails, nothing given back within an observation's budget.
 - **Owed.** The supervisor's A/B at 1,000 clients and more (running).
+
+### A-476 — A takeover successor names the versions its adoption stands for by its ledger and, where its checkpoint let the ledger's positions go, by the checkpoint (2026-11-18, goal 87 via g083; §4.16 owner-loss recovery; A-333, A-364, A-404, A-412)
+
+Applied in the same change to: GAPS (A-404's entry); `docs/bugs/2026-11-18-a-successors-chain-lacked-the-versions-its-checkpoint-stood-for.md`;
+`crates/server/src/merge_origin.rs` (`ledger_identities`, and the test
+`a_successors_chain_names_the_versions_its_checkpoint_stands_for`); `crates/server/src/daemon.rs`
+(`Daemon::merge_chain_identities` reads an adopted green's versions through it).
+
+- **What was there.** An adopted green's chain holds only the versions after its adoption, and the versions through it
+  are named by the successor's ledger (A-333). Since A-404 a holder lets go of its ledger's positions below the durable
+  checkpoint it keeps, which stands for them. The chain read named the adopted versions from the ledger alone, so a
+  successor whose checkpoint had let go of version 1 named its chain from version 2. It did so whenever a record it
+  recomputed named version 2 committed: 2 of 4 runs of the fleet test of a successor two versions behind, on Linux, at
+  and before A-273.
+- **The rule.** The versions through an adoption are named by the ledger's record where it holds the position, and by
+  the held checkpoint's record of what it accepted where it let go of it (`merge_origin::ledger_identities`): the two
+  durable halves of the successor's prefix since A-404. The engine (rebuilt or advanced from that checkpoint), the
+  rebuild at a restart and the durable state were right throughout; only the read missed the checkpoint.
+- **Checks.** On the Mac Studio (debug, r436, 2026-11-18): `cargo test --locked -p slates-server --lib merge_origin` 17
+  of 17, the new `a_successors_chain_names_the_versions_its_checkpoint_stands_for` among A-404's; the one-crate clippy
+  of `slates-server` clean; `cargo xtask check` structural clean and its literal check clean in this change (it counts
+  50 literals in other crates' files); rustfmt's layout taken. Red with the checkpoint's names left out (the read as it
+  was): the new test fails, naming `[(2, …), (3, …)]` for `[(1, …), (2, …), (3, …)]`, the fleet test's failure's shape.
+- **Owed.** The fleet test twenty times on Linux and on macOS (filed for main).
+
+### A-474 — A watcher's own late looks are no span it did not watch: A-308's reset waits for a gap past the window and the watcher's measured lateness (2026-11-18, built for goal g255; §4.14 `daemon.alive`; A-228, A-232, A-308, A-455, A-467)
+- **What was there.** A-308 started every shard's still time again at a look a window or more after the watchdog's last
+  one, taking the gap for the process frozen or paging whole. The watchdog looks a beat apart whatever its own lateness,
+  so a watchdog thread held off its CPU about a window at every look restarted a wedged shard's stillness at each look:
+  no verdict ever came, and since it beat at each look the anchor saw no lapse either. The anchor's start judgment and
+  its judgment of a silent watchdog's process run the same rule and had the same hole under its own late looks.
+- **The rule (`watchdog::slept_past_ns`).** A gap is a span nothing watched only past the shard's window plus the
+  watcher's own lateness p99, and never past A-455's ceiling nor under the window. A watcher's looks run late by up to
+  its p99, so a gap that lateness explains is its own late look, and across it a shard's CPU clock and its scheduler
+  state still say whether it moved: a thread leaves the run queue for a block only by running, which the clock shows.
+  It is the bound the anchor already takes a gap in its own looks for a sleep at (A-467: the liveness window plus its
+  lateness p99, capped), so both watchers attribute a gap alike. A process frozen whole, or a host asleep, still gaps
+  past it, so A-308's case stands; a runaway reading cannot stretch it past the ceiling.
+- **The lateness (`watchdog::LatenessTail`).** One bounded window of a watcher's lateness readings, its last hundred
+  with their nearest-rank p99 (A-228's form, moved from the anchor, which now keeps its waits' lateness in it too). The
+  watchdog records each look's lateness past its beat and gives every `Look` its p99 (`Look::watcher_late_ns`); the
+  anchor passes its own into its start and silent-watchdog judgments.
+- **Test.** `a_shard_is_judged_wedged_though_the_watchers_own_looks_run_a_window_late` (`crates/server/src/watchdog.rs`:
+  looks a beat and a window apart by a watcher whose p99 says so, the shard judged wedged at the first late look; and
+  gaps past the ceiling under a runaway reading, never judged across them).
+- **Evidence.** Built and run on the Mac Studio (kiln r435, 2026-11-18, load 6.3-16.7, debug build): `cargo test
+  --locked -p slates-server --lib -- watchdog` 28 of 28 and `cargo test --locked -p slates-api --lib -- role::anchor` 12
+  of 12 (one ignored, the held process's role). Red-checked once with A-308's reset at any gap of a window: the shard
+  behind looks a window late was never judged. `cargo clippy -p slates-server -p slates-api --all-targets` found nothing
+  in A-474's lines (two cognitive-complexity findings in `crates/api/tests/api.rs`, 1324 and 1630, are another
+  change's), and `cargo xtask check` none in its files.
+
+Applied in the same change to: §4.14 (a status block on `daemon.alive`), GAPS (A-308's entry), `docs/bugs/` (a record,
+and A-467's record's sibling line), `crates/server/src/watchdog.rs`, `crates/api/src/role/anchor.rs`.
+
+### A-472 — A landed mode or bits change is synced through its file's own handle in its batch's barrier before it is reported, by the rule each platform documents (2026-11-18, g085; §4.15 step 8; A-130, A-132, A-458, A-466)
+Applied in the same change to: §4.15 step 8 (the rule and its sources), GAPS (A-185's owed list), `crates/land`
+(`src/engine.rs`: `StagedMeta` and `MetaSet`, `stage_meta`, `set_meta`, `report_meta`, the batch's files
+(`batch_files`) and room (`batch_pages_of`, `stages_meta`), a batch that ends unsynced recording its metadata entries;
+`src/os.rs`: the barrier's `Durability`, a metadata entry's file synced whole; `src/os_windows.rs`: `CHMOD_ACCESS` asks
+`FILE_WRITE_DATA`; `src/chmod_tests.rs` and `src/captured_tests.rs`, the tests; and, from main's clippy and literal scan
+of the same files, `src/test_store.rs`, new, the suites' one store fixture, the golden vectors' inputs as named
+constants, a named type, and two tests split under the complexity bound), `crates/vfs` (`src/host/mod.rs`: the
+barrier's and `open_to_chmod`'s documentation; `src/host/sim.rs`: a mode or bits set in place unsynced until a barrier
+names its file, `holds_unsynced_metadata`).
+- **What was there.** A-458's metadata entry set a file's mode or bits in place and reported the entry at once; the
+  only sync after it was its directory's, at the landing's end.
+- **The sources (read 2026-11-18).**
+  - fsync(2) (Linux man-pages, man7.org): fsync "also flushes the metadata information associated with the file", and
+    "does not necessarily ensure that the entry in the directory containing the file has also reached disk"; fdatasync
+    "does not flush modified metadata unless that metadata is needed in order to allow a subsequent data retrieval",
+    its examples the times and, needed, the size. A mode is not needed to read the bytes.
+  - ext4 (docs.kernel.org, `filesystems/ext4/journal` and `admin-guide/ext4`): the journal carries metadata, a
+    transaction commits within `commit=` seconds, "if you lose your power, you will lose as much as the latest 5 seconds
+    of metadata changes". Neither page says a directory's fsync commits another inode's changes.
+  - XFS (`filesystems/xfs/xfs-delayed-logging-design`): "all high level transactions are asynchronous by default",
+    durable at a log force, forces "to a specific LSN" and every checkpoint before it; nothing names a directory's
+    fsync as forcing another inode's later change.
+  - Apple's fsync(2): "causes all modified data and attributes of fildes to be moved to a permanent storage device",
+    the drive's own cache aside, which `F_FULLFSYNC` (fcntl(2)) asks it to flush.
+  - FlushFileBuffers (learn.microsoft.com): "writes all the buffered information for a specified file to the device",
+    its handle "must have the GENERIC_WRITE access right"; flushing every file of a volume asks administrative
+    privileges, which slates never holds (R10).
+  - So no platform documents a directory's sync covering a child's mode: on each, the file's own sync is the rule, and
+    nothing was left as it was.
+- **The rule.** A metadata entry is staged in A-130's batch beside the files: its fields set in place through its own
+  handle, judged again there (A-458), the handle held open and counted one page against the batch's room, the barrier
+  syncing it off the shard (A-132) — Linux `fsync`, since a temporary's `fdatasync` would not do, macOS `fsync`, Windows
+  `FlushFileBuffers` — and the entry reported and advanced only after. A set is atomic, so the file holds the old value
+  or the new one whatever happens before then; what waits is the report. A batch that ends without its barrier records
+  its metadata entries as it records its files, skipped or failed, which never advances them, so the volume keeps them
+  and the next landing judges the file again. A file the landing may not open to set its metadata fails its entry alone:
+  on Windows that is a read-only file, whose handle may not write (owed, GAPS).
+- **Tests.** Failing first on the Mac Studio (2026-11-18, kiln r433, load 5.3 to 11.1, debug), the simulated host's
+  sync model in place and the engine as it was: 3 of 35 `slates-land` lib tests failed — the new
+  `a_metadata_entry_is_synced_by_its_batchs_barrier_before_it_is_reported` (no barrier taken) and the two captured
+  clones' metadata tests (the mode left unsynced). With the fix (load 7.8 to 10.3): `cargo test --locked -p slates-land
+  --lib` 35 of 35, the writer ignored; `slates-vfs --lib -- host::sim captured` 3 of 3. Red-checked once: with the
+  barrier given the batch's temporaries alone, the same 3 failed. `cargo fmt` laid the lines out. Filed for main: the
+  crash oracle, whose metadata entries now take a barrier.
 
 ### A-485 — Every held copy follows its object's move as the install's walk reaches it, whatever its route (2026-11-18, goal 85 bug 1, g079; §4.8 "Promotion and takeover", "Authority scope", §4.10 "Ownership follows the writer"; A-291, A-398)
 Applied in the same change to: §4.8 "Promotion and takeover" (A-398's status), GAPS (the move entry's target-dies

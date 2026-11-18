@@ -43,17 +43,57 @@ const FILE_MODE: u32 = 0o100_644;
 const EXECUTABLE_MODE: u32 = 0o100_755;
 /// Shape: a directory's mode.
 const DIR_MODE: u32 = 0o040_755;
+/// Shape: a witnessed file's size on the disk.
+const WITNESSED_SIZE: u64 = 3;
+/// Shape: a witnessed file's owner (judged by an overlay's verdict, not bound by the encoding).
+const OWNER: u32 = 501;
+/// Shape: a witnessed file's group (judged, not bound, as the owner).
+const GROUP: u32 = 20;
+/// Shape: when a witness was taken (not in the encoding).
+const WITNESSED_AT: u64 = 11;
+/// Shape: the created file's identity byte and size.
+const NEW_IDENTITY: u8 = 0x11;
+/// Shape: see `NEW_IDENTITY`.
+const NEW_SIZE: u64 = 5;
+/// Shape: the replaced file's witnessed identity byte, its new identity byte and its new size.
+const LIB_WITNESSED: u8 = 0x22;
+/// Shape: see `LIB_WITNESSED`.
+const LIB_IDENTITY: u8 = 0x33;
+/// Shape: see `LIB_WITNESSED`.
+const LIB_SIZE: u64 = 7;
+/// Shape: the file whose metadata alone changes: its inode, its identity byte (its bytes are its witness's) and size.
+const RUN_INO: u64 = 5;
+/// Shape: see `RUN_INO`.
+const RUN_IDENTITY: u8 = 0x55;
+/// Shape: see `RUN_INO`.
+const RUN_SIZE: u64 = 9;
+/// Shape: the deleted file's inode and witnessed identity byte.
+const GONE_INO: u64 = 3;
+/// Shape: see `GONE_INO`.
+const GONE_WITNESSED: u8 = 0x44;
+/// Shape: the removed, the moved and the cleared directories' inodes.
+const OLD_INO: u64 = 4;
+/// Shape: see `OLD_INO`.
+const MOVED_INO: u64 = 6;
+/// Shape: see `OLD_INO`.
+const CLEARED_INO: u64 = 10;
+/// Format: `FILE_ATTRIBUTE_SYSTEM`, the bit a field test flips in a word of Windows bits.
+const FLIP_SYSTEM: u16 = 0x4;
+/// Format: the owner's execute bit, which a field test flips in a mode.
+const FLIP_OWNER_EXECUTE: u32 = 0o100;
+/// Format: the others' execute bit, which a field test flips in a mode's permission bits.
+const FLIP_OTHERS_EXECUTE: u32 = 0o1;
 
 fn fingerprint(ino: u64, mode: u32, windows: u16) -> Fingerprint {
   Fingerprint {
     dev: DEV,
     ino,
-    size: 3,
+    size: WITNESSED_SIZE,
     mtime_ns: MTIME_NS,
     ctime_ns: CTIME_NS,
     mode,
-    uid: 501,
-    gid: 20,
+    uid: OWNER,
+    gid: GROUP,
     birth_ns: BIRTH_NS,
     windows,
   }
@@ -64,7 +104,7 @@ fn witness(ino: u64, mode: u32, windows: u16, identity: u8) -> Witness {
   Witness {
     fingerprint: fingerprint(ino, mode, windows),
     identity: [identity; 32],
-    witnessed_at: 11,
+    witnessed_at: WITNESSED_AT,
     racy: false,
   }
 }
@@ -132,7 +172,7 @@ fn golden_entries(basis: Judged) -> Vec<LandingEntry> {
   const ARCHIVE: u16 = 0x20;
   let none = WindowsAttributes::default();
   let executable = FileMeta {
-    permissions: 0o755,
+    permissions: EXECUTABLE_MODE & FileMeta::PERMISSIONS,
     windows: HIDDEN | ARCHIVE,
   };
   let mut entries = vec![
@@ -140,7 +180,7 @@ fn golden_entries(basis: Judged) -> Vec<LandingEntry> {
       "/src/new.rs",
       Action::Create,
       None,
-      Some(overlay(0x11, 5, FILE_MODE)),
+      Some(overlay(NEW_IDENTITY, NEW_SIZE, FILE_MODE)),
       basis,
       bits(HIDDEN | ARCHIVE, Kind::File),
     ),
@@ -166,15 +206,15 @@ fn golden_entries(basis: Judged) -> Vec<LandingEntry> {
   match basis {
     Judged::Witness => {
       let was = FileMeta {
-        permissions: 0o644,
+        permissions: FILE_MODE & FileMeta::PERMISSIONS,
         windows: 0,
       };
       entries.extend([
         entry(
           "/src/lib.rs",
           Action::Replace,
-          Some(witness(2, FILE_MODE, ARCHIVE, 0x22)),
-          Some(overlay(0x33, 7, FILE_MODE)),
+          Some(witness(2, FILE_MODE, ARCHIVE, LIB_WITNESSED)),
+          Some(overlay(LIB_IDENTITY, LIB_SIZE, FILE_MODE)),
           basis,
           none,
         ),
@@ -184,15 +224,15 @@ fn golden_entries(basis: Judged) -> Vec<LandingEntry> {
             from: was,
             to: executable,
           },
-          Some(witness(5, FILE_MODE, 0, 0x55)),
-          Some(overlay(0x55, 9, EXECUTABLE_MODE)),
+          Some(witness(RUN_INO, FILE_MODE, 0, RUN_IDENTITY)),
+          Some(overlay(RUN_IDENTITY, RUN_SIZE, EXECUTABLE_MODE)),
           basis,
           bits(HIDDEN | ARCHIVE, Kind::File),
         ),
         entry(
           "/src/gone.rs",
           Action::Delete,
-          Some(witness(3, FILE_MODE, 0, 0x44)),
+          Some(witness(GONE_INO, FILE_MODE, 0, GONE_WITNESSED)),
           None,
           basis,
           none,
@@ -200,7 +240,7 @@ fn golden_entries(basis: Judged) -> Vec<LandingEntry> {
         entry(
           "/old",
           Action::Rmdir,
-          Some(witness(4, DIR_MODE, 0, 0)),
+          Some(witness(OLD_INO, DIR_MODE, 0, 0)),
           None,
           basis,
           none,
@@ -210,7 +250,7 @@ fn golden_entries(basis: Judged) -> Vec<LandingEntry> {
           Action::Rename {
             from: "/origin".into(),
           },
-          Some(witness(6, DIR_MODE, 0, 0)),
+          Some(witness(MOVED_INO, DIR_MODE, 0, 0)),
           None,
           basis,
           none,
@@ -218,7 +258,7 @@ fn golden_entries(basis: Judged) -> Vec<LandingEntry> {
         entry(
           "/cleared",
           Action::Clear,
-          Some(witness(10, DIR_MODE, 0, 0)),
+          Some(witness(CLEARED_INO, DIR_MODE, 0, 0)),
           Some(made_directory()),
           basis,
           none,
@@ -228,15 +268,15 @@ fn golden_entries(basis: Judged) -> Vec<LandingEntry> {
     // A captured clone's manifest makes no clear and no rename (A-291): a moved directory is its paths removed and made.
     Judged::Content => {
       let was = FileMeta {
-        permissions: 0o644,
+        permissions: FILE_MODE & FileMeta::PERMISSIONS,
         windows: ARCHIVE,
       };
       entries.extend([
         entry(
           "/src/lib.rs",
           Action::Replace,
-          Some(content_witness(0x22, was)),
-          Some(overlay(0x33, 7, FILE_MODE)),
+          Some(content_witness(LIB_WITNESSED, was)),
+          Some(overlay(LIB_IDENTITY, LIB_SIZE, FILE_MODE)),
           basis,
           bits(ARCHIVE, Kind::File),
         ),
@@ -246,15 +286,15 @@ fn golden_entries(basis: Judged) -> Vec<LandingEntry> {
             from: was,
             to: executable,
           },
-          Some(content_witness(0x55, was)),
-          Some(overlay(0x55, 9, EXECUTABLE_MODE)),
+          Some(content_witness(RUN_IDENTITY, was)),
+          Some(overlay(RUN_IDENTITY, RUN_SIZE, EXECUTABLE_MODE)),
           basis,
           bits(HIDDEN | ARCHIVE, Kind::File),
         ),
         entry(
           "/src/gone.rs",
           Action::Delete,
-          Some(content_witness(0x44, FileMeta::default())),
+          Some(content_witness(GONE_WITNESSED, FileMeta::default())),
           None,
           basis,
           none,
@@ -417,11 +457,11 @@ fn common_changes() -> [(&'static str, Change); 11] {
   [
     ("path", |e| e.path = format!("{}x", e.path).into()),
     ("windows bits", |e| {
-      e.windows = WindowsAttributes::kept(u32::from(e.windows.bits() ^ 0x4), Kind::Dir);
+      e.windows = WindowsAttributes::kept(u32::from(e.windows.bits() ^ FLIP_SYSTEM), Kind::Dir);
     }),
     ("witness mode", |e| {
       if let Some(w) = e.witnessed.as_mut() {
-        w.fingerprint.mode ^= 0o100;
+        w.fingerprint.mode ^= FLIP_OWNER_EXECUTE;
       }
     }),
     ("witness identity", |e| {
@@ -441,7 +481,7 @@ fn common_changes() -> [(&'static str, Change); 11] {
     }),
     ("volume's mode", |e| {
       if let Some(o) = e.overlay.as_mut() {
-        o.mode ^= 0o100;
+        o.mode ^= FLIP_OWNER_EXECUTE;
       }
     }),
     ("volume's mtime", |e| {
@@ -456,12 +496,12 @@ fn common_changes() -> [(&'static str, Change); 11] {
     }),
     ("metadata entry's base", |e| {
       if let Action::Chmod { from, .. } = &mut e.action {
-        from.windows ^= 0x4;
+        from.windows ^= FLIP_SYSTEM;
       }
     }),
     ("metadata entry's target", |e| {
       if let Action::Chmod { to, .. } = &mut e.action {
-        to.permissions ^= 0o1;
+        to.permissions ^= FLIP_OTHERS_EXECUTE;
       }
     }),
   ]

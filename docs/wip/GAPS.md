@@ -2750,7 +2750,10 @@
 > `fleet` binary exited 4 on a wedge verdict that came 146 s past its window (g231 on a 15-CPU Mac at load 62 to 131,
 > 0.2 to 1 GB free; one poll measured 160,662 ms): the whole process had gone unscheduled, the watchdog's thread with
 > it, and the look after its gap judged every shard still for the gap. A look a window or more after the watchdog's
-> last now starts each shard's still time again (`a_gap_in_the_watchdogs_own_looks_is_not_counted_as_a_wedge`). Open
+> last now starts each shard's still time again (`a_gap_in_the_watchdogs_own_looks_is_not_counted_as_a_wedge`); since
+> A-474 only a gap past the window and the watcher's own lateness p99 (capped at A-455's ceiling) does, since one its own
+> lateness explains is no unwatched span, and a watcher whose every look ran a window late never judged a wedged shard
+> (`a_shard_is_judged_wedged_though_the_watchers_own_looks_run_a_window_late`). Open
 > then, closed 2026-11-18 by A-336 (the entry below): a shard held in the kernel past a watched window (a page-in at that
 > pressure) was still judged wedged; telling `D` and XNU's uninterruptible wait from a sleep was the owed decision.
 > Also from the same report, a test's
@@ -3334,6 +3337,15 @@
 > (`a_holder_lets_go_of_the_records_and_inputs_its_checkpoint_stands_for`), so a replica's records and inputs are bounded
 > by the versions its owner has not yet committed. A-238's owed "the holders' replicas and records grow per version" is
 > closed by A-385 and A-404.
+>
+> **Fixed 2026-11-18 (g083, A-476): a takeover successor's chain lacked the versions its checkpoint stood for.** A
+> successor that had let go of its ledger's positions below its held checkpoint (A-404) named its adopted versions by
+> the ledger alone, so its chain began after them (`a_successor_two_versions_behind_adopts_the_versions_between_and_serves_the_green`,
+> 2 of 4 runs on Linux, at and before A-273). The versions through its adoption are now named by the ledger where it
+> holds the position and by the checkpoint's record of what it accepted where it let go of it
+> (`merge_origin::ledger_identities`; test `a_successors_chain_names_the_versions_its_checkpoint_stands_for`). Its
+> engine, its rebuild and its durable state were right throughout. Record:
+> `docs/bugs/2026-11-18-a-successors-chain-lacked-the-versions-its-checkpoint-stood-for.md`.
 >
 > **Fixed 2026-11-18 (g232, A-385): a holder's replica of a green kept every version's values.** An owner folds its
 > green's histories to its per-green budget, never past a live reader's version; a holder's replica, the engine it
@@ -18847,6 +18859,14 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   path holds, but which a lossless layout (four-byte lengths, layouts 6 and 7) or a refusal at the plan would close; and
   an overlay's witness's owner, birth time and Windows bits are judged, its verdict comparing whole fingerprints, and not
   bound, the encoding holding the device, inode, size, times and mode alone); and
+  a landed mode or bits change's durability, **built by A-472 the same day** (a metadata entry synced through its file's
+  own handle in its batch's barrier before it is reported: Linux `fsync`, macOS `fsync`, Windows `FlushFileBuffers`, each
+  as its documentation states; no source says a directory's sync covers another inode's metadata; its unit tests ran on
+  the Mac Studio, the crash oracle's rerun filed for main; still owed with it: on Windows a file read-only when its
+  metadata entry opens it fails that entry alone, since `FlushFileBuffers` needs a handle that may write and NTFS refuses
+  one to a read-only file, where a clear of the bit before the flush's open, or a measured rule, would land it; and a made
+  directory's mode, given after `mkdirat` and synced with the directory's parent alone, has the same question, unasked
+  until now); and
   the seam's numbering: refusals the engine tells apart are POSIX numbers and the rest Win32 codes, so a Win32 code equal
   to one of the engine's numbers (`ERROR_NOT_SAME_DEVICE` 17, `ERROR_INSUFFICIENT_BUFFER` 122, among five) would read as
   that refusal; none of the writer's calls is known to answer one, and a typed refusal at the seam would close it.

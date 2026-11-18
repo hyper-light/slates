@@ -31,7 +31,7 @@ use slates_server::DaemonConfig;
 use slates_server::daemon::{HEARTBEAT_NS, LIVENESS_BUDGET_NS};
 #[cfg(test)]
 use slates_server::watchdog::Want;
-use slates_server::watchdog::{Look, ShardWatch, Verdict};
+use slates_server::watchdog::{LATENESS_SAMPLES, Look, ShardWatch, Verdict};
 use slates_vfs::clock::{Clock, HostClock};
 
 use super::daemon::{measure, segment_name};
@@ -406,23 +406,24 @@ fn judge_start(
   supervisor: &Supervisor,
   watch: &mut ShardWatch,
   (now, beat_ns): (u64, u64),
-  window_ns: u64,
+  (window_ns, watcher_late_ns): (u64, u64),
 ) -> Verdict {
   judge_start_of(
     supervisor.child_pid(),
     watch,
     (now, beat_ns, slates_machine::memory_stall::read()),
-    window_ns,
+    (window_ns, watcher_late_ns),
   )
 }
 
 /// [`judge_start`] for the process `pid` names, at the anchor's clock `now`, its beat word `beat_ns`, and the host's
-/// memory stall at this look `memory` (`slates_machine::memory_stall::read`), over the window `window_ns`.
+/// memory stall at this look `memory` (`slates_machine::memory_stall::read`), over the window `window_ns`, by an anchor
+/// whose own looks run `watcher_late_ns` late at their p99 ([`Lateness::p99_ns`], A-474).
 fn judge_start_of(
   pid: Option<u32>,
   watch: &mut ShardWatch,
   (now, beat_ns, memory): (u64, u64, Option<slates_machine::memory_stall::StallReading>),
-  window_ns: u64,
+  (window_ns, watcher_late_ns): (u64, u64),
 ) -> Verdict {
   // The spinning rule is a thread's: a window of CPU on one thread without a step, so the CPU judged is the busiest
   // thread's. The process's sum is no such reading: a start whose shards begin in parallel sums past a window while no
@@ -439,7 +440,7 @@ fn judge_start_of(
   judge_start_by(
     watch,
     (now, memory, beat_ns),
-    (window_ns, start_spin_window_ns(window_ns)),
+    (window_ns, start_spin_window_ns(window_ns), watcher_late_ns),
     clock,
     || pid.and_then(slates_rt::process_run_reading),
   )
@@ -468,11 +469,13 @@ fn start_spin_window_ns(window_ns: u64) -> u64 {
 /// The daemon's beat word `beat_ns` is the start's step (A-312, a beat after each unit of its work, A-461): a start that
 /// beats is alive at that look and its CPU without a beat is counted from it, so a start is judged by its silence since
 /// its last beat, however long it has run in all. The silence is judged against `window_ns` and the busiest thread's CPU
-/// without a beat against `spin_window_ns` ([`start_spin_window_ns`]).
+/// without a beat against `spin_window_ns` ([`start_spin_window_ns`]). A gap in the anchor's own looks counts as a span
+/// it did not watch only past the window and its own lateness p99, `watcher_late_ns` (A-474,
+/// `slates_server::watchdog::slept_past_ns`), never for its own late looks.
 fn judge_start_by(
   watch: &mut ShardWatch,
   (now, memory, beat_ns): (u64, Option<slates_machine::memory_stall::StallReading>, u64),
-  (window_ns, spin_window_ns): (u64, u64),
+  (window_ns, spin_window_ns, watcher_late_ns): (u64, u64, u64),
   mut clock: impl FnMut() -> Option<(u64, u64)>,
   scheduler: impl FnOnce() -> Option<slates_rt::RunReading>,
 ) -> Verdict {
@@ -491,6 +494,7 @@ fn judge_start_by(
     run,
     memory,
     now_ns: now,
+    watcher_late_ns,
   };
   let (verdict, next) = watch.judge(look, window_ns, spin_window_ns);
   *watch = next;
@@ -556,7 +560,7 @@ fn on_lapse(
       pid,
       &mut quiet.watch,
       (now, seen.heartbeat_ns, slates_machine::memory_stall::read()),
-      window,
+      (window, lateness.p99_ns()),
     )
   }) {
     Lapse::Withheld => {
@@ -771,7 +775,12 @@ fn observe(
           }
           Some(since) if !kill_sent => {
             if let Some(said) = start_stuck(
-              judge_start(supervisor, &mut start_watch, (now, heartbeat_ns), window),
+              judge_start(
+                supervisor,
+                &mut start_watch,
+                (now, heartbeat_ns),
+                (window, lateness.p99_ns()),
+              ),
               window,
             ) {
               slates_machine::log_line!(
@@ -856,21 +865,15 @@ fn observe(
 /// Format: nanoseconds in a millisecond, for the anchor's log lines.
 const NS_PER_MS: u64 = 1_000_000;
 
-/// Shape: the anchor's own lateness samples kept (A-228): a hundred, the fewest whose nearest-rank p99 is a single
-/// reading, as the fleet's put-latency window keeps (`slates_server::fleet`, `PUT_LATENCY_SEALS`).
-const LATENESS_SAMPLES: usize = 100;
-/// Format: the percentile the anchor's lateness is read at, and the hundred it is out of (the p99).
-const LATENESS_PERCENTILE: usize = 99;
-const PERCENT: usize = 100;
-
 /// How late the anchor's own timed waits come back (§4.14, A-228): for each of its last [`LATENESS_SAMPLES`] waits that
-/// ran its whole pause, how much longer than the pause it took. A machine busy enough to starve the daemon's watchdog
+/// ran its whole pause, how much longer than the pause it took (`slates_server::watchdog::LatenessTail`, the readings
+/// the daemon's watchdog keeps of its own looks too, A-474). A machine busy enough to starve the daemon's watchdog
 /// starves the anchor too, so the anchor holds the daemon's beat to the liveness window plus what its own clock shows of
 /// the machine's lateness, never to a fixed second. A wait that ended early (an exit, a hold, a signal) says nothing of
-/// lateness and is not kept. Bounded: the oldest sample leaves as the newest comes.
+/// lateness and is not kept.
 #[derive(Debug, Default)]
 struct Lateness {
-  samples: std::collections::VecDeque<u64>,
+  tail: slates_server::watchdog::LatenessTail,
 }
 
 impl Lateness {
@@ -879,27 +882,17 @@ impl Lateness {
     if took_ns < asked_ns {
       return;
     }
-    if self.samples.len() >= LATENESS_SAMPLES {
-      self.samples.pop_front();
-    }
-    self.samples.push_back(took_ns.saturating_sub(asked_ns));
+    self.tail.record(took_ns.saturating_sub(asked_ns));
   }
 
   /// The p99 of the kept samples (nearest rank), zero before any.
   fn p99_ns(&self) -> u64 {
-    let mut sorted: Vec<u64> = self.samples.iter().copied().collect();
-    sorted.sort_unstable();
-    let last = sorted.len().saturating_sub(1);
-    let rank = last
-      .saturating_mul(LATENESS_PERCENTILE)
-      .checked_div(PERCENT)
-      .unwrap_or(0);
-    sorted.get(rank).copied().unwrap_or(0)
+    self.tail.p99_ns()
   }
 
   /// How many samples are kept.
   fn len(&self) -> usize {
-    self.samples.len()
+    self.tail.len()
   }
 
   /// Derived: the age past which a daemon's beat is lapsed: the liveness window plus the anchor's measured lateness p99
@@ -1008,7 +1001,7 @@ mod lapse_tests {
         let verdict = judge_start_by(
           watch,
           (look * HEARTBEAT_NS, None, 0),
-          (LIVENESS_BUDGET_NS, LIVENESS_BUDGET_NS),
+          (LIVENESS_BUDGET_NS, LIVENESS_BUDGET_NS, 0),
           || Some((10, 10)),
           blocked,
         );
@@ -1026,7 +1019,7 @@ mod lapse_tests {
     let verdict = judge_start_by(
       &mut moved,
       (ends, None, 0),
-      (LIVENESS_BUDGET_NS, LIVENESS_BUDGET_NS),
+      (LIVENESS_BUDGET_NS, LIVENESS_BUDGET_NS, 0),
       || reads.next().flatten(),
       blocked,
     );
@@ -1040,7 +1033,7 @@ mod lapse_tests {
     let verdict = judge_start_by(
       &mut still,
       (ends, None, 0),
-      (LIVENESS_BUDGET_NS, LIVENESS_BUDGET_NS),
+      (LIVENESS_BUDGET_NS, LIVENESS_BUDGET_NS, 0),
       || Some((10, 10)),
       blocked,
     );
@@ -1076,7 +1069,7 @@ mod lapse_tests {
           judge_start_by(
             &mut watch,
             (look * HEARTBEAT_NS, None, 0),
-            (LIVENESS_BUDGET_NS, LIVENESS_BUDGET_NS),
+            (LIVENESS_BUDGET_NS, LIVENESS_BUDGET_NS, 0),
             || Some((10, 10)),
             reading(state),
           )
@@ -1128,7 +1121,7 @@ mod lapse_tests {
       let verdict = judge_start_by(
         &mut watch,
         (cpu, None, 0),
-        (LIVENESS_BUDGET_NS, spin_window),
+        (LIVENESS_BUDGET_NS, spin_window, 0),
         || Some((cpu, cpu)),
         runnable,
       );
@@ -1188,7 +1181,7 @@ mod lapse_tests {
       let verdict = judge_start_by(
         &mut watch,
         (now, None, beat_ns),
-        (window, window),
+        (window, window, 0),
         || Some((10, 10)),
         asleep,
       );
@@ -1232,7 +1225,7 @@ mod lapse_tests {
         match judge_start_by(
           &mut watch,
           (look * HEARTBEAT_NS, None, 0),
-          (window, window),
+          (window, window, 0),
           || Some((10, 10)),
           asleep,
         ) {
@@ -1415,7 +1408,7 @@ mod lapse_tests {
       judged.largest_gap = judged.largest_gap.max(last_look.elapsed());
       last_look = std::time::Instant::now();
       let now = u64::try_from(base.elapsed().as_nanos()).unwrap_or(u64::MAX);
-      let verdict = judge_start_of(Some(pid), watch, (now, 0, memory), LIVENESS_BUDGET_NS);
+      let verdict = judge_start_of(Some(pid), watch, (now, 0, memory), (LIVENESS_BUDGET_NS, 0));
       judged.verdicts.push(verdict);
       if start_stuck(verdict, LIVENESS_BUDGET_NS).is_some() {
         judged.stuck_at = Some(from.elapsed());
@@ -1845,7 +1838,12 @@ mod tests {
       {
         wait(LOOK);
         let now = u64::try_from(watched.elapsed().as_nanos()).unwrap();
-        let verdict = judge_start_of(Some(pid), &mut watch, (now, 0, None), LIVENESS_BUDGET_NS);
+        let verdict = judge_start_of(
+          Some(pid),
+          &mut watch,
+          (now, 0, None),
+          (LIVENESS_BUDGET_NS, 0),
+        );
         if matches!(verdict, Verdict::Starved { .. }) {
           starved_looks += 1;
         }
