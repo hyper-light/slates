@@ -54,8 +54,8 @@ fn file(n: usize) -> String {
 
 /// §4.4, A-267. Do: overlay a host directory of 600 files, pin them all, change every file on disk, and ask the
 /// volume's status until the drift is seen; then read the drift in pages. Expect: the status answers (one reply), the
-/// drifted entries it carries plus the count it elides make 600, and the paged read holds all 600 once each, the
-/// status's entries its first. Before 2026-11-08 the status was refused
+/// drifted entries it carries plus the count it elides make 600, and the paged read holds all 600 once each, every
+/// entry the status carried among them. Before 2026-11-08 the status was refused
 /// `BadRequest { reason: "reply too large for the bulk area" }`.
 #[test]
 fn a_volume_with_more_drift_than_one_reply_holds_still_answers_its_status() {
@@ -104,8 +104,8 @@ fn a_volume_with_more_drift_than_one_reply_holds_still_answers_its_status() {
   daemon.stop();
 }
 
-/// The paged drift read of `volume` holds every drifted file once, typed, and `carried` (the status's text entries) names
-/// its first entries.
+/// The paged drift read of `volume` holds every drifted file once, typed, and every entry `carried` (the status's text
+/// entries) names is among them.
 fn the_paged_read_holds_every_entry(
   client: &mut slates_client::Client,
   volume: slates_client::VolumeId,
@@ -131,11 +131,13 @@ fn the_paged_read_holds_every_entry(
       file(n)
     );
   }
+  let read: std::collections::BTreeSet<String> = whole
+    .drifted
+    .iter()
+    .map(|entry| format!("{} ({:?})", entry.path, entry.kind))
+    .collect();
   assert!(
-    carried
-      .iter()
-      .zip(&whole.drifted)
-      .all(|(carried, read)| *carried == format!("{} ({:?})", read.path, read.kind)),
-    "the status carries the first entries of the full list"
+    carried.iter().all(|carried| read.contains(carried)),
+    "every entry the status carries is in the full list"
   );
 }

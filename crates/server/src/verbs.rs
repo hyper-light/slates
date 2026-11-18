@@ -4426,7 +4426,7 @@ fn dispatch_inner(
     RequestBody::Resize { volume, size } => resize(state, principal, volume, size),
     RequestBody::Destroy { volume } => destroy(state, principal, volume),
     RequestBody::Status { volume } => status(state, principal, volume),
-    RequestBody::Drifted { volume, from } => drifted(state, principal, volume, from),
+    RequestBody::Drifted { volume, after } => drifted(state, principal, volume, after),
     RequestBody::Conflicts {
       work,
       verdict,
@@ -10110,6 +10110,22 @@ enum DriftItem {
 }
 
 impl DriftItem {
+  /// An entry of a page the volume core read ([`slates_vfs::base::DriftPageEntry`]).
+  fn of_page(entry: slates_vfs::base::DriftPageEntry) -> DriftItem {
+    match entry {
+      slates_vfs::base::DriftPageEntry::Drifted { path, kind } => {
+        DriftItem::Drifted(slates_ipc::protocol::DriftEntry {
+          path,
+          kind: wire_drift_kind(kind),
+        })
+      }
+      slates_vfs::base::DriftPageEntry::Unverified { path, refusal } => DriftItem::Unverified {
+        path,
+        refusal: format!("{refusal}"),
+      },
+    }
+  }
+
   /// The entry's path.
   fn path(&self) -> &str {
     match self {
@@ -10160,9 +10176,20 @@ struct DriftRead {
   refused: Option<slates_vfs::VfsError>,
 }
 
+/// A drift's kind as the wire carries it.
+fn wire_drift_kind(kind: slates_vfs::base::DriftKind) -> slates_ipc::protocol::DriftKind {
+  use slates_ipc::protocol::DriftKind;
+  match kind {
+    slates_vfs::base::DriftKind::Modified => DriftKind::Modified,
+    slates_vfs::base::DriftKind::Deleted => DriftKind::Deleted,
+    slates_vfs::base::DriftKind::Replaced => DriftKind::Replaced,
+    slates_vfs::base::DriftKind::TypeChanged => DriftKind::TypeChanged,
+  }
+}
+
 /// Reads an overlay volume's base once, re-checking every witnessed entry ([`DriftRead`]).
 fn drift_entries(slot: &mut VolumeSlot, store: &mut slates_vfs::volume::Store) -> DriftRead {
-  use slates_ipc::protocol::{BaseReport, DriftEntry, DriftKind, WatcherState};
+  use slates_ipc::protocol::{BaseReport, DriftEntry, WatcherState};
   let Some(host) = slot.host.as_mut() else {
     return DriftRead {
       items: Vec::new(),
@@ -10179,12 +10206,7 @@ fn drift_entries(slot: &mut VolumeSlot, store: &mut slates_vfs::volume::Store) -
         .map(|(path, kind)| {
           DriftItem::Drifted(DriftEntry {
             path: path.clone(),
-            kind: match kind {
-              slates_vfs::base::DriftKind::Modified => DriftKind::Modified,
-              slates_vfs::base::DriftKind::Deleted => DriftKind::Deleted,
-              slates_vfs::base::DriftKind::Replaced => DriftKind::Replaced,
-              slates_vfs::base::DriftKind::TypeChanged => DriftKind::TypeChanged,
-            },
+            kind: wire_drift_kind(*kind),
           })
         })
         .chain(
@@ -10222,14 +10244,18 @@ fn drift_entries(slot: &mut VolumeSlot, store: &mut slates_vfs::volume::Store) -
   }
 }
 
-/// `Drifted`: one page of the volume's drift from position `from` (A-267), typed as a status's `base` types it, as many
-/// entries as one reply chunk holds. An entry too long for any page alone is passed over and counted; a base that
-/// cannot be read now is refused as the volume core refused it.
+/// `Drifted`: one page of the volume's drift past inode `after` (A-267), typed as a status's `base` types it: the volume
+/// core visits, in inode order, the inodes a status would list, re-checking the witnessed ones now
+/// ([`slates_vfs::base::Overlay::drift_page`]), until a reply chunk's worth is found or the page has spent its slice of
+/// the shard's step ([`DRIFT_SLICE_PERMILLE`]). So a walk re-checks each witnessed entry once and a page never holds the
+/// shard longer than its slice; reading the whole status a page re-checked every entry once a page. An inode's entries
+/// go on one page together; an entry too long for any page alone is passed over and counted. A base that cannot be
+/// read now is refused as the volume core refused it.
 fn drifted(
   state: &mut ShardState,
   principal: &Principal,
   volume: VolumeId,
-  from: u64,
+  after: Option<u64>,
 ) -> ReplyBody {
   let (handle, record) = match find(state, volume) {
     Ok(x) => x,
@@ -10238,20 +10264,52 @@ fn drifted(
   if !rights_of(&record, principal).read {
     return forbidden("drifted");
   }
-  let Ok(slot) = state.volumes.get_mut(handle) else {
-    return refused(Refusal::NotFound);
-  };
-  let read = drift_entries(slot, &mut state.store);
-  if let Some(refusal) = read.refused {
-    return refused(refusal_of_vfs(&refusal));
-  }
   let room = reply_room(&ReplyBody::Drifted {
     drifted: Vec::new(),
     unverified: Vec::new(),
     next: Some(u64::MAX),
     oversized: u32::MAX,
   });
-  let start = usize::try_from(from).unwrap_or(usize::MAX);
+  let slice = state
+    .config
+    .step_quantum_ns()
+    .saturating_mul(DRIFT_SLICE_PERMILLE)
+    / PERMILLE;
+  let ShardState { volumes, store, .. } = state;
+  let Ok(slot) = volumes.get_mut(handle) else {
+    return refused(Refusal::NotFound);
+  };
+  let Some(host) = slot.host.as_mut() else {
+    // A volume with no base has no drift.
+    return ReplyBody::Drifted {
+      drifted: Vec::new(),
+      unverified: Vec::new(),
+      next: None,
+      oversized: 0,
+    };
+  };
+  let started = slates_rt::futures::now_ns();
+  let mut spent = || slates_rt::futures::now_ns().saturating_sub(started) >= slice;
+  let read = match slot.volume.with_host(host).drift_page(
+    store,
+    after.map(slates_vfs::ids::InodeNo),
+    drift_batch(room),
+    &mut spent,
+  ) {
+    Ok(read) => read,
+    Err(e) => return refused(refusal_of_vfs(&e)),
+  };
+  drift_page_reply(read, after, room)
+}
+
+/// A page of drift as one reply carries it: whole inodes in order while they fit `room`, an entry too long for any page
+/// alone passed over and counted, and the inode the next page starts after. A page always takes its first inode (as
+/// much of it as fits), so a walk moves.
+fn drift_page_reply(
+  read: slates_vfs::base::DriftPageRead,
+  after: Option<u64>,
+  room: usize,
+) -> ReplyBody {
   let mut base = Some(slates_ipc::protocol::BaseReport::Read {
     drifted: Vec::new(),
     unverified: Vec::new(),
@@ -10259,22 +10317,37 @@ fn drifted(
   });
   let mut used = 0usize;
   let mut oversized = 0u32;
-  let mut position = start;
-  for item in read.items.iter().skip(start) {
-    let bytes = item.typed_len();
-    if bytes > room {
-      oversized = oversized.saturating_add(1);
-      position = position.saturating_add(1);
-      continue;
-    }
-    if used.saturating_add(bytes) > room {
+  let mut cursor = after;
+  let mut taken_any = false;
+  let mut stopped_short = false;
+  for (no, found) in read.entries {
+    let items: Vec<DriftItem> = found.into_iter().map(DriftItem::of_page).collect();
+    let (sendable, too_long): (Vec<DriftItem>, Vec<DriftItem>) =
+      items.into_iter().partition(|item| item.typed_len() <= room);
+    let bytes: usize = sendable.iter().map(DriftItem::typed_len).sum();
+    if taken_any && used.saturating_add(bytes) > room {
+      stopped_short = true;
       break;
     }
-    used = used.saturating_add(bytes);
-    item.push_into(&mut base);
-    position = position.saturating_add(1);
+    oversized = oversized.saturating_add(u32::try_from(too_long.len()).unwrap_or(u32::MAX));
+    for item in sendable {
+      let len = item.typed_len();
+      if used.saturating_add(len) > room {
+        // Only the page's first inode can come here (two long entries of one inode): the rest of it is counted.
+        oversized = oversized.saturating_add(1);
+        continue;
+      }
+      used = used.saturating_add(len);
+      item.push_into(&mut base);
+    }
+    taken_any = true;
+    cursor = Some(no.0);
   }
-  let next = (position < read.items.len()).then(|| u64::try_from(position).unwrap_or(u64::MAX));
+  let next = if stopped_short {
+    cursor
+  } else {
+    read.next.map(|no| no.0)
+  };
   let (drifted, unverified) = match base {
     Some(slates_ipc::protocol::BaseReport::Read {
       drifted,
@@ -10289,6 +10362,21 @@ fn drifted(
     next,
     oversized,
   }
+}
+
+/// Shape: a `Drifted` page's slice of the shard's step budget, parts per thousand: half, as a `changed_since` page's
+/// and a destroy slice's, so one page never takes the whole step from the shard's other clients (§4.3). A re-check is a
+/// host's open, `fstat` and close, tens of microseconds, so the page looks at the clock after each.
+const DRIFT_SLICE_PERMILLE: u64 = 500;
+
+/// Derived: the inodes one drift page asks the volume core for: as many drifted entries as a page could hold at the
+/// smallest an entry encodes to (an empty path), so one visit fills a page.
+fn drift_batch(room: usize) -> usize {
+  let smallest = encoded_len(&slates_ipc::protocol::DriftEntry {
+    path: String::new(),
+    kind: slates_ipc::protocol::DriftKind::Modified,
+  });
+  room.checked_div(smallest).unwrap_or(1).max(1)
 }
 
 /// A volume's journal for its status (§4.5): its budget and retention, and what its consuming rounds found waiting.

@@ -8,8 +8,8 @@
 //! **What a walk promises.** Each list's order is a key that never changes for its items: a volume's id, a grant's id,
 //! a record's sequence, a green version and the paths it changed. A page continues past the last key the previous page
 //! held, so an item that stands for the whole walk is answered exactly once however the list changes meanwhile; one
-//! made or removed during the walk may or may not be. An overlay's drift continues from a position, as a directory
-//! listing does, so a drift that changes between pages may repeat or skip an entry. A page whose cursor would not move
+//! made or removed during the walk may or may not be. An overlay's drift continues past an inode, so an entry drifted
+//! for the whole walk is answered once too. A page whose cursor would not move
 //! the walk forward is refused [`Error::Protocol`] ([`crate::ProtocolFault::UnexpectedReply`], a fault in slates), so a
 //! walk always ends.
 //!
@@ -96,14 +96,15 @@ impl Instance {
       .map_err(|e| self.fail(e, Some(Missing::Volume(green))))
   }
 
-  /// One page of an overlay's drift (§4.15 "Drift", A-267) from position `from` (0 begins), typed as a status types
-  /// it, with the position the next page is read from. A status carries the first drifted entries that fit beside its
-  /// other fields and counts the rest ([`crate::DriftReport::elided`]); this reads them all. Each page re-checks the
-  /// witnessed entries against the disk, as a status does.
-  pub fn drift_page(&mut self, volume: VolumeId, from: u64) -> Result<DriftPage, Error> {
+  /// One page of an overlay's drift (§4.15 "Drift", A-267) past inode `after` (`None` begins), typed as a status types
+  /// it, in inode order, with the inode the next page starts after. A status carries the first drifted entries that fit
+  /// beside its other fields and counts the rest ([`crate::DriftReport::elided`]); this reads them all. A page
+  /// re-checks the witnessed entries it passes against the disk, as a status re-checks them all, so a walk re-checks
+  /// each once; a page may hold no entry and still carry a cursor.
+  pub fn drift_page(&mut self, volume: VolumeId, after: Option<u64>) -> Result<DriftPage, Error> {
     let page = self
       .client
-      .drifted_page(volume, from)
+      .drifted_page(volume, after)
       .map_err(|e| self.fail(e, Some(Missing::Volume(volume))))?;
     Ok(drift_page_of(page))
   }

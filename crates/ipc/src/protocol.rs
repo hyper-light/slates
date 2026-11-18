@@ -936,16 +936,16 @@ pub enum RequestBody {
     /// The keyed hash under the issuer secret.
     proof: [u8; 32],
   },
-  /// One page of an overlay volume's drifted entries (§4.4 `status`, A-267): every witnessed entry whose disk no longer
-  /// matches its witness, and every one whose re-check the host refused, in path order from position `from`. A
-  /// status carries the first that fit; this reads them all. A position, not a path, continues it, so a long path never
-  /// rides in a request; a drift that changes between pages may repeat or skip an entry, as a directory listing may.
-  /// A read; never recorded. Appended.
+  /// One page of an overlay volume's drift (§4.4 `status`, A-267): the entries a status lists — every witnessed entry
+  /// whose disk no longer matches its witness, and every one whose re-check the host refuses now — in inode order past
+  /// `after`, re-checked now as a status re-checks them, as many as one reply chunk holds and its slice of the shard's
+  /// step allows. A walk of the pages re-checks each witnessed entry once, and an entry drifted for the whole walk is
+  /// answered once. A status carries the first that fit; this reads them all. A read; never recorded. Appended.
   Drifted {
     /// The overlay volume.
     volume: VolumeId,
-    /// The position to read from: 0 to begin, else the previous page's `next`.
-    from: u64,
+    /// The inode the previous page ended at, or `None` for the first page.
+    after: Option<u64>,
   },
   /// One page of a work's last conflicting verdict (§4.16, A-267): the windows of the submit's or the rebase's verdict
   /// `verdict` named, from position `from`, as many as one reply chunk holds. The work keeps the verdict until its next
@@ -4002,11 +4002,12 @@ pub enum ReplyBody {
   },
   /// One page of a volume's drifted entries (`Drifted`), typed as a status's `base` types them. Appended.
   Drifted {
-    /// This page's entries the disk changed after the volume witnessed them, in path order.
+    /// This page's entries the disk changed after the volume witnessed them, in inode order.
     drifted: Vec<DriftEntry>,
-    /// This page's entries whose re-check the host refused now, by path, in path order.
+    /// This page's entries whose re-check the host refused now, by path, in inode order.
     unverified: Vec<String>,
-    /// The position the next page reads from, or `None` when this page ends the list.
+    /// The inode the next page starts after, or `None` when this page ends the walk. A page may hold no entry and
+    /// still carry one: it spent its slice of the shard's step re-checking entries that had not drifted.
     next: Option<u64>,
     /// Entries in this page's range too long for any page alone (a host path near Linux's `PATH_MAX`), passed over
     /// and counted, never sent as a reply no chunk holds.

@@ -169,6 +169,35 @@ pub struct BaseRange {
   pub stamp: u64,
 }
 
+/// One entry of a page of an overlay's drift ([`Overlay::drift_page`]; §4.4 `status`, A-267): as `status` lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DriftPageEntry {
+  /// A witnessed entry whose disk no longer matches its witness, as recorded.
+  Drifted {
+    /// The entry, by path.
+    path: String,
+    /// What the disk did to it.
+    kind: DriftKind,
+  },
+  /// A witnessed entry whose re-check the host refused now: not known to match.
+  Unverified {
+    /// The entry, by path.
+    path: String,
+    /// The host's refusal.
+    refusal: VfsError,
+  },
+}
+
+/// A page of an overlay's drift ([`Overlay::drift_page`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DriftPageRead {
+  /// The inodes found drifted or unverified, in inode order, each with its entries as `status` lists them: an entry
+  /// recorded drifted whose re-check the host refuses now is in both of `status`'s lists, so it is both here.
+  pub entries: Vec<(InodeNo, Vec<DriftPageEntry>)>,
+  /// The last inode the page visited, when inodes remain past it to visit; `None` once the walk is done.
+  pub next: Option<InodeNo>,
+}
+
 /// What `status` reports for an overlay volume.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BaseStatus {
@@ -3241,6 +3270,104 @@ impl Overlay<'_> {
       }
     }
     Ok(())
+  }
+
+  /// One page of `status`'s drift (§4.4, A-267): visits, in inode order past `after`, every inode `status` would list —
+  /// those witnessed, re-checked now as `status` re-checks them, and those with drift recorded — and answers the ones
+  /// found drifted or unverified, until `limit` are found or `spent` says the page's slice of the shard's step is used.
+  /// It always visits one inode before it asks, so a walk moves. Where inodes remain, the page names the last it
+  /// visited, which the next page starts after. A walk of the pages re-checks each witnessed entry once; reading the
+  /// whole status each page re-checked every entry once a page and held the shard for all of them each time.
+  /// The watcher's hints are `status`'s to take: a walk follows a status.
+  pub fn drift_page(
+    &mut self,
+    store: &mut Store,
+    after: Option<InodeNo>,
+    limit: usize,
+    spent: &mut dyn FnMut() -> bool,
+  ) -> Result<DriftPageRead, VfsError> {
+    if self.vol.base.is_none() {
+      return Err(VfsError::NotOverlay);
+    }
+    let mut entries = Vec::new();
+    let mut cursor = after;
+    loop {
+      let Some(no) = self.next_drift_candidate(cursor) else {
+        return Ok(DriftPageRead {
+          entries,
+          next: None,
+        });
+      };
+      cursor = Some(no);
+      let mut found = Vec::new();
+      if self
+        .vol
+        .base
+        .as_ref()
+        .is_some_and(|b| b.witness(no).is_some())
+      {
+        match self.check_drift(store, no) {
+          // Drift found is recorded by the check itself and listed below.
+          Ok(()) | Err(VfsError::BaseDrift) => {}
+          Err(refusal) => found.push(DriftPageEntry::Unverified {
+            path: self.path_or_inode(store, no),
+            refusal,
+          }),
+        }
+      }
+      if let Some(kind) = self
+        .vol
+        .base
+        .as_ref()
+        .and_then(|b| b.drift.get(&no).copied())
+      {
+        found.push(DriftPageEntry::Drifted {
+          path: self.path_or_inode(store, no),
+          kind,
+        });
+      }
+      if !found.is_empty() {
+        entries.push((no, found));
+      }
+      if entries.len() >= limit || spent() {
+        let more = self.next_drift_candidate(cursor).is_some();
+        return Ok(DriftPageRead {
+          entries,
+          next: cursor.filter(|_| more),
+        });
+      }
+    }
+  }
+
+  /// The next inode past `after` that `status` would list: witnessed (to re-check), or with drift recorded.
+  fn next_drift_candidate(&self, after: Option<InodeNo>) -> Option<InodeNo> {
+    let plane = self.vol.base.as_ref()?;
+    let witnessed = plane
+      .witnesses
+      .iter_head_after(after.as_ref())
+      .next()
+      .map(|(no, _)| *no);
+    let from = match after {
+      Some(no) => std::ops::Bound::Excluded(no),
+      None => std::ops::Bound::Unbounded,
+    };
+    let drifted = plane
+      .drift
+      .range((from, std::ops::Bound::Unbounded))
+      .next()
+      .map(|(no, _)| *no);
+    match (witnessed, drifted) {
+      (Some(witnessed), Some(drifted)) => Some(witnessed.min(drifted)),
+      (witnessed, drifted) => witnessed.or(drifted),
+    }
+  }
+
+  /// An inode's path, or `inode N` where none names it, as `status` names it.
+  fn path_or_inode(&self, store: &Store, no: InodeNo) -> String {
+    self
+      .vol
+      .path_of_inode(store, no)
+      .unwrap_or_else(|| format!("inode {}", no.0))
   }
 
   /// `status`: every witnessed entry re-checked now, the drift list by path, the watcher.

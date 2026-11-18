@@ -22317,6 +22317,17 @@ dimension was read from its history), GAPS, `docs/bugs/2026-11-08-a-status-with-
   from one read of the base, under one bound and one count (`with_drift`, `DriftItem`): the typed copy had no bound,
   and would have refused the status again past 600 drifted entries. A base that cannot be read is refused typed by
   the paged read (`refusal_of_vfs`), where it was a text line.
+- **A page re-checks what it passes (2026-11-17, goal g247):** each page of `Drifted` read the whole status — every
+  witnessed entry re-checked against the disk — and took its slice, so walking a drift of N entries over W witnessed
+  ones cost W host re-checks a page and held the shard for all of them each time (a branch switched beneath an overlaid
+  repository drifts tens of thousands). A page now visits, in inode order past a cursor, the inodes a status would
+  list (witnessed, or with drift recorded), re-checking the witnessed ones (`Overlay::drift_page`, a range over the
+  witness table and the drift record), until a reply's worth is found or its slice of the shard's step is spent
+  (`DRIFT_SLICE_PERMILLE`, half, as `changed_since`'s), visiting one before it asks so a walk moves; a walk re-checks
+  each witnessed entry once, and an entry drifted for the whole walk is answered once. An inode's entries go on one
+  page together. Held to `status` over the simulated host by an oracle (pages of 1, 3 and 64 inodes, the slice spent
+  after every visit, every second, or never; replaced, removed and refused entries)
+  (`a_drift_walk_a_page_at_a_time_lists_what_a_status_lists`).
 - **Every reader says which:** `slates status --drift` walks the paged read; the text counts all; MCP and the SDKs carry
   the count. An SDK binding for the paged read is owed.
 - **A list a verb's own reply carries (2026-11-17, goal g247):** reproduced by use first, each refused "reply too large

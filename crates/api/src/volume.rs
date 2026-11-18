@@ -200,8 +200,8 @@ pub struct DriftReport {
   pub elided: u32,
 }
 
-/// One page of an overlay's drift ([`crate::Instance::drift_page`]; §4.15 "Drift", A-267): its entries in path order,
-/// typed as a status types them, and the position the next page is read from.
+/// One page of an overlay's drift ([`crate::Instance::drift_page`]; §4.15 "Drift", A-267): its entries in inode order,
+/// typed as a status types them, and the inode the next page starts after.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct DriftPage {
   /// Each entry of the page the disk changed after the volume witnessed it.
@@ -210,7 +210,7 @@ pub struct DriftPage {
   pub unverified: Vec<String>,
   /// Entries in the page's range too long for any reply alone, passed over and counted.
   pub oversized: u32,
-  /// The position the next page is read from, or `None` when this page ends the drift.
+  /// The inode the next page starts after, or `None` when this page ends the walk.
   pub next: Option<u64>,
 }
 

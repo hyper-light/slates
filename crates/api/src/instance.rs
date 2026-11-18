@@ -300,15 +300,20 @@ impl Instance {
       watcher: report.watcher,
       elided: 0,
     };
-    let mut from = 0;
+    let mut after = None;
     loop {
-      let page = self.drift_page(volume, from)?;
+      let page = self.drift_page(volume, after)?;
       whole.drifted.extend(page.drifted);
       whole.unverified.extend(page.unverified);
       whole.elided = whole.elided.saturating_add(page.oversized);
       match page.next {
-        None => return Ok(Some(whole)),
-        Some(next) => from = next,
+        None => {
+          // The pages come in inode order; the report names its entries in path order, as a status does.
+          whole.drifted.sort_by(|a, b| a.path.cmp(&b.path));
+          whole.unverified.sort();
+          return Ok(Some(whole));
+        }
+        next => after = next,
       }
     }
   }

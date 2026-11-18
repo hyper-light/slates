@@ -2869,3 +2869,101 @@ fn an_untouched_base_file_reports_the_disks_windows_attribute_bits_and_follows_t
     "the mode is the disk's own"
   );
 }
+
+/// A-267 (§4.4 `status`, `Drifted`). Do: overlay a base of 40 files in four directories, pin them all, then outside the
+/// volume replace a third of them, remove a seventh, and arm the host to refuse opening five (an I/O error); walk the
+/// drift a page at a time — pages of 1, 3 and 64 inodes, with the page's slice spent after every visit, every second
+/// visit, or never — and take a status. Expect: every walk's entries, in inode order and each inode once, are exactly
+/// what the status lists, drifted with their kinds and unverified apart; a walk always moves (a page visits one inode
+/// before its slice is asked) and ends. Reading the whole status each page made a walk cost its square.
+#[test]
+fn a_drift_walk_a_page_at_a_time_lists_what_a_status_lists() {
+  for (limit, every) in [(1, 1), (3, 2), (3, usize::MAX), (64, 1), (64, usize::MAX)] {
+    let mut host = SimHost::new();
+    let mut store = store();
+    populate(&mut host, 4, 40);
+    let mut vol = overlay(&mut host, &mut store);
+    vol.with_host(&mut host).pin(&mut store, None).unwrap();
+    host.advance_ns(1_000_000_000);
+    for f in (0..40).step_by(3) {
+      host.replace_file(&format!("/d{}/f{f}", f % 4), b"changed outside");
+    }
+    for f in (1..40).step_by(7) {
+      host.remove(&format!("/d{}/f{f}", f % 4));
+    }
+    for f in [2, 5, 8, 11, 14] {
+      host.fail(
+        slates_vfs::host::sim::SimVerb::OpenFile,
+        &format!("/d{}/f{f}", f % 4),
+        slates_vfs::host::HostError::Unavailable(5),
+        u32::MAX,
+      );
+    }
+    let mut walked: Vec<(
+      slates_vfs::ids::InodeNo,
+      Vec<slates_vfs::base::DriftPageEntry>,
+    )> = Vec::new();
+    let mut after = None;
+    let mut pages = 0usize;
+    loop {
+      let mut visits = 0usize;
+      let mut spent = || {
+        visits += 1;
+        visits % every == 0
+      };
+      let page = vol
+        .with_host(&mut host)
+        .drift_page(&mut store, after, limit, &mut spent)
+        .unwrap();
+      pages += 1;
+      assert!(
+        page.entries.len() <= limit,
+        "a page holds at most its limit"
+      );
+      if let (Some(next), Some(before)) = (page.next, after) {
+        assert!(next > before, "a page moves the walk");
+      }
+      walked.extend(page.entries);
+      match page.next {
+        None => break,
+        next => after = next,
+      }
+      assert!(pages < 1_000, "the walk ends");
+    }
+    assert!(
+      walked.windows(2).all(|pair| pair[0].0 < pair[1].0),
+      "inode order, each once (limit {limit}, every {every})"
+    );
+    let status = vol.with_host(&mut host).status(&mut store).unwrap();
+    let mut drifted: Vec<(String, DriftKind)> = Vec::new();
+    let mut unverified: Vec<String> = Vec::new();
+    for (_, entries) in walked {
+      for entry in entries {
+        match entry {
+          slates_vfs::base::DriftPageEntry::Drifted { path, kind } => drifted.push((path, kind)),
+          slates_vfs::base::DriftPageEntry::Unverified { path, .. } => unverified.push(path),
+        }
+      }
+    }
+    drifted.sort();
+    unverified.sort();
+    let mut listed: Vec<String> = status
+      .unverified
+      .iter()
+      .map(|(path, _)| path.clone())
+      .collect();
+    listed.sort();
+    assert!(
+      !status.drift.is_empty() && !listed.is_empty(),
+      "the test drifts and refuses"
+    );
+    assert_eq!(
+      drifted, status.drift,
+      "drifted (limit {limit}, every {every})"
+    );
+    assert_eq!(
+      unverified, listed,
+      "unverified (limit {limit}, every {every})"
+    );
+  }
+}

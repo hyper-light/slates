@@ -131,8 +131,10 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// not hold (A-267): `Instance::rewitness` answers `Rewitnessed { paths, paths_elided }`, `Stale::Disk` carries
 /// `elided`, `LandingReport` carries `degraded_elided`, and a presentation is clean only when it carries and counts no
 /// conflict (the same day). 12: `Stale::Verdict`, a merge's or a rebase's conflict windows read after the work's verdict
-/// was replaced; `merge` and `rebase` answer every window of a verdict however many (A-267) (the same day).
-pub const CONTRACT: u32 = 12;
+/// was replaced; `merge` and `rebase` answer every window of a verdict however many (A-267) (the same day). 13:
+/// `drift_page` reads past an inode (`after: Option<u64>`), in inode order, re-checking the entries it passes; `drift`
+/// answers its lists in path order (A-267) (the same day).
+pub const CONTRACT: u32 = 13;
 
 /// What a rewitness did (§4.15 `rewitness`): the paths one reply holds and the count of the rest (A-267).
 pub use slates_client::Rewitnessed;

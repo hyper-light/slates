@@ -912,7 +912,8 @@ fn a_greens_changes_are_read_a_page_at_a_time_and_whole() {
 
 /// A-267 (§4.15 "Drift"): do write 100 files with long names through an overlay, change each on the disk, then read the
 /// volume's status and its drift. Expect: the status carries what fits and counts the rest (`elided` above zero);
-/// `drift` names all 100 `Modified` and elides none; and the paged read, walked from position 0, names each once.
+/// `drift` names all 100 `Modified`, in path order, and elides none; and the paged read, walked from the start, names
+/// each once.
 /// Before A-267 a status with 600 drifted entries was refused, and the library read only what a status carried.
 #[test]
 fn an_overlays_drift_past_one_reply_is_read_whole() {
@@ -955,20 +956,18 @@ fn an_overlays_drift_past_one_reply_is_read_whole() {
     })
     .collect();
   assert_eq!((whole.drifted, whole.elided), (expected.clone(), 0));
-  let mut from = 0;
+  let mut after = None;
   let mut walked = Vec::new();
   loop {
-    let page = instance.drift_page(volume, from).unwrap();
+    let page = instance.drift_page(volume, after).unwrap();
     walked.extend(page.drifted);
     match page.next {
       None => break,
-      Some(next) => from = next,
+      next => after = next,
     }
   }
-  assert_eq!(
-    walked, expected,
-    "the pages name each entry once, in path order"
-  );
+  walked.sort_by(|a, b| a.path.cmp(&b.path));
+  assert_eq!(walked, expected, "the pages name each entry once");
   daemon.stop();
 }
 

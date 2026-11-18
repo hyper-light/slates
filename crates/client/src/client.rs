@@ -220,11 +220,11 @@ pub struct Page<T, C> {
 /// `base` types them (A-299).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DriftedPage {
-  /// This page's entries the disk changed after the volume witnessed them, in path order.
+  /// This page's entries the disk changed after the volume witnessed them, in inode order.
   pub drifted: Vec<slates_ipc::protocol::DriftEntry>,
-  /// This page's entries whose re-check the host refused now, by path, in path order.
+  /// This page's entries whose re-check the host refused now, by path, in inode order.
   pub unverified: Vec<String>,
-  /// The position the next page is read from, or `None` when this page ends the list.
+  /// The inode the next page starts after, or `None` when this page ends the walk.
   pub next: Option<u64>,
   /// Entries in this page's range too long for any reply alone (a host path near the platform's maximum), passed over
   /// and counted, never sent.
@@ -4677,7 +4677,7 @@ impl Client {
   }
 
   /// An overlay volume's drift (§4.4 `status`, A-267): every entry the disk changed after the volume witnessed it and
-  /// every one whose re-check the host refused, each list in path order, walked a page at a time from the volume's owner
+  /// every one whose re-check the host refused, each list in inode order, walked a page at a time from the volume's owner
   /// ([`Client::drifted_page`]), since a status carries only the first that fit. Also the number of entries too long for
   /// any reply, which no page carries.
   pub fn drifted(&mut self, volume: VolumeId) -> Result<DriftedPage, ClientError> {
@@ -4687,34 +4687,39 @@ impl Client {
       next: None,
       oversized: 0,
     };
-    let mut from = 0u64;
+    let mut after = None;
     loop {
-      let page = self.drifted_page(volume, from)?;
+      let page = self.drifted_page(volume, after)?;
       whole.drifted.extend(page.drifted);
       whole.unverified.extend(page.unverified);
       whole.oversized = whole.oversized.saturating_add(page.oversized);
       match page.next {
         None => return Ok(whole),
-        Some(next) => from = next,
+        next => after = next,
       }
     }
   }
 
-  /// One page of an overlay volume's drift (§4.4 `status`, A-267) from position `from` (0 begins), typed as a status's
-  /// `base` types it, as many entries as one reply holds; where the next page is read from; and the entries in this
-  /// page's range too long for any reply alone, passed over and counted. A page whose position does not move past
-  /// `from` is refused [`ClientError::UnexpectedReply`], so a walk always ends.
-  pub fn drifted_page(&mut self, volume: VolumeId, from: u64) -> Result<DriftedPage, ClientError> {
+  /// One page of an overlay volume's drift (§4.4 `status`, A-267) past inode `after` (`None` begins), typed as a
+  /// status's `base` types it, in inode order, re-checked now; the inode the next page starts after; and the entries in
+  /// this page's range too long for any reply alone, passed over and counted. A page may hold no entry and still carry
+  /// a cursor (it spent its slice of the shard's step on entries that had not drifted). A page whose cursor does not
+  /// move past `after` is refused [`ClientError::UnexpectedReply`], so a walk always ends.
+  pub fn drifted_page(
+    &mut self,
+    volume: VolumeId,
+    after: Option<u64>,
+  ) -> Result<DriftedPage, ClientError> {
     let ReplyBody::Drifted {
       drifted,
       unverified,
       next,
       oversized,
-    } = self.call(&RequestBody::Drifted { volume, from })?
+    } = self.call(&RequestBody::Drifted { volume, after })?
     else {
       return Err(ClientError::UnexpectedReply { verb: "drifted" });
     };
-    forward(next, Some(from), "drifted")?;
+    forward(next, after, "drifted")?;
     Ok(DriftedPage {
       drifted,
       unverified,
