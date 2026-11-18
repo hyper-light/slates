@@ -13129,7 +13129,7 @@ fn a_live_ship_a_candidate_cannot_admit_is_refused_and_ships_once_it_can() {
     Ok(volume) => {
       Client::connect(daemons[1].instance()).call(&RequestBody::Destroy { volume: *volume })
     }
-    Err(reply) => reply.clone(),
+    Err(reply) => reply.as_ref().clone(),
   };
   let shipped = client.call(&RequestBody::LiveShip {
     volume: id,
