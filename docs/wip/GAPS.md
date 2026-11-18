@@ -856,8 +856,12 @@
 >   and `capture_base` (§4.15's status: `Instance::capture_base`, contract 34) with the move of a clone of a captured
 >   base, the form a kiln workspace takes (decided below), held by a three-daemon test that moves such a clone, serves it
 >   on its new owner and destroys the captured snapshot once the old owner let the clone go.
-> - **Owed, in order:** kiln's runners as members (certificates under kiln's CA as the manifest's enrollment root,
->   seeds from kiln's runner directory); kiln's relocation of an agent with its volume (detach, move, attach on the
+> - **Kiln's runners as members (2026-11-18, kiln goal 95101ef3, its pieces K1-K3):** each runner's node key and its
+>   certificate from kiln's CA naming the fleet and the runner's failure domain (K1), the runners that join found
+>   through kiln's server and the manifest written per runner with kiln's CA as its enrollment root (K2), and the
+>   operator's choice of which runners join, with `f` and each node's address, a chosen runner's Slates started with
+>   `StartSpec.fleet` once `role::check_fleet` (contract 39) read the manifest it wrote as its start will (K3).
+> - **Owed, in order:** kiln's relocation of an agent with its volume (detach, move, attach on the
 >   target) and its workspaces made as clones of a captured base; the automatic migration by the origin of the last N
 >   writes (AC-8.16's other half); a move carrying snapshots other than the head; a multi-runner test with injected
 >   faults. The capture's own owed parts: admission reserving its cost ahead, a large file read across slices rather
@@ -1041,6 +1045,29 @@
 >
 > Beyond the goal's clauses, owed from this entry: the async form for the remaining verbs, the MCP list tools answering
 > a page at a time, and a merge's versions typed on the wire.
+
+> **The Node SDK suites on Windows (2026-11-18, §4.7 status "the Node SDK suites end on Windows"; goal 88).** The three
+> Node suites had never run on Windows: CI's `sdk` job ran on `ubuntu-latest` and `macos-latest` alone. Main's diag run
+> 44384411115 (main da697d886) ran them on both Windows runners, and the step went past 70 minutes until cancelled, with
+> no log kept. The cause, read from the code: every teardown sent `process.kill(-anchor.pid, 'SIGKILL')`, which Windows
+> refuses (libuv opens the process by its id, and there are no groups), and swallowed the refusal; the anchor lived on,
+> and its process handle kept `node --test` waiting. **Built:** one teardown the three suites share
+> (`crates/sdk-node/tests/anchor.mjs`): the group kill on Unix, and on Windows the anchor's own process ended, whose
+> kill-on-close job ends its daemon (`crates/anchor/src/supervise.rs`); a teardown fails its test when the anchor still
+> runs 20 s after its kill. CI's `sdk` job gains `windows-latest` and `windows-11-arm` legs that run the Node suites
+> and the packaged smoke test, each Node step bounded at 30 minutes; the packaged test's helper is copied beside it in
+> `ci.yml`, `.kiln/ci.yaml` and `.kiln/nightly.yaml`. **Owed:**
+> - the first Windows run of the three suites (filed for main; red would be a suite failing, not hanging);
+> - the Python suites on Windows: the `sdk` job's Python steps assume a Unix venv (`venv/bin/pip`), and the suites
+>   themselves start the anchor with `start_new_session` and end it with `os.killpg(os.getpgid(..), SIGKILL)`
+>   (`test_sdk.py`, `test_sdk_async.py`), neither of which Windows has, and the async suite's freeze uses `pgrep` and
+>   `SIGSTOP` as the Node one does: the same teardown, the anchor's own process ended, is owed there;
+> - `every async call ends across restart, silence, reader loss and death` (`sdk_async.test.mjs`) skips loudly on
+>   Windows. It freezes the daemon with `SIGSTOP`/`SIGCONT`, finds the instance's daemons with `pgrep -f` and reads
+>   whether each has stopped with `ps -o state=`; none exists there. Its Windows twin freezes each process whole with
+>   `NtSuspendProcess`/`NtResumeProcess`, as `crates/cli/tests/start_judgment.rs` does, and finds them by command
+>   line; a Node test can make the call only through native code (a test helper the suite spawns, never the shipped
+>   addon).
 
 > **git, Mercurial and Subversion over the WinFsp drive (2026-11-17, Part 6 "Real workloads", §4.6; A-300; Ada's
 > goal of 2026-11-18).** The Windows lanes (`windows-lint`, `windows-arm64`) now run the roster's four version-control
@@ -11249,6 +11276,16 @@ Owed:
 
 Shards streams on macOS have the same shape and are covered: their writes are logged since `1fa154230`; on Windows
 since A-402, which also makes the log option 2 names available to the WinFsp drive.
+
+### 2026-11-18: a snapshot exported as its archive through the library (Mantle's CP-T10.4; built, A-441); the volume from an archive owed
+
+> - **Built.** `Instance::export_archive` (contract 38): a snapshot rendered as its archive file (`ARCHIVE_FILE`) in a
+>   new volume of the caller's, walked in slices on the owner shard, read back a page at a time with `read`.
+>   `a_snapshot_exported_as_its_archive_carries_every_file_and_entry` decodes and restores what it reads back: every
+>   file's bytes, length and mode, the directories, none of a write after the snapshot, the same manifest twice.
+> - **Owed.** The volume made from an archive (import), through `slates_archive::Planning` as a takeover restores
+>   (`fleet::restore_in_turns`, `verbs::populate_making`), with hostile archives refused by kind: the next piece. A
+>   streamed encoder: the archive is held whole while it is encoded, one unit of its size.
 
 ### 2026-11-18: a volume a publication left out lost its logged writes at the next restart (found by reading; fixed, A-422)
 

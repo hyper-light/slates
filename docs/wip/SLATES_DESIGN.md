@@ -5221,6 +5221,19 @@ idle turn a request meets, E[T²]/E[T] over the turns of its own idle spins, is 
 > Test: `crates/server/tests/closed_loop.rs` (each owner decides by what it measured; the loop's parks follow the
 > decision).
 
+> **Status (2026-11-18, the Node SDK suites end on Windows).** The Node suites (`sdk.test.mjs`, `sdk_async.test.mjs`,
+> `packaged.test.mjs`) start a real anchor and end it in one shared teardown (`crates/sdk-node/tests/anchor.mjs`). On
+> Unix the anchor leads its own process group and one `SIGKILL` to the group ends it and every daemon it started. On
+> Windows a negative pid is refused (libuv opens the process by its id), and the anchor holds its daemon in a
+> kill-on-close job only it has a handle to (`crates/anchor/src/supervise.rs`), so ending the anchor's own process
+> ends the daemon with it. Until 2026-11-18 the suites had never run on Windows, and every teardown sent the group kill
+> there, swallowed its refusal and left the anchor running, whose process handle kept `node --test` waiting for over
+> 70 minutes on both Windows runners (diag run 44384411115). A teardown now fails its test if the anchor is still
+> running 20 s after its kill. CI's `sdk` job runs the Node suites and the packaged smoke test on `windows-latest`
+> and `windows-11-arm` (its Python steps need a Unix venv and are owed there). The test that freezes the daemon with
+> `SIGSTOP` and finds it with `pgrep` and `ps` skips loudly on Windows; its Windows freeze (`NtSuspendProcess`, as
+> slates' Rust suites freeze a process there) is owed (GAPS).
+
 **Worked example.** From Python: `await client.create("scratch", bounded=4 GiB)`: the extension
 writes the slot, spins for `spin_ns`, and returns the reply without ever touching the event loop
 (fast path); if the daemon were busy, the extension parks, the reply lands, the daemon writes the
@@ -8397,6 +8410,18 @@ the format floor.
 > - **Still owed.** Restore's output is dense (AUD-29-57).
 >
 > **Reconciled 2026-11-06 (VFS plan Step 15).** A restore's output is sparse again (5106abc2; AUD-29-57 closed, A-55).
+
+> **Status (2026-11-18, A-441: a snapshot exported as its archive through the library).** `ArchiveExport`
+> (`Instance::export_archive`, contract 38) renders a snapshot as its archive file, `ARCHIVE_FILE`, in a new volume of
+> the caller's, as an image build renders an ext2 file (`crate::image`): checked at once (the volume, `read`, the name,
+> the snapshot), then walked in slices by a task of the owner shard (`slates_vfs::export::SnapshotArchiver`), the
+> snapshot pinned until the file is written, the volume and the request's completion committed as one atom. A consumer
+> reads the file a page at a time (`read`) and keeps it where it keeps bytes (Mantle, kiln's object store, CP-T10.4).
+> The archive carries every file's bytes and every entry's metadata, each chunk and the whole verified by identity on
+> the way back in; its manifest identity, which the reply names, is the tree's. A snapshot whose entries still read an
+> overlay's base is refused `Unsupported` (capture the base first); a merge volume's too. Owed: the volume made from an
+> archive (the next piece, through `slates_archive::Planning` as a takeover restores); a streamed encoder, since the
+> archive is held whole while it is encoded, one unit of its size, then written into the file a chunk a unit.
 
 ### 4.12 Agent surfaces (D-19)
 
@@ -30812,6 +30837,45 @@ Applied in the same change to: §4.6, the Shards form's resync and death bullets
 
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class B), `crates/server/src/{learned_wait,told,
 callback,nfs,delegation,lib}.rs`.
+
+### A-441 — A snapshot exported as its archive through the library (2026-11-18, goal g268; Mantle's CP-T10.4, "Slates snapshots on Mantle"; §4.11 "Archive", D-17; §4.12 the consumer contract, A-299)
+Applied in the same change to: `crates/ipc` (`RequestBody::ArchiveExport`, `ReplyBody::ArchiveExported`,
+`ARCHIVE_FILE`, appended and published in `tests/wire_order.txt`); `crates/server/src/image.rs` (`archive_verb`,
+`ArchiveJob`, `run_archive`), `verbs.rs` (its dispatch, its new volume's name, its durability claim as a creation's) and
+`merge_service.rs` (`StoreVerb::Archive`); `crates/client` (`Client::archive_export`, `ArchiveExported`);
+`crates/api` (`Instance::export_archive`, `ArchiveExported` and `ARCHIVE_FILE` re-exported, `CONTRACT` 38, the test
+`a_snapshot_exported_as_its_archive_carries_every_file_and_entry`); §4.11's status; GAPS (2026-11-18).
+
+- **Why.** Kiln keeps every byte it holds on Mantle (plan T10), Slates snapshots among them (CP-T10.4). The archive
+  format has existed since Phase 7 as the fleet's replication unit (`slates_vfs::export`), but no consumer could ask
+  for one: no verb exported a snapshot.
+- **The shape.** The export is a volume, as an image build is: a new volume of the caller's holding one file, the
+  archive. Every path a consumer already has then serves it: the paged `read` streams it out (a reply rides one bulk
+  chunk), the volume's size policy bounds it, its destroy lets it go, and a restart keeps it, since it is published.
+  No buffer or token of its own needs a bound, an expiry or a reaper. The archive's bytes are slates' own wire format
+  (§4.11): header, chunk records, manifest, seek table, trailer, every chunk named by the BLAKE3 of its bytes, the
+  whole hashed.
+- **Running.** As `image build` runs (§4.6, A-160): the verb checks the volume, `read` on it, the name and the snapshot
+  at once and defers its reply to a task of the owner shard. The task pins the snapshot and walks it with
+  `SnapshotArchiver` a unit at a time within the slice budget. It encodes the archive, admits the volume sized to it
+  (rounded up to whole chunks), and writes the file a chunk a unit. It then records and publishes the volume with the
+  request's completion as one atom, and lets the pin go. A refusal at any step discards the volume and the pin.
+- **Rights.** `read`: an archive copies only what a reader can read, and the snapshot's pin lasts only while the export
+  runs. An image build needs `write`, since its volume pins the snapshot for good.
+- **Refusals.** A snapshot the volume does not hold, `NotFound` (`Missing::Snapshot`). A name held, `AlreadyExists`. A
+  snapshot whose entries still read an overlay's base, `Unsupported`, with the way out (`capture_base`, then export the
+  captured snapshot). A merge volume, `Unsupported`. A shard without consensus, `ConsensusNotInitialized`. Room, by the
+  admission's own refusals.
+- **Owed.** The volume made from an archive (import), the next piece. A streamed encoder: the archive is held whole
+  while it is walked and encoded (the encoding is one unit of the archive's size), then written in slices; a shard
+  exporting a snapshot near its memory holds it twice for that moment.
+- **Evidence (Mac Studio, 2026-11-18, debug).** `a_snapshot_exported_as_its_archive_carries_every_file_and_entry`
+  passes in 0.80 s. It exports a snapshot of a small file, a 300 KiB file and an empty one in nested directories, and
+  reads back a 308,524-byte archive. That archive decodes, names the manifest the export named, and restores every
+  file's bytes, length and mode and both directories, without the write made after the snapshot. A second export
+  names the same manifest. A snapshot never taken is `NotFound` and a held name `AlreadyExists`. The wire's order test
+  holds the two appended variants, and the contract's history names 38. With the file's writing removed, it was red
+  once: an empty file where the export named 308,524 bytes.
 
 ### A-444 — A live exchange to a holder waits its session's persistent-congestion duration, the session plane's own judgment of a gone path; the live budget is that duration's floor (2026-11-18, built for goal g255; R3's class B, item B-d; RFC 9002 §6.2, §7.6.1; A-200, A-292)
 - **What was there.** A live-shipped exchange (A-200) ran under a hard deadline of one liveness window (`fleet::

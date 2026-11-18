@@ -4486,6 +4486,7 @@ fn claims_placed_durability(body: &RequestBody) -> bool {
       | RequestBody::SubmitSigned { .. }
       | RequestBody::ImageBuild { .. }
       | RequestBody::ImageMerge { .. }
+      | RequestBody::ArchiveExport { .. }
   )
 }
 
@@ -4899,6 +4900,11 @@ fn dispatch_inner(
     RequestBody::ImageMerge { image, name } => {
       crate::image::merge_verb(state, principal, image, name)
     }
+    RequestBody::ArchiveExport {
+      volume,
+      snapshot,
+      name,
+    } => crate::image::archive_verb(state, principal, volume, snapshot, name),
     RequestBody::Checkout {
       green,
       base,
@@ -14195,7 +14201,8 @@ fn new_volume_name(body: &RequestBody) -> Option<&str> {
     | RequestBody::CreateWork { name, .. }
     | RequestBody::Clone { name, .. }
     | RequestBody::ImageBuild { name, .. }
-    | RequestBody::ImageMerge { name, .. } => Some(name),
+    | RequestBody::ImageMerge { name, .. }
+    | RequestBody::ArchiveExport { name, .. } => Some(name),
     _ => None,
   }
 }
