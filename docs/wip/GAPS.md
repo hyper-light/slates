@@ -581,9 +581,14 @@
 >   macOS flushes a socket whose every copy rides a message. **And the successor's half on macOS (A-339, the same
 >   day):** the write log and its replay, the kept barrier replies, recovery keeping a stream whose end the anchor held,
 >   and the successor keeping its copy of the fresh end until the device's first bytes on it or the channel's close.
->   **Owed:** the anchor holding a stream's DAX objects (until then a stream gives its resync up at its guest's first
->   DAX map); Windows on Shards' handle path, and a write log for a Windows stream, whose acknowledged writes a death
->   still loses whether or not it is resynced. Found beside it (Linux and macOS): a resynced stream whose dead daemon's
+>   **And its DAX maps (A-365, the same day):** the anchor holds each DAX object a stream hands its device, the shard's
+>   DAX range table records each range answered, and a successor takes the objects back, ingests the guest's unsynced
+>   stores before it serves anything and answers the device with the same objects; a stream keeps its resync through
+>   its guest's maps. **Owed:** Windows on Shards' handle path, and a write log for a Windows stream, whose acknowledged
+>   writes a death still loses whether or not it is resynced. Found with A-365 (Linux): A-197's writable copies are
+>   taken back awake before the write log's replay, so a logged write a client's store followed can be written over
+>   that store at a takeover (DAX objects are kept dormant through the replay for that reason); its tests write
+>   through no other path before the client's store. Found beside it (Linux and macOS): a resynced stream whose dead daemon's
 >   log overflowed is not told which writes it lost (a FUSE mount is, `LostWrites`; counted,
 >   `shards.resync_writes_unreported`); a stream's `FORGET`s are not logged, so a resynced stream keeps the references
 >   a lost one gave back until it ends; and a stream's `close` publishes even when the log holds every write it
