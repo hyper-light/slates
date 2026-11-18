@@ -780,9 +780,10 @@ fn expect_no_hosts_mount_reaches_a_guests_own(
   }
 }
 
-/// Linux's `EINVAL` and `EACCES`.
+/// Linux's `EINVAL`, `EACCES` and `EIO`.
 const EINVAL: i32 = 22;
 const EACCES: i32 = 13;
+const EIO: i32 = 5;
 
 /// Linux's ACL entry tags (`include/uapi/linux/posix_acl.h`): the owner, a named user, the owning group, a named
 /// group, the mask and everyone else; and the id an entry naming no one carries (`ACL_UNDEFINED_ID`).
@@ -1630,4 +1631,133 @@ fn create_through_a_route_with_no_umask(
     "the host's file is masked by the default ACL"
   );
   made.ino
+}
+
+/// Linux's `FUSE_SETXATTR_EXT` (`include/uapi/linux/fuse.h`, protocol 7.33), as a guest's kernel offers it at INIT, and
+/// `FUSE_SETXATTR_ACL_KILL_SGID`, a setter's flag its extended `fuse_setxattr_in` carries.
+const FUSE_SETXATTR_EXT: u32 = 1 << 29;
+const FUSE_SETXATTR_ACL_KILL_SGID: u32 = 1 << 0;
+/// Format: `S_ISGID`, the set-group-ID bit of `st_mode` (`<sys/stat.h>`).
+const S_ISGID: u32 = 0o2000;
+
+/// A SETXATTR of `name` set to `value` in the extended form a kernel that kept `FUSE_SETXATTR_EXT` sends
+/// (`fuse_setxattr_in`: size, flags, the setter's flags `setter` and a pad, then the name and its NUL, then the value).
+fn extended_setxattr_body(name: &[u8], value: &[u8], setter: u32) -> Vec<u8> {
+  let mut body = u32::try_from(value.len()).unwrap().to_le_bytes().to_vec();
+  for word in [0, setter, 0] {
+    body.extend_from_slice(&word.to_le_bytes());
+  }
+  body.extend_from_slice(name);
+  body.push(0);
+  body.extend_from_slice(value);
+  body
+}
+
+/// Sends `bridge` the INIT a Linux guest's kernel sends, offering `FUSE_POSIX_ACL` and `FUSE_SETXATTR_EXT`, and reads
+/// back whether its reply kept the extended form, as a transport reads its kernel's form of SETXATTR from the reply.
+fn init_keeps_the_extended_setxattr(bridge: &mut VolumeBridge<'_>, cx: &OpContext) -> bool {
+  let offer = init_offering(FUSE_POSIX_ACL | FUSE_SETXATTR_EXT | FUSE_DONT_MASK);
+  let reply = exchange(bridge, cx, &message(Opcode::Init as u32, 1, 0, &offer));
+  assert_eq!(errno(&reply), 0, "INIT served");
+  let kept = slates_bridge_fuse::init::kept_flags(&reply[OUT_HEADER_LEN..]).unwrap();
+  kept & u64::from(FUSE_SETXATTR_EXT) != 0
+}
+
+/// A-378 (a guest's kernel says an ACL's setter is outside the file's group). Do: send the INIT a Linux guest's kernel
+/// sends, offering `FUSE_POSIX_ACL` and `FUSE_SETXATTR_EXT`, through a guest's route and through a host's mount; then,
+/// over the guest's route serving the form its INIT kept, as Shards' stream and the virtio-fs device serve it, set the
+/// ACL `setfacl -m u:4242:rw,u:4343:-` makes on two set-group-ID files the run owns at 02660, one with
+/// `FUSE_SETXATTR_ACL_KILL_SGID` (what Linux's `fuse_set_acl` sends for a setter outside the file's group without
+/// `CAP_FSETID`) and one without, and a default ACL with the flag on a set-group-ID directory; then send a SETXATTR too
+/// short for the extended head. Expect the guest's INIT to keep `FUSE_SETXATTR_EXT` and the host's not; each ACL read
+/// back as set, its name found past the extended head; the flagged file 0660, its set-group-ID bit gone and its group
+/// bits the mask, as Linux's `posix_acl_update_mode` leaves a file on its own filesystems; the unflagged file 02660;
+/// the directory 02770, since Linux clears the bit for an access ACL alone; and the short request `EIO`.
+#[test]
+fn a_guests_acl_set_from_outside_the_files_group_clears_its_set_group_id_bit() {
+  let mut store = store();
+  let mut vol = owned_volume(&mut store);
+  let root = vol.root_inode(&store).unwrap();
+  let mut made = |name: &str, directory: bool, mode: u32| {
+    let made = if directory {
+      vol.mkdir_no(&mut store, root, name, mode).unwrap()
+    } else {
+      vol.create_file_no(&mut store, root, name, mode).unwrap()
+    };
+    vol.chmod(&mut store, made, mode).unwrap();
+    vol.chown(&mut store, made, RUN.0, RUN.1).unwrap();
+    made.0
+  };
+  let flagged = made("flagged.txt", false, S_ISGID | 0o660);
+  let unflagged = made("unflagged.txt", false, S_ISGID | 0o660);
+  let directory = made("shared", true, S_ISGID | 0o770);
+  let cx = test_cx();
+  let extended = {
+    let mut guest =
+      VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store).serving_a_guest();
+    init_keeps_the_extended_setxattr(&mut guest, &cx)
+  };
+  assert!(extended, "a guest's kernel is asked for the extended form");
+  let mut host = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  assert!(
+    !init_keeps_the_extended_setxattr(&mut host, &cx),
+    "a host's kernel, which sets no ACL, is not"
+  );
+  drop(host);
+  let mut guest =
+    VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store).serving_a_guest();
+  {
+    use slates_bridge_core::Bridge as _;
+    guest.set_setxattr_ext(extended);
+  }
+  let mut unique = 1u64;
+  let mut ask = |opcode: Opcode, nodeid: u64, body: &[u8]| {
+    unique += 1;
+    exchange(
+      &mut guest,
+      &cx,
+      &message_as(opcode as u32, unique, nodeid, RUN, body),
+    )
+  };
+  for (node, name, value, setter, mode, what) in [
+    (
+      flagged,
+      ACCESS_ACL,
+      granting_acl(6),
+      FUSE_SETXATTR_ACL_KILL_SGID,
+      0o660,
+      "an access ACL set from outside the group clears the bit",
+    ),
+    (
+      unflagged,
+      ACCESS_ACL,
+      granting_acl(6),
+      0,
+      S_ISGID | 0o660,
+      "one set from inside it keeps the bit",
+    ),
+    (
+      directory,
+      DEFAULT_ACL,
+      default_acl(),
+      FUSE_SETXATTR_ACL_KILL_SGID,
+      S_ISGID | 0o770,
+      "a default ACL keeps it whoever sets it",
+    ),
+  ] {
+    let set = ask(
+      Opcode::SetXattr,
+      node,
+      &extended_setxattr_body(name, &value, setter),
+    );
+    assert_eq!(errno(&set), 0, "{what}: the set is served");
+    assert_eq!(
+      attribute_of(&mut ask, node, name),
+      Some(value),
+      "{what}: the ACL reads back as set"
+    );
+    assert_eq!(Judged::of(&mut ask, node, false).mode, mode, "{what}");
+  }
+  let short = ask(Opcode::SetXattr, flagged, &[0u8; 8]);
+  assert_eq!(errno(&short), EIO, "a request short of the extended head");
 }

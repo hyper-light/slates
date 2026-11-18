@@ -2,8 +2,9 @@
 //! device when it saves a VM and taken back by a fresh stream when the VM is restored (Shards' D176 part 5).
 //!
 //! **What they hold.** The volume the stream served and the snapshot its SAVE took of it at the cut; the directory the
-//! stream presented (its scope's inode, none for the whole volume); the owner view its guest's run named (A-281); and
-//! every inode the guest's kernel holds, with its references and how many of them are open handles, exactly as the
+//! stream presented (its scope's inode, none for the whole volume); the owner view its guest's run named (A-281); the
+//! form of `SETXATTR` its guest's kernel sends, which its `INIT` settled once and a restored guest never repeats
+//! (A-378); and every inode the guest's kernel holds, with its references and how many of them are open handles, exactly as the
 //! volume keeps them for the stream's attachment ([`slates_vfs::recover::InodeReferences`], the recovery image's own
 //! record). Node ids are inode numbers and a clone shares its origin's numbers (A-166), so they name the same files on
 //! the volume unchanged since the cut and on a clone of its snapshot. No handle table is kept: a request names its
@@ -24,8 +25,9 @@ use slates_vfs::recover::InodeReferences;
 use slates_wire::Wire;
 
 /// Format: the tables' format, the word they begin with. A new format takes the next number; a restore refuses tables
-/// of another.
-pub(super) const FORMAT: u32 = 1;
+/// of another. Format 2 added the guest's `SETXATTR` form (A-378); tables of format 1, saved by a daemon that never
+/// offered the extended form, are refused as any other format is, with the reason Shards reports.
+pub(super) const FORMAT: u32 = 2;
 /// Format: the bytes of the format word before the body, and of the check after it (a little-endian `u32` each).
 const WORD_BYTES: usize = size_of::<u32>();
 
@@ -40,6 +42,9 @@ pub(super) struct StreamTables {
   pub(super) scope: Option<u64>,
   /// The owners the guest's run named, swapped (A-281); none for the identity.
   pub(super) owners: Option<SwappedOwners>,
+  /// Whether the guest's kernel sends the extended `fuse_setxattr_in` (`FUSE_SETXATTR_EXT`, A-378): the restored stream
+  /// parses each `SETXATTR` as the saved one did.
+  pub(super) setxattr_ext: bool,
   /// Each inode the guest holds, in rising inode order, with its references and the opens among them.
   pub(super) held: Vec<InodeReferences>,
 }
@@ -139,6 +144,7 @@ pub(super) fn most_bytes(max_inodes: usize) -> usize {
       run_uid: u32::MAX,
       run_gid: u32::MAX,
     }),
+    setxattr_ext: true,
     held: Vec::new(),
   }
   .to_bytes()
@@ -159,8 +165,8 @@ pub(super) fn most_bytes(max_inodes: usize) -> usize {
 mod tests {
   use super::*;
 
-  /// Tables holding the run's owner swapped with the host's, a scope, an open file, a held directory and a file the
-  /// guest holds with no name left.
+  /// Tables holding the run's owner swapped with the host's, a scope, the extended `SETXATTR` form, an open file, a
+  /// held directory and a file the guest holds with no name left.
   fn tables() -> StreamTables {
     StreamTables {
       volume: VolumeId { bytes: [7; 16] },
@@ -172,6 +178,7 @@ mod tests {
         run_uid: 1000,
         run_gid: 1001,
       }),
+      setxattr_ext: true,
       held: vec![
         InodeReferences {
           inode: 9,

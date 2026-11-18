@@ -43,7 +43,7 @@ and the sweep's selection assumed none could happen.
   records as one batch (a refused atom's records are dropped with it, so each committed atom's are set aside first).
 - `AuditKind::GrantExpired` is appended to the record enum and to the wire's typed audit kind, each published
   (`crates/db/tests/wire_order.txt`, `crates/ipc/tests/wire_order.txt`, D-15), and the consumer contract types it
-  (`slates_api::AuditKind::GrantExpired`, `CONTRACT` 30).
+  (`slates_api::AuditKind::GrantExpired`, `CONTRACT` 31).
 
 ## Tests
 

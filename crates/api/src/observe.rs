@@ -54,11 +54,13 @@ pub struct AuditRecord {
   pub landing: Option<u64>,
   /// The manifest it concerns, when bound.
   pub manifest: Option<[u8; 32]>,
-  /// The landing's state when the record was made, for a finished landing.
+  /// The landing's state when the record was made, for a finished landing: [`LandingStage::Refused`] or
+  /// [`LandingStage::Aborted`] for a granted landing that was refused, after the records of the steps it took.
   pub outcome: Option<LandingStage>,
   /// How the landing's signature was judged (signed work, A-321), on a record of the landing as a whole — its
   /// presentation's and a granted run's [`AuditKind::LandingPlanned`], its [`AuditKind::LandingFinished`]
-  /// ([`Verification::Unsigned`] when it carried none): the landing's provenance. `None` on every other record.
+  /// ([`Verification::Unsigned`] when it carried none): the landing's provenance. `None` on every other record, and on
+  /// the end of a landing refused before anything named its manifest, which had no statement to judge.
   pub verification: Option<Verification>,
 }
 
