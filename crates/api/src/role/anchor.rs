@@ -9,7 +9,9 @@
 //! (`slates_machine::process_clock`), by the rule its watchdog judges each shard by once it runs
 //! (`slates_server::watchdog::ShardWatch`): no CPU progress for a liveness window is a start
 //! that is stuck, and a window of CPU with no first beat is one that spins; a start that keeps
-//! progressing, however slowly, is starved and waited for. Until 2026-11-07 a start that had not
+//! progressing, however slowly, is starved and waited for, and so is one whose process waits on memory while the host
+//! reports a memory stall (A-336: `slates_machine::memory_stall`, and the process's threads read as the watchdog reads a
+//! shard's, `slates_rt::process_run_reading`). Until 2026-11-07 a start that had not
 //! beaten within the fixed recovery budget, a wall second, was killed, and every restart started
 //! over: on this Mac at 144 spinners on 18 CPUs the anchor killed 153 starts of 153, each
 //! 1.07-1.22 s after its spawn, after it had used 16-18 ms of CPU.
@@ -24,6 +26,8 @@ use slates_anchor::{AnchorSegment, RegionKind, RestartPolicy, Stopping, Supervis
 use slates_machine::MachineProfile;
 use slates_server::DaemonConfig;
 use slates_server::daemon::{HEARTBEAT_NS, LIVENESS_BUDGET_NS};
+#[cfg(test)]
+use slates_server::watchdog::Want;
 use slates_server::watchdog::{Look, ShardWatch, Verdict};
 use slates_vfs::clock::{Clock, HostClock};
 
@@ -354,38 +358,72 @@ fn stop_gracefully(supervisor: &mut Supervisor, clock: &mut HostClock) -> Result
 /// One look at the starting daemon in its own CPU time (`slates_machine::process_clock`): its progress and its busiest
 /// thread's CPU, judged by the watchdog's rule over the liveness window ([`LIVENESS_BUDGET_NS`]; A-232 derives it for both): a start's first instructions are
 /// its one step, so it is alive while its CPU progresses and has run less than a window of it, and starved, not stuck,
-/// while its CPU stands still with one of its threads runnable (`slates_rt::process_runnable`, A-228's rule). With no
-/// clock reading (the process already gone) the wall window stands alone, as for a shard with no thread clock.
+/// while its CPU stands still with one of its threads runnable (`slates_rt::process_run_reading`, A-228's rule), or with
+/// none runnable while the host reports a memory stall and its threads' waits are ones memory can show as (A-336: on
+/// Linux one held in the kernel, `D`; elsewhere any). With no clock reading (the process already gone) the wall window
+/// stands alone, as for a shard with no thread clock.
 fn judge_start(supervisor: &Supervisor, watch: &mut ShardWatch, now: u64) -> Verdict {
-  judge_start_of(supervisor.child_pid(), watch, now)
+  judge_start_of(
+    supervisor.child_pid(),
+    watch,
+    now,
+    slates_machine::memory_stall::read(),
+  )
 }
 
-/// [`judge_start`] for the process `pid` names.
-fn judge_start_of(pid: Option<u32>, watch: &mut ShardWatch, now: u64) -> Verdict {
+/// [`judge_start`] for the process `pid` names, with the host's memory stall at this look `memory`
+/// (`slates_machine::memory_stall::read`).
+fn judge_start_of(
+  pid: Option<u32>,
+  watch: &mut ShardWatch,
+  now: u64,
+  memory: Option<slates_machine::memory_stall::StallReading>,
+) -> Verdict {
   // The spinning rule is a thread's: a window of CPU on one thread without a step, so the CPU judged is the busiest
   // thread's. The process's sum is no such reading: a start whose shards begin in parallel sums past a window while no
   // thread nears one (every start of 23 shards on a 32-CPU Studio was killed, 2026-11-08). Where the threads cannot be
   // read nothing is judged spinning, and the progress alone judges a start wedged.
-  let cpu = pid
-    .and_then(slates_machine::process_clock::process_cpu)
-    .map(|reading| (reading.busiest_thread_ns.unwrap_or(0), reading.progress));
+  let clock = || {
+    pid
+      .and_then(slates_machine::process_clock::process_cpu)
+      .map(|reading| (reading.busiest_thread_ns.unwrap_or(0), reading.progress))
+  };
   // Before 2026-11-08 a start had no scheduler reading, so a start held off its CPUs for a window was killed as stuck
-  // ("made no progress for 1014 ms; killing it" in `held_rendezvous` on CI's Windows runner).
-  let run = pid
-    .and_then(slates_rt::process_runnable)
-    .map(|runnable| slates_rt::RunReading {
-      state: if runnable {
-        slates_rt::RunState::Runnable
-      } else {
-        slates_rt::RunState::Blocked
-      },
-      waited_ns: None,
-    });
+  // ("made no progress for 1014 ms; killing it" in `held_rendezvous` on CI's Windows runner). Before A-336 a process
+  // waiting on memory, every thread off the CPU, was stuck the same way, a daemon paging whole killed at its lapse.
+  judge_start_by(watch, (now, memory), clock, || {
+    pid.and_then(slates_rt::process_run_reading)
+  })
+}
+
+/// The start's rule over its readings, taken in this order (g243's rule for an observation, which the watchdog's look
+/// shares): the process's `clock`, what the `scheduler` says of its threads, and, when that answer is a block, the clock
+/// again. A process that ran between the first read and the answer has moved, whatever the answer says, and the look
+/// takes the second read; with no rise, the answer stands for the window, since a thread leaves the run queue for a
+/// block only by running, which the clock would show. With the first read alone, a start blocked in a call for most of a
+/// window whose call returned just then ran and blocked again before the scheduler looked, and was judged stuck, the
+/// window still and never runnable; the anchor kills a start on that verdict. A runnable answer is starved, not stuck,
+/// whatever the clock, so it needs no second read.
+fn judge_start_by(
+  watch: &mut ShardWatch,
+  (now, memory): (u64, Option<slates_machine::memory_stall::StallReading>),
+  mut clock: impl FnMut() -> Option<(u64, u64)>,
+  scheduler: impl FnOnce() -> Option<slates_rt::RunReading>,
+) -> Verdict {
+  let first = clock();
+  let run = scheduler();
+  let blocked = run.is_some_and(|run| run.state == slates_rt::RunState::Blocked);
+  let cpu = match (first, blocked.then(&mut clock).flatten()) {
+    (Some((_, before)), Some(again)) if again.1 > before => Some(again),
+    (None, again @ Some(_)) => again,
+    _ => first,
+  };
   let look = Look {
     steps: 0,
     parked: false,
     cpu,
     run,
+    memory,
     now_ns: now,
   };
   // A start's thread is held to the liveness budget itself, whatever the build: A-318 holds only the daemon's own
@@ -447,7 +485,12 @@ fn on_lapse(
   let looked_age = now.saturating_sub(seen.looked_ns.unwrap_or(0).max(seen.resumed_ns));
   let pid = supervisor.child_pid();
   match judge_lapse(seen.looked_ns.is_some() && looked_age <= seen.bound, || {
-    judge_start_of(pid, &mut quiet.watch, now)
+    judge_start_of(
+      pid,
+      &mut quiet.watch,
+      now,
+      slates_machine::memory_stall::read(),
+    )
   }) {
     Lapse::Withheld => {
       slates_machine::log_line!(
@@ -815,6 +858,57 @@ fn lapse_wait(watch: Watch, beat_ns: u64, now_ns: u64, budget_ns: u64) -> u64 {
 mod lapse_tests {
   use super::*;
 
+  /// g243's sibling (`docs/bugs/2026-11-18-an-observation-read-the-clock-before-the-scheduler.md`), A-228's start rule.
+  /// Do: judge a start blocked in a call, its clock still and never runnable, look by look for most of a window; at the
+  /// look that ends the window, script its reads in the order the rule takes them: the clock still, the scheduler
+  /// finding it blocked, and the clock read again after that answer, risen (the call returned and the start ran between
+  /// the first read and the answer). Expect: alive. With the first read alone the start was stuck, still for the window
+  /// and never runnable, and the anchor kills a stuck start. A second read that shows no rise stands with the answer:
+  /// stuck, as before.
+  #[test]
+  fn a_start_that_runs_between_its_clock_and_the_schedulers_answer_has_moved() {
+    let blocked = || {
+      Some(slates_rt::RunReading {
+        state: slates_rt::RunState::Blocked,
+        waited_ns: None,
+        uninterruptible: None,
+      })
+    };
+    let looks = LIVENESS_BUDGET_NS / HEARTBEAT_NS;
+    let watched = |watch: &mut ShardWatch| {
+      for look in 1..=looks {
+        let verdict = judge_start_by(
+          watch,
+          (look * HEARTBEAT_NS, None),
+          || Some((10, 10)),
+          blocked,
+        );
+        assert_eq!(
+          verdict,
+          Verdict::Alive,
+          "look {look}: still for less than a window"
+        );
+      }
+    };
+    let ends = (looks + 1) * HEARTBEAT_NS;
+    let mut moved = ShardWatch::default();
+    watched(&mut moved);
+    let mut reads = [Some((10, 10)), Some((12, 12))].into_iter();
+    let verdict = judge_start_by(&mut moved, (ends, None), || reads.next().flatten(), blocked);
+    assert_eq!(
+      verdict,
+      Verdict::Alive,
+      "it ran between its clock and the answer"
+    );
+    let mut still = ShardWatch::default();
+    watched(&mut still);
+    let verdict = judge_start_by(&mut still, (ends, None), || Some((10, 10)), blocked);
+    assert!(
+      matches!(verdict, Verdict::Wedged { .. }),
+      "still at both reads and blocked: stuck a window after it last moved, {verdict:?}"
+    );
+  }
+
   /// A-232, §4.14. Do: judge a lapsed beat with the watchdog still looking, and with it silent while the daemon's process
   /// is alive, starved, wedged (no CPU, never runnable: frozen) or spinning (a window of CPU on one thread). Expect: a
   /// looking watchdog's lapse is its verdict and kills without asking about the process; a silent one kills only a
@@ -828,7 +922,17 @@ mod lapse_tests {
       )),
       Lapse::Withheld
     );
-    for spared in [Verdict::Alive, Verdict::Starved { for_ns: window }] {
+    for spared in [
+      Verdict::Alive,
+      Verdict::Starved {
+        for_ns: window,
+        of: Want::Cpu,
+      },
+      Verdict::Starved {
+        for_ns: window,
+        of: Want::Memory,
+      },
+    ] {
       assert_eq!(judge_lapse(false, || spared), Lapse::Starved, "{spared:?}");
     }
     for stuck in [
@@ -843,6 +947,212 @@ mod lapse_tests {
         "{stuck:?}"
       );
     }
+  }
+
+  /// Format: the environment variable under which [`a_held_process_role`] holds its process; unset, it returns at once.
+  const HELD_ROLE_ENV: &str = "SLATES_ANCHOR_HELD_PROCESS_ROLE";
+  /// Format: [`a_held_process_role`]'s name for libtest.
+  const HELD_ROLE: &str = "role::anchor::lapse_tests::a_held_process_role";
+  /// The role: holds this process where a process waiting on memory is, until its standard input ends (its parent
+  /// closes it, or ends): on Linux its test thread held in the kernel past signals ([`hold_in_the_kernel`]); elsewhere
+  /// every thread blocked, the test's in a read of standard input.
+  #[test]
+  #[ignore = "a role: run by a_process_waiting_on_memory_is_spared_while_the_host_stalls_and_stuck_a_window_after"]
+  fn a_held_process_role() {
+    if std::env::var_os(HELD_ROLE_ENV).is_none() {
+      return;
+    }
+    hold_in_the_kernel();
+  }
+
+  /// Shape: the stack the held thread's child runs its two calls on (a read and an exit).
+  #[cfg(target_os = "linux")]
+  const CHILD_STACK: usize = 64 * 1024;
+
+  /// The child of [`hold_in_the_kernel`]: reads one byte of standard input (or its end), then exits. It runs on its own
+  /// stack in the parent's memory, so it makes no allocation and takes no lock: two system calls.
+  #[cfg(target_os = "linux")]
+  extern "C" fn read_standard_input_then_exit(_: *mut libc::c_void) -> libc::c_int {
+    let mut byte = 0_u8;
+    // SAFETY: `byte` is this frame's own; descriptor 0 is the process's standard input.
+    unsafe {
+      libc::syscall(
+        libc::SYS_read,
+        libc::c_long::from(libc::STDIN_FILENO),
+        (&raw mut byte).cast::<libc::c_void>(),
+        1_usize,
+      );
+      libc::_exit(0)
+    }
+  }
+
+  /// Holds the calling thread where the kernel holds a thread waiting on a page-in, in a wait past signals (`D`): it
+  /// clones a child that shares its memory and makes it wait (`CLONE_VM | CLONE_VFORK`, as `vfork` does), so the kernel
+  /// keeps it in `wait_for_vfork_done` until the child has read standard input and exited; then reaps the child. As
+  /// `slates_rt`'s `thread_clock` tests hold one (`hold_in_the_kernel` there).
+  #[cfg(target_os = "linux")]
+  fn hold_in_the_kernel() {
+    let mut stack = vec![0_u8; CHILD_STACK];
+    let top = stack.as_mut_ptr().wrapping_add(CHILD_STACK);
+    // SAFETY: the child runs `read_standard_input_then_exit` on `stack`, which outlives it (the call returns only once
+    // the child has exited, `CLONE_VFORK`); it shares this process's memory and touches nothing but its own stack.
+    let child = unsafe {
+      libc::clone(
+        read_standard_input_then_exit,
+        top.cast(),
+        libc::CLONE_VM | libc::CLONE_VFORK | libc::SIGCHLD,
+        std::ptr::null_mut(),
+      )
+    };
+    assert!(child > 0, "the child was cloned");
+    let mut status = 0;
+    // SAFETY: reaps this thread's own child; `status` is this frame's own.
+    unsafe { libc::waitpid(child, &raw mut status, 0) };
+    drop(stack);
+  }
+
+  /// Holds the calling thread blocked in a read of standard input, as every blocked wait reads where the platform does
+  /// not tell a memory wait from another; the read ends at standard input's end.
+  #[cfg(not(target_os = "linux"))]
+  fn hold_in_the_kernel() {
+    use std::io::Read;
+    let mut byte = [0_u8];
+    let _ = std::io::stdin().read(&mut byte);
+  }
+
+  /// A started process killed and reaped when dropped, however the test ends.
+  struct Held(std::process::Child);
+
+  impl Drop for Held {
+    fn drop(&mut self) {
+      let _ = self.0.kill();
+      let _ = self.0.wait();
+    }
+  }
+
+  /// What [`judge_held`] saw: when (since its first look's base) the process was found stuck, if it was; the verdicts
+  /// in order; and the largest gap between two of its looks, the lateness a busy machine adds to a verdict's time.
+  struct Judged {
+    stuck_at: Option<Duration>,
+    verdicts: Vec<Verdict>,
+    largest_gap: Duration,
+  }
+
+  /// Judges the held process `pid` as the anchor judges a daemon whose watchdog stopped looking, a look a beat, on the
+  /// clock `base` (the watch's), from now until it is found stuck or `span` passes, with the host's memory reading
+  /// `memory`.
+  fn judge_held(
+    pid: u32,
+    (watch, base): (&mut ShardWatch, std::time::Instant),
+    span: Duration,
+    memory: Option<slates_machine::memory_stall::StallReading>,
+  ) -> Judged {
+    let from = std::time::Instant::now();
+    let mut judged = Judged {
+      stuck_at: None,
+      verdicts: Vec::new(),
+      largest_gap: Duration::ZERO,
+    };
+    let mut last_look = from;
+    while from.elapsed() < span {
+      let (_hold, look) = std::sync::mpsc::channel::<()>();
+      let _ = look.recv_timeout(Duration::from_nanos(HEARTBEAT_NS));
+      judged.largest_gap = judged.largest_gap.max(last_look.elapsed());
+      last_look = std::time::Instant::now();
+      let now = u64::try_from(base.elapsed().as_nanos()).unwrap_or(u64::MAX);
+      let verdict = judge_start_of(Some(pid), watch, now, memory);
+      judged.verdicts.push(verdict);
+      if start_stuck(verdict).is_some() {
+        judged.stuck_at = Some(from.elapsed());
+        break;
+      }
+    }
+    judged
+  }
+
+  /// A-336, §4.14, the anchor's lapse and start judgment. Do: start a process held where a process waiting on memory is
+  /// (this binary re-invoked as [`a_held_process_role`]: on Linux a thread held in the kernel past signals, elsewhere
+  /// every thread blocked); once the scheduler reads it so, judge it as the anchor judges a daemon whose watchdog
+  /// stopped looking, a look a beat, for three windows while the host reports a memory stall, then for up to three more
+  /// with the stall cleared. Expect: never stuck while the host stalls, and starved for memory once a window has
+  /// passed; stuck within a window and three looks of the stall clearing. Before, the process was stuck a window after
+  /// it stopped, and the anchor killed a daemon paging whole at its lapse.
+  #[test]
+  #[cfg(not(miri))]
+  fn a_process_waiting_on_memory_is_spared_while_the_host_stalls_and_stuck_a_window_after() {
+    let window = Duration::from_nanos(LIVENESS_BUDGET_NS);
+    let look = Duration::from_nanos(HEARTBEAT_NS);
+    let held = Held(
+      std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", HELD_ROLE])
+        .env(HELD_ROLE_ENV, "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap(),
+    );
+    let pid = held.0.id();
+    let platform_tells = cfg!(target_os = "linux");
+    let settled = std::time::Instant::now();
+    loop {
+      let reading = slates_rt::process_run_reading(pid);
+      let held_as_wanted = reading.is_some_and(|reading| {
+        reading.state == slates_rt::RunState::Blocked
+          && (!platform_tells || reading.uninterruptible == Some(true))
+      });
+      if held_as_wanted {
+        break;
+      }
+      assert!(
+        settled.elapsed() < window * 10,
+        "the role never settled where a process waiting on memory is: {reading:?}"
+      );
+      let (_hold, pause) = std::sync::mpsc::channel::<()>();
+      let _ = pause.recv_timeout(look);
+    }
+    let mut watch = ShardWatch::default();
+    let base = std::time::Instant::now();
+    let pressed = Some(slates_machine::memory_stall::StallReading::Level { pressed: true });
+    let during = judge_held(pid, (&mut watch, base), window * 3, pressed);
+    let clear = Some(slates_machine::memory_stall::StallReading::Level { pressed: false });
+    let after = judge_held(pid, (&mut watch, base), window * 3, clear);
+    drop(held);
+    let for_memory = |verdict: &&Verdict| {
+      matches!(
+        verdict,
+        Verdict::Starved {
+          of: Want::Memory,
+          ..
+        }
+      )
+    };
+    println!(
+      "a process waiting on memory: stuck while the host stalled {:?}; starved for memory at {} of {} looks; stuck {:?} \
+       after the stall cleared, the looks' largest gap {:?}",
+      during.stuck_at,
+      during.verdicts.iter().filter(for_memory).count(),
+      during.verdicts.len(),
+      after.stuck_at,
+      after.largest_gap
+    );
+    assert_eq!(
+      during.stuck_at, None,
+      "stuck while the host stalled: {:?}",
+      during.verdicts
+    );
+    assert!(
+      during.verdicts.iter().any(|verdict| for_memory(&verdict)),
+      "starved for memory once a window had passed: {:?}",
+      during.verdicts
+    );
+    let stuck_after = after.stuck_at.expect("stuck once the stall cleared");
+    // The last look that saw the stall came at most one look's gap before the clear, and the verdict comes at the first
+    // look a window past it.
+    assert!(
+      stuck_after <= window + after.largest_gap * 2,
+      "stuck {stuck_after:?} after the stall cleared, past a window and two of the looks' largest gap ({:?})",
+      after.largest_gap
+    );
   }
 
   /// A-228, §4.14. Do: feed the anchor's lateness window a quiet history (waits on time), then a late one (each wait
@@ -1129,7 +1439,7 @@ mod tests {
       {
         wait(LOOK);
         let now = u64::try_from(watched.elapsed().as_nanos()).unwrap();
-        let verdict = judge_start_of(Some(pid), &mut watch, now);
+        let verdict = judge_start_of(Some(pid), &mut watch, now, None);
         if matches!(verdict, Verdict::Starved { .. }) {
           starved_looks += 1;
         }
