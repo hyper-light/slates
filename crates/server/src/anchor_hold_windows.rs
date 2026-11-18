@@ -114,6 +114,18 @@ pub(crate) struct HandedMount {
   pub(crate) adoptable: bool,
 }
 
+/// A Shards stream's resync end the anchor handed back (A-433): its attachment, the daemon's end of the stream's resync
+/// pipe, and its record, the stream's session as last told (`crate::shards`'s `resync::from_handle_session`).
+#[derive(Debug)]
+pub(crate) struct HandedResync {
+  /// The attachment whose stream the end resyncs.
+  pub(crate) attachment: u64,
+  /// The daemon's end of the resync pipe.
+  pub(crate) end: OwnedHandle,
+  /// The session as last told.
+  pub(crate) record: Vec<u8>,
+}
+
 /// A connection the anchor handed back: its id and the socket. None is handed back on Windows.
 #[derive(Debug)]
 pub(crate) struct HandedConnection {
@@ -123,12 +135,15 @@ pub(crate) struct HandedConnection {
   pub(crate) socket: OwnedStream,
 }
 
-/// The inherited mount objects and the fresh control channel; Windows NFS connections are still owed.
+/// The inherited mount objects, the Shards streams' resync ends and the fresh control channel; Windows NFS connections
+/// are still owed.
 #[derive(Debug, Default)]
 pub(crate) struct Handed {
   /// The held NFS connections.
   pub(crate) connections: Vec<HandedConnection>,
   pub(crate) mounts: Vec<HandedMount>,
+  /// The held Shards streams' resync ends (A-433).
+  pub(crate) resync_ends: Vec<HandedResync>,
   pub(crate) channel: Option<OwnedHandle>,
 }
 
@@ -155,6 +170,33 @@ pub(crate) fn adopt(bound: usize) -> Handed {
     }
   };
   for entry in entries {
+    // A Shards stream's resync end (A-433), one handle: kept for the shard that owns its attachment, which serves the
+    // stream again or lets the end go. One this process cannot own keeps its id as a refused entry with no handle, so
+    // the control shard releases the anchor's copy; its value is never taken a second time.
+    if entry.what == WHAT_SHARDS_RESYNC
+      && let [value] = entry.values.as_slice()
+    {
+      match adopted(*value) {
+        Ok(end) => handed.resync_ends.push(HandedResync {
+          attachment: entry.id,
+          end,
+          record: entry.record,
+        }),
+        Err(error) => {
+          slates_machine::log_line!(
+            "slates-server: held resync end {} refused: {error}",
+            entry.id
+          );
+          handed.mounts.push(HandedMount {
+            attachment: entry.id,
+            handles: Vec::new(),
+            record: entry.record,
+            adoptable: false,
+          });
+        }
+      }
+      continue;
+    }
     let mut owned = Vec::new();
     let mut refused = false;
     for value in entry.values {

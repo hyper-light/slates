@@ -798,9 +798,11 @@
 >   day): a resync end is a kind of held entry of one handle, and a daemon replaces a held entry's record as the
 >   stream's session moves; and the attach's half (A-427, the same day): the message-mode resync pipe made at the
 >   attach, held by the anchor before the stream serves anything, its session and holder told before any reply that
->   rests on them, its device end handed to the client beside the stream's. Owed after them: the successor's half
->   (adopting the held end, the duplicate into the holder, the replies kept for a resend) and `slates shards`
->   handing the resync end to its command. **Built since (A-402, 2026-11-18):** the write log on
+>   rests on them, its device end handed to the client beside the stream's; and the successor's half (A-433, the same
+>   day): the held end adopted, a fresh pipe duplicated into the holder the session names (checked by its creation
+>   time) and named in a `Resync`, the replies kept for a resend, and `slates shards` handing the end where
+>   `{resync}` stands. Owed on Windows: a stream's DAX sections held by the anchor (it gives its resync up at its
+>   first map). **Built since (A-402, 2026-11-18):** the write log on
 >   Windows, so a Windows stream's acknowledged writes outlive its daemon's death, replayed into the volume (its Windows
 >   run is main's, `run-requests.md`); before, a Windows stream's acknowledged writes since the last publication were
 >   lost at its daemon's death. Found with A-365 (Linux), **fixed by A-389 (2026-11-18)**:
@@ -854,8 +856,12 @@
 >   and `capture_base` (§4.15's status: `Instance::capture_base`, contract 34) with the move of a clone of a captured
 >   base, the form a kiln workspace takes (decided below), held by a three-daemon test that moves such a clone, serves it
 >   on its new owner and destroys the captured snapshot once the old owner let the clone go.
-> - **Owed, in order:** kiln's runners as members (certificates under kiln's CA as the manifest's enrollment root,
->   seeds from kiln's runner directory); kiln's relocation of an agent with its volume (detach, move, attach on the
+> - **Kiln's runners as members (2026-11-18, kiln goal 95101ef3, its pieces K1-K3):** each runner's node key and its
+>   certificate from kiln's CA naming the fleet and the runner's failure domain (K1), the runners that join found
+>   through kiln's server and the manifest written per runner with kiln's CA as its enrollment root (K2), and the
+>   operator's choice of which runners join, with `f` and each node's address, a chosen runner's Slates started with
+>   `StartSpec.fleet` once `role::check_fleet` (contract 39) read the manifest it wrote as its start will (K3).
+> - **Owed, in order:** kiln's relocation of an agent with its volume (detach, move, attach on the
 >   target) and its workspaces made as clones of a captured base; the automatic migration by the origin of the last N
 >   writes (AC-8.16's other half); a move carrying snapshots other than the head; a multi-runner test with injected
 >   faults. The capture's own owed parts: admission reserving its cost ahead, a large file read across slices rather
@@ -1039,6 +1045,29 @@
 >
 > Beyond the goal's clauses, owed from this entry: the async form for the remaining verbs, the MCP list tools answering
 > a page at a time, and a merge's versions typed on the wire.
+
+> **The Node SDK suites on Windows (2026-11-18, §4.7 status "the Node SDK suites end on Windows"; goal 88).** The three
+> Node suites had never run on Windows: CI's `sdk` job ran on `ubuntu-latest` and `macos-latest` alone. Main's diag run
+> 44384411115 (main da697d886) ran them on both Windows runners, and the step went past 70 minutes until cancelled, with
+> no log kept. The cause, read from the code: every teardown sent `process.kill(-anchor.pid, 'SIGKILL')`, which Windows
+> refuses (libuv opens the process by its id, and there are no groups), and swallowed the refusal; the anchor lived on,
+> and its process handle kept `node --test` waiting. **Built:** one teardown the three suites share
+> (`crates/sdk-node/tests/anchor.mjs`): the group kill on Unix, and on Windows the anchor's own process ended, whose
+> kill-on-close job ends its daemon (`crates/anchor/src/supervise.rs`); a teardown fails its test when the anchor still
+> runs 20 s after its kill. CI's `sdk` job gains `windows-latest` and `windows-11-arm` legs that run the Node suites
+> and the packaged smoke test, each Node step bounded at 30 minutes; the packaged test's helper is copied beside it in
+> `ci.yml`, `.kiln/ci.yaml` and `.kiln/nightly.yaml`. **Owed:**
+> - the first Windows run of the three suites (filed for main; red would be a suite failing, not hanging);
+> - the Python suites on Windows: the `sdk` job's Python steps assume a Unix venv (`venv/bin/pip`), and the suites
+>   themselves start the anchor with `start_new_session` and end it with `os.killpg(os.getpgid(..), SIGKILL)`
+>   (`test_sdk.py`, `test_sdk_async.py`), neither of which Windows has, and the async suite's freeze uses `pgrep` and
+>   `SIGSTOP` as the Node one does: the same teardown, the anchor's own process ended, is owed there;
+> - `every async call ends across restart, silence, reader loss and death` (`sdk_async.test.mjs`) skips loudly on
+>   Windows. It freezes the daemon with `SIGSTOP`/`SIGCONT`, finds the instance's daemons with `pgrep -f` and reads
+>   whether each has stopped with `ps -o state=`; none exists there. Its Windows twin freezes each process whole with
+>   `NtSuspendProcess`/`NtResumeProcess`, as `crates/cli/tests/start_judgment.rs` does, and finds them by command
+>   line; a Node test can make the call only through native code (a test helper the suite spawns, never the shipped
+>   addon).
 
 > **git, Mercurial and Subversion over the WinFsp drive (2026-11-17, Part 6 "Real workloads", §4.6; A-300; Ada's
 > goal of 2026-11-18).** The Windows lanes (`windows-lint`, `windows-arm64`) now run the roster's four version-control
@@ -3721,7 +3750,14 @@
 >   liveness window, hard, for its asks and its lent sessions; now the record plane's round budget over the slowest
 >   asked path's measured tail, `owner_location::round_budget_for`), an operator's promotion forwarded to the root
 >   group's leader (A-439: one liveness window; now the stall every forward over a leader session takes, the window and
->   the path's measured round-trip tail, `verbs::forward_stall_ns`) and the forward lane's stall (2026-11-18, A-315,
+>   the path's measured round-trip tail, `verbs::forward_stall_ns`), every callback on an NFSv4.1 back channel (A-442:
+>   one liveness window; now the carrying connection's learned round trip, RFC 6298 with Karn's rule, backed off after a
+>   timeout up to the NFSv4 lease, `callback::bound_ns`, sharing A-431's learner, `learned_wait`), a live exchange to a
+>   holder (A-444: one liveness window, hard; now its session's persistent-congestion duration, RFC 9002 §7.6.1 from the
+>   session plane's estimator, plus the transfer, and that duration's floor where no session is at hand,
+>   `live_ship::exchange_budget`, `fleet::live_budget`; `return_sessions`' silence floor the session's own probe timeout)
+>   and the forward
+>   lane's stall (2026-11-18, A-315,
 >   goal g255): a batch
 >   quiet for its budget is given up only once a turn of its lane begun after the silence was seen has read the
 >   session's own socket empty, or found no session at all, so an origin kept off its CPU reads its owner's replies
@@ -11251,6 +11287,16 @@ Owed:
 Shards streams on macOS have the same shape and are covered: their writes are logged since `1fa154230`; on Windows
 since A-402, which also makes the log option 2 names available to the WinFsp drive.
 
+### 2026-11-18: a snapshot exported as its archive through the library (Mantle's CP-T10.4; built, A-441); the volume from an archive owed
+
+> - **Built.** `Instance::export_archive` (contract 38): a snapshot rendered as its archive file (`ARCHIVE_FILE`) in a
+>   new volume of the caller's, walked in slices on the owner shard, read back a page at a time with `read`.
+>   `a_snapshot_exported_as_its_archive_carries_every_file_and_entry` decodes and restores what it reads back: every
+>   file's bytes, length and mode, the directories, none of a write after the snapshot, the same manifest twice.
+> - **Owed.** The volume made from an archive (import), through `slates_archive::Planning` as a takeover restores
+>   (`fleet::restore_in_turns`, `verbs::populate_making`), with hostile archives refused by kind: the next piece. A
+>   streamed encoder: the archive is held whole while it is encoded, one unit of its size.
+
 ### 2026-11-18: a volume a publication left out lost its logged writes at the next restart (found by reading; fixed, A-422)
 
 > - **Found.** By reading (g268, the write log's sibling sweep after A-410). `verbs::clear_write_log` stamped the write
@@ -18575,9 +18621,13 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   Red-checked on windows-latest (run 44367207034): the `ARCHIVE` set-aside and the default owner each; the own-drive
   refusal passes on both runners (run 44376034930), its red-check filed for main's run.
   **Owed:** `crates/server/tests/audit_crossing.rs` (main's, 2026-11-18) is gated to Unix only for its landing target
-  and has not run on Windows: lift its gate once a Windows run passes it; a symbolic link in a landing on Windows
-  (refused `EPERM`: no unprivileged, handle-relative way to make one);
-  a reflink (`FSCTL_DUPLICATE_EXTENTS_TO_FILE` on ReFS); A-262's landing half (the volume's other attribute bits); and
+  and has not run on Windows: lift its gate once a Windows run passes it; a symbolic link in a landing on Windows,
+  **built by A-438 the same day** (the Windows link in A-275's form, handle-relative, staged and moved into place, the
+  privilege enabled for its thread alone where the process holds it; its Windows test filed for main's lanes; still
+  owed with it: a directory link's type, which the seam does not carry, a Windows base reading a link back in A-275's
+  `/` form rather than its print name's `\`, and the Developer Mode route for an account without the privilege,
+  measured); a reflink (`FSCTL_DUPLICATE_EXTENTS_TO_FILE` on ReFS); A-262's landing half (the volume's other attribute
+  bits); and
   the seam's numbering: refusals the engine tells apart are POSIX numbers and the rest Win32 codes, so a Win32 code equal
   to one of the engine's numbers (`ERROR_NOT_SAME_DEVICE` 17, `ERROR_INSUFFICIENT_BUFFER` 122, among five) would read as
   that refusal; none of the writer's calls is known to answer one, and a typed refusal at the seam would close it.

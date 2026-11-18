@@ -1343,7 +1343,14 @@ impl LandFs for SimHost {
     Ok(())
   }
 
-  fn symlink(&mut self, dir: HostDir, name: &str, target: &str) -> Result<(), HostError> {
+  /// One step, as `symlinkat` makes a link: `staged` is not used (see the seam).
+  fn symlink(
+    &mut self,
+    dir: HostDir,
+    name: &str,
+    target: &str,
+    _staged: &str,
+  ) -> Result<(), HostError> {
     self.write_step()?;
     let parts = self.entry_parts(dir, name)?;
     if self.node(&parts).is_some() {
