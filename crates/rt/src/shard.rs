@@ -344,6 +344,8 @@ pub struct ShardContext {
   idle_ratio: u64,
   /// The least idle spin window, while tracking (A-223).
   idle_floor_ns: u64,
+  /// The longest one idle spin may run, window and holds alike, while tracking (A-361).
+  idle_ceiling_ns: u64,
   /// The configured step budget and idle spin, the quantum and the spin when not tracking.
   fixed_quantum_ns: u64,
   fixed_spin_ns: u64,
@@ -534,6 +536,11 @@ impl ShardContext {
         .map_or(crate::runtime::NO_IDLE_FLOOR_NS, |tracking| {
           tracking.idle_floor_ns
         }),
+      idle_ceiling_ns: config
+        .wake_tracking
+        .map_or(crate::runtime::NO_IDLE_CEILING_NS, |tracking| {
+          tracking.idle_ceiling_ns
+        }),
       fixed_quantum_ns: config.step_budget_ns,
       fixed_spin_ns: config.spin_ns,
       real_time: driver.kind() != DriverKind::Simulation,
@@ -642,11 +649,12 @@ impl ShardContext {
   /// Notes client work as [`note_activity`](Self::note_activity) does, and holds the idle window open until at least
   /// `window_ns` from now, however long the shard's own window is (§4.7; A-326): the daemon's hold for a client in R9's
   /// closed loop, whose next request may reach this shard only after the loop has gone round the others. The latest end
-  /// asked for stands; a later, shorter hold or a plain activity never cuts it short. Called on the shard's own thread.
+  /// asked for stands; a later, shorter hold or a plain activity never cuts it short. No hold runs past the shard's
+  /// idle ceiling from now (A-361). Called on the shard's own thread.
   pub fn hold_idle_window(&self, window_ns: u64) {
     let now = self.now_ns();
     self.activity_ns.set(Some(now));
-    let until = now.saturating_add(window_ns);
+    let until = now.saturating_add(window_ns.min(self.idle_ceiling_ns));
     if until > self.held_until_ns.get() {
       self.held_until_ns.set(until);
     }
@@ -1507,16 +1515,17 @@ impl ShardContext {
   }
 
   /// The idle spin window now, while the shard tracks an estimate: the online wake estimate times the configured
-  /// idle ratio, and at least the configured floor (§4.3, §4.7; A-223). The runtime's own spin-then-park has
-  /// ratio 1 and no floor, the 2-competitive spin. The daemon's floor is R9's provisioning floor, and its ratio
-  /// what the platform's loaded wake was measured to need (`slates_server::config::loaded_wake_ratio`). The
-  /// configured spin while the shard tracks none.
+  /// idle ratio, at least the configured floor and at most the configured ceiling (§4.3, §4.7; A-223, A-361). The
+  /// runtime's own spin-then-park has ratio 1, no floor and no ceiling, the 2-competitive spin. The daemon's is R9's
+  /// provisioning floor alone (ratio 0, `slates_server::config::NO_ESTIMATE_MULTIPLE`), under its watchdog's window
+  /// (`slates_server::config::IDLE_SPIN_CEILING`). The configured spin while the shard tracks none.
   pub fn idle_window_ns(&self) -> u64 {
     self.wake.get().map_or(self.fixed_spin_ns, |estimate| {
       estimate
         .mean_ns()
         .saturating_mul(self.idle_ratio)
         .max(self.idle_floor_ns)
+        .min(self.idle_ceiling_ns)
     })
   }
 

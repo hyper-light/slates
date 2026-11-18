@@ -5331,8 +5331,8 @@ impl Drop for EndStreams {
 /// The shard's server loop: a poller of its clients' rings; serves while there is work, keeps
 /// polling for the idle window after its last work (§4.7 "Wake strategy": a shard polls while
 /// any client has activity within the window), and idles past it. The window is the shard's own
-/// (`ShardContext::idle_window_ns`): R9's floor, or the platform's multiple of its online wake estimate where a
-/// loaded wake costs more than parking saves (`config::idle_window_ns`; A-223).
+/// (`ShardContext::idle_window_ns`): R9's floor on every platform, no estimate pricing it, and never past the idle spin's
+/// ceiling (`config::NO_ESTIMATE_MULTIPLE`, `config::IDLE_SPIN_CEILING`; A-223, A-361).
 async fn serve_loop() {
   #[cfg(target_os = "linux")]
   let _end_mounts = EndMounts;
@@ -5347,7 +5347,7 @@ async fn serve_loop() {
   loop {
     let idle_window_ns = derived!(
       futures::idle_window_ns().unwrap_or(crate::config::PROVISION_FLOOR_NS),
-      "the shard's idle window: max(provision_floor_ns, wake estimate × loaded_wake_ratio)",
+      "the shard's idle window: provision_floor_ns, no estimate's multiple, under idle_spin_ceiling_ns",
       ["rt.idle_window_ns"]
     )
     .get();
