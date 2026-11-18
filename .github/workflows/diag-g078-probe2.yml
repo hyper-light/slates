@@ -1,0 +1,25 @@
+# Diagnostics only (never main): does an unconfined process enter a named userns profile by change_profile (the aa-exec
+# route A-370 rejects), on Ubuntu 24.04 and 26.04?
+name: diag-g078-probe2
+on:
+  push:
+    branches: ['diag-g078-probe2*']
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-latest]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: change_profile from unconfined into a named userns profile
+        shell: bash
+        run: |
+          head -2 /etc/os-release; uname -r
+          echo "restrict_unprivileged_unconfined: $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_unconfined)"
+          printf 'abi <abi/4.0>,\n\nprofile slates-probe flags=(unconfined) {\n  userns,\n}\n' | sudo apparmor_parser -r && echo loaded
+          echo "--- by the attribute (changeprofile), then unshare -Ur:"
+          sh -c 'echo "changeprofile slates-probe" > /proc/thread-self/attr/apparmor/current && echo "label: $(cat /proc/thread-self/attr/apparmor/current)" && exec unshare -Ur sh -c "echo inside: \$(id -u) \$(cat /proc/self/attr/apparmor/current)"' || echo "refused: $?"
+          echo "--- by aa-exec:"
+          aa-exec -p slates-probe -- unshare -Ur sh -c 'echo inside: $(id -u) $(cat /proc/self/attr/apparmor/current)' || echo "refused: $?"
+          sudo dmesg | grep 'apparmor=' | tail -6 || true
