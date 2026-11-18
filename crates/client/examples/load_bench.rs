@@ -2737,7 +2737,7 @@ mod tests {
   }
 
   /// AC-9.1 (the oracle's bounds rest on the harness's instants, `support/load_oracle.rs`): a worker the host keeps off
-  /// its CPU right after it hands a request to its ring, long enough for the daemon to answer it, still stamps that
+  /// its CPU before every clock read, long enough for the daemon to answer what it handed its ring, still stamps that
   /// request sent before the daemon wrote its reply. Stamped after the send returned, it recorded a send 100 ms after
   /// the answer, as the measurer's run recorded a submit sent after the verdict that reflected it (2026-11-18).
   #[test]
@@ -2745,14 +2745,14 @@ mod tests {
     let (daemon, mut observer, client, green) = stamp_daemon("send");
     let _ = spans(&mut observer);
     let holder = hold_the_shard(&daemon, &SEND_HOLD);
-    // The host takes the worker off its CPU before its first clock read: what it handed its ring by then, the shard,
-    // let go now, answers while it is away.
-    let mut preempted = true;
+    // The host takes the worker off its CPU before each of its clock reads, and the shard, let go at the first, answers
+    // whatever the worker handed its ring while the worker is away.
+    let mut first = true;
     let read: ClockRead = Box::new(move || {
-      if std::mem::take(&mut preempted) {
+      if std::mem::take(&mut first) {
         SEND_HOLD.release();
-        std::thread::sleep(PREEMPTION);
       }
+      std::thread::sleep(PREEMPTION);
       slates_machine::clock::monotonic_ns()
     });
     let mut worker = worker_creating_a_work(client, green, read);
