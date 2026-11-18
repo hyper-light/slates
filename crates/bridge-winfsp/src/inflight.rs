@@ -177,7 +177,6 @@ pub fn finish_response(packet: &mut [u8], status: i32) -> Result<usize, Refusal>
   Ok(aligned)
 }
 
-/// One checked request in a retained batch. Its payload remains opaque unless a specific checked accessor reads it.
 /// A hard link a patched WinFsp driver forwards (A-360): the open it names, the new name, and whether a taken name may be
 /// replaced.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,6 +189,7 @@ pub struct Link {
   pub replace: bool,
 }
 
+/// One checked request in a retained batch. Its payload remains opaque unless a specific checked accessor reads it.
 pub struct Request<'a> {
   bytes: &'a [u8],
   kind: u32,
