@@ -13017,3 +13017,62 @@ nothing in any run; no reply was lost (the anchored daemon's counters).
   length-changing edits.
 - **The large-file rung is capacity-bound before it is CPU-bound** on one owner shard: its first wall is the table its
   works fill, not the verdict.
+
+## A full edit and merge after W1 and the reply carrier: even on one shard, slower on every runner with more (goal 222; A-247, A-296; 2026-11-18)
+
+**What it is.** Goal 222's owed A/B: the loaded p99 and p999 of a single client's full edit and merge (`edit_merge_bench`,
+an edit of 64 bytes of a 4 KiB file and its submit to the green's verdict) on main before W1 and the reply carrier
+(`8dff8fcad`) and after both (`d0e737b8d`), on Linux, macOS and Windows, interleaved. Where the A/B moved, a second run
+with four arms named the landing: `8dff8fcad`, `3c0af9399` (W1 landed), `d0e737b8d` (A-296 landed) and `7d760c4ea`
+(main at the time).
+
+**Environment.** GitHub runners from diagnostics branches never merged, 2026-11-18 09:07 to 10:52 UTC: run 44272914208
+(two arms, all five runner kinds), 44279913406 (four arms, `ubuntu-24.04-arm` and `windows-11-arm`), 44283060368 (four
+arms, `macos-latest`). Every runner has 4 vCPUs (`macos-latest` 3); the in-process daemon derived 1 shard on the x86_64
+runners, 3 on the arm64 ones and 2 on `macos-latest`. Each arm's harness built release from its own source extract.
+Loaded on Linux is the controlled load of A-224: a `systemd-run --user --scope` capped at two CPUs and 256 MB, two
+spinning threads per core of the machine (8), and a sibling writer that fsyncs 16 MiB again and again; on macOS and
+Windows, the harness's own two spinning threads a core. Quiet ran right after, nothing else on the runner.
+
+**Command.** `edit_merge_bench --loaded-only --spinners-per-core 2 --files 10 --form accept --form conflict` and
+`edit_merge_bench --quiet-only --files 10 --files 1000 --form accept --form conflict`. Each invocation is 3 runs of up to
+1,000 samples; each cell below is the invocation's median over its 3 runs, as its `goal` line prints it; the arms were
+rotated each round, three rounds, and every round is inside the ranges shown. `--files 10`, microseconds unless marked:
+
+| runner (shards) | form | `8dff8fcad` p50 / p99 | `3c0af9399` (W1) | `d0e737b8d` (+ A-296) | `7d760c4ea` (main) |
+|---|---|---|---|---|---|
+| Linux x86_64 (1) | loaded accept | 14-15 / 4.3-9.0 ms | | 15-17 / 6.2-8.5 ms | |
+| Linux x86_64 (1) | quiet accept | 13 / 21-31 | | 13-17 / 21-30 | |
+| Windows x86_64 (1) | loaded accept | 33-35 / 70-71 | | 34-35 / 66-70 | |
+| Windows x86_64 (1) | quiet accept | 28-29 / 66-71 | | 28-31 / 65 | |
+| Linux arm64 (3) | loaded accept | 4.0-8.1 ms / 21.0-21.3 ms | 12.1-19.0 ms / 38.9-45.0 ms | 16.1-19.1 ms / 39.0-41.9 ms | 14.0-18.9 ms / 37.0-41.0 ms |
+| Linux arm64 (3) | quiet accept | 18 / 36-40 | 53-54 / 76-88 | 50-52 / 77-82 | 51-52 / 78-85 |
+| Linux arm64 (3) | quiet conflict | 15 / 34-35 | 55-58 / 82-88 | 51-55 / 75-81 | 49-55 / 76-84 |
+| Windows arm64 (3) | loaded accept | 29-32 / 106-129 | 71-72 / 23.4-42.6 ms | 66-78 / 46.7-164.8 ms | 67-78 / 45.2-162.8 ms |
+| Windows arm64 (3) | quiet accept | 24-28 / 55-62 | 67-80 / 117-152 | 61-78 / 107-132 | 65-70 / 110-118 |
+| macOS arm64 (2) | loaded accept | 70-76 / 5.7-7.9 ms | 306-319 / 14.6-16.1 ms | 260-349 / 13.6-21.2 ms | 238-279 / 13.1-14.7 ms |
+| macOS arm64 (2) | quiet accept | 105-108 / 221-231 | 97-106 / 233-240 | 106-128 / 238-344 | 93-109 / 220-241 |
+| macOS arm64 (2) | quiet conflict | 103-110 / 219-265 | 246-328 / 769-918 | 248-254 / 681-728 | 247-271 / 671-806 |
+
+The p999s follow the p99s: Linux x86_64 loaded 9.0-12.0 ms on both arms, Windows x86_64 loaded 0.11-10.2 ms before and
+31.8 ms in every after round, Linux arm64 loaded 24-27 ms before and 44-48 ms with W1. Under the 256 MB cap the arm64
+runners refused the 1,000-file green at capacity (`TableAtCapacity { table: "green_chains" }`), so their loaded rows are
+10 files only; the quiet 1,000-file rows moved as the 10-file ones did. No answer was wrong in any run.
+
+**On a 32-core Mac.** adas-mac-studio.local-2 (Apple M3 Ultra, 23 shards derived), 2026-11-18 10:15 to 10:19 UTC, load
+19.4 to 26.9, `--quiet-only` only (the box is shared), A B B A A B: accept p50 117-129 µs and p99 280-334 µs before,
+465-727 µs and 721-4,836 µs after; conflict p50 93-122 and p99 253-299 µs before, 353-515 and 558-805 µs after. The same
+two builds' 1,000-client rung (`load_bench --clients 1000 --hot-files 800 --rounds 3 --think-us 0`, in-process, 10:11
+UTC) went the other way: 5,177 to 5,933 verdicts a second before and 9,044 to 12,714 after, with the accept p99
+27.9-35.4 ms before and 19.0-39.5 ms after, no reply lost.
+
+**What it means.**
+- **W1 slowed the single client wherever the daemon has more than one shard**, and the reply carrier added nothing
+  measurable: a work on a shard other than its green's owner pays the hop at every edit and submit. Quiet, a 3-shard
+  runner's accept went from 18 to about 52 µs at the median (Linux arm64) and 24-28 to 61-80 µs (Windows arm64); loaded,
+  the Linux arm64 p99 doubled and the Windows arm64 p99 went from about 0.1 ms to 23-165 ms. On one shard the arms are
+  even. Main still carries it.
+- **Many clients gain from W1 what one client loses:** at 1,000 clients the same build answers 1.7 to 2.2 times the
+  verdicts a second.
+- **The goal is met on no platform under load:** loaded p99 4.3-45 ms on Linux, 5.7-21 ms on macOS, 23-165 ms on Windows
+  arm64 after W1; only Windows x86_64's single shard holds its p99 near 70 µs, with a p999 of 31.8 ms.
