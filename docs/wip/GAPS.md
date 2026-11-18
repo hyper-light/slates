@@ -879,7 +879,44 @@
 >     lists. Behind a held floor, 64 versions of 64-byte overwrites of a 1 MiB file under a 16 MiB cap: 16 of 64
 >     accepted before, 64 after (`green_retention.rs`, CI runs 42358895080 and 42367326179);
 >   - a stated offered load per client for the 1 ms bound. At zero think time, 100k clients at 1 ms is 10⁸
->     operations a second.
+>     operations a second. **The harness's half is built (2026-11-17, g231):**
+>     - `--think-us` is the mean of an exponential pause drawn after every reply and before each client's first
+>       request. Many independent clients' requests together approach a Poisson stream whatever each one's own pauses
+>       (the Palm–Khintchine theorem). The fixed pause it replaces sent every client's first request at the same
+>       instant and kept the clients bunched after, which no fleet of independent agents does.
+>     - Every level prints an `offered` row: replies, verdicts and rebases a second, and the time-averaged number of
+>       clients in flight, thinking, pausing after a refusal for now, and held, and their sum. A held client is due to
+>       send and not sent, by the harness's sweep or its connection's ring or in-flight bound; its wait is summed at
+>       its send and is in no latency row, since a latency is stamped at the send.
+>     - Unit tests in the example (`cargo test -p slates-client --example load_bench`): the draws' mean and their
+>       shares past one and two means against the exponential's, within five standard errors of 200,000 draws; two
+>       workers' draws apart (fewer than 1% equal); the row's account of each state of the clients and their sum; a
+>       level of no wall time reporting zeroes.
+>
+>     **Why think time 0 cannot meet the bound, on any build.** Each round of a client holds a verdict, the green's one
+>     serialized step. In the closed loop at think time 0 the owner finishes at most one round per verdict's cost of its
+>     CPU, so a round takes at least the clients × that cost (Little's law). The owner's CPU a verdict was 21.0–26.9 µs
+>     on W1 and 37.6–50.9 µs on main db9c514e (agents/perf-w1's BENCHMARKS, 2026-11-09). So at 1,000 clients a round
+>     takes at least 21 ms on W1 and 38 ms on main. A round is six requests (four edits, the append and the submit),
+>     and holding each under 1 ms at think time 0 would need a verdict of at most 6 µs at 1,000 clients and 60 ns at
+>     100,000. A conflict adds verdicts and rebases to the round, and lowers both bounds further.
+>
+>     **The proposed statement (a decision for Ada, owner g231).** The bound holds at §1.4's offered increment rate per
+>     green: tens of increments a second for a few agents, thousands for a fleet session (hecate MERGE.md §7). The green
+>     rate is the same at every rung, so a client's share falls as the clients grow. At 100,000 clients a thousand
+>     increments a second is one submit a client every 100 s, about an agent's pace; at 1,000 clients it is one a
+>     second each.
+>     - Each rung sweeps its think mean so the verdicts a second (the `offered` row) span the fleet row, 10³ to 10⁴.
+>     - Each rung reports the highest rate at which every kind's p99 stays under 1 ms: the rung's capacity at the
+>       bound, which ratchets upward only.
+>     - The bound holds where that capacity covers 10³, the fleet row's floor.
+>     - The closed loop at think time 0 is the rung's capacity, reported in verdicts a second and never against the
+>       bound.
+>
+>     **Owed, measurement (the supervisor's):** the 1,000-client rung on main, and on W1 once it lands. Each think mean
+>     runs as its own invocation with a fresh daemon, interleaved across builds: every kind's p50, p99, p999 and max,
+>     and the `offered` row. A think mean of about 200 ms gives about 10³ verdicts a second at 1,000 clients (a round of
+>     about six requests a client), and about 20 ms gives about 10⁴. The run's own verdicts a second are the figure.
 >
 >   The 10,000-client rung (same Studio, load 9.8 to 10.9, 313 connections) did not finish within its 30-minute bound.
 >   After 1,775 s about 2,170 of 10,000 clients were done and about 11,600 submits counted, with daemon RSS 17.6 GB.
