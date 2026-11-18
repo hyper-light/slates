@@ -904,6 +904,10 @@ impl Daemon {
     }
     #[cfg(windows)]
     let mut inherited_winfsp = crate::winfsp::split_held(handed.mounts, shards.len()).into_iter();
+    // The Shards streams' resync ends (A-433), each to the shard that owns its attachment.
+    #[cfg(windows)]
+    let mut inherited_resync =
+      crate::shards::split_held_resync(handed.resync_ends, shards.len()).into_iter();
     #[cfg(windows)]
     let mut windows_channel = handed.channel;
     #[cfg(windows)]
@@ -934,6 +938,7 @@ impl Daemon {
         } else {
           None
         },
+        inherited_resync.next().unwrap_or_default(),
       );
       // This shard's learning of the mounts it keeps, taken before it starts so none of the daemon's crossings is
       // judged before the shard has recorded them (A-227). A Linux shard the anchor handed no FUSE device keeps no mount
@@ -4111,6 +4116,7 @@ async fn start_shard(
   #[cfg(windows)] windows_holds: (
     Vec<crate::winfsp::InheritedMount>,
     Option<std::os::windows::io::OwnedHandle>,
+    Vec<crate::anchor_hold::HandedResync>,
   ),
 ) {
   // How long a shard's start takes (its recovery included) is in the boot log: the control loop's first call to each
@@ -4258,9 +4264,10 @@ async fn init_shard(
   config_shards: &[u16],
   retained: Option<crate::retention::Retained>,
   #[cfg(unix)] holds: ShardHolds,
-  #[cfg(windows)] (inherited_winfsp, windows_channel): (
+  #[cfg(windows)] (inherited_winfsp, windows_channel, inherited_resync): (
     Vec<crate::winfsp::InheritedMount>,
     Option<std::os::windows::io::OwnedHandle>,
+    Vec<crate::anchor_hold::HandedResync>,
   ),
 ) -> Result<crate::recovery_slices::SliceReport, ServerError> {
   // The carrier of what this shard sends other shards whose control channels are full (§4.3, `xshard::carrier`):
@@ -4428,12 +4435,9 @@ async fn init_shard(
     published_keys: std::collections::BTreeSet::new(),
     published_held: crate::content_holder::PublishedHeld::default(),
     write_log,
-    #[cfg(unix)]
     writes_lost: recovered_writes.everything_lost,
     replay: recovered_writes.records,
-    #[cfg(unix)]
     pending_replies: std::collections::BTreeMap::new(),
-    #[cfg(unix)]
     recovered_replies: std::collections::BTreeMap::new(),
     #[cfg(unix)]
     dax_ranges,
@@ -4493,8 +4497,9 @@ async fn init_shard(
     inherited_copies: holds.copies,
     #[cfg(target_os = "linux")]
     adopt_fuse: Vec::new(),
-    #[cfg(unix)]
     adopt_shards: Vec::new(),
+    #[cfg(windows)]
+    inherited_resync,
     snapshot_views: std::collections::BTreeMap::new(),
     #[cfg(unix)]
     guest_devices: Vec::new(),
@@ -4719,7 +4724,6 @@ async fn init_shard(
   crate::fuse::adopt_held();
   // The Shards streams whose resync ends the anchor held, served again on fresh streams (A-316, A-339), and every held
   // device no record claimed released.
-  #[cfg(unix)]
   crate::shards::adopt_held();
   #[cfg(windows)]
   crate::winfsp::adopt_held();

@@ -70,7 +70,7 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
             run CMD with a Shards fs stream of the volume at descriptor N (Linux, macOS)
   shards ID [--subtree DIR] [--read-only] [--json] -- CMD [ARG ...]
             run CMD with a Shards fs stream of the volume as a handle: {handle} in its arguments names its value,
-            e.g. `shards run --slates-fs-handle {handle} ...` (Windows)
+            e.g. `shards run --slates-fs-handle {handle} ...`, and {resync}, where it stands, its resync end's (Windows)
   vhost-user ID [--tag NAME] [--subtree DIR] [--read-only] [--dax-window SIZE] [--json] -- VMM [ARG ...]
             run VMM with slates' own virtio-fs device of the volume: {socket} in its arguments names the device's
             socket end (/proc/self/fd/N) and {fd} its descriptor (N), e.g. `crosvm run --vhost-user
@@ -607,6 +607,9 @@ pub(crate) struct ShardsRequest {
   /// Where the command finds its stream's resync end (`--resync-fd M`, Unix; A-316), when it asked for one: the channel
   /// a successor daemon hands it a fresh stream on (`slates_bridge_fuse::shards_resync`).
   pub resync_at: Option<i32>,
+  /// Whether the command's arguments name its stream's resync end where `{resync}` stands (Windows; A-433), as a handle
+  /// it inherits.
+  pub resync_named: bool,
   /// Announce the attachment as JSON.
   pub json: bool,
   /// The command and its arguments.
@@ -850,6 +853,10 @@ const FIRST_HANDED_FD: i32 = 3;
 /// value in the command's process, in decimal, as Shards' `--slates-fs-handle V` takes it (A-179).
 pub(crate) const HANDLE_PLACEHOLDER: &str = "{handle}";
 
+/// Format: where a `shards` command's arguments name its stream's resync end on Windows (A-433): each occurrence becomes
+/// the end's handle value in the command's process, in decimal. Unix places the end at a number instead (`--resync-fd`).
+pub(crate) const RESYNC_PLACEHOLDER: &str = "{resync}";
+
 /// How a platform hands a `shards` command its stream end: Unix places a descriptor at a number the command is told
 /// with `--fd N` before it replaces itself with the command; Windows starts the command inheriting a handle whose value
 /// is written where `{handle}` stands in its arguments, since a handle's value is not the caller's to choose.
@@ -935,6 +942,17 @@ fn parse_shards(
     ));
   }
   let resync_at = resync_fd(taken, handed)?;
+  let resync_named = command
+    .iter()
+    .skip(1)
+    .any(|argument| argument.contains(RESYNC_PLACEHOLDER));
+  if resync_named && handed != HandOff::Handle {
+    return Err(ParseError::BadValue {
+      what: "{resync}",
+      reason: "this platform places the resync end at a descriptor number: --resync-fd M"
+        .to_owned(),
+    });
+  }
   Ok(Command::Shards(ShardsRequest {
     instance: taken.instance(),
     volume: volume(id)?,
@@ -942,6 +960,7 @@ fn parse_shards(
     read_only: taken.switch("--read-only"),
     handed,
     resync_at,
+    resync_named,
     json: taken.json(),
     command,
   }))
@@ -3085,6 +3104,40 @@ mod tests {
   /// A-316. Do: parse `shards` as Unix hands its end with a resync end at its own number, without one, at a number
   /// below three, at the stream's own number, and not a number; and as Windows hands its end with one. Expect the
   /// number taken, none when not asked, each wrong one refused as usage naming `--resync-fd`, and Windows refusing it.
+  /// A-433. Do: parse `shards` as Windows hands its end with `{resync}` beside `{handle}` in the command's arguments, and
+  /// without it; and as Unix hands its end with `{resync}` in the arguments. Expect the resync end named where it
+  /// stands, none when not named, and Unix refusing the placeholder as usage naming `{resync}` (its resync end is
+  /// placed at a number, `--resync-fd`).
+  #[test]
+  fn shards_names_the_resync_end_where_resync_stands_on_windows_alone() {
+    let id = "0123456789abcdef0123456789abcdef";
+    let windows = |line: &str| parse_on(&args(line), HandOffKind::Handle);
+    let Command::Shards(named) = windows(&format!(
+      "shards {id} -- shards run --slates-fs-handle {{handle}} --slates-fs-resync-handle {{resync}}"
+    ))
+    .unwrap() else {
+      panic!("shards");
+    };
+    assert!(named.resync_named, "{{resync}} names the resync end");
+    let Command::Shards(unnamed) = windows(&format!(
+      "shards {id} -- shards run --slates-fs-handle {{handle}}"
+    ))
+    .unwrap() else {
+      panic!("shards");
+    };
+    assert!(!unnamed.resync_named);
+    assert!(matches!(
+      parse_on(
+        &args(&format!("shards {id} --fd 5 -- reader --resync {{resync}}")),
+        HandOffKind::Descriptor
+      ),
+      Err(ParseError::BadValue {
+        what: "{resync}",
+        ..
+      })
+    ));
+  }
+
   #[test]
   fn shards_takes_a_resync_end_at_a_number_of_its_own_on_unix_alone() {
     let id = "0123456789abcdef0123456789abcdef";

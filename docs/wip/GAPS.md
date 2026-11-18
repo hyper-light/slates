@@ -795,9 +795,11 @@
 >   day): a resync end is a kind of held entry of one handle, and a daemon replaces a held entry's record as the
 >   stream's session moves; and the attach's half (A-427, the same day): the message-mode resync pipe made at the
 >   attach, held by the anchor before the stream serves anything, its session and holder told before any reply that
->   rests on them, its device end handed to the client beside the stream's. Owed after them: the successor's half
->   (adopting the held end, the duplicate into the holder, the replies kept for a resend) and `slates shards`
->   handing the resync end to its command. **Built since (A-402, 2026-11-18):** the write log on
+>   rests on them, its device end handed to the client beside the stream's; and the successor's half (A-433, the same
+>   day): the held end adopted, a fresh pipe duplicated into the holder the session names (checked by its creation
+>   time) and named in a `Resync`, the replies kept for a resend, and `slates shards` handing the end where
+>   `{resync}` stands. Owed on Windows: a stream's DAX sections held by the anchor (it gives its resync up at its
+>   first map). **Built since (A-402, 2026-11-18):** the write log on
 >   Windows, so a Windows stream's acknowledged writes outlive its daemon's death, replayed into the volume (its Windows
 >   run is main's, `run-requests.md`); before, a Windows stream's acknowledged writes since the last publication were
 >   lost at its daemon's death. Found with A-365 (Linux), **fixed by A-389 (2026-11-18)**:

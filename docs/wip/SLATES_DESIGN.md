@@ -4473,9 +4473,9 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
   device end rides beside the stream's in the socket route's confirmation; on Windows (A-427) a message-mode pipe whose
   device end is duplicated into the attaching client beside the stream's (`ShardsHanded`'s `resync`), the daemon's end
   held by the anchor's exchange before the stream serves anything and its session (with the process holding the stream,
-  its id and creation time) told by `Record` before any reply that rests on a change (A-423), and whose `Resync` will
-  name the fresh end's handle in that process, where the successor duplicates it (A-418), since no descriptor rides a
-  message there. The daemon's end is
+  its id and creation time) told by `Record` before any reply that rests on a change (A-423), and whose `Resync` names
+  the fresh end's handle in that process, where the successor duplicates it (A-418, A-433), since no descriptor rides a
+  message there; `slates shards` hands the device end where `{resync}` stands (A-433). The daemon's end is
   held by the anchor, as a FUSE device is, and the daemon keeps its own copy while the anchor holds one (A-339: XNU's
   collector of descriptors in flight flushes a socket whose every copy rides a message), with the token, the stream's
   owner view and its kernel's SETXATTR form as its session (A-378), updated when the guest names its owner, when its
@@ -4502,8 +4502,8 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
   and serves it on a fresh stream, its owner view, its SETXATTR form and token from the hold, its references and opens
   from the image, the reply the dead daemon published and never wrote answering the request the device resends, and
   the writes it acknowledged and the lookups its guest gave back (`FORGET`, A-390) after its last publication replayed
-  from the write log (A-63) as a mount's are. On Windows, whose successor half is owed (its attach half is A-427), a
-  death ends the stream,
+  from the write log (A-63) as a mount's are; on Windows too (A-433), its fresh end duplicated into the holder the
+  session names, checked by its creation time. On Windows, a stream with no held resync end ends at a death,
   and the writes it acknowledged after its last publication are replayed into the volume all the same (A-402). Where that log overflowed, the guest is told every file it had open may
   have lost writes, as a taken-over mount's kernel is (`LostWrites`, A-393): a handle from before the death answers its
   `flush` `EIO` until an `fsync` through it has, once. It removes any other's record, as before.
@@ -30380,4 +30380,52 @@ no new contract number); `unsafe-budget.toml` (`slates-ipc` 139 → 140); and:
   entry not held refused, the release) and `process_started`'s run on Windows, in CI's Windows lanes; filed for main.
 - **Owed.** The successor's half on Windows (adopting the held end, keeping the record, a fresh pipe duplicated into the
   holder named in a `Resync`, the replies kept for a resend and the `FORGET`s logged); `slates shards` handing the
-  resync end to its command (`{resync}`); and the real-process Windows restart test, filed with the successor's half.
+  resync end to its command (`{resync}`); and the real-process Windows restart test, filed with the successor's half:
+  all built by A-433.
+
+### A-433 — A Windows Shards stream outlives its daemon: the successor adopts the held resync end, duplicates a fresh stream into the holder the session names, and answers a resent request from the reply kept for it (2026-11-18, goal 90, item b, piece four; A-316's successor half on Windows; A-418's wire, A-423's hold, A-427's attach half)
+Applied in the same change to: §4.6, the Shards form's resync and death bullets; A-427's owed list; GAPS, A-281's entry
+(its Windows item); `docs/cli.md` (`{resync}`); `unsafe-budget.toml` (`slates-ipc` 140 → 141); and:
+- `crates/server`: `anchor_hold_windows.rs` (`HandedResync`; `adopt` keeps a resync entry's one handle for its shard, a
+  refused one released, its value never taken twice); `daemon.rs` (each shard's resync ends; `shards::adopt_held` on
+  every platform); `state.rs` (`adopt_shards` and `inherited_resync` on Windows; the pending and recovered replies and
+  the lost-writes flag on every platform); `verbs.rs` (recovery keeps a Windows stream whose end the anchor held; the
+  replies published and recovered on every platform); `write_log.rs` (`log_forgets` on every platform); `shards.rs`
+  (`split_held_resync`, `adopt_held`, `adopt_one` and `refuse_adoption` on Windows; the reply kept for a resend, the
+  replay, the logged `FORGET`s and the lost writes on every platform; `resync_held`); `shards/resync_handle.rs`
+  (`adopted`, `held`, `send_resync`, `release_orphan`); `shards/resync.rs` (`from_handle_session` for the successor).
+- `crates/ipc`: `stream::write_now` (a pipe write never waited for), `stream::spawn_with_ends` (a second handle named
+  where its placeholder stands), `handle_route::hand_stream_to` (a duplicate into a process checked by its creation
+  time, opened once).
+- `crates/cli`: `slates shards`' `{resync}` (`args::RESYNC_PLACEHOLDER`, `ShardsRequest::resync_named`; a Unix command
+  naming it refused as usage); its Windows hand-off (`handed_resync_end`: the daemon's end, or one already ended); the
+  real-process test `slates_shards_resyncs_its_programs_stream_after_its_daemon_is_killed` (`tests/shards.rs`).
+
+- **What was there.** A-427 made the channel and held its end, but the next daemon released every resync end it was
+  handed (an entry of a kind it did not adopt) and recovery removed the stream's record as every guest's: the device
+  read the channel's end, and its share ended with its daemon (Shards' option (a)).
+- **The successor.** Recovery keeps a Windows stream whose resync end the anchor handed back, as Unix does (A-316). The
+  successor serves it on a fresh pipe as the same attachment: its owner view, form and token from the end's record,
+  its references and opens from the image, no `INIT`, no restore, the writes and `FORGET`s its predecessor
+  acknowledged after its last publication replayed, and its guest told of lost writes where that log overflowed
+  (A-393). It duplicates the fresh end into the process the record names as the holder, opened once and checked by its
+  creation time, so a later process given the same id never receives it, and writes a Windows `Resync` (A-418) naming
+  the end's value on the held channel without waiting (`write_now`): a device that reads nothing cannot hold the shard,
+  and the pipe's room (the attach's message and one `Resync`) takes it whether or not the device read `Attached`. It
+  keeps no copy of the fresh end, so the stream lives exactly as long as the holder's. A refused duplicate or
+  `Resync` ends the attachment, whose end releases the hold; a duplicate already made is closed again in the holder,
+  which no one has told its value.
+- **At most once (A-61's rule).** A held Windows stream keeps each barrier reply among the shard's pending replies before
+  the publication that carries it, and lets it go once written whole, as a Unix stream does; the successor answers a
+  first request whose unique is that reply's from it (`shards.replayed`), never by running it again. Its `FORGET`s are
+  logged where the anchor holds its end (A-390).
+- **`slates shards` on Windows** hands the command the device's end where `{resync}` stands in its arguments, beside
+  `{handle}`, and keeps no copy of it; where the daemon made no channel, an ended one. A Unix command naming
+  `{resync}` is refused as usage: its end is placed at a number (`--resync-fd`).
+- **Evidence.** Red first: on main the CLI's parse test did not build (no `resync_named`); green, the CLI's `shards`
+  parse tests on a Mac Studio. `cargo xwin check` of `slates-ipc`, `slates-server`, `slates-client` and `slates-cli`
+  with their tests is clean for Windows. The real-process test (an anchor, a killed daemon, the probe reading the file
+  through the stream its `Resync` names) and the Windows unit and suite runs are filed for main.
+- **Owed.** A Windows stream's DAX sections held by the anchor (A-365 is Unix's; a Windows stream gives its resync up at
+  its first map, A-427); and Shards' device half, which takes the `Resync` through its spawner's grants (its
+  coordinator's condition 4c).

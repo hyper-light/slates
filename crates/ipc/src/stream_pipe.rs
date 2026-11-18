@@ -333,22 +333,44 @@ enum Way {
 /// bytes read, or zero once the peer has gone. For a client that only wants to wait, such as a test or a probe; the
 /// daemon's end is served by its shard's driver instead.
 pub fn read_waiting(end: BorrowedHandle<'_>, into: &mut [u8]) -> Result<usize, IpcError> {
-  waited(end, Way::Read, into.as_mut_ptr(), into.len())
+  waited(end, Way::Read, into.as_mut_ptr(), into.len(), false)
 }
 
 /// Writes `bytes` to `end`, an overlapped end (the handed one), waiting until the kernel has taken them: the bytes
 /// written. A byte-mode pipe's write finishes whole unless the peer goes first, which is refused.
 pub fn write_waiting(end: BorrowedHandle<'_>, bytes: &[u8]) -> Result<usize, IpcError> {
-  waited(end, Way::Write, bytes.as_ptr().cast_mut(), bytes.len())
+  waited(
+    end,
+    Way::Write,
+    bytes.as_ptr().cast_mut(),
+    bytes.len(),
+    false,
+  )
+}
+
+/// Writes `bytes` to `end` only if the pipe takes them now, never waiting for a reader (A-433): a write the reader's
+/// buffer has no room for is cancelled and refused, and a message-mode pipe's cancelled write leaves no part of its
+/// message behind. What a successor daemon sends a Shards device on its resync channel, so a device that reads nothing
+/// cannot hold a shard. The bytes written.
+pub fn write_now(end: BorrowedHandle<'_>, bytes: &[u8]) -> Result<usize, IpcError> {
+  waited(
+    end,
+    Way::Write,
+    bytes.as_ptr().cast_mut(),
+    bytes.len(),
+    true,
+  )
 }
 
 /// One overlapped read or write on `end` of `length` bytes at `buffer`, waited for on a manual-reset event of its own,
-/// as an overlapped handle requires (a null `OVERLAPPED` on one is invalid). A gone peer reads zero.
+/// as an overlapped handle requires (a null `OVERLAPPED` on one is invalid). A gone peer reads zero. With `now`, an
+/// operation the kernel could not finish at once is cancelled, then settled: refused unless it finished meanwhile.
 fn waited(
   end: BorrowedHandle<'_>,
   way: Way,
   buffer: *mut u8,
   length: usize,
+  now: bool,
 ) -> Result<usize, IpcError> {
   // SAFETY: a nameless manual-reset event, unsignalled, not inheritable; checked and owned below.
   let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
@@ -385,6 +407,11 @@ fn waited(
   let code = if started == 0 { last_error() } else { 0 };
   if started == 0 && code != ERROR_IO_PENDING {
     return gone_or_refused(code, way);
+  }
+  if now && started == 0 {
+    // SAFETY: cancels the one operation this frame's OVERLAPPED started on this live handle; it is settled below before
+    // the OVERLAPPED or the caller's buffer goes.
+    unsafe { CancelIoEx(end.as_raw_handle(), &overlapped) };
   }
   let mut moved = 0u32;
   // SAFETY: waits for the operation the OVERLAPPED above started on this live handle; `moved` is a local.
@@ -497,32 +524,67 @@ pub fn spawn_with(
   stream: OwnedHandle,
   placeholder: &str,
 ) -> Result<HandedChild, IpcError> {
+  spawn_with_ends(program, args, (stream, placeholder), None)
+}
+
+/// [`spawn_with`], and with `resync` the device's end of the stream's resync channel (A-433): a second handle the
+/// program inherits, its value written where the second placeholder stands. This process keeps no copy of that end: it
+/// is not judged by object as the stream is (A-180), so the program's is the only one once it runs. Refused `Layout`
+/// when either placeholder is named in no argument.
+pub fn spawn_with_ends(
+  program: &std::ffi::OsStr,
+  args: &[String],
+  (stream, placeholder): (OwnedHandle, &str),
+  resync: Option<(OwnedHandle, &str)>,
+) -> Result<HandedChild, IpcError> {
   use crate::win_spawn::{Spawn, StandardOutput, duplicate_inheritable, kill_on_close_job, spawn};
-  if !args.iter().any(|argument| argument.contains(placeholder)) {
+  let named = |placeholder: &str| args.iter().any(|argument| argument.contains(placeholder));
+  if !named(placeholder) || resync.as_ref().is_some_and(|(_, at)| !named(at)) {
     return Err(IpcError::Layout {
       reason: "a handed stream end is named in the program's arguments",
     });
   }
   let job = kill_on_close_job()?;
   let inherited = duplicate_inheritable(stream.as_raw_handle())?;
-  let handed = u64::try_from(inherited.0.expose_provenance()).map_err(|_| IpcError::Layout {
-    reason: "a handle value wider than 64 bits",
-  })?;
+  let value_of = |handle: windows_sys::Win32::Foundation::HANDLE| {
+    u64::try_from(handle.expose_provenance()).map_err(|_| IpcError::Layout {
+      reason: "a handle value wider than 64 bits",
+    })
+  };
+  let handed = value_of(inherited.0)?;
+  let resync_inherited = resync
+    .as_ref()
+    .map(|(end, at)| duplicate_inheritable(end.as_raw_handle()).map(|dup| (dup, *at)))
+    .transpose()?;
+  let resync_value = resync_inherited
+    .as_ref()
+    .map(|(dup, at)| value_of(dup.0).map(|value| (value.to_string(), *at)))
+    .transpose()?;
   let value = handed.to_string();
   let args: Vec<std::ffi::OsString> = args
     .iter()
-    .map(|argument| std::ffi::OsString::from(argument.replace(placeholder, &value)))
+    .map(|argument| {
+      let named = argument.replace(placeholder, &value);
+      std::ffi::OsString::from(match &resync_value {
+        Some((resync, at)) => named.replace(at, resync),
+        None => named,
+      })
+    })
     .collect();
+  let mut handles = vec![inherited.0];
+  handles.extend(resync_inherited.iter().map(|(dup, _)| dup.0));
   let spawned = spawn(&Spawn {
     program,
     args: &args,
     environment: None,
-    inherited: &[inherited.0],
+    inherited: &handles,
     output: StandardOutput::Inherited,
     job: Some(job.0),
     process_security: None,
   });
   drop(inherited);
+  drop(resync_inherited);
+  drop(resync);
   let process = spawned?;
   let child = HandedChild {
     process,
