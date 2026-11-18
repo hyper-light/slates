@@ -45,6 +45,8 @@ const VERSION: u32 = 2;
 const HEADER_BYTES: usize = 4;
 /// Format: one entry's bytes (`struct posix_acl_xattr_entry`: `e_tag` le16, `e_perm` le16, `e_id` le32).
 const ENTRY_BYTES: usize = 8;
+/// Format: where an entry's id begins, after its tag and its permission set (`e_id`).
+const ID_AT: usize = 4;
 /// Format: the file owner's entry (`ACL_USER_OBJ`).
 const USER_OBJ: u16 = 0x01;
 /// Format: a named user's entry (`ACL_USER`), its id a uid.
@@ -262,7 +264,7 @@ fn entry_of(bytes: &[u8; ENTRY_BYTES]) -> Result<Entry, AclRefusal> {
       <[u8; 2]>::try_from(pair).map_err(|_| AclRefusal::Invalid)?,
     ))
   };
-  let id_bytes = bytes.get(4..ENTRY_BYTES).ok_or(AclRefusal::Invalid)?;
+  let id_bytes = bytes.get(ID_AT..ENTRY_BYTES).ok_or(AclRefusal::Invalid)?;
   let entry = Entry {
     tag: word(0)?,
     perm: word(2)?,
@@ -280,17 +282,16 @@ fn entry_of(bytes: &[u8; ENTRY_BYTES]) -> Result<Entry, AclRefusal> {
 /// Format: the rank of a tag no ACL holds.
 const UNKNOWN_RANK: u8 = u8::MAX;
 
-/// A tag's place in the order every ACL keeps its entries in.
+/// Format: the order every ACL keeps its entries' tags in, as `posix_acl_valid` walks them (`fs/posix_acl.c`).
+const TAG_ORDER: [u16; 6] = [USER_OBJ, USER, GROUP_OBJ, GROUP, MASK, OTHER];
+
+/// A tag's place in the order every ACL keeps its entries in ([`TAG_ORDER`]); [`UNKNOWN_RANK`] for any other tag.
 fn tag_rank(tag: u16) -> u8 {
-  match tag {
-    USER_OBJ => 0,
-    USER => 1,
-    GROUP_OBJ => 2,
-    GROUP => 3,
-    MASK => 4,
-    OTHER => 5,
-    _ => UNKNOWN_RANK,
-  }
+  TAG_ORDER
+    .iter()
+    .position(|known| *known == tag)
+    .and_then(|rank| u8::try_from(rank).ok())
+    .unwrap_or(UNKNOWN_RANK)
 }
 
 /// Refuses an ACL Linux's `posix_acl_valid` refuses: the owner first and once, named users after it, the owning group

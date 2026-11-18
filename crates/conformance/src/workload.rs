@@ -150,6 +150,7 @@ git status --porcelain=v2 --branch
 /// fixed date, as the git workloads' do, and the clone's `hgrc` is written back with the source's relative path,
 /// since `hg clone` records a local source by its absolute path.
 const MERCURIAL: &str = r#"
+# Format: every commit's one fixed date, as the git workloads fix theirs.
 d='2026-09-14 00:00:00 +0000'
 hg init src
 cd src
@@ -213,7 +214,11 @@ hg -R ../shared status --all
 /// workload's absolute path, which the comparison replaces by the root token. Under Git for Windows' shell (A-300) the
 /// directory is taken in its drive form (`pwd -W`, `D:/a`; other shells refuse the option and the plain `pwd` answers),
 /// since a file URL names a Windows directory as `file:///D:/a`, and `svnlook youngest` ends its line with Windows'
-/// carriage return there, which the revision loop's count must not carry.
+/// carriage return there, which the revision loop's count must not carry. The repository's representation cache
+/// (`db/rep-cache.db`) is compared by what it holds, its rows, printed where `sqlite3` is on the `PATH`, never by its
+/// bytes: it is an SQLite file, whose page layout two runs of the same commits did not share (CI run 44247840584,
+/// ubuntu, 2026-11-18); the revisions it caches (`db/revs`, `db/revprops`, `db/current`) stay byte-compared, and
+/// `svnadmin verify` and the dump's checksum print the repository whole.
 const SUBVERSION: &str = r#"
 top=$(pwd -W 2>/dev/null || pwd)
 case $top in
@@ -221,6 +226,7 @@ case $top in
   *) url="file:///$top/repo" ;;
 esac
 svn() { command svn --config-dir "$top/svn-config" --non-interactive --no-auth-cache "$@"; }
+# Format: every revision's one fixed date, and the repository's fixed UUID.
 printf '2026-09-14T00:00:00.000000Z' > date
 svnadmin create repo
 svnadmin setuuid repo 00000000-0000-4000-8000-00000000c0de
@@ -266,13 +272,18 @@ svn info --show-item last-changed-revision
 svn info --show-item url
 svn info --show-item repos-uuid
 svn log -v -r 1:HEAD '^/'
+# Format: revision 5 is the change on trunk, 6 the branch's merge into it.
 svn diff -c 5 '^/'
 svn propget svn:mergeinfo .
 svn cat -r 2 a.txt
 svn list -R '^/'
 cd ..
 svnadmin verify repo
+if command -v sqlite3 >/dev/null 2>&1; then
+  sqlite3 repo/db/rep-cache.db 'SELECT hash, revision, offset, size, expanded_size FROM rep_cache ORDER BY hash'
+fi
 svnlook tree repo
+# Format: revision 6, the merge, as the repository records it.
 svnlook changed -r 6 repo
 svnadmin dump -q repo | cksum
 "#;
@@ -610,6 +621,12 @@ pub const ROSTER: &[Workload] = &[
         "FSFS keeps a random instance id beside the repository's UUID, drawn anew by `svnadmin setuuid` by design; \
          the UUID itself is printed (`svn info --show-item repos-uuid`)",
       ),
+      (
+        "repo/db/rep-cache.db",
+        "FSFS's representation cache is an SQLite file, whose pages SQLite lays out as it goes, so two runs of the \
+         same commits differ in its bytes; its rows are printed where sqlite3 is on the PATH, and the revisions it \
+         caches are compared byte for byte",
+      ),
     ],
     runs_on_windows: true,
   },
@@ -854,10 +871,12 @@ pub struct StatedDifference {
 }
 
 /// Why the WinFsp drive's link counts are not NTFS's (A-300).
-const NO_HARD_LINK_ON_THE_DRIVE: &str = "the WinFsp drive makes no hard link: WinFsp's driver answers \
-  FileLinkInformation STATUS_NOT_SUPPORTED before any file system is asked (v2.1, src/sys/fileinfo.c) and its NTFS \
-  compatibility page lists hard links unsupported, so a local clone copies on the drive where NTFS links; the bytes \
-  are the same (A-300)";
+const NO_HARD_LINK_ON_THE_DRIVE: &str = concat!(
+  "the WinFsp drive makes no hard link: WinFsp's driver answers ",
+  "FileLinkInformation STATUS_NOT_SUPPORTED before any file system is asked (v2.1, src/sys/fileinfo.c) and its NTFS ",
+  "compatibility page lists hard links unsupported, so a local clone copies on the drive where NTFS links; the bytes ",
+  "are the same (A-300)",
+);
 
 /// The WinFsp drive's stated differences: how many files of a local clone have two names (A-300). git and Mercurial
 /// link a local clone's files where the file system can and copy them where it cannot, so these lines count links on

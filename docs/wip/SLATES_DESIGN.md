@@ -415,6 +415,16 @@ inputs the daemon reads at boot or observes at runtime, never constants in the c
 | Kernel-cached op vs daemon op | < 1 µs vs 10+ µs | same | [C: EdenFS Caching.md] | must-measure |
 | Copies of a volume's sealed content | 1 (archive export on demand) | f+1 across failure domains, chosen from 2f+1 candidates in the owner's neighbourhood | [A: Vertical Paxos; A: Copysets] | f from the failure-domain tree; the scatter width from measured re-replication bandwidth and the accepted loss probability |
 
+> **Status (2026-11-18, A-297, Ada's decision): the many-client merge bound is stated at the fleet row's increment
+> rate.** "1,000 clients under 1 ms" holds when every kind's p99 stays under 1 ms while one green takes 10³ or more
+> verdicts a second from 1,000 clients, the floor of the row "Increments per green volume per second" above, with no
+> oracle failure. Every kind is each request, attempt by attempt and end to end with its resends, and a whole edit and
+> merge with the client's own think pauses left out. The load test judges each level against it
+> (`crates/client/examples/load_bench.rs`, its `bound` row). A level with no think time is the rung's capacity in
+> verdicts a second and is never judged against the bound: its clients queue on the green's one serialized verdict,
+> so a request waits about the clients times the verdict's cost (Little's law), 21 ms at 1,000 clients on the owner's
+> measured 21.0–26.9 µs a verdict (BENCHMARKS, 2026-11-09).
+
 ---
 
 ## Part 2 — The shape of the system
@@ -6173,6 +6183,15 @@ failure.
 > pin it (`a_forwarded_submit_refused_overloaded_while_it_commits_is_answered_under_its_own_id`;
 > `docs/bugs/2026-11-06-a-resend-under-its-id-was-already-acknowledged.md`).
 
+> **Status (2026-11-17, an `Overloaded` verb is never its own completion).** `Overloaded` means the request was not
+> started, so its id stays unanswered and a resend under it runs the verb. Raised inside a verb (a held copy not yet
+> materialized in the takeover's settle window; a deferred verb whose task the full arena refused), it was recorded as
+> the completion, and every resend under the id met it for good. `run_recorded` now leaves it unrecorded, counted
+> `verb.overloaded_unrecorded`; a verb that refuses it part-way ends what it began itself, as the Shards attach ends its
+> attachment (`a_resend_under_the_id_of_an_overloaded_verb_runs_the_verb`;
+> `docs/bugs/2026-11-17-an-overloaded-verb-was-recorded-as-its-completion.md`). Open (GAPS): a live-shipped verb whose
+> effects committed before its held-reply bound refused it, and a deferred task that ends on `Overloaded`.
+
 > **Status (2026-11-08, A-252: a request waiting for a version is a durable state).** A submit whose acceptance waits for
 > its version's commit was waited on in memory, so after a restart its resend under its own id found no record and ran
 > again as a new version. The accept now logs `Op::CompletionAwaiting` in the transaction that appends the version, so
@@ -6695,6 +6714,28 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > Held by `a_candidate_behind_the_retained_tail_is_installed_without_a_whole_record_on_the_log` (one candidate stopped
 > for the middle third of 180 sequential stable writes: one whole record, at least one install, and the candidate caught
 > up).
+>
+> **The period in slices (2026-11-17, g230).** The record period's live work on a shard (following each volume's
+> candidates, answering writers whose condition is met, owing or shipping a whole record or image, and re-sending what
+> each holder lacks) visited every live volume the shard owned in one turn, so its cost grew with the volumes and every
+> client of the shard waited behind it. It now runs a slice of about the shard's step quantum a turn
+> (`live_ship::period_slice`, the quantum a destroy's or an archive's slice is cut by), resuming after the last volume
+> visited; the first volume of a slice is always visited, so the period always ends. Held by
+> `a_shards_live_volumes_are_visited_by_the_period_in_slices_and_none_is_starved` (`crates/server/tests/fleet.rs`: 24
+> live volumes, the quantum cut to one volume a slice, every log durable at its head after three periods). Owed
+> (measurement): the owner shard's longest step with thousands of live volumes, before and after.
+>
+> **The credit in bytes (2026-11-17, A-200 amended that day, AC-8.9).** The owner's credit was a fixed two entries, and
+> a publication past it shipped the whole volume next. Now the entries not yet durable and the retained tail are each
+> held to the wire bytes of the whole state an install would send (`slates_db::live::Bounds::of_whole`, set at each whole
+> record and install image), so a burst of barriers on one volume ships its deltas at once and the volume is shipped
+> whole only where that is the cheaper catch-up. Held by `a_burst_of_writes_to_a_live_volume_ships_its_changes_not_the_volume`
+> (`crates/server/tests/fleet.rs`: sixteen clients write half a page each while both holders are held off their shards; every
+> write answered, no publication turned away, no whole record; red on the fixed credit) and the byte bounds' unit tests in
+> `crates/db/tests/live.rs`. The same day a lane began sending the entries a holder lacks as one batch a congestion window
+> (A-200's second amendment of 2026-11-17, `live_ship::take_batch`, `serve_entries`): in the same flow each held holder
+> was caught up in batches of several entries an exchange (`fleet.live.batches`, `fleet.live.batched`), where it had
+> been sent one entry an exchange.
 >
 > **Chaos from outside the processes (2026-11-06).** `crates/cli/tests/live_chaos.rs` streams writes through the Rust
 > client while it partitions or kills processes. It ends every flow with Agreement, NoLoss, StaleNeverCommits and
@@ -8545,6 +8586,31 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > a smaller per-version cost (the median of 50 submits grows from 116 µs to 473 µs across 500 versions), and more than
 > one version to a holder per pass.
 
+> **Status (2026-11-17, A-286: version 0 of a green over a base places at `f > 0` a slice at a time).** A green over a
+> base names its origin as version 0's inputs. At `f > 0` they were made in one poll (the held snapshot walked again,
+> encoded and archived) at the green's creation and again on every pass of the record plane until version 0 placed,
+> shipped whole in one message, and restored, decoded and seeded on each holder in one poll. Over the whole kernel
+> (1.67 GB) each of those is seconds of one shard's poll, past A-232's watchdog, so one primary and two replicas could not
+> set the kernel up; no fleet test had a based green. Now:
+> - the owner makes the inputs once, a share at a time, in a task of the green's shard (`merge_origin::OriginInputsJob`:
+>   the held walk a unit at a time, the canonical bytes written a share at a time into an archive cut and hashed as they
+>   arrive, the origin's identity hashed from the same bytes and checked against the recorded one), keeps them until
+>   every candidate holds version 0, and enqueues version 0's record once they are made;
+> - a shipment carries the record, the offer and at most one slice's verification of the chunks its targets lack, and
+>   a target that cannot accept the record yet answers with what it holds: a content acknowledgement when it holds the
+>   inputs whole, else the offer's missing set (`Committed::answers` hands both back to the owner);
+> - each holder seeds its replica a share at a time (`merge_origin::ReplicaSeed`: the held chunks one at a time, the
+>   origin decoded and the engine seeded a share at a time, the identity compared), its first slice as the record
+>   arrives, so a small origin is still acknowledged in the exchange that carried it, and only while the hold still
+>   holds the inputs (a green forgotten meanwhile, by its tombstone or a takeover's reclaim, installs nothing).
+>
+> Inputs archives are chunked at the archive's largest chunk (1 MiB), so the kernel's origin is about 1,600 extents
+> rather than 100,000 to 400,000. Test: `a_green_over_a_base_places_its_origin_at_f1_a_slice_at_a_time`
+> (`crates/server/tests/fleet.rs`). Owed: the measurement over the whole kernel; a restarted owner remakes version 0's
+> inputs before it re-ships the record (A-246), since the inputs' identity is not recorded; a takeover successor still
+> gathers version 0 from its hold in one call (`recover_green_inputs`); a large increment's archive is still remade from
+> its chain entry on each pass that ships it.
+
 > **Status (2026-11-06, A-235: the record plane runs when there is merge work).**
 > The merge record plane ran once per coordinator period (100 ms), putting a version's inputs at one period and its
 > record at the next, so every answer at `f > 0` waited at least one period, and usually two. One submit at a time on an
@@ -8615,10 +8681,14 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > itself is still refused `land`. Proven by `crates/server/tests/checkout.rs` (a real daemon over a real directory:
 > two merged pushes and an overlapping one refused with its window; the granted landing writes every merged byte; an
 > outsider's edit of a merged file is the presentation's only conflict; a wrong or moved base refused; three of three
-> red with the base check and the writes removed), by `crates/cli/tests/fs_server.rs` (two `slates daemon --fleet`
-> processes, up to the presentation), and across two machines on 2026-11-05: a client on Linux pushed to a green on a
-> macOS server, whose human granted the landing at its anchor, and the merged files landed on the server's disk
-> (GAPS). A Linux server stops at the presentation: its CLI cannot issue a grant (A-201).
+> red with the base check and the writes removed), by `crates/cli/tests/fs_server.rs` (two fleet nodes through the real
+> binary: presented and unwritten under an unset policy; since 2026-11-18 landed on the server's disk under the write
+> policy its launcher set, A-285: bypass in the one `slates land`, ask once the launcher approves exactly the presented
+> manifest, on macOS arm64 and Linux x86_64 and arm64; and with the server node in its own Linux container, landing into
+> the volume attached to it, in CI's Linux CLI step), and across two machines on 2026-11-05: a client on Linux pushed
+> to a green on a macOS server, whose human granted the landing at its anchor, and the merged files landed on the
+> server's disk (GAPS). The stop at the presentation on a Linux server (no grant from its CLI, A-201) is gone for the
+> launcher's path: the policy the launcher set, never a person's proof, decides the write (A-285).
 
 **Role.** Let many agents work on clones of one shared volume and fold their work back into it
 with no locks, no last-writer-wins, and no inferred merge. Each agent's work becomes an
@@ -8720,6 +8790,11 @@ that holder, fatal-and-loud, before any read. On a laptop the owner is the only 
 second computation exists; that is the derived N=1 case, and the differential test proves the
 fleet path computes the same answers.
 
+> **Status (A-247, 2026-11-08).** A green's works are served on the partitions their names hash to, and only the verdict
+> and a first read of a base file are the green's: a verb that needs either is parked on the work's shard and resumed
+> by the owner's answer (`crates/server/src/work_home.rs`). Each work's base is held by a durable floor on the green's
+> partition. Across nodes (a work on the creating client's node) is not built.
+
 **Submission.** `submit(work_volume, evidence?)`: seal the work volume (drain open extents,
 compose the net op set, chunk; in a fleet, place the snapshot to its candidate holders now, at
 f+1 acknowledgements, if the auto-seal has not), build the increment, send it to green's owner: the same shard is a call, another
@@ -8801,7 +8876,7 @@ is refused `StaleEpoch` at the first holder and never applied; the paused owner 
 on resume; the submitter's retry lands at the new
 owner and returns `Accepted{46}`.
 
-**Laptop degenerate.** One node: the merge record is a partition log append, placement is local,
+**Laptop degenerate.** One shard: a green and all its works share a partition, and every ask of the owner is a direct call in the verb's own step (A-247). One node: the merge record is a partition log append, placement is local,
 the holder set is the owner, every arrow in the submission is an in-process call, and the
 merge path is microseconds.
 
@@ -14965,6 +15040,159 @@ GAPS, BENCHMARKS ("The spin policy, measured and rejected").
   keeps its tails under load. The decision rests on Ada's rule that p99 under load is the target. The true spin's change
   is kept on record, not landed (`agents/clients-spin`, a75f9213).
 
+### A-247 — A green's works are served where they live; only the verdict is the green's (accepted 2026-11-07, the supervisor's W1)
+Applied in the same change to: §4.16 (Data model, Submission, Rebase, Laptop degenerate), §4.8 (Lookup: a work's id
+routes to its own shard and node), `crates/server/src/verbs.rs` (`create_work`, `edit`, `edit_staged`, `declare`,
+`submit`, `rebase`, `build_increment`), `crates/server/src/work_home.rs` (new: the parked verbs and the asks of the
+owner), `crates/server/src/merge_service.rs` (`reachable_floor`, the deferred reply's route),
+`crates/server/src/work_files.rs` (`FetchedBase`), `crates/server/src/daemon.rs` (recovery of works through their green's
+owner, the floors' reconcile), `crates/db` (`WorkFloorRecord`, `Op::WorkFloorSet`, `Op::WorkFloorDropped`), the tests
+named below, BENCHMARKS, GAPS.
+
+Status: accepted 2026-11-07. Step one (one node, the shards) built 2026-11-08 on agents/perf-w1, on main since
+2026-11-17 (g231). Step two (a work on the creating client's node, with the forward lanes of
+`crates/server/src/forward_lane.rs`) is not built: a `CreateWork` forwarded from another node still places the work on
+the green's shard.
+
+- **Why.** Every operation of a green's works is served on the green's one owner shard, because a work is placed
+  on its green's partition and reads its base from the green's engine there. A closed-loop client's latency is then
+  the clients times the owner's service time (Little's law):
+  - one node, think time 0: 1,000 clients at about 112 µs an operation, p50 35 to 73 ms; 10,000 clients, p50 50 ms
+    (loadtest-scale, the supervisor's baseline);
+  - three nodes at `f = 1`, every verb forwarded: about 500 µs an operation, and at 3,000 clients the accepted
+    submit's p50 411 ms (fixtures, the supervisor's baseline). The owner's CPU was 7 to 8 s a run while its replicas idled, and 893 to 1,000 of 1,000
+    submits were refused `Overloaded` behind its backlog (fixtures, adacachy).
+  Of a rung's operations, edits, reads, rebases and creations are about 92%. None of them needs the green's
+  sequence. Only a submit's verdict does: it must see every accepted increment before it in one order.
+- **The rule.**
+  - *Where a work lives.* A work is placed on the partition its name hashes to (`owner_of_name`), on the green's node in
+    this first step, and its id carries that partition, so its edits, reads, staging and submit arrive there. The name
+    rule is the plain volumes': a name is created and looked up on the partition it hashes to, so a work's name is
+    unique beside theirs and no alias is needed. Hashing spreads a green's works over the shards whatever shard their
+    clients came in on, and a request forwarded from another node, which has no creating shard, places the same way.
+    The second step (across nodes) amends this rule when it is built.
+  - *Creation.* `CreateWork` runs on the work's partition. It asks the green's owner once: may this principal create a
+    work, and at which head. The owner records the work's base as a floor (below) in the same step and answers the head.
+    The work's record is then made on its own partition, under the request's completion key.
+  - *A verb that needs the owner.* A verb of a work runs on the work's shard as one synchronous step, with no await.
+    One that needs something only the owner has is parked at `dispatch`'s gate, as `lease_wait` parks one, and the ask
+    runs as a task of the work's shard, bounded by a deadline (past it the verb is refused `Overloaded`, and the retry
+    runs it again). The answer resumes the verb under the same completion key. Bounded by the shard's client credit, as
+    `lease_wait` is.
+  - *A work's order.* While a verb of a work is parked, every later verb of that work parks behind it, and they resume
+    in arrival order, so an edit never overtakes a submit pipelined after it, and no edit lands during a submit's
+    verdict.
+  - *The work's base.* A work holds the files it changed (A-202's `WorkFiles`). An edit, a read or a declare of a file it
+    has not changed needs that file as the base holds it. Its shard fetches the file from the owner for that one verb,
+    and the verb consumes it: an edit moves it into the work's own files, as today. A base file is never cached on the
+    work's shard, so the work's charge and footprint are unchanged and there is nothing to invalidate.
+  - *Submission.* The work's shard moves the work's journal and changed files out to the owner, which composes the
+    increment from them over the green's base (`build_increment`, W2's planned composition), runs the verdict and the
+    commit, moves the work's floor, and records the completion under the request's key, exactly as a forwarded verb
+    records it there (deferred to the quorum as AUD-11 defers it). The verdict is the green's one serialized step. The
+    answer goes back to the work's shard, which, in one transaction, restates the work (reset on an accept, its journal
+    and files put back on a conflict), records the completion on its own partition, and only then replies.
+  - *A submit's route (A-298).* A submit off its green's shard asks for its verdict only once its work's catalog
+    register, which A-255 makes the route of a resend after a takeover, is committed at its quorum, read on the work's
+    shard; it waits there as a parked verb until then. The owner's gate cannot see that register, since the owner's
+    partition holds no record of a work on another shard.
+  - *A submit's write policy (A-307).* A merge follows the stricter of its work's and its green's merge modes (A-285),
+    judged with the verdict: the work's mode is read on the work's shard and carried in the ask, the green's is read
+    by the owner, and the owner refuses a forbidden merge before it builds the increment and answers an asked one with
+    the increment's identity. A submit a consumer's own ask policy held (`SubmitHeld`, `EditSubmitHeld`) carries that
+    hold with it, and is asked whatever the volumes' modes short of their forbidding it. A `SubmitApproved` leaves the
+    work's shard only once its approval verifies (never a consumer's, its proof the keyed hash under the launcher's
+    secret or the issuer's), since the verdict trusts what it is sent.
+  - *Rebase* rides the same path: the owner maps the increment through its deltas, moves the floor, and answers the
+    changed delta and the new base. Nothing about the green changes.
+  - *An edit-and-submit (A-225)* applies its edit to what it moves to the owner, not to the work, so nothing of it is
+    durable until the answer: an accept resets the work, a conflict applies the edit, each in the settling transaction
+    with the completion.
+  - *Floors (loadtest-scale, W3's coupling).* The owner keeps one durable record per live work of its green: the work
+    and its base version. It is made at creation, moved by the work's accept and rebase, and dropped by the work's
+    destroy (a message after the destroy commits, whose loss is an orphan as below). `reachable_floor` is the minimum
+    over these records and the green's pins, for a work on the owner's shard too (R8), so a checkpoint never folds past
+    a live work's base wherever it lives. An orphan (a record whose work's creation or destroy a crash cut short) is
+    found at the daemon's start, as A-236's name aliases are: each record's work is looked up on its partition, and the
+    record is dropped if it is gone. Only a crash leaves one.
+  - *Recovery.* A work replays its durable log (A-207). Its entries need the old bytes only for an edit whose file the
+    work had not changed, so the log's replay is given the base through the same ask of the owner, once the partitions
+    are all recovered, and the work is unserved (`Unpublished`) until it has. A work's recovery no longer needs a local
+    engine.
+  - *A work composes its own increment.* A first touch's fetch brings the path's base entries (`Green::path_base`),
+    which the work keeps until its base moves; a rebase answers those of its restated journal. A submit or rebase
+    fetches what its journal names that the work lacks, composes by the owner's own function over `Base::for_names`, and
+    sends the increment alone. The owner only judges.
+  - *Asks are batched per owner.* A shard keeps one batch of asks out to each owner at a time, at most a client
+    region's credit, waiting for room on the owner's channel; one message an ask flooded the channels at 3,000 clients
+    and stalled every run.
+  - *A creation holds its id and its name* while the owner admits it (`Op::WorkCreationPending`, settled with the
+    creation, dropped at a start). The id is the creating transaction's sequence, so a parked creation, which commits
+    nothing, would share it with every other parked in the same step.
+  - *A submit not yet settled.* When a submit goes to the owner, the work's partition records it, whole, in the
+    verb's transaction (`Op::WorkSubmitPending`), and the settle clears it (`Op::WorkSubmitSettled`). While it is
+    recorded, every other verb of the work waits behind it, and the submit runs again first, under its own key, to take
+    the owner's answer. So an answer lost on its way back, or a restart between the owner's step and the work's, never
+    lets a later verb land on a work that the owner's accept has yet to reset: it did, and the reset then dropped an
+    acknowledged edit (`an_edit_after_a_lost_answer_is_kept_when_the_submit_is_retried`).
+  - *Exactly once.* A client's retry meets, in order: the work's shard's completion record; a parked verb it joins; or a
+    re-run, which sends the owner the same request id. The owner answers a request it has completed from its record,
+    whatever the work now holds, so a crash between the owner's accept and the work's reset resolves to the same answer,
+    and the work's reset is idempotent by version. The engine's identity cache (`Green::accepted`, restored from the
+    chain) answers a re-seal under a new request id. A-252's defect (a submit resent after its owner's restart while its
+    acceptance waited at the quorum) is in the owner's deferred path that this uses, and is fixed there.
+- **Reads of a green off its owner (the supervisor's decision of 2026-11-08).**
+  - *`ReadAt::Head` is unchanged.* It stays on the owner, as §4.8 pins it ("head reads at the owner under its lease or
+    from f+1 candidates"). A replica's own head answered as `Head` could be older than the client's own accepted
+    version. A lease that kept it the latest would have to be revoked before each commit, which is coordination on
+    the write path (banned item 10).
+  - *The additive form, `ReadAt::AtLeast { version }`.* A committed version at least as new as a floor the client
+    names, and the reply names the version served. The floor is what the client already saw: its last accepted or
+    last read version of that green, which gives read-your-writes and monotonic reads. Any shard may serve it from an
+    epoch-published immutable root (R2), never holding the owner's shard. A shard behind the floor forwards to the
+    owner rather than answer older. The merge engine already tolerates an older base through its verdict and
+    rebase, so a work reading its base does not need the strict head. Strict readers, the load harness's oracle among
+    them, stay on `Head`.
+  - *What each form can take, measured before building it.* Fixtures' 10,000-client `f = 1` run (adacachy,
+    `rungs9/ab-clean-1.log`), the 33% of retries the harness calls `ReadHead`: 312,218 operations and no `ReadAt::Head`
+    among them. Each conflict's resolve is one `Versions` and then a `ReadRange` of each window at that **named
+    version**, and it ends in one `Rebase`, so 125,615 (40%) are `Versions` and 186,603 (60%) are named-version reads.
+    The harness's only `ReadAt::Head` reads are its oracle's and its setup's. The other callers:
+    - `slates read` and MCP's resource and `view_arg` reads default to `Head`, one request per interactive read, and
+      could opt in;
+    - the Python and Node SDKs issue no `ReadAt` read over the ring at all.
+  - *The 60%, named-version reads, needs only a published root.* A committed version is immutable, so any holder of it
+    can serve it, with no new read form and no floor. It moves off the owner when the root below exists.
+  - *The 40%, the `Versions` calls, goes without a read path (the supervisor, 2026-11-08).* On a conflict, `Submitted`
+    and `Rebased` name the head the verdict was judged against, a reply field taken in the wire's next major. A client
+    reads its conflict windows at that version instead of asking `Versions`, so the bytes it reads are exactly the
+    bytes the verdict saw, where a `Versions` call could name a later head. About 13% of the retries. Test first: a
+    conflict's reply names the head it was judged against, and a read at that version shows exactly those bytes.
+  - *`AtLeast` comes last*, for clients that read "recent enough": the CLI's and MCP's opt-in reads.
+  - *The root does not exist yet.* A green's committed state is the engine's `BTreeMap` and W2's shard-local `Chunks`,
+    owned by one shard's thread. No epoch-published root exists for a green, so publishing one is part of this work.
+  - *Test first:* a client never reads below its own accepted version, from any shard, over a model of commits and
+    reads. Non-vacuity counter: reads served off the owner.
+- **Laptop degenerate (R8).** One node with one shard: the work's shard is the owner's, every fetch and verdict call is
+  a direct call (`xshard`'s own-shard path), and the behaviour is today's. The same code, `f = 0`.
+- **What it does not change.** The verdict, its windows, the merge record, the increment's identity and format, the
+  holders' recomputation, and every refusal. They run on the owner as now.
+- **Proven by (failing first where a test of a defect).**
+  - The merge oracles run over both placements and compare every verdict and every file: a work on the owner's
+    shard, on another shard, and on another node. Histories include a length change followed by an edit past it
+    (loadtest-scale's `merge_post_state.rs`).
+  - Floors: a remote work based below the head keeps its base across a checkpoint. Its submit and rebase are judged,
+    not answered `UnknownBase`. The owner's restart keeps the floor. The work's destroy, or its node's reap,
+    releases it, and the next checkpoint folds past it.
+  - Exactly once: an edit and a submit retried across the work's daemon's restart, and across the owner's, answer
+    their records.
+- **Measured (owed):**
+  - the owner's serialized cost per verdict, which is the green's ceiling;
+  - loadtest-scale's one-node rung at 1,000, 3,000 and 10,000 clients, and fixtures' three-node `f = 1` rung at
+    1,000 and 3,000, interleaved against main;
+  - A-225's two-machine measurement with the work on the client's node, where the edit is then local and only the
+    submit crosses the link.
+
 ### A-224 — A shard thread's scheduling slice: measured and rejected (2026-11-08; the supervisor's decisions of 2026-11-06 and 2026-11-07)
 Applied in the same change to: BENCHMARKS ("A shard's scheduling slice, measured and rejected"), GAPS. No code: the
 built change stays on agents/perf-2 (`7c04f873`, the runtime's request; `0d8a61d9`, the harness's sweep) for the
@@ -15854,6 +16082,61 @@ mutations broken). Bug record `docs/bugs/2026-11-07-a-live-shipper-made-before-i
 **Applied in the same change to:** `crates/db/src/live.rs`, `crates/server/src/live_ship.rs`, §4.10's live-shipping
 status, GAPS.
 
+**Amended 2026-11-17 (g230, AC-8.9): the credit is bytes, and its bound is the whole state an install would send.**
+"Backpressure" above asked for a credit derived by Little's law from the measured apply rate and round trip. The daemon
+shipped a fixed credit of two entries instead (`CREDIT = 2`, with `RETAIN = 4`, R3 debt), and what happened past it was
+worse than a wait: a publication the credit turned away left the volume owing a whole record, so the volume's next
+entry carried every byte the volume holds to every holder, and the writer that published it waited for that copy. Every
+barrier publishes (an `fsync`, a `COMMIT`, each recorded verb), so many writers on one volume put several publications
+inside one round trip, and the third of them shipped the volume: with sixteen clients writing half a page each to a
+half-MiB volume while its holders were held a quarter of a liveness window, 13 of the 16 publications were turned away
+and the log took two more whole records, each a copy of the volume to both holders (`fleet.live.whole` 1 → 3; 4 entries
+appended, at most 3 in flight); with the change, none was turned away, no whole record, 16 entries appended and 16 in
+flight at once (this Mac, debug, 2026-11-17; `a_burst_of_writes_to_a_live_volume_ships_its_changes_not_the_volume`,
+`crates/server/tests/fleet.rs`; bug record `docs/bugs/2026-11-17-a-burst-on-a-live-volume-shipped-the-whole-volume.md`).
+- **The unit is bytes.** Little's law says how many entries are in flight (the publication rate times the time to
+  acknowledge), and that number is the workload's, not a constant: a count bounds memory by nothing, since an entry may
+  be a whole record. The shipper now holds the wire bytes of the entries not yet durable within `Bounds::credit` and the
+  retained tail within `Bounds::retain` (`slates_db::live::Bounds`, `Entry::wire_bytes`).
+- **The bound is derived from the data** (`Bounds::of_whole`): both are the size of the whole state an install would
+  send, measured at each whole record and each install image (`live_ship::published`, `refresh_image`). A delta is then
+  turned away only when the deltas outstanding would already cost more than the whole record a turned-away one leads to,
+  and the owner's memory for them stays within one whole state. The retained tail's byte bound was already this
+  quantity (2026-11-06); the credit joins it, and the two counts are gone.
+- **The log never stops at a bound.** One entry is admitted whatever its size while nothing is in flight, a whole state
+  goes one entry past the credit (`Shipper::append_checkpoint`, at most the credit and one whole state in flight), and
+  the newest entry is never dropped from the tail for size.
+- **What was not built.** Rate and round trip are not measured for the credit: past the whole state's bytes no rate
+  would change the decision, since the whole record is then the cheaper catch-up, and under it every publication is
+  admitted at once. Queueing turned-away deltas behind a count was measured and rejected on 2026-11-06 (BENCHMARKS);
+  this admits them, ships them at once, and stops only where shipping the volume costs less.
+**Applied in the same change to:** `crates/db/src/live.rs` (`Bounds`, the byte credit and tail), `crates/db/tests/live.rs`
+(the model and unit tests in bytes; three new tests), `crates/server/src/live_ship.rs` (`CREDIT`, `RETAIN` removed),
+`crates/server/tests/fleet.rs` (the burst flow, red first), `crates/cluster` (its test and bench), §4.10's live-shipping
+status, GAPS, the bug record.
+
+**Amended 2026-11-17 (g230): the entries a holder lacks go as one batch a window.** A dispatch's lane sent a holder
+each entry in its own exchange and waited for the answer before the next (`live_ship::ship_lane`), so the entries a
+burst piled up behind a lane's first reached the holder one round trip each, and a holder back from a stall caught up on
+the retained tail a round trip an entry (two hundred entries over an 80 ms path is 16 s). With the credit in bytes a
+burst's entries are all in flight at once, so the lane now sends the entries of one volume that follow each other as one
+message (`slates_db::live::encode_batch`, `decode_batch`; request kind 26, `LIVE_ENTRIES_STREAM`, the `Control` class)
+while it fits the session's congestion window (`live_ship::take_batch`, derived: one window, the bytes the session may
+have in flight a round trip, RFC 9002 §7, so a batch never holds the class past a round of it; the first entry always
+goes). The holder applies a batch's entries in order exactly as it applies one (`live_ship::serve_entries`: checked,
+kept and committed each, stopping at the first gap, fence or bound) and answers once with the head it reached, which the
+owner folds as any answer. Nothing a holder accepts changes, so the register invariants rest on the same per-entry
+rules; a batch is refused whole when its header and an entry disagree (`decode_batch`). Every node of a fleet runs one
+build: a holder that does not know kind 26 answers nothing a batch can be acknowledged by, and no fallback to single
+entries is kept (CLAUDE.md §2 item 7). The kind was 25 on its branch until A-288's work routes took 25 on main the same
+day: merged, every batch reached the route's handler, was answered with nothing and was sent again at once (about 500
+a second), and the holders took none of a burst; every kind on a fleet connection is now held distinct by a test
+(`fleet::request_kind_tests`; `docs/bugs/2026-11-17-live-batches-shared-the-work-routes-request-kind.md`).
+**Applied in the same change to:** `crates/db/src/live.rs` (the batch codec), `crates/cluster/src/live.rs`
+(`LIVE_ENTRIES_STREAM`, `serve_entries`), `crates/server/src/{live_ship,fleet}.rs` (`take_batch`, `serve_entries`, the
+serve arm), the tests (`crates/db/tests/live.rs` hostile batches; `crates/cluster/tests/live.rs` a batch durable in one
+exchange and applied up to its first gap; the burst flow's batch counters), §4.10's live-shipping status, GAPS.
+
 ### A-240 — A live log's phase one counts its quorum among the holders its shipper recorded before it shipped (accepted and built 2026-11-06; the supervisor's option (C))
 
 - **Why.** A-200's phase one took any `f + 1` reports. Its argument needs them to come from the hosts that hold the
@@ -16472,6 +16755,8 @@ Applied in the same change to: §4.16's status, A-9's "recorded durably" (now: r
   `docs/bugs/2026-11-07-creating-a-green-held-its-shard-for-the-whole-walk.md`). Peak RSS over `fs/` and the whole kernel
   is in BENCHMARKS.
 - **Owed.**
+  - (2026-11-17, A-286) At `f > 0` version 0's inputs are made once a share at a time, shipped in bounded parts and
+    seeded on each holder a share at a time; they were walked, encoded and archived in one poll on every pass.
   - A green taken over by another host still records its origin as bytes (the successor holds no base snapshot; raft's
     fleet path).
   - The engine still holds the origin twice (current content and version 0's history value); loadtest-scale shares
@@ -16945,6 +17230,58 @@ Applied in the same change to:
   the rung's 109 to 4,261 oracle failures fall to 0 on every run that finished. 7 of 18 runs stalled on W3's checkpoint
   fence, which is independent of this rule (A-257).
 
+### A-286 — Version 0 of a green over a base is made, shipped and seeded a slice at a time at `f > 0` (accepted and built 2026-11-17, g232)
+
+§4.16 "Commit" names a version's inputs in its merge record and places them at `f + 1` before the record commits, and
+"Apply on holders" recomputes the version from them. For a green over a base, version 0's inputs are its origin: every
+byte of the base snapshot in the origin's canonical encoding. At `f > 0` the owner made them in one poll (the held
+snapshot walked again, encoded and archived; A-217) at the green's creation and again on every pass of the record plane
+until version 0 placed. A-244's shipment carried them whole in one message, and each holder restored, decoded and seeded
+them in one poll. Over the whole Linux kernel (97,229 files, 1.67 GB) each of those is seconds of one shard's poll, past
+the watchdog's verdict on a shard that holds its CPU that long (A-232), so the load test's one primary and two replicas
+could not set the kernel up at all. No fleet test had a green over a base, so none of it had run.
+
+Replace it, keeping A-244's one path:
+- **Made once, a share at a time.** The owner makes version 0's inputs in a task of the green's shard: the held snapshot
+  walked a unit at a time, its canonical bytes written a share at a time into an archive that cuts and hashes chunks as
+  the bytes arrive, and the origin's identity hashed from the same bytes and checked against the one the green recorded.
+  A taken-over green's recorded origin bytes are cut the same way. Version 0's record is enqueued once they are made, and
+  nothing of the green ships before. The archive is kept until every candidate holds version 0.
+- **Shipped in bounded parts.** A shipment carries the record, the offer of its inputs and at most a shipment's bound of
+  the chunks its targets lack. The bound is what a holder verifies in one slice, half a step quantum at the measured
+  BLAKE3 rate, and at least one chunk always goes. A target that cannot accept the record yet answers with what it holds
+  of the inputs: a content acknowledgement bound to them when it holds them whole, else the content plane's missing set
+  for the offer, asked again after the shipment's chunks. The owner keeps each target's missing set, ships each group of
+  targets what it lacks, and nudges the record plane when an answer shows progress. An ordinary increment is far below
+  the bound and still crosses whole in one exchange.
+- **Seeded a share at a time.** A holder seeds its replica of version 0 from the held chunks, read one at a time, the
+  origin decoded and the engine seeded a share at a time, and the head identity compared with the record's. The seed's
+  first slice runs as the record arrives, so an origin that seeds within it is acknowledged in that exchange; a larger
+  one goes on in a task, and every record of the green is answered with the content acknowledgement until it is done.
+  A seed installs its replica only while the hold still holds the inputs: a tombstone or a takeover's reclaim forgets
+  everything held for the green and drops its replica, and a seed past reading the hold that installed after that
+  would keep a whole origin nothing removes.
+- **Inputs chunked at the archive's largest chunk.** That is 1 MiB, the most any reader admits (AUD-29-13), where the host
+  page made a kernel-sized origin 100,000 to 400,000 extents and a 6 to 23 MB manifest. At 1 MiB it is about 1,600
+  extents and 90 KB, small enough to offer in every shipment and to read in a slice. Neither page nor chunk size is a
+  wire constant: a holder keys held inputs by the manifest identity the owner computed.
+
+Rejected: placing a large version's inputs through the content plane's own put ahead of its record (A-244's removed
+path), which is a second path chosen by size. Also rejected: one whole-archive shipment with a longer deadline, which still
+holds each holder's shard for the whole verification and decode. Also rejected: offering the manifest only once per
+target, since the holder can then name what it lacks only by keeping the offer, while at 1 MiB chunks the offer costs
+little.
+
+Applied in the same change to: §4.16 (status); A-217 (owed); A-244's shipment (bounded); GAPS; `slates-cluster`
+(`Committed::answers`; `ContentHold::held_manifest`, `held_chunk`); `slates-server` (new `merge_origin`: `InputsBuilder`,
+`OriginInputsJob`, `ReplicaSeed`, `seed_version_zero`; `merge_service`: `inputs_archive` at the archive's largest chunk,
+`MergeShardState::origin_inputs` and `seeding`, `PendingMergeRecord::lacking`, `ship_version`, `ship_groups`,
+`cut_shipments`, `ShipInputs`, `shipment_bound`, `record_inputs_answers`, `inputs_held`, `insert_pending`,
+`corrupt_if_faulted`, `HeldWalk::into_walked`, the removal of `walk_held_origin`; `fleet::serve_merge_shipment`); the
+unit tests (among them `a_seed_whose_green_is_forgotten_meanwhile_installs_nothing`, red with the install's hold check
+removed) and `a_green_over_a_base_places_its_origin_at_f1_a_slice_at_a_time`. No change to a record's format, the
+content messages or the shipment's framing.
+
 ### A-246 — A restarted owner re-enqueues the merge records its chain holds (accepted 2026-11-07)
 
 AUD-11 answers a submit at `f > 0` once its version's record commits at the quorum. The records an owner owes and the
@@ -17017,7 +17354,8 @@ Applied in the same change to:
   - The green's owner answers only the completion under the request's own key and refuses anything else `NotFound`. A
     key copied into another session is refused at its origin's door (A-SEAT).
   - A version's record ships only once its submitting work's catalog is committed, so no holder holds a completion
-    without its route. The record plane ships that catalog at the work's creation, and on demand.
+    without its route. The record plane ships that catalog at the work's creation, and on demand. A work on another
+    shard than its green (A-247) meets this on its own shard before its verdict is asked (A-298).
   - The successor never runs a resend whose key its chain does not hold. A work no member owns has no work to run against,
     so the green's owner refuses it `NotFound`. It answers only from the chain it adopted whole, to the quorum's head
     (`takeover::adopt`), so a version committed at the quorum whose answer was lost is answered, never run again
@@ -21179,6 +21517,21 @@ A fleet that mixes builds therefore stops with a typed refusal; it never reads a
 But the refusal comes from the length, not from a version or schema check: the configuration encoding carries
 none, so a later field whose absence still parsed would be defaulted. Named as a gap (GAPS), not shimmed here.
 
+> **Status (2026-11-17, g230): the configuration's layout is versioned and refused by name.** A regional configuration
+> now begins with a magic ("RCFG") and a layout version (1: the layout with A-272's dropped confirmations and the
+> moved-object exceptions last), and a root configuration with its own ("RTCF", 1)
+> (`raft_wire::REGIONAL_MAGIC`, `REGIONAL_LAYOUT`, `ROOT_MAGIC`, `ROOT_LAYOUT`). A decoder reads them before any field
+> and refuses another kind or an unversioned layout `ForeignLayout { magic }` and another version
+> `LayoutVersion { layout }`, so no layout is ever read by another's positions. An unversioned configuration begins
+> with its version number, whose low word is the magic only at version 1,195,787,090 (regional) or 1,178,817,618
+> (root). A retained council or root whose configuration is another build's layout refuses recovery as a corrupt one
+> does (a vote is never forgotten), now by name ("retained council base is another build's layout",
+> `retention::configuration_refused`). Every caller above refuses as before; only the reason changed. Held by
+> `a_configuration_of_another_layout_is_refused_by_name` (`crates/cluster/src/raft_wire.rs`) and
+> `a_retained_council_of_another_layout_refuses_recovery_by_name` (`crates/server/src/retention.rs`). The
+> configuration group's commands (`config_group::ConfigCommand`) are told apart by a tag byte and carry no layout
+> version: a change to an existing command's fields would be read by position, as the configuration was (GAPS).
+
 ### A-251 — A host takeover counts a holder's promise of an object only when the holder spoke for that object, and a holder lists a copy by the authority it was written under (accepted 2026-11-08; steps (a) and (b) built)
 
 A host takeover's phase one (§4.8 "Promotion and takeover") counted a holder's complete paged answer as a promise of
@@ -21815,7 +22168,12 @@ proof sets nothing once the policy has moved (`Refusal::PolicyChanged`). Built t
 kept in its record and on every shard's channels bound to it, held on the agent's shard before its request is routed
 (forbid refused; ask turns a landing into `Present` and a merge into `SubmitHeld`/`EditSubmitHeld`; bypass leaves the
 volume's mode to decide), so the stricter of consumer and volume governs; and the MCP and SDK land verbs, which send
-`Land` with no grant, say what the policy does. Owed: signed work. The
+`Land` with no grant, say what the policy does. Built 2026-11-18 with the two-node filesystem-server flow
+(`crates/cli/tests/fs_server.rs`, which found it): a landing's grant is refused `Forbidden` on a consumer-bound
+channel before anything else, whatever its proof (`landing::grant_verb`, counter `grant_by_consumer`), as a policy
+setting and a merge's approval already were, so an agent never approves its own landing
+(`docs/bugs/2026-11-18-an-agents-own-channel-could-approve-its-own-landing.md`). Open, its siblings: `Enroll` and
+`Revoke` still verify the proof alone (GAPS). Owed: signed work. The
 SSH-signature verifier built first (below) stays, for signed work.
 - **The rule (Ada, 2026-11-18).** Merging and landing to disk follow the permission mode the user gave the harness or
   agent that asks. Bypass (Claude Code's `bypassPermissions`, Codex's full access): slates merges and writes, no
@@ -22609,3 +22967,100 @@ Applied in the same change to:
   use, so at each such check); answered from the inode's attribute table. A create reads its parent's attribute table
   once. Owed to the integrator: the round trips a guest's non-owner `stat`-and-open costs over a stream, before and
   after.
+
+### A-298 — A submit off its green's shard asks for its verdict only once its work's route is committed (A-255 under A-247; 2026-11-17, g231, landing W1)
+Applied in the same change to: §4.16 (Submission), A-247's rule ("A submit's route"), A-255's rule (the record plane's
+gate), `crates/server/src/work_home.rs` (`Need::Route`, `route_committed`, `await_route`, `routes_placed`,
+`AWAITED_ROUTE`), `crates/server/src/merge_service.rs` (`next_merge_work` runs `routes_placed`; the gate's comment),
+`crates/server/src/fleet.rs` (`catalog_committed`'s reading), `crates/server/src/verbs.rs` (`judge_submission` names
+its `SealedWork`'s work in the record), the test below, GAPS. Named A-290 in the branch commits that built it
+(agents/g231-000-clients-loadtest-w1 9dfccacd4), a number another goal holds; renumbered before it reached main.
+
+- **What was wrong.** A-255 (built on main 2026-11-09, without W1) ships a version's merge record, which carries the
+  submit's completion, only once the submitting work's catalog register is committed, because after a takeover that
+  register, which names the green, is the only route a resend has to the completion. The record plane checks it on the
+  green's owner shard, "which holds its works too". A-247 (W1) places a work on the shard its name hashes to, so most
+  works are elsewhere, and the owner's partition holds no record of them: `catalog_committed` finds none and passes.
+  Merged as it stood, W1 would have let a record carrying a completion reach its holders before its route existed.
+- **The rule.** The register is the work's, held on the work's own shard. So a submit of a work whose green lives on
+  another shard (and an edit-and-submit) asks the owner for a verdict only once the work's catalog register is ready
+  at its quorum, read on the work's shard. Until then it waits there as W1's other parked verbs wait: the register
+  ships at once (the work joins `works_owing_catalog`, and the record plane is nudged), the later verbs of the work park
+  behind it, the record plane's next pass on that shard after the commit runs the submit's gate again
+  (`routes_placed`), and past the lease bound the submit is answered `Overloaded`, unrecorded, its retry meeting the
+  route again. Nothing has gone to the owner, so nothing waits to be settled. A record therefore never exists before its
+  route: the owner's gate still holds every work on its own shard, and finds no record of a work elsewhere because that
+  work's shard met the rule first.
+- **What it costs.** Nothing on a laptop, where the register is ready at once (no remote candidate). In a fleet, only a
+  submit that reaches its work's shard before the work's register has committed waits, for one placement of that
+  register (A-255 measured a submit made right after its work's creation at 1.59–1.64 ms against 1.25–1.29 ms, an idle
+  Mac Studio, 2026-11-09); the verdict then follows the register instead of running beside it.
+- **Checked once, not every pass.** The owner's gate re-reads readiness at every pass, and readiness is judged under
+  the current configuration, so it can lapse when a neighbourhood changes until the register is placed again. This
+  rule reads it once, before the verdict. A register committed at its quorum stays held there, so the route the rule
+  protects exists from then on; re-placing it under a new configuration is the record plane's period, as for every
+  register.
+- **Proven** by `a_submit_off_its_greens_shard_waits_for_its_works_catalog_record_before_its_verdict`
+  (`crates/server/tests/fleet.rs`): three nodes at `f = 1`, two shards each, both holders withholding every work's
+  catalog record, a work on the shard its green is not on. Its record is never placed while the catalog is withheld,
+  the work's shard counts the wait (`merge.work.awaited_route`), and once lifted the submit is answered version 1 and
+  the green holds one version. A-255's own test runs one shard a node, where every work shares its green's shard, so it
+  could not see this.
+
+### A-297 — The many-client merge bound is stated at the fleet row's increment rate, and the load test judges it (accepted 2026-11-18, Ada's decision; g231)
+Applied in the same change to: §1.4 (the status under the table), GAPS (the load test's entry: the statement and the
+judgment), `crates/client/examples/load_bench.rs` (the `bound` row; `Cycle` and `Round` leave out the client's think
+pauses; a cycle starts at its first edit's first send), BENCHMARKS (a note on the paced cycle figures before it).
+- **The question.** The goal "1,000 clients under 1 ms" named no offered load, and none can be met at think time 0: a
+  client's round holds one verdict, the green's one serialized step, so in a closed loop a round takes at least the
+  clients times the owner's CPU a verdict (21.0–26.9 µs on W1, BENCHMARKS 2026-11-09), 21 ms at 1,000 clients. Holding
+  each of a round's six requests under 1 ms there needs a verdict of at most 6 µs at 1,000 clients and 60 ns at
+  100,000, on any build. g231 put three statements to Ada (2026-11-17): §1.4's own increment rate per green; a
+  measured agent's pace (one sample of this Mac's agents: a median of 1,640 s between writes); and think time 0.
+- **The decision (Ada, 2026-11-18).** The first: the bound is measured at up to 1,000 merges a second, §1.4's
+  fleet-session row ("thousands"). It holds when every kind's p99 stays under 1 ms at 10³ or more verdicts a second with
+  1,000 clients and no oracle failures. Each rung sweeps its think mean so its verdicts a second span 10³ to 10⁴, and
+  reports the highest rate at which the bound holds, its capacity at the bound, which only ratchets upward.
+- **The judgment.** Each level prints `bound`: the bound and its rate, the level's verdicts a second, the worst p99 of
+  every kind (each attempt and each operation) with its row and kind, the clients held, given up or starved, the
+  oracle's failures, and `met`. A level meets it only at the rate or above, every p99 under 1 ms (exactly 1 ms is not
+  under), no failure, and no client given up or starved.
+- **A whole edit and merge leaves out the client's pauses.** The harness thinks after every reply, so a cycle (a round's
+  first edit to its first verdict) held five pauses: about 1 s of them at the pace that offers 10³ verdicts a second
+  from 1,000 clients, so no paced level could meet a bound over every kind. A pause is the client's own time. A
+  refusal's pause and a held send stay in, since the service or the harness kept the client waiting. A cycle also
+  starts at its first edit's first send, so a refusal for now of that edit is in it. At think time 0 a cycle is its
+  wall, as before.
+- **Proven by** the example's unit tests (`cargo test -p slates-client --example load_bench`): a round's cycle and round
+  are its requests' time and none of its pauses, through a conflict's resolution too; a cycle starts at the first send;
+  the row meets the bound with every kind under it at the rate and names the kind over it, and does not meet it below
+  the rate, with an oracle failure, with a client given up or starved, or with nothing timed. The measurement is the
+  supervisor's (CLAUDE.md §8): the 1,000-client rung on main with W1 at think means that span 10³ to 10⁴ verdicts a
+  second.
+
+### A-307 — A merge's write policy holds for a work off its green's shard (A-285 under A-247; 2026-11-18, g231, landing W1)
+Applied in the same change to: §4.16 (Submission, A-247's "A submit's write policy"), `crates/server/src/verbs.rs`
+(`merge_mode_of`, `stricter_merge_mode`, `SubmitPolicy` over main's `Approval`, `approval_verifies`; `judge_submission`
+and `owner_judge` take the policy), `crates/server/src/work_home.rs` (`Need::Verdict` carries it; `SubmitApproved`,
+`SubmitHeld` and `EditSubmitHeld` parked as `Submit` and `EditSubmit` are, an approval only once `may_ask` verifies it;
+their reset checked first), the test below, GAPS.
+- **What was wrong.** A-285 (main, 2026-11-18, without W1) judges a merge's policy in `submit` from both volumes'
+  records on that shard's partition, where a work and its green always met. W1 (A-247) serves a work on the shard its
+  name hashes to and asks the green's owner for the verdict: there the owner holds no record of the work, and the work's
+  shard none of the green, so merged as written, an off-shard work would have merged under one volume's mode alone (a
+  green's `Forbid` or `Ask` never seen from the work's shard, a work's never seen by the owner). And a `SubmitApproved`
+  would have reached the owner before its proof was checked, since W1's gate parks a verb before the verb runs.
+- **The rule.** The policy is judged where the verdict runs, with what each shard holds: the work's mode read on the
+  work's shard and sent in the ask, the green's read by the owner, the stricter deciding (a tie is the work's, as
+  A-285's). `Forbid` refuses before the increment is built; `Ask` answers `MergeApprovalRequired` with the increment's
+  identity, and an approval of another increment `GrantMismatch`. A consumer's session hold (`SubmitHeld`, A-285's
+  session policy) travels the same way and raises a bypass to an ask there. The work's shard sends an approval only
+  once it verifies; one that does not runs there, where `submit_approved` refuses it (`Forbidden` for a consumer,
+  `GrantIssuerUnverified` for a proof that does not verify), and nothing reaches the green. On one shard this is the
+  same code with both records local.
+- **Proven** by `a_merge_off_its_greens_shard_follows_both_volumes_write_policy` (`crates/server/tests/works_off_owner.rs`,
+  eight shards, works named onto other shards than their green's): the green's forbid refuses naming the green; the
+  work's ask answers its identity, refuses another increment's approval, an agent's and a forged one with nothing
+  merged, and accepts the launcher's; the green's ask holds an edit-and-submit, keeping its edit, until approved; an
+  agent's session that asks holds its merge of its own off-shard work; the owner was asked for the verdicts. A-285's
+  own tests run one shard, where every work shares its green's partition.
