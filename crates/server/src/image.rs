@@ -582,6 +582,7 @@ impl BuildJob {
         live_shipped: false,
         live_holders: None,
         write: None,
+        write_version: 0,
       },
       base: BaseRecord::Image {
         volume: self.source,
