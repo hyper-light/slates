@@ -12886,6 +12886,122 @@ fn a_successors_live_log_goes_on_past_every_position_durable_before_it() {
   );
 }
 
+/// Format: a successor's count of taken-over volumes made from the claim it reserved as a candidate (§4.2, g229).
+const CLAIM_TAKEN_OVER: &str = "fleet.live.claim_taken_over";
+/// Format: a node's count of taken-over volumes given up after their attempts (`fleet::give_up_taken_over`).
+const MATERIALIZE_GIVEN_UP: &str = "fleet.materialize.given_up";
+/// Shape: the creates a fill tries, each at the size the last one's refusal named: the bytes, then what the inode
+/// allowance or the metadata left, then one more for a ledger another admission moved meanwhile.
+const FILL_ATTEMPTS: usize = 3;
+
+/// Fills `daemon`'s shard (one shard a node in these meshes) with one bounded volume of everything it admits now: a
+/// create past any shard's room is refused `BudgetExceeded` naming what the shard could admit, and a create of that size
+/// takes it. The volume made, or the last reply.
+fn fill_shard(daemon: &Daemon, name: &str) -> Result<VolumeId, ReplyBody> {
+  let mut client = Client::connect(daemon.instance());
+  let mut limit = u64::MAX / 2;
+  let mut last = None;
+  for _ in 0..FILL_ATTEMPTS {
+    let reply = client.call(&RequestBody::Create {
+      name: name.to_owned(),
+      size: SizeClass::Bounded { limit },
+      names: NamePolicy::Exact,
+      require_locked: false,
+      base: None,
+    });
+    match reply {
+      ReplyBody::Created { id } => return Ok(id),
+      ReplyBody::Refused {
+        refusal: Refusal::BudgetExceeded { available },
+      } if available > 0 && available < limit => limit = available,
+      other => {
+        last = Some(other);
+        break;
+      }
+    }
+  }
+  Err(last.unwrap_or(ReplyBody::Refused {
+    refusal: Refusal::BudgetExceeded { available: limit },
+  }))
+}
+
+/// §4.2 ("a remote holder makes the same admission against its own machine before acknowledging placement"; g229, the
+/// macOS kill-at-ack failure, CI diag-supervisor-live-2): a candidate reserves a live volume's claim as it takes the
+/// log's first entry, so its successor makes the volume in that room however full its shard grew since. Do: three
+/// nodes at `f = 1`, the pressure hold held at nothing; on a, a bounded live-shipped volume written six files, each
+/// answered at durability; once the survivor the volume ranks first holds its log, fill that survivor's shard with a
+/// bounded volume of everything it then admits; stop a. Expect the successor to serve the volume and every file within
+/// the serve wait, made from its claim (`fleet.live.claim_taken_over` moved) and never given up. Before, the fill took the
+/// room a successor's restore needs, the restore was refused `BudgetExceeded` a period at a time, and after the failover
+/// SLO's attempts the volume was given up (`NotRecovered`) while the other survivor held every acknowledged write.
+#[test]
+fn a_candidates_claim_keeps_the_room_its_successor_makes_the_volume_in() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, mut daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  // No pressure hold: a takeover's restore may run into the hold's room (`fleet::past_the_pressure_hold`), which would
+  // let a successor without its claim make the volume all the same.
+  for daemon in &daemons {
+    daemon.inject_available_memory(u64::MAX / 2).unwrap();
+  }
+  let mut client = Client::connect(daemons[0].instance());
+  let (id, written) = live_volume_written(&mut client, &daemons, "claimed");
+  drop(client);
+  let object = ObjectId(id.bytes);
+  let successor = rendezvous_first(&[hosts[1], hosts[2]], object).expect("a survivor takes over");
+  let index = if successor == hosts[1] { 1 } else { 2 };
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let holds_log = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    daemons[index]
+      .fleet_live_held(object)
+      .map(|held| held.is_some())
+  });
+  drop(observed);
+  let filled = fill_shard(&daemons[index], "fill");
+  let taken_before = refusal_count(&daemons[index], CLAIM_TAKEN_OVER).unwrap();
+  let given_up_before = refusal_count(&daemons[index], MATERIALIZE_GIVEN_UP).unwrap();
+  daemons.remove(0).stop();
+  let index = index - 1;
+  let instance = daemons[index].instance().to_owned();
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let served = poll_status_answers(&observed, &instance, id);
+  let mut reader = Client::connect(&instance);
+  let read: Vec<bool> = (0..CONTINUITY_FILES)
+    .map(|file| {
+      let reply = read_at_head(&mut reader, id, &format!("/continuity-{file}"));
+      matches!(reply, ReplyBody::ReadPage { bytes, .. } if bytes == continuity_body(file))
+    })
+    .collect();
+  drop(reader);
+  let taken = refusal_count(&daemons[index], CLAIM_TAKEN_OVER).unwrap();
+  let given_up = refusal_count(&daemons[index], MATERIALIZE_GIVEN_UP).unwrap();
+  drop(observed);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "claimed: the successor held the log {holds_log}, its shard filled {filled:?}; served {served}, read {read:?}; \
+     claims taken over {taken_before} -> {taken}, given up {given_up_before} -> {given_up}"
+  );
+  assert!(
+    written
+      .iter()
+      .all(|reply| matches!(reply, ReplyBody::FsDone { .. })),
+    "every write was answered at durability: {written:?}"
+  );
+  assert!(
+    holds_log && filled.is_ok(),
+    "the successor held the log ({holds_log}) and its shard was filled: {filled:?}"
+  );
+  assert!(
+    served && read.iter().all(|read| *read),
+    "the successor serves the volume ({served}) and every file reads back through it: {read:?}"
+  );
+  assert!(
+    taken > taken_before && given_up == given_up_before,
+    "made from its claim ({taken_before} -> {taken}), never given up ({given_up_before} -> {given_up})"
+  );
+}
+
 /// Format: a node's count of objects its takeover rounds adopted (`takeover::record_adoption`).
 const TAKEOVER_ADOPTED: &str = "fleet.takeover.adopted";
 /// Format: a node's count of takeover rounds started over (`takeover::begin_round`, A-353).
