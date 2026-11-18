@@ -315,6 +315,18 @@ impl Relay {
     let _ = self.report();
   }
 
+  /// Cuts what leaves `node` only: it still hears every peer and none hears it.
+  pub(crate) fn mute(&self, node: usize) {
+    for other in (0..self.nodes).filter(|other| *other != node) {
+      self.send(Command::Rule {
+        from: node,
+        to: other,
+        rule: PathRule::CUT,
+      });
+    }
+    let _ = self.report();
+  }
+
   /// Every path back to the default: every datagram forwarded at once.
   pub(crate) fn heal(&self) {
     self.shape_all(PathRule::default());
@@ -1083,6 +1095,63 @@ fn a_cut_drops_its_direction_only_until_healed() {
   let (bytes, _) =
     receive_within(&nodes[1].bound[1], ARRIVAL_WAIT).expect("a healed path delivers");
   assert_eq!(bytes, b"healed");
+}
+
+/// Goal g229, the one-way partitions a flow applies to a whole node. Do: mute node 0 and send each way; heal; deafen node
+/// 0 and send each way. Expect: muted, node 0's datagram is cut and node 1's arrives; deafened, the reverse; each cut
+/// counted on its own direction.
+#[test]
+fn mute_and_deafen_each_cut_one_direction_of_a_node() {
+  let (relay, nodes) = relayed_pair(5);
+  relay.mute(0);
+  nodes[0]
+    .dialer
+    .send_to(b"unheard", nodes[1].advertised_record)
+    .unwrap();
+  nodes[1]
+    .dialer
+    .send_to(b"heard", nodes[0].advertised_record)
+    .unwrap();
+  let (bytes, _) =
+    receive_within(&nodes[0].bound[1], ARRIVAL_WAIT).expect("a muted node still hears");
+  assert_eq!(bytes, b"heard");
+  assert_eq!(
+    receive_within(&nodes[1].bound[1], ABSENCE_WAIT),
+    None,
+    "nobody hears a muted node"
+  );
+  let report = relay.report();
+  assert_eq!(
+    (report.cut(0, 1), report.cut(1, 0)),
+    (1, 0),
+    "{}",
+    report.summary()
+  );
+  relay.heal();
+  relay.deafen(0);
+  nodes[0]
+    .dialer
+    .send_to(b"spoken", nodes[1].advertised_record)
+    .unwrap();
+  nodes[1]
+    .dialer
+    .send_to(b"lost", nodes[0].advertised_record)
+    .unwrap();
+  let (bytes, _) =
+    receive_within(&nodes[1].bound[1], ARRIVAL_WAIT).expect("a deafened node still speaks");
+  assert_eq!(bytes, b"spoken");
+  assert_eq!(
+    receive_within(&nodes[0].bound[1], ABSENCE_WAIT),
+    None,
+    "a deafened node hears nothing"
+  );
+  let report = relay.report();
+  assert_eq!(
+    (report.cut(0, 1), report.cut(1, 0)),
+    (1, 1),
+    "{}",
+    report.summary()
+  );
 }
 
 /// Goal g229, the rates and the hold. Do: send node 0 -> 1 under all-loss, then under a fixed delay, then under

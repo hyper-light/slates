@@ -1991,9 +1991,16 @@
 >     record link's ephemeral source is attributed to its node by the process holding the port (`/proc` on Linux,
 >     `netstat` and `ps` on macOS); a datagram no census attributes is dropped and counted, never forwarded, since
 >     forwarding it could carry a cut-off node's traffic across.
->   - Three flows run behind it (`Fleet::start_relayed`): writes streamed while every path holds 20 ms ± 5 ms and loses
->     1 %, then 5 %, then 1 % with 2 % duplicated, then a takeover over the lossy paths; an owner cut off both ways
->     while it runs; and an owner that still speaks to its peers but hears none.
+>   - Eight flows run behind it (`Fleet::start_relayed`), the partitions each against a running process:
+>     - writes streamed while every path holds 20 ms ± 5 ms and loses 1 %, then 5 %, then 1 % with 2 % duplicated, then
+>       a takeover over the lossy paths;
+>     - an owner cut off both ways, deafened (it speaks and hears nothing) or muted (it hears and nobody hears it), each
+>       taken over (`an_owner_partitioned`);
+>     - each candidate in turn cut off, deafened or muted for 2 s, with no write refused and no takeover: a partitioned
+>       candidate deposes no one, since its view is one voter's and a death needs `f + 1` (A-250)
+>       (`candidates_partitioned_in_turn`, the SIGSTOP flow's partition kinds);
+>     - one candidate held 200 ms ± 50 ms each way (T-8.3's slow candidate), and no write waits for it: the median write
+>       made meanwhile stays under its round trip, since one holder of two makes a write durable at `f = 1`.
 >   - Two invariants are judged from outside, in every flow that takes a live volume over (the relayed ones, the
 >     SIGSTOP owner and the SIGKILL takeovers: `judge_takeover`, `an_owner_partitioned`). ReadSafety: a latest-state
 >     read sent through any node after a write's acknowledgement answers that write or a refusal, never other bytes and
@@ -2006,9 +2013,9 @@
 >     it was partitioned refused. Until 2026-11-17 the SIGSTOP flow refused every write sent after the resume instead,
 >     but a re-admitted old node forwards a write to the volume's owner (§4.8 "Lookup"), so an acknowledgement through
 >     it after the heal can be right; such writes are held to NoLoss on the successor with every other acknowledged one.
->   - The relay's own five tests (in-process sockets, no daemon) pass on macOS (kiln on Adas-MacBook-Pro-3, 2026-11-17,
->     run r71 and again with the takeover checks): forwarding and the answer's way back, a one-way cut, loss, delay and
->     duplication, attribution by process, and the draws. The flows' first runs are the supervisor's (CLAUDE.md §8):
+>   - The relay's own six tests (in-process sockets, no daemon) pass on macOS (kiln on Adas-MacBook-Pro-3, 2026-11-17):
+>     forwarding and the answer's way back, a one-way cut, a node muted and deafened, loss, delay and duplication,
+>     attribution by process, and the draws. The flows' first runs are the supervisor's (CLAUDE.md §8):
 >     `SLATES_TEST_CLI=1 cargo test --release -p slates-cli --test live_chaos -- --test-threads=1` on macOS and Linux.
 >     Linux's census has run nowhere yet.
 >

@@ -10,7 +10,9 @@
 //! - **NoLoss**: every write a client was told succeeded is served byte for byte at the end, by whichever node serves the
 //!   volume then; and no file is ever served torn (a write not acknowledged is absent or whole).
 //! - **StaleNeverCommits**: once a volume has been taken over, every copy of its log that answers is fenced at or above
-//!   the serving owner's epoch, and a write made through the superseded owner is refused, never acknowledged.
+//!   the serving owner's epoch, and a write sent to the superseded owner while it was partitioned is refused, never
+//!   acknowledged ([`judge_stale_writes`]); and while the owner serves, no partitioned candidate takes its volume over
+//!   ([`no_takeover`]).
 //! - **Convergence**: once healed, every candidate holds the owner's head (epoch, position and identity), and the owner's
 //!   log is durable at its head with nothing owed.
 //! - **ReadSafety**: a latest-state read sent through any node after a write's acknowledgement arrived answers that
@@ -2185,23 +2187,26 @@ fn judge_healed(
   }
 }
 
-/// A-200 with candidates partitioned in turn mid-stream: do stream writes to a live volume and stop each candidate's
-/// process (SIGSTOP) for [`PARTITION`] in turn, the stream running throughout, then resume it. Expect every write
-/// acknowledged (durable through whichever candidate answers), none lost, both candidates caught up once healed, and one
-/// chain identity at every head any copy reported.
-#[test]
-fn candidates_partitioned_in_turn_mid_stream_lose_nothing() {
-  /// Shape: how long each candidate is partitioned: past the liveness budget (1 s), so its sessions are found dead.
-  const PARTITION: Duration = Duration::from_secs(2);
-  if !gated("rolling-partition") {
+/// Shape: how long each candidate is partitioned in turn: past the liveness budget (1 s), so its sessions are found
+/// dead.
+const CANDIDATE_PARTITION: Duration = Duration::from_secs(2);
+
+/// A-200 with candidates partitioned in turn mid-stream: do stream writes to a live volume and partition each candidate
+/// in turn for [`CANDIDATE_PARTITION`] as `partition` says, the stream running throughout, then end the partition.
+/// Expect every write acknowledged (durable through whichever candidate answers), none lost, both candidates caught up
+/// once healed, one chain identity at every head any copy reported, and no takeover ([`no_takeover`]): a partitioned
+/// candidate is not its owner's loss, however the partition makes it judge the owner.
+fn candidates_partitioned_in_turn(tag: &str, flow: &'static str, partition: Partition) {
+  if !gated(tag) {
     return;
   }
-  let fleet = Fleet::start("rolling", Supervision::Bare);
+  let fleet = partition.fleet(tag);
   let owner_index = fleet.owner_index();
   let owner = fleet.instances[owner_index].clone();
   let candidates = candidates_of(&fleet, owner_index);
-  let volume = fleet.create_volume(&owner, "rolling", true);
-  let mut verdict = Verdict::new("candidates partitioned in turn mid-stream");
+  let volume = fleet.create_volume(&owner, tag, true);
+  let mut verdict = Verdict::new(flow);
+  let mut epoch_before = None;
   let (outcomes, samples) = stream_through(
     &fleet.instances,
     &owner,
@@ -2210,12 +2215,15 @@ fn candidates_partitioned_in_turn_mid_stream_lose_nothing() {
     |began| {
       for index in fleet.others(owner_index) {
         after_writes(&owner, &volume, BETWEEN_EVENTS);
-        fleet.stop(index);
-        let stopped = began.elapsed();
-        sleep(PARTITION);
-        fleet.resume(index);
+        if epoch_before.is_none() {
+          epoch_before = Some(serving_epoch(&owner, &volume));
+        }
+        partition.begin(&fleet, index);
+        let from = began.elapsed();
+        sleep(CANDIDATE_PARTITION);
+        partition.end(&fleet, index);
         verdict.note(format!(
-          "{} partitioned from {stopped:?} to {:?}",
+          "{} {partition:?} from {from:?} to {:?}",
           fleet.instances[index],
           began.elapsed()
         ));
@@ -2223,11 +2231,7 @@ fn candidates_partitioned_in_turn_mid_stream_lose_nothing() {
       after_writes(&owner, &volume, BETWEEN_EVENTS);
     },
   );
-  let refused: Vec<&Outcome> = outcomes.iter().filter(|o| o.refused.is_some()).collect();
-  verdict.check(
-    "every write acknowledged",
-    refused.iter().map(|o| format!("{o:?}")).collect(),
-  );
+  verdict.check("every write acknowledged", refused_lines(&outcomes));
   judge_healed(
     &mut verdict,
     &owner,
@@ -2236,8 +2240,76 @@ fn candidates_partitioned_in_turn_mid_stream_lose_nothing() {
     &outcomes,
     &samples,
   );
+  verdict.check(
+    "no takeover while the owner served (a partitioned candidate deposes no one)",
+    no_takeover(&owner, &candidates, &volume, epoch_before.unwrap_or(0)),
+  );
+  if let Some(relay) = &fleet.relay {
+    verdict.note(relay.report().summary());
+  }
   drop(fleet);
   verdict.judge();
+}
+
+/// That no survivor took `volume` over while its owner still served it: the owner ships under the epoch it shipped under
+/// before (`epoch_before`), and no candidate counted a takeover (`fleet.live.taken_over`). A partitioned candidate may
+/// hold the owner dead from its side, but that is one voter's view: the council's leader retires a member only once
+/// `f + 1` voters hold it dead, and a report below the incarnation the member refuted at counts for nothing (§4.8
+/// "Who declares a death", A-250), while the other candidate still hears the owner. A takeover follows only a
+/// retirement, so none may run (T-8.5's "no false deaths"). The violations.
+fn no_takeover(owner: &str, candidates: &[String], volume: &str, epoch_before: u64) -> Vec<String> {
+  let epoch_now = serving_epoch(owner, volume);
+  let deposed = (epoch_now != epoch_before).then(|| {
+    format!(
+      "the owner {owner} ships under epoch {epoch_now}, not {epoch_before} as before the partitions"
+    )
+  });
+  let taken = candidates.iter().filter_map(|candidate| {
+    let count = counter(candidate, "fleet.live.taken_over");
+    (count > 0).then(|| format!("{candidate} counted {count} takeovers"))
+  });
+  deposed.into_iter().chain(taken).collect()
+}
+
+/// [`candidates_partitioned_in_turn`] with each candidate's process stopped (SIGSTOP): it does nothing while stopped,
+/// its timers with it.
+#[test]
+fn candidates_partitioned_in_turn_mid_stream_lose_nothing() {
+  candidates_partitioned_in_turn(
+    "rolling",
+    "candidates partitioned in turn mid-stream",
+    Partition::Stopped,
+  );
+}
+
+/// [`candidates_partitioned_in_turn`] with each candidate cut off both ways at the fault relay while it runs (goal g229):
+/// from its side the owner and the other candidate fall silent, so it suspects them and may try a takeover, which it must
+/// never win.
+#[test]
+fn candidates_cut_off_in_turn_while_running_lose_nothing_and_depose_no_one() {
+  candidates_partitioned_in_turn(
+    "rolling-cut",
+    "candidates cut off in turn while running",
+    Partition::Isolated,
+  );
+}
+
+/// [`candidates_partitioned_in_turn`] with each candidate deafened in turn (goal g229): it hears nothing and still speaks,
+/// so its suspicion of the owner, and any promotion it asks for, reach every peer while their answers never reach it.
+#[test]
+fn candidates_deafened_in_turn_lose_nothing_and_depose_no_one() {
+  candidates_partitioned_in_turn(
+    "rolling-deaf",
+    "candidates deafened in turn",
+    Partition::Deafened,
+  );
+}
+
+/// [`candidates_partitioned_in_turn`] with each candidate muted in turn (goal g229): it hears every entry the owner ships
+/// and can acknowledge none, so the owner's writes are durable through the other candidate alone.
+#[test]
+fn candidates_muted_in_turn_lose_nothing_and_depose_no_one() {
+  candidates_partitioned_in_turn("rolling-mute", "candidates muted in turn", Partition::Muted);
 }
 
 /// A-200 under injected jitter: do stream writes to a live volume while each candidate's process is stopped for a
@@ -4356,7 +4428,103 @@ fn writes_stream_through_lossy_paths_and_a_takeover_over_them_loses_nothing() {
   verdict.judge();
 }
 
-/// How a flow partitions a volume's owner mid-stream (goal g229).
+/// Shape: the one-way hold on every path to and from a slow candidate: ten times the lossy profile's hold. Beside the
+/// other candidate's loopback paths (tens of microseconds) that is far past T-8.3's tenfold slower candidate, so the
+/// flow is the stricter case; its round trip (400 ms) stays well inside the liveness budget (1 s), so the candidate is
+/// slow, never dead.
+const SLOW_HOLD: Duration = Duration::from_millis(200);
+/// Shape: the slow hold's spread, a quarter of it.
+const SLOW_SPREAD: Duration = Duration::from_millis(50);
+/// Shape: the durable writes made while one candidate is slow: four chaos events' worth.
+const SLOW_WRITES: u64 = 4 * BETWEEN_EVENTS;
+
+/// A-200 and AC-8.12's straggler immunity across real processes (goal g229, injected latency on one replica; T-8.3's
+/// slow candidate, whose probation half is not built): do stream writes to a live volume, then hold every datagram to and
+/// from one candidate 200 ms ± 50 ms each way for [`SLOW_WRITES`] durable writes, then heal. Expect every write
+/// acknowledged and none lost, both candidates caught up once healed, one identity at every head, and no write waiting
+/// on the slow candidate ([`slow_candidate_waited`]).
+#[test]
+fn writes_stream_past_a_slow_candidate_without_waiting_for_it() {
+  if !gated("slow-candidate") {
+    return;
+  }
+  let fleet = Fleet::start_relayed("slow", Supervision::Bare, &FLEET_NODES);
+  let owner_index = fleet.owner_index();
+  let owner = fleet.instances[owner_index].clone();
+  let candidates = candidates_of(&fleet, owner_index);
+  let slow = fleet.others(owner_index)[0];
+  let volume = fleet.create_volume(&owner, "slow", true);
+  let mut verdict = Verdict::new("writes past a slow candidate");
+  let mut slowed = (Duration::ZERO, Duration::ZERO);
+  let (outcomes, samples) = stream_through(
+    &fleet.instances,
+    &owner,
+    &volume,
+    0..STREAM_FILES,
+    |began| {
+      after_writes(&owner, &volume, BETWEEN_EVENTS);
+      fleet.relay().shape_node(
+        slow,
+        PathRule {
+          delay: SLOW_HOLD,
+          jitter: SLOW_SPREAD,
+          ..PathRule::default()
+        },
+      );
+      let from = began.elapsed();
+      after_writes(&owner, &volume, SLOW_WRITES);
+      slowed = (from, began.elapsed());
+      fleet.relay().heal();
+      after_writes(&owner, &volume, BETWEEN_EVENTS);
+    },
+  );
+  verdict.note(format!(
+    "{} slowed {SLOW_HOLD:?} ± {SLOW_SPREAD:?} each way from {:?} to {:?}",
+    fleet.instances[slow], slowed.0, slowed.1
+  ));
+  verdict.check("every write acknowledged", refused_lines(&outcomes));
+  verdict.check(
+    "no write waited for the slow candidate",
+    slow_candidate_waited(&outcomes, slowed),
+  );
+  judge_healed(
+    &mut verdict,
+    &owner,
+    &candidates,
+    &volume,
+    &outcomes,
+    &samples,
+  );
+  verdict.note(fleet.relay().report().summary());
+  drop(fleet);
+  verdict.judge();
+}
+
+/// The violation when the writes sent while a candidate was slow (`slowed`, from the stream's start) took a median of
+/// its shortest round trip or more: the owner then waited on it. It need not: a write is durable at `W = max(n − f, f)`
+/// of an owner's `n` holders, one of two at `f = 1` (`slates_db::live`'s `Shipper::reached_by`), so the other candidate's
+/// acknowledgement is enough.
+fn slow_candidate_waited(outcomes: &[Outcome], slowed: (Duration, Duration)) -> Vec<String> {
+  let mut took: Vec<Duration> = outcomes
+    .iter()
+    .filter(|outcome| {
+      outcome.refused.is_none() && outcome.sent >= slowed.0 && outcome.sent < slowed.1
+    })
+    .map(|outcome| outcome.took)
+    .collect();
+  took.sort();
+  let round_trip = SLOW_HOLD.saturating_sub(SLOW_SPREAD).saturating_mul(2);
+  match took.get(took.len() / 2) {
+    Some(median) if *median >= round_trip => vec![format!(
+      "the median of {} writes made while it was slow took {median:?}, at least its shortest round trip {round_trip:?}",
+      took.len()
+    )],
+    Some(_) => Vec::new(),
+    None => vec!["no write was acknowledged while the candidate was slow".to_owned()],
+  }
+}
+
+/// How a flow partitions one node mid-stream (goal g229).
 #[derive(Clone, Copy, Debug)]
 enum Partition {
   /// Its process stopped (SIGSTOP) until resumed (SIGCONT): it does nothing meanwhile, its timers with it.
@@ -4365,13 +4533,42 @@ enum Partition {
   Isolated,
   /// Cut off one way at the fault relay while its process runs on: it speaks to every peer and hears none.
   Deafened,
+  /// Cut off the other way at the fault relay while its process runs on: it hears every peer and none hears it.
+  Muted,
 }
 
 impl Partition {
-  /// Whether the owner's process runs through the partition: the flow then puts the fault relay between the nodes to
-  /// partition it, and reads through it while the partition lasts.
+  /// Whether the node's process runs through the partition: the flow then puts the fault relay between the nodes to
+  /// partition it, and can read through it while the partition lasts.
   fn running(self) -> bool {
     !matches!(self, Partition::Stopped)
+  }
+
+  /// A fleet for a flow that partitions this way: behind the fault relay when the process runs on.
+  fn fleet(self, tag: &str) -> Fleet {
+    if self.running() {
+      Fleet::start_relayed(tag, Supervision::Bare, &FLEET_NODES)
+    } else {
+      Fleet::start(tag, Supervision::Bare)
+    }
+  }
+
+  /// Partitions `fleet`'s node `node`.
+  fn begin(self, fleet: &Fleet, node: usize) {
+    match self {
+      Partition::Stopped => fleet.stop(node),
+      Partition::Isolated => fleet.relay().isolate(node),
+      Partition::Deafened => fleet.relay().deafen(node),
+      Partition::Muted => fleet.relay().mute(node),
+    }
+  }
+
+  /// Ends the partition of `fleet`'s node `node`: resumes its process, or heals every path.
+  fn end(self, fleet: &Fleet, node: usize) {
+    match self {
+      Partition::Stopped => fleet.resume(node),
+      Partition::Isolated | Partition::Deafened | Partition::Muted => fleet.relay().heal(),
+    }
   }
 }
 
@@ -4418,11 +4615,7 @@ fn an_owner_partitioned(tag: &str, flow: &'static str, partition: Partition) {
   if !gated(tag) {
     return;
   }
-  let fleet = if partition.running() {
-    Fleet::start_relayed(tag, Supervision::Bare, &FLEET_NODES)
-  } else {
-    Fleet::start(tag, Supervision::Bare)
-  };
+  let fleet = partition.fleet(tag);
   let owner_index = fleet.owner_index();
   let owner = fleet.instances[owner_index].clone();
   let volume = fleet.create_volume(&owner, tag, true);
@@ -4467,11 +4660,7 @@ fn partition_owner_mid_stream(
   let survivors: Vec<&str> = candidates.iter().map(String::as_str).collect();
   let mut run = PartitionRun::default();
   after_writes(owner, volume, BETWEEN_EVENTS);
-  match partition {
-    Partition::Stopped => fleet.stop(owner_index),
-    Partition::Isolated => fleet.relay().isolate(owner_index),
-    Partition::Deafened => fleet.relay().deafen(owner_index),
-  }
+  partition.begin(fleet, owner_index);
   run.partitioned_at = began.elapsed();
   let taken = wait_taken_over(&survivors, volume);
   verdict.note(format!(
@@ -4493,11 +4682,11 @@ fn partition_owner_mid_stream(
     run.probes.extend(probes);
     // A heal the reads needed (the owner held them past their bound) ended the partition there.
     run.healed_at = healed.unwrap_or_else(|| {
-      fleet.relay().heal();
+      partition.end(fleet, owner_index);
       began.elapsed()
     });
   } else {
-    fleet.resume(owner_index);
+    partition.end(fleet, owner_index);
     run.healed_at = began.elapsed();
     run
       .probes
@@ -4699,5 +4888,19 @@ fn an_owner_that_hears_nothing_while_it_still_speaks_is_superseded_and_serves_no
     "deafened",
     "an owner that hears nothing while it still speaks",
     Partition::Deafened,
+  );
+}
+
+/// An owner that still hears its peers but that none of them hears (goal g229; AC-8.1, AC-8.2): [`an_owner_partitioned`]
+/// with [`Partition::Muted`], the other one-way partition. Its entries and its lease's probes never leave it, so it can
+/// neither commit nor confirm its lease, while it hears its peers condemn it and its successor take over. Expect what
+/// that flow states: superseded, acknowledging no write while muted, never answering a read with less than its successor
+/// acknowledged, and every invariant held.
+#[test]
+fn an_owner_no_peer_hears_while_it_hears_them_all_is_superseded_and_serves_nothing_stale() {
+  an_owner_partitioned(
+    "muted",
+    "an owner no peer hears while it hears them all",
+    Partition::Muted,
   );
 }
