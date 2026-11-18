@@ -889,13 +889,68 @@ fn a_signed_landing_is_judged_and_read_back_through_the_contract() {
     &mut instance,
     &VolumeSpec::overlay("signed-landing", &folder.path, ROOM),
   );
-  write_file(&mut instance, volume, "/s.txt", b"signed\n");
+  let (landing, verified) = land_signed(&mut instance, &launcher, volume, &folder);
+  expect_the_signed_landing_audited(&mut instance, landing, verified);
+  daemon.stop();
+}
+
+/// Shape: the instances that read the audit in the cross-shard test beside the one that landed. A client's shard is its
+/// id's residue over the shards and fresh ids are handed out in turn, so the four sit on both of kiln's shards
+/// whichever the first took.
+#[cfg(unix)]
+const AUDIT_READERS: usize = 3;
+
+/// AC-5.10 / AC-5.12 (A-321, A-265; §4.15 "Ownership facts": the audit log is written through the control shard;
+/// §4.12) on the shards kiln starts: do land an overlay signed and approve it as
+/// `a_signed_landing_is_judged_and_read_back_through_the_contract` does, the overlay named so that the shard other than
+/// the control shard owns it; then read the audit from the instance that landed and from three more attached after it.
+/// Expect every reader to read the landing's planned and finished records, verified. Before A-265 `Audit` read only the
+/// partition of the reader's own shard while a landing's records were written on its volume's, so a reader on the
+/// control shard read none of them and the landing's verdict with them (GAPS, found by g90).
+#[cfg(unix)]
+#[test]
+fn a_signed_landings_audit_reads_back_on_every_shard_kiln_starts() {
+  let (daemon, mut instance) = kiln_grouped("audit-shards");
+  let launcher = issuer_of(&daemon);
+  let folder = Folder::new();
+  let name = (0..)
+    .map(|n| format!("audited-elsewhere-{n}"))
+    .find(|name| slates_server::verbs::owner_of_name(name, usize::from(KILN_SHARDS)) != 0)
+    .unwrap();
+  let volume = provision(
+    &mut instance,
+    &VolumeSpec::overlay(&name, &folder.path, ROOM),
+  );
+  let (landing, verified) = land_signed(&mut instance, &launcher, volume, &folder);
+  let mut readers: Vec<Instance> = (0..AUDIT_READERS)
+    .map(|_| Instance::attach(instance.name()).unwrap())
+    .collect();
+  expect_the_signed_landing_audited(&mut instance, landing, verified);
+  for reader in &mut readers {
+    expect_the_signed_landing_audited(reader, landing, verified);
+  }
+  drop(readers);
+  daemon.stop();
+}
+
+/// The signed landing of `a_signed_landing_is_judged_and_read_back_through_the_contract`: do trust a fresh key on
+/// `volume` with the `launcher`'s authority, write a file into it, plan its landing into `folder`, sign the statement
+/// the plan states and land with the signature, and approve what that asks. Expect what that test names; the landing
+/// and the verdict it was answered with.
+#[cfg(unix)]
+fn land_signed(
+  instance: &mut Instance,
+  launcher: &slates_api::Issuer,
+  volume: VolumeId,
+  folder: &Folder,
+) -> (u64, Verification) {
+  write_file(instance, volume, "/s.txt", b"signed\n");
   let key = signer::TestSigner::fresh();
   let trusted = TrustedSigner::from_wire(key.public()).unwrap();
   instance
-    .set_signers(volume, std::slice::from_ref(&trusted), &launcher)
+    .set_signers(volume, std::slice::from_ref(&trusted), launcher)
     .unwrap();
-  let request = landing_into(volume, &folder);
+  let request = landing_into(volume, folder);
   let LandOutcome::ApprovalRequired(plan) = instance.plan_landing(&request).unwrap() else {
     panic!("a plan presents");
   };
@@ -917,13 +972,12 @@ fn a_signed_landing_is_judged_and_read_back_through_the_contract() {
     None,
     "nothing written before the approval"
   );
-  let LandOutcome::Written(report) = instance.approve_landing(&asked, &launcher).unwrap() else {
+  let LandOutcome::Written(report) = instance.approve_landing(&asked, launcher).unwrap() else {
     panic!("the approved manifest lands");
   };
   assert_eq!(report.verification, verified);
   assert_eq!(folder.read("s.txt").unwrap(), b"signed\n");
-  expect_the_signed_landing_audited(&mut instance, report.landing, verified);
-  daemon.stop();
+  (report.landing, verified)
 }
 
 /// The audit of `a_signed_landing_is_judged_and_read_back_through_the_contract`. Expect every record of `landing` that
@@ -1578,6 +1632,240 @@ mod shards {
     assert_eq!(errno(&missing), ENOENT, "a name the volume lacks is ENOENT");
     drop(device);
     daemon.stop();
+  }
+}
+
+/// The async form by use (§4.12 "Embedding", R6; A-299): an instance a host awaits on its own loop.
+#[cfg(unix)]
+mod asynchronous_form {
+  use std::cell::Cell;
+  use std::os::fd::BorrowedFd;
+  use std::pin::pin;
+  use std::task::{Context, Poll, Waker};
+
+  use slates_api::{AsyncInstance, Completion, Reactor, Waiting, Woke};
+
+  use super::*;
+
+  /// Shape: the most polls [`block_on`] gives a future whose waits all answer at once: one is enough, a few more
+  /// guard against a call that loops without waiting.
+  const POLLS: usize = 4;
+
+  /// Shape: how many times the rounds the cancellation case wants dropped it may run: a round whose call is answered on
+  /// its first poll (the daemon replied before the call reached its wait) drops nothing and runs again.
+  const ROUNDS_PER_DROP: usize = 4;
+
+  /// A host's reactor in miniature: its wait blocks this thread in `poll(2)` until the completion signal is readable
+  /// or the timeout passes, then answers at once, so an awaited call ends in the one poll [`block_on`] gives it. A call
+  /// that would wait for good fails the test instead of hanging it: a wait with no timeout is bounded by the suite's
+  /// wait, and so are the waits a call times out one after another with no signal between them (a live daemon's call
+  /// goes on waiting through its deadlines, A-232, so only the host bounds it). It counts how its waits ended, the
+  /// evidence a test prints: a wait that timed out is the driver's deadline, not a reply's signal.
+  #[derive(Default)]
+  struct Blocking {
+    /// Waits the completion signal ended.
+    readable: Cell<u64>,
+    /// Waits the timeout ended.
+    timed_out: Cell<u64>,
+    /// How long the waits since the last signal timed out, in all.
+    unsignalled: Cell<Duration>,
+  }
+
+  impl Reactor for Blocking {
+    fn wait(&self, completion: Completion, timeout_ns: Option<u64>) -> Waiting<'_> {
+      // SAFETY: `completion` is the waiting instance's completion descriptor, which its client keeps open for as long
+      // as the instance lives, and the call that waits here borrows the instance.
+      let descriptor = unsafe { BorrowedFd::borrow_raw(completion) };
+      let bound = timeout_ns.map_or(START_WAIT, Duration::from_nanos);
+      let timeout = rustix::event::Timespec::try_from(bound).ok();
+      let mut interest = [rustix::event::PollFd::new(
+        &descriptor,
+        rustix::event::PollFlags::IN,
+      )];
+      let woke = match rustix::event::poll(&mut interest, timeout.as_ref()) {
+        Ok(0) if timeout_ns.is_none() => Err(std::io::Error::new(
+          std::io::ErrorKind::TimedOut,
+          "nothing landed within the suite's wait",
+        )),
+        Ok(0) => Ok(Woke::TimedOut),
+        Ok(_) => Ok(Woke::Readable),
+        Err(errno) => Err(std::io::Error::from(errno)),
+      };
+      let counted = match woke {
+        Ok(Woke::Readable) => {
+          self.unsignalled.set(Duration::ZERO);
+          &self.readable
+        }
+        Ok(Woke::TimedOut) => {
+          let unsignalled = self.unsignalled.get().saturating_add(bound);
+          self.unsignalled.set(unsignalled);
+          if unsignalled > START_WAIT {
+            return Box::pin(std::future::ready(Err(std::io::Error::new(
+              std::io::ErrorKind::TimedOut,
+              "no reply was signalled within the suite's wait",
+            ))));
+          }
+          &self.timed_out
+        }
+        Err(_) => return Box::pin(std::future::ready(woke)),
+      };
+      counted.set(counted.get().saturating_add(1));
+      Box::pin(std::future::ready(woke))
+    }
+  }
+
+  /// A reactor whose wait never answers: a host's loop while its call waits, for the cancellation case.
+  struct Never;
+
+  impl Reactor for Never {
+    fn wait(&self, _completion: Completion, _timeout_ns: Option<u64>) -> Waiting<'_> {
+      Box::pin(std::future::pending())
+    }
+  }
+
+  /// Polls `future` to its end with a waker that wakes nothing: its waits answer at once, so it ends within
+  /// [`POLLS`].
+  fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    let mut future = pin!(future);
+    let mut context = Context::from_waker(Waker::noop());
+    for _ in 0..POLLS {
+      if let Poll::Ready(out) = future.as_mut().poll(&mut context) {
+        return out;
+      }
+    }
+    panic!("an awaited call did not end within {POLLS} polls");
+  }
+
+  /// A-299, R6: do drive the async form over a daemon: provision an empty volume, snapshot it, read its status,
+  /// provision a clone of the snapshot, ask the status of a volume no one made; then drop a status call while its wait
+  /// has not answered, and ask again, until more calls have been dropped than twice the calls the client admits
+  /// outstanding (a call the daemon answered before it reached its wait is answered on its first poll, drops nothing,
+  /// and the round runs again); destroy the clone, and give the instance back to the synchronous form. Expect each
+  /// answer as the synchronous verb answers it, the stranger refused `NotFound` naming the volume, every call after a
+  /// dropped one answered (a dropped call is cancelled and its reply dropped when it comes; calls left in the driver
+  /// would fill it and have one refused `TooManyOutstanding`), every drop made within the rounds' bound, and the
+  /// synchronous form serving afterwards with its parked calls woken
+  /// ([`expect_parked_synchronous_calls_woken`]). The reactor's wakes and the slowest answered round are printed: a
+  /// round's wait that timed out was ended by the driver's deadline, not by its reply's signal.
+  #[test]
+  fn an_async_instance_provisions_snapshots_reports_and_destroys() {
+    let (daemon, mut instance) = grouped("async");
+    let abandoned = instance
+      .client()
+      .outstanding_limit()
+      .saturating_mul(2)
+      .saturating_add(1);
+    let reactor = Blocking::default();
+    let mut instance = AsyncInstance::new(instance).unwrap();
+    let volume = block_on(instance.provision(&reactor, &VolumeSpec::empty("async", ROOM)))
+      .unwrap()
+      .volume();
+    let snapshot = block_on(instance.snapshot(&reactor, volume)).unwrap();
+    let status = block_on(instance.status(&reactor, volume)).unwrap();
+    assert_eq!((status.name.as_str(), status.snapshots), ("async", 1));
+    let copy = block_on(instance.provision(
+      &reactor,
+      &VolumeSpec::clone_of("async-copy", volume, snapshot),
+    ))
+    .unwrap()
+    .volume();
+    assert_eq!(
+      block_on(instance.status(&reactor, NOWHERE)),
+      Err(Error::NotFound(Missing::Volume(NOWHERE)))
+    );
+    let (dropped, slowest) = drop_and_ask_again(&mut instance, &reactor, volume, abandoned);
+    eprintln!(
+      "dropped {dropped} of {abandoned} calls; the slowest answered round took {slowest:?}; the reactor's waits ended \
+       {} by the signal, {} by the driver's deadline",
+      reactor.readable.get(),
+      reactor.timed_out.get()
+    );
+    assert_eq!(
+      dropped, abandoned,
+      "every drop made within the rounds' bound"
+    );
+    assert_eq!(
+      block_on(instance.status(&reactor, copy)).map(|status| status.name),
+      Ok("async-copy".to_owned()),
+      "a dropped call leaves the instance serving"
+    );
+    block_on(instance.destroy(&reactor, copy)).unwrap();
+    let mut instance = instance.into_instance().unwrap();
+    expect_parked_synchronous_calls_woken(&mut instance, volume);
+    daemon.stop();
+  }
+
+  /// Shape: the synchronous calls made after the instance is given back, each parking at once.
+  const PARKED_CALLS: u64 = 20;
+
+  /// The synchronous half of `an_async_instance_provisions_snapshots_reports_and_destroys`. Do: on the instance the
+  /// async form gave back, ask `volume`'s status [`PARKED_CALLS`] times, the client spinning for none of them, so each
+  /// parks for its reply. Expect each answered, every one of them parked, and each well within the client's reply
+  /// deadline. With the async form's completion bridge still running, the daemon's one wake per reply went to the bridge
+  /// or to the parked call, whichever the kernel picked, and 16 to 19 of 20 such calls slept to their 2.0 s deadline
+  /// (macOS, Mac Studio, 2026-11-18).
+  fn expect_parked_synchronous_calls_woken(instance: &mut Instance, volume: VolumeId) {
+    let deadline = Duration::from_nanos(instance.client().deadlines().reply_ns);
+    instance.client().spin_for(Some(0));
+    let (parks_before, _) = instance.client().park_ratio();
+    for call in 0..PARKED_CALLS {
+      let asked = Instant::now();
+      assert_eq!(
+        instance.status(volume).map(|status| status.snapshots),
+        Ok(1)
+      );
+      let took = asked.elapsed();
+      assert!(
+        took < deadline,
+        "call {call}: a parked synchronous call took {took:?} of its {deadline:?} deadline: its wake went elsewhere"
+      );
+    }
+    let (parks_after, _) = instance.client().park_ratio();
+    assert!(
+      parks_after.saturating_sub(parks_before) >= PARKED_CALLS,
+      "every call parked: {parks_before} parks before, {parks_after} after"
+    );
+    instance.client().spin_for(None);
+  }
+
+  /// The cancellation case of `an_async_instance_provisions_snapshots_reports_and_destroys`: rounds of a status call of
+  /// `volume` polled once on a loop that never answers and dropped, then one asked on `reactor`, until `wanted` calls
+  /// were dropped or [`ROUNDS_PER_DROP`] times that many rounds ran. A call the daemon answered on its first poll drops
+  /// nothing and must have been answered. Each asked call must be answered. The calls dropped, and the slowest round's
+  /// asked call.
+  fn drop_and_ask_again(
+    instance: &mut AsyncInstance,
+    reactor: &Blocking,
+    volume: VolumeId,
+    wanted: usize,
+  ) -> (usize, Duration) {
+    let mut dropped = 0;
+    let mut slowest = Duration::ZERO;
+    for round in 0..wanted.saturating_mul(ROUNDS_PER_DROP) {
+      if dropped == wanted {
+        break;
+      }
+      {
+        let waiting = instance.status(&Never, volume);
+        let mut waiting = pin!(waiting);
+        let mut context = Context::from_waker(Waker::noop());
+        match waiting.as_mut().poll(&mut context) {
+          Poll::Pending => dropped += 1,
+          Poll::Ready(answered) => assert!(
+            answered.is_ok(),
+            "round {round}: a call answered on its first poll: {answered:?}"
+          ),
+        }
+      }
+      let asked = Instant::now();
+      let answered = block_on(instance.status(reactor, volume));
+      slowest = slowest.max(asked.elapsed());
+      assert!(
+        answered.is_ok(),
+        "round {round}: a dropped call is cancelled, so the next is answered: {answered:?}"
+      );
+    }
+    (dropped, slowest)
   }
 }
 

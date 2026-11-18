@@ -213,6 +213,13 @@ impl Grants {
     self.records.remove(&id);
   }
 
+  /// Keeps only the grants `held` says the durable table holds (A-266; AC-2.3): after an atom that issued a grant here
+  /// was rolled back, the grant leaves this table too, so nothing lands under a grant whose issue was refused. An id it
+  /// held stays refused as ended, as one [`Grants::end`] removed is.
+  pub fn retain(&mut self, mut held: impl FnMut(GrantId) -> bool) {
+    self.records.retain(|id, _| held(*id));
+  }
+
   /// The grants past their term at `now_ns` that are still usable, for the sweep that ends them.
   pub fn expired_at(&self, now_ns: u64) -> Vec<GrantId> {
     self
@@ -230,9 +237,13 @@ impl Grants {
     }
   }
 
-  /// Checks that `id` covers the landing `binding` describes, writing `manifest`, now.
+  /// Checks that `id` covers the landing `binding` describes, writing `manifest`, now. A check only reads: a grant past
+  /// its term is refused as expired and left as it was, so the sweep ([`Grants::expired_at`]) still finds it and its
+  /// expiry is recorded and audited before it leaves the table (A-266). Until 2026-11-18 the check marked such a grant
+  /// expired in this table alone, which the sweep then passed over: it was never recorded, stayed listed as issued and
+  /// stayed in this table until a restart.
   pub fn check(
-    &mut self,
+    &self,
     id: Option<GrantId>,
     binding: &GrantBinding,
     manifest: [u8; 32],
@@ -242,17 +253,15 @@ impl Grants {
     // An id this table issued that is no longer held has ended (A-266): refused as ended, never taken for a grant the
     // caller still needs (which would present the landing again).
     let issued_here = id.0 >= 1 && id.0 <= self.next;
-    let g = self.records.get_mut(&id).ok_or(if issued_here {
+    let g = self.records.get(&id).ok_or(if issued_here {
       GrantRefusal::GrantExpired
     } else {
       GrantRefusal::GrantRequired
     })?;
-    if g.state == GrantState::Issued && now_ns > g.expires_ns {
-      g.state = GrantState::Expired;
-    }
     match g.state {
       GrantState::Revoked => return Err(GrantRefusal::GrantRefused),
       GrantState::Expired | GrantState::Consumed => return Err(GrantRefusal::GrantExpired),
+      GrantState::Issued if now_ns > g.expires_ns => return Err(GrantRefusal::GrantExpired),
       GrantState::Issued => {}
     }
     // Who lands what where must be what the human approved, whatever the manifest: a create-only plan has
@@ -461,6 +470,42 @@ mod tests {
       grants.check(Some(id3), &bound, [4; 32], 110),
       Err(GrantRefusal::GrantRefused)
     );
+  }
+
+  /// A-266: do issue a grant with a term of 50 at 100, check a landing against it at 200 (past its term), then ask the
+  /// sweep for the grants due at 200; expect the check refused as expired and the grant among those due, so its
+  /// expiry is recorded and audited. Before 2026-11-18 the check marked the grant expired in the table alone and the
+  /// sweep, which takes issued grants past their term, never returned it: it was never recorded.
+  #[test]
+  fn a_grant_a_landing_found_past_its_term_is_still_due_for_the_sweep() {
+    let mut grants = Grants::default();
+    let bound = binding();
+    let id = grants
+      .issue(
+        Surface::Cli,
+        [1; 32],
+        bound.clone(),
+        GrantScope::Once,
+        100,
+        50,
+      )
+      .expect("a grant id");
+    assert_eq!(
+      grants.check(Some(id), &bound, [1; 32], 200),
+      Err(GrantRefusal::GrantExpired)
+    );
+    assert_eq!(
+      grants.expired_at(200),
+      vec![id],
+      "the grant the check refused is still due for the sweep"
+    );
+    grants.end(id);
+    assert_eq!(
+      grants.check(Some(id), &bound, [1; 32], 200),
+      Err(GrantRefusal::GrantExpired),
+      "an ended grant stays refused as ended"
+    );
+    assert!(grants.expired_at(200).is_empty(), "and is due no more");
   }
 
   /// AUD-29-06: a restored grant keeps its id and state, the next grant issued takes an id past it, and a

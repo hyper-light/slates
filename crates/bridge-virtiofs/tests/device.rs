@@ -3751,3 +3751,162 @@ fn a_guests_cache_write_back_of_a_fresh_page_is_applied() {
   bridge.read(object, &other, 0, page, &mut now).unwrap();
   assert_eq!(now, refetched, "the volume holds the guest's newer page");
 }
+
+/// Format: Linux's `FUSE_POSIX_ACL` and `FUSE_SETXATTR_EXT` (`include/uapi/linux/fuse.h`), which a guest's kernel offers
+/// at INIT, and `FUSE_SETXATTR_ACL_KILL_SGID`, a setter's flag in the extended `fuse_setxattr_in`.
+const FUSE_POSIX_ACL: u32 = 1 << 20;
+const FUSE_SETXATTR_EXT: u32 = 1 << 29;
+const FUSE_SETXATTR_ACL_KILL_SGID: u32 = 1 << 0;
+/// Format: `S_ISGID`, the set-group-ID bit of `st_mode` (`<sys/stat.h>`).
+const S_ISGID: u32 = 0o2000;
+
+/// The access ACL `setfacl -m u:4242:rwx` makes of a directory at 0775 (version 2, then each entry's tag, permissions
+/// and id): its owner rwx, 4242 rwx, its group rwx, the mask rwx, everyone else r-x.
+fn named_user_acl() -> Vec<u8> {
+  let mut value = 2u32.to_le_bytes().to_vec();
+  for (tag, perm, id) in [
+    (0x01u16, 7u16, u32::MAX),
+    (0x02, 7, 4242),
+    (0x04, 7, u32::MAX),
+    (0x10, 7, u32::MAX),
+    (0x20, 5, u32::MAX),
+  ] {
+    value.extend_from_slice(&tag.to_le_bytes());
+    value.extend_from_slice(&perm.to_le_bytes());
+    value.extend_from_slice(&id.to_le_bytes());
+  }
+  value
+}
+
+/// A SETXATTR body of `name` set to `value`: the short `fuse_setxattr_in` (size, flags), or with `setter` the extended
+/// one (size, flags, the setter's flags, a pad); then the name and its NUL, then the value.
+fn setxattr_body(name: &[u8], value: &[u8], setter: Option<u32>) -> Vec<u8> {
+  let mut body = u32::try_from(value.len()).unwrap().to_le_bytes().to_vec();
+  body.extend_from_slice(&0u32.to_le_bytes());
+  if let Some(setter) = setter {
+    body.extend_from_slice(&setter.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+  }
+  body.extend_from_slice(name);
+  body.push(0);
+  body.extend_from_slice(value);
+  body
+}
+
+/// A-378. Do: through a device whose bridge serves a guest's kernel, make the guest's INIT, offering `FUSE_POSIX_ACL`
+/// and `FUSE_SETXATTR_EXT`, and a SETXATTR after it available at once and serve one pass, the SETXATTR in the extended
+/// form setting the access ACL of the set-group-ID root (02775) with `FUSE_SETXATTR_ACL_KILL_SGID`; then make the same
+/// INIT and a short-form SETXATTR of a user attribute through a device whose bridge is a host's. Expect the pass to serve
+/// both, the guest's INIT reply to keep `FUSE_SETXATTR_EXT` and the device to say so; the SETXATTR parsed in the
+/// extended form though the same pass served the INIT, the ACL kept and the root 0775, its set-group-ID bit cleared; and
+/// the host's device to keep the short form, its SETXATTR served as one.
+#[test]
+fn a_device_parses_setxattr_in_the_form_its_guests_init_reply_kept() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let root = vol.root_inode(&store).unwrap();
+  // Nothing the device's replies wait to publish (no inode past the committed ceiling), so a pass runs on past the INIT.
+  vol.chmod(&mut store, root, S_ISGID | 0o775).unwrap();
+  let cx = context();
+  let offered = FUSE_POSIX_ACL | FUSE_SETXATTR_EXT;
+  let rq = usize::from(FIRST_REQUEST_QUEUE);
+  let object = ObjectId::new(root.0, 0);
+  {
+    let (mut device, mut driver) = device_and_driver();
+    let mut guest = VolumeBridge::new(vid(), &mut vol, &mut store).serving_a_guest();
+    let init = driver.submit(
+      rq,
+      &message(Opcode::Init.to_wire(), 1, 0, &init_body(offered)),
+      REPLY_CAP,
+      1,
+    );
+    let set = driver.submit(
+      rq,
+      &message(
+        Opcode::SetXattr.to_wire(),
+        2,
+        ROOT,
+        &setxattr_body(
+          b"system.posix_acl_access",
+          &named_user_acl(),
+          Some(FUSE_SETXATTR_ACL_KILL_SGID),
+        ),
+      ),
+      REPLY_CAP,
+      1,
+    );
+    let pass = serve(
+      &mut device,
+      FIRST_REQUEST_QUEUE,
+      &mut driver,
+      &mut guest,
+      &cx,
+      BATCH,
+    )
+    .unwrap();
+    assert_eq!(
+      pass.served, 2,
+      "one pass serves the INIT and the SETXATTR after it"
+    );
+    let mut replies = std::collections::HashMap::new();
+    while let Some((head, len)) = driver.reap(rq) {
+      replies.insert(head, driver.reply_of(rq, head, len));
+    }
+    let kept = u32::from_le_bytes(
+      replies[&init][OUT_HEADER_LEN + INIT_FLAGS_AT..OUT_HEADER_LEN + INIT_FLAGS_AT + 4]
+        .try_into()
+        .unwrap(),
+    );
+    assert_ne!(
+      kept & FUSE_SETXATTR_EXT,
+      0,
+      "the guest keeps the extended form"
+    );
+    assert!(device.setxattr_ext(), "and the device says so");
+    assert_eq!(
+      reply_error(&replies[&set]),
+      0,
+      "the extended SETXATTR is served"
+    );
+    assert_eq!(
+      guest
+        .xattr_get(object, &cx, b"system.posix_acl_access")
+        .unwrap(),
+      named_user_acl(),
+      "its name and value were found past the extended head"
+    );
+    assert_eq!(
+      guest.getattr(object, &cx).unwrap().mode,
+      0o775,
+      "and its setter's flag cleared the set-group-ID bit"
+    );
+  }
+  let (mut device, mut driver) = device_and_driver();
+  let mut host = VolumeBridge::new(vid(), &mut vol, &mut store);
+  let init = exchange_once(
+    &mut device,
+    &mut driver,
+    &mut host,
+    &cx,
+    &message(Opcode::Init.to_wire(), 1, 0, &init_body(offered)),
+  );
+  assert_eq!(reply_error(&init), 0);
+  assert!(
+    !device.setxattr_ext(),
+    "a host's mount is asked for no ACL, so for no extended form"
+  );
+  let set = exchange_once(
+    &mut device,
+    &mut driver,
+    &mut host,
+    &cx,
+    &message(
+      Opcode::SetXattr.to_wire(),
+      2,
+      ROOT,
+      &setxattr_body(b"user.note", b"kept", None),
+    ),
+  );
+  assert_eq!(reply_error(&set), 0, "the short form is served as one");
+  assert_eq!(host.xattr_get(object, &cx, b"user.note").unwrap(), b"kept");
+}

@@ -27,6 +27,7 @@ AuditKind 3 LandingValidated
 AuditKind 4 EntryWritten
 AuditKind 5 EntryRefused
 AuditKind 6 LandingFinished
+AuditKind 7 GrantExpired
 BaseReport 0 Read
 BaseReport 1 Unreadable
 CauseRecord 0 Root
@@ -284,6 +285,7 @@ ReplyBody 64 SignersSet
 ReplyBody 65 MergeRecord
 ReplyBody 66 Drifted
 ReplyBody 67 Conflicts
+ReplyBody 68 Renewed
 RequestBody 0 Create
 RequestBody 1 Snapshot
 RequestBody 2 DestroySnapshot
@@ -361,6 +363,7 @@ RequestBody 73 SetSigners
 RequestBody 74 MergeRecord
 RequestBody 75 Drifted
 RequestBody 76 Conflicts
+RequestBody 77 Renew
 Residency 0 DaemonRam
 Residency 1 DaemonRamAndKernelCache
 Residency 2 DaemonRamKernelCacheAndRuntimeVm

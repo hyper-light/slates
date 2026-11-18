@@ -2758,6 +2758,16 @@ impl Client {
     self.end.disarm_async().map_err(ClientError::Ipc)
   }
 
+  /// Ends the async completion channel ([`Self::enable_async_completion`]) for a caller going back to the synchronous
+  /// form, so its parked calls are woken by the daemon's wake rather than a bridge taking it (see
+  /// `ClientEnd::disable_async_completion`). The descriptor the async form polled is closed.
+  pub fn disable_async_completion(&mut self) -> Result<(), ClientError> {
+    self
+      .end
+      .disable_async_completion()
+      .map_err(ClientError::Ipc)
+  }
+
   /// Clears the completion fd's readiness after the loop reports it readable.
   #[cfg(unix)]
   pub fn drain_completion(&self) {
@@ -4599,6 +4609,19 @@ impl Client {
     match self.call(&RequestBody::Detach { attachment })? {
       ReplyBody::Detached => Ok(()),
       _ => Err(ClientError::UnexpectedReply { verb: "detach" }),
+    }
+  }
+
+  /// Renews a CLI attachment's term from its holder (A-230, A-384), and nothing else: the term now in force and how soon
+  /// to renew again, nanoseconds, as `(term, renew_every)`. Refused as any use of the attachment is (`AttachmentExpired`
+  /// once its term lapsed).
+  pub fn renew(&mut self, attachment: u64) -> Result<(u64, u64), ClientError> {
+    match self.call(&RequestBody::Renew { attachment })? {
+      ReplyBody::Renewed {
+        term_ns,
+        renew_every_ns,
+      } => Ok((term_ns, renew_every_ns)),
+      _ => Err(ClientError::UnexpectedReply { verb: "renew" }),
     }
   }
 
