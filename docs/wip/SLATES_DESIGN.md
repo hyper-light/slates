@@ -26106,8 +26106,9 @@ idle-mount line), GAPS ("Chaos from outside the processes"; A-346's entry, its o
 - **The creator rule's siblings (fixed later the same day, goal g229).** A-222's attach rules on the client's shard
   took a yielded volume for this node's own, since the client's shard knows the id's creator and not the volume shard's
   yield. A mount of one is now refused by its kind on the volume's shard (`remote_attach::lost_attach`). A record-form
-  attach of one, sent to the successor, is remembered with its client before it is sent, by a call to the client's
-  shard (`remote_attach::remember_volume_at`), so the client's reap ends it there. The reap keeps every remembered volume
+  attach of one, sent to the successor, is remembered with its client before it is sent, on the client's shard, which
+  sends it once remembered (`remote_attach::remember_volume_at`, `verbs::remember_then_forward`), so the client's reap
+  ends it there. The reap keeps every remembered volume
   this node's routing does not own (`reap_at_owners`). Tests: `an_owner_admitted_again_refuses_a_mount_of_the_volume_it_yielded_by_kind`,
   `a_holder_of_a_volume_its_node_yielded_is_reaped_at_the_successor`.
 - **Owed.** A later takeover naming this node a yielded volume's successor again replaces the copy since A-362 (g250);

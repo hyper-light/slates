@@ -44,9 +44,10 @@ it held the volume's attachment bound, though the write lease ended at its term.
 - `remote_attach::lost_record_attach`, `remember_volume` and `remember_volume_at`. A record-form attach of a lost volume
   is remembered with its client before it is sent, decided on the volume's shard:
   - directly, when the client's shard is the volume's;
-  - otherwise by a cross-shard call to the client's shard (`verbs::remembered_or_refusal`), which refuses
-    `RemoteAttachmentsFull` past the client's bound and answers `Overloaded`, not started and not recorded, when the
-    client's shard does not answer within a liveness budget. The attach is never sent unremembered.
+  - otherwise on the client's shard, where the owner's task hands the attach (`verbs::remember_then_forward`). It is
+    sent from there once remembered, refused `RemoteAttachmentsFull` past the client's bound (recorded there, as A-222's
+    own refusal is), or answered `Overloaded`, not started and not recorded, when that shard's state is out of reach.
+    The attach is never sent unremembered.
 - `remote_attach::reap_at_owners` keeps every remembered volume this node's routing does not name it the owner of. The
   creator rule is dropped there: it took a volume this node created and lost for this node's own.
 
@@ -60,4 +61,11 @@ Both are in `crates/server/tests/fleet.rs`, on A-334's setup (`yielded_by_an_own
 - `a_holder_of_a_volume_its_node_yielded_is_reaped_at_the_successor`, with a re-invoked holder process
   (`yielded_holder_role`). Red: the successor held the attachment, and after the holder was killed it was never reaped
   (`left Some(1)`, `remote_attach.ended` 0, after the whole period budget, 414 s). Green: none left once the old
-  owner's reap ran.
+  owner's reap ran (`left Some(0)`, `remote_attach.ended` 1 on the successor).
+
+Both green on a Mac Studio (2026-11-18, kiln r3500), beside A-334's own test and the idle NFS mount's, 5 of 5 in 25.9 s,
+and the server's `remote_attach`, `readmission` and `lease` unit tests (13).
+
+A first build of the cross-shard half awaited a cross-shard call inside the owner's spawned task. That task must be
+`Send` to cross shards, and a call is not, so the build failed. The remember now runs on the client's shard, and the
+attach is sent from there (`verbs::remember_then_forward`).
