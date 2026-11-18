@@ -12,8 +12,9 @@
 >   overlay's move (its base stays on its source host, §4.10 "Overlay volumes in a fleet", so it is refused typed
 >   until a remote base service or a captured base exists); kiln's runners as members (certificates under kiln's CA,
 >   seeds from kiln's runner directory); a multi-runner test with injected faults.
-> - **Decision owed (Ada):** Hex's D281 reads "Volumes stay per machine (2026-11-14)", while this goal replicates a
->   volume's changes to copies on other runners and moves a volume with its agent.
+> - **Decided (Ada, 2026-11-18):** the persistent disks Hex gives microVMs stay on their own machine (Hex's D281,
+>   "volumes stay per machine", stands); only slates workspaces replicate across kiln runners, so the moves and copies
+>   this entry owes are of slates volumes alone.
 
 > **A grant is signed by a key only the human holds (2026-11-18, R10, D-22, §4.13; A-285, Ada's decision: fs-server's
 > option D, with A as the fallback, on every OS).** This closes, once built, "No grant can be issued on Linux from the
