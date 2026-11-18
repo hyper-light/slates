@@ -9970,8 +9970,8 @@ fn owned_live_line(
 
 /// CLAUDE.md "Bounded work everywhere", A-200's record period: a shard's live volumes are visited a slice of about a
 /// step quantum at a time (`live_ship::period_slice`), never all in one turn. Do: three nodes at `f = 1`; on a, 24
-/// live-shipped volumes, each written once and answered at durability; cut the owner's slices after one volume each
-/// (`Daemon::inject_live_period_quantum(Some(0))`) and let two record periods pass. Expect at least 24 slices for each
+/// live-shipped volumes, each written once, answered at durability and detached; cut the owner's slices after one volume
+/// each (`Daemon::inject_live_period_quantum(Some(0))`) and let three record periods pass. Expect at least 24 slices for each
 /// period that passed whole (one volume each, and one that finds none left), and every volume's log durable at its head
 /// with nothing owed: the slicing starved none. Before, one turn visited every live volume the shard owned.
 #[test]
@@ -10003,6 +10003,14 @@ fn a_shards_live_volumes_are_visited_by_the_period_in_slices_and_none_is_starved
     assert!(
       matches!(written, ReplyBody::FsDone { .. }),
       "volume {index}'s write answered at durability: {written:?}"
+    );
+    // A partition's attachments are capped at the node's derived admission limit (`PartitionCaps::attachments`), which
+    // can sit below this test's volume count (a Mac Studio refused one `TableAtCapacity`, 2026-11-17); the log ships
+    // with no attachment held.
+    let detached = client.call(&RequestBody::Detach { attachment });
+    assert!(
+      matches!(detached, ReplyBody::Detached),
+      "volume {index}'s attachment was let go: {detached:?}"
     );
     volumes.push(id);
   }
