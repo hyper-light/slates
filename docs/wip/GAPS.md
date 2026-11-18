@@ -19,7 +19,8 @@
 > - the KIND lane's first run of its device probe (`device_probe` in `xtask/src/kind_export.rs`, written with this
 >   change): a root pod makes `/dev/null`'s and `/dev/mem`'s numbers in the volume, and an unprivileged pod must open
 >   the first (the control: the pod's bind is not `nodev`) and be refused `EPERM` on the second by the device cgroup;
-> - a guest's proof over virtio-fs, beside g260's `nodev` guest mount;
+> - a guest's proof over virtio-fs (g260's): the guest mount line in `docs/cli.md` asks for `nosuid,nodev` since
+>   2026-11-17, with A-294's reason;
 > - Windows: a device node (and a FIFO or socket) has no WinFsp form. A directory holding one failed its whole listing
 >   (`read_all_entries` took each entry's attribute word with `?`), a sibling defect since A-26 that kept device nodes
 >   make common (an unpacked `/dev`); fixed 2026-11-17, the drive's listing leaves such an entry out (`listed`), so a

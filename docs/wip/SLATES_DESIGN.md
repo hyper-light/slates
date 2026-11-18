@@ -22475,7 +22475,8 @@ and `crates/bridge-winfsp` (refused unsupported, as a FIFO), `crates/land` (refu
     rather than rely on `fusermount3`'s default; the OCI binding), where the open is refused `EACCES` (`may_open_dev`);
     an export's PersistentVolume is `nodev`, and in a pod, whose bind drops the flag (measured, A-94), the container
     runtime's device cgroup refuses the open; a guest's mount of a share is the guest's, so slates asks for `nodev`
-    there (the guest mount line, g260), and a guest that declines opens only its own devices, inside the VM.
+    there (`docs/cli.md`'s guest mount line asks for `nosuid,nodev`), and a guest that declines opens only its own
+    devices, inside the VM.
   - Each route reports the number in its own encoding: NFSv3's `rdev`, NFSv4's `rawdev`, and FUSE's `rdev` in the
     Linux kernel's `new_encode_dev` form, where a number past it reads as 0, as Linux's NFS client reads one
     (`xdr_decode_specdata3`). WinFsp and FSKit have no device kind and refuse the node unsupported, as a FIFO.
@@ -22497,8 +22498,8 @@ and `crates/bridge-winfsp` (refused unsupported, as a FIFO), `crates/land` (refu
   FUSE, an ordinary user: `/dev/null`'s number refused `EACCES` on the `nodev` mount) and
   `a_device_node_is_made_with_its_number_and_never_opened` (Linux's NFSv4.1 and 4.2 clients, as root, `nodev`).
 - **Owed.** The KIND lane's first run of its device probe (`device_probe`, `xtask/src/kind_export.rs`: `/dev/null`'s
-  number opens in an unprivileged pod, `/dev/mem`'s is refused `EPERM` by the device cgroup); a guest's proof beside g260's `nodev`
-  guest mount; a Windows representation (WSL keeps a device node as a reparse point tagged `IO_REPARSE_TAG_LX_CHR` or
+  number opens in an unprivileged pod, `/dev/mem`'s is refused `EPERM` by the device cgroup); a guest's proof (g260's; the guest mount
+  line asks for `nosuid,nodev` since 2026-11-17); a Windows representation (WSL keeps a device node as a reparse point tagged `IO_REPARSE_TAG_LX_CHR` or
   `_LX_BLK`; the drive's listing leaves such entries out since 2026-11-17, where one had failed the whole directory);
   each pjdfstest list and its record re-recorded from a real run, since the device-fixture entries are expected to pass
   and a list edited without its run fails the record's doc-truth test.
