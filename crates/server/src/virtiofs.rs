@@ -308,9 +308,27 @@ impl BridgeAccess for ShardBridge {
     crate::live_ship::DurableWait::new(self.volume, target)
   }
 
-  /// Every transport's bound on a durability claim (`crate::live_ship::durable_wait_ns`: the liveness budget).
-  fn durable_bound_ns(&mut self) -> u64 {
-    crate::live_ship::durable_wait_ns()
+  /// Every transport's rule for a durability claim (`crate::live_ship::begin_durable_bound`): windows of the liveness
+  /// budget, ended by one with nothing heard, at most the failover SLO's worth.
+  fn durable_bound(&mut self, now_ns: u64) -> slates_bridge_core::durable_bound::DurableBound {
+    let volume = self.volume;
+    state::with_state(|s| crate::live_ship::begin_durable_bound(s, volume, now_ns)).unwrap_or_else(
+      || {
+        // The shard's state out of reach (its shutdown): one window, with nothing to hear.
+        slates_bridge_core::durable_bound::DurableBound::begin(
+          0,
+          now_ns,
+          crate::live_ship::durable_wait_ns(),
+          1,
+        )
+      },
+    )
+  }
+
+  /// The volume's acknowledgements heard on its durability path (`crate::live_ship::heard_of`).
+  fn durable_heard(&mut self) -> u64 {
+    let volume = self.volume;
+    state::with_state(|s| crate::live_ship::heard_of(s, volume)).unwrap_or(0)
   }
 
   /// On the device's ledger (`virtiofs.live_fsync_waited`, `virtiofs.live_fsync_refused`).

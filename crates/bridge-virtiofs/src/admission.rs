@@ -753,12 +753,17 @@ impl<S: VmmSeam> AdmittedDevice<S> {
     self.device.durable_oldest()
   }
 
-  /// Settles the device's `FSYNC` replies held for durability (`durability`, within `bound_ns` as of `now_ns`;
-  /// [`Device::settle_durable`]) and notifies each queue whose driver asks. Nothing to do once the device is not live.
+  /// Settles the device's `FSYNC` replies held for durability (`durability`, each wait judged as of `now_ns` against
+  /// `heard`, a new one begun by `begin`; [`Device::settle_durable`]) and notifies each queue whose driver asks. Nothing
+  /// to do once the device is not live.
   pub fn settle_durable(
     &mut self,
     durability: &mut dyn FnMut(u64) -> crate::device::Durability,
-    (now_ns, bound_ns): (u64, u64),
+    judged: (
+      u64,
+      u64,
+      &mut dyn FnMut() -> slates_bridge_core::durable_bound::DurableBound,
+    ),
   ) -> Result<crate::device::DurableSettled, ServeError> {
     if self.state != AttachmentState::Live {
       return Ok(crate::device::DurableSettled::default());
@@ -767,7 +772,7 @@ impl<S: VmmSeam> AdmittedDevice<S> {
       let memory = self.seam.memory().map_err(ServeError::Seam)?;
       self
         .device
-        .settle_durable(memory, durability, (now_ns, bound_ns), &mut self.ledger)
+        .settle_durable(memory, durability, judged, &mut self.ledger)
         .map_err(ServeError::Device)?
     };
     self.notify_completed(&settled.completed)?;

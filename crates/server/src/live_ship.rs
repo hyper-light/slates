@@ -29,6 +29,7 @@
 //!
 //! Not yet: a holder's replicas do not survive its own daemon's restart.
 
+use slates_bridge_core::durable_bound::{DurableBound, GaveUp};
 use std::collections::{BTreeMap, VecDeque};
 
 use slates_db::live::{
@@ -223,6 +224,11 @@ pub(crate) struct LiveVolume {
   /// whole entry. Pairs only accumulate, but one retired between the entry and the image (a node back at its anchor)
   /// could leave the image short of a key the entry's check passed.
   image_anchors: Option<Vec<u64>>,
+  /// Acknowledgements that moved this volume's durability forward: a holder's acknowledged position advancing
+  /// ([`fold_into`]), or its head's or catalog's placement gaining an acknowledgement or a newer sequence
+  /// (`fleet::record_acks_in`). A reply held for durability gives up only after a whole wait of
+  /// [`DURABLE_WAIT_NS`] in which this did not move ([`DurableBound`]).
+  heard: u64,
 }
 
 /// What a candidate keeps of one live volume.
@@ -282,29 +288,118 @@ pub(crate) fn take_barrier(state: &mut ShardState) -> Option<(slates_db::catalog
   state.live.barrier.take()
 }
 
-/// Derived: how long a transport's reply waits for durability before it is answered "try again" (NFS `JUKEBOX`): the
-/// daemon's liveness budget, past which a holder that has not answered is not a live one to wait for.
+/// Derived: how long a transport's reply waits for durability with nothing heard before it is answered that it is not
+/// durable (NFS `JUKEBOX`, FUSE and virtio-fs `EIO`): the daemon's liveness budget, past which a holder that has not
+/// answered is not a live one to wait for. A window, not a deadline: each one in which the volume's durability moved
+/// forward starts another ([`DurableBound`]).
 const DURABLE_WAIT_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS;
 
-/// Waits on this (the volume's owner) shard, without blocking it, until `volume`'s log is durable at `target`, or
-/// [`DURABLE_WAIT_NS`] has passed: whether it became durable. The caller answers a stable write or `COMMIT` only then,
-/// and otherwise tells the client to try again: a barrier never claims what `f` candidates do not hold.
+/// Format: nanoseconds in a millisecond, for the milliseconds a give-up's record reads in.
+pub(crate) const NS_PER_MS: u64 = 1_000_000;
+
+/// `object`'s volume heard an acknowledgement that moved its durability forward: its head's or its catalog's placement
+/// gained an acknowledgement or a newer sequence (`fleet::record_acks_in`). Counted on the volume's shipper
+/// ([`LiveVolume::heard`]); nothing for a volume this shard does not ship.
+pub(crate) fn heard(state: &mut ShardState, object: ObjectId) {
+  let volume = object.placement_key().0;
+  if let Some(live) = state.live.shipping.get_mut(&volume) {
+    live.heard = live.heard.saturating_add(1);
+  }
+}
+
+/// The first window of a wait for `volume`'s durability beginning at `now_ns`, under the one rule every transport judges
+/// a held durable reply by (`slates_bridge_core::durable_bound`): windows of [`DURABLE_WAIT_NS`], at most the shard's
+/// failover SLO's worth of them (`DurableBound::windows_within`; 10 at the default 10 s, the supervisor's landing
+/// condition of 2026-11-11). Under load on adacachy2 a healthy `fsync`'s bytes were already held by a candidate while
+/// the volume's head placement was in flight, and the old single deadline answered `EIO` (3 of 10 runs, every run that
+/// reached it).
+pub(crate) fn begin_durable_bound(
+  state: &ShardState,
+  volume: slates_db::catalog::VolumeId,
+  now_ns: u64,
+) -> DurableBound {
+  DurableBound::begin(
+    heard_of(state, volume),
+    now_ns,
+    DURABLE_WAIT_NS,
+    DurableBound::windows_within(state.config.failover_slo_ns, DURABLE_WAIT_NS),
+  )
+}
+
+/// Whether, and why, `bound`'s wait for `volume` has given up at `now_ns`, judged against what the volume has heard on
+/// its durability path ([`LiveVolume::heard`]).
+pub(crate) fn judge_durable_bound(
+  state: &ShardState,
+  volume: slates_db::catalog::VolumeId,
+  bound: &mut DurableBound,
+  now_ns: u64,
+) -> Option<GaveUp> {
+  bound.judge(heard_of(state, volume), now_ns)
+}
+
+/// [`LiveVolume::heard`] of `volume`, or zero when this shard does not ship it.
+pub(crate) fn heard_of(state: &ShardState, volume: slates_db::catalog::VolumeId) -> u64 {
+  state
+    .live
+    .shipping
+    .get(&volume.bytes)
+    .map_or(0, |live| live.heard)
+}
+
+/// Waits on this (the volume's owner) shard, without blocking it, until `volume`'s log is durable at `target`, or a
+/// window of [`DURABLE_WAIT_NS`] has passed with nothing heard ([`DurableBound`]): whether it became durable. The
+/// caller answers a stable write or `COMMIT` only then, and otherwise tells the client to try again: a barrier never
+/// claims what `f` candidates do not hold.
 pub(crate) async fn wait_durable(volume: slates_db::catalog::VolumeId, target: u64) -> bool {
-  let parked = std::future::poll_fn(|cx| {
-    let settled = state::with_state(|s| durability(s, volume, target, Some(cx.waker())))
-      .unwrap_or(Durability::Never);
-    if settled == Durability::Pending {
-      std::task::Poll::Pending
-    } else {
-      std::task::Poll::Ready(())
+  let Some(mut bound) =
+    state::with_state(|s| begin_durable_bound(s, volume, slates_rt::futures::now_ns()))
+  else {
+    return false;
+  };
+  let mut gave_up = None;
+  // A window at a time ([`DurableBound`]): one that ends with the volume's durability moved forward is followed by
+  // another, one that ends with nothing heard gives up.
+  loop {
+    let parked = std::future::poll_fn(|cx| {
+      let settled = state::with_state(|s| durability(s, volume, target, Some(cx.waker())))
+        .unwrap_or(Durability::Never);
+      if settled == Durability::Pending {
+        std::task::Poll::Pending
+      } else {
+        std::task::Poll::Ready(())
+      }
+    });
+    let left = bound.ends_ns().saturating_sub(slates_rt::futures::now_ns());
+    match slates_rt::futures::within(left, parked).await {
+      Ok(Some(())) | Err(_) => break,
+      Ok(None) => {
+        let given_up = state::with_state(|s| {
+          judge_durable_bound(s, volume, &mut bound, slates_rt::futures::now_ns())
+        })
+        .unwrap_or(Some(GaveUp::Silent));
+        if let Some(why) = given_up {
+          gave_up = Some(why);
+          break;
+        }
+      }
     }
-  });
-  let durable =
-    matches!(
-      slates_rt::futures::within(DURABLE_WAIT_NS, parked).await,
-      Ok(Some(()))
-    ) && state::with_state(|s| durability(s, volume, target, None) == Durability::Durable)
-      .unwrap_or(false);
+  }
+  let durable = state::with_state(|s| {
+    let durable = durability(s, volume, target, None) == Durability::Durable;
+    if !durable {
+      // What durability still lacked when the wait ended (2026-11-09): the client is told its write is not durable.
+      slates_machine::log_line!(
+        "slates-server: a held durable reply gave up after {} windows of {} ms, {} (shard {}): {}",
+        bound.windows(),
+        DURABLE_WAIT_NS / NS_PER_MS,
+        gave_up.map_or("its wait ended", GaveUp::named),
+        s.shard,
+        durability_report(s, volume, target)
+      );
+    }
+    durable
+  })
+  .unwrap_or(false);
   let _ = state::with_state(|s| {
     s.count(
       if durable {
@@ -354,6 +449,53 @@ pub(crate) fn durability(
     done_or_park(state, volume.bytes, false, waker);
   }
   Durability::Pending
+}
+
+/// What a reply waiting for `volume`'s log to be durable at `target` is still waiting on, as one line for a log: the
+/// owner's head and durable position, the last whole entry, each holder's acknowledged head, the lanes in flight and how
+/// long each has run, the holders found unreachable, and each condition [`answerable`] asks. Asked when a held reply
+/// gives up, so a refusal says which part of durability it lacked.
+pub(crate) fn durability_report(
+  state: &ShardState,
+  volume: slates_db::catalog::VolumeId,
+  target: u64,
+) -> String {
+  let now = slates_rt::futures::now_ns();
+  let placed = head_placed(state, volume.bytes);
+  let recorded = active_set_recorded(state, volume.bytes);
+  let covered = covers_candidates(state, volume.bytes);
+  let Some(live) = state.live.shipping.get(&volume.bytes) else {
+    return format!("target {target}: no shipper; head placed {placed}");
+  };
+  let holders: Vec<String> = live
+    .shipper
+    .holders()
+    .iter()
+    .map(|holder| {
+      format!(
+        "{}@{:?}",
+        holder.0,
+        live.shipper.held_by(*holder).map(|head| head.position)
+      )
+    })
+    .collect();
+  let lanes: Vec<String> = live
+    .lanes
+    .iter()
+    .map(|(holder, began)| format!("{}:{}ms", holder.0, now.saturating_sub(*began) / NS_PER_MS))
+    .collect();
+  let unreachable: Vec<u64> = live.unreachable.iter().map(|holder| holder.0).collect();
+  format!(
+    "target {target}; head {:?}; durable {:?}; whole {:?}; owes whole {}; holders {holders:?}; lanes {lanes:?}; \
+     unreachable {unreachable:?}; head placed {placed}; active set recorded {recorded} (at {:?}); covers candidates \
+     {covered}; fenced {:?}",
+    live.shipper.head().map(|head| head.position),
+    live.shipper.durable(),
+    live.whole_entry.map(|head| head.position),
+    live.owes_whole,
+    live.recorded,
+    live.fenced,
+  )
 }
 
 /// Derived: how long a held reply waits for durability before its transport answers that it is not (NFS `JUKEBOX`,
@@ -907,6 +1049,7 @@ pub(crate) fn published(
       recording: None,
       whole_entry: None,
       image_anchors: None,
+      heard: 0,
     });
   follow_candidates(state, id.bytes);
   let Some(live) = state.live.shipping.get_mut(&id.bytes) else {
@@ -2059,6 +2202,9 @@ fn fold_into(state: &mut ShardState, replies: Vec<(ObjectId, HostId, Vec<u8>)>) 
     // looped at the network's speed: 982 and 5,501 refusals on the two holders of one five-write run, and later a holder
     // installed at a checkpoint the tail had passed, re-installed there without end (2026-11-05, `live_fleet`).
     let progressed = live.shipper.held_by(host) != held_before;
+    if progressed {
+      live.heard = live.heard.saturating_add(1);
+    }
     if live.shipper.durable() > before {
       state.count(LIVE_DURABLE, 1);
       resolve(state, object.0);

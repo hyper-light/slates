@@ -6213,6 +6213,33 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > the flow: with both candidates stopped the `fsync` fails `EIO` after 1.0006 s (the liveness budget); healthy and after
 > the candidates resume, it succeeds.
 >
+> **The wait is judged by what it hears, not by the clock (found 2026-11-09, on main 2026-11-17).** A held `fsync`
+> gave up at one wall-clock deadline of the liveness budget from its hold, so load that slowed the candidates or the
+> owner spent it: a healthy `fsync` answered `EIO` 1 in 6 runs on main and 2 in 9 on raft-7 at load 36–145. Under load
+> on adacachy2 its bytes were already held by a candidate while the volume's head placement, shipped on the membership
+> loop, was still in flight. Now each live volume counts the acknowledgements that moved its durability forward
+> (`live_ship::LiveVolume::heard`: a holder's acknowledged position advancing, its head's or catalog's placement gaining
+> an acknowledgement), and a held reply waits in windows of the liveness budget: a window that ends with that count
+> moved starts the next, and one that ends with nothing heard gives up. The wait begins at most the failover SLO's worth
+> of windows whatever it hears (`failover_slo_ns / DURABLE_WAIT_NS`, at least one; 10 at the default 10 s): the
+> operator's bound on how long an owner's object may go unserved before a takeover serves it, past which a write not
+> yet durable is past what the fleet promises to keep. Without that total, a wait that keeps hearing other writes'
+> progress while its own position is never acknowledged would start windows without end (banned item 8). The rule is
+> one pure module every transport judges by (`slates_bridge_core::durable_bound`): the FUSE `fsync`
+> (`fuse::settle_held`), the shared wait of an NFS stable write or `COMMIT` and a Shards `FSYNC`
+> (`live_ship::wait_durable`), and the virtio-fs device's `FSYNC` (`slates_bridge_virtiofs`'s device, its wait begun
+> and judged through `BridgeAccess::durable_bound` and `durable_heard`), which had kept a single deadline of its own.
+> Stopped candidates acknowledge nothing and are still given up after one window; candidates that answer slowly keep
+> the wait going. A refusal logs what durability still lacked and which rule ended the wait
+> (`live_ship::durability_report`). Red first: with both candidates cycling stopped 700 ms and running 100 ms,
+> `a_fuse_fsync_on_a_live_volume_waits_out_candidates_that_answer_slowly` refused the first `fsync` `EIO` after
+> 1.0013–1.0037 s, 3 of 3; after, 6 of 6 succeeded in 1.50–1.59 s (adacachy2, 2026-11-09). A guest's `FSYNC` whose
+> volume hears an acknowledgement every half window is answered `0` after a window and a half
+> (`a_guests_fsync_of_a_live_volume_waits_while_its_volume_keeps_progressing`), where the device's single deadline
+> answered `EIO` at one window. Open (GAPS): WinFsp's held flush still judges by one deadline, and an owner starved past
+> a window's end may judge it before reading the acknowledgements waiting for it
+> (`docs/bugs/2026-11-09-a-healthy-live-fsync-was-refused-at-a-wall-clock-deadline.md`).
+>
 > **Every other durability claim (2026-11-05, the sibling sweep of FUSE `fsync`).** Each place a client is told data is
 > durable on a live volume now waits for the position its barrier published, and the same failing test holds each to
 > it across three real daemon processes (`crates/cli/tests/live_fleet.rs`): with both candidates' processes stopped

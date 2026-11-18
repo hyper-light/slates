@@ -15263,6 +15263,44 @@ Mac, binaries built on `d61c3be2`):
   a panic injected into one honest client, the test failed in 12.85 s, where main's ran on past a 120 s bound
   (adacachy).
 
+### 2026-11-09: a healthy live `fsync` was refused at a wall-clock deadline under load — fixed (on main 2026-11-17); WinFsp's flush and a starved owner open
+
+`a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it` answered the `fsync` made with every candidate
+running `EIO`: 1 in 6 runs on main, 2 in 9 on raft-7 (raft's report, load 36–145 on adacachy). Made to fail on demand on
+adacachy2 by pinning the test and 32 spinners to four CPUs with the test's daemons reniced to 15: the healthy `fsync`
+failed in every run that reached it (3 of 10; the rest failed earlier in the fleet's start). The give-up's record
+(`fuse::settle_held`, `live_ship::durability_report`) showed what it lacked: the candidate held the bytes (`durable 1`,
+its target), and the volume's head was not yet placed when the wall clock reached the liveness budget.
+
+Fixed (`docs/bugs/2026-11-09-a-healthy-live-fsync-was-refused-at-a-wall-clock-deadline.md`; found and built by bug-sweep
+on `agents/bug-sweep-2`, landed by g244-healthy-fsync-live): a held reply gives up only after a whole window of the
+liveness budget in which nothing moved its volume's durability forward (`live_ship::LiveVolume::heard`), and at most the
+failover SLO's worth of windows whatever it hears (`DurableBound::windows_within`, 10 at the default 10 s; the
+supervisor's landing condition of 2026-11-11, banned item 8). The rule is one pure module,
+`slates_bridge_core::durable_bound`, and every Unix transport judges a held durable reply by it: the FUSE `fsync`,
+`live_ship::wait_durable` (an NFS stable write or `COMMIT`, a Shards `FSYNC`), and the virtio-fs device's `FSYNC`, which
+had kept its own single deadline (`BridgeAccess::durable_bound`, `durable_heard`). Evidence:
+- `acknowledgements_that_trickle_without_the_target_end_the_wait_at_its_bound` (`crates/bridge-core/src/durable_bound.rs`):
+  a wait that keeps hearing other writes' progress while its own position is never acknowledged ends `AtTheBound` after
+  ten windows; red with the bound removed, a thousand windows and no end.
+- `a_guests_fsync_of_a_live_volume_waits_while_its_volume_keeps_progressing` (`crates/bridge-virtiofs/tests/serve.rs`):
+  a guest's `FSYNC` whose volume hears progress every half window is answered `0` after a window and a half.
+- `a_fuse_fsync_on_a_live_volume_waits_out_candidates_that_answer_slowly` (`crates/cli/tests/live_fleet.rs`, gated on
+  `SLATES_TEST_CLI=1`): red 3 of 3 and green 6 of 6 on adacachy2 (2026-11-09); the stopped-candidates flow still refuses
+  after one window (1.0004–1.0017 s, 3 of 3). Owed: the supervisor's run of both live FUSE flows under load on main.
+
+Open:
+- **WinFsp's held flush** (`winfsp.rs`, its `deadline_ns` from `live_ship::durable_wait_ns`) still answers
+  `STATUS_UNEXPECTED_IO_ERROR` at one liveness budget from its hold, however its candidates are answering. Owned by
+  g244-healthy-fsync-live, next.
+- **An owner starved past a window's end** judges that end when it next runs, possibly before it has folded the
+  acknowledgements waiting on its sockets, so a window it could not observe may read as silent. raft's failing run shows
+  the owner itself late (the stopped-candidates `fsync` gave up after 1.60 s against a 1.00 s bound). Owned by
+  g244-healthy-fsync-live, after WinFsp's flush.
+- The lanes to each holder are cut at a hard liveness budget (`fleet::live_budget`), and a cut holder waits for the record
+  period or its session's return. Under load such a cut can outlast a window, which the wait's judgment cannot tell from
+  silence.
+
 ### 2026-11-09: a taken-over green's version 3 was never placed once under whole-suite load (open, instrumented)
 
 `a_share_of_a_green_made_after_its_last_version_survives_a_takeover` (`crates/server/tests/fleet.rs`, 73797a42,

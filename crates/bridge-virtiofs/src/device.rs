@@ -37,6 +37,7 @@
 //! cannot catch — shorter than the FUSE header, or a request-queue chain with no room for a reply
 //! header — faults the device (the VMM resets it), the same policy as a malformed chain.
 
+use slates_bridge_core::durable_bound::DurableBound;
 use std::fmt;
 
 use slates_bridge_core::{Bridge, OpContext};
@@ -305,8 +306,9 @@ struct DurableHeld {
   owes: Option<u64>,
   /// The log position it waits to be durable at.
   target: u64,
-  /// When [`Device::settle_durable`] first saw it, the start of its bound; `None` until then.
-  since_ns: Option<u64>,
+  /// Its wait, in windows, begun when [`Device::settle_durable`] first saw it; `None` until then
+  /// (`slates_bridge_core::durable_bound`, the rule every transport's held durable reply is judged by).
+  bound: Option<DurableBound>,
 }
 
 /// The oldest `FSYNC` reply held for durability ([`Device::durable_oldest`]): what the device loop waits on.
@@ -314,8 +316,8 @@ struct DurableHeld {
 pub struct DurableOldest {
   /// The log position it waits to be durable at.
   pub target: u64,
-  /// When its bound began; `None` before the first [`Device::settle_durable`] saw it.
-  pub since_ns: Option<u64>,
+  /// When its wait's open window ends; `None` before the first [`Device::settle_durable`] saw it.
+  pub window_ends_ns: Option<u64>,
 }
 
 /// What one [`Device::settle_durable`] did.
@@ -326,7 +328,7 @@ pub struct DurableSettled {
   pub completed: Vec<Completed>,
   /// Replies released once their volume was durable, having waited at least one settle for it.
   pub waited: u64,
-  /// Replies answered `EIO`: not durable within the bound, or never to be.
+  /// Replies answered `EIO`: not durable within their bound, or never to be.
   pub refused: u64,
 }
 
@@ -1145,7 +1147,7 @@ impl Device {
         unique: held.unique,
         owes: held.owes,
         target,
-        since_ns: None,
+        bound: None,
       });
       return Ok(None);
     }
@@ -1533,7 +1535,7 @@ impl Device {
   pub fn durable_oldest(&self) -> Option<DurableOldest> {
     self.durable.front().map(|held| DurableOldest {
       target: held.target,
-      since_ns: held.since_ns,
+      window_ends_ns: held.bound.map(|bound| bound.ends_ns()),
     })
   }
 
@@ -1543,26 +1545,27 @@ impl Device {
     self.durable.len()
   }
 
-  /// Settles every held `FSYNC` reply whose volume is durable at its position (`durability`), never will be, or has
-  /// waited `bound_ns` since this settle first saw it, as of `now_ns`: a durable one is released as served, the others
-  /// answered `EIO` in its place, and either then waits for the volume's FUSE mounts as every reply does
+  /// Settles every held `FSYNC` reply whose volume is durable at its position (`durability`), never will be, or whose
+  /// wait has given up as of `now_ns` (its [`DurableBound`], begun by `begin` the first time this settle sees it, judged
+  /// against `heard`, the volume's acknowledgements heard on its durability path): a durable one is released as served,
+  /// the others answered `EIO` in its place, and either then waits for the volume's FUSE mounts as every reply does
   /// ([`Device::settle_told`]). The rest stay held.
   pub fn settle_durable(
     &mut self,
     memory: &mut dyn GuestMemory,
     durability: &mut dyn FnMut(u64) -> Durability,
-    (now_ns, bound_ns): (u64, u64),
+    (now_ns, heard, begin): (u64, u64, &mut dyn FnMut() -> DurableBound),
     admission: &mut dyn ChainAdmission,
   ) -> Result<DurableSettled, DeviceError> {
     let mut settled = DurableSettled::default();
     let mut index = 0;
     while let Some(held) = self.durable.get_mut(index) {
-      let first_sight = held.since_ns.is_none();
-      let since = *held.since_ns.get_or_insert(now_ns);
+      let first_sight = held.bound.is_none();
+      let bound = held.bound.get_or_insert_with(&mut *begin);
       let refuse = match durability(held.target) {
         Durability::Durable => false,
         Durability::Never => true,
-        Durability::Pending if now_ns.saturating_sub(since) >= bound_ns => true,
+        Durability::Pending if bound.judge(heard, now_ns).is_some() => true,
         Durability::Pending => {
           index = index.saturating_add(1);
           continue;

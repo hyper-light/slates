@@ -12,6 +12,7 @@
 
 mod common;
 
+use slates_bridge_core::durable_bound::DurableBound;
 use std::cell::{Cell, RefCell};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::pin::Pin;
@@ -81,6 +82,8 @@ const COPY_SLICE: u64 = 4096;
 /// Shape: the bound the test owner names for a reply's wait on the volume's FUSE mounts (AC-3.3): long enough that a read
 /// the guest sends after a write is served well within it, short enough to keep the tests quick.
 const TOLD_BOUND_NS: u64 = 200_000_000;
+/// Shape: the most windows of [`TOLD_BOUND_NS`] a held `FSYNC` waits (the stand-in owner's failover SLO's worth).
+const DURABLE_WINDOWS: u32 = 10;
 /// Shape: the bytes the told tests' guest writes and reads back: a reply that fits [`REPLY_CAP`].
 const TOLD_BYTES: usize = 64;
 /// Format: the byte the told tests' file holds first, and the byte the guest writes over it.
@@ -123,6 +126,8 @@ thread_local! {
   static DURABLE_WAKERS: RefCell<Vec<Waker>> = const { RefCell::new(Vec::new()) };
   /// What the loop counted of its `FSYNC` replies held for durability: released after a wait, and answered `EIO`.
   static DURABLE_COUNTED: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+  /// The stand-in volume's acknowledgements heard on its durability path, which a held `FSYNC`'s wait is judged against.
+  static DURABLE_HEARD: Cell<u64> = const { Cell::new(0) };
   /// When the guest of the guest-kill test hung up, for the loop's task to measure its end from.
   static HUNG_UP: Cell<Option<Instant>> = const { Cell::new(None) };
 }
@@ -443,8 +448,17 @@ impl BridgeAccess for OwnedVolume {
     StandInDurable { target }
   }
 
-  fn durable_bound_ns(&mut self) -> u64 {
-    TOLD_BOUND_NS
+  fn durable_bound(&mut self, now_ns: u64) -> DurableBound {
+    DurableBound::begin(
+      DURABLE_HEARD.with(Cell::get),
+      now_ns,
+      TOLD_BOUND_NS,
+      DURABLE_WINDOWS,
+    )
+  }
+
+  fn durable_heard(&mut self) -> u64 {
+    DURABLE_HEARD.with(Cell::get)
   }
 
   fn durable_settled(&mut self, waited: u64, refused: u64) {
@@ -1188,13 +1202,29 @@ fn a_daemon_stopped_while_a_guest_writes_reply_waits_leaves_no_wait_behind() {
 /// Format: `fuse_fsync_in` (`include/uapi/linux/fuse.h`): `fh` (8), `fsync_flags` (4) and padding (4).
 const FSYNC_IN_BYTES: usize = 16;
 
+/// When the stand-in log becomes durable at the `FSYNC`'s position, once the read after it is published.
+#[derive(Clone, Copy)]
+enum Durable {
+  /// Never.
+  Never,
+  /// At once.
+  AtOnce,
+  /// After [`TRICKLES`] half windows, each hearing one acknowledgement (another write's progress), so the wait outlasts
+  /// one window while every window hears something.
+  AfterTrickling,
+}
+
+/// Shape: the half windows the trickling log hears an acknowledgement in before it becomes durable: three, a window and a
+/// half, past the single window the old bound allowed.
+const TRICKLES: u64 = 3;
+
 /// What the guest saw of an `FSYNC` of node `node` with a `READ` sent after it: the `FSYNC`'s errno, how long after it
 /// was sent its element was published, and whether the read's element came first.
 async fn fsync_then_read(
   node: u64,
   kick: &OwnedFd,
   call: &OwnedFd,
-  durable_at: Option<u64>,
+  durable: Durable,
 ) -> (i32, Duration, bool) {
   let rq = usize::from(FIRST_REQUEST_QUEUE);
   let sent = Instant::now();
@@ -1212,8 +1242,20 @@ async fn fsync_then_read(
   rustix::io::write(kick, &[1u8]).unwrap();
   notified(call).await;
   let (first, _) = with_guest(|g| g.reap(rq)).expect("a used element after the notification");
-  if let Some(at) = durable_at {
-    durable_through(at);
+  match durable {
+    Durable::Never => {}
+    Durable::AtOnce => durable_through(1),
+    Durable::AfterTrickling => {
+      let trickle = futures::spawn(async {
+        for _ in 0..TRICKLES {
+          let _ = futures::sleep(TOLD_BOUND_NS / 2).await;
+          DURABLE_HEARD.with(|heard| heard.set(heard.get() + 1));
+        }
+        durable_through(1);
+      })
+      .unwrap();
+      let _ = futures::detach(trickle);
+    }
   }
   let mut published = None;
   while published.is_none() {
@@ -1230,9 +1272,9 @@ async fn fsync_then_read(
 }
 
 /// Runs one guest `FSYNC` (and a `READ` after it) through a loop whose barrier leaves the `FSYNC` waiting for the stand-in
-/// log's position 1, which becomes durable after the read is published when `durable_at` says so: the guest's view
+/// log's position 1, which becomes durable after the read is published as `durable` says: the guest's view
 /// ([`fsync_then_read`]), what the loop counted, and whether it ended on the guest's hangup with its terminal step run.
-fn fsync_on_a_live_volume(durable_at: Option<u64>) -> ((i32, Duration, bool), (u64, u64), bool) {
+fn fsync_on_a_live_volume(durable: Durable) -> ((i32, Duration, bool), (u64, u64), bool) {
   static LIVE: AtomicU64 = AtomicU64::new(0);
   let rt = Runtime::start(&config()).unwrap();
   let shard = rt.shard_ids().first().copied().unwrap();
@@ -1243,6 +1285,7 @@ fn fsync_on_a_live_volume(durable_at: Option<u64>) -> ((i32, Duration, bool), (u
     DURABLE_OWED.with(|owed| owed.set(Some(1)));
     DURABLE_AT.with(|at| at.set(None));
     DURABLE_COUNTED.with(|counted| counted.set((0, 0)));
+    DURABLE_HEARD.with(|heard| heard.set(0));
     let (admitted, kick_write, call_read) = admitted_over_pipes(&mut owned.registry);
     let id = register(DEVICE_BOUND).unwrap();
     let device_task = futures::spawn(async move {
@@ -1252,7 +1295,7 @@ fn fsync_on_a_live_volume(durable_at: Option<u64>) -> ((i32, Duration, bool), (u
     .unwrap();
     let _ = futures::detach(device_task);
     let guest_task = futures::spawn(async move {
-      let seen = fsync_then_read(node, &kick_write, &call_read, durable_at).await;
+      let seen = fsync_then_read(node, &kick_write, &call_read, durable).await;
       let counted = DURABLE_COUNTED.with(Cell::get);
       drop(kick_write);
       let _ = guest_tx.send((seen, counted));
@@ -1274,7 +1317,7 @@ fn fsync_on_a_live_volume(durable_at: Option<u64>) -> ((i32, Duration, bool), (u
 /// refused, never `0`; the loop ends cleanly.
 #[test]
 fn a_guests_fsync_of_a_live_volume_never_durable_is_answered_eio_at_the_bound() {
-  let ((errno, after, read_first), counted, ended) = fsync_on_a_live_volume(None);
+  let ((errno, after, read_first), counted, ended) = fsync_on_a_live_volume(Durable::Never);
   println!("the FSYNC was answered {errno} after {after:?}");
   assert!(
     read_first,
@@ -1298,7 +1341,7 @@ fn a_guests_fsync_of_a_live_volume_never_durable_is_answered_eio_at_the_bound() 
 /// reply that waited and was released.
 #[test]
 fn a_guests_fsync_of_a_live_volume_is_answered_once_durable() {
-  let ((errno, after, read_first), counted, ended) = fsync_on_a_live_volume(Some(1));
+  let ((errno, after, read_first), counted, ended) = fsync_on_a_live_volume(Durable::AtOnce);
   println!("the FSYNC was answered {errno} after {after:?}");
   assert!(
     read_first,
@@ -1310,5 +1353,32 @@ fn a_guests_fsync_of_a_live_volume_is_answered_once_durable() {
     "released by durability, not the bound: {after:?}"
   );
   assert_eq!(counted, (1, 0), "counted as waited");
+  assert!(ended, "the loop ended on the hangup, its terminal step run");
+}
+
+/// The rule every held durable reply is judged by (`slates_bridge_core::durable_bound`; 2026-11-11, the supervisor's
+/// order: the virtio-fs device's sibling of the FUSE `fsync` fix). Do: as above, but once the read is published the
+/// stand-in volume hears an acknowledgement every half window, three times, before its log becomes durable at position 1:
+/// a wait longer than one window in which every window hears something, as a loaded fleet's is. Expect the `FSYNC`
+/// answered `0` after more than one window, counted as a reply that waited, never refused. Before, the device answered
+/// `EIO` at one window from its first settle, however its volume was progressing.
+#[test]
+fn a_guests_fsync_of_a_live_volume_waits_while_its_volume_keeps_progressing() {
+  let ((errno, after, read_first), counted, ended) =
+    fsync_on_a_live_volume(Durable::AfterTrickling);
+  println!("the FSYNC was answered {errno} after {after:?}");
+  assert!(
+    read_first,
+    "the later read is published while the FSYNC waits"
+  );
+  assert_eq!(
+    errno, 0,
+    "the FSYNC succeeds once durable, its volume heard progressing in every window: {after:?}"
+  );
+  assert!(
+    after > Duration::from_nanos(TOLD_BOUND_NS),
+    "it waited past one window, or the test shows nothing: {after:?}"
+  );
+  assert_eq!(counted, (1, 0), "counted as waited, never refused");
   assert!(ended, "the loop ended on the hangup, its terminal step run");
 }
