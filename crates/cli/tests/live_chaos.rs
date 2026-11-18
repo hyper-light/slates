@@ -4881,11 +4881,6 @@ fn a_write_answered_the_instant_before_its_owner_dies_is_served_by_its_successor
   let mut verdict = Verdict::new("a write answered the instant before its owner dies");
   let owner_index = fleet.owner_index();
   for iteration in 0..ITERATIONS {
-    let barrier = if iteration % 2 == 0 {
-      Barrier::ClientWrite
-    } else {
-      Barrier::NfsFileSync
-    };
     let owner = fleet.instances[owner_index].clone();
     let volume = fleet.create_volume(
       &owner,
@@ -4893,74 +4888,213 @@ fn a_write_answered_the_instant_before_its_owner_dies_is_served_by_its_successor
       true,
       Claim::Dynamic,
     );
-    let files: Vec<(String, Vec<u8>)> = (0..=BEFORE)
-      .map(|file| {
-        let name = format!("ack-{iteration}-{file}");
-        let body = chaos_body(iteration * (BEFORE + 1) + file);
-        (name, body)
-      })
-      .collect();
-    let (probe, before) = files.split_last().unwrap();
-    let answered = answered_within(&fleet.instances, &volume, || {
-      for (name, body) in before {
-        write_through(&owner, &volume, Barrier::ClientWrite, name, body);
-      }
-      write_through(&owner, &volume, barrier, &probe.0, &probe.1);
-    });
-    if let Err(state) = answered {
-      verdict.check(
-        &format!("every write answered, iteration {iteration} ({barrier:?})"),
-        vec![format!(
-          "a write on {owner} was not answered within the fleet wait:\n{state}"
-        )],
-      );
+    let round = (iteration, BEFORE, barrier_of(iteration));
+    if kill_at_ack(&mut fleet, (owner_index, &volume), round, &mut verdict) == AckRound::Stopped {
       break;
     }
-    // The instant the probe's answer is back, the owner is gone.
-    fleet.kill_node(owner_index);
-    let survivors: Vec<String> = fleet
-      .others(owner_index)
-      .into_iter()
-      .map(|index| fleet.instances[index].clone())
-      .collect();
-    let refs: Vec<&str> = survivors.iter().map(String::as_str).collect();
-    match wait_reads(&refs, &volume, &probe.0, &probe.1) {
-      Some((successor, took)) => {
-        let lost: Vec<String> = before
-          .iter()
-          .filter(|(name, body)| {
-            Client::connect(successor, deadlines())
-              .ok()
-              .and_then(|mut client| {
-                client
-                  .read(volume_id_of(&volume), &format!("/{name}"), ReadAt::Head)
-                  .ok()
-              })
-              .is_none_or(|bytes| bytes != *body)
-          })
-          .map(|(name, _)| name.clone())
-          .collect();
-        verdict.note(format!(
-          "iteration {iteration} ({barrier:?}): {successor} served the probe {took:?} after the owner's death"
-        ));
-        verdict.check(
-          &format!("NoLoss, iteration {iteration} (earlier files)"),
-          lost,
-        );
-      }
-      None => verdict.check(
-        &format!("NoLoss, iteration {iteration} ({barrier:?})"),
-        vec![format!(
-          "no survivor served {} within the fleet wait:\n{}",
-          probe.0,
-          diagnosis(&survivors, &volume)
-        )],
-      ),
-    }
-    // The dead node's replacement, a fresh member at the same index, owns the next iteration's volume.
-    fleet.replace_node(owner_index);
-    fleet.wait_rejoined();
   }
+  drop(fleet);
+  verdict.judge();
+}
+
+/// The barrier an iteration of the kill-at-acknowledgement flows writes its probe through: the client's `fs_write` and a
+/// userspace NFS `FILE_SYNC` write, in turn.
+fn barrier_of(iteration: usize) -> Barrier {
+  if iteration % 2 == 0 {
+    Barrier::ClientWrite
+  } else {
+    Barrier::NfsFileSync
+  }
+}
+
+/// What one iteration of the kill-at-acknowledgement flows came to ([`kill_at_ack`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AckRound {
+  /// The owner was killed at the probe's answer, a survivor's service judged, and the dead node replaced.
+  Judged,
+  /// A write was not answered within the fleet wait (judged so): the fleet's daemons are gone, and the flow stops.
+  Stopped,
+}
+
+/// One iteration of the kill-at-acknowledgement flows on `volume`, live-shipped from the node at `owner_index`: `before`
+/// files written, then a probe through `barrier`, the owner SIGKILLed the instant the probe's answer returns, the probe
+/// and every file before it required of a survivor byte for byte (NoLoss), and the dead node replaced by a fresh member,
+/// which owns the next iteration's volume.
+fn kill_at_ack(
+  fleet: &mut Fleet,
+  (owner_index, volume): (usize, &str),
+  (iteration, before, barrier): (usize, usize, Barrier),
+  verdict: &mut Verdict,
+) -> AckRound {
+  let owner = fleet.instances[owner_index].clone();
+  let files: Vec<(String, Vec<u8>)> = (0..=before)
+    .map(|file| {
+      let name = format!("ack-{iteration}-{file}");
+      let body = chaos_body(iteration * (before + 1) + file);
+      (name, body)
+    })
+    .collect();
+  let (probe, earlier) = files.split_last().unwrap();
+  let answered = answered_within(&fleet.instances, volume, || {
+    for (name, body) in earlier {
+      write_through(&owner, volume, Barrier::ClientWrite, name, body);
+    }
+    write_through(&owner, volume, barrier, &probe.0, &probe.1);
+  });
+  if let Err(state) = answered {
+    verdict.check(
+      &format!("every write answered, iteration {iteration} ({barrier:?})"),
+      vec![format!(
+        "a write on {owner} was not answered within the fleet wait:\n{state}"
+      )],
+    );
+    return AckRound::Stopped;
+  }
+  // The instant the probe's answer is back, the owner is gone.
+  fleet.kill_node(owner_index);
+  let survivors: Vec<String> = fleet
+    .others(owner_index)
+    .into_iter()
+    .map(|index| fleet.instances[index].clone())
+    .collect();
+  let refs: Vec<&str> = survivors.iter().map(String::as_str).collect();
+  match wait_reads(&refs, volume, &probe.0, &probe.1) {
+    Some((successor, took)) => {
+      let lost: Vec<String> = earlier
+        .iter()
+        .filter(|(name, body)| {
+          Client::connect(successor, deadlines())
+            .ok()
+            .and_then(|mut client| {
+              client
+                .read(volume_id_of(volume), &format!("/{name}"), ReadAt::Head)
+                .ok()
+            })
+            .is_none_or(|bytes| bytes != *body)
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+      verdict.note(format!(
+        "iteration {iteration} ({barrier:?}): {successor} served the probe {took:?} after the owner's death"
+      ));
+      verdict.check(
+        &format!("NoLoss, iteration {iteration} (earlier files)"),
+        lost,
+      );
+    }
+    None => verdict.check(
+      &format!("NoLoss, iteration {iteration} ({barrier:?})"),
+      vec![format!(
+        "no survivor served {} within the fleet wait:\n{}",
+        probe.0,
+        diagnosis(&survivors, volume)
+      )],
+    ),
+  }
+  // The dead node's replacement, a fresh member at the same index, owns the next iteration's volume.
+  fleet.replace_node(owner_index);
+  fleet.wait_rejoined();
+  AckRound::Judged
+}
+
+/// The bytes the first shard of `instance`'s daemon reserves for content, as `status` reports it (`reserve=`).
+fn shard_reserve(instance: &str) -> u64 {
+  let out = run_ready(instance, &["status"]);
+  out
+    .lines()
+    .find_map(|line| {
+      line
+        .trim_start()
+        .strip_prefix("shard 0:")?
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("reserve="))?
+        .parse()
+        .ok()
+    })
+    .unwrap_or_else(|| panic!("shard 0's reserve in {out:?}"))
+}
+
+/// Whether a refusal on stderr is the typed one a fleet with no room for a claim answers (§4.2, A-401).
+fn refused_for_room(err: &str) -> bool {
+  err.contains("BudgetExceeded")
+}
+
+/// A-401 (§4.2: "a remote holder makes the same admission against its own machine before acknowledging placement")
+/// across real processes: the kill-at-acknowledgement flow with bounded claims that bind. Do, `ITERATIONS` times on one
+/// fleet, create a bounded volume of three quarters of a shard's content reserve on the owner (the share the stream
+/// bound's 782 MiB took of CI's 7 GB macOS runner's 1 GiB shards, so a daemon's two shards hold two such claims and
+/// refuse a third, on any machine), live-ship it, then run the kill-at-acknowledgement iteration on it. Expect each
+/// iteration either refused typed (`BudgetExceeded`) at its create or its live-ship, before anything ships, or its probe
+/// and every file before it served by a survivor after the owner's death; and at least one iteration served. Before
+/// A-401 the live-ship was answered whatever the candidates could hold, and a successor without room gave a shipped
+/// volume up (`NotRecovered`) while a survivor held every acknowledged write (iterations 3 and 4 on the runner).
+#[test]
+fn a_bounded_claim_is_served_by_its_successor_or_refused_before_it_ships() {
+  /// Shape: the iterations: past the two claims a daemon's shards hold, so the fleet runs out of room.
+  const ITERATIONS: usize = 6;
+  /// Shape: the files written before the probe, as the kill-at-acknowledgement flow writes.
+  const BEFORE: usize = 8;
+  /// Shape: the share of a shard's content reserve each claim takes, as a fraction: three quarters.
+  const CLAIM_SHARE: (u64, u64) = (3, 4);
+  if !gated("bounded-kill-at-ack") {
+    return;
+  }
+  let mut fleet = Fleet::start("bounded-ack", Supervision::Bare);
+  let mut verdict =
+    Verdict::new("a bounded claim served by its successor or refused before it ships");
+  let owner_index = fleet.owner_index();
+  let claim_mib = shard_reserve(&fleet.instances[owner_index])
+    .saturating_mul(CLAIM_SHARE.0)
+    .checked_div(CLAIM_SHARE.1)
+    .unwrap_or(0)
+    >> 20;
+  let bound = format!("{claim_mib}MiB");
+  let (mut served, mut refused) = (0usize, 0usize);
+  for iteration in 0..ITERATIONS {
+    let owner = fleet.instances[owner_index].clone();
+    let name = format!("bounded-ack-{iteration}");
+    let (code, out, err) = run(&owner, &["volume", "create", &name, "--bounded", &bound]);
+    if code != 0 {
+      verdict.check(
+        &format!("a create refused for room is typed, iteration {iteration}"),
+        (!refused_for_room(&err))
+          .then(|| err.clone())
+          .into_iter()
+          .collect(),
+      );
+      refused += 1;
+      continue;
+    }
+    let volume = value_of(&out, "id");
+    fleet.share(&owner, &volume);
+    let (code, _, err) = run(&owner, &["live-ship", &volume]);
+    if code != 0 {
+      verdict.check(
+        &format!("a live-ship refused for room is typed, iteration {iteration}"),
+        (!refused_for_room(&err))
+          .then(|| err.clone())
+          .into_iter()
+          .collect(),
+      );
+      refused += 1;
+      continue;
+    }
+    let round = (iteration, BEFORE, barrier_of(iteration));
+    match kill_at_ack(&mut fleet, (owner_index, &volume), round, &mut verdict) {
+      AckRound::Judged => served += 1,
+      AckRound::Stopped => break,
+    }
+  }
+  verdict.note(format!(
+    "claims of {bound}: {served} shipped and judged after their owner's death, {refused} refused before they shipped"
+  ));
+  verdict.check(
+    "non-vacuity: at least one claim shipped and its owner killed",
+    (served == 0)
+      .then(|| "no iteration shipped".to_owned())
+      .into_iter()
+      .collect(),
+  );
   drop(fleet);
   verdict.judge();
 }
