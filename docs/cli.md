@@ -468,8 +468,8 @@ socket whose first message, 28 bytes, names the attachment and a secret token, a
 its successor recovers the attachment, the successor hands a fresh stream end naming the same token. On Linux each
 message is one packet; on macOS the channel is a stream, so read each message whole by its 28 bytes. Reading the
 channel's end means no such stream will come (the attachment ended, or the daemon could not keep it); a platform that
-makes no channel yet hands one already ended. On macOS today the daemon's successor cannot yet recover the attachment,
-so the end comes at the daemon's death.
+makes no channel yet hands one already ended. A program that ends its share closes the channel's end with the
+stream's.
 A guest whose init names its run's owner, as Shards' does with `trusted.shards.owner`, is shown the files the host
 made as that owner's, so an unprivileged run writes them; the volume keeps the host's own ids for what the run makes,
 so every other route shows those files as the host's.
