@@ -750,7 +750,7 @@ async fn reserve(alias: Option<&NameAlias>) -> Result<(), Refusal> {
       confirmed: false,
     },
   };
-  crate::xshard::call_within(
+  crate::xshard::call_in_shard_time(
     alias.this,
     alias.name_shard,
     move |s| crate::verbs::alias_step(s, &reservation),
@@ -779,7 +779,7 @@ async fn settle(alias: Option<NameAlias>, reserved: Result<(), Refusal>, made: b
   } else {
     slates_db::Op::NameAliasReleased { name: alias.name }
   };
-  let settled = crate::xshard::call_within(
+  let settled = crate::xshard::call_in_shard_time(
     alias.this,
     alias.name_shard,
     move |s| crate::verbs::alias_step(s, &step),
