@@ -8193,7 +8193,10 @@ past that. One flow of the verbs, every outcome and refusal asserted as its type
 > **Status (2026-11-18, A-310).** Built: `crates/api/src/seam.rs`, `crates/api/src/sim.rs`, the contract at version 9,
 > and the suite over an in-process instance and over the simulator. A pinned snapshot's destroy reaches a consumer as
 > `Invalid::Request` with the volume core's `Pinned` as its note, untyped; the simulator answers the same, and a typed
-> class for it is owed to the contract.
+> class for it is owed to the contract. (Amended 2026-11-18: typed since `CONTRACT` 15, `Busy::Volume(Pinned)`, which
+> the simulator answers and the suite asserts. At `CONTRACT` 30 the suite passes over an in-process instance and over
+> the simulator, on a Mac Studio, kiln run r160. The seam's signatures are unchanged since 16, and the error classes
+> added since reach it as they reach the instance.)
 
 **The consumer contract (A-299).** Everything a consumer touches goes through `slates-api` (Ada,
 2026-11-18): provisioning and managing volumes, serving them, landing, merging, their conflicts,

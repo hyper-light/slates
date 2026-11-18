@@ -671,9 +671,10 @@
 > **What Hex and Mantle need from slates (2026-11-18, goal g268).**
 > - **Hex** reaches other products only through a trait with a simulator and one conformance suite (its `CLAUDE.md`
 >   §9). **Built (A-310):** `slates_api::Volumes`, implemented by `Instance` and by `SimVolumes`, held to one suite
->   (`crates/api/tests/api.rs`). **Owed:** a typed class for a pinned snapshot's destroy, answered `Invalid::Request`
->   today (the contract's, goal g262); Hex's own use of the seam when it takes slates (kiln's plan T7, CP-T7.8 and
->   CP-T7.13). **Decided (Ada, 2026-11-18):** Hex's microVM disks stay per machine (its D281); slates workspaces alone
+>   (`crates/api/tests/api.rs`). A pinned snapshot's destroy is typed since `CONTRACT` 15 (`Busy::Volume(Pinned)`, the
+>   simulator's answer and the suite's assertion too); at `CONTRACT` 30 the suite passes over an instance and over the
+>   simulator (kiln run r160, 2026-11-18). **Owed:** Hex's own use of the seam when it takes slates (kiln's plan T7,
+>   CP-T7.8 and CP-T7.13). **Decided (Ada, 2026-11-18):** Hex's microVM disks stay per machine (its D281); slates workspaces alone
 >   replicate across runners (g267's entry).
 > - **Mantle**'s agent, asked on 2026-11-18 whether it waits on slates, has not answered; its kiln track (plan T10)
 >   puts kiln's bytes on Mantle through kiln's `Blobs`, and two of its steps reach slates, neither started: CP-T10.4 keeps slates snapshots on Mantle, which needs a snapshot's
