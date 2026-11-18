@@ -4321,50 +4321,23 @@ fn keys_for_rebuild(sealed: bool, keys_recorded: bool) -> Result<(), &'static st
   Ok(())
 }
 
-/// The volume a live log describes, rebuilt as a takeover's archive on the volume's new owner shard (A-200): the
-/// lineage key adopted, every payload opened, the deltas applied in order to the whole image, and the result laid out
-/// as `materialize_taken_over` restores (directories and files, a symlink as a file of its target, as the export lays
-/// it out). Refused, counted, when the log cannot be rebuilt whole: the volume is then not served from it. In one go:
-/// what [`Rebuilding`] does a slice a turn, run to its end.
-pub(crate) fn archive_from_live(
-  state: &mut ShardState,
-  id: slates_db::catalog::VolumeId,
-  owner: &slates_db::catalog::Principal,
-  fetched: &Fetched,
-) -> Result<slates_archive::Archive, &'static str> {
-  let rebuilt = Rebuilding::begin(
-    state,
-    id,
-    owner,
-    (fetched.lineage.clone(), fetched.naming.clone()),
-    fetched.payloads.clone(),
-  )
-  .and_then(|mut rebuilding| {
-    while !rebuilding.advance(|| false)? {}
-    rebuilding.archive()
-  });
-  rebuilt_counted(state, rebuilt)
+/// Counts a live takeover's rebuild refused, in total and by why (`fleet.live.takeover_refused.*`), as a holder's refusals
+/// are counted: one counter for nine refusals hid which step a 1,000-write log failed at on KIND (runs 42178128960,
+/// 42318867890: 1,512 refusals). The refusal, for its caller to return.
+pub(crate) fn rebuild_refused(state: &mut ShardState, why: &'static str) -> &'static str {
+  state.count(LIVE_TAKEOVER_REFUSED, 1);
+  state.count(why, 1);
+  why
 }
 
-/// Counts a rebuild's outcome where the takeover's status reads it: taken over, or refused in total and by why.
-pub(crate) fn rebuilt_counted<T>(
-  state: &mut ShardState,
-  rebuilt: Result<T, &'static str>,
-) -> Result<T, &'static str> {
-  match &rebuilt {
-    Ok(_) => state.count(LIVE_TAKEN_OVER, 1),
-    Err(why) => {
-      // In total and by why (`fleet.live.takeover_refused.*`), as a holder's refusals are counted: one counter for nine
-      // refusals hid which step a 1,000-write log failed at on KIND (runs 42178128960, 42318867890: 1,512 refusals).
-      state.count(LIVE_TAKEOVER_REFUSED, 1);
-      state.count(why, 1);
-    }
-  }
-  rebuilt
+/// Counts a live volume taken over (`fleet.live.taken_over`): made from its rebuilt log and published, in the turn that
+/// makes it servable (A-343), so a count read means a volume a restart rebuilds.
+pub(crate) fn taken_over(state: &mut ShardState) {
+  state.count(LIVE_TAKEN_OVER, 1);
 }
 
 /// A live log's rebuild on its volume's new owner shard, its payloads opened, decoded and applied in order a slice at a
-/// time (g251, CLAUDE.md "Bounded work everywhere"): what [`archive_from_live`] does whole. A takeover rebuilt the whole
+/// time (g251, CLAUDE.md "Bounded work everywhere"). A takeover rebuilt the whole
 /// log inside the one owner-shard turn that made the volume: on a Mac Studio the nemesis's volumes, 16,737 to 27,430
 /// sealed payloads of 152 to 306 MB, took 0.24 to 0.62 s to open and 0.09 to 0.44 s to apply, and with the restore and
 /// the publication after them the turn ran past the watchdog's spin window, which ended the successor's process

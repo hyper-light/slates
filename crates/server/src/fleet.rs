@@ -5792,10 +5792,7 @@ async fn make_live_in_turns(
   let begun = state::with_state(|s| {
     let begun =
       crate::live_ship::Rebuilding::begin(s, id, &catalog.owner, (lineage, naming), payloads);
-    match begun {
-      Ok(rebuilding) => Ok(rebuilding),
-      Err(why) => crate::live_ship::rebuilt_counted(s, Err(why)),
-    }
+    begun.map_err(|why| crate::live_ship::rebuild_refused(s, why))
   })
   .ok_or(MATERIALIZE_UNANSWERED)?;
   let mut rebuilding = begun?;
@@ -5808,10 +5805,7 @@ async fn make_live_in_turns(
     let done = state::with_state(|s| {
       s.count(LIVE_REBUILD_SLICES, 1);
       turned(s, object);
-      match advanced {
-        Ok(done) => Ok(done),
-        Err(why) => crate::live_ship::rebuilt_counted(s, Err(why)),
-      }
+      advanced.map_err(|why| crate::live_ship::rebuild_refused(s, why))
     })
     .ok_or(MATERIALIZE_UNANSWERED)??;
     if done {
@@ -5829,7 +5823,7 @@ async fn make_live_in_turns(
   let archive = rebuilding.archive();
   let archive = state::with_state(|s| {
     turned(s, object);
-    crate::live_ship::rebuilt_counted(s, archive)
+    archive.map_err(|why| crate::live_ship::rebuild_refused(s, why))
   })
   .ok_or(MATERIALIZE_UNANSWERED)??;
   futures::yield_now().await;
@@ -5871,8 +5865,11 @@ async fn make_live_in_turns(
     s.placed_heads.insert(object, placed);
     s.placed_heads.insert(object.catalog(), catalog_placed);
     // Published before it is served (A-343): its image is what a restart rebuilds it from, and its shipper is made
-    // from the adopted head at once.
-    published_before_served(s)
+    // from the adopted head at once. Counted taken over only then, in this turn, as the one-turn materialization counted
+    // it: a test that restarts the successor once the count rises found a volume made and published.
+    published_before_served(s)?;
+    crate::live_ship::taken_over(s);
+    Ok(())
   })
   .ok_or(MATERIALIZE_UNANSWERED)?
 }

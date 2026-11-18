@@ -41,8 +41,10 @@ given up on: no attempt could ever be answered within a period.
 ## Exact edits (A-374)
 
 - `crates/server/src/live_ship.rs`: `Rebuilding` (begin with the lineage key adopted and the keys taken; `advance`, a
-  payload at least until the turn's share is spent; `archive`); `archive_from_live` is the same run to its end;
-  `rebuilt_counted`.
+  payload at least until the turn's share is spent; `archive`) in place of `archive_from_live`; `rebuild_refused`, and
+  `taken_over`, counted in the turn that makes and publishes the volume, as the one-turn materialization counted it
+  (a successor restarted once the count rose must find the volume published: `a_successor_restarted_before_any_write_
+  keeps_the_live_volume_it_took_over`, A-343, failed when the count came two turns before the publication).
 - `crates/server/src/fleet.rs`: `make_live`, a task of the owner shard that claims the volume's record, makes it in
   turns (`make_live_in_turns`: the rebuild's slices, then the archive, the restore and the making with its publication,
   each a turn) and leaves its end there; `begin_live` waits a period for it, and the task outlives the wait (waited

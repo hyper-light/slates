@@ -6945,8 +6945,8 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > least `f + 1` answers is adopted (`slates_db::live::adopt`). Whole entries carry the volume's lineage key wrapped for
 > each neighbour (the `sealing` a head carries), so the successor opens the log whether or not the volume ever sealed;
 > it replays the whole image and the deltas after it (`VolumeImage::apply`) and serves the volume as an archive of
-> that image and the content runs (`live_ship::archive_from_live`, the export's layout), through the same
-> `materialize_taken_over` a seal's takeover uses. A log that cannot be rebuilt whole is refused, counted
+> that image and the content runs (`live_ship::Rebuilding`, the export's layout; in turns since A-374), through the
+> same restore and making a seal's takeover uses (`verbs::restore_taken_over`, `materialize_taken_over_restored`). A log that cannot be rebuilt whole is refused, counted
 > (`fleet.live.takeover_refused`), never silently replaced by an older seal. The successor keeps the volume
 > live-shipped (its catalog carries the flag) and ships under the head's epoch, above the dead owner's. Across three
 > real daemon processes (`a_live_volumes_acknowledged_writes_survive_its_owners_death`): five writes, each answered at
@@ -26498,7 +26498,8 @@ nemesis entry), `crates/server/src/lease.rs`, `crates/server/src/member_task.rs`
 ### A-374 — A live takeover's materialization runs in turns of its owner shard, by a task of that shard, and a later attempt joins it (2026-11-18, goal g251: every open slates bug fixed; the nemesis's watchdog kills; §4.8 "Promotion and takeover", §4.10 live shipping; CLAUDE.md "Bounded work everywhere"; A-347's sibling)
 Applied in the same change to: §4.10's status (A-374), GAPS (A-347's "one-turn walks of a whole volume": the live
 rebuild closed), the bug record `docs/bugs/2026-11-18-a-live-takeover-made-its-volume-in-one-turn.md`,
-`crates/server/src/live_ship.rs` (`Rebuilding`, `rebuilt_counted`), `crates/server/src/fleet.rs` (`make_live`,
+`crates/server/src/live_ship.rs` (`Rebuilding` in place of `archive_from_live`, `rebuild_refused`, `taken_over`),
+`crates/server/src/fleet.rs` (`make_live`,
 `make_live_in_turns`, `begin_live`, `making_of`, `Joined`, `VolumeWait::Making`), `crates/server/src/verbs.rs`
 (`made_already`, `restore_taken_over`, `materialize_taken_over_restored`), `crates/server/src/state.rs`
 (`ShardState::making_taken_over`, `Making`, `PendingVolume::record_turns`, `live_adopted`), `crates/server/src/daemon.rs`
