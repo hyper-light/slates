@@ -3064,3 +3064,5 @@ slates-server: shard 2 initialized in 1261 µs
 slates-server: shard 0 initialized in 2044 µs
 slates daemon: instance fsb-1652-10-dll serving on 3 shards under the anchor
 ## run 10 of 10 done, 2026-11-18T13:14:44Z
+To https://github.com/hyper-light/slates
+   604c0ba..d6eca7d  d6eca7d1b995d9d39d9d07a9811afc81b98bd5a5 -> diag-results/g258-44292211799-dll-x86
