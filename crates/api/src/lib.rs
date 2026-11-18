@@ -251,10 +251,10 @@ pub use slates_ipc::protocol::{
 /// The rendezvous's and the channel's own typed refusals the contract carries.
 pub use slates_ipc::{DeliveryFault, error::RouteRefusal};
 
-/// The client's deadlines as the product derives them (§4.7 "Failure matrix"; `Deadlines::derive`): a reply is waited
-/// for as long as the anchor waits for the daemon's heartbeat before it questions the daemon's liveness, and a
-/// reconnect is tried for the recovery budget a restart is bounded by. Every client this crate makes uses them, as the
-/// CLI's do.
+/// The client's deadlines as the product derives them (§4.7 "Failure matrix"; `Deadlines::derive`): a wait that cannot
+/// see the daemon's departure asks after the daemon's liveness as often as the anchor waits for the daemon's heartbeat
+/// (a synchronous call's reply is waited for until it comes or the daemon's process ends, A-456), and a reconnect is
+/// tried for the recovery budget a restart is bounded by. Every client this crate makes uses them, as the CLI's do.
 pub fn deadlines() -> Deadlines {
   Deadlines::derive(
     slates_server::daemon::LIVENESS_BUDGET_NS,

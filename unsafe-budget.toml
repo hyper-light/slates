@@ -235,7 +235,13 @@
 #   by BLAKE3.
 
 [budget]
-slates-machine = 85
+slates-machine = 86
+# 2026-11-18 (+1, A-456, Linux only; 85 -> 86): `switches::switches_now`'s Linux arm, one `libc::getrusage` with
+#   `RUSAGE_THREAD` into a zeroed, fully sized `rusage` this frame owns (rustix has no `getrusage`). A client's park that
+#   waits on its daemon's departure beside its reply polls a descriptor, so the daemon's futex wake cannot confirm it
+#   found the client asleep; the client judges its own sleep by this count, as Windows' parks do, or its wake estimate
+#   learns nothing on Linux. `slates-rt`'s attribution reads the same call for the shards (its own block): folding it
+#   into this one is owed (one block fewer there).
 # 2026-11-18 (+4, A-357, Windows only; 81 -> 85): the thread-profiling calls of A-223 (`switches.rs`) are found in kernel32
 #   at run time, never imported: three typed function-pointer aliases (`Enable`, `Read`, `Disable`) and the block that
 #   looks them up with `GetModuleHandleW` and `GetProcAddress`; the three calls' blocks were counted already. Nano Server's
@@ -422,7 +428,12 @@ slates-db = 0
 # SYNCHRONIZE and PROCESS_QUERY_LIMITED_INFORMATION (OpenProcess, the handle adopted), reads its creation time
 # (GetProcessTimes, also of the daemon's own pseudo-handle, GetCurrentProcess) to tell it from a process given its pid
 # after it, and waits on the claim's Event and the process at once (WaitForMultipleObjects); compiled only for Windows.
-slates-ipc = 146
+slates-ipc = 147
+# 2026-11-18 (+1, A-452, `mach_claim.rs` compiled only for macOS; the budget raised by g251b, which found it over): the
+#   region fetch's receive ends on the kernel's send-once notification when the owner went away holding the fetch's
+#   reply right, and `fetch` destroys that notification with `mach_msg_destroy` (1), as every other refused or
+#   unexpected message is, so whatever it carried is given back once. A-452 added the site on 2026-11-18 without raising
+#   the budget, and `cargo xtask unsafe` counted 147 against 146 from then.
 # 2026-11-18 (+1, §4.6 A-433, a Windows Shards stream's resync, `stream_pipe.rs` compiled only for Windows): `write_now`
 #   cancels a pipe write the reader has no room for (`CancelIoEx`, 1), so a successor's `Resync` to a device that
 #   reads nothing never holds its shard; the write and its settling are the waited write's sites.

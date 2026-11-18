@@ -333,8 +333,76 @@ pub const WINDOW_CEILING_NS: u64 = crate::daemon::OBSERVE_BUDGET_NS;
 /// its shards keep `W`. Both of a shard's judgments follow it: wedged or starved after this window without a step, and
 /// spinning after this window of CPU held to the build ([`spin_window_ns`]). Pure, so the rule is tested on every host;
 /// the shard publishes its own window by the same rule as the health signal `shard.watch_window_ns`.
+#[allow(
+  clippy::manual_clamp,
+  reason = "`clamp` panics if its lower bound passes its upper; `min` then `max` cannot panic whatever the two constants \
+            become, which the no-panic rule asks of every path"
+)]
 pub fn watch_window_ns(overrun_ns: u64) -> u64 {
   overrun_ns.min(WINDOW_CEILING_NS).max(LIVENESS_BUDGET_NS)
+}
+
+/// Derived: the gap between a watcher's two looks past which its silence is taken for the process's or the host's, so
+/// a shard's still time starts again (A-474, the rule A-308 set at the window): the shard's window `window_ns` plus the
+/// watcher's own lateness p99 `watcher_late_ns` ([`LatenessTail`]), and never past A-455's ceiling
+/// ([`WINDOW_CEILING_NS`]), nor under the window. A watcher's looks come a beat apart and run late by up to its p99, so
+/// a gap that lateness explains is its own late look, over which a shard's CPU clock and its scheduler state still say
+/// whether it moved (a thread leaves the run queue for a block only by running, which the clock shows); only a gap past
+/// it is a span nothing watched. It is the bound A-467's anchor takes a gap in its own looks for a sleep at (the
+/// liveness window plus its lateness p99, capped), so both watchers attribute a gap alike. Capped, a runaway reading (two
+/// pauses among its last looks) never makes a whole host's sleep count against a shard.
+pub fn slept_past_ns(window_ns: u64, watcher_late_ns: u64) -> u64 {
+  window_ns
+    .saturating_add(watcher_late_ns)
+    .min(WINDOW_CEILING_NS.max(window_ns))
+}
+
+/// Shape: the lateness readings a watcher keeps (A-228, A-474): a hundred, the fewest whose nearest-rank p99 is a single
+/// reading, as the fleet's put-latency window keeps (`crate::fleet`, `PUT_LATENCY_SEALS`).
+pub const LATENESS_SAMPLES: usize = 100;
+/// Format: the percentile a watcher's lateness is read at, and the hundred it is out of (the p99).
+const LATENESS_PERCENTILE: usize = 99;
+const PERCENT: usize = 100;
+
+/// How late a watcher's own timed waits come back (§4.14, A-228, A-474): for each of its last [`LATENESS_SAMPLES`] waits,
+/// how much longer than its pause it took, and their p99. A machine busy enough to delay a watcher delays what it
+/// watches too, so the watchdog and the anchor each hold their judgments to their own measured lateness, never to a
+/// fixed second. Bounded: the oldest reading leaves as the newest comes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LatenessTail {
+  readings: std::collections::VecDeque<u64>,
+}
+
+impl LatenessTail {
+  /// Keeps one wait's lateness, nanoseconds past its pause.
+  pub fn record(&mut self, late_ns: u64) {
+    if self.readings.len() >= LATENESS_SAMPLES {
+      self.readings.pop_front();
+    }
+    self.readings.push_back(late_ns);
+  }
+
+  /// The p99 of the kept readings (nearest rank), zero before any.
+  pub fn p99_ns(&self) -> u64 {
+    let mut sorted: Vec<u64> = self.readings.iter().copied().collect();
+    sorted.sort_unstable();
+    let last = sorted.len().saturating_sub(1);
+    let rank = last
+      .saturating_mul(LATENESS_PERCENTILE)
+      .checked_div(PERCENT)
+      .unwrap_or(0);
+    sorted.get(rank).copied().unwrap_or(0)
+  }
+
+  /// How many readings are kept.
+  pub fn len(&self) -> usize {
+    self.readings.len()
+  }
+
+  /// Whether none is kept yet.
+  pub fn is_empty(&self) -> bool {
+    self.readings.is_empty()
+  }
 }
 
 /// The build's measured cost in the banner's words.
@@ -537,6 +605,9 @@ pub struct Look {
   pub memory: Option<StallReading>,
   /// The watchdog's clock, nanoseconds.
   pub now_ns: u64,
+  /// How late the watcher's own looks come, its measured lateness p99 ([`LatenessTail`], A-474): a gap between two
+  /// looks within the window and this is the watcher's own lateness, never a span it did not watch ([`slept_past_ns`]).
+  pub watcher_late_ns: u64,
 }
 
 impl ShardWatch {
@@ -649,14 +720,17 @@ impl ShardWatch {
     } else {
       memory.then_some(Want::Memory)
     };
-    // A look a window or more after the watchdog's last one saw nothing in between: the watchdog's own thread was kept off
-    // its CPU, as a process frozen whole or paging is, and whether the shard waited for a CPU in that gap was never asked.
-    // Its stillness there is the process's, so the shard's measures start again at this look, its still time and its time
-    // without CPU alike, and a wedge is judged only over a window the watchdog watched (A-308). Before, a fleet test binary
-    // was ended with exit 4 on a wedge verdict that came 146 s past its window, when the whole process had gone
-    // unscheduled at 0.2 to 1 GB free (g231, load 62 to 131). A stuck shard is still judged a window after the watchdog's
-    // looks come back.
-    let unwatched = look.now_ns.saturating_sub(self.looked_ns) >= window_ns;
+    // A look later than the watcher's own lateness explains, a window and its lateness p99 after its last one
+    // ([`slept_past_ns`], A-474), saw nothing in between: the watcher's own thread was kept off its CPU, as a process
+    // frozen whole or paging is, and whether the shard waited for a CPU in that gap was never asked. Its stillness there
+    // is the process's, so the shard's measures start again at this look, its still time and its time without CPU alike,
+    // and a wedge is judged only over a window the watcher watched (A-308). Before A-308, a fleet test binary was ended
+    // with exit 4 on a wedge verdict that came 146 s past its window, when the whole process had gone unscheduled at 0.2
+    // to 1 GB free (g231, load 62 to 131). A stuck shard is still judged a window after the watcher's looks come back.
+    // A gap its own lateness explains is no such span (A-474): before, A-308 took every gap of a window for one, so a
+    // watcher whose every look ran a window late restarted a wedged shard's stillness at each, and never judged it.
+    let unwatched =
+      look.now_ns.saturating_sub(self.looked_ns) >= slept_past_ns(window_ns, look.watcher_late_ns);
     let next = self.after_still_look(
       &look,
       progress,
@@ -729,7 +803,12 @@ fn run(
     }
     let now = clock.monotonic_ns();
     let late_ns = lateness.look(now);
-    let mut looks: Vec<Option<Look>> = holders.iter().map(|holder| look_at(*holder, now)).collect();
+    // How late this thread's own looks come, at their p99 (A-474): a gap they explain is no span it did not watch.
+    let watcher_late_ns = lateness.p99_ns();
+    let mut looks: Vec<Option<Look>> = holders
+      .iter()
+      .map(|holder| look_at(*holder, now, watcher_late_ns))
+      .collect();
     // Each shard's window at this look, from the overrun it measured (A-455), aligned with `holders`.
     let windows: Vec<u64> = holders
       .iter()
@@ -845,27 +924,38 @@ fn stuck_lateness_words(watch: &ShardWatch, now_ns: u64, window_ns: u64) -> Stri
 
 /// How late the watchdog's own looks run, past the beat they wait for: the thread is itself scheduled, and a busy
 /// machine delays it. Kept since the last turn that beat, so the end names the lateness of the very looks its verdict
-/// rests on (the one that last saw the shard move, and each after it), for a test to bound the end by (A-232).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// rests on (the one that last saw the shard move, and each after it), for a test to bound the end by (A-232); and over
+/// its last looks, whose p99 says which gaps are its own lateness (A-474, [`slept_past_ns`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Lateness {
   /// The last look's time on the watchdog's clock; zero before the first.
   last_look_ns: u64,
   /// The largest lateness of a look since the last beat, the beating look's own included.
   since_beat_ns: u64,
+  /// The lateness of its last looks ([`LatenessTail`]).
+  tail: LatenessTail,
 }
 
 impl Lateness {
-  /// Records a look at `now_ns` and returns how late it was: its gap from the last look past one beat.
+  /// Records a look at `now_ns` and returns how late it was: its gap from the last look past one beat. The first look
+  /// has no gap, and nothing is recorded of it.
   fn look(&mut self, now_ns: u64) -> u64 {
     let late_ns = if self.last_look_ns == 0 {
       0
     } else {
-      now_ns
+      let late_ns = now_ns
         .saturating_sub(self.last_look_ns)
-        .saturating_sub(HEARTBEAT_NS)
+        .saturating_sub(HEARTBEAT_NS);
+      self.tail.record(late_ns);
+      late_ns
     };
     self.last_look_ns = now_ns.max(1);
     late_ns
+  }
+
+  /// How late the watchdog's looks come at their p99 ([`LatenessTail::p99_ns`]).
+  fn p99_ns(&self) -> u64 {
+    self.tail.p99_ns()
   }
 
   /// Folds this look's lateness into the episode's and returns the episode's: a beating look starts the episode
@@ -978,8 +1068,9 @@ fn overrun_of(holder: SlotHolder) -> u64 {
     .unwrap_or(0)
 }
 
-/// One look at the shard `holder` names, at `now_ns`; `None` once its slot holds another registration.
-fn look_at(holder: SlotHolder, now_ns: u64) -> Option<Look> {
+/// One look at the shard `holder` names, at `now_ns`, by a watchdog whose own looks run `watcher_late_ns` late at
+/// their p99 ([`Look::watcher_late_ns`]); `None` once its slot holds another registration.
+fn look_at(holder: SlotHolder, now_ns: u64, watcher_late_ns: u64) -> Option<Look> {
   let (steps, parked) = slates_rt::registry::with_entry(holder.shard(), |entry| {
     (entry.pulse.steps(), entry.parking.parked())
   })?;
@@ -992,6 +1083,7 @@ fn look_at(holder: SlotHolder, now_ns: u64) -> Option<Look> {
     run: None,
     memory: None,
     now_ns,
+    watcher_late_ns,
   })
 }
 
@@ -1059,7 +1151,11 @@ fn read_runs(
   let readings = slates_rt::registry::shard_run_readings(&asked);
   for ((index, holder), reading) in at.into_iter().zip(asked).zip(readings) {
     if let Some(Some(look)) = looks.get_mut(index) {
-      *look = after_the_answer(*look, reading, look_at(holder, look.now_ns));
+      *look = after_the_answer(
+        *look,
+        reading,
+        look_at(holder, look.now_ns, look.watcher_late_ns),
+      );
     }
   }
 }
@@ -1196,6 +1292,7 @@ mod tests {
       run: None,
       memory: None,
       now_ns,
+      watcher_late_ns: 0,
     }
   }
 
@@ -1691,6 +1788,57 @@ mod tests {
       first_wedged,
       Some(10),
       "wedged a whole watched window after the gap, not before"
+    );
+  }
+
+  /// The first wedged verdict, and when, for a shard that steps at the first look and then stands still, blocked, its
+  /// clock still, judged at looks `gap_ns` apart by a watcher whose lateness p99 is `watcher_late_ns`; `None` if none
+  /// came within twenty looks.
+  fn wedged_at(gap_ns: u64, watcher_late_ns: u64) -> Option<(u64, Verdict)> {
+    let first = Look {
+      watcher_late_ns,
+      ..look(1, false, Some((10, 10)), TURN)
+    };
+    let (_, mut watch) = ShardWatch::default().judge(first, WINDOW, WINDOW);
+    (1..=20_u64).find_map(|n| {
+      let now_ns = TURN + n * gap_ns;
+      let (verdict, next) = watch.judge(
+        Look {
+          run: blocked(None),
+          watcher_late_ns,
+          ..look(1, false, Some((10, 10)), now_ns)
+        },
+        WINDOW,
+        WINDOW,
+      );
+      watch = next;
+      matches!(verdict, Verdict::Wedged { .. }).then_some((now_ns, verdict))
+    })
+  }
+
+  /// A-474, A-308, §4.14. Do: judge a shard that steps and then stands still, blocked, its clock still, the watcher's
+  /// every look coming a window late (a gap of a beat and a window between looks), as its own lateness p99 says (a host
+  /// that holds the watcher's thread off its CPU so); then with a runaway lateness reading (an hour) and gaps a little
+  /// past the ceiling (a host asleep). Expect: wedged at the first late look after its last movement, within its window,
+  /// a beat and the watcher's lateness; and across gaps past the ceiling, never, since nothing watched it then (A-308).
+  /// Before, A-308 took every gap of a window for a span the watcher did not watch, the shard's stillness restarted at
+  /// each late look, and the wedge was never judged.
+  #[test]
+  fn a_shard_is_judged_wedged_though_the_watchers_own_looks_run_a_window_late() {
+    let late = WINDOW;
+    let gap = TURN + late;
+    let (at, verdict) = wedged_at(gap, late)
+      .expect("the wedged shard was judged though the watcher's looks ran a window late");
+    assert!(
+      at - TURN <= WINDOW + TURN + late,
+      "judged {} ns after its last movement, past its window, a beat and the watcher's lateness ({verdict:?})",
+      at - TURN
+    );
+    let ceiling = WINDOW_CEILING_NS;
+    assert_eq!(
+      wedged_at(ceiling + TURN, 3_600 * WINDOW),
+      None,
+      "a gap past the ceiling is a span nothing watched, whatever the watcher's lateness reads"
     );
   }
 

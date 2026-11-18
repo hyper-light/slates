@@ -167,6 +167,23 @@ pub fn meta_verdict(from: FileMeta, disk: FileMeta, to: FileMeta) -> MetaVerdict
   }
 }
 
+/// The metadata a replaced file lands with (A-466), each field by [`meta_verdict`]'s rule: the volume's value where it
+/// changed the field and the disk still holds the base's; the disk's where the volume left the field as the base had it
+/// (an outsider's change kept, as bytes the volume did not change are) or already holds the volume's. None where a
+/// field the volume changed holds a third value on the disk: the file's conflict. A captured clone's replacement is
+/// staged with it, its bytes judged by their own content verdict; never a value made of two (D-27).
+pub fn landed_meta(from: FileMeta, disk: FileMeta, to: FileMeta) -> Option<FileMeta> {
+  let permissions = field(from.permissions, disk.permissions, to.permissions);
+  let windows = field(from.windows, disk.windows, to.windows);
+  match (permissions, windows) {
+    (Field::Conflict, _) | (_, Field::Conflict) => None,
+    (permissions, windows) => Some(FileMeta {
+      permissions: permissions.set().unwrap_or(disk.permissions),
+      windows: windows.set().unwrap_or(disk.windows),
+    }),
+  }
+}
+
 /// The verdict for a file whose metadata alone the volume changed (`Action::Chmod`, A-458): no file is the disk's
 /// removal (`ModifyDelete`) and anything else a type change; a file is judged field by field ([`meta_verdict`]). Its
 /// bytes are the disk's, whatever they are now, since the volume kept the base's, so the file is judged by its

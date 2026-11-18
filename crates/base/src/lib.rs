@@ -25,6 +25,7 @@
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 pub mod own_mounts;
+pub mod s3;
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]

@@ -694,18 +694,29 @@ mod tests {
     let id = vol.snapshot(&mut store).unwrap();
     let tree = vol.frozen_tree(id).unwrap();
     let at = |path: &str| held_at(&store, tree, NameEquivalence::Exact, path).unwrap();
-    assert!(matches!(at("/d/f"), Held::File { size: 4, .. }));
-    assert!(matches!(at("/d"), Held::Dir { .. }));
-    assert!(matches!(at("/"), Held::Dir { .. }));
-    assert!(matches!(at("/s"), Held::Symlink { target, .. } if &*target == "d/f"));
-    assert_eq!(at("/missing"), Held::Absent);
-    assert_eq!(at("/d/f/beneath"), Held::Absent);
+    assert_each_kind_held(&at);
     let Held::File { no, .. } = at("/d/f") else {
       panic!("/d/f is no file");
     };
     let mut bytes = [0u8; 8];
     assert_eq!(read_file(&store, tree, no, 0, &mut bytes).unwrap(), 4);
     assert_eq!(&bytes[..4], b"four");
+  }
+
+  /// The held-at test's tree read through `at`, each path as its kind: a file with its size, a directory, the root, a
+  /// symlink with its target, and nothing at a missing name or beneath a file.
+  fn assert_each_kind_held(at: &dyn Fn(&str) -> Held) {
+    assert_files_and_directories_held(at);
+    assert!(matches!(at("/s"), Held::Symlink { target, .. } if &*target == "d/f"));
+    assert_eq!(at("/missing"), Held::Absent);
+    assert_eq!(at("/d/f/beneath"), Held::Absent);
+  }
+
+  /// The held-at test's file with its size, its directory and the root, each read through `at` as its kind.
+  fn assert_files_and_directories_held(at: &dyn Fn(&str) -> Held) {
+    assert!(matches!(at("/d/f"), Held::File { size: 4, .. }));
+    assert!(matches!(at("/d"), Held::Dir { .. }));
+    assert!(matches!(at("/"), Held::Dir { .. }));
   }
 
   /// The clone's configuration: its own prefix, as every volume on a host has.

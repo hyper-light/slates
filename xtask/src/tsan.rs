@@ -45,7 +45,7 @@ const SERVER_TARGETS: [&str; 4] = [
 
 /// Shape: the tests the lane leaves out, each with why. A skipped test still runs in every other lane;
 /// only its assertion is one the instrumentation itself falsifies.
-const SKIPPED: [(&str, &str); 6] = [
+const SKIPPED: [(&str, &str); 7] = [
   (
     "region::tests::locking_a_small_region_is_reported_by_the_os_within_one_page",
     "ThreadSanitizer ignores mlock (its runtime prints `ThreadSanitizer ignores mlock/mlockall/munlock/\
@@ -74,6 +74,14 @@ const SKIPPED: [(&str, &str); 6] = [
     "it classifies each step by its measured CPU time against the quantum; under instrumentation one CI run \
      (37153112465, x86, 2026-10-03) judged an extra step unattributed (2, not 1). Not reproduced here (0 of 10 \
      instrumented, 0 of 10 plain); that the slower instrumented step crossed the quantum is the hypothesis",
+  ),
+  (
+    "a_poll_the_host_kept_off_its_cpu_is_not_its_tasks",
+    "the sibling of the entry above: it pins the shard and a spinner to one CPU and classifies each held step by \
+     its measured CPU time against the 1 ms quantum; under instrumentation main 7cc0a13a5's run 44397328424 (x86, \
+     2026-11-18) judged its three long polls one the task's, one blocked and one the host's, (1, 1, 1, 1) where it \
+     wants (0, 0, 2, 1), while e418f5cd2's run that day passed it with no runtime change between them that touches \
+     the classification; that the instrumented poll's own CPU crossed the quantum is the hypothesis",
   ),
   (
     "a_client_learns_its_wake_from_the_parks_a_reply_ended",
