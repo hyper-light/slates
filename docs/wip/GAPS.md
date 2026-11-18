@@ -7314,13 +7314,20 @@ Every phase retains its original acceptance gates plus the A-9 additions.
 | `models/Reconfig.tla` | Old {a1,a2,a3} → New {a2,a3,a4}, three records | no error (ReadSafety, NoLoss, TypeOK) | 20,478 distinct | 19 | 2026-09-04 |
 | `models/FencedRegister.tla` | 3 holders, 2 hosts, 2 epochs, 2 records per epoch | no error (TotalOrder, Continuity, StaleNeverCommits, ReadSafety, TypeOK) | 1,432,929 distinct | 27 | 2026-09-04 |
 | `models/FencedRegister.tla` | 3 holders, 2 hosts, 3 epochs, 2 records per epoch | not completed: stopped after 3 h 7 min with 83 GB of queued states on disk; needs symmetry reduction (TLC symmetry sets over Acceptors and Hosts) and a bounded record alphabet before it is feasible; the two-epoch result stands (one takeover plus a resumed stale owner) | — | — | 2026-09-04 |
+| `models/FencedRegister.tla` | `FencedRegister_2.cfg`, re-run (A-364): 3 holders, 2 hosts, 2 epochs, 2 records per epoch | no error, the same as 2026-09-04 (TLC 1.7.4, Temurin 21.0.13, `-deadlock`, 8 workers, Mac Studio, 1 min 16 s) | 1,432,929 distinct | 27 | 2026-11-18 |
+| `models/Reconfig.tla` | `Reconfig.cfg`, re-run (A-364) | no error, the same as 2026-09-04 (1 s) | 20,478 distinct | 19 | 2026-11-18 |
+| `models/FencedLedger.tla` | `FencedLedger.cfg` (A-364): 3 holders, 2 hosts, 2 epochs, 2 positions, 2 values, per-position adoption | no error (TypeOK, Agreement, Continuity, AdoptedIsPrefix, StaleNeverCommits, ReadSafety; 2 min 11 s) | 2,683,673 distinct | 27 | 2026-11-18 |
+| `models/FencedLedger.tla` | `FencedLedger_register.cfg` (A-364): the same under the register's rule, the highest record alone (the server's round before the record half) | Continuity violated, as it must be (non-vacuity): the adopted log lacks a committed lower position | 29,623 distinct at the violation | 14 | 2026-11-18 |
 
 The models are architecture artifacts, not CI jobs. These historical runs apply only to the
 listed models and configurations. The Rust simulations are evidence with known gaps, not a
 proof or established refinement (BUG-12/13). A-9 corrects §4.8; refinement/revalidation remains
-owed before GAP-A9-7 closes. Running a checker requires separate explicit tooling authorization;
-none ran for A-9. Any authorized rerun must bound work and keep state outside the project tree: TLC's disk-backed state queue otherwise lands in `docs/wip/models/states`, which
-is what happened on 2026-09-04 (83 GB, removed).
+owed before GAP-A9-7 closes. Model checking is allowed since 2026-11-18 (CLAUDE.md §2 item 13 removed): the
+re-runs and `FencedLedger` above ran with a user-space JDK and `tla2tools.jar` under `~/.cache` on the runner, each
+bounded, its state queue outside the project tree (`-metadir`): TLC's disk-backed state queue otherwise lands in
+`docs/wip/models/states`, which is what happened on 2026-09-04 (83 GB, removed). The command, from a copy of the models:
+`java -XX:+UseParallelGC -Xmx12g -cp tla2tools.jar tlc2.TLC -workers 8 -deadlock -cleanup -metadir <outside> -config
+<cfg> <spec>.tla` (`-deadlock` because each model's runs end: bounded epochs and records).
 
 Two modelling bugs were found and fixed before the runs passed: the first draft let an owner issue two
 different records for one sequence number (a model error, not a design error), and its Fencing
@@ -17557,7 +17564,18 @@ suite on adacachy2 and 1 of 3 of the stack's (the supervisor's gate); alone it p
   (`slates-server --lib` 266 of 266, macOS arm64, 2026-11-18).
 - **Open, the record half (GAP-A9-7):** a successor whose own records end two or more versions below the adopted one
   lacks the intermediate records themselves (phase one reports each holder's highest record only), which no fetch by
-  identity can fill; it is still given up `chain` at the bound.
+  identity can fill; it is still given up `chain` at the bound. **Modelled (A-364, g250, 2026-11-18):**
+  `docs/wip/models/FencedLedger.tla` adopts a ledger position by position, as §4.8 states it, and TLC finds no error at
+  two epochs (2,683,673 distinct states; Agreement, Continuity, AdoptedIsPrefix, StaleNeverCommits, ReadSafety), while
+  the register's rule, the highest record alone, fails Continuity (the model table below). Owed, the build (g250): the
+  successor's green materialization, finding positions between its own highest record and the adopted version unknown
+  here (`merge_service::unheld_green_inputs` answering none), asks the members of the green's recovery cohorts for the
+  positions in that range under the round's epoch (a holder promises the object, raising its fence, and reports each
+  accepted position with its epoch), adopts at each position the record accepted under the highest epoch among a
+  recovery quorum of each cohort, re-commits each under its own epoch (phase-two acceptance at a new epoch records that
+  epoch, BUG-12), and then gathers the chain; holders already keep a ledger's every position (`Acceptor::accepted`,
+  never compacted for a merge chain). The takeover's share stays open while the green is pending (A-345's
+  `takeover::materializing`), so its holders still authorize the question.
 
 ### 2026-11-07: a daemon killed inside its profile's republication refused every successor — fixed
 
