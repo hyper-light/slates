@@ -32232,7 +32232,9 @@ a field test; `src/manifest_vectors.txt`, new: the published vectors; `src/lib.r
   fallback tick kept.
 - **Tests.** `a_beat_is_late_against_the_shards_own_window` (`crates/server/src/daemon.rs`: a quiet shard, one held two
   and a half windows, and a runaway reading).
-- EVIDENCE_A470
+- **Evidence.** Built and run on the Mac Studio (kiln r411, 2026-11-18, load 8.5-13.8, debug build): `cargo test
+  --locked -p slates-server --lib -- late_beat watchdog` 28 of 28. Red-checked once with the old rule, the line at half
+  the bare liveness window: a gap of three fifths of a window on a shard held two and a half windows was late.
 
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry), `crates/server/src/daemon.rs`, and
 `docs/bugs/2026-11-18-the-anchor-never-found-a-wedged-daemon-once-its-own-waits-ran-a-window-late.md` (A-467's bug,
