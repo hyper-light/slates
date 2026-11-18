@@ -2219,6 +2219,16 @@ pub(crate) fn catalog_placed(state: &mut ShardState, catalog: ObjectId) {
 /// owed at a checkpoint the holder already holds cannot move it, so instead the volume is marked to owe a fresh whole
 /// record (its next publication or the period appends one, and the install is made from that).
 fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
+  // A superseded owner ships nothing more of the volume it lost (A-349): every holder refuses its log `StaleEpoch`, and
+  // each send held that holder's record session for an exchange that could never land. Until 2026-11-18 the record
+  // period sent the entries a holder lacked again every period: an owner admitted again after its takeover had its
+  // sessions out on that loan at the start of every period, where its own takeover round of another departure met
+  // them, never asked the other survivor and gave up two objects within tolerance (the chaos nemesis, seed
+  // 6876545201569229162: `fleet.live.install_built` about 2,240 after its fence, `fleet.takeover.pages_unsent` 213 to
+  // 928).
+  if fenced(state, volume).is_some() {
+    return Vec::new();
+  }
   if !holders_placed(state, volume) {
     return Vec::new();
   }
@@ -2447,21 +2457,19 @@ pub(crate) fn holder_reached(holder: HostId) {
 }
 
 /// Walks `shard`'s live volumes for `holder`'s return a turn at a time ([`reached_slice`]), from a task of the control
-/// shard (`origin`), each turn awaited within the live exchange's longest budget. Bounded: a turn always moves the walk
+/// shard (`origin`), each turn awaited within the live exchange's longest budget and a turn of the shard of its own,
+/// the control shard's too ([`crate::xshard::Turns`]). Bounded: a turn always moves the walk
 /// on, the volumes are the shard's, and a turn the shard does not answer within its budget ends the walk (the record
 /// period sends the holder what it lacks then). Detached by [`holder_reached`]: nothing joins it, and its slot is reaped
 /// when it ends.
 async fn reached_walk(origin: u16, shard: u16, holder: HostId) {
   let deadline = crate::fleet::live_budget().max_deadline_ns();
+  let mut turns = crate::xshard::Turns::new(origin, shard);
   let mut after = None;
   loop {
-    let next = crate::xshard::call_within(
-      origin,
-      shard,
-      move |s| reached_slice(s, holder, after),
-      deadline,
-    )
-    .await;
+    let next = turns
+      .call(move |s| reached_slice(s, holder, after), deadline)
+      .await;
     match next {
       Some(Some(last)) => after = Some(last),
       _ => break,
@@ -2981,29 +2989,30 @@ const LIVE_PERIODS: &str = "fleet.live.periods";
 
 /// The record period's turn on `shard` (run from the control shard): re-ships what each holder of each live volume
 /// there still lacks, so a lost message or a holder that was away is caught up without waiting for the next write.
-/// The volumes are visited in slices, each one turn of the owner shard of about a step quantum ([`period_slice`]), so a
-/// shard owning many live volumes is never held for all of them in one turn (CLAUDE.md "Bounded work everywhere"):
+/// The volumes are visited in slices, each one turn of the owner shard of about a step quantum ([`period_slice`]) and a
+/// turn of its own, the control shard's too ([`crate::xshard::Turns`]), so a shard owning many live volumes is never
+/// held for all of them in one turn (CLAUDE.md "Bounded work everywhere"):
 /// until 2026-11-17 one turn visited every one, a cost that grew with the volumes the shard owned while every client
 /// of the shard waited behind it.
 pub(crate) async fn period(origin: u16, shard: u16) {
   drain_stragglers();
   let deadline = crate::fleet::live_budget().max_deadline_ns();
+  let mut turns = crate::xshard::Turns::new(origin, shard);
   let mut after = None;
   let mut first = true;
   loop {
     let counted = std::mem::take(&mut first);
-    let next = crate::xshard::call_within(
-      origin,
-      shard,
-      move |s| {
-        if counted {
-          s.count(LIVE_PERIODS, 1);
-        }
-        period_slice(s, after)
-      },
-      deadline,
-    )
-    .await;
+    let next = turns
+      .call(
+        move |s| {
+          if counted {
+            s.count(LIVE_PERIODS, 1);
+          }
+          period_slice(s, after)
+        },
+        deadline,
+      )
+      .await;
     match next {
       Some(Some(last)) => after = Some(last),
       _ => break,
@@ -3052,6 +3061,12 @@ fn period_slice(s: &mut ShardState, after: Option<[u8; 16]>) -> Option<[u8; 16]>
 /// The period's visit to one live volume: follows its candidates, retries holders whose last lane went unanswered,
 /// answers writers whose wait a condition met, and owes or ships the whole record or image it is due.
 fn period_volume(s: &mut ShardState, volume: [u8; 16]) {
+  // A superseded owner's log does no more period work (A-349): no holder takes it ([`pending_sends`]), its writers were
+  // refused when it learned its fence ([`learn_superseded`]), and following its candidates would record a holder set,
+  // or make a whole record or an image, for a volume that is not its own any more.
+  if fenced(s, volume).is_some() {
+    return;
+  }
   let id = slates_db::catalog::VolumeId { bytes: volume };
   follow_candidates(s, volume);
   // The period is what retries a holder whose last lane went unanswered ([`LiveVolume::unreachable`]).
