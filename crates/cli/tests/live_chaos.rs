@@ -41,6 +41,12 @@
 //! ([`Fleet::start_relayed`]): each node advertises a port block the relay owns and binds its own (the manifest's `bind`,
 //! A-277), with no privilege, where T-8.7 named iptables or pf, which R10 rules out. Every relayed flow prints its seed.
 //!
+//! The nemesis ([`a_seeded_nemesis_of_single_faults_keeps_every_register_invariant`]) draws a schedule of single faults
+//! from its seed (every path lossy, a node slowed, one link severed, or a node stopped, cut off, deafened or muted, the
+//! owner struck as often as a candidate, and once a run until it is taken over) and waits for the fleet to recover
+//! whole between them, so no cohort loses two members; it ends with every invariant above, Continuity judged from the
+//! samples since its takeovers are unscheduled ([`continuity_in_samples`]).
+//!
 //! Each flow prints the client-seen latency of its writes (p50, p99, p999, max). The fleet helpers are copies of
 //! `live_fleet.rs`'s (where they are private), extended with anchored nodes, so a daemon can be killed and succeeded.
 //! Gated like the other process flows (`SLATES_TEST_CLI=1`). Never run with a kernel NFS mount of these daemons live:
@@ -68,7 +74,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use relay::{PathRule, Relay, RelayedNode};
+use relay::{Draws, PathRule, Relay, RelayedNode};
 use slates_client::{Client, ClientError, Deadlines, Intent, ReadAt, Refusal, VolumeId};
 
 /// Shape: how long a fleet step may take on a loaded box: the formation wait of the process flows.
@@ -1719,17 +1725,18 @@ fn read_everywhere(
   read_everywhere_during(fleet, volume, newest, began, || {})
 }
 
-/// ReadSafety over the reads a flow sent through every node (`instances`) while its `owner` served throughout (goal g229;
-/// AC-8.1's ReadSafety, `docs/wip/models/FencedRegister.tla`), against the stream's `outcomes`. Expect: every read sent
-/// after its write's acknowledgement answered that write or a refusal, never other bytes and never missing
-/// ([`read_safety`]): a candidate forwards a latest-state read to the owner, so none may answer from its own copy,
-/// however its partition made it judge the owner; at least one read judged through every node, so reads that all came
-/// before any acknowledgement, or only of writes refused, cannot pass for a held invariant (the non-vacuity count); and
-/// every judged read through the owner answered with its write, since an owner whose lease one healthy candidate
-/// confirms serves its latest state (§4.8 "Leases and reads": `min(f, others)` confirmations, one of two at `f = 1`).
+/// ReadSafety over the reads a flow sent through every node (`instances`), against the stream's `outcomes` (goal g229;
+/// AC-8.1's ReadSafety, `docs/wip/models/FencedRegister.tla`). Expect: every read sent after its write's
+/// acknowledgement answered that write or a refusal, never other bytes and never missing ([`read_safety`]): a candidate
+/// forwards a latest-state read to the owner, so none may answer from its own copy, however its partition made it judge
+/// the owner; and at least one read judged through every node, so reads that all came before any acknowledgement, or
+/// only of writes refused, cannot pass for a held invariant (the non-vacuity count). With `owner` named (an owner that
+/// served throughout), every judged read through it answered with its write too, since an owner whose lease one healthy
+/// candidate confirms serves its latest state (§4.8 "Leases and reads": `min(f, others)` confirmations, one of two at
+/// `f = 1`).
 fn judge_reads(
   verdict: &mut Verdict,
-  (owner, instances): (&str, &[String]),
+  (owner, instances): (Option<&str>, &[String]),
   probes: &[ReadProbe],
   outcomes: &[Outcome],
 ) {
@@ -1765,14 +1772,16 @@ fn judge_reads(
     read_safety(probes, outcomes),
   );
   verdict.check("ReadSafety judged a read through every node", unjudged);
-  verdict.check(
-    "the owner answered every read",
-    judged_reads
-      .iter()
-      .filter(|probe| probe.through == owner && probe.answer != ReadAnswer::Current)
-      .map(|probe| probe.to_string())
-      .collect(),
-  );
+  if let Some(owner) = owner {
+    verdict.check(
+      "the owner answered every read",
+      judged_reads
+        .iter()
+        .filter(|probe| probe.through == owner && probe.answer != ReadAnswer::Current)
+        .map(|probe| probe.to_string())
+        .collect(),
+    );
+  }
 }
 
 /// What a takeover owes beyond NoLoss and the fences, judged from outside the processes (goal g229; AC-8.1's Continuity
@@ -2407,7 +2416,12 @@ fn candidates_partitioned_in_turn(tag: &str, flow: &'static str, partition: Part
     "no takeover while the owner served (a partitioned candidate deposes no one)",
     no_takeover(&owner, &candidates, &volume, epoch_before.unwrap_or(0)),
   );
-  judge_reads(&mut verdict, (&owner, &fleet.instances), &probes, &outcomes);
+  judge_reads(
+    &mut verdict,
+    (Some(&owner), &fleet.instances),
+    &probes,
+    &outcomes,
+  );
   if let Some(relay) = &fleet.relay {
     verdict.note(relay.report().summary());
   }
@@ -2591,7 +2605,12 @@ fn writes_stream_through_random_candidate_stalls() {
     &outcomes,
     &samples,
   );
-  judge_reads(&mut verdict, (&owner, &fleet.instances), &probes, &outcomes);
+  judge_reads(
+    &mut verdict,
+    (Some(&owner), &fleet.instances),
+    &probes,
+    &outcomes,
+  );
   drop(fleet);
   verdict.judge();
 }
@@ -4529,6 +4548,28 @@ fn light_loss() -> PathRule {
   }
 }
 
+/// The lossy profiles, by name, mildest first: the light profile ([`light_loss`]); its hold losing 5 %; and its hold
+/// losing 1 % with 2 % duplicated.
+fn lossy_profiles() -> [(&'static str, PathRule); 3] {
+  [
+    ("1 % lost", light_loss()),
+    (
+      "5 % lost",
+      PathRule {
+        loss_ppm: HEAVY_LOSS_PPM,
+        ..light_loss()
+      },
+    ),
+    (
+      "1 % lost, 2 % duplicated",
+      PathRule {
+        duplicate_ppm: DUPLICATE_PPM,
+        ..light_loss()
+      },
+    ),
+  ]
+}
+
 /// A-200 over lossy, delayed paths (goal g229; AC-8.1 and AC-8.2's invariants across real processes; the fault relay,
 /// A-277): do stream writes to a live volume while every path of the fleet holds each datagram 20 ms ± 5 ms one way and
 /// loses 1 % of them, then 5 %, then 1 % with 2 % duplicated, reading the newest acknowledged writes through every node
@@ -4557,23 +4598,7 @@ fn writes_stream_through_lossy_paths_and_a_takeover_over_them_loses_nothing() {
     0..STREAM_FILES,
     |began, newest| {
       let relay = fleet.relay();
-      for (phase, rule) in [
-        ("1 % lost", light_loss()),
-        (
-          "5 % lost",
-          PathRule {
-            loss_ppm: HEAVY_LOSS_PPM,
-            ..light_loss()
-          },
-        ),
-        (
-          "1 % lost, 2 % duplicated",
-          PathRule {
-            duplicate_ppm: DUPLICATE_PPM,
-            ..light_loss()
-          },
-        ),
-      ] {
+      for (phase, rule) in lossy_profiles() {
         relay.shape_all(rule);
         verdict.note(format!(
           "every path held {LOSSY_HOLD:?} ± {LOSSY_SPREAD:?}, {phase}, from {:?}",
@@ -4595,7 +4620,12 @@ fn writes_stream_through_lossy_paths_and_a_takeover_over_them_loses_nothing() {
     &outcomes,
     &samples,
   );
-  judge_reads(&mut verdict, (&owner, &fleet.instances), &probes, &outcomes);
+  judge_reads(
+    &mut verdict,
+    (Some(&owner), &fleet.instances),
+    &probes,
+    &outcomes,
+  );
   fleet.relay().shape_all(light_loss());
   // The owner's last word before its loss, for Continuity: what it held durable then.
   let last_look = live_states(&owner, &volume).unwrap_or_default();
@@ -4643,6 +4673,15 @@ const SLOW_SPREAD: Duration = Duration::from_millis(50);
 /// Shape: the durable writes made while one candidate is slow: four chaos events' worth.
 const SLOW_WRITES: u64 = 4 * BETWEEN_EVENTS;
 
+/// The rule on every path to and from a slow node: each datagram held [`SLOW_HOLD`] ± [`SLOW_SPREAD`].
+fn slow_path() -> PathRule {
+  PathRule {
+    delay: SLOW_HOLD,
+    jitter: SLOW_SPREAD,
+    ..PathRule::default()
+  }
+}
+
 /// A-200 and AC-8.12's straggler immunity across real processes (goal g229, injected latency on one replica; T-8.3's
 /// slow candidate, whose probation half is not built): do stream writes to a live volume, then hold every datagram to and
 /// from one candidate 200 ms ± 50 ms each way for [`SLOW_WRITES`] durable writes, reading the newest acknowledged writes
@@ -4671,14 +4710,7 @@ fn writes_stream_past_a_slow_candidate_without_waiting_for_it() {
     0..STREAM_FILES,
     |began, newest| {
       after_writes(&owner, &volume, BETWEEN_EVENTS);
-      fleet.relay().shape_node(
-        slow,
-        PathRule {
-          delay: SLOW_HOLD,
-          jitter: SLOW_SPREAD,
-          ..PathRule::default()
-        },
-      );
+      fleet.relay().shape_node(slow, slow_path());
       let from = began.elapsed();
       let mut to = from;
       probes.extend(read_everywhere_during(
@@ -4714,7 +4746,12 @@ fn writes_stream_past_a_slow_candidate_without_waiting_for_it() {
     &outcomes,
     &samples,
   );
-  judge_reads(&mut verdict, (&owner, &fleet.instances), &probes, &outcomes);
+  judge_reads(
+    &mut verdict,
+    (Some(&owner), &fleet.instances),
+    &probes,
+    &outcomes,
+  );
   verdict.note(fleet.relay().report().summary());
   drop(fleet);
   verdict.judge();
@@ -5122,5 +5159,520 @@ fn an_owner_no_peer_hears_while_it_hears_them_all_is_superseded_and_serves_nothi
     "muted",
     "an owner no peer hears while it hears them all",
     Partition::Muted,
+  );
+}
+
+// ── The nemesis: a seeded schedule of single faults across real processes (goal g229) ───────────────────────────────
+
+/// Shape: the faults one nemesis run applies, one at a time: enough that each of the seven kinds of fault is drawn
+/// about twice a run, few enough that a run stays within minutes.
+const NEMESIS_FAULTS: usize = 14;
+/// Shape: the shortest drawn fault: a blip under the membership horizon (900 ms), which no node may act on.
+const FAULT_MIN: Duration = Duration::from_millis(200);
+/// Shape: the longest drawn fault: past detection and the death-confirmation window (about 2 s together, A-129), so a
+/// partitioned owner may be taken over meanwhile, and a fault may end while its takeover runs.
+const FAULT_MAX: Duration = Duration::from_secs(4);
+/// Shape: the partitions a nemesis draws from, each as likely.
+const PARTITIONS: [Partition; 4] = [
+  Partition::Stopped,
+  Partition::Isolated,
+  Partition::Deafened,
+  Partition::Muted,
+];
+/// Shape: the faults on paths a nemesis draws from beside the partitions: every path lossy, one node slowed, or one
+/// link severed.
+const PATH_FAULTS: u64 = 3;
+
+/// Whom a nemesis fault strikes, resolved against the volume's owner when the fault begins, since a takeover moves it.
+#[derive(Clone, Copy, Debug)]
+enum Target {
+  /// The node that ships the volume then.
+  Owner,
+  /// One of the owner's candidates then, by its rank among the other nodes.
+  Candidate(usize),
+}
+
+/// One link between two nodes, resolved against the volume's owner when the fault begins.
+#[derive(Clone, Copy, Debug)]
+enum Link {
+  /// Between the owner and one of its candidates, by its rank among the other nodes.
+  OwnerAnd(usize),
+  /// Between the owner's two candidates.
+  Candidates,
+}
+
+/// One fault of a nemesis schedule.
+#[derive(Clone, Copy, Debug)]
+enum Fault {
+  /// Every path of the fleet held and lossy, as one of [`lossy_profiles`] has it.
+  Lossy(PathRule),
+  /// One node's every path held as [`slow_path`] has it.
+  Slow(Target),
+  /// One link cut both ways while every other path carries on: the two ends cannot hear each other, and each still
+  /// hears the third node, which hears both (a partition that is not transitive).
+  Severed(Link),
+  /// One node partitioned for the drawn length: an owner may be taken over meanwhile, or not yet.
+  Partitioned(Target, Partition),
+  /// The owner partitioned until a survivor has taken its volume over, then half the drawn length more: one a run, so
+  /// every run judges a takeover.
+  Superseded(Partition),
+}
+
+impl Fault {
+  /// The nodes this fault strikes while `owner` owns the volume: none for a fault on every path, two for a link.
+  fn nodes(self, fleet: &Fleet, owner: usize) -> Vec<usize> {
+    let others = fleet.others(owner);
+    let candidate = |rank: usize| others[rank % others.len()];
+    match self {
+      Fault::Lossy(_) => Vec::new(),
+      Fault::Slow(Target::Owner) | Fault::Partitioned(Target::Owner, _) | Fault::Superseded(_) => {
+        vec![owner]
+      }
+      Fault::Slow(Target::Candidate(rank)) | Fault::Partitioned(Target::Candidate(rank), _) => {
+        vec![candidate(rank)]
+      }
+      Fault::Severed(Link::OwnerAnd(rank)) => vec![owner, candidate(rank)],
+      Fault::Severed(Link::Candidates) => others.clone(),
+    }
+  }
+
+  /// Begins this fault on `nodes` ([`Fault::nodes`]).
+  fn begin(self, fleet: &Fleet, nodes: &[usize]) {
+    match (self, nodes) {
+      (Fault::Lossy(rule), _) => fleet.relay().shape_all(rule),
+      (Fault::Slow(_), [node]) => fleet.relay().shape_node(*node, slow_path()),
+      (Fault::Severed(_), [one, other]) => {
+        fleet.relay().rule(*one, *other, PathRule::CUT);
+        fleet.relay().rule(*other, *one, PathRule::CUT);
+      }
+      (Fault::Partitioned(_, partition) | Fault::Superseded(partition), [node]) => {
+        partition.begin(fleet, *node);
+      }
+      _ => {}
+    }
+  }
+
+  /// Ends this fault: the node resumed, or every path healed.
+  fn end(self, fleet: &Fleet, nodes: &[usize]) {
+    match (self, nodes) {
+      (Fault::Partitioned(_, partition) | Fault::Superseded(partition), [node]) => {
+        partition.end(fleet, *node);
+      }
+      _ => fleet.relay().heal(),
+    }
+  }
+}
+
+/// A fault and how long it is held: a [`Fault::Superseded`] is held until its takeover and half its length more.
+#[derive(Clone, Copy, Debug)]
+struct Planned {
+  fault: Fault,
+  length: Duration,
+}
+
+/// A nemesis schedule of `count` faults drawn from `draws`: each of the four partitions and the three path faults as
+/// likely, a struck node as likely the owner as either candidate (a severed link the owner's to either candidate as
+/// likely as the candidates' own), each length within [`FAULT_MIN`]–[`FAULT_MAX`]; and one drawn position made the
+/// owner's supersession, so each run takes the volume over at least once.
+fn nemesis_schedule(draws: &mut Draws, count: usize) -> Vec<Planned> {
+  let nodes = u64::try_from(FLEET_NODES.len()).unwrap();
+  let partitions = u64::try_from(PARTITIONS.len()).unwrap();
+  let rank = |pick: u64| usize::try_from(pick - 1).unwrap();
+  let target = |draws: &mut Draws| match draws.below(nodes) {
+    0 => Target::Owner,
+    pick => Target::Candidate(rank(pick)),
+  };
+  let link = |draws: &mut Draws| match draws.below(nodes) {
+    0 => Link::Candidates,
+    pick => Link::OwnerAnd(rank(pick)),
+  };
+  let mut schedule: Vec<Planned> = (0..count)
+    .map(|_| {
+      let fault = match draws.below(PATH_FAULTS + partitions) {
+        0 => {
+          let profiles = lossy_profiles();
+          let pick = draws.below(u64::try_from(profiles.len()).unwrap());
+          Fault::Lossy(profiles[usize::try_from(pick).unwrap()].1)
+        }
+        1 => Fault::Slow(target(draws)),
+        2 => Fault::Severed(link(draws)),
+        partition => Fault::Partitioned(
+          target(draws),
+          PARTITIONS[usize::try_from(partition - PATH_FAULTS).unwrap()],
+        ),
+      };
+      Planned {
+        fault,
+        length: draws.within(FAULT_MIN, FAULT_MAX),
+      }
+    })
+    .collect();
+  let at = usize::try_from(draws.below(u64::try_from(count).unwrap())).unwrap();
+  let partition = PARTITIONS[usize::try_from(draws.below(partitions)).unwrap()];
+  if let Some(planned) = schedule.get_mut(at) {
+    planned.fault = Fault::Superseded(partition);
+  }
+  schedule
+}
+
+/// The node that ships `volume` under the highest fence, its owner, once exactly one does at that fence (two at one
+/// fence would be two owners of one epoch), within each fleet wait judged by progress.
+fn wait_one_owner(fleet: &Fleet, volume: &str) -> usize {
+  let mut window = FrozenWindow::new();
+  loop {
+    let shipping: Vec<(usize, u64)> = (0..fleet.instances.len())
+      .filter_map(|index| {
+        live_states(&fleet.instances[index], volume)
+          .unwrap_or_default()
+          .into_iter()
+          .find(|state| !state.holding)
+          .map(|state| (index, state.fence))
+      })
+      .collect();
+    let top = shipping.iter().map(|(_, fence)| *fence).max();
+    let at_top: Vec<usize> = shipping
+      .iter()
+      .filter(|(_, fence)| Some(*fence) == top)
+      .map(|(index, _)| *index)
+      .collect();
+    if let [owner] = at_top.as_slice() {
+      return *owner;
+    }
+    assert!(
+      window.moving(&format!("{shipping:?}")),
+      "one node shipped the volume at the highest fence, or the shippers kept changing, within each fleet wait: \
+       (node, fence) {shipping:?}\n{}",
+      diagnosis(&fleet.instances, volume)
+    );
+    pause();
+  }
+}
+
+/// Waits until every node but `owner` holds a copy of `volume` fenced at the owner's epoch or above, at or past the
+/// head the owner had made durable when the wait began: a copy a fault left behind catches up by the entries after it
+/// or by an install. Judged by progress over the copies still behind, so one stuck copy is not hidden by another's
+/// moving.
+fn wait_caught_up(fleet: &Fleet, owner: usize, volume: &str) {
+  let (fence, target) = live_states(&fleet.instances[owner], volume)
+    .unwrap_or_default()
+    .into_iter()
+    .find(|state| !state.holding)
+    .map_or((0, 0), |state| (state.fence, state.durable.unwrap_or(0)));
+  let mut window = FrozenWindow::new();
+  loop {
+    let behind: Vec<(String, Option<(u64, Option<u64>)>)> = fleet
+      .others(owner)
+      .into_iter()
+      .map(|index| {
+        let copy = live_states(&fleet.instances[index], volume)
+          .unwrap_or_default()
+          .into_iter()
+          .find(|state| state.holding)
+          .map(|state| (state.fence, state.head));
+        (fleet.instances[index].clone(), copy)
+      })
+      .filter(|(_, copy)| {
+        !copy.is_some_and(|(copy_fence, head)| {
+          copy_fence >= fence && head.is_some_and(|head| head >= target)
+        })
+      })
+      .collect();
+    if behind.is_empty() {
+      return;
+    }
+    assert!(
+      window.moving(&format!("{behind:?}")),
+      "every copy caught up to {}'s durable head {target} at fence {fence}, or the copies behind kept moving, within \
+       each fleet wait: (node, (fence, head)) {behind:?}\n{}",
+      fleet.instances[owner],
+      diagnosis(&fleet.instances, volume)
+    );
+    pause();
+  }
+}
+
+/// Waits until the fleet has recovered whole from a nemesis fault, so the next is the only one (two faults in one
+/// cohort are past `f`): every member seated and holding the whole configuration, no voter change in flight, every node
+/// settled at its neighbourhood, one node shipping the volume, and every other copy caught up ([`wait_caught_up`]).
+/// The owner's index.
+fn wait_recovered(fleet: &Fleet, volume: &str) -> usize {
+  wait_settled(&fleet.instances, fleet.instances.len());
+  wait_council_seated(&fleet.instances);
+  wait_neighbourhood_settled(&fleet.instances);
+  let owner = wait_one_owner(fleet, volume);
+  wait_caught_up(fleet, owner, volume);
+  owner
+}
+
+/// The survivor among `survivors` that took `volume` over from an owner that shipped it under `fence`, once one has,
+/// within the fleet wait, and after how long: it counted more takeovers than it had before the owner was partitioned
+/// (`counted`, one count a survivor), or it ships under a higher fence. A successor counts its rebuild at once but ships
+/// only from its next publication, which may wait for the partition's end when the stream's node is the old owner.
+/// Unlike [`wait_taken_over`], a survivor that took the volume over earlier in the run, or still ships it under an
+/// earlier fence, is not taken for the successor.
+fn wait_taken_over_again<'a>(
+  survivors: &[&'a str],
+  volume: &str,
+  (fence, counted): (u64, &[u64]),
+) -> Option<(&'a str, Duration)> {
+  let began = Instant::now();
+  while began.elapsed() < FLEET_WAIT {
+    if let Some((successor, _)) = survivors.iter().zip(counted).find(|(survivor, before)| {
+      counter(survivor, "fleet.live.taken_over") > **before
+        || serving_epoch(survivor, volume) > fence
+    }) {
+      return Some((*successor, began.elapsed()));
+    }
+    pause();
+  }
+  None
+}
+
+/// What one nemesis fault did.
+struct Strike {
+  /// What it was, whom it struck and when, for the verdict's notes.
+  line: String,
+  /// The reads sent while it lasted.
+  probes: Vec<ReadProbe>,
+  /// For a supersession: whether a survivor took the volume over within the fleet wait.
+  taken_over: Option<bool>,
+}
+
+/// Applies `planned` to `fleet`, its target resolved against the volume's owner now: begins it, holds it half its
+/// length (a supersession: until a survivor has taken the volume over), reads the stream's newest acknowledged writes
+/// (`newest`) through every node while it holds the second half, then ends it ([`read_everywhere_during`]).
+fn strike(
+  fleet: &Fleet,
+  volume: &str,
+  planned: Planned,
+  (began, newest): (&Instant, &NewestAcknowledged),
+) -> Strike {
+  let owner = wait_one_owner(fleet, volume);
+  let nodes = planned.fault.nodes(fleet, owner);
+  let half = planned.length / 2;
+  // Before the fault, what a supersession's successor must move past: the owner's fence and each survivor's count.
+  let candidates = candidates_of(fleet, owner);
+  let survivors: Vec<&str> = candidates.iter().map(String::as_str).collect();
+  let fence = serving_epoch(&fleet.instances[owner], volume);
+  let counted: Vec<u64> = survivors
+    .iter()
+    .map(|survivor| counter(survivor, "fleet.live.taken_over"))
+    .collect();
+  planned.fault.begin(fleet, &nodes);
+  let from = began.elapsed();
+  let taken = if let Fault::Superseded(_) = planned.fault {
+    Some(
+      wait_taken_over_again(&survivors, volume, (fence, &counted))
+        .map(|(successor, took)| format!("{successor} after {took:?}")),
+    )
+  } else {
+    sleep(half);
+    None
+  };
+  let mut to = from;
+  let probes = read_everywhere_during(fleet, volume, newest, began, || {
+    sleep(half);
+    planned.fault.end(fleet, &nodes);
+    to = began.elapsed();
+  });
+  let struck = if nodes.is_empty() {
+    "every path".to_owned()
+  } else {
+    nodes
+      .iter()
+      .map(|node| fleet.instances[*node].as_str())
+      .collect::<Vec<_>>()
+      .join(" and ")
+  };
+  let mut line = format!("{:?} on {struck} from {from:?} to {to:?}", planned.fault);
+  if let Some(taken) = &taken {
+    line.push_str(&format!(
+      "; taken over by {}",
+      taken
+        .as_deref()
+        .unwrap_or("no survivor within the fleet wait")
+    ));
+  }
+  Strike {
+    line,
+    probes,
+    taken_over: taken.map(|taken| taken.is_some()),
+  }
+}
+
+/// Continuity from the samples alone, for a flow whose takeovers are many and unscheduled (the nemesis;
+/// `docs/wip/models/FencedRegister.tla`): every head an owner shipped under fence `e` is at or past every position an
+/// owner reported durable under a fence below `e`. A successor's log goes on from the head its takeover adopted
+/// (`slates_db::live::Shipper::new`), which is at or past every such position, and its head only grows, so this never
+/// fails falsely; it catches an adoption below what was durable whenever a sample shows the successor's head before
+/// its writes carry it past. The violations.
+fn continuity_in_samples(samples: &[Sample]) -> Vec<String> {
+  let mut durable_at: BTreeMap<u64, u64> = BTreeMap::new();
+  for sample in samples.iter().filter(|sample| !sample.state.holding) {
+    if let Some(durable) = sample.state.durable {
+      let most = durable_at.entry(sample.state.fence).or_default();
+      *most = (*most).max(durable);
+    }
+  }
+  samples
+    .iter()
+    .filter(|sample| !sample.state.holding)
+    .filter_map(|sample| {
+      let fence = sample.state.fence;
+      let durable_before = durable_at.range(..fence).map(|(_, durable)| *durable).max()?;
+      let head = sample.state.head?;
+      (head < durable_before).then(|| {
+        format!(
+          "node {} shipped head {head} under fence {fence} at {:?}, below position {durable_before} made durable \
+           under an earlier fence",
+          sample.node, sample.at
+        )
+      })
+    })
+    .collect()
+}
+
+/// A-200 under a seeded nemesis (goal g229: injected latency and loss, replicas and owners offline, every register
+/// invariant; T-8.1 and T-8.7's partitions across real processes, one at a time). Do: stream writes to a live volume
+/// through one node of a relayed fleet while [`NEMESIS_FAULTS`] single faults drawn from the flow's seed
+/// ([`nemesis_schedule`]; `SLATES_CHAOS_SEED` replays it) strike one at a time: every path lossy and held, a node
+/// slowed, one link severed, or a node (the owner as likely as either candidate) stopped, cut off, deafened or muted,
+/// each for [`FAULT_MIN`]–[`FAULT_MAX`], and once a run the owner partitioned until it is taken over; read through
+/// every node while each lasts; end it; and wait for the fleet to recover whole ([`wait_recovered`]) and for the
+/// stream, forwarded once another node owns the volume, to make more writes durable before the next. Expect, across
+/// every takeover the schedule causes: one identity at every head (Agreement, the models' TotalOrder); every write
+/// acknowledged through any node served by the last owner (NoLoss); every copy fenced at or above the last owner's
+/// epoch (StaleNeverCommits); no shipped head below what an earlier epoch made durable (Continuity,
+/// [`continuity_in_samples`]); every read answering its write or a refusal (ReadSafety); every supersession taken over;
+/// and, healed, every copy at the last owner's head (Convergence) and a write through it acknowledged.
+#[test]
+fn a_seeded_nemesis_of_single_faults_keeps_every_register_invariant() {
+  if !gated("nemesis") {
+    return;
+  }
+  let fleet = Fleet::start_relayed("nemesis", Supervision::Bare, &FLEET_NODES);
+  let front = fleet.instances[fleet.owner_index()].clone();
+  let volume = fleet.create_volume(&front, "nemesis", true);
+  // The relay draws from the flow's seed; the schedule from the same seed turned half a word, so the two differ.
+  let seed = chaos_seed("nemesis");
+  let schedule = nemesis_schedule(
+    &mut Draws::seeded(seed.rotate_left(u64::BITS / 2)),
+    NEMESIS_FAULTS,
+  );
+  let mut verdict = Verdict::new("a seeded nemesis of single faults");
+  verdict.note(format!(
+    "seed {seed} ({CHAOS_SEED} replays it); the schedule: {schedule:?}"
+  ));
+  let mut strikes = Vec::new();
+  let (outcomes, samples) = stream_through_reading(
+    &fleet.instances,
+    &front,
+    &volume,
+    0..STREAM_FILES,
+    |began, newest| {
+      after_writes(&front, &volume, BETWEEN_EVENTS);
+      for planned in &schedule {
+        let struck = strike(&fleet, &volume, *planned, (began, newest));
+        let owner = wait_recovered(&fleet, &volume);
+        // Writes go on through the front node, forwarded to the owner when it is another node now, so each fault lands
+        // mid-stream with writes on either side and a stream that stopped cannot pass for one that kept going.
+        after_writes(&fleet.instances[owner], &volume, BETWEEN_EVENTS);
+        verdict.note(format!(
+          "{}; recovered at {:?}, owner {}",
+          struck.line,
+          began.elapsed(),
+          fleet.instances[owner]
+        ));
+        strikes.push(struck);
+      }
+    },
+  );
+  judge_nemesis(
+    &mut verdict,
+    &fleet,
+    &volume,
+    (&outcomes, &samples),
+    strikes,
+  );
+  verdict.note(fleet.relay().report().summary());
+  drop(fleet);
+  verdict.judge();
+}
+
+/// The verdict of [`a_seeded_nemesis_of_single_faults_keeps_every_register_invariant`] once its stream has stopped,
+/// from the stream's `outcomes`, every node's `samples` and what each fault did (`strikes`).
+fn judge_nemesis(
+  verdict: &mut Verdict,
+  fleet: &Fleet,
+  volume: &str,
+  (outcomes, samples): (&[Outcome], &[Sample]),
+  strikes: Vec<Strike>,
+) {
+  verdict.note(latency_line(outcomes));
+  let owner = &fleet.instances[wait_one_owner(fleet, volume)];
+  let epoch = serving_epoch(owner, volume);
+  let takeovers: u64 = fleet
+    .instances
+    .iter()
+    .map(|instance| counter(instance, "fleet.live.taken_over"))
+    .sum();
+  verdict.note(format!(
+    "the last owner {owner} ships under epoch {epoch}; {takeovers} takeovers counted"
+  ));
+  verdict.check(
+    "every supersession taken over",
+    strikes
+      .iter()
+      .filter(|strike| strike.taken_over == Some(false))
+      .map(|strike| strike.line.clone())
+      .collect(),
+  );
+  verdict.check(
+    "the nemesis took the volume over (a takeover judged)",
+    if takeovers == 0 {
+      vec!["no node counted a takeover".to_owned()]
+    } else {
+      Vec::new()
+    },
+  );
+  let (heads, disagreements) = agreement(samples);
+  verdict.note(format!("{} samples, {heads} heads seen", samples.len()));
+  verdict.check("Agreement (TotalOrder)", disagreements);
+  verdict.check("Continuity", continuity_in_samples(samples));
+  verdict.check("NoLoss (the last owner)", no_loss(owner, volume, outcomes));
+  let all: Vec<&str> = fleet.instances.iter().map(String::as_str).collect();
+  verdict.check(
+    "StaleNeverCommits (fences)",
+    fenced_at_or_above(&all, volume, epoch),
+  );
+  let probes: Vec<ReadProbe> = strikes
+    .into_iter()
+    .flat_map(|strike| strike.probes)
+    .collect();
+  judge_reads(verdict, (None, &fleet.instances), &probes, outcomes);
+  let others: Vec<&str> = all
+    .iter()
+    .copied()
+    .filter(|instance| *instance != owner.as_str())
+    .collect();
+  let (caught_up, last) = converged(owner, &others, volume);
+  verdict.note(format!("converged on the last owner: {caught_up}: {last}"));
+  verdict.check(
+    "Convergence",
+    if caught_up { Vec::new() } else { vec![last] },
+  );
+  let (head, last_writes) = first_write_through(
+    owner,
+    volume,
+    STREAM_FILES..STREAM_FILES + FIRST_WRITE_FILES,
+    &Instant::now(),
+  );
+  verdict.check(
+    "a write through the last owner acknowledged, its head shown",
+    first_write_shown(owner, head, &last_writes),
+  );
+  verdict.check(
+    "NoLoss (the last write)",
+    no_loss(owner, volume, &last_writes),
   );
 }
