@@ -3727,3 +3727,43 @@ fn expect_each_wrong_restore_refused_with_its_reason(daemon: &Daemon, id: Volume
     assert!(refused.contains(why), "{why}: {refused}");
   }
 }
+
+/// A-316. Do: attach a volume over a stream on a daemon that has no anchor (this file's harness), and read the stream's
+/// resync end. Expect `Attached` naming the attachment and a token, with no descriptor, and then the channel's end at
+/// once: no anchor holds the daemon's end, so no resync can come, and the device knows it (Shards' option (a)).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_stream_whose_resync_end_no_anchor_holds_tells_its_device_no_resync_will_come() {
+  use slates_bridge_fuse::shards_resync::{ResyncKind, ResyncMessage, TOKEN_BYTES};
+  use std::os::fd::AsFd;
+  let (daemon, instance) = single_shard_daemon("shards-resync-unheld");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&scratch("resync-unheld")) else {
+    panic!("the volume was not created");
+  };
+  let attached = attach(&daemon, id, None, Intent::Write).unwrap();
+  let resync = attached
+    .resync
+    .as_ref()
+    .expect("Linux makes a stream's resync channel");
+  rustix::net::sockopt::set_socket_timeout(
+    resync,
+    rustix::net::sockopt::Timeout::Recv,
+    Some(CREDIT_WAIT),
+  )
+  .unwrap();
+  let mut bytes = [0u8; 64];
+  let (read, carried) = slates_ipc::stream::recv_message(resync.as_fd(), &mut bytes).unwrap();
+  let told = ResyncMessage::parse(&bytes[..read]).unwrap();
+  assert_eq!(
+    (told.kind, told.attachment, carried.len()),
+    (ResyncKind::Attached, attached.attachment, 0),
+    "the device first reads its attachment's token"
+  );
+  assert_ne!(told.token, [0; TOKEN_BYTES]);
+  let (read, _) = slates_ipc::stream::recv_message(resync.as_fd(), &mut bytes).unwrap();
+  assert_eq!(read, 0, "and then the channel's end: no anchor holds it");
+  drop(attached);
+  drop(client);
+  daemon.stop();
+}

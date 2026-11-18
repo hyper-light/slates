@@ -744,6 +744,9 @@ fn attach_handed(
     crate::shards::Handoff {
       attachment,
       stream: end,
+      // A vhost-user device's socket has no resync channel: its front end reconnects to a new back end itself.
+      #[cfg(target_os = "linux")]
+      resync: None,
     },
   );
   capability.read_write = if writable {

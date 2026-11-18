@@ -431,6 +431,9 @@ impl Volumes for SimVolumes {
         token: None,
       },
       stream: handed,
+      // The simulator holds no channel a successor could resync the stream over: a consumer handles none, as it does on
+      // the platforms whose daemon hands none (A-316).
+      resync: None,
     })
   }
 

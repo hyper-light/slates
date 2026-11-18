@@ -557,16 +557,32 @@ pub struct StreamDelivery {
   pub request_id: u64,
   /// The attachment the daemon serves on the stream.
   pub attachment: u64,
+  /// Whether the stream's resync end follows this delivery, as the next one for the same request (A-316).
+  pub resync_follows: bool,
 }
 
-/// A descriptor the daemon delivered over the control socket, with what it is for: a content map (A-135) or a
-/// stream end (A-161). Each names the request it answers, so a client takes only its own.
+/// The device's end of a Shards stream's resync channel (A-316), delivered right after the stream's own end: the
+/// channel a successor daemon hands the device a fresh stream on (`slates_bridge_fuse::shards_resync`).
+#[cfg(unix)]
+pub struct ResyncDelivery {
+  /// The channel's end.
+  pub end: std::os::fd::OwnedFd,
+  /// The request this delivery answers (the attach's id).
+  pub request_id: u64,
+  /// The attachment the channel resyncs.
+  pub attachment: u64,
+}
+
+/// A descriptor the daemon delivered over the control socket, with what it is for: a content map (A-135), a stream
+/// end (A-161) or a stream's resync end (A-316). Each names the request it answers, so a client takes only its own.
 #[cfg(unix)]
 pub enum ControlDelivery {
   /// A read-only content map.
   Mapping(MappingDelivery),
   /// A Shards fs stream's other end.
   Stream(StreamDelivery),
+  /// A Shards fs stream's resync end.
+  Resync(ResyncDelivery),
 }
 
 #[cfg(unix)]
@@ -576,6 +592,7 @@ impl ControlDelivery {
     match self {
       Self::Mapping(mapping) => mapping.request_id,
       Self::Stream(stream) => stream.request_id,
+      Self::Resync(resync) => resync.request_id,
     }
   }
 }
@@ -768,6 +785,8 @@ pub mod platform {
   const KIND_MAPPING: u64 = 1;
   /// Format: the kind of a stream-end delivery.
   const KIND_STREAM: u64 = 2;
+  /// Format: the kind of a stream's resync-end delivery (A-316).
+  const KIND_RESYNC: u64 = 3;
   /// Format: a mapping delivery's body after its kind (§4.6, A-135): request id (8), mapping id (8), the block's
   /// offset in its backing object (8), the file's authorized length (8), the block length (8).
   const MAPPING_MSG_BYTES: usize = 40;
@@ -781,10 +800,13 @@ pub mod platform {
   const MAPPING_AT_FILE_LEN: usize = 24;
   /// Format: the block length's offset.
   const MAPPING_AT_BLOCK_LEN: usize = 32;
-  /// Format: a stream delivery's body after its kind (A-161): request id (8), attachment id (8).
-  const STREAM_MSG_BYTES: usize = 16;
+  /// Format: a stream delivery's body after its kind (A-161): request id (8), attachment id (8), and whether the
+  /// stream's resync end follows (8, one or zero; A-316). A resync delivery's body is the same, its third word zero.
+  const STREAM_MSG_BYTES: usize = 24;
   /// Format: the attachment id's offset in a stream delivery.
   const STREAM_AT_ATTACHMENT: usize = 8;
+  /// Format: the resync-follows word's offset in a stream delivery.
+  const STREAM_AT_RESYNC_FOLLOWS: usize = 16;
   /// Derived: the longest delivery, a kind word and a mapping's body; every receive reads into this much.
   const DELIVERY_MAX_BYTES: usize = KIND_BYTES + MAPPING_MSG_BYTES;
   /// Format: the one descriptor every delivery carries: an arena block's backing object, or a stream end.
@@ -910,6 +932,7 @@ pub mod platform {
       stream: std::os::fd::BorrowedFd<'_>,
       request_id: u64,
       attachment: u64,
+      resync_follows: bool,
     ) -> Result<(), IpcError> {
       let mut body = [0u8; KIND_BYTES + STREAM_MSG_BYTES];
       put_words(
@@ -918,9 +941,35 @@ pub mod platform {
           (0, KIND_STREAM),
           (KIND_BYTES + AT_REQUEST, request_id),
           (KIND_BYTES + STREAM_AT_ATTACHMENT, attachment),
+          (
+            KIND_BYTES + STREAM_AT_RESYNC_FOLLOWS,
+            u64::from(resync_follows),
+          ),
         ],
       );
       self.send_delivery(&body, stream, "sendmsg stream")
+    }
+
+    /// Sends the client that attached a Shards fs stream the device's end of its resync channel (A-316), right after
+    /// the stream's own end ([`Self::send_stream`] with `resync_follows`), with the request it answers and the
+    /// attachment it resyncs. No confinement check, as for the stream: the channel carries only what the daemon sends
+    /// that one attachment's device.
+    pub fn send_resync(
+      &self,
+      end: std::os::fd::BorrowedFd<'_>,
+      request_id: u64,
+      attachment: u64,
+    ) -> Result<(), IpcError> {
+      let mut body = [0u8; KIND_BYTES + STREAM_MSG_BYTES];
+      put_words(
+        &mut body,
+        &[
+          (0, KIND_RESYNC),
+          (KIND_BYTES + AT_REQUEST, request_id),
+          (KIND_BYTES + STREAM_AT_ATTACHMENT, attachment),
+        ],
+      );
+      self.send_delivery(&body, end, "sendmsg resync")
     }
 
     /// One delivery, `body` padded to the longest kind's and sealed, with `descriptor` by `SCM_RIGHTS`, in one
@@ -1066,7 +1115,7 @@ pub mod platform {
         })?
         .open(Class::Delivery, &sealed)?;
       let kind = word_at(&body, 0);
-      if kind != KIND_MAPPING && kind != KIND_STREAM {
+      if ![KIND_MAPPING, KIND_STREAM, KIND_RESYNC].contains(&kind) {
         return Err(IpcError::Layout {
           reason: "a delivery of an unknown kind",
         });
@@ -1083,6 +1132,13 @@ pub mod platform {
       Ok(Some(if kind == KIND_STREAM {
         super::ControlDelivery::Stream(super::StreamDelivery {
           stream: descriptor,
+          request_id: field(AT_REQUEST),
+          attachment: field(STREAM_AT_ATTACHMENT),
+          resync_follows: field(STREAM_AT_RESYNC_FOLLOWS) != 0,
+        })
+      } else if kind == KIND_RESYNC {
+        super::ControlDelivery::Resync(super::ResyncDelivery {
+          end: descriptor,
           request_id: field(AT_REQUEST),
           attachment: field(STREAM_AT_ATTACHMENT),
         })
@@ -2212,8 +2268,10 @@ pub mod platform {
     ) -> Result<super::super::MappingDelivery, IpcError> {
       match delivery {
         Some(super::super::ControlDelivery::Mapping(mapping)) => Ok(mapping),
-        Some(super::super::ControlDelivery::Stream(_)) => Err(IpcError::Layout {
-          reason: "a stream end arrived where a mapping was sent",
+        Some(
+          super::super::ControlDelivery::Stream(_) | super::super::ControlDelivery::Resync(_),
+        ) => Err(IpcError::Layout {
+          reason: "a stream's end arrived where a mapping was sent",
         }),
         None => Err(IpcError::Layout {
           reason: "a delivery was waiting but recv returned None",
@@ -2269,9 +2327,9 @@ pub mod platform {
       )
       .map_err(|e| super::refused("add seals", e))?;
 
-      control.send_stream(handed.as_fd(), 5, 501)?;
+      control.send_stream(handed.as_fd(), 5, 501, false)?;
       control.send_mapping(block.as_fd(), read_only(6, 12, (0, 4096, 4096)))?;
-      control.send_stream(other_handed.as_fd(), 7, 502)?;
+      control.send_stream(other_handed.as_fd(), 7, 502, false)?;
       drop(handed);
 
       let first = match liveness.recv_delivery()? {
@@ -2311,6 +2369,56 @@ pub mod platform {
       if liveness.recv_delivery()?.is_some() {
         return Err(IpcError::Layout {
           reason: "a fourth delivery appeared from nowhere",
+        });
+      }
+      Ok(())
+    }
+
+    /// A-316: a stream whose resync channel the daemon made is delivered with it. Do: send a stream end saying its
+    /// resync end follows, then that resync end, then a plain stream end; read all three, and send a message on the
+    /// daemon's end of the resync pair. Expect the first to say a resync end follows and the third not; the second to be
+    /// the resync end for the same request and attachment; and the message read whole on the delivered end, which is
+    /// the channel's other end, not a copy.
+    #[test]
+    fn a_streams_resync_end_follows_its_end_on_the_control_socket() -> Result<(), IpcError> {
+      let (control, liveness) = channel()?;
+      let (_daemon_end, handed) = crate::stream::pair()?;
+      let (daemon_resync, handed_resync) = crate::stream::message_pair()?;
+      let (_plain_daemon_end, plain_handed) = crate::stream::pair()?;
+      control.send_stream(handed.as_fd(), 9, 901, true)?;
+      control.send_resync(handed_resync.as_fd(), 9, 901)?;
+      control.send_stream(plain_handed.as_fd(), 10, 902, false)?;
+      drop(handed_resync);
+      let Some(super::super::ControlDelivery::Stream(stream)) = liveness.recv_delivery()? else {
+        return Err(IpcError::Layout {
+          reason: "the first delivery was not the stream end",
+        });
+      };
+      let Some(super::super::ControlDelivery::Resync(resync)) = liveness.recv_delivery()? else {
+        return Err(IpcError::Layout {
+          reason: "the second delivery was not the resync end",
+        });
+      };
+      let Some(super::super::ControlDelivery::Stream(plain)) = liveness.recv_delivery()? else {
+        return Err(IpcError::Layout {
+          reason: "the third delivery was not the plain stream end",
+        });
+      };
+      let told = (stream.resync_follows, plain.resync_follows);
+      let named = (resync.request_id, resync.attachment);
+      if told != (true, false) || named != (9, 901) {
+        return Err(IpcError::Layout {
+          reason: "a resync end was not told, or named another request",
+        });
+      }
+      crate::stream::send(daemon_resync.as_fd(), b"attached")
+        .map_err(|e| super::refused("send", e))?;
+      let mut got = [0u8; 16];
+      let (read, descriptors) = crate::stream::recv_message(resync.end.as_fd(), &mut got)
+        .map_err(|e| super::refused("recv_message", e))?;
+      if got.get(..read) != Some(&b"attached"[..]) || !descriptors.is_empty() {
+        return Err(IpcError::Layout {
+          reason: "the delivered resync end is not the channel's other end",
         });
       }
       Ok(())
@@ -2368,8 +2476,8 @@ pub mod platform {
           }
           Hostile::AfterADropped => {
             let (_first_end, first) = crate::stream::pair()?;
-            control.send_stream(first.as_fd(), 1, 1)?;
-            control.send_stream(handed.as_fd(), 2, 2)?;
+            control.send_stream(first.as_fd(), 1, 1, false)?;
+            control.send_stream(handed.as_fd(), 2, 2, false)?;
             drop_one(&liveness)?;
           }
         }
@@ -2722,9 +2830,22 @@ pub mod platform {
       _stream: std::os::fd::BorrowedFd<'_>,
       _request_id: u64,
       _attachment: u64,
+      _resync_follows: bool,
     ) -> Result<(), IpcError> {
       Err(IpcError::Unsupported {
         feature: "a stream end over the control socket (macOS has the socket route)",
+      })
+    }
+
+    /// No control socket here (A-316): a macOS stream is handed no resync end yet.
+    pub fn send_resync(
+      &self,
+      _end: std::os::fd::BorrowedFd<'_>,
+      _request_id: u64,
+      _attachment: u64,
+    ) -> Result<(), IpcError> {
+      Err(IpcError::Unsupported {
+        feature: "a resync end over the control socket (macOS hands none yet)",
       })
     }
   }
