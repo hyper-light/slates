@@ -14859,6 +14859,135 @@ fn a_share_of_a_green_made_after_its_last_version_survives_a_takeover() {
   );
 }
 
+/// §4.16 failure matrix ("Green owner loss in a fleet: Degraded for the membership horizon, then Masked after takeover
+/// on a candidate that holds the ledger"; AUD-14; GAP-A9-7's input half; GAPS 2026-11-09): a successor one version
+/// behind the quorum takes the green over. Do: three nodes at `f = 1`; on a, a green advanced to version 2 and recomputed
+/// by both holders; the survivor rendezvous ranks first for the green then refusing every content put, so version 3
+/// commits at a and the other holder alone; a dies. Expect the successor at version 2 and the other holder at 3 when a
+/// dies; the successor to fetch version 3's inputs from the other holder (counted `merge.takeover_inputs_fetched`) and
+/// place the green at version 3 without giving it up, with the owner's chain, serving version 1 and the head's bytes.
+/// Its refusal of content puts stands throughout, so nothing but its own fetch can bring it version 3's inputs. Before
+/// 2026-11-18 the successor waited on its chain every period: without end, then, once bounded, until it gave the green
+/// up `TakeoverIncomplete { waited_on: "chain" }`, as 2 of 10 arm64 runs of the share test did under spinners
+/// (diag-clients-green-1).
+#[test]
+fn a_successor_one_version_behind_fetches_the_versions_inputs_and_serves_the_green() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(n);
+  let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+
+  let mut client = Client::connect(daemons[0].instance());
+  let (green, work) = green_with_work(&mut client, "lagging-successor", &daemons);
+  let object = ObjectId(green.bytes);
+  let successor_host =
+    rendezvous_first(&[hosts[1], hosts[2]], object).expect("a survivor takes over the green");
+  // Indices among the survivors, once a is gone; the whole fleet's are one more.
+  let successor_index = usize::from(successor_host != hosts[1]);
+  let other_index = 1 - successor_index;
+  commit_version(&mut client, work, (0, "hello"), 1);
+  commit_version(&mut client, work, (5, " world"), 2);
+  let (both_at_two, unowned) = holders_before_owner_death_at(&daemons, green, 2);
+  daemons[1 + successor_index]
+    .inject_merge_fault(slates_server::merge_service::MergeFault {
+      refuse_content_puts: true,
+      corrupt_next_inputs: false,
+      refuse_records: false,
+      refuse_work_catalogs: false,
+    })
+    .expect("the successor's refusal of content puts installs");
+  commit_version(&mut client, work, (11, "!"), 3);
+  let other_at_three = poll_until(
+    &daemons.iter().collect::<Vec<_>>(),
+    PLACEMENT_DEADLINE,
+    || {
+      daemons[1 + other_index]
+        .merge_holder_state(green)
+        .map(|state| state.version == Some(3))
+    },
+  );
+  let successor_at_death = daemons[1 + successor_index].merge_holder_state(green);
+  let owner_chain = daemons[0].merge_chain_identities(green).unwrap();
+
+  daemons.remove(0).stop();
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let given_up = |daemon: &Daemon| {
+    daemon.refusals_on_every_shard().map(|counted| {
+      counted
+        .get("merge.takeover_given_up")
+        .is_some_and(|count| *count > 0)
+    })
+  };
+  // The daemon's own verdict ends the wait: the green placed at version 3, or given up at its bound.
+  poll_until(&survivors, PLACEMENT_DEADLINE, || {
+    Ok(
+      daemons[successor_index].merge_record_placed(green, 3)?
+        || given_up(&daemons[successor_index])?,
+    )
+  });
+  let placed = daemons[successor_index].merge_record_placed(green, 3);
+  let counted = daemons[successor_index].refusals_on_every_shard();
+  let successor_chain = daemons[successor_index].merge_chain_identities(green);
+  let served = observe_taken_over_green(&daemons[successor_index], green);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  let counted = counted.expect("the successor's counters are read");
+  let count_of = |name: &str| counted.get(name).copied().unwrap_or(0);
+  assert!(both_at_two, "both holders recomputed version 2");
+  assert!(unowned, "before the death neither holder owned the green");
+  assert!(other_at_three, "the other holder recomputed version 3");
+  assert_eq!(
+    successor_at_death.map(|state| state.version),
+    Ok(Some(2)),
+    "the successor was one version behind when the owner died"
+  );
+  assert_eq!(
+    placed,
+    Ok(true),
+    "the successor placed the taken-over green at version 3 (given up {}, fetched {}, waited on its chain {}, waited on \
+     its inputs {})",
+    count_of("merge.takeover_given_up"),
+    count_of("merge.takeover_inputs_fetched"),
+    count_of("merge.takeover_incomplete"),
+    count_of("merge.takeover_waits_inputs")
+  );
+  assert_eq!(
+    count_of("merge.takeover_given_up"),
+    0,
+    "the green was never given up"
+  );
+  assert!(
+    count_of("merge.takeover_inputs_fetched") >= 1,
+    "the successor fetched version 3's inputs from the other holder"
+  );
+  assert_eq!(
+    successor_chain,
+    Ok(owner_chain),
+    "the successor's chain carries the owner's increment identities, in order"
+  );
+  assert_eq!(
+    served,
+    TakenOverGreenView {
+      head: Ok(3),
+      at_one: Ok(b"hello".to_vec()),
+      at_head: Ok(b"hello world!".to_vec()),
+    },
+    "the successor serves the head version, version 1 and the head's bytes"
+  );
+}
+
 /// The green's head as a client must read it from an owner that has just restarted or taken the green over (§4.8
 /// "Leases and reads", AUD-08): the owner parks the read until its lease confirms and refuses it `LeaseUnconfirmed`
 /// if the lease bound passes first, a refusal retryable by design. So the read is sent again while it is refused so,
@@ -16208,31 +16337,36 @@ fn green_with_work(client: &mut Client, name: &str, fleet: &[Daemon]) -> (Volume
 /// Submits three versions from `work` on its owner: each acceptance resolves within the placement
 /// deadline once the version commits at the quorum (AUD-11) and answers the expected version.
 fn commit_three_versions(client: &mut Client, work: VolumeId) {
-  for (version, (at, bytes)) in [(0u64, "hello"), (5, " world"), (11, "!")]
+  for (version, edit) in [(0u64, "hello"), (5, " world"), (11, "!")]
     .into_iter()
     .enumerate()
   {
-    edit_work(client, work, at, bytes);
-    let started = Instant::now();
-    let submitted = client
-      .try_call(
-        &RequestBody::Submit {
-          work,
-          evidence: Vec::new(),
-        },
-        u64::try_from(PLACEMENT_DEADLINE.as_nanos()).unwrap_or(u64::MAX),
-      )
-      .expect("the acceptance resolves once the version commits at the quorum");
-    let expected = u64::try_from(version).unwrap() + 1;
-    assert!(
-      started.elapsed() < PLACEMENT_DEADLINE,
-      "version {expected}'s acceptance resolved within the placement deadline"
-    );
-    assert!(
-      matches!(submitted, ReplyBody::Submitted { version: Some(v), .. } if v == expected),
-      "version {expected}: {submitted:?}"
-    );
+    commit_version(client, work, edit, u64::try_from(version).unwrap() + 1);
   }
+}
+
+/// Inserts `bytes` at `at` in `work`'s file `f` and submits it on its owner: the acceptance resolves within the
+/// placement deadline once the version commits at the quorum (AUD-11) and answers version `expected`.
+fn commit_version(client: &mut Client, work: VolumeId, (at, bytes): (u64, &str), expected: u64) {
+  edit_work(client, work, at, bytes);
+  let started = Instant::now();
+  let submitted = client
+    .try_call(
+      &RequestBody::Submit {
+        work,
+        evidence: Vec::new(),
+      },
+      u64::try_from(PLACEMENT_DEADLINE.as_nanos()).unwrap_or(u64::MAX),
+    )
+    .expect("the acceptance resolves once the version commits at the quorum");
+  assert!(
+    started.elapsed() < PLACEMENT_DEADLINE,
+    "version {expected}'s acceptance resolved within the placement deadline"
+  );
+  assert!(
+    matches!(submitted, ReplyBody::Submitted { version: Some(v), .. } if v == expected),
+    "version {expected}: {submitted:?}"
+  );
 }
 
 /// Before the owner dies: whether both holders recomputed version 3 (the successor's own prefix is
@@ -17277,7 +17411,8 @@ fn plant_taken_over_green(daemon: &Daemon, with_catalog: bool) {
         }
         s.pending_green_materializations.insert(
           object,
-          slates_server::state::PendingGreen { merge, attempts: 0 },
+          // No survivor reported its version: a planted green has no sources to fetch from.
+          slates_server::state::PendingGreen::adopted(merge, Vec::new()),
         );
       },
     )

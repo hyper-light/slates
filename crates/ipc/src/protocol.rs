@@ -3139,9 +3139,10 @@ pub enum RecoveryCause {
   /// rather than waiting without end. Appended.
   TakeoverIncomplete {
     /// What the last attempt waited on: `catalog` (its catalog register or that register's placement never adopted),
-    /// `chain` (an input not held, or the adopted version beyond this node's accepted prefix), `placement` (no
-    /// placement of the adopted record, or no shard for its partition), or `refused` (the owner shard refused the
-    /// rebuilt green).
+    /// `chain` (a version's record not known here: the adopted version beyond this node's accepted records), `inputs`
+    /// (an input its ledger names not held here, and not served whole by the survivors that reported the adopted
+    /// version), `placement` (no placement of the adopted record, or no shard for its partition), or `refused` (the
+    /// owner shard refused the rebuilt green).
     waited_on: String,
   },
 }
