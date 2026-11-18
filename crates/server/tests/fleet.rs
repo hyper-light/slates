@@ -12840,13 +12840,15 @@ impl AnchoredFleet {
   }
 }
 
-/// Creates a volume named `name` on `daemons[0]`, writes `path` with its own name as its bytes, and seals it: the
-/// volume, once the seal placed and both other nodes hold its head; else what did not hold.
+/// Creates a volume named `name` on `daemons[0]`, shares it with the account on every other node (so a successor's client
+/// may read it), writes `path` with its own name as its bytes, and seals it: the volume, once the seal placed and both
+/// other nodes hold its head; else what did not hold.
 fn sealed_and_held(daemons: &[Daemon], name: &str, path: &str) -> Result<VolumeId, String> {
   let mut client = Client::connect(daemons[0].instance());
   let ReplyBody::Created { id } = client.call(&scratch(name)) else {
     return Err("create on the owner".to_owned());
   };
+  share_with_fleet(&mut client, id, daemons);
   let attachment = write_attachment(&mut client, id);
   let written = write_own_name(&mut client, id, attachment, path);
   let detached = client.call(&RequestBody::Detach { attachment });
