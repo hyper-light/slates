@@ -1,0 +1,65 @@
+# DIAG (not for main): the liveness suite (crates/server/tests/liveness.rs, A-228) on Windows x86_64 and arm64, which no
+# CI lane runs; measures its build and its runtime (three runs, one test at a time and the default), for the proposal of
+# a Windows lane (the supervisor's ask of 2026-11-18 10:16 UTC; CLAUDE.md §2 item 13 if it is long).
+name: diag-integrator-liveness
+on:
+  push:
+    branches: ['diag-integrator-liveness-*']
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  liveness-windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl for the C the daemon links (arm64)
+        if: matrix.os == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Build the liveness suite
+        shell: bash
+        run: |
+          began=$(date +%s)
+          cargo test --locked -p slates-server --test liveness --no-run
+          echo "build $(( $(date +%s) - began ))s" | tee -a liveness-results.txt
+      - name: The liveness suite, three runs each way
+        shell: bash
+        run: |
+          failed=0
+          for run in 1 2 3; do
+            for threads in 1 default; do
+              args=""; [ "$threads" = 1 ] && args="--test-threads=1"
+              began=$(date +%s)
+              cargo test --locked -p slates-server --test liveness -- $args > liveness-run-$run-$threads.log 2>&1; code=$?
+              echo "run $run threads $threads exit $code took $(( $(date +%s) - began ))s" | tee -a liveness-results.txt
+              grep -E "test result|FAILED|panicked" liveness-run-$run-$threads.log | cut -c1-400 | tee -a liveness-results.txt
+              [ $code -eq 0 ] || failed=$((failed+1))
+            done
+          done
+          [ $failed -eq 0 ]
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: liveness-${{ matrix.os }}
+          path: liveness-*
