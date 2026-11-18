@@ -20,6 +20,11 @@
 //! - **starved** once a whole window has passed with no CPU progress while the scheduler had it waiting for a CPU. It is
 //!   not stuck (A-228: on adacachy at CPUWeight=1 a shard held off its CPU was runnable throughout while its clock stood
 //!   still, and the anchor killed a live daemon); it beats, and is logged once an episode;
+//! - **starved for memory** likewise while it was held off the CPU in a wait memory shows as, as the host reported a
+//!   memory stall (A-336, [`held_for_memory`]): a thread waiting on a page-in, a reclaim or a refault is neither running
+//!   nor runnable, as a deadlocked one is, and a lone daemon at a few hundred megabytes free ended itself on that verdict
+//!   (exit 4, fleet test binaries at 0.2 to 1 GB free, 2026-11-17). Such a look counts as the shard's movement, as a
+//!   runnable one does, so a stuck shard is still judged wedged a window after the stall clears;
 //! - **alive** otherwise: busy inside one poll for less than a window, or given a little CPU at a time.
 //!
 //! What the scheduler says comes from `slates_rt::registry::shard_run_readings`, asked only about shards with no step
@@ -33,6 +38,18 @@
 //! - **No answer** (Miri, or a source that cannot be read): the CPU clock stands alone, as it did before.
 //!
 //! A stopped thread never reads as runnable, so a frozen process is still killed.
+//!
+//! What the host says of memory comes from `slates_machine::memory_stall`, read once a look that suspects a shard, and
+//! the thread's own kind of wait from the same scheduler reading (A-336, one rule on every platform, each giving what
+//! it can):
+//! - **Linux**: PSI's memory `some` total rising since the last look (`/proc/pressure/memory`), and the thread held in
+//!   the kernel past signals (`D`), never asleep in a futex, a poll or a sleep (`S`), which no stall excuses. `some`, not
+//!   `full`: a thread delayed on memory on a CPU that runs anything else never shows in `full`, and a busy machine runs
+//!   something on every CPU (`kernel/sched/psi.c`). The thread's `wchan` names its wait in the log line.
+//! - **macOS**: `kern.memorystatus_vm_pressure_level` above normal. XNU reports a user page fault's wait as it does a
+//!   lock's, so any blocked wait counts while the level is raised.
+//! - **Windows**: the low-memory resource notification signaled; any blocked wait counts (its wait reason is not read).
+//! - **No reading** (PSI absent, a refused read, Miri): nothing excuses a still shard, as before.
 //!
 //! The window is the existing liveness budget ([`crate::daemon::LIVENESS_BUDGET_NS`]), a fixed number recorded as R3
 //! debt in GAPS. A-228 adds no number to it. A poll's CPU is held to the build the daemon runs in (A-318,
@@ -69,6 +86,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel}
 use std::thread::JoinHandle;
 
 use slates_anchor::AnchorSegment;
+use slates_machine::memory_stall::StallReading;
 use slates_rt::{RunReading, RunState, SlotHolder};
 use slates_vfs::clock::{Clock, HostClock};
 
@@ -83,6 +101,58 @@ pub struct Watchdog {
   turns: &'static Turns,
   /// The CPU a poll may run before the shard is judged spinning ([`spin_window_ns`]).
   spin_window_ns: u64,
+  /// Where the thread reads the host's memory stall (A-336).
+  memory: &'static MemoryStallSource,
+}
+
+/// Where the watchdog reads the host's memory stall (A-336): the host's own reading
+/// ([`slates_machine::memory_stall::read`]), unless a test has put a level in its place ([`MemoryStallSource::inject`],
+/// `Daemon::inject_memory_stall`), as `Daemon::inject_pressure_hold` drives admission's hold: so a test proves the rule
+/// with no host short of memory, driving the very reading the rule takes. Written by a test, read by the watchdog's
+/// thread; a flag, so acquire and release. One per daemon, leaked for the process's life like [`Turns`]: a word.
+#[derive(Debug, Default)]
+#[repr(align(128))]
+pub struct MemoryStallSource {
+  /// [`HOST_READING`], [`INJECTED_CLEAR`] or [`INJECTED_PRESSED`].
+  injected: std::sync::atomic::AtomicU8,
+}
+
+/// Format: the source's word when the host's own reading is taken.
+const HOST_READING: u8 = 0;
+/// Format: the source's word when a test has put a clear level in the host's reading's place.
+const INJECTED_CLEAR: u8 = 1;
+/// Format: the source's word when a test has put a pressed level in the host's reading's place.
+const INJECTED_PRESSED: u8 = 2;
+
+impl MemoryStallSource {
+  /// Puts a level in the host's reading's place, pressed or clear; `None` gives the host's own reading back.
+  pub fn inject(&self, pressed: Option<bool>) {
+    let word = match pressed {
+      None => HOST_READING,
+      Some(false) => INJECTED_CLEAR,
+      Some(true) => INJECTED_PRESSED,
+    };
+    self
+      .injected
+      .store(word, std::sync::atomic::Ordering::Release);
+  }
+
+  /// The host's memory stall now, or the level a test put in its place.
+  fn read(&self) -> Option<StallReading> {
+    match self.injected.load(std::sync::atomic::Ordering::Acquire) {
+      INJECTED_CLEAR => Some(StallReading::Level { pressed: false }),
+      INJECTED_PRESSED => Some(StallReading::Level { pressed: true }),
+      _ => slates_machine::memory_stall::read(),
+    }
+  }
+
+  /// Where the reading comes from, in the banner's words.
+  fn describe(&self) -> &'static str {
+    match self.injected.load(std::sync::atomic::Ordering::Acquire) {
+      INJECTED_CLEAR | INJECTED_PRESSED => "a level a test put in the host's reading's place",
+      _ => slates_machine::memory_stall::source(),
+    }
+  }
 }
 
 /// What the watchdog thread did, counted as it goes: how many times it looked at the shards, and at how many of those it
@@ -133,15 +203,18 @@ impl Watchdog {
     let (stop, stop_signal) = channel();
     let cost = slates_machine::build_cost::build_cost();
     let spin_window_ns = spin_window_ns(cost);
+    let memory: &'static MemoryStallSource = Box::leak(Box::default());
     slates_machine::log_line!(
       "slates daemon: the watchdog beats every {} ms and finds a shard stuck after a {} ms window without a step, with \
        no CPU progress and no wait for a CPU, or after {} ms of CPU without a step (the window is the liveness budget, \
        and a poll's CPU is held to this build: {}); a shard waiting for a CPU is starved, not stuck, and the beat goes \
-       on; {}",
+       on, and so is one waiting on memory while the host reports a memory stall ({}: {:?} now); {}",
       HEARTBEAT_NS / NS_PER_MS,
       LIVENESS_BUDGET_NS / NS_PER_MS,
       spin_window_ns / NS_PER_MS,
       describe_cost(cost),
+      memory.describe(),
+      memory.read(),
       match supervision {
         Supervision::Anchored => "an anchor reads the beat, so a stuck shard withholds it",
         Supervision::Alone =>
@@ -157,7 +230,7 @@ impl Watchdog {
           &holders,
           (&control, &stop_signal),
           supervision,
-          (turns, spin_window_ns),
+          (turns, spin_window_ns, memory),
         )
       })?;
     Ok(Watchdog {
@@ -165,7 +238,13 @@ impl Watchdog {
       handle: Some(handle),
       turns,
       spin_window_ns,
+      memory,
     })
+  }
+
+  /// Where the thread reads the host's memory stall, for a test to put a level in its place (A-336).
+  pub fn memory_stall(&self) -> &'static MemoryStallSource {
+    self.memory
   }
 
   /// What the thread has done so far ([`Turns`]).
@@ -315,10 +394,13 @@ pub fn decide(
 pub enum Verdict {
   /// Parked, stepping, given a little CPU at a time, or inside one poll for less than a window.
   Alive,
-  /// No step and no CPU progress for `for_ns` (at least a window), but the scheduler had it waiting for a CPU. It beats.
+  /// No step and no CPU progress for `for_ns` (at least a window), but the scheduler had it waiting for a CPU, or it was
+  /// held off the CPU waiting on memory while the host reported a memory stall (A-336). It beats.
   Starved {
     /// How long the shard has run no CPU without a step.
     for_ns: u64,
+    /// What it waited for at the last look that excused it.
+    of: Want,
   },
   /// No step, no CPU progress and no wait for a CPU for `for_ns` (at least a window).
   Wedged {
@@ -339,6 +421,33 @@ impl Verdict {
   fn beats(self) -> bool {
     matches!(self, Verdict::Alive | Verdict::Starved { .. })
   }
+}
+
+/// What a starved shard waited for, at the last look that told it from a wedged one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Want {
+  /// A CPU: the scheduler had its thread runnable, or credited it a wait for one (A-228).
+  #[default]
+  Cpu,
+  /// Memory: its thread was off the CPU in a wait memory shows as, while the host reported a memory stall (A-336,
+  /// [`held_for_memory`]).
+  Memory,
+}
+
+/// Whether a still shard's look finds it held waiting on memory (A-336): the host reported a memory stall since the
+/// look before (`before`, at this look `now`; [`slates_machine::memory_stall::stalled_between`]), and its thread is off
+/// the CPU in a wait memory can show as. Where the platform tells such a wait (Linux), that is one the kernel holds the
+/// thread in past signals (`D`: a page-in, a reclaim's throttle, a refault), never a futex, a poll or a sleep (`S`),
+/// however the host stalls; where it does not (macOS reports a user page fault's wait as it does a lock's, and Windows'
+/// wait reason is not read), any blocked wait. With no reading of the thread, nothing excuses it, as before. Pure, so
+/// the rule is tested on every host.
+pub fn held_for_memory(
+  before: Option<StallReading>,
+  now: Option<StallReading>,
+  run: Option<RunReading>,
+) -> bool {
+  run.is_some_and(|run| run.state == RunState::Blocked && run.uninterruptible != Some(false))
+    && slates_machine::memory_stall::stalled_between(before, now)
 }
 
 /// One shard's history since its last step, as the watchdog keeps it.
@@ -363,6 +472,10 @@ pub struct ShardWatch {
   /// The look before the one that last saw it move: its last movement came after this look, so a verdict's lateness is
   /// measured from here ([`ShardWatch::still_after_ns`]).
   still_after_ns: u64,
+  /// The host's memory stall at the last look, where it was read ([`Look::memory`]).
+  memory: Option<StallReading>,
+  /// What it waited for at the last look that excused its stillness: a CPU or memory.
+  starved_of: Want,
 }
 
 /// One look at a shard: its step count, whether it is parked, its thread clock reading (CPU nanoseconds, progress),
@@ -377,6 +490,9 @@ pub struct Look {
   pub cpu: Option<(u64, u64)>,
   /// What the scheduler says of its thread, when it can be read.
   pub run: Option<RunReading>,
+  /// The host's memory stall at this look, when it was read (A-336, [`slates_machine::memory_stall::read`]); the
+  /// watchdog reads it only at a look that suspects a shard.
+  pub memory: Option<StallReading>,
   /// The watchdog's clock, nanoseconds.
   pub now_ns: u64,
 }
@@ -417,15 +533,18 @@ impl ShardWatch {
   }
 
   /// The history after a look at a shard that neither stepped nor parked: `rose` whether its CPU progress rose, `moved`
-  /// whether it moved in any way (that, or runnable, or credited a wait).
+  /// whether it moved in any way (that, or runnable, or credited a wait, or held for memory), `excused` what it was
+  /// found waiting for, if anything.
   fn after_still_look(
     self,
     look: &Look,
     progress: Option<u64>,
-    rose: bool,
-    moved: bool,
+    (rose, moved): (bool, bool),
+    excused: Option<Want>,
   ) -> ShardWatch {
     ShardWatch {
+      memory: look.memory,
+      starved_of: excused.unwrap_or(self.starved_of),
       progress: if rose { progress } else { self.progress },
       progressed_ns: if rose {
         look.now_ns
@@ -465,6 +584,8 @@ impl ShardWatch {
           waited_ns,
           looked_ns: look.now_ns,
           still_after_ns: self.looked_ns,
+          memory: look.memory,
+          starved_of: Want::Cpu,
         },
       );
     }
@@ -477,6 +598,15 @@ impl ShardWatch {
     // rise; the state says so instead. A rise says it waited between two looks, seen in neither.
     let waiting = look.run.is_some_and(|run| run.state == RunState::Runnable)
       || matches!((self.waited_ns, waited_ns), (Some(before), Some(now)) if now > before);
+    // Off the CPU in a wait memory shows as while the host reported a memory stall: starved for memory, not stuck
+    // (A-336). Before, a shard waiting on a page-in at a few hundred megabytes free was judged wedged, never having been
+    // runnable, and a lone daemon ended itself. A stuck shard is still judged a window after the stall clears.
+    let memory = !waiting && held_for_memory(self.memory, look.memory, look.run);
+    let excused = if waiting {
+      Some(Want::Cpu)
+    } else {
+      memory.then_some(Want::Memory)
+    };
     // A look a window or more after the watchdog's last one saw nothing in between: the watchdog's own thread was kept off
     // its CPU, as a process frozen whole or paging is, and whether the shard waited for a CPU in that gap was never asked.
     // Its stillness there is the process's, so the shard's measures start again at this look, its still time and its time
@@ -488,8 +618,8 @@ impl ShardWatch {
     let next = self.after_still_look(
       &look,
       progress,
-      rose || unwatched,
-      rose || waiting || unwatched,
+      (rose || unwatched, rose || excused.is_some() || unwatched),
+      excused,
     );
     let still_for = look.now_ns.saturating_sub(next.moved_ns);
     if still_for >= window_ns {
@@ -513,7 +643,13 @@ impl ShardWatch {
     }
     let no_cpu_for = look.now_ns.saturating_sub(next.progressed_ns);
     if no_cpu_for >= window_ns {
-      return (Verdict::Starved { for_ns: no_cpu_for }, next);
+      return (
+        Verdict::Starved {
+          for_ns: no_cpu_for,
+          of: next.starved_of,
+        },
+        next,
+      );
     }
     (Verdict::Alive, next)
   }
@@ -526,7 +662,7 @@ fn run(
   holders: &[SlotHolder],
   (control, stop): (&Receiver<()>, &Receiver<()>),
   supervision: Supervision,
-  (turns, spin_window_ns): (&Turns, u64),
+  (turns, spin_window_ns, memory): (&Turns, u64, &MemoryStallSource),
 ) {
   let mut clock = HostClock::new();
   let mut watches = vec![ShardWatch::begun_at(clock.monotonic_ns().max(1)); holders.len()];
@@ -548,7 +684,7 @@ fn run(
     let now = clock.monotonic_ns();
     let late_ns = lateness.look(now);
     let mut looks: Vec<Option<Look>> = holders.iter().map(|holder| look_at(*holder, now)).collect();
-    read_runs(holders, &watches, &mut looks);
+    read_runs(holders, &watches, &mut looks, memory);
     // In shard order, aligned with `reported`: `None` for a slot that now holds another registration.
     let verdicts: Vec<Option<(u16, Verdict)>> = holders
       .iter()
@@ -572,9 +708,16 @@ fn run(
         .and_then(|watch| verdict_lateness_ns(now, watch.still_after_ns()));
       end_process(cause, lateness.since_beat(false, late_ns), verdict_late_ns);
     }
-    for ((found, said), watch) in verdicts.iter().zip(reported.iter_mut()).zip(&watches) {
+    for (((found, said), watch), holder) in verdicts
+      .iter()
+      .zip(reported.iter_mut())
+      .zip(&watches)
+      .zip(holders)
+    {
       if let Some((shard, verdict)) = found {
-        report(said, (*shard, *verdict, turn), (watch, now));
+        report(said, (*shard, *verdict, turn), (watch, now), || {
+          memory_wait_words(*holder, watch)
+        });
       }
     }
     turns.looked(stuck.is_some());
@@ -770,49 +913,101 @@ fn look_at(holder: SlotHolder, now_ns: u64) -> Option<Look> {
     parked,
     cpu,
     run: None,
+    memory: None,
     now_ns,
   })
 }
 
-/// Asks the scheduler about the shards under suspicion, all at once: at most one Windows snapshot a beat.
-fn read_runs(holders: &[SlotHolder], watches: &[ShardWatch], looks: &mut [Option<Look>]) {
-  let suspects: Vec<(&mut Look, SlotHolder)> = looks
-    .iter_mut()
+/// Asks the scheduler about the shards under suspicion, all at once (at most one Windows snapshot a beat), and reads the
+/// host's memory stall once for the look (A-336), into every shard's look: a look that suspects no shard reads neither,
+/// so a daemon whose shards step or park costs nothing more than before.
+fn read_runs(
+  holders: &[SlotHolder],
+  watches: &[ShardWatch],
+  looks: &mut [Option<Look>],
+  memory: &MemoryStallSource,
+) {
+  let suspected: Vec<usize> = looks
+    .iter()
     .zip(watches)
-    .zip(holders)
-    .filter_map(|((look, watch), holder)| {
-      let look = look.as_mut()?;
-      watch.suspects(look).then_some((look, *holder))
+    .enumerate()
+    .filter_map(|(index, (look, watch))| {
+      look
+        .as_ref()
+        .is_some_and(|look| watch.suspects(look))
+        .then_some(index)
     })
     .collect();
-  if suspects.is_empty() {
+  if suspected.is_empty() {
     return;
   }
-  let asked: Vec<SlotHolder> = suspects.iter().map(|(_, holder)| *holder).collect();
+  let stall = memory.read();
+  for look in looks.iter_mut().flatten() {
+    look.memory = stall;
+  }
+  let (at, asked): (Vec<usize>, Vec<SlotHolder>) = suspected
+    .into_iter()
+    .filter_map(|index| holders.get(index).map(|holder| (index, *holder)))
+    .unzip();
   let readings = slates_rt::registry::shard_run_readings(&asked);
-  for ((look, _), reading) in suspects.into_iter().zip(readings) {
-    look.run = reading;
+  for (index, reading) in at.into_iter().zip(readings) {
+    if let Some(Some(look)) = looks.get_mut(index) {
+      look.run = reading;
+    }
   }
 }
 
-/// Logs what the watchdog found of a shard the first look it finds it: `said` holds the kind last logged, cleared once
+/// What an episode's log line said of a shard: its verdict's kind, and for a starved one what it waited for, so a shard
+/// starved for a CPU that then waits on memory is logged again.
+type Said = (std::mem::Discriminant<Verdict>, Option<Want>);
+
+/// The [`Said`] of a verdict.
+fn said_of(verdict: Verdict) -> Said {
+  let of = match verdict {
+    Verdict::Starved { of, .. } => Some(of),
+    Verdict::Alive | Verdict::Wedged { .. } | Verdict::Spinning { .. } => None,
+  };
+  (std::mem::discriminant(&verdict), of)
+}
+
+/// Logs what the watchdog found of a shard the first look it finds it: `said` holds what was last logged, cleared once
 /// the shard is alive. A starved shard that then blocks is logged again as wedged. `turn` is what the watchdog does this
 /// turn, which a stuck shard's line names.
-/// A stuck shard's line names the lateness its verdict rests on, from `watch` at `now_ns` ([`stuck_lateness_words`]).
+/// A stuck shard's line names the lateness its verdict rests on, from `watch` at `now_ns` ([`stuck_lateness_words`]); a
+/// shard starved for memory, its wait in the `waiting` words ([`memory_wait_words`]).
 fn report(
-  said: &mut Option<std::mem::Discriminant<Verdict>>,
+  said: &mut Option<Said>,
   (shard, verdict, turn): (u16, Verdict, Turn),
   (watch, now_ns): (&ShardWatch, u64),
+  waiting: impl FnOnce() -> String,
 ) {
   if verdict == Verdict::Alive {
     *said = None;
     return;
   }
-  let kind = std::mem::discriminant(&verdict);
+  let kind = said_of(verdict);
   if *said != Some(kind) {
     *said = Some(kind);
-    log_verdict(shard, verdict, turn, || stuck_lateness_words(watch, now_ns));
+    log_verdict(
+      shard,
+      (verdict, turn),
+      || stuck_lateness_words(watch, now_ns),
+      waiting,
+    );
   }
+}
+
+/// A shard starved for memory in its log line's words: the kernel wait its thread is in, where the platform names one
+/// (Linux's `wchan`), and the host's reading at the look.
+fn memory_wait_words(holder: SlotHolder, watch: &ShardWatch) -> String {
+  let wait = slates_rt::registry::shard_kernel_wait_name(holder).map_or_else(
+    || "off the CPU".to_owned(),
+    |name| format!("in the kernel ({name})"),
+  );
+  format!(
+    "its thread waits {wait}, and the host's reading is {:?}",
+    watch.memory
+  )
 }
 
 /// What a turn does, in a stuck shard's log line.
@@ -824,14 +1019,34 @@ fn consequence(turn: Turn) -> &'static str {
   }
 }
 
-/// Logs one episode's verdict, with what the watchdog saw; a stuck one with the lateness `late` words.
-fn log_verdict(shard: u16, verdict: Verdict, turn: Turn, late: impl FnOnce() -> String) {
+/// Logs one episode's verdict, with what the watchdog saw; a stuck one with the lateness `late` words, one starved for
+/// memory with its wait's `waiting` words.
+fn log_verdict(
+  shard: u16,
+  (verdict, turn): (Verdict, Turn),
+  late: impl FnOnce() -> String,
+  waiting: impl FnOnce() -> String,
+) {
   match verdict {
-    Verdict::Starved { for_ns } => slates_machine::log_line!(
+    Verdict::Starved {
+      for_ns,
+      of: Want::Cpu,
+    } => slates_machine::log_line!(
       "slates daemon: shard {shard} is starved: no step and no CPU progress for {} ms, past the {} ms window, while its \
        thread waits for a CPU; the watchdog goes on beating",
       for_ns / NS_PER_MS,
       LIVENESS_BUDGET_NS / NS_PER_MS
+    ),
+    Verdict::Starved {
+      for_ns,
+      of: Want::Memory,
+    } => slates_machine::log_line!(
+      "slates daemon: shard {shard} is starved for memory: no step and no CPU progress for {} ms, past the {} ms \
+       window, while the host reports a memory stall; {}; the watchdog goes on beating, and judges it wedged a window \
+       after the stall clears",
+      for_ns / NS_PER_MS,
+      LIVENESS_BUDGET_NS / NS_PER_MS,
+      waiting()
     ),
     Verdict::Wedged { for_ns } => slates_machine::log_line!(
       "slates daemon: shard {shard} is wedged: no step, no CPU progress and no wait for a CPU for {} ms, past the {} ms \
@@ -867,6 +1082,7 @@ mod tests {
       parked,
       cpu,
       run: None,
+      memory: None,
       now_ns,
     }
   }
@@ -876,14 +1092,26 @@ mod tests {
     Some(RunReading {
       state: RunState::Runnable,
       waited_ns,
+      uninterruptible: Some(false),
     })
   }
 
-  /// What the scheduler says of a thread off the CPU and not ready.
+  /// What the scheduler says of a thread off the CPU and not ready, asleep (Linux `S`).
   fn blocked(waited_ns: Option<u64>) -> Option<RunReading> {
     Some(RunReading {
       state: RunState::Blocked,
       waited_ns,
+      uninterruptible: Some(false),
+    })
+  }
+
+  /// What the scheduler says of a thread off the CPU in a wait whose kind is `uninterruptible`: held in the kernel
+  /// (Linux `D`), asleep (`S`), or not told (`None`, macOS and Windows).
+  fn waiting_in(uninterruptible: Option<bool>) -> Option<RunReading> {
+    Some(RunReading {
+      state: RunState::Blocked,
+      waited_ns: None,
+      uninterruptible,
     })
   }
 
@@ -1157,7 +1385,10 @@ mod tests {
     assert!(verdicts.iter().all(|verdict| verdict.beats()));
     assert_eq!(
       verdicts.last(),
-      Some(&Verdict::Starved { for_ns: 50 * TURN })
+      Some(&Verdict::Starved {
+        for_ns: 50 * TURN,
+        of: Want::Cpu
+      })
     );
   }
 
@@ -1169,32 +1400,48 @@ mod tests {
     assert_eq!(first_wedged(&verdicts), None, "{verdicts:?}");
   }
 
-  /// A-228, §4.14. Do: find a shard starved, then wedged, then alive, and starved again. Expect: only a stuck shard
-  /// stops the beat, and each kind is logged once an episode, a starved shard that then blocks being logged again.
+  /// A-228, A-336, §4.14. Do: find a shard starved for a CPU, then for memory, then wedged, then alive. Expect: only a
+  /// stuck shard stops the beat, and each kind is logged once an episode: a starved shard that then waits on memory, or
+  /// blocks, is logged again.
   #[test]
   fn each_kind_of_verdict_is_logged_once_an_episode_and_only_a_stuck_shard_stops_the_beat() {
-    let starved = Verdict::Starved { for_ns: WINDOW };
+    let starved = Verdict::Starved {
+      for_ns: WINDOW,
+      of: Want::Cpu,
+    };
+    let for_memory = Verdict::Starved {
+      for_ns: WINDOW,
+      of: Want::Memory,
+    };
     let wedged = Verdict::Wedged { for_ns: WINDOW };
     let spinning = Verdict::Spinning {
       cpu_ns: WINDOW,
       window_ns: WINDOW,
     };
-    assert!(Verdict::Alive.beats() && starved.beats());
+    assert!(Verdict::Alive.beats() && starved.beats() && for_memory.beats());
     assert!(!wedged.beats() && !spinning.beats());
     let mut said = None;
     let watch = (&ShardWatch::default(), WINDOW);
-    report(&mut said, (1, starved, Turn::Beat), watch);
-    assert_eq!(said, Some(std::mem::discriminant(&starved)));
+    let words = String::new;
+    report(&mut said, (1, starved, Turn::Beat), watch, words);
+    assert_eq!(said, Some(said_of(starved)));
     report(
       &mut said,
-      (1, Verdict::Starved { for_ns: 2 * WINDOW }, Turn::Beat),
+      (
+        1,
+        Verdict::Starved {
+          for_ns: 2 * WINDOW,
+          of: Want::Cpu,
+        },
+        Turn::Beat,
+      ),
       watch,
+      words,
     );
-    assert_eq!(
-      said,
-      Some(std::mem::discriminant(&starved)),
-      "the same episode"
-    );
+    assert_eq!(said, Some(said_of(starved)), "the same episode");
+    report(&mut said, (1, for_memory, Turn::Beat), watch, words);
+    assert_eq!(said, Some(said_of(for_memory)), "now waiting on memory");
+    assert_ne!(said_of(for_memory), said_of(starved));
     report(
       &mut said,
       (
@@ -1206,9 +1453,10 @@ mod tests {
         }),
       ),
       watch,
+      words,
     );
-    assert_eq!(said, Some(std::mem::discriminant(&wedged)), "now stuck");
-    report(&mut said, (1, Verdict::Alive, Turn::Beat), watch);
+    assert_eq!(said, Some(said_of(wedged)), "now stuck");
+    report(&mut said, (1, Verdict::Alive, Turn::Beat), watch, words);
     assert_eq!(said, None);
   }
 
@@ -1272,7 +1520,17 @@ mod tests {
 
   /// Alive and starved shards are not handed in as stuck, and the turn beats.
   fn a_beating_shard_beats(supervision: Supervision, stopping: bool) {
-    for verdict in [Verdict::Alive, Verdict::Starved { for_ns: WINDOW }] {
+    for verdict in [
+      Verdict::Alive,
+      Verdict::Starved {
+        for_ns: WINDOW,
+        of: Want::Cpu,
+      },
+      Verdict::Starved {
+        for_ns: WINDOW,
+        of: Want::Memory,
+      },
+    ] {
       assert!(verdict.beats(), "{verdict:?}");
       assert_eq!(
         decide(supervision, None, false, stopping),
@@ -1568,6 +1826,139 @@ mod tests {
     for (name, reading) in cases {
       let verdicts = replay(&vec![reading; 20]);
       assert_eq!(first_wedged(&verdicts), Some(11), "{name}: {verdicts:?}");
+    }
+  }
+
+  /// A pressed level, as macOS and Windows read the host.
+  fn pressed(pressed: bool) -> Option<StallReading> {
+    Some(StallReading::Level { pressed })
+  }
+
+  /// The host's memory reading at each turn of a replay.
+  type MemoryAt<'a> = &'a dyn Fn(u64) -> Option<StallReading>;
+
+  /// Replays a shard that took its last step at the first turn and whose CPU clock never moves again, its thread off
+  /// the CPU as `run` says at every look, while the host's reading at turn `n` is `memory(n)`; the verdicts in order, the
+  /// first of them the second turn's.
+  fn replay_with_memory(run: Option<RunReading>, memory: MemoryAt<'_>, turns: u64) -> Vec<Verdict> {
+    let (_, mut watch) = ShardWatch::default().judge(
+      Look {
+        memory: memory(1),
+        ..look(5, false, Some((10, 10)), TURN)
+      },
+      WINDOW,
+      WINDOW,
+    );
+    (2..=turns)
+      .map(|turn| {
+        let (verdict, next) = watch.judge(
+          Look {
+            run,
+            memory: memory(turn),
+            ..look(5, false, Some((10, 10)), turn * TURN)
+          },
+          WINDOW,
+          WINDOW,
+        );
+        watch = next;
+        verdict
+      })
+      .collect()
+  }
+
+  /// Shape: the turn of the last look at which the host reports a memory stall in the A-336 replays.
+  const LAST_STALLED_TURN: u64 = 30;
+
+  /// A-336, §4.14, the starved extreme for memory. Do: replay a shard that stops stepping and runs no CPU, off the CPU
+  /// in a wait memory shows as (held in the kernel, Linux `D`; or a wait the platform does not tell, macOS and Windows),
+  /// while the host reports a memory stall at every look up to turn 30 (a pressed level; a PSI total rising), then
+  /// reports none. Expect: never wedged while the host stalls, three windows of it, and starved for memory once a
+  /// window has passed with no CPU; wedged a window after the last stalled look, at turn 40, so a stuck shard is still
+  /// found once the stall clears. Before, it was wedged at turn 11, a window after its last step, as a lone daemon at a
+  /// few hundred megabytes free was ended (g231, 2026-11-17).
+  #[test]
+  fn a_shard_waiting_on_memory_while_the_host_stalls_is_starved_and_wedged_a_window_after_the_stall_clears()
+   {
+    let level = |turn: u64| pressed(turn <= LAST_STALLED_TURN);
+    let total = |turn: u64| {
+      Some(StallReading::Cumulative {
+        stalled_us: 1_000 * turn.min(LAST_STALLED_TURN),
+      })
+    };
+    let readings: [(&str, MemoryAt<'_>); 2] =
+      [("a pressed level", &level), ("a rising total", &total)];
+    for (source, memory) in readings {
+      for (wait, run) in [
+        ("held in the kernel", waiting_in(Some(true))),
+        ("a wait the platform does not tell", waiting_in(None)),
+      ] {
+        let verdicts = replay_with_memory(run, memory, 60);
+        assert_eq!(
+          first_wedged(&verdicts),
+          Some(LAST_STALLED_TURN + 10),
+          "{source}, {wait}: {verdicts:?}"
+        );
+        assert!(
+          verdicts
+            .iter()
+            .take_while(|verdict| !matches!(verdict, Verdict::Wedged { .. }))
+            .all(|verdict| verdict.beats()),
+          "{source}, {wait}: every verdict before the wedge beats"
+        );
+        assert!(
+          verdicts.contains(&Verdict::Starved {
+            for_ns: (LAST_STALLED_TURN - 1) * TURN,
+            of: Want::Memory
+          }),
+          "{source}, {wait}: starved for memory at the last stalled look: {verdicts:?}"
+        );
+      }
+    }
+  }
+
+  /// A-336, §4.14, the stuck extreme where the platform tells the wait. Do: replay a still shard asleep in a futex, a
+  /// poll or a sleep (Linux `S`), and one with no reading of its thread at all, while the host reports a memory stall at
+  /// every look. Expect: each wedged a window after its last step, at turn 11, as before: a stall on the host does not
+  /// excuse a thread whose own state says it is not waiting on memory, nor one nothing was read of.
+  #[test]
+  fn a_shard_asleep_or_unread_is_wedged_within_the_window_however_the_host_stalls() {
+    let stalled = |_| pressed(true);
+    for (wait, run) in [("asleep", blocked(None)), ("no reading", None)] {
+      let verdicts = replay_with_memory(run, &stalled, 30);
+      assert_eq!(first_wedged(&verdicts), Some(11), "{wait}: {verdicts:?}");
+    }
+  }
+
+  /// A-336, the rule's table. Do: ask whether a still look finds a shard held for memory, for each thread reading (held
+  /// in the kernel, a wait not told, asleep, runnable, none) and each host stall (a pressed level, a clear one, a risen
+  /// total, an unchanged total, a total with none before it, no reading). Expect: held only where the host stalled and
+  /// the thread is blocked in a wait memory can show as.
+  #[test]
+  fn a_look_finds_a_shard_held_for_memory_only_off_the_cpu_while_the_host_stalls() {
+    let total = |stalled_us| Some(StallReading::Cumulative { stalled_us });
+    let stalls = [
+      ("pressed", None, pressed(true), true),
+      ("clear", pressed(true), pressed(false), false),
+      ("risen", total(5), total(6), true),
+      ("unchanged", total(5), total(5), false),
+      ("first total", None, total(5), false),
+      ("no reading", pressed(true), None, false),
+    ];
+    let threads = [
+      ("held in the kernel", waiting_in(Some(true)), true),
+      ("not told", waiting_in(None), true),
+      ("asleep", waiting_in(Some(false)), false),
+      ("runnable", runnable(None), false),
+      ("unread", None, false),
+    ];
+    for (stall, before, now, stalled) in stalls {
+      for (thread, run, may_wait_on_memory) in threads {
+        assert_eq!(
+          held_for_memory(before, now, run),
+          stalled && may_wait_on_memory,
+          "{stall}, {thread}"
+        );
+      }
     }
   }
 }

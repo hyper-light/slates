@@ -396,6 +396,7 @@ VolumeRefusal 16 DigestCacheFull
 VolumeRefusal 17 Memory
 VolumeRefusal 18 JournalIncomplete
 VolumeRefusal 19 RecoveryVersion
+VolumeRefusal 20 RetentionExceeded
 WatcherState 0 Live
 WatcherState 1 Overflowed
 WatcherState 2 Unavailable
