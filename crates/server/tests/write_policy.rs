@@ -17,7 +17,9 @@ use slates_client::{
   WritePolicy,
 };
 use slates_ipc::protocol::{GrantScope, Intent};
-use slates_server::landing::{enroll_proof, grant_proof, merge_approval_proof, policy_proof};
+use slates_server::landing::{
+  enroll_proof, grant_proof, merge_approval_proof, policy_proof, revoke_proof,
+};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 mod common;
@@ -64,6 +66,7 @@ fn landing(land: WriteMode) -> WritePolicy {
   WritePolicy {
     merge: WriteMode::Ask,
     land,
+    require_signed_merges: false,
   }
 }
 
@@ -255,6 +258,7 @@ fn merging(merge: WriteMode) -> WritePolicy {
   WritePolicy {
     merge,
     land: WriteMode::Ask,
+    require_signed_merges: false,
   }
 }
 
@@ -355,6 +359,112 @@ fn an_agent_cannot_approve_its_own_merge() {
   daemon.stop();
 }
 
+/// A-285: an agent never approves its own landing, as it never approves its own merge. Do: from a channel bound to an
+/// enrolled consumer, land the agent's own volume, whose policy asks, then grant that presented landing with a genuine
+/// proof (the launcher's secret leaked to the agent). Expect the approval request, the grant refused `Forbidden`, and
+/// nothing written: the landing's approval is the launcher's or the harness's, never the agent's own channel's.
+#[test]
+fn an_agent_cannot_approve_its_own_landing() {
+  let (daemon, instance) = daemon("approve-landing");
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let target = target_dir();
+  let mut launcher = connect(&instance);
+  let account = rustix::process::getuid().as_raw();
+  let (consumer, capability) = launcher
+    .enroll(account, enroll_proof(&secret, account))
+    .unwrap();
+  let mut agent = connect(&instance);
+  agent.attest(consumer, &capability).unwrap();
+  let volume = volume_with(&mut agent, "self-approved", b"agent's work");
+  set(&mut launcher, &secret, volume, landing(WriteMode::Ask));
+  let Ok(Landing::GrantRequired {
+    landing: presented,
+    manifest,
+    ..
+  }) = agent.land(volume, None, &target.path, Filter::default(), None)
+  else {
+    panic!("an ask landing answers an approval request");
+  };
+  let proof = grant_proof(
+    &secret,
+    presented,
+    &manifest,
+    GrantScope::Once,
+    GRANT_TERM_NS,
+  );
+  let granted = agent.grant(presented, manifest, GrantScope::Once, GRANT_TERM_NS, proof);
+  assert!(
+    matches!(
+      granted,
+      Err(ClientError::Refused(Refusal::Forbidden { .. }))
+    ),
+    "a consumer-bound channel approves no landing, even with a genuine proof: {granted:?}"
+  );
+  assert_eq!(on_disk(&target), None);
+  drop(agent);
+  drop(launcher);
+  daemon.stop();
+}
+
+/// A-285: an agent never enrolls a consumer or revokes one, as it never sets a policy or approves a landing: the
+/// launcher's authority is the instance's issuer, which an agent's consumer-bound channel never holds. Do: from a
+/// channel bound to an enrolled consumer, holding genuine proofs (the launcher's secret leaked to the agent), enroll a
+/// fresh consumer under the agent's own account, then revoke a second agent's consumer; then revoke that consumer from
+/// the launcher's channel. Expect the agent's enrollment and revocation refused `Forbidden`, the second agent's channel
+/// still served after them, and refused `ConsumerRevoked` only after the launcher's revocation.
+#[test]
+fn an_agent_cannot_enroll_or_revoke_a_consumer() {
+  let (daemon, instance) = daemon("enroll-revoke");
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let mut launcher = connect(&instance);
+  let account = rustix::process::getuid().as_raw();
+  let (consumer, capability) = launcher
+    .enroll(account, enroll_proof(&secret, account))
+    .unwrap();
+  let (neighbour, neighbour_capability) = launcher
+    .enroll(account, enroll_proof(&secret, account))
+    .unwrap();
+  let mut agent = connect(&instance);
+  agent.attest(consumer, &capability).unwrap();
+  let mut neighbouring_agent = connect(&instance);
+  neighbouring_agent
+    .attest(neighbour, &neighbour_capability)
+    .unwrap();
+  let neighbours_volume = volume_with(&mut neighbouring_agent, "neighbours", b"neighbour's work");
+  let enrolled = agent.enroll(account, enroll_proof(&secret, account));
+  assert!(
+    matches!(
+      enrolled,
+      Err(ClientError::Refused(Refusal::Forbidden { .. }))
+    ),
+    "a consumer-bound channel enrolls no consumer, even with a genuine proof: {enrolled:?}"
+  );
+  let revoked = agent.revoke(neighbour, revoke_proof(&secret, neighbour));
+  assert!(
+    matches!(
+      revoked,
+      Err(ClientError::Refused(Refusal::Forbidden { .. }))
+    ),
+    "a consumer-bound channel revokes no consumer, even with a genuine proof: {revoked:?}"
+  );
+  assert!(
+    neighbouring_agent.status(neighbours_volume).is_ok(),
+    "the neighbour's consumer stands after the agent's refused revocation"
+  );
+  launcher
+    .revoke(neighbour, revoke_proof(&secret, neighbour))
+    .unwrap();
+  let after = neighbouring_agent.status(neighbours_volume);
+  assert!(
+    matches!(after, Err(ClientError::Refused(Refusal::ConsumerRevoked))),
+    "the launcher's revocation takes: {after:?}"
+  );
+  drop(neighbouring_agent);
+  drop(agent);
+  drop(launcher);
+  daemon.stop();
+}
+
 /// A-285: a present-only landing never writes, whatever the policy. Do: present a bypass volume's landing and a
 /// forbidden volume's. Expect each answered with its plan (an approval request), nothing on disk, and the bypass
 /// volume's ordinary `land` afterwards written at once.
@@ -440,6 +550,7 @@ fn a_consumers_own_policy_holds_its_agent_to_the_stricter_mode() {
   let asked = WritePolicy {
     merge: WriteMode::Forbid,
     land: WriteMode::Ask,
+    require_signed_merges: false,
   };
   launcher
     .set_policy(
@@ -459,6 +570,7 @@ fn a_consumers_own_policy_holds_its_agent_to_the_stricter_mode() {
   let forbidden = WritePolicy {
     merge: WriteMode::Forbid,
     land: WriteMode::Forbid,
+    require_signed_merges: false,
   };
   launcher
     .set_policy(

@@ -1,8 +1,9 @@
 //! The anchor's hold on this daemon's FUSE devices (§4.6 "Linux": "restore from the anchor's held fd"; A-61;
-//! AC-3.4). A FUSE mount's device is the daemon's own descriptor, so without the anchor it dies with the
-//! process. With it, the daemon hands the anchor a duplicate of each device it mounts, over the channel the
-//! anchor gave it ([`slates_anchor::held`]), and the next daemon gets the devices back and serves their
-//! mounts again (`crate::fuse::adopt_held`).
+//! AC-3.4), and on its Shards streams' resync ends, which it keeps as it keeps a device (A-316; on macOS, where there is
+//! no FUSE, they are the only devices it holds, A-339). A FUSE mount's device is the daemon's own descriptor, so
+//! without the anchor it dies with the process. With it, the daemon hands the anchor a duplicate of each device it
+//! mounts, over the channel the anchor gave it ([`slates_anchor::held`]), and the next daemon gets the devices back and
+//! serves their mounts again (`crate::fuse::adopt_held`), or their streams on fresh ones (`crate::shards::adopt_held`).
 //!
 //! The channel and the handed devices are adopted once at start by [`crate::anchor_hold`], which the NFS connection
 //! hold (A-113) shares; this module splits the devices by the partition that owns their attachment (an attachment id
@@ -12,9 +13,12 @@
 //! A daemon without a supervising anchor (a test harness, a standalone start) has no channel: its sends are
 //! answered `None`, and its mounts end with it, as before A-61.
 
-use std::os::fd::{BorrowedFd, OwnedFd};
+#[cfg(target_os = "linux")]
+use std::os::fd::BorrowedFd;
+use std::os::fd::OwnedFd;
 
 use slates_anchor::held::{HoldRefusal, Outgoing};
+#[cfg(target_os = "linux")]
 use slates_bridge_fuse::session::Session;
 
 use crate::anchor_hold::{HandedDevice, send};
@@ -28,13 +32,18 @@ pub(crate) struct HeldDevice {
   pub(crate) attachment: u64,
   /// The device.
   pub(crate) device: OwnedFd,
-  /// What its connection negotiated.
+  /// What its connection negotiated (a FUSE device's; Linux).
+  #[cfg(target_os = "linux")]
   pub(crate) session: Option<Session>,
+  /// The session's bytes as the anchor kept them: a Shards stream's resync end keeps its token and owner view there
+  /// (A-316; `crate::shards`), which the attachment's record, not these bytes, says it is.
+  pub(crate) raw_session: Option<Vec<u8>>,
 }
 
 impl HeldDevice {
   /// Whether this device's mount can be served again: its session arrived and its kernel can resend the
   /// requests the dead daemon read and never answered (without that, those callers would wait forever).
+  #[cfg(target_os = "linux")]
   pub(crate) fn adoptable(&self) -> bool {
     self.session.is_some_and(|session| session.kernel_resends)
   }
@@ -46,6 +55,7 @@ impl HeldDevice {
 pub(crate) fn split(handed: Vec<HandedDevice>, partitions: usize) -> Vec<Vec<HeldDevice>> {
   let mut split: Vec<Vec<HeldDevice>> = (0..partitions).map(|_| Vec::new()).collect();
   for handed in handed {
+    #[cfg(target_os = "linux")]
     let session = handed
       .session
       .as_deref()
@@ -53,7 +63,9 @@ pub(crate) fn split(handed: Vec<HandedDevice>, partitions: usize) -> Vec<Vec<Hel
     let held = HeldDevice {
       attachment: handed.attachment,
       device: handed.device,
+      #[cfg(target_os = "linux")]
       session,
+      raw_session: handed.session,
     };
     let partition = usize::from(crate::verbs::owner_of_attachment(handed.attachment));
     match split.get_mut(partition) {
@@ -68,11 +80,13 @@ pub(crate) fn split(handed: Vec<HandedDevice>, partitions: usize) -> Vec<Vec<Hel
 }
 
 /// Asks the anchor to hold `device` for `attachment`.
+#[cfg(target_os = "linux")]
 pub(crate) fn hold(attachment: u64, device: BorrowedFd<'_>) -> Option<Result<(), HoldRefusal>> {
   send(&Outgoing::Hold { attachment, device })
 }
 
 /// Tells the anchor what `attachment`'s connection negotiated.
+#[cfg(target_os = "linux")]
 pub(crate) fn session(attachment: u64, session: Session) -> Option<Result<(), HoldRefusal>> {
   let bytes = session.to_bytes();
   send(&Outgoing::Session {

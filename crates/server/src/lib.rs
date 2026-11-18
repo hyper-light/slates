@@ -60,14 +60,17 @@ mod forward_lane;
 mod fs_verbs;
 #[cfg(target_os = "linux")]
 mod fuse;
-#[cfg(target_os = "linux")]
+// The descriptors the anchor holds for this daemon's attachments: FUSE devices (Linux) and Shards streams' resync ends
+// (Linux, macOS; A-316, A-339).
+#[cfg(unix)]
 mod fuse_hold;
 // The macOS NFS mounts this daemon serves, recorded as its own (A-227).
 #[cfg(target_os = "macos")]
 mod own_nfs;
 // A writable direct map's copy that outlives its daemon: held by the anchor, taken back by the successor (A-197).
 mod checkout;
-pub mod grant_signature;
+// A green's takeover successor adopts its holder ledger rather than copying it (§4.16 owner-loss recovery, A-333).
+mod green_adopt;
 pub mod head;
 #[cfg(target_os = "linux")]
 mod held_copy;
@@ -79,11 +82,21 @@ pub mod lease;
 mod lease_wait;
 mod live_ship;
 mod member_task;
+// Version 0 of a green over a base, made, shipped and seeded a slice at a time at `f > 0` (§4.16, A-286).
+mod merge_origin;
 pub mod merge_service;
 mod mirror;
+// A host admitted again under its own id yields the volumes it catalogued (A-334, §4.8 "Authority scope").
+mod readmission;
 mod remote_attach;
-#[cfg(target_os = "linux")]
+mod work_home;
+// The writes acknowledged since the last publication, kept in anchor RAM (A-63): a FUSE mount's (Linux) and a Shards
+// stream's (Linux, macOS; A-316, A-339).
+#[cfg(unix)]
 mod write_log;
+// Each range a Shards stream's held DAX backing has answered, kept in anchor RAM for a successor (A-365).
+#[cfg(unix)]
+mod dax_ranges;
 // The Windows WinFsp transport (§4.6 "Windows"): a volume at a drive letter, served on its owner shard.
 #[cfg(windows)]
 mod winfsp;
@@ -120,6 +133,8 @@ mod recovery_slices;
 pub mod seal_keys;
 // A client's session key (GAP-A9-9's threat model): what a client resuming under its id proves before its seat is served.
 pub mod session_key;
+// Signed work (A-321): SSH signatures over a merge's or a landing's statement, verified as provenance, never a permission.
+pub mod signed_work;
 mod snapshot_view;
 // The Shards fs transport (§4.6, the Shards route; A-161): a volume served to a Shards microVM over an anonymous
 // stream, on the volume's owning shard: a socket pair on Unix, a duplex named pipe on Windows served by the runtime's

@@ -21,8 +21,11 @@
 //! 4. the client sends its proof, the id sealed with AES-256-GCM under its key, the transcript (the label, the kind,
 //!    the id and both nonces) as additional data, so a proof made for one kind of offer never opens for the other;
 //! 5. the daemon opens it, retires the offer (a secret claims once), and sends its confirmation, the id sealed under its
-//!    own key, with the descriptor by `SCM_RIGHTS` in the same message; the client opens the confirmation before it
-//!    trusts the descriptor, and closes the route, which tells the daemon its receive has returned;
+//!    own key, with the descriptor by `SCM_RIGHTS` in the same message; a stream's offer whose resync channel the
+//!    daemon made sends that channel's device end beside the stream's, under a confirmation kind of its own that names
+//!    two descriptors (A-339), so the client knows exactly what to expect and refuses anything else; the client opens
+//!    the confirmation before it trusts a descriptor, and closes the route, which tells the daemon its receive has
+//!    returned;
 //! 6. only then does the daemon close its own copy of the descriptor. XNU flushes a Unix socket whose every reference is in a
 //!    message in flight when its collector of such descriptors runs (`unp_gc`), so an end the daemon closed at once
 //!    could arrive with its receive buffer emptied and its reads answering end of file (measured 2026-10-24; the bug
@@ -83,8 +86,11 @@ const OFFER_STREAM: u8 = 1;
 const OFFER_MAP: u8 = 2;
 /// Format: the kind byte that opens every message the daemon sends: its nonce follows.
 pub const KIND_CHALLENGE: u8 = 0;
-/// Format: the kind of the daemon's confirmation, which carries the stream end.
+/// Format: the kind of the daemon's confirmation, which carries the offer's one descriptor.
 pub const KIND_CONFIRM: u8 = 1;
+/// Format: the kind of the daemon's confirmation of a stream's offer that carries two descriptors (A-339): the stream's
+/// end, then the device's end of its resync channel. Only a stream's offer is confirmed so.
+pub const KIND_CONFIRM_WITH_RESYNC: u8 = 6;
 /// Format: the kinds of the daemon's refusals, each alone and then the end.
 pub const KIND_NO_OFFER: u8 = 2;
 /// Format: a refused proof.
@@ -544,25 +550,39 @@ pub fn confined_map(
   Ok(())
 }
 
+/// Format: the most descriptors a confirmation carries: a stream's end and its resync end (A-339).
+const CONFIRMED_DESCRIPTORS: usize = 2;
+/// Format: the descriptors a confirmation is read with room for: one more than the most it carries, so a message
+/// carrying more is seen as such and refused rather than cut short.
+const CONFIRMATION_ROOM: usize = CONFIRMED_DESCRIPTORS + 1;
+
 /// Sends the daemon's confirmation on `connection`, the offered descriptor by `SCM_RIGHTS` in the same message, so it
-/// arrives with the bytes that vouch for it.
+/// arrives with the bytes that vouch for it; for a stream's offer with a resync channel, `resync`, that channel's device
+/// end, rides beside it under [`KIND_CONFIRM_WITH_RESYNC`] (A-339).
 pub fn send_confirmation(
   connection: BorrowedFd<'_>,
   confirmation: &[u8; SEALED_BYTES],
   stream: BorrowedFd<'_>,
+  resync: Option<BorrowedFd<'_>>,
 ) -> Result<(), IpcError> {
   let mut message = [0u8; 1 + SEALED_BYTES];
   let (kind, body) = message.split_at_mut(1);
   if let Some(byte) = kind.first_mut() {
-    *byte = KIND_CONFIRM;
+    *byte = if resync.is_some() {
+      KIND_CONFIRM_WITH_RESYNC
+    } else {
+      KIND_CONFIRM
+    };
   }
   body.copy_from_slice(confirmation);
-  let fds = [stream];
-  let mut space = [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(1))];
+  let both = [Some(stream), resync];
+  let fds: Vec<BorrowedFd<'_>> = both.into_iter().flatten().collect();
+  let mut space =
+    [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(CONFIRMED_DESCRIPTORS))];
   let mut control = SendAncillaryBuffer::new(&mut space);
   if !control.push(SendAncillaryMessage::ScmRights(&fds)) {
     return Err(IpcError::Layout {
-      reason: "the stream end did not fit the ancillary buffer",
+      reason: "the offered descriptors did not fit the ancillary buffer",
     });
   }
   let sent = rustix::net::sendmsg(
@@ -605,19 +625,31 @@ fn refusal_of(kind: u8) -> RouteRefusal {
   }
 }
 
+/// What a claim brings: the offer's descriptor (a stream's end, a map's copy), and for a stream's offer the device's
+/// end of its resync channel when the daemon made one (A-339). Each close-on-exec.
+#[derive(Debug)]
+pub struct Claimed {
+  /// The offered descriptor.
+  pub descriptor: OwnedFd,
+  /// The stream's resync end, beside it; none for a map, or a stream with no channel.
+  pub resync: Option<OwnedFd>,
+}
+
 /// Claims the `kind` offer `id` from the daemon of `instance` with the offer's `secret` (the client's side of the
-/// exchange in the module doc): its descriptor, once the daemon's confirmation opens. Each socket read and write waits
-/// `within` at a time, and when that runs out asks `alive` whether the daemon still lives: while it does, the step goes
-/// on waiting, as a client waits for a deferred reply (A-186), since a live daemon always answers its route; once it
-/// does not, the claim is refused `DeadlineExceeded`. The daemon's refusals arrive typed (`RouteRefused`), and a
-/// confirmation that does not open is refused `Confirmation` with the descriptor it carried closed.
+/// exchange in the module doc): its descriptor, and a stream's resync end beside it, once the daemon's confirmation
+/// opens. Each socket read and write waits `within` at a time, and when that runs out asks `alive` whether the daemon
+/// still lives: while it does, the step goes on waiting, as a client waits for a deferred reply (A-186), since a live
+/// daemon always answers its route; once it does not, the claim is refused `DeadlineExceeded`. The daemon's refusals
+/// arrive typed (`RouteRefused`); a confirmation that does not open is refused `Confirmation`, one carrying other
+/// descriptors than its kind and the offer's name `Malformed`, and one carrying a socket the kernel flushed in flight
+/// `Flushed`, every descriptor it carried closed.
 pub fn claim(
   instance: &str,
   (kind, id): (OfferKind, u64),
   secret: &[u8; SECRET_BYTES],
   within: Duration,
   alive: &mut dyn FnMut() -> bool,
-) -> Result<OwnedFd, IpcError> {
+) -> Result<Claimed, IpcError> {
   let address = SocketAddrUnix::new(path(instance)?).map_err(|e| refused("socket address", e))?;
   let socket = stream_socket()?;
   for which in [
@@ -645,7 +677,7 @@ pub fn claim(
   read_exact(socket.as_fd(), &mut daemon_nonce, alive)?;
   let exchange = Exchange::new(secret, (kind, id), &hello.client_nonce, &daemon_nonce)?;
   write_all(socket.as_fd(), &exchange.proof()?, alive)?;
-  let (confirmation, stream) = receive_confirmation(socket.as_fd(), alive)?;
+  let (confirmation, claimed) = receive_confirmation(socket.as_fd(), kind, alive)?;
   if !exchange.confirmation_holds(&confirmation) {
     return Err(IpcError::RouteRefused {
       refusal: RouteRefusal::Confirmation,
@@ -653,13 +685,16 @@ pub fn claim(
   }
   // A flush empties a socket's receive buffer and zeroes its high-water mark; a live end's is the kernel's default. A
   // descriptor that is not a socket (a map's copy) answers no such size, and is not judged by it.
-  if rustix::net::sockopt::socket_recv_buffer_size(&stream).is_ok_and(|bytes| bytes == 0) {
+  let flushed = |descriptor: &OwnedFd| {
+    rustix::net::sockopt::socket_recv_buffer_size(descriptor).is_ok_and(|bytes| bytes == 0)
+  };
+  if flushed(&claimed.descriptor) || claimed.resync.as_ref().is_some_and(flushed) {
     return Err(IpcError::RouteRefused {
       refusal: RouteRefusal::Flushed,
     });
   }
-  // Closing `socket` on return tells the daemon this receive has returned, so it may close its copy of the end.
-  Ok(stream)
+  // Closing `socket` on return tells the daemon this receive has returned, so it may close its copies of the ends.
+  Ok(claimed)
 }
 
 /// Whether a step whose wait ran out may wait again: while `alive` says the daemon lives; otherwise the claim is
@@ -672,14 +707,16 @@ fn wait_again(alive: &mut dyn FnMut() -> bool) -> Result<(), IpcError> {
   }
 }
 
-/// The daemon's answer to a proof: its confirmation and the stream end it carried, or its refusal. Its wait runs out
-/// and is renewed as [`claim`] says.
+/// The daemon's answer to a proof for a `kind` offer: its confirmation and the descriptors it carried, or its refusal.
+/// Its wait runs out and is renewed as [`claim`] says.
 fn receive_confirmation(
   socket: BorrowedFd<'_>,
+  kind: OfferKind,
   alive: &mut dyn FnMut() -> bool,
-) -> Result<([u8; SEALED_BYTES], OwnedFd), IpcError> {
+) -> Result<([u8; SEALED_BYTES], Claimed), IpcError> {
   let mut message = [0u8; 1 + SEALED_BYTES];
-  let mut space = [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(1))];
+  let mut space =
+    [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(CONFIRMATION_ROOM))];
   let mut control = RecvAncillaryBuffer::new(&mut space);
   let received = loop {
     match rustix::net::recvmsg(
@@ -700,34 +737,61 @@ fn receive_confirmation(
       descriptors.extend(iter);
     }
   }
-  let kind = message.first().copied().unwrap_or(KIND_MALFORMED);
+  // macOS has no `MSG_CMSG_CLOEXEC`, so each received descriptor is made close-on-exec here, as the client's promise
+  // to its caller says: no child the client spawns inherits one by accident. A child another of the client's threads
+  // forks between the receive and this call could still inherit it; a client that forks while it claims makes that
+  // window.
+  for descriptor in &descriptors {
+    rustix::io::fcntl_setfd(descriptor, rustix::io::FdFlags::CLOEXEC)
+      .map_err(|e| refused("fcntl_setfd received end", e))?;
+  }
+  let confirmed = message.first().copied().unwrap_or(KIND_MALFORMED);
   if received.bytes == 0 {
     return Err(IpcError::RouteRefused {
       refusal: RouteRefusal::Malformed,
     });
   }
-  if kind != KIND_CONFIRM {
+  if !matches!(confirmed, KIND_CONFIRM | KIND_CONFIRM_WITH_RESYNC) {
     return Err(IpcError::RouteRefused {
-      refusal: refusal_of(kind),
+      refusal: refusal_of(confirmed),
     });
   }
   let malformed = IpcError::RouteRefused {
     refusal: RouteRefusal::Malformed,
   };
-  if received.bytes != message.len() || descriptors.len() != 1 {
+  if received.bytes != message.len() {
     return Err(malformed);
   }
-  let stream = descriptors.pop().ok_or(malformed.clone())?;
-  // macOS has no `MSG_CMSG_CLOEXEC`, so the received end is made close-on-exec here, as the client's promise to its
-  // caller says: no child the client spawns inherits it by accident. A child another of the client's threads forks
-  // between the receive and this call could still inherit it; a client that forks while it claims makes that window.
-  rustix::io::fcntl_setfd(&stream, rustix::io::FdFlags::CLOEXEC)
-    .map_err(|e| refused("fcntl_setfd received end", e))?;
+  let claimed = claimed_of(confirmed, kind, descriptors).ok_or(malformed.clone())?;
   let confirmation = message
     .get(1..)
     .and_then(|body| <[u8; SEALED_BYTES]>::try_from(body).ok())
     .ok_or(malformed)?;
-  Ok((confirmation, stream))
+  Ok((confirmation, claimed))
+}
+
+/// The descriptors a confirmation of kind `confirmed` carried for a `kind` offer, as the protocol names them: one for
+/// [`KIND_CONFIRM`]; a stream's end then its resync end for [`KIND_CONFIRM_WITH_RESYNC`], which only a stream's offer is
+/// confirmed with (A-339). `None` for any other count or pairing, every descriptor then closed.
+fn claimed_of(confirmed: u8, kind: OfferKind, descriptors: Vec<OwnedFd>) -> Option<Claimed> {
+  let with_resync = confirmed == KIND_CONFIRM_WITH_RESYNC;
+  if with_resync && kind != OfferKind::Stream {
+    return None;
+  }
+  match <[OwnedFd; 2]>::try_from(descriptors) {
+    Ok([descriptor, resync]) if with_resync => Some(Claimed {
+      descriptor,
+      resync: Some(resync),
+    }),
+    Ok(_) => None,
+    Err(descriptors) => match <[OwnedFd; 1]>::try_from(descriptors) {
+      Ok([descriptor]) if !with_resync => Some(Claimed {
+        descriptor,
+        resync: None,
+      }),
+      _ => None,
+    },
+  }
 }
 
 /// Writes all of `bytes` on a blocking socket whose writes time out, each wait renewed as [`claim`] says.
@@ -880,5 +944,60 @@ mod tests {
     let directory = first.parent().unwrap();
     assert!(!directory.starts_with("/tmp"));
     owner_only(directory).unwrap();
+  }
+
+  /// Reads `received`'s copy of a stream end: what its peer `peer` wrote reads back through it.
+  fn reads_through(peer: &OwnedFd, received: &OwnedFd, bytes: &[u8]) -> bool {
+    crate::stream::send(peer.as_fd(), bytes).unwrap();
+    let mut back = vec![0u8; bytes.len()];
+    rustix::io::read(received, &mut back).is_ok_and(|read| back.get(..read) == Some(bytes))
+  }
+
+  /// A-339. Do: send a stream's confirmation with its resync end beside its end, and one with its end alone; read each
+  /// as a stream's claim and as a map's. Expect a stream's claim of the first to take the end and then the resync end,
+  /// each the very socket sent (bytes written on its peer read back through it) and close-on-exec; a map's claim of it
+  /// refused `Malformed`, since only a stream's offer carries a resync end; the second taken by either kind of claim with
+  /// no resync end.
+  #[test]
+  fn a_streams_confirmation_carries_its_resync_end_beside_its_end_and_a_maps_never_does() {
+    let confirmation = [7u8; SEALED_BYTES];
+    let mut alive = || true;
+    // Kept open past every receipt: a socket whose every copy rides a message is flushed by macOS's collector (A-161).
+    let (stream_peer, stream_end) = crate::stream::pair().unwrap();
+    let (resync_peer, resync_end) = crate::stream::pair().unwrap();
+    let malformed = IpcError::RouteRefused {
+      refusal: RouteRefusal::Malformed,
+    };
+    for kind in [OfferKind::Stream, OfferKind::Map] {
+      let (daemon, client) = crate::stream::pair().unwrap();
+      send_confirmation(
+        daemon.as_fd(),
+        &confirmation,
+        stream_end.as_fd(),
+        Some(resync_end.as_fd()),
+      )
+      .unwrap();
+      match (kind, receive_confirmation(client.as_fd(), kind, &mut alive)) {
+        (OfferKind::Stream, Ok((confirmed, claimed))) => {
+          assert_eq!(confirmed, confirmation);
+          let resync = claimed.resync.expect("the resync end rides beside the end");
+          assert!(reads_through(&stream_peer, &claimed.descriptor, b"end"));
+          assert!(reads_through(&resync_peer, &resync, b"resync"));
+          for received in [&claimed.descriptor, &resync] {
+            let flags = rustix::io::fcntl_getfd(received).unwrap();
+            assert!(flags.contains(rustix::io::FdFlags::CLOEXEC));
+          }
+        }
+        (OfferKind::Map, Err(refused)) => assert_eq!(refused, malformed),
+        (kind, other) => panic!("a {kind:?} claim of a stream's two ends: {other:?}"),
+      }
+    }
+    for kind in [OfferKind::Stream, OfferKind::Map] {
+      let (daemon, client) = crate::stream::pair().unwrap();
+      send_confirmation(daemon.as_fd(), &confirmation, stream_end.as_fd(), None).unwrap();
+      let (_, claimed) = receive_confirmation(client.as_fd(), kind, &mut alive).unwrap();
+      assert!(claimed.resync.is_none(), "one descriptor, no resync end");
+      assert!(reads_through(&stream_peer, &claimed.descriptor, b"alone"));
+    }
   }
 }

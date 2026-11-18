@@ -205,28 +205,34 @@ fn mount_verb(
 
 /// `unmount` on Windows (§4.6 "Windows"): the WinFsp volume at drive `path` is the daemon's own, so the library finds
 /// its attachment among the volumes' reported mounts and detaches it; a volume whose status was refused cannot report
-/// its mounts and is named on standard error, and the drive is still released when another volume reports it.
+/// its mounts and is named on standard error, whether or not the drive is released (another volume reports it). The
+/// names went missing from a released drive's unmount when the CLI moved onto the library (A-278) and came back on
+/// 2026-11-18 (the integrator's Windows lane, run 44257181904).
 #[cfg(windows)]
 fn unmount_verb(instance: &str, path: &str) -> Result<(), Failure> {
   let mut attached = Instance::from_client(instance, connect(instance)?);
   match attached.unmount(path) {
-    Err(slates_api::Error::Mount(slates_api::MountFault::NotMounted { path, unreported }))
-      if !unreported.is_empty() =>
-    {
-      for volume in &unreported {
-        slates_machine::log_line!(
-          "slates: volume {} ({}) refused {}: its mounts are unknown",
-          volume.name,
-          slates_api::volume_id_text(volume.volume),
-          volume.refusal
-        );
-      }
+    Ok(unmounted) => {
+      name_the_unasked(&unmounted.unreported);
+      Ok(())
+    }
+    Err(slates_api::Error::Mount(slates_api::MountFault::NotMounted { path, unreported })) => {
+      name_the_unasked(&unreported);
       Err(failure_of_api(
         slates_api::Error::Mount(slates_api::MountFault::NotMounted { path, unreported }),
         instance,
       ))
     }
-    other => other.map_err(|e| failure_of_api(e, instance)),
+    Err(refused) => Err(failure_of_api(refused, instance)),
+  }
+}
+
+/// Names on standard error each volume a Windows unmount could not ask, with its status's refusal: its mounts are
+/// unknown.
+#[cfg(windows)]
+fn name_the_unasked(unreported: &[slates_api::Unreported]) {
+  for volume in unreported {
+    slates_machine::log_line!("slates: {volume}: its mounts are unknown");
   }
 }
 
@@ -239,7 +245,9 @@ fn unmount_verb(instance: &str, path: &str) -> Result<(), Failure> {
 }
 
 /// A library refusal as the command's failure: a refusal (exit 1) for every class the daemon or the machine refused
-/// with, no daemon (exit 3), or the command's own (exit 4), as [`failure_of`] maps the client's (A-299's taxonomy).
+/// with, no daemon (exit 3), or the command's own (exit 4), as [`failure_of`] maps the client's (A-299's taxonomy). A
+/// missing issuer authority is the command's own: nothing was asked of the daemon, since the anchor's surface is not in
+/// this command's environment (`docs/cli.md`'s exit 4; until 2026-11-18 it exited 1, the integrator's CLI flow found it).
 fn failure_of_api(error: slates_api::Error, instance: &str) -> Failure {
   use slates_api::Error as E;
   match error {
@@ -247,6 +255,7 @@ fn failure_of_api(error: slates_api::Error, instance: &str) -> Failure {
       instance: instance.to_owned(),
       cause: cause.to_string(),
     },
+    own @ E::Denied(slates_api::Denied::NoAuthority(_)) => Failure::Failed(own.to_string()),
     E::Mount(
       fault @ (slates_api::MountFault::Unsupported { .. } | slates_api::MountFault::NoCapability),
     ) => Failure::Refused(fault.to_string()),
@@ -1663,6 +1672,8 @@ pub(crate) fn run_shards(request: &ShardsRequest) -> Result<(), Failure> {
     attachment: shards.attachment.attachment,
     stream: shards.stream,
     at: request.handed,
+    resync: shards.resync,
+    resync_at: request.resync_at,
   };
   hand_to(client, OsStr::new(program), args, handed)
 }
@@ -1680,6 +1691,12 @@ struct Handed {
   stream: slates_client::StreamEnd,
   /// Where the command finds it.
   at: crate::args::HandOff,
+  /// The stream's resync end, when the daemon handed one (A-316).
+  #[cfg_attr(windows, allow(dead_code))]
+  resync: Option<slates_client::StreamEnd>,
+  /// Where the command finds its resync end, when it asked for one (`--resync-fd`).
+  #[cfg_attr(windows, allow(dead_code))]
+  resync_at: Option<i32>,
 }
 
 /// Replaces this process with `program`, the stream end at the descriptor number `handed` names
@@ -1700,11 +1717,31 @@ fn hand_to(
     ));
   };
   let args: Vec<OsString> = args.iter().map(OsString::from).collect();
-  let error = slates_ipc::stream::exec_with(program, &args, handed.stream, at);
+  let mut ends = vec![(handed.stream, at)];
+  if let Some(resync_at) = handed.resync_at {
+    ends.push((resync_end(handed.resync)?, resync_at));
+  }
+  let error = slates_ipc::stream::exec_with_ends(program, &args, ends);
   Err(Failure::Failed(format!(
     "shards: running {} with its end at descriptor {at}: {error}",
     program.to_string_lossy()
   )))
+}
+
+/// The resync end a command that asked for one is handed (A-316): the daemon's, or, where the daemon handed none (a
+/// platform with no resync yet, a stream served without one), a channel already ended, so the command reads its end at
+/// once and knows, as it would from the daemon's, that no resync will come.
+#[cfg(unix)]
+fn resync_end(
+  handed: Option<slates_client::StreamEnd>,
+) -> Result<slates_client::StreamEnd, Failure> {
+  if let Some(handed) = handed {
+    return Ok(handed);
+  }
+  let (ended, end) = slates_ipc::stream::message_pair()
+    .map_err(|e| Failure::Failed(format!("shards: an ended resync channel: {e}")))?;
+  drop(ended);
+  Ok(end)
 }
 
 /// Starts `program` holding the stream end as a handle named where `{handle}` stands in `args`
@@ -2229,8 +2266,49 @@ fn status_text(report: &StatusReport) -> String {
     option_text(report.placed.mirror_age_ns),
     report.placed.host_epoch
   ) + &mounts_text(report)
+    + &loss_text(report)
     + &journal_text(&report.journal)
     + &transports_text(&report.transports)
+}
+
+/// The volume's loss window (§4.10, AC-8.3): what an owner loss would lose now (`unknown` when the time is from another
+/// boot of the clock), the newest seal placed on another host by head sequence (`none` while there is none), whether
+/// the volume is live-shipped, and the takeover that made this node its owner.
+fn loss_text(report: &StatusReport) -> String {
+  let loss = &report.loss;
+  let mut out = format!(
+    "loss_at_risk_ns: {}\nloss_placed_sequence: {}\nloss_live_shipped: {}\n",
+    loss
+      .at_risk_ns
+      .map_or_else(|| "unknown".to_owned(), |ns| ns.to_string()),
+    loss
+      .placed_sequence
+      .map_or_else(|| "none".to_owned(), |sequence| sequence.to_string()),
+    loss.live_shipped
+  );
+  if let Some(taken) = &loss.taken_over {
+    out.push_str(&format!(
+      "taken_over: epoch {} head {} from_live_log {}\n",
+      taken.epoch, taken.head_sequence, taken.from_live_log
+    ));
+    if let Some(past) = &taken.past_tolerance {
+      out.push_str(&format!(
+        "taken_over_past_tolerance: registers {} live_log {}\n",
+        shortfall_text(past.registers.as_ref()),
+        shortfall_text(past.live_log.as_ref())
+      ));
+    }
+  }
+  out
+}
+
+/// One part of a takeover past tolerance in `status` (A-332): `<remaining>/<needed>` of the hosts its recovery counted
+/// on, or `within` when that part was recovered within tolerance.
+fn shortfall_text(shortfall: Option<&slates_ipc::protocol::Shortfall>) -> String {
+  shortfall.map_or_else(
+    || "within".to_owned(),
+    |short| format!("{}/{}", short.remaining, short.needed),
+  )
 }
 
 /// The volume's journal (§4.5): its budget and retention, and what its consuming rounds found waiting (the budget's
@@ -2445,6 +2523,8 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
   // This node's certificate anchor (A-237): what a share from another host names this host's accounts by
   // (`slates share ID uid:N@ANCHOR`).
   out.push_str(&format!("anchor: {}\n", report.anchor));
+  // Whether the anchor has judged this daemon recovered (A-311): until then its exit counts toward a crash loop.
+  out.push_str(&format!("recovered: {}\n", report.recovered));
   let root: String = report
     .seal
     .root_id
@@ -2514,6 +2594,20 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
       || "never".to_owned(),
       |ns| (ns / NANOS_PER_MILLISECOND).to_string()
     )
+  ));
+  // The failover delay as the daemon estimates it now (A-363): each term and the measurements behind it, so a term that
+  // is still its prior (zero samples) reads as one. Nothing sets it.
+  let failover = &report.fleet.failover;
+  out.push_str(&format!(
+    "fleet_failover: total_ns={} detection_ns={} (detector periods {}) confirmation_ns={} (coordinator periods {}) recovery_ns={} (takeovers {} volumes {})\n",
+    failover.total_ns,
+    failover.detection_ns,
+    failover.detection_samples,
+    failover.confirmation_ns,
+    failover.confirmation_samples,
+    failover.recovery_ns,
+    failover.takeovers_timed,
+    failover.volumes_timed
   ));
   for session in &report.fleet.sessions {
     out.push_str(&format!(
@@ -2895,8 +2989,29 @@ mod harness_tests {
 
 #[cfg(test)]
 mod tests {
-  use super::{chokepoint_value, digest_json, signal_value};
+  use super::{chokepoint_value, digest_json, failure_of_api, signal_value};
+  use crate::Failure;
   use slates_client::{AbsenceIs, ChokepointReport, Digest, Signal};
+
+  /// The integrator's report (2026-11-18, the CLI flow on d1323898: `slates enroll` with no anchor in the environment
+  /// exited 1 printing `denied: NoAuthority(NoHandoff)`). Do: map a missing issuer authority and a revoked consumer's
+  /// denial to the command's failure. Expect the first the command's own (exit 4) naming the anchor's surface it needs,
+  /// as `docs/cli.md` says, and the second the daemon's refusal (exit 1).
+  #[test]
+  fn a_missing_issuer_authority_fails_the_command_and_a_denial_is_a_refusal() {
+    let missing = failure_of_api(
+      slates_api::Error::Denied(slates_api::Denied::NoAuthority(
+        slates_api::IssuerFault::NoHandoff,
+      )),
+      "i",
+    );
+    assert!(
+      matches!(&missing, Failure::Failed(text) if text.contains("no anchor in this environment")),
+      "{missing:?}"
+    );
+    let revoked = failure_of_api(slates_api::Error::Denied(slates_api::Denied::Revoked), "i");
+    assert!(matches!(revoked, Failure::Refused(_)), "{revoked:?}");
+  }
 
   /// A chokepoint renders its activity when fresh, and `absent/<meaning>` when its newest span is past
   /// the horizon or it never reported — the stale age stated as a last sighting, never as a live value

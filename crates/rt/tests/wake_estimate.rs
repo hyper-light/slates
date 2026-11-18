@@ -120,6 +120,7 @@ fn a_tracking_shard_learns_its_wake_from_the_parks_its_kicks_ended() {
     prior_ns: PRIOR_NS,
     shift: SHIFT,
     idle_ratio: 1,
+    idle_floor_ns: slates_rt::runtime::NO_IDLE_FLOOR_NS,
   };
   let rt = LocalRuntime::new(&config(PRIOR_NS, Some(tracking))).unwrap();
   let ctx = rt.context();
@@ -174,6 +175,98 @@ fn a_tracking_shard_learns_its_wake_from_the_parks_its_kicks_ended() {
   step_until_idle(fixed_ctx);
   assert_eq!(fixed_ctx.counters().wake_samples, 0);
   assert_eq!(fixed_ctx.quantum_ns(), QUANTUM_NS);
+}
+
+/// Shape: the loaded test's prior, the top of a quiet wake on the hosts measured (1.7-10 µs on Apple silicon,
+/// Linux and Windows, A-223), so a mean above it has counted queueing behind the spinners.
+const QUIET_PRIOR_NS: u64 = 10_000;
+/// Shape: kicked parks the loaded test drives at least: four weighting windows of [`SHIFT`], so the estimate
+/// has forgotten its quiet prior.
+const LOADED_KICKS: u64 = 4 << SHIFT;
+/// Shape: kicked parks the loaded test drives at most, waiting for the spinners' queueing to show in the mean
+/// (a run in which the scheduler happened to place the woken shard well needs more kicks to show it).
+const MOST_LOADED_KICKS: u64 = 16 << SHIFT;
+/// Shape: spinning threads per logical CPU, as the A/B bar loads a machine (two a CPU, A-223).
+const SPINNERS_PER_CPU: usize = 2;
+
+/// Shape: the least idle window the loaded test's shard is given, the daemon's own on Linux and macOS: R9's
+/// provisioning floor, 50 µs (A-223).
+const IDLE_FLOOR_NS: u64 = 50_000;
+/// Shape: the loaded test's idle ratio, the daemon's on Linux and macOS: no multiple of the estimate.
+const NO_RATIO: u64 = 0;
+
+/// A-223 (i): a tracking shard kicked while asleep beside more spinning threads than CPUs learns wakes that
+/// include its queueing for a CPU, so its mean rises, and the step quantum follows it. Its idle window must
+/// not: a window priced on the estimate spins longer the more its own spinning queues the woken shard. On the
+/// daemon's rule for a platform whose loaded wake was measured cheap (Linux, macOS), the window is R9's floor
+/// whatever the estimate reads (ratio 0, floor F).
+///
+/// The run proves something once the mean stands above the quiet prior (the non-vacuity bound): a window priced on the
+/// mean would then be longer than the prior's. How far the mean climbs depends on the window, since a shard spinning out
+/// a long one queues the next woken shard behind it: at the floor a loaded 3-CPU macOS runner reached 1.43 times the
+/// prior where ten times was asked (diag-liveness-40), as the daemon-level test found
+/// (`crates/server/tests/idle_window.rs`).
+#[test]
+#[cfg_attr(miri, ignore)] // the OS driver opens a kqueue or an eventfd, which Miri does not model
+fn a_loaded_shards_idle_window_stays_at_its_floor_while_its_mean_climbs() {
+  let tracking = WakeTracking {
+    prior_ns: QUIET_PRIOR_NS,
+    shift: SHIFT,
+    idle_ratio: NO_RATIO,
+    idle_floor_ns: IDLE_FLOOR_NS,
+  };
+  let rt = LocalRuntime::new(&config(QUIET_PRIOR_NS, Some(tracking))).unwrap();
+  let ctx = rt.context();
+  let (tx, rx) = channel::<Waker>();
+  rt.spawn(async move {
+    for _ in 0..MOST_LOADED_KICKS {
+      PendOnce {
+        wakers: tx.clone(),
+        polled: false,
+      }
+      .await;
+    }
+  })
+  .unwrap();
+  let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+  let stop = std::sync::atomic::AtomicBool::new(false);
+  std::thread::scope(|scope| {
+    for _ in 0..cpus * SPINNERS_PER_CPU {
+      scope.spawn(|| {
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+          std::hint::spin_loop();
+        }
+      });
+    }
+    let mut kicks = 0;
+    while kicks < LOADED_KICKS
+      || (ctx.counters().wake_cost_ns <= QUIET_PRIOR_NS && kicks < MOST_LOADED_KICKS)
+    {
+      step_until_idle(ctx);
+      park_and_kick(ctx, &rx);
+      kicks += 1;
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+  });
+  step_until_idle(ctx);
+  let counters = ctx.counters();
+  assert!(
+    counters.wake_samples >= 2 << SHIFT,
+    "enough kicks met a sleeping shard to move the estimate off its prior: {counters:?}"
+  );
+  assert!(
+    counters.wake_cost_ns > QUIET_PRIOR_NS,
+    "the spinners queued the woken shard, so its mean rose past the quiet prior: {counters:?}"
+  );
+  assert_eq!(
+    ctx.quantum_ns(),
+    counters.wake_cost_ns,
+    "the step quantum still reads the mean"
+  );
+  assert_eq!(
+    counters.idle_window_ns, IDLE_FLOOR_NS,
+    "the idle window is the floor however far the queued mean climbed: {counters:?}"
+  );
 }
 
 /// How a held poll spends its hold.

@@ -585,6 +585,7 @@ impl BuildJob {
         live_holders: None,
         write: None,
         write_version: 0,
+        signers: Vec::new(),
       },
       base: BaseRecord::Image {
         volume: self.source,
@@ -600,6 +601,7 @@ impl BuildJob {
       access: Vec::new(),
       created_ns: state.clock.monotonic_ns(),
       catalog_version: 0,
+      taken_over: None,
     };
     let Admitted {
       volume,

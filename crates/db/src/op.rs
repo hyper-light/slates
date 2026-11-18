@@ -474,6 +474,78 @@ pub enum Op {
     /// The policy.
     policy: crate::catalog::WritePolicy,
   },
+  /// A work's base is held for it on its green's partition, wherever the work lives (A-247): made at the work's
+  /// creation, moved by its accept and rebase. Appended (2026-11-18), with the five after it: each variant's index is
+  /// its tag on the log, so A-247's records follow every variant main had when they landed.
+  WorkFloorSet {
+    /// The green.
+    green: VolumeId,
+    /// The work.
+    work: VolumeId,
+    /// The version the work is based on.
+    base: u64,
+  },
+  /// A work's creation waits for its green's owner to admit it, holding its name and its id (A-247). Appended.
+  WorkCreationPending {
+    /// The creation.
+    record: crate::catalog::PendingCreationRecord,
+  },
+  /// A work's pending creation ended: made, refused, or dropped at a start (A-247). Appended.
+  WorkCreationSettled {
+    /// The name.
+    name: String,
+  },
+  /// A work's submit went to its green's owner and waits to be settled on the work (A-247). Appended.
+  WorkSubmitPending {
+    /// The submit.
+    record: crate::catalog::PendingSubmitRecord,
+  },
+  /// A work's pending submit was settled (A-247). Appended.
+  WorkSubmitSettled {
+    /// The work.
+    work: VolumeId,
+  },
+  /// A work's floor is released: it was destroyed, or found gone at recovery (A-247). Appended.
+  WorkFloorDropped {
+    /// The green.
+    green: VolumeId,
+    /// The work.
+    work: VolumeId,
+  },
+  /// A volume's trusted signers were set by its launcher (signed work, A-321): the whole set, replacing the last.
+  /// Appended (2026-11-17).
+  VolumeSignersSet {
+    /// The volume.
+    id: VolumeId,
+    /// The public keys, in SSH wire form, in the order set.
+    keys: Vec<Vec<u8>>,
+  },
+  /// A volume this partition lost to a takeover is taken over here again (A-362): its stale record goes, with its
+  /// snapshots and lineage, so the state the takeover adopted is recorded in its place by the `VolumeCreated` that
+  /// follows. Unlike `VolumeDestroyed` it leaves no tombstone (the volume lives on, its registers adopted here) and erases
+  /// no key (the adopted lineage is the volume's own). Its attachments are ended before it. Appended (2026-11-18).
+  VolumeRelinquished {
+    /// The volume.
+    id: VolumeId,
+  },
+  /// A green this node took over from its departed owner, recorded here by adopting this node's own holder ledger of it
+  /// (§4.16 owner-loss recovery; A-333): the green's catalog record, and versions 0 to `version` as the merge records
+  /// this node accepted as one of the green's holders and the inputs it holds for them, which it keeps while the green
+  /// lives here. So the partition records neither the green's origin nor those versions' increments, and its chain holds
+  /// only the versions after `version`. A kernel-sized origin re-recorded as bytes was refused at the partition's merge
+  /// budget, which lost the green with its owner. One operation, so the green is never recorded without its adoption:
+  /// checked as a volume's creation is. Appended (2026-11-18).
+  GreenAdopted {
+    /// The green's catalog record, under its original id and name.
+    record: crate::catalog::VolumeRecord,
+    /// The adopted version: the green's head when this node took it over.
+    version: u64,
+    /// The green's head identity at `version`, which a replica rebuilt from the ledger must reproduce.
+    identity: [u8; 32],
+    /// Version 0's inputs manifest identity, as the ledger's version 0 record names it (the origin's canonical encoding,
+    /// archived); `None` for a green with no origin.
+    origin: Option<[u8; 32]>,
+  },
 }
 
 impl Op {
@@ -516,6 +588,7 @@ impl Op {
       Op::AuditAppended { .. } => "audit_appended",
       Op::GreenAdvanced { .. } => "green_advanced",
       Op::GreenOriginated { .. } => "green_originated",
+      Op::GreenAdopted { .. } => "green_adopted",
       Op::ClientIdReserved { .. } => "client_id_reserved",
       Op::NfsOpenSet { .. } => "nfs_open_set",
       Op::NfsOpenCleared { .. } => "nfs_open_cleared",
@@ -540,6 +613,12 @@ impl Op {
       Op::NameAliasReserved { .. } => "name_alias_reserved",
       Op::NameAliasConfirmed { .. } => "name_alias_confirmed",
       Op::NameAliasReleased { .. } => "name_alias_released",
+      Op::WorkFloorSet { .. } => "work_floor_set",
+      Op::WorkFloorDropped { .. } => "work_floor_dropped",
+      Op::WorkCreationPending { .. } => "work_creation_pending",
+      Op::WorkCreationSettled { .. } => "work_creation_settled",
+      Op::WorkSubmitPending { .. } => "work_submit_pending",
+      Op::WorkSubmitSettled { .. } => "work_submit_settled",
       Op::AttachmentRenewed { .. } => "attachment_renewed",
       Op::AttachmentExpired { .. } => "attachment_expired",
       Op::LiveShippingChanged { .. } => "live_shipping_changed",
@@ -547,6 +626,8 @@ impl Op {
       Op::CompletionAwaiting { .. } => "completion_awaiting",
       Op::VolumeWritePolicySet { .. } => "volume_write_policy_set",
       Op::ConsumerWritePolicySet { .. } => "consumer_write_policy_set",
+      Op::VolumeSignersSet { .. } => "volume_signers_set",
+      Op::VolumeRelinquished { .. } => "volume_relinquished",
     }
   }
 }

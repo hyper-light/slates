@@ -289,8 +289,12 @@ const ACCESS3_EXECUTE: u32 = 0x20;
 /// Format: `UNSTABLE` (`stable_how` = 0, RFC 1813 §3.3.7): the server may reply before the data is
 /// stable; the client keeps its copy until a COMMIT (or a later stable WRITE) answers with the same
 /// write verifier, and re-sends it when the verifier changed (the server restarted in between).
-/// An `UNSTABLE` write is answered `UNSTABLE` — the bytes are in the volume, not yet in the
-/// recovery image — and the client's COMMIT is the barrier that publishes them.
+/// An `UNSTABLE` write is answered `UNSTABLE`, and the host publishes it into the recovery image
+/// before the reply all the same (A-358), so it survives the daemon's death without the client's
+/// help: a client may never write it again, and Apple's sends nothing after a COMMIT answered a new
+/// verifier (docs/bugs/2026-11-18-an-fsynced-file-came-back-empty-after-a-daemon-kill-under-the-macos-mount.md).
+/// What `UNSTABLE` leaves to the COMMIT is durability past the daemon: a live-shipped volume's
+/// candidates (A-200).
 const UNSTABLE: u32 = 0;
 /// Format: `FILE_SYNC` (`stable_how` = 2, RFC 1813 §3.3.7): the data and its metadata are stable
 /// before the reply. slates makes a write stable by publishing the shard's recovery image into
@@ -1411,8 +1415,9 @@ impl<'b> Export<'b> {
 
   /// NFSPROC3_WRITE: write the request's data at `offset` to the file a handle names, over the
   /// shared interface under the export's context. The reply's `committed` level is what the write
-  /// asked for, made true by the host: an `UNSTABLE` write is answered `UNSTABLE` (the bytes are in
-  /// the volume; the client's later COMMIT publishes them), and a `DATA_SYNC` or `FILE_SYNC` write is
+  /// asked for, made true by the host: an `UNSTABLE` write is answered `UNSTABLE` (the host publishes
+  /// its bytes before the reply too, A-358, and the client's later COMMIT is what waits for a
+  /// live-shipped volume's candidates, A-200), and a `DATA_SYNC` or `FILE_SYNC` write is
   /// answered `FILE_SYNC` because the host's barrier publishes the shard's recovery image before it
   /// sends the reply (§4.8) — and replaces this reply with `NFS3ERR_IO` when that barrier is refused
   /// ([`io_failure_reply`]). A write against a read-only export or a pinned view is refused by the
@@ -1495,11 +1500,12 @@ impl<'b> Export<'b> {
     Ok((wcc, written, committed))
   }
 
-  /// NFSPROC3_COMMIT: make a file's unstable writes stable (RFC 1813 §3.3.21). The bytes an
-  /// `UNSTABLE` write left in the volume become stable when the shard's recovery image is published
-  /// into anchor-owned RAM (§4.8); the host that runs this export does that at its barrier after the
-  /// commit and before it sends the reply (and answers a refused barrier with `NFS3ERR_IO`,
-  /// [`io_failure_reply`]). The commit itself resolves the handle and returns the file's current
+  /// NFSPROC3_COMMIT: make a file's unstable writes stable (RFC 1813 §3.3.21). Each write's bytes are
+  /// already in the shard's recovery image in anchor-owned RAM, published before the write was
+  /// answered (§4.8; A-358); the host that runs this export runs its barrier after the commit and
+  /// before it sends the reply all the same, which on a live-shipped volume waits until its
+  /// candidates hold the publication (A-200), and answers a refused barrier with `NFS3ERR_IO`
+  /// ([`io_failure_reply`]). The commit itself resolves the handle and returns the file's current
   /// `wcc_data` and the same `writeverf3` a write returns, so a client `fsync` (which the kernel
   /// issues as COMMIT) succeeds over the mount, as the git, sqlite and editor workloads require.
   /// Without this a COMMIT is `PROC_UNAVAIL` and the client's `fsync` fails.
@@ -2907,9 +2913,9 @@ fn encode_wcc(writer: &mut XdrWriter, wcc: Wcc) {
 
 /// The `stable_how` a WRITE call asks for (RFC 1813 §3.3.7: `UNSTABLE`, `DATA_SYNC` or
 /// `FILE_SYNC`), decoded from its arguments — the file handle, the offset and the count precede
-/// it — or `None` for a call that does not decode that far. The host's barrier reads it to decide
-/// whether the write's reply may go out before the shard's recovery image is published: only an
-/// `UNSTABLE` write may (its client commits later); any other level is published first.
+/// it — or `None` for a call that does not decode that far. The host reads it to decide what the
+/// write's reply waits for: every write is published before its reply (A-358), and one that asked for
+/// more than `UNSTABLE` also waits for a live-shipped volume's candidates (A-200).
 pub fn write_stable_how(args: &mut XdrReader<'_>) -> Option<u32> {
   Nfsfh3::decode(args).ok()?;
   args.u64().ok()?;
@@ -2917,7 +2923,8 @@ pub fn write_stable_how(args: &mut XdrReader<'_>) -> Option<u32> {
   args.u32().ok()
 }
 
-/// Whether a WRITE's decoded `stable_how` asks for a reply before the data is stable (`UNSTABLE`).
+/// Whether a WRITE's decoded `stable_how` claims no stability (`UNSTABLE`): its reply waits for no
+/// live-shipped volume's candidates, though the host publishes it before the reply (A-358).
 pub fn is_unstable(stable_how: u32) -> bool {
   stable_how == UNSTABLE
 }
@@ -3135,7 +3142,10 @@ fn nfsstat_of(e: &VfsError) -> Nfsstat3 {
     VfsError::NotDirectory => Nfsstat3::Notdir,
     VfsError::IsDirectory => Nfsstat3::Isdir,
     VfsError::NotEmpty => Nfsstat3::Notempty,
-    VfsError::NoSpace => Nfsstat3::Nospc,
+    VfsError::NoSpace | VfsError::RetentionExceeded => Nfsstat3::Nospc,
+    // An offset or length past what the volume addresses: the file would be too large (RFC 1813 §2.6), never the
+    // server's own fault.
+    VfsError::FileTooLarge => Nfsstat3::Fbig,
     VfsError::NotPermitted => Nfsstat3::Perm,
     // A read-only attachment or a snapshot's view is a read-only file system (`NFS3ERR_ROFS`; v4's `NFS4ERR_ROFS` by
     // `Nfsstat4::of_v3`).

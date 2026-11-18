@@ -3,8 +3,8 @@
 //! memory segment (created without a filesystem entry, `slates_mem::SharedObject`) holding the
 //! machine profile, the per-partition operation logs, the catalog snapshots, the audit log and
 //! the manifests of landings in flight, and it supervises the daemon: starts it with the
-//! segment handed over, observes its heartbeat, restarts it when it exits, and stops restarting
-//! when the daemon fails faster than it can recover (a typed `CrashLoop`, never a busy loop).
+//! segment handed over, observes its heartbeat, restarts it when it exits, and backs off when its
+//! starts fail in a row (a typed `CrashLoop`, never a busy loop and never given up; A-119, A-311).
 //!
 //! What lives where (`layout`): a header with the magic, the layout version, the machine
 //! identity, a generation word and the geometry; a supervision block the anchor and the daemon

@@ -21,8 +21,12 @@
 //! - [`stats`] — medians, percentiles by integer rationals, bootstrap intervals with a seeded
 //!   generator, and the stopping rule.
 //! - [`mod@bench`] — the measurement harness with batching for sub-timer-resolution operations.
+//! - [`build_cost`] — what this build costs against the machine: one chain of work compiled by this build and in
+//!   machine code, so a judgment in CPU time is held to the build it runs in (A-318).
 //! - [`facts`] — the fixed facts queried from the OS (pages, cache line, the cores this process may run
 //!   on, its CPU budget, memory, power).
+//! - [`memory_stall`] — the host's memory stall, read at a look: whether its tasks have been held waiting on memory,
+//!   so a liveness judgment tells a shard waiting on a page-in from a wedged one (A-336).
 //! - [`placement`] — where the shards run: how many, and whether they are fixed to cores the process
 //!   owns; the runtime and the wake probe both place by it.
 //! - [`probes`] — the microbenchmarks.
@@ -43,17 +47,20 @@
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 pub mod bench;
+pub mod build_cost;
 pub mod clock;
 pub mod derived;
 pub mod error;
 pub mod facts;
 pub mod log;
+pub mod memory_stall;
 pub mod placement;
 pub mod probes;
 pub mod process_clock;
 pub mod profile;
 pub mod segment;
 pub mod stats;
+pub mod switches;
 pub mod wake;
 
 pub use derived::Derived;

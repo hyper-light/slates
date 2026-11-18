@@ -38,9 +38,20 @@ fn main() -> ExitCode {
   until the instance answers, and makes the consensus group of an instance run alone. If the anchor
   exits first, the start is refused `StartFault::AnchorExited` with its exit code; the anchor's log
   lines on standard error say why.
-- `StartSpec::anchor_command()` is the same command for a host that launches the anchor its own way,
+- `StartSpec::anchor_command()` is the same command for a host that launches the anchor its own way
+  (`anchor_command_under(&wrapper)`, with `wrapper` the `OsStr` words of `systemd-run --user --scope
+  --`, runs it under a wrapper that execs it, keeping the launcher's secret on its standard input),
   for example under its service manager so the instance outlives the host's process. Such a host
-  waits with `Instance::wait_for(name, None, Some(deadline))`.
+  waits with `Instance::wait_for(name, None, Some(deadline))`; one that holds the anchor's child
+  waits with `Instance::wait_for(name, Some(&mut child), None)` and needs no deadline: the wait lasts
+  while the anchor lives, and the anchor judges its starting daemon by its progress, never by a
+  second (A-366).
+- `StartSpec::until_served()` asks the anchor to stop when its daemons crash-loop before any of
+  them has served: the instance never answered, so no client can be waiting on it, and the wait ends
+  `StartFault::NeverServed` (the anchor exits `role::EXIT_NEVER_SERVED`, 5) instead of lasting while
+  the anchor loops on them. For a host that has attached nothing yet, as kiln's own start of its
+  machine's instance. Once a daemon has served, an anchor never gives its instance up (A-119), asked
+  or not.
 - `Started.anchor.stop()` stops the instance: a graceful stop on Unix (`SIGTERM`), the process ended
   on Windows. The instance's volumes live in its memory, so they go with it.
 - Every process of the instance carries `--instance NAME` in its arguments, so a host or a test can
@@ -74,22 +85,42 @@ Conflicts are their own outcome in both (`Conflicted`), typed per path. The laun
 `WritePolicy` per volume with `Instance::set_write_policy(PolicySubject::Volume(v), &policy, &issuer)`
 and reads it with `write_policy` (`None` while unset: merges run at once, landings ask); an act
 follows the stricter of
-the volume's and, once the daemon keeps them, the agent's own; an agent can never raise its own (the
+the volume's and the agent's own (`PolicySubject::Consumer`); an agent can never raise its own (the
 daemon refuses the verb on an agent's channel). The launcher approves an ask with
 `Instance::approve_landing(&approval, &issuer)`, which writes exactly the manifest shown or answers
 the new presentation when the volume or the disk changed since, and
 `Instance::approve_merge(&approval, &issuer)`, which merges exactly the increment shown or asks
-again when the work changed. Both work from any `Instance`. Owed on the daemon's side: an agent's
-own mode, and signed work.
+again when the work changed. Both work from any `Instance`.
 
 ### Signed work
 
-A merge or a landing may carry a signature (`WorkSignature::from_armoured`, the text
-`ssh-keygen -Y sign` writes), and its outcome carries how it was judged:
-`Verification::{Verified { signer }, Unsigned, Invalid { reason }}`. A volume's policy may require
-signed merges. Signatures never gate permission; the write mode does. Until the daemon verifies
-signed work, a signed call is refused `Error::Unsupported(Unsupported::SignedWork)` before anything
-is sent.
+A merge or a landing may carry a signature by its author's key, and its outcome carries how the
+daemon judged it: `Verification::{Verified { signer }, Unsigned, Invalid { reason }}`. Signatures
+never gate permission; the write mode does.
+
+1. The launcher trusts keys on a volume: `set_signers(volume, &[TrustedSigner::from_openssh(line)?],
+   &issuer)` (an `ssh-ed25519` or FIDO `sk-ssh-ed25519@openssh.com` public key line); `signers(volume)`
+   reads them back. A merge verifies under its work's and its green's signers.
+2. The signer asks for the statement, `merge_statement(&work, &evidence)` (the work, its green, its
+   base and the increment's identity, as plain text), signs it with
+   `ssh-keygen -Y sign -n slates-work -f KEY FILE`, and merges with
+   `merge(&work, &evidence, Some(&WorkSignature::from_armoured(&text)?))` before the work changes.
+3. The verdict is recorded with the version: `merge_record(green, version)` reads it back.
+
+A landing is signed the same way. Every presentation states the landing's statement (the volume,
+the target and the manifest hash, as plain text): `plan_landing(&request)` answers it in
+`LandingApproval::statement`, as does a `land` an ask mode holds. Sign it with the same command and
+land with `land(&request, Some(&signature))`. The verdict comes back in the approval
+(`LandingApproval::verification`) and in what was written (`LandingReport::verification`), and the
+landing's planned and finished audit records keep it: `audit(since)` reads it back as
+`AuditRecord::verification`. An approval carries the landing's signature on to
+`approve_landing(&approval, &issuer)` (`LandingApproval::signature`, which an approver may also set).
+Nothing requires a signed landing.
+
+A volume's policy may require signed merges (`WritePolicy::require_signed_merges`, on a green for
+every merge into it, on a work for every merge from it): an unsigned or invalid merge is then
+answered `MergeOutcome::Refused` with `PolicyReason::SignatureRequired`, at once in bypass and at its
+approval in ask.
 
 ### Errors
 
@@ -140,19 +171,22 @@ nothing answers until detached) and mounts nothing (a mount is a record). The co
   (typed, an overlay's base read or unreadable), `drift` (typed entries: `Modified`, `Deleted`,
   `Replaced`, `TypeChanged`), `rewitness`, `read`.
 - Serving: `mount(volume, path, &MountOptions)` and `unmount(path)` (macOS: the loopback NFS mount;
-  Linux: FUSE; Windows: a WinFsp drive), `serve_shards(volume, intent, subtree)` (a stream end to
+  Linux: FUSE; Windows: a WinFsp drive; it answers `Unmounted`, whose `unreported` names each volume a
+  Windows unmount could not ask for its mounts), `serve_shards(volume, intent, subtree)` (a stream end to
   hand `shards run --slates-fs-fd N`), `serve_vhost_user(..)` (Linux), `detach(attachment)`.
   `slates_api::mount::available()` says, with no daemon, whether this machine can mount a volume
   and through what (`MountKind`), or what is missing (`MountMissing`). `slates_api::mount::unmount_lazy(path)`
   lets go of a mount that a leftover process still uses (Linux, `fusermount3 -u -z`).
 - Landing: `land(&request, signature)` under the caller's mode; `plan_landing(&request)` presents
-  without writing, for a reviewer; `approval_entries(&approval)` lists what an approval writes, path
+  without writing, for a reviewer, and states what a signer signs; `approval_entries(&approval)` lists what an approval writes, path
   by path (each file's BLAKE3 and length, a rename's origin, a symlink's target, the conflict found at
   it): a reviewer with no mount of the volume builds the change from it, checking each file it reads
   at the head against its entry, and presents the landing again on a mismatch; `approve_landing(&approval,
   &issuer)` writes exactly what was approved.
 - Merging: `merge(&work, &evidence, signature)` and `rebase(&work)`, with typed conflict windows and
-  the green's head; `approve_merge(&approval, &issuer)` for a merge an ask mode held. `Instance::client()` lends the raw client for the declared edits on a work volume (`edit`,
+  the green's head; `approve_merge(&approval, &issuer)` for a merge an ask mode held;
+  `merge_statement(&work, &evidence)`, `merge_record(green, version)`, `set_signers` and `signers`
+  for signed merges. `Instance::client()` lends the raw client for the declared edits on a work volume (`edit`,
   `declare`) and the file verbs, outside the contract.
 - The launcher's authority: `Issuer::from_environment()` (the anchor's handoff, as `slates grant`
   has it) or `Issuer::from_handoff(pairs)`. The SDKs and the MCP server cannot approve: they do not
@@ -208,9 +242,7 @@ fn workspace(folder: &std::path::Path, at: &str) -> Result<(), slates_api::Error
 ## What is owed
 
 1. The starter handed the launcher's authority on every platform.
-2. The daemon's side of the write modes, merge approvals and signed work, and the verbs that set a
-   policy and hand out the statement a signer signs.
-3. Typed fields on the wire for drift, a presentation's conflicts and a merge's versions.
-4. A paged volume listing.
-5. An async form over the host's own reactor.
-6. A typed class for a pinned snapshot's destroy, answered `Invalid::Request` today.
+2. Typed fields on the wire for drift, a presentation's conflicts and a merge's versions.
+3. A paged volume listing.
+4. An async form over the host's own reactor.
+5. A typed class for a pinned snapshot's destroy, answered `Invalid::Request` today.

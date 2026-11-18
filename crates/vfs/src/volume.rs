@@ -65,6 +65,11 @@ const DESTROY_CLOCK_EVERY_UNITS: usize = 16;
 /// smaller is the volume's bound so a landing never produces a file the target refuses.
 pub const LINK_MAX: u32 = 32_767;
 
+/// Format: the live inodes a volume is made with — its root directory, and nothing else. The version
+/// slots a dynamic volume holds from its admission (A-342), taken before it is made so a refusal leaves
+/// nothing allocated.
+pub const NEW_VOLUME_INODES: u64 = 1;
+
 /// Derived: the inode-version budget's operation headroom (§4.2) — the transient version a copy-up
 /// holds. `Volume::make_current_inode` inserts the new inode version and retires the old within one
 /// synchronous, exclusively-borrowed shard call (no `await` between the insert and the retire), so
@@ -489,6 +494,16 @@ pub struct Volume {
   /// admitting owner (the server derives it from the shard's inode capacity); a volume built without
   /// a set allowance is unbounded (`u64::MAX`), so tests and non-admitting callers are unaffected.
   pub(crate) inode_allowance: u64,
+  /// Whether this volume's inode slots are a version hold (§4.2 "Dynamic volumes"; A-342): set by the admitting owner
+  /// for a dynamic volume, whose allowance is a ceiling it reserves nothing of. Off for a bounded claim, whose whole
+  /// allowance its admission reserved, and for a volume built without an owner (tests, snapshot views), which the slab
+  /// alone bounds.
+  pub(crate) holds_versions: bool,
+  /// The version slots this volume holds for its live inodes while [`Volume::holds_versions`] is set: one taken from the
+  /// shard's unpromised version capacity for each inode issued past it, never given back while the volume lives (an
+  /// unlinked inode's slot backs the next one, as a dynamic volume's byte growth backs its next write), and returned
+  /// whole by the owner at teardown ([`Volume::version_hold`]).
+  pub(crate) version_hold: u64,
   /// Live directory entries the head reaches (§4.2 resource vector, the namespace dimension):
   /// incremented on `dir_insert`, decremented on `dir_remove`. Bounds hard-link fan-out and name
   /// churn, which neither the byte quota nor the inode allowance bounds (one inode, many names).
@@ -557,6 +572,9 @@ struct Needs {
   blocks: usize,
   /// Inode versions a snapshot pins that the copy-ups will retain (the retention charge).
   retained: u64,
+  /// Fresh inode numbers the verb issues: a dynamic volume's hold grows by those past it (A-342), from the same
+  /// unpromised version capacity the retention charge draws on.
+  fresh: u64,
 }
 
 /// A rename [`Volume::admit_rename`] admitted: its source and target as looked up, the spelling the
@@ -669,8 +687,9 @@ pub(crate) struct VolumeSeed {
 }
 
 impl Volume {
-  /// The volume's inode-number prefix: the top bits of every inode number it issues, so an inode number names its
-  /// volume within a shard (what a write log's replay routes by, A-63).
+  /// The volume's inode-number prefix: the top bits of every inode number it issues. A clone keeps its origin's numbers
+  /// for every inode it inherits, so an inode number alone does not name its volume: a write log's replay goes by the
+  /// volume its record names (A-63; 2026-11-18).
   pub fn prefix(&self) -> u16 {
     self.prefix
   }
@@ -754,8 +773,10 @@ impl Volume {
       takeover_below: InodeNo(0),
       takeover_kept: BTreeSet::new(),
       dirty: crate::delta::Dirty::default(),
-      live_inodes: 1,
+      live_inodes: NEW_VOLUME_INODES,
       inode_allowance: u64::MAX,
+      holds_versions: false,
+      version_hold: 0,
       live_entries: 0,
       entry_allowance: u64::MAX,
       retention_allowance: u64::MAX,
@@ -845,6 +866,8 @@ impl Volume {
       dirty: crate::delta::Dirty::default(),
       live_inodes: origin.live_inodes,
       inode_allowance: u64::MAX,
+      holds_versions: false,
+      version_hold: 0,
       live_entries: origin.live_entries,
       entry_allowance: u64::MAX,
       retention_allowance: u64::MAX,
@@ -946,8 +969,10 @@ impl Volume {
       takeover_below: InodeNo(0),
       takeover_kept: BTreeSet::new(),
       dirty: crate::delta::Dirty::default(),
-      live_inodes: 1,
+      live_inodes: NEW_VOLUME_INODES,
       inode_allowance: u64::MAX,
+      holds_versions: false,
+      version_hold: 0,
       live_entries: 0,
       entry_allowance: u64::MAX,
       retention_allowance: u64::MAX,
@@ -2162,7 +2187,7 @@ impl Volume {
     // A preflight: the pool's claimable room counts (A-98); the charge that follows claims it.
     if retention > store.admittable() {
       self.retention_refusals = self.retention_refusals.saturating_add(1);
-      return Err(VfsError::NoSpace);
+      return Err(VfsError::RetentionExceeded);
     }
     // Replacing another entry keeps the replaced entry's spelling on a folding volume, as APFS does:
     // `d` renamed onto `a` where `A` exists leaves one entry, `A` (EQUIVALENCE §4). Under the exact
@@ -3895,6 +3920,13 @@ impl Volume {
     if self.live_inodes >= self.inode_allowance || self.next_counter >= InodeNo::DERIVED_BIT {
       return Err(VfsError::NoSpace);
     }
+    // A dynamic volume's inode past its hold first takes a slot from the shard's unpromised version capacity (A-342),
+    // refused `NoSpace` once none is left, as its bytes' growth is.
+    let growth = self.hold_growth(1);
+    if growth > 0 {
+      let taken = store.versions.grow(growth).map_err(|_| VfsError::NoSpace)?;
+      self.version_hold = self.version_hold.saturating_add(taken.slots);
+    }
     let no = InodeNo::compose(self.prefix, self.next_counter);
     self.next_counter = self.next_counter.saturating_add(1);
     self.live_inodes = self.live_inodes.saturating_add(1);
@@ -4010,6 +4042,7 @@ impl Volume {
   fn need_new_inode(&self, store: &Store, needs: &mut Needs) -> Result<(), VfsError> {
     let no = InodeNo::compose(self.prefix, self.next_counter);
     needs.inodes = needs.inodes.saturating_add(1);
+    needs.fresh = needs.fresh.saturating_add(1);
     needs.tries = needs.tries.saturating_add(trie::nodes_to_set(
       &store.tries,
       self.inode_root,
@@ -4095,12 +4128,20 @@ impl Volume {
     if store.blocks.room() < needs.blocks {
       return Err(VfsError::Memory(store.blocks.refusal()));
     }
-    if needs.retained > 0 {
-      let over_allowance = self.retention_allowance != u64::MAX
-        && self.retained_versions().saturating_add(needs.retained) > self.retention_allowance;
-      if over_allowance || store.versions.admittable() < needs.retained {
-        return Err(VfsError::NoSpace);
-      }
+    let over_allowance = needs.retained > 0
+      && self.retention_allowance != u64::MAX
+      && self.retained_versions().saturating_add(needs.retained) > self.retention_allowance;
+    // The retention the copy-ups charge and the hold a dynamic volume's fresh inodes grow (A-342) both come from the
+    // shard's unpromised version capacity, so they are admitted together. A refusal names its bound: the retention
+    // when the copy-ups alone do not fit (§4.2 `RetentionBudgetExceeded`), else the growth, as a dynamic volume's
+    // refused bytes are named.
+    let admittable = store.versions.admittable();
+    if over_allowance || admittable < needs.retained {
+      return Err(VfsError::RetentionExceeded);
+    }
+    let versions = needs.retained.saturating_add(self.hold_growth(needs.fresh));
+    if versions > 0 && admittable < versions {
+      return Err(VfsError::NoSpace);
     }
     Ok(())
   }
@@ -4400,7 +4441,7 @@ impl Volume {
     store.make_room(bytes);
     if store.budget.charge_retention(bytes).is_err() {
       self.retention_refusals = self.retention_refusals.saturating_add(1);
-      return Err(VfsError::NoSpace);
+      return Err(VfsError::RetentionExceeded);
     }
     self.retention_prepaid = self.retention_prepaid.saturating_add(bytes);
     Ok(())
@@ -4475,10 +4516,10 @@ impl Volume {
     store
       .budget
       .charge_retention(all)
-      .map_err(|_| VfsError::NoSpace)?;
+      .map_err(|_| VfsError::RetentionExceeded)?;
     if store.versions.charge_retention(versions).is_err() {
       store.budget.credit_retention(all);
-      return Err(VfsError::NoSpace);
+      return Err(VfsError::RetentionExceeded);
     }
     self.retention_charged = bytes;
     self.versions_charged = versions;
@@ -4518,6 +4559,53 @@ impl Volume {
     }
     self.inode_allowance = allowance;
     Ok(())
+  }
+
+  /// Makes this volume's inode slots a version hold (§4.2 "Dynamic volumes"; A-342) and takes the slots its live inodes
+  /// need now — a new volume's root, a clone's inherited inodes, a rebuilt volume's live ones — from the shard's
+  /// unpromised version capacity, whole or not at all: refused `BudgetExceeded` with nothing changed when that capacity
+  /// cannot back them. The admitting owner calls it for a dynamic volume in place of reserving its allowance, which
+  /// stays the ceiling [`Volume::next_no`] refuses at; from here each inode issued past the hold takes one slot more.
+  pub fn hold_versions(&mut self, store: &mut Store) -> Result<(), VfsError> {
+    let growth = self.live_inodes.saturating_sub(self.version_hold);
+    if growth > 0 {
+      let taken = store.versions.grow(growth).map_err(VfsError::Memory)?;
+      self.version_hold = self.version_hold.saturating_add(taken.slots);
+    }
+    self.holds_versions = true;
+    Ok(())
+  }
+
+  /// Makes this volume's inode slots a version hold of `slots` its owner already took for it from the shard's unpromised
+  /// version capacity (A-342): a dynamic clone's inherited inodes, taken before the clone pinned its snapshot so that a
+  /// refusal had nothing to unpin. Each inode it issues past them grows the hold as any dynamic volume's does.
+  pub fn adopt_version_hold(&mut self, slots: u64) {
+    self.version_hold = self.version_hold.saturating_add(slots);
+    self.holds_versions = true;
+  }
+
+  /// The version slots this volume holds for its inodes (A-342): what its owner returns to the shard's version budget
+  /// at teardown. Zero for a volume whose slots its admission reserved (a bounded claim) or that no owner admitted.
+  pub fn version_hold(&self) -> u64 {
+    self.version_hold
+  }
+
+  /// Whether this volume's inode slots are a version hold (A-342): a dynamic volume its owner admitted, whose allowance
+  /// is a ceiling with nothing reserved of it.
+  pub fn holds_versions(&self) -> bool {
+    self.holds_versions
+  }
+
+  /// The slots issuing `fresh` more inodes would take into the hold (A-342): those past it, for a volume that holds
+  /// its versions; none for any other.
+  fn hold_growth(&self, fresh: u64) -> u64 {
+    if !self.holds_versions {
+      return 0;
+    }
+    self
+      .live_inodes
+      .saturating_add(fresh)
+      .saturating_sub(self.version_hold)
   }
 
   pub(crate) fn inode<'s>(&self, store: &'s Store, no: InodeNo) -> Result<&'s Inode, VfsError> {
@@ -4745,7 +4833,7 @@ impl Volume {
       && self.retains(born)
       && self.retained_versions() >= self.retention_allowance
     {
-      return Err(VfsError::NoSpace);
+      return Err(VfsError::RetentionExceeded);
     }
     // A retained version also draws a slot from the shard's version budget — from capacity not
     // promised to any volume's logical allowance or the copy-up headroom (§4.2: "a new retained
@@ -4765,7 +4853,7 @@ impl Volume {
       store
         .versions
         .charge_retention(1)
-        .map_err(|_| VfsError::NoSpace)?;
+        .map_err(|_| VfsError::RetentionExceeded)?;
       self.versions_charged = self.versions_charged.saturating_add(1);
     }
     let _ = kind;

@@ -12,6 +12,14 @@ on:
   schedule:
     - cron: "17 3 * * *"
 
+# One run per ref and event at a time, and at most one waiting behind it (2026-11-18: 24 runs queued behind each other
+# on main starved the runner pool, and the release's builds waited). A waiting run is replaced by a newer push's, never
+# the run in progress: cancelling in progress on main left no run finishing at all when pushes came every few minutes.
+# The nightly schedule has its own group, so a push never displaces it.
+concurrency:
+  group: ci-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
   # WinFsp, pinned (A-206): the receiver is written from this version and refuses any other, so an unpinned install would
@@ -199,9 +207,13 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           grep -qx user_allow_other /etc/fuse.conf 2>/dev/null || echo user_allow_other | sudo tee -a /etc/fuse.conf
+      # SLATES_TEST_CONTAINER turns on fs_server's container lane (fs-server plan step 2): on Linux the server node runs
+      # in its own Docker container and lands the client node's merge into a volume attached to it; the lane is compiled
+      # on Linux only (Docker Desktop's containers are not reachable by address from a macOS host).
       - name: The slates CLI flow (anchor + daemon)
         env:
           SLATES_TEST_CLI: "1"
+          SLATES_TEST_CONTAINER: "1"
         run: |
           cargo test -p slates-cli --test cli --test fs_server -- --test-threads=1 --nocapture
       # `slates exec`'s FUSE flow (§4.6 "The launcher") on a host whose AppArmor does not confine unprivileged user
@@ -678,6 +690,15 @@ jobs:
         if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: cargo test -p slates-server --test observe
+      # The daemon's liveness beat (§4.14 `daemon.alive`, A-228): a starved shard keeps the beat, a wedged or spinning one
+      # stops it, on Windows' own thread clock and scheduler readings. No lane ran it on Windows until 2026-11-18, when
+      # only g243's diagnostic runs caught a starved-shard bug there. One test at a time, as the other in-process daemon
+      # suites here run: 12 tests (6 child roles ignored) in 51-52 s, the binary built in 173 s from cold, every one of
+      # three runs passing (diag-integrator-liveness-1, run 44290078113, windows-latest, 2026-11-18).
+      - name: Test the liveness beat, one test at a time (native Windows)
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
+        timeout-minutes: 15
+        run: cargo test -p slates-server --test liveness -- --test-threads=1
       # A-205: a deleted file's pages leave the working set and read back through the files recreated over them.
       - name: Test a deleted file's memory going back to the OS (native Windows)
         if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
@@ -847,6 +868,13 @@ jobs:
           }
           (Join-Path $svn 'bin') | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
           "C:\Program Files\Git\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      # The workloads' shared environment under Git for Windows' `sh`: pip's `hg`, a `#!` script naming `python.exe`,
+      # starts, and Subversion's `^/trunk` reaches a Windows program as written (A-327's `MSYS_NO_PATHCONV` broke the
+      # first, CI run 44271637767; no setting at all the second, 44260193629).
+      - name: The workloads' environment under Git for Windows' sh (native Windows)
+        if: ${{ !cancelled() && steps.vcs-tools.outcome == 'success' }}
+        timeout-minutes: 15
+        run: cargo test -p slates-conformance --lib under_the_environment_git_for_windows_sh -- --nocapture
       - name: git, Mercurial and Subversion over the WinFsp drive (native Windows)
         if: ${{ !cancelled() && steps.vcs-tools.outcome == 'success' }}
         timeout-minutes: 30
@@ -1055,6 +1083,12 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: cargo test -p slates-server --test give_back -- --nocapture
+      # The liveness beat (A-228), as on x86_64: 12 tests in 57-58 s one at a time, three runs of three passing
+      # (diag-integrator-liveness-1, run 44290078113, windows-11-arm, 2026-11-18).
+      - name: Test the liveness beat, one test at a time (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-server --test liveness -- --test-threads=1
       # The fleet over real loopback UDP sessions with mutual TLS (crates/server/tests/fleet.rs): formation, detection,
       # replication, takeover and serving the dead owner's bytes over the successor's NFS port. It was cfg(unix) as a
       # whole until 2026-11-06; only the virtio-fs guest test stays Unix-only. It needs the Windows datagram socket's
@@ -1199,6 +1233,13 @@ jobs:
           }
           (Join-Path $svn 'bin') | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
           "C:\Program Files\Git\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      # The workloads' shared environment under Git for Windows' `sh`: pip's `hg`, a `#!` script naming `python.exe`,
+      # starts, and Subversion's `^/trunk` reaches a Windows program as written (A-327's `MSYS_NO_PATHCONV` broke the
+      # first, CI run 44271637767; no setting at all the second, 44260193629).
+      - name: The workloads' environment under Git for Windows' sh (native arm64 Windows)
+        if: ${{ !cancelled() && steps.vcs-tools.outcome == 'success' }}
+        timeout-minutes: 15
+        run: cargo test -p slates-conformance --lib under_the_environment_git_for_windows_sh -- --nocapture
       - name: git, Mercurial and Subversion over the WinFsp drive (native arm64 Windows)
         if: ${{ !cancelled() && steps.vcs-tools.outcome == 'success' }}
         timeout-minutes: 30
@@ -1620,6 +1661,59 @@ jobs:
       - name: shuttle (T-1.6 two agents on one base; T-6.7 sixteen agents on one green)
         run: RUSTFLAGS="--cfg shuttle" cargo test -p slates-vfs -p slates-merge --test shuttle_clones --test shuttle_green -- --nocapture
 
+  # live_chaos every night (Ada, 2026-11-18: long CI lanes are allowed; CLAUDE.md §2 item 13 removed): every flow of
+  # crates/cli/tests/live_chaos.rs across real processes, injected latency, loss, partitions, kills and the nemesis,
+  # with every register invariant judged (TotalOrder, Continuity, StaleNeverCommits, ReadSafety, NoLoss). Each flow runs
+  # on its own, capped, with its log kept, so one hung flow (a takeover reported, then nothing, seen twice on
+  # 2026-11-18) cannot hide the others. The cap is four times the slowest passing flow recorded (425 s under load,
+  # 2026-11-18). Nightly only: a full run takes hours on a hosted runner.
+  live-chaos-nightly:
+    name: live_chaos (every flow, capped; nightly)
+    if: github.event_name == 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the chaos binary (release)
+        run: cargo test --locked --release -p slates-cli --test live_chaos --no-run
+      - name: live_chaos, each flow on its own, capped, logs kept
+        env:
+          SLATES_TEST_CLI: "1"
+          SLATES_FLEET_TRACE: "1"
+        run: |
+          ulimit -n 65536 || ulimit -n "$(ulimit -Hn)"
+          echo "nofile $(ulimit -n); cores $(nproc); $(free -g | sed -n 2p); load $(cat /proc/loadavg)"
+          mkdir -p target/chaos
+          bin=$(cargo test --locked --release -p slates-cli --test live_chaos --no-run --message-format=json 2>/dev/null \
+            | jq -r 'select(.executable != null and .target.name == "live_chaos") | .executable' | tail -1)
+          slowest_pass_s=425
+          cap_s=$((slowest_pass_s * 4))
+          failed=0
+          for flow in $("$bin" --list --format terse 2>/dev/null | sed -n 's/: test$//p'); do
+            echo "=== ${flow}"
+            if ! timeout "${cap_s}" "$bin" --exact "${flow}" --test-threads=1 --nocapture > "target/chaos/${flow}.log" 2>&1; then
+              echo "FAILED (or past ${cap_s} s): ${flow}"
+              tail -60 "target/chaos/${flow}.log"
+              failed=$((failed + 1))
+            fi
+          done
+          echo "flows failed: ${failed}"
+          [ "${failed}" -eq 0 ]
+      - name: Upload the chaos logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-chaos-nightly-${{ matrix.os }}
+          path: target/chaos/
+
   # Part 6 "Concurrency", nightly: ThreadSanitizer over the crates whose tests run real threads against
   # shared state (mem, rt, ipc, client), with the standard library rebuilt instrumented. `cargo xtask tsan`
   # first requires a report from a deliberate race (`crates/mem/tests/race_canary.rs`), so a clean run
@@ -1712,6 +1806,19 @@ jobs:
       # leg runs on its own cluster, deleted at the end, and fails rather than skips on a kernel without TLS.
       - name: The kernel's TLS record layer and NFS client (for the export leg)
         run: sudo modprobe tls && sudo modprobe nfs && sudo modprobe nfsv4
+      # kind's nodes are privileged containers whose processes all run as the host's root, so the six nodes share root's
+      # inotify instances. Ubuntu 26.04's runner image (ubuntu26 20261101.186.1) leaves fs.inotify.max_user_instances at the
+      # kernel's 128, where 24.04's image (ubuntu24 20261101.360.1) set 1280. At 128, kube-proxy exited 1 and crash-looped on
+      # 4 of 5 workers, so a pod there could not reach the cluster's DNS and the fleet never formed (`peers_probed=0`,
+      # diag-release-13 and -14). Derived: kind's documented limits for this failure (kind's Known Issues, "Pod errors due
+      # to too many open files"), raised only, never lowered; with them 6 of 6 kube-proxies ran with 0 restarts on 26.04
+      # (diag-release-14).
+      - name: Room for the nodes' inotify instances (kind's known issue; 26.04's image keeps the kernel's 128)
+        run: |
+          set -euo pipefail
+          at_least() { now=$(sysctl -n "$1"); if [ "$now" -lt "$2" ]; then sudo sysctl -w "$1=$2"; else echo "$1 = $now"; fi; }
+          at_least fs.inotify.max_user_instances 512
+          at_least fs.inotify.max_user_watches 524288
       - name: The export leg (kubelet's nfs PersistentVolume over RPC-with-TLS)
         run: cargo xtask kind export --require-kernel-tls
       # The DAX matrix's Kubernetes socket-route cell (docs/wip/virtiofs.md §8; `xtask/src/kind_direct.rs`): a process in

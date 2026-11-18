@@ -146,6 +146,9 @@ pub struct Pulse {
   /// The shard's online wake estimate (`ShardContext::wake_cost_ns`), mirrored at each wake it folds
   /// in, for a reader on another thread (the daemon's status, a stall diagnosis).
   wake_cost_ns: AtomicU64,
+  /// The shard's idle spin window (`ShardContext::counters`' `idle_window_ns`), mirrored beside the wake estimate
+  /// it may be priced on, so a reader on another thread can tell whether the window follows the estimate (A-223).
+  idle_window_ns: AtomicU64,
 }
 
 impl Pulse {
@@ -170,6 +173,17 @@ impl Pulse {
   /// [`Pulse::record_wake_cost`]).
   pub fn wake_cost_ns(&self) -> u64 {
     self.wake_cost_ns.load(Ordering::Relaxed)
+  }
+
+  /// The owning shard mirrors its idle spin window after folding a wake into its estimate.
+  pub fn record_idle_window(&self, idle_window_ns: u64) {
+    self.idle_window_ns.store(idle_window_ns, Ordering::Relaxed);
+  }
+
+  /// The shard's idle spin window, nanoseconds, as of its last measured wake; 0 until its first (see
+  /// [`Pulse::record_idle_window`]).
+  pub fn idle_window_ns(&self) -> u64 {
+    self.idle_window_ns.load(Ordering::Relaxed)
   }
 
   /// The owning shard's application loop marks one period of forward progress.
@@ -306,6 +320,22 @@ impl Registration {
   /// The registered shard id.
   pub fn shard(&self) -> u16 {
     self.shard
+  }
+
+  /// Tells every shard that asked this slot for room ([`crate::shard::ShardContext::want_room`]) that its control
+  /// channel has room now, as a shard's drain that took a message tells them ([`crate::room`]): for a holder that takes
+  /// messages off the slot's control channel itself (a test's stand-in for a shard), called after each take. The fence
+  /// orders the take before the look at who asked, as the drain's does, so either an asker's second try finds the room
+  /// or this finds its mark.
+  pub fn tell_room(&self) {
+    let _ = with_entry(self.shard, |entry| {
+      fence(Ordering::SeqCst);
+      if entry.room_wanted.maybe_any() {
+        entry
+          .room_wanted
+          .take_each(|origin| give_room(origin, self.shard));
+      }
+    });
   }
 }
 
@@ -675,9 +705,10 @@ pub fn shard_cpu(holder: SlotHolder) -> Option<crate::thread_clock::CpuReading> 
 /// [`shard_cpu`] over a window, it tells a starved shard (runnable, its clock barely moving) from one blocked in a call.
 ///
 /// A shard blocked on another thread of the process ([`waiting_on`]) reads as that thread does when that thread is
-/// runnable: blocked on a thread waiting for a CPU, it is starved, not stuck (A-228's transitive wait). A shard blocked on
-/// a thread that is itself blocked still reads blocked, so a deadlock is still found. One batch reads both: the shards'
-/// threads and the threads they wait on.
+/// runnable: blocked on a thread waiting for a CPU, it is starved, not stuck (A-228's transitive wait). So it does when
+/// that thread is held in the kernel past signals (Linux `D`, [`crate::RunReading::uninterruptible`]): a join on a
+/// thread waiting on a page-in waits on memory too (A-336). A shard blocked on a thread that is itself asleep still reads
+/// blocked, so a deadlock is still found. One batch reads both: the shards' threads and the threads they wait on.
 pub fn shard_run_readings(holders: &[SlotHolder]) -> Vec<Option<crate::thread_clock::RunReading>> {
   let marks: Vec<(u64, u64)> = holders
     .iter()
@@ -698,6 +729,7 @@ pub fn shard_run_readings(holders: &[SlotHolder]) -> Vec<Option<crate::thread_cl
   let starting = crate::thread_clock::RunReading {
     state: crate::thread_clock::RunState::Runnable,
     waited_ns: None,
+    uninterruptible: Some(false),
   };
   let handles: Vec<u64> = marks
     .iter()
@@ -726,13 +758,25 @@ pub fn shard_run_readings(holders: &[SlotHolder]) -> Vec<Option<crate::thread_cl
     .map(|(shard, waited)| match (shard, waited) {
       (Some(shard), Some(waited))
         if shard.state == crate::thread_clock::RunState::Blocked
-          && waited.state == crate::thread_clock::RunState::Runnable =>
+          && (waited.state == crate::thread_clock::RunState::Runnable
+            || waited.uninterruptible == Some(true)) =>
       {
         Some(waited)
       }
       (shard, _) => shard,
     })
     .collect()
+}
+
+/// The kernel function the shard `holder` names waits in, for a log line that names its wait (A-336): Linux's `wchan`;
+/// `None` elsewhere, for a registration no longer in its slot, or where the kernel names none.
+pub fn shard_kernel_wait_name(holder: SlotHolder) -> Option<String> {
+  with_entry(holder.shard, |entry| {
+    (entry.holder() == holder).then(|| entry.cpu_clock.load(Ordering::Acquire))
+  })
+  .flatten()
+  .filter(|handle| *handle != 0)
+  .and_then(crate::thread_clock::kernel_wait_name)
 }
 
 /// The scheduler state of the shard `holder` names at this instant ([`shard_run_readings`]).

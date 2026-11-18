@@ -968,7 +968,9 @@ fn a_scope_must_name_a_directory(daemon: &Daemon, id: VolumeId) {
   assert!(
     matches!(
       attach(daemon, id, Some("outside.txt"), Intent::Write),
-      Err(Refusal::BadRequest { .. })
+      Err(Refusal::Volume {
+        refusal: slates_ipc::protocol::VolumeRefusal::NotDirectory
+      })
     ),
     "a scope must be a directory"
   );
@@ -2794,7 +2796,7 @@ mod route {
     drop(silent);
 
     // The honest claim, after all of it, succeeds; a second with the same secret finds no offer.
-    let stream = slates_ipc::route::claim(
+    let claimed = slates_ipc::route::claim(
       &instance,
       (OfferKind::Stream, attachment),
       &secret,
@@ -2806,7 +2808,8 @@ mod route {
       answer: ShardsAttached {
         attachment,
         lease_epoch: None,
-        stream,
+        stream: claimed.descriptor,
+        resync: claimed.resync,
       },
       shards: shard_holders(&daemon),
     });
@@ -2844,11 +2847,13 @@ mod route {
   /// one; this test's churn makes it likelier per claim).
   const CLAIMS_UNDER_CHURN: usize = 48;
 
-  /// A-161 step 3, by use (`docs/bugs/2026-10-24-a-stream-end-arrived-flushed-by-the-kernel-in-flight.md`): every
-  /// stream end handed over on the route arrives live while another thread opens and closes Unix sockets, each close
-  /// a chance for XNU's collector of descriptors in flight to run. Do: claim many ends under that churn, and on each
-  /// read its receive buffer and run `INIT` through it. Expect every end live: its receive buffer the kernel's
-  /// default, never the zero a flush leaves, and its `INIT` answered.
+  /// A-161 step 3, by use (`docs/bugs/2026-10-24-a-stream-end-arrived-flushed-by-the-kernel-in-flight.md`), and A-339's
+  /// resync end beside each: every stream end handed over on the route, and its resync end, arrives live while another
+  /// thread opens and closes Unix sockets, each close a chance for XNU's collector of descriptors in flight to run. Do:
+  /// claim many ends under that churn; on each read the receive buffer of the end and of its resync end, run `INIT`
+  /// through the end, and read the resync end's first message. Expect every end live: each receive buffer the kernel's
+  /// default, never the zero a flush leaves, the `INIT` answered, and the resync end still holding its `Attached`,
+  /// naming its attachment (a flush empties the buffer it waits in).
   #[test]
   fn every_end_handed_over_arrives_live_while_sockets_churn() {
     let (daemon, instance) = single_shard_daemon("shards-route-churn");
@@ -2900,14 +2905,14 @@ mod route {
     let mut flushed = 0usize;
     for _ in 0..CLAIMS_UNDER_CHURN {
       let (attachment, secret) = offer(client, id);
-      let stream = match slates_ipc::route::claim(
+      let claimed = match slates_ipc::route::claim(
         instance,
         (OfferKind::Stream, attachment),
         &secret,
         CREDIT_WAIT,
         &mut || false,
       ) {
-        Ok(stream) => stream,
+        Ok(claimed) => claimed,
         Err(IpcError::RouteRefused {
           refusal: slates_ipc::error::RouteRefusal::Flushed,
         }) => {
@@ -2916,7 +2921,13 @@ mod route {
         }
         Err(other) => panic!("a claim failed: {other}"),
       };
-      if rustix::net::sockopt::socket_recv_buffer_size(&stream).unwrap() == 0 {
+      let resync = claimed
+        .resync
+        .expect("a stream's resync end rides beside it (A-339)");
+      let live = |end: &std::os::fd::OwnedFd| {
+        rustix::net::sockopt::socket_recv_buffer_size(end).unwrap() != 0
+      };
+      if !live(&claimed.descriptor) || !live(&resync) || !attached_first(&resync, attachment) {
         flushed += 1;
         continue;
       }
@@ -2924,13 +2935,28 @@ mod route {
         answer: ShardsAttached {
           attachment,
           lease_epoch: None,
-          stream,
+          stream: claimed.descriptor,
+          resync: Some(resync),
         },
         shards: shard_holders(daemon),
       });
       guest.init();
     }
     flushed
+  }
+
+  /// Whether `resync`, a device's resync end, still holds its first message, `Attached` naming `attachment` (A-339):
+  /// a flush in flight empties the buffer it waits in, and its read then answers the end.
+  fn attached_first(resync: &std::os::fd::OwnedFd, attachment: u64) -> bool {
+    use slates_bridge_fuse::shards_resync::{RESYNC_MESSAGE_BYTES, ResyncKind, ResyncMessage};
+    use std::os::fd::AsFd;
+    bound_reads(resync, CREDIT_WAIT);
+    let mut message = [0u8; RESYNC_MESSAGE_BYTES];
+    let Ok((read, _)) = slates_ipc::stream::recv_message(resync.as_fd(), &mut message) else {
+      return false;
+    };
+    ResyncMessage::parse(message.get(..read).unwrap_or_default())
+      .is_ok_and(|message| message.kind == ResyncKind::Attached && message.attachment == attachment)
   }
 
   /// A-161 step 3: an offer unclaimed past its life is dropped by its timer, so a claim then finds no offer, and the
@@ -3726,4 +3752,55 @@ fn expect_each_wrong_restore_refused_with_its_reason(daemon: &Daemon, id: Volume
     let refused = restored(&mut stream, &bytes).unwrap_err();
     assert!(refused.contains(why), "{why}: {refused}");
   }
+}
+
+/// Bounds `end`'s reads by `bound` where the OS lets it. XNU refuses any socket option on a socket that can neither send
+/// nor receive (`EINVAL`, its `sosetopt`), as a resync end is once its daemon's end closed with no anchor to hold it; a
+/// read of such an end never waits, so it needs no bound.
+fn bound_reads(end: &OwnedFd, bound: Duration) {
+  match rustix::net::sockopt::set_socket_timeout(
+    end,
+    rustix::net::sockopt::Timeout::Recv,
+    Some(bound),
+  ) {
+    Ok(()) | Err(rustix::io::Errno::INVAL) => {}
+    Err(other) => panic!("bounding a resync end's reads: {other}"),
+  }
+}
+
+/// A-316, A-339 (macOS too). Do: attach a volume over a stream on a daemon that has no anchor (this file's harness),
+/// and read the stream's resync end, one message at a time. Expect `Attached` naming the attachment and a token, with
+/// no descriptor, and then the channel's end at once: no anchor holds the daemon's end, so no resync can come, and the
+/// device knows it (Shards' option (a)).
+#[test]
+fn a_stream_whose_resync_end_no_anchor_holds_tells_its_device_no_resync_will_come() {
+  use slates_bridge_fuse::shards_resync::{
+    RESYNC_MESSAGE_BYTES, ResyncKind, ResyncMessage, TOKEN_BYTES,
+  };
+  use std::os::fd::AsFd;
+  let (daemon, instance) = single_shard_daemon("shards-resync-unheld");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&scratch("resync-unheld")) else {
+    panic!("the volume was not created");
+  };
+  let attached = attach(&daemon, id, None, Intent::Write).unwrap();
+  let resync = attached
+    .resync
+    .as_ref()
+    .expect("Linux and macOS make a stream's resync channel");
+  bound_reads(resync, CREDIT_WAIT);
+  let mut bytes = [0u8; RESYNC_MESSAGE_BYTES];
+  let (read, carried) = slates_ipc::stream::recv_message(resync.as_fd(), &mut bytes).unwrap();
+  let told = ResyncMessage::parse(&bytes[..read]).unwrap();
+  assert_eq!(
+    (told.kind, told.attachment, carried.len()),
+    (ResyncKind::Attached, attached.attachment, 0),
+    "the device first reads its attachment's token"
+  );
+  assert_ne!(told.token, [0; TOKEN_BYTES]);
+  let (read, _) = slates_ipc::stream::recv_message(resync.as_fd(), &mut bytes).unwrap();
+  assert_eq!(read, 0, "and then the channel's end: no anchor holds it");
+  drop(attached);
+  drop(client);
+  daemon.stop();
 }

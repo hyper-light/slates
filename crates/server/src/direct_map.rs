@@ -445,22 +445,21 @@ async fn answer_after(
     if let Some(owed) = owed {
       let _ = crate::told::wait(owed).await;
     }
-    deliver_to(route, reply, here).await;
+    deliver_to(route, reply, here);
   }
 }
 
 /// Delivers a deferred reply where its request waits: on this shard's ring when its client is served here, else as a
 /// task on the client's shard (A-188), as an image build's reply goes, waiting for room as every reply carried home
 /// does (`crate::xshard::send_back`).
-async fn deliver_to(route: ReplyRoute, reply: ReplyBody, here: u16) {
+fn deliver_to(route: ReplyRoute, reply: ReplyBody, here: u16) {
   if route.shard == here {
     crate::state::deliver(route.client_index, route.request, reply, true);
     return;
   }
   crate::xshard::send_reply_home(route.shard, move || {
     crate::state::deliver(route.client_index, route.request, reply, true);
-  })
-  .await;
+  });
 }
 
 /// Writes back every writable map the dead client `client_id` holds on this shard (§4.6, A-186, A-188), before its reap
@@ -884,9 +883,6 @@ mod served {
       None,
     ) {
       Ok(fill) => defer(state, fill),
-      Err(Begun::Directory) => refused(Refusal::BadRequest {
-        reason: "the path is a directory".to_owned(),
-      }),
       Err(Begun::Vfs(error)) => refused(refusal_of_vfs(&error)),
       Err(Begun::Unavailable) => refused(Refusal::MapUnavailable),
       Err(Begun::FellBack) => {
@@ -956,9 +952,6 @@ mod served {
       Some((volume, attachment)),
     ) {
       Ok(fill) => defer(state, fill),
-      Err(Begun::Directory) => refused(Refusal::BadRequest {
-        reason: "the path is a directory".to_owned(),
-      }),
       Err(Begun::Vfs(error)) => refused(refusal_of_vfs(&error)),
       Err(Begun::Unavailable) => refused(Refusal::MapUnavailable),
       Err(Begun::FellBack) => {
@@ -983,9 +976,8 @@ mod served {
 
   /// Why a direct map did not begin.
   enum Begun {
-    /// The path is a directory.
-    Directory,
-    /// The path does not resolve, or its file cannot be read.
+    /// The path does not resolve, names a directory (A-299: the volume core's typed `IsDirectory`, never words), or
+    /// its file cannot be read.
     Vfs(slates_vfs::error::VfsError),
     /// A shape the direct map does not serve: an overlay, or a client served here that no descriptor can reach.
     Unavailable,
@@ -1080,7 +1072,7 @@ mod served {
         Target::Path(key) => {
           let located = slot.volume.resolve(store, key).map_err(Begun::Vfs)?;
           if matches!(located.child, Child::Dir(_)) {
-            return Err(Begun::Directory);
+            return Err(Begun::Vfs(slates_vfs::error::VfsError::IsDirectory));
           }
           located.inode
         }
@@ -1326,7 +1318,8 @@ mod served {
         return refused(Refusal::MapUnavailable);
       };
       let key = (slates_ipc::route::OfferKind::Map, mapping_id);
-      if !crate::shards_route::offer(state, key, secret, descriptor) {
+      // A map's copy rides alone: only a stream's offer carries a resync end (A-339).
+      if !crate::shards_route::offer(state, key, secret, (descriptor, None)) {
         state.count(FELL_BACK, 1);
         return refused(Refusal::MapUnavailable);
       }
@@ -1637,7 +1630,7 @@ mod served {
     });
     // Delivered after the state's borrow ends, since delivery takes it again.
     if let Some((reply, Some(route), here)) = answered {
-      super::deliver_to(route, reply, here).await;
+      super::deliver_to(route, reply, here);
     }
   }
 }

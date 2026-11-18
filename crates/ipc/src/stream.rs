@@ -43,6 +43,100 @@ pub fn pair() -> Result<(OwnedFd, OwnedFd), IpcError> {
   Ok((daemon, handed))
 }
 
+/// A connected pair of anonymous message sockets for a Shards stream's resync channel (A-316;
+/// `slates_bridge_fuse::shards_resync`): the daemon's end (non-blocking, its sends never raising the signal) and the
+/// device's. Each [`send`] there is one message whole, and one may carry a descriptor ([`send_with_descriptor`]):
+/// sequenced packets on Linux; a stream elsewhere, whose messages are of one fixed length and read whole
+/// ([`recv_message`]). macOS has no sequenced-packet Unix sockets (`EPROTONOSUPPORT`), and a datagram pair, which keeps
+/// messages whole, never tells a survivor its peer has gone: measured on macOS 26.4 (2026-11-18), a blocked `recv`, a
+/// `select` and a kqueue on the device's end each waited out their 5 s after the daemon's end closed, and a `recv`
+/// after it answered `ECONNRESET` once and then blocked again (A-339). A device must read the channel's end when no
+/// resync will ever come, so macOS's channel is a stream, whose reads answer zero once every copy of the peer's end
+/// has closed. Both ends close-on-exec, nothing on disk (R1).
+pub fn message_pair() -> Result<(OwnedFd, OwnedFd), IpcError> {
+  use rustix::net::{AddressFamily, SocketFlags, SocketType};
+  #[cfg(target_os = "linux")]
+  let (kind, flags) = (SocketType::SEQPACKET, SocketFlags::CLOEXEC);
+  #[cfg(not(target_os = "linux"))]
+  let (kind, flags) = (SocketType::STREAM, SocketFlags::empty());
+  let (daemon, handed) = rustix::net::socketpair(AddressFamily::UNIX, kind, flags, None)
+    .map_err(|e| refused("socketpair", e))?;
+  #[cfg(not(target_os = "linux"))]
+  for end in [&daemon, &handed] {
+    rustix::io::fcntl_setfd(end, rustix::io::FdFlags::CLOEXEC)
+      .map_err(|e| refused("fcntl_setfd", e))?;
+  }
+  #[cfg(target_vendor = "apple")]
+  rustix::net::sockopt::set_socket_nosigpipe(&daemon, true)
+    .map_err(|e| refused("setsockopt(SO_NOSIGPIPE)", e))?;
+  rustix::io::ioctl_fionbio(&daemon, true).map_err(|e| refused("ioctl_fionbio", e))?;
+  Ok((daemon, handed))
+}
+
+/// Format: the descriptors one message is read with room for: the one a resync carries (A-316), and one more, so a
+/// message carrying two is seen as such and refused rather than cut to one.
+const RECEIVED_DESCRIPTORS: usize = 2;
+
+/// Receives one message on a message end ([`message_pair`]) into `into`, one message long, with every descriptor it
+/// carried, as a device receives a resync (A-316, A-339): Linux reads one packet; elsewhere the channel is a stream, so
+/// the reads go on until `into` is full. The bytes read: `into`'s length for a whole message; fewer when the peer's
+/// packet was shorter (Linux) or the peer went part-way through a message (elsewhere); zero once the peer has gone.
+/// Each descriptor close-on-exec, marked at receipt on Linux and just after elsewhere. Waits for a message unless
+/// `end` is non-blocking.
+pub fn recv_message(end: BorrowedFd<'_>, into: &mut [u8]) -> Result<(usize, Vec<OwnedFd>), Errno> {
+  let mut descriptors = Vec::new();
+  let mut filled = 0usize;
+  loop {
+    let Some(room) = into.get_mut(filled..) else {
+      break;
+    };
+    let read = recv_part(end, room, &mut descriptors)?;
+    filled = filled.saturating_add(read);
+    if read == 0 || filled == into.len() || READS_ONE_PACKET {
+      break;
+    }
+  }
+  Ok((filled, descriptors))
+}
+
+/// Whether a message end's one read is one whole message: Linux's sequenced packets; a stream (elsewhere) is read
+/// until the message is whole.
+const READS_ONE_PACKET: bool = cfg!(target_os = "linux");
+
+/// One read of a message end into `into`, its descriptors added to `descriptors`, each close-on-exec: the bytes read.
+fn recv_part(
+  end: BorrowedFd<'_>,
+  into: &mut [u8],
+  descriptors: &mut Vec<OwnedFd>,
+) -> Result<usize, Errno> {
+  use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags};
+  let mut space =
+    [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(RECEIVED_DESCRIPTORS))];
+  let mut control = RecvAncillaryBuffer::new(&mut space);
+  #[cfg(target_os = "linux")]
+  let flags = RecvFlags::CMSG_CLOEXEC;
+  #[cfg(not(target_os = "linux"))]
+  let flags = RecvFlags::empty();
+  let received = rustix::net::recvmsg(
+    end,
+    &mut [std::io::IoSliceMut::new(into)],
+    &mut control,
+    flags,
+  )?;
+  let mut arrived = Vec::new();
+  for message in control.drain() {
+    if let RecvAncillaryMessage::ScmRights(carried) = message {
+      arrived.extend(carried);
+    }
+  }
+  #[cfg(not(target_os = "linux"))]
+  for descriptor in &arrived {
+    rustix::io::fcntl_setfd(descriptor, rustix::io::FdFlags::CLOEXEC)?;
+  }
+  descriptors.append(&mut arrived);
+  Ok(received.bytes)
+}
+
 /// Sends what of `bytes` the daemon's end takes now: the bytes taken, `EAGAIN` when its buffer is full, `EPIPE` once
 /// the peer has gone (never the signal; see the module doc).
 pub fn send(end: BorrowedFd<'_>, bytes: &[u8]) -> Result<usize, Errno> {
@@ -117,43 +211,65 @@ pub fn exec_with(
   stream: OwnedFd,
   at: i32,
 ) -> IpcError {
+  exec_with_ends(program, args, vec![(stream, at)])
+}
+
+/// [`exec_with`] for several ends, each handed at its own number: what `slates shards` does with a stream end and its
+/// resync end (A-316). Exactly one copy of each reaches the program, at its number. Every end is first copied,
+/// close-on-exec, above every number any of them is handed at, so placing one never closes another's source, and a copy
+/// never lands on its own number (where `dup2` would leave close-on-exec set). Refused before anything changes for a
+/// number below [`FIRST_HANDED_NUMBER`] or two ends at one number.
+pub fn exec_with_ends(
+  program: &std::ffi::OsStr,
+  args: &[std::ffi::OsString],
+  ends: Vec<(OwnedFd, i32)>,
+) -> IpcError {
   use std::os::fd::AsRawFd;
   use std::os::unix::process::CommandExt;
-  if at < FIRST_HANDED_NUMBER {
+  let mut numbers: Vec<i32> = ends.iter().map(|(_, at)| *at).collect();
+  numbers.sort_unstable();
+  numbers.dedup();
+  if numbers.len() != ends.len() || numbers.first().is_some_and(|at| *at < FIRST_HANDED_NUMBER) {
     return IpcError::Layout {
-      reason: "a stream end is handed past standard input, output and error",
+      reason: "ends are handed past standard input, output and error, each at its own number",
     };
   }
-  // `dup2` must copy from another number than `at`: a copy onto itself would leave close-on-exec set.
-  let source = if stream.as_raw_fd() == at {
-    match rustix::io::fcntl_dupfd_cloexec(&stream, FIRST_HANDED_NUMBER) {
-      Ok(copy) => copy,
+  let above = numbers
+    .last()
+    .copied()
+    .unwrap_or(FIRST_HANDED_NUMBER)
+    .saturating_add(1);
+  let mut sources = Vec::with_capacity(ends.len());
+  for (end, at) in ends {
+    match rustix::io::fcntl_dupfd_cloexec(&end, above) {
+      Ok(copy) => sources.push((copy, at)),
       Err(e) => return refused("fcntl_dupfd_cloexec", e),
     }
-  } else {
-    stream
-  };
-  if let Err(e) = rustix::io::fcntl_setfd(&source, rustix::io::FdFlags::CLOEXEC) {
-    return refused("fcntl_setfd", e);
   }
-  let from = source.as_raw_fd();
+  let moves: Vec<(i32, i32)> = sources
+    .iter()
+    .map(|(source, at)| (source.as_raw_fd(), *at))
+    .collect();
   let mut command = std::process::Command::new(program);
   command.args(args);
   // SAFETY: the closure runs in this process just before `execvp`, after the standard library has reset the signal state
-  // it changes, and makes one system call, `dup2(from, at)`, on numbers it copied, reading errno on failure: no
-  // allocation, no lock, no other state, which is what `pre_exec` asks. `from` is open until the exec returns, since
-  // `source` is dropped only after it; `dup2` places a copy at `at`, replacing whatever was open there, with
-  // close-on-exec cleared, so the exec keeps that copy while `from`, close-on-exec, closes.
+  // it changes, and only reads `moves` (already allocated) and makes one system call per end, `dup2(from, at)`, reading
+  // errno on failure: no allocation, no lock, no other state, which is what `pre_exec` asks. Each `from` is open until
+  // the exec returns, since `sources` is dropped only after it, and lies above every `at`, so no `dup2` closes a source
+  // another still needs; `dup2` places each copy with close-on-exec cleared, so the exec keeps them while the sources,
+  // close-on-exec, close.
   unsafe {
     command.pre_exec(move || {
-      if libc::dup2(from, at) < 0 {
-        return Err(std::io::Error::last_os_error());
+      for &(from, at) in &moves {
+        if libc::dup2(from, at) < 0 {
+          return Err(std::io::Error::last_os_error());
+        }
       }
       Ok(())
     });
   }
   let error = command.exec();
-  drop(source);
+  drop(sources);
   IpcError::OsRefused {
     call: "exec",
     code: error.raw_os_error(),
@@ -231,6 +347,108 @@ mod tests {
   use super::*;
 
   use std::os::fd::AsFd;
+
+  /// A-316, A-339. Do: make a message pair; send two messages on the daemon's end, then a third carrying a descriptor
+  /// (the read end of a stream pair); read each on the handed end into a buffer of its length, as a device reads its
+  /// fixed-length messages; then read the daemon's end empty. Expect each message whole and in order, the descriptor
+  /// arriving with the third alone and working (bytes written on its peer read through it), the daemon's end refusing
+  /// to wait, and every end close-on-exec.
+  #[test]
+  fn a_message_pair_keeps_each_message_whole_and_carries_a_descriptor() {
+    let (daemon, handed) = message_pair().unwrap();
+    let (carried_peer, carried) = pair().unwrap();
+    send(daemon.as_fd(), b"first").unwrap();
+    send(daemon.as_fd(), b"second message").unwrap();
+    send_with_descriptor(daemon.as_fd(), b"third", carried.as_fd()).unwrap();
+    for expected in [&b"first"[..], b"second message"] {
+      let mut buf = vec![0u8; expected.len()];
+      let (read, descriptors) = recv_message(handed.as_fd(), &mut buf).unwrap();
+      assert_eq!(buf.get(..read), Some(expected));
+      assert!(descriptors.is_empty(), "no descriptor rode {expected:?}");
+    }
+    let mut buf = [0u8; 5];
+    let (read, descriptors) = recv_message(handed.as_fd(), &mut buf).unwrap();
+    assert_eq!(buf.get(..read), Some(&b"third"[..]));
+    // Closed only once the receiver has its own: a socket whose every copy rides a message is flushed by macOS's
+    // collector of descriptors in flight (A-161).
+    drop(carried);
+    let [arrived] = <[OwnedFd; 1]>::try_from(descriptors).unwrap();
+    rustix::io::write(&carried_peer, b"through").unwrap();
+    let mut through = [0u8; 8];
+    let read = rustix::io::read(&arrived, &mut through).unwrap();
+    assert_eq!(through.get(..read), Some(&b"through"[..]));
+    assert_eq!(
+      recv(daemon.as_fd(), &mut buf),
+      Err(Errno::AGAIN),
+      "the daemon's end returns at once when nothing waits"
+    );
+    for end in [&daemon, &handed, &arrived] {
+      let flags = rustix::io::fcntl_getfd(end).unwrap();
+      assert!(flags.contains(rustix::io::FdFlags::CLOEXEC));
+    }
+  }
+
+  /// Shape: how long the device's read of the channel may wait for the end: far past any scheduling delay, so a read
+  /// still waiting at it was never woken.
+  const END_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+  /// Shape: how long the test lets the device's read start waiting before the daemon's end closes, so the read is
+  /// woken by the close rather than finding it already done.
+  const READ_STARTS: std::time::Duration = std::time::Duration::from_millis(100);
+
+  /// A-339. Do: make a message pair; on another thread, wait in a read of the device's end, bounded by [`END_WAIT`];
+  /// close the daemon's end; then read the device's end again. Expect the waiting read woken with zero (the channel's
+  /// end) before its bound, and the later read zero too: a device learns that no resync will come. On macOS a datagram
+  /// pair's survivor was never woken by its peer's close (its read waited out the bound), which is why the channel is a
+  /// stream there.
+  #[test]
+  fn a_message_pairs_device_end_reads_the_end_once_the_daemons_end_closes() {
+    // The daemon's end must have no other copy, as in a child another test spawns ([`crate::descriptor_test_gate`]).
+    let _gate = crate::descriptor_test_gate();
+    let (daemon, handed) = message_pair().unwrap();
+    rustix::net::sockopt::set_socket_timeout(
+      &handed,
+      rustix::net::sockopt::Timeout::Recv,
+      Some(END_WAIT),
+    )
+    .unwrap();
+    let reader = std::thread::spawn(move || {
+      let mut message = [0u8; 8];
+      let started = std::time::Instant::now();
+      let read = recv_message(handed.as_fd(), &mut message).map(|(read, _)| read);
+      (read, started.elapsed(), handed)
+    });
+    std::thread::sleep(READ_STARTS);
+    drop(daemon);
+    let (read, waited, handed) = reader.join().unwrap();
+    assert_eq!(read, Ok(0), "the waiting read is woken with the end");
+    assert!(
+      waited < END_WAIT,
+      "woken by the close, not its bound: {waited:?}"
+    );
+    let mut message = [0u8; 8];
+    assert_eq!(
+      recv_message(handed.as_fd(), &mut message).map(|(read, _)| read),
+      Ok(0),
+      "and every later read answers the end"
+    );
+  }
+
+  /// A-316. Do: hand ends at a number below three, and two ends at one number. Expect each refused `Layout` before
+  /// anything is copied or run (the test process goes on).
+  #[test]
+  fn ends_handed_below_three_or_two_at_one_number_are_refused_before_exec() {
+    let program = std::ffi::OsStr::new("/nonexistent/slates-a315");
+    let (_kept, low) = pair().unwrap();
+    assert!(matches!(
+      exec_with_ends(program, &[], vec![(low, 2)]),
+      IpcError::Layout { .. }
+    ));
+    let (first, second) = pair().unwrap();
+    assert!(matches!(
+      exec_with_ends(program, &[], vec![(first, 7), (second, 7)]),
+      IpcError::Layout { .. }
+    ));
+  }
 
   /// Do: make a pair, write on the handed end, read on the daemon's; then read the daemon's end empty. Expect the bytes
   /// across, the daemon's end refusing to wait (non-blocking), and both ends close-on-exec.

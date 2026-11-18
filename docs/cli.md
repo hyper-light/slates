@@ -30,9 +30,14 @@ slates anchor [--instance NAME] [--quick] [--shards N] [--fleet PATH --node NAME
 The anchor measures the machine profile (seconds; `--quick` for tests), creates the shared
 segment in RAM, publishes the profile into it, and supervises `slates daemon` as a child with
 the segment handed over in its environment. It restarts a daemon that exits, kills one whose
-heartbeat lapses, and gives up on a crash loop (the bound is derived from the recovery budget
-and the measured daemon start). `SIGINT` or `SIGTERM` stops both. This path is intended to avoid explicit disk writes;
+heartbeat lapses because a shard is stuck (never one whose shards are only starved: kept off their
+CPUs, or waiting on memory while the host reports a memory stall), and gives up on a crash loop
+(the bound is derived from the recovery budget and the measured daemon start). `SIGINT` or `SIGTERM` stops both. This path is intended to avoid explicit disk writes;
 an anonymous shared segment alone does not establish locked residency or no swapping.
+
+`--shards N` overrides the derived shard count (tests). One process runs at most 1,024 shards (the
+runtime's registry of shards); a larger count is refused as a usage error before anything starts, since
+the daemon could never register its shards and the anchor would restart it for good.
 
 `slates daemon` run alone measures a profile and serves without an anchor (development).
 
@@ -291,7 +296,7 @@ slates read VOLUME PATH [--version N | --attachment A]
 slates mount ID PATH [--read-only] [--subtree DIR]
 slates unmount PATH
 slates export ID [--read-only] [--subtree DIR] [--uid UID]
-slates land ID TARGET [--snapshot N] [--include P] [--exclude P] [--grant N] [--json]
+slates land ID TARGET [--snapshot N] [--include P]... [--exclude P]... [--grant N] [--json]
 slates image build ID SNAPSHOT NAME --capacity SIZE [--json]
 slates image merge IMAGE NAME [--json]
 slates grants [--json]
@@ -416,6 +421,10 @@ human saw, the scope and the term — which the daemon recomputes before issuing
 not verify (a forged, replayed or modified-plan approval) is refused `GrantIssuerUnverified` and
 counted; the MCP server and the SDKs carry no proof by construction and are refused by kind.
 Passing `--grant N` to `land` then consumes the grant; the landing must present the same manifest.
+`land --include P` and `--exclude P` each take a path prefix of the volume (`/.git`), as often as given: an entry
+lands when it lies under an included prefix (or none is given) and under no excluded one. Until 2026-11-17 each
+flag kept its last value alone, so a harness could leave out one prefix
+(`docs/bugs/2026-11-17-land-kept-only-the-last-exclude.md`).
 `land --snapshot N` lands that snapshot exactly as it was taken, whatever the volume has become since; the
 volume's later edits stay private, and a later `land` without `--snapshot` lands them over it.
 One landing at a time writes into a directory, whichever volume lands and however its path is
@@ -444,7 +453,7 @@ sets a principal's rights on a volume (`uid:N`, `consumer:N` under your account,
 `consumer:ACCOUNT/N`; no switch removes the entry). `enroll`, `revoke` and `run` are the anchor user's
 surface like `grant` and need its variables; `share` is the volume owner's.
 
-`slates shards ID [--subtree DIR] [--read-only] --fd N [--json] -- CMD [ARG ...]` hands a program a Shards
+`slates shards ID [--subtree DIR] [--read-only] --fd N [--resync-fd M] [--json] -- CMD [ARG ...]` hands a program a Shards
 microVM's filesystem device: it attaches the volume (or only `DIR` of it; for writing unless `--read-only`, as
 `mount` attaches), announces the attachment (`attachment: N`, or `{"attachment": N}` under `--json`), and
 replaces itself with `CMD`, one end of a socket pair at descriptor `N` — the end the daemon serves that attachment
@@ -454,6 +463,13 @@ the copy at `N` goes into the command, so the attachment lasts exactly as long a
 command, and anything the command handed the end to, closes it (or on `detach`, a revocation, the volume's destroy).
 The process you started is the command — its pid, its signals, its exit code — so ending it ends the attachment; a
 command that cannot run is a failure (exit 4), its attachment ended with the end it never got.
+With `--resync-fd M` the command also gets the stream's resync channel at descriptor `M` (Linux and macOS): a
+socket whose first message, 28 bytes, names the attachment and a secret token, and over which, if the daemon dies and
+its successor recovers the attachment, the successor hands a fresh stream end naming the same token. On Linux each
+message is one packet; on macOS the channel is a stream, so read each message whole by its 28 bytes. Reading the
+channel's end means no such stream will come (the attachment ended, or the daemon could not keep it); a platform that
+makes no channel yet hands one already ended. A program that ends its share closes the channel's end with the
+stream's.
 A guest whose init names its run's owner, as Shards' does with `trusted.shards.owner`, is shown the files the host
 made as that owner's, so an unprivileged run writes them; the volume keeps the host's own ids for what the run makes,
 so every other route shows those files as the host's.

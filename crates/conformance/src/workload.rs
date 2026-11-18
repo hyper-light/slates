@@ -45,13 +45,17 @@ pub struct Workload {
 /// object count is compared, not `git count-objects`' kilobytes: those are `st_blocks`, the host
 /// filesystem's allocation unit (APFS rounds every loose object up to 4 KiB, the export reports the
 /// bytes held), a property of the filesystem under the repository, not of git (the CI macOS runner,
-/// 2026-09-16: "10 objects, 40 kilobytes" on the host, "10 objects, 5 kilobytes" on the mount).
+/// 2026-09-16: "10 objects, 40 kilobytes" on the host, "10 objects, 5 kilobytes" on the mount). Under Git for Windows'
+/// shell the link is a Windows symbolic link, asked for on its `ln` alone (`MSYS=winsymlinks:nativestrict`, which that
+/// shell's `ln` would otherwise answer with a copy), so it goes through the drive's reparse points (A-275) on one side
+/// and NTFS's on the other; git itself runs as Git for Windows ships it, its own symbolic links off (A-327). Every other
+/// shell ignores the variable.
 const GIT: &str = r#"
 git init -q .
 printf 'hello\n' > a.txt
 mkdir -p d
 printf 'world\n' > d/b.txt
-ln -s a.txt link
+MSYS=winsymlinks:nativestrict ln -s a.txt link
 chmod u=rwx,go=rx d/b.txt
 git add -A
 git commit -q -m first
@@ -150,6 +154,7 @@ git status --porcelain=v2 --branch
 /// fixed date, as the git workloads' do, and the clone's `hgrc` is written back with the source's relative path,
 /// since `hg clone` records a local source by its absolute path.
 const MERCURIAL: &str = r#"
+# Format: every commit's one fixed date, as the git workloads fix theirs.
 d='2026-09-14 00:00:00 +0000'
 hg init src
 cd src
@@ -204,16 +209,33 @@ hg -R ../shared status --all
 
 /// The Subversion workload (the goal of 2026-11-18): an FSFS repository made with a fixed UUID; a working copy of its
 /// trunk, whose state is SQLite (`.svn/wc.db`, journalled and locked as SQLite does over the file system under it);
-/// a commit, a branch by a server-side copy, a switch to it and a commit there, a switch back and a commit on trunk,
-/// an update back to an older revision and forward again, a merge of the branch into trunk (Subversion's own merge,
-/// recorded in `svn:mergeinfo`), a tag, a cleanup, a second working copy of the branch, then the repository verified
-/// and dumped. Every revision's date is set to one fixed instant before the history is printed (`svnadmin
+/// two commits, a branch by a server-side copy, a switch to it and a commit there, a switch back and a commit on
+/// trunk, an update back to an older revision and forward again, a merge of the branch into trunk (Subversion's own
+/// merge, recorded in `svn:mergeinfo`), a tag, a cleanup, a second working copy of the branch, then the repository
+/// verified and dumped. Every revision's date is set to one fixed instant before the history is printed (`svnadmin
 /// setrevprop`, which runs no hook), as the git and Mercurial workloads fix theirs; the client's configuration is the
 /// workload's own (`--config-dir`), so nothing outside the tree is read or written. Every repository URL holds the
 /// workload's absolute path, which the comparison replaces by the root token. Under Git for Windows' shell (A-300) the
 /// directory is taken in its drive form (`pwd -W`, `D:/a`; other shells refuse the option and the plain `pwd` answers),
 /// since a file URL names a Windows directory as `file:///D:/a`, and `svnlook youngest` ends its line with Windows'
 /// carriage return there, which the revision loop's count must not carry.
+///
+/// No commit sends more than one file's text. Subversion's client sends a commit's texts after its tree, in the order
+/// of a hash table (`svn_client__do_commit`'s `file_mods`, `subversion/libsvn_client/commit_util.c` of 1.14), and APR
+/// seeds each hash table from the clock and its addresses (`apr_hash_make`, `tables/apr_hash.c` of 1.7), so the order
+/// is drawn anew in every process; FSFS numbers a revision's items in the order they arrive. One commit of two new
+/// files therefore wrote its revision file, and the representation cache's row for each text, in either of two orders:
+/// the cache's item number for `d/b.txt`'s text was 3 in one run and 4 in the next (host and host on ubuntu, host and
+/// mount on macOS and over Linux FUSE: CI runs 44252249999, 44252296495 and 44252854695, 2026-11-18), and on Subversion
+/// 1.14.5 (kiln run r956) twelve runs of the script with that commit wrote `db/revs/0/2` two ways, seven and five
+/// times, every other file alike, while twelve runs with its two files committed apart were identical in every
+/// revision file, the cache's rows and its bytes, the output and the dump. So the revision files (`db/revs`), their
+/// properties (`db/revprops`) and the youngest revision (`db/current`) are compared byte for byte. The representation
+/// cache (`db/rep-cache.db`) is compared by what Subversion keeps in it, its rows, rather than by SQLite's bytes for
+/// them: each content's hash, the revision that first stored it and its size print where `sqlite3` is on the `PATH`
+/// (its bytes had differed between two runs, CI run 44247840584, only because its rows had), and `svnadmin verify`
+/// checks each row against the revision it names (`verify_rep_cache`, `subversion/libsvn_fs_fs/verify.c` of 1.14).
+/// The dump's checksum, `svnlook tree`, `svn log -v` and `svnadmin verify` print every revision's content.
 const SUBVERSION: &str = r#"
 top=$(pwd -W 2>/dev/null || pwd)
 case $top in
@@ -221,6 +243,7 @@ case $top in
   *) url="file:///$top/repo" ;;
 esac
 svn() { command svn --config-dir "$top/svn-config" --non-interactive --no-auth-cache "$@"; }
+# Format: every revision's one fixed date, and the repository's fixed UUID.
 printf '2026-09-14T00:00:00.000000Z' > date
 svnadmin create repo
 svnadmin setuuid repo 00000000-0000-4000-8000-00000000c0de
@@ -228,10 +251,12 @@ svn mkdir -q -m layout "$url/trunk" "$url/branches" "$url/tags"
 svn checkout -q "$url/trunk" wc
 cd wc
 printf 'one\n' > a.txt
+svn add -q a.txt
+svn commit -q -m base
 mkdir d
 printf 'two\n' > d/b.txt
-svn add -q a.txt d
-svn commit -q -m base
+svn add -q d
+svn commit -q -m 'base directory'
 svn copy -q -m 'branch feature' '^/trunk' '^/branches/feature'
 svn switch -q '^/branches/feature'
 printf 'feature\n' > f.txt
@@ -240,7 +265,8 @@ svn commit -q -m feature
 svn switch -q '^/trunk'
 printf 'main\n' >> a.txt
 svn commit -q -m 'main change'
-svn update -q -r 2
+# Format: revision 3 is the base, its two files each committed alone.
+svn update -q -r 3
 cat a.txt
 svn update -q
 svn merge -q '^/branches/feature'
@@ -266,14 +292,19 @@ svn info --show-item last-changed-revision
 svn info --show-item url
 svn info --show-item repos-uuid
 svn log -v -r 1:HEAD '^/'
-svn diff -c 5 '^/'
+# Format: revision 6 is the change on trunk, 7 the branch's merge into it.
+svn diff -c 6 '^/'
 svn propget svn:mergeinfo .
 svn cat -r 2 a.txt
 svn list -R '^/'
 cd ..
 svnadmin verify repo
+if command -v sqlite3 >/dev/null 2>&1; then
+  sqlite3 repo/db/rep-cache.db 'SELECT hash, revision, expanded_size FROM rep_cache ORDER BY hash'
+fi
 svnlook tree repo
-svnlook changed -r 6 repo
+# Format: revision 7, the merge, as the repository records it.
+svnlook changed -r 7 repo
 svnadmin dump -q repo | cksum
 "#;
 
@@ -443,9 +474,25 @@ if grep -q 'new\.txt' events.txt; then echo "observed new.txt created"; else ech
 ///   two runs of the Mercurial workload wrote one list in two orders);
 /// - one time zone and locale, and npm with no update check, funding or audit messages and no log files (their path,
 ///   in the cache, would be the one line that differs between runs);
-/// - under Git for Windows' shell (A-300), `ln -s` making a Windows symbolic link and failing where it cannot
-///   (`winsymlinks:nativestrict`), as POSIX's does; by default that shell copies the target instead, which would hide
-///   whether the drive makes links (A-275). Every other shell ignores the variable.
+/// - cargo's plain output and its own target directory (`CARGO_TARGET_DIR=target`, which cargo takes relative to the
+///   directory it runs in, so the crate's own), whatever a parent sets: every CI job sets `CARGO_TERM_COLOR=always`,
+///   whose escape sequence before `Fresh` made the cargo workload's count of fresh builds read 0, failing it on both
+///   sides of every leg (CI runs 44247840584 and 44252249999, 2026-11-18), and kiln's runs set a target directory
+///   outside the tree, where the workload's `./target/debug/mini` would not be;
+/// - under Git for Windows' shell, Subversion's repository-relative URLs handed on as written and every other argument
+///   converted as that shell converts it (`MSYS2_ARG_CONV_EXCL=^/`). The shell rewrites an argument that looks like a
+///   POSIX path before it starts a Windows program (its runtime's `arg_heuristic_with_exclusions`, `winsup/cygwin/
+///   path.cc`, called for each argument in `spawn.cc`), and it took `^/trunk` for one, so `svn` was handed
+///   `^C:\Program Files\Git\trunk` and refused it on both sides (CI run 44260193629, both Windows lanes). The variable
+///   names argument prefixes, separated by `;`, that are left alone. A-327 turned the rewrite off for every argument
+///   instead (`MSYS_NO_PATHCONV`), and that stopped the one Mercurial needs: pip's `hg` is a script whose `#!` line
+///   names `python.exe`, which the shell starts with the script's path as its first argument, and handed unconverted,
+///   `/c/hostedtoolcache/…/Scripts/hg` is a path Python reads on the current drive, `D:\c\…`, so every `hg` exited 2 on
+///   both sides (CI run 44271637767). Every other shell ignores the variable. Git for Windows' native symbolic links
+///   (`MSYS=winsymlinks:nativestrict`) are asked for by the `git` workload's one `ln -s` alone, not here: git reads the
+///   same variable to turn its own symbolic links on, and with them on it resolves every change of directory through
+///   `GetFinalPathNameByHandleW` (`compat/mingw.c` `mingw_chdir`), which Windows refuses on a drive the Mount Manager
+///   did not make (A-327).
 pub const ENVIRONMENT: &[(&str, &str)] = &[
   ("GIT_AUTHOR_NAME", "slates"),
   ("GIT_AUTHOR_EMAIL", "slates@example.invalid"),
@@ -466,7 +513,9 @@ pub const ENVIRONMENT: &[(&str, &str)] = &[
   ("npm_config_fund", "false"),
   ("npm_config_audit", "false"),
   ("npm_config_logs_max", "0"),
-  ("MSYS", "winsymlinks:nativestrict"),
+  ("CARGO_TERM_COLOR", "never"),
+  ("CARGO_TARGET_DIR", "target"),
+  ("MSYS2_ARG_CONV_EXCL", "^/"),
 ];
 
 /// [`ENVIRONMENT`] as POSIX shell `export` lines ([`export_line`]), for a leg that sets it inside a script (the live
@@ -609,6 +658,12 @@ pub const ROSTER: &[Workload] = &[
         "repo/db/uuid",
         "FSFS keeps a random instance id beside the repository's UUID, drawn anew by `svnadmin setuuid` by design; \
          the UUID itself is printed (`svn info --show-item repos-uuid`)",
+      ),
+      (
+        "repo/db/rep-cache.db",
+        "FSFS's representation cache is an SQLite file, judged by what Subversion keeps in it, its rows: each \
+         content's hash, first revision and size are printed where sqlite3 is on the PATH, and `svnadmin verify` \
+         checks every row against the revision it names; the revisions it caches are compared byte for byte",
       ),
     ],
     runs_on_windows: true,
@@ -854,10 +909,12 @@ pub struct StatedDifference {
 }
 
 /// Why the WinFsp drive's link counts are not NTFS's (A-300).
-const NO_HARD_LINK_ON_THE_DRIVE: &str = "the WinFsp drive makes no hard link: WinFsp's driver answers \
-  FileLinkInformation STATUS_NOT_SUPPORTED before any file system is asked (v2.1, src/sys/fileinfo.c) and its NTFS \
-  compatibility page lists hard links unsupported, so a local clone copies on the drive where NTFS links; the bytes \
-  are the same (A-300)";
+const NO_HARD_LINK_ON_THE_DRIVE: &str = concat!(
+  "the WinFsp drive makes no hard link: WinFsp's driver answers ",
+  "FileLinkInformation STATUS_NOT_SUPPORTED before any file system is asked (v2.1, src/sys/fileinfo.c) and its NTFS ",
+  "compatibility page lists hard links unsupported, so a local clone copies on the drive where NTFS links; the bytes ",
+  "are the same (A-300)",
+);
 
 /// The WinFsp drive's stated differences: how many files of a local clone have two names (A-300). git and Mercurial
 /// link a local clone's files where the file system can and copy them where it cannot, so these lines count links on
@@ -1418,5 +1475,51 @@ mod tests {
     expected.push_str("QUOTED=[it's \"here\" $HOME]\n");
     assert_eq!(printed, expected);
     assert!(printed.contains("HGRCPATH=[]\n"), "{printed}");
+  }
+
+  /// CI run 44271637767 (both Windows lanes): under [`ENVIRONMENT`] every `hg` exited 2 on both sides, Python handed
+  /// the unconverted path of pip's `hg` script. Do: under [`ENVIRONMENT`], have Git for Windows' `sh` run `hg version`
+  /// (a script on the `PATH` whose `#!` line names `python.exe`) and hand a Windows program, Python, Subversion's
+  /// repository-relative URL `^/trunk`. Expect `hg` to answer 0 and Python to print `^/trunk` as written: A-327's
+  /// `MSYS_NO_PATHCONV` failed the first (exit 2), and no setting at all the second (`^C:\Program Files\Git\trunk`, CI
+  /// run 44260193629). Skips loudly without Git for Windows' `sh`, `hg` or Python on the `PATH`; CI's Windows lanes
+  /// install them first.
+  #[cfg(windows)]
+  #[test]
+  fn under_the_environment_git_for_windows_sh_starts_hg_and_hands_on_a_relative_url() {
+    let sh = |script: &str| {
+      std::process::Command::new("sh")
+        .args(["-c", script])
+        .envs(ENVIRONMENT.iter().copied())
+        .output()
+    };
+    let Ok(uname) = sh("uname -s") else {
+      eprintln!("SKIP: no `sh` on the PATH (Git for Windows' `bin` holds one)");
+      return;
+    };
+    let uname = String::from_utf8_lossy(&uname.stdout).into_owned();
+    if !(uname.starts_with("MINGW") || uname.starts_with("MSYS")) {
+      eprintln!(
+        "SKIP: the `sh` on the PATH is not Git for Windows' (`uname -s` answered {uname:?})"
+      );
+      return;
+    }
+    for tool in ["hg", "python"] {
+      if !sh(&format!("command -v {tool}")).is_ok_and(|found| found.status.success()) {
+        eprintln!("SKIP: no `{tool}` on the PATH");
+        return;
+      }
+    }
+    let hg = sh("hg version -q").unwrap();
+    assert!(
+      hg.status.success(),
+      "`hg version` under the environment: {hg:?}"
+    );
+    let python = sh("python -c 'import sys; print(sys.argv[1])' '^/trunk'").unwrap();
+    assert!(python.status.success(), "{python:?}");
+    assert_eq!(
+      String::from_utf8_lossy(&python.stdout).trim_end(),
+      "^/trunk"
+    );
   }
 }

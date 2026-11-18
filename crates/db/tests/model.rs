@@ -365,6 +365,7 @@ fn volume(n: u64, name: &str) -> VolumeRecord {
       live_holders: None,
       write: None,
       write_version: 0,
+      signers: Vec::new(),
     },
     base: BaseRecord::Scratch,
     head: SnapshotId { value: 0 },
@@ -377,6 +378,7 @@ fn volume(n: u64, name: &str) -> VolumeRecord {
     access: vec![],
     created_ns: 0,
     catalog_version: 0,
+    taken_over: None,
   }
 }
 
@@ -392,6 +394,8 @@ enum Step {
   Access(usize),
   LiveShip(usize, bool),
   Destroy(usize),
+  /// A live volume relinquished to its re-adoption (A-362): gone with no tombstone.
+  Relinquish(usize),
   Snapshot(usize),
   Place(usize, usize),
   DropSnapshot(usize, usize),
@@ -413,6 +417,9 @@ enum Step {
   GreenOriginate(usize),
   /// A green's checkpoint (W3) at a version, which folds the increments up to it.
   GreenCheckpoint(usize, u64),
+  /// A green recorded by its takeover successor's adoption of its holder ledger (A-333): the version it was adopted at,
+  /// and whether it has an origin.
+  GreenAdopt(u64, bool),
   NfsOpen(u8, u8, u32),
   NfsOpenClear(usize),
   NfsLock(usize, u64, u64, bool),
@@ -452,6 +459,7 @@ fn step() -> impl Strategy<Value = Step> {
     1 => (0..8usize).prop_map(Step::Access),
     1 => (0..8usize, proptest::bool::ANY).prop_map(|(v, on)| Step::LiveShip(v, on)),
     1 => (0..8usize).prop_map(Step::Destroy),
+    1 => (0..8usize).prop_map(Step::Relinquish),
     2 => (0..8usize).prop_map(Step::Snapshot),
     1 => (0..8usize, 0..4usize).prop_map(|(v, s)| Step::Place(v, s)),
     1 => (0..8usize, 0..4usize).prop_map(|(v, s)| Step::DropSnapshot(v, s)),
@@ -471,6 +479,7 @@ fn step() -> impl Strategy<Value = Step> {
     2 => (0..8usize).prop_map(Step::GreenAdvance),
     1 => (0..8usize).prop_map(Step::GreenOriginate),
     1 => (0..8usize, 0..6u64).prop_map(|(v, at)| Step::GreenCheckpoint(v, at)),
+    1 => (0..6u64, any::<bool>()).prop_map(|(at, origin)| Step::GreenAdopt(at, origin)),
     2 => (0..4u8, 0..8u8, 1..4u32).prop_map(|(c, f, a)| Step::NfsOpen(c, f, a)),
     1 => (0..8usize).prop_map(Step::NfsOpenClear),
     2 => (0..8usize, 0..1_000u64, 1..1_000u64, any::<bool>()).prop_map(|(o, a, l, w)| Step::NfsLock(o, a, l, w)),
@@ -607,6 +616,9 @@ fn op_for(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
     Step::Destroy(v) => Op::VolumeDestroyed {
       id: vid(pick(&ids.live, *v)?),
     },
+    Step::Relinquish(v) => Op::VolumeRelinquished {
+      id: vid(pick(&ids.live, *v)?),
+    },
     Step::Snapshot(v) => {
       let volume = pick(&ids.live, *v)?;
       let id = ids
@@ -709,7 +721,8 @@ fn op_for(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
     | Step::Audit(..)
     | Step::GreenAdvance(..)
     | Step::GreenOriginate(..)
-    | Step::GreenCheckpoint(..)) => return op_for_service(step, ids, now_ns),
+    | Step::GreenCheckpoint(..)
+    | Step::GreenAdopt(..)) => return op_for_service(step, ids, now_ns),
     step @ (Step::NfsOpen(..)
     | Step::NfsOpenClear(..)
     | Step::NfsLock(..)
@@ -804,6 +817,14 @@ fn op_for_service(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
           landing: None,
           manifest: None,
           outcome: None,
+          // Every other record carries a verdict, so recovery is held to keep it (A-321).
+          signature: k
+            .is_multiple_of(2)
+            .then_some(slates_db::catalog::SignatureVerdict {
+              kind: 1,
+              detail: *k,
+              fingerprint: [*k; 32],
+            }),
         },
       }
     }
@@ -826,6 +847,18 @@ fn op_for_service(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
       version: *at,
       checkpoint: at.to_be_bytes().to_vec(),
     },
+    // An adoption records a new green with its version 0 and every version up to the adopted one; the steps after it
+    // advance, checkpoint and destroy it as any green, and a later origin of it is refused, never recorded.
+    Step::GreenAdopt(at, origin) => {
+      let n = ids.next_volume;
+      ids.next_volume += 1;
+      Op::GreenAdopted {
+        record: volume(n, &format!("v{n}")),
+        version: *at,
+        identity: [u8::try_from(*at).unwrap_or(u8::MAX); 32],
+        origin: origin.then_some([7; 32]),
+      }
+    }
     _ => return None,
   })
 }
@@ -1021,10 +1054,10 @@ fn note_applied(op: &Op, ids: &mut Ids) {
     Op::NfsLockSet { record } => ids.nfs_locks.push(record.other),
     Op::NfsLockCleared { other } => ids.nfs_locks.retain(|o| o != other),
     Op::NfsInstanceAdvanced { instance } => ids.nfs_instance = *instance,
-    Op::VolumeCreated { record } => ids
+    Op::VolumeCreated { record } | Op::GreenAdopted { record, .. } => ids
       .live
       .push(u64::from_be_bytes(record.id.bytes[..8].try_into().unwrap())),
-    Op::VolumeDestroyed { id } => {
+    Op::VolumeDestroyed { id } | Op::VolumeRelinquished { id } => {
       let n = u64::from_be_bytes(id.bytes[..8].try_into().unwrap());
       ids.live.retain(|v| *v != n);
       ids.snapshots.retain(|(v, _)| *v != n);
@@ -1751,6 +1784,204 @@ fn a_green_checkpoint_folds_its_chain_and_recovery_holds_it() {
   );
 }
 
+/// The adoption test's green, adopted at [`ADOPTED_AT`].
+const ADOPTED_GREEN: u64 = 2;
+/// Shape: the version the adoption test's green is adopted at by its takeover successor.
+const ADOPTED_AT: u64 = 3;
+
+/// The adoption test's green recorded by its adoption at `version` from a ledger whose version 0 names inputs `[7; 32]`.
+fn adopted_at(version: u64) -> Op {
+  Op::GreenAdopted {
+    record: volume(ADOPTED_GREEN, "adopted"),
+    version,
+    identity: [9; 32],
+    origin: Some([7; 32]),
+  }
+}
+
+/// Records the adoption test's green by its adoption at [`ADOPTED_AT`], then asks for a second adoption, a creation
+/// under its id and an origin: each refused `AlreadyExists`, none recorded.
+fn adopt_and_refuse_a_second_version_zero(seg: &mut AnchorSegment, db: &mut Db) {
+  let green = vid(ADOPTED_GREEN);
+  db.mutate(seg, &adopted_at(ADOPTED_AT), 0).unwrap();
+  assert!(
+    db.partition().volume(green).is_some(),
+    "recorded by its adoption"
+  );
+  assert_eq!(db.partition().green_head(green), ADOPTED_AT);
+  assert!(db.partition().green_chain(green).is_empty());
+  let seq = db.next_seq();
+  for late in [
+    adopted_at(ADOPTED_AT + 1),
+    Op::VolumeCreated {
+      record: volume(ADOPTED_GREEN, "another"),
+    },
+    Op::GreenOriginated {
+      green,
+      origin: vec![1],
+    },
+  ] {
+    let refused = db.mutate(seg, &late, 0);
+    assert!(
+      matches!(refused, Err(DbError::AlreadyExists { .. })),
+      "{late:?}: {refused:?}"
+    );
+  }
+  assert_eq!(db.next_seq(), seq, "no refused version 0 was recorded");
+}
+
+/// Advances the adopted green two increments, asks for checkpoints at its adoption, below it and past its head (each
+/// refused with the adoption as the floor held, none recorded), then checkpoints it at version 4: version 5 alone stays in
+/// the chain.
+fn checkpoint_past_the_adoption(seg: &mut AnchorSegment, db: &mut Db) {
+  let green = vid(ADOPTED_GREEN);
+  for n in 0..2u8 {
+    db.mutate(
+      seg,
+      &Op::GreenAdvanced {
+        green,
+        increment: vec![n; INCREMENT_BYTES],
+      },
+      0,
+    )
+    .unwrap();
+  }
+  assert_eq!(db.partition().green_head(green), ADOPTED_AT + 2);
+  let seq = db.next_seq();
+  for version in [ADOPTED_AT, ADOPTED_AT - 1, ADOPTED_AT + 3] {
+    let refused = db.mutate(
+      seg,
+      &Op::GreenCheckpointed {
+        green,
+        version,
+        checkpoint: vec![0xC0; CHECKPOINT_BYTES],
+      },
+      0,
+    );
+    assert_eq!(
+      refused.err(),
+      Some(DbError::CheckpointOutOfRange {
+        version,
+        held: ADOPTED_AT,
+        head: ADOPTED_AT + 2,
+      }),
+      "a checkpoint at {version} is refused"
+    );
+  }
+  assert_eq!(db.next_seq(), seq, "no refused checkpoint was recorded");
+  db.mutate(
+    seg,
+    &Op::GreenCheckpointed {
+      green,
+      version: ADOPTED_AT + 1,
+      checkpoint: vec![0xC0; CHECKPOINT_BYTES],
+    },
+    0,
+  )
+  .unwrap();
+  assert_eq!(
+    db.partition().green_chain(green),
+    &[vec![1; INCREMENT_BYTES]],
+    "version 5 alone is past the checkpoint at 4"
+  );
+  assert_eq!(db.partition().green_head(green), ADOPTED_AT + 2);
+}
+
+/// §4.16 owner-loss recovery (A-333). Do: record a green by its adoption at version 3 (its successor's holder ledger
+/// holds versions 0 to 3), adopt it again, create a volume under its id and give it an origin; advance it two increments;
+/// checkpoint it at its adoption, below it and past its head, then at version 4; recover from the log and from a
+/// snapshot. Expect: the green recorded with a head of 3 and an empty chain; the second adoption, the creation and the
+/// origin refused `AlreadyExists`, never recorded; the two increments versions 4 and 5; the three checkpoints refused
+/// `CheckpointOutOfRange` with the adoption as the floor held, and the one at 4 leaving version 5 alone in the chain;
+/// both recoveries holding the adoption, the checkpoint and the chain.
+#[test]
+fn an_adopted_greens_chain_begins_after_its_adoption_and_recovery_holds_it() {
+  let green = vid(ADOPTED_GREEN);
+  let mut seg = segment("slates-db-adoption", LOG_BYTES);
+  let mut db = recover(&mut seg, 0, checkpoint_caps(), 0).unwrap().0;
+  adopt_and_refuse_a_second_version_zero(&mut seg, &mut db);
+  checkpoint_past_the_adoption(&mut seg, &mut db);
+  let live = db.partition().to_snapshot(0);
+  drop(db);
+  let (mut db, _) = recover(&mut seg, 0, checkpoint_caps(), 0).unwrap();
+  assert_eq!(
+    db.partition().to_snapshot(0),
+    live,
+    "the log holds the adoption"
+  );
+  db.snapshot(&mut seg).unwrap();
+  drop(db);
+  let (recovered, stats) = recover(&mut seg, 0, checkpoint_caps(), 0).unwrap();
+  assert!(stats.snapshot.is_some());
+  assert_eq!(
+    recovered.partition().to_snapshot(0),
+    live,
+    "a snapshot carries the adoption"
+  );
+  assert_eq!(
+    recovered.partition().green_adoption(green).copied(),
+    Some(slates_db::partition::GreenAdoption {
+      green,
+      version: ADOPTED_AT,
+      identity: [9; 32],
+      origin: Some([7; 32]),
+    })
+  );
+}
+
+/// AUD-29-43, A-238, A-333: a destroyed green's tombstone is written one past every sequence its register held, and a
+/// green's register holds a merge record at every version up to its head, whatever its chain still holds. Do: destroy a
+/// green checkpointed at 3 with a head of 5, and one adopted at 3 with a head of 4. Expect each tombstone's sequence past
+/// its head: 6 and 5. Before, it was one past the chain's length (3 and 2), below versions its holders had accepted.
+#[test]
+fn a_destroyed_greens_tombstone_is_past_its_head_whatever_its_chain_holds() {
+  let mut seg = segment("slates-db-green-tombstone", LOG_BYTES);
+  let mut db = recover(&mut seg, 0, checkpoint_caps(), 0).unwrap().0;
+  let (checkpointed, adopted) = (vid(CHECKPOINT_GREEN), vid(ADOPTED_GREEN));
+  db.mutate(
+    &mut seg,
+    &Op::VolumeCreated {
+      record: volume(CHECKPOINT_GREEN, "checkpointed"),
+    },
+    0,
+  )
+  .unwrap();
+  for n in 0..5u8 {
+    db.mutate(&mut seg, &advance(n), 0).unwrap();
+    if n == 2 {
+      db.mutate(&mut seg, &checkpoint_at(3), 0).unwrap();
+    }
+  }
+  db.mutate(&mut seg, &adopted_at(ADOPTED_AT), 0).unwrap();
+  db.mutate(
+    &mut seg,
+    &Op::GreenAdvanced {
+      green: adopted,
+      increment: vec![1; INCREMENT_BYTES],
+    },
+    0,
+  )
+  .unwrap();
+  for id in [checkpointed, adopted] {
+    for op in [
+      Op::VolumeStateChanged {
+        id,
+        state: VolumeState::Destroying,
+      },
+      Op::VolumeDestroyed { id },
+    ] {
+      db.mutate(&mut seg, &op, 0).unwrap();
+    }
+  }
+  let sequences = [checkpointed, adopted].map(|id| {
+    db.partition()
+      .tombstone(id)
+      .map(|tombstone| tombstone.sequence)
+  });
+  assert_eq!(sequences, [Some(6), Some(ADOPTED_AT + 2)]);
+  assert_eq!(db.partition().green_adoption(adopted), None);
+}
+
 /// §4.8 recovery, §2.6 boot step 2: recovery takes the newest snapshot slot that decodes. Do: take snapshots until both
 /// slots hold one, recover to learn which is newer, then publish into the newer slot bytes that begin with a higher
 /// sequence than either but do not decode, and recover again. Expect: the second recovery starts from the older
@@ -1982,6 +2213,79 @@ fn a_tenants_key_is_erased_with_its_last_volume_on_the_partition() {
   drop(db);
   let recovered = open(&mut segment);
   assert!(!tenant_key(&recovered, first_account) && tenant_key(&recovered, other_account));
+}
+
+/// A-362 (§4.8 "Promotion and takeover"): a volume relinquished to its re-adoption leaves no tombstone and erases no key,
+/// so the adopted state is made again under its id and name, and recovery agrees. Do: make a volume and record its
+/// lineage key; relinquish it; make it again under the same id and name, as the takeover that names this node again
+/// records it; then recover the database; and alongside, destroy a second volume and try to make it again. Expect the
+/// relinquish to leave the volume made again, its lineage key kept and no tombstone, the recovered database the same;
+/// and the destroyed volume refused `AlreadyExists` (its tombstone holds the id).
+#[test]
+fn a_relinquished_volume_is_made_again_under_its_id_and_keeps_its_key() {
+  let mut segment = segment("slates-db-relinquish", LOG_BYTES);
+  let mut db = open(&mut segment);
+  for n in [1, 2] {
+    db.mutate(
+      &mut segment,
+      &Op::VolumeCreated {
+        record: volume(n, &format!("v{n}")),
+      },
+      0,
+    )
+    .unwrap();
+  }
+  let lineage = slates_db::catalog::SealKeyOwner::Lineage { volume: vid(1) };
+  db.mutate(
+    &mut segment,
+    &Op::SealKeySet {
+      record: slates_db::catalog::SealKeyRecord {
+        owner: lineage.clone(),
+        id: [1; 16],
+        record: vec![2; slates_db::catalog::SEAL_KEY_RECORD_BYTES],
+      },
+    },
+    0,
+  )
+  .unwrap();
+  db.mutate(&mut segment, &Op::VolumeRelinquished { id: vid(1) }, 0)
+    .unwrap();
+  assert!(
+    db.partition().volume(vid(1)).is_none(),
+    "the stale record went"
+  );
+  db.mutate(
+    &mut segment,
+    &Op::VolumeCreated {
+      record: volume(1, "v1"),
+    },
+    0,
+  )
+  .expect("the volume is made again under its id and name: no tombstone holds them");
+  assert!(
+    db.partition().seal_key(&lineage).is_some(),
+    "its lineage key is kept, unlike a destroy's"
+  );
+  db.mutate(&mut segment, &Op::VolumeDestroyed { id: vid(2) }, 0)
+    .unwrap();
+  let again = db.mutate(
+    &mut segment,
+    &Op::VolumeCreated {
+      record: volume(2, "v2"),
+    },
+    0,
+  );
+  assert!(
+    matches!(again, Err(slates_db::DbError::AlreadyExists { .. })),
+    "a destroyed volume's tombstone holds its id: {again:?}"
+  );
+  drop(db);
+  let recovered = open(&mut segment);
+  assert!(
+    recovered.partition().volume(vid(1)).is_some()
+      && recovered.partition().seal_key(&lineage).is_some(),
+    "recovery agrees: the volume made again, its key kept"
+  );
 }
 
 // ---------------------------------------------------------------- acknowledgements that name owed ids

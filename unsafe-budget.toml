@@ -222,12 +222,30 @@
 #   by BLAKE3.
 
 [budget]
-slates-machine = 70
+slates-machine = 85
+# 2026-11-18 (+4, A-357, Windows only; 81 -> 85): the thread-profiling calls of A-223 (`switches.rs`) are found in kernel32
+#   at run time, never imported: three typed function-pointer aliases (`Enable`, `Read`, `Disable`) and the block that
+#   looks them up with `GetModuleHandleW` and `GetProcAddress`; the three calls' blocks were counted already. Nano Server's
+#   kernel32 exports none of the three, and the binary that imported them exited 0xC0000139 there before any of its code
+#   ran (release run 44326428333; docs/bugs/2026-11-18-the-windows-binary-did-not-start-in-nano-server.md).
+# 2026-11-18 (+2, A-336, Windows only; 79 -> 81): the host's memory stall (`memory_stall.rs`), Windows' low-memory resource
+#   notification: `CreateMemoryResourceNotification` once a process and `QueryMemoryResourceNotification` at each look
+#   that suspects a shard, Win32 FFI with no safe wrapper. The watchdog and the anchor tell a shard waiting on memory
+#   from a wedged one by it; Linux reads `/proc/pressure/memory` and macOS a sysctl through the existing helper (none).
+# 2026-11-18 (+2, A-318, one compiled per target): the build-cost chain in machine code (`build_cost.rs`,
+#   `machine_chain`), an `asm!` block for x86-64 and one for AArch64, each reading a slice it is handed and writing only
+#   its own registers. Machine code is the point: it is the one form of the work no compiler flag instruments or
+#   deoptimizes, so the compiled chain's time against it is this build's slowdown, which the watchdog holds a poll's
+#   CPU to. No safe form of inline assembly exists.
 # 2026-11-08 (+7, the start judgment per thread): another process's threads, each one's CPU (`process_clock.rs`,
 #   `busiest_of` and `busiest_thread_ns`): on macOS `proc_pidinfo(PROC_PIDLISTTHREADS)` and `proc_pidinfo
 #   (PROC_PIDTHREADINFO)` (the thread record built field by field, not zeroed); on Windows `CreateToolhelp32Snapshot`,
 #   `Thread32First`, `Thread32Next`, `OpenThread` with the limited query right and `GetThreadTimes`. Linux reads `/proc`
 #   (none). None has a safe wrapper.
+# 2026-11-06 (+7, A-223, compiled only for Windows): the wake probe confirms its waiter asleep by its cycle count
+#   (`wake.rs`, `platform::Watch`): `GetCurrentThreadId`, `OpenThread` with query rights, `QueryThreadCycleTime` and
+#   the handle's `CloseHandle`; and a thread reads its own context switches (`switches.rs`): `EnableThreadProfiling`,
+#   `ReadThreadProfilingData` and `DisableThreadProfiling`. None has a safe wrapper.
 # 2026-11-07 (+2, compiled only for Linux): the process clock reads the whole process's CPU-time clock,
 #   `clock_getcpuclockid` and `clock_gettime`; `/proc/<pid>/schedstat`, which it read before, is the main thread's alone.
 #   Neither call has a safe wrapper in rustix.
@@ -465,6 +483,12 @@ slates-sdk-node = 0
 # the Swift FSVolume handler a C ABI over `serve` — sanctioned FFI unsafe, each block with a SAFETY
 # note. The shipped crate (no `test-harness` feature) builds none of it; the count is a text scan.
 slates-bridge-fskit = 9
+# slates-bridge-winfsp raised 148 -> 155 on 2026-11-18 (A-350, the drive reports its account as every object's owner, so
+# git trusts a repository on it): the `GetSecurity` slot's callback signature in `ffi.rs`, 1; in `host.rs` the
+# `get_security` callback's two blocks (the handler and the descriptor's copy, as `get_security_by_name`'s), the
+# daemon's own token in `drive_security_descriptor` (`OpenProcessToken` and owning its handle), and
+# `token_information`'s two `GetTokenInformation` calls (the size, then the read), 6. The SIDs' text and the descriptor's
+# SDDL are safe Rust (`crate::account`, tested on every host).
 # slates-bridge-winfsp raised 146 -> 148 on 2026-11-09 (A-275, NTFS's rule for who may make a link, judged by the drive
 # since WinFsp's own check refuses Developer Mode, diagnostics run 42712321599): the `GetTokenInformation(TokenPrivileges)`
 # query of a link-making Create's token in `dispatcher.rs` (`creator_may_link`), and the `RegGetValueW` read of
@@ -530,7 +554,7 @@ slates-bridge-fskit = 9
 # channel. Its reader's view needs the section's handle borrowed once to duplicate it (+1, `purge_intents.rs`), and the
 # intent event's `SetEvent`, the control call's `WaitForMultipleObjects` and the old channel test's `WaitForSingleObject`
 # go (-3). Measured by `cargo xtask unsafe`.
-slates-bridge-winfsp = 148
+slates-bridge-winfsp = 155
 # Raised 3 -> 5 on 2026-10-19 for `udmabuf.rs` (the `UDMABUF_CREATE` ioctl and the descriptor it returns), which
 # confined a guest's DAX window to a descriptor covering only that window
 # (docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md). Lowered 5 -> 3 on 2026-10-25

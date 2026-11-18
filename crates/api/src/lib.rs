@@ -21,8 +21,10 @@
 //!   write — bypass, ask, forbid ([`WriteMode`]) — set by the launcher per consumer or volume, never raised by an
 //!   agent. A landing answers [`LandOutcome`], a merge [`MergeOutcome`], a rebase [`RebaseOutcome`] ([`outcome`]).
 //! - *Conflicts* are verdicts, typed per path ([`LandingConflict`], [`MergeConflict`]); nothing is ever inferred (D-27).
-//! - *Signed work* ([`signed`]): a merge or a landing may carry a signature, and its outcome says how it was judged
-//!   ([`Verification`]); a volume's policy may require signed merges. Signatures never gate permission.
+//! - *Signed work* ([`signed`], A-321): a merge or a landing may carry a signature over its statement, its outcome says
+//!   how it was judged ([`Verification`]) and its record keeps it (a merge's [`MergeRecord`], a landing's
+//!   [`AuditRecord`]); a volume's trusted signers are the launcher's to set, and its policy may require signed merges.
+//!   Signatures never gate permission.
 //! - *Errors* ([`error`]): one closed taxonomy whose variant is what a consumer does about it.
 //! - *The seam* ([`seam`], [`sim`]): the volume verbs as a trait, for hosts that need a simulator (A-310).
 //!
@@ -44,8 +46,8 @@
 //! compile errors of the matches it must extend — never as a variant falling silently through a wildcard. The wire
 //! types re-exported here grow append-only (D-15) and count as the contract's where it returns them.
 //!
-//! **What is owed** (GAPS, the A-278 and A-299 rows): the starter handed the launcher's authority on every platform;
-//! the write modes, approvals of merges and signed work verified on the daemon's side (A-285); typed fields on the wire
+//! **What is owed** (GAPS, the A-278, A-299 and A-321 rows): the starter handed the launcher's authority on every
+//! platform; typed fields on the wire
 //! for drift, a presentation's conflicts and a merge's versions, replacing what this crate reads from text; a paged
 //! listing; an async form over a host's reactor (R6); a typed class for a pinned snapshot's destroy, which the daemon
 //! answers untyped (`Invalid::Request`, A-310).
@@ -85,16 +87,18 @@ pub use grant::{GrantAuthority, GrantClaim, GrantProof};
 pub use instance::{Instance, LandingRequest};
 pub use issuer::{GRANT_TERM_NS, Issuer};
 pub use launcher::{LauncherFault, LauncherSecret};
-pub use mount::{MountKind, MountOptions, Mounted};
+pub use mount::{MountKind, MountOptions, Mounted, Unmounted};
 pub use observe::{AuditKind, AuditRecord, GrantRecord, GrantState, LandingStage};
 pub use outcome::{
   ActionTally, LandOutcome, LandingApproval, LandingConflict, LandingReport, LandingState,
-  MergeApproval, MergeConflict, MergeConflictClass, MergeConflicts, MergeOutcome, RebaseOutcome,
-  Summary, Work,
+  MergeApproval, MergeConflict, MergeConflictClass, MergeConflicts, MergeOutcome, MergeRecord,
+  RebaseOutcome, Summary, Work,
 };
 pub use policy::{PolicyReason, PolicyRefusal, PolicySubject, WriteAct, WriteMode, WritePolicy};
 pub use seam::Volumes;
-pub use signed::{SignatureFault, Signer, SignerKey, Verification, WorkSignature};
+pub use signed::{
+  MergeStatement, SignatureFault, Signer, SignerKey, TrustedSigner, Verification, WorkSignature,
+};
 pub use sim::SimVolumes;
 pub use start::{Anchor, StartSpec, Started};
 pub use volume::{
@@ -105,11 +109,13 @@ pub use volume::{
 /// own.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Format: the consumer contract's version (§4.12 "Versioning", A-299), raised by one with every change to a type or a
-/// verb of the contract; a consumer asserts the one it was written against. 1: the contract as A-299 first published it
-/// (2026-11-18). 2: `Denied::Policy`, the class a write policy's refusal takes outside a landing or a merge (the
-/// same day). 3: `Instance::set_write_policy` and `Instance::write_policy`, over the daemon's policy verbs (A-285), and
-/// a landing or a merge a policy forbids answered as its `Refused` outcome (the same day). 4: the audit log and the
+/// The consumer contract's version (§4.12 "Versioning", A-299), raised by one with every change to a type or a verb
+/// of the contract; a consumer asserts the one it was written against.
+///
+/// 1: the contract as A-299 first published it (2026-11-18). 2: `Denied::Policy`, the class a write policy's refusal
+/// takes outside a landing or a merge (the same day). 3: `Instance::set_write_policy` and `Instance::write_policy`,
+/// over the daemon's policy verbs (A-285), and a landing or a merge a policy forbids answered as its `Refused` outcome
+/// (the same day). 4: the audit log and the
 /// grant listing typed (`AuditRecord`, `GrantRecord`; the same day). 5: `WritePolicy::UNSET` merges at once and asks
 /// for landings, as the daemon applies an unset policy (the same day). 6: a merge an ask mode holds is a
 /// `MergeApproval` (the increment's identity and paths) approved by `approve_merge`, and a landing's approval a
@@ -122,18 +128,64 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// reply's typed field, never its text: `DriftReport::watcher` a `Watcher`, and a green's or a work volume's status
 /// read with no base (it failed as a protocol fault before) (the same day). 9: the [`Volumes`]
 /// seam over the contract's volume verbs, implemented by [`Instance`] and by the simulator [`SimVolumes`] (A-310) (the
-/// same day).
-pub const CONTRACT: u32 = 9;
+/// same day). 10: a volume's loss window, `VolumeStatus::loss` (`LossReport`, `VolumeTakeover`; AC-8.3): what an owner
+/// loss would lose now, the newest seal placed on another host, and on a successor the takeover that made it the owner
+/// (the same day). 11: `DaemonReport::recovered`, the anchor's verdict that the daemon has served as long as its start
+/// took, so its exit is no failed start (A-311) (the same day). 12: `ShardsStream::resync`, the device's end of a Shards
+/// stream's resync channel, which `serve_shards` hands beside the stream's where the daemon makes one (Linux; macOS too
+/// since A-339, the type unchanged), none elsewhere and from the simulator (A-316; the same day). 13: signed merges
+/// (A-321): `merge` sends its signature and answers how the daemon judged it, `merge_statement` (a
+/// [`MergeStatement`]), `approve_merge` carries the signature again (`MergeApproval::signature`), `merge_record` (a
+/// [`MergeRecord`], `Missing::Version`), `set_signers` and `signers` ([`TrustedSigner`]); a volume's policy may require
+/// signed merges, refused
+/// [`PolicyReason::SignatureRequired`], and a consumer's that does `Invalid::SignedMergesNotAVolume`;
+/// `SignatureFault::Expired` gone, since no statement expires; a signed landing still `Unsupported(SignedWork)` (the same
+/// day). 14: `StartSpec::anchor_command_under`, the anchor's command under a wrapper that execs it (`systemd-run
+/// --scope`), the launcher's standard input kept (A-299; the same day). 15: the volume core's refusals typed
+/// (`VolumeRefusal`, each in the class a consumer acts on as `Busy`, `Stale`, `Denied`, `Exhausted`, `Unusable` or
+/// `Invalid` `::Volume`): until then each reached a consumer as an invalid request carrying a word, a pinned snapshot's
+/// destroy among them (A-299; the same day). 16: `Instance::unmount` and the seam's `unmount` answer what was removed ([`Unmounted`]): on
+/// Windows each volume the scan could not ask is named there when another volume reported the drive (it was named only
+/// when none did), and a host refusal renders in words, the daemon's `TargetUnavailable` by that name (A-299; the same
+/// day). 17: the daemon's database refusals typed (`DatabaseRefusal`, unusable as `Unusable::Database`): until then a
+/// corrupt record, a regressed NFSv4 instance, a checkpoint out of range, a malformed sealing key and a refused encoding
+/// reached a consumer as an invalid request carrying words (A-299; the same day). 18: a snapshot's retention refused is
+/// typed apart from the quota (`VolumeRefusal::RetentionExceeded`, exhausted as `Exhausted::Volume`): until then the
+/// volume core answered it `NoSpace`, which a consumer read as its own quota (kiln's review, A-342's record; the same
+/// day). 19: a target's refusal is typed (`HostFault::Target(TargetRefusal)`, the wire's appended `Refusal::Target`):
+/// until then a landing target's, a mount point's and a mount's refusals carried the daemon's words; the superseded
+/// `TargetUnavailable` is a protocol fault, since no daemon of this build sends it (A-299; the same day). 20: signed
+/// landings (A-321): `land` sends its signature and the daemon judges it, so `Unsupported::SignedWork` is gone; a
+/// [`LandingApproval`] carries the landing's `statement` (what a signer signs) and the `signature` it carried, which
+/// `approve_landing` presents and lands with again; a [`LandingReport`]'s `verification` is the verdict on what was
+/// written, no longer always unsigned; an [`AuditRecord`] of a landing as a whole carries its `verification` (the same
+/// day). 21: a takeover past the volume's tolerance shows in its loss report (`VolumeTakeover::past_tolerance`, a
+/// [`PastTolerance`] naming the [`Shortfall`] of its registers' cohort and of its live log's recorded holders): until
+/// then a consumer could not tell a takeover that may have lost writes acknowledged only to the lost hosts from one that
+/// kept every one (A-332; the same day). 22: a reply held for durability past the failover SLO is a typed
+/// retry (`RetryCause::DurabilityPending`, the wire's appended `Refusal::DurabilityPending`): until then a write whose
+/// log or tombstone could not be held where its reply waits for it was never answered (A-354; the same day). 23: a
+/// start a host waits on needs no wall-clock deadline of its own: [`StartSpec::until_served`] asks the anchor to stop when its daemons crash-loop before any of them has served, and
+/// [`Instance::wait_for`] with that anchor's child then ends [`StartFault::NeverServed`]; until then an anchor looped on
+/// such an instance for good (A-119), so a host bounded its wait by a second it picked, and a slow start under load
+/// outlasted it (kiln's 30 s at load 28, 2026-11-18; A-366). 24: the daemon's status carries the failover delay as the
+/// node estimates it now (`DaemonReport::fleet`'s `failover`, a [`FailoverReport`]): detection, confirmation and
+/// recovery, each with the measurements behind it, summed; nothing sets it, it moves with what the node measures (A-363;
+/// the same day).
+///
+/// Format: one whole number, the last of the versions above.
+pub const CONTRACT: u32 = 24;
 
 /// The typed client and its own types, for the verbs [`Instance::client`] lends outside the contract.
 pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, VhostUserDevice};
 /// The wire's types the contract takes and returns (§4.9; append-only, D-15).
 pub use slates_ipc::protocol::{
-  AttachTransport, ConflictClass, DaemonReport, Filter, GrantScope, GreenBase, HostAnswer,
-  HostPathReason, Intent, JournalReport, LandingDegradation, LandingDurability, MountReport,
-  NamePolicy, OwnMountUse, PlacedState, PlannedAction, PlannedContent, PlannedEntry, Principal,
-  ReadAt, RecoveryCause, SnapshotId, TelemetryReport, TransportReport, UnsupportedReason, VolumeId,
-  VolumeSummary,
+  AttachTransport, ConflictClass, DaemonReport, DatabaseRefusal, FailoverReport, Filter,
+  GrantScope, GreenBase, HostAnswer, HostPathReason, Intent, JournalReport, LandingDegradation,
+  LandingDurability, LossReport, MountReport, NamePolicy, OwnMountUse, PastTolerance, PlacedState,
+  PlannedAction, PlannedContent, PlannedEntry, Principal, ReadAt, RecoveryCause, Shortfall,
+  SnapshotId, TargetRefusal, TelemetryReport, TransportReport, UnsupportedReason, VolumeId,
+  VolumeRefusal, VolumeSummary, VolumeTakeover,
 };
 /// The rendezvous's and the channel's own typed refusals the contract carries.
 pub use slates_ipc::{DeliveryFault, error::RouteRefusal};

@@ -37,8 +37,8 @@ pub mod error;
 
 pub use client::{
   Advanced, Attachment, Client, Connecting, CreateSpec, Deadlines, Digest, EntriesPage, ImageBuilt,
-  LAST_SEQUENCE, Landing, Rebased, SESSION_KEY_BYTES, Session, ShardsStream, StreamEnd, Submitted,
-  VhostUserDevice,
+  LAST_SEQUENCE, Landing, MergeRecord, MergeStatement, Rebased, SESSION_KEY_BYTES, Session,
+  ShardsStream, SignedLanding, StreamEnd, Submitted, VhostUserDevice,
 };
 /// A file mapped for reading by the same-kernel direct map (§4.6; A-171, A-173, A-175), or copied where it cannot be;
 /// and one mapped read and write, whose stores the daemon writes back into the file (A-186).
@@ -58,9 +58,10 @@ pub use slates_ipc::protocol::{
   LandingSummary, LearnerReport, NamePolicy, OciBinding, PlacedState, PlannedAction,
   PlannedContent, PlannedEntry, PolicySubject, Principal, ReadAt, ReadWritePolicy, RecoveryCause,
   Refusal, RefusalCount, Residency, RetirementReport, Rights, Scope, SessionReport, ShardReport,
-  SharingSemantics, Signal, SizeClass, SnapshotBoundary, SnapshotCoverage, SnapshotId, SpanRecord,
-  StatusReport, TakeoverReport, TargetPathConstraint, TelemetryReport, TransportReport,
-  UnsupportedReason, VolumeId, VolumeSummary, WorkOp, WriteAct, WriteMode, WritePolicy,
+  SharingSemantics, Signal, SignatureFault, Signer, SignerKey, SizeClass, SnapshotBoundary,
+  SnapshotCoverage, SnapshotId, SpanRecord, StatusReport, TakeoverReport, TargetPathConstraint,
+  TelemetryReport, TransportReport, UnsupportedReason, Verification, VolumeId, VolumeSummary,
+  WorkOp, WriteAct, WriteMode, WritePolicy,
 };
 /// The request id [`Client::begin`] returns and [`Client::poll_reply`] matches on — the async
 /// caller holds it between the send and the reply the completion fd signals (§4.7, D-19).

@@ -1,9 +1,10 @@
 # A healthy live `fsync` was refused at a wall-clock deadline under load
 
 - **Date:** 2026-11-09; on main 2026-11-17. **Status:** fixed (the FUSE `fsync`, an NFS stable write or `COMMIT`, a
-  Shards `FSYNC`, the virtio-fs device's `FSYNC`, WinFsp's held flush), and its sibling, an owner starved past a
-  window's end (GAPS). **Design:** §4.10
-  status "FUSE `fsync` at durability" and "The wait is judged by what it hears", A-200, A-292, AC-8.3. **Found by:** raft-7's
+  Shards `FSYNC`, the virtio-fs device's `FSYNC`, WinFsp's held flush), and its siblings, an owner starved past a
+  window's end and an owner slow to ask (GAPS). **Design:** §4.10
+  status "FUSE `fsync` at durability", "The wait is judged by what it hears" and "Silence is the holders' only when
+  they were asked", A-200, A-292, A-301, AC-8.3. **Found by:** raft-7's
   run of the live fleet suite; ordered by the supervisor ahead of older items, since a spurious `EIO` on `fsync` tells an
   application its data is lost. Diagnosed and built by bug-sweep (`agents/bug-sweep-2` 50fa8c56, and the total bound
   and the shared module after it); landed by g244-healthy-fsync-live.
@@ -107,3 +108,15 @@ Shards refusals told the application its data might be lost. No acknowledged dat
   onto the clock (the failover SLO from the hold), so a receiver that never waits cannot hold the verdict past it. Red
   first: `acknowledgements_read_after_a_late_window_end_start_the_next_window` and
   `a_guests_fsync_is_not_refused_while_its_receiver_has_not_read_what_came`, each answered `EIO` by the rule before.
+- **An owner slow to ask: fixed 2026-11-17 (A-301).** The receiver's two waits prove the owner has read what came,
+  not that it asked. A fresh volume's head and catalog are asked only by the coordinator's period, behind its other
+  rounds, so a period stretched past a window left a window with nothing asked and nothing heard, and the wait gave up on
+  holders it had never asked. Each live volume now keeps its owner's oldest unanswered ask
+  (`live_ship::LiveVolume::unanswered_since_ns`: a lane opened by `dispatch`, a head's or catalog's placement round
+  noted by `fleet::ship_head` on the volume's shard before the round), cleared by anything heard, and a silent window
+  is confirmed only once that ask is a window old (`DurableBound::judge`). Red first:
+  `a_window_in_which_the_owner_asked_nothing_is_given_up_only_once_its_ask_is_a_window_old`,
+  `an_owner_that_never_asks_holds_the_verdict_only_to_the_total_bound` and
+  `a_guests_fsync_is_not_refused_while_its_owner_has_asked_its_holders_nothing`, each given up `Silent` (`EIO`) by the
+  rule before it. Closed by construction, not yet seen in a give-up record; the record now names the oldest unanswered
+  ask's age (`live_ship::durability_report`), so a failing run under load tells it from a holder's silence.

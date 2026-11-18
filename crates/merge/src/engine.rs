@@ -469,6 +469,11 @@ pub struct Green {
   /// retry of an accepted submit is answered from. Bounded by the chain (one entry per committed
   /// version), which the partition caps in bytes; recovery rebuilds it by replaying the chain.
   accepted: BTreeMap<[u8; 32], u64>,
+  /// How the signature of each version's submit was judged, for every version a signed submit committed (signed work,
+  /// A-321): the version's provenance, kept with the accepted record and bounded as it is (at most one entry per
+  /// committed version), carried by the chain entries and then by the checkpoint that folds them, so a version's verdict
+  /// reads back for as long as the green answers its idempotency record.
+  signatures: BTreeMap<u64, crate::chain_entry::Signature>,
   /// The **rejected-result cache** (§4.16; AUD-16): the conflict windows of increments that were
   /// refused, kept so a retry of the same increment is answered without re-judging — but a conflict
   /// is not in the chain, so nothing else bounds this; it is bounded here by `rejected_budget` bytes,
@@ -892,6 +897,11 @@ impl Green {
         .filter(|(_, version)| **version <= at)
         .map(|(id, version)| (*id, *version))
         .collect(),
+      signatures: self
+        .signatures
+        .range(..=at)
+        .map(|(version, signature)| (*version, *signature))
+        .collect(),
       files: self.changed_content_at(at),
       dirs: self
         .dir_history
@@ -925,7 +935,14 @@ impl Green {
     origin: crate::origin::Origin,
     checkpoint: &crate::checkpoint::Checkpoint,
   ) -> Green {
-    let mut green = Green::with_origin(origin);
+    Green::with_origin(origin).with_checkpoint(checkpoint)
+  }
+
+  /// This green, seeded from its origin and at version 0 with no increment yet, with `checkpoint` applied: what
+  /// [`Green::restore`] does after its seeding, so a recovery that seeds the origin a share at a time ([`OriginLoad`])
+  /// restores the same green as the one call does.
+  pub fn with_checkpoint(mut self, checkpoint: &crate::checkpoint::Checkpoint) -> Green {
+    let green = &mut self;
     for changed in &checkpoint.files {
       green.restore_file(changed);
     }
@@ -948,11 +965,12 @@ impl Green {
       green.restore_xattr(changed);
     }
     green.accepted = checkpoint.accepted.iter().copied().collect();
+    green.signatures = checkpoint.signatures.iter().copied().collect();
     green.deltas_from = checkpoint.version;
     green.folded_below = checkpoint.version;
     green.identity_version = checkpoint.version;
     green.special_history_bytes = green.special_history_recounted();
-    green
+    self
   }
 
   fn restore_file(&mut self, changed: &crate::checkpoint::Changed<String, Vec<u8>>) {
@@ -1483,6 +1501,33 @@ impl Green {
     base
   }
 
+  /// The entries one path contributes to a restricted base at `version` ([`Green::base_for`]): every dimension's entry
+  /// at `path`, and the hard links whose link or target it is. What a work's shard fetches with a path it touches, so
+  /// that [`Base::for_names`](crate::increment::Base::for_names) assembles its increment's base without the green
+  /// (A-247).
+  pub fn path_base(&self, version: u64, path: &str) -> crate::increment::Base {
+    let mut base = crate::increment::Base::of_files(Vec::new());
+    let at_head = version >= self.head();
+    if at_head {
+      self.head_entries(path, &mut base);
+      for (link, target) in &self.hardlinks {
+        if link == path || target == path {
+          base.hardlinks.push((link.clone(), target.clone()));
+        }
+      }
+    } else {
+      self.entries_at(path, version, &mut base);
+      for (link, history) in &self.hardlink_history {
+        if let Some(target) = history_at(history, version)
+          && (link == path || target == path)
+        {
+          base.hardlinks.push((link.clone(), target));
+        }
+      }
+    }
+    base
+  }
+
   /// Every dimension's entry at `path` at the head but hard links, added to `base` ([`Green::base_for`]).
   fn head_entries(&self, path: &str, base: &mut crate::increment::Base) {
     if let Some(bytes) = self.content.get(path) {
@@ -1778,6 +1823,7 @@ impl Green {
       .saturating_add(self.history_lists)
       .saturating_sub(self.history_current)
       .saturating_add(self.special_history_bytes)
+      .saturating_add(self.chunks.held_bytes())
   }
 
   /// The ops each intervening delta in `(base, head]` applied to `path`, oldest first: read at the versions `path`'s
@@ -2779,6 +2825,26 @@ impl Green {
     version
   }
 
+  /// Records how the signature of the submit that committed `version` was judged (signed work, A-321): what the service
+  /// does once the version's chain entry is durable, and recovery as it replays the entry. A version past the head is
+  /// never committed, so it is not recorded, and its answer is `false`.
+  pub fn record_signature(
+    &mut self,
+    version: u64,
+    signature: crate::chain_entry::Signature,
+  ) -> bool {
+    if version == 0 || version > self.head() {
+      return false;
+    }
+    self.signatures.insert(version, signature);
+    true
+  }
+
+  /// How the signature of the submit that committed `version` was judged, if that submit carried one (A-321).
+  pub fn signature(&self, version: u64) -> Option<crate::chain_entry::Signature> {
+    self.signatures.get(&version).copied()
+  }
+
   /// The effect a chain entry's resolved form stands for, its bytes read from the head and the increment's post-state.
   fn effect_of(&self, applied: &crate::chain_entry::Applied, post_state: &[u8]) -> Effect {
     use crate::chain_entry::Applied;
@@ -3023,6 +3089,42 @@ impl Green {
     }
   }
 
+  /// The feed position the content this green releases now is stamped with (A-273): the position of the next
+  /// message its owner sends its replicas. Each version accepted and each fold of the history is one message, sent in
+  /// order, and the owner calls [`Green::advance_feed`] as it sends one.
+  pub fn feed_position(&self) -> u64 {
+    self.chunks.position()
+  }
+
+  /// The owner sent its replicas the feed message at [`Green::feed_position`] (a version accepted or a fold of the
+  /// history): content released from now on is stamped with the next position (A-273).
+  pub fn advance_feed(&mut self) {
+    self.chunks.advance();
+  }
+
+  /// A replica built from this green now begins reading its content in place (A-273): until it acknowledges the feed
+  /// message that released a chunk, or leaves, that chunk stays where it is, its bytes unchanged and its room unreused.
+  /// The replica's holder id.
+  pub fn hold_content(&mut self) -> u64 {
+    self.chunks.hold()
+  }
+
+  /// `holder` has applied the feed message at `position` and dropped what it released: content every holder has
+  /// passed is freed (A-273).
+  pub fn acknowledge_content(&mut self, holder: u64, position: u64) {
+    self.chunks.acknowledge(holder, position);
+  }
+
+  /// `holder` reads this green's content no more (dropped, rebuilt or ended): it holds no free from now on (A-273).
+  pub fn leave_content(&mut self, holder: u64) {
+    self.chunks.leave(holder);
+  }
+
+  /// The frees of content held for a replica since this green was made: A-273's non-vacuity counter.
+  pub fn content_frees_held(&self) -> u64 {
+    self.chunks.frees_held()
+  }
+
   /// The content and IPC histories' retained bytes **recounted** from the histories themselves — the oracle
   /// the running totals are checked against (balanced accounting): the distinct chunks the content values name and
   /// their piece lists, less the current values, and every earlier IPC node.
@@ -3046,6 +3148,7 @@ impl Green {
       .saturating_add(values().map(crate::history::Value::list_bytes).sum())
       .saturating_sub(current)
       .saturating_add(self.special_history_recounted())
+      .saturating_add(self.chunks.held_bytes_recounted())
   }
 
   /// The IPC history's earlier nodes, recounted: every node but each path's latest.
@@ -3189,6 +3292,8 @@ impl Green {
     use crate::increment::VolumeOp;
     let mut changed: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
     let mut journal: Vec<VolumeOp> = Vec::new();
+    // The sources of the renames restated: each one's removal is the rename's, not an unlink of its own.
+    let mut moved_from: BTreeSet<String> = BTreeSet::new();
     for effect in effects {
       match effect {
         Effect::Special(path, node) => {
@@ -3199,19 +3304,29 @@ impl Green {
           journal.push(VolumeOp::Mknod { path, node, mode });
         }
         Effect::RemoveSpecial(path) => journal.push(VolumeOp::Unlink { path }),
+        // A rename is restated as the rename it is, in head coordinates, as the composer states one (one `Rename`,
+        // replacing whatever the head holds there): its whole-file insert stands for bytes supplied by the move, and
+        // replayed over a head that holds the destination it would add them to that file's own.
+        Effect::SetContent(path, bytes, _, ContentSource::Copied(from)) => {
+          journal.push(VolumeOp::Rename {
+            from: from.clone(),
+            to: path.clone(),
+          });
+          moved_from.insert(from);
+          changed.insert(path, Some(bytes));
+        }
         Effect::SetContent(path, bytes, ops, _) => {
           if !self.content.contains_key(&path) {
             journal.push(VolumeOp::Create { path: path.clone() });
           }
-          for op in &ops {
-            if let Some(volume_op) = content_volume_op(&path, op) {
-              journal.push(volume_op);
-            }
-          }
+          let head_len = self.content.get(&path).map_or(0, |head| head.len() as u64);
+          journal.extend(content_volume_ops(&path, &ops, head_len));
           changed.insert(path, Some(bytes));
         }
         Effect::RemoveContent(path) => {
-          journal.push(VolumeOp::Unlink { path: path.clone() });
+          if !moved_from.remove(&path) {
+            journal.push(VolumeOp::Unlink { path: path.clone() });
+          }
           changed.insert(path, None);
         }
         Effect::MakeDir(path) => journal.push(VolumeOp::Mkdir { path }),
@@ -3239,36 +3354,56 @@ impl Green {
   }
 }
 
-/// Restates a mapped content op as a declared operation (head coordinates; the post-state offset is
-/// re-derived when the rebased journal is next composed, so it is dropped here). Returns `None` for a
-/// non-content op kind.
-fn content_volume_op(path: &str, op: &Op) -> Option<crate::increment::VolumeOp> {
+/// Restates a file's mapped content ops as declared operations, in head coordinates. The ops are one pass over the
+/// head's `head_len` bytes ([`apply`]: each at its offset in the head, in order), while a journal is replayed one
+/// operation at a time over the file as the operations before it left it. So each op is restated where [`apply`] stands
+/// when it reaches it: past the output so far, with the head left from its cursor still after it. Restated at their
+/// head offsets as they stand, an insert followed by a delete at the same offset deleted the inserted byte. The
+/// post-state offset is re-derived when the rebased journal is next composed, so it is dropped here; an op of another
+/// kind restates as nothing.
+fn content_volume_ops(path: &str, ops: &[Op], head_len: u64) -> Vec<crate::increment::VolumeOp> {
   use crate::increment::VolumeOp;
-  let path = path.to_owned();
-  Some(match op.kind {
-    OpKind::Overwrite => VolumeOp::Overwrite {
-      path,
-      at: op.at,
-      len: op.len,
-    },
-    OpKind::Insert => VolumeOp::Insert {
-      path,
-      at: op.at,
-      len: op.len,
-    },
-    OpKind::Extend => VolumeOp::Extend {
-      path,
-      at: op.at,
-      len: op.len,
-    },
-    OpKind::Delete => VolumeOp::Delete {
-      path,
-      at: op.at,
-      len: op.len,
-    },
-    OpKind::Truncate => VolumeOp::Truncate { path, len: op.len },
-    _ => return None,
-  })
+  let mut restated = Vec::with_capacity(ops.len());
+  // `pos`: the cursor in the head; `out`: the length [`apply`] has written, where the next op stands in the journal.
+  let (mut pos, mut out) = (0u64, 0u64);
+  for op in ops {
+    if op.at > pos {
+      out = out.saturating_add(op.at.min(head_len).saturating_sub(pos));
+      pos = op.at;
+    }
+    let path = path.to_owned();
+    let (at, len) = (out, op.len);
+    match op.kind {
+      OpKind::Overwrite => {
+        restated.push(VolumeOp::Overwrite { path, at, len });
+        out = out.saturating_add(len);
+        pos = pos.saturating_add(len);
+      }
+      OpKind::Insert => {
+        restated.push(VolumeOp::Insert { path, at, len });
+        out = out.saturating_add(len);
+      }
+      OpKind::Extend => {
+        restated.push(VolumeOp::Extend { path, at, len });
+        out = out.saturating_add(len);
+      }
+      OpKind::Delete => {
+        restated.push(VolumeOp::Delete {
+          path,
+          at,
+          len: len.min(head_len.saturating_sub(pos)),
+        });
+        pos = pos.saturating_add(len);
+      }
+      // [`apply`] keeps nothing of the head past a truncate: the file is cut where its output stands.
+      OpKind::Truncate => {
+        restated.push(VolumeOp::Truncate { path, len: out });
+        pos = head_len;
+      }
+      _ => {}
+    }
+  }
+  restated
 }
 
 /// Files one per-dimension merge result into the accepted effects or the conflict windows.

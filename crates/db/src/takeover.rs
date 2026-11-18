@@ -3,8 +3,12 @@
 //! (`crates/db/tests/takeover_model.rs`).
 //!
 //! An object is adopted once every one of its recovery cohorts has its recovery quorum of members that promised it
-//! ([`Quorum::recovery`]: `cohort − f`, so the promises meet every set of `f + 1` a record committed on). It is lost
-//! when a cohort has fewer members left than that quorum: more of the cohort failed than the region tolerates.
+//! ([`Quorum::recovery`]: `cohort − f`, so the promises meet every set of `f + 1` a record committed on). When a cohort
+//! has fewer members left than that quorum, more of it failed than the region tolerates, and no quorum can meet every
+//! committed record. Until A-309 such an object was lost: never adopted, its share never confirmed, its copies kept and
+//! recovered by no one. Now the members that exist now recover it: it is adopted once every surviving member of its
+//! cohorts, settled and current (the neighbourhood a change in flight reached), has promised it, with the newest record
+//! any of them holds ([`Readiness::ReadyPastTolerance`]). Within tolerance the counting is unchanged.
 //!
 //! What counts as a member's promise is the question A-251 is about ([`CountingRule`]). A member that listed the object
 //! has promised it and reported its highest record. Until A-251 (b), a member whose paged answer was complete also
@@ -17,8 +21,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::register::{
-  Accepted, Acceptor, Authority, HostEpoch, HostId, HostPrepare, HostPromise, Lineage,
-  OBJECT_BYTES, ObjectId, Prepare, Quorum, RegionalConfiguration, RegisterError,
+  Accepted, Acceptor, Authority, HostEpoch, HostId, HostPrepare, HostPromise,
+  LEDGER_PROMISE_HEADER_BYTES, LedgerPrepare, LedgerPromise, Lineage, OBJECT_BYTES, ObjectId,
+  Prepare, Quorum, RegionalConfiguration, RegisterError,
 };
 
 /// Which answers count as a member's promise of an object.
@@ -53,12 +58,16 @@ pub struct Heard<'a> {
 pub enum Readiness {
   /// Every cohort has its recovery quorum of promises: adopt the newest record reported.
   Ready,
-  /// A cohort has not promised enough yet.
+  /// A cohort has not promised enough yet: within tolerance its recovery quorum, past it every surviving member of the
+  /// object's cohorts.
   Waiting,
-  /// A cohort has fewer members left than its recovery quorum: the object cannot be recovered. Carries what was
-  /// judged, so a caller can say why without recomputing it.
-  Lost {
-    /// The short cohort's index in the cohorts [`readiness`] was given.
+  /// A cohort has fewer members left than its recovery quorum (more of it failed than the region tolerates), and every
+  /// surviving member of the object's cohorts, settled and current, has promised it (A-309): adopt the newest record
+  /// reported, the newest any surviving holder of it has. No quorum can meet every committed record past tolerance; this
+  /// is the most the members that exist now hold. Carries what was judged, so a caller can say why without recomputing
+  /// it.
+  ReadyPastTolerance {
+    /// The first short cohort's index in the cohorts [`readiness`] was given.
     cohort: usize,
     /// Its recovery quorum.
     needed: usize,
@@ -84,15 +93,20 @@ impl Heard<'_> {
 
 /// Where an object recovered through `cohorts` stands, its members being the hosts `is_member` admits, under `quorum`
 /// and `rule`, given what was `heard` of it. A cohort's hosts that are no longer members (the retired host among them)
-/// count toward its size, not its promises.
+/// count toward its size, not its promises. `current` are the cohorts the object was placed on in its recovery owners'
+/// current neighbourhoods while a change was in flight ([`RegionalConfiguration::current_cohorts`]): counted only past
+/// tolerance, where every surviving member of every cohort, settled and current, must have promised, since a record
+/// newer than any quorum shows may sit on any of them (A-309).
 pub fn readiness(
   cohorts: &[Vec<HostId>],
+  current: &[Vec<HostId>],
   is_member: impl Fn(HostId) -> bool,
   quorum: Quorum,
   heard: &Heard<'_>,
   rule: CountingRule,
 ) -> Readiness {
   let mut ready = true;
+  let mut short = None;
   for (index, cohort) in cohorts.iter().enumerate() {
     let needed = quorum.recovery(cohort.len());
     let members: Vec<HostId> = cohort
@@ -101,11 +115,8 @@ pub fn readiness(
       .filter(|host| is_member(*host))
       .collect();
     if members.len() < needed {
-      return Readiness::Lost {
-        cohort: index,
-        needed,
-        members: members.len(),
-      };
+      short = short.or(Some((index, needed, members.len())));
+      continue;
     }
     let promised = members
       .iter()
@@ -113,8 +124,26 @@ pub fn readiness(
       .count();
     ready &= promised >= needed;
   }
-  if ready {
-    Readiness::Ready
+  let Some((cohort, needed, members)) = short else {
+    return if ready {
+      Readiness::Ready
+    } else {
+      Readiness::Waiting
+    };
+  };
+  let every_survivor = cohorts
+    .iter()
+    .chain(current)
+    .flatten()
+    .copied()
+    .filter(|host| is_member(*host))
+    .all(|host| heard.promised(host, rule));
+  if every_survivor {
+    Readiness::ReadyPastTolerance {
+      cohort,
+      needed,
+      members,
+    }
   } else {
     Readiness::Waiting
   }
@@ -288,9 +317,170 @@ pub fn answer_by_name(
   answer
 }
 
+/// `holder`'s answer to the ledger question `prepare` (A-364), from `acceptors` (its own records), by the checks a by-name
+/// question runs ([`answer_by_name`]): the committed configuration names the asker the ledger's successor, and the
+/// copy's line falls to the asker in this round ([`copy_falls_to`]). A held copy is promised as a page promises it
+/// ([`promise_object`]: the asker's authority installed, the fence raised to the round's epoch), then every position it
+/// accepted in the range is listed, ascending, until `budget` bytes, at least one position listed; where it stopped is
+/// `next`. A holder with no acceptor for the ledger holds nothing of it and says so (no positions, the range covered).
+/// A fence above the epoch is reported, with no positions. `None`: refused (another successor or another round, or a
+/// promise refused for any other reason), which the asker counts as no answer.
+pub fn answer_ledger(
+  holder: HostId,
+  prepare: &LedgerPrepare,
+  regional: &RegionalConfiguration,
+  acceptors: &mut impl AcceptorStore,
+  budget: usize,
+) -> Option<LedgerPromise> {
+  if regional.successor(prepare.departed, prepare.object) != Some(prepare.owner) {
+    return None;
+  }
+  let mut promise = LedgerPromise {
+    holder,
+    departed: prepare.departed,
+    epoch: prepare.epoch,
+    generation: prepare.generation,
+    object: prepare.object,
+    positions: Vec::new(),
+    next: None,
+    fenced: None,
+  };
+  let Some(acceptor) = acceptors.acceptor_mut(&prepare.object) else {
+    return Some(promise);
+  };
+  if !copy_falls_to(
+    regional,
+    acceptor,
+    prepare.object,
+    prepare.departed,
+    prepare.owner,
+  ) {
+    return None;
+  }
+  let from_retired = regional.retired.contains_key(&acceptor.owner());
+  let page = HostPrepare {
+    departed: prepare.departed,
+    owner: prepare.owner,
+    epoch: prepare.epoch,
+    generation: prepare.generation,
+    after: None,
+    named: Vec::new(),
+  };
+  match promise_object(acceptor, prepare.object, &page, from_retired) {
+    Ok(_) => {}
+    Err(RegisterError::StaleEpoch { current }) => {
+      promise.fenced = Some(HostEpoch(current));
+      return Some(promise);
+    }
+    Err(_) => return None,
+  }
+  let mut used = LEDGER_PROMISE_HEADER_BYTES;
+  for accepted in acceptor.positions_between(prepare.object, prepare.from, prepare.to) {
+    let size = LedgerPromise::position_bytes(&accepted);
+    if !promise.positions.is_empty() && used.saturating_add(size) > budget {
+      promise.next = Some(accepted.sequence);
+      break;
+    }
+    used = used.saturating_add(size);
+    promise.positions.push(accepted);
+  }
+  Some(promise)
+}
+
 /// Whether `promise` has answered any object yet, so a budget never leaves a question with no answer at all.
 fn answered(promise: &HostPromise) -> bool {
   !promise.entries.is_empty() || !promise.nothing.is_empty()
+}
+
+/// What one member answered of a ledger's range (A-364, [`crate::register::LedgerPromise`]): the positions it accepted,
+/// by sequence, and the position its answer covers the range up to (the range's end, or where a paged answer stopped).
+/// Within `from..covered_to` a position it lists is its report, and one it does not list it promised to hold nothing at.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LedgerAnswered {
+  /// The positions it accepted, by sequence.
+  pub positions: BTreeMap<u64, Accepted>,
+  /// The position past the last its answer covers.
+  pub covered_to: u64,
+}
+
+/// What phase one adopts of a ledger's range, position by position (A-364; §4.8 "For each ledger position ... adopts the
+/// highest accepted proposal consistent with the committed prefix").
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LedgerAdoption {
+  /// The adopted positions, ascending from the range's start with no gap: at each, the value accepted under the highest
+  /// epoch among the members' reports.
+  pub adopted: Vec<Accepted>,
+  /// The first position not adopted, when the range was not adopted whole: its cohorts' promises are not all in, or no
+  /// member that promised it reported a value there (which a committed prefix never leaves).
+  pub stopped_at: Option<u64>,
+  /// Whether any adopted position was recovered past tolerance ([`Readiness::ReadyPastTolerance`]).
+  pub past_tolerance: bool,
+}
+
+/// The positions of a ledger's range `from..to` phase one adopts from `answers` (A-364), each member's answer counted per
+/// position as [`readiness`] counts a page's promise of an object under [`CountingRule::NamedAnswer`]: a member promised a
+/// position when it reported it, or when its answer covers it and lists nothing there. At each position, in order, once
+/// its cohorts (settled and current, members by `is_member`, under `quorum`) are ready, the value accepted under the
+/// highest epoch among the reports is adopted. The first position not ready, or ready with no report, ends the
+/// adoption: positions are adopted in order, since the merge plane ships a ledger's next position only once the last is
+/// placed, so a hole below a later position is never a committed prefix. Modelled by `docs/wip/models/FencedLedger.tla`
+/// (`PerPositionLog`), whose Continuity and AdoptedIsPrefix hold, and fail under the register's rule.
+pub fn ledger_positions(
+  (cohorts, current): (&[Vec<HostId>], &[Vec<HostId>]),
+  is_member: impl Fn(HostId) -> bool,
+  quorum: Quorum,
+  (from, to): (u64, u64),
+  answers: &BTreeMap<HostId, LedgerAnswered>,
+) -> LedgerAdoption {
+  let mut adoption = LedgerAdoption::default();
+  let no_complete = BTreeSet::new();
+  for position in from..to {
+    let reports: BTreeMap<HostId, Accepted> = answers
+      .iter()
+      .filter_map(|(host, answered)| {
+        answered
+          .positions
+          .get(&position)
+          .map(|accepted| (*host, accepted.clone()))
+      })
+      .collect();
+    let named_nothing: BTreeSet<HostId> = answers
+      .iter()
+      .filter(|(_, answered)| {
+        answered.covered_to > position && !answered.positions.contains_key(&position)
+      })
+      .map(|(host, _)| *host)
+      .collect();
+    let heard = Heard {
+      reports: &reports,
+      complete: &no_complete,
+      named_nothing: &named_nothing,
+      local: None,
+    };
+    let verdict = readiness(
+      cohorts,
+      current,
+      &is_member,
+      quorum,
+      &heard,
+      CountingRule::NamedAnswer,
+    );
+    let newest = reports
+      .into_values()
+      .reduce(|best, next| if next.epoch > best.epoch { next } else { best });
+    match (verdict, newest) {
+      (Readiness::Ready, Some(newest)) => adoption.adopted.push(newest),
+      (Readiness::ReadyPastTolerance { .. }, Some(newest)) => {
+        adoption.past_tolerance = true;
+        adoption.adopted.push(newest);
+      }
+      _ => {
+        adoption.stopped_at = Some(position);
+        return adoption;
+      }
+    }
+  }
+  adoption
 }
 
 #[cfg(test)]
@@ -304,6 +494,90 @@ mod tests {
       epoch: HostEpoch(1),
       value: vec![u8::try_from(sequence).unwrap_or(u8::MAX)],
     }
+  }
+
+  /// One member's answer of a ledger's range for [`ledger_positions`]: `positions` as `(sequence, epoch, value byte)`,
+  /// covering the range up to `covered_to`.
+  fn answered(positions: &[(u64, u64, u8)], covered_to: u64) -> LedgerAnswered {
+    LedgerAnswered {
+      positions: positions
+        .iter()
+        .map(|(sequence, epoch, byte)| {
+          (
+            *sequence,
+            Accepted {
+              sequence: *sequence,
+              epoch: HostEpoch(*epoch),
+              value: vec![*byte],
+            },
+          )
+        })
+        .collect(),
+      covered_to,
+    }
+  }
+
+  /// A-364 (§4.8 "For each ledger position"): a ledger's range is adopted position by position: at each, once a recovery
+  /// quorum of its cohort promised it, the value accepted under the highest epoch, in order, stopping at the first
+  /// position not ready, or ready with no report. Do: a cohort of the retired host and two members at `f = 1` (a quorum of
+  /// two); answers for positions 3 and 4 in four shapes: both members, one holding an older-epoch value at 3; one member
+  /// alone; a range both promised whose position 3 neither reports; one member's answer stopping at 4. Expect: 3 and 4
+  /// adopted, 3 under the higher epoch; nothing, stopped at 3; nothing, stopped at 3; 3 alone, stopped at 4.
+  #[test]
+  fn a_ledger_is_adopted_position_by_position_in_order() {
+    let (departed, a, b) = (HostId(9), HostId(1), HostId(2));
+    let cohorts = vec![vec![departed, a, b]];
+    let is_member = |host: HostId| host != departed;
+    let quorum = Quorum { f: 1 };
+    let adopt = |answers: BTreeMap<HostId, LedgerAnswered>| {
+      ledger_positions((&cohorts, &[]), is_member, quorum, (3, 5), &answers)
+    };
+    let both = adopt(BTreeMap::from([
+      (a, answered(&[(3, 2, 30), (4, 2, 40)], 5)),
+      (b, answered(&[(3, 1, 31)], 5)),
+    ]));
+    assert_eq!(
+      both
+        .adopted
+        .iter()
+        .map(|accepted| (accepted.sequence, accepted.epoch.0, accepted.value.clone()))
+        .collect::<Vec<_>>(),
+      vec![(3, 2, vec![30]), (4, 2, vec![40])],
+      "each position's value under the highest epoch"
+    );
+    assert_eq!((both.stopped_at, both.past_tolerance), (None, false));
+    let alone = adopt(BTreeMap::from([(
+      a,
+      answered(&[(3, 2, 30), (4, 2, 40)], 5),
+    )]));
+    assert!(
+      alone.adopted.is_empty() && alone.stopped_at == Some(3),
+      "{alone:?}"
+    );
+    let hole = adopt(BTreeMap::from([
+      (a, answered(&[(4, 2, 40)], 5)),
+      (b, answered(&[], 5)),
+    ]));
+    assert!(
+      hole.adopted.is_empty() && hole.stopped_at == Some(3),
+      "{hole:?}"
+    );
+    let paged = adopt(BTreeMap::from([
+      (a, answered(&[(3, 2, 30)], 4)),
+      (b, answered(&[(3, 2, 30), (4, 2, 40)], 5)),
+    ]));
+    assert_eq!(
+      (
+        paged
+          .adopted
+          .iter()
+          .map(|accepted| accepted.sequence)
+          .collect::<Vec<_>>(),
+        paged.stopped_at
+      ),
+      (vec![3], Some(4)),
+      "a position one member's answer did not reach waits for it"
+    );
   }
 
   /// The two rules differ only on a complete answer that did not list the object: today's counts it, A-251's needs it
@@ -328,6 +602,7 @@ mod tests {
     assert_eq!(
       readiness(
         &cohorts,
+        &[],
         is_member,
         quorum,
         &heard,
@@ -338,6 +613,7 @@ mod tests {
     assert_eq!(
       readiness(
         &cohorts,
+        &[],
         is_member,
         quorum,
         &heard,
@@ -352,6 +628,7 @@ mod tests {
     assert_eq!(
       readiness(
         &cohorts,
+        &[],
         is_member,
         quorum,
         &named,
@@ -361,38 +638,79 @@ mod tests {
     );
   }
 
-  /// A cohort with fewer members left than its recovery quorum is lost under either rule, and every cohort must have
-  /// its quorum. Do: two cohorts at f = 1, the second left with a single member of three; then two whole cohorts, only
-  /// one of which has promised. Expect: lost, naming the second cohort, its quorum of two and its one member; then
-  /// waiting.
+  /// A-309: a cohort with fewer members left than its recovery quorum waits for every surviving member of the object's
+  /// cohorts, settled and current, under either rule, and every cohort within tolerance must have its quorum. Do: two
+  /// settled cohorts at f = 1, the second left with a single member of three, and a current cohort with a member of its
+  /// own; hear the first cohort's two members, then the short cohort's survivor by name, then the current cohort's
+  /// member. Expect waiting until the last of them, then ready past tolerance naming the short cohort, its quorum of two
+  /// and its one member; and two whole cohorts, only one of which has promised, waiting whatever the current cohort
+  /// says. Before A-309 the short cohort read lost at once and the object was never adopted.
   #[test]
-  fn every_cohort_needs_its_quorum_and_a_short_one_is_lost() {
-    let (departed, gone, a, b, c) = (HostId(9), HostId(8), HostId(1), HostId(2), HostId(3));
+  fn a_short_cohort_waits_for_every_surviving_holder_and_a_whole_one_for_its_quorum() {
+    let (departed, gone, a, b, c, d) = (
+      HostId(9),
+      HostId(8),
+      HostId(1),
+      HostId(2),
+      HostId(3),
+      HostId(4),
+    );
     let quorum = Quorum { f: 1 };
-    let reports = BTreeMap::from([(a, record(1)), (b, record(1))]);
     let empty = BTreeSet::new();
-    let heard = Heard {
-      reports: &reports,
-      complete: &empty,
-      named_nothing: &empty,
-      local: None,
-    };
     let is_member = |host: HostId| host != departed && host != gone;
     let short = vec![vec![departed, a, b], vec![departed, gone, c]];
+    let current = vec![vec![departed, a, d]];
+    let first = BTreeMap::from([(a, record(1)), (b, record(1))]);
+    let named_c = BTreeSet::from([c]);
+    let all = BTreeMap::from([(a, record(1)), (b, record(1)), (d, record(2))]);
     for rule in [CountingRule::CompleteAnswer, CountingRule::NamedAnswer] {
+      let heard = Heard {
+        reports: &first,
+        complete: &empty,
+        named_nothing: &empty,
+        local: None,
+      };
       assert_eq!(
-        readiness(&short, is_member, quorum, &heard, rule),
-        Readiness::Lost {
+        readiness(&short, &current, is_member, quorum, &heard, rule),
+        Readiness::Waiting,
+        "the short cohort's survivor and the current cohort's member are not heard yet"
+      );
+      // The survivor answers: by name under A-251's rule, by its complete pages under today's.
+      let named = Heard {
+        complete: &named_c,
+        named_nothing: &named_c,
+        ..heard
+      };
+      assert_eq!(
+        readiness(&short, &current, is_member, quorum, &named, rule),
+        Readiness::Waiting,
+        "the current cohort's member is not heard yet"
+      );
+      let everyone = Heard {
+        reports: &all,
+        complete: &named_c,
+        named_nothing: &named_c,
+        ..heard
+      };
+      assert_eq!(
+        readiness(&short, &current, is_member, quorum, &everyone, rule),
+        Readiness::ReadyPastTolerance {
           cohort: 1,
           needed: 2,
           members: 1
         }
       );
     }
+    let heard = Heard {
+      reports: &first,
+      complete: &empty,
+      named_nothing: &empty,
+      local: None,
+    };
     let whole = vec![vec![departed, a, b], vec![departed, b, c]];
     for rule in [CountingRule::CompleteAnswer, CountingRule::NamedAnswer] {
       assert_eq!(
-        readiness(&whole, is_member, quorum, &heard, rule),
+        readiness(&whole, &current, is_member, quorum, &heard, rule),
         Readiness::Waiting
       );
     }
@@ -797,6 +1115,7 @@ mod tests {
     assert_eq!(
       readiness(
         &cohorts,
+        &[],
         is_member,
         quorum,
         &open,
@@ -807,6 +1126,7 @@ mod tests {
     assert_eq!(
       readiness(
         &cohorts,
+        &[],
         is_member,
         quorum,
         &shut,
@@ -817,6 +1137,7 @@ mod tests {
     assert_eq!(
       readiness(
         &cohorts,
+        &[],
         is_member,
         quorum,
         &open,
@@ -833,6 +1154,7 @@ mod tests {
     assert_eq!(
       readiness(
         &cohorts,
+        &[],
         is_member,
         quorum,
         &answered,

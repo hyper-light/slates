@@ -261,6 +261,53 @@ fn refused_unpublished_create(daemon: &Daemon, client: &mut Client) -> RequestId
   create_id
 }
 
+/// GAPS (an open sibling found by reading `reconcile_unpublished_effects`, 2026-10-24; proven here 2026-11-18): a clone
+/// whose transaction is rolled back gives back its pin on its origin's snapshot. Do: create a volume and snapshot it; with
+/// the next publication refused before its append, clone the snapshot (refused `Unpublished`, the transaction rolled back
+/// and the orphaned clone torn down); then destroy the snapshot. Expect the clone refused typed, one rollback counted, and
+/// the snapshot destroyed. Before, the teardown kept the clone's pin on the snapshot, and its destroy was refused
+/// `Pinned` until the daemon restarted.
+#[test]
+fn a_clone_rolled_back_unpublished_gives_back_its_pin_on_the_origins_snapshot() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-clone-pin-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let anchor = held_anchor("clone-pin", &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let origin = client.create(&scratch("pin-origin")).unwrap();
+  let snapshot = client.snapshot(origin).unwrap();
+  daemon
+    .inject_publication_fault(Some(slates_db::replay::PublicationFault::BeforeAppend))
+    .expect("the fault is installed");
+  let cloned = client.clone_snapshot(origin, snapshot, "pin-clone");
+  let rollbacks = rollbacks_of(&daemon);
+  daemon
+    .inject_publication_fault(None)
+    .expect("the faults still pending on the other shards are cleared");
+  let destroyed = client.destroy_snapshot(origin, snapshot);
+  daemon.stop();
+  drop(anchor);
+  assert!(
+    matches!(
+      cloned,
+      Err(ClientError::Refused(Refusal::Unpublished { .. }))
+    ),
+    "the clone is refused typed as unpublished: {cloned:?}"
+  );
+  assert_eq!(
+    rollbacks, 1,
+    "the shard rolled the clone's transaction back"
+  );
+  assert!(
+    destroyed.is_ok(),
+    "the origin's snapshot is destroyed, no pin left by the rolled-back clone: {destroyed:?}"
+  );
+}
+
 /// The volume names the daemon lists, sorted.
 fn names_listed(client: &mut Client) -> Vec<String> {
   let mut names: Vec<String> = client
@@ -1366,6 +1413,84 @@ fn a_holders_publication_carries_the_record_it_acknowledges_not_everything_it_ho
   );
 }
 
+/// Shape: the positions of one ledger the per-position test holds, one publication each: enough that a delta carrying
+/// the whole ledger would carry tens of times what one position is.
+const LEDGER_POSITIONS: u64 = 64;
+
+/// §4.8 "persistence before reply", A-367: a holder of a green keeps every version's merge record, a ledger that is
+/// never compacted, and publishes before it acknowledges each; what that publication carries must be the record it
+/// acknowledges, never the ledger it already carries. Do: hold [`LEDGER_POSITIONS`] records of one ledger register (a
+/// merge record's class byte, so no position is compacted) at its next sequence each, through the holder's production
+/// path, reading after each the held bytes its publication's delta carried; then restart the daemon warm over the same
+/// anchor. Expect every delta after the first to carry the same bytes (the register's head and the one position; a hold
+/// a checkpoint published carries none in a delta), and every position held after the restart at its sequence. Before:
+/// the register was one piece, so each delta carried every position held, and a green's commit at `f > 0` grew by a
+/// position's bytes a version (about 10 µs a version in a debug build, `a_submit_late_in_a_greens_history_...`).
+#[test]
+fn a_holders_publication_carries_the_position_it_acknowledges_not_the_whole_ledger() {
+  use slates_db::register::{HostEpoch, HostId, ObjectId, Record};
+
+  let profile = common::machine_profile();
+  let instance = format!("srv-held-ledger-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let anchor = held_anchor("held-ledger", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let owner = first.member_identity().unwrap();
+  let ledger = ObjectId::new(HostId(owner.0), 1);
+  let carried = |daemon: &Daemon| {
+    daemon
+      .refusals_on_every_shard()
+      .unwrap()
+      .get("publish.delta_held_bytes")
+      .copied()
+      .unwrap_or(0)
+  };
+  let mut per_hold = Vec::new();
+  for sequence in 1..=LEDGER_POSITIONS {
+    let before = carried(&first);
+    let mut value = vec![slates_server::catalog::MERGE_CLASS];
+    value.resize(HELD_VALUE_BYTES, u8::try_from(sequence % 251).unwrap());
+    let record = Record {
+      owner,
+      object: ledger,
+      sequence,
+      epoch: HostEpoch(1),
+      generation: 0,
+      value,
+    };
+    let reply = first.hold_record_as_authorized(owner, record).unwrap();
+    assert!(!reply.is_empty(), "position {sequence} acknowledged");
+    per_hold.push(carried(&first).saturating_sub(before));
+  }
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  let held_after = second.fleet_held_positions(ledger);
+  second.stop();
+  let deltas: std::collections::BTreeSet<u64> = per_hold
+    .iter()
+    .skip(1)
+    .copied()
+    .filter(|bytes| *bytes > 0)
+    .collect();
+  assert_eq!(
+    deltas.len(),
+    1,
+    "every delta after the first carries the register's head and one position, whatever the ledger holds: {per_hold:?}"
+  );
+  assert_eq!(
+    held_after.map(|positions| positions
+      .into_iter()
+      .map(|(sequence, _)| sequence)
+      .collect::<Vec<_>>()),
+    Ok((1..=LEDGER_POSITIONS).collect::<Vec<_>>()),
+    "every acknowledged position is held after a warm restart"
+  );
+}
+
 // -------------------------------------------- crash injection at every durable step (AC-2.3, AC-2.12)
 //
 // A scenario of single-transaction steps, so each crash point is a real state a kill can leave. Two
@@ -1913,6 +2038,7 @@ fn present_landing(
     target: target.to_owned(),
     filter: Filter::default(),
     grant: None,
+    signature: None,
   }) {
     Ok(ReplyBody::GrantRequired { landing, .. }) => landing,
     other => panic!("the landing was not presented: {other:?}"),
@@ -2099,7 +2225,11 @@ fn a_clone_pin_and_a_destroy_in_flight_reconcile_to_the_catalog_across_a_restart
   assert!(
     matches!(
       client.destroy_snapshot(kept, snapshot),
-      Err(ClientError::Refused(slates_ipc::protocol::Refusal::BadRequest { reason })) if reason == "Pinned"
+      Err(ClientError::Refused(
+        slates_ipc::protocol::Refusal::Volume {
+          refusal: slates_ipc::protocol::VolumeRefusal::Pinned
+        }
+      ))
     ),
     "the recovered snapshot is still pinned by the recovered clone (a lost pin would let it be destroyed): {:?}",
     client.destroy_snapshot(kept, snapshot)
@@ -2181,7 +2311,11 @@ fn an_image_volumes_pin_on_its_snapshot_reconciles_across_a_restart() {
   assert!(
     matches!(
       client.destroy_snapshot(kept, snapshot),
-      Err(ClientError::Refused(slates_ipc::protocol::Refusal::BadRequest { reason })) if reason == "Pinned"
+      Err(ClientError::Refused(
+        slates_ipc::protocol::Refusal::Volume {
+          refusal: slates_ipc::protocol::VolumeRefusal::Pinned
+        }
+      ))
     ),
     "the recovered snapshot is still pinned by the recovered image volume: {:?}",
     client.destroy_snapshot(kept, snapshot)
@@ -5033,6 +5167,86 @@ fn a_greens_base_snapshot_is_held_and_its_origin_recovered_from_it() {
     .expect("with the green gone nothing holds the snapshot");
   drop(client);
   second.stop();
+}
+
+/// §4.8 "Recovery", §4.16 "Green owner restart: Masked", §4.3 "Bounded work everywhere" (A-217's owed item; 2026-11-18,
+/// goal g232): a restarted owner seeds a green's engine from its held origin a share at a time, a recovery unit each. The
+/// whole origin was seeded in one step, hashing and copying every file: over the Linux kernel's 1.67 GB that is seconds
+/// of one poll, so a restarted owner of a kernel-sized green was ended by its watchdog inside its own recovery, again at
+/// every restart. Do: a green over a pinned overlay's snapshot of four files of a hashing share each; restart the daemon
+/// over the same segment. Expect: the recovery counted its seeding of the origin over more than one share
+/// (`merge.recovery.origin_load_steps`), and the green reads each file's bytes at version 0.
+#[test]
+fn a_restarted_owner_seeds_a_greens_origin_a_share_at_a_time() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-originload-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  // A file a share: each is its own unit of the seeding, so the origin cannot seed in one.
+  let share = usize::try_from(config.archive_slice_bytes())
+    .unwrap()
+    .max(1);
+  let anchor = held_anchor("originload", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let target = common::target::target_dir();
+  let files: Vec<(String, Vec<u8>)> = (0..4u8)
+    .map(|file| (format!("file-{file}"), vec![file.wrapping_add(1); share]))
+    .collect();
+  for (name, bytes) in &files {
+    target.seed(name, bytes);
+  }
+  let mut client = connect(&instance);
+  let overlay = client
+    .create(&CreateSpec {
+      size: SizeClass::Bounded { limit: 1 << 30 },
+      base: Some(target.path.clone()),
+      ..scratch("origin-load-base")
+    })
+    .unwrap();
+  assert_eq!(
+    client.pin(overlay, None).unwrap(),
+    u64::try_from(files.len()).unwrap(),
+    "every base file pinned"
+  );
+  let snapshot = client.snapshot(overlay).unwrap();
+  let green = client
+    .create_green_over(
+      "origin-load-green",
+      false,
+      slates_client::GreenBase {
+        volume: overlay,
+        snapshot,
+      },
+    )
+    .unwrap();
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  let reads: Vec<bool> = files
+    .iter()
+    .map(|(name, bytes)| {
+      client
+        .read(green, name, slates_client::ReadAt::Version { version: 0 })
+        .is_ok_and(|read| read == *bytes)
+    })
+    .collect();
+  let counters = second.refusals_on_every_shard().unwrap();
+  let seeded_in = counters
+    .get("merge.recovery.origin_load_steps")
+    .copied()
+    .unwrap_or(0);
+  drop(client);
+  second.stop();
+  assert!(
+    seeded_in > 1,
+    "the recovery seeded the origin over {seeded_in} shares: {counters:?}"
+  );
+  assert!(
+    reads.iter().all(|read| *read),
+    "every file reads its bytes at version 0: {reads:?}"
+  );
 }
 
 /// A sibling of a removed base directory at recovery (found by liveness while slicing recovery, 2026-11-08): after a

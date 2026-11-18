@@ -366,6 +366,23 @@ impl ShardsBacking {
   }
 }
 
+/// Why a VMM's backing a successor took back was not kept again ([`ShardsBackings::adopt_vmm`], A-365); nothing was kept
+/// or counted.
+#[derive(Debug)]
+pub enum VmmRefusal {
+  /// The fill budget has no room for what its filled ranges count.
+  Budget {
+    /// What its filled ranges count against the budget.
+    charge: u64,
+    /// What the backings count now.
+    charged: u64,
+    /// The budget.
+    budget: u64,
+  },
+  /// The registry has no slot for it at its handle: past its slots, or out of order.
+  Full(MemError),
+}
+
 /// Why a same-kernel client's backing was not kept ([`ShardsBackings::insert_peer`]); nothing was kept or counted.
 #[derive(Debug)]
 pub enum PeerRefusal {
@@ -557,6 +574,65 @@ impl ShardsBackings {
         Err(PeerRefusal::Full(full))
       }
     }
+  }
+
+  /// Keeps a VMM's backing a successor daemon took back from its anchor (A-365) at the exact `(index, generation)` its
+  /// backing had in the dead daemon, so the copy id the anchor holds its object under names it again and no backing made
+  /// later can meet that id. Its ranges are filled and asked writable as the dead daemon's range table recorded them
+  /// (`filled`, `writable`), and it counts `charge` against the budget (the transport's rule for what its filled ranges
+  /// count). Called while recovery rebuilds the shard, beside [`ShardsBackings::adopt_peer`], in one ascending `index`
+  /// order (the slab's [`Slab::insert_at`] contract). Refused, nothing kept or counted, past the budget, past the
+  /// registry's slots, or out of order.
+  ///
+  /// **Kept dormant until woken** ([`ShardsBackings::wake`]): no write reaches it meanwhile. Its object already holds
+  /// every write the dead daemon made to its ranges, in order with its guest's stores, so the write log's replay, which
+  /// runs between its adoption and its stream's, must not write a logged write over a store its guest made after it.
+  /// Measured: kept awake through the replay, a guest's unsynced store was written over by the replay of the write it
+  /// followed and never reached the file (`a_streams_dax_map_outlives_its_daemon_with_its_unsynced_stores`, 2026-11-18).
+  ///
+  /// [`Slab::insert_at`]: slates_mem::Slab::insert_at
+  pub fn adopt_vmm(
+    &mut self,
+    object: DaxObject,
+    (volume, inode): (u16, InodeNo),
+    (index, generation): (u32, u32),
+    (filled, writable): (BTreeSet<u64>, BTreeSet<u64>),
+    charge: u64,
+  ) -> Result<Handle<ShardsBacking>, VmmRefusal> {
+    if !self.charge(charge) {
+      return Err(VmmRefusal::Budget {
+        charge,
+        charged: self.charged,
+        budget: self.budget,
+      });
+    }
+    let mut backing = ShardsBacking::new(object, volume, inode);
+    backing.filled = filled;
+    backing.writable = writable;
+    match self.slab.insert_at(index, generation, backing) {
+      Ok(handle) => Ok(handle),
+      Err(full) => {
+        self.uncharge(charge);
+        Err(VmmRefusal::Full(full))
+      }
+    }
+  }
+
+  /// Wakes a backing [`ShardsBackings::adopt_vmm`] kept dormant: from now on every change of its file reaches it, as it
+  /// reaches every backing. Whether there was such a backing (a stale handle, or one awake already, changes nothing).
+  pub fn wake(&mut self, handle: Handle<ShardsBacking>) -> bool {
+    let Ok(backing) = self.slab.get(handle) else {
+      return false;
+    };
+    let handles = self
+      .by_file
+      .entry((backing.volume, backing.inode))
+      .or_default();
+    if handles.contains(&handle) {
+      return false;
+    }
+    handles.push(handle);
+    true
   }
 
   /// How many same-kernel clients' backings are held, and their objects' bytes.

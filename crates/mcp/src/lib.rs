@@ -1277,9 +1277,11 @@ fn tool_list() -> Vec<Value> {
     ),
     tool(
       "slates.land.materialize",
-      "Land a volume's diverged entries onto a host directory, as the write mode your user gave you allows \
-       (A-285): under bypass it writes at once; under ask it returns the manifest for your harness to approve and \
-       writes nothing; a forbidding mode is refused. This tool never approves (R10).",
+      concat!(
+        "Land a volume's diverged entries onto a host directory, as the write mode your user gave you allows ",
+        "(A-285): under bypass it writes at once; under ask it returns the manifest for your harness to approve and ",
+        "writes nothing; a forbidding mode is refused. This tool never approves (R10).",
+      ),
       json!({
         "volume": string,
         "target": string,
@@ -1501,6 +1503,11 @@ pub fn summary_json(v: &VolumeSummary) -> Value {
   })
 }
 
+/// One part of a takeover past tolerance as JSON (A-332): the hosts its recovery needed and how many of them remained.
+fn shortfall_json(shortfall: &slates_ipc::protocol::Shortfall) -> Value {
+  json!({ "needed": shortfall.needed, "remaining": shortfall.remaining })
+}
+
 /// A volume status report as JSON. Public so the CLI's `--json` emits the same schema as the MCP
 /// surface (§4.12 schema parity — one definition, two surfaces).
 pub fn status_json(r: &StatusReport) -> Value {
@@ -1518,6 +1525,20 @@ pub fn status_json(r: &StatusReport) -> Value {
       .collect::<Vec<_>>(),
     "mounts_elided": r.mounts_elided,
     "takeover_kept": r.takeover_kept,
+    "loss": {
+      "at_risk_ns": r.loss.at_risk_ns,
+      "placed_sequence": r.loss.placed_sequence,
+      "live_shipped": r.loss.live_shipped,
+      "taken_over": r.loss.taken_over.as_ref().map(|taken| json!({
+        "epoch": taken.epoch,
+        "head_sequence": taken.head_sequence,
+        "from_live_log": taken.from_live_log,
+        "past_tolerance": taken.past_tolerance.as_ref().map(|past| json!({
+          "registers": past.registers.as_ref().map(shortfall_json),
+          "live_log": past.live_log.as_ref().map(shortfall_json),
+        })),
+      })),
+    },
     "head": r.head.value,
     "snapshots": r.snapshots,
     "watcher": r.watcher,
@@ -2055,11 +2076,24 @@ pub fn daemon_json(r: &DaemonReport, telemetry: &[TelemetryReport]) -> Value {
         "bytes_consumed": session.bytes_consumed,
         "path_mtu": session.path_mtu,
       })).collect::<Vec<_>>(),
+      // The failover delay as the daemon estimates it now, each term with the measurements behind it (A-363).
+      "failover": json!({
+        "total_ns": r.fleet.failover.total_ns,
+        "detection_ns": r.fleet.failover.detection_ns,
+        "detection_samples": r.fleet.failover.detection_samples,
+        "confirmation_ns": r.fleet.failover.confirmation_ns,
+        "confirmation_samples": r.fleet.failover.confirmation_samples,
+        "recovery_ns": r.fleet.failover.recovery_ns,
+        "takeovers_timed": r.fleet.failover.takeovers_timed,
+        "volumes_timed": r.fleet.failover.volumes_timed,
+      }),
     },
   });
   // Inserted after: one more key in the literal passes `json!`'s macro recursion limit.
   if let Some(fields) = report.as_object_mut() {
     fields.insert("dumps_local_full".to_owned(), json!(r.dumps_local_full));
+    // Whether the anchor has judged the daemon recovered (A-311): what a caller that ends a daemon on purpose waits for.
+    fields.insert("recovered".to_owned(), json!(r.recovered));
   }
   report
 }
