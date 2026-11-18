@@ -1883,6 +1883,11 @@ pub struct DaemonReport {
   /// This node's certificate anchor (A-237): the host a principal of this node names, as a share to one of its
   /// accounts must name it. Stable across the node's restarts. Appended.
   pub anchor: u64,
+  /// The anchor has judged this daemon recovered (A-311): it has served as long as its start took, so its exit from
+  /// here on is no failed start and is restarted at once, where an exit before would count toward a crash loop. Whoever
+  /// ends a daemon on purpose (a test's kill, an operator's) waits for it first. `false` with no anchor, which judges
+  /// nothing. Appended.
+  pub recovered: bool,
 }
 
 /// The node's sealing at rest (A-92): how its root came (`unavailable`, `minted`, `minted-daemon-only` or

@@ -3204,6 +3204,10 @@ const REFUSED_NOT_WHOLE_FIRST: &str = "fleet.live.takeover_refused.not_whole_fir
 const REFUSED_LAYOUT: &str = "fleet.live.takeover_refused.layout";
 /// Counter: a taken-over live volume rebuilt from the adopted log.
 const LIVE_TAKEN_OVER: &str = "fleet.live.taken_over";
+/// Counter: a live takeover's phase one adopted past tolerance (A-309): fewer than `f + 1` recorded holders were still
+/// members, so every surviving member that may hold the log reported first, and the greatest head among them was
+/// adopted. Counted per phase one that adopted, a refetch included. Zero is the reading of a region within tolerance.
+const LIVE_TAKEN_OVER_PAST_TOLERANCE: &str = "fleet.live.taken_over_past_tolerance";
 
 /// What a takeover fetched of a live volume: the adopted head's payloads (a whole one first), and the
 /// successor's copy of the lineage key the first carries (A-92 piece 4c), unwrapped on this control shard.
@@ -3254,11 +3258,20 @@ pub(crate) async fn ask_reports(
 /// asked that is not a holder still reports, and its head is adopted when it is the greatest. `Ok(None)` when no
 /// candidate holds any of the volume's log (it was never shipped); `Err` with what the takeover waits for when too few
 /// holders answered.
+///
+/// Past tolerance, when fewer than `f + 1` of the recorded holders are still members (`slates_db::live::past_tolerance`),
+/// that count can never be met, and the takeover waited for good (g240's finding at `f = 1`: {survivor, destroyed node}
+/// recorded, the replacement that caught up on the log not among them). Then the members that exist now recover it
+/// (A-309): every surviving recorded holder and every surviving member of `cohort_hosts` (where the retired owner placed
+/// the volume, settled and current, so where a joint transition shipped its log) must report, and the greatest head
+/// among all the reports is adopted (`slates_db::live::adopt_past_tolerance`), counted
+/// [`LIVE_TAKEN_OVER_PAST_TOLERANCE`]. This node's own report is known whatever it holds.
 pub(crate) async fn fetch(
   object: ObjectId,
   epoch: slates_db::register::HostEpoch,
   candidates: Vec<HostId>,
   holders: Vec<HostId>,
+  cohort_hosts: Vec<HostId>,
 ) -> Result<Option<Fetched>, &'static str> {
   let local = state::with_state(|s| s.fleet.configuration().owner)
     .ok_or("fleet.live.takeover_waits_state")?;
@@ -3281,15 +3294,12 @@ pub(crate) async fn fetch(
   if let Some(head) = own {
     reports.push((local, head));
   }
-  let mut others: Vec<HostId> = candidates
-    .into_iter()
-    .filter(|host| *host != local)
-    .collect();
-  for holder in &holders {
-    if *holder != local && !others.contains(holder) {
-      others.push(*holder);
-    }
-  }
+  // Past tolerance (A-309): the recorded holders' count can never be met, so every surviving member that may hold the
+  // log is waited for instead.
+  let members: Vec<HostId> =
+    state::with_state(|s| s.council.configuration().members.clone()).unwrap_or_default();
+  let wait = past_tolerance_wait(&holders, &cohort_hosts, &members, local, quorum);
+  let others = others_to_ask(candidates, &holders, wait.as_deref(), local);
   // Phase one proper: every other candidate and recorded holder reports its head and the bytes it keeps, a few bytes
   // each, within the liveness budget whatever the path.
   for (host, bytes) in ask_reports(object, epoch, &others, crate::fleet::live_budget()).await {
@@ -3298,18 +3308,7 @@ pub(crate) async fn fetch(
       kept.insert(host, bytes);
     }
   }
-  let needed = usize::try_from(quorum.f)
-    .ok()
-    .and_then(|f| f.checked_add(1))
-    .unwrap_or(usize::MAX);
-  let counted = reports
-    .iter()
-    .filter(|(host, _)| holders.contains(host))
-    .count();
-  if counted < needed {
-    return Err("fleet.live.takeover_waits_quorum");
-  }
-  let Some((holder, head)) = slates_db::live::adopt(&reports, &holders, quorum) else {
+  let Some((holder, head)) = phase_one_choice(&reports, &holders, wait.as_deref(), quorum)? else {
     return Ok(None);
   };
   let refused = state::with_state(|s| s.live.refused_rebuilds.get(&object).cloned()).flatten();
@@ -3478,6 +3477,84 @@ const LIVE_TAKEOVER_NO_KEY_EXHAUSTED: &str = "fleet.live.takeover_no_key_exhaust
 /// Derived: how long a successor waits at one head for the key to a log it holds no key for: ten liveness budgets
 /// (`daemon::OBSERVE_BUDGET_NS`), past a pair's redelivery (once a record period) many times over.
 const NO_KEY_WAIT_NS: u64 = crate::daemon::OBSERVE_BUDGET_NS;
+
+/// The surviving members a live phase one waits for past tolerance (A-309), `None` within it: when fewer than `f + 1` of
+/// the recorded `holders` are `members` (`slates_db::live::past_tolerance`), every recorded holder and every member of
+/// `cohort_hosts` (where the retired owner placed the volume) still a member, `local` aside, since this node's own copy
+/// is known whatever it holds.
+fn past_tolerance_wait(
+  holders: &[HostId],
+  cohort_hosts: &[HostId],
+  members: &[HostId],
+  local: HostId,
+  quorum: slates_db::register::Quorum,
+) -> Option<Vec<HostId>> {
+  if !slates_db::live::past_tolerance(holders, |host| members.contains(&host), quorum) {
+    return None;
+  }
+  let mut wait: Vec<HostId> = holders
+    .iter()
+    .chain(cohort_hosts)
+    .copied()
+    .filter(|host| *host != local && members.contains(host))
+    .collect();
+  wait.sort_unstable_by_key(|host| host.0);
+  wait.dedup();
+  Some(wait)
+}
+
+/// The hosts phase one asks besides this node (`local`): every candidate, then every recorded holder and every host a
+/// phase one past tolerance waits for (`wait`, A-309) not among them, so a holder outside the placement is asked too.
+fn others_to_ask(
+  candidates: Vec<HostId>,
+  holders: &[HostId],
+  wait: Option<&[HostId]>,
+  local: HostId,
+) -> Vec<HostId> {
+  let mut others: Vec<HostId> = candidates
+    .into_iter()
+    .filter(|host| *host != local)
+    .collect();
+  for holder in holders.iter().chain(wait.into_iter().flatten()) {
+    if *holder != local && !others.contains(holder) {
+      others.push(*holder);
+    }
+  }
+  others
+}
+
+/// Phase one's choice from `reports` (A-240, A-309): within tolerance (`wait` is `None`), the greatest head once `f + 1`
+/// of the recorded `holders` reported (`slates_db::live::adopt`), else the takeover waits for its quorum; past it, the
+/// greatest head once every host of `wait` reported (`slates_db::live::adopt_past_tolerance`), counted
+/// [`LIVE_TAKEN_OVER_PAST_TOLERANCE`], else the takeover waits for them. `Ok(None)` when nobody holds any of the log.
+fn phase_one_choice(
+  reports: &[(HostId, Option<Head>)],
+  holders: &[HostId],
+  wait: Option<&[HostId]>,
+  quorum: slates_db::register::Quorum,
+) -> Result<Option<(HostId, Head)>, &'static str> {
+  let Some(wait) = wait else {
+    let needed = usize::try_from(quorum.f)
+      .ok()
+      .and_then(|f| f.checked_add(1))
+      .unwrap_or(usize::MAX);
+    let counted = reports
+      .iter()
+      .filter(|(host, _)| holders.contains(host))
+      .count();
+    if counted < needed {
+      return Err("fleet.live.takeover_waits_quorum");
+    }
+    return Ok(slates_db::live::adopt(reports, holders, quorum));
+  };
+  match slates_db::live::adopt_past_tolerance(reports, wait) {
+    slates_db::live::PastTolerance::Waiting => Err("fleet.live.takeover_waits_past_tolerance"),
+    slates_db::live::PastTolerance::Adopt(adopted) => {
+      let _ = state::with_state_counted(|s| s.count(LIVE_TAKEN_OVER_PAST_TOLERANCE, 1));
+      Ok(adopted)
+    }
+  }
+}
 
 /// Counter: a taken-over live volume's log was not fetched again, its rebuild having been refused at the head phase
 /// one adopted now ([`next_fetch`]).

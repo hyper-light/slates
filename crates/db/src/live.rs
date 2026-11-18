@@ -832,6 +832,53 @@ pub fn adopt(
     .max_by_key(|(_, head)| head.rank())
 }
 
+/// Whether a live takeover's phase one is past tolerance (A-309): fewer than `f + 1` of the recorded `holders` are still
+/// members (`is_member`), so [`adopt`]'s count can never be met. More of the log's holders failed than the region
+/// tolerates; A-240's count waited for good (g240's finding: at `f = 1` a set recorded as {survivor, destroyed node}).
+pub fn past_tolerance(
+  holders: &[HostId],
+  is_member: impl Fn(HostId) -> bool,
+  quorum: Quorum,
+) -> bool {
+  let Some(needed) = usize::try_from(quorum.f)
+    .ok()
+    .and_then(|f| f.checked_add(1))
+  else {
+    return false;
+  };
+  holders.iter().filter(|host| is_member(**host)).count() < needed
+}
+
+/// Phase one's choice past tolerance ([`adopt_past_tolerance`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PastTolerance {
+  /// A surviving host that may hold the log has not reported yet.
+  Waiting,
+  /// Every surviving host that may hold the log has reported: the holder of the greatest head and that head, `None`
+  /// when none holds any of the log.
+  Adopt(Option<(HostId, Head)>),
+}
+
+/// Phase one's choice past tolerance (A-309): once every host of `wait` has reported, the greatest head among `reports`.
+/// `wait` is every surviving member that may hold the log: the recorded holders still members and the members of the
+/// retired owner's cohorts for the volume, settled and current (where a joint transition shipped). No count of
+/// recorded holders can meet every durable entry past tolerance; waiting for every surviving holder means the newest
+/// head any of them keeps is never passed over, the replacement that caught up on the log among them.
+pub fn adopt_past_tolerance(reports: &[(HostId, Option<Head>)], wait: &[HostId]) -> PastTolerance {
+  if !wait
+    .iter()
+    .all(|host| reports.iter().any(|(reporter, _)| reporter == host))
+  {
+    return PastTolerance::Waiting;
+  }
+  PastTolerance::Adopt(
+    reports
+      .iter()
+      .filter_map(|(holder, head)| head.map(|head| (*holder, head)))
+      .max_by_key(|(_, head)| head.rank()),
+  )
+}
+
 /// What the owner keeps of its log beyond its own state, in bytes of entries at their wire size
 /// ([`Entry::wire_bytes`]; AC-8.9).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
