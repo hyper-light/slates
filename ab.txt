@@ -2580,3 +2580,5 @@ slates daemon: instance fsb-914-10-perkind serving on 3 shards under the anchor
 slates-winfsp: reply spin window = 8700 ns: the median one-way channel wake of 15 (the 2-competitive spin)
 slates daemon: the control shard's beat task ran 725 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 2 steps and 1 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 0 unattributed), fired 2 timers, waited 1 times, spawned 0 tasks and finished 0; 7 tasks live; its longest poll is 87 ms and its timer overrun 625 ms
 ## run 10 of 10 done, 2026-11-18T11:53:52Z
+To https://github.com/hyper-light/slates
+   548db04..77d43fb  77d43fb559fbd5c757822508c538dab6225d9770 -> diag-results/g258-44273781244-perkind-arm
