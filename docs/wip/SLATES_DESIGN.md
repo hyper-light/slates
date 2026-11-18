@@ -23195,7 +23195,11 @@ Applied in the same change to:
   `a_forward_with_no_owner_to_find_keeps_looking_for_its_location_budget` failed 3 of 3 on each over main's budget,
   the location never looking again (`diag-g255-loc-red-1`, `-red-3`), and passed 3 of 3 on each with this form, as did
   `the_failover_slo_ends_a_forwards_location_budget`, the false-death test and the location round's session-out test
-  (`-green-4`, run 44260988795); the five-node takeover test, 16 of 16 on current main (above).
+  (`-green-4`, run 44260988795); the five-node takeover test, 16 of 16 over main as of `bfc34cace` (above). Over
+  A-315 and main as of `1e8f4a49e` (`diag-g255-land2-1`, run 44273659893), on each of the three runners the four
+  location tests 3 of 3 each, the five-node takeover test and the left-out-head takeover test 6 of 6 each, and the
+  held-origin test 3 of 3; and fmt, clippy and the whole `slates-server` suite pass on ubuntu-latest, `fleet` 157 of
+  157.
 - **Cost.** None at the location's steady state: one more look at the direct route a round. A location that cannot find
   its owner ends one look past the horizon: about a poll interval when its rounds are answered, and one round's wait
   when they wait on a silent peer.
