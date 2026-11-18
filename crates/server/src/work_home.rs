@@ -386,9 +386,11 @@ fn need_of(state: &ShardState, work: DbVolumeId, body: &RequestBody) -> Option<N
   }
 }
 
-/// What a submit verb brings its verdict: its evidence, its approval and its signature (A-285, A-321); `None` for a
-/// verb that is not a submit.
-fn submitted(body: &RequestBody) -> Option<(&[[u8; 32]], crate::verbs::Approval, Option<Vec<u8>>)> {
+/// What a submit verb brings its verdict: its evidence, its approval and its signature's bytes (A-285, A-321).
+type Submission<'a> = (&'a [[u8; 32]], crate::verbs::Approval, Option<Vec<u8>>);
+
+/// The [`Submission`] a submit verb brings; `None` for a verb that is not a submit.
+fn submitted(body: &RequestBody) -> Option<Submission<'_>> {
   use crate::verbs::Approval;
   match body {
     RequestBody::Submit { evidence, .. } => Some((evidence, Approval::None, None)),
