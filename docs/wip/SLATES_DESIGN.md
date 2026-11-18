@@ -635,6 +635,14 @@ the measured wake cost before parking (the 2-competitive rule). The mount is nev
 > without a beat. The catalog's replay and a green's engine built over its origin are each one unit still. Record:
 > `docs/bugs/2026-11-07-a-shards-recovery-ran-in-one-poll-and-the-watchdog-withheld-the-beat.md`.
 
+> **Starts that fail in a row are backed off from their own life (2026-11-17, A-311).** Step 1's supervision counted
+> failed starts in a window of a second, so a start that a busy machine stretched past the window and that then failed
+> was never a crash loop and was restarted at once for good (a 407-shard start, every second for 27 minutes on B10's
+> Linux gate at load 70). Now the first failed start is restarted at once and the second in a row is a crash loop,
+> backed off at least the failed start's own life and doubling to the operator's failover SLO. Owed (GAPS): the
+> serve-then-crash loop, and a long start that beats per unit of work. Record:
+> `docs/bugs/2026-11-11-starts-longer-than-the-restart-window-were-restarted-at-once-forever.md`.
+
 1. The anchor process starts (or is already running), maps or creates the shared segment, and
    loads or rebuilds the machine profile.
 2. The daemon starts, attaches the segment, and either replays the op logs into fresh in-memory
@@ -13539,7 +13547,10 @@ Applied in the same change to:
 Status: built 2026-10-08. Since 2026-11-09 only an exit before the daemon served counts toward the bound (the
 supervision block's serving word, which the daemon marks once its start, recovery included, is done): a daemon killed
 while serving had recovered, and counting it backed off a test that killed a serving daemon twenty times
-(`docs/bugs/2026-11-09-a-daemon-killed-while-serving-was-counted-toward-the-crash-loop.md`).
+(`docs/bugs/2026-11-09-a-daemon-killed-while-serving-was-counted-toward-the-crash-loop.md`). Since 2026-11-17 (A-311)
+the window below is gone: a second failed start in a row is a crash loop, backed off from its own life and doubling to
+the operator's failover SLO, since a start longer than the window was never one
+(`docs/bugs/2026-11-11-starts-longer-than-the-restart-window-were-restarted-at-once-forever.md`).
 - What it answers: the anchor counted restarts in a window (the recovery budget) against an allowance of the budget
   over the longest measured start, and past it stopped supervising for good. On a loaded host a start stretched to
   160–490 ms (shard recovery contending for the CPU), the allowance fell to one, and `realworld_chaos.sh`'s two kills
@@ -21721,3 +21732,51 @@ Applied in the same change to:
   two tests, each answered `EIO` at one window by the rule before.
 - **Owed.** The supervisor's runs of the live FUSE flows under load on main, and a Windows run of
   `crates/cli/tests/live_winfsp.rs`. Open (GAPS): a window can still be silent through the owner's own delay in asking.
+
+### A-311 — Starts that fail in a row are backed off from their own life, however long each takes; the backoff doubles to the failover SLO (accepted 2026-11-12, the supervisor's ruling: "the anchor budget approved, plus serve-then-crash backoff and a derived RETRY_CAP_NS"; the never-served half built 2026-11-17 for goal g254)
+
+Applied in the same change to:
+- `crates/anchor/src/supervise.rs`: `RestartPolicy` is the backoff's cap alone (`RestartPolicy::derive(failover_slo_ns)`);
+  `crash_loop_backoff`, pure, with its unit tests; the failed starts in a row (`CRASH_LOOP_FAILURES`,
+  `Step::Restarted::failed_in_a_row` in place of `in_window`). The restart window, `RETRY_CAP_NS` and
+  `Supervisor::set_policy` are removed.
+- `crates/api/src/role/anchor.rs`: the policy derived once from the daemon configuration's `failover_slo_ns` and logged
+  with its derivation; a measured start no longer re-derives it; the restart line names the failed starts in a row.
+- Tests: `crates/anchor/tests/anchor.rs` (`a_crash_loop_of_starts_longer_than_the_window_is_backed_off`, red on main; the
+  crash-loop, served-restart, doubling, device-hold, torn-publication and device-refusal fixtures under the rule),
+  `crates/anchor/tests/handles_windows.rs` (the prompt fixture's one exit is now a restart), the role harness
+  `crates/server/tests/common/supervised.rs` (the role restarted at its exit is stopped at once), and
+  `crates/cli/tests/cli.rs` (the many-shard start's watch ends at the first start kill; the hold-refusal fixture's
+  policy).
+- A-119's status, §2.6's status, GAPS, `docs/wip/bench/kill_storm.sh`'s comment, and
+  `docs/bugs/2026-11-11-starts-longer-than-the-restart-window-were-restarted-at-once-forever.md`.
+
+- **What was there.** The anchor counted a daemon's failed starts (exits before it served, A-119 as amended 2026-11-09)
+  inside a window of the recovery budget, a second, against the starts the budget held at the longest start measured,
+  and backed off past that count from the window, doubling to 60 s. A start longer than the window fell in a window of
+  its own every time, so it was never a crash loop and was restarted at once for good: B10's Linux gate on adacachy2
+  (load 67-73) killed and restarted a 407-shard start every second for 27 minutes.
+- **The rule.** A failed start is restarted at once. The second in a row is a crash loop, recorded as `CrashLoop`, and
+  restarted after a backoff of at least the failed daemon's own life, spawn to exit: the loop's first backoff that life,
+  each next twice the last, doubled no further than the cap and never shorter than the failed start took. A daemon that
+  serves resets the count and the backoff. So a loop spends at most half its time starting, however long each start
+  takes, and supervision still never gives up (A-119).
+- **Why two in a row.** One failure is an event, and restarting it at once is the quickest recovery there is; a second
+  in a row is the first evidence that the next start may fail the same way. The window let "budget over start" failures
+  through at full speed each second while starts were short, and treated none as a loop once a start outlasted it.
+- **The cap, derived.** The operator's failover SLO (`FAILOVER_SLO_NS`, ten seconds until the operator gives one): the
+  outage the operator accepts for a failed owner, and the lease the daemon grants every NFSv4 client
+  (`crates/server/src/delegation.rs`). Capped there, a looping daemon starts again within one SLO of its last failure, so
+  once the loop's cause clears it serves within the bound the operator set, and its NFSv4 clients' leases have not all
+  lapsed meanwhile. The old cap was a hard Linux NFS mount's major timeout (`nfs(5)`, `timeo` 600), which no mount slates
+  makes sets. The backoff's floor, the failed start's own life, may exceed the cap, and wins: a start longer than the
+  SLO still never spends more than half the loop's time.
+- **Evidence.** Red on main 29ef4521 (the liveness agent's run, `2a5570e4d`): a child whose every start runs 400 ms and
+  fails before serving, under a policy whose window was 200 ms, was restarted at once 4 times of 4, backed off None. On
+  this change the same child is a crash loop at its second exit, backed off its own life: 548 ms after starts of 400 ms
+  (`cargo test -p slates-anchor --test anchor -- --nocapture a_crash_loop_of_starts_longer`, an 18-core M-series
+  MacBook at load 15, 2026-11-17).
+- **Owed** (GAPS, the entry of 2026-11-11): the serve-then-crash loop, a daemon that dies before it has served as long as
+  its start took (`a_daemon_that_dies_soon_after_it_serves_is_backed_off`, ignored), once the end-to-end tests that kill
+  a serving daemon again soon after it serves pace their kills on a recovered verdict the anchor publishes; and a long
+  start that beats per unit of work, so the 407-shard start is not killed in the first place.

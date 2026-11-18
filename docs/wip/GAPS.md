@@ -801,6 +801,27 @@
 > sets. Main failed 6 of 10 Windows runs of the test; the fix passed 10 of 10 (`diag-liveness-4`, `-6`). The bug record
 > of 2026-11-07 has the log.
 
+> **Starts that each failed past the anchor's restart window were restarted at once, for good (found 2026-11-11 on
+> B10's Linux gate; the never-served half closed 2026-11-17, A-311; open below).** The anchor counted failed starts in a
+> window of the recovery budget, a second, so a start that took longer fell in a window of its own every time and was
+> never a crash loop. B10's gate on adacachy2 (be4985bb, load 67-73) ran `a_start_whose_shards_sum_past_a_window_comes_up`
+> for 27 minutes, the anchor killing the 407-shard start every second ("ran 1009-1037 ms of CPU on one thread without
+> beating") and restarting it at once; the goal's record (g254) has main's macOS CI meeting it at 367 shards. Now a
+> second failed start in a row is a crash loop, backed off at least its own life and doubling to the failover SLO
+> (A-311). Red on main 29ef4521 (a 400 ms start against a 200 ms window: restarted at once 4 times of 4, backed off
+> None); passes on this change, a crash loop at the second exit backed off 548 ms, its own life (an 18-core MacBook at
+> load 15; `a_crash_loop_of_starts_longer_than_the_window_is_backed_off`, the bug record of 2026-11-11). The test now ends its watch at the anchor's first start kill instead of reading on. Open:
+> - **The serve-then-crash loop.** A daemon that serves, then dies before it has served as long as its start took, is
+>   still restarted at once every time (`a_daemon_that_dies_soon_after_it_serves_is_backed_off`, ignored until then).
+>   The rule is approved (the supervisor, 2026-11-12), but six end-to-end files kill a serving daemon again soon after
+>   it serves (`held_rendezvous.rs`, `nfs_held.rs`, `merge_kill.rs`, `live_fleet.rs`, `winfsp.rs`, `guest_vhost.rs`), and
+>   `held_rendezvous` failed 4 of 4 under the rule at load 21-63 (the liveness agent's run of 2026-11-11). They are to
+>   pace their kills on a recovered verdict the anchor publishes.
+> - **A long start beats per unit of work.** The backoff paces a loop of killed starts; it does not let the 407-shard
+>   start come up. That start's one thread runs past a window of CPU before the daemon's first beat. A hypothesis from
+>   the code, not yet measured: the daemon's main thread making every ordered pair of shards' rings
+>   (`slates_rt::runtime::connect_pairs`, N(N-1) rings, 165,242 at 407 shards) before the watchdog thread exists.
+
 > **The anchor killed every start a busy machine starved (found 2026-11-06, closed 2026-11-07; recovery in one poll and
 > the client's deadlines stay open, below).** A start not beaten within the fixed recovery budget (a wall second) was
 > killed, and every restart started over. Now a start is judged in its own CPU time by the watchdog's rule: killed only
