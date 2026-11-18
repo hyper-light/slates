@@ -13,7 +13,15 @@
 //! - stat;
 //! - open, then read (the bytes back, compared, so a fast wrong answer is a failed run, not a result);
 //! - rename (within the directory);
-//! - unlink.
+//! - unlink;
+//! - on Windows, create then a security query, on its own files and timed from the create's start to the query's
+//!   answer. The query reaches slates' receive worker as QuerySecurity and WinFsp answers it without calling the host,
+//!   which registers no GetSecurity callback, so it is a request no shard call precedes, right after a Create: where an
+//!   open's confirmation posted behind no wake would hold the worker (A-274). Each such call reached the worker on both
+//!   Windows runners (diag-winfsp-overlap-52, run 43148071819: 21,000 of 21,000 a daemon on arm64; on x86_64 the worker
+//!   took 273,006 more that no call of the bench's made, one for each of the 273,007 Cleanups but one); a stream query
+//!   did not (the kernel refused it, error 87, before any request), so it is not here. An error answer is counted and
+//!   printed, never dropped.
 //!
 //! Each phase runs over all of a round's files before the next, so the directory holds them from the creates to the
 //! unlinks, as a tree being written does. Rounds interleave the arms and rotate which goes first, so a load that
@@ -84,10 +92,22 @@ const PERMILLE: u64 = 1000;
 const NS_PER_US: u64 = 1000;
 /// Format: see [`NS_PER_US`].
 const NS_PER_TENTH_US: u64 = 100;
-/// Format: the operations, in the order a round makes them.
-const OPERATIONS: [&str; 9] = [
-  "create", "write", "fsync", "close", "stat", "open", "read", "rename", "unlink",
+/// Format: the operations, in the order a round makes them. The last is Windows' alone.
+const OPERATIONS: [&str; 10] = [
+  "create",
+  "write",
+  "fsync",
+  "close",
+  "stat",
+  "open",
+  "read",
+  "rename",
+  "unlink",
+  "create_security",
 ];
+/// Format: the index of [`OPERATIONS`]' create-then-security-query.
+#[cfg(windows)]
+const CREATE_SECURITY: usize = 9;
 
 fn ns(elapsed: Duration) -> u64 {
   u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
@@ -135,10 +155,12 @@ impl Arm {
   }
 }
 
-/// One arm's samples of each operation, in [`OPERATIONS`] order.
+/// One arm's samples of each operation, in [`OPERATIONS`] order, and of each the calls answered with an error (the
+/// count, and the last error's code).
 #[derive(Default)]
 struct Samples {
-  by_operation: [Vec<u64>; 9],
+  by_operation: [Vec<u64>; OPERATIONS.len()],
+  errors: [(u64, u32); OPERATIONS.len()],
 }
 
 impl Samples {
@@ -147,6 +169,46 @@ impl Samples {
       samples.push(ns(ended.saturating_duration_since(started)));
     }
   }
+
+  /// Counts a timed call answered with `code`, kept as a result: on WinFsp an answer made without the host is an error.
+  #[cfg(windows)]
+  fn answered_error(&mut self, operation: usize, code: u32) {
+    if let Some(errors) = self.errors.get_mut(operation) {
+      errors.0 = errors.0.saturating_add(1);
+      errors.1 = code;
+    }
+  }
+}
+
+/// The file's owner, asked on its handle: a QuerySecurity request WinFsp answers without calling slates' host. Its
+/// answer, or the error's Win32 code.
+#[cfg(windows)]
+fn query_security(file: &std::fs::File) -> Result<(), u32> {
+  use std::os::windows::io::AsRawHandle;
+  use windows_sys::Win32::Foundation::LocalFree;
+  use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+  use windows_sys::Win32::Security::{OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID};
+  let mut owner: PSID = std::ptr::null_mut();
+  let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+  // SAFETY: the handle is the open file's for the whole call; the out-pointers are this frame's, and only the owner is
+  // asked for, so no ACL pointer is written.
+  let code = unsafe {
+    GetSecurityInfo(
+      file.as_raw_handle(),
+      SE_FILE_OBJECT,
+      OWNER_SECURITY_INFORMATION,
+      &mut owner,
+      std::ptr::null_mut(),
+      std::ptr::null_mut(),
+      std::ptr::null_mut(),
+      &mut descriptor,
+    )
+  };
+  if !descriptor.is_null() {
+    // SAFETY: a successful GetSecurityInfo hands its descriptor to the caller to free with LocalFree, once.
+    unsafe { LocalFree(descriptor) };
+  }
+  if code == 0 { Ok(()) } else { Err(code) }
 }
 
 /// A file's bytes: its round and index in the first sixteen, then a pattern of both, so a read of another file's bytes
@@ -201,6 +263,26 @@ fn round(
     samples.push(1, created, written);
     samples.push(2, written, synced);
     samples.push(3, synced, closed);
+  }
+  #[cfg(windows)]
+  {
+    for index in 0..files {
+      let path = work.join(format!("{pass}-r{round}-s{index}"));
+      let started = Instant::now();
+      let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|e| fail("create", &path, e))?;
+      let answer = query_security(&file);
+      samples.push(CREATE_SECURITY, started, Instant::now());
+      if let Err(code) = answer {
+        samples.answered_error(CREATE_SECURITY, code);
+      }
+      drop(file);
+      // Untimed: these files are the op's own, so the directory the other phases see is unchanged.
+      std::fs::remove_file(&path).map_err(|e| fail("unlink", &path, e))?;
+    }
   }
   for index in 0..files {
     let path = made(index);
@@ -424,11 +506,24 @@ fn print_pass(arms: &[Arm], mut measured: Pass) {
   println!("# pass {}: {load}", measured.name);
   let mut cells: Vec<Vec<String>> = OPERATIONS.iter().map(|_| Vec::new()).collect();
   for (arm, samples) in arms.iter().zip(measured.samples.iter_mut()) {
-    for ((operation, column), samples) in OPERATIONS
+    for (((operation, column), samples), (errors, code)) in OPERATIONS
       .iter()
       .zip(cells.iter_mut())
       .zip(samples.by_operation.iter_mut())
+      .zip(samples.errors)
     {
+      // An operation this platform does not make (the Windows queries elsewhere) prints no row and an empty cell.
+      if samples.is_empty() {
+        column.push("—".to_owned());
+        continue;
+      }
+      if errors > 0 {
+        println!(
+          "# {} {operation}: {errors} of {} calls answered error {code}",
+          arm.name,
+          samples.len()
+        );
+      }
       let ranks = summary(samples);
       println!(
         "fsbench\t{}\t{}\t{operation}\t{}\t{}\t{}\t{}\t{}",
@@ -459,6 +554,9 @@ fn print_pass(arms: &[Arm], mut measured: Pass) {
   println!("| op | {} |", names.join(" | "));
   println!("|---|{}", "---|".repeat(arms.len()));
   for (operation, row) in OPERATIONS.iter().zip(cells) {
+    if row.iter().all(|cell| cell == "—") {
+      continue;
+    }
     println!("| {operation} | {} |", row.join(" | "));
   }
   println!();

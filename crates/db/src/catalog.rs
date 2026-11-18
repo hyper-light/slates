@@ -282,9 +282,12 @@ pub struct PolicyRecord {
   /// harness through the issuer, never by an agent. `None` until one is set: merges at once, lands under approval.
   /// Appended.
   pub write: Option<WritePolicy>,
-  /// How many times the write policy was set (A-285): a setter names the version it read, so a captured proof sets
-  /// nothing once the policy has moved. Appended.
+  /// How many times the write policy or the trusted signers were set (A-285, A-321): a setter names the version it
+  /// read, so a captured proof sets nothing once the policy has moved. Appended.
   pub write_version: u64,
+  /// The keys trusted to sign the volume's work (signed work, A-321), in SSH wire form, in the order the launcher set
+  /// them: a merge's signature verifies under its work's and its green's, a landing's under its volume's. Appended.
+  pub signers: Vec<Vec<u8>>,
 }
 
 /// How one kind of write is permitted (A-285): the mode the user gave the harness or agent.
@@ -298,13 +301,16 @@ pub enum WriteMode {
   Forbid,
 }
 
-/// A volume's write policy (A-285): the mode for its merges and the mode for its landings.
+/// A volume's write policy (A-285): the mode for its merges and the mode for its landings, and whether its merges must
+/// be signed (A-321).
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WritePolicy {
   /// How a merge into the volume is permitted.
   pub merge: WriteMode,
   /// How a landing of the volume is permitted.
   pub land: WriteMode,
+  /// Merges into the volume (a green) or from it (a work) must carry a signature that verifies under a trusted signer.
+  pub require_signed_merges: bool,
 }
 
 /// A live shipper's holder set and the epoch it ships under (A-240): the `2f` candidates it ships to, as their host
@@ -422,6 +428,23 @@ pub struct VolumeRecord {
   /// the access list, the base — so the owner ships each change as a newer record and a takeover adopts the
   /// newest (AUD-29-17). Raised in `apply`, so replay reproduces it.
   pub catalog_version: u64,
+  /// The takeover that made this node the volume's owner (AC-8.3, A-325), recorded with the volume when the successor
+  /// materializes it, so its loss report survives the successor's restart over its anchor; `None` for a volume made
+  /// here. Appended.
+  pub taken_over: Option<TakeoverRecord>,
+}
+
+/// The takeover that made a node a volume's owner (AC-8.3, A-325; the loss report in `slates status`): the epoch the head
+/// was placed under, the head sequence the volume was served from, and whether it was rebuilt from the volume's live log
+/// (no acknowledged write lost) or from the seal the head names (the lost owner's edits after it are the loss window).
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TakeoverRecord {
+  /// The epoch the adopted head was placed under.
+  pub epoch: u64,
+  /// The head sequence the volume was served from.
+  pub head_sequence: u64,
+  /// Whether the volume was rebuilt from its live log rather than from the seal the head names.
+  pub from_live_log: bool,
 }
 
 /// Where a snapshot's records and content are held (§4.8).

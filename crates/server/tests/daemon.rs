@@ -2077,10 +2077,11 @@ fn the_daemon_serves_the_lifecycle_verbs_exactly_once_with_leases_and_typed_refu
 }
 
 /// Shape: a version slab large enough to physically hold several volumes' inode and trie nodes, yet
-/// small enough that one big-quota volume's inode allowance reserves all of it above the copy-up
-/// headroom. So a further volume is refused by the §4.2 *reservation* while physical slots plainly
-/// remain — the honesty the reservation adds over the bare per-volume cap (a raw `SlabFull` would
-/// only fire once the slab were physically exhausted, which it is not here).
+/// small enough that a bounded claim's allowance and a dynamic volume's inodes take all of it above
+/// the copy-up headroom. So a further volume is refused by the §4.2 *reservation* while physical slots
+/// plainly remain (the claim's reserved slots it has not used yet) — the honesty the reservation adds
+/// over the bare per-volume cap (a raw `SlabFull` would only fire once the slab were physically
+/// exhausted, which it is not here).
 const SMALL_VERSION_SLAB: usize = 64;
 /// Shape: refused-create attempts against a full version budget — enough that, were a partial volume
 /// allocated and leaked on each refusal (the pre-reorder bug), the trie slab would physically fill
@@ -2090,11 +2091,14 @@ const LEAK_PROBES: usize = 24;
 /// Shape: the capped daemon's arena, sized with its slab so a slot is about 1 MiB of quota (A-109: a volume's inode
 /// allowance is its quota's share of the slab, the arena over the slab per inode).
 const SLAB_RESERVE: u64 = 64 << 20;
-/// Shape: a dynamic maximum of twice the arena, so its inode allowance is every reservable slot (the bytes per inode
-/// round up, so the arena itself would leave one). Being dynamic, it reserves no bytes, so a refusal after it is the
-/// version reservation's alone.
+/// Shape: a dynamic maximum of twice the arena, so its derived inode allowance is every reservable slot: a ceiling it
+/// reserves nothing of (A-342), as a kiln agent volume's quarter of the machine's memory is. Being dynamic, it reserves
+/// no bytes either.
 const SLAB_FILLER_MAX: u64 = 2 * SLAB_RESERVE;
-/// Shape: a probe's dynamic maximum: one byte, one slot, no bytes reserved.
+/// Shape: a bounded claim of a quarter of the arena: about a quarter of the slab reserved whole, the rest left
+/// unpromised, and its bytes well inside what the capped arena admits.
+const CLAIM_LIMIT: u64 = SLAB_RESERVE / 4;
+/// Shape: a probe's maximum (or a claim shrunk to it): one byte, one slot.
 const PROBE_MAX: u64 = 1;
 
 /// A test daemon whose inode-version slab is `max_inodes` slots, on a single shard so every volume
@@ -2120,37 +2124,107 @@ fn capped_daemon(name: &str, max_inodes: usize) -> (Daemon, String) {
   (daemon, instance)
 }
 
-/// The §4.2 inode-dimension *reservation*, through the real create and destroy verbs (no mount): a
-/// volume's inode allowance is reserved against the shard's version slab at create, so a second
-/// volume whose allowance the slab cannot also back is refused (`BudgetExceeded`) even though byte
-/// space plainly remains — the disjoint reservation the bare per-volume cap does not give — and the
-/// slab returns on destroy so a later volume is admitted again. Non-vacuous: the byte budget is far
-/// larger than these small quotas, so only the version reservation can refuse the second volume;
-/// without it, both would be created.
-fn version_reservation_scenario() {
-  let (daemon, instance) = capped_daemon("versions", SMALL_VERSION_SLAB);
-  let mut client = Client::connect(&instance);
-  let sized = |name: &str, max: u64| RequestBody::Create {
+fn sized(name: &str, size: SizeClass) -> RequestBody {
+  RequestBody::Create {
     name: name.to_owned(),
-    size: SizeClass::Dynamic { max },
+    size,
     names: NamePolicy::Exact,
     require_locked: false,
     base: None,
+  }
+}
+
+/// Acknowledges every completion `client` was answered so far, so the records it leaves unacknowledged stay a small
+/// window (the raw test client never acknowledges on its own).
+fn acknowledge(client: &mut Client) {
+  let up_to = client.sequence;
+  let ReplyBody::Acknowledged = client.call(&RequestBody::Acknowledge {
+    up_to,
+    owed: Vec::new(),
+  }) else {
+    panic!("acknowledge");
   };
-  // The first volume's inode allowance fills the version slab (less the one-slot copy-up headroom).
-  let first = client.call(&sized("first", SLAB_FILLER_MAX));
-  let ReplyBody::Created { id: first } = first else {
-    panic!("first create: {first:?}");
+}
+
+/// Makes empty files in `volume` until one is refused: how many were made, and the refusal. Empty files cost no bytes,
+/// so only the inode dimension refuses them. Every [`ACK_EVERY`] files the completions are acknowledged.
+fn fill_with_empty_files(client: &mut Client, volume: VolumeId) -> (u64, Refusal) {
+  let ReplyBody::Attached { attachment, .. } = client.call(&RequestBody::Attach {
+    volume,
+    snapshot: None,
+    intent: Intent::Write,
+    form: AttachRequest::Root,
+  }) else {
+    panic!("attach");
   };
+  let slab = u64::try_from(SMALL_VERSION_SLAB).unwrap();
+  let mut made = 0u64;
+  loop {
+    assert!(made <= slab, "more empty files than the slab has slots");
+    match client.call(&RequestBody::FsWrite {
+      volume,
+      attachment,
+      path: format!("f{made}"),
+      bytes: Vec::new(),
+      mode: 0o644,
+    }) {
+      ReplyBody::Refused { refusal } => {
+        acknowledge(client);
+        return (made, refusal);
+      }
+      _ => made += 1,
+    }
+    if made.is_multiple_of(u64::try_from(ACK_EVERY).unwrap()) {
+      acknowledge(client);
+    }
+  }
+}
+
+/// The slab with no slot left unpromised: a bounded claim of [`CLAIM_LIMIT`] reserved whole, and a dynamic volume grown
+/// into every other slot, a slot per empty file, until its next file is refused `NoSpace` (A-342). The claim and the
+/// dynamic volume.
+fn fill_the_slab(client: &mut Client) -> (VolumeId, VolumeId) {
+  let ReplyBody::Created { id: claim } =
+    client.call(&sized("claim", SizeClass::Bounded { limit: CLAIM_LIMIT }))
+  else {
+    panic!("the claim");
+  };
+  let ReplyBody::Created { id: grower } = client.call(&sized(
+    "grower",
+    SizeClass::Dynamic {
+      max: SLAB_FILLER_MAX,
+    },
+  )) else {
+    panic!("the dynamic volume");
+  };
+  let (made, refusal) = fill_with_empty_files(client, grower);
+  assert!(
+    made > 0 && matches!(refusal, Refusal::NoSpace),
+    "a dynamic volume grows into the unpromised slots, then ENOSPC: {made} files, {refusal:?}"
+  );
+  (claim, grower)
+}
+
+/// The §4.2 inode dimension through the real create, write and destroy verbs (no mount): a bounded
+/// claim's inode allowance is reserved against the shard's version slab at create, and a dynamic volume
+/// holds a slot for each inode it makes from what no claim was promised (A-342); with none left, a
+/// further volume is refused (`BudgetExceeded`) even though byte space and physical slots plainly
+/// remain — the disjoint reservation the bare per-volume cap does not give — and the slots return on
+/// destroy so a later volume is admitted again. Non-vacuous: the byte budget is far larger than these
+/// empty files and probes need, so only the version slab can refuse them.
+fn version_reservation_scenario() {
+  let (daemon, instance) = capped_daemon("versions", SMALL_VERSION_SLAB);
+  let mut client = Client::connect(&instance);
+  let (_claim, grower) = fill_the_slab(&mut client);
   // Many further creates cannot be backed by the slab, so admission refuses each — not for want of
   // bytes. Every one must refuse at the *reservation* (`BudgetExceeded`), never with `SlabFull`:
-  // that is the leak proof. The reservation is taken before `Volume::create`, so a refusal allocates
-  // no root inode, trie or dir. Were a partial volume leaked on each refusal instead, these probes
-  // would physically exhaust the trie slab within a handful of attempts and later refusals would
-  // become `SlabFull` (a `BadRequest`) — which this asserts never happens.
+  // that is the leak proof. The slot is taken before `Volume::create` returns a volume to publish, so
+  // a refusal leaks no root inode, trie or dir. Were a partial volume leaked on each refusal instead,
+  // these probes would physically exhaust the trie slab within a handful of attempts and later
+  // refusals would become `SlabFull` (a `BadRequest`) — which this asserts never happens.
   for probe in 0..LEAK_PROBES {
     let name = format!("probe-{probe}");
-    match client.call(&sized(&name, PROBE_MAX)) {
+    match client.call(&sized(&name, SizeClass::Dynamic { max: PROBE_MAX })) {
       ReplyBody::Refused {
         refusal: Refusal::BudgetExceeded { .. },
       } => {}
@@ -2159,9 +2233,9 @@ fn version_reservation_scenario() {
       }
     }
   }
-  // Destroy the first; its reserved slots return to the slab as the destroy completes in slices.
+  // Destroy the dynamic volume; its hold returns to the slab as the destroy completes in slices.
   assert!(matches!(
-    client.call(&RequestBody::Destroy { volume: first }),
+    client.call(&RequestBody::Destroy { volume: grower }),
     ReplyBody::Destroyed
   ));
   let started = Instant::now();
@@ -2169,7 +2243,7 @@ fn version_reservation_scenario() {
     let ReplyBody::Listed { volumes } = client.call(&RequestBody::List) else {
       panic!("list");
     };
-    if volumes.is_empty() {
+    if !volumes.iter().any(|v| v.id == grower) {
       break;
     }
     assert!(
@@ -2177,40 +2251,28 @@ fn version_reservation_scenario() {
       "destroy completes in slices: {volumes:?}"
     );
   }
-  // With the slab returned, a fresh volume is admitted again — the reservation is released on teardown.
+  // With the hold returned, a fresh volume is admitted again — the hold is released on teardown.
   assert!(
     matches!(
-      client.call(&sized("third", PROBE_MAX)),
+      client.call(&sized("third", SizeClass::Dynamic { max: PROBE_MAX })),
       ReplyBody::Created { .. }
     ),
-    "the slab freed by destroy backs a new volume's allowance"
+    "the slots freed by destroy back a new volume"
   );
   daemon.stop();
 }
 
-/// The inode reservation moves with the policy on resize (§4.2): a volume whose allowance fills the
-/// version slab, resized down, returns slots so another volume is admitted — proof the reservation
-/// tracks the resized allowance, not the create-time one. Non-vacuous: without the re-derivation the
-/// resized volume keeps its old (larger) reservation and the second volume stays refused.
+/// A bounded claim's inode reservation moves with its policy on resize (§4.2): with every slot the claim
+/// left held by a dynamic volume's inodes, a further volume is refused; the claim resized down returns
+/// slots, and the further volume is admitted — proof the reservation tracks the resized allowance, not
+/// the create-time one. Non-vacuous: without the re-derivation the claim keeps its old (larger)
+/// reservation and the further volume stays refused.
 fn version_reservation_moves_on_resize_scenario() {
   let (daemon, instance) = capped_daemon("resize-versions", SMALL_VERSION_SLAB);
   let mut client = Client::connect(&instance);
-  let sized = |name: &str, size: SizeClass| RequestBody::Create {
-    name: name.to_owned(),
-    size,
-    names: NamePolicy::Exact,
-    require_locked: false,
-    base: None,
-  };
   let tiny = SizeClass::Dynamic { max: PROBE_MAX };
-  // A big-maximum volume's allowance fills the version slab.
-  let filler_size = SizeClass::Dynamic {
-    max: SLAB_FILLER_MAX,
-  };
-  let ReplyBody::Created { id: filler } = client.call(&sized("filler", filler_size)) else {
-    panic!("filler create");
-  };
-  // A second volume, however small, cannot be backed while the filler holds the whole slab.
+  let (claim, _grower) = fill_the_slab(&mut client);
+  // A further volume, however small, cannot be backed while the claim and the grower hold the slab.
   assert!(
     matches!(
       client.call(&sized("tenant", tiny)),
@@ -2218,14 +2280,14 @@ fn version_reservation_moves_on_resize_scenario() {
         refusal: Refusal::BudgetExceeded { .. }
       }
     ),
-    "the version slab is full while the filler holds its whole allowance"
+    "the version slab is full while the claim holds its whole allowance"
   );
-  // Resize the filler down to a tiny quota: its inode allowance shrinks and returns slots.
+  // Resize the claim down to a tiny quota: its inode allowance shrinks and returns slots.
   assert!(
     matches!(
       client.call(&RequestBody::Resize {
-        volume: filler,
-        size: SizeClass::Dynamic { max: PROBE_MAX }
+        volume: claim,
+        size: SizeClass::Bounded { limit: PROBE_MAX }
       }),
       ReplyBody::Resized
     ),
@@ -2242,9 +2304,10 @@ fn version_reservation_moves_on_resize_scenario() {
   daemon.stop();
 }
 
-/// The shard's version-slab reservation is observable in the daemon status (§4.2 "statfs includes
+/// The shard's version-slab commitments are observable in the daemon status (§4.2 "statfs includes
 /// backed inode availability", at the shard level): the reported slab capacity is the configured
-/// one, and committed version slots move as a volume's inode allowance is reserved.
+/// one, and committed version slots move as a volume's are committed — a bounded claim's allowance,
+/// a dynamic volume's hold for its root (A-342).
 fn version_stats_scenario() {
   let (daemon, instance) = capped_daemon("version-stats", SMALL_VERSION_SLAB);
   let mut client = Client::connect(&instance);
@@ -2268,19 +2331,14 @@ fn version_stats_scenario() {
     "the reported version slab is the configured capacity"
   );
   assert_eq!(before, 0, "no volumes yet, nothing committed to the slab");
-  let ReplyBody::Created { .. } = client.call(&RequestBody::Create {
-    name: "vol".into(),
-    size: SizeClass::Dynamic { max: 1 << 20 },
-    names: NamePolicy::Exact,
-    require_locked: false,
-    base: None,
-  }) else {
+  let ReplyBody::Created { .. } = client.call(&sized("vol", SizeClass::Dynamic { max: 1 << 20 }))
+  else {
     panic!("create");
   };
   let (_, after) = stats(&mut client);
   assert!(
     after > before,
-    "a volume's inode allowance is committed against the version slab: {after}"
+    "a volume's slots are committed against the version slab: {after}"
   );
   daemon.stop();
 }

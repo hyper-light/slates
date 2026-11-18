@@ -512,6 +512,14 @@ pub enum Op {
     /// The work.
     work: VolumeId,
   },
+  /// A volume's trusted signers were set by its launcher (signed work, A-321): the whole set, replacing the last.
+  /// Appended (2026-11-17).
+  VolumeSignersSet {
+    /// The volume.
+    id: VolumeId,
+    /// The public keys, in SSH wire form, in the order set.
+    keys: Vec<Vec<u8>>,
+  },
   /// A green this node took over from its departed owner, recorded here by adopting this node's own holder ledger of it
   /// (§4.16 owner-loss recovery; A-333): the green's catalog record, and versions 0 to `version` as the merge records
   /// this node accepted as one of the green's holders and the inputs it holds for them, which it keeps while the green
@@ -610,6 +618,7 @@ impl Op {
       Op::CompletionAwaiting { .. } => "completion_awaiting",
       Op::VolumeWritePolicySet { .. } => "volume_write_policy_set",
       Op::ConsumerWritePolicySet { .. } => "consumer_write_policy_set",
+      Op::VolumeSignersSet { .. } => "volume_signers_set",
     }
   }
 }

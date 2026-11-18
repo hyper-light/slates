@@ -67,7 +67,6 @@ mod fuse_hold;
 mod own_nfs;
 // A writable direct map's copy that outlives its daemon: held by the anchor, taken back by the successor (A-197).
 mod checkout;
-pub mod grant_signature;
 // A green's takeover successor adopts its holder ledger rather than copying it (§4.16 owner-loss recovery, A-333).
 mod green_adopt;
 pub mod head;
@@ -125,6 +124,8 @@ mod recovery_slices;
 pub mod seal_keys;
 // A client's session key (GAP-A9-9's threat model): what a client resuming under its id proves before its seat is served.
 pub mod session_key;
+// Signed work (A-321): SSH signatures over a merge's or a landing's statement, verified as provenance, never a permission.
+pub mod signed_work;
 mod snapshot_view;
 // The Shards fs transport (§4.6, the Shards route; A-161): a volume served to a Shards microVM over an anonymous
 // stream, on the volume's owning shard: a socket pair on Unix, a duplex named pipe on Windows served by the runtime's
