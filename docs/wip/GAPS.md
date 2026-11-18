@@ -1099,12 +1099,11 @@
 >     load ~52) and 1.384 s (a diagnostic run on a Mac, load 28 to 47). That run's timeline: the link redialed 89 ms
 >     after the drop, its handshake took 665 ms (its cause not measured apart), the lane's first turn on the replacement
 >     came at 853 ms with 8,031 forwards queued, a sent its first reply at 896 ms, and b's lane took it at 1,384 ms
->     while the burst's resends cycled through b's control shard (37,000 to 62,000 batches given up a run); the
->     judgment and the redial were not the cost. The
->     test now keeps b's lane borrowing the session with four readers, a read each in flight, discovery held: green 5 of
->     5 (dropped 2,002 to 2,644 ms into the silence against its 1,998 ms window, answered on the replacement 21 to 112 ms
->     later) and red 5 of 5 with the return's judgment removed, on a Mac at load 33 to 56 beside 8 spinners. The burst
->     went to A-306's test, below.
+>     while the burst's resends cycled through b's control shard (61,824 batches given up that run, 20,349 to 47,925
+>     in the 12 others read); the judgment and the redial were not the cost. The test now keeps b's lane borrowing the
+>     session with four readers, a read each in flight, discovery held: green 5 of 5 (dropped 2,002 to 2,644 ms into the
+>     silence against its 1,998 ms window, answered on the replacement 21 to 112 ms later) and red 5 of 5 with the
+>     return's judgment removed, on a Mac at load 33 to 56 beside 8 spinners. The burst went to A-306's test, below.
 >   - **Finding (b), fixed (2026-11-18, A-306): a resend keeps its place in the lane.** A read through b during the dead
 >     session missed its failover bound behind the burst's resends: each resend took fresh tickets at the back of the
 >     lane and was given up again before it was begun. With the probe read sent just after the burst's first round,
