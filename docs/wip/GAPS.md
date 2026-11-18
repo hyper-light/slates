@@ -242,6 +242,19 @@
 >   writes (AC-8.16's other half); a move carrying snapshots other than the head; a multi-runner test with injected
 >   faults. The capture's own owed parts: admission reserving its cost ahead, a large file read across slices rather
 >   than whole in one, and the report of bytes read and retained and of the elapsed cost (§4.15's status).
+> - **Open, blocks this entry's landing (found 2026-11-18 by `a_move_whose_target_dies_at_the_switch_is_served_by_its_successor`,
+>   red 3 of 3 after main ef7f0915a was merged, green before on c73211b0f):** the target dies at the switch and the old
+>   owner a is its takeover's successor. a's control shard saw the switched move's exception gone (the takeover hands
+>   the object back to its creator) and released its frozen copy (`fleet.move.released` 1, `fleet.move.superseded` 0)
+>   before the takeover registered the object pending (the `adopted_back` guard in `moves::drive_outgoing` reads
+>   `pending_materializations`, which races the round); the materialization then held no content and fetched only
+>   from the head's recorded holder, the dead target (`fleet.fetch.no_holder_session` 100), until it was given up
+>   (`fleet.materialize.given_up` 1): every verb answers `NotRecovered { TakeoverIncomplete { waited_on: "content" } }`.
+>   Owed, in this order: a switched move whose exception is gone while its target left the membership is a hand-back,
+>   so the old owner waits (never releases) for its takeover; that takeover reuses the frozen copy when the adopted
+>   head names the frozen head's manifest (a thaw, no fetch) and supersedes it only for a newer head; and the old
+>   owner's frozen content is served by identity (or the move places f + 1 copies besides the old owner's), so a
+>   successor other than the old owner recovers when the target was the only other holder.
 > - **Owed before kiln's workspaces switch (found 2026-11-18 reading `crates/land/src/verdict.rs`, not yet by a
 >   test):** a clone of a captured base lands as a scratch volume does. Its record names no base and its files hold no
 >   witness (a capture makes each body the volume's own, and the witness lived in the base body), so every entry of
