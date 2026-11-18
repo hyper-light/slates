@@ -5171,6 +5171,18 @@ async fn successor_lineage_of(
   handed
 }
 
+/// What a takeover's loss report says of its tolerance (A-332): the shortfall the round adopted the volume's head at
+/// (`registers`) and the one phase one adopted its live log at (`live_log`), `None` when both were within tolerance.
+fn past_tolerance_of(
+  registers: Option<slates_db::catalog::RecoveryShortfall>,
+  live_log: Option<slates_db::catalog::RecoveryShortfall>,
+) -> Option<slates_db::catalog::TakeoverPastTolerance> {
+  (registers.is_some() || live_log.is_some()).then_some(slates_db::catalog::TakeoverPastTolerance {
+    registers,
+    live_log,
+  })
+}
+
 /// Materializes one taken-over volume from the content this node holds for its head (see
 /// [`materialize_pending`]) **on the shard the volume's id routes to** — the partition its id names is
 /// where every verb for it will run (`verbs::owner_of`), so that is where it must live. The archive and
@@ -5297,6 +5309,17 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
   } else {
     (archive, successor_lineage)
   };
+  // Whether the round adopted the head, or phase one the log, past tolerance (A-309), for the loss report (A-332).
+  let registers_short = state::with_state(|s| {
+    s.pending_materializations
+      .get(&object)
+      .and_then(|pending| pending.registers_short)
+  })
+  .flatten();
+  let past_tolerance = past_tolerance_of(
+    registers_short,
+    live.as_ref().and_then(|fetched| fetched.past_tolerance),
+  );
   let served = call_within(
     origin,
     target,
@@ -5312,6 +5335,7 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) -> Result<(
           epoch: placed.epoch.0,
           head_sequence: sequence,
           from_live_log: live.is_some(),
+          past_tolerance,
         },
       };
       // The volume's lineage key, so this node seals under the same key the dead owner did (A-92 pieces 3b and 4c); an

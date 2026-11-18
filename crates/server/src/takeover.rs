@@ -221,6 +221,10 @@ pub struct HostTakeover {
   /// for ([`give_up_unpromised`]). Never adopted or learned again in this round, and the share is not confirmed while
   /// any is here, so their holders keep their copies (A-272's rule). Bounded by the retired host's objects.
   given_up: BTreeSet<ObjectId>,
+  /// Per learned object judged ready past tolerance ([`ready_objects`]), the first of its cohorts short of the recovery
+  /// quorum: its adoption records it with a volume's head, whose loss report names it once served (A-332). Bounded by
+  /// `learned`: an entry leaves with its object.
+  past_tolerance: BTreeMap<ObjectId, slates_db::catalog::RecoveryShortfall>,
 }
 
 /// One learned object's wait for its recovery cohorts' promises (§4.8 phase one), as the round's bound counts it: the
@@ -276,6 +280,7 @@ impl HostTakeover {
       page_advances: 0,
       waits: BTreeMap::new(),
       given_up: BTreeSet::new(),
+      past_tolerance: BTreeMap::new(),
     }
   }
 
@@ -292,6 +297,7 @@ impl HostTakeover {
     self.named_nothing.clear();
     self.waits.clear();
     self.given_up.clear();
+    self.past_tolerance.clear();
   }
 
   /// Whether `object` is settled in this round, so no answer makes it learned again: adopted, or given up on.
@@ -1224,11 +1230,17 @@ pub(crate) fn ready_objects(
           ready.push((*object, newest));
         }
       }
-      Readiness::ReadyPastTolerance { .. } => {
-        // Every surviving member of its cohorts has promised (A-309): adopted as a ready one is, counted.
+      Readiness::ReadyPastTolerance {
+        needed, members, ..
+      } => {
+        // Every surviving member of its cohorts has promised (A-309): adopted as a ready one is, counted, and the cohort
+        // it fell short in kept for the volume's loss report (A-332).
         take.waits.remove(object);
         if let Some(newest) = reports.values().cloned().reduce(newest_of) {
           past_tolerance = past_tolerance.saturating_add(1);
+          take
+            .past_tolerance
+            .insert(*object, shortfall(needed, members));
           ready.push((*object, newest));
         }
       }
@@ -1261,10 +1273,22 @@ pub(crate) fn ready_objects(
   take
     .waits
     .retain(|object, _| take.learned.contains_key(object));
+  take
+    .past_tolerance
+    .retain(|object, _| take.learned.contains_key(object));
   if past_tolerance > 0 {
     state.count(TAKEOVER_RECOVERED_PAST_TOLERANCE, past_tolerance);
   }
   ready
+}
+
+/// The shortfall a readiness past tolerance judged (A-332): a cohort's recovery quorum `needed` and the `members` of it
+/// left, as the loss report counts them.
+fn shortfall(needed: usize, members: usize) -> slates_db::catalog::RecoveryShortfall {
+  slates_db::catalog::RecoveryShortfall {
+    needed: u64::try_from(needed).unwrap_or(u64::MAX),
+    remaining: u64::try_from(members).unwrap_or(u64::MAX),
+  }
 }
 
 /// The members that promised one learned object: those that listed it, with the highest record each holds, and those
@@ -1731,7 +1755,9 @@ fn record_adoption(
   // The members other than this node that reported the adopted position: a green's successor fetches any input it
   // lacks from them (`fleet::fetch_green_inputs`), since each accepted that version holding its inputs.
   let mut reported_adopted = Vec::new();
+  let mut registers_short = None;
   if let Some(take) = state.host_takeovers.get_mut(&departed) {
+    registers_short = take.past_tolerance.remove(&object);
     if let Some(reports) = take.learned.remove(&object) {
       reported_adopted = reports
         .into_iter()
@@ -1779,10 +1805,9 @@ fn record_adoption(
       .collect();
     cohort_hosts.sort_unstable_by_key(|host| host.0);
     cohort_hosts.dedup();
-    state.pending_materializations.insert(
-      object,
-      crate::state::PendingVolume::adopted(head, Some(departed), cohort_hosts),
-    );
+    let mut pending = crate::state::PendingVolume::adopted(head, Some(departed), cohort_hosts);
+    pending.registers_short = registers_short;
+    state.pending_materializations.insert(object, pending);
   } else {
     match crate::merge_service::MergeRecordValue::decode_record(&record.value) {
       // A green: its newest merge record was adopted; the owned green is rebuilt from this node's accepted chain

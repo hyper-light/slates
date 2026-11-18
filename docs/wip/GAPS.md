@@ -1409,6 +1409,13 @@
 >   surviving recorded holder and every surviving member of the retired owner's cohorts for the volume, and adopts the
 >   greatest head (`fleet.live.taken_over_past_tolerance`). Owed: the supervisor's store-destroyed flow
 >   (`crates/cli/tests/live_chaos.rs`) on merged main, both Linux arches, for the end-to-end evidence.
+> - **Fixed (A-332, g250, 2026-11-18): a takeover past tolerance shows in the volume's status.** Its loss report's
+>   `taken_over.past_tolerance` names the shortfall of the head register's cohort and of the live log's recorded holders
+>   (the hosts recovery needed, how many remained), kept in the volume's takeover record (`CONTRACT` 21); `slates status`
+>   prints `taken_over_past_tolerance`. Test: `a_takeover_past_its_tolerance_shows_in_the_volumes_loss_report`
+>   (`crates/server/src/verbs.rs`); the AC-8.3 fleet test holds it `None` within tolerance, and the store-destroyed flow
+>   holds the report to the successor's own counts (the supervisor's run). Still Ada's (Decisions): whether a volume
+>   recovered past tolerance also refuses writes until an operator acknowledges it.
 > - **Open (A-309): a holder the round never asked keeps its copy** (`fleet.takeover.kept_unasked`). A neighbourhood an
 >   owner settled away from keeps the owner's copies; before A-309 they went when the owner's takeover settled, safe
 >   only within tolerance. Owed: such a holder lets them go at the settle, on the owner's report that every record it
@@ -2679,7 +2686,14 @@
 > **`LIVENESS_BUDGET_NS` is still a fixed second (R3 debt, 2026-11-06; follow-on, not A-228).** It is A-228's window and
 > the reply-deadline unit of about 60 files (the client's and the server's deadlines, observations, the scatter's room
 > wait). A-228 judges the window in each shard's own CPU time, which keeps a starved daemon alive, but the window's length
-> is still the `Shape:` constant "a second", not measured.
+> is still the `Shape:` constant "a second", not measured. **Derived since 2026-11-18 (A-359, goal g255):** `W` is the
+> ratified recovery budget `T` by rent or buy (a verdict waits as long as the recovery it starts costs), the heartbeat
+> `W / ELECTION_MARGIN`, the same values; the machine's wake p99 at boot is its floor, and the boot log names both and
+> says when the floor passes the window. Owed, in order: `W` held at runtime so a daemon runs at its floor where that
+> is past `W` (every use is listed by class in A-359); the failover SLO derived as the membership horizon plus the
+> council's confirmation window plus `T` (2.9 s today) once each consumer that takes it as a lease term (a landing's
+> target lease, a CLI attachment's term, the NFSv4 and delegation leases, the restart cap) has its own term; and the
+> class C claim wait below.
 >
 > - **Class A, a cross-shard wait judged in its target's own time (2026-11-06, in progress).** A verb's wait for
 >   another shard's answer gave up at the wall second while the target was alive and starved, and the work went on to

@@ -11142,7 +11142,22 @@ fn loss_report(
         epoch: taken.epoch,
         from_live_log: taken.from_live_log,
         head_sequence: taken.head_sequence,
+        past_tolerance: taken.past_tolerance.map(wire_past_tolerance),
       }),
+  }
+}
+
+/// A takeover's record of going past the volume's tolerance (A-309, A-332), as the loss report carries it.
+fn wire_past_tolerance(
+  past: slates_db::catalog::TakeoverPastTolerance,
+) -> slates_ipc::protocol::PastTolerance {
+  let shortfall = |short: slates_db::catalog::RecoveryShortfall| slates_ipc::protocol::Shortfall {
+    needed: short.needed,
+    remaining: short.remaining,
+  };
+  slates_ipc::protocol::PastTolerance {
+    registers: past.registers.map(shortfall),
+    live_log: past.live_log.map(shortfall),
   }
 }
 
@@ -16514,6 +16529,17 @@ mod tests {
     catalog: &crate::catalog::CatalogValue,
     archive: &slates_archive::Archive,
   ) -> Result<(), Box<super::ReplyBody>> {
+    take_over_past(state, id, catalog, archive, None)
+  }
+
+  /// [`take_over`] recording `past_tolerance` as the takeover's (A-332): `None` within tolerance.
+  fn take_over_past(
+    state: &mut crate::state::ShardState,
+    id: slates_db::catalog::VolumeId,
+    catalog: &crate::catalog::CatalogValue,
+    archive: &slates_archive::Archive,
+    past_tolerance: Option<slates_db::catalog::TakeoverPastTolerance>,
+  ) -> Result<(), Box<super::ReplyBody>> {
     let head = crate::head::HeadValue {
       manifest: None,
       content_holders: Vec::new(),
@@ -16528,9 +16554,84 @@ mod tests {
         epoch: 1,
         head_sequence: 1,
         from_live_log: false,
+        past_tolerance,
       },
     };
     super::materialize_taken_over(state, id, &taken, Vec::new(), Some(archive))
+  }
+
+  /// A-332 (A-309, AC-8.3; §4.10 "Auto-seal"): a takeover past the volume's tolerance shows in the volume's loss report.
+  /// Do: take over one volume recorded past tolerance (its head register adopted from one member of a cohort whose
+  /// recovery quorum is two, its live log within tolerance) and another within tolerance, then ask each one's status as
+  /// its owner. Expect the first's loss report to name the takeover and that shortfall, registers short and the live log
+  /// not, and the second's to name its takeover with no shortfall. Before, the report could not tell a takeover that
+  /// lost acknowledged writes to the lost hosts from one that kept every one.
+  #[test]
+  fn a_takeover_past_its_tolerance_shows_in_the_volumes_loss_report() {
+    crate::daemon::audit_on_shard(|state| {
+      let data = slates_archive::Archive::raw_chunk(b"DATA".to_vec());
+      let archive = takeover_archive(
+        vec![slates_archive::Extent {
+          offset: 0,
+          len: 4,
+          chunk: data.identity,
+          chunk_offset: 0,
+        }],
+        vec![data.clone()],
+      );
+      // Shape: the store-destroyed takeover's cohort at `f = 1`, a recovery quorum of two with one member left.
+      let short = slates_db::catalog::RecoveryShortfall {
+        needed: 2,
+        remaining: 1,
+      };
+      let past = slates_db::catalog::VolumeId { bytes: [0x71; 16] };
+      take_over_past(
+        state,
+        past,
+        &takeover_catalog("past-tolerance", 1 << 20),
+        &archive,
+        Some(slates_db::catalog::TakeoverPastTolerance {
+          registers: Some(short),
+          live_log: None,
+        }),
+      )
+      .unwrap();
+      let within = slates_db::catalog::VolumeId { bytes: [0x72; 16] };
+      take_over(
+        state,
+        within,
+        &takeover_catalog("within-tolerance", 1 << 20),
+        &archive,
+      )
+      .unwrap();
+      let owner = Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 501,
+      };
+      let taken = |state: &mut crate::state::ShardState, id: slates_db::catalog::VolumeId| {
+        match super::status(state, &owner, VolumeId { bytes: id.bytes }) {
+          ReplyBody::Status { report } => report.loss.taken_over,
+          other => panic!("the volume's status was answered: {other:?}"),
+        }
+      };
+      let past_taken = taken(state, past).expect("the takeover past tolerance is reported");
+      assert_eq!(
+        past_taken.past_tolerance,
+        Some(slates_ipc::protocol::PastTolerance {
+          registers: Some(slates_ipc::protocol::Shortfall {
+            needed: 2,
+            remaining: 1
+          }),
+          live_log: None,
+        }),
+        "its registers recovered from one member of a cohort that needed two: {past_taken:?}"
+      );
+      let within_taken = taken(state, within).expect("the takeover within tolerance is reported");
+      assert_eq!(
+        within_taken.past_tolerance, None,
+        "a takeover within tolerance names no shortfall: {within_taken:?}"
+      );
+    });
   }
 
   /// AUD-29-17: do: take over a volume whose catalog carries a consumer's grant, and one whose catalog
