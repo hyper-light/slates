@@ -26758,9 +26758,10 @@ Applied in the same change to:
     `set_consumer_policy_everywhere`, `consumer_policy_on_channel`, `revoke_everywhere`, `attest_on_channel`,
     `clone_named_elsewhere`; `nfs.rs` `serve_remote`, `gather_entries`, `call_owner`; `direct_map.rs` `hand_off`;
     `delegation.rs` `send_recalls`; `remote_attach.rs` `serve_unforwardable`; `work_route.rs` `answer_on_green_shard`.
-    `~` on the wall still: the recovery's cross-shard passes (`daemon.rs` `rebuild_remote_works`,
-    `drop_pending_creations`, `reconcile_work_floors`, `reconcile_name_aliases`, `retained_client_ids`) and the image's
-    alias steps (`image.rs` `reserve`, `settle`), each `xshard::call_within` one window.
+    Since A-403 the recovery's cross-shard passes (`daemon.rs` `rebuild_remote_works`, `drop_pending_creations`,
+    `reconcile_work_floors`, `reconcile_name_aliases`; `retained_client_ids` judged its target's progress already) and the
+    image's alias steps (`image.rs` `reserve`, `settle`) wait in their target's own time too (`xshard::call_in_shard_time`),
+    where each was `xshard::call_within` one window on the wall.
   - Class B, a wait on another host: the forward lane (`verbs::forward_once`'s stall budget base, judged in the lane's
     own time, A-315; `forward_lane.rs` `REPLACEMENT_ANSWER_PERIODS`, `path_floor_ns`, `FailoverBound::from_now`'s
     fallback, A-352); `fleet.rs` `return_sessions` (the transport's silence floor) and `live_budget` (A-200's
@@ -28837,3 +28838,25 @@ Applied in the same change to:
   save and a restore, and the write log's unit tests. The guard removed alone fails it (the counter 0). Measured on a
   Mac Studio (r286), three interleaved passes: a `FLUSH` after a logged page write took 17.5–20.0 µs p50 before and
   15.7–16.0 µs after, and every one of 1,000 published nothing (BENCHMARKS, this date).
+
+### A-403 — The recovery's cross-shard passes and the image's alias steps wait in their target's own time: the liveness window's floor for them is the target's measured progress, never a boot snapshot (2026-11-18, built for goal g255; item 1's "W's floor from the running wake estimate"; A-65, A-228, A-359)
+
+- **What was there.** A-359's class A list kept seven call families on the wall: the daemon's recovery passes over the
+  other shards (`rebuild_remote_works` 4 calls, `drop_pending_creations`, `reconcile_work_floors` 3,
+  `reconcile_name_aliases` 3) and the image's alias steps (`image.rs` `reserve`, `settle`), each `xshard::call_within` one
+  liveness window of wall time. They run while every shard is busy with its own recovery, so a target alive and working
+  on its CPU could outlast one wall window and its pass was skipped: the very case A-228 rules a target starved, not
+  stuck. A-359 measured the machine's floor once at boot (the wake probe's p99), which Ada's rule of 2026-11-18 rules out:
+  a value computed once at boot is still a constant.
+- **The rule.** Each waits by `xshard::call_in_shard_time` (A-65's rule, `xshard::within_shard_time`), as the class A
+  verbs have since 2026-11-06: a wait goes on while its target makes progress on its CPU, and gives up only when the target
+  made none for a window or ran its budget, judged in the target's own CPU time. The floor of each wait is then the
+  target's own measured progress, live, never a number. The room probe (`free_room_of`, a heartbeat's bound on a
+  question it can ask again next pass) is not a liveness wait and stays.
+- **Owed.** The boot log's floor line (`config::liveness_window(wake.p99_ns)`) is kept as the A/B record; the running
+  overrun each shard mirrors in its pulse (`Pulse::scheduler_overrun_ns`) is the live floor a published window would
+  follow. A failing test of a recovery pass beside a target kept busy past a window is filed for main (the recovery and
+  cross-shard suites).
+
+Applied in the same change to: the design's A-359 class A list, GAPS (the `LIVENESS_BUDGET_NS` entry),
+`crates/server/src/{daemon,image}.rs`.

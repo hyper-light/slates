@@ -5657,7 +5657,7 @@ async fn recover_works_across_partitions(origin: u16, shards: &[ShardId]) {
 /// `NotFound`, as a work whose log would not replay does.
 async fn rebuild_remote_works(origin: u16, shards: &[ShardId]) {
   for shard in shards.iter().copied() {
-    let Some(unbuilt) = crate::xshard::call_within(
+    let Some(unbuilt) = crate::xshard::call_in_shard_time(
       origin,
       shard.0,
       |s| std::mem::take(&mut s.work_home.unbuilt),
@@ -5669,7 +5669,7 @@ async fn rebuild_remote_works(origin: u16, shards: &[ShardId]) {
     };
     for work in unbuilt {
       let id = work.work;
-      let Some(entries) = crate::xshard::call_within(
+      let Some(entries) = crate::xshard::call_in_shard_time(
         origin,
         shard.0,
         move |s| s.db.partition().work_log(id).to_vec(),
@@ -5684,7 +5684,7 @@ async fn rebuild_remote_works(origin: u16, shards: &[ShardId]) {
         continue;
       };
       let (green, created_at) = (work.green, work.created_at);
-      let Some(replayed) = crate::xshard::call_within(
+      let Some(replayed) = crate::xshard::call_in_shard_time(
         origin,
         owner.0,
         move |s| crate::verbs::owner_replay(s, green, created_at, &entries),
@@ -5694,7 +5694,7 @@ async fn rebuild_remote_works(origin: u16, shards: &[ShardId]) {
       else {
         continue;
       };
-      let _ = crate::xshard::call_within(
+      let _ = crate::xshard::call_in_shard_time(
         origin,
         shard.0,
         move |s| crate::verbs::install_replayed_work(s, &work, replayed),
@@ -5710,7 +5710,7 @@ async fn rebuild_remote_works(origin: u16, shards: &[ShardId]) {
 /// after, its work never having been made.
 async fn drop_pending_creations(origin: u16, shards: &[ShardId]) {
   for shard in shards.iter().copied() {
-    let _ = crate::xshard::call_within(
+    let _ = crate::xshard::call_in_shard_time(
       origin,
       shard.0,
       |s| {
@@ -5740,7 +5740,7 @@ async fn drop_pending_creations(origin: u16, shards: &[ShardId]) {
 async fn reconcile_work_floors(origin: u16, shards: &[ShardId]) -> usize {
   let mut reconciled = 0usize;
   for shard in shards.iter().copied() {
-    let Some(floors) = crate::xshard::call_within(
+    let Some(floors) = crate::xshard::call_in_shard_time(
       origin,
       shard.0,
       |s| s.db.partition().work_floors().collect::<Vec<_>>(),
@@ -5756,7 +5756,7 @@ async fn reconcile_work_floors(origin: u16, shards: &[ShardId]) -> usize {
         continue;
       };
       let work = floor.work;
-      let Some((exists, holds)) = crate::xshard::call_within(
+      let Some((exists, holds)) = crate::xshard::call_in_shard_time(
         origin,
         home.0,
         move |s| {
@@ -5779,7 +5779,7 @@ async fn reconcile_work_floors(origin: u16, shards: &[ShardId]) -> usize {
       };
       if let Some(base) = change {
         let (green, work) = (floor.green, floor.work);
-        let moved = crate::xshard::call_within(
+        let moved = crate::xshard::call_in_shard_time(
           origin,
           shard.0,
           move |s| crate::verbs::owner_floor(s, green, work, base),
@@ -5802,7 +5802,7 @@ async fn reconcile_work_floors(origin: u16, shards: &[ShardId]) -> usize {
 async fn reconcile_name_aliases(origin: u16, shards: &[ShardId]) -> usize {
   let mut reconciled = 0usize;
   for shard in shards {
-    let Some(aliases) = crate::xshard::call_within(
+    let Some(aliases) = crate::xshard::call_in_shard_time(
       origin,
       shard.0,
       |s| s.db.partition().name_aliases().cloned().collect::<Vec<_>>(),
@@ -5819,7 +5819,7 @@ async fn reconcile_name_aliases(origin: u16, shards: &[ShardId]) -> usize {
       let id = alias.volume;
       let volume = match shards.get(usize::from(partition)) {
         Some(owner) => {
-          let Some(volume) = crate::xshard::call_within(
+          let Some(volume) = crate::xshard::call_in_shard_time(
             origin,
             owner.0,
             move |s| s.db.partition().volume(id).cloned(),
@@ -5843,7 +5843,7 @@ async fn reconcile_name_aliases(origin: u16, shards: &[ShardId]) -> usize {
           slates_db::Op::NameAliasReleased { name: alias.name }
         }
       };
-      let settled = crate::xshard::call_within(
+      let settled = crate::xshard::call_in_shard_time(
         origin,
         shard.0,
         move |s| crate::verbs::alias_step(s, &op).is_ok(),
