@@ -18,6 +18,12 @@
 //! covers, so a holder cannot make a reader take an envelope for a plain archive or the reverse. Wrapping is
 //! deterministic: the sealed manifest carries the archive's header with its creation time zeroed (informational, and
 //! never part of the manifest identity), so a snapshot sealed again — the healer's re-offer — is the same envelope.
+//!
+//! A wrap is made a slice at a time ([`Wrapping`], A-323): the owner shard seals a seal's archive in turns of its step
+//! quantum, so no turn seals more than one chunk past its share, whatever the volume's size. Until 2026-11-18 the whole
+//! archive was wrapped in one turn: 98 ms for 64 MiB of 64 KiB chunks (`envelope_bench`, 2026-10-05), so at about a GiB
+//! one turn ran past the daemon's watchdog window of a second, and a volume that large crash-looped its owner at every
+//! seal. [`wrap`] is one whole advance and makes the very same envelope.
 
 use hyper_seal::keys::WrappingKey;
 use hyper_seal::name::{NAME, Namer};
@@ -60,6 +66,8 @@ pub enum EnvelopeError {
   Malformed,
   /// A sealed chunk is larger than an archive's chunk can be.
   TooLarge,
+  /// The wrap already ended: it made its envelope, or a refusal ended it ([`Wrapping::advance`]).
+  Spent,
 }
 
 impl From<SealedError> for EnvelopeError {
@@ -69,69 +77,165 @@ impl From<SealedError> for EnvelopeError {
 }
 
 /// Wraps `archive` in an envelope (the module doc): every chunk sealed under `lineage` in segments of `segment`
-/// plaintext bytes and named under `namer`, and the archive without its chunks sealed as one more.
+/// plaintext bytes and named under `namer`, and the archive without its chunks sealed as one more. One whole advance of
+/// a [`Wrapping`], so a wrap made in slices is this very envelope.
 pub fn wrap(
   archive: &Archive,
   lineage: &WrappingKey,
   namer: &Namer,
   segment: u32,
 ) -> Result<Archive, EnvelopeError> {
-  let mut sealing = Sealing {
-    entries: Vec::with_capacity(archive.chunks.len().saturating_add(1)),
-    chunks: Vec::with_capacity(archive.chunks.len().saturating_add(1)),
-    stored: std::collections::BTreeSet::new(),
-    largest: 0,
-  };
-  // A chunk's keyed name depends on its identity alone, so a repeat is skipped before it is sealed.
-  let mut named = std::collections::BTreeSet::new();
-  for chunk in &archive.chunks {
-    let keyed = namer
-      .name(&chunk.identity)
-      .map_err(|e| EnvelopeError::Sealed(SealedError::Seal(e)))?;
-    if !named.insert(keyed) {
-      continue;
+  let mut wrapping = Wrapping::new(archive.clone(), segment);
+  // Each advance seals at least one chunk or the manifest, so the loop ends: at once with the whole budget.
+  loop {
+    if let Some(envelope) = wrapping.advance(lineage, namer, u64::MAX)? {
+      return Ok(envelope);
     }
-    let sealed = seal_chunk(lineage, namer, chunk, segment)?;
-    let name = entry_name(CHUNK_PREFIX, &sealed.name);
-    sealing.push(sealed, name)?;
   }
-  let without_chunks = Archive {
-    chunks: Vec::new(),
-    created_unix: 0,
-    ..archive.clone()
-  };
-  let manifest = seal_chunk(
-    lineage,
-    namer,
-    &Archive::raw_chunk(without_chunks.encode()),
-    segment,
-  )?;
-  let name = entry_name(MANIFEST_PREFIX, &manifest.name);
-  sealing.push(manifest, name)?;
-  let Sealing {
-    mut entries,
-    chunks,
-    largest,
-    ..
-  } = sealing;
-  entries.sort_by(|a, b| a.name.cmp(&b.name));
-  let largest = u32::try_from(largest).map_err(|_| EnvelopeError::TooLarge)?;
-  Ok(Archive {
-    base_page_size: archive.base_page_size,
-    chunk_min: archive.chunk_min.min(largest),
-    chunk_max: largest.max(archive.chunk_max),
-    created_unix: 0,
-    volume_id: archive.volume_id,
-    snapshot_id: archive.snapshot_id,
-    name_policy_id: 0,
-    unicode_version: 0,
-    root_meta: NodeMeta {
-      ino: ENVELOPE_ROOT_INO,
-      ..NodeMeta::default()
-    },
-    manifest: Node::Directory(entries),
-    chunks,
-  })
+}
+
+/// An envelope made a slice at a time (A-323; the module doc): the archive's chunks sealed in the order it lists them,
+/// at least a byte budget's worth a slice ([`Wrapping::advance`]), a chunk whose keyed name is already sealed skipped,
+/// then the archive without its chunks sealed last as the manifest. The order and every sealed byte are [`wrap`]'s, so
+/// the envelope is the same however the slices fall. A refusal ends the wrap ([`EnvelopeError::Spent`] after it): its
+/// maker starts again from the archive.
+pub struct Wrapping {
+  /// The archive being wrapped: its chunks are read in order and let go at the end, when the rest of it is sealed.
+  archive: Archive,
+  /// The index in the archive's chunk list of the next chunk to seal.
+  next: usize,
+  /// The keyed names already sealed: a chunk's keyed name depends on its identity alone, so a repeat is skipped before
+  /// it is sealed.
+  named: std::collections::BTreeSet<[u8; NAME]>,
+  /// The envelope's entries and chunks so far.
+  sealing: Sealing,
+  /// The plaintext bytes each sealed segment carries.
+  segment: u32,
+  /// Whether the wrap has ended: its envelope made, or a refusal met.
+  spent: bool,
+}
+
+impl Wrapping {
+  /// Begins wrapping `archive` in segments of `segment` plaintext bytes; nothing is sealed until the first
+  /// [`Self::advance`].
+  pub fn new(archive: Archive, segment: u32) -> Wrapping {
+    let capacity = archive.chunks.len().saturating_add(1);
+    Wrapping {
+      archive,
+      next: 0,
+      named: std::collections::BTreeSet::new(),
+      sealing: Sealing {
+        entries: Vec::with_capacity(capacity),
+        chunks: Vec::with_capacity(capacity),
+        stored: std::collections::BTreeSet::new(),
+        largest: 0,
+      },
+      segment,
+      spent: false,
+    }
+  }
+
+  /// The archive's chunks not yet sealed or skipped: what the wrap has left before its manifest.
+  pub fn chunks_left(&self) -> usize {
+    self.archive.chunks.len().saturating_sub(self.next)
+  }
+
+  /// Seals the archive's next chunks under `lineage`, each named under `namer`, until this call has sealed at least
+  /// `byte_budget` of their stored bytes (one chunk at least, so a wrap always moves on); once no chunk is left, the
+  /// archive without its chunks as the manifest, and the envelope is returned. `None` while chunks remain. Every call
+  /// passes the keys the first did. A refusal ends the wrap, and every call after an end is refused
+  /// [`EnvelopeError::Spent`].
+  pub fn advance(
+    &mut self,
+    lineage: &WrappingKey,
+    namer: &Namer,
+    byte_budget: u64,
+  ) -> Result<Option<Archive>, EnvelopeError> {
+    if self.spent {
+      return Err(EnvelopeError::Spent);
+    }
+    let advanced = self.seal_chunks(lineage, namer, byte_budget);
+    let made = match advanced {
+      Ok(true) => self.finish(lineage, namer).map(Some),
+      Ok(false) => return Ok(None),
+      Err(error) => Err(error),
+    };
+    self.spent = true;
+    made
+  }
+
+  /// Seals the next chunks until `byte_budget` of their stored bytes are sealed, one at least: whether none is left.
+  fn seal_chunks(
+    &mut self,
+    lineage: &WrappingKey,
+    namer: &Namer,
+    byte_budget: u64,
+  ) -> Result<bool, EnvelopeError> {
+    let mut sealed_bytes: u64 = 0;
+    let mut sealed_one = false;
+    while let Some(chunk) = self.archive.chunks.get(self.next) {
+      if sealed_one && sealed_bytes >= byte_budget {
+        return Ok(false);
+      }
+      let keyed = namer
+        .name(&chunk.identity)
+        .map_err(|e| EnvelopeError::Sealed(SealedError::Seal(e)))?;
+      if self.named.insert(keyed) {
+        let sealed = seal_chunk(lineage, namer, chunk, self.segment)?;
+        let len = u64::try_from(chunk.payload.len()).map_err(|_| EnvelopeError::TooLarge)?;
+        sealed_bytes = sealed_bytes.saturating_add(len);
+        sealed_one = true;
+        let name = entry_name(CHUNK_PREFIX, &sealed.name);
+        self.sealing.push(sealed, name)?;
+      }
+      self.next = self.next.saturating_add(1);
+    }
+    Ok(true)
+  }
+
+  /// Seals the archive without its chunks (its creation time zeroed, the module doc) as the manifest and makes the
+  /// envelope; the archive's chunks are let go first, so the manifest is sealed without a copy of them.
+  fn finish(&mut self, lineage: &WrappingKey, namer: &Namer) -> Result<Archive, EnvelopeError> {
+    // The chunks are all sealed into the envelope by now; the plaintext copies go before the manifest is encoded.
+    self.archive.chunks = Vec::new();
+    let without_chunks = Archive {
+      created_unix: 0,
+      ..self.archive.clone()
+    };
+    let manifest = seal_chunk(
+      lineage,
+      namer,
+      &Archive::raw_chunk(without_chunks.encode()),
+      self.segment,
+    )?;
+    let name = entry_name(MANIFEST_PREFIX, &manifest.name);
+    self.sealing.push(manifest, name)?;
+    let Sealing {
+      mut entries,
+      chunks,
+      largest,
+      ..
+    } = std::mem::take(&mut self.sealing);
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    let largest = u32::try_from(largest).map_err(|_| EnvelopeError::TooLarge)?;
+    let archive = &self.archive;
+    Ok(Archive {
+      base_page_size: archive.base_page_size,
+      chunk_min: archive.chunk_min.min(largest),
+      chunk_max: largest.max(archive.chunk_max),
+      created_unix: 0,
+      volume_id: archive.volume_id,
+      snapshot_id: archive.snapshot_id,
+      name_policy_id: 0,
+      unicode_version: 0,
+      root_meta: NodeMeta {
+        ino: ENVELOPE_ROOT_INO,
+        ..NodeMeta::default()
+      },
+      manifest: Node::Directory(entries),
+      chunks,
+    })
+  }
 }
 
 /// Opens `envelope` (the module doc): the real archive, every chunk its manifest references opened under `lineage`
@@ -189,8 +293,9 @@ pub fn open(
   Ok(archive)
 }
 
-/// An envelope being made ([`wrap`]): its entries, its chunks, the identities of the chunks it already stores, and the
-/// largest sealed chunk's length.
+/// An envelope being made ([`Wrapping`]): its entries, its chunks, the identities of the chunks it already stores, and
+/// the largest sealed chunk's length.
+#[derive(Default)]
 struct Sealing {
   entries: Vec<Entry>,
   chunks: Vec<Chunk>,

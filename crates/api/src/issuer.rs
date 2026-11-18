@@ -176,6 +176,22 @@ impl Issuer {
     ))
   }
 
+  /// The proof a `SetSigners` request carries (A-321): the keyed hash of exactly `volume`, `keys` and the policy
+  /// `version` they replace, under the secret the running daemon published, with the signers domain's own tag.
+  pub(crate) fn signers_proof(
+    &self,
+    volume: slates_ipc::protocol::VolumeId,
+    keys: &[Vec<u8>],
+    version: u64,
+  ) -> Result<[u8; 32], Error> {
+    Ok(slates_server::landing::signers_proof(
+      &self.secret()?,
+      volume,
+      keys,
+      version,
+    ))
+  }
+
   /// The proof that confirms the consensus recovery plan `plan` (§4.8, A-19), for an instance whose operator holds no
   /// recovery key of their own.
   pub fn recovery_proof(&self, plan: &[u8; 32]) -> Result<[u8; 32], Error> {
