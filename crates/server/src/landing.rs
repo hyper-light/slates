@@ -237,6 +237,8 @@ pub struct LandCall<'a> {
   pub filter: &'a slates_ipc::protocol::Filter,
   /// The grant, when one was issued.
   pub grant: Option<u64>,
+  /// Present only (`Present`, A-285): answer the presentation whatever the write policy, never land.
+  pub present_only: bool,
 }
 
 /// Lands `volume`'s snapshot into `target` (§4.15). Without a grant covering the planned
@@ -496,6 +498,7 @@ fn land_verb_unix(
     target,
     filter,
     grant,
+    present_only,
   } = call;
   let (handle, record) = match find(state, volume) {
     Ok(x) => x,
@@ -507,14 +510,14 @@ fn land_verb_unix(
   // The write policy (A-285): a forbidding mode refuses every landing, granted or not, before any host access; a
   // bypass mode grants the landing the daemon presents and lands it in the same request.
   let mode = land_mode(&record);
-  if mode == slates_db::catalog::WriteMode::Forbid {
+  if mode == slates_db::catalog::WriteMode::Forbid && !present_only {
     state.count(POLICY_FORBIDS_LAND, 1);
     return refused(Refusal::PolicyForbids {
       act: WriteAct::Land,
       by: PolicySubject::Volume { volume },
     });
   }
-  let bypass = grant.is_none() && mode == slates_db::catalog::WriteMode::Bypass;
+  let bypass = !present_only && grant.is_none() && mode == slates_db::catalog::WriteMode::Bypass;
   let db_volume = to_db_volume(volume);
   // A landing without a grant ends in a presentation, and the shard holds only so many: past the bound it
   // is refused before any host access, id or record (AUD-29-07).
@@ -870,6 +873,7 @@ fn land_under_policy(
             target: &job.target,
             filter: &requested.filter,
             grant: Some(grant),
+            present_only: false,
           },
         )
       }
@@ -2779,6 +2783,23 @@ pub fn policy_proof(
   *hasher.finalize().as_bytes()
 }
 
+/// Format: the domain tag of a merge approval's proof.
+const MERGE_APPROVAL_DOMAIN: &[u8] = b"slates.merge-approval";
+
+/// The proof a `SubmitApproved` request carries (A-285): the keyed hash, under the issuer secret, of the merge approval
+/// domain tag, the work volume and the approved increment's identity.
+pub fn merge_approval_proof(
+  secret: &[u8; slates_anchor::layout::ISSUER_SECRET_BYTES],
+  work: VolumeId,
+  identity: &[u8; 32],
+) -> [u8; 32] {
+  let mut hasher = blake3::Hasher::new_keyed(secret);
+  hasher.update(MERGE_APPROVAL_DOMAIN);
+  hasher.update(&work.bytes);
+  hasher.update(identity);
+  *hasher.finalize().as_bytes()
+}
+
 /// Serves `SetPolicy` (A-285): refused `Forbidden` on a consumer-bound channel, whatever its proof, so an agent never
 /// sets (and so never raises) its own policy, counted `policy_set_by_consumer`; `GrantIssuerUnverified` when the proof
 /// does not verify; a volume's policy recorded durably in its record. A consumer's own policy is not built yet
@@ -2804,7 +2825,7 @@ pub fn set_policy_verb(
       feature: "a consumer's write policy (A-285, owed)".to_owned(),
     });
   };
-  if let Err(reply) = crate::verbs::find(state, volume) {
+  if let Err(reply) = policy_record(state, volume) {
     return *reply;
   }
   let now = state.clock.monotonic_ns();
@@ -2830,8 +2851,8 @@ pub fn policy_verb(
       feature: "a consumer's write policy (A-285, owed)".to_owned(),
     });
   };
-  let record = match crate::verbs::find(state, volume) {
-    Ok((_, record)) => record,
+  let record = match policy_record(state, volume) {
+    Ok(record) => record,
     Err(reply) => return *reply,
   };
   if !crate::verbs::rights_of(&record, principal).read {
@@ -2840,6 +2861,27 @@ pub fn policy_verb(
   ReplyBody::Policy {
     policy: record.policy.write.map(wire_policy),
   }
+}
+
+/// The catalog record a policy is set on or read from (A-285): any volume this shard holds — a store-backed volume, a
+/// green or a work, which holds no store slot — refused `NotFound` for one it does not and `Destroying` for one going.
+fn policy_record(
+  state: &ShardState,
+  volume: VolumeId,
+) -> Result<slates_db::catalog::VolumeRecord, Box<ReplyBody>> {
+  let record = state
+    .db
+    .partition()
+    .volume(crate::verbs::to_db_volume(volume))
+    .cloned()
+    .ok_or_else(|| Box::new(crate::verbs::refused(Refusal::NotFound)))?;
+  if matches!(
+    record.state,
+    slates_db::catalog::VolumeState::Destroying | slates_db::catalog::VolumeState::Destroyed
+  ) {
+    return Err(Box::new(crate::verbs::refused(Refusal::Destroying)));
+  }
+  Ok(record)
 }
 
 /// A volume's landing mode (A-285): its policy's, or ask while none is set.

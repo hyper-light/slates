@@ -8,12 +8,13 @@ use slates_mem::{Handoff, SparseObject, Width, WordRun, Words};
 use crate::error::AnchorError;
 use crate::layout::{
   AT_GENERATION, AT_GEOMETRY, AT_IDENTITY, AT_MAGIC, AT_TOTAL, AT_VERSION, GEOMETRY_BYTES,
-  Geometry, HEADER_BYTES, IDENTITY_BYTES, ISSUER_SECRET_BYTES, LAYOUT_VERSION, MAGIC,
-  PAYLOAD_BYTES, PAYLOAD_GENERATION, PAYLOAD_LEN, RING_CAPACITY, RING_HEAD, RING_SEQ_BASE,
-  RING_TAIL, RegionKind, RegionSpec, SEAL_ROOT_ID_BYTES, SEAL_ROOT_KEY_BYTES, SESSION_SECRET_BYTES,
-  SUP_GENERATION, SUP_HEARTBEAT, SUP_HOLD_REFUSALS, SUP_ISSUER, SUP_LOG_REFUSALS, SUP_LOOKED,
-  SUP_PID, SUP_RESTARTS, SUP_SEAL_PRESENT, SUP_SEAL_ROOT, SUP_SERVING, SUP_SESSION_PRESENT,
-  SUP_SESSION_SECRET, SUP_STARTED, SUP_STATE, SUP_STOP, SUP_STOP_BY, State,
+  Geometry, HEADER_BYTES, IDENTITY_BYTES, ISSUER_SECRET_BYTES, LAUNCHER_SECRET_BYTES,
+  LAYOUT_VERSION, MAGIC, PAYLOAD_BYTES, PAYLOAD_GENERATION, PAYLOAD_LEN, RING_CAPACITY, RING_HEAD,
+  RING_SEQ_BASE, RING_TAIL, RegionKind, RegionSpec, SEAL_ROOT_ID_BYTES, SEAL_ROOT_KEY_BYTES,
+  SESSION_SECRET_BYTES, SUP_GENERATION, SUP_HEARTBEAT, SUP_HOLD_REFUSALS, SUP_ISSUER,
+  SUP_LAUNCHER_PRESENT, SUP_LAUNCHER_SECRET, SUP_LOG_REFUSALS, SUP_LOOKED, SUP_PID, SUP_RESTARTS,
+  SUP_SEAL_PRESENT, SUP_SEAL_ROOT, SUP_SERVING, SUP_SESSION_PRESENT, SUP_SESSION_SECRET,
+  SUP_STARTED, SUP_STATE, SUP_STOP, SUP_STOP_BY, State,
 };
 
 /// The node's sealing root as the anchor holds it (A-92): its key id and its key bytes.
@@ -86,6 +87,14 @@ fn segment_words(geometry: &Geometry) -> Words {
         .with(WordRun::racy(
           at.saturating_add(SUP_SESSION_SECRET),
           SESSION_SECRET_BYTES,
+        ))
+        .with(WordRun::one(
+          at.saturating_add(SUP_LAUNCHER_PRESENT),
+          Width::U64,
+        ))
+        .with(WordRun::racy(
+          at.saturating_add(SUP_LAUNCHER_SECRET),
+          LAUNCHER_SECRET_BYTES,
         )),
       // The content pool's owner words (A-98), each claimed by compare-and-swap.
       RegionKind::Pool => words.with(WordRun::strided(
@@ -667,6 +676,47 @@ impl AnchorSegment {
       SESSION_SECRET_BYTES,
     )?;
     let mut secret = [0u8; SESSION_SECRET_BYTES];
+    self.object.read_racy(at, &mut secret)?;
+    Ok(Some(secret))
+  }
+
+  /// Publishes the launcher secret (`layout::SUP_LAUNCHER_PRESENT`, A-299): the secret, then the published word,
+  /// released after it, so a reader that sees the word sees the whole secret. The anchor publishes it once, before it
+  /// starts any daemon, from what its starter provided; every daemon under the anchor reads it.
+  pub fn publish_launcher_secret(
+    &mut self,
+    secret: &[u8; LAUNCHER_SECRET_BYTES],
+  ) -> Result<(), AnchorError> {
+    let at = self.region_span(
+      RegionKind::Supervision,
+      SUP_LAUNCHER_SECRET,
+      LAUNCHER_SECRET_BYTES,
+    )?;
+    self.object.write_racy(at, secret)?;
+    let spec = self.spec(RegionKind::Supervision)?;
+    self
+      .word_at(spec, SUP_LAUNCHER_PRESENT)?
+      .store(1, Ordering::Release);
+    Ok(())
+  }
+
+  /// The launcher secret, if this anchor's starter provided one (A-299): what a launcher-class proof may be keyed by
+  /// beside the issuer secret.
+  pub fn launcher_secret(&self) -> Result<Option<[u8; LAUNCHER_SECRET_BYTES]>, AnchorError> {
+    let spec = self.spec(RegionKind::Supervision)?;
+    if self
+      .word_at(spec, SUP_LAUNCHER_PRESENT)?
+      .load(Ordering::Acquire)
+      != 1
+    {
+      return Ok(None);
+    }
+    let at = self.region_span(
+      RegionKind::Supervision,
+      SUP_LAUNCHER_SECRET,
+      LAUNCHER_SECRET_BYTES,
+    )?;
+    let mut secret = [0u8; LAUNCHER_SECRET_BYTES];
     self.object.read_racy(at, &mut secret)?;
     Ok(Some(secret))
   }
