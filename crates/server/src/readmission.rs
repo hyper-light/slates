@@ -22,10 +22,11 @@
 //! to its successor through the location round. Its latest state is refused here whatever the lease says
 //! ([`crate::lease::LeaseVerdict::LostToSuccessor`]), so a mount or a peer's forward that still names this node never reads the
 //! stale copy. A host's first epoch is [`slates_db::register::FIRST_EPOCH`], and a restarted daemon is a new member at
-//! it, so a boot's install never yields. A yielded volume stays yielded: a later takeover that names this node its
-//! successor again finds the id present and keeps the stale copy (`verbs::materialize_taken_over`), so serving it
-//! would need that rebuild first, which is owed with the release of a yielded copy's memory (the ledger transfer
-//! GAP-A9-7 owes).
+//! it, so a boot's install never yields. A yielded volume stays yielded until a later takeover names this node its
+//! successor again: that takeover relinquishes the stale copy (its record with no tombstone, its slot torn down in
+//! slices, its fence forgotten, the yield lifted) and makes the volume from the state it adopted (A-362,
+//! `verbs::materialize_taken_over`). Until then the copy's memory stays held (released with GAP-A9-7's ledger
+//! transfer).
 
 use std::collections::BTreeSet;
 

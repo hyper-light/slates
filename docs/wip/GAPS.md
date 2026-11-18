@@ -80,13 +80,14 @@
 >   no trusted signers (`verbs::materialize_taken_over`, `materialize_taken_over_green`: `write: None`), since the
 >   catalog register (`catalog::CatalogValue`) carries neither, so a volume taken over merges and lands as an unset
 >   one does, its signed-merge requirement dropped; the catalog register should carry both;
-> - **a sibling found here, open (§4.15's audit, not signed work's):** a presented-then-granted landing's presentation
->   record is durable twice: `present` appends its `LandingPlanned`, and `finish` mirrors every record the engine's
->   in-memory ring (`state.landing.audit`) holds for the landing's id, the presentation's own among them; a resumed
->   landing's second finish would mirror the first attempt's records again the same way. Measured on the Mac Studio
->   (2026-11-18, `a_signed_landing_is_judged_recorded_and_read_back` with its records printed): the landing's audit read
->   planned (no grant), grant issued, planned (no grant), planned (grant 1), validated, entry written, finished. The
->   verdicts agree, so signed work reads true; the trail should mirror each engine record once;
+> - **found here, open (§4.15 "Audit", §4.14):** on a daemon of more than one shard `Audit` reads only the partition of
+>   the shard that serves it (`RequestBody::Audit` routes to the client's own shard, `landing::audit_verb`), while a
+>   landing's records are written on its volume's owner shard, so a consumer misses every landing whose volume another
+>   shard owns, its signed-work verdicts with them. kiln starts two shards. Measured on the Mac Studio (2026-11-18): a
+>   presented-then-granted landing on a two-shard daemon (`crates/server/tests/daemon.rs`'s fixture) read back no record
+>   of the landing at all; on one shard every step. §4.15 says the audit log is written through the control shard. The
+>   fix needs a read over every partition with a cursor per partition (each keeps its own sequence), or the records
+>   written where the design says;
 > - a real FIDO key's signature end to end (the touch flag is proven with a software stand-in);
 > - the integrator's runs on Linux and Windows (the merge tests are platform-free but for the agent's own channel; the
 >   landing tests run where the daemon lands, on Unix, and a Windows landing writer, when it lands, must judge and
@@ -102,16 +103,23 @@
 > up. No survivor withheld a promise; the round never asked. Fixed: a fenced volume sends nothing and does no period work
 > (`live_ship::pending_sends`, `period_volume`). Test: `a_superseded_owner_ships_nothing_more_of_the_volume_it_lost`
 > (`crates/server/tests/fleet.rs`). Bug record: `docs/bugs/2026-11-18-a-superseded-owners-shipper-starved-its-own-takeover-round.md`.
-> - **Owed (g250, next): re-adoption.** X1's round now adopts X2's objects, and its materialization meets X1's own
->   superseded copy: `verbs::materialize_taken_over` keeps a volume the node already holds, so the adopted state (X2's
->   acknowledged writes) never replaces the stale copy, its fenced shipper or its kept fence. A takeover that names a node
->   holding a superseded (fenced, or with A-334 yielded) copy must replace it. Until then the seed fails there.
+> - **Fixed (A-362, g250, 2026-11-18): re-adoption.** X1's round adopts X2's objects, and its materialization met X1's
+>   own superseded copy: `verbs::materialize_taken_over` kept a volume the node already held, so the adopted state (X2's
+>   acknowledged writes) never replaced the stale copy, its fenced shipper or its kept fence. Now a takeover that names a
+>   node holding a copy it lost to a successor (`verbs::lost_to_a_successor`: fenced, A-338, or yielded, A-334)
+>   relinquishes that copy (`verbs::relinquish_superseded`: its attachments ended, its record gone with no tombstone and
+>   no key erased, `Op::VolumeRelinquished`; its slot torn down by the reaper in slices; its shipper, fence and yield
+>   forgotten; the image published without it) and makes the volume from the state it adopted. Tests:
+>   `a_takeover_that_names_this_node_again_replaces_its_superseded_copy` (`crates/server/src/verbs.rs`) and
+>   `a_relinquished_volume_is_made_again_under_its_id_and_keeps_its_key` (`crates/db/tests/model.rs`, with the step in
+>   the db model's histories). Still owed: a guest device or Shards stream serving the stale copy is ended, not waited
+>   for, since the adopted state takes the id at once.
 > - **Owed: a lane that ends on a refusal is sent again at once** (`live_ship::lane_ended` follows any answer;
 >   `fold_into` follows only progress, for this reason since 2026-11-05). X2, retired before it knew, sent its log to the
 >   two members, which refused it `not_a_member` 85,877 and 86,502 times in one run, its sessions out on that loop.
 > - **Owed: a round's question takes a session only if it is in its link at that instant** (`takeover::ask_pages`, and the
 >   takeover's fetch), so any borrower that takes it every period starves the round the same way.
-> - **Owed (the supervisor's):** the seed on main once re-adoption lands.
+> - **Owed (the supervisor's):** the seed on main (6876545201569229162, both Linux arches), now that re-adoption is in.
 
 > **A superseded owner's mounts served its copy: NFS answers `NFS3ERR_STALE`, a FUSE mount ends (2026-11-18, A-346,
 > §4.8 "Leases and reads", AUD-29-84; g230).** A-338 sent the old owner's verbs to its successor, but its mounts were
@@ -1378,6 +1386,13 @@
 >   surviving recorded holder and every surviving member of the retired owner's cohorts for the volume, and adopts the
 >   greatest head (`fleet.live.taken_over_past_tolerance`). Owed: the supervisor's store-destroyed flow
 >   (`crates/cli/tests/live_chaos.rs`) on merged main, both Linux arches, for the end-to-end evidence.
+> - **Fixed (A-332, g250, 2026-11-18): a takeover past tolerance shows in the volume's status.** Its loss report's
+>   `taken_over.past_tolerance` names the shortfall of the head register's cohort and of the live log's recorded holders
+>   (the hosts recovery needed, how many remained), kept in the volume's takeover record (`CONTRACT` 21); `slates status`
+>   prints `taken_over_past_tolerance`. Test: `a_takeover_past_its_tolerance_shows_in_the_volumes_loss_report`
+>   (`crates/server/src/verbs.rs`); the AC-8.3 fleet test holds it `None` within tolerance, and the store-destroyed flow
+>   holds the report to the successor's own counts (the supervisor's run). Still Ada's (Decisions): whether a volume
+>   recovered past tolerance also refuses writes until an operator acknowledges it.
 > - **Open (A-309): a holder the round never asked keeps its copy** (`fleet.takeover.kept_unasked`). A neighbourhood an
 >   owner settled away from keeps the owner's copies; before A-309 they went when the owner's takeover settled, safe
 >   only within tolerance. Owed: such a holder lets them go at the settle, on the owner's report that every record it
@@ -1954,11 +1969,16 @@
 > CI's runners (spin windows of 18 to 35 s), and the lane passed with no spinning verdict, six runs of six
 > (diag-g251-tsan); an unoptimized build 3.5 times (a Mac Studio), a release build 1.0. Regressions: `a_poll_is_judged_spinning_only_past_the_window_held_to_its_build`
 > (red with the budget put back as the spin window), `a_poll_slower_than_the_budget_within_the_builds_spin_window_keeps_the_beat`
-> (`crates/server/tests/liveness.rs`). **Siblings, open:** the anchor's start judgment holds a starting daemon's busiest
-> thread to a window of CPU too (`crates/api/src/role/anchor.rs`, `process_clock`), and an observation's budget is counted
-> in the observed shard's CPU (`crate::observe::ShardTime`); neither is held to the build yet, and neither has been seen
-> to fail under ThreadSanitizer. The release-build spinning kills of the A-228 entry ("A kill the rule does not touch")
-> are untouched: a release build's window is the budget.
+> (`crates/server/tests/liveness.rs`). **Its siblings, closed 2026-11-18 (A-356, g251):** the anchor's start judgment
+> held a starting daemon's busiest thread to the bare budget of CPU (`crates/api/src/role/anchor.rs`), and an
+> observation's or a cross-shard wait's budget is counted in the observed shard's CPU (`crate::observe::ShardTime`);
+> neither was held to the build, and neither had been seen to fail under ThreadSanitizer. Now the anchor measures the
+> build in its own process, which runs the executable its daemon runs, and judges a start's thread against the spin
+> window; a wait gives its shard the budget held to the build in CPU, its windows still at most the budget on the wall,
+> so a shard that stops is judged as soon as before. Red with the bare budget put back, each at its own assertion
+> (`a_starts_thread_is_judged_spinning_only_past_the_window_held_to_its_build`,
+> `a_shard_in_a_slower_build_is_given_its_budget_held_to_the_build`). The release-build spinning kills of the A-228 entry
+> ("A kill the rule does not touch") are untouched: a release build's window is the budget.
 
 > **A Windows UDP socket died on an earlier send's ICMP error (found 2026-11-06, fixed 2026-11-06).** With Windows'
 > default `SIO_UDP_CONNRESET`, a port-unreachable for a datagram sent earlier failed the socket's next `recvfrom` with
@@ -2558,7 +2578,13 @@
 >   again 2026-11-17 in an in-process fleet test binary (adas-macbook-pro, macOS arm64, debug, load 23 to 56, beside
 >   another fleet test process): `shard 0 is spinning, 1077 ms of CPU without a step` ended the binary (exit 4) in the
 >   third of 13 A-255 and tombstone tests; which test it was is not known. The 11 it never ran passed one to a process
->   at load 70 to 116, so it did not reproduce.
+>   at load 70 to 116, so it did not reproduce. **One cause found and fixed 2026-11-18 (g251):** a work's catalog with
+>   no session to ship over held a one-shard node's control shard inside its record plane's poll, the merge plane
+>   nudging itself after every ship (windows-11-arm, 3 of 3 runs of the council-forms submit test; the shard's pulse
+>   dumped at the verdict named `run_record_plane`'s task, diag-g251-spin-3). The arm nudges now only when the ship's
+>   placement was recorded (`docs/bugs/2026-11-18-a-work-catalog-with-no-session-spun-the-record-plane.md`;
+>   `a_work_catalog_with_no_session_to_ship_over_waits_for_the_period`: red 233,090 ships with no session in 25
+>   periods, green within the bound). The 2026-11-17 sighting has its shape; the 2026-11-08 one is not established.
 > - **Siblings with the same blind spot.** `crate::observe::ShardTime` (`next_window_ns`), used by observations and the
 >   cross-shard waits (`xshard`), gave up on a window with no CPU progress, so a starved shard's observation or call
 >   ended early: **fixed 2026-11-08 (bug-sweep).** A window with no CPU progress now ends the wait only if the scheduler
@@ -2589,6 +2615,11 @@
 >   not stuck. `a_start_held_off_its_cpus_is_starved_not_stuck` (`crates/api/src/role/anchor.rs`) holds a busy process off its
 >   CPU at SCHED_IDLE: without the reading, judged "made no progress for 1001 ms", 2 of 2 on adacachy2; with it, starved
 >   at 14-23 looks and never stuck, 7 of 7 (nice 0 and 19). A process with every thread blocked still reads stuck.
+>   Since 2026-11-18 (g251) the rule is held with its condition put in place on every host
+>   (`a_start_whose_clock_stands_still_while_runnable_is_starved_not_stuck`: the clock still and the threads runnable,
+>   never stuck; blocked, stuck a window after; red with the scheduler's answer dropped), since a big idle host cannot
+>   starve a real start (jupiter, 32 cores: "did not starve", the premise failing, not the rule); the real-process test
+>   says so and skips its starved half there.
 >   Its spinning half reads each thread too since 2026-11-08 (liveness): the busiest thread's CPU, not the process's sum,
 >   which had killed every start of 23 shards on a 32-CPU Studio
 >   (`docs/bugs/2026-11-08-the-start-judgment-held-a-processs-summed-cpu-to-one-threads-window.md`).
@@ -2648,7 +2679,14 @@
 > **`LIVENESS_BUDGET_NS` is still a fixed second (R3 debt, 2026-11-06; follow-on, not A-228).** It is A-228's window and
 > the reply-deadline unit of about 60 files (the client's and the server's deadlines, observations, the scatter's room
 > wait). A-228 judges the window in each shard's own CPU time, which keeps a starved daemon alive, but the window's length
-> is still the `Shape:` constant "a second", not measured.
+> is still the `Shape:` constant "a second", not measured. **Derived since 2026-11-18 (A-359, goal g255):** `W` is the
+> ratified recovery budget `T` by rent or buy (a verdict waits as long as the recovery it starts costs), the heartbeat
+> `W / ELECTION_MARGIN`, the same values; the machine's wake p99 at boot is its floor, and the boot log names both and
+> says when the floor passes the window. Owed, in order: `W` held at runtime so a daemon runs at its floor where that
+> is past `W` (every use is listed by class in A-359); the failover SLO derived as the membership horizon plus the
+> council's confirmation window plus `T` (2.9 s today) once each consumer that takes it as a lease term (a landing's
+> target lease, a CLI attachment's term, the NFSv4 and delegation leases, the restart cap) has its own term; and the
+> class C claim wait below.
 >
 > - **Class A, a cross-shard wait judged in its target's own time (2026-11-06, in progress).** A verb's wait for
 >   another shard's answer gave up at the wall second while the target was alive and starved, and the work went on to
@@ -3816,19 +3854,59 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 >   merged byte from its side of the attached volume. 3 of 3 runs on GitHub's ubuntu runner (run 44254100848, kernel 7.0,
 >   Docker 29.4); red with the launcher's approval taken away (fails at the asked project's read) and with bypass
 >   replaced by ask (the one land writes nothing).
-> - **The server on a second machine lands onto that machine's path (2026-11-18, fs-server plan step 3; macOS legs
->   done, Linux legs owed).** Two kiln runners, one manifest over the LAN (Wi-Fi: 90-150 ms average round trips, spikes
->   to about 470 ms), no person in the run. `fs_server.rs`'s roles (`role`: `mint`, `unpack`, `node`, `ask`, `bypass`,
->   `approve`) are the per-machine steps: the server's `mint` makes the fleet's identities and `unpack` hands them to the
->   client, `node` starts each node (the server under its launcher's secret, made on the server, mode 0600, read on
->   standard input), the client pushes two increments over four files into two greens (accepted 1 and 2; the late push
->   refused with `src/one.txt [0..3]`), the server checks each out; under ask the land answers the approval request (1
->   create, 3 replaces) with the project unchanged, then the launcher's approval writes 4 entries; under bypass one
->   `slates land` writes 4 entries (92 bytes); the server's disk holds every merged byte. Server Adas-Mac-Studio, client
->   Adas-Mac-Studio-2: passed in 83 s (kiln node runs r1052, r1054); the reverse: passed in 69 s (r1118, r1119). The
->   kiln program that drives both machines is the supervisor's (`~/.cache/slates-scratch/fanout/fs-two-machines.js`).
->   **Owed:** the Linux x86_64 legs (server on Linux, then client on Linux). adacachy2 was held for hours by kiln's own
->   CI labs, during which kiln freezes every agent run there; adacachy did not answer.
+> - **The server on a second machine lands onto that machine's path (2026-11-18, fs-server plan step 3): done in both
+>   directions between macOS arm64 and Linux x86_64.** Two kiln runners, one manifest over the LAN, no person in the
+>   run. `fs_server.rs`'s roles (`role`: `mint`, `unpack`, `node`, `ask`, `bypass`, `approve`) are the per-machine
+>   steps: the server's `mint` makes the fleet's identities and `unpack` hands them to the client, `node` starts each
+>   node (the server under its launcher's secret, made on the server, mode 0600, read on standard input), the client
+>   pushes two increments over four files into two greens (accepted 1 and 2; the late push refused with
+>   `src/one.txt [0..3]`), the server checks each out; under ask the land answers the approval request (1 create, 3
+>   replaces) with the project unchanged, then the launcher's approval writes 4 entries; under bypass one `slates land`
+>   writes 4 entries (92 bytes); the server's disk then holds exactly the 4 merged files. The recorded command is the
+>   kiln program `docs/wip/bench/fs-two-machines/run.js`, pasted as `code_run`'s program. Its input names the two
+>   runners, each machine's `slates` and `fs_server` binaries (from `build.sh` beside it), each node's UDP port block
+>   and the runners whose house rules cap every command. It checks each node's port block free before it starts, reads
+>   every regular file under each project after the landing, so "exactly the 4 merged files" is measured, and ends by
+>   reporting what each machine has left: no process, unit or folder after any run below.
+>   - macOS to macOS, earlier the same day (the supervisor's first program): server Adas-Mac-Studio, client
+>     Adas-Mac-Studio-2, passed in 83 s (kiln node runs r1052, r1054); the reverse in 69 s (r1118, r1119). Wi-Fi: 90-150
+>     ms average round trips, spikes to about 470 ms.
+>   - Linux and macOS, 14:50-15:28 UTC: adacachy (AMD Ryzen 9 9950X3D2, 16 cores and 32 threads, 122 GiB, CachyOS
+>     kernel 7.2.9, wired; every command in its own `systemd-run --user` unit at CPU weight 1, nice 19, 8 GiB and its
+>     disk's IO caps, as its house rules require) and Adas-Mac-Studio (Apple M3 Ultra, 32 cores, 96 GiB, macOS 26.4,
+>     Wi-Fi), both machines' binaries at 1e8f4a49e (branch `supervisor/fs-two-1e8f4a49e`; `fs_server.rs`'s roles are
+>     unchanged on main since). adacachy's firewall admits LAN UDP only on kiln's ports and KDE Connect's 1714-1764, so
+>     its node takes 1740-1741 or 1750-1751 there (`ss -uln`: only 1716 bound in the range); the Mac's node 17202-17203
+>     or 17212-17213. 10 of 11 runs passed: server on adacachy 7 of 8 (47, 166, 58, 60, 173, 152 and 220 s), server on
+>     the Mac 3 of 3 (45, 209 and 190 s). The last three, with the committed program as it stands, passed in a row:
+>     g066j (server on the Mac, 209 s, adacachy at load 100.6), g066k (server on adacachy, 220 s, load 69.8) and g066l
+>     (server on the Mac, 190 s, adacachy at load 122.6). Their phases, in seconds, in that order: port check 6.5,
+>     13.6, 5.5; identities, manifest and secret 10.8, 18.1, 3.7; nodes up 7.2, 28.2, 6.4; root group formed 10.5,
+>     10.2, 2.1; the client's first read of the first green 46.3, 30.3, 4.6; its two pushes, the late refusal and the
+>     server's checkout 55.3, 64.7, 59.0; the same for the second green 33.4, 18.5, 23.7 and 30.3, 10.5, 66.5; ask
+>     (presented, approved, written) 2.1, 10.3, 10.1; bypass's one land 1.5, 9.4, 2.5; cleanup 3.5, 4.2, 3.5. Every
+>     step is its own kiln command with 1-2 s of dispatch, so on a quiet pair most of a phase is kiln's: g066b and
+>     g066c took 47 and 45 s in all. The record sessions' smoothed round trip ran from 17 ms (adacachy at load 34) to
+>     724 ms (at load 122.6), with probe timeouts up to 3.3 s.
+>   - **Open: one forwarded verb refused `OwnerUnreachable { region: 0 }` (run g066d, about 15:00 UTC, server on
+>     adacachy at 1750).** The client's `work` was refused about 125 s after the root group formed, after the client's
+>     first read of the same green had answered. At the refusal the client node held configuration version 0 with no
+>     members while the server held version 1 with both, each node had replaced its record session after a loss 15
+>     (client) and 17 (server) times, and both had a probe session. Its identities phase took 27.7 s (2.8 to 20.6 s in
+>     the other runs), so a machine or the path was slow then. It did not recur in the 8 runs after it, 5 of them in
+>     the same direction on the same ports. The mechanics are known: `verbs::resolve_and_forward` resends to a live
+>     owner until the failover SLO (`FAILOVER_SLO_NS`, 10 s) passes and then refuses `OwnerUnreachable`, a typed
+>     refusal a consumer retries; and a learner fetches the configuration only over a record session
+>     (`fleet::drive_learner_fetch`). The cause is a hypothesis, since the run kept no node logs: the server node, held
+>     to CPU weight 1 on adacachy under a load near 100 (in g066e, at load 112.9, its control shard ran 627, 923 and
+>     1,104 ms late against its 1,000 ms watchdog window), answered its record sessions late for longer than the SLO.
+>     The program now keeps each node's last 400 log lines and its whole status on a failure. Owed under plan step 4:
+>     reproduce it on one box with the server node held to a CPU quota (`systemd-run --user -p CPUQuota=`) and tell
+>     from its log whether the refusal is the SLO doing its job, the configuration arriving once the starvation ends,
+>     or a session or learner defect, which then gets its failing test first.
+>   - Gotcha: a transient unit's service manager substitutes `${NAME}` anywhere in its command (systemd.service(5),
+>     "Command lines"; systemd 262), so the first run's `"${f#./}"` reached bash empty and its disk read lost every
+>     path while the flow itself passed; the program passes every `$` as `$$`.
 > - **Remote attach is owed (§4.10):** another node's `attach` is refused `NotFound`, so a client on another node
 >   pushes through a green, never through a write attachment.
 > - **A self-signed fleet certificate must be a leaf.** OpenSSL's default (`CA:TRUE`) is refused
