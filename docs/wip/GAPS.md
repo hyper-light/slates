@@ -917,10 +917,14 @@
 >   `StartSpec.fleet` once `role::check_fleet` (contract 39) read the manifest it wrote as its start will (K3).
 > - **Kiln moves an agent with its volume (A-450, kiln K4, 2026-11-18):** through the library alone (`move_volume` to the
 >   target's member id, followed until `Moved`, every refusal by kind, the agent left running where it was), the
->   target's runner mounting the moved volume under its own place once its new owner serves it. Today's kiln
->   workspaces are overlays and are refused `NotPlain`; they move once made as clones of a captured base (K5). The live
->   move across two Mac runners is filed for main.
-> - **Owed, in order:** kiln's workspaces made as clones of a captured base (K5); the automatic migration by the origin of the last N
+>   target's runner mounting the moved volume under its own place once its new owner serves it. The live move across
+>   two Mac runners is filed for main.
+> - **Kiln's workspaces as captured clones (A-463, kiln K5, 2026-11-18):** on a runner the server's `[slates_fleet]`
+>   lists, each workspace is an O(1) clone of its folder's captured base (one capture shared while the folder is as
+>   captured, a base gone with its last clone), so it moves; its review and landing are A-424's; a workspace that moved
+>   is landed nowhere until stage 2. Machines outside the fleet keep overlays. Held by kiln's real-instance test
+>   (`captured_tests.rs`); the live move of a captured clone and the bare-metal run on its mount are filed for main.
+> - **Owed, in order:** the automatic migration by the origin of the last N
 >   writes (AC-8.16's other half); a move carrying snapshots other than the head; a multi-runner test with injected
 >   faults. The capture's own owed parts: admission reserving its cost ahead, a large file read across slices rather
 >   than whole in one, and the report of bytes read and retained and of the elapsed cost (§4.15's status).
@@ -954,6 +958,18 @@
 >   `fleet.materialize.given_up` 1, every read `NotRecovered`), with it on it passes before and after (7.85 s, 5.87 s).
 >   An earlier red-check in a second worktree had passed 7 of 7 only because its build shared the green tree's target
 >   directory and ran the green binary; a red-check mutates the tree the green run built.
+> - **Broken again by A-398's install walk, fixed (2026-11-18, A-485, goal 85 bug 1).** From A-398 on the target-dies
+>   test failed every run (4 of 4 on macOS and Linux, main's r242, r277, r327): neither survivor adopted or materialized
+>   the moved volume (no `fleet.takeover.adopted`, `fleet.move.adopted` or `fleet.materialize.*` on c), a released its
+>   frozen copy, and every read met `NotFound` (Linux) or `HomedElsewhere { region 0 }` (macOS). A-398's per-copy install
+>   step followed a move only for a copy routed to a retired host, so at the switch no holder's copy followed: each kept
+>   its live old owner's route and authority, no takeover of the dead target listed it, and the configuration handed the
+>   volume's line to a successor that never adopted it. Now every copy the walk reaches follows its object's move
+>   (`moves::follow_moved_object`); held by `a_held_copy_follows_its_move_at_the_install_walk_and_falls_to_the_dead_
+>   targets_successor` (the server's unit tests, red without the fix). Bug record:
+>   `docs/bugs/2026-11-18-a-held-copy-of-a-moved-volume-stopped-following-its-move-at-the-install-walk.md`. **Owed
+>   (main's):** the fleet test itself on macOS and Linux, and the volume-moved test (goal 85 bug 2), whose move back may
+>   lean on the same following (not shown: holders a new owner's own move round reaches take its authority there).
 > - **Owed (the handoff's bound):** the frozen phase lasts as long as the handoff's copy takes, and an unreported move
 >   is held to the failover SLO (10 s by default), so a volume whose content cannot be copied to one more host within it
 >   is refused `MoveRefusal::Unplaced` and thaws. The fix is to place the head off the owner before freezing (the volume
@@ -3831,8 +3847,11 @@
 >   attempt joins it in the owner shard's own time). **Class A is closed:** every `xshard::call_within` and
 >   `task_within` left waits for a reason stated beside it (the caller's own period or cadence, a remote wait, or a
 >   peer's one-at-a-time serve), and every other cross-shard wait is judged in its target's own time. Owed, found on the
->   way: an adopted move's seal is still taken again when its answer is lost to a stopped shard; recording the seal on
->   the owner shard would make `moves::seal_adopted` idempotent. **Class C, the rendezvous's claim (A-443, 2026-11-18,
+>   way: an adopted move's seal was still taken again when its answer was lost to a stopped shard. Closed by A-488
+>   (2026-11-18, g225): the owner shard records the seal on the volume (`VolumeSlot::adopted_seal`), and
+>   `verbs::seal_adopted_head` answers a second ask the recorded seal
+>   (`an_adopted_moves_seal_asked_again_after_its_answer_was_lost_is_taken_once`). **Class C, the rendezvous's
+>   claim (A-443, 2026-11-18,
 >   g251):** a client's claim waited a fixed second for its answer (`rendezvous::CLAIM_WAIT_NS`), so a daemon alive and
 >   slow to answer was reported gone; it now waits while its rendezvous's owner lives, ending at once at its death (on
 >   Linux the socket, reset with the listener's owner; on macOS the owner's bootstrap name, looked up at twice the time
@@ -3878,7 +3897,15 @@
 >   wake the park at the exit, and was not built. Found on the way: `slates-rt`'s attribution reads the same
 >   `getrusage` as the client's Linux park through its own unsafe block; folding it into `slates_machine::switches`
 >   leaves one. Owed in C-a: the same constant in `ack_release.rs`, `attach_forms.rs` and `shards.rs`, the
->   same two waits; Windows' run of the cross-process rendezvous file is filed for main. Class B (the
+>   same two waits; Windows' run of the cross-process rendezvous file is filed for main. C-c's first part since A-492
+>   (2026-11-19, g232): the macOS socket route's offer lived two liveness budgets on a timer and its exchange gave the
+>   client one budget, so a live client slower than either found no offer or was dropped mid-claim; now an offer waits
+>   while the client it was made for lives (let go when the reaper retires that client,
+>   `shards_route::let_go_of_client`, which ends a stream's attachment as its end closes) and an exchange waits on its
+>   client while the client's connection lives (`an_offer_waits_for_its_live_clients_claim_past_any_fixed_life`,
+>   `an_exchange_serves_a_live_client_slower_than_any_fixed_bound`,
+>   `a_retired_clients_offers_are_let_go_and_their_ends_closed`); owed: a cross-process test of a client killed before
+>   its claim. Class B (the
 >   transport's round-trip estimate) is open, but for the owner-location round (2026-11-18, A-437, goal g255: one
 >   liveness window, hard, for its asks and its lent sessions; now the record plane's round budget over the slowest
 >   asked path's measured tail, `owner_location::round_budget_for`), an operator's promotion forwarded to the root
@@ -4497,6 +4524,17 @@
 > the quorum collector's change: `4a221524` 1/50, `21da6e57` 0/50 on one busy CPU. The test now waits until the
 > foreign node holds the owner dead; no assertion changed. Interleaved on one busy CPU: before 2/150, after 0/150.
 > Record: `docs/bugs/2026-11-05-a-lookup-before-the-owners-death-was-known-never-ran-its-round.md`.
+
+> **A root learner behind its asker's root refused every location round: fixed (2026-11-18, A-489, §4.8 Lookup).** The
+> same test failed 2 of 3 on main's quiet Mac Studio (main 3022c6894 and 2a5bf7264) with `OwnerUnreachable`. The
+> successor, a root learner, counted `root_view_differs` once for each of the foreign voter's 58 and 68 rounds until the
+> lookup's budget ran out. A seat change moves the root's version (A-406) and nothing a learner compared, so a learner
+> that missed it at formation never fetched. A query bound to a newer root than the peer holds now sends the peer's root
+> learner to fetch from the asker at its next period (`fleet.owner_location.root_behind`). Regression:
+> `a_location_query_bound_to_a_newer_root_sends_the_learner_to_fetch_from_its_asker`, red with the record left out. The
+> fleet test's runs are filed for main. **Open:** the converse. An asker behind its peers' root is refused with an empty
+> reply that tells it nothing, so it needs a refusal that names the peer's version: a reply format change (SLATES_DESIGN
+> A-489, owed). Record: `docs/bugs/2026-11-18-a-root-learner-behind-its-asker-refused-every-location-round.md`.
 
 > **Directory blocks in size classes (A-203, 2026-11-05): VFS plan step 13 done.** A directory's block is the smallest
 > of 17 classes, 256 B to 4 KiB, four to a doubling, that holds its entries. Each class is a list of 64 KiB pages from
@@ -18856,6 +18894,14 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   path holds, but which a lossless layout (four-byte lengths, layouts 6 and 7) or a refusal at the plan would close; and
   an overlay's witness's owner, birth time and Windows bits are judged, its verdict comparing whole fingerprints, and not
   bound, the encoding holding the device, inode, size, times and mode alone); and
+  a landed mode or bits change's durability, **built by A-472 the same day** (a metadata entry synced through its file's
+  own handle in its batch's barrier before it is reported: Linux `fsync`, macOS `fsync`, Windows `FlushFileBuffers`, each
+  as its documentation states; no source says a directory's sync covers another inode's metadata; its unit tests ran on
+  the Mac Studio, the crash oracle's rerun filed for main; still owed with it: on Windows a file read-only when its
+  metadata entry opens it fails that entry alone, since `FlushFileBuffers` needs a handle that may write and NTFS refuses
+  one to a read-only file, where a clear of the bit before the flush's open, or a measured rule, would land it; and a made
+  directory's mode, given after `mkdirat` and synced with the directory's parent alone, has the same question, unasked
+  until now); and
   the seam's numbering: refusals the engine tells apart are POSIX numbers and the rest Win32 codes, so a Win32 code equal
   to one of the engine's numbers (`ERROR_NOT_SAME_DEVICE` 17, `ERROR_INSUFFICIENT_BUFFER` 122, among five) would read as
   that refusal; none of the writer's calls is known to answer one, and a typed refusal at the seam would close it.

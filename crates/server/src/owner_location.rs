@@ -3,7 +3,9 @@
 //! A read-only exchange asks the admitted home-region peers, bounded by the existing session
 //! table and the record plane's measured round budget over the slowest path it asks (A-437). It never executes a
 //! client verb or grants authority. One cached route per client avoids repeating discovery for ordinary use, without a
-//! global catalog. Evidence: the five-node history in tests/fleet.rs and the dated remote-lookup bug report.
+//! global catalog. A query is bound to its asker's root view; one bound to a newer view than a peer holds is refused and
+//! sends that peer's root learner to fetch from the asker (A-489). Evidence: the five-node history in tests/fleet.rs and
+//! the dated remote-lookup bug reports.
 
 use slates_cluster::membership::Liveness;
 use slates_cluster::{CommitBudget, broadcast};
@@ -100,7 +102,7 @@ impl Query {
   /// this node does not serve the object, and the first owner is this node itself only for an object it lost to a
   /// successor (A-334, A-338), which only the location round can find. Asked on the control shard, where the council's
   /// configuration is. A holder of a moved object's copy follows the exception in its routing
-  /// (`crate::moves::follow_moved_objects`), so the two agree wherever both are known.
+  /// (`crate::moves::follow_moved_object`), so the two agree wherever both are known.
   pub(crate) fn known_owner(
     self,
     state: &ShardState,
@@ -178,23 +180,35 @@ fn eligible(state: &ShardState, host: HostId, region: RegionId) -> bool {
 /// takeover does not advertise itself until adoption finishes. Peers without this object report no owner;
 /// they never infer one from live membership. The session has already authenticated enrollment. Returns the reply
 /// and, when this node does not claim the object, why ([`declined`]), for the caller to count.
+///
+/// A query bound to a root view other than this node's is refused, since a reply binds the view it was asked under.
+/// One bound to a newer view than this node holds also says that `peer`, the asker, holds that view and this node is
+/// behind ([`note_newer_root`]): its root learner fetches from `peer` at its next period, and the asker's next look is
+/// answered (A-489). A root learner fetched only when its regions or the voters it knew looked wrong
+/// (`fleet::root_diverges`), and a seat change moves the root's version with neither (A-406), so a learner left behind at
+/// formation refused every round a foreign voter asked, until the lookup's budget ran out (`OwnerUnreachable`).
 pub(crate) fn serve(
-  state: &ShardState,
+  state: &mut ShardState,
+  peer: HostId,
   bytes: &[u8],
 ) -> Result<(Vec<u8>, Option<&'static str>), LocationError> {
   let query = Query::from_bytes(bytes).map_err(|_| LocationError::Malformed)?;
+  if !state.consensus_ready {
+    return Err(LocationError::NotReady);
+  }
+  let held_root = state.root.configuration().version;
+  if held_root != query.root_version {
+    if query.root_version > held_root {
+      note_newer_root(state, query.root_version, peer);
+    }
+    return Err(LocationError::RootViewDiffers);
+  }
   let local = state.fleet.host();
   let root = state.root.configuration();
   let creator_region = state
     .node_regions
     .get(&ObjectId(query.object).creator())
     .copied();
-  if !state.consensus_ready {
-    return Err(LocationError::NotReady);
-  }
-  if root.version != query.root_version {
-    return Err(LocationError::RootViewDiffers);
-  }
   if state.node_regions.get(&local) != Some(&RegionId(query.region))
     || creator_region
       .is_none_or(|region| root.home_of(ObjectId(query.object), region) != RegionId(query.region))
@@ -218,6 +232,20 @@ pub(crate) fn serve(
     .to_bytes(),
     declined,
   ))
+}
+
+/// Counter: a location query bound to a newer root view than this node holds, which says this node is behind (A-489).
+/// Format: a counter name in the daemon's status report.
+const ROOT_BEHIND: &str = "fleet.owner_location.root_behind";
+
+/// Records that `peer` holds root configuration `version`, newer than the one this node holds ([`serve`], A-489): the
+/// newest version so shown and the peer that showed it, which the root learner's next period fetches from
+/// (`fleet::root_learner_fetch`), counted.
+fn note_newer_root(state: &mut ShardState, version: u64, peer: HostId) {
+  state.count(ROOT_BEHIND, 1);
+  if state.root_newer_seen.is_none_or(|(seen, _)| version > seen) {
+    state.root_newer_seen = Some((version, peer));
+  }
 }
 
 /// The green `object`'s catalog record names, if `object` is a work whose catalog record this node holds (A-255).
@@ -792,5 +820,77 @@ mod tests {
       slow.max_deadline_ns() > slow_tail,
       "a lent session is waited for past the slowest path's tail"
     );
+  }
+
+  /// The peer a root learner's period fetches from beside the voters it knows, if any (`fleet::root_learner_fetch`).
+  fn shown_by(fetch: crate::fleet::RootLearnerFetch) -> Option<HostId> {
+    match fetch {
+      crate::fleet::RootLearnerFetch::Due { shown_by } => shown_by,
+      crate::fleet::RootLearnerFetch::Idle => None,
+    }
+  }
+
+  /// A-489 (§4.8 Lookup; D-14 root learners): a location query bound to a newer root view than this node holds is
+  /// refused, since a reply binds the view it was asked under, and it tells this node that it is behind and that the
+  /// asker holds the newer root: the root learner's next period fetches from the asker. Main's runs of the fleet test
+  /// `a_location_round_asks_a_peer_whose_session_was_out_once_it_returns` (the quiet Mac Studio, main 3022c6894 and
+  /// 2a5bf7264) failed 2 of 3 with `OwnerUnreachable`: the successor, a root learner, counted `root_view_differs` once
+  /// for each of the foreign voter's 58 and 68 rounds until the lookup's budget ran out, since nothing it compared told
+  /// it that a seat change (A-406) had moved the root on. Do: on a shard whose root has moved past one version (a region
+  /// admitted), run the learner's period, then serve location queries bound to the older version (from Q), to its own
+  /// (from Q), to the next (from P), to the one after (from R) and to the next again (from P), and run the period twice.
+  /// Expect: the older and both newer views refused `RootViewDiffers` and its own view served; three newer views
+  /// counted; no fetch from a shown peer before the queries, a fetch from R (which showed the newest) at the first period
+  /// after them, and none from a shown peer at the second.
+  #[test]
+  fn a_location_query_bound_to_a_newer_root_sends_the_learner_to_fetch_from_its_asker() {
+    use slates_cluster::root_group::RootCommand;
+    let (refusals, periods, behind, (p, q, r)) = crate::daemon::audit_on_shard(|state| {
+      let local = state.fleet.host();
+      let object = ObjectId::new(local, 1);
+      state.node_regions.insert(local, RegionId(0));
+      let older = state.root.configuration().version;
+      assert!(state.root.propose(RootCommand::AdmitRegion(RegionId(2))));
+      let held = state.root.configuration().version;
+      assert!(held > older, "the root moved past one version");
+      let (p, q, r) = (
+        HostId(local.0 ^ 1),
+        HostId(local.0 ^ 2),
+        HostId(local.0 ^ 3),
+      );
+      let bound = |root_version| {
+        Query {
+          object: object.0,
+          region: 0,
+          root_version,
+        }
+        .to_bytes()
+      };
+      let now = slates_rt::futures::now_ns();
+      let before = crate::fleet::root_learner_fetch(state, now);
+      let refusals = [
+        serve(state, q, &bound(older)).err(),
+        serve(state, q, &bound(held)).err(),
+        serve(state, p, &bound(held.saturating_add(1))).err(),
+        serve(state, r, &bound(held.saturating_add(2))).err(),
+        serve(state, p, &bound(held.saturating_add(1))).err(),
+      ];
+      let first = crate::fleet::root_learner_fetch(state, now);
+      let second = crate::fleet::root_learner_fetch(state, now);
+      let behind = state.refusals.get(ROOT_BEHIND).copied();
+      (refusals, [before, first, second], behind, (p, q, r))
+    });
+    let view = Some(LocationError::RootViewDiffers);
+    assert_eq!(
+      refusals,
+      [view, None, view, view, view],
+      "the older and the newer views refused, its own served (from {q:?}, {p:?} and {r:?})"
+    );
+    assert_eq!(
+      periods.map(shown_by),
+      [None, Some(r), None],
+      "fetched from {r:?}, which showed the newest root, at the first period after the queries alone: {periods:?}"
+    );
+    assert_eq!(behind, Some(3), "each newer view counted");
   }
 }
