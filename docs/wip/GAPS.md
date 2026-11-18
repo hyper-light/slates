@@ -1694,7 +1694,8 @@
 >     the seeded engine is still one step, costing what the versions changed.
 >   - Open (found 2026-11-18, g232): a taken-over plain volume is restored in one call (`verbs::materialize_taken_over`:
 >     `slates_archive::restore`, then every file written), so a kernel-sized base volume's successor would hold one poll
->     for seconds, the wall the green's own takeover meets (A-286's owed item `recover_green_inputs`).
+>     for seconds. The green's own takeover met the same wall until A-333 (2026-11-18), which adopts the successor's
+>     holder ledger and replica instead.
 >
 >   The 2026-11-06 record, as it was found (reported to fixtures, A-217's re-lander): In-process daemon on the Mac (loaded arm, load 30 to 47), Linux v7.4-rc1 whole (97,229
 >   files on APFS, 1.67 GB), the sliced pin:
@@ -1752,7 +1753,8 @@
 >       (`crates/server/tests/green_checkpoint.rs`).
 >   - **Still owed:**
 >     - At `f > 0` the holders' replicas and holder records still grow a version at a time.
->     - A takeover adopts the whole chain into the successor's partition.
+>     - ~~A takeover adopts the whole chain into the successor's partition.~~ Since A-333 (2026-11-18) the successor
+>       records the green by its adoption of its own holder ledger: nothing of the chain up to the adopted version.
 >     - A checkpoint keeps 40 bytes for every accepted identity.
 >     - The checkpoint walk is not sliced.
 >
@@ -1889,7 +1891,8 @@
 > - the measurement over the whole kernel on the launcher (`crates/cli/tests/load_scale.rs`): the owner's and the
 >   holders' longest polls while version 0 places, and the time to place it;
 > - a restarted owner remakes version 0's inputs before it re-ships the record (A-246);
-> - a takeover successor gathers version 0 from its hold in one call (`recover_green_inputs`);
+> - ~~a takeover successor gathers version 0 from its hold in one call (`recover_green_inputs`);~~ closed by A-333
+>   (2026-11-18): the successor adopts the replica it built from version 0 when it was placed;
 > - a large increment's archive is remade from its chain entry on each pass that ships it;
 > - version 0's archive is kept while any candidate lacks version 0, which is for good if a candidate never answers and
 >   membership does not remove it;
@@ -1915,6 +1918,31 @@
 >   holder rebuilds such a green and refuses it again only at the version that mismatched;
 > - a rebuild over a long chain recomputes every version the holder accepted (300,000 at the 100,000-client rung's three
 >   rounds), since the holder keeps no checkpoint of its replica; the holder's growth per version is A-238's owed item.
+>
+> **Fixed 2026-11-18 (g232, A-333): losing the primary of a kernel-sized green lost the green.** The takeover successor
+> rebuilt the green beside the ledger it holds as one of the green's holders: version 0's inputs and every increment's
+> restored whole and every accepted record decoded in one poll, then the origin's bytes and every increment recorded
+> again in its partition and the green replayed twice in another. The partition's merge budget (a quarter of a shard's
+> metadata reserve, about 333 MB a shard on a 64 GB machine of 16 shards) refused the kernel's 1.67 GB origin at its
+> first record, and the takeover was given up at the failover bound (`NotRecovered { TakeoverIncomplete { refused } }`).
+> Now the successor records the green by its adoption of its own holder ledger (`Op::GreenAdopted`) and serves it with
+> the replica it already had, brought to the adopted version a slice at a time; a restarted successor re-adopts it at
+> boot before admitting clients (`crates/server/src/green_adopt.rs`). Test:
+> `a_successor_adopts_a_greens_ledger_past_its_merge_budget_and_keeps_it_across_its_restart`
+> (`crates/server/tests/fleet.rs`: three nodes at `f = 1`, each partition's merge budget a quarter of the 4 MiB base the
+> green's origin is walked from; owner a stopped for good, then the successor restarted warm). Found and fixed
+> beside it: a destroyed green's tombstone was one past its chain's length, short after a checkpoint (A-238), so it could
+> be older than versions its holders had accepted (`a_destroyed_greens_tombstone_is_past_its_head_whatever_its_chain_holds`,
+> `crates/db/tests/model.rs`: 3 and 2 before, 6 and 5 now). Still open:
+> - a successor whose ledger ends two or more versions below the adopted one (the ledger-prefix transfer of records,
+>   GAP-A9-7), and a new candidate that holds nothing of the green (AUD-14's transfer to a new candidate set);
+> - the adoption records the gathered completions in one call on the owner shard, up to each client's bound per client:
+>   at 100,000 clients that is up to some hundreds of thousands of records in one poll;
+> - a successor with no replica whose ledger lacks inputs below the adopted version rebuilds from version 0 at each
+>   attempt (bounded by the failover SLO's attempts), where keeping the partial replica would resume it;
+> - flagged for removal: `GreenOriginated` (a green's origin as bytes in its partition) has no producer since A-333, so
+>   its replay (`GreenReplay`'s decode, `OriginInputsJob`'s recorded stage, a checkout's hash of the bytes) runs only in
+>   the tests that record one; the operation's tag stays, since every operation after it is numbered by its place.
 >
 > The topology launcher is `crates/cli/tests/load_scale.rs`. It runs one primary and two replica server nodes in
 > region 0 at `f = 1`, and client nodes in region 1, so the client nodes are never the green's holders. One harness

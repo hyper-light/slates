@@ -512,6 +512,24 @@ pub enum Op {
     /// The work.
     work: VolumeId,
   },
+  /// A green this node took over from its departed owner, recorded here by adopting this node's own holder ledger of it
+  /// (§4.16 owner-loss recovery; A-333): the green's catalog record, and versions 0 to `version` as the merge records
+  /// this node accepted as one of the green's holders and the inputs it holds for them, which it keeps while the green
+  /// lives here. So the partition records neither the green's origin nor those versions' increments, and its chain holds
+  /// only the versions after `version`. A kernel-sized origin re-recorded as bytes was refused at the partition's merge
+  /// budget, which lost the green with its owner. One operation, so the green is never recorded without its adoption:
+  /// checked as a volume's creation is. Appended (2026-11-18).
+  GreenAdopted {
+    /// The green's catalog record, under its original id and name.
+    record: crate::catalog::VolumeRecord,
+    /// The adopted version: the green's head when this node took it over.
+    version: u64,
+    /// The green's head identity at `version`, which a replica rebuilt from the ledger must reproduce.
+    identity: [u8; 32],
+    /// Version 0's inputs manifest identity, as the ledger's version 0 record names it (the origin's canonical encoding,
+    /// archived); `None` for a green with no origin.
+    origin: Option<[u8; 32]>,
+  },
 }
 
 impl Op {
@@ -554,6 +572,7 @@ impl Op {
       Op::AuditAppended { .. } => "audit_appended",
       Op::GreenAdvanced { .. } => "green_advanced",
       Op::GreenOriginated { .. } => "green_originated",
+      Op::GreenAdopted { .. } => "green_adopted",
       Op::ClientIdReserved { .. } => "client_id_reserved",
       Op::NfsOpenSet { .. } => "nfs_open_set",
       Op::NfsOpenCleared { .. } => "nfs_open_cleared",
