@@ -327,7 +327,9 @@ fn answer(s: &mut ShardState, stream: &mut ShardsStream, handed: Descriptor, ino
 
 /// Answers the filled ask with the value of the section's duplicate in the claimant's process (Windows), and remembers
 /// the claimant as a holder; the daemon's own duplicate closes here. With no claimant (never expected: every ask is
-/// claimed before it is taken), or the OS refusing the duplicate, the ask is refused `EIO`, counted.
+/// claimed before it is taken), or the OS refusing the duplicate, the ask is refused `EIO`, counted. A section handed
+/// gives the stream's resync up (A-427): its guest's stores through it live where only the device maps them once this
+/// daemon is gone.
 #[cfg(windows)]
 fn answer(
   s: &mut ShardState,
@@ -342,10 +344,13 @@ fn answer(
     Some(value)
   });
   match value {
-    Some(value) => owe(
-      stream,
-      &slates_bridge_fuse::shards_fs::descriptor_handle_answer(value),
-    ),
+    Some(value) => {
+      owe(
+        stream,
+        &slates_bridge_fuse::shards_fs::descriptor_handle_answer(value),
+      );
+      super::give_up_resync_for_dax(s, stream);
+    }
     None => {
       owe(
         stream,

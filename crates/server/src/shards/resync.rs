@@ -39,14 +39,22 @@
 //! in the device's channel until the device reads it, and a socket whose every copy rides a message is what macOS's
 //! collector flushes (A-339). A request the dead daemon published with its effect and never answered is answered from
 //! that reply when the device resends it (A-61's rule, `crate::shards`'s replay). Its DAX objects the anchor held are
-//! taken back and their guest's unsynced stores ingested before it serves anything (A-365). Not here yet: Windows
-//! (GAPS).
+//! taken back and their guest's unsynced stores ingested before it serves anything (A-365).
+//!
+//! **Windows** (A-427) keeps the same token, owner view and form, and one thing more: the process that holds the
+//! stream ([`Holder`]), since a successor there duplicates the fresh end into a process rather than sending it on the
+//! channel (A-418's wire). The session's bytes there are [`handle_session_bytes`], and the channel's I/O is the child
+//! module `resync_handle` of `crate::shards`. A successor's half on Windows is not here yet (GAPS).
 
+#[cfg(unix)]
 use std::os::fd::{AsFd, OwnedFd};
 
+#[cfg(unix)]
 use slates_anchor::held::Outgoing;
 use slates_bridge_core::OwnerView;
-use slates_bridge_fuse::shards_resync::{ResyncKind, ResyncMessage, TOKEN_BYTES};
+use slates_bridge_fuse::shards_resync::TOKEN_BYTES;
+#[cfg(unix)]
+use slates_bridge_fuse::shards_resync::{ResyncKind, ResyncMessage};
 
 /// Format: the bytes the anchor keeps beside a stream's held resync end, its hold's session: the token; the owner view's
 /// two owners as four little-endian `u32`s (the volume's uid and gid, the run's uid and gid; all zero for the identity,
@@ -54,7 +62,28 @@ use slates_bridge_fuse::shards_resync::{ResyncKind, ResyncMessage, TOKEN_BYTES};
 /// [`FORM_SETXATTR_EXT`] (A-378). Within the anchor's cap (`slates_anchor::held::SESSION_CAP`).
 pub(super) const SESSION_BYTES: usize = TOKEN_BYTES + 4 * size_of::<u32>() + size_of::<u64>();
 // A session the anchor's message could not carry would refuse every hold: checked as the daemon is built.
+#[cfg(unix)]
 const _: () = assert!(SESSION_BYTES <= slates_anchor::held::SESSION_CAP);
+
+/// The process that holds a Windows stream (A-427): its id, and its creation time (`GetProcessTimes`' 100-nanosecond
+/// count), which together name one process for its whole life, since an id is given again only after its process has
+/// ended. A successor duplicates a fresh stream end into it (A-418). The zero holder names none.
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Holder {
+  /// Its process id.
+  pub(super) pid: u32,
+  /// Its creation time.
+  pub(super) started: u64,
+}
+
+/// Format: the bytes of a Windows stream's held session (A-427), the record of its anchor-held resync end: the session's
+/// [`SESSION_BYTES`], then the holder's process id (`u32`) and creation time (`u64`), little-endian.
+#[cfg(any(windows, test))]
+pub(super) const HANDLE_SESSION_BYTES: usize = SESSION_BYTES + size_of::<u32>() + size_of::<u64>();
+// A session the Windows hold's record could not carry would refuse every hold: checked as the daemon is built.
+#[cfg(any(windows, test))]
+const _: () = assert!(HANDLE_SESSION_BYTES <= slates_anchor::handles::RECORD_CAP);
 /// Format: the session's form bit of a guest whose kernel sends the extended `fuse_setxattr_in` (A-378).
 const FORM_SETXATTR_EXT: u64 = 1;
 
@@ -69,6 +98,7 @@ pub(super) struct Kept {
 }
 
 /// A stream's resync channel as its daemon keeps it.
+#[cfg(unix)]
 #[derive(Debug)]
 pub(super) struct Resync {
   /// The attachment's resync token, which only the anchor's hold and the device know besides.
@@ -78,6 +108,7 @@ pub(super) struct Resync {
   pub(super) end: Option<OwnedFd>,
 }
 
+#[cfg(unix)]
 impl Resync {
   /// Whether the anchor holds the daemon's end: only then can a successor resync the stream.
   pub(super) fn held(&self) -> bool {
@@ -86,6 +117,7 @@ impl Resync {
 }
 
 /// What [`establish`] made: the device's end, to hand out with the stream's, and the channel as the daemon keeps it.
+#[cfg(unix)]
 pub(super) struct Established {
   /// The device's end.
   pub(super) end: OwnedFd,
@@ -104,6 +136,7 @@ pub(super) enum Unmade {
 
 /// Makes `attachment`'s resync channel and asks the anchor to hold the daemon's end with `owners` (see the module's
 /// notes). Run before the attachment's record commits; [`give_up`] undoes the hold if the attach goes no further.
+#[cfg(unix)]
 pub(super) fn establish(attachment: u64, kept: Kept) -> Result<Established, Unmade> {
   let mut token = [0u8; TOKEN_BYTES];
   slates_transport::handshake::secure_random(&mut token).map_err(|_| Unmade::NoToken)?;
@@ -131,6 +164,7 @@ pub(super) fn establish(attachment: u64, kept: Kept) -> Result<Established, Unma
 
 /// Asks the anchor to hold `daemon`, `attachment`'s resync end, with `session`: whether it does. A hold the anchor took
 /// whose session it refused is released again, so the anchor never keeps an end without its token.
+#[cfg(unix)]
 fn hold(attachment: u64, daemon: &OwnedFd, session: &[u8; SESSION_BYTES]) -> bool {
   let held = crate::anchor_hold::send(&Outgoing::Hold {
     attachment,
@@ -154,6 +188,7 @@ fn hold(attachment: u64, daemon: &OwnedFd, session: &[u8; SESSION_BYTES]) -> boo
 /// kernel took at its `INIT`, so a successor shows its guest what this daemon does and parses its requests as this one
 /// does. A refused update gives the resync up ([`give_up`]): a successor must never show the guest another owner or
 /// misread its requests. Whether the anchor still holds the end.
+#[cfg(unix)]
 pub(super) fn tell_session(attachment: u64, resync: &mut Resync, kept: Kept) -> bool {
   if !resync.held() {
     return false;
@@ -175,6 +210,7 @@ pub(super) fn tell_session(attachment: u64, resync: &mut Resync, kept: Kept) -> 
 /// `Resync` naming `attachment` and its `token`, with `device` (the device's end of the fresh stream the successor
 /// serves the attachment on) riding it: whether it went whole. A device that has gone refuses it, and the attachment is
 /// then ended (Shards' option (a)).
+#[cfg(unix)]
 pub(super) fn send_resync(
   held: &OwnedFd,
   attachment: u64,
@@ -194,6 +230,7 @@ pub(super) fn send_resync(
 }
 
 /// What [`give_up`] did.
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum GivenUp {
   /// The anchor held no end for the attachment: nothing to release.
@@ -207,6 +244,7 @@ pub(super) enum GivenUp {
 
 /// Gives `attachment`'s resync up: the anchor closes its end and the daemon its own, so the device reads the channel's
 /// end and knows its share ends with this daemon.
+#[cfg(unix)]
 pub(super) fn give_up(attachment: u64, resync: &mut Resync) -> GivenUp {
   let Some(own) = resync.end.take() else {
     return GivenUp::Nothing;
@@ -243,6 +281,7 @@ pub(super) fn session_bytes(token: &[u8; TOKEN_BYTES], kept: Kept) -> [u8; SESSI
 
 /// The token and what a held end's session bytes keep, or none for bytes of another length or a form bit this daemon
 /// does not know.
+#[cfg(any(unix, test))]
 pub(super) fn from_session(bytes: &[u8]) -> Option<([u8; TOKEN_BYTES], Kept)> {
   let whole = <&[u8; SESSION_BYTES]>::try_from(bytes).ok()?;
   let (token, rest) = whole.split_first_chunk::<TOKEN_BYTES>()?;
@@ -265,6 +304,45 @@ pub(super) fn from_session(bytes: &[u8]) -> Option<([u8; TOKEN_BYTES], Kept)> {
     Kept {
       owners,
       setxattr_ext: form & FORM_SETXATTR_EXT != 0,
+    },
+  ))
+}
+
+/// The record of a Windows stream's held resync end (A-427): its session's bytes ([`session_bytes`]), then its holder's
+/// (see [`HANDLE_SESSION_BYTES`]).
+#[cfg(any(windows, test))]
+pub(super) fn handle_session_bytes(
+  token: &[u8; TOKEN_BYTES],
+  kept: Kept,
+  holder: Holder,
+) -> [u8; HANDLE_SESSION_BYTES] {
+  let session = session_bytes(token, kept);
+  let (pid, started) = (holder.pid.to_le_bytes(), holder.started.to_le_bytes());
+  let mut bytes = [0u8; HANDLE_SESSION_BYTES];
+  for (slot, byte) in bytes
+    .iter_mut()
+    .zip(session.iter().chain(pid.iter()).chain(started.iter()))
+  {
+    *slot = *byte;
+  }
+  bytes
+}
+
+/// The token, what the session keeps and the holder a Windows stream's held record names, or none for bytes of another
+/// length or a session [`from_session`] refuses. A successor reads it (the successor's half on Windows, owed).
+#[cfg(test)]
+pub(super) fn from_handle_session(bytes: &[u8]) -> Option<([u8; TOKEN_BYTES], Kept, Holder)> {
+  let whole = <&[u8; HANDLE_SESSION_BYTES]>::try_from(bytes).ok()?;
+  let (session, holder) = whole.split_first_chunk::<SESSION_BYTES>()?;
+  let (token, kept) = from_session(session)?;
+  let (pid, started) = holder.split_first_chunk::<{ size_of::<u32>() }>()?;
+  let started = <[u8; size_of::<u64>()]>::try_from(started).ok()?;
+  Some((
+    token,
+    kept,
+    Holder {
+      pid: u32::from_le_bytes(*pid),
+      started: u64::from_le_bytes(started),
     },
   ))
 }
@@ -315,6 +393,47 @@ mod tests {
     unknown[SESSION_BYTES - 1] = 0x80;
     assert!(
       from_session(&unknown).is_none(),
+      "a form bit this daemon does not know"
+    );
+  }
+
+  /// A-427. Do: encode a Windows stream's session (a token, a swap of owners, the extended `SETXATTR` form, and the
+  /// holder's id and creation time) and read it back; then read it one byte short, one byte long, with a form bit this
+  /// daemon does not know, and the Unix session's bytes alone. Expect: the token, the view, the form and the holder back
+  /// as made, the Unix session's bytes first; every other refused.
+  #[test]
+  fn a_windows_streams_session_keeps_its_holder() {
+    let token = [9u8; TOKEN_BYTES];
+    let kept = Kept {
+      owners: OwnerView::swapping((501, 20), (1000, 1001)),
+      setxattr_ext: true,
+    };
+    let holder = Holder {
+      pid: 4321,
+      started: 0x01DB_5A6C_0F00_1234,
+    };
+    let bytes = handle_session_bytes(&token, kept, holder);
+    let (read_token, read, read_holder) = from_handle_session(&bytes).unwrap();
+    assert_eq!((read_token, read_holder), (token, holder));
+    assert_eq!(read.owners.swapped(), kept.owners.swapped());
+    assert!(read.setxattr_ext, "the kept form reads back");
+    assert_eq!(
+      &bytes[..SESSION_BYTES],
+      &session_bytes(&token, kept)[..],
+      "the Unix session's bytes come first"
+    );
+    assert!(from_handle_session(&bytes[..HANDLE_SESSION_BYTES - 1]).is_none());
+    let mut long = bytes.to_vec();
+    long.push(0);
+    assert!(from_handle_session(&long).is_none());
+    assert!(
+      from_handle_session(&session_bytes(&token, kept)).is_none(),
+      "a Unix session names no holder"
+    );
+    let mut unknown = bytes;
+    unknown[SESSION_BYTES - 1] = 0x80;
+    assert!(
+      from_handle_session(&unknown).is_none(),
       "a form bit this daemon does not know"
     );
   }
