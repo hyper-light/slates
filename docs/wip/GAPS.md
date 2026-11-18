@@ -1682,6 +1682,19 @@
 >   run of `a_start_whose_shards_sum_past_a_window_comes_up` under load, and the starting thread's CPU by phase at 407
 >   shards. Which unit made the 407-shard start's long thread is the code's arithmetic, not yet measured: the main
 >   thread making every ordered pair of shards' rings (`slates_rt::runtime::connect_pairs`, 165,242 at 407 shards).
+> - **A shard count past the runtime's registry was started and restarted for good (found 2026-11-18 by the
+>   integrator, fixed 2026-11-18, g251).** The test sized its start at three windows' worth of shards with no bound, and
+>   a 4-CPU runner's cheap shard starts asked 1,417 (ubuntu, run 44298844583) and 1,574 (macOS, run 44310013691): past
+>   the 1,024 one process registers (`slates_rt::registry::MAX_SHARDS`). The runtime refused the registration in the
+>   daemon ("too many shards: at most 1024 per process"), after the anchor had started it, so every start failed and the
+>   anchor, which gives no daemon up (A-119, A-311), backed it off for good. Now a `--shards` count past the registry is
+>   refused where it is given, before anything starts: as a bad `--shards` by the roles (`slates_api::role::shard_count`,
+>   which an anchor's own daemon and an embedding host's start read their arguments through) and by the `slates`
+>   command (`a_shard_count_past_the_runtimes_registry_is_refused_before_any_start`, `..._as_usage`, red before: both
+>   parsed 1,025). The test runs the most shards one process runs where three windows ask more, says how many windows
+>   they sum, and skips loudly where they do not pass one. The ring mesh stays quadratic, as A-312 chose (a beat per
+>   ring rather than fewer rings): at the registry's bound 1,047,552 rings, made and charged to no budget the daemon
+>   derives; a count that large is a test's override, never a derived one.
 
 > **The anchor killed every start a busy machine starved (found 2026-11-06, closed 2026-11-07; recovery in one poll and
 > the client's deadlines stay open, below).** A start not beaten within the fixed recovery budget (a wall second) was

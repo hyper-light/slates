@@ -34,6 +34,10 @@ heartbeat lapses, and gives up on a crash loop (the bound is derived from the re
 and the measured daemon start). `SIGINT` or `SIGTERM` stops both. This path is intended to avoid explicit disk writes;
 an anonymous shared segment alone does not establish locked residency or no swapping.
 
+`--shards N` overrides the derived shard count (tests). One process runs at most 1,024 shards (the
+runtime's registry of shards); a larger count is refused as a usage error before anything starts, since
+the daemon could never register its shards and the anchor would restart it for good.
+
 `slates daemon` run alone measures a profile and serves without an anchor (development).
 
 ## Creating the first consensus group

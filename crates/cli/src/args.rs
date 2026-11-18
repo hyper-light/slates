@@ -1144,13 +1144,15 @@ fn take(arguments: &[String]) -> Result<Taken, ParseError> {
   Ok(taken)
 }
 
+/// `--shards N`, read as the roles read it (`slates_api::role::shard_count`): a count past the runtime's registry is
+/// refused as usage before anything starts.
 fn shards_of(taken: &Taken) -> Result<Option<u16>, ParseError> {
   taken
     .value("--shards")
     .map(|s| {
-      s.parse::<u16>().map_err(|e| ParseError::BadValue {
+      slates_api::role::shard_count(s).map_err(|reason| ParseError::BadValue {
         what: "--shards",
-        reason: e.to_string(),
+        reason,
       })
     })
     .transpose()
