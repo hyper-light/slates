@@ -968,7 +968,9 @@ fn a_scope_must_name_a_directory(daemon: &Daemon, id: VolumeId) {
   assert!(
     matches!(
       attach(daemon, id, Some("outside.txt"), Intent::Write),
-      Err(Refusal::BadRequest { .. })
+      Err(Refusal::Volume {
+        refusal: slates_ipc::protocol::VolumeRefusal::NotDirectory
+      })
     ),
     "a scope must be a directory"
   );
