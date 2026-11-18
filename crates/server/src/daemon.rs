@@ -7536,6 +7536,257 @@ mod tests {
     );
   }
 
+  /// A-309's sibling, red before it: a holder outside the successor's placement lets its stale copy go when the
+  /// takeover completes, though the last confirmation dropped the retirement in the version that recorded it. Do: make
+  /// the audit node a holder, in a five-member `f = 1` region whose every neighbourhood is the whole region, of a second
+  /// member's object whose successor places it elsewhere; take that member over and install; then have every survivor
+  /// confirm, and install again. Expect the copy moved to the successor at the first install and reclaimed at the
+  /// second. Before, the holder judged staleness by the kept retirement alone, which the last confirmation had already
+  /// dropped, so the copy, its content and its lease-gate record stayed for good.
+  #[test]
+  fn a_holder_outside_the_successors_placement_lets_its_copy_go_when_the_takeover_completes() {
+    let (moved, reclaimed, held) = audit_on_shard(|state| {
+      use slates_cluster::config_group::{Reconfiguration, RegionalCouncil};
+      use slates_db::register::{
+        Acceptor, Authority, FIRST_EPOCH, HostId, ObjectId, Quorum, Record,
+      };
+      let local = state.fleet.host();
+      let departed = HostId(local.0 ^ 1);
+      let others = [
+        HostId(local.0 ^ 2),
+        HostId(local.0 ^ 3),
+        HostId(local.0 ^ 4),
+      ];
+      // Shape: a neighbourhood of every member, so the departed host's cohorts and its successor's placement are each
+      // a copyset of three among the five.
+      let scatter = 5;
+      let mut members = vec![local, departed];
+      members.extend(others);
+      // The audit node the council's sole voter, so each proposal commits as it is made.
+      state.council = RegionalCouncil::new(
+        local,
+        members,
+        vec![local],
+        Quorum { f: 1 },
+        std::collections::BTreeMap::new(),
+        scatter,
+        false,
+      );
+      install_council(state);
+      let regional = state.council.configuration().clone();
+      let mut retired = regional.clone();
+      retired.take_over(departed, scatter).unwrap();
+      // An object the audit node holds as a member of its cohort, whose successor is another member that places it
+      // where the audit node is not.
+      let object = (0..256u64)
+        .map(|index| ObjectId::new(departed, index))
+        .find(|object| {
+          let cohort = regional.settled[&departed].cohort(departed, *object, regional.quorum);
+          retired
+            .successor(departed, *object)
+            .is_some_and(|successor| {
+              successor != local
+                && cohort.contains(&local)
+                && retired
+                  .configuration_for(successor)
+                  .is_some_and(|placement| !placement.place(*object).candidates.contains(&local))
+            })
+        })
+        .expect(
+          "some object of the departed member is placed by its successor away from this holder",
+        );
+      let generation = state.fleet.configuration().version;
+      let mut acceptor = Acceptor::new(
+        local,
+        Authority {
+          generation,
+          owner: departed,
+        },
+      );
+      acceptor
+        .accept(&Record {
+          owner: departed,
+          object,
+          sequence: 0,
+          epoch: FIRST_EPOCH,
+          generation,
+          value: b"head".to_vec(),
+        })
+        .unwrap();
+      state.holder_records.insert(object, acceptor);
+      state.fleet.track_object_owner(object, departed);
+      assert!(state.council.propose(Reconfiguration::TakeOver(departed)));
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      let successor = state.council.configuration().successor(departed, object);
+      let moved = successor.is_some() && state.fleet.object_owner(object) == successor;
+      for survivor in state.council.configuration().survivors_of(departed) {
+        state.council.propose(Reconfiguration::Confirm {
+          departed,
+          successor: survivor,
+        });
+      }
+      assert!(
+        state
+          .council
+          .configuration()
+          .completed
+          .contains_key(&departed),
+        "the takeover completed"
+      );
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      let reclaimed = state
+        .refusals
+        .get("fleet.takeover.reclaimed")
+        .copied()
+        .unwrap_or(0);
+      (moved, reclaimed, state.holder_records.contains_key(&object))
+    });
+    assert!(moved, "the copy moves to its successor at the takeover");
+    assert_eq!(reclaimed, 1, "and is reclaimed once the takeover completes");
+    assert!(!held, "the stale copy is gone");
+  }
+
+  /// A-309: a holder the takeover never asked keeps its copy when the successor confirms, however the confirmation is
+  /// read. Do: make the audit node hold a copy of a member's object although it is in none of that member's
+  /// neighbourhoods (a copy an earlier neighbourhood of the member left there), in a six-member `f = 1` region whose
+  /// neighbourhoods are three; take the member over and install; have the object's successor alone confirm and
+  /// install; then have every other survivor confirm, so the takeover completes, and install again. Expect the copy
+  /// moved to the successor at the first install and kept at both later ones, each counted `fleet.takeover.kept_unasked`.
+  /// The successor never learned the copy (its round asks only the member's neighbourhoods), so its confirmation says
+  /// nothing of it; before A-309 the second install let it go on the kept retirement's confirmation alone (the lineage
+  /// model's history, `crates/db/tests/lineage_model.rs`), losing the only copy of an object nobody adopted.
+  #[test]
+  fn a_holder_the_takeover_never_asked_keeps_its_copy() {
+    let (moved, after_one, after_all, unasked) = audit_on_shard(|state| {
+      use slates_cluster::config_group::{Reconfiguration, RegionalCouncil};
+      use slates_db::register::{
+        Acceptor, Authority, FIRST_EPOCH, HostId, ObjectId, Quorum, Record, RegionalConfiguration,
+      };
+      let local = state.fleet.host();
+      let others: Vec<HostId> = (100..104).map(|key| HostId(local.0 ^ key)).collect();
+      // Shape: the candidate floor at `f = 1`, so a neighbourhood is three of the six members.
+      let scatter = 3;
+      let quorum = Quorum { f: 1 };
+      let members_with = |departed: HostId| {
+        let mut members = vec![local, departed];
+        members.extend(others.iter().copied());
+        members
+      };
+      // A member whose neighbourhood leaves the audit node out, and an object of it whose successor places it
+      // elsewhere too: rendezvous decides both, so search a few ids.
+      let (departed, object) = (1..64u64)
+        .map(|key| HostId(local.0 ^ key))
+        .find_map(|departed| {
+          let formed = RegionalConfiguration::formed(
+            members_with(departed),
+            quorum,
+            std::collections::BTreeMap::new(),
+            scatter,
+            false,
+          );
+          if formed.neighbourhoods[&departed].hosts.contains(&local) {
+            return None;
+          }
+          let mut retired = formed.clone();
+          retired.take_over(departed, scatter)?;
+          (0..256u64)
+            .map(|index| ObjectId::new(departed, index))
+            .find(|object| {
+              retired
+                .successor(departed, *object)
+                .is_some_and(|successor| {
+                  retired
+                    .configuration_for(successor)
+                    .is_some_and(|placement| !placement.place(*object).candidates.contains(&local))
+                })
+            })
+            .map(|object| (departed, object))
+        })
+        .expect("a member whose neighbourhood and successor both leave the audit node out");
+      state.council = RegionalCouncil::new(
+        local,
+        members_with(departed),
+        vec![local],
+        quorum,
+        std::collections::BTreeMap::new(),
+        scatter,
+        false,
+      );
+      install_council(state);
+      let generation = state.fleet.configuration().version;
+      let mut acceptor = Acceptor::new(
+        local,
+        Authority {
+          generation,
+          owner: departed,
+        },
+      );
+      acceptor
+        .accept(&Record {
+          owner: departed,
+          object,
+          sequence: 0,
+          epoch: FIRST_EPOCH,
+          generation,
+          value: b"head".to_vec(),
+        })
+        .unwrap();
+      state.holder_records.insert(object, acceptor);
+      state.fleet.track_object_owner(object, departed);
+      assert!(state.council.propose(Reconfiguration::TakeOver(departed)));
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      let configuration = state.council.configuration().clone();
+      assert!(
+        !configuration.survivors_of(departed).contains(&local),
+        "the audit node is no survivor: the takeover's rounds never ask it"
+      );
+      let successor = configuration
+        .successor(departed, object)
+        .expect("the object ranks a survivor");
+      let moved = state.fleet.object_owner(object) == Some(successor);
+      assert!(state.council.propose(Reconfiguration::Confirm {
+        departed,
+        successor,
+      }));
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      let after_one = state.holder_records.contains_key(&object);
+      for survivor in state.council.configuration().survivors_of(departed) {
+        state.council.propose(Reconfiguration::Confirm {
+          departed,
+          successor: survivor,
+        });
+      }
+      assert!(
+        state
+          .council
+          .configuration()
+          .completed
+          .contains_key(&departed),
+        "the takeover completed"
+      );
+      install_council(state);
+      crate::takeover::resolve_held_objects(state, local);
+      let after_all = state.holder_records.contains_key(&object);
+      let unasked = state
+        .refusals
+        .get("fleet.takeover.kept_unasked")
+        .copied()
+        .unwrap_or(0);
+      (moved, after_one, after_all, unasked)
+    });
+    assert!(moved, "the copy moves to its successor at the takeover");
+    assert!(
+      after_one,
+      "kept on the successor's confirmation in the kept retirement"
+    );
+    assert!(after_all, "kept on the completed takeover's record");
+    assert_eq!(unasked, 2, "each keep counted");
+  }
+
   /// Measurement (not a gate): the condemnation cost — slates' own takeover work per retired-host object —
   /// for the detection-budget F decision (`docs/wip/fleet-under-load.md` Part 6). The takeover is one batched,
   /// paged phase-one round per retired host (§4.8 "Promotion and takeover", `crate::takeover`), so its work is

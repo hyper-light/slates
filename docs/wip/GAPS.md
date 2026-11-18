@@ -442,7 +442,9 @@
 > **Open (live-durability, 2026-11-09): the regional configuration's encoding carries no version or schema check.**
 > `raft_wire::encode_regional_configuration` is a fixed sequence of fields with no version byte. A-272 appended a
 > field (`dropped_unconfirmed`); an old entry is refused only because it runs out of bytes there (`Truncated`), and a
-> new one at an old build because bytes are left over (`LengthMismatch`). Every caller refuses rather than defaults:
+> new one at an old build because bytes are left over (`LengthMismatch`). A-309 (2026-11-18) put completion records
+> in that field's place: an old entry with no drop recorded now parses as one with no completion record, which reads
+> every absent line unresolved (the safe direction), and a new entry with records misreads at an old build. Every caller refuses rather than defaults:
 > - a retained council's base and view at restart (`retention::restore`);
 > - snapshots (`fold::for_saved`, `fold::install`);
 > - a learner's fetch and a join (`consensus`).
@@ -469,7 +471,8 @@
 > reclaimed yet. Now a round with a lost object does not confirm (`takeover::share_done`). A ranked successor that is
 > neither a member nor a kept retirement, a retirement the bound dropped before every survivor confirmed, and a host
 > retired with nothing to recover through all read `Lineage::Unresolved`
-> (`RegionalConfiguration::dropped_unconfirmed`), and `Unresolved` never reclaims. The sweep for the same inference
+> (`RegionalConfiguration::dropped_unconfirmed`, replaced by A-309's completion records), and `Unresolved` never
+> reclaims. The sweep for the same inference
 > from absence, every path that frees a held record, held content, a merge replica or a live log:
 > - `takeover::resolve_held_objects` on `Settled`: the defect, fixed.
 > - `takeover::resolve_held_objects` on `stale_after_confirmation` (a holder outside the successor's placement once
@@ -481,9 +484,35 @@
 > - `merge_service`'s recompute mismatch: a divergent replica, refused by design. Positive.
 > - The other `merge_service` removals and `takeover::adopt`'s acceptor: taken and reinserted, nothing freed.
 > - `Daemon::drop_held_content` and the warm-restart test's `forget_object`: test injection.
-> **Open (A-272 ii):** an unresolved object is kept but recovered by no one. Owed: kept adoption records, so Settled
-> rests on one, and a round of the current members for unresolved objects, so `f + 1` counts the members that exist
-> now (here, the replacement that holds the live log).
+> **Open (A-272 ii), in part fixed by A-309 (g250, 2026-11-18):** an unresolved object is kept but recovered by no
+> one. Owed: kept adoption records, so Settled rests on one, and a round of the current members for unresolved objects,
+> so `f + 1` counts the members that exist now (here, the replacement that holds the live log).
+> - **Fixed (A-309 piece 1): Settled rests on a completion record** (`RegionalConfiguration::completed`, replacing
+>   `dropped_unconfirmed`), and a holder lets a copy go only for a takeover that asked it. Five histories let a holder
+>   let go of a copy nobody adopted, each red before its fix: a takeover with no survivor (a region formed on one node,
+>   taken over before it reports its grown neighbourhood placed) and one carried into such a takeover, each dropped at
+>   once and read settled (read from the code); and, found by the lineage model (`crates/db/tests/lineage_model.rs`),
+>   an object no survivor of its cohorts was ranked for (no round learned it, the takeover completed), a carried
+>   retirement the bound dropped while its carrier was kept (the carrier's objects ranked anew, a survivor confirmed
+>   without one), and a holder the round never asked reading a confirmation as an adoption. The retirement now records
+>   the neighbourhood a change in flight reached; every object ranks a survivor; the bound drops a carrier with what it
+>   carries. Sibling fixed: a holder outside the successor's placement kept its stale copy for good when the last
+>   confirmation dropped the retirement in the same version. A move on an unresolved line is allowed (records are
+>   bounded, so an old volume's line reads unresolved once its record goes). The lineage model is
+>   `docs/wip/models/Lineage.tla`, read as text only.
+> - **Open (A-309 pieces 2 and 3):** the members that exist now recovering a cohort past its tolerance (the
+>   store-destroyed case: the settled cohort [owner, A, old B] with only A left, the replacement B' holding the live
+>   log outside it; until then such an object stays learned and unadopted, its share unconfirmed); the live takeover
+>   past tolerance (A-240's phase one counts only recorded holders, so at `f = 1` with {A, old B} recorded it waits for
+>   good, g240's finding).
+> - **Open (A-309): a holder the round never asked keeps its copy** (`fleet.takeover.kept_unasked`). A neighbourhood an
+>   owner settled away from keeps the owner's copies; before A-309 they went when the owner's takeover settled, safe
+>   only within tolerance. Owed: such a holder lets them go at the settle, on the owner's report that every record it
+>   owns is placed on the new neighbourhood.
+> - **Residual, recorded:** a line through a retirement the bound let go before it completed stays unresolved and
+>   unrecovered; re-ranking it could adopt a stale copy beside a live adopter the configuration no longer knows. A
+>   neighbourhood an unsettled owner wrote to before the last one it moved to is not recorded: past tolerance a copy
+>   there is neither learned nor let go.
 
 > **Fixed (live-durability, 2026-11-08): an OS socket awaited on the simulation driver woke only on its timers.**
 > The simulation driver took a readiness wait's handle for a fabric port, so an OS socket bound off a shard waited

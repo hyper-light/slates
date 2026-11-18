@@ -12,8 +12,8 @@
 use std::mem::size_of;
 
 use slates_db::register::{
-  Adoption, DomainId, HostEpoch, HostId, Moved, Neighbourhood, OBJECT_BYTES, ObjectId, Quorum,
-  RegionId, RegionalConfiguration, Retirement, RootConfiguration, Settled,
+  Adoption, CompletedTakeover, DomainId, HostEpoch, HostId, Moved, Neighbourhood, OBJECT_BYTES,
+  ObjectId, Quorum, RegionId, RegionalConfiguration, Retirement, RootConfiguration, Settled,
 };
 use slates_transport::connection::Priority;
 use slates_transport::endpoint::{Endpoint, EndpointError};
@@ -747,6 +747,14 @@ pub fn encode_regional_configuration(config: &RegionalConfiguration) -> Vec<u8> 
     encode_hosts(&mut out, &retirement.survivors);
     encode_hosts(&mut out, &retirement.confirmed);
     encode_hosts(&mut out, &retirement.unconfirmed);
+    // The current neighbourhood a change in flight reached (A-309): a presence byte, then its settled form.
+    match &retirement.current {
+      Some(current) => {
+        out.push(u8::from(true));
+        encode_settled(&mut out, current);
+      }
+      None => out.push(u8::from(false)),
+    }
   }
   put_u32(
     &mut out,
@@ -758,7 +766,15 @@ pub fn encode_regional_configuration(config: &RegionalConfiguration) -> Vec<u8> 
     put_bytes(&mut out, &adoption.head);
     put_bytes(&mut out, &adoption.catalog);
   }
-  encode_hosts(&mut out, &config.dropped_unconfirmed);
+  put_u32(
+    &mut out,
+    u32::try_from(config.completed.len()).unwrap_or(u32::MAX),
+  );
+  for (host, record) in &config.completed {
+    put_u64(&mut out, host.0);
+    put_u64(&mut out, record.version);
+    encode_hosts(&mut out, &record.confirmed);
+  }
   put_u32(
     &mut out,
     u32::try_from(config.moved.len()).unwrap_or(u32::MAX),
@@ -791,6 +807,22 @@ fn decode_moved(
     rest = tail;
   }
   Ok((moved, rest))
+}
+
+/// Decodes the completion records (count, then each `(host, version, confirmed hosts)`), bounding every count (A-309).
+fn decode_completed(
+  bytes: &[u8],
+) -> Result<(std::collections::BTreeMap<HostId, CompletedTakeover>, &[u8]), RaftWireError> {
+  let (count, mut rest) = take_count(bytes)?;
+  let mut completed = std::collections::BTreeMap::new();
+  for _ in 0..count {
+    let (host, tail) = take_u64(rest)?;
+    let (version, tail) = take_u64(tail)?;
+    let (confirmed, tail) = decode_hosts(tail)?;
+    completed.insert(HostId(host), CompletedTakeover { version, confirmed });
+    rest = tail;
+  }
+  Ok((completed, rest))
 }
 
 /// Decodes the adoptions map (count, then each `(object, successor, head, catalog)`), bounding the count.
@@ -863,8 +895,8 @@ fn decode_settled_map(
   Ok((settled, rest))
 }
 
-/// Decodes the retirements map (count, then each `(host, version, settled, survivors, confirmed, unconfirmed)`),
-/// bounding every count.
+/// Decodes the retirements map (count, then each `(host, version, settled, survivors, confirmed, unconfirmed,
+/// current)`, the current neighbourhood a presence byte and then its settled form), bounding every count.
 fn decode_retired(
   bytes: &[u8],
 ) -> Result<(std::collections::BTreeMap<HostId, Retirement>, &[u8]), RaftWireError> {
@@ -877,11 +909,19 @@ fn decode_retired(
     let (survivors, tail) = decode_hosts(tail)?;
     let (confirmed, tail) = decode_hosts(tail)?;
     let (unconfirmed, tail) = decode_hosts(tail)?;
+    let (present, tail) = take_bool(tail)?;
+    let (current, tail) = if present {
+      let (current, tail) = decode_settled(tail)?;
+      (Some(current), tail)
+    } else {
+      (None, tail)
+    };
     retired.insert(
       HostId(host),
       Retirement {
         version,
         settled,
+        current,
         survivors,
         confirmed,
         unconfirmed,
@@ -906,7 +946,7 @@ pub fn decode_regional_configuration(bytes: &[u8]) -> Result<RegionalConfigurati
   let (settled, rest) = decode_settled_map(rest)?;
   let (retired, rest) = decode_retired(rest)?;
   let (adoptions, rest) = decode_adoptions(rest)?;
-  let (dropped_unconfirmed, rest) = decode_hosts(rest)?;
+  let (completed, rest) = decode_completed(rest)?;
   let (moved, rest) = decode_moved(rest)?;
   expect_end(rest)?;
   Ok(RegionalConfiguration {
@@ -920,7 +960,7 @@ pub fn decode_regional_configuration(bytes: &[u8]) -> Result<RegionalConfigurati
     settled,
     retired,
     adoptions,
-    dropped_unconfirmed,
+    completed,
     moved,
   })
 }
@@ -1815,9 +1855,88 @@ mod tests {
     let bytes = encode_regional_configuration(&config);
     assert_eq!(
       decode_regional_configuration(&bytes),
-      Ok(config),
+      Ok(config.clone()),
       "round-trip is identity with a moved object"
     );
+    // A completed takeover's record (A-309) survives it too: every survivor of every kept retirement confirms.
+    let departed: Vec<HostId> = config.retired.keys().copied().collect();
+    for retired in departed {
+      for survivor in config.survivors_of(retired) {
+        config.confirm(retired, survivor);
+      }
+    }
+    assert!(!config.completed.is_empty());
+    let bytes = encode_regional_configuration(&config);
+    assert_eq!(
+      decode_regional_configuration(&bytes),
+      Ok(config),
+      "round-trip is identity with completion records"
+    );
+    // A retirement taken while a change was in flight keeps the current neighbourhood its joint writes reached
+    // (A-309): a member formed beside one other, a third admitted, then the member taken over before it reports.
+    let mut joint = RegionalConfiguration::formed(
+      vec![A, B],
+      Quorum { f: 1 },
+      std::collections::BTreeMap::new(),
+      3,
+      false,
+    );
+    assert!(joint.admit(HostId(3), None, 3));
+    joint.take_over(A, 3);
+    assert!(
+      joint
+        .retired
+        .get(&A)
+        .is_some_and(|retirement| retirement.current.is_some()),
+      "the change in flight is kept"
+    );
+    let bytes = encode_regional_configuration(&joint);
+    assert_eq!(
+      decode_regional_configuration(&bytes),
+      Ok(joint),
+      "round-trip is identity with a retirement's current neighbourhood"
+    );
+  }
+
+  /// A-309: a completion record whose confirmed-host count lies — more ids than the bytes back — is refused before
+  /// allocating, and a configuration cut short inside its completion records is refused.
+  #[test]
+  fn a_lying_completion_record_count_is_refused() {
+    use slates_db::register::RegionalConfiguration;
+    let mut config = RegionalConfiguration::formed(
+      vec![A, B, HostId(3)],
+      Quorum { f: 1 },
+      std::collections::BTreeMap::new(),
+      3,
+      false,
+    );
+    config.take_over(A, 3);
+    for survivor in config.survivors_of(A) {
+      config.confirm(A, survivor);
+    }
+    let confirmed = config
+      .completed
+      .get(&A)
+      .map(|record| record.confirmed.len())
+      .unwrap();
+    assert!(config.moved.is_empty());
+    let bytes = encode_regional_configuration(&config);
+    // The record is the last one: its confirmed ids (a count, then each) are followed only by the moved objects' count.
+    let tail = confirmed * size_of::<u64>() + size_of::<u32>();
+    let count_at = bytes.len() - tail - size_of::<u32>();
+    let mut lying = bytes.clone();
+    lying[count_at..count_at + size_of::<u32>()].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert_eq!(
+      decode_regional_configuration(&lying),
+      Err(RaftWireError::LengthMismatch),
+      "a count beyond the bytes is refused"
+    );
+    for cut in 1..=tail + size_of::<u32>() + 2 * size_of::<u64>() {
+      assert!(
+        decode_regional_configuration(&bytes[..bytes.len() - cut]).is_err(),
+        "a configuration cut {cut} bytes short is refused"
+      );
+    }
   }
 
   /// A configuration whose moved-object count lies — more exceptions than the bytes back — is refused before
@@ -1866,11 +1985,12 @@ mod tests {
     );
     config.take_over(A, 3);
     let bytes = encode_regional_configuration(&config);
-    // The last retirement ends with its confirmed ids (a count, none here) and its unconfirmed ids (a count,
-    // none here): make the confirmed count claim every id there is.
-    // The adoptions' count, the unconfirmed drops' count and the moved objects' count (none of each here) follow the
-    // last retirement, in that order.
-    let confirmed_count_at = bytes.len() - 5 * size_of::<u32>();
+    // The last retirement ends with its confirmed ids (a count, none here), its unconfirmed ids (a count, none here)
+    // and its current neighbourhood's presence byte (none here, A-309): make the confirmed count claim every id there
+    // is. The adoptions' count, the completion records' count and the moved objects' count (none of each here) follow
+    // the last retirement, in that order.
+    let tail = 5 * size_of::<u32>() + 1;
+    let confirmed_count_at = bytes.len() - tail;
     let mut lying = bytes.clone();
     lying[confirmed_count_at..confirmed_count_at + size_of::<u32>()]
       .copy_from_slice(&u32::MAX.to_le_bytes());
@@ -1879,7 +1999,7 @@ mod tests {
       Err(RaftWireError::LengthMismatch),
       "a count beyond the bytes is refused"
     );
-    for cut in 1..=5 * size_of::<u32>() {
+    for cut in 1..=tail {
       assert!(
         decode_regional_configuration(&bytes[..bytes.len() - cut]).is_err(),
         "a configuration cut {cut} bytes short is refused"
