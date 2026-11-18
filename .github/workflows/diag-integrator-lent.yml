@@ -1,0 +1,32 @@
+# DIAG (not for main): g245's two dead-lent-session fleet tests 10 times each under two spinners a CPU at nice 19, on Linux x86_64
+# and arm64 (g245, owed under load).
+name: diag-integrator-lent
+on:
+  push:
+    branches: ['diag-integrator-lent-*']
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  lent-session-fleet:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the tests
+        run: cargo test --locked -p slates-server --test fleet --no-run
+      - name: The lent-session fleet tests under spinners
+        run: bash .github/diag-integrator-lent.sh
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lent-results-${{ matrix.os }}
+          path: target/lent-*
