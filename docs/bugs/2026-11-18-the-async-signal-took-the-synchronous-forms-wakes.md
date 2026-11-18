@@ -58,4 +58,3 @@ swallowed error (CLAUDE.md §2 item 9). The bridge then started with no thread, 
 deadline. The start is now refused typed (`IpcError::OsRefused`, "spawn the completion bridge's thread"), through a
 `Spawn` seam the test refuses with `EAGAIN` (`a_bridge_whose_thread_the_os_refuses_is_refused_typed`, red with the
 refusal bypassed).
-
