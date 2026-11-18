@@ -1676,14 +1676,18 @@ async fn serve_peer_records(
             crate::takeover::serve_host_prepare(s, local, peer_host, &request)
           })
           .unwrap_or_default(),
-          stream if is_content_stream(stream) => state::with_state(|s| {
-            let peer_host = s
-              .learned_members
-              .get(&peer_anchor)
-              .map_or(seed, |learned| learned.host);
-            serve_content_request(s, local, peer_host, stream, &request)
-          })
-          .unwrap_or_default(),
+          stream if is_content_stream(stream) => {
+            let reply = state::with_state(|s| {
+              let peer_host = s
+                .learned_members
+                .get(&peer_anchor)
+                .map_or(seed, |learned| learned.host);
+              serve_content_request(s, local, peer_host, stream, &request)
+            })
+            .unwrap_or_default();
+            injected_content_ack_delay(&reply).await;
+            reply
+          }
           // A green's merge record with the inputs it names while this holder lacks them (§4.16 "Apply on holders",
           // "Commit" in one exchange a version): the inputs are held, then the record recomputed and accepted.
           crate::merge_service::MERGE_RECORD_STREAM => state::with_state(|s| {
@@ -2783,6 +2787,7 @@ fn start_mirror_seal(
     SealJob {
       snapshot: head,
       sequence,
+      put_sequence: sequence,
       archiver: Some(archiver),
       archive: None,
       manifest: None,
@@ -2795,6 +2800,8 @@ fn start_mirror_seal(
       rounds: 0,
       first_round_at_ns: None,
       healing: false,
+      republish: false,
+      refilled: Vec::new(),
       records_acked: Vec::new(),
       shipment: None,
     },
@@ -2926,7 +2933,7 @@ fn advance_seals(
         head,
         sequence,
         created_unix,
-        false,
+        None,
       )
     {
       continue;
@@ -2944,14 +2951,23 @@ fn advance_seals(
 
 /// The healer's step (§4.10 "anti-entropy walks Merkle manifests between recorded holders and repairs only
 /// differing subtrees; the healer replays puts …"; §4.8 "Derived constants": "healer cadence from the
-/// measured put-failure rate"): once per healer period ([`heal_period_ns`]) it re-opens a seal job for the
-/// **next** owned volume whose head snapshot is recorded placed — a `healing` job, seeded with the owner as
-/// the only acknowledged holder — so the ordinary content rounds re-**offer** the archive to every candidate:
-/// a holder that lost nothing answers with an empty missing set and is put zero bytes (the Merkle identity
-/// diff finds no differing subtree), a holder that lost content is put exactly what it lacks and counts as
-/// a repair, and the placement is re-recorded. One snapshot per period, in volume-id order, wrapping: a
-/// bounded slice of the walk over everything this node has placed (§4.3 bounded work). Nothing to do while
-/// a seal for the volume is already in progress, on a laptop (nothing is placed remotely), or between steps.
+/// measured put-failure rate"): once per healer period ([`heal_period_ns`]) it opens a `healing` seal job for
+/// the **next** owned volume whose head snapshot is recorded placed, of the kind [`heal_for`] decides:
+/// - **Restore** the holders the placement, and so the shipped head, names: the ordinary content rounds
+///   re-**offer** the archive to each of them at once — a holder that lost nothing answers with an empty missing
+///   set and is put zero bytes (the Merkle identity diff finds no differing subtree), a holder that lost content
+///   is put exactly what it lacks and counts as a repair — and the job ends once every one of them holds it,
+///   recording nothing: the placement and the head already name them. Until 2026-11-17 the job re-offered to the
+///   current cohort in rendezvous order, placed on whichever candidates answered first and re-recorded that set
+///   at the head's sequence, so a cohort member that held no head yet took the content in the named holder's
+///   place, the named holder stayed empty, and the head kept naming it (A-276).
+/// - **Replace** a named holder that has left the fleet: the content is put on the current cohort at the next
+///   sequence, and once recorded the head is republished there ([`record_replacement`]), since a head is never
+///   rewritten at its sequence.
+///
+/// One snapshot per period, in volume-id order, wrapping: a bounded slice of the walk over everything this
+/// node has placed (§4.3 bounded work). Nothing to do while a seal for the volume is already in progress, on a
+/// laptop (nothing is placed remotely), or between steps.
 fn heal_one_placed_snapshot(state: &mut ShardState, local: HostId, created_unix: u64) {
   let now = state.clock.monotonic_ns();
   if state
@@ -2982,20 +2998,27 @@ fn heal_one_placed_snapshot(state: &mut ShardState, local: HostId, created_unix:
         return None;
       }
       let snapshot = state.db.partition().snapshot(*id, record.head)?;
-      matches!(snapshot.placed, PlacementState::Placed { .. }).then_some((
+      let PlacementState::Placed { region, .. } = &snapshot.placed else {
+        return None;
+      };
+      Some((
         *id,
         *handle,
         object,
         record.head,
         record.epoch,
+        region.clone(),
       ))
     });
   state.healer.last_step_ns = Some(now);
-  let Some((id, handle, object, head, sequence)) = candidate else {
+  let Some((id, handle, object, head, sequence, region)) = candidate else {
     state.healer.after = None;
     return;
   };
   state.healer.after = Some(id);
+  let Some(heal) = heal_for(state, local, object, &region) else {
+    return;
+  };
   start_seal(
     state,
     local,
@@ -3004,9 +3027,170 @@ fn heal_one_placed_snapshot(state: &mut ShardState, local: HostId, created_unix:
     head,
     sequence,
     created_unix,
-    true,
+    Some(heal),
   );
 }
+
+/// What a healing job does ([`heal_one_placed_snapshot`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Heal {
+  /// Re-offer the content at the head's sequence to these holders — the ones the placement names that can be put to,
+  /// the owner among them when named — and end once every one of them holds it: the placement and the head stay as
+  /// they are.
+  Restore(Vec<HostId>),
+  /// Place on the current cohort at the next sequence and republish the head there naming that set.
+  Replace,
+}
+
+/// The heal for an owned snapshot whose recorded placement names `region` (§4.10 "the healer"), as [`heal_decision`]
+/// decides it from the council's members and `object`'s candidates under the current configuration, with what it found
+/// counted.
+fn heal_for(
+  state: &mut ShardState,
+  local: HostId,
+  object: ObjectId,
+  region: &[u64],
+) -> Option<Heal> {
+  let configuration = state.fleet.configuration();
+  let quorum = configuration.quorum;
+  let candidates = configuration.place(object).candidates;
+  let (heal, found) = heal_decision(
+    local,
+    region,
+    &state.council.configuration().members,
+    &candidates,
+    quorum,
+  );
+  for (seen, counter) in [
+    (found.named_gone, HEAL_NAMED_GONE),
+    (found.named_short, HEAL_NAMED_SHORT),
+    (
+      found.named_outside_candidates,
+      HEAL_NAMED_OUTSIDE_CANDIDATES,
+    ),
+  ] {
+    if seen {
+      state.count(counter, 1);
+    }
+  }
+  heal
+}
+
+/// What the healer found in a placement beside the heal it decided ([`heal_decision`]); each is counted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct HealFindings {
+  /// A remote holder the placement names is no longer a member ([`HEAL_NAMED_GONE`]).
+  named_gone: bool,
+  /// The placement names fewer than `f + 1` holders ([`HEAL_NAMED_SHORT`]).
+  named_short: bool,
+  /// A remote holder the placement names is a member outside the object's candidates
+  /// ([`HEAL_NAMED_OUTSIDE_CANDIDATES`]).
+  named_outside_candidates: bool,
+}
+
+/// The heal for a placement naming `region`, owned by `local`, under the council's `members` and the object's current
+/// `candidates` at `quorum` (§4.10 "the healer"; A-276). Pure, so the rule is tested at `f = 0` and on a fleet alike:
+/// - a **replace** when a remote holder it names is no longer a member, which no re-offer can reach, or when it names
+///   fewer than `f + 1` holders (one recorded before the fleet's `f` grew): the content is placed on the current cohort
+///   at the next sequence and the head republished there;
+/// - otherwise a **restore** of the holders it names that can be put to: the owner, which holds its own content, and the
+///   named remote holders among the candidates, the only ones that admit a placement from this owner
+///   (`content_authority`). A named member outside the candidates keeps the copy its head names and serves reads of it,
+///   but cannot be put to, so it is left out;
+/// - no heal when no named remote holder can be put to: at `f = 0` the owner's own copy is the whole placement, and
+///   nothing remote is named to verify.
+///
+/// Until 2026-11-17 the replace was taken whenever no remote holder was named, which at `f = 0` replaced a whole
+/// placement at every healer step and advanced a one-node fleet's head sequence by one each time, for good.
+fn heal_decision(
+  local: HostId,
+  region: &[u64],
+  members: &[HostId],
+  candidates: &[HostId],
+  quorum: Quorum,
+) -> (Option<Heal>, HealFindings) {
+  let mut named: Vec<HostId> = Vec::with_capacity(region.len());
+  for host in region.iter().map(|host| HostId(*host)) {
+    if !named.contains(&host) {
+      named.push(host);
+    }
+  }
+  let remote = || named.iter().filter(|host| **host != local);
+  let copies = u64::try_from(named.len()).unwrap_or(u64::MAX);
+  let found = HealFindings {
+    named_gone: remote().any(|host| !members.contains(host)),
+    named_short: copies < u64::from(quorum.f).saturating_add(1),
+    named_outside_candidates: remote().any(|host| !candidates.contains(host)),
+  };
+  if found.named_gone || found.named_short {
+    return (Some(Heal::Replace), found);
+  }
+  // The holders the restore ends with: the owner when the placement names it, and the named remote holders it can put
+  // to, in the placement's order.
+  let holders: Vec<HostId> = named
+    .iter()
+    .copied()
+    .filter(|host| *host == local || candidates.contains(host))
+    .collect();
+  let restore = holders.iter().any(|host| *host != local);
+  (restore.then_some(Heal::Restore(holders)), found)
+}
+
+/// The status count under which the healer records a step that found a holder the shipped head names no longer a
+/// member: a re-offer cannot reach that holder, so the job places on the current cohort and republishes the head
+/// (A-276).
+/// Format: a refusal name in the daemon's status report.
+const HEAL_NAMED_GONE: &str = "fleet.heal.named_gone";
+
+/// The status count under which the healer records a step that found the shipped head naming fewer than `f + 1`
+/// holders, as a placement recorded before the fleet's `f` grew does: the job places on the current cohort and
+/// republishes the head, as for a departed holder (A-276).
+/// Format: a refusal name in the daemon's status report.
+const HEAL_NAMED_SHORT: &str = "fleet.heal.named_short";
+
+/// The status count under which the healer records a step that found a holder the shipped head names still a member
+/// but no longer among the object's candidates, so no placement to it is admitted: its copy is left as its head names
+/// it, and only the named candidates are restored.
+/// Format: a refusal name in the daemon's status report.
+const HEAL_NAMED_OUTSIDE_CANDIDATES: &str = "fleet.heal.named_outside_candidates";
+
+/// The status count under which the healer records a heal that ran the membership horizon without finishing (every
+/// put refused, or a holder to restore unreachable): the job is dropped and the volume healed again on a later step,
+/// so one stuck heal never leaves the healer skipping the volume (banned item 8; A-276).
+/// Format: a refusal name in the daemon's status report.
+const HEAL_UNFINISHED: &str = "fleet.heal.unfinished";
+
+/// The status count under which the healer records a head republished at the next sequence to name the holders that
+/// hold its content (A-276). Format: a refusal name in the daemon's status report.
+const HEAL_REPUBLISHED: &str = "fleet.heal.republished";
+
+/// The status count under which the healer records a replace whose placement and republished head were not recorded:
+/// the database refused the transaction (rolled back whole), or the volume's head moved before it could be advanced.
+/// Nothing was recorded, so the shipped head keeps naming the holders it named and the volume is healed again on a later
+/// step. Format: a refusal name in the daemon's status report.
+const HEAL_REPUBLISH_REFUSED: &str = "fleet.heal.republish_refused";
+
+/// The status count under which the healer records a replace whose head's sequence is already the largest value, so
+/// no sequence can follow it to put the content at: the head keeps naming the holders it named.
+/// Format: a refusal name in the daemon's status report.
+const HEAL_EPOCH_EXHAUSTED: &str = "fleet.heal.epoch_exhausted";
+
+/// The status count under which the healer records a restore that ended with every holder the head names holding the
+/// content, whether it put any back or found each whole: the placement and the head were left as they were (§4.10
+/// "the healer"). Format: a refusal name in the daemon's status report.
+const HEAL_VERIFIED: &str = "fleet.heal.verified";
+
+/// The status count of repairs whose holder's acknowledgement arrived after its round had stopped collecting at the
+/// hedge delay ([`fold_late_content`]): a repair all the same, and counted in the shard's repairs; this count shows
+/// how many of them took the straggler's path (§4.10 "the healer").
+/// Format: a refusal name in the daemon's status report.
+const HEAL_REPAIRED_LATE: &str = "fleet.heal.repaired_late";
+
+/// The status count of holders a restoring round put bytes to whose acknowledgement the round did not collect: their
+/// refill outlasted the round's collection at the hedge delay, as a large volume's does against small puts' p95 and
+/// any refill can under load. Their repair is counted when the acknowledgement is folded later, or in a later round.
+/// Format: a refusal name in the daemon's status report.
+const HEAL_REFILL_OUTLASTED_ROUND: &str = "fleet.heal.refill_outlasted_round";
 
 /// The head snapshot of `id` that still needs sealing — its id and the head sequence — or `None` when the
 /// volume has no snapshot yet, or its head is already recorded placed (a finished seal is dropped). A seal in
@@ -3056,8 +3240,9 @@ fn sealable_head(
 
 /// Starts the seal of `head` for `object`: the archive walk over the volume's snapshot, and the content
 /// placement with the owner already counted (it holds its own content) when it is a candidate. `false`,
-/// counted, if the snapshot cannot be walked. A `healing` seal is the healer's re-offer of an
-/// already-placed snapshot ([`heal_one_placed_snapshot`]).
+/// counted, if the snapshot cannot be walked. A `healing` seal is the healer's work on an already-placed
+/// snapshot ([`heal_one_placed_snapshot`]): a restore puts to the holders its placement names, a replace to the
+/// current cohort at the next sequence.
 #[allow(clippy::too_many_arguments)]
 fn start_seal(
   state: &mut ShardState,
@@ -3067,8 +3252,19 @@ fn start_seal(
   head: DbSnapshotId,
   sequence: u64,
   created_unix: u64,
-  healing: bool,
+  healing: Option<Heal>,
 ) -> bool {
+  // A replace puts its content at the next sequence, ahead of every holder's records, since a holder refuses a put
+  // at the head's own sequence that the head there does not name it for (`content_retention::admits`).
+  let put_sequence = if matches!(healing, Some(Heal::Replace)) {
+    let Some(next) = sequence.checked_add(1) else {
+      state.count(HEAL_EPOCH_EXHAUSTED, 1);
+      return false;
+    };
+    next
+  } else {
+    sequence
+  };
   let Ok(slot) = state.volumes.get(handle) else {
     return false;
   };
@@ -3085,8 +3281,12 @@ fn start_seal(
     return false;
   };
   // Content places on the current cohort alone (§4.10): the head names its holders, so a change in flight
-  // never needs it joined.
-  let mut content = state.fleet.configuration().place_content(object);
+  // never needs it joined. A restore puts to the holders the placement names instead: they are the ones the head
+  // names and a successor fetches from, and a head is never rewritten at its sequence.
+  let mut content = match &healing {
+    Some(Heal::Restore(holders)) => Placement::of(holders),
+    Some(Heal::Replace) | None => state.fleet.configuration().place_content(object),
+  };
   content.acked = if content.candidates.contains(&local) {
     vec![local]
   } else {
@@ -3097,18 +3297,41 @@ fn start_seal(
     SealJob {
       snapshot: head,
       sequence,
+      put_sequence,
       archiver: Some(archiver),
       archive: None,
       manifest: None,
       content,
       rounds: 0,
       first_round_at_ns: None,
-      healing,
+      healing: healing.is_some(),
+      republish: matches!(healing, Some(Heal::Replace)),
+      refilled: Vec::new(),
       records_acked: Vec::new(),
       shipment: None,
     },
   );
   true
+}
+
+/// Whether `job`'s content is where the job must leave it: a restoring heal once every holder it restores holds it,
+/// since each is one the shipped head names and a successor may fetch from; every other job — a seal, a replace, a
+/// mirror shipment — once `f + 1` of its candidates do.
+fn seal_complete(job: &SealJob, quorum: Quorum) -> bool {
+  if restoring(job) {
+    job
+      .content
+      .candidates
+      .iter()
+      .all(|holder| job.content.acked.contains(holder))
+  } else {
+    job.content.placed(quorum)
+  }
+}
+
+/// Whether `job` is a heal that restores the holders its snapshot's placement names (rather than a replace).
+fn restoring(job: &SealJob) -> bool {
+  job.healing && !job.republish
 }
 
 /// Advances `object`'s seal one slice of `slice_bytes`; `true` once its archive is complete (this slice or
@@ -3337,11 +3560,17 @@ fn content_budget_at(hedge_delay: u64, round: CommitBudget) -> CommitBudget {
 
 /// Folds one holder's bound content acknowledgement into `job` — the same merge whether it arrived in the
 /// round that dispatched it or later, as a straggler ([`LateReplies::Content`]); the placement is the
-/// distinct acknowledging candidates, so a repeat is inert.
-fn fold_content_ack(job: &mut SealJob, holder: HostId) {
-  if !job.content.acked.contains(&holder) {
-    job.content.acked.push(holder);
+/// distinct acknowledging candidates, so a repeat is inert. Returns whether the fold is a **repair**: the first
+/// acknowledgement of a holder a restoring heal refilled ([`SealJob::refilled`]), so each repaired holder counts
+/// once whichever path its acknowledgement took. Until 2026-11-17 only an acknowledgement inside its round counted,
+/// and a refill that outlasted the round's hedge delay — a large volume's, or any under load — restored the holder
+/// with no repair counted.
+fn fold_content_ack(job: &mut SealJob, holder: HostId) -> bool {
+  if job.content.acked.contains(&holder) {
+    return false;
   }
+  job.content.acked.push(holder);
+  restoring(job) && job.refilled.contains(&holder)
 }
 
 /// The content put `object`'s seal calls for this period — its archive moved out for the dispatch — or
@@ -3387,21 +3616,39 @@ fn content_work(
   let now = state.clock.monotonic_ns();
   let shard = state.shard;
   let job = seal_jobs(state, track).get_mut(&object)?;
-  if job.content.placed(quorum) {
+  // A job whose content is where it must be waits for its record, however long it took: a late acknowledgement can
+  // complete a heal just past its bound, and a replace dropped then would leave its head unpublished.
+  if seal_complete(job, quorum) {
     return None;
   }
-  let hedged = match job.first_round_at_ns {
-    Some(first_round_at) if now.saturating_sub(first_round_at) < hedge_delay => return None,
-    Some(_) => true,
-    None => false,
-  };
+  // Every heal is bounded by the membership horizon from its first round, judged between rounds (its archive home), so
+  // no round in flight loses its job. A heal past it ends unfinished and is counted: the job is dropped, so a later
+  // healer step comes back to the volume rather than skipping it while a job that cannot finish stays open (a replace
+  // whose every put was refused stayed open for good, 2026-11-09; A-276).
+  let overdue = job.healing
+    && job.archive.is_some()
+    && job
+      .first_round_at_ns
+      .is_some_and(|first| now.saturating_sub(first) > crate::lease::horizon_ns());
+  if overdue {
+    seal_jobs(state, track).remove(&object);
+    state.count(HEAL_UNFINISHED, 1);
+    return None;
+  }
+  // A restore offers to every holder it restores at once: each is owed the content, not just the first `f` of them.
+  let hedged = restoring(job)
+    || match job.first_round_at_ns {
+      Some(first_round_at) if now.saturating_sub(first_round_at) < hedge_delay => return None,
+      Some(_) => true,
+      None => false,
+    };
   let archive = job.archive.take()?;
   Some(ContentWork {
     track,
     shard,
     object,
     snapshot: job.snapshot,
-    sequence: job.sequence,
+    sequence: job.put_sequence,
     archive,
     candidates: job.content.candidates.clone(),
     acked: job.content.acked.clone(),
@@ -3532,6 +3779,7 @@ async fn put_seal_content(origin: u16, local: HostId, work: ContentWork) -> Opti
     shard,
     object,
     snapshot,
+    sequence,
     archive,
     round,
     quorum,
@@ -3548,54 +3796,106 @@ async fn put_seal_content(origin: u16, local: HostId, work: ContentWork) -> Opti
     let Some(job) = seal_jobs(s, track).get_mut(&object) else {
       return; // The seal was superseded meanwhile; its archive is dropped with it.
     };
-    if job.snapshot != snapshot {
+    // The round folds only into the job it was put for: a heal of the same snapshot can complete, be recorded and be
+    // followed by another at a different put sequence while a round is out, and its acknowledgements bind the old one.
+    if job.snapshot != snapshot || job.put_sequence != sequence {
       return;
     }
     job.archive = Some(archive);
     if round == 0 && job.first_round_at_ns.is_none() {
       job.first_round_at_ns = Some(dispatched_ns);
     }
-    let Some(placement) = placement else {
+    let Some(fold) = fold_round(job, placement, &refilled, quorum) else {
       return;
     };
-    job.rounds = job.rounds.saturating_add(1);
-    // A healing round that shipped bytes to a holder repaired it: that holder had lost content the
-    // placement recorded it as holding (§4.10 "repairs only differing subtrees").
-    let repaired = if job.healing {
-      refilled
-        .iter()
-        .filter(|host| placement.acked.contains(host))
-        .count()
-    } else {
-      0
-    };
-    for host in placement.acked {
-      fold_content_ack(job, host);
+    s.repairs = s.repairs.saturating_add(fold.repaired);
+    s.put_outcomes.record(fold.placed);
+    if fold.outlasted > 0 {
+      s.count(HEAL_REFILL_OUTLASTED_ROUND, fold.outlasted);
     }
-    let placed = job.content.placed(quorum);
-    s.repairs = s
-      .repairs
-      .saturating_add(u64::try_from(repaired).unwrap_or(u64::MAX));
-    s.put_outcomes.record(placed);
   });
   dispatch
+}
+
+/// What folding one content round's outcome into its seal job found ([`fold_round`]).
+struct RoundFold {
+  /// Holders whose first acknowledgement completed a repair ([`fold_content_ack`]).
+  repaired: u64,
+  /// Holders the round, a restoring one, put bytes to whose acknowledgement it did not collect.
+  outlasted: u64,
+  /// Whether the job's content is now where the job must leave it ([`seal_complete`]).
+  placed: bool,
+}
+
+/// Folds one content round's outcome into its seal job on the owner shard. A restoring round that shipped bytes to a
+/// holder is repairing it: that holder had lost content the placement records it as holding (§4.10 "repairs only
+/// differing subtrees"), so it is remembered on the job ([`SealJob::refilled`]) and its acknowledgement counts the
+/// repair whenever it is folded, in this round or as a straggler's later. Then the round's acknowledgements are
+/// folded. `None` when the round returned no placement: nothing was sent, or the dispatch failed.
+fn fold_round(
+  job: &mut SealJob,
+  placement: Option<Placement>,
+  refilled: &[HostId],
+  quorum: Quorum,
+) -> Option<RoundFold> {
+  if restoring(job) {
+    for host in refilled {
+      if !job.refilled.contains(host) {
+        job.refilled.push(*host);
+      }
+    }
+  }
+  let placement = placement?;
+  job.rounds = job.rounds.saturating_add(1);
+  let outlasted = if restoring(job) {
+    refilled
+      .iter()
+      .filter(|host| !placement.acked.contains(host))
+      .count()
+  } else {
+    0
+  };
+  let mut repaired: u64 = 0;
+  for host in placement.acked {
+    if fold_content_ack(job, host) {
+      repaired = repaired.saturating_add(1);
+    }
+  }
+  Some(RoundFold {
+    repaired,
+    outlasted: u64::try_from(outlasted).unwrap_or(u64::MAX),
+    placed: seal_complete(job, quorum),
+  })
 }
 
 /// Records durably each seal whose content **and** head have both placed (§4.10; AC-8.2 "no head record names
 /// content that is not placed"): the snapshot's manifest identity (`SnapshotIdentified`) and its region
 /// placement (`SnapshotPlaced`, the content holders), the facts `status` and `await placed(region)` answer
 /// from and a restart resumes from. The seal is then dropped — its archive with it; the volume holds the
-/// bytes, and its holders serve them by identity. Runs on the owner shard, where the seal and the volume's
-/// database partition live.
+/// bytes, and its holders serve them by identity. A replacing heal's placement is recorded with the head republished
+/// at the sequence it put the content at, in one transaction ([`record_replacement`]). A restoring heal records nothing: it is dropped once every holder the
+/// placement names holds the content, since the placement and the head already name exactly them, and recording
+/// the set again at the head's sequence could only change the head's value there. Runs on the owner shard, where
+/// the seal and the volume's database partition live.
 fn record_placed_seals(state: &mut ShardState) {
   let quorum = state.fleet.configuration().quorum;
   let now = state.clock.monotonic_ns();
-  let done: Vec<(ObjectId, DbSnapshotId, [u8; 32], Vec<u64>)> = state
+  let restored: Vec<ObjectId> = state
+    .seals
+    .iter()
+    .filter(|(_, job)| restoring(job) && job.manifest.is_some() && seal_complete(job, quorum))
+    .map(|(object, _)| *object)
+    .collect();
+  for object in restored {
+    state.seals.remove(&object);
+    state.count(HEAL_VERIFIED, 1);
+  }
+  let done: Vec<PlacedSeal> = state
     .seals
     .iter()
     .filter_map(|(object, job)| {
       let identity = job.manifest?;
-      if !job.content.placed(quorum) {
+      if restoring(job) || !job.content.placed(quorum) {
         return None;
       }
       let head = state.placed_heads.get(object)?;
@@ -3603,10 +3903,23 @@ fn record_placed_seals(state: &mut ShardState) {
         return None;
       }
       let region = job.content.acked.iter().map(|host| host.0).collect();
-      Some((*object, job.snapshot, identity, region))
+      Some(PlacedSeal {
+        object: *object,
+        snapshot: job.snapshot,
+        identity,
+        region,
+        republish: job.republish.then_some(job.put_sequence),
+      })
     })
     .collect();
-  for (object, snapshot, identity, region) in done {
+  for PlacedSeal {
+    object,
+    snapshot,
+    identity,
+    region,
+    republish,
+  } in done
+  {
     let volume = DbVolumeId { bytes: object.0 };
     // A mirror placement already recorded is kept: a home seal that completes again for a mirrored snapshot (the
     // healer's re-offer) wrote `mirror: None` over it until 2026-10-09, which started a second mirror job for the
@@ -3624,25 +3937,87 @@ fn record_placed_seals(state: &mut ShardState) {
     if mirror.is_some() {
       state.count(MIRROR_KEPT_ON_HOME_RECORD, 1);
     }
-    let ops = [
-      Op::SnapshotIdentified {
-        volume,
-        id: snapshot,
-        identity,
-      },
-      Op::SnapshotPlaced {
-        volume,
-        id: snapshot,
-        placed: PlacementState::Placed { region, mirror },
-      },
-    ];
-    for op in &ops {
-      if state.db.mutate(&mut state.segment, op, now).is_err() {
-        break; // The snapshot is gone (destroyed meanwhile): nothing to record; the seal is dropped.
+    let identified = Op::SnapshotIdentified {
+      volume,
+      id: snapshot,
+      identity,
+    };
+    let placed = Op::SnapshotPlaced {
+      volume,
+      id: snapshot,
+      placed: PlacementState::Placed { region, mirror },
+    };
+    match republish {
+      Some(epoch) => {
+        let republished = Op::VolumeHeadAdvanced {
+          id: volume,
+          head: snapshot,
+          epoch,
+        };
+        let counter = if record_replacement(state, [identified, placed, republished], now) {
+          HEAL_REPUBLISHED
+        } else {
+          HEAL_REPUBLISH_REFUSED
+        };
+        state.count(counter, 1);
+      }
+      None => {
+        for op in [&identified, &placed] {
+          if state.db.mutate(&mut state.segment, op, now).is_err() {
+            break; // The snapshot is gone (destroyed meanwhile): nothing to record; the seal is dropped.
+          }
+        }
       }
     }
     state.seals.remove(&object);
   }
+}
+
+/// A seal whose content and head have both placed, as [`record_placed_seals`] records it.
+struct PlacedSeal {
+  object: ObjectId,
+  snapshot: DbSnapshotId,
+  identity: [u8; 32],
+  region: Vec<u64>,
+  /// For a replacing heal: the sequence its content was put at, where the head is republished naming `region`.
+  republish: Option<u64>,
+}
+
+/// Records a replacing heal's placement and republishes the head over it, as one durable record (§4.10 "the healer";
+/// A-276): `ops` are the snapshot's identity, its placement on the holders that took the content at the next sequence,
+/// and the volume's head advanced to that sequence with the same snapshot (`Op::VolumeHeadAdvanced`, as a lost head's
+/// advance does), so the next record period ships a head there naming those holders. The head is never given a new
+/// value at its old position: a holder refuses that, rightly. So nothing is recorded unless the volume's head is still
+/// the snapshot and the advance is to the sequence just after its own: a newer head names its own holders. And the
+/// three are one transaction, every operation checked before it opens (inside one, a refused operation would leave the
+/// ones before it applied, to be logged at the commit): recorded apart, a refusal or a crash between the placement and
+/// the advance left the placement naming the new holders at the old sequence, a head value there that differs from
+/// the one its holders hold, which they refuse for good. Whether the transaction committed; a commit that fails is
+/// rolled back whole (`Db::commit`).
+fn record_replacement(state: &mut ShardState, ops: [Op; 3], now: u64) -> bool {
+  let follows = ops.iter().any(|op| match op {
+    Op::VolumeHeadAdvanced { id, head, epoch } => state
+      .db
+      .partition()
+      .volume(*id)
+      .is_some_and(|record| record.head == *head && record.epoch.checked_add(1) == Some(*epoch)),
+    _ => false,
+  });
+  if !follows
+    || ops
+      .iter()
+      .any(|op| state.db.partition().check(op, now).is_err())
+  {
+    return false;
+  }
+  state.db.begin();
+  let applied = ops
+    .iter()
+    .all(|op| state.db.mutate(&mut state.segment, op, now).is_ok());
+  // Committed whatever was applied, since an open transaction would take the next caller's operations into it; every
+  // operation passed its check above and an apply after a passing check is unconditional, so all three were.
+  let committed = state.db.commit(&mut state.segment).is_ok();
+  applied && committed
 }
 
 /// The status refusal count under which the fleet loop records a taken-over volume it could not
@@ -4011,6 +4386,23 @@ async fn injected_serve_delay() {
 /// Counter: a test's injected serve delay the runtime could not time; the answer went at once.
 /// Format: a counter name in the daemon's status report.
 const SERVE_DELAY_UNTIMED: &str = "fleet.serve_delay_untimed";
+
+/// Waits out a test's injected acknowledgement delay (`Daemon::inject_content_ack_delay`) before this holder's content
+/// `reply` leaves, when the reply is an acknowledgement; nothing in production. The hold took the content before the
+/// wait, so the owner meets the condition a holder whose refill outlasts the round meets under load: its round stops
+/// collecting at the hedge delay and the acknowledgement arrives as a straggler's. A sleep the runtime could not time is
+/// counted and the reply goes at once.
+async fn injected_content_ack_delay(reply: &[u8]) {
+  let Some(delay_ns) = state::with_state(|s| s.injected_content_ack_delay_ns).flatten() else {
+    return;
+  };
+  if !matches!(ContentMessage::decode(reply), Ok(ContentMessage::Ack(_))) {
+    return;
+  }
+  if slates_rt::futures::sleep(delay_ns).await.is_err() {
+    count_refusal(SERVE_DELAY_UNTIMED);
+  }
+}
 
 /// Runs `recovery` on this shard with the memory-pressure hold lifted for exactly its duration, then sets the hold
 /// back. A takeover's materialization (its fetch's staging, the restore, the volume's reservations and the writes
@@ -5393,11 +5785,22 @@ fn fold_late_content(late: LateReplies, replies: &[(HostId, TimedReply)]) {
         Track::Home => s.put_latency.record(latency_ns),
         Track::Mirror => s.mirror_put_latency.record(latency_ns),
       }
-      if let Some(job) = seal_jobs(s, track).get_mut(&object)
-        && job.snapshot == snapshot
-        && job.content.candidates.contains(holder)
-      {
-        fold_content_ack(job, *holder);
+      // Folded only into the job the put was made for: the same snapshot at the same put sequence. A restore's
+      // straggler, bound to the head's sequence, is no acknowledgement of a replace of that snapshot that started
+      // meanwhile at the next one, which the holder's door judges apart.
+      let repaired = match seal_jobs(s, track).get_mut(&object) {
+        Some(job)
+          if job.snapshot == snapshot
+            && job.put_sequence == sequence
+            && job.content.candidates.contains(holder) =>
+        {
+          fold_content_ack(job, *holder)
+        }
+        _ => false,
+      };
+      if repaired {
+        s.repairs = s.repairs.saturating_add(1);
+        s.count(HEAL_REPAIRED_LATE, 1);
       }
     }
   });
@@ -8733,6 +9136,81 @@ mod tests {
       heal_period_ns(&outcomes),
       HEARTBEAT_NS,
       "short rounds as common as placed ones: one snapshot per period, the floor"
+    );
+  }
+
+  /// §4.10 "the healer" (A-276), the heal's decision at `f = 0` and on a fleet. Do: decide the heal for a one-node
+  /// fleet's placement (the owner alone at `f = 0`), for an `f = 1` placement whose named holders are members and
+  /// candidates, one naming a departed holder, one naming fewer than `f + 1` holders, one whose named holder is a member
+  /// outside the candidates, and one naming a holder twice. Expect: no heal at `f = 0`, since the owner's copy is the
+  /// whole placement; a restore of exactly the named candidates with the owner; a replace for the departed and for the
+  /// short, each found; no heal when no named candidate is left, the outsider found; and the repeat counted once.
+  /// Before (2026-11-17), a placement naming no remote holder was replaced, so at `f = 0` every healer step advanced the
+  /// head's sequence by one, for good.
+  #[test]
+  fn the_heal_restores_named_candidates_and_replaces_only_a_departed_or_short_placement() {
+    let (owner, b, c, d) = (HostId(1), HostId(2), HostId(3), HostId(4));
+    let lone = heal_decision(owner, &[owner.0], &[owner], &[owner], Quorum { f: 0 });
+    assert_eq!(
+      lone,
+      (None, HealFindings::default()),
+      "f = 0: the owner's own copy is the whole placement; nothing to heal"
+    );
+    let fleet = [owner, b, c];
+    let restored = heal_decision(owner, &[owner.0, b.0], &fleet, &fleet, Quorum { f: 1 });
+    assert_eq!(
+      restored,
+      (Some(Heal::Restore(vec![owner, b])), HealFindings::default()),
+      "every named holder a member and a candidate: restore exactly them"
+    );
+    let departed = heal_decision(owner, &[owner.0, d.0], &fleet, &fleet, Quorum { f: 1 });
+    assert_eq!(
+      departed,
+      (
+        Some(Heal::Replace),
+        HealFindings {
+          named_gone: true,
+          named_outside_candidates: true,
+          ..HealFindings::default()
+        }
+      ),
+      "a named holder that left: replace"
+    );
+    let short = heal_decision(owner, &[owner.0], &fleet, &fleet, Quorum { f: 1 });
+    assert_eq!(
+      short,
+      (
+        Some(Heal::Replace),
+        HealFindings {
+          named_short: true,
+          ..HealFindings::default()
+        }
+      ),
+      "fewer than f + 1 named: replace"
+    );
+    let moved = heal_decision(owner, &[owner.0, c.0], &fleet, &[owner, b], Quorum { f: 1 });
+    assert_eq!(
+      moved,
+      (
+        None,
+        HealFindings {
+          named_outside_candidates: true,
+          ..HealFindings::default()
+        }
+      ),
+      "the named holder a member outside the candidates: left as its head names it, found"
+    );
+    let repeated = heal_decision(owner, &[owner.0, b.0, b.0], &fleet, &fleet, Quorum { f: 2 });
+    assert_eq!(
+      repeated,
+      (
+        Some(Heal::Replace),
+        HealFindings {
+          named_short: true,
+          ..HealFindings::default()
+        }
+      ),
+      "a holder named twice is one copy: two copies are short of f + 1 = 3"
     );
   }
 

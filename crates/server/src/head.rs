@@ -142,6 +142,11 @@ pub struct SealJob {
   pub snapshot: SnapshotId,
   /// The head sequence the seal places for (the snapshot's epoch).
   pub sequence: u64,
+  /// The sequence the content is put at: `sequence`, or the next one for a heal that replaces a holder the head names
+  /// and republishes the head (A-276). A holder whose newest head is at `sequence` and does not name it refuses a put
+  /// there (`content_retention::admits`), and admits one ahead of its records, which it keeps until the head
+  /// republished at that sequence names it.
+  pub put_sequence: u64,
   /// The walk in progress, until the archive is complete.
   pub archiver: Option<SnapshotArchiver>,
   /// The complete archive, kept until its content places (then dropped — the volume holds the bytes).
@@ -160,11 +165,23 @@ pub struct SealJob {
   /// round that is merely a little slow is not doubled up on, while one that has fallen into the tail is.
   /// `None` until the first round goes out.
   pub first_round_at_ns: Option<u64>,
-  /// Whether this job is the **healer's** re-offer of an already-placed snapshot (§4.10 "anti-entropy …
-  /// the healer") rather than a fresh seal: the snapshot's placement is already recorded, so the job is
-  /// kept past the "already placed" drop, and a holder that answers the offer with chunks it lacked is a
-  /// **repair**, counted. Its rounds are the ordinary content rounds — the same put, hedge and record path.
+  /// Whether this job is the **healer's** work on an already-placed snapshot (§4.10 "anti-entropy … the
+  /// healer") rather than a fresh seal: the snapshot's placement is already recorded, so the job is kept past
+  /// the "already placed" drop. Its rounds are the ordinary content rounds — the same put, hedge and record
+  /// path. A heal either **restores** the holders the shipped head names (its candidates are exactly those
+  /// holders, it ends once every one of them holds the content, and it records nothing, since the placement
+  /// and the head already name them), or **replaces** them (`republish`).
   pub healing: bool,
+  /// For a healing job that replaces a holder the shipped head names that is no longer a member (or a head naming
+  /// no remote holder): its content is put on the current cohort at `put_sequence` and, once its placement is
+  /// recorded, the head is republished at that sequence naming the new set, since a holder never takes a new value
+  /// at a position it holds (§4.10 "the healer"; A-276). False for every other job.
+  pub republish: bool,
+  /// For a restoring heal: the holders whose answer to one of its offers named chunks they lacked, so the bytes
+  /// they hold once they acknowledge were put back by this heal. Each is one **repair**, counted when its
+  /// acknowledgement is folded, whether it arrives in its round or after the round stopped collecting at the
+  /// hedge delay (a straggler's). Empty for every other job.
+  pub refilled: Vec<HostId>,
   /// For a mirror shipment (`crate::mirror`): the mirror holders of its content that acknowledged its head and
   /// catalog records. Placed in the mirror once `f + 1` hold both. Empty for a home seal.
   pub records_acked: Vec<HostId>,

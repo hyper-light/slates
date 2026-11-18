@@ -809,6 +809,11 @@ pub struct ShardState {
   /// client's reply deadline while each step stays inside its own bound. `None` in production
   /// (`Daemon::inject_serve_delay`).
   pub injected_serve_delay_ns: Option<u64>,
+  /// Test support (never reachable from the wire): how long this node, as a content holder, holds each acknowledgement
+  /// of a placement before it leaves, after the hold already took the content, so the owner's round stops collecting at
+  /// its hedge delay first and folds the acknowledgement as a straggler's. A missing set or a refusal goes at once.
+  /// `None` in production (`Daemon::inject_content_ack_delay`).
+  pub injected_content_ack_delay_ns: Option<u64>,
   /// Test support (never reachable from the wire): a volume whose forwarded verbs this node leaves unanswered while
   /// set, the session carrying its other replies as before, as an owner alive but never answering one exchange is to
   /// its asker (`Daemon::inject_forward_silence`). `None` in production.
