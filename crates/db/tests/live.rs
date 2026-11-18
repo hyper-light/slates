@@ -1323,20 +1323,10 @@ fn a_burst_of_deltas_within_the_whole_state_is_admitted_and_one_past_it_waits() 
     Err(LiveError::NoCredit { durable: None }),
     "the delta that would pass the whole state's bytes waits"
   );
-  assert!(
-    shipper.admits_checkpoint(),
-    "what is in flight is within the credit"
-  );
-  let whole = shipper.append_checkpoint(vec![1; WHOLE]).unwrap();
-  appended.push(whole);
-  assert!(
-    !shipper.admits_checkpoint(),
-    "a checkpoint goes one past the credit, and no further"
-  );
-  assert_eq!(
-    shipper.append_checkpoint(vec![2; WHOLE]),
-    Err(LiveError::NoCredit { durable: None })
-  );
+  appended.push(expect_a_whole_state_admitted_one_past_the_credit(
+    &mut shipper,
+    WHOLE,
+  ));
   let held = held_after(HostId(1), &appended);
   assert_eq!(shipper.on_reply(HostId(2), Ok(held)), Next::Nothing);
   assert_eq!(
@@ -1349,6 +1339,26 @@ fn a_burst_of_deltas_within_the_whole_state_is_admitted_and_one_past_it_waits() 
     "the acknowledgement settles every entry and gives its bytes back"
   );
   assert!(shipper.append(vec![3; DELTA]).is_ok());
+}
+
+/// The whole state of `a_burst_of_deltas_within_the_whole_state_is_admitted_and_one_past_it_waits`. Do: with what is
+/// in flight within the credit, append a whole state of `whole` bytes, then another. Expect the first admitted one past
+/// the credit and the second refused `NoCredit`. Returns the admitted entry.
+fn expect_a_whole_state_admitted_one_past_the_credit(shipper: &mut Shipper, whole: usize) -> Entry {
+  assert!(
+    shipper.admits_checkpoint(),
+    "what is in flight is within the credit"
+  );
+  let admitted = shipper.append_checkpoint(vec![1; whole]).unwrap();
+  assert!(
+    !shipper.admits_checkpoint(),
+    "a checkpoint goes one past the credit, and no further"
+  );
+  assert_eq!(
+    shipper.append_checkpoint(vec![2; whole]),
+    Err(LiveError::NoCredit { durable: None })
+  );
+  admitted
 }
 
 /// AC-8.9: the credit counts what each entry costs. Do bound a shipper at three small entries' bytes and put one small
@@ -2175,23 +2185,7 @@ fn hostile_batches_are_refused_not_trusted() {
   assert_eq!(object_of(&bytes), Some(OBJECT));
   assert_eq!(epoch_of_batch(&bytes), Some(HostEpoch(2)));
   assert_eq!(encode_batch(&[]), None, "an empty batch is never made");
-  for length in 0..bytes.len() {
-    assert_eq!(
-      decode_batch(&bytes[..length], CAP),
-      Err(LiveError::Malformed),
-      "truncated at {length}"
-    );
-  }
-  let count_at = 8 + 16 + 8;
-  for count in [u32::MAX, 0, 4] {
-    let mut lying = bytes.clone();
-    lying[count_at..count_at + 4].copy_from_slice(&count.to_le_bytes());
-    assert_eq!(
-      decode_batch(&lying, CAP),
-      Err(LiveError::Malformed),
-      "a count of {count}"
-    );
-  }
+  expect_every_truncation_and_lying_count_refused(&bytes);
   let mut longer = bytes.clone();
   longer.push(0);
   assert_eq!(decode_batch(&longer, CAP), Err(LiveError::Malformed));
@@ -2211,9 +2205,40 @@ fn hostile_batches_are_refused_not_trusted() {
     Err(LiveError::Malformed),
     "an entry of another epoch than the batch's"
   );
+  expect_every_bit_flip_refused_or_seen(&bytes, &entries);
+}
+
+/// The truncations and lying counts of `hostile_batches_are_refused_not_trusted`. Expect a batch's `bytes` cut short
+/// anywhere, and the batch with its count over-claiming the bytes that follow (`u32::MAX`), zero, or one more than it
+/// holds, each refused `Malformed`.
+fn expect_every_truncation_and_lying_count_refused(bytes: &[u8]) {
+  use slates_db::live::decode_batch;
+  for length in 0..bytes.len() {
+    assert_eq!(
+      decode_batch(&bytes[..length], CAP),
+      Err(LiveError::Malformed),
+      "truncated at {length}"
+    );
+  }
+  let count_at = 8 + 16 + 8;
+  for count in [u32::MAX, 0, 4] {
+    let mut lying = bytes.to_vec();
+    lying[count_at..count_at + 4].copy_from_slice(&count.to_le_bytes());
+    assert_eq!(
+      decode_batch(&lying, CAP),
+      Err(LiveError::Malformed),
+      "a count of {count}"
+    );
+  }
+}
+
+/// The bit flips of `hostile_batches_are_refused_not_trusted`. Expect every single-bit flip of a batch's `bytes`
+/// refused, or decoded to entries other than `entries` as the chain sees them, never a panic.
+fn expect_every_bit_flip_refused_or_seen(bytes: &[u8], entries: &[Entry]) {
+  use slates_db::live::decode_batch;
   let identities: Vec<_> = entries.iter().map(Entry::identity).collect();
   for bit in 0..bytes.len() * 8 {
-    let mut flipped = bytes.clone();
+    let mut flipped = bytes.to_vec();
     flipped[bit / 8] ^= 1 << (bit % 8);
     if let Ok(decoded) = decode_batch(&flipped, CAP) {
       let decoded: Vec<_> = decoded.iter().map(Entry::identity).collect();
