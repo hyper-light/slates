@@ -61,6 +61,8 @@ Established 0 Record
 Established 1 OciBind
 GrantScope 0 Once
 GrantScope 1 Session
+HeldGaveUp 0 Silent
+HeldGaveUp 1 AtTheBound
 HostAnswer 0 NotFound
 HostAnswer 1 NotDirectory
 HostAnswer 2 NotFile
@@ -193,6 +195,7 @@ Refusal 67 SignatureRequired
 Refusal 68 Volume
 Refusal 69 Database
 Refusal 70 Target
+Refusal 71 DurabilityPending
 ReplyBody 0 Created
 ReplyBody 1 Snapshotted
 ReplyBody 2 SnapshotDestroyed

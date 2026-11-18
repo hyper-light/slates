@@ -27,11 +27,11 @@ mod order;
 use slates_ipc::protocol::{
   AttachRequest, AttachTransport, BaseReport, CauseRecord, ConflictClass, Conformance,
   DatabaseRefusal, DeleteWhileOpen, DriftKind, EditBytes, EntryKind, Established, GrantScope,
-  HostAnswer, HostPathReason, Intent, IpcNodeKind, KernelCache, LandingDegradation, NamePolicy,
-  OwnMountUse, PlannedAction, PolicySubject, Principal, ReadAt, ReadWritePolicy, RecoveryCause,
-  Refusal, ReplyBody, RequestBody, Residency, Scope, SignatureFault, SignerKey, SizeClass,
-  SnapshotBoundary, TargetPathConstraint, TargetRefusal, UnsupportedReason, Verification,
-  VolumeRefusal, WatcherState, WorkOp, WriteAct, WriteMode,
+  HeldGaveUp, HostAnswer, HostPathReason, Intent, IpcNodeKind, KernelCache, LandingDegradation,
+  NamePolicy, OwnMountUse, PlannedAction, PolicySubject, Principal, ReadAt, ReadWritePolicy,
+  RecoveryCause, Refusal, ReplyBody, RequestBody, Residency, Scope, SignatureFault, SignerKey,
+  SizeClass, SnapshotBoundary, TargetPathConstraint, TargetRefusal, UnsupportedReason,
+  Verification, VolumeRefusal, WatcherState, WorkOp, WriteAct, WriteMode,
 };
 use slates_wire::Wire;
 
@@ -54,6 +54,7 @@ fn schemas() -> Vec<&'static str> {
     <EntryKind as Wire>::SCHEMA,
     <Established as Wire>::SCHEMA,
     <GrantScope as Wire>::SCHEMA,
+    <HeldGaveUp as Wire>::SCHEMA,
     <HostAnswer as Wire>::SCHEMA,
     <HostPathReason as Wire>::SCHEMA,
     <Intent as Wire>::SCHEMA,

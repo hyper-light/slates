@@ -152,10 +152,13 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// volume core answered it `NoSpace`, which a consumer read as its own quota (kiln's review, A-342's record; the same
 /// day). 19: a target's refusal is typed (`HostFault::Target(TargetRefusal)`, the wire's appended `Refusal::Target`):
 /// until then a landing target's, a mount point's and a mount's refusals carried the daemon's words; the superseded
-/// `TargetUnavailable` is a protocol fault, since no daemon of this build sends it (A-299; the same day).
+/// `TargetUnavailable` is a protocol fault, since no daemon of this build sends it (A-299; the same day). 20: a reply
+/// held for durability past the owner's bound is a typed retry (`RetryCause::DurabilityPending`, the wire's appended
+/// `Refusal::DurabilityPending` and `HeldGaveUp`): until then a write whose log or tombstone could not be held where its
+/// reply waits for it was never answered (A-354; the same day).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 19;
+pub const CONTRACT: u32 = 20;
 
 /// The typed client and its own types, for the verbs [`Instance::client`] lends outside the contract.
 pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, VhostUserDevice};
