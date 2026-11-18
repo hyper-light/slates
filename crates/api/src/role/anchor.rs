@@ -13,13 +13,14 @@
 //! beaten within the fixed recovery budget, a wall second, was killed, and every restart started
 //! over: on this Mac at 144 spinners on 18 CPUs the anchor killed 153 starts of 153, each
 //! 1.07-1.22 s after its spawn, after it had used 16-18 ms of CPU.
-//! The restart policy is re-derived from the measured daemon start: the longest start seen
-//! is the p99 until enough starts exist to take a real one.
+//! The restart policy is the supervisor's (A-119, A-311): a failed start is restarted at once, a
+//! second in a row is a crash loop backed off from its own life, doubling to the operator's
+//! failover SLO. Until 2026-11-17 the policy was re-derived from the longest start measured, and a
+//! start that outlasted its window of a second was never a crash loop (`slates_anchor::supervise`).
 
 use std::time::Duration;
 
 use slates_anchor::{AnchorSegment, RegionKind, RestartPolicy, Stopping, Supervisor};
-use slates_db::replay::RECOVERY_BUDGET_NS;
 use slates_machine::MachineProfile;
 use slates_server::DaemonConfig;
 use slates_server::daemon::{HEARTBEAT_NS, LIVENESS_BUDGET_NS};
@@ -235,9 +236,15 @@ pub(crate) fn supervise(options: &ProcessOptions, daemon_args: &[String]) -> Res
       .publish_launcher_secret(secret.bytes())
       .map_err(|e| failed("launcher secret", e))?;
   }
-  // Until a start is measured, the budget holds one start: a daemon that fails once
-  // before it ever beat is restarted once.
-  let policy = RestartPolicy::derive(RECOVERY_BUDGET_NS, RECOVERY_BUDGET_NS);
+  // A crash loop's backoff doubles to the operator's failover SLO (A-311), logged with its derivation as the daemon's
+  // derived constants are.
+  let policy = RestartPolicy::derive(config.failover_slo_ns);
+  slates_machine::log_line!(
+    "slates anchor: a crash loop backs off from its failed start's own life, doubling to {} ms: {} (anchors {:?})",
+    policy.get().backoff_cap_ns / NS_PER_MS,
+    policy.formula,
+    policy.anchors
+  );
   // The daemon is this very executable, restarted from the image the anchor runs (A-145), never from what its path holds
   // after an upgrade in place.
   let mut supervisor =
@@ -381,7 +388,9 @@ fn judge_start_of(pid: Option<u32>, watch: &mut ShardWatch, now: u64) -> Verdict
     run,
     now_ns: now,
   };
-  let (verdict, next) = watch.judge(look, LIVENESS_BUDGET_NS);
+  // A start's thread is held to the liveness budget itself, whatever the build: A-318 holds only the daemon's own
+  // watchdog to the build's measured slowdown and leaves the anchor's judgments at the budget.
+  let (verdict, next) = watch.judge(look, LIVENESS_BUDGET_NS, LIVENESS_BUDGET_NS);
   *watch = next;
   verdict
 }
@@ -519,12 +528,28 @@ fn start_stuck(verdict: Verdict) -> Option<String> {
       for_ns / NS_PER_MS,
       LIVENESS_BUDGET_NS / NS_PER_MS
     )),
-    Verdict::Spinning { cpu_ns } => Some(format!(
+    Verdict::Spinning { cpu_ns, window_ns } => Some(format!(
       "ran {} ms of CPU on one thread without beating (the {} ms liveness window)",
       cpu_ns / NS_PER_MS,
-      LIVENESS_BUDGET_NS / NS_PER_MS
+      window_ns / NS_PER_MS
     )),
   }
+}
+
+/// Says once a daemon that it has recovered (A-311): it has served as long as its start took, so its exit from here on
+/// is no failed start and is restarted at once. `said` is the daemon whose verdict was said last.
+fn say_recovered(supervisor: &Supervisor, recovered: bool, said: &mut Option<u32>) {
+  let pid = supervisor.child_pid();
+  if !recovered || pid.is_none() || *said == pid {
+    return;
+  }
+  *said = pid;
+  slates_machine::log_line!(
+    "slates anchor: daemon pid {} recovered: it has served as long as its start took ({} ms), so its exit is no failed \
+     start",
+    pid.map_or_else(|| "unknown".to_owned(), |pid| pid.to_string()),
+    supervisor.start_took_ns().unwrap_or(0) / NS_PER_MS
+  );
 }
 
 /// The observation loop.
@@ -536,7 +561,6 @@ fn observe(
   let mut starting_since = Some(started);
   // The start under way, judged in the daemon's own CPU time until its first beat (the module doc).
   let mut start_watch = ShardWatch::default();
-  let mut longest_start_ns = 0u64;
   let mut watch = Watch::default();
   let mut daemon_watch = DaemonWatch::default();
   let mut lateness = Lateness::default();
@@ -563,6 +587,8 @@ fn observe(
   );
   let mut kill_sent = false;
   let mut quiet = Quiet::default();
+  // The daemon whose recovery the log has said (A-311), so each daemon's is said once.
+  let mut said_recovered = None;
   loop {
     if signal::stop_requested() {
       stop_gracefully(supervisor, clock)?;
@@ -588,18 +614,20 @@ fn observe(
           )
         };
         quiet.reset_while(alive);
-        // A starting daemon is looked at every beat (its first beat times its start, which sets the restart policy);
-        // a running one only when its heartbeat could next be found lapsed (`lapse_wait`).
-        let pause = if starting_since.is_some() {
+        // A starting daemon is looked at every beat, since its start is judged by its CPU until its first beat, and so
+        // is one not yet judged recovered (A-311), so that verdict comes within a beat of being due; a recovered one only
+        // when its heartbeat could next be found lapsed (`lapse_wait`).
+        let recovered = supervisor
+          .has_recovered()
+          .map_err(|e| failed("supervision", e))?;
+        say_recovered(supervisor, recovered, &mut said_recovered);
+        let pause = if starting_since.is_some() || !recovered {
           observation_pause()
         } else {
           Duration::from_nanos(lapse_wait(watch, heartbeat_ns, now, bound))
         };
         match starting_since {
           Some(since) if heartbeat_ns >= since => {
-            longest_start_ns = longest_start_ns.max(now.saturating_sub(since));
-            supervisor
-              .set_policy(RestartPolicy::derive(RECOVERY_BUDGET_NS, longest_start_ns).get());
             starting_since = None;
           }
           Some(_) if !kill_sent => {
@@ -640,10 +668,10 @@ fn observe(
       }
       slates_anchor::Step::Restarted {
         exit_code,
-        in_window,
+        failed_in_a_row,
       } => {
         slates_machine::log_line!(
-          "slates anchor: daemon exited ({exit_code:?}); restarted as pid {} ({in_window} in the window)",
+          "slates anchor: daemon exited ({exit_code:?}); restarted as pid {} ({failed_in_a_row} failed starts in a row)",
           supervisor
             .child_pid()
             .map_or_else(|| "unknown".to_owned(), |pid| pid.to_string())
@@ -805,7 +833,10 @@ mod lapse_tests {
     }
     for stuck in [
       Verdict::Wedged { for_ns: window },
-      Verdict::Spinning { cpu_ns: window },
+      Verdict::Spinning {
+        cpu_ns: window,
+        window_ns: window,
+      },
     ] {
       assert!(
         matches!(judge_lapse(false, || stuck), Lapse::Stuck(_)),

@@ -165,6 +165,12 @@ fn workload_environment<'a>(command: &'a mut Command, scratch: &Path) -> &'a mut
     .env(ENV_WATCH_SECONDS, WATCH_SECONDS.to_string())
 }
 
+/// A workload's script as `sh -c` runs it: its error output joined to its output, and stopped at its first failing
+/// command.
+fn shell_script(workload: &Workload) -> String {
+  format!("exec 2>&1\nset -e\n{}", workload.script)
+}
+
 /// Runs a workload's script in a fresh directory and captures everything. The script starts in the directory's plain
 /// form, which is the one its tools print it in (on Windows the drive form, not a canonical path's verbatim one).
 fn execute(
@@ -174,9 +180,11 @@ fn execute(
 ) -> Result<slates_conformance::workload::Run, Failure> {
   create_dir(dir)?;
   let directory = plain_path(dir);
-  let script = format!("exec 2>&1\nset -e\n{}", workload.script);
   let mut command = Command::new("sh");
-  command.arg("-c").arg(&script).current_dir(&directory);
+  command
+    .arg("-c")
+    .arg(shell_script(workload))
+    .current_dir(&directory);
   let output = workload_environment(&mut command, scratch)
     .stdin(Stdio::null())
     .output()
@@ -320,6 +328,47 @@ mod tests {
     assert!(
       output.status.success() && said.contains("author slates") && !said.contains("gpgsig"),
       "the workload's commit was made unsigned: {said}"
+    );
+  }
+
+  /// AC-3.2 / T-3.3 (A-289's sweep; CI run 44247840584, macOS, 2026-11-18). Do: run the roster's cargo workload through
+  /// the workload environment from a parent environment that colours cargo's output (`CARGO_TERM_COLOR=always`, which
+  /// every CI job sets) and builds elsewhere (`CARGO_TARGET_DIR` outside the tree, which kiln's runs set). Expect: exit
+  /// 0, the built binary run, and the second build counted `Fresh` once. Before, CI's colour put an escape sequence
+  /// before `Fresh`, so the script's count read 0 and it exited 1 on both sides, which was recorded `Identical` until
+  /// A-289 failed a workload failing alike: the reuse AC-3.2 names had never been checked in CI. A parent's target
+  /// directory left `./target/debug/mini` unbuilt.
+  #[test]
+  fn the_workload_environment_keeps_a_parents_cargo_settings_out() {
+    if !tool_on_path("cargo") {
+      eprintln!("skipping the inherited cargo settings: cargo is absent");
+      return;
+    }
+    let path =
+      crate::conformance::build_output(&format!("slates-cargo-env-{}", std::process::id()))
+        .unwrap();
+    let scratch = super::super::Scratch { path, keep: false };
+    let workload = ROSTER
+      .iter()
+      .find(|workload| workload.name == "cargo")
+      .unwrap();
+    let mut command = Command::new("sh");
+    command
+      .arg("-c")
+      .arg(shell_script(workload))
+      .current_dir(scratch.path())
+      // What the parent passes, set before the workload's environment as an inherited variable is.
+      .env("CARGO_TERM_COLOR", "always")
+      .env("CARGO_TARGET_DIR", scratch.path().join("elsewhere"));
+    let output = workload_environment(&mut command, scratch.path())
+      .stdin(Stdio::null())
+      .output()
+      .unwrap();
+    let said = String::from_utf8_lossy(&output.stdout);
+    assert!(
+      output.status.success() && said.ends_with("mini says hello with 1 args\n1\n"),
+      "the cargo workload built its own target, ran it, and found its second build fresh: exit {:?}, output {said:?}",
+      output.status.code()
     );
   }
 

@@ -2229,8 +2229,33 @@ fn status_text(report: &StatusReport) -> String {
     option_text(report.placed.mirror_age_ns),
     report.placed.host_epoch
   ) + &mounts_text(report)
+    + &loss_text(report)
     + &journal_text(&report.journal)
     + &transports_text(&report.transports)
+}
+
+/// The volume's loss window (§4.10, AC-8.3): what an owner loss would lose now (`unknown` when the time is from another
+/// boot of the clock), the newest seal placed on another host by head sequence (`none` while there is none), whether
+/// the volume is live-shipped, and the takeover that made this node its owner.
+fn loss_text(report: &StatusReport) -> String {
+  let loss = &report.loss;
+  let mut out = format!(
+    "loss_at_risk_ns: {}\nloss_placed_sequence: {}\nloss_live_shipped: {}\n",
+    loss
+      .at_risk_ns
+      .map_or_else(|| "unknown".to_owned(), |ns| ns.to_string()),
+    loss
+      .placed_sequence
+      .map_or_else(|| "none".to_owned(), |sequence| sequence.to_string()),
+    loss.live_shipped
+  );
+  if let Some(taken) = &loss.taken_over {
+    out.push_str(&format!(
+      "taken_over: epoch {} head {} from_live_log {}\n",
+      taken.epoch, taken.head_sequence, taken.from_live_log
+    ));
+  }
+  out
 }
 
 /// The volume's journal (§4.5): its budget and retention, and what its consuming rounds found waiting (the budget's
@@ -2445,6 +2470,8 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
   // This node's certificate anchor (A-237): what a share from another host names this host's accounts by
   // (`slates share ID uid:N@ANCHOR`).
   out.push_str(&format!("anchor: {}\n", report.anchor));
+  // Whether the anchor has judged this daemon recovered (A-311): until then its exit counts toward a crash loop.
+  out.push_str(&format!("recovered: {}\n", report.recovered));
   let root: String = report
     .seal
     .root_id

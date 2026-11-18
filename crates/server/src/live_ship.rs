@@ -33,7 +33,8 @@ use slates_bridge_core::durable_bound::{DurableBound, GaveUp, Heard, Spans};
 use std::collections::{BTreeMap, VecDeque};
 
 use slates_db::live::{
-  Admitted, Entry, Head, Install, LiveError, Next, Replica, Shipper, decode_reply, encode_reply,
+  Admitted, Bounds, Entry, Head, Install, LiveError, Next, Replica, Shipper, decode_reply,
+  encode_reply,
 };
 use slates_db::register::{HostEpoch, HostId, ObjectId};
 use slates_vfs::delta::VolumeRecord;
@@ -53,13 +54,6 @@ const BODY_SEALED: u8 = 1;
 /// Format: the second byte: the body is in the clear, where this node cannot seal at all (no sealing root), as a
 /// seal's archive is placed then (`fleet::envelope_of`).
 const BODY_CLEAR: u8 = 0;
-/// Derived: the entries a volume's shipper holds that are not yet durable, at most. Shape: one publication in flight
-/// and one behind it, the pipelining of a writer that does not wait (A-200's barrier slice derives it from the measured
-/// apply rate and round trip; until then a writer that outruns two is shipped a whole record next).
-const CREDIT: u64 = 2;
-/// Shape: the entries the owner retains for a holder that lags, beyond which it is installed: as many as the credit
-/// lets be in flight, twice over.
-const RETAIN: usize = 4;
 
 /// Counter: a live volume's publication that could not be shipped as an entry, because its content could not be read,
 /// sealed or appended; its next publication ships the whole volume.
@@ -121,6 +115,28 @@ pub(crate) fn held_sealings(
       .and_then(|first| sealed_body(first))
       .and_then(|body| body.sealing)
   })
+}
+
+/// The sealing of the whole entry `object`'s live log begins with on this holder, when it holds that log sealed: what a
+/// fellow candidate hands the volume's successor its key from (A-295), never a sealing the asker sends.
+pub(crate) fn held_sealing(
+  state: &ShardState,
+  object: ObjectId,
+) -> Option<crate::head::HeadSealing> {
+  let held = state.live.held.get(&object)?;
+  sealed_body(held.entries.front()?)?.sealing
+}
+
+/// The position of the newest entry of the live log this node holds for `object` as a candidate, or `None` while it holds
+/// none (`Daemon::fleet_live_held`).
+pub(crate) fn held_position(state: &ShardState, object: ObjectId) -> Option<u64> {
+  state
+    .live
+    .held
+    .get(&object)?
+    .replica
+    .head()
+    .map(|head| head.position)
 }
 
 pub(crate) fn let_go(state: &mut ShardState, object: ObjectId) {
@@ -233,6 +249,11 @@ pub(crate) struct LiveVolume {
   /// (`fleet::record_acks_in`). A reply held for durability gives up only after a whole wait of
   /// [`DURABLE_WAIT_NS`] in which this did not move ([`DurableBound`]).
   heard: u64,
+  /// When this owner first asked a holder something on this volume's durability path since [`LiveVolume::heard`] last
+  /// moved: a lane opened to send it entries or an install ([`dispatch`]), or its head's or catalog's placement asked
+  /// (`fleet::ship_head`, through [`asked`]). `None` while nothing asked is unanswered. A held reply's silent window is
+  /// given up only once this is a window old (A-301): the owner's own delay in asking is not its holders' silence.
+  unanswered_since_ns: Option<u64>,
 }
 
 /// One candidate's copy of a live log as its shard's recovery image keeps it (A-200; §4.8 "Recovery": a warm restart
@@ -437,6 +458,9 @@ pub(crate) struct LiveState {
   /// shard: its log is not fetched again until phase one adopts another head. One entry a pending materialization, removed
   /// when it is served.
   pub(crate) refused_rebuilds: BTreeMap<ObjectId, Refused>,
+  /// Test support (`Daemon::inject_live_period_quantum`, never set in production): the quantum the period's slices are
+  /// cut by in place of the shard's step quantum ([`period_slice`]).
+  pub(crate) period_quantum_ns: Option<u64>,
 }
 
 /// Notes, after a transport's barrier published `volume`, the position its reply must wait for ([`wait_durable`]).
@@ -464,8 +488,37 @@ pub(crate) const NS_PER_MS: u64 = 1_000_000;
 pub(crate) fn heard(state: &mut ShardState, object: ObjectId) {
   let volume = object.placement_key().0;
   if let Some(live) = state.live.shipping.get_mut(&volume) {
-    live.heard = live.heard.saturating_add(1);
+    note_heard(live);
   }
+}
+
+/// `live` heard something that moved its durability forward: counted ([`LiveVolume::heard`]), and every ask before it
+/// is answered ([`LiveVolume::unanswered_since_ns`]).
+fn note_heard(live: &mut LiveVolume) {
+  live.heard = live.heard.saturating_add(1);
+  live.unanswered_since_ns = None;
+}
+
+/// Whether this shard ships `object`'s volume live, so that an ask of its holders is noted for its held replies
+/// ([`asked`]).
+pub(crate) fn ships(state: &ShardState, object: ObjectId) -> bool {
+  state.live.shipping.contains_key(&object.placement_key().0)
+}
+
+/// This owner is asking `object`'s holders to place its volume's head or catalog (`fleet::ship_head`, a round about to
+/// be sent): noted on the volume's shipper as an ask the volume's held replies may hold its holders to (A-301); nothing
+/// for a volume this shard does not ship.
+pub(crate) fn asked(state: &mut ShardState, object: ObjectId) {
+  let volume = object.placement_key().0;
+  if let Some(live) = state.live.shipping.get_mut(&volume) {
+    note_asked(live, slates_rt::futures::now_ns());
+  }
+}
+
+/// `live`'s owner asked a holder something at `now_ns`: the oldest ask unanswered, unless an older one is
+/// ([`LiveVolume::unanswered_since_ns`]).
+fn note_asked(live: &mut LiveVolume, now_ns: u64) {
+  live.unanswered_since_ns.get_or_insert(now_ns);
 }
 
 /// Derived: how far apart the looks are that confirm a held reply's silent window
@@ -508,17 +561,20 @@ pub(crate) fn judge_durable_bound(
 }
 
 /// What a reply held for `volume`'s durability is judged against now: the acknowledgements the volume has heard
-/// ([`heard_of`]), and the waits the daemon's control shard has entered in its driver, each with nothing ready to run.
-/// The control shard holds the sessions every holder's acknowledgement arrives on (`send_from_control`), and hands each
-/// one to the volume's shard as a task there; so once it has waited twice after a moment, every acknowledgement that
-/// reached it before then has been read and handed on (the rule's own reasoning, `slates_bridge_core::durable_bound`).
-/// Read off its registry pulse, with no shard round trip.
+/// ([`heard_of`]), the waits the daemon's control shard has entered in its driver, each with nothing ready to run, and
+/// the owner's oldest unanswered ask ([`LiveVolume::unanswered_since_ns`]). The control shard holds the sessions every
+/// holder's acknowledgement arrives on (`send_from_control`), and hands each one to the volume's shard as a task there;
+/// so once it has waited twice after a moment, every acknowledgement that reached it before then has been read and
+/// handed on (the rule's own reasoning, `slates_bridge_core::durable_bound`). Read off its registry pulse, with no shard
+/// round trip.
 pub(crate) fn heard_now(state: &ShardState, volume: slates_db::catalog::VolumeId) -> Heard {
   let control = state.shards.first().copied().unwrap_or(state.shard);
+  let live = state.live.shipping.get(&volume.bytes);
   Heard {
     acknowledged: heard_of(state, volume),
     receiver_idles: slates_rt::registry::with_entry(control, |entry| entry.pulse.waits())
       .unwrap_or(0),
+    unanswered_since_ns: live.and_then(|live| live.unanswered_since_ns),
   }
 }
 
@@ -640,8 +696,8 @@ pub(crate) fn durability(
 
 /// What a reply waiting for `volume`'s log to be durable at `target` is still waiting on, as one line for a log: the
 /// owner's head and durable position, the last whole entry, each holder's acknowledged head, the lanes in flight and how
-/// long each has run, the holders found unreachable, and each condition [`answerable`] asks. Asked when a held reply
-/// gives up, so a refusal says which part of durability it lacked.
+/// long each has run, the holders found unreachable, each condition [`answerable`] asks, and how long the owner's oldest
+/// unanswered ask has waited. Asked when a held reply gives up, so a refusal says which part of durability it lacked.
 pub(crate) fn durability_report(
   state: &ShardState,
   volume: slates_db::catalog::VolumeId,
@@ -672,10 +728,14 @@ pub(crate) fn durability_report(
     .map(|(holder, began)| format!("{}:{}ms", holder.0, now.saturating_sub(*began) / NS_PER_MS))
     .collect();
   let unreachable: Vec<u64> = live.unreachable.iter().map(|holder| holder.0).collect();
+  // How long the owner's oldest unanswered ask has waited (A-301): none, when the owner had asked nothing unanswered.
+  let unanswered_ms = live
+    .unanswered_since_ns
+    .map(|asked| now.saturating_sub(asked) / NS_PER_MS);
   format!(
     "target {target}; head {:?}; durable {:?}; whole {:?}; owes whole {}; holders {holders:?}; lanes {lanes:?}; \
      unreachable {unreachable:?}; head placed {placed}; active set recorded {recorded} (at {:?}); covers candidates \
-     {covered}; fenced {:?}",
+     {covered}; fenced {:?}; oldest unanswered ask {unanswered_ms:?} ms",
     live.shipper.head().map(|head| head.position),
     live.shipper.durable(),
     live.whole_entry.map(|head| head.position),
@@ -1237,7 +1297,9 @@ pub(crate) fn published(
         quorum,
         &holders,
         None,
-        (CREDIT, RETAIN),
+        // Nothing is known of the volume's whole state before its first whole record, which is this log's first entry
+        // (`owes_whole`): admitted with nothing in flight, it sets the bounds (`Bounds::of_whole`, below).
+        Bounds::default(),
       ),
       owes_whole: true,
       owes_image: false,
@@ -1253,6 +1315,7 @@ pub(crate) fn published(
       whole_entry: None,
       image_anchors: None,
       heard: 0,
+      unanswered_since_ns: None,
     });
   follow_candidates(state, id.bytes);
   let Some(live) = state.live.shipping.get_mut(&id.bytes) else {
@@ -1294,9 +1357,12 @@ pub(crate) fn published(
       if whole {
         let head = entry.head();
         live.shipper.mark_checkpoint(head);
-        // Derived: the retained tail's byte bound is this whole record's size, the install a laggard would be sent
-        // instead: shipping it the entries it lacks never costs more than installing it (`Shipper::retain_up_to`).
-        live.shipper.retain_up_to(payload.len());
+        // Derived (AC-8.9, A-200 amended 2026-11-17): the credit and the retained tail are both this whole record's
+        // size, the install a laggard would be sent instead: the deltas outstanding never cost more than the whole
+        // record a turned-away one leads to, and shipping a laggard the entries it lacks never costs more than
+        // installing it (`Bounds::of_whole`). The fixed credit of two entries had made a third publication inside one
+        // round trip ship the whole volume.
+        live.shipper.set_bounds(Bounds::of_whole(payload.len()));
         live.whole = Some((head, payload));
         live.owes_image = false;
         live.whole_anchors = anchors;
@@ -1347,7 +1413,7 @@ fn kept_reaches_size(state: &ShardState, id: slates_db::catalog::VolumeId) -> bo
 /// holder behind is installed. Until 2026-11-07 such a holder set `owes_whole`, so the next write's record carried the
 /// whole volume to every holder and every write behind it waited for the up-to-date candidate to take it: 20–45 MB a
 /// time, 100–600 ms each, and writes of 1.2–1.9 s (CI, `diag-live-durability-14`). The retained tail's byte bound
-/// follows the image (`Shipper::retain_up_to`), so a laggard is sent the entries it lacks while they cost less than
+/// follows the image (`Shipper::set_bounds`), so a laggard is sent the entries it lacks while they cost less than
 /// installing the volume as it is now, not as it was at its last whole record. A volume whose image cannot be made
 /// stays owing it, and the next publication or period tries again.
 fn refresh_image(state: &mut ShardState, id: slates_db::catalog::VolumeId) {
@@ -1374,7 +1440,7 @@ fn refresh_image(state: &mut ShardState, id: slates_db::catalog::VolumeId) {
     return;
   };
   live.shipper.mark_checkpoint(head);
-  live.shipper.retain_up_to(image.len());
+  live.shipper.set_bounds(Bounds::of_whole(image.len()));
   live.whole = Some((head, image));
   // The entry's anchors stay what A-240 judges the log by (`whole_anchors`); the image's are judged beside them.
   // An image sealed under no keys (a volume shipped in the clear) has none to judge.
@@ -1990,6 +2056,8 @@ fn dispatch(state: &mut ShardState, sends: Vec<Send>) {
         return false;
       }
       live.lanes.insert(send.holder, now);
+      // The holder is asked now: a held reply may hold it to an answer from a window hence (A-301).
+      note_asked(live, now);
       if !opened.contains(&(send.object, send.holder)) {
         opened.push((send.object, send.holder));
       }
@@ -2173,15 +2241,20 @@ async fn ship_to_holder(
   });
 }
 
-/// The messages of one lane in turn ([`ship_to_holder`]): whether the holder answered every one it was sent.
+/// The messages of one lane in turn ([`ship_to_holder`]): whether the holder answered every one it was sent. The entries
+/// of one volume that follow each other go as one batch while it fits the session's congestion window
+/// ([`take_batch`]): sent one exchange an entry, a burst of `n` entries reached the holder in `n` round trips, and a
+/// holder back from a stall caught up on the retained tail a round trip an entry.
 async fn ship_lane(
   origin: u16,
   holder: HostId,
   sends: Vec<Send>,
   budget: slates_cluster::CommitBudget,
 ) -> bool {
-  for send in sends {
+  let mut queue: VecDeque<Send> = sends.into();
+  while let Some(first) = queue.pop_front() {
     let sessions = borrow_session(holder, budget.max_deadline_ns()).await;
+    let send = take_batch(first, &mut queue, &sessions);
     // Each message under its own budget: the liveness budget plus its transfer on the session it rides, so an install of
     // the whole volume is not given up the moment an entry would be (`exchange_budget`).
     let exchange = exchange_budget(send.bytes.len(), &sessions);
@@ -2208,6 +2281,68 @@ async fn ship_lane(
     }
   }
   true
+}
+
+/// Counter: batches of entries sent to a holder in one exchange ([`take_batch`]).
+const LIVE_BATCHES: &str = "fleet.live.batches";
+/// Counter: entries sent in those batches.
+const LIVE_BATCHED: &str = "fleet.live.batched";
+
+/// `first` with the entries of its volume that follow it in `queue`, taken from it as one batch
+/// (`slates_db::live::encode_batch`, [`slates_cluster::live::LIVE_ENTRIES_STREAM`]) while the batch's bytes stay within
+/// the session's congestion window; `first` alone when nothing follows it that fits, or it is not an entry. Derived: a
+/// batch is at most one window (the bytes the session may have in flight a round trip, RFC 9002 §7), so it rides the
+/// `Control` class without holding it past a round of the window, and the first entry always goes, whatever its size.
+fn take_batch(
+  first: Send,
+  queue: &mut VecDeque<Send>,
+  sessions: &[(HostId, slates_transport::endpoint::Endpoint)],
+) -> Send {
+  if first.stream != slates_cluster::live::LIVE_ENTRY_STREAM {
+    return first;
+  }
+  let window = sessions.first().map_or(0, |(_, endpoint)| {
+    usize::try_from(endpoint.congestion_window()).unwrap_or(usize::MAX)
+  });
+  let mut bytes = first.bytes.len();
+  let following = queue
+    .iter()
+    .take_while(|next| {
+      let fits = next.stream == slates_cluster::live::LIVE_ENTRY_STREAM
+        && next.object == first.object
+        && bytes.saturating_add(next.bytes.len()) <= window;
+      if fits {
+        bytes = bytes.saturating_add(next.bytes.len());
+      }
+      fits
+    })
+    .count();
+  if following == 0 {
+    return first;
+  }
+  let encoded: Vec<&[u8]> = std::iter::once(first.bytes.as_slice())
+    .chain(
+      queue
+        .iter()
+        .take(following)
+        .map(|next| next.bytes.as_slice()),
+    )
+    .collect();
+  let Some(batch) = slates_db::live::encode_batch(&encoded) else {
+    return first;
+  };
+  queue.drain(..following.min(queue.len()));
+  let carried = u64::try_from(following).map_or(u64::MAX, |following| following.saturating_add(1));
+  let _ = state::with_state_counted(|s| {
+    s.count(LIVE_BATCHES, 1);
+    s.count(LIVE_BATCHED, carried);
+  });
+  Send {
+    object: first.object,
+    holder: first.holder,
+    stream: slates_cluster::live::LIVE_ENTRIES_STREAM,
+    bytes: batch,
+  }
 }
 
 /// The budget one message to one holder gets: the liveness budget a reply gets, plus the time its bytes take at the
@@ -2422,7 +2557,7 @@ fn fold_into(state: &mut ShardState, replies: Vec<(ObjectId, HostId, Vec<u8>)>) 
     // installed at a checkpoint the tail had passed, re-installed there without end (2026-11-05, `live_fleet`).
     let progressed = live.shipper.held_by(host) != held_before;
     if progressed {
-      live.heard = live.heard.saturating_add(1);
+      note_heard(live);
     }
     if live.shipper.durable() > before {
       state.count(LIVE_DURABLE, 1);
@@ -2463,54 +2598,112 @@ fn owes_whole_within_credit(state: &ShardState, volume: [u8; 16]) -> bool {
     .live
     .shipping
     .get(&volume)
-    .is_some_and(|live| live.owes_whole && live.shipper.in_flight() <= CREDIT)
+    .is_some_and(|live| live.owes_whole && live.shipper.admits_checkpoint())
 }
+
+/// Counter: one owner-shard turn of the record period's live work ([`period_slice`]).
+const LIVE_PERIOD_SLICES: &str = "fleet.live.period_slices";
+/// Counter: a record period's live work on one shard ([`period`]), however many turns it took.
+const LIVE_PERIODS: &str = "fleet.live.periods";
 
 /// The record period's turn on `shard` (run from the control shard): re-ships what each holder of each live volume
 /// there still lacks, so a lost message or a holder that was away is caught up without waiting for the next write.
+/// The volumes are visited in slices, each one turn of the owner shard of about a step quantum ([`period_slice`]), so a
+/// shard owning many live volumes is never held for all of them in one turn (CLAUDE.md "Bounded work everywhere"):
+/// until 2026-11-17 one turn visited every one, a cost that grew with the volumes the shard owned while every client
+/// of the shard waited behind it.
 pub(crate) async fn period(origin: u16, shard: u16) {
   drain_stragglers();
-  let _ = crate::xshard::call_within(
-    origin,
-    shard,
-    |s| {
-      let volumes: Vec<[u8; 16]> = s.live.shipping.keys().copied().collect();
-      // A volume that owes a whole record ships one once its credit allows: a burst that outran the credit left its
-      // last writes unshipped until another write came, and none might (three of five writes, `live_fleet`).
-      for volume in &volumes {
-        let id = slates_db::catalog::VolumeId { bytes: *volume };
-        follow_candidates(s, *volume);
-        // The period is what retries a holder whose last lane went unanswered ([`LiveVolume::unreachable`]).
-        if let Some(live) = s.live.shipping.get_mut(volume) {
-          live.unreachable.clear();
+  let deadline = crate::fleet::live_budget().max_deadline_ns();
+  let mut after = None;
+  let mut first = true;
+  loop {
+    let counted = std::mem::take(&mut first);
+    let next = crate::xshard::call_within(
+      origin,
+      shard,
+      move |s| {
+        if counted {
+          s.count(LIVE_PERIODS, 1);
         }
-        // A writer may wait on a condition that changes with no acknowledgement to fold (the head placed once its
-        // neighbourhood settles, a pair delivered): answered here at the latest.
-        resolve(s, *volume);
-        // A log whose last whole entry no successor among the candidates could open is checkpointed again once this
-        // shard has delivered the pairs that would let it ([`covers_candidates`]).
-        if !covers_candidates(s, *volume)
-          && coverable_now(s, *volume)
-          && let Some(live) = s.live.shipping.get_mut(volume)
-        {
-          live.owes_whole = true;
-        }
-        if owes_whole_within_credit(s, *volume) {
-          published(s, id, None);
-        } else if owes_image(s, *volume) && published_whole(s, id) {
-          // No publication is coming to make the image a holder behind the tail waits for (the writer is idle).
-          refresh_image(s, id);
-        }
-      }
-      let mut sends = Vec::new();
-      for volume in volumes {
-        sends.extend(pending_sends(s, volume));
-      }
-      dispatch(s, sends);
-    },
-    crate::fleet::live_budget().max_deadline_ns(),
-  )
-  .await;
+        period_slice(s, after)
+      },
+      deadline,
+    )
+    .await;
+    match next {
+      Some(Some(last)) => after = Some(last),
+      _ => break,
+    }
+  }
+}
+
+/// One slice of [`period`]: the shard's live volumes after `after` in key order, each visited ([`period_volume`]) and
+/// what its holders lack sent, until the shard's step quantum is spent (`futures::step_budget_ns`, what a destroy's or
+/// an archive's slice is sized by); the last volume visited when any remain after it, `None` once none does. The first
+/// volume is always visited, so a slice always moves the period on.
+fn period_slice(s: &mut ShardState, after: Option<[u8; 16]>) -> Option<[u8; 16]> {
+  s.count(LIVE_PERIOD_SLICES, 1);
+  let quantum = s
+    .live
+    .period_quantum_ns
+    .or_else(slates_rt::futures::step_budget_ns)
+    .unwrap_or(s.config.runtime.step_budget_ns);
+  let began = slates_rt::futures::now_ns();
+  let mut cursor = after;
+  let mut sends = Vec::new();
+  let remaining = loop {
+    let next = match cursor {
+      Some(last) => s
+        .live
+        .shipping
+        .range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded))
+        .next()
+        .map(|(volume, _)| *volume),
+      None => s.live.shipping.keys().next().copied(),
+    };
+    let Some(volume) = next else {
+      break None;
+    };
+    period_volume(s, volume);
+    sends.extend(pending_sends(s, volume));
+    cursor = Some(volume);
+    if slates_rt::futures::now_ns().saturating_sub(began) >= quantum {
+      break cursor;
+    }
+  };
+  dispatch(s, sends);
+  remaining
+}
+
+/// The period's visit to one live volume: follows its candidates, retries holders whose last lane went unanswered,
+/// answers writers whose wait a condition met, and owes or ships the whole record or image it is due.
+fn period_volume(s: &mut ShardState, volume: [u8; 16]) {
+  let id = slates_db::catalog::VolumeId { bytes: volume };
+  follow_candidates(s, volume);
+  // The period is what retries a holder whose last lane went unanswered ([`LiveVolume::unreachable`]).
+  if let Some(live) = s.live.shipping.get_mut(&volume) {
+    live.unreachable.clear();
+  }
+  // A writer may wait on a condition that changes with no acknowledgement to fold (the head placed once its
+  // neighbourhood settles, a pair delivered): answered here at the latest.
+  resolve(s, volume);
+  // A log whose last whole entry no successor among the candidates could open is checkpointed again once this shard has
+  // delivered the pairs that would let it ([`covers_candidates`]).
+  if !covers_candidates(s, volume)
+    && coverable_now(s, volume)
+    && let Some(live) = s.live.shipping.get_mut(&volume)
+  {
+    live.owes_whole = true;
+  }
+  // A volume that owes a whole record ships one once its credit allows: a burst that outran the credit left its last
+  // writes unshipped until another write came, and none might (three of five writes, `live_fleet`).
+  if owes_whole_within_credit(s, volume) {
+    published(s, id, None);
+  } else if owes_image(s, volume) && published_whole(s, id) {
+    // No publication is coming to make the image a holder behind the tail waits for (the writer is idle).
+    refresh_image(s, id);
+  }
 }
 
 /// This shard's live logs for `status` (A-200): each it ships, then each it holds as a candidate.
@@ -2601,39 +2794,107 @@ pub(crate) fn serve_entry(
   peer: HostId,
   request: &[u8],
 ) -> Vec<u8> {
+  let epoch = slates_db::live::epoch_of(request);
+  serve_taken(state, (local, peer), (request, epoch), |request, bound| {
+    Entry::decode(request, bound).map(|entry| vec![entry])
+  })
+}
+
+/// The one way a candidate takes entries from `peer`, alone ([`serve_entry`]) or as a batch ([`serve_entries`]), so a
+/// batch is served exactly as its entries would be: authorized and bounded ([`admitted`]), decoded by `decode` within
+/// the bound, taken in order ([`take_entries`]), counted, and answered only once this shard's recovery image keeps what
+/// was taken ([`acknowledged`]). `epoch` is the request's, read from its header, for the refusal of an unauthorized one.
+/// Until 2026-11-17 a batch was served beside the single entry's path, and main's acknowledgement rule (A-270) reached
+/// the single entry alone when the two met at a merge.
+fn serve_taken(
+  state: &mut ShardState,
+  (local, peer): (HostId, HostId),
+  (request, epoch): (&[u8], Option<HostEpoch>),
+  decode: impl FnOnce(&[u8], usize) -> Result<Vec<Entry>, LiveError>,
+) -> Vec<u8> {
   let object = slates_db::live::object_of(request);
   let bound = match admitted(state, local, peer, object) {
     Ok(bound) => bound,
     Err(why) => {
       count_refused(state, why);
-      return encode_reply(&Err(not_served(
-        state,
-        object,
-        slates_db::live::epoch_of(request),
-      )));
+      return encode_reply(&Err(not_served(state, object, epoch)));
     }
   };
-  let reply = Entry::decode(request, bound).and_then(|entry| {
-    let held = held_entry(state, peer, entry.object);
-    match held.replica.check(&entry)? {
-      Admitted::Apply(head) => {
-        keep(held, &entry.payload, bound)?;
-        held.replica.commit(entry.epoch, head);
-        Ok(Some(head))
-      }
-      Admitted::Held => Ok(held.replica.head()),
-    }
-  });
+  let (reply, taken) = match decode(request, bound) {
+    Ok(entries) => take_entries(state, peer, &entries, bound),
+    Err(refusal) => (Err(refusal), 0),
+  };
   match &reply {
     Err(error) => {
       count_refused(state, refused_counter(error));
       encode_reply(&reply)
     }
     Ok(_) => {
-      state.count(LIVE_HELD, 1);
+      state.count(LIVE_HELD, taken);
       acknowledged(state, encode_reply(&reply))
     }
   }
+}
+
+/// One entry taken into a candidate's copy (guard-then-apply, `Replica::check` then `commit`): applied and kept within
+/// `bound` when it extends the head, passed over when already held; the head held after it, or why not.
+fn take_entry(held: &mut Held, entry: &Entry, bound: usize) -> Result<Option<Head>, LiveError> {
+  match held.replica.check(entry)? {
+    Admitted::Apply(head) => {
+      keep(held, &entry.payload, bound)?;
+      held.replica.commit(entry.epoch, head);
+      Ok(Some(head))
+    }
+    Admitted::Held => Ok(held.replica.head()),
+  }
+}
+
+/// A candidate's answer to a batch of entries from `peer` (A-200 amended 2026-11-17, [`ship_lane`]): authorized and
+/// bounded as [`serve_entry`] does one entry, then each entry checked, kept and committed in order exactly as one entry
+/// is, until one is neither applied nor already held (a gap, a fence, the bound): answered once, with the head held
+/// after the last, or the first refusal when no entry was taken. Each entry taken counts `fleet.live.held`, as one sent
+/// alone does.
+pub(crate) fn serve_entries(
+  state: &mut ShardState,
+  local: HostId,
+  peer: HostId,
+  request: &[u8],
+) -> Vec<u8> {
+  let epoch = slates_db::live::epoch_of_batch(request);
+  serve_taken(
+    state,
+    (local, peer),
+    (request, epoch),
+    slates_db::live::decode_batch,
+  )
+}
+
+/// A batch's entries taken in order ([`take_entry`]) until one is not: the head held after the last taken, or the first
+/// refusal when none was; and how many were taken. A refusal that stops the batch after some were taken is counted
+/// here, since the answer is then the head reached.
+fn take_entries(
+  state: &mut ShardState,
+  peer: HostId,
+  entries: &[Entry],
+  bound: usize,
+) -> (Result<Option<Head>, LiveError>, u64) {
+  let mut reached = None;
+  let mut taken: u64 = 0;
+  for entry in entries {
+    match take_entry(held_entry(state, peer, entry.object), entry, bound) {
+      Ok(head) => {
+        taken = taken.saturating_add(1);
+        reached = Some(head);
+      }
+      Err(refusal) => {
+        if reached.is_some() {
+          count_refused(state, refused_counter(&refusal));
+        }
+        return (reached.ok_or(refusal), taken);
+      }
+    }
+  }
+  (reached.ok_or(LiveError::Malformed), taken)
 }
 
 /// A candidate's answer to an install from `peer`, as [`serve_entry`]: the install's state replaces what it held.
@@ -2958,6 +3219,10 @@ const REFUSED_NOT_WHOLE_FIRST: &str = "fleet.live.takeover_refused.not_whole_fir
 const REFUSED_LAYOUT: &str = "fleet.live.takeover_refused.layout";
 /// Counter: a taken-over live volume rebuilt from the adopted log.
 const LIVE_TAKEN_OVER: &str = "fleet.live.taken_over";
+/// Counter: a live takeover's phase one adopted past tolerance (A-309): fewer than `f + 1` recorded holders were still
+/// members, so every surviving member that may hold the log reported first, and the greatest head among them was
+/// adopted. Counted per phase one that adopted, a refetch included. Zero is the reading of a region within tolerance.
+const LIVE_TAKEN_OVER_PAST_TOLERANCE: &str = "fleet.live.taken_over_past_tolerance";
 
 /// What a takeover fetched of a live volume: the adopted head's payloads (a whole one first), and the
 /// successor's copy of the lineage key the first carries (A-92 piece 4c), unwrapped on this control shard.
@@ -3008,11 +3273,20 @@ pub(crate) async fn ask_reports(
 /// asked that is not a holder still reports, and its head is adopted when it is the greatest. `Ok(None)` when no
 /// candidate holds any of the volume's log (it was never shipped); `Err` with what the takeover waits for when too few
 /// holders answered.
+///
+/// Past tolerance, when fewer than `f + 1` of the recorded holders are still members (`slates_db::live::past_tolerance`),
+/// that count can never be met, and the takeover waited for good (g240's finding at `f = 1`: {survivor, destroyed node}
+/// recorded, the replacement that caught up on the log not among them). Then the members that exist now recover it
+/// (A-309): every surviving recorded holder and every surviving member of `cohort_hosts` (where the retired owner placed
+/// the volume, settled and current, so where a joint transition shipped its log) must report, and the greatest head
+/// among all the reports is adopted (`slates_db::live::adopt_past_tolerance`), counted
+/// [`LIVE_TAKEN_OVER_PAST_TOLERANCE`]. This node's own report is known whatever it holds.
 pub(crate) async fn fetch(
   object: ObjectId,
   epoch: slates_db::register::HostEpoch,
   candidates: Vec<HostId>,
   holders: Vec<HostId>,
+  cohort_hosts: Vec<HostId>,
 ) -> Result<Option<Fetched>, &'static str> {
   let local = state::with_state(|s| s.fleet.configuration().owner)
     .ok_or("fleet.live.takeover_waits_state")?;
@@ -3035,15 +3309,12 @@ pub(crate) async fn fetch(
   if let Some(head) = own {
     reports.push((local, head));
   }
-  let mut others: Vec<HostId> = candidates
-    .into_iter()
-    .filter(|host| *host != local)
-    .collect();
-  for holder in &holders {
-    if *holder != local && !others.contains(holder) {
-      others.push(*holder);
-    }
-  }
+  // Past tolerance (A-309): the recorded holders' count can never be met, so every surviving member that may hold the
+  // log is waited for instead.
+  let members: Vec<HostId> =
+    state::with_state(|s| s.council.configuration().members.clone()).unwrap_or_default();
+  let wait = past_tolerance_wait(&holders, &cohort_hosts, &members, local, quorum);
+  let others = others_to_ask(candidates, &holders, wait.as_deref(), local);
   // Phase one proper: every other candidate and recorded holder reports its head and the bytes it keeps, a few bytes
   // each, within the liveness budget whatever the path.
   for (host, bytes) in ask_reports(object, epoch, &others, crate::fleet::live_budget()).await {
@@ -3052,41 +3323,51 @@ pub(crate) async fn fetch(
       kept.insert(host, bytes);
     }
   }
-  let needed = usize::try_from(quorum.f)
-    .ok()
-    .and_then(|f| f.checked_add(1))
-    .unwrap_or(usize::MAX);
-  let counted = reports
-    .iter()
-    .filter(|(host, _)| holders.contains(host))
-    .count();
-  if counted < needed {
-    return Err("fleet.live.takeover_waits_quorum");
-  }
-  let Some((holder, head)) = slates_db::live::adopt(&reports, &holders, quorum) else {
+  let Some((holder, head)) = phase_one_choice(&reports, &holders, wait.as_deref(), quorum)? else {
     return Ok(None);
   };
   let refused = state::with_state(|s| s.live.refused_rebuilds.get(&object).cloned()).flatten();
-  let key_here = refused
-    .as_ref()
-    .and_then(|refused| refused.sealing.as_ref())
-    .is_some_and(|sealing| {
-      state::with_state(|s| crate::seal_keys::successor_lineage(s, sealing).is_some())
-        .unwrap_or(false)
-    });
-  match next_fetch(
+  // The hosts that answered phase one, this node left out: the fellow candidates a key this node lacks is asked of.
+  let answered: Vec<HostId> = reports
+    .iter()
+    .map(|(host, _)| *host)
+    .filter(|host| *host != local)
+    .collect();
+  // A key handed over for an earlier attempt at this log, kept with its refusal (A-295).
+  let mut handed = refused.as_ref().and_then(|refused| refused.handed.clone());
+  let key_here = handed.is_some()
+    || refused
+      .as_ref()
+      .and_then(|refused| refused.sealing.as_ref())
+      .is_some_and(|sealing| {
+        state::with_state(|s| crate::seal_keys::successor_lineage(s, sealing).is_some())
+          .unwrap_or(false)
+      });
+  let mut decision = next_fetch(
     refused.as_ref(),
     head,
     slates_rt::futures::now_ns(),
     key_here,
-  ) {
+  );
+  // Only the owner's shard delivers a pair, so with the owner lost the key a successor lacks can come only from a fellow
+  // candidate that holds it (A-295): asked once an attempt while the wait lasts.
+  if decision == NextFetch::WaitsKey
+    && let Some(sealing) = refused
+      .as_ref()
+      .and_then(|refused| refused.sealing.as_ref())
+    && let Some(key) = handed_lineage(object, sealing, &answered).await
+  {
+    handed = Some(key);
+    decision = NextFetch::Fetch;
+  }
+  match decision {
     NextFetch::Fetch => {
       if key_here
         && refused
           .as_ref()
           .is_some_and(|refused| refused.why == REFUSED_NO_KEY)
       {
-        let _ = state::with_state(|s| s.count(LIVE_TAKEOVER_KEY_ARRIVED, 1));
+        let _ = state::with_state_counted(|s| s.count(LIVE_TAKEOVER_KEY_ARRIVED, 1));
       }
     }
     NextFetch::WaitsNewHead => return Err(LIVE_TAKEOVER_WAITS_NEW_HEAD),
@@ -3110,9 +3391,7 @@ pub(crate) async fn fetch(
     .first()
     .and_then(|first| sealed_body(first))
     .and_then(|body| body.sealing);
-  let lineage = sealing.as_ref().and_then(|sealing| {
-    state::with_state(|s| crate::seal_keys::successor_lineage(s, sealing)).flatten()
-  });
+  let lineage = lineage_for_rebuild(object, sealing.as_ref(), handed, &answered).await;
   let naming = sealing.as_ref().and_then(|sealing| sealing.naming.clone());
   Ok(Some(Fetched {
     head,
@@ -3121,6 +3400,47 @@ pub(crate) async fn fetch(
     naming,
     sealing,
   }))
+}
+
+/// The lineage key a rebuild opens the log sealed under `sealing` with: this node's own entry; else the key a fellow
+/// candidate handed over for that lineage (`handed`), or asked now of the hosts that answered phase one (`answered`), so a
+/// successor that holds no entry of its own is served at its first attempt, not a refusal later (A-295); none for a log
+/// shipped in the clear.
+async fn lineage_for_rebuild(
+  object: ObjectId,
+  sealing: Option<&crate::head::HeadSealing>,
+  handed: Option<([u8; 16], Vec<u8>)>,
+  answered: &[HostId],
+) -> Option<([u8; 16], Vec<u8>)> {
+  let sealing = sealing?;
+  if let Some(own) =
+    state::with_state(|s| crate::seal_keys::successor_lineage(s, sealing)).flatten()
+  {
+    return Some(own);
+  }
+  match handed.filter(|(id, _)| *id == sealing.lineage) {
+    Some(handed) => Some(handed),
+    None => handed_lineage(object, sealing, answered).await,
+  }
+}
+
+/// The lineage key of the log `sealing` belongs to, handed to this successor by a fellow candidate (A-295): asked of the
+/// hosts that answered phase one (`fleet::ask_handed_lineage`), counted, and kept with the log's refusal when it has
+/// one, so a later attempt fetches with it rather than asking again. `None` when none handed one that checked.
+async fn handed_lineage(
+  object: ObjectId,
+  sealing: &crate::head::HeadSealing,
+  answered: &[HostId],
+) -> Option<([u8; 16], Vec<u8>)> {
+  let key = crate::fleet::ask_handed_lineage(object, sealing, answered).await?;
+  let kept = key.clone();
+  let _ = state::with_state_counted(|s| {
+    if let Some(refused) = s.live.refused_rebuilds.get_mut(&object) {
+      refused.handed = Some(kept);
+    }
+    s.count(LIVE_TAKEOVER_KEY_HANDED, 1);
+  });
+  Some(key)
 }
 
 /// A rebuild refused at a head ([`note_rebuild`]): what decides whether, and when, the log is fetched again
@@ -3136,6 +3456,10 @@ pub(crate) struct Refused {
   pub(crate) since: u64,
   /// The log's whole entry's sealing, when it was sealed.
   pub(crate) sealing: Option<crate::head::HeadSealing>,
+  /// A key a fellow candidate handed this node for the log while it waited for one (A-295): the key's id and the key
+  /// wrapped under this node's root, as `seal_keys::successor_lineage` returns one. Kept with the refusal it answers, so
+  /// it lives exactly as long as the takeover waiting for it.
+  pub(crate) handed: Option<([u8; 16], Vec<u8>)>,
 }
 
 /// What a successor does about a live volume's log at the head phase one adopted ([`next_fetch`]).
@@ -3157,6 +3481,10 @@ const LIVE_TAKEOVER_WAITS_KEY: &str = "fleet.live.takeover_waits_key";
 /// Counter: a takeover that fetched the log again because the key it lacked has come ([`next_fetch`]): once per arrival.
 /// Format: a counter name in the daemon's status report.
 const LIVE_TAKEOVER_KEY_ARRIVED: &str = "fleet.live.takeover_key_arrived";
+/// Counter: a takeover handed the log's key by a fellow candidate, at its first fetch or while it waited for the key
+/// (A-295): once a key handed.
+/// Format: a counter name in the daemon's status report.
+const LIVE_TAKEOVER_KEY_HANDED: &str = "fleet.live.takeover_key_handed";
 /// Counter: a takeover whose key for the adopted log did not come within [`NO_KEY_WAIT_NS`]: no longer waited for at
 /// that head, answered typed.
 /// Format: a counter name in the daemon's status report.
@@ -3164,6 +3492,84 @@ const LIVE_TAKEOVER_NO_KEY_EXHAUSTED: &str = "fleet.live.takeover_no_key_exhaust
 /// Derived: how long a successor waits at one head for the key to a log it holds no key for: ten liveness budgets
 /// (`daemon::OBSERVE_BUDGET_NS`), past a pair's redelivery (once a record period) many times over.
 const NO_KEY_WAIT_NS: u64 = crate::daemon::OBSERVE_BUDGET_NS;
+
+/// The surviving members a live phase one waits for past tolerance (A-309), `None` within it: when fewer than `f + 1` of
+/// the recorded `holders` are `members` (`slates_db::live::past_tolerance`), every recorded holder and every member of
+/// `cohort_hosts` (where the retired owner placed the volume) still a member, `local` aside, since this node's own copy
+/// is known whatever it holds.
+fn past_tolerance_wait(
+  holders: &[HostId],
+  cohort_hosts: &[HostId],
+  members: &[HostId],
+  local: HostId,
+  quorum: slates_db::register::Quorum,
+) -> Option<Vec<HostId>> {
+  if !slates_db::live::past_tolerance(holders, |host| members.contains(&host), quorum) {
+    return None;
+  }
+  let mut wait: Vec<HostId> = holders
+    .iter()
+    .chain(cohort_hosts)
+    .copied()
+    .filter(|host| *host != local && members.contains(host))
+    .collect();
+  wait.sort_unstable_by_key(|host| host.0);
+  wait.dedup();
+  Some(wait)
+}
+
+/// The hosts phase one asks besides this node (`local`): every candidate, then every recorded holder and every host a
+/// phase one past tolerance waits for (`wait`, A-309) not among them, so a holder outside the placement is asked too.
+fn others_to_ask(
+  candidates: Vec<HostId>,
+  holders: &[HostId],
+  wait: Option<&[HostId]>,
+  local: HostId,
+) -> Vec<HostId> {
+  let mut others: Vec<HostId> = candidates
+    .into_iter()
+    .filter(|host| *host != local)
+    .collect();
+  for holder in holders.iter().chain(wait.into_iter().flatten()) {
+    if *holder != local && !others.contains(holder) {
+      others.push(*holder);
+    }
+  }
+  others
+}
+
+/// Phase one's choice from `reports` (A-240, A-309): within tolerance (`wait` is `None`), the greatest head once `f + 1`
+/// of the recorded `holders` reported (`slates_db::live::adopt`), else the takeover waits for its quorum; past it, the
+/// greatest head once every host of `wait` reported (`slates_db::live::adopt_past_tolerance`), counted
+/// [`LIVE_TAKEN_OVER_PAST_TOLERANCE`], else the takeover waits for them. `Ok(None)` when nobody holds any of the log.
+fn phase_one_choice(
+  reports: &[(HostId, Option<Head>)],
+  holders: &[HostId],
+  wait: Option<&[HostId]>,
+  quorum: slates_db::register::Quorum,
+) -> Result<Option<(HostId, Head)>, &'static str> {
+  let Some(wait) = wait else {
+    let needed = usize::try_from(quorum.f)
+      .ok()
+      .and_then(|f| f.checked_add(1))
+      .unwrap_or(usize::MAX);
+    let counted = reports
+      .iter()
+      .filter(|(host, _)| holders.contains(host))
+      .count();
+    if counted < needed {
+      return Err("fleet.live.takeover_waits_quorum");
+    }
+    return Ok(slates_db::live::adopt(reports, holders, quorum));
+  };
+  match slates_db::live::adopt_past_tolerance(reports, wait) {
+    slates_db::live::PastTolerance::Waiting => Err("fleet.live.takeover_waits_past_tolerance"),
+    slates_db::live::PastTolerance::Adopt(adopted) => {
+      let _ = state::with_state_counted(|s| s.count(LIVE_TAKEN_OVER_PAST_TOLERANCE, 1));
+      Ok(adopted)
+    }
+  }
+}
 
 /// Counter: a taken-over live volume's log was not fetched again, its rebuild having been refused at the head phase
 /// one adopted now ([`next_fetch`]).
@@ -3202,15 +3608,24 @@ pub(crate) fn note_rebuild(
   why: Option<&'static str>,
   sealing: Option<crate::head::HeadSealing>,
 ) {
-  let _ = state::with_state(|s| match why {
+  let _ = state::with_state_counted(|s| match why {
     // Only a refusal of the log itself: one from the volume's restore says nothing about the log's bytes.
     Some(why) if REBUILD_REFUSALS.contains(&why) => {
       let now = slates_rt::futures::now_ns();
+      let previous = s.live.refused_rebuilds.get(&object);
       // The first refusal at this head for this reason starts the clock its bound runs from; a repeat keeps it.
-      let since = match s.live.refused_rebuilds.get(&object) {
+      let since = match previous {
         Some(refused) if refused.head == head && refused.why == why => refused.since,
         _ => now,
       };
+      // A key handed over stays while it is for the log's lineage (A-295).
+      let handed = previous
+        .and_then(|refused| refused.handed.clone())
+        .filter(|(id, _)| {
+          sealing
+            .as_ref()
+            .is_some_and(|sealing| sealing.lineage == *id)
+        });
       s.live.refused_rebuilds.insert(
         object,
         Refused {
@@ -3218,6 +3633,7 @@ pub(crate) fn note_rebuild(
           why,
           since,
           sealing,
+          handed,
         },
       );
     }
@@ -3705,6 +4121,7 @@ mod tests {
       why,
       since: 0,
       sealing: None,
+      handed: None,
     };
     for kind in [
       REFUSED_OPEN,
@@ -3836,6 +4253,7 @@ mod tests {
       why: REFUSED_NO_KEY,
       since,
       sealing: None,
+      handed: None,
     };
     let inside = since + NO_KEY_WAIT_NS - 1;
     assert_eq!(

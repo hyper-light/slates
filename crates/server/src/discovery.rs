@@ -87,21 +87,25 @@ pub(crate) struct Discovery {
 }
 
 impl Discovery {
+  /// This node's discovery authority, announcing `advertised`, its probe-plane and record-plane addresses as its peers
+  /// dial them (`FleetTransport::advertise`, `advertise_record`). A peer prefers an announced address to its manifest's
+  /// at every dial, so an announcement of a bound port behind a port mapping sent every redial around the mapping (A-277,
+  /// A-330).
   pub(crate) fn new(
     state: &ShardState,
     name: String,
     roots: Vec<CertificateDer<'static>>,
     certificate: CertificateDer<'static>,
-    probe: NodeAddress,
-    record_port: u16,
+    advertised: (NodeAddress, NodeAddress),
     peers: &[FleetPeer],
   ) -> Result<Self, Refusal> {
+    let (probe, record) = advertised;
     let seed = member_id(state.origin_anchor, 0);
     let fleet = state.config.fleet.as_ref();
     let local = Announcement {
       anchor: state.origin_anchor,
       certificate: certificate.as_ref().to_vec(),
-      record: probe.with_port(record_port).to_string(),
+      record: record.to_string(),
       probe: probe.to_string(),
       region: fleet
         .and_then(|fleet| fleet.regions.get(&seed))

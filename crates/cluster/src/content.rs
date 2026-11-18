@@ -1760,6 +1760,33 @@ impl ContentHold {
     Some(with_chunks(&archive, chunks))
   }
 
+  /// The manifest of a manifest held for `object` — the archive's header and tree, with no chunks — or `None` if it is
+  /// not held for that object: what a reader that takes the chunks one at a time ([`ContentHold::held_chunk`]) walks,
+  /// so a large held manifest is never copied out whole in one call, as [`ContentHold::archive_of`] copies it (a
+  /// holder seeding a kernel-sized green's version 0 a share at a time, §4.16 "Apply on holders", A-286).
+  pub fn held_manifest(
+    &self,
+    arena: &ChunkArena,
+    object: ObjectId,
+    identity: &[u8; 32],
+  ) -> Option<Archive> {
+    let record = self.objects.get(&object)?.manifests.get(identity)?;
+    Self::manifest_of(arena, record)
+  }
+
+  /// One chunk of a manifest held for `object`, as stored, copied out of `arena`: `None` unless the object holds that
+  /// manifest and its held content references the chunk (AUD-29-45: never another object's bytes, the rule a chunk
+  /// fetch is served by). The other half of [`ContentHold::held_manifest`] (A-286).
+  pub fn held_chunk(
+    &self,
+    arena: &ChunkArena,
+    object: ObjectId,
+    identity: &[u8; 32],
+    chunk: &[u8; 32],
+  ) -> Option<Chunk> {
+    self.piece_of(arena, object, identity, chunk)
+  }
+
   /// The manifest-only archive bytes of a manifest held for `object`, as stored, or `None` if not held for it.
   fn manifest_bytes(
     &self,
@@ -3748,6 +3775,67 @@ mod tests {
       "the archive reassembles byte for byte"
     );
     assert_eq!(archive.referenced_chunks(), identities);
+  }
+
+  /// §4.16 "Apply on holders" (A-286): a holder seeding a green's version 0 a share at a time reads the inputs it holds
+  /// one chunk at a time rather than as one copy of the whole archive. Do: hold a two-chunk archive for one object, then
+  /// read its manifest and each of its chunks back one at a time, for that object and for another. Expect: the manifest
+  /// is the archive's with no chunks, and its chunks, read one at a time in reference order and put back in, make the
+  /// archive the hold gives whole, byte for byte; another object, a manifest not held, and a chunk the manifest does not
+  /// reference are each answered nothing.
+  #[test]
+  fn a_held_manifest_is_read_back_a_chunk_at_a_time() {
+    let archive = two_chunk_archive();
+    let mut hold = ContentHold::new();
+    let mut room = TestSpace::new();
+    let manifest = hold
+      .hold(
+        &mut room.space(),
+        OBJECT,
+        Placed::default(),
+        archive.clone(),
+      )
+      .unwrap();
+    let held = hold.held_manifest(&room.arena, OBJECT, &manifest).unwrap();
+    assert_eq!(
+      held.encode(),
+      with_chunks(&archive, Vec::new()).encode(),
+      "the held manifest is the archive's header and tree, no chunks"
+    );
+    let chunks: Vec<Chunk> = held
+      .referenced_chunks()
+      .iter()
+      .map(|chunk| {
+        hold
+          .held_chunk(&room.arena, OBJECT, &manifest, chunk)
+          .unwrap()
+      })
+      .collect();
+    let whole = hold.archive_of(&room.arena, OBJECT, &manifest).unwrap();
+    assert_eq!(
+      with_chunks(&held, chunks).encode(),
+      whole.encode(),
+      "a chunk at a time reassembles what the hold gives whole"
+    );
+    let first = archive.chunks[0].identity;
+    assert!(hold.held_manifest(&room.arena, OTHER, &manifest).is_none());
+    assert!(
+      hold
+        .held_chunk(&room.arena, OTHER, &manifest, &first)
+        .is_none()
+    );
+    assert!(hold.held_manifest(&room.arena, OBJECT, &hash(9)).is_none());
+    assert!(
+      hold
+        .held_chunk(&room.arena, OBJECT, &hash(9), &first)
+        .is_none()
+    );
+    assert!(
+      hold
+        .held_chunk(&room.arena, OBJECT, &manifest, &hash(9))
+        .is_none(),
+      "a chunk the manifest does not reference is not read"
+    );
   }
 
   /// The holder side served end to end in-process: an offer to a hold with one chunk already present

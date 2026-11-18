@@ -1918,26 +1918,7 @@ fn a_device_mknod_makes_a_node_for_root_and_refuses_any_other_caller_eperm() {
   let mut store = store();
   let mut vol = volume(&mut store);
   let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
-  let widest = (259, (1 << 20) - 1);
-  {
-    let mut export = export_to(&mut bridge, 0);
-    let root = root_handle(&mut export);
-    for (ftype3, name) in [(3, "block"), (4, "char")] {
-      let (status, made) = mknod_reply(&mut export, &root, name, ftype3, widest);
-      assert_eq!(status, Nfsstat3::Ok.wire(), "root makes a {name} device");
-      for attrs in [made.unwrap(), attributes_of(&mut export, &root, name)] {
-        assert_eq!(
-          (
-            attrs.kind as u32,
-            attrs.rdev.specdata1,
-            attrs.rdev.specdata2
-          ),
-          (ftype3, widest.0, widest.1),
-          "a {name} device reports its type and number"
-        );
-      }
-    }
-  }
+  expect_root_makes_each_device_at_the_widest_number(&mut bridge);
   let cx = write_cx();
   let root_ino = bridge.root(&cx).unwrap();
   chmod(&mut bridge, &cx, root_ino, 0o777);
@@ -1972,6 +1953,30 @@ fn a_device_mknod_makes_a_node_for_root_and_refuses_any_other_caller_eperm() {
     ),
     (4, 0, 0, 1000)
   );
+}
+
+/// Root's half of `a_device_mknod_makes_a_node_for_root_and_refuses_any_other_caller_eperm`. Do: as root, MKNOD a block
+/// and a character device numbered 259:1048575 (past the old 8-bit encoding) through `bridge`. Expect each made, and
+/// its MKNOD reply and a GETATTR to report its type (`NF3BLK`, `NF3CHR`) and its number in `rdev`.
+fn expect_root_makes_each_device_at_the_widest_number(bridge: &mut VolumeBridge<'_>) {
+  let widest = (259, (1 << 20) - 1);
+  let mut export = export_to(bridge, 0);
+  let root = root_handle(&mut export);
+  for (ftype3, name) in [(3, "block"), (4, "char")] {
+    let (status, made) = mknod_reply(&mut export, &root, name, ftype3, widest);
+    assert_eq!(status, Nfsstat3::Ok.wire(), "root makes a {name} device");
+    for attrs in [made.unwrap(), attributes_of(&mut export, &root, name)] {
+      assert_eq!(
+        (
+          attrs.kind as u32,
+          attrs.rdev.specdata1,
+          attrs.rdev.specdata2
+        ),
+        (ftype3, widest.0, widest.1),
+        "a {name} device reports its type and number"
+      );
+    }
+  }
 }
 
 /// A-268, kept by A-294. Do: make a FIFO, then MKNOD a character device of the same name; then, as a user who may not
@@ -3609,4 +3614,124 @@ fn hostile_names_never_reach_outside_the_export_or_leave_an_entry() {
     .filter(|name| name != "." && name != "..")
     .collect();
   assert!(in_d.is_empty(), "nothing was created in `d`: {in_d:?}");
+}
+
+// ------------------------------------------------------------- the group a new object takes (A-328)
+
+/// Format: the group of the two parent directories, not the creator's.
+const PARENT_GID: u32 = 7;
+/// Format: the creator's group, the one its `AUTH_SYS` credential names.
+const CREATOR_GID: u32 = 20;
+/// Format: the set-group-ID bit of a mode (`S_ISGID`).
+const S_ISGID: u32 = 0o2000;
+
+/// What a directory made in a set-group-ID parent takes from it, and the group an object made in a plain parent takes,
+/// as this host's own file systems give them (A-328). A macOS host's are BSD's: APFS gives a directory made in a `2755`
+/// parent `755` (measured, macOS 26, 2026-11-18), and every object its parent's group (XNU's `vnode_authattr_new`).
+#[cfg(target_os = "macos")]
+const THIS_HOSTS_RULE: (u32, u32) = (0, PARENT_GID);
+/// What a directory made in a set-group-ID parent takes from it, and the group an object made in a plain parent takes,
+/// as this host's own file systems give them (A-328). Linux's are System V's (`inode_init_owner`): the bit, and the
+/// creator's group; Windows' NFS export answers as Linux's does.
+#[cfg(not(target_os = "macos"))]
+const THIS_HOSTS_RULE: (u32, u32) = (S_ISGID, CREATOR_GID);
+
+/// A MKDIR (`directory`) or an UNCHECKED CREATE of `name` in the directory behind `parent` over `export`, mode `0o755`
+/// or `0o644`; the new object's attributes.
+fn make_over_the_export(
+  export: &mut Export<'_>,
+  parent: &Nfsfh3,
+  name: &str,
+  directory: bool,
+) -> Fattr3 {
+  let mut args = XdrWriter::new();
+  parent.encode(&mut args);
+  args.opaque(name.as_bytes());
+  if !directory {
+    args.u32(0); // createmode UNCHECKED
+  }
+  args.bool(true); // sattr3 mode set
+  args.u32(if directory { 0o755 } else { 0o644 });
+  args.bool(false); // uid
+  args.bool(false); // gid
+  args.bool(false); // size
+  args.u32(0); // atime DONT_CHANGE
+  args.u32(0); // mtime DONT_CHANGE
+  let procedure = if directory {
+    NFSPROC3_MKDIR
+  } else {
+    NFSPROC3_CREATE
+  };
+  let reply = export
+    .serve_nfs(procedure, &mut XdrReader::new(args.as_slice()))
+    .unwrap();
+  let mut r = XdrReader::new(&reply);
+  assert_eq!(r.u32().unwrap(), Nfsstat3::Ok.wire(), "{name} was made");
+  assert!(r.bool().unwrap(), "a handle follows");
+  let _fh = Nfsfh3::decode(&mut r).unwrap();
+  PostOpAttr::decode(&mut r)
+    .unwrap()
+    .0
+    .expect("the new object's attributes")
+}
+
+/// Makes directory `name` under `root` as `cx`, gives it to `501:PARENT_GID` with `mode`, and returns its handle.
+fn parent_owned_by_group(
+  bridge: &mut VolumeBridge<'_>,
+  cx: &OpContext,
+  root: ObjectId,
+  name: &str,
+  mode: u32,
+) -> Nfsfh3 {
+  let made = bridge.mkdir(root, cx, name, 0o755).unwrap();
+  chown(bridge, cx, made.ino, 501, PARENT_GID);
+  chmod(bridge, cx, made.ino, mode);
+  slates_bridge_nfs::FileHandle {
+    volume: VolumeId { bytes: [0x11; 16] },
+    inode: made.ino,
+    generation: 0,
+    attachment: 0,
+    token: [0u8; 16],
+  }
+  .to_fh()
+}
+
+/// A-328 / §4.6 "POSIX and transparency acceptance": a new object takes its group over the NFS export as a native NFS
+/// server on this host would give it, by this host's file systems' rule. Do: as uid 501 whose credential names group
+/// 20, MKDIR in a set-group-ID directory of group 7, and MKDIR and CREATE in a plain one of group 7. Expect: on macOS
+/// (BSD's rule) the directory in the set-group-ID parent without the bit and every object in group 7; elsewhere
+/// (System V's) that directory with the bit and in group 7, and the plain parent's objects in group 20. Before A-328
+/// a macOS host's export gave System V's rule, and a Subversion repository's `db/revprops`, made in the set-group-ID
+/// `db`, read `2755` over the mount where APFS gives `755` (CI run 44260193629).
+#[test]
+fn an_object_made_over_the_export_takes_its_group_by_this_hosts_rule() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root = oid(bridge.root(&cx).unwrap());
+  let set_group_id = parent_owned_by_group(&mut bridge, &cx, root, "sgid", 0o2755);
+  let plain = parent_owned_by_group(&mut bridge, &cx, root, "plain", 0o755);
+  let mut export = export_as(&mut bridge, 501, CREATOR_GID);
+  let (directory_bit, plain_gid) = THIS_HOSTS_RULE;
+
+  let in_set_group_id = make_over_the_export(&mut export, &set_group_id, "d", true);
+  assert_eq!(
+    (in_set_group_id.gid, in_set_group_id.mode & S_ISGID),
+    (PARENT_GID, directory_bit),
+    "a directory made in the set-group-ID parent"
+  );
+  for directory in [true, false] {
+    let made = make_over_the_export(
+      &mut export,
+      &plain,
+      if directory { "d" } else { "f" },
+      directory,
+    );
+    assert_eq!(
+      (made.gid, made.mode & S_ISGID),
+      (plain_gid, 0),
+      "an object made in the plain parent (a directory: {directory})"
+    );
+  }
 }

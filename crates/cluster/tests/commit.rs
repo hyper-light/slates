@@ -126,17 +126,34 @@ fn run_commit_with_budget(
   holder_generation: u64,
   budget: CommitBudget,
 ) -> (Result<Placement, String>, Option<u64>) {
-  let (outcome, stale, _) = run_commit_timed(serve, holder_generation, budget);
+  let (outcome, stale, _, _) = run_commit_timed(serve, holder_generation, budget);
   (outcome, stale)
 }
 
+/// What the holders that did not acknowledge answered (`Committed::answers`), with the same wire history as
+/// [`run_commit_full`]: each holder's id and its reply's bytes.
+fn run_commit_answers(serve: [bool; 2], holder_generation: u64) -> Vec<(HostId, Vec<u8>)> {
+  let (_, _, _, answers) = run_commit_timed(
+    serve,
+    holder_generation,
+    CommitBudget::hard(DEADLINE_NS, POLL_NS),
+  );
+  answers
+}
+
 /// Runs the same wire history and also returns how long the commit took on the simulation's virtual clock, from
-/// its call to its return.
+/// its call to its return, and what the holders that did not acknowledge answered.
+#[allow(clippy::type_complexity)]
 fn run_commit_timed(
   serve: [bool; 2],
   holder_generation: u64,
   budget: CommitBudget,
-) -> (Result<Placement, String>, Option<u64>, u64) {
+) -> (
+  Result<Placement, String>,
+  Option<u64>,
+  u64,
+  Vec<(HostId, Vec<u8>)>,
+) {
   let mut sim = SimRuntime::new(&config(), 1).unwrap();
   let id = sim.shard_ids()[0];
 
@@ -239,8 +256,9 @@ fn run_commit_timed(
       .await;
       let elapsed = slates_rt::futures::now_ns().saturating_sub(started);
       let stale = committed.stale_version;
+      let answers = committed.answers;
       let outcome = committed.outcome.map_err(|e: ClusterError| e.to_string());
-      let _ = result_tx.send((outcome, stale, elapsed));
+      let _ = result_tx.send((outcome, stale, elapsed, answers));
     })
     .unwrap();
 
@@ -257,7 +275,7 @@ fn run_commit_timed(
 fn a_commit_returns_at_its_quorum_not_at_its_poll() {
   /// Shape: the daemon's record poll, a tenth of its 100 ms heartbeat.
   const DAEMON_POLL_NS: u64 = 10_000_000;
-  let (outcome, _, elapsed_ns) = run_commit_timed(
+  let (outcome, _, elapsed_ns, _) = run_commit_timed(
     [true, true],
     GENERATION,
     CommitBudget::hard(DEADLINE_NS, DAEMON_POLL_NS),
@@ -541,6 +559,40 @@ fn a_holder_on_a_newer_configuration_rides_its_version_back_and_the_owner_does_n
     "a same-generation commit places: {placed:?}"
   );
   assert_eq!(none, None, "no holder was ahead, so nothing rides back");
+}
+
+/// §4.16 "Commit" (A-286): a holder that cannot accept a record yet answers with what it holds of the record's
+/// inputs, and the owner reads that answer to ship what the holder still lacks; so a commit hands back what every
+/// holder that did not acknowledge answered (`Committed::answers`), whatever it is. Do: commit while both holders are
+/// on a newer configuration (each refuses `ConfigurationStale`), then while both are on the owner's. Expect: the first
+/// commit's answers are both holders' refusals, each naming the newer configuration; the second commit's answers
+/// hold no acknowledgement (a holder that acknowledged is in the placement, not among the answers).
+#[test]
+fn a_holder_that_does_not_acknowledge_is_read_back_by_its_answer() {
+  let mut answers = run_commit_answers([true, true], GENERATION + 1);
+  answers.sort_by_key(|(host, _)| host.0);
+  let hosts: Vec<HostId> = answers.iter().map(|(host, _)| *host).collect();
+  assert_eq!(
+    hosts,
+    [HostId(2), HostId(3)],
+    "both refusing holders' answers are handed back"
+  );
+  for (host, reply) in &answers {
+    assert_eq!(
+      slates_db::register::decode_refusal(reply),
+      Some(slates_db::register::Refusal::ConfigurationStale {
+        version: GENERATION + 1
+      }),
+      "holder {host:?} answered its refusal, naming its configuration"
+    );
+  }
+  let placed = run_commit_answers([true, true], GENERATION);
+  assert!(
+    placed
+      .iter()
+      .all(|(_, reply)| { slates_db::register::Ack::decode(reply).is_err() }),
+    "an acknowledgement is never among the answers: {placed:?}"
+  );
 }
 
 /// AC (acceptance history 4): a retry of the same record **reuses the connection** — the second commit
