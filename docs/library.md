@@ -235,10 +235,22 @@ nothing answers until detached) and mounts nothing (a mount is a record). The co
   (`Unrestricted`, `ProfileLoaded`, `ProfileMissing`, `Unsupported`), and every refusal is an
   `ExecFault` naming its remedy.
 
-Calls are synchronous: a provisioning verb answers in microseconds, and a landing or a mount waits
-while the daemon lives. A host on its own async runtime runs them on its blocking pool until the
-async form lands. `slates_api::VERSION` is the crate's version, the workspace's one version;
+Calls on `Instance` are synchronous: a provisioning verb answers in microseconds, and a landing or a
+mount waits while the daemon lives. A host on its own event loop awaits the verbs `AsyncInstance` serves:
+provisioning from every source, a snapshot, a status and a destroy. It lends one wait, `Reactor::wait`:
+the client's completion signal readable, or a timeout, whichever comes first. Nothing spawns and no runtime
+is added; a future dropped mid-call cancels its call. `AsyncInstance::new(instance)` and
+`into_instance()` move between the forms; deregister the completion descriptor from the loop first,
+since handing back closes it. The other verbs run on the host's blocking pool until the async form
+serves them too. `slates_api::VERSION` is the crate's version, the workspace's one version;
 `slates_api::CONTRACT` is the contract's.
+
+Every list a verb answers comes a page at a time or is bounded: `list_page`, `grants_page`,
+`audit_page`, `changed_since_page` and `drift_page` read one page and name the next, and `list`,
+`grants`, `audit`, `changed_since` and `drift` walk them whole. The audit is one log, written through the
+control shard, so every instance reads every landing's records whichever shard it sits on. A granted
+landing that is refused ends its trail: a `LandingFinished` record whose `outcome` is `Refused`, or
+`Aborted` once it wrote an entry.
 
 ## A host's workspace flow
 
@@ -282,6 +294,6 @@ fn workspace(folder: &std::path::Path, at: &str) -> Result<(), slates_api::Error
 
 ## What is owed
 
-1. The starter handed the launcher's authority on every platform.
-2. Typed fields on the wire for drift, a presentation's conflicts and a merge's versions.
-3. An async form over the host's own reactor.
+1. A typed field on the wire for a merge's versions (the work's base beside the head).
+2. The async form for the remaining verbs: the paged reads, landings, merges, policies and
+   observation.
