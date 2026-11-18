@@ -3843,10 +3843,11 @@ enum Phase {
   Sweep { parents: Vec<Box<str>>, next: usize },
   /// Taking each entry's verdict against the disk, one entry per unit.
   Validate { ours: Ours, next: usize },
-  /// Writing: per unit, one entry, one window of a large file, one batch's barrier or one staged file placed (A-130).
+  /// Writing: per unit, one entry, one window of a large file, one batch's barrier or one staged file placed (A-130);
+  /// its progress boxed to keep the enum small, as `Advance`'s is.
   Write {
     next: usize,
-    progress: WriteProgress,
+    progress: Box<WriteProgress>,
   },
   /// Syncing the touched directories, one per unit.
   Sync {
@@ -4249,7 +4250,7 @@ impl<'h, H: LandFs> LandingRun<'h, H> {
           } else {
             next_phase = Some(Phase::Write {
               next: 0,
-              progress: WriteProgress::start(*began),
+              progress: Box::new(WriteProgress::start(*began)),
             });
           }
         }

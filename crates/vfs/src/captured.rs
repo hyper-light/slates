@@ -694,18 +694,41 @@ mod tests {
     let id = vol.snapshot(&mut store).unwrap();
     let tree = vol.frozen_tree(id).unwrap();
     let at = |path: &str| held_at(&store, tree, NameEquivalence::Exact, path).unwrap();
-    assert!(matches!(at("/d/f"), Held::File { size: 4, .. }));
-    assert!(matches!(at("/d"), Held::Dir { .. }));
-    assert!(matches!(at("/"), Held::Dir { .. }));
-    assert!(matches!(at("/s"), Held::Symlink { target, .. } if &*target == "d/f"));
-    assert_eq!(at("/missing"), Held::Absent);
-    assert_eq!(at("/d/f/beneath"), Held::Absent);
+    let kinds: Vec<(&str, &str)> = ["/d/f", "/d", "/", "/s", "/missing", "/d/f/beneath"]
+      .into_iter()
+      .map(|path| (path, kind_of(&at(path))))
+      .collect();
+    assert_eq!(
+      kinds,
+      vec![
+        ("/d/f", "file of 4"),
+        ("/d", "directory"),
+        ("/", "directory"),
+        ("/s", "symlink to d/f"),
+        ("/missing", "absent"),
+        ("/d/f/beneath", "absent"),
+      ]
+    );
     let Held::File { no, .. } = at("/d/f") else {
       panic!("/d/f is no file");
     };
     let mut bytes = [0u8; 8];
     assert_eq!(read_file(&store, tree, no, 0, &mut bytes).unwrap(), 4);
     assert_eq!(&bytes[..4], b"four");
+  }
+
+  /// [`held_at_reads_each_kind_and_nothing_beneath_a_file`]'s reading of what a tree holds: its kind, a file's size and a
+  /// symlink's target, the rest of each kind left aside.
+  fn kind_of(held: &Held) -> &'static str {
+    match held {
+      Held::File { size: 4, .. } => "file of 4",
+      Held::File { .. } => "file",
+      Held::Dir { .. } => "directory",
+      Held::Symlink { target, .. } if &**target == "d/f" => "symlink to d/f",
+      Held::Symlink { .. } => "symlink",
+      Held::Absent => "absent",
+      Held::Special => "special",
+    }
   }
 
   /// The clone's configuration: its own prefix, as every volume on a host has.
