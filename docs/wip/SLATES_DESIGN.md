@@ -9731,6 +9731,14 @@ entry either old or new, never torn).
    | no witness; disk has an entry with the same bytes | created | Skip |
    | file became a directory or the reverse | any | Conflict(TypeChanged) |
 
+   A file whose bytes the volume kept and whose mode or Windows bits it changed is a metadata entry (`Chmod`, A-458): no
+   byte of it is rewritten, and each field the volume changed — the permission bits, the Windows bits a volume keeps for
+   a file (A-262) — is judged on its own by the same rule: set where the disk still holds the base's value,
+   `AcceptIdentical` where it holds the volume's, `Conflict(ModifyModify)` where it holds a third; a field the volume
+   left as the base had stays as the disk holds it, as bytes the disk changed and the volume did not do. A missing file
+   is `ModifyDelete` and anything but a file `TypeChanged`. The fields are set through the file's own handle, which is
+   judged again by its own `fstat` just before.
+
    Any `Conflict` refuses the landing with `Conflict{entries}` and records `LandingValidated`
    with the verdicts; nothing is written. Resolution is the agent's or the human's (`read_base`,
    rewrite, `rewitness`), after which the landing is planned again and presents a new manifest.
@@ -19659,8 +19667,9 @@ overwrite, `SetBasicInfo`, `CanDelete` and rename in `host.rs`).
   - **Stage 3's landing half, built 2026-11-18 (A-451):** a Windows landing gives each file, directory and link it
     makes the bits the volume keeps for it, a file's `READONLY` still its mode's, reads the word back and refuses the
     entry `EOPNOTSUPP` where a bit did not take; a directory link lands as a directory link. The manifest carries the
-    bits, so a grant binds them. Linux and macOS landings carry the bits in the volume and apply none. A change of an
-    untouched base file's bits alone lands nothing, as a change of its mode alone lands nothing (GAPS).
+    bits, so a grant binds them. Linux and macOS landings carry the bits in the volume and apply none. Since A-458 (the
+    same day) a change of a file's bits or mode alone lands too, as a metadata entry with no byte rewritten; until then
+    it landed nothing.
   - **Stage 2, owed when works are mountable:** the merge's metadata dimension, the bits merged as the mode is, accept,
     identical or conflict, never inferred (D-27). No work can set the bits today (below), so no merge can drop them.
 - **Invisible to the merge and the landing until then (checked 2026-11-08).** A work's increment is composed from the
@@ -31366,8 +31375,8 @@ and `tests/os_removal.rs`, the bits passed through).
   skipped loudly without the link privilege or Developer Mode).
 - **Owed.** A change of an untouched base file's bits alone lands nothing. A landing judges a base file by its bytes,
   so the verdict passes the entry its copy-up makes as `Skip`, as it passes a change of the file's mode alone, which
-  §4.15 step 1 names among what a landing carries; a captured clone's entry compares content alone likewise. A
-  directory's bits, like a Unix directory's mode, are given after it is made, so a crash between the two steps leaves it
+  §4.15 step 1 names among what a landing carries; a captured clone's entry compares content alone likewise (built by
+  A-458 the same day: a metadata entry). A directory's bits, like a Unix directory's mode, are given after it is made, so a crash between the two steps leaves it
   without them, and a resumed landing takes it as already there. The presented entry list (`PlannedEntry`, §4.15 step
   2) shows each entry's mode and not its bits, which the grant now binds. The backslash read-back of a landed link
   (`..\src\lib.rs` read by the Windows base) is the base plane's own map, not this one, and stays its own piece.

@@ -1786,16 +1786,19 @@ fn a_session_grant_covers_the_next_landing() {
   assert_eq!(finished, 2);
 }
 
-/// A-262, A-451. Do: run §4.15's worked example twice over the same base, the second time with Windows attribute bits
-/// set (`HIDDEN | SYSTEM`) on an edited file, on a created one, and on a base file the work never otherwise touched.
-/// Expect: both landings are `Done` with nothing refused, leave the same disk, byte for byte and kind for kind, and
-/// write the same count; the edited and the created file hold the bits on the disk, and without them what the volume
-/// kept (the base file's none, a created file's `ARCHIVE`). The untouched base file is passed by: a landing judges a base
-/// file by its bytes, so a change of its bits alone lands nothing, as a change of its mode alone does not (GAPS, A-451).
+/// A-262, A-451, A-458. Do: run §4.15's worked example twice over the same base, the second time with Windows attribute
+/// bits set (`HIDDEN | SYSTEM`) on an edited file, on a created one, and on a base file the work never otherwise
+/// touched. Expect: both landings are `Done` with nothing refused and leave the same disk, byte for byte and kind for
+/// kind; the edited, the created and the untouched file hold the bits on the disk, and without them what the volume
+/// kept (the base files' none, a created file's `ARCHIVE`). The untouched file's bits land as a metadata entry, its
+/// bytes never rewritten, so the second landing writes one entry more. Before A-458 a change of a base file's bits
+/// alone landed nothing.
 #[test]
 fn a_landing_carries_windows_attribute_bits_and_writes_the_same_bytes() {
   /// Format: `FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM`.
   const HIDDEN_SYSTEM: u32 = 0x2 | 0x4;
+  /// The files the bits are set on: an edited one, a created one, and an untouched base file.
+  const MARKED: [&str; 3] = ["/src/lib.rs", "/src/new1.rs", "/src/f12.rs"];
   let land = |with_bits: bool| {
     let mut host = SimHost::new();
     example_base(&mut host, 16);
@@ -1803,7 +1806,7 @@ fn a_landing_carries_windows_attribute_bits_and_writes_the_same_bytes() {
     let mut vol = overlay(&mut host, &mut store);
     example_edits(&mut vol, &mut host, &mut store);
     if with_bits {
-      for path in ["/src/lib.rs", "/src/new1.rs", "/src/f12.rs"] {
+      for path in MARKED {
         set_windows_bits(
           &mut vol,
           &mut host,
@@ -1814,6 +1817,7 @@ fn a_landing_carries_windows_attribute_bits_and_writes_the_same_bytes() {
         );
       }
     }
+    let untouched = host.fingerprint("/src/f12.rs").unwrap();
     let target = root_target(&mut host);
     let mut session = Session::new();
     let mut setup = Setup {
@@ -1825,7 +1829,12 @@ fn a_landing_carries_windows_attribute_bits_and_writes_the_same_bytes() {
     };
     let report = setup.land(example_request(1)).unwrap();
     assert_eq!(report.state, LandingState::Done, "{report:?}");
-    let bits = ["/src/lib.rs", "/src/new1.rs"].map(|path| host.windows_attributes(path));
+    assert_eq!(
+      host.fingerprint("/src/f12.rs").unwrap().ino,
+      untouched.ino,
+      "the untouched file is never rewritten"
+    );
+    let bits = MARKED.map(|path| host.windows_attributes(path));
     (disk(&host), report.written, bits)
   };
   let (with_bits, written_with_bits, bits_with) = land(true);
@@ -1835,19 +1844,20 @@ fn a_landing_carries_windows_attribute_bits_and_writes_the_same_bytes() {
     "the bits change no byte and no kind a landing writes, and refuse nothing"
   );
   assert_eq!(
-    written_with_bits, written_without,
-    "nor how many entries it writes ({written_without})"
+    written_with_bits,
+    written_without + 1,
+    "one entry more: the untouched file's bits, as a metadata entry"
   );
-  let hidden_system = u16::try_from(HIDDEN_SYSTEM).unwrap();
+  let hidden_system = Some(u16::try_from(HIDDEN_SYSTEM).unwrap());
   assert_eq!(
     bits_with,
-    [Some(hidden_system), Some(hidden_system)],
-    "the edited and the created file land with the bits the volume keeps"
+    [hidden_system; 3],
+    "every marked file lands with the bits the volume keeps"
   );
   assert_eq!(
     bits_without,
-    [Some(0), Some(WindowsAttributes::ARCHIVE)],
-    "without them, what the volume kept: the base file's none, a created file's ARCHIVE"
+    [Some(0), Some(WindowsAttributes::ARCHIVE), Some(0)],
+    "without them, what the volume kept: a base file's none, a created file's ARCHIVE"
   );
 }
 

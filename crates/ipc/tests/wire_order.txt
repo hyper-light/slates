@@ -139,6 +139,7 @@ PlannedAction 4 Mkdir
 PlannedAction 5 Rmdir
 PlannedAction 6 Symlink
 PlannedAction 7 Clear
+PlannedAction 8 Chmod
 PolicySubject 0 Consumer
 PolicySubject 1 Volume
 Principal 0 Uid

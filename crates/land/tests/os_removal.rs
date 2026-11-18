@@ -293,6 +293,10 @@ impl LandFs for Interfering {
   ) -> Result<(), HostError> {
     self.inner.end_barrier(files, ran)
   }
+  fn open_to_chmod(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError> {
+    self.tick();
+    self.inner.open_to_chmod(dir, name)
+  }
   fn set_mode(&mut self, file: HostFile, mode: u32) -> Result<(), HostError> {
     self.tick();
     self.inner.set_mode(file, mode)

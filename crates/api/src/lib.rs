@@ -225,9 +225,12 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 40: [`Instance::import_archive`], a volume made from an archive a volume of the caller's holds as [`ARCHIVE_FILE`]
 /// ([`ArchiveImported`]), and its refusal by kind, [`Invalid::Archive`] naming an [`ArchiveFault`] (Mantle's
 /// CP-T10.4, A-453; the same day).
+/// 41: a landing carries a file whose mode or Windows attribute bits alone changed (A-458): [`PlannedAction::Chmod`]
+/// names such an entry with the mode and bits it had, and [`ActionTally::chmod`] counts them; until then such a change
+/// was planned as a replacement the verdict passed by, and it never landed (the same day).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 40;
+pub const CONTRACT: u32 = 41;
 
 /// What a rewitness did (§4.15 `rewitness`): the paths one reply holds and the count of the rest (A-267).
 pub use slates_client::Rewitnessed;

@@ -18690,12 +18690,22 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   the grant; the Windows writer gives each file, directory and link it makes those bits and reads the word back,
   refusing the entry `EOPNOTSUPP` where the target's file system did not take one, as FAT drops `OFFLINE` and
   `NOT_CONTENT_INDEXED`; a directory link lands as one; its unit tests ran on the Mac Studio, its Windows test and two
-  oracle tests filed for main's lanes; still owed with it: a change of an untouched base file's bits alone lands
-  nothing, since a landing judges a base file by its bytes and passes the copy-up's entry `Skip`, as it passes a change
-  of its mode alone, which §4.15 step 1 names among what a landing carries, and a captured clone's entry likewise
-  compares content alone; a directory's bits, like a Unix directory's mode, are given after it is made, so a crash
-  between the two leaves it without them and a resumed landing takes it as already there; and the presented entry list
-  (`PlannedEntry`, §4.15 step 2) shows each entry's mode and not its bits, which the grant now binds); and
+  oracle tests filed for main's lanes; still owed with it: a directory's bits, like a Unix directory's mode, are given
+  after it is made, so a crash between the two leaves it without them and a resumed landing takes it as already there;
+  and the presented entry list (`PlannedEntry`, §4.15 step 2) shows each entry's mode and not its bits, which the grant
+  now binds, but for a metadata entry's); a file whose mode or Windows bits alone changed, which never landed (the
+  verdict judged a replacement by its bytes alone, a captured clone's plan compared content alone, and the plan read a
+  metadata-only copy-up's bytes from the disk, so an outsider's `chmod` of such a file refused the whole landing
+  `BaseDrift`), **fixed by A-458 the same day** (`docs/bugs/2026-11-18-a-files-mode-or-windows-bits-changed-alone-never-landed.md`:
+  a metadata entry, `Chmod`, judged field by field and set through the file's own handle, no byte rewritten; its unit
+  tests ran on the Mac Studio, the oracle and crash-oracle reruns filed for main; still owed with it: a metadata-only
+  write is made durable by its directory's sync alone, as a made directory's mode is, where a file-level `fsync` off the
+  shard is owed, from memory of ext4's and XFS's fsync paths, which commit only to the directory's own last change, to
+  verify; a mode Windows cannot hold (an execute bit) makes an entry whose set changes nothing there, and the next
+  landing finds the file as the disk keeps it; a check and a set are two calls on one handle, so an outsider's change to
+  the same field between them is not seen; a `touch` alone and a base directory's mode change alone still land nothing;
+  a captured clone's replacement overwrites an outsider's mode change where an overlay's refuses it (T-1.14); and the
+  manifest's encoding, which grants bind, has no golden vector); and
   the seam's numbering: refusals the engine tells apart are POSIX numbers and the rest Win32 codes, so a Win32 code equal
   to one of the engine's numbers (`ERROR_NOT_SAME_DEVICE` 17, `ERROR_INSUFFICIENT_BUFFER` 122, among five) would read as
   that refusal; none of the writer's calls is known to answer one, and a typed refusal at the seam would close it.
