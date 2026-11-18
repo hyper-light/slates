@@ -406,6 +406,20 @@ pub(super) fn hold_for_ingest(
   )
 }
 
+/// Holds the SAVE of `total` bytes at the head of `stream` for an ingest of every backing with writable ranges (A-303):
+/// the guest's stores through its maps reach the volume before the snapshot at the cut, as a `FSYNC`'s do before its
+/// answer. Whether there is one to wait for.
+pub(super) fn hold_save_for_ingest(
+  s: &ShardState,
+  stream: &mut ShardsStream,
+  total: usize,
+) -> bool {
+  stream.dax.begin_ingest_all(
+    &s.store.shards_backings,
+    slates_bridge_core::dax_backing::Then::Serve(u64::try_from(total).unwrap_or(u64::MAX)),
+  )
+}
+
 /// Starts the ingest every backing with writable ranges takes before the stream ends. Whether there is one.
 pub(super) fn ingest_before_end(s: &ShardState, stream: &mut ShardsStream) -> bool {
   stream.dax.ingest_before_end(&s.store.shards_backings)
