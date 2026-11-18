@@ -1485,6 +1485,33 @@ cluster.
 >   `Overloaded` past it);
 > - the fleet's tasks are added to every shard though they run on the control shard alone.
 
+> **Status (2026-11-18, a reply carried home waits for room while its shard lives).** A result going to another
+> shard's control channel waits for room for as long as that shard lives. That covers a forwarded verb's answer, a
+> scatter part's result and a cross-shard call's result. It also covers a reply handed home by a shard that holds its
+> state (FUSE, WinFsp, images, landings, lease waits, live shipping, the merge plane's deferred acceptances), and the
+> answer of a task refused at admission. Only a shard gone, its daemon stopping, leaves a result undelivered
+> (`xshard.reply_dropped`).
+> - Before: `xshard::send_back` waited one coordinator period and dropped the result, and a reply handed home met a
+>   full channel once. That dropped 4,074 to 4,518 results a run of the 3,000-client load rung on main 80be552a. A
+>   diagnostic build of db9c514e found every one an acknowledgement scatter's part (4,364 of 4,364 and 4,418 of
+>   4,418), whose entry in `ShardState::ack_scatters` then stayed for good. Since A-232 a client waits for a reply
+>   while its daemon lives, so a lost verb reply would be a call that never ends.
+> - What bounds the waiting (banned item 8): a result waits in a task its request already has (the forwarded verb's,
+>   the part's, the call's). A caller that cannot await hands the reply to the channel at once, and only a full
+>   channel puts the wait on one task of its own shard (`xshard::carry_home`). So a shard's waits are at most its
+>   requests in flight: within the clients' credit, `clients_per_shard × slots` a shard, and an acknowledgement's
+>   parts within `ack_scatter_bound`. They are also at most its task arena, where a spawn is refused typed and counted
+>   by its caller.
+> - Counted: `xshard.room_waits_started`, `_ended` and `_peak` (the most held at once) in each shard's status.
+> - A scatter's part on its way out is a request, not a reply: it still waits at most `PART_ROOM_BUDGET_NS` and is
+>   answered `Overloaded`, typed.
+>
+> Tests: `a_forwarded_answer_waits_for_room_on_its_clients_shard_rather_than_being_dropped`
+> (`crates/server/tests/reply_room.rs`; it fails with `send_back`'s wait bounded to a period again) and
+> `a_reply_handed_home_to_a_full_channel_waits_for_room` (`crates/server/src/xshard.rs`). Owed: a reply handed home
+> while both the client's channel and this shard's task arena are full is still lost, counted by its caller, since
+> the arena refuses a spawn at its hard capacity (GAPS).
+
 **Failure matrix.** Driver setup refused (seccomp): Masked (epoll). Task arena full: Refused
 (`TooManyTasks`, admission). A task exceeding the bounded-work rule (a poll past the step quantum on
 the CPU, or waiting inside a call past it): Degraded, counted (`long_steps`, `blocked_steps`), the

@@ -70,7 +70,9 @@ fn name_on(partition: usize, tag: &str) -> String {
 }
 
 /// Holds the shard at `partition` for `hold`: its thread runs nothing else meanwhile. Returns once the hold has begun,
-/// with the thread that waits for it to end.
+/// with the thread that waits for it to end. Asleep, which this daemon's watchdog allows because the test's hold
+/// ([`OWNER_HOLD`]) is a tenth of a liveness window: this daemon has no anchor, and a shard asleep for a whole window
+/// can be judged wedged, which ends the daemon's process and this test binary with it (A-232).
 fn hold(
   daemon: &Daemon,
   partition: usize,
@@ -213,7 +215,9 @@ const HELD_PAST_WAIT: Duration = Duration::from_nanos(HEARTBEAT_NS * 2);
 
 /// Holds the shard at `partition` until `release` is set (or [`OBSERVE_BUDGET_NS`] passes, the daemon's own bound on an
 /// observation): its thread runs nothing else meanwhile. Returns once the hold has begun, with the thread that waits for
-/// it to end.
+/// it to end. The hold may outlast a liveness window on a loaded host, so it wakes every [`HOLD_POLL`]: each wake is CPU
+/// progress, so the watchdog never judges the shard wedged (A-232; `hold_until_answered` in
+/// `crates/server/tests/ack_release.rs` holds the same way).
 fn hold_until(
   daemon: &Daemon,
   partition: usize,

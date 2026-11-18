@@ -230,8 +230,8 @@ async fn given_room(target: u16, mut message: Control) -> bool {
 
 /// [`run_on`] for work whose loss would leave state behind on `shard` (a closed connection's byte states, A-192): a
 /// channel full at once hands the message to a task of this shard that waits for room as a result carried home does
-/// ([`send_back`]). Counted under `refused` on this shard when it is refused past that, the shard is gone, or this shard
-/// could not take the waiting task.
+/// ([`send_back`]), for as long as `shard` lives. Counted under `refused` on this shard when the shard is gone, or this
+/// shard could not take the waiting task.
 pub fn run_on_waiting(
   origin: u16,
   shard: u16,
@@ -1030,13 +1030,12 @@ fn carry_home(origin: u16, body: impl FnOnce() + Send + 'static) -> Result<(), R
       error: RtError::ControlFull { .. },
       message: Some(unsent),
     }) => discarding_unsent(|| {
-      let waiting = slates_rt::futures::spawn(async move {
+      slates_rt::futures::spawn(async move {
         if !given_room(origin, unsent).await {
           state::with_state_counted(|s| s.count(REPLY_DROPPED, 1));
         }
-      })?;
-      let _ = slates_rt::futures::detach(waiting);
-      Ok(())
+      })
+      .and_then(slates_rt::futures::detach)
     }),
     Err(refused) => discarding_unsent(|| {
       drop(refused.message);
