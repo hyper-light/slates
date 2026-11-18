@@ -27834,6 +27834,7 @@ fn planted_merge_record(anchor: HostId) -> slates_server::merge_service::MergeRe
     completion: None,
     signature: None,
     folded_below: 0,
+    checkpoint_floor: 0,
   }
 }
 

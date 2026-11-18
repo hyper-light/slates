@@ -653,6 +653,8 @@ pub(crate) fn drop_copy(state: &mut ShardState, object: ObjectId) {
   state.fleet.forget_object(object);
   state.departed_owners.remove(&object);
   state.merge.replicas.remove(&object);
+  // Its durable checkpoint goes with it (A-404).
+  crate::merge_service::forget_checkpoint(state, object);
 }
 
 /// Answers one page of a successor's takeover round on [`TAKEOVER_STREAM`] (§4.8): after checking the asker is
@@ -2724,6 +2726,7 @@ mod tests {
         completion: None,
         signature: None,
         folded_below: 0,
+        checkpoint_floor: 0,
       };
       state.pending_green_materializations.insert(
         green,
