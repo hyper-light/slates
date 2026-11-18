@@ -297,10 +297,11 @@ struct Client {
 
 #[pymethods]
 impl Client {
-  /// Connects to the named daemon `instance` as a new client (§4.7 rendezvous). `reply_ns` is how
-  /// long a reply is awaited before the daemon's liveness is questioned, and `reconnect_ns` how long a
-  /// reconnect is tried after it is found gone — both derived by the caller from the machine's budgets
-  /// (`slates_client.Deadlines.derive` in Rust; exposed here as explicit nanoseconds).
+  /// Connects to the named daemon `instance` as a new client (§4.7 rendezvous). `reply_ns` is how often
+  /// a wait that cannot see the daemon's departure asks its liveness, and `reconnect_ns` how long a
+  /// request refused for now during a fleet takeover is asked again; a reconnect itself waits while the
+  /// instance's anchor lives and fails at once with none (A-468). Both derived by the caller from the
+  /// machine's budgets (`slates_client.Deadlines.derive` in Rust; exposed here as explicit nanoseconds).
   #[staticmethod]
   #[pyo3(signature = (instance, reply_ns, reconnect_ns))]
   fn connect(instance: &str, reply_ns: u64, reconnect_ns: u64) -> PyResult<Client> {
@@ -800,9 +801,9 @@ impl AsyncClient {
 impl AsyncClient {
   /// Connects to the named daemon `instance` as a new async client, without holding the loop
   /// (AUD-29-19): the rendezvous claim is made at once and its answer read on the loop's timers at the
-  /// pacing the client asks for. Awaitable; raises `SlatesError` when the daemon refuses the claim or
-  /// leaves it unanswered past the claim wait. `reply_ns`/`reconnect_ns` are the same derived budgets
-  /// `Client.connect` takes.
+  /// pacing the client asks for. Awaitable; raises `SlatesError` when the daemon refuses the claim, or
+  /// when the rendezvous's holder (its anchor, or a daemon holding its own) goes before the claim is
+  /// answered (A-443, A-468). `reply_ns`/`reconnect_ns` are the same derived budgets `Client.connect` takes.
   #[staticmethod]
   #[pyo3(signature = (instance, reply_ns, reconnect_ns))]
   fn connect(
