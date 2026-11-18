@@ -2911,6 +2911,12 @@ before the report is published, so a tool never reads attributes newer than the 
 > leaves a stale stamp with the restamp owed, reported as lost writes rather than dropped. Proven by
 > `a_volume_a_publication_leaves_out_keeps_its_logged_writes_for_the_next_daemon`
 > (`docs/bugs/2026-11-18-a-left-out-volumes-logged-writes-were-dropped-at-the-next-restart.md`).
+> **The replay writes an overlay's file through its host (2026-11-18, A-429).** The replay wrote a logged record through
+> the volume alone, where the bridge had written it through the overlay's host. For a base file the recovered image
+> holds uncopied, the write then opened its window with nothing of the disk in it, and the bytes before it read as
+> zeros. `verbs::replay_one` now writes an overlay's record as the bridge does: the file copied up and its windows read
+> from the disk first. Proven by `a_replayed_write_into_an_overlays_base_file_keeps_the_disks_bytes_around_it`
+> (`docs/bugs/2026-11-18-a-replayed-write-into-an-overlays-base-file-zeroed-the-bytes-before-it.md`).
 > **The takeover round is built (2026-10-23, A-158).** A restored mount tells its kernel what its predecessor may not
 > have: the epoch bump and an invalidation of the root and of every restored reference and replayed inode, in slices.
 > Proven on Linux 7.2.9 through the real binary, each test red with the change's files at the previous commit:
@@ -7901,6 +7907,18 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   (its anchor stopped first); the restarted log ends past the head shipped before plus the writes since, and a
 >   survivor serves all ten files (4 of 4 on a Mac Studio, heads 4 then 10 or 11). With the restarted log begun again
 >   at genesis the first write through it is never answered, its log at head 0 with nothing durable.
+> - **A restarted owner's log shipped nothing once its holders came back (fixed 2026-11-18, A-428).** The resumed log's
+>   first whole entry is made at the restart, before the owner's pairs are delivered again, so it covers no candidate's
+>   key; a write appends after it. A holder that came back, owed an install, waited for an image made at the log's head
+>   whenever the last whole state was behind the head; no image was made while a whole record was owed to cover the
+>   candidates' keys (`refresh_image`); and that record waited for credit that only the holders' installs could free.
+>   Nothing shipped, and every write after the restart was refused `DurabilityPending` at the held-reply bound
+>   (`owes whole true; holders [..@None, ..@None]; lanes []; covers candidates false`, on main and on g230's branches,
+>   five of five runs). Now a holder owed an install is sent the last whole state while the retained tail reaches past
+>   it (`Shipper::retains_after`), and takes the entries after it from the tail; only a whole state behind the tail
+>   waits for an image at the head, as the rolling partition's installs need. Held by
+>   `live_ship::tests::a_returned_holder_owed_an_install_is_sent_the_last_whole_state_while_the_tail_reaches_past_it`
+>   and A-344's `a_write_answered_after_a_live_owners_warm_restart_survives_its_takeover`.
 > - **A superseded owner's mounts went on serving its copy (fixed 2026-11-18, A-346, for a fence the owner learned).**
 >   A-338 routed the old owner's verbs to its successor, but its mounts kept the volume: once its lease confirmed again
 >   (the owner re-admitted), an NFS mount answered reads from the copy the successor's writes had passed and its stable
@@ -30210,3 +30228,57 @@ Applied in the same change to:
   of the fix removed, the restarted daemon handed nothing (`left: []`). `cargo xwin check -p slates-server
   --all-targets` for `x86_64-pc-windows-msvc` is clean of the three dead items. The restart through a real daemon
   is main's (`run-requests.md`).
+
+### A-429 — The write log's replay writes an overlay's logged write through its host (2026-11-18, goal g268; found by reading in A-422's sibling sweep; §4.6 "Linux", §4.15 copy-up; amends A-63's replay)
+Applied in the same change to: `crates/server/src/verbs.rs` (`replay_one`; the test
+`a_replayed_write_into_an_overlays_base_file_keeps_the_disks_bytes_around_it`), §4.6 (the takeover status, after
+A-422's paragraph), GAPS (A-422's entry, its second sibling marked fixed) and the bug record
+`docs/bugs/2026-11-18-a-replayed-write-into-an-overlays-base-file-zeroed-the-bytes-before-it.md`.
+
+- **What was there.** A transport's write reaches an overlay through the overlay's host (`VolumeBridge::write`,
+  `host_for`). `Overlay::write` copies a base file up first: it reads the file and records its witness, and for the
+  large class it pins each touched window from the disk. Only then does it apply the bytes. The replay of a logged
+  write (`replay_one`) called `Volume::write` with no host. For a file the dead daemon had copied up after its last
+  publication, which the recovered image still holds as a base file, the write opened its chunk window from the
+  window's start with nothing of the disk in it. Every byte of the window before the write then read as zero, and the
+  file was left unwitnessed.
+- **The rule.** A replayed write is the write the transport made, applied the way the transport applied it. An
+  overlay's record goes through `Volume::with_host` and the slot's host, and an overlay whose host is away is refused
+  `BaseUnavailable`, as the bridge refuses it. Recovery reopens an overlay's host before it replays the log
+  (`build_recovered_volume`), so in a recovery only a volume it could not rebuild lacks one, and that volume is not
+  replayed.
+- **What remains.** A base file the disk changed between the dead daemon's copy-up and the replay is copied up as the
+  disk holds it now. The dead daemon's copy was never published, so the replayed write lands on the newer bytes;
+  logging a copy-up's bytes would cost a whole file per first write.
+- **Evidence.** The test replays a logged write of eight bytes at byte 10 of an uncopied base file (the server crate's
+  `lib.rs`) and reads the file back through the overlay: with the fix it reads as the disk's file with the eight bytes
+  in place. It was red once with the replay writing through the volume alone, the first difference at byte 0 (Mac
+  Studio, 2026-11-18T20:29Z, debug); with the fix it passes beside the clone replay test and the write log's eleven (13
+  of 13).
+
+### A-428 — A holder owed an install is sent the last whole state while the retained tail reaches past it (2026-11-18, g232; §4.10 live shipping, A-344's warm restart; the regression main bisected to A-376)
+
+Applied in the same change to: §4.10's status ("A restarted owner's log shipped nothing once its holders came back"),
+GAPS (A-344's entry), `docs/bugs/2026-11-18-a-restarted-owners-log-shipped-nothing-once-its-holders-came-back.md`,
+`crates/db/src/live.rs` (`Shipper::retains_after`), `crates/server/src/live_ship.rs` (`reached_volume`), and the test
+below.
+- **What was there.** A holder that came back to a live volume and was owed an install waited for an image made at the
+  log's head whenever the last whole state was behind the head (`reached_volume`, `owes_image`). After an owner's warm
+  restart (A-344) the resumed log's first whole entry is made before the owner's pairs are delivered again, so it covers
+  no candidate's key, and a write appends after it. Then three rules each waited on another: the image is not made while
+  a whole record is owed (`refresh_image`), and the period owes one to cover the candidates' keys once the pairs are
+  delivered; that record waits for credit (`Shipper::admits_checkpoint`); and the credit is freed only by the holders
+  taking the entries in flight, which needs the installs. Nothing shipped, and every write after the restart was refused
+  `DurabilityPending` at the held-reply bound. Main bisected the fleet test's red to A-376 (its cheaper holder
+  publications changed the order of the restart's steps); the cause is the live log's.
+- **The rule.** A holder owed an install is sent the last whole state while the retained tail still holds every entry
+  after it (`Shipper::retains_after`): installed there, it takes those entries from the tail, so its acknowledgements
+  free the credit and the owed record follows. Only a whole state behind the tail, which would leave the holder owing a
+  second install, waits for an image made at the head, as the rolling partition's installs need
+  (diag-live-durability-54).
+- **Test.** `live_ship::tests::a_returned_holder_owed_an_install_is_sent_the_last_whole_state_while_the_tail_reaches_past_it`:
+  a resumed log past position 5 with its whole entry at 6 and a write at 7, both holders returned: each is sent an
+  install of the whole state at 6; past two writes with the tail cut to its newest entry, none is sent. Red on main's
+  rule: the first case sent nothing either.
+- **Still owed.** With the tail cut past the last whole state, a whole record owed (for the keys, or after a refused
+  publication) and a full credit can still meet the same wait; see GAPS.

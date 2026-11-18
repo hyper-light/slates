@@ -17852,7 +17852,11 @@ fn replay_forget(
 }
 
 /// Writes one logged record into the volume it was written through, which the record names; `None` when recovery did
-/// not rebuild that volume.
+/// not rebuild that volume. An overlay's write goes through its host, as the bridge's write did (A-429): a base file
+/// the image holds uncopied is copied up first, its windows read from the disk, so the bytes around the write stay the
+/// disk's. Written through the volume alone, the write opened its window from the window's start with nothing of the
+/// disk in it, and the bytes before it read as zeros. An overlay whose host is away is refused `BaseUnavailable`, as
+/// the bridge refuses it.
 fn replay_one(
   state: &mut ShardState,
   record: &crate::write_log::Record,
@@ -17860,9 +17864,21 @@ fn replay_one(
   let handle = slot_of_volume(state, record.volume)?;
   let slot = state.volumes.get_mut(handle).ok()?;
   let inode = slates_vfs::ids::InodeNo(record.inode);
-  let written = slot
-    .volume
-    .write(&mut state.store, inode, record.offset, &record.bytes);
+  let written = if slot.volume.is_overlay() {
+    match slot.host.as_mut() {
+      Some(host) => {
+        slot
+          .volume
+          .with_host(host)
+          .write(&mut state.store, inode, record.offset, &record.bytes)
+      }
+      None => Err(slates_vfs::VfsError::BaseUnavailable(0)),
+    }
+  } else {
+    slot
+      .volume
+      .write(&mut state.store, inode, record.offset, &record.bytes)
+  };
   // A mount taken over by this daemon may hold pages of this inode that differ from the volume with no reference of it
   // recorded, so its takeover round names it (A-158): older ones when the write landed, and the refused write's own
   // bytes, which its writer's kernel cached, when it did not.
@@ -18432,6 +18448,91 @@ mod tests {
     );
     assert_eq!(clone_reads, b"clone!", "the clone has its replayed write");
     assert_eq!(origin_reads, b"origin", "the origin is untouched");
+  }
+
+  /// Shape: where the replayed write lands in the overlay's base file: past the file's start, inside its first window,
+  /// so the disk's bytes lie on both sides of it.
+  const REPLAYED_AT: usize = 10;
+  /// Shape: the replayed write's bytes.
+  const REPLAYED: &[u8] = b"REPLAYED";
+
+  /// A-429 (A-63's replay; found by reading in A-422's sibling sweep, 2026-11-18): a logged write into an overlay's
+  /// base file is replayed through the overlay's host, as the bridge wrote it. Do: on a shard holding an overlay of
+  /// this crate's sources, replay a logged write of "REPLAYED" at byte 10 of its `lib.rs`, which nothing has copied up,
+  /// as a successor replays a write its dead daemon acknowledged after its last publication; read the file back through
+  /// the overlay. Expect: the replay succeeds, and the file reads as the disk's `lib.rs` with those eight bytes in
+  /// place.
+  /// Before, the replay wrote through the volume alone and never copied the file up, so the write opened its window
+  /// from the window's start with nothing of the disk in it: the ten bytes before it read as zeros where the disk's
+  /// showed.
+  #[test]
+  fn a_replayed_write_into_an_overlays_base_file_keeps_the_disks_bytes_around_it() {
+    const DISK: &[u8] = include_bytes!("lib.rs");
+    let (replayed, read) = crate::daemon::audit_on_shard(|state| {
+      let principal = Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 1234,
+      };
+      let base = concat!(env!("CARGO_MANIFEST_DIR"), "/src").to_owned();
+      let (overlay, handle) = dynamic_volume(state, &principal, "replayed-overlay", Some(base));
+      let file = {
+        let super::ShardState { store, volumes, .. } = &mut *state;
+        let slot = volumes.get_mut(handle).unwrap();
+        let root = slot.volume.root_inode(store).unwrap();
+        let host = slot.host.as_mut().unwrap();
+        slot
+          .volume
+          .with_host(host)
+          .lookup_no(store, root, "lib.rs")
+          .unwrap()
+          .inode
+      };
+      let record = crate::write_log::Record {
+        volume: overlay.bytes,
+        inode: file.0,
+        offset: u64::try_from(REPLAYED_AT).unwrap(),
+        bytes: REPLAYED.to_vec(),
+      };
+      let replayed =
+        super::replay_one(state, &record).map(|written| written.map_err(|e| e.to_string()));
+      let super::ShardState { store, volumes, .. } = &mut *state;
+      let slot = volumes.get_mut(handle).unwrap();
+      let host = slot.host.as_mut().unwrap();
+      let mut overlay_fs = slot.volume.with_host(host);
+      let mut read = Vec::new();
+      let mut piece = vec![0u8; 4096];
+      loop {
+        let at = u64::try_from(read.len()).unwrap();
+        let got = overlay_fs.read(store, file, at, &mut piece).unwrap();
+        if got == 0 {
+          break;
+        }
+        read.extend_from_slice(&piece[..got]);
+      }
+      (replayed, read)
+    });
+    assert_eq!(
+      replayed,
+      Some(Ok(REPLAYED.len())),
+      "the logged write was replayed"
+    );
+    let mut expected = DISK.to_vec();
+    expected[REPLAYED_AT..REPLAYED_AT + REPLAYED.len()].copy_from_slice(REPLAYED);
+    assert_eq!(
+      read.len(),
+      expected.len(),
+      "the file keeps the disk's length"
+    );
+    let first_difference = read
+      .iter()
+      .zip(&expected)
+      .position(|(got, want)| got != want);
+    assert_eq!(
+      first_difference,
+      None,
+      "the file reads as the disk's with the replayed bytes in place (the first ten bytes: {:?})",
+      &read[..REPLAYED_AT]
+    );
   }
 
   /// A-64 (the relief). Do: on a shard with a reduced reserve, write a file large enough that rewriting it leaves the

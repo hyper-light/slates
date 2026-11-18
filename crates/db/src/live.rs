@@ -1621,6 +1621,13 @@ impl Shipper {
       .is_some_and(|entry| entry.head() == *head)
   }
 
+  /// Whether the retained tail still holds every entry after `position` (A-428): a holder installed from a whole state at
+  /// `position` then catches up by those entries alone, so [`Shipper::pending`] answers it entries, never a second
+  /// install. The owner owes an install image at its head only for a whole state the tail no longer reaches past.
+  pub fn retains_after(&self, position: u64) -> bool {
+    !matches!(self.entries_after(Some(position)), Next::Install)
+  }
+
   /// The retained entries after `position` (all of them from position 0 when `None`), or an install when the tail no
   /// longer reaches back that far.
   fn entries_after(&self, position: Option<u64>) -> Next {
