@@ -2172,17 +2172,16 @@
 >   transport's round-trip estimate) is open, but for the forward lane's stall (2026-11-18, A-315, goal g255): a batch
 >   quiet for its budget is given up only once a turn of its lane begun after the silence was seen has read the
 >   session's own socket empty, or found no session at all, so an origin kept off its CPU reads its owner's replies
->   before it calls the owner
->   silent, and the failover bound from the forward's first send caps it
+>   before it calls the owner silent, and the failover bound from the forward's first send caps it
 >   (`a_held_origin_gives_up_no_forward_whose_reply_came_while_it_was_held`;
 >   `docs/bugs/2026-11-18-a-forward-lanes-silence-was-judged-before-its-shard-read-what-came.md`). loadtest-scale's lane
 >   poll clock (`6da9670d`, CPU-credited turns of a 10 ms pace) did not land: it assumed an idle shard's timer fires on
 >   time, and Windows' 15.6 ms tick broke it (reverted from the B13 stack, `b458723c9`). C+D (A-232): the client's part
->   is done, since a call waits while its
->   daemon lives (2026-11-14, `docs/bugs/2026-11-13-a-live-starved-daemons-call-was-failed-stalled.md`); the window
->   itself, `W`, is still a fixed budget (R3 debt). Found on
->   the way: a Windows channel (a `Sid`) can never attest a consumer (`verify_attestation` takes a uid only), and two
->   server unit tests of landing fail on Windows, where CI does not run them. Record: `docs/bugs/2026-11-06-a-cross-shard-wait-lost-a-starved-shards-answer.md`.
+>   is done, since a call waits while its daemon lives (2026-11-14,
+>   `docs/bugs/2026-11-13-a-live-starved-daemons-call-was-failed-stalled.md`); the window itself, `W`, is still a fixed
+>   budget (R3 debt). Found on the way: a Windows channel (a `Sid`) can never attest a consumer (`verify_attestation`
+>   takes a uid only), and two server unit tests of landing fail on Windows, where CI does not run them. Record:
+>   `docs/bugs/2026-11-06-a-cross-shard-wait-lost-a-starved-shards-answer.md`.
 
 > **A-190's purge client leaves the daemon's process (2026-11-06, fixed); the sweep for the rest (open).** No daemon
 > thread opens a path on a volume the daemon serves (§4.6). The coherent purge's opens, writes and reads now run in a
