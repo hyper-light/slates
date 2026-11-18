@@ -274,6 +274,9 @@ pub(crate) struct LiveVolume {
   /// When the fold that made the newest entry durable ran, on the host's monotonic clock: a reply held for it times its
   /// own wake from there ([`wait_durable`], `fleet.live.hop.reply`).
   resolved_ns: Option<u64>,
+  /// How long this volume's entries take from their publication to their durability (A-396, [`crate::live_hold`]): a
+  /// reply held for the newest one holds this shard's window until it is expected ([`hold_for_answer`]).
+  answers: crate::live_hold::AnswerWindow,
 }
 
 /// One candidate's copy of a live log as its shard's recovery image keeps it (A-200; §4.8 "Recovery": a warm restart
@@ -510,6 +513,7 @@ pub(crate) fn restore_copies(state: &mut ShardState, copies: Vec<HeldLive>) {
       entries: copy.entries.into(),
       bytes,
       first: copy.first,
+      arrivals: crate::live_hold::StreamWindow::default(),
       charged: 0,
     };
     // A copy made after the restart starts above every slot the recovered image carried.
@@ -567,6 +571,10 @@ pub(crate) struct Held {
   /// pushed after the last or all cleared ([`Held::clear_entries`], which moves it past them), so a slot never names
   /// two entries, and a delta carries a copy's new slots and the ones it dropped.
   first: u64,
+  /// The owner's entries as a stream (A-396): the gaps between those this copy took, and its run, which say how long
+  /// this holder's shard holds its idle window for the next one ([`serve_taken`]). Memory only: a restarted holder
+  /// learns it again.
+  arrivals: crate::live_hold::StreamWindow,
   /// The bytes of these entries past the claim this node reserved for the volume (§4.2, g229; [`Room`]), charged on
   /// this control shard as content held for another owner (`ShardBudget::charge_replicated`). The entries within the
   /// claim are charged against it: before a takeover the claim's room holds the log, after it the volume.
@@ -620,6 +628,7 @@ impl Held {
       entries: VecDeque::new(),
       bytes: 0,
       first,
+      arrivals: crate::live_hold::StreamWindow::default(),
       charged: 0,
     }
   }
@@ -717,6 +726,9 @@ pub(crate) struct LiveState {
   /// publication commits ([`owned_committed`]), so a refused one leaves it as the journal is. Bounded by the volumes this
   /// shard serves.
   kept: BTreeMap<[u8; 16], OwnedLive>,
+  /// On the control shard: the dispatches it carries as a stream (A-396), whose window it holds after each one's lanes end
+  /// so the next of a closed loop finds it polling ([`send_from_control`]).
+  pub(crate) dispatches: crate::live_hold::StreamWindow,
 }
 
 /// Notes, after a transport's barrier published `volume`, the position its reply must wait for ([`wait_durable`]).
@@ -1068,6 +1080,7 @@ fn done_or_park(
   if durable {
     return true;
   }
+  hold_for_answer(state, volume);
   let held: usize = state.live.parked.values().map(Vec::len).sum();
   let parked = state.live.parked.entry(volume).or_default();
   if !parked.iter().any(|known| known.will_wake(waker)) {
@@ -1287,8 +1300,55 @@ pub(crate) fn defer(
     .awaiting_by_request
     .insert((origin, id.client, id.sequence), (volume.bytes, target));
   state.count(LIVE_AWAITED, 1);
+  hold_for_answer(state, volume.bytes);
   None
 }
+
+/// Asks this (the owner) shard to hold its idle window until the newest entry of `volume` is expected durable (A-396): a
+/// reply held for it then finds the shard polling when the holders' answer is folded in, not parked behind a wake. The
+/// window is the volume's own, learned from its entries' rounds, publication to durability on the host's clock
+/// ([`LiveVolume::answers`], [`count_hops`]); nothing before the first is timed. The shard keeps the hold only where it
+/// pays (A-387, [`crate::live_hold::hold`]).
+fn hold_for_answer(state: &mut ShardState, volume: [u8; 16]) {
+  let Some(live) = state.live.shipping.get(&volume) else {
+    return;
+  };
+  let (Some((_, published_ns)), Some(window)) = (live.newest, live.answers.window()) else {
+    return;
+  };
+  let left =
+    crate::live_hold::remaining(published_ns, window, slates_machine::clock::monotonic_ns());
+  count_hold(state, LIVE_HOLD_ANSWER, crate::live_hold::hold(left));
+}
+
+/// Counts a live hold asked at `site` (A-396) by what the shard did with it (`held`, [`crate::live_hold::hold`]): the
+/// site's counter for a hold asked of the shard, and [`LIVE_HOLD_DECLINED`] as well when the shard declined it, its
+/// measured idle turn no shorter than its wake (A-387). Nothing for nothing asked.
+fn count_hold(state: &mut ShardState, site: &'static str, held: Option<bool>) {
+  let Some(kept) = held else {
+    return;
+  };
+  state.count(site, 1);
+  if !kept {
+    state.count(LIVE_HOLD_DECLINED, 1);
+  }
+}
+
+/// Counter: a reply held for a live volume's durability asked its owner shard to hold its idle window until the answer
+/// was expected (A-396, [`hold_for_answer`]).
+const LIVE_HOLD_ANSWER: &str = "fleet.live.hold.answer";
+/// Counter: the control shard was asked to hold its idle window through a lane's exchange until its holder's answer was
+/// expected (A-396, [`ship_lane`]).
+const LIVE_HOLD_EXCHANGE: &str = "fleet.live.hold.exchange";
+/// Counter: the control shard was asked to hold its idle window after a dispatch for the next one of its stream (A-396,
+/// [`send_from_control`]).
+const LIVE_HOLD_DISPATCHES: &str = "fleet.live.hold.dispatches";
+/// Counter: a holder was asked to hold its idle window after an entry for the next one of its owner's stream (A-396,
+/// [`serve_taken`]).
+const LIVE_HOLD_ENTRIES: &str = "fleet.live.hold.entries";
+/// Counter: of the live holds asked (every `fleet.live.hold.*` site), those the shard declined, its measured idle turn no
+/// shorter than its wake estimate (A-387's predicate; A-396): the holds kept are the sites' sum less these.
+const LIVE_HOLD_DECLINED: &str = "fleet.live.hold.declined";
 
 /// A retry of a verb whose reply still waits for durability joins the wait, answered with the same reply when it comes.
 pub(crate) fn join(
@@ -2600,6 +2660,7 @@ fn new_live_volume(shipper: Shipper) -> LiveVolume {
     publishing_ns: None,
     newest: None,
     resolved_ns: None,
+    answers: crate::live_hold::AnswerWindow::default(),
   }
 }
 
@@ -3516,8 +3577,11 @@ async fn send_from_control(origin: u16, control: u16, sends: Vec<Send>) {
     origin,
     control,
     move || async move {
-      // Where the round's hop to the control shard ends ([`LaneStamps`]).
+      // Where the round's hop to the control shard ends ([`LaneStamps`]); and this dispatch is a message of the control
+      // shard's stream of them (A-396), whose window is held after the lanes end, so the next dispatch of a closed loop
+      // finds the shard polling.
       let began_ns = slates_machine::clock::monotonic_ns();
+      let window = state::with_state(|s| s.live.dispatches.arrived(began_ns)).unwrap_or(0);
       drain_stragglers();
       let mut lanes: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>> = Vec::new();
       for (holder, sends) in by_holder(sends) {
@@ -3529,6 +3593,10 @@ async fn send_from_control(origin: u16, control: u16, sends: Vec<Send>) {
         )));
       }
       every(lanes).await;
+      let left =
+        crate::live_hold::remaining(began_ns, window, slates_machine::clock::monotonic_ns());
+      let held = crate::live_hold::hold(left);
+      let _ = state::with_state_counted(|s| count_hold(s, LIVE_HOLD_DISPATCHES, held));
     },
     deadline,
   )
@@ -3585,6 +3653,18 @@ async fn ship_to_holder(
   });
 }
 
+/// Asks this (the control) shard to hold its idle window through an exchange with `holder` until its answer is expected
+/// (A-396): the window its record link learned from that holder's answers; nothing before the first is timed. The shard
+/// keeps the hold only where it pays (A-387, [`crate::live_hold::hold`]).
+fn hold_for_exchange(state: &mut ShardState, holder: HostId) {
+  let window = state
+    .record_sessions
+    .get(&holder)
+    .and_then(|link| link.live_answers.window())
+    .unwrap_or(0);
+  count_hold(state, LIVE_HOLD_EXCHANGE, crate::live_hold::hold(window));
+}
+
 /// The messages of one lane in turn ([`ship_to_holder`]): whether the holder answered every one it was sent. The entries
 /// of one volume that follow each other go as one batch while it fits the session's congestion window
 /// ([`take_batch`]): sent one exchange an entry, a burst of `n` entries reached the holder in `n` round trips, and a
@@ -3604,6 +3684,9 @@ async fn ship_lane(
     // Each message under its own budget: the liveness budget plus its transfer on the session it rides, so an install of
     // the whole volume is not given up the moment an entry would be (`exchange_budget`).
     let exchange = exchange_budget(send.bytes.len(), &sessions);
+    // The control shard polls through the exchange until its holder's answer is expected (A-396): parked, it took a
+    // wake to read the answer.
+    let _ = state::with_state(|s| hold_for_exchange(s, holder));
     let sent_ns = slates_machine::clock::monotonic_ns();
     let exchanged =
       slates_cluster::live::exchange((send.stream, &send.bytes), sessions, exchange, |_, _| true)
@@ -3618,6 +3701,16 @@ async fn ship_lane(
     ready_ns = answered_ns;
     let (replies, stragglers) = settle_sessions(exchanged);
     let answered = !replies.is_empty();
+    if answered {
+      // How long this holder took to answer: the window the next exchange with it is held for (A-396).
+      let _ = state::with_state(|s| {
+        if let Some(link) = s.record_sessions.get_mut(&holder) {
+          link
+            .live_answers
+            .answered(answered_ns.saturating_sub(sent_ns));
+        }
+      });
+    }
     if !answered {
       let _ = state::with_state(|s| s.count(LIVE_UNANSWERED, 1));
     }
@@ -3935,7 +4028,8 @@ fn count_hop(state: &mut ShardState, (count, sum): (&'static str, &'static str),
 /// The round of `volume`'s newest entry, hop by hop, once an answer made it durable: its publication's arrival at the
 /// shipper and the lane's `stamps` partition it into the build, the hop to the control shard, the lane, the exchange and
 /// the hop back, each a difference of consecutive stamps on one clock, so they add up to the round. A fold with no
-/// stamps (a straggler's late answer) times nothing; the entry is let go either way. The fold's own time is kept for the
+/// stamps (a straggler's late answer) times no hop; the entry is let go either way, and its round, publication to
+/// durability, is what the volume's answer window learns (A-396, [`hold_for_answer`]). The fold's own time is kept for the
 /// reply's wake ([`HOP_REPLY`]).
 fn count_hops(state: &mut ShardState, volume: [u8; 16], stamps: Option<LaneStamps>) {
   let now = slates_machine::clock::monotonic_ns();
@@ -3954,6 +4048,9 @@ fn count_hops(state: &mut ShardState, volume: [u8; 16], stamps: Option<LaneStamp
   }
   live.newest = None;
   live.resolved_ns = Some(now);
+  // The newest entry's round, publication to durability, is what a reply held for the next one holds the owner's window
+  // by (A-396, [`hold_for_answer`]).
+  live.answers.answered(now.saturating_sub(published_ns));
   let Some(stamps) = stamps else {
     return;
   };
@@ -4303,12 +4400,21 @@ fn serve_taken(
     }
     Ok(_) => {
       state.count(LIVE_HELD, taken);
+      // The owner's entries are a stream (A-396): one that took something is a message of it, whose window this shard
+      // holds once it has answered, so the owner's next entry of a closed loop finds it polling. Read with the copy
+      // already reached for the entries taken, so the stream marks no piece of its own (A-270).
+      let window = if taken > 0 {
+        object
+          .and_then(|object| state.live.held.get_mut(&object))
+          .map_or(0, |held| held.arrivals.arrived(arrived_ns))
+      } else {
+        0
+      };
       let answer = acknowledged(state, encode_reply(&reply));
-      count_hop(
-        state,
-        HOP_HOLDER,
-        slates_machine::clock::monotonic_ns().saturating_sub(arrived_ns),
-      );
+      let now = slates_machine::clock::monotonic_ns();
+      count_hop(state, HOP_HOLDER, now.saturating_sub(arrived_ns));
+      let held = crate::live_hold::hold(crate::live_hold::remaining(arrived_ns, window, now));
+      count_hold(state, LIVE_HOLD_ENTRIES, held);
       answer
     }
   }
@@ -4572,6 +4678,7 @@ fn held_entry_in(live: &mut LiveState, owner: HostId, object: ObjectId) -> &mut 
     entries: VecDeque::new(),
     bytes: 0,
     first,
+    arrivals: crate::live_hold::StreamWindow::default(),
     charged: 0,
   });
   held.replica.reassign(owner);
@@ -4821,6 +4928,7 @@ fn fenced_copy(
     entries: VecDeque::new(),
     bytes: 0,
     first,
+    arrivals: crate::live_hold::StreamWindow::default(),
     charged: 0,
   });
   held.replica.prepare(epoch)?;

@@ -4447,7 +4447,9 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
   names the attachment and its resync token, 128 bits from the daemon's secure random and never its mount capability.
   On Linux it is a sequenced-packet pair whose device end follows the stream's on the client's control socket; on
   macOS (A-339) a stream of 28-byte messages, since a datagram pair's survivor is never told its peer has gone, whose
-  device end rides beside the stream's in the socket route's confirmation; Windows hands none yet. The daemon's end is
+  device end rides beside the stream's in the socket route's confirmation; Windows hands none yet, and its wire is
+  built (A-418): a message-mode pipe whose `Resync` names the fresh end's handle in the stream's holder's process,
+  where the successor duplicated it, since no descriptor rides a message there. The daemon's end is
   held by the anchor, as a FUSE device is, and the daemon keeps its own copy while the anchor holds one (A-339: XNU's
   collector of descriptors in flight flushes a socket whose every copy rides a message), with the token, the stream's
   owner view and its kernel's SETXATTR form as its session (A-378), updated when the guest names its owner, when its
@@ -7373,6 +7375,21 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > (`crates/server/tests/fleet.rs`: 16 writes in a closed loop; each hop timed once a timed round; the hops' nanoseconds
 > equal to the rounds'). The breakdown under the contract command is owed (the supervisor's run).
 >
+> **A live write parks no shard on its path where a held shard polls (2026-11-18, A-396, g076b).** The round's cost was
+> parked threads, not the cross-shard hop: each shard on a write's path (the owner awaiting the fold, its control shard
+> awaiting the dispatch and then the holder's answer, the holder awaiting the entry) slept in its driver between its
+> parts and paid a wake. Each now asks to hold its idle window across its wait (`crate::live_hold`): the owner while a
+> reply waits for durability, for the volume's answer window (`hold_for_answer`, from `done_or_park` and `defer`); the
+> control shard through an exchange, for that holder's (`hold_for_exchange`), and after a dispatch, for its stream's
+> next; a holder after it answers an entry, for the owner's next (`serve_taken`). Every window is learned from the
+> traffic it waits on by RFC 9002 §5.3's law, a stream's never longer than its run (A-326's rule), and each shard keeps a
+> hold only while its measured idle turn is shorter than its wake (A-387's predicate, the runtime's own decision on
+> every host: a macOS shard, whose `kevent` naps, declines). Counted `fleet.live.hold.{answer,exchange,dispatches,
+> entries}` (asked) and `fleet.live.hold.declined`; held by
+> `a_live_write_loop_asks_the_owners_the_control_shards_and_the_holders_shards_to_hold`. Prototype and first A/B figures
+> in A-396. Landed before its A/B under Ada's rule of 2026-11-18 (an agent implements, unit-tests, merges and ends): the
+> supervisor's A/B, main before the holds against main with them, decides whether they stay.
+>
 > **FUSE `fsync` at durability (2026-11-05).** A FUSE mount answered `fsync` at the owner's own barrier, so on a
 > live-shipped volume it claimed what no candidate held: with both candidates' processes stopped it returned success in
 > 19 µs (`a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it`, red first). An `fsync` (or `fsyncdir`)
@@ -8739,6 +8756,10 @@ it builds against the contract and adds to it rather than around it.
 > (`umount -f`, their next calls failing), and answers which (`LetGo`). Linux's `unmount_lazy` was refused `Unsupported`
 > elsewhere, so a macOS host had no library route off a busy, `hard` loopback mount; it and `MountMissing::LazyUnmount`
 > are gone.
+> **`CONTRACT` = 37 (A-417):** `mount::available` on Windows answers `MountMissing::MountManager` where the machine does
+> not let WinFsp's driver make a mount's drive (`MountUseMountmgrFromFSD`, A-369), by the driver's own rule over the
+> value it reads at every mount. Until then such a machine was told it could mount, and each mount was refused
+> `MountManagerNotAllowed` after the host had made the volume it was for (kiln's bare-metal starts).
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -29699,3 +29720,140 @@ Applied in the same change to: §4.8 (learners), A-380's entry, GAPS (A-380's op
 `crates/db/src/register.rs`, `crates/cluster/src/raft_wire.rs`, `crates/cluster/src/root_group.rs`,
 `crates/server/src/fleet.rs`, their tests, and the bug record
 `docs/bugs/2026-11-18-a-root-learner-named-the-root-voters-of-its-join.md`.
+
+### A-412 — A holder behind its own records catches up from them, fetching their inputs from the record's owner (2026-11-18, kiln goal g250; §4.16 "Apply on holders"; A-313, A-333, A-364, A-373)
+Applied in the same change to: GAPS (the entry at its head), the bug record of 2026-11-18 on a holder behind its own
+records, `crates/server/src/merge_service.rs` (`record_standing`, `catch_up`, `MergeShardState::catching_up`) and
+`crates/server/src/fleet.rs` (`fetch_ledger_inputs`, `merge.catch_up.*`).
+- **What was there.** A takeover commits the versions it adopted again through the register path, which carries no
+  inputs, and the record plane ships a placed version no more, so a holder whose replica had not reached them held their
+  records with nothing to apply them by. A record ahead of the replica was out of order, for good.
+- **The rule.** A record ahead of the replica's next version looks for the versions between in the holder's own ledger
+  (`merge_origin::ledger_unheld`). Held whole, with their inputs, the replica is advanced through them (A-333's
+  `advance_replica`) and the record served as the next version, recomputed before it is acknowledged. An input not
+  held is fetched by identity from the record's sender, the green's owner, which holds every version's inputs while its
+  records name them (A-244), staged as placed for its version, one fetch a green at a time in a detached task of the
+  shard, and the owner's next shipment of the record finds it held. A version between whose record the holder lacks is
+  out of order, as before.
+- **Tests.** `a_holder_behind_its_own_records_after_a_takeover_fetches_their_inputs_and_takes_the_next_version`
+  (`crates/server/tests/fleet.rs`): three nodes at `f = 1`, the holder withholding version 3 when the owner dies, the
+  successor's version 4 committed with it and recomputed there, version 3's input fetched. Kiln r355, the Mac Studio,
+  2026-11-18, debug build: green in 4.4 s; red without the catch-up, version 4 answered out of order 4,865 times in
+  405 s. The merge unit tests (`merge_origin`, `merge_service`) 27 of 27.
+
+### A-396 — A live write parks no shard on its path where a held shard polls: the owner holds its idle window while a reply waits for durability, its control shard through an exchange and for its next dispatch, a holder for the owner's next entry; each window learned from the traffic it waits on (2026-11-18, goal g076b: a live write under 50 µs at the median and 1 ms at p999; §4.10 "Live shipping", §4.7 "Wake strategy"; A-200, A-326, A-387)
+
+Applied in the same change to: §4.10 (a status), GAPS (the live entry), `crates/transport/src/rtt.rs`
+(`RttEstimator::expected_within`), `crates/rt/src/shard.rs` (`ShardContext::hold_idle_window` says whether it kept the
+hold), `crates/server/src/live_hold.rs` (new: `AnswerWindow`, `StreamWindow`, `remaining`, `hold`),
+`crates/server/src/live_ship.rs` (`hold_for_answer` from `done_or_park` and `defer`; `hold_for_exchange` and the
+exchange's learning in `ship_lane`; the dispatch stream in `send_from_control`; the entry stream in `serve_taken`; the
+answer window learned in `count_hops`; `LiveVolume::answers`, `Held::arrivals`, `LiveState::dispatches`;
+`count_hold`, `fleet.live.hold.*`), `crates/server/src/state.rs` (`RecordLink::live_answers`),
+`crates/server/tests/fleet.rs` (`a_live_write_loop_asks_the_owners_the_control_shards_and_the_holders_shards_to_hold`).
+- **What the round cost.** A stable write to a live-shipped volume is answered once a candidate holds it (A-200), so its
+  path runs through four shards on three nodes: the owner shard builds and appends the entry, its node's control shard
+  sends it and hands the answer back, the holder's control shard keeps it and answers. Each parked in its driver between
+  its parts, so a write paid a wake at each: the control shard woken for the dispatch and again for the answer, the
+  holder for the entry, the owner for the fold. Measured with the contract command
+  (`measure_what_live_shipping_adds_to_a_stable_nfs_write`) on 2026-11-18, before the supervisor's runs:
+  - adacachy (Linux, a capped unit, load 45–70): main added 136–182 µs at the median; one shard a daemon (the owner is
+    the control shard: no hop at all) 101–163; every shard held for a fixed millisecond (a prototype), one shard 78–107
+    and two shards 63–96. Two held shards beat one: the hop between two polling shards is cheap and the shards work in
+    parallel. So the hop was not the cost. Held apart at load 55–60, two shards: none 189–291, the owner and its control
+    shard 141–221, all three kinds 95–120.
+  - The windows of this amendment against main, six rounds alternating at load 78–93: added 86.0–115.2 µs against
+    186.0–295.1. Not better in the tails: the live p999 4.2–27.7 ms against 2.6–15.1, and the plain write's p99 293–1,024
+    against 132–785 µs. The spinning shards spend the unit's CPU quota (800%), whose throttling stalls every thread of
+    the unit; the supervisor's runs read the unit's `nr_throttled` to tell.
+  - The Mac Studio (macOS, load 19–24, no hold): main 178–180 µs, the exchange about 130 µs of it with the holder's own
+    serve about 7 µs; a macOS thread's wake about 30 µs there.
+- **The rule.** Two kinds of wait, each learned by RFC 9002 §5.3's law (the transport's own estimator), held for the bound
+  an answer is expected within, `smoothed + 4 · variation` (§6.2.1's terms without the timer granularity and ack delay a
+  spinning waiter does not arm):
+  - an *answer window*, for an answer a shard's own message caused: the owner's round from a publication to its entry's
+    durability, per volume; the control shard's exchange with each holder, kept on its record link;
+  - a *stream window*, for the next message of a closed loop: the control shard's dispatches, and each holder's entries
+    from one owner's log. A gap within the bound continues the run, a longer one begins a new run; the hold is the
+    bound, never longer than the run has lasted, and nothing for a run's first message (A-326's ski-rental rule), so a
+    paced sender starts no run and a run's end costs at most the spin the run took.
+  Nothing is held before a window is learned. A hold pays only while a held shard sees a message sooner than a kicked
+  park would wake for it, and every hold is asked of the runtime, which decides that from the shard's own measurements
+  (A-387's predicate, cfg-free since 2026-11-18): it keeps the hold while the idle turn a message lands in is shorter
+  than the shard's wake estimate, and declines it otherwise, counted (`fleet.live.hold.declined`). Linux's epoll and
+  Windows' completion port answer a zero-timeout poll at once, so their shards hold; a macOS shard's zero-timeout
+  `kevent` naps 12–15 µs a turn, longer than its 3–8 µs wake, so it declines; a shard a loaded machine preempts stops
+  holding until its turns are cheap again. The windows are learned wherever the holds are declined. The first form of
+  this amendment fixed the hold at none on macOS by `#[cfg]`, as A-387's first form did; it now follows A-387's.
+- **What was tried and lost.** The owner shipping over sessions of its own, with no hop to the control shard: its proxy
+  (one shard a daemon) saved less than the holds, and it needs a session per shard a holder (the transport's
+  demultiplexer keeps one session a peer's certificate), so it was not built. The owner and control holds alone, without
+  the stream holds, measured as above.
+- **Tests.** `RttEstimator`'s bound and the windows' rules are unit-tested (`rtt::tests`, `live_hold::tests`: no window
+  before an answer; a stream's first message holds nothing; a run holds no longer than it has lasted; a pause past the
+  bound begins a new run). `a_live_write_loop_asks_the_owners_the_control_shards_and_the_holders_shards_to_hold`: a
+  closed loop of 32 writes, every one answered at durability, and every site asked its shard to hold with a learned
+  window: the owner, its control shard (through an exchange and for a dispatch) and a holder; whether each shard kept
+  its holds is A-387's decision, printed with the declines. Landed before its A/B (Ada's rule of 2026-11-18: an agent
+  implements, unit-tests, merges and ends). Owed, filed for the supervisor: that test on Linux and macOS, and the A/B
+  (main before the holds against main with them; quiet and loaded; Linux and the Studio) with the units'
+  `nr_throttled`, which decides whether the holds stay; the answer holds alone are a second arm not built.
+
+### A-417 — A Windows host learns before it mounts whether WinFsp's driver may make the drive (2026-11-18, g085, the Windows leg of kiln's bare-metal goal; amends A-278 piece 3's `mount::available`, follows A-369)
+Applied in the same change to: §4.12 (the contract's status, `CONTRACT` = 37), `crates/api/src/mount.rs`
+(`available` and the pure `winfsp_available`, with its test), `crates/api/src/error.rs` (`MountMissing::MountManager`
+and its words), `crates/api/src/lib.rs` (`CONTRACT`), `crates/bridge-winfsp/src/ffi.rs` (`mount_manager_allowed`, one
+`machine_word` reader for it and Developer Mode, so the unsafe count stays 156) and `host.rs`, `docs/library.md`,
+README (installing on Windows), GAPS.
+- **What was wrong.** Since A-369 every slates WinFsp drive is a Mount Manager drive that WinFsp's driver makes on the
+  daemon's request, which it does only where an Administrator set `MountUseMountmgrFromFSD` to 1. `mount::available`,
+  the fact a host reads before it mounts (§4.12 "Verbs"; kiln's runner facts), asked only whether WinFsp's library
+  loads. So a machine without the setting was told it could mount, and a host that then made a volume and mounted it
+  was refused `MountManagerNotAllowed`: kiln's bare-metal engine makes each agent's volume before its mount, and refuses
+  a start typed only on what `available` names.
+- **The rule, read at its source.** WinFsp's driver reads `MountUseMountmgrFromFSD` under `FSP_REGKEY` at every such
+  request (`FspVolumeUseMountmgr`, WinFsp master `src/sys/volume.c`, read 2026-11-18): it refuses `STATUS_ACCESS_DENIED`
+  when the read fails, the value is not a `REG_DWORD`, or it is anything but 1; `FSP_REGKEY` is
+  `\Registry\Machine\Software\WOW6432Node\WinFsp` on every 64-bit Windows, arm64 included (`src/sys/driver.h`).
+  Nothing is cached at the driver's load, so `available` reads the same value by the same rule at each call
+  (`RegGetValueW` with `RRF_RT_REG_DWORD`, which refuses every other type), and its answer is the one a mount meets.
+- **The answer.** `Unsupported { missing: MountMissing::MountManager }`, whose words name the one command that allows
+  it. The library is asked first: without it no drive is ever asked for, so `MountMissing::WinFsp` is named alone.
+- **Tests.** `a_windows_mount_is_available_only_where_winfsps_driver_may_make_its_drive` (every pair of the two facts,
+  and the words), on every host. The registry read itself runs only on Windows: compiled for
+  `x86_64-pc-windows-msvc`; a Windows run of `available` with and without the setting is filed for main's runners.
+
+### A-418 — The Windows resync wire: a `Resync` names the fresh stream end's handle in its holder's process (2026-11-18, goal 90, item b, piece one: what Shards needs from slates; A-316's and A-339's Windows half)
+Applied in the same change to: §4.6, the Shards form's resync bullet; GAPS, A-281's entry (its Windows owed item);
+`crates/bridge-fuse/src/shards_resync.rs` (`HandedResync`, `RESYNC_HANDLE_MESSAGE_BYTES`, `ResyncRefusal::NoHandle`, the
+module's channel and message paragraphs).
+
+- **What was there.** A-316's and A-339's `Resync` carries the device's end of a fresh stream by `SCM_RIGHTS`. Windows
+  carries no descriptor with a message: a handle reaches another process only when a holder duplicates it into that
+  process's table (`DuplicateHandle` with the target's process handle), and only its value travels (A-175's route,
+  `slates_ipc::handle_route`). So a Windows `Resync` must say where the end was put.
+- **The message.** The same 28 bytes as every `Resync` (kind 2, version 1, two zero bytes, the attachment, the token),
+  then the id of the process the successor duplicated the fresh end into (`u32`) and the end's handle value there
+  (`u64`, never zero: zero names no handle, A-175's convention), little-endian, 40 bytes in all. The `Attached`
+  message is the 28 bytes on every platform. The channel on Windows is a message-mode named pipe
+  (`slates_ipc::stream::message_pair`, as the anchor's hold channel is), so each message is one read whole and the
+  lengths never run together; each form is refused at the other's length, so neither passes for the other.
+- **To whom the end goes: the stream's holder, never the confined VM.** Shards' coordinator set condition 4c
+  (2026-11-18): a VM process confined in an AppContainer takes handles only through its spawner's grants, so the new
+  stream must reach it the way `--slates-fs-handle` does. The process named is therefore the one that holds the stream
+  for the VM: the process `slates shards` names with `ShardsHolder` (A-181), else the attaching client. How the device
+  takes the end from there is its handle path, which the coordinator specifies with the device's half.
+- **Default deny (condition 4a).** The device takes a Windows resync only if it parses at its length, is version 1 and
+  kind `Resync` with zero reserved bytes, names a handle, and names the attachment and token of the channel's
+  `Attached` (`HandedResync::resyncs`, the token compared over all its bytes).
+- **Evidence.** The codec's unit tests (`crates/bridge-fuse`, `shards_resync`): the golden vector, every forgery (each
+  token byte, another attachment, an `Attached` in the Windows form, a zero handle), every wrong length to twice the
+  message, another version, a reserved byte, and every single-bit flip parsed or refused without a panic.
+- **Owed.** The attach's half on Windows: the message-mode resync pipe made at the attach, `Attached` written before
+  the hand-off, the daemon's end held by the anchor with the session (token, owner view, form, and the holder's process
+  id and start time, so a successor never duplicates into a reused id), the device's end handed beside the stream's
+  (`ShardsHanded`, the client, `slates shards`, `serve_shards`). The successor's half: the held end adopted, the
+  record kept, a fresh pipe, its client end duplicated into the holder and named in this message, the replies kept for
+  a resend and the `FORGET`s logged as on Unix. The anchor's Windows hold needs a kind for the resync end and a
+  message that replaces a held entry's record (the session moves as the guest names its owner, its `INIT` is answered,
+  a restore runs and its holder changes). And Shards' device half.

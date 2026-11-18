@@ -1,5 +1,19 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A holder behind its own records answered every later version out of order: fixed (2026-11-18, A-412, §4.16 "Apply on
+> holders"; g250; the bug record of the same day).** A takeover commits the versions it adopted again through the
+> register path, which carries no inputs, and the record plane never ships a placed version again, so a holder whose
+> replica had not reached them held their records and could not apply them: it answered every later version
+> `merge.out_of_order` for good, and at `f = 1` with the old owner gone the successor's next version never placed. Now a
+> record ahead of the replica finds the versions between in the holder's own ledger: their inputs held, the replica
+> advances through them and the record is served as its next; an input not held is fetched by identity from the
+> record's owner (`fleet::fetch_ledger_inputs`, `merge.catch_up.begun`, `merge.catch_up.fetched`). Test:
+> `a_holder_behind_its_own_records_after_a_takeover_fetches_their_inputs_and_takes_the_next_version`
+> (`crates/server/tests/fleet.rs`): green in 4.4 s (kiln r355, Mac Studio, debug); red without the catch-up, version 4
+> answered out of order 4,865 times in 405 s and never placed.
+> - **Open (sibling):** a holder restarted warm with no replica, holding a record whose input it lacks, rebuilds nothing
+>   (the A-313 rebuild meets the missing input) and nothing fetches the input.
+
 > **A takeover's successor answered a forwarded read `NotFound` before it had made the volume: fixed (2026-11-18, A-394,
 > ReadSafety, §4.8 "Lookup"; g250; the chaos nemesis, seed 6876545201569229162 on macOS).** With A-382 in, the seed's
 > fourteen faults all recovered on the Mac Studio, and the verdict failed ReadSafety alone, 3 of 3 runs: during the first
@@ -759,7 +773,11 @@
 >   **And its DAX maps (A-365, the same day):** the anchor holds each DAX object a stream hands its device, the shard's
 >   DAX range table records each range answered, and a successor takes the objects back, ingests the guest's unsynced
 >   stores before it serves anything and answers the device with the same objects; a stream keeps its resync through
->   its guest's maps. **Owed:** Windows on Shards' handle path. **Built since (A-402, 2026-11-18):** the write log on
+>   its guest's maps. **Owed:** Windows on Shards' handle path; its wire is built (A-418, 2026-11-18): a Windows
+>   `Resync` names the fresh end's handle in the stream's holder's process, where a successor duplicates it (A-175's
+>   route), since no descriptor rides a message there; owed after it, the attach's half (the message-mode resync pipe,
+>   the anchor holding its end with the session and the holder) and the successor's half (adopting the held end, the
+>   duplicate into the holder, the replies kept for a resend). **Built since (A-402, 2026-11-18):** the write log on
 >   Windows, so a Windows stream's acknowledged writes outlive its daemon's death, replayed into the volume (its Windows
 >   run is main's, `run-requests.md`); before, a Windows stream's acknowledged writes since the last publication were
 >   lost at its daemon's death. Found with A-365 (Linux), **fixed by A-389 (2026-11-18)**:
@@ -940,6 +958,12 @@
 >   (`a_shards_stream_end_serves_the_volume_it_was_made_for`; the map's data path is the server's Shards suite's); and
 >   the contract's history held by a doc-truth test, every version a line in order up to `CONTRACT` and none past it
 >   (`the_contract_history_names_every_version_in_order`);
+> - **a Windows machine that could not make the drive was told it could mount, closed 2026-11-18 (A-417, `CONTRACT` =
+>   37):** `mount::available` asked only whether WinFsp's library loads, while every mount since A-369 also needs the
+>   machine to let WinFsp's driver make its drive (`MountUseMountmgrFromFSD`). It now reads that value by the driver's
+>   own rule (WinFsp `src/sys/volume.c`) and answers `MountMissing::MountManager`. Unit test: the decision over each pair
+>   of facts, on every host; owed: a Windows run of `available` with the setting and without it (filed for main's
+>   runners; the registry read is compiled for `x86_64-pc-windows-msvc`, never run by its author);
 > - the async form (R6), first piece built (`CONTRACT` = 31): `AsyncInstance` over a host's `Reactor`, awaiting
 >   provisioning, a snapshot, a status and a destroy; handing it back stops its completion bridge, which took the
 >   synchronous form's wakes (`docs/bugs/2026-11-18-the-async-signal-took-the-synchronous-forms-wakes.md`); owed: the
@@ -1026,21 +1050,58 @@
 > The race: `a<n>` linked to `b<n>`, `a<n>` held open so the mount's next round purges it (A-190), a write through
 > `b<n>`, then `a<n>` closed and deleted at once (`vm-delete-race.ps1`). In 4 of 4 runs, the deleter hung within 60
 > rounds: at rounds 28 and 17 before the fix, and at 60 and 1 after it. Its thread waits in `NtClose` (`IopCloseFile`) for its
-> cleanup IRP. Local kernel debugging at round 1 (`kd -kl`, 2026-11-18 18:52 UTC) showed:
-> - one file node's Main and Paging resources held shared by an owner pointer, which is a WinFsp request;
-> - one exclusive waiter, a system worker thread;
-> - the daemon's receive worker idle, waiting for the next request through FltMgr;
-> - the purge client idle on its pipe.
-> So the stuck request is not in user mode.
+> cleanup IRP. Local kernel debugging at round 1 (`kd -kl`, 2026-11-18 18:52 UTC, `hang-kd-1`; read again from the
+> dump the same day, which corrects two lines first written here) showed:
+> - **The receive worker was not idle: it was sending an answer.** Its one IRP had a buffered input and no MDL (flags
+>   `0x60830`, `Mdl 0`). In `crate::dispatcher` only `send` makes that IRP (`TRANSACT_BATCH`, the answer as input, no
+>   output); a receive's output is an MDL. The thread waited in kernel mode in `FsRtlCancellableWaitForSingleObject`,
+>   called from FltMgr (return address `fffff804'1b2821cf`, inside FLTMGR at `fffff804'1b260000`-`1b2f5000` by `lm a`
+>   in `hang-kd-4`).
+> - **The purge client was not idle on its pipe: it was opening a file.** Its only thread held a Create IRP (flags
+>   `0x884`) and waited at the same FltMgr return address. The pipe wait was the mount thread's: a pending read of the
+>   client's answer.
+> - The deleter, the receive worker, the purge client and the mount thread all began waiting at one tick (5988).
+> - One resource was held shared, alone, by a request. In WinFsp's source a request holds a single resource shared only
+>   as a Create's rename lock (WinFsp v2.1 `src/sys/create.c:246` and `669`): the purge client's open.
+> - One file node's two resources were held shared by another request, with one exclusive waiter (a system worker) and
+>   a contention count of 6. WinFsp leaves a node shared to a request only for a non-cached or paging read
+>   (`src/sys/read.c:357-444`), an information query (`src/sys/fileinfo.c:1024-1102`), a stream query (`763-790`), a
+>   security query (`src/sys/security.c:77-109`), a device control (`src/sys/devctl.c:268`) or a reparse point's
+>   read (`src/sys/fsctl.c:339`). Each of these waits for a receive.
+> - A second system worker held one resource exclusive and a second one on its own stack.
+>
+> **The mechanism the source gives (a hypothesis that fits every waiter; not proven).**
+> - WinFsp completes an answered IRP inline, on the thread that sent the answer. `FspVolumeTransact`
+>   (`src/sys/volume.c:1089-1102`) calls `FspIopDispatchComplete` for each answer, and the kind's `FSP_LEAVE_IOC`
+>   (`src/sys/driver.h:289-306`) ends in `IoCompleteRequest` (`src/sys/iop.c:321`).
+> - So the completion routines of every driver above WinFsp run on slates' receive worker. FltMgr's run there, and with
+>   them each minifilter's post-operation callback that FltMgr does not hand back to the requester's thread.
+> - slates has one receiver (A-198; `crate::dispatcher`'s `Worker`, "the only receive thread"). If a filter's completion
+>   makes a synchronous request on the same drive, the worker waits inside FltMgr for a request only it can receive,
+>   and the drive stops. Then the purge client's open, the request holding the node, the deleter's cleanup and the
+>   system worker that wants the node exclusive all wait on that worker.
+> - WinFsp's own dispatcher survives such nesting: it runs at least two receive threads (`src/dll/fs.c:26`, `384-401`;
+>   by default one per processor, 4 to 16), so another thread takes the filter's request.
+> - The filter is likely Defender's (WdFilter): the VM runs MsMpEng with real-time protection on. On CI's x86_64
+>   runner, something the bench never called asked one QuerySecurity per Cleanup (273,006 in g258's diag-52 probe;
+>   none on arm64), which is a filter's pattern.
+> - Unproven: which IRP the worker's answer completed, and which filter waited. The worker's stack ends at FltMgr's
+>   first frame, because FltMgr's symbols were not loaded.
+> - **The fix, once confirmed, is slates':** a receive must never wait for a send's completion. One way is a second
+>   receiver, WinFsp's own posture; A-198's capture-and-settle order assumes one, so this is a design amendment.
+>   Another way is to send from a thread that does not receive.
 > - **Impact when unrecovered.** The process cannot exit while the daemon lives, and on the first run the daemon did not
 >   exit when its anchor was killed. Windows' restart then hung past 15 minutes, and a reset was needed.
-> - **Not known yet:** which request holds the node (the owner pointer's `Kind` and IRP), and whether WinFsp as released
->   reaches the hang. There, a purge follows a change from outside a file's open names (A-190) rather than a hard link's.
+> - **Not known yet:** which request holds the node (the owner pointer's `Kind` and IRP), whether the hang needs a
+>   filter (the race with Defender's real-time protection off), and whether WinFsp as released reaches it. There, a purge
+>   follows a change from outside a file's open names (A-190) rather than a hard link's.
 > - **Also open:** 3 of 59 deletes were refused `ERROR_ACCESS_DENIED` in that race with the fix in place, where NTFS
 >   deletes.
-> - **Owed** (filed to main, run-requests 2026-11-18): `vm-hang-probe2.ps1` on the VM, which dumps the owner request
->   and its IRP when the race stops, and the same race on WinFsp's own driver with an outside writer in place of the
->   link.
+> - **Owed** (filed to main, run-requests 2026-11-18):
+>   - `vm-hang-probe2.ps1` on the VM, which dumps the owner request and its IRP when the race stops, now with FltMgr's
+>     symbols loaded, the receive worker's whole stack and `fltmc instances`;
+>   - the 60-round race three times with Defender's real-time protection off, against three times with it on;
+>   - the same race on WinFsp's own driver, with an outside writer in place of the link.
 
 > **The WinFsp drive declares a folding volume case-sensitive (found 2026-11-17 reading WinFsp v2.1's source for
 > A-300; open, Windows-only, no drive test yet).** The mount sets `CaseSensitiveSearch` (and `CasePreservedNames`) for
@@ -4356,7 +4417,13 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 > status "The tail and three more defects"). Open: the added median is the cross-shard dispatch round (50 µs not met);
 > p999 under 1 ms at load 30. Since 2026-11-18 the round is counted hop by hop on the owner (§4.10 status "The round,
 > counted hop by hop": `fleet.live.hop.*`, the hops adding up to the round exactly); its breakdown under the contract
-> command is owed. Since 2026-11-07 a live volume's log goes to each holder on its own lane, the holders at once, only
+> command is owed. A-396 (2026-11-18): the round's cost was parked threads, not the hop; each shard on a write's path
+> asks to hold its idle window across its wait, the windows learned from the traffic, each hold kept only while the
+> shard's measured idle turn is shorter than its wake (A-387's predicate: a macOS shard declines). First A/B at load
+> 78–93 (adacachy): added 86–115 µs against main's 186–295, but the live p999 not better (4.2–27.7 ms against 2.6–15.1)
+> and the plain write's p99 worse (293–1,024 against 132–785 µs): suspected the unit's CPU quota spent by the spinning
+> shards; landed before its A/B (Ada's rule of 2026-11-18), the supervisor's A/B with `nr_throttled` is owed and
+> decides whether the holds stay. Since 2026-11-07 a live volume's log goes to each holder on its own lane, the holders at once, only
 > to holders of its catalog, and a lane waits for its requests before it ends (§4.10 status "One lane a holder"): a
 > write no longer waits for a stopped candidate (main: 406–1,064 ms for the first write after a stop, now 3–99 ms), and
 > no holder's session is left lent with a cancelled request (KIND `wan`, `wan-loss` and `ceiling` acknowledged every
