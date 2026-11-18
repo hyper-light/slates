@@ -33,12 +33,15 @@
 > that holds a record session it dialed to it (`DirectContact::Dialed`, `ShardState::dialed_in`). Test:
 > `the_pairs_canonical_dialer_keeps_a_peer_that_dialed_it_and_only_it` (`crates/server/src/daemon.rs`). Bug record:
 > `docs/bugs/2026-11-18-a-learner-the-pairs-lower-anchor-dropped-a-voter-that-kept-it.md`.
-> - **Open: a learner's voters are not versioned.** A seat change is a Raft configuration entry that moves no
->   configuration version, so a learner never fetches on it, and a learner answered by another learner takes that one's
->   known voters. A learner whose stale voters omit the leader sends its reports (which only the leader proposes) to
->   members that are not it, and the reports are answered `NotLeader` until a configuration commits. The principled fix
->   carries the voter set inside the versioned configuration a learner fetches (a format change of the regional
->   configuration's encoding; for Ada's design review).
+> - **Fixed (2026-11-18, A-380): a learner's voters are versioned.** A seat change was a Raft configuration entry that
+>   moved no configuration version, so a learner never fetched on it, and a learner answered by another learner took that
+>   one's known voters (`a_learner_learns_who_votes_once_the_voter_it_joined_from_is_gone`: 3 of 24 runs at one CPU, a
+>   learner naming only the stopped bootstrapper). Now the configuration records the council's voters, the leader
+>   records the voters in force once no change is in flight (`ConfigCommand::Seat`), and a learner reads them from the
+>   configuration it holds. Tests: `a_learner_names_the_voters_the_configuration_records_through_a_seat_change`
+>   (`crates/cluster/src/config_group.rs`), `a_seat_records_the_voters_in_id_order_and_advances_the_version_only_when_they_change`
+>   (`crates/db/src/register.rs`), the round trip in `crates/cluster/src/raft_wire.rs`. The root group's learners still
+>   name the root voters of their join (the open sibling of the 2026-11-08 entry).
 > - **Owed (the supervisor's):** the learner tests' rate on the diag lanes once this lands
 >   (`a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone` and its three siblings, at one CPU
 >   beside two busy loops, as diag-g225-forming-fleet-reaches-2 ran them).
