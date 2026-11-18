@@ -1171,6 +1171,13 @@ impl Partition {
             existing: alias.volume.bytes,
           });
         }
+        // A work being admitted here holds its name meanwhile (A-247), against a work made on another shard as much as
+        // against one made here (A-400).
+        if let Some(pending) = self.pending_creations.get(&record.name) {
+          return Err(DbError::AlreadyExists {
+            existing: pending.work.bytes,
+          });
+        }
         if self.name_aliases.len() >= self.caps.volumes {
           return Err(DbError::Capacity {
             table: "name aliases",
