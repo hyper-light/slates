@@ -1,5 +1,30 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Signed work: merges are signed work (2026-11-17, §4.16, §4.12 "The consumer contract"; A-321, goal g090, Ada's
+> rule of 2026-11-18 that a signature is provenance and never the permission gate).** A merge may carry an SSH
+> signature (`PROTOCOL.sshsig`, namespace `slates-work`, Ed25519 or FIDO Ed25519) over its statement — the work, its
+> green, its base and the increment's identity, which a held submit hands the signer. The green's owner judges it under
+> the work's and the green's trusted signers (set only by the launcher, `SetSigners`), and records the verdict
+> (verified with its signer, unsigned, invalid with its reason) with the version: in its chain entry, then in the
+> green's accepted record and the checkpoint that folds the entry. It is answered on the merge and read back with
+> `MergeRecord`. A green or a work can require signed merges (`WritePolicy::require_signed_merges`, launcher-set); an
+> unsigned or invalid merge is refused `SignatureRequired` when it would merge, in every mode. A consumer's policy
+> cannot require it. The contract carries all of it (`CONTRACT` 13). Proven by `crates/server/tests/signed_work.rs`
+> (8 of 8, macOS arm64, 2026-11-17; each red with its guard removed), the verifier's 11 unit tests over new
+> `ssh-keygen -Y sign` vectors, the chain and checkpoint codecs' tests and the contract's by-use test. **Owed, in
+> order:**
+> - a landing's signature: the statement is defined (`signed_work::landing_statement`: the volume, the target with its
+>   length, the manifest); the verdict on `Land` and `Present` under the volume's signers, recorded with the landing's
+>   record and read back in the audit, and the contract's `land` with a signature (today `Unsupported(SignedWork)`);
+> - the verdict carried by a version's merge record (`MergeRecordValue`) to holders and a takeover successor, which
+>   records none today, so a green taken over reads its merged versions unsigned;
+> - **a sibling found here, open (A-285's too):** a takeover successor makes a volume's record with no write policy and
+>   no trusted signers (`verbs::materialize_taken_over`, `materialize_taken_over_green`: `write: None`), since the
+>   catalog register (`catalog::CatalogValue`) carries neither, so a volume taken over merges and lands as an unset
+>   one does, its signed-merge requirement dropped; the catalog register should carry both;
+> - a real FIDO key's signature end to end (the touch flag is proven with a software stand-in);
+> - the integrator's runs on Linux and Windows (the suite is platform-free but for the agent's own channel, Unix).
+
 > **A reply carried home past a full channel was dropped: fixed (goal 238, 2026-11-18, A-296, from perf's branch of
 > 2026-11-09; §4.3, CLAUDE.md §2 items 8 and 9).** `xshard::send_back` waited one coordinator period for room and then
 > dropped the result (`xshard.reply_dropped`); `xshard::hand_reply_home` (fuse, image, landing, lease_wait, live_ship,
@@ -268,10 +293,10 @@
 >   (`set_write_policy`, `write_policy`, `Refused` outcomes; piece 5, `CONTRACT` = 3), and merges under a mode with
 >   their approvals and the present-only verb reach it too (`approve_merge`, `plan_landing` on `Present`; `CONTRACT`
 >   = 6); owed: a consumer's own mode, the MCP and SDK land verb under the mode, signed work verified with the
->   statement a signer signs and the trusted signers a launcher registers;
-> - (built, `CONTRACT` = 14: the volume core's refusals typed, `Refusal::Volume`, no catch-all left in
->   `refusal_of_vfs`;) typed fields on the wire for a landing target's refusal (`TargetUnavailable` carries words), a
->   merge's versions
+>   statement a signer signs and the trusted signers a launcher registers — signed merges built (A-321, `CONTRACT` =
+>   13), a signed landing owed;
+> - (built, `CONTRACT` = 15: the volume core's refusals typed, `Refusal::Volume`, no catch-all left in
+>   `refusal_of_vfs`;) typed fields on the wire for a landing target's refusal (`TargetUnavailable` carries words), a merge's versions
 >   (the work's base beside the head), and the words the crate still reads from the daemon's closed tables (a landing's
 >   state, a summary's actions, the audit's kinds, a grant's state); an overlay's drift is built (`StatusReport::base`,
 >   `CONTRACT` = 8), and a presentation's conflicts are read typed from its entries;
@@ -309,7 +334,10 @@
 > asks a file's final path with `VOLUME_NAME_DOS` is refused the same way (Python's `os.path.realpath` raised it on a
 > WinFsp drive in WinFsp issue 427). **Decision for Ada:** (a) state it, the route's limitation (recommended now: no
 > privilege is ever required, R10); (b) mount through the Mount Manager (`\\.\X:`), which works and needs an
-> Administrator, so only as a choice the person makes when elevated; (c) mount as a WinFsp network file system, whose
+> Administrator, so only as a choice the person makes when elevated; (b') the same with WinFsp's machine-wide setting
+> `MountUseMountmgrFromFSD=1`, which an Administrator sets once (as WinFsp itself is installed once) and which then lets
+> an unprivileged mount use the Mount Manager from WinFsp's kernel driver, its drives global to the machine (WinFsp's
+> registry-settings page: "not recommended for general use"); (c) mount as a WinFsp network file system, whose
 > final path is a UNC path (`\\?\UNC\…`), which every tool would then print in place of the drive. **Open:** the
 > cell's record (`native-windows-winfsp.workloads.json`, still the owed skip of 2026-11-05) is re-recorded from the
 > first run with A-327; the roster's other workloads (cargo, npm, python, rg, rsync, sqlite, editor, watcher) are owed a
@@ -371,7 +399,8 @@
 > - **built (2026-11-18):** the MCP and SDK land verb follows the policy (it already sent `Land`; its promises now
 >   say so); `assert_materialize_lands_under_a_bypass_policy` over MCP;
 > - signed work: a merge or landing may carry an SSH signature, checked and recorded (verified with its signer,
->   unsigned, invalid with its reason), and a volume may require signed merges;
+>   unsigned, invalid with its reason), and a volume may require signed merges — **built for merges (2026-11-17,
+>   A-321)**, a landing's owed (A-321's entry);
 > - the end-to-end proof on adacachy: a bypass agent's landing written at once, an ask agent's after approval, a
 >   signed merge verified and an invalid signature reported. **The landing half ran on Linux (2026-11-18):**
 >   `write_policy.rs` 9 of 9 on Linux x86_64 and arm64, a real daemon and client over a real target directory (GitHub
@@ -2217,6 +2246,20 @@
 >   budget (R3 debt). Found on the way: a Windows channel (a `Sid`) can never attest a consumer (`verify_attestation`
 >   takes a uid only), and two server unit tests of landing fail on Windows, where CI does not run them. Record:
 >   `docs/bugs/2026-11-06-a-cross-shard-wait-lost-a-starved-shards-answer.md`.
+> - **Class B, the location budget: done (2026-11-18, A-317, goal g255; clients' `3c072f490` of 2026-11-09).** A
+>   forward with no known owner looked for it for one liveness budget of wall time, which a starved control shard spent
+>   before reading the gossip that refutes a false death (clients' runs at nice 19 beside two spinners a CPU: 1 or 2
+>   calls refused in every false death), and which a single round waiting on silent peers spent whole. It now looks for
+>   the membership horizon on the wall and ends only with a look begun after it, the direct route asked again after
+>   each round, within the failover SLO (`fleet.owner_location.gave_up`, `.budget_spent`, `.slo_ended`;
+>   `a_forward_with_no_owner_to_find_keeps_looking_for_its_location_budget`,
+>   `the_failover_slo_ends_a_forwards_location_budget`). Two longer budgets did not land: clients' polls and the horizon
+>   followed by the control shard's two driver waits each run a forward's location to the failover SLO, the polls when
+>   rounds wait on a silent peer and the waits when the control shard is busy. On main as of `9addf53ef` every rewrite
+>   made the five-node takeover test fail some runs, where that base's own budget passed it; on main as of `bfc34cace`
+>   this one passes it 16 of 16, as main does (what changed between the bases was not traced).
+>   Still class B: the location round's own wait for silent peers, `SESSION_WAIT_NS`, `fleet::live_budget`, the NFS
+>   callback probe and the leader forward (`promote_region_here_or_forward`), each a liveness budget of wall time.
 
 > **A-190's purge client leaves the daemon's process (2026-11-06, fixed); the sweep for the rest (open).** No daemon
 > thread opens a path on a volume the daemon serves (§4.6). The coherent purge's opens, writes and reads now run in a
