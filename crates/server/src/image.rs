@@ -1407,7 +1407,7 @@ impl ArchiveJob {
       .source
       .bytes
       .get(size_of::<u64>()..)
-      .and_then(|low| <[u8; 8]>::try_from(low).ok())
+      .and_then(|low| <[u8; size_of::<u64>()]>::try_from(low).ok())
       .map_or(0, u64::from_be_bytes);
     self.stamp = (local, created_unix);
     self.codec = Some(state.config.codec.clone());
