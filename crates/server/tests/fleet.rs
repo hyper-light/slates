@@ -11777,8 +11777,6 @@ fn a_candidate_behind_a_port_mapping_is_redialed_through_it_so_a_cut_there_holds
   );
 }
 
-/// Format: the status count of a live volume a successor rebuilt from its log (`live_ship`'s `LIVE_TAKEN_OVER`).
-const LIVE_TAKEN_OVER: &str = "fleet.live.taken_over";
 /// Format: the status count of the volumes a shard yielded at its host's re-admission (`readmission::YIELDED`).
 const READMISSION_YIELDED: &str = "fleet.readmission.yielded";
 /// Shape: how long reads through an owner admitted again are made: past the lease bound a read parks for (the stale
