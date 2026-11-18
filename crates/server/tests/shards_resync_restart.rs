@@ -430,6 +430,25 @@ fn a_nameless_file_held_by_its_lookup(writer: &mut Guest) -> u64 {
   node
 }
 
+/// Before the death, A-399: `writer`'s guest flushes its handle of `data` (`file`), as its `close` would, after the
+/// write the log holds: answered with no publication of its own, counted `shards.flush_logged`. The write outlives the
+/// daemon from the log all the same (`answered_once_and_kept` reads it back after the death).
+fn a_close_publishes_nothing_its_log_holds(
+  daemon: &Daemon,
+  writer: &mut Guest,
+  (data, fh): (u64, u64),
+) {
+  let mut flush = fh.to_le_bytes().to_vec();
+  flush.extend_from_slice(&[0u8; 16]);
+  let (errno, _, _) = writer.ask(&request(FLUSH, 26, data, &flush));
+  assert_eq!(errno, 0, "the flush is answered");
+  assert_eq!(
+    counted(daemon, "shards.flush_logged", 1),
+    1,
+    "with no publication of its own: the log holds the write"
+  );
+}
+
 /// After the last publication, A-390: `writer`'s guest gives the nameless file's lookup back (`FORGET`, which takes no
 /// reply), and the volume lets the file go: its referenced bytes drop by the file's at least. Returns them then.
 fn the_guest_lets_it_go(
@@ -615,12 +634,13 @@ fn answered_once_and_kept(
   );
 }
 
-/// A-316 (Shards' coordinator's conditions 4a and 4b, slates' half), A-339 (macOS too), A-378, A-390, A-393. Do: as the
-/// anchor, hand a daemon the hold channel; attach a volume three times in the Shards form; the second stream's kernel
-/// sends an INIT taking the extended SETXATTR form; on the second stream create, write, close and unlink a file, its
-/// lookup still held, the unlink's barrier publishing it nameless; create a file and open it on the second stream;
+/// A-316 (Shards' coordinator's conditions 4a and 4b, slates' half), A-339 (macOS too), A-378, A-390, A-393, A-399. Do:
+/// as the anchor, hand a daemon the hold channel; attach a volume three times in the Shards form; the second stream's
+/// kernel sends an INIT taking the extended SETXATTR form; on the second stream create, write, close and unlink a file,
+/// its lookup still held, the unlink's barrier publishing it nameless; create a file and open it on the second stream;
 /// withhold the daemon's replies and send an exclusive CREATE on the first stream, whose barrier publishes it with its
-/// reply; then write on the second stream, acknowledged after that last publication, and give the nameless file's
+/// reply; then write on the second stream, acknowledged after that last publication, flush that handle as a close does
+/// (answered with no publication of its own while the log holds the write, counted), and give the nameless file's
 /// lookup back there (a FORGET, no publication after it), the volume's referenced bytes dropping by the file's; mark
 /// the daemon's write log overflowed, as a refused publication of a full one leaves it; kill the daemon (a fenced stop:
 /// no record ended, no hold released); start a second daemon over the same segment with the held ends handed back,
@@ -673,6 +693,7 @@ fn a_stream_is_resynced_after_its_daemons_death_and_its_unanswered_create_is_ans
   init_in_the_extended_form(&anchor, &mut old_writer, &mut writing.hold);
   let forgotten = a_nameless_file_held_by_its_lookup(&mut old_writer);
   let file = create_unanswered_then_write(&first, &mut old_creator, &mut old_writer);
+  a_close_publishes_nothing_its_log_holds(&first, &mut old_writer, file);
   let let_go = the_guest_lets_it_go(&mut client, volume, &mut old_writer, forgotten);
   assert!(
     first.inject_write_log_overflow().unwrap(),

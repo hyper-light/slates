@@ -912,7 +912,7 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
     crate::xshard::call_in_shard_time(
       control,
       shard,
-      move |s| dispatch(s, FORWARDED_CLIENT, &principal, body),
+      move |s| serve_forwarded_read(s, &principal, body, volume),
       crate::daemon::LIVENESS_BUDGET_NS,
     )
     .await
@@ -921,6 +921,10 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
       control,
       shard,
       move |s| {
+        // Not made here yet: refused before any completion is recorded, so the resend under its id runs it once made.
+        if let Some(refusal) = forwarded_before_made(s, volume) {
+          return (Some(refusal), None);
+        }
         if let Some(up_to) = ack_up_to {
           prune_forwarded(s, origin_host, id.client, up_to, &ack_owed);
         }
@@ -937,6 +941,41 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
     Some(crate::remote_attach::serve_unforwardable(control, shard, origin_host, body).await)
   };
   encode_body(&named_if_unshared(reply, (control, shard), volume, requester).await)
+}
+
+/// A read forwarded from another node, on its volume's owner shard: refused while this node owns the volume by its own
+/// routing but has not made it yet ([`forwarded_before_made`]), else dispatched as a local read is.
+fn serve_forwarded_read(
+  state: &mut ShardState,
+  principal: &Principal,
+  body: RequestBody,
+  volume: VolumeId,
+) -> ReplyBody {
+  forwarded_before_made(state, volume)
+    .unwrap_or_else(|| dispatch(state, FORWARDED_CLIENT, principal, body))
+}
+
+/// Format: the status count of verbs forwarded from another node to this one as `volume`'s owner by this node's routing
+/// (a takeover's successor) before it made the volume, refused `Overloaded` ([`forwarded_before_made`]).
+const FORWARD_BEFORE_MADE: &str = "fleet.forward.refused.before_made";
+
+/// The refusal a verb forwarded from another node meets on `volume`'s owner shard when this node owns the volume by its
+/// own routing (a takeover's successor) but its catalog does not hold it yet: `Overloaded`, retryable, the answer a local
+/// client's verb gets here ([`owned_unmaterialized`]). Dispatched, the verb found no volume and answered `NotFound`,
+/// telling a reader its acknowledged write did not exist (the chaos nemesis at seed 6876545201569229162, ReadSafety:
+/// reads through a holder during the owner's isolation, forwarded to the successor its routing named, `NotFound` five
+/// times a run), and a forwarded write had that `NotFound` recorded as its completion. A volume this shard records
+/// unrecovered is dispatched, so its typed refusal names why (A-394).
+fn forwarded_before_made(state: &mut ShardState, volume: VolumeId) -> Option<ReplyBody> {
+  let id = to_db_volume(volume);
+  if state.fleet.object_owner(ObjectId(volume.bytes)) != Some(state.fleet.host())
+    || state.db.partition().volume(id).is_some()
+    || state.unrecovered.contains_key(&id)
+  {
+    return None;
+  }
+  state.count(FORWARD_BEFORE_MADE, 1);
+  Some(refused(Refusal::Overloaded { shard: state.shard }))
 }
 
 /// The answer to a forwarded write once its verb has run on the owner `shard`: its reply after the mounts its change owes
@@ -6398,6 +6437,249 @@ fn release_credits(
   if let Some(m) = metadata {
     state.store.metadata.release(m);
   }
+}
+
+/// A candidate's claim on the shard that would restore a live volume this node holds the log of (§4.2: "a remote holder
+/// makes the same admission against its own machine before acknowledging placement"; g229, 2026-11-18): the credits a
+/// successor's restore takes ([`make_restored`]), reserved when the candidate takes the log's first entry
+/// (`live_ship::admit_claim`), taken over by the restore ([`take_claim_or_admit`]), and released once the copy goes
+/// (`live_ship::reconcile_claims`). Before, a candidate reserved nothing and a successor made the admission only at its
+/// restore, so one whose shard had filled since gave the volume up while a survivor held every acknowledged write (CI's
+/// 7 GB macOS runner, diag-supervisor-live-2: refused `BudgetExceeded` for 100 periods, then `NotRecovered`).
+pub(crate) struct CandidateClaim {
+  /// The credits the restore takes over.
+  credits: Credits,
+  /// When the claim was reserved ([`slates_rt::futures::now_ns`]): a reconciliation that read the control shard's copies
+  /// before it never releases it ([`reconcile_candidate_claims`]).
+  reserved_ns: u64,
+}
+
+/// Where a reconciliation found a copy's claim on this shard ([`reconcile_candidate_claims`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClaimFound {
+  /// A candidate claim holding these bytes.
+  Claimed(u64),
+  /// No claim: this shard serves the volume itself, whose own credits hold its room (a successor's restore took the
+  /// claim over).
+  Served,
+  /// No claim and no volume: the control shard admits it again (a warm restart's copies).
+  Missing,
+}
+
+/// Counter: a candidate claim reserved for a live log this node holds (§4.2, [`CandidateClaim`]).
+/// Format: a counter name in the daemon's status report.
+const CLAIM_ADMITTED: &str = "fleet.live.claim_admitted";
+/// Counter: a candidate claim refused for room: the holder answered `NoRoom` and took nothing.
+/// Format: a counter name in the daemon's status report.
+const CLAIM_REFUSED: &str = "fleet.live.claim_refused";
+/// Counter: a taken-over volume made from this node's candidate claim, which no admission since could take.
+/// Format: a counter name in the daemon's status report.
+const CLAIM_TAKEN_OVER: &str = "fleet.live.claim_taken_over";
+/// Counter: a candidate claim released because its copy went (or its admission's copy was never taken).
+/// Format: a counter name in the daemon's status report.
+const CLAIM_RELEASED: &str = "fleet.live.claim_released";
+/// Counter: a taken-over volume's making that failed after it took its credits, which went back to its claim.
+/// Format: a counter name in the daemon's status report.
+const CLAIM_RETURNED: &str = "fleet.live.claim_returned";
+
+/// The credits a taken-over volume of `size` holds from its making ([`make_restored`]), as a create admits them: a
+/// bounded claim's bytes and inode allowance, the volume's records against the metadata ledger, and a strict volume's
+/// locked entitlement; whole or none, a refusal giving back what was taken. A dynamic volume reserves no bytes and no
+/// slots: it holds the slots of the inodes it is restored with, and grows from what is unpromised (A-342).
+fn restore_credits(
+  state: &mut ShardState,
+  size: SizeClass,
+  require_locked: bool,
+) -> Result<Credits, Refusal> {
+  let reservation = match size {
+    SizeClass::Bounded { limit } => {
+      Some(state.store.reserve(limit).map_err(|e| budget_refusal(&e))?)
+    }
+    SizeClass::Dynamic { .. } => None,
+  };
+  let version = match size {
+    SizeClass::Bounded { .. } => {
+      let allowance = inode_allowance(state, size);
+      match state.store.versions.reserve(allowance) {
+        Ok(credit) => Some(credit),
+        Err(e) => {
+          release_credits(state, reservation, None, None);
+          return Err(budget_refusal(&e));
+        }
+      }
+    }
+    SizeClass::Dynamic { .. } => None,
+  };
+  let metadata = match reserve_metadata(state, journal_floor_bytes(state)) {
+    Ok(credit) => credit,
+    Err(refusal) => {
+      release_credits(state, reservation, version, None);
+      return Err(refusal);
+    }
+  };
+  let lock = match require_locked
+    .then(|| reserve_locked(state, size))
+    .transpose()
+  {
+    Ok(lock) => lock,
+    Err(refusal) => {
+      release_credits(state, reservation, version, Some(metadata));
+      return Err(refusal);
+    }
+  };
+  Ok(Credits {
+    reservation,
+    version,
+    metadata: Some(metadata),
+    lock,
+  })
+}
+
+/// A ledger's refusal as a verb answers it: `BudgetExceeded` with what could be admitted, else the memory error's own.
+fn budget_refusal(error: &slates_mem::MemError) -> Refusal {
+  match error {
+    slates_mem::MemError::BudgetExceeded { available, .. } => Refusal::BudgetExceeded {
+      available: *available,
+    },
+    other => refusal_of_mem(other),
+  }
+}
+
+/// The bytes credits hold for a volume's content: a bounded claim's reservation, none for a dynamic volume.
+fn credit_bytes(credits: &Credits) -> u64 {
+  credits
+    .reservation
+    .map_or(0, |reservation| reservation.bytes)
+}
+
+/// Returns credits to the shard's ledgers, its locked entitlement with them.
+fn release_all(state: &mut ShardState, credits: Credits) {
+  let Credits {
+    reservation,
+    version,
+    metadata,
+    lock,
+  } = credits;
+  release_credits(state, reservation, version, metadata);
+  drop(lock);
+}
+
+/// Reserves this node's candidate claim on live volume `id` of `size` on this shard, the one its id routes to
+/// ([`CandidateClaim`]): the bytes it holds for the volume's content, its bound for a bounded claim and none for a
+/// dynamic volume. Idempotent: a claim reserved already answers its bytes. Refused typed, nothing kept, when the shard
+/// cannot make the admission a successor's restore would make.
+pub(crate) fn admit_candidate_claim(
+  state: &mut ShardState,
+  id: DbVolumeId,
+  size: SizeClass,
+  require_locked: bool,
+) -> Result<u64, Refusal> {
+  if let Some(claim) = state.candidate_claims.get(&id) {
+    return Ok(credit_bytes(&claim.credits));
+  }
+  match restore_credits(state, size, require_locked) {
+    Ok(credits) => {
+      let bytes = credit_bytes(&credits);
+      let reserved_ns = slates_rt::futures::now_ns();
+      state.candidate_claims.insert(
+        id,
+        CandidateClaim {
+          credits,
+          reserved_ns,
+        },
+      );
+      state.count(CLAIM_ADMITTED, 1);
+      Ok(bytes)
+    }
+    Err(refusal) => {
+      state.count(CLAIM_REFUSED, 1);
+      Err(refusal)
+    }
+  }
+}
+
+/// Releases this shard's candidate claims that `kept` does not name and that were reserved before `read_ns`, when the
+/// control shard read the live copies this node holds (`live_ship::reconcile_claims`): their copies went (a destroy's
+/// tombstone let them go), or their admission's copy was never taken. Answers where each of `kept` stands here, so the
+/// control shard admits a missing one again.
+pub(crate) fn reconcile_candidate_claims(
+  state: &mut ShardState,
+  kept: &std::collections::BTreeSet<DbVolumeId>,
+  read_ns: u64,
+) -> Vec<(DbVolumeId, ClaimFound)> {
+  let released: Vec<DbVolumeId> = state
+    .candidate_claims
+    .iter()
+    .filter(|(id, claim)| !kept.contains(id) && claim.reserved_ns < read_ns)
+    .map(|(id, _)| *id)
+    .collect();
+  for id in released {
+    if let Some(claim) = state.candidate_claims.remove(&id) {
+      release_all(state, claim.credits);
+      state.count(CLAIM_RELEASED, 1);
+    }
+  }
+  kept
+    .iter()
+    .map(|id| {
+      let found = match state.candidate_claims.get(id) {
+        Some(claim) => ClaimFound::Claimed(credit_bytes(&claim.credits)),
+        None if state.by_id.contains_key(id) && !lost_to_a_successor(state, *id) => {
+          ClaimFound::Served
+        }
+        None => ClaimFound::Missing,
+      };
+      (*id, found)
+    })
+    .collect()
+}
+
+/// The bytes this shard's candidate claim on `id` holds for its content ([`CandidateClaim`]), none without one: what a
+/// taken-over volume's restore counts as its own beside what the shard could admit ([`restore_taken_over`]).
+pub(crate) fn claimed_bytes(state: &ShardState, id: DbVolumeId) -> u64 {
+  state
+    .candidate_claims
+    .get(&id)
+    .map_or(0, |claim| credit_bytes(&claim.credits))
+}
+
+/// The credits a taken-over volume's making takes ([`make_restored`]): this node's candidate claim on it, taken over
+/// whole and counted, else the admission a create makes, refused typed. A successor that held the volume's log
+/// reserved its claim when it took the log's first entry, so nothing admitted since took its room.
+fn take_claim_or_admit(
+  state: &mut ShardState,
+  id: DbVolumeId,
+  size: SizeClass,
+  require_locked: bool,
+) -> Result<Credits, Box<ReplyBody>> {
+  if let Some(claim) = state.candidate_claims.remove(&id) {
+    state.count(CLAIM_TAKEN_OVER, 1);
+    return Ok(claim.credits);
+  }
+  restore_credits(state, size, require_locked).map_err(|refusal| Box::new(refused(refusal)))
+}
+
+/// Puts the credits a failed making of `id` took back as its candidate claim, answering `refusal`
+/// ([`take_claim_or_admit`]): the next attempt finds the room this one had, whichever way the credits came. Released, as
+/// any claim is, once this node holds no copy of the volume's log ([`reconcile_candidate_claims`]).
+fn return_to_claim(
+  state: &mut ShardState,
+  id: DbVolumeId,
+  credits: Credits,
+  refusal: Refusal,
+) -> ReplyBody {
+  let reserved_ns = slates_rt::futures::now_ns();
+  if let Some(earlier) = state.candidate_claims.insert(
+    id,
+    CandidateClaim {
+      credits,
+      reserved_ns,
+    },
+  ) {
+    release_all(state, earlier.credits);
+  }
+  state.count(CLAIM_RETURNED, 1);
+  refused(refusal)
 }
 
 /// Reserves a volume's records against the shard's metadata ledger (§4.2 metadata dimension) before
@@ -12691,7 +12973,7 @@ pub(crate) fn materialize_taken_over(
   if made_already(state, id, taken.catalog)? {
     return Ok(());
   }
-  let restored = restore_taken_over(state, taken.catalog, archive)?;
+  let restored = restore_taken_over(state, id, taken.catalog, archive)?;
   make_restored(state, id, taken, region, restored.as_ref())
 }
 
@@ -12745,7 +13027,7 @@ pub(crate) fn made_already(
 }
 
 /// The size class a taken-over volume's catalog names.
-fn taken_over_size(catalog: &crate::catalog::CatalogValue) -> SizeClass {
+pub(crate) fn taken_over_size(catalog: &crate::catalog::CatalogValue) -> SizeClass {
   match catalog.size {
     DbSizeClass::Bounded { limit } => SizeClass::Bounded { limit },
     DbSizeClass::Dynamic { max } => SizeClass::Dynamic { max },
@@ -12760,6 +13042,7 @@ fn taken_over_size(catalog: &crate::catalog::CatalogValue) -> SizeClass {
 /// catalog registers.
 pub(crate) fn restore_taken_over(
   state: &mut ShardState,
+  id: DbVolumeId,
   catalog: &crate::catalog::CatalogValue,
   archive: Option<&slates_archive::Archive>,
 ) -> Result<Option<slates_archive::Restored>, Box<ReplyBody>> {
@@ -12775,10 +13058,13 @@ pub(crate) fn restore_taken_over(
   if let Ok(needed) = slates_archive::restore_needed(archive) {
     state.store.make_room(needed.min(volume_cap));
   }
-  let restore_budget = volume_cap.min(state.store.budget.admittable());
+  // The room this node's candidate claim holds for the volume is the restore's own (§4.2, g229): what the shard could
+  // admit beside it no longer counts it.
+  let claimed = claimed_bytes(state, id);
+  let restore_budget = volume_cap.min(state.store.budget.admittable().saturating_add(claimed));
   // A refusal names what the shard could admit now, the pool's free extents included: the arena claims nothing
   // for a restore the pool cannot cover (A-98), so the budget alone names only what the shard already holds.
-  let room = volume_cap.min(state.store.admittable());
+  let room = volume_cap.min(state.store.admittable().saturating_add(claimed));
   slates_archive::restore(archive, restore_budget)
     .map(Some)
     .map_err(|e| {
@@ -12805,88 +13091,22 @@ fn make_restored(
 ) -> Result<(), Box<ReplyBody>> {
   let (head, catalog, sequence) = (taken.head, taken.catalog, taken.sequence);
   let size = taken_over_size(catalog);
-  let reservation = match size {
-    SizeClass::Bounded { limit } => match state.store.reserve(limit) {
-      Ok(r) => Some(r),
-      Err(slates_mem::MemError::BudgetExceeded { available, .. }) => {
-        return Err(Box::new(refused(Refusal::BudgetExceeded { available })));
-      }
-      Err(e) => {
-        return Err(Box::new(refused(refusal_of_mem(&e))));
-      }
-    },
-    SizeClass::Dynamic { .. } => None,
-  };
-  // A bounded claim reserves its whole inode allowance; a dynamic volume holds slots for the inodes it is restored with
-  // (taken below, once they are in) and grows its hold as it makes more (A-342).
-  let reserved = match size {
-    SizeClass::Bounded { .. } => Some(state.store.versions.reserve(inode_allowance(state, size))),
-    SizeClass::Dynamic { .. } => None,
-  };
-  let version_credit = match reserved {
-    None => None,
-    Some(Ok(c)) => Some(c),
-    Some(Err(slates_mem::MemError::BudgetExceeded { available, .. })) => {
-      return Err(Box::new(give_back(
-        state,
-        reservation,
-        None,
-        None,
-        Refusal::BudgetExceeded { available },
-      )));
-    }
-    Some(Err(e)) => {
-      return Err(Box::new(give_back(
-        state,
-        reservation,
-        None,
-        None,
-        refusal_of_mem(&e),
-      )));
-    }
-  };
+  // The candidate claim this node reserved as it took the volume's log (§4.2, g229), else the admission a create makes:
+  // a bounded claim's bytes and inode allowance, its records, and a volume that must live in locked RAM keeps that
+  // guarantee on its successor (AUD-29-17): a successor that cannot promise it refuses the takeover typed rather than
+  // serve the volume swappable. A dynamic volume holds slots for the inodes it is restored with (taken below, once
+  // they are in) and grows its hold as it makes more (A-342). A failure after this point returns the credits to the
+  // claim ([`return_to_claim`]), so the next attempt finds the room this one had.
+  let credits = take_claim_or_admit(state, id, size, catalog.require_locked)?;
   let names = wire_names(catalog.names);
   let config = volume_config(state, names, quota_for(size));
-  // The taken-over volume's records are reserved against the metadata ledger before it exists (§4.2).
-  let metadata_credit = match reserve_metadata(state, config.journal_bytes) {
-    Ok(credit) => Some(credit),
-    Err(refusal) => {
-      return Err(Box::new(give_back(
-        state,
-        reservation,
-        version_credit,
-        None,
-        refusal,
-      )));
-    }
-  };
-  // A volume that must live in locked RAM keeps that guarantee on its successor (§4.2, AUD-29-17): its entitlement
-  // is reserved against this process's lock capacity as a strict create reserves it, and a successor that cannot
-  // promise it refuses the takeover typed rather than serve the volume swappable.
-  let lock_credit = match catalog
-    .require_locked
-    .then(|| reserve_locked(state, size))
-    .transpose()
-  {
-    Ok(credit) => credit,
-    Err(refusal) => {
-      return Err(Box::new(give_back(
-        state,
-        reservation,
-        version_credit,
-        metadata_credit,
-        refusal,
-      )));
-    }
-  };
   let mut volume = match Volume::create(&mut state.store, config) {
     Ok(v) => v,
     Err(e) => {
-      return Err(Box::new(give_back(
+      return Err(Box::new(return_to_claim(
         state,
-        reservation,
-        version_credit,
-        metadata_credit,
+        id,
+        credits,
         refusal_of_vfs(&e),
       )));
     }
@@ -12895,11 +13115,10 @@ fn make_restored(
   if let Err(e) = admit_dimensions(state, &mut volume, size) {
     let discarded = volume.discard_partial(&mut state.store);
     count_kept(state, VOLUME_DISCARD_REFUSED, discarded);
-    return Err(Box::new(give_back(
+    return Err(Box::new(return_to_claim(
       state,
-      reservation,
-      version_credit,
-      metadata_credit,
+      id,
+      credits,
       refusal_of_vfs(&e),
     )));
   }
@@ -12908,11 +13127,10 @@ fn make_restored(
   {
     let discarded = volume.discard_partial(&mut state.store);
     count_kept(state, VOLUME_DISCARD_REFUSED, discarded);
-    return Err(Box::new(give_back(
+    return Err(Box::new(return_to_claim(
       state,
-      reservation,
-      version_credit,
-      metadata_credit,
+      id,
+      credits,
       refusal_of_vfs(&e),
     )));
   }
@@ -12922,14 +13140,19 @@ fn make_restored(
   {
     let discarded = volume.discard_partial(&mut state.store);
     count_kept(state, VOLUME_DISCARD_REFUSED, discarded);
-    return Err(Box::new(give_back(
+    return Err(Box::new(return_to_claim(
       state,
-      reservation,
-      version_credit,
-      metadata_credit,
+      id,
+      credits,
       refusal_of_vfs(&e),
     )));
   }
+  let Credits {
+    reservation,
+    version: version_credit,
+    metadata: metadata_credit,
+    lock: lock_credit,
+  } = credits;
   let now = state.clock.monotonic_ns();
   let record = VolumeRecord {
     id,
@@ -14599,12 +14822,9 @@ pub(crate) async fn rebuild_recovered(
     rebuilt.copies_adopted = crate::shards::dax_hold::adopt_inherited(state);
     slices.unit_done().await;
   }
-  // The writes acknowledged after the last publication, a FUSE mount's (Linux) and a Shards stream's (Linux, macOS;
-  // A-316, A-339), back on top of the rebuilt volumes (A-63).
-  #[cfg(unix)]
-  {
-    rebuilt.writes_replayed = replay_writes(state, slices).await;
-  }
+  // The writes acknowledged after the last publication, a FUSE mount's (Linux) and a Shards stream's (every platform;
+  // A-316, A-339, A-402), back on top of the rebuilt volumes (A-63).
+  rebuilt.writes_replayed = replay_writes(state, slices).await;
   // The writable copies wake once the replay is done (A-389): every change reaches them again from here on, and what
   // the replay wrote beneath one that it differs from is its client's later store, which the client's next sync writes
   // back. The streams' DAX objects wake when their streams take them.
@@ -16085,7 +16305,6 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
   call_records_published(state);
   // Every volume captured: this image holds every logged write, so the write log empties, stamped with this
   // generation (A-63). A volume skipped keeps the log, so its writes stay replayable.
-  #[cfg(unix)]
   clear_write_log(
     state,
     published.skipped.is_empty(),
@@ -16351,7 +16570,6 @@ fn publish_delta_into(
   crate::content_holder::held_committed(state, held.whole, false);
   crate::live_ship::owned_committed(state, held.owned, false);
   call_records_published(state);
-  #[cfg(unix)]
   clear_write_log(
     state,
     published.skipped.is_empty(),
@@ -16843,13 +17061,11 @@ const TAKEOVER_KEPT_UNRELEASED: &str = "recovery.takeover_kept_unreleased";
 const REVOKED_MOUNTS_OVERDUE: &str = "fuse.revoked_overdue";
 
 /// Format: the refusal counter of a write-log span the content object refused (A-63): that write is not logged.
-#[cfg(unix)]
 pub(crate) const WRITE_LOG_UNWRITTEN: &str = "recovery.write_log_unwritten";
 
 /// Empties the shard's FUSE write log after a publication that captured every volume (A-63), stamped with that
 /// publication's generation: every write before it is in that image now. A volume skipped keeps the log, so its
 /// writes stay owed to the next daemon.
-#[cfg(unix)]
 fn clear_write_log(state: &mut ShardState, captured_every_volume: bool, generation: u64) {
   if !captured_every_volume {
     return;
@@ -16874,7 +17090,6 @@ fn clear_write_log(state: &mut ShardState, captured_every_volume: bool, generati
 /// place among the writes (GAPS, A-154's sibling): the kernel never resends one, so without it the references a dead
 /// daemon was given back after its last publication stayed counted, and an unlinked file the kernel had let go was
 /// never reclaimed.
-#[cfg(unix)]
 async fn replay_writes(
   state: &mut ShardState,
   slices: &mut crate::recovery_slices::RecoverySlices,
@@ -16909,7 +17124,6 @@ async fn replay_writes(
 }
 
 /// The slot of the volume a record names, when recovery rebuilt it.
-#[cfg(unix)]
 fn slot_of_volume(
   state: &ShardState,
   volume: [u8; 16],
@@ -16919,7 +17133,6 @@ fn slot_of_volume(
 
 /// Gives back one logged `FORGET`'s lookups, as its attachment's own, in the volume its record names; `None` when
 /// recovery did not rebuild that volume.
-#[cfg(unix)]
 fn replay_forget(
   state: &mut ShardState,
   forgotten: crate::write_log::Forgotten,
@@ -16936,7 +17149,6 @@ fn replay_forget(
 
 /// Writes one logged record into the volume it was written through, which the record names; `None` when recovery did
 /// not rebuild that volume.
-#[cfg(unix)]
 fn replay_one(
   state: &mut ShardState,
   record: &crate::write_log::Record,
@@ -16957,7 +17169,6 @@ fn replay_one(
 /// Empties the write log under the committed image's generation and appends `remaining` to it, so the records a
 /// replay has not yet applied survive a crash before it ends. A record the log cannot take marks it overflowed
 /// (A-63: the next daemon reports every taken-over file as having lost writes).
-#[cfg(unix)]
 fn relog_remaining(state: &mut ShardState, remaining: &[crate::write_log::Logged]) {
   let generation = state.journal.generation();
   let (Some(object), Some(log)) = (state.content.as_mut(), state.write_log.as_mut()) else {
@@ -16985,12 +17196,10 @@ fn relog_remaining(state: &mut ShardState, remaining: &[crate::write_log::Logged
 }
 
 /// Format: the refusal counter of a logged write recovery could not replay (A-63).
-#[cfg(unix)]
 const WRITE_REPLAY_REFUSED: &str = "recovery.write_replay_refused";
 
 /// Format: the refusal counter of a logged `FORGET` recovery could not give back (no rebuilt volume holds its inode,
 /// or the volume refused it).
-#[cfg(unix)]
 const FORGET_REPLAY_REFUSED: &str = "recovery.forget_replay_refused";
 
 /// Format: the refusal counter of a volume whose recovered references could not be settled.
@@ -17426,9 +17635,8 @@ mod tests {
   /// shard, a volume whose file "f" holds "origin", snapshotted and cloned; replay a logged write of "clone!" at offset 0
   /// of the clone's "f", through the clone, as the successor of a daemon that served it would. Expect: the clone's "f"
   /// reads "clone!" and the origin's still "origin", the inode carrying the origin's prefix (non-vacuous). Before, the
-  /// write went to the origin, the clone kept "origin" and lost its write. Every Unix: macOS replays a Shards stream's
-  /// logged writes too (A-339).
-  #[cfg(unix)]
+  /// write went to the origin, the clone kept "origin" and lost its write. Every platform: a Shards stream's logged
+  /// writes are replayed on macOS (A-339) and Windows (A-402) too.
   #[test]
   fn a_replayed_write_to_a_clones_inherited_file_lands_in_the_clone() {
     let (origin_reads, clone_reads, inherited_prefix, origin_prefix) =
@@ -19894,6 +20102,77 @@ mod tests {
       Err(Refusal::ConsumerNotEnrolled),
       "a proof under a guessed capability does not verify"
     );
+  }
+
+  /// The chaos nemesis at seed 6876545201569229162 (ReadSafety; §4.8 "Lookup"): a verb forwarded to this node as a
+  /// volume's owner by its own routing, a takeover's successor, before it has made the volume is refused `Overloaded`,
+  /// retryable, never answered `NotFound`. Do: route a volume another member created to this node, as a takeover's install
+  /// routes it to its successor, without making it; serve a forwarded status read of it as `serve_forward` does on its
+  /// owner shard; then create a volume here and serve the same read of it. Expect the first refused `Overloaded` and
+  /// counted once, the second answered. Before, the first answered `NotFound`: a reader through a holder was told its
+  /// acknowledged write did not exist.
+  #[test]
+  fn a_forwarded_read_of_a_volume_owned_here_but_not_made_is_refused_retryably() {
+    let (unmade, made, counted) = crate::daemon::audit_on_shard(|state| {
+      let principal = Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 1234,
+      };
+      let local = state.fleet.host();
+      let creator = slates_db::HostId(local.0 ^ 1);
+      let unmade_id = super::VolumeId {
+        bytes: slates_db::register::ObjectId::new(creator, 7).0,
+      };
+      state
+        .fleet
+        .track_object_owner(slates_db::register::ObjectId(unmade_id.bytes), local);
+      let unmade = super::serve_forwarded_read(
+        state,
+        &principal,
+        super::RequestBody::Status { volume: unmade_id },
+        unmade_id,
+      );
+      let super::ReplyBody::Created { id } = super::dispatch(
+        state,
+        1,
+        &principal,
+        super::RequestBody::Create {
+          name: "made-here".to_owned(),
+          size: super::SizeClass::Dynamic { max: 1 << 20 },
+          names: super::NamePolicy::Exact,
+          require_locked: false,
+          base: None,
+        },
+      ) else {
+        panic!("the volume was created")
+      };
+      let made = super::serve_forwarded_read(
+        state,
+        &principal,
+        super::RequestBody::Status { volume: id },
+        id,
+      );
+      let counted = state
+        .refusals
+        .get(super::FORWARD_BEFORE_MADE)
+        .copied()
+        .unwrap_or(0);
+      (unmade, made, counted)
+    });
+    assert!(
+      matches!(
+        unmade,
+        super::ReplyBody::Refused {
+          refusal: Refusal::Overloaded { .. }
+        }
+      ),
+      "a volume owned here but not made is refused retryably: {unmade:?}"
+    );
+    assert!(
+      !matches!(made, super::ReplyBody::Refused { .. }),
+      "a volume made here is answered: {made:?}"
+    );
+    assert_eq!(counted, 1, "counted once");
   }
 }
 

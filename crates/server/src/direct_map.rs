@@ -380,14 +380,33 @@ fn sync_then(
   let mark = held
     .writer
     .and_then(|(volume, _)| crate::told::mark(state, crate::verbs::to_db_volume(volume)));
+  let writer = held.writer;
   let sync = match Sync::new(state, client_id, held, principal.clone()) {
     Ok(sync) => sync,
     Err(refusal) => return refused(refusal),
   };
+  // On a live-shipped volume the sync's reply may wait for durability, so it is seated among the shard's held replies
+  // before the write-back writes anything: refused `Overloaded` at the bound with nothing written, never after
+  // (A-200; `crate::live_ship::take_seat`). A release lets its copy go whatever its write-back answers, so it is
+  // seated when there is room and otherwise runs seatless, never refused for room (`seat_if_room`).
+  if let Some((volume, _)) = writer {
+    let volume = crate::verbs::to_db_volume(volume);
+    match after {
+      AfterSync::Answer => {
+        if let Err(refusal) = crate::live_ship::take_seat(state, volume, request) {
+          return refused(refusal);
+        }
+      }
+      AfterSync::Release => crate::live_ship::seat_if_room(state, volume, request),
+    }
+  }
   match defer_task(state, request, answer_after(sync, request, (after, mark))) {
     // Never seen: `run_recorded` sends nothing for a verb that deferred its acceptance.
     Ok(()) => ReplyBody::Acknowledged,
-    Err(refusal) => refused(refusal),
+    Err(refusal) => {
+      crate::live_ship::release_seat(state, request);
+      refused(refusal)
+    }
   }
 }
 
@@ -436,6 +455,8 @@ async fn answer_after(
       return crate::live_ship::defer(s, live, request, route, reply)
         .map(|refusal| (refusal, route, s.shard, None));
     }
+    // Answered without waiting for durability: the seat its sync took, if any, is given back.
+    crate::live_ship::release_seat(s, request);
     let (reply, route) = complete(s, request, reply);
     let owed = mark.and_then(|mark| crate::told::owed(s, mark));
     Some((reply, route, s.shard, owed))
