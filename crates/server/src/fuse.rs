@@ -1357,22 +1357,13 @@ fn hand_over_session(s: &mut ShardState, attachment: u64, mount: &mut FuseMount)
   }
 }
 
-/// Serves again every FUSE mount recovery kept because the anchor held its device (A-61), and closes every held
-/// device recovery found no record for. Each kept mount gets a registry attachment from its record (its rights,
-/// its durable owner, so the references recovery gave back are its own), the serve state its session restored,
-/// and one `FUSE_NOTIFY_RESEND`, so the requests the dead daemon read and never answered come back; then its
-/// serve task. A mount that cannot be served again is unmounted and ended, counted.
+/// Serves again every FUSE mount recovery kept because the anchor held its device (A-61). Each kept mount gets a
+/// registry attachment from its record (its rights, its durable owner, so the references recovery gave back are its
+/// own), the serve state its session restored, and one `FUSE_NOTIFY_RESEND`, so the requests the dead daemon read and
+/// never answered come back; then its serve task. A mount that cannot be served again is unmounted and ended, counted.
+/// A held device recovery found no record for is closed by `crate::shards::adopt_held`, which runs next on every Unix.
 pub(crate) fn adopt_held() {
-  let (kept, orphaned) = state::with_state(|s| {
-    (
-      std::mem::take(&mut s.adopt_fuse),
-      std::mem::take(&mut s.inherited_fuse),
-    )
-  })
-  .unwrap_or_default();
-  for held in orphaned {
-    let _ = crate::fuse_hold::release(held.attachment);
-  }
+  let kept = state::with_state(|s| std::mem::take(&mut s.adopt_fuse)).unwrap_or_default();
   for (record, held) in kept {
     let _ = state::with_state_counted(move |s| adopt_one(s, record, held));
   }

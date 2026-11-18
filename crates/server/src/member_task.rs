@@ -498,13 +498,15 @@ impl Fleet for StateFleet<'_> {
     {
       return None;
     }
-    // The holder side of the owner lease (§4.8 "Leases and reads"; AUD-08): when this node answered, and the
-    // configuration version the prober announced.
+    // The holder side of the owner lease (§4.8 "Leases and reads"; AUD-08): when this node answered with a standing that
+    // can confirm the prober's lease (A-351: an answer to a host the configuration retired names none, and holds no
+    // promotion of its objects back), and the configuration version the prober announced.
     let now = slates_machine::clock::monotonic_ns();
-    state.answers_given.answered_alive(prober, now);
-    state.answers_given.announced(prober, configuration_version);
     let regional = state.council.configuration();
-    Some((regional.version, regional.standing_of(prober)))
+    let (version, standing) = (regional.version, regional.standing_of(prober));
+    state.answers_given.answered(prober, now, standing);
+    state.answers_given.announced(prober, configuration_version);
+    Some((version, standing))
   }
 
   fn hears(&self, from: HostId) -> bool {
@@ -527,6 +529,19 @@ impl Fleet for StateFleet<'_> {
   fn lease_holders(&self, into: &mut Vec<HostId>) {
     self.0.fleet.configuration().lease_holders_into(into);
   }
+}
+
+/// Test support: this node's answer to `prober`'s probe announcing `configuration_version`, as the membership plane has
+/// the control shard give it ([`Fleet::answer`]): the configuration version and the prober's standing it names, or
+/// `None` when the prober is not learned on contact.
+#[cfg(test)]
+pub(crate) fn answer_probe(
+  state: &mut ShardState,
+  prober: HostId,
+  boot_nonce: u64,
+  configuration_version: u64,
+) -> Option<(u64, Option<u64>)> {
+  StateFleet(state).answer(prober, boot_nonce, configuration_version)
 }
 
 /// Folds the events a datagram produced: each acknowledgement's round trip, owner-lease standing and first arrival.

@@ -41,6 +41,7 @@
 pub mod config_group;
 pub mod content;
 pub mod envelope;
+pub mod failover;
 pub mod fleet;
 mod fold;
 pub mod lease_renewal;

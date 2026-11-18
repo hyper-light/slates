@@ -33,13 +33,25 @@ const ROOM: u64 = 4 << 20;
 const MODE: u32 = 0o644;
 /// Shape: how long the deadline test waits on an instance nobody starts.
 const NOBODY_WAIT: Duration = Duration::from_millis(300);
+/// Format: the environment word that makes this host's daemon role fail before it serves (A-366's test): a daemon that
+/// cannot start, as one whose machine refuses it would.
+const DAEMON_FAILS: &str = "API_START_TEST_DAEMON_FAILS";
+/// Format: the exit of a daemon role [`DAEMON_FAILS`] stops: a failed role's code, as a refused start exits.
+const DAEMON_FAILS_EXIT: u8 = slates_api::role::EXIT_FAILED;
 
 fn main() -> ExitCode {
   let args: Vec<String> = std::env::args().skip(1).collect();
   if args.first().map(String::as_str) == Some(PREFIX) {
+    let daemon = matches!(
+      slates_api::role::Role::parse(&args[1..]),
+      Ok(slates_api::role::Role::Daemon(_))
+    );
+    if daemon && std::env::var_os(DAEMON_FAILS).is_some() {
+      return ExitCode::from(DAEMON_FAILS_EXIT);
+    }
     return slates_api::role::main(&args[..1], &args[1..]);
   }
-  let tests: [(&str, fn()); 9] = [
+  let tests: [(&str, fn()); 10] = [
     (
       "an_instance_starts_from_the_hosts_own_executable_serves_and_stops",
       an_instance_starts_from_the_hosts_own_executable_serves_and_stops,
@@ -75,6 +87,10 @@ fn main() -> ExitCode {
     (
       "an_anchor_started_under_an_exec_wrapper_keeps_the_launchers_secret",
       an_anchor_started_under_an_exec_wrapper_keeps_the_launchers_secret,
+    ),
+    (
+      "an_anchor_asked_until_served_stops_when_none_of_its_daemons_serves",
+      an_anchor_asked_until_served_stops_when_none_of_its_daemons_serves,
     ),
   ];
   let filter = args.iter().find(|arg| !arg.starts_with('-'));
@@ -451,4 +467,65 @@ fn an_anchor_started_under_an_exec_wrapper_keeps_the_launchers_secret() {
       "the wrapped anchor stops gracefully"
     );
   }
+}
+
+/// Ends the anchor it holds when dropped (killed, then reaped), so a failed assertion leaves no instance behind.
+struct Spawned(Option<std::process::Child>);
+
+impl Drop for Spawned {
+  fn drop(&mut self) {
+    if let Some(mut child) = self.0.take() {
+      let _killed = child.kill();
+      let _waited = child.wait();
+    }
+  }
+}
+
+/// A-366. Do: start an anchor from this binary whose every daemon exits before it serves (a daemon that cannot start),
+/// asking `until_served`, and wait on the anchor with no deadline of the host's own. Expect the wait to end
+/// `NeverServed`, the anchor gone with `EXIT_NEVER_SERVED`, and (Unix) no process of the instance left. Then start the
+/// same, not asking, and wait twice as long as the first took, with that as the deadline: expect `Unavailable` and the
+/// anchor still running, looping on its daemon as an anchor does (A-119), so it is the ask that stops it. Before A-366
+/// no anchor stopped, and a host's wait on one whose daemons could not start lasted until its own wall-clock deadline.
+fn an_anchor_asked_until_served_stops_when_none_of_its_daemons_serves() {
+  let instance = instance_name("unserved");
+  let mut command = spec(&instance).until_served().anchor_command().unwrap();
+  command.env(DAEMON_FAILS, "1");
+  let began = Instant::now();
+  let mut asked = Spawned(Some(command.spawn().unwrap()));
+  let waited = Instance::wait_for(&instance, asked.0.as_mut(), None);
+  let took = began.elapsed();
+  assert!(
+    matches!(waited, Err(Error::Start(StartFault::NeverServed))),
+    "{waited:?}"
+  );
+  let status = asked.0.take().unwrap().wait().unwrap();
+  assert_eq!(
+    status.code(),
+    Some(i32::from(slates_api::role::EXIT_NEVER_SERVED)),
+    "{status:?}"
+  );
+  #[cfg(unix)]
+  assert!(
+    processes_of(&instance).is_empty(),
+    "no process of the instance is left: {:?}",
+    processes_of(&instance)
+  );
+  println!("an anchor asked until_served stopped after {took:?}");
+
+  let looping = instance_name("looping");
+  let mut command = spec(&looping).anchor_command().unwrap();
+  command.env(DAEMON_FAILS, "1");
+  let mut unasked = Spawned(Some(command.spawn().unwrap()));
+  let until = Instant::now() + took * 2;
+  let waited = Instance::wait_for(&looping, unasked.0.as_mut(), Some(until));
+  assert!(
+    matches!(&waited, Err(Error::Unavailable { instance, .. }) if *instance == looping),
+    "{waited:?}"
+  );
+  let still = unasked.0.as_mut().unwrap().try_wait().unwrap();
+  assert!(
+    still.is_none(),
+    "an anchor not asked loops on its daemon: {still:?}"
+  );
 }
