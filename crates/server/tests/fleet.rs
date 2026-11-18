@@ -19121,7 +19121,7 @@ fn a_versions_merge_record_waits_for_its_works_catalog_record() {
   );
 }
 
-/// A-290 (A-255 under A-247): a work on another shard than its green asks for its verdict only once its catalog record,
+/// A-298 (A-255 under A-247): a work on another shard than its green asks for its verdict only once its catalog record,
 /// its submit's route, is committed, so the version's merge record, which carries the completion, never exists before
 /// its route. The owner's own gate cannot see such a work's catalog, since the owner's partition holds no record of it.
 /// Do: three nodes at `f = 1`, two shards each; on a, a green whose version 0 is placed; both holders withhold every

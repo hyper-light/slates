@@ -20,7 +20,7 @@
 >   a confirmed ssh-agent key and written, the askpass refusing, an unregistered key and a replay refused.
 
 > **W1 would have let a merge record reach its holders before its route: fixed before W1 landed (2026-11-17, g231;
-> A-290, §4.16).** A-255 holds a version's merge record, which carries its submit's completion, until the submitting
+> A-298, §4.16).** A-255 holds a version's merge record, which carries its submit's completion, until the submitting
 > work's catalog register is committed, checking it on the green's owner shard. W1 (A-247) puts most works on other
 > shards, whose records the owner's partition does not hold, so the check passed for them unseen; merging the two also
 > failed to compile where A-255's record named a `work_id` that W1's owner half does not have. A submit off its green's

@@ -14544,7 +14544,7 @@ the green's shard.
     records it there (deferred to the quorum as AUD-11 defers it). The verdict is the green's one serialized step. The
     answer goes back to the work's shard, which, in one transaction, restates the work (reset on an accept, its journal
     and files put back on a conflict), records the completion on its own partition, and only then replies.
-  - *A submit's route (A-290).* A submit off its green's shard asks for its verdict only once its work's catalog
+  - *A submit's route (A-298).* A submit off its green's shard asks for its verdict only once its work's catalog
     register, which A-255 makes the route of a resend after a takeover, is committed at its quorum, read on the work's
     shard; it waits there as a parked verb until then. The owner's gate cannot see that register, since the owner's
     partition holds no record of a work on another shard.
@@ -16617,7 +16617,7 @@ Applied in the same change to:
     key copied into another session is refused at its origin's door (A-SEAT).
   - A version's record ships only once its submitting work's catalog is committed, so no holder holds a completion
     without its route. The record plane ships that catalog at the work's creation, and on demand. A work on another
-    shard than its green (A-247) meets this on its own shard before its verdict is asked (A-290).
+    shard than its green (A-247) meets this on its own shard before its verdict is asked (A-298).
   - The successor never runs a resend whose key its chain does not hold. A work no member owns has no work to run against,
     so the green's owner refuses it `NotFound`. It answers only from the chain it adopted whole, to the quorum's head
     (`takeover::adopt`), so a version committed at the quorum whose answer was lost is answered, never run again
@@ -21103,12 +21103,13 @@ GAP-A9-9's macOS segment by name, its option 1); the Windows confirm-per-use pat
   panic (`crates/server/src/grant_signature.rs`, 10 tests). The golden test was red until the vector was re-signed over
   the exact encoding, since the first vector was signed before the target gained its length prefix.
 
-### A-290 — A submit off its green's shard asks for its verdict only once its work's route is committed (A-255 under A-247; 2026-11-17, g231, landing W1)
+### A-298 — A submit off its green's shard asks for its verdict only once its work's route is committed (A-255 under A-247; 2026-11-17, g231, landing W1)
 Applied in the same change to: §4.16 (Submission), A-247's rule ("A submit's route"), A-255's rule (the record plane's
 gate), `crates/server/src/work_home.rs` (`Need::Route`, `route_committed`, `await_route`, `routes_placed`,
 `AWAITED_ROUTE`), `crates/server/src/merge_service.rs` (`next_merge_work` runs `routes_placed`; the gate's comment),
 `crates/server/src/fleet.rs` (`catalog_committed`'s reading), `crates/server/src/verbs.rs` (`judge_submission` names
-its `SealedWork`'s work in the record), the test below, GAPS.
+its `SealedWork`'s work in the record), the test below, GAPS. Named A-290 in the branch commits that built it
+(agents/g231-000-clients-loadtest-w1 9dfccacd4), a number another goal holds; renumbered before it reached main.
 
 - **What was wrong.** A-255 (built on main 2026-11-09, without W1) ships a version's merge record, which carries the
   submit's completion, only once the submitting work's catalog register is committed, because after a takeover that
