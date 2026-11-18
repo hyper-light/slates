@@ -388,6 +388,9 @@ pub struct Client {
   /// Async `changed_since` answers, by the public word their caller awaits: each walks the answer's pages as a chain,
   /// as a listing does.
   changed_chains: std::collections::BTreeMap<u64, ChangedChain>,
+  /// Async submits and rebases, by the public word their caller awaits (A-267): a conflicting verdict whose reply
+  /// counted windows it could not carry walks the rest as a chain, as a listing does.
+  verdict_chains: std::collections::BTreeMap<u64, VerdictChain>,
   /// Derived: the outstanding operations admitted — the command ring's slots, the client's in-flight
   /// bound (the same bound the retryable set keeps).
   awaited_cap: usize,
@@ -579,6 +582,176 @@ impl ChangedChain {
   /// The answer: every path taken, in path order, each once.
   fn into_paths(self) -> Vec<String> {
     self.paths.into_iter().collect()
+  }
+}
+
+/// A submit's or a rebase's conflicting verdict walked page by page (§4.16, A-267): its reply carries the first windows
+/// and counts the rest, which the work keeps under the verdict's id; the walk reads them, synchronously
+/// ([`Client::submit_with_evidence`], [`Client::rebase`]) or as a chain of requests under the call's one word
+/// ([`Client::submit_begin`], [`Client::rebase_begin`]), so a caller is handed every window either way.
+#[derive(Debug)]
+struct VerdictChain {
+  work: VolumeId,
+  /// Which verb's outcome the walk ends in.
+  kind: VerdictKind,
+  /// Whether the verdict's own reply came, naming the verdict.
+  started: bool,
+  /// The verdict, once its reply named it.
+  verdict: u64,
+  windows: Vec<MergeWindow>,
+  /// The windows the verdict holds: those its reply carried and those it counted.
+  total: usize,
+}
+
+/// Which verb a [`VerdictChain`] answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VerdictKind {
+  Submit,
+  Rebase,
+}
+
+/// What a submit or a rebase ends in, before it is the verb's own type.
+enum VerdictOutcome {
+  Submitted(Submitted),
+  Rebased(Rebased),
+}
+
+impl VerdictChain {
+  /// A walk of `work`'s `kind` verdict, before its reply.
+  fn new(work: VolumeId, kind: VerdictKind) -> VerdictChain {
+    VerdictChain {
+      work,
+      kind,
+      started: false,
+      verdict: 0,
+      windows: Vec::new(),
+      total: 0,
+    }
+  }
+
+  /// Takes the verdict's reply, then each page of its windows: the outcome once every window is taken, else `None`,
+  /// the next page to ask for being [`VerdictChain::request`]. A page that brings no window while more are owed, that
+  /// names a position other than the windows taken, or that ends short of or past the verdict's count, is refused, so
+  /// a walk always ends.
+  fn take(&mut self, body: ReplyBody) -> Result<Option<VerdictOutcome>, ClientError> {
+    if !self.started {
+      return self.take_verdict(body);
+    }
+    let ReplyBody::Conflicts { windows, next } = resolved(body)? else {
+      return Err(ClientError::UnexpectedReply { verb: "conflicts" });
+    };
+    let before = self.windows.len();
+    self.windows.extend(windows);
+    let taken = self.windows.len();
+    match next {
+      Some(next) if taken > before && taken < self.total && usize::try_from(next) == Ok(taken) => {
+        Ok(None)
+      }
+      None if taken == self.total => Ok(Some(
+        self.kind.conflicted(std::mem::take(&mut self.windows)),
+      )),
+      _ => Err(ClientError::UnexpectedReply { verb: "conflicts" }),
+    }
+  }
+
+  /// The verdict's own reply: its outcome, or `None` when it counted windows it could not carry.
+  fn take_verdict(&mut self, body: ReplyBody) -> Result<Option<VerdictOutcome>, ClientError> {
+    let verb = self.kind.verb();
+    let (version, conflicts, elided, verdict) = match (self.kind, resolved(body)?) {
+      (
+        VerdictKind::Submit,
+        ReplyBody::Submitted {
+          version,
+          conflicts,
+          conflicts_elided,
+          verdict,
+        },
+      )
+      | (
+        VerdictKind::Rebase,
+        ReplyBody::Rebased {
+          version,
+          conflicts,
+          conflicts_elided,
+          verdict,
+        },
+      ) => (version, conflicts, conflicts_elided, verdict),
+      (
+        VerdictKind::Submit,
+        ReplyBody::MergeApprovalRequired {
+          identity, paths, ..
+        },
+      ) => {
+        return Ok(Some(VerdictOutcome::Submitted(
+          Submitted::ApprovalRequired { identity, paths },
+        )));
+      }
+      _ => return Err(ClientError::UnexpectedReply { verb }),
+    };
+    if let Some(version) = version {
+      return Ok(Some(self.kind.accepted(version)));
+    }
+    if elided == 0 {
+      return Ok(Some(self.kind.conflicted(conflicts)));
+    }
+    self.total = usize::try_from(elided)
+      .ok()
+      .and_then(|elided| conflicts.len().checked_add(elided))
+      .ok_or(ClientError::UnexpectedReply { verb })?;
+    self.started = true;
+    self.verdict = verdict;
+    self.windows = conflicts;
+    Ok(None)
+  }
+
+  /// The request for the next page: from the windows taken so far.
+  fn request(&self) -> RequestBody {
+    RequestBody::Conflicts {
+      work: self.work,
+      verdict: self.verdict,
+      from: u32::try_from(self.windows.len()).unwrap_or(u32::MAX),
+    }
+  }
+}
+
+impl VerdictKind {
+  fn verb(self) -> &'static str {
+    match self {
+      VerdictKind::Submit => "submit",
+      VerdictKind::Rebase => "rebase",
+    }
+  }
+
+  fn accepted(self, version: u64) -> VerdictOutcome {
+    match self {
+      VerdictKind::Submit => VerdictOutcome::Submitted(Submitted::Accepted(version)),
+      VerdictKind::Rebase => VerdictOutcome::Rebased(Rebased::Rebased(version)),
+    }
+  }
+
+  fn conflicted(self, windows: Vec<MergeWindow>) -> VerdictOutcome {
+    match self {
+      VerdictKind::Submit => VerdictOutcome::Submitted(Submitted::Conflict(windows)),
+      VerdictKind::Rebase => VerdictOutcome::Rebased(Rebased::Conflict(windows)),
+    }
+  }
+}
+
+impl VerdictOutcome {
+  /// The submit's outcome, or a typed mismatch for a rebase's.
+  fn submitted(self) -> Result<Submitted, ClientError> {
+    match self {
+      VerdictOutcome::Submitted(outcome) => Ok(outcome),
+      VerdictOutcome::Rebased(_) => Err(ClientError::UnexpectedReply { verb: "submit" }),
+    }
+  }
+
+  /// The rebase's outcome, or a typed mismatch for a submit's.
+  fn rebased(self) -> Result<Rebased, ClientError> {
+    match self {
+      VerdictOutcome::Rebased(outcome) => Ok(outcome),
+      VerdictOutcome::Submitted(_) => Err(ClientError::UnexpectedReply { verb: "rebase" }),
+    }
   }
 }
 
@@ -1003,24 +1176,6 @@ fn extract_read(body: ReplyBody) -> Result<Vec<u8>, ClientError> {
   }
 }
 
-/// Extracts a submit's outcome from its reply — accepted at a version, or a conflict with windows —
-/// or a typed mismatch. The same rule the sync [`Client::submit`] applies.
-fn extract_submitted(body: ReplyBody) -> Result<Submitted, ClientError> {
-  match body {
-    ReplyBody::Submitted {
-      version: Some(v), ..
-    } => Ok(Submitted::Accepted(v)),
-    ReplyBody::Submitted {
-      version: None,
-      conflicts,
-    } => Ok(Submitted::Conflict(conflicts)),
-    ReplyBody::MergeApprovalRequired {
-      identity, paths, ..
-    } => Ok(Submitted::ApprovalRequired { identity, paths }),
-    _ => Err(ClientError::UnexpectedReply { verb: "submit" }),
-  }
-}
-
 /// Extracts a green's head version from its reply, or a typed mismatch.
 fn extract_versions(body: ReplyBody) -> Result<u64, ClientError> {
   match body {
@@ -1030,20 +1185,6 @@ fn extract_versions(body: ReplyBody) -> Result<u64, ClientError> {
 }
 
 /// Extracts the changed-paths list from its reply, or a typed mismatch.
-/// Extracts a rebase's outcome — rebased onto a version, or a conflict — or a typed mismatch.
-fn extract_rebased(body: ReplyBody) -> Result<Rebased, ClientError> {
-  match body {
-    ReplyBody::Rebased {
-      version: Some(v), ..
-    } => Ok(Rebased::Rebased(v)),
-    ReplyBody::Rebased {
-      version: None,
-      conflicts,
-    } => Ok(Rebased::Conflict(conflicts)),
-    _ => Err(ClientError::UnexpectedReply { verb: "rebase" }),
-  }
-}
-
 /// Confirms a namespace declaration's reply, or a typed mismatch (yields `true`, the unit sentinel).
 fn extract_declared(body: ReplyBody) -> Result<bool, ClientError> {
   match body {
@@ -1252,6 +1393,7 @@ impl Client {
       chain_steps: std::collections::BTreeMap::new(),
       list_chains: std::collections::BTreeMap::new(),
       changed_chains: std::collections::BTreeMap::new(),
+      verdict_chains: std::collections::BTreeMap::new(),
       awaited_cap: unpublished_cap,
       unawaited_dropped: 0,
       attest_in_flight: None,
@@ -2278,6 +2420,7 @@ impl Client {
     if self.edit_chains.remove(&word).is_some()
       || self.list_chains.remove(&word).is_some()
       || self.changed_chains.remove(&word).is_some()
+      || self.verdict_chains.remove(&word).is_some()
     {
       let steps: Vec<u64> = self
         .chain_steps
@@ -2307,6 +2450,7 @@ impl Client {
       .chain(self.edit_chains.keys().copied())
       .chain(self.list_chains.keys().copied())
       .chain(self.changed_chains.keys().copied())
+      .chain(self.verdict_chains.keys().copied())
       .collect::<std::collections::BTreeSet<u64>>()
       .into_iter()
       .collect()
@@ -2348,6 +2492,7 @@ impl Client {
       // A page taken as a raw reply ends its walk: the caller has the page, and nothing waits on the chain.
       self.list_chains.remove(&word);
       self.changed_chains.remove(&word);
+      self.verdict_chains.remove(&word);
       self.note_reply(word, &body, true);
       return resolved(body).map(Some);
     }
@@ -2357,6 +2502,7 @@ impl Client {
         self.awaited.remove(&word);
         self.list_chains.remove(&word);
         self.changed_chains.remove(&word);
+        self.verdict_chains.remove(&word);
         self.note_reply(word, &body, true);
         return resolved(body).map(Some);
       }
@@ -2937,10 +3083,15 @@ impl Client {
     work: VolumeId,
     evidence: &[[u8; 32]],
   ) -> Result<RequestId, ClientError> {
-    self.begin(&RequestBody::Submit {
+    let id = self.begin(&RequestBody::Submit {
       work,
       evidence: evidence.to_vec(),
-    })
+    })?;
+    // Its verdict may count windows its reply could not carry, read as a chain under this word (A-267).
+    self
+      .verdict_chains
+      .insert(id.word(), VerdictChain::new(work, VerdictKind::Submit));
+    Ok(id)
   }
 
   /// Begins an advance of a green attachment (§4.16), returning its request id.
@@ -2999,12 +3150,80 @@ impl Client {
     id: RequestId,
     spin_ns: u64,
   ) -> Result<Option<Submitted>, ClientError> {
-    self.spin_as(id, spin_ns, extract_submitted)
+    self
+      .verdict_spin(id.word(), spin_ns)?
+      .map(VerdictOutcome::submitted)
+      .transpose()
   }
 
-  /// Takes a submit's outcome by id word once the completion fd signals.
+  /// Takes a submit's outcome by id word once the completion fd signals: every conflict window, a verdict's reply that
+  /// counted windows it could not carry sending the next page's request under the same word (A-267).
   pub fn submit_poll(&mut self, word: u64) -> Result<Option<Submitted>, ClientError> {
-    self.poll_as(word, extract_submitted)
+    self
+      .verdict_poll(word)?
+      .map(VerdictOutcome::submitted)
+      .transpose()
+  }
+
+  /// A verdict walk's outcome within `spin_ns` ([`VerdictChain`]).
+  fn verdict_spin(
+    &mut self,
+    word: u64,
+    spin_ns: u64,
+  ) -> Result<Option<VerdictOutcome>, ClientError> {
+    let started = Instant::now();
+    loop {
+      if let Some(body) = self.take_held(word)? {
+        return self.advance_verdict(word, body);
+      }
+      if elapsed_ns(started) >= spin_ns {
+        return Ok(None);
+      }
+      std::hint::spin_loop();
+    }
+  }
+
+  /// A verdict walk's outcome once the completion fd signals ([`VerdictChain`]).
+  fn verdict_poll(&mut self, word: u64) -> Result<Option<VerdictOutcome>, ClientError> {
+    match self.take_held(word)? {
+      Some(body) => self.advance_verdict(word, body),
+      None => Ok(None),
+    }
+  }
+
+  /// Advances the verdict walk `word` by one reply: its outcome once every window is taken, else `None` with the next
+  /// page's request sent under the walk's word.
+  fn advance_verdict(
+    &mut self,
+    word: u64,
+    body: ReplyBody,
+  ) -> Result<Option<VerdictOutcome>, ClientError> {
+    let Some(chain) = self.verdict_chains.get_mut(&word) else {
+      return Err(ClientError::UnexpectedReply { verb: "submit" });
+    };
+    match chain.take(body) {
+      Ok(Some(outcome)) => {
+        self.verdict_chains.remove(&word);
+        Ok(Some(outcome))
+      }
+      Ok(None) => {
+        let request = chain.request();
+        match self.begin(&request) {
+          Ok(id) => {
+            self.chain_steps.insert(id.word(), word);
+            Ok(None)
+          }
+          Err(e) => {
+            self.verdict_chains.remove(&word);
+            Err(e)
+          }
+        }
+      }
+      Err(e) => {
+        self.verdict_chains.remove(&word);
+        Err(e)
+      }
+    }
   }
 
   /// Begins a versions query on a green, returning its request id.
@@ -3104,7 +3323,12 @@ impl Client {
 
   /// Begins a rebase of a work volume, returning its request id.
   pub fn rebase_begin(&mut self, work: VolumeId) -> Result<RequestId, ClientError> {
-    self.begin(&RequestBody::Rebase { work })
+    let id = self.begin(&RequestBody::Rebase { work })?;
+    // Its verdict may count windows its reply could not carry, read as a chain under this word (A-267).
+    self
+      .verdict_chains
+      .insert(id.word(), VerdictChain::new(work, VerdictKind::Rebase));
+    Ok(id)
   }
 
   /// Takes a rebase's outcome within `spin_ns`.
@@ -3113,12 +3337,19 @@ impl Client {
     id: RequestId,
     spin_ns: u64,
   ) -> Result<Option<Rebased>, ClientError> {
-    self.spin_as(id, spin_ns, extract_rebased)
+    self
+      .verdict_spin(id.word(), spin_ns)?
+      .map(VerdictOutcome::rebased)
+      .transpose()
   }
 
-  /// Takes a rebase's outcome by id word once the completion fd signals.
+  /// Takes a rebase's outcome by id word once the completion fd signals: every conflict window, as
+  /// [`Client::submit_poll`] reads them (A-267).
   pub fn rebase_poll(&mut self, word: u64) -> Result<Option<Rebased>, ClientError> {
-    self.poll_as(word, extract_rebased)
+    self
+      .verdict_poll(word)?
+      .map(VerdictOutcome::rebased)
+      .transpose()
   }
 
   /// Begins a namespace declaration on a work volume, returning its request id. The `WorkOp` is the
@@ -3736,21 +3967,30 @@ impl Client {
     work: VolumeId,
     evidence: &[[u8; 32]],
   ) -> Result<Submitted, ClientError> {
-    match self.call(&RequestBody::Submit {
+    let reply = self.call(&RequestBody::Submit {
       work,
       evidence: evidence.to_vec(),
-    })? {
-      ReplyBody::Submitted {
-        version: Some(v), ..
-      } => Ok(Submitted::Accepted(v)),
-      ReplyBody::Submitted {
-        version: None,
-        conflicts,
-      } => Ok(Submitted::Conflict(conflicts)),
-      ReplyBody::MergeApprovalRequired {
-        identity, paths, ..
-      } => Ok(Submitted::ApprovalRequired { identity, paths }),
-      _ => Err(ClientError::UnexpectedReply { verb: "submit" }),
+    })?;
+    self
+      .verdict_of(work, VerdictKind::Submit, reply)?
+      .submitted()
+  }
+
+  /// A submit's or a rebase's reply as its outcome, every conflict window read (A-267): past what the reply carried, a
+  /// page at a time from the work, which keeps the verdict.
+  fn verdict_of(
+    &mut self,
+    work: VolumeId,
+    kind: VerdictKind,
+    reply: ReplyBody,
+  ) -> Result<VerdictOutcome, ClientError> {
+    let mut chain = VerdictChain::new(work, kind);
+    let mut reply = reply;
+    loop {
+      if let Some(outcome) = chain.take(reply)? {
+        return Ok(outcome);
+      }
+      reply = self.call(&chain.request())?;
     }
   }
 
@@ -3764,12 +4004,15 @@ impl Client {
     identity: [u8; 32],
     proof: [u8; 32],
   ) -> Result<Submitted, ClientError> {
-    extract_submitted(self.call(&RequestBody::SubmitApproved {
+    let reply = self.call(&RequestBody::SubmitApproved {
       work,
       evidence: evidence.to_vec(),
       identity,
       proof,
-    })?)
+    })?;
+    self
+      .verdict_of(work, VerdictKind::Submit, reply)?
+      .submitted()
   }
 
   /// Edits a work volume and submits it, in one request (§4.16, A-225): exactly [`Client::edit`] and then, when the
@@ -3802,37 +4045,18 @@ impl Client {
       let token = self.stage(work, bytes)?;
       request(slates_ipc::protocol::EditBytes::Staged { token })
     };
-    match self.call(&request)? {
-      ReplyBody::Submitted {
-        version: Some(v), ..
-      } => Ok(Submitted::Accepted(v)),
-      ReplyBody::Submitted {
-        version: None,
-        conflicts,
-      } => Ok(Submitted::Conflict(conflicts)),
-      ReplyBody::MergeApprovalRequired {
-        identity, paths, ..
-      } => Ok(Submitted::ApprovalRequired { identity, paths }),
-      _ => Err(ClientError::UnexpectedReply {
-        verb: "edit_and_submit",
-      }),
-    }
+    let reply = self.call(&request)?;
+    self
+      .verdict_of(work, VerdictKind::Submit, reply)?
+      .submitted()
   }
 
   /// Rebases a work volume onto its green's head (§4.16): its pending operations are mapped forward,
   /// moving the work's base without committing to the green — the head version it now sits on, or the
   /// conflict windows to resolve first.
   pub fn rebase(&mut self, work: VolumeId) -> Result<Rebased, ClientError> {
-    match self.call(&RequestBody::Rebase { work })? {
-      ReplyBody::Rebased {
-        version: Some(v), ..
-      } => Ok(Rebased::Rebased(v)),
-      ReplyBody::Rebased {
-        version: None,
-        conflicts,
-      } => Ok(Rebased::Conflict(conflicts)),
-      _ => Err(ClientError::UnexpectedReply { verb: "rebase" }),
-    }
+    let reply = self.call(&RequestBody::Rebase { work })?;
+    self.verdict_of(work, VerdictKind::Rebase, reply)?.rebased()
   }
 
   /// Clones a snapshot into a new volume; the clone's id.

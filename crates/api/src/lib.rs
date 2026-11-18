@@ -130,8 +130,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// `Instance::drift` reads every entry (the same day). 11: a list a verb's own reply carries counts what one reply could
 /// not hold (A-267): `Instance::rewitness` answers `Rewitnessed { paths, paths_elided }`, `Stale::Disk` carries
 /// `elided`, `LandingReport` carries `degraded_elided`, and a presentation is clean only when it carries and counts no
-/// conflict (the same day).
-pub const CONTRACT: u32 = 11;
+/// conflict (the same day). 12: `Stale::Verdict`, a merge's or a rebase's conflict windows read after the work's verdict
+/// was replaced; `merge` and `rebase` answer every window of a verdict however many (A-267) (the same day).
+pub const CONTRACT: u32 = 12;
 
 /// What a rewitness did (§4.15 `rewitness`): the paths one reply holds and the count of the rest (A-267).
 pub use slates_client::Rewitnessed;

@@ -954,6 +954,18 @@ pub enum RequestBody {
     /// The position to read from: 0 to begin, else the previous page's `next`.
     from: u64,
   },
+  /// One page of a work's last conflicting verdict (§4.16, A-267): the windows of the submit's or the rebase's verdict
+  /// `verdict` named, from position `from`, as many as one reply chunk holds. The work keeps the verdict until its next
+  /// submit or rebase; a verdict no longer kept is refused `VerdictReplaced`. Served on the work's owner. A read; never
+  /// recorded. Appended.
+  Conflicts {
+    /// The work volume.
+    work: VolumeId,
+    /// The verdict, as its `Submitted` or `Rebased` named it.
+    verdict: u64,
+    /// The position to read from: the windows the verdict's reply carried, then each page's `next`.
+    from: u32,
+  },
 }
 
 /// The bytes an [`RequestBody::EditSubmit`] inserts (A-225): carried in the request, or, for an edit larger than one
@@ -1599,6 +1611,7 @@ impl RequestBody {
       | RequestBody::Destroy { volume }
       | RequestBody::Status { volume }
       | RequestBody::Drifted { volume, .. }
+      | RequestBody::Conflicts { work: volume, .. }
       | RequestBody::ReadBase { volume, .. }
       | RequestBody::Digest { volume, .. }
       | RequestBody::Rewitness { volume, .. }
@@ -1712,6 +1725,8 @@ impl RequestBody {
     matches!(
       self,
       RequestBody::Status { .. }
+        | RequestBody::Drifted { .. }
+        | RequestBody::Conflicts { .. }
         | RequestBody::Versions { .. }
         | RequestBody::ChangedSince { .. }
         | RequestBody::Read { .. }
@@ -3444,6 +3459,12 @@ pub enum Refusal {
     /// The policy's version now.
     current: u64,
   },
+  /// A `Conflicts` read named a verdict the work no longer keeps (A-267): a later submit or rebase of the work replaced
+  /// it, or the daemon that judged it restarted. Submit or rebase again for a new verdict. Appended.
+  VerdictReplaced {
+    /// The work volume.
+    work: VolumeId,
+  },
 }
 
 /// Why recovery could not rebuild a volume its catalog holds ([`Refusal::NotRecovered`], §4.8). Append-only.
@@ -3603,15 +3624,24 @@ pub enum ReplyBody {
   Submitted {
     /// The committed green version, when the increment was accepted; `None` on conflict.
     version: Option<u64>,
-    /// The conflict windows to rebase against, when not accepted.
+    /// The conflict windows to rebase against, when not accepted: as many as one reply holds (§4.3; A-267).
     conflicts: Vec<MergeWindow>,
+    /// Conflict windows past what one reply holds (A-267): the work keeps its verdict, and `Conflicts` reads every
+    /// window of it a page at a time.
+    conflicts_elided: u32,
+    /// The verdict the windows are of, kept with the work for `Conflicts`; 0 when there is none.
+    verdict: u64,
   },
   /// A work volume was rebased onto its green's head (§4.16). The green is unchanged.
   Rebased {
     /// The head the work is now based on, when every operation mapped cleanly; `None` on conflict.
     version: Option<u64>,
-    /// The conflict windows to resolve, when the rebase did not complete.
+    /// The conflict windows to resolve, when the rebase did not complete: as many as one reply holds (A-267).
     conflicts: Vec<MergeWindow>,
+    /// Conflict windows past what one reply holds (A-267), read with `Conflicts`.
+    conflicts_elided: u32,
+    /// The verdict the windows are of, kept with the work for `Conflicts`; 0 when there is none.
+    verdict: u64,
   },
   /// Cloned.
   Cloned {
@@ -3990,6 +4020,13 @@ pub enum ReplyBody {
     /// Entries in this page's range too long for any page alone (a host path near Linux's `PATH_MAX`), passed over
     /// and counted, never sent as a reply no chunk holds.
     oversized: u32,
+  },
+  /// One page of a work's kept verdict (`Conflicts`, A-267): its windows in the verdict's order. Appended.
+  Conflicts {
+    /// The windows of this page.
+    windows: Vec<MergeWindow>,
+    /// The position the next page reads from, or `None` when this page ends the verdict.
+    next: Option<u32>,
   },
 }
 

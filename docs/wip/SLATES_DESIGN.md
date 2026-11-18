@@ -22316,5 +22316,14 @@ dimension was read from its history), GAPS, `docs/bugs/2026-11-08-a-status-with-
   the status reply. The client, the CLI, MCP, both SDKs and `slates-api` carry the counts (`CONTRACT` = 11:
   `Rewitnessed`, `Stale::Disk::elided`, `LandingReport::degraded_elided`; a presentation is clean only when it carries
   and counts no conflict).
-- **Still to come under A-267:** the conflict windows of `Submitted` and `Rebased`, kept with the work and paged from
-  it, so the client hands back every window.
+- **A merge verdict's windows (2026-11-17, goal g247):** `Submitted` and `Rebased` carried every conflict window and
+  were refused at 400 (`crates/server/tests/verdict_pages.rs`), so a work in conflict learned nothing of what to
+  resolve. A work needs every window, not a count, so the work keeps its last conflicting verdict
+  (`WorkState::verdict`, `KeptVerdict`: every window under an id, the shard's monotonic clock past the work's last),
+  the reply carries the windows one reply holds with `conflicts_elided` and the `verdict` id, and `Conflicts { work,
+  verdict, from }` reads the rest a page at a time; the next submit or rebase replaces the verdict, a successful one
+  clears it, a restart forgets it, and a read of one no longer kept is refused `VerdictReplaced`. Its windows are the
+  work's own operations' conflicts, bounded by the journal the merge budget charges. The client walks them,
+  synchronously and as a chain under the call's word (`VerdictChain`), so `Submitted::Conflict` and
+  `Rebased::Conflict` hold every window and no consumer changed; `slates-api` maps `VerdictReplaced` to
+  `Stale::Verdict` (`CONTRACT` = 12).

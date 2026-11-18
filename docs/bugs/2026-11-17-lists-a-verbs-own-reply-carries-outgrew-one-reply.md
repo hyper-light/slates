@@ -64,6 +64,7 @@ A-267's first part bounded a status's drift; these four ride in the reply of a v
   encoding (its attachment and its length prefix, twelve bytes more), so 400 mounts at paths of two to four bytes
   outgrew the status reply. `mounts_of` now counts each mount's encoding. Reproduced by use
   (`a_status_with_more_mounts_than_its_budget_holds_is_answered`).
-- `Submitted` and `Rebased` carry a verdict's conflict windows the same way, refused at 400 windows by the same test's
-  first form. They need every window, not a count, since a work resolves each, so they are kept with the work and paged
-  from it (next, A-267).
+- **`Submitted` and `Rebased`**, fixed in the change after this one: a verdict's conflict windows, refused at 400
+  windows by the same test's first form. A work needs every window, not a count, since it resolves each, so the work
+  keeps its verdict, `Conflicts` pages it, and the client hands back every window
+  (`crates/server/tests/verdict_pages.rs`).

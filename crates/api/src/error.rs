@@ -334,6 +334,12 @@ pub enum Stale {
     /// The policy's version now.
     current: u64,
   },
+  /// A merge's or a rebase's conflict windows were read after the work's verdict was replaced — by a later submit or
+  /// rebase of the work, or the daemon's restart (A-267): merge or rebase again for a new verdict.
+  Verdict {
+    /// The work volume.
+    work: VolumeId,
+  },
 }
 
 /// Why a call is refused for now.
@@ -700,6 +706,7 @@ impl Error {
       Refusal::AttachmentExpired { attachment } => Error::Stale(Stale::Attachment { attachment }),
       Refusal::GrantMismatch => Error::Stale(Stale::Approval),
       Refusal::PolicyChanged { current } => Error::Stale(Stale::Policy { current }),
+      Refusal::VerdictReplaced { work } => Error::Stale(Stale::Verdict { work }),
       Refusal::GrantInvalid => Error::Stale(Stale::Grant),
       Refusal::LandingConflict {
         entries,

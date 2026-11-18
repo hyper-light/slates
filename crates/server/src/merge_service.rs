@@ -2869,6 +2869,8 @@ pub(crate) fn serve_awaiting(
     let reply = ReplyBody::Submitted {
       version: Some(version),
       conflicts: Vec::new(),
+      conflicts_elided: 0,
+      verdict: 0,
     };
     state.db.begin();
     let recorded = crate::verbs::record_completion(state, origin, id, reply);
@@ -2944,6 +2946,8 @@ fn resolve_accepted(state: &mut ShardState, object: ObjectId, placed: u64) {
     let reply = ReplyBody::Submitted {
       version: Some(version),
       conflicts: Vec::new(),
+      conflicts_elided: 0,
+      verdict: 0,
     };
     for entry in waiting {
       state

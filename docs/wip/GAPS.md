@@ -338,8 +338,11 @@
 >   showing the count. Siblings fixed the same way: a finished landing's degraded cells (`degraded_elided`; one a
 >   directory where the host refuses a directory's sync) and a status's mounts, whose budget counted paths alone
 >   (`docs/bugs/2026-11-17-lists-a-verbs-own-reply-carries-outgrew-one-reply.md`).
-> - **Still open, the same one-reply shape:** the conflict windows of `Submitted` and `Rebased` (reproduced: refused at
->   400 windows). Owed: kept with the work and paged from it, the client handing back every window.
+> - **A merge verdict's windows: fixed (A-267, 2026-11-17, goal g247).** `Submitted` and `Rebased` were refused at 400
+>   windows. The work keeps its last conflicting verdict, the reply carries what fits with `conflicts_elided` and its
+>   `verdict` id, `Conflicts` reads the rest, and the client hands back every window, sync and async; a replaced or
+>   forgotten verdict is refused `VerdictReplaced`. **Open:** a verdict is kept in memory alone, so a restart between a
+>   conflicting submit and its walk answers `VerdictReplaced`, and the caller submits again.
 
 > **A version appended before its owner restarted never committed: fixed (2026-11-07, §4.16 Commit, AUD-11;
 > A-246).** A restarted owner rebuilt its greens from their chains, but not the merge records

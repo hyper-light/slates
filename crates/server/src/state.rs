@@ -1047,6 +1047,21 @@ pub struct WorkState {
   /// The bytes this work is charged against the shard's budget: its content's and journal's footprint
   /// (`crate::work_charge`), released when it shrinks, resets or is destroyed.
   pub charged: u64,
+  /// The work's last conflicting verdict (§4.16, A-267), kept for `Conflicts` until its next submit or rebase replaces
+  /// it, and cleared when one succeeds. Its windows are conflicts of the work's own declared operations, so their
+  /// number is bounded by the journal the merge budget charges; a restart forgets it, and a read of it is then refused
+  /// `VerdictReplaced`.
+  pub verdict: Option<KeptVerdict>,
+}
+
+/// A work's kept conflicting verdict (§4.16, A-267): its id, which the `Submitted` or `Rebased` reply named, and every
+/// window of it, in the verdict's order.
+#[derive(Clone, Debug)]
+pub struct KeptVerdict {
+  /// The verdict's id: the shard's monotonic clock when it was judged, and past the work's last.
+  pub id: u64,
+  /// Every window of the verdict.
+  pub windows: Vec<slates_ipc::protocol::MergeWindow>,
 }
 
 /// A reply waiting to be written into a client's ring.

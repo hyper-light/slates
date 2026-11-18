@@ -4046,6 +4046,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::NotShared { .. } => "not_shared",
     Refusal::PolicyForbids { .. } => "policy_forbids",
     Refusal::PolicyChanged { .. } => "policy_changed",
+    Refusal::VerdictReplaced { .. } => "verdict_replaced",
     Refusal::ImageRefused { .. } => "image_refused",
     Refusal::NotRootLeader => "not_root_leader",
     Refusal::ConsensusNotInitialized => "consensus_not_initialized",
@@ -4438,6 +4439,11 @@ fn dispatch_inner(
     RequestBody::Destroy { volume } => destroy(state, principal, volume),
     RequestBody::Status { volume } => status(state, principal, volume),
     RequestBody::Drifted { volume, from } => drifted(state, principal, volume, from),
+    RequestBody::Conflicts {
+      work,
+      verdict,
+      from,
+    } => conflicts(state, principal, work, verdict, from),
     RequestBody::List { after } => list_page(vec![list_part(state, principal, after)]),
     RequestBody::DaemonStatus => {
       let mine = shard_report(state);
@@ -6618,6 +6624,7 @@ fn create_work(
       files: crate::work_files::WorkFiles::default(),
       revision: 0,
       charged,
+      verdict: None,
     },
   );
   // Its catalog register, which names its green, is the route a resend of its submit takes after a takeover, and its
@@ -7235,6 +7242,72 @@ fn build_increment(
   ))
 }
 
+/// Keeps a conflicting verdict with its work (§4.16, A-267): every window, under a fresh id, until the work's next
+/// submit or rebase. Returns what the verdict's reply carries in `room` bytes — the first windows, the count of the
+/// rest, which `Conflicts` reads, and the id it reads them by. The id is the shard's monotonic clock, kept past the
+/// work's last, so a verdict replaced (or a daemon restarted, which keeps none) never answers for another.
+fn keep_verdict(
+  state: &mut ShardState,
+  work_id: DbVolumeId,
+  windows: Vec<slates_ipc::protocol::MergeWindow>,
+  room: usize,
+) -> (Vec<slates_ipc::protocol::MergeWindow>, u32, u64) {
+  let now = state.clock.monotonic_ns();
+  let Some(work) = state.works.get_mut(&work_id) else {
+    // No work to keep it with (it cannot happen inside the verb that judged it): carry what fits, read nothing more.
+    let (carried, elided) = carried(windows, room);
+    return (carried, elided, 0);
+  };
+  let id = now.max(
+    work
+      .verdict
+      .as_ref()
+      .map_or(1, |kept| kept.id.saturating_add(1)),
+  );
+  let (carried, elided) = carried(windows.clone(), room);
+  work.verdict = Some(crate::state::KeptVerdict { id, windows });
+  (carried, elided, id)
+}
+
+/// `Conflicts`: one page of a work's kept verdict from position `from` (§4.16, A-267), as many windows as one reply
+/// holds, in the verdict's order. A verdict the work no longer keeps — replaced by a later submit or rebase, cleared by
+/// one that succeeded, or forgotten by a restart — is refused `VerdictReplaced`. A window always fits a page alone: a
+/// work's path arrives in a request, whose framing is larger than a page's (as A-264's changed paths).
+fn conflicts(
+  state: &mut ShardState,
+  principal: &Principal,
+  work: VolumeId,
+  verdict: u64,
+  from: u32,
+) -> ReplyBody {
+  let work_id = match crate::merge_service::require_work(state, principal, work, false, "conflicts")
+  {
+    Ok((record, _)) => record.id,
+    Err(refusal) => return refused(refusal),
+  };
+  let Some(kept) = state
+    .works
+    .get(&work_id)
+    .and_then(|w| w.verdict.as_ref())
+    .filter(|kept| verdict != 0 && kept.id == verdict)
+  else {
+    return refused(Refusal::VerdictReplaced { work });
+  };
+  let room = reply_room(&ReplyBody::Conflicts {
+    windows: Vec::new(),
+    next: Some(u32::MAX),
+  });
+  let start = usize::try_from(from).unwrap_or(usize::MAX);
+  let rest = kept.windows.get(start..).unwrap_or_default();
+  let (windows, more) = fitting(rest.iter().cloned(), room);
+  let next = if more {
+    u32::try_from(start.saturating_add(windows.len())).ok()
+  } else {
+    None
+  };
+  ReplyBody::Conflicts { windows, next }
+}
+
 /// The conflict windows of a merge outcome, as the wire's [`MergeWindow`](slates_ipc::protocol::MergeWindow)s.
 fn merge_windows(
   windows: &[slates_merge::engine::ConflictWindow],
@@ -7521,14 +7594,26 @@ fn submit(
       ReplyBody::Submitted {
         version: Some(version),
         conflicts: Vec::new(),
+        conflicts_elided: 0,
+        verdict: 0,
       }
     }
     slates_merge::engine::Outcome::Conflict { windows } => {
       // The work is not reset: the bound secured for a reset is released.
       settle_after_conflict(state, green_id, &inc.id);
+      let room = reply_room(&ReplyBody::Submitted {
+        version: None,
+        conflicts: Vec::new(),
+        conflicts_elided: 0,
+        verdict: u64::MAX,
+      });
+      let (conflicts, conflicts_elided, verdict) =
+        keep_verdict(state, work_id, merge_windows(&windows), room);
       ReplyBody::Submitted {
         version: None,
-        conflicts: merge_windows(&windows),
+        conflicts,
+        conflicts_elided,
+        verdict,
       }
     }
     // A base below the green's checkpoint (W3) is no live reader's, so it is unknown: never judged, and nothing
@@ -7618,6 +7703,8 @@ fn reset_accepted_work(state: &mut ShardState, work_id: DbVolumeId, version: u64
   w.journal.clear();
   w.files.clear();
   w.revision = w.revision.wrapping_add(1);
+  // Accepted: no conflicting verdict stands, so a read of an earlier one is refused (A-267).
+  w.verdict = None;
   // The recount of what it now keeps: nothing, so the charge only falls and cannot be refused.
   let kept = crate::work_charge::footprint(&w.files, &w.journal);
   let _ = crate::work_charge::set_to(state, work_id, kept);
@@ -7689,6 +7776,8 @@ fn rebase(state: &mut ShardState, principal: &Principal, work: VolumeId) -> Repl
         w.base_version = version;
         w.journal = journal;
         w.revision = w.revision.wrapping_add(1);
+        // Rebased: no conflicting verdict stands (A-267).
+        w.verdict = None;
       }
       // The work's base rose, so the reachable floor may have: fold the green's histories to it and
       // credit the retention released (a settle after a rise only credits).
@@ -7696,12 +7785,26 @@ fn rebase(state: &mut ShardState, principal: &Principal, work: VolumeId) -> Repl
       ReplyBody::Rebased {
         version: Some(version),
         conflicts: Vec::new(),
+        conflicts_elided: 0,
+        verdict: 0,
       }
     }
-    slates_merge::engine::Rebased::Conflict { windows } => ReplyBody::Rebased {
-      version: None,
-      conflicts: merge_windows(&windows),
-    },
+    slates_merge::engine::Rebased::Conflict { windows } => {
+      let room = reply_room(&ReplyBody::Rebased {
+        version: None,
+        conflicts: Vec::new(),
+        conflicts_elided: 0,
+        verdict: u64::MAX,
+      });
+      let (conflicts, conflicts_elided, verdict) =
+        keep_verdict(state, work_id, merge_windows(&windows), room);
+      ReplyBody::Rebased {
+        version: None,
+        conflicts,
+        conflicts_elided,
+        verdict,
+      }
+    }
     // A base below the green's checkpoint (W3): unknown, as the submit answers it.
     slates_merge::engine::Rebased::BaseUnavailable { base, .. } => refused(Refusal::UnknownBase {
       green: to_wire_volume(green_id),
@@ -10599,6 +10702,8 @@ fn record_taken_over_completions(
         ReplyBody::Submitted {
           version: Some(version),
           conflicts: Vec::new(),
+          conflicts_elided: 0,
+          verdict: 0,
         },
         work,
       );
@@ -12901,6 +13006,7 @@ fn rebuild_work(state: &mut ShardState, record: &VolumeRecord, green: DbVolumeId
       files,
       revision: 0,
       charged,
+      verdict: None,
     },
   );
 }
