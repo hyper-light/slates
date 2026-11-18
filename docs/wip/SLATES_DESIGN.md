@@ -31843,7 +31843,10 @@ Applied in the same change to: §2.5 (the graceful stop's status), §4.14 (a sta
   at the ceiling), `a_wedged_daemon_is_found_lapsed_though_the_anchors_own_looks_run_twice_a_window_late` (the loop's
   replay with every look two windows late: found after the bound, within the lateness of it) and
   `the_loop_waits_at_most_its_gap_and_finds_a_lapse_at_the_budgets_end`, in `crates/api/src/role/anchor.rs`.
-- EVIDENCE_A467
+- **Evidence.** Built and run on the Mac Studio (kiln r386, 2026-11-18, load 5.5-6.0, debug build): `cargo test
+  --locked -p slates-api --lib -- role::anchor` 12 of 12 (one ignored, the held process's role). Red-checked once with
+  the old rule, the bound uncapped and the wait half the bound: the runaway reading held the bound at 3,601 s where the
+  ceiling is 10 s, and the replay with every look two windows late never found the wedged daemon lapsed.
 
 Applied in the same change to: §4.14 (a status block on `daemon.alive`), GAPS (the `LIVENESS_BUDGET_NS` entry),
 `crates/api/src/role/anchor.rs`.
