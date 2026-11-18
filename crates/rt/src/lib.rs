@@ -38,6 +38,8 @@
 
 mod attribution;
 pub mod control;
+/// DIAG (diag-g251-spin, never main).
+pub mod diag_site;
 pub mod driver;
 pub mod error;
 pub mod futures;

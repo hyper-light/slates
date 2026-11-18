@@ -701,6 +701,9 @@ fn run(
       .position(|found| found.is_some_and(|(_, verdict)| !verdict.beats()));
     let stuck = stuck_at.and_then(|index| verdicts.get(index).copied().flatten());
     let turn = decide(supervision, stuck, control_ended, stopping);
+    if let Some(index) = stuck_at {
+      diag_spin::dump(holders, index, now);
+    }
     if let Turn::End(cause) = turn {
       turns.looked(stuck.is_some());
       let verdict_late_ns = stuck_at
@@ -2059,6 +2062,127 @@ mod tests {
           stalled && may_wait_on_memory,
           "{stall}, {thread}"
         );
+      }
+    }
+  }
+}
+
+/// DIAG (diag-g251-spin, never main): what every shard was doing at a stuck verdict, and the stuck shard's stack.
+mod diag_spin {
+  use std::sync::atomic::{AtomicU64, Ordering};
+
+  use slates_rt::SlotHolder;
+
+  /// Backtraces the handler has written.
+  static WRITTEN: AtomicU64 = AtomicU64::new(0);
+  /// Whether the dump has run once.
+  static DUMPED: AtomicU64 = AtomicU64::new(0);
+
+  #[cfg(unix)]
+  fn write_stderr(text: &str) {
+    // SAFETY: fd 2 and a live buffer of its length.
+    let _ = unsafe { libc::write(2, text.as_ptr().cast(), text.len()) };
+  }
+
+  #[cfg(not(unix))]
+  fn write_stderr(text: &str) {
+    use std::io::Write;
+    let _ = std::io::stderr().write_all(text.as_bytes());
+  }
+
+  #[cfg(target_os = "linux")]
+  extern "C" fn handler(_signal: libc::c_int) {
+    let trace = std::backtrace::Backtrace::force_capture();
+    let text =
+      format!("DIAG backtrace of the stuck shard's thread:\n{trace}\nDIAG backtrace end\n");
+    write_stderr(&text);
+    WRITTEN.fetch_add(1, Ordering::SeqCst);
+  }
+
+  #[cfg(target_os = "linux")]
+  fn install_and_signal(tid: u64) {
+    // SAFETY: a zeroed sigaction with a handler of the right signature; SIGUSR2 is unused by the daemon.
+    unsafe {
+      let mut action: libc::sigaction = std::mem::zeroed();
+      action.sa_sigaction = handler as extern "C" fn(libc::c_int) as usize;
+      action.sa_flags = libc::SA_RESTART;
+      libc::sigemptyset(&mut action.sa_mask);
+      libc::sigaction(libc::SIGUSR2, &action, std::ptr::null_mut());
+    }
+    for sample in 0..3u64 {
+      let before = WRITTEN.load(Ordering::SeqCst);
+      // SAFETY: tgkill to a thread of this process.
+      let _ = unsafe {
+        libc::syscall(
+          libc::SYS_tgkill,
+          libc::getpid(),
+          libc::pid_t::try_from(tid).unwrap_or(0),
+          libc::SIGUSR2,
+        )
+      };
+      let began = std::time::Instant::now();
+      while WRITTEN.load(Ordering::SeqCst) == before
+        && began.elapsed() < std::time::Duration::from_millis(1500)
+      {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+      }
+      write_stderr(&format!(
+        "DIAG sample {sample}: written {}\n",
+        WRITTEN.load(Ordering::SeqCst)
+      ));
+      std::thread::sleep(std::time::Duration::from_millis(150));
+    }
+  }
+
+  #[cfg(not(target_os = "linux"))]
+  fn install_and_signal(_tid: u64) {}
+
+  fn proc_line(tid: u64, name: &str) -> String {
+    std::fs::read_to_string(format!("/proc/self/task/{tid}/{name}"))
+      .unwrap_or_default()
+      .trim()
+      .to_owned()
+  }
+
+  pub(super) fn dump(holders: &[SlotHolder], stuck: usize, now_ns: u64) {
+    if DUMPED.swap(1, Ordering::SeqCst) != 0 {
+      return;
+    }
+    let mut stuck_tid = None;
+    for (index, holder) in holders.iter().enumerate() {
+      let words = slates_rt::registry::diag_pulse_words(*holder);
+      let site = slates_rt::registry::diag_site_name(*holder);
+      let tid = slates_rt::registry::diag_shard_tid(*holder);
+      let cpu = slates_rt::registry::shard_cpu(*holder);
+      let (stat, wchan, status) = tid.map_or_else(Default::default, |tid| {
+        (
+          proc_line(tid, "stat"),
+          proc_line(tid, "wchan"),
+          proc_line(tid, "status"),
+        )
+      });
+      let switches: Vec<&str> = status
+        .lines()
+        .filter(|line| line.contains("ctxt_switches"))
+        .collect();
+      write_stderr(&format!(
+        "DIAG shard {} (index {index}{}): pulse [steps, waits, spawns, completed, longest_ns, polling slot+1, poll_began_ns, phase, full_turns, overrun_ns] = {words:?}; task site {site:?}; cpu {cpu:?}; watchdog now {now_ns}; tid {tid:?}; stat {stat:?}; wchan {wchan:?}; {switches:?}\n",
+        holder.shard(),
+        if index == stuck { ", STUCK" } else { "" },
+      ));
+      if index == stuck {
+        stuck_tid = tid;
+      }
+    }
+    if let Some(tid) = stuck_tid {
+      install_and_signal(tid);
+      for (index, holder) in holders.iter().enumerate() {
+        let words = slates_rt::registry::diag_pulse_words(*holder);
+        write_stderr(&format!(
+          "DIAG after samples, shard index {index}: pulse {words:?}; task site {:?}; cpu {:?}\n",
+          slates_rt::registry::diag_site_name(*holder),
+          slates_rt::registry::shard_cpu(*holder)
+        ));
       }
     }
   }

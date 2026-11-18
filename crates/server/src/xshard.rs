@@ -129,12 +129,14 @@ pub fn run_on(
     state::with_state_counted(work);
     return Ok(());
   }
-  let task = SpawnRequest::new(
+  let site = slates_rt::diag_site::intern(std::any::type_name_of_val(&work));
+  let mut task = SpawnRequest::new(
     Box::pin(async move {
       state::with_state_counted(work);
     }),
     None,
   );
+  task.diag_site = site;
   registry::send_control(shard, Control::Spawn(Box::new(task)))
 }
 
@@ -535,12 +537,14 @@ pub fn run_on_waiting(
     state::with_state_counted(work);
     return;
   }
-  let task = SpawnRequest::new(
+  let site = slates_rt::diag_site::intern(std::any::type_name_of_val(&work));
+  let mut task = SpawnRequest::new(
     Box::pin(async move {
       state::with_state_counted(work);
     }),
     None,
   );
+  task.diag_site = site;
   if carry(shard, Control::Spawn(Box::new(task))).is_err() {
     state::with_state_counted(|s| s.count(refused, 1));
   }
@@ -710,7 +714,8 @@ pub fn call_on<T: Send + 'static>(
     });
   }
   let id = register();
-  let task = SpawnRequest::new(
+  let site = slates_rt::diag_site::intern(std::any::type_name_of_val(&work));
+  let mut task = SpawnRequest::new(
     Box::pin(async move {
       let result = work();
       let back = SpawnRequest::new(
@@ -723,6 +728,7 @@ pub fn call_on<T: Send + 'static>(
     }),
     None,
   );
+  task.diag_site = site;
   match registry::send_control(shard, Control::Spawn(Box::new(task))) {
     Ok(()) => Ok(CrossShardCall {
       target: shard,
@@ -768,7 +774,8 @@ pub async fn call_within_room<T: Send + 'static>(
   }
   let started = slates_rt::futures::now_ns();
   let id = register();
-  let task = SpawnRequest::new(
+  let site = slates_rt::diag_site::intern(std::any::type_name_of_val(&work));
+  let mut task = SpawnRequest::new(
     Box::pin(async move {
       let result = state::with_state(work);
       let back = SpawnRequest::new(
@@ -781,6 +788,7 @@ pub async fn call_within_room<T: Send + 'static>(
     }),
     None,
   );
+  task.diag_site = site;
   if !given_room_within(shard, Control::Spawn(Box::new(task)), deadline_ns).await {
     forget(id);
     return None;

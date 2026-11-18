@@ -149,9 +149,61 @@ pub struct Pulse {
   /// The shard's idle spin window (`ShardContext::counters`' `idle_window_ns`), mirrored beside the wake estimate
   /// it may be priced on, so a reader on another thread can tell whether the window follows the estimate (A-223).
   idle_window_ns: AtomicU64,
+  /// DIAG (diag-g251-spin, never main): the slot polled now, plus one; 0 between polls.
+  diag_polling: AtomicU64,
+  /// DIAG: when the current poll began, the shard's clock.
+  diag_poll_began_ns: AtomicU64,
+  /// DIAG: the loop's phase: 1 step, 2 idle spin, 3 idle slice, 4 park, 5 full-ring wait.
+  diag_phase: AtomicU64,
+  /// DIAG: turns a send spent waiting on a full ring, cumulative.
+  diag_full_turns: AtomicU64,
+  /// DIAG: the polled task's site number (`crate::diag_site`).
+  diag_site: AtomicU64,
 }
 
 impl Pulse {
+  /// DIAG: the poll now (slot plus one, 0 for none) and when it began.
+  pub fn diag_polling(&self, slot_plus_one: u64, at_ns: u64) {
+    self.diag_polling.store(slot_plus_one, Ordering::Relaxed);
+    self.diag_poll_began_ns.store(at_ns, Ordering::Relaxed);
+  }
+
+  /// DIAG: the loop's phase now.
+  pub fn diag_phase(&self, phase: u64) {
+    self.diag_phase.store(phase, Ordering::Relaxed);
+  }
+
+  /// DIAG: the polled task's site number.
+  pub fn diag_site(&self, site: u64) {
+    self.diag_site.store(site, Ordering::Relaxed);
+  }
+
+  /// DIAG: the polled task's site, named.
+  pub fn diag_site_name(&self) -> &'static str {
+    crate::diag_site::name(self.diag_site.load(Ordering::Relaxed))
+  }
+
+  /// DIAG: one more turn waiting on a full ring.
+  pub fn diag_full_turn(&self) {
+    self.diag_full_turns.fetch_add(1, Ordering::Relaxed);
+  }
+
+  /// DIAG: every word, for the watchdog's dump.
+  pub fn diag_words(&self) -> [u64; 10] {
+    [
+      self.steps.load(Ordering::Relaxed),
+      self.waits.load(Ordering::Relaxed),
+      self.spawns.load(Ordering::Relaxed),
+      self.completed.load(Ordering::Relaxed),
+      self.longest_step_ns.load(Ordering::Relaxed),
+      self.diag_polling.load(Ordering::Relaxed),
+      self.diag_poll_began_ns.load(Ordering::Relaxed),
+      self.diag_phase.load(Ordering::Relaxed),
+      self.diag_full_turns.load(Ordering::Relaxed),
+      self.scheduler_overrun_ns.load(Ordering::Relaxed),
+    ]
+  }
+
   /// The owning shard mirrors its measured scheduler overrun after folding a wait into it.
   pub fn record_scheduler_overrun(&self, overrun_ns: u64) {
     self
@@ -766,6 +818,32 @@ pub fn shard_run_readings(holders: &[SlotHolder]) -> Vec<Option<crate::thread_cl
       (shard, _) => shard,
     })
     .collect()
+}
+
+/// DIAG (diag-g251-spin, never main): the pulse's words of the shard `holder` names.
+pub fn diag_pulse_words(holder: SlotHolder) -> Option<[u64; 10]> {
+  with_entry(holder.shard, |entry| {
+    (entry.holder() == holder).then(|| entry.pulse.diag_words())
+  })
+  .flatten()
+}
+
+/// DIAG (diag-g251-spin, never main): the site of the task the shard `holder` names polls now, or polled last.
+pub fn diag_site_name(holder: SlotHolder) -> Option<&'static str> {
+  with_entry(holder.shard, |entry| {
+    (entry.holder() == holder).then(|| entry.pulse.diag_site_name())
+  })
+  .flatten()
+}
+
+/// DIAG (diag-g251-spin, never main): the Linux thread id of the shard `holder` names.
+pub fn diag_shard_tid(holder: SlotHolder) -> Option<u64> {
+  with_entry(holder.shard, |entry| {
+    (entry.holder() == holder).then(|| entry.cpu_clock.load(Ordering::Acquire))
+  })
+  .flatten()
+  .filter(|handle| *handle != 0)
+  .and_then(crate::thread_clock::diag_tid)
 }
 
 /// The kernel function the shard `holder` names waits in, for a log line that names its wait (A-336): Linux's `wchan`;

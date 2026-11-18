@@ -735,6 +735,13 @@ impl ShardContext {
     self.with_inner(|inner| inner.driver.now_ns()).unwrap_or(0)
   }
 
+  /// DIAG (diag-g251-spin, never main): marks the loop's phase in the pulse.
+  fn diag_phase(&self, phase: u64) {
+    if let Some(entry) = self.entry {
+      entry.pulse.diag_phase(phase);
+    }
+  }
+
   /// Times a shard-pair ring was full and the sender spun.
   pub fn pair_full_events(&self) -> u64 {
     self.pair_full_events.get()
@@ -796,6 +803,9 @@ impl ShardContext {
   /// rings would otherwise each wait for the other to drain, for good), then yield. Skipped when the
   /// state is borrowed (a wake from inside a borrow): the next turn drains.
   fn drain_while_waiting(&self) {
+    if let Some(entry) = self.entry {
+      entry.pulse.diag_full_turn();
+    }
     let _ = self.with_inner(|inner| self.drain_inbound(inner));
     // The poll waits for its peer here, not on the CPU: the window marks it (`attribution`).
     self.update_attribution(Tracker::yielded_in_poll);
@@ -811,8 +821,10 @@ impl ShardContext {
       future,
       parent,
       receipt,
+      diag_site,
     } = request;
     let parent = parent.filter(|p| p.shard() == self.id).map(|p| p.slot());
+    crate::diag_site::set_next(diag_site);
     let admitted = self.admit(future, parent, false);
     receipt.answer(match &admitted {
       Ok(task) => Admission::Admitted(*task),
@@ -1221,6 +1233,7 @@ impl ShardContext {
     // `park` every loop) pays nothing for it.
     let mut last_wait_ns = self.now_ns();
     loop {
+      self.diag_phase(1);
       let outcome = self.step();
       if outcome.exit {
         // The slot's next holder starts its task generations past this shard's (slot reuse), and a
@@ -1237,14 +1250,17 @@ impl ShardContext {
         }
         continue;
       }
+      self.diag_phase(2);
       if self.spin_after_activity(outcome.next_deadline_ns) {
         continue;
       }
       // Idle: one slice of the registered idle work, then the loop looks for work again; it parks once the idle
       // work has none left (§4.2, "the shard schedules a pre-fault task on its idle time").
+      self.diag_phase(3);
       if self.idle_slice() {
         continue;
       }
+      self.diag_phase(4);
       self.park(outcome.next_deadline_ns);
       last_wait_ns = self.now_ns();
     }
@@ -1864,7 +1880,9 @@ impl ShardContext {
           future,
           parent,
           receipt,
+          diag_site,
         } = *request;
+        crate::diag_site::set_next(diag_site);
         if inner.shutting_down {
           // A shard shutting down admits nothing new — its arena drains to empty and the loop exits
           // — so the request is refused unadmitted: its receipt answered, its future dropped here.
@@ -1951,8 +1969,25 @@ impl ShardContext {
     let mut cx = Context::from_waker(&waker);
     self.current_task.set(Some(slot));
     let start = self.now_ns();
+    if let Some(entry) = self.entry {
+      let site = self
+        .with_inner(|inner| {
+          handle_at(&inner.arena, slot)
+            .and_then(|handle| inner.arena.get(handle).ok())
+            .map(|task| task.diag_site)
+        })
+        .flatten()
+        .unwrap_or(0);
+      entry
+        .pulse
+        .diag_polling(u64::from(slot).saturating_add(1), start);
+      entry.pulse.diag_site(site);
+    }
     let poll = future.as_mut().poll(&mut cx);
     let ended = self.now_ns();
+    if let Some(entry) = self.entry {
+      entry.pulse.diag_polling(0, ended);
+    }
     self.current_task.set(None);
     let done = matches!(poll, Poll::Ready(()));
     let attributed = self.attribute_poll(start, ended);

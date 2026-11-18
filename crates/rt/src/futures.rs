@@ -74,6 +74,7 @@ pub fn current_task() -> Option<TaskId> {
 
 /// Spawns a joinable task on the current shard with no parent.
 pub fn spawn<F: Future<Output = ()> + 'static>(future: F) -> Result<TaskId, RtError> {
+  crate::diag_site::set_next(crate::diag_site::intern(std::any::type_name::<F>()));
   registry::with_current(|ctx| ctx.spawn_local(boxed(future), None))
     .ok_or(RtError::NotOnShardThread)?
 }
@@ -82,11 +83,13 @@ pub fn spawn<F: Future<Output = ()> + 'static>(future: F) -> Result<TaskId, RtEr
 /// meanwhile, and each of its yields still ends a step (`ShardContext::spawn_alone`). A daemon's shard start, whose
 /// recovery yields between slices while nothing else may yet reach the shard's state, is the use.
 pub fn spawn_alone<F: Future<Output = ()> + 'static>(future: F) -> Result<TaskId, RtError> {
+  crate::diag_site::set_next(crate::diag_site::intern(std::any::type_name::<F>()));
   registry::with_current(|ctx| ctx.spawn_alone(boxed(future))).ok_or(RtError::NotOnShardThread)?
 }
 
 /// Spawns a joinable child of the current task; a parent's completion cancels and joins it.
 pub fn spawn_child<F: Future<Output = ()> + 'static>(future: F) -> Result<TaskId, RtError> {
+  crate::diag_site::set_next(crate::diag_site::intern(std::any::type_name::<F>()));
   registry::with_current(|ctx| {
     let parent = ctx.current_task().map(|t| t.0.slot());
     ctx.spawn_local(boxed(future), parent)

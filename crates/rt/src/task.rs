@@ -37,10 +37,13 @@ pub struct SpawnRequest {
   pub parent: Option<Encoded>,
   /// The receipt to answer at admission; none for a fire-and-forget submission.
   pub receipt: ReceiptSlot,
+  /// DIAG (diag-g251-spin): the caller's site number.
+  pub diag_site: u64,
 }
 
 impl SpawnRequest {
   /// A request whose admission nobody reads.
+  #[track_caller]
   pub fn new(
     future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
     parent: Option<Encoded>,
@@ -49,10 +52,12 @@ impl SpawnRequest {
       future,
       parent,
       receipt: ReceiptSlot::none(),
+      diag_site: crate::diag_site::intern_location(std::panic::Location::caller()),
     }
   }
 
   /// A request whose admission the submitter reads: the request, and the receipt it answers.
+  #[track_caller]
   pub fn with_receipt(
     future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
     parent: Option<Encoded>,
@@ -63,6 +68,7 @@ impl SpawnRequest {
         future,
         parent,
         receipt: slot,
+        diag_site: crate::diag_site::intern_location(std::panic::Location::caller()),
       },
       receipt,
     )
@@ -223,6 +229,8 @@ pub struct TaskSlot {
   pub long_steps: u32,
   /// The longest poll by the wall clock, in nanoseconds.
   pub longest_step_ns: u64,
+  /// DIAG (diag-g251-spin): the task's site number.
+  pub diag_site: u64,
 }
 
 impl TaskSlot {
@@ -243,6 +251,7 @@ impl TaskSlot {
       polls: 0,
       long_steps: 0,
       longest_step_ns: 0,
+      diag_site: crate::diag_site::take_next(),
     }
   }
 
