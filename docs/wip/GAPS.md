@@ -1086,7 +1086,7 @@
 > list` was refused "reply too large for the bulk area" from 100 volumes on a two-shard daemon, so an operator could not
 > list what a server holds. `List { after }` is now answered a page at a time, `Listed { volumes, next }`: volumes in id
 > order, a reply chunk's worth, each shard sending at most a page. The client walks the pages, sync and as an async
-> chain. A new volume's name is bounded so its summary fits one page and its status one reply (2,931 bytes since
+> chain. A new volume's name is bounded so its summary fits one page and its status one reply (2,896 bytes since
 > 2026-11-18, A-267; it was the page's 4,012, whose status was refused; `InvalidName` past it), and an unrecovered
 > volume's cause is cut to fit beside it; recorded, the cause is bounded (a base at `create`: 1,023 bytes on macOS, 3,812
 > on Linux and Windows; a reason at 256) so `status` names it whole. **Under load:** at load about 160 on this Mac (2026-11-09) creates
@@ -1135,7 +1135,7 @@
 >   (`docs/bugs/2026-11-17-lists-a-verbs-own-reply-carries-outgrew-one-reply.md`).
 > - **A name a status could not hold: fixed (A-263, A-267, 2026-11-18, goal g247).** A volume created under the
 >   listing's longest name (4,012 bytes) was listed and its status refused "reply too large". A name is now bounded by
->   the status at its widest on any host too, 2,931 bytes, and a status's mounts take no more than the room the rest of
+>   the status at its widest on any host too, 2,896 bytes (2,931 before A-332), and a status's mounts take no more than the room the rest of
 >   its report leaves (`docs/bugs/2026-11-18-a-volume-under-the-longest-name-could-not-be-statused.md`).
 > - **Every reply list, swept (2026-11-18, goal g247).** Every list a reply carries is paged, carried with a count,
 >   or bounded by a closed set (the transports, a landing's action counts) or a consensus group's voters; telemetry

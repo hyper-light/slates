@@ -43,7 +43,8 @@ before A-263 a create took names up to 4,062 bytes, with the same result.
   fact at `HOST_FACT_BYTES` (255, macOS's `uname` field less its NUL; a fact past it is now cut at a character
   boundary), and the entries of whichever situation encodes widest (`every_situation`: each platform, each listener,
   each right), each entry refused with a reason. Another build differs only in its guest entries, by a reason at most.
-- The longest name a create accepts is now 2,931 bytes: `reply_bounds.rs` finds it by asking and `volume_list.rs`'s
+- The longest name a create accepts is now 2,896 bytes (2,931 until main's loss report gained a takeover past
+  tolerance, A-332, whose two shortfalls at their widest take 35 bytes; measured 2026-11-18): `reply_bounds.rs` finds it by asking and `volume_list.rs`'s
   `the_longest_name_a_create_carries_is_listed` agrees. It depends only on the wire's shapes, the chunk and
   `HOST_FACT_BYTES`, so it is the same on every host.
 

@@ -26619,7 +26619,7 @@ as a chain), `crates/server/tests/volume_list.rs`, `crates/cli/tests/cli.rs`, bo
 - **And a name bound:** a `create` carried names up to 4,062 bytes, whose summary no page held. A new volume's name is
   refused `InvalidName` past the longest whose summary one page holds alone (4,012 bytes, derived from the page's room
   with room for a recovery cause's fixed part), so every volume a client can create is one it can list. Since
-  2026-11-18 it is also no longer than a status holds beside its other fields at their widest, 2,931 bytes (A-267, "A
+  2026-11-18 it is also no longer than a status holds beside its other fields at their widest, 2,896 bytes (A-267, "A
   name every reply holds"). An unrecovered
   volume's cause (B8's `not_recovered`: a base's path, a host's refusal) is cut to what the page holds beside it; the
   record and `NotRecovered` keep it whole, a base path bounded at `create` by the platform's maximum and the refusal's
@@ -26800,7 +26800,8 @@ lists, the kept verdicts, `longest_name`, `widest_report`), `crates/vfs/src/base
   `a_volume_under_the_longest_name_a_create_accepts_is_listed_and_statused`). A name is now bounded by the lesser of
   the two (`longest_name`). The status's share is a chunk less `widest_unnamed_status`: every field at its widest, the
   host facts cut at `HOST_FACT_BYTES` (255, macOS's `uname` field), and the transports of the widest situation on any
-  platform, each entry refused with a reason (`transports::widest_report`). That is 2,931 bytes on every host. A
+  platform, each entry refused with a reason (`transports::widest_report`). That is 2,896 bytes on every host (2,931 before
+  A-332's takeover past tolerance joined the loss report). A
   status's mounts take no more than the room the rest of its report leaves, then its drift what is left
   (`docs/bugs/2026-11-18-a-volume-under-the-longest-name-could-not-be-statused.md`).
 - **The byte lists (2026-11-17, goal g247):** `read_base` read the whole base file into the daemon's memory and
