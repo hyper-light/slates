@@ -4599,9 +4599,11 @@ async fn init_shard(
     read_ahead: crate::verbs::ReadAheadLedger::default(),
     council_timing: slates_cluster::timing::ElectionTiming::floor(),
     root_timing: slates_cluster::timing::ElectionTiming::floor(),
-    failover: slates_cluster::failover::Failover::new(),
+    // Supervised by its anchor within the liveness window (A-405): the detection a node has before any peer judges it.
+    failover: slates_cluster::failover::Failover::new().supervised(LIVENESS_BUDGET_NS),
     failover_ns: crate::fleet::failover_in_periods(
       slates_cluster::failover::Failover::new()
+        .supervised(LIVENESS_BUDGET_NS)
         .estimate()
         .total_ns(),
     ),

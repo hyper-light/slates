@@ -673,6 +673,93 @@ fn a_winfsp_drive_handle_and_view_survive_twenty_killed_daemons() {
   }
 }
 
+/// Shape: the kills the unflushed-write flow makes, each after one write the daemon answered and before any flush.
+const UNFLUSHED_KILLS: u32 = 5;
+
+/// A-379 (A-358 on Windows; GAPS 2026-11-18, "a WinFsp write answered before its publication may be lost across a daemon
+/// kill"). Do: mount a volume writable at a drive; then, for each of [`UNFLUSHED_KILLS`] kills: create a new file through
+/// the drive, open unbuffered so its write reaches the daemon when it is made, and write its first page; kill the daemon
+/// before any flush or close, wait for its successor to hold the same drive, flush the handle (`FlushFileBuffers`) and
+/// read the page back uncached. Expect: each flush is refused, or it succeeds and the page reads back as written; never
+/// a flush that succeeds over a lost write. At least one flush must succeed with its write kept (the non-vacuity
+/// evidence). A new file's page is written past every length a publication holds. An overwrite inside a published
+/// length lands in place in anchor-owned memory (§4.8, an open extent) and survives without one: this test's first
+/// draft overwrote one page and kept 5 of 5 without the fix (diagnostics run 44354915582).
+#[test]
+fn a_write_answered_before_its_daemons_kill_is_kept_or_its_flush_refused() {
+  use std::os::windows::fs::OpenOptionsExt;
+  use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_NO_BUFFERING;
+  if !live_mount_runs() {
+    return;
+  }
+  let instance = instance("unflushed");
+  let _anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "unflushed", "--bounded", "64MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let hex = value_of(&out, "id");
+  let drive = free_drive_letter();
+  let (code, _, err) = run(&instance, &["mount", &hex, &drive]);
+  assert_eq!(code, 0, "mount: {err}");
+  let root = format!("{drive}\\");
+  wait_ready(&root);
+  let original = drive_target(&drive).expect("the mounted drive names a kernel volume");
+  let (mut kept, mut refused, mut lost) = (0u32, 0u32, Vec::new());
+  for iteration in 1..=UNFLUSHED_KILLS {
+    // Each daemon is killed once the anchor has judged it recovered (A-311), as in the takeover test.
+    let killed = recovered::await_recovered(&instance, &|_| true, POLL, RECOVERED_WAIT);
+    let fill = b'A' + u8::try_from(iteration).unwrap();
+    let handle = std::fs::OpenOptions::new()
+      .read(true)
+      .write(true)
+      .create_new(true)
+      .custom_flags(FILE_FLAG_NO_BUFFERING)
+      .open(format!("{root}unflushed-{iteration}.bin"))
+      .unwrap();
+    // Unbuffered, so the address and the length are sector-aligned and the write is the daemon's when it returns.
+    let page = SectorPage([fill; FILE_BYTES]);
+    assert_eq!(
+      handle.seek_write(&page.0, 0).unwrap(),
+      FILE_BYTES,
+      "the write before kill {iteration} was answered whole"
+    );
+    kill_daemon(killed);
+    wait_for_successor(&instance, &drive, &original, killed, iteration);
+    match handle.sync_all() {
+      Err(error) => {
+        refused += 1;
+        eprintln!("WINFSP UNFLUSHED: kill {iteration}: the flush was refused: {error}");
+      }
+      Ok(()) => {
+        let back = read_uncached_page(&handle).unwrap();
+        if back == vec![fill; FILE_BYTES] {
+          kept += 1;
+        } else {
+          lost.push(format!(
+            "kill {iteration}: the flush succeeded, then the page read {} bytes starting {:?}, not {fill}",
+            back.len(),
+            back.first()
+          ));
+        }
+      }
+    }
+  }
+  eprintln!(
+    "WINFSP UNFLUSHED: {UNFLUSHED_KILLS} kills: kept {kept}, flush refused {refused}, lost under a successful flush {}",
+    lost.len()
+  );
+  assert!(
+    lost.is_empty(),
+    "writes answered before their daemon's kill were lost while the next flush succeeded: {lost:?}"
+  );
+  assert!(
+    kept > 0,
+    "a flush after a kill succeeded with its write kept at least once"
+  );
+}
+
 /// A-198/A-158. Do: keep a view of a file open, rename it through the SDK, kill the daemon, then write the renamed
 /// file through the successor. Expect: the original view follows its file even though its old pathname is gone.
 #[test]
