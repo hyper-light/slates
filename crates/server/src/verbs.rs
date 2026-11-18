@@ -12968,11 +12968,12 @@ pub(crate) async fn rebuild_recovered(
   .await;
   rebuilt.blocks_swept = sweep_claims(state, claims);
   slices.unit_done().await;
-  // The writable copies the anchor held are taken back first, so every write the replay applies is written into them
-  // by the volume's write boundary (A-197).
-  #[cfg(target_os = "linux")]
+  // The objects the anchor held are taken back first, so every write the replay applies is written into them by the
+  // volume's write boundary: the writable direct maps' copies (A-197, Linux) and the Shards streams' DAX objects
+  // (A-365), in one ascending order of their backings' handles.
+  #[cfg(unix)]
   {
-    rebuilt.copies_adopted = crate::held_copy::adopt_inherited(state);
+    rebuilt.copies_adopted = crate::shards::dax_hold::adopt_inherited(state);
     slices.unit_done().await;
   }
   // The writes acknowledged after the last publication, a FUSE mount's (Linux) and a Shards stream's (Linux, macOS;

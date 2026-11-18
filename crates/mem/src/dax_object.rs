@@ -560,6 +560,23 @@ mod imp {
       })
     }
 
+    /// The object `fd` names, one [`DaxObject::create`] made in another process of this daemon's line (an anchor held it
+    /// across its maker's death, A-365), holding its file in `layout`, of which slates may map at most `most_views` pages
+    /// at once. Refused `NotADaxObject` unless `fd` is such an object: [`DAX_OBJECT_BYTES`] long, and on Linux a memfd
+    /// sealed against growing, shrinking and further seals, as one is made. Its placement in huge pages is not known
+    /// (that is the dead process's), so a placed page it holds is zeroed as any other is: the cost is a split page, never
+    /// a byte.
+    pub fn adopt(fd: OwnedFd, most_views: usize, layout: DaxLayout) -> Result<DaxObject, MemError> {
+      platform::check_adopted(&fd)?;
+      Ok(DaxObject {
+        fd,
+        layout,
+        views: BTreeMap::new(),
+        most_views,
+        placed: BTreeSet::new(),
+      })
+    }
+
     /// How the object lays out its file.
     #[must_use]
     pub fn layout(&self) -> DaxLayout {
@@ -1265,6 +1282,23 @@ mod imp {
       Ok(fd)
     }
 
+    /// Whether `fd` is an object [`create_object`] made: [`DAX_OBJECT_BYTES`] long, and sealed against growing,
+    /// shrinking and further seals. Refused `NotADaxObject` otherwise (A-365).
+    pub(super) fn check_adopted(fd: &OwnedFd) -> Result<(), MemError> {
+      let object_bytes = rustix::fs::fstat(fd)
+        .map(|stat| u64::try_from(stat.st_size).unwrap_or(0))
+        .unwrap_or(0);
+      let sealed = rustix::fs::fcntl_get_seals(fd).is_ok_and(|seals| {
+        seals.contains(
+          rustix::fs::SealFlags::GROW | rustix::fs::SealFlags::SHRINK | rustix::fs::SealFlags::SEAL,
+        )
+      });
+      if object_bytes != DAX_OBJECT_BYTES || !sealed {
+        return Err(MemError::NotADaxObject { object_bytes });
+      }
+      Ok(())
+    }
+
     /// Gives the whole pages `from .. to` of `view` back to the object, which then reads zeros there and holds no
     /// memory for them (`MADV_REMOVE` over a shared mapping punches the object's hole).
     pub(super) fn zero_pages(view: &mut RangeView, from: usize, to: usize) -> Result<(), MemError> {
@@ -1423,6 +1457,18 @@ mod imp {
       Ok(fd)
     }
 
+    /// Whether `fd` is an object [`create_object`] made: [`DAX_OBJECT_BYTES`] long. macOS seals nothing, and its object
+    /// was sized once, all it allows. Refused `NotADaxObject` otherwise (A-365).
+    pub(super) fn check_adopted(fd: &OwnedFd) -> Result<(), MemError> {
+      let object_bytes = rustix::fs::fstat(fd)
+        .map(|stat| u64::try_from(stat.st_size).unwrap_or(0))
+        .unwrap_or(0);
+      if object_bytes != DAX_OBJECT_BYTES {
+        return Err(MemError::NotADaxObject { object_bytes });
+      }
+      Ok(())
+    }
+
     /// Zeroes, among the whole pages `from .. to` of `view`, those that hold something: `mincore` marks them resident
     /// or paged out (a compressed or swapped page still holds its bytes). A page never touched stays untouched, so no
     /// memory is committed for it.
@@ -1508,6 +1554,11 @@ mod imp {
         call: "dax object",
         code: None,
       })
+    }
+
+    /// Never an object here: none is ever made.
+    pub(super) fn check_adopted(_fd: &OwnedFd) -> Result<(), MemError> {
+      Err(MemError::NotADaxObject { object_bytes: 0 })
     }
 
     /// Never reached: no object is ever created here.

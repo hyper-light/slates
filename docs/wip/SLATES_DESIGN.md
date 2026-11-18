@@ -4373,9 +4373,17 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
   device end rides beside the stream's in the socket route's confirmation; Windows hands none yet. The daemon's end is
   held by the anchor, as a FUSE device is, and the daemon keeps its own copy while the anchor holds one (A-339: XNU's
   collector of descriptors in flight flushes a socket whose every copy rides a message), with the token and the
-  stream's owner view as its session, updated when the guest names its owner, and released when the attachment ends or
-  its guest first maps a file with DAX (whose stores then live where only the device maps them).
-  A successor hands the device a fresh stream over it in a `Resync` naming the same token, and keeps its own copy of
+  stream's owner view as its session, updated when the guest names its owner, and released when the attachment ends.
+  A stream whose guest maps files with DAX keeps its resync (A-365): the anchor holds each file's DAX object before its
+  first descriptor goes to the device, and the shard's DAX range table in anchor RAM records each range answered and
+  whether it was asked writable, a slot a range, its slots derived from the fill budget; a refusal of either gives the
+  resync up, as a stream did at its first map before A-365, since the guest's stores live where only the device maps
+  them once the daemon is gone.
+  A successor takes the held DAX objects back while recovery rebuilds the shard, at the very handles their backings
+  had, dormant through the write log's replay (each already holds every write the dead daemon made to its ranges, in
+  order with its guest's stores), and its stream ingests their writable ranges before it serves anything, wakes them so
+  every change reaches them again, and answers the device's new asks with the same objects. It hands the device a fresh
+  stream over the channel in a `Resync` naming the same token, and keeps its own copy of
   the fresh end until the device shows it holds its own, by its first bytes on the stream or by its end of the channel
   closing, which the stream's task watches for meanwhile (A-339: the `Resync` waits in the device's channel until the
   device reads it, and a socket whose every copy rides a message is what macOS's collector flushes); the device takes
@@ -4517,6 +4525,16 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 > the stream's write log, the kept barrier reply, recovery keeping the stream, the replay, the successor's copy of the
 > fresh end (the end arrived flushed in 3 of 3 runs), the channel's watch, and the macOS daemon keeping its held
 > devices. Owed: the anchor holding a stream's DAX objects; Windows; and the siblings GAPS names.
+
+> **Status (2026-11-18, A-365, a stream's DAX maps outlive its daemon).** Built and proven by use on macOS (a Mac
+> Studio, kiln runs r3427 to r3489) and Linux. With the test as the anchor and the device: a stream's guest maps a file
+> with DAX and stores through the map without syncing; the anchor is given the file's object as the descriptor goes
+> out and the stream keeps its resync; across the daemon's death the successor takes the object back, the guest's
+> unsynced store reads back through another stream, the device's new ask is answered with the very object it maps (a
+> store through the old map reads back through the new one), and another stream's write after the resync reaches the
+> guest's map (`crates/server/tests/shards_resync_dax.rs`). The range table's codec and bounds, the held object's
+> record and `DaxObject::adopt`'s refusals have unit tests. Each of eight guards removed alone fails the restart test,
+> among them the dormancy through the replay, whose absence lost the guest's store. Owed: Windows (Shards' handle path).
 
 > **Status (2026-11-18, A-303, a VM's save and restore).** Built and proven by use. Over a real daemon, a guest's SAVE
 > is answered with tables and leaves the volume's newest snapshot; a fresh stream of a clone of that snapshot takes
@@ -26251,3 +26269,52 @@ Applied in the same change to:
 
 Applied in the same change to: GAPS (the model table and its toolchain note; the record half's entry), and the model
 files.
+
+### A-365 — A Shards stream's DAX maps outlive its daemon: the anchor holds each object, the shard's DAX range table records each answered range, and a successor takes the objects back, ingests their guest's unsynced stores and answers the device with the same objects (2026-11-18, built for goal g268, what Shards needs from slates; A-316's and A-339's owed DAX item)
+Applied in the same change to:
+- §4.6, the Shards form: the resync channel's bullet and a status of this date. GAPS: A-281's entry, its restart item.
+- `crates/mem`: `DaxObject::adopt` (a held object's descriptor checked as one `DaxObject::create` made: its size, and on
+  Linux its seals) and `MemError::NotADaxObject`; the test
+  `an_object_held_across_its_makers_end_is_adopted_and_nothing_else_is`.
+- `crates/vfs/src/shards_backing.rs`: `ShardsBackings::adopt_vmm` (a VMM's backing kept again at its exact handle,
+  dormant) and `wake`; `VmmRefusal`.
+- `crates/bridge-core/src/dax_backing.rs`: `Then::Resume`, `filled_charge`, `most_views` public, `pending_inode`,
+  `backing_of`, `adopt`.
+- `crates/server`: `config.rs` (`ShardContentLayout::dax_ranges`, `dax_range_slots`, `dax_range_table_bytes`; the
+  anchor's held-copy bound grown by the DAX backings a shard can hold); `dax_ranges.rs` (the range table and its unit
+  tests); `shards/dax_hold.rs` (the held object's record, the split of handed copies by kind, `keep`, `let_go`,
+  `adopt_inherited` in one ascending order with A-197's copies, `claim`, `let_go_every_unclaimed`, the counters
+  `shards.dax_hold_refused`, `shards.dax_adopted`, `shards.dax_adopt_refused`); `anchor_hold.rs` (held copies on every
+  Unix); `held_copy.rs` (`adopt_or_release`, `claim_deadline`); `daemon.rs` (the table opened beside the write log,
+  `ShardHolds::dax`); `verbs.rs` (the merged adoption before the replay); `shards.rs` (`ShardsStream::held_dax`,
+  `keep_resync_through_dax`, `Then::Resume`, a stream whose ingest is under way turns at once, the claim at adoption,
+  `shards.dax_adopted_unpublished`); `shards/dax.rs` (the answer keeps what a successor needs; a backing's end lets it
+  go). The test: `crates/server/tests/shards_resync_dax.rs`, a binary of its own.
+
+- **What was there.** A stream gave its resync up at its guest's first DAX map (A-316): the guest's stores through a map
+  live in an object only the device maps once its daemon is gone, and a successor knew nothing of it, so a DAX share
+  ended at a daemon's death.
+- **What a successor needs.** The object, which the anchor holds as it holds a writable copy (A-197): sent before the
+  first descriptor goes to the device, its id the backing's handle encoded with its partition, its record the
+  attachment and the inode under a tag of its own; released at the backing's end. And which ranges of it are the file's
+  and which the guest may have stored into: a range never filled reads zeros, which a comparison against the file would
+  take for the guest's stores, and macOS's shared-memory objects say nothing of which pages were touched. So each range
+  answered is recorded in the shard's DAX range table in anchor RAM, with whether it was asked writable, when the ask is
+  answered (never at the fill's start: a death mid-fill must not leave a half-filled range named filled). The table has
+  a slot for each range the shard's fill budget can count, since each filled range counts a range against it, so a slot
+  is always free; a table of another layout is cleared and started again, never misread.
+- **The successor.** Recovery takes each held object back at the very handle its backing had, in one ascending order
+  with A-197's copies (the registry's `insert_at` contract), for each stream it kept, and dormant: no write reaches it
+  until its stream takes it. The object already holds every write the dead daemon made to its ranges, in order with its
+  guest's stores, and the write log's replay runs between: kept awake, the replay wrote the logged write over the
+  guest's later store, and the store never reached the file (measured, the first run of the test). The stream's
+  adoption takes the objects into its session, wakes them, ingests their writable ranges before it serves anything
+  (its serve task turns at once while an ingest is under way), publishes, and answers the device's new asks with the
+  same objects, so the guest's maps stay right. An object no kept stream claims is let go, its ranges forgotten.
+- **Found beside it** (GAPS): A-197's writable copies are adopted awake before the replay, so a logged write a client's
+  store followed can be written over that store at a takeover, the same hazard; its tests do not write through another
+  path before the client's store.
+- **Evidence.** On a Mac Studio (kiln runs r3427 to r3489): the focused tests pass, the restart test among them, and the
+  existing stream DAX tests; each of eight guards removed alone fails the restart test (the dormancy, the hold, the
+  range's record, its writable mark, the adoption's ingest, the wake, the session's adoption, and the resync kept at a
+  DAX map). Linux: GitHub's ubuntu runner (run 44347232055).

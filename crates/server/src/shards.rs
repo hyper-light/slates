@@ -105,6 +105,9 @@ mod tables;
 // socket, macOS beside it on the socket route (A-339).
 #[cfg(unix)]
 mod resync;
+// A resyncable stream's DAX objects held by the anchor, and their adoption by a successor (A-365).
+#[cfg(unix)]
+pub(crate) mod dax_hold;
 
 pub use end::HandedEnd;
 use end::{DaemonEnd, Received, Sent};
@@ -119,6 +122,8 @@ pub(crate) enum Then {
   },
   /// The stream ends next.
   End,
+  /// The stream goes on: a resynced stream's adopted DAX objects were ingested before it served anything (A-365).
+  Resume,
 }
 
 /// A stream's finished ingest.
@@ -135,6 +140,9 @@ pub(crate) struct Done {
 /// Format: the refusal-ledger name of an ending stream's ingested writes that the publication after them did not
 /// capture: they reach the volume, and are made durable by the next publication.
 const END_UNPUBLISHED: &str = "shards.dax_end_unpublished";
+/// Format: the refusal-ledger name of a resynced stream's adopted DAX stores (A-365) that the publication after their
+/// ingest did not capture: they reach the volume, and are made durable by the next publication.
+const ADOPTED_UNPUBLISHED: &str = "shards.dax_adopted_unpublished";
 /// Format: the refusal-ledger name of a frame the protocol refuses (a length past the largest frame, a control frame
 /// with no ask): the stream that sent it is ended.
 const FRAME_REFUSED: &str = "shards.frame_refused";
@@ -197,8 +205,8 @@ const RESYNC_UNMADE: &str = "shards.resync_unmade";
 /// daemon's death, as before.
 #[cfg(unix)]
 const RESYNC_UNHELD: &str = "shards.resync_unheld";
-/// Counter: a stream that gave its resync up while it lived (A-316): its guest mapped a file with DAX, or the anchor
-/// refused the owner view's update.
+/// Counter: a stream that gave its resync up while it lived (A-316): the anchor refused to hold a DAX object its guest
+/// maps, or the range table to record its ranges (A-365), or the anchor refused the owner view's update.
 #[cfg(unix)]
 const RESYNC_GIVEN_UP: &str = "shards.resync_given_up";
 /// Counter: a stream served again on a fresh stream after its daemon's death, its device handed the fresh end over the
@@ -367,6 +375,10 @@ pub(crate) struct ShardsStream {
   /// ([`wait_for_work`]).
   #[cfg(unix)]
   fresh_copy: Option<HandedEnd>,
+  /// The DAX objects of this stream's backings the anchor holds (A-365; [`dax_hold`]), by inode: each its copy id, so its
+  /// backing's end releases it. Only a stream whose resync the anchor holds has any.
+  #[cfg(unix)]
+  held_dax: BTreeMap<u64, u64>,
 }
 
 impl ShardsStream {
@@ -413,6 +425,8 @@ impl ShardsStream {
       replay: None,
       #[cfg(unix)]
       fresh_copy: None,
+      #[cfg(unix)]
+      held_dax: BTreeMap::new(),
     }
   }
 }
@@ -623,10 +637,27 @@ pub(crate) fn attach(s: &mut ShardState, ask: ShardsAsk) -> Result<ShardsAttache
   })
 }
 
-/// Gives `stream`'s resync up once its guest maps a file with DAX (A-316; `dax::answer`), counted: the device reads its
-/// resync channel's end and knows its share ends at a daemon's death.
+/// Keeps `stream`'s resync through its guest's DAX map of `inode`, just answered (A-365; `dax::answer`): the anchor holds
+/// the object and the range table records its ranges ([`dax_hold::keep`]), so a successor can take them back. Where
+/// either is refused, or the answer names no file, the resync is given up instead ([`give_up_resync_for_dax`]). A stream
+/// whose resync no anchor holds keeps nothing.
+#[cfg(unix)]
+fn keep_resync_through_dax(s: &mut ShardState, stream: &mut ShardsStream, inode: Option<u64>) {
+  if !stream.resync.as_ref().is_some_and(resync::Resync::held) {
+    return;
+  }
+  if inode.is_some_and(|inode| dax_hold::keep(s, stream, inode)) {
+    return;
+  }
+  give_up_resync_for_dax(s, stream);
+}
+
+/// Gives `stream`'s resync up, counted, where its guest's DAX objects cannot be held for a successor (A-316, A-365): the
+/// device reads its resync channel's end and knows its share ends at a daemon's death, and every object the anchor held
+/// for it is let go.
 #[cfg(unix)]
 fn give_up_resync_for_dax(s: &mut ShardState, stream: &mut ShardsStream) {
+  dax_hold::let_go_all(s, stream);
   let Some(resync) = stream.resync.as_mut() else {
     return;
   };
@@ -1192,23 +1223,30 @@ fn abandoned(s: &mut ShardState, attachment: u64) {
 /// keeps its copy of the fresh end, the resync channel is watched beside it ([`wait_for_work`]).
 async fn serve(attachment: u64) {
   loop {
-    let Some(Some((stream, writing, watched))) = state::with_state(|s| {
+    let Some(Some((stream, writing, watched, busy))) = state::with_state(|s| {
       s.shards_streams.get(&attachment).map(|stream| {
         (
           end::raw(&stream.stream),
           stream.sent < stream.owed,
           watched(stream),
+          // An ingest under way turns at once: a resynced stream's adopted objects are ingested before anything is read
+          // (A-365), whether or not its device has sent anything yet.
+          stream.dax.ingesting(),
         )
       })
     }) else {
       return;
     };
-    let ready = match wait_for_work(stream, writing, watched).await {
-      Woke::Stream(ready) => ready,
-      Woke::Channel => {
-        #[cfg(unix)]
-        let _ = state::with_state_counted(|s| abandoned(s, attachment));
-        continue;
+    let ready = if busy {
+      Ok(())
+    } else {
+      match wait_for_work(stream, writing, watched).await {
+        Woke::Stream(ready) => ready,
+        Woke::Channel => {
+          #[cfg(unix)]
+          let _ = state::with_state_counted(|s| abandoned(s, attachment));
+          continue;
+        }
       }
     };
     if ready.is_err() {
@@ -1565,6 +1603,16 @@ fn ingest_turn(s: &mut ShardState, stream: &mut ShardsStream) -> Turned {
         s.count(END_UNPUBLISHED, 1);
       }
       Turned::Ended
+    }
+    // A resynced stream's adopted objects are in the file (A-365): published, so they outlive a second death, before
+    // the stream reads anything.
+    Then::Resume => {
+      if done.wrote
+        && !crate::verbs::publish_shard(s).is_ok_and(|published| published.captured(stream.volume))
+      {
+        s.count(ADOPTED_UNPUBLISHED, 1);
+      }
+      Turned::Served
     }
   }
 }
@@ -2321,6 +2369,8 @@ pub(crate) fn adopt_held() {
   for (record, held) in kept {
     let _ = state::with_state_counted(move |s| adopt_one(s, record, held));
   }
+  // Every DAX object recovery kept for a stream no adoption took is let go (A-365).
+  let _ = state::with_state_counted(dax_hold::let_go_every_unclaimed);
 }
 
 /// Serves `record`, a Shards attachment its dead daemon served, again on a fresh stream, then hands its device the fresh
@@ -2368,6 +2418,8 @@ fn adopt_one(s: &mut ShardState, record: AttachmentRecord, held: crate::fuse_hol
     end: Some(held.device),
   });
   stream.replay = s.recovered_replies.remove(&attachment);
+  // Its DAX objects recovery kept, taken into its session and ingested before it serves anything (A-365).
+  let _ingesting = dax_hold::claim(s, &mut stream);
   s.shards_streams.insert(attachment, stream);
   if futures::spawn(serve(attachment))
     .and_then(futures::detach)
