@@ -269,7 +269,8 @@ pub(crate) struct HeldHead {
   identity: [u8; 32],
 }
 
-/// Holds again, after a warm restart, the copies a recovered image kept ([`held_copies`]), each with its fence.
+/// Holds again, after a warm restart, the copies a recovered image kept (`RecoveredHeld`'s live copies, in
+/// [`crate::content_holder::restore_held_registers`]), each with its fence.
 pub(crate) fn restore_copies(state: &mut ShardState, copies: Vec<HeldLive>) {
   for copy in copies {
     let object = ObjectId(copy.object);
