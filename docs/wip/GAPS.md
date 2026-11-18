@@ -3722,11 +3722,18 @@
 > (A-318); each verdict's line names the window it was judged by, and the status carries each shard's as the health
 > signal `shard.watch_window_ns`. Before, a shard the host kept off its CPU longer than `W` was judged against `W`
 > whatever the host measured, and A-359 only said so at boot. The ceiling keeps the watchdog from going blind, since a
-> wedged shard never waits again and so never forgets a spike measured just before it wedged. Still on `W` itself, each
-> owed its own change (class D): the anchor's start and lapse judgments (`role/anchor.rs`, D-b), the daemon's own
-> supervision waits (`reap_loop`, `log_late_beat`, `starved_share_ns`, `stop_parts`, `start_with_fleet`, the anchor's
-> hold windows, `held_copy`; D-c), and a laptop's failover detection term (A-405's supervision window), which should
-> follow the windows the watchdog now judges by.
+> wedged shard never waits again and so never forgets a spike measured just before it wedged. **Since A-461 (D-b's
+> start and stop half) the anchor judges a start by its silence against its own window**: from the spawn until the
+> watchdog first looks, each beat a step of the start's, so a start that beats is waited for however long it runs and
+> a wedged one is found a window after its last beat or CPU rise (before, a lapse bound and a whole window more after
+> its first beat); the window is the liveness window raised to how late the anchor's own timed waits come back, within
+> A-455's ceiling (`role/anchor.rs` `anchor_window_ns`), which a silent watchdog's process is judged by too; and a
+> graceful stop is judged in the daemon's own beating (`slates_anchor::StopBounds`, `supervise::stop_overdue`: deaf or
+> overdue once its last beat is a window past the request or its deadline; the lapse at the running lapse bound).
+> Still on `W` itself, each owed its own change (class D): the anchor's lapse bound and observation cadence
+> (`lapse_bound_ns`, `lapse_wait`; D-b's rest), the daemon's own supervision waits (`reap_loop`, `log_late_beat`,
+> `starved_share_ns`, `stop_parts`, `start_with_fleet`, the anchor's hold windows, `held_copy`; D-c), and a laptop's
+> failover detection term (A-405's supervision window), which should follow the windows the watchdog now judges by.
 >
 > - **Class A, a cross-shard wait judged in its target's own time (2026-11-06, in progress).** A verb's wait for
 >   another shard's answer gave up at the wall second while the target was alive and starved, and the work went on to

@@ -691,6 +691,12 @@ startup).
 > budget passes unacknowledged). Measured by real processes: a council leader sent `SIGTERM` drained in
 > about 0.2 s and a survivor led 0.106–0.127 s after the signal (four runs), against a 1 s election timeout
 > that a kill would have had the survivors wait out first.
+> **Since A-461 (2026-11-18)** the stop's bounds are derived (`slates_anchor::StopBounds`): the lapse is the bound the
+> anchor holds a running daemon's beat to (the liveness window plus its own measured lateness p99), and the
+> acknowledgement and the overrun are judged in the daemon's own beating (`supervise::stop_overdue`): it is deaf once
+> its last beat is a window past the request with no acknowledgement, and overdue once it is a window past the
+> deadline it declared, the window the anchor's (`role/anchor.rs` `anchor_window_ns`). A daemon held off its CPUs
+> mid-drain beats late and is waited for; one that stops beating is the lapse's.
 
 > **Status (2026-09-05).** Steps 1, 2, 3 and 5 are implemented for one host (GAPS §8d):
 > `slates anchor` measures the profile, creates the segment, publishes the profile and
@@ -9464,6 +9470,21 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > `a_shards_status_names_the_window_its_watchdog_judges_it_by` (`crates/server/src/watchdog.rs`). Not yet: the
 > anchor's start and lapse judgment, the daemon's other supervision waits and a laptop's failover detection term still
 > read `W` itself (GAPS).
+
+> **Status (2026-11-18, A-461): a start is judged by its silence, against the anchor's own window.** The anchor judges
+> a starting daemon until its watchdog first looks (`SUP_LOOKED`), not only until its first beat, and each of its beats
+> (A-312, after each unit of its work) is a step of the start's (`role/anchor.rs` `judge_start_by`): a start that keeps
+> beating or progressing is waited for however long it runs in all, and a wedged one is judged by its silence, a window
+> after its last beat or CPU rise. Before, the start judgment ended at the first beat, and a start wedged after it was
+> found only once its beat had lapsed and its process had stood still a whole window more (A-312 recorded it, "a
+> window later"). The window is the anchor's (`anchor_window_ns`): the liveness window raised to how late the anchor's
+> own timed waits come back (its lateness p99), within A-455's ceiling, the watchdog's rule over the anchor's measure; a
+> silent watchdog's process (A-232) is judged by the same window, and the kill lines name it. A graceful stop's bounds
+> are derived too (§2.5's status). Regressions: `a_start_that_beats_is_waited_for_and_a_wedged_one_is_judged_by_its_silence`,
+> `a_start_is_judged_by_the_window_its_anchors_own_waits_measure` (`crates/api/src/role/anchor.rs`) and
+> `a_stopping_daemon_is_overdue_by_its_own_beating_not_by_the_owners_clock` (`crates/anchor/src/supervise.rs`). Not
+> yet: the anchor's lapse bound (`lapse_bound_ns`, the liveness window plus its lateness p99) and its observation
+> cadence (GAPS).
 
 > **Telemetry oracle correction (2026-09-20, AC-0.11).** A drain request itself emits spans.
 > The daemon integration oracle now derives convergence from the reply quota minus the
@@ -31495,3 +31516,46 @@ handoff's length built, the Unix sibling found); and:
   characters a device with a resync session; `SLATES_ANCHOR_COPIES`, about 77 a DAX object), and Linux refuses an
   `execve` with a single string past `MAX_ARG_STRLEN`, `PAGE_SIZE * 32` (`include/uapi/linux/binfmts.h`: 131,072 bytes
   on 4 KiB pages, about 1,200 devices), while the bounds admit `shards × 4096`. Open; not this change's.
+
+### A-461 — A start is judged by its silence until its watchdog looks, its beats its steps; the anchor's window is the liveness window raised to its own measured lateness; a graceful stop is judged in the daemon's own beating (2026-11-18, built for goal g255; R3's class D, item D-b's start and stop half; §2.5 graceful stop, §4.14 `daemon.alive`; A-228, A-232, A-312, A-318, A-455)
+- **What was there.** The anchor judged a start by the watchdog's rule (`ShardWatch`) over the bare liveness window `W`,
+  and only until the start's first beat; a start wedged after it was found once its beat had lapsed past the lapse
+  bound and its process had then stood still a whole window more (A-312: "a window later"). The start's beats were no
+  step of the rule's: its `Look` held a step count of zero. A graceful stop killed a daemon that had not acknowledged
+  within `W` of the request, or that ran `W` past its declared deadline, both on the anchor's clock, and one whose beat
+  was older than `W`, with none of the lateness the anchor measures.
+- **The start.** It is judged from its spawn until its watchdog first looks (`SUP_LOOKED`, zeroed at each start), when
+  the daemon judges its own shards and its beat becomes the watchdog's verdict (A-232). The beat word is the start's
+  step (A-312: the starting thread beats after each unit of its work), so a start that keeps beating, or progressing in
+  its CPU, is waited for however long it runs in all, and a wedged start is judged by its silence: a window since its
+  last beat or CPU rise with its threads never runnable. The spin rule counts a thread's CPU from the last beat.
+- **The window, derived (`anchor_window_ns`).** The liveness window raised to how late this anchor's own timed waits
+  come back (its lateness p99 over its last 100 waits, which its lapse bound already reads), within A-455's ceiling:
+  the rule the daemon's watchdog judges its shards by (`watchdog::watch_window_ns`), over the anchor's own measure,
+  since a starting daemon's shards have measured nothing yet and a silent watchdog's cannot be read. A host that holds
+  the anchor's waits past `W` holds a start's threads too, so its process can show no progress sooner; a quiet host's
+  waits come back within a tick, so its window is `W`. A silent watchdog's process (A-232) is judged by the same
+  window. The spin window is that window held to the build (A-318). The kill lines name the window ("made no progress
+  for F ms (its W ms window)"), and a start's kill line its age since the spawn.
+- **The stop (`slates_anchor::StopBounds`, `supervise::stop_overdue`).** The lapse is the bound the anchor holds a
+  running daemon's beat to (`W` plus its measured lateness p99). The acknowledgement and the overrun are judged in the
+  daemon's own beating: deaf once its last beat is a window past the request with no acknowledgement, overdue once it is
+  a window past the deadline it declared. A daemon's control loop reads the request at each of its turns and its beats
+  show the turns, so a window of its beating is a window of turns it had to see the request; one held off its CPUs
+  beats late and is waited for, mid-drain, its planned handoff not cut short; one that stops beating is the lapse's, so
+  every stop still ends.
+- **Tests.** `a_start_that_beats_is_waited_for_and_a_wedged_one_is_judged_by_its_silence` (a start asleep between beats
+  three fifths of a window apart for five windows: never stuck; then silent: wedged a window after the look that saw
+  its last beat) and `a_start_is_judged_by_the_window_its_anchors_own_waits_measure` (the window from waits on time, two
+  and a half windows late and an hour late: `W`, two and a half, the ceiling, a silent start wedged at each) in
+  `crates/api/src/role/anchor.rs`; `a_stopping_daemon_is_overdue_by_its_own_beating_not_by_the_owners_clock` in
+  `crates/anchor/src/supervise.rs`. The CLI's start and frozen-daemon flows (`crates/cli/tests/cli.rs`) now read the
+  window their kill line names, never under `W`; the anchor's stop flows (`crates/anchor/tests/anchor.rs`) pass
+  `StopBounds`.
+- **Not yet (class D).** The anchor's lapse bound (`lapse_bound_ns`: `W` plus its lateness p99) and its observation
+  cadence; the daemon's own supervision waits (D-c).
+- EVIDENCE_A461
+
+Applied in the same change to: §2.5 (the graceful stop's status), §4.14 (a status block on `daemon.alive`), GAPS (the
+`LIVENESS_BUDGET_NS` entry), `crates/api/src/role/anchor.rs`, `crates/anchor/src/{supervise,lib}.rs`,
+`crates/anchor/tests/anchor.rs`, `crates/cli/tests/cli.rs`.
