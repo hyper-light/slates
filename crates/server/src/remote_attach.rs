@@ -494,6 +494,10 @@ pub(crate) async fn reap_at_owners(
   if requests.is_empty() {
     return Ok(());
   }
+  // A wall bound, by its reason (A-440): the task's own waits are on remote owners, each held to the forward lane's
+  // bound (class B), so the control shard's own time would judge the wrong clock; and the remote reap is idempotent at
+  // its owners (`serve_unforwardable`: it ends what the client still holds there and keeps no completion record), so a
+  // reap this wait gives up on is sent again by the next sweep at no cost but the asking.
   crate::xshard::task_within(
     origin,
     control,

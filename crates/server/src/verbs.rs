@@ -15462,15 +15462,10 @@ pub(crate) async fn rebuild_recovered(
   restore_nfs_answers(state, calls, nfs_replies);
   // The barrier replies the dead daemon published and never delivered, for the mounts (Linux) and streams (A-316,
   // A-339) the anchor held (A-61).
-  #[cfg(unix)]
-  {
-    state.recovered_replies = replies
-      .into_iter()
-      .map(|reply| (reply.attachment, (reply.unique, reply.reply)))
-      .collect();
-  }
-  #[cfg(windows)]
-  drop(replies);
+  state.recovered_replies = replies
+    .into_iter()
+    .map(|reply| (reply.attachment, (reply.unique, reply.reply)))
+    .collect();
   let mut rebuilt = Rebuilt::default();
   // Every block the images name is claimed before anything else allocates in the arena (A-64): the held
   // replicas and the merge volumes below allocate fresh blocks, which must never land on one an image names.
@@ -16921,13 +16916,7 @@ fn held_nfs_replies_changed(state: &ShardState) -> bool {
 
 /// The barrier replies not yet delivered, which ride with the effects they answer (A-61).
 fn pending_replies(state: &ShardState) -> Vec<slates_vfs::recover::HeldReply> {
-  #[cfg(unix)]
-  return state.pending_replies.values().cloned().collect();
-  #[cfg(windows)]
-  {
-    let _ = state;
-    Vec::new()
-  }
+  state.pending_replies.values().cloned().collect()
 }
 
 /// A checkpoint of every volume into the free slot (§4.8): the whole shard, as every publication was before A-68.
@@ -18170,6 +18159,18 @@ fn reconcile_lost(state: &mut ShardState, record: &VolumeRecord) -> (usize, usiz
           .position(|held| held.attachment == a.id)
       {
         let held = state.inherited_fuse.swap_remove(at);
+        state.adopt_shards.push(((**a).clone(), held));
+        return false;
+      }
+      // A Windows stream whose resync end the anchor held is kept the same way (A-433).
+      #[cfg(windows)]
+      if matches!(a.form, AttachForm::ShardsFs { .. })
+        && let Some(at) = state
+          .inherited_resync
+          .iter()
+          .position(|held| held.attachment == a.id)
+      {
+        let held = state.inherited_resync.swap_remove(at);
         state.adopt_shards.push(((**a).clone(), held));
         return false;
       }

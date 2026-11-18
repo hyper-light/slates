@@ -391,7 +391,14 @@ slates-vfs = 0
 #   (`GetLastError`, `RtlNtStatusToDosError`, 2); and the target's owner check (`GetSecurityInfo`, the process token
 #   opened and owned, a token record read and its SID taken for the user and for the default owner, the SIDs compared,
 #   the descriptor freed: 7).
-slates-land = 23
+# 2026-11-18 (+6, A-438, a symbolic link in a Windows landing, `os_windows.rs` only; 23 -> 29): NTFS sets a link's
+#   reparse buffer only through `FSCTL_SET_REPARSE_POINT` on a handle (`DeviceIoControl`, 1), for a caller with
+#   `SeCreateSymbolicLinkPrivilege` enabled, which an administrator's token holds disabled; `CreateSymbolicLinkW` enables
+#   it around its own call but takes a path, which the handle-relative writer never resolves. So the set runs on its
+#   thread under a copy of the process token with the privilege enabled: the token opened and owned (1), duplicated for
+#   impersonation and owned (1), the privilege enabled in the copy (`AdjustTokenPrivileges`, 1), the thread's token set
+#   (`SetThreadToken`, 1) and reverted (`RevertToSelf`, 1). None has a safe wrapper.
+slates-land = 29
 # 2026-11-02, A-198: retire the six supervisor job/assignment sites in favor of IPC's existing creation-time job
 # attribute. The hold transport has ten Win32 ownership/I/O sites: last-error read, event create/adopt, read/write,
 # event wait, cancellation and join on timeout or failed wait, and adoption of a duplicated handle. No unsafe sharing.
@@ -407,7 +414,10 @@ slates-db = 0
 # 2026-11-02 (+3, A-198 Step 9.4): the holder's process descriptor is converted from SDDL, applied before acquiring
 # held objects, and freed with LocalFree (`process_access.rs`). CreateProcessW borrows that same descriptor at birth;
 # these Win32 security calls have no safe wrapper and add no file or privilege requirement.
-slates-ipc = 140
+slates-ipc = 141
+# 2026-11-18 (+1, §4.6 A-433, a Windows Shards stream's resync, `stream_pipe.rs` compiled only for Windows): `write_now`
+#   cancels a pipe write the reader has no room for (`CancelIoEx`, 1), so a successor's `Resync` to a device that
+#   reads nothing never holds its shard; the write and its settling are the waited write's sites.
 # 2026-11-18 (+1, §4.6 A-427, a Windows Shards stream's resync holder, `handle_route.rs` compiled only for Windows):
 #   `process_started` reads a process's creation time with `GetProcessTimes` (1), which has no safe wrapper, so a
 #   successor hands a fresh stream only to the process the session named, never to a later one given its id.

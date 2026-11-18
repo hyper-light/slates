@@ -107,6 +107,8 @@ mod winfsp;
 // rides the runtime's TCP, which every platform has since A-182.
 mod callback;
 mod delegation;
+// A wait whose bound is learned from the waits it measured (RFC 6298, Karn's rule, back-off; A-431, A-442).
+mod learned_wait;
 mod listing;
 mod lock_ledger;
 pub mod nfs;

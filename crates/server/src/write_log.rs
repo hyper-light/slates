@@ -691,9 +691,8 @@ pub(crate) fn log_acknowledged_write(
 }
 
 /// Format: the counter of a `FORGET` the write log could not take and no publication carried: its lookups stay
-/// counted across a restart, a bounded leak (GAPS, A-154's sibling), never a lost write. Unix only, as `log_forgets`
-/// is.
-#[cfg(unix)]
+/// counted across a restart, a bounded leak (GAPS, A-154's sibling), never a lost write. Every platform's, as
+/// `log_forgets` is (A-433).
 const FORGET_UNLOGGED: &str = "write_log.forget_unlogged";
 
 /// Logs the lookups `forgotten` (each a file and a count) gave back through `attachment` on `volume` in the shard's
@@ -702,10 +701,8 @@ const FORGET_UNLOGGED: &str = "write_log.forget_unlogged";
 /// leave its references counted in the image for good. A log with no room forces a publication, which carries the
 /// `FORGET` (already applied) when it captured the volume, and gives back room for it again when it left the volume out
 /// ([`keep_record`], A-436); one still unkept is counted, and never marks the log overflowed, which would report every
-/// taken-over file as having lost writes. Unix only: a FUSE mount is Linux's, and a Windows
-/// stream has no resync end the anchor holds (its resync is owed, g234), so it ends with its daemon and every reference
-/// it held goes with it; the replay gives back a logged `FORGET` on every platform.
-#[cfg(unix)]
+/// taken-over file as having lost writes. A FUSE mount is Linux's; a stream whose resync end the anchor holds is every
+/// platform's (Windows since A-433).
 pub(crate) fn log_forgets(
   s: &mut crate::state::ShardState,
   (volume, attachment): (slates_db::catalog::VolumeId, u64),
