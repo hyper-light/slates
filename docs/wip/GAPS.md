@@ -46,12 +46,15 @@
 > - **Not this entry: the x86_64 runs of the same seeds** ended two daemons each by their watchdogs ("shard N is
 >   spinning, 1000 ms of CPU without a step") right after the supersession, so the dead nodes' copies read none: the
 >   live takeover's materialization in one turn, g251's item, as seed 17036665960917068132.
-> - **Open: a superseded owner's shipper that is never told its fence ships on.** In 2 of 12 runs of the third node's
->   case (CI diag 44358084443) the re-admitted adopter's own log of the volume, yielded but never fenced, built 119 and
->   1,714 installs for the creator, which refused each `not_the_acting_owner`; the adopter never learned its fence from
->   those answers, though the creator's copy was fenced above it. A-349 stops a fenced log only. Next: why that answer
->   does not fence the sender (`live_ship::not_served`, `Shipper::on_reply`), and whether a yielded log should stop
->   as a fenced one does (its waiting writers then need a refusal of their own).
+> - **Fixed (A-409, 2026-11-18): a superseded owner's shipper that was never told its fence shipped on.** In 2 of 12
+>   runs of the third node's case (CI diag 44358084443) the re-admitted adopter's own log of the volume, yielded but
+>   never fenced, built 119 and 1,714 installs for the creator, which refused each `not_the_acting_owner`. Now a yielded
+>   volume's log ships nothing and does no period work, as a fenced one (A-349), its waiting verbs answered
+>   `DurabilityPending` at the yield (`live_ship::yielded`, counted `fleet.live.yield_refused`); and a holder refusing a
+>   stale sender tells it the highest fence it knows, its record copy's as well as its live copy's
+>   (`live_ship::known_fence`), so a sender below it is fenced. Why no refusal fenced it in that run is not read from
+>   its counters (the creator's live copy showed fence 3 against the adopter's 2 at the end); the run that shows the
+>   storm gone is filed for main (run-requests.md).
 > - **Owed: the let-go and the yield survive a warm restart only once published.** The let-go rides the control shard's
 >   next publication; a warm restart before it restores the copies and routes them to this host again; and the yield
 >   is memory-only (`ShardState::yielded`), so a warm restart forgets that the node lost the volume at all (A-334).
@@ -3091,8 +3094,11 @@
 > merge record names the newest version its owner knew committed (record format 4); a holder keeps its replica's
 > checkpoint there as a held piece, and a rebuild starts from it and recomputes only the versions after it
 > (`a_rebuilt_replica_starts_from_the_checkpoint_its_holder_keeps`: versions 1 and 2's increments not held, the replica
-> rebuilt to 3). Owed, step two: the holder lets go of its records and inputs below the checkpoint, and a takeover's
-> adoption reads the checkpoint below them.
+> rebuilt to 3). Step two, the same day: the holder's ledger drops its positions after version 0 and below the
+> checkpoint's own, and its retention releases the inputs they named
+> (`a_holder_lets_go_of_the_records_and_inputs_its_checkpoint_stands_for`), so a replica's records and inputs are bounded
+> by the versions its owner has not yet committed. A-238's owed "the holders' replicas and records grow per version" is
+> closed by A-385 and A-404.
 >
 > **Fixed 2026-11-18 (g232, A-385): a holder's replica of a green kept every version's values.** An owner folds its
 > green's histories to its per-green budget, never past a live reader's version; a holder's replica, the engine it
@@ -17557,9 +17563,15 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     the refill test compares the whole range (`docs/bugs/2026-10-25-a-dax-slice-past-the-read-cap-dropped-a-guests-stores.md`).
   - **Verified:** this Mac, Shards 25 of 25; fedora, the three tests green, and all three red with `read_whole` cut to
     one call.
-  - **Open, siblings found by the sweep:** WinFsp's host answers a Windows read with one bridge read, so a read past
-    256 KiB returns short mid-file, which Windows may zero-fill on a paging read (to measure on Windows); FSKit's shim
-    does the same.
+  - **Siblings found by the sweep:** WinFsp's host answered a Windows read with one bridge read, so a read past
+    256 KiB returned short mid-file, which a program takes for the file's end and Windows zero-fills on a paging read.
+    **Fixed 2026-11-18 (g079, goal 83):** the host answers a read through `read_whole`, in as many bridge reads as the
+    cap takes, stopping short only at the file's end. The failing test is
+    `a_read_longer_than_the_bridges_cap_returns_every_byte_asked_for` (`crates/cli/tests/winfsp.rs`: one unbuffered
+    1 MiB read from a longer file's start; it reads 256 KiB without the fix). It is a live-drive test on CI's Windows
+    lanes, filed for main's run (`run-requests.md`); `cargo xwin check` is clean. Record:
+    `docs/bugs/2026-11-18-a-winfsp-read-past-the-bridges-cap-came-back-short.md`. FSKit's shim does the same and is
+    not shipped: slates never mounts through FSKit.
 
 - **The direct map on macOS (A-173, G-direct step 4, 2026-10-25): built, and proven on this Mac by a real client.**
   - **What:** a `MapRead` on macOS is answered `MapOffered`. The file's copy is a shared-memory object whose name went

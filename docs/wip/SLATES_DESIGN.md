@@ -6316,6 +6316,14 @@ creator plus these exceptions; this adds no global lookup catalog or per-write c
 > let-go is kept by the control shard's next publication, so a warm restart before it restores the copies; and the
 > yield itself is memory-only (`ShardState::yielded`), so a warm restart forgets it.
 
+> **Status (2026-11-18, A-409: a lost volume's log stops by itself, and a refusal names the fence).** A volume its
+> node yielded at its re-admission (A-334) ships nothing more and does no period work, as a fenced one does (A-349):
+> the node knows the loss before a holder can tell it. Each verb waiting on its durability is answered
+> `DurabilityPending` at the yield (`live_ship::yielded`). A holder refusing a message from a sender that is not the
+> volume's acting owner answers `StaleEpoch` at the highest fence it holds the volume at, its record copy's as well as
+> its live copy's (`live_ship::known_fence`), so a sender below it learns it was superseded and stops. Before, a
+> re-admitted adopter's log, never fenced, sent the creator an install of its whole volume 1,714 times in one run.
+
 **Lookup.** A volume id carries its creator host. A lookup by id routes to that host, or, when
 the configuration records a takeover of that host, to the candidate that rendezvous ranks first
 among the survivors of its neighbourhood at the takeover generation; an ownership or home move is a configuration exception naming the affected volume and its
@@ -18468,7 +18476,8 @@ Applied in the same change to:
 - **Owed.**
   - At `f > 0` the holders' replicas and records grow per version. ~~A takeover adopts the whole chain.~~ Since A-333
     (2026-11-18) a takeover records nothing of the chain up to the adopted version: its successor's holder ledger is it.
-    Since A-385 (2026-11-18) a replica folds where its owner folded; its records and held inputs still grow.
+    Since A-385 (2026-11-18) a replica folds where its owner folded, and since A-404 (2026-11-18) it lets go of its records
+    and held inputs below the durable checkpoint it keeps at its owner's committed floor.
   - The 40 bytes a checkpoint keeps for each accepted identity.
   - The checkpoint walk is not sliced.
 
@@ -29385,9 +29394,6 @@ Applied in the same change to: §4.16's failure matrix (a green holder's restart
   one version recomputed).
 - **Measured.** The server's merge, retention, state and takeover unit tests, 34 of 34 (kiln, the Mac Studio,
   2026-11-18, debug).
-- **Still owed (step two).** The holder lets go of its ledger positions below the checkpoint and the inputs placed at
-  or below it, and a takeover's adoption (A-333) reads the checkpoint for the versions below it.
-
 ### A-408 — The last wall-clock cross-shard waits wait in their target's own time (2026-11-18, built for goal g255; A-65, A-403)
 
 - **What was there.** Eight cross-shard calls still waited one liveness window of wall time (`xshard::call_within` with
@@ -29461,6 +29467,40 @@ GAPS (the binary release lane's entry) and `docs/publish.md` ("The binary releas
   runner AC-9.5 asks for.
 - **Owed.** The proof is a release run (a tag or a dry run) whose two copies of a Windows target land on two images
   and match; filed for main. clang-cl, which compiles AWS-LC's C on arm64, still comes from the image.
+
+### A-409 — A lost volume's live log stops by itself, and a holder's refusal names the highest fence it knows (2026-11-18, g230, scale-out; §4.8 "Authority scope", §4.10 "Live shipping"; A-334, A-349, A-382's open item)
+Applied in the same change to: §4.8 "Authority scope" (its status), GAPS (A-382's entry: its open item fixed), and the
+code below.
+- **What was there.** A-349 stopped a fenced log, one a holder had answered with a later fence. A log whose node yielded
+  the volume at its re-admission (A-334) was never fenced unless a holder said so, and the holder that refused it as not
+  the volume's acting owner answered from its live copy's fence alone. In 2 of 12 runs of
+  `every_copy_catches_up_once_the_third_node_takes_the_volume_from_the_adopter` (CI diag 44358084443) the re-admitted
+  adopter's log built 119 and 1,714 installs of its whole volume for the creator, each refused `not_the_acting_owner`:
+  a storm of the kind A-349 found starving a takeover round's sessions. Why no refusal fenced it is not read from that
+  run's counters.
+- **The rule.** A yielded volume is lost (`live_ship::lost`: fenced or yielded): its log ships nothing and the period
+  only judges what still waits on it; at the yield every verb waiting on its durability is answered `DurabilityPending`
+  with the time it was held (`live_ship::yielded`, counted `fleet.live.yield_refused`), since the write it waits for was
+  made on a copy the successor's writes have passed and the same request run again goes to the successor; its
+  transports' parked replies are woken to meet the yield at their gates. A holder's refusal of a sender that is not the
+  acting owner is `StaleEpoch` at the highest fence the holder knows for the volume, its live copy's or its record
+  copy's (`known_fence`, the new `Acceptor::fence`), and `Unauthorized` only when the sender's epoch is not below it.
+- **Tests.** `a_refused_sender_below_the_fence_a_holder_knows_is_told_that_fence` (`live_ship`'s unit tests: the
+  decision over every epoch against a fence). The fleet runs that show the storm gone and every re-admission and
+  supersession test still green are filed for main (run-requests.md, A-409).
+
+- **Step two (2026-11-18).** Once a holder keeps a new checkpoint, its ledger drops the positions after version 0 and
+  below the checkpoint's own (`Acceptor::compact_ledger_between`: phase one ranks only the highest position, and the
+  rebuild still reads version 0's record, which names the origin, and the checkpoint's, whose identity it checks), and
+  its retention judges the content placed from version 1 again (`content_retention::retain_object_from`), releasing
+  the inputs nothing names now (`merge.replica.compacted_inputs`). A takeover's adoption (A-333) needs nothing below
+  the checkpoint: its completions walk passes over the positions it lacks, and its replica is rebuilt from the
+  checkpoint and advanced from its records above it. A replica's records and inputs are now bounded by the versions
+  its owner has not yet committed. Tests: `a_holder_lets_go_of_the_records_and_inputs_its_checkpoint_stands_for`
+  (`merge_origin.rs`: positions 0, 2 and 3 kept, version 1's inputs released, the replica rebuilt to version 3 from the
+  checkpoint) and `a_ledger_compacted_between_keeps_its_first_position_and_the_checkpoints_own` (`register.rs`); the
+  server's merge, retention, state and takeover unit tests 35 of 35 and the acceptor tests 9 of 9 (kiln, the Mac Studio,
+  2026-11-18, debug).
 
 ### A-412 — A holder behind its own records catches up from them, fetching their inputs from the record's owner (2026-11-18, kiln goal g250; §4.16 "Apply on holders"; A-313, A-333, A-364, A-373)
 Applied in the same change to: GAPS (the entry at its head), the bug record of 2026-11-18 on a holder behind its own
