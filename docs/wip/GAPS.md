@@ -986,7 +986,7 @@
 > of 2026-11-07 has the log.
 
 > **Starts that each failed past the anchor's restart window were restarted at once, for good (found 2026-11-11 on
-> B10's Linux gate; the never-served half closed 2026-11-17, A-311; open below).** The anchor counted failed starts in a
+> B10's Linux gate; closed 2026-11-17 by A-311 and A-312; the supervisor's runs under load owed, below).** The anchor counted failed starts in a
 > window of the recovery budget, a second, so a start that took longer fell in a window of its own every time and was
 > never a crash loop. B10's gate on adacachy2 (be4985bb, load 67-73) ran `a_start_whose_shards_sum_past_a_window_comes_up`
 > for 27 minutes, the anchor killing the 407-shard start every second ("ran 1009-1037 ms of CPU on one thread without
