@@ -55,7 +55,7 @@ pub fn drain_verb(state: &mut ShardState, partition: u16) -> ReplyBody {
   let drained = state.telemetry.drain_up_to(state.telemetry_quota);
   let window_ns = now_ns.saturating_sub(state.last_drain_ns);
   state.last_drain_ns = now_ns;
-  let horizon_ns = state.failover_ns;
+  let horizon_ns = state.config.failover_slo_ns;
   let dropped_total = state.telemetry.dropped();
   let report = summarize(
     partition,

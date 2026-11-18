@@ -3388,10 +3388,11 @@ impl Daemon {
     })
   }
 
-  /// Test support: while `Some(ns)`, this node's control shard publishes `ns` as its failover delay in place of its
-  /// estimate, and fans it to every shard with the next period (A-363): the bound of every wait that bounds a failover
-  /// (a forward, the location round, a held reply, a takeover's attempts) for a test whose subject is that bound's
-  /// rule. `None` returns to the estimate.
+  /// Test support: while `Some(ns)`, this node publishes `ns` as its failover delay in place of its estimate, on every
+  /// shard at once (A-363, A-414): the bound of every wait that bounds a failover (a forward, the location round, a held
+  /// reply, a takeover's attempts) and the term of the leases that read it (the write lease, a landing's target lease,
+  /// a staging buffer), for a test whose subject is that bound's or term's rule. `None` returns to the estimate at the
+  /// control shard's next period, which the fan carries to the others.
   pub fn inject_failover(&self, ns: Option<u64>) -> Result<(), ObserveError> {
     // On every shard at once: a laptop runs no coordinator to fan it, and a fleet's fan carries the same value.
     for shard in self.shards.iter().copied() {

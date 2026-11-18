@@ -847,8 +847,8 @@ fn land_under_policy(
   };
   let presented = present(s, presenter, &ids, plan);
   let reply = if matches!(presented, ReplyBody::GrantRequired { .. }) {
-    // The grant needs to stand only until the landing that follows checks it: the operator's failover bound, the
-    // term the landing's own target lease runs under.
+    // The grant needs to stand only until the landing that follows checks it: the node's failover delay (A-363,
+    // A-414), the term the landing's own target lease runs under.
     let term = s.failover_ns;
     match issue_grant(
       s,
@@ -992,8 +992,9 @@ fn defer_granted_landing(state: &mut ShardState, mut prepared: Prepared) -> Repl
   state.landing.next_holder = state.landing.next_holder.saturating_add(1);
   let shard = state.shard;
   let control = state.shards.first().copied().unwrap_or(shard);
-  // The term is the operator's failover bound, as the per-shard lease's was; the measured landing duration
-  // p99 x k of §4.15's table, with its keepalive, comes with the sliced engine (AUD-29-25).
+  // The term is the node's failover delay (A-363, A-414): a landing its daemon's end cancelled leaves its lease to the
+  // term (AUD-29-03), so the target waits no longer than a failover would leave it unserved, while a running landing
+  // renews it between its slices and during its barriers (`keep_lease_alive`, AUD-29-25).
   let term = state.failover_ns;
   let deadline = state.clock.monotonic_ns().saturating_add(term);
   let (origin, id) = request;
@@ -1285,7 +1286,9 @@ async fn recall_before_finish(granted: &mut GrantedRun, renew: LeaseAsk, key: &s
       }
       crate::delegation::drain(s);
       s.count(LANDING_HELD_FOR_RECALL, 1);
-      Some((s.store.recall_gate.generation(), s.failover_ns))
+      // The NFSv4 lease the server advertises (`nfs::v4_limits`), which a delegation's holder is owed after its recall:
+      // not the landing's own lease term.
+      Some((s.store.recall_gate.generation(), s.config.failover_slo_ns))
     })
     .flatten();
     let Some((generation, lease)) = asked else {
@@ -1671,9 +1674,7 @@ fn begin_granted(
   Begun::Planning(Box::new(Planning {
     beginning,
     writer,
-    lease_seen_ns: lease
-      .expires_ns
-      .saturating_sub(state.failover_ns),
+    lease_seen_ns: lease.expires_ns.saturating_sub(state.failover_ns),
     lease,
     handle: prepared.handle,
     landing_id,

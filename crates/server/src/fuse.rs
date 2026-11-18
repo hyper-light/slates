@@ -398,7 +398,7 @@ pub(crate) fn defer_attach(state: &mut ShardState, pending: PendingAttach) -> Re
   };
   let route = state.reply_route.take();
   let cause = state.current_span;
-  let deadline_ns = state.failover_ns;
+  let deadline_ns = state.config.failover_slo_ns;
   let shard = state.shard;
   let task = async move {
     let mount_point = pending
@@ -1680,7 +1680,7 @@ fn unmount_owned(mount_point: &str) {
 async fn reap(mut pending: PendingExit) {
   let tick = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;
   let bound =
-    state::with_state(|s| s.failover_ns).unwrap_or(crate::daemon::HEARTBEAT_NS);
+    state::with_state(|s| s.config.failover_slo_ns).unwrap_or(crate::daemon::HEARTBEAT_NS);
   let began = futures::now_ns();
   loop {
     if let Some(done) = pending.poll() {

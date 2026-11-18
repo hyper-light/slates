@@ -3480,7 +3480,13 @@
 > its holder's** (`min(F, the gaps' tail + W)`, renewed by every verb and by a holder's `Renew`, fresh after a restart),
 > held by `slates attach --hold` and the library's `slates_client::Hold` (the SDKs make no CLI-form attachment: theirs
 > end with their client); since A-405 a laptop's failover delay counts its anchor's supervision window as its detection
-> (two seconds there); owed: the volume's write lease (D-16) taking its holder's term. Owed, each in its own
+> (two seconds there); **since A-414 the volume's write lease (D-16), a landing's target lease and a staging buffer
+> take the failover delay as their term**, and a write lease stays its holder's while any of its write attachments
+> lives (renewed at each lapse; another principal refused `LeaseHeld` meanwhile), where before it ran out at its term
+> under a live writer. Still on the placeholder, each owed a term of its own: the NFSv4 and delegation leases (with the
+> wait a landing gives a recalled delegation, which must stay equal to the lease the server advertises), the anchor's
+> restart cap, the FUSE helpers' bounds, the status capture's deadline (it should count from the capture, not the
+> request), a move's overdue bound and the telemetry freshness horizon. Owed, each in its own
 > change: each other lease takes its term from a φ-accrual
 > detector of its own holder's renewals (a CLI attachment once the CLI process sends a keepalive); `W`'s floor from the
 > pulses' running wake delay; then `FAILOVER_SLO_NS` and `with_failover_slo` go, since nothing sets `F`. The boot-time

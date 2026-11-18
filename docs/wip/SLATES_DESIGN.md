@@ -1913,9 +1913,12 @@ landing constants are in §4.15.
 > the takeovers and volumes it timed (the ratified recovery budget before the first), and publishes it in its status
 > (`FleetReport::failover`). **Since A-375 the waits that bound a failover read it** (a forward's bound, the location
 > round's cap, a held reply's total, a takeover's attempts), fanned to every shard in whole coordinator periods; **since
-> A-384 a CLI attachment's term is its holder's**, at most the failover delay; the other lease terms still read the
-> operator's 10 s placeholder above until each takes a term of its own (A-363's owed list; GAPS, the
-> `LIVENESS_BUDGET_NS` entry).
+> A-384 a CLI attachment's term is its holder's**, at most the failover delay; **since A-414 the volume's write lease,
+> a landing's target lease and a staging buffer take the failover delay as their term**, and the write lease stays its
+> holder's while any of its write attachments lives (renewed at each lapse, refused `LeaseHeld` to another principal
+> meanwhile). The NFSv4 and delegation leases, the anchor's restart cap and four bounds that are not leases (the FUSE
+> helper's, the status capture's, a move's and the telemetry horizon) still read the operator's 10 s placeholder above
+> until each takes a term of its own (A-414's owed list; GAPS, the `LIVENESS_BUDGET_NS` entry).
 
 **Worked example.** An agent clones snapshot S of a 2 million-file volume: the reply arrives in one
 ring round trip; the clone's `referenced_bytes` equals S's referenced bytes (charged in full),
@@ -29501,3 +29504,51 @@ code below.
   checkpoint) and `a_ledger_compacted_between_keeps_its_first_position_and_the_checkpoints_own` (`register.rs`); the
   server's merge, retention, state and takeover unit tests 35 of 35 and the acceptor tests 9 of 9 (kiln, the Mac Studio,
   2026-11-18, debug).
+
+### A-414 — The leases off the placeholder take the failover delay as their term, and a write lease stays its holder's while any of its write attachments lives (2026-11-18, built for goal g255; A-363's owed list, the volume's write lease owed since A-384; D-16, §4.15 "The lease keepalive")
+- **What was there.** The volume's write lease (D-16), a landing's target lease and the grant a bypass policy issues
+  for its landing, and a staging buffer each took the operator's 10 s placeholder (`DaemonConfig::failover_slo_ns`) as
+  their term, after A-363 made the failover delay a live output and A-375 moved the waits that bound a failover to it.
+  And the write lease ran out at its term whatever its holder still held: it was taken at an attach for writing,
+  renewed only by the same principal's next such attach, and released by the reaper at its term, so ten seconds after
+  a library client or a mount attached a volume for writing, another principal could attach it for writing too while
+  the first still wrote. Writes do not check the lease; its term gates another writer's take.
+- **The rule.** Each of these terms is the node's failover delay (`ShardState::failover_ns`, A-363): a holder that is
+  gone keeps what it held no longer than a failover would leave it unserved. A write lease is renewed by whatever holds
+  it (A-384's rule), and a write attachment is its holder's presence: at the lease's lapse the reaper renews it at its
+  epoch while its holder holds a live write attachment of the volume (`verbs::expire_leases`, `lease_kept_until`), to
+  that attachment's own expiry for a CLI attachment (its term is its holder's pace, A-384) and a failover delay ahead
+  for any other kind, each of which ends by a rule of its own (a library client's at its reap, a mount's at its
+  unmount or its daemon's end, a guest device's at its hangup, another host's at that host's reap of its client or its
+  retirement, A-222). Another principal's take of a lease past its term whose holder still holds one is refused
+  `LeaseHeld` (`verbs::take_write_lease`), so the moment between the lapse and the reaper's pass hands it to no second
+  writer. Once the holder's write attachments have ended, the lease lasts one term more, as before: a client reaped
+  while paused keeps it (T-2.3). A record the database refuses at the pass is counted (`db.secondary_refused`); the
+  pass dropped it silently before.
+- **Not a renewal per use.** A CLI attachment's renewals do not renew the lease with them (the first build did, a
+  durable record more per renewal, three a second for a held attachment): the lease is renewed once a term, at its
+  lapse, and a take between judges the holder's attachments directly.
+- **Test support.** `Daemon::inject_failover` now holds the delay on every shard at once: a laptop runs no coordinator
+  to fan it, and these terms are read on every shard. The integration tests that shortened a lease through the
+  placeholder hold the delay instead (`crates/client/tests/reap.rs`, `crates/server/tests/landing_fairness.rs`).
+- **Not moved, owed, each a term of its own:** the NFSv4 and delegation leases (the lease the server advertises, and the
+  wait a landing gives a recalled delegation, which must stay equal to it), the anchor's restart cap, and four bounds
+  that are not leases: the FUSE mount and unmount helpers' (a helper process's wait), the status capture's (its
+  deadline counts from the request, so a scatter on a starved daemon would lose it at a shorter one; it should count
+  from the capture), a move's overdue bound and the telemetry freshness horizon (failover-shaped, but their tests run
+  in the fleet suites). Then `FAILOVER_SLO_NS` and `with_failover_slo` go.
+- **What changes.** On a laptop these terms fall from 10 s to its failover delay, about two seconds (A-405), and in a
+  quiet fleet to about four to five: a landing's lease is renewed between its slices at half its term, so a starved
+  control shard now has half the delay, not five seconds, to answer a renewal before the landing's entries are fenced
+  `LeaseEnded` (filed for main's starved landing lane). A volume a live writer holds is never taken by a second writer,
+  however long the first sits idle.
+- **Tests.** `a_write_lease_stays_its_holders_while_the_holder_keeps_a_write_attachment` (the reaper's pass past the
+  term renews the owner's lease at its epoch; another principal refused `LeaseHeld` past the renewed term with no pass
+  between; granted once the owner's attachment ended) and
+  `a_cli_attachment_keeps_the_write_lease_to_its_own_term_and_a_read_one_keeps_none` (`crates/server/src/verbs.rs`).
+  EVIDENCE_PLACEHOLDER
+
+Applied in the same change to: §4.4 "Derived constants" (its status), GAPS (the `LIVENESS_BUDGET_NS` entry),
+`docs/cli.md`, `crates/server/src/{verbs,landing,daemon,remote_attach}.rs`, `crates/db/src/catalog.rs` (the consumers'
+lease docs), `crates/client/tests/reap.rs`, `crates/server/tests/landing_fairness.rs`, `crates/cli/tests/fs_server.rs`
+(a bound's comment).

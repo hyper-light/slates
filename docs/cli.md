@@ -16,7 +16,9 @@ holder's (design A-384): every verb that names it renews it, and `slates attach 
 that process until the process ends, however long the attachment sits idle. One that nothing renews lasts at most the
 daemon's failover delay after its last use (about two seconds on a laptop, its anchor's supervision window and the
 recovery; a few seconds in a fleet; `slates status` shows the delay as `fleet_failover`); one renewed at a steady pace ends about one and a third seconds after its renewals stop.
-It ends at the term's lapse with the write lease it held. A verb that names it after is refused
+It ends at the term's lapse, releasing the volume's write lease unless the same user still holds another write
+attachment of it: a write lease stays its holder's while any of its write attachments lives (design A-414). A verb
+that names an ended attachment is refused
 `AttachmentExpired`, never `NotFound`: attach again. An SDK client's attachments end with the client instead. `exec` is Linux-only
 and currently expects an externally supplied `SLATES_ROOT` naming an established root mount; on a host whose AppArmor
 restricts unprivileged user namespaces it needs slates' AppArmor profile and `--apparmor-profile` (below).

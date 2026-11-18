@@ -2882,7 +2882,7 @@ fn status_on_channel(
     let expires = state
       .clock
       .monotonic_ns()
-      .saturating_add(state.failover_ns);
+      .saturating_add(state.config.failover_slo_ns);
     slot
       .status_pages
       .begin(request, expires, &mut state.store.metadata);
@@ -10933,9 +10933,6 @@ fn renew(state: &mut ShardState, principal: &Principal, attachment: u64) -> Repl
     if let Err(e) = state.db.mutate(&mut state.segment, &renewal, now) {
       return refused(refusal_of_db(&e));
     }
-    if let Err(e) = renew_write_lease(state, &record, expires_ns, now) {
-      return refused(refusal_of_db(&e));
-    }
   }
   ReplyBody::Renewed {
     term_ns: term,
@@ -11099,8 +11096,10 @@ fn guest_over_the_ring(
 }
 
 /// Takes (or renews) the volume's write lease for `principal` (D-16): the holder renews at its
-/// epoch, an expired lease passes to the next epoch, and the term is the node's live failover delay (A-363). The
-/// principal's attachments of the volume renew it while they live (`renew_write_lease`, A-414).
+/// epoch, an expired lease passes to the next epoch, and the term is the node's live failover delay (A-363, A-414).
+/// Another principal's lease is refused `LeaseHeld` while it is unexpired, and past its term too while its holder still
+/// holds a live write attachment of the volume ([`lease_kept_until`]): the reaper renews such a lease at its lapse
+/// ([`expire_leases`]), and a take between the lapse and that pass must not hand it to a second writer.
 fn take_write_lease(
   state: &mut ShardState,
   record: &VolumeRecord,
@@ -11109,21 +11108,26 @@ fn take_write_lease(
 ) -> Result<u64, Refusal> {
   let epoch = match &record.lease {
     Some(current) if &current.holder == principal => current.epoch,
-    Some(current) if current.expires_ns <= now => {
-      current
-        .epoch
-        .checked_add(1)
-        .ok_or_else(|| Refusal::Unsupported {
-          feature: LEASE_EPOCH_EXHAUSTED.to_owned(),
-        })?
+    Some(current)
+      if current.expires_ns > now
+        || lease_kept_until(state, record.id, &current.holder, now).is_some() =>
+    {
+      return Err(Refusal::LeaseHeld {
+        epoch: current.epoch,
+      });
     }
-    Some(_) => 1,
+    Some(current) => current
+      .epoch
+      .checked_add(1)
+      .ok_or_else(|| Refusal::Unsupported {
+        feature: LEASE_EPOCH_EXHAUSTED.to_owned(),
+      })?,
     None => 1,
   };
   let term = derived!(
     state.failover_ns,
-    "the node's failover delay (A-363): an abandoned holder keeps the write lease no longer than a failover would leave \
-     the volume unserved (A-230), and its holding attachment renews it while it lives (A-414)",
+    "the node's failover delay (A-363): a holder whose write attachments have all ended keeps the write lease no longer \
+     than a failover would leave the volume unserved (A-230); while one lives, the lease is renewed at each lapse (A-414)",
     ["failover_ns"]
   );
   let lease = LeaseRecord {
@@ -11143,6 +11147,35 @@ fn take_write_lease(
     )
     .map_err(|e| refusal_of_db(&e))?;
   Ok(epoch)
+}
+
+/// Until when the volume's write lease stays `holder`'s because the holder still holds a live write attachment of it
+/// (D-16, A-414), or `None` when it holds none and the lease may lapse at its term. A lease is renewed by whatever holds
+/// it (A-384's rule), and a write attachment is its holder's presence: a CLI attachment that has not lapsed keeps the
+/// lease to its own expiry (its term is its holder's pace, A-384), and any other kind keeps it a failover delay from
+/// `now`, since each ends by a rule of its own (a library client's at its reap, a mount's at its unmount or the
+/// daemon's end, a guest device's at its hangup, another host's at that host's reap of its client or its retirement,
+/// A-222). Before, the lease ran out at its term while its holder's attachment lived, so a second principal could take
+/// the write lease of a volume a live writer held; and an ended attachment's lease still lasts its term, so a client
+/// reaped while paused keeps it (T-2.3).
+fn lease_kept_until(
+  state: &ShardState,
+  volume: DbVolumeId,
+  holder: &Principal,
+  now: u64,
+) -> Option<u64> {
+  let term = state.failover_ns.max(1);
+  state
+    .db
+    .partition()
+    .attachments_of(volume)
+    .into_iter()
+    .filter(|attachment| &attachment.principal == holder && attachment.rights.write)
+    .filter_map(|attachment| match attachment.consumer {
+      Consumer::Termed { expires_ns } => (expires_ns > now).then_some(expires_ns),
+      _ => Some(now.saturating_add(term)),
+    })
+    .max()
 }
 
 fn detach(state: &mut ShardState, principal: &Principal, attachment: u64) -> ReplyBody {
@@ -11360,41 +11393,8 @@ pub(crate) fn use_attachment(
       .db
       .mutate(&mut state.segment, &renewal, now)
       .map_err(|e| refusal_of_db(&e))?;
-    renew_write_lease(state, &record, now.saturating_add(term), now).map_err(|e| refusal_of_db(&e))?;
   }
   Ok(())
-}
-
-/// Renews the volume's write lease with the CLI attachment that holds it (D-16, A-230, A-414): the lease is its holder's,
-/// so a renewal of the attachment is a renewal of the lease, to the same expiry at the same epoch. Before, the lease was
-/// taken at the attach and released at its term while the attachment lived on, renewed by verbs or a hold, so another
-/// principal could take the volume's write lease from a live holder. A lease another principal holds, none, or one that
-/// already runs as long, is left as it is.
-fn renew_write_lease(
-  state: &mut ShardState,
-  record: &AttachmentRecord,
-  expires_ns: u64,
-  now: u64,
-) -> Result<(), DbError> {
-  let Some(lease) = state
-    .db
-    .partition()
-    .volume(record.volume)
-    .and_then(|volume| volume.lease.clone())
-  else {
-    return Ok(());
-  };
-  if lease.holder != record.principal || lease.expires_ns >= expires_ns {
-    return Ok(());
-  }
-  state.db.mutate(
-    &mut state.segment,
-    &Op::LeaseTaken {
-      volume: record.volume,
-      lease: LeaseRecord { expires_ns, ..lease },
-    },
-    now,
-  )
 }
 
 /// Ends every CLI attachment of this partition whose term has lapsed (A-230): as a detach would, releasing the write
@@ -14910,15 +14910,38 @@ pub fn serve_round(state: &mut ShardState) -> bool {
   any
 }
 
-/// Releases every lease whose term passed (the wheel pops; nothing scans); the count.
+/// Ends or renews every write lease whose term passed (the wheel pops; nothing scans), D-16, A-414: a lease whose holder
+/// still holds a live write attachment of its volume is renewed at its epoch to [`lease_kept_until`], and any other is
+/// released. The leases acted on.
 pub fn expire_leases(state: &mut ShardState) -> usize {
   let now = state.clock.monotonic_ns();
-  let expired = state.db.partition_mut().expired_leases(now);
-  let count = expired.len();
-  for volume in expired {
-    let _ = state
+  expire_leases_at(state, now)
+}
+
+/// [`expire_leases`] at `now`, on the shard's clock. A record the database refuses is counted
+/// ([`DB_SECONDARY_REFUSED`]), never dropped silently; the lease then stands as recorded, and another principal's take
+/// judges it as this pass would have ([`take_write_lease`]).
+fn expire_leases_at(state: &mut ShardState, now: u64) -> usize {
+  let lapsed = state.db.partition_mut().expired_leases(now);
+  let count = lapsed.len();
+  for volume in lapsed {
+    let kept = state
       .db
-      .mutate(&mut state.segment, &Op::LeaseReleased { volume }, now);
+      .partition()
+      .volume(volume)
+      .and_then(|record| record.lease.clone())
+      .and_then(|lease| {
+        lease_kept_until(state, volume, &lease.holder, now).map(|expires_ns| LeaseRecord {
+          expires_ns,
+          ..lease
+        })
+      });
+    let op = match kept {
+      Some(lease) => Op::LeaseTaken { volume, lease },
+      None => Op::LeaseReleased { volume },
+    };
+    let recorded = state.db.mutate(&mut state.segment, &op, now);
+    count_secondary(state, recorded);
   }
   count
 }
@@ -20905,6 +20928,196 @@ mod tests {
       "a volume made here is answered: {made:?}"
     );
     assert_eq!(counted, 1, "counted once");
+  }
+
+  /// Shape: the uid of the second principal the write-lease tests share a volume with.
+  const OTHER_UID: u32 = 4321;
+
+  /// The volume's owner and a second principal of the same host, for the write-lease tests.
+  fn lease_principals() -> (Principal, Principal) {
+    let of = |uid| Principal::Uid {
+      host: slates_db::HostId(0),
+      uid,
+    };
+    (of(1234), of(OTHER_UID))
+  }
+
+  /// A bounded volume `principal` creates on this shard: its id.
+  fn plain_volume(
+    state: &mut crate::state::ShardState,
+    principal: &Principal,
+    name: &str,
+  ) -> VolumeId {
+    let reply = super::dispatch(
+      state,
+      1,
+      principal,
+      super::RequestBody::Create {
+        name: name.to_owned(),
+        size: super::SizeClass::Bounded { limit: 1 << 20 },
+        names: super::NamePolicy::Exact,
+        require_locked: false,
+        base: None,
+      },
+    );
+    let ReplyBody::Created { id } = reply else {
+      panic!("{name}: {reply:?}")
+    };
+    id
+  }
+
+  /// `principal`'s attachment of `volume` with `intent` in `form`, made through the verb: its id.
+  fn attached(
+    state: &mut crate::state::ShardState,
+    principal: &Principal,
+    volume: VolumeId,
+    intent: super::Intent,
+    form: super::AttachRequest,
+  ) -> u64 {
+    let reply = super::dispatch(
+      state,
+      1,
+      principal,
+      super::RequestBody::Attach {
+        volume,
+        snapshot: None,
+        intent,
+        form,
+      },
+    );
+    let ReplyBody::Attached { attachment, .. } = reply else {
+      panic!("{reply:?}")
+    };
+    attachment
+  }
+
+  /// D-16, A-414. Do: on one shard whose failover delay is a nanosecond, so a write lease's own term lapses at once,
+  /// attach a volume for write in the library's form as its owner and share it for writing with a second principal;
+  /// run the reaper's lease pass past the lease's term; have the second principal take the lease past the renewed term,
+  /// with no pass between; then detach the owner's attachment and take again. Expect: the pass renews the owner's lease
+  /// at its epoch instead of releasing it, the owner's attachment being live; the second principal refused `LeaseHeld`
+  /// naming that epoch; and once the attachment ended, granted the lease. Before, the lease ran out at its term while
+  /// its holder's attachment lived, and the second principal took the write lease of a volume a live writer held.
+  #[test]
+  fn a_write_lease_stays_its_holders_while_the_holder_keeps_a_write_attachment() {
+    crate::daemon::audit_on_shard(|state| {
+      let (owner, other) = lease_principals();
+      state.failover_ns = 1;
+      let id = plain_volume(state, &owner, "kept-lease");
+      let shared = super::dispatch(
+        state,
+        1,
+        &owner,
+        super::RequestBody::Share {
+          volume: id,
+          principal: slates_ipc::protocol::Principal::Uid {
+            host: 0,
+            uid: OTHER_UID,
+          },
+          rights: slates_ipc::protocol::Rights {
+            read: true,
+            write: true,
+            admin: false,
+          },
+        },
+      );
+      assert!(matches!(shared, ReplyBody::Shared), "{shared:?}");
+      let attachment = attached(
+        state,
+        &owner,
+        id,
+        super::Intent::Write,
+        super::AttachRequest::Root,
+      );
+      let volume = super::to_db_volume(id);
+      let lease = |state: &crate::state::ShardState| {
+        state
+          .db
+          .partition()
+          .volume(volume)
+          .and_then(|record| record.lease.clone())
+      };
+      let taken = lease(&*state).expect("the write attach took the lease");
+      // Past the lease's own term by a liveness window, longer than any tick of the lease wheel.
+      let pass = taken
+        .expires_ns
+        .saturating_add(crate::daemon::LIVENESS_BUDGET_NS);
+      assert_eq!(
+        super::expire_leases_at(state, pass),
+        1,
+        "the pass met the lapsed lease"
+      );
+      let renewed = lease(&*state).expect("the pass renewed the lease rather than releasing it");
+      assert_eq!(
+        (&renewed.holder, renewed.epoch),
+        (&owner, taken.epoch),
+        "the owner's, at its epoch"
+      );
+      assert!(renewed.expires_ns > pass, "renewed past the pass");
+      let past_renewal = renewed.expires_ns.saturating_add(1);
+      let record = state.db.partition().volume(volume).cloned().unwrap();
+      assert_eq!(
+        super::take_write_lease(state, &record, &other, past_renewal),
+        Err(Refusal::LeaseHeld { epoch: taken.epoch }),
+        "a lease past its term whose holder still holds a write attachment is the holder's"
+      );
+      let detached = super::dispatch(state, 1, &owner, super::RequestBody::Detach { attachment });
+      assert!(matches!(detached, ReplyBody::Detached), "{detached:?}");
+      let record = state.db.partition().volume(volume).cloned().unwrap();
+      assert!(
+        super::take_write_lease(state, &record, &other, past_renewal).is_ok(),
+        "the ended attachment let the lease go"
+      );
+    });
+  }
+
+  /// D-16, A-414. Do: attach a volume for write in the CLI's form and for reading in the library's form, both as its
+  /// owner, then ask until when the owner keeps the volume's write lease, before the CLI attachment's term ends and at
+  /// its end; and ask it for a principal holding no attachment. Expect: the CLI attachment's own expiry while it lives
+  /// (its term is its holder's, A-384), and nothing once it lapsed (a read attachment keeps no write lease) or for the
+  /// other principal.
+  #[test]
+  fn a_cli_attachment_keeps_the_write_lease_to_its_own_term_and_a_read_one_keeps_none() {
+    crate::daemon::audit_on_shard(|state| {
+      let (owner, other) = lease_principals();
+      state.failover_ns = crate::daemon::LIVENESS_BUDGET_NS;
+      let id = plain_volume(state, &owner, "kept-by-term");
+      let termed = attached(
+        state,
+        &owner,
+        id,
+        super::Intent::Write,
+        super::AttachRequest::Termed,
+      );
+      attached(
+        state,
+        &owner,
+        id,
+        super::Intent::Read,
+        super::AttachRequest::Root,
+      );
+      let volume = super::to_db_volume(id);
+      let expires_ns = match state
+        .db
+        .partition()
+        .attachment(termed)
+        .map(|record| &record.consumer)
+      {
+        Some(super::Consumer::Termed { expires_ns }) => *expires_ns,
+        found => panic!("a CLI attachment holds a term: {found:?}"),
+      };
+      let before = expires_ns.saturating_sub(1);
+      assert_eq!(
+        super::lease_kept_until(state, volume, &owner, before),
+        Some(expires_ns)
+      );
+      assert_eq!(
+        super::lease_kept_until(state, volume, &owner, expires_ns),
+        None,
+        "lapsed, and the read attachment keeps no write lease"
+      );
+      assert_eq!(super::lease_kept_until(state, volume, &other, before), None);
+    });
   }
 }
 
