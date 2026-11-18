@@ -7151,6 +7151,23 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   `a_successors_live_log_goes_on_past_every_position_durable_before_it` (`crates/server/tests/fleet.rs`). Owed: the
 >   adopted head lives in the successor shard's memory until the volume's first publication, as the volume's own image
 >   does (GAPS, A-325's live-shipped item).
+> - **A superseded owner stranded its clients (fixed 2026-11-18, A-338).** The nemesis (seeds 6876545201569229162,
+>   10695597685579409771 and 12136749566337968553) failed with "a fence-2 copy behind the fence-1 owner's durable head".
+>   Reproduced in-process (the owner cut off on the probe plane alone, its record plane whole, as the relay left it
+>   before A-330): the takeover completes, the holders' fences go to the successor's epoch, and the old owner learns it
+>   from a holder's `StaleEpoch` and keeps the volume fenced, as designed on 2026-11-05. But the old owner is the
+>   volume's creator, and a node forwarded only a volume it neither created nor recorded, so every verb through the
+>   old owner's node was answered there `StaleEpoch` for good; and a third node routed to the creator, which, readmitted
+>   under its id with its objects gone to their successors, redirected each forward `HomedElsewhere`, which routed to it
+>   again. So a stream whose front node was the old owner never reached the successor, the successor never shipped, and
+>   the only line shipping the volume was the old owner's fenced one. Now a superseded owner steps down: a volume whose
+>   log is fenced at a later epoch is routed to its current owner as any non-owner's is (`verbs::owned_by_another_host`),
+>   and a node asks its own routing for an object it holds before taking the creator for its owner
+>   (`owner_location`'s `known_owner`). The old owner's own first write after its loss may be the one that finds the
+>   fence, and is refused `StaleEpoch`; the next reaches the successor. Held by
+>   `a_superseded_owners_clients_reach_its_successor` (`crates/server/tests/fleet.rs`). Owed (GAPS): a mount on the old
+>   owner (NFS, FUSE) still answers `StaleEpoch`; a node with no routing entry for its own lost object takes itself as
+>   the creator route; and a successor ships a live volume only from its first write.
 
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
@@ -24952,3 +24969,22 @@ Applied in the same change to:
 - **The rule.** The live takeover records, on the owner shard where it materializes the volume, the head phase one
   adopted. The volume's shipper, made at its first publication, starts from that head and takes it once. A volume
   made on its own node starts from nothing, as before.
+
+### A-338 — A superseded owner steps down: its verbs on the volume it lost go to the successor, and a holder routes by its own routing before the creator (2026-11-18, g230, scale-out; §4.8 "Promotion and takeover", R8; the chaos nemesis's stranded owner)
+Applied in the same change to:
+- §4.10 live shipping: the chaos flows' status (a superseded owner stranded its clients).
+- `crates/server/src/verbs.rs`: `owned_by_another_host` routes a superseded volume. `crates/server/src/live_ship.rs`:
+  `superseded`. `crates/server/src/owner_location.rs`: `known_owner` asks this node's routing before the creator.
+- Tests: `a_superseded_owners_clients_reach_its_successor` (`crates/server/tests/fleet.rs`), red on main's code and red
+  with either guard removed.
+- GAPS: the entry of 2026-11-18.
+- **What was there.** A superseded owner kept its volume fenced and refused every write `StaleEpoch` (2026-11-05,
+  `a_superseded_owner_resumed_after_its_takeover_is_fenced`), and a node forwarded a verb only for a volume it had not
+  created and held no record of, so the old owner, its creator, answered every verb itself, for good. A third node took
+  the creator for the owner while its process lived; the creator, readmitted under its id with its objects gone to
+  their successors, redirected each forward `HomedElsewhere`, and the next forward went to it again.
+- **The rule.** A node that does not own a volume routes its verbs to the volume's owner, whoever created it (R8): a
+  node whose log of the volume was fenced at a later epoch does not own it, and a node that holds a copy of an object
+  asks its own routing (the records it accepted, the retirements it installed) before taking the creator for its
+  owner. The superseded owner's own first write after its loss may still be the one that finds the fence, and is
+  refused `StaleEpoch`; the next goes to the successor.

@@ -1150,6 +1150,13 @@ fn stale_epoch(current: HostEpoch) -> slates_ipc::protocol::ReplyBody {
   }
 }
 
+/// Whether this node's ownership of volume `id` was superseded (A-338): its log fenced at a later epoch by a holder that
+/// took a successor's takeover, so the volume is the successor's now and this node's verbs on it go there
+/// (`verbs::owned_by_another_host`).
+pub(crate) fn superseded(state: &ShardState, id: slates_db::catalog::VolumeId) -> bool {
+  fenced(state, id.bytes).is_some()
+}
+
 /// The epoch `volume`'s owner here was fenced at, if it was.
 fn fenced(state: &ShardState, volume: [u8; 16]) -> Option<HostEpoch> {
   state
