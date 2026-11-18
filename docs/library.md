@@ -63,7 +63,7 @@ green) follow the permission the user gave the harness or agent asking to write:
 | `WriteMode` | A landing answers | A merge answers |
 |---|---|---|
 | `Bypass` | `LandOutcome::Written(report)` | `MergeOutcome::Merged { version, .. }` |
-| `Ask` | `LandOutcome::ApprovalRequired(approval)` | `MergeOutcome::ApprovalRequired(approval)` |
+| `Ask` | `LandOutcome::ApprovalRequired(landing_approval)` | `MergeOutcome::ApprovalRequired(merge_approval)` |
 | `Forbid` | `LandOutcome::Refused(policy_refusal)` | `MergeOutcome::Refused(policy_refusal)` |
 
 Conflicts are their own outcome in both (`Conflicted`), typed per path. The launcher sets a
@@ -72,10 +72,11 @@ and reads it with `write_policy` (`None` while unset: merges run at once, landin
 follows the stricter of
 the volume's and, once the daemon keeps them, the agent's own; an agent can never raise its own (the
 daemon refuses the verb on an agent's channel). The launcher approves an ask with
-`Instance::approve(&approval, &issuer)`, which writes exactly the manifest shown or answers the new
-presentation when the volume or the disk changed since. Owed on the daemon's side: an agent's own
-mode, merges under a mode, and a verb that presents a bypass volume's landing without writing it —
-until then `plan_landing` refuses a bypass volume rather than write it.
+`Instance::approve_landing(&approval, &issuer)`, which writes exactly the manifest shown or answers
+the new presentation when the volume or the disk changed since, and
+`Instance::approve_merge(&approval, &issuer)`, which merges exactly the increment shown or asks
+again when the work changed. Both work from any `Instance`. Owed on the daemon's side: an agent's
+own mode, and signed work.
 
 ### Signed work
 
@@ -133,10 +134,10 @@ where you must decide; a moved contract then fails your build at the place to up
   without writing, for a reviewer; `approval_entries(&approval)` lists what an approval writes, path
   by path (each file's BLAKE3 and length, a rename's origin, a symlink's target, the conflict found at
   it): a reviewer with no mount of the volume builds the change from it, checking each file it reads
-  at the head against its entry, and presents the landing again on a mismatch; `approve(&approval,
+  at the head against its entry, and presents the landing again on a mismatch; `approve_landing(&approval,
   &issuer)` writes exactly what was approved.
-- Merging: `merge(&work, signature)` and `rebase(&work)`, with typed conflict windows and the green's
-  head. `Instance::client()` lends the raw client for the declared edits on a work volume (`edit`,
+- Merging: `merge(&work, &evidence, signature)` and `rebase(&work)`, with typed conflict windows and
+  the green's head; `approve_merge(&approval, &issuer)` for a merge an ask mode held. `Instance::client()` lends the raw client for the declared edits on a work volume (`edit`,
   `declare`) and the file verbs, outside the contract.
 - The launcher's authority: `Issuer::from_environment()` (the anchor's handoff, as `slates grant`
   has it) or `Issuer::from_handoff(pairs)`. The SDKs and the MCP server cannot approve: they do not
@@ -170,7 +171,7 @@ fn workspace(folder: &std::path::Path, at: &str) -> Result<(), slates_api::Error
     LandOutcome::ApprovalRequired(approval) => {
       // Show `approval.summary` and `slates.approval_entries(&approval)?`; once approved:
       let issuer = Issuer::from_environment()?;
-      match slates.approve(&approval, &issuer)? {
+      match slates.approve_landing(&approval, &issuer)? {
         LandOutcome::Written(report) => println!("landed: {:?}", report.state),
         LandOutcome::ApprovalRequired(fresh) => println!("it changed; show {} instead", fresh.manifest_text()),
         LandOutcome::Conflicted(conflicts) => println!("{} conflicts", conflicts.len()),

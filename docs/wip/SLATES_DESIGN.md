@@ -6975,13 +6975,16 @@ it builds against the contract and adds to it rather than around it.
 - *Outcomes.* A landing answers `LandOutcome::{Written(report), ApprovalRequired(approval),
   Conflicted(conflicts), Refused(policy refusal)}`; a merge `MergeOutcome::{Merged { version,
   verification }, ApprovalRequired, Conflicted { windows, head }, Refused}`; a rebase
-  `RebaseOutcome::{Rebased { version }, Conflicted}`. An `Approval` names what awaits (a landing
-  request, or a work and its green), the presentation's id, the manifest hash it binds and a typed
-  summary of what it writes (entries per action, bytes, what the filter left out);
-  `Instance::approval_entries` lists it path by path (A-287). `Instance::approve` presents again and
-  approves only when the manifest is still the one shown, so an approval never covers more than its
-  approver saw; otherwise it answers the new presentation. `Instance::plan_landing` presents without
-  writing whatever the mode, for a reviewer.
+  `RebaseOutcome::{Rebased { version }, Conflicted}`. A `LandingApproval` names the request, the
+  presentation's id, the manifest hash it binds and a typed summary of what it writes (entries per
+  action, bytes, what the filter left out); `Instance::approval_entries` lists it path by path
+  (A-287). A `MergeApproval` names the work and its green, the increment's identity it binds and
+  the paths it changes. `Instance::approve_landing` presents again and approves only when the
+  manifest is still the one shown, and `Instance::approve_merge` merges only while the increment is
+  still the one shown; otherwise each answers what holds now. Both work from any client: an
+  approval is bound to what it shows, never to the client that first presented it.
+  `Instance::plan_landing` presents without writing whatever the mode (the daemon's present-only
+  verb), for a reviewer.
 - *Conflicts are verdicts (D-26, D-27).* A landing conflict names its path, its class (§4.15 step 4's
   table: both changed, changed against deleted, deleted against changed, both renamed, both created,
   a type change, the target in use) and the bytes the volume would land there; a merge conflict its
@@ -7065,6 +7068,13 @@ it builds against the contract and adds to it rather than around it.
 > word of the daemon's closed tables read in one place and a stranger a protocol fault; `CONTRACT` = 4.
 > `CONTRACT` = 5: `WritePolicy::UNSET` merges at once and asks for landings, as the daemon applies an
 > unset policy (agreed with A-285's owner; R10 asks for a disk write, a merge changes memory).
+> **`CONTRACT` = 6:** over A-285's present-only verb and merge approvals (1242c7d9): `plan_landing`
+> presents through `Present`, so a bypass volume's plan writes nothing; an ask merge answers a
+> `MergeApproval` (identity, paths) that `approve_merge` merges under the launcher's proof, an
+> approval of another increment merging nothing and asking again; the landing's approval is a
+> `LandingApproval`, approved by `approve_landing`; `merge` takes evidence. Proven by use
+> (`a_merge_follows_its_greens_write_mode`: an ask green holds the merge, nothing merged; a stranger's
+> approval asks again; the shown one merges at 1; a forbidding green refuses).
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -21400,6 +21410,12 @@ contract", new, with its status), GAPS (the A-299 entry and the Embedding librar
 - **`CONTRACT` 5, the same day:** `WritePolicy::UNSET` merges at once and asks for landings (it read ask for both).
   The daemon applies an unset policy so (A-285's owner raised it): R10 asks for a write to disk, while a merge changes
   memory, and every submit merged at once before write modes existed, kiln's included.
+- **`CONTRACT` 6, the same day** (over A-285's present-only verb and merge approvals, 1242c7d9, whose placeholder in
+  `merge` it replaces): `Approval` split into `LandingApproval` and `MergeApproval`, so no outcome can hold an approval
+  of the other act; `approve` into `approve_landing` and `approve_merge` (the authority proves the merge with
+  `merge_approval_proof`; a changed increment merges nothing and is asked again); `merge` takes evidence;
+  `plan_landing` presents through the daemon's `Present`, whatever the mode, and its bypass refusal and
+  `Unsupported::WritePolicies` are gone.
 - **Checked.** `cargo test -p slates-api` (37 unit, 9 by use, 5 start, 1 doc) and `cargo test -p slates-cli` on
   macOS arm64 (kiln runner, 2026-11-18): the cases in §4.12's status. The Linux and Windows arms of the mount and the
   CLI's Windows unmount are not compiled on this host; the integrator's lanes are their first compiler.

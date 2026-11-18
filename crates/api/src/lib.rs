@@ -77,8 +77,9 @@ pub use issuer::{GRANT_TERM_NS, Issuer};
 pub use mount::{MountKind, MountOptions, Mounted};
 pub use observe::{AuditKind, AuditRecord, GrantRecord, GrantState, LandingStage};
 pub use outcome::{
-  ActionTally, Approval, Awaiting, LandOutcome, LandingConflict, LandingReport, LandingState,
-  MergeConflict, MergeConflictClass, MergeConflicts, MergeOutcome, RebaseOutcome, Summary, Work,
+  ActionTally, LandOutcome, LandingApproval, LandingConflict, LandingReport, LandingState,
+  MergeApproval, MergeConflict, MergeConflictClass, MergeConflicts, MergeOutcome, RebaseOutcome,
+  Summary, Work,
 };
 pub use policy::{PolicyReason, PolicyRefusal, PolicySubject, WriteAct, WriteMode, WritePolicy};
 pub use signed::{SignatureFault, Signer, SignerKey, Verification, WorkSignature};
@@ -97,8 +98,11 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// same day). 3: `Instance::set_write_policy` and `Instance::write_policy`, over the daemon's policy verbs (A-285), and
 /// a landing or a merge a policy forbids answered as its `Refused` outcome (the same day). 4: the audit log and the
 /// grant listing typed (`AuditRecord`, `GrantRecord`; the same day). 5: `WritePolicy::UNSET` merges at once and asks
-/// for landings, as the daemon applies an unset policy (the same day).
-pub const CONTRACT: u32 = 5;
+/// for landings, as the daemon applies an unset policy (the same day). 6: a merge an ask mode holds is a
+/// `MergeApproval` (the increment's identity and paths) approved by `approve_merge`, and a landing's approval a
+/// `LandingApproval` approved by `approve_landing` (`Approval` and `approve` split by what they approve); `merge` takes
+/// evidence; `plan_landing` presents through the daemon's present-only verb whatever the mode (the same day).
+pub const CONTRACT: u32 = 6;
 
 /// The typed client and its own types, for the verbs [`Instance::client`] lends outside the contract.
 pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, VhostUserDevice};
