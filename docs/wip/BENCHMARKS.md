@@ -12106,6 +12106,542 @@ x86_64 (windows-latest), quiet, p50: arm minus main within each run, µs (sorted
   µs, 9 of 10 runs, beyond the control); a quiet stat costs +8.1 µs on arm64 and +4.0 on x86_64 (above).
 - **The form:** main's separate receiver, one worker. A-215's combined transact and A-219's second worker are measured
   and rejected.
+- **Continued 2026-11-18 (goal g258, the next section):** cut (c)'s no-wake variant deadlocked over the one-request channel
+  and, over a channel of two (A-348, which lands), measured slower; cut (b), the per-kind spin choice, measured in two forms
+  and rejected; after cut (c) the receiver is within the DLL's spread on x86_64 but for a few microseconds, and on arm64
+  a stat, a rename and an unlink cost 40 to 82 µs more at the quiet p50 and a write 87 µs more loaded.
+
+## Step 7, continued: the no-wake variant, the request channel's bound, the per-kind spin choice, and what remains against the DLL (goal g258; audit step 7; 2026-11-18)
+
+**The question.** Ada (2026-11-07): keep cutting the WinFsp receiver's per-IRP costs, re-measured on both Windows runners,
+quiet and loaded, until it is within the DLL dispatcher's spread or she accepts what remains. After cut (c) (A-274): cut
+(c)'s no-wake variant against cut (c), with "a Create then a security query" a named op, then (b), the per-kind spin
+window.
+
+**How every A/B here was read.** As BENCHMARKS "The bench's own noise" and "Cut (c)" read theirs: the arms interleaved on
+one VM of each runner, quiet and loaded (two spinners a logical CPU), ten runs a lane, the list rotating each run, with
+windows-ab.sh's stall detector; a control arm (main's own binary copied, as diag-winfsp-overlap-48's identical arms); a cut
+called on its within-run differences from main against the range the control's own differences span. The command, each
+arm a build:
+
+```
+ARMS="main=ab-bin/main/slates.exe control=ab-bin/control/slates.exe <cut>=ab-bin/<cut>/slates.exe" \
+  BENCH=ab-bin/mount_bench.exe RUNS=10 SPINNERS_PER_CPU=2 bash docs/wip/bench/fsbench/windows-ab.sh
+```
+
+Hardware: windows-11-arm, image win11-vs2026-arm64 20261112.217.1, Windows 10.0.26200.9974, ARM64 Family 8 Model D49, 4
+CPUs; windows-latest, image win25-vs2026 20261103.298.1, Windows 10.0.26100.33674, AMD Family 25 or 26 (each lane names
+its own), 4 CPUs; 15 GiB each, shared VMs; WinFsp 2.1.25156. Main is `69cd38b2` throughout, with the bench's
+`create_security` (`f2a1eb25`, the main arm, its `slates.exe` main's). All runs 2026-11-18, 09:14 to 14:10 UTC. Every run's
+output is on the lane's `diag-results/g258-<run>-<lane>` branch.
+
+### The bench's create_security op (landed, `58c8b4f6`)
+
+`crates/cli/examples/mount_bench.rs` times, on Windows, an exclusive create then a security query on its handle
+(`GetSecurityInfo`, owner), from the create's start to the query's answer, on files of its own that are closed and
+removed untimed. The query reaches the receive worker as QuerySecurity, which WinFsp answers without calling the host (no
+GetSecurity callback): the request no shard call precedes, right after a Create. diag-winfsp-overlap-52 (run 43148071819)
+saw every such call reach the worker, 21,000 of 21,000 a daemon on arm64; a stream query never did (the kernel refused all
+10,000, error 87), so only the security query is timed. On windows-latest the worker also took 273,006 security queries no
+call of the bench's made, one for each of the 273,007 Cleanups but one, so that runner's lanes carry that traffic in every
+op. The op costs the DLL arm dearly there: 232 ms a call at the loaded p50 against main's 2.9 ms (diag-g258-3, run
+44274158769, cancelled), so the comparison with the DLL below uses the nine ops the earlier comparisons used.
+
+### Cut (c)'s no-wake variant, first form: a deadlock over a one-request channel
+
+**The variant.** Cut (c) (A-274) posts an open's confirmation and wakes the mount's task. The variant posts it without
+the wake, so the next request's own wake carries it to the shard: a stat's open and its info query cost the shard one
+wake, not two. A request WinFsp answers without the shard right after a Create (a security query; mount_bench's
+`create_security` times one) finds the confirmation unapplied and wakes the task and waits a round.
+
+**First form: it deadlocks.** Diag `diag-g258-1` (run 44271751211; main 69cd38b2 with the bench's `create_security`
+(`f2a1eb25`), a control, the variant `abffdfc9`) stalled in its first run on both runners, each lane failing on
+windows-ab.sh's stall detector (1,159 s with no step and no round):
+- windows-11-arm: the first look at the variant's new drive (`[ -d U:/ ]` after `slates mount`) never returned;
+- windows-latest: one whole warm-up round of 1,000 files ran, then the variant's quiet round 1 stalled 11.9 s in;
+- its live CLI suite hung on both runners (`a_cached_read_through_a_winfsp_mount_shows_another_paths_change` on x86_64
+  and `a_file_at_a_two_thousand_unit_path_is_served_across_a_killed_daemon` on arm64, 43 minutes each until cancelled),
+  where the bridge's 103 tests had passed.
+
+**The cause.** The mount's request channel held one request (`REQUEST_BOUND = 1`, "the one receiver waits for its current
+callback's answer before sending another request"), which cut (c) stopped being true: the posted confirmation stays in
+the channel, so the next call's post (`call_on`: post, then wake) waited for room until the shard took the confirmation.
+On main the confirmation's own wake brings the shard, so that post waits for a shard wake on the worker's path, which
+cut (c) meant to remove and diag-winfsp-overlap-52's count of waited-for confirmations did not see (it counted only waits
+for the answer). With no wake, nothing brought the shard: deadlock. On x86_64 a security query from no call of the
+bench's followed nearly every Create (273,006 of them, run 43148071819), and its save woke the shard, which is why a
+whole warm-up round ran there first.
+
+**The test, red first.** `host::channel::the_next_request_is_posted_while_a_confirmation_waits_untaken` posts a
+confirmation and then the next request with nothing taking either: at main's bound (`ca6738e2`) it fails on both
+runners (diag-g258-4, run 44278926773, `red` jobs), at the bound of two (`bb09e307`) it passes, the bridge's 104 tests
+with it, on both runners, and so does the variant over that bound (`685dd645`), whose live CLI suite no longer hangs.
+
+### A-348: the request channel holds the posted confirmation beside the next call (lands); the no-wake variant over it (rejected)
+
+**The arms.** Diag `diag-g258-4` (run 44278926773), four arms: main, the control, `bound` (`bb09e307`: `REQUEST_BOUND`
+two, derived from the worker's outstanding requests, one call it waits for and one confirmation it posted) and `nowake`
+(`685dd645`: the no-wake variant over that bound). Ten runs a lane, 0 failed, no stall, no heartbeat lapse;
+windows-11-arm 10:07–13:54 UTC, windows-latest (AMD Family 25 Model 1) 10:14–13:18 UTC. Its live jobs at both arms passed
+clippy -D warnings, the bridge's 104 tests (the channel test among them) and the CLI's WinFsp suite but two tests that
+fail on main itself on both runners (`a_refused_mount_time_hold_leaves_nothing_mounted` and
+`unmount_releases_every_healthy_drive_beside_a_volume_recovery_could_not_rebuild`: they read the CLI's refusal text, which
+now comes from `slates-api`); its red jobs at main's bound failed the channel test on both runners, as required.
+
+**Verdict, the bound: dead even, and it lands on A-274's rule.**
+- No p50 or p99 cell is beyond the control on windows-latest; on windows-11-arm only tails are, both ways: quiet p99
+  unlink +75.5 µs (4 of 10 faster) and p999 fsync slower, quiet max close faster.
+- It lands because it makes the code hold the design's rule, not for speed: A-274's worker "posts the confirmation, wakes
+  the mount's task, acknowledges and goes on", and with one request's room the next request's post waited for the shard
+  to take that confirmation. The derivation the constant stated ("the one receiver waits for its current callback's
+  answer before sending another request") stopped being true with cut (c), and the no-wake variant showed what the stale
+  bound does to a worker that posts without waking. At two the post never waits, at no measured cost.
+
+**Verdict, the no-wake variant over the bound: rejected.** Slower beyond the control on windows-11-arm: loaded write
+p50 +48.4 µs (0 of 10 runs faster), rename +14.6 (2 of 10), unlink +5.2 (1 of 10), create_security +9.5 (1 of 10, p99
++1,884 and p999 +9,467), quiet write +7.5 (0 of 10); faster only on loaded fsync −13.8 (10 of 10). On windows-latest its
+loaded p99 open is +636 µs (0 of 10 faster), and within the spread its p50s lean slower (loaded stat +5.1, 1 of 10 faster;
+open +4.6, 0 of 10; quiet open +14.3, 1 of 10; quiet create_security +27.5, 3 of 10). Against the bound within each run,
+its quiet create_security is +24.3 µs on arm64 (0 of 10 faster) and +0.0 on x86_64: the round its security query waits,
+and on x86_64 the round every Create's foreign security query already paid. The wake at the post is cut (c)'s reason and
+stays: the shard woken at the post serves the confirmation while the worker sends, and the request after an open finds it
+awake.
+
+arm64 (windows-11-arm), loaded, p50: the bound (`bb09e307`) minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 267.8 | -24.4 -10.6 -8.1 -6.1 -4.2 -0.6 +1.5 +6.7 +7.3 +24.8 | -0.6 (6/10 faster) | -22.0 -13.1 -7.4 -1.1 +0.1 +2.3 +12.3 +14.2 +18.9 +20.7 | +2.3 (4/10 faster) | within the control |
+| write | 137.7 | -29.5 -26.9 -8.6 -7.5 +1.2 +2.9 +6.7 +7.1 +13.5 +16.5 | +2.9 (4/10 faster) | -12.1 -11.2 -8.0 -6.7 +0.1 +1.1 +2.0 +5.3 +9.2 +15.4 | +1.1 (4/10 faster) | within the control |
+| fsync | 131.3 | -10.6 -8.8 -5.6 -2.2 -1.7 -0.8 +4.3 +5.6 +9.6 +10.4 | -0.8 (6/10 faster) | -5.7 -5.2 -4.3 +0.5 +0.9 +2.3 +2.7 +8.0 +10.2 +11.9 | +2.3 (3/10 faster) | within the control |
+| close | 5343.3 | -871.8 -613.8 -417.9 -417.3 -316.3 -297.6 -61.6 +254.9 +705.8 +902.9 | -297.6 (7/10 faster) | -819.0 -449.3 -325.1 -317.9 -215.4 +4.2 +444.2 +628.0 +761.8 +1459.2 | +4.2 (5/10 faster) | within the control |
+| stat | 149.9 | -11.1 -11.0 -2.7 -2.1 -1.7 -1.1 -1.0 -0.4 +0.4 +6.7 | -1.1 (8/10 faster) | -2.5 -2.5 -1.7 -1.6 -1.6 -1.6 -0.4 +0.0 +1.1 +7.1 | -1.6 (7/10 faster) | within the control |
+| open | 4562.7 | -3713.7 -349.6 -335.1 -261.7 -216.5 -89.8 +108.0 +139.7 +396.9 +681.5 | -89.8 (6/10 faster) | -3604.5 -461.2 -344.9 -275.5 -58.8 +130.0 +433.6 +595.4 +2548.4 +4296.8 | +130.0 (5/10 faster) | within the control |
+| read | 57.3 | -4.0 -2.6 -2.0 -1.0 -0.6 +0.4 +0.5 +1.8 +2.1 +5.1 | +0.4 (5/10 faster) | -3.0 -2.3 -2.0 -1.6 -1.0 +2.8 +2.9 +5.0 +5.3 +5.3 | +2.8 (5/10 faster) | within the control |
+| rename | 542.3 | -90.7 -17.0 -7.9 -6.7 -1.9 -1.9 -0.3 +0.3 +14.0 +825.9 | -1.9 (7/10 faster) | -89.5 -13.9 -11.9 -5.0 +0.6 +1.2 +2.3 +3.6 +3.8 +8.2 | +1.2 (4/10 faster) | within the control |
+| unlink | 341.9 | -279.0 -7.1 -5.8 -3.8 -0.8 +0.3 +2.6 +5.6 +1013.5 +1298.0 | +0.3 (5/10 faster) | -287.5 -3.4 +0.0 +1.6 +2.1 +3.2 +3.2 +3.3 +4.6 +4.8 | +3.2 (2/10 faster) | within the control |
+| create_security | 239.2 | -24.6 -5.4 -3.5 -1.8 -1.8 -0.2 +2.1 +3.8 +40.1 +41.5 | -0.2 (6/10 faster) | -32.9 -5.5 -2.8 -2.6 -2.0 +2.2 +2.3 +3.6 +4.1 +4.2 | +2.2 (5/10 faster) | within the control |
+
+arm64 (windows-11-arm), quiet, p50: the bound (`bb09e307`) minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 237.0 | -14.9 -10.4 -8.8 -5.0 -4.4 +0.7 +4.8 +7.8 +9.5 +20.3 | +0.7 (5/10 faster) | -3.9 -3.3 -2.3 -1.6 +0.6 +2.7 +3.1 +8.8 +10.3 +21.6 | +2.7 (4/10 faster) | within the control |
+| write | 104.1 | -5.9 -3.4 -3.4 -0.6 +0.0 +0.2 +0.5 +1.2 +1.2 +1.8 | +0.2 (4/10 faster) | -3.3 -1.9 -1.2 -0.8 +1.3 +1.4 +1.9 +1.9 +3.7 +7.1 | +1.4 (4/10 faster) | within the control |
+| fsync | 115.5 | -7.9 -6.0 -4.3 -0.5 -0.4 +0.1 +0.3 +0.9 +1.0 +3.3 | +0.1 (5/10 faster) | -4.6 -3.2 -2.5 +1.2 +1.5 +1.6 +2.6 +4.4 +5.0 +8.7 | +1.6 (3/10 faster) | within the control |
+| close | 4325.0 | -339.1 -326.7 -84.7 -78.7 +62.9 +266.6 +267.5 +398.8 +436.5 +578.3 | +266.6 (4/10 faster) | -332.1 -257.5 -198.5 -179.2 -77.3 -12.4 +126.6 +246.8 +591.4 +608.2 | -12.4 (6/10 faster) | within the control |
+| stat | 178.7 | -3.1 -2.3 -2.2 -1.7 -0.7 -0.2 -0.2 +0.1 +1.8 +20.7 | -0.2 (7/10 faster) | -33.6 -19.9 -16.8 -15.9 -5.7 -4.7 +0.3 +2.2 +2.4 +21.4 | -4.7 (6/10 faster) | within the control |
+| open | 3885.7 | -543.8 -345.0 -171.3 +242.8 +296.8 +297.6 +442.6 +476.4 +476.6 +598.1 | +297.6 (3/10 faster) | -547.4 -538.2 -283.7 -220.9 +30.8 +254.8 +342.9 +493.6 +549.0 +747.9 | +254.8 (4/10 faster) | within the control |
+| read | 48.6 | -5.5 -0.4 +0.1 +0.1 +0.4 +0.8 +1.4 +2.1 +2.7 +3.0 | +0.8 (2/10 faster) | -2.8 -2.2 -1.6 -0.6 -0.1 +0.5 +1.2 +1.5 +1.7 +3.9 | +0.5 (5/10 faster) | within the control |
+| rename | 495.4 | -24.8 -14.5 -14.1 -9.4 -8.2 -8.2 -2.0 +0.7 +2.7 +4.5 | -8.2 (7/10 faster) | -13.9 -10.0 -7.6 -5.6 -4.5 -3.5 -3.2 +3.1 +6.4 +12.4 | -3.5 (7/10 faster) | within the control |
+| unlink | 305.3 | -22.2 -16.0 -5.1 -4.6 -2.2 -1.3 +0.5 +4.2 +6.2 +24.7 | -1.3 (6/10 faster) | -12.8 -5.3 -5.2 -3.1 -2.2 -1.0 +0.0 +0.7 +3.4 +18.0 | -1.0 (6/10 faster) | within the control |
+| create_security | 236.7 | -25.1 -23.8 -9.5 -6.9 -1.6 -0.2 +6.0 +7.5 +8.1 +22.4 | -0.2 (6/10 faster) | -6.5 -4.1 -1.2 +0.0 +3.9 +6.7 +9.0 +13.1 +17.3 +32.4 | +6.7 (3/10 faster) | within the control |
+
+x86_64 (windows-latest), loaded, p50: the bound (`bb09e307`) minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 1416.8 | -94.7 -76.6 -65.1 -53.4 -16.8 -8.8 +0.3 +10.3 +28.7 +118.7 | -8.8 (6/10 faster) | -61.1 -41.1 -23.8 -12.8 -1.4 +3.5 +8.3 +10.5 +60.1 +66.1 | +3.5 (5/10 faster) | within the control |
+| write | 86.8 | -0.9 -0.6 -0.2 -0.2 -0.2 -0.1 -0.1 +0.0 +0.7 +3.3 | -0.1 (7/10 faster) | -0.7 -0.7 -0.7 -0.6 -0.5 -0.4 -0.3 -0.1 +0.7 +21.2 | -0.4 (8/10 faster) | within the control |
+| fsync | 130.7 | -20.1 -9.8 -0.9 -0.5 -0.4 -0.1 +0.1 +0.4 +1.1 +21.2 | -0.1 (6/10 faster) | -2.0 -2.0 -1.4 -0.8 -0.5 -0.2 +0.1 +0.1 +5.8 +15.7 | -0.2 (6/10 faster) | within the control |
+| close | 69.4 | -0.7 -0.6 -0.4 -0.2 -0.1 +0.0 +0.0 +0.0 +0.5 +0.8 | +0.0 (5/10 faster) | -0.5 -0.4 -0.2 -0.2 -0.2 -0.1 -0.1 -0.1 +0.5 +1.2 | -0.1 (8/10 faster) | within the control |
+| stat | 263.0 | -13.6 -10.0 -2.1 -2.1 -1.1 -0.4 -0.3 +0.4 +1.4 +28.6 | -0.4 (7/10 faster) | -2.5 -2.4 -1.9 -1.2 -1.2 -1.1 -1.0 -0.4 +8.4 +26.5 | -1.1 (8/10 faster) | within the control |
+| open | 193.5 | -25.8 -25.2 -1.4 -1.1 -0.6 +0.0 +0.0 +0.4 +19.3 +25.2 | +0.0 (5/10 faster) | -25.9 -2.2 -1.1 -0.7 -0.4 -0.4 +0.2 +1.0 +3.9 +22.7 | -0.4 (6/10 faster) | within the control |
+| read | 92.9 | -1.5 -1.4 -0.3 -0.3 -0.1 -0.1 +0.1 +0.6 +1.1 +1.3 | -0.1 (6/10 faster) | -1.4 -0.3 -0.3 -0.1 -0.1 -0.1 -0.1 +0.3 +1.2 +2.1 | -0.1 (7/10 faster) | within the control |
+| rename | 648.3 | -79.7 -66.1 -9.3 -6.9 -2.4 +1.7 +6.6 +6.8 +15.6 +110.2 | +1.7 (5/10 faster) | -59.5 -20.4 -7.1 -4.0 -1.8 +3.7 +5.5 +12.3 +76.0 +85.8 | +3.7 (5/10 faster) | within the control |
+| unlink | 364.8 | -55.9 -55.4 -13.5 -10.2 -0.3 +1.6 +4.0 +7.2 +9.5 +61.3 | +1.6 (5/10 faster) | -47.7 -8.7 -6.3 -1.1 -0.1 +1.2 +3.7 +9.7 +28.6 +33.1 | +1.2 (5/10 faster) | within the control |
+| create_security | 2417.2 | -113.7 -104.7 -104.5 -33.0 -32.0 -21.2 -17.0 -11.2 -8.6 +72.0 | -21.2 (9/10 faster) | -74.4 -42.7 -8.0 -7.2 -3.9 +6.3 +6.9 +12.3 +14.4 +52.5 | +6.3 (5/10 faster) | within the control |
+
+x86_64 (windows-latest), quiet, p50: the bound (`bb09e307`) minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 921.9 | -95.6 -58.1 -29.3 -28.8 -28.0 -7.6 +35.6 +35.8 +35.9 +91.6 | -7.6 (6/10 faster) | -132.4 -54.9 -39.8 -12.0 +4.9 +6.0 +7.5 +8.3 +25.7 +42.0 | +6.0 (4/10 faster) | within the control |
+| write | 90.0 | -28.6 -24.5 -18.3 -3.7 -1.0 +0.9 +2.4 +4.2 +11.2 +36.3 | +0.9 (5/10 faster) | -18.4 -8.4 -1.7 -0.8 -0.1 +2.1 +4.8 +8.8 +9.6 +11.9 | +2.1 (5/10 faster) | within the control |
+| fsync | 121.4 | -2.1 -1.3 -1.2 -1.2 -0.9 -0.3 +0.8 +1.0 +2.0 +11.7 | -0.3 (6/10 faster) | -1.8 -1.7 -1.4 -0.4 -0.4 +0.5 +0.6 +1.1 +1.7 +2.1 | +0.5 (5/10 faster) | within the control |
+| close | 67.1 | -1.3 -0.8 -0.7 -0.6 -0.6 -0.4 -0.3 -0.1 +0.3 +0.4 | -0.4 (8/10 faster) | -1.0 -0.8 -0.6 -0.5 -0.5 -0.3 -0.2 +0.1 +0.3 +0.4 | -0.3 (7/10 faster) | within the control |
+| stat | 263.1 | -19.3 -10.6 -4.7 -3.0 -2.9 -0.7 +4.7 +9.2 +18.3 +29.6 | -0.7 (6/10 faster) | -12.8 -8.6 -5.4 -3.4 +1.8 +4.8 +5.0 +6.2 +8.7 +13.2 | +4.8 (4/10 faster) | within the control |
+| open | 196.5 | -40.4 -19.7 -12.3 -8.9 -5.5 +0.7 +11.4 +18.2 +39.2 +46.2 | +0.7 (5/10 faster) | -32.5 -20.8 -1.0 +0.6 +2.8 +4.5 +5.1 +9.5 +17.7 +24.2 | +4.5 (3/10 faster) | within the control |
+| read | 94.2 | -18.8 -16.0 -12.9 -4.4 +0.3 +0.6 +3.9 +4.7 +10.1 +33.6 | +0.6 (4/10 faster) | -13.4 -5.3 -0.4 +0.5 +1.4 +1.9 +4.2 +8.8 +15.1 +15.7 | +1.9 (3/10 faster) | within the control |
+| rename | 605.5 | -60.4 -22.2 -20.5 -9.3 -6.1 -5.8 -3.4 +2.4 +17.9 +118.1 | -5.8 (7/10 faster) | -41.6 -22.5 +2.9 +4.3 +7.5 +9.5 +12.3 +24.2 +52.5 +74.6 | +9.5 (2/10 faster) | within the control |
+| unlink | 360.0 | -55.3 -36.3 -20.1 -12.4 -6.7 -2.5 +3.7 +5.9 +14.0 +78.6 | -2.5 (6/10 faster) | -44.9 -29.7 -10.5 -4.5 -1.9 +1.6 +11.1 +18.3 +33.7 +34.6 | +1.6 (5/10 faster) | within the control |
+| create_security | 1516.2 | -201.3 -75.3 -54.5 -13.9 -6.9 +4.6 +45.9 +80.2 +89.0 +115.8 | +4.6 (5/10 faster) | -183.4 -85.3 -68.4 -12.1 -10.2 +7.2 +7.3 +10.2 +30.9 +69.8 | +7.2 (5/10 faster) | within the control |
+
+arm64 (windows-11-arm), loaded, p50: the no-wake variant (`685dd645`) minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 267.8 | -22.2 -10.3 -10.1 -6.4 -0.8 +0.2 +3.1 +5.1 +6.5 +6.5 | +0.2 (5/10 faster) | -22.0 -13.1 -7.4 -1.1 +0.1 +2.3 +12.3 +14.2 +18.9 +20.7 | +2.3 (4/10 faster) | within the control |
+| write | 137.7 | +20.5 +34.7 +35.1 +40.8 +43.9 +48.4 +50.3 +50.6 +55.0 +79.8 | +48.4 (0/10 faster) | -12.1 -11.2 -8.0 -6.7 +0.1 +1.1 +2.0 +5.3 +9.2 +15.4 | +1.1 (4/10 faster) | **slower** beyond the control |
+| fsync | 131.3 | -25.9 -19.2 -17.9 -15.2 -14.4 -13.8 -11.1 -10.4 -8.0 -3.8 | -13.8 (10/10 faster) | -5.7 -5.2 -4.3 +0.5 +0.9 +2.3 +2.7 +8.0 +10.2 +11.9 | +2.3 (3/10 faster) | **faster** beyond the control |
+| close | 5343.3 | -894.1 -527.0 -523.0 -332.2 -238.0 -145.3 -43.2 -35.4 -26.9 +438.6 | -145.3 (9/10 faster) | -819.0 -449.3 -325.1 -317.9 -215.4 +4.2 +444.2 +628.0 +761.8 +1459.2 | +4.2 (5/10 faster) | within the control |
+| stat | 149.9 | -8.7 -0.3 +0.2 +0.2 +0.7 +1.9 +7.6 +8.1 +8.6 +9.1 | +1.9 (2/10 faster) | -2.5 -2.5 -1.7 -1.6 -1.6 -1.6 -0.4 +0.0 +1.1 +7.1 | -1.6 (7/10 faster) | within the control |
+| open | 4562.7 | -3720.7 -608.3 -306.0 -254.7 -47.2 +29.9 +41.8 +81.6 +243.8 +301.1 | +29.9 (5/10 faster) | -3604.5 -461.2 -344.9 -275.5 -58.8 +130.0 +433.6 +595.4 +2548.4 +4296.8 | +130.0 (5/10 faster) | within the control |
+| read | 57.3 | -4.3 -3.9 -1.1 -0.7 +0.5 +1.4 +1.5 +1.8 +2.0 +2.6 | +1.4 (4/10 faster) | -3.0 -2.3 -2.0 -1.6 -1.0 +2.8 +2.9 +5.0 +5.3 +5.3 | +2.8 (5/10 faster) | within the control |
+| rename | 542.3 | -81.6 -2.5 +7.7 +8.5 +8.5 +14.6 +18.5 +19.7 +25.3 +1287.7 | +14.6 (2/10 faster) | -89.5 -13.9 -11.9 -5.0 +0.6 +1.2 +2.3 +3.6 +3.8 +8.2 | +1.2 (4/10 faster) | **slower** beyond the control |
+| unlink | 341.9 | -278.5 +1.2 +3.6 +3.7 +4.9 +5.2 +6.5 +11.0 +15.7 +1373.7 | +5.2 (1/10 faster) | -287.5 -3.4 +0.0 +1.6 +2.1 +3.2 +3.2 +3.3 +4.6 +4.8 | +3.2 (2/10 faster) | **slower** beyond the control |
+| create_security | 239.2 | -23.6 +0.4 +4.0 +4.4 +6.2 +9.5 +12.6 +12.7 +15.7 +1366.5 | +9.5 (1/10 faster) | -32.9 -5.5 -2.8 -2.6 -2.0 +2.2 +2.3 +3.6 +4.1 +4.2 | +2.2 (5/10 faster) | **slower** beyond the control |
+
+arm64 (windows-11-arm), quiet, p50: the no-wake variant (`685dd645`) minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 237.0 | -12.3 -6.0 -5.4 -5.4 -1.1 -0.7 -0.6 +0.7 +5.3 +20.0 | -0.7 (7/10 faster) | -3.9 -3.3 -2.3 -1.6 +0.6 +2.7 +3.1 +8.8 +10.3 +21.6 | +2.7 (4/10 faster) | within the control |
+| write | 104.1 | +1.8 +2.6 +3.2 +5.5 +5.5 +7.5 +8.4 +9.6 +11.7 +12.5 | +7.5 (0/10 faster) | -3.3 -1.9 -1.2 -0.8 +1.3 +1.4 +1.9 +1.9 +3.7 +7.1 | +1.4 (4/10 faster) | **slower** beyond the control |
+| fsync | 115.5 | -6.9 -5.4 -4.2 -3.3 -1.5 -1.1 +0.8 +1.3 +2.3 +2.8 | -1.1 (6/10 faster) | -4.6 -3.2 -2.5 +1.2 +1.5 +1.6 +2.6 +4.4 +5.0 +8.7 | +1.6 (3/10 faster) | within the control |
+| close | 4325.0 | -395.9 -373.5 -95.6 -8.2 +111.4 +119.4 +197.8 +226.8 +295.9 +441.7 | +119.4 (4/10 faster) | -332.1 -257.5 -198.5 -179.2 -77.3 -12.4 +126.6 +246.8 +591.4 +608.2 | -12.4 (6/10 faster) | within the control |
+| stat | 178.7 | -8.3 -4.4 +1.0 +1.2 +1.2 +2.0 +3.5 +3.7 +3.8 +25.9 | +2.0 (2/10 faster) | -33.6 -19.9 -16.8 -15.9 -5.7 -4.7 +0.3 +2.2 +2.4 +21.4 | -4.7 (6/10 faster) | within the control |
+| open | 3885.7 | -1309.9 -546.6 -376.4 -321.4 -101.1 -77.9 +338.1 +376.5 +712.8 +903.9 | -77.9 (6/10 faster) | -547.4 -538.2 -283.7 -220.9 +30.8 +254.8 +342.9 +493.6 +549.0 +747.9 | +254.8 (4/10 faster) | within the control |
+| read | 48.6 | -2.7 -1.1 -0.6 -0.4 -0.4 +0.0 +0.3 +0.5 +1.6 +2.2 | +0.0 (5/10 faster) | -2.8 -2.2 -1.6 -0.6 -0.1 +0.5 +1.2 +1.5 +1.7 +3.9 | +0.5 (5/10 faster) | within the control |
+| rename | 495.4 | -21.6 -8.5 -6.8 -4.0 -3.3 -0.2 +0.3 +8.5 +10.2 +13.1 | -0.2 (6/10 faster) | -13.9 -10.0 -7.6 -5.6 -4.5 -3.5 -3.2 +3.1 +6.4 +12.4 | -3.5 (7/10 faster) | within the control |
+| unlink | 305.3 | -25.5 -6.3 -6.1 -5.3 -3.6 -1.1 +2.8 +4.1 +5.5 +25.7 | -1.1 (6/10 faster) | -12.8 -5.3 -5.2 -3.1 -2.2 -1.0 +0.0 +0.7 +3.4 +18.0 | -1.0 (6/10 faster) | within the control |
+| create_security | 236.7 | -16.7 +6.2 +13.7 +22.6 +24.1 +24.7 +30.4 +31.0 +44.7 +68.8 | +24.7 (1/10 faster) | -6.5 -4.1 -1.2 +0.0 +3.9 +6.7 +9.0 +13.1 +17.3 +32.4 | +6.7 (3/10 faster) | within the control |
+
+x86_64 (windows-latest), loaded, p50: the no-wake variant (`685dd645`) minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 1416.8 | -56.7 -34.0 -24.6 +3.0 +7.0 +25.0 +27.1 +27.4 +36.8 +36.9 | +25.0 (3/10 faster) | -61.1 -41.1 -23.8 -12.8 -1.4 +3.5 +8.3 +10.5 +60.1 +66.1 | +3.5 (5/10 faster) | within the control |
+| write | 86.8 | -0.5 -0.4 -0.2 -0.2 -0.1 +0.0 +0.1 +0.3 +0.3 +19.5 | +0.0 (5/10 faster) | -0.7 -0.7 -0.7 -0.6 -0.5 -0.4 -0.3 -0.1 +0.7 +21.2 | -0.4 (8/10 faster) | within the control |
+| fsync | 130.7 | -18.0 -0.9 -0.7 -0.5 -0.2 +0.1 +0.2 +1.3 +2.8 +4.1 | +0.1 (5/10 faster) | -2.0 -2.0 -1.4 -0.8 -0.5 -0.2 +0.1 +0.1 +5.8 +15.7 | -0.2 (6/10 faster) | within the control |
+| close | 69.4 | -0.7 -0.1 +0.1 +0.1 +0.1 +0.1 +0.1 +0.5 +0.6 +0.6 | +0.1 (2/10 faster) | -0.5 -0.4 -0.2 -0.2 -0.2 -0.1 -0.1 -0.1 +0.5 +1.2 | -0.1 (8/10 faster) | within the control |
+| stat | 263.0 | -1.4 +2.5 +2.7 +2.8 +4.5 +5.1 +8.1 +8.1 +21.4 +28.0 | +5.1 (1/10 faster) | -2.5 -2.4 -1.9 -1.2 -1.2 -1.1 -1.0 -0.4 +8.4 +26.5 | -1.1 (8/10 faster) | within the control |
+| open | 193.5 | +2.0 +3.0 +4.0 +4.2 +4.5 +4.6 +4.7 +5.0 +29.7 +30.2 | +4.6 (0/10 faster) | -25.9 -2.2 -1.1 -0.7 -0.4 -0.4 +0.2 +1.0 +3.9 +22.7 | -0.4 (6/10 faster) | within the control |
+| read | 92.9 | -0.9 -0.6 -0.3 -0.3 -0.2 -0.1 +0.2 +0.5 +1.0 +1.5 | -0.1 (6/10 faster) | -1.4 -0.3 -0.3 -0.1 -0.1 -0.1 -0.1 +0.3 +1.2 +2.1 | -0.1 (7/10 faster) | within the control |
+| rename | 648.3 | -9.4 +1.6 +3.3 +5.9 +10.0 +10.5 +44.9 +48.7 +66.4 +87.8 | +10.5 (1/10 faster) | -59.5 -20.4 -7.1 -4.0 -1.8 +3.7 +5.5 +12.3 +76.0 +85.8 | +3.7 (5/10 faster) | within the control |
+| unlink | 364.8 | -16.0 -2.4 -1.6 +0.5 +4.5 +5.9 +6.4 +19.9 +47.5 +68.0 | +5.9 (3/10 faster) | -47.7 -8.7 -6.3 -1.1 -0.1 +1.2 +3.7 +9.7 +28.6 +33.1 | +1.2 (5/10 faster) | within the control |
+| create_security | 2417.2 | -95.8 -40.7 -40.4 -31.4 -25.4 -18.5 -17.2 +0.7 +36.3 +46.1 | -18.5 (7/10 faster) | -74.4 -42.7 -8.0 -7.2 -3.9 +6.3 +6.9 +12.3 +14.4 +52.5 | +6.3 (5/10 faster) | within the control |
+
+x86_64 (windows-latest), quiet, p50: the no-wake variant (`685dd645`) minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 921.9 | -105.5 -27.6 -26.1 +12.5 +20.9 +21.8 +27.9 +29.7 +36.4 +43.2 | +21.8 (3/10 faster) | -132.4 -54.9 -39.8 -12.0 +4.9 +6.0 +7.5 +8.3 +25.7 +42.0 | +6.0 (4/10 faster) | within the control |
+| write | 90.0 | -26.6 -26.6 -17.1 -10.4 -4.7 -4.1 -1.7 +0.3 +0.7 +1.0 | -4.1 (7/10 faster) | -18.4 -8.4 -1.7 -0.8 -0.1 +2.1 +4.8 +8.8 +9.6 +11.9 | +2.1 (5/10 faster) | within the control |
+| fsync | 121.4 | -4.7 -2.7 -1.6 -0.8 -0.8 +0.0 +1.3 +4.8 +7.7 +10.0 | +0.0 (5/10 faster) | -1.8 -1.7 -1.4 -0.4 -0.4 +0.5 +0.6 +1.1 +1.7 +2.1 | +0.5 (5/10 faster) | within the control |
+| close | 67.1 | -2.1 -0.9 -0.6 -0.3 -0.2 +0.0 +0.1 +0.2 +0.8 +0.8 | +0.0 (5/10 faster) | -1.0 -0.8 -0.6 -0.5 -0.5 -0.3 -0.2 +0.1 +0.3 +0.4 | -0.3 (7/10 faster) | within the control |
+| stat | 263.1 | -2.1 -1.7 +1.0 +3.5 +3.5 +5.5 +5.8 +15.1 +22.6 +25.1 | +5.5 (2/10 faster) | -12.8 -8.6 -5.4 -3.4 +1.8 +4.8 +5.0 +6.2 +8.7 +13.2 | +4.8 (4/10 faster) | within the control |
+| open | 196.5 | -2.9 +2.7 +3.7 +6.4 +12.5 +14.3 +16.5 +18.7 +25.8 +28.3 | +14.3 (1/10 faster) | -32.5 -20.8 -1.0 +0.6 +2.8 +4.5 +5.1 +9.5 +17.7 +24.2 | +4.5 (3/10 faster) | within the control |
+| read | 94.2 | -17.3 -17.2 -12.2 -7.9 -5.5 -2.5 -1.0 -0.7 +0.5 +1.1 | -2.5 (8/10 faster) | -13.4 -5.3 -0.4 +0.5 +1.4 +1.9 +4.2 +8.8 +15.1 +15.7 | +1.9 (3/10 faster) | within the control |
+| rename | 605.5 | -12.3 -2.1 -2.1 +2.4 +4.1 +4.2 +17.0 +18.0 +25.2 +42.1 | +4.2 (3/10 faster) | -41.6 -22.5 +2.9 +4.3 +7.5 +9.5 +12.3 +24.2 +52.5 +74.6 | +9.5 (2/10 faster) | within the control |
+| unlink | 360.0 | -30.0 -21.5 -6.2 -5.8 -4.2 -2.1 +4.6 +18.1 +40.3 +49.5 | -2.1 (6/10 faster) | -44.9 -29.7 -10.5 -4.5 -1.9 +1.6 +11.1 +18.3 +33.7 +34.6 | +1.6 (5/10 faster) | within the control |
+| create_security | 1516.2 | -145.9 -14.0 -6.9 +11.7 +15.0 +27.5 +28.1 +30.1 +43.2 +77.6 | +27.5 (3/10 faster) | -183.4 -85.3 -68.4 -12.1 -10.2 +7.2 +7.3 +10.2 +30.9 +69.8 | +7.2 (5/10 faster) | within the control |
+
+### Cut (b), the per-kind spin choice: the 2-competitive form and the median form, both rejected
+
+**The change.** A-212's worker spins every shard reply for its window (the median one-way wake it measured as it started)
+and then parks. One window for every kind spun where it could not pay: on arm64 quiet a Create's reply came within it for
+0.2 % of its waits and a Rename's for 0.1 %, each spinning about 9.4 µs of CPU before it slept, while an Info's came within
+it for 98.2 % (diag-winfsp-overlap-50, run 42506936806). The cut let each kind of request (a `host::Op` variant) choose
+between spinning the window and parking at once by its own recent replies, each reply stamped with the instant its shard
+sent it so a kind that parks keeps learning (`crates/bridge-winfsp/src/spin_choice.rs`; its six tests on every host and the
+wait test in `reply.rs` on both Windows runners; the bridge's 110 tests and, for the first form, the CLI's WinFsp suites
+passed on both runners). Two rules, each over about 1,600 replies (the wake estimate's own precision rule):
+- **the 2-competitive form** (`agents/g258-step-continued-ada-perkind`, `f638d2aa`, `95f97256`; diag `diag-g258-2`, run
+  44273781244, windows-11-arm 09:27–11:54 UTC, windows-latest AMD Family 25 Model 17 09:28–11:16 UTC): a spin costs the
+  time spun and a park one wake, the window; a kind spins while the weighted mean of what spinning cost its replies is at
+  most the window;
+- **the median form** (`agents/g258-step-continued-ada-perkind-median`, `1e9afce6`; diag `diag-g258-7`, run 44293352092,
+  windows-11-arm 11:32–14:09 UTC, windows-latest AMD Family 25 Model 1 11:35–13:52 UTC): a kind spins while at least half
+  of its replies came within the window, so the spin catches its median reply.
+
+Both lanes ten runs, 0 failed, no stall, no heartbeat lapse.
+
+**Verdict: both rejected. Each loses on x86_64 and trades on arm64.**
+- windows-latest, the 2-competitive form: 7 p50 cells slower beyond the control, none faster: loaded close +16.7 µs (0 of
+  10 runs faster; within 1 µs of that in every run: a wake added to each), unlink +27.4 (0 of 10), create_security +59.2
+  (0 of 10); quiet fsync +15.4, stat +19.1, rename +54.4, unlink +28.6. The rule parked kinds whose median reply the spin
+  caught (there a Release's came within the window for 63 % of its waits loaded and an Open's for 54 % quiet,
+  diag-winfsp-overlap-50).
+- windows-latest, the median form: slower beyond the control on loaded close +20.3 (0 of 10), stat +42.5 (2 of 10; p99
+  +5,818), read +20.0 (1 of 10), fsync +19.3, quiet stat +19.8, loaded p99 open and p999 rename; none faster. Parking
+  only kinds whose median reply missed did not spare this runner: each p50 that moved, moved by about one wake.
+- windows-11-arm, the 2-competitive form: faster beyond the control on loaded write p50 −19.6 µs (10 of 10) and rename
+  −25.2 (9 of 10; p99 −1,857); slower on loaded create +8.0 (1 of 10 faster), stat +20.2 (1 of 10; p99 +6,080), unlink
+  +16.1 (0 of 10), quiet fsync +15.7.
+- windows-11-arm, the median form: faster beyond the control on loaded write −42.3 µs (10 of 10) and rename −35.2 (10 of
+  10), about half of the loaded write's gap against the DLL below; slower on loaded stat +11.7 (1 of 10; p99 +7,160, 0 of
+  10), quiet write +4.3 and fsync +10.9.
+- So a spin that misses costs arm64's loaded shards a CPU they need, and a park costs x86_64 a wake it does not otherwise
+  pay. A choice that gets the first without the second needs a signal of contention, not of the kind alone: owed, below.
+- The per-kind count each worker logs as it ends was lost in these runs: the bench's teardown ends each anchor right after
+  its unmount answers, before the worker's last line. The Windows wait test holds the count instead
+  (`a_kind_whose_replies_came_late_is_waited_for_parked_at_once`).
+
+arm64 (windows-11-arm), loaded, p50: the 2-competitive form (`f638d2aa`) minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 206.8 | -6.4 +1.3 +7.2 +7.6 +7.7 +8.0 +8.2 +9.6 +13.7 +16.0 | +8.0 (1/10 faster) | -13.6 -9.2 -6.8 -6.1 -2.2 -1.1 +3.3 +3.9 +6.2 +6.9 | -1.1 (6/10 faster) | **slower** beyond the control |
+| write | 186.0 | -47.7 -43.6 -41.2 -26.8 -25.7 -19.6 -18.4 -14.9 -9.3 -8.2 | -19.6 (10/10 faster) | -5.9 -1.6 -1.0 -0.7 +0.7 +1.1 +3.5 +5.6 +6.0 +8.9 | +1.1 (4/10 faster) | **faster** beyond the control |
+| fsync | 108.5 | -1.5 +1.8 +2.1 +3.8 +4.5 +5.8 +8.7 +10.0 +10.2 +10.8 | +5.8 (1/10 faster) | -11.8 -10.7 -8.6 -4.0 -3.4 -2.5 -0.1 +8.6 +8.8 +9.2 | -2.5 (7/10 faster) | within the control |
+| close | 4638.2 | -313.9 -301.6 -104.4 -88.8 +35.2 +145.7 +221.1 +260.0 +271.2 +289.9 | +145.7 (4/10 faster) | -549.5 -523.5 -315.3 -240.9 -65.5 -4.6 +71.8 +110.6 +148.6 +165.7 | -4.6 (6/10 faster) | within the control |
+| stat | 152.9 | -9.4 +3.6 +4.2 +12.4 +15.0 +20.2 +20.9 +21.6 +22.8 +24.9 | +20.2 (1/10 faster) | -2.7 +0.2 +1.2 +1.4 +2.5 +2.6 +3.3 +4.1 +4.1 +4.5 | +2.6 (1/10 faster) | **slower** beyond the control |
+| open | 4059.0 | -336.7 -93.3 -80.1 -57.5 -50.7 -40.1 +52.4 +103.0 +160.9 +202.4 | -40.1 (6/10 faster) | -395.8 -191.1 -136.3 -124.9 -123.3 -94.4 +15.7 +44.6 +62.3 +106.8 | -94.4 (6/10 faster) | within the control |
+| read | 44.7 | -1.5 -1.2 -1.0 -0.5 -0.4 -0.1 +0.0 +0.1 +0.1 +0.5 | -0.1 (6/10 faster) | -2.4 -1.9 -1.6 -1.1 -0.8 -0.3 +0.0 +0.2 +0.2 +0.7 | -0.3 (6/10 faster) | within the control |
+| rename | 512.2 | -33.0 -30.8 -29.9 -27.1 -26.1 -25.2 -23.5 -8.7 -0.4 +11.6 | -25.2 (9/10 faster) | -3.7 +4.2 +4.2 +7.0 +7.3 +9.4 +10.0 +10.4 +11.9 +16.0 | +9.4 (1/10 faster) | **faster** beyond the control |
+| unlink | 341.4 | +10.8 +12.9 +14.1 +15.3 +15.9 +16.1 +16.6 +16.6 +20.1 +31.3 | +16.1 (0/10 faster) | -2.9 -1.0 +0.6 +1.9 +2.1 +2.1 +2.9 +3.5 +6.9 +9.5 | +2.1 (2/10 faster) | **slower** beyond the control |
+| create_security | 238.5 | -10.3 -9.2 -8.6 -6.6 -5.0 -4.7 -3.9 -2.0 +2.5 +9.0 | -4.7 (8/10 faster) | -6.2 -2.4 -1.3 -0.5 +2.3 +3.4 +4.0 +4.3 +5.7 +6.4 | +3.4 (4/10 faster) | within the control |
+
+arm64 (windows-11-arm), quiet, p50: the 2-competitive form (`f638d2aa`) minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 203.1 | -8.5 -8.4 -4.1 +1.1 +2.8 +4.5 +4.6 +7.5 +9.4 +10.5 | +4.5 (3/10 faster) | -3.7 -0.8 -0.6 +0.7 +1.1 +1.8 +2.7 +7.1 +10.6 +13.8 | +1.8 (3/10 faster) | within the control |
+| write | 96.8 | +2.7 +4.2 +4.6 +4.8 +5.9 +7.2 +8.3 +9.5 +10.0 +12.0 | +7.2 (0/10 faster) | -4.3 -3.8 -1.3 -0.4 +2.5 +2.6 +3.5 +3.9 +4.1 +9.6 | +2.6 (4/10 faster) | within the control |
+| fsync | 110.3 | -1.4 +7.6 +9.8 +10.0 +13.1 +15.7 +17.1 +17.3 +21.8 +22.0 | +15.7 (1/10 faster) | -7.5 -5.7 -3.5 -1.9 -0.4 +1.5 +3.0 +5.9 +6.9 +9.1 | +1.5 (5/10 faster) | **slower** beyond the control |
+| close | 4083.9 | -58.7 -57.8 -52.0 -6.2 +21.1 +34.6 +35.2 +64.6 +147.9 +261.6 | +34.6 (4/10 faster) | -197.3 -145.0 -101.8 -56.0 -50.3 +31.1 +45.2 +99.9 +110.0 +132.8 | +31.1 (5/10 faster) | within the control |
+| stat | 169.0 | -7.6 -0.7 -0.4 +1.3 +1.7 +1.9 +2.8 +10.3 +20.8 +33.3 | +1.9 (3/10 faster) | -15.7 -3.5 +0.7 +1.0 +4.3 +5.6 +6.4 +12.2 +16.2 +25.9 | +5.6 (2/10 faster) | within the control |
+| open | 3838.3 | -39.8 +1.0 +3.9 +11.4 +12.1 +31.8 +32.0 +38.4 +59.5 +67.4 | +31.8 (1/10 faster) | -76.1 -56.2 -53.8 -38.2 -5.9 +15.2 +23.3 +43.8 +56.1 +103.1 | +15.2 (5/10 faster) | within the control |
+| read | 42.6 | -2.3 +0.1 +0.3 +0.3 +0.3 +0.5 +0.6 +0.7 +1.2 +1.5 | +0.5 (1/10 faster) | -0.7 -0.7 -0.4 -0.1 +0.0 +0.0 +0.1 +0.4 +0.8 +1.3 | +0.0 (4/10 faster) | within the control |
+| rename | 468.0 | -5.0 -3.7 -3.4 -0.5 -0.1 +0.5 +6.5 +25.5 +39.0 +40.6 | +0.5 (5/10 faster) | -5.7 -2.9 +0.6 +4.1 +4.5 +6.7 +7.3 +8.2 +8.2 +14.1 | +6.7 (2/10 faster) | within the control |
+| unlink | 286.2 | -6.9 -6.5 -3.7 -0.6 +3.4 +3.7 +10.6 +14.9 +19.3 +22.2 | +3.7 (4/10 faster) | -1.6 -0.6 +0.5 +1.3 +3.8 +4.5 +6.4 +7.7 +8.7 +12.2 | +4.5 (2/10 faster) | within the control |
+| create_security | 228.1 | -24.5 -17.8 -16.7 -15.4 -7.7 -5.7 -2.9 -1.8 +1.3 +11.6 | -5.7 (8/10 faster) | -16.3 -11.8 -8.1 -1.9 +2.1 +6.1 +7.4 +7.9 +10.3 +14.4 | +6.1 (4/10 faster) | within the control |
+
+x86_64 (windows-latest), loaded, p50: the 2-competitive form (`f638d2aa`) minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 1105.1 | -2.9 +0.0 +2.1 +9.8 +41.9 +46.2 +53.6 +74.1 +80.2 +81.8 | +46.2 (1/10 faster) | -38.1 -28.7 -27.1 -23.6 -17.6 -12.4 +27.3 +27.3 +38.7 +54.4 | -12.4 (6/10 faster) | within the control |
+| write | 74.5 | +0.0 +4.6 +14.4 +14.5 +15.7 +16.0 +16.1 +17.2 +17.8 +18.1 | +16.0 (0/10 faster) | -1.2 -0.4 -0.4 -0.2 -0.1 +0.0 +0.4 +0.9 +15.0 +16.8 | +0.0 (5/10 faster) | within the control |
+| fsync | 105.7 | -0.9 +0.0 +13.4 +16.1 +16.9 +17.8 +28.9 +32.8 +33.2 +34.0 | +17.8 (1/10 faster) | -1.1 -0.9 -0.7 -0.3 -0.1 +0.0 +0.0 +1.1 +32.2 +33.0 | +0.0 (5/10 faster) | within the control |
+| close | 55.1 | +16.3 +16.4 +16.5 +16.7 +16.7 +16.7 +16.8 +16.8 +17.2 +17.3 | +16.7 (0/10 faster) | -0.6 -0.4 -0.2 -0.2 -0.1 -0.1 +0.1 +0.2 +1.0 +1.3 | -0.1 (6/10 faster) | **slower** beyond the control |
+| stat | 191.7 | +0.5 +16.9 +17.8 +33.7 +36.2 +36.4 +37.2 +73.3 +75.9 +76.8 | +36.4 (0/10 faster) | -1.0 -0.5 -0.3 -0.2 -0.2 +0.8 +0.9 +1.1 +34.9 +39.1 | +0.8 (5/10 faster) | within the control |
+| open | 153.9 | -1.1 +0.5 +1.0 +14.5 +17.8 +18.1 +19.0 +37.3 +37.3 +39.8 | +18.1 (1/10 faster) | -0.9 +0.5 +0.6 +0.7 +0.8 +1.2 +1.3 +3.1 +21.8 +22.8 | +1.2 (1/10 faster) | within the control |
+| read | 75.3 | -0.1 +0.2 +0.4 +0.5 +0.5 +1.1 +1.7 +17.3 +17.7 +18.7 | +1.1 (1/10 faster) | -0.3 -0.1 +0.2 +0.2 +0.5 +0.5 +0.5 +1.0 +17.2 +17.8 | +0.5 (2/10 faster) | within the control |
+| rename | 489.0 | +1.9 +5.4 +14.6 +38.4 +72.7 +75.3 +79.2 +195.8 +196.6 +209.9 | +75.3 (0/10 faster) | -2.7 -2.2 -0.8 -0.4 +2.5 +2.9 +5.1 +5.5 +107.1 +109.2 | +2.9 (4/10 faster) | within the control |
+| unlink | 326.4 | +4.1 +4.3 +11.2 +12.5 +18.4 +27.4 +29.1 +30.9 +34.5 +48.0 | +27.4 (0/10 faster) | -19.8 -8.7 -3.3 -3.1 +2.2 +2.7 +4.7 +14.6 +16.9 +18.2 | +2.7 (4/10 faster) | **slower** beyond the control |
+| create_security | 1829.1 | +44.9 +52.4 +54.2 +54.8 +55.6 +59.2 +72.7 +78.0 +86.4 +94.5 | +59.2 (0/10 faster) | -18.6 -11.0 -0.7 +5.5 +9.8 +12.0 +21.3 +25.1 +28.0 +36.0 | +12.0 (3/10 faster) | **slower** beyond the control |
+
+x86_64 (windows-latest), quiet, p50: the 2-competitive form (`f638d2aa`) minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 652.3 | -42.7 -41.8 +0.4 +1.5 +5.4 +16.7 +32.4 +34.7 +44.7 +50.9 | +16.7 (2/10 faster) | -43.3 -30.7 -6.9 +0.4 +2.7 +18.1 +20.2 +23.8 +36.0 +45.3 | +18.1 (3/10 faster) | within the control |
+| write | 64.8 | -30.8 -15.4 -12.7 -10.9 +4.4 +10.9 +17.4 +18.9 +22.3 +22.4 | +10.9 (4/10 faster) | -29.2 -25.6 -12.0 -6.4 -4.5 +18.8 +20.5 +21.1 +26.9 +28.7 | +18.8 (5/10 faster) | within the control |
+| fsync | 74.9 | -11.5 -6.9 -1.2 +4.3 +8.3 +15.4 +16.2 +17.2 +17.5 +23.6 | +15.4 (3/10 faster) | -8.2 -4.6 -2.4 -1.8 -0.2 +3.2 +4.4 +4.8 +6.7 +9.0 | +3.2 (5/10 faster) | **slower** beyond the control |
+| close | 39.5 | -0.5 -0.1 +0.1 +0.4 +0.5 +0.7 +0.8 +0.9 +1.0 +1.1 | +0.7 (2/10 faster) | -0.6 -0.2 -0.1 -0.1 +0.0 +0.1 +0.4 +0.5 +0.5 +0.9 | +0.1 (4/10 faster) | within the control |
+| stat | 158.3 | -24.9 -13.1 -5.7 +9.3 +14.0 +19.1 +20.9 +24.8 +27.3 +30.2 | +19.1 (3/10 faster) | -12.4 -10.0 -5.8 -4.1 -2.8 +7.8 +8.3 +10.7 +14.4 +17.9 | +7.8 (5/10 faster) | **slower** beyond the control |
+| open | 115.8 | -19.5 -19.5 -16.2 -11.0 -2.1 +0.8 +9.6 +10.1 +18.7 +20.2 | +0.8 (5/10 faster) | -19.9 -16.4 -4.1 -2.8 -2.0 +10.0 +12.7 +13.4 +18.2 +20.0 | +10.0 (5/10 faster) | within the control |
+| read | 9.1 | -0.5 -0.2 +0.0 +0.0 +0.0 +0.0 +0.1 +0.1 +0.2 +0.3 | +0.0 (2/10 faster) | -0.1 -0.1 -0.1 -0.1 +0.0 +0.0 +0.0 +0.1 +0.1 +0.5 | +0.0 (4/10 faster) | within the control |
+| rename | 354.6 | -52.0 -35.2 -17.0 +9.2 +36.6 +54.4 +55.4 +69.8 +73.9 +86.5 | +54.4 (3/10 faster) | -45.7 -40.6 -15.5 -12.3 -7.8 +28.8 +41.5 +42.4 +46.9 +46.9 | +28.8 (5/10 faster) | **slower** beyond the control |
+| unlink | 196.0 | -28.7 -18.4 -7.6 +11.5 +16.5 +28.6 +31.5 +34.4 +40.2 +43.1 | +28.6 (3/10 faster) | -18.3 -11.8 -7.6 +1.3 +1.5 +9.7 +20.1 +22.2 +22.8 +23.9 | +9.7 (3/10 faster) | **slower** beyond the control |
+| create_security | 1108.3 | -92.8 -44.7 +2.3 +17.0 +17.7 +23.9 +29.7 +39.3 +50.2 +73.4 | +23.9 (2/10 faster) | -66.9 -57.1 +15.1 +21.0 +23.7 +23.9 +31.3 +32.8 +43.5 +65.7 | +23.9 (2/10 faster) | within the control |
+
+arm64 (windows-11-arm), loaded, p50: the median form (`1e9afce6`) minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 244.0 | -20.9 -4.1 -0.3 +3.4 +5.9 +6.2 +8.5 +11.4 +20.0 +23.7 | +6.2 (3/10 faster) | -20.6 -20.4 -13.5 -11.3 -4.6 -4.0 -3.7 +1.7 +9.6 +10.9 | -4.0 (7/10 faster) | within the control |
+| write | 183.3 | -52.7 -50.8 -49.3 -46.2 -43.6 -42.3 -35.3 -35.1 -18.7 -11.3 | -42.3 (10/10 faster) | -7.5 -2.2 -1.6 -0.7 +1.3 +2.2 +5.6 +6.6 +8.7 +12.9 | +2.2 (4/10 faster) | **faster** beyond the control |
+| fsync | 124.5 | -9.9 -3.5 -2.7 -2.6 -0.6 -0.5 +0.5 +5.6 +5.6 +8.6 | -0.5 (6/10 faster) | -13.0 -8.1 -7.8 -7.4 -6.6 -4.4 -3.4 -1.2 +6.6 +10.8 | -4.4 (8/10 faster) | within the control |
+| close | 5342.2 | -1671.3 -335.6 -248.5 -141.1 +17.4 +84.5 +148.8 +200.4 +655.8 +886.5 | +84.5 (4/10 faster) | -1329.7 -1312.2 -607.0 -457.4 -346.2 -219.7 +56.3 +165.6 +247.3 +629.7 | -219.7 (6/10 faster) | within the control |
+| stat | 154.5 | -1.1 +0.4 +6.9 +8.1 +10.9 +11.7 +18.7 +19.6 +20.0 +20.2 | +11.7 (1/10 faster) | -1.1 -0.1 +0.4 +0.5 +0.7 +0.8 +1.7 +1.8 +3.2 +4.3 | +0.8 (2/10 faster) | **slower** beyond the control |
+| open | 4425.7 | -4252.5 -179.1 -176.6 -162.4 -12.7 -9.4 -7.8 +108.9 +253.3 +486.5 | -9.4 (7/10 faster) | -3917.9 -943.0 -262.6 -204.6 -203.8 -156.7 +80.6 +125.1 +195.4 +545.6 | -156.7 (6/10 faster) | within the control |
+| read | 52.5 | -6.2 -3.0 -1.1 -1.0 -0.8 -0.2 +0.1 +0.5 +1.5 +2.5 | -0.2 (6/10 faster) | -6.3 -3.6 -1.9 -1.2 -1.1 -1.0 -0.1 +1.4 +1.7 +1.9 | -1.0 (7/10 faster) | within the control |
+| rename | 534.9 | -50.3 -47.2 -46.9 -43.6 -39.8 -35.2 -32.7 -30.5 -16.4 -7.9 | -35.2 (10/10 faster) | -2.6 +0.0 +3.2 +3.2 +4.4 +6.2 +7.3 +7.7 +10.1 +18.5 | +6.2 (1/10 faster) | **faster** beyond the control |
+| unlink | 354.4 | -8.5 -4.2 -3.1 -0.9 -0.3 -0.1 +0.1 +1.4 +3.8 +3.9 | -0.1 (6/10 faster) | -5.3 -3.1 -2.9 -0.9 +1.3 +1.9 +2.2 +3.4 +5.1 +10.1 | +1.9 (4/10 faster) | within the control |
+| create_security | 241.4 | -10.5 -10.2 -9.4 -4.2 -3.4 -3.2 -2.4 -2.2 -1.1 +0.4 | -3.2 (9/10 faster) | -8.0 -4.8 +0.9 +1.1 +2.8 +3.6 +4.8 +7.3 +8.6 +12.3 | +3.6 (2/10 faster) | within the control |
+
+arm64 (windows-11-arm), quiet, p50: the median form (`1e9afce6`) minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 235.2 | -5.8 -3.2 -2.6 -2.3 -1.0 +0.2 +0.7 +0.7 +1.5 +5.8 | +0.2 (5/10 faster) | -6.2 -6.1 -4.2 -3.8 -2.7 -1.6 -1.6 +1.3 +1.7 +3.3 | -1.6 (7/10 faster) | within the control |
+| write | 101.5 | -0.6 +2.9 +3.2 +3.9 +4.3 +4.3 +5.1 +5.3 +7.1 +7.6 | +4.3 (1/10 faster) | -5.1 -4.9 -3.8 -3.1 -1.5 -0.9 -0.4 -0.4 +0.9 +2.6 | -0.9 (8/10 faster) | **slower** beyond the control |
+| fsync | 118.0 | -1.5 +4.6 +6.2 +7.1 +10.5 +10.9 +13.2 +13.3 +16.2 +22.8 | +10.9 (1/10 faster) | -7.2 -6.2 -2.8 -2.2 -2.1 -0.6 -0.3 +2.4 +4.0 +4.0 | -0.6 (7/10 faster) | **slower** beyond the control |
+| close | 4295.1 | -210.7 -79.2 -66.7 -45.9 -37.0 -17.0 -15.9 -4.4 +53.0 +55.2 | -17.0 (8/10 faster) | -172.8 -134.6 -106.0 -102.2 -38.5 +26.0 +26.3 +36.6 +51.4 +83.9 | +26.0 (5/10 faster) | within the control |
+| stat | 187.7 | -22.4 -11.4 -8.2 -4.1 -3.7 -1.9 -0.6 -0.6 +1.2 +8.3 | -1.9 (8/10 faster) | -25.8 -3.5 -1.9 -1.7 -1.5 +0.6 +1.0 +1.3 +1.6 +23.8 | +0.6 (5/10 faster) | within the control |
+| open | 4111.5 | -178.3 -99.5 -34.8 -20.5 +3.6 +70.0 +102.3 +156.9 +191.8 +194.5 | +70.0 (4/10 faster) | -170.6 -97.2 -89.6 -77.3 +34.6 +44.3 +52.4 +106.3 +154.7 +161.6 | +44.3 (4/10 faster) | within the control |
+| read | 48.4 | -3.2 -2.7 -0.2 +0.0 +0.1 +0.5 +0.6 +0.6 +1.5 +3.4 | +0.5 (3/10 faster) | -1.4 -1.3 -0.8 -0.6 -0.2 +0.1 +1.5 +1.6 +1.7 +2.2 | +0.1 (5/10 faster) | within the control |
+| rename | 491.4 | -5.6 +2.8 +3.1 +6.5 +7.2 +8.4 +12.6 +18.7 +23.5 +70.1 | +8.4 (1/10 faster) | -13.1 -4.9 -1.4 -0.6 +0.0 +1.4 +2.9 +3.3 +4.9 +9.0 | +1.4 (4/10 faster) | within the control |
+| unlink | 299.7 | -6.7 -4.7 -4.6 -4.5 -3.8 -2.8 +0.7 +2.6 +4.9 +28.3 | -2.8 (6/10 faster) | -5.9 +1.2 +1.9 +2.3 +2.7 +4.3 +4.8 +6.1 +10.0 +10.7 | +4.3 (1/10 faster) | within the control |
+| create_security | 235.2 | -15.4 -11.4 -10.0 -6.4 -5.4 -1.6 +0.8 +1.1 +2.0 +5.2 | -1.6 (6/10 faster) | -7.9 -7.4 -5.8 -5.3 -0.7 -0.6 +0.5 +2.0 +4.9 +5.1 | -0.6 (6/10 faster) | within the control |
+
+x86_64 (windows-latest), loaded, p50: the median form (`1e9afce6`) minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 1436.3 | -85.3 -51.9 -49.3 -33.9 -24.3 +17.9 +35.8 +46.8 +55.8 +58.0 | +17.9 (5/10 faster) | -116.4 -52.8 -50.0 -29.8 -20.6 -18.2 -1.5 +31.7 +42.1 +77.2 | -18.2 (7/10 faster) | within the control |
+| write | 88.5 | -3.5 -0.3 -0.1 +0.0 +1.3 +1.4 +13.4 +19.1 +20.7 +21.2 | +1.4 (3/10 faster) | -19.0 -8.4 -4.2 -3.2 -0.3 -0.3 -0.3 -0.2 +0.9 +2.5 | -0.3 (8/10 faster) | within the control |
+| fsync | 130.8 | -8.4 -0.3 -0.2 +0.5 +1.5 +19.3 +21.1 +23.7 +41.6 +42.2 | +19.3 (3/10 faster) | -23.5 -21.2 -19.1 -7.7 -0.6 +0.1 +0.3 +0.5 +5.4 +18.0 | +0.1 (5/10 faster) | **slower** beyond the control |
+| close | 69.0 | +0.0 +0.2 +1.2 +19.5 +19.9 +20.3 +20.6 +20.9 +21.0 +21.1 | +20.3 (0/10 faster) | -1.5 -1.1 -1.0 -1.0 -0.5 -0.4 -0.4 -0.1 +0.0 +0.5 | -0.4 (8/10 faster) | **slower** beyond the control |
+| stat | 261.8 | -29.5 -0.2 +1.4 +2.6 +3.2 +42.5 +48.7 +49.1 +49.7 +85.5 | +42.5 (2/10 faster) | -29.5 -29.2 -4.2 -1.0 -0.7 -0.3 +0.6 +3.2 +3.4 +29.3 | -0.3 (6/10 faster) | **slower** beyond the control |
+| open | 192.7 | -24.6 -0.5 +0.0 +1.2 +4.3 +22.7 +22.9 +24.5 +25.7 +27.1 | +22.7 (2/10 faster) | -24.9 -23.5 -5.4 -1.2 -0.8 -0.3 -0.1 +22.5 +25.4 +26.7 | -0.3 (7/10 faster) | within the control |
+| read | 92.9 | -0.2 +0.0 +0.5 +0.8 +1.7 +20.0 +20.7 +21.5 +21.7 +22.2 | +20.0 (1/10 faster) | -1.8 -1.1 -0.3 -0.2 -0.1 -0.1 +0.0 +0.7 +1.1 +1.1 | -0.1 (6/10 faster) | **slower** beyond the control |
+| rename | 638.7 | -96.6 +0.0 +4.8 +20.4 +28.4 +94.7 +120.2 +150.8 +157.7 +189.5 | +94.7 (1/10 faster) | -97.5 -94.4 -32.1 -18.8 -3.2 +1.2 +3.3 +7.7 +38.6 +95.1 | +1.2 (5/10 faster) | within the control |
+| unlink | 358.6 | -42.2 -0.5 +3.6 +13.3 +13.9 +26.3 +29.0 +49.3 +65.5 +70.1 | +26.3 (2/10 faster) | -53.2 -29.1 -20.4 -8.1 -0.3 +1.5 +2.0 +29.6 +45.7 +64.7 | +1.5 (5/10 faster) | within the control |
+| create_security | 2402.5 | -112.2 -42.6 -35.5 -29.5 -25.6 -20.0 -6.0 -0.5 +32.6 +34.1 | -20.0 (8/10 faster) | -62.6 -61.5 -34.8 -12.0 -10.4 -3.0 +0.4 +8.6 +56.7 +60.6 | -3.0 (6/10 faster) | within the control |
+
+x86_64 (windows-latest), quiet, p50: the median form (`1e9afce6`) minus main within each run, µs (sorted); the cut's median against the control's spread.
+
+| op | main's median | cut − main, each run | cut median | control − main, each run | control median | verdict |
+|---|---|---|---|---|---|---|
+| create | 931.3 | -61.2 -35.1 -22.6 -15.1 +6.5 +23.2 +32.4 +38.2 +47.1 +49.1 | +23.2 (4/10 faster) | -40.8 -40.1 -29.4 -24.1 -22.2 -14.2 +19.0 +25.2 +29.8 +58.4 | -14.2 (6/10 faster) | within the control |
+| write | 105.2 | -27.1 -12.6 -4.1 -2.9 +3.2 +4.3 +7.2 +10.6 +11.3 +35.6 | +4.3 (4/10 faster) | -28.4 -25.2 -12.7 -12.3 -3.4 +0.1 +2.5 +6.4 +9.5 +15.9 | +0.1 (5/10 faster) | within the control |
+| fsync | 120.4 | -2.2 -1.8 +0.3 +2.3 +4.2 +8.8 +21.7 +22.1 +22.7 +46.0 | +8.8 (2/10 faster) | -4.5 -3.3 -1.6 +0.0 +0.2 +0.2 +0.5 +3.2 +5.0 +10.1 | +0.2 (3/10 faster) | within the control |
+| close | 65.3 | -0.6 +0.0 +0.1 +0.1 +0.7 +1.1 +1.1 +1.2 +2.2 +4.2 | +1.1 (1/10 faster) | -0.9 -0.5 -0.4 -0.2 -0.1 +0.0 +0.0 +0.1 +0.2 +1.2 | +0.0 (5/10 faster) | within the control |
+| stat | 263.0 | -14.0 -12.5 -4.1 -3.7 +18.7 +19.8 +24.9 +27.6 +28.4 +39.7 | +19.8 (4/10 faster) | -10.9 -9.8 -7.0 -5.7 -4.3 -0.7 +0.3 +3.1 +5.2 +15.1 | -0.7 (6/10 faster) | **slower** beyond the control |
+| open | 208.1 | -36.8 -12.8 -11.8 +0.4 +1.7 +9.5 +15.6 +18.1 +19.4 +40.6 | +9.5 (3/10 faster) | -28.6 -22.7 -14.1 -7.8 -6.3 -2.4 +1.2 +7.0 +22.0 +34.4 | -2.4 (6/10 faster) | within the control |
+| read | 110.8 | -25.4 -14.5 -4.0 -3.7 -0.9 -0.6 +2.7 +4.3 +16.3 +35.4 | -0.6 (6/10 faster) | -24.8 -21.2 -15.5 -12.0 -6.8 -2.8 -1.4 +2.6 +10.4 +30.1 | -2.8 (7/10 faster) | within the control |
+| rename | 605.4 | -59.6 -40.6 -27.4 +15.3 +35.6 +37.6 +47.9 +79.7 +96.5 +104.6 | +37.6 (3/10 faster) | -92.4 -38.4 -31.9 -21.3 -20.0 -17.6 +3.1 +23.7 +38.4 +66.7 | -17.6 (6/10 faster) | within the control |
+| unlink | 362.3 | -54.7 -27.7 -27.5 -16.8 -2.2 +24.3 +34.7 +40.8 +43.3 +48.3 | +24.3 (5/10 faster) | -65.3 -30.0 -28.2 -18.4 -12.9 -8.3 +11.0 +28.4 +31.8 +49.7 | -8.3 (6/10 faster) | within the control |
+| create_security | 1514.4 | -59.1 -19.6 -9.7 -7.2 +8.0 +17.0 +17.2 +39.8 +41.4 +96.8 | +17.0 (4/10 faster) | -57.3 -32.3 -30.7 -28.8 -24.7 -0.6 +6.8 +8.0 +32.2 +86.4 | -0.6 (6/10 faster) | within the control |
+
+### Main against main as cut (c) landed: nothing large lost since
+
+**The question.** `diag-g258-3`'s first arm64 run put main's quiet stat p50 51 µs over the DLL arm's, where the last
+comparison before cut (c) (diag-winfsp-overlap-41) put the receiver 17.7 µs over. Had main lost time since cut (c) landed
+(B11, `29ef4521`, 2026-11-11), 551 commits before main `69cd38b2`?
+
+**The A/B.** Diag `diag-g258-5` (run 44279316423): main (`69cd38b2` with the bench's `create_security`), a control
+(main's binary copied) and old (`29ef4521`), interleaved on one VM of each runner, quiet and loaded, ten runs a lane, 0
+failed, no stall, the list rotating each run. windows-11-arm: win11-vs2026-arm64 20261112.217.1, Windows 10.0.26200.9974;
+windows-latest: win25-vs2026 20261103.298.1, Windows 10.0.26100.33674, AMD Family 26 Model 2; 4 CPUs each, 2026-11-18
+09:50–12:46 UTC. The command is windows-ab.sh's with `ARMS="main=… control=… old=…"`, `RUNS=10 SPINNERS_PER_CPU=2`.
+
+**Verdict: nothing large.** One cell a runner is beyond the control's spread, each the old build faster: arm64 loaded
+create p50 by 3.6 µs (7 of 10 runs), x86_64 quiet create_security p50 by 25.9 µs (8 of 10). Within the spread, arm64's old
+build was faster in every run on a quiet rename (median 9.1 µs) and a loaded write (9.3 µs), and in 9 of 10 on a loaded
+stat (1.6 µs). The arm64 stat gap against the DLL is not a loss since cut (c): old and main stat alike (quiet p50 −1.2 µs,
+6 of 10).
+
+### What remains against the DLL dispatcher after cut (c)
+
+**The A/B.** Diag `diag-g258-6` (run 44292211799): main (`69cd38b2`, the bench as it was, nine ops), a control and the
+DLL arm (`71cf09ac`, built from its own tree as diag-winfsp-overlap-41 built it), ten runs a lane. windows-11-arm 11:24–
+13:50 UTC, 0 failed; windows-latest (AMD Family 26 Model 2) 11:22–13:15 UTC, 9 done and run 4 failed: the DLL arm's daemon
+missed its heartbeat under load ("the daemon's heartbeat lapsed; killing it") and its drive died, so that run's loaded
+pass is lost for every arm. Read by Step 7's rule (main is within the DLL's spread at an op's p50 or p99 when its median
+run is no slower than the DLL arm's slowest run), with each run's main − dll beside the control's.
+
+**Verdict.**
+- **windows-latest: 5 cells of 36 beyond the DLL's spread**, four of them by under 5 µs: quiet close p50 (main − dll +2.4
+  µs within each run), open p50 (+11.5), read p50 (+0.3), loaded close p50 (+1.3); and loaded rename p99 (+7,076). Loaded,
+  main is faster than the DLL arm at the p50 of every op but close and open (median within each run: create −34.4, write
+  −10.3, fsync −16.0, stat −10.1, read −44.0, rename −27.6, unlink −13.8 µs).
+- **windows-11-arm: 10 cells of 36 beyond it.** At the p50, within each run: quiet stat +42.4 µs, rename +81.5, unlink
+  +40.2, read +5.1; loaded write +86.9, rename +74.8, unlink +31.2, stat +6.7; and loaded open p99 and rename p99. The
+  control's differences sit within 3 µs of main's in every one, so these are the receiver's, not the bench's.
+- Against diag-winfsp-overlap-41 (before cut (c), A-215's combined form `comb2` against the DLL): arm64's quiet stat gap
+  +17.7 µs then, +42.4 now; rename +35.8 then, +81.5 now; loaded write +84.5 then, +86.9 now. Main lost no more than about
+  9 µs of it since cut (c) landed (the section above), and the main arm then was the combined form at two workers, which
+  does not ship, so the two runs do not separate what moved; the arm64 gap is what this run measures.
+
+#### arm64 (windows-11-arm), run 44292211799: 10 runs done, 0 failed
+
+arm64 (windows-11-arm), run 44292211799, quiet: main's and the DLL arm's p50 and p99 (median run, the DLL's slowest run), and main − dll within each run, µs.
+
+| op | rank | main median | dll slowest | verdict | main − dll, each run (sorted) | median | control − dll median |
+|---|---|---|---|---|---|---|---|
+| create | p50 | 208.1 | 214.5 | within | +17.5 +18.0 +19.0 +19.5 +20.1 +20.2 +20.7 +21.7 +22.1 +27.0 | +20.2 | +20.7 |
+| create | p99 | 421.3 | 582.1 | within | -138.5 -98.0 -66.0 -5.4 +14.7 +18.2 +31.2 +68.5 +72.6 +86.5 | +18.2 | +24.4 |
+| write | p50 | 92.8 | 103.2 | within | -6.5 -5.1 -5.0 -4.2 -4.2 -3.8 +0.2 +0.7 +1.3 +1.7 | -3.8 | -1.6 |
+| write | p99 | 293.0 | 653.2 | within | -41.5 -6.2 +2.7 +6.2 +18.4 +20.2 +23.8 +44.4 +62.4 +578.6 | +20.2 | -0.6 |
+| fsync | p50 | 109.7 | 114.7 | within | -2.0 -1.8 -1.7 +0.0 +0.5 +0.7 +0.9 +1.1 +1.2 +1.7 | +0.7 | +0.1 |
+| fsync | p99 | 211.5 | 355.7 | within | -101.3 -52.2 -38.8 -14.5 -12.2 +13.1 +13.2 +21.9 +22.9 +43.6 | +13.1 | +3.0 |
+| close | p50 | 4374.3 | 4487.9 | within | -14.6 +28.1 +78.4 +95.6 +100.5 +100.9 +114.3 +132.5 +163.2 +227.9 | +100.9 | +160.5 |
+| close | p99 | 6523.3 | 16471.5 | within | -9568.3 -9204.6 -5358.2 -3331.9 -1671.7 -1347.8 -1238.0 -1170.8 -604.8 -604.3 | -1347.8 | -1266.1 |
+| stat | p50 | 162.7 | 122.1 | **worse** by 40.6 | +35.9 +37.7 +41.4 +42.0 +42.3 +42.4 +43.1 +44.8 +47.6 +51.9 | +42.4 | +41.2 |
+| stat | p99 | 254.1 | 310.5 | within | -65.8 -50.4 -33.3 -30.8 +40.3 +54.7 +62.0 +89.3 +175.8 +212.8 | +54.7 | +51.2 |
+| open | p50 | 3835.2 | 4034.0 | within | +15.8 +29.8 +67.7 +76.8 +84.0 +124.0 +181.6 +226.6 +233.4 +264.2 | +124.0 | +122.3 |
+| open | p99 | 5679.2 | 6662.5 | within | +39.3 +103.9 +117.6 +126.7 +141.8 +182.0 +206.4 +223.9 +300.7 +433.4 | +182.0 | +322.2 |
+| read | p50 | 44.4 | 43.2 | **worse** by 1.2 | +4.5 +4.5 +4.6 +4.7 +4.9 +5.1 +5.7 +6.0 +6.1 +6.2 | +5.1 | +5.3 |
+| read | p99 | 72.0 | 77.8 | within | +0.7 +1.6 +3.4 +3.5 +3.6 +4.0 +4.5 +5.5 +5.9 +7.4 | +4.0 | +5.2 |
+| rename | p50 | 466.0 | 409.8 | **worse** by 56.2 | +66.4 +74.4 +77.7 +78.2 +79.5 +81.5 +81.9 +82.6 +84.0 +85.3 | +81.5 | +79.1 |
+| rename | p99 | 1427.7 | 1883.3 | within | -141.2 +31.9 +124.4 +147.9 +156.9 +238.5 +464.6 +503.8 +630.6 +667.4 | +238.5 | +48.8 |
+| unlink | p50 | 287.3 | 256.9 | **worse** by 30.4 | +31.5 +37.0 +37.9 +38.5 +40.1 +40.2 +41.6 +43.2 +44.3 +46.8 | +40.2 | +39.8 |
+| unlink | p99 | 626.5 | 731.7 | within | -105.2 +25.9 +61.9 +64.1 +67.7 +93.8 +108.9 +110.5 +149.9 +257.1 | +93.8 | +108.2 |
+
+arm64 (windows-11-arm), run 44292211799, loaded: main's and the DLL arm's p50 and p99 (median run, the DLL's slowest run), and main − dll within each run, µs.
+
+| op | rank | main median | dll slowest | verdict | main − dll, each run (sorted) | median | control − dll median |
+|---|---|---|---|---|---|---|---|
+| create | p50 | 230.5 | 240.4 | within | -16.6 -2.7 +4.1 +4.2 +6.1 +7.0 +8.1 +12.2 +15.0 +15.0 | +7.0 | +5.1 |
+| create | p99 | 1164.9 | 2489.1 | within | -1575.8 -644.2 -170.6 +52.5 +74.4 +90.0 +121.3 +234.8 +256.1 +386.0 | +90.0 | +209.8 |
+| write | p50 | 189.7 | 104.7 | **worse** by 85.0 | +83.7 +84.1 +84.5 +84.7 +86.6 +86.9 +87.8 +88.6 +90.0 +92.5 | +86.9 | +88.9 |
+| write | p99 | 694.8 | 1476.3 | within | -839.2 -56.7 -23.5 +56.6 +104.6 +114.2 +214.3 +283.2 +633.8 +732.6 | +114.2 | +208.6 |
+| fsync | p50 | 113.8 | 127.3 | within | -19.9 -12.4 -10.8 -9.5 -6.8 -6.4 -4.3 -2.9 -2.7 +0.1 | -6.4 | -6.7 |
+| fsync | p99 | 313.4 | 27623.4 | within | -27164.2 -14703.3 -12685.5 -9383.7 -8389.9 -5735.8 -4803.3 -2700.0 -1695.8 -227.3 | -5735.8 | -5762.9 |
+| close | p50 | 5146.8 | 5947.8 | within | -961.5 -257.5 -171.8 -157.0 -112.9 +30.8 +31.3 +193.6 +387.8 +515.8 | +30.8 | -238.4 |
+| close | p99 | 43719.3 | 46165.6 | within | -3873.7 -3451.9 -1973.6 -1878.9 -1279.6 -1096.5 -1075.1 -894.3 +550.6 +1581.6 | -1096.5 | -1354.6 |
+| stat | p50 | 158.6 | 153.5 | **worse** by 5.1 | +4.2 +4.4 +4.8 +5.9 +6.1 +6.7 +7.3 +8.6 +8.8 +9.9 | +6.7 | +6.6 |
+| stat | p99 | 2040.2 | 44885.3 | within | -42368.7 -34980.1 -34436.9 -33444.0 -33132.6 -32872.8 -32234.9 -31736.0 -26653.5 -19894.9 | -32872.8 | -32944.8 |
+| open | p50 | 4464.4 | 4741.7 | within | -462.3 +4.9 +126.2 +131.9 +158.0 +173.6 +199.4 +248.6 +303.8 +531.1 | +173.6 | +86.6 |
+| open | p99 | 47426.1 | 47091.6 | **worse** by 334.5 | +40.5 +976.0 +1565.0 +1569.5 +2280.6 +2649.9 +5679.9 +7269.9 +8170.0 +11113.2 | +2649.9 | +2921.9 |
+| read | p50 | 50.4 | 52.0 | within | -3.1 -0.5 -0.2 +0.8 +1.3 +1.6 +2.0 +2.8 +3.0 +4.6 | +1.6 | +0.8 |
+| read | p99 | 85.9 | 86.4 | within | -3.0 +0.1 +0.7 +1.3 +1.7 +4.1 +4.5 +4.7 +4.8 +5.5 | +4.1 | +2.2 |
+| rename | p50 | 524.4 | 456.7 | **worse** by 67.7 | +56.6 +69.1 +69.1 +69.7 +71.0 +74.8 +77.0 +86.0 +89.4 +90.0 | +74.8 | +76.9 |
+| rename | p99 | 35829.9 | 32744.2 | **worse** by 3085.7 | +2899.4 +6186.6 +6230.8 +7620.7 +8214.4 +9538.2 +9827.6 +10186.5 +10747.6 +11297.1 | +9538.2 | +8389.8 |
+| unlink | p50 | 348.4 | 320.2 | **worse** by 28.2 | +27.6 +28.1 +28.3 +28.9 +29.3 +31.2 +32.0 +32.4 +34.0 +36.7 | +31.2 | +32.0 |
+| unlink | p99 | 27545.5 | 45088.5 | within | -17426.8 -16561.6 -14076.9 -13814.5 -13267.9 -12761.8 -11337.4 -10654.5 -10594.9 -10061.2 | -12761.8 | -12561.2 |
+
+cells worse than the DLL's spread: 10 of 36
+
+#### x86_64 (windows-latest), run 44292211799: 9 runs done, 1 failed
+
+x86_64 (windows-latest), run 44292211799, quiet: main's and the DLL arm's p50 and p99 (median run, the DLL's slowest run), and main − dll within each run, µs.
+
+| op | rank | main median | dll slowest | verdict | main − dll, each run (sorted) | median | control − dll median |
+|---|---|---|---|---|---|---|---|
+| create | p50 | 484.3 | 493.6 | within | -5.2 -1.8 +1.3 +4.6 +8.6 +8.8 +20.2 +21.4 +35.8 | +8.6 | +12.9 |
+| create | p99 | 947.5 | 1002.3 | within | -174.2 -28.6 -26.9 +75.7 +81.2 +85.6 +158.2 +249.5 +512.6 | +81.2 | +44.9 |
+| write | p50 | 47.3 | 54.5 | within | -15.6 -10.7 -3.8 -3.5 +1.2 +2.0 +10.3 +11.2 +22.1 | +1.2 | +5.1 |
+| write | p99 | 209.9 | 295.7 | within | -58.5 -35.5 -34.6 -25.1 -15.7 +1.3 +49.5 +59.2 +87.1 | -15.7 | -5.3 |
+| fsync | p50 | 59.8 | 74.3 | within | -14.5 -10.9 -6.0 +0.9 +3.2 +3.7 +4.1 +5.6 +9.0 | +3.2 | +3.2 |
+| fsync | p99 | 133.4 | 186.6 | within | -50.4 -39.9 -39.3 -7.1 -6.1 -5.1 +6.5 +9.4 +39.0 | -6.1 | +1.0 |
+| close | p50 | 30.4 | 28.7 | **worse** by 1.7 | +1.7 +2.0 +2.0 +2.2 +2.4 +2.5 +2.5 +2.7 +3.0 | +2.4 | +2.4 |
+| close | p99 | 114.8 | 268.7 | within | -127.7 -79.3 -29.7 -23.9 +29.7 +30.5 +43.1 +43.5 +121.1 | +29.7 | +21.2 |
+| stat | p50 | 122.8 | 149.5 | within | -25.8 -24.6 -18.0 +2.5 +4.8 +4.8 +8.6 +19.3 +25.9 | +4.8 | +5.3 |
+| stat | p99 | 215.2 | 546.4 | within | -353.9 -10.2 -3.6 -1.4 +9.0 +33.4 +51.9 +181.8 +254.5 | +9.0 | +30.7 |
+| open | p50 | 79.1 | 74.5 | **worse** by 4.6 | -6.1 +0.9 +4.6 +8.1 +11.5 +14.4 +14.9 +19.0 +21.2 | +11.5 | +12.8 |
+| open | p99 | 157.4 | 162.5 | within | -11.3 -2.2 +4.1 +4.6 +18.3 +30.1 +35.5 +39.1 +48.0 | +18.3 | +10.7 |
+| read | p50 | 5.3 | 5.2 | **worse** by 0.1 | +0.1 +0.3 +0.3 +0.3 +0.3 +0.4 +0.4 +0.5 +0.5 | +0.3 | +0.4 |
+| read | p99 | 67.0 | 71.4 | within | -14.0 -8.1 -4.4 -2.8 +1.4 +1.7 +2.5 +16.9 +23.5 | +1.4 | +1.0 |
+| rename | p50 | 248.9 | 306.6 | within | -51.6 -48.8 -41.2 -6.6 +4.6 +7.4 +8.3 +32.3 +40.9 | +4.6 | +7.5 |
+| rename | p99 | 453.5 | 647.7 | within | -176.5 -128.5 -33.4 -14.2 -1.5 +12.6 +59.0 +106.0 +259.7 | -1.5 | +12.9 |
+| unlink | p50 | 150.8 | 165.3 | within | -9.1 -3.9 +0.1 +2.5 +2.8 +4.8 +10.8 +13.3 +23.8 | +2.8 | +6.9 |
+| unlink | p99 | 413.8 | 526.7 | within | -191.6 -65.8 -5.9 +7.9 +47.4 +64.9 +92.0 +96.3 +312.6 | +47.4 | +12.5 |
+
+x86_64 (windows-latest), run 44292211799, loaded: main's and the DLL arm's p50 and p99 (median run, the DLL's slowest run), and main − dll within each run, µs.
+
+| op | rank | main median | dll slowest | verdict | main − dll, each run (sorted) | median | control − dll median |
+|---|---|---|---|---|---|---|---|
+| create | p50 | 704.1 | 763.2 | within | -49.7 -44.0 -43.5 -36.4 -34.4 -32.0 -17.1 -7.2 +9.0 | -34.4 | -25.5 |
+| create | p99 | 64654.9 | 209578.9 | within | -157167.3 -147264.7 -144065.5 -143871.0 -141647.1 -140407.7 -139194.0 -133505.4 -127112.3 | -141647.1 | -139429.8 |
+| write | p50 | 43.1 | 56.3 | within | -11.5 -10.4 -10.4 -10.4 -10.3 -10.0 -9.5 -9.5 -9.1 | -10.3 | -9.8 |
+| write | p99 | 204.9 | 33802.2 | within | -33557.4 -33318.9 -1552.7 -144.3 -120.4 -86.0 -80.5 -64.3 +3875.4 | -120.4 | -121.3 |
+| fsync | p50 | 63.1 | 87.1 | within | -22.9 -18.3 -17.6 -17.2 -16.0 -10.5 -9.9 -9.7 -9.7 | -16.0 | -10.1 |
+| fsync | p99 | 178.7 | 32988.8 | within | -32790.7 -24292.5 -50.9 -14.9 -10.1 -6.2 -3.3 +22.8 +34.0 | -10.1 | -13.8 |
+| close | p50 | 31.7 | 31.4 | **worse** by 0.3 | +0.8 +1.1 +1.2 +1.2 +1.3 +1.4 +1.5 +1.5 +1.7 | +1.3 | +1.3 |
+| close | p99 | 84.9 | 146.4 | within | -48.8 -22.9 -11.5 -8.9 -7.3 -5.8 -2.7 -0.3 +7.6 | -7.3 | -6.2 |
+| stat | p50 | 129.1 | 142.8 | within | -12.0 -11.5 -10.4 -10.3 -10.1 -8.2 -8.1 -8.0 -3.2 | -10.1 | -9.3 |
+| stat | p99 | 313.6 | 121938.9 | within | -121625.4 -99042.9 -98900.7 -98876.5 -97477.1 -95208.4 -93254.9 -91855.5 -77648.0 | -97477.1 | -97481.6 |
+| open | p50 | 79.9 | 83.1 | within | -7.9 -7.0 -6.1 -0.9 +1.9 +2.5 +2.8 +2.9 +10.0 | +1.9 | -4.9 |
+| open | p99 | 209.2 | 45123.4 | within | -44914.7 -40826.0 -40716.8 -431.3 -85.4 -78.4 -78.1 -60.2 -20.9 | -85.4 | -94.6 |
+| read | p50 | 6.3 | 52.6 | within | -46.0 -44.6 -44.6 -44.5 -44.0 -43.2 -36.7 -11.7 -11.2 | -44.0 | -44.6 |
+| read | p99 | 81.6 | 153.0 | within | -80.5 -79.6 -73.4 -71.2 -61.4 -54.3 -51.0 -37.3 -35.5 | -61.4 | -66.3 |
+| rename | p50 | 290.0 | 321.9 | within | -38.3 -35.2 -34.9 -31.9 -27.6 -23.6 -22.5 -22.5 -21.5 | -27.6 | -22.4 |
+| rename | p99 | 8497.5 | 1653.0 | **worse** by 6844.5 | +93.2 +3033.3 +4832.5 +5150.9 +7076.1 +7266.6 +7321.9 +7647.3 +10569.0 | +7076.1 | +7433.2 |
+| unlink | p50 | 168.8 | 188.3 | within | -25.4 -23.9 -19.5 -17.5 -13.8 -10.4 -6.7 +2.6 +4.0 | -13.8 | -19.1 |
+| unlink | p99 | 826.4 | 116635.6 | within | -115643.0 -111465.5 -110790.7 -110007.1 -103431.6 -102131.0 -101294.5 -100697.9 -97209.6 | -103431.6 | -103067.9 |
+
+cells worse than the DLL's spread: 5 of 36
+
+**What is left to cut, and the decision for Ada.** On x86_64 main is within the DLL's spread but for a few microseconds at
+four quiet or loaded p50s and a loaded rename tail. On arm64 a stat, a rename and an unlink cost 40 to 82 µs more at the
+quiet p50, and a write, a rename and an unlink 31 to 87 µs more loaded. The levers measured and not yet tried:
+- **A spin choice that reads contention.** The median form took 42.3 µs off arm64's loaded write p50 and 35.2 off its
+  rename (10 of 10 runs each), and lost a wake on x86_64. A choice that parks only while the machine's CPUs are contended,
+  measured (for instance from each reply's way back after a park against the window), would keep the first without the
+  second. Unbuilt, unmeasured.
+- **Shard threads above normal priority on Windows** (run 42059294312, one instrumented arm64 run, 2026-11-05): a loaded
+  SetSize's hop 67.6 to 15.7 µs and a write's p50 238 to 100 µs. It changes how the whole daemon competes with the user's
+  own programs, so it is a decision for Ada, not a cut.
+- **A fresh per-phase profile of arm64's quiet stat, rename and unlink** (as diag-winfsp-overlap-46): the last one put 18
+  µs of a stat on crash safety's own work and 3 to 5 µs a request on the kernel inside the transaction call; it does not
+  account for 42.
+- Crash safety's price (the journal, the ledger, A-198's barriers) stays, as the supervisor decided on 2026-11-07 (R4).
 
 ## CreateGreen sliced: its shard and peak RSS over `fs/` and the whole kernel (2026-11-07)
 
@@ -13286,3 +13822,89 @@ held version 0's inputs (`merge.inputs_unheld` 709 each).
   inode-version slab at recovery (by 6,348 bytes), so the green built over it is fenced. A second run (11:02 UTC) logged
   the same two lines with the same byte counts, so it is deterministic here. The seeding fix could not be exercised;
   the run is owed again once the volume recovers. Reported to goal 232.
+
+## A GiB volume's seal and a holder's return over thousands of live volumes, after the turns: both under the window, the seal 14 minutes long, one step at its end that grows with the volume (A-323, A-324; goal 230's landing; 2026-11-18)
+
+**What it is.** The two bounds goal 230's landing (`ca216dbf8`) owed at scale, measured on main by the measurer's
+uncommitted harness: two tests appended to `crates/server/tests/fleet.rs` in a scratch copy only (never on main), each
+a three-node `f = 1` fleet in one process (`formed_mesh`; a fleet test node has one shard, so the owner shard is its
+control shard), nothing injected, so the shard's own quantum slices the work.
+- *The seal (A-323).* On node a, a volume of 1,024 MiB (and of 256 MiB) of bytes no chunk repeats, written over a's NFS
+  port in 16 MiB files of 64 KiB `FILE_SYNC` writes, then sealed by a snapshot. Read: the wall time from the snapshot
+  to `AwaitPlaced` answering placed (polled every 20 ms), the wrap's turns (`fleet.seal.wrap_slices`), the record
+  periods the seal walk ran (`fleet.seal.walks`), each node's longest step (the shard pulse's `longest_step_ns`, a
+  maximum since the node started) before the snapshot and after placement, and in a fourth run each moment the owner's
+  longest step rose while the seal ran.
+- *The return (A-324).* On a, 1,000 (and 4,000) live-shipped volumes bounded at 64 KiB, made by 16 clients at once,
+  each written once at durability; b settled (it holds every log, the same positions at two reads in a row); then, as
+  `a_holders_return_is_walked_in_turns_and_it_takes_every_log` does, b's control shard held for two liveness budgets
+  while one client writes the volumes again in order, one at a time, until the hold's span has passed. Read: the time
+  from the hold's end until b holds every volume written again one entry past where it settled (each read one volume
+  at a time through `Daemon::fleet_live_held`, since a status report of thousands of live logs is past a test client's
+  status capacity), a's walk turns (`fleet.live.reached_slices`), and each node's longest step before the hold and
+  after the catch-up.
+
+**Environment.** Mac Studio adas-mac-studio.local-2 (Apple M3 Ultra, 32 cores, 96 GiB, macOS 26.4, 16 KiB pages, so a
+256 KiB chunk), 2026-11-18 12:30 to 14:08 UTC, load 5.1 to 19.1 from other work (no quieter host was free). Release
+`fleet` test binary of main `1eca77263` with the harness appended.
+
+**Command.** `SLATES_TEST_MEASURE=1 SLATES_MEASURE_DEADLINE_SECS=3600 SLATES_MEASURE_SEAL_MIB=<1024|256> fleet --exact
+measure_a_large_volume_seals_in_turns --nocapture`, and `SLATES_MEASURE_LIVE_VOLUMES=<1000|4000> fleet --exact
+measure_a_holders_return_over_thousands_of_live_volumes --nocapture`, each its own process, one at a time.
+
+**The seal.**
+
+| Volume | Run | Placed after the snapshot | Wrap turns | Record periods | a's longest step, before → after | b's, c's after |
+|---|---|---|---|---|---|---|
+| 1,024 MiB | 1 | 845.7 s | 4,096 | 8,310 | 2.2 → 230.5 ms | 20.7, 18.9 ms |
+| 1,024 MiB | 2 | 847.3 s | 4,096 | 8,314 | 1.8 → 272.2 ms | 18.1, 9.5 ms |
+| 1,024 MiB | 3 | 847.9 s | 4,096 | 8,318 | 2.2 → 233.2 ms | 10.5, 11.8 ms |
+| 1,024 MiB | 4 | 847.6 s | 4,096 | 8,321 | 2.1 → 243.4 ms | 13.7, 21.0 ms |
+| 256 MiB | 1 | 211.4 s | 1,024 | 2,079 | 3.6 → 42.7 ms | 2.2, 2.3 ms |
+| 256 MiB | 2 | 211.1 s | 1,024 | 2,078 | 0.6 → 23.6 ms | 7.9, 2.2 ms |
+| 256 MiB | 3 | 213.4 s | 1,024 | 2,089 | 0.6 → 27.6 ms | 4.4, 31.8 ms |
+
+The volume was written in 1.7 to 2.5 s (1,024 MiB) and 0.4 to 0.7 s (256 MiB), no write refused. Where the owner's
+longest step rose (runs 4 and 3): at 1,024 MiB it stayed at or under 5.6 ms through the archive walk and all 4,096
+wrap turns; then, at 838.17 to 838.72 s, with the wrap complete and the content not yet placed, it rose to 9.0, then
+152.9, then 243.4 ms; placed 8.9 s later. At 256 MiB it stayed at or under 9.8 ms until 210.06 s, then rose to 27.6 ms,
+3.4 s before placed.
+
+**The return.**
+
+| Live volumes | Run | Written again in the hold | b caught up after the hold ended | a's walk turns | a's longest step, before → after |
+|---|---|---|---|---|---|
+| 1,000 | 1 | 1,000 in 0.92 s | 0.279 s | 285 | 8.2 → 12.0 ms |
+| 1,000 | 2 | 1,000 in 1.07 s | 0.322 s | 338 | 11.2 → 11.2 ms (no rise) |
+| 1,000 | 3 | 1,000 in 1.01 s | 0.315 s | 270 | 7.3 → 11.0 ms |
+| 1,000 | 4 | 1,000 in 1.04 s | 0.250 s | 223 | 7.1 → 11.6 ms |
+| 1,000 | 5 | 1,000 in 0.93 s | 0.149 s | 173 | 10.2 → 11.4 ms |
+| 4,000 | 1 | 857 in 2.02 s | 0.237 s | 450 | 28.9 → 40.1 ms |
+| 4,000 | 2 | 979 in 2.00 s | 0.330 s | 458 | 46.8 → 46.8 ms (no rise) |
+| 4,000 | 3 | 1,071 in 2.00 s | 0.350 s | 391 | 29.8 → 37.8 ms |
+| 4,000 | 4 | 999 in 2.00 s | 0.308 s | 262 | 28.8 → 42.0 ms |
+| 4,000 | 5 | 960 in 2.00 s | 0.376 s | 405 | 51.8 → 51.8 ms (no rise) |
+
+The volumes were made in 13.9 to 14.1 s (1,000) and 62.9 to 66.0 s (4,000), none refused; b's hold was measured at
+2.000 to 2.139 s, so b's own longest step after is the hold itself. In every run a's `fleet.live.appended` rose by
+exactly the writes made, b's `fleet.live.held` by one more than that, and nothing stayed behind. Where a's longest step
+did not rise, no step of the return was longer than the step the setup had already taken (46.8 and 51.8 ms, made while
+4,000 volumes were created).
+
+**What it means.**
+- **Both bounds hold at this scale, on this Mac.** No owner step reached the 1 s watchdog window: 230 to 272 ms during
+  a GiB seal, at most 42 ms (or, where it did not rise, the setup's 52 ms) during a return over 4,000 live volumes on
+  one shard. The return's walk ran in 173 to 458 turns, and b held every log 0.15 to 0.38 s after its hold ended.
+- **The wrap is in turns, but the step after it is not.** The owner's longest step through the archive walk and the
+  4,096 wrap turns stayed at or under 5.6 ms; the steps of 153 and 243 ms came once the wrap was complete, before the
+  content placed. It grows with the volume: 23.6 to 42.7 ms at 256 MiB, 230 to 272 ms at 1,024 MiB, about a quarter of
+  a millisecond a MiB on this Mac, so a volume of about 4 GiB would reach the window here (an extrapolation, not
+  measured). Which step it is (the envelope's completion, or the first content round's put) the trace cannot say.
+  Reported to goal 230.
+- **A GiB seal takes fourteen minutes.** The seal walk advances each volume's seal one slice a record period
+  (`run_record_period`, 100 ms): 8,310 to 8,321 periods for 1,024 MiB, 2,078 to 2,089 for 256 MiB, linear in the
+  volume (101.7 ms a period). About half are the archive walk (about 259 KB a slice here) and half the wrap, which seals
+  one chunk a turn at this quantum: 4,096 turns for 4,096 chunks of 256 KiB. On a host with 4 KiB pages the chunk is
+  64 KiB, so the same wrap would be 16,384 periods, about 27 minutes on its own (computed here, not measured). Before
+  A-323 the wrap was one turn, and about a GiB ran past the window; now it places, slowly. Reported to
+  goal 230.

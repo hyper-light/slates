@@ -3580,6 +3580,45 @@ pub enum Refusal {
     /// Why, typed.
     refusal: VolumeRefusal,
   },
+  /// The daemon's own records could not serve the verb, for a reason the variants before this one do not name (A-299):
+  /// until 2026-11-18 each reached a client as `BadRequest` carrying the database error's words. Appended.
+  Database {
+    /// Why, typed.
+    refusal: DatabaseRefusal,
+  },
+}
+
+/// What the daemon's database refused, where the refusals before [`Refusal::Database`] name nothing closer (A-299):
+/// each the class of a database error (`slates_db::DbError`) by the same name. Append-only.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DatabaseRefusal {
+  /// A record in the log did not verify (a torn tail, or a hostile byte): the sequence expected there.
+  Corrupt {
+    /// The sequence expected.
+    seq: u64,
+  },
+  /// An NFSv4 instance advance named an instance at or below the current one (§4.6 A-37).
+  NfsInstanceRegressed {
+    /// The partition's current instance.
+    current: u32,
+  },
+  /// A green's checkpoint at a version it cannot stand for (W3; §4.16): not past the checkpoint the green holds, or
+  /// past its head.
+  CheckpointOutOfRange {
+    /// The version the checkpoint named.
+    version: u64,
+    /// The version of the checkpoint the green holds (0: none).
+    held: u64,
+    /// The green's head.
+    head: u64,
+  },
+  /// A sealing key record of other than its fixed length (A-92).
+  SealKeyMalformed {
+    /// The record's length.
+    len: u64,
+  },
+  /// A record's encoding was refused.
+  Encoding,
 }
 
 /// What the volume core refused, where the refusals before [`Refusal::Volume`] name nothing closer (A-299): each the
