@@ -1313,6 +1313,7 @@ dependencies = [
  "slates-ipc",
  "slates-machine",
  "slates-mem",
+ "slates-merge",
  "slates-rt",
  "slates-server",
  "slates-vfs",

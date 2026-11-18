@@ -116,6 +116,9 @@ fn race(instance: &str, green: VolumeId, client_index: usize) -> Vec<Told> {
         });
         work.1 = version;
       }
+      Submitted::ApprovalRequired { .. } => {
+        panic!("no write policy is set here, so no merge awaits approval")
+      }
       Submitted::Conflict(windows) => {
         assert!(
           windows

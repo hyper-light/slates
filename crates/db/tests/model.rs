@@ -273,6 +273,71 @@ fn binding_a_bound_mount_keeps_its_identity_and_recovery_agrees() {
   }
 }
 
+/// Shape: the works a generated history's adopted completions route to (A-288): a few, so routes share works.
+const ROUTED_WORKS: u8 = 3;
+
+/// The work a generated adopted completion routes to: an id no generated volume takes (its bytes are all the same high
+/// value, where `vid` counts up from the low end).
+fn routed_work(index: u8) -> VolumeId {
+  VolumeId {
+    bytes: [u8::MAX.saturating_sub(index); 16],
+  }
+}
+
+/// A-288: every work's routed count equals the retained completions the partition's snapshot carries under that work,
+/// so a route is kept exactly while a completion it leads to is retained, never past its acknowledgement.
+fn routes_match_their_records(db: &Db) -> Result<(), TestCaseError> {
+  let snapshot = db.partition().to_snapshot(0);
+  for index in 0..ROUTED_WORKS {
+    let work = routed_work(index);
+    let tagged = snapshot
+      .completions
+      .iter()
+      .flat_map(|client| &client.records)
+      .filter(|record| record.work == Some(work))
+      .count();
+    prop_assert_eq!(
+      db.partition().completions_routed_by(work),
+      tagged,
+      "work {}'s routed count against the records that carry it",
+      index
+    );
+  }
+  Ok(())
+}
+
+/// A-288, the model's own rule: a completion just recorded that its window retains carries exactly the work it was
+/// recorded with (none for a completion a verb ran), so a route is never lost while its completion is held.
+fn a_retained_completion_carries_its_route(
+  db: &Db,
+  record: &CompletionRecord,
+) -> Result<(), TestCaseError> {
+  if !matches!(
+    db.partition()
+      .completion(record.origin, record.client, record.sequence),
+    Seen::Completed(_)
+  ) {
+    return Ok(());
+  }
+  let carried = db
+    .partition()
+    .to_snapshot(0)
+    .completions
+    .iter()
+    .filter(|client| client.origin == record.origin && client.client == record.client)
+    .flat_map(|client| &client.records)
+    .find(|held| held.sequence == record.sequence)
+    .map(|held| held.work);
+  prop_assert_eq!(
+    carried,
+    Some(record.work),
+    "client {} sequence {}'s route",
+    record.client,
+    record.sequence
+  );
+  Ok(())
+}
+
 fn vid(n: u64) -> VolumeId {
   let mut bytes = [0u8; 16];
   bytes[..8].copy_from_slice(&n.to_be_bytes());
@@ -334,7 +399,8 @@ enum Step {
   Release(usize),
   Attach(usize, u32),
   Detach(usize),
-  Complete(u32, u32),
+  /// A completion recorded: the client, the sequence, and the work it routes to when a successor adopted it (A-288).
+  Complete(u32, u32, Option<u8>),
   Acknowledge(u32, u32, Vec<u32>),
   Grant(usize),
   GrantState(usize, u8),
@@ -393,7 +459,7 @@ fn step() -> impl Strategy<Value = Step> {
     1 => (0..8usize).prop_map(Step::Release),
     1 => (0..8usize, 0..3u32).prop_map(|(v, c)| Step::Attach(v, c)),
     1 => (0..8usize).prop_map(Step::Detach),
-    2 => (0..3u32, 0..16u32).prop_map(|(c, s)| Step::Complete(c, s)),
+    2 => (0..3u32, 0..16u32, proptest::option::of(0..ROUTED_WORKS)).prop_map(|(c, s, w)| Step::Complete(c, s, w)),
     1 => (0..3u32, 0..16u32, proptest::collection::vec(0..16u32, 0..4)).prop_map(|(c, s, owed)| Step::Acknowledge(c, s, owed)),
     1 => (0..8usize).prop_map(Step::Grant),
     1 => (0..8usize, 0..4u8).prop_map(|(g, s)| Step::GrantState(g, s)),
@@ -619,12 +685,13 @@ fn op_for(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
     Step::Detach(a) => Op::AttachmentRemoved {
       id: pick(&ids.attachments, *a)?,
     },
-    Step::Complete(c, s) => Op::CompletionRecorded {
+    Step::Complete(c, s, routed) => Op::CompletionRecorded {
       record: CompletionRecord {
         origin: 0,
         client: *c,
         sequence: *s,
         result: vec![u8::try_from(*s).unwrap_or(0); 3],
+        work: routed.map(routed_work),
       },
     },
     Step::Acknowledge(c, s, owed) => Op::CompletionsAcknowledged {
@@ -1026,6 +1093,7 @@ fn every_recovery_equals_the_live_partition_under(
       );
       prop_assert_eq!(recovered.next_seq(), seq);
       prop_assert!(!stats.torn, "a clean crash has no torn tail");
+      routes_match_their_records(&recovered)?;
       db = recovered;
       hold_to(&mut db, cadence);
       continue;
@@ -1037,6 +1105,15 @@ fn every_recovery_equals_the_live_partition_under(
       Ok(_) => {
         note_applied(&op, &mut ids);
         applied += 1;
+        if matches!(
+          op,
+          Op::CompletionRecorded { .. } | Op::CompletionsAcknowledged { .. }
+        ) {
+          routes_match_their_records(&db)?;
+        }
+        if let Op::CompletionRecorded { record } = &op {
+          a_retained_completion_carries_its_route(&db, record)?;
+        }
       }
       Err(
         DbError::NotFound
@@ -1061,6 +1138,7 @@ fn every_recovery_equals_the_live_partition_under(
   prop_assert_eq!(recovered.partition().to_snapshot(0), live);
   prop_assert_eq!(recovered.next_seq(), seq);
   prop_assert!(usize::try_from(seq).map_err(failed)? >= applied);
+  routes_match_their_records(&recovered)?;
   Ok(())
 }
 
@@ -1336,6 +1414,7 @@ fn completions_are_exactly_once_across_recovery() {
         client: 7,
         sequence: 3,
         result: vec![1, 2, 3],
+        work: None,
       },
     },
     0,
@@ -1349,6 +1428,7 @@ fn completions_are_exactly_once_across_recovery() {
         client: 7,
         sequence: 4,
         result: vec![4],
+        work: None,
       },
     },
     0,
@@ -1376,6 +1456,76 @@ fn completions_are_exactly_once_across_recovery() {
   assert_eq!(db.partition().completion(0, 7, 4), Seen::Completed(vec![4]));
 }
 
+/// A-288: the completions a green's successor adopted are counted under the work whose submit each completes, durably,
+/// until the client acknowledges them. Do: record two adopted completions of one work and a third a verb ran, recover,
+/// acknowledge the first, recover again, then acknowledge the second. Expect: the work's count follows exactly the adopted
+/// completions retained (2, 2 after the recovery, 1, 1 after the next, 0), the verb's completion counts for no work, and
+/// another work counts nothing throughout.
+#[test]
+fn a_works_adopted_completions_are_counted_until_acknowledged_across_recovery() {
+  let mut seg = segment("slates-db-routed-completions", LOG_BYTES);
+  let mut db = open(&mut seg);
+  let (work, other) = (routed_work(0), routed_work(1));
+  let record = |sequence: u32, work: Option<VolumeId>| Op::CompletionRecorded {
+    record: CompletionRecord {
+      origin: 0,
+      client: 7,
+      sequence,
+      result: vec![u8::try_from(sequence).unwrap()],
+      work,
+    },
+  };
+  for op in [
+    record(3, Some(work)),
+    record(4, Some(work)),
+    record(5, None),
+  ] {
+    db.mutate(&mut seg, &op, 0).unwrap();
+  }
+  let acknowledge = |up_to: u32| Op::CompletionsAcknowledged {
+    origin: 0,
+    client: 7,
+    up_to,
+    owed: Vec::new(),
+  };
+  let mut counts = vec![(
+    db.partition().completions_routed_by(work),
+    db.partition().completions_routed_by(other),
+  )];
+  drop(db);
+  let (mut db, _) = recover(&mut seg, 0, caps(), 0).unwrap();
+  counts.push((
+    db.partition().completions_routed_by(work),
+    db.partition().completions_routed_by(other),
+  ));
+  db.mutate(&mut seg, &acknowledge(3), 0).unwrap();
+  counts.push((
+    db.partition().completions_routed_by(work),
+    db.partition().completions_routed_by(other),
+  ));
+  drop(db);
+  let (mut db, _) = recover(&mut seg, 0, caps(), 0).unwrap();
+  counts.push((
+    db.partition().completions_routed_by(work),
+    db.partition().completions_routed_by(other),
+  ));
+  db.mutate(&mut seg, &acknowledge(5), 0).unwrap();
+  counts.push((
+    db.partition().completions_routed_by(work),
+    db.partition().completions_routed_by(other),
+  ));
+  assert_eq!(
+    counts,
+    vec![(2, 0), (2, 0), (1, 0), (1, 0), (0, 0)],
+    "the work's adopted completions, counted while retained"
+  );
+  assert_eq!(
+    db.partition().completion(0, 7, 4),
+    Seen::Acknowledged,
+    "the last adopted completion was released by the acknowledgement that ended its count"
+  );
+}
+
 /// The idempotency key is globally unique: two **distinct origin hosts** with the *same* (client, sequence)
 /// keep independent completions, so a cross-node forwarded write (keyed by its authenticated origin) never
 /// returns — or is deduplicated against — a local client that happens to share its per-node id (§4.8, task
@@ -1394,6 +1544,7 @@ fn completions_from_distinct_origins_do_not_collide() {
           client: 7,
           sequence: 3,
           result,
+          work: None,
         },
       },
       0,
@@ -1911,6 +2062,7 @@ fn owed_step_applied(
       client: OWING_CLIENT,
       sequence,
       result: sequence.to_le_bytes().to_vec(),
+      work: None,
     },
   };
   match step {
@@ -2041,6 +2193,7 @@ fn a_wait_and_its_transaction_are_one_durable_step() {
       client: OWING_CLIENT,
       sequence: 1,
       result: b"other".to_vec(),
+      work: None,
     },
   };
   db.begin();
@@ -2071,6 +2224,7 @@ fn a_wait_and_its_transaction_are_one_durable_step() {
         client: OWING_CLIENT,
         sequence: 3,
         result: b"seven".to_vec(),
+        work: None,
       },
     },
     0,

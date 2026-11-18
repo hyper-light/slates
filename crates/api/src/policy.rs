@@ -19,8 +19,9 @@
 
 use std::fmt;
 
-use slates_ipc::protocol::VolumeId;
+use slates_ipc::protocol::{self as wire, VolumeId};
 
+use crate::error::{Error, Unsupported};
 use crate::signed::Verification;
 
 /// What a write mode governs.
@@ -135,6 +136,89 @@ pub enum PolicyReason {
     /// The merge's signature, as judged.
     verification: Verification,
   },
+}
+
+impl WriteAct {
+  /// The act as the wire names it.
+  pub(crate) fn of_wire(act: wire::WriteAct) -> WriteAct {
+    match act {
+      wire::WriteAct::Merge => Self::Merge,
+      wire::WriteAct::Land => Self::Land,
+    }
+  }
+}
+
+impl WriteMode {
+  /// The mode as the wire carries it.
+  fn wire(self) -> wire::WriteMode {
+    match self {
+      Self::Forbid => wire::WriteMode::Forbid,
+      Self::Ask => wire::WriteMode::Ask,
+      Self::Bypass => wire::WriteMode::Bypass,
+    }
+  }
+
+  /// The mode as the wire names it.
+  fn of_wire(mode: wire::WriteMode) -> WriteMode {
+    match mode {
+      wire::WriteMode::Forbid => Self::Forbid,
+      wire::WriteMode::Ask => Self::Ask,
+      wire::WriteMode::Bypass => Self::Bypass,
+    }
+  }
+}
+
+impl WritePolicy {
+  /// The policy as the wire carries it (A-285). The wire keeps no signed-merge requirement yet, so a policy that sets
+  /// one is refused [`Unsupported::SignedWork`] here, before anything is sent: a requirement the daemon would drop is
+  /// never sent as if it held.
+  pub(crate) fn wire(&self) -> Result<wire::WritePolicy, Error> {
+    if self.require_signed_merges {
+      return Err(Error::Unsupported(Unsupported::SignedWork));
+    }
+    Ok(wire::WritePolicy {
+      merge: self.merge.wire(),
+      land: self.land.wire(),
+    })
+  }
+
+  /// The policy as the wire names it; no signed-merge requirement, which the wire does not keep yet.
+  pub(crate) fn of_wire(policy: wire::WritePolicy) -> WritePolicy {
+    WritePolicy {
+      merge: WriteMode::of_wire(policy.merge),
+      land: WriteMode::of_wire(policy.land),
+      require_signed_merges: false,
+    }
+  }
+}
+
+impl PolicySubject {
+  /// The subject as the wire carries it.
+  pub(crate) fn wire(self) -> wire::PolicySubject {
+    match self {
+      Self::Consumer(consumer) => wire::PolicySubject::Consumer { consumer },
+      Self::Volume(volume) => wire::PolicySubject::Volume { volume },
+    }
+  }
+
+  /// The subject as the wire names it.
+  pub(crate) fn of_wire(subject: wire::PolicySubject) -> PolicySubject {
+    match subject {
+      wire::PolicySubject::Consumer { consumer } => Self::Consumer(consumer),
+      wire::PolicySubject::Volume { volume } => Self::Volume(volume),
+    }
+  }
+}
+
+impl PolicyRefusal {
+  /// The daemon's `PolicyForbids { act, by }` (A-285): the act's mode forbids it.
+  pub(crate) fn forbidden(act: wire::WriteAct, by: wire::PolicySubject) -> PolicyRefusal {
+    PolicyRefusal {
+      act: WriteAct::of_wire(act),
+      by: PolicySubject::of_wire(by),
+      reason: PolicyReason::Forbidden,
+    }
+  }
 }
 
 impl fmt::Display for PolicyRefusal {

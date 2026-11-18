@@ -127,6 +127,20 @@ impl Issuer {
       .map_err(|e| instance.error(e))
   }
 
+  /// The proof a `SetPolicy` request carries (A-285, A-299): the keyed hash of exactly `subject` and `policy` under the
+  /// secret the running daemon published, with the policy domain's own tag, so it proves nothing else.
+  pub(crate) fn policy_proof(
+    &self,
+    subject: &slates_ipc::protocol::PolicySubject,
+    policy: &slates_ipc::protocol::WritePolicy,
+  ) -> Result<[u8; 32], Error> {
+    Ok(slates_server::landing::policy_proof(
+      &self.secret()?,
+      subject,
+      policy,
+    ))
+  }
+
   /// The proof that confirms the consensus recovery plan `plan` (§4.8, A-19), for an instance whose operator holds no
   /// recovery key of their own.
   pub fn recovery_proof(&self, plan: &[u8; 32]) -> Result<[u8; 32], Error> {
