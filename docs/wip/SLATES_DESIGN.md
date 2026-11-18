@@ -11911,6 +11911,8 @@ Recipes to copy verbatim:
   checkout/upload stay on the host. [C: publish-node.yml:60-66]
 - A `guard` job asserts the git tag equals the workspace version, or names a test of the lane
   (`v<version>-test.N`, accepted by the release lane alone; A-210). [C: release.yml:40-45]
+- Windows binaries are built with MSVC toolset 14.44 and Windows SDK 10.0.26100.0, pinned (A-411), not the image's
+  default toolset, so a runner image update leaves a tag's bytes alone.
 - Windows binaries link the C runtime statically (`+crt-static`), and the x86_64 one must start in a
   process-isolated Nano Server container, which has no Visual C++ runtime (A-210). Every push starts CI's debug build
   there too, the runtime's DLLs beside it, so an import Nano Server lacks fails the push that adds it (A-357); one
@@ -29131,7 +29133,7 @@ Applied in the same change to: `xtask/src/release.rs` (`runner_image`, `checked_
   runner reproduced. So it is still refused, but the refusal names both images (from each copy's smoke record,
   `ImageOS` and `ImageVersion`) and says to run one copy again until both share an image. A pair from one image that
   differs keeps the plain refusal: that is a reproducibility bug.
-- **Owed.** Pin the MSVC toolset and the Windows SDK the Windows binaries link, so a tag's bytes do not depend on which
+- **Owed (settled by A-411, the same day).** Pin the MSVC toolset and the Windows SDK the Windows binaries link, so a tag's bytes do not depend on which
   image a runner has (GAPS).
 
 ### A-400 — A work lives on the shard that serves its creation, its client's own; its name is held where the name hashes to, by an alias (2026-11-18, built for goals 231 and 257, 1,000 clients under 1 ms; amends A-247's "Where a work lives")
@@ -29204,3 +29206,23 @@ Applied in the same change to: §4.16's failure matrix (a green holder's restart
   wait, the room probe's heartbeat, the reaper's deadline, the Shards route's exchange) are their own items.
 
 Applied in the same change to: `crates/server/src/{green_adopt,nfs,remote_attach,verbs}.rs`.
+
+### A-411 — The Windows release builds pin MSVC toolset 14.44 and Windows SDK 10.0.26100.0, so a tag's Windows bytes do not depend on the runner image (2026-11-18, the release goals g236 and g237; settles A-407's owed item)
+Applied in the same change to: `.github/workflows/release.yml` (the step "MSVC toolset 14.44 and Windows SDK
+10.0.26100.0, pinned", through `ilammy/msvc-dev-cmd`, and the matrix's `msvc_arch`), Appendix B.2 (its recipes),
+GAPS (the binary release lane's entry) and `docs/publish.md` ("The binary release").
+- **The evidence.** The tag `v0.1.0`'s two x86_64 binaries, from `windows-2025` 20261103.298.1 (871a057d) and
+  20261116.315.1 (d3498b4f), differ in 2,559,679 bytes. Their Rich headers, which list every tool build that made
+  their objects, differ only in Visual Studio's default toolset: the linker (14.51 build 36260 against 14.52 build
+  37029, one entry each), its C runtime objects (build 35721 against 36815: 10 assembled, 16 and 17 C, 40 C++) and the
+  objects that toolset compiled (build 36260 against 37029: 4 assembled, 91 C). The Windows SDK's 204 objects are the
+  same (build 33145) in both.
+- **The decision.** Build with VS 2022 17.14's toolset 14.44, which both `windows-2025` images and the `windows-11-arm`
+  image carry beside the default (`Microsoft.VisualStudio.Component.VC.14.44.17.14.x86.x64` and `.ARM64`, version
+  18.11 and 18.12 of the component on the two images; actions/runner-images' readmes and release notes, 2026-11-18),
+  and the one Windows SDK the images carry. A side-by-side toolset is a frozen release serviced apart from the
+  default, which moves with every image. Rejected: comparing the two copies' toolsets instead of their bytes, which
+  would ship bytes no second runner reproduced; and building both copies in one job, which gives up the separate
+  runner AC-9.5 asks for.
+- **Owed.** The proof is a release run (a tag or a dry run) whose two copies of a Windows target land on two images
+  and match; filed for main. clang-cl, which compiles AWS-LC's C on arm64, still comes from the image.
