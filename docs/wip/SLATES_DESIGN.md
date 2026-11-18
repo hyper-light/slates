@@ -6868,9 +6868,9 @@ command and every host start, mount and grant through one implementation.
   is given no grant authority: under Ada's decision of 2026-11-18 a grant is proved by a key only
   the human holds (A-285), presented through the crate's proof-agnostic grant call.
 - *What a host holds.* An `Instance`: one held client of one running instance. A landing's
-  presentation lives as long as the client that made it (A-46), so a plan a person is shown is
-  granted and landed on the same client. An `Issuer`: the confirmation surface's authority (§4.13),
-  the anchor segment's handoff, attached for the length of one proof and never kept as a secret.
+  presentation lives as long as the client that made it (A-46), so a plan an approver is shown is
+  approved and landed on the same client. An `Issuer`: the launcher's authority (§4.13, A-299), the
+  anchor segment's handoff, attached for the length of one proof and never kept as a secret.
 - *Verbs.* Attach, the group of an instance run alone (`ensure_group`), create (an overlay over a
   host folder with a dynamic size, or scratch), snapshot, clone, destroy, list, status, drift and
   rewitness; serving as a host mount (§4.6, every platform's own mechanism; `mount::available` says
@@ -6880,15 +6880,12 @@ command and every host start, mount and grant through one implementation.
   `land_approved`, which grants and lands only the manifest a person approved and otherwise returns
   the new plan; observation (daemon status, audit, grants, telemetry). `Instance::client` lends the
   whole typed client for the rest (the merge verbs of §4.16, the file verbs).
-- *Refusals.* One closed `Error`: the daemon's `Refusal`, `Unavailable` (no daemon at the instance),
-  the channel's own, and the crate's (`MountFault` with the OS's error number, `IssuerFault`,
-  `PathFault`, `StartFault`). None is prose alone; the enums are `#[non_exhaustive]`, so a host
-  matches them with a wildcard arm as the crate grows.
+- *Refusals.* One closed `Error` whose variant is what a consumer does about it (the consumer
+  contract below, A-299). None is prose alone.
 - *Grant exclusion.* The SDKs and the MCP server depend on `slates-client`, not on this crate, so
   no grant verb reaches them (the structural exclusion this section asks of the registry); the
   daemon still refuses a grant kind on their channels whatever they claim.
-- *Versioning.* The workspace's one version. The report types it re-exports are the wire's, which
-  grow append-only (D-15), so a host matches their enums with a wildcard arm.
+- *Versioning.* The workspace's one version (`VERSION`), and the contract's own (`CONTRACT`, below).
 
 > **Status (2026-11-18, A-278, pieces 1 and 2).** Built: the crate with attach, the group, the
 > volume lifecycle, drift, the host mount on macOS, Linux and Windows (moved from the CLI with its
@@ -6904,6 +6901,97 @@ command and every host start, mount and grant through one implementation.
 > (`crates/api/tests/start.rs`, no libtest harness: its `main` serves the roles). Owed, in order:
 > an async form over a host's reactor (R6: a readiness wait and a timer over the client's driver);
 > a seam trait with a simulator and a conformance suite for hosts whose rules ask for one.
+
+**The consumer contract (A-299).** Everything a consumer touches goes through `slates-api` (Ada,
+2026-11-18): provisioning and managing volumes, serving them, landing, merging, their conflicts,
+permission errors, and every other interaction. Answers are typed outcomes and failures typed
+errors — closed enums a consumer matches and acts on, never strings. Kiln is the first consumer:
+it builds against the contract and adds to it rather than around it.
+- *Write permission.* Merging a work volume into its green (§4.16) and landing a volume onto a
+  host directory (§4.15) follow the permission the user gave the harness or agent asking to write,
+  a `WriteMode` per act (`WritePolicy { merge, land, require_signed_merges }`): **bypass** merges
+  and writes at once; **ask** answers a typed approval request (`ApprovalRequired`) the harness
+  presents, and writes once it is approved; **forbid** answers a typed refusal (`Refused`). The
+  launcher (kiln passes each agent's mode) or the harness sets a policy per enrolled consumer (an
+  agent's session, §4.13 "Principals") or per volume; an act follows the stricter of its caller's
+  and its volume's (`WritePolicy::meet`); a subject with no policy is asked, which is how every
+  landing behaved before. No key, signature or person-only proof decides it. An agent never raises
+  its own mode: setting a policy and approving need the launcher's authority — the instance's
+  issuer, handed to whoever starts the instance — which the daemon refuses on a consumer's channel,
+  and an agent holds only its consumer's capability. The daemon keeps and enforces the policies
+  (A-285, the owner of §4.13's grant path).
+- *Outcomes.* A landing answers `LandOutcome::{Written(report), ApprovalRequired(approval),
+  Conflicted(conflicts), Refused(policy refusal)}`; a merge `MergeOutcome::{Merged { version,
+  verification }, ApprovalRequired, Conflicted { windows, head }, Refused}`; a rebase
+  `RebaseOutcome::{Rebased { version }, Conflicted}`. An `Approval` names what awaits (a landing
+  request, or a work and its green), the presentation's id, the manifest hash it binds and a typed
+  summary of what it writes (entries per action, bytes, what the filter left out);
+  `Instance::approval_entries` lists it path by path (A-287). `Instance::approve` presents again and
+  approves only when the manifest is still the one shown, so an approval never covers more than its
+  approver saw; otherwise it answers the new presentation. `Instance::plan_landing` presents without
+  writing whatever the mode, for a reviewer.
+- *Conflicts are verdicts (D-26, D-27).* A landing conflict names its path, its class (§4.15 step 4's
+  table: both changed, changed against deleted, deleted against changed, both renamed, both created,
+  a type change, the target in use) and the bytes the volume would land there; a merge conflict its
+  file, its window in base coordinates and its class (§4.16's `MergeConflictClass`), with the
+  green's head the work must rebase onto. Nothing is inferred and nothing is written for a conflict;
+  the consumer resolves (`read_base`, a rewrite, `rewitness`; a rebase) and lands or merges again.
+- *Signed work (Ada, 2026-11-18).* A merge or a landing may carry a signature by its author's key
+  (an SSH signature, `PROTOCOL.sshsig`, the format of A-285's verifier: Ed25519 and FIDO Ed25519
+  keys), and its outcome carries how the daemon judged it: `Verified { signer }`, `Unsigned`, or
+  `Invalid { reason }`, the verifier's closed reasons. A volume's policy may require signed merges;
+  an unsigned or invalid merge into it is refused `SignatureRequired` even in bypass. Signatures
+  never gate permission: the mode does.
+- *Volumes.* One typed create, `Instance::provision(&VolumeSpec)`, for every source: an overlay
+  over a host folder, an empty volume, a clone of a snapshot, a green (empty or over a complete
+  immutable snapshot), a work volume over a green, which answers its green and its base version.
+  Snapshot, destroy, list, a typed status (`VolumeStatus`, an overlay's base `Read` or
+  `Unreadable`), an overlay's drift as typed entries (`Drift { path, kind }`, `Modified`,
+  `Deleted`, `Replaced`, `TypeChanged`, apart from the entries whose re-check the host refused),
+  `read` at a head, a version or an attachment's view, and serving: a host mount on bare metal, or
+  a descriptor a VMM takes.
+- *Errors.* `Error`'s variant is the class of thing a consumer does: `NotFound` (naming the subject
+  the call named: a volume, a snapshot, a presentation, an attachment, an entry, a shard),
+  `AlreadyExists`, `Denied`, `Exhausted`, `Busy`, `Stale`, `Retry { cause, pause_ns }` (the
+  derived first pause; `Instance::retry_pause_ns` gives each later one), `Unavailable` (no daemon:
+  start it, or report), `Unsupported`, `Invalid`, `Unusable` (destroying, not recovered, no group),
+  `Elsewhere`, `Host` (with the OS's error number), `Mount`, `Start`, and `Protocol` (a fault in
+  slates: report it). Every refusal on the wire maps to exactly one of them in one exhaustive table,
+  so a refusal added to the wire does not compile until it is given its class. Words the daemon or
+  the OS said only in prose travel as a `Note`, which is displayed and never matched.
+- *Versioning a consumer pins.* No contract enum is `#[non_exhaustive]`. `slates_api::CONTRACT` is
+  raised by one with every change to a type or a verb of the contract; a consumer pinning slates at
+  a commit asserts the version it was written against and matches exhaustively, so at its next
+  vendoring a moved contract is a failed assertion beside the compile errors of the matches it must
+  extend — never a variant falling silently through a wildcard. The wire types the contract
+  re-exports grow append-only (D-15) and count as the contract's where it returns them.
+- *Laptop and fleet (R8).* One contract and one code path: the same calls, outcomes and errors on a
+  laptop instance and on a fleet node; a fleet's own refusals (`Elsewhere`, `Retry` for an owner
+  not confirmed) are variants a laptop never sends.
+
+> **Status (2026-11-18, A-299, piece 4: the contract published).** Built in `slates-api`: the write
+> modes, the policy and its typed refusal (`policy`), signed work's types (`signed`), the outcomes,
+> approvals and typed conflicts (`outcome`), typed provisioning, status and drift (`volume`), the
+> closed taxonomy with one exhaustive table over the wire's refusals, the channel's and this
+> process's own faults (`error`), and `Instance::{provision, read, land, plan_landing,
+> approval_entries, approve, merge, rebase, retry_pause_ns}` over today's daemon, on which every
+> landing with something to write asks and the launcher approves it with the issuer; `CONTRACT` = 1.
+> The CLI's mount, grant, enroll, revoke, run and recover map the taxonomy to its exit codes.
+> Proven by use over an in-process daemon (`crates/api/tests/api.rs`: the group missing is
+> `Unusable(NoGroup)`; provisioning from each source, `AlreadyExists` naming the holder, a destroyed
+> volume `NotFound` naming it; an overlay's landing answered `ApprovalRequired` with its typed
+> summary, a stale approval writing nothing and answering the fresh presentation, the shown one
+> `Written` and `Done`; a file changed on disk typed drift and a typed `ModifyModify` conflict with
+> the volume's bytes; a merge `Merged`, a rewrite of the same bytes `Conflicted` with its window and
+> the green's head, a clean work rebased and merged; signed work refused `Unsupported(SignedWork)`)
+> and by unit tests of the pure parts (each refusal's class, the drift text's grammar, the summary's
+> actions, the merge classes' discriminants, the policy meet). **Owed, in order:** the starter handed
+> the launcher's authority on every platform (the anchor passes the segment's descriptor back on
+> Linux); the daemon's side of the modes, merge approvals and signed work, with the verbs that set a
+> policy and hand out a statement to sign (A-285's owner, agreed through g262's inbox); typed fields
+> on the wire for drift, a presentation's conflicts, a landing's target refusal and a merge's
+> versions (the work's base beside the head), replacing what the crate reads from text or asks
+> again; a paged listing; typed audit and grant states.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -20950,3 +21038,59 @@ GAP-A9-9's macOS segment by name, its option 1); the Windows confirm-per-use pat
   expiry and an untouched security key are each refused with their own reason; hostile bytes are refused, never a
   panic (`crates/server/src/grant_signature.rs`, 10 tests). The golden test was red until the vector was re-signed over
   the exact encoding, since the first vector was signed before the target gained its length prefix.
+
+### A-299 — The consumer contract: write modes per act, typed outcomes, typed conflicts and drift, signed work, one closed error taxonomy, a contract version a consumer pins (accepted 2026-11-18, Ada's widening of goal g262; piece 4, the contract published, built 2026-11-18)
+Applied in the same change to: §4.12 ("Embedding": what a host holds, its refusals and its versioning; "The consumer
+contract", new, with its status), GAPS (the A-299 entry and the Embedding library row), `docs/library.md`.
+- `crates/api`: `policy.rs` (new: `WriteMode`, `WriteAct`, `WritePolicy`, `PolicySubject`, `PolicyRefusal`,
+  `PolicyReason`), `signed.rs` (new: `WorkSignature`, `Verification`, `Signer`, `SignerKey`, `SignatureFault`),
+  `outcome.rs` (new: `LandOutcome`, `MergeOutcome`, `RebaseOutcome`, `Approval`, `Awaiting`, `Work`, `Summary`,
+  `ActionTally`, `LandingReport`, `LandingState`, `LandingConflict`, `MergeConflict`, `MergeConflicts`), `volume.rs`
+  (new: `VolumeSpec`, `Source`, `Provisioned`, `VolumeStatus`, `BaseState`, `DriftReport`, `Drift`, `DriftKind`,
+  `Watcher`), `error.rs` (rewritten: the classes and their details, `Note`, `MountMissing`, `Unreported`; every enum
+  closed), `instance.rs` (`provision`, `read`, `land`, `plan_landing`, `approval_entries`, `approve`, `merge`,
+  `rebase`, `retry_pause_ns`; `create`, `clone_snapshot`, `land` under a grant id, `land_approved`, `LandingPlan`,
+  `Planned` and `Approved` removed, replaced), `lib.rs` (`CONTRACT`; `overlay` and `scratch` replaced by
+  `VolumeSpec::overlay`, `VolumeSpec::empty`), `grant.rs`, `issuer.rs`, `start.rs` (the launcher's authority),
+  `mount.rs` (typed missing pieces), `Cargo.toml` (`slates-merge`), `tests/api.rs`, `tests/start.rs`.
+- `crates/cli/src/verbs.rs`: `failure_of_api` maps the taxonomy's classes to the command's exit codes; the Windows
+  unmount names each unreported volume from its typed refusal.
+
+- **Why.** Ada (2026-11-18): "merge and write to disk permissions need to reflect those granted by the user to the
+  harness/agent seeking to merge their write to disk. Part of your work is figuring out and building a correct, robust,
+  performant API with typed responses and errors that consumers can consume (Kiln is a consumer) to act upon this. This
+  also applies to handling merge conflicts, permission errors, provisioning/managing volumes, and other interactions."
+  And the rule of the same day: agents can approve merges and landings; bypass writes, ask returns a typed approval
+  request, forbid a typed refusal; no keys, no signatures, no person-only proofs; the launcher or the harness sets a
+  session's or a volume's policy, and an agent can never raise its own. And, later the same day: "we can (and should)
+  support signed work (signed merges, etc.)": a merge or a landing may carry a signature, its outcome a typed
+  verification, and a volume's policy may require signed merges; signatures never gate permission.
+- **Before.** `slates-api` answered the wire's `Refusal` (with free text in a dozen variants), the client's own
+  `ClientError`, a landing's plan with its conflicts as `"path (Class)"` strings, a summary counting actions by name,
+  an outcome's state as a word, a drift list of `"path (Kind)"` strings with an unreadable base reported as a drift
+  entry `"status refused: ..."`, a merge window's class as a byte, and enums a consumer had to match with a wildcard.
+  A consumer acting on any of it parsed text.
+- **The shape.** One class per thing a consumer does (the table in `error.rs`), with the refusal's own data typed in
+  its detail; where the daemon or the OS spoke in prose only, a `Note`, displayed and never matched. The mapping from
+  the wire is one exhaustive match, so a refusal added to the wire cannot compile until it has a class. `NotFound`
+  names the subject the call named, which the bare wire refusal does not. Outcomes are enums of what happened —
+  written, awaiting approval, conflicted, refused — and the refusal a policy makes is an outcome, not an error: in a
+  forbid mode it is the expected answer. A landing whose presentation found conflicts answers them typed, read from
+  the presentation's own entries (A-287), never parsed. An unreadable base is a state of the status, never a failure of
+  it, so a mount still reads the daemon's port.
+- **Closed, and versioned for a pinning consumer.** The A-278 crate's enums were `#[non_exhaustive]`, which forces a
+  wildcard and lets a new variant fall through it unhandled. Kiln vendors slates at a commit; a new variant should stop
+  its build where it must decide, so every contract enum is exhaustive and `CONTRACT` (1) is raised with every change.
+- **Write permission, split between the crate and the daemon.** The modes are enforced where agents reach slates — the
+  daemon, through the MCP server, the SDKs and the mounts as much as this crate — so the daemon keeps them (A-285's
+  owner). The crate publishes the types now so kiln's agents (g263–g266) build against them. Until the daemon's side
+  lands, every landing with something to write asks (today's behaviour, a grant per landing) and `approve` grants it
+  with the launcher's issuer, binding exactly the manifest shown; a signed act is refused `Unsupported(SignedWork)`
+  before anything is sent, and every outcome reports `Unsigned`, which is true.
+- **Rejected.** A merge's conflicts carrying the work's base from the handle a consumer holds: the daemon knows the
+  base, a handle can be stale, and the wire carries it next (owed). A paged listing faked over the one-reply list: the
+  daemon answers every volume in one reply today, and a page the daemon did not cut would hide that cost; the paged
+  verb is owed. Policy verbs that could only refuse until the daemon keeps policies: left out until they work.
+- **Checked.** `cargo test -p slates-api` (37 unit, 9 by use, 5 start, 1 doc) and `cargo test -p slates-cli` on
+  macOS arm64 (kiln runner, 2026-11-18): the cases in §4.12's status. The Linux and Windows arms of the mount and the
+  CLI's Windows unmount are not compiled on this host; the integrator's lanes are their first compiler.
