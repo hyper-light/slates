@@ -15628,6 +15628,22 @@ suite on adacachy2 and 1 of 3 of the stack's (the supervisor's gate); alone it p
   owner's chain, 2 of 2, and the nine green takeover tests beside it 10 of 10 (macOS arm64, load 32-60). The share
   test's rerun under diag-clients-green-1's load is owed to the supervisor's lanes.
   `docs/bugs/2026-11-18-a-successor-one-version-behind-never-received-the-adopted-versions-inputs.md`.
+- **Sibling, bounded 2026-11-18: a taken-over tombstone's record.** The same period's first step,
+  `fleet::adopt_pending_tombstones` (AUD-29-43), skipped a tombstone whose partition has no shard here every period
+  without a count, and retried one its shard refused (the partition's volume capacity full, or a live volume under the
+  id) every period without end. Each pending tombstone (`state::PendingTombstone`) now counts its attempts against
+  `takeover_attempts`, each counted by its reason (`fleet.tombstone.waits.shard`, `fleet.tombstone.adopt_refused`, and
+  `fleet.tombstone.adopt_unanswered`, which `adopt_refused` counted before), and at the bound it is given up,
+  `fleet.tombstone.given_up` with a log line, and attempted no more. The adoption had already placed the tombstone at
+  the quorum, so the volume is never served again; the retirement is what is lost, which leaves the candidates holding
+  the tombstone. It stays marked, so the volume is still known destroyed and its catalog never rebuilt. Red first:
+  with the give-up cut out in a scratch copy, a tombstone whose partition has no shard here was attempted
+  100 times in 100 periods (`waits.shard` 100) and one a live volume's shard refused 99 times (`adopt_refused` 99),
+  neither given up (2 of 2, `a_taken_over_tombstone_whose_partition_has_no_shard_here_is_given_up_by_name`,
+  `a_taken_over_tombstone_its_shard_refuses_is_given_up_and_the_live_volume_stays`); with the bound each is given up
+  after 10, counted once, attempted no more, and the live volume still answers its status. Beside them the destroyed
+  volume's takeover test and seven volume and green takeover tests, 10 of 10 in 27.5 s; `slates-server --lib` 267 of
+  267 (macOS arm64, Adas-MacBook-Pro-3, load 26-38, 2026-11-18).
 - **Sibling, fixed 2026-11-18: a panic on the rebuilt green's role.** `verbs::materialize_taken_over_green` checked with
   a `debug_assert!` that the id it rebuilds names a green, the last `debug_assert!` in any crate's sources (CLAUDE.md §2
   item 6): a debug build's shard panicked on a volume of another role under the id, and a release build went on to
