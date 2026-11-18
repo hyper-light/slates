@@ -7918,6 +7918,10 @@ it builds against the contract and adds to it rather than around it.
 > way. `HostFault` renders in words, the daemon's `TargetUnavailable` by that name. Both were lost when the CLI moved
 > onto the library (A-278); the integrator's Windows lane found them (run 44257181904,
 > `docs/bugs/2026-11-18-the-cli-on-the-library-lost-two-windows-refusals-words.md`).
+> **`CONTRACT` = 17:** the daemon's database refusals are typed on the wire (`Refusal::Database { refusal:
+> DatabaseRefusal }`, appended). `refusal_of_db` is exhaustive: its catch-all sent a corrupt record, a regressed
+> NFSv4 instance, a checkpoint out of range, a malformed sealing key and a refused encoding as `BadRequest` words. The
+> contract classes each `Unusable::Database`, a fault on the daemon's side to report.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -17050,6 +17054,10 @@ is preempted, and raising its thread's priority removes the wait (run 4205929431
 is not yet a measured gain and no priority has been changed.
 Applied in the same change to: GAPS, BENCHMARKS, `crates/bridge-winfsp/src/reply.rs`, `host.rs`, `dispatcher.rs` and `lib.rs`.
 
+**A window per kind of request (2026-11-18): measured in two forms and rejected (A-348).** One window for every kind
+stays: parking at once the kinds whose replies miss it freed arm64's loaded shards (a loaded write 42.3 µs faster at the
+p50) and cost x86_64 a wake at each p50 it moved (a loaded stat 42.5 µs slower).
+
 Applied in the same change to: GAPS (the audit entry's unmeasured-receiver item); `crates/bridge-winfsp/src/dispatcher.rs`,
 `inflight/capture.rs`, `purge_intents.rs`, `notify.rs` and `host.rs`.
 
@@ -17244,6 +17252,9 @@ Applied in the same change to:
   −2,375 µs (8 to 9 of 10), write's and unlink's p50 and write's p99 beyond the control's spread. No x86_64 loaded p99
   moves beyond the control's. The cost is a quiet stat: p50 +8.1 µs on arm64 and +4.0 µs on x86_64, the post's wake costing
   about what the round did when the shard is idle.
+- **Amended by A-348 (2026-11-18).** The mount's request channel held one request, so the request after an open waited in
+  its post until the shard had taken the confirmation; it holds two now, and the post never waits. The variant that posts
+  without the wake deadlocked over the one-request channel and, over two, measured slower: the wake stays.
 
 ### A-249 — The purge in progress is one slot the receive worker reads, never a channel it drains (accepted and built 2026-11-07, the supervisor's decision: option (a); amends A-190 and A-198)
 
@@ -25203,6 +25214,39 @@ Applied in the same change to:
   mounts as a node that does not hold it: an NFS request `NFS3ERR_STALE` and no root at a mount, as the router answers a
   handle of a volume outside the node's set; a FUSE mount fenced as a revoked one is, its kernel's cache dropped, its
   requests refused `ENOTCONN`, and the mount ended. The client mounts the volume through its successor's node.
+
+### A-348 — The mount's request channel holds the receive worker's posted confirmation beside its next call; the post's wake stays, and the per-kind spin choice is measured and rejected (2026-11-18, goal g258, audit step 7 continued; amends A-274, records against A-212)
+
+Applied in the same change to:
+- §4.6 (Windows): this entry is its record.
+- `crates/bridge-winfsp/src/host.rs`: `REQUEST_BOUND` is `CALLS_WAITED_FOR + CONFIRMATIONS_POSTED`, two; the test
+  `host::channel::the_next_request_is_posted_while_a_confirmation_waits_untaken`.
+- A-274: its record names this amendment.
+- BENCHMARKS ("Step 7, continued"), GAPS (the Step 7 entry).
+- **What was there.** The mount's request channel was a `sync_channel` of one request: "the one receiver waits for its
+  current callback's answer before sending another request". A-274 made that untrue: the worker posts an open's
+  confirmation and goes on, so the confirmation can still be in the channel when the worker's next callback posts its
+  call, and that post waited for room until the shard took the confirmation. On main the confirmation's own wake brings
+  the shard, so the wait was a shard wake on the worker's path, the kind of wait A-274 took off it. A worker that posted
+  without the wake waited for good: cut (c)'s no-wake variant stalled both Windows runners in its first run, a drive's
+  first look on arm64 and the warm-up's next round on x86_64 never answered, and its live CLI suite hung (diag-g258-1,
+  run 44271751211).
+- **The rule.** The channel holds every request the one receive worker can have outstanding: the call it waits for and
+  the one confirmation it posted without waiting (A-274 refuses a second over it, `inflight::settle`). No post waits for
+  the shard to take what is in the channel. Red at one request on both Windows runners, green at two (diag-g258-4, run
+  44278926773). Measured dead even against main: no p50 or p99 cell beyond the control on x86_64, only tails both ways on
+  arm64 (the same run, ten runs a runner). It lands on A-274's rule, not for speed.
+- **The post's wake stays.** Over the two-request channel the no-wake variant measured slower beyond the control: arm64's
+  loaded write p50 +48.4 µs (0 of 10 runs faster), rename, unlink, create_security and quiet write, and x86_64's loaded
+  p99 open +636 µs (0 of 10); only arm64's loaded fsync was faster (−13.8, 10 of 10). Woken at the post, the shard serves
+  the confirmation while the worker sends, and the request after an open finds it awake.
+- **A-212's spin, one window for every kind, stays.** Cut (b) let each kind of shard request choose between spinning the
+  window and parking at once, by its own recent replies, each stamped with its shard's send instant: by the 2-competitive
+  costs (diag-g258-2) and by whether its median reply came within the window (diag-g258-7). Both lost on x86_64, about a
+  wake at each p50 that moved (the 2-competitive form's loaded close +16.7 µs, 0 of 10 faster; the median form's loaded
+  stat +42.5) and traded on arm64 (the median form's loaded write −42.3 and rename −35.2, 10 of 10 each, against loaded stat
+  +11.7 and quiet fsync +10.9). Neither lands: a spin that misses costs arm64's loaded shards a CPU they need, a park costs
+  x86_64 a wake, and a choice that takes the first without the second needs a signal of contention (open in GAPS).
 
 ### A-335 — A stale copy is let go only once its holder keeps no content for it: a successor's confirmation says its record was adopted, not that its content was fetched (2026-11-18, kiln goal g250; a bug found while checking A-309's owed rule)
 
