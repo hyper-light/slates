@@ -11243,8 +11243,13 @@ fn a_repair_whose_acknowledgement_outlasts_its_round_is_counted() {
      {repairs_before:?} → {repairs_after:?}, late repairs {late_before:?} → {late_after:?}; the owner's put latency \
      (readings, p95 ns) {measured:?}; the owner's counts {healer:?}"
   );
+  let outlasted = outlasted_before
+    .as_ref()
+    .ok()
+    .zip(outlasted_after.as_ref().ok())
+    .is_some_and(|(before, after)| after > before);
   assert!(
-    matches!((&outlasted_before, &outlasted_after), (Ok(before), Ok(after)) if after > before),
+    outlasted,
     "the refill outlasted the round that sent it, so the case shown is the one that went uncounted: \
      {outlasted_before:?} → {outlasted_after:?}; the owner's put latency (readings, p95 ns) {measured:?}"
   );
