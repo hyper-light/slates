@@ -1,0 +1,42 @@
+# DIAG (not for main): g230's A-382 landing commit on main: its tests and the re-admission and supersession tests
+# beside them, on Linux x86_64 and arm64.
+name: diag-g230-land
+on:
+  push:
+    branches: ['diag-g230-land-*']
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  focused:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: |
+          set +e
+          cargo test --locked -p slates-server --test fleet --no-run > build.log 2>&1; code=$?
+          grep -E "^(error|warning)" -A 12 build.log | head -80
+          exit $code
+      - name: Focused
+        run: |
+          set +e
+          timeout 900 cargo test --locked -p slates-server --lib -- readmission verbs::tests::a_takeover_that_names_this_node_again_replaces_its_superseded_copy > lib.log 2>&1; echo "== lib exit $?"
+          grep -E "^test result|FAILED|panicked at" lib.log | head
+          for t in every_copy_catches_up_once_the_creator_takes_its_volume_back_from_the_adopter every_copy_catches_up_once_the_third_node_takes_the_volume_from_the_adopter a_superseded_owner_restarted_warm_ships_no_record_of_the_volume_it_lost an_owner_admitted_again_forwards_the_volume_its_successor_took_over_and_never_serves_its_own_copy an_idle_volumes_nfs_mount_on_an_owner_admitted_again_answers_stale a_fleet_settles_on_one_configuration_after_the_owner_a_takeover_made_is_retired_in_turn a_superseded_owner_ships_nothing_more_of_the_volume_it_lost a_superseded_owners_clients_reach_its_successor a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again; do
+            timeout 1500 cargo test --locked -p slates-server --test fleet -- --exact "$t" --nocapture > "out-$t.log" 2>&1; echo "== $t exit $?"
+            grep -E "panicked at|test result" -A 1 "out-$t.log" | cut -c1-500
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: land-logs-${{ matrix.os }}
+          path: "*.log"
