@@ -11252,7 +11252,7 @@ since A-402, which also makes the log option 2 names available to the WinFsp dri
 
 ### 2026-11-18: a snapshot exported as its archive through the library (Mantle's CP-T10.4; built, A-441); the volume from an archive owed
 
-> - **Built.** `Instance::export_archive` (contract 39): a snapshot rendered as its archive file (`ARCHIVE_FILE`) in a
+> - **Built.** `Instance::export_archive` (contract 38): a snapshot rendered as its archive file (`ARCHIVE_FILE`) in a
 >   new volume of the caller's, walked in slices on the owner shard, read back a page at a time with `read`.
 >   `a_snapshot_exported_as_its_archive_carries_every_file_and_entry` decodes and restores what it reads back: every
 >   file's bytes, length and mode, the directories, none of a write after the snapshot, the same manifest twice.
