@@ -1,5 +1,26 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **owner_turn's refused `mkdir` asked the program, not the kernel: fixed (2026-11-18, test only).**
+> `a_mutations_reply_waits_for_its_barrier_and_a_refused_barrier_answers_eio` (`crates/bridge-fuse/tests/owner_turn.rs`)
+> failed on every CI run of the ubuntu-latest gates job since main moved to Ubuntu 26.04 (from run 43146258837 on
+> 2026-11-12 to 44210937388 on 2026-11-18; diag-slabs-58 200 of 200 alone), and was ledgered as a rare race. It is
+> not a race: 26.04's `/usr/bin/mkdir` is uutils coreutils 0.10.0, which is told `EIO` by `mkdir(2)` and exits 0
+> because the refused directory exists in the volume (strace in diag-slabs-61, run 43146145846). The owner refused the
+> right request (`MkDir`) and the kernel answered `EIO`. The test now makes the directory by `mkdir(2)` and holds the
+> answer to `EIO`. Swept: no other test judges a coreutils program's refusal through a mount (the rest redirect in the
+> shell, `cat` a missing path, or run util-linux's `fallocate`). **Consequence, open:** the job runs `cargo test
+> --workspace`, which stops at the first failing binary, so no suite after `slates-bridge-fuse`'s `owner_turn` ran on
+> that lane from 2026-11-12 until this fix; the first run with it is the stack that lands it. Record:
+> `docs/bugs/2026-11-18-owner-turns-mkdir-asked-the-program-not-the-kernel.md`.
+
+> **KIND on Ubuntu 26.04 ran out of inotify instances: fixed in the lane (2026-11-09).** The KIND lane failed at
+> formation on `ubuntu-latest` once it became 26.04 (`peers_probed=0`), and passed on 24.04. The image keeps the
+> kernel's `fs.inotify.max_user_instances = 128` (24.04's set 1280), which kind's six privileged nodes share as the
+> host's root; kube-proxy crash-looped on 4 of 5 workers, so pods there never reached the cluster's DNS. Raised to
+> kind's documented 512 (and 524288 watches), 6 of 6 kube-proxies ran with 0 restarts (diag-release-14). The job
+> raises them before the lane; the image stays 26.04. Record:
+> `docs/bugs/2026-11-09-kind-on-ubuntu-26-04-ran-out-of-inotify-instances.md`.
+
 > **Device nodes are kept as metadata (2026-11-17, §4.5, §4.6, §4.15, §4.16; A-294, Ada's option (c) for A-26 of
 > 2026-11-18; replaces A-268's `EPERM`).** A block or character device node is now an inode whose body is its number,
 > kept through the volume, its recovery image (28) and delta (11), archives (manifest minor 4), merges and ext4 images,
@@ -238,7 +259,17 @@
 > - signed work: a merge or landing may carry an SSH signature, checked and recorded (verified with its signer,
 >   unsigned, invalid with its reason), and a volume may require signed merges;
 > - the end-to-end proof on adacachy: a bypass agent's landing written at once, an ask agent's after approval, a
->   signed merge verified and an invalid signature reported.
+>   signed merge verified and an invalid signature reported. **The landing half ran on Linux (2026-11-18):**
+>   `write_policy.rs` 9 of 9 on Linux x86_64 and arm64, a real daemon and client over a real target directory (GitHub
+>   run 44240968028, main 821d12f7d); signed work stays owed;
+> - **built (2026-11-18, found by the two-node filesystem-server flow):** an agent approves no landing of its own. A
+>   landing's grant verified its proof and manifest but not its channel, so a consumer-bound channel holding a genuine
+>   launcher-class proof was granted, where a policy setting and a merge's approval are refused `Forbidden` whatever
+>   the proof. `grant_verb` now refuses it first (`grant_by_consumer`): `an_agent_cannot_approve_its_own_landing` (red
+>   without the guard: granted) and `fs_server.rs`'s server-node agent
+>   (`docs/bugs/2026-11-18-an-agents-own-channel-could-approve-its-own-landing.md`). **Open, its siblings:** `Enroll`
+>   and `Revoke` still verify the proof alone, so a consumer-bound channel holding a genuine proof could enroll a fresh
+>   consumer (binding a channel that escapes its own consumer policy) or revoke another; the same guard is owed.
 
 > **W1 would have let a work off its green's shard merge under one volume's write policy: fixed before W1 landed
 > (2026-11-18, g231; A-307, §4.16).** A-285 judges a merge's policy from the work's and the green's records on one
@@ -293,7 +324,11 @@
 > `undo.desc` naming its source by absolute path (now excluded with the reason). **Closed in the same change:** a
 > workload whose script failed alike on both sides was recorded `Identical` (`compare` asked only that the exit codes
 > be equal, while Part 6 asks them 0); it is now `Failed` on every leg, red-checked first. Subversion was absent from
-> every machine this change could use, so its workload runs first in CI. Locks: every leg runs a workload's two sides
+> every machine this change could use, so its workload runs first in CI. CI's first run of it (run 44247840584, ubuntu,
+> 2026-11-18) held the host gate red: two runs differed at `repo/db/rep-cache.db`, FSFS's representation cache, an
+> SQLite file whose page bytes are not what Subversion promises. It is now compared by its rows (printed where `sqlite3`
+> is on the `PATH`) and left out of the byte comparison with that reason, on every leg as on the host; the revisions it
+> caches (`db/revs`, `db/revprops`, `db/current`) stay byte-compared. Locks: every leg runs a workload's two sides
 > under one kernel, whose own locks bind SQLite's, FSFS's and Mercurial's; served locks matter only between kernels.
 > **Open:** (1) the runs over each mount, which are the supervisor's (CLAUDE.md §8): any difference they find is a gap
 > to fix failing-test-first; (2) ~~the Windows WinFsp roster~~ **built 2026-11-17 (A-300, above)**: WinFsp's driver
@@ -2814,7 +2849,19 @@
 >   (`crates/base/tests/host.rs`).
 > - **No grant can be issued on Linux from the CLI.** The anchor's issuer segment is a descriptor only its children
 >   hold (`PRINTS_ISSUER_SURFACE` in `crates/cli/tests/cli.rs`), so a Linux server's landing stops at its
->   presentation. Needs a decision on the Linux issuer surface (§4.13).
+>   presentation. **Closed for the launcher's path (2026-11-18, A-285, fs-server plan step 1):** the launcher (kiln,
+>   or this test acting as it) starts the server's anchor with its secret on standard input (A-299) and sets the
+>   volume's write policy through `slates-api`; bypass then lands in the one `slates land`, and ask lands once the
+>   launcher approves exactly the presented manifest. `crates/cli/tests/fs_server.rs`, two anchored nodes:
+>   `a_bypass_server_lands_the_client_nodes_merge_in_one_call` (4 entries written, the project exactly the merged
+>   files) and `an_ask_server_lands_the_client_nodes_merge_once_its_launcher_approves_that_manifest` (the approval
+>   request writes nothing; agents' channels set and approve nothing, `NotFound` on the client node, `Forbidden` on
+>   the server's; another manifest refused `GrantMismatch`; the approved one writes 4 entries). Passed on macOS arm64,
+>   Linux x86_64 and Linux arm64 (GitHub run 44248664367: `fs_server` 8 of 8, `write_policy` 10 of 10); red with the
+>   bypass policy or the launcher's approval taken away, and with the grant guard taken out (run 44248681152: each
+>   mutated test fails at its own assertion; the agent's own grant issued, `Ok(1)`). **Still open:** a person at a bare
+>   CLI, with no launcher, has no approval verb of their own; one would read the launcher's secret from a descriptor
+>   the person passes, never an argument or the environment.
 > - **Remote attach is owed (§4.10):** another node's `attach` is refused `NotFound`, so a client on another node
 >   pushes through a green, never through a write attachment.
 > - **A self-signed fleet certificate must be a leaf.** OpenSSL's default (`CA:TRUE`) is refused
@@ -15634,11 +15681,27 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
         and the failing run's daemon reported its shard starved 1.6 s (`a heartbeat came 1626 ms after the last`).
         Arm B's one stall of the stale-handle test's attackers (0 attempts in its 2 s window, 1 of 14 runs; arm A 0 of
         13) has the same look, in a test where arm B does nothing but look its tracker up.
+        **Not reproduced on 1c49c33f (fs-server, 2026-11-11), closed by 4ae3f84b:** since 2026-11-06 a forwarded call
+        waits for its owner in the owner's own time (`xshard::task_in_shard_time`, A-65's rule), so a starved owner's
+        reply is heard and only a wedged one's is given up. 20 of 20 runs of
+        `a_mount_survives_connections_broken_and_tampered_mid_call_under_load` passed beside 36 spinners in a 2-CPU unit
+        at load 17–201 on adacachy (at the recorded 1 in 5, twenty clean runs come by chance about 1% of the time).
       - Main's, found sweeping for the connection end's siblings: a READDIR of the host root asks every shard for its
         entries (`nfs.rs` `gather_all_entries`), though the capability it presents authorizes one volume, whose owner its
-        id names (D-14); a client holding a capability can make every shard answer as often as it likes.
+        id names (D-14); a client holding a capability can make every shard answer as often as it likes. **Fixed
+        2026-11-11 (fs-server):** the listing asks the one shard whose partition holds the capability's attachment (its
+        id's high bits), the only one that can list anything under it, and none without a capability. Red first:
+        `a_host_root_listing_asks_only_the_shard_its_capability_names` (`crates/server/tests/nfs_hostile.rs`), the host
+        root listed under a control-shard volume's capability while the other shard was wedged, answered `SYSTEM_ERR`
+        after 1.04 s; served after. Sibling, open: a dropped NFSv4 client's or destroyed session's purge
+        (`v4::compound::purge_owed`) is sent to every owner, so a client that churns sessions makes every shard answer;
+        the connection end's footprint (A-192) is the shape a fix would take.
       - Seen in both arms, not this change's: a WRITE at the last offsets of the range is answered
-        `NFS3ERR_SERVERFAULT`, where RFC 1813 has `NFS3ERR_FBIG`.
+        `NFS3ERR_SERVERFAULT`, where RFC 1813 has `NFS3ERR_FBIG`. **Fixed 2026-11-11 (fs-server):** NFSv3's statuses lacked
+        `NFS3ERR_FBIG` (27), so the volume's `FileTooLarge` fell to the catch-all; it now maps to `NFS3ERR_FBIG`, and to
+        `NFS4ERR_FBIG` on NFSv4. Red first: `a_write_at_a_colossal_offset_is_refused_and_the_daemon_survives` now holds
+        the overflowing WRITE to 27 (it answered 10006). Siblings, open: `TooManyLinks` and `CrossVolumeMove` also fall to
+        `NFS3ERR_SERVERFAULT`, where RFC 1813 has `NFS3ERR_MLINK` (31) and `NFS3ERR_XDEV` (18).
 - **A READ reply past 64 KiB closed the RPC-with-TLS export (found and fixed 2026-10-25, `3e05c70d`).** rustls caps
   its buffer of sealed records at 64 KiB, and the session's send wrote a reply with `write_all`, so any READ reply past
   it ended the connection, and the kubelet's `hard` mount retried it for good: through a kubelet-mounted export a file

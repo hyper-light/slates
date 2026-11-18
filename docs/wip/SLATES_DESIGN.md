@@ -8652,10 +8652,13 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > itself is still refused `land`. Proven by `crates/server/tests/checkout.rs` (a real daemon over a real directory:
 > two merged pushes and an overlapping one refused with its window; the granted landing writes every merged byte; an
 > outsider's edit of a merged file is the presentation's only conflict; a wrong or moved base refused; three of three
-> red with the base check and the writes removed), by `crates/cli/tests/fs_server.rs` (two `slates daemon --fleet`
-> processes, up to the presentation), and across two machines on 2026-11-05: a client on Linux pushed to a green on a
-> macOS server, whose human granted the landing at its anchor, and the merged files landed on the server's disk
-> (GAPS). A Linux server stops at the presentation: its CLI cannot issue a grant (A-201).
+> red with the base check and the writes removed), by `crates/cli/tests/fs_server.rs` (two fleet nodes through the real
+> binary: presented and unwritten under an unset policy; since 2026-11-18 landed on the server's disk under the write
+> policy its launcher set, A-285: bypass in the one `slates land`, ask once the launcher approves exactly the presented
+> manifest, on macOS arm64 and Linux x86_64 and arm64), and across two machines on 2026-11-05: a client on Linux pushed
+> to a green on a macOS server, whose human granted the landing at its anchor, and the merged files landed on the
+> server's disk (GAPS). The stop at the presentation on a Linux server (no grant from its CLI, A-201) is gone for the
+> launcher's path: the policy the launcher set, never a person's proof, decides the write (A-285).
 
 **Role.** Let many agents work on clones of one shared volume and fold their work back into it
 with no locks, no last-writer-wins, and no inferred merge. Each agent's work becomes an
@@ -22065,7 +22068,12 @@ proof sets nothing once the policy has moved (`Refusal::PolicyChanged`). Built t
 kept in its record and on every shard's channels bound to it, held on the agent's shard before its request is routed
 (forbid refused; ask turns a landing into `Present` and a merge into `SubmitHeld`/`EditSubmitHeld`; bypass leaves the
 volume's mode to decide), so the stricter of consumer and volume governs; and the MCP and SDK land verbs, which send
-`Land` with no grant, say what the policy does. Owed: signed work. The
+`Land` with no grant, say what the policy does. Built 2026-11-18 with the two-node filesystem-server flow
+(`crates/cli/tests/fs_server.rs`, which found it): a landing's grant is refused `Forbidden` on a consumer-bound
+channel before anything else, whatever its proof (`landing::grant_verb`, counter `grant_by_consumer`), as a policy
+setting and a merge's approval already were, so an agent never approves its own landing
+(`docs/bugs/2026-11-18-an-agents-own-channel-could-approve-its-own-landing.md`). Open, its siblings: `Enroll` and
+`Revoke` still verify the proof alone (GAPS). Owed: signed work. The
 SSH-signature verifier built first (below) stays, for signed work.
 - **The rule (Ada, 2026-11-18).** Merging and landing to disk follow the permission mode the user gave the harness or
   agent that asks. Bypass (Claude Code's `bypassPermissions`, Codex's full access): slates merges and writes, no
