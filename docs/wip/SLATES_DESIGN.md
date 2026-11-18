@@ -25304,7 +25304,8 @@ Applied in the same change to:
     `shards.resync_writes_unreported` and GAPS keeps the gap.
   - **Evidence.** A Mac Studio, kiln run r2527: the focused tests pass (`shards_resync_restart`, `shards_resync`, the
     write log's and the replay's unit tests, the route's), and each of seven guards removed alone fails the restart
-    test. Linux (adacachy, kernel 7.2.9, kiln run r3191): the same focused tests pass, A-316's restart test among them
+    test. Linux (adacachy, kernel 7.2.9, kiln run r3191; and GitHub's ubuntu runner, kernel 7.0.0-1016-aws, run
+    44329563487, with the client's stream tests too): the same focused tests pass, A-316's restart test among them
     (its devices' reads held off under churn there too, where nothing is flushed), and the FUSE held-mount restart
     tests of `crates/cli/tests/cli.rs` (`a_write_in_flight_at_the_daemons_kill_is_resent_and_every_acknowledged_write_survives`,
     `a_fuse_mount_whose_daemon_was_killed_is_ended_by_the_restarted_daemon`), which the moved release of unclaimed
