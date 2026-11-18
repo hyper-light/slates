@@ -19326,6 +19326,211 @@ mod tests {
     );
   }
 
+  /// Shape: the bytes of each record the full-log tests fill the write log with, and of the write each then logs: one
+  /// size, so the log that refused a filler refuses the write too.
+  const FILLER_BYTES: usize = 64 * 1024;
+
+  /// The full-log tests' shard: a plain volume and an overlay of this crate's sources, each with a published file; one
+  /// of the overlay's base files copied up and its host taken away, so its next publication is its whole image and
+  /// cannot be taken; and the write log filled with the plain volume's records until it refuses one. Returns the two
+  /// volumes and their files.
+  fn a_full_log_beside_a_left_out_overlay(
+    state: &mut crate::state::ShardState,
+  ) -> (
+    super::DbVolumeId,
+    slates_vfs::ids::InodeNo,
+    super::DbVolumeId,
+    slates_vfs::ids::InodeNo,
+  ) {
+    let principal = Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 1234,
+    };
+    let base = concat!(env!("CARGO_MANIFEST_DIR"), "/src").to_owned();
+    let (plain, plain_handle) = dynamic_volume(state, &principal, "full-log-plain", None);
+    let (overlay, overlay_handle) =
+      dynamic_volume(state, &principal, "full-log-overlay", Some(base));
+    let plain_file = {
+      let super::ShardState { store, volumes, .. } = &mut *state;
+      let slot = volumes.get_mut(plain_handle).unwrap();
+      let root = slot.volume.root_inode(store).unwrap();
+      slot
+        .volume
+        .create_file_no(store, root, "kept", 0o644)
+        .unwrap()
+    };
+    let overlay_file = {
+      let super::ShardState { store, volumes, .. } = &mut *state;
+      let slot = volumes.get_mut(overlay_handle).unwrap();
+      let root = slot.volume.root_inode(store).unwrap();
+      let host = slot.host.as_mut().unwrap();
+      slot
+        .volume
+        .with_host(host)
+        .create_file_no(store, root, "kept", 0o644)
+        .unwrap()
+    };
+    super::publish_shard(state).expect("the shard publishes both files");
+    {
+      let super::ShardState { store, volumes, .. } = &mut *state;
+      let slot = volumes.get_mut(overlay_handle).unwrap();
+      let root = slot.volume.root_inode(store).unwrap();
+      let host = slot.host.as_mut().unwrap();
+      let mut overlay_fs = slot.volume.with_host(host);
+      let copied = overlay_fs.lookup_no(store, root, "lib.rs").unwrap().inode;
+      overlay_fs.write(store, copied, 0, b"copied up").unwrap();
+    }
+    let host = state.volumes.get_mut(overlay_handle).unwrap().host.take();
+    assert!(host.is_some(), "the overlay had a base host");
+    let filler = vec![b'f'; FILLER_BYTES];
+    loop {
+      let super::ShardState {
+        write_log, content, ..
+      } = &mut *state;
+      match write_log.as_mut().unwrap().append(
+        content.as_mut().unwrap(),
+        (plain.bytes, plain_file.0),
+        0,
+        &filler,
+      ) {
+        Ok(()) => {}
+        Err(crate::write_log::Refused::Full) => break,
+        Err(other) => panic!("the log refused a filler: {other:?}"),
+      }
+    }
+    (plain, plain_file, overlay, overlay_file)
+  }
+
+  /// The write log as a restarted daemon would find it now, against the generation the shard's journal committed.
+  fn log_as_a_successor_finds_it(
+    state: &mut crate::state::ShardState,
+  ) -> crate::write_log::Recovered {
+    let generation = {
+      let object = state.content.as_ref().unwrap();
+      let (images, deltas) = (state.content_range, state.delta_range);
+      slates_vfs::checkpoint_log::committed_generation(
+        &super::ContentView {
+          object,
+          start: images.0,
+          len: images.1 - images.0,
+        },
+        &super::ContentView {
+          object,
+          start: deltas.0,
+          len: deltas.1 - deltas.0,
+        },
+      )
+    };
+    let super::ShardState {
+      write_log, content, ..
+    } = &mut *state;
+    write_log
+      .as_ref()
+      .unwrap()
+      .reopened(content.as_mut().unwrap(), generation)
+      .unwrap()
+  }
+
+  /// A-436 (A-422's third sibling, from reading): a write a full log cannot take is kept by the publication it forces
+  /// when that publication captures the write's volume, though it leaves another volume out. Do: on a shard with a
+  /// reduced reserve (so its write log is small), a plain volume and an overlay that cannot be imaged, the log filled
+  /// with the plain volume's records; write into the plain volume's file and log it as a transport does. Expect: the
+  /// forced publication left the overlay out (it kept the overlay's record, counted) and captured the plain volume; the
+  /// log is not marked overflowed, nothing is counted unlogged, and a restarted daemon is told nothing was lost. Before
+  /// A-436 the write counted unlogged because the overlay was left out, the overflow was marked, and every file a
+  /// taken-over mount had open was reported as having lost writes, though the image held the write.
+  #[test]
+  fn a_full_logs_forced_publication_keeps_a_captured_volumes_write_and_reports_no_loss() {
+    let (left_out, holds_every_write, unlogged, recovered) =
+      crate::daemon::audit_on_shard_configured(
+        |state| {
+          let (plain, plain_file, _, _) = a_full_log_beside_a_left_out_overlay(state);
+          let payload = vec![b'p'; FILLER_BYTES];
+          let handle = *state.by_id.get(&plain).unwrap();
+          {
+            let super::ShardState { store, volumes, .. } = &mut *state;
+            let slot = volumes.get_mut(handle).unwrap();
+            slot.volume.write(store, plain_file, 0, &payload).unwrap();
+          }
+          crate::write_log::log_acknowledged_write(state, plain, (plain_file.0, 0), &payload);
+          (
+            state
+              .refusals
+              .get(super::DEFERRED_KEPT)
+              .copied()
+              .unwrap_or(0),
+            state.write_log.as_ref().unwrap().holds_every_write(),
+            state
+              .refusals
+              .get(super::WRITE_LOG_UNWRITTEN)
+              .copied()
+              .unwrap_or(0),
+            log_as_a_successor_finds_it(state),
+          )
+        },
+        |config| config.reserve_per_shard = RELIEF_RESERVE,
+      );
+    assert_eq!(left_out, 1, "the forced publication left the overlay out");
+    assert!(holds_every_write, "the log is not marked overflowed");
+    assert_eq!(unlogged, 0, "nothing was counted unlogged");
+    assert!(
+      !recovered.everything_lost,
+      "a restarted daemon is told nothing was lost"
+    );
+  }
+
+  /// A-436: a write a full log cannot take, to the volume the publication it forces leaves out, is appended again into
+  /// the room that publication gave back (A-422's retain drops the captured volumes' records). Do: as in
+  /// [`a_full_logs_forced_publication_keeps_a_captured_volumes_write_and_reports_no_loss`], but write into the
+  /// overlay's own file. Expect: the publication left the overlay out; the log is not marked overflowed; and a
+  /// restarted daemon is handed the overlay's write and told nothing was lost. Before A-436 the write was in neither
+  /// the image nor the log, and the overflow was marked.
+  #[test]
+  fn a_full_logs_forced_publication_appends_a_left_out_volumes_write_again() {
+    let (left_out, holds_every_write, overlay, overlay_file, recovered) =
+      crate::daemon::audit_on_shard_configured(
+        |state| {
+          let (_, _, overlay, overlay_file) = a_full_log_beside_a_left_out_overlay(state);
+          let payload = vec![b'o'; FILLER_BYTES];
+          let handle = *state.by_id.get(&overlay).unwrap();
+          {
+            let super::ShardState { store, volumes, .. } = &mut *state;
+            let slot = volumes.get_mut(handle).unwrap();
+            slot.volume.write(store, overlay_file, 0, &payload).unwrap();
+          }
+          crate::write_log::log_acknowledged_write(state, overlay, (overlay_file.0, 0), &payload);
+          (
+            state
+              .refusals
+              .get(super::DEFERRED_KEPT)
+              .copied()
+              .unwrap_or(0),
+            state.write_log.as_ref().unwrap().holds_every_write(),
+            overlay,
+            overlay_file,
+            log_as_a_successor_finds_it(state),
+          )
+        },
+        |config| config.reserve_per_shard = RELIEF_RESERVE,
+      );
+    assert_eq!(left_out, 1, "the forced publication left the overlay out");
+    assert!(holds_every_write, "the log is not marked overflowed");
+    assert!(
+      !recovered.everything_lost,
+      "a restarted daemon is told nothing was lost"
+    );
+    assert_eq!(
+      recovered.records,
+      vec![crate::write_log::Logged::Write(crate::write_log::Record {
+        volume: overlay.bytes,
+        inode: overlay_file.0,
+        offset: 0,
+        bytes: vec![b'o'; FILLER_BYTES],
+      })],
+      "a restarted daemon is handed the overlay's write, and none of the captured volume's"
+    );
+  }
+
   /// A dynamic volume named `name` (over `base` when given), created through the verb: its id and its slot.
   fn dynamic_volume(
     state: &mut crate::state::ShardState,

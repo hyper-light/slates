@@ -353,7 +353,7 @@ impl OriginLoad {
     if let Some((path, bytes)) = origin.files.pop() {
       let moved = path.len().saturating_add(bytes.len());
       green.identity.add(&file_entry(&path, &bytes));
-      green.content.insert(path.clone(), bytes.clone());
+      green.set_current(path.clone(), bytes.clone());
       green.last_changed.insert(path.clone(), 0);
       let value = crate::history::Value::whole(&mut green.chunks, &bytes);
       green.push_content(path, 0, Some(value));
@@ -435,7 +435,9 @@ pub struct Green {
   /// The keys whose entries any commit after `identity_version` changed: bounded by the keys the green's histories
   /// hold, each once however often it changed.
   identity_dirty: BTreeSet<IdentityKey>,
-  content: BTreeMap<String, Vec<u8>>,
+  /// Each file's current bytes: a block in the green's store (A-273 step 3), its owner's own or, on a replica, its owner's
+  /// read in place.
+  content: BTreeMap<String, slates_mem::sealed::Block>,
   content_history: ContentHistory,
   /// The chunks the content history's values share (`crate::history`).
   chunks: crate::history::Chunks,
@@ -1097,12 +1099,14 @@ impl Green {
   }
 
   fn restore_file(&mut self, changed: &crate::checkpoint::Changed<String, Vec<u8>>) {
-    if let Some(old) = self.content.remove(&changed.key) {
-      self.identity.remove(&file_entry(&changed.key, &old));
+    if let Some(old) = self.current(&changed.key) {
+      let entry = file_entry(&changed.key, old);
+      self.identity.remove(&entry);
     }
+    self.remove_current(&changed.key);
     if let Some(bytes) = &changed.value {
       self.identity.add(&file_entry(&changed.key, bytes));
-      self.content.insert(changed.key.clone(), bytes.clone());
+      self.set_current(changed.key.clone(), bytes.clone());
     }
     self.last_changed.insert(changed.key.clone(), changed.at);
     self.clear_content_history(&changed.key);
@@ -1268,7 +1272,7 @@ impl Green {
         self
           .content_ref_at(path, since)
           .map(|bytes| file_entry(path, &bytes)),
-        self.content.get(path).map(|bytes| file_entry(path, bytes)),
+        self.current(path).map(|bytes| file_entry(path, bytes)),
       ),
       IdentityKey::Special(path) => (
         self
@@ -1337,8 +1341,8 @@ impl Green {
     for (path, node) in &self.specials {
       set.add(&special_entry(path, node));
     }
-    for (path, bytes) in &self.content {
-      set.add(&file_entry(path, bytes));
+    for (path, block) in &self.content {
+      set.add(&file_entry(path, self.chunks.block_bytes(*block)));
     }
     for path in &self.dirs {
       set.add(&dir_entry(path));
@@ -1423,7 +1427,10 @@ impl Green {
       files: self
         .content
         .iter()
-        .map(|(path, bytes)| (path.clone(), bytes.len() as u64))
+        .map(|(path, block)| {
+          let len = self.chunks.block_bytes(*block).len();
+          (path.clone(), len as u64)
+        })
         .collect(),
       dirs: self.dirs.iter().cloned().collect(),
       modes: self
@@ -1466,7 +1473,30 @@ impl Green {
 
   /// A file's current bytes, or `None` when it is absent.
   pub fn content(&self, path: &str) -> Option<&[u8]> {
-    self.content.get(path).map(Vec::as_slice)
+    self.current(path)
+  }
+
+  /// `path`'s current bytes, read where the green's store keeps them (A-273 step 3).
+  fn current(&self, path: &str) -> Option<&[u8]> {
+    self
+      .content
+      .get(path)
+      .map(|block| self.chunks.block_bytes(*block))
+  }
+
+  /// Makes `bytes` `path`'s current value, its block sealed in the store, and releases the block it replaces.
+  fn set_current(&mut self, path: String, bytes: Vec<u8>) {
+    let block = self.chunks.seal(bytes);
+    if let Some(old) = self.content.insert(path, block) {
+      self.chunks.release_block(old);
+    }
+  }
+
+  /// Takes `path`'s current value away, releasing its block.
+  fn remove_current(&mut self, path: &str) {
+    if let Some(old) = self.content.remove(path) {
+      self.chunks.release_block(old);
+    }
   }
 
   /// Every file the green currently holds, with its bytes — so a new work volume can be seeded with
@@ -1475,7 +1505,7 @@ impl Green {
     self
       .content
       .iter()
-      .map(|(path, bytes)| (path.as_str(), bytes.as_slice()))
+      .map(|(path, block)| (path.as_str(), self.chunks.block_bytes(*block)))
   }
 
   /// Whether a directory exists at the path.
@@ -1717,7 +1747,7 @@ impl Green {
 
   /// Every dimension's entry at `path` at the head but hard links, added to `base` ([`Green::base_for`]).
   fn head_entries(&self, path: &str, base: &mut crate::increment::Base) {
-    if let Some(bytes) = self.content.get(path) {
+    if let Some(bytes) = self.current(path) {
       base.files.push((path.to_owned(), bytes.len() as u64));
     }
     if let Some(node) = self.specials.get(path) {
@@ -1826,10 +1856,7 @@ impl Green {
       .rposition(|(recorded, _)| *recorded <= version)?;
     let value = history.get(index)?.1.as_ref()?;
     if index.saturating_add(1) == history.len() {
-      return self
-        .content
-        .get(path)
-        .map(|bytes| Cow::Borrowed(bytes.as_slice()));
+      return self.current(path).map(Cow::Borrowed);
     }
     Some(Cow::Owned(value.materialize(&self.chunks)))
   }
@@ -1855,8 +1882,7 @@ impl Green {
       .min(total);
     let page = if index.saturating_add(1) == history.len() {
       self
-        .content
-        .get(path)
+        .current(path)
         .and_then(|bytes| bytes.get(start..end))
         .unwrap_or_default()
         .to_vec()
@@ -2198,11 +2224,11 @@ impl Green {
     }
     // Move whatever the source names, capturing its current value so an intervening change to the
     // source follows the move, and removing the source name.
-    if let Some(source) = self.content.get(from) {
+    if let Some(source) = self.current(from) {
       let ops = vec![insert_whole(source.len() as u64)];
       effects.push(Effect::SetContent(
         dst.to_owned(),
-        source.clone(),
+        source.to_vec(),
         ops,
         ContentSource::Copied(from.to_owned()),
       ));
@@ -2227,8 +2253,8 @@ impl Green {
     if self.occupied_by_nonfile(path) {
       return Err(Green::window(path, MergeConflictClass::TypeChanged));
     }
-    match self.content.get(path) {
-      Some(current) if current.as_slice() == bytes.as_slice() => Ok(None),
+    match self.current(path) {
+      Some(current) if current == bytes.as_slice() => Ok(None),
       Some(_) => Err(Green::window(path, MergeConflictClass::CreateCreate)),
       None => {
         let ops = vec![insert_whole(bytes.len() as u64)];
@@ -2366,11 +2392,7 @@ impl Green {
         crate::map::Mapped::Overlaps => span.start,
       };
       let agent_bytes = span_bytes(&inc.post_state, op.src, op.len);
-      let current = self
-        .content
-        .get(path)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
+      let current = self.current(path).unwrap_or_default();
       let start = usize::try_from(head_start).unwrap_or(usize::MAX);
       let end = start.saturating_add(agent_bytes.len());
       let identical = current.get(start..end) == Some(agent_bytes);
@@ -2391,8 +2413,7 @@ impl Green {
     if mapped.is_empty() {
       return Ok(None);
     }
-    let empty = Vec::new();
-    let current = self.content.get(path).unwrap_or(&empty);
+    let current = self.current(path).unwrap_or_default();
     let next = apply(current, &mapped, &inc.post_state);
     Ok(Some(Effect::SetContent(
       path.to_owned(),
@@ -2919,7 +2940,7 @@ impl Green {
     for path in removed_content {
       // A removed file's last value stays in the history for reconstruction: no longer a current value, so retained
       // and charged (`history_bytes`).
-      self.content.remove(&path);
+      self.remove_current(&path);
       self.last_changed.insert(path.clone(), version);
       self.push_content(path, version, None);
     }
@@ -2928,7 +2949,7 @@ impl Green {
       // history gains is the bytes the new value added, its piece list, and whatever the old one held that the new
       // one does not, the retention charged to the running totals.
       let value = self.content_value(&path, &ops, &bytes);
-      self.content.insert(path.clone(), bytes);
+      self.set_current(path.clone(), bytes);
       self.last_changed.insert(path.clone(), version);
       self.push_content(path.clone(), version, Some(value));
       delta.insert(path, ops);
@@ -3198,8 +3219,7 @@ impl Green {
       Applied::Special(path, node) => Effect::Special(path.clone(), *node),
       Applied::RemoveSpecial(path) => Effect::RemoveSpecial(path.clone()),
       Applied::Spliced(path, ops) => {
-        let empty = Vec::new();
-        let current = self.content.get(path).unwrap_or(&empty);
+        let current = self.current(path).unwrap_or_default();
         Effect::SetContent(
           path.clone(),
           apply(current, ops, post_state),
@@ -3218,7 +3238,7 @@ impl Green {
         )
       }
       Applied::Copied { dst, from } => {
-        let bytes = self.content.get(from).cloned().unwrap_or_default();
+        let bytes = self.current(from).map(<[u8]>::to_vec).unwrap_or_default();
         let ops = vec![insert_whole(bytes.len() as u64)];
         Effect::SetContent(dst.clone(), bytes, ops, ContentSource::Copied(from.clone()))
       }
@@ -3394,7 +3414,7 @@ impl Green {
   /// less what the current value (bytes and list) grew by: the overwritten and the deleted or truncated bytes, and the
   /// old value's list (the bytes an insert or extension adds are current). Stored whole, the old value and its list.
   fn edit_reservation(&self, path: &str, ops: &[&Op]) -> usize {
-    let old = self.content.get(path).map_or(0, Vec::len);
+    let old = self.current(path).map_or(0, <[u8]>::len);
     let old_len = u64::try_from(old).unwrap_or(u64::MAX);
     let (overwritten, removed, inserted) =
       ops
@@ -3464,7 +3484,7 @@ impl Green {
       content: self
         .content
         .values()
-        .map(Vec::len)
+        .map(|block| self.chunks.block_bytes(*block).len())
         .sum::<usize>()
         .saturating_add(self.specials.len().saturating_mul(SPECIAL_NODE_BYTES)),
       history: self.history_bytes(),
@@ -3473,40 +3493,122 @@ impl Green {
     }
   }
 
-  /// The feed position the content this green releases now is stamped with (A-273): the position of the next
-  /// message its owner sends its replicas. Each version accepted and each fold of the history is one message, sent in
-  /// order, and the owner calls [`Green::advance_feed`] as it sends one.
+  /// The feed position (A-273): on the owner, the position of its next feed message, which content released now is
+  /// stamped with; on a replica, the position of the next message it applies.
   pub fn feed_position(&self) -> u64 {
     self.chunks.position()
   }
 
-  /// The owner sent its replicas the feed message at [`Green::feed_position`] (a version accepted or a fold of the
-  /// history): content released from now on is stamped with the next position (A-273).
-  pub fn advance_feed(&mut self) {
-    self.chunks.advance();
+  /// The blocks the owner sealed and released since its last feed message, at its feed position, which then moves past
+  /// it (A-273): what its next message carries to its replicas. `None` on a replica.
+  pub(crate) fn take_changes(&mut self) -> Option<slates_mem::sealed::Changes> {
+    self.chunks.take_changes()
   }
 
-  /// A replica built from this green now begins reading its content in place (A-273): until it acknowledges the feed
-  /// message that released a chunk, or leaves, that chunk stays where it is, its bytes unchanged and its room unreused.
-  /// The replica's holder id.
-  pub fn hold_content(&mut self) -> u64 {
-    self.chunks.hold()
+  /// A replica of this green now (A-273 step 3): every index, history and delta the owner holds, cloned, and its
+  /// content named as the owner names it and read in place, never copied: it is registered with the owner's blocks,
+  /// which keep every block it may read until it has passed the message that released it. It applies the owner's
+  /// feed from the owner's feed position now. `None` on a replica, which has no blocks of its own to give.
+  pub fn replica(&mut self) -> Option<Green> {
+    let chunks = self.chunks.replica()?;
+    Some(Green {
+      identity: self.identity.clone(),
+      identity_version: self.identity_version,
+      identity_dirty: self.identity_dirty.clone(),
+      content: self.content.clone(),
+      content_history: self.content_history.clone(),
+      chunks,
+      history_lists: self.history_lists,
+      specials: self.specials.clone(),
+      special_history: self.special_history.clone(),
+      special_changed: self.special_changed.clone(),
+      dirs: self.dirs.clone(),
+      modes: self.modes.clone(),
+      symlinks: self.symlinks.clone(),
+      hardlinks: self.hardlinks.clone(),
+      xattrs: self.xattrs.clone(),
+      dir_history: self.dir_history.clone(),
+      mode_history: self.mode_history.clone(),
+      symlink_history: self.symlink_history.clone(),
+      hardlink_history: self.hardlink_history.clone(),
+      xattr_history: self.xattr_history.clone(),
+      deltas: self.deltas.clone(),
+      deltas_from: self.deltas_from,
+      last_changed: self.last_changed.clone(),
+      mode_changed: self.mode_changed.clone(),
+      symlink_changed: self.symlink_changed.clone(),
+      hardlink_changed: self.hardlink_changed.clone(),
+      xattr_changed: self.xattr_changed.clone(),
+      accepted: self.accepted.clone(),
+      signatures: self.signatures.clone(),
+      // A replica answers rebases and reads, never a submit: it keeps no rejected results.
+      rejected: BTreeMap::new(),
+      rejected_order: std::collections::VecDeque::new(),
+      rejected_bytes: 0,
+      rejected_budget: 0,
+      rejected_evicted: 0,
+      history_current: self.history_current,
+      special_history_bytes: self.special_history_bytes,
+      folded_below: self.folded_below,
+      fast_path_hits: 0,
+      changes: self.changes.clone(),
+      latest_change: self.latest_change.clone(),
+      below_floor_last: self.below_floor_last.clone(),
+      links_to: self.links_to.clone(),
+      changes_bytes: self.changes_bytes,
+      deltas_visited: std::cell::Cell::new(0),
+    })
   }
 
-  /// `holder` has applied the feed message at `position` and dropped what it released: content every holder has
-  /// passed is freed (A-273).
-  pub fn acknowledge_content(&mut self, holder: u64, position: u64) {
-    self.chunks.acknowledge(holder, position);
+  /// A replica passed a feed message: content every replica has passed is freed (A-273).
+  pub fn acknowledge_replica(&mut self, passed: slates_mem::sealed::Passed) {
+    self.chunks.acknowledge(passed);
   }
 
-  /// `holder` reads this green's content no more (dropped, rebuilt or ended): it holds no free from now on (A-273).
-  pub fn leave_content(&mut self, holder: u64) {
-    self.chunks.leave(holder);
+  /// A replica is done (dropped, rebuilt or ended): this green keeps nothing for it from now on (A-273).
+  pub fn leave_replica(&mut self, left: slates_mem::sealed::Left) {
+    self.chunks.leave(left);
+  }
+
+  /// A replica's registration given back, for its owner's [`Green::leave_replica`]; `None` from an owner.
+  pub fn into_left(self) -> Option<slates_mem::sealed::Left> {
+    self.chunks.into_left()
+  }
+
+  /// A replica about to replay the message that carries `changes`: the blocks it sealed become readable and are
+  /// adopted, in the owner's order, by the replay's seals (`crate::store`). False, unchanged, where they are refused.
+  pub(crate) fn begin_replay(&mut self, changes: &slates_mem::sealed::Changes) -> bool {
+    self.chunks.begin(changes)
+  }
+
+  /// A replica done replaying it: passed, and what its owner frees by; none when its replay was not its owner's.
+  pub(crate) fn finish_replay(
+    &mut self,
+    changes: &slates_mem::sealed::Changes,
+  ) -> Option<slates_mem::sealed::Passed> {
+    self.chunks.finish(changes)
   }
 
   /// The frees of content held for a replica since this green was made: A-273's non-vacuity counter.
   pub fn content_frees_held(&self) -> u64 {
     self.chunks.frees_held()
+  }
+
+  /// The bytes of content this green released and keeps only for its replicas until each has passed the release
+  /// (A-273): its memory, charged in its retained history.
+  pub fn content_held_bytes(&self) -> usize {
+    self.chunks.held_bytes()
+  }
+
+  /// Reads of content this green could not answer (A-273 step 3): never on an owner, nor on a replica whose replay is
+  /// its owner's; a replica whose count moved answered from bytes it did not have, and is not to be answered from.
+  pub fn content_reads_refused(&self) -> u64 {
+    self.chunks.reads_refused()
+  }
+
+  /// Whether this green is a replica, its content its owner's read in place.
+  pub fn is_replica(&self) -> bool {
+    self.chunks.is_replica()
   }
 
   /// The content and IPC histories' retained bytes **recounted** from the histories themselves — the oracle
@@ -3707,7 +3809,7 @@ impl Green {
           if !self.content.contains_key(&path) {
             journal.push(VolumeOp::Create { path: path.clone() });
           }
-          let head_len = self.content.get(&path).map_or(0, |head| head.len() as u64);
+          let head_len = self.current(&path).map_or(0, |head| head.len() as u64);
           journal.extend(content_volume_ops(&path, &ops, head_len));
           changed.insert(path, Some(bytes));
         }
@@ -3733,7 +3835,7 @@ impl Green {
     }
     // Only what ends different from the head is the work's own: bytes equal to the head's, and the
     // removal of a file the head does not hold, are no change.
-    changed.retain(|path, after| after.as_deref() != self.content.get(path).map(Vec::as_slice));
+    changed.retain(|path, after| after.as_deref() != self.current(path));
     Rebased::Rebased {
       version: to,
       changed,
