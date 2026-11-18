@@ -14,6 +14,36 @@
 > in order, its regeneration behind `--ignored`), and the completion record framed with its reply's schema hash, so a
 > record of another schema is refused typed rather than read as another reply. g262 (the contract's owner) told.
 
+> **A fresh member that joined before its admission kept contact with no one: fixed (2026-11-18, A-331, §4.8; goal
+> g225; found 2026-11-09 by raft-chaos and recorded then on a branch that never reached main).** live_chaos's
+> fresh-member flow (`a_member_that_never_held_the_log_never_stands_in_for_its_holder`) kills the bootstrap voter of five
+> nodes at f = 1 and starts a fresh process in its place. Its second formation wait never ended in 2 of 48 runs at one
+> CPU on main 84d1f59a (diag-live-fixes-70), in 1 of 48 with learner-3 (diag-raft-chaos-ab-66), and in both of main's
+> first gated runs on 2026-11-18 (the integrator's macOS run at bfc34cace; Linux, CI run 44269183565, ubuntu-latest):
+> one node, the fresh member, stayed at in contact 0 and unmeshed 0 while the others read (4, 0). Its status every 5 s
+> for 48 s (diag-raft-chaos-ab-68b-2): five members held alive, configuration version 0, its council at version 8 with
+> the replaced bootstrapper its only voter, its last fetch asking one peer at the start of the wait, and
+> `fleet.learner.no_session` 113; on Linux, `fleet.link.out_of_contact` 4. **Cause:** its join was answered with a
+> configuration committed before it existed, which does not name it, and a learner's join state, whose voters are the
+> bootstrapper alone. `direct_contact`'s member rule then judged every live peer `OutsideNeighbourhood`: it is no one's
+> neighbour, holds nothing, and knows no live voter. Every record link idled, and its learner, which fetches only over
+> record sessions, never learned version 12, which admits it.
+> **Fixed:** a node the council configuration it holds does not name keeps contact with every member it holds alive
+> (`DirectContact::Unadmitted`, judged with `Forming` in `fleet::joining_contact`) until it holds one that names it; then
+> the member rule applies. Test, failing first:
+> `a_fresh_member_joined_before_its_admission_keeps_contact_with_every_live_member` (`crates/server/src/consensus.rs`:
+> the real join path, `serve_fetch` as a learner donor and `adopt_fetch` as the fresh member, then a later answer that
+> admits it). On the Mac Studio (kiln r1379): red on main's `fleet.rs` (all four `OutsideNeighbourhood`, the mesh at
+> 0, as in CI), green with the change, red again with only the `Unadmitted` arm taken out. Bug record:
+> `docs/bugs/2026-11-18-a-fresh-member-joined-before-its-admission-kept-contact-with-no-one.md`.
+> - **To measure (the supervisor's):** live_chaos's fresh-member flow at one CPU (diag-60's harness), N of 48 runs that
+>   form: main before A-331 against main with it. Before: 46 of 48 on 84d1f59a, 47 of 48 with learner-3 (2 and 1 at the
+>   formation wait).
+> - **Siblings, reported, not changed:** a learner's known voters can go back through another learner's answer
+>   (`serve_fetch` answers with the answerer's known voters); `drive_root_learner_fetch` filters on the root's voters
+>   (2026-11-08 entry below, still open); live_chaos's `diagnosis` leaves out `fleet.learner.*` and `fleet_learner`, so
+>   this stall's own counters never printed on main (told to g229, which owns that harness).
+
 > **Signed work: merges are signed work (2026-11-17, §4.16, §4.12 "The consumer contract"; A-321, goal g090, Ada's
 > rule of 2026-11-18 that a signature is provenance and never the permission gate).** A merge may carry an SSH
 > signature (`PROTOCOL.sshsig`, namespace `slates-work`, Ed25519 or FIDO Ed25519) over its statement — the work, its
