@@ -38,6 +38,7 @@ slates-bridge-oci = { path = "crates/bridge-oci", version = "0.1.0" }
 slates-merge = { path = "crates/merge", version = "0.1.0" }
 slates-mcp = { path = "crates/mcp", version = "0.1.0" }
 slates-client = { path = "crates/client", version = "0.1.0" }
+slates-api = { path = "crates/api", version = "0.1.0" }
 slates-cli = { path = "crates/cli", version = "0.1.0" }
 slates-wire-derive = { path = "crates/wire-derive", version = "0.1.0" }
 slates-transport = { path = "crates/transport", version = "0.1.0" }

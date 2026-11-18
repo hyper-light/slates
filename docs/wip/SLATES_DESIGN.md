@@ -152,7 +152,8 @@ the two equal):
 | `slates-bridge-nfs` | the mount point and loopback socket (§4.6) |
 | `slates-bridge-fskit` | the mount (§4.6) |
 | `slates-bridge-winfsp` | the volume (§4.6) |
-| `slates-cli` | the launcher's namespace setup and mount install (§4.12); its reads of the operator's fleet manifest, certificate, key and recovery-key files are defects against A-50's zero disk access, to be removed |
+| `slates-cli` | the launcher's namespace setup (§4.12); its reads of the operator's fleet manifest, certificate, key and recovery-key files are defects against A-50's zero disk access, to be removed |
+| `slates-api` | the host mount (§4.6; moved from slates-cli by A-278): a mount point resolved to the real path the kernel records, a read, never a write |
 <!-- host-path-sites:end -->
 
 ### 0.3 Evidence tiers and how citations are written
@@ -542,6 +543,10 @@ the measured wake cost before parking (the 2-competitive rule). The mount is nev
 
 - **Rust client library**: the reference implementation of the ring protocol; used by the CLI,
   the launcher, and both SDKs.
+- **Rust library for embedding hosts** (`slates-api`, A-278): what a host such as kiln vendors and
+  drives slates through, never the `slates` command — attach to an instance, volumes, a host mount
+  or a descriptor a VMM takes, drift, landing plans and landing under a grant the host's own
+  confirmation surface issues, and observation. The CLI mounts and grants through it.
 - **Python SDK** (`slates` on PyPI): PyO3 extension; `async` methods on any event loop through
   file-descriptor readiness; a sync facade.
 - **TypeScript SDK** (`@hyper-light/slates` on npm, with `@hyper-light/slates-<platform>` binary
@@ -4310,7 +4315,9 @@ root-relative path as an explicit alternative; it does not report that the reque
 
 > **Status (2026-11-06, A-230).** A CLI attachment (`slates attach`) is not the client's to take with it. It holds a
 > term, the failover SLO as the write lease's, renewed by each verb that names it. It ends at the lapse with its lease,
-> and a later use is refused `AttachmentExpired`. Only an SDK client's attachments end with the client, as below.
+> and a later use is refused `AttachmentExpired`. Only an SDK client's attachments end with the client, as below. Since
+> 2026-11-09 only the attachment's own principal's use renews it: no record is written by an identity a request merely
+> names, rather than the one its session authenticated (`use_attachment`).
 
 > **Status (2026-09-20, A-28).** Client retirement reserves the dead client's seat and id
 > until every owner shard has removed its SDK attachments. Unsent forwards are cancelled;
@@ -5686,8 +5693,12 @@ registry (D-14). A node's advertised port and the next are its two serve sockets
 first, records on the second — each shared by every peer through the session plane's connection-id
 demultiplexer (§4.10a §8; a peer's re-dial after a lost session replaces the old session), and every
 peer dials it there, so both ends of every session are computed from the same file and can never
-disagree. A manifest with fewer than `f + 1` nodes, a repeated name or certificate, a base at the end
-of the port range, or an identity the TLS stack cannot use, is refused by name at boot. The two serve
+disagree. A node behind a port mapping (a NAT's port forward, a container runtime's published ports,
+the chaos harness's fault relay) also names where its own two sockets bind (`bind`: an IPv4 literal
+and the base of the same block, A-277); it serves there while every peer still dials its advertised
+ports, and the mapping between them is the operator's. A manifest with fewer than `f + 1` nodes, a
+repeated name or certificate, a base (advertised or bound) at the end of the port range, or an identity
+the TLS stack cannot use, is refused by name at boot. The two serve
 sockets are bound once, before the daemon starts (`FleetTransport::bind`, between the pure plan and the
 daemon), so an address already in use refuses the start by plane and address, rather than leaving a
 daemon that can never be probed. A caller that already holds its ports hands the bound sockets over
@@ -5947,6 +5958,13 @@ failure.
 > version once it has placed. The wait counts toward the client's bound and leaves when its completion replaces it or the
 > client acknowledges it. After a takeover the resend is refused retryable and nothing runs twice, but its version is not
 > named, short of the failure matrix's Masked: owed as A-255 (GAPS).
+
+> **Status (2026-11-09, A-255: a submit's completion moves with its green).** After a takeover a resend under its own id
+> is answered the version it was accepted as, the failure matrix's Masked. Its completion key rides the version's chain
+> entry and merge record, and the green's successor records it. The resend reaches the successor through the work's
+> catalog record, which names the green: held, or learned from a location round. A version's record ships only once
+> that catalog is committed, and the record plane ships the catalog at the work's creation. A merge record carries
+> format version 1; another version is refused typed.
 
 > **Status (2026-11-07, A-245: an acknowledgement names the ids still owed).** A watermark is contiguous, so one held or
 > slow request kept every later completion of its client: the owner pruned none of them, and past `2 × slots` refused
@@ -6374,6 +6392,13 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   does.
 > - **An install never finishing inside an entry's budget (open).** The whole volume, sent to a candidate behind the
 >   retained tail, is resent without end (GAPS "Chaos from outside the processes").
+> - **Loss, and an owner partitioned while it runs (built 2026-11-17, goal g229; first runs owed).** A fault relay in
+>   the test (`crates/cli/tests/support/relay.rs`) owns every node's advertised ports and forwards to its bind block
+>   (A-277). It loses, holds, duplicates and reorders datagrams per path and cuts a running node off one way or both,
+>   with no privilege: T-8.7's partitions without the iptables or pf that R10 rules out. Its flows stream writes over
+>   lossy paths through a takeover, cut a running owner off, and deafen one, and also judge ReadSafety (a read through
+>   the partitioned owner never answers less than its successor acknowledged) and Continuity (the successor's first
+>   head is past every position durable under an earlier epoch) from outside the processes.
 
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
@@ -6798,6 +6823,43 @@ lists are not the authority. CLI human grant operations occupy a privileged surf
 registry and are structurally excluded from SDK/MCP exports.
 
 **Rust client.** The ring protocol, rendezvous per OS, completion fd, request ids, typed errors.
+
+**Embedding (A-278).** A host product that embeds slates — kiln first, then Hex — vendors it and
+drives it through one Rust crate, `slates-api`, never through the `slates` command and never by
+parsing its output. The crate is the client plus what was the CLI's alone: the host mount, the
+issuer authority, the grant's term. The CLI calls it for these, so the command and every host
+mount and grant through one implementation.
+- *What a host holds.* An `Instance`: one held client of one running instance. A landing's
+  presentation lives as long as the client that made it (A-46), so a plan a person is shown is
+  granted and landed on the same client. An `Issuer`: the confirmation surface's authority (§4.13),
+  the anchor segment's handoff, attached for the length of one proof and never kept as a secret.
+- *Verbs.* Attach, the group of an instance run alone (`ensure_group`), create (an overlay over a
+  host folder with a dynamic size, or scratch), snapshot, clone, destroy, list, status, drift and
+  rewitness; serving as a host mount (§4.6, every platform's own mechanism) or as a descriptor a VMM
+  takes (the Shards stream, A-161; the vhost-user socket); landing plans, landing under a grant, and
+  `land_approved`, which grants and lands only the manifest a person approved and otherwise returns
+  the new plan; observation (daemon status, audit, grants, telemetry). `Instance::client` lends the
+  whole typed client for the rest (the merge verbs of §4.16, the file verbs).
+- *Refusals.* One closed `Error`: the daemon's `Refusal`, `Unavailable` (no daemon at the instance),
+  the channel's own, and the crate's (`MountFault` with the OS's error number, `IssuerFault`,
+  `PathFault`). None is prose alone.
+- *Grant exclusion.* The SDKs and the MCP server depend on `slates-client`, not on this crate, so
+  no grant verb reaches them (the structural exclusion this section asks of the registry); the
+  daemon still refuses a grant kind on their channels whatever they claim.
+- *Versioning.* The workspace's one version. The report types it re-exports are the wire's, which
+  grow append-only (D-15), so a host matches their enums with a wildcard arm.
+
+> **Status (2026-11-18, A-278, piece 1).** Built: the crate with attach, the group, the volume
+> lifecycle, drift, the host mount on macOS, Linux and Windows (moved from the CLI with its
+> `unsafe` block), the Shards stream and vhost-user serving, landing plans, `land_approved`, the
+> issuer (from the environment, as `slates grant` has it, or from a handoff's pairs), observation;
+> the CLI's `mount`, `unmount`, `export`, `grant`, `enroll`, `revoke`, `run` and `recover` call
+> it. Proven by use over an in-process daemon (`crates/api/tests/api.rs`). Owed, in order:
+> starting an instance from the host's own executable, with the issuer handed to its starter, so a
+> host runs no `slates` binary (the anchor and daemon roles move into the crate); an async form over
+> a host's reactor (R6: a readiness wait and a timer over the client's driver); a seam trait with a
+> simulator and a conformance suite for hosts whose rules ask for one; a landing plan's per-path
+> entries, paged, for a person to review.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -7897,13 +7959,16 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > green takeover and a late holder's catch-up.
 >
 > **Reconciled 2026-11-06 (VFS plan Step 15).** Green takeover materializes a taken-over green from the successor's
-> accepted records (40aa3de7, AUD-14); a successor with a short prefix waits for GAP-A9-7's ledger-prefix transfer. A
+> accepted records (40aa3de7, AUD-14); a successor with a short prefix waits for GAP-A9-7's ledger-prefix transfer
+> (since 2026-11-18 its input half is built, see the status of that date below; the record half is still owed). A
 > late holder's catch-up is built (AUD-13, below). Still owed: mounted work and green volumes, the extent-backed green
 > chain, pipelined and hedged merge records.
 
-> **Status (2026-09-18, AUD-14: a taken-over green is servable).** The generic takeover promoted one adopted record and materialized content only for a plain volume's `HeadValue`; a green's adopted `MergeRecordValue` left the successor with a holder replica and nothing to serve — no catalog record, origin, chain, engine or placed version. Now the record value carries the green's name, evidence policy and owner (from the catalog, at `enqueue_record`), the takeover completion routes an adopted merge record to `pending_green_materializations`, and `materialize_pending_greens` gathers the chain from the successor's **own accepted records** (its holder acceptor's persisted positions give every version's input manifest; the held content gives the origin and each increment, `recover_green_inputs`) and materializes it on the shard the id routes to (`materialize_taken_over_green`): the catalog entry, the origin and every increment re-recorded durably, the engine replayed by the boot derivation and its head identity checked against the adopted record's — a mismatch refuses the green loudly — then the head placed. A successor whose accepted prefix is shorter than the adopted head stays pending, counted (`merge.takeover_incomplete`): the ledger-prefix transfer is GAP-A9-7's contract. Regression: three-node `f = 1`, three versions, owner dies, the successor's chain identities equal the owner's, `versions`/reads/a new submit and its retry serve through the public client (`docs/bugs/2026-09-18-green-takeover-left-no-servable-chain.md`).
+> **Status (2026-09-18, AUD-14: a taken-over green is servable).** The generic takeover promoted one adopted record and materialized content only for a plain volume's `HeadValue`; a green's adopted `MergeRecordValue` left the successor with a holder replica and nothing to serve — no catalog record, origin, chain, engine or placed version. Now the record value carries the green's name, evidence policy and owner (from the catalog, at `enqueue_record`), the takeover completion routes an adopted merge record to `pending_green_materializations`, and `materialize_pending_greens` gathers the chain from the successor's **own accepted records** (its holder acceptor's persisted positions give every version's input manifest; the held content gives the origin and each increment, `recover_green_inputs`) and materializes it on the shard the id routes to (`materialize_taken_over_green`): the catalog entry, the origin and every increment re-recorded durably, the engine replayed by the boot derivation and its head identity checked against the adopted record's — a mismatch refuses the green loudly — then the head placed. A successor whose accepted prefix is shorter than the adopted head stays pending, counted (`merge.takeover_incomplete`): the ledger-prefix transfer is GAP-A9-7's contract. **Since 2026-11-09 the wait is bounded:** each pending green counts its attempts, one a period, and past the failover SLO's worth of periods it is given up on, every verb on it answering `NotRecovered { cause: TakeoverIncomplete { waited_on } }` with the branch it waited on (`catalog`, `chain`, `inputs` since 2026-11-18, `placement`, `refused`), counted `merge.takeover_given_up`; before, each branch retried without end (GAPS 2026-11-09). Regression: three-node `f = 1`, three versions, owner dies, the successor's chain identities equal the owner's, `versions`/reads/a new submit and its retry serve through the public client (`docs/bugs/2026-09-18-green-takeover-left-no-servable-chain.md`).
 >
 > **Status (2026-11-07, AUD-29-17: a taken-over green keeps its shares).** The rebuilt green's access list was empty: a green shipped no catalog register. It now does, its merge records wait for the register's current version to commit, and the successor rebuilds the green from the adopted register's access list and sequence, waiting for it counted (`merge.takeover_waits_catalog`). Regression: `a_share_of_a_green_made_after_its_last_version_survives_a_takeover` (`docs/bugs/2026-11-07-a-taken-over-green-lost-its-access-list.md`).
+>
+> **Status (2026-11-18, a successor one version behind fetches the inputs it lacks; GAP-A9-7's input half).** A version commits at `f + 1`, so when a green's owner dies one holder may hold the newest version and the other not yet. When the one behind was the successor, it adopted the newest record (the other holder reports it) but held none of that version's inputs, and nothing fetched them: the green waited on its chain each period until the bound gave it up (`TakeoverIncomplete { waited_on: "chain" }`; 2 of 10 arm64 runs of the share test under spinners, diag-clients-green-1). Now the adoption keeps the members that reported the adopted version (each accepted it holding its inputs, A-244), and the materialization fetches each input the ledger names and this node lacks (`merge_service::unheld_green_inputs`) by identity from them (`fleet::fetch_green_inputs`, through the volume takeover's own hedged, verified fetch), staged at its version so the retention rule keeps it, counted `merge.takeover_inputs_fetched`. An input still not held after an attempt is its own wait, named `inputs` if the bound gives the green up; an attempt that leaves fewer inputs unheld than ever before is progress and starts the bound's count again, at most once per input. A successor whose own records end two or more versions below the adopted one lacks the intermediate records themselves (phase one reports each holder's highest record only), which no fetch by identity can fill: it is still given up at the bound, named `chain`, the record half owed. Regression: `a_successor_one_version_behind_fetches_the_versions_inputs_and_serves_the_green` (`docs/bugs/2026-11-18-a-successor-one-version-behind-never-received-the-adopted-versions-inputs.md`).
 
 > **Status (2026-09-18, AUD-11: acceptance waits for the commit).** `submit` returned `Submitted{version}` on the owner's local append, with the version's merge record still pending on the record plane at `f > 0` — a version a surviving quorum might not hold, and a completion record saying otherwise. Now the acceptance **waits for the commit**: when `placed_version` has not reached the version, the verb registers the request as awaiting (`MergeShardState::awaiting`: the reply route and the completion key, bounded by the clients' credit) and `run_recorded` commits its effects with no completion and no reply; when `record_merge_acks` places the version at the quorum, `resolve_accepted` records the acceptance as each waiting request's completion on the owner partition (one durable step) and delivers the reply by a task on the request's shard. A retry while waiting joins the wait; a cross-node forward polls the completion within the liveness budget, else is refused retryable. At `f = 0` the append is the commit and nothing changes (R8). Regression: two-node `f = 1`, the holder withholding content puts, then acknowledgements (`MergeFault::refuse_records`) — no acceptance under either, the wait resolving once both lift, the retry answered from the record (`docs/bugs/2026-09-18-submit-acceptance-before-fleet-commit.md`). The retry after the owner's loss belongs to AUD-14's takeover recovery.
 
@@ -8953,6 +9018,7 @@ workflow dry run.
 | AC-5.9 | T-5.11 | CLI/MCP/SDK adapters conform to one operation descriptor and are navigable. | Execute the same create/clone/base/attach/status/resize flows through each adapter, using ids and scoped names; expect equivalent results/refusals, useful help, stable JSON, bounded cursors and cancellation. |
 | AC-5.10 | T-5.12 | Human grants are authenticated and bound to the exact proposed landing. | Preview a plan, change its filter/target/content, replay or forge approval from an agent channel; expect refusal. Approve the unchanged manifest through the enrolled human surface and expect only its granted effects and audit records. |
 | AC-5.11 | T-5.13 | Users can discover attachment support and complete supported flows without hidden setup. | Start from an enrolled instance on each host, follow CLI help through a live overlay and an immutable-base/guest flow; expect endpoint/root discovery, actual path/tag readiness, clear coverage/reservation/durability output and actionable capability errors. |
+| AC-5.12 | T-5.14 | An embedding host drives every flow through the library alone (A-278): no `slates` command, no parsed output. | Through `slates-api` over a live daemon: attach (no daemon: `Unavailable`), make the group, create, snapshot, clone and destroy; lay an overlay over a folder, change it, read its drift; plan its landing, grant and land exactly the approved manifest (another manifest returns the new plan and writes nothing); serve it to a VMM as a Shards stream and speak FUSE through the end; observe the daemon. Expect every answer typed and the folder to change only at the granted landing. |
 
 ### Phase 6 — Merge engine: green volumes, increments, canonical rebase, the verdict (single node)
 
@@ -9845,6 +9911,8 @@ slates/
     cluster/                 membership, the configuration group, neighbourhoods, the register and
                              content puts with hedging, takeover, migration, mirroring
     mcp/                     MCP server and skills projection
+    api/                     `slates-api`: the library an embedding host drives slates through (A-278):
+                             instances, volumes, the host mount, landing under a grant, observation
     cli/                     `slates` binary: daemon, exec launcher, admin
     sdk-py/                  PyO3 extension (async via fd readiness)
     sdk-node/                napi-rs addon (async via uv_poll)
@@ -14141,7 +14209,10 @@ the reaper's loop; the verbs that name an attachment), `crates/cli` (`slates att
   - The term is the operator's failover SLO, derived as the write lease's: `derived!(failover_slo_ns, …)`, 10 s by
     default. A write attachment holds the lease, so its term is the lease's.
   - Every verb that names it (`Fs*`, `detach`, `advance`, `bind`) renews it once less than half the term is left:
-    one durable record per half term of use, never one per verb.
+    one durable record per half term of use, never one per verb. Only its own principal's use renews it, or ends it
+    at the lapse. Another principal's use writes nothing and is refused by the verb's own check. Amended 2026-11-09,
+    after fixtures' sweep: a use renewed it ahead of that check, so any channel that named the id kept another
+    account's attachment alive.
   - It ends at the lapse, by the reaper's sweep or the first use after, as a detach does. The write lease goes with
     it, recorded `AttachmentExpired`.
   - A later use is refused `AttachmentExpired`, never `NotFound`. The partition keeps the expired ids, at most its
@@ -16297,6 +16368,51 @@ Applied in the same change to: §4.16 (Commit status); §4.10 content retention 
 tests; GAPS. Evidence: `docs/bugs/2026-11-07-a-versions-inputs-and-record-took-five-hops.md`,
 `docs/bugs/2026-11-07-retention-decoded-every-merge-record-per-put.md`. Wire: the merge record stream's payload is now a
 shipment. A holder of an older build fails to decode it and answers nothing, so a mixed fleet refuses safely.
+
+### A-255 — A submit's completion moves with its green, and a resend reaches the green's successor through its work's catalog (accepted and built 2026-11-09; loadtest-scale's route, fixtures' gate, the supervisor's three constraints)
+
+Applied in the same change to:
+- `crates/merge`: `chain_entry` version 2 carries `Completion { origin, client, sequence }`.
+- `crates/anchor`: `LAYOUT_VERSION` 7.
+- `crates/server`:
+  - `MergeRecordValue::completion` and its format version (`RECORD_MAGIC`, `RECORD_VERSION` 1, `RecordRefused`);
+  - `record_taken_over_completions`;
+  - `CatalogValue::work_of`, `fleet::owed_merge_catalogs` and `owed_adopted_work_catalogs`;
+  - `verbs::locate_work_green`;
+  - `owner_location::locate_work_of` and `Reply::work_of`;
+  - the record plane's gate (`PendingMergeRecord::work`, `fleet::catalog_committed`, `MergeWork::ShipWorkCatalog`,
+    `works_owing_catalog`).
+- The tests named in the bug record, GAPS, and §4.16's status.
+
+- **What was there.** A-252 made a waiting submit a durable state of the owner's partition. After a takeover the
+  resend was refused `OwnerUnreachable` without end. The completion window died with the owner, and the resend routes
+  by its work's id, which no survivor owns: a work's head is never placed.
+- **The rule.**
+  - RIFL §3: "If the object migrates, then the completion record must move with it." For a merge the object is the
+    green. The submit's completion key rides its version's chain entry and merge record, which holders replicate.
+    The successor's adopted chain answers a resend under that key with its version at once. The key lives as long as
+    the record, under W2's retention, and has no separate table.
+  - The route is the work's own replicated catalog register, which names its green. It needs no global catalog (D-14),
+    no client wire change and no id format change. A request for a work no member owns goes unchanged to the green's
+    owner. An origin holding no copy of the catalog learns the green from a location round of the catalog's holders.
+  - The green's owner answers only the completion under the request's own key and refuses anything else `NotFound`. A
+    key copied into another session is refused at its origin's door (A-SEAT).
+  - A version's record ships only once its submitting work's catalog is committed, so no holder holds a completion
+    without its route. The record plane ships that catalog at the work's creation, and on demand.
+  - The successor never runs a resend whose key its chain does not hold. A work no member owns has no work to run against,
+    so the green's owner refuses it `NotFound`. It answers only from the chain it adopted whole, to the quorum's head
+    (`takeover::adopt`), so a version committed at the quorum whose answer was lost is answered, never run again
+    (`a_submit_whose_answer_was_lost_with_its_owner_is_answered_its_version_by_the_greens_successor`).
+  - A merge record carries its own format version. Another is refused typed, never decoded by a second path (§2.7).
+- **Measured.** A submit made right after its work's creation: median 1.59–1.64 ms against 1.25–1.29 ms without the
+  work's catalog, on an idle Mac Studio, 2026-11-09. While the catalog waited for the coordinator's period it was
+  109 ms. The bug record has the arms.
+- **Open.**
+  - A second loss of the green's owner needs the ledger-prefix transfer (GAP-A9-7).
+  - The cross-region case is owed a test.
+  - The route has no end for a work whose owner died. Only a volume's owner writes its tombstone, and a work never
+    comes back, so its adopted catalog record is kept placed for as long as the fleet runs: a store with no bound,
+    which CLAUDE.md §2 bans. How it should end is reserved for Ada (GAPS, A-255's entry, 2026-11-17).
 
 ### A-254 — The owner of an instance is decided before anything is created (accepted 2026-11-08)
 Applied in the same change to: §4.7 (the rendezvous's status), GAPS, `crates/cli/src/anchor.rs` (`run`),
@@ -20464,6 +20580,75 @@ The steps' own records follow.
     their own shape red on both runners: the client's `Stalled` branch, the lone self-end, and starved treated as stuck.
     The tables are in the bug record.
 
+### A-277 — A fleet node may bind elsewhere than it advertises (2026-11-17, built for goal g229, chaos across real processes)
+
+Applied in the same change to:
+- §4.8 "Deployment": the `bind` sentence, and a bound base past the port range refused as an advertised one is.
+- `crates/server/src/deploy.rs`: `FleetNodeEntry::bind`; `bind_address` binds the block a node names, else its
+  advertised address as before; `validate` and the plan refuse a bind block past the port range
+  (`PortBlockOverflows`, naming the bind's base). The tests: `a_node_that_binds_elsewhere_serves_there_and_is_dialed_where_it_advertises`
+  and the bind case of `a_bad_manifest_is_refused_by_name`.
+- `crates/cli/src/fleet.rs`: the manifest's optional `bind` per node, an IPv4 literal with a nonzero port; a name,
+  a missing port, port 0 or a non-string refused naming `nodes[i].bind` (`a_declared_bind_parses_and_a_bad_one_is_named`).
+- `docs/cli.md`: the manifest's `bind` field. GAPS: "Chaos from outside the processes", the relay owed.
+- **What was there.** A node bound exactly the address it advertised (an IP literal), or every interface on the
+  advertised port (a name). Whatever a peer dialed had to be the node's own socket. A node behind a port mapping
+  whose outer ports differ from its inner ones (a container runtime's published ports, a NAT's port forward) could
+  not join a fleet: it bound the outer port, which is not its to bind. And nothing could stand between two real
+  daemons on one machine, since discovery's announcement of a node's own address wins over the manifest's at every
+  dial (`fleet::resolve_peer_address`), so every peer reached the node's socket directly.
+- **The rule.** `bind` names the IPv4 literal and base port the node's two serve sockets bind; the advertised
+  address still names where every peer dials it, and the node still announces only that. The block is the same two
+  ports. With no `bind`, nothing changes. The anchor binds and hands over the plan's sockets, so it binds the block
+  too, and the daemon's check of an inherited socket compares it with the bind block.
+- **Why.** Goal g229 (Ada's chaos directive of 2026-11-04: knock replicas offline, inject latency and loss) owed loss
+  across real processes on a developer's machine, where netem needs privileges this project never takes. A relay in
+  the test that owns every node's advertised ports and forwards to their bind blocks can drop, delay, duplicate and
+  reorder each datagram, and cut a running node off in either direction, with no privilege. Only KIND's netem
+  injected loss before, and only on real pods (`cargo xtask kind live`, which no lane runs).
+
+### A-278 — An embedding host drives slates through one library, `slates-api`; the host mount and the issuer move into it from the CLI (accepted and built in part 2026-11-18, Ada's goal "slates has a library API for embedding hosts")
+
+Applied in the same change to:
+- §2.4 (the surfaces list), §4.12 ("Embedding", its status, and AC-5.12 / T-5.14 in Phase 5's table), Appendix B.6
+  (the layout); `docs/library.md` (the user's guide) and the README's documentation table.
+- `crates/api` (new): `lib.rs` (the crate doc, `deadlines`, `overlay`, `scratch`), `instance.rs` (`Instance`,
+  `LandingPlan`, `Planned`, `Approved`, `LandingRequest`), `issuer.rs` (`Issuer`, `GRANT_TERM_NS`), `mount.rs` (the
+  host mount, moved), `error.rs` (`Error`, `MountFault`, `IssuerFault`, `PathFault`), `tests/api.rs`.
+- `crates/cli`: `src/mount.rs` deleted; `verbs.rs` mounts, unmounts, exports, grants, enrolls, revokes, runs and
+  recovers through the crate; `args.rs` takes the grant's term from it.
+- `unsafe-budget.toml` (the macOS `mount(2)` block counted in `slates-api`, `slates-cli` 7 → 6), `xtask/src/main.rs`
+  (`slates-api` may name host paths: the mount point's real path, a read), GAPS (the inventory row).
+
+- **Why.** Ada (2026-11-18): kiln invoking slates only through its CLI is wrong; kiln must vendor slates and use a
+  library API, as it vendors Shards, Hex and Mantle. Until now kiln ran the `slates` binary for every verb
+  (`crates/kiln/src/workspace/slates.rs` at kiln 28b6c8ca): one process per verb, its JSON parsed back, the anchor
+  found by a binary on the `PATH`, a landing plan held only while the command that made it ran (so kiln re-planned
+  before every grant), one `--exclude` per landing, and a grant possible only by passing on the variables the anchor
+  had printed to its log, never on Linux.
+- **The rule.** A host product reaches slates through `slates-api` alone. Its name follows the convention of the
+  products kiln vendors (`hex-api`, `shards-api`, `quiver-api`): the crate other products reach the product through.
+  What a front end needs past the client (a mount, the issuer, the grant's term) lives in this crate once, and every
+  front end calls it, the CLI included; no front end keeps a copy (CLAUDE.md §2 item 7).
+- **The issuer stays the human's.** The crate's `Issuer` is the same authority `slates grant` holds — the anchor
+  segment's handoff, which the anchor's tree inherits and, on macOS and Windows, its user exports — attached for one
+  proof at a time and never kept as a secret, so a daemon restart between two grants meets each with its own secret.
+  The SDKs and the MCP server do not depend on the crate, so no grant verb reaches them; an embedding host is a
+  confirmation surface in §4.13's sense, and `Instance::land_approved` binds its grant to exactly the manifest its
+  person approved.
+- **Owed, in order.** (1) Starting an instance from the host's own executable: the anchor and daemon roles move into
+  the crate, a host's `main` serves them, and the anchor hands its starter the issuer on an inherited channel (the
+  segment's descriptor on Linux), so a host runs no `slates` binary and grants on Linux too. (2) An async form over a
+  host's reactor (R6). (3) A seam trait with a simulator and a conformance suite, for hosts whose rules ask for one
+  (Hex's §9, kiln's `kiln-seams`). (4) A landing plan's per-path entries, paged.
+- **Checked.** `crates/api/tests/api.rs` over a daemon in the test process: no daemon is `Unavailable`; a create before
+  the group is `ConsensusNotInitialized` and the group is made twice harmlessly; create, snapshot, clone and destroy;
+  an overlay's landing with `/.git` left out lands exactly the approved manifest, an approval of another manifest
+  writes nothing and returns the plan, and the folder is untouched until then; a file changed on disk after the volume
+  changed it is drift and a planned conflict, and a grant id nobody issued lands nothing; the daemon's status and a
+  shard's telemetry; and a Shards stream from the crate answers FUSE `INIT` and finds the volume's file (Linux and
+  macOS). The CLI's harness verb test runs its enrollment through the crate's issuer.
+
 ### A-289 — The workload roster runs git's history and maintenance, Mercurial and Subversion on every leg, and a workload that fails alike on both sides fails (accepted 2026-11-17, Ada's goal of 2026-11-18: git, Mercurial and Subversion on slates volumes on every route, byte-identical to the host, covered by workload tests in CI)
 Applied in the same change to: Part 6 ("Real workloads" and its status), GAPS, `crates/conformance/src/workload.rs`
 (the three workloads, `ENVIRONMENT`, `environment_exports`, `compare`), `crates/conformance/src/record.rs`
@@ -20516,4 +20701,3 @@ judged by `fails_the_suite`), `crates/server/tests/virtiofs.rs` (the guest's env
   unsupported), so a local clone copies there while NTFS links, and a git repository's symbolic-link probe needs
   WinFsp reparse points, which the drive does not serve yet. A Linux FUSE leg outside a container (the native Linux
   lane reaches the daemon through the NFS adapter). The runs over each mount are the supervisor's (CLAUDE.md §8).
-
