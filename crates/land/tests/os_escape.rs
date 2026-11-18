@@ -376,9 +376,25 @@ impl LandFs for Interfering {
     self.tick();
     self.inner.rmdir(dir, name)
   }
-  fn symlink(&mut self, dir: HostDir, name: &str, target: &str) -> Result<(), HostError> {
+  fn symlink(
+    &mut self,
+    dir: HostDir,
+    name: &str,
+    target: &str,
+    staged: &str,
+  ) -> Result<(), HostError> {
     self.tick();
-    self.inner.symlink(dir, name, target)
+    self.inner.symlink(dir, name, target, staged)
+  }
+  fn clone_temp(
+    &mut self,
+    dir: HostDir,
+    name: &str,
+    from: HostFile,
+    len: u64,
+  ) -> Result<HostFile, HostError> {
+    self.tick();
+    self.inner.clone_temp(dir, name, from, len)
   }
   fn sync_dir(&mut self, dir: HostDir) -> Result<(), HostError> {
     self.tick();

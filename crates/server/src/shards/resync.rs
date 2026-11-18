@@ -281,7 +281,6 @@ pub(super) fn session_bytes(token: &[u8; TOKEN_BYTES], kept: Kept) -> [u8; SESSI
 
 /// The token and what a held end's session bytes keep, or none for bytes of another length or a form bit this daemon
 /// does not know.
-#[cfg(any(unix, test))]
 pub(super) fn from_session(bytes: &[u8]) -> Option<([u8; TOKEN_BYTES], Kept)> {
   let whole = <&[u8; SESSION_BYTES]>::try_from(bytes).ok()?;
   let (token, rest) = whole.split_first_chunk::<TOKEN_BYTES>()?;
@@ -329,8 +328,8 @@ pub(super) fn handle_session_bytes(
 }
 
 /// The token, what the session keeps and the holder a Windows stream's held record names, or none for bytes of another
-/// length or a session [`from_session`] refuses. A successor reads it (the successor's half on Windows, owed).
-#[cfg(test)]
+/// length or a session [`from_session`] refuses. A successor reads it (A-433).
+#[cfg(any(windows, test))]
 pub(super) fn from_handle_session(bytes: &[u8]) -> Option<([u8; TOKEN_BYTES], Kept, Holder)> {
   let whole = <&[u8; HANDLE_SESSION_BYTES]>::try_from(bytes).ok()?;
   let (session, holder) = whole.split_first_chunk::<SESSION_BYTES>()?;

@@ -18,9 +18,16 @@ blake3 = { workspace = true }
 rustix = { workspace = true }
 libc = { workspace = true }
 
-# Windows' write seam (`src/os_windows.rs`): handle-relative creates, renames, removals and flushes.
+# Windows' write seam (`src/os_windows.rs`): handle-relative creates, renames, removals and flushes; a symbolic link's
+# set names `SeCreateSymbolicLinkPrivilege` by its number (`Wdk_System_SystemServices`, A-438); a reflink asks the
+# volume whether it shares clusters (`Win32_System_SystemServices`) and clones by `FSCTL_DUPLICATE_EXTENTS_TO_FILE`
+# (`Win32_System_Ioctl`, A-445).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true }
+windows-sys = { workspace = true, features = [
+  "Wdk_System_SystemServices",
+  "Win32_System_Ioctl",
+  "Win32_System_SystemServices",
+] }
 
 [dev-dependencies]
 proptest = { workspace = true }

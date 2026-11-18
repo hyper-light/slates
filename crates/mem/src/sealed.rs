@@ -34,7 +34,18 @@
 //!
 //! **What it costs.** A block is one allocation of its bytes, as a `Vec<u8>` chunk was; a reader's live table is one
 //! entry a live block (its generation, address and length), the metadata A-273 counted a replica holding. No atomic is
-//! touched by a read, a seal or a release: the writer's id, taken once when a store is made, is the only one (D-7).
+//! touched by a read, a seal or a release: the writer's id, taken once when a store is made, and the count of writers
+//! dropped with a reader registered (below) are the only ones (D-7).
+//!
+//! **Lifetimes.** A reader reads a block only while its writer keeps it, so a reader's lifetime is bounded by its
+//! writer's: the writer's holder ends every reader (each leaves, giving back its [`Left`]) before it gives the writer up,
+//! with [`SealedBlocks::end`], which frees every block the writer holds, live and kept alike, and is refused, the writer
+//! handed back unchanged, while a reader is registered. A writer dropped with a reader still registered frees nothing:
+//! that reader may still read any block it holds, on another thread, and nothing here can know that it never will
+//! (shared ownership could, and D-8 rules it out), so freeing would hand it freed bytes. Such a drop is its holder's
+//! error, counted process-wide ([`dropped_with_readers`]) so the holder's tests hold it at zero: a holder that ends its
+//! readers first never leaks. Found by Miri, 2026-11-18: a test that never made its reader leave dropped its writer
+//! with a live block, which the writer kept (`docs/bugs/2026-11-18-a-sealed-block-writer-dropped-with-a-reader-kept-its-blocks.md`).
 //!
 //! **Bounds (A-273 step 4).** Nothing here grows without a bound and a typed refusal at it:
 //! - Readers: a join past the limit its writer's holder gives (one reader a shard that may read, the machine's) is
@@ -53,6 +64,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The next writer's id: process-unique, so a reader refuses values of another writer's store.
 static NEXT_WRITER: AtomicU64 = AtomicU64::new(1);
+
+/// Writers dropped with a reader still registered since the process began (module docs, "Lifetimes"): each kept every
+/// block it held. A holder that ends its readers first keeps this at zero.
+static DROPPED_WITH_READERS: AtomicU64 = AtomicU64::new(0);
+
+/// Writers dropped with a reader still registered since the process began (module docs, "Lifetimes"): what a holder's
+/// tests hold at zero.
+pub fn dropped_with_readers() -> u64 {
+  DROPPED_WITH_READERS.load(Ordering::Relaxed)
+}
 
 /// A sealed block's name: its slot in its writer's store and which use of that slot it is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -444,6 +465,16 @@ impl SealedBlocks {
     self.readers.len()
   }
 
+  /// The writer given up (module docs, "Lifetimes"): every block it holds freed, live and kept alike, once no reader is
+  /// registered; refused while one is, the writer handed back unchanged for its holder to keep until its readers have
+  /// left.
+  pub fn end(self) -> Result<(), Box<SealedBlocks>> {
+    if self.readers.is_empty() {
+      return Ok(());
+    }
+    Err(Box::new(self))
+  }
+
   /// The bytes of the kept blocks **recounted** from the kept list itself: the oracle [`SealedBlocks::held_bytes`] is
   /// checked against.
   pub fn held_bytes_recounted(&self) -> usize {
@@ -496,11 +527,12 @@ impl SealedBlocks {
 }
 
 impl Drop for SealedBlocks {
-  /// Frees every block, unless a reader is still registered: then nothing is freed, since that reader may still read
-  /// any block it holds live. The writer's readers leave before it is dropped (`slates-merge`'s replicas do); one that
-  /// did not costs this store's memory, never a read of freed bytes.
+  /// Frees every block, live and kept alike, once no reader is registered. With a reader still registered nothing is
+  /// freed, since it may still read any block it holds, and the drop is counted ([`dropped_with_readers`]): its holder
+  /// ends its readers first, with [`SealedBlocks::end`] (module docs, "Lifetimes").
   fn drop(&mut self) {
     if !self.readers.is_empty() {
+      DROPPED_WITH_READERS.fetch_add(1, Ordering::Relaxed);
       return;
     }
     for slot in &mut self.slots {
@@ -693,54 +725,124 @@ mod tests {
   /// Shape: the readers a test's writer takes, more than any plain test registers; the generated histories meet it.
   const READERS: usize = 8;
 
-  /// A-273 step 3: a sealed block reads back as sealed, an empty one too; a release with no reader frees at once and its
-  /// slot is reused under a new generation, so the old name reads nothing.
+  /// The writer's own read of `block`: `bytes`, or nothing once it is freed or its slot used again.
+  fn writer_reads(store: &SealedBlocks, block: Block, bytes: Option<&[u8]>) {
+    assert_eq!(store.bytes(block), bytes);
+  }
+
+  /// A reader's read of `block`: `bytes`, or nothing (refused) when the block is not in its live table.
+  fn reader_reads(reader: &BlockReader, block: Block, bytes: Option<&[u8]>) {
+    assert_eq!(reader.read(block), bytes);
+  }
+
+  /// The writer's live and kept bytes, the kept ones equal to their recount.
+  fn writer_holds(store: &SealedBlocks, live: usize, held: usize) {
+    assert_eq!((store.live_bytes(), store.held_bytes()), (live, held));
+    assert_eq!(store.held_bytes(), store.held_bytes_recounted());
+  }
+
+  /// A-273 step 3: a sealed block reads back as sealed, an empty one too, and its bytes are counted live.
   #[test]
-  fn a_block_reads_back_as_sealed_and_a_release_with_no_reader_frees_it() {
+  fn a_block_reads_back_as_sealed_an_empty_one_too() {
     let mut store = SealedBlocks::new();
     let a = store.seal(b"alpha".to_vec());
     let empty = store.seal(Vec::new());
-    assert_eq!(store.bytes(a), Some(&b"alpha"[..]));
-    assert_eq!(store.bytes(empty), Some(&b""[..]));
-    assert_eq!(store.live_bytes(), 5);
+    writer_reads(&store, a, Some(&b"alpha"[..]));
+    writer_reads(&store, empty, Some(&b""[..]));
+    writer_holds(&store, 5, 0);
+  }
+
+  /// A-273 step 3: a release with no reader frees at once, keeping nothing, and the slot is reused under a new
+  /// generation, so the old name reads nothing.
+  #[test]
+  fn a_release_with_no_reader_frees_at_once_and_its_slot_is_reused() {
+    let mut store = SealedBlocks::new();
+    let a = store.seal(b"alpha".to_vec());
     store.release(a);
-    assert_eq!(store.bytes(a), None, "freed at once");
-    assert_eq!((store.live_bytes(), store.held_bytes()), (0, 0));
+    writer_reads(&store, a, None);
+    writer_holds(&store, 0, 0);
     let b = store.seal(b"beta".to_vec());
-    assert_eq!(b.slot, a.slot, "the slot is reused");
-    assert_ne!(b.generation, a.generation);
-    assert_eq!(store.bytes(a), None);
-    assert_eq!(store.bytes(b), Some(&b"beta"[..]));
+    assert_eq!(
+      (b.slot, b.generation == a.generation),
+      (a.slot, false),
+      "the slot reused, the name new"
+    );
+    writer_reads(&store, a, None);
+    writer_reads(&store, b, Some(&b"beta"[..]));
     assert_eq!(store.frees_held(), 0);
   }
 
   /// A-273 step 3: with a reader, a released block stays readable to it until it passes the message that released it,
-  /// and is freed at its acknowledgement, not before; the reader reads the blocks a message sealed once admitted.
+  /// and is freed at its acknowledgement, not before; the reader reads the blocks a message sealed once admitted; and
+  /// once the reader has left, the writer ends with every block freed. (Under Miri this test once leaked its live
+  /// block: it never made its reader leave, and the writer, dropped with a reader registered, kept every block.)
   #[test]
   fn a_released_block_stays_until_every_reader_passes_its_release() {
     let mut store = SealedBlocks::new();
     let kept = store.seal(b"kept".to_vec());
     let mut reader = BlockReader::new(store.join(READERS).unwrap());
-    assert_eq!(reader.read(kept), Some(&b"kept"[..]));
     let fresh = store.seal(b"fresh".to_vec());
     store.release(kept);
     let changes = store.take_changes();
-    assert_eq!(changes.sealed().collect::<Vec<_>>(), vec![fresh]);
-    assert_eq!(changes.released(), &[kept]);
-    assert_eq!(reader.read(fresh), None, "not yet admitted");
+    assert_eq!(
+      (changes.sealed().collect::<Vec<_>>(), changes.released()),
+      (vec![fresh], &[kept][..])
+    );
+    reader_reads(&reader, fresh, None);
     reader.admit(&changes).unwrap();
-    assert_eq!(reader.read(fresh), Some(&b"fresh"[..]));
-    assert_eq!(reader.read(kept), Some(&b"kept"[..]), "still the reader's");
-    assert_eq!((store.held_bytes(), store.frees_held()), (4, 1));
-    assert_eq!(store.held_bytes(), store.held_bytes_recounted());
+    reader_reads(&reader, fresh, Some(&b"fresh"[..]));
+    reader_reads(&reader, kept, Some(&b"kept"[..]));
+    writer_holds(&store, 5, 4);
+    assert_eq!(store.frees_held(), 1);
     let passed = reader.pass(&changes).unwrap();
-    assert_eq!(reader.read(kept), None, "passed: refused, never read");
-    assert_eq!(reader.refused(), 2);
-    assert_eq!(store.held_bytes(), 4, "freed only at the acknowledgement");
+    reader_reads(&reader, kept, None);
+    assert_eq!(
+      reader.refused(),
+      2,
+      "refused, never read, before its admission and after its pass"
+    );
+    writer_holds(&store, 5, 4);
     store.acknowledge(passed);
-    assert_eq!(store.held_bytes(), 0);
-    assert_eq!(store.held_bytes_recounted(), 0);
-    assert_eq!(store.bytes(fresh), Some(&b"fresh"[..]));
+    writer_holds(&store, 5, 0);
+    store.leave(reader.leave());
+    assert!(
+      store.end().is_ok(),
+      "no reader left: ended, every block freed"
+    );
+  }
+
+  /// A-273 step 3, the writer's end (module docs, "Lifetimes"): ended while a reader is registered, the writer is handed
+  /// back unchanged and its reader still reads every block it holds; once the reader has left, ending it frees every
+  /// block it holds, live and kept alike (a leak fails this test under Miri).
+  #[test]
+  fn a_writer_ends_only_once_its_readers_have_left_and_then_frees_every_block() {
+    let mut store = SealedBlocks::new();
+    let live = store.seal(vec![1; 16]);
+    let kept = store.seal(vec![2; 16]);
+    let reader = BlockReader::new(store.join(READERS).unwrap());
+    store.release(kept);
+    let Err(store) = store.end() else {
+      panic!("ended under a registered reader");
+    };
+    let mut store = *store;
+    reader_reads(&reader, live, Some(&[1u8; 16][..]));
+    reader_reads(&reader, kept, Some(&[2u8; 16][..]));
+    writer_holds(&store, 16, 16);
+    store.leave(reader.leave());
+    writer_holds(&store, 16, 0);
+    assert!(store.end().is_ok());
+  }
+
+  /// A-273 step 3 (module docs, "Lifetimes"): a writer dropped with a reader still registered frees nothing, since the
+  /// reader may still read, and is counted; this one holds no block, so it keeps nothing.
+  #[test]
+  fn a_writer_dropped_with_a_reader_registered_is_counted() {
+    let mut store = SealedBlocks::new();
+    let reader = BlockReader::new(store.join(READERS).unwrap());
+    let before = dropped_with_readers();
+    drop(store);
+    assert!(dropped_with_readers() > before);
+    drop(reader);
   }
 
   /// A-273 step 3: changes out of order, twice, or of another writer are refused unchanged; a block of another writer
@@ -773,6 +875,7 @@ mod tests {
     let foreign = other.seal(b"x".to_vec());
     assert_eq!(reader.read(foreign).map(<[u8]>::len), None);
     assert_eq!(reader.read(Block::NONE), None);
+    store.leave(reader.leave());
   }
 
   /// A-273 step 3: a reader that leaves holds no free, and one that joins later never sees a block released before it
@@ -871,6 +974,7 @@ mod tests {
     store.leave(first.leave());
     let again = BlockReader::new(store.join(1).unwrap());
     store.leave(again.leave());
+    assert!(store.end().is_ok(), "every reader left: the writer ends");
   }
 
   /// A-273 step 4: past the held limit the slowest reader is evicted, one at a time: every later message names it and it
@@ -913,6 +1017,7 @@ mod tests {
     assert_eq!(rebuilt.live_blocks(), 0, "it names only what is live");
     store.leave(rebuilt.leave());
     store.leave(fast.leave());
+    assert!(store.end().is_ok(), "every reader left: the writer ends");
   }
 
   /// A-273 step 4: a change left unfed (the writer's holder made a second change before taking the first's) evicts every
@@ -948,6 +1053,7 @@ mod tests {
     assert_eq!(again.read(first), Some(&[3u8; 4][..]));
     assert_eq!(again.read(later), None, "released and passed");
     store.leave(again.leave());
+    assert!(store.end().is_ok(), "every reader left: the writer ends");
   }
 
   /// One reader of the generated histories: the reader, the blocks the model says it may read, and the messages sent it

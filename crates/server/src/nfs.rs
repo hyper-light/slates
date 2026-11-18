@@ -2006,7 +2006,9 @@ fn with_v4_sessions<R>(
 
 /// Sends `work` to shard `to` and awaits its outcome in a detached task of this shard, counting `lost` when it could
 /// not be delivered or did not answer while `to` was working, up to the liveness budget of its CPU
-/// (`xshard::within_shard_time`, R3 class A), never a silent drop (banned item 9).
+/// (`xshard::within_shard_time`, R3 class A), never a silent drop (banned item 9). Derived (A-442): the budget is the
+/// liveness window every cross-shard wait judged in its target's own time takes as its window (A-65): a wall window,
+/// then more while `to` runs or waits for a CPU, so a starved shard's answer is heard and a wedged one's given up.
 fn send_note(
   this: u16,
   to: u16,
@@ -3454,12 +3456,14 @@ fn bind_back_channel(sessionid: SessionId, id: u64, minor: Option<u32>) {
 const NFS4_CALLBACK_PROBES: &str = "nfs4.callback.probes";
 
 /// Probes `sessionid`'s back channel with `CB_SEQUENCE` alone and records whether the client answered `NFS4_OK`
-/// within a liveness budget.
+/// within the back channel's learned round trip (`callback::bound_ns`, A-442).
 async fn probe_back_channel(sessionid: SessionId) {
+  let bound = state::with_state(|s| crate::callback::bound_ns(s, &sessionid))
+    .unwrap_or(crate::daemon::LIVENESS_BUDGET_NS);
   let outcome = crate::callback::call_on_slot(
     sessionid,
     |next| slates_bridge_nfs::v4::callback::probe(&sessionid, next.minor, next.sequence),
-    crate::daemon::LIVENESS_BUDGET_NS,
+    bound,
   )
   .await;
   if let Err(error) = outcome {

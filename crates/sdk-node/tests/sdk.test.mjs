@@ -11,7 +11,8 @@ import { closeSync, existsSync, mkdirSync, mkdtempSync, rmSync, rmdirSync } from
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
+import { endAnchor, startAnchor } from './anchor.mjs';
 
 const require = createRequire(import.meta.url);
 const addonPath = process.env.SLATES_NODE_ADDON;
@@ -122,13 +123,7 @@ test('lifecycle round trip over a live daemon', async (t) => {
   // (R5). The anchor is a child killed in `finally`, so a failed assertion leaves no daemon behind.
   const slates = require(addonPath);
   const instance = `slates-sdk-node-${process.pid}`;
-  // `detached` makes the anchor its own process-group leader, so teardown can kill the whole group —
-  // the anchor and the daemon it supervises — at once, rather than leaving the daemon up until its own
-  // liveness timeout notices the anchor gone.
-  const anchor = spawn(daemon, ['--instance', instance, 'anchor', '--quick', '--shards', '1'], {
-    stdio: 'ignore',
-    detached: true,
-  });
+  const anchor = startAnchor(daemon, instance);
   try {
     const client = await connectWhenReady(slates, instance);
     const bootstrap = spawnSync(daemon, ['--instance', instance, 'bootstrap', 'root'], {
@@ -227,12 +222,7 @@ test('lifecycle round trip over a live daemon', async (t) => {
     const nsChanged = client.changedSince(green, nsBase);
     assert.ok(nsChanged.some((p) => p.includes('keep.txt')), JSON.stringify(nsChanged));
   } finally {
-    // Kill the whole process group (negative pid) so the supervised daemon goes with the anchor at once.
-    try {
-      process.kill(-anchor.pid, 'SIGKILL');
-    } catch {
-      // The group is already gone; nothing to reap.
-    }
+    await endAnchor(anchor);
   }
 });
 
@@ -257,10 +247,7 @@ test('a synchronous call beside the async completion signal is woken by its repl
   }
   const slates = require(addonPath);
   const instance = `slates-sdk-node-beside-${process.pid}`;
-  const anchor = spawn(daemon, ['--instance', instance, 'anchor', '--quick', '--shards', '1'], {
-    stdio: 'ignore',
-    detached: true,
-  });
+  const anchor = startAnchor(daemon, instance);
   try {
     const client = await connectWhenReady(slates, instance);
     const bootstrap = spawnSync(daemon, ['--instance', instance, 'bootstrap', 'root'], {
@@ -288,11 +275,7 @@ test('a synchronous call beside the async completion signal is woken by its repl
     assert.ok(parksAfter - parksBefore >= PARKED_CALLS, `every call parked: ${parksBefore} before, ${parksAfter} after`);
     client.spinFor(null);
   } finally {
-    try {
-      process.kill(-anchor.pid, 'SIGKILL');
-    } catch {
-      // The group is already gone; nothing to reap.
-    }
+    await endAnchor(anchor);
   }
 });
 
@@ -336,10 +319,7 @@ test('a listing says which volumes are live-shipped and which recovery could not
   }
   const slates = require(addonPath);
   const instance = `slates-sdk-node-list-${process.pid}`;
-  const anchor = spawn(daemon, ['--instance', instance, 'anchor', '--quick', '--shards', '1'], {
-    stdio: 'ignore',
-    detached: true,
-  });
+  const anchor = startAnchor(daemon, instance);
   const scratch = mkdtempSync(join(tmpdir(), 'slates-sdk-node-list-'));
   try {
     const client = await connectWhenReady(slates, instance);
@@ -366,11 +346,7 @@ test('a listing says which volumes are live-shipped and which recovery could not
     assert.equal(entries[live].liveShipped, true, `the live-shipped volume says so: ${JSON.stringify(entries[live])}`);
     assert.ok(entries[live].notRecovered == null, `no recovery cause on a live volume: ${JSON.stringify(entries[live])}`);
   } finally {
-    try {
-      process.kill(-anchor.pid, 'SIGKILL');
-    } catch {
-      // The group is already gone; nothing to reap.
-    }
+    await endAnchor(anchor);
     rmSync(scratch, { recursive: true, force: true });
   }
 });

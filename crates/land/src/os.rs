@@ -702,6 +702,19 @@ impl LandFs for OsLand {
     })
   }
 
+  /// No reflink here yet (`capabilities` says so, so the engine never asks): Linux's `FICLONE` and macOS's
+  /// `clonefile` are owed (A-445); refused `ENOTSUP`, nothing made.
+  fn clone_temp(
+    &mut self,
+    dir: HostDir,
+    _name: &str,
+    _from: HostFile,
+    _len: u64,
+  ) -> Result<HostFile, HostError> {
+    self.dir(dir)?;
+    Err(refusal(rustix::io::Errno::NOTSUP))
+  }
+
   fn create_temp(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError> {
     if let Some(file) = self.create_unnamed(dir)? {
       return Ok(file);
@@ -832,7 +845,14 @@ impl LandFs for OsLand {
     rustix::fs::unlinkat(self.dir(dir)?, name, AtFlags::REMOVEDIR).map_err(refusal)
   }
 
-  fn symlink(&mut self, dir: HostDir, name: &str, target: &str) -> Result<(), HostError> {
+  /// `symlinkat` makes the link whole at `name` in one step, so `staged` is not used (the seam's contract).
+  fn symlink(
+    &mut self,
+    dir: HostDir,
+    name: &str,
+    target: &str,
+    _staged: &str,
+  ) -> Result<(), HostError> {
     rustix::fs::symlinkat(target, self.dir(dir)?, name).map_err(refusal)
   }
 
