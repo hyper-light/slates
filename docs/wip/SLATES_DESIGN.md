@@ -7797,7 +7797,14 @@ command and every host start, mount and grant through one implementation.
   prefix and `--instance NAME`, and a host finds exactly its own instance's processes. The start
   waits for the first answer at the anchor's heartbeat cadence while the anchor lives, and makes
   the group of an instance run alone; a host that launches the anchor under its service manager
-  takes the command (`StartSpec::anchor_command`) and waits with `Instance::wait_for`. The starter
+  takes the command (`StartSpec::anchor_command`) and waits with `Instance::wait_for`, while the
+  anchor lives when it holds the anchor's child and by a deadline of its own when it does not. A
+  starter that has attached nothing yet asks `StartSpec::until_served` (A-366): an anchor whose
+  daemons crash-loop before any of them has served (none reached its serving mark,
+  `Supervisor::ever_served`) stops, exit 5, and the wait ends `StartFault::NeverServed`, since no
+  client could be waiting on an instance that never answered; an anchor that has served once never
+  gives its instance up (A-119), asked or not. So no host bounds its wait by a second it picked,
+  which a slow start under load outlasts (kiln's 30 s at load 28, 2026-11-18). The starter
   is the launcher: under Ada's rule of 2026-11-18 (A-285 as revised, A-299) write permission
   follows each agent's mode and the launcher's authority is the instance's issuer, which the start
   is to hand its starter on every platform (owed; today the starter holds it where the anchor's
@@ -26068,3 +26075,30 @@ Applied in the same change to: §4.14 (A-318's note), GAPS (A-318's entry: its s
 - **What it does not change.** A release build (its chain runs at machine code's speed), the wedged and starved
   judgments on the wall, the anchor's lapse bound and the beat.
 
+
+### A-366 — A host waits on its anchor while it lives; an anchor its starter asked stops when none of its daemons ever served (2026-11-18, kiln goal g264; §4.12 "Embedding", §2.6 step 1, A-119, A-232, A-278)
+
+- **What was wrong.** A starter that held the anchor's child still bounded its wait by a second it picked: kiln's
+  start of its machine's instance waited 30 s (`UP_WAIT`), and a slow start under load outlasted it (kiln's
+  `slates_roles` test, Mac Studio at load average 28 during a parallel build, 2026-11-18: "the anchor didn't answer
+  within 30s"; passed at load 16-18 in 24-27 s). Without a deadline the wait could last for good: an anchor never gives
+  its instance up (A-119), so a daemon that cannot start is restarted after a backoff forever, and the starter sees
+  nothing but "no rendezvous yet".
+- **The rule.** The anchor already judges its starting daemon by the daemon's own CPU progress, never a second (A-232),
+  so a host that holds the anchor's child waits while the anchor lives (`Instance::wait_for(name, Some(child), None)`).
+  A starter that has attached nothing yet asks `StartSpec::until_served` (handed to the anchor as the environment word
+  `SLATES_UNTIL_SERVED`, as the launcher's record is): an anchor none of whose daemons has reached its serving mark
+  (`layout::SUP_SERVING`; `Supervisor::ever_served`, which also sees a daemon that marked and died at its exit step)
+  stops at their crash loop (two failed starts in a row, A-311), exit `role::EXIT_NEVER_SERVED` (5), and the wait ends
+  `StartFault::NeverServed`. No client can hold a mount on an instance that never answered, which is what A-119
+  protects; an anchor that has served once never gives its instance up, asked or not. CONTRACT 22.
+- **What remains.** The serving mark comes right after the daemon's start returns, so a client that attached during
+  the start of a daemon that then died before marking is the one case the rule cannot see; a starter that asks makes
+  no mount before its own wait and first call succeed, as kiln does.
+- **Applied in the same change to** `crates/anchor/src/supervise.rs` (`ever_served`), `crates/api/src/start.rs`
+  (`StartSpec::until_served`, the wait's mapping, the module doc), `crates/api/src/error.rs`
+  (`StartFault::NeverServed`), `crates/api/src/role/{mod,anchor}.rs` (`EXIT_NEVER_SERVED`, `Failure::NeverServed`, the
+  stop), `crates/api/src/lib.rs` (CONTRACT 22), `crates/cli/src/main.rs` (the command's mapping, exit 5), §4.12
+  "Embedding", `docs/library.md`; tests `crates/anchor/tests/anchor.rs` (the two crash-loop tests say whether a
+  daemon served) and `crates/api/tests/start.rs`
+  (`an_anchor_asked_until_served_stops_when_none_of_its_daemons_serves`).
