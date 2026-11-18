@@ -43,6 +43,14 @@ const INDENT: &str = "  ";
 /// Format: the version of the stub a maintainer publishes once to create a name on npm — below every
 /// real release, so the first tagged release supersedes it (npm/cli#8544; vorpal's recipe).
 const RESERVED_VERSION: &str = "0.0.0";
+/// The CLI crate's manifest, whose `[package.metadata.binstall]` tells cargo-binstall where each shipped target's
+/// release binary is (Appendix B.2).
+const CLI_MANIFEST: &str = "crates/cli/Cargo.toml";
+/// Format: where a release attaches a shipped target's binary, in cargo-binstall's template: the repository, the tag
+/// `v<version>` (`release.yml` runs on it) and the asset's name (`targets::ASSETS`).
+const BINSTALL_URL_PREFIX: &str = "{ repo }/releases/download/v{ version }/";
+/// Format: cargo-binstall's name for a raw binary, the release's one form (Appendix B.2: no archive).
+const BINSTALL_FORMAT: &str = "bin";
 
 /// What `cargo xtask version` is asked to do.
 pub(crate) enum Mode {
@@ -167,6 +175,19 @@ pub(crate) struct Truth {
   pub(crate) platform_dirs: Vec<String>,
   /// The platform packages found, by directory name.
   pub(crate) platforms: BTreeMap<String, PlatformPackage>,
+  /// The CLI manifest's cargo-binstall table.
+  pub(crate) binstall: Binstall,
+}
+
+/// The CLI manifest's cargo-binstall facts (Appendix B.2, A-413).
+pub(crate) struct Binstall {
+  /// `[package.metadata.binstall] pkg-fmt`, if the manifest sets it.
+  pub(crate) format: Option<String>,
+  /// Each override's `pkg-url`, by target triple (`None` for an override that names none).
+  pub(crate) urls: BTreeMap<String, Option<String>>,
+  /// Whether the crate names its `repository` (its own, or inherited from `[workspace.package]`), which `{ repo }`
+  /// reads.
+  pub(crate) repository: bool,
 }
 
 /// How `pyproject.toml` declares the version.
@@ -273,6 +294,20 @@ pub(crate) enum Finding {
   },
   /// A pin on a package no target produces.
   OptionalDependencyStray { name: String },
+  /// The CLI manifest's `pkg-fmt` is not `bin`: cargo-binstall would look for an archive the release never attaches.
+  BinstallFormat { found: String },
+  /// The CLI crate names no `repository`, which cargo-binstall's `{ repo }` reads.
+  BinstallNoRepository,
+  /// A shipped target with no cargo-binstall override: cargo-binstall would guess its URL.
+  BinstallTargetMissing { triple: String },
+  /// An override for a target slates does not ship.
+  BinstallTargetStray { triple: String },
+  /// An override whose `pkg-url` is not the release's address of its target's binary.
+  BinstallUrlDrift {
+    triple: String,
+    found: String,
+    expected: String,
+  },
   /// The writer found no line for a field it must stamp.
   LineNotFound { key: String },
   /// The writer found several lines for a field it must stamp.
@@ -356,6 +391,31 @@ impl fmt::Display for Finding {
         f,
         "{NODE_PACKAGE}: optionalDependencies pins `{name}`, which no napi.targets entry produces; run `cargo xtask version --write`"
       ),
+      Self::BinstallFormat { found } => write!(
+        f,
+        "{CLI_MANIFEST}: `[package.metadata.binstall] pkg-fmt` is `{found}`, not `{BINSTALL_FORMAT}`: a release attaches raw binaries, no archive"
+      ),
+      Self::BinstallNoRepository => write!(
+        f,
+        "{CLI_MANIFEST}: the crate names no `repository` (`repository.workspace = true` over `[workspace.package] repository`), which cargo-binstall's `{{ repo }}` reads"
+      ),
+      Self::BinstallTargetMissing { triple } => write!(
+        f,
+        "{CLI_MANIFEST}: no `[package.metadata.binstall.overrides.{triple}]` for a target slates ships; cargo-binstall would guess its URL"
+      ),
+      Self::BinstallTargetStray { triple } => write!(
+        f,
+        "{CLI_MANIFEST}: `[package.metadata.binstall.overrides.{triple}]` names a target slates does not ship ({})",
+        shipped_triples()
+      ),
+      Self::BinstallUrlDrift {
+        triple,
+        found,
+        expected,
+      } => write!(
+        f,
+        "{CLI_MANIFEST}: the override for {triple} has `pkg-url = \"{found}\"`, not the release's `{expected}`"
+      ),
       Self::LineNotFound { key } => write!(
         f,
         "no line `{INDENT}\"{key}\": ...` at the top level to stamp (the file is not in npm's two-space shape)"
@@ -375,6 +435,7 @@ pub(crate) fn audit(truth: &Truth) -> Vec<Finding> {
   audit_root(&truth.root, &truth.workspace_version, &mut findings);
   audit_platforms(truth, &mut findings);
   audit_optional_dependencies(&truth.root, &truth.workspace_version, &mut findings);
+  audit_binstall(&truth.binstall, &mut findings);
   findings
 }
 
@@ -545,6 +606,45 @@ fn audit_optional_dependencies(
   }
 }
 
+/// The CLI manifest's cargo-binstall table names exactly the shipped targets, each with the release's address of its
+/// binary, as raw binaries, under the crate's repository (Appendix B.2, A-413).
+fn audit_binstall(binstall: &Binstall, findings: &mut Vec<Finding>) {
+  if binstall.format.as_deref() != Some(BINSTALL_FORMAT) {
+    findings.push(Finding::BinstallFormat {
+      found: binstall.format.clone().unwrap_or_default(),
+    });
+  }
+  if !binstall.repository {
+    findings.push(Finding::BinstallNoRepository);
+  }
+  for (triple, asset) in crate::targets::ASSETS {
+    let expected = format!("{BINSTALL_URL_PREFIX}{asset}");
+    match binstall.urls.get(*triple) {
+      None => findings.push(Finding::BinstallTargetMissing {
+        triple: (*triple).to_owned(),
+      }),
+      Some(found) if found.as_deref() != Some(expected.as_str()) => {
+        findings.push(Finding::BinstallUrlDrift {
+          triple: (*triple).to_owned(),
+          found: found.clone().unwrap_or_default(),
+          expected,
+        });
+      }
+      Some(_) => {}
+    }
+  }
+  for triple in binstall.urls.keys() {
+    if !crate::targets::ASSETS
+      .iter()
+      .any(|(shipped, _)| shipped == triple)
+    {
+      findings.push(Finding::BinstallTargetStray {
+        triple: triple.clone(),
+      });
+    }
+  }
+}
+
 /// `<root name>-<platform id>`: napi's platform package name.
 fn platform_name(root_name: &str, platform: &Platform) -> String {
   format!("{root_name}-{}", platform.id)
@@ -573,6 +673,53 @@ pub(crate) fn read_truth(root: &Path) -> Result<Truth, Failure> {
     root: read_root_package(root)?,
     platform_dirs,
     platforms,
+    binstall: read_binstall(root)?,
+  })
+}
+
+/// Reads the CLI manifest's cargo-binstall table, and whether the crate names a repository.
+fn read_binstall(root: &Path) -> Result<Binstall, Failure> {
+  let manifest = read_toml(&root.join(CLI_MANIFEST))?;
+  let workspace = read_toml(&root.join("Cargo.toml"))?;
+  let package = manifest.get("package");
+  let table = package
+    .and_then(|p| p.get("metadata"))
+    .and_then(|m| m.get("binstall"));
+  let format = table
+    .and_then(|t| t.get("pkg-fmt"))
+    .and_then(toml::Value::as_str)
+    .map(str::to_owned);
+  let urls = table
+    .and_then(|t| t.get("overrides"))
+    .and_then(toml::Value::as_table)
+    .map(|overrides| {
+      overrides
+        .iter()
+        .map(|(triple, entry)| {
+          let url = entry
+            .get("pkg-url")
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned);
+          (triple.clone(), url)
+        })
+        .collect()
+    })
+    .unwrap_or_default();
+  let inherited = workspace
+    .get("workspace")
+    .and_then(|w| w.get("package"))
+    .and_then(|p| p.get("repository"))
+    .and_then(toml::Value::as_str)
+    .is_some();
+  let repository = match package.and_then(|p| p.get("repository")) {
+    Some(toml::Value::String(_)) => true,
+    Some(field) => inherited && field.get("workspace").and_then(toml::Value::as_bool) == Some(true),
+    None => false,
+  };
+  Ok(Binstall {
+    format,
+    urls,
+    repository,
   })
 }
 
@@ -1112,7 +1259,87 @@ mod tests {
       },
       platform_dirs: platforms.keys().cloned().collect(),
       platforms,
+      binstall: Binstall {
+        format: Some(BINSTALL_FORMAT.to_owned()),
+        urls: crate::targets::ASSETS
+          .iter()
+          .map(|(triple, asset)| {
+            (
+              (*triple).to_owned(),
+              Some(format!("{BINSTALL_URL_PREFIX}{asset}")),
+            )
+          })
+          .collect(),
+        repository: true,
+      },
     }
+  }
+
+  /// Appendix B.2, A-413: do drift each part of the CLI manifest's cargo-binstall table from a consistent tree: drop a
+  /// shipped target's override, add one for a target slates does not ship, point one at another asset, ask for an
+  /// archive, and name no repository; expect each named once, as its own finding. A consistent table has none
+  /// (`a_consistent_tree_has_no_findings`).
+  #[test]
+  fn the_binstall_table_names_exactly_the_shipped_binaries() {
+    let mut truth = consistent("@hyper-light/slates", "0.1.0");
+    let urls = &mut truth.binstall.urls;
+    urls.remove("aarch64-pc-windows-msvc");
+    urls.insert(
+      "x86_64-apple-darwin".to_owned(),
+      Some(format!("{BINSTALL_URL_PREFIX}slates-macos-x64")),
+    );
+    urls.insert(
+      "x86_64-unknown-linux-gnu".to_owned(),
+      Some(format!("{BINSTALL_URL_PREFIX}slates-linux-x64-musl")),
+    );
+    truth.binstall.format = Some("tgz".to_owned());
+    truth.binstall.repository = false;
+    let findings = audit(&truth);
+    assert_eq!(
+      findings,
+      vec![
+        Finding::BinstallFormat {
+          found: "tgz".to_owned()
+        },
+        Finding::BinstallNoRepository,
+        Finding::BinstallUrlDrift {
+          triple: "x86_64-unknown-linux-gnu".to_owned(),
+          found: format!("{BINSTALL_URL_PREFIX}slates-linux-x64-musl"),
+          expected: format!("{BINSTALL_URL_PREFIX}slates-linux-x64"),
+        },
+        Finding::BinstallTargetMissing {
+          triple: "aarch64-pc-windows-msvc".to_owned()
+        },
+        Finding::BinstallTargetStray {
+          triple: "x86_64-apple-darwin".to_owned()
+        },
+      ],
+      "{findings:#?}"
+    );
+    let message = findings
+      .iter()
+      .map(ToString::to_string)
+      .collect::<Vec<_>>()
+      .join("\n");
+    assert!(message.contains(CLI_MANIFEST), "{message}");
+    assert!(message.contains("slates does not ship"), "{message}");
+  }
+
+  /// Appendix B.2, A-413: do read the tree's own CLI manifest; expect its cargo-binstall table to name exactly the
+  /// binaries a release attaches, under a repository, so `cargo binstall` finds each shipped target's binary and
+  /// refuses the rest.
+  #[test]
+  fn the_trees_binstall_table_names_the_release_binaries() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+      .parent()
+      .unwrap_or_else(|| Path::new("."));
+    let binstall = match read_binstall(root) {
+      Ok(binstall) => binstall,
+      Err(Failure(message)) => panic!("{message}"),
+    };
+    let mut findings = Vec::new();
+    audit_binstall(&binstall, &mut findings);
+    assert_eq!(findings, vec![], "{findings:#?}");
   }
 
   #[test]
