@@ -42,9 +42,11 @@ const DELTA_MAGIC: u32 = u32::from_le_bytes(*b"SLD1");
 /// order) an inode image it carries may hold a symlink's `FILE_ATTRIBUTE_DIRECTORY` (image version 26), which an
 /// earlier reader would drop without a word; 10 (A-270, built 2026-11-09 as 9, landed 2026-11-18 after A-275, so it
 /// takes the next) what the shard holds for other owners as the pieces put and the keys removed since the last
-/// publication, never the whole held image (image version 27).
+/// publication, never the whole held image (image version 27); 11 (A-294, built 2026-11-17 as 9, landed after A-270,
+/// so it takes the next) every inode image it carries may be a block or character device node with its number (image
+/// version 28).
 /// Format: the delta format's version, the latest entry of the history above.
-pub const DELTA_VERSION: u16 = 10;
+pub const DELTA_VERSION: u16 = 11;
 /// Format: a log frame's header — a little-endian payload length then a CRC-32C of the payload.
 const LOG_HEADER: usize = 2 * size_of::<u32>();
 /// Format: a log frame's payload prefix — its generation and its base checkpoint's generation.

@@ -273,7 +273,14 @@ mod tests {
     assert_eq!(met.mode(WriteAct::Land), WriteMode::Forbid);
     assert!(met.require_signed_merges);
     assert_eq!(met, volume.meet(&consumer), "the meet is symmetric");
+    expect_each_raise_named(&consumer, &volume);
+  }
 
+  /// The raises of `a_policy_meets_another_at_the_stricter_and_a_raise_is_named`. Expect a laxer mode to raise a
+  /// stricter one and not the reverse; `consumer`'s policy no raise over unset, which already merges at once and asks for
+  /// landings, while a landing bypass is one; and over `volume`'s policy, dropping its signature requirement a raise and
+  /// forbidding its merges none.
+  fn expect_each_raise_named(consumer: &WritePolicy, volume: &WritePolicy) {
     assert!(WriteMode::Bypass.raises(WriteMode::Ask));
     assert!(!WriteMode::Forbid.raises(WriteMode::Ask));
     assert!(
@@ -290,16 +297,16 @@ mod tests {
     );
     let dropped = WritePolicy {
       require_signed_merges: false,
-      ..volume
+      ..*volume
     };
     assert!(
-      dropped.raises(&volume),
+      dropped.raises(volume),
       "dropping a signature requirement is a raise"
     );
     let lowered = WritePolicy {
       merge: WriteMode::Forbid,
-      ..volume
+      ..*volume
     };
-    assert!(!lowered.raises(&volume), "a lowering is not");
+    assert!(!lowered.raises(volume), "a lowering is not");
   }
 }

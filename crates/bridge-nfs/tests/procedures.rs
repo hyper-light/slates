@@ -1842,6 +1842,18 @@ fn export_to<'a>(bridge: &'a mut VolumeBridge<'_>, uid: u32) -> Export<'a> {
 /// The status of a MKNOD of `name` in the directory `dir` of `ftype3` (3 a block device, 4 a character one, 7 a FIFO),
 /// with no attributes set and, for a device, the major and minor 1 and 2.
 fn mknod_status(export: &mut Export<'_>, dir: &Nfsfh3, name: &str, ftype3: u32) -> u32 {
+  mknod_reply(export, dir, name, ftype3, (1, 2)).0
+}
+
+/// A MKNOD of `name` in the directory `dir` of `ftype3`, with no attributes set and, for a device, the major and
+/// minor `device`: its status and, when made, the new object's attributes from the reply.
+fn mknod_reply(
+  export: &mut Export<'_>,
+  dir: &Nfsfh3,
+  name: &str,
+  ftype3: u32,
+  device: (u32, u32),
+) -> (u32, Option<Fattr3>) {
   let mut args = XdrWriter::new();
   dir.encode(&mut args);
   args.opaque(name.as_bytes());
@@ -1852,13 +1864,34 @@ fn mknod_status(export: &mut Export<'_>, dir: &Nfsfh3, name: &str, ftype3: u32) 
   args.u32(0); // atime DONT_CHANGE
   args.u32(0); // mtime DONT_CHANGE
   if ftype3 == 3 || ftype3 == 4 {
-    args.u32(1); // specdata3 major
-    args.u32(2); // specdata3 minor
+    args.u32(device.0); // specdata3 major
+    args.u32(device.1); // specdata3 minor
   }
   let reply = export
     .serve_nfs(NFSPROC3_MKNOD, &mut XdrReader::new(args.as_slice()))
     .expect("MKNOD is answered, not PROC_UNAVAIL");
-  XdrReader::new(&reply).u32().unwrap()
+  let mut reader = XdrReader::new(&reply);
+  let status = reader.u32().unwrap();
+  if status != Nfsstat3::Ok.wire() {
+    return (status, None);
+  }
+  assert!(
+    reader.bool().unwrap(),
+    "MKNOD returns the new object's handle"
+  );
+  Nfsfh3::decode(&mut reader).unwrap();
+  (status, PostOpAttr::decode(&mut reader).unwrap().0)
+}
+
+/// The attributes a GETATTR of `name` in `dir` answers.
+fn attributes_of(export: &mut Export<'_>, dir: &Nfsfh3, name: &str) -> Fattr3 {
+  let handle = lookup_fh(export, dir, name);
+  let mut args = XdrWriter::new();
+  handle.encode(&mut args);
+  let reply = export.getattr(&mut XdrReader::new(args.as_slice()));
+  let mut reader = XdrReader::new(&reply);
+  assert_eq!(reader.u32().unwrap(), Nfsstat3::Ok.wire());
+  Fattr3::decode(&mut reader).unwrap()
 }
 
 /// The status of a LOOKUP of `name` in the directory `dir`.
@@ -1872,22 +1905,30 @@ fn lookup_status(export: &mut Export<'_>, dir: &Nfsfh3, name: &str) -> u32 {
   XdrReader::new(&reply).u32().unwrap()
 }
 
-/// AC-3.10 / A-26, A-268. Do: MKNOD a block and a character device as root. Expect: `NFS3ERR_PERM`, which a client
-/// reports as `EPERM`, what `mknod(2)` answers for "the filesystem ... does not support the type of node requested",
-/// and no name made. Before, the answer was `NFS3ERR_BADTYPE`, which the Linux client turns into its internal
-/// `EBADTYPE`, errno 527, and every program printed "Unknown error 527".
+/// AC-3.10 / A-294, which replaced A-268's refusal. Do: as root, MKNOD a block and a character device numbered
+/// 259:1048575 (past the old 8-bit encoding) and stat each; then, as uid 1000 in a directory it may write, MKNOD the
+/// same kinds, one of root's names again, and a whiteout (a character device numbered 0/0). Expect root's devices made,
+/// each reported by its MKNOD reply and a GETATTR with its type (`NF3BLK`, `NF3CHR`) and its number in `rdev`; uid
+/// 1000's devices refused `NFS3ERR_PERM`, which a client reports as `EPERM`, as `nfsd` refuses a caller without
+/// `CAP_MKNOD`, with no name made, after `NFS3ERR_EXIST` for the taken name; and its whiteout made, as Linux makes one
+/// for any caller (`vfs_mknod`'s `is_whiteout`). Before A-294 every device was `NFS3ERR_PERM`; before A-268,
+/// `NFS3ERR_BADTYPE`, which the Linux client turned into its internal `EBADTYPE`, errno 527.
 #[test]
-fn a_device_mknod_is_refused_eperm_as_a_file_system_without_device_nodes_refuses_it() {
+fn a_device_mknod_makes_a_node_for_root_and_refuses_any_other_caller_eperm() {
   let mut store = store();
   let mut vol = volume(&mut store);
   let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
-  let mut export = export_to(&mut bridge, 0);
+  expect_root_makes_each_device_at_the_widest_number(&mut bridge);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  chmod(&mut bridge, &cx, root_ino, 0o777);
+  let mut export = export_as(&mut bridge, 1000, 1000);
   let root = root_handle(&mut export);
-  for (ftype3, name) in [(3, "block"), (4, "char")] {
+  for (ftype3, name) in [(3, "user-block"), (4, "user-char")] {
     assert_eq!(
       mknod_status(&mut export, &root, name, ftype3),
       Nfsstat3::Perm.wire(),
-      "a {name} device is refused EPERM"
+      "a {name} device is refused EPERM to uid 1000"
     );
     assert_eq!(
       lookup_status(&mut export, &root, name),
@@ -1895,13 +1936,54 @@ fn a_device_mknod_is_refused_eperm_as_a_file_system_without_device_nodes_refuses
       "no {name} name is made"
     );
   }
+  assert_eq!(
+    mknod_status(&mut export, &root, "block", 3),
+    Nfsstat3::Exist.wire(),
+    "a taken name is EEXIST before the device's EPERM"
+  );
+  let (status, made) = mknod_reply(&mut export, &root, "whiteout", 4, (0, 0));
+  assert_eq!(status, Nfsstat3::Ok.wire(), "anyone makes a whiteout");
+  let made = made.unwrap();
+  assert_eq!(
+    (
+      made.kind as u32,
+      made.rdev.specdata1,
+      made.rdev.specdata2,
+      made.uid
+    ),
+    (4, 0, 0, 1000)
+  );
 }
 
-/// A-268. Do: make a FIFO, then MKNOD a character device of the same name; then, as a user who may not write the root,
-/// MKNOD a device in it. Expect: `NFS3ERR_EXIST` for the taken name and `NFS3ERR_ACCES` for the directory, each before
-/// the device's own refusal, in the order Linux's `vfs_mknod` takes them (the lookup, then `may_create`, then the node
-/// type). An exclusive create over NFS skips the client's own lookup, so the server is the one that must say the name
-/// is taken.
+/// Root's half of `a_device_mknod_makes_a_node_for_root_and_refuses_any_other_caller_eperm`. Do: as root, MKNOD a block
+/// and a character device numbered 259:1048575 (past the old 8-bit encoding) through `bridge`. Expect each made, and
+/// its MKNOD reply and a GETATTR to report its type (`NF3BLK`, `NF3CHR`) and its number in `rdev`.
+fn expect_root_makes_each_device_at_the_widest_number(bridge: &mut VolumeBridge<'_>) {
+  let widest = (259, (1 << 20) - 1);
+  let mut export = export_to(bridge, 0);
+  let root = root_handle(&mut export);
+  for (ftype3, name) in [(3, "block"), (4, "char")] {
+    let (status, made) = mknod_reply(&mut export, &root, name, ftype3, widest);
+    assert_eq!(status, Nfsstat3::Ok.wire(), "root makes a {name} device");
+    for attrs in [made.unwrap(), attributes_of(&mut export, &root, name)] {
+      assert_eq!(
+        (
+          attrs.kind as u32,
+          attrs.rdev.specdata1,
+          attrs.rdev.specdata2
+        ),
+        (ftype3, widest.0, widest.1),
+        "a {name} device reports its type and number"
+      );
+    }
+  }
+}
+
+/// A-268, kept by A-294. Do: make a FIFO, then MKNOD a character device of the same name; then, as a user who may not
+/// write the root, MKNOD a device in it. Expect: `NFS3ERR_EXIST` for the taken name and `NFS3ERR_ACCES` for the
+/// directory, each before the superuser rule, in the order Linux's `mknodat` takes them (the lookup, then
+/// `may_create`, then `CAP_MKNOD`). An exclusive create over NFS skips the client's own lookup, so the server is the one
+/// that must say the name is taken.
 #[test]
 fn a_device_mknod_is_told_its_name_is_taken_or_its_directory_unwritable_first() {
   let mut store = store();

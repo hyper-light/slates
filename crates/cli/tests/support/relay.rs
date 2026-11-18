@@ -524,14 +524,14 @@ impl RelayState {
       let bytes = buffer.get(..length).unwrap_or_default().to_vec();
       match arrival {
         Arrival::Wake => {}
-        Arrival::Listener(index) => self.from_sender(index, from, bytes),
-        Arrival::Flow(index) => self.from_receiver(index, from, bytes),
+        Arrival::Listener(index) => self.relay_from_sender(index, from, bytes),
+        Arrival::Flow(index) => self.relay_from_receiver(index, from, bytes),
       }
     }
   }
 
   /// A datagram a node's socket sent to listener `listener`: on, through the flow of its socket.
-  fn from_sender(&mut self, listener: usize, source: SocketAddrV4, bytes: Vec<u8>) {
+  fn relay_from_sender(&mut self, listener: usize, source: SocketAddrV4, bytes: Vec<u8>) {
     let Some(flow) = self.flow_for(listener, source) else {
       return;
     };
@@ -552,7 +552,7 @@ impl RelayState {
   }
 
   /// A datagram the receiver's socket answered flow `flow` with: back, out of the flow's listener, to its sender.
-  fn from_receiver(&mut self, flow: usize, from: SocketAddrV4, bytes: Vec<u8>) {
+  fn relay_from_receiver(&mut self, flow: usize, from: SocketAddrV4, bytes: Vec<u8>) {
     let Some(found) = self.flows.get(flow).and_then(Option::as_ref) else {
       return;
     };
@@ -1295,7 +1295,13 @@ fn the_draws_are_reproducible_and_within_their_bounds() {
   );
   assert!((0..1000).all(|_| !first.chance(0)));
   assert!((0..1000).all(|_| first.chance(PARTS_PER_MILLION)));
-  // The schedule's draws: within their bounds, every value of a small bound met, and one seed one sequence.
+  expect_the_schedules_draws_within_their_bounds();
+}
+
+/// The schedule's half of `the_draws_are_reproducible_and_within_their_bounds`. Do: draw spans and picks from two
+/// generators seeded alike. Expect every span within its bounds, one seed one sequence, every value of a small bound
+/// drawn, a bound of zero drawing zero, and a span whose upper bound is not above its lower drawing the lower.
+fn expect_the_schedules_draws_within_their_bounds() {
   let (low, high) = (Duration::from_millis(200), Duration::from_secs(4));
   let (mut schedule, mut again) = (Draws::seeded(11), Draws::seeded(11));
   let spans: Vec<Duration> = (0..1000).map(|_| schedule.within(low, high)).collect();
