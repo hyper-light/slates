@@ -8715,6 +8715,10 @@ it builds against the contract and adds to it rather than around it.
 > (`umount -f`, their next calls failing), and answers which (`LetGo`). Linux's `unmount_lazy` was refused `Unsupported`
 > elsewhere, so a macOS host had no library route off a busy, `hard` loopback mount; it and `MountMissing::LazyUnmount`
 > are gone.
+> **`CONTRACT` = 37 (A-417):** `mount::available` on Windows answers `MountMissing::MountManager` where the machine does
+> not let WinFsp's driver make a mount's drive (`MountUseMountmgrFromFSD`, A-369), by the driver's own rule over the
+> value it reads at every mount. Until then such a machine was told it could mount, and each mount was refused
+> `MountManagerNotAllowed` after the host had made the volume it was for (kiln's bare-metal starts).
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -29520,3 +29524,27 @@ Appendix B.2, GAPS and `docs/publish.md`.
   addressing another asset, an archive format, and a crate with no repository, each as its own finding.
 - **Owed.** An install against a published release (run request); publishing the crate to crates.io would let
   `cargo binstall slates-cli` drop `--git`.
+
+### A-417 — A Windows host learns before it mounts whether WinFsp's driver may make the drive (2026-11-18, g085, the Windows leg of kiln's bare-metal goal; amends A-278 piece 3's `mount::available`, follows A-369)
+Applied in the same change to: §4.12 (the contract's status, `CONTRACT` = 37), `crates/api/src/mount.rs`
+(`available` and the pure `winfsp_available`, with its test), `crates/api/src/error.rs` (`MountMissing::MountManager`
+and its words), `crates/api/src/lib.rs` (`CONTRACT`), `crates/bridge-winfsp/src/ffi.rs` (`mount_manager_allowed`, one
+`machine_word` reader for it and Developer Mode, so the unsafe count stays 156) and `host.rs`, `docs/library.md`,
+README (installing on Windows), GAPS.
+- **What was wrong.** Since A-369 every slates WinFsp drive is a Mount Manager drive that WinFsp's driver makes on the
+  daemon's request, which it does only where an Administrator set `MountUseMountmgrFromFSD` to 1. `mount::available`,
+  the fact a host reads before it mounts (§4.12 "Verbs"; kiln's runner facts), asked only whether WinFsp's library
+  loads. So a machine without the setting was told it could mount, and a host that then made a volume and mounted it
+  was refused `MountManagerNotAllowed`: kiln's bare-metal engine makes each agent's volume before its mount, and refuses
+  a start typed only on what `available` names.
+- **The rule, read at its source.** WinFsp's driver reads `MountUseMountmgrFromFSD` under `FSP_REGKEY` at every such
+  request (`FspVolumeUseMountmgr`, WinFsp master `src/sys/volume.c`, read 2026-11-18): it refuses `STATUS_ACCESS_DENIED`
+  when the read fails, the value is not a `REG_DWORD`, or it is anything but 1; `FSP_REGKEY` is
+  `\Registry\Machine\Software\WOW6432Node\WinFsp` on every 64-bit Windows, arm64 included (`src/sys/driver.h`).
+  Nothing is cached at the driver's load, so `available` reads the same value by the same rule at each call
+  (`RegGetValueW` with `RRF_RT_REG_DWORD`, which refuses every other type), and its answer is the one a mount meets.
+- **The answer.** `Unsupported { missing: MountMissing::MountManager }`, whose words name the one command that allows
+  it. The library is asked first: without it no drive is ever asked for, so `MountMissing::WinFsp` is named alone.
+- **Tests.** `a_windows_mount_is_available_only_where_winfsps_driver_may_make_its_drive` (every pair of the two facts,
+  and the words), on every host. The registry read itself runs only on Windows: compiled for
+  `x86_64-pc-windows-msvc`; a Windows run of `available` with and without the setting is filed for main's runners.

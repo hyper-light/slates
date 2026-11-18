@@ -929,6 +929,12 @@
 >   a busy unmount of a path where nothing is mounted is refused with the program's status, on each OS. By use, with a
 >   kernel mount: `a_busy_mount_is_let_go_of_the_oss_way` (`crates/api/tests/api.rs`, run with `SLATES_TEST_MOUNT=1`,
 >   filed for main's run);
+> - **a Windows machine that could not make the drive was told it could mount, closed 2026-11-18 (A-417, `CONTRACT` =
+>   37):** `mount::available` asked only whether WinFsp's library loads, while every mount since A-369 also needs the
+>   machine to let WinFsp's driver make its drive (`MountUseMountmgrFromFSD`). It now reads that value by the driver's
+>   own rule (WinFsp `src/sys/volume.c`) and answers `MountMissing::MountManager`. Unit test: the decision over each pair
+>   of facts, on every host; owed: a Windows run of `available` with the setting and without it (filed for main's
+>   runners; the registry read is compiled for `x86_64-pc-windows-msvc`, never run by its author);
 > - the async form (R6), first piece built (`CONTRACT` = 31): `AsyncInstance` over a host's `Reactor`, awaiting
 >   provisioning, a snapshot, a status and a destroy; handing it back stops its completion bridge, which took the
 >   synchronous form's wakes (`docs/bugs/2026-11-18-the-async-signal-took-the-synchronous-forms-wakes.md`); owed: the
