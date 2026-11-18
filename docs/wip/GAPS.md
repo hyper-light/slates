@@ -30,6 +30,31 @@
 >   (2026-11-08 entry below, still open); live_chaos's `diagnosis` leaves out `fleet.learner.*` and `fleet_learner`, so
 >   this stall's own counters never printed on main (told to g229, which owns that harness).
 
+> **Signed work: merges are signed work (2026-11-17, §4.16, §4.12 "The consumer contract"; A-321, goal g090, Ada's
+> rule of 2026-11-18 that a signature is provenance and never the permission gate).** A merge may carry an SSH
+> signature (`PROTOCOL.sshsig`, namespace `slates-work`, Ed25519 or FIDO Ed25519) over its statement — the work, its
+> green, its base and the increment's identity, which a held submit hands the signer. The green's owner judges it under
+> the work's and the green's trusted signers (set only by the launcher, `SetSigners`), and records the verdict
+> (verified with its signer, unsigned, invalid with its reason) with the version: in its chain entry, then in the
+> green's accepted record and the checkpoint that folds the entry. It is answered on the merge and read back with
+> `MergeRecord`. A green or a work can require signed merges (`WritePolicy::require_signed_merges`, launcher-set); an
+> unsigned or invalid merge is refused `SignatureRequired` when it would merge, in every mode. A consumer's policy
+> cannot require it. The contract carries all of it (`CONTRACT` 13). Proven by `crates/server/tests/signed_work.rs`
+> (8 of 8, macOS arm64, 2026-11-17; each red with its guard removed), the verifier's 11 unit tests over new
+> `ssh-keygen -Y sign` vectors, the chain and checkpoint codecs' tests and the contract's by-use test. **Owed, in
+> order:**
+> - a landing's signature: the statement is defined (`signed_work::landing_statement`: the volume, the target with its
+>   length, the manifest); the verdict on `Land` and `Present` under the volume's signers, recorded with the landing's
+>   record and read back in the audit, and the contract's `land` with a signature (today `Unsupported(SignedWork)`);
+> - the verdict carried by a version's merge record (`MergeRecordValue`) to holders and a takeover successor, which
+>   records none today, so a green taken over reads its merged versions unsigned;
+> - **a sibling found here, open (A-285's too):** a takeover successor makes a volume's record with no write policy and
+>   no trusted signers (`verbs::materialize_taken_over`, `materialize_taken_over_green`: `write: None`), since the
+>   catalog register (`catalog::CatalogValue`) carries neither, so a volume taken over merges and lands as an unset
+>   one does, its signed-merge requirement dropped; the catalog register should carry both;
+> - a real FIDO key's signature end to end (the touch flag is proven with a software stand-in);
+> - the integrator's runs on Linux and Windows (the suite is platform-free but for the agent's own channel, Unix).
+
 > **A reply carried home past a full channel was dropped: fixed (goal 238, 2026-11-18, A-296, from perf's branch of
 > 2026-11-09; §4.3, CLAUDE.md §2 items 8 and 9).** `xshard::send_back` waited one coordinator period for room and then
 > dropped the result (`xshard.reply_dropped`); `xshard::hand_reply_home` (fuse, image, landing, lease_wait, live_ship,
@@ -298,7 +323,8 @@
 >   (`set_write_policy`, `write_policy`, `Refused` outcomes; piece 5, `CONTRACT` = 3), and merges under a mode with
 >   their approvals and the present-only verb reach it too (`approve_merge`, `plan_landing` on `Present`; `CONTRACT`
 >   = 6); owed: a consumer's own mode, the MCP and SDK land verb under the mode, signed work verified with the
->   statement a signer signs and the trusted signers a launcher registers;
+>   statement a signer signs and the trusted signers a launcher registers — signed merges built (A-321, `CONTRACT` =
+>   13), a signed landing owed;
 > - typed fields on the wire for a landing target's refusal (`TargetUnavailable` carries words), a merge's versions
 >   (the work's base beside the head), and the words the crate still reads from the daemon's closed tables (a landing's
 >   state, a summary's actions, the audit's kinds, a grant's state); an overlay's drift is built (`StatusReport::base`,
@@ -402,7 +428,8 @@
 > - **built (2026-11-18):** the MCP and SDK land verb follows the policy (it already sent `Land`; its promises now
 >   say so); `assert_materialize_lands_under_a_bypass_policy` over MCP;
 > - signed work: a merge or landing may carry an SSH signature, checked and recorded (verified with its signer,
->   unsigned, invalid with its reason), and a volume may require signed merges;
+>   unsigned, invalid with its reason), and a volume may require signed merges — **built for merges (2026-11-17,
+>   A-321)**, a landing's owed (A-321's entry);
 > - the end-to-end proof on adacachy: a bypass agent's landing written at once, an ask agent's after approval, a
 >   signed merge verified and an invalid signature reported. **The landing half ran on Linux (2026-11-18):**
 >   `write_policy.rs` 9 of 9 on Linux x86_64 and arm64, a real daemon and client over a real target directory (GitHub

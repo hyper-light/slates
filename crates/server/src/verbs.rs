@@ -4205,6 +4205,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::NotShared { .. } => "not_shared",
     Refusal::PolicyForbids { .. } => "policy_forbids",
     Refusal::PolicyChanged { .. } => "policy_changed",
+    Refusal::SignatureRequired { .. } => "signature_required",
     Refusal::ImageRefused { .. } => "image_refused",
     Refusal::NotRootLeader => "not_root_leader",
     Refusal::ConsensusNotInitialized => "consensus_not_initialized",
@@ -4252,6 +4253,7 @@ fn claims_placed_durability(body: &RequestBody) -> bool {
       | RequestBody::EditSubmit { .. }
       | RequestBody::EditSubmitHeld { .. }
       | RequestBody::SubmitHeld { .. }
+      | RequestBody::SubmitSigned { .. }
       | RequestBody::ImageBuild { .. }
       | RequestBody::ImageMerge { .. }
   )
@@ -4442,14 +4444,32 @@ fn dispatch_inner(
     } => edit(state, principal, work, &path, at, delete_len, &bytes),
     RequestBody::Declare { work, op } => declare(state, principal, work, op),
     RequestBody::Submit { work, evidence } => {
-      submit(state, principal, work, evidence, Approval::None)
+      submit(state, principal, work, (evidence, None), Approval::None)
     }
+    RequestBody::SubmitSigned {
+      work,
+      evidence,
+      signature,
+    } => submit(
+      state,
+      principal,
+      work,
+      (evidence, Some(signature)),
+      Approval::None,
+    ),
     RequestBody::SubmitApproved {
       work,
       evidence,
       identity,
       proof,
-    } => submit_approved(state, principal, (work, evidence), identity, proof),
+      signature,
+    } => submit_approved(
+      state,
+      principal,
+      (work, evidence, signature),
+      identity,
+      proof,
+    ),
     RequestBody::EditSubmit {
       work,
       path,
@@ -4488,8 +4508,25 @@ fn dispatch_inner(
       },
       (evidence, true),
     ),
-    RequestBody::SubmitHeld { work, evidence } => {
-      submit(state, principal, work, evidence, Approval::Held)
+    RequestBody::SubmitHeld {
+      work,
+      evidence,
+      signature,
+    } => submit(
+      state,
+      principal,
+      work,
+      (evidence, signature),
+      Approval::Held,
+    ),
+    RequestBody::SetSigners {
+      volume,
+      keys,
+      version,
+      proof,
+    } => crate::landing::set_signers_verb(state, principal, (volume, keys, version), proof),
+    RequestBody::MergeRecord { green, version } => {
+      crate::merge_service::merge_record_verb(state, principal, green, version)
     }
     RequestBody::Rebase { work } => rebase(state, principal, work),
     RequestBody::Advance {
@@ -4870,15 +4907,31 @@ fn consumer_gate(
         grant: None,
       }),
     },
-    RequestBody::Submit { .. } | RequestBody::EditSubmit { .. }
+    RequestBody::Submit { .. }
+    | RequestBody::SubmitSigned { .. }
+    | RequestBody::EditSubmit { .. }
       if policy.merge == WriteMode::Forbid =>
     {
       state.count("policy_forbids.merge", 1);
       Err(forbids(WriteAct::Merge))
     }
     RequestBody::Submit { work, evidence } if policy.merge == WriteMode::Ask => {
-      Ok(RequestBody::SubmitHeld { work, evidence })
+      Ok(RequestBody::SubmitHeld {
+        work,
+        evidence,
+        signature: None,
+      })
     }
+    // A signed merge is held as an unsigned one is, its signature kept for the approval request (A-321).
+    RequestBody::SubmitSigned {
+      work,
+      evidence,
+      signature,
+    } if policy.merge == WriteMode::Ask => Ok(RequestBody::SubmitHeld {
+      work,
+      evidence,
+      signature: Some(signature),
+    }),
     RequestBody::EditSubmit {
       work,
       path,
@@ -4921,6 +4974,14 @@ fn set_consumer_policy_on_channel(
   ) {
     state.count("grant_issuer_unverified", 1);
     return Served::Reply(refused(Refusal::GrantIssuerUnverified));
+  }
+  // Signed merges are a volume's requirement (A-321): what a green accepts, or what a work's merges must carry, judged
+  // where the merge's verdict is, which holds both volumes' records and neither session's. A launcher holds an agent to
+  // it by setting it on the agent's work; a consumer's policy is refused it, rather than keep a rule nothing reads.
+  if policy.require_signed_merges {
+    return Served::Reply(refused(Refusal::BadRequest {
+      reason: "signed merges are required by a volume's policy, not a consumer's".to_owned(),
+    }));
   }
   let origin = state.shard;
   let Some(owner) = shard_of_partition(state, owner_of_consumer(consumer)) else {
@@ -5037,6 +5098,7 @@ fn consumer_policy_on_channel(
       Some(Some((policy, version))) => ReplyBody::Policy {
         policy: policy.map(crate::landing::wire_policy),
         version,
+        signers: Vec::new(),
       },
       _ => refused(Refusal::NotFound),
     };
@@ -5689,6 +5751,7 @@ fn create(
       live_holders: None,
       write: None,
       write_version: 0,
+      signers: Vec::new(),
     },
     base: match base {
       None => BaseRecord::Scratch,
@@ -6409,6 +6472,7 @@ fn found_green(
       live_holders: None,
       write: None,
       write_version: 0,
+      signers: Vec::new(),
     },
     base: BaseRecord::Scratch,
     head: DbSnapshotId::default(),
@@ -6736,6 +6800,7 @@ fn create_work(
       live_holders: None,
       write: None,
       write_version: 0,
+      signers: Vec::new(),
     },
     base: BaseRecord::Scratch,
     head: DbSnapshotId::default(),
@@ -6949,7 +7014,7 @@ fn edit_and_submit(
       state,
       principal,
       work,
-      evidence,
+      (evidence, None),
       if held { Approval::Held } else { Approval::None },
     ),
     refused_edit => refused_edit,
@@ -6993,13 +7058,7 @@ fn settle_edit_submit(
   splice: Splice<'_>,
   reply: ReplyBody,
 ) -> ReplyBody {
-  if matches!(
-    reply,
-    ReplyBody::Submitted {
-      version: Some(_),
-      ..
-    }
-  ) {
+  if accepted_version(&reply).is_some() {
     // The edit went to the owner inside the increment, so a buffer it came from is done with.
     if let slates_ipc::protocol::EditBytes::Staged { token } = splice.insert {
       let _ = state
@@ -7535,7 +7594,7 @@ pub(crate) fn reset_would_fit(
 fn submit_approved(
   state: &mut ShardState,
   principal: &Principal,
-  (work, evidence): (VolumeId, Vec<[u8; 32]>),
+  (work, evidence, signature): (VolumeId, Vec<[u8; 32]>, Option<Vec<u8>>),
   identity: [u8; 32],
   proof: [u8; 32],
 ) -> ReplyBody {
@@ -7547,7 +7606,13 @@ fn submit_approved(
     state.count("grant_issuer_unverified", 1);
     return refused(Refusal::GrantIssuerUnverified);
   }
-  submit(state, principal, work, evidence, Approval::Of(identity))
+  submit(
+    state,
+    principal,
+    work,
+    (evidence, signature),
+    Approval::Of(identity),
+  )
 }
 
 /// What a submit carries of the write policy's approval (A-285).
@@ -7650,8 +7715,8 @@ fn refused_before_the_seal(
 fn approval_answer(
   mode: slates_db::catalog::WriteMode,
   approval: Approval,
-  work: VolumeId,
-  inc: &slates_merge::engine::Increment,
+  (work, green, inc): (DbVolumeId, DbVolumeId, &slates_merge::engine::Increment),
+  signed: &JudgedSignature,
 ) -> Option<ReplyBody> {
   let asks = mode == slates_db::catalog::WriteMode::Ask
     || (approval == Approval::Held && mode == slates_db::catalog::WriteMode::Bypass);
@@ -7662,23 +7727,190 @@ fn approval_answer(
     Approval::Of(identity) if identity == inc.id => None,
     Approval::Of(_) => Some(refused(Refusal::GrantMismatch)),
     Approval::None | Approval::Held => Some(ReplyBody::MergeApprovalRequired {
-      work,
+      work: to_wire_volume(work),
       identity: inc.id,
       paths: u64::try_from(inc.doc.paths.paths().len()).unwrap_or(u64::MAX),
+      statement: crate::signed_work::merge_statement(&work.bytes, &green.bytes, inc.base, &inc.id),
+      verification: signed.verification,
     }),
+  }
+}
+
+/// A volume's signed-work rules (A-321): its trusted signers and whether its merges must be signed. Read where the
+/// volume's record is: a work's on the work's shard, a green's on its owner's (A-247), so a submit carries its work's
+/// to the verdict ([`SubmitPolicy`]) as it carries its work's merge mode.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SignedRules {
+  /// The trusted signers, in SSH wire form: read only for a submit that carries a signature, the only one they judge.
+  pub(crate) signers: Vec<Vec<u8>>,
+  /// Whether merges from (a work) or into (a green) the volume must be signed.
+  pub(crate) required: bool,
+}
+
+/// Whether `id`'s policy, as its record on this shard holds it, requires signed merges (A-321): never for a volume this
+/// shard does not hold.
+pub(crate) fn requires_signed_merges(state: &ShardState, id: DbVolumeId) -> bool {
+  state
+    .db
+    .partition()
+    .volume(id)
+    .and_then(|record| record.policy.write)
+    .is_some_and(|policy| policy.require_signed_merges)
+}
+
+/// `id`'s trusted signers as its record on this shard holds them (A-321): none, for a volume this shard does not hold.
+pub(crate) fn signers_of(state: &ShardState, id: DbVolumeId) -> &[Vec<u8>] {
+  state
+    .db
+    .partition()
+    .volume(id)
+    .map_or(&[], |record| record.policy.signers.as_slice())
+}
+
+/// A submit's signature as its verdict judged it (A-321): over the merge's statement, under the work's and the green's
+/// trusted signers together.
+struct JudgedSignature {
+  /// Whether the submit carried a signature: its reply is then `SubmittedSigned`.
+  carried: bool,
+  /// How it was judged.
+  verification: slates_ipc::protocol::Verification,
+  /// The volume whose policy requires signed merges, when either does: the work's first, as a tie of merge modes is.
+  required_by: Option<DbVolumeId>,
+}
+
+/// Judges the signature `policy` carries for `inc`, the increment of `work` into `green` (A-321), on the green's owner,
+/// where the green's record is; the work's rules came with the submit. An unsigned submit costs two reads of the
+/// records' flags: the statement is built and the signers parsed only for a signature. Counted per verdict.
+fn judge_signature(
+  state: &mut ShardState,
+  (work, green): (DbVolumeId, DbVolumeId),
+  inc: &slates_merge::engine::Increment,
+  policy: &SubmitPolicy,
+) -> JudgedSignature {
+  let verification = match policy.signature.as_deref() {
+    None => slates_ipc::protocol::Verification::Unsigned,
+    Some(signature) => {
+      let statement =
+        crate::signed_work::merge_statement(&work.bytes, &green.bytes, inc.base, &inc.id);
+      let trusted = crate::signed_work::trusted_of(
+        policy
+          .work_signed
+          .signers
+          .iter()
+          .chain(signers_of(state, green)),
+      );
+      crate::signed_work::judge(Some(signature), &statement, &trusted)
+    }
+  };
+  if let Some(counter) = crate::signed_work::counter(&verification) {
+    state.count(counter, 1);
+  }
+  let required_by = if policy.work_signed.required {
+    Some(work)
+  } else {
+    requires_signed_merges(state, green).then_some(green)
+  };
+  JudgedSignature {
+    carried: policy.signature.is_some(),
+    verification,
+    required_by,
+  }
+}
+
+/// The refusal a volume's signed-merge requirement makes of `signed` (A-321): `SignatureRequired`, naming the volume
+/// and how the signature was judged, unless it verified. Met in every write mode when the merge would happen: a bypass
+/// merge at once, an asked one at its approval.
+fn refused_unsigned(state: &mut ShardState, signed: &JudgedSignature) -> Option<ReplyBody> {
+  let by = signed.required_by?;
+  if matches!(
+    signed.verification,
+    slates_ipc::protocol::Verification::Verified { .. }
+  ) {
+    return None;
+  }
+  state.count("signature_required.merge", 1);
+  Some(refused(Refusal::SignatureRequired {
+    by: slates_ipc::protocol::PolicySubject::Volume {
+      volume: to_wire_volume(by),
+    },
+    verification: signed.verification,
+  }))
+}
+
+/// A conflict's reply (§4.16): `SubmittedSigned` with how the signature was judged when the submit carried one (A-321),
+/// else `Submitted`. Nothing is recorded for a conflict.
+fn conflicted_reply(
+  windows: &[slates_merge::engine::ConflictWindow],
+  signed: &JudgedSignature,
+) -> ReplyBody {
+  let conflicts = merge_windows(windows);
+  if signed.carried {
+    ReplyBody::SubmittedSigned {
+      version: None,
+      conflicts,
+      verification: signed.verification,
+    }
+  } else {
+    ReplyBody::Submitted {
+      version: None,
+      conflicts,
+    }
+  }
+}
+
+/// The version a submit's reply names as accepted, signed or not (A-321): what a work settles on.
+pub(crate) fn accepted_version(reply: &ReplyBody) -> Option<u64> {
+  match reply {
+    ReplyBody::Submitted {
+      version: Some(version),
+      ..
+    }
+    | ReplyBody::SubmittedSigned {
+      version: Some(version),
+      ..
+    } => Some(*version),
+    _ => None,
   }
 }
 
 /// What a submit brings its verdict from its write policy (A-285): its work's own merge mode, read on the work's shard
 /// where the work's record is, and what it carries of an approval: none, its caller's own ask (a consumer's session
 /// held it, `SubmitHeld`), or the launcher's approval of one increment, verified before it got here
-/// ([`approval_verifies`]). The green's mode is read where the verdict runs.
-#[derive(Clone, Copy, Debug)]
+/// ([`approval_verifies`]). And its signed work (A-321): the signature it carries, if any, and its work's signed-work
+/// rules, read with the mode. The green's mode and rules are read where the verdict runs.
+#[derive(Clone, Debug)]
 pub(crate) struct SubmitPolicy {
   /// The work's merge mode ([`merge_mode_of`]).
   pub(crate) work_mode: slates_db::catalog::WriteMode,
   /// What the submit carries of an approval.
   pub(crate) approval: Approval,
+  /// The signature the submit carries over its merge's statement (A-321).
+  pub(crate) signature: Option<Vec<u8>>,
+  /// The work's signed-work rules ([`requires_signed_merges`], [`signers_of`]).
+  pub(crate) work_signed: SignedRules,
+}
+
+impl SubmitPolicy {
+  /// The policy a submit of `work` carrying `approval` and `signature` brings its verdict, read on the work's shard.
+  pub(crate) fn of_work(
+    state: &ShardState,
+    work: DbVolumeId,
+    (approval, signature): (Approval, Option<Vec<u8>>),
+  ) -> SubmitPolicy {
+    SubmitPolicy {
+      work_mode: merge_mode_of(state, work),
+      approval,
+      work_signed: SignedRules {
+        signers: if signature.is_some() {
+          signers_of(state, work).to_vec()
+        } else {
+          Vec::new()
+        },
+        required: requires_signed_merges(state, work),
+      },
+      signature,
+    }
+  }
 }
 
 /// Submits a work volume's declared operations to its green as an increment (§4.16): compose the
@@ -7691,7 +7923,7 @@ fn submit(
   state: &mut ShardState,
   principal: &Principal,
   work: VolumeId,
-  evidence: Vec<[u8; 32]>,
+  (evidence, signature): (Vec<[u8; 32]>, Option<Vec<u8>>),
   approval: Approval,
 ) -> ReplyBody {
   let (work_id, green_id) =
@@ -7717,10 +7949,7 @@ fn submit(
       let Some(sealed) = take_sealed(state, work_id) else {
         return refused(Refusal::NotFound);
       };
-      let policy = SubmitPolicy {
-        work_mode: merge_mode_of(state, work_id),
-        approval,
-      };
+      let policy = SubmitPolicy::of_work(state, work_id, (approval, signature));
       let reply = judge_submission(state, &sealed, evidence, policy);
       put_back_sealed(state, sealed);
       reply
@@ -7770,11 +7999,7 @@ fn settle_submit(
   green_id: DbVolumeId,
   reply: ReplyBody,
 ) -> ReplyBody {
-  let ReplyBody::Submitted {
-    version: Some(version),
-    ..
-  } = reply
-  else {
+  let Some(version) = accepted_version(&reply) else {
     return reply;
   };
   // A retry's answer for a work already past that version has nothing left to settle. At that very version it resets
@@ -7829,8 +8054,21 @@ fn judge_submission(
     Ok(built) => built,
     Err(refusal) => return refused(refusal),
   };
-  if let Some(answer) = approval_answer(mode, policy.approval, to_wire_volume(sealed.work), &inc) {
+  // Signed work (A-321): the signature is judged over the merge's statement, once the increment it names is built. It
+  // permits nothing — the modes above did — and is recorded with the version as its provenance. An asked merge answers
+  // with the verdict, so the approver sees it and a signer learns the statement from a held submit, whatever the
+  // requirement; a volume that requires signed merges refuses one that did not verify when it would merge, here.
+  let signed = judge_signature(state, (sealed.work, green_id), &inc, &policy);
+  if let Some(answer) = approval_answer(
+    mode,
+    policy.approval,
+    (sealed.work, green_id, &inc),
+    &signed,
+  ) {
     return answer;
+  }
+  if let Some(refusal) = refused_unsigned(state, &signed) {
+    return refusal;
   }
   // The increment is recorded durably so a restart replays it (§4.8, §4.16). Guard-then-apply: the
   // chain must be able to hold it *before* the verdict commits, so an accepted increment is always
@@ -7911,7 +8149,7 @@ fn judge_submission(
         (green_id, sealed.work),
         version,
         (&increment_bytes, &inc),
-        applied.as_deref(),
+        (applied.as_deref(), &signed.verification),
       ) {
         return refused(refusal);
       }
@@ -7941,18 +8179,14 @@ fn judge_submission(
       if crate::merge_service::placed_version(state, object).is_none_or(|placed| placed < version) {
         crate::merge_service::defer_acceptance(state, green_id, version);
       }
-      ReplyBody::Submitted {
-        version: Some(version),
-        conflicts: Vec::new(),
-      }
+      // The version's own record answers (A-321): the signature recorded with it, which for an increment the engine
+      // had accepted before is that first submit's.
+      crate::merge_service::accepted_reply(state, green_id, version)
     }
     slates_merge::engine::Outcome::Conflict { windows } => {
       // The work is not reset: the bound secured for a reset is released.
       settle_after_conflict(state, green_id, &inc.id);
-      ReplyBody::Submitted {
-        version: None,
-        conflicts: merge_windows(&windows),
-      }
+      conflicted_reply(&windows, &signed)
     }
     // A base below the green's checkpoint (W3) is no live reader's, so it is unknown: never judged, and nothing
     // retained, so the bytes secured are credited back.
@@ -7972,14 +8206,18 @@ fn judge_submission(
 /// checkpoint, so without it the green stayed full for good. What is still full is refused `TableAtCapacity`.
 /// Appends accepted `version`'s entry to `green`'s durable chain, unless an idempotent accept already holds it (A-257): the
 /// increment as submitted and what its verdict resolved it to, with the completion key of the submit from `work` that made
-/// it (A-255, A-288). At a version whose record goes to holders the head's identity is read anyway, and goes beside it for
-/// a replay to compare; at `f = 0` the entries after the last checkpoint are checked by their digest alone.
+/// it (A-255, A-288) and how its signature was judged (A-321: the version's provenance). At a version whose record goes to
+/// holders the head's identity is read anyway, and goes beside it for a replay to compare; at `f = 0` the entries after
+/// the last checkpoint are checked by their digest alone.
 fn record_accepted(
   state: &mut ShardState,
   (green, work): (DbVolumeId, DbVolumeId),
   version: u64,
   (increment_bytes, increment): (&[u8], &slates_merge::engine::Increment),
-  applied: Option<&[slates_merge::chain_entry::Applied]>,
+  (applied, verification): (
+    Option<&[slates_merge::chain_entry::Applied]>,
+    &slates_ipc::protocol::Verification,
+  ),
 ) -> Result<(), Refusal> {
   if state.db.partition().green_head(green) >= version {
     return Ok(());
@@ -8001,14 +8239,23 @@ fn record_accepted(
       crate::merge_service::SubmitCompletion::of_current(state, work)
         .map(crate::merge_service::SubmitCompletion::to_entry),
       identity,
+      crate::signed_work::to_entry(verification),
     ),
   };
   let now = state.clock.monotonic_ns();
   state
     .db
     .mutate(&mut state.segment, &record, now)
-    .map(|_| ())
-    .map_err(|e| refusal_of_db(&e))
+    .map_err(|e| refusal_of_db(&e))?;
+  // The version's provenance (A-321), once its entry is durable: what the version's answers and its merge record read,
+  // and what a checkpoint keeps when it folds the entry.
+  if let (Some(signature), Some(engine)) = (
+    crate::signed_work::to_entry(verification),
+    state.greens.get_mut(&green),
+  ) {
+    engine.record_signature(version, signature);
+  }
+  Ok(())
 }
 
 fn chain_admits(
@@ -11016,6 +11263,7 @@ pub(crate) fn materialize_taken_over_green(
         live_holders: None,
         write: None,
         write_version: 0,
+        signers: Vec::new(),
       },
       base: BaseRecord::Scratch,
       head: DbSnapshotId::default(),
@@ -11100,6 +11348,8 @@ pub(crate) fn materialize_taken_over_green(
         &increment,
         &applied,
         completion.map(crate::merge_service::SubmitCompletion::to_entry),
+        None,
+        // The signature's verdict does not ride the merge record yet (A-321, GAPS): a successor records none.
         None,
       ),
     };
@@ -11400,6 +11650,7 @@ pub(crate) fn materialize_taken_over(
       live_holders: catalog.live_holders.clone(),
       write: None,
       write_version: 0,
+      signers: Vec::new(),
     },
     // Placed content is always whole in RAM (an overlay's base-backed bodies are never sealed), so the
     // successor serves it with no base beneath.
@@ -13065,6 +13316,10 @@ fn replay_chain_entry(
   let accepted = green.apply_recorded(&entry.increment, &entry.applied);
   if accepted != version {
     return Err(GreenFence::WrongVersion { version, accepted });
+  }
+  // The version's signature verdict, as its submit's was judged (A-321): provenance read back, never judged again.
+  if let Some(signature) = entry.signature {
+    green.record_signature(version, signature);
   }
   let identity = green.head_identity();
   let at_checkpoint = head_check.and_then(|(at, recorded)| (at == version).then_some(recorded));
@@ -14799,6 +15054,7 @@ mod tests {
         live_holders: None,
         write: None,
         write_version: 0,
+        signers: Vec::new(),
       },
       base: BaseRecord::Scratch,
       head: SnapshotId::default(),

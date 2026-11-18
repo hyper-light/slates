@@ -7571,12 +7571,15 @@ it builds against the contract and adds to it rather than around it.
   file, its window in base coordinates and its class (§4.16's `MergeConflictClass`), with the
   green's head the work must rebase onto. Nothing is inferred and nothing is written for a conflict;
   the consumer resolves (`read_base`, a rewrite, `rewitness`; a rebase) and lands or merges again.
-- *Signed work (Ada, 2026-11-18).* A merge or a landing may carry a signature by its author's key
-  (an SSH signature, `PROTOCOL.sshsig`, the format of A-285's verifier: Ed25519 and FIDO Ed25519
-  keys), and its outcome carries how the daemon judged it: `Verified { signer }`, `Unsigned`, or
-  `Invalid { reason }`, the verifier's closed reasons. A volume's policy may require signed merges;
-  an unsigned or invalid merge into it is refused `SignatureRequired` even in bypass. Signatures
-  never gate permission: the mode does.
+- *Signed work (Ada, 2026-11-18; A-321).* A merge or a landing may carry a signature by its author's
+  key (an SSH signature, `PROTOCOL.sshsig`, under the namespace `slates-work`: Ed25519 and FIDO
+  Ed25519 keys) over the act's statement, which the daemon states (`Instance::merge_statement`), and
+  its outcome carries how the daemon judged it: `Verified { signer }`, `Unsigned`, or
+  `Invalid { reason }`, the verifier's closed reasons, under the volume's trusted signers, which the
+  launcher sets (`Instance::set_signers`). The verdict is recorded with the version and read back
+  (`Instance::merge_record`). A volume's policy may require signed merges; an unsigned or invalid
+  merge into it is refused `SignatureRequired` even in bypass, when it would merge. Signatures never
+  gate permission: the mode does. Merges are signed work now; a landing's signature is owed (A-321).
 - *Volumes.* One typed create, `Instance::provision(&VolumeSpec)`, for every source: an overlay
   over a host folder, an empty volume, a clone of a snapshot, a green (empty or over a complete
   immutable snapshot), a work volume over a green, which answers its green and its base version.
@@ -7676,6 +7679,17 @@ it builds against the contract and adds to it rather than around it.
 > that ends a daemon on purpose waits for it first.
 > **`CONTRACT` = 12 (A-316):** `ShardsStream::resync`, the device's end of a Shards stream's resync channel, which
 > `serve_shards` hands beside the stream's where the daemon makes one (Linux); none elsewhere and from the simulator.
+> **`CONTRACT` = 13 (A-321, signed merges):** `merge` sends its signature and answers how the daemon
+> judged it; `merge_statement` hands a signer the statement the daemon states; `approve_merge` carries
+> the merge's signature again (`MergeApproval::signature`); `merge_record` reads a version's verdict
+> back (`MergeRecord`, `Missing::Version`); `set_signers` and `signers` (`TrustedSigner`) under the
+> launcher's authority; a volume's policy may require signed merges (refused as
+> `PolicyReason::SignatureRequired`), a consumer's that does `Invalid::SignedMergesNotAVolume`;
+> `SignatureFault::Expired` gone, since no statement expires. A signed landing is still
+> `Unsupported(SignedWork)`, its verdict owed. Proven by use
+> (`a_signed_merge_is_judged_and_read_back_through_the_contract`: a requiring green refuses an
+> unsigned merge, the statement signed by the trusted key merges at 1 verified, its record reads back
+> verified and the origin's unsigned).
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -9114,7 +9128,9 @@ anchor segment; in a fleet a record sent to green's 2f+1 candidate holders under
 epoch, committed at f+1 acknowledgements, refused by any holder that has seen a higher epoch for
 that host, and issued only when every identity the version references is placed. The reply is `Accepted{version}` or `Conflict{windows}`. An
 increment id already in `seen` returns its original result (the completion record holds the
-reply); retries are always safe.
+reply); retries are always safe. A signed submit's verdict rides the version's chain entry and the green's accepted
+record, a checkpoint keeping it once it folds the entry (A-321): the version's provenance, read back by `MergeRecord`
+and answering every later reply that names the version.
 
 **Apply on holders (fleet).** Every holder of green's version N+1 recomputes the verdict and the
 manifest identity from the record's inputs before serving the version to any attachment, and
@@ -9135,7 +9151,12 @@ shard a cross-shard message, another host the wire, routed by the green's id to 
 owner with the piggyback rule (a refusal from a non-owner names the current owner and epoch;
 placement refresh is single-flight per green). The caller parks and resumes with the verdict. A work volume with
 `stream = true` submits at every auto-seal; an agent that wants a review boundary submits
-explicitly. A green with `require_evidence` refuses increments without evidence references.
+explicitly. A green with `require_evidence` refuses increments without evidence references. A submit may be signed
+work (A-321): it carries an SSH signature over the merge's statement (the work, its green, its base and the increment's
+identity, which a held submit hands the signer), judged on the green's owner under the work's and the green's trusted
+signers once the increment is built, recorded with the version and answered; a work or a green whose policy requires
+signed merges refuses one that did not verify when it would merge (`SignatureRequired`). A signature never permits a
+merge: the write modes do (A-285).
 
 **Edit and submit in one request (A-225).** `edit_and_submit(work_volume, path, at, delete_len, bytes, evidence?)` is
 `edit` and then `submit`, in one request: the work's owner applies the edit exactly as `edit` does and, when the edit
@@ -9178,7 +9199,8 @@ unavailable: Refused (`ContentUnavailable`), retryable. Increment above the deri
 Refused (`IncrementTooLarge{limit}`); the SDK splits by path. Evidence required and absent:
 Refused (`EvidenceRequired`).
 
-**Refusals.** The merge entries of §4.4's taxonomy plus `StaleEpoch` and `ContentUnavailable`.
+**Refusals.** The merge entries of §4.4's taxonomy plus `StaleEpoch`, `ContentUnavailable` and, for a volume that
+requires signed merges, `SignatureRequired` (A-321).
 
 **Derived constants.**
 
@@ -22583,8 +22605,10 @@ channel before anything else, whatever its proof (`landing::grant_verb`, counter
 setting and a merge's approval already were, so an agent never approves its own landing
 (`docs/bugs/2026-11-18-an-agents-own-channel-could-approve-its-own-landing.md`). Built the same day, its siblings:
 `Enroll` and `Revoke` refuse `Forbidden` on a consumer-bound channel before the proof (`enroll_by_consumer`,
-`revoke_by_consumer`), so no launcher-class verb answers an agent's own channel (GAPS). Owed: signed work. The
-SSH-signature verifier built first (below) stays, for signed work.
+`revoke_by_consumer`), so no launcher-class verb answers an agent's own channel (GAPS); `SetSigners` refuses it
+alike (A-321). Signed merges built 2026-11-17 (A-321): the statement, the verdict recorded with the version, the
+trusted signers and a volume's requirement; owed, a landing's signature (A-321's next piece). The SSH-signature
+verifier built first (below) is signed work's, its grant statement removed.
 - **The rule (Ada, 2026-11-18).** Merging and landing to disk follow the permission mode the user gave the harness or
   agent that asks. Bypass (Claude Code's `bypassPermissions`, Codex's full access): slates merges and writes, no
   prompt. Ask: slates answers a typed approval request (the change's summary and manifest) that the harness presents
@@ -22596,7 +22620,7 @@ SSH-signature verifier built first (below) stays, for signed work.
 - **Signed work (Ada: "we can (and should) support signed work").** A merge or a landing may carry an SSH signature
   (OpenSSH `PROTOCOL.sshsig`); slates verifies it, records it as provenance and answers a typed check (verified with
   its signer, unsigned, or invalid with its reason), and a volume can require signed merges. It never decides whether
-  a write is permitted.
+  a write is permitted. Built for merges by A-321 (its statement, its trusted signers, its record).
 - **Withdrawn.** The same morning A-285 read R10 as a human-only proof: fs-server's options of 2026-11-05 (A, a prompt
   on the anchor's terminal; B, a same-user socket; C, a separate operator account; D, a signature by a key only the
   human holds; E, standing grants in a file the human writes), of which Ada first chose D with A as the fallback. Ada
@@ -24419,6 +24443,109 @@ Applied in the same change to:
 - **Owed** (GAPS): macOS (the channel's hand-off on the socket route, and the write log, which a resync there needs so
   no write acknowledged after the last barrier is lost); the anchor holding a stream's DAX objects; Windows on Shards'
   handle path; and Shards' device half (ROOT, after its v0.8.0 tag).
+
+### A-321 — Signed work: a merge may carry an SSH signature over its statement, judged under the volume's trusted signers, recorded with the version as its provenance and answered typed; a volume can require signed merges; a signature never permits a write (2026-11-17, goal g090 "Signed work", Ada's rule of 2026-11-18)
+Applied in the same change to: §4.16 ("Submission", "Commit", "Refusals"), §4.12 ("The consumer contract": its
+signed-work bullet and status, `CONTRACT` 13), A-285's status, GAPS (the A-285 and A-299 entries, and a head entry of
+its own), `docs/library.md`, and:
+- `crates/server/src/signed_work.rs` (was `grant_signature.rs`): the statements (`merge_statement`,
+  `landing_statement`), the verifier under the namespace `slates-work` (`verify`, `judge`), trusted keys
+  (`TrustedKey`: kind, fingerprint, wire form), the verdict as a chain entry records it (`to_entry`, `of_entry`), its
+  counters; A-285's withdrawn grant statement, nonce and expiry removed. Golden vectors re-made with `ssh-keygen -Y sign`
+  over both statements (OpenSSH 10.2p1, 2026-11-17), each checked with `ssh-keygen -Y verify`.
+- `crates/ipc/src/protocol.rs`: `WritePolicy::require_signed_merges`; `SignerKey`, `Signer`, `SignatureFault`,
+  `Verification`; `SubmitSigned`, `SetSigners`, `MergeRecord` requests; `SubmitHeld` and `SubmitApproved` carry a
+  signature; `SubmittedSigned`, `SignersSet`, `MergeRecord` replies; `MergeApprovalRequired` carries the statement and
+  the verdict; `Policy` carries the signers; `Refusal::SignatureRequired`.
+- `crates/db`: `PolicyRecord::signers`, `WritePolicy::require_signed_merges`, `Op::VolumeSignersSet` (moves the policy
+  version, as a policy setting does).
+- `crates/merge`: the chain entry's version 4 (the verdict, `chain_entry::Signature`), the checkpoint's version 3 (the
+  signed versions' verdicts beside the accepted identities), `Green::record_signature` and `Green::signature`.
+- `crates/server`: `verbs.rs` (`judge_signature`, `refused_unsigned`, `SignedRules`, `SubmitPolicy` carries the
+  signature and the work's rules, `record_accepted` records the verdict, replay records it, `accepted_version`),
+  `work_home.rs` (the signature and the work's rules travel with the ask, A-247), `merge_service.rs`
+  (`recorded_verification`, `accepted_reply`, `merge_record_verb`), `landing.rs` (`signers_proof`, `set_signers_verb`,
+  the policy's requirement and its signers on the wire), the consumer gate (a signed submit held as an unsigned one is),
+  a consumer's policy refused the requirement.
+- `crates/client`: `submit_with_signature`, `merge_statement`, `submit_approved_signed`, `set_signers`, `signers`,
+  `merge_record`.
+- `crates/api`: `Instance::merge` sends its signature, `merge_statement`, `approve_merge` carries it again,
+  `merge_record`, `set_signers`, `signers`; `TrustedSigner`, `MergeStatement`, `MergeRecord`,
+  `MergeApproval::signature`, `Missing::Version`, `Invalid::SignedMergesNotAVolume`; `SignatureFault::Expired` gone;
+  `CONTRACT` 13.
+- Tests: `crates/server/tests/signed_work.rs` (new, below), `crates/merge/tests/{chain_replay,checkpoint}.rs`, the
+  verifier's unit tests, `crates/api/tests/api.rs` (`a_signed_merge_is_judged_and_read_back_through_the_contract`).
+
+- **Why.** Ada (2026-11-18): "we can (and should) support signed work (signed merges, etc.)", with the rule of the same
+  day that write permission follows the mode the user gave the agent, never a key or a person-only proof (A-285). So a
+  signature is provenance: who made the work. It is verified, recorded and answered; the one rule it feeds is a volume's
+  own requirement that what merges into it (or from it) be signed, a property of the volume the launcher sets as it sets
+  the write policy.
+- **What is signed: the statement.** Plain text, one field a line, so `ssh-keygen -Y sign -n slates-work -f KEY FILE`
+  signs it as a file and a person reads what they sign. A merge's: `slates merge v1`, the work, its green, the base
+  version and the increment's identity (`blake3` of the work, its base, its ops document and its post-state, §4.16), so
+  the signature binds every byte merged and verifies for that increment alone. A landing's (defined now, verified in the
+  next piece): `slates landing v1`, the volume, the target as the request names it with its length in bytes before it
+  (no path can forge a later line), and the manifest hash. The SSH namespace `slates-work` separates slates work from
+  every other signature (a git commit signs under `git`); the first line separates a merge from a landing. A statement
+  names one act exactly, so it carries no expiry: once the work changes, its signature no longer verifies.
+- **How a signer gets the statement.** From a held submit (`SubmitHeld`, the client's `merge_statement`): the
+  increment is built and nothing is merged, whatever the modes short of forbidding the merge, and the answer
+  (`MergeApprovalRequired`) carries the identity and the statement. The daemon states it, so the format lives in one
+  place.
+- **Trusted signers.** A volume's signers are public keys (`ssh-ed25519`, or FIDO `sk-ssh-ed25519@openssh.com`, whose
+  signature must carry the holder's touch) the launcher sets with `SetSigners`: the whole set, so a key is removed by
+  setting the set without it, proven by the launcher's secret over the volume, the keys and the policy version it
+  replaces (a captured proof sets nothing once the policy moved), refused `Forbidden` on an agent's own channel whatever
+  its proof. A merge verifies under its work's and its green's signers together. A valid signature by any other key is
+  `Invalid { UnregisteredKey }`.
+- **The verdict.** `Verified { signer }` (the key's type and its SHA-256 fingerprint, `ssh-keygen -l -E sha256`'s),
+  `Unsigned`, or `Invalid { reason }` (malformed, another namespace, an unsupported key or hash, an unregistered key, a
+  signature that does not verify, a security key not touched). Judged on the green's owner once the increment is built,
+  where the green's record is; the work's signers and requirement travel with a submit from a work on another shard
+  (A-247), as its merge mode does (A-307).
+- **Recorded, durably, as provenance.** An accepted version's chain entry carries its verdict (format version 4); the
+  green's accepted record keeps it (`Green::record_signature`) as it keeps the version's increment identity, and a
+  checkpoint that folds the entry keeps it too (format version 3). So the verdict is recorded once, at the merge, and
+  read back unchanged after a restart or a fold, under whatever signers are trusted by then: provenance is how the
+  merge was judged when it merged. It is bounded as the accepted record is, one entry at most per committed version. A
+  consumer reads it back with `MergeRecord { green, version }`. An accepted submit is answered from the version's record
+  (`SubmittedSigned` when the version records a verdict), so a submit's first answer, its deferred one at `f > 0` and a
+  resend's after a restart agree; a conflict records nothing and answers the submit's own verdict.
+- **A volume can require signed merges.** `WritePolicy::require_signed_merges` on a green holds every merge into it to
+  a verified signature, on a work every merge from it; either requiring decides. It is met when the merge would happen:
+  a bypass merge at once, an asked merge at its approval (`SubmitApproved` carries the signature again), refused
+  `SignatureRequired { by, verification }` with nothing merged. An asked merge answers with its verdict first, so the
+  approver sees it and a signer gets the statement whatever the requirement. A consumer's policy cannot set it (refused
+  `BadRequest`, and `Invalid::SignedMergesNotAVolume` in the contract before anything is sent): it is a volume's rule,
+  judged where the verdict runs, which holds both volumes' records and no session's; a launcher holds an agent to it by
+  setting it on the agent's work.
+- **Never a permission.** A signature changes nothing a mode decides: a forbidden merge is refused signed or not, an
+  asked one waits for its approval signed or not, a bypass one merges with a signature that did not verify (recorded
+  invalid) unless a volume requires signed merges.
+- **Rejected.** Keeping the verdict only in the chain entry: a checkpoint folds a version's entry as soon as no live
+  work is based below it, which with one work is the merge's own answer, so the first run read version 1 back
+  `NotFound` (`a_signed_merge_is_judged_recorded_and_read_back`); it is kept with the accepted record instead. Keeping
+  the signature's bytes beside the verdict: the verdict is what slates judged under the signers trusted at the merge,
+  and a later re-verification would judge under another set. A requirement checked before the approval request: a
+  signer could not get the statement from a volume that requires signatures, so the requirement is met at the merge. A
+  separate statement verb: a held submit already builds the increment and merges nothing, on every route.
+- **Proven** by `crates/server/tests/signed_work.rs` (8 tests, macOS arm64, Mac Studio, 2026-11-17): a signed merge
+  verified, a stranger's `UnregisteredKey`, a stale statement's `BadSignature`, an unsigned one, each merged and read
+  back, with the checkpoint counter and the verifier's counters as non-vacuity; a requiring green refusing an unsigned,
+  a stranger's and a `git`-namespace signature with nothing merged and a work's own requirement naming the work; an
+  asked signed merge held with its verdict, its unsigned approval refused and its signed one merged; the launcher's
+  signer set refused for a forged proof, a stale version and a non-key, kept once each in order, and a consumer's
+  requirement refused; an agent's channel refused the signers (Unix); eight works over four shards, signed and judged
+  on the green's owner; the verdicts read back after a restart from the replayed chain entries and after a second from
+  the checkpoint that folded them; a forbidden merge giving no statement. Each red with its guard removed (the
+  requirement, the work's rules travelling, the replay's record, the checkpoint's table, the green's signers, the
+  consumer refusal), the restored build green. The verifier's 11 unit tests over the new `ssh-keygen` vectors, the
+  chain and checkpoint codecs' tests, and the contract's `a_signed_merge_is_judged_and_read_back_through_the_contract`.
+- **Owed** (GAPS): a landing's signature (the statement is defined; the verdict on `Land` and `Present`, recorded with
+  the landing's record and read back in the audit, and the contract's `land` with a signature); the verdict carried by
+  a version's merge record to holders and a takeover successor (a successor records none today); a real FIDO key's
+  signature end to end.
 
 ### A-331 — A node the council configuration it holds does not name keeps direct contact with every member it holds alive, until it holds one that names it (2026-11-18, goal g225: a forming fleet reaches every candidate at start)
 Applied in the same change to: §4.8 "Consensus lifetime" (the learner paragraph), GAPS (the entry for this stall),
