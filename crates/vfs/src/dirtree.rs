@@ -748,6 +748,18 @@ impl Tree {
     }
   }
 
+  /// Stamps every block of the tree born at `born` (A-395): what a recovered directory the head shares with a snapshot
+  /// takes, so the head copies a block before it changes one, as the live volume's copy-on-write did, and never writes
+  /// a block the snapshot reads. Its blocks were all just built, so none is shared with anything yet.
+  pub fn restamp(&self, blocks: &mut BlockStore, born: Epoch) -> Result<(), VfsError> {
+    let mut all = Vec::new();
+    self.blocks(blocks, &mut all);
+    for (block, _) in all {
+      edit(blocks, block)?.set_born(born);
+    }
+    Ok(())
+  }
+
   /// Every block of the tree with its size and the size of the class that fits its live bytes, for the oracles
   /// (A-203).
   pub fn block_sizes(&self, blocks: &BlockStore) -> Vec<(BlockRef, usize, usize)> {

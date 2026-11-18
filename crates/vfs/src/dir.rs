@@ -744,6 +744,17 @@ impl DirNode {
       t.blocks_since(blocks, since, out);
     }
   }
+
+  /// Stamps this node and every block of its entries born at `born` (A-395): a recovered directory the head shares
+  /// with a snapshot takes its directory inode's own birth epoch, so the head copies it (and a block of it) before
+  /// changing it, as live copy-on-write did, and a retired copy goes to the deadlist of the snapshot that holds it.
+  pub fn restamp(&mut self, blocks: &mut BlockStore, born: Epoch) -> Result<(), VfsError> {
+    self.born = born;
+    if let DirEntries::Indexed(t) = &self.entries {
+      t.restamp(blocks, born)?;
+    }
+    Ok(())
+  }
 }
 
 #[cfg(test)]

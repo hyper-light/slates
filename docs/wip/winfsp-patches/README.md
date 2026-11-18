@@ -53,6 +53,10 @@ slates at `28ad74fcd` (diagnostics run 44350120133's release build); main's is `
   skips loudly and passes; `git clone --local` on the drive dies, `fatal: failed to create link
   'G:\dst/.git/objects/4d/4bc1…': Function not implemented` (exit 128). Then this driver again (a reboot).
 
+**Open beside the proof** (2026-11-18): a delete of one name racing the purge that a write through the other name
+owes it (A-190) can hang the deleter in its cleanup; seen in every run of that race on the VM (GAPS, "A delete
+racing a coherent purge can hang its caller"). Whether WinFsp as released reaches it is not yet known.
+
 ## Seen beside them, not changed, for the owner to judge
 
 - `FileHardLinkInformation` (the query that lists a file's names, `fsutil hardlink list`) still answers
