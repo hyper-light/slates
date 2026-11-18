@@ -3812,26 +3812,58 @@ fn take_batch(
 /// over a session a partition had left at an initial window and a 100–240 ms smoothed RTT: each was cut off, its link
 /// dropped and dialed afresh, at an initial window again, and the whole volume sent again, 1,391 times (2.06 GB) while
 /// both candidates already held the owner's head, and no write became durable (2026-11-06, `live_chaos.rs`).
+///
+/// The reply's part is the holder session's own persistent-congestion duration (A-444; RFC 9002 §7.6.1, three of its
+/// probe timeouts from the session plane's estimator, floored at the initial one): the session plane's judgment of a gone
+/// path, so a holder whose path is slower than a liveness window is still answered, and a silent one is given up within
+/// it, as `fleet::return_sessions` drops its session. Until A-444 the reply's part was one liveness window.
 fn exchange_budget(
   bytes: usize,
   sessions: &[(HostId, slates_transport::endpoint::Endpoint)],
 ) -> slates_cluster::CommitBudget {
-  let live = crate::fleet::live_budget();
-  let transfer_ns = sessions.first().map_or(0, |(_, endpoint)| {
-    // Before any sample the smoothed RTT reads zero; the probe timeout, twice the initial RTT then, stands in.
-    let round_trip = match endpoint.smoothed_rtt() {
-      0 => endpoint.pto(),
-      measured => measured,
-    };
-    u64::try_from(bytes)
-      .unwrap_or(u64::MAX)
-      .saturating_mul(round_trip)
-      .checked_div(endpoint.congestion_window().max(1))
-      .unwrap_or(0)
-  });
+  match sessions.first() {
+    Some((_, endpoint)) => exchange_budget_for(
+      bytes,
+      HolderPath {
+        persistent_congestion_ns: endpoint.persistent_congestion_duration(),
+        smoothed_rtt_ns: endpoint.smoothed_rtt(),
+        pto_ns: endpoint.pto(),
+        congestion_window: endpoint.congestion_window(),
+      },
+    ),
+    None => crate::fleet::live_budget(),
+  }
+}
+
+/// What the session plane measured of one holder's path, for its exchange's budget ([`exchange_budget_for`]).
+#[derive(Clone, Copy, Debug)]
+struct HolderPath {
+  /// The session's persistent-congestion duration (RFC 9002 §7.6.1).
+  persistent_congestion_ns: u64,
+  /// Its smoothed round trip; zero before any sample.
+  smoothed_rtt_ns: u64,
+  /// Its probe timeout (§6.2.1).
+  pto_ns: u64,
+  /// Its congestion window, bytes.
+  congestion_window: u64,
+}
+
+/// [`exchange_budget`] over a holder's measured path: the session's persistent-congestion duration plus `bytes`' transfer
+/// at the window-limited rate.
+fn exchange_budget_for(bytes: usize, path: HolderPath) -> slates_cluster::CommitBudget {
+  // Before any sample the smoothed RTT reads zero; the probe timeout, twice the initial RTT then, stands in.
+  let round_trip = match path.smoothed_rtt_ns {
+    0 => path.pto_ns,
+    measured => measured,
+  };
+  let transfer_ns = u64::try_from(bytes)
+    .unwrap_or(u64::MAX)
+    .saturating_mul(round_trip)
+    .checked_div(path.congestion_window.max(1))
+    .unwrap_or(0);
   slates_cluster::CommitBudget::hard(
-    live.deadline_ns.saturating_add(transfer_ns),
-    live.poll_interval_ns,
+    path.persistent_congestion_ns.saturating_add(transfer_ns),
+    crate::fleet::live_budget().poll_interval_ns,
   )
 }
 
@@ -7520,5 +7552,41 @@ mod tests {
         "a body of {len} bytes opens as it was sealed"
       );
     }
+  }
+
+  /// R3's class B (B-d, A-444; RFC 9002 §6.2, §7.6.1). Do: measure one holder's path with replies a liveness window and a
+  /// half apart and another's with quick ones, as the session plane's estimator does, and derive the budget a small live
+  /// exchange to each runs under. Expect: the slow holder's past its round trip, so its reply is heard where one liveness
+  /// window gave it up and dropped its link; the quick holder's its session's persistent-congestion duration and no more
+  /// than a window past it, so a silent holder is still given up within its session's own duration.
+  #[test]
+  fn a_live_exchange_waits_its_holder_path_and_a_silent_one_ends_within_its_floor() {
+    let window = crate::daemon::LIVENESS_BUDGET_NS;
+    let path = |sample_ns: u64| {
+      let mut rtt = slates_transport::rtt::RttEstimator::new();
+      for _ in 0..8 {
+        rtt.on_sample(sample_ns, 0);
+      }
+      super::HolderPath {
+        persistent_congestion_ns: rtt.persistent_congestion_duration_floored(0),
+        smoothed_rtt_ns: rtt.smoothed_rtt(),
+        pto_ns: rtt.pto(0),
+        congestion_window: 1 << 20,
+      }
+    };
+    let slow = super::exchange_budget_for(64, path(window + window / 2));
+    assert!(
+      slow.deadline_ns > window + window / 2,
+      "a holder whose replies take a window and a half is heard: {} ns",
+      slow.deadline_ns
+    );
+    let quick_path = path(1_000_000);
+    let quick = super::exchange_budget_for(64, quick_path);
+    assert!(
+      quick.deadline_ns >= quick_path.persistent_congestion_ns
+        && quick.deadline_ns < quick_path.persistent_congestion_ns + window,
+      "a silent holder is given up within its session's own duration: {} ns",
+      quick.deadline_ns
+    );
   }
 }

@@ -3715,7 +3715,11 @@
 >   group's leader (A-439: one liveness window; now the stall every forward over a leader session takes, the window and
 >   the path's measured round-trip tail, `verbs::forward_stall_ns`), every callback on an NFSv4.1 back channel (A-442:
 >   one liveness window; now the carrying connection's learned round trip, RFC 6298 with Karn's rule, backed off after a
->   timeout up to the NFSv4 lease, `callback::bound_ns`, sharing A-431's learner, `learned_wait`) and the forward
+>   timeout up to the NFSv4 lease, `callback::bound_ns`, sharing A-431's learner, `learned_wait`), a live exchange to a
+>   holder (A-444: one liveness window, hard; now its session's persistent-congestion duration, RFC 9002 §7.6.1 from the
+>   session plane's estimator, plus the transfer, and that duration's floor where no session is at hand,
+>   `live_ship::exchange_budget`, `fleet::live_budget`; `return_sessions`' silence floor the session's own probe timeout)
+>   and the forward
 >   lane's stall (2026-11-18, A-315,
 >   goal g255): a batch
 >   quiet for its budget is given up only once a turn of its lane begun after the silence was seen has read the

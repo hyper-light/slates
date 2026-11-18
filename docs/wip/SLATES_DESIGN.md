@@ -30812,3 +30812,26 @@ Applied in the same change to: §4.6, the Shards form's resync and death bullets
 
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class B), `crates/server/src/{learned_wait,told,
 callback,nfs,delegation,lib}.rs`.
+
+### A-444 — A live exchange to a holder waits its session's persistent-congestion duration, the session plane's own judgment of a gone path; the live budget is that duration's floor (2026-11-18, built for goal g255; R3's class B, item B-d; RFC 9002 §6.2, §7.6.1; A-200, A-292)
+- **What was there.** A live-shipped exchange (A-200) ran under a hard deadline of one liveness window (`fleet::
+  live_budget`), the reply's part of a holder's exchange too (`live_ship::exchange_budget`: the window plus the transfer),
+  past which the holder was taken for not live and its link dropped and dialed afresh. A returned record session was
+  judged dead when silent past the longer of a liveness window and its persistent-congestion duration
+  (`fleet::return_sessions`). The duration, three probe timeouts each floored at the initial one, is at least 2 s, so
+  the window there never decided; and in the live exchange the window, under that floor, gave up holders whose sessions
+  the transport still counted live, its slow-path replies too.
+- **The rule.** One judgment of a gone holder path, the session plane's own: RFC 9002 §7.6.1's persistent-congestion
+  duration, three probe timeouts (`smoothed_rtt + max(4·rttvar, kGranularity) + max_ack_delay`, §6.2.1) from the
+  session's own estimator, each floored at the initial one (§6.2.2). A holder's live exchange waits it plus its bytes'
+  transfer (`exchange_budget_for`), so a holder slower than a window is heard and a silent one ends within it. Where no
+  holder's session is at hand (the generic `live_budget`: a lineage request, a work's route, the walks and the dispatch
+  bounded by it), the duration's floor, the initial probe timeout's three, below which no path is ever judged gone. A
+  returned session is dropped when silent past its duration, floored at its own probe timeout where a window stood (no
+  change in what decides).
+- **Test.** `a_live_exchange_waits_its_holder_path_and_a_silent_one_ends_within_its_floor` (`crate::live_ship`: a path
+  measured at a window and a half a round trip gets a budget past it; a quick path's budget is its session's duration
+  and no more than a window past it).
+  EVIDENCE_PLACEHOLDER
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class B), `crates/server/src/{fleet,live_ship}.rs`.
