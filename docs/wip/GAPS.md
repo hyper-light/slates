@@ -1111,7 +1111,7 @@
 >   `a_populated_region_no_slower_than_the_untouched_one_is_unmeasured` (ef529d8a). Record:
 >   `docs/bugs/2026-11-11-the-fault-probe-reported-a-zero-fault-on-a-loaded-machine.md`.
 
-> **The Windows wake estimate (A-223, found 2026-11-05 on jupiter, fixed 2026-11-06; the idle window's rule decided 2026-11-11, extended for closed loops 2026-11-18 by A-326, on main 2026-11-18 with the merge of liveness's branch; Windows' own window closed 2026-11-18 by A-361).**
+> **The Windows wake estimate (A-223, found 2026-11-05 on jupiter, fixed 2026-11-06; the idle window's rule decided 2026-11-11, extended for closed loops 2026-11-18 by A-326, on main 2026-11-18 with the merge of liveness's branch; Windows' own window closed 2026-11-18 by A-361; macOS' hold removed 2026-11-18 by A-387).**
 > The boot probe let a Windows waiter's announcement stand in for its sleep, and the shards' online estimate learned
 > kicks that met a thread not yet blocked. Both measured a handoff, 0.14–0.85 µs, so the idle window (100 times it) was
 > 14–80 µs and owner shards parked between a single client's creates. Now the probe kicks only once the waiter's cycle
@@ -1161,6 +1161,22 @@
 >     made for a request read within F of its shard's last client I/O holds its owner open for the loop's return at R9's
 >     percentile, 2F × the least k with ((S − 1)/S)^k ≤ 1/100, never more cycles than the loop had run (§4.7, A-326;
 >     `crates/server/tests/closed_loop.rs`). A paced client's requests hold nothing.
+>   - **Fixed (A-387, 2026-11-18, goal g234): A-326's hold made a macOS single client slower at many shards.** The
+>     measurer's quiet-gated Studio A/B (32 CPUs, 23 shards) found the spinning single client's p50 doubled once A-223's
+>     rule and A-326 landed (48.5–86.9 to 97.6–105.8 µs) and its p99 up (200.3–251.3 to 262.1–298.1 µs). A held macOS
+>     shard does not poll: its zero-timeout `kevent` sleeps 12–15 µs a turn with an involuntary switch (A-218). On a quiet
+>     M4 Max at nine shards, with the hold set to none, the median create was 41.3–43.3 against 51.4–60.0 µs at an equal
+>     p99 (92.3 and 92.0 µs at the median), the process's CPU 1.65 against 2.9 cores, and beside two spinners a logical
+>     CPU the p99 1.34 against 1.87 ms; the quiet nine-shard p999 was 128.6 against 108.6 µs at the median, the spreads
+>     overlapping (BENCHMARKS, "The closed-loop hold on macOS"). Now macOS holds none (`config::closed_loop_hold`); Linux
+>     and Windows keep the hold. On the 32-CPU Studio at 23 shards every unheld run beat every held one (p50 44.7–64.5
+>     against 94.4–115.2 µs, p99 147.6–249.3 against 256.0–376.0 µs, 1.9–2.2 against 3.4–5.8 cores). Record:
+>     `docs/bugs/2026-11-18-a-held-macos-shard-napped-instead-of-polling.md`.
+>   - **Open: a macOS single client over many shards still misses R9's 50 µs** (2026-11-18, after A-387): p99 84.6–152.5
+>     µs at nine shards on the quiet M4 Max and 147.6–249.3 µs at 23 on the shared 32-CPU Studio, unheld. Not yet
+>     measured apart: the client's own shard napping 12–15 µs a turn through R9's window (A-218 kept it for its loaded
+>     tails), an owner's park and kick (3.1–7.2 µs wakes here), and a cold first run (every p99 above 100 µs at nine
+>     shards was a first run's).
 >   - **Owed: the supervisor's measurement of A-223, its window rule and A-326 on main** (`provision_bench`, every N,
 >     quiet and two spinners a logical CPU): on ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest and
 >     windows-11-arm at 2 shards and the derived count, plus `PROVISION_BENCH_SHARDS=3` on Linux and a many-core Linux
