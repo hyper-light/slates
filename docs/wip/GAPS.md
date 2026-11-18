@@ -1,5 +1,48 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A reply carried home past a full channel was dropped: fixed (goal 238, 2026-11-18, A-296, from perf's branch of
+> 2026-11-09; §4.3, CLAUDE.md §2 items 8 and 9).** `xshard::send_back` waited one coordinator period for room and then
+> dropped the result (`xshard.reply_dropped`); `xshard::hand_reply_home` (fuse, image, landing, lease_wait, live_ship,
+> the merge plane's deferred acceptances, winfsp) handed a reply over once and counted it undelivered on a full
+> channel; and a task refused at admission answered its client once (`AnswerUnstarted`). Each lost what it carried:
+> 4,074 to 4,518 a run of the 3,000-client rung on main 80be552a. A diagnostic build of main db9c514e (2026-11-09)
+> counted every one an acknowledgement scatter's part (4,364 of 4,364 and 4,418 of 4,418 in two runs), not a verb's
+> reply, so no client waited out a reply deadline there. A lost part's release had run on its shard; what the loss
+> left was the acknowledgement's entry on the client's shard (`ShardState::ack_scatters`), which nothing else
+> removes, so the table crept toward `ack_scatter_bound`, past which an acknowledgement's releases are not sent at all
+> (`ack.release_refused`). (Until 2026-11-18 this entry said each loss refused clients `AcknowledgementOwed`, about
+> 27,000 times a run; that does not follow, since that bound reads the completions retained, which the part had
+> released.) Since A-232 a client waits for a reply while its daemon lives, so a lost verb reply would be a call that
+> never ends.
+>
+> Now each shard has a carrier (`xshard::carrier`, spawned first by the shard's start): a message that meets a full
+> channel, or finds messages for the same shard kept, is kept in order behind them, for as long as the shard it goes to
+> lives; only a shard gone (its daemon stopping) leaves one undelivered. The carrier asks that shard to tell it when its
+> channel next has room (A-279's wake), tries once more, and waits with no timer until the drain that makes the room
+> wakes it; its first form, and perf's branch, tried again every tenth of a coordinator period. The sender holds
+> nothing meanwhile, and nothing is spawned. That matters twice. perf's branch waited in a task per reply, which a
+> full arena refused. And a task refused at admission drops inside the runtime's admission, where no task can be
+> spawned at all; a wake there still marks the carrier ready. Both fail first in `crates/server/src/xshard.rs`
+> (`a_reply_handed_home_while_this_shards_arena_is_full_waits_for_room`,
+> `a_task_refused_at_admission_answers_its_client_through_a_full_channel`), and
+> `a_forwarded_answer_waits_for_room_on_its_clients_shard_rather_than_being_dropped` (`crates/server/tests/reply_room.rs`)
+> failed with `send_back`'s wait bounded to a period again (perf, 2026-11-12). What bounds it (item 8): every kept message answers a request in flight or is awaited by a task, so a shard
+> keeps at most `DaemonConfig::kept_bound` (`2 × clients_per_shard × slots × shards` plus the task arenas, in the boot
+> log); past it a message is refused to its sender and counted (`xshard.keep_refused`), which
+> `the_carrier_keeps_its_bound_in_order_and_refuses_one_past_it` holds on a daemon's derived bound, with the order of
+> what was kept; its stand-in for the client's shard tells the waiting shards after each message it takes, as a drain
+> does (`Registration::tell_room`), and a carrier that does not ask is never woken. Counted per shard thread, not in
+> the shard's state, which a caller that keeps a reply may be borrowing: `xshard.room_waits_started`, `_ended`, `_peak`.
+> Swept: every `send_back`, `send_reply_home` and `hand_reply_home` caller, `run_on_waiting` (A-192's connection ends,
+> now carried the same way), and every direct `send_control` of a reply in `crates/server/src`; and, from main as this
+> landed, a resumed verb's reply (`lease_wait::reply_home`, which b49360733 had sent from a task that waited for room,
+> refused by a full arena) now carried the same way, and `call_within_room`'s result, which comes home through
+> `send_back` while its request waits with `given_room_within`'s bounded, told wait. Siblings reported, not
+> changed (not replies, each counted where lost): a client handed to a shard (`daemon.rs`, `HANDOFF_LOST`), a released
+> client id (`RELEASE_LOST`), an NFS connection's migration (`MIGRATE_REFUSED`), and a Windows DAX holder's record
+> (`shards.rs`, `tell_holder`). To measure (the supervisor's): the 3,000-client rung's `xshard.reply_dropped` (about
+> 4,200 on main before, 0 expected), `xshard.room_waits_peak`, and each verb's p99 against main.
+
 > **A volume reported no loss window: built (2026-11-17, AC-8.3, §4.10 "Auto-seal"; g230).** Nothing told an agent
 > what an owner loss would cost it, or a successor's client what one had cost: the status promised
 > `last_placed_snapshot_age` and carried nothing. `status` now carries `LossReport`: `at_risk_ns` (zero at a placed,
@@ -65,11 +108,12 @@
 > mounts `nosuid,nodev`, the Linux FUSE mount now stating both itself; a pod's device cgroup; a guest asked for
 > `nosuid,nodev`, a real guest's test of both built 2026-11-18, A-94's amendment). Proven by each crate's unit tests
 > (A-294 names them). **Owed:**
-> - **every root pjdfstest list re-recorded with its record from a real run (the integrator's lanes).** The
->   device-fixture entries (1,798 of the Linux FUSE list's 1,800; every entry of the NFSv4, OCI and virtio-fs lists;
->   1,788 of the macOS list's 1,905) are expected to pass now, so each lane reports them listed-now-passing until the
->   re-record; a list cannot be edited ahead of its run, since `a_record_names_the_expected_failure_list_as_tracked`
->   holds each record to its list's digest;
+> - ~~every root pjdfstest list re-recorded with its record from a real run (the integrator's lanes)~~ **done
+>   2026-11-18.** Every device-fixture entry passed where predicted: CI run 44252249999 (virtio-fs guest 1,798 of
+>   1,798; macOS NFS 1,788 of 1,905) and run 44258878562 (the Linux FUSE adapter 1,798 of 1,800). Each list shrank by
+>   exactly those cases (virtio-fs, NFSv4 and OCI to none). The three Linux lanes' records were re-recorded by diag run
+>   44262117526, which met every verdict over the shrunk lists (FUSE 2 expected failures, NFSv4 and OCI none, 8,770 of
+>   8,798 passed), and `docs/wip/conformance.md` was regenerated from them;
 > - the real-kernel tests run on the Linux lanes: `a_device_node_reaches_the_mount_with_its_number_and_is_never_opened`
 >   (FUSE) and `a_device_node_is_made_with_its_number_and_never_opened` (the NFSv4 kernel client, which now mounts
 >   `nosuid,nodev`);
@@ -1514,9 +1558,10 @@
 >     resend came within 21 ms every time). It now owes the answer within the liveness budget of the owner's last
 >     progress through them, and asserts the room wake's counts
 >     (`docs/bugs/2026-11-17-a-kept-forward-polled-for-room-and-its-test-timed-the-owners-queue.md`).
->   - Open: the scatter's parts and a result carried home still poll a full channel every `REPLY_PACE_NS`
->     (`xshard::given_room_within`, `given_room`); `retry_forwards` stops at the first refused forward, so one full
->     owner holds back kept forwards to owners with room.
+>   - ~~Open: the scatter's parts and a result carried home still poll a full channel every `REPLY_PACE_NS`
+>     (`xshard::given_room_within`, `given_room`)~~: closed 2026-11-18 (A-296), both ask for room and wait for the
+>     drain's word. Open: `retry_forwards` stops at the first refused forward, so one full owner holds back kept
+>     forwards to owners with room.
 >   - Unmeasured: under a saturated owner, an idle client shard whose resend keeps losing the room to busy shards is
 >     told at every drain, so it wakes about once per its own wake latency, where the timer woke it once per idle
 >     window (100 wakes). The owner pays a kick per such shard per tell. Owed: kicks and CPU at the 10k fan-in rung.
@@ -2580,7 +2625,15 @@
 >   checks run on the dry run. Dry runs on 2026-11-05 published nothing: seven wheels and the sdist passed `twine
 >   check` (run 42048582138), and seven addons each landed in their package (run 42055543098).
 > - **Owed to Ada:** a release is published only when a maintainer pushes a real tag `v<version>` and publishes its
->   draft (`docs/publish.md`). The test draft is never to be published.
+>   draft (`docs/publish.md`, "The publish step", which lists what the publish needs from her). The test drafts are
+>   never to be published.
+> - **The dry run stages the whole release (2026-11-17, A-320).** Before, a run with no tag stopped after the builds,
+>   and only the two test tags had ever checked the checksums, the copies' comparison and the provenance. Now a
+>   read-only `stage` job runs in every run. It makes and checks `SHA256SUMS`, compares each target's two copies and
+>   writes the provenance and a publish plan. It keeps them as the run's `release-staged` artifact. Only a tag's
+>   `draft release` job signs and drafts, from exactly those files. Dry run 44261010043 (2026-11-18, commit
+>   44c7cc17): all fourteen copies passed their smoke tests, the seven pairs were byte for byte the same, and
+>   `SHA256SUMS` checked. Nothing was signed or released: no tag, no draft, no attestation. A-320 has the numbers.
 > - **Closed 2026-11-05 by 68b9cb05 (A-213): the anchor aborted when its stderr closed** (found by the smoke test,
 >   2026-11-04: `slates anchor 2>&1 >/dev/null | head -n 1` exited 134, because `eprintln!` panics on EPIPE under
 >   `panic = "abort"`). Every shipped print site now writes through `slates_machine::log`, which counts a refused line

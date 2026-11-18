@@ -3309,8 +3309,9 @@ const ACCEPTANCE_REJOINED: &str = "merge.acceptance_rejoined";
 /// A resolved acceptance whose completion record could not be made durable (rolled back); the
 /// client's retry re-executes and meets the idempotent accept.
 const ACCEPTANCE_UNRECORDED: &str = "merge.acceptance_unrecorded";
-/// A resolved acceptance whose delivery task the client's shard refused at its admission bound; the
-/// completion record answers the client's retry.
+/// A resolved acceptance whose reply could not be carried to its client's shard (`xshard::hand_reply_home`): that
+/// shard gone, as its daemon stops, or this shard's carrier at its bound. The completion record answers the client's
+/// resend. (Until goal 238, 2026-11-18, a full channel there lost it too.)
 const ACCEPTANCE_UNDELIVERED: &str = "merge.acceptance_undelivered";
 /// A holder withheld a merge record's acknowledgement (the injected fault).
 const RECORD_WITHHELD: &str = "merge.record_withheld";
