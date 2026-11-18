@@ -377,13 +377,17 @@ enum Op<T> {
 
 impl<T> Op<T> {
   /// Whether the request changed what survives a restart, so the shard publishes before it answers (§4.8, D-18): a
-  /// namespace or size change, an explicit flush, or the close of a handle that changed its file. A write alone does
-  /// not: Windows' cache writes back lazily, and its handle's close or flush carries the barrier, as a FUSE close's
-  /// `flush` does.
+  /// namespace or size change, a write, an explicit flush, or the close of a handle that changed its file. A write
+  /// publishes too (A-379, A-358's rule on Windows). Windows counts the pages a paging write carried clean once the write
+  /// is answered and never sends them again, and Windows has no write log (A-63's is Unix). A WinFsp drive also
+  /// outlives a killed daemon (A-198). So a write answered before any publication died with its daemon, and the
+  /// successor's flush then answered success over the loss. Leaving it to the handle's close or flush, as a FUSE
+  /// close's `flush` can since the FUSE write log holds every write, lost it.
   fn needs_barrier(&self) -> bool {
     matches!(
       self,
       Op::Open { .. }
+        | Op::Write { .. }
         | Op::PurgeOpen { .. }
         | Op::Release { .. }
         | Op::Create { .. }
@@ -517,8 +521,11 @@ impl Request {
     let through =
       context_of(&self.op).and_then(|context| names.name_of(context).map(str::to_owned));
     let bound = bind(self.op, ledger);
+    // A purge's own write, and its close when it carries no delete, change nothing (`crate::purge`): they are answered
+    // without a publication. A delete a purge's last handle carries is made and published (A-360, A-190).
     let barrier = bound.as_ref().is_ok_and(|op| {
-      op.needs_barrier() && !matches!(op, Op::Cleanup { object, delete: None } if object.purge)
+      op.needs_barrier()
+        && !matches!(op, Op::Cleanup { object, delete: None } | Op::Write { object, .. } if object.purge)
     });
     let echo = matches!(&bound, Ok(Op::Write { object, .. }) if object.purge);
     let change = bound.as_ref().ok().and_then(|op| change_of(op, bridge, cx));
