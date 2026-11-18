@@ -194,6 +194,77 @@ fn equal_content_seals_to_equal_bytes_and_holders_deduplicate_it() {
   );
 }
 
+/// Shape: the distinct chunks of the many-chunk snapshot: enough that a scan per chunk, the shape the wrap and the open
+/// had until 2026-11-17, is the most of their work, and few enough to seal in a test's time.
+const MANY_CHUNKS: u32 = 2048;
+/// Shape: the files of the many-chunk snapshot that repeat a chunk an earlier file holds.
+const REPEATED_FILES: u32 = 512;
+/// Shape: a small chunk's length: a quarter of a segment, so thousands seal quickly.
+const SMALL_CHUNK_LEN: usize = 1024;
+
+/// A raw chunk of `SMALL_CHUNK_LEN` bytes distinct for `seed`.
+fn small_chunk(seed: u32) -> Chunk {
+  Archive::raw_chunk(
+    seed
+      .to_le_bytes()
+      .iter()
+      .copied()
+      .cycle()
+      .take(SMALL_CHUNK_LEN)
+      .enumerate()
+      .map(|(at, byte)| byte ^ u8::try_from(at % 251).unwrap())
+      .collect(),
+  )
+}
+
+/// A-92 3b at scale: do wrap a snapshot of 2,048 distinct chunks, 512 more files repeating some of them, then open the
+/// envelope after it travels as an encoded archive. Expect the very archive back, every chunk in manifest order; and
+/// the envelope to store each sealed chunk once: the distinct chunks and the manifest, no identity twice. The wrap and
+/// the open find a sealed chunk by a set and an index, where a scan per chunk made each `n²` in the chunks.
+#[test]
+fn an_envelope_of_thousands_of_chunks_opens_to_the_very_archive() {
+  let tenant = new_tenant();
+  let chunks: Vec<Chunk> = (0..MANY_CHUNKS).map(small_chunk).collect();
+  let mut entries: Vec<Entry> = (0..MANY_CHUNKS)
+    .map(|at| {
+      file(
+        &format!("f{at:05}"),
+        &chunks[usize::try_from(at).unwrap()],
+        i64::from(at),
+      )
+    })
+    .chain((0..REPEATED_FILES).map(|at| {
+      let repeated = &chunks[usize::try_from(at * 3 % MANY_CHUNKS).unwrap()];
+      file(&format!("r{at:05}"), repeated, i64::from(at))
+    }))
+    .collect();
+  entries.sort_by(|a, b| a.name.cmp(&b.name));
+  let original = Archive {
+    manifest: Node::Directory(entries),
+    chunks: chunks.clone(),
+    ..snapshot(&[chunk(1), chunk(2)], 7)
+  };
+  let envelope = wrap(&original, &tenant.lineage, &tenant.namer, SEGMENT).unwrap();
+  let carried = Archive::decode(&envelope.encode()).unwrap();
+  let identities: std::collections::BTreeSet<[u8; 32]> =
+    carried.chunks.iter().map(|chunk| chunk.identity).collect();
+  assert_eq!(
+    (carried.chunks.len(), identities.len()),
+    (
+      usize::try_from(MANY_CHUNKS).unwrap() + 1,
+      usize::try_from(MANY_CHUNKS).unwrap() + 1
+    ),
+    "each distinct chunk and the manifest, stored once"
+  );
+  assert_eq!(
+    open(&carried, &tenant.lineage, &tenant.namer).unwrap(),
+    Archive {
+      created_unix: 0,
+      ..original
+    }
+  );
+}
+
 /// seal.md §13: do encode an envelope as a holder receives it; expect it to verify as an archive with no key, and to
 /// hold none of the plaintext chunks' bytes, none of their identities, no file name and no time.
 #[test]

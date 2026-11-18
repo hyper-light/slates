@@ -29,8 +29,13 @@
 //!   cohort has fewer members left than that quorum, it is adopted once every surviving member of its cohorts, settled
 //!   and current, has promised, with the newest record any of them holds (A-309): the members that exist now recover
 //!   it, where before it was lost and recovered by no one.
+//! - **The wait's bound (A-304).** A member that never answers the successor while every other member hears it is never
+//!   retired, so an object waiting for its promise would wait without end. Each learned object counts the periods it
+//!   waits with no member promising it anew and no page advancing ([`PromiseWait`]); past the failover SLO's worth it is
+//!   given up by name ([`give_up_unpromised`]), and the share stays unconfirmed, so its holders keep their copies
+//!   (A-272's rule). A wait past tolerance, for every surviving member, is bounded the same way.
 //! - **Confirmation.** A successor confirms its share once every member it asked has answered in full and every
-//!   object it learned is adopted (A-272); the council records it ([`crate::fleet`]'s report stream), and a
+//!   object it learned is adopted, none given up (A-272, A-304); the council records it ([`crate::fleet`]'s report stream), and a
 //!   retirement becomes a completion record once every survivor has confirmed or carried its share into a takeover
 //!   that completed (A-309). Only that record settles a line, and only for a holder the takeover asked.
 //!
@@ -95,6 +100,20 @@ const TAKEOVER_ADOPT_UNACKED: &str = "fleet.takeover.adopt_unplaced.unacked";
 /// The status count of learned objects a period left unadopted because a recovery cohort had not promised them yet.
 /// Format: a refusal name in the daemon's status report.
 const TAKEOVER_UNPROMISED: &str = "fleet.takeover.unpromised";
+/// Of [`TAKEOVER_UNPROMISED`]: those that had waited past the round's bound ([`PromiseWait`]), each period until it gave
+/// them up. Zero is the healthy reading. Format: a refusal name in the daemon's status report.
+const TAKEOVER_UNPROMISED_PAST_BOUND: &str = "fleet.takeover.unpromised.past_bound";
+/// The status count of learned objects a round gave up on ([`give_up_unpromised`]): every verb on one answers
+/// `NotRecovered { cause: TakeoverIncomplete { waited_on: "promises" } }`. Zero is the healthy reading. Format: a refusal
+/// name in the daemon's status report.
+const TAKEOVER_GIVEN_UP: &str = "fleet.takeover.given_up";
+/// Format: the wait a given-up learned object names in its refusal's cause (`RecoveryCause::TakeoverIncomplete`): its
+/// recovery cohorts' promises.
+const UNPROMISED_WAIT: &str = "promises";
+
+/// Counter: takeover pages and questions by name a test's injected silence left unanswered
+/// (`Daemon::inject_takeover_silence`); zero in production. Format: a counter name in the daemon's status report.
+const TAKEOVER_SILENCED_BY_FAULT: &str = "fleet.takeover.silenced_by_fault";
 
 /// The status refusal count under which a holder records a takeover page it deferred because its own answers
 /// to the retired owner's probes may still feed that owner's lease (§4.8 "Leases and reads", AUD-08); the
@@ -156,6 +175,45 @@ pub struct HostTakeover {
   /// since the round began and never cleared by a restart: the round's progress, which a taken-over object waiting on a
   /// register this round may still bring reads ([`rounds_still_paging`]).
   page_advances: u64,
+  /// Per learned object still waiting for its recovery cohorts' promises, its count toward the round's bound
+  /// ([`PromiseWait`]). Bounded by `learned`: an entry leaves with its object.
+  waits: BTreeMap<ObjectId, PromiseWait>,
+  /// The objects this round gave up on: each waited the failover SLO's worth of periods with no member promising it
+  /// anew and no page of the round advancing, and every verb on it answers `NotRecovered` naming the promises it waited
+  /// for ([`give_up_unpromised`]). Never adopted or learned again in this round, and the share is not confirmed while
+  /// any is here, so their holders keep their copies (A-272's rule). Bounded by the retired host's objects.
+  given_up: BTreeSet<ObjectId>,
+}
+
+/// One learned object's wait for its recovery cohorts' promises (§4.8 phase one), as the round's bound counts it: the
+/// periods it waited since it last made progress, and the marks its progress is judged against. Without a bound a member
+/// that never promised it (one cut off from this node alone, which the council therefore never retires) left the object
+/// waiting every period for as long as the daemon ran, and every verb on it answered a retryable `Overloaded`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PromiseWait {
+  /// The periods judged waiting since the object last made progress.
+  attempts: u32,
+  /// The most members that had promised the object at any period of this round.
+  promised: usize,
+  /// The round's page advances ([`HostTakeover::page_advances`]) at the object's last progress.
+  advances: u64,
+}
+
+impl PromiseWait {
+  /// Counts one period in which the object was judged waiting, `promised` members having promised it and the round at
+  /// `advances` page advances, and returns its attempts since its last progress. More members promising it than ever
+  /// before, or the round paging further, is progress and starts the count again: a page still to come may list it, and
+  /// a member answers by name only once its pages are complete. A period with neither counts one attempt.
+  fn record(&mut self, promised: usize, advances: u64) -> u32 {
+    if promised > self.promised || advances > self.advances {
+      self.promised = self.promised.max(promised);
+      self.advances = self.advances.max(advances);
+      self.attempts = 0;
+    } else {
+      self.attempts = self.attempts.saturating_add(1);
+    }
+    self.attempts
+  }
 }
 
 /// One asked member's progress through its answer: the object its next page starts after, and whether its
@@ -178,11 +236,15 @@ impl HostTakeover {
       fenced: None,
       named_nothing: BTreeMap::new(),
       page_advances: 0,
+      waits: BTreeMap::new(),
+      given_up: BTreeSet::new(),
     }
   }
 
   /// Starts the round over at `generation` and `epoch`: every promise was for the old round, so every page is
-  /// asked again. What was adopted stays adopted, and the page advances stay counted.
+  /// asked again. What was adopted stays adopted, and the page advances stay counted. What was given up is judged
+  /// afresh: the new configuration may have retired the member it waited for, and an adoption then clears its record
+  /// on the owner shard (`verbs::materialize_taken_over`).
   fn restart(&mut self, generation: u64, epoch: HostEpoch) {
     self.generation = generation;
     self.epoch = epoch;
@@ -190,6 +252,13 @@ impl HostTakeover {
     self.learned.clear();
     self.fenced = None;
     self.named_nothing.clear();
+    self.waits.clear();
+    self.given_up.clear();
+  }
+
+  /// Whether `object` is settled in this round, so no answer makes it learned again: adopted, or given up on.
+  fn settled(&self, object: &ObjectId) -> bool {
+    self.adopted.contains(object) || self.given_up.contains(object)
   }
 
   /// Records `host`'s answer to a page as its progress `page`, counting it in [`HostTakeover::page_advances`] when it
@@ -438,6 +507,10 @@ pub(crate) fn serve_host_prepare(
   };
   if prepare.owner != peer_host {
     return refuse(state);
+  }
+  if state.injected_takeover_silence.contains(&peer_host) {
+    state.count(TAKEOVER_SILENCED_BY_FAULT, 1);
+    return Vec::new();
   }
   let installed = state.fleet.configuration().version;
   if prepare.generation != installed || state.council.configuration().version != installed {
@@ -692,6 +765,8 @@ async fn drive_host_takeover(
   for (object, adopted) in ready {
     dispatches.extend(adopt(departed, object, adopted, local, budget).await);
   }
+  let past = state::with_state(|s| unpromised_past_the_bound(s, departed)).unwrap_or_default();
+  give_up_unpromised(departed, past, local).await;
   let done = state::with_state(|s| round_done(s, departed, local)).unwrap_or(false);
   if done {
     crate::fleet::send_council_report(
@@ -891,7 +966,7 @@ fn promise_local_copies(
     return;
   };
   for (object, highest) in learned {
-    if !take.adopted.contains(&object) {
+    if !take.settled(&object) {
       take
         .learned
         .entry(object)
@@ -987,7 +1062,7 @@ pub(crate) fn fold_answers(
     }
     let page = page_of(&promise);
     for (object, highest) in promise.entries {
-      if !take.adopted.contains(&object) {
+      if !take.settled(&object) {
         take
           .learned
           .entry(object)
@@ -1027,12 +1102,14 @@ pub(crate) fn ready_objects(
   if local_promises {
     answer_own_copies_by_name(state, departed, local, &regional);
   }
+  let bound = crate::fleet::takeover_attempts(state.config.failover_slo_ns);
   let Some(take) = state.host_takeovers.get_mut(&departed) else {
     return Vec::new();
   };
   let mut ready = Vec::new();
   let mut past_tolerance: u64 = 0;
   let mut unpromised: u64 = 0;
+  let mut past_the_bound: u64 = 0;
   let complete: BTreeSet<HostId> = take
     .pages
     .iter()
@@ -1058,27 +1135,182 @@ pub(crate) fn ready_objects(
       CountingRule::NamedAnswer,
     ) {
       Readiness::Ready => {
+        // Its promises are in: an adoption short of placement is tried again, never counted toward the bound.
+        take.waits.remove(object);
         if let Some(newest) = reports.values().cloned().reduce(newest_of) {
           ready.push((*object, newest));
         }
       }
       Readiness::ReadyPastTolerance { .. } => {
+        // Every surviving member of its cohorts has promised (A-309): adopted as a ready one is, counted.
+        take.waits.remove(object);
         if let Some(newest) = reports.values().cloned().reduce(newest_of) {
           past_tolerance = past_tolerance.saturating_add(1);
           ready.push((*object, newest));
         }
       }
-      Readiness::Waiting => unpromised = unpromised.saturating_add(1),
+      Readiness::Waiting => {
+        unpromised = unpromised.saturating_add(1);
+        let promised = promisers(reports, take.named_nothing.get(object));
+        let attempts = take
+          .waits
+          .entry(*object)
+          .or_default()
+          .record(promised, take.page_advances);
+        if attempts >= bound {
+          past_the_bound = past_the_bound.saturating_add(1);
+        }
+      }
     }
   }
   if unpromised > 0 {
     let count = state.refusals.entry(TAKEOVER_UNPROMISED).or_insert(0);
     *count = count.saturating_add(unpromised);
   }
+  if past_the_bound > 0 {
+    let count = state
+      .refusals
+      .entry(TAKEOVER_UNPROMISED_PAST_BOUND)
+      .or_insert(0);
+    *count = count.saturating_add(past_the_bound);
+  }
+  // An object that left the learned (adopted or given up) waits no more.
+  take
+    .waits
+    .retain(|object, _| take.learned.contains_key(object));
   if past_tolerance > 0 {
     state.count(TAKEOVER_RECOVERED_PAST_TOLERANCE, past_tolerance);
   }
   ready
+}
+
+/// The members that promised one learned object: those that listed it, with the highest record each holds, and those
+/// that answered for it by name holding nothing of it. A member is counted once, however it promised.
+fn promisers(
+  reports: &BTreeMap<HostId, Accepted>,
+  named_nothing: Option<&BTreeSet<HostId>>,
+) -> usize {
+  let named = named_nothing
+    .into_iter()
+    .flatten()
+    .filter(|host| !reports.contains_key(host))
+    .count();
+  reports.len().saturating_add(named)
+}
+
+/// The learned objects of `departed`'s round that waited for their cohorts' promises past the bound, each with its
+/// attempts: as many periods as the failover SLO holds ([`crate::fleet::takeover_attempts`]) with no member promising it
+/// anew and no page of the round advancing. [`ready_objects`] counts the periods; [`drive_host_takeover`] gives these up
+/// ([`give_up_unpromised`]).
+pub(crate) fn unpromised_past_the_bound(
+  state: &ShardState,
+  departed: HostId,
+) -> Vec<(ObjectId, u32)> {
+  let bound = crate::fleet::takeover_attempts(state.config.failover_slo_ns);
+  state
+    .host_takeovers
+    .get(&departed)
+    .map(|take| {
+      take
+        .waits
+        .iter()
+        .filter(|(object, wait)| wait.attempts >= bound && take.learned.contains_key(*object))
+        .map(|(object, wait)| (*object, wait.attempts))
+        .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// Gives up on `departed`'s learned objects in `past` ([`unpromised_past_the_bound`], each with its attempts), which no
+/// member cut off from this node alone will ever promise, since the council never retires it, so nothing else ends their
+/// wait. Each object's owner shard records it unrecovered, `TakeoverIncomplete { waited_on: "promises" }`, so every verb
+/// on it answers `NotRecovered` where it answered a retryable `Overloaded`; this node claims it to lookups, so a read from
+/// another node meets that answer; and the round learns it no more, asks no more about it, and confirms no share while it
+/// is given up, so its holders keep their copies (A-272's rule). A catalog register has no verbs of its own: the volume it
+/// belongs to waits for it in its materialization and is given up there, naming `catalog`. With no shard for its partition
+/// here nothing is recorded or claimed, as for a taken-over volume ([`crate::fleet`]'s give-up). Bounded work: one call
+/// per owner shard, whatever the objects' number, and one log line; an owner shard that does not answer within the period
+/// leaves its objects learned, given up again the next.
+async fn give_up_unpromised(departed: HostId, past: Vec<(ObjectId, u32)>, local: HostId) {
+  let Some(origin) = state::with_state(|s| s.shard) else {
+    return;
+  };
+  if past.is_empty() {
+    return;
+  }
+  let most_attempts = past
+    .iter()
+    .map(|(_, attempts)| *attempts)
+    .max()
+    .unwrap_or(0);
+  // Each object's owner shard, `None` for a catalog register (nothing to record) or a partition with no shard here.
+  let mut by_shard: BTreeMap<u16, Vec<ObjectId>> = BTreeMap::new();
+  let mut settled: Vec<(ObjectId, bool)> = Vec::new();
+  for (object, _) in &past {
+    let target = (!object.is_catalog())
+      .then(|| {
+        let partition = crate::verbs::owner_of(slates_ipc::protocol::VolumeId { bytes: object.0 });
+        state::with_state(|s| s.shards.get(usize::from(partition)).copied()).flatten()
+      })
+      .flatten();
+    match target {
+      Some(shard) => by_shard.entry(shard).or_default().push(*object),
+      None => settled.push((*object, false)),
+    }
+  }
+  for (shard, objects) in by_shard {
+    let ids: Vec<slates_db::catalog::VolumeId> = objects
+      .iter()
+      .map(|object| slates_db::catalog::VolumeId { bytes: object.0 })
+      .collect();
+    let recorded = crate::xshard::call_within(
+      origin,
+      shard,
+      move |s| {
+        for id in ids {
+          s.unrecovered.insert(
+            id,
+            slates_ipc::protocol::RecoveryCause::TakeoverIncomplete {
+              waited_on: UNPROMISED_WAIT.to_owned(),
+            },
+          );
+        }
+      },
+      crate::daemon::HEARTBEAT_NS,
+    )
+    .await
+    .is_some();
+    if recorded {
+      settled.extend(objects.into_iter().map(|object| (object, true)));
+    }
+  }
+  let Some(first) = settled.first().map(|(object, _)| *object) else {
+    return;
+  };
+  let given_up = u64::try_from(settled.len()).unwrap_or(u64::MAX);
+  let claimed = settled.iter().filter(|(_, claimed)| *claimed).count();
+  state::with_state_counted(|s| {
+    if let Some(take) = s.host_takeovers.get_mut(&departed) {
+      for (object, _) in &settled {
+        take.learned.remove(object);
+        take.waits.remove(object);
+        take.named_nothing.remove(object);
+        take.given_up.insert(*object);
+      }
+    }
+    for (object, _) in settled.iter().filter(|(_, claimed)| *claimed) {
+      track_owner_on_every_shard(s, *object, local);
+    }
+    s.count(TAKEOVER_GIVEN_UP, given_up);
+  });
+  slates_machine::log_line!(
+    "slates daemon: the takeover of {}'s objects gave up {given_up} of them (the first {}) after up to {most_attempts} \
+     periods, the failover SLO's worth, with no member of their recovery cohorts promising them anew and no page of the \
+     round advancing; {claimed} recorded unrecovered on their shards, every verb on one answering NotRecovered (a \
+     catalog register is given up with its volume, and an object whose partition no shard here serves is dropped)",
+    departed.0,
+    crate::verbs::hex_of(&first.0)
+  );
 }
 
 /// The successor answers itself by name (A-251 (b)), as it asks any member: for each learned object it has neither
@@ -1390,7 +1622,7 @@ fn record_adoption(
 }
 
 /// Whether this node's share of `departed`'s takeover is done: every member of the recovery neighbourhoods it
-/// asked has answered in full, and every object it learned is adopted.
+/// asked has answered in full, and every object it learned is adopted, none given up ([`share_done`]).
 fn round_done(state: &ShardState, departed: HostId, local: HostId) -> bool {
   let regional = state.council.configuration();
   let Some(take) = state.host_takeovers.get(&departed) else {
@@ -1400,6 +1632,7 @@ fn round_done(state: &ShardState, departed: HostId, local: HostId) -> bool {
     take.generation == regional.version,
     take.fenced.is_none(),
     take.learned.is_empty(),
+    take.given_up.is_empty(),
     regional
       .recovery_hosts(departed)
       .into_iter()
@@ -1409,13 +1642,20 @@ fn round_done(state: &ShardState, departed: HostId, local: HostId) -> bool {
 }
 
 /// Whether a share is done, from its round's facts: under the current configuration, unfenced, every member's page
-/// complete, and every object it learned adopted (A-272). A confirmation is what lets the takeover complete, and a
-/// completed takeover settles its objects' lines for every holder it asked (A-309), so a round with an object still
-/// learned must not confirm. Before A-272 an object declared lost was dropped from those learned and the round
-/// confirmed as though it had been adopted; since A-309 no object is declared lost (past tolerance the members that
-/// exist now recover it), so learned is the whole of it.
-fn share_done(current: bool, unfenced: bool, nothing_learned: bool, every_page: bool) -> bool {
-  current && unfenced && nothing_learned && every_page
+/// complete, and every object it learned adopted, none given up (A-272, A-304). A confirmation is what lets the takeover
+/// complete, and a completed takeover settles its objects' lines for every holder it asked (A-309), so a round with an
+/// object still learned or given up must not confirm: its retirement stays kept, and its holders keep their copies.
+/// Before A-272 an object declared lost was dropped from those learned and the round confirmed as though it had been
+/// adopted; since A-309 no object is declared lost (past tolerance the members that exist now recover it), and an
+/// object given up on waiting for its cohorts' promises ([`give_up_unpromised`]) keeps the share open the same way.
+fn share_done(
+  current: bool,
+  unfenced: bool,
+  nothing_learned: bool,
+  nothing_given_up: bool,
+  every_page: bool,
+) -> bool {
+  current && unfenced && nothing_learned && nothing_given_up && every_page
 }
 
 #[cfg(test)]
@@ -1497,22 +1737,66 @@ mod tests {
     );
   }
 
-  /// A-272, A-309: a round confirms its share only once every object it learned is adopted. Do ask whether a share is
-  /// done with every page complete, with and without an object still learned, and with a page missing. Expect done only
-  /// with nothing learned and every page in. Before A-272 a lost object counted as done; since A-309 none is lost, and an
-  /// object past tolerance stays learned until every surviving holder has answered and it is adopted.
+  /// The bound on a learned object's wait for its cohorts' promises (`PromiseWait`): a period counts only when no member
+  /// promised the object anew and no page of the round advanced. Do: record a first period with one member promising,
+  /// three still periods, a second member's promise, two still periods, a page advance, then still periods to the
+  /// failover SLO's attempts at a one-second SLO. Expect the count to start again at the first period, the promise and
+  /// the advance, to count one a still period otherwise, and to reach the bound only after that many still periods in a
+  /// row, so a round that still pages or still hears promises never gives an object up.
+  #[test]
+  fn a_promise_wait_counts_only_periods_with_no_new_promise_and_no_page_advance() {
+    let mut wait = PromiseWait::default();
+    let mut seen = Vec::new();
+    for (promised, advances) in [
+      (1, 4),
+      (1, 4),
+      (1, 4),
+      (1, 4),
+      (2, 4),
+      (2, 4),
+      (2, 4),
+      (2, 5),
+    ] {
+      seen.push(wait.record(promised, advances));
+    }
+    assert_eq!(seen, vec![0, 1, 2, 3, 0, 1, 2, 0]);
+    let bound = crate::fleet::takeover_attempts(crate::daemon::HEARTBEAT_NS.saturating_mul(10));
+    let mut attempts = 0;
+    for _ in 0..bound {
+      attempts = wait.record(2, 5);
+    }
+    assert_eq!(
+      attempts, bound,
+      "the bound's worth of still periods in a row"
+    );
+    assert_eq!(
+      wait.record(1, 5),
+      bound.saturating_add(1),
+      "fewer promisers than before are no progress"
+    );
+  }
+
+  /// A-272, A-304, A-309: a round confirms its share only once every object it learned is adopted, none given up. Do ask
+  /// whether a share is done with every page complete, with and without an object still learned or given up, and with a
+  /// page missing. Expect done only with nothing learned, nothing given up and every page in. Before A-272 a lost object
+  /// counted as done; since A-309 none is lost, and an object past tolerance stays learned until every surviving holder
+  /// has answered and it is adopted, or is given up at A-304's bound.
   #[test]
   fn a_round_confirms_only_once_every_object_it_learned_is_adopted() {
     assert!(
-      !share_done(true, true, false, true),
+      !share_done(true, true, false, true, true),
       "an object still learned: not done, the takeover stays kept"
     );
     assert!(
-      share_done(true, true, true, true),
+      !share_done(true, true, true, false, true),
+      "an object given up: not done, the takeover stays kept"
+    );
+    assert!(
+      share_done(true, true, true, true, true),
       "every object adopted: done"
     );
     assert!(
-      !share_done(true, true, true, false),
+      !share_done(true, true, true, true, false),
       "a member's pages incomplete: not done"
     );
   }

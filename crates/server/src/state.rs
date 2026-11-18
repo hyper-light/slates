@@ -771,6 +771,13 @@ pub struct ShardState {
   /// Live shipping (§4.10, A-200; [`crate::live_ship`]): the live volumes this shard owns and ships, and on the control
   /// shard what this node holds of others' as a candidate.
   pub(crate) live: crate::live_ship::LiveState,
+  /// The takeovers that made this node the owner of a volume this shard serves, by volume (AC-8.3, the loss report in
+  /// `slates status`): the epoch, the head sequence served from, and whether from the volume's live log. One entry a
+  /// taken-over volume of this shard, dropped when the volume is destroyed.
+  pub(crate) taken_over: BTreeMap<VolumeId, slates_ipc::protocol::VolumeTakeover>,
+  /// Test support (`Daemon::inject_seal_walk_quantum`, never set in production): the quantum the record period's seal
+  /// walk turns are cut by in place of the shard's step quantum (`fleet::seal_walk_slice`).
+  pub(crate) seal_walk_quantum_ns: Option<u64>,
   /// This node's takeovers in progress (§4.8 "Promotion and takeover"; [`crate::takeover`]): for each kept
   /// retirement whose survivors include this node and that it has not confirmed its share of yet, the round —
   /// its epoch, each asked member's progress, the objects learned and adopted. Only the control shard drives it;
@@ -854,6 +861,10 @@ pub struct ShardState {
   /// set, the session carrying its other replies as before, as an owner alive but never answering one exchange is to
   /// its asker (`Daemon::inject_forward_silence`). `None` in production.
   pub injected_forward_silence: Option<slates_ipc::protocol::VolumeId>,
+  /// Test support (never reachable from the wire): the successors whose takeover pages and questions by name this
+  /// holder leaves unanswered while set, as a holder cut off from one successor alone is to it: the council never
+  /// retires it, since every other member hears it (`Daemon::inject_takeover_silence`). Empty in production.
+  pub injected_takeover_silence: std::collections::BTreeSet<slates_db::HostId>,
   /// Test support (never reachable from the wire): the peer whose record session is made deaf by the forward lane's next
   /// borrow of it, once (`Daemon::inject_session_deafness`). `None` in production.
   pub injected_deaf_session: Option<slates_db::HostId>,
