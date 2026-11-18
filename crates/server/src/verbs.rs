@@ -8372,13 +8372,21 @@ fn build_increment(
   sealed: &crate::work_home::SealedWork,
   evidence: Vec<[u8; 32]>,
 ) -> Result<(DbVolumeId, slates_merge::engine::Increment), Refusal> {
+  build_increment_on(state.greens.get(&sealed.green), sealed, evidence)
+}
+
+/// [`build_increment`] over `engine`, the green's engine wherever it is held: its owner's, or a replica of it on the
+/// work's shard (A-465), which composes the same increment from the same state.
+fn build_increment_on(
+  engine: Option<&slates_merge::engine::Green>,
+  sealed: &crate::work_home::SealedWork,
+  evidence: Vec<[u8; 32]>,
+) -> Result<(DbVolumeId, slates_merge::engine::Increment), Refusal> {
   let green_id = sealed.green;
   let base_version = sealed.base_version;
   // The green is gone (destroyed), or the work's base is past the head it holds: the base names a
   // version this green does not have (§4.16 failure matrix, `UnknownBase`).
-  let engine = state
-    .greens
-    .get(&green_id)
+  let engine = engine
     .filter(|engine| base_version <= engine.head())
     .ok_or(Refusal::UnknownBase {
       green: to_wire_volume(green_id),
@@ -9416,12 +9424,21 @@ fn map_rebase(
   state: &mut ShardState,
   sealed: &crate::work_home::SealedWork,
 ) -> crate::work_home::RebaseAnswer {
+  rebase_on(state.greens.get_mut(&sealed.green), sealed)
+}
+
+/// [`map_rebase`] over `engine`, the green's engine wherever it is held: its owner's, or a replica of it on the work's
+/// shard (A-465), whose answer is the owner's for the same state, since it is computed by this same function.
+pub(crate) fn rebase_on(
+  engine: Option<&mut slates_merge::engine::Green>,
+  sealed: &crate::work_home::SealedWork,
+) -> crate::work_home::RebaseAnswer {
   use crate::work_home::RebaseAnswer;
-  let (green_id, inc) = match build_increment(state, sealed, Vec::new()) {
+  let (green_id, inc) = match build_increment_on(engine.as_deref(), sealed, Vec::new()) {
     Ok(built) => built,
     Err(refusal) => return RebaseAnswer::Reply(refused(refusal)),
   };
-  let Some(engine) = state.greens.get_mut(&green_id) else {
+  let Some(engine) = engine else {
     return RebaseAnswer::Reply(refused(Refusal::NotFound));
   };
   match engine.rebase(&inc) {
@@ -9577,8 +9594,18 @@ pub(crate) fn owner_files(
   version: u64,
   paths: &[String],
 ) -> crate::work_files::FetchedBase {
+  base_files(state.greens.get(&green), version, paths)
+}
+
+/// [`owner_files`] over `engine`, the green's engine wherever it is held: its owner's, or a replica of it on the
+/// work's shard (A-465).
+pub(crate) fn base_files(
+  engine: Option<&slates_merge::engine::Green>,
+  version: u64,
+  paths: &[String],
+) -> crate::work_files::FetchedBase {
   let mut fetched = crate::work_files::FetchedBase::default();
-  let Some(engine) = state.greens.get(&green) else {
+  let Some(engine) = engine else {
     fetched.gone = true;
     return fetched;
   };
@@ -9601,10 +9628,21 @@ pub(crate) fn owner_page(
   green: DbVolumeId,
   version: u64,
   path: String,
+  range: (u64, u64),
+) -> crate::work_files::FetchedBase {
+  base_page(state.greens.get(&green), version, path, range)
+}
+
+/// [`owner_page`] over `engine`, the green's engine wherever it is held: its owner's, or a replica of it on the work's
+/// shard (A-465).
+pub(crate) fn base_page(
+  engine: Option<&slates_merge::engine::Green>,
+  version: u64,
+  path: String,
   (offset, want): (u64, u64),
 ) -> crate::work_files::FetchedBase {
   let mut fetched = crate::work_files::FetchedBase::default();
-  let Some(engine) = state.greens.get(&green) else {
+  let Some(engine) = engine else {
     fetched.gone = true;
     return fetched;
   };
@@ -9623,8 +9661,17 @@ pub(crate) fn owner_sizes(
   green: DbVolumeId,
   version: u64,
 ) -> crate::work_files::FetchedBase {
+  base_sizes(state.greens.get(&green), version)
+}
+
+/// [`owner_sizes`] over `engine`, the green's engine wherever it is held: its owner's, or a replica of it on the work's
+/// shard (A-465).
+pub(crate) fn base_sizes(
+  engine: Option<&slates_merge::engine::Green>,
+  version: u64,
+) -> crate::work_files::FetchedBase {
   let mut fetched = crate::work_files::FetchedBase::default();
-  let Some(engine) = state.greens.get(&green) else {
+  let Some(engine) = engine else {
     fetched.gone = true;
     return fetched;
   };
@@ -10350,24 +10397,7 @@ fn attach(
     Ok(epoch) => epoch,
     Err(refusal) => return refused(refusal),
   };
-  let (db_form, established, mut capability) = match binding {
-    None => (
-      AttachForm::Root,
-      Established::Record,
-      crate::transports::root(&situation),
-    ),
-    Some(binding) => (
-      AttachForm::Oci {
-        source: binding.entry.source.clone(),
-        destination: binding.entry.destination.clone(),
-        read_only: binding.entry.read_only,
-      },
-      Established::OciBind {
-        binding: Box::new(binding.entry),
-      },
-      crate::transports::oci(&situation),
-    ),
-  };
+  let (db_form, established, mut capability) = established_form(binding, &situation);
   let attachment = next_attachment_id(state);
   let termed = matches!(consumer, Consumer::Termed { .. });
   let token = match capability_token(borrows_mount) {
@@ -10412,6 +10442,36 @@ fn attach(
     established,
     capability,
     token: (!borrows_mount).then_some(token),
+  }
+}
+
+/// What an attachment records and reports of its establishment: the record form when nothing was bound, or the OCI
+/// bind `binding` made, each with its transport's capability report in `situation`.
+fn established_form(
+  binding: Option<crate::oci::Binding>,
+  situation: &crate::transports::Situation,
+) -> (
+  AttachForm,
+  Established,
+  slates_ipc::protocol::AttachmentCapability,
+) {
+  match binding {
+    None => (
+      AttachForm::Root,
+      Established::Record,
+      crate::transports::root(situation),
+    ),
+    Some(binding) => (
+      AttachForm::Oci {
+        source: binding.entry.source.clone(),
+        destination: binding.entry.destination.clone(),
+        read_only: binding.entry.read_only,
+      },
+      Established::OciBind {
+        binding: Box::new(binding.entry),
+      },
+      crate::transports::oci(situation),
+    ),
   }
 }
 
@@ -17140,6 +17200,13 @@ enum Streamed {
   Refused(slates_vfs::VfsError),
 }
 
+/// The volumes a checkpoint leaves out by name: those it could not capture, each with why, and those whose committed
+/// record it carries in their place (A-430).
+type LeftOutVolumes<'a> = (
+  &'a [(DbVolumeId, slates_vfs::VfsError)],
+  &'a [(DbVolumeId, slates_vfs::recover::VolumeImage)],
+);
+
 /// One attempt at [`publish_checkpoint`]: the shard image streamed straight into the content object's free slot, each
 /// volume encoded as it is captured, leaving out the volumes being destroyed and those in `skipped`. The checkpoint was
 /// first held whole (every one left its own size in the daemon's footprint: 270 MB after 50,000 macOS files whose
@@ -17148,10 +17215,7 @@ enum Streamed {
 fn stream_checkpoint(
   state: &mut ShardState,
   handles: &[Handle<VolumeSlot>],
-  (skipped, carried): (
-    &[(DbVolumeId, slates_vfs::VfsError)],
-    &[(DbVolumeId, slates_vfs::recover::VolumeImage)],
-  ),
+  (skipped, carried): LeftOutVolumes<'_>,
   held: &mut Vec<slates_vfs::recover::HeldPiece>,
   (replies, calls, nfs_replies, nfs_states): (
     &mut Vec<slates_vfs::recover::HeldReply>,
@@ -17295,23 +17359,36 @@ fn capture_live_record(state: &mut ShardState, id: DbVolumeId, record: Option<&[
   }
 }
 
-/// [`publish_delta`] into `encoded`.
-fn publish_delta_into(
+/// What a delta's pass over its volumes gathered ([`encode_changed_volumes`]).
+struct DeltaVolumes {
+  /// The volumes whose publication the delta records, marked published once it commits.
+  recorded: Vec<Handle<VolumeSlot>>,
+  /// The keys whose record the shard holds once the delta commits: recorded, clean, or skipped with a committed one.
+  present: std::collections::BTreeSet<[u8; 16]>,
+  /// How many volume records the delta holds.
+  count: usize,
+}
+
+/// Encodes into `encoded`, in key order (the order a shard delta holds its volumes in: `ShardDelta::new` sorts by key),
+/// each changed volume's publication. A volume being destroyed is named in `published.destroying`; a clean one stays
+/// present unencoded; one whose publication cannot be encoded is counted, named in `published.skipped`, and keeps its
+/// committed record.
+fn encode_changed_volumes(
   state: &mut ShardState,
   encoded: &mut Vec<u8>,
-) -> Result<Published, slates_vfs::VfsError> {
-  let mut recorded = Vec::new();
-  let mut present = std::collections::BTreeSet::new();
-  let mut published = Published::default();
-  // In key order, the order a shard delta holds its volumes in (`ShardDelta::new` sorts by key).
+  published: &mut Published,
+) -> Result<DeltaVolumes, slates_vfs::VfsError> {
+  let mut volumes = DeltaVolumes {
+    recorded: Vec::new(),
+    present: std::collections::BTreeSet::new(),
+    count: 0,
+  };
   let mut keyed: Vec<_> = state
     .volumes
     .iter()
     .map(|(handle, slot)| (slot.id.bytes, handle))
     .collect();
   keyed.sort_by_key(|(key, _)| *key);
-  let count_at = slates_vfs::checkpoint_log::ShardDelta::encode_start(encoded);
-  let mut count = 0usize;
   for (_, handle) in &keyed {
     let slot = state.volumes.get_mut(*handle)?;
     let id = slot.id;
@@ -17320,7 +17397,7 @@ fn publish_delta_into(
       continue;
     }
     if slot.volume.is_clean(&state.store) {
-      present.insert(id.bytes);
+      volumes.present.insert(id.bytes);
       published.volumes.push(id);
       continue;
     }
@@ -17332,10 +17409,10 @@ fn publish_delta_into(
       encoded,
     ) {
       Ok(()) => {
-        present.insert(id.bytes);
+        volumes.present.insert(id.bytes);
         published.volumes.push(id);
-        recorded.push(*handle);
-        count = count.saturating_add(1);
+        volumes.recorded.push(*handle);
+        volumes.count = volumes.count.saturating_add(1);
         capture_live_record(
           state,
           id,
@@ -17348,11 +17425,26 @@ fn publish_delta_into(
         published.skipped.push(id);
         // A skipped volume keeps its committed record, so it stays present.
         if state.published_keys.contains(&id.bytes) {
-          present.insert(id.bytes);
+          volumes.present.insert(id.bytes);
         }
       }
     }
   }
+  Ok(volumes)
+}
+
+/// [`publish_delta`] into `encoded`.
+fn publish_delta_into(
+  state: &mut ShardState,
+  encoded: &mut Vec<u8>,
+) -> Result<Published, slates_vfs::VfsError> {
+  let mut published = Published::default();
+  let count_at = slates_vfs::checkpoint_log::ShardDelta::encode_start(encoded);
+  let DeltaVolumes {
+    recorded,
+    present,
+    count,
+  } = encode_changed_volumes(state, encoded, &mut published)?;
   let mut removed: Vec<[u8; 16]> = state
     .published_keys
     .iter()
@@ -19644,13 +19736,21 @@ mod tests {
     slot.volume.to_image(&state.store, None).unwrap()
   }
 
-  /// The shard image committed in the shard's checkpoint slots. The image a recovery would rebuild for `volume` from
-  /// the shard's journal as it stands, the committed checkpoint and its deltas folded by `Journal::recover`; `None`
-  /// when the journal holds no such volume.
+  /// The image a recovery would rebuild for `volume` from the shard's journal as it stands ([`recovered_volumes`]);
+  /// `None` when the journal holds no such volume.
   fn recovered_record(
     state: &crate::state::ShardState,
     volume: super::DbVolumeId,
   ) -> Option<slates_vfs::recover::VolumeImage> {
+    recovered_volumes(state)
+      .into_iter()
+      .find(|keyed| keyed.key == volume.bytes)
+      .map(|keyed| keyed.image)
+  }
+
+  /// Every volume a recovery would rebuild from the shard's journal as it stands, the committed checkpoint and its
+  /// deltas folded by `Journal::recover`; none when nothing ever committed.
+  fn recovered_volumes(state: &crate::state::ShardState) -> Vec<slates_vfs::recover::KeyedImage> {
     let object = state.content.as_ref().unwrap();
     let (images, deltas) = (state.content_range, state.delta_range);
     let (image, _) = slates_vfs::checkpoint_log::Journal::recover(
@@ -19666,13 +19766,10 @@ mod tests {
       },
     )
     .unwrap();
-    image?
-      .volumes
-      .into_iter()
-      .find(|keyed| keyed.key == volume.bytes)
-      .map(|keyed| keyed.image)
+    image.map_or_else(Vec::new, |image| image.volumes)
   }
 
+  /// The shard image committed in the shard's checkpoint slots.
   fn committed_image(state: &mut crate::state::ShardState) -> super::ShardImage {
     let (start, end) = state.content_range;
     let slots = super::ContentSlots {

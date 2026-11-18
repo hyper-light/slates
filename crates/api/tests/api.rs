@@ -2417,9 +2417,6 @@ fn wait_for_attachments(instance: &mut Instance, volume: VolumeId, count: u32) {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_vhost_user_device_the_library_serves_drives_a_guest_whose_file_it_reads() {
-  use slates_bridge_fuse::abi::{OUT_HEADER_LEN, Opcode};
-  use slates_bridge_fuse::reply::EntryOut;
-
   let (daemon, mut instance) = grouped("vhost-user");
   let volume = provision(&mut instance, &VolumeSpec::empty("vhosted", ROOM));
   let device = instance
@@ -2444,9 +2441,38 @@ fn a_vhost_user_device_the_library_serves_drives_a_guest_whose_file_it_reads() {
     "the memory table is accepted"
   );
   front.configure_queues(&driver);
+  guest_creates_writes_and_releases_its_file(&front, &mut driver);
+  assert_eq!(
+    read_file(&mut instance, volume, &format!("/{GUEST_FILE}")),
+    FROM_THE_GUEST,
+    "the library reads what the guest wrote"
+  );
+  drop(driver);
+  drop(front);
+  wait_for_attachments(&mut instance, volume, 0);
+  assert_a_windowed_device_is_offered(&mut instance, volume);
+  assert_eq!(
+    instance
+      .serve_vhost_user(NOWHERE, Intent::Write, ("slates", None), None)
+      .err(),
+    Some(Error::NotFound(Missing::Volume(NOWHERE)))
+  );
+  daemon.stop();
+}
+
+/// As the guest over `front`: create [`GUEST_FILE`], write [`FROM_THE_GUEST`] into it and release it, each answered
+/// without an error.
+#[cfg(target_os = "linux")]
+fn guest_creates_writes_and_releases_its_file(
+  front: &vhost_front_end::FrontEnd,
+  driver: &mut guest::Guest<slates_bridge_virtiofs::vhost_user::GuestRegions>,
+) {
+  use slates_bridge_fuse::abi::{OUT_HEADER_LEN, Opcode};
+  use slates_bridge_fuse::reply::EntryOut;
+
   let created = through_vhost(
-    &front,
-    &mut driver,
+    front,
+    driver,
     &guest::message(
       Opcode::Create.to_wire(),
       1,
@@ -2458,8 +2484,8 @@ fn a_vhost_user_device_the_library_serves_drives_a_guest_whose_file_it_reads() {
   let node = guest::u64_at(&created, OUT_HEADER_LEN);
   let handle = guest::u64_at(&created, OUT_HEADER_LEN + EntryOut::LEN);
   let written = through_vhost(
-    &front,
-    &mut driver,
+    front,
+    driver,
     &guest::message(
       Opcode::Write.to_wire(),
       2,
@@ -2469,8 +2495,8 @@ fn a_vhost_user_device_the_library_serves_drives_a_guest_whose_file_it_reads() {
   );
   assert_eq!(guest::reply_error(&written), 0, "WRITE");
   let released = through_vhost(
-    &front,
-    &mut driver,
+    front,
+    driver,
     &guest::message(
       Opcode::Release.to_wire(),
       3,
@@ -2479,14 +2505,12 @@ fn a_vhost_user_device_the_library_serves_drives_a_guest_whose_file_it_reads() {
     ),
   );
   assert_eq!(guest::reply_error(&released), 0, "RELEASE");
-  assert_eq!(
-    read_file(&mut instance, volume, &format!("/{GUEST_FILE}")),
-    FROM_THE_GUEST,
-    "the library reads what the guest wrote"
-  );
-  drop(driver);
-  drop(front);
-  wait_for_attachments(&mut instance, volume, 0);
+}
+
+/// The volume served again over vhost-user with a DAX window of one range offers the window (the capability's
+/// residency names DAX-mapped guest pages); the device is then let go, and the volume left without attachments.
+#[cfg(target_os = "linux")]
+fn assert_a_windowed_device_is_offered(instance: &mut Instance, volume: VolumeId) {
   let windowed = instance
     .serve_vhost_user(
       volume,
@@ -2504,14 +2528,7 @@ fn a_vhost_user_device_the_library_serves_drives_a_guest_whose_file_it_reads() {
     windowed.attachment.capability.residency
   );
   drop(windowed);
-  wait_for_attachments(&mut instance, volume, 0);
-  assert_eq!(
-    instance
-      .serve_vhost_user(NOWHERE, Intent::Write, ("slates", None), None)
-      .err(),
-    Some(Error::NotFound(Missing::Volume(NOWHERE)))
-  );
-  daemon.stop();
+  wait_for_attachments(instance, volume, 0);
 }
 
 /// AC-5.12 (A-278; §4.6, G-vhost): vhost-user is Linux's (its eventfds and the KVM VMMs that speak it), and elsewhere the

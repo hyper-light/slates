@@ -37,7 +37,13 @@ mod chmod_tests;
 pub mod engine;
 pub mod grant;
 pub mod manifest;
+// The landing manifest's golden vectors (A-469): the bytes a grant binds, pinned for each layout.
+#[cfg(test)]
+mod manifest_vectors;
 pub mod source;
+// The store and volume configuration the unit tests land over, one fixture for every suite.
+#[cfg(test)]
+mod test_store;
 pub mod verdict;
 // The Windows attribute word a landed object takes from the volume's bits (A-451): the Windows writer's, and pure.
 #[cfg(any(windows, test))]
