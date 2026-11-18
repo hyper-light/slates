@@ -6566,7 +6566,14 @@ mirroring have no targets and their verbs refuse `Unsupported`.
 >   holder that accepts it drops the volume's and its catalog's records. Waiting for every candidate is what
 >   keeps a later takeover from meeting a lone live head.
 > - **A takeover adopts the tombstone** and never materializes the volume. Before this a successor served a
->   destroyed volume again.
+>   destroyed volume again. The successor records the adopted tombstone on the shard the id routes to once a period,
+>   and since 2026-11-18 past the failover SLO's worth of attempts (`failover_slo_ns / HEARTBEAT_NS`, as for a
+>   taken-over volume or green) it gives that record up, counted `fleet.tombstone.given_up` with its last reason (no
+>   shard for the partition, refused, unanswered): the adoption already placed the tombstone under the successor at the
+>   quorum, so the volume is never served again, and what is lost is the retirement, which leaves the candidates
+>   holding the tombstone, the safe state. The successor keeps it marked, so the volume stays known destroyed there.
+>   Before, a tombstone whose partition had no shard was skipped every period, uncounted, and a refused one retried
+>   every period without end.
 > - **On a laptop** the tombstone retires with the destroy: there is no remote candidate to ship to.
 > - **Single-value registers** (head, catalog, tombstone) keep only their newest accepted position. A
 >   green's chain is a ledger and is kept whole.
