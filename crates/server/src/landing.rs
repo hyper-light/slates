@@ -3214,9 +3214,7 @@ pub(crate) fn grants_part(
   let grants = state
     .db
     .partition()
-    .grants_of(principal)
-    .into_iter()
-    .filter(|g| after.is_none_or(|after| g.id > after))
+    .grants_of_after(principal, after)
     .map(|g| GrantSummary {
       id: g.id,
       volume: to_wire_volume(g.volume),
@@ -3225,7 +3223,8 @@ pub(crate) fn grants_part(
       scope: wire_grant_scope(&g.scope),
       state: grant_state_name(g.state),
     });
-  // `grants_of` walks the partition's grants in id order, so the first that fit are the page's.
+  // `grants_of_after` walks the partition's grants in id order from the cursor, lazily, so the first that fit are the
+  // page's and the walk stops there.
   let (items, more) = crate::verbs::fitting(grants, grants_page_room());
   crate::verbs::PagePart { items, more }
 }

@@ -707,14 +707,23 @@ impl Partition {
       })
   }
 
-  /// The grants made for a principal (a walk of the table; a `slates grants` read, never a
-  /// hot path).
-  pub fn grants_of(&self, principal: &Principal) -> Vec<&GrantRecord> {
+  /// `principal`'s grants past grant id `after` (`None`: from the first), in grant-id order (§4.13, A-266, A-267): a
+  /// range from the cursor over the id-ordered table, so a page of a principal's grants costs the grants it passes, never
+  /// the whole table; collecting every grant of the principal and then skipping to the cursor cost the table each page.
+  pub fn grants_of_after<'a>(
+    &'a self,
+    principal: &'a Principal,
+    after: Option<u64>,
+  ) -> impl Iterator<Item = &'a GrantRecord> + 'a {
+    let from = match after {
+      Some(after) => std::ops::Bound::Excluded(after),
+      None => std::ops::Bound::Unbounded,
+    };
     self
       .grants
-      .values()
-      .filter(|g| &g.principal == principal)
-      .collect()
+      .range((from, std::ops::Bound::Unbounded))
+      .map(|(_, grant)| grant)
+      .filter(move |grant| &grant.principal == principal)
   }
 
   /// A grant.

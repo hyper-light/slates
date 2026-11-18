@@ -134,3 +134,42 @@ fn an_ended_grant_leaves_the_table_and_its_id_is_never_issued_again() {
     "the highest id issued survives the recovery"
   );
 }
+
+/// Shape: the grants the cursor test issues, alternating between two principals.
+const ISSUED: u64 = 30;
+
+/// A-267 (§4.13, A-266). Do: issue 30 grants alternating between two principals, then read each principal's grants
+/// past every cursor: none, every grant id, and one past the last. Expect: each read is exactly the principal's grants
+/// with ids past the cursor, in id order, as filtering every grant of the table gives; the read ranges from the cursor
+/// over the id-ordered table, so a page of grants costs the grants it passes, never the table.
+#[test]
+fn a_principals_grants_past_any_cursor_are_read_in_id_order() {
+  let mut seg = segment("slates-db-grants-after");
+  let (mut db, _) = recover(&mut seg, 0, caps(), NOW_NS).unwrap();
+  let principal = |uid| Principal::Uid {
+    host: slates_db::HostId(0),
+    uid,
+  };
+  for id in 1..=ISSUED {
+    let Op::GrantIssued { mut record } = issued(id) else {
+      panic!("issued makes a GrantIssued");
+    };
+    record.principal = principal(1000 + u32::try_from(id % 2).unwrap());
+    db.mutate(&mut seg, &Op::GrantIssued { record }, NOW_NS)
+      .unwrap();
+  }
+  for who in [principal(1000), principal(1001)] {
+    for after in std::iter::once(None).chain((0..=ISSUED + 1).map(Some)) {
+      let sought: Vec<u64> = db
+        .partition()
+        .grants_of_after(&who, after)
+        .map(|grant| grant.id)
+        .collect();
+      let expected: Vec<u64> = (1..=ISSUED)
+        .filter(|id| principal(1000 + u32::try_from(id % 2).unwrap()) == who)
+        .filter(|id| after.is_none_or(|after| *id > after))
+        .collect();
+      assert_eq!(sought, expected, "{who:?} after {after:?}");
+    }
+  }
+}

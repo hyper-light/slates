@@ -22288,6 +22288,10 @@ tick), `crates/server/src/verbs.rs` (the gather, the target bound), `crates/ipc/
   in `apply`, and the runtime table once that commits; its history is the audit log. The highest id issued is kept and
   snapshotted, so an id is never reused and a spent one is refused `GrantInvalid`.
 - **Ended at its term:** the reap tick ends grants past their term, counted.
+- **A seek (2026-11-17, goal g247):** a page collected every grant of the principal and then skipped to the cursor,
+  so each page cost the table; it ranges from the cursor over the id-ordered table, lazily, and stops when the page
+  is full (`Partition::grants_of_after`), checked against the filter past every cursor for two principals' interleaved
+  grants (`a_principals_grants_past_any_cursor_are_read_in_id_order`).
 - **A target that a grant can be listed with:** a `land` request carries a target of about 4,046 bytes; a target past
   `longest_grantable_target` (3,995 bytes, a grants page's room less a summary with an empty target) is refused
   `TargetUnavailable` before presenting. Landing runs on macOS and Linux; macOS's `PATH_MAX` (1,023 bytes) is the
