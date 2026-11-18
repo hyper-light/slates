@@ -389,7 +389,12 @@
 > Locks: every leg runs a workload's two sides
 > under one kernel, whose own locks bind SQLite's, FSFS's and Mercurial's; served locks matter only between kernels.
 > **Open:** (1) the runs over each mount, which are the supervisor's (CLAUDE.md §8): any difference they find is a gap
-> to fix failing-test-first; (2) ~~the Windows WinFsp roster~~ **built 2026-11-17 (A-300, above)**: WinFsp's driver
+> to fix failing-test-first. **Shown identical (2026-11-18, CI run 44260193629, main 30014e93, the first with A-319):**
+> Linux FUSE (the daemon's own mount) and NFSv4.2 ran all twelve roster workloads identical, the OCI container's Linux
+> engine the six its image holds (git, git's history, Mercurial, Subversion, cargo, python), and the live virtio-fs
+> guest all twelve in 247 s; the three Linux records are re-recorded from that run's artifact. macOS's NFS loopback
+> mount had run git, git's history and Mercurial identical in each of three earlier runs (44247840584, 44252249999,
+> 44252296495), and Subversion with only the item order A-319 fixed; (2) ~~the Windows WinFsp roster~~ **built 2026-11-17 (A-300, above)**: WinFsp's driver
 > has no hard links (winfsp.dev's NTFS compatibility page), so Mercurial and git copy where NTFS links, now the
 > route's stated difference; git's symbolic-link probe needed reparse points, which the drive serves since A-275
 > landed (2026-11-17, below); (3) ~~a Linux FUSE leg outside a container~~
