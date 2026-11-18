@@ -2725,6 +2725,13 @@ before the report is published, so a tool never reads attributes newer than the 
 > counted (`write_log.forget_unlogged`), never taken for a lost write. Proven by
 > `the_lookups_a_dead_daemon_was_given_back_after_its_last_publication_stay_given_back`
 > (`docs/bugs/2026-11-08-a-forget-after-the-last-publication-leaked-its-lookup-reference.md`).
+> **Every record names its volume (2026-11-18, A-166's sibling sweep).** The replay found a record's volume by its inode
+> number's prefix, and a clone keeps its origin's numbers for every file it inherits, so a write a dead daemon logged to
+> a clone's inherited file was replayed into the origin (or another clone of it), and the clone lost it. Each write and
+> `FORGET` record now carries the id of the volume its mount serves, and the replay goes there (`verbs::replay_one`,
+> `replay_forget`). The log's header carries a layout word: a log of the layout before that holds records is reported as
+> lost writes, never misread. Proven by `a_replayed_write_to_a_clones_inherited_file_lands_in_the_clone`
+> (`docs/bugs/2026-11-18-a-replayed-write-to-a-clones-inherited-file-landed-in-its-origin.md`).
 > **The takeover round is built (2026-10-23, A-158).** A restored mount tells its kernel what its predecessor may not
 > have: the epoch bump and an invalidation of the root and of every restored reference and replayed inode, in slices.
 > Proven on Linux 7.2.9 through the real binary, each test red with the change's files at the previous commit:
