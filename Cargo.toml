@@ -181,6 +181,8 @@ missing_panics_doc = "deny"
 
 [profile.release]
 lto = true
+# DIAG (diag-g251-spin, never main): line tables for the stuck shard's backtrace.
+debug = "line-tables-only"
 # No unwinding in release: allocation exhaustion and every other failure is a typed refusal,
 # and a panic is a bug that must stop the process (Appendix B.1, hecate's no-panic law).
 panic = "abort"

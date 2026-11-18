@@ -484,6 +484,18 @@ fn kernel_wait_name_of(_handle: u64) -> Option<String> {
   None
 }
 
+/// DIAG (diag-g251-spin, never main): the Linux thread id a handle carries.
+#[cfg(all(target_os = "linux", not(miri)))]
+pub(crate) fn diag_tid(handle: u64) -> Option<u64> {
+  (handle & TAG != 0).then(|| (handle & !TAG) >> TID_SHIFT)
+}
+
+/// DIAG: no thread id here.
+#[cfg(any(not(target_os = "linux"), miri))]
+pub(crate) fn diag_tid(_handle: u64) -> Option<u64> {
+  None
+}
+
 /// The run-queue wait in a thread's `schedstat`, its second field, nanoseconds; `None` for a line without one.
 #[cfg(any(all(target_os = "linux", not(miri)), test))]
 fn wait_of_schedstat(schedstat: &str) -> Option<u64> {
