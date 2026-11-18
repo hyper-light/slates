@@ -29546,7 +29546,10 @@ code below.
   term renews the owner's lease at its epoch; another principal refused `LeaseHeld` past the renewed term with no pass
   between; granted once the owner's attachment ended) and
   `a_cli_attachment_keeps_the_write_lease_to_its_own_term_and_a_read_one_keeps_none` (`crates/server/src/verbs.rs`).
-  EVIDENCE_PLACEHOLDER
+  Run on the Mac Studio (kiln, 2026-11-18, load 19, debug build, `cargo test --locked -p slates-server --lib -- lease
+  fanned_the_failover`): 27 of 27, both new tests among them with the landing lease's, the owner lease's and the fan's.
+  Red-checked once: with the pass releasing a kept lease, the first test fails at its renewal. The integration tests
+  this change edits (the client reap, the landing keepalive) are filed for main's suites.
 
 Applied in the same change to: §4.4 "Derived constants" (its status), GAPS (the `LIVENESS_BUDGET_NS` entry),
 `docs/cli.md`, `crates/server/src/{verbs,landing,daemon,remote_attach}.rs`, `crates/db/src/catalog.rs` (the consumers'
