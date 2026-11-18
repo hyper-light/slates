@@ -1,5 +1,35 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A host admitted again refused its successor's records for good, so its live copy never caught up: fixed
+> (2026-11-18, A-382, §4.8 "Authority scope"; g230; the chaos nemesis's convergence, seeds 6876545201569229162 and
+> 7236833171758868842 on arm64, CI diag 44345243646).** The superseded adopter, admitted again under its id, kept its
+> register copies of the objects it had adopted under its own authority, at their old generation: its re-admission
+> forgot its own routes, and the install moves a copy only along its route. So it refused the creator's catalog and
+> head `ForeignGeneration` every period (660 to 796 a run), and the creator, which ships a live log only to a holder
+> holding its catalog, never sent it the log: its live copy stayed at fence 2 behind the creator's fence 3 for a whole
+> fleet wait. Fixed: the re-admission lets those copies go (`readmission::let_go_own_registers`,
+> `fleet.readmission.registers_let_go`), so the successor's next record makes them afresh, and a volume a node lost to
+> a successor ships no catalog or head record (`fleet::unplaced_heads`). Tests:
+> `every_copy_catches_up_once_the_creator_takes_its_volume_back_from_the_adopter`,
+> `every_copy_catches_up_once_the_third_node_takes_the_volume_from_the_adopter` and
+> `a_superseded_owner_restarted_warm_ships_no_record_of_the_volume_it_lost` (`crates/server/tests/fleet.rs`). Bug
+> record: `docs/bugs/2026-11-18-a-readmitted-adopters-own-register-copies-refused-its-successor-for-good.md`.
+> - **Not this entry: the x86_64 runs of the same seeds** ended two daemons each by their watchdogs ("shard N is
+>   spinning, 1000 ms of CPU without a step") right after the supersession, so the dead nodes' copies read none: the
+>   live takeover's materialization in one turn, g251's item, as seed 17036665960917068132.
+> - **Open: a superseded owner's shipper that is never told its fence ships on.** In 2 of 12 runs of the third node's
+>   case (CI diag 44358084443) the re-admitted adopter's own log of the volume, yielded but never fenced, built 119 and
+>   1,714 installs for the creator, which refused each `not_the_acting_owner`; the adopter never learned its fence from
+>   those answers, though the creator's copy was fenced above it. A-349 stops a fenced log only. Next: why that answer
+>   does not fence the sender (`live_ship::not_served`, `Shipper::on_reply`), and whether a yielded log should stop
+>   as a fenced one does (its waiting writers then need a refusal of their own).
+> - **Owed: the let-go and the yield survive a warm restart only once published.** The let-go rides the control shard's
+>   next publication; a warm restart before it restores the copies and routes them to this host again; and the yield
+>   is memory-only (`ShardState::yielded`), so a warm restart forgets that the node lost the volume at all (A-334).
+> - **Owed: a copy made afresh takes the first member's record at the current generation as its owner's,** as a new
+>   candidate's does. A node that knows it lost a volume (yielded or fenced) ships it no record; a stale owner that
+>   does not know yet was retired, so it is no member until its re-admission yields.
+
 > **Partly closed (g262, 2026-11-18): every wire enum of the protocol and of the records is held to its published
 > tags by a test.** Two guards read each wire enum's schema, which names its variants in tag order:
 > `crates/ipc/tests/wire_order.rs` (43 enums, 410 tags) and `crates/db/tests/wire_order.rs` (17 enums, 152 tags, `Op`
@@ -426,10 +456,20 @@
 >   whole materialization in one owner-shard turn (0.73 to 2.84 s at 152 to 306 MB of sealed log on a Mac Studio), and
 >   each period's attempt, its 100 ms deadline outlasted, fetched and rebuilt the whole log again. The log is now rebuilt
 >   a payload a slice by a task of the owner shard, the archive, the restore and the making each a turn, and a later
->   attempt joins the task running (`a_live_takeover_is_rebuilt_in_turns_and_joined_while_it_runs`; the bug record of
->   2026-11-18, "a live takeover made its volume in one turn"). Still owed: the archive's layout and the restore in quantum
->   slices (each one turn, about 0.1 s at 300 MB), the first publication's whole entry (the item above), and a sealed
->   volume's restore.
+>   attempt joins the task running (`a_live_takeover_is_fetched_and_rebuilt_in_turns_and_joined_while_it_runs`; the bug
+>   record of 2026-11-18, "a live takeover made its volume in one turn"). **Its fetch closed the same day (A-386, g251):**
+>   the candidate's answer (every entry cloned, then copied into one growing answer) and the successor's decode (every
+>   payload copied out) were each one turn of a control shard, 406 MB of log beside a 557 ms poll in a nemesis run
+>   (seed 18189587465523915115); the answer is now laid out a copy slice a turn on a task of the serve loop and handed to
+>   the transport uncopied, and the successor reads the payloads in place as it applies them (the bug record of
+>   2026-11-18, "a takeover fetch copied the whole log in one turn"). Still owed: the archive's layout and the restore in
+>   quantum slices (each one turn, about 0.1 s at 300 MB), the first publication's whole entry (the item above), a
+>   sealed volume's restore, and the plain (unlogged) takeover's restore and population, still one owner-shard turn
+>   behind a call whose deadline is a period (g232's kernel base volume: 97,254 files, 1.99 GB, seconds of one poll).
+>   **The restore's steps exist (A-391, g251, 2026-11-18):** `slates_archive::Planning`, `Planned::restoring` and
+>   `Restoring` make a restore a piece at a time (no piece past one chunk's bytes but a merge onto a file's growing
+>   piece); the server still calls the one-call `restore` until the population in steps and the plain takeover path's
+>   owner-shard task follow (g251's next change).
 >   - **Measured (2026-11-18):** g251's trace of the nemesis spin kills found a taken-over volume's first publication
 >     (`fleet::published_before_served` -> `live_ship::published`, its whole entry) at 1.06 s in one turn; the
 >     measurer's 32-writer run (128 MiB, diag-measurer-7) lost a daemon to the watchdog in 3 of 8 runs at 1,000-1,002 ms
@@ -648,13 +688,16 @@
 >   DAX range table records each range answered, and a successor takes the objects back, ingests the guest's unsynced
 >   stores before it serves anything and answers the device with the same objects; a stream keeps its resync through
 >   its guest's maps. **Owed:** Windows on Shards' handle path, and a write log for a Windows stream, whose acknowledged
->   writes a death still loses whether or not it is resynced. Found with A-365 (Linux): A-197's writable copies are
->   taken back awake before the write log's replay, so a logged write a client's store followed can be written over
->   that store at a takeover (DAX objects are kept dormant through the replay for that reason); its tests write
->   through no other path before the client's store. Found beside it (Linux and macOS): a resynced stream whose dead daemon's
+>   writes a death still loses whether or not it is resynced. Found with A-365 (Linux), **fixed by A-389 (2026-11-18)**:
+>   A-197's writable copies were taken back awake before the write log's replay, so a logged write a client's store
+>   followed was written over that store, in the client's own map, at a takeover; they are kept dormant through the
+>   replay and woken after it, as A-365's DAX objects are (`crates/server/tests/held_copy_replay.rs`, Linux). Found
+>   beside it (Linux and macOS): a resynced stream whose dead daemon's
 >   log overflowed is not told which writes it lost (a FUSE mount is, `LostWrites`; counted,
->   `shards.resync_writes_unreported`); a stream's `FORGET`s are not logged, so a resynced stream keeps the references
->   a lost one gave back until it ends; and a stream's `close` publishes even when the log holds every write it
+>   `shards.resync_writes_unreported`); a stream's `FORGET`s were not logged, so a resynced stream kept the references
+>   a lost one gave back until it ended (**fixed by A-390, 2026-11-18**: logged as a mount's are, where the anchor holds
+>   the stream's resync end; `shards_resync_restart`'s nameless file stays let go across the death); and a stream's
+>   `close` publishes even when the log holds every write it
 >   acknowledged, where a mount's skips it (A-63's flush rule: a FUSE request that published took 105 us p50 against
 >   15 us for a read, 2026-10-06).
 >   Shards owes its device's half, after its v0.8.0 tag.
@@ -745,6 +788,12 @@
 >   an overlay's drift is built (`StatusReport::base`, `CONTRACT` = 8), and a presentation's conflicts are read typed
 >   from its entries;
 > - owed: a typed field on the wire for a merge's versions (the work's base beside the head);
+> - the async form (R6), first piece built (`CONTRACT` = 31): `AsyncInstance` over a host's `Reactor`, awaiting
+>   provisioning, a snapshot, a status and a destroy; handing it back stops its completion bridge, which took the
+>   synchronous form's wakes (`docs/bugs/2026-11-18-the-async-signal-took-the-synchronous-forms-wakes.md`); owed: the
+>   paged verbs, landings, merges, policies and observation, awaited the same way; and the Node SDK's `Client`, whose
+>   synchronous verbs park beside the bridge its `completionFd()` starts (the same stolen wake, on macOS and Windows;
+>   reported, not changed);
 > - a run of the Linux and Windows arms (mount, the CLI's Windows unmount): not compiled on the Mac that built piece 4.
 
 > **git, Mercurial and Subversion over the WinFsp drive (2026-11-17, Part 6 "Real workloads", §4.6; A-300; Ada's
@@ -2722,6 +2771,9 @@
 >       now it marks the shard its region names and the doorbell thread kicks only the shards marked. Each shard's
 >       parks fell 59% and the shards' CPU 20 to 34% at 1,000 clients; the latencies moved with the box's load (14 to 52)
 >       more than with the change, so no latency is claimed for it (BENCHMARKS, 2026-11-18).
+>     - **Closed: an ask waiting out the batch before it (A-388, 2026-11-18).** One batch of asks was out to an owner at
+>       a time, and the wait for it was about half of an ask's way to the owner (p99 1.6 to 2.1 ms for submits and
+>       rebases at 50 ms); a shard now keeps two out.
 >     - **Open, the hops (by the trace):** an edit of a work off its client's shard crosses four thread hand-offs (the
 >       client's shard, the work's, the owner's, back), each waiting for its thread to run; and a first touch, a
 >       verdict, a rebase and a read of the green each queue on the owner's one thread.
@@ -2804,10 +2856,12 @@
 > - a holder's seed gathers the size its held manifest declares, at most a chunk's bytes an extent, uncharged, as the
 >   one-call restore before it was: an owner's manifest naming one chunk many times makes a holder gather that many
 >   copies. The seed's transient bytes (gathered, decoded, seeded) want charging to the shard's budget;
-> - sibling, found reading `held_inputs` (not changed here): its restore cap is the archive's distinct chunks' bytes and
+> - ~~sibling, found reading `held_inputs` (not changed here): its restore cap is the archive's distinct chunks' bytes and
 >   one more chunk, on the rule that an inputs archive names each chunk once. A fixed-size cut names a chunk again
 >   wherever the inputs repeat a chunk's bytes at a chunk boundary (two identical runs of a chunk or more), and such
->   inputs are refused `merge.inputs_undecodable` for good. A failing test is owed before any change.
+>   inputs are refused `merge.inputs_undecodable` for good. A failing test is owed before any change.~~ Closed by A-383
+>   (2026-11-18): such inputs were refused `merge.inputs_unheld` (not `undecodable`) at every shipment; a holder now
+>   gathers them extent by extent, charged to its shard's budget while it recomputes.
 >
 > **Fixed 2026-11-18 (g232, A-313): a restarted holder refused every later version of its greens.** A warm restart keeps
 > a holder's accepted records and held inputs, but its replica of each green lived in memory alone, so it answered every
@@ -2823,6 +2877,27 @@
 >   holder rebuilds such a green and refuses it again only at the version that mismatched;
 > - a rebuild over a long chain recomputes every version the holder accepted (300,000 at the 100,000-client rung's three
 >   rounds), since the holder keeps no checkpoint of its replica; the holder's growth per version is A-238's owed item.
+>
+> **Fixed 2026-11-18 (g232, A-385): a holder's replica of a green kept every version's values.** An owner folds its
+> green's histories to its per-green budget, never past a live reader's version; a holder's replica, the engine it
+> recomputes every version on and a takeover adopts, folded nothing. Now each merge record names where the owner's engine
+> had folded (record format 3) and the holder folds its replica there once it holds the version, as a rebuild does at
+> each version. Test: `a_holders_replica_keeps_no_more_history_than_its_owner` (`crates/server/tests/fleet.rs`): 130
+> versions of 4,043 bytes under a 256 KiB chain cap, both replicas folded below 66 holding 260,288 bytes of history, the
+> owner's to the byte; with the fold a no-op they held 524,643 bytes, folded below 0 (kiln r133, Mac Studio). Still
+> open, A-238's owed: a holder's ledger records and held inputs grow per version until a durable checkpoint of the
+> replica on the holder lets them go below the floor.
+>
+> **Fixed 2026-11-18 (g232, A-383): a version whose inputs repeat a chunk was refused by every holder, for good.** A
+> holder restored a version's inputs within the archive's distinct chunks' bytes and one chunk more; inputs cut at fixed
+> offsets name a chunk at several extents wherever they repeat a chunk's bytes at the cut (a run of one byte three chunks
+> long is enough), so every holder refused the version `merge.inputs_unheld` at every shipment and, at `f = 1`, it never
+> placed. Now a holder gathers the inputs extent by extent and charges what the recomputation holds (twice their declared
+> size) to its shard's budget first, refusing `merge.inputs_over_budget` past what it can admit. Test:
+> `a_version_whose_inputs_repeat_a_chunk_is_recomputed_by_every_holder` (`crates/server/tests/fleet.rs`): passed in
+> 4.15 s; red on main's holder code, the submit `DeadlineExceeded` after 60 s and each holder 4,583 refusals (kiln r49,
+> Mac Studio; `docs/bugs/2026-11-18-inputs-repeating-a-chunk-were-refused-by-every-holder-for-good.md`). Still open:
+> the recomputation of one version, gather included, is one call, costing what the increment's size costs.
 >
 > **Fixed 2026-11-18 (g232): the late-submit test judged a green's history by factors no measurement gave.**
 > `a_submit_late_in_a_greens_history_is_answered_as_fast_as_an_early_one` (`crates/server/tests/fleet.rs`) held the median
@@ -3194,8 +3269,10 @@
 > (`FleetReport::failover`, `CONTRACT` 24; `slates status` prints `fleet_failover`), each term with the measurements
 > behind it. **Since A-375 the failover-shaped waits read it** (a forward's bound, the location round's cap, a held
 > reply's total, a takeover's attempts), fanned to every shard in whole periods. **Since A-384 a CLI attachment's term is
-> its holder's** (`min(F, the gaps' tail + W)`, renewed by every verb and by a holder's `Renew`, fresh after a restart);
-> `slates attach --hold` and the library's and SDKs' attachment objects as holders are owed next. Owed, each in its own
+> its holder's** (`min(F, the gaps' tail + W)`, renewed by every verb and by a holder's `Renew`, fresh after a restart),
+> held by `slates attach --hold` and the library's `slates_client::Hold` (the SDKs make no CLI-form attachment: theirs
+> end with their client); owed: a laptop's failover delay counting its anchor's supervision window as its detection, and
+> the volume's write lease (D-16) taking its holder's term. Owed, each in its own
 > change: each other lease takes its term from a φ-accrual
 > detector of its own holder's renewals (a CLI attachment once the CLI process sends a keepalive); `W`'s floor from the
 > pulses' running wake delay; then `FAILOVER_SLO_NS` and `with_failover_slo` go, since nothing sets `F`. The boot-time

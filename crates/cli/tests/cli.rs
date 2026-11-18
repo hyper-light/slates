@@ -13317,3 +13317,84 @@ fn assert_gone(instance: &str, id: &str) {
     "the destroyed volume is not found: {err}"
   );
 }
+
+/// Shape: how long the hold flow leaves its held attachment with no verb: several of the bare term a laptop daemon gives a
+/// CLI attachment nothing renews (its failover delay there, the recovery budget, A-363 and A-384), so only the hold kept
+/// it, and long enough after the hold's end for any term to lapse.
+const HOLD_IDLE: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// A-384, the CLI's holder: `slates attach --hold` keeps a CLI attachment alive from its process, and its end lets the
+/// attachment lapse. Do: on an anchored daemon, create a volume; run `attach ID --write --hold` in the background and
+/// read the attachment it names; leave the attachment with no verb for [`HOLD_IDLE`]; write a file under it from another
+/// `slates` process; kill the holding process; wait [`HOLD_IDLE`] again; write under it once more. Expect the holding
+/// process still running before its kill, the first write accepted (the hold kept the attachment through several bare
+/// terms), and the last refused `AttachmentExpired` (exit 1: the process's end ended the renewals). Gated like the CLI
+/// flow (`SLATES_TEST_CLI=1`): an anchor, its daemon and a process per verb.
+#[test]
+fn attach_hold_keeps_a_cli_attachment_alive_until_its_process_ends() {
+  use std::io::BufRead;
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the attach --hold flow: set SLATES_TEST_CLI=1 to run it (an anchor and its daemon)"
+    );
+    return;
+  }
+  let instance = format!("cli-hold-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "held", "--bounded", "4MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let mut holder = slates()
+    .arg("--instance")
+    .arg(&instance)
+    .args(["attach", &id, "--write", "--hold"])
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
+  let named = {
+    let stdout = holder.stdout.take().expect("the holder's output");
+    let mut lines = std::io::BufReader::new(stdout).lines();
+    lines.find_map(|line| {
+      line
+        .ok()
+        .and_then(|line| line.strip_prefix("attachment: ").map(str::to_owned))
+    })
+  };
+  let Some(attachment) = named else {
+    // The holder ended without naming one: what it said is the reason.
+    let output = holder.wait_with_output().unwrap();
+    panic!(
+      "the holder named no attachment: {}",
+      String::from_utf8_lossy(&output.stderr)
+    );
+  };
+  #[allow(clippy::disallowed_methods)] // the held attachment with no verb, past several bare terms
+  std::thread::sleep(HOLD_IDLE);
+  let still_holding = holder.try_wait().unwrap().is_none();
+  let (written, _, written_err) =
+    run_with_stdin(&instance, &["write", &id, &attachment, "held.txt"], b"held");
+  let _killed = holder.kill();
+  let _reaped = holder.wait();
+  #[allow(clippy::disallowed_methods)] // the hold ended: any term lapses
+  std::thread::sleep(HOLD_IDLE);
+  let (late, _, late_err) =
+    run_with_stdin(&instance, &["write", &id, &attachment, "late.txt"], b"late");
+  drop(anchor);
+  assert!(
+    still_holding,
+    "the holding process was still running before its kill"
+  );
+  assert_eq!(
+    written, 0,
+    "the hold kept the attachment through several bare terms: {written_err}"
+  );
+  assert_eq!(
+    late, 1,
+    "the attachment lapsed once its holder ended: {late_err}"
+  );
+  assert!(late_err.contains("AttachmentExpired"), "{late_err}");
+}

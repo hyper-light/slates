@@ -2051,6 +2051,8 @@ fn serve_request(
   // it is acknowledged before the next publication, and a death first would otherwise take it from the volume (A-316).
   #[cfg(unix)]
   log_write(s, stream, total, &answered);
+  #[cfg(unix)]
+  log_forgets(s, stream, total, &answered);
   stream.owed = answered.frame;
   stream.sent = 0;
   // A reply after which the guest keeps an effect across a restart waits for the publication that makes it durable
@@ -2165,6 +2167,28 @@ fn log_write(s: &mut ShardState, stream: &ShardsStream, total: usize, answered: 
       s.count(crate::verbs::WRITE_LOG_UNWRITTEN, 1);
     }
   }
+}
+
+/// Logs the lookups the `FORGET` or `BATCH_FORGET` at the head of `stream` (`total` bytes) gave back, where the anchor
+/// holds the stream's resync end (A-390): a successor that keeps the stream gives them back again, as a FUSE mount's
+/// does (A-154's sibling), since the guest never resends a `FORGET`. Before A-390 a resynced stream kept the references
+/// a lost one gave back until it ended, and an unlinked file its guest had let go stayed referenced. A stream no
+/// successor keeps ends at its daemon's death and every reference it held goes with it, so nothing is logged for it.
+#[cfg(unix)]
+fn log_forgets(s: &mut ShardState, stream: &ShardsStream, total: usize, answered: &Answered) {
+  if !matches!(answered.opcode, Some(Opcode::Forget | Opcode::BatchForget))
+    || !stream.resync.as_ref().is_some_and(resync::Resync::held)
+  {
+    return;
+  }
+  let mut forgotten = Vec::new();
+  let request = stream.inbound.get(LENGTH_BYTES..total).unwrap_or(&[]);
+  kernel_changes(request, answered.reply(&stream.outbound), &mut |change| {
+    if let KernelChange::Forgot { node, count } = change {
+      forgotten.push((node, count));
+    }
+  });
+  crate::write_log::log_forgets(s, (stream.volume, stream.attachment), forgotten);
 }
 
 /// The node, offset and bytes of the `WRITE` request `request` is; `None` for any other.

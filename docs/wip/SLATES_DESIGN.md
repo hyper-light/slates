@@ -853,6 +853,7 @@ plan schedules.
 - Lost: Brotli, xz, fixed "save 12.5%" rules (sector-rounding artefacts), SHA-256 (not fixed-cost across the matrix), CDC everywhere.
 - Amended (A-53, 2026-09-30): format minor 3 — every node's four times are signed and complete (access, modification, change, birth) and its extended attributes are carried as names with value extents over the archive's chunks, all covered by the manifest identity; a takeover successor restores them (AUD-29-56, `docs/bugs/2026-09-30-a-placed-archive-lost-attributes-and-times.md`).
 - Amended (A-20, 2026-09-15): the manifest's per-node metadata carries the owner (uid, gid), and the root directory's own metadata (mode, owner, times) rides ahead of the tree in the manifest section — format minor 2, both covered by the header's manifest identity — so replication, clone-from-archive and a takeover successor's rebuild (`materialize_taken_over`) reproduce ownership, not only modes and times; under the NFS edge's POSIX access control a tree rebuilt as `0:0` would have shut its owner out (`docs/bugs/2026-09-14-volume-root-owned-by-root-wheel.md`).
+- Amended (A-391, 2026-11-18): a restore is made in bounded steps (`slates_archive::Planning`, `Planned::restoring`, `Restoring`): the tree planned a node or a directory's entry at a time, the chunks indexed and the need counted an extent at a time, then the buffers allocated, the references gathered, each extent filled from its chunk (decoded once, with the first extent that names it) and each piece laid into its file, one at a time, each step until its caller's `spent` says the share is spent. `restore` and `restore_needed` are the steps run to their ends, one code path. A takeover successor restores in turns of its shard's clock through it (g251; the plain takeover's restore of the 1.99 GB kernel base volume ran seconds in one poll, g232).
 - Erasure coding: the format carries a fragment record kind from the first release: a chunk may be held as k data and m parity fragments (Reed-Solomon), each fragment with its own BLAKE3, the chunk's identity unchanged, so replication, archive and clone-from-archive all understand fragments from the first release; the policy that codes cold sealed content instead of replicating it is measured in Phase 8 (D-O6): the class boundary comes from measured read rates, the (k, m) from the failure-domain tree, and the reconstruction cost from the profile [A: Rashmi et al., EC-Cache, NSDI 2016; A: Muralidhar et al., f4, OSDI 2014; A: Huang et al., LRC, ATC 2012].
 
 ### D-18 Durability: explicit client, process, host and region boundaries
@@ -2865,7 +2866,9 @@ before the report is published, so a tool never reads attributes newer than the 
 > attachment's own (`Volume::forget_for`). A `FORGET` the log cannot take forces a publication; one still refused is
 > counted (`write_log.forget_unlogged`), never taken for a lost write. Proven by
 > `the_lookups_a_dead_daemon_was_given_back_after_its_last_publication_stay_given_back`
-> (`docs/bugs/2026-11-08-a-forget-after-the-last-publication-leaked-its-lookup-reference.md`).
+> (`docs/bugs/2026-11-08-a-forget-after-the-last-publication-leaked-its-lookup-reference.md`). A Shards stream whose
+> resync end the anchor holds logs its guest's `FORGET`s the same way since A-390 (2026-11-18); before, a resynced
+> stream kept the references a lost one gave back until it ended.
 > **Every record names its volume (2026-11-18, A-166's sibling sweep).** The replay found a record's volume by its inode
 > number's prefix, and a clone keeps its origin's numbers for every file it inherits, so a write a dead daemon logged to
 > a clone's inherited file was replayed into the origin (or another clone of it), and the clone lost it. Each write and
@@ -4448,8 +4451,8 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
   nothing by itself: recovery keeps a Shards attachment whose resync end the anchor held (Linux, A-316; macOS, A-339)
   and serves it on a fresh stream, its owner view, its SETXATTR form and token from the hold, its references and opens
   from the image, the reply the dead daemon published and never wrote answering the request the device resends, and
-  the writes it acknowledged after its last publication replayed from the write log (A-63) as a mount's are; it removes
-  any other's record, as before.
+  the writes it acknowledged and the lookups its guest gave back (`FORGET`, A-390) after its last publication replayed
+  from the write log (A-63) as a mount's are; it removes any other's record, as before.
 
 > **Status (2026-10-24).** Built and proven by use, in-process: `crates/server/src/shards.rs` (the serve task),
 > `crates/ipc/src/stream.rs` (the pair), `crates/bridge-fuse/src/shards_fs.rs` (the frames and their answers),
@@ -6236,6 +6239,24 @@ creator plus these exceptions; this adds no global lookup catalog or per-write c
 > Owed: the holders' side (a committed move installs the new owner's authority on the object's copies, fencing the
 > old owner) and the planned handoff in the daemon (§4.10 "Ownership follows the writer").
 
+> **Status (2026-11-18, A-382: a host admitted again gives up its own authority on its copies).** The host-epoch bump
+> fences every object the host owned, and its re-admission yields its catalogued volumes (A-334). The same install now
+> lets go every register copy the host held, as a candidate, under its own authority: the copies of the objects it took
+> over before it was retired (`readmission::let_go_own_registers`, counted `fleet.readmission.registers_let_go`). Its
+> takeover completed before the re-admission (`RegionalConfiguration::admits`), so each such object is its successor's.
+> The configuration no longer names that successor, and the re-admission forgot the host's own routes, so nothing else
+> moves those copies: kept, each refused the successor's every record `ForeignGeneration`. A live log ships only to a
+> holder that holds its catalog, so the host's live copy never caught up (the chaos nemesis, CI diag 44345243646: 660
+> to 796 such refusals a run). Let go, the successor's next record makes the copy afresh, as it makes any new
+> candidate's, and its live log follows. The host keeps the content it holds for those objects (A-335). A volume a node
+> lost to a successor, yielded or with its log fenced, ships no catalog or head record (`fleet::unplaced_heads`), since
+> a copy made afresh takes the first member's record it meets as its owner's. Held by
+> `every_copy_catches_up_once_the_creator_takes_its_volume_back_from_the_adopter`,
+> `every_copy_catches_up_once_the_third_node_takes_the_volume_from_the_adopter` and
+> `a_superseded_owner_restarted_warm_ships_no_record_of_the_volume_it_lost` (`crates/server/tests/fleet.rs`). Owed: the
+> let-go is kept by the control shard's next publication, so a warm restart before it restores the copies; and the
+> yield itself is memory-only (`ShardState::yielded`), so a warm restart forgets it.
+
 **Lookup.** A volume id carries its creator host. A lookup by id routes to that host, or, when
 the configuration records a takeover of that host, to the candidate that rendezvous ranks first
 among the survivors of its neighbourhood at the takeover generation; an ownership or home move is a configuration exception naming the affected volume and its
@@ -6967,9 +6988,27 @@ reconstruction budget are derived, never fixed (D-O6).
 > with its turns, made, or refused) is what a later attempt reads before it fetches anything: it joins one running
 > (`fleet.materialize.waits.making`, its turns counted as progress against the give-up bound) and reads one ended; the
 > log is rebuilt once a takeover (`fleet.live.rebuilds_begun`). Held by
-> `a_live_takeover_is_rebuilt_in_turns_and_joined_while_it_runs` (`crates/server/tests/fleet.rs`). Owed: the archive's
-> layout and the restore are each one turn whatever the volume (about 0.1 s each at 300 MB), and the first publication's
-> live whole entry is sealed in one turn (g230's item, the "one-turn walks of a whole volume" in GAPS).
+> `a_live_takeover_is_fetched_and_rebuilt_in_turns_and_joined_while_it_runs` (`crates/server/tests/fleet.rs`). Owed: the
+> archive's layout and the restore are each one turn whatever the volume (about 0.1 s each at 300 MB), and the first
+> publication's live whole entry is sealed in one turn (g230's item, the "one-turn walks of a whole volume" in GAPS).
+>
+> **Status (2026-11-18, A-386, g251: a takeover's fetch of a live log in turns).** The fetch the rebuild starts from was
+> still one turn on each end: the candidate the successor adopted cloned every entry it held and copied them all into
+> one answer grown as it went, in a turn of its control shard, and the successor copied every payload back out of the
+> answer in a turn of its own (a nemesis run held 34,814 entries, 406 MB appended, beside a control shard's single
+> 557 ms poll, seed 18189587465523915115). Now the candidate lays its answer out on a task of its serve loop
+> (`live_ship::serve_fetch`, `FetchAnswer`): the fence raised and published in the first turn, then the entries a copy
+> slice a turn (`DaemonConfig::copy_slice_bytes_within` of the takeover's quantum, an entry at least, counted
+> `fleet.live.fetch_slices`), into a buffer reserved whole, which the transport takes as it is (`Endpoint::reply` by
+> value, `StreamSender::write` keeping it as the stream's buffer). The successor reads the answer's reply and leaves the
+> payloads in place (`slates_db::live::FetchedLog`): each is read and checked against the hold's cap when the rebuild
+> applies it, and a payload whose framing broke in transit stops the rebuild `fleet.live.takeover_refused.fetched`, which
+> is not kept as the log's refusal, so the log is fetched again. A successor that holds the adopted head itself lays its
+> own copy out the same way. A copy that moved while its answer was laid out (a later successor's fence, another head,
+> entries gone, the copy let go) answers as a fetch arriving then would. The wire is unchanged. Held by the same fleet
+> test (the answer an entry a turn under a cut quantum, both survivors' longest steps under the window, the successor's
+> failover estimate timing the volume) and `a_fetch_answered_an_entry_a_turn_is_the_answer_laid_out_at_once`
+> (`crates/server/src/live_ship.rs`).
 >
 > The same change gives every sliced walk its turns on the shard that drives it (`xshard::Turns`). A walk is driven by a
 > task of the control shard, one `xshard::call_within` a slice; a call to another shard is a task there, a turn of its
@@ -8453,6 +8492,22 @@ it builds against the contract and adds to it rather than around it.
 > its attempt took, then a `LandingFinished` whose outcome is `Refused`, or `Aborted` once it wrote an entry
 > (§4.15's status of the same day); such an end that names no manifest carries no `verification`. No type changed; the
 > `audit` verb's answer did, so the number moves. Until then a refused landing's trail ended at its grant.
+> **`CONTRACT` = 31, the async form (R6), first piece:** `AsyncInstance` over a host's `Reactor`. The host lends one
+> wait: the client's completion signal readable, or the driver's next deadline, whichever comes first. Each call goes
+> through `slates_client::driver`, one at a time: submit, arm, pump, wait, tick. A future dropped mid-call cancels its
+> ticket, so a cancelled call leaks nothing and the instance goes on serving. It awaits provisioning from every source,
+> a snapshot, a status and a destroy. `into_instance` and `new` move between the forms. `into_instance` stops the
+> completion signal first: on macOS (and Windows) it is a bridge thread waiting where a parked synchronous call waits,
+> and the daemon wakes one waiter per reply, so with the bridge running a parked synchronous call slept to its reply
+> deadline (16 to 19 of 20 calls, Mac Studio, 2026-11-18;
+> `docs/bugs/2026-11-18-the-async-signal-took-the-synchronous-forms-wakes.md`). Proof:
+> `an_async_instance_provisions_snapshots_reports_and_destroys` (`crates/api/tests/api.rs`), whose reactor is a
+> blocking `poll(2)` and whose executor is a bare poll loop: no runtime is added (D-9). It drops 65 calls, twice the
+> client's outstanding bound and one more, then makes 20 synchronous calls that each park. Each guard turns it red
+> alone: a parked call that waited its whole deadline without the bridge's stop; the 29th round refused
+> `AcknowledgementOwed` without the periodic acknowledgement; a call left waiting past the suite's wait without the
+> cancel. Owed: the paged verbs (list, read, a landing's entries), landings and merges, and the policy and observation
+> verbs, awaited the same way.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -9983,7 +10038,8 @@ compose: `map(a..c) = map(b..c) ∘ map(a..b)`. Deltas older than the derived re
 checkpoint deltas by the same composition, which is exact, so every base back to green's origin
 maps at O(log) checkpoint lookups plus the raw deltas after the last checkpoint. (Since A-238 the durable
 checkpoint is the green's state at its reachable floor, and a base below it is refused `UnknownBase`: no live reader
-names one.)
+names one.) A holder's replica folds where its owner's engine had folded when it made the merge record the holder
+holds (the record names the floor), so no replica keeps more history than its owner (A-385).
 
 **The verdict, two pure passes.** Inputs: the mapped increment, the effect ranges of the
 intervening deltas, and the referenced immutable content. Pass one: a sweep line over the
@@ -10023,7 +10079,11 @@ manifest identity from the record's inputs before serving the version to any att
 compares its head identity with the record at every version; a mismatch refuses that version on
 that holder, fatal-and-loud, before any read. On a laptop the owner is the only holder and no
 second computation exists; that is the derived N=1 case, and the differential test proves the
-fleet path computes the same answers.
+fleet path computes the same answers. A holder reads a version's inputs from its content hold extent by extent, as
+the inputs were cut, so inputs that repeat a chunk's bytes (one chunk named at several extents) read as the file
+they are; what the recomputation holds of them, the gathered bytes and the increment decoded from them, is charged to
+the holder's shard's budget before a byte is reserved and released once it has recomputed, and a record whose inputs
+the shard cannot admit waits, counted `merge.inputs_over_budget`, as one whose inputs are not yet held (A-383).
 
 > **Status (A-247, 2026-11-08).** A green's works are served on the partitions their names hash to, and only the verdict
 > and a first read of a base file are the green's: a verb that needs either is parked on the work's shard and resumed
@@ -16547,9 +16607,10 @@ the green's shard.
     which the work keeps until its base moves; a rebase answers those of its restated journal. A submit or rebase
     fetches what its journal names that the work lacks, composes by the owner's own function over `Base::for_names`, and
     sends the increment alone. The owner only judges.
-  - *Asks are batched per owner.* A shard keeps one batch of asks out to each owner at a time, at most a client
-    region's credit, waiting for room on the owner's channel; one message an ask flooded the channels at 3,000 clients
-    and stalled every run.
+  - *Asks are batched per owner.* A shard keeps at most two batches of asks out to each owner at a time (A-388; one
+    until 2026-11-18), each at most a client region's credit, waiting for room on the owner's channel; one message an ask
+    flooded the channels at 3,000 clients and stalled every run, and one batch at a time made an ask wait for the batch
+    before it to come back before it left.
   - *A creation holds its id and its name* while the owner admits it (`Op::WorkCreationPending`, settled with the
     creation, dropped at a start). The id is the creating transaction's sequence, so a parked creation, which commits
     nothing, would share it with every other parked in the same step.
@@ -18158,6 +18219,7 @@ Applied in the same change to:
 - **Owed.**
   - At `f > 0` the holders' replicas and records grow per version. ~~A takeover adopts the whole chain.~~ Since A-333
     (2026-11-18) a takeover records nothing of the chain up to the adopted version: its successor's holder ledger is it.
+    Since A-385 (2026-11-18) a replica folds where its owner folded; its records and held inputs still grow.
   - The 40 bytes a checkpoint keeps for each accepted identity.
   - The checkpoint walk is not sliced.
 
@@ -19320,7 +19382,10 @@ Hypervisor's and QEMU's socket-route cells), §4.6 (the DAX matrix's status) and
     against writes, a whole number of pages: `PeerObject::adopt`); adopts it at the exact slot and generation its
     backing had (`ShardsBackings::adopt_peer`, over the slab's `insert_at`), so the map id its client holds names it
     again; and holds the map under its client. Adoption precedes the write log's replay (A-63), so every write the
-    replay applies is written into the copy by the volume's write boundary, as every change is.
+    replay applies is written into the copy by the volume's write boundary, as every change is. (Amended 2026-11-18 by
+    A-389: the copy is kept dormant through the replay and woken after it. It already holds every write the dead daemon
+    made, in order with its client's stores, and the replay written into it wrote a logged write over a store the
+    client made after that write.)
   - **The holder claims it.** A client reconnects under its own id; `slates pmem` watches its control socket for its
     daemon's departure (`Client::daemon_watch`, `POLLRDHUP`) and syncs at once, which reconnects and claims the map. A
     map no holder claims within the client's reconnect budget (recovery 1 s + liveness 1 s), counted from the shard's
@@ -27222,7 +27287,7 @@ Applied in the same change to:
   same objects, so the guest's maps stay right. An object no kept stream claims is let go, its ranges forgotten.
 - **Found beside it** (GAPS): A-197's writable copies are adopted awake before the replay, so a logged write a client's
   store followed can be written over that store at a takeover, the same hazard; its tests do not write through another
-  path before the client's store.
+  path before the client's store. (Fixed by A-389.)
 - **Evidence.** On a Mac Studio (kiln runs r3427 to r3489): the focused tests pass, the restart test among them, and the
   existing stream DAX tests; each of eight guards removed alone fails the restart test (the dormancy, the hold, the
   range's record, its writable mark, the adoption's ingest, the wake, the session's adoption, and the resync kept at a
@@ -27783,7 +27848,7 @@ tick), `crates/server/src/verbs.rs` (the gather, the target bound), `crates/ipc/
   kinds), `crates/db/src/catalog.rs` (`AuditKind::GrantExpired`, appended and published, D-15),
   `crates/server/src/landing.rs` (`end_expired_grants`, `record_expiry`), `crates/land/src/grant.rs` (`check`),
   `crates/ipc/src/protocol.rs` (the wire's typed `AuditKind::GrantExpired`, appended and published), `crates/api`
-  (`AuditKind::GrantExpired`, `CONTRACT` 31), GAPS,
+  (`AuditKind::GrantExpired`, `CONTRACT` 32), GAPS,
   `docs/bugs/2026-11-18-a-grant-a-landing-found-past-its-term-was-never-ended.md`.
   - The sweep records each expiry with a `grant_expired` record in one atom, under the principal the grant was made
     for (no one acted) and the manifest it bound; on another shard the committed atoms' records are owed to the
@@ -28105,3 +28170,280 @@ Applied in the same change to: A-309's holder rule (above), GAPS (the unasked ho
 Applied in the same change to: §4.4 "Derived constants" (its status), GAPS (the `LIVENESS_BUDGET_NS` entry),
 `crates/ipc/src/protocol.rs`, `crates/ipc/tests/wire_order.txt`, `crates/client/src/client.rs`,
 `crates/server/src/{verbs,state,daemon}.rs`, `crates/server/tests/attachment_term.rs`.
+
+**A-384's holders (the second change, the same day).** The library's holder is `slates_client::Hold`
+(`crates/client/src/hold.rs`): made for an attachment, it renews it once before it returns (so a refusal comes back at
+once), then from a thread of its own over a client of its own, at the cadence each `Renewed` names, until it is dropped
+(the stop channel's sender dropped ends the renewer's wait at once, and the thread is joined) or the daemon refuses a
+renewal (`Hold::lost`, `Hold::wait_lost`). Its own client, because a renewal must not wait behind its holder's other
+calls on one ordered channel; it waits on a channel with a timeout, never a sleep (D-9). The CLI's holder is `slates
+attach ID --hold` (`crates/cli/src/verbs.rs`, `hold`): it attaches in the CLI's form, says so as `attach` does, and
+waits on a `Hold` until the daemon refuses it; the process ending, however it ends, ends the renewals, so no signal
+handling is needed and a killed holder behaves as an interrupted one. The SDKs (Python, Node) make no CLI-form
+attachment: their verbs ride their own client, and a library client's `attach` takes the root form, which ends with
+that client, so neither has an attachment for a term to judge; a library user who makes a CLI-form attachment holds it
+with a `Hold`. `docs/cli.md` states the term as A-384 made it (it still named the 10 s SLO). Held by
+`a_hold_keeps_an_idle_cli_attachment_and_its_drop_lets_it_lapse` (`crates/client/tests/client.rs`) and
+`attach_hold_keeps_a_cli_attachment_alive_until_its_process_ends` (`crates/cli/tests/cli.rs`, gated by
+`SLATES_TEST_CLI`). Owed beside them: a laptop's failover delay counts its anchor's supervision as its detection (the
+watchdog's window `W`, A-232: a stuck daemon is ended and restarted), so a bare attachment's ceiling there is `W` plus
+the recovery, not the recovery alone; and the volume's write lease (D-16) takes its holder's term too.
+Measured on the Mac Studio (2026-11-18, load 22-23, debug build): the library test held an attachment through three 2 s
+ceilings with no verb and saw it refused `AttachmentExpired` two ceilings after the hold's drop (10.8-10.9 s); the CLI
+flow, twice, held one through 4 s with no verb, wrote under it from another process, and saw it refused once the holding
+process was killed (11.9-12.3 s); the CLI's parse tests take `--hold` (29 of 29; its first run refused the flag, missing
+from the global switch table). Red-checked: a `Hold` whose renewer renews nothing fails the library test's held write,
+and a `--hold` that returns after attaching fails the CLI flow (its holder gone before the write).
+
+### A-382 — A host admitted again lets go its own register copies, and a volume it lost ships no record: the superseded adopter's copy catches up (2026-11-18, g230, scale-out; §4.8 "Authority scope", "Promotion and takeover"; the chaos nemesis's convergence, seeds 6876545201569229162 and 7236833171758868842; A-334's holder side)
+Applied in the same change to: §4.8 "Authority scope" (its status), GAPS (the entry of 2026-11-18), the bug record
+`docs/bugs/2026-11-18-a-readmitted-adopters-own-register-copies-refused-its-successor-for-good.md`, and the code below.
+- **What was there.** A host the council retired while it was away, admitted again under its id, yields the volumes it
+  catalogues (A-334), and its re-admission forgets its own routes (`FleetNode::install_configuration`). It also held
+  register copies, as a candidate, of the objects it had taken over before it was retired, and they still named it as
+  their owner, at the generation of its own takeover. The install moves a held copy's authority only to the owner its
+  route names (`fleet::reconcile_held_authority`), and nothing routed those objects any more, so the copies kept their
+  authority for good.
+- **What it broke.** Convergence. The object's next owner shipped its catalog and head to every candidate, and the
+  re-admitted host refused each `ForeignGeneration` (660 to 796 a run in the nemesis's four dumps, CI diag 44345243646).
+  A live log ships only to a holder that holds its volume's catalog (`live_ship::pending_sends`), so the host's live
+  copy, at the fence of its own takeover, was never sent the successor's log and stayed behind it for a whole fleet
+  wait. Reproduced in process on both Linux arches (CI diag 44354746021): the creator at fence 3 (head 9), the third
+  node at its head, the adopter still at fence 2 (head 5), and the creator never sent it anything.
+- **The rule.** At the install that re-admits the host (its own host epoch advanced), the control shard lets go every
+  held register copy whose authority names the host (`readmission::let_go_own_registers`, counted
+  `fleet.readmission.registers_let_go`): its takeover completed before it could be admitted again
+  (`RegionalConfiguration::admits`), so each such object is its successor's, and the successor adopted every position of
+  it that ever committed. The successor's next record makes the copy afresh, as a new candidate's
+  (`fleet::check_held_record`), and its live log follows. The content held for those objects stays (A-335). A volume
+  this node lost to a successor (yielded, A-334, or its log fenced, A-338) ships no catalog or head record
+  (`fleet::unplaced_heads`): its successor owns its registers, every holder refuses them, and a copy made afresh takes
+  the first member's record it meets as its owner's, so a stale catalog stamped at the sender's current host epoch could
+  have taken it before the successor's.
+- **Tests.** `every_copy_catches_up_once_the_creator_takes_its_volume_back_from_the_adopter` and
+  `every_copy_catches_up_once_the_third_node_takes_the_volume_from_the_adopter` (`crates/server/tests/fleet.rs`: the
+  A-351 scene, a volume taken back from the adopter that took it first, ending in the nemesis's `wait_caught_up`):
+  green 2 of 2 each on both Linux arches (CI diag 44358084443), and red without the let-go (the adopter's copy stays at
+  fence 2). `a_superseded_owner_restarted_warm_ships_no_record_of_the_volume_it_lost` (same file: A-344's scene, the
+  superseded owner restarted warm so its placed acknowledgements are gone): green 2 of 2 on arm64, neither other
+  node refusing any record of the old owner's in 20 periods, and red without the record half's guard, 19 refused by
+  each in 20 periods (CI diag 44360107160); the convergence scene alone never ships a stale record (red without the
+  guard, 3 of 3 runs passed there).
+- **Not this amendment.** The x86_64 runs of the same seeds ended two daemons each by their watchdogs (a shard spinning
+  1000 ms of CPU in one poll) right after the supersession: the live takeover's materialization in one turn, g251's.
+- **Owed.** The let-go is kept by the control shard's next publication, so a warm restart before it restores the
+  copies; the yield is memory-only (`ShardState::yielded`). A yielded volume's own live shipper still does period work
+  and ships (A-349's rule covers a fenced one): in 2 of 12 runs of the third node's case the superseded adopter built
+  119 and 1,714 installs for the creator, each refused `not_the_acting_owner`.
+
+### A-383 — A holder reads a version's inputs extent by extent, charged to its shard's budget, never refused for good by a cap of distinct chunks (2026-11-18, goal g232: one primary and two replicas editing the Linux kernel tree; §4.16 "Apply on holders")
+
+Applied in the same change to: §4.16 "Apply on holders", GAPS (the load test's ledger: `held_inputs`'s sibling, closed),
+`docs/bugs/2026-11-18-inputs-repeating-a-chunk-were-refused-by-every-holder-for-good.md`,
+`crates/server/src/merge_service.rs` (`held_inputs`, `HeldInputs`, `INPUTS_OVER_BUDGET`, `RECOMPUTE_COPIES`, the record
+path's release of the charge), `crates/server/src/merge_origin.rs` (`Gather::planned` and `Gather::reserve`,
+`PlannedInputs`), and the tests below.
+- **What was there.** A holder recomputing a version restored its inputs archive with `slates_archive::restore` within
+  the bytes of the archive's distinct chunks and one chunk more, on the rule that an inputs archive names each chunk
+  once (AUD-29-13: a hostile archive naming a chunk many times was refused before allocating). An inputs archive is cut
+  at fixed offsets (`merge_origin::InputsBuilder`, chunks of `MAX_CHUNK_BYTES`), so inputs that repeat a chunk's bytes at
+  the cut — a run of one byte three chunks long covers at least two whole chunks wherever it lies — name one chunk at
+  several extents and restore to more than the cap: every holder refused such a version at every shipment, counted
+  `merge.inputs_unheld` though it held the inputs, and at `f = 1` the version never placed.
+- **The rule.** The holder reads the inputs as the replica's rebuild and seed do: the held manifest planned first (its
+  one file's extents and declared size, the size no more than its extents can hold), then gathered extent by extent
+  from the hold. Before a byte is reserved, what the recomputation holds — the gathered bytes and the increment decoded
+  from them, whose post-state copies at most as many (`RECOMPUTE_COPIES`, two) — is charged to the shard's budget
+  (`Store::grow`) and released once the version is recomputed, on every path. A shard that cannot admit it refuses the
+  record `merge.inputs_over_budget`; the owner ships it again, and the holder recomputes it once it has room. The
+  hostile manifest AUD-29-13 refused is still refused before anything is allocated, now at what the shard can admit,
+  and an honest one is read whole.
+- **Tests.** `a_version_whose_inputs_repeat_a_chunk_is_recomputed_by_every_holder` (`crates/server/tests/fleet.rs`: three
+  nodes at `f = 1`, a work writes a run of one byte three chunks long, a page a request, and submits; the version is
+  accepted, both holders recompute it, and each holder's held inputs name one chunk at more than one extent, the case
+  meant); `a_holder_reads_inputs_that_repeat_a_chunk_and_charges_them_while_it_holds_them` and
+  `inputs_naming_a_chunk_past_what_the_shard_admits_are_refused_before_any_is_gathered` (`merge_service.rs`: the very
+  bytes read, twice their size charged and all of it given back; a manifest naming one chunk past what a reduced shard
+  admits refused, the budget unchanged).
+- **Measured.** Kiln r49, the Mac Studio, 2026-11-18, debug build: the fleet test passed in 4.15 s (780 edits of about
+  4 KiB; both holders at version 1; both holders' inputs name a chunk twice). Red, with the change's server code
+  reverted: the submit ended `DeadlineExceeded` at the test's 60 s, both holders stayed at version 0 and counted
+  `merge.inputs_unheld` 4,583 and 4,582 times, and the test failed after 470.8 s; with the charge taken as zero both unit
+  tests failed. The holder fleet tests the record path reaches (the mismatch, the inputs in one exchange, the record
+  issued once placed, the restarted holder, the successor one version behind, the late submit) passed on the same
+  server code, 6 of 6 (r3646).
+- **Still owed.** A version's recomputation, its gather included, is one call, costing what its increment's size costs.
+
+### A-385 — A holder folds its replica of a green where its owner folded: a merge record names the owner's fold floor (2026-11-18, goal g232: one primary and two replicas editing the Linux kernel tree; §4.16 "Position mapping" and "Apply on holders"; A-238's owed item, its replica half)
+
+Applied in the same change to: §4.16 "Position mapping", A-238's "Owed", GAPS (the load test's ledger),
+`crates/server/src/merge_service.rs` (`MergeRecordValue::folded_below`, `RECORD_VERSION` 3, `fold_replica`,
+`REPLICA_FOLDED`, the owner's record made with its engine's floor, the holder's recomputation folding),
+`crates/server/src/merge_origin.rs` (a rebuild or an advance folds at each version it recomputes),
+`crates/server/src/daemon.rs` (`Daemon::merge_history`, test support), and the tests below.
+- **What was there.** An owner folds its green's histories to its per-green budget (`settle_green_retention`: the green
+  chain cap, never past the oldest version a live reader names). A holder's replica of the green — the engine it
+  recomputes every version on, and the one a takeover adopts (A-333) — folded nothing, so it kept every value every
+  version wrote: at the goal's 300,000 versions, each replica held every version of every file edited.
+- **The rule.** Each merge record names the version below which the owner's engine had folded when it made the record
+  (`folded_below`, appended; the record format moves to 3). A holder folds its replica there once it holds the version:
+  as a record's own recomputation (`fold_replica`) and at each version a rebuild (A-313) or an advance (A-333)
+  recomputes. No later increment is based below the floor, since no live reader names a version below it, so the fold
+  changes no verdict and no identity. The owner makes the record before the settle that follows its accept, so a
+  replica's floor trails its owner's by at most that settle, and a takeover's successor serves the green folded as its
+  owner had it at the last record.
+- **Tests.** `a_holders_replica_keeps_no_more_history_than_its_owner` (`crates/server/tests/fleet.rs`: three nodes at
+  `f = 1` under a 256 KiB chain cap, one work rewriting one file whole each version until twice the cap is written;
+  each holder's replica folds where its newest record says, counted, holding no more than the cap and one version's
+  value); `a_holder_folds_its_replica_where_its_owners_record_says_the_owner_folded` and
+  `a_rebuilt_replica_folds_where_each_record_says_its_owner_folded` (`merge_origin.rs`: the record path served a
+  shipment, and the rebuild).
+- **Measured.** Kiln r133, the Mac Studio, 2026-11-18, debug build: 130 versions of 4,043 bytes; the owner folded below
+  66 with 260,288 bytes of history, and both holders' replicas folded below 66 with 260,288 bytes, the owner's to the
+  byte. Red, with the fold made a no-op: both replicas folded below 0 with 524,643 bytes, and the fleet test and both
+  unit tests failed. On the same tree the holder tests a fold reaches passed: the restarted holder, the successor one
+  version behind, the adoption past the merge budget, the repeated chunk, the mismatch, the late submit (fleet 7 of 7),
+  the holder recovery tests 12 of 12, and the merge, retention, state and takeover unit tests 32 of 32.
+- **Still owed.** A holder's ledger records and held inputs still grow per version: releasing them below the floor needs
+  a durable checkpoint of the replica on the holder (a rebuild recomputes from version 0, and a takeover adopts the
+  records for its completions).
+
+### A-386 — A takeover's fetch of a live log is answered in turns, and read in place
+
+*2026-11-18, g251 (the coordinator's order after seed 18189587465523915115).* §4.10 live shipping's takeover fetch
+(A-200, A-240) is answered and read in bounded turns. **Before:** the candidate phase one adopted answered the fetch in
+one turn of its control shard: every held entry cloned, then copied into one answer grown as it went (`encode_fetched`),
+then the shard published; the successor copied every payload back out of the answer (`decode_fetched`) in one turn of
+its own control shard, or cloned its own copy whole when it held the adopted head; and the transport copied the whole
+answer once more into the stream's buffer. In a nemesis run (seed 18189587465523915115, x86_64) the candidate held
+34,814 entries of a log of which 406 MB had been appended, and a control shard logged a single 557 ms poll before a
+successor's watchdog ended it. **Now:** the candidate's serve loop answers a fetch on a task of its own
+(`live_ship::serve_fetch`): its first turn authorizes, fences the copy at the successor's epoch and publishes the fence;
+then `FetchAnswer` lays the entries out a copy slice a turn (half the takeover's quantum at the measured memcpy rate,
+`DaemonConfig::copy_slice_bytes_within(fleet::seal_quantum_ns)`, an entry at least), into a buffer reserved for all of
+them (`slates_db::live::fetched_reply`, `push_fetched`). The transport takes a reply by value and keeps it as the
+stream's buffer (`Endpoint::reply`, `Connection::reply`, `StreamSender::write`), so no reply is copied whole. The
+successor decodes the answer's reply and keeps the payloads in place (`slates_db::live::FetchedLog`); the rebuild takes
+each as it applies it (`Rebuilding::advance`), checked against the hold's cap then. A broken framing stops the rebuild
+`fleet.live.takeover_refused.fetched`, which `note_rebuild` does not keep, so the next attempt fetches again, as an
+answer that did not decode always was. A successor that holds the adopted head lays its own copy out the same way
+(`own_log`). Under the fence nothing ships to the copy, so its entries hold still between the turns; a copy that moved
+anyway answers what a fetch arriving then would: a raised fence its stale-epoch refusal, otherwise the head it holds
+now without entries, which the successor does not take. The wire is unchanged: the answer's bytes are the ones
+`encode_fetched` wrote.
+
+Tests: `a_live_takeover_is_fetched_and_rebuilt_in_turns_and_joined_while_it_runs` (renamed from A-374's; it now also
+counts the answer's turns on both survivors, at least one an entry under the cut quantum, holds both survivors' longest
+steps under the window, and reads the successor's failover estimate timing the volume) and
+`a_fetch_answered_an_entry_a_turn_is_the_answer_laid_out_at_once` (an entry a turn and all at once give the same bytes;
+a raised fence and a let-go copy answer as a fetch arriving then would); `hostile_fetched_replies_are_refused`
+(`crates/db/tests/live.rs`) reads the payloads in place: a payload over the cap and a length of `u32::MAX` are refused
+when reached, and no cut of the answer reads whole.
+
+Applied in the same change to: §4.10's status (A-386), GAPS (A-347's "one-turn walks of a whole volume": the live
+takeover's fetch), the bug record `docs/bugs/2026-11-18-a-takeover-fetch-copied-the-whole-log-in-one-turn.md`,
+`crates/db/src/live.rs`, `crates/db/tests/live.rs`, `crates/transport/src/{stream,connection,endpoint,conn,flow}.rs`,
+`crates/transport/tests/{session,stateless_reset}.rs`, `crates/transport/examples/{congestion_bench,path_mtu_bench}.rs`,
+`crates/server/src/{live_ship,fleet,config}.rs`, `crates/server/tests/fleet.rs`.
+
+### A-388 — A shard keeps two batches of asks out to each owner, so an ask made while one is out leaves at once (2026-11-18, built for goals 231 and 257, 1,000 clients under 1 ms; amends A-247's "Asks are batched per owner")
+Applied in the same change to: §4.16 (A-247's rule, "Asks are batched per owner"), GAPS (the load test's entry),
+`crates/server/src/work_home.rs` (`Outbox::out`, `BATCHES_OUT`, `BATCHES_OUT_PEAK`, `start_ask`, `take_batch`, the module's
+"Asks are batched"), and the test below.
+- **What was measured.** A work's verb that needs its green's owner parks on the work's shard and its ask goes into the
+  shard's outbox for that owner; one batch was out at a time, so an ask made while a batch was out waited for that
+  batch's whole round trip (the owner's turn, the answer's way back, the shard's turn to send again) before it left. The
+  g083 trace on the Mac Studio (1,000 clients over 23 shards, a think mean of 50 ms, load 25 to 35, 2026-11-18) split an
+  ask's way to the owner at that wait: in the outbox p50 32 to 37 µs and p99 1.6 to 2.1 ms for submits and rebases,
+  against 71 to 84 µs and 2.4 to 2.7 ms from the batch's sending to the owner's start of the ask; in the slowest 1% of
+  edits, submits and rebases the outbox's mean was 3.5, 6.2 and 8.5 ms against the rest of the way's 3.6, 6.5 and 8.1.
+- **The rule.** A shard keeps at most two batches out to each owner: an ask made while fewer are out goes in a batch of
+  its own at once, and past two it waits for a batch's answer, as before. Two is double buffering, the least that
+  keeps the owner from waiting an asking shard's round trip for its next batch: one is served while the other waits at
+  the owner. A work's order is unchanged: a work has one ask out at a time (its queue's oldest verb), so two batches out
+  never carry two asks of one work. The owner's channel holds at most two messages from each asking shard, the bound
+  one batch gave it doubled.
+- **Test.** `a_shards_second_ask_leaves_while_its_first_batch_is_still_out` (`crates/server/tests/works_off_owner.rs`):
+  two works on one shard ask the green's held owner, one after the other, and the shard has two batches out at once;
+  red at one batch (its peak 1). The status counter `merge.work.batches_out_peak` is the most a shard has had out to
+  one owner at once.
+- **Measured** (BENCHMARKS, "Two batches of asks out to an owner", Mac Studio, 1,000 clients, 2026-11-18): every request
+  kind's p99 lower in five of six pairs back to back, by 40 to 50% in the pair at matched load 30 at a think mean of
+  50 ms (an accepted submit 1.55 to 0.80 ms); traced, the outbox's p999 fell eightfold to tenfold (a submit's 12.9 to
+  1.4 ms) and the whole submit's p999 by two thirds.
+
+### A-391 — An archive restore is made in bounded steps
+
+*2026-11-18, g251 (the coordinator's order: the takeover's archive, restore and population in turns).* D-17's restore
+(`crates/archive/src/restore.rs`) planned the whole tree, allocated every buffer, decoded every chunk and laid every
+file out in one call: a takeover successor's restore ran inside one turn of its owner shard (0.14 to 0.18 s for a
+300 MB live volume on a Mac Studio, A-374's trace; seconds for g232's 1.99 GB, 97,254-file kernel base volume).
+**Now** the restore is three types, each made a piece at a time until its caller's `spent` answers that the step's
+share is spent, a piece at least: `Planning` (the root's attributes, then a node or a directory's entry a piece, the
+archive's chunks indexed a chunk a piece from the last, the need counted an extent a piece), `Planned` (its `needed`,
+and `restoring(budget)`, which refuses `OverBudget` before anything is allocated, as before), and `Restoring` (a buffer
+allocated, an extent's reference gathered, an extent filled from its chunk, the chunk decoded and verified once with
+the first extent that names it, or a data piece laid into its file, contiguous pieces merged). No piece holds more than
+one chunk's bytes, except a merge onto a file's growing piece, which copies the piece it lays. `restore` and
+`restore_needed` are the steps run to their ends, so every caller restores through one code path. The walk is
+iterative per entry, so a flat directory of 97,254 entries is that many pieces, never one. Nothing changes in what a
+restore produces: the 13 existing restore tests and 3 transfer tests pass on the stepped code.
+
+Tests: `a_restore_in_steps_of_one_piece_is_the_restore_in_one_call` (`crates/archive/tests/restore.rs`: an archive with
+a sparse file of three data extents over two chunks around a hole, a compressed chunk named eight times, a nested tree,
+an empty file, attribute values on the root and on a file, a duplicated and an unnamed chunk; one piece a step equals
+one call, with more plan steps and restore steps than files; the need equals `restore_needed`; a budget one byte short
+refused before a step; a missing chunk refused in steps as in one call). Red: a chunk's later extents dropped after its
+first fill fails `a_chunk_named_many_times_is_decoded_once_and_its_expansion_is_admitted` (the step-for-step oracle
+alone cannot see it, since one call is the same steps).
+
+Applied in the same change to: D-17 (its amendment line), GAPS (A-347's one-turn walks: the restore's steps exist; the
+server still restores in one turn until the population and the plain takeover path follow),
+`crates/archive/src/{restore,lib}.rs`, `crates/archive/tests/restore.rs`.
+
+### A-389 — A writable direct map's copy is taken back dormant through the write log's replay and woken after it, as a Shards stream's DAX object is (2026-11-18, goal g268; the sibling A-365 found in A-197)
+Applied in the same change to:
+- §4.6's A-197 entry and A-365's "Found beside it", amended; GAPS: A-281's entry.
+- `crates/vfs/src/shards_backing.rs`: `ShardsBackings::adopt_peer` keeps the copy dormant, out of its file's list, until
+  `wake`.
+- `crates/server`: `held_copy.rs` (`wake_adopted`, the module's notes), `verbs.rs` (the copies woken once the replay is
+  done), `shards/dax_hold.rs` (`adopt_inherited`'s notes); the test `crates/server/tests/held_copy_replay.rs`, a binary of
+  its own (it plays the anchor).
+
+- **What was there.** A successor took each writable copy back (A-197) before the write log's replay and kept it
+  awake, so that every write the replay applied reached the copy through the volume's write boundary. But the copy
+  already holds every write the dead daemon made to its file, written through before each was acknowledged, in order
+  with its client's stores. A client that stored over a range after a logged write to it had its store written over
+  by that write's replay, in its own map: its next sync then found nothing to write, and the store was lost. A-365
+  met the same hazard with a stream's DAX objects and kept them dormant; this is that rule for A-197's copies.
+- **The rule.** Every object the anchor held is taken back dormant, in one ascending order of its backing's handle, and
+  wakes only after the replay: a writable copy once the replay is done (`held_copy::wake_adopted`), a stream's DAX
+  object when its stream takes it. Where the replayed bytes and the copy differ, the copy holds its client's later
+  store, which the client's next sync writes back; from the wake on every change reaches the copy again.
+- **Evidence.** Linux (adacachy, kiln run r252, 2026-11-18): the new test passes, and so do A-365's
+  (`shards_resync_dax`) and A-197's own takeover tests (`crates/cli/tests/pmem.rs`,
+  `a_pmem_vmms_copy_survives_a_daemon_takeover_with_its_unsynced_store`,
+  `a_copy_no_holder_claims_after_a_takeover_is_written_back_and_let_go`). Each guard removed alone fails the new test:
+  the copy taken back awake, as before, leaves the client's map holding the replayed bytes where its store was (the
+  failing test, the bug itself); a copy never woken fails at the sync after the takeover.
+
+### A-390 — A Shards stream logs its guest's FORGETs after the last publication, as a FUSE mount does, where the anchor holds its resync end (2026-11-18, goal g268; a sibling A-339 recorded in GAPS)
+Applied in the same change to:
+- §4.6, the Shards form's death bullet; the write log's status (A-154's sibling), amended; GAPS: A-281's entry.
+- `crates/server`: `write_log.rs` (`log_forgets`, moved from `fuse.rs` and shared; the module's notes), `fuse.rs` (calls
+  it), `shards.rs` (`log_forgets` of a stream whose resync end the anchor holds); the test
+  `crates/server/tests/shards_resync_restart.rs` (the nameless file its guest lets go after the last publication).
+
+- **What was there.** A FUSE mount logs the lookups its kernel gives back (`FORGET`, `BATCH_FORGET`) beside its writes
+  (A-154's sibling, 2026-11-08), since a `FORGET` takes no reply and is never resent: one served after the last
+  publication and lost with its daemon left the references the image recorded counted for good. A Shards stream's were
+  not logged. Once a stream outlived its daemon (A-316, A-339), its successor restored the lookups the image recorded,
+  and an unlinked file the guest had let go stayed referenced until the stream ended.
+- **The rule.** A stream whose resync end the anchor holds logs each `FORGET`'s lookups as its attachment's, through
+  the mount's own code, now shared (`write_log::log_forgets`); the replay gives them back in their place among the
+  writes. A stream no successor keeps is not logged: its attachment and every reference it held end at its daemon's
+  death.
+- **Evidence.** On a Mac Studio (kiln run r221) and on Linux (adacachy, kiln run r252), the restart test passes, its
+  volume's referenced bytes after the successor's recovery where the guest's `FORGET` left them, 39 bytes, the
+  surviving file's. With the stream's `FORGET`s not logged, it fails on both: 65,575 bytes, the 64 KiB the nameless
+  file kept referenced, and the 39.

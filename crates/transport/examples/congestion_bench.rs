@@ -407,7 +407,7 @@ async fn coordinator(
         let _ = done.send((index, received.len() as u64, elapsed));
         let _ = bulk_done_tx.send(());
         // Acknowledge the transfer and keep the session driven until the coordinator ends the run.
-        if let Err(e) = endpoint.reply(id, &[]) {
+        if let Err(e) = endpoint.reply(id, Vec::new()) {
           eprintln!("ROLE bulk server {index} reply: {e:?}");
           return;
         }

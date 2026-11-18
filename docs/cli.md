@@ -11,9 +11,12 @@ guarantee. A daemon restart under the same anchor keeps acknowledged content and
 (`acknowledged_content_and_its_snapshot_survive_a_daemon_restart_byte_for_byte`); the anchor's own death
 loses RAM by design.
 `attach` returns an attachment record without creating a mounted path. A CLI attachment outlives the `slates attach`
-that made it, for later `slates` runs to name (`write ID ATTACHMENT`, `detach ATTACHMENT`, `advance`). It lasts one
-term, the daemon's failover SLO (10 s unless `slates anchor` is given another), and every verb that names it renews the
-term. It ends at the term's lapse with the write lease it held. A verb that names it after is refused
+that made it, for later `slates` runs to name (`write ID ATTACHMENT`, `detach ATTACHMENT`, `advance`). Its term is its
+holder's (design A-384): every verb that names it renews it, and `slates attach ID --write --hold` keeps it alive from
+that process until the process ends, however long the attachment sits idle. One that nothing renews lasts at most the
+daemon's failover delay after its last use (about a second on a laptop, a few seconds in a fleet; `slates status` shows
+the delay as `fleet_failover`); one renewed at a steady pace ends about one and a third seconds after its renewals stop.
+It ends at the term's lapse with the write lease it held. A verb that names it after is refused
 `AttachmentExpired`, never `NotFound`: attach again. An SDK client's attachments end with the client instead. `exec` is Linux-only
 and currently expects an externally supplied `SLATES_ROOT` naming an established root mount; on a host whose AppArmor
 restricts unprivileged user namespaces it needs slates' AppArmor profile and `--apparmor-profile` (below).
@@ -312,7 +315,7 @@ slates apparmor profile [--executable PATH]
 slates apparmor check [--json]
 slates shards ID [--subtree DIR] [--read-only] --fd N [--json] -- CMD [ARG ...]
 slates vhost-user ID [--tag NAME] [--subtree DIR] [--read-only] [--dax-window SIZE] [--json] -- VMM [ARG ...]
-slates attach ID [--read | --write] [--snapshot N] [--json]
+slates attach ID [--read | --write] [--snapshot N] [--hold] [--json]
 slates detach ATTACHMENT [--json]
 slates status [--json]
 slates status ID [--drift] [--json]

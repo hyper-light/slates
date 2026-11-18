@@ -118,7 +118,7 @@ fn a_stream_flows_over_a_live_session() {
         .map_err(|e| format!("{e:?}"))?;
         server.establish().await.map_err(|e| format!("{e:?}"))?;
         let (id, _kind, received) = server.next_request().await.map_err(|e| format!("{e:?}"))?;
-        server.reply(id, &[]).map_err(|e| format!("{e:?}"))?;
+        server.reply(id, Vec::new()).map_err(|e| format!("{e:?}"))?;
         server.settle().await.map_err(|e| format!("{e:?}"))?;
         Ok::<_, String>(received)
       }
@@ -186,7 +186,7 @@ fn each_end_holds_the_parameters_its_peer_declared() {
       .unwrap();
       server.establish().await.unwrap();
       let (request, _kind, _) = server.next_request().await.unwrap();
-      server.reply(request, &[]).unwrap();
+      server.reply(request, Vec::new()).unwrap();
       server.settle().await.unwrap();
       let _ = server_view_tx.send(server.peer_parameters());
     })
@@ -276,7 +276,7 @@ fn a_session_finds_its_paths_mtu_and_falls_back_when_the_path_shrinks() {
       server.establish().await.unwrap();
       for _ in 0..2 {
         let (request, _kind, received) = server.next_request().await.unwrap();
-        server.reply(request, &digest(&received)).unwrap();
+        server.reply(request, digest(&received)).unwrap();
       }
       server.settle().await.unwrap();
     })
@@ -438,7 +438,7 @@ fn transfers_across_a_dead_path(dead: DeadFor) -> DeadPathOutcome {
       // Every request until the client's end marker: the finding transfers and the one across the dead path.
       loop {
         let (request, _kind, received) = server.next_request().await.unwrap();
-        server.reply(request, &digest(&received)).unwrap();
+        server.reply(request, digest(&received)).unwrap();
         if received == END_MARKER {
           break;
         }
@@ -2473,7 +2473,7 @@ fn a_dialer_that_outwaited_an_absent_peer_completes_the_handshake_once_the_peer_
         .map_err(|e| format!("{e:?}"))?;
         server.establish().await.map_err(|e| format!("{e:?}"))?;
         let (id, _kind, received) = server.next_request().await.map_err(|e| format!("{e:?}"))?;
-        server.reply(id, &[]).map_err(|e| format!("{e:?}"))?;
+        server.reply(id, Vec::new()).map_err(|e| format!("{e:?}"))?;
         server.settle().await.map_err(|e| format!("{e:?}"))?;
         Ok::<_, String>(received)
       }

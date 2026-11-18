@@ -557,3 +557,136 @@ fn a_tree_at_the_depth_bound_restores() {
   let restored = restore(&decoded, ADMITTED).expect("restores");
   assert_eq!(restored.directories.len(), depth);
 }
+
+/// One extent of `len` bytes at `offset`, the whole of the chunk `identity` from `chunk_offset`.
+fn extent_of(offset: u64, len: u64, identity: [u8; 32], chunk_offset: u64) -> Extent {
+  Extent {
+    offset,
+    len,
+    chunk: identity,
+    chunk_offset,
+  }
+}
+
+/// An archive that exercises every piece of a restore: a sparse file of three data extents over two chunks around a
+/// hole, a file naming one compressed chunk many times, a nested tree, an empty file, attribute values on the root and
+/// on a file (one over a hole), and a chunk no extent names.
+fn every_piece() -> Archive {
+  let first = Archive::raw_chunk(b"ABCDEFGHIJ".to_vec());
+  let second = Archive::compressed_chunk(vec![0x6b_u8; 4096]);
+  let unnamed = Archive::raw_chunk(b"never named".to_vec());
+  let sparse = Node::File(vec![
+    extent_of(0, 4, first.identity, 2),
+    extent_of(4, 6, [0u8; 32], 0),
+    extent_of(10, 3, first.identity, 0),
+    extent_of(13, 4096, second.identity, 0),
+  ]);
+  let mut tagged = entry(
+    "tagged",
+    Node::File(vec![extent_of(0, 5, first.identity, 5)]),
+  );
+  tagged.meta.xattrs = vec![
+    slates_archive::manifest::Xattr {
+      name: b"user.colour".to_vec(),
+      extents: vec![extent_of(0, 3, first.identity, 1)],
+    },
+    slates_archive::manifest::Xattr {
+      name: b"user.gap".to_vec(),
+      extents: vec![
+        extent_of(0, 2, [0u8; 32], 0),
+        extent_of(2, 2, first.identity, 8),
+      ],
+    },
+  ];
+  let manifest = Node::Directory(vec![
+    entry("copies", repeated(second.identity, 4096, 8)),
+    entry("empty", Node::File(Vec::new())),
+    entry(
+      "outer",
+      Node::Directory(vec![
+        entry("inner", Node::Directory(vec![entry("sparse", sparse)])),
+        tagged,
+      ]),
+    ),
+  ]);
+  let mut archive = archive_with(manifest, vec![first, second.clone(), unnamed, second]);
+  archive.root_meta.xattrs = vec![slates_archive::manifest::Xattr {
+    name: b"user.root".to_vec(),
+    extents: vec![extent_of(0, 4, [0u8; 32], 0)],
+  }];
+  archive
+}
+
+/// g251 (CLAUDE.md "Bounded work everywhere"; a taken-over volume restored in turns of its shard): do restore an
+/// archive that exercises every piece of a restore in steps of one piece, planned and then restored, and in one call.
+/// Expect the same restored volume either way, the stepped one in more steps than the tree has files (non-vacuous: no
+/// step did more than its piece), its need the one `restore_needed` reads, a budget one byte short of it refused
+/// `OverBudget` before a step of the restore, and a missing chunk refused in steps as in one call.
+#[test]
+fn a_restore_in_steps_of_one_piece_is_the_restore_in_one_call() {
+  let archive = every_piece();
+  let whole = restore(&archive, ADMITTED).expect("restores in one call");
+  let mut planning = slates_archive::Planning::new(&archive);
+  let mut plan_steps = 0u64;
+  let planned = loop {
+    plan_steps += 1;
+    if let Some(planned) = planning.step(|| true).expect("plans") {
+      break planned;
+    }
+  };
+  assert_eq!(
+    Ok(planned.needed()),
+    slates_archive::restore_needed(&archive)
+  );
+  let mut restoring = planned.restoring(ADMITTED).expect("admitted");
+  let mut restore_steps = 0u64;
+  let stepped = loop {
+    restore_steps += 1;
+    if let Some(restored) = restoring.step(|| true).expect("restores in steps") {
+      break restored;
+    }
+  };
+  assert_eq!(stepped, whole, "the same volume either way");
+  assert_eq!(
+    stepped.files["outer/inner/sparse"]
+      .dense()
+      .map(|bytes| bytes.len()),
+    Some(4109)
+  );
+  assert!(
+    plan_steps > whole.files.len() as u64 && restore_steps > whole.files.len() as u64,
+    "a piece a step: {plan_steps} plan steps and {restore_steps} restore steps for {} files",
+    whole.files.len()
+  );
+  let needed = slates_archive::restore_needed(&archive).unwrap();
+  let mut short = slates_archive::Planning::new(&archive);
+  let planned = loop {
+    if let Some(planned) = short.step(|| true).unwrap() {
+      break planned;
+    }
+  };
+  assert!(matches!(
+    planned.restoring(needed - 1),
+    Err(ArchiveError::OverBudget { needed: refused, budget }) if refused == needed && budget == needed - 1
+  ));
+  let mut missing = every_piece();
+  missing
+    .chunks
+    .retain(|chunk| chunk.encoding != slates_archive::Encoding::Lz4);
+  let mut planning = slates_archive::Planning::new(&missing);
+  let planned = loop {
+    if let Some(planned) = planning.step(|| true).unwrap() {
+      break planned;
+    }
+  };
+  let mut restoring = planned.restoring(ADMITTED).unwrap();
+  let refused = loop {
+    match restoring.step(|| true) {
+      Ok(Some(_)) => break None,
+      Ok(None) => {}
+      Err(refusal) => break Some(refusal),
+    }
+  };
+  assert_eq!(refused, Some(ArchiveError::MissingChunk));
+  assert_eq!(restore(&missing, ADMITTED), Err(ArchiveError::MissingChunk));
+}

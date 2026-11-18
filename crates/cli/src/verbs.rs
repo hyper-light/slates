@@ -410,10 +410,55 @@ pub(crate) fn run(request: &ClientRequest) -> Result<(), Failure> {
       destination: destination.clone(),
     };
     return emit_attach(&mut client, *volume, *snapshot, *intent, form, request.json)
+      .map(|_attachment| ())
       .map_err(|e| failure_of(e, &request.instance));
+  }
+  if let Verb::Hold {
+    volume,
+    snapshot,
+    intent,
+  } = &request.verb
+  {
+    return hold(
+      &mut client,
+      &request.instance,
+      (*volume, *snapshot, *intent),
+      request.json,
+    )
+    .map_err(|e| failure_of(e, &request.instance));
   }
   let outcome = serve(&mut client, &request.verb, request.json);
   outcome.map_err(|e| failure_of(e, &request.instance))
+}
+
+/// `slates attach VOLUME --hold` (A-384): attaches in the CLI's form and says so as `attach` does, then keeps the
+/// attachment alive from this process until it ends: a [`slates_client::Hold`] renews it at the cadence the daemon names,
+/// so other `slates` processes may name it however long they are idle. The process ending (an interrupt, a kill, any
+/// end) ends the renewals, and the attachment lapses at its holder's pace; a renewal the daemon refuses (the attachment
+/// detached elsewhere) ends the command with that refusal.
+fn hold(
+  client: &mut Client,
+  instance: &str,
+  (volume, snapshot, intent): (VolumeId, Option<SnapshotId>, Intent),
+  json: bool,
+) -> Result<(), ClientError> {
+  let attachment = emit_attach(
+    client,
+    volume,
+    snapshot,
+    intent,
+    AttachRequest::Termed,
+    json,
+  )?;
+  let held = slates_client::Hold::new(instance, slates_api::deadlines(), attachment)?;
+  slates_machine::log_line!(
+    "slates attach --hold: holding attachment {attachment} (its term {} ms); it lapses once this process ends",
+    held.term_ns() / NANOS_PER_MILLISECOND
+  );
+  match held.wait_lost() {
+    Some(refused) => Err(refused),
+    None => Ok(()),
+  }
 }
 
 /// Serves the MCP tools (§4.12): the merge/volume/attach/base/land tools mapped onto the client SDK,
@@ -1006,8 +1051,9 @@ fn emit_attach(
   intent: Intent,
   form: AttachRequest,
   json: bool,
-) -> Result<(), ClientError> {
+) -> Result<u64, ClientError> {
   let attached = client.attach_with(volume, snapshot, intent, form)?;
+  let attachment = attached.attachment;
   if json {
     slates_machine::out_line!("{}", slates_mcp::attachment_json(&attached));
   } else {
@@ -1022,7 +1068,7 @@ fn emit_attach(
     slates_machine::out_text!("{}", established_text(&attached.established));
     slates_machine::out_text!("{}", capability_text(&attached.capability));
   }
-  Ok(())
+  Ok(attachment)
 }
 
 /// What an attach established, as `key: value` lines; a container bind shows its verified source,
@@ -1357,8 +1403,9 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
     }
     Verb::Status { volume, drift } => emit_status(client, *volume, *drift, json)?,
     // `mount`/`unmount` run `mount_nfs`/`umount` (CLI/OS operations whose failure is a `Failure`, not a
-    // `ClientError`), so [`run`] handles them before this dispatch; they never reach here.
-    Verb::Mount { .. } | Verb::Unmount { .. } | Verb::Export { .. } => {}
+    // `ClientError`), and `attach --hold` needs the instance for its own client, so [`run`] handles them before this
+    // dispatch; they never reach here.
+    Verb::Mount { .. } | Verb::Unmount { .. } | Verb::Export { .. } | Verb::Hold { .. } => {}
     Verb::Snapshot { volume } => emit_snapshot(client, *volume, json)?,
     Verb::DestroySnapshot { volume, snapshot } => {
       client.destroy_snapshot(*volume, *snapshot)?;
@@ -1414,7 +1461,9 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
       snapshot,
       intent,
       form,
-    } => emit_attach(client, *volume, *snapshot, *intent, form.clone(), json)?,
+    } => {
+      emit_attach(client, *volume, *snapshot, *intent, form.clone(), json)?;
+    }
     Verb::Detach { attachment, volume } => {
       match volume {
         Some(volume) => client.detach_of(*volume, *attachment)?,
