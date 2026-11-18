@@ -18404,7 +18404,8 @@ Applied in the same change to:
 - **Owed.**
   - At `f > 0` the holders' replicas and records grow per version. ~~A takeover adopts the whole chain.~~ Since A-333
     (2026-11-18) a takeover records nothing of the chain up to the adopted version: its successor's holder ledger is it.
-    Since A-385 (2026-11-18) a replica folds where its owner folded; its records and held inputs still grow.
+    Since A-385 (2026-11-18) a replica folds where its owner folded, and since A-404 (2026-11-18) it lets go of its records
+    and held inputs below the durable checkpoint it keeps at its owner's committed floor.
   - The 40 bytes a checkpoint keeps for each accepted identity.
   - The checkpoint walk is not sliced.
 
@@ -29188,5 +29189,15 @@ Applied in the same change to: §4.16's failure matrix (a green holder's restart
   one version recomputed).
 - **Measured.** The server's merge, retention, state and takeover unit tests, 34 of 34 (kiln, the Mac Studio,
   2026-11-18, debug).
-- **Still owed (step two).** The holder lets go of its ledger positions below the checkpoint and the inputs placed at
-  or below it, and a takeover's adoption (A-333) reads the checkpoint for the versions below it.
+- **Step two (2026-11-18).** Once a holder keeps a new checkpoint, its ledger drops the positions after version 0 and
+  below the checkpoint's own (`Acceptor::compact_ledger_between`: phase one ranks only the highest position, and the
+  rebuild still reads version 0's record, which names the origin, and the checkpoint's, whose identity it checks), and
+  its retention judges the content placed from version 1 again (`content_retention::retain_object_from`), releasing
+  the inputs nothing names now (`merge.replica.compacted_inputs`). A takeover's adoption (A-333) needs nothing below
+  the checkpoint: its completions walk passes over the positions it lacks, and its replica is rebuilt from the
+  checkpoint and advanced from its records above it. A replica's records and inputs are now bounded by the versions
+  its owner has not yet committed. Tests: `a_holder_lets_go_of_the_records_and_inputs_its_checkpoint_stands_for`
+  (`merge_origin.rs`: positions 0, 2 and 3 kept, version 1's inputs released, the replica rebuilt to version 3 from the
+  checkpoint) and `a_ledger_compacted_between_keeps_its_first_position_and_the_checkpoints_own` (`register.rs`); the
+  server's merge, retention, state and takeover unit tests 35 of 35 and the acceptor tests 9 of 9 (kiln, the Mac Studio,
+  2026-11-18, debug).
