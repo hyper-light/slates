@@ -1355,7 +1355,12 @@ pub(crate) fn rounds_the_bound_ended(
         && !regional.retired.contains_key(departed)
         && !regional.completed.contains_key(departed)
     })
-    .map(|(departed, take)| (*departed, take.learned.keys().copied().collect()))
+    .map(|(departed, take)| {
+      (
+        *departed,
+        take.learned.keys().copied().collect::<Vec<ObjectId>>(),
+      )
+    })
     .filter(|(_, learned)| !learned.is_empty())
     .collect()
 }
