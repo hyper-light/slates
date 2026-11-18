@@ -78,6 +78,17 @@ pub enum RaftWireError {
     /// The byte that arrived.
     flag: u8,
   },
+  /// A configuration's bytes do not begin with its kind's magic ([`decode_regional_configuration`],
+  /// [`decode_root_configuration`]): not a configuration of that kind, or one an earlier, unversioned layout wrote.
+  ForeignLayout {
+    /// The word that arrived where the magic belongs.
+    magic: u32,
+  },
+  /// A configuration's magic is its kind's but its layout version is not one this build reads: another build's.
+  LayoutVersion {
+    /// The layout version that arrived.
+    layout: u32,
+  },
 }
 
 /// Format: the leading tag byte; these are its values.
@@ -700,12 +711,44 @@ pub async fn request_raft(
   Ok(RaftMessage::decode(&reply).ok())
 }
 
+/// Format: a regional configuration's magic, "RCFG" little-endian, before its layout version: a configuration an
+/// earlier, unversioned layout wrote begins with its configuration version, whose low word is the magic only at version
+/// 1,195,787,090, which no fleet's council reaches.
+const REGIONAL_MAGIC: u32 = u32::from_le_bytes(*b"RCFG");
+/// Format: the regional configuration's layout version: 1, the first versioned layout (with A-272's
+/// `dropped_unconfirmed` and the moved-object exceptions, `moved`, last). A decoder refuses any other by name ([`RaftWireError::LayoutVersion`]) rather than read
+/// another layout's fields by position: before it, a field appended to the layout was refused only by the accident of
+/// a length (`Truncated` one way, `LengthMismatch` the other), and a change that kept the length would have been read
+/// with a field defaulted (GAPS, live-durability 2026-11-09).
+const REGIONAL_LAYOUT: u32 = 1;
+/// Format: a root configuration's magic, "RTCF" little-endian, as [`REGIONAL_MAGIC`] is the regional one's: an
+/// unversioned root configuration's version matches it only at 1,178,817,618.
+const ROOT_MAGIC: u32 = u32::from_le_bytes(*b"RTCF");
+/// Format: the root configuration's layout version: 1, the first versioned layout.
+const ROOT_LAYOUT: u32 = 1;
+
+/// Reads a configuration's magic and layout version and refuses either when it is not `(magic, layout)`, by name.
+fn take_layout(bytes: &[u8], (magic, layout): (u32, u32)) -> Result<&[u8], RaftWireError> {
+  let (arrived, rest) = take_u32(bytes)?;
+  if arrived != magic {
+    return Err(RaftWireError::ForeignLayout { magic: arrived });
+  }
+  let (arrived, rest) = take_u32(rest)?;
+  if arrived != layout {
+    return Err(RaftWireError::LayoutVersion { layout: arrived });
+  }
+  Ok(rest)
+}
+
 /// Encodes a [`RegionalConfiguration`] for the wire — a **learner** fetches it from a council voter to catch
 /// up on the committed configuration (§4.8, D-14: the council is a small elected set but the region is large,
-/// so a non-voter member *learns* the configuration rather than voting on it). Little-endian throughout,
-/// each map as a count then its entries, so two nodes encode it identically.
+/// so a non-voter member *learns* the configuration rather than voting on it). Little-endian throughout: its magic
+/// and layout version ([`REGIONAL_MAGIC`], [`REGIONAL_LAYOUT`]), then each map as a count then its entries, so two
+/// nodes encode it identically.
 pub fn encode_regional_configuration(config: &RegionalConfiguration) -> Vec<u8> {
   let mut out = Vec::new();
+  put_u32(&mut out, REGIONAL_MAGIC);
+  put_u32(&mut out, REGIONAL_LAYOUT);
   put_u64(&mut out, config.version);
   put_u32(&mut out, config.quorum.f);
   out.push(u8::from(config.has_mirror));
@@ -894,9 +937,12 @@ fn decode_retired(
 
 /// Decodes a [`RegionalConfiguration`], or a typed refusal for hostile or truncated bytes — every declared
 /// count is bounded against the bytes that arrived before allocating (a lying count is
-/// [`RaftWireError::LengthMismatch`]), so a hostile datagram cannot force an over-allocation or a panic.
+/// [`RaftWireError::LengthMismatch`]), so a hostile datagram cannot force an over-allocation or a panic; and
+/// bytes of another layout are refused by name before any field is read ([`RaftWireError::ForeignLayout`],
+/// [`RaftWireError::LayoutVersion`]).
 pub fn decode_regional_configuration(bytes: &[u8]) -> Result<RegionalConfiguration, RaftWireError> {
-  let (version, rest) = take_u64(bytes)?;
+  let rest = take_layout(bytes, (REGIONAL_MAGIC, REGIONAL_LAYOUT))?;
+  let (version, rest) = take_u64(rest)?;
   let (f, rest) = take_u32(rest)?;
   let (has_mirror, rest) = take_bool(rest)?;
   let (members, rest) = decode_hosts(rest)?;
@@ -974,10 +1020,12 @@ fn decode_domains(
 /// Encodes a [`RootConfiguration`] for the wire — the cross-region counterpart of
 /// [`encode_regional_configuration`], carried when a region catches up on the root group's committed state
 /// (§4.8, D-14). Little-endian throughout, each collection as a count then its entries, so two nodes encode
-/// it identically: version, the regions, the moved homes (`(volume, region)` each), and the promotions
-/// (`(lost, mirror)` each).
+/// it identically: its magic and layout version ([`ROOT_MAGIC`], [`ROOT_LAYOUT`]), the version, the regions, the moved
+/// homes (`(volume, region)` each), and the promotions (`(lost, mirror)` each).
 pub fn encode_root_configuration(config: &RootConfiguration) -> Vec<u8> {
   let mut out = Vec::new();
+  put_u32(&mut out, ROOT_MAGIC);
+  put_u32(&mut out, ROOT_LAYOUT);
   put_u64(&mut out, config.version);
   put_u32(
     &mut out,
@@ -1007,9 +1055,11 @@ pub fn encode_root_configuration(config: &RootConfiguration) -> Vec<u8> {
 
 /// Decodes a [`RootConfiguration`], or a typed refusal for hostile or truncated bytes — every declared count
 /// is bounded against the bytes that arrived before allocating (a lying count is
-/// [`RaftWireError::LengthMismatch`]), so a hostile datagram cannot force an over-allocation or a panic.
+/// [`RaftWireError::LengthMismatch`]), so a hostile datagram cannot force an over-allocation or a panic; and bytes of
+/// another layout are refused by name ([`take_layout`]).
 pub fn decode_root_configuration(bytes: &[u8]) -> Result<RootConfiguration, RaftWireError> {
-  let (version, rest) = take_u64(bytes)?;
+  let rest = take_layout(bytes, (ROOT_MAGIC, ROOT_LAYOUT))?;
+  let (version, rest) = take_u64(rest)?;
   let (regions, rest) = decode_regions(rest)?;
   let (homes, rest) = decode_homes(rest)?;
   let (promotions, rest) = decode_promotions(rest)?;
@@ -1886,6 +1936,8 @@ mod tests {
   #[test]
   fn a_lying_regional_configuration_count_is_refused() {
     let mut bytes = Vec::new();
+    bytes.extend_from_slice(&REGIONAL_MAGIC.to_le_bytes());
+    bytes.extend_from_slice(&REGIONAL_LAYOUT.to_le_bytes());
     bytes.extend_from_slice(&0u64.to_le_bytes()); // version
     bytes.extend_from_slice(&1u32.to_le_bytes()); // quorum.f
     bytes.push(0); // has_mirror
@@ -1917,6 +1969,8 @@ mod tests {
   #[test]
   fn a_lying_root_configuration_count_is_refused() {
     let mut bytes = Vec::new();
+    bytes.extend_from_slice(&ROOT_MAGIC.to_le_bytes());
+    bytes.extend_from_slice(&ROOT_LAYOUT.to_le_bytes());
     bytes.extend_from_slice(&0u64.to_le_bytes()); // version
     bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // regions count = huge
     assert_eq!(
@@ -1924,5 +1978,78 @@ mod tests {
       Err(RaftWireError::LengthMismatch),
       "a count beyond the bytes is refused"
     );
+  }
+
+  /// GAPS (live-durability, 2026-11-09): a configuration of another layout is refused by name, never read by position.
+  /// Do encode a regional and a root configuration, then decode: each as it is; with its layout version raised; with its
+  /// magic changed; and as the earlier, unversioned layout wrote it (its bytes after the magic and version). Expect each
+  /// read back as it is, `LayoutVersion` for the raised layout, and `ForeignLayout` for the other two, never a
+  /// configuration read with its fields shifted. Before, an unversioned layout one field short or long was refused only
+  /// by the accident of its length.
+  #[test]
+  fn a_configuration_of_another_layout_is_refused_by_name() {
+    use slates_db::register::RegionalConfiguration;
+    let mut regional = RegionalConfiguration::formed(
+      vec![A, B, HostId(3)],
+      Quorum { f: 1 },
+      std::collections::BTreeMap::new(),
+      3,
+      false,
+    );
+    regional.version = 7;
+    let root = RootConfiguration::formed(vec![RegionId(0), RegionId(1)]);
+    let regional_bytes = encode_regional_configuration(&regional);
+    let root_bytes = encode_root_configuration(&root);
+    assert_eq!(
+      (regional_bytes.get(..8), root_bytes.get(..8)),
+      (
+        Some(b"RCFG\x01\x00\x00\x00".as_slice()),
+        Some(b"RTCF\x01\x00\x00\x00".as_slice())
+      ),
+      "golden: each layout begins with its magic and version 1, little-endian"
+    );
+    assert_eq!(decode_regional_configuration(&regional_bytes), Ok(regional));
+    assert_eq!(decode_root_configuration(&root_bytes), Ok(root));
+    let layout_at = size_of::<u32>();
+    let mut raised = regional_bytes.clone();
+    raised[layout_at..layout_at + size_of::<u32>()]
+      .copy_from_slice(&(REGIONAL_LAYOUT + 1).to_le_bytes());
+    assert_eq!(
+      decode_regional_configuration(&raised),
+      Err(RaftWireError::LayoutVersion {
+        layout: REGIONAL_LAYOUT + 1
+      })
+    );
+    let mut raised = root_bytes.clone();
+    raised[layout_at..layout_at + size_of::<u32>()]
+      .copy_from_slice(&(ROOT_LAYOUT + 1).to_le_bytes());
+    assert_eq!(
+      decode_root_configuration(&raised),
+      Err(RaftWireError::LayoutVersion {
+        layout: ROOT_LAYOUT + 1
+      })
+    );
+    assert_eq!(
+      decode_regional_configuration(&root_bytes),
+      Err(RaftWireError::ForeignLayout { magic: ROOT_MAGIC }),
+      "a root configuration is not read as a regional one"
+    );
+    assert_eq!(
+      decode_root_configuration(&regional_bytes),
+      Err(RaftWireError::ForeignLayout {
+        magic: REGIONAL_MAGIC
+      })
+    );
+    let unversioned = &regional_bytes[2 * size_of::<u32>()..];
+    assert_eq!(
+      decode_regional_configuration(unversioned),
+      Err(RaftWireError::ForeignLayout { magic: 7 }),
+      "the unversioned layout begins with its configuration version, 7, where the magic belongs"
+    );
+    let unversioned = &root_bytes[2 * size_of::<u32>()..];
+    assert!(matches!(
+      decode_root_configuration(unversioned),
+      Err(RaftWireError::ForeignLayout { .. })
+    ));
   }
 }

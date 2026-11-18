@@ -38,7 +38,7 @@ use std::sync::mpsc::channel;
 use rustls::pki_types::PrivateKeyDer;
 use slates_cluster::live::{LIVE_ENTRY_STREAM, fold_late, serve_entry, ship};
 use slates_cluster::{CommitBudget, RECORD_STREAM, commit_record};
-use slates_db::live::{Replica, Shipper};
+use slates_db::live::{Bounds, Replica, Shipper};
 use slates_db::register::{
   Acceptor, Authority, HostEpoch, HostId, ObjectId, Placement, Quorum, Record,
 };
@@ -343,7 +343,9 @@ fn main() {
         Quorum { f: 1 },
         &[OWNER, HOLDERS[0], HOLDERS[1]],
         None,
-        (1, 1),
+        // One write at a time, as the rows below are measured: the credit admits the next entry only once nothing
+        // is in flight (any bound admits one entry then), and the tail keeps only the newest.
+        Bounds::default(),
       );
       let payload = vec![7u8; payload_bytes];
       let mut late = Vec::new();

@@ -18,7 +18,7 @@ mod common;
 use common::generated::{increment_of, op_of, origin_of, raw};
 use proptest::prelude::*;
 use slates_merge::engine::Green;
-use slates_merge::increment::{VolumeOp, compose_volume};
+use slates_merge::increment::{Base, VolumeOp, compose_volume};
 use slates_merge::origin::Origin;
 
 proptest! {
@@ -58,6 +58,52 @@ proptest! {
     }
     // Non-vacuity: every version was composed at least once.
     prop_assert!(u64::from(compared) > green.head());
+  }
+}
+
+proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
+  /// A-247 (a work composes its increment on its own shard): for any green built by generated increments and any
+  /// generated journal, the base assembled from each named path's own entries (`Green::path_base`, what a work's shard
+  /// fetches a path at a time) is the restricted base itself, at every version from the origin to the head: the same
+  /// entries in the same order, so the work's increment is byte for byte the owner's.
+  #[test]
+  fn a_base_assembled_a_path_at_a_time_is_the_restricted_base(
+    origin in proptest::collection::vec(raw(), 0..24),
+    history in proptest::collection::vec(raw(), 0..16),
+    journals in proptest::collection::vec(proptest::collection::vec(raw(), 1..8), 1..8),
+  ) {
+    let mut green = Green::with_origin(origin_of(&origin));
+    for (index, step) in history.iter().enumerate() {
+      let id = u8::try_from(index).unwrap_or(u8::MAX);
+      let _ = green.submit(&increment_of(step).at(id, green.head()));
+    }
+    for version in 0..=green.head() {
+      for journal in &journals {
+        let journal: Vec<VolumeOp> = journal.iter().map(op_of).collect();
+        let named: std::collections::BTreeSet<&str> =
+          journal.iter().flat_map(VolumeOp::names).flatten().collect();
+        let per_path: std::collections::BTreeMap<String, Base> = named
+          .iter()
+          .map(|path| ((*path).to_owned(), green.path_base(version, path)))
+          .collect();
+        let restricted = green.base_for(version, &journal);
+        prop_assert_eq!(
+          Base::for_names(&named, &per_path),
+          Some(restricted),
+          "version {} of {}, journal {:?}",
+          version,
+          green.head(),
+          journal
+        );
+        // A path left out is a base not known, never a smaller one.
+        if let Some(first) = named.iter().next() {
+          let mut missing = per_path.clone();
+          missing.remove(*first);
+          prop_assert_eq!(Base::for_names(&named, &missing), None);
+        }
+      }
+    }
   }
 }
 
