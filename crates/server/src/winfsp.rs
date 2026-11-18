@@ -50,8 +50,8 @@
 //! holds one task and one message per mount, and ends at the answer or at the shard's stop. A daemon with no anchor
 //! holds nothing, so nothing waits; its mount is refused at the hold.
 //!
-//! Across a killed daemon the anchor holds the control, drive-link and ledger
-//! objects (A-198); recovery retains a matching catalog attachment, builds a successor dispatcher for that held volume,
+//! Across a killed daemon the anchor holds the control and ledger objects (A-198), and the held volume keeps its Mount
+//! Manager drive (A-369); recovery retains a matching catalog attachment, builds a successor dispatcher for that held volume,
 //! and seeds its coherence names from the ledger's live opens. An old context resolves by stable file identity, with
 //! the old process's bridge handle suppressed. The 20-kill CLI oracle also requires a counted uncached read through
 //! the old handle, so cached bytes cannot stand in for a successor serving it.
@@ -67,7 +67,9 @@ use slates_bridge_core::{
 };
 use slates_bridge_winfsp::held::{Record as HeldRecord, windows::Inherited};
 use slates_bridge_winfsp::host::Ready;
-use slates_bridge_winfsp::host::{MountThread, Notified, Outcome, Purged, REQUEST_BOUND, Request};
+use slates_bridge_winfsp::host::{
+  MountThread, Notified, Outcome, Purged, REQUEST_BOUND, Request, WinFspError,
+};
 use slates_bridge_winfsp::notify::{NotifyRound, OpenNames};
 use slates_bridge_winfsp::opens::{Ledger, Open};
 use slates_bridge_winfsp::purge::{Purge, purge_range};
@@ -301,7 +303,7 @@ pub(crate) fn defer_attach(state: &mut ShardState, pending: PendingAttach) -> Re
       None,
     ) {
       Ok(thread) => await_mounted(thread).await,
-      Err(error) => Err((error.to_string(), None)),
+      Err(error) => Err((mount_refusal(&error), error.to_string(), None)),
     };
     // A hold the anchor may yet read names this process's objects, so a refused one keeps them until it is released.
     // Each refusal is typed for the reply (A-299) and keeps its words for the log.
@@ -329,7 +331,7 @@ pub(crate) fn defer_attach(state: &mut ShardState, pending: PendingAttach) -> Re
           }
         }
       }
-      Err((why, thread)) => Err((refused_mount, why, thread)),
+      Err((refusal, why, thread)) => Err((refusal, why, thread)),
     };
     let served = state::with_state_counted(|s| {
       let mut reaped = None;
@@ -442,19 +444,38 @@ fn end_released(s: &mut ShardState, record: &AttachmentRecord) -> ReplyBody {
   }
 }
 
+/// The typed refusal a mount's failure is answered (A-299, A-369): a machine that does not let WinFsp's driver make a
+/// Mount Manager drive and a letter another volume has by name, an OS refusal by its number, anything else as a
+/// refused mount whose words are in the daemon's log.
+fn mount_refusal(error: &WinFspError) -> slates_ipc::protocol::TargetRefusal {
+  use slates_ipc::protocol::TargetRefusal;
+  match error {
+    WinFspError::MountManagerNotAllowed => TargetRefusal::MountManagerNotAllowed,
+    WinFspError::DriveLetterTaken => TargetRefusal::DriveLetterTaken,
+    WinFspError::Os { code, .. } => TargetRefusal::MountRefused { errno: *code },
+    _ => TargetRefusal::MountRefused { errno: None },
+  }
+}
+
+/// A mount that did not come up: its typed refusal, its words for the log, and the thread to reap.
+type Unmounted = (
+  slates_ipc::protocol::TargetRefusal,
+  String,
+  Option<MountThread>,
+);
+
 /// Waits, without holding the shard, for the mount thread's first outcome: the thread when the drive is mounted, or why
 /// not with the thread to reap.
-async fn await_mounted(
-  mut thread: MountThread,
-) -> Result<(MountThread, Ready), (String, Option<MountThread>)> {
+async fn await_mounted(mut thread: MountThread) -> Result<(MountThread, Ready), Unmounted> {
   loop {
     match thread.outcome() {
       Some(Outcome::Mounted(Ok(ready))) => return Ok((thread, *ready)),
       Some(Outcome::Mounted(Err(error)) | Outcome::Failed(error)) => {
-        return Err((error.to_string(), Some(thread)));
+        return Err((mount_refusal(&error), error.to_string(), Some(thread)));
       }
       Some(Outcome::Stopped) => {
         return Err((
+          slates_ipc::protocol::TargetRefusal::MountRefused { errno: None },
           "the mount thread ended before mounting".to_owned(),
           Some(thread),
         ));
@@ -725,17 +746,15 @@ fn checked_inherited(mount: crate::anchor_hold::HandedMount) -> Option<Inherited
     }
   };
   let mut handles = mount.handles.into_iter();
-  let (Some(volume), Some(link), Some(ledger)) = (handles.next(), handles.next(), handles.next())
-  else {
+  let (Some(volume), Some(ledger)) = (handles.next(), handles.next()) else {
     slates_machine::log_line!(
-      "slates-server: held mount {} has fewer than three handles",
+      "slates-server: held mount {} has fewer than its two handles",
       mount.attachment
     );
     return None;
   };
   Some(Inherited {
     volume,
-    link,
     ledger,
     record,
   })
@@ -789,7 +808,7 @@ async fn adopt_mount(record: AttachmentRecord, held: InheritedMount) {
     Some(held),
   ) {
     Ok(thread) => await_mounted(thread).await,
-    Err(error) => Err((error.to_string(), None)),
+    Err(error) => Err((mount_refusal(&error), error.to_string(), None)),
   };
   let adopted = state::with_state_counted(|s| match mounted {
     Ok((thread, ready)) => match keep(s, &record, thread, requests, waker, (ready, own), true) {
@@ -802,7 +821,7 @@ async fn adopt_mount(record: AttachmentRecord, held: InheritedMount) {
         Err(Some(thread))
       }
     },
-    Err((why, thread)) => {
+    Err((_, why, thread)) => {
       refuse_adoption(s, &record, &why);
       Err(thread)
     }
