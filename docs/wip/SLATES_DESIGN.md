@@ -30681,3 +30681,33 @@ Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class B), 
 
 Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class A), `crates/server/src/{shards_route,
 anchor_hold_windows,remote_attach,mirror,fleet}.rs`.
+
+### A-443 — A client's claim waits while its rendezvous's owner lives; the restart bound only where a live anchor holds it (2026-11-18, goal 85 via g251; R3's class C, C-a; §4.7 "Rendezvous"; A-114, A-176, A-178, A-232)
+
+- **What was there.** A claim waited a fixed second for the daemon's answer (`rendezvous::CLAIM_WAIT_NS`), or the
+  caller's restart bound where a live anchor held the rendezvous (A-114), never less than the second. A daemon alive and
+  slow to answer (a busy machine, a long start, a control shard starved) had its clients told it was unavailable, where
+  every call since A-232 waits for a live daemon's answer however long.
+- **The rule.** A claim waits while its rendezvous's owner lives, and its owner's death ends it at once: on Linux the
+  socket, whose connection the kernel resets when the listener's owner dies; on macOS the owner's bootstrap name
+  (`crate::owner_name`, A-178), which launchd takes back the moment its holder's receive right dies, looked up as the
+  claim waits, at once and then at twice the time waited at each look, so the looks cost the logarithm of the wait and a
+  death is seen within the time already waited. Where a live anchor holds the rendezvous, the daemon may be restarting
+  under it and the anchor's life says nothing of the daemon's, so the caller's restart bound bounds the claim as before;
+  `connect` gives none, for a daemon no anchor holds. On Linux a claim cannot tell an anchor's listener from its
+  daemon's, so a restart bound given bounds it there too: the caller's own clock.
+- **Owed.** Windows: opening the owner's named Event to probe it would keep the name and refuse a successor its
+  ownership while the probe held it (A-176), so a claim there still waits the claim wait; the next step is the
+  daemon's pid in the bootstrap header with an exit watch, or an open-only probe that cannot block a successor. The
+  claim wait remains the daemon's bound on a silent client (Linux's pending handshakes, the stale slots) and the macOS
+  region fetch's wait for the owner's turn, which the Mach reply's send-once notification could end at the owner's
+  death instead. The fleet tests' `CREDIT_WAIT` in daemon time is C-a's second half.
+- **Tests.** `a_claim_on_a_daemon_that_answers_past_the_claim_wait_is_served` and
+  `a_claim_on_a_daemon_that_died_ends_by_its_owners_life_not_a_clock` (`rendezvous.rs`'s macOS unit tests): a claim
+  due through half again the claim wait and then served; a claim whose daemon end went refused for a rendezvous with no
+  live owner within the claim wait of its going. The cross-process `a_claim_is_polled_without_waiting_and_refused_once_
+  its_daemon_is_gone` (`crates/ipc/tests/rendezvous.rs`, renamed from its claim-wait form) is filed for main's run on
+  every platform.
+
+Applied in the same change to: GAPS (the `LIVENESS_BUDGET_NS` entry's class C), `crates/ipc/src/rendezvous.rs`,
+`crates/ipc/tests/rendezvous.rs`.

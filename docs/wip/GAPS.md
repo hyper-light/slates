@@ -3706,7 +3706,17 @@
 >   `task_within` left waits for a reason stated beside it (the caller's own period or cadence, a remote wait, or a
 >   peer's one-at-a-time serve), and every other cross-shard wait is judged in its target's own time. Owed, found on the
 >   way: an adopted move's seal is still taken again when its answer is lost to a stopped shard; recording the seal on
->   the owner shard would make `moves::seal_adopted` idempotent. Class B (the
+>   the owner shard would make `moves::seal_adopted` idempotent. **Class C, the rendezvous's claim (A-443, 2026-11-18,
+>   g251):** a client's claim waited a fixed second for its answer (`rendezvous::CLAIM_WAIT_NS`), so a daemon alive and
+>   slow to answer was reported gone; it now waits while its rendezvous's owner lives, ending at once at its death (on
+>   Linux the socket, reset with the listener's owner; on macOS the owner's bootstrap name, looked up at twice the time
+>   waited each time), and within the caller's restart bound only where a live anchor holds the rendezvous
+>   (`a_claim_on_a_daemon_that_answers_past_the_claim_wait_is_served`,
+>   `a_claim_on_a_daemon_that_died_ends_by_its_owners_life_not_a_clock`). Owed in C-a: Windows, where opening the owner's
+>   named Event to probe it would keep the name and refuse a successor its ownership, so its claim still waits the claim
+>   wait (a daemon's pid in the bootstrap header with an exit watch, or an open-only probe that cannot block a successor,
+>   is the next step); the fleet tests' `CREDIT_WAIT` in daemon time; and the macOS region fetch's own wait for the
+>   owner's turn (the Mach reply's send-once notification would end it at the owner's death). Class B (the
 >   transport's round-trip estimate) is open, but for the owner-location round (2026-11-18, A-437, goal g255: one
 >   liveness window, hard, for its asks and its lent sessions; now the record plane's round budget over the slowest
 >   asked path's measured tail, `owner_location::round_budget_for`), an operator's promotion forwarded to the root
