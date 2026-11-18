@@ -1,0 +1,21 @@
+name: diag-a285-e2e
+on:
+  push:
+    branches: [diag-a285-e2e]
+jobs:
+  write-policy:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: A-285's write policy, end to end on a Linux server
+        run: |
+          uname -a; nproc; free -g || true
+          git log -1 --format='%h %s' | cut -c1-120
+          cargo test --locked -p slates-server --test write_policy -- --nocapture
