@@ -7006,6 +7006,17 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > late. Red-checked: with the control-verb wait removed the last write returned at head 1, durable none, owed
 > (3 of 3); with the NFS wait removed the counter is zero and the race shows an undurable reply in 2 of 3.
 >
+> **The held replies' bound is met before a verb runs (2026-11-18).** A shard holds at most `awaiting_bound` such
+> replies (its client seats times ring slots). A recorded verb that could be held (one that changes a live-shipped
+> volume, or a destroy while `f > 0`) meets that bound before it runs (`live_ship::refuse_over_bound`, from
+> `verbs::run_recorded`): refused `Overloaded`, it changed nothing, and its resend under the same id runs it once, as on
+> a plain volume. Before, the bound was met in `defer`, after the verb's effects had committed with no completion
+> record, so the resend ran the verb again over them: a directory's resend was refused `AlreadyExists`, an append landed
+> twice (g232's finding). Held by
+> `a_live_shipped_verb_refused_at_the_held_reply_bound_changed_nothing_so_its_resend_runs_once`
+> (`crates/server/tests/fleet.rs`). An asynchronous outcome (a mapped file's sync, an image build) still meets the bound
+> in `defer`, after its commit (GAPS, OPEN).
+>
 > **Slice three (2026-11-05): takeover from the live log.** The whole-state kind (23) carries a successor's fetch beside
 > installs, by tag (`slates_db::live::Fetch`). A takeover that adopts a live-shipped volume's head runs phase one for
 > its log (`live_ship::fetch`): every candidate of the head's placement raises its fence to the head's placed epoch,
@@ -7305,6 +7316,14 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > acceptor whose changes do not account for its positions against what was published (one put in place of another) is
 > carried whole, as its pieces. Still carried whole when changed: the content hold's image (its every manifest and
 > chunk, at each publication that changed it) and the mirror records.
+>
+> **The content hold is its pieces (2026-11-18, A-376; image version 30).** The content hold's image was one piece,
+> every stored chunk, held manifest and stage, re-encoded at every publication and re-put whenever it changed: at
+> `f > 0` every version of a green, whose inputs its holders keep. Now each stored chunk, each manifest held for an object
+> and each stage is a piece (`ContentHold::pieces`), the hold keeps which it changed since the last committed
+> publication (`ContentHold::changed_pieces`), and a delta carries those; a recovery puts them back into the hold's image
+> (`ContentHold::image_from_pieces`) and rebuilds the hold from it as before, every chunk verified. Still carried whole
+> when changed: the mirror records.
 >
 > **One lane a holder, only to holders of the catalog, and no session left with a cancelled request (2026-11-07).**
 > The dispatch round (`live_ship::dispatch`, `send_from_control`) now ships the way the record plane's sessions allow.
@@ -27063,6 +27082,8 @@ Applied in the same change to:
   loaded, `--apparmor-profile` binds and its command reads the volume as the runner's uid, runs `unconfined` and is
   refused its own `unshare -Ur`, while without the option the launcher is refused naming it; a test demanding the
   loaded regime with none loaded fails (the red check); the SDKs' plumbing tests pass against the built wheel and addon.
+  Each guard red-checked (diagnostics run 44353311142): without the step-out the launcher ran unasked under the loaded
+  profile; without the exec-time drop the command ran under the profile's label and held the grant.
 - **Rejected:** entering a named profile by `change_profile` from unconfined, and an enforce-mode profile confining the
   whole binary (§4.6, "The launcher on a restricted host", says why).
 - **What remains.** The daemon publishing its root mount, so `SLATES_ROOT` need not be named (GAPS). The release
@@ -27181,3 +27202,33 @@ Applied in the same change to:
   a slates-signed driver (an EV code-signing certificate and a Microsoft Partner Center account for attestation
   signing). Both are Ada's. Until then the drive on WinFsp as released makes no hard link and A-300's stated difference
   stands.
+
+### A-376 — A holder publishes what changed of its content hold: the hold's image is a piece per stored chunk, per held manifest and per stage, and a delta carries those the hold changed since the last committed publication (2026-11-18, goal g232: one primary and two replicas editing the Linux kernel tree; image version 30)
+Applied in the same change to: §4.8 (A-270's status: "The content hold is its pieces"), GAPS (the load test's
+ledger), `crates/cluster/src/content.rs` (`HoldPiece`, `ManifestPiece`, `ContentHold::changed_pieces`, `clear_changes`,
+`piece_bytes`, `pieces`, `image_from_pieces`, every change noted where the hold makes it; `manifest_image`, `chunk_image`,
+`stage_image`), `crates/server/src/content_holder.rs` (`KIND_CONTENT_CHUNK`, `KIND_CONTENT_MANIFEST`,
+`KIND_CONTENT_STAGE`, `hold_piece_key`, the content pieces in `held_image`, `held_changes`, `held_committed` and
+`split_held`, `HeldRefused::Content`), `crates/server/src/verbs.rs` (a recovered hold owes no change),
+`crates/vfs/src/recover.rs` (`IMAGE_VERSION` 30), and the tests below.
+- **What was there.** A-270 left the content hold's image whole: one piece holding every stored chunk, held manifest and
+  stage, recomputed at every publication (`ContentHold::to_image`) and re-put whenever its bytes changed. A holder of a
+  green holds every version's inputs, so every version's put and record re-encoded and re-wrote every input it held:
+  `sample` of the late-submit test at 1,000 versions (Mac Studio, debug, after A-372) found about a tenth of each
+  holder's time in that encoding, and its deltas big enough that the journal checkpointed about as often as it logged.
+- **The rule.** The hold's image is a piece per stored chunk (keyed by its identity's first 24 bytes), per manifest held
+  for an object (by the first 24 bytes of the BLAKE3 of its object and identity, since one manifest can be held for
+  several objects) and per stage (by its object). The hold notes each piece where it changes it (a chunk stored or
+  released, a manifest held, placed again or forgotten, a stage opened, grown or closed), and a delta carries the pieces
+  noted since the last committed publication, each put if held and removed if not; a checkpoint carries every piece.
+  A recovery puts the pieces back into the hold's image in its canonical order and rebuilds the hold from it as before,
+  every chunk verified, and the rebuilt hold owes no change.
+- **Tests.** `a_holders_publication_carries_the_content_it_puts_not_the_whole_hold` (`daemon.rs`: 64 puts, every delta
+  one size, the folded deltas the whole image); the held-pieces oracle (`daemon.rs`) puts and releases content between
+  deltas and checkpoints; the hold's model tests (`slates-cluster`) fold every step's changed pieces and hold them to
+  the hold's pieces, and the folded pieces to the hold's image, byte for byte.
+- **Measured.** Kiln r3543, the Mac Studio, 2026-11-18, debug build: on main's code a put's delta carried the whole hold,
+  170 bytes at the first of 64 puts and 158 more at each after (64 sizes); with this change one size each. The
+  late-submit test's late median at 300 versions 2.28 to 2.37 ms against the early 2.31 to 2.49 (after A-372, 2.92 to
+  3.28 against 1.87 to 1.96), and at 1,000 versions 3.76 ms against 6.00 (after A-372, 8.49 against 2.28; before A-367,
+  18.2 against 2.16): a version late in a green's history now costs what an early one does.

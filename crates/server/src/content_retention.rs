@@ -302,6 +302,7 @@ mod tests {
             uid: 0,
           },
           completion: None,
+          signature: None,
         };
         state
           .holder_records

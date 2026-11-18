@@ -2592,6 +2592,16 @@
 > - a rebuild over a long chain recomputes every version the holder accepted (300,000 at the 100,000-client rung's three
 >   rounds), since the holder keeps no checkpoint of its replica; the holder's growth per version is A-238's owed item.
 >
+> **Fixed 2026-11-18 (g232, A-376): every version re-published the whole content hold.** The content hold's image was
+> one piece (A-270), every chunk, manifest and stage a holder keeps, recomputed at every publication and re-put whenever
+> it changed, which at `f > 0` is every version of a green: after A-372 about a tenth of a holder's time at 1,000
+> versions (`sample`, Mac Studio, debug), and deltas big enough that the journal checkpointed about as often as it
+> logged. Now the hold is a piece per chunk, per held manifest and per stage, it notes each piece it changes, and a delta
+> carries those (image version 30). Test: `a_holders_publication_carries_the_content_it_puts_not_the_whole_hold`
+> (`daemon.rs`): on main's code a put's delta grew 158 bytes a put, now one size. With A-367, A-372 and this, the
+> late-submit test's late median at 300 versions is 2.28 to 2.37 ms against early 2.31 to 2.49, and at 1,000 versions
+> 3.76 against 6.00 (kiln r3543, Mac Studio, debug): no growth with a green's history left at `f = 1` on the commit path.
+>
 > **Fixed 2026-11-18 (g232, A-372): every version re-judged every version's inputs its holders kept.** A holder runs the
 > retention rule after every record it accepts and every put it holds, and the rule judged every manifest held for the
 > object, each by decoding the ledger position at its placed sequence (`content_retention::retain_object`), so a green's
@@ -3046,6 +3056,20 @@
 > - ~~**Owed:** the five-arm A/B with every worker count fixed at build time and no probe~~ **done 2026-11-07**
 >   (diag-winfsp-overlap-40 to -42; BENCHMARKS, "Step 7's verdict"): no form is within the DLL's spread on both runners,
 >   and A-215's combined form is measured and rejected; main's separate form ships.
+
+> **A live-shipped verb refused at the held replies' bound ran again on its resend (2026-11-18, A-200; recorded verbs
+> CLOSED, asynchronous outcomes OPEN, owner g226).** `live_ship::defer` judged the shard's bound on replies held for
+> durability (`awaiting_bound`) after a verb's effects committed with no completion record, and answered `Overloaded`,
+> which a client resends under the same id: the resend met `Seen::New` and ran the verb again over its own effects (a
+> directory's resend refused `AlreadyExists`; an `O_APPEND` write appended twice). Found by g232 and reported by the
+> supervisor. A recorded verb now meets the bound before it runs (`live_ship::refuse_over_bound` in
+> `verbs::run_recorded`), and `defer_destroy` no longer refuses. Held by
+> `a_live_shipped_verb_refused_at_the_held_reply_bound_changed_nothing_so_its_resend_runs_once`
+> (`crates/server/tests/fleet.rs`).
+> - **OPEN, the siblings:** the outcome of a mapped file's sync (`direct_map::answer_after`) and of an image build or
+>   merge (`image::complete_once_durable`) still reach `defer` after their commit and can be refused there. Their held
+>   count changes across their awaits, so the bound cannot be judged when they begin. The fix owed is a seat held for
+>   such a reply from the task's start, refused `Overloaded` before the task runs.
 
 > **A live-shipped volume fails a waiting writer when its candidates are slow (2026-11-05, A-200; OPEN, owner raft).**
 > A-200 says holders that do not answer "make the writer wait: backpressure, never a false success". A stable reply on a
@@ -5360,6 +5384,15 @@ still fails `-D clippy::disallowed-methods` with the flag in place, and the plan
 >   - the SDKs' plumbing tests passed against the built wheel (3 of 3) and addon (1 of 1).
 >
 >   CI's `gates` job runs both regimes on every push since (`The slates exec AppArmor profile, opted into (Linux)`).
+> - **Red-checked** (diagnostics run 44353311142, `ubuntu-24.04`), each guard removed in turn:
+>   - the switch dropped from the launcher's arguments failed the shared grammar's test and the CLI's round trip;
+>   - with the step-out removed, the launcher ran without the option under the loaded profile (exit 0, where 4 is
+>     owed);
+>   - with the exec-time drop removed, the command ran labelled `/home/runner/work/slates/slates/target/debug/slates
+>     (unconfined)` and held the grant (`grant-held`).
+> - **macOS** (diagnostics run 44352021341, `macos-latest`): the focused tests pass there too (5, 4, 6 and the CLI's
+>   `apparmor_prints_the_profile_and_checks_the_host`); `slates apparmor check` answers `readiness: unsupported` (exit 1)
+>   and `exec` the refusal it always gave off Linux (exit 4).
 > - The launcher moved from `crates/cli/src/exec.rs` to `crates/api/src/exec.rs`, so an embedding host's executable
 >   serves it (`role::main`'s `exec`), and the profile can name that executable.
 >
