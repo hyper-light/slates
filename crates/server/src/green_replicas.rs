@@ -125,6 +125,10 @@ pub(crate) const ROUTE_IDLE: &str = "merge.replica.route_idle";
 /// Counter: a shard's idle check that could not be started (its task arena full): the replicas wait for their next use
 /// to arm it again, holding their charge meanwhile.
 pub(crate) const IDLE_CHECK_REFUSED: &str = "merge.replica.idle_check_refused";
+/// Counter: a message of the feed its owner sent to a replica's shard (A-502).
+pub(crate) const FEED_SENT: &str = "merge.replica.feed_sent";
+/// Counter: a replica's acknowledgement that came home to its owner (A-502).
+pub(crate) const ACKNOWLEDGED: &str = "merge.replica.acknowledged";
 
 /// This shard's part in the replicas of greens (module docs): as an owner, the shards it fed and the engines it is
 /// retiring; as a replica's shard, the replicas it holds.
@@ -543,6 +547,7 @@ fn broadcast(
   message: FeedMessage,
 ) {
   for target in targets {
+    state.count(FEED_SENT, 1);
     send(
       state,
       *target,
@@ -788,6 +793,7 @@ fn leave_held(state: &mut ShardState, key: (VolumeId, u64)) {
 /// The owner takes what a replica of its installed engine passed; one of a retiring engine is not needed, since that
 /// engine waits only for its replicas to leave.
 fn acknowledged(state: &mut ShardState, (green, install): (VolumeId, u64), passed: Passed) {
+  state.count(ACKNOWLEDGED, 1);
   let installed = state
     .green_replicas
     .fed
@@ -1576,5 +1582,74 @@ mod tests {
     });
     assert!(held_again.is_some(), "held again");
     daemon.stop();
+  }
+
+  /// The owner's counts of the feed's messages it sent and of its replicas' acknowledgements that came home.
+  fn sent_and_acknowledged(state: &mut ShardState) -> [u64; 2] {
+    [FEED_SENT, ACKNOWLEDGED].map(|counter| state.refusals.get(counter).copied().unwrap_or(0))
+  }
+
+  /// The owner's head of `green` and its identity.
+  fn head_of(state: &mut ShardState, green: VolumeId) -> (u64, [u8; 32]) {
+    let engine = state.greens.get_mut(&green).unwrap();
+    (engine.head(), engine.head_identity())
+  }
+
+  /// Whether the replicas on the second and third shards both hold `head` of `green`, within an observation's budget
+  /// each. A replica sends its acknowledgement in the step that applies the feed, so once both hold it, an observation
+  /// of the owner made after this sees every acknowledgement of that feed home.
+  fn both_hold(daemon: &crate::daemon::Daemon, green: VolumeId, head: (u64, [u8; 32])) -> bool {
+    [1, 2]
+      .into_iter()
+      .all(|at| eventually(daemon, at, move |state| held_at(state, green, head)).is_some())
+  }
+
+  /// A-502. Do: on a three-shard daemon, a green on the first shard with one version, held at its head by the replicas
+  /// on the other two shards; then, in one turn of the owner, three more versions submitted, each reply read before the
+  /// next submit. Expect: no message of the feed sent before any of the turn's replies (before A-502 each reply waited
+  /// for one message a replica for each of the version's changes); once the turn is over, both replicas at the owner's
+  /// head, the turn's changes sent to each replica's shard in one message, two in all, and one acknowledgement come home
+  /// from each.
+  #[test]
+  fn a_turns_changes_go_to_each_replica_in_one_message_after_the_turns_replies() {
+    let daemon = crate::daemon::audit_daemon_of(3);
+    let (green, work, first) = crate::daemon::observe_first(&daemon, |state| {
+      let (green, work) = green_and_work(state, "turned");
+      submit_one(state, work, 1);
+      (green, work, head_of(state, green))
+    });
+    assert!(both_hold(&daemon, green, first), "both replicas hold version 1");
+    let before = crate::daemon::observe_first(&daemon, sent_and_acknowledged);
+    let (sent_before_replies, head) = crate::daemon::observe_first(&daemon, move |state| {
+      let mut sent_before_replies = Vec::new();
+      for byte in [2, 3, 4] {
+        let [sent, _] = sent_and_acknowledged(state);
+        submit_one(state, work, byte);
+        let [sent_by_the_reply, _] = sent_and_acknowledged(state);
+        sent_before_replies.push(sent_by_the_reply.saturating_sub(sent));
+      }
+      (sent_before_replies, head_of(state, green))
+    });
+    assert_eq!(
+      sent_before_replies,
+      [0, 0, 0],
+      "no message of the feed sent before any of the turn's replies"
+    );
+    assert!(both_hold(&daemon, green, head), "both replicas at the owner's head");
+    let after = crate::daemon::observe_first(&daemon, sent_and_acknowledged);
+    assert_eq!(
+      [
+        after[0].saturating_sub(before[0]),
+        after[1].saturating_sub(before[1])
+      ],
+      [2, 2],
+      "the turn's changes in one message to each replica's shard, one acknowledgement back from each"
+    );
+    daemon.stop();
+    assert_eq!(
+      slates_mem::sealed::dropped_with_readers(),
+      0,
+      "no owner dropped with a replica registered"
+    );
   }
 }
