@@ -5225,7 +5225,37 @@ failure mode to protect against. `std::` paths resolve on every platform, so lea
 typo in them an error. Red-checked rather than assumed — a planted `rustix::fs::fsync` in `slates-mem`
 still fails `-D clippy::disallowed-methods` with the flag in place, and the plant was removed byte-exact.
 
-### 8a-launcher-ci. `slates exec` writes its own userns maps, which two kernels refuse (2026-10-20, OPEN — a defect, not a runner setting)
+### 8a-launcher-ci. `slates exec` writes its own userns maps, which two kernels refuse (2026-10-20; re-diagnosed 2026-11-05: Ubuntu's AppArmor restriction; CLOSED 2026-11-18 by A-370: slates' profile, used when asked)
+
+> **Closed 2026-11-18 by A-370 (goal g078, kiln 7d8d1280): `slates exec` runs unprivileged on a restricted host, with
+> slates' AppArmor profile loaded and the option on.** Ada's decision the same day: "Ship the profile but feature flag
+> it so whether via SDK (Node/Python), API, or CLI it is user enabled." Design §4.6 "The launcher on a restricted
+> host".
+> - **The profile:** `abi <abi/4.0>,` then `profile <executable> flags=(unconfined) { userns, }`, named by the
+>   executable's real path. It is rendered by the binary for its own path (`slates apparmor profile`) and by the SDKs
+>   and slates-api for any path. `slates apparmor check` says whether the host restricts user namespaces and prints the
+>   root commands that load the profile. slates never loads it (R10) and never writes `/etc/apparmor.d` (R1).
+> - **The flag:** `slates exec --apparmor-profile`, slates-api's `ExecSpec::apparmor` (`AppArmor::Profile`), the Python
+>   SDK's `exec_command(..., apparmor_profile=True)`, the Node SDK's `execCommand(..., { apparmorProfile: true })`; off
+>   unless set.
+>   - Off: a launcher running under its loaded profile leaves it first (`changeprofile unconfined`), so the host's
+>     restriction refuses it as with no profile loaded, and the refusal names the switch; with no profile loaded, the
+>     refusal is word for word the one of 2026-11-05.
+>   - On: the namespace is made under the profile and the command is exec'd unconfined (`exec unconfined`), so it holds
+>     no user-namespace grant.
+> - **Measured** (diagnostics run 44344947954, the launcher's sequence by a probe, 2026-11-18): on `ubuntu-24.04`
+>   (AppArmor 4.0.1, Linux 7.0.0-1017-azure) and `ubuntu-latest`, now Ubuntu 26.04.1 (AppArmor 5.0.2, Linux
+>   7.0.0-1016-aws, `apparmor_restrict_unprivileged_unconfined=1`):
+>   - the profile loaded, the maps, the private tree and the bind succeed, and the command reads the volume;
+>   - the step-out restores the refusal;
+>   - with `exec unconfined` the command runs `unconfined`, and its own `unshare -Ur` is refused (inherited, it
+>     succeeded);
+>   - a copy of the binary at another path is not covered.
+> - **Through the real binary:** RUNFLOW
+> - The launcher moved from `crates/cli/src/exec.rs` to `crates/api/src/exec.rs`, so an embedding host's executable
+>   serves it (`role::main`'s `exec`), and the profile can name that executable.
+>
+> The entry as it stood on 2026-11-05:
 
 > **Re-diagnosed 2026-11-05 (bug-sweep): the refusal is fixed; the rest is a host setting after all, which slates
 > cannot lift unprivileged.** The entry below drew its conclusion from a probe that execs a shell, and an exec'd process
@@ -7051,8 +7081,9 @@ namespace. An unsatisfiable path is refused with the exact missing directory, ne
 budgeted `unsafe` (`unshare_unsafe`, sound in the single-threaded pre-exec launcher). The `--`
 splits the flags from the command; the parsing is unit-tested on every host, and the launcher
 runs against a real daemon mount in the CI Linux lane. Owed: the daemon publishing its root
-mount so `SLATES_ROOT` need not be set by hand, and the AppArmor-profile detection with the exact
-remedy message (a generic hint is given now).
+mount so `SLATES_ROOT` need not be set by hand. (The AppArmor detection with the exact remedy message landed
+2026-11-05; slates' AppArmor profile, used when the caller asks, with A-370 on 2026-11-18, when the launcher moved to
+`crates/api/src/exec.rs`: GAPS `8a-launcher-ci`.)
 
 The xtask unsafe counter was made word-boundary aware in the same change: it counted the
 substring `unsafe` inside identifiers like `unshare_unsafe`; it now counts the `unsafe` keyword

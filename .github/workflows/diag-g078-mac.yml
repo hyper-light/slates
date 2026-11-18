@@ -1,0 +1,24 @@
+# Diagnostics only (never main): A-370's focused tests on macOS, where the launcher is refused typed (goal g078).
+name: diag-g078-mac
+on:
+  push:
+    branches: ['diag-g078-mac*']
+jobs:
+  mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Focused tests
+        run: |
+          set -o pipefail
+          cargo test -p slates-client --lib exec:: 2>&1 | tail -12
+          cargo test -p slates-api --lib exec:: 2>&1 | tail -12
+          cargo test -p slates-cli --bin slates -- exec apparmor harness 2>&1 | tail -12
+          cargo test -p slates-cli --test cli -- --exact apparmor_prints_the_profile_and_checks_the_host 2>&1 | tail -8
+          cargo check -p slates-sdk-python -p slates-sdk-node 2>&1 | tail -3
+          target/debug/slates apparmor check || echo "check exit $?"
+          target/debug/slates exec --apparmor-profile --volume v --at /tmp -- true || echo "exec exit $?"
