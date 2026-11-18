@@ -2326,7 +2326,12 @@ async fn run_import(mut job: ImportJob, alias: Option<NameAlias>) {
 /// admit, and restored; and laid into the volume.
 async fn import_steps(job: &mut ImportJob) -> Result<(), Refusal> {
   with(|s| job.open(s))?;
-  while with(|s| job.feed_step(s, feed_slice_bytes(&s.config)))?.is_none() {
+  while with(|s| {
+    let slice = feed_slice_bytes(&s.config);
+    job.feed_step(s, slice)
+  })?
+  .is_none()
+  {
     slates_rt::futures::yield_now().await;
   }
   let archive = loop {
