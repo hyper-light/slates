@@ -716,7 +716,8 @@ fn wait_settled(instances: &[String], members: usize) {
     assert!(
       window.moving(&format!("{views:?}")),
       "the fleet settled, or kept changing, within each fleet wait (council voters, configuration members, record \
-       sessions): {views:?}"
+       sessions): {views:?}\n{}",
+      diagnosis(instances, "")
     );
     pause();
   }
@@ -2266,7 +2267,9 @@ fn print_slow_windows(instances: &[String], outcomes: &[Outcome], samples: &[Sam
   }
 }
 
-/// Every node's sessions, live logs and live counters, as `status` prints them: what a stalled flow shows.
+/// Every node's sessions, live logs and live counters, as `status` prints them: what a stalled flow shows. Also what a
+/// fleet that never settled shows ([`wait_settled`]: its council and configuration, its takeovers and their promises),
+/// with `volume` empty, which keeps every volume's live log.
 fn diagnosis(instances: &[String], volume: &str) -> String {
   instances
     .iter()
@@ -2299,6 +2302,8 @@ fn diagnosis(instances: &[String], volume: &str) -> String {
             || line.starts_with("fleet_takeovers_pending")
             || line.starts_with("fleet_held_records")
             || line.starts_with("fleet_configuration_version")
+            || line.starts_with("fleet_configuration_members")
+            || line.starts_with("fleet_council")
             || line.contains("anchor")
             || line.starts_with("fleet_host")
             || line.starts_with("fleet_peers_")

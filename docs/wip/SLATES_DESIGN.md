@@ -5751,6 +5751,16 @@ refinement and revalidation before those results can be applied to the corrected
 > A-304's like any other (a member that never promises gives the object up by name). Piece 3: a live log whose recorded
 > holders are past tolerance is taken from every surviving holder of it, recorded or in the retired owner's cohorts.
 
+> **Status (2026-11-18, A-335: a stale copy keeps the content a head may name).** A successor's confirmation says the
+> record was adopted, never that the content was fetched: the successor fetches a taken-over volume's content from the
+> holders its adopted head names, and from no one else (`fleet::fetch_into_hold`). So a holder lets a stale copy go
+> only once its retention rule (AUD-29-43) leaves no content held for the object: content its newest record names it
+> for, or content placed ahead of its records, keeps the copy whole (`takeover::let_go_stale`, counted
+> `fleet.takeover.kept_holding_content`). Before, a holder outside the successor's placement dropped content the adopted
+> head named at the confirmation, and at `f = 1` with the dead owner the head's only other holder the volume was lost to
+> one failure (`docs/bugs/2026-11-18-a-stale-copy-reclaim-dropped-content-a-successor-still-fetched.md`). Owed: the
+> release of a copy kept so (GAPS).
+
 **Neighbourhood changes.** A host's neighbourhood changes only through the group (a member
 left, a fresh member joined, a rebalancing). While a change is in flight the owner writes to a
 quorum of the old candidates and a quorum of the new ones (joint writes); the group retires the
@@ -24665,7 +24675,9 @@ model below; each red before its fix):
   retirement in the version that records it (before, such a holder kept its stale copy for good). A holder the round
   never asked keeps its copy (`fleet.takeover.kept_unasked`): within tolerance it is stale, past it it may be the only
   one, and nothing in the configuration tells which. Owed (GAPS): a holder an owner's neighbourhood settled away from
-  lets its copies go at that settle, on the owner's report, so these do not stay.
+  lets its copies go at that settle, on the owner's report, so these do not stay. (Wrong as stated, A-335: the settle
+  report covers records, not content, and a head may go on naming such a holder's content; a stale copy whose content
+  its holder still keeps is kept whole since A-335.)
 - **Bounded** (banned item 8): at most one record per member (`completed_bound`), the oldest let go first, but never
   the record of a survivor that left owing its share while the retirement it carried is kept, since that retirement's
   completion rests on it. A holder that lags past a let-go record keeps a stale copy: a leak bounded by what it holds,
@@ -25325,3 +25337,49 @@ entry), `docs/cli.md` (the anchor), `crates/machine/src/memory_stall.rs` (new: `
   a shard asleep on a lock whose holder pages, judged wedged on Linux (the holder is not named, as for a starved
   holder); Windows' per-thread wait reason (`WrPageIn` and its kin) as the thread's own reading there; and a run of a
   daemon in a host truly short of memory (a bounded container with swap), the measurer's.
+
+### A-335 — A stale copy is let go only once its holder keeps no content for it: a successor's confirmation says its record was adopted, not that its content was fetched (2026-11-18, kiln goal g250; a bug found while checking A-309's owed rule)
+
+A takeover's survivor confirms its share once every object its round learned is adopted: the newest record re-committed
+under its own placement (A-272). Its materialization comes after: a volume's content is fetched from the holders the
+adopted head names, and from no one else (§4.10 "fetches … by identity from a recorded holder"; `fleet::fetch_into_hold`).
+A holder of the retired owner's copy that the successor's placement leaves out read the confirmation (or the completion
+record) as its copy's adoption and dropped the copy whole, record and content (`takeover::reclaim`). At `f = 1` a seal
+places its content on the owner and one more holder; when that one was such a holder and the successor held none of the
+content, the successor could fetch from nobody once the copy was dropped, and one failure lost the volume
+(`docs/bugs/2026-11-18-a-stale-copy-reclaim-dropped-content-a-successor-still-fetched.md`).
+
+- **The record and the content are judged apart.** The record's lineage decides that a copy is stale (A-272, A-309,
+  unchanged). The content's own rule decides what it keeps (AUD-29-43): a holder keeps a manifest while its newest
+  accepted record names it for this holder, or while it is the newest placement ahead of its records. A stale copy is let
+  go only once that rule, run on the object first, leaves nothing held for it; otherwise the copy is kept whole
+  (`takeover::let_go_stale`, `fleet.takeover.kept_holding_content`, counted at each install that judges it). The
+  adopted record is the newest the round learned; when it is this holder's own, its head names this holder, so the
+  copy this holder keeps is exactly the one the successor may fetch. A green is the same: its successor fetches a
+  version's inputs from the members that reported the adopted version (`fleet::fetch_green_inputs`), and a reporter's
+  inputs are content the rule keeps.
+- **What it costs.** A copy kept for its content stays until a newer record reaches its holder and the retention rule
+  releases it. A holder outside the successor's placement receives no newer record, so it keeps the copy for good: a
+  leak bounded by what it holds, never a loss. The release is owed with the content's own certificate: a successor
+  confirms only once its adopted volumes' content is re-placed under its own placement, and an owner's settle certifies
+  its content as well as its records; a holder outside the placement then lets go (GAPS).
+- **A-309's owed rule was wrong as stated.** "A holder an owner's neighbourhood settled away from lets its copies go at
+  that settle, on the owner's report that every record it owns is placed on the new neighbourhood": the report covers
+  records (`fleet::records_placed_on_current_neighbourhood`), while content stays on the cohort it was placed on and the
+  head goes on naming its holders (§4.8 "Neighbourhood changes" status: "Content stays on its current cohort: the head
+  names its holders"). The healer leaves such a named holder outside the candidates and relies on it keeping the copy
+  (A-276's open item, `fleet.heal.named_outside_candidates`). A holder that dropped its content at the settle would
+  leave the head naming a holder without it, and the owner's failure would lose the volume. Only register copies whose
+  content no head this holder holds names may go on that rule.
+
+Held by, in `crates/server/src/daemon.rs`: `a_holder_outside_the_successors_placement_keeps_the_content_its_head_names`
+(the successor's confirmation, then the completed takeover) and
+`a_lagging_holder_keeps_the_content_its_head_names_when_the_takeover_completes` (a holder that installs only the
+completion record), each red before (the copy and its content reclaimed), over `hold_a_head_naming_this_holder` (a
+seven-member `f = 1` region; the volume's successor places it away from the holder); A-309's
+`a_holder_outside_the_successors_placement_lets_its_copy_go_when_the_takeover_completes` still lets a copy with no
+content go.
+
+Applied in the same change to: §4.8 "Promotion and takeover" (status), A-309 (its holder rule and its owed line), GAPS
+(A-272 (ii)'s entry and the content hazard), `crates/server/src/takeover.rs`, `crates/server/src/daemon.rs` (tests) and
+the bug record.
