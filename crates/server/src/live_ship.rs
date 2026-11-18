@@ -1302,7 +1302,8 @@ pub(crate) fn published(
         (local, object, epoch),
         quorum,
         &holders,
-        start,
+        // Red check only: main's shipper starts from nothing.
+        start.and(None),
         // Nothing is known of the volume's whole state before its first whole record, which is this log's first entry
         // (`owes_whole`): admitted with nothing in flight, it sets the bounds (`Bounds::of_whole`, below).
         Bounds::default(),
