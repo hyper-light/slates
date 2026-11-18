@@ -1267,7 +1267,16 @@ pub struct NfsV4Caps {
   /// Derived: the bytes of call records a shard holds at once (A-127): what answers a compound retried after a
   /// restart, bounded beside the slot caches it is the durable twin of.
   pub record_bytes: usize,
+  /// Derived: the lease the listener grants every client and advertises (`FATTR4_LEASE_TIME`, RFC 8881 §8.3), which
+  /// is also the wait a recalled delegation is owed before it is revoked (§10.4.5) and every wait on that (A-425). Read
+  /// only through `nfs::v4_lease_ns`, so the lease told and the waits on it are one number.
+  pub lease_ns: u64,
 }
+
+/// Format: how long an idle Linux NFSv4 client goes between two renewals of its lease however short the lease it is
+/// told: `nfs4_schedule_state_renewal` waits two thirds of the lease, never less than five seconds (`if (timeout < 5 *
+/// HZ) timeout = 5 * HZ;`, fs/nfs/nfs4renewd.c, Linux master, read 2026-11-18). The served client's fact, not a tunable.
+pub const NFS_V4_CLIENT_RENEWAL_FLOOR_NS: u64 = 5_000_000_000;
 
 /// Shape: the holders the NFSv4 client share of a shard's reserve is split between (A-127): the slot caches (a kept
 /// reply per slot) and the call records (what a kept reply becomes across a restart, published with its effects).
@@ -1344,12 +1353,27 @@ fn nfs_v4_caps(
     ["max_inodes", "shards"]
   );
   derivations.push(note("nfs_v4_locks", &locks));
+  // The lease (A-425) outlasts the longest an idle client goes between two renewals, the Linux client's floor, by the
+  // lateness a live party may show before it is judged (A-228's window), for the renewal's delivery; in the whole seconds
+  // `FATTR4_LEASE_TIME` carries, so the lease a client is told is the lease it holds. Not the failover delay, which is
+  // shorter: below the floor a live idle client's lease lapses between its renewals, and a full table drops its state.
+  let lease_ns: Derived<u64> = derived!(
+    NFS_V4_CLIENT_RENEWAL_FLOOR_NS
+      .saturating_add(crate::daemon::LIVENESS_BUDGET_NS)
+      .div_ceil(NANOS_PER_SECOND)
+      .saturating_mul(NANOS_PER_SECOND),
+    "ceil((NFS_V4_CLIENT_RENEWAL_FLOOR_NS + LIVENESS_BUDGET_NS) / 1 s) s: an idle Linux client's longest gap between \
+     renewals and the lateness a live party may show, in the whole seconds FATTR4_LEASE_TIME carries",
+    ["NFS_V4_CLIENT_RENEWAL_FLOOR_NS", "LIVENESS_BUDGET_NS"]
+  );
+  derivations.push(note("nfs_v4_lease_ns", &lease_ns));
   NfsV4Caps {
     slots: slots.get(),
     clients: clients.get(),
     opens: opens.get(),
     locks: locks.get(),
     record_bytes: record_bytes.get(),
+    lease_ns: lease_ns.get(),
   }
 }
 

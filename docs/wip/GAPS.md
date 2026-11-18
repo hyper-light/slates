@@ -3574,10 +3574,13 @@
 > (two seconds there); **since A-414 the volume's write lease (D-16), a landing's target lease and a staging buffer
 > take the failover delay as their term**, and a write lease stays its holder's while any of its write attachments
 > lives (renewed at each lapse; another principal refused `LeaseHeld` meanwhile), where before it ran out at its term
-> under a live writer. Still on the placeholder, each owed a term of its own: the NFSv4 and delegation leases (with the
-> wait a landing gives a recalled delegation, which must stay equal to the lease the server advertises), the anchor's
-> restart cap, the FUSE helpers' bounds, the status capture's deadline (it should count from the capture, not the
-> request), a move's overdue bound and the telemetry freshness horizon. Owed, each in its own
+> under a live writer. **Since A-425 the NFSv4 lease is derived**: an idle Linux client's renewal floor (5 s,
+> `fs/nfs/nfs4renewd.c`) and a liveness window, in whole seconds (6 s), one number for the lease advertised, the
+> delegation recall's and quiet period's waits, the NFSv3 gate's and a landing's recall wait (`nfs::v4_lease_ns`).
+> Owed beside it: the client table's lapse judged per client, from each client's own renewal gaps (A-384's accrual), so
+> a client slower than Linux's floor keeps its state too. Still on the placeholder, each owed a term of its own: the
+> anchor's restart cap, the FUSE helpers' bounds, the status capture's deadline (it should count from the capture, not
+> the request), a move's overdue bound and the telemetry freshness horizon. Owed, each in its own
 > change: each other lease takes its term from a φ-accrual
 > detector of its own holder's renewals (a CLI attachment once the CLI process sends a keepalive); `W`'s floor from the
 > pulses' running wake delay; then `FAILOVER_SLO_NS` and `with_failover_slo` go, since nothing sets `F`. The boot-time
