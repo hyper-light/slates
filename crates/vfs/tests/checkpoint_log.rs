@@ -704,9 +704,11 @@ fn with_version(mut bytes: Vec<u8>, version: u16) -> Vec<u8> {
   bytes
 }
 
-/// A-270 (§4.8 "Recovery"): do give recovery a shard image written in the version before this build's. Expect it
-/// refused `RecoveryVersion`, naming both versions, before any field is decoded: a layout this build does not know is
-/// never read as its own.
+/// A-270 and A-275 (§4.8 "Recovery"): do give recovery a shard image written in the version before this build's, its
+/// bytes otherwise this build's own. Expect it refused `RecoveryVersion`, naming both versions, before any field is
+/// decoded, and the same image at this build's version read: a layout this build does not know is never read as its
+/// own (A-270's held pieces), and neither is one whose fields may hold what an earlier reader drops without a word
+/// (A-275's directory link bit).
 #[test]
 fn an_image_of_another_version_is_refused_by_its_version() {
   let mut store = store();
@@ -720,11 +722,13 @@ fn an_image_of_another_version_is_refused_by_its_version() {
       expected: slates_vfs::recover::IMAGE_VERSION,
     })
   );
+  assert!(ShardImage::from_content(&full(&vol, &store).to_content()).is_ok());
 }
 
-/// A-270 (§4.8 "Recovery"): do commit a checkpoint, then append a CRC-valid delta frame written in the delta version
-/// before this build's. Expect the recovery refused `RecoveryVersion`. Read as a torn frame instead, the replay would end
-/// there and recover the checkpoint without the acknowledged deltas after it.
+/// A-270 and A-275 (§4.8 "Recovery"): do commit a checkpoint, then append a CRC-valid delta frame written in the delta
+/// version before this build's, its bytes otherwise this build's own. Expect the recovery refused `RecoveryVersion`, not
+/// the delta replayed as this build's. Read as a torn frame instead, the replay would end there and recover the
+/// checkpoint without the acknowledged deltas after it.
 #[test]
 fn a_delta_of_another_version_is_refused_not_read_as_torn() {
   use slates_wire::Wire;
