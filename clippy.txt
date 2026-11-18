@@ -1,0 +1,90 @@
+fatal: ambiguous argument 'HEAD^': unknown revision or path not in the working tree.
+Use '--' to separate paths from revisions, like this:
+'git <command> [<revision>...] -- [<file>...]'
+# fmt and clippy at d26681dd8a07f1eb4587bf2815ed6040f667aa86 (parent HEAD^) on windows-11-arm
+## fmt bridge, exit 0
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded cfg-if v1.0.4
+  Downloaded lz4_flex v0.11.6
+  Downloaded itoa v1.0.18
+  Downloaded tinyvec_macros v0.1.1
+  Downloaded windows-targets v0.53.5
+  Downloaded constant_time_eq v0.4.2
+  Downloaded find-msvc-tools v0.1.12
+  Downloaded jobserver v0.1.35
+  Downloaded quote v1.0.47
+  Downloaded shlex v2.0.1
+  Downloaded zmij v1.0.23
+  Downloaded zstd v0.13.3
+  Downloaded zstd-safe v7.3.0
+  Downloaded arrayvec v0.7.8
+  Downloaded memmap2 v0.9.11
+  Downloaded twox-hash v2.1.4
+  Downloaded pkg-config v0.3.34
+  Downloaded unicode-ident v1.0.24
+  Downloaded getrandom v0.4.3
+  Downloaded proc-macro2 v1.0.107
+  Downloaded serde_core v1.0.229
+  Downloaded serde_derive v1.0.229
+  Downloaded tinyvec v1.13.2
+  Downloaded serde v1.0.229
+  Downloaded blake3 v1.8.7
+  Downloaded cc v1.4.5
+  Downloaded memchr v2.8.3
+  Downloaded serde_json v1.0.151
+  Downloaded unicode-normalization v0.1.25
+  Downloaded syn v2.0.119
+  Downloaded syn v3.0.5
+  Downloaded windows_aarch64_msvc v0.53.1
+  Downloaded zstd-sys v2.1.0+zstd.1.5.7
+  Downloaded windows-sys v0.60.2
+   Compiling getrandom v0.4.3
+   Compiling cfg-if v1.0.4
+   Compiling shlex v2.0.1
+   Compiling find-msvc-tools v0.1.12
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.47
+   Compiling windows_aarch64_msvc v0.53.1
+   Compiling serde_core v1.0.229
+   Compiling zmij v1.0.23
+   Compiling jobserver v0.1.35
+   Compiling cc v1.4.5
+    Checking arrayvec v0.7.8
+    Checking constant_time_eq v0.4.2
+   Compiling syn v3.0.5
+   Compiling serde_json v1.0.151
+   Compiling serde v1.0.229
+    Checking windows-targets v0.53.5
+    Checking memchr v2.8.3
+    Checking itoa v1.0.18
+   Compiling blake3 v1.8.7
+    Checking windows-sys v0.60.2
+   Compiling pkg-config v0.3.34
+    Checking memmap2 v0.9.11
+   Compiling serde_derive v1.0.229
+   Compiling zstd-sys v2.1.0+zstd.1.5.7
+   Compiling syn v2.0.119
+   Compiling zstd-safe v7.3.0
+    Checking twox-hash v2.1.4
+    Checking tinyvec_macros v0.1.1
+    Checking tinyvec v1.13.2
+    Checking lz4_flex v0.11.6
+    Checking unicode-normalization v0.1.25
+    Checking slates-image v0.1.0 (C:\a\slates\slates\crates\image)
+   Compiling slates-wire-derive v0.1.0 (C:\a\slates\slates\crates\wire-derive)
+    Checking slates-machine v0.1.0 (C:\a\slates\slates\crates\machine)
+    Checking slates-mem v0.1.0 (C:\a\slates\slates\crates\mem)
+    Checking slates-wire v0.1.0 (C:\a\slates\slates\crates\wire)
+    Checking slates-ipc v0.1.0 (C:\a\slates\slates\crates\ipc)
+    Checking slates-rt v0.1.0 (C:\a\slates\slates\crates\rt)
+    Checking zstd v0.13.3
+    Checking slates-archive v0.1.0 (C:\a\slates\slates\crates\archive)
+    Checking slates-vfs v0.1.0 (C:\a\slates\slates\crates\vfs)
+    Checking slates-anchor v0.1.0 (C:\a\slates\slates\crates\anchor)
+    Checking slates-db v0.1.0 (C:\a\slates\slates\crates\db)
+    Checking slates-bridge-core v0.1.0 (C:\a\slates\slates\crates\bridge-core)
+    Checking slates-bridge-winfsp v0.1.0 (C:\a\slates\slates\crates\bridge-winfsp)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 41.89s
+## clippy bridge, exit 0
