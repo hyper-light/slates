@@ -13660,6 +13660,8 @@ fn a_submit_to_a_green_on_a_non_control_shard_is_answered_once_its_record_commit
     ReplyBody::Submitted {
       version: Some(1),
       conflicts: Vec::new(),
+      conflicts_elided: 0,
+      verdict: 0,
     },
     "the submit is accepted once its record commits; the record placed {placed:?}; the owner's merge counters \
      {counters:?}"
@@ -13785,6 +13787,8 @@ fn a_submit_made_while_the_council_forms_is_answered_once_its_record_commits() {
     Some(ReplyBody::Submitted {
       version: Some(1),
       conflicts: Vec::new(),
+      conflicts_elided: 0,
+      verdict: 0,
     }),
     "accepted as version 1"
   );
@@ -13842,6 +13846,8 @@ fn a_submit_at_f1_is_answered_without_waiting_for_the_coordinators_period() {
       ReplyBody::Submitted {
         version: Some(index + 1),
         conflicts: Vec::new(),
+        conflicts_elided: 0,
+        verdict: 0,
       },
       "submit {index} is accepted as the next version"
     );
@@ -13927,6 +13933,8 @@ fn a_merge_version_reaches_each_holder_with_its_inputs_in_one_exchange() {
       ReplyBody::Submitted {
         version: Some(index + 1),
         conflicts: Vec::new(),
+        conflicts_elided: 0,
+        verdict: 0,
       },
       "submit {index} is accepted as the next version"
     );
@@ -13992,6 +14000,8 @@ fn a_submit_late_in_a_greens_history_is_answered_as_fast_as_an_early_one() {
       ReplyBody::Submitted {
         version: Some(index + 1),
         conflicts: Vec::new(),
+        conflicts_elided: 0,
+        verdict: 0,
       },
       "submit {index} is accepted as the next version"
     );
@@ -14295,6 +14305,8 @@ fn check_resent_after_restart(seen: ResentAfterRestart) {
     Some(Ok(ReplyBody::Submitted {
       version: Some(1),
       conflicts: Vec::new(),
+      conflicts_elided: 0,
+      verdict: 0,
     })),
     "the submit resent under its id after the restart is answered the version it was accepted as: {:?}",
     seen.counters
@@ -15269,6 +15281,8 @@ fn a_submit_resent_after_two_takeovers_in_sequence_is_answered_its_version() {
     Some(ReplyBody::Submitted {
       version: Some(1),
       conflicts: Vec::new(),
+      conflicts_elided: 0,
+      verdict: 0,
     }),
     "the submit committed at version 1"
   );
@@ -15293,6 +15307,8 @@ fn a_submit_resent_after_two_takeovers_in_sequence_is_answered_its_version() {
     ReplyBody::Submitted {
       version: Some(1),
       conflicts: Vec::new(),
+      conflicts_elided: 0,
+      verdict: 0,
     },
     "the resend after two takeovers in sequence is answered the version it was accepted as"
   );
@@ -15376,6 +15392,8 @@ fn a_works_head_is_never_placed_so_a_takeover_cannot_bring_it_back_to_run_a_rese
     ReplyBody::Submitted {
       version: Some(1),
       conflicts: Vec::new(),
+      conflicts_elided: 0,
+      verdict: 0,
     },
     "the submit committed at version 1"
   );
@@ -15529,6 +15547,8 @@ fn a_submit_resent_after_its_owner_was_taken_over_is_answered_its_version() {
     Some(ReplyBody::Submitted {
       version: Some(1),
       conflicts: Vec::new(),
+      conflicts_elided: 0,
+      verdict: 0,
     }),
     "the submit committed at version 1"
   );
@@ -15550,6 +15570,8 @@ fn a_submit_resent_after_its_owner_was_taken_over_is_answered_its_version() {
     ReplyBody::Submitted {
       version: Some(1),
       conflicts: Vec::new(),
+      conflicts_elided: 0,
+      verdict: 0,
     },
     "the resend through the takeover is answered the version it was accepted as"
   );
@@ -15704,6 +15726,8 @@ fn a_works_route_ends_once_the_greens_owner_holds_none_of_its_completions() {
     Some(ReplyBody::Submitted {
       version: Some(1),
       conflicts: Vec::new(),
+      conflicts_elided: 0,
+      verdict: 0,
     }),
     "the submit committed at version 1"
   );
@@ -15733,6 +15757,8 @@ fn a_works_route_ends_once_the_greens_owner_holds_none_of_its_completions() {
     ReplyBody::Submitted {
       version: Some(1),
       conflicts: Vec::new(),
+      conflicts_elided: 0,
+      verdict: 0,
     },
     "the route answered the resend the version it was accepted as"
   );
@@ -19668,6 +19694,8 @@ fn a_submit_whose_answer_was_lost_with_its_owner_is_answered_its_version_by_the_
     Some(Ok(ReplyBody::Submitted {
       version: Some(1),
       conflicts: Vec::new(),
+      conflicts_elided: 0,
+      verdict: 0,
     })),
     "the submit resent after its owner died is answered its version by the green's successor"
   );
@@ -19802,6 +19830,8 @@ fn a_versions_merge_record_waits_for_its_works_catalog_record() {
     Some(Ok(ReplyBody::Submitted {
       version: Some(1),
       conflicts: Vec::new(),
+      conflicts_elided: 0,
+      verdict: 0,
     })),
     "the submit was answered its version once its record committed"
   );
@@ -19995,6 +20025,8 @@ fn a_request_id_copied_into_another_session_reaches_no_completion_through_a_take
     Some(Ok(ReplyBody::Submitted {
       version: Some(1),
       conflicts: Vec::new(),
+      conflicts_elided: 0,
+      verdict: 0,
     })),
     "the victim's own resend is answered its version"
   );
@@ -20137,6 +20169,8 @@ fn a_survivor_holding_no_copy_of_the_works_catalog_learns_its_green_from_a_locat
     Some(Ok(ReplyBody::Submitted {
       version: Some(1),
       conflicts: Vec::new(),
+      conflicts_elided: 0,
+      verdict: 0,
     })),
     "d's resend is answered its version through the green the location round named"
   );
