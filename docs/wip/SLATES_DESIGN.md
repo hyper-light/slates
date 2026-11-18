@@ -30090,6 +30090,13 @@ Applied in the same change to: GAPS (the load test's entry), `crates/client/exam
 `Worker::sweep`, `park_until`, `arm_in_flight`, `count_park`, `park_margin_ns`, `next_due`, `park` paired for Unix and
 Windows, `park_timeout_ns`, `Parked`, `Connection::completion`, the `harness` row's park columns, the module's "Workers
 wait"), and the example's tests below.
+
+Status: **rejected 2026-11-18** by its A/B, and taken back out the same day (g083): the supervisor's run r155 on the Mac
+Studio over `fs/` at 1,000 clients (BENCHMARKS, "A load-test worker that parks between replies") found the longest
+sweep shorter in 1 pair of 6, the held clients the same (none in any of the twelve runs), and the p99 worse once the box
+was loaded (an edit's 26.9 ms against 8.6 ms at load 25 to 28). A dead-even or worse A/B does not land. The workers
+spin again; the change's lint fixes stay (the stamp tests' preemption is a yielding wait, D-9; the span drain keeps no
+name it never reads), and its two parking tests went with the parking. The text below is the record of what was built.
 - **What was measured.** Every worker spun for its whole level, so the harness took a core a worker from the daemon it
   measured: eight on the Mac Studio's 32. On that box under load its sweeps took 25 to 127 ms and held 6.9 clients on
   average, due to send and not yet sent, against 2.2 in flight, at 1,000 clients (g083's trace, 2026-11-18).
