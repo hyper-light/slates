@@ -79,6 +79,27 @@
 > - a real FIDO key's signature end to end (the touch flag is proven with a software stand-in);
 > - the integrator's runs on Linux and Windows (the suite is platform-free but for the agent's own channel, Unix).
 
+> **A takeover round gave up two objects within tolerance: a superseded owner's shipper held its sessions every period
+> (2026-11-18, A-349, NoLoss; g250; the chaos nemesis, seed 6876545201569229162, CI diag 44311638654 on both Linux arches).**
+> Read with a status dump and three diagnostic lines (diag-g250-nemesis-2, CI run 44320668620, 5 of 6 rounds): the owner
+> X1, isolated, taken over and admitted again under host epoch 2, still shipped its fenced epoch-1 log every record
+> period (`fleet.live.install_built` 2,227 to 2,245, each refused `StaleEpoch`); the next fault retired its successor X2,
+> whose objects fell to X1; and X1's round never sent the other survivor its page, its record session out on that loan
+> at every period (`lent_to live_ship`, `fleet.takeover.pages_unsent` 213 to 928), until A-304's bound gave both objects
+> up. No survivor withheld a promise; the round never asked. Fixed: a fenced volume sends nothing and does no period work
+> (`live_ship::pending_sends`, `period_volume`). Test: `a_superseded_owner_ships_nothing_more_of_the_volume_it_lost`
+> (`crates/server/tests/fleet.rs`). Bug record: `docs/bugs/2026-11-18-a-superseded-owners-shipper-starved-its-own-takeover-round.md`.
+> - **Owed (g250, next): re-adoption.** X1's round now adopts X2's objects, and its materialization meets X1's own
+>   superseded copy: `verbs::materialize_taken_over` keeps a volume the node already holds, so the adopted state (X2's
+>   acknowledged writes) never replaces the stale copy, its fenced shipper or its kept fence. A takeover that names a node
+>   holding a superseded (fenced, or with A-334 yielded) copy must replace it. Until then the seed fails there.
+> - **Owed: a lane that ends on a refusal is sent again at once** (`live_ship::lane_ended` follows any answer;
+>   `fold_into` follows only progress, for this reason since 2026-11-05). X2, retired before it knew, sent its log to the
+>   two members, which refused it `not_a_member` 85,877 and 86,502 times in one run, its sessions out on that loop.
+> - **Owed: a round's question takes a session only if it is in its link at that instant** (`takeover::ask_pages`, and the
+>   takeover's fetch), so any borrower that takes it every period starves the round the same way.
+> - **Owed (the supervisor's):** the seed on main once re-adoption lands.
+
 > **A superseded owner's mounts served its copy: NFS answers `NFS3ERR_STALE`, a FUSE mount ends (2026-11-18, A-346,
 > §4.8 "Leases and reads", AUD-29-84; g230).** A-338 sent the old owner's verbs to its successor, but its mounts were
 > gated by its lease alone: once it confirmed again, an NFS mount on the old owner answered reads from the copy the
@@ -241,10 +262,23 @@
 > - **Owed:** a seal's archive walk and its wrap each advance one slice a record period (100 ms), so a large volume takes
 >   many periods to place: at a walk slice of half a 20 µs quantum at 5 GB/s, about 50 KB a period, a GiB takes hours.
 >   The turns are bounded; their pace is not derived from the loss window a seal serves.
-> - **Owed (siblings, one-turn walks of a whole volume):** a takeover's open of a sealed envelope
->   (`fleet::opened_archive`'s `envelope::open`) and a live log's whole record (`live_ship::payload` seals the volume's
->   whole image in one turn) are each one turn of the whole volume, the first on the successor, the second at every
->   whole entry and install image.
+> - **Closed (2026-11-18, A-347):** a takeover opens a sealed envelope in turns of the successor's owner shard
+>   (`fleet::open_in_turns`, `slates_cluster::envelope::Opening`); test `a_takeovers_envelope_is_opened_in_turns_and_served`.
+> - **Closed (2026-11-18, A-347): the sliced walks were one poll on the control shard.** A walk's slices are calls from a
+>   control-shard task, and a call to the caller's own shard runs inline, so the live period, a returned holder's walk
+>   (A-324), the seal walk and the open ran every slice in one poll over the control shard's own volumes and on every
+>   shard of a one-shard daemon; their tests counted slices, not polls. They now go through `xshard::Turns` (a call to
+>   the driving shard yields first; two slices of one walk in one poll counted `xshard.turns_shared`, which the four
+>   tests hold at zero). The measurer's A-324 longest steps (at most 12.0 ms over 1,000 live volumes, 42.0 ms over 4,000,
+>   one shard, 2026-11-18) grew with the volumes as one poll would; to be measured again.
+> - **Owed (siblings, one-turn walks of a whole volume):** a live log's whole record (`live_ship::payload` seals the
+>   volume's whole image in one turn, at every whole entry and install image); and, after A-347's open, the takeover's
+>   restore (`slates_archive::restore` in `verbs::materialize_taken_over`) lays the whole archive out in the one turn
+>   that makes the volume, and the sealed manifest is opened in one turn (its cost grows with the entries).
+> - **Owed (found by the measurer, 2026-11-18, Mac Studio, main 1eca77263):** at a GiB seal the owner's longest step,
+>   230 to 272 ms in 4 runs, is one step after the wrap ends (the envelope's completion or the first content round's put,
+>   not yet told apart), about a quarter of a millisecond a MiB: a seal of about 4 GiB would reach the watchdog's
+>   one-second window (extrapolated).
 > - **Owed (sibling, a seal left with nothing to do):** a content round's archive is carried back to the owner shard by
 >   `xshard::run_on_counted` (`fleet::put_seal_content`); a full control channel drops it, counted `xshard.run_refused`,
 >   and leaves the job with no archive as A-322's did, until a newer snapshot supersedes it.
@@ -1348,6 +1382,19 @@
 >   unrecovered; re-ranking it could adopt a stale copy beside a live adopter the configuration no longer knows. A
 >   neighbourhood an unsettled owner wrote to before the last one it moved to is not recorded: past tolerance a copy
 >   there is neither learned nor let go.
+> - **Fixed (A-340, g250, 2026-11-18): the bound's drop is typed and counted.** Why it must drop is stated (the
+>   configuration is bounded by its members; keeping every outstanding retirement grows it with every restart while one
+>   share stays open, refusing admissions stalls the region while one round is stuck, refusing a takeover leaves a dead
+>   host unfenced). The rounds it ends give every object they learned and did not adopt up by name: `NotRecovered
+>   { cause: TakeoverIncomplete { waited_on: "retirement" } }`, counted `fleet.takeover.given_up.retirement_dropped`;
+>   before, the rounds were forgotten silently and such a volume answered a retryable `OwnerUnreachable` for good. Every
+>   holder counts the copies it keeps on an unresolved line (`fleet.takeover.kept_unresolved`) or a lost one
+>   (`fleet.takeover.kept_lost`). Tests: `a_round_the_retirement_bound_ended_names_what_it_had_learned`,
+>   `a_round_the_retirement_bound_ended_gives_its_learned_volumes_up_by_name` (`crates/server/src/takeover.rs`).
+> - **Open (A-340): a volume no round had learned when its retirement went** is served by no member and answers
+>   `OwnerUnreachable` once the lookup's bound passes; only its holders' `kept_unresolved` shows it. Owed: a holder
+>   answers the owner-location exchange (`crate::owner_location`) for a copy on an unresolved line, so the lookup answers
+>   `NotRecovered` by name.
 
 > **Open (live-durability, 2026-11-09; A-272 ii adjacent): an object whose line never passed through an unconfirmed
 > predecessor reads lost on a second failure inside that predecessor's takeover window.** A host that retires before
@@ -1710,6 +1757,19 @@
 >   run of `a_start_whose_shards_sum_past_a_window_comes_up` under load, and the starting thread's CPU by phase at 407
 >   shards. Which unit made the 407-shard start's long thread is the code's arithmetic, not yet measured: the main
 >   thread making every ordered pair of shards' rings (`slates_rt::runtime::connect_pairs`, 165,242 at 407 shards).
+> - **A shard count past the runtime's registry was started and restarted for good (found 2026-11-18 by the
+>   integrator, fixed 2026-11-18, g251).** The test sized its start at three windows' worth of shards with no bound, and
+>   a 4-CPU runner's cheap shard starts asked 1,417 (ubuntu, run 44298844583) and 1,574 (macOS, run 44310013691): past
+>   the 1,024 one process registers (`slates_rt::registry::MAX_SHARDS`). The runtime refused the registration in the
+>   daemon ("too many shards: at most 1024 per process"), after the anchor had started it, so every start failed and the
+>   anchor, which gives no daemon up (A-119, A-311), backed it off for good. Now a `--shards` count past the registry is
+>   refused where it is given, before anything starts: as a bad `--shards` by the roles (`slates_api::role::shard_count`,
+>   which an anchor's own daemon and an embedding host's start read their arguments through) and by the `slates`
+>   command (`a_shard_count_past_the_runtimes_registry_is_refused_before_any_start`, `..._as_usage`, red before: both
+>   parsed 1,025). The test runs the most shards one process runs where three windows ask more, says how many windows
+>   they sum, and skips loudly where they do not pass one. The ring mesh stays quadratic, as A-312 chose (a beat per
+>   ring rather than fewer rings): at the registry's bound 1,047,552 rings, made and charged to no budget the daemon
+>   derives; a count that large is a test's override, never a derived one.
 
 > **The anchor killed every start a busy machine starved (found 2026-11-06, closed 2026-11-07; recovery in one poll and
 > the client's deadlines stay open, below).** A start not beaten within the fixed recovery budget (a wall second) was
@@ -2481,11 +2541,16 @@
 >   before the scheduler looked, and was judged wedged: the same test ended `Deadline { stage: Admission }` 3.019 s after
 >   it asked, its answer already sent (1 of 32 runs of the failing tree on windows-latest, diag-g243-2, where a look at the
 >   scheduler is a 3 ms snapshot). It now reads the clock again after the scheduler answers (`OwnTime::next_window_ns`);
->   record `docs/bugs/2026-11-18-an-observation-read-the-clock-before-the-scheduler.md`. **Open, reported:** the
->   watchdog's look (`look_at`, then `read_runs`) and the anchor's start judgment (`judge_start_of`) read in the same
->   order; their whole-window rule leaves the gap one look wide, at the end of a window the shard sat still through; and
->   no `ci.yml` lane runs the liveness suite on Windows (`docs/wip/ci-matrix.md`), which is why only a diagnostics run saw
->   this. The anchor's start judgment
+>   record `docs/bugs/2026-11-18-an-observation-read-the-clock-before-the-scheduler.md`. **Its two siblings, reported then,
+>   closed 2026-11-18 (g251):** the watchdog's look (`look_at`, then `read_runs`) and the anchor's start judgment
+>   (`judge_start_of`) read in the same order, so a shard or a start blocked in a call for most of a window, whose call
+>   returned between the first read and the scheduler's answer, was judged stuck as it parked. Each now reads again after
+>   the answer (`watchdog::after_the_answer`; `anchor::judge_start_by`, when the answer is a block): a step, a park or a
+>   clock risen at the second read is movement. Red with the second read ignored, each at its own assertion
+>   (`a_shard_that_moves_between_the_look_and_the_schedulers_answer_has_moved`: `Wedged` where `Alive` was due;
+>   `a_start_that_runs_between_its_clock_and_the_schedulers_answer_has_moved`: likewise). Still open: no `ci.yml` lane
+>   runs the liveness suite on Windows (`docs/wip/ci-matrix.md`), which is why only a diagnostics run saw the first.
+>   The anchor's start judgment
 >   (`crates/api/src/role/anchor.rs`, `process_clock`) judged a whole process by CPU time with no scheduler reading, so a
 >   start starved for a whole window was killed ("the starting daemon made no progress for 1014 ms; killing it", in
 >   `held_rendezvous` on CI's Windows runner): **fixed 2026-11-08 (bug-sweep).** It now asks whether any of the start's
