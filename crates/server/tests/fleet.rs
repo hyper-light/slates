@@ -15247,6 +15247,32 @@ fn continuity_write(instance: &str, volume: VolumeId, file: usize) -> ReplyBody 
   written
 }
 
+/// Shape: the writes a restarted successor's test sends at most until one is answered at durability. A write is sent
+/// again when it is refused `StaleEpoch`, the successor taken over again while its restart outlasted the failure
+/// detector (a correct takeover at the next epoch; its first write meets its fence and the next goes to its successor,
+/// A-338), or `DurabilityPending`, held past the failover SLO (A-354): one of each, then the answer.
+const CONTINUITY_WRITES: usize = 3;
+
+/// [`continuity_write`] sent again while it is refused `StaleEpoch` or `DurabilityPending`, at most
+/// [`CONTINUITY_WRITES`] times: every reply in order, the last the answer.
+fn continuity_write_answered(instance: &str, volume: VolumeId, file: usize) -> Vec<ReplyBody> {
+  let mut replies = Vec::new();
+  while replies.len() < CONTINUITY_WRITES {
+    let reply = continuity_write(instance, volume, file);
+    let again = matches!(
+      reply,
+      ReplyBody::Refused {
+        refusal: Refusal::StaleEpoch { .. } | Refusal::DurabilityPending { .. }
+      }
+    );
+    replies.push(reply);
+    if !again {
+      break;
+    }
+  }
+  replies
+}
+
 /// Whether each of the continuity files `0..files` reads back through `instance` as written.
 fn continuity_read(instance: &str, volume: VolumeId, files: usize) -> Vec<bool> {
   let mut reader = Client::connect(instance);
@@ -15391,22 +15417,29 @@ fn restarted_successor(prefix: &str) -> RestartedSuccessor {
 }
 
 /// A-344 (§4.10; §4.8 "Recovery"): a successor restarted warm after its live takeover takes a write to the volume. Do: the
-/// [`RestartedSuccessor`] scene; write a seventh file through the successor; read all seven back through it. Expect the
-/// write answered and every file read. Before, the restart forgot the promotion epoch (`placed_heads`): its shipper and
-/// its records ran at its host's epoch, 1, under the fence 2 its takeover had raised at the holders, and the write was
-/// not answered within the client's deadline.
+/// [`RestartedSuccessor`] scene; write a seventh file through the successor, sent again while refused `StaleEpoch` or
+/// `DurabilityPending` ([`continuity_write_answered`]: under load the restart can outlast the failure detector and the
+/// third node takes the volume over again, a correct takeover); read all seven back through it. Expect the write answered
+/// and every file read. Before, the restart forgot the promotion epoch (`placed_heads`): its shipper and its records ran
+/// at its host's epoch, 1, under the fence 2 its takeover had raised at the holders, and the write was not answered
+/// within the client's deadline. Under load (g247, 2026-11-18) the test failed a correct second takeover's `StaleEpoch
+/// { current: 3 }` and a write held past the client's 30 s deadline (before A-354 bounded a held reply).
 #[test]
 fn a_successor_restarted_warm_takes_a_write_to_the_volume_it_took_over() {
   let _serial = serialize_fleet_tests();
   let scene = restarted_successor("successor-write");
   let instance = scene.daemons[scene.index].instance().to_owned();
-  let after = continuity_write(&instance, scene.volume, CONTINUITY_FILES);
+  let replies = continuity_write_answered(&instance, scene.volume, CONTINUITY_FILES);
+  let after = replies
+    .last()
+    .cloned()
+    .expect("at least one write was sent");
   let read = continuity_read(&instance, scene.volume, CONTINUITY_FILES + 1);
   for daemon in scene.daemons {
     daemon.stop();
   }
   eprintln!(
-    "a write after the successor's warm restart: taken {}, served {}, written {after:?}, read {read:?}",
+    "a write after the successor's warm restart: taken {}, served {}, written {replies:?}, read {read:?}",
     scene.taken, scene.served
   );
   assert!(
