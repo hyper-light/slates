@@ -2337,6 +2337,9 @@ pub mod platform {
     #[test]
     fn an_unsealed_forged_unknown_or_dropped_delivery_is_refused_and_its_descriptor_closed()
     -> Result<(), IpcError> {
+      // The zero read waits on the handed end's last close, which a child another test spawns would hold until its
+      // exec ([`crate::descriptor_test_gate`]).
+      let _gate = crate::descriptor_test_gate();
       for case in [
         Hostile::Unsealed,
         Hostile::Forged,

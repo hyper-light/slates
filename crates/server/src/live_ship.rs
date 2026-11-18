@@ -29,6 +29,7 @@
 //!
 //! Not yet: a holder's replicas do not survive its own daemon's restart.
 
+use slates_bridge_core::durable_bound::{DurableBound, GaveUp, Heard, Spans};
 use std::collections::{BTreeMap, VecDeque};
 
 use slates_db::live::{
@@ -59,6 +60,10 @@ const BODY_CLEAR: u8 = 0;
 const LIVE_REFUSED: &str = "fleet.live.refused";
 /// Counter: whole records appended to a live log, each a copy of the volume's content.
 const LIVE_WHOLE: &str = "fleet.live.whole";
+/// Counter: the bytes of the whole records appended.
+const LIVE_WHOLE_BYTES: &str = "fleet.live.whole_bytes";
+/// Counter: the bytes of the changes (delta records) appended.
+const LIVE_CHANGE_BYTES: &str = "fleet.live.change_bytes";
 /// Counter: install images made from a publication's state (or a clean volume's, on the record period) for a holder
 /// behind the retained tail, beside the log rather than on it ([`refresh_image`]).
 const LIVE_IMAGE: &str = "fleet.live.install_image";
@@ -217,6 +222,97 @@ pub(crate) struct LiveVolume {
   /// whole entry. Pairs only accumulate, but one retired between the entry and the image (a node back at its anchor)
   /// could leave the image short of a key the entry's check passed.
   image_anchors: Option<Vec<u64>>,
+  /// Acknowledgements that moved this volume's durability forward: a holder's acknowledged position advancing
+  /// ([`fold_into`]), or its head's or catalog's placement gaining an acknowledgement or a newer sequence
+  /// (`fleet::record_acks_in`). A reply held for durability gives up only after a whole wait of
+  /// [`DURABLE_WAIT_NS`] in which this did not move ([`DurableBound`]).
+  heard: u64,
+}
+
+/// One candidate's copy of a live log as its shard's recovery image keeps it (A-200; §4.8 "Recovery": a warm restart
+/// keeps every replica the node acknowledged): its owner, its fence, the head it holds and the sealed entries since the
+/// last whole one.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HeldLive {
+  object: [u8; 16],
+  owner: u64,
+  fence: u64,
+  head: Option<HeldHead>,
+  /// The slot of the first entry (A-270).
+  first: u64,
+  /// The entries, from `first`, in slot order. A head piece carries none; recovery joins them from their own pieces.
+  entries: Vec<Vec<u8>>,
+}
+
+impl HeldLive {
+  /// The object this copy is of.
+  pub(crate) fn object(&self) -> [u8; 16] {
+    self.object
+  }
+
+  /// The slot of its first entry.
+  pub(crate) fn first(&self) -> u64 {
+    self.first
+  }
+
+  /// This copy with `entries`, from its first slot, joined to it.
+  pub(crate) fn with_entries(self, entries: Vec<Vec<u8>>) -> HeldLive {
+    HeldLive { entries, ..self }
+  }
+}
+
+/// A held copy's head, as [`HeldLive`] keeps it.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HeldHead {
+  epoch: u64,
+  position: u64,
+  identity: [u8; 32],
+}
+
+/// Holds again, after a warm restart, the copies a recovered image kept ([`held_copies`]), each with its fence.
+pub(crate) fn restore_copies(state: &mut ShardState, copies: Vec<HeldLive>) {
+  for copy in copies {
+    let object = ObjectId(copy.object);
+    let head = copy.head.map(|head| Head {
+      epoch: HostEpoch(head.epoch),
+      position: head.position,
+      identity: head.identity,
+    });
+    let bytes = copy
+      .entries
+      .iter()
+      .map(Vec::len)
+      .fold(0usize, usize::saturating_add);
+    let held = Held {
+      replica: Replica::recovered(HostId(copy.owner), object, HostEpoch(copy.fence), head),
+      entries: copy.entries.into(),
+      bytes,
+      first: copy.first,
+    };
+    // A copy made after the restart starts above every slot the recovered image carried.
+    let (_, end) = held.slots();
+    state.live.slot_floor = state.live.slot_floor.max(end);
+    state.live.held.insert(object, held);
+    state.count(LIVE_RESTORED, 1);
+  }
+}
+
+/// Counter: live copies a warm restart held again from the recovery image.
+const LIVE_RESTORED: &str = "fleet.live.restored";
+
+/// Counter: a holder's answer withheld because the publication that would keep what it acknowledged did not commit;
+/// the owner re-ships it.
+const LIVE_UNPUBLISHED: &str = "fleet.live.unpublished";
+
+/// Commits this shard's recovery image before a holder acknowledges what it now keeps (§4.8 "Recovery", as content and
+/// register holders do): `reply`, or nothing when the publication did not commit, which the owner reads as no answer
+/// and re-ships. A warm restart must hold again everything acknowledged, and its fence.
+fn acknowledged(state: &mut ShardState, reply: Vec<u8>) -> Vec<u8> {
+  if crate::verbs::publish_shard(state).is_err() {
+    state.count(LIVE_UNPUBLISHED, 1);
+    return Vec::new();
+  }
+  reply
 }
 
 /// What a candidate keeps of one live volume.
@@ -227,6 +323,72 @@ pub(crate) struct Held {
   entries: VecDeque<Vec<u8>>,
   /// Their bytes.
   bytes: usize,
+  /// The slot of the first entry (A-270): entry `i` is slot `first + i`, its held piece's position. Entries are only
+  /// pushed after the last or all cleared ([`Held::clear_entries`], which moves it past them), so a slot never names
+  /// two entries, and a delta carries a copy's new slots and the ones it dropped.
+  first: u64,
+}
+
+impl Held {
+  /// Drops every entry: the next one pushed takes the slot after the last dropped.
+  fn clear_entries(&mut self) {
+    let dropped = u64::try_from(self.entries.len()).unwrap_or(u64::MAX);
+    self.first = self.first.saturating_add(dropped);
+    self.entries.clear();
+    self.bytes = 0;
+  }
+
+  /// The slots its entries hold: `first..end`.
+  pub(crate) fn slots(&self) -> (u64, u64) {
+    let held = u64::try_from(self.entries.len()).unwrap_or(u64::MAX);
+    (self.first, self.first.saturating_add(held))
+  }
+
+  /// The entry at `slot`, when it holds one.
+  pub(crate) fn entry_at(&self, slot: u64) -> Option<&[u8]> {
+    let index = usize::try_from(slot.checked_sub(self.first)?).ok()?;
+    self.entries.get(index).map(Vec::as_slice)
+  }
+
+  /// This copy's head piece's fields (A-270): its owner, fence, head and first slot, with no entries.
+  pub(crate) fn head_of(&self, object: ObjectId) -> HeldLive {
+    HeldLive {
+      object: object.0,
+      owner: self.replica.owner().0,
+      fence: self.replica.fence().0,
+      head: self.replica.head().map(|head| HeldHead {
+        epoch: head.epoch.0,
+        position: head.position,
+        identity: head.identity,
+      }),
+      first: self.first,
+      entries: Vec::new(),
+    }
+  }
+}
+
+#[cfg(test)]
+impl Held {
+  /// Test support (A-270's oracle): a copy of `object` for `owner` holding nothing, its first slot `first`.
+  pub(crate) fn for_test(owner: HostId, object: ObjectId, first: u64) -> Held {
+    Held {
+      replica: Replica::new(owner, object),
+      entries: VecDeque::new(),
+      bytes: 0,
+      first,
+    }
+  }
+
+  /// Test support: keeps `payload` after the last entry, as an accepted entry is kept.
+  pub(crate) fn push_for_test(&mut self, payload: Vec<u8>) {
+    self.bytes = self.bytes.saturating_add(payload.len());
+    self.entries.push_back(payload);
+  }
+
+  /// Test support: drops every entry, as a whole entry or an install does.
+  pub(crate) fn clear_for_test(&mut self) {
+    self.clear_entries();
+  }
 }
 
 /// The node's live-shipping state, on every shard: the volumes this shard owns and ships, and (on the control shard)
@@ -235,8 +397,12 @@ pub(crate) struct Held {
 pub(crate) struct LiveState {
   /// The live volumes this shard owns, by volume bytes.
   pub(crate) shipping: BTreeMap<[u8; 16], LiveVolume>,
-  /// What this node holds as a candidate, by object.
-  pub(crate) held: BTreeMap<ObjectId, Held>,
+  /// What this node holds as a candidate, by object. Tracked (`crate::tracked`), so a publication carries only the
+  /// copies reached since the last (A-270).
+  pub(crate) held: crate::tracked::Tracked<ObjectId, Held>,
+  /// The first slot a copy made now takes (A-270): at or above every slot a committed publication carried for any copy,
+  /// so a copy dropped and made again never reuses a published entry's key.
+  pub(crate) slot_floor: u64,
   /// The live volumes the publication in progress recorded, with their record (`None`: the publication was a
   /// checkpoint, so the whole image ships): shipped once it commits ([`ship_captured`]), dropped if it is refused.
   pub(crate) captured: Vec<(slates_db::catalog::VolumeId, Option<Vec<u8>>)>,
@@ -279,29 +445,144 @@ pub(crate) fn take_barrier(state: &mut ShardState) -> Option<(slates_db::catalog
   state.live.barrier.take()
 }
 
-/// Derived: how long a transport's reply waits for durability before it is answered "try again" (NFS `JUKEBOX`): the
-/// daemon's liveness budget, past which a holder that has not answered is not a live one to wait for.
+/// Derived: how long a transport's reply waits for durability with nothing heard before it is answered that it is not
+/// durable (NFS `JUKEBOX`, FUSE and virtio-fs `EIO`): the daemon's liveness budget, past which a holder that has not
+/// answered is not a live one to wait for. A window, not a deadline: each one in which the volume's durability moved
+/// forward starts another ([`DurableBound`]).
 const DURABLE_WAIT_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS;
 
-/// Waits on this (the volume's owner) shard, without blocking it, until `volume`'s log is durable at `target`, or
-/// [`DURABLE_WAIT_NS`] has passed: whether it became durable. The caller answers a stable write or `COMMIT` only then,
-/// and otherwise tells the client to try again: a barrier never claims what `f` candidates do not hold.
+/// Format: nanoseconds in a millisecond, for the milliseconds a give-up's record reads in.
+pub(crate) const NS_PER_MS: u64 = 1_000_000;
+
+/// `object`'s volume heard an acknowledgement that moved its durability forward: its head's or its catalog's placement
+/// gained an acknowledgement or a newer sequence (`fleet::record_acks_in`). Counted on the volume's shipper
+/// ([`LiveVolume::heard`]); nothing for a volume this shard does not ship.
+pub(crate) fn heard(state: &mut ShardState, object: ObjectId) {
+  let volume = object.placement_key().0;
+  if let Some(live) = state.live.shipping.get_mut(&volume) {
+    live.heard = live.heard.saturating_add(1);
+  }
+}
+
+/// Derived: how far apart the looks are that confirm a held reply's silent window
+/// (`slates_bridge_core::durable_bound::Spans::look_ns`): the heartbeat, the cadence the control shard beats the
+/// anchor's word at (§4.14), so a control shard that runs waits in its driver at least once between two looks.
+const DURABLE_LOOK_NS: u64 = crate::daemon::HEARTBEAT_NS;
+
+/// The spans a held reply's wait is judged in on this shard: windows of [`DURABLE_WAIT_NS`], looks [`DURABLE_LOOK_NS`]
+/// apart while a silence is confirmed, and at most the shard's failover SLO from the hold (10 s by default; the
+/// supervisor's landing condition of 2026-11-11, banned item 8).
+fn durable_spans(state: &ShardState) -> Spans {
+  Spans {
+    window_ns: DURABLE_WAIT_NS,
+    total_ns: state.config.failover_slo_ns,
+    look_ns: DURABLE_LOOK_NS,
+  }
+}
+
+/// The first window of a wait for `volume`'s durability beginning at `now_ns`, under the one rule every transport judges
+/// a held durable reply by (`slates_bridge_core::durable_bound`). Under load on adacachy2 a healthy `fsync`'s bytes were
+/// already held by a candidate while the volume's head placement was in flight, and the old single deadline answered
+/// `EIO` (3 of 10 runs, every run that reached it).
+pub(crate) fn begin_durable_bound(
+  state: &ShardState,
+  volume: slates_db::catalog::VolumeId,
+  now_ns: u64,
+) -> DurableBound {
+  DurableBound::begin(heard_now(state, volume), now_ns, durable_spans(state))
+}
+
+/// Whether, and why, `bound`'s wait for `volume` has given up at `now_ns`, judged against what the volume has heard on
+/// its durability path and how often its receiver has idled ([`heard_now`]).
+pub(crate) fn judge_durable_bound(
+  state: &ShardState,
+  volume: slates_db::catalog::VolumeId,
+  bound: &mut DurableBound,
+  now_ns: u64,
+) -> Option<GaveUp> {
+  bound.judge(heard_now(state, volume), now_ns)
+}
+
+/// What a reply held for `volume`'s durability is judged against now: the acknowledgements the volume has heard
+/// ([`heard_of`]), and the waits the daemon's control shard has entered in its driver, each with nothing ready to run.
+/// The control shard holds the sessions every holder's acknowledgement arrives on (`send_from_control`), and hands each
+/// one to the volume's shard as a task there; so once it has waited twice after a moment, every acknowledgement that
+/// reached it before then has been read and handed on (the rule's own reasoning, `slates_bridge_core::durable_bound`).
+/// Read off its registry pulse, with no shard round trip.
+pub(crate) fn heard_now(state: &ShardState, volume: slates_db::catalog::VolumeId) -> Heard {
+  let control = state.shards.first().copied().unwrap_or(state.shard);
+  Heard {
+    acknowledged: heard_of(state, volume),
+    receiver_idles: slates_rt::registry::with_entry(control, |entry| entry.pulse.waits())
+      .unwrap_or(0),
+  }
+}
+
+/// [`LiveVolume::heard`] of `volume`, or zero when this shard does not ship it.
+fn heard_of(state: &ShardState, volume: slates_db::catalog::VolumeId) -> u64 {
+  state
+    .live
+    .shipping
+    .get(&volume.bytes)
+    .map_or(0, |live| live.heard)
+}
+
+/// Waits on this (the volume's owner) shard, without blocking it, until `volume`'s log is durable at `target`, or a
+/// window of [`DURABLE_WAIT_NS`] has passed with nothing heard ([`DurableBound`]): whether it became durable. The
+/// caller answers a stable write or `COMMIT` only then, and otherwise tells the client to try again: a barrier never
+/// claims what `f` candidates do not hold.
 pub(crate) async fn wait_durable(volume: slates_db::catalog::VolumeId, target: u64) -> bool {
-  let parked = std::future::poll_fn(|cx| {
-    let settled = state::with_state(|s| durability(s, volume, target, Some(cx.waker())))
-      .unwrap_or(Durability::Never);
-    if settled == Durability::Pending {
-      std::task::Poll::Pending
-    } else {
-      std::task::Poll::Ready(())
+  let Some(mut bound) =
+    state::with_state(|s| begin_durable_bound(s, volume, slates_rt::futures::now_ns()))
+  else {
+    return false;
+  };
+  let mut gave_up = None;
+  // A window at a time ([`DurableBound`]): one that ends with the volume's durability moved forward is followed by
+  // another, one that ends with nothing heard gives up.
+  loop {
+    let parked = std::future::poll_fn(|cx| {
+      let settled = state::with_state(|s| durability(s, volume, target, Some(cx.waker())))
+        .unwrap_or(Durability::Never);
+      if settled == Durability::Pending {
+        std::task::Poll::Pending
+      } else {
+        std::task::Poll::Ready(())
+      }
+    });
+    let left = bound
+      .next_look_ns()
+      .saturating_sub(slates_rt::futures::now_ns());
+    match slates_rt::futures::within(left, parked).await {
+      Ok(Some(())) | Err(_) => break,
+      Ok(None) => {
+        let given_up = state::with_state(|s| {
+          judge_durable_bound(s, volume, &mut bound, slates_rt::futures::now_ns())
+        })
+        .unwrap_or(Some(GaveUp::Silent));
+        if let Some(why) = given_up {
+          gave_up = Some(why);
+          break;
+        }
+      }
     }
-  });
-  let durable =
-    matches!(
-      slates_rt::futures::within(DURABLE_WAIT_NS, parked).await,
-      Ok(Some(()))
-    ) && state::with_state(|s| durability(s, volume, target, None) == Durability::Durable)
-      .unwrap_or(false);
+  }
+  let durable = state::with_state(|s| {
+    let durable = durability(s, volume, target, None) == Durability::Durable;
+    if !durable {
+      // What durability still lacked when the wait ended (2026-11-09): the client is told its write is not durable.
+      slates_machine::log_line!(
+        "slates-server: a held durable reply gave up after {} windows of {} ms, {} (shard {}): {}",
+        bound.windows(),
+        DURABLE_WAIT_NS / NS_PER_MS,
+        gave_up.map_or("its wait ended", GaveUp::named),
+        s.shard,
+        durability_report(s, volume, target)
+      );
+    }
+    durable
+  })
+  .unwrap_or(false);
   let _ = state::with_state(|s| {
     s.count(
       if durable {
@@ -353,9 +634,57 @@ pub(crate) fn durability(
   Durability::Pending
 }
 
-/// Derived: how long a held reply waits for durability before its transport answers that it is not (NFS `JUKEBOX`,
-/// FUSE and virtio-fs `EIO`, WinFsp `STATUS_UNEXPECTED_IO_ERROR`): [`DURABLE_WAIT_NS`]. Asked by those transports, so
-/// compiled where they are.
+/// What a reply waiting for `volume`'s log to be durable at `target` is still waiting on, as one line for a log: the
+/// owner's head and durable position, the last whole entry, each holder's acknowledged head, the lanes in flight and how
+/// long each has run, the holders found unreachable, and each condition [`answerable`] asks. Asked when a held reply
+/// gives up, so a refusal says which part of durability it lacked.
+pub(crate) fn durability_report(
+  state: &ShardState,
+  volume: slates_db::catalog::VolumeId,
+  target: u64,
+) -> String {
+  let now = slates_rt::futures::now_ns();
+  let placed = head_placed(state, volume.bytes);
+  let recorded = active_set_recorded(state, volume.bytes);
+  let covered = covers_candidates(state, volume.bytes);
+  let Some(live) = state.live.shipping.get(&volume.bytes) else {
+    return format!("target {target}: no shipper; head placed {placed}");
+  };
+  let holders: Vec<String> = live
+    .shipper
+    .holders()
+    .iter()
+    .map(|holder| {
+      format!(
+        "{}@{:?}",
+        holder.0,
+        live.shipper.held_by(*holder).map(|head| head.position)
+      )
+    })
+    .collect();
+  let lanes: Vec<String> = live
+    .lanes
+    .iter()
+    .map(|(holder, began)| format!("{}:{}ms", holder.0, now.saturating_sub(*began) / NS_PER_MS))
+    .collect();
+  let unreachable: Vec<u64> = live.unreachable.iter().map(|holder| holder.0).collect();
+  format!(
+    "target {target}; head {:?}; durable {:?}; whole {:?}; owes whole {}; holders {holders:?}; lanes {lanes:?}; \
+     unreachable {unreachable:?}; head placed {placed}; active set recorded {recorded} (at {:?}); covers candidates \
+     {covered}; fenced {:?}",
+    live.shipper.head().map(|head| head.position),
+    live.shipper.durable(),
+    live.whole_entry.map(|head| head.position),
+    live.owes_whole,
+    live.recorded,
+    live.fenced,
+  )
+}
+
+/// Derived: the window a held reply's wait for durability is judged in (`slates_bridge_core::durable_bound`) before its
+/// transport answers that it is not durable (NFS `JUKEBOX`, FUSE and virtio-fs `EIO`, WinFsp
+/// `STATUS_UNEXPECTED_IO_ERROR`): [`DURABLE_WAIT_NS`]. Asked by those transports for their give-up records, so compiled
+/// where they are.
 pub(crate) const fn durable_wait_ns() -> u64 {
   DURABLE_WAIT_NS
 }
@@ -906,6 +1235,7 @@ pub(crate) fn published(
       recording: None,
       whole_entry: None,
       image_anchors: None,
+      heard: 0,
     });
   follow_candidates(state, id.bytes);
   let Some(live) = state.live.shipping.get_mut(&id.bytes) else {
@@ -936,6 +1266,7 @@ pub(crate) fn published(
   };
   match appended {
     Ok(entry) => {
+      let shipped = u64::try_from(payload.len()).unwrap_or(u64::MAX);
       live.owes_whole = false;
       live.kept = if whole {
         payload.len()
@@ -961,6 +1292,9 @@ pub(crate) fn published(
       state.count(LIVE_APPENDED, 1);
       if whole {
         state.count(LIVE_WHOLE, 1);
+        state.count(LIVE_WHOLE_BYTES, shipped);
+      } else {
+        state.count(LIVE_CHANGE_BYTES, shipped);
       }
       if image_owed {
         // The volume's state now is this publication's, so its image is exactly the head just appended.
@@ -2128,6 +2462,9 @@ fn fold_into(state: &mut ShardState, replies: Vec<(ObjectId, HostId, Vec<u8>)>) 
     // looped at the network's speed: 982 and 5,501 refusals on the two holders of one five-write run, and later a holder
     // installed at a checkpoint the tail had passed, re-installed there without end (2026-11-05, `live_fleet`).
     let progressed = live.shipper.held_by(host) != held_before;
+    if progressed {
+      live.heard = live.heard.saturating_add(1);
+    }
     if live.shipper.durable() > before {
       state.count(LIVE_DURABLE, 1);
       resolve(state, object.0);
@@ -2378,10 +2715,15 @@ pub(crate) fn serve_entry(
   let reply = Entry::decode(request, bound)
     .and_then(|entry| take_entry(held_entry(state, peer, entry.object), &entry, bound));
   match &reply {
-    Err(error) => count_refused(state, refused_counter(error)),
-    Ok(_) => state.count(LIVE_HELD, 1),
+    Err(error) => {
+      count_refused(state, refused_counter(error));
+      encode_reply(&reply)
+    }
+    Ok(_) => {
+      state.count(LIVE_HELD, 1);
+      acknowledged(state, encode_reply(&reply))
+    }
   }
-  encode_reply(&reply)
 }
 
 /// One entry taken into a candidate's copy (guard-then-apply, `Replica::check` then `commit`): applied and kept within
@@ -2482,8 +2824,7 @@ pub(crate) fn serve_install(
     let held = held_entry(state, peer, install.object);
     match held.replica.check_install(&install)? {
       Admitted::Apply(head) => {
-        held.entries.clear();
-        held.bytes = 0;
+        held.clear_entries();
         keep(held, &install.state, bound)?;
         held.replica.commit(install.epoch, head);
         Ok((Some(head), true))
@@ -2496,10 +2837,15 @@ pub(crate) fn serve_install(
   }
   let reply = reply.map(|(head, _)| head);
   match &reply {
-    Err(error) => count_refused(state, refused_counter(error)),
-    Ok(_) => state.count(LIVE_HELD, 1),
+    Err(error) => {
+      count_refused(state, refused_counter(error));
+      encode_reply(&reply)
+    }
+    Ok(_) => {
+      state.count(LIVE_HELD, 1);
+      acknowledged(state, encode_reply(&reply))
+    }
   }
-  encode_reply(&reply)
 }
 
 /// Why a holder will not serve a message about `object` made under `epoch`: below the fence its copy has promised it is
@@ -2530,7 +2876,7 @@ fn admitted(
   let placing = slates_cluster::content::ContentAccess::Place;
   let authority = crate::fleet::content_authority(
     regional,
-    &state.holder_records,
+    state.holder_records.as_map(),
     local,
     peer,
     placing,
@@ -2603,10 +2949,12 @@ fn refused_counter(error: &LiveError) -> &'static str {
 /// The holder's copy of `object`, kept for `owner`: the configuration names `owner` the volume's acting owner (the caller
 /// checked it, [`admitted`]), so a successor takes the copy over; the fence still refuses any stale epoch.
 fn held_entry(state: &mut ShardState, owner: HostId, object: ObjectId) -> &mut Held {
+  let first = state.live.slot_floor;
   let held = state.live.held.entry(object).or_insert_with(|| Held {
     replica: Replica::new(owner, object),
     entries: VecDeque::new(),
     bytes: 0,
+    first,
   });
   held.replica.reassign(owner);
   held
@@ -2629,7 +2977,7 @@ pub(crate) fn serve_fetch(
   let reading = slates_cluster::content::ContentAccess::Read;
   if !crate::fleet::content_authorized(
     regional,
-    &state.holder_records,
+    state.holder_records.as_map(),
     local,
     peer,
     reading,
@@ -2644,7 +2992,9 @@ pub(crate) fn serve_fetch(
       let head = held.replica.head();
       let entries: Vec<Vec<u8>> = held.entries.iter().cloned().collect();
       state.count(LIVE_FETCHED, 1);
-      slates_db::live::encode_fetched(&Ok(head), &entries)
+      // The fence this raised is a promise too: it outlives a restart before it is told.
+      let reply = slates_db::live::encode_fetched(&Ok(head), &entries);
+      acknowledged(state, reply)
     }
     Err(refusal) => slates_db::live::encode_fetched(&Err(refusal), &[]),
   }
@@ -2666,7 +3016,7 @@ pub(crate) fn serve_report(
   let reading = slates_cluster::content::ContentAccess::Read;
   if !crate::fleet::content_authorized(
     regional,
-    &state.holder_records,
+    state.holder_records.as_map(),
     local,
     peer,
     reading,
@@ -2681,7 +3031,9 @@ pub(crate) fn serve_report(
       let head = held.replica.head();
       let kept = u64::try_from(held.bytes).unwrap_or(u64::MAX);
       state.count(LIVE_REPORTED, 1);
-      slates_db::live::encode_reported(&Ok(head), kept)
+      // The fence this raised is a promise: it outlives a restart before it is told (as a fetch's, `serve_fetch`).
+      let reply = slates_db::live::encode_reported(&Ok(head), kept);
+      acknowledged(state, reply)
     }
     Err(refusal) => slates_db::live::encode_reported(&Err(refusal), 0),
   }
@@ -2704,10 +3056,12 @@ fn fenced_copy(
   object: ObjectId,
   epoch: slates_db::register::HostEpoch,
 ) -> Result<&mut Held, LiveError> {
+  let first = state.live.slot_floor;
   let held = state.live.held.entry(object).or_insert_with(|| Held {
     replica: Replica::new(successor, object),
     entries: VecDeque::new(),
     bytes: 0,
+    first,
   });
   held.replica.prepare(epoch)?;
   Ok(held)
@@ -2732,8 +3086,7 @@ pub(crate) fn serve_state(
 /// Keeps `payload` after what is held (a whole one first drops what came before it), within `bound`.
 fn keep(held: &mut Held, payload: &[u8], bound: usize) -> Result<(), LiveError> {
   if payload.first() == Some(&KIND_WHOLE) {
-    held.entries.clear();
-    held.bytes = 0;
+    held.clear_entries();
   }
   let bytes = held
     .bytes
