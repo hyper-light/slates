@@ -2,9 +2,12 @@
 //! §4.14, §4.15 "Audit"). The wire carries a grant's state, an audit record's kind and a landing's stage typed
 //! (`GrantSummary::grant_state`, `AuditEntry::audit_kind` and `stage`, appended 2026-11-18); this module reads those,
 //! never the words beside them, which are for people. Until then it read the words, and a word it did not know was a
-//! protocol fault.
+//! protocol fault. A record of a landing as a whole carries how the landing's signature was judged (A-321), typed as
+//! the wire carries it.
 
 use slates_ipc::protocol::{self as wire, AuditEntry, GrantScope, GrantSummary, VolumeId};
+
+use crate::signed::Verification;
 
 /// A grant as the daemon lists it (§4.13).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,6 +56,10 @@ pub struct AuditRecord {
   pub manifest: Option<[u8; 32]>,
   /// The landing's state when the record was made, for a finished landing.
   pub outcome: Option<LandingStage>,
+  /// How the landing's signature was judged (signed work, A-321), on a record of the landing as a whole — its
+  /// presentation's and a granted run's [`AuditKind::LandingPlanned`], its [`AuditKind::LandingFinished`]
+  /// ([`Verification::Unsigned`] when it carried none): the landing's provenance. `None` on every other record.
+  pub verification: Option<Verification>,
 }
 
 /// What an audit record records.
@@ -135,6 +142,7 @@ pub(crate) fn audit_of(entry: AuditEntry) -> AuditRecord {
     landing: entry.landing,
     manifest: entry.manifest,
     outcome: entry.stage.map(stage_of),
+    verification: entry.verification.map(Verification::of_wire),
   }
 }
 
@@ -197,6 +205,7 @@ mod tests {
       outcome: stage.map(|_| "a word for people".to_owned()),
       audit_kind: kind,
       stage,
+      verification: None,
     };
     for (typed, kind) in [
       (wire::AuditKind::GrantIssued, AuditKind::GrantIssued),

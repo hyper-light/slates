@@ -169,6 +169,15 @@ const TAKEOVER_RECOVERED_PAST_TOLERANCE: &str = "fleet.takeover.recovered_past_t
 /// Format: a refusal name in the daemon's status report.
 const TAKEOVER_ADOPTED: &str = "fleet.takeover.adopted";
 
+/// Counter: a takeover round started over, under a newer configuration or above a fence a holder reported
+/// ([`begin_round`]); the objects it adopted stay adopted, and their copies do not raise its epoch (A-353).
+/// Format: a counter name in the daemon's status report.
+const TAKEOVER_ROUND_RESTARTED: &str = "fleet.takeover.restarted";
+
+/// Counter: a finished share whose confirmation a test withheld (`Daemon::inject_confirmation_withheld`, A-353).
+/// Format: a counter name in the daemon's status report.
+const TAKEOVER_CONFIRMATION_WITHHELD: &str = "fleet.takeover.confirmation_withheld_by_fault";
+
 /// Derived: the bytes one takeover page may carry — the credit a fresh fleet session grants before any window
 /// update (`slates_transport::connection::initial_receive_window` at the fleet frame cap: the reorder
 /// threshold plus one packets of stream data), so a page reaches the successor in one flight on any session,
@@ -212,6 +221,10 @@ pub struct HostTakeover {
   /// for ([`give_up_unpromised`]). Never adopted or learned again in this round, and the share is not confirmed while
   /// any is here, so their holders keep their copies (A-272's rule). Bounded by the retired host's objects.
   given_up: BTreeSet<ObjectId>,
+  /// Per learned object judged ready past tolerance ([`ready_objects`]), the first of its cohorts short of the recovery
+  /// quorum: its adoption records it with a volume's head, whose loss report names it once served (A-332). Bounded by
+  /// `learned`: an entry leaves with its object.
+  past_tolerance: BTreeMap<ObjectId, slates_db::catalog::RecoveryShortfall>,
 }
 
 /// One learned object's wait for its recovery cohorts' promises (§4.8 phase one), as the round's bound counts it: the
@@ -267,6 +280,7 @@ impl HostTakeover {
       page_advances: 0,
       waits: BTreeMap::new(),
       given_up: BTreeSet::new(),
+      past_tolerance: BTreeMap::new(),
     }
   }
 
@@ -283,6 +297,7 @@ impl HostTakeover {
     self.named_nothing.clear();
     self.waits.clear();
     self.given_up.clear();
+    self.past_tolerance.clear();
   }
 
   /// Whether `object` is settled in this round, so no answer makes it learned again: adopted, or given up on.
@@ -812,7 +827,16 @@ async fn drive_host_takeover(
   let past = state::with_state(|s| unpromised_past_the_bound(s, departed)).unwrap_or_default();
   give_up_unpromised(departed, past, local).await;
   let done = state::with_state(|s| round_done(s, departed, local)).unwrap_or(false);
-  if done {
+  // Test support: a confirmation withheld, as one late to commit leaves the share owed (A-353).
+  let withheld = done
+    && state::with_state(|s| {
+      if s.injected_confirmation_withheld {
+        s.count(TAKEOVER_CONFIRMATION_WITHHELD, 1);
+      }
+      s.injected_confirmation_withheld
+    })
+    .unwrap_or(false);
+  if done && !withheld {
     crate::fleet::send_council_report(
       slates_cluster::config_group::ConfigCommand::Confirm {
         departed,
@@ -850,9 +874,11 @@ pub(crate) fn begin_round(
     .host_takeovers
     .entry(departed)
     .or_insert_with(|| HostTakeover::new(regional.version, first_epoch));
+  let mut restarted = false;
   if take.generation != regional.version {
     let epoch = take.epoch.max(first_epoch);
     take.restart(regional.version, epoch);
+    restarted = true;
   }
   if let Some(fence) = take.fenced {
     let Some(above) = fence.0.checked_add(1) else {
@@ -861,8 +887,12 @@ pub(crate) fn begin_round(
     };
     let epoch = HostEpoch(above).max(take.epoch);
     take.restart(regional.version, epoch);
+    restarted = true;
   }
   let (epoch, generation) = (take.epoch, take.generation);
+  if restarted {
+    state.count(TAKEOVER_ROUND_RESTARTED, 1);
+  }
   // This node's own copies count toward each cohort's `f + 1` only once it may promise them, as a holder's
   // answer does ([`gate_open`]); until then it still asks the other members, and counts their answers.
   if gate_open(state, departed) {
@@ -938,10 +968,18 @@ fn unanswered_by_name(
     .collect()
 }
 
-/// The epoch a new round of `departed`'s takeover starts at: above every epoch this node's copies of the
-/// objects that fall to it were written at, and at least the retired host's bumped fencing epoch — the fence
-/// every holder raised for it at the install. A holder's fence above it sends the round higher. `None` when a
-/// copy was written at `u64::MAX`, which no epoch can exceed.
+/// The epoch a round of `departed`'s takeover starts at, or starts over at under a newer configuration: above every
+/// epoch this node's copies of the objects that fall to it and that the round has not adopted were written at, and at
+/// least the retired host's bumped fencing epoch — the fence every holder raised for it at the install. A holder's
+/// fence above it sends the round higher. `None` when a copy was written at `u64::MAX`, which no epoch can exceed.
+///
+/// An object the round adopted is left out (A-353): its copies hold this node's own adoption and every record it wrote
+/// since, all at the round's epoch, and this node writes it there. Counted, they put a round started over under a newer
+/// configuration one above that epoch, its pages raised every holder's fence for the adopted objects there, and every
+/// record this node wrote for them after was refused `StaleEpoch` for good: the catalog naming a successor's live
+/// holders never placed, its shipper never shipped, and a write through the successor waited without end (the lossy
+/// flow's hang, caught live on a Mac Studio by g229, 2026-11-18). Each survivor's confirmation of its own share is a new
+/// configuration, so the round starts over whenever another survivor confirms first.
 fn initial_epoch(
   state: &ShardState,
   regional: &RegionalConfiguration,
@@ -953,10 +991,17 @@ fn initial_epoch(
     .get(&departed)
     .copied()
     .unwrap_or(slates_db::register::FIRST_EPOCH);
+  let adopted = state
+    .host_takeovers
+    .get(&departed)
+    .map(|take| &take.adopted);
   state
     .holder_records
     .iter()
-    .filter(|(object, acceptor)| copy_falls_to(regional, acceptor, **object, departed, local))
+    .filter(|(object, acceptor)| {
+      copy_falls_to(regional, acceptor, **object, departed, local)
+        && !adopted.is_some_and(|adopted| adopted.contains(*object))
+    })
     .flat_map(|(_, acceptor)| acceptor.persisted().1)
     .try_fold(bumped, |highest, (_, _, epoch, _)| {
       Some(highest.max(HostEpoch(epoch.0.checked_add(1)?)))
@@ -1185,11 +1230,17 @@ pub(crate) fn ready_objects(
           ready.push((*object, newest));
         }
       }
-      Readiness::ReadyPastTolerance { .. } => {
-        // Every surviving member of its cohorts has promised (A-309): adopted as a ready one is, counted.
+      Readiness::ReadyPastTolerance {
+        needed, members, ..
+      } => {
+        // Every surviving member of its cohorts has promised (A-309): adopted as a ready one is, counted, and the cohort
+        // it fell short in kept for the volume's loss report (A-332).
         take.waits.remove(object);
         if let Some(newest) = reports.values().cloned().reduce(newest_of) {
           past_tolerance = past_tolerance.saturating_add(1);
+          take
+            .past_tolerance
+            .insert(*object, shortfall(needed, members));
           ready.push((*object, newest));
         }
       }
@@ -1222,10 +1273,22 @@ pub(crate) fn ready_objects(
   take
     .waits
     .retain(|object, _| take.learned.contains_key(object));
+  take
+    .past_tolerance
+    .retain(|object, _| take.learned.contains_key(object));
   if past_tolerance > 0 {
     state.count(TAKEOVER_RECOVERED_PAST_TOLERANCE, past_tolerance);
   }
   ready
+}
+
+/// The shortfall a readiness past tolerance judged (A-332): a cohort's recovery quorum `needed` and the `members` of it
+/// left, as the loss report counts them.
+fn shortfall(needed: usize, members: usize) -> slates_db::catalog::RecoveryShortfall {
+  slates_db::catalog::RecoveryShortfall {
+    needed: u64::try_from(needed).unwrap_or(u64::MAX),
+    remaining: u64::try_from(members).unwrap_or(u64::MAX),
+  }
 }
 
 /// The members that promised one learned object: those that listed it, with the highest record each holds, and those
@@ -1692,7 +1755,9 @@ fn record_adoption(
   // The members other than this node that reported the adopted position: a green's successor fetches any input it
   // lacks from them (`fleet::fetch_green_inputs`), since each accepted that version holding its inputs.
   let mut reported_adopted = Vec::new();
+  let mut registers_short = None;
   if let Some(take) = state.host_takeovers.get_mut(&departed) {
+    registers_short = take.past_tolerance.remove(&object);
     if let Some(reports) = take.learned.remove(&object) {
       reported_adopted = reports
         .into_iter()
@@ -1740,10 +1805,9 @@ fn record_adoption(
       .collect();
     cohort_hosts.sort_unstable_by_key(|host| host.0);
     cohort_hosts.dedup();
-    state.pending_materializations.insert(
-      object,
-      crate::state::PendingVolume::adopted(head, Some(departed), cohort_hosts),
-    );
+    let mut pending = crate::state::PendingVolume::adopted(head, Some(departed), cohort_hosts);
+    pending.registers_short = registers_short;
+    state.pending_materializations.insert(object, pending);
   } else {
     match crate::merge_service::MergeRecordValue::decode_record(&record.value) {
       // A green: its newest merge record was adopted; the owned green is rebuilt from this node's accepted chain

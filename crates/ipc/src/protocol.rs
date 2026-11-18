@@ -522,6 +522,11 @@ pub enum RequestBody {
     filter: Filter,
     /// A grant the caller already holds (from `slates grant`), or none to be presented.
     grant: Option<u64>,
+    /// A signature over the landing's statement (signed work, A-321; `slates_server::signed_work::landing_statement`,
+    /// signed under the namespace `slates-work`): judged under the volume's trusted signers against the manifest the
+    /// landing writes (or presents), recorded with the landing's audit records and answered. It permits nothing: the
+    /// landing follows its write mode.
+    signature: Option<Vec<u8>>,
   },
   /// The caller's grants (a read; creating a grant is off-ring).
   Grants,
@@ -942,6 +947,9 @@ pub enum RequestBody {
     target: String,
     /// The filter.
     filter: Filter,
+    /// A signature over the presented landing's statement, judged as `Land`'s is (A-321): what a held landing of an
+    /// asking session carries to its approval request.
+    signature: Option<Vec<u8>>,
   },
   /// A `Submit` whose caller's own policy asks (A-285): served as a submit under an ask mode whatever the volumes'
   /// modes, so the merge is answered `MergeApprovalRequired` (or refused, if a volume forbids it). What an agent's
@@ -2406,8 +2414,9 @@ pub struct LossReport {
   /// Whether the volume ships its live log to holders in a fleet (A-200), so an owner loss loses no write acknowledged
   /// at durability.
   pub live_shipped: bool,
-  /// Set on a node that took the volume over from a lost owner: what it serves from, and so what the loss took. Kept in
-  /// this node's memory: a restart of this node forgets it.
+  /// Set on a node that took the volume over from a lost owner: what it serves from, and so what the loss took, and
+  /// whether the takeover went past the volume's tolerance (A-332). Recorded with the volume (A-325), so it survives this
+  /// node's restart.
   pub taken_over: Option<VolumeTakeover>,
 }
 
@@ -2421,6 +2430,34 @@ pub struct VolumeTakeover {
   /// The head sequence served from: when the volume was not served from its live log, the lost owner's edits after the
   /// seal it names (its `placed_sequence` when it was lost) are the loss window.
   pub head_sequence: u64,
+  /// Set when the takeover recovered the volume past its tolerance (A-309, A-332): more of the hosts holding it were lost
+  /// than its placement tolerates, so it was rebuilt from the newest copy the hosts that remained held, and a write
+  /// acknowledged only to the lost hosts may be gone. `None` within tolerance, where every write the lost owner
+  /// acknowledged at durability survived. Appended.
+  pub past_tolerance: Option<PastTolerance>,
+}
+
+/// How a takeover went past a volume's tolerance (A-309, A-332): which of its parts were recovered from fewer surviving
+/// holders than recovery counts on, and by how much. At least one part is set.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PastTolerance {
+  /// The volume's head register: its first cohort short of the recovery quorum when the takeover adopted the newest
+  /// record every surviving member of the volume's cohorts held. `None` when it was recovered within tolerance.
+  pub registers: Option<Shortfall>,
+  /// The volume's live log (A-200): its recorded holders short of `f + 1` members when the takeover adopted the greatest
+  /// head every surviving recorded holder reported. `None` when the log was recovered within tolerance, or the volume
+  /// has none.
+  pub live_log: Option<Shortfall>,
+}
+
+/// A recovery count short of its quorum (A-332): the hosts recovery counts on, and how many of them were still members
+/// when the takeover recovered past tolerance.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Shortfall {
+  /// The hosts recovery needed: a cohort's recovery quorum, or `f + 1` of a live log's recorded holders.
+  pub needed: u64,
+  /// How many of the hosts that count were members then (fewer than `needed`).
+  pub remaining: u64,
 }
 
 /// A volume's journal as its consuming rounds measured it (§4.5 "Journal"). The budget's formula is the mutation rate
@@ -3113,6 +3150,9 @@ pub struct LandingOutcome {
   pub barriers: u64,
   /// The terminal state, typed (A-299, 2026-11-18: until then a consumer read `state`'s name). Appended.
   pub stage: LandingStage,
+  /// How the landing's signature was judged against the manifest it wrote (signed work, A-321), as its finished
+  /// record keeps it: `Unsigned` when the landing carried none. Appended.
+  pub verification: Verification,
 }
 
 /// A landing's stage (§4.15 "State machines"): the four terminal states a finished landing reports and the stages
@@ -3277,6 +3317,10 @@ pub struct AuditEntry {
   pub audit_kind: AuditKind,
   /// The terminal state, typed, for a finished landing. Appended with `audit_kind`.
   pub stage: Option<LandingStage>,
+  /// How the landing's signature was judged (signed work, A-321), on a record of the landing as a whole: its
+  /// presentation's and a granted run's `LandingPlanned`, and its `LandingFinished` (`Unsigned` when it carried
+  /// none). `None` on every other record. Appended.
+  pub verification: Option<Verification>,
 }
 
 /// What an audit record records (§4.15). Append-only.
@@ -3683,6 +3727,19 @@ pub enum Refusal {
     /// Why, typed.
     refusal: TargetRefusal,
   },
+  /// The verb ran and its effects are committed on its owner, but they were not held where its reply waits for them
+  /// (a live-shipped volume's log on the owner and `f` candidates, A-200; a destroy's tombstone placed at `f + 1`,
+  /// AUD-29-43) within the failover SLO from the hold: the total bound of the rule every transport judges a held reply
+  /// by (`slates_bridge_core::durable_bound`), the operator's bound on how long an object may go unserved before a
+  /// takeover serves it, past which a write not yet held is past what the fleet promises (A-354). Through a shorter
+  /// silence the reply still waits, never a false success. The verb's effects stay committed on the owner and nothing
+  /// claims them durable; this is the request's recorded outcome (§4.9), so a retry under the same id meets it, and the
+  /// verb runs again only under a new id. Until 2026-11-18 such a reply was held for good when what it waited for could
+  /// not happen. Appended.
+  DurabilityPending {
+    /// How long the reply was held before it was told this, nanoseconds.
+    held_ns: u64,
+  },
 }
 
 /// Why a target cannot be used ([`Refusal::Target`], A-299): each the class of a landing target's, a mount point's or a
@@ -4082,6 +4139,12 @@ pub enum ReplyBody {
     summary: LandingSummary,
     /// Conflicts found before any write (empty when the landing is clean).
     conflicts: Vec<String>,
+    /// The exact statement a signature over this landing signs (signed work, A-321;
+    /// `slates_server::signed_work::landing_statement`: the volume, the target as the request named it and this
+    /// manifest, one field a line): sign it under the namespace `slates-work` and land with the signature.
+    statement: Vec<u8>,
+    /// How the request's signature was judged against this manifest (A-321): `Unsigned` when it carried none.
+    verification: Verification,
   },
   /// A landing finished (or partially).
   Landed {

@@ -492,6 +492,11 @@ pub struct ShardState {
   /// (`verbs::lease_verdict`). Bounded by the partition's volume cap: a subset of the catalog, pruned to it at each
   /// yield (`crate::readmission`).
   pub(crate) yielded: std::collections::BTreeSet<slates_db::catalog::VolumeId>,
+  /// The slots of stale copies this shard relinquished to a takeover that named this node again (A-362,
+  /// `verbs::materialize_taken_over`), each torn down a destroy slice at a time by the reaper (`verbs::step_destroys`)
+  /// after its record went, since the volume made from the adopted state took its id. Bounded by the partition's volume
+  /// cap: a relinquished copy was a volume this shard held, and each leaves once its teardown is done.
+  pub(crate) relinquished: Vec<VolumeSlot>,
   /// The Linux FUSE mounts this shard serves, by attachment (§4.6 "Linux"; AUD-29-64; `crate::fuse`). Bounded
   /// by the partition's attachment cap: one entry per live FUSE attachment at most.
   #[cfg(target_os = "linux")]
@@ -932,6 +937,10 @@ pub struct ShardState {
   /// holder leaves unanswered while set, as a holder cut off from one successor alone is to it: the council never
   /// retires it, since every other member hears it (`Daemon::inject_takeover_silence`). Empty in production.
   pub injected_takeover_silence: std::collections::BTreeSet<slates_db::HostId>,
+  /// Test support (never reachable from the wire): while set, this node, as a successor, sends no confirmation of a
+  /// takeover share it has finished, as a confirmation late to commit leaves the share owed while other members confirm
+  /// theirs (`Daemon::inject_confirmation_withheld`, A-353). `false` in production.
+  pub injected_confirmation_withheld: bool,
   /// Test support (never reachable from the wire): the peer whose record session is made deaf by the forward lane's next
   /// borrow of it, once (`Daemon::inject_session_deafness`). `None` in production.
   pub injected_deaf_session: Option<slates_db::HostId>,
@@ -1532,6 +1541,10 @@ pub struct PendingVolume {
   /// adopted, since the retirement may complete and be let go before the log is fetched. Empty for a volume no round
   /// adopted (a mirror's promotion).
   pub cohort_hosts: Vec<slates_db::register::HostId>,
+  /// Set when its head register was adopted past tolerance (A-309, A-332): the first cohort short of its recovery quorum,
+  /// which the volume's loss report names once it is served (`slates_db::catalog::TakeoverPastTolerance::registers`).
+  /// `None` within tolerance and for a volume no round adopted.
+  pub registers_short: Option<slates_db::catalog::RecoveryShortfall>,
 }
 
 impl PendingVolume {
@@ -1549,6 +1562,7 @@ impl PendingVolume {
       most_staged: None,
       round_seen: None,
       cohort_hosts,
+      registers_short: None,
     }
   }
 
