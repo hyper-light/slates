@@ -98,7 +98,7 @@ fn emit_recovery(
   json: bool,
 ) -> Result<(), Failure> {
   use slates_ipc::protocol::{ReplyBody, RequestBody};
-  let proof = match crate::recovery_key::load()? {
+  let proof = match slates_api::role::recovery_key()? {
     Some(key) => key.proof(&plan),
     None => issuer()?
       .recovery_proof(&plan)
@@ -410,7 +410,7 @@ fn serve_mcp_http(server: slates_mcp::McpServer, port: u16, instance: &str) -> R
   use slates_rt::tcp::{Ipv4Addr, SocketAddrV4, TcpListener};
   let mcp =
     |what: &str, e: &dyn std::fmt::Display| Failure::Failed(format!("mcp http {what}: {e}"));
-  let profile = crate::daemon::measure(true)?;
+  let profile = slates_api::role::measure(true)?;
   let config = slates_server::config::DaemonConfig::derive(&profile, instance, Some(1));
   let runtime =
     slates_rt::runtime::LocalRuntime::new(&config.runtime).map_err(|e| mcp("runtime", &e))?;
@@ -744,15 +744,6 @@ fn emit_create(client: &mut Client, spec: &CreateSpec, json: bool) -> Result<(),
 
 /// `volume snapshot`: the snapshot's sequence number, as text or a JSON `{ "snapshot" }` (the MCP
 /// `slates.volume.snapshot` schema).
-/// A failure's text for a message that reports two of them at once (the NFS mount's bind-then-unmount).
-#[cfg(all(unix, not(target_os = "linux")))]
-fn failure_text(failure: &Failure) -> String {
-  match failure {
-    Failure::Refused(text) | Failure::Failed(text) => text.clone(),
-    other => format!("{other:?}"),
-  }
-}
-
 fn emit_snapshot(client: &mut Client, volume: VolumeId, json: bool) -> Result<(), ClientError> {
   let (snapshot, coverage) = client.snapshot_with_coverage(volume)?;
   // What the barrier could claim (§4.6 "Writeback and snapshot barrier"): `complete` when every write
@@ -2627,7 +2618,7 @@ fn id_list_text(ids: &[u64]) -> String {
 
 /// `slates profile`: the machine profile, as its derived constants or as JSON.
 pub(crate) fn profile(options: &ProfileOptions) -> Result<(), Failure> {
-  let profile = crate::daemon::measure(options.quick)?;
+  let profile = slates_api::role::measure(options.quick)?;
   if options.json {
     let json = profile
       .to_json()
@@ -2683,7 +2674,7 @@ mod harness_tests {
   const TEST_SHARDS: u16 = 2;
 
   /// The machine profile this binary's test daemons derive from, measured **once per process** (§4.1), as
-  /// production measures once at the anchor's boot — `crate::daemon::measure` itself is per-invocation and
+  /// production measures once at the anchor's boot — `slates_api::role::measure` itself is per-invocation and
   /// right to be, which is why this wrapper exists only for the tests.
   ///
   /// Measured afresh per test, the wake probe runs beside the other tests' probes and daemons, measures their
@@ -2697,7 +2688,7 @@ mod harness_tests {
     static PROFILE: std::sync::OnceLock<Result<slates_machine::MachineProfile, String>> =
       std::sync::OnceLock::new();
     PROFILE
-      .get_or_init(|| crate::daemon::measure(true).map_err(|e| format!("{e:?}")))
+      .get_or_init(|| slates_api::role::measure(true).map_err(|e| format!("{e:?}")))
       .clone()
       .expect("the machine profile measures")
   }

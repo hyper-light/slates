@@ -85,7 +85,7 @@ impl Drop for AnchorProcess {
   }
 }
 
-/// Format: the start of the line the daemon prints once it serves (`crates/cli/src/daemon.rs`).
+/// Format: the start of the line the daemon prints once it serves (`crates/api/src/role/daemon.rs`).
 const SERVING_LINE: &str = "slates daemon: instance ";
 
 /// Starts `slates anchor --quick`, waits for its daemon to serve and answer, and bootstraps the consensus group.

@@ -1422,9 +1422,10 @@ jobs:
   # by SHA-256 and built with the system cc inside the runner's temp — not vendored (fsx is APSL 2.0 and
   # fsstress GPL-2.0; licences do not enter this MIT tree by a lane's hand) and not installed. They are the
   # only non-Rust tooling of this lane, and the design itself names them (Part 6). macOS runs the daemon's
-  # NFS loopback mount as shipped (`slates mount`, no privilege); Linux reaches the same export through a root
-  # `mount -t nfs` by the OS client, recorded LIMITED because no daemon transport serves the FUSE bridge yet;
-  # the tracer is strace on Linux and `sudo fs_usage` on macOS. The daemon never runs as root (R10).
+  # NFS loopback mount as shipped (`slates mount`, no privilege); Linux runs the workload roster over the daemon's
+  # own FUSE mount (`slates mount`, no privilege; A-293) and reaches the same export through a root `mount -t nfs`
+  # by the OS client for the other suites, recorded LIMITED, since those over the FUSE mount run in the container
+  # lane; the tracer is strace on Linux and `sudo fs_usage` on macOS. The daemon never runs as root (R10).
   # Records go to the runner's temp and are uploaded as artifacts; the tracked matrix is regenerated from
   # them deliberately (`cargo xtask conformance matrix --write`), never by CI, so a run's date cannot drift
   # the doc-truth test. A suite that does not meet its verdict fails the step after writing its record.

@@ -67,12 +67,14 @@ mod fuse_hold;
 mod own_nfs;
 // A writable direct map's copy that outlives its daemon: held by the anchor, taken back by the successor (A-197).
 mod checkout;
+pub mod grant_signature;
 pub mod head;
 #[cfg(target_os = "linux")]
 mod held_copy;
 pub mod histogram;
 mod image;
 pub mod landing;
+mod landing_entries;
 pub mod lease;
 mod lease_wait;
 mod live_ship;
