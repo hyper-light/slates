@@ -104,12 +104,6 @@ const TAKEOVER_GIVEN_UP: &str = "fleet.takeover.given_up";
 /// Format: the wait a given-up learned object names in its refusal's cause (`RecoveryCause::TakeoverIncomplete`): its
 /// recovery cohorts' promises.
 const UNPROMISED_WAIT: &str = "promises";
-/// Format: the wait a lost object names in its refusal's cause (`RecoveryCause::TakeoverIncomplete`): a recovery cohort's
-/// quorum, which fewer members than it are left to give.
-const LOST_WAIT: &str = "quorum";
-/// The status count of lost objects a round recorded unrecovered on their owner shards ([`record_lost`]). Format: a
-/// refusal name in the daemon's status report.
-const TAKEOVER_LOST_RECORDED: &str = "fleet.takeover.lost.recorded";
 
 /// Counter: takeover pages and questions by name a test's injected silence left unanswered
 /// (`Daemon::inject_takeover_silence`); zero in production. Format: a counter name in the daemon's status report.
@@ -178,8 +172,6 @@ pub struct HostTakeover {
   /// for ([`give_up_unpromised`]). Never adopted or learned again in this round, and the share is not confirmed while
   /// any is here, so their holders keep their copies (A-272's rule). Bounded by the retired host's objects.
   given_up: BTreeSet<ObjectId>,
-  /// The lost objects whose owner shards this round has told they are unrecovered ([`record_lost`]). Bounded by `lost`.
-  lost_recorded: BTreeSet<ObjectId>,
 }
 
 /// One learned object's wait for its recovery cohorts' promises (§4.8 phase one), as the round's bound counts it: the
@@ -236,7 +228,6 @@ impl HostTakeover {
       page_advances: 0,
       waits: BTreeMap::new(),
       given_up: BTreeSet::new(),
-      lost_recorded: BTreeSet::new(),
     }
   }
 
@@ -254,7 +245,6 @@ impl HostTakeover {
     self.named_nothing.clear();
     self.waits.clear();
     self.given_up.clear();
-    self.lost_recorded.clear();
   }
 
   /// Whether `object` is settled in this round, so no answer makes it learned again: adopted, or given up on.
@@ -722,7 +712,6 @@ async fn drive_host_takeover(
   }
   let past = state::with_state(|s| unpromised_past_the_bound(s, departed)).unwrap_or_default();
   give_up_unpromised(departed, past, local).await;
-  record_lost(departed, local).await;
   let done = state::with_state(|s| round_done(s, departed, local)).unwrap_or(false);
   if done {
     crate::fleet::send_council_report(
@@ -1178,95 +1167,21 @@ pub(crate) fn unpromised_past_the_bound(
 /// per owner shard, whatever the objects' number, and one log line; an owner shard that does not answer within the period
 /// leaves its objects learned, given up again the next.
 async fn give_up_unpromised(departed: HostId, past: Vec<(ObjectId, u32)>, local: HostId) {
+  let Some(origin) = state::with_state(|s| s.shard) else {
+    return;
+  };
+  if past.is_empty() {
+    return;
+  }
   let most_attempts = past
     .iter()
     .map(|(_, attempts)| *attempts)
     .max()
     .unwrap_or(0);
-  let objects: Vec<ObjectId> = past.into_iter().map(|(object, _)| object).collect();
-  let settled = record_unrecovered(&objects, UNPROMISED_WAIT, local).await;
-  let Some(first) = settled.first().map(|(object, _)| *object) else {
-    return;
-  };
-  let given_up = u64::try_from(settled.len()).unwrap_or(u64::MAX);
-  let claimed = settled.iter().filter(|(_, claimed)| *claimed).count();
-  state::with_state_counted(|s| {
-    if let Some(take) = s.host_takeovers.get_mut(&departed) {
-      for (object, _) in &settled {
-        take.learned.remove(object);
-        take.waits.remove(object);
-        take.named_nothing.remove(object);
-        take.given_up.insert(*object);
-      }
-    }
-    s.count(TAKEOVER_GIVEN_UP, given_up);
-  });
-  slates_machine::log_line!(
-    "slates daemon: the takeover of {}'s objects gave up {given_up} of them (the first {}) after up to {most_attempts} \
-     periods, the failover SLO's worth, with no member of their recovery cohorts promising them anew and no page of the \
-     round advancing; {claimed} recorded unrecovered on their shards, every verb on one answering NotRecovered (a \
-     catalog register is given up with its volume, and an object whose partition no shard here serves is dropped)",
-    departed.0,
-    crate::verbs::hex_of(&first.0)
-  );
-}
-
-/// Records the lost objects of `departed`'s round not yet recorded ([`HostTakeover::lost_recorded`]): each a recovery
-/// cohort left with fewer members than its recovery quorum, more of it failed than the region tolerates, so no round under
-/// this configuration adopts it. Every verb on one answers `NotRecovered { TakeoverIncomplete { waited_on: "quorum" } }`
-/// where it answered a retryable `Overloaded` for as long as the daemon ran, and this node claims it to lookups. The share
-/// was already kept unconfirmed, and the holders their copies (A-272). An owner shard that does not answer within the
-/// period leaves its objects to the next.
-async fn record_lost(departed: HostId, local: HostId) {
-  let lost: Vec<ObjectId> = state::with_state(|s| {
-    s.host_takeovers
-      .get(&departed)
-      .map(|take| take.lost.difference(&take.lost_recorded).copied().collect())
-      .unwrap_or_default()
-  })
-  .unwrap_or_default();
-  if lost.is_empty() {
-    return;
-  }
-  let settled = record_unrecovered(&lost, LOST_WAIT, local).await;
-  let Some(first) = settled.first().map(|(object, _)| *object) else {
-    return;
-  };
-  let recorded = u64::try_from(settled.len()).unwrap_or(u64::MAX);
-  state::with_state_counted(|s| {
-    if let Some(take) = s.host_takeovers.get_mut(&departed) {
-      take
-        .lost_recorded
-        .extend(settled.iter().map(|(object, _)| *object));
-    }
-    s.count(TAKEOVER_LOST_RECORDED, recorded);
-  });
-  slates_machine::log_line!(
-    "slates daemon: the takeover of {}'s objects found {recorded} of them lost (the first {}): a recovery cohort has \
-     fewer members left than its recovery quorum, so every verb on one answers NotRecovered, and their holders keep \
-     their copies",
-    departed.0,
-    crate::verbs::hex_of(&first.0)
-  );
-}
-
-/// Records each of `objects` unrecovered on its owner shard, `TakeoverIncomplete { waited_on }`, so every verb on it
-/// answers `NotRecovered` there and is never forwarded (`verbs::owned_by_another_host`), and claims it to lookups, so a
-/// read from another node meets that answer. Bounded work: one call per owner shard, whatever the objects' number. A
-/// catalog register has no verbs of its own and is settled unrecorded (its volume's materialization names `catalog`), as
-/// is an object whose partition no shard here serves. The objects settled, each with whether it was recorded; those of
-/// an owner shard that did not answer within the period are not among them.
-async fn record_unrecovered(
-  objects: &[ObjectId],
-  waited_on: &'static str,
-  local: HostId,
-) -> Vec<(ObjectId, bool)> {
-  let Some(origin) = state::with_state(|s| s.shard) else {
-    return Vec::new();
-  };
+  // Each object's owner shard, `None` for a catalog register (nothing to record) or a partition with no shard here.
   let mut by_shard: BTreeMap<u16, Vec<ObjectId>> = BTreeMap::new();
   let mut settled: Vec<(ObjectId, bool)> = Vec::new();
-  for object in objects {
+  for (object, _) in &past {
     let target = (!object.is_catalog())
       .then(|| {
         let partition = crate::verbs::owner_of(slates_ipc::protocol::VolumeId { bytes: object.0 });
@@ -1291,7 +1206,7 @@ async fn record_unrecovered(
           s.unrecovered.insert(
             id,
             slates_ipc::protocol::RecoveryCause::TakeoverIncomplete {
-              waited_on: waited_on.to_owned(),
+              waited_on: UNPROMISED_WAIT.to_owned(),
             },
           );
         }
@@ -1304,12 +1219,33 @@ async fn record_unrecovered(
       settled.extend(objects.into_iter().map(|object| (object, true)));
     }
   }
+  let Some(first) = settled.first().map(|(object, _)| *object) else {
+    return;
+  };
+  let given_up = u64::try_from(settled.len()).unwrap_or(u64::MAX);
+  let claimed = settled.iter().filter(|(_, claimed)| *claimed).count();
   state::with_state_counted(|s| {
-    for (object, _) in settled.iter().filter(|(_, recorded)| *recorded) {
+    if let Some(take) = s.host_takeovers.get_mut(&departed) {
+      for (object, _) in &settled {
+        take.learned.remove(object);
+        take.waits.remove(object);
+        take.named_nothing.remove(object);
+        take.given_up.insert(*object);
+      }
+    }
+    for (object, _) in settled.iter().filter(|(_, claimed)| *claimed) {
       track_owner_on_every_shard(s, *object, local);
     }
+    s.count(TAKEOVER_GIVEN_UP, given_up);
   });
-  settled
+  slates_machine::log_line!(
+    "slates daemon: the takeover of {}'s objects gave up {given_up} of them (the first {}) after up to {most_attempts} \
+     periods, the failover SLO's worth, with no member of their recovery cohorts promising them anew and no page of the \
+     round advancing; {claimed} recorded unrecovered on their shards, every verb on one answering NotRecovered (a \
+     catalog register is given up with its volume, and an object whose partition no shard here serves is dropped)",
+    departed.0,
+    crate::verbs::hex_of(&first.0)
+  );
 }
 
 /// The successor answers itself by name (A-251 (b)), as it asks any member: for each learned object it has neither

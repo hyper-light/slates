@@ -34,19 +34,22 @@ ended the wait but a configuration change.
    `unrecovered`: the verb went to the location round, met this node's own routing and answered `Overloaded` for good.
    The bound's tests all ran on a lone node, which never forwards. With the phase-one bound in place and the check
    removed, the three-node test answered `Overloaded` until its deadline (467 s of periods).
-2. **A lost object was never answered either.** An object whose cohort has fewer members left than its recovery quorum
-   is counted `fleet.takeover.lost` and kept from confirmation (A-272), but was never recorded unrecovered: every verb
-   on it answered `Overloaded` for as long as the daemon ran.
+2. **A lost object is never answered either (open; g250's A-309 takes it).** An object whose cohort has fewer members
+   left than its recovery quorum is counted `fleet.takeover.lost` and kept from confirmation (A-272), but is never
+   recorded unrecovered: every verb on it answers `Overloaded` for as long as the daemon runs. A record naming the
+   quorum was built and proven the same day (`a_taken_over_object_whose_cohort_lost_its_quorum_is_refused_by_name`,
+   five nodes, the owner and one of its two other holders stopped together; red with the record removed: `Overloaded`
+   to the 60 s deadline) and withdrawn before it landed, at g250's request: A-309 recovers such an object instead, so
+   the refusal would only be undone. The test belongs to A-309, inverted: the object is recovered.
 
 ## Fix (exact edits)
 
 - `crates/server/src/takeover.rs`: `PromiseWait` (per learned object: the periods it waited with no member promising it
   anew and no page of the round advancing); `ready_objects` counts them, `unpromised_past_the_bound` lists those past
-  `fleet::takeover_attempts(failover_slo_ns)`, `give_up_unpromised` gives them up through `record_unrecovered` (one
-  call per owner shard; `TakeoverIncomplete { waited_on: "promises" }`; claimed to lookups); `HostTakeover::given_up`
-  keeps them out of the round and keeps the share unconfirmed (`share_done`); a restart judges them afresh.
-  `record_lost` records lost objects the same way (`waited_on: "quorum"`). Counters `fleet.takeover.given_up`,
-  `fleet.takeover.unpromised.past_bound`, `fleet.takeover.lost.recorded`. `Daemon::inject_takeover_silence`.
+  `fleet::takeover_attempts(failover_slo_ns)`, `give_up_unpromised` gives them up (one call per
+  owner shard; `TakeoverIncomplete { waited_on: "promises" }`; claimed to lookups); `HostTakeover::given_up`
+  keeps them out of the round and keeps the share unconfirmed (`share_done`); a restart judges them afresh. Counters
+  `fleet.takeover.given_up`, `fleet.takeover.unpromised.past_bound`. `Daemon::inject_takeover_silence`.
 - `crates/server/src/verbs.rs`: `owned_by_another_host` answers a volume its shard records unrecovered; a taken-over
   materialization (plain and green) clears a stale record. `crates/server/src/fleet.rs`: `takeover_attempts` shared;
   an adopted tombstone clears a stale record.
@@ -55,6 +58,5 @@ ended the wait but a configuration change.
 ## Tests
 
 `a_taken_over_object_a_survivor_never_promises_is_given_up_by_name` (red twice: the bound cut out, and the forwarding
-check removed), `a_taken_over_object_whose_cohort_lost_its_quorum_is_refused_by_name` (five nodes; the owner and one
-of its two other holders stopped together), `a_promise_wait_counts_only_periods_with_no_new_promise_and_no_page_advance`,
+check removed), `a_promise_wait_counts_only_periods_with_no_new_promise_and_no_page_advance`,
 `a_round_that_lost_an_object_does_not_confirm_its_share` (extended to a given-up object).

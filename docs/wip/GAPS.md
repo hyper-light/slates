@@ -10157,12 +10157,12 @@ new process. In simulation the session ended one round trip after its first pack
   this node's own routing, which the give-up claims, and answered `Overloaded` for good: on a fleet of more than one node
   no client saw the materialization's `NotRecovered` either, whose tests ran on a lone node, which never forwards. It is
   answered on its owner shard now; the three-node regression above holds both.
-- **Sibling, fixed 2026-11-18:** an object the round declared lost (a cohort with fewer members than its recovery
-  quorum, counted `fleet.takeover.lost`) was never recorded unrecovered either, so every verb on it answered a retryable
-  `Overloaded` for as long as the daemon ran. It is recorded now through the same batched recorder
-  (`takeover::record_lost`, `NotRecovered { TakeoverIncomplete { waited_on: "quorum" } }`, counted
-  `fleet.takeover.lost.recorded`), proven by `a_taken_over_object_whose_cohort_lost_its_quorum_is_refused_by_name` (five
-  nodes at f = 1, the owner and one of its two other holders stopped together).
+- **Sibling, open (g250's A-309 takes it):** an object the round declared lost (a cohort with fewer members than its
+  recovery quorum, counted `fleet.takeover.lost`) is never recorded unrecovered either, so every verb on it answers a
+  retryable `Overloaded` for as long as the daemon runs. A record naming the short cohort (`waited_on: "quorum"`) was
+  built and proven on 2026-11-18 (red with the record removed: `Overloaded` to the 60 s deadline) and withdrawn before it
+  landed, at g250's request: A-309 recovers such an object instead (the round adopts once every surviving member of its
+  cohorts has promised, and `Readiness::Lost` goes away), so a refusal would only be undone.
 
 ### 2026-11-08: a takeover can call an object lost through a cohort that never held it (open)
 
