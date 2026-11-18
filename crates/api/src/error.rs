@@ -39,7 +39,7 @@ use slates_client::ClientError;
 use slates_ipc::error::RouteRefusal;
 use slates_ipc::protocol::{
   AttachTransport, DatabaseRefusal, HostPathReason, OwnMountUse, Principal, RecoveryCause, Refusal,
-  SnapshotId, UnsupportedReason, VolumeId, VolumeRefusal,
+  SnapshotId, TargetRefusal, UnsupportedReason, VolumeId, VolumeRefusal,
 };
 use slates_ipc::{DeliveryFault, IpcError};
 
@@ -396,6 +396,13 @@ pub enum RetryCause {
   },
   /// A stream's holder record has not reached its shard yet (A-181).
   HolderPending,
+  /// The verb ran on its owner, but what its reply waits for (a live volume's log on `f` candidates, a destroy's
+  /// tombstone placed at `f + 1`) was not held within the failover SLO from the hold (A-354): its effects stay on the
+  /// owner, never claimed durable, and the call made again runs the verb again.
+  DurabilityPending {
+    /// How long the reply was held, nanoseconds.
+    held_ns: u64,
+  },
   /// The command ring is full: nothing was sent.
   RingFull,
   /// The daemon left this channel, or a reconnected one is still being bound: nothing was sent.
@@ -441,9 +448,6 @@ pub enum Unsupported {
     /// The form.
     feature: &'static str,
   },
-  /// A landing that carries a signature: the daemon verifies signed merges (A-321) and not yet a landing's signature
-  /// ([`crate::signed`]). Nothing was sent.
-  SignedWork,
   /// The TLS provider's secure random refused, so no launcher secret could be made ([`crate::LauncherSecret::generate`]).
   SecureRandom,
 }
@@ -574,9 +578,9 @@ pub enum HostFault {
   },
   /// An overlay's base could not be read now: its drift is unknown (§4.15 "Drift").
   BaseUnreadable,
-  /// The daemon's `TargetUnavailable`, in its words: a landing's target cannot be opened or escapes containment
-  /// (§4.15 step 4), or a mount's drive could not be made (a WinFsp mount whose hold the anchor did not answer).
-  Target(Note),
+  /// A target the verb needs cannot be used, typed (A-299; until 2026-11-18 the daemon's words): a landing's target
+  /// directory (§4.15 step 4), a mount point, or the mount the daemon made there (§4.6).
+  Target(TargetRefusal),
   /// An OS call of the channel failed.
   Os {
     /// The call.
@@ -801,6 +805,9 @@ impl Error {
       Refusal::ContentUnavailable => retry(RetryCause::ContentUnavailable, pause_ns),
       Refusal::DigestUnverified => retry(RetryCause::ChangedWhileRead { path: None }, pause_ns),
       Refusal::HolderPending => retry(RetryCause::HolderPending, pause_ns),
+      Refusal::DurabilityPending { held_ns } => {
+        retry(RetryCause::DurabilityPending { held_ns }, pause_ns)
+      }
       Refusal::Unsupported { feature } => {
         Error::Unsupported(Unsupported::Feature(Note::new(feature)))
       }
@@ -837,7 +844,11 @@ impl Error {
       Refusal::HomedElsewhere { region } => Error::Elsewhere(Elsewhere::Region { region }),
       Refusal::NotRootLeader => Error::Elsewhere(Elsewhere::RootLeader),
       Refusal::BaseUnavailable { path, errno } => Error::Host(HostFault::Base { path, errno }),
-      Refusal::TargetUnavailable { reason } => Error::Host(HostFault::Target(Note::new(reason))),
+      Refusal::Target { refusal } => Error::Host(HostFault::Target(refusal)),
+      // No daemon of this build sends it (superseded by `Target`, A-299): a client and a daemon of different builds.
+      Refusal::TargetUnavailable { reason } => {
+        Error::Protocol(ProtocolFault::UnexpectedRefusal(Note::new(reason)))
+      }
       Refusal::DuplicateRequest => Error::Protocol(ProtocolFault::DuplicateRequest),
       Refusal::Volume { refusal } => Error::of_volume(refusal),
       Refusal::Database { refusal } => Error::Unusable(Unusable::Database(refusal)),
@@ -857,7 +868,8 @@ impl Error {
       VolumeRefusal::TooManyLinks
       | VolumeRefusal::FileTooLarge
       | VolumeRefusal::DigestCacheFull
-      | VolumeRefusal::Memory => Error::Exhausted(Exhausted::Volume(refusal)),
+      | VolumeRefusal::Memory
+      | VolumeRefusal::RetentionExceeded => Error::Exhausted(Exhausted::Volume(refusal)),
       VolumeRefusal::JournalIncomplete { .. } | VolumeRefusal::RecoveryVersion { .. } => {
         Error::Unusable(Unusable::Volume(refusal))
       }
@@ -950,6 +962,41 @@ impl fmt::Display for Denied {
   }
 }
 
+/// A target refusal in words, as a person reads it beside the daemon's `TargetUnavailable`.
+fn target_words(refusal: TargetRefusal) -> String {
+  match refusal {
+    TargetRefusal::NotAbsolute => "the path is not absolute".to_owned(),
+    TargetRefusal::Escapes => "a component escapes the landing's target directory".to_owned(),
+    TargetRefusal::Missing => "the path does not exist".to_owned(),
+    TargetRefusal::NotDirectory => "the path is not a directory".to_owned(),
+    TargetRefusal::NotFile => "the path is not a file".to_owned(),
+    TargetRefusal::Stale => "the host no longer holds the path".to_owned(),
+    TargetRefusal::OwnedByAnother { owner: Some(owner) } => {
+      format!("the path belongs to uid {owner}, not the user the verb runs for")
+    }
+    TargetRefusal::OwnedByAnother { owner: None } => {
+      "the path belongs to another user than the one the verb runs for".to_owned()
+    }
+    TargetRefusal::Host { errno } => format!("the host refused the path: {}", errno_text(Some(errno))),
+    TargetRefusal::NotMounted => "the kernel's mount table names no mount of this daemon's there".to_owned(),
+    TargetRefusal::RecordsFull { capacity } => {
+      format!("this daemon already records the {capacity} mounts it can as its own")
+    }
+    TargetRefusal::NoOwnMountTag => "this daemon has no tag to name its own mounts by".to_owned(),
+    TargetRefusal::MountRefused { errno: Some(errno) } => {
+      format!("the OS refused the mount: {} (the daemon's log has its words)", errno_text(Some(errno)))
+    }
+    TargetRefusal::MountRefused { errno: None } => {
+      "the OS refused the mount (the daemon's log has its words)".to_owned()
+    }
+    TargetRefusal::NotADriveLetter => "the mount point is not a drive letter (`S:`)".to_owned(),
+    TargetRefusal::AnchorHold => {
+      "the anchor's hold on the drive did not answer within its bound; the mount or its release waits on it".to_owned()
+    }
+    TargetRefusal::DetachPending => "a detach of this drive already waits for the anchor's release".to_owned(),
+  }
+}
+
 impl fmt::Display for HostFault {
   /// Each fault by its kind and the daemon's or the OS's own words, never their `Debug`: the `Target` fault is named
   /// by the daemon's refusal, `TargetUnavailable`, which a person and a script both look for (A-299; until 2026-11-18
@@ -964,7 +1011,7 @@ impl fmt::Display for HostFault {
       Self::BaseUnreadable => {
         f.write_str("the overlay's base could not be read now, so its drift is unknown")
       }
-      Self::Target(note) => write!(f, "TargetUnavailable: {note}"),
+      Self::Target(refusal) => write!(f, "TargetUnavailable: {}", target_words(*refusal)),
       Self::Os { call, errno } => write!(f, "{call} failed: {}", errno_text(*errno)),
       Self::Memory(note) => write!(f, "the channel's shared memory refused: {note}"),
       Self::Route(refusal) => write!(
@@ -1363,7 +1410,7 @@ mod tests {
 
   use super::{
     Busy, Denied, Error, Exhausted, Existing, HostFault, Missing, Note, ProtocolFault, RetryCause,
-    Stale, Unreported, Unusable,
+    Stale, TargetRefusal, Unreported, Unusable,
   };
 
   /// Shape: the pause a test's retryable refusal carries.
@@ -1465,6 +1512,7 @@ mod tests {
       V::FileTooLarge,
       V::DigestCacheFull,
       V::Memory,
+      V::RetentionExceeded,
     ] {
       assert_eq!(
         volume_refused(bound),
@@ -1523,15 +1571,12 @@ mod tests {
   }
 
   /// A-299 (the integrator's Windows lane, 2026-11-18, run 44257181904: `a_refused_mount_time_hold_leaves_nothing_mounted`
-  /// read `Target("...")`). Do: render the daemon's `TargetUnavailable` for a WinFsp mount whose hold the anchor did
-  /// not answer, and a host refusal of every other kind. Expect: the first named `TargetUnavailable` with the
-  /// daemon's words; none rendered as its `Debug`.
+  /// read `Target("...")`). Do: render the typed target refusal for a WinFsp mount whose hold the anchor did not answer,
+  /// and a host refusal of every other kind. Expect: the first named `TargetUnavailable`, the daemon's refusal, with
+  /// the hold in words; none rendered as its `Debug`.
   #[test]
   fn a_host_refusal_is_named_by_its_kind_in_words() {
-    let hold = Error::Host(HostFault::Target(Note::new(
-      "the WinFsp mount at E: was refused: the anchor's hold: the anchor did not answer",
-    )))
-    .to_string();
+    let hold = Error::Host(HostFault::Target(TargetRefusal::AnchorHold)).to_string();
     assert!(
       hold.contains("TargetUnavailable") && hold.contains("the anchor's hold"),
       "{hold}"
@@ -1542,7 +1587,7 @@ mod tests {
         errno: 2,
       },
       HostFault::BaseUnreadable,
-      HostFault::Target(Note::new("words")),
+      HostFault::Target(TargetRefusal::OwnedByAnother { owner: Some(501) }),
       HostFault::Os {
         call: "mmap",
         errno: None,
@@ -1615,5 +1660,45 @@ mod tests {
       rights.contains("Forbidden") && rights.contains("status"),
       "{rights}"
     );
+  }
+
+  /// A-354 (2026-11-18): do type the daemon's refusal of a reply held past the failover SLO for durability. Expect a
+  /// retry carrying how long it was held, after the pause.
+  #[test]
+  fn a_reply_held_past_its_durable_bound_is_a_retry() {
+    assert_eq!(
+      Error::of_refusal(Refusal::DurabilityPending { held_ns: 7 }, None, PAUSE_NS),
+      Error::Retry {
+        cause: RetryCause::DurabilityPending { held_ns: 7 },
+        pause_ns: PAUSE_NS,
+      }
+    );
+  }
+
+  /// A-299 (2026-11-18): do type the daemon's typed target refusal and the variant it superseded. Expect the first a
+  /// host refusal carrying its reason, and the second, which no daemon of this build sends, a protocol fault naming the
+  /// words it carried.
+  #[test]
+  fn a_target_refusal_is_typed_and_its_superseded_words_are_a_protocol_fault() {
+    assert_eq!(
+      Error::of_refusal(
+        Refusal::Target {
+          refusal: TargetRefusal::Escapes
+        },
+        None,
+        PAUSE_NS
+      ),
+      Error::Host(HostFault::Target(TargetRefusal::Escapes))
+    );
+    assert!(matches!(
+      Error::of_refusal(
+        Refusal::TargetUnavailable {
+          reason: "words".to_owned()
+        },
+        None,
+        PAUSE_NS
+      ),
+      Error::Protocol(ProtocolFault::UnexpectedRefusal(_))
+    ));
   }
 }

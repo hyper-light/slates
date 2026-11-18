@@ -2385,6 +2385,72 @@ fn restart_flow(take_over: bool) {
     "a survivor served every write X acknowledged before its restart: {counters:?}"
   );
 }
+/// A live line's head position, `None` while the log has none.
+fn head_position(line: Option<&LiveLine>) -> Option<u64> {
+  line.and_then(|(head, _, _)| head.parse().ok())
+}
+
+/// A-344 across real processes (§4.10 "Live shipping", T-8.6 Continuity, §4.8 "Recovery"): a live log survives its
+/// owner's warm restart, and a write the restarted owner answers is served by its successor. Do: three anchored daemon
+/// processes; on the owner, a live-shipped volume shared with every node and written [`FILES`] files, each answered at
+/// durability; restart the owner's daemon as a crash does, its anchor kept ([`restart_warm`]); write one more file
+/// through it; then kill the owner whole (its anchor stopped first, so it starts no replacement, then its daemon, then
+/// the anchor). Expect the write after the restart answered, the owner's log after it past the head it had before the
+/// restart (it went on, never began again), and a survivor to serve every file, the one written after the restart among
+/// them. Before A-344 a restarted owner began a second chain from position 0 under the same epoch, which a takeover's
+/// phase one would lose to the old one; only in-process tests covered it
+/// (`crates/server/tests/fleet.rs`, `a_write_answered_after_a_live_owners_warm_restart_survives_its_takeover`).
+#[test]
+fn a_write_answered_after_an_owners_warm_restart_is_served_by_its_successor() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping owner-restart flow: set SLATES_TEST_CLI=1 to run it (three anchored daemons)"
+    );
+    return;
+  }
+  let mut fleet = start_fleet_as("live-owner-restart", "anchor");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = fleet.instances[owner_index].clone();
+  let id = create_live_volume(&owner, "owner-restarted");
+  share_with_nodes(&anchors_of(&fleet.instances), &owner, &id);
+  write_files(&owner, &id, 0..FILES);
+  let before = live_line(&owner, "shipping", &id);
+  restart_warm(&owner);
+  let after_restart = write_files(&owner, &id, FILES..FILES + 1);
+  let after = live_line(&owner, "shipping", &id);
+  // The owner dies whole: its anchor stopped first, so the daemon's death starts no replacement.
+  let owner_daemon = daemon_pid(&owner);
+  signal(&fleet.daemons[owner_index], rustix::process::Signal::STOP);
+  signal_pid(&owner_daemon, "-KILL");
+  drop(fleet.daemons.remove(owner_index));
+  let survivors: Vec<String> = fleet
+    .instances
+    .iter()
+    .filter(|instance| **instance != owner)
+    .cloned()
+    .collect();
+  let refs: Vec<&String> = survivors.iter().collect();
+  let (successor, took) = wait_served_whole(&refs, &id, FILES + 1);
+  let counters: Vec<_> = survivors
+    .iter()
+    .map(|survivor| (survivor.clone(), live_counters(survivor)))
+    .collect();
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  eprintln!(
+    "live owner restart: the owner's log before its restart {before:?}, after its write {after:?} (answered in \
+     {after_restart:?}); served whole by {successor} after {took:?}; {counters:?}"
+  );
+  let (before_head, after_head) = (
+    head_position(before.as_ref()),
+    head_position(after.as_ref()),
+  );
+  assert!(
+    matches!((before_head, after_head), (Some(before), Some(after)) if after > before),
+    "the restarted owner's log went on past its head before the restart: {before:?} then {after:?}"
+  );
+}
+
 // ── Every transport's durability claim on a live volume (A-200, AC-8.3): FUSE `fsync` and the NFS stable write and
 // `COMMIT` wait above; each other transport whose reply tells its client the data is durable is held to the same rule
 // here. With both candidates' processes stopped, the claim fails (an errno, a refusal), never succeeds; healthy and once

@@ -6,7 +6,7 @@ use std::fmt;
 use slates_anchor::AnchorError;
 use slates_db::DbError;
 use slates_ipc::IpcError;
-use slates_ipc::protocol::{DatabaseRefusal, Refusal, VolumeRefusal};
+use slates_ipc::protocol::{DatabaseRefusal, Refusal, TargetRefusal, VolumeRefusal};
 use slates_mem::MemError;
 use slates_rt::RtError;
 use slates_vfs::error::VfsError;
@@ -120,6 +120,8 @@ pub fn refusal_of_vfs(e: &VfsError) -> Refusal {
       existing: slates_ipc::protocol::VolumeId::default(),
     },
     VfsError::NoSpace => Refusal::NoSpace,
+    // A snapshot's retention, typed apart from the quota (§4.2 `RetentionBudgetExceeded`; until 2026-11-18 `NoSpace`).
+    VfsError::RetentionExceeded => volume(VolumeRefusal::RetentionExceeded),
     VfsError::RecoveryIncomplete | VfsError::Integrity => Refusal::ContentUnavailable,
     // The wire's taxonomy names one kind for a name the volume will not take, whatever the reason.
     VfsError::InvalidName | VfsError::NameTooLong => Refusal::InvalidName,
@@ -255,6 +257,41 @@ pub fn refusal_of_db(e: &DbError) -> Refusal {
 /// A database refusal no other variant names, typed (A-299).
 fn database(refusal: DatabaseRefusal) -> Refusal {
   Refusal::Database { refusal }
+}
+
+/// The wire refusal for a target the verb cannot use (§4.15 step 4, §4.6), typed (A-299): until 2026-11-18 each was
+/// `TargetUnavailable` carrying words.
+pub fn target(refusal: TargetRefusal) -> Refusal {
+  Refusal::Target { refusal }
+}
+
+/// A host's refusal of a target path (a landing's directory, a mount point), typed.
+pub fn target_of_host(e: &slates_vfs::host::HostError) -> TargetRefusal {
+  use slates_vfs::host::HostError as H;
+  match e {
+    H::NotFound => TargetRefusal::Missing,
+    H::NotDirectory => TargetRefusal::NotDirectory,
+    H::NotFile => TargetRefusal::NotFile,
+    H::StaleHandle => TargetRefusal::Stale,
+    H::Unavailable(errno) | H::OwnMount(errno) => TargetRefusal::Host { errno: *errno },
+  }
+}
+
+/// Why a mount was not recorded as this daemon's own (A-227), typed.
+#[cfg(unix)]
+pub fn target_of_unrecorded(why: slates_base::own_mounts::Unrecorded) -> TargetRefusal {
+  use slates_base::own_mounts::Unrecorded;
+  match why {
+    Unrecorded::NotMounted => TargetRefusal::NotMounted,
+    Unrecorded::Full(full) => records_full(full),
+  }
+}
+
+/// The refusal of a mount past the most this daemon records as its own (A-227).
+pub fn records_full(full: slates_base::own_mounts::Full) -> TargetRefusal {
+  TargetRefusal::RecordsFull {
+    capacity: u64::try_from(full.capacity).unwrap_or(u64::MAX),
+  }
 }
 
 #[cfg(test)]
