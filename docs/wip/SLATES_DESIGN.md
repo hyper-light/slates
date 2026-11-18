@@ -6933,6 +6933,11 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   receive loop at its first probe of a peer still starting (3 of 4 starts never formed). The fix that landed is
 >   liveness's (00c4add1, first pushed as d8a8d859: every Windows datagram socket, an adopted one too, made with
 >   `SIO_UDP_CONNRESET` and `SIO_UDP_NETRESET` off); the WinFsp flow needs it to form its fleet.
+> - *A publication that owed a whole record before the fleet knew the volume* (2026-11-18, g227): every claim above waits
+>   for the position `live_ship::durable_target` names, and while the volume's head was unplaced it named the head as
+>   it stood, ignoring a whole record owed for a publication that could not become an entry (the credit full with the
+>   candidates stopped). With nothing shipped yet a claim waited for nothing; with a head it waited one position short of
+>   the record holding its write. The owed record now counts placed or not (`owed_position`, unit-tested red first).
 > - *Landings* need no wait: a landing claims what it wrote to disk, which holds it; a takeover that loses the volume's
 >   undurable tail serves the disk's bytes through the base, and a later landing that would revert the disk is refused
 >   by the witness check.
@@ -7738,7 +7743,12 @@ it builds against the contract and adds to it rather than around it.
   a commit asserts the version it was written against and matches exhaustively, so at its next
   vendoring a moved contract is a failed assertion beside the compile errors of the matches it must
   extend — never a variant falling silently through a wildcard. The wire types the contract
-  re-exports grow append-only (D-15) and count as the contract's where it returns them.
+  re-exports grow append-only (D-15) and count as the contract's where it returns them. A
+  test, not review, holds the rule: `crates/ipc/tests/wire_order.rs` compares every wire enum of
+  the protocol with its published tags (`tests/wire_order.txt`). A variant appended is published
+  in its change by the test's `--ignored` writer, which refuses to publish a moved tag. Anything
+  else fails, naming the enum and the first tag that moved (since 2026-11-18, after
+  `SubmitApproved` moved from 69 to 71; it stays at 71).
 - *Laptop and fleet (R8).* One contract and one code path: the same calls, outcomes and errors on a
   laptop instance and on a fleet node; a fleet's own refusals (`Elsewhere`, `Retry` for an owner
   not confirmed) are variants a laptop never sends.

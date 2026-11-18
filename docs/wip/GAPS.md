@@ -1,5 +1,14 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Partly closed (g262, 2026-11-18): the protocol's wire enums are held to their published tags by a test.**
+> `crates/ipc/tests/wire_order.rs` reads each wire enum's schema, which names its variants in tag order, and compares
+> it with `tests/wire_order.txt`: 43 enums, 410 tags. A second test fails when the protocol's source derives `Wire`
+> for an enum it does not hold. An append is published in its change by the `--ignored` writer
+> (`publish_appended_variants`), which refuses while any published tag moved. `SubmitApproved` stays at 71: moving it
+> back would be a second move, and builds since 04d7ea465 speak 71. Still owed, from the entry below:
+> - the records' enums held the same way: `crates/db`'s 17 wire enums, with the same test over their schemas;
+> - the completion record framed with its reply's schema hash (the log's owner).
+
 > **Open (g267, 2026-11-18): the wire's append-only rule (D-15) is kept by review alone, and a persisted reply is read
 > outside every schema check.** A variant's wire tag is its index in its enum (`crates/wire-derive/src/lib.rs`,
 > `expand_enum`). 04d7ea465 (A-285) inserted `RequestBody::SubmitHeld` and `EditSubmitHeld` before `SubmitApproved`, so
@@ -3213,7 +3222,14 @@
 > answered `0` in under 1 ms) and a WinFsp flush (error after 1.001–1.028 s, where it succeeded in 995 µs; a volume
 > flush now publishes at all) wait too (§4.10 status "Every other durability claim"). Open (live-durability): one x86_64
 > virtio-fs run of 19 answered a stopped `FSYNC` `0` after 1.000358 s, unexplained; that run printed no log line, and
-> the 16 runs since, which print the owner's log and the hold's counters at that point, never repeated it. Open
+> the 16 runs since, which print the owner's log and the hold's counters at that point, never repeated it. Fixed (g227, 2026-11-18): the position every transport's claim waits for (`live_ship::durable_target`) ignored a
+record the volume owed while the fleet did not yet know it (its head unplaced). A publication that could not become an
+entry (the credit full with the candidates stopped) owes a whole record at the head's next position, but the unplaced
+case returned the head as it stood: with nothing shipped yet the reply waited for nothing, and with a head it waited one
+position short, so once the head was placed the claim was answered while the write it named was only in the record
+still owed. The decision is now one pure function (`owed_position`), the owed record counted placed or not; its unit
+test (`a_reply_whose_publication_owes_a_whole_record_waits_for_that_record_placed_or_not`) was red first. Whether this
+was the stopped `FSYNC` answered `0` above is not shown: that run printed no log line. Open
 > (live-fixes): a Windows fleet did not re-form after an anchor succeeded a suspended candidate under a fresh identity.
 > Measured in the daemon (release, BENCHMARKS "What live shipping adds to a stable NFS write"): a live 4 KiB `FILE_SYNC`
 > write costs 90–114 µs more than a plain one at the median, p99 217–398 µs, p999 0.44–1.27 ms, worst 0.47–1.87 ms at
