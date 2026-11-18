@@ -1,0 +1,142 @@
+Build started 11/18/2026 3:40:42 PM.
+Logging verbosity is set to: Normal.
+Project "D:\a\_temp\winfsp\build\VStudio\winfsp.sln" on node 1 (winfsp_sys target(s)).
+ValidateSolutionConfiguration:
+  Building solution configuration "Release|x64".
+ValidateProjects:
+  The project "winfsp_msi" is not selected for building in solution configuration "Release|x64".
+  The project "CustomActions" is not selected for building in solution configuration "Release|x64".
+Project "D:\a\_temp\winfsp\build\VStudio\winfsp.sln" (1) is building "D:\a\_temp\winfsp\build\VStudio\winfsp_sys.vcxproj" (2) on node 1 (default targets).
+DriverBuildNotifications:
+  Building 'winfsp.sys' with toolset 'WindowsKernelModeDriver10.0' and the 'Desktop' target platform.
+  Using KMDF 1.15.
+PrepareForBuild:
+  Creating directory "D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\".
+  Structured output is enabled. The formatting of compiler diagnostics will reflect the error hierarchy. See https://aka.ms/cpp/structured-output for more details.
+  Creating directory "D:\a\_temp\winfsp\build\VStudio\build\Release\".
+  Creating directory "D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\winfsp.sys.tlog\".
+InitializeBuildStatus:
+  Creating "D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\winfsp.sys.tlog\unsuccessfulbuild" because "AlwaysCreate" was specified.
+  Touching "D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\winfsp.sys.tlog\unsuccessfulbuild".
+CustomBuild:
+  Writing driver-x64.inf
+  Stamping D:\a\_temp\winfsp\build\VStudio\build\Release\driver-x64.inf
+  Stamping [Version] section with DriverVer=11/18/2026,2.1.26322.0
+ClCompile:
+  C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207\bin\HostX86\x64\CL.exe /c /I..\..\src /I..\..\opt\fsext\inc /I..\..\inc /ID:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\ /Zi /nologo /W4 /WX /diagnostics:column /Ox /Os /Oy- /D _WIN64 /D _AMD64_ /D AMD64 /D _WIN64 /D _AMD64_ /D AMD64 /D _WIN32_WINNT=0x0A00 /D WINVER=0x0A00 /D WINNT=1 /D NTDDI_VERSION=0xA000010 /D NTDDI_VERSION=0x0A000006 /D _WIN32_WINNT=0x0A00 /D MyProductName=WinFsp /D MyProductFileName=winfsp /D "MyDescription=Windows File System Proxy" /D "MyCompanyName=Navimatics LLC" /D "MyCopyright=2015-2026 Bill Zissimopoulos" /D MyProductVersion=2025 /D MyProductStage=Gold /D MyVersion=2.1.26322 /D "MyVersionWithCommas=2,1,26322,0" /D MyFullVersion=2.1.26322.490e7db /D "MyFspFsctlDeviceClassGuid={ 0x6f9d25fa, 0x6dee, 0x4a9d, { 0x80, 0xf5, 0xe9, 0x8e, 0x14, 0xf3, 0x5e, 0x54 } }" /D "MyFspFsvrtDeviceClassGuid={ 0xb48171c3, 0xdd50, 0x4852, { 0x83, 0xa3, 0x34, 0x4c, 0x50, 0xd9, 0x3b, 0x17 } }" /D "MyFsctlRegisterPath=\".\"" /D "MyNpRegisterPath=\".\"" /D "MyEventLogRegisterPath=\".\"" /GF /Gm- /Zp8 /GS /guard:cf /Gy /fp:precise /Qspectre /Zc:wchar_t- /Zc:forScope /Zc:inline /GR- /Fo"D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\\" /Fd"D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\vc143.pdb" /external:W4 /Gz /wd4603 /wd4627 /wd4986 /wd4987 /wd4996 /FI"C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\warning.h" /FC /errorReport:queue /kernel -cbstring -d2epilogunwind  /d1nodatetime /d1import_no_registry /d2AllowCompatibleILVersions /d2Zi+ ..\..\src\shared\ku\mountmgr.c ..\..\src\shared\ku\posix.c ..\..\src\shared\ku\uuid5.c ..\..\src\sys\cleanup.c ..\..\src\sys\close.c ..\..\src\sys\create.c ..\..\src\sys\debug.c ..\..\src\sys\devctl.c ..\..\src\sys\device.c ..\..\src\sys\dirctl.c ..\..\src\sys\driver.c ..\..\src\sys\ea.c ..\..\src\sys\callbacks.c ..\..\src\sys\file.c ..\..\src\sys\fileinfo.c ..\..\src\sys\flush.c ..\..\src\sys\fsctl.c ..\..\src\sys\fsext.c ..\..\src\sys\iop.c ..\..\src\sys\ioq.c ..\..\src\sys\devtimer.c ..\..\src\sys\lockctl.c ..\..\src\sys\meta.c ..\..\src\sys\mountdev.c ..\..\src\sys\mup.c ..\..\src\sys\name.c ..\..\src\sys\psbuffer.c ..\..\src\sys\read.c ..\..\src\sys\security.c ..\..\src\sys\shutdown.c ..\..\src\sys\silo.c ..\..\src\sys\statistics.c ..\..\src\sys\sxs.c ..\..\src\sys\trace.c ..\..\src\sys\util.c ..\..\src\sys\volinfo.c ..\..\src\sys\volume.c ..\..\src\sys\wq.c ..\..\src\sys\write.c
+  mountmgr.c
+  posix.c
+  uuid5.c
+  cleanup.c
+  close.c
+  create.c
+  debug.c
+  devctl.c
+  device.c
+  dirctl.c
+  driver.c
+  ea.c
+  callbacks.c
+  file.c
+  fileinfo.c
+  flush.c
+  fsctl.c
+  fsext.c
+  iop.c
+  ioq.c
+  Generating Code...
+  Compiling...
+  devtimer.c
+  lockctl.c
+  meta.c
+  mountdev.c
+  mup.c
+  name.c
+  psbuffer.c
+  read.c
+  security.c
+  shutdown.c
+  silo.c
+  statistics.c
+  sxs.c
+  trace.c
+  util.c
+  volinfo.c
+  volume.c
+  wq.c
+  write.c
+  Generating Code...
+ResourceCompile:
+  C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x86\rc.exe /D _WIN64 /D _AMD64_=1 /D AMD64 /D _WIN64 /D _AMD64_=1 /D AMD64 /D _WIN32_WINNT=0x0A00 /D WINVER=0x0A00 /D WINNT=1 /D NTDDI_VERSION=0xA000010 /D "SMP_ID=\\\"{dd38f7fc-d7bd-488b-9242-7d8754cde80d}\\\"" /D MyProductName=WinFsp /D MyProductFileName=winfsp /D "MyDescription=Windows File System Proxy" /D "MyCompanyName=Navimatics LLC" /D "MyCopyright=2015-2026 Bill Zissimopoulos" /D MyProductVersion=2025 /D MyProductStage=Gold /D MyVersion=2.1.26322 /D "MyVersionWithCommas=2,1,26322,0" /D MyFullVersion=2.1.26322.490e7db /D "MyFspFsctlDeviceClassGuid={ 0x6f9d25fa, 0x6dee, 0x4a9d, { 0x80, 0xf5, 0xe9, 0x8e, 0x14, 0xf3, 0x5e, 0x54 } }" /D "MyFspFsvrtDeviceClassGuid={ 0xb48171c3, 0xdd50, 0x4852, { 0x83, 0xa3, 0x34, 0x4c, 0x50, 0xd9, 0x3b, 0x17 } }" /D "MyFsctlRegisterPath=\".\"" /D "MyNpRegisterPath=\".\"" /D "MyEventLogRegisterPath=\".\"" /l"0x0409" /I"C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um" /ID:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\ /I"C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207\atlmfc\include" /nologo /fo"D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\version.res" ..\..\src\sys\version.rc 
+Link:
+  C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207\bin\HostX86\x64\link.exe /ERRORREPORT:QUEUE /OUT:"D:\a\_temp\winfsp\build\VStudio\build\Release\winfsp-x64.sys" /VERSION:"10.0" /INCREMENTAL:NO /NOLOGO /WX /SECTION:"INIT,d" cng.lib wdmsec.lib \BufferOverflowK.lib "C:\Program Files (x86)\Windows Kits\10\lib\10.0.26100.0\km\x64\ntoskrnl.lib" "C:\Program Files (x86)\Windows Kits\10\lib\10.0.26100.0\km\x64\hal.lib" "C:\Program Files (x86)\Windows Kits\10\lib\10.0.26100.0\km\x64\wmilib.lib" /NODEFAULTLIB /MANIFEST:NO /DEBUG /PDB:"D:\a\_temp\winfsp\build\VStudio\build\Release\winfsp-x64.sys.pdb" /PDBSTRIPPED:"D:\a\_temp\winfsp\build\VStudio\build\Release\winfsp-x64.sys.public.pdb" /MAP:"D:\a\_temp\winfsp\build\VStudio\build\Release\winfsp-x64.sys.map" /SUBSYSTEM:NATIVE,"10.00" /Driver /OPT:REF /OPT:ICF /ENTRY:"GsDriverEntry" /RELEASE /IMPLIB:"D:\a\_temp\winfsp\build\VStudio\build\Release\winfsp-x64.sys.lib" /MERGE:"_TEXT=.text;_PAGE=PAGE" /MACHINE:X64 /PROFILE /guard:cf /PDBALTPATH:winfsp-x64.sys.pdb /kernel /IGNORE:4198,4010,4037,4039,4065,4070,4078,4087,4089,4221,4108,4088,4218,4218,4235 /osversion:10.0 /pdbcompress /debugtype:pdata D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\version.res
+  D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\mountmgr.obj
+  D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\posix.obj
+  D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\uuid5.obj
+  D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\cleanup.obj
+  D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\close.obj
+  D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\create.obj
+  D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\debug.obj
+  D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\devctl.obj
+  D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\device.obj
+  D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\dirctl.obj
+  D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\driver.obj
+  D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\ea.obj
+  D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\callbacks.obj
+  D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\file.obj
+  D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\fileinfo.obj
+  D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\flush.obj
+  D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\fsctl.obj
+  D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\fsext.obj
+  D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\iop.obj
+  D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\ioq.obj
+  D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\devtimer.obj
+  D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\lockctl.obj
+  D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\meta.obj
+  D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\mountdev.obj
+  D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\mup.obj
+  D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\name.obj
+  D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\psbuffer.obj
+  D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\read.obj
+  D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\security.obj
+  D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\shutdown.obj
+  D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\silo.obj
+  D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\statistics.obj
+  D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\sxs.obj
+  D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\trace.obj
+  D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\util.obj
+  D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\volinfo.obj
+  D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\volume.obj
+  D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\wq.obj
+  D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\write.obj
+     Creating library D:\a\_temp\winfsp\build\VStudio\build\Release\winfsp-x64.sys.lib and object D:\a\_temp\winfsp\build\VStudio\build\Release\winfsp-x64.sys.exp
+  winfsp_sys.vcxproj -> D:\a\_temp\winfsp\build\VStudio\build\Release\winfsp-x64.sys
+DriverPackageTarget:
+  Packaging up the following projects for the following configurations:
+  
+   Configuration='' Platform=''
+  
+  
+  The following files will be packaged:
+  
+  File to package:      D:\a\_temp\winfsp\build\VStudio\build\Release\winfsp-x64.sys.
+  Location in Package:  \winfsp-x64.sys.
+  Requested by project: 
+  
+  
+  Creating directory "D:\a\_temp\winfsp\build\VStudio\build\Release\winfsp.sys".
+  Copying file from "D:\a\_temp\winfsp\build\VStudio\build\Release\winfsp-x64.sys" to "D:\a\_temp\winfsp\build\VStudio\build\Release\winfsp.sys\winfsp-x64.sys".
+DrvCat:
+  DrvCat task was skipped as there was no catalog file to process
+  
+FinalizeBuildStatus:
+  Deleting file "D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\winfsp.sys.tlog\unsuccessfulbuild".
+  Touching "D:\a\_temp\winfsp\build\VStudio\build\winfsp.sys.build\Release\x64\winfsp.sys.tlog\winfsp.sys.lastbuildstate".
+Done Building Project "D:\a\_temp\winfsp\build\VStudio\winfsp_sys.vcxproj" (default targets).
+Done Building Project "D:\a\_temp\winfsp\build\VStudio\winfsp.sln" (winfsp_sys target(s)).
+
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+
+Time Elapsed 00:00:18.50

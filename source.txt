@@ -1,0 +1,6 @@
+490e7db sys: volinfo: FILE_SUPPORTS_HARD_LINKS for a volume that declares HardLinks
+96bdc64 sys: FileLinkInformation: forward hard links to a file system that declares VolumeParams.HardLinks
+ddca7bd sys: driver.inf: PnpLockdown=1
+        <MyTargetPlatformVersion>10.0.26100.0</MyTargetPlatformVersion>
+        <MyNtddiVersion>0x0A000006</MyNtddiVersion>
+        <MyWin32Version>0x0A00</MyWin32Version>
