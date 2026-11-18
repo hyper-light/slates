@@ -1,0 +1,59 @@
+# DIAG (not for main): goals 88 and 90's Windows-only run requests on main -- g268's A-402 (a Windows Shards stream's
+# acknowledged write outlives its daemon through the write log; red half on 5661d23d4, the commit before A-402), and
+# g262's completion bridge (ipc completion/endpoint units) and the Node SDK's parked synchronous call beside the async
+# completion signal, on windows-latest and windows-11-arm.
+name: diag-supervisor-win-8890
+on:
+  push:
+    branches: ['diag-supervisor-win-8890-*']
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  green:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: A-402 stream write log (g268)
+        if: always()
+        shell: bash
+        run: cargo test --locked -p slates-server --test stream_write_log -- --nocapture
+      - name: completion bridge units (g262)
+        if: always()
+        shell: bash
+        run: cargo test --locked -p slates-ipc --lib -- completion endpoint
+      - name: Node SDK, a parked synchronous call beside the async signal (g262)
+        if: always()
+        shell: bash
+        run: |
+          cargo build --locked -p slates-cli -p slates-sdk-node
+          cp target/debug/slates_sdk_node.dll target/debug/slates_sdk_node.node
+          SLATES_NODE_ADDON="$PWD/target/debug/slates_sdk_node.node" SLATES_DAEMON="$PWD/target/debug/slates.exe" node --test crates/sdk-node/tests/sdk.test.mjs
+  a402-red:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 5661d23d4
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: A-402's test on the commit before it (must fail at "the acknowledged write outlived the daemon")
+        shell: bash
+        run: |
+          git show --stat --oneline -1 | head -3
+          if [ -f crates/server/tests/stream_write_log.rs ]; then cargo test --locked -p slates-server --test stream_write_log -- --nocapture; else echo "no stream_write_log test at 5661d23d4: the red half needs the test file carried over"; exit 3; fi
