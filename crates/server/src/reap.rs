@@ -94,11 +94,11 @@ fn begin(state: &mut ShardState, silence_ns: u64) -> Vec<(Handle<ClientSlot>, u3
 /// its file only through the attachment it was made under, so they are written back first (A-186), a store to a shared
 /// map outliving its process; and the copies are let go once the attachments are gone.
 ///
-/// Each call waits in its shard's own time (A-432; R3's class A, A-65): a window of `budget_ns`, then on while the shard
-/// works or waits for a CPU, until it has run `budget_ns` of CPU (held to this build), so a shard alive and busy (a long
-/// write-back, a starved thread) is waited for, and only one that stopped, or ran its budget without answering, defers
-/// the reap `Overloaded`, which the next sweep retries rather than removing an attachment its stores still need. Each
-/// waited one window on the wall, so a busy owner deferred every reap that met it and the next sweep sent the same
+/// Each call waits in its shard's own time (A-432; R3's class A, A-65): a window of `budget_ns`, then on while the
+/// shard works or waits for a CPU, until it has run `budget_ns` of CPU (held to this build), so a shard alive and busy
+/// (a long write-back, a starved thread) is waited for, and only one that stopped, or ran its budget without answering,
+/// defers the reap `Overloaded`, which the next sweep retries rather than removing an attachment its stores still need.
+/// Each waited one window on the wall, so a busy owner deferred every reap that met it and the next sweep sent the same
 /// write-back again beside the first.
 async fn remove_on_owners(
   origin: u16,

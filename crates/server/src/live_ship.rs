@@ -3578,9 +3578,9 @@ const LIVE_REACHED_UNWALKED: &str = "fleet.live.reached_unwalked";
 async fn send_from_control(origin: u16, control: u16, sends: Vec<Send>) {
   let budget = crate::fleet::live_budget();
   let deadline = budget.max_deadline_ns().saturating_mul(2);
-  // A wall bound, by its reason (A-432): the dispatch's lanes are exchanges with remote holders, each bounded on the wall
-  // by the live budget (class B's), and nothing reads this wait's answer. It bounds how long the owner shard's task that
-  // sent the dispatch stays: a lane is taken free again at the same bound ([`lane_expiry_ns`]), so a wait on in the
+  // A wall bound, by its reason (A-432): the dispatch's lanes are exchanges with remote holders, each bounded on the
+  // wall by the live budget (class B's), and nothing reads this wait's answer. It bounds how long the owner shard's task
+  // that sent the dispatch stays: a lane is taken free again at the same bound ([`lane_expiry_ns`]), so a wait on in the
   // control shard's time would let a starved control shard gather one such task a lane every bound.
   let _ = crate::xshard::task_within(
     origin,
