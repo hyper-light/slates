@@ -28,6 +28,13 @@
 //! list, a read, a landing's entries), the landings and merges, and the serving verbs (descriptors passed beside the
 //! reply) stay on [`Instance`]. [`AsyncInstance::into_instance`] gives the instance back for them, and
 //! [`AsyncInstance::new`] takes it again.
+//!
+//! **Handing back stops the signal.** On macOS the completion signal is a bridge thread parked on the wake word the
+//! daemon raises on a reply to a parked client, and on Windows on the named Event; a parked synchronous call waits on
+//! the same one. The daemon wakes one waiter per reply, so with the bridge still running the wake went to whichever the
+//! kernel picked, and a parked synchronous call slept to its reply deadline: 16 to 19 of 20 calls, each up to 2.0 s,
+//! on the Mac Studio (2026-11-18; `docs/bugs/2026-11-18-the-async-signal-took-the-synchronous-forms-wakes.md`). So
+//! [`AsyncInstance::into_instance`] stops the bridge and closes its descriptor before it hands the instance back.
 
 use std::future::Future;
 use std::pin::Pin;
