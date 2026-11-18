@@ -33080,5 +33080,10 @@ Unix sibling built); and:
   `handles.rs` (a test past the complexity bound, a constant assertion, a string sliced by index, and
   `WHAT_SHARDS_DAX`'s `Format:` line out of the literal check's four-line reach); the same kinds in this change's
   siblings (`held.rs`'s and `held_windows.rs`'s tests, `tests/handles_windows.rs`'s `full_role`, the server's stand-in
-  anchor script and the Windows serve loop, whose anchor waits now share one call). `held_turn.rs`'s `1_u64`, which the
-  literal check reads as `1_`, main fixed meanwhile with its `Derived:` line (`cf61d54e4`), so this landing leaves it.
+  anchor script and the Windows serve loop, whose anchor waits now share one call). In that loop a wake for a session
+  changed outside the stream's task no longer tells the anchor on its own: it takes a turn, and the turn tells it
+  (`Turned::Session`, as a turn owing a session already did), after any durability or change notice owed and
+  before any reply goes out, so the rule that the anchor learns a session before a reply depends on it holds unchanged;
+  a turn that owes a refill sends nothing, and a later turn tells it. `held_turn.rs`'s `1_u64`,
+  which the literal check reads as `1_`, main fixed meanwhile with its `Derived:` line (`cf61d54e4`), so this landing
+  leaves it.
