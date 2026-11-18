@@ -127,10 +127,12 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// same day). 10: a volume's loss window, `VolumeStatus::loss` (`LossReport`, `VolumeTakeover`; AC-8.3): what an owner
 /// loss would lose now, the newest seal placed on another host, and on a successor the takeover that made it the owner
 /// (the same day). 11: `DaemonReport::recovered`, the anchor's verdict that the daemon has served as long as its start
-/// took, so its exit is no failed start (A-311) (the same day).
+/// took, so its exit is no failed start (A-311) (the same day). 12: `ShardsStream::resync`, the device's end of a Shards
+/// stream's resync channel, which `serve_shards` hands beside the stream's where the daemon makes one (Linux), none
+/// elsewhere and from the simulator (A-316; the same day).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 11;
+pub const CONTRACT: u32 = 12;
 
 /// The typed client and its own types, for the verbs [`Instance::client`] lends outside the contract.
 pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, VhostUserDevice};
