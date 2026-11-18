@@ -466,6 +466,10 @@
 >   quantum slices (each one turn, about 0.1 s at 300 MB), the first publication's whole entry (the item above), a
 >   sealed volume's restore, and the plain (unlogged) takeover's restore and population, still one owner-shard turn
 >   behind a call whose deadline is a period (g232's kernel base volume: 97,254 files, 1.99 GB, seconds of one poll).
+>   **The restore's steps exist (A-391, g251, 2026-11-18):** `slates_archive::Planning`, `Planned::restoring` and
+>   `Restoring` make a restore a piece at a time (no piece past one chunk's bytes but a merge onto a file's growing
+>   piece); the server still calls the one-call `restore` until the population in steps and the plain takeover path's
+>   owner-shard task follow (g251's next change).
 >   - **Measured (2026-11-18):** g251's trace of the nemesis spin kills found a taken-over volume's first publication
 >     (`fleet::published_before_served` -> `live_ship::published`, its whole entry) at 1.06 s in one turn; the
 >     measurer's 32-writer run (128 MiB, diag-measurer-7) lost a daemon to the watchdog in 3 of 8 runs at 1,000-1,002 ms
