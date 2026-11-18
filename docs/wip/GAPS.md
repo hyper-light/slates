@@ -15606,6 +15606,15 @@ suite on adacachy2 and 1 of 3 of the stack's (the supervisor's gate); alone it p
   owner's chain, 2 of 2, and the nine green takeover tests beside it 10 of 10 (macOS arm64, load 32-60). The share
   test's rerun under diag-clients-green-1's load is owed to the supervisor's lanes.
   `docs/bugs/2026-11-18-a-successor-one-version-behind-never-received-the-adopted-versions-inputs.md`.
+- **Sibling, fixed 2026-11-18: a panic on the rebuilt green's role.** `verbs::materialize_taken_over_green` checked with
+  a `debug_assert!` that the id it rebuilds names a green, the last `debug_assert!` in any crate's sources (CLAUDE.md §2
+  item 6): a debug build's shard panicked on a volume of another role under the id, and a release build went on to
+  replay the green's chain against that volume's record. It is refused typed now, `AlreadyExists` naming the id, so the
+  takeover counts it and gives the green up at its bound, naming `refused`. Red first:
+  `a_taken_over_green_whose_id_names_a_plain_volume_is_refused_typed` (`crates/server/src/verbs.rs`): with the `debug_assert!` put back in a scratch copy
+  the shard panicked ("assertion failed: matches!(crate::merge_service::merge_role(state, id), Some(MergeRole::Green {
+  .. }))") and the test failed; with the refusal it answers `AlreadyExists` and the plain volume stays plain and served
+  (`slates-server --lib` 266 of 266, macOS arm64, 2026-11-18).
 - **Open, the record half (GAP-A9-7):** a successor whose own records end two or more versions below the adopted one
   lacks the intermediate records themselves (phase one reports each holder's highest record only), which no fetch by
   identity can fill; it is still given up `chain` at the bound.
