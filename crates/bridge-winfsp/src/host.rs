@@ -44,6 +44,7 @@ use std::os::windows::io::{
 };
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::task::Waker;
+use std::time::Instant;
 
 use slates_bridge_core::{Bridge, NodeAttr, ObjectId, OpContext, RenameFlags, SetAttr};
 use slates_vfs::error::VfsError;
@@ -64,6 +65,8 @@ use crate::held::{
 use crate::notify::OpenNames;
 use crate::opens::{Ledger, Open, RESTORED_HANDLE};
 use crate::purge::{Purge, PurgeOutcome};
+use crate::reply::Stamped;
+use crate::spin_choice::ReplyKind;
 use crate::{STATUS_SUCCESS, file_attributes, filetime_from_unix_ns, listed, ntstatus};
 use slates_mem::SparseObject;
 
@@ -345,6 +348,39 @@ enum Op<T> {
 }
 
 impl<T> Op<T> {
+  /// The kind of reply the request waits for, for the receive worker's choice between spinning and parking at once
+  /// (`crate::spin_choice`, audit step 7, cut (b)): one per variant, so a new request is given its own.
+  fn reply_kind(&self) -> ReplyKind {
+    match self {
+      Op::RenameName { .. } => ReplyKind::RenameName,
+      Op::Confirm { .. } => ReplyKind::Confirm,
+      Op::VolumeInfo => ReplyKind::VolumeInfo,
+      Op::Resolve { .. } => ReplyKind::Resolve,
+      Op::Open { .. } => ReplyKind::Open,
+      Op::PurgeResolve { .. } => ReplyKind::PurgeResolve,
+      Op::PurgeOpen { .. } => ReplyKind::PurgeOpen,
+      Op::Create { .. } => ReplyKind::Create,
+      Op::Read { .. } => ReplyKind::Read,
+      Op::Write { .. } => ReplyKind::Write,
+      Op::Info { .. } => ReplyKind::Info,
+      Op::ReadDir { .. } => ReplyKind::ReadDir,
+      Op::SetSize { .. } => ReplyKind::SetSize,
+      Op::Truncate { .. } => ReplyKind::Truncate,
+      Op::Rename { .. } => ReplyKind::Rename,
+      Op::SetAllocation { .. } => ReplyKind::SetAllocation,
+      Op::SetTimes { .. } => ReplyKind::SetTimes,
+      Op::CanDelete { .. } => ReplyKind::CanDelete,
+      Op::Flush { .. } => ReplyKind::Flush,
+      Op::FlushVolume => ReplyKind::FlushVolume,
+      Op::Cleanup { .. } => ReplyKind::Cleanup,
+      Op::Release { .. } => ReplyKind::Release,
+      Op::LinkByName { .. } => ReplyKind::LinkByName,
+      Op::LinkOf { .. } => ReplyKind::LinkOf,
+      Op::MakeLink { .. } => ReplyKind::MakeLink,
+      Op::UnmakeLink { .. } => ReplyKind::UnmakeLink,
+    }
+  }
+
   /// Whether the request changed what survives a restart, so the shard publishes before it answers (§4.8, D-18): a
   /// namespace or size change, an explicit flush, or the close of a handle that changed its file. A write alone does
   /// not: Windows' cache writes back lazily, and its handle's close or flush carries the barrier, as a FUSE close's
@@ -415,7 +451,7 @@ enum Reply {
 /// from the channel [`MountThread::start`] was given and serves it on the owner shard ([`Request::serve`]).
 pub struct Request {
   op: Op<u64>,
-  reply: SyncSender<Reply>,
+  reply: SyncSender<Stamped<Reply>>,
   hint: u64,
   /// Whether recovery is replaying this request from a dead daemon's journal (`crate::dispatcher`), so a Close the
   /// dead daemon already applied may be found done.
@@ -745,7 +781,7 @@ fn bind(op: Op<u64>, ledger: &Ledger<SparseObject>) -> Result<Op<Open>, crate::o
 /// A served request whose reply is still to be sent.
 pub struct Served {
   reply: Reply,
-  sender: SyncSender<Reply>,
+  sender: SyncSender<Stamped<Reply>>,
   barrier: bool,
   echo: bool,
   restored_read: bool,
@@ -784,9 +820,11 @@ impl Served {
     self.reply = Reply::Err(crate::status_unexpected_io_error());
   }
 
-  /// Sends the reply to the waiting dispatcher thread. `false` when that thread is gone (the mount is being torn down).
+  /// Sends the reply to the waiting dispatcher thread, stamped with the instant it was sent, so the waiting thread learns
+  /// how long it took whichever way it waited (`crate::spin_choice`). `false` when that thread is gone (the mount is being
+  /// torn down).
   pub fn send(self) -> bool {
-    self.sender.send(self.reply).is_ok()
+    self.sender.send(Stamped::now(self.reply)).is_ok()
   }
 }
 
@@ -1416,16 +1454,19 @@ impl Handler {
 }
 
 fn call_on(requests: &SyncSender<Request>, wake: &Waker, op: Op<u64>) -> Reply {
+  let kind = op.reply_kind();
+  let posted = Instant::now();
   let Some(answer) = post(requests, op) else {
     return Reply::Err(crate::status_unsuccessful());
   };
   wake.wake_by_ref();
-  crate::reply::await_reply(&answer).unwrap_or(Reply::Err(crate::status_unsuccessful()))
+  crate::reply::await_reply(kind, posted, &answer)
+    .unwrap_or(Reply::Err(crate::status_unsuccessful()))
 }
 
 /// Puts `op` on the mount's channel and answers where its reply will come, or `None` when the mount is gone. Nothing
 /// wakes the mount's task: the caller does, or a later request's wake carries it there (FIFO).
-fn post(requests: &SyncSender<Request>, op: Op<u64>) -> Option<Receiver<Reply>> {
+fn post(requests: &SyncSender<Request>, op: Op<u64>) -> Option<Receiver<Stamped<Reply>>> {
   let (reply, answer) = sync_channel(1);
   requests
     .send(Request {
@@ -1439,7 +1480,7 @@ fn post(requests: &SyncSender<Request>, op: Op<u64>) -> Option<Receiver<Reply>> 
 }
 
 /// A posted confirmation's answer, still to be taken ([`confirmed_open`]).
-pub(crate) struct Confirming(Receiver<Reply>);
+pub(crate) struct Confirming(Receiver<Stamped<Reply>>);
 
 /// Posts the confirmation that the driver accepted the open `context` names and wakes the mount's task, without waiting
 /// for it: the shard applies it while the receive worker acknowledges and receives, and the FIFO channel puts it ahead of
@@ -1464,10 +1505,12 @@ pub(crate) fn post_confirm(
 pub(crate) fn confirmed_open(confirming: &Confirming, wake: &Waker) -> Result<(), WinFspError> {
   let Confirming(answer) = confirming;
   let reply = match answer.try_recv() {
-    Ok(reply) => reply,
+    Ok(stamped) => stamped.value,
     Err(TryRecvError::Empty) => {
+      let waiting = Instant::now();
       wake.wake_by_ref();
-      crate::reply::await_reply(answer).map_err(|_| WinFspError::MountThread)?
+      crate::reply::await_reply(ReplyKind::Confirm, waiting, answer)
+        .map_err(|_| WinFspError::MountThread)?
     }
     Err(TryRecvError::Disconnected) => return Err(WinFspError::MountThread),
   };

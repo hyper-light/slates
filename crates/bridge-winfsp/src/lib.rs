@@ -66,6 +66,9 @@ mod purge_token;
 // How the receive thread waits for a shard's reply: spin for what a wake costs, then park (A-212).
 #[cfg(windows)]
 mod reply;
+// Which kinds of shard reply that thread spins for at all, chosen by each kind's own replies (audit step 7, cut (b)).
+// Pure, so it is tested on every host.
+pub mod spin_choice;
 // The purges Windows did not take, made again on a doubling wait until each takes or the volume's request timeout
 // passes (A-190 as amended 2026-11-01). Pure, so it is tested on every host.
 pub mod retry;
