@@ -1091,6 +1091,28 @@ fn staged(state: &ShardState, item: &AskItem) -> bool {
 
 /// One ask answered on the owner's shard.
 fn answer_on_owner(state: &mut ShardState, item: AskItem) -> Outcome {
+  let start = state.clock.monotonic_ns();
+  let span = state
+    .tracer
+    .open_unlinked(item.id, slates_wire::observe::Chokepoint::ShardOp, start);
+  let label = match &item.need {
+    Need::Files(_) => 2,
+    Need::Page { .. } => 3,
+    Need::Sizes => 4,
+    Need::Verdict { .. } => 5,
+    Need::Rebase { .. } => 6,
+    Need::Admit { .. } => 7,
+    Need::Route => 8,
+  };
+  let outer = state.current_span.replace(span.context());
+  let outcome = answer_on_owner_diag(state, item);
+  state.current_span = outer;
+  let end = state.clock.monotonic_ns();
+  crate::telemetry::emit(state, span.end(label, end));
+  outcome
+}
+
+fn answer_on_owner_diag(state: &mut ShardState, item: AskItem) -> Outcome {
   let AskItem {
     need,
     green,

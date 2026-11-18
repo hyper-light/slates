@@ -4269,7 +4269,10 @@ async fn init_shard(
   // The telemetry sink keeps the most recent spans up to one client ring's depth (§4.14): a shard
   // processes at most a ring of in-flight requests, so a ring's depth of recent spans covers the
   // current activity window; older spans are shed (and counted), telemetry being the shed-first class.
-  let telemetry_capacity = usize::try_from(config.region.slots).unwrap_or(1).max(1);
+  let telemetry_capacity = std::env::var("SLATES_DIAG_SPAN_CAPACITY")
+    .ok()
+    .and_then(|value| value.parse::<usize>().ok())
+    .unwrap_or_else(|| usize::try_from(config.region.slots).unwrap_or(1).max(1));
   // The grant-issuer secret this daemon minted at start (§4.13), read from the anchor's supervision block
   // before the segment moves into the state; every shard reads the same value, so a `Grant` verifies on
   // whichever shard serves the client.
