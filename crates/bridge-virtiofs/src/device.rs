@@ -1342,6 +1342,67 @@ impl Device {
     self.queues.get_mut(index).ok_or(DeviceError::NotConfigured)
   }
 
+  /// Dispatches a chain's gathered request: the bytes written into its reply, or none when a SETUPMAPPING was taken and
+  /// the chain is held while its window's backing is filled and its pieces mapped (no reply is scattered now; the turn,
+  /// and the message placer's acks, answer the guest). On Unix, FUSE_SETUPMAPPING / FUSE_REMOVEMAPPING go through the
+  /// DAX placer when the VMM offered one (§4.6); every other opcode, and these when no window is offered, are answered
+  /// by the FUSE codec's dispatch.
+  fn dispatch(
+    &mut self,
+    queue: u16,
+    chain: &DescriptorChain,
+    bridge: &mut dyn Bridge,
+    cx: &OpContext,
+  ) -> Option<usize> {
+    #[cfg(unix)]
+    {
+      match serve_dax(
+        &self.request,
+        bridge,
+        cx,
+        &mut self.dax_placer,
+        &mut self.backed,
+        &mut self.reply,
+      ) {
+        DaxServed::NotHandled => Some(self.writeback.serve(
+          &self.request,
+          bridge,
+          cx,
+          &mut self.reply,
+        )),
+        DaxServed::Replied(n) => Some(n),
+        DaxServed::MapHeld {
+          unique,
+          window,
+          sends,
+        } => {
+          self.backed.map = Some(crate::backed::HeldMap {
+            queue,
+            chain: chain.clone(),
+            unique,
+            window,
+            sends,
+            sent: false,
+            pieces_left: 0,
+            mapped: Vec::new(),
+            refused: false,
+          });
+          None
+        }
+      }
+    }
+    #[cfg(not(unix))]
+    {
+      // Only a held map names its queue and chain, and maps are Unix's (§4.6).
+      let _held_on = (queue, chain);
+      Some(
+        self
+          .writeback
+          .serve(&self.request, bridge, cx, &mut self.reply),
+      )
+    }
+  }
+
   /// Holds, unserved, a chain whose request asks for the guest's stores through its maps to reach the volume first,
   /// while they are written back ([`crate::backed`]): whether it was held. A chain already through its ingest (`fresh`
   /// false) is served, with how the ingest came out.
@@ -1419,50 +1480,10 @@ impl Device {
     let mut written = if room_short {
       0
     } else {
-      // On Unix, FUSE_SETUPMAPPING / FUSE_REMOVEMAPPING go through the DAX placer when the VMM offered one (§4.6);
-      // every other opcode — and these when no window is offered — are answered by the FUSE codec's dispatch.
-      #[cfg(unix)]
-      {
-        match serve_dax(
-          &self.request,
-          bridge,
-          cx,
-          &mut self.dax_placer,
-          &mut self.backed,
-          &mut self.reply,
-        ) {
-          DaxServed::NotHandled => self
-            .writeback
-            .serve(&self.request, bridge, cx, &mut self.reply),
-          DaxServed::Replied(n) => n,
-          // A SETUPMAPPING was taken: hold the chain while its window's backing is filled and its pieces mapped. No
-          // reply is scattered now; the turn (and the message placer's acks) answer the guest.
-          DaxServed::MapHeld {
-            unique,
-            window,
-            sends,
-          } => {
-            self.backed.map = Some(crate::backed::HeldMap {
-              queue,
-              chain: chain.clone(),
-              unique,
-              window,
-              sends,
-              sent: false,
-              pieces_left: 0,
-              mapped: Vec::new(),
-              refused: false,
-            });
-            return Ok(ChainOutcome::DaxMapHeld);
-          }
-        }
-      }
-      #[cfg(not(unix))]
-      {
-        self
-          .writeback
-          .serve(&self.request, bridge, cx, &mut self.reply)
-      }
+      let Some(written) = self.dispatch(queue, chain, bridge, cx) else {
+        return Ok(ChainOutcome::DaxMapHeld);
+      };
+      written
     };
     // A write-back the volume refused before this request is answered where its asker reads an answer, so a guest's
     // fsync or close fails rather than claim its stores durable (A-163's rule; a RELEASE's answer the kernel ignores,

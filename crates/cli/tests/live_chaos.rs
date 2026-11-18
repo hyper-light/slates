@@ -4900,7 +4900,7 @@ fn a_write_answered_the_instant_before_its_owner_dies_is_served_by_its_successor
 /// The barrier an iteration of the kill-at-acknowledgement flows writes its probe through: the client's `fs_write` and a
 /// userspace NFS `FILE_SYNC` write, in turn.
 fn barrier_of(iteration: usize) -> Barrier {
-  if iteration % 2 == 0 {
+  if iteration.is_multiple_of(2) {
     Barrier::ClientWrite
   } else {
     Barrier::NfsFileSync
