@@ -30,8 +30,8 @@ use slates_ipc::protocol::{
   HostAnswer, HostPathReason, Intent, IpcNodeKind, KernelCache, LandingDegradation, NamePolicy,
   OwnMountUse, PlannedAction, PolicySubject, Principal, ReadAt, ReadWritePolicy, RecoveryCause,
   Refusal, ReplyBody, RequestBody, Residency, Scope, SignatureFault, SignerKey, SizeClass,
-  SnapshotBoundary, TargetPathConstraint, UnsupportedReason, Verification, VolumeRefusal,
-  WatcherState, WorkOp, WriteAct, WriteMode,
+  SnapshotBoundary, TargetPathConstraint, TargetRefusal, UnsupportedReason, Verification,
+  VolumeRefusal, WatcherState, WorkOp, WriteAct, WriteMode,
 };
 use slates_wire::Wire;
 
@@ -77,6 +77,7 @@ fn schemas() -> Vec<&'static str> {
     <SignerKey as Wire>::SCHEMA,
     <SizeClass as Wire>::SCHEMA,
     <SnapshotBoundary as Wire>::SCHEMA,
+    <TargetRefusal as Wire>::SCHEMA,
     <TargetPathConstraint as Wire>::SCHEMA,
     <UnsupportedReason as Wire>::SCHEMA,
     <Verification as Wire>::SCHEMA,

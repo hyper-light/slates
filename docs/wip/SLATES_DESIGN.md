@@ -7936,6 +7936,13 @@ it builds against the contract and adds to it rather than around it.
 > `VolumeRefusal::RetentionExceeded`, and the contract classes it `Exhausted::Volume`. kiln's review had read the
 > shard's slab as its own quota (A-342's record). Proof: `a_snapshots_retention_refused_is_not_the_quota`
 > (`crates/api/tests/api.rs`, a daemon whose slab is capped small).
+> **`CONTRACT` = 19:** a target's refusal is typed. `Refusal::Target { refusal: TargetRefusal }` is appended, and the
+> daemon sends it where it sent `TargetUnavailable` with words: a landing target that is not absolute, escapes, is
+> missing, is another's or that the host refused; a mount point that is not a directory or is another user's; a
+> mount the kernel's table does not name or past the records the daemon keeps; a mount the OS refused (its errno
+> when it gave one); a WinFsp drive the anchor's hold did not answer, or whose detach already waits. The words go to
+> the daemon's log. The contract carries the reason as `HostFault::Target(TargetRefusal)` and renders it after the
+> daemon's `TargetUnavailable`. The superseded variant is a protocol fault, since no daemon of this build sends it.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
