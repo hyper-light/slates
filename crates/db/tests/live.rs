@@ -1750,6 +1750,53 @@ fn expect_a_whole_state_admitted_one_past_the_credit(shipper: &mut Shipper, whol
   admitted
 }
 
+/// A-371 (AC-8.9; A-200 amended): a whole state in flight rides one past the credit and never counts against the
+/// deltas behind it. Do: bound a shipper by a whole state of 64 KiB, append that whole state as the daemon does
+/// (`append_checkpoint`, then `mark_checkpoint` and the bounds set again from it), and with nothing acknowledged append
+/// 4 KiB deltas. Expect every delta whose bytes keep the deltas in flight within the credit admitted, as with no whole
+/// state in flight, the next refused `NoCredit`, no second whole state admitted while the first and the deltas are
+/// in flight, and the acknowledgement settling all of them. Before, the whole state's own bytes filled the credit, so
+/// every delta after a whole entry was refused until the whole was durable, and the daemon, owing a whole state for each
+/// refusal, shipped the volume whole again (the measurer's 32 writers on a 128 MiB volume: 1 whole record became 3).
+#[test]
+fn deltas_behind_a_whole_state_in_flight_are_admitted_within_the_credit() {
+  const WHOLE: usize = 64 << 10;
+  const DELTA: usize = 4 << 10;
+  let mut shipper = shipper_bounded_by_whole(WHOLE);
+  let whole = shipper.append_checkpoint(vec![7; WHOLE]).unwrap();
+  shipper.mark_checkpoint(whole.head());
+  shipper.set_bounds(Bounds::of_whole(whole.wire_bytes()));
+  let delta_bytes = Entry {
+    payload: vec![0; DELTA],
+    ..whole.clone()
+  }
+  .wire_bytes();
+  let admitted = whole.wire_bytes() / delta_bytes;
+  let mut appended = vec![whole];
+  for value in 0..admitted {
+    let payload = vec![u8::try_from(value % 256).unwrap(); DELTA];
+    appended.push(shipper.append(payload).unwrap_or_else(|refusal| {
+      panic!("delta {value} of {admitted} behind the whole state: {refusal:?}")
+    }));
+  }
+  assert_eq!(
+    shipper.append(vec![0; DELTA]),
+    Err(LiveError::NoCredit { durable: None }),
+    "the delta that would pass the credit waits"
+  );
+  assert!(
+    !shipper.admits_checkpoint(),
+    "no second whole state while the first and the deltas are in flight"
+  );
+  let held = held_after(HostId(1), &appended);
+  assert_eq!(shipper.on_reply(HostId(2), Ok(held)), Next::Nothing);
+  assert_eq!(
+    (shipper.in_flight(), shipper.in_flight_bytes()),
+    (0, 0),
+    "the acknowledgement settles the whole state and every delta"
+  );
+}
+
 /// AC-8.9: the credit counts what each entry costs. Do bound a shipper at three small entries' bytes and put one small
 /// entry in flight. Expect a second small entry admitted, an entry larger than what is left refused though only one
 /// is in flight, and, once nothing is in flight, that same large entry admitted whatever its size (the log never

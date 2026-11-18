@@ -173,25 +173,28 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// start a host waits on needs no wall-clock deadline of its own: [`StartSpec::until_served`] asks the anchor to stop when its daemons crash-loop before any of them has served, and
 /// [`Instance::wait_for`] with that anchor's child then ends [`StartFault::NeverServed`]; until then an anchor looped on
 /// such an instance for good (A-119), so a host bounded its wait by a second it picked, and a slow start under load
-/// outlasted it (kiln's 30 s at load 28, 2026-11-18; A-366). 24: the chosen-path launcher ([`exec`]): an [`ExecSpec`]
-/// whose [`AppArmor`] option, off unless the user opts in, lets the launcher make its namespace under slates' AppArmor
-/// profile where the host restricts unprivileged user namespaces; [`exec::command`] builds the command that runs it from a
-/// host's own executable, which [`role::main`] serves; [`exec::check`] answers the host's [`Readiness`]; its refusals
-/// are [`ExecFault`] (A-370; the same day).
+/// outlasted it (kiln's 30 s at load 28, 2026-11-18; A-366). 24: the daemon's status carries the failover delay as the
+/// node estimates it now (`DaemonReport::fleet`'s `failover`, a [`FailoverReport`]): detection, confirmation and
+/// recovery, each with the measurements behind it, summed; nothing sets it, it moves with what the node measures (A-363;
+/// the same day). 25: the chosen-path launcher ([`exec`]): an [`ExecSpec`] whose [`AppArmor`] option, off unless the
+/// user opts in, lets the launcher make its namespace under slates' AppArmor profile where the host restricts
+/// unprivileged user namespaces; [`exec::command`] builds the command that runs it from a host's own executable, which
+/// [`role::main`] serves; [`exec::check`] answers the host's [`Readiness`]; its refusals are [`ExecFault`] (A-370; the
+/// same day).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 24;
+pub const CONTRACT: u32 = 25;
 
 /// The typed client and its own types, for the verbs [`Instance::client`] lends outside the contract.
 pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, VhostUserDevice};
 /// The wire's types the contract takes and returns (§4.9; append-only, D-15).
 pub use slates_ipc::protocol::{
-  AttachTransport, ConflictClass, DaemonReport, DatabaseRefusal, Filter, GrantScope, GreenBase,
-  HostAnswer, HostPathReason, Intent, JournalReport, LandingDegradation, LandingDurability,
-  LossReport, MountReport, NamePolicy, OwnMountUse, PastTolerance, PlacedState, PlannedAction,
-  PlannedContent, PlannedEntry, Principal, ReadAt, RecoveryCause, Shortfall, SnapshotId,
-  TargetRefusal, TelemetryReport, TransportReport, UnsupportedReason, VolumeId, VolumeRefusal,
-  VolumeSummary, VolumeTakeover,
+  AttachTransport, ConflictClass, DaemonReport, DatabaseRefusal, FailoverReport, Filter,
+  GrantScope, GreenBase, HostAnswer, HostPathReason, Intent, JournalReport, LandingDegradation,
+  LandingDurability, LossReport, MountReport, NamePolicy, OwnMountUse, PastTolerance, PlacedState,
+  PlannedAction, PlannedContent, PlannedEntry, Principal, ReadAt, RecoveryCause, Shortfall,
+  SnapshotId, TargetRefusal, TelemetryReport, TransportReport, UnsupportedReason, VolumeId,
+  VolumeRefusal, VolumeSummary, VolumeTakeover,
 };
 /// The rendezvous's and the channel's own typed refusals the contract carries.
 pub use slates_ipc::{DeliveryFault, error::RouteRefusal};

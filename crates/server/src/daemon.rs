@@ -885,9 +885,19 @@ impl Daemon {
     let handed = crate::anchor_hold::adopt(config.held_device_bound());
     #[cfg(unix)]
     let mut inherited_devices = crate::fuse_hold::split(handed.devices, shards.len()).into_iter();
-    // The writable copies (A-197), each moved to the shard that holds its map: Linux alone sends the anchor one.
+    // The held copies: the Shards streams' DAX objects (A-365), each moved to the shard that owns its attachment; and
+    // the writable direct maps' copies (A-197), each to the shard that holds its map, which Linux alone sends the anchor.
+    #[cfg(unix)]
+    let (other_copies, inherited_dax) = crate::shards::dax_hold::split(handed.copies, shards.len());
+    #[cfg(unix)]
+    let mut inherited_dax = inherited_dax.into_iter();
     #[cfg(target_os = "linux")]
-    let mut inherited_copies = crate::held_copy::split(handed.copies, shards.len()).into_iter();
+    let mut inherited_copies = crate::held_copy::split(other_copies, shards.len()).into_iter();
+    #[cfg(all(unix, not(target_os = "linux")))]
+    for copy in other_copies {
+      // No other kind of copy is held here: one is let go at once, its record no shard's.
+      let _released = crate::anchor_hold::release_copy(copy.copy);
+    }
     #[cfg(windows)]
     let mut inherited_winfsp = crate::winfsp::split_held(handed.mounts, shards.len()).into_iter();
     #[cfg(windows)]
@@ -910,6 +920,7 @@ impl Daemon {
         devices: inherited_devices.next().unwrap_or_default(),
         #[cfg(target_os = "linux")]
         copies: inherited_copies.next().unwrap_or_default(),
+        dax: inherited_dax.next().unwrap_or_default(),
       };
       #[cfg(windows)]
       let windows_holds = (
@@ -2574,6 +2585,26 @@ impl Daemon {
     })
   }
 
+  /// Test support (A-367): every position this node holds of `object` as a holder, as its sequence and the epoch it was
+  /// accepted at, in sequence order.
+  pub fn fleet_held_positions(
+    &self,
+    object: slates_db::register::ObjectId,
+  ) -> Result<Vec<(u64, u64)>, ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      s.holder_records
+        .get(&object)
+        .map(|acceptor| {
+          acceptor
+            .positions()
+            .filter(|(held, ..)| *held == object)
+            .map(|(_, sequence, epoch, _)| (sequence, epoch.0))
+            .collect()
+        })
+        .unwrap_or_default()
+    })
+  }
+
   /// Test support: the record this node holds of `object` at ledger position `sequence`, with the epoch its fence has
   /// seen; `None` when it holds none there. A test reads what a takeover adopted at a position whatever the successor
   /// wrote after it.
@@ -3870,12 +3901,17 @@ fn content_slice(
   (usize, usize),
   Option<crate::write_log::WriteLog>,
   crate::write_log::Recovered,
+  Option<crate::dax_ranges::RangeTable>,
 ) {
   let images = image_range(config, partition, content.as_deref());
   let Some(object) = content.filter(|_| images.1 > images.0) else {
-    return ((0, 0), None, crate::write_log::Recovered::default());
+    return ((0, 0), None, crate::write_log::Recovered::default(), None);
   };
   let layout = config.shard_content_layout();
+  // The DAX range table (A-365), with what the previous daemon recorded in it.
+  let ranges_start = slice_start(config, partition).saturating_add(layout.dax_ranges.0);
+  let ranges_bytes = layout.dax_ranges.1.saturating_sub(layout.dax_ranges.0);
+  let dax_ranges = crate::dax_ranges::RangeTable::open(object, ranges_start, ranges_bytes);
   let log_start = slice_start(config, partition).saturating_add(layout.write_log.0);
   let log_bytes = layout.write_log.1.saturating_sub(layout.write_log.0);
   // The journal's generation — the checkpoint's advanced over its committed deltas (A-68) — since a write logged
@@ -3894,8 +3930,13 @@ fn content_slice(
     },
   );
   match crate::write_log::WriteLog::open(object, log_start, log_bytes, generation) {
-    Some((log, recovered)) => (images, Some(log), recovered),
-    None => (images, None, crate::write_log::Recovered::default()),
+    Some((log, recovered)) => (images, Some(log), recovered, dax_ranges),
+    None => (
+      images,
+      None,
+      crate::write_log::Recovered::default(),
+      dax_ranges,
+    ),
   }
 }
 
@@ -3934,6 +3975,8 @@ struct ShardHolds {
   /// The held writable copies.
   #[cfg(target_os = "linux")]
   copies: Vec<crate::held_copy::InheritedCopy>,
+  /// The held Shards streams' DAX objects (A-365).
+  dax: Vec<crate::shards::dax_hold::InheritedDax>,
 }
 
 /// A shard's start, run alone on its shard ([`futures::spawn_alone`]): its boot fault if the tests set one, then
@@ -4219,7 +4262,7 @@ async fn init_shard(
     None => None,
   };
   #[cfg(unix)]
-  let (content_range, write_log, recovered_writes) =
+  let (content_range, write_log, recovered_writes, dax_ranges) =
     content_slice(config, partition, content.as_mut());
   #[cfg(windows)]
   let content_range = content_slice(config, partition, content.as_ref());
@@ -4276,6 +4319,12 @@ async fn init_shard(
     pending_replies: std::collections::BTreeMap::new(),
     #[cfg(unix)]
     recovered_replies: std::collections::BTreeMap::new(),
+    #[cfg(unix)]
+    dax_ranges,
+    #[cfg(unix)]
+    inherited_dax: holds.dax,
+    #[cfg(unix)]
+    adopted_dax: std::collections::BTreeMap::new(),
     write_verifier: now.to_be_bytes(),
     nfs_v4: None,
     nfs_v4_files: None,
@@ -4450,6 +4499,7 @@ async fn init_shard(
     read_ahead: crate::verbs::ReadAheadLedger::default(),
     council_timing: slates_cluster::timing::ElectionTiming::floor(),
     root_timing: slates_cluster::timing::ElectionTiming::floor(),
+    failover: slates_cluster::failover::Failover::new(),
     council,
     consensus_ready: false,
     consensus_generation: 0,
@@ -7103,6 +7153,7 @@ mod tests {
           uid: 0,
         },
         completion: None,
+        signature: None,
       };
       let record = Record {
         owner,
@@ -7150,22 +7201,69 @@ mod tests {
     Clear(u8),
     /// Live copy `copy` let go.
     Drop(u8),
-    /// A register record held for object `object`.
+    /// A register put in place for object `object`: a fresh acceptor that keeps no changes, holding one position.
     Hold(u8),
     /// Object `object`'s register dropped.
     Forget(u8),
+    /// The next position of object `object`'s register accepted, its acceptor made, keeping its changes, when none is
+    /// held (A-367: the ledger a holder of a green keeps).
+    Accept(u8),
+    /// Object `object`'s newest position accepted again at a newer epoch, as a takeover re-commits it (A-367).
+    Again(u8),
+    /// Object `object`'s register compacted below its newest position, as a single-value register is (A-367).
+    Compact(u8),
+    /// A fresh acceptor that keeps its changes put in place of object `object`'s, holding one position (A-367): its
+    /// changes do not account for the published positions it replaced.
+    Renew(u8),
     /// A delta published: what `held_changes` carries, folded over the model.
     Delta,
     /// A checkpoint published: everything held.
     Checkpoint,
   }
 
-  /// A-270, the oracle of the incremental held image: do run a generated history of live copies kept, cleared, let go
-  /// and made again, and registers held and dropped, publishing deltas and checkpoints between them. Expect after
-  /// every publication the pieces a restart would fold (each checkpoint's, each delta's put and removed applied in
-  /// order) to equal everything the shard holds (`held_image`). A change the tracked maps missed, a live slot reused
-  /// by a copy made again, or a key both put and removed fails here as a difference, before it is a record a restart
-  /// lost.
+  /// Accepts into `acceptor` a record of `object` from the owner its authority names, under its generation: at
+  /// `again`, its value unchanged at an epoch one past its fence (a takeover's re-commit); else at the position after its
+  /// highest, at its fence's epoch, valued by `at`. Whether it was accepted.
+  fn held_accept(
+    acceptor: &mut slates_db::register::Acceptor,
+    object: slates_db::register::ObjectId,
+    at: usize,
+    again: Option<u64>,
+  ) -> bool {
+    use slates_db::register::{HostEpoch, Record};
+    let (promised, _) = acceptor.persisted();
+    let (sequence, epoch, value) = match again {
+      Some(sequence) => {
+        let Some(value) = acceptor.value_at(object, sequence).map(<[u8]>::to_vec) else {
+          return false;
+        };
+        (sequence, HostEpoch(promised.0.saturating_add(1)), value)
+      }
+      None => {
+        let next = acceptor
+          .highest(object)
+          .map_or(1, |(sequence, _)| sequence.saturating_add(1));
+        (next, promised, format!("value {at}").into_bytes())
+      }
+    };
+    acceptor
+      .accept(&Record {
+        owner: acceptor.owner(),
+        object,
+        sequence,
+        epoch,
+        generation: acceptor.generation(),
+        value,
+      })
+      .is_ok()
+  }
+
+  /// A-270, A-367, the oracle of the incremental held image: do run a generated history of live copies kept, cleared,
+  /// let go and made again, and registers held, dropped, grown a position at a time, accepted again at a newer epoch,
+  /// compacted and replaced, publishing deltas and checkpoints between them. Expect after every publication the pieces a
+  /// restart would fold (each checkpoint's, each delta's put and removed applied in order) to equal everything the shard
+  /// holds (`held_image`). A change the tracked maps or an acceptor's changes missed, a live slot reused by a copy made
+  /// again, or a key both put and removed fails here as a difference, before it is a record a restart lost.
   #[test]
   fn folding_every_held_delta_over_its_checkpoint_gives_what_the_shard_holds() {
     use proptest::strategy::Strategy;
@@ -7174,12 +7272,16 @@ mod tests {
       type Model =
         std::collections::BTreeMap<[u8; slates_vfs::recover::HELD_PIECE_KEY_BYTES], Vec<u8>>;
       let local = state.fleet.host();
-      let step = (0u8..7, 0u8..3).prop_map(|(kind, which)| match kind {
+      let step = (0u8..12, 0u8..3).prop_map(|(kind, which)| match kind {
         0 | 1 => HeldStep::Push(which),
         2 => HeldStep::Clear(which),
         3 => HeldStep::Drop(which),
         4 => HeldStep::Hold(which),
         5 => HeldStep::Forget(which),
+        6 | 7 => HeldStep::Accept(which),
+        8 => HeldStep::Again(which),
+        9 => HeldStep::Compact(which),
+        10 => HeldStep::Renew(which),
         _ if which == 0 => HeldStep::Checkpoint,
         _ => HeldStep::Delta,
       });
@@ -7220,19 +7322,60 @@ mod tests {
               state.live.held.remove(&object(which));
             }
             HeldStep::Hold(which) => {
-              state.holder_records.insert(
-                object(which),
-                Acceptor::new(
-                  local,
-                  Authority {
-                    generation: u64::try_from(at).unwrap(),
-                    owner: HostId(local.0 ^ 1),
-                  },
-                ),
+              let mut fresh = Acceptor::new(
+                local,
+                Authority {
+                  generation: u64::try_from(at).unwrap(),
+                  owner: HostId(local.0 ^ 1),
+                },
               );
+              held_accept(&mut fresh, object(which), at, None);
+              state.holder_records.insert(object(which), fresh);
             }
             HeldStep::Forget(which) => {
               state.holder_records.remove(&object(which));
+            }
+            HeldStep::Accept(which) => {
+              let acceptor = state
+                .holder_records
+                .entry(object(which))
+                .or_insert_with(|| {
+                  Acceptor::new(
+                    local,
+                    Authority {
+                      generation: 0,
+                      owner: HostId(local.0 ^ 1),
+                    },
+                  )
+                  .tracking_changes()
+                });
+              held_accept(acceptor, object(which), at, None);
+            }
+            HeldStep::Again(which) => {
+              if let Some(acceptor) = state.holder_records.get_mut(&object(which))
+                && let Some((sequence, _)) = acceptor.highest(object(which))
+              {
+                held_accept(acceptor, object(which), at, Some(sequence));
+              }
+            }
+            HeldStep::Compact(which) => {
+              if let Some(acceptor) = state.holder_records.get_mut(&object(which))
+                && let Some((sequence, _)) = acceptor.highest(object(which))
+              {
+                acceptor.compact_below(object(which), sequence);
+              }
+            }
+            HeldStep::Renew(which) => {
+              let mut fresh = Acceptor::new(
+                local,
+                Authority {
+                  generation: u64::try_from(at).unwrap(),
+                  owner: HostId(local.0 ^ 1),
+                },
+              )
+              .tracking_changes();
+              held_accept(&mut fresh, object(which), at, None);
+              state.holder_records.insert(object(which), fresh);
             }
             HeldStep::Delta => {
               let changes = crate::content_holder::held_changes(state);
@@ -9099,6 +9242,7 @@ mod tests {
           uid: 0,
         },
         completion: None,
+        signature: None,
       };
       let record = Record {
         owner,

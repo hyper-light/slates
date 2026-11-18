@@ -117,6 +117,12 @@ pub enum MemError {
     /// The most views the owner allows.
     most: usize,
   },
+  /// A descriptor handed back as a DAX object that is none (`crate::dax_object::DaxObject::adopt`, A-365): not
+  /// [`crate::dax_object::DAX_OBJECT_BYTES`] long, or on Linux not sealed as one is made. Nothing was adopted.
+  NotADaxObject {
+    /// The bytes the descriptor's object holds, zero where they could not be read.
+    object_bytes: u64,
+  },
 }
 
 /// Why a shared object's layout or access was refused (AUD-29-09).
@@ -230,6 +236,12 @@ impl fmt::Display for MemError {
         write!(
           f,
           "a DAX object already maps the {most} ranges its owner allows"
+        )
+      }
+      Self::NotADaxObject { object_bytes } => {
+        write!(
+          f,
+          "a descriptor of {object_bytes} bytes handed back as a DAX object is none"
         )
       }
     }

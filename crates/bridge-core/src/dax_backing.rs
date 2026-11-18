@@ -175,6 +175,9 @@ pub enum Then {
   Serve(u64),
   /// The attachment ends next.
   End,
+  /// Nothing waits on it: the transport goes on as before once the stores are in (a resynced stream's adopted
+  /// backings, ingested before it serves anything, A-365).
+  Resume,
 }
 
 /// A finished ingest.
@@ -293,8 +296,10 @@ pub fn guarded_layout() -> DaxLayout {
   })
 }
 
-/// Derived: the views of its object a backing may hold at once: the fill budget in pages, the most it can fill.
-fn most_views(backings: &ShardsBackings) -> usize {
+/// Derived: the views of its object a backing may hold at once: the fill budget in pages, the most it can fill. Public
+/// for a backing kept again from a dead daemon's object (A-365), which holds views as one made here does.
+#[must_use]
+pub fn most_views(backings: &ShardsBackings) -> usize {
   usize::try_from(backings.budget().checked_div(DAX_RANGE_BYTES).unwrap_or(0)).unwrap_or(usize::MAX)
 }
 
@@ -302,10 +307,15 @@ fn most_views(backings: &ShardsBackings) -> usize {
 /// identity; under a guard two for a range alone and sixteen for fifteen in a row), at least one. That is what its
 /// placed pages hold resident, so a placement never takes memory the budget does not count.
 fn charge_of(backing: &ShardsBacking) -> u64 {
-  backing
-    .object()
-    .layout()
-    .pages_holding(backing.filled().iter().copied())
+  filled_charge(backing.object().layout(), backing.filled().iter().copied())
+}
+
+/// What a backing in `layout` whose ranges `filled` are filled counts against the fill budget ([`charge_of`]'s rule),
+/// for a backing kept again before it is made (a successor's adoption, A-365).
+#[must_use]
+pub fn filled_charge(layout: DaxLayout, filled: impl IntoIterator<Item = u64>) -> u64 {
+  layout
+    .pages_holding(filled)
     .max(1)
     .saturating_mul(DAX_RANGE_BYTES)
 }
@@ -417,6 +427,33 @@ impl DaxBackingSession {
   #[must_use]
   pub fn len(&self) -> usize {
     self.backings.len()
+  }
+
+  /// The inode of the fill under way, if one: the ask its answer will be for.
+  #[must_use]
+  pub fn pending_inode(&self) -> Option<u64> {
+    self.pending.as_ref().map(|pending| pending.inode)
+  }
+
+  /// The backing it holds for `inode`, if one: its handle in the store's registry, which the anchor's hold of its object
+  /// is named by (A-365).
+  #[must_use]
+  pub fn backing_of(&self, inode: u64) -> Option<Handle<ShardsBacking>> {
+    self.backings.get(&inode).copied()
+  }
+
+  /// Takes `handle`, a backing of `inode` kept again in the store (a resynced stream's, adopted from the anchor's hold,
+  /// A-365), as this session's: every ask of the node is answered with its object from now on, and its ranges asked
+  /// writable are what an ingest compares. A backing it holds already for `inode` is kept, and `handle` is not taken.
+  /// Whether it was taken.
+  pub fn adopt(&mut self, inode: u64, handle: Handle<ShardsBacking>) -> bool {
+    match self.backings.entry(inode) {
+      Entry::Vacant(vacant) => {
+        vacant.insert(handle);
+        true
+      }
+      Entry::Occupied(_) => false,
+    }
   }
 
   /// Whether it backs file `inode`.
