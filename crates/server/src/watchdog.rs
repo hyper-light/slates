@@ -418,12 +418,18 @@ impl ShardWatch {
       || matches!((self.waited_ns, waited_ns), (Some(before), Some(now)) if now > before);
     // A look a window or more after the watchdog's last one saw nothing in between: the watchdog's own thread was kept off
     // its CPU, as a process frozen whole or paging is, and whether the shard waited for a CPU in that gap was never asked.
-    // Its stillness there is the process's, so the shard's still time starts again at this look, and a wedge is judged
-    // only over a window the watchdog watched (A-308). Before, a fleet test binary was ended with exit 4 on a wedge verdict
-    // that came 146 s past its window, when the whole process had gone unscheduled at 0.2 to 1 GB free (g231, load 62 to
-    // 131). A stuck shard is still judged a window after the watchdog's looks come back.
+    // Its stillness there is the process's, so the shard's measures start again at this look, its still time and its time
+    // without CPU alike, and a wedge is judged only over a window the watchdog watched (A-308). Before, a fleet test binary
+    // was ended with exit 4 on a wedge verdict that came 146 s past its window, when the whole process had gone
+    // unscheduled at 0.2 to 1 GB free (g231, load 62 to 131). A stuck shard is still judged a window after the watchdog's
+    // looks come back.
     let unwatched = look.now_ns.saturating_sub(self.looked_ns) >= window_ns;
-    let next = self.after_still_look(&look, progress, rose, rose || waiting || unwatched);
+    let next = self.after_still_look(
+      &look,
+      progress,
+      rose || unwatched,
+      rose || waiting || unwatched,
+    );
     let still_for = look.now_ns.saturating_sub(next.moved_ns);
     if still_for >= window_ns {
       return (Verdict::Wedged { for_ns: still_for }, next);
