@@ -7745,11 +7745,12 @@ it builds against the contract and adds to it rather than around it.
   vendoring a moved contract is a failed assertion beside the compile errors of the matches it must
   extend — never a variant falling silently through a wildcard. The wire types the contract
   re-exports grow append-only (D-15) and count as the contract's where it returns them. A
-  test, not review, holds the rule: `crates/ipc/tests/wire_order.rs` compares every wire enum of
-  the protocol with its published tags (`tests/wire_order.txt`). A variant appended is published
-  in its change by the test's `--ignored` writer, which refuses to publish a moved tag. Anything
-  else fails, naming the enum and the first tag that moved (since 2026-11-18, after
-  `SubmitApproved` moved from 69 to 71; it stays at 71).
+  test, not review, holds the rule. `crates/ipc/tests/wire_order.rs` compares every wire enum of
+  the protocol with its published tags (`tests/wire_order.txt`); `crates/db/tests/wire_order.rs`
+  does the same for the records the log keeps. A variant appended is published in its change by
+  the test's `--ignored` writer, which refuses to publish a moved tag. Anything else fails, naming
+  the enum and the first tag that moved (since 2026-11-18, after `SubmitApproved` moved from 69 to
+  71; it stays at 71).
 - *Laptop and fleet (R8).* One contract and one code path: the same calls, outcomes and errors on a
   laptop instance and on a fleet node; a fleet's own refusals (`Elsewhere`, `Retry` for an owner
   not confirmed) are variants a laptop never sends.
