@@ -13873,6 +13873,47 @@ fn a_successor_restarted_before_any_write_keeps_the_live_volume_it_took_over() {
   );
 }
 
+/// Probe (never for main): a live volume's own owner restarted warm at once, then one write through it.
+#[test]
+fn probe_a_live_owner_restarted_warm_takes_a_write() {
+  let _serial = serialize_fleet_tests();
+  let (mut fleet, mut daemons, _hosts, (id, written)) = anchored_fleet_with_a_live_volume(
+    &["live-own-a", "live-own-b", "live-own-c"],
+    "live-own",
+  );
+  eprintln!("probe2: writes before {:?}", written.iter().map(|reply| matches!(reply, ReplyBody::FsDone { .. })).collect::<Vec<_>>());
+  daemons.remove(0).stop();
+  daemons.insert(0, fleet.start(0));
+  let instance = daemons[0].instance().to_owned();
+  let served = poll_status_answers(&daemons.iter().collect::<Vec<_>>(), &instance, id);
+  eprintln!("probe2: served after the owner's warm restart {served}");
+  let mut client = Client::connect(&instance);
+  let attached = client.call(&RequestBody::Attach {
+    volume: id,
+    snapshot: None,
+    intent: Intent::Write,
+    form: AttachRequest::Root,
+  });
+  eprintln!("probe2: attach {attached:?}");
+  let counters = summed_counters(&daemons[0]);
+  let live: Vec<_> = counters.iter().filter(|(name, _)| name.starts_with("fleet.live")).collect();
+  eprintln!("probe2: owner live counters before the write {live:?}");
+  if let ReplyBody::Attached { attachment, .. } = attached {
+    let started = std::time::Instant::now();
+    let after = client.call(&RequestBody::FsWrite {
+      volume: id,
+      attachment,
+      path: "/after-owner-restart".to_owned(),
+      bytes: b"after".to_vec(),
+      mode: 0o644,
+    });
+    eprintln!("probe2: a write after the owner's warm restart, {:?}: {after:?}", started.elapsed());
+  }
+  for daemon in daemons {
+    daemon.stop();
+  }
+}
+
 /// AC (§4.8 "Promotion and takeover" — the successor "adopts the newest records, and serves"; §4.10
 /// clone-from-archive; R8 one code path): three daemons form an `f = 1` fleet; a file is written over NFS
 /// into a volume on A and sealed; its content places (A plus one content candidate) and its head reaches
