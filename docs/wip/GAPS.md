@@ -245,8 +245,11 @@
 > writes wait in that window (the cover gate above), and the holders keep their copies (A-272). The flows never reach
 > it: they kill the owner only once the fleet has recovered, and by then no successor lacked the key (48 of 48 runs,
 > every key-wait counter 0).
-> Owed: the deterministic skip in ranking A-271 names (model-first, §4.8), or another way for the successor to obtain
-> the key, then a process test that kills the owner inside the window.
+> The sibling, read the same way: a sealed head's envelope opens only through the lineage key the head wraps for each
+> candidate's anchor under the same pair (A-92 piece 4c), so a replacement successor in that window leaves it unopened
+> (`fleet.seal.envelope_unopened`, `fleet::opened_archive`) and that volume unserved too. Owed for both: the
+> deterministic skip in ranking A-271 names (model-first, §4.8), or another way for the successor to obtain the key,
+> then a process test that kills the owner inside the window (`Daemon::inject_pair_withhold` holds it open).
 
 > **Fixed (live-durability, 2026-11-08): each caller judged a dead session by its own clock.** The live lane's watch
 > waited a fixed second of silence, and the forward lane its own. On the fabric the fixed second cut a live holder
