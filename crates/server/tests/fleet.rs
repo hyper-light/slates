@@ -12283,7 +12283,7 @@ fn probe_plane_cut(daemons: &[Daemon], hosts: &[HostId], cut: bool) -> bool {
 }
 
 /// A counter of `daemon`'s, summed over its shards.
-fn counted(daemon: &Daemon, name: &str) -> u64 {
+fn summed_count(daemon: &Daemon, name: &str) -> u64 {
   summed_counters(daemon).get(name).copied().unwrap_or(0)
 }
 
@@ -12312,7 +12312,7 @@ fn a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again()
       &observed,
       RETIREMENT_DEADLINE,
       promise_wait_periods().saturating_mul(3),
-      || Ok(counted(&daemons[at], "fleet.takeover.given_up") > 0),
+      || Ok(summed_count(&daemons[at], "fleet.takeover.given_up") > 0),
     );
   let at_give_up: Vec<String> = daemons.iter().map(configuration_view).collect();
   let answering = daemons[1..]
@@ -12327,7 +12327,7 @@ fn a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again()
       readmission_periods(&observed),
       || settled_on_one_configuration(&daemons, &hosts),
     );
-  let judged_afresh = counted(&daemons[at], "fleet.takeover.judged_afresh");
+  let judged_afresh = summed_count(&daemons[at], "fleet.takeover.judged_afresh");
   let at_end: Vec<String> = daemons.iter().map(configuration_view).collect();
   for daemon in daemons {
     daemon.stop();

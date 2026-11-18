@@ -79,6 +79,30 @@
 > - a real FIDO key's signature end to end (the touch flag is proven with a software stand-in);
 > - the integrator's runs on Linux and Windows (the suite is platform-free but for the agent's own channel, Unix).
 
+> **The nemesis's fleet stayed split for good after a takeover gave objects up: fixed (2026-11-18, A-351, §4.8; goal
+> g225; the chaos nemesis, seeds 6876545201569229162 on both Linux arches and 7236833171758868842 on x86_64, CI diag
+> 44311638654).** Every run ended at `live_chaos.rs:716` with the survivors at two members and the retired owner at
+> three. The volume's creator was cut off and its volume adopted; the creator was re-admitted; then the adopter was cut
+> off and its takeover gave the adopted volume and its catalog up (A-304's bound). Once the adopter was heard again, the
+> leader proposed its admission each period and nothing changed: a kept retirement refuses its host's re-admission, a
+> share with an object given up is never confirmed, and nothing but a new configuration started such a round over. Two
+> causes held the promises back: the creator's own fenced shipper took the round's sessions (A-349, g250, landed), and,
+> under `Superseded(Deafened)`, every holder's promotion gate (AUD-08) counted its answers to the deaf adopter's probes,
+> though an answer to a host the configuration retired confirms no lease (in-process, 1 of 3 runs on a Mac Studio, kiln
+> r2219: the holder deferred 103 pages, the successor gave 2 objects up). Fixed: only an answer naming the prober a
+> standing counts toward the gate, a former member's last such answer is kept until its horizon passes (the per-period
+> prune had dropped it at the retirement, opening the gate early), and a round that gave objects up starts over once its
+> retired host is heard alive again, once a refutation (`fleet.takeover.judged_afresh`). Tests:
+> `a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again` and
+> `a_fleet_settles_on_one_configuration_after_the_owner_a_takeover_made_is_retired_in_turn`
+> (`crates/server/tests/fleet.rs`), with unit tests in `lease.rs`, `takeover.rs` and `daemon.rs`. Bug record:
+> `docs/bugs/2026-11-18-a-retired-owner-heard-again-was-never-readmitted-and-the-fleet-stayed-split.md`.
+> - **Not this entry: the nemesis's watchdog kills.** Seeds 2120743995065985386 and 17036665960917068132 ended with
+>   status `?` on two or three nodes because the A-232 watchdog ended daemons ("shard 1 is spinning, 1000 ms of CPU
+>   without a step", g251's item); under `Supervision::Bare` a daemon ended stays ended, so no fleet can settle at three
+>   after one. The first of them failed after nine recovered faults, not at formation.
+> - **Owed (the supervisor's):** the nemesis seeds on main with A-351, A-349 and g250's re-adoption.
+
 > **A takeover round gave up two objects within tolerance: a superseded owner's shipper held its sessions every period
 > (2026-11-18, A-349, NoLoss; g250; the chaos nemesis, seed 6876545201569229162, CI diag 44311638654 on both Linux arches).**
 > Read with a status dump and three diagnostic lines (diag-g250-nemesis-2, CI run 44320668620, 5 of 6 rounds): the owner
