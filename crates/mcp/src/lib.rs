@@ -2089,6 +2089,17 @@ pub fn daemon_json(r: &DaemonReport, telemetry: &[TelemetryReport]) -> Value {
         "bytes_consumed": session.bytes_consumed,
         "path_mtu": session.path_mtu,
       })).collect::<Vec<_>>(),
+      // The failover delay as the daemon estimates it now, each term with the measurements behind it (A-363).
+      "failover": json!({
+        "total_ns": r.fleet.failover.total_ns,
+        "detection_ns": r.fleet.failover.detection_ns,
+        "detection_samples": r.fleet.failover.detection_samples,
+        "confirmation_ns": r.fleet.failover.confirmation_ns,
+        "confirmation_samples": r.fleet.failover.confirmation_samples,
+        "recovery_ns": r.fleet.failover.recovery_ns,
+        "takeovers_timed": r.fleet.failover.takeovers_timed,
+        "volumes_timed": r.fleet.failover.volumes_timed,
+      }),
     },
   });
   // Inserted after: one more key in the literal passes `json!`'s macro recursion limit.
