@@ -1,5 +1,24 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A grant is signed by a key only the human holds (2026-11-18, R10, D-22, §4.13; A-285, Ada's decision: fs-server's
+> option D, with A as the fallback, on every OS).** This closes, once built, "No grant can be issued on Linux from the
+> CLI" (A-201's entry). **Built (piece 1):** the signed statement and its SSH-signature verifier
+> (`crates/server/src/grant_signature.rs`; `ssh-ed25519` and `sk-ssh-ed25519`, the touch required, namespace
+> `slates-grant`), 10 unit tests against a real `ssh-keygen -Y sign` vector: forged, unregistered, changed manifest
+> and every other field, another namespace, expired, untouched, hostile bytes. **Owed, in order:**
+> - the presentation's nonce, a signed `Grant` on the wire, the nonce spent once (a replay refused);
+> - durable key registration: the first key only through A's terminal prompt (a standalone anchor) or kiln's person
+>   session (a kiln-managed anchor, WebAuthn; the supervisor's direction, put to Ada); later keys signed by a
+>   registered key; no agent channel adds one;
+> - `slates grant` signing through `ssh-keygen -Y sign`, and A's prompt over a pty;
+> - the exported-variables issuer surface removed on macOS and Windows (GAP-A9-9's macOS segment then closes by name);
+>   `enroll`, `revoke`, `run` and `recover` prove authority with the same issuer secret and need the signed proof too;
+> - the Windows confirm-per-use path (OpenSSH's agent, or FIDO through Windows Hello), recorded;
+> - the WebAuthn form verified (its challenge is the statement's SHA-256; g263 and g264 own kiln's side);
+> - a real FIDO key's signature (the unit test stands a software key in for the authenticator);
+> - the end-to-end proof on adacachy, `SLATES_TEST_GRANT=1`: registration through A over a pty, a landing granted by
+>   a confirmed ssh-agent key and written, the askpass refusing, an unregistered key and a replay refused.
+
 > **The dirty-page test's precondition, proved each attempt (2026-11-09, A-248).**
 > `a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path` failed intermittently ("the sync says so:
 > Ok(())", B10's gate, adacachy2, load about 66) when the kernel wrote the store's page back before the replacement. On
