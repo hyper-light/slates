@@ -26930,6 +26930,7 @@ Applied in the same change to:
 - `crates/server/src/winfsp.rs`: the owed words (`siblings`, `owe_siblings`), told and purged by the next round.
 - `crates/cli/tests/winfsp_semantics.rs`: `a_hard_link_made_through_the_drive_names_the_same_file`, the live
   `CreateHardLinkW` test, which skips loudly where the driver refuses the link itself.
+- `unsafe-budget.toml`: `slates-bridge-winfsp` 155 to 158, the link's three sites.
 - A-300: its stated difference holds on WinFsp as released.
 - GAPS ("WinFsp hard links").
 - **What was there.** WinFsp's driver completes `FileLinkInformation` itself, `STATUS_NOT_SUPPORTED` with the comment "no
@@ -26979,14 +26980,23 @@ Applied in the same change to:
   every other name the file is open under (`NotifyRound::add_siblings`) and purges their bytes (A-190's purge), never
   the name it came through, whose cache saw the change. The owed words are bounded by the handles Windows holds; past
   that the round tells every open name. The round follows the reply, at the mount's next turn: a reader through another
-  name sees the change once the notification is applied (2.5 ms after the writer's close on the VM), not with the reply.
+  name sees the change once the notification is applied (on the VM, 0.9 ms after the writer's close in the live test
+  and 7 ms in the two-names check), not with the reply.
   Telling the names before the reply would make the receive worker wait on a notification whose purge may need that
   worker (a dirty page of another name is written back through it), which WinFsp's rule against notifying from the
   answering thread forbids. The first form kept the request's own journal records owed instead; that told and purged the
   name it came through too, and a purge opens the file through the drive with write access, so on the VM a reader of
-  that name sharing only reads was refused (`ERROR_SHARING_VIOLATION`) while the purge lasted.
-- **Proven so far.** The request decoding, the replay rule and the shard's rules by the tests above (diag lane, both
-  Windows runners). End to end on a test-signing Windows VM: owed in this entry's next record.
+  that name sharing only reads was refused (`ERROR_SHARING_VIOLATION`) while the purge lasted. A reader of another
+  name still can be, while that name's purge lasts, as after any change A-190 purges for (once in the VM's check,
+  against none in 51 reads of the writer's own name).
+- **Proven.** The request decoding, the replay rule, the shard's rules and the owed words by the tests above, green on
+  both Windows runners (diagnostics run 44350120133 at `28ad74fcd`; the notification and decoding tests also on the
+  Mac Studio, kiln r3516). End to end on a Windows Server 2025 evaluation under KVM on adacachy, test signing on,
+  WinFsp 2.1.25156's driver replaced by the patched build (`docs/wip/winfsp-patches/README.md` has the build and
+  every line): the live test passes with the drive's half and fails `ERROR_NOT_SUPPORTED` with main's, which declares
+  no `HardLinks`; `git clone --local` of a repository on the drive exits 0 with its 7 object files linked, as on
+  NTFS. With WinFsp's own driver back, the test refuses as before (skipping loudly as CI runs it) and the clone dies,
+  `failed to create link`.
 - **What remains, and whose.** The patch reaches users only in a WinFsp release: upstream, which needs WinFsp's
   contributor agreement signed (adding a name to `Contributors.asciidoc` assigns joint copyright to WinFsp's author), or
   a slates-signed driver (an EV code-signing certificate and a Microsoft Partner Center account for attestation

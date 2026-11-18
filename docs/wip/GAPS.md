@@ -711,8 +711,11 @@
 > to pass hard links to its file system, an upstream change to a signed kernel driver (outward-facing); recommended:
 > keep the stated difference and offer the change upstream. **2026-11-18, A-360 (goal g258):** the driver change is
 > written, two commits on WinFsp v2.1 that apply to v2.2 (`docs/wip/winfsp-patches`, never sent to WinFsp), and the
-> drive declares `HardLinks` and serves a forwarded link (its focused tests on both Windows runners); end to end on a
-> test-signing Windows VM: owed. The decision now comes with the patch in hand: WinFsp's contributor agreement
+> drive declares `HardLinks` and serves a forwarded link (its focused tests on both Windows runners). Proven end to end
+> on a test-signing Windows Server 2025 VM under KVM (adacachy) with the patched driver: the live `CreateHardLinkW`
+> test passes (one file index, two links, the other name reads a write 0.9 ms after the writer's close) and `git clone
+> --local` on the drive links all 7 object files, as NTFS does; with WinFsp's own driver the clone dies `failed to
+> create link` and the test skips loudly. The decision now comes with the patch in hand: WinFsp's contributor agreement
 > (upstream; it assigns joint copyright to WinFsp's author) or an EV code-signing certificate and a Microsoft Partner
 > Center account (a slates-signed driver). **The lanes' first run (CI 44260193629, 2026-11-18, x86_64
 > and arm64 alike; A-327):** Mercurial identical but for the three stated lines. git and git's history failed on the
