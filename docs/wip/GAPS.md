@@ -1,5 +1,40 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Device nodes are kept as metadata (2026-11-17, §4.5, §4.6, §4.15, §4.16; A-294, Ada's option (c) for A-26 of
+> 2026-11-18; replaces A-268's `EPERM`).** A block or character device node is now an inode whose body is its number,
+> kept through the volume, its recovery image (28) and delta (11), archives (manifest minor 4), merges and ext4 images,
+> and made and reported by FUSE (`rdev`) and NFS (`rdev`, NFSv4 `rawdev`) with its number. Linux's rule decides who
+> makes one: root, except a whiteout (a character device 0/0) for any caller who may write the directory. Nothing opens
+> one as a device: a landing refuses it before its first write, and each consumer's kernel is guarded (slates' own
+> mounts `nosuid,nodev`, the Linux FUSE mount now stating both itself; a pod's device cgroup; a guest asked for
+> `nodev`). Proven by each crate's unit tests (A-294 names them). **Owed:**
+> - **every root pjdfstest list re-recorded with its record from a real run (the integrator's lanes).** The
+>   device-fixture entries (1,798 of the Linux FUSE list's 1,800; every entry of the NFSv4, OCI and virtio-fs lists;
+>   1,788 of the macOS list's 1,905) are expected to pass now, so each lane reports them listed-now-passing until the
+>   re-record; a list cannot be edited ahead of its run, since `a_record_names_the_expected_failure_list_as_tracked`
+>   holds each record to its list's digest;
+> - the real-kernel tests run on the Linux lanes: `a_device_node_reaches_the_mount_with_its_number_and_is_never_opened`
+>   (FUSE) and `a_device_node_is_made_with_its_number_and_never_opened` (the NFSv4 kernel client, which now mounts
+>   `nosuid,nodev`);
+> - the KIND lane's first run of its device probe (`device_probe` in `xtask/src/kind_export.rs`, written with this
+>   change): a root pod makes `/dev/null`'s and `/dev/mem`'s numbers in the volume, and an unprivileged pod must open
+>   the first (the control: the pod's bind is not `nodev`) and be refused `EPERM` on the second by the device cgroup;
+> - a guest's proof over virtio-fs (g260's): the guest mount line in `docs/cli.md` asks for `nosuid,nodev` since
+>   2026-11-17, with A-294's reason;
+> - Windows: a device node (and a FIFO or socket) has no WinFsp form. A directory holding one failed its whole listing
+>   (`read_all_entries` took each entry's attribute word with `?`), a sibling defect since A-26 that kept device nodes
+>   make common (an unpacked `/dev`); fixed 2026-11-17, the drive's listing leaves such an entry out (`listed`), so a
+>   directory holding only such entries lists empty and its removal is refused `STATUS_DIRECTORY_NOT_EMPTY`; the live
+>   proof is owed to CI's Windows runner. Showing them in WSL's form, a reparse point tagged `IO_REPARSE_TAG_LX_CHR`,
+>   `_LX_BLK`, `_LX_FIFO` or `_AF_UNIX`, is the candidate, now that the drive answers reparse requests (A-275).
+
+> **A snapshot's attribute-only change was lost in recovery: fixed (2026-11-17, §4.8).** The image's cross-snapshot
+> dedup matched a version to an earlier snapshot's by its body alone, while the rebuild shares the earlier snapshot's
+> whole record, so a version changed only by a `chmod`, `chown` or `touch` between two snapshots recovered with the
+> earlier one's metadata (snapshot `b` read 0o644 for its 0o600, `a_version_that_differs_only_in_its_attributes_keeps_them_through_recovery`).
+> Every FIFO, socket and device-node version shares one body, so for them any two versions matched. The match now
+> needs the whole inode image equal. Record: `docs/bugs/2026-11-17-a-snapshots-attribute-only-change-was-lost-in-recovery.md`.
+
 > **A lone daemon's end left the line's writer unjoined: fixed (2026-11-18, A-232).** Main's TSan lane failed both
 > stuck-shard tests of `crates/client/tests/lone_daemon.rs` from the push that landed A-232 (run 44210937388): "the lone
 > daemon was still running 10s after its shard was held". The watchdog reached its verdict within a window and logged
@@ -38,6 +73,16 @@
 > **Built since (A-302, 2026-11-18):** a guest's POSIX ACLs (`setfacl`'s `system.posix_acl_access` and a directory's
 > `system.posix_acl_default`) are its data on the same routes, checked as Linux checks one, their named users and
 > groups kept through the stream's owner view; stored and not enforced, as Shards' own server keeps them.
+> **Built since (A-314, 2026-11-18):** enforced, at Shards' coordinator's ask. A guest route's INIT asks the guest's
+> kernel for `FUSE_POSIX_ACL`, so it judges every access by the access ACL it reads; the shared seam keeps Linux's
+> rules on every route: the mode is the access ACL's owner, mask and other entries (a set changes the mode, a chmod
+> anywhere is read back as the ACL's change, an ACL that says no more than a mode is kept as none), and a directory's
+> default ACL is what everything made in it takes, whoever makes it, in place of the umask. Proven by use with a model
+> of Linux's permission check over the dispatch's answers (`crates/bridge-fuse/tests/shards_fs.rs`). Not kept: Linux's
+> clearing of set-group-ID when a caller outside the file's group sets an ACL, which the FUSE wire carries only under
+> `FUSE_SETXATTR_EXT`, not negotiated (a per-connection request form a restored or resynced stream would have to
+> carry). Owed: a real guest's run of it (a Shards guest over a stream; a VM over slates' own virtio-fs device) and the
+> GETXATTR round trips it adds to a non-owner's access, measured by the integrator.
 > **Built since (A-303, 2026-11-18):** a stream's tables for a VM's save and restore (Shards' D176 part 5): a SAVE
 > waits for the guest's stores through its maps, takes and publishes a snapshot at the cut and answers tables naming
 > it with the guest's references, opens, scope and owner view; a RESTORE, a fresh stream's first frame, takes them onto
@@ -49,7 +94,8 @@
 > - A stream that survives a daemon restart, answering Shards' RESEND, each non-idempotent request (CREATE with
 >   O_EXCL, MKDIR, LINK, RENAME, UNLINK) answered at most once from the dead daemon's durable record of its outcome;
 >   else the stream ends typed and counted. The owner view then has to be kept with the attachment's record.
-> - Shards' side, after its v0.8.0 tag and landed by its coordinator from signed branches: its guest test over a
+> - Shards' side, after its v0.8.0 tag and landed by its coordinator from signed branches: its own server enforcing a
+>   guest's ACLs as slates now does (`FUSE_POSIX_ACL`, queued by its coordinator), its guest test over a
 >   slates stream on Linux and macOS (`tests/slates_fs.rs`, Windows only today), the bump of the slates revision it
 >   pins (f71282e1f; handed to it as the signed branch `agents/g268-slates-rev-bump`, 808cdc1e4, pinning ac30fc77a
 >   and Rust 1.98.1), the WHP window patches 0001 to 0003 (the signed branch `agents/g268-whp-window-edge-cases`,
@@ -278,7 +324,8 @@
 > naming the precondition. adacachy2: 10 of 10 before (load 66-68) and 10 of 10 after (load 66-77), no attempt missed. Record:
 > `docs/bugs/2026-11-09-a-dirty-page-test-took-an-early-write-back-for-a-lost-refusal.md`.
 
-> **A refused device node reached programs as "Unknown error 527": fixed (2026-11-08, §4.6, A-26; A-268).** MKNOD of a
+> **A refused device node reached programs as "Unknown error 527": fixed (2026-11-08, §4.6, A-26; A-268; the refusal
+> itself replaced by A-294 on 2026-11-17, which makes the node).** MKNOD of a
 > block or character device, and NFSv4's CREATE of one, answered `BADTYPE`, which the Linux client turns into its
 > internal `EBADTYPE` (errno 527): 331 cases of a full pjdfstest run over NFSv4, and the NFSv3 lane alike. Now a taken
 > name is `EEXIST`, an unwritable directory `EACCES`, then `EPERM`, as a local file system without device nodes answers
@@ -8521,7 +8568,9 @@ drops the flags. A local Docker bind of a `nosuid` mount keeps them, so this is 
 
 **Response.**
 - `docs/deploy.md` now requires `allowPrivilegeEscalation: false` (Pod Security `restricted`; `no_new_privs` makes setuid
-  bits inert on exec). `nodev` stays moot, since slates refuses device nodes.
+  bits inert on exec). `nodev` stays moot, since slates refuses device nodes. (No longer, since A-294 of 2026-11-17:
+  device nodes are kept, and in a pod the container runtime's device cgroup is the guard; its KIND proof is owed, see
+  the A-294 entry at the top.)
 - The lane checks the behaviour instead of the flags. A root pod plants a setuid-root coreutils `id`. A non-root pod
   without the setting must run it as 0, the control that proves the probe can see an escalation. A pod with the setting
   must run it as 65534.

@@ -2633,7 +2633,7 @@ enum Creation {
   /// A symbolic link to the target, through the v3 SYMLINK.
   Link(String),
   /// A FIFO, socket, block or character device name, through the v3 MKNOD, which decides what the
-  /// volume keeps (§4.6 A-26: FIFO and socket names; no device nodes).
+  /// volume keeps (§4.6: FIFO and socket names, A-26; device nodes with their numbers, A-294).
   Node(Ftype3, Specdata3),
 }
 

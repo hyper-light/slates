@@ -3574,10 +3574,12 @@ fn whole_file(
   vec![extent]
 }
 
-/// An inode's manifest metadata: its attributes with its kind's type bits, as the export writes them.
+/// An inode's manifest metadata: its attributes with its kind's type bits, and a device node's number (A-294), as the
+/// export writes them.
 fn meta_of(inode: &InodeImage) -> slates_archive::NodeMeta {
   use slates_vfs::export::{
-    MODE_DIRECTORY, MODE_FIFO, MODE_FILE, MODE_SOCKET, MODE_SYMLINK, permissions_of_mode,
+    MODE_BLOCK_DEVICE, MODE_CHAR_DEVICE, MODE_DIRECTORY, MODE_FIFO, MODE_FILE, MODE_SOCKET,
+    MODE_SYMLINK, permissions_of_mode,
   };
   use slates_vfs::recover::KindImage;
   let type_bits = match inode.kind {
@@ -3586,6 +3588,12 @@ fn meta_of(inode: &InodeImage) -> slates_archive::NodeMeta {
     KindImage::Symlink => MODE_SYMLINK,
     KindImage::Fifo => MODE_FIFO,
     KindImage::Socket => MODE_SOCKET,
+    KindImage::BlockDevice => MODE_BLOCK_DEVICE,
+    KindImage::CharDevice => MODE_CHAR_DEVICE,
+  };
+  let (device_major, device_minor) = match inode.body {
+    BodyImage::Device { major, minor } => (major, minor),
+    _ => (0, 0),
   };
   let attrs = &inode.attrs;
   slates_archive::NodeMeta {
@@ -3599,6 +3607,8 @@ fn meta_of(inode: &InodeImage) -> slates_archive::NodeMeta {
     nlink: attrs.nlink,
     uid: attrs.uid,
     gid: attrs.gid,
+    device_major,
+    device_minor,
     xattrs: Vec::new(),
   }
 }

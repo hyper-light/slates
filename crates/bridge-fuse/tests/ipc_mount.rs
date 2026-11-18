@@ -1,4 +1,5 @@
-//! A-26 / AC-3.10: real kernel IPC is local and transient; cloned names share no pipe or listener.
+//! A-26 / AC-3.10: real kernel IPC is local and transient; cloned names share no pipe or listener. A-294: a device node
+//! the volume keeps reaches the mount with its number, and the kernel opens none as a device.
 //! Requires the same ordinary-user FUSE environment as coherence_mount; its paths are in the build output
 //! (`CARGO_TARGET_TMPDIR`; A-50: never `/tmp`, never a RAM directory).
 #![cfg(target_os = "linux")]
@@ -17,7 +18,7 @@ use slates_bridge_fuse::channel::{
 use slates_bridge_fuse::mount::{Mount, MountError, mount};
 use slates_db::catalog::{Principal, VolumeId};
 use slates_vfs::clock::HostClock;
-use slates_vfs::inode::Kind;
+use slates_vfs::inode::{DeviceNumber, SpecialNode};
 use slates_vfs::recover::VolumeImage;
 use slates_vfs::volume::{Volume, VolumeConfig};
 
@@ -76,9 +77,9 @@ fn original_image() -> VolumeImage {
     rustix::process::getgid().as_raw(),
   );
   let root = original.root_inode(&store).unwrap();
-  for (name, kind) in [("pipe", Kind::Fifo), ("socket", Kind::Socket)] {
+  for (name, node) in [("pipe", SpecialNode::Fifo), ("socket", SpecialNode::Socket)] {
     let inode = original
-      .mknod_no(&mut store, root, name, 0o600, kind)
+      .mknod_no(&mut store, root, name, 0o600, node)
       .unwrap();
     original
       .chown(
@@ -375,5 +376,86 @@ fn fifo_and_socket_communication_is_local_to_each_clone() {
     drop(paths);
     first.join().unwrap();
     second.join().unwrap();
+  });
+}
+
+/// A volume image holding device nodes made through the volume (A-294): a character device numbered 1:3, `/dev/null`'s
+/// number, which any process opens on a mount that allows devices, and a block device numbered 8:0, each readable and
+/// writable by everyone and owned by the mounting user.
+fn device_image() -> VolumeImage {
+  let mut store = common::store();
+  let uid = rustix::process::getuid().as_raw();
+  let gid = rustix::process::getgid().as_raw();
+  let mut volume = common::volume_for_owner(&mut store, uid, gid);
+  let root = volume.root_inode(&store).unwrap();
+  for (name, node) in [
+    ("null", SpecialNode::CharDevice(DeviceNumber::new(1, 3))),
+    ("disk", SpecialNode::BlockDevice(DeviceNumber::new(8, 0))),
+  ] {
+    let inode = volume
+      .mknod_no(&mut store, root, name, 0o666, node)
+      .unwrap();
+    volume.chown(&mut store, inode, uid, gid).unwrap();
+  }
+  volume.to_image(&store, None).unwrap()
+}
+
+/// AC-3.10 / A-294: a device node a volume keeps reaches a real kernel mount as a device node with its number, and the
+/// kernel opens none as a device. Do: serve, over an ordinary user's FUSE mount, a volume holding a character device
+/// numbered 1:3 (`/dev/null`'s, which an ordinary user opens wherever devices are allowed, so a mount without `nodev`
+/// would hand this one the host's driver) and a block device numbered 8:0; read the mount's flags, stat both nodes and
+/// open each for reading. Expect the mount `nodev`, each node's type and number as the volume made it, and each open
+/// refused `EACCES` by the kernel (`may_open_dev`, `fs/namei.c`), so nothing reaches a driver.
+#[test]
+fn a_device_node_reaches_the_mount_with_its_number_and_is_never_opened() {
+  std::thread::scope(|scope| {
+    let paths = MountPaths::new();
+    let mounted = match mount(&paths.original, &[], MOUNT_WAIT) {
+      Ok(mounted) => mounted,
+      Err(MountError::NoDevice { .. } | MountError::Helper { .. } | MountError::Spawn { .. }) => {
+        eprintln!("skipping mounted device-node proof: fusermount3 or /dev/fuse unavailable");
+        return;
+      }
+      Err(error) => panic!("FUSE mount failed: {error}"),
+    };
+    let image = device_image();
+    let server = scope.spawn(move || serve(mounted, Served::Plain(Box::new(image)), 3, None));
+    let flags = rustix::fs::statvfs(paths.original.as_str()).unwrap().f_flag;
+    assert!(
+      flags.contains(rustix::fs::StatVfsMountFlags::NODEV),
+      "the mount is nodev: {flags:?}"
+    );
+    for (name, file_type, major, minor) in [
+      ("null", rustix::fs::FileType::CharacterDevice, 1, 3),
+      ("disk", rustix::fs::FileType::BlockDevice, 8, 0),
+    ] {
+      let path = format!("{}/{name}", paths.original);
+      let stat = rustix::fs::stat(path.as_str()).unwrap();
+      assert_eq!(
+        rustix::fs::FileType::from_raw_mode(stat.st_mode),
+        file_type,
+        "{name}'s type"
+      );
+      assert_eq!(
+        (
+          rustix::fs::major(stat.st_rdev),
+          rustix::fs::minor(stat.st_rdev)
+        ),
+        (major, minor),
+        "{name}'s number"
+      );
+      assert_eq!(
+        rustix::fs::open(
+          path.as_str(),
+          OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+          Mode::empty()
+        )
+        .map(drop),
+        Err(rustix::io::Errno::ACCESS),
+        "{name} is never opened as a device"
+      );
+    }
+    drop(paths);
+    server.join().unwrap();
   });
 }
