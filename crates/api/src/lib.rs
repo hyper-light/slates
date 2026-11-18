@@ -106,7 +106,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// evidence; `plan_landing` presents through the daemon's present-only verb whatever the mode (the same day). 7: the
 /// launcher's own secret: `LauncherSecret`, `StartSpec::launcher` and `with_launcher`, `Issuer::from_launcher_secret`,
 /// `StartSpec::anchor_command` fallible (`StartFault::Launcher`), `IssuerFault::LauncherCannotRecover`,
-/// `Unsupported::SecureRandom` (the same day).
+/// `Unsupported::SecureRandom`; and, from A-285's owner the same hour, `Stale::Policy`, a policy setting that raced
+/// another (`set_write_policy` names the version it read) (the same day).
 pub const CONTRACT: u32 = 7;
 
 /// The typed client and its own types, for the verbs [`Instance::client`] lends outside the contract.

@@ -7112,9 +7112,13 @@ it builds against the contract and adds to it rather than around it.
 > secure random, kept by the host), `StartSpec::with_launcher`, carried on the anchor's standard input
 > as one checked record in a pipe closed before the spawn, read first and published into the segment
 > before any daemon (a bad record refused, exit 1, before anything is held);
-> `Issuer::from_launcher_secret` proves with it after the host's restart as before (the daemon's
-> verification is A-285's owner's next piece). Proven by use: an instance started with a secret serves;
-> an anchor handed garbage or a short record refuses to start.
+> `Issuer::from_launcher_secret` proves with it after the host's restart as before, and the daemon
+> verifies it beside the issuer secret (A-285's owner, 0366b68a; a policy setting names the version it
+> replaces, `Stale::Policy`). Proven by use through real processes
+> (`the_launchers_secret_proves_its_policy_across_a_daemon_restart`: a volume's policy set under the
+> secret, a stranger's refused `Unproven`, the daemon killed and restarted by its anchor, and the
+> launcher's next setting verified by the new daemon); an anchor handed garbage or a short record
+> refuses to start.
 
 **Merging from the SDKs (D-27).** `submit(work_volume, evidence=None)` parks and resolves to
 `Accepted{version}` or raises `MergeConflict` carrying the windows; `rebase(work_volume,
@@ -21487,8 +21491,9 @@ contract", new, with its status), GAPS (the A-299 entry and the Embedding librar
   proves grants, merges, policies, enrollments and revocations with no segment attached; a consensus recovery stays the
   segment's (`IssuerFault::LauncherCannotRecover`). Checked by unit tests (the record whole and as written, each fault;
   two generated secrets distinct) and by use in `tests/start.rs` (an instance started with a secret serves; garbage and
-  a short record each refused at the anchor's start). Owed: the daemon's verification under it (A-285's owner), then a
-  by-use proof that a launcher-keyed `set_write_policy` and approval verify after a daemon restart.
+  a short record each refused at the anchor's start). The daemon's verification landed the same hour (A-285's owner,
+  0366b68a), and `the_launchers_secret_proves_its_policy_across_a_daemon_restart` proves the whole path by use: the
+  daemon killed and restarted by its anchor verifies the launcher's next setting.
 - **Checked.** `cargo test -p slates-api` (37 unit, 9 by use, 5 start, 1 doc) and `cargo test -p slates-cli` on
   macOS arm64 (kiln runner, 2026-11-18): the cases in §4.12's status. The Linux and Windows arms of the mount and the
   CLI's Windows unmount are not compiled on this host; the integrator's lanes are their first compiler.
