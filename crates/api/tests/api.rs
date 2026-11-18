@@ -121,6 +121,7 @@ fn grouped(tag: &str) -> (Daemon, Instance) {
 }
 
 /// [`grouped`] on the shards of the daemon kiln starts ([`KILN_SHARDS`]).
+#[cfg(unix)]
 fn kiln_grouped(tag: &str) -> (Daemon, Instance) {
   let (daemon, mut instance) = daemon_on(tag, KILN_SHARDS);
   instance.ensure_group().unwrap();
@@ -958,6 +959,7 @@ fn a_merge_follows_its_greens_write_mode() {
 
 /// kiln's volume bound (`crates/kiln/src/workspace/slates.rs`, `volume_max`): a quarter of the machine's memory in whole
 /// GiB, at least one and at most 64.
+#[cfg(unix)]
 fn kiln_volume_max() -> u64 {
   /// Format: kiln's `MAX_VOLUME_GIB`.
   const MAX_VOLUME_GIB: u64 = 64;
@@ -966,6 +968,7 @@ fn kiln_volume_max() -> u64 {
 
 /// The daemon's own count of each shard's inode-version slab (§4.2 inode dimension), printed beside a test's verdict
 /// as its evidence: the slots, those committed to volumes' allowances, and those snapshots retain.
+#[cfg(unix)]
 fn print_version_slabs(instance: &mut Instance, when: &str) {
   for shard in instance.daemon_status().unwrap().shards {
     eprintln!(
