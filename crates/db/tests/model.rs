@@ -2241,7 +2241,7 @@ fn a_relinquished_volume_is_made_again_under_its_id_and_keeps_its_key() {
     &mut segment,
     &Op::SealKeySet {
       record: slates_db::catalog::SealKeyRecord {
-        owner: lineage.clone(),
+        owner: lineage,
         id: [1; 16],
         record: vec![2; slates_db::catalog::SEAL_KEY_RECORD_BYTES],
       },

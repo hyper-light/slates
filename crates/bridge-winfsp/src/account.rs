@@ -70,9 +70,10 @@ pub fn sid_text(bytes: &[u8]) -> Option<String> {
     .checked_add(SID_HEADER_BYTES)?;
   for word in bytes
     .get(SID_HEADER_BYTES..end)?
-    .chunks_exact(SUB_AUTHORITY_BYTES)
+    .as_chunks::<SUB_AUTHORITY_BYTES>()
+    .0
   {
-    let sub_authority = u32::from_le_bytes(word.try_into().ok()?);
+    let sub_authority = u32::from_le_bytes(*word);
     text.push_str(&format!("-{sub_authority}"));
   }
   Some(text)
