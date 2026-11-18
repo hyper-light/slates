@@ -912,7 +912,7 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
     crate::xshard::call_in_shard_time(
       control,
       shard,
-      move |s| dispatch(s, FORWARDED_CLIENT, &principal, body),
+      move |s| serve_forwarded_read(s, &principal, body, volume),
       crate::daemon::LIVENESS_BUDGET_NS,
     )
     .await
@@ -921,6 +921,10 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
       control,
       shard,
       move |s| {
+        // Not made here yet: refused before any completion is recorded, so the resend under its id runs it once made.
+        if let Some(refusal) = forwarded_before_made(s, volume) {
+          return (Some(refusal), None);
+        }
         if let Some(up_to) = ack_up_to {
           prune_forwarded(s, origin_host, id.client, up_to, &ack_owed);
         }
@@ -937,6 +941,41 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
     Some(crate::remote_attach::serve_unforwardable(control, shard, origin_host, body).await)
   };
   encode_body(&named_if_unshared(reply, (control, shard), volume, requester).await)
+}
+
+/// A read forwarded from another node, on its volume's owner shard: refused while this node owns the volume by its own
+/// routing but has not made it yet ([`forwarded_before_made`]), else dispatched as a local read is.
+fn serve_forwarded_read(
+  state: &mut ShardState,
+  principal: &Principal,
+  body: RequestBody,
+  volume: VolumeId,
+) -> ReplyBody {
+  forwarded_before_made(state, volume)
+    .unwrap_or_else(|| dispatch(state, FORWARDED_CLIENT, principal, body))
+}
+
+/// Format: the status count of verbs forwarded from another node to this one as `volume`'s owner by this node's routing
+/// (a takeover's successor) before it made the volume, refused `Overloaded` ([`forwarded_before_made`]).
+const FORWARD_BEFORE_MADE: &str = "fleet.forward.refused.before_made";
+
+/// The refusal a verb forwarded from another node meets on `volume`'s owner shard when this node owns the volume by its
+/// own routing (a takeover's successor) but its catalog does not hold it yet: `Overloaded`, retryable, the answer a local
+/// client's verb gets here ([`owned_unmaterialized`]). Dispatched, the verb found no volume and answered `NotFound`,
+/// telling a reader its acknowledged write did not exist (the chaos nemesis at seed 6876545201569229162, ReadSafety:
+/// reads through a holder during the owner's isolation, forwarded to the successor its routing named, `NotFound` five
+/// times a run), and a forwarded write had that `NotFound` recorded as its completion. A volume this shard records
+/// unrecovered is dispatched, so its typed refusal names why (A-394).
+fn forwarded_before_made(state: &mut ShardState, volume: VolumeId) -> Option<ReplyBody> {
+  let id = to_db_volume(volume);
+  if state.fleet.object_owner(ObjectId(volume.bytes)) != Some(state.fleet.host())
+    || state.db.partition().volume(id).is_some()
+    || state.unrecovered.contains_key(&id)
+  {
+    return None;
+  }
+  state.count(FORWARD_BEFORE_MADE, 1);
+  Some(refused(Refusal::Overloaded { shard: state.shard }))
 }
 
 /// The answer to a forwarded write once its verb has run on the owner `shard`: its reply after the mounts its change owes
@@ -19579,6 +19618,77 @@ mod tests {
       Err(Refusal::ConsumerNotEnrolled),
       "a proof under a guessed capability does not verify"
     );
+  }
+
+  /// The chaos nemesis at seed 6876545201569229162 (ReadSafety; §4.8 "Lookup"): a verb forwarded to this node as a
+  /// volume's owner by its own routing, a takeover's successor, before it has made the volume is refused `Overloaded`,
+  /// retryable, never answered `NotFound`. Do: route a volume another member created to this node, as a takeover's install
+  /// routes it to its successor, without making it; serve a forwarded status read of it as `serve_forward` does on its
+  /// owner shard; then create a volume here and serve the same read of it. Expect the first refused `Overloaded` and
+  /// counted once, the second answered. Before, the first answered `NotFound`: a reader through a holder was told its
+  /// acknowledged write did not exist.
+  #[test]
+  fn a_forwarded_read_of_a_volume_owned_here_but_not_made_is_refused_retryably() {
+    let (unmade, made, counted) = crate::daemon::audit_on_shard(|state| {
+      let principal = Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 1234,
+      };
+      let local = state.fleet.host();
+      let creator = slates_db::HostId(local.0 ^ 1);
+      let unmade_id = super::VolumeId {
+        bytes: slates_db::register::ObjectId::new(creator, 7).0,
+      };
+      state
+        .fleet
+        .track_object_owner(slates_db::register::ObjectId(unmade_id.bytes), local);
+      let unmade = super::serve_forwarded_read(
+        state,
+        &principal,
+        super::RequestBody::Status { volume: unmade_id },
+        unmade_id,
+      );
+      let super::ReplyBody::Created { id } = super::dispatch(
+        state,
+        1,
+        &principal,
+        super::RequestBody::Create {
+          name: "made-here".to_owned(),
+          size: super::SizeClass::Dynamic { max: 1 << 20 },
+          names: super::NamePolicy::Exact,
+          require_locked: false,
+          base: None,
+        },
+      ) else {
+        panic!("the volume was created")
+      };
+      let made = super::serve_forwarded_read(
+        state,
+        &principal,
+        super::RequestBody::Status { volume: id },
+        id,
+      );
+      let counted = state
+        .refusals
+        .get(super::FORWARD_BEFORE_MADE)
+        .copied()
+        .unwrap_or(0);
+      (unmade, made, counted)
+    });
+    assert!(
+      matches!(
+        unmade,
+        super::ReplyBody::Refused {
+          refusal: Refusal::Overloaded { .. }
+        }
+      ),
+      "a volume owned here but not made is refused retryably: {unmade:?}"
+    );
+    assert!(
+      !matches!(made, super::ReplyBody::Refused { .. }),
+      "a volume made here is answered: {made:?}"
+    );
+    assert_eq!(counted, 1, "counted once");
   }
 }
 

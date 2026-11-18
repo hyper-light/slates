@@ -28362,3 +28362,25 @@ alone cannot see it, since one call is the same steps).
 Applied in the same change to: D-17 (its amendment line), GAPS (A-347's one-turn walks: the restore's steps exist; the
 server still restores in one turn until the population and the plain takeover path follow),
 `crates/archive/src/{restore,lib}.rs`, `crates/archive/tests/restore.rs`.
+
+### A-394 — A verb forwarded to a takeover's successor before it has made the volume is refused retryably, never answered `NotFound` (2026-11-18, kiln goal g250; §4.8 "Lookup"; ReadSafety; the chaos nemesis, seed 6876545201569229162)
+Applied in the same change to: GAPS (the entry at its head) and `crates/server/src/verbs.rs` (`serve_forward`,
+`serve_forwarded_read`, `forwarded_before_made`, `fleet.forward.refused.before_made`).
+- **What was there.** A node serves a verb another node forwarded to it as the volume's owner without asking whether it
+  holds the volume: the sender found it the owner, and a forward is one hop. A takeover's install moves the volume's
+  route to its successor on every holder before the successor has made it, so in that window a holder forwards a
+  client's read there, and the successor, finding no volume in its catalog, answered `NotFound`: a claim that the file
+  does not exist, which ReadSafety refuses (an owner-location round never answers `NotFound` for a view it cannot
+  reach). A forwarded write met the same answer and had it recorded as its completion. With A-382 in, the chaos
+  nemesis at seed 6876545201569229162 recovered from all fourteen faults on the Mac Studio and failed on this alone,
+  3 of 3 runs: five reads through a holder during the owner's isolation, each "missing". A diagnostic build logged each
+  read forwarded to the successor the holder's routing named, answered `NotFound` there.
+- **The rule.** On the volume's owner shard, a forwarded verb for a volume this node owns by its own routing and does
+  not hold in its catalog is refused `Overloaded` (retryable), before any completion is recorded, the answer a local
+  client's verb already gets there (`owned_unmaterialized`). A volume recorded unrecovered is dispatched as before, so its
+  typed refusal names why.
+- **Tests.** `a_forwarded_read_of_a_volume_owned_here_but_not_made_is_refused_retryably` (`crates/server/src/verbs.rs`:
+  a volume another member created routed to this node and not made, a forwarded status read refused `Overloaded` and
+  counted, a volume made here answered; without the guard the read answered `NotFound`). The chaos nemesis at seed
+  6876545201569229162 on the Mac Studio (kiln r264, 2026-11-18, debug build): 2 of 2 runs passed with every invariant
+  held, 91.9 s and 63.5 s, where main bf58691 failed ReadSafety in 3 of 3 (r212).

@@ -1,5 +1,20 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A takeover's successor answered a forwarded read `NotFound` before it had made the volume: fixed (2026-11-18, A-394,
+> ReadSafety, §4.8 "Lookup"; g250; the chaos nemesis, seed 6876545201569229162 on macOS).** With A-382 in, the seed's
+> fourteen faults all recovered on the Mac Studio, and the verdict failed ReadSafety alone, 3 of 3 runs: during the first
+> fault (the owner isolated), five reads through a holder of the newest acknowledged writes answered "missing". A
+> diagnostic build (kiln r251) logged each: the holder's routing named the takeover's successor as the owner, the holder
+> forwarded the reads there, and the successor, owning the volume by its own routing but not yet holding it in its
+> catalog, served each as any forwarded verb is served, found no volume and answered `NotFound`: a claim that the file
+> did not exist. A forwarded write met the same `NotFound` and had it recorded as its completion. A local client's verb
+> there already met `owned_unmaterialized`'s retryable `Overloaded`; a forwarded one now meets the same
+> (`verbs::forwarded_before_made`, counted `fleet.forward.refused.before_made`), before any completion is recorded.
+> Test: `a_forwarded_read_of_a_volume_owned_here_but_not_made_is_refused_retryably` (`crates/server/src/verbs.rs`), red
+> without the guard (`NotFound`). The seed on the fix (kiln r264, Mac Studio, debug build): 2 of 2 runs pass, every
+> invariant held, 91.9 s and 63.5 s; on main bf58691 without it (r212), 3 of 3 failed ReadSafety alone, five reads each.
+> **Owed (the supervisor's):** the seed on both Linux arches on the fix.
+
 > **A host admitted again refused its successor's records for good, so its live copy never caught up: fixed
 > (2026-11-18, A-382, §4.8 "Authority scope"; g230; the chaos nemesis's convergence, seeds 6876545201569229162 and
 > 7236833171758868842 on arm64, CI diag 44345243646).** The superseded adopter, admitted again under its id, kept its
