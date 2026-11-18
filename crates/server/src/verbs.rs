@@ -5835,32 +5835,41 @@ pub(crate) fn admit(
   // ([`Volume::hold_versions`] below; A-342), as its bytes grow — one big maximum promised the whole slab to a volume
   // holding 54 bytes (docs/bugs/2026-11-18-a-dynamic-volume-reserved-the-whole-version-slab.md).
   let inode_alloc = inode_allowance(state, size);
-  let version_credit = match size {
-    SizeClass::Bounded { .. } => match state.store.versions.reserve(inode_alloc) {
-      Ok(c) => Some(c),
-      Err(slates_mem::MemError::BudgetExceeded { available, .. }) => {
-        report_first_budget_refusal(state, "versions", inode_alloc, available);
-        return Err(Box::new(give_back(
-          state,
-          reservation,
-          None,
-          None,
-          Refusal::BudgetExceeded { available },
-        )));
-      }
-      Err(e) => {
-        return Err(Box::new(give_back(
-          state,
-          reservation,
-          None,
-          None,
-          Refusal::BadRequest {
-            reason: e.to_string(),
-          },
-        )));
-      }
-    },
-    SizeClass::Dynamic { .. } => None,
+  // A dynamic volume's first slots are its root's, taken here, before the volume is made, as a claim's reservation
+  // is, so a refusal leaves no root inode, trie or dir allocated; they become its hold once it is made (below).
+  let (wanted, taken) = match size {
+    SizeClass::Bounded { .. } => (inode_alloc, state.store.versions.reserve(inode_alloc)),
+    SizeClass::Dynamic { .. } => (
+      slates_vfs::volume::NEW_VOLUME_INODES,
+      state
+        .store
+        .versions
+        .grow(slates_vfs::volume::NEW_VOLUME_INODES),
+    ),
+  };
+  let version_credit = match taken {
+    Ok(c) => Some(c),
+    Err(slates_mem::MemError::BudgetExceeded { available, .. }) => {
+      report_first_budget_refusal(state, "versions", wanted, available);
+      return Err(Box::new(give_back(
+        state,
+        reservation,
+        None,
+        None,
+        Refusal::BudgetExceeded { available },
+      )));
+    }
+    Err(e) => {
+      return Err(Box::new(give_back(
+        state,
+        reservation,
+        None,
+        None,
+        Refusal::BadRequest {
+          reason: e.to_string(),
+        },
+      )));
+    }
   };
   // The volume's records — its journal budget, its object, its snapshot slab's first segment — are
   // reserved against the shard's metadata ledger before anything is allocated (§4.2 metadata
@@ -5949,19 +5958,15 @@ pub(crate) fn admit(
       refusal_of_vfs(&e),
     )));
   }
-  // A dynamic volume holds a slot for its root now, and for each inode it makes from here (A-342). Whole or refused
-  // with nothing taken, and the last step that can refuse, so a refusal has no hold to return.
-  if matches!(size, SizeClass::Dynamic { .. })
-    && let Err(e) = volume.hold_versions(&mut state.store)
-  {
-    return Err(Box::new(give_back(
-      state,
-      reservation,
-      version_credit,
-      metadata_credit,
-      refusal_of_vfs(&e),
-    )));
-  }
+  // A dynamic volume's root slot becomes its hold (A-342), which grows as it makes inodes and goes back with it at
+  // teardown, never a reserved credit.
+  let version_credit = match version_credit {
+    Some(credit) if matches!(size, SizeClass::Dynamic { .. }) => {
+      volume.adopt_version_hold(credit.slots);
+      None
+    }
+    credit => credit,
+  };
   Ok(Admitted {
     volume,
     host,
@@ -10420,6 +10425,31 @@ fn settle_version_reservation(
   slates_mem::budget::VersionCredit { slots: new }
 }
 
+/// The version slots a resized volume's reservation moves to: a bounded claim's new allowance; a dynamic volume's
+/// unchanged (A-342), since it reserves none of its allowance and holds slots for its inodes instead.
+fn resized_reservation(volume: &Volume, old: u64, new_allowance: u64) -> u64 {
+  if volume.holds_versions() {
+    old
+  } else {
+    new_allowance
+  }
+}
+
+/// The version credit a resized volume's slot holds once the core accepted the resize: a bounded claim's reservation
+/// settled from its `old` slots to its new allowance ([`settle_version_reservation`]); a dynamic volume's unchanged
+/// (A-342), as it reserves none.
+fn settle_resized_credit(
+  versions: &mut slates_mem::budget::VersionBudget,
+  volume: &Volume,
+  credit: Option<slates_mem::budget::VersionCredit>,
+  (old, new_allowance): (u64, u64),
+) -> Option<slates_mem::budget::VersionCredit> {
+  if volume.holds_versions() {
+    return credit;
+  }
+  Some(settle_version_reservation(versions, old, new_allowance))
+}
+
 fn resize(
   state: &mut ShardState,
   principal: &Principal,
@@ -10448,10 +10478,7 @@ fn resize(
   };
   let new_allowance = derived_inode_allowance.max(slot.volume.inode_usage().0);
   let old_version = slot.version_credit.map_or(0, |c| c.slots);
-  // Only a bounded claim's reservation moves with its allowance; a dynamic volume's allowance is a ceiling it reserves
-  // nothing of, its slots a hold that grows as it makes inodes (A-342).
-  let reserves = !slot.volume.holds_versions();
-  let reserved = if reserves { new_allowance } else { old_version };
+  let reserved = resized_reservation(&slot.volume, old_version, new_allowance);
   let version_grown =
     match grow_version_reservation(&mut state.store.versions, old_version, reserved) {
       Ok(v) => v,
@@ -10497,13 +10524,12 @@ fn resize(
   // settle the byte reservation the same way.
   // Never refused: `new_allowance` is at least the live count, the setter's one refusal. Counted all the same.
   let allowed = slot.volume.set_inode_allowance(new_allowance);
-  if reserves {
-    slot.version_credit = Some(settle_version_reservation(
-      &mut state.store.versions,
-      old_version,
-      new_allowance,
-    ));
-  }
+  slot.version_credit = settle_resized_credit(
+    &mut state.store.versions,
+    &slot.volume,
+    slot.version_credit,
+    (old_version, new_allowance),
+  );
   if let Some(old) = old {
     let combined = old.bytes.saturating_add(grown.map_or(0, |g| g.bytes));
     state

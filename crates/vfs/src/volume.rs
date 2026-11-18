@@ -65,6 +65,11 @@ const DESTROY_CLOCK_EVERY_UNITS: usize = 16;
 /// smaller is the volume's bound so a landing never produces a file the target refuses.
 pub const LINK_MAX: u32 = 32_767;
 
+/// Format: the live inodes a volume is made with — its root directory, and nothing else. The version
+/// slots a dynamic volume holds from its admission (A-342), taken before it is made so a refusal leaves
+/// nothing allocated.
+pub const NEW_VOLUME_INODES: u64 = 1;
+
 /// Derived: the inode-version budget's operation headroom (§4.2) — the transient version a copy-up
 /// holds. `Volume::make_current_inode` inserts the new inode version and retires the old within one
 /// synchronous, exclusively-borrowed shard call (no `await` between the insert and the retire), so
@@ -768,7 +773,7 @@ impl Volume {
       takeover_below: InodeNo(0),
       takeover_kept: BTreeSet::new(),
       dirty: crate::delta::Dirty::default(),
-      live_inodes: 1,
+      live_inodes: NEW_VOLUME_INODES,
       inode_allowance: u64::MAX,
       holds_versions: false,
       version_hold: 0,
@@ -964,7 +969,7 @@ impl Volume {
       takeover_below: InodeNo(0),
       takeover_kept: BTreeSet::new(),
       dirty: crate::delta::Dirty::default(),
-      live_inodes: 1,
+      live_inodes: NEW_VOLUME_INODES,
       inode_allowance: u64::MAX,
       holds_versions: false,
       version_hold: 0,
