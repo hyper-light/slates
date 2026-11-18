@@ -6667,7 +6667,8 @@ so an agent that needs durability can `await placed(scope)`.
 > (`crates/server/tests/fleet.rs`: two shards a node, the volume on a non-control shard, the successor restarted warm
 > the moment its takeover is counted, before any write; every file reads back; on main's code `NoImage` at two shards a
 > node and at one). A-338's test could not show this guard missing: it writes through the successor right after the
-> takeover, and that write's barrier publishes the volume, its image and its shipper both.
+> takeover, and that write's barrier publishes the volume, its image and its shipper both. A live log itself survives
+> its owner's warm restart since A-344 (§4.10 status, "A live log forked at its owner's warm restart").
 
 > **Status (2026-11-05, A-222: another host's write attachment).** A client on another node attaches a volume in the
 > record form, through the fleet's forward, and writes it through the file verbs; the owner records it under the
@@ -7189,6 +7190,30 @@ derived from the measured apply rate applies credit backpressure to that volume'
 >   `a_superseded_owners_clients_reach_its_successor` (`crates/server/tests/fleet.rs`). Owed (GAPS): a mount on the old
 >   owner (NFS, FUSE) still answers `StaleEpoch`; and a node with no routing entry for its own lost object takes itself
 >   as the creator route. A successor ships a live volume from its takeover since A-343.
+> - **A live log forked at its owner's warm restart (fixed 2026-11-18, A-344).** The shipper lived in the owner shard's
+>   memory alone, and a restarted owner made a new one at its next publication, from nothing, at the greater of its
+>   host's epoch and `placed_heads`' (memory too). An owner restarted warm shipped a second chain from position 0 under
+>   the same epoch: a holder that held nothing took it and made a write durable on it, a holder at the old chain's head
+>   refused it, and a takeover's phase one, adopting the greatest rank, adopted the old chain and lost that write
+>   (Agreement and NoLoss). A successor restarted warm shipped, and wrote the volume's records, at its host's epoch under
+>   the fence its takeover had raised, so nothing placed and its writes waited past the client's deadline; and its own
+>   copy of the log came back from the restart below the fence it had raised. Now an owner shard keeps, for each live
+>   log it ships, a piece of its recovery image (`live_ship::OwnedLive`: the epoch, the position the next entry takes,
+>   the fence a holder answered with), carried by every publication that captures the volume, at the position that
+>   publication's entry takes (an entry is appended only once its publication commits, so no position past the kept one
+>   was ever shipped), and by one that changes it. A restarted owner makes its shipper again past that position under
+>   that epoch (`Shipper::resumed`): its first entry ranks above every entry of its old chain, each holder is installed
+>   from it, and no position it may have shipped is used again; one fenced before stays fenced, so its verbs keep going
+>   to its successor (A-338). A newly learned fence is published at once. A successor's records are written at the
+>   promotion epoch its volume record keeps (A-325's `taken_over`, `fleet::promotion_epoch`), and it publishes the fence
+>   it raises on its own copy before its own report counts, as a remote candidate does. The db model's restart nemesis
+>   holds every invariant (800 runs at `f = 1` and `f = 2`, the candidates fixed and following a joint transition: 7,151 restarts, 3,520 of them between an image and its append, 13,107 installs, 496 takeovers); begun again at genesis, as before, 790 of the 800 runs broke, 138 on Agreement and 16 on NoLoss; resumed past the
+>   durable position alone, 788 broke, 77 on Agreement and 7 on NoLoss. Held by `a_write_answered_after_a_live_owners_warm_restart_survives_its_takeover`,
+>   `a_successor_restarted_warm_takes_a_write_to_the_volume_it_took_over`,
+>   `a_successors_own_copy_keeps_its_raised_fence_across_its_warm_restart` and
+>   `a_superseded_owner_restarted_warm_answers_reads_with_its_successors_writes` (`crates/server/tests/fleet.rs`), each
+>   red on main's code and with its guard alone removed. A restarted owner ships its log again at its next publication:
+>   until a write, its holders keep the old chain, which holds every write acknowledged before the restart.
 
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
@@ -25099,3 +25124,36 @@ Applied in the same change to:
   successor's log starts at the takeover, with a whole entry past every position durable before it, and ships to the
   holder set the dead owner recorded. A refused publication keeps the takeover pending
   (`fleet.materialize.unpublished`), as A-325 said.
+
+### A-344 — A live log survives its owner's warm restart: the owner keeps its log's epoch, the position its next entry takes and its fence in its recovery image, and resumes past that position; a restarted successor keeps its promotion epoch, and its own copy its raised fence (2026-11-18, g230, scale-out; §4.10 live shipping, §4.8 "Recovery"; A-200, A-240, A-325, A-329, A-338)
+Applied in the same change to:
+- §4.10 live shipping: the chaos flows' status ("A live log forked at its owner's warm restart"); §4.8 Recovery: A-343's
+  status points to it.
+- `crates/db/src/live.rs`: `Shipper::resumed`, `Shipper::next_position`; `transferred` takes a resumed shipper's first
+  entry as the floor. `crates/server/src/live_ship.rs`: `OwnedLive` and the owner's kept pieces (`owned_changes`,
+  `owned_pieces`, `owned_committed`, `restore_owned`), `planned`, `fenced`, `fold_into`, `fetch`.
+  `crates/server/src/content_holder.rs`: the held image's owned kind. `crates/server/src/fleet.rs`: `promotion_epoch`
+  in `owed_record`. `crates/server/src/verbs.rs`: both publication paths commit the owned pieces.
+- Tests: the db model's restart nemesis and its two mutations (`crates/db/tests/live.rs`), the resumed shipper's unit
+  test; four fleet tests (`crates/server/tests/fleet.rs`), each red on main's code and with its guard alone removed.
+- GAPS: the entry of 2026-11-18. Bug record: `docs/bugs/2026-11-18-a-live-log-forked-at-its-owners-warm-restart.md`.
+- **What was there.** A-200 kept the owner's log in its shard's memory and made the shipper at the volume's first
+  publication; nothing said what a warm restart of the owner does to it. A restarted owner began again at position 0
+  under the same epoch, two chains at one epoch, and the rank phase one adopts by let the old chain win over writes the
+  new one had made durable. A restart also forgot a successor's promotion epoch (`placed_heads`), its fence on its own
+  copy, and an owner's knowledge that it was superseded.
+- **The rule.**
+  - An owner keeps, per live log it ships, its epoch, the position its next entry takes and the epoch a holder fenced it
+    at, in its shard's recovery image, carried by every publication that captures the volume (at the position that
+    publication's entry takes, since an entry is appended only after its publication commits) and by one that changes
+    it. A newly learned fence is published at once.
+  - A restarted owner makes its shipper again under the kept epoch, its first entry one past the kept position, whole:
+    no position it may have shipped is used again, so its new chain ranks above every entry of the old, and each holder
+    is installed from it. Nothing before that entry counts as settled or durable. Resuming past the position the owner
+    knew durable is not enough: positions it shipped past that point may be held, and the model breaks then too.
+  - One fenced before its restart stays fenced: its verbs go to its successor (A-338) and it ships nothing.
+  - A successor writes its volume's records at the promotion epoch its volume record keeps (A-325's `taken_over`), so a
+    restart that forgets `placed_heads` does not write them below its holders' fence; and it publishes the fence it
+    raises on its own copy before its own report counts, as a remote candidate publishes its own before it answers.
+  - A restarted owner ships its log again at its next publication; until then its holders keep the old chain, which
+    holds every write acknowledged before the restart.

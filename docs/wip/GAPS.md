@@ -79,6 +79,29 @@
 > - a real FIDO key's signature end to end (the touch flag is proven with a software stand-in);
 > - the integrator's runs on Linux and Windows (the suite is platform-free but for the agent's own channel, Unix).
 
+> **A live log forked at its owner's warm restart: kept and resumed past every position it may have shipped (2026-11-18,
+> A-344, §4.10, §4.8 "Recovery"; g230; found by A-343's probes).** The shipper lived in the owner shard's memory alone.
+> An owner restarted warm (a Mac Studio, three nodes at `f = 1`) took a write (`FsDone`, 410 ms) on a new chain from
+> position 0 under the same epoch: the holder that held nothing took it, the holder at the old chain's position 5 refused
+> it 893 times `behind`, and a takeover's phase one adopts the greatest rank, the old chain's. A successor restarted warm
+> wrote its records and shipped at its host's epoch under the fence its takeover had raised, so its write waited past the
+> client's 30 s deadline; its own copy came back below the fence it had raised; and a superseded owner restarted warm
+> served reads from its own copy. Now an owner keeps each live log's epoch, next position and fence in its recovery image
+> (`live_ship::OwnedLive`) and resumes past that position (`Shipper::resumed`); a successor writes its records at its
+> volume record's promotion epoch and publishes its own raised fence before counting it; a learned fence is published at
+> once. The db model's restart nemesis holds every invariant (800 runs at `f = 1` and `f = 2`, the candidates fixed and following a joint transition: 7,151 restarts, 3,520 of them between an image and its append, 13,107 installs, 496 takeovers) and breaks begun again at genesis
+> (790 of the 800 runs broke, 138 on Agreement and 16 on NoLoss) or resumed past the durable position alone (788 broke, 77 on Agreement and 7 on NoLoss). Tests (each red on main's code and
+> with its guard alone removed): `a_write_answered_after_a_live_owners_warm_restart_survives_its_takeover`,
+> `a_successor_restarted_warm_takes_a_write_to_the_volume_it_took_over`,
+> `a_successors_own_copy_keeps_its_raised_fence_across_its_warm_restart`,
+> `a_superseded_owner_restarted_warm_answers_reads_with_its_successors_writes` (`crates/server/tests/fleet.rs`). Bug
+> record `docs/bugs/2026-11-18-a-live-log-forked-at-its-owners-warm-restart.md`.
+> - **Owed (the supervisor's):** the live chaos flows and the nemesis on the fix, and an owner-restart flow across real
+>   processes (`kill -9` under the anchor, writes before and after, then the owner's loss).
+> - **Owed:** a restarted owner ships its log again only at its next publication; until a write its holders keep the
+>   old chain, which holds every write acknowledged before the restart, but a publication imaged and never appended is
+>   on the owner alone until then.
+
 > **A live-shipped volume taken over was lost by a restart before its first write: published at its takeover
 > (2026-11-18, A-343, §4.8 "persistence before reply"; g230, A-325's live item).** A-325 published a volume taken over
 > from its seal before serving it and left a live-shipped one to its first write's barrier, so a successor restarted
@@ -91,17 +114,8 @@
 > write's barrier publishes the volume.
 > - **Owed (the supervisor's):** the live chaos flows and the nemesis on the fix: the successor now ships a whole entry
 >   at the takeover, not at the first write.
-> - **Open (found by this test's probes, 2026-11-18, Mac Studio; g230 takes it next): a live log does not survive its
->   owner's warm restart.** The shipper lives in the owner shard's memory, and a restarted owner makes a new one at its
->   first publication, from nothing, at `max(placed head's epoch, host epoch)`, both of which a restart forgets
->   (`placed_heads` and `LiveState::adopted` are memory). An owner restarted warm at once took one write (`FsDone` in
->   410 ms) on a new chain from position 0 at its own epoch 1: the holder that had held nothing took it (head 2,
->   durable 2 at `f = 1`), the holder at the old chain's position 5 refused it 893 times `behind`. Two chains at one
->   epoch; a takeover's phase one adopts the greatest rank, (1, 5), so it would lose the write acknowledged after the
->   restart (read from `slates_db::live::adopt`; the run that shows it is the next piece's failing test). A successor
->   restarted warm after its takeover shipped at epoch 1 under the holders' fence 2, `refused.no_credit`, and its write
->   was not answered within the client's 30 s deadline. And the successor's own copy of the log, fenced at 2 by its
->   takeover, came back from the restart at fence 1.
+> - **Found by this test's probes and fixed the same day (A-344, the entry above):** a live log did not survive its
+>   owner's warm restart.
 
 > **A superseded owner stranded its clients: it steps down (2026-11-18, A-338, §4.8, R8; g230, the chaos nemesis's
 > "fence-2 copy behind the fence-1 owner's durable head").** After a takeover the old owner kept its volume fenced and

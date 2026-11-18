@@ -1556,6 +1556,41 @@ fn a_resumed_owners_first_entry_is_past_every_position_it_may_have_shipped() {
   assert_eq!(resumed.durable(), Some(6));
 }
 
+/// A-344 with A-240's joint transition: do resume an owner's shipper past position 5 (holders 2 and 3), begin a
+/// transition to holders 4 and 5, and ask whether the target holds the log before any entry, after the first entry is
+/// appended, and after holder 4 installs it. Expect it short until `f` of the target hold that first entry, which carries
+/// every write made durable on the chain before the restart. Judged at once, nothing being durable on the new chain yet,
+/// the record could name a set that holds none of those writes, and a takeover counting it would lose them.
+#[test]
+fn a_resumed_owners_new_holders_count_only_once_they_hold_its_first_entry() {
+  let hosts = [HostId(1), HostId(2), HostId(3)];
+  let mut resumed = Shipper::resumed(
+    (hosts[0], OBJECT, HostEpoch(1)),
+    Quorum { f: 1 },
+    &hosts,
+    Some(5),
+    bounds_of(8, 16, 1),
+  )
+  .unwrap();
+  assert!(resumed.begin_transition(&[HostId(4), HostId(5)]));
+  assert!(
+    !resumed.transferred(),
+    "no member of the target holds anything of the resumed chain"
+  );
+  let entry = resumed.append(vec![6]).unwrap();
+  assert!(
+    !resumed.transferred(),
+    "the first entry is appended and no member of the target holds it"
+  );
+  let mut four = Replica::new(hosts[0], OBJECT);
+  installed_past_its_chain(&mut resumed, HostId(4), &mut four, &entry);
+  assert_eq!(resumed.on_reply(HostId(4), Ok(four.head())), Next::Nothing);
+  assert!(
+    resumed.transferred(),
+    "f of the target hold the first entry, and with it every write durable before the restart"
+  );
+}
+
 /// A holder's copy of a chain of `entries` entries host `hosts[0]` shipped at epoch 1, positions 0 on.
 fn holder_of_an_old_chain(hosts: &[HostId; 3], entries: u8) -> Replica {
   let mut before = Shipper::new(
