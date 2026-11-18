@@ -153,6 +153,18 @@ seal, loss, one healer step at the at-rest cadence — the first step fires at o
 re-archive in slices, offer, put of the missing chunks, acknowledgement, re-record). The regressions on the
 same machinery: hedge test 6.00 s, seal test 3.85 s, takeover-content test 10.04 s (each `-- --exact`).
 
+**Amended 2026-11-17 (A-276, goal g248).** The re-offer above went to the current cohort in rendezvous order and
+re-recorded whichever holders acknowledged, and a refilled holder counted a repair only when its round collected the
+acknowledgement. Three faults followed: a refill that outlasted the round's collection at the hedge delay restored the
+holder with no repair counted (how this piece's test failed under load); a cohort member holding no head took the
+content in the named holder's place; and a holder that left stayed named, since a head is never rewritten at its
+sequence. Now a heal **restores** exactly the holders the placement names that are candidates, all at once, ends once
+each holds the content and records nothing; a repair counts whenever its acknowledgement is folded; a placement naming a
+departed holder, or fewer than `f + 1`, is **replaced** on the current cohort at the next sequence and recorded with the
+head republished there, as one transaction; and every heal ends once its content round's whole span and a period have
+passed since its first round. §4.10 and A-276 in
+`SLATES_DESIGN.md` hold the rule and its measurements.
+
 **Probation** (the design's "puts a repeatedly late candidate on probation for the group to replace";
 threshold "late count over the measured window that exceeds the hedge rate's variance") is **not** in
 this piece: it is a configuration-group action (the council replaces the candidate), so it belongs with

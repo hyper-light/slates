@@ -71,12 +71,17 @@ fn disk(host: &SimHost) -> Disk {
     .collect()
 }
 
-/// T-1.12 / A-26: planning a landing with IPC names refuses before any host write.
+/// T-1.12 / A-26, A-294: planning a landing with an IPC name or a device node refuses before any host write: a grant
+/// authorizes file content, never a host endpoint or device node, and making a device node on the host would need a
+/// privilege slates never holds (R10).
 #[test]
 fn ipc_names_refuse_landing_before_an_ordinary_file_can_be_written() {
+  use slates_vfs::inode::{DeviceNumber, SpecialNode};
   for kind in [
-    slates_vfs::inode::Kind::Fifo,
-    slates_vfs::inode::Kind::Socket,
+    SpecialNode::Fifo,
+    SpecialNode::Socket,
+    SpecialNode::BlockDevice(DeviceNumber::new(8, 1)),
+    SpecialNode::CharDevice(DeviceNumber::new(0, 0)),
   ] {
     let mut store = store();
     let mut volume = scratch(&mut store);

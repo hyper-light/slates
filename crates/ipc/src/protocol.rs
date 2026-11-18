@@ -860,13 +860,69 @@ pub enum RequestBody {
     subject: PolicySubject,
     /// The policy.
     policy: WritePolicy,
-    /// The keyed hash under the issuer secret.
+    /// The policy version the setter read (`Policy`'s `version`): refused `PolicyChanged` once the policy has moved.
+    version: u64,
+    /// The keyed hash under the launcher's secret, over the subject, the policy and the version.
     proof: [u8; 32],
   },
   /// Reads a write policy (A-285): `None` when none is set, which is ask. Appended.
   Policy {
     /// What the policy is set on.
     subject: PolicySubject,
+  },
+  /// Presents a landing and never lands it, whatever the volume's write policy (A-285): the answer is `GrantRequired`
+  /// with the plan, its entries kept for `LandingEntries`, exactly as an asked `Land` answers, and nothing is written.
+  /// A reviewer reads the changes a bypass volume would land at once, and a forbidden volume's too, since reading them
+  /// writes nothing. Served on the volume's owner shard, as `Land` is. Appended.
+  Present {
+    /// The volume.
+    volume: VolumeId,
+    /// The snapshot, or the head.
+    snapshot: Option<SnapshotId>,
+    /// The target directory's path.
+    target: String,
+    /// The filter.
+    filter: Filter,
+  },
+  /// A `Submit` whose caller's own policy asks (A-285): served as a submit under an ask mode whatever the volumes'
+  /// modes, so the merge is answered `MergeApprovalRequired` (or refused, if a volume forbids it). What an agent's
+  /// channel sends in place of `Submit` when the consumer's merge mode asks; never needed from a client. Appended.
+  SubmitHeld {
+    /// The work volume.
+    work: VolumeId,
+    /// The evidence references (opaque to slates), possibly none.
+    evidence: Vec<[u8; 32]>,
+  },
+  /// An `EditSubmit` whose caller's own policy asks (A-285): the edit applies, and the submit is held as
+  /// `SubmitHeld`'s is. Appended.
+  EditSubmitHeld {
+    /// The work volume.
+    work: VolumeId,
+    /// The file.
+    path: String,
+    /// The offset.
+    at: u64,
+    /// Bytes removed at `at`.
+    delete_len: u64,
+    /// The bytes inserted at `at`.
+    insert: EditBytes,
+    /// The evidence references (opaque to slates), possibly none.
+    evidence: Vec<[u8; 32]>,
+  },
+  /// Submits a work whose merge an ask policy held for approval (A-285): the launcher's or the harness's approval of
+  /// exactly the increment `identity` names (the identity a `MergeApprovalRequired` reply carried), proven by the keyed
+  /// hash under the issuer secret (`slates_server::landing::merge_approval_proof`). The increment is built again and
+  /// merged only if it is still that one; one that changed since is refused `GrantMismatch`. Refused `Forbidden` on a
+  /// consumer-bound channel and `GrantIssuerUnverified` without the proof. Appended.
+  SubmitApproved {
+    /// The work volume.
+    work: VolumeId,
+    /// The evidence references (opaque to slates), possibly none.
+    evidence: Vec<[u8; 32]>,
+    /// The approved increment's identity.
+    identity: [u8; 32],
+    /// The keyed hash under the issuer secret.
+    proof: [u8; 32],
   },
 }
 
@@ -1505,6 +1561,7 @@ impl RequestBody {
       | RequestBody::Edit { work: volume, .. }
       | RequestBody::Declare { work: volume, .. }
       | RequestBody::Submit { work: volume, .. }
+      | RequestBody::SubmitApproved { work: volume, .. }
       | RequestBody::Rebase { work: volume }
       | RequestBody::Clone { volume, .. }
       | RequestBody::Attach { volume, .. }
@@ -1529,12 +1586,15 @@ impl RequestBody {
       | RequestBody::StagePut { work: volume, .. }
       | RequestBody::EditStaged { work: volume, .. }
       | RequestBody::EditSubmit { work: volume, .. }
+      | RequestBody::EditSubmitHeld { work: volume, .. }
+      | RequestBody::SubmitHeld { work: volume, .. }
       | RequestBody::FsWrite { volume, .. }
       | RequestBody::FsWriteStaged { volume, .. }
       | RequestBody::FsRemove { volume, .. }
       | RequestBody::FsRename { volume, .. }
       | RequestBody::FsMkdir { volume, .. }
       | RequestBody::Land { volume, .. }
+      | RequestBody::Present { volume, .. }
       | RequestBody::ImageBuild { volume, .. }
       | RequestBody::ImageMerge { image: volume, .. } => Some(*volume),
       // A volume's policy lives in its record, on its owner shard.
@@ -1588,8 +1648,11 @@ impl RequestBody {
         | RequestBody::Edit { .. }
         | RequestBody::EditStaged { .. }
         | RequestBody::EditSubmit { .. }
+        | RequestBody::EditSubmitHeld { .. }
+        | RequestBody::SubmitHeld { .. }
         | RequestBody::Declare { .. }
         | RequestBody::Submit { .. }
+        | RequestBody::SubmitApproved { .. }
         | RequestBody::Rebase { .. }
         | RequestBody::Clone { .. }
         | RequestBody::Resize { .. }
@@ -2039,7 +2102,8 @@ pub enum WorkOp {
     /// The attribute name.
     name: String,
   },
-  /// Create an IPC namespace inode with explicit metadata and no endpoint state.
+  /// Create a namespace inode with no content, with explicit metadata and no endpoint state: a FIFO or socket name
+  /// (A-26), or a device node and its number (A-294).
   Mknod {
     /// The new path.
     path: String,
@@ -2048,20 +2112,35 @@ pub enum WorkOp {
   },
 }
 
-/// A-26: a declared IPC kind. Device nodes have no wire representation here.
+/// A declared kind of name with no content: a FIFO or socket name (A-26), or a device node with its number, metadata
+/// nothing opens as a device (A-294). The device kinds are appended, so the two earlier tags are unchanged.
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IpcNodeKind {
   /// A named pipe without queued bytes.
   Fifo,
   /// A socket name without a listener or connection.
   Socket,
+  /// A block device node (A-294).
+  BlockDevice {
+    /// The major number.
+    major: u32,
+    /// The minor number.
+    minor: u32,
+  },
+  /// A character device node (A-294); a whiteout is one numbered 0/0.
+  CharDevice {
+    /// The major number.
+    major: u32,
+    /// The minor number.
+    minor: u32,
+  },
 }
 
-/// Metadata supplied by a work's declared IPC creation (§4.16, A-26). These are volume
-/// metadata, not host credentials or endpoint authority. Replay never reads a local clock.
+/// Metadata supplied by a work's declared creation of a name with no content (§4.16, A-26, A-294). These are volume
+/// metadata, not host credentials, endpoint authority or device access. Replay never reads a local clock.
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IpcNode {
-  /// The IPC kind.
+  /// The kind, with a device node's number.
   pub kind: IpcNodeKind,
   /// Permission bits.
   pub mode: u32,
@@ -2135,6 +2214,59 @@ pub struct StatusReport {
   /// daemon issued after its last publication, which no image counted, so such a file is kept, charged to the volume's
   /// quota, until that mount ends. Zero outside a takeover. Appended.
   pub takeover_kept: u32,
+  /// An overlay's base as this status read it, typed (§4.15 "Drift"; A-299): the facts `drifted` and `watcher` carry as
+  /// text for people, for a consumer to match. `None` for a volume with no base folder (a scratch volume, a clone of
+  /// one, a green, a work volume). Appended.
+  pub base: Option<BaseReport>,
+}
+
+/// An overlay's base as a status read it (§4.15 "Drift"; A-299). Append-only.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum BaseReport {
+  /// The base was read.
+  Read {
+    /// Each entry the disk changed after the volume witnessed it: landing it would conflict.
+    drifted: Vec<DriftEntry>,
+    /// Each entry whose re-check the host refused now, by path: not known to match its witness.
+    unverified: Vec<String>,
+    /// The base's watcher.
+    watcher: WatcherState,
+  },
+  /// The base could not be read now: its drift is unknown.
+  Unreadable,
+}
+
+/// One drifted entry of an overlay (§4.15 "Drift").
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct DriftEntry {
+  /// The entry, from the volume's root.
+  pub path: String,
+  /// What the disk did to it.
+  pub kind: DriftKind,
+}
+
+/// What changed on the disk beneath a witnessed entry (§4.15 "Drift"). Append-only.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DriftKind {
+  /// The same file, with other bytes or attributes.
+  Modified,
+  /// The entry is gone.
+  Deleted,
+  /// Another file sits at the path.
+  Replaced,
+  /// A file became a directory, or the reverse.
+  TypeChanged,
+}
+
+/// An overlay's watcher (§4.15): hints that make drift reports prompt, never the truth. Append-only.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WatcherState {
+  /// Delivering hints.
+  Live,
+  /// It lost events; a full re-check is done or scheduled.
+  Overflowed,
+  /// None on this host or folder: fingerprints alone.
+  Unavailable,
 }
 
 /// A volume's journal as its consuming rounds measured it (§4.5 "Journal"). The budget's formula is the mutation rate
@@ -3272,6 +3404,12 @@ pub enum Refusal {
     /// The subject whose policy forbids it.
     by: PolicySubject,
   },
+  /// A `SetPolicy` named a policy version the policy has moved past (A-285): a raced or replayed setting changes nothing.
+  /// Read the policy again and set it from there. Appended.
+  PolicyChanged {
+    /// The policy's version now.
+    current: u64,
+  },
 }
 
 /// Why recovery could not rebuild a volume its catalog holds ([`Refusal::NotRecovered`], §4.8). Append-only.
@@ -3773,6 +3911,19 @@ pub enum ReplyBody {
   Policy {
     /// The policy.
     policy: Option<WritePolicy>,
+    /// The policy's version: how many times it was set, which a `SetPolicy` names.
+    version: u64,
+  },
+  /// A merge an ask policy holds for approval (A-285): nothing was merged. `identity` names the increment exactly
+  /// (`blake3` of the work, its base, its post-state and its ops document, §4.16), so an approval
+  /// (`SubmitApproved`) binds it; `paths` counts the paths it changes. Appended.
+  MergeApprovalRequired {
+    /// The work volume.
+    work: VolumeId,
+    /// The increment's identity.
+    identity: [u8; 32],
+    /// The paths the increment changes.
+    paths: u64,
   },
 }
 

@@ -39,7 +39,7 @@ fn main() -> ExitCode {
   if args.first().map(String::as_str) == Some(PREFIX) {
     return slates_api::role::main(&args[..1], &args[1..]);
   }
-  let tests: [(&str, fn()); 5] = [
+  let tests: [(&str, fn()); 8] = [
     (
       "an_instance_starts_from_the_hosts_own_executable_serves_and_stops",
       an_instance_starts_from_the_hosts_own_executable_serves_and_stops,
@@ -59,6 +59,18 @@ fn main() -> ExitCode {
     (
       "a_wait_for_an_instance_nobody_starts_ends_unavailable_at_its_deadline",
       a_wait_for_an_instance_nobody_starts_ends_unavailable_at_its_deadline,
+    ),
+    (
+      "an_instance_started_with_a_launcher_secret_takes_it_and_serves",
+      an_instance_started_with_a_launcher_secret_takes_it_and_serves,
+    ),
+    (
+      "an_anchor_handed_a_bad_launcher_record_refuses_to_start",
+      an_anchor_handed_a_bad_launcher_record_refuses_to_start,
+    ),
+    (
+      "the_launchers_secret_proves_its_policy_across_a_daemon_restart",
+      the_launchers_secret_proves_its_policy_across_a_daemon_restart,
     ),
   ];
   let filter = args.iter().find(|arg| !arg.starts_with('-'));
@@ -101,7 +113,10 @@ struct Stopping(Option<Anchor>);
 impl Stopping {
   /// Stops the anchor now; its exit code.
   fn stop(mut self) -> Option<i32> {
-    self.0.take().unwrap().stop().unwrap()
+    match self.0.take().map(Anchor::stop) {
+      Some(Ok(code)) => code,
+      other => panic!("the held anchor stops: {other:?}"),
+    }
   }
 }
 
@@ -245,4 +260,118 @@ fn a_wait_for_an_instance_nobody_starts_ends_unavailable_at_its_deadline() {
     "{refused:?}"
   );
   assert!(began.elapsed() >= NOBODY_WAIT, "{:?}", began.elapsed());
+}
+
+/// A-299. Do: start an instance from this binary with a launcher secret, which the start hands the anchor on its
+/// standard input, and use it. Expect: the anchor takes the record (an anchor that could not would refuse to start) and
+/// the instance serves; the secret's issuer refuses only what the launcher's authority cannot prove, a consensus
+/// recovery.
+fn an_instance_started_with_a_launcher_secret_takes_it_and_serves() {
+  let instance = instance_name("launcher");
+  let secret = slates_api::LauncherSecret::generate().unwrap();
+  let started = Instance::start(&spec(&instance).with_launcher(secret.clone())).unwrap();
+  let mut slates = started.instance;
+  let anchor = Stopping(Some(started.anchor));
+  assert_eq!(
+    slates.daemon_status().unwrap().shards.len(),
+    usize::from(TEST_SHARDS)
+  );
+  assert_eq!(
+    slates_api::Issuer::from_launcher_secret(&secret).recovery_proof(&[0; 32]),
+    Err(Error::Denied(slates_api::Denied::NoAuthority(
+      slates_api::IssuerFault::LauncherCannotRecover
+    )))
+  );
+  assert_eq!(anchor.stop(), Some(0));
+}
+
+/// A-299. Do: launch this binary's anchor with the launcher's marker set and a standard input holding bytes that are not
+/// a launcher's record, then with one cut short. Expect: each anchor refuses to start with the refused-configuration
+/// code before the instance answers — an anchor whose starter meant to give it authority and failed never runs.
+fn an_anchor_handed_a_bad_launcher_record_refuses_to_start() {
+  use std::io::Write;
+  for (tag, bytes) in [
+    ("garbage", vec![7u8; slates_api::launcher::RECORD_BYTES]),
+    ("short", vec![7u8; 3]),
+  ] {
+    let instance = instance_name(tag);
+    let mut command = spec(&instance).anchor_command().unwrap();
+    let (reader, mut writer) = std::io::pipe().unwrap();
+    writer.write_all(&bytes).unwrap();
+    drop(writer);
+    command
+      .env(
+        slates_api::launcher::ENV_LAUNCHER,
+        slates_api::launcher::LAUNCHER_ON_STDIN,
+      )
+      .stdin(std::process::Stdio::from(reader));
+    let mut child = command.spawn().unwrap();
+    assert_eq!(
+      Instance::wait_for(&instance, Some(&mut child), None).unwrap_err(),
+      Error::Start(StartFault::AnchorExited {
+        code: Some(i32::from(slates_api::role::EXIT_REFUSED))
+      }),
+      "{tag}"
+    );
+  }
+}
+
+/// A-299, A-285. Do: start an instance from this binary with a launcher secret, set a volume's write policy under the
+/// secret's authority and under a stranger's, then kill the daemon (the anchor restarts it, as after a crash) and set
+/// the policy again under the same secret. Expect: the launcher's setting holds and reads back; the stranger's is
+/// refused `Unproven`; after the restart the new daemon, which minted an issuer secret of its own, still verifies the
+/// launcher's proof — the authority a host keeps outlives the daemon — and the volume keeps its policy and takes the new
+/// one.
+fn the_launchers_secret_proves_its_policy_across_a_daemon_restart() {
+  use slates_api::{Denied, PolicySubject, WriteMode, WritePolicy};
+  let instance = instance_name("restart");
+  let secret = slates_api::LauncherSecret::generate().unwrap();
+  let started = Instance::start(&spec(&instance).with_launcher(secret.clone())).unwrap();
+  let mut slates = started.instance;
+  let anchor = Stopping(Some(started.anchor));
+  let launcher = slates_api::Issuer::from_launcher_secret(&secret);
+  let volume = slates
+    .provision(&slates_api::VolumeSpec::empty("governed", ROOM))
+    .unwrap()
+    .volume();
+  let subject = PolicySubject::Volume(volume);
+  let bypass = WritePolicy {
+    merge: WriteMode::Bypass,
+    land: WriteMode::Bypass,
+    require_signed_merges: false,
+  };
+  slates
+    .set_write_policy(subject, &bypass, &launcher)
+    .unwrap();
+  assert_eq!(slates.write_policy(subject).unwrap(), Some(bypass));
+  let stranger =
+    slates_api::Issuer::from_launcher_secret(&slates_api::LauncherSecret::generate().unwrap());
+  assert_eq!(
+    slates.set_write_policy(subject, &WritePolicy::UNSET, &stranger),
+    Err(Error::Denied(Denied::Unproven))
+  );
+  #[cfg(unix)]
+  {
+    let anchor_pid = anchor.0.as_ref().unwrap().id();
+    let (daemon_pid, _) = processes_of(&instance)
+      .into_iter()
+      .find(|(pid, args)| *pid != anchor_pid && args.contains(" daemon "))
+      .unwrap();
+    let daemon = rustix::process::Pid::from_raw(i32::try_from(daemon_pid).unwrap()).unwrap();
+    rustix::process::kill_process(daemon, rustix::process::Signal::KILL).unwrap();
+    let ask = WritePolicy {
+      land: WriteMode::Ask,
+      ..bypass
+    };
+    // The client reconnects to the daemon the anchor restarted, under its own id, and the setting is sent to it.
+    slates.set_write_policy(subject, &ask, &launcher).unwrap();
+    assert_eq!(slates.write_policy(subject).unwrap(), Some(ask));
+    assert!(
+      processes_of(&instance)
+        .iter()
+        .all(|(pid, _)| *pid != daemon_pid),
+      "the daemon that answered is a new one"
+    );
+  }
+  assert_eq!(anchor.stop(), Some(0));
 }

@@ -24,6 +24,7 @@
 //! - *Signed work* ([`signed`]): a merge or a landing may carry a signature, and its outcome says how it was judged
 //!   ([`Verification`]); a volume's policy may require signed merges. Signatures never gate permission.
 //! - *Errors* ([`error`]): one closed taxonomy whose variant is what a consumer does about it.
+//! - *The seam* ([`seam`], [`sim`]): the volume verbs as a trait, for hosts that need a simulator (A-310).
 //!
 //! **Starting an instance with no slates binary** ([`start`], [`role`]). A host starts its instance from its own
 //! executable: [`Instance::start`] runs `HOST_EXE PREFIX... --instance NAME anchor`, and the host's `main` hands the
@@ -46,7 +47,13 @@
 //! **What is owed** (GAPS, the A-278 and A-299 rows): the starter handed the launcher's authority on every platform;
 //! the write modes, approvals of merges and signed work verified on the daemon's side (A-285); typed fields on the wire
 //! for drift, a presentation's conflicts and a merge's versions, replacing what this crate reads from text; a paged
-//! listing; an async form over a host's reactor (R6); a seam trait with a simulator and a conformance suite.
+//! listing; an async form over a host's reactor (R6); a typed class for a pinned snapshot's destroy, which the daemon
+//! answers untyped (`Invalid::Request`, A-310).
+//!
+//! **The seam (A-310).** A host whose rules reach other products only through a trait with a simulator and a
+//! conformance suite (Hex's `CLAUDE.md` §9) holds [`Volumes`]: the contract's volume verbs, implemented by [`Instance`]
+//! and by [`SimVolumes`], an in-memory stand-in that answers the same typed outcomes and errors. One conformance suite
+//! runs over both (`tests/seam.rs`).
 
 // The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds are exempt.
 // The panic rule: a print macro panics on a refused write, and a library prints nothing: every outcome is returned.
@@ -57,11 +64,15 @@ pub mod error;
 pub mod grant;
 pub mod instance;
 pub mod issuer;
+pub mod launcher;
 pub mod mount;
+pub mod observe;
 pub mod outcome;
 pub mod policy;
 pub mod role;
+pub mod seam;
 pub mod signed;
+pub mod sim;
 pub mod start;
 pub mod volume;
 
@@ -73,13 +84,18 @@ pub use error::{
 pub use grant::{GrantAuthority, GrantClaim, GrantProof};
 pub use instance::{Instance, LandingRequest};
 pub use issuer::{GRANT_TERM_NS, Issuer};
+pub use launcher::{LauncherFault, LauncherSecret};
 pub use mount::{MountKind, MountOptions, Mounted};
+pub use observe::{AuditKind, AuditRecord, GrantRecord, GrantState, LandingStage};
 pub use outcome::{
-  ActionTally, Approval, Awaiting, LandOutcome, LandingConflict, LandingReport, LandingState,
-  MergeConflict, MergeConflictClass, MergeConflicts, MergeOutcome, RebaseOutcome, Summary, Work,
+  ActionTally, LandOutcome, LandingApproval, LandingConflict, LandingReport, LandingState,
+  MergeApproval, MergeConflict, MergeConflictClass, MergeConflicts, MergeOutcome, RebaseOutcome,
+  Summary, Work,
 };
 pub use policy::{PolicyReason, PolicyRefusal, PolicySubject, WriteAct, WriteMode, WritePolicy};
+pub use seam::Volumes;
 pub use signed::{SignatureFault, Signer, SignerKey, Verification, WorkSignature};
+pub use sim::SimVolumes;
 pub use start::{Anchor, StartSpec, Started};
 pub use volume::{
   BaseState, Drift, DriftKind, DriftReport, Provisioned, Source, VolumeSpec, VolumeStatus, Watcher,
@@ -92,18 +108,32 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Format: the consumer contract's version (§4.12 "Versioning", A-299), raised by one with every change to a type or a
 /// verb of the contract; a consumer asserts the one it was written against. 1: the contract as A-299 first published it
 /// (2026-11-18). 2: `Denied::Policy`, the class a write policy's refusal takes outside a landing or a merge (the
+/// same day). 3: `Instance::set_write_policy` and `Instance::write_policy`, over the daemon's policy verbs (A-285), and
+/// a landing or a merge a policy forbids answered as its `Refused` outcome (the same day). 4: the audit log and the
+/// grant listing typed (`AuditRecord`, `GrantRecord`; the same day). 5: `WritePolicy::UNSET` merges at once and asks
+/// for landings, as the daemon applies an unset policy (the same day). 6: a merge an ask mode holds is a
+/// `MergeApproval` (the increment's identity and paths) approved by `approve_merge`, and a landing's approval a
+/// `LandingApproval` approved by `approve_landing` (`Approval` and `approve` split by what they approve); `merge` takes
+/// evidence; `plan_landing` presents through the daemon's present-only verb whatever the mode (the same day). 7: the
+/// launcher's own secret: `LauncherSecret`, `StartSpec::launcher` and `with_launcher`, `Issuer::from_launcher_secret`,
+/// `StartSpec::anchor_command` fallible (`StartFault::Launcher`), `IssuerFault::LauncherCannotRecover`,
+/// `Unsupported::SecureRandom`; and, from A-285's owner the same hour, `Stale::Policy`, a policy setting that raced
+/// another (`set_write_policy` names the version it read) (the same day). 8: an overlay's drift read from the status
+/// reply's typed field, never its text: `DriftReport::watcher` a `Watcher`, and a green's or a work volume's status
+/// read with no base (it failed as a protocol fault before) (the same day). 9: the [`Volumes`]
+/// seam over the contract's volume verbs, implemented by [`Instance`] and by the simulator [`SimVolumes`] (A-310) (the
 /// same day).
-pub const CONTRACT: u32 = 2;
+pub const CONTRACT: u32 = 9;
 
 /// The typed client and its own types, for the verbs [`Instance::client`] lends outside the contract.
 pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, VhostUserDevice};
 /// The wire's types the contract takes and returns (§4.9; append-only, D-15).
 pub use slates_ipc::protocol::{
-  AttachTransport, AuditEntry, ConflictClass, DaemonReport, Filter, GrantScope, GrantSummary,
-  GreenBase, HostAnswer, HostPathReason, Intent, JournalReport, LandingDegradation,
-  LandingDurability, MountReport, NamePolicy, OwnMountUse, PlacedState, PlannedAction,
-  PlannedContent, PlannedEntry, Principal, ReadAt, RecoveryCause, SnapshotId, TelemetryReport,
-  TransportReport, UnsupportedReason, VolumeId, VolumeSummary,
+  AttachTransport, ConflictClass, DaemonReport, Filter, GrantScope, GreenBase, HostAnswer,
+  HostPathReason, Intent, JournalReport, LandingDegradation, LandingDurability, MountReport,
+  NamePolicy, OwnMountUse, PlacedState, PlannedAction, PlannedContent, PlannedEntry, Principal,
+  ReadAt, RecoveryCause, SnapshotId, TelemetryReport, TransportReport, UnsupportedReason, VolumeId,
+  VolumeSummary,
 };
 /// The rendezvous's and the channel's own typed refusals the contract carries.
 pub use slates_ipc::{DeliveryFault, error::RouteRefusal};

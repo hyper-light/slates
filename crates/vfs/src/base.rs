@@ -562,10 +562,16 @@ impl BasePlane {
     self.unavailable.len()
   }
 
-  /// A clone's plane: the same root and facts, its own listings, and the witnesses of the snapshot it
-  /// was made from — frozen at `epoch` — never the origin's head's (A-48). Before 2026-09-30 a clone of an
-  /// older snapshot took the head's, so after a rewitness its old-based bytes were judged against the
-  /// newer witness.
+  /// A clone's plane: the same root and facts, the origin's base directories under the same handles with nothing of
+  /// their cached listings, and the witnesses of the snapshot it was made from — frozen at `epoch` — never the origin's
+  /// head's (A-48). Before 2026-09-30 a clone of an older snapshot took the head's, so after a rewitness its old-based
+  /// bytes were judged against the newer witness.
+  ///
+  /// The handles name directories in the origin's host, so a clone reads its base through that host or one holding the
+  /// same handles to the same directories (the daemon's: `slates_base::OsHost::try_clone_dirs`). Each directory is
+  /// listed afresh on first use (the base is live), and one a recovery reopened keeps that mark (A-151). Before
+  /// 2026-11-18 a clone kept only its root's listing, so every base subdirectory its snapshot already held refused it
+  /// `NotOverlay` (`a_clones_base_subdirectory_reads_as_the_disk_holds_it`). Bounded by the origin's listings.
   pub(crate) fn for_clone(&self, root_no: InodeNo, epoch: Epoch) -> Self {
     let mut plane = Self::new(
       BaseConfig {
@@ -575,6 +581,25 @@ impl BasePlane {
       },
       root_no,
     );
+    plane.listings = self
+      .listings
+      .iter()
+      .map(|(&no, listing)| {
+        (
+          no,
+          Listing {
+            dir: listing.dir,
+            source: listing.source.clone(),
+            fingerprint: None,
+            entries: None,
+            read_at_ns: 0,
+            watch: WatchState::Unavailable,
+            restored: listing.restored,
+          },
+        )
+      })
+      .collect();
+    plane.unavailable = self.unavailable.clone();
     plane.witnesses = self.witnesses.view_at(epoch);
     plane.witness_homes = self.witness_homes.view_at(epoch);
     plane.whiteouts = self.whiteouts.view_at(epoch);
@@ -901,7 +926,12 @@ impl Volume {
             deeper.push((path, h));
           }
         }
-        Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => {
+        Child::File(no)
+        | Child::Symlink(no)
+        | Child::Fifo(no)
+        | Child::Socket(no)
+        | Child::BlockDevice(no)
+        | Child::CharDevice(no) => {
           if witnessed(no) {
             found.push(Diverged {
               path,
@@ -1342,9 +1372,15 @@ impl Overlay<'_> {
           gone.push(e.name.to_owned());
         }
         (Some(_), _) => {}
-        (None, Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no))
-          if self.unloaded_file(store, no) =>
-        {
+        (
+          None,
+          Child::File(no)
+          | Child::Symlink(no)
+          | Child::Fifo(no)
+          | Child::Socket(no)
+          | Child::BlockDevice(no)
+          | Child::CharDevice(no),
+        ) if self.unloaded_file(store, no) => {
           gone.push(e.name.to_owned());
         }
         (None, Child::Dir(h)) => {
@@ -1818,9 +1854,12 @@ impl Overlay<'_> {
   /// Whether a located entry is an untouched base entry (unwitnessed, base-backed).
   fn is_unloaded(&self, store: &Store, located: &Located) -> bool {
     match located.child {
-      Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => {
-        self.unloaded_file(store, no)
-      }
+      Child::File(no)
+      | Child::Symlink(no)
+      | Child::Fifo(no)
+      | Child::Socket(no)
+      | Child::BlockDevice(no)
+      | Child::CharDevice(no) => self.unloaded_file(store, no),
       Child::Dir(_) | Child::Whiteout => false,
     }
   }
@@ -1930,20 +1969,20 @@ impl Overlay<'_> {
     self.vol.create_file(store, dir, name, mode)
   }
 
-  /// Creates a FIFO/socket name while respecting existing base names (A-26).
+  /// Creates a FIFO or socket name (A-26) or a device node (A-294) while respecting existing base names.
   pub fn mknod_no(
     &mut self,
     store: &mut Store,
     dir_no: InodeNo,
     name: &str,
     mode: u32,
-    kind: Kind,
+    node: crate::inode::SpecialNode,
   ) -> Result<InodeNo, VfsError> {
     let dir = self.vol.entry_dir(store, dir_no)?;
     if self.exists(store, dir, name)? {
       return Err(VfsError::AlreadyExists);
     }
-    self.vol.mknod_no(store, dir_no, name, mode, kind)
+    self.vol.mknod_no(store, dir_no, name, mode, node)
   }
 
   /// `mkdir` that refuses a name the base holds; a directory created in an overlay volume is
@@ -2112,7 +2151,15 @@ impl Overlay<'_> {
       return Ok(());
     }
     let origin = match (source.child, &from_base) {
-      (Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no), Some(_)) => {
+      (
+        Child::File(no)
+        | Child::Symlink(no)
+        | Child::Fifo(no)
+        | Child::Socket(no)
+        | Child::BlockDevice(no)
+        | Child::CharDevice(no),
+        Some(_),
+      ) => {
         self.copy_up(store, no, CopyUp::Metadata)?;
         None
       }
@@ -2742,7 +2789,11 @@ impl Overlay<'_> {
     let no = match located.child {
       Child::File(no) => no,
       Child::Dir(_) => return Err(VfsError::IsDirectory),
-      Child::Symlink(_) | Child::Fifo(_) | Child::Socket(_) => {
+      Child::Symlink(_)
+      | Child::Fifo(_)
+      | Child::Socket(_)
+      | Child::BlockDevice(_)
+      | Child::CharDevice(_) => {
         return Err(VfsError::DigestNotClean);
       }
       Child::Whiteout => return Err(VfsError::NotFound),
@@ -3521,8 +3572,22 @@ impl Overlay<'_> {
       .map(|e| e.child);
     Ok(match (then, now) {
       (
-        Some(Child::File(a) | Child::Symlink(a) | Child::Fifo(a) | Child::Socket(a)),
-        Some(Child::File(b) | Child::Symlink(b) | Child::Fifo(b) | Child::Socket(b)),
+        Some(
+          Child::File(a)
+          | Child::Symlink(a)
+          | Child::Fifo(a)
+          | Child::Socket(a)
+          | Child::BlockDevice(a)
+          | Child::CharDevice(a),
+        ),
+        Some(
+          Child::File(b)
+          | Child::Symlink(b)
+          | Child::Fifo(b)
+          | Child::Socket(b)
+          | Child::BlockDevice(b)
+          | Child::CharDevice(b),
+        ),
       ) if a == b
         && self.vol.inode_in(store, id, a)?.version == self.vol.inode(store, b)?.version =>
       {
@@ -3647,7 +3712,12 @@ impl Overlay<'_> {
           }
         }
       }
-      Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => {
+      Child::File(no)
+      | Child::Symlink(no)
+      | Child::Fifo(no)
+      | Child::Socket(no)
+      | Child::BlockDevice(no)
+      | Child::CharDevice(no) => {
         // The disk holds the bytes: the entry leaves the overlay. The next lookup reloads it
         // from the listing as an untouched base entry, and its cached bytes go with it — retained
         // (§4.2) when a snapshot still pins them, secured before anything changes.
@@ -3851,12 +3921,17 @@ impl Overlay<'_> {
           match kind {
             Kind::Dir => walk.dirs.push(child_path(&path, &name)),
             Kind::File => walk.files.push(no),
-            Kind::Symlink | Kind::Fifo | Kind::Socket => {}
+            Kind::Symlink | Kind::Fifo | Kind::Socket | Kind::BlockDevice | Kind::CharDevice => {}
           }
         }
       }
       Child::File(no) => walk.files.push(no),
-      Child::Symlink(_) | Child::Fifo(_) | Child::Socket(_) | Child::Whiteout => {}
+      Child::Symlink(_)
+      | Child::Fifo(_)
+      | Child::Socket(_)
+      | Child::BlockDevice(_)
+      | Child::CharDevice(_)
+      | Child::Whiteout => {}
     }
     Ok(None)
   }
@@ -4025,7 +4100,12 @@ impl Overlay<'_> {
       stale.dirs.push(dir_no);
       for entry in store.dirs.get(dir)?.iter(&store.blocks) {
         let child = match entry.child {
-          Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no)
+          Child::File(no)
+          | Child::Symlink(no)
+          | Child::Fifo(no)
+          | Child::Socket(no)
+          | Child::BlockDevice(no)
+          | Child::CharDevice(no)
             if self.unloaded_file(store, no) =>
           {
             no

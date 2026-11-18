@@ -2354,6 +2354,26 @@ pub struct RegionalConfiguration {
   /// settled: nothing shows they were adopted, and a holder told settled reclaims its copy. In id order. It grows only
   /// on a region losing more hosts than it tolerates, which a pruned retirement never records.
   pub dropped_unconfirmed: Vec<HostId>,
+  /// The objects an explicit move took off their creator's line (§4.8 "Authority scope": "moving one volume changes
+  /// that object's ownership generation, recorded in the configuration's moved-object exceptions, without fencing
+  /// unrelated volumes"; §4.10 "operators keep an explicit move"), keyed by the object's placement key, so every register
+  /// class of a volume moves as one ([`ObjectId::placement_key`]). Moved objects only: an object absent here is owned
+  /// along its creator's line ([`owner_of`](RegionalConfiguration::owner_of)). An entry is made by its owner's move
+  /// ([`move_object`](RegionalConfiguration::move_object)), follows its owner's takeover at the successor's
+  /// confirmation, and is dropped when the object moves back to its creator or its owner reports it destroyed
+  /// ([`forget_moved`](RegionalConfiguration::forget_moved)), so it holds only live moved objects; a move past the
+  /// bound its proposer derives is refused before it is proposed.
+  pub moved: std::collections::BTreeMap<ObjectId, Moved>,
+}
+
+/// One object's explicit move off its creator's line ([`RegionalConfiguration::moved`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Moved {
+  /// The member the object moved to: its owner from then on, and the host its line starts from when that member
+  /// retires.
+  pub owner: HostId,
+  /// The configuration version the move committed at: the object's ownership generation (§4.8 "Authority scope").
+  pub version: u64,
 }
 
 /// One promoted object's adoption in the mirror region (`docs/wip/mirroring.md` decision 4): the member that adopts it,
@@ -2394,6 +2414,7 @@ impl RegionalConfiguration {
       retired: std::collections::BTreeMap::new(),
       adoptions: std::collections::BTreeMap::new(),
       dropped_unconfirmed: Vec::new(),
+      moved: std::collections::BTreeMap::new(),
     };
     config.fix_neighbourhoods(scatter);
     // A formed region owns nothing yet: every member's first neighbourhood is already settled.
@@ -2634,6 +2655,7 @@ impl RegionalConfiguration {
       .partition_point(|host| host.0 < successor.0);
     retirement.confirmed.insert(position, successor);
     self.version = version;
+    self.follow_moved_takeover(departed, successor, version);
     self.prune_retirements();
     true
   }
@@ -2678,6 +2700,129 @@ impl RegionalConfiguration {
       .adoptions
       .get(&object)
       .is_some_and(|adoption| adoption.successor == successor)
+  }
+
+  /// Where `object`'s line starts (§4.8 "Lookup"): its moved-object exception's owner, else its creator. Every register
+  /// class of one object follows the same exception ([`ObjectId::placement_key`]), so a volume's catalog moves with it.
+  fn line_start(&self, object: ObjectId) -> HostId {
+    self
+      .moved
+      .get(&object.placement_key())
+      .map_or_else(|| object.creator(), |moved| moved.owner)
+  }
+
+  /// The member that owns `object` now, from the configuration alone (§4.8 "Lookup": "a volume id carries its creator
+  /// host … an ownership or home move is a configuration exception naming the affected volume and its authority
+  /// generation"). Its line starts at its moved-object exception's owner, else at its creator; a member there owns it,
+  /// and a retired one hands it on along the takeover's lineage ([`lineage`](RegionalConfiguration::lineage)). `None`
+  /// when the line names no member: lost, settled past every kept retirement (the configuration no longer names the
+  /// successor that adopted it; the object's holders do), or unresolved.
+  pub fn owner_of(&self, object: ObjectId) -> Option<HostId> {
+    let start = self.line_start(object);
+    if self.members.contains(&start) {
+      return Some(start);
+    }
+    match self.lineage(start, object) {
+      Lineage::Successor { successor, .. } => Some(successor),
+      Lineage::Lost | Lineage::Settled | Lineage::Unresolved => None,
+    }
+  }
+
+  /// Whether `from` may move `object` to `to` (§4.10 "Ownership follows the writer": the planned handoff an operator's
+  /// explicit move runs): `from` and `to` are two members, and the configuration names `from` as the object's owner
+  /// ([`owner_of`](RegionalConfiguration::owner_of)) or names no owner because the object's line runs through a
+  /// takeover that is done. In that last case the configuration holds no claim against `from`: the successor that
+  /// adopted the object is named only by the object's own records, and a member proposes a move only of a volume it
+  /// serves under confirmed authority, while a host that lost its authority is retired and never proposes again under
+  /// its id ([`admits`](RegionalConfiguration::admits)). Refused for a lost or unresolved line, which nothing may claim
+  /// (A-272), and for a line a kept retirement still carries to a successor other than `from`.
+  pub fn moves(&self, object: ObjectId, from: HostId, to: HostId) -> bool {
+    if from == to || !self.members.contains(&from) || !self.members.contains(&to) {
+      return false;
+    }
+    let start = self.line_start(object);
+    if self.members.contains(&start) {
+      return start == from;
+    }
+    match self.lineage(start, object) {
+      Lineage::Successor { successor, .. } => successor == from,
+      Lineage::Settled => true,
+      Lineage::Lost | Lineage::Unresolved => false,
+    }
+  }
+
+  /// Moves `object` from its owner `from` to the member `to`, as [`moves`](RegionalConfiguration::moves) allows: its
+  /// exception names `to` at the new version, its ownership generation; or it is dropped when `to` is the object's
+  /// creator, whose line the object is back on. Advances the version. Returns whether the configuration changed.
+  pub fn move_object(&mut self, object: ObjectId, from: HostId, to: HostId) -> bool {
+    if !self.moves(object, from, to) {
+      return false;
+    }
+    let Some(version) = self.version.checked_add(1) else {
+      return false;
+    };
+    let key = object.placement_key();
+    if to == key.creator() {
+      self.moved.remove(&key);
+    } else {
+      self.moved.insert(key, Moved { owner: to, version });
+    }
+    self.version = version;
+    true
+  }
+
+  /// Whether `owner` may drop `object`'s exception: the object is moved, and `owner` owns it now.
+  pub fn forgets_moved(&self, object: ObjectId, owner: HostId) -> bool {
+    self.moved.contains_key(&object.placement_key()) && self.owner_of(object) == Some(owner)
+  }
+
+  /// Drops `object`'s exception at its owner's report that the object is destroyed, so an exception never outlives
+  /// its object. Returns whether the configuration changed.
+  pub fn forget_moved(&mut self, object: ObjectId, owner: HostId) -> bool {
+    if !self.forgets_moved(object, owner) {
+      return false;
+    }
+    let Some(version) = self.version.checked_add(1) else {
+      return false;
+    };
+    self.moved.remove(&object.placement_key());
+    self.version = version;
+    true
+  }
+
+  /// Follows a takeover in the moved-object exceptions as `successor` confirms its share of `departed`'s: every
+  /// exception whose line the takeover's lineage carries to `successor` in `departed`'s round
+  /// ([`Lineage::Successor`]) names `successor` from `version` on, or is dropped when `successor` is the object's
+  /// creator, whose line it is back on. A line is followed whether it starts at `departed` or at a host whose own
+  /// successor retired before confirming and carried it into `departed`'s takeover. Done before the retirement can be
+  /// pruned, so no exception's line ever starts at a retirement the configuration no longer keeps.
+  fn follow_moved_takeover(&mut self, departed: HostId, successor: HostId, version: u64) {
+    let followed: Vec<ObjectId> = self
+      .moved
+      .iter()
+      .filter(|(object, moved)| {
+        !self.members.contains(&moved.owner)
+          && self.lineage(moved.owner, **object)
+            == Lineage::Successor {
+              departed,
+              successor,
+            }
+      })
+      .map(|(object, _)| *object)
+      .collect();
+    for object in followed {
+      if successor == object.creator() {
+        self.moved.remove(&object);
+      } else {
+        self.moved.insert(
+          object,
+          Moved {
+            owner: successor,
+            version,
+          },
+        );
+      }
+    }
   }
 
   /// Whether `host` still owes a confirmation of its share of `departed`'s takeover: `departed`'s retirement is
@@ -4250,6 +4395,328 @@ mod tests {
       !regional.retired.contains_key(&departed),
       "dropped with the last confirmation"
     );
+  }
+
+  /// §4.8 "Authority scope" and "Lookup", §4.10 "operators keep an explicit move" (T-8.14's configuration half). Do: in
+  /// a five-member region, move host 1's object to host 2, then try every move that is not its owner's; move it on to
+  /// host 3; move it back to its creator. Expect each owner's move to change the configuration once, the exception to
+  /// name the owner at the move's version, every other move refused (not the owner, to itself, to a non-member), and
+  /// the move back to the creator to drop the exception; the object's catalog register moves with it, and an unrelated
+  /// object of host 1 never does.
+  #[test]
+  fn a_move_names_the_objects_owner_and_only_its_owner_moves_it() {
+    let (mut regional, _) = wide_region();
+    let (creator, b, c) = (HostId(1), HostId(2), HostId(3));
+    let object = ObjectId::new(creator, 7);
+    let unrelated = ObjectId::new(creator, 8);
+    assert_eq!(regional.owner_of(object), Some(creator));
+    let version = expect_a_move_to_name_its_new_owner(&mut regional, object, unrelated, creator, b);
+    expect_every_move_but_its_owners_refused(&mut regional, object, creator, b, c);
+    assert_eq!(regional.version, version, "refused moves change nothing");
+
+    assert!(regional.move_object(object, b, c));
+    assert_eq!(regional.owner_of(object), Some(c));
+    assert!(regional.move_object(object, c, creator));
+    assert!(
+      !regional.moved.contains_key(&object),
+      "back on its creator's line, with no exception"
+    );
+    assert_eq!(regional.owner_of(object), Some(creator));
+  }
+
+  /// The first move of `a_move_names_the_objects_owner_and_only_its_owner_moves_it`. Do: move `object` from
+  /// `creator`, which made `unrelated` too, to `to`. Expect the configuration's version to advance by one, the
+  /// exception to name `to` at that version, the object and its catalog register owned by `to`, and `unrelated` still
+  /// on its creator's line. Returns the version the move committed at.
+  fn expect_a_move_to_name_its_new_owner(
+    regional: &mut RegionalConfiguration,
+    object: ObjectId,
+    unrelated: ObjectId,
+    creator: HostId,
+    to: HostId,
+  ) -> u64 {
+    let before = regional.version;
+    assert!(regional.move_object(object, creator, to));
+    assert_eq!(regional.version, before + 1);
+    assert_eq!(
+      regional.moved.get(&object),
+      Some(&Moved {
+        owner: to,
+        version: before + 1
+      })
+    );
+    assert_eq!(regional.owner_of(object), Some(to));
+    assert_eq!(
+      regional.owner_of(object.catalog()),
+      Some(to),
+      "a volume's catalog register moves with it"
+    );
+    assert_eq!(
+      regional.owner_of(unrelated),
+      Some(creator),
+      "a move fences nothing but its object"
+    );
+    regional.version
+  }
+
+  /// The refused moves of `a_move_names_the_objects_owner_and_only_its_owner_moves_it`. Do: with `object` moved from
+  /// `creator` to `owner`, move it from its old owner to `other`, from its owner to itself, and from its owner to a
+  /// host that is not a member. Expect every one refused.
+  fn expect_every_move_but_its_owners_refused(
+    regional: &mut RegionalConfiguration,
+    object: ObjectId,
+    creator: HostId,
+    owner: HostId,
+    other: HostId,
+  ) {
+    assert!(
+      !regional.move_object(object, creator, other),
+      "the old owner no longer moves it"
+    );
+    assert!(
+      !regional.move_object(object, owner, owner),
+      "not to its own owner"
+    );
+    assert!(
+      !regional.move_object(object, owner, HostId(9)),
+      "not to a non-member"
+    );
+  }
+
+  /// §4.8 "Authority scope" with "Promotion and takeover". Do: move host 1's object to host 2; take host 2 over;
+  /// confirm every survivor's share. Expect the object owned by its successor while the retirement is kept, the
+  /// exception naming that successor from its confirmation on, and still the successor once the retirement is
+  /// dropped, never the creator. Then report it destroyed: only its owner's report drops the exception, after which
+  /// it is on its creator's line again.
+  #[test]
+  fn a_moved_objects_exception_follows_its_owners_takeover_and_goes_with_its_destroy() {
+    let (mut regional, scatter) = wide_region();
+    let (creator, b) = (HostId(1), HostId(2));
+    let object = ObjectId::new(creator, 7);
+    assert!(regional.move_object(object, creator, b));
+    regional.take_over(b, scatter);
+    let Lineage::Successor { successor, .. } = regional.lineage(b, object) else {
+      panic!("a takeover with survivors names a successor");
+    };
+    assert_eq!(regional.owner_of(object), Some(successor));
+    for host in regional.recovery_hosts(b) {
+      regional.confirm(b, host);
+    }
+    assert!(
+      !regional.retired.contains_key(&b),
+      "the retirement is dropped"
+    );
+    assert_eq!(
+      regional.moved.get(&object).map(|moved| moved.owner),
+      Some(successor),
+      "the exception followed the takeover"
+    );
+    assert_eq!(regional.owner_of(object), Some(successor));
+    expect_only_its_owners_destroy_report_drops_the_exception(
+      &mut regional,
+      object,
+      creator,
+      successor,
+    );
+  }
+
+  /// The destroy of `a_moved_objects_exception_follows_its_owners_takeover_and_goes_with_its_destroy`. Do: with
+  /// `object`, made by `creator`, moved and owned by `owner`, report it destroyed from another member, then from its
+  /// owner, then from its owner again. Expect only its owner's first report to drop the exception, after which the
+  /// object is on its creator's line again and there is nothing left to forget.
+  fn expect_only_its_owners_destroy_report_drops_the_exception(
+    regional: &mut RegionalConfiguration,
+    object: ObjectId,
+    creator: HostId,
+    owner: HostId,
+  ) {
+    let other = regional
+      .members
+      .iter()
+      .copied()
+      .find(|host| *host != owner)
+      .expect("a five-member region keeps another member");
+    assert!(
+      !regional.forget_moved(object, other),
+      "only its owner reports it destroyed"
+    );
+    assert!(regional.forget_moved(object, owner));
+    assert!(!regional.moved.contains_key(&object));
+    assert_eq!(regional.owner_of(object), Some(creator));
+    assert!(
+      !regional.forget_moved(object, owner),
+      "nothing left to forget"
+    );
+  }
+
+  /// §4.8 "Authority scope" with "Promotion and takeover", repeated. Do: move host 1's objects to host 2; take host 2
+  /// over; take over, before it confirms, the survivor that is the successor of one of them, so its own takeover carries
+  /// the first; confirm every share of both. Expect that object owned throughout by the member its line names, its
+  /// exception naming the member that adopted it once both retirements are dropped, never a lost line (before
+  /// 2026-11-18 the exception followed only a successor that confirmed the very takeover the move's owner retired in,
+  /// so it kept naming host 2 and the object's line read settled, with no owner). And an object whose successor is its
+  /// creator is back on its creator's line, with no exception.
+  #[test]
+  fn a_moved_objects_exception_follows_a_takeover_carried_into_another() {
+    let (mut regional, scatter) = wide_region();
+    let (creator, moved_to) = (HostId(1), HostId(2));
+    let objects = objects_moved(&mut regional, creator, moved_to);
+    regional.take_over(moved_to, scatter);
+    let successor_of = |regional: &RegionalConfiguration, object: ObjectId| match regional
+      .lineage(moved_to, object)
+    {
+      Lineage::Successor { successor, .. } => successor,
+      other => panic!("a takeover with survivors names a successor: {other:?}"),
+    };
+    let carried = objects
+      .iter()
+      .copied()
+      .find(|object| successor_of(&regional, *object) != creator)
+      .expect("some object's successor is not its creator");
+    let carrier = successor_of(&regional, carried);
+    let home = objects
+      .iter()
+      .copied()
+      .find(|object| successor_of(&regional, *object) == creator);
+    regional.take_over(carrier, scatter);
+    let adopter = regional
+      .owner_of(carried)
+      .expect("the carried takeover names a member");
+    assert_ne!(adopter, carrier);
+    for host in regional.recovery_hosts(moved_to) {
+      regional.confirm(moved_to, host);
+    }
+    for host in regional.recovery_hosts(carrier) {
+      regional.confirm(carrier, host);
+    }
+    assert!(regional.retired.is_empty(), "both takeovers are done");
+    assert_eq!(
+      regional.owner_of(carried),
+      Some(adopter),
+      "the member that adopted it owns it, once the line it was adopted through is dropped"
+    );
+    assert_eq!(
+      regional.moved.get(&carried).map(|moved| moved.owner),
+      (adopter != creator).then_some(adopter)
+    );
+    expect_every_moved_line_kept(&regional, &objects, home, creator);
+  }
+
+  /// The objects of `a_moved_objects_exception_follows_a_takeover_carried_into_another`: sixty-four of `creator`'s,
+  /// each moved to `to`. Expect every move made.
+  fn objects_moved(
+    regional: &mut RegionalConfiguration,
+    creator: HostId,
+    to: HostId,
+  ) -> Vec<ObjectId> {
+    let objects: Vec<ObjectId> = (0..64).map(|index| ObjectId::new(creator, index)).collect();
+    for object in &objects {
+      assert!(regional.move_object(*object, creator, to));
+    }
+    objects
+  }
+
+  /// The end of `a_moved_objects_exception_follows_a_takeover_carried_into_another`, both takeovers done. Expect
+  /// `home`, an object its creator `creator` adopted if there was one, back on its creator's line with no exception,
+  /// and every one of `objects` still owned by a member.
+  fn expect_every_moved_line_kept(
+    regional: &RegionalConfiguration,
+    objects: &[ObjectId],
+    home: Option<ObjectId>,
+    creator: HostId,
+  ) {
+    if let Some(home) = home {
+      assert!(
+        !regional.moved.contains_key(&home),
+        "an object adopted by its creator is back on its creator's line"
+      );
+      assert_eq!(regional.owner_of(home), Some(creator));
+    }
+    for object in objects {
+      assert!(
+        regional.owner_of(*object).is_some(),
+        "no moved object's line is lost: {object:?}"
+      );
+    }
+  }
+
+  /// §4.10 "operators keep an explicit move" after "Promotion and takeover". Do: take host 1 over and confirm every
+  /// share, so its takeover is done and the configuration names no owner for its objects; move one from the member
+  /// that adopted it; then make another object's line unresolved (its retirement dropped before every survivor
+  /// confirmed, A-272) and try to move that. Expect the settled object's move made by a member, its exception naming
+  /// the member it moved to; a move from a non-member or to the mover refused; and the unresolved object's move refused,
+  /// since nothing may claim it.
+  #[test]
+  fn a_member_moves_an_object_whose_takeover_is_done_and_never_an_unresolved_one() {
+    let (mut regional, scatter) = wide_region();
+    let departed = HostId(1);
+    let object = ObjectId::new(departed, 4);
+    regional.take_over(departed, scatter);
+    let Lineage::Successor { successor, .. } = regional.lineage(departed, object) else {
+      panic!("a takeover with survivors names a successor");
+    };
+    for host in regional.recovery_hosts(departed) {
+      regional.confirm(departed, host);
+    }
+    assert!(regional.retired.is_empty());
+    assert_eq!(
+      regional.owner_of(object),
+      None,
+      "a done takeover's line names no owner"
+    );
+    let to = regional
+      .members
+      .iter()
+      .copied()
+      .find(|host| *host != successor)
+      .expect("a five-member region keeps another member");
+    assert!(
+      !regional.moves(object, departed, to),
+      "a retired host moves nothing"
+    );
+    assert!(
+      !regional.moves(object, successor, successor),
+      "not to itself"
+    );
+    assert!(regional.move_object(object, successor, to));
+    assert_eq!(regional.owner_of(object), Some(to));
+    assert!(
+      !regional.moves(object, successor, departed),
+      "once moved, only its new owner moves it"
+    );
+
+    let unresolved = regional
+      .members
+      .iter()
+      .copied()
+      .find(|host| *host != to)
+      .expect("a four-member region keeps another member");
+    expect_no_member_moves_an_unresolved_object(&mut regional, unresolved, scatter);
+  }
+
+  /// The unresolved half of `a_member_moves_an_object_whose_takeover_is_done_and_never_an_unresolved_one`. Do: take
+  /// `unresolved` over and drop its retirement before every survivor confirms (A-272), so an object of its own is on
+  /// an unresolved line; then move that object from every member to every member. Expect every move refused.
+  fn expect_no_member_moves_an_unresolved_object(
+    regional: &mut RegionalConfiguration,
+    unresolved: HostId,
+    scatter: u64,
+  ) {
+    let lost = ObjectId::new(unresolved, 4);
+    regional.take_over(unresolved, scatter);
+    regional.retired.remove(&unresolved);
+    regional.dropped_unconfirmed.push(unresolved);
+    assert_eq!(regional.lineage(unresolved, lost), Lineage::Unresolved);
+    let members = regional.members.clone();
+    assert!(members.len() >= 2);
+    for from in &members {
+      for target in &members {
+        assert!(
+          !regional.moves(lost, *from, *target),
+          "no member claims an unresolved line"
+        );
+      }
+    }
   }
 
   /// §4.8 "Promotion and takeover", repeated: a survivor that retires before confirming its share of an earlier

@@ -26,9 +26,27 @@
 //! never a queue. While the owner may not serve the volume's latest state (its lease not holding, AUD-29-83), nothing is
 //! read: the guest's requests wait in the stream, asked again each heartbeat.
 //!
+//! **The run's owner (A-281).** Shards' init names the run's owner on a share's root as it mounts it, with Shards' owner
+//! word (`trusted.shards.owner`, `UID:GID`), so that a run of an unprivileged user writes the share it was given. The
+//! stream takes the word before any dispatch, from the guest's root on the stream's root alone, and keeps it on no file:
+//! from then on its guest is shown the owner the volume keeps for the root as the run's owner and the run's as the
+//! root's, uid and gid each, and the ids a guest names (a creator, a chown) are kept the other way round. Every other
+//! route sees the owners the volume keeps, so a host reads its own files as its own. The swap lives with the stream:
+//! nothing survives a restart, and the next stream's guest names its owner again as it mounts.
+//!
+//! **The guest's attributes (A-290).** A stream is a guest kernel's route: besides `user.` its guest reads and writes
+//! its own attribute namespaces, `trusted.` and `security.` (an overlayfs upper directory's `trusted.overlay.*`, a
+//! binary's `security.capability`), kept in the volume as its data. No host's mount shows or sets them.
+//!
 //! **Control asks.** Shards' device sends asks of its own:
-//! - its backend's tables for a snapshot of the VM, and their restore (D176). slates keeps no tables a VM's snapshot can
-//!   carry, so each is refused in the form Shards reads: a control answer with its reason.
+//! - its backend's tables for a snapshot of the VM, and their restore (Shards' D176 part 5; A-303). A SAVE, sent while
+//!   the device is paused and so between requests, is held while the guest's stores through its maps reach the volume,
+//!   then answered with the tables of the child module `tables`: a snapshot of the volume at the cut, taken for the
+//!   stream's own principal and made durable first, the inodes the guest holds with their references and opens, its
+//!   scope and its owner view. A RESTORE is taken only as a fresh stream's first frame, and only onto the volume saved,
+//!   unchanged since the cut, or a clone of the cut's snapshot, presenting the same directory: the stream's attachment
+//!   is then given what the saved one held, its owner view too. Anything else is refused in the form Shards reads, a
+//!   control answer with its reason, and changes nothing.
 //! - a file's descriptor for a DAX window's mapping (D189), answered by the child module `dax` (Shards part 3;
 //!   `docs/wip/shards/dax-protocol.md`). The answer is a descriptor of the file's DAX object, one per attachment and
 //!   file, holding only that file's bytes, filled a slice a turn. A descriptor of slates' content itself would hand the
@@ -48,18 +66,19 @@ use std::os::fd::AsFd;
 use std::os::windows::io::AsHandle;
 
 use slates_bridge_core::volume_bridge::new_handle_store;
-use slates_bridge_core::{AttachmentId, Rights, View, VolumeBridge};
+use slates_bridge_core::{AttachmentId, ObjectId, OwnerView, Rights, View, VolumeBridge};
 use slates_bridge_fuse::Opcode;
 use slates_bridge_fuse::bridge::{
   EIO, KernelChange, kernel_changes, needs_barrier, reclaim_unreported,
 };
 use slates_bridge_fuse::shards_fs::{
-  ASK_DESCRIPTOR, ASK_RESTORE, ASK_SAVE, Answered, FRAME_BYTES, Frame, LENGTH_BYTES, Split, answer,
-  control_refusal, refuse, split_frame,
+  ASK_DESCRIPTOR, ASK_RESTORE, ASK_SAVE, Answered, FRAME_BYTES, Frame, LENGTH_BYTES, OwnerWord,
+  Split, answer, control_answer, control_refusal, owner_word, owner_word_reply, refuse,
+  split_frame_bounded,
 };
 use slates_db::Op;
 use slates_db::catalog::{AttachForm, AttachmentRecord, Consumer, Principal, VolumeId};
-use slates_ipc::protocol::{Intent, Refusal};
+use slates_ipc::protocol::{Intent, Refusal, ReplyBody};
 use slates_mem::slab::Slab;
 use slates_rt::futures;
 use slates_vfs::clock::Clock;
@@ -78,6 +97,8 @@ use crate::state::{self, ShardState};
 mod dax;
 // The daemon's end of the stream as each platform serves it: one seam, paired arms.
 mod end;
+// A stream's tables for a VM's save and restore (A-303).
+mod tables;
 
 pub use end::HandedEnd;
 use end::{DaemonEnd, Received, Sent};
@@ -161,18 +182,60 @@ const HOLDER_ADDED: &str = "shards.holder_added";
 /// Format: the refusal-ledger name of a stream end dropped because its request's reply was not the attach that made
 /// it (a rolled-back verb answered a refusal): the end closes, so the stream ends with it.
 const HANDOFF_DROPPED: &str = "shards.handoff_dropped";
-/// Format: the reason a refused snapshot ask carries to Shards, which reports it.
-const NO_TABLES: &str =
-  "slates keeps no share tables a VM snapshot can carry; the share ends with the VM";
-/// Format: the reason a refused restore ask carries to Shards, which reports it.
-const NO_RESTORE: &str =
-  "slates restores no share tables; attach the volume again to the restored VM";
+/// Counter: an owner word taken (A-281): a guest's root named its run's owner on the stream's root, which the stream
+/// shows its guest as the owner of what the volume keeps as its root's owner's, and the reverse.
+const OWNER_NAMED: &str = "shards.owner_named";
+/// Format: the refusal-ledger name of an owner word refused (A-281): from a caller other than the guest's root
+/// (`EPERM`), on a node other than the stream's root or with no `UID:GID` (`EINVAL`), or with its root unreadable.
+const OWNER_REFUSED: &str = "shards.owner_refused";
+/// Counter: a SAVE answered with the stream's tables (A-303).
+const SAVED: &str = "shards.saved";
+/// Format: the refusal-ledger name of a SAVE refused (A-303), with no snapshot left behind but one taken before a later
+/// step failed.
+const SAVE_REFUSED: &str = "shards.save_refused";
+/// Counter: a RESTORE taken: the stream's attachment holds what the saved one did (A-303).
+const RESTORED: &str = "shards.restored";
+/// Format: the refusal-ledger name of a RESTORE refused (A-303), which changed nothing.
+const RESTORE_REFUSED: &str = "shards.restore_refused";
+/// Format: the reason a SAVE carries when it brings anything: Shards' device sends none.
+const SAVE_MALFORMED: &str = "a SAVE brings nothing after its ask";
+/// Format: the reason a SAVE carries when the guest's stores through its maps could not reach the volume first.
+const SAVE_STORES_REFUSED: &str =
+  "the guest's stores through its maps could not reach the volume before the cut";
+/// Format: the reason a SAVE carries when the stream's principal may not snapshot its volume.
+const SAVE_FORBIDDEN: &str =
+  "the share's principal may not snapshot its volume, so its VM cannot be saved with it";
+/// Format: the reason a SAVE carries when another attachment's request was in flight at the cut.
+const SAVE_IN_FLIGHT: &str = "another attachment's request was in flight at the cut; save again";
+/// Format: the reason a SAVE carries when the volume refused its snapshot otherwise.
+const SAVE_UNSNAPSHOTTED: &str = "the volume refused the save's snapshot";
+/// Format: the reason a SAVE carries when its snapshot could not be made durable before the answer.
+const SAVE_UNDURABLE: &str = "the save's snapshot could not be made durable";
+/// Format: the reason a SAVE carries when its tables are longer than a control frame carries.
+const SAVE_TOO_LONG: &str = "the stream's tables are longer than a control frame carries";
+/// Format: the reason a SAVE or a RESTORE carries when the stream can no longer be served (its volume or its
+/// attachment gone).
+const STREAM_GONE: &str = "the share's volume or attachment is gone";
+/// Format: the reason a RESTORE carries when it is not the stream's first frame.
+const RESTORE_NOT_FIRST: &str = "a restore must be a fresh stream's first frame";
+/// Format: the reason a RESTORE carries when the stream serves neither the volume saved, unchanged since the cut, nor
+/// a clone of the cut's snapshot.
+const RESTORE_ELSEWHERE: &str = "the stream serves neither the saved volume unchanged since the save nor a clone of the save's snapshot";
+/// Format: the reason a RESTORE carries when the stream presents another directory than the saved one did.
+const RESTORE_ANOTHER_DIRECTORY: &str =
+  "the stream presents another directory than the saved share";
+/// Format: the reason a RESTORE carries when a file the saved guest held is not in the volume.
+const RESTORE_FILE_GONE: &str = "a file the saved guest held is not in this volume";
+/// Format: the reason a RESTORE carries when its tables name what no guest could hold.
+const RESTORE_INVALID: &str = "the tables name references no guest could hold";
 /// Format: the reason an unknown control ask's refusal carries to Shards.
 const UNKNOWN_ASK: &str = "a control ask slates does not know";
 
 /// One attachment served over a stream: its end of the pair, the open-handle map kept across requests, the registry
 /// attachment its requests are admitted under, what it presents, and the frames in and out.
 pub(crate) struct ShardsStream {
+  /// The attachment's id, the key the shard keeps the stream under, and its owner in the volume's reference ledger.
+  attachment: u64,
   /// The daemon's end of the pair: a non-blocking socket (Unix), or a pipe end its shard's driver serves (Windows).
   stream: DaemonEnd,
   /// The attachment's open file handles, kept across requests as FUSE keeps them.
@@ -223,6 +286,17 @@ pub(crate) struct ShardsStream {
   /// sent once the volume's log is durable at this position, and replaced by `EIO` (to request `unique`) if it is not
   /// within the liveness budget, since a guest's `fsync` must not claim what no candidate holds.
   durable: Option<DurableOwed>,
+  /// How the guest is shown the volume's owners (A-281): the identity until its root names the run's owner with
+  /// Shards' owner word, then a swap of the root's owner then and the run's. Kept for the stream's life; a restart ends
+  /// the stream, and the next one's guest names it again as it mounts. A RESTORE brings the saved stream's (A-303).
+  owners: OwnerView,
+  /// Whether the stream has read no frame yet: only then may a RESTORE come, and only then may a control frame run to
+  /// [`ShardsStream::restore_most`] (A-303).
+  restorable: bool,
+  /// Derived: the longest tables this shard could make ([`tables::most_bytes`] of its inode slab's capacity). With its
+  /// ask byte, the bound on a fresh stream's first control frame, past which it is refused before anything is allocated
+  /// for it.
+  restore_most: usize,
 }
 
 /// What an owed `FSYNC` reply waits for on a live-shipped volume (A-200): the log position its barrier published, and
@@ -380,6 +454,7 @@ pub(crate) fn attach(s: &mut ShardState, ask: ShardsAsk) -> Result<ShardsAttache
   s.shards_streams.insert(
     attachment,
     ShardsStream {
+      attachment,
       stream: daemon_end,
       handles: new_handle_store(),
       registry,
@@ -401,6 +476,9 @@ pub(crate) fn attach(s: &mut ShardState, ask: ShardsAsk) -> Result<ShardsAttache
       told_mark: None,
       told: None,
       durable: None,
+      owners: OwnerView::IDENTITY,
+      restorable: true,
+      restore_most: tables::most_bytes(s.config.store.max_inodes),
     },
   );
   if futures::spawn(serve(attachment))
@@ -1010,7 +1088,39 @@ fn turn_with(s: &mut ShardState, stream: &mut ShardsStream) -> Turned {
       return Turned::Ended;
     }
   };
+  answer_frame(s, stream, control, total)
+}
+
+/// Answers the frame of `total` bytes at the head of `stream`: a control ask (`control`: a SAVE or a RESTORE, A-303; a
+/// descriptor ask; any other refused) or, with none, a guest's request. Then the frame is consumed, and unless serving
+/// it ended the stream, its reply goes out as far as the stream takes it.
+fn answer_frame(
+  s: &mut ShardState,
+  stream: &mut ShardsStream,
+  control: Option<u8>,
+  total: usize,
+) -> Turned {
+  // Only a fresh stream's first frame may be a RESTORE (A-303); every frame after reads within the request's bound.
+  let first = std::mem::replace(&mut stream.restorable, false);
   let served = match control {
+    // Shards' device sends a SAVE with nothing after its ask byte; one carrying more is no SAVE of its.
+    Some(ASK_SAVE) if total != LENGTH_BYTES.saturating_add(1) => {
+      s.count(SAVE_REFUSED, 1);
+      owe(stream, &control_refusal(SAVE_MALFORMED));
+      true
+    }
+    Some(ASK_SAVE) => {
+      // The guest's stores through its maps reach the volume before the cut: the SAVE waits for them, unconsumed.
+      if dax::hold_save_for_ingest(s, stream, total) {
+        return Turned::Served;
+      }
+      answer_save(s, stream, false);
+      true
+    }
+    Some(ASK_RESTORE) => {
+      answer_restore(s, stream, first, total);
+      true
+    }
     Some(ASK_DESCRIPTOR) => {
       // The ask's body follows its length word and its ask byte.
       let body_at = LENGTH_BYTES.saturating_add(1);
@@ -1030,6 +1140,15 @@ fn turn_with(s: &mut ShardState, stream: &mut ShardsStream) -> Turned {
         .get(LENGTH_BYTES..total)
         .unwrap_or(&[])
         .to_vec();
+      // Shards' owner word is the stream's to take, never a file's attribute (A-281).
+      if let Some(word) = owner_word(&request) {
+        let served = take_owner_word(s, stream, word);
+        consume(stream, total);
+        if !served {
+          return Turned::Ended;
+        }
+        return flush_unless_refill_owed(s, stream);
+      }
       if dax::hold_for_ingest(s, stream, &request, total) {
         stream.told_mark = crate::told::mark(s, stream.volume);
         return Turned::Served;
@@ -1038,6 +1157,11 @@ fn turn_with(s: &mut ShardState, stream: &mut ShardsStream) -> Turned {
     }
   };
   consume(stream, total);
+  // A fresh stream's first frame may have grown the buffer to a restore's tables: the room goes back (A-303).
+  if first && stream.inbound.len() > FRAME_BYTES && stream.filled <= FRAME_BYTES {
+    stream.inbound.truncate(FRAME_BYTES);
+    stream.inbound.shrink_to(FRAME_BYTES);
+  }
   if !served {
     return Turned::Ended;
   }
@@ -1117,6 +1241,12 @@ fn ingest_turn(s: &mut ShardState, stream: &mut ShardsStream) -> Turned {
     return Turned::Served;
   };
   match done.then {
+    // A SAVE held for the guest's stores is answered with the tables once they are in (A-303).
+    Then::Serve { total } if held_save(stream, total) => {
+      answer_save(s, stream, done.refused.is_some());
+      consume(stream, total);
+      flush_unless_refill_owed(s, stream)
+    }
     Then::Serve { total } => {
       let served = serve_request(
         s,
@@ -1169,9 +1299,15 @@ enum Took {
 /// towards the frame's own length (bounded by the largest frame before the buffer grows for it), so the loop ends with
 /// a whole frame, nothing more to read, the peer's close, or a refusal.
 fn take_frame(stream: &mut ShardsStream) -> Took {
+  // A fresh stream's first frame may be a RESTORE, whose tables can run past any request (A-303).
+  let control_most = if stream.restorable {
+    stream.restore_most.saturating_add(1).max(FRAME_BYTES)
+  } else {
+    FRAME_BYTES
+  };
   loop {
     let head = stream.inbound.get(..stream.filled).unwrap_or(&[]);
-    let need = match split_frame(head, FRAME_BYTES) {
+    let need = match split_frame_bounded(head, FRAME_BYTES, control_most) {
       Ok(Split::Whole(Frame::Request(_), total)) => {
         return Took::Frame {
           control: None,
@@ -1216,14 +1352,227 @@ fn consume(stream: &mut ShardsStream, total: usize) {
   stream.filled = filled.saturating_sub(total);
 }
 
-/// Answers a control ask with its refusal, owed as the stream's reply (see the module doc).
-fn answer_control(stream: &mut ShardsStream, ask: u8) {
-  let refusal = match ask {
-    ASK_SAVE => control_refusal(NO_TABLES),
-    ASK_RESTORE => control_refusal(NO_RESTORE),
-    _ => control_refusal(UNKNOWN_ASK),
+/// Answers a control ask slates does not know with its refusal, owed as the stream's reply (see the module doc).
+fn answer_control(stream: &mut ShardsStream, _ask: u8) {
+  owe(stream, &control_refusal(UNKNOWN_ASK));
+}
+
+/// Whether the frame of `total` bytes held at the head of `stream` is a SAVE (A-303).
+fn held_save(stream: &ShardsStream, total: usize) -> bool {
+  let head = stream.inbound.get(..total).unwrap_or(&[]);
+  matches!(
+    split_frame_bounded(head, FRAME_BYTES, FRAME_BYTES),
+    Ok(Split::Whole(Frame::Control { ask: ASK_SAVE, .. }, _))
+  )
+}
+
+/// Answers a SAVE (A-303; Shards' D176 part 5) with the stream's tables, owed as its reply, or a refusal with its
+/// reason. The guest's stores through its maps reached the volume first, unless `stores_refused`: then the cut would
+/// lack them, and the SAVE is refused.
+fn answer_save(s: &mut ShardState, stream: &mut ShardsStream, stores_refused: bool) {
+  let saved = if stores_refused {
+    Err(SAVE_STORES_REFUSED)
+  } else {
+    save(s, stream).and_then(|tables| control_answer(&tables).ok_or(SAVE_TOO_LONG))
   };
-  owe(stream, &refusal);
+  match saved {
+    Ok(answer) => {
+      s.count(SAVED, 1);
+      owe(stream, &answer);
+    }
+    Err(reason) => {
+      s.count(SAVE_REFUSED, 1);
+      owe(stream, &control_refusal(reason));
+    }
+  }
+}
+
+/// The tables of `stream` at a cut made now: a snapshot of its volume taken for the attachment's own principal and made
+/// durable, then what the attachment holds of the volume, its scope and its owner view ([`tables::StreamTables`]).
+fn save(s: &mut ShardState, stream: &ShardsStream) -> Result<Vec<u8>, &'static str> {
+  let principal = s
+    .db
+    .partition()
+    .attachment(stream.attachment)
+    .map(|record| record.principal.clone())
+    .ok_or(STREAM_GONE)?;
+  let volume = slates_ipc::protocol::VolumeId {
+    bytes: stream.volume.bytes,
+  };
+  let (snapshot, _) =
+    crate::verbs::take_snapshot(s, &principal, volume).map_err(|refused| match *refused {
+      ReplyBody::Refused {
+        refusal: Refusal::Forbidden { .. },
+      } => SAVE_FORBIDDEN,
+      ReplyBody::Refused {
+        refusal: Refusal::BarrierIncomplete { .. },
+      } => SAVE_IN_FLIGHT,
+      _ => SAVE_UNSNAPSHOTTED,
+    })?;
+  if !crate::verbs::publish_shard(s).is_ok_and(|published| published.captured(stream.volume)) {
+    return Err(SAVE_UNDURABLE);
+  }
+  let &handle = s.by_id.get(&stream.volume).ok_or(STREAM_GONE)?;
+  let held = s
+    .volumes
+    .get(handle)
+    .map(|slot| slot.volume.held_by(stream.attachment))
+    .map_err(|_| STREAM_GONE)?;
+  let owners = stream
+    .owners
+    .swapped()
+    .map(
+      |((kept_uid, kept_gid), (run_uid, run_gid))| tables::SwappedOwners {
+        kept_uid,
+        kept_gid,
+        run_uid,
+        run_gid,
+      },
+    );
+  Ok(tables::encode(&tables::StreamTables {
+    volume: stream.volume,
+    snapshot: crate::verbs::to_db_snapshot(snapshot),
+    scope: stream.scope,
+    owners,
+    held,
+  }))
+}
+
+/// Answers a RESTORE (A-303), owed as the stream's reply: the stream's attachment takes what the saved stream held and
+/// its guest's owner view, or a refusal with its reason, which changed nothing. `first` is whether it is the stream's
+/// first frame; the tables follow its ask byte in the frame of `total` bytes at the head of the stream.
+fn answer_restore(s: &mut ShardState, stream: &mut ShardsStream, first: bool, total: usize) {
+  let restored = if first {
+    // The tables are read where they lie; the buffer is lent out of the stream meanwhile, not copied.
+    let inbound = std::mem::take(&mut stream.inbound);
+    let body_at = LENGTH_BYTES.saturating_add(1);
+    let restored = restore(s, stream, inbound.get(body_at..total).unwrap_or(&[]));
+    stream.inbound = inbound;
+    restored
+  } else {
+    Err(RESTORE_NOT_FIRST)
+  };
+  match restored {
+    Ok(()) => {
+      s.count(RESTORED, 1);
+      owe(stream, &control_answer(&[]).unwrap_or_default());
+    }
+    Err(reason) => {
+      s.count(RESTORE_REFUSED, 1);
+      owe(stream, &control_refusal(reason));
+    }
+  }
+}
+
+/// Gives `stream`'s attachment what the tables `bytes` say the saved stream held, after every check: the tables
+/// decode; the stream presents the directory the saved one did; and it serves the volume saved, unchanged since the
+/// cut, or a clone of the cut's snapshot, whose numbers are its origin's. The volume then checks each reference
+/// itself, all before any is given ([`slates_vfs::volume::Volume::adopt_held`]).
+fn restore(
+  s: &mut ShardState,
+  stream: &mut ShardsStream,
+  bytes: &[u8],
+) -> Result<(), &'static str> {
+  let tables = tables::decode(bytes, stream.restore_most).map_err(tables::TablesRefused::reason)?;
+  if tables.scope != stream.scope {
+    return Err(RESTORE_ANOTHER_DIRECTORY);
+  }
+  let &handle = s.by_id.get(&stream.volume).ok_or(STREAM_GONE)?;
+  let from_the_cut = if tables.volume == stream.volume {
+    let snapshot = crate::verbs::core_snapshot(slates_ipc::protocol::SnapshotId {
+      value: tables.snapshot.value,
+    });
+    s.volumes
+      .get(handle)
+      .ok()
+      .and_then(|slot| slot.volume.unchanged_since(snapshot).ok())
+      .unwrap_or(false)
+  } else {
+    s.db.partition().lineage(stream.volume).is_some_and(|edge| {
+      edge.origin_volume == tables.volume && edge.origin_snapshot == tables.snapshot
+    })
+  };
+  if !from_the_cut {
+    return Err(RESTORE_ELSEWHERE);
+  }
+  {
+    let ShardState { store, volumes, .. } = &mut *s;
+    let slot = volumes.get_mut(handle).map_err(|_| STREAM_GONE)?;
+    slot
+      .volume
+      .adopt_held(store, stream.attachment, &tables.held)
+      .map_err(|e| match e {
+        slates_vfs::VfsError::NotFound | slates_vfs::VfsError::StaleHandle => RESTORE_FILE_GONE,
+        _ => RESTORE_INVALID,
+      })?;
+  }
+  stream.owners = tables.owners.map_or(OwnerView::IDENTITY, |owners| {
+    OwnerView::swapping(
+      (owners.kept_uid, owners.kept_gid),
+      (owners.run_uid, owners.run_gid),
+    )
+  });
+  Ok(())
+}
+
+/// Takes a guest's owner word (A-281): a word Shards' rules refuse is answered with its errno and changes nothing; one
+/// named by the guest's root on the stream's root makes the stream show the root's owner as it is now, uid and gid, as
+/// the run's owner the word names, and the run's as the root's, until the stream ends. The word is kept on no file:
+/// the reply is owed with nothing written to the volume, so no barrier waits on it. `false` when the attachment can no
+/// longer be served (its registry entry or its volume gone): the stream ends.
+fn take_owner_word(s: &mut ShardState, stream: &mut ShardsStream, word: OwnerWord) -> bool {
+  let answered = match word {
+    OwnerWord::Named { unique, uid, gid } => match root_owner(s, stream) {
+      Some(Ok(kept)) => {
+        stream.owners = OwnerView::swapping(kept, (uid, gid));
+        s.count(OWNER_NAMED, 1);
+        word
+      }
+      Some(Err(errno)) => OwnerWord::Refused { unique, errno },
+      None => return false,
+    },
+    OwnerWord::Refused { .. } => word,
+  };
+  if answered.errno() != 0 {
+    s.count(OWNER_REFUSED, 1);
+  }
+  stream.owed = owner_word_reply(&answered, &mut stream.outbound);
+  stream.sent = 0;
+  true
+}
+
+/// The owner (uid, gid) the volume keeps for the stream's root, its scope's directory or the volume's own: the errno
+/// its read was refused with, or `None` when the attachment can no longer be served.
+fn root_owner(s: &mut ShardState, stream: &mut ShardsStream) -> Option<Result<(u32, u32), i32>> {
+  let &handle = s.by_id.get(&stream.volume)?;
+  let cx = s.attachments.begin(stream.registry).ok()?;
+  let owner = {
+    let ShardState { store, volumes, .. } = &mut *s;
+    match volumes.get_mut(handle) {
+      Ok(slot) => {
+        let mut bridge = VolumeBridge::attached(
+          stream.volume,
+          &mut slot.volume,
+          store,
+          &mut stream.handles,
+          slot.host.as_mut().map(|host| host as &mut dyn HostFs),
+        );
+        let mut scoped = None;
+        let served = crate::verbs::scoped_or_whole(&mut bridge, &mut scoped, stream.scope);
+        let attrs = served
+          .root(&cx)
+          .and_then(|root| served.getattr(ObjectId::new(root, 0), &cx));
+        Some(
+          attrs
+            .map(|attrs| (attrs.uid, attrs.gid))
+            .map_err(slates_bridge_fuse::bridge::errno),
+        )
+      }
+      Err(_) => None,
+    }
+  };
+  s.attachments.end(stream.registry);
+  owner
 }
 
 /// Makes `bytes` the reply owed on `stream`.
@@ -1291,7 +1640,9 @@ fn serve_request(
       &mut stream.handles,
       slot.host.as_mut().map(|host| host as &mut dyn HostFs),
     )
-    .offering_dax(dax_offer);
+    .offering_dax(dax_offer)
+    .viewing_owners(stream.owners)
+    .serving_a_guest();
     let mut scoped = None;
     let served = crate::verbs::scoped_or_whole(&mut bridge, &mut scoped, stream.scope);
     let request = stream.inbound.get(LENGTH_BYTES..total).unwrap_or(&[]);

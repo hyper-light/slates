@@ -327,6 +327,11 @@ pub enum Stale {
   Bootstrap,
   /// The reviewed state or the daemon's authority changed before a recovery was authorized.
   Recovery,
+  /// A write policy moved after it was read (A-285): read it again and set it from there.
+  Policy {
+    /// The policy's version now.
+    current: u64,
+  },
 }
 
 /// Why a call is refused for now.
@@ -422,9 +427,8 @@ pub enum Unsupported {
   /// A merge or a landing that carries a signature: the daemon's verifier for signed work is not in this build
   /// ([`crate::signed`]). Nothing was sent.
   SignedWork,
-  /// A write-policy verb: the daemon's side of the write modes is not in this build ([`crate::policy`]). Nothing was
-  /// sent.
-  WritePolicies,
+  /// The TLS provider's secure random refused, so no launcher secret could be made ([`crate::LauncherSecret::generate`]).
+  SecureRandom,
 }
 
 /// What is wrong with the request.
@@ -642,7 +646,7 @@ impl Error {
   }
 
   /// A channel failure, typed.
-  fn of_ipc(instance: &str, error: IpcError, pause_ns: u64) -> Error {
+  pub(crate) fn of_ipc(instance: &str, error: IpcError, pause_ns: u64) -> Error {
     match error {
       error @ IpcError::DaemonUnavailable { .. } => Error::Unavailable {
         instance: instance.to_owned(),
@@ -693,6 +697,7 @@ impl Error {
       Refusal::UnknownBase { green, version } => Error::Stale(Stale::Base { green, version }),
       Refusal::AttachmentExpired { attachment } => Error::Stale(Stale::Attachment { attachment }),
       Refusal::GrantMismatch => Error::Stale(Stale::Approval),
+      Refusal::PolicyChanged { current } => Error::Stale(Stale::Policy { current }),
       Refusal::GrantInvalid => Error::Stale(Stale::Grant),
       Refusal::LandingConflict { entries } => Error::Stale(Stale::Disk { paths: entries }),
       Refusal::ConsensusBootstrapStale => Error::Stale(Stale::Bootstrap),
@@ -726,21 +731,7 @@ impl Error {
       }),
       Refusal::NotShared { principal, .. } => Error::Denied(Denied::NotShared { principal }),
       Refusal::PolicyForbids { act, by } => {
-        Error::Denied(Denied::Policy(crate::policy::PolicyRefusal {
-          act: match act {
-            slates_ipc::protocol::WriteAct::Merge => crate::policy::WriteAct::Merge,
-            slates_ipc::protocol::WriteAct::Land => crate::policy::WriteAct::Land,
-          },
-          by: match by {
-            slates_ipc::protocol::PolicySubject::Consumer { consumer } => {
-              crate::policy::PolicySubject::Consumer(consumer)
-            }
-            slates_ipc::protocol::PolicySubject::Volume { volume } => {
-              crate::policy::PolicySubject::Volume(volume)
-            }
-          },
-          reason: crate::policy::PolicyReason::Forbidden,
-        }))
+        Error::Denied(Denied::Policy(PolicyRefusal::forbidden(act, by)))
       }
       Refusal::ConsumerNotEnrolled => Error::Denied(Denied::NotEnrolled),
       Refusal::ConsumerRevoked => Error::Denied(Denied::Revoked),
@@ -1125,6 +1116,9 @@ pub enum IssuerFault {
   Attach(slates_anchor::AnchorError),
   /// The daemon has not published an issuer secret yet (an all-zero secret is no authority): it is still starting.
   NotPublished,
+  /// This authority is the launcher's secret (A-299), which proves grants, merges, policies, enrollments and
+  /// revocations; confirming a consensus recovery needs the issuer secret on the anchor's segment.
+  LauncherCannotRecover,
 }
 
 impl fmt::Display for IssuerFault {
@@ -1138,6 +1132,9 @@ impl fmt::Display for IssuerFault {
       Self::Malformed { reason } => write!(f, "the anchor's handoff is malformed: {reason}"),
       Self::Attach(error) => write!(f, "attaching the anchor: {error}"),
       Self::NotPublished => f.write_str("the daemon has published no issuer secret yet"),
+      Self::LauncherCannotRecover => f.write_str(
+        "the launcher's secret cannot confirm a consensus recovery; that needs the anchor's segment",
+      ),
     }
   }
 }
@@ -1183,6 +1180,11 @@ pub enum StartFault {
     /// The OS error number, when the OS gave one.
     errno: Option<i32>,
   },
+  /// The launcher's record could not be made ready on the anchor's standard input (A-299): the pipe refused.
+  Launcher {
+    /// The OS error number, when the OS gave one.
+    errno: Option<i32>,
+  },
 }
 
 impl fmt::Display for StartFault {
@@ -1203,6 +1205,11 @@ impl fmt::Display for StartFault {
       ),
       Self::Wait { errno } => write!(f, "waiting on the anchor: {}", errno_text(*errno)),
       Self::Stop { errno } => write!(f, "stopping the anchor: {}", errno_text(*errno)),
+      Self::Launcher { errno } => write!(
+        f,
+        "handing the anchor the launcher's secret: {}",
+        errno_text(*errno)
+      ),
     }
   }
 }
@@ -1253,9 +1260,19 @@ mod tests {
       typed(Refusal::StaleLease { current: 4 }),
       Error::Stale(Stale::Lease { current: 4 })
     );
-    let overloaded = typed(Refusal::Overloaded { shard: 1 });
+    expect_an_overload_retried_after_the_pause(&typed(Refusal::Overloaded { shard: 1 }));
     assert_eq!(
-      overloaded,
+      typed(Refusal::ConsensusNotInitialized),
+      Error::Unusable(Unusable::NoGroup)
+    );
+    assert!(!typed(Refusal::ConsumerRevoked).is_retryable());
+  }
+
+  /// The retry of `each_refusal_is_typed_into_the_class_a_consumer_acts_on`: expect `overloaded`, shard 1's overload
+  /// typed, to be a retry of that cause after the pause it was typed with.
+  fn expect_an_overload_retried_after_the_pause(overloaded: &Error) {
+    assert_eq!(
+      *overloaded,
       Error::Retry {
         cause: RetryCause::Overloaded { shard: 1 },
         pause_ns: PAUSE_NS
@@ -1263,11 +1280,6 @@ mod tests {
     );
     assert!(overloaded.is_retryable());
     assert_eq!(overloaded.retry_pause_ns(), Some(PAUSE_NS));
-    assert_eq!(
-      typed(Refusal::ConsensusNotInitialized),
-      Error::Unusable(Unusable::NoGroup)
-    );
-    assert!(!typed(Refusal::ConsumerRevoked).is_retryable());
   }
 
   /// A-299: do type a `NotFound` for a call that names nothing that could be missing, and a daemon gone past the

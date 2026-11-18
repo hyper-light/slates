@@ -185,8 +185,10 @@ fn kernel_mount_with(source: &str, port: u16, minor: u32, extra: &str) -> Kernel
   #[allow(clippy::disallowed_methods)] // the mount point, in the build output
   std::fs::create_dir_all(&path).unwrap();
   let mount = KernelMount { path };
-  // Locks go to the server (the default `local_lock=none`): LOCK, LOCKT and LOCKU are served (A-35).
-  let options = format!("vers=4.{minor},proto=tcp,port={port},soft,timeo=10,retrans=2{extra}");
+  // Locks go to the server (the default `local_lock=none`): LOCK, LOCKT and LOCKU are served (A-35). `nosuid,nodev`, as
+  // `docs/deploy.md` has every mount of an export (A-94): a device node the volume keeps (A-294) is never opened as one.
+  let options =
+    format!("vers=4.{minor},proto=tcp,port={port},soft,timeo=10,retrans=2,nosuid,nodev{extra}");
   let output = privileged("mount")
     .args(["-t", "nfs4", "-o", &options, source])
     .arg(&mount.path)
@@ -509,8 +511,8 @@ fn the_owners_own_file_refuses_a_truncating_open_without_write_permission(root: 
 }
 
 /// `mkfifo` and a UNIX socket's `bind` create their names through the kernel client (NFSv4 CREATE of
-/// `NF4FIFO` and `NF4SOCK`, §4.6 A-26) and read back as those kinds; a block or character device is
-/// refused (A-26 keeps no device nodes) without creating a name.
+/// `NF4FIFO` and `NF4SOCK`, §4.6 A-26) and read back as those kinds; a character device made as root reads back as
+/// one with its number (A-294) and is removed like any name.
 #[cfg(target_os = "linux")]
 #[allow(clippy::disallowed_methods)] // file calls through the kernel mount under test (RAM-backed)
 fn special_names(root: &Path) {
@@ -543,18 +545,27 @@ fn special_names(root: &Path) {
   drop(listener);
   std::fs::remove_file(&socket_path).unwrap();
 
-  // As root, so the local kernel's own `CAP_MKNOD` check passes and the refusal is the server's.
+  // As root, so the local kernel's own `CAP_MKNOD` check passes and the server makes the node (A-294).
   let device = root.join("device");
-  let refused = privileged("mknod")
+  let made = privileged("mknod")
     .arg(&device)
     .args(["c", "1", "3"])
     .output()
     .unwrap();
-  assert!(!refused.status.success(), "a device node is refused (A-26)");
+  assert!(made.status.success(), "a device node is made (A-294)");
+  let metadata = std::fs::symlink_metadata(&device).unwrap();
   assert!(
-    std::fs::symlink_metadata(&device).is_err(),
-    "a refused device leaves no name"
+    metadata.file_type().is_char_device(),
+    "a device node reads back as one"
   );
+  let rdev = rustix::fs::Dev::try_from(std::os::unix::fs::MetadataExt::rdev(&metadata)).unwrap();
+  assert_eq!(
+    (rustix::fs::major(rdev), rustix::fs::minor(rdev)),
+    (1, 3),
+    "with its number"
+  );
+  let removed = privileged("rm").arg(&device).output().unwrap();
+  assert!(removed.status.success(), "a device node is removed");
 }
 
 /// `utimensat` with explicit times through the kernel client, including times past 2038 and 2106:
@@ -787,23 +798,56 @@ fn sparse_seek_and_copy(root: &Path) {
   std::fs::remove_file(&sparse).unwrap();
 }
 
-/// A-26, A-268: through the kernel's own client, `mknod` of a character and a block device as root fails with `EPERM`
-/// ("Operation not permitted"), what a local file system that holds no device nodes answers. It ran as root because a
-/// client without `CAP_MKNOD` refuses before it asks the server. Before, the server's `NFS4ERR_BADTYPE` reached the
-/// program as the client's internal errno 527 ("Unknown error 527").
-fn a_device_node_is_refused_eperm(root: &Path) {
-  for (kind, name) in [("c", "char"), ("b", "block")] {
+/// A-294 (which replaced A-268's refusal): through the kernel's own client, `mknod` of a character device numbered
+/// 1:3 (`/dev/null`'s, which any process opens wherever devices are allowed) and a block device numbered 259:1048575
+/// (past the old 8-bit encoding) as root makes each node; each reads back with its kind and number, and the kernel
+/// refuses to open either (`EACCES`, `may_open_dev`), since the mount is `nodev`. It runs as root because a client
+/// without `CAP_MKNOD` refuses before it asks the server. Before A-294 the server answered `NFS4ERR_PERM`; before
+/// A-268, `NFS4ERR_BADTYPE`, which reached the program as the client's internal errno 527 ("Unknown error 527").
+#[allow(clippy::disallowed_methods)] // file calls through the kernel mount under test (RAM-backed)
+fn a_device_node_is_made_with_its_number_and_never_opened(root: &Path) {
+  use std::os::unix::fs::{FileTypeExt, MetadataExt};
+  for (kind, name, major, minor) in [("c", "char", 1, 3), ("b", "block", 259, (1 << 20) - 1)] {
+    let path = root.join(name);
     let made = privileged("mknod")
-      .arg(root.join(name))
-      .args([kind, "1", "2"])
+      .arg(&path)
+      .args([kind, &major.to_string(), &minor.to_string()])
       .output()
       .unwrap();
-    let said = String::from_utf8_lossy(&made.stderr);
-    assert!(!made.status.success(), "no {name} device is made");
     assert!(
-      said.contains("Operation not permitted"),
-      "the {name} device is refused EPERM, not an internal errno: {said}"
+      made.status.success(),
+      "the {name} device is made: {}",
+      String::from_utf8_lossy(&made.stderr)
     );
+    let metadata = std::fs::symlink_metadata(&path).unwrap();
+    let file_type = metadata.file_type();
+    assert!(
+      if kind == "c" {
+        file_type.is_char_device()
+      } else {
+        file_type.is_block_device()
+      },
+      "the {name} device reads back as its kind"
+    );
+    // The host's own `dev_t` (an `i32` on macOS, a `u64` on Linux), from the portable `u64` the standard library gives.
+    let rdev = rustix::fs::Dev::try_from(metadata.rdev()).unwrap();
+    assert_eq!(
+      (rustix::fs::major(rdev), rustix::fs::minor(rdev)),
+      (major, minor),
+      "the {name} device reads back with its number"
+    );
+    let opened = rustix::fs::open(
+      path.as_path(),
+      rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::CLOEXEC,
+      rustix::fs::Mode::empty(),
+    );
+    assert_eq!(
+      opened.map(drop),
+      Err(rustix::io::Errno::ACCESS),
+      "the {name} device is never opened as one"
+    );
+    let removed = privileged("rm").arg(&path).output().unwrap();
+    assert!(removed.status.success(), "the {name} device is removed");
   }
 }
 
@@ -876,7 +920,7 @@ fn the_linux_kernel_nfsv4_client_mounts_and_works_a_volume() {
       let mounted = kernel_mount(&source, port, minor);
       exercise(&mounted.path, &payload);
       an_unlinked_open_file_keeps_serving_with_no_silly_rename(&mounted.path);
-      a_device_node_is_refused_eperm(&mounted.path);
+      a_device_node_is_made_with_its_number_and_never_opened(&mounted.path);
       large_sequential_writes_round_trip(&mounted.path);
       #[cfg(target_os = "linux")]
       if minor == 2 {

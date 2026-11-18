@@ -821,16 +821,27 @@ impl OriginWalk {
             self.dirs.push(path);
           }
         }
-        Kind::Fifo | Kind::Socket => {
+        Kind::Fifo | Kind::Socket | Kind::BlockDevice | Kind::CharDevice => {
           if let Some(first) = self.first_name.get(&row.inode) {
             self.origin.hardlinks.push((path, first.clone()));
             continue;
           }
           use slates_merge::special::{SpecialKind, SpecialNode};
-          let kind = if row.kind == Kind::Fifo {
-            SpecialKind::Fifo
-          } else {
-            SpecialKind::Socket
+          // A device node's number is captured with it (A-294): an inode holds it from its `mknod` on.
+          let number = volume
+            .device_in(store, self.snapshot, row.inode)?
+            .unwrap_or_default();
+          let kind = match row.kind {
+            Kind::Fifo => SpecialKind::Fifo,
+            Kind::Socket => SpecialKind::Socket,
+            Kind::BlockDevice => SpecialKind::BlockDevice {
+              major: number.major,
+              minor: number.minor,
+            },
+            _ => SpecialKind::CharDevice {
+              major: number.major,
+              minor: number.minor,
+            },
           };
           self.origin.modes.push((path.clone(), attrs.mode));
           self.first_name.insert(row.inode, path.clone());
@@ -1472,6 +1483,8 @@ pub(crate) fn status_merge_volume(
       journal: slates_ipc::protocol::JournalReport::default(),
       // A merge volume serves no FUSE mount of its own, so nothing is kept for one (U10).
       takeover_kept: 0,
+      // A green or a work volume has no base folder (A-299).
+      base: None,
     }),
   })
 }
@@ -1572,9 +1585,9 @@ pub(crate) const RECORD_AWAITS_WORK_CATALOG: &str = "merge.record.awaits_work_ca
 /// Format: a merge record's magic, "GMRC" little-endian, after the register's class byte: an unversioned record an
 /// earlier layout wrote begins with its version number, whose low word is the magic only at version 1,129,467,207.
 const RECORD_MAGIC: u32 = u32::from_le_bytes(*b"GMRC");
-/// Format: a merge record's format version (A-255: 1 is the first versioned format, with the submit's completion key);
-/// a decoder refuses any other.
-const RECORD_VERSION: u32 = 1;
+/// Format: a merge record's format version (A-255: 1 is the first versioned format, with the submit's completion key; 2
+/// carries the submitting work beside the key, A-288); a decoder refuses any other.
+const RECORD_VERSION: u32 = 2;
 /// Format: a merge record's magic and its version are each a little-endian `u32`.
 const RECORD_WORD_BYTES: usize = size_of::<u32>();
 /// Format: the magic and version before a merge record's value.
@@ -1619,7 +1632,9 @@ pub struct MergeRecordValue {
 }
 
 /// A submit's completion key as a merge record carries it ([`MergeRecordValue::completion`]): the client's host, the
-/// client and the request's sequence, the key a partition's completion window holds it under.
+/// client and the request's sequence, the key a partition's completion window holds it under; and, for a client on
+/// another node than the work's owner, the work the submit was made from, which a green's successor records the
+/// completion under (A-288), so the work's route is kept only while a completion that route can reach is held.
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SubmitCompletion {
   /// The client's host (`HostId.0`): this node for a local client, the authenticated origin for a forwarded one.
@@ -1628,15 +1643,22 @@ pub struct SubmitCompletion {
   pub client: u32,
   /// The request's sequence within the client.
   pub sequence: u32,
+  /// The work the submit was made from, for a submit forwarded from another node: not part of the key, the route a
+  /// resend under it takes after a takeover (A-255, A-288). `None` for a client of the work's owner's own node: its
+  /// resend is served by that node, from the records it made, and never takes the route; if the node is gone, so is it.
+  pub work: Option<DbVolumeId>,
 }
 
 impl SubmitCompletion {
-  /// The key of the request now running on `state`, if a request is running (`ShardState::current_request`).
-  pub(crate) fn of_current(state: &ShardState) -> Option<SubmitCompletion> {
+  /// The key of the request now running on `state`, a submit of `work`, if a request is running
+  /// (`ShardState::current_request`); the work is named only for a request another node forwarded here.
+  pub(crate) fn of_current(state: &ShardState, work: DbVolumeId) -> Option<SubmitCompletion> {
+    let local = state.origin_anchor.0;
     state.current_request.map(|(origin, id)| SubmitCompletion {
       origin,
       client: id.client,
       sequence: id.sequence,
+      work: (origin != local).then_some(work),
     })
   }
 
@@ -1646,6 +1668,7 @@ impl SubmitCompletion {
       origin: self.origin,
       client: self.client,
       sequence: self.sequence,
+      work: self.work.map(|work| work.bytes),
     }
   }
 
@@ -1655,6 +1678,7 @@ impl SubmitCompletion {
       origin: key.origin,
       client: key.client,
       sequence: key.sequence,
+      work: key.work.map(|bytes| DbVolumeId { bytes }),
     }
   }
 }
@@ -3297,7 +3321,8 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
   use super::*;
 
-  /// AC-6.8 / A-26: seed a green from a frozen FIFO/socket namespace without reading a stream.
+  /// AC-6.8 / A-26, A-294: seed a green from a frozen namespace of FIFO and socket names and device nodes without
+  /// reading a stream or opening a device; expect every kind, owner and device number in the green, each alias a link.
   #[test]
   fn ipc_snapshot_seeds_a_replayable_green_origin() {
     let encoded = {
@@ -3331,10 +3356,20 @@ mod tests {
       )
       .expect("create source");
       let root = volume.root_inode(&store).expect("root");
-      for (name, kind) in [("pipe", Kind::Fifo), ("socket", Kind::Socket)] {
+      use slates_vfs::inode::{DeviceNumber, SpecialNode};
+      for (name, node) in [
+        ("pipe", SpecialNode::Fifo),
+        ("socket", SpecialNode::Socket),
+        ("disk", SpecialNode::BlockDevice(DeviceNumber::new(8, 1))),
+        ("whiteout", SpecialNode::CharDevice(DeviceNumber::new(0, 0))),
+        (
+          "widest",
+          SpecialNode::CharDevice(DeviceNumber::new(u32::MAX, u32::MAX)),
+        ),
+      ] {
         let inode = volume
-          .mknod_no(&mut store, root, name, 0o640, kind)
-          .expect("create IPC name");
+          .mknod_no(&mut store, root, name, 0o640, node)
+          .expect("create a name with no content");
         volume.chown(&mut store, inode, 123, 456).expect("owner");
         volume
           .link_no(&mut store, root, &format!("{name}-link"), inode)
@@ -3350,17 +3385,27 @@ mod tests {
       origin.files.is_empty(),
       "no stream is represented as file bytes"
     );
-    assert_eq!(origin.specials.len(), 2);
+    assert_eq!(origin.specials.len(), 5);
     let green = Green::with_origin(origin.clone());
+    use slates_merge::special::SpecialKind;
     for (path, kind) in [
-      ("pipe", slates_merge::special::SpecialKind::Fifo),
-      ("socket", slates_merge::special::SpecialKind::Socket),
+      ("pipe", SpecialKind::Fifo),
+      ("socket", SpecialKind::Socket),
+      ("disk", SpecialKind::BlockDevice { major: 8, minor: 1 }),
+      ("whiteout", SpecialKind::CharDevice { major: 0, minor: 0 }),
+      (
+        "widest",
+        SpecialKind::CharDevice {
+          major: u32::MAX,
+          minor: u32::MAX,
+        },
+      ),
     ] {
       let node = green.special(path).expect("metadata survived capture");
       assert_eq!((node.kind, node.uid, node.gid), (kind, 123, 456));
       assert_eq!(green.special(&format!("{path}-link")), Some(node));
     }
-    assert_eq!(origin.hardlinks.len(), 2);
+    assert_eq!(origin.hardlinks.len(), 5);
     assert_eq!(origin.encode(), encoded);
     assert_eq!(
       Green::with_origin(origin.clone()).head_identity(),
@@ -3575,7 +3620,12 @@ mod tests {
         host: slates_db::HostId(0),
         uid: 1000,
       },
-      completion: None,
+      completion: Some(SubmitCompletion {
+        origin: 11,
+        client: 12,
+        sequence: 13,
+        work: Some(DbVolumeId { bytes: [14u8; 16] }),
+      }),
     }
   }
 
@@ -3635,6 +3685,18 @@ mod tests {
       MergeRecordValue::decode_record(&other_version),
       Err(RecordRefused::Version {
         found: RECORD_VERSION.saturating_add(1),
+        expected: RECORD_VERSION,
+      })
+    );
+    // A-288: a record of format 1, whose completion carried no submitting work, is refused typed, never read without it.
+    let mut before_the_work = value().to_record_bytes();
+    if let Some(version) = before_the_work.get_mut(5..9) {
+      version.copy_from_slice(&1u32.to_le_bytes());
+    }
+    assert_eq!(
+      MergeRecordValue::decode_record(&before_the_work),
+      Err(RecordRefused::Version {
+        found: 1,
         expected: RECORD_VERSION,
       })
     );

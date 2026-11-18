@@ -29,6 +29,7 @@
 //!
 //! Not yet: a holder's replicas do not survive its own daemon's restart.
 
+use slates_bridge_core::durable_bound::{DurableBound, GaveUp, Heard, Spans};
 use std::collections::{BTreeMap, VecDeque};
 
 use slates_db::live::{
@@ -65,6 +66,10 @@ const RETAIN: usize = 4;
 const LIVE_REFUSED: &str = "fleet.live.refused";
 /// Counter: whole records appended to a live log, each a copy of the volume's content.
 const LIVE_WHOLE: &str = "fleet.live.whole";
+/// Counter: the bytes of the whole records appended.
+const LIVE_WHOLE_BYTES: &str = "fleet.live.whole_bytes";
+/// Counter: the bytes of the changes (delta records) appended.
+const LIVE_CHANGE_BYTES: &str = "fleet.live.change_bytes";
 /// Counter: install images made from a publication's state (or a clean volume's, on the record period) for a holder
 /// behind the retained tail, beside the log rather than on it ([`refresh_image`]).
 const LIVE_IMAGE: &str = "fleet.live.install_image";
@@ -223,6 +228,98 @@ pub(crate) struct LiveVolume {
   /// whole entry. Pairs only accumulate, but one retired between the entry and the image (a node back at its anchor)
   /// could leave the image short of a key the entry's check passed.
   image_anchors: Option<Vec<u64>>,
+  /// Acknowledgements that moved this volume's durability forward: a holder's acknowledged position advancing
+  /// ([`fold_into`]), or its head's or catalog's placement gaining an acknowledgement or a newer sequence
+  /// (`fleet::record_acks_in`). A reply held for durability gives up only after a whole wait of
+  /// [`DURABLE_WAIT_NS`] in which this did not move ([`DurableBound`]).
+  heard: u64,
+}
+
+/// One candidate's copy of a live log as its shard's recovery image keeps it (A-200; §4.8 "Recovery": a warm restart
+/// keeps every replica the node acknowledged): its owner, its fence, the head it holds and the sealed entries since the
+/// last whole one.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HeldLive {
+  object: [u8; 16],
+  owner: u64,
+  fence: u64,
+  head: Option<HeldHead>,
+  /// The slot of the first entry (A-270).
+  first: u64,
+  /// The entries, from `first`, in slot order. A head piece carries none; recovery joins them from their own pieces.
+  entries: Vec<Vec<u8>>,
+}
+
+impl HeldLive {
+  /// The object this copy is of.
+  pub(crate) fn object(&self) -> [u8; 16] {
+    self.object
+  }
+
+  /// The slot of its first entry.
+  pub(crate) fn first(&self) -> u64 {
+    self.first
+  }
+
+  /// This copy with `entries`, from its first slot, joined to it.
+  pub(crate) fn with_entries(self, entries: Vec<Vec<u8>>) -> HeldLive {
+    HeldLive { entries, ..self }
+  }
+}
+
+/// A held copy's head, as [`HeldLive`] keeps it.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HeldHead {
+  epoch: u64,
+  position: u64,
+  identity: [u8; 32],
+}
+
+/// Holds again, after a warm restart, the copies a recovered image kept (`RecoveredHeld`'s live copies, in
+/// [`crate::content_holder::restore_held_registers`]), each with its fence.
+pub(crate) fn restore_copies(state: &mut ShardState, copies: Vec<HeldLive>) {
+  for copy in copies {
+    let object = ObjectId(copy.object);
+    let head = copy.head.map(|head| Head {
+      epoch: HostEpoch(head.epoch),
+      position: head.position,
+      identity: head.identity,
+    });
+    let bytes = copy
+      .entries
+      .iter()
+      .map(Vec::len)
+      .fold(0usize, usize::saturating_add);
+    let held = Held {
+      replica: Replica::recovered(HostId(copy.owner), object, HostEpoch(copy.fence), head),
+      entries: copy.entries.into(),
+      bytes,
+      first: copy.first,
+    };
+    // A copy made after the restart starts above every slot the recovered image carried.
+    let (_, end) = held.slots();
+    state.live.slot_floor = state.live.slot_floor.max(end);
+    state.live.held.insert(object, held);
+    state.count(LIVE_RESTORED, 1);
+  }
+}
+
+/// Counter: live copies a warm restart held again from the recovery image.
+const LIVE_RESTORED: &str = "fleet.live.restored";
+
+/// Counter: a holder's answer withheld because the publication that would keep what it acknowledged did not commit;
+/// the owner re-ships it.
+const LIVE_UNPUBLISHED: &str = "fleet.live.unpublished";
+
+/// Commits this shard's recovery image before a holder acknowledges what it now keeps (§4.8 "Recovery", as content and
+/// register holders do): `reply`, or nothing when the publication did not commit, which the owner reads as no answer
+/// and re-ships. A warm restart must hold again everything acknowledged, and its fence.
+fn acknowledged(state: &mut ShardState, reply: Vec<u8>) -> Vec<u8> {
+  if crate::verbs::publish_shard(state).is_err() {
+    state.count(LIVE_UNPUBLISHED, 1);
+    return Vec::new();
+  }
+  reply
 }
 
 /// What a candidate keeps of one live volume.
@@ -233,6 +330,72 @@ pub(crate) struct Held {
   entries: VecDeque<Vec<u8>>,
   /// Their bytes.
   bytes: usize,
+  /// The slot of the first entry (A-270): entry `i` is slot `first + i`, its held piece's position. Entries are only
+  /// pushed after the last or all cleared ([`Held::clear_entries`], which moves it past them), so a slot never names
+  /// two entries, and a delta carries a copy's new slots and the ones it dropped.
+  first: u64,
+}
+
+impl Held {
+  /// Drops every entry: the next one pushed takes the slot after the last dropped.
+  fn clear_entries(&mut self) {
+    let dropped = u64::try_from(self.entries.len()).unwrap_or(u64::MAX);
+    self.first = self.first.saturating_add(dropped);
+    self.entries.clear();
+    self.bytes = 0;
+  }
+
+  /// The slots its entries hold: `first..end`.
+  pub(crate) fn slots(&self) -> (u64, u64) {
+    let held = u64::try_from(self.entries.len()).unwrap_or(u64::MAX);
+    (self.first, self.first.saturating_add(held))
+  }
+
+  /// The entry at `slot`, when it holds one.
+  pub(crate) fn entry_at(&self, slot: u64) -> Option<&[u8]> {
+    let index = usize::try_from(slot.checked_sub(self.first)?).ok()?;
+    self.entries.get(index).map(Vec::as_slice)
+  }
+
+  /// This copy's head piece's fields (A-270): its owner, fence, head and first slot, with no entries.
+  pub(crate) fn head_of(&self, object: ObjectId) -> HeldLive {
+    HeldLive {
+      object: object.0,
+      owner: self.replica.owner().0,
+      fence: self.replica.fence().0,
+      head: self.replica.head().map(|head| HeldHead {
+        epoch: head.epoch.0,
+        position: head.position,
+        identity: head.identity,
+      }),
+      first: self.first,
+      entries: Vec::new(),
+    }
+  }
+}
+
+#[cfg(test)]
+impl Held {
+  /// Test support (A-270's oracle): a copy of `object` for `owner` holding nothing, its first slot `first`.
+  pub(crate) fn for_test(owner: HostId, object: ObjectId, first: u64) -> Held {
+    Held {
+      replica: Replica::new(owner, object),
+      entries: VecDeque::new(),
+      bytes: 0,
+      first,
+    }
+  }
+
+  /// Test support: keeps `payload` after the last entry, as an accepted entry is kept.
+  pub(crate) fn push_for_test(&mut self, payload: Vec<u8>) {
+    self.bytes = self.bytes.saturating_add(payload.len());
+    self.entries.push_back(payload);
+  }
+
+  /// Test support: drops every entry, as a whole entry or an install does.
+  pub(crate) fn clear_for_test(&mut self) {
+    self.clear_entries();
+  }
 }
 
 /// The node's live-shipping state, on every shard: the volumes this shard owns and ships, and (on the control shard)
@@ -241,8 +404,12 @@ pub(crate) struct Held {
 pub(crate) struct LiveState {
   /// The live volumes this shard owns, by volume bytes.
   pub(crate) shipping: BTreeMap<[u8; 16], LiveVolume>,
-  /// What this node holds as a candidate, by object.
-  pub(crate) held: BTreeMap<ObjectId, Held>,
+  /// What this node holds as a candidate, by object. Tracked (`crate::tracked`), so a publication carries only the
+  /// copies reached since the last (A-270).
+  pub(crate) held: crate::tracked::Tracked<ObjectId, Held>,
+  /// The first slot a copy made now takes (A-270): at or above every slot a committed publication carried for any copy,
+  /// so a copy dropped and made again never reuses a published entry's key.
+  pub(crate) slot_floor: u64,
   /// The live volumes the publication in progress recorded, with their record (`None`: the publication was a
   /// checkpoint, so the whole image ships): shipped once it commits ([`ship_captured`]), dropped if it is refused.
   pub(crate) captured: Vec<(slates_db::catalog::VolumeId, Option<Vec<u8>>)>,
@@ -266,10 +433,10 @@ pub(crate) struct LiveState {
   /// the volume, holding those holders' sessions until they return ([`drain_stragglers`]). Bounded by the sessions: each
   /// holds at least one.
   stragglers: Vec<(u16, ObjectId, slates_cluster::Stragglers)>,
-  /// The head each taken-over live volume's rebuild was last refused at, and why ([`owes_refetch`]), on the control
+  /// The head each taken-over live volume's rebuild was last refused at, and why ([`next_fetch`]), on the control
   /// shard: its log is not fetched again until phase one adopts another head. One entry a pending materialization, removed
   /// when it is served.
-  pub(crate) refused_rebuilds: BTreeMap<ObjectId, (Head, &'static str)>,
+  pub(crate) refused_rebuilds: BTreeMap<ObjectId, Refused>,
 }
 
 /// Notes, after a transport's barrier published `volume`, the position its reply must wait for ([`wait_durable`]).
@@ -282,29 +449,144 @@ pub(crate) fn take_barrier(state: &mut ShardState) -> Option<(slates_db::catalog
   state.live.barrier.take()
 }
 
-/// Derived: how long a transport's reply waits for durability before it is answered "try again" (NFS `JUKEBOX`): the
-/// daemon's liveness budget, past which a holder that has not answered is not a live one to wait for.
+/// Derived: how long a transport's reply waits for durability with nothing heard before it is answered that it is not
+/// durable (NFS `JUKEBOX`, FUSE and virtio-fs `EIO`): the daemon's liveness budget, past which a holder that has not
+/// answered is not a live one to wait for. A window, not a deadline: each one in which the volume's durability moved
+/// forward starts another ([`DurableBound`]).
 const DURABLE_WAIT_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS;
 
-/// Waits on this (the volume's owner) shard, without blocking it, until `volume`'s log is durable at `target`, or
-/// [`DURABLE_WAIT_NS`] has passed: whether it became durable. The caller answers a stable write or `COMMIT` only then,
-/// and otherwise tells the client to try again: a barrier never claims what `f` candidates do not hold.
+/// Format: nanoseconds in a millisecond, for the milliseconds a give-up's record reads in.
+pub(crate) const NS_PER_MS: u64 = 1_000_000;
+
+/// `object`'s volume heard an acknowledgement that moved its durability forward: its head's or its catalog's placement
+/// gained an acknowledgement or a newer sequence (`fleet::record_acks_in`). Counted on the volume's shipper
+/// ([`LiveVolume::heard`]); nothing for a volume this shard does not ship.
+pub(crate) fn heard(state: &mut ShardState, object: ObjectId) {
+  let volume = object.placement_key().0;
+  if let Some(live) = state.live.shipping.get_mut(&volume) {
+    live.heard = live.heard.saturating_add(1);
+  }
+}
+
+/// Derived: how far apart the looks are that confirm a held reply's silent window
+/// (`slates_bridge_core::durable_bound::Spans::look_ns`): the heartbeat, the cadence the control shard beats the
+/// anchor's word at (§4.14), so a control shard that runs waits in its driver at least once between two looks.
+const DURABLE_LOOK_NS: u64 = crate::daemon::HEARTBEAT_NS;
+
+/// The spans a held reply's wait is judged in on this shard: windows of [`DURABLE_WAIT_NS`], looks [`DURABLE_LOOK_NS`]
+/// apart while a silence is confirmed, and at most the shard's failover SLO from the hold (10 s by default; the
+/// supervisor's landing condition of 2026-11-11, banned item 8).
+fn durable_spans(state: &ShardState) -> Spans {
+  Spans {
+    window_ns: DURABLE_WAIT_NS,
+    total_ns: state.config.failover_slo_ns,
+    look_ns: DURABLE_LOOK_NS,
+  }
+}
+
+/// The first window of a wait for `volume`'s durability beginning at `now_ns`, under the one rule every transport judges
+/// a held durable reply by (`slates_bridge_core::durable_bound`). Under load on adacachy2 a healthy `fsync`'s bytes were
+/// already held by a candidate while the volume's head placement was in flight, and the old single deadline answered
+/// `EIO` (3 of 10 runs, every run that reached it).
+pub(crate) fn begin_durable_bound(
+  state: &ShardState,
+  volume: slates_db::catalog::VolumeId,
+  now_ns: u64,
+) -> DurableBound {
+  DurableBound::begin(heard_now(state, volume), now_ns, durable_spans(state))
+}
+
+/// Whether, and why, `bound`'s wait for `volume` has given up at `now_ns`, judged against what the volume has heard on
+/// its durability path and how often its receiver has idled ([`heard_now`]).
+pub(crate) fn judge_durable_bound(
+  state: &ShardState,
+  volume: slates_db::catalog::VolumeId,
+  bound: &mut DurableBound,
+  now_ns: u64,
+) -> Option<GaveUp> {
+  bound.judge(heard_now(state, volume), now_ns)
+}
+
+/// What a reply held for `volume`'s durability is judged against now: the acknowledgements the volume has heard
+/// ([`heard_of`]), and the waits the daemon's control shard has entered in its driver, each with nothing ready to run.
+/// The control shard holds the sessions every holder's acknowledgement arrives on (`send_from_control`), and hands each
+/// one to the volume's shard as a task there; so once it has waited twice after a moment, every acknowledgement that
+/// reached it before then has been read and handed on (the rule's own reasoning, `slates_bridge_core::durable_bound`).
+/// Read off its registry pulse, with no shard round trip.
+pub(crate) fn heard_now(state: &ShardState, volume: slates_db::catalog::VolumeId) -> Heard {
+  let control = state.shards.first().copied().unwrap_or(state.shard);
+  Heard {
+    acknowledged: heard_of(state, volume),
+    receiver_idles: slates_rt::registry::with_entry(control, |entry| entry.pulse.waits())
+      .unwrap_or(0),
+  }
+}
+
+/// [`LiveVolume::heard`] of `volume`, or zero when this shard does not ship it.
+fn heard_of(state: &ShardState, volume: slates_db::catalog::VolumeId) -> u64 {
+  state
+    .live
+    .shipping
+    .get(&volume.bytes)
+    .map_or(0, |live| live.heard)
+}
+
+/// Waits on this (the volume's owner) shard, without blocking it, until `volume`'s log is durable at `target`, or a
+/// window of [`DURABLE_WAIT_NS`] has passed with nothing heard ([`DurableBound`]): whether it became durable. The
+/// caller answers a stable write or `COMMIT` only then, and otherwise tells the client to try again: a barrier never
+/// claims what `f` candidates do not hold.
 pub(crate) async fn wait_durable(volume: slates_db::catalog::VolumeId, target: u64) -> bool {
-  let parked = std::future::poll_fn(|cx| {
-    let settled = state::with_state(|s| durability(s, volume, target, Some(cx.waker())))
-      .unwrap_or(Durability::Never);
-    if settled == Durability::Pending {
-      std::task::Poll::Pending
-    } else {
-      std::task::Poll::Ready(())
+  let Some(mut bound) =
+    state::with_state(|s| begin_durable_bound(s, volume, slates_rt::futures::now_ns()))
+  else {
+    return false;
+  };
+  let mut gave_up = None;
+  // A window at a time ([`DurableBound`]): one that ends with the volume's durability moved forward is followed by
+  // another, one that ends with nothing heard gives up.
+  loop {
+    let parked = std::future::poll_fn(|cx| {
+      let settled = state::with_state(|s| durability(s, volume, target, Some(cx.waker())))
+        .unwrap_or(Durability::Never);
+      if settled == Durability::Pending {
+        std::task::Poll::Pending
+      } else {
+        std::task::Poll::Ready(())
+      }
+    });
+    let left = bound
+      .next_look_ns()
+      .saturating_sub(slates_rt::futures::now_ns());
+    match slates_rt::futures::within(left, parked).await {
+      Ok(Some(())) | Err(_) => break,
+      Ok(None) => {
+        let given_up = state::with_state(|s| {
+          judge_durable_bound(s, volume, &mut bound, slates_rt::futures::now_ns())
+        })
+        .unwrap_or(Some(GaveUp::Silent));
+        if let Some(why) = given_up {
+          gave_up = Some(why);
+          break;
+        }
+      }
     }
-  });
-  let durable =
-    matches!(
-      slates_rt::futures::within(DURABLE_WAIT_NS, parked).await,
-      Ok(Some(()))
-    ) && state::with_state(|s| durability(s, volume, target, None) == Durability::Durable)
-      .unwrap_or(false);
+  }
+  let durable = state::with_state(|s| {
+    let durable = durability(s, volume, target, None) == Durability::Durable;
+    if !durable {
+      // What durability still lacked when the wait ended (2026-11-09): the client is told its write is not durable.
+      slates_machine::log_line!(
+        "slates-server: a held durable reply gave up after {} windows of {} ms, {} (shard {}): {}",
+        bound.windows(),
+        DURABLE_WAIT_NS / NS_PER_MS,
+        gave_up.map_or("its wait ended", GaveUp::named),
+        s.shard,
+        durability_report(s, volume, target)
+      );
+    }
+    durable
+  })
+  .unwrap_or(false);
   let _ = state::with_state(|s| {
     s.count(
       if durable {
@@ -356,9 +638,57 @@ pub(crate) fn durability(
   Durability::Pending
 }
 
-/// Derived: how long a held reply waits for durability before its transport answers that it is not (NFS `JUKEBOX`,
-/// FUSE and virtio-fs `EIO`, WinFsp `STATUS_UNEXPECTED_IO_ERROR`): [`DURABLE_WAIT_NS`]. Asked by those transports, so
-/// compiled where they are.
+/// What a reply waiting for `volume`'s log to be durable at `target` is still waiting on, as one line for a log: the
+/// owner's head and durable position, the last whole entry, each holder's acknowledged head, the lanes in flight and how
+/// long each has run, the holders found unreachable, and each condition [`answerable`] asks. Asked when a held reply
+/// gives up, so a refusal says which part of durability it lacked.
+pub(crate) fn durability_report(
+  state: &ShardState,
+  volume: slates_db::catalog::VolumeId,
+  target: u64,
+) -> String {
+  let now = slates_rt::futures::now_ns();
+  let placed = head_placed(state, volume.bytes);
+  let recorded = active_set_recorded(state, volume.bytes);
+  let covered = covers_candidates(state, volume.bytes);
+  let Some(live) = state.live.shipping.get(&volume.bytes) else {
+    return format!("target {target}: no shipper; head placed {placed}");
+  };
+  let holders: Vec<String> = live
+    .shipper
+    .holders()
+    .iter()
+    .map(|holder| {
+      format!(
+        "{}@{:?}",
+        holder.0,
+        live.shipper.held_by(*holder).map(|head| head.position)
+      )
+    })
+    .collect();
+  let lanes: Vec<String> = live
+    .lanes
+    .iter()
+    .map(|(holder, began)| format!("{}:{}ms", holder.0, now.saturating_sub(*began) / NS_PER_MS))
+    .collect();
+  let unreachable: Vec<u64> = live.unreachable.iter().map(|holder| holder.0).collect();
+  format!(
+    "target {target}; head {:?}; durable {:?}; whole {:?}; owes whole {}; holders {holders:?}; lanes {lanes:?}; \
+     unreachable {unreachable:?}; head placed {placed}; active set recorded {recorded} (at {:?}); covers candidates \
+     {covered}; fenced {:?}",
+    live.shipper.head().map(|head| head.position),
+    live.shipper.durable(),
+    live.whole_entry.map(|head| head.position),
+    live.owes_whole,
+    live.recorded,
+    live.fenced,
+  )
+}
+
+/// Derived: the window a held reply's wait for durability is judged in (`slates_bridge_core::durable_bound`) before its
+/// transport answers that it is not durable (NFS `JUKEBOX`, FUSE and virtio-fs `EIO`, WinFsp
+/// `STATUS_UNEXPECTED_IO_ERROR`): [`DURABLE_WAIT_NS`]. Asked by those transports for their give-up records, so compiled
+/// where they are.
 pub(crate) const fn durable_wait_ns() -> u64 {
   DURABLE_WAIT_NS
 }
@@ -907,6 +1237,7 @@ pub(crate) fn published(
       recording: None,
       whole_entry: None,
       image_anchors: None,
+      heard: 0,
     });
   follow_candidates(state, id.bytes);
   let Some(live) = state.live.shipping.get_mut(&id.bytes) else {
@@ -937,6 +1268,7 @@ pub(crate) fn published(
   };
   match appended {
     Ok(entry) => {
+      let shipped = u64::try_from(payload.len()).unwrap_or(u64::MAX);
       live.owes_whole = false;
       live.kept = if whole {
         payload.len()
@@ -959,6 +1291,9 @@ pub(crate) fn published(
       state.count(LIVE_APPENDED, 1);
       if whole {
         state.count(LIVE_WHOLE, 1);
+        state.count(LIVE_WHOLE_BYTES, shipped);
+      } else {
+        state.count(LIVE_CHANGE_BYTES, shipped);
       }
       if image_owed {
         // The volume's state now is this publication's, so its image is exactly the head just appended.
@@ -1206,6 +1541,20 @@ fn payload(
   Some((payload, Some(anchors)))
 }
 
+/// The anchor of `candidate` if this shard's pair to that anchor was accepted by `candidate` itself, the incarnation now
+/// at the anchor: only then can it unwrap a key wrapped for the anchor. A node replaced at its own anchor comes back
+/// under a new member id with none of its predecessor's keys. Counted by anchor alone, the predecessor's acceptance
+/// covered the replacement, writes went durable on a key it never received, and as successor it could not open the
+/// log (A-271; the store-destroyed takeover, 2026-11-09).
+fn covered_anchor(
+  candidate: HostId,
+  anchors: &BTreeMap<HostId, u64>,
+  delivered: &BTreeMap<u64, HostId>,
+) -> Option<u64> {
+  let anchor = *anchors.get(&candidate)?;
+  (delivered.get(&anchor) == Some(&candidate)).then_some(anchor)
+}
+
 /// Whether a successor among `volume`'s remote candidates (those still in the neighbourhood) can open its log: its
 /// last whole entry is in the clear, or carries a copy of the lineage key for each one's anchor (A-92 piece 4c), as a
 /// sealed head must before it ships (`fleet::sealing_covers`). Every candidate at once, since any may succeed. A whole
@@ -1216,8 +1565,9 @@ fn covers_candidates(state: &ShardState, volume: [u8; 16]) -> bool {
   let Some(live) = state.live.shipping.get(&volume) else {
     return true;
   };
+  // Each candidate's anchor only once this shard's pair to it was accepted by that very candidate ([`covered_anchor`]).
   let wanted: Vec<Option<u64>> = remote_candidates(state, volume)
-    .map(|candidate| state.member_anchors.get(&candidate).copied())
+    .map(|candidate| covered_anchor(candidate, &state.member_anchors, &state.pairs_delivered))
     .collect();
   log_covers(
     &wanted,
@@ -1266,10 +1616,7 @@ fn remote_candidates(state: &ShardState, volume: [u8; 16]) -> impl Iterator<Item
 /// then owes one ([`period`]), so the log is checkpointed again once the pairs are there.
 fn coverable_now(state: &ShardState, volume: [u8; 16]) -> bool {
   remote_candidates(state, volume).all(|candidate| {
-    state
-      .member_anchors
-      .get(&candidate)
-      .is_some_and(|anchor| state.pairs_delivered.contains_key(anchor))
+    covered_anchor(candidate, &state.member_anchors, &state.pairs_delivered).is_some()
   })
 }
 
@@ -2059,6 +2406,9 @@ fn fold_into(state: &mut ShardState, replies: Vec<(ObjectId, HostId, Vec<u8>)>) 
     // looped at the network's speed: 982 and 5,501 refusals on the two holders of one five-write run, and later a holder
     // installed at a checkpoint the tail had passed, re-installed there without end (2026-11-05, `live_fleet`).
     let progressed = live.shipper.held_by(host) != held_before;
+    if progressed {
+      live.heard = live.heard.saturating_add(1);
+    }
     if live.shipper.durable() > before {
       state.count(LIVE_DURABLE, 1);
       resolve(state, object.0);
@@ -2260,10 +2610,15 @@ pub(crate) fn serve_entry(
     }
   });
   match &reply {
-    Err(error) => count_refused(state, refused_counter(error)),
-    Ok(_) => state.count(LIVE_HELD, 1),
+    Err(error) => {
+      count_refused(state, refused_counter(error));
+      encode_reply(&reply)
+    }
+    Ok(_) => {
+      state.count(LIVE_HELD, 1);
+      acknowledged(state, encode_reply(&reply))
+    }
   }
-  encode_reply(&reply)
 }
 
 /// A candidate's answer to an install from `peer`, as [`serve_entry`]: the install's state replaces what it held.
@@ -2289,8 +2644,7 @@ pub(crate) fn serve_install(
     let held = held_entry(state, peer, install.object);
     match held.replica.check_install(&install)? {
       Admitted::Apply(head) => {
-        held.entries.clear();
-        held.bytes = 0;
+        held.clear_entries();
         keep(held, &install.state, bound)?;
         held.replica.commit(install.epoch, head);
         Ok((Some(head), true))
@@ -2303,10 +2657,15 @@ pub(crate) fn serve_install(
   }
   let reply = reply.map(|(head, _)| head);
   match &reply {
-    Err(error) => count_refused(state, refused_counter(error)),
-    Ok(_) => state.count(LIVE_HELD, 1),
+    Err(error) => {
+      count_refused(state, refused_counter(error));
+      encode_reply(&reply)
+    }
+    Ok(_) => {
+      state.count(LIVE_HELD, 1);
+      acknowledged(state, encode_reply(&reply))
+    }
   }
-  encode_reply(&reply)
 }
 
 /// Why a holder will not serve a message about `object` made under `epoch`: below the fence its copy has promised it is
@@ -2337,7 +2696,7 @@ fn admitted(
   let placing = slates_cluster::content::ContentAccess::Place;
   let authority = crate::fleet::content_authority(
     regional,
-    &state.holder_records,
+    state.holder_records.as_map(),
     local,
     peer,
     placing,
@@ -2410,10 +2769,12 @@ fn refused_counter(error: &LiveError) -> &'static str {
 /// The holder's copy of `object`, kept for `owner`: the configuration names `owner` the volume's acting owner (the caller
 /// checked it, [`admitted`]), so a successor takes the copy over; the fence still refuses any stale epoch.
 fn held_entry(state: &mut ShardState, owner: HostId, object: ObjectId) -> &mut Held {
+  let first = state.live.slot_floor;
   let held = state.live.held.entry(object).or_insert_with(|| Held {
     replica: Replica::new(owner, object),
     entries: VecDeque::new(),
     bytes: 0,
+    first,
   });
   held.replica.reassign(owner);
   held
@@ -2436,7 +2797,7 @@ pub(crate) fn serve_fetch(
   let reading = slates_cluster::content::ContentAccess::Read;
   if !crate::fleet::content_authorized(
     regional,
-    &state.holder_records,
+    state.holder_records.as_map(),
     local,
     peer,
     reading,
@@ -2451,7 +2812,9 @@ pub(crate) fn serve_fetch(
       let head = held.replica.head();
       let entries: Vec<Vec<u8>> = held.entries.iter().cloned().collect();
       state.count(LIVE_FETCHED, 1);
-      slates_db::live::encode_fetched(&Ok(head), &entries)
+      // The fence this raised is a promise too: it outlives a restart before it is told.
+      let reply = slates_db::live::encode_fetched(&Ok(head), &entries);
+      acknowledged(state, reply)
     }
     Err(refusal) => slates_db::live::encode_fetched(&Err(refusal), &[]),
   }
@@ -2473,7 +2836,7 @@ pub(crate) fn serve_report(
   let reading = slates_cluster::content::ContentAccess::Read;
   if !crate::fleet::content_authorized(
     regional,
-    &state.holder_records,
+    state.holder_records.as_map(),
     local,
     peer,
     reading,
@@ -2488,7 +2851,9 @@ pub(crate) fn serve_report(
       let head = held.replica.head();
       let kept = u64::try_from(held.bytes).unwrap_or(u64::MAX);
       state.count(LIVE_REPORTED, 1);
-      slates_db::live::encode_reported(&Ok(head), kept)
+      // The fence this raised is a promise: it outlives a restart before it is told (as a fetch's, `serve_fetch`).
+      let reply = slates_db::live::encode_reported(&Ok(head), kept);
+      acknowledged(state, reply)
     }
     Err(refusal) => slates_db::live::encode_reported(&Err(refusal), 0),
   }
@@ -2511,10 +2876,12 @@ fn fenced_copy(
   object: ObjectId,
   epoch: slates_db::register::HostEpoch,
 ) -> Result<&mut Held, LiveError> {
+  let first = state.live.slot_floor;
   let held = state.live.held.entry(object).or_insert_with(|| Held {
     replica: Replica::new(successor, object),
     entries: VecDeque::new(),
     bytes: 0,
+    first,
   });
   held.replica.prepare(epoch)?;
   Ok(held)
@@ -2539,8 +2906,7 @@ pub(crate) fn serve_state(
 /// Keeps `payload` after what is held (a whole one first drops what came before it), within `bound`.
 fn keep(held: &mut Held, payload: &[u8], bound: usize) -> Result<(), LiveError> {
   if payload.first() == Some(&KIND_WHOLE) {
-    held.entries.clear();
-    held.bytes = 0;
+    held.clear_entries();
   }
   let bytes = held
     .bytes
@@ -2563,6 +2929,9 @@ const LIVE_TAKEOVER_REFUSED: &str = "fleet.live.takeover_refused";
 const REFUSED_LINEAGE: &str = "fleet.live.takeover_refused.lineage";
 /// Counter: a takeover refused because an entry's payload would not open (its seal, or its bytes).
 const REFUSED_OPEN: &str = "fleet.live.takeover_refused.open";
+/// Counter: a takeover refused because the log is sealed and this node holds no lineage or naming key for it: its own
+/// key record, not the log's bytes ([`next_fetch`] waits for the key).
+const REFUSED_NO_KEY: &str = "fleet.live.takeover_refused.no_key";
 /// Counter: a takeover refused because an opened entry's record would not decode.
 const REFUSED_RECORD: &str = "fleet.live.takeover_refused.record";
 /// Counter: a takeover refused because a delta would not apply to the image before it.
@@ -2583,6 +2952,8 @@ pub(crate) struct Fetched {
   pub(crate) payloads: Vec<Vec<u8>>,
   pub(crate) lineage: Option<([u8; 16], Vec<u8>)>,
   pub(crate) naming: Option<crate::head::HeadNaming>,
+  /// The first payload's sealing, when the log is sealed: kept with a refusal for a missing key ([`Refused`]).
+  pub(crate) sealing: Option<crate::head::HeadSealing>,
 }
 
 /// Phase one's question, on the control shard: each of `others` with a session in its link is asked to raise its copy
@@ -2680,9 +3051,32 @@ pub(crate) async fn fetch(
   let Some((holder, head)) = slates_db::live::adopt(&reports, &holders, quorum) else {
     return Ok(None);
   };
-  let refused = state::with_state(|s| s.live.refused_rebuilds.get(&object).copied()).flatten();
-  if !owes_refetch(refused.as_ref(), head) {
-    return Err(LIVE_TAKEOVER_WAITS_NEW_HEAD);
+  let refused = state::with_state(|s| s.live.refused_rebuilds.get(&object).cloned()).flatten();
+  let key_here = refused
+    .as_ref()
+    .and_then(|refused| refused.sealing.as_ref())
+    .is_some_and(|sealing| {
+      state::with_state(|s| crate::seal_keys::successor_lineage(s, sealing).is_some())
+        .unwrap_or(false)
+    });
+  match next_fetch(
+    refused.as_ref(),
+    head,
+    slates_rt::futures::now_ns(),
+    key_here,
+  ) {
+    NextFetch::Fetch => {
+      if key_here
+        && refused
+          .as_ref()
+          .is_some_and(|refused| refused.why == REFUSED_NO_KEY)
+      {
+        let _ = state::with_state(|s| s.count(LIVE_TAKEOVER_KEY_ARRIVED, 1));
+      }
+    }
+    NextFetch::WaitsNewHead => return Err(LIVE_TAKEOVER_WAITS_NEW_HEAD),
+    NextFetch::WaitsKey => return Err(LIVE_TAKEOVER_WAITS_KEY),
+    NextFetch::KeyExhausted => return Err(LIVE_TAKEOVER_NO_KEY_EXHAUSTED),
   }
   let payloads = if holder == local {
     state::with_state(|s| {
@@ -2704,41 +3098,113 @@ pub(crate) async fn fetch(
   let lineage = sealing.as_ref().and_then(|sealing| {
     state::with_state(|s| crate::seal_keys::successor_lineage(s, sealing)).flatten()
   });
-  let naming = sealing.and_then(|sealing| sealing.naming);
+  let naming = sealing.as_ref().and_then(|sealing| sealing.naming.clone());
   Ok(Some(Fetched {
     head,
     payloads,
     lineage,
     naming,
+    sealing,
   }))
 }
 
+/// A rebuild refused at a head ([`note_rebuild`]): what decides whether, and when, the log is fetched again
+/// ([`next_fetch`]). The whole entry's sealing is kept (a few kilobytes) so a refusal for a missing key can tell, with no
+/// fetch, when the key has come.
+#[derive(Clone, Debug)]
+pub(crate) struct Refused {
+  /// The head the log was refused at.
+  pub(crate) head: Head,
+  /// The refusal's counter name.
+  pub(crate) why: &'static str,
+  /// When it was first refused at that head for that reason.
+  pub(crate) since: u64,
+  /// The log's whole entry's sealing, when it was sealed.
+  pub(crate) sealing: Option<crate::head::HeadSealing>,
+}
+
+/// What a successor does about a live volume's log at the head phase one adopted ([`next_fetch`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NextFetch {
+  /// Fetch it.
+  Fetch,
+  /// Not again at this head: its bytes decided the refusal.
+  WaitsNewHead,
+  /// Not yet: this node holds no key for it, and none has come.
+  WaitsKey,
+  /// Not at this head: no key came within [`NO_KEY_WAIT_NS`].
+  KeyExhausted,
+}
+
+/// Counter: a takeover holding no key for the adopted log, waiting for one at its head ([`next_fetch`]).
+/// Format: a counter name in the daemon's status report.
+const LIVE_TAKEOVER_WAITS_KEY: &str = "fleet.live.takeover_waits_key";
+/// Counter: a takeover that fetched the log again because the key it lacked has come ([`next_fetch`]): once per arrival.
+/// Format: a counter name in the daemon's status report.
+const LIVE_TAKEOVER_KEY_ARRIVED: &str = "fleet.live.takeover_key_arrived";
+/// Counter: a takeover whose key for the adopted log did not come within [`NO_KEY_WAIT_NS`]: no longer waited for at
+/// that head, answered typed.
+/// Format: a counter name in the daemon's status report.
+const LIVE_TAKEOVER_NO_KEY_EXHAUSTED: &str = "fleet.live.takeover_no_key_exhausted";
+/// Derived: how long a successor waits at one head for the key to a log it holds no key for: ten liveness budgets
+/// (`daemon::OBSERVE_BUDGET_NS`), past a pair's redelivery (once a record period) many times over.
+const NO_KEY_WAIT_NS: u64 = crate::daemon::OBSERVE_BUDGET_NS;
+
 /// Counter: a taken-over live volume's log was not fetched again, its rebuild having been refused at the head phase
-/// one adopted now ([`owes_refetch`]).
+/// one adopted now ([`next_fetch`]).
 /// Format: a counter name in the daemon's status report.
 const LIVE_TAKEOVER_WAITS_NEW_HEAD: &str = "fleet.live.takeover_waits_new_head";
 
-/// Whether a successor fetches the adopted holder's log for a rebuild, given the head and kind its last rebuild was
-/// refused at (`None`: none was). A refusal the log's bytes decide is final for that head (its first payload's
-/// sealing, its records and its deltas are fixed by the chain identity), so the log is fetched again only once phase
-/// one adopts another head. The lineage refusal is this node's own key record (`seal_keys::adopt_lineage`), which may
-/// succeed next time, so it is retried. Every refusal refetched the whole log each record period before: 389 fetches
-/// of one holder for a successor that could never open the log (CI, diag-14 run 3, 2026-11-07).
-fn owes_refetch(refused: Option<&(Head, &'static str)>, adopted: Head) -> bool {
+/// What a successor does about the log at `adopted`, given its last refusal (`None`: none) and whether the key that
+/// refusal lacked can be unwrapped here now (`key_here`, read from the refused whole entry's sealing; no fetch). A
+/// refusal the log's bytes decide is final for that head (its first payload's sealing, its records and its deltas are
+/// fixed by the chain identity), so the log is fetched again only once phase one adopts another head. The lineage
+/// refusal is this node's own key record, retried. A refusal for a key this node does not hold waits for the key, an
+/// event, and the log is fetched once when it has come, never each period: the successor that could not open the log
+/// fetched it 104 to 204 times a run (2026-11-09). Bounded by [`NO_KEY_WAIT_NS`], then answered typed.
+fn next_fetch(refused: Option<&Refused>, adopted: Head, now: u64, key_here: bool) -> NextFetch {
   match refused {
-    None => true,
-    Some((_, kind)) if *kind == REFUSED_LINEAGE => true,
-    Some((head, _)) => *head != adopted,
+    None => NextFetch::Fetch,
+    Some(refused) if refused.why == REFUSED_LINEAGE || refused.head != adopted => NextFetch::Fetch,
+    Some(refused) if refused.why == REFUSED_NO_KEY => {
+      if now.saturating_sub(refused.since) >= NO_KEY_WAIT_NS {
+        NextFetch::KeyExhausted
+      } else if key_here {
+        NextFetch::Fetch
+      } else {
+        NextFetch::WaitsKey
+      }
+    }
+    Some(_) => NextFetch::WaitsNewHead,
   }
 }
 
 /// Records on the control shard that `object`'s rebuild from the log at `head` was refused for `why`, so its log is not
-/// fetched again at that head ([`owes_refetch`]); forgets it once the volume is served (`why` is `None`).
-pub(crate) fn note_rebuild(object: ObjectId, head: Head, why: Option<&'static str>) {
+/// fetched again at that head ([`next_fetch`]); forgets it once the volume is served (`why` is `None`).
+pub(crate) fn note_rebuild(
+  object: ObjectId,
+  head: Head,
+  why: Option<&'static str>,
+  sealing: Option<crate::head::HeadSealing>,
+) {
   let _ = state::with_state(|s| match why {
     // Only a refusal of the log itself: one from the volume's restore says nothing about the log's bytes.
     Some(why) if REBUILD_REFUSALS.contains(&why) => {
-      s.live.refused_rebuilds.insert(object, (head, why));
+      let now = slates_rt::futures::now_ns();
+      // The first refusal at this head for this reason starts the clock its bound runs from; a repeat keeps it.
+      let since = match s.live.refused_rebuilds.get(&object) {
+        Some(refused) if refused.head == head && refused.why == why => refused.since,
+        _ => now,
+      };
+      s.live.refused_rebuilds.insert(
+        object,
+        Refused {
+          head,
+          why,
+          since,
+          sealing,
+        },
+      );
     }
     Some(_) => {}
     None => {
@@ -2748,8 +3214,9 @@ pub(crate) fn note_rebuild(object: ObjectId, head: Head, why: Option<&'static st
 }
 
 /// The refusals of a rebuild from a live log ([`rebuild`]), each its counter's name.
-const REBUILD_REFUSALS: [&str; 6] = [
+const REBUILD_REFUSALS: [&str; 7] = [
   REFUSED_LINEAGE,
+  REFUSED_NO_KEY,
   REFUSED_OPEN,
   REFUSED_RECORD,
   REFUSED_APPLY,
@@ -2806,6 +3273,19 @@ fn sealed_body(payload: &[u8]) -> Option<SealedBody> {
   <SealedBody as Wire>::decode(&mut &body[..]).ok()
 }
 
+/// Whether a rebuild may open the log's payloads: a sealed log only under keys this node has recorded, adopted from the
+/// log's own whole entry or held before, never under a key made on the spot ([`crate::seal_keys::recorded_lineage`]).
+/// Without them it is refused [`REFUSED_NO_KEY`] and waits for the key ([`next_fetch`]). Before, the rebuild made a key,
+/// failed to open the log under it and was refused `open`, final for the head: the successor waited for a head that
+/// could not move with its owner dead (`fleet.live.takeover_waits_new_head` 368 to 381 times a run, 2026-11-09), and the
+/// key it made stayed recorded in the way of the right one.
+fn keys_for_rebuild(sealed: bool, keys_recorded: bool) -> Result<(), &'static str> {
+  if sealed && !keys_recorded {
+    return Err(REFUSED_NO_KEY);
+  }
+  Ok(())
+}
+
 /// The volume a live log describes, rebuilt as a takeover's archive on the volume's new owner shard (A-200): the
 /// lineage key adopted, every payload opened, the deltas applied in order to the whole image, and the result laid out
 /// as `materialize_taken_over` restores (directories and files, a symlink as a file of its target, as the export lays
@@ -2839,9 +3319,28 @@ fn rebuild(
     crate::seal_keys::adopt_lineage(state, id, owner, lineage, fetched.naming.as_ref())
       .map_err(|_| REFUSED_LINEAGE)?;
   }
+  // Opened only under keys recorded here, never made ([`seal_keys::recorded_lineage`]).
+  let sealed = fetched
+    .payloads
+    .first()
+    .is_some_and(|payload| sealed_body(payload).is_some());
+  let account = crate::seal_keys::tenant_of(owner);
+  let keys = if sealed {
+    crate::seal_keys::recorded_lineage(state, id, account)
+      .ok()
+      .flatten()
+      .zip(
+        crate::seal_keys::recorded_namer(state, id, account)
+          .ok()
+          .flatten(),
+      )
+  } else {
+    None
+  };
+  keys_for_rebuild(sealed, keys.is_some())?;
   let mut publications = Vec::new();
   for payload in &fetched.payloads {
-    publications.push(open_payload(state, id, owner, payload).ok_or(REFUSED_OPEN)?);
+    publications.push(open_payload(keys.as_ref(), payload).ok_or(REFUSED_OPEN)?);
   }
   let mut image = None;
   let mut runs: BTreeMap<(u64, u64), Vec<u8>> = BTreeMap::new();
@@ -2918,18 +3417,14 @@ fn open_body(
 
 /// One payload's body, opened under the volume's lineage key when sealed.
 fn open_payload(
-  state: &mut ShardState,
-  id: slates_db::catalog::VolumeId,
-  owner: &slates_db::catalog::Principal,
+  keys: Option<&(hyper_seal::keys::WrappingKey, hyper_seal::name::Namer)>,
   payload: &[u8],
 ) -> Option<LivePublication> {
   let (header, body) = payload.split_at_checked(2)?;
   let bytes = if header.get(1) == Some(&BODY_SEALED) {
     let sealed = <SealedBody as Wire>::decode(&mut &body[..]).ok()?;
-    let account = crate::seal_keys::tenant_of(owner);
-    let lineage = crate::seal_keys::lineage(state, id, account).ok()?;
-    let namer = crate::seal_keys::namer(state, id, account).ok()?;
-    open_body(&lineage, &namer, sealed.pieces)?
+    let (lineage, namer) = keys?;
+    open_body(lineage, namer, sealed.pieces)?
   } else {
     body.to_vec()
   };
@@ -3058,10 +3553,12 @@ fn whole_file(
   vec![extent]
 }
 
-/// An inode's manifest metadata: its attributes with its kind's type bits, as the export writes them.
+/// An inode's manifest metadata: its attributes with its kind's type bits, and a device node's number (A-294), as the
+/// export writes them.
 fn meta_of(inode: &InodeImage) -> slates_archive::NodeMeta {
   use slates_vfs::export::{
-    MODE_DIRECTORY, MODE_FIFO, MODE_FILE, MODE_SOCKET, MODE_SYMLINK, permissions_of_mode,
+    MODE_BLOCK_DEVICE, MODE_CHAR_DEVICE, MODE_DIRECTORY, MODE_FIFO, MODE_FILE, MODE_SOCKET,
+    MODE_SYMLINK, permissions_of_mode,
   };
   use slates_vfs::recover::KindImage;
   let type_bits = match inode.kind {
@@ -3070,6 +3567,12 @@ fn meta_of(inode: &InodeImage) -> slates_archive::NodeMeta {
     KindImage::Symlink => MODE_SYMLINK,
     KindImage::Fifo => MODE_FIFO,
     KindImage::Socket => MODE_SOCKET,
+    KindImage::BlockDevice => MODE_BLOCK_DEVICE,
+    KindImage::CharDevice => MODE_CHAR_DEVICE,
+  };
+  let (device_major, device_minor) = match inode.body {
+    BodyImage::Device { major, minor } => (major, minor),
+    _ => (0, 0),
   };
   let attrs = &inode.attrs;
   slates_archive::NodeMeta {
@@ -3083,6 +3586,8 @@ fn meta_of(inode: &InodeImage) -> slates_archive::NodeMeta {
     nlink: attrs.nlink,
     uid: attrs.uid,
     gid: attrs.gid,
+    device_major,
+    device_minor,
     xattrs: Vec::new(),
   }
 }
@@ -3136,6 +3641,12 @@ mod tests {
       identity: [8; 32],
       ..refused_at
     };
+    let refused = |why| Refused {
+      head: refused_at,
+      why,
+      since: 0,
+      sealing: None,
+    };
     for kind in [
       REFUSED_OPEN,
       REFUSED_RECORD,
@@ -3143,21 +3654,25 @@ mod tests {
       REFUSED_NOT_WHOLE_FIRST,
       REFUSED_LAYOUT,
     ] {
-      assert!(
-        !owes_refetch(Some(&(refused_at, kind)), refused_at),
+      assert_eq!(
+        next_fetch(Some(&refused(kind)), refused_at, 0, false),
+        NextFetch::WaitsNewHead,
         "{kind} at the same head is refused again by the same bytes"
       );
-      assert!(
-        owes_refetch(Some(&(refused_at, kind)), later),
+      assert_eq!(
+        next_fetch(Some(&refused(kind)), later, 0, false),
+        NextFetch::Fetch,
         "{kind} at another head is fetched"
       );
     }
-    assert!(
-      owes_refetch(Some(&(refused_at, REFUSED_LINEAGE)), refused_at),
+    assert_eq!(
+      next_fetch(Some(&refused(REFUSED_LINEAGE)), refused_at, 0, false),
+      NextFetch::Fetch,
       "a lineage refusal is this node's own record, retried"
     );
-    assert!(
-      owes_refetch(None, refused_at),
+    assert_eq!(
+      next_fetch(None, refused_at, 0, false),
+      NextFetch::Fetch,
       "nothing refused yet: fetched"
     );
   }
@@ -3216,6 +3731,140 @@ mod tests {
     assert!(!names_holder(&value(Some(vec![3, 9])), local));
     assert!(!names_holder(&value(None), local));
     assert!(!names_holder(&[0xff, 1, 2], local));
+  }
+
+  /// A-271: do ask whether a rebuild may open a log's payloads, sealed or not, with and without keys recorded here.
+  /// Expect a sealed log without keys refused `no_key`, the rest let through. Before, the rebuild made a key and was
+  /// refused `open` at the first payload, final for the head.
+  #[test]
+  fn a_sealed_log_this_node_holds_no_key_for_is_refused_for_the_missing_key() {
+    assert_eq!(
+      keys_for_rebuild(true, false),
+      Err(REFUSED_NO_KEY),
+      "sealed, no keys here"
+    );
+    assert_eq!(
+      keys_for_rebuild(true, true),
+      Ok(()),
+      "sealed, keys here: opened"
+    );
+    assert_eq!(
+      keys_for_rebuild(false, false),
+      Ok(()),
+      "in the clear: no key needed"
+    );
+  }
+
+  /// A-271: a refusal for a missing key waits for the key, an event, not a timer re-fetch. Do ask what a successor does
+  /// at the refused head with no key yet, once the key has come, past the bound, and at a later head. Expect it to wait
+  /// for the key without fetching, fetch once the key is here, answer `no_key_exhausted` past
+  /// [`NO_KEY_WAIT_NS`], and fetch at a later head. Before, the refusal (counted `open`) waited for a new head at once
+  /// for good; retried each period instead, it fetched the whole log 104 to 204 times a run.
+  #[test]
+  fn a_missing_key_is_waited_for_and_the_log_fetched_once_it_comes() {
+    let at = Head {
+      epoch: slates_db::register::HostEpoch(1),
+      position: 1_056,
+      identity: [3; 32],
+    };
+    let later = Head {
+      position: 1_057,
+      ..at
+    };
+    let since = 5_000;
+    let refused = Refused {
+      head: at,
+      why: REFUSED_NO_KEY,
+      since,
+      sealing: None,
+    };
+    let inside = since + NO_KEY_WAIT_NS - 1;
+    assert_eq!(
+      next_fetch(Some(&refused), at, inside, false),
+      NextFetch::WaitsKey,
+      "no key yet: no fetch"
+    );
+    assert_eq!(
+      next_fetch(Some(&refused), at, inside, true),
+      NextFetch::Fetch,
+      "the key has come: fetched"
+    );
+    assert_eq!(
+      next_fetch(Some(&refused), at, since + NO_KEY_WAIT_NS, false),
+      NextFetch::KeyExhausted,
+      "past the bound: typed"
+    );
+    assert_eq!(
+      next_fetch(Some(&refused), later, inside, false),
+      NextFetch::Fetch,
+      "a later head: fetched"
+    );
+  }
+
+  /// A-271: a pair accepted by a node's predecessor at the same anchor does not cover the node. Do ask whether a
+  /// candidate is covered when this shard's pair to its anchor was accepted by an earlier member id at that anchor, by
+  /// the candidate itself, or by no one. Expect only its own acceptance to cover it. Before, the anchor alone counted:
+  /// a node replaced at its anchor (store destroyed, new member id) was taken for covered, writes went durable on a key
+  /// it never received, and as successor it could not open the log (2026-11-09: no pair recorded, current or retired, in
+  /// 5 of 5 failing runs).
+  #[test]
+  fn a_pair_accepted_by_a_predecessor_at_the_same_anchor_does_not_cover_its_replacement() {
+    let (predecessor, replacement, anchor) = (HostId(11), HostId(22), 7_u64);
+    let anchors = BTreeMap::from([(replacement, anchor)]);
+    assert_eq!(
+      covered_anchor(
+        replacement,
+        &anchors,
+        &BTreeMap::from([(anchor, predecessor)])
+      ),
+      None,
+      "the predecessor accepted: not covered"
+    );
+    assert_eq!(
+      covered_anchor(
+        replacement,
+        &anchors,
+        &BTreeMap::from([(anchor, replacement)])
+      ),
+      Some(anchor),
+      "its own acceptance: covered"
+    );
+    assert_eq!(
+      covered_anchor(replacement, &anchors, &BTreeMap::new()),
+      None,
+      "no pair: not covered"
+    );
+    assert_eq!(
+      covered_anchor(
+        HostId(33),
+        &anchors,
+        &BTreeMap::from([(anchor, replacement)])
+      ),
+      None,
+      "no anchor known"
+    );
+  }
+
+  /// A-271's retention invariant: a holder's log begins at the newest whole entry it holds, so a successor reads the
+  /// newest entry's key from the first payload it fetches. Do keep two deltas, then a whole entry, then a delta. Expect
+  /// the whole entry first and the earlier deltas gone. If this ever changes, a fetch must read the newest whole entry
+  /// that names this node, not the first payload (A-271's named fallback).
+  #[test]
+  fn a_holders_log_begins_at_the_newest_whole_entry_it_holds() {
+    let mut held = Held::for_test(HostId(1), ObjectId([4; 16]), 0);
+    for payload in [
+      vec![KIND_DELTA, 1],
+      vec![KIND_DELTA, 2],
+      vec![KIND_WHOLE, 3],
+      vec![KIND_DELTA, 4],
+    ] {
+      keep(&mut held, &payload, 1 << 20).unwrap();
+    }
+    assert_eq!(
+      held.entries.iter().cloned().collect::<Vec<_>>(),
+      vec![vec![KIND_WHOLE, 3], vec![KIND_DELTA, 4]],
+      "the newest whole entry first, what came before it dropped"
+    );
   }
 
   /// Format: the key generation the tests' keys carry.

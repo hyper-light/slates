@@ -13,9 +13,9 @@
 //! crosses is range-checked (a JS number is an `f64`; the SDK refuses a value that would not round-trip
 //! rather than silently truncating).
 //!
-//! Grants are deliberately absent (R10): the SDK has no verb that creates a landing grant — a grant is
-//! made only by a human at the CLI or a confirmation surface, never by an agent answering its own
-//! question.
+//! Grants are deliberately absent (R10): the SDK has no verb that creates or approves a landing grant. A landing
+//! follows the write mode the user gave the agent (A-285): bypass lands at once, ask comes back grant-required for the
+//! launcher to approve, a forbidding mode is refused; the launcher, never the agent, sets the mode and approves.
 
 // The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds
 // are exempt. Once a crate is clean this holds it there; out-of-bounds indexing and slicing are denied
@@ -165,12 +165,15 @@ pub struct ConflictWindow {
 }
 
 /// The outcome of a `submit` or `rebase` (§4.16): `ok` whether the increment landed cleanly, the green
-/// `version` produced (or null on conflict), and the `conflicts` windows to resolve.
+/// `version` produced (or null on conflict), and the `conflicts` windows to resolve; for a merge an ask write policy
+/// holds (A-285), the increment's `approvalIdentity` (hex) the launcher's approval binds and its `approvalPaths`.
 #[napi(object)]
 pub struct MergeOutcome {
   pub ok: bool,
   pub version: Option<i64>,
   pub conflicts: Vec<ConflictWindow>,
+  pub approval_identity: Option<String>,
+  pub approval_paths: Option<i64>,
 }
 
 /// Builds the uniform merge outcome for `submit`/`rebase`: `ok` is exactly "a version was produced";
@@ -196,6 +199,8 @@ fn merge_outcome(
     ok: version.is_some(),
     version,
     conflicts,
+    approval_identity: None,
+    approval_paths: None,
   })
 }
 
@@ -514,6 +519,13 @@ fn work_volume(id: VolumeId, base: u64) -> Result<WorkVolume> {
 fn submit_outcome(outcome: Submitted) -> Result<MergeOutcome> {
   match outcome {
     Submitted::Accepted(version) => merge_outcome(Some(version), Vec::new()),
+    Submitted::ApprovalRequired { identity, paths } => Ok(MergeOutcome {
+      ok: false,
+      version: None,
+      conflicts: Vec::new(),
+      approval_identity: Some(hex32(&identity)),
+      approval_paths: Some(status_i64(paths, "paths")?),
+    }),
     Submitted::Conflict(windows) => merge_outcome(
       None,
       windows

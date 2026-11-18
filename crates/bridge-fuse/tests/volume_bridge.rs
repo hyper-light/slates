@@ -132,44 +132,77 @@ fn reply_nodeid(out: &[u8]) -> u64 {
   u64::from_le_bytes(out[OUT_HEADER_LEN..OUT_HEADER_LEN + 8].try_into().unwrap())
 }
 
-/// AC-3.10 / A-26: Linux MKNOD vectors create real FIFO/socket names and reject a device.
+/// A little-endian word of a reply at byte `at`.
+fn word(out: &[u8], at: usize) -> u32 {
+  u32::from_le_bytes(out[at..at + 4].try_into().unwrap())
+}
+
+/// A `fuse_mknod_in` body: mode, rdev, umask, padding, then the name.
+fn mknod_body(mode: u32, rdev: u32, name: &str) -> Vec<u8> {
+  let mut body = mode.to_le_bytes().to_vec();
+  body.extend_from_slice(&rdev.to_le_bytes());
+  body.extend_from_slice(&[0; 8]);
+  body.extend_from_slice(&name_body(name));
+  body
+}
+
+/// `message` sent by the process running as `uid` (`fuse_in_header.uid`, after the node id).
+fn message_as(uid: u32, opcode: u32, unique: u64, nodeid: u64, body: &[u8]) -> Vec<u8> {
+  let mut m = message(opcode, unique, nodeid, body);
+  m[24..28].copy_from_slice(&uid.to_le_bytes());
+  m
+}
+
+/// AC-3.10 / A-26, A-294: Linux MKNOD vectors make real FIFO and socket names and device nodes, each reported with its
+/// type bits and a device's number in the kernel's encoding (`fuse_attr.rdev`), by the reply and by a later lookup. A
+/// regular file asked of MKNOD is refused unsupported, and a device node asked by a process that is not root `EPERM`
+/// (the kernel asks `CAP_MKNOD` first; slates holds every route to the same rule), no name made by either.
 #[test]
-fn mknod_reports_ipc_types_and_refuses_device_nodes() {
+fn mknod_makes_ipc_names_and_device_nodes_with_their_numbers() {
   let mut store = store();
   let mut volume = volume(&mut store);
   let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut volume, &mut store);
   let mut out = vec![0; OUT_HEADER_LEN + EntryOut::LEN];
-  for (name, mode) in [("pipe", 0o010640u32), ("socket", 0o140640u32)] {
-    // Linux fuse_mknod_in: mode, rdev, umask, padding; followed by the name.
-    let mut body = mode.to_le_bytes().to_vec();
-    body.extend_from_slice(&[0; 12]);
-    body.extend_from_slice(&name_body(name));
-    dispatch(&message(8, 1, 1, &body), &mut bridge, &mut out);
-    assert!(ok(&out), "{name} creation");
-    // fuse_entry_out has a 40-byte prefix; fuse_attr.mode is at byte 60.
-    let offset = OUT_HEADER_LEN + 40 + 60;
-    assert_eq!(
-      u32::from_le_bytes(out[offset..offset + 4].try_into().unwrap()),
-      mode
+  // fuse_entry_out has a 40-byte prefix; in fuse_attr the mode is at byte 60 and rdev at byte 76.
+  let (mode_at, rdev_at) = (OUT_HEADER_LEN + 40 + 60, OUT_HEADER_LEN + 40 + 76);
+  for (name, mode, rdev) in [
+    ("pipe", 0o010640u32, 0u32),
+    ("socket", 0o140640, 0),
+    // Block 8:1, character 0x123:0x45678 (the minor's high bits above the major) and a whiteout, 0:0.
+    ("disk", 0o060640, 0x0000_0801),
+    ("wide", 0o020640, 0x4561_2378),
+    ("whiteout", 0o020000, 0),
+  ] {
+    dispatch(
+      &message(8, 1, 1, &mknod_body(mode, rdev, name)),
+      &mut bridge,
+      &mut out,
     );
+    assert!(ok(&out), "{name} creation");
+    assert_eq!((word(&out, mode_at), word(&out, rdev_at)), (mode, rdev));
     dispatch(&message(1, 2, 1, &name_body(name)), &mut bridge, &mut out);
     assert!(ok(&out), "{name} lookup");
-    assert_eq!(
-      u32::from_le_bytes(out[offset..offset + 4].try_into().unwrap()),
-      mode
-    );
+    assert_eq!((word(&out, mode_at), word(&out, rdev_at)), (mode, rdev));
   }
-  let mut body = 0o060600u32.to_le_bytes().to_vec();
-  body.extend_from_slice(&[0; 12]);
-  body.extend_from_slice(&name_body("device"));
-  dispatch(&message(8, 3, 1, &body), &mut bridge, &mut out);
-  assert_eq!(i32::from_le_bytes(out[4..8].try_into().unwrap()), -95);
-  dispatch(
-    &message(1, 4, 1, &name_body("device")),
-    &mut bridge,
-    &mut out,
-  );
-  assert!(absent(&out), "the refused device node was never made");
+  for (uid, mode, errno, name) in [
+    (0, 0o100600, -95, "regular"),
+    (1001, 0o060600, -1, "user-disk"),
+    (1001, 0o020600, -1, "user-null"),
+  ] {
+    let rdev = 0x0000_0103;
+    dispatch(
+      &message_as(uid, 8, 3, 1, &mknod_body(mode, rdev, name)),
+      &mut bridge,
+      &mut out,
+    );
+    assert_eq!(
+      i32::from_le_bytes(out[4..8].try_into().unwrap()),
+      errno,
+      "{name}"
+    );
+    dispatch(&message(1, 4, 1, &name_body(name)), &mut bridge, &mut out);
+    assert!(absent(&out), "the refused {name} was never made");
+  }
 }
 
 /// T-3.1 / A-26: truncated MKNOD bodies cannot create a name, including a missing NUL terminator.

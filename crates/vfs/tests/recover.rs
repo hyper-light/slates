@@ -1332,6 +1332,70 @@ fn a_version_shared_across_snapshots_is_captured_once_and_recovers_shared() {
   recovered.destroy_snapshot(&mut fresh, snap_b).unwrap();
 }
 
+/// §4.8, the cross-snapshot dedup, and A-294: a version is shared with an earlier snapshot's only when it is that
+/// version, never because its bytes match. Do: make a file, a FIFO and a device node; snapshot; change only each one's
+/// mode; snapshot again; change each mode once more in the head, so both snapshots hold versions that diverged from the
+/// head with the bytes (or the empty body, or the device number) of the first; recover. Expect each snapshot's own
+/// modes and the head's, and the rebuilt volume to image as the original did.
+#[test]
+fn a_version_that_differs_only_in_its_attributes_keeps_them_through_recovery() {
+  use slates_vfs::inode::{DeviceNumber, SpecialNode};
+  let mut src = store();
+  let mut vol = volume(&mut src, 1 << 30);
+  let root = vol.root_inode(&src).unwrap();
+  let file = vol.create_file_no(&mut src, root, "f", 0o644).unwrap();
+  vol.write(&mut src, file, 0, b"stable-value").unwrap();
+  let pipe = vol
+    .mknod_no(&mut src, root, "p", 0o644, SpecialNode::Fifo)
+    .unwrap();
+  let disk = vol
+    .mknod_no(
+      &mut src,
+      root,
+      "d",
+      0o644,
+      SpecialNode::BlockDevice(DeviceNumber::new(8, 1)),
+    )
+    .unwrap();
+  let nodes = [file, pipe, disk];
+  let snap_a = vol.snapshot(&mut src).unwrap();
+  for no in nodes {
+    vol.chmod(&mut src, no, 0o600).unwrap();
+  }
+  let snap_b = vol.snapshot(&mut src).unwrap();
+  for no in nodes {
+    vol.chmod(&mut src, no, 0o640).unwrap();
+  }
+  let image = vol.to_image(&src, None).unwrap();
+  let mut fresh = common::surviving(&src);
+  let claims = common::claims(&mut fresh, &[&image]);
+  let recovered = Volume::from_image(
+    &mut fresh,
+    &image,
+    &claims,
+    Box::new(StepClock::new(0, 1)),
+    1 << 16,
+    None,
+  )
+  .unwrap();
+  for no in nodes {
+    assert_eq!(
+      (
+        recovered.stat_in(&fresh, snap_a, no).unwrap().mode,
+        recovered.stat_in(&fresh, snap_b, no).unwrap().mode,
+        recovered.stat(&fresh, no).unwrap().mode
+      ),
+      (0o644, 0o600, 0o640),
+      "inode {no:?}: each snapshot's mode and the head's survive recovery"
+    );
+  }
+  assert_eq!(
+    recovered.to_image(&fresh, None).unwrap(),
+    image,
+    "the rebuilt volume images as the original"
+  );
+}
+
 /// AC (§4.8): a version shared across a chain of snapshots recovers as one inode and survives being
 /// dropped newest-first with an intervening allocation that reuses freed slots — the adversarial case
 /// for the global newest-referencer-first deadlist reconstruction. If the shared inode were on more
@@ -2245,13 +2309,24 @@ fn streamed_shard(store: &mut Store) -> StreamedShard {
       reply: b"r4".to_vec(),
     },
   ];
-  (volumes, b"held replica image bytes".to_vec(), replies)
+  // Two held pieces (A-270), out of key order, so the streamed encoder's sort is compared too.
+  let held = vec![
+    slates_vfs::recover::HeldPiece {
+      key: [7; slates_vfs::recover::HELD_PIECE_KEY_BYTES],
+      bytes: b"a later held piece".to_vec(),
+    },
+    slates_vfs::recover::HeldPiece {
+      key: [2; slates_vfs::recover::HELD_PIECE_KEY_BYTES],
+      bytes: b"an earlier held piece".to_vec(),
+    },
+  ];
+  (volumes, held, replies)
 }
 
-/// A streamed shard's volumes by key, its held bytes and its replies.
+/// A streamed shard's volumes by key, its held pieces and its replies.
 type StreamedShard = (
   Vec<([u8; 16], Volume)>,
-  Vec<u8>,
+  Vec<slates_vfs::recover::HeldPiece>,
   Vec<slates_vfs::recover::HeldReply>,
 );
 
@@ -2267,7 +2342,7 @@ fn stream_into(
   slots: &mut Vec<u8>,
   store: &Store,
   volumes: &[([u8; 16], Volume)],
-  held: &[u8],
+  held: &mut Vec<slates_vfs::recover::HeldPiece>,
   (replies, calls, nfs_replies, nfs_states): (
     &mut Vec<slates_vfs::recover::HeldReply>,
     &mut Vec<slates_vfs::recover::HeldCall>,
@@ -2294,7 +2369,7 @@ fn stream_into(
 fn shard_of(
   store: &Store,
   volumes: &[([u8; 16], Volume)],
-  held: &[u8],
+  held: &[slates_vfs::recover::HeldPiece],
   (replies, calls, nfs_replies, nfs_states): (
     &[slates_vfs::recover::HeldReply],
     &[slates_vfs::recover::HeldCall],
@@ -2395,7 +2470,7 @@ fn a_streamed_shard_checkpoint_equals_the_shard_image_and_recovers() {
     &mut slots,
     &store,
     &volumes,
-    &held,
+    &mut held.clone(),
     (&mut replies, &mut calls, &mut nfs_replies, &mut nfs_states),
   )
   .unwrap();
@@ -2437,7 +2512,7 @@ fn a_refused_or_abandoned_streamed_checkpoint_leaves_the_committed_one() {
     &mut slots,
     &store,
     &small_sorted,
-    &[],
+    &mut Vec::new(),
     (
       &mut Vec::new(),
       &mut Vec::new(),

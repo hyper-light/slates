@@ -23,7 +23,7 @@ use crate::{
   OpContext, RenameFlags, SetAttr,
 };
 use slates_vfs::error::VfsError;
-use slates_vfs::inode::Kind;
+use slates_vfs::inode::SpecialNode;
 
 /// `inner`, scoped to directory `scope`.
 pub struct ScopedBridge<'b> {
@@ -278,10 +278,10 @@ impl Bridge for ScopedBridge<'_> {
     cx: &OpContext,
     name: &str,
     mode: u32,
-    kind: Kind,
+    node: SpecialNode,
   ) -> Result<NodeAttr, VfsError> {
     self.admit(parent, cx)?;
-    self.inner.mknod(parent, cx, name, mode, kind)
+    self.inner.mknod(parent, cx, name, mode, node)
   }
 
   fn release(&mut self, object: ObjectId, cx: &OpContext, fh: u64) -> Result<(), VfsError> {
@@ -455,6 +455,14 @@ impl Bridge for ScopedBridge<'_> {
 
   fn dax_offer(&mut self) -> crate::DaxOffer {
     self.inner.dax_offer()
+  }
+
+  fn owner_view(&mut self) -> crate::OwnerView {
+    self.inner.owner_view()
+  }
+
+  fn attribute_namespaces(&mut self) -> crate::AttributeNamespaces {
+    self.inner.attribute_namespaces()
   }
 
   fn dax_state(&mut self) -> Option<crate::DaxState<'_>> {
