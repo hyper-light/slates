@@ -429,9 +429,15 @@
 >   launcher-class proof was granted, where a policy setting and a merge's approval are refused `Forbidden` whatever
 >   the proof. `grant_verb` now refuses it first (`grant_by_consumer`): `an_agent_cannot_approve_its_own_landing` (red
 >   without the guard: granted) and `fs_server.rs`'s server-node agent
->   (`docs/bugs/2026-11-18-an-agents-own-channel-could-approve-its-own-landing.md`). **Open, its siblings:** `Enroll`
->   and `Revoke` still verify the proof alone, so a consumer-bound channel holding a genuine proof could enroll a fresh
->   consumer (binding a channel that escapes its own consumer policy) or revoke another; the same guard is owed.
+>   (`docs/bugs/2026-11-18-an-agents-own-channel-could-approve-its-own-landing.md`). **Built the same day, its
+>   siblings:** `Enroll` and `Revoke` verified the proof alone, so a consumer-bound channel holding a genuine proof
+>   could enroll a fresh consumer (binding a channel that escapes its own consumer policy) or revoke another agent's.
+>   Both now refuse `Forbidden` before the proof (`enroll_by_consumer`, `revoke_by_consumer`):
+>   `an_agent_cannot_enroll_or_revoke_a_consumer`, each guard red-checked alone (GitHub run 44274679371, Linux x86_64:
+>   without the enroll guard the agent's channel was handed consumer 11; without the revoke guard its revocation
+>   answered `Ok`; with both, `write_policy.rs` 11 of 11, `consumers.rs` 1 of 1, the server's unit tests 311 passed,
+>   clippy clean). The sweep of every launcher-proof check (the six callers of `landing::proven_by_launcher`, and
+>   consensus control) found no other: consensus control already refuses any principal but an OS account.
 
 > **W1 would have let a work off its green's shard merge under one volume's write policy: fixed before W1 landed
 > (2026-11-18, g231; A-307, §4.16).** A-285 judges a merge's policy from the work's and the green's records on one
@@ -1545,6 +1551,24 @@
 > bound, not the product: `a_lone_daemons_spinning_shard_ends_its_process_and_the_call_ends_daemon_gone` gave up its
 > loop at ten windows of wall while its call was inside its own bound after an exit that came 8.49 s after the hold;
 > the loop now runs to the call's bound after the exit.
+
+> **ThreadSanitizer's slow polls ended in-process daemons' test binaries (found 2026-11-17, fixed 2026-11-18, A-318).**
+> Main's TSan lane had been red on every push since A-232: in run 44238377555 the `client` test binary died with
+> SIGABRT when an in-process daemon's watchdog judged "shard 4 is spinning, 1054 ms of CPU without a step against the
+> 1000 ms window", and in diag-b13-2 the server's library tests the same way at 1,060 ms. A lone daemon's stuck verdict
+> ends its process (A-232), and an in-process daemon's process is the test binary. A window of CPU is no poll's only in
+> a build that runs code at the speed the budget was set for; ThreadSanitizer's runtime is called at every memory
+> access and every function's entry and exit. The spin window is now the budget held to the build: scaled by compiled ÷
+> machine-code time for one chain of work, measured once a process (`slates_machine::build_cost`), never below the
+> budget; the watchdog's start line names both. Measured: ThreadSanitizer's builds 17.9 to 35.3 times machine code on
+> CI's runners (spin windows of 18 to 35 s), and the lane passed with no spinning verdict, six runs of six
+> (diag-g251-tsan); an unoptimized build 3.5 times (a Mac Studio), a release build 1.0. Regressions: `a_poll_is_judged_spinning_only_past_the_window_held_to_its_build`
+> (red with the budget put back as the spin window), `a_poll_slower_than_the_budget_within_the_builds_spin_window_keeps_the_beat`
+> (`crates/server/tests/liveness.rs`). **Siblings, open:** the anchor's start judgment holds a starting daemon's busiest
+> thread to a window of CPU too (`crates/api/src/role/anchor.rs`, `process_clock`), and an observation's budget is counted
+> in the observed shard's CPU (`crate::observe::ShardTime`); neither is held to the build yet, and neither has been seen
+> to fail under ThreadSanitizer. The release-build spinning kills of the A-228 entry ("A kill the rule does not touch")
+> are untouched: a release build's window is the budget.
 
 > **A Windows UDP socket died on an earlier send's ICMP error (found 2026-11-06, fixed 2026-11-06).** With Windows'
 > default `SIO_UDP_CONNRESET`, a port-unreachable for a datagram sent earlier failed the socket's next `recvfrom` with
@@ -3061,7 +3085,36 @@
 >     2026-11-17): forwarding and the answer's way back, a one-way cut, a node muted and deafened, loss, delay and
 >     duplication, attribution by process, and the draws. The flows' first runs are the supervisor's (CLAUDE.md §8):
 >     `SLATES_TEST_CLI=1 cargo test --release -p slates-cli --test live_chaos -- --test-threads=1` on macOS and Linux.
->     Linux's census has run nowhere yet.
+>   - **First runs (2026-11-18), 11 of 35 flows failed on macOS arm64 (main bfc34cace) and the same on Linux x86_64 and
+>     arm64 (69cd38b22).** Linux's census ran there for the first time and attributed every socket but two datagrams.
+>     - **Fixed (A-330): the relay never carried the record plane.** The three owner-partition flows failed
+>       StaleNeverCommits: their cut-off owners acknowledged 2,086, 3,528 and 2,412 writes after the cut, each durable on
+>       a candidate, over record links that went around the relay, since a node announced its record plane at its bound
+>       port and formation's redial dialed it. Every relayed flow was vacuous on that plane; each now requires a
+>       record-plane datagram per acknowledged write from its relay (`judge_relayed`). Red first:
+>       `a_candidate_behind_a_port_mapping_is_redialed_through_it_so_a_cut_there_holds_its_record_plane`
+>       (`docs/bugs/2026-11-18-a-redial-went-around-the-port-mapping-the-record-plane-was-announced-at-its-bound-port.md`).
+>     - **Open (g229): ReadSafety through a resumed owner.** In the SIGSTOP owner flow the old owner, read the moment it
+>       resumed, answered `NotFound` for the successor's acknowledged writes (2.29 s and 3.00 s into the run, 70 to 780
+>       ms after their acknowledgements), where it must refuse or answer them. The flow now notes the reader's state when
+>       a read answers missing (`note_missing`), and its first run with it (Mac Studio, 2026-11-18) showed the cause: the
+>       old owner was retired and re-admitted under its own id (`fleet_host_epoch` 2), its catalog still held the volume
+>       with its epoch-1 shipper, and its lease confirmed again (`lease.refused.superseded` 1, `lease.wait.parked` 1,
+>       `lease.wait.served` 1), so it served its stale copy. A re-admission yields an owner's objects only in its
+>       routing table (`FleetNode::install_configuration`), and `verbs::owned_by_another_host` serves every volume its
+>       node created or still catalogues.
+>     - **Fixed in the flow (g229): the big-entry flow judged a forwarder as its successor.** It took the first
+>       survivor that served the three files, which a survivor forwarding to the real successor does too, and a
+>       forwarder shows no shipping head after a write through it: every write through it was acknowledged and read
+>       back, yet `first_head` was none. The flow now takes the survivor that took the volume over (`took_over`, the
+>       rule `wait_serving` and `wait_taken_over` share) and names every survivor's live lines. Run on the Mac Studio
+>       (2026-11-18): the successor's first write acknowledged with its head shown, held; Continuity alone failed
+>       (g230's).
+>     - **Open (g229): a replaced member never meshed** (`a_member_that_never_held_the_log_never_stands_in_for_its_holder`,
+>       macOS): the replacement sat at configuration version 0, in contact with no peer, its four record links idle as
+>       out of contact (`fleet.link.out_of_contact` 4) through a whole fleet wait, while the owner had already recorded
+>       it as a live holder.
+>     - g230's: Continuity in five flows (a successor's positions start again at 1) and the nemesis's fence lag.
 >
 > - **Fixed: a destroy was answered before its tombstone was placed** (record
 >   `docs/bugs/2026-11-06-a-destroy-was-answered-before-its-tombstone-was-placed.md`).
@@ -16422,8 +16475,12 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   but leaves the pages it stored in the object, and a later fill of the range skips what the volume then holds as holes
   or zeros, so those pages could reach a guest's map.
 - **Open, reported by A-166's sibling sweep (each from reading; each to be proven by a test before a change):**
-  - write-log replay (`verbs::replay_one`) routes a logged FUSE write by its inode number's prefix, which for a clone's
-    inherited file is its origin's: a replayed write would land in the origin;
+  - **Fixed 2026-11-18 (g251):** write-log replay (`verbs::replay_one`) routed a logged FUSE write by its inode number's
+    prefix, which for a clone's inherited file is its origin's: a replayed write landed in the origin and the clone lost
+    it (proven by `a_replayed_write_to_a_clones_inherited_file_lands_in_the_clone`, red with the prefix routing put
+    back). Every write-log record now names the volume it was written through and is replayed there, the `FORGET`s too;
+    the log's header carries a layout word, and a log of the layout before that holds records is reported as lost writes,
+    never misread (`docs/bugs/2026-11-18-a-replayed-write-to-a-clones-inherited-file-landed-in-its-origin.md`);
   - the in-process DAX gate's recall (`has_writable_of_prefix`, `writable_of_prefix`, `recalling(no.prefix())`) counts
     a clone's writable windows on inherited files under the origin, so the clone's snapshot could freeze under one
     (harness-only exposure: `writable_dax`, DAX unadvertised);

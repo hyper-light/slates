@@ -41,8 +41,19 @@ server launcher's genuine proof, expecting `Forbidden`.
   refused `NotFound`, since it holds neither the volume nor its presentations.
 - Docs: A-285's status (design) and the GAPS entry.
 
-## Siblings (reported, open)
+## Siblings (fixed the same day)
 
-`Enroll` (`verbs::enroll`) and `Revoke` (`verbs::revoke_on_channel`) also verify the proof alone. A consumer-bound
+`Enroll` (`verbs::enroll`) and `Revoke` (`verbs::revoke_on_channel`) also verified the proof alone. A consumer-bound
 channel holding a genuine proof could enroll a fresh consumer and bind a new channel to it, escaping its own consumer
-policy, or revoke another consumer. They need the same guard.
+policy, or revoke another consumer. Both now refuse `Forbidden` first, counted `enroll_by_consumer` and
+`revoke_by_consumer`. The test `an_agent_cannot_enroll_or_revoke_a_consumer` (`crates/server/tests/write_policy.rs`)
+enrolls from an agent's channel, then revokes a second agent's consumer from it, both with genuine proofs; the second
+agent's channel must still be served after that, and refused `ConsumerRevoked` only after the launcher's own
+revocation. Each guard was red-checked alone on Linux x86_64 (GitHub run 44274679371): without the enroll guard the
+agent's channel was handed a new consumer (id 11); without the revoke guard its revocation of the other agent's
+consumer answered `Ok`. With both guards, `write_policy.rs` passed 11 of 11, `consumers.rs` 1 of 1 and the server's
+unit tests 311, and clippy was clean.
+
+The sweep covered every launcher-proof check: the six callers of `landing::proven_by_launcher` (grant, volume policy,
+consumer policy, merge approval, enroll, revoke) and consensus control's recovery proof. Consensus control already
+refuses any principal but an OS account (`verbs::serve_consensus_control`). No other verb was found.

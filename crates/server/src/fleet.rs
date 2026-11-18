@@ -184,8 +184,14 @@ pub struct FleetPeer {
 pub struct FleetTransport<Serve = ServeSockets> {
   /// This node's fleet TLS identity (operator-provisioned).
   pub identity: Identity,
-  /// The address this node publishes to authenticated peers.
+  /// The probe-plane address this node publishes to authenticated peers: where they dial its probes, its advertised
+  /// address and base port.
   pub advertise: NodeAddress,
+  /// The record-plane address this node publishes to authenticated peers: where they dial its record links (the
+  /// advertised base port's next in a manifest's layout). Never the port its record socket is bound to, which differs
+  /// behind a port mapping (A-277): a peer told the bound port redials around the mapping, or to a port the mapping does
+  /// not forward (A-330).
+  pub advertise_record: NodeAddress,
   /// Operator trust anchors for certificates of nodes absent from the seed manifest.
   pub enrollment_roots: Vec<CertificateDer<'static>>,
   /// The TLS server name this node presents and its peers pin.
@@ -440,6 +446,7 @@ impl FleetTransport<ServeAddresses> {
     let FleetTransport {
       identity,
       advertise,
+      advertise_record,
       enrollment_roots,
       name,
       serve,
@@ -449,6 +456,7 @@ impl FleetTransport<ServeAddresses> {
     Ok(FleetTransport {
       identity,
       advertise,
+      advertise_record,
       enrollment_roots,
       name,
       serve: serve.bind()?,
@@ -1049,6 +1057,7 @@ fn serve_export(export: Option<ExportListener>, identity: Kept<Identity>) {
 pub async fn run_membership(transport: FleetTransport) {
   let FleetTransport {
     advertise,
+    advertise_record,
     enrollment_roots,
     identity,
     name,
@@ -1065,12 +1074,6 @@ pub async fn run_membership(transport: FleetTransport) {
     // No peers — nothing to probe; the placement path still runs the `FleetNode`, degenerate (R8).
     return;
   }
-  // The record port discovery publishes is the one the record socket is bound to; a socket that cannot
-  // say (the OS refusing `getsockname`) cannot be published, counted like a socket that would not bind.
-  let Ok(record_port) = record_socket.local_addr().map(|address| address.port()) else {
-    count_refusal(BIND_REFUSED);
-    return;
-  };
   // The identity is shared by every serve session and client dial of this shard — it is not `Clone` (it
   // holds a private key), so the control shard owns the one copy for its life (`ShardContext::keep`) and
   // each task names it by its `Kept` handle, reaching it only inside a closure while this shard runs
@@ -1098,14 +1101,16 @@ pub async fn run_membership(transport: FleetTransport) {
   let neighbourhood =
     state::with_state(|state| state.config.fleet_peer_capacity.saturating_add(1)).unwrap_or(1);
   let local = state::with_state(|s| s.fleet.host()).unwrap_or(HostId(0));
+  // Discovery announces both planes where this node advertises them, never where it binds (A-277, A-330): a peer
+  // prefers the announcement at every dial (`resolve_peer_address`), and behind a port mapping the bound record port is
+  // reached around the mapping or not at all.
   let initialized = state::with_state(|state| {
     state.discovery = Some(crate::discovery::Discovery::new(
       state,
       name.clone(),
       enrollment_roots.clone(),
       certificate,
-      advertise,
-      record_port,
+      (advertise, advertise_record),
       &peers,
     )?);
     crate::discovery::restore(state)

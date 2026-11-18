@@ -35,9 +35,13 @@ struct MountPaths {
 }
 
 impl MountPaths {
-  fn new() -> Self {
+  /// The mount points of the test `test` in this process. A test's name is in the path because libtest runs this file's
+  /// tests at once, in one process: with the process id alone both mounted on one `original`, one over the other, each
+  /// test's paths reached the other's volume, and the first to fail unmounted and removed the other's (CI's ubuntu
+  /// runner, run 44260193629: `pipe` answered ENOENT, and `disk` stat right and then answered ENOENT, both in 0.03 s).
+  fn new(test: &str) -> Self {
     let root = format!(
-      "{}/slates-ipc-{}",
+      "{}/slates-ipc-{test}-{}",
       env!("CARGO_TARGET_TMPDIR"),
       std::process::id()
     );
@@ -324,7 +328,7 @@ fn verify_isolation(paths: &MountPaths, original: &LiveIpc) {
 #[test]
 fn fifo_and_socket_communication_is_local_to_each_clone() {
   std::thread::scope(|scope| {
-    let paths = MountPaths::new();
+    let paths = MountPaths::new("ipc");
     // This proof binds a unix socket *inside* the mount, and A-50 puts the mount in the build output rather
     // than `/tmp`, so on a host whose build directory is deep the socket's path is longer than `sockaddr_un`
     // can hold and `bind` answers `ENAMETOOLONG`. That is the shape of the host, not a fault in the bridge, so
@@ -409,7 +413,7 @@ fn device_image() -> VolumeImage {
 #[test]
 fn a_device_node_reaches_the_mount_with_its_number_and_is_never_opened() {
   std::thread::scope(|scope| {
-    let paths = MountPaths::new();
+    let paths = MountPaths::new("devices");
     let mounted = match mount(&paths.original, &[], MOUNT_WAIT) {
       Ok(mounted) => mounted,
       Err(MountError::NoDevice { .. } | MountError::Helper { .. } | MountError::Spawn { .. }) => {
