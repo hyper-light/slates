@@ -8266,7 +8266,9 @@ fn sync_config_from_council(local: HostId) {
     // allowance restarts from now (a takeover under this version cannot yet have committed).
     s.lease
       .installed(configuration.version, slates_machine::clock::monotonic_ns());
-    s.fleet.install_configuration(configuration, &members);
+    // At this host's own epoch advanced (retired while away, admitted again under its id), its catalogued volumes are
+    // yielded to their successors (A-334, `crate::readmission`).
+    crate::readmission::install_placement(s, configuration, &members);
     // Raise the fence for every held object to its owner's committed fencing epoch (§4.8 "every holder
     // raises its fence for that host to the new epoch"). A failed owner's epoch was bumped by the council's
     // takeover, so this fences a resumed stale owner `StaleEpoch` across all its objects **at once** — done
@@ -8453,7 +8455,8 @@ impl Fan {
         .as_ref()
         .and_then(|membership| membership.durability)
         .and_then(|bound| bound.shortfall(&placement));
-      s.fleet.install_configuration(placement, &members);
+      // This shard's own catalog is yielded at this host's epoch advanced, as the control shard's is (A-334).
+      crate::readmission::install_placement(s, placement, &members);
     }
     if let Some(root) = self.root {
       s.root.adopt(root);

@@ -94,23 +94,20 @@ impl Query {
   }
 
   /// Reuse this client's most recent route, or the id's live creator when it is still in the
-  /// object's home. A dead creator never turns into a rendezvous guess over unrelated members.
+  /// object's home. A dead creator never turns into a rendezvous guess over unrelated members. Never this node: a
+  /// verb is forwarded only when this node does not serve the object, and the creator is this node itself only for an
+  /// object it yielded at its re-admission (A-334), which only the location round can find the successor of.
   pub(crate) fn known_owner(
     self,
     state: &ShardState,
     cached: Option<CachedRoute>,
   ) -> Option<HostId> {
+    let creator = ObjectId(self.object).creator();
     cached
       .filter(|route| self.reuses(state, *route).is_none())
       .map(|route| route.owner)
-      .or_else(|| {
-        eligible(
-          state,
-          ObjectId(self.object).creator(),
-          RegionId(self.region),
-        )
-        .then_some(ObjectId(self.object).creator())
-      })
+      .or_else(|| eligible(state, creator, RegionId(self.region)).then_some(creator))
+      .filter(|owner| *owner != state.fleet.host())
   }
 }
 

@@ -10948,6 +10948,163 @@ fn a_candidate_behind_a_port_mapping_is_redialed_through_it_so_a_cut_there_holds
   );
 }
 
+/// Format: the status count of a live volume a successor rebuilt from its log (`live_ship`'s `LIVE_TAKEN_OVER`).
+const LIVE_TAKEN_OVER: &str = "fleet.live.taken_over";
+/// Format: the status count of the volumes a shard yielded at its host's re-admission (`readmission::YIELDED`).
+const READMISSION_YIELDED: &str = "fleet.readmission.yielded";
+/// Shape: how long reads through an owner admitted again are made: past the lease bound a read parks for (the stale
+/// answer before A-334 came from a parked read served once the lease confirmed), the owner location's round, and its
+/// forward's resends, twice over.
+const READMITTED_READS: Duration = Duration::from_nanos(4 * LIVENESS_BUDGET_NS);
+/// Shape: the pause between two of those reads.
+const READMITTED_READ_PACE: Duration = Duration::from_millis(50);
+
+/// The bytes [`an_owner_admitted_again_forwards_the_volume_its_successor_took_over_and_never_serves_its_own_copy`]
+/// writes through the successor, after the takeover: the file the owner's own copy never held.
+fn written_by_the_successor() -> Vec<u8> {
+  b"written through the successor after its owner's false death\n".to_vec()
+}
+
+/// A live volume on `daemons[0]`, shared with every node's account and written once (`/first`, answered at durability).
+fn shared_live_volume(daemons: &[Daemon]) -> VolumeId {
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id } = client.call(&scratch("owner-admitted-again")) else {
+    panic!("the live volume is created on its owner");
+  };
+  share_with_fleet(&mut client, id, daemons);
+  let attachment = write_attachment(&mut client, id);
+  let shipped = client.call(&RequestBody::LiveShip {
+    volume: id,
+    live_shipped: true,
+  });
+  assert!(
+    matches!(shipped, ReplyBody::LiveShippingSet { live_shipped: true }),
+    "the volume is live-shipped: {shipped:?}"
+  );
+  let first = client.call(&RequestBody::FsWrite {
+    volume: id,
+    attachment,
+    path: "/first".to_owned(),
+    bytes: vec![1; BURST_WRITE_BYTES],
+    mode: 0o644,
+  });
+  assert!(
+    matches!(first, ReplyBody::FsDone { .. }),
+    "the first write is answered at durability: {first:?}"
+  );
+  id
+}
+
+/// Has both survivors (`daemons[1..]`) judge `daemons[0]`, `owner`, dead though it lives, and waits for one of them to
+/// take its live volume over: that survivor's index.
+fn falsely_taken_over(daemons: &[Daemon], owner: HostId) -> usize {
+  let survivors: Vec<&Daemon> = daemons.iter().skip(1).collect();
+  inject_death_into(survivors.iter().copied(), owner);
+  let mut successor = None;
+  let took = poll_until(&survivors, RETIREMENT_DEADLINE + SERVE_DEADLINE, || {
+    successor = (1..daemons.len())
+      .find(|index| refusal_count(&daemons[*index], LIVE_TAKEN_OVER).is_ok_and(|count| count > 0));
+    Ok(successor.is_some())
+  });
+  assert!(
+    took,
+    "a survivor took the live volume over from its falsely dead owner"
+  );
+  successor.unwrap()
+}
+
+/// This node's host epoch, from its status, through a client of `daemon`.
+fn host_epoch_of(daemon: &Daemon) -> Option<u64> {
+  match Client::connect(daemon.instance()).call(&RequestBody::DaemonStatus) {
+    ReplyBody::DaemonStatus { report } => Some(report.fleet.host_epoch),
+    _ => None,
+  }
+}
+
+/// Reads `/second` of `volume` through `daemon` every [`READMITTED_READ_PACE`] until it answers its bytes or
+/// [`READMITTED_READS`] passes: every answer, in order.
+fn reads_through(daemon: &Daemon, volume: VolumeId) -> Vec<ReplyBody> {
+  let mut client = Client::connect(daemon.instance());
+  let (_pace_sender, pace) = std::sync::mpsc::channel::<()>();
+  let began = Instant::now();
+  let mut answers = Vec::new();
+  while began.elapsed() < READMITTED_READS {
+    let answer = client.call(&RequestBody::Read {
+      volume,
+      path: "/second".to_owned(),
+      at: ReadAt::Head,
+    });
+    let served =
+      matches!(&answer, ReplyBody::ReadBytes { bytes } if *bytes == written_by_the_successor());
+    answers.push(answer);
+    if served {
+      break;
+    }
+    let _ = pace.recv_timeout(READMITTED_READ_PACE);
+  }
+  answers
+}
+
+/// A-334, §4.8 "Authority scope" and "Leases and reads" (ReadSafety through an owner admitted again; T-8.7's false
+/// death). Do: on a three-node fleet, make a live volume on a, share it and write a first file; have both survivors
+/// judge a dead though it lives, so the council retires a and a survivor takes the volume over; write a second file
+/// through the successor; wait until a, refuting its death, is admitted again at a newer host epoch; read the second file
+/// through a. Expect: every read answers the file's bytes or a refusal, never `NotFound` or other bytes, and one answers
+/// its bytes (a forwards it to the successor); and a counted the volume yielded. Before A-334, a served the copy its
+/// catalog kept, once its lease confirmed again, and answered the second file `NotFound`: what the SIGSTOP owner flow of
+/// `crates/cli/tests/live_chaos.rs` read through its resumed owner (goal g229, 2026-11-18).
+#[test]
+fn an_owner_admitted_again_forwards_the_volume_its_successor_took_over_and_never_serves_its_own_copy()
+ {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let id = shared_live_volume(&daemons);
+  let successor = falsely_taken_over(&daemons, hosts[0]);
+  let mut writer = Client::connect(daemons[successor].instance());
+  let attachment = write_attachment(&mut writer, id);
+  let second = writer.call(&RequestBody::FsWrite {
+    volume: id,
+    attachment,
+    path: "/second".to_owned(),
+    bytes: written_by_the_successor(),
+    mode: 0o644,
+  });
+  assert!(
+    matches!(second, ReplyBody::FsDone { .. }),
+    "the successor's write is answered at durability: {second:?}"
+  );
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let readmitted = poll_until(&observed, REJOIN_DEADLINE, || {
+    Ok(host_epoch_of(&daemons[0]).is_some_and(|epoch| epoch > slates_db::register::FIRST_EPOCH.0))
+  });
+  assert!(readmitted, "a was admitted again at a newer host epoch");
+  let answers = reads_through(&daemons[0], id);
+  let yielded = refusal_count(&daemons[0], READMISSION_YIELDED);
+  drop(daemons);
+  let stale: Vec<&ReplyBody> = answers
+    .iter()
+    .filter(|answer| match answer {
+      ReplyBody::ReadBytes { bytes } => *bytes != written_by_the_successor(),
+      ReplyBody::Refused { refusal } => matches!(refusal, Refusal::NotFound),
+      _ => false,
+    })
+    .collect();
+  assert!(
+    stale.is_empty(),
+    "an owner admitted again answered its successor's acknowledged write from its own copy: {stale:?} of {answers:?}"
+  );
+  assert!(
+    answers
+      .last()
+      .is_some_and(|answer| matches!(answer, ReplyBody::ReadBytes { .. })),
+    "a read through the owner admitted again reached the successor's write: {answers:?}"
+  );
+  assert!(
+    yielded.is_ok_and(|count| count > 0),
+    "the owner admitted again yielded its volume: {yielded:?}"
+  );
+}
+
 /// Shape: how long [`a_takeover_completes_when_one_survivor_never_received_the_head`] holds the owner's record
 /// session to one survivor out — the placement deadline, longer than the placements and the owner's stop it
 /// has to cover; the hold ends with the owner in any case.

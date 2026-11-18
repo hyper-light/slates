@@ -449,6 +449,13 @@ pub struct ShardState {
   /// one entry per catalog volume at most, made once at the shard's start.
   pub(crate) unrecovered:
     BTreeMap<slates_db::catalog::VolumeId, slates_ipc::protocol::RecoveryCause>,
+  /// The volumes this shard catalogued when its node's host epoch last advanced at a configuration it installed: the
+  /// host was retired while away and admitted again under its id, so each was taken over and its successor serves it
+  /// (A-334; §4.8 "Authority scope": the bumped epoch fences every object the host owned). A client's verb on one is
+  /// forwarded to the successor (`verbs::owned_by_another_host`), and its latest state is never served here
+  /// (`verbs::lease_verdict`). Bounded by the partition's volume cap: a subset of the catalog, pruned to it at each
+  /// yield (`crate::readmission`).
+  pub(crate) yielded: std::collections::BTreeSet<slates_db::catalog::VolumeId>,
   /// The Linux FUSE mounts this shard serves, by attachment (§4.6 "Linux"; AUD-29-64; `crate::fuse`). Bounded
   /// by the partition's attachment cap: one entry per live FUSE attachment at most.
   #[cfg(target_os = "linux")]
