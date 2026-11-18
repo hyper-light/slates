@@ -682,6 +682,15 @@ jobs:
         if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
         timeout-minutes: 15
         run: cargo test -p slates-server --test observe
+      # The daemon's liveness beat (§4.14 `daemon.alive`, A-228): a starved shard keeps the beat, a wedged or spinning one
+      # stops it, on Windows' own thread clock and scheduler readings. No lane ran it on Windows until 2026-11-18, when
+      # only g243's diagnostic runs caught a starved-shard bug there. One test at a time, as the other in-process daemon
+      # suites here run: 12 tests (6 child roles ignored) in 51-52 s, the binary built in 173 s from cold, every one of
+      # three runs passing (diag-integrator-liveness-1, run 44290078113, windows-latest, 2026-11-18).
+      - name: Test the liveness beat, one test at a time (native Windows)
+        if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
+        timeout-minutes: 15
+        run: cargo test -p slates-server --test liveness -- --test-threads=1
       # A-205: a deleted file's pages leave the working set and read back through the files recreated over them.
       - name: Test a deleted file's memory going back to the OS (native Windows)
         if: ${{ !cancelled() && steps.winfsp.outcome == 'success' }}
@@ -1059,6 +1068,12 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: cargo test -p slates-server --test give_back -- --nocapture
+      # The liveness beat (A-228), as on x86_64: 12 tests in 57-58 s one at a time, three runs of three passing
+      # (diag-integrator-liveness-1, run 44290078113, windows-11-arm, 2026-11-18).
+      - name: Test the liveness beat, one test at a time (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-server --test liveness -- --test-threads=1
       # The fleet over real loopback UDP sessions with mutual TLS (crates/server/tests/fleet.rs): formation, detection,
       # replication, takeover and serving the dead owner's bytes over the successor's NFS port. It was cfg(unix) as a
       # whole until 2026-11-06; only the virtio-fs guest test stays Unix-only. It needs the Windows datagram socket's

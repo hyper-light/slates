@@ -69,6 +69,24 @@
 > - a real FIDO key's signature end to end (the touch flag is proven with a software stand-in);
 > - the integrator's runs on Linux and Windows (the suite is platform-free but for the agent's own channel, Unix).
 
+> **A successor's live log began again at position 0: it goes on from the head its takeover adopted (2026-11-18, A-329,
+> Continuity, T-8.6; g230).** `live_ship::published` made every shipper with no start, so a successor's first entry was
+> position 0 at genesis under its higher epoch: holders took it by rank and NoLoss held, but the chaos flows' Continuity
+> failed in five takeover flows (macOS, main bfc34cace, kiln r1246: position 1 against 72 to 1,000 durable before).
+> The live takeover now records the adopted head on the owner shard (`live_ship::adopt_head`), and the volume's shipper
+> starts from it. Tests: `a_successors_first_entry_is_numbered_past_the_head_its_takeover_adopted` (live_ship) and
+> `a_successors_live_log_goes_on_past_every_position_durable_before_it` (`crates/server/tests/fleet.rs`).
+> - **Owed (the supervisor's):** the five chaos flows' Continuity on the fix (they failed alike on both Linux arches,
+>   diag 44269183565).
+> - **Open, not numbering (read from that run's log, seed 6876545201569229162, and the macOS one's):** the nemesis's
+>   "a fence-2 copy behind the fence-1 owner's durable head". Both holders' fences stand at 2, raised by a takeover's
+>   phase one that never completed, while the owner b, still the owner at fence 1, ships epoch-1 entries neither takes
+>   (its head 6,810, durable 6,808, c at 6,808 and a at 6,588): a fence an abandoned takeover raised strands its owner.
+>   No successor shipped, so no position was renumbered; A-329 does not touch it.
+> - **Owed:** the adopted head lives in the successor shard's memory until the volume's first publication, as the
+>   volume's own image does for a live-shipped takeover (A-325's owed item): a successor restarted before then loses
+>   both.
+
 > **A reply carried home past a full channel was dropped: fixed (goal 238, 2026-11-18, A-296, from perf's branch of
 > 2026-11-09; §4.3, CLAUDE.md §2 items 8 and 9).** `xshard::send_back` waited one coordinator period for room and then
 > dropped the result (`xshard.reply_dropped`); `xshard::hand_reply_home` (fuse, image, landing, lease_wait, live_ship,
@@ -112,6 +130,43 @@
 > (`shards.rs`, `tell_holder`). To measure (the supervisor's): the 3,000-client rung's `xshard.reply_dropped` (about
 > 4,200 on main before, 0 expected), `xshard.room_waits_peak`, and each verb's p99 against main.
 
+> **A holder's return was one turn of every live volume on each shard: in turns (2026-11-18, A-324, A-200, CLAUDE.md
+> "Bounded work everywhere"; g230, the sibling the seal walk's entry named).** `live_ship::holder_reached` ran
+> `send_to_reached` on every shard as one closure, visiting every live volume the shard owns and building every message
+> the returned holder lacked (an install a copy of the whole volume each) in one turn. It now walks each shard in turns of
+> the step quantum (`reached_slice`, counted `fleet.live.reached_slices`). Test:
+> `a_holders_return_is_walked_in_turns_and_it_takes_every_log` (`crates/server/tests/fleet.rs`). **Owed (measurement, the
+> supervisor's):** the owner shard's longest step when a holder of thousands of live volumes returns, before and after.
+> **Still owed (the seal walk's other sibling):** a new configuration's install on the control shard
+> (`fleet::sync_config_from_council`) raises every held record's fence and moves every held object of a retired owner
+> in one turn. Slicing it is not a cut of a loop alone: a record a stale owner sends to a held object not yet reached
+> must still meet the new fence, so each acceptor must be brought up to the installed version when it is next asked as
+> well as by the walk (a design change to §4.8's install, with its model).
+
+> **A seal's envelope was wrapped in one turn, and a refused one never started again: in turns, and dropped (2026-11-18,
+> A-323 and A-322, §4.10 "Content replication"; g230).** The owner shard wrapped a seal's whole archive in the turn its
+> walk ended (98 ms for 64 MiB, `envelope_bench` 2026-10-05; about 1.5 s a GiB, past the watchdog's one-second window,
+> so a seal of a GiB volume ended its owner, and every restart sealed it again). It now runs in turns of the shard's
+> clock, a chunk at least (`fleet::wrap_slice`, `slates_cluster::envelope::Wrapping`), making the very envelope a whole
+> wrap makes. And a refused envelope left its job with its walk spent and no archive: every later period found nothing to
+> put, and its head never placed while that snapshot was the head (a heal kept that way shut the healer out of the
+> volume); the job is now dropped and started again the next period, as A-92 piece 3b always said. Tests:
+> `a_seals_envelope_is_wrapped_in_turns_and_places`, `a_seal_whose_envelope_was_refused_is_started_again_and_places`
+> (`crates/server/tests/fleet.rs`), `an_envelope_wrapped_in_slices_is_the_whole_wraps_to_the_byte`,
+> `a_wrap_ends_at_its_envelope_or_its_refusal` (`crates/cluster/tests/envelope.rs`). Bug record
+> `docs/bugs/2026-11-18-a-refused-envelope-left-its-seal-with-nothing-to-do.md`.
+> - **Owed (measurement, the supervisor's):** the owner shard's longest step while a GiB volume seals, before and after.
+> - **Owed:** a seal's archive walk and its wrap each advance one slice a record period (100 ms), so a large volume takes
+>   many periods to place: at a walk slice of half a 20 µs quantum at 5 GB/s, about 50 KB a period, a GiB takes hours.
+>   The turns are bounded; their pace is not derived from the loss window a seal serves.
+> - **Owed (siblings, one-turn walks of a whole volume):** a takeover's open of a sealed envelope
+>   (`fleet::opened_archive`'s `envelope::open`) and a live log's whole record (`live_ship::payload` seals the volume's
+>   whole image in one turn) are each one turn of the whole volume, the first on the successor, the second at every
+>   whole entry and install image.
+> - **Owed (sibling, a seal left with nothing to do):** a content round's archive is carried back to the owner shard by
+>   `xshard::run_on_counted` (`fleet::put_seal_content`); a full control channel drops it, counted `xshard.run_refused`,
+>   and leaves the job with no archive as A-322's did, until a newer snapshot supersedes it.
+
 > **A volume reported no loss window: built (2026-11-17, AC-8.3, §4.10 "Auto-seal"; g230).** Nothing told an agent
 > what an owner loss would cost it, or a successor's client what one had cost: the status promised
 > `last_placed_snapshot_age` and carried nothing. `status` now carries `LossReport`: `at_risk_ns` (zero at a placed,
@@ -123,8 +178,14 @@
 > placing by refusing the owner's records, so the window is the edits after the last *placed* seal, not the last seal).
 > - **Owed:** auto-seal at a derived cadence (Phase 8 task 8), which bounds the window; it needs the operator's
 >   loss-window SLO, a decision for Ada (options in the g230 progress record).
-> - **Owed:** the takeover report survives the successor's restart; it lives in the shard's memory, so a restarted
->   successor reports no takeover (the window it reports from then on is still exact).
+> - **Closed (2026-11-18, A-325):** the takeover report survives the successor's restart: it is kept in the volume's
+>   record (`VolumeRecord::taken_over`). The test found that the volume itself did not: nothing published the shard's
+>   image after a takeover until the volume's first write, so a successor restarted before then refused it `NoImage`
+>   and never served it again. A volume taken over from its seal is now published before it is served. Test:
+>   `a_successors_takeover_report_survives_its_warm_restart`.
+> - **Owed:** a live-shipped volume taken over is still published first by its first write's barrier, so a successor
+>   restarted before that write loses it the same way; publishing it at the takeover starts the successor's live log
+>   there (`live_ship::published`), a change to the live takeover's shape that needs its own piece and its chaos runs.
 
 > **A sealed envelope's wrap and open were quadratic in its chunks: linear (2026-11-17, A-92 piece 3b; g230).** The
 > wrap (`slates_cluster::envelope::wrap`) checked each sealed chunk against every chunk already stored, and the open
@@ -132,8 +193,7 @@
 > the open on a takeover's path (the recovery budget is 1 s) and the wrap in one turn of the owner shard. Now a set and
 > an index. Test: `an_envelope_of_thousands_of_chunks_opens_to_the_very_archive` (`crates/cluster/tests/envelope.rs`).
 > **Owed (measurement, the supervisor's):** `cargo run --release -p slates-cluster --example envelope_bench` at 16,384
-> chunks, before and after. **Still owed:** the wrap runs whole in one owner-shard turn at a seal's end (64 MiB took
-> 98 ms, 2026-10-05); slicing it is the seal walk's next piece.
+> chunks, before and after. The wrap's one owner-shard turn at a seal's end is in turns since A-323 (2026-11-18, above).
 
 > **The seal walk held its shard for every seal at once: in turns (2026-11-17, §4.10 "Content replication", CLAUDE.md
 > "Bounded work everywhere"; g230, the sibling of the live period's slicing below).** Each record period the owner
@@ -143,9 +203,8 @@
 > (`fleet::seal_walk_slice`, counted `fleet.seal.walk_slices` against `fleet.seal.walks`), each turn's content puts
 > dispatched before the next. Test: `a_shards_seals_are_walked_in_turns_and_every_one_places` (the turn injected to one
 > volume, `Daemon::inject_seal_walk_quantum`). **Owed:** the owner shard's longest step with hundreds of volumes sealing
-> at once (measurement, the supervisor's); and the envelope wrap at a seal's end (`fleet::envelope_of`) still seals the
-> archive's new chunks in one turn (64 MiB took 98 ms, 2026-10-05): a seal of a large new volume holds its shard for
-> the whole wrap.
+> at once (measurement, the supervisor's). The envelope wrap at a seal's end, one turn of the whole archive then, is in
+> turns since A-323 (2026-11-18, above).
 
 > **owner_turn's refused `mkdir` asked the program, not the kernel: fixed (2026-11-18, test only).**
 > `a_mutations_reply_waits_for_its_barrier_and_a_refused_barrier_answers_eio` (`crates/bridge-fuse/tests/owner_turn.rs`)
@@ -343,7 +402,8 @@
 >   statement a signer signs and the trusted signers a launcher registers — signed merges built (A-321, `CONTRACT` =
 >   13), a signed landing owed;
 > - (built, `CONTRACT` = 15: the volume core's refusals typed, `Refusal::Volume`, no catch-all left in
->   `refusal_of_vfs`;) typed fields on the wire for a landing target's refusal (`TargetUnavailable` carries words), a merge's versions
+>   `refusal_of_vfs`; `CONTRACT` = 16: an unmount's unasked volumes answered and a host refusal rendered in words,
+>   the integrator's two Windows failures;) typed fields on the wire for a landing target's refusal (`TargetUnavailable` carries words), a merge's versions
 >   (the work's base beside the head), and the words the crate still reads from the daemon's closed tables (a landing's
 >   state, a summary's actions, the audit's kinds, a grant's state); an overlay's drift is built (`StatusReport::base`,
 >   `CONTRACT` = 8), and a presentation's conflicts are read typed from its entries;
@@ -659,6 +719,79 @@
 > an embedding host passes them through `slates_api::Filter` (A-278). Test:
 > `args::tests::a_landing_keeps_every_include_and_exclude_given`. Record:
 > `docs/bugs/2026-11-17-land-kept-only-the-last-exclude.md`.
+
+> **The fault probe can read a page fault as free under load (found 2026-11-09 by the A-223 plan; fixed 2026-11-11 by
+> liveness, 15e27a90 on agents/liveness-fault-probe).** `slates_machine::probes::faults` takes `base_ns` as the median of map, touch every page and unmap,
+> less the median of map and unmap alone, over 256 pages, with a saturating subtraction. The two medians are taken in
+> separate measurements, so under load the second can come within 256 ns of the first or pass it, and the cost reads 0.
+> - **Seen:** `profile::tests::a_profile_measures_within_its_budget_and_round_trips_through_json` asserts
+>   `faults.base_ns > 0` and failed in 1 of 10 full `slates-machine` suite runs on main 39c1a9e4 on fedora-2 (32 CPUs,
+>   load 21-34), and in 0 of 10 runs of the test alone. The A-223 branch read the same: 0 of 10 alone, 1 of 3 and 0 of 10
+>   in the suite.
+> - **Why it matters:** consumers take `faults.base_ns.max(1)` (`config.rs`, `region.rs`), so nothing divides by zero.
+>   But a 1 ns fault then feeds derived bounds, among them the arena region (`pages = 100 × 2 × syscall / fault`) and the
+>   pre-fault slice.
+> - **Fixed:** `faults` returns a `Result` and refuses a non-positive per-page difference with
+>   `MeasurementTimeout { probe: "faults" }`, so `MachineProfile::measure_patiently` measures again within the probe's
+>   wall ceiling. A populated or huge-page region measured at nothing reads `None`. Tests (red on main, `Ok(0)` and
+>   `Some(0)`): `a_touched_region_no_slower_than_the_untouched_one_is_refused_never_a_zero_fault` and
+>   `a_populated_region_no_slower_than_the_untouched_one_is_unmeasured` (ef529d8a). Record:
+>   `docs/bugs/2026-11-11-the-fault-probe-reported-a-zero-fault-on-a-loaded-machine.md`.
+
+> **The Windows wake estimate (A-223, found 2026-11-05 on jupiter, fixed 2026-11-06; the idle window's rule decided 2026-11-11, extended for closed loops 2026-11-18 by A-326, on main 2026-11-18 with the merge of liveness's branch; Windows' own window open).**
+> The boot probe let a Windows waiter's announcement stand in for its sleep, and the shards' online estimate learned
+> kicks that met a thread not yet blocked. Both measured a handoff, 0.14–0.85 µs, so the idle window (100 times it) was
+> 14–80 µs and owner shards parked between a single client's creates. Now the probe kicks only once the waiter's cycle
+> count stands still, and it drops a wake its waiter's own switch count shows it never slept through. The shards judge
+> their parks by that switch count too (`slates_machine::switches`; the bug record of 2026-11-06).
+> - **Measured on CI at two shards** (`diag-liveness-2`, three quiet runs a runner): owner parks per 1,000
+>   single-client creates fell from 30–88 to 0–1 per shard on x86_64 and from 2–7 to 0–1 on arm64. The single-client
+>   p99 went from 45.5–49.3 to 33.3–37.7 µs (x86_64) and from 32.8–35.0 to 28.9–31.4 µs (arm64). The 8-client p99 stayed
+>   within 7 % (495–503 against 511–519 µs; 474–494 against 499–531 µs). The probe reads 7.1–9.1 µs, confirmed.
+> - **The idle window's rule: decided and built (2026-11-11, the supervisor's decision A).** The ratio of 100 had
+>   come to multiply a real wake, 0.71–0.91 ms of window at boot, and the shard's live estimate, which counts the
+>   run-queue wait its own spinning causes, lengthened it to hundreds of milliseconds under load. Now the window is
+>   `max(F, the shard's wake estimate × the platform's multiple)` (`config::idle_window_ns`, §4.3, §4.7). F is R9's
+>   50 µs provisioning floor (`config::PROVISION_FLOOR`), which `provision_bench` gates on too. The multiple
+>   (`config::loaded_wake_ratio`, paired `#[cfg]` functions) is 0 on Linux and macOS, so no estimate prices the window there and a shard's own
+>   spinning cannot lengthen it (`crates/server/tests/idle_window.rs`), and 100 on Windows (§5).
+>   - Measured at two shards on CI (diag-liveness-35, BENCHMARKS "The idle window's rule"): a 1 ms-paced client's CPU
+>     fell from main's 1,451–2,023 to 155–224 thousandths of a core on Linux, the loaded single-client p99 halved
+>     (8.0 → 4.0 ms on x86_64, 9.8 → 4.0 ms on arm64), and the quiet p99 stayed within main's spread. As built
+>     (diag-liveness-37): 188–219 quiet and 293–365 loaded on Linux.
+>   - The paced client's quiet cost is judged by the supervisor's criteria, not a fixed bar: well below main's on
+>     Linux (188–219 against 1,451–2,023 thousandths of a core), and on Windows A-223-alone's level, kept by decision A
+>     (131–341). The plan's step 6 confirms it on the finished code against main.
+>   - Measured and rejected: the floor of confirmed wakes (it queued too, 0.33–33.8 ms), the floor less Linux's
+>     run-queue time (0 to 1.75 µs, the shards parked through a client's requests), the live floor × 100 capped at 4F
+>     (twice the paced CPU), and the boot probe's smallest wake as a second input to `max` (6.8–346 µs on a loaded
+>     boot, past F in 5 of 9 boots on each Linux runner).
+>   - **Open (C): Windows' own window.** A Windows shard parked beside two spinners a CPU waits 50–100 ms to run again,
+>     so R9's floor alone made that the loaded single-client p99 (97–100 ms on windows-latest, 48–56 ms on
+>     windows-11-arm, against 125–127 µs medians at the multiple). Windows keeps the multiple, and its paced client
+>     the cost (177–435 thousandths of a core quiet), until that wait is understood and a window measured for it.
+>   - **Fixed (A-326, 2026-11-18, goal g234): a closed loop's other shards parked at R9's floor alone.** The plan's
+>     step 6 (2026-11-12, diag-liveness-42 to -45 and adacachy2; every N in the A-223 plan's notes) found the rule
+>     fails a quiet single client over three shards: p99 116.4 µs against main's 27.1 on ubuntu-24.04-arm, 144–331
+>     parks per 1,000 creates, since a create goes to the partition its name hashes to and a loop returns to an owner
+>     only after going round the others. A fixed `F × S` or `2F × S` window fixed it there (36.8 and 29.5 µs) but spun
+>     for a paced client too (1,386–2,289 thousandths of a core at fifteen shards against main's 664). Now a forward
+>     made for a request read within F of its shard's last client I/O holds its owner open for the loop's return at R9's
+>     percentile, 2F × the least k with ((S − 1)/S)^k ≤ 1/100, never more cycles than the loop had run (§4.7, A-326;
+>     `crates/server/tests/closed_loop.rs`). A paced client's requests hold nothing.
+>   - **Owed: the supervisor's measurement of A-223, its window rule and A-326 on main** (`provision_bench`, every N,
+>     quiet and two spinners a logical CPU): on ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest and
+>     windows-11-arm at 2 shards and the derived count, plus `PROVISION_BENCH_SHARDS=3` on Linux and a many-core Linux
+>     machine at its derived shards: the single-client p99 against main's (R9 at every count, main's 27.1 µs at three),
+>     owner parks per 1,000 in the spinning form (near 0) and the paced form (above 0), and the paced form's CPU
+>     (Linux main 1,451–2,023 thousandths of a core at two shards; the rule 155–232).
+> - **The client's Windows wake (sibling (d), fixed 2026-11-11).** The ipc client took any reply stamp inside its wait,
+>   since the Event cannot say a sleeper was found, so a reply sent before it blocked was learned as a handoff. It now
+>   judges its wait by its own switch count, as the shards do, and keeps its seed where the OS refuses the count. Of
+>   16,384 racing parks a run on CI's Windows runners, main learned 11–48 of those that never switched out, the fix
+>   none (`diag-liveness-client-4`, 10 runs a tree); the parked bench form's client estimate read 17–33 µs before and
+>   after. Seen on the way: `presentation.rs` failed on Windows (`Unsupported { feature: "landing" }`, no Windows
+>   landing writer, A-262), on main's code too, where CI never ran it; it now builds on Unix only, as the verb does.
 
 > **The dirty-page test's precondition, proved each attempt (2026-11-09, A-248).**
 > `a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path` failed intermittently ("the sync says so:
@@ -3857,6 +3990,11 @@ are retained with their scope; no documentation edit is an implementation accept
   cost is measured (§4.3), which `RuntimeConfig::from_profile` says in its formula string.
 - "10 × broadcast RTT p99" for election timeouts is Raft's published rule; ratified as a shape
   constant with the citation.
+- The idle window's multiple of the wake estimate on Windows (100, `config::loaded_wake_ratio` on Windows, a `derived!` naming
+  this entry): the ratio every platform had before A-223, kept on Windows by the supervisor's decision (2026-11-11)
+  because R9's floor alone cost a loaded single-client p99 of 48–100 ms there. It stands until Windows' own window is
+  measured (A-223's open item (C)). Linux and macOS take none: their window is R9's floor, F
+  (`config::PROVISION_FLOOR`, 50 µs), which is the requirement itself.
 - The format floor for compression (savings must exceed the chunk's metadata overhead) is
   derived from the format, not a literal.
 - The racy-window timestamp granularity per base filesystem (§4.15) is a cited table keyed by

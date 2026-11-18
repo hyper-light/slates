@@ -27,7 +27,7 @@ use slates_ipc::protocol::{
 };
 
 use crate::error::{Busy, Error, Exhausted, Existing, Invalid, KindMismatch, Missing, Note};
-use crate::mount::{MountOptions, Mounted};
+use crate::mount::{MountOptions, Mounted, Unmounted};
 use crate::outcome::Work;
 use crate::seam::Volumes;
 use crate::volume::{Provisioned, Source, VolumeSpec};
@@ -455,11 +455,12 @@ impl Volumes for SimVolumes {
     })
   }
 
-  fn unmount(&mut self, path: &str) -> Result<(), Error> {
+  fn unmount(&mut self, path: &str) -> Result<Unmounted, Error> {
     self
       .attachments
       .retain(|_, attachment| !matches!(&attachment.held, Held::Mount { path: at } if at == path));
-    Ok(())
+    // The simulator asks no volume's status for its mounts, so none goes unasked.
+    Ok(Unmounted::default())
   }
 
   fn detach(&mut self, attachment: u64) -> Result<(), Error> {

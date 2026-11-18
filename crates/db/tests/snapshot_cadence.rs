@@ -133,6 +133,7 @@ fn green() -> VolumeRecord {
     access: vec![],
     created_ns: 0,
     catalog_version: 0,
+    taken_over: None,
   }
 }
 

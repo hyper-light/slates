@@ -20,7 +20,6 @@ use std::time::{Duration, Instant};
 
 use slates_client::{CreateSpec, NamePolicy, SizeClass};
 use slates_ipc::protocol::{ReplyBody, RequestBody};
-use slates_server::config::IDLE_WINDOW_RATIO;
 use slates_server::daemon::{LIVENESS_BUDGET_NS, OBSERVE_BUDGET_NS};
 use slates_server::state::ShardState;
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
@@ -34,7 +33,8 @@ const TEST_SHARDS: u16 = 2;
 /// verdict ends its process, this test binary with it. A-232's own held-daemon tests hold half a window for the same
 /// reason. It must outlast the flood (5 to 20 ms for 41,125 spawns on an 18-CPU Mac under 36 spinning threads,
 /// 2026-11-17), the forward meeting the full channel, and the client's shard going idle with the forward kept and asking
-/// the owner for room: an idle window after its last work, 0.3 to 21 ms in the same runs.
+/// the owner for room: an idle window after its last work, R9's 50 µs floor on Linux and macOS since A-223's window
+/// rule (0.3 to 21 ms in the same runs, when the window was a multiple of the wake estimate).
 const HOLD: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS / 2);
 /// Shape: how long the kept forward's answer may take after the owner's last progress through the flood queued ahead of
 /// it: the liveness budget, far past the one task (the forward) and the one reply home that follow the flood's last
@@ -109,8 +109,8 @@ fn hold(
 }
 
 /// The room wake's counts on the shard at `partition` (`slates_rt::room`): its tasks' asks for room in a full channel,
-/// the tasks a drain's word woke, and its wake estimate in nanoseconds, of which the serve loop's idle window is
-/// [`IDLE_WINDOW_RATIO`] times.
+/// the tasks a drain's word woke, and its idle window in nanoseconds, the window its serve loop polls for after its last
+/// work (`slates_rt::shard::Counters::idle_window_ns`).
 fn room_counts(daemon: &Daemon, partition: usize) -> (u64, u64, u64) {
   daemon
     .observation(
@@ -122,7 +122,7 @@ fn room_counts(daemon: &Daemon, partition: usize) -> (u64, u64, u64) {
           (
             counters.room_waits,
             counters.room_wakes,
-            counters.wake_cost_ns,
+            counters.idle_window_ns,
           )
         })
         .unwrap_or_default()
@@ -192,7 +192,7 @@ fn a_forward_kept_for_a_full_channel_is_sent_once_the_channel_has_room() {
     std::thread::yield_now();
   }
   let (waited, since_progress) = (released.elapsed(), progressed.elapsed());
-  let (asks, wakes, wake_cost_ns) = room_counts(&daemon, origin);
+  let (asks, wakes, idle_window_ns) = room_counts(&daemon, origin);
   drop(client);
   daemon.stop();
   assert!(flooded > 0, "the owner's control channel was filled");
@@ -205,7 +205,6 @@ fn a_forward_kept_for_a_full_channel_is_sent_once_the_channel_has_room() {
   assert!(
     asks >= 1 && wakes >= 1,
     "the client's shard asked the owner for room and the owner's drain woke it: {asks} asks, {wakes} wakes (an idle \
-     window of {} ns against a hold of {HOLD:?})",
-    wake_cost_ns.saturating_mul(IDLE_WINDOW_RATIO)
+     window of {idle_window_ns} ns against a hold of {HOLD:?})"
   );
 }
