@@ -6719,7 +6719,11 @@ ports, and the mapping between them is the operator's. It announces the advertis
 plane's too (A-330), since a peer prefers the announcement to the manifest at every later dial: announced at
 its bound port, every redial of a record link went around the mapping. A manifest with fewer than `f + 1` nodes, a
 repeated name or certificate, a base (advertised or bound) at the end of the port range, or an identity
-the TLS stack cannot use, is refused by name at boot. The two serve
+the TLS stack cannot use, is refused by name at boot. A node addressed by name, and any peer enrolled under a trusted
+root (it announces its address, which may be a name), is resolved at every dial through the host's nameservers, read
+once at boot: `/etc/resolv.conf` on Unix; on Windows, which has no such file, the DNS servers of the network adapters
+that are up and have a gateway, with `resolv.conf(5)`'s default timeout and attempts (A-490); a manifest that may dial
+a name on a host with no IPv4 nameserver is refused at boot by name. The two serve
 sockets are bound once, before the daemon starts (`FleetTransport::bind`, between the pure plan and the
 daemon), so an address already in use refuses the start by plane and address, rather than leaving a
 daemon that can never be probed. A caller that already holds its ports hands the bound sockets over
@@ -32365,3 +32369,24 @@ Applied in the same change to: GAPS (A-404's entry); `docs/bugs/2026-11-18-a-suc
 
 Applied in the same change to: §4.14 (a status block on `daemon.alive`), GAPS (A-308's entry), `docs/bugs/` (a record,
 and A-467's record's sibling line), `crates/server/src/watchdog.rs`, `crates/api/src/role/anchor.rs`.
+
+### A-490 — A Windows fleet node reads its nameservers from its network adapters, since Windows has no `/etc/resolv.conf`: a kiln runner on Windows can join a fleet that trusts kiln's CA (2026-11-18, UI goal 85 bug 5 via g071, found by g267 in kiln K3; §4.8 "Deployment"; contract 39)
+- **The bug.** A fleet node reads the host's nameservers at boot when a node is named or an enrollment root is trusted
+  (a peer enrolled under a root announces its addresses, which may be names). The one reader read `/etc/resolv.conf`,
+  so a Windows node whose manifest trusted a root was refused at its start and at kiln's `check_fleet`, every address a
+  literal or not; every kiln runner's manifest names kiln's CA as its root.
+- **The rule.** `read_resolver` is a seam with two halves of one signature. Unix reads `/etc/resolv.conf` as before.
+  Windows reads the DNS servers its network adapters list (`GetAdaptersAddresses`) and keeps, by Go's rule there
+  (`net/dnsconfig_windows.go`), those of the adapters that are up and have a gateway, in order, each once. Windows states
+  no timeout or attempt count an application can read, so `resolv.conf(5)`'s defaults (5 s, 2 attempts) stand, as Go
+  takes them; with one nameserver they give up 10 s after the first query, as the Windows DNS client does (Microsoft's
+  KB 2834226). No count caps the servers: the Windows client asks every server it holds (KB 2834226).
+- **Bounded and checked.** The call is asked for its size, then into a buffer of that size; an adapter added between the
+  two refuses the start by name rather than retrying. The walk reads a link or an address only once it lies wholly
+  inside the buffer, aligned, and walks no more steps than entries fit in the buffer.
+- **Test.** `a_windows_hosts_adapters_give_its_resolver` (`crates/api/src/role/fleet.rs`, on every host).
+
+Applied in the same change to: §4.8 "Deployment", GAPS (the kiln runners' entry), `docs/bugs/` (a record), `docs/cli.md`,
+`docs/deploy.md`, `crates/api/src/role/fleet.rs`, `crates/api/src/role/fleet/windows_dns.rs` (new),
+`crates/api/Cargo.toml`, `unsafe-budget.toml`, and the doc comments of `crates/server/src/dns.rs` and
+`crates/server/src/deploy.rs`.

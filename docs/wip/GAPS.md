@@ -906,6 +906,12 @@
 >   through kiln's server and the manifest written per runner with kiln's CA as its enrollment root (K2), and the
 >   operator's choice of which runners join, with `f` and each node's address, a chosen runner's Slates started with
 >   `StartSpec.fleet` once `role::check_fleet` (contract 39) read the manifest it wrote as its start will (K3).
+> - **Fixed (2026-11-18, A-490): a Windows runner can read its nameservers.** Its manifest trusts kiln's CA as a root,
+>   so its start reads the host's nameservers (a peer enrolled under the root may announce a name), and the reader
+>   knew only `/etc/resolv.conf`, which Windows lacks: every Windows runner was refused at `check_fleet`. Windows now
+>   reads the DNS servers of its network adapters that are up and have a gateway (`role/fleet/windows_dns.rs`, Go's
+>   rule), judged by a cfg-free function unit-tested on every host (the bug record of 2026-11-18). Owed: a Windows
+>   node's live start on a manifest with a root (filed for main's Windows lanes).
 > - **Kiln moves an agent with its volume (A-450, kiln K4, 2026-11-18):** through the library alone (`move_volume` to the
 >   target's member id, followed until `Moved`, every refusal by kind, the agent left running where it was), the
 >   target's runner mounting the moved volume under its own place once its new owner serves it. Today's kiln
