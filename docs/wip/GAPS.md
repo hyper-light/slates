@@ -33,12 +33,15 @@
 > that holds a record session it dialed to it (`DirectContact::Dialed`, `ShardState::dialed_in`). Test:
 > `the_pairs_canonical_dialer_keeps_a_peer_that_dialed_it_and_only_it` (`crates/server/src/daemon.rs`). Bug record:
 > `docs/bugs/2026-11-18-a-learner-the-pairs-lower-anchor-dropped-a-voter-that-kept-it.md`.
-> - **Open: a learner's voters are not versioned.** A seat change is a Raft configuration entry that moves no
->   configuration version, so a learner never fetches on it, and a learner answered by another learner takes that one's
->   known voters. A learner whose stale voters omit the leader sends its reports (which only the leader proposes) to
->   members that are not it, and the reports are answered `NotLeader` until a configuration commits. The principled fix
->   carries the voter set inside the versioned configuration a learner fetches (a format change of the regional
->   configuration's encoding; for Ada's design review).
+> - **Fixed (2026-11-18, A-380): a learner's voters are versioned.** A seat change was a Raft configuration entry that
+>   moved no configuration version, so a learner never fetched on it, and a learner answered by another learner took that
+>   one's known voters (`a_learner_learns_who_votes_once_the_voter_it_joined_from_is_gone`: 3 of 24 runs at one CPU, a
+>   learner naming only the stopped bootstrapper). Now the configuration records the council's voters, the leader
+>   records the voters in force once no change is in flight (`ConfigCommand::Seat`), and a learner reads them from the
+>   configuration it holds. Tests: `a_learner_names_the_voters_the_configuration_records_through_a_seat_change`
+>   (`crates/cluster/src/config_group.rs`), `a_seat_records_the_voters_in_id_order_and_advances_the_version_only_when_they_change`
+>   (`crates/db/src/register.rs`), the round trip in `crates/cluster/src/raft_wire.rs`. The root group's learners still
+>   name the root voters of their join (the open sibling of the 2026-11-08 entry).
 > - **Owed (the supervisor's):** the learner tests' rate on the diag lanes once this lands
 >   (`a_learners_reports_reach_the_council_once_the_voter_it_joined_from_is_gone` and its three siblings, at one CPU
 >   beside two busy loops, as diag-g225-forming-fleet-reaches-2 ran them).
@@ -116,7 +119,20 @@
 >   written where the design says. A-265 writes them where the design says: every record is held by the control
 >   shard's partition (a record made on another shard owed to it as one batch), `Audit` is served there a page at a
 >   time, one sequence numbers the daemon's audit, and `a_client_on_any_shard_reads_every_shards_audit`
->   (`crates/server/tests/audit_pages.rs`) reads every record from clients on both of two shards;
+>   (`crates/server/tests/audit_pages.rs`) reads every record from clients on both of two shards. Through the contract,
+>   on the shards kiln starts: `a_signed_landings_audit_reads_back_on_every_shard_kiln_starts` (`crates/api/tests/api.rs`)
+>   reads a signed landing's planned and finished records, verified, from four instances on both shards; on main
+>   79aee2a17, before A-265, the landing instance's whole audit read `[]` (Mac Studio, kiln r3614), and it passes with
+>   A-265 (r3621);
+> - **found by g90, closed 2026-11-18 (§4.15 "Audit" and its state machine):** a granted landing that was refused wrote
+>   none of its records, so its trail ended at its grant. The run's plan, validation and entries in the engine's ring
+>   were dropped, and nothing recorded its end. Now every attempt, from the moment its id is decided, records in its
+>   completion's atom the ring's records of it and a `landing_finished`. That record names `refused` (`aborted` once
+>   the attempt wrote an entry), the manifest it planned (its grant's when it planned none) and its verdict. The
+>   server's own refusals count too: the lease, the volume, the snapshot, the host and the target. Proven by three
+>   tests in `crates/server/tests/presentations.rs` (a conflict in the run, a grant mismatch in the plan, a lease held
+>   before it), each red on main 79aee2a17 (Mac Studio, r3614), a fourth for an end that names no manifest, and the
+>   unit test of the `aborted` rule (`docs/bugs/2026-11-18-a-refused-granted-landing-left-no-trail.md`);
 > - a real FIDO key's signature end to end (the touch flag is proven with a software stand-in): it needs a physical key,
 >   which only a person holds, or OpenSSH's software authenticator (`regress/misc/sk-dummy`, built from OpenSSH's source
 >   and loaded by `ssh-keygen -w`), a tool build CLAUDE.md §2 item 14 reserves for Ada; macOS's OpenSSH 10.2p1 on the
@@ -587,8 +603,24 @@
 > of Linux's permission check over the dispatch's answers (`crates/bridge-fuse/tests/shards_fs.rs`). Not kept: Linux's
 > clearing of set-group-ID when a caller outside the file's group sets an ACL, which the FUSE wire carries only under
 > `FUSE_SETXATTR_EXT`, not negotiated (a per-connection request form a restored or resynced stream would have to
-> carry). Owed: a real guest's run of it (a Shards guest over a stream; a VM over slates' own virtio-fs device) and the
-> GETXATTR round trips it adds to a non-owner's access, measured by the integrator.
+> carry). (Kept since A-378, below.) Owed: a real guest's run of it (a Shards guest over a stream; a VM over slates' own
+> virtio-fs device) and the GETXATTR round trips it adds to a non-owner's access, measured by the integrator.
+> **Built since (A-378, 2026-11-18):** an access ACL set from outside a file's group clears the file's set-group-ID
+> bit, as Linux does. A guest route's INIT asks for `FUSE_SETXATTR_EXT` beside `FUSE_POSIX_ACL`; each transport reads
+> the form from the INIT reply the shared dispatch wrote and tells its bridge (the virtio-fs device before every chain,
+> since one pass can serve an INIT and a request after it; a Shards stream before every request); the dispatch then
+> reads the extended `fuse_setxattr_in`, and for `system.posix_acl_access` with `FUSE_SETXATTR_ACL_KILL_SGID` clears
+> the bit once the ACL is set (a default ACL's set leaves it, as on Linux). A Shards stream keeps the form in its
+> anchor-held session (40 bytes; the anchor's cap is 64) and in its SAVE tables (format 2), so a resynced or a restored
+> stream, which sees no INIT, reads its guest's requests as before. Found and fixed with it: a RESTORE never told the
+> anchor the restored guest's session, so a daemon's death after a restore served the guest with the fresh stream's
+> identity owners, the saved swap (A-281) lost. Tables saved before A-378 (format 1) are refused at a RESTORE with
+> their reason, as any other format is. Proven by use (a Mac Studio, kiln runs r3591, r3599 and r3623; Linux, GitHub
+> run 44357398816): a 02660 file whose access ACL a guest sets with the flag is 0660, one set without it stays 02660, and
+> a directory's default ACL leaves its bit; the virtio-fs device serves an extended SETXATTR in the pass that served its
+> INIT; a stream reads the form after a restore and after its daemon's death; each of fourteen guards removed alone
+> fails its test. Owed: a real guest's run (a non-member's `setfacl` on a set-group-ID file, over a Shards stream and
+> over slates' own virtio-fs device).
 > **Built since (A-303, 2026-11-18):** a stream's tables for a VM's save and restore (Shards' D176 part 5): a SAVE
 > waits for the guest's stores through its maps, takes and publishes a snapshot at the cut and answers tables naming
 > it with the guest's references, opens, scope and owner view; a RESTORE, a fresh stream's first frame, takes them onto
@@ -1687,6 +1719,26 @@
 >   settle would leave the owner's head naming a holder without it. Owed now, in order: register copies whose content
 >   no head the holder holds names go on that rule (g250's next piece); content goes only on the content's own
 >   certificate, the release below.
+> - **Fixed in part (A-341, g250, 2026-11-18): an unasked copy goes where the object was recovered within tolerance.**
+>   A holder the round never asked lets its copy go as a stale one goes (its content kept while its retention rule
+>   keeps it, A-335) when its successor confirms in the kept retirement and the object's settled recovery cohorts each
+>   keep their recovery quorum of members (`RegionalConfiguration::within_tolerance`; counted
+>   `fleet.takeover.unasked_covered`): every record committed for the object is on `f + 1` of each settled cohort, so
+>   the round learned one at least as new. **The first rule was unsafe, found by the lineage model before it was
+>   built:** letting every unasked copy go at a confirmation, held to a placement that had certified a record at least
+>   as new elsewhere, let go the last copy of a record placed at `f + 1` after one failure at `f = 1` (seed 44: a region
+>   formed on host 1 alone admitted 102, wrote an object jointly to {1} and {1, 102}, moved its neighbourhood to later
+>   joiners unsettled and died; the round asked the joiners, learned nothing, and the "certification" was the dead
+>   owner's own cohort). Tests: the lineage model (`crates/db/tests/lineage_model.rs`: its A-309 oracle, an adoption
+>   after every copy let go, now with never-placed copies exempt; red with the tolerance unjudged, seed 44) and
+>   `a_holder_the_takeover_never_asked_lets_go_what_was_recovered_within_tolerance` (`crates/server/src/daemon.rs`);
+>   kiln r41 (Mac Studio), each red: the model with the tolerance unjudged, the server with every or no unasked copy
+>   covered.
+>   **Still owed:** a copy first judged on a completion record (the last successor to confirm completes the takeover
+>   in the version that records it) or past tolerance is kept, `fleet.takeover.kept_unasked`: the completion record
+>   keeps no neighbourhood to judge by. Owed: the completion record keeps the retired host's settled neighbourhood (and
+>   its carried retirements'), so a holder judges its object's cohorts there too; and the settle-based rule above for a
+>   live owner.
 > - **Fixed (A-335, g250, 2026-11-18): a stale-copy reclaim dropped content a successor still fetched.** A holder
 >   outside the successor's placement let its copy go whole at the successor's confirmation or the completion record,
 >   while the confirmation certifies the record adopted and the successor fetches content from the adopted head's holders
@@ -2624,6 +2676,26 @@
 >     takes after the daemon read the request (`a_send_is_stamped_before_the_daemon_can_have_answered_it`,
 >     `a_reply_is_stamped_after_the_ring_it_was_taken_from_was_read`).
 >
+>     **Where a slow request's time goes (2026-11-18, g083's trace diagnostic, never on main).** Each attempt the
+>     harness timed was joined with every span the daemon's shards held for its request (each shard's sink sized to
+>     hold the run; the owner's answer to each ask and each resumed verb spanned too), on the Mac Studio at 1,000
+>     clients over 23 shards, main `f6d37937b`'s code with the diagnostic, in-process, load 14 to 17. At a think mean of 50 ms (1,121
+>     verdicts a second) an edit's p50 was 141 µs and its p99 2.2 ms; of it the verb itself took 12 µs at the median
+>     and the owner's answer 13 µs at the p99, and the rest was waiting for a thread: the request in the client's ring
+>     until its shard read it (p99 634 µs), the hop to the work's shard (267 µs), the ask out to the owner, batch and
+>     queue (397 µs), the answer back (127 µs), the reply home (238 µs), and the harness taking it (25 µs at the p99,
+>     2.7 ms at the p999). In the slowest 1% the means were 1.8, 0.9, 2.1, 0.4, 0.7 and 3.6 ms; at 20 ms (2,682
+>     verdicts a second) 2.2, 1.6, 4.5, 0.5, 1.2 and 8.5 ms. Each `floor` p99 (the product's alone) was 1.6 to 2.7 ms at
+>     50 ms and 2.2 to 4.6 ms at 20 ms. Every shard parked and woke about 7,500 times a second: the doorbell's herd
+>     (A-381, closed below). The owner ran at 33% and 51% of a core; every other shard at 13 to 28%.
+>     - **Closed: the doorbell's herd (A-381, 2026-11-18).** On macOS and Windows each client's ring kicked every shard;
+>       now it marks the shard its region names and the doorbell thread kicks only the shards marked. Each shard's
+>       parks fell 59% and the shards' CPU 20 to 34% at 1,000 clients; the latencies moved with the box's load (14 to 52)
+>       more than with the change, so no latency is claimed for it (BENCHMARKS, 2026-11-18).
+>     - **Open, the hops (by the trace):** an edit of a work off its client's shard crosses four thread hand-offs (the
+>       client's shard, the work's, the owner's, back), each waiting for its thread to run; and a first touch, a
+>       verdict, a rebase and a read of the green each queue on the owner's one thread.
+>
 >     **Owed, measurement (the supervisor's):** the 1,000-client rung on main with W1 (A-247 step one, landed
 >     2026-11-17) against main before it (02c6469e5). Each think mean runs as its own invocation with a fresh daemon,
 >     interleaved across builds: every kind's p50, p99, p999 and max, the `offered` row and the `bound` row. A think
@@ -2702,10 +2774,12 @@
 > - a holder's seed gathers the size its held manifest declares, at most a chunk's bytes an extent, uncharged, as the
 >   one-call restore before it was: an owner's manifest naming one chunk many times makes a holder gather that many
 >   copies. The seed's transient bytes (gathered, decoded, seeded) want charging to the shard's budget;
-> - sibling, found reading `held_inputs` (not changed here): its restore cap is the archive's distinct chunks' bytes and
+> - ~~sibling, found reading `held_inputs` (not changed here): its restore cap is the archive's distinct chunks' bytes and
 >   one more chunk, on the rule that an inputs archive names each chunk once. A fixed-size cut names a chunk again
 >   wherever the inputs repeat a chunk's bytes at a chunk boundary (two identical runs of a chunk or more), and such
->   inputs are refused `merge.inputs_undecodable` for good. A failing test is owed before any change.
+>   inputs are refused `merge.inputs_undecodable` for good. A failing test is owed before any change.~~ Closed by A-383
+>   (2026-11-18): such inputs were refused `merge.inputs_unheld` (not `undecodable`) at every shipment; a holder now
+>   gathers them extent by extent, charged to its shard's budget while it recomputes.
 >
 > **Fixed 2026-11-18 (g232, A-313): a restarted holder refused every later version of its greens.** A warm restart keeps
 > a holder's accepted records and held inputs, but its replica of each green lived in memory alone, so it answered every
@@ -2731,6 +2805,17 @@
 > owner's to the byte; with the fold a no-op they held 524,643 bytes, folded below 0 (kiln r133, Mac Studio). Still
 > open, A-238's owed: a holder's ledger records and held inputs grow per version until a durable checkpoint of the
 > replica on the holder lets them go below the floor.
+>
+> **Fixed 2026-11-18 (g232, A-383): a version whose inputs repeat a chunk was refused by every holder, for good.** A
+> holder restored a version's inputs within the archive's distinct chunks' bytes and one chunk more; inputs cut at fixed
+> offsets name a chunk at several extents wherever they repeat a chunk's bytes at the cut (a run of one byte three chunks
+> long is enough), so every holder refused the version `merge.inputs_unheld` at every shipment and, at `f = 1`, it never
+> placed. Now a holder gathers the inputs extent by extent and charges what the recomputation holds (twice their declared
+> size) to its shard's budget first, refusing `merge.inputs_over_budget` past what it can admit. Test:
+> `a_version_whose_inputs_repeat_a_chunk_is_recomputed_by_every_holder` (`crates/server/tests/fleet.rs`): passed in
+> 4.15 s; red on main's holder code, the submit `DeadlineExceeded` after 60 s and each holder 4,583 refusals (kiln r49,
+> Mac Studio; `docs/bugs/2026-11-18-inputs-repeating-a-chunk-were-refused-by-every-holder-for-good.md`). Still open:
+> the recomputation of one version, gather included, is one call, costing what the increment's size costs.
 >
 > **Fixed 2026-11-18 (g232): the late-submit test judged a green's history by factors no measurement gave.**
 > `a_submit_late_in_a_greens_history_is_answered_as_fast_as_an_early_one` (`crates/server/tests/fleet.rs`) held the median

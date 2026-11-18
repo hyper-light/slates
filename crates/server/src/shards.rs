@@ -354,6 +354,10 @@ pub(crate) struct ShardsStream {
   /// Whether the stream has read no frame yet: only then may a RESTORE come, and only then may a control frame run to
   /// [`ShardsStream::restore_most`] (A-303).
   restorable: bool,
+  /// Whether its guest's kernel sends the extended `fuse_setxattr_in` (A-378): its `INIT` reply kept
+  /// `FUSE_SETXATTR_EXT`. Kept for the stream's life, through a resync (the held session) and a restore (the tables), so
+  /// every request is parsed in the form the kernel sends it.
+  setxattr_ext: bool,
   /// Derived: the longest tables this shard could make ([`tables::most_bytes`] of its inode slab's capacity). With its
   /// ask byte, the bound on a fresh stream's first control frame, past which it is refused before anything is allocated
   /// for it.
@@ -418,6 +422,7 @@ impl ShardsStream {
       durable: None,
       owners: OwnerView::IDENTITY,
       restorable: true,
+      setxattr_ext: false,
       restore_most,
       #[cfg(unix)]
       resync: None,
@@ -675,7 +680,11 @@ fn give_up_resync_for_dax(s: &mut ShardState, stream: &mut ShardsStream) {
 /// served without one, ending at a daemon's death as before) and one the anchor was not given.
 #[cfg(unix)]
 fn establish_resync(s: &mut ShardState, attachment: u64) -> Option<resync::Established> {
-  match resync::establish(attachment, OwnerView::IDENTITY) {
+  let fresh = resync::Kept {
+    owners: OwnerView::IDENTITY,
+    setxattr_ext: false,
+  };
+  match resync::establish(attachment, fresh) {
     Ok(established) => {
       if !established.resync.held() {
         s.count(RESYNC_UNHELD, 1);
@@ -1731,7 +1740,8 @@ fn answer_save(s: &mut ShardState, stream: &mut ShardsStream, stores_refused: bo
 }
 
 /// The tables of `stream` at a cut made now: a snapshot of its volume taken for the attachment's own principal and made
-/// durable, then what the attachment holds of the volume, its scope and its owner view ([`tables::StreamTables`]).
+/// durable, then what the attachment holds of the volume, its scope, its owner view and its guest's `SETXATTR` form
+/// ([`tables::StreamTables`]).
 fn save(s: &mut ShardState, stream: &ShardsStream) -> Result<Vec<u8>, &'static str> {
   let principal = s
     .db
@@ -1777,6 +1787,7 @@ fn save(s: &mut ShardState, stream: &ShardsStream) -> Result<Vec<u8>, &'static s
     snapshot: crate::verbs::to_db_snapshot(snapshot),
     scope: stream.scope,
     owners,
+    setxattr_ext: stream.setxattr_ext,
     held,
   }))
 }
@@ -1855,7 +1866,45 @@ fn restore(
       (owners.run_uid, owners.run_gid),
     )
   });
+  stream.setxattr_ext = tables.setxattr_ext;
+  // What a successor must keep is the restored guest's: its owner view and its kernel's form (A-378; before, a restored
+  // stream's held session kept the fresh stream's identity view).
+  #[cfg(unix)]
+  tell_session(s, stream);
   Ok(())
+}
+
+/// Records the form of `SETXATTR` `stream`'s guest's kernel sends from now on, where `answered` is its `INIT` answered:
+/// as the reply it reads kept it (A-378), and tells a held resync session so a successor parses as this daemon does.
+fn kept_at_init(s: &mut ShardState, stream: &mut ShardsStream, answered: &Answered) {
+  if answered.opcode != Some(Opcode::Init) || answered.error != 0 {
+    return;
+  }
+  stream.setxattr_ext = answered
+    .reply(&stream.outbound)
+    .get(slates_bridge_fuse::abi::OUT_HEADER_LEN..)
+    .and_then(slates_bridge_fuse::init::kept_flags)
+    .is_some_and(|kept| kept & slates_bridge_fuse::abi::flags::SETXATTR_EXT != 0);
+  #[cfg(unix)]
+  tell_session(s, stream);
+  #[cfg(windows)]
+  let _ = s;
+}
+
+/// Tells the anchor what `stream`'s successor must keep (its owner view and its kernel's form; A-281, A-378), where
+/// the anchor holds its resync end: a refused update gives the resync up, counted.
+#[cfg(unix)]
+fn tell_session(s: &mut ShardState, stream: &mut ShardsStream) {
+  let kept = resync::Kept {
+    owners: stream.owners,
+    setxattr_ext: stream.setxattr_ext,
+  };
+  if let Some(resync) = stream.resync.as_mut()
+    && resync.held()
+    && !resync::tell_session(stream.attachment, resync, kept)
+  {
+    s.count(RESYNC_GIVEN_UP, 1);
+  }
 }
 
 /// Takes a guest's owner word (A-281): a word Shards' rules refuse is answered with its errno and changes nothing; one
@@ -1870,12 +1919,7 @@ fn take_owner_word(s: &mut ShardState, stream: &mut ShardsStream, word: OwnerWor
         stream.owners = OwnerView::swapping(kept, (uid, gid));
         s.count(OWNER_NAMED, 1);
         #[cfg(unix)]
-        if let Some(resync) = stream.resync.as_mut()
-          && resync.held()
-          && !resync::tell_owners(stream.attachment, resync, stream.owners)
-        {
-          s.count(RESYNC_GIVEN_UP, 1);
-        }
+        tell_session(s, stream);
         word
       }
       Some(Err(errno)) => OwnerWord::Refused { unique, errno },
@@ -1993,12 +2037,15 @@ fn serve_request(
     .offering_dax(dax_offer)
     .viewing_owners(stream.owners)
     .serving_a_guest();
+    // The guest's kernel sends `SETXATTR` in the form its `INIT` reply kept, or the saved guest's did (A-378).
+    slates_bridge_core::Bridge::set_setxattr_ext(&mut bridge, stream.setxattr_ext);
     let mut scoped = None;
     let served = crate::verbs::scoped_or_whole(&mut bridge, &mut scoped, stream.scope);
     let request = stream.inbound.get(LENGTH_BYTES..total).unwrap_or(&[]);
     answer(request, served, &cx, &mut stream.outbound)
   };
   s.attachments.end(stream.registry);
+  kept_at_init(s, stream, &answered);
   release_forgotten(s, stream, total, &answered);
   // A write the guest is told succeeded outlives this daemon in the shard's write log, as a FUSE mount's does (A-63):
   // it is acknowledged before the next publication, and a death first would otherwise take it from the volume (A-316).
@@ -2383,7 +2430,7 @@ pub(crate) fn adopt_held() {
 fn adopt_one(s: &mut ShardState, record: AttachmentRecord, held: crate::fuse_hold::HeldDevice) {
   let attachment = record.id;
   let kept = held.raw_session.as_deref().and_then(resync::from_session);
-  let (Some((token, owners)), AttachForm::ShardsFs { scope }) = (kept, record.form.clone()) else {
+  let (Some((token, kept)), AttachForm::ShardsFs { scope }) = (kept, record.form.clone()) else {
     return refuse_adoption(s, &record);
   };
   let Ok((daemon_end, device_end)) = end::pair() else {
@@ -2410,7 +2457,8 @@ fn adopt_one(s: &mut ShardState, record: AttachmentRecord, held: crate::fuse_hol
     scope,
     tables::most_bytes(s.config.store.max_inodes),
   );
-  stream.owners = owners;
+  stream.owners = kept.owners;
+  stream.setxattr_ext = kept.setxattr_ext;
   stream.restorable = false;
   // The successor's copy of the held end is kept as the attach's daemon kept its own (`resync`'s module notes).
   stream.resync = Some(resync::Resync {
