@@ -179,9 +179,9 @@ const CALLS_WAITED_FOR: usize = 1;
 /// before its next save, so it never posts a second over it (`inflight::settle`).
 const CONFIRMATIONS_POSTED: usize = 1;
 /// Derived: the mount's request channel holds every request its one receive worker can have outstanding at once, a
-/// confirmation it posted and the call it then waits for, so no post waits for the shard to take what is in it. At one
-/// request, the call after an open waited in its post until the shard took the confirmation (and for good when nothing
-/// woke the shard: cut (c)'s no-wake variant stalled both Windows runners, diag-g258-1, run 44271751211).
+/// confirmation it posted and the call it then waits for, so no post waits for the shard to take what is in it (A-348).
+/// At one request, the call after an open waited in its post until the shard took the confirmation (and for good when
+/// nothing woke the shard: cut (c)'s no-wake variant stalled both Windows runners, diag-g258-1, run 44271751211).
 pub const REQUEST_BOUND: usize = CALLS_WAITED_FOR.saturating_add(CONFIRMATIONS_POSTED);
 /// Shape: the outcomes the mount thread can have unread at once: a command's (the task sends at most one command, a
 /// round or a purge, before reading its outcome) or the mount's, and the stop's after either.
