@@ -291,7 +291,7 @@ slates read VOLUME PATH [--version N | --attachment A]
 slates mount ID PATH [--read-only] [--subtree DIR]
 slates unmount PATH
 slates export ID [--read-only] [--subtree DIR] [--uid UID]
-slates land ID TARGET [--snapshot N] [--include P] [--exclude P] [--grant N] [--json]
+slates land ID TARGET [--snapshot N] [--include P]... [--exclude P]... [--grant N] [--json]
 slates image build ID SNAPSHOT NAME --capacity SIZE [--json]
 slates image merge IMAGE NAME [--json]
 slates grants [--json]
@@ -416,6 +416,10 @@ human saw, the scope and the term — which the daemon recomputes before issuing
 not verify (a forged, replayed or modified-plan approval) is refused `GrantIssuerUnverified` and
 counted; the MCP server and the SDKs carry no proof by construction and are refused by kind.
 Passing `--grant N` to `land` then consumes the grant; the landing must present the same manifest.
+`land --include P` and `--exclude P` each take a path prefix of the volume (`/.git`), as often as given: an entry
+lands when it lies under an included prefix (or none is given) and under no excluded one. Until 2026-11-17 each
+flag kept its last value alone, so a harness could leave out one prefix
+(`docs/bugs/2026-11-17-land-kept-only-the-last-exclude.md`).
 `land --snapshot N` lands that snapshot exactly as it was taken, whatever the volume has become since; the
 volume's later edits stay private, and a later `land` without `--snapshot` lands them over it.
 One landing at a time writes into a directory, whichever volume lands and however its path is

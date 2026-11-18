@@ -47,8 +47,8 @@ jobs:
           cp verbs.orig "$F"
           grep -E '^error|panicked at|^test result|left|right|clone' red.log | head -30
           echo "red exit $code; restored mutant sites: $(grep -c 'slot.volume.prefix() == prefix' "$F")"
-          # The red must fail by the test's own assertion, never by a compile error.
-          test "$code" -ne 0 && grep -q 'panicked at' red.log && ! grep -q '^error\[' red.log
+          # The red must fail at the routing's own assertion, never earlier and never by a compile error.
+          test "$code" -ne 0 && grep -q 'the clone has its replayed write' red.log && ! grep -q '^error\[' red.log
       - name: slates-vfs
         if: success() || failure()
         run: cargo test --locked -p slates-vfs

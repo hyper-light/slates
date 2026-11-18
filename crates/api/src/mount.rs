@@ -15,8 +15,8 @@
 //!
 //! Moved here from `crates/cli/src/mount.rs` on 2026-11-18 (A-278), so the CLI and an embedding host mount through
 //! one implementation. The shape is adapted from sylk's cgofuse mount (`core/purevfs`): a pure, injectable capability
-//! detection ([`classify`], tested on any host with no live mount), a probe that refuses with a message naming what is
-//! missing, and the mount/unmount lifecycle.
+//! detection (`classify`, the other BSDs' and tested on any host with no live mount), a probe that refuses with a message
+//! naming what is missing, and the mount/unmount lifecycle.
 
 #[cfg(not(windows))]
 use std::process::Command;
