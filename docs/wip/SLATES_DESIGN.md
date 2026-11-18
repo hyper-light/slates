@@ -4490,6 +4490,15 @@ base operations, concurrent SDK/kernel writes and invalidation loss. Source-leve
 cannot establish the mount guarantee. A native Windows or NFS adapter must report its actual
 semantics; a Linux guest provides a separate POSIX target, not evidence for those native paths.
 
+**The group a new object takes (A-328).** POSIX lets the implementation choose (`mkdir(2)`: the parent's group or the
+creator's), and each route gives what a native file system under the kernel it serves gives, so a tool sees the same
+tree over the route as on the host. FUSE and virtio-fs serve Linux kernels: System V's rule, the creator's group unless
+the parent directory is set-group-ID, whose group a new object takes and whose bit a new directory takes too. The NFS
+export, and the routes without a kernel, give their host's own rule, as a native NFS server does: System V's on Linux,
+BSD's on macOS, the parent's group always and no inherited bit (`slates_bridge_core::GroupRule`). Measured on APFS: a
+directory made in a `2755` parent reads `755`; before A-328 the macOS export gave `2755`, and a Subversion
+repository's `db/revprops` differed there from the host's (CI run 44260193629).
+
 A mount is transparent to ordinary path-based tools within the selected namespace, but remains
 a filesystem boundary: `st_dev`, mount tables, cross-boundary links and EXDEV may expose it.
 Attaching over an existing directory hides it in that namespace; the retained base descriptor
@@ -23821,3 +23830,35 @@ with a decision for Ada), and `crates/conformance/src/workload.rs` (`ENVIRONMENT
   Subversion workload's own paths are already in the drive form, `pwd -W`).
 - **The failing test** is the lanes' workloads step itself, red in run 44260193629 on both architectures; nothing else
   runs Git for Windows. Its next run is the check.
+
+### A-328 — A new object takes its group by the rule of the kernel its route serves: System V's for Linux kernels, its host's own over the NFS export, BSD's on macOS (2026-11-18, A-289's macOS run; Ada's goal of 2026-11-18)
+Applied in the same change to: §4.6 ("POSIX and transparency acceptance": the group a new object takes), GAPS (A-289's
+entry; the AUD-29-81 row), `crates/bridge-core/src/group_rule.rs` (new: `GroupRule`, its decision and
+`of_this_host`), `authority.rs` (`OpContext::group_rule`, this host's rule by default), `volume_bridge.rs`
+(`stamp_created_owner` asks the rule), and `crates/bridge-fuse/src/bridge.rs` (a creating request takes System V's).
+- **What was there.** AUD-29-81 (2026-10-01) made every transport stamp a new object by System V's rule: the creator's
+  group unless the parent is set-group-ID, whose group it takes and whose bit a new directory takes too. That is
+  Linux's (`inode_init_owner`, `fs/inode.c`), and it was written for FUSE. macOS's file systems follow BSD's: the
+  parent's group always, and no directory takes the bit (XNU's `vnode_authattr_new`; measured on APFS, macOS 26,
+  2026-11-18: in a `2755` parent `mkdir` makes `755`).
+- **What it broke.** CI run 44260193629's macOS leg ran the Subversion workload over the NFS loopback mount: its
+  repository's `db` is made set-group-ID (`svn_fs_create2` asks `svn_io_dir_make_sgid`, `fs-loader.c`), and FSFS
+  makes `db/revprops`, `db/revs` and the rest with plain `mkdir` (`fs_fs.c`). On the host they read `755`, over the
+  mount `2755`, so the trees differed at `repo/db/revprops`. The same rule gave an object the creator's group where
+  APFS gives the parent's; no workload compares groups, but `ls -l` shows it.
+- **The decision.** A route gives a new object what a native file system under the kernel it serves would. FUSE and
+  virtio-fs requests come from Linux kernels (a host's `/dev/fuse`, a virtio-fs guest, a Shards guest): System V's.
+  The NFS export gives its host's own rule, as a native NFS server does, since its host's file system would make the
+  object; so do the routes without a kernel (the typed channel): System V's on Linux and Windows, BSD's on macOS. One
+  pure decision (`GroupRule::created`) holds both rules and is unit-tested on every host; the host's choice is a
+  paired `#[cfg]` (`of_this_host`); the operation context carries the rule as it carries the creator's group, metadata
+  of the request and never authority. It is no mode switch: each route keeps one rule, the one its kernel has.
+- **Kept.** The volume root is its provisioning user's (`stamp_root_owner`), so in an ordinary tree BSD's parent group
+  is the user's own group, as the root:wheel fix of 2026-09-09 asked; only a parent of another group now gives that
+  group, as APFS does. pjdfstest accepts either group for a new object (`mkdir/00.t`, `open/00.t`).
+- **Tests.** Red first: `bsds_rule_gives_each_new_object_its_parents_group_and_no_directory_the_bit`
+  (`crates/bridge-core/tests/volume_bridge.rs`), a directory made in a set-group-ID parent reading the bit before the
+  stamp asked the rule; with it, `system_vs_rule_gives_a_set_group_id_parents_group_and_bit_and_else_the_creators_group`
+  and the decision's own two unit tests. By use over the export:
+  `an_object_made_over_the_export_takes_its_group_by_this_hosts_rule` (`crates/bridge-nfs/tests/procedures.rs`), which
+  holds macOS's CI run to BSD's rule and every other host to System V's. The FUSE creation test of AUD-29-81 stands.
