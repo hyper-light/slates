@@ -6528,6 +6528,29 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > (`a_guests_fsync_is_not_refused_while_its_receiver_has_not_read_what_came`); each was answered `EIO` at one window by
 > the rule before it (`docs/bugs/2026-11-09-a-healthy-live-fsync-was-refused-at-a-wall-clock-deadline.md`).
 >
+> **Silence is the holders' only when they were asked (A-301, 2026-11-17).** The receiver's two waits prove the owner
+> has read what came, not that it asked. Some of what a held reply waits for is asked only at the owner's own pace: a
+> fresh volume's head and catalog are shipped by the coordinator's period after that period's other rounds, each
+> awaited in turn (`fleet::ship_shard_heads`), so a period a loaded machine stretches past a window left a window in
+> which nothing was asked and nothing heard, and the wait gave up on holders that had never been asked. Each live volume
+> now keeps when its owner first asked a holder something since it last heard anything on the volume's durability path
+> (`live_ship::LiveVolume::unanswered_since_ns`): a lane opened to send it entries or an install (`live_ship::dispatch`),
+> or a head's or catalog's placement round sent (`fleet::ship_head`, noted on the volume's shard before the round, which
+> that shard runs before the round's acknowledgements). Anything heard clears it. A window that ended with nothing heard
+> is confirmed only once that ask is a window old, a holder having had the whole liveness budget to answer it, and then
+> by the receiver's two waits as before; an owner that never asks holds the verdict only to the total bound. The rule
+> never gives up earlier than before; with candidates stopped, the barrier's lanes are the ask, so the refusal still
+> comes a window and two or three looks after the hold. A give-up's record names the oldest unanswered ask's age
+> (`live_ship::durability_report`). Red first: the rule's
+> `a_window_in_which_the_owner_asked_nothing_is_given_up_only_once_its_ask_is_a_window_old` and
+> `an_owner_that_never_asks_holds_the_verdict_only_to_the_total_bound`, and the device's
+> `a_guests_fsync_is_not_refused_while_its_owner_has_asked_its_holders_nothing` (an owner that asks half a window past
+> the window's end, answered at once), each given up `Silent` (`EIO`) by A-292's rule alone before the owner had asked.
+> Not tracked as an ask: a pair key's delivery (one per owner shard and candidate, not per volume), so a wait on it
+> alone holds to the total bound; and the ask is kept per volume, not per holder, so a stopped candidate's re-sent lane
+> can stand in for an ask the owner has not yet made of a live one (a stopped candidate and a stretched period at once,
+> where the rule is A-292's alone).
+>
 > **Every other durability claim (2026-11-05, the sibling sweep of FUSE `fsync`).** Each place a client is told data is
 > durable on a live volume now waits for the position its barrier published, and the same failing test holds each to
 > it across three real daemon processes (`crates/cli/tests/live_fleet.rs`): with both candidates' processes stopped
@@ -23172,6 +23195,42 @@ Held by:
 Applied in the same change to: §4.10's status (A-271's window), A-92 piece 4c (the hand-off), A-271's record, GAPS
 (the window's entry: a live log fixed at `f ≥ 2` and `f = 1` open, a sealed head fixed), and the bug record
 `docs/bugs/2026-11-17-a-replacement-successor-waited-for-a-key-only-the-dead-owner-could-deliver.md`.
+
+### A-301 — A held durable reply's silent window counts against its holders only once an ask of the owner's has gone a window unanswered (2026-11-17, built for goal g244)
+
+Applied in the same change to:
+- §4.10's status, "Silence is the holders' only when they were asked".
+- `crates/bridge-core/src/durable_bound.rs`: `Heard::unanswered_since_ns`; `DurableBound::judge` confirms a silent
+  window only once that ask is a window old (`asked_a_window_before`); its module doc; two unit tests.
+- `crates/server/src/live_ship.rs`: `LiveVolume::unanswered_since_ns`, set by `dispatch` (a lane opened) and by
+  `asked` (a head's or catalog's placement round), cleared by anything heard (`note_heard`); `heard_now` hands it to
+  the rule; `durability_report` names its age. `crates/server/src/fleet.rs`: `Head::live`, and `ship_head` notes the
+  ask on the volume's shard before its round. `crates/bridge-virtiofs/src/serve.rs` (`BridgeAccess::durable_heard`'s
+  doc) and `crates/server/src/virtiofs.rs`.
+- Tests: the rule's
+  `a_window_in_which_the_owner_asked_nothing_is_given_up_only_once_its_ask_is_a_window_old` and
+  `an_owner_that_never_asks_holds_the_verdict_only_to_the_total_bound`; `crates/bridge-virtiofs/tests/serve.rs`
+  (`a_guests_fsync_is_not_refused_while_its_owner_has_asked_its_holders_nothing`).
+- GAPS "2026-11-09: a healthy live `fsync` was refused at a wall-clock deadline under load", and
+  `docs/bugs/2026-11-09-a-healthy-live-fsync-was-refused-at-a-wall-clock-deadline.md`.
+- **What was there.** A-292's rule gave a window that ended with nothing heard up once the receiver (the daemon's
+  control shard) had idled twice: proof that the owner had read what came, not that it had asked anything. A fresh
+  volume's head and catalog are asked only by the coordinator's period, behind that period's other rounds, so an owner
+  whose period ran past a window gave up on holders it had not asked (GAPS, the hypothesis of 2026-11-17).
+- **The rule.** The liveness budget is how long a holder may leave an ask unanswered before it is not a live one to
+  wait for. So a silent window is confirmed only once the owner's oldest unanswered ask is a window old; then the
+  receiver's two waits and a later look, as before. Whatever it hears or asks, the wait ends at the failover SLO.
+- **Why.** The budget's own words are about a holder that has not answered, which presumes it was asked. Without the
+  ask, the rule measured the owner's own pace against its holders: the class of defect A-292 removed for the wall clock.
+- **What it does not change.** It never gives up earlier than A-292's rule (it only adds a condition). With candidates
+  stopped, the barrier's lanes are the ask, so the refusal comes a window and two or three looks after the hold, as
+  before.
+- **Open.** A pair key's delivery is not an ask of the volume (it is per owner shard and candidate), so a wait on it
+  alone holds to the failover SLO. The ask is kept per volume, not per holder: a stopped candidate's re-sent lane can
+  stand in for an ask the owner has not yet made of a live one, where the rule is A-292's alone.
+- **Owed.** The supervisor's runs of the live FUSE flows under load on main (`a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it`
+  and `a_fuse_fsync_on_a_live_volume_waits_out_candidates_that_answer_slowly`, `SLATES_TEST_CLI=1`), whose give-up
+  records now name the oldest unanswered ask's age.
 
 ### A-319 — The version-control workloads after CI's first runs: one text per Subversion commit, cargo's colour and target pinned, and the live guest's console read while it runs (2026-11-18, A-289's runs over each mount; Ada's goal of 2026-11-18)
 Applied in the same change to: Part 6 (the status of the version-control workloads), A-289 (its owed list), GAPS (A-289's

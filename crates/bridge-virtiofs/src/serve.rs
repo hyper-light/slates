@@ -461,8 +461,9 @@ pub trait BridgeAccess {
   /// for every transport's durability claim, its windows and its total bound.
   fn durable_bound(&mut self, now_ns: u64) -> slates_bridge_core::durable_bound::DurableBound;
 
-  /// What a held reply's wait is judged against now: the volume's acknowledgements heard on its durability path, and the
-  /// idles of the shard that receives them (`slates_bridge_core::durable_bound::Heard`).
+  /// What a held reply's wait is judged against now: the volume's acknowledgements heard on its durability path, the
+  /// idles of the shard that receives them, and the owner's oldest unanswered ask of its holders
+  /// (`slates_bridge_core::durable_bound::Heard`).
   fn durable_heard(&mut self) -> slates_bridge_core::durable_bound::Heard;
 
   /// Counts what one settle of the device's `FSYNC` replies held for durability did: released once durable after a

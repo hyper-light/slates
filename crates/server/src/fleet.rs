@@ -2212,6 +2212,9 @@ struct Head {
   shape: Placement,
   acked: Vec<HostId>,
   quorum: Quorum,
+  /// Whether its shard ships its volume live (`live_ship::ships`): then a held durable reply may hold the candidates to
+  /// an answer, and [`ship_head`] notes the ask on that shard before its round (A-301).
+  live: bool,
 }
 
 /// The volume heads this node owns that some candidate has **not yet acknowledged** (§4.8 "records are sent
@@ -2525,6 +2528,7 @@ fn owed_record(
     },
     acked,
     quorum: config.quorum,
+    live: crate::live_ship::ships(state, object),
   })
 }
 
@@ -9136,6 +9140,15 @@ async fn ship_head(
       SHIP_HEAD_NO_SESSION
     });
     return None; // No live session to a candidate that still needs the head; retry next period.
+  }
+  if head.live {
+    // The candidates are asked now, so a held durable reply on the live volume may hold them to an answer a window
+    // hence (A-301). Noted on the volume's shard before the round is sent: that shard runs what this one sends it in
+    // order, so the note is there before the round's own acknowledgements ([`record_acks_in`], sent after the round).
+    let object = head.object;
+    crate::xshard::run_on_counted(origin, head.shard, move |s| {
+      crate::live_ship::asked(s, object);
+    });
   }
   let taken: Vec<HostId> = holders.iter().map(|(host, _)| *host).collect();
   let committed = commit_record(

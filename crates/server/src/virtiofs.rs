@@ -313,7 +313,8 @@ impl BridgeAccess for ShardBridge {
   }
 
   /// Every transport's rule for a durability claim (`crate::live_ship::begin_durable_bound`): windows of the liveness
-  /// budget, a silent one given up once the control shard has read what came, at most the failover SLO from the hold.
+  /// budget, a silent one given up once an ask of the owner's has gone a window unanswered and the control shard has
+  /// read what came, at most the failover SLO from the hold.
   fn durable_bound(&mut self, now_ns: u64) -> slates_bridge_core::durable_bound::DurableBound {
     let volume = self.volume;
     state::with_state(|s| crate::live_ship::begin_durable_bound(s, volume, now_ns)).unwrap_or_else(
@@ -333,8 +334,8 @@ impl BridgeAccess for ShardBridge {
     )
   }
 
-  /// What a held reply's wait is judged against now (`crate::live_ship::heard_now`): the volume's acknowledgements and
-  /// the control shard's idles.
+  /// What a held reply's wait is judged against now (`crate::live_ship::heard_now`): the volume's acknowledgements, the
+  /// control shard's idles and the owner's oldest unanswered ask.
   fn durable_heard(&mut self) -> slates_bridge_core::durable_bound::Heard {
     let volume = self.volume;
     state::with_state(|s| crate::live_ship::heard_now(s, volume)).unwrap_or_default()
